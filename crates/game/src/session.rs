@@ -28,6 +28,7 @@ use replay::{
 use rules::{GaugeKind, RulePreset};
 
 use crate::autoplay::{Autoplay, AutoplayError};
+use crate::bests::{BestView, SavedPlay};
 use crate::live::{Closing, InputWaitError, LiveError, Opening, Rig};
 use crate::logic::{AbortCause, LogicConfig, LogicError, Record};
 use crate::policy::{
@@ -311,6 +312,10 @@ pub struct PlayReport {
     pub saved: Option<Result<RecordRef, SaveError>>,
     /// The result extension's summary of a recorded play.
     pub result: Option<ResultSummary>,
+    /// The play's standing against its personal best, as the record sink
+    /// answered ([`RecordSink::after_result`]); `None` when it says
+    /// nothing, or there is no sink, record or summary.
+    pub best: Option<BestView>,
     /// The preset the play was evaluated under: after a reload at a
     /// retry, the new one.
     pub preset: RulePreset,
@@ -779,7 +784,7 @@ impl Loaded {
         let window = TimeUs(end.0.saturating_sub(self.opens_at().0).max(0));
         let inputs = window_inputs(&device, window, &rates).saturating_add(system);
         if let Ok(probe) = &probe
-            && let r = Reservation::from_probe(probe, &self.chart, &device, self.config.effects)
+            && let r = Reservation::from_probe(probe, &device, self.config.effects)
             && !r.fits(inputs)
         {
             return Err(LogicError::RecordingTooLarge {
@@ -835,7 +840,7 @@ impl Loaded {
             0,
         )
         .map_err(LogicError::Eval)?;
-        let r = Reservation::from_probe(&probe, &self.chart, &device, self.config.effects)
+        let r = Reservation::from_probe(&probe, &device, self.config.effects)
             .with_autoplay(inputs, schedule);
         if !r.fits(inputs) {
             return Err(LogicError::RecordingTooLarge {
@@ -1004,6 +1009,23 @@ impl Loaded {
                 live: &live,
             })
         });
+        let best = match (
+            parts.records.as_mut(),
+            play_record.as_ref(),
+            saved.as_ref(),
+            result.as_ref(),
+        ) {
+            (Some(sink), Some(record), Some(saved), Some(summary)) => {
+                sink.after_result(&SavedPlay {
+                    record,
+                    saved: saved.as_ref(),
+                    summary,
+                    chart: &self.chart,
+                    preset,
+                })
+            }
+            _ => None,
+        };
         let retried =
             end == PlayEnd::Aborted(AbortCause::Retry) || tail_cut == Some(AbortCause::Retry);
         if retried {
@@ -1023,6 +1045,7 @@ impl Loaded {
             record: play_record,
             saved,
             result,
+            best,
             preset: preset.clone(),
         }
     }
@@ -1385,11 +1408,6 @@ fn arrival(a: &InputArrival) -> Arrival {
 /// (design.md "Recording Capacity"): what [`Reservation`] counts.
 pub const RECORDING_MEMORY: usize = 512 << 20;
 
-/// The bytes the evaluator's own tables may take per chart object (its
-/// judgeable notes, their flags and its deadlines), an allowance on top of
-/// what [`Reservation`] counts exactly.
-pub const TABLE_BYTES_PER_OBJECT: usize = 64;
-
 /// An allowance for the logic step's small fixed parts (its per-source
 /// bookkeeping, the play view's buffers and the gauges).
 pub const SMALL_PARTS_BYTES: usize = 64 << 10;
@@ -1407,7 +1425,10 @@ pub const SMALL_PARTS_BYTES: usize = 64 << 10;
 /// command queue and a copy of the events, each also of
 /// [`Evaluator::max_events`]. The fixed part holds the chart's share of
 /// those events (its notes, mines and song end), the render effect queue,
-/// and the allowances for tables and small parts.
+/// and the allowances for tables ([`Evaluator::table_bytes`]) and small
+/// parts. Its components are `eval`'s, which also composes the batch
+/// evaluation's peak from them ([`Evaluator::batch_bytes`]); a play holds
+/// no gauge histories.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Reservation {
     /// Bytes reserved whatever the capacity.
@@ -1428,36 +1449,26 @@ impl Reservation {
         effects: usize,
     ) -> Option<Self> {
         let probe = Evaluator::new(chart, preset, device, &InputStart::default(), None, 0).ok()?;
-        Some(Self::from_probe(&probe, chart, device, effects))
+        Some(Self::from_probe(&probe, device, effects))
     }
 
-    /// [`of`](Self::of), with an evaluator built for the play with no
-    /// input capacity.
+    /// [`of`](Self::of), with an evaluator built for the play's chart and
+    /// preset with no input capacity.
     #[must_use]
-    pub fn from_probe(
-        probe: &Evaluator<'_>,
-        chart: &Chart,
-        device: &eval::DeviceProfile,
-        effects: usize,
-    ) -> Self {
+    pub fn from_probe(probe: &Evaluator<'_>, device: &eval::DeviceProfile, effects: usize) -> Self {
         let sources = device.sources.len();
-        let event = 2 * size_of::<JudgeEvent>() + size_of::<::audio::SoundCmd>();
-        let input = size_of::<eval::PhysicalInputEvent>();
-        let slot = size_of::<(TimeUs, eval::PhysicalInputEvent)>();
+        let event = 2 * eval::EVENT_BYTES + size_of::<::audio::SoundCmd>();
+        let input = eval::INPUT_BYTES;
         let total = |inputs: usize| {
             let budget = inputs + sources;
             probe.max_events(budget) * event
                 + sources * (inputs + 1) * input
                 + 2 * budget * input
-                + budget * slot
+                + budget * eval::RING_SLOT_BYTES
         };
-        let objects: usize = chart.lanes.iter().map(Vec::len).sum();
         let empty = total(0);
         Self {
-            fixed: empty
-                + effects * size_of::<JudgeEvent>()
-                + objects * TABLE_BYTES_PER_OBJECT
-                + SMALL_PARTS_BYTES,
+            fixed: empty + effects * eval::EVENT_BYTES + probe.table_bytes() + SMALL_PARTS_BYTES,
             per_input: total(1) - empty,
         }
     }

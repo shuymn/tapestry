@@ -185,9 +185,16 @@ fn status(report: &PlayReport) -> (EndStatus, TimeUs) {
     (s.end, s.finalized)
 }
 
-fn file_name(report: &PlayReport) -> String {
+/// The number of the saved record's file, `<n>-<id>.tprl`.
+fn number(report: &PlayReport) -> u64 {
     let saved = report.saved.as_ref().unwrap().as_ref().unwrap();
-    saved.path.file_name().unwrap().to_str().unwrap().to_owned()
+    let name = saved.path.file_name().unwrap().to_str().unwrap();
+    let (n, id) = name.trim_end_matches(".tprl").split_once('-').unwrap();
+    assert!(
+        id.len() == 16 && u64::from_str_radix(id, 16).is_ok(),
+        "{name}"
+    );
+    n.parse().unwrap()
 }
 
 const NOTES: [(u8, i64); 6] = [
@@ -225,10 +232,7 @@ fn retry_resets_judgment_and_starts_a_new_log() {
     assert_eq!(two.tally.counts.perfect, 6);
     assert_eq!(two.live[0].seq, 0);
     // Two logs, numbered in order, each decoding to its record.
-    assert_eq!(
-        (file_name(&one), file_name(&two)),
-        ("1.tprl".to_owned(), "2.tprl".to_owned())
-    );
+    assert_eq!((number(&one), number(&two)), (1, 2));
     for r in [&one, &two] {
         let path = &r.saved.as_ref().unwrap().as_ref().unwrap().path;
         let decoded = replay::decode(&fs::read(path).unwrap(), &DecodeLimits::STANDARD).unwrap();
@@ -906,7 +910,7 @@ fn retry_in_the_countdown() {
     assert_eq!((one.record.as_ref(), one.saved.as_ref()), (None, None));
     assert_eq!(status(&two), (EndStatus::EndedMidway, TimeUs(-501_001)));
     assert!(judgments(&two.live).is_empty());
-    assert_eq!(file_name(&two), "1.tprl");
+    assert_eq!(number(&two), 1);
 }
 
 #[test]
@@ -2220,4 +2224,112 @@ fn user_preset_links_are_refused() {
         .unwrap();
     assert_eq!(entry.error, Some(&refused));
     assert_eq!(entry.preset, None);
+}
+
+/// What a sink heard after a play's result.
+#[derive(Clone, Debug, PartialEq)]
+struct Heard {
+    saved: Option<PathBuf>,
+    chart: [u8; 32],
+    notes: usize,
+    summary: game::ResultSummary,
+}
+
+/// Saves through local records and remembers each play it hears about,
+/// answering with its count.
+struct Listening {
+    records: game::LocalRecords,
+    heard: Rc<RefCell<Vec<Heard>>>,
+}
+
+impl game::RecordSink for Listening {
+    fn save(&mut self, rec: &replay::PlayRecord) -> Result<game::RecordRef, SaveError> {
+        self.records.save(rec)
+    }
+
+    fn after_result(&mut self, play: &game::SavedPlay<'_>) -> Option<game::BestView> {
+        let mut heard = self.heard.borrow_mut();
+        heard.push(Heard {
+            saved: play.saved.ok().map(|r| r.path.clone()),
+            chart: play.chart.identity.sha256,
+            notes: play.chart.lanes.iter().map(Vec::len).sum(),
+            summary: play.summary.clone(),
+        });
+        Some(game::BestView::NotCounted(format!("heard {}", heard.len())))
+    }
+}
+
+fn listening(
+    root: &DataRoot,
+    chart: &Chart,
+    records: PathBuf,
+) -> (Session<Out>, Rc<RefCell<Vec<Heard>>>) {
+    let heard = Rc::default();
+    let parts = Parts {
+        records: Some(Box::new(Listening {
+            records: game::LocalRecords::new(records),
+            heard: Rc::clone(&heard),
+        })),
+        ..parts(root, chart, &Events::default())
+    };
+    (session_with(root, parts), heard)
+}
+
+/// Each recorded play reaches the sink once after its result, with its
+/// saved path, the chart just played and the play's summary, and the
+/// sink's answer is the report's; a play that recorded nothing does not.
+#[test]
+fn finish_play_hands_each_recorded_play_to_the_sink() {
+    let (_dir, root) = temp_root();
+    let chart = taps(&NOTES);
+    let (mut s, heard) = listening(&root, &chart, root.records());
+    // Retried at the first step: nothing recorded.
+    let none = s
+        .play(script(vec![connect(0)], &[(-999 * MS, Command::Retry)]))
+        .unwrap();
+    assert_eq!(none.record, None);
+    assert_eq!(none.best, None);
+    assert!(heard.borrow().is_empty());
+    let mut first = presses(&NOTES[..3]);
+    first.insert(0, connect(0));
+    let one = s
+        .play(script(first, &[(1_500 * MS, Command::Retry)]))
+        .unwrap();
+    let two = s.play(script(presses(&NOTES), &[])).unwrap();
+    let heard = heard.borrow();
+    assert_eq!(heard.len(), 2);
+    for (i, (report, h)) in [&one, &two].into_iter().zip(heard.iter()).enumerate() {
+        let saved = report.saved.as_ref().unwrap().as_ref().unwrap();
+        assert_eq!(h.saved.as_ref(), Some(&saved.path));
+        assert_eq!(h.chart, chart.identity.sha256);
+        assert_eq!(h.notes, NOTES.len());
+        assert_eq!(Some(&h.summary), report.result.as_ref());
+        assert_eq!(
+            report.best,
+            Some(game::BestView::NotCounted(format!("heard {}", i + 1)))
+        );
+    }
+}
+
+/// A play whose record could not be saved still reaches the sink, with
+/// why, and its summary.
+#[test]
+fn failed_save_reaches_the_sink_unsaved() {
+    let (_dir, root) = temp_root();
+    fs::create_dir_all(root.path()).unwrap();
+    fs::write(root.records(), b"not a directory").unwrap();
+    let chart = taps(&[(1, 1_000)]);
+    let (mut s, heard) = listening(&root, &chart, root.records());
+    let mut items = vec![connect(0)];
+    items.extend(presses(&[(1, 1_000)]));
+    let one = s.play(script(items, &[])).unwrap();
+    assert!(matches!(one.saved, Some(Err(SaveError::Io { .. }))));
+    let heard = heard.borrow();
+    assert_eq!(heard.len(), 1);
+    assert_eq!(heard[0].saved, None);
+    assert_eq!(Some(&heard[0].summary), one.result.as_ref());
+    assert_eq!(
+        one.best,
+        Some(game::BestView::NotCounted("heard 1".to_owned()))
+    );
 }

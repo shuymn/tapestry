@@ -102,6 +102,11 @@ pub enum DecodeError {
     /// all.
     #[error("the record binds too many controls")]
     TooManyBindings,
+    /// The held-input snapshot names more controls than a source can bind
+    /// (its bindings and axes, at the evaluator's limits), per source or in
+    /// all, or names one control twice.
+    #[error("the held-input snapshot names too many controls")]
+    TooManyHeld,
     /// A list declares more elements than the bytes left could hold.
     #[error("a list of {0} elements exceeds the data")]
     CountBeyondData(u64),
@@ -182,6 +187,10 @@ mod tests {
             (
                 DecodeError::TooManyBindings,
                 "the record binds too many controls",
+            ),
+            (
+                DecodeError::TooManyHeld,
+                "the held-input snapshot names too many controls",
             ),
             (
                 DecodeError::CountBeyondData(7),

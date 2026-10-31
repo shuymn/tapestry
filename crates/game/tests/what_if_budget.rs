@@ -1,7 +1,7 @@
 //! The result screen's evaluation budget (design.md "Extension
 //! Boundaries"): what a what-if holds at its peak stays within
-//! `what_if_bytes`, the reservation a play under the viewed preset is
-//! admitted with, on a chart of taps, long notes and mines, with a preset
+//! `what_if_bytes`, the batch evaluation's peak a rebuild admits a record
+//! with, on a chart of taps, long notes and mines, with a preset
 //! of more gauges than the played one.
 //!
 //! A global allocator keeps the bytes live on threads that opted in and
