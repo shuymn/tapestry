@@ -145,33 +145,6 @@ fn element_cap(root: &Path) {
     );
 }
 
-fn bitmap_fonts(root: &Path) {
-    // With its synthesised space each font keeps 4,096 glyphs.
-    for i in 0..16 {
-        common::big_fnt(root, &format!("b{i}.fnt"), 4_095, 4_096, 0);
-    }
-    let fonts = join((0..16).map(|i| format!(r#"{{"id": "{i}", "path": "b{i}.fnt"}}"#)));
-    let texts = join((0..64_u32).map(|i| {
-        let line: String = (0..128)
-            .map(|c| char::from_u32(common::BIG_FNT_CODE + i * 16 + c).unwrap())
-            .collect();
-        format!(
-            r#"{{"id": "t{i}", "font": "{}", "size": 8, "constantText": "{line}"}}"#,
-            i % 16
-        )
-    }));
-    let dsts =
-        join((0..64).map(|i| format!(r#"{{"id": "t{i}", "dst": [{{"w": 1000, "h": 8}}]}}"#)));
-    write(
-        root,
-        "s.json",
-        hd(&format!(
-            r#""font": [{fonts}], "text": [{texts}], "destination": [{dsts}]"#
-        ))
-        .as_bytes(),
-    );
-}
-
 fn run(root: &Path) -> usize {
     let (mut def, header) = read_header(root, "s.json").unwrap();
     let imported = import(&mut def, &header, &Config::defaults(&header)).unwrap();
@@ -192,7 +165,7 @@ fn bench_import(c: &mut Criterion) {
         b.iter(|| black_box(run(black_box(d.path()))));
     });
     let d = tempfile::tempdir().unwrap();
-    bitmap_fonts(d.path());
+    common::bitmap_fonts(d.path(), 0);
     assert_eq!(run(d.path()), 64);
     c.bench_function("skin_beatoraja_import_bitmap_fonts", |b| {
         b.iter(|| black_box(run(black_box(d.path()))));

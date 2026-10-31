@@ -281,47 +281,10 @@ fn check_f2(_: &Header, i: Imported) {
     assert_eq!(i.skin.quad_capacity(), MAX_WIDGET_QUADS);
 }
 
-/// F6's glyph lines per font: with its synthesised space, 16 fonts fill
-/// the sheet's glyph cap.
-const F6_GLYPHS: usize = MAX_SHEET_GLYPHS / MAX_FONTS - 1;
-
-/// F6: 64 texts of 128 glyphs in 16 bitmap fonts, the font slots full,
-/// each font at the page cap (16 pages) and the file size cap, so the
-/// fonts fill the total font bytes, and together at the sheet's glyph
-/// and kerning caps.
+/// F6: [`common::bitmap_fonts`] with each font also at the file size cap,
+/// so the fonts fill the total font bytes.
 fn f6(root: &Path) {
-    assert_eq!(F6_GLYPHS.div_ceil(256), MAX_FNT_PAGES);
-    for i in 0..MAX_FONTS {
-        common::big_fnt(
-            root,
-            &format!("b{i}.fnt"),
-            F6_GLYPHS,
-            MAX_SHEET_KERNINGS / MAX_FONTS,
-            usize::try_from(MAX_FNT_BYTES).unwrap(),
-        );
-    }
-    let fonts = join((0..MAX_FONTS).map(|i| format!(r#"{{"id": "{i}", "path": "b{i}.fnt"}}"#)));
-    let texts = join((0..MAX_TEXT_ELEMENTS).map(|i| {
-        let line: String = (0..128)
-            .map(|c| char::from_u32(common::BIG_FNT_CODE + as_u32(i * 16 + c)).unwrap())
-            .collect();
-        format!(
-            r#"{{"id": "t{i}", "font": "{}", "size": 8, "constantText": "{line}"}}"#,
-            i % MAX_FONTS
-        )
-    }));
-    let dsts = join(
-        (0..MAX_TEXT_ELEMENTS)
-            .map(|i| format!(r#"{{"id": "t{i}", "dst": [{{"w": 1000, "h": 8}}]}}"#)),
-    );
-    write(
-        root,
-        "s.json",
-        common::hd(&format!(
-            r#""font": [{fonts}], "text": [{texts}], "destination": [{dsts}]"#
-        ))
-        .as_bytes(),
-    );
+    common::bitmap_fonts(root, usize::try_from(MAX_FNT_BYTES).unwrap());
 }
 
 fn check_f6(_: &Header, i: Imported) {

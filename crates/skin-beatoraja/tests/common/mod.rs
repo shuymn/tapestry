@@ -137,6 +137,45 @@ pub fn big_fnt(root: &Path, name: &str, glyphs: usize, kernings: usize, bytes: u
     write(root, name, s.as_bytes());
 }
 
+/// `s.json` of 64 texts of 128 glyphs in 16 [`big_fnt`] fonts `b<n>.fnt`,
+/// each padded to `bytes`: the font slots and text elements full, the
+/// fonts at the page cap and, with their synthesised spaces, together at
+/// the sheet's glyph and kerning caps.
+pub fn bitmap_fonts(root: &Path, bytes: usize) {
+    use skin_model::{MAX_FONTS, MAX_SHEET_GLYPHS, MAX_SHEET_KERNINGS, MAX_TEXT_ELEMENTS};
+    for i in 0..MAX_FONTS {
+        big_fnt(
+            root,
+            &format!("b{i}.fnt"),
+            MAX_SHEET_GLYPHS / MAX_FONTS - 1,
+            MAX_SHEET_KERNINGS / MAX_FONTS,
+            bytes,
+        );
+    }
+    let fonts = join((0..MAX_FONTS).map(|i| format!(r#"{{"id": "{i}", "path": "b{i}.fnt"}}"#)));
+    let texts = join((0..MAX_TEXT_ELEMENTS).map(|i| {
+        let line: String = (0..128)
+            .map(|c| char::from_u32(BIG_FNT_CODE + u32::try_from(i * 16 + c).unwrap()).unwrap())
+            .collect();
+        format!(
+            r#"{{"id": "t{i}", "font": "{}", "size": 8, "constantText": "{line}"}}"#,
+            i % MAX_FONTS
+        )
+    }));
+    let dsts = join(
+        (0..MAX_TEXT_ELEMENTS)
+            .map(|i| format!(r#"{{"id": "t{i}", "dst": [{{"w": 1000, "h": 8}}]}}"#)),
+    );
+    write(
+        root,
+        "s.json",
+        hd(&format!(
+            r#""font": [{fonts}], "text": [{texts}], "destination": [{dsts}]"#
+        ))
+        .as_bytes(),
+    );
+}
+
 /// A 1920×1080 play skin whose fields are `body`.
 pub fn hd(body: &str) -> String {
     format!("{{\"type\": 0, \"w\": 1920, \"h\": 1080, {body}}}")
