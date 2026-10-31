@@ -291,6 +291,24 @@ pub(crate) struct Text {
 }
 
 impl Text {
+    /// A line `width_em` wide in a box `w` wide at size `h`: its squeeze
+    /// `sx`, its drawn width `d` and its offset from the box's left.
+    fn fit(&self, width_em: f32, w: f32, h: f32) -> (f32, f32, f32) {
+        let tw = width_em * h;
+        let sx = if self.overflow == Overflow::Shrink && tw > w {
+            w / tw
+        } else {
+            1.0
+        };
+        let d = tw * sx;
+        let off = match self.align {
+            Align::Left => 0.0,
+            Align::Center => (w - d) / 2.0,
+            Align::Right => w - d,
+        };
+        (sx, d, off)
+    }
+
     /// Pushes `image` laid out in the box `[x, y, w, h]`; nothing when the
     /// line is drawn 0 wide. Allocates nothing.
     pub(crate) fn draw(
@@ -300,21 +318,10 @@ impl Text {
         brush: &Brush,
         out: &mut QuadBatch,
     ) {
-        let tw = image.width * h;
-        let sx = if self.overflow == Overflow::Shrink && tw > w {
-            w / tw
-        } else {
-            1.0
-        };
-        let d = tw * sx;
+        let (sx, d, off) = self.fit(image.width, w, h);
         if d <= 0.0 {
             return;
         }
-        let off = match self.align {
-            Align::Left => 0.0,
-            Align::Center => (w - d) / 2.0,
-            Align::Right => w - d,
-        };
         let [ix, iy, iw, ih] = image.ink;
         let rect = [
             x + off + (ix - image.left) * h * sx,
@@ -344,18 +351,7 @@ impl Text {
         uvs: &UvTable,
         out: &mut QuadBatch,
     ) {
-        let tw = line.width_em * h;
-        let sx = if self.overflow == Overflow::Shrink && tw > w {
-            w / tw
-        } else {
-            1.0
-        };
-        let d = tw * sx;
-        let off = match self.align {
-            Align::Left => 0.0,
-            Align::Center => (w - d) / 2.0,
-            Align::Right => w - d,
-        };
+        let (sx, _, off) = self.fit(line.width_em, w, h);
         let [fx, fy] = brush.pivot;
         let pivot = [x + fx * w, y + fy * h];
         for q in &line.quads {
