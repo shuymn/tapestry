@@ -22,6 +22,8 @@ pub(crate) const KNOWN_BOOLEAN_IDS: &[(i32, &str)] = &[
     (23, "select_panel3"),
     (32, "autoplay_off"),
     (33, "autoplay_on"),
+    (40, "bgaoff"),
+    (41, "bgaon"),
     (42, "gauge_groove"),
     (43, "gauge_hard"),
     (50, "ir_offline"),
@@ -341,9 +343,29 @@ pub(crate) fn named(name: &str) -> Option<Cond> {
 mod tests {
     use super::*;
 
+    /// Every id of the factory's `BooleanType` entries at `0.8.9`, the
+    /// `SkinProperty` constants resolved, written out apart from the
+    /// table so an omission fails.
+    const UPSTREAM_IDS: [i32; 216] = [
+        1, 2, 3, 5, 21, 22, 23, 32, 33, 40, 41, 42, 43, 50, 51, 60, 61, 62, 80, 81, 82, 84, 90, 91,
+        100, 101, 102, 103, 104, 105, 118, 119, 121, 125, 126, 127, 128, 129, 130, 131, 150, 151,
+        152, 153, 154, 155, 160, 161, 162, 163, 164, 170, 171, 172, 173, 174, 175, 176, 177, 178,
+        179, 180, 181, 182, 183, 184, 190, 191, 192, 193, 194, 195, 196, 197, 198, 200, 201, 202,
+        203, 204, 205, 206, 207, 220, 221, 222, 223, 224, 225, 226, 227, 230, 231, 232, 233, 234,
+        235, 236, 237, 238, 239, 240, 241, 261, 270, 271, 272, 273, 280, 281, 282, 283, 289, 290,
+        300, 301, 302, 303, 304, 305, 306, 307, 320, 321, 322, 323, 324, 325, 326, 327, 330, 331,
+        332, 335, 336, 340, 341, 342, 343, 344, 345, 346, 347, 352, 353, 354, 361, 400, 603, 604,
+        606, 608, 624, 625, 1002, 1003, 1004, 1005, 1006, 1007, 1008, 1010, 1011, 1012, 1013, 1014,
+        1015, 1016, 1017, 1030, 1031, 1046, 1080, 1100, 1101, 1102, 1103, 1104, 1128, 1129, 1130,
+        1131, 1160, 1161, 1177, 1196, 1197, 1198, 1199, 1200, 1201, 1202, 1203, 1204, 1205, 1206,
+        1207, 1208, 1240, 1242, 1243, 1262, 1263, 1330, 1331, 1332, 1335, 1336, 1362, 1363, 2241,
+        2242, 2243, 2244, 2245, 2246,
+    ];
+
     #[test]
     fn the_names_table_is_pinned() {
-        assert_eq!(KNOWN_BOOLEAN_IDS.len(), 214);
+        let ids: Vec<i32> = KNOWN_BOOLEAN_IDS.iter().map(|&(id, _)| id).collect();
+        assert_eq!(ids, UPSTREAM_IDS);
         assert!(KNOWN_BOOLEAN_IDS.windows(2).all(|w| w[0].0 < w[1].0));
         for (id, name) in [
             (230, "gauge_1p_0_10"),
@@ -382,5 +404,10 @@ mod tests {
         assert_eq!(numeric(-900, &declared, &on), Cond::Fold(false));
         assert_eq!(numeric(901, &declared, &on), Cond::Undefined(901));
         assert_eq!(numeric(202, &declared, &on), Cond::Unsupported(202));
+        // The BGA built-ins win over items declared with their numbers.
+        let declared = BTreeSet::from([40, 41]);
+        assert_eq!(numeric(40, &declared, &declared), Cond::Unsupported(40));
+        assert_eq!(numeric(-41, &declared, &declared), Cond::Unsupported(-41));
+        assert_eq!(named("!bgaon"), Some(Cond::Unsupported(-41)));
     }
 }
