@@ -283,6 +283,8 @@ struct Headless {
     restore_fails: usize,
     /// Rounds opened, by their restore point.
     restores: Vec<TimeUs>,
+    /// Whether each load was a practice's Start, as `loads`.
+    practiced: Vec<bool>,
     /// Each shelf state selection was shown, with its clock time: the
     /// revision and the chosen file's error, or why it cannot open.
     presets: Vec<(i64, PresetsSeen)>,
@@ -371,6 +373,7 @@ impl Headless {
             practice_shown: None,
             restore_fails: 0,
             restores: Vec::new(),
+            practiced: Vec::new(),
         }
     }
 
@@ -723,6 +726,7 @@ impl AppRig for Headless {
         }
         self.seen.push(Seen::Load(i));
         self.loads.push((i, Vec::new()));
+        self.practiced.push(loaded.practice().is_some());
         Ok(())
     }
 
@@ -1843,6 +1847,26 @@ fn act() -> impl Strategy<Value = Act> {
     ]
 }
 
+/// One action, or a practice: P on a chart (the practice chart among
+/// them), Start at 100 %, the quit key some time in, and Back on the page.
+fn step() -> impl Strategy<Value = Vec<(i64, Act)>> {
+    let practice =
+        (0..3_000_i64, 0..=P, 0..4_000_i64, 0..3_000_i64).prop_map(|(after, chart, quit, back)| {
+            let mut acts = vec![(after, Act::Practice(chart))];
+            acts.extend(to_start(0));
+            acts.extend([
+                (10, Act::Page(PracticeInput::Confirm)),
+                (quit, Act::Quit),
+                (back, Act::Page(PracticeInput::Back)),
+            ]);
+            acts
+        });
+    prop_oneof![
+        8 => (0..3_000_i64, act()).prop_map(|a| vec![a]),
+        2 => practice,
+    ]
+}
+
 fn refusal() -> impl Strategy<Value = Refusal> {
     prop_oneof![
         Just(Refusal::Missing),
@@ -1855,9 +1879,10 @@ fn refusal() -> impl Strategy<Value = Refusal> {
 proptest! {
     #![proptest_config(ProptestConfig { cases: 64, ..ProptestConfig::default() })]
 
-    /// Random selections, retries, quits, backs, preset switches and
-    /// closes at random times, over two built charts and one refused
-    /// chart: the run ends cleanly; every play that finalized anything has
+    /// Random selections, retries, quits, backs, preset switches, closes
+    /// and practices (P, Start, the quit key, Back) at random times, over
+    /// two built charts, one refused chart and the practice chart: the run
+    /// ends cleanly; every play that finalized anything has
     /// a saved record that re-evaluates equal to live; attempts count from
     /// 1 per chart; every play is reserved at its countdown's start, before
     /// any wait and with nothing allocated after its handoff; and every
@@ -1866,9 +1891,11 @@ proptest! {
     fn any_command_sequence_ends_cleanly(
         refusal in refusal(),
         first in 0..3_usize,
-        rest in proptest::collection::vec((0..3_000_i64, act()), 0..20),
+        rest in proptest::collection::vec(step(), 0..20),
     ) {
-        let acts = std::iter::once((0, Act::Choose(first))).chain(rest).collect();
+        let acts = std::iter::once((0, Act::Choose(first)))
+            .chain(rest.into_iter().flatten())
+            .collect();
         counting::track(true);
         counting::thread_self_check();
         counting::track(false);
@@ -1876,8 +1903,15 @@ proptest! {
         prop_assert!(ran.is_ok(), "{:?}", ran);
         prop_assert!(rig.quitting);
         prop_assert!(rig.violations.is_empty(), "{:?}", rig.violations);
-        for (chart, plays) in &rig.loads {
-            let expected: Vec<u32> = (1..).take(plays.len()).collect();
+        // A chart's plays count from 1; a practice's Starts go on counting
+        // the plays of its one load.
+        for ((chart, plays), &practiced) in rig.loads.iter().zip(&rig.practiced) {
+            let from = if practiced {
+                plays.first().map_or(1, |p| p.attempt)
+            } else {
+                1
+            };
+            let expected: Vec<u32> = (from..).take(plays.len()).collect();
             prop_assert_eq!(attempts(plays), expected, "chart {}", chart);
         }
         // Every play handed over was closed and reported, and each that
