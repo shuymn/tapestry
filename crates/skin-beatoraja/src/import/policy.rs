@@ -30,8 +30,8 @@
 //! 11. The scratch side of an imported skin: the side the skin draws it
 //!     on, given to the caller as `Imported::scratch` (a setting comes
 //!     with S11).
-//! 12. The lane approximations (D9, [`LaneApprox`]), each accepted by
-//!     default ([`lane_approx_accepted`]): a notes and long-note bodies
+//! 12. The lane approximations (D9, [`super::report::LaneApprox`]), each
+//!     accepted by the owner: a notes and long-note bodies
 //!     stop at the top of the lanes; b an unhit tap keeps falling below
 //!     the line until it is judged a miss or leaves the lanes; c a tap hit
 //!     early disappears at once; d a hit mine disappears when hit (an unhit
@@ -54,7 +54,7 @@ use std::fmt;
 
 use skin_model::End;
 
-use super::report::{LaneApprox, NoteKind, Notes, Severity, Span};
+use super::report::{NoteKind, Notes, Severity, Span};
 use crate::error::ImportError;
 use crate::tree::Arena;
 
@@ -124,23 +124,4 @@ pub(crate) fn unsupported(
 /// first at 0, a perpetual end, and an image cycle absent or on a timer.
 pub(crate) fn untimed_ok(identical: bool, first_at_zero: bool, end: End, cycle_ok: bool) -> bool {
     identical && first_at_zero && matches!(end, End::Hold | End::Loop { .. }) && cycle_ok
-}
-
-/// Whether the owner accepts lane approximation `a` (decision 12): all
-/// are accepted.
-pub(crate) fn lane_approx_accepted(a: LaneApprox) -> bool {
-    match a {
-        LaneApprox::TopCrop
-        | LaneApprox::LateTaps
-        | LaneApprox::EarlyTaps
-        | LaneApprox::Mines
-        | LaneApprox::Dst2
-        | LaneApprox::Expansion
-        | LaneApprox::LnTail
-        | LaneApprox::LnBody
-        | LaneApprox::CoverAbove
-        | LaneApprox::BarLine
-        | LaneApprox::CoverOrder
-        | LaneApprox::LiftStretch => true,
-    }
 }

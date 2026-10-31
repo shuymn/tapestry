@@ -226,30 +226,21 @@ impl Cx<'_> {
         Ok(Some(out))
     }
 
-    /// Notes lane approximation `a` at `at` for `part`, or refuses it
-    /// when the owner does not accept it.
+    /// Notes lane approximation `a` at `at`, which the owner accepts
+    /// (decision 12); `part` is what a rejected one would refuse.
+    #[cfg_attr(
+        not(test),
+        expect(unused_variables, reason = "only a test rejects an approximation")
+    )]
     pub(in super::super) fn lane_approx(
         &mut self,
         at: Span,
         part: CriticalPart,
         a: LaneApprox,
     ) -> Result<(), ImportError> {
+        let kind = NoteKind::Deviation(DeviationId::D9(a));
         #[cfg(test)]
         if REJECTED.with(std::cell::Cell::get) == Some(a) {
-            return self.lane_approx_with(at, part, a, |_| false);
-        }
-        self.lane_approx_with(at, part, a, policy::lane_approx_accepted)
-    }
-
-    fn lane_approx_with(
-        &mut self,
-        at: Span,
-        part: CriticalPart,
-        a: LaneApprox,
-        accepted: fn(LaneApprox) -> bool,
-    ) -> Result<(), ImportError> {
-        let kind = NoteKind::Deviation(DeviationId::D9(a));
-        if !accepted(a) {
             return Err(ImportError::Critical {
                 at: self.loc(at),
                 part,
