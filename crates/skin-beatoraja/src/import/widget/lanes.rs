@@ -292,7 +292,7 @@ impl Cx<'_> {
 
         // Preconditions (`SkinNote.java:27-40`, `JsonPlaySkinObjectLoader.
         // java:50-93`): eight notes and lanes, long-note arrays at least
-        // `lnend`'s length, eight mines.
+        // `lnend`'s length; every lane's mine resolves with the other parts.
         let lane_rects = self.lane_rects(rec)?;
         if note.len() != LANES || lane_rects.len() != LANES {
             return refuse(self, "dst");
@@ -317,9 +317,6 @@ impl Cx<'_> {
             || hcn_lists.iter().any(|&i| hcn_len(i) < tail)
         {
             return refuse(self, "lnend");
-        }
-        if mine.len() < LANES {
-            return refuse(self, "mine");
         }
         let ys: Vec<i32> = lane_rects.iter().map(|(_, r)| r[1]).collect();
         if ys.windows(2).any(|w| matches!(w, [a, b] if a != b)) {
@@ -693,7 +690,7 @@ impl Cx<'_> {
     }
 
     /// Whether an image listing offset 4 cannot move over the lanes
-    /// (design.md, the S6b-2 offset-4 rule): no rotation of any kind, the
+    /// (stage3.md, the SUDDEN+ mapping): no rotation of any kind, the
     /// identity stretch, and every key's drawn x edges, with the
     /// horizontal user offsets, outside the lanes' rounded span. Offsets
     /// 3, 4 and 5 move only y and alpha (`play/LaneRenderer.java:332-345`)
