@@ -18,6 +18,7 @@ use crate::expr::{State, TIMER_OFF};
 use crate::layout::Layout;
 use crate::widget::gauge::GaugeLook;
 use crate::widget::lanes::{LaneView, Side};
+use crate::widget::text::TextTable;
 
 /// What the skin knows of one of the preset's gauges, in the preset's
 /// order ([`GaugeDesc::from_rule`]).
@@ -121,6 +122,8 @@ pub struct Play {
     notes: Option<Box<Notes>>,
     /// The context's gauge descriptors.
     gauges: Box<[GaugeDesc]>,
+    /// The attempt's rasterized lines, empty until one is attached.
+    text: TextTable,
 }
 
 /// The chart's notes and bar lines, kept for a skin with lanes.
@@ -204,6 +207,7 @@ impl Play {
             scratch: ctx.scratch,
             notes,
             gauges: ctx.gauges.into(),
+            text: TextTable::default(),
         })
     }
 
@@ -229,6 +233,15 @@ impl Play {
             fields: &self.fields,
             timers: &self.ms,
         }
+    }
+
+    /// The attempt's rasterized lines.
+    pub(crate) fn text(&self) -> &TextTable {
+        &self.text
+    }
+
+    pub(crate) fn set_text(&mut self, table: TextTable) {
+        self.text = table;
     }
 
     /// The descriptor of the context's gauge `i`.

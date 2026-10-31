@@ -12,24 +12,29 @@
 //! into runs wherever the blend or the clip changes.
 //!
 //! A [`Sheet`] holds a skin's files and images: rectangles of the files cut
-//! into grids of frames, each image with its own frame cycle and filter.
-//! Loading it checks the counts, confines the paths to the skin folder and
-//! reads only the headers. [`Sheet::atlas`] decodes the files of one
-//! [`Variant`] (1x or @2x) into texture-array [`Page`]s with box-filtered
-//! mips and a [`UvTable`] that finds each frame in them.
+//! into grids of frames, each image with its own frame cycle and filter,
+//! and its font files. Loading it checks the counts, confines the paths to
+//! the skin folder and reads only the headers and the fonts' first bytes.
+//! [`Sheet::atlas`] decodes the files of one [`Variant`] (1x or @2x) into
+//! texture-array [`Page`]s with box-filtered mips and a [`UvTable`] that
+//! finds each frame in them.
 //!
 //! A [`Skin`] holds elements in draw order, each an image, a number, a
-//! gauge, a judgment display or the lanes widget on a keyframe [`Track`]
-//! on a timer, placed in one of seven [`Region`]s, and `when` timers. The
-//! target size gives the [`Canvas`]; the player's [`Layout`] moves, scales
-//! and hides regions within the translation clamp, and the scratch side
-//! and lane width re-lay the lanes ([`Skin::placement`]). [`Skin::prepare`] makes one attempt's [`Play`];
+//! gauge, a judgment display, a line of text or the lanes widget on a
+//! keyframe [`Track`] on a timer, placed in one of seven [`Region`]s, and
+//! `when` timers. The target size gives the [`Canvas`]; the player's
+//! [`Layout`] moves, scales and hides regions within the translation
+//! clamp, and the scratch side and lane width re-lay the lanes
+//! ([`Skin::placement`]). [`Skin::prepare`] makes one attempt's [`Play`];
+//! [`Skin::text_requests`] lists the lines of text to rasterize, and
+//! [`Skin::attach_text`] hands the play their images in a [`TextTable`].
 //! [`Skin::build`] runs each frame's drained effects through its reducer,
 //! reads the play view's snapshot into the [`PLAY`] schema's fields,
 //! starts the timers and pushes each drawn element's quads: an image's
 //! current frame from the uv table, turned about its pivot; a number's
 //! glyph cells; a gauge's lit and unlit segments; the judgment's grade
-//! and combo; or the lanes' notes, bar lines, judgment line and covers.
+//! and combo; a text's line; or the lanes' notes, bar lines, judgment line
+//! and covers.
 //!
 //! Expressions use integers only; floats appear only in a quad's geometry,
 //! after evaluation. The cast lints below reject `as` casts that may
@@ -67,6 +72,7 @@ pub use expr::{
     MAX_SOURCE_BYTES, MAX_STACK, OptionDef, Program, Scope, SkinOps, Span, State, TIMER_OFF,
     compile,
 };
+pub use image::font::{FontDef, FontError, MAX_FONT_BYTES, MAX_FONTS, MAX_TOTAL_FONT_BYTES};
 pub use image::{
     CycleDef, FileAt, FileDef, HEADER_BYTES, ImageDef, ImageError, MAX_FILE_BYTES, MAX_FILES,
     MAX_IMAGE_FRAMES, MAX_IMAGE_TEXELS, MAX_IMAGES, MAX_PATH_BYTES, MAX_SIDE, MAX_SKIN_FRAMES,
@@ -102,3 +108,7 @@ pub use widget::lanes::{
     MAX_COVERED, Side,
 };
 pub use widget::scroll::Scale;
+pub use widget::text::{
+    ChartText, FontRef, MAX_TEXT_BYTES, MAX_TEXT_ELEMENTS, MAX_TEXT_EM, MAX_TEXT_EM_PX, Overflow,
+    TextDef, TextError, TextField, TextImage, TextRequest, TextTable, TextTableError, TextValue,
+};

@@ -109,6 +109,7 @@ fn worst() -> skin_model::Skin {
                 },
             )],
             judges: vec![j],
+            texts: Vec::new(),
         },
     )
     .unwrap()
