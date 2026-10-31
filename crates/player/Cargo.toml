@@ -47,8 +47,14 @@ winit.workspace = true
 
 [dev-dependencies]
 bms-parser.workspace = true
+rusqlite.workspace = true
 tempfile.workspace = true
 toml.workspace = true
 
 [lints]
 workspace = true
+
+# The bests tests include the library's shared test fixture by path, which
+# opens the database with rusqlite; cargo-machete does not follow #[path].
+[package.metadata.cargo-machete]
+ignored = ["rusqlite"]

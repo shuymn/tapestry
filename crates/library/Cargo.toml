@@ -1,15 +1,19 @@
 [package]
 name = "library"
 version = "0.0.0"
-description = "The library database: chart headers in SQLite, kept current by a background scan."
+description = "The library database: chart headers and personal bests in SQLite, kept current by a background scan."
 edition.workspace = true
 license = "GPL-3.0-or-later"
 repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+bms-model.workspace = true
 bms-parser.workspace = true
+eval.workspace = true
 md-5.workspace = true
+replay.workspace = true
+rules.workspace = true
 rusqlite.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
@@ -19,6 +23,7 @@ unicode-normalization.workspace = true
 criterion.workspace = true
 encoding_rs.workspace = true
 tempfile.workspace = true
+zstd.workspace = true
 
 [lints]
 workspace = true

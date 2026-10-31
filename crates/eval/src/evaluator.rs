@@ -15,9 +15,33 @@ use rules::{
 };
 
 use crate::EvalError;
+use crate::batch::{GaugePoint, GaugeResult};
 use crate::convert::{ConversionState, LaneEdge};
 use crate::gauge::{Cause, GaugeState, Gauges};
-use crate::input::{DeviceProfile, InputStart, PhysicalInputEvent, Section, evaluation_time};
+use crate::input::{
+    ControlId, DeviceProfile, InputStart, PhysicalInputEvent, Section, SourceId, evaluation_time,
+};
+
+/// The bytes of one event of the evaluator's output.
+pub const EVENT_BYTES: usize = size_of::<JudgeEvent>();
+/// The bytes of one recorded input.
+pub const INPUT_BYTES: usize = size_of::<PhysicalInputEvent>();
+/// The bytes of one control of a held-input snapshot.
+pub const HELD_BYTES: usize = size_of::<(SourceId, ControlId, i32)>();
+/// The bytes of one slot of the evaluator's input ring.
+pub const RING_SLOT_BYTES: usize = size_of::<(TimeUs, PhysicalInputEvent)>();
+/// The bytes the evaluator's own tables may take per chart object (its
+/// judgeable notes, their flags and its deadlines): an allowance, counted
+/// once for every object of the chart.
+pub const TABLE_BYTES_PER_OBJECT: usize = 64;
+/// The allowance per gauge for its state, its `#TOTAL` correction and the
+/// preset's validation, beside its history and its result.
+pub const GAUGE_BYTES: usize = 256;
+/// The allowance for a batch evaluation's small fixed parts: the
+/// conversion state, the lane tables and each source's staging.
+pub const BATCH_SMALL_BYTES: usize = 64 << 10;
+/// The least capacity a growing vector of gauge points takes.
+const MIN_HISTORY_CAPACITY: usize = 4;
 
 /// One output of the evaluator.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -636,18 +660,70 @@ impl<'a> Evaluator<'a> {
     #[must_use]
     pub fn max_events(&self, inputs: usize) -> usize {
         let g = self.gauges.states().len();
-        let notes: usize = self.lanes.iter().map(|l| l.targets.len()).sum();
+        let (notes, mines) = self.targets_and_mines();
+        notes
+            .saturating_mul(3 + g)
+            .saturating_add(inputs.saturating_mul(2 + g))
+            .saturating_add(mines.saturating_mul(1 + g))
+            .saturating_add(1)
+    }
+
+    /// The judgeable notes and the mines evaluated.
+    fn targets_and_mines(&self) -> (usize, usize) {
+        let notes = self.lanes.iter().map(|l| l.targets.len()).sum();
         let mines = self
             .lanes
             .iter()
             .flat_map(|l| &l.deadlines)
             .filter(|d| d.kind == DeadlineKind::Mine)
             .count();
-        notes
-            .saturating_mul(3 + g)
-            .saturating_add(inputs.saturating_mul(2 + g))
-            .saturating_add(mines.saturating_mul(1 + g))
-            .saturating_add(1)
+        (notes, mines)
+    }
+
+    /// The allowance for the evaluator's own tables:
+    /// [`TABLE_BYTES_PER_OBJECT`] per object of every lane of the chart, a
+    /// section's evaluation included.
+    #[must_use]
+    pub fn table_bytes(&self) -> usize {
+        let objects: usize = self.chart.lanes.iter().map(Vec::len).sum();
+        objects.saturating_mul(TABLE_BYTES_PER_OBJECT)
+    }
+
+    /// The most bytes [`evaluate`](crate::evaluate) holds at its peak for a
+    /// record of `inputs` inputs and `held` controls held at its start, under
+    /// this evaluator's chart and preset,
+    /// the caller's record included (design.md "Recording Capacity"): the
+    /// input four times (the record, the copy evaluated, the staging by
+    /// source and the merge) and the input ring; the event output at
+    /// [`max_events`](Self::max_events); each gauge's history at twice the
+    /// most points it can hold (one per judgment, empty POOR and mine hit),
+    /// never under a vector's least capacity, with its vector, its result
+    /// and [`GAUGE_BYTES`], and one history more for the copy a growth
+    /// makes; the [tables](Self::table_bytes); [`BATCH_SMALL_BYTES`]; and
+    /// the held-input snapshot twice (the record's and the copy evaluated).
+    /// Plain arithmetic, saturating.
+    #[must_use]
+    pub fn batch_bytes(&self, inputs: usize, held: usize) -> usize {
+        let g = self.gauges.states().len();
+        let (notes, mines) = self.targets_and_mines();
+        let points = notes.saturating_add(inputs).saturating_add(mines);
+        let history = points
+            .saturating_mul(2)
+            .max(MIN_HISTORY_CAPACITY)
+            .saturating_mul(size_of::<GaugePoint>());
+        let per_gauge = history
+            .saturating_add(size_of::<Vec<GaugePoint>>())
+            .saturating_add(size_of::<GaugeResult>())
+            .saturating_add(GAUGE_BYTES);
+        let snapshot = held.saturating_mul(2 * HELD_BYTES);
+        inputs
+            .saturating_mul(4 * INPUT_BYTES + RING_SLOT_BYTES)
+            .saturating_add(self.max_events(inputs).saturating_mul(EVENT_BYTES))
+            .saturating_add(g.saturating_mul(per_gauge))
+            .saturating_add(history)
+            .saturating_add(self.table_bytes())
+            .saturating_add(BATCH_SMALL_BYTES)
+            .saturating_add(snapshot)
     }
 
     /// Appends an input, in the order [`merge`](crate::merge) produced.
