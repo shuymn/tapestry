@@ -197,7 +197,6 @@ struct Common {
     filter: Filter,
     pivot: Anchor,
     offset: Offset,
-    angle: i64,
     stretch: Stretch,
     stretch_mode: i32,
     untimed: bool,
@@ -801,12 +800,11 @@ impl<'d> Cx<'d> {
             Some(self.compile(&src, Ty::Bool, at)?)
         };
 
-        let mut angle = offset_angle(&offset);
         if text {
-            if text_angle || angle != 0 {
+            if text_angle || offset.r != 0 {
                 self.ignored(at, NoteKind::Ignored { field: "angle" });
             }
-            angle = 0;
+            offset.r = 0;
         }
         Ok(Some(Common {
             role,
@@ -822,7 +820,6 @@ impl<'d> Cx<'d> {
             },
             pivot: pivot(dst.center),
             offset,
-            angle,
             stretch: Stretch::of(dst.stretch),
             stretch_mode: dst.stretch,
             untimed,
@@ -1081,12 +1078,8 @@ impl Common {
     /// Key `k`'s model angle: the source's plus the offsets, negated
     /// for the model, which turns clockwise.
     fn angle_of(&self, k: &SrcKey) -> i64 {
-        -(i64::from(k.angle) + self.angle)
+        -(i64::from(k.angle) + self.offset.r)
     }
-}
-
-fn offset_angle(o: &Offset) -> i64 {
-    o.r
 }
 
 /// The pivot of `center` (`SkinObject.java:80-81, 228-233`): honoured
