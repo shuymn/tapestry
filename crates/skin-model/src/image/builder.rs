@@ -21,9 +21,9 @@ use super::fnt::{
 use super::font::{self, FontDef, FontError, MAX_FONTS, MAX_TOTAL_FONT_BYTES};
 use super::path::{self, PathError, Root};
 use super::{
-    Cell, File, FileAt, FileDef, Image, ImageDef, ImageError, MAX_FILES, MAX_IMAGES, NEXT_SHEET,
-    Sheet, Total, Version, add_frames, check_cycle, checked_header, cut, image_frames, push_frames,
-    read_file, renumber, resolve_file, texels,
+    Cell, File, FileAt, FileDef, Image, ImageDef, ImageError, MAX_FILE_BYTES, MAX_FILES,
+    MAX_IMAGES, NEXT_SHEET, Sheet, Total, Version, add_frames, check_cycle, checked_header, cut,
+    decode, image_frames, push_frames, read_file, renumber, resolve_file, texels,
 };
 use crate::quad::Filter;
 use crate::widget::text::MAX_TEXT_ELEMENTS;
@@ -360,8 +360,10 @@ impl SheetBuilder {
     /// more than the sheet has left of [`MAX_SHEET_GLYPHS`] and
     /// [`MAX_SHEET_KERNINGS`]. Then the pages, all or nothing: each page's
     /// attempt, metadata, byte totals, image and frame; then each header
-    /// and the texel totals; then every glyph inside its page. Each page
-    /// becomes a whole-file image of one frame, filtered linearly.
+    /// and the texel totals; then every glyph inside its page; then each
+    /// page decoded and dropped, one at a time, so a corrupt page fails
+    /// this font rather than the atlas. Each page becomes a whole-file
+    /// image of one frame, filtered linearly.
     ///
     /// On any failure the builder is as it was, but for the attempts and
     /// the font bytes spent.
@@ -480,6 +482,24 @@ impl SheetBuilder {
             }
         }
 
+        // Every page decodes, one at a time, so a corrupt page fails this
+        // font here rather than the atlas later.
+        for (p, (resolved, &d)) in paths.iter().zip(&dims).enumerate() {
+            let at = FileAt {
+                file: first + p,
+                hi: false,
+            };
+            let (mut handle, len) =
+                path::open(resolved).map_err(|e| page_error(p, ImageError::path(at, e)))?;
+            let (bytes, more) = decode::read_capped(&mut handle, len, MAX_FILE_BYTES)
+                .map_err(|source| page_error(p, ImageError::Io { at, source }))?;
+            drop(handle);
+            if more {
+                return Err(page_error(p, ImageError::FileTooLarge { at }));
+            }
+            decode::decode(bytes, d).map_err(|e| page_error(p, ImageError::decode(at, e)))?;
+        }
+
         // Kept.
         let mut pages = Vec::with_capacity(dims.len());
         for (name, d) in file.pages().iter().zip(dims) {
@@ -561,6 +581,12 @@ impl SheetBuilder {
         let chain = std::iter::once(primary).chain(fallbacks.iter().copied());
         self.bitmap_fonts.push(chain.collect());
         Ok(index)
+    }
+
+    /// The files admitted: image files and bitmap font pages.
+    #[must_use]
+    pub fn file_count(&self) -> usize {
+        self.files.len()
     }
 
     /// The glyphs and kerning pairs the admitted `.fnt` files keep.
