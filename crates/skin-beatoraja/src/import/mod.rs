@@ -610,7 +610,7 @@ impl<'d> Cx<'d> {
         };
         // A negative number is a player-drawn image (`JSONSkinLoader.java:
         // 316-339`).
-        if ops::java_int(&id).is_some_and(|n| n < 0) {
+        if id.parse::<i32>().is_ok_and(|n| n < 0) {
             self.drop_el(
                 Role::Decorative,
                 at,
@@ -1173,7 +1173,7 @@ impl<'d> Cx<'d> {
             regions: REGIONS,
             whens: std::mem::take(&mut self.whens),
             sheet,
-            lanes: self.lanes.as_ref().map(widget::lanes::LaneState::def),
+            lanes: self.lanes.as_ref().map(|l| l.def),
             elements: std::mem::take(&mut self.elements),
             widgets: std::mem::take(&mut self.widgets),
         };

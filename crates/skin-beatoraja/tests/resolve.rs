@@ -89,6 +89,25 @@ fn conditions_take_four_forms() {
 }
 
 #[test]
+fn an_option_number_without_a_negation_refuses() {
+    for c in ["-2147483648", "[-2147483648, 1]", "[[1, -2147483648]]"] {
+        let d = skin(&[(
+            "s.json",
+            &play(&format!(r#""property": [{{"if": {c}, "value": {{}}}}]"#)),
+        )]);
+        assert!(
+            matches!(header(&d), Err(ImportError::Range { field: "if", .. })),
+            "{c}"
+        );
+    }
+    let d = skin(&[(
+        "s.json",
+        &play(r#""property": [{"if": -2147483647, "value": {"name": "x"}}]"#),
+    )]);
+    assert!(header(&d).is_ok());
+}
+
+#[test]
 fn a_conditional_item_adds_its_value_then_its_values() {
     let body = r#""property": [
         {"name": "first"},
