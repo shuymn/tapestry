@@ -4,7 +4,7 @@
 [package]
 name = "fuzz"
 version = "0.0.0"
-description = "Fuzz targets: chart loading, input log decoding, Raw Input packet decoding, canonical preset decoding and skin definition reading."
+description = "Fuzz targets: chart loading, input log decoding, Raw Input packet decoding, canonical preset decoding and skin definition reading and import."
 edition = "2024"
 # GPL because it links `input` (design.md "Licenses"). Tooling, never shipped.
 license = "GPL-3.0-or-later"
@@ -22,8 +22,10 @@ input = { path = "../crates/input" }
 replay = { path = "../crates/replay" }
 rules = { path = "../crates/rules" }
 skin-beatoraja = { path = "../crates/skin-beatoraja" }
+skin-model = { path = "../crates/skin-model" }
 libfuzzer-sys = "0.4.13"
 # The same versions as the workspace's (root Cargo.toml).
+png = "0.18.1"
 tempfile = "3.27.0"
 zstd = { version = "0.14.3", default-features = false }
 

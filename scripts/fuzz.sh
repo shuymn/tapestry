@@ -137,6 +137,7 @@ run_target() {
     -artifact_prefix="$artifacts/" -print_final_stats=1)
   [ -n "$seed" ] && options+=(-seed="$seed")
   [ "$target" = bms_load ] && options+=(-dict=fuzz/dict/bms.dict)
+  [ "$target" = skin_json ] && options+=(-dict=fuzz/dict/skin.dict)
   echo "=== $target: $seconds s"
   status=0
   cargo_fuzz run "$target" "${corpora[@]}" -- "${options[@]}" || status=$?

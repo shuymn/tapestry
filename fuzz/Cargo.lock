@@ -230,9 +230,11 @@ dependencies = [
  "eval",
  "input",
  "libfuzzer-sys",
+ "png",
  "replay",
  "rules",
  "skin-beatoraja",
+ "skin-model",
  "tempfile",
  "zstd",
 ]
@@ -545,6 +547,7 @@ checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
 name = "skin-beatoraja"
 version = "0.0.0"
 dependencies = [
+ "bms-model",
  "skin-model",
 ]
 

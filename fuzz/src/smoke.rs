@@ -6,10 +6,11 @@ use std::path::Path;
 
 use replay::{DecodeError, DecodeLimits, Section};
 use rules::{CanonicalError, RuleError};
-use skin_beatoraja::{Header, ImportError, Syntax};
+use skin_beatoraja::{Header, ImportError, Imported, NoteKind, Rule, Syntax, Usage};
 
 use crate::{
-    RawSummary, bms_load, preset_canonical, raw_input, replay_body, replay_file, seeds, skin_json,
+    RawSummary, bms_load, draw, preset_canonical, raw_input, replay_body, replay_file, seeds,
+    skin_json,
 };
 
 /// Every seed in `expected` is generated, and no other: a deleted seed
@@ -268,10 +269,21 @@ fn skin_json_seeds_resolve_or_fail_as_built() {
             "syntax",
             "missing",
             "configured_fails",
+            "images",
+            "numbers",
+            "text",
+            "tracks",
+            "ops",
+            "offsets",
+            "choices_default",
         ],
     );
+    let imports: Vec<&str> = seeds::skin_imports().iter().map(|(n, _)| *n).collect();
     for (name, data) in seeds {
-        let result = skin_json(&data);
+        if imports.contains(&name) {
+            continue;
+        }
+        let result = skin_json(&data).map(|(h, _)| h);
         match name {
             "options" => {
                 let h = result.unwrap_or_else(|e| panic!("{name}: {e}"));
@@ -328,6 +340,78 @@ fn skin_json_seeds_resolve_or_fail_as_built() {
                 matches!(result, Err(ImportError::Read { .. })),
                 "{name}: {result:?}"
             ),
+            _ => panic!("no expectation for seed {name}"),
+        }
+    }
+}
+
+/// Usage with the given counters, the rest zero.
+fn usage(elements: u32, images: u32, frames: u32, files: u32) -> Usage {
+    Usage {
+        elements,
+        images,
+        frames,
+        files,
+        file_attempts: files,
+        keys: elements,
+        ..Usage::default()
+    }
+}
+
+fn kinds(i: &Imported) -> Vec<NoteKind> {
+    i.report.notes.iter().map(|n| n.kind).collect()
+}
+
+#[test]
+fn skin_import_seeds_import_and_draw_as_built() {
+    for (name, data) in seeds::skin_imports() {
+        let (_, imported) = skin_json(&data).unwrap_or_else(|e| panic!("{name}: {e}"));
+        let i = imported.unwrap_or_else(|e| panic!("{name}: {e}"));
+        let u = i.report.usage;
+        // Quads at 0, 50, 500 and 5,000 ms, each with a perfect judgment.
+        let drawn = draw(&i);
+        match name {
+            "images" => {
+                assert_eq!(u, usage(2, 2, 14, 2), "{name}");
+                assert_eq!(i.skin.sheet().frame_count(), 14, "{name}");
+                assert_eq!(drawn, [2, 2, 2, 2], "{name}");
+            }
+            "numbers" => {
+                assert_eq!(u.elements, 2, "{name}");
+                assert_eq!(u.widget_quads, 4 + 11, "{name}");
+                assert_eq!(i.skin.quad_capacity(), 15, "{name}");
+                // EX score 150: three glyphs; the perfect count 1: one.
+                assert_eq!(drawn, [4, 4, 4, 4], "{name}");
+            }
+            "text" => {
+                assert_eq!((u.texts, u.fonts), (2, 1), "{name}");
+                assert_eq!(
+                    kinds(&i),
+                    [NoteKind::Deviation(skin_beatoraja::DeviationId::D6)]
+                );
+                assert_eq!(drawn, [2, 2, 2, 2], "{name}");
+            }
+            "tracks" => {
+                assert_eq!(u.keys, 3, "{name}");
+                assert_eq!(drawn, [1, 1, 1, 1], "{name}");
+            }
+            "ops" => {
+                assert_eq!(u.elements, 3, "{name}");
+                assert_eq!(kinds(&i), [NoteKind::UndefinedOp(7_777)], "{name}");
+                assert!(i.skin.ops().total() > 0, "{name}");
+                // The perfect shows with the 20 % gauge range.
+                assert_eq!(drawn, [2, 2, 2, 2], "{name}");
+            }
+            "offsets" => {
+                assert_eq!(kinds(&i), [NoteKind::RuntimeOffset(4)], "{name}");
+                assert_eq!(drawn, [1, 1, 1, 1], "{name}");
+            }
+            "choices_default" => {
+                assert_eq!(i.report.files.len(), 1, "{name}");
+                assert_eq!(i.report.files[0].rule, Rule::Default, "{name}");
+                assert!(!i.report.files[0].ambiguous, "{name}");
+                assert_eq!(drawn, [1, 1, 1, 1], "{name}");
+            }
             _ => panic!("no expectation for seed {name}"),
         }
     }

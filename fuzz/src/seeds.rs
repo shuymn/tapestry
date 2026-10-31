@@ -608,7 +608,8 @@ fn skin_input(files: &[&str]) -> Vec<u8> {
 
 /// `skin_json` seeds: headers whose wrapper-enabled fields (options, file
 /// choices, offsets) hold includes, choices and conditional items, the
-/// lenient syntax, then one refused input per kind.
+/// lenient syntax, one refused input per kind, then skins that import
+/// ([`skin_imports`]).
 #[must_use]
 pub fn skin_jsons() -> Vec<Seed> {
     let options = r#"{"type": 0, "name": "seed", "author": "a", "w": 1920, "h": 1080,
@@ -665,6 +666,100 @@ pub fn skin_jsons() -> Vec<Seed> {
             skin_input(&[r#"{"type": 0, "offset": [{"include": "none.json"}]}"#]),
         ),
         ("configured_fails", skin_input(&[&configured_fails, "[]"])),
+    ]
+    .into_iter()
+    .chain(skin_imports())
+    .collect()
+}
+
+/// A 1920×1080 play skin of `body` with the resources of the skin folder
+/// as sources `strip`, `grid` and font `f`.
+fn play_skin(body: &str) -> Vec<u8> {
+    skin_input(&[&format!(
+        r#"{{"type": 0, "w": 1920, "h": 1080,
+            "source": [{{"id": "strip", "path": "strip.png"}}, {{"id": "grid", "path": "grid.png"}}],
+            "font": [{{"id": "f", "path": "font.ttf"}}], {body}}}"#
+    )])
+}
+
+/// `skin_json` seeds that import: images, numbers, text, tracks, ops,
+/// offsets and a default file choice.
+#[must_use]
+pub fn skin_imports() -> Vec<Seed> {
+    vec![
+        (
+            "images",
+            play_skin(
+                r#""image": [
+                    {"id": "s", "src": "strip", "w": 100, "h": 10, "divx": 10, "timer": 46, "cycle": 100},
+                    {"id": "g", "src": "grid", "w": 8, "h": 8, "divx": 2, "divy": 2}],
+                "destination": [
+                    {"id": "s", "timer": 41, "dst": [{"x": 10, "y": 10, "w": 20, "h": 20}]},
+                    {"id": "g", "blend": 2, "center": 7, "dst": [{"x": 50, "y": 10, "w": 8, "h": 8, "angle": 30}]}]"#,
+            ),
+        ),
+        (
+            "numbers",
+            play_skin(
+                r#""value": [
+                    {"id": "ex", "src": "strip", "w": 100, "h": 10, "divx": 10, "digit": 4, "ref": 71},
+                    {"id": "pg", "src": "strip", "w": 100, "h": 10, "divx": 10, "digit": 13, "ref": 110, "align": 2}],
+                "destination": [
+                    {"id": "ex", "timer": 41, "dst": [{"x": 10, "y": 500, "w": 10, "h": 10}]},
+                    {"id": "pg", "timer": 41, "dst": [{"x": 10, "y": 600, "w": 10, "h": 10}]}]"#,
+            ),
+        ),
+        (
+            "text",
+            play_skin(
+                r#""text": [
+                    {"id": "t", "font": "f", "size": 20, "ref": 10},
+                    {"id": "c", "font": "f", "size": 20, "constantText": "seed", "align": 1, "overflow": 2}],
+                "destination": [
+                    {"id": "t", "timer": 41, "dst": [{"x": 400, "y": 900, "w": 300, "h": 20}]},
+                    {"id": "c", "timer": 41, "dst": [{"x": 400, "y": 800, "w": 300, "h": 20}]}]"#,
+            ),
+        ),
+        (
+            "tracks",
+            play_skin(
+                r#""image": [{"id": "g", "src": "grid", "w": 4, "h": 4}],
+                "destination": [{"id": "g", "timer": 41, "loop": 100, "dst": [
+                    {"time": 0, "x": 0, "y": 0, "w": 4, "h": 4, "acc": 2},
+                    {"time": 100, "x": 100, "a": 128},
+                    {"time": 200, "x": 0, "a": 255}]}]"#,
+            ),
+        ),
+        (
+            "ops",
+            play_skin(
+                r#""property": [{"name": "p", "item": [{"name": "x", "op": 900}]}],
+                "image": [{"id": "g", "src": "grid", "w": 4, "h": 4}],
+                "destination": [
+                    {"id": "g", "op": [241], "dst": [{"w": 4, "h": 4}]},
+                    {"id": "g", "op": [232, 900], "dst": [{"w": 4, "h": 4}]},
+                    {"id": "g", "op": [7777], "dst": [{"w": 4, "h": 4}]}]"#,
+            ),
+        ),
+        (
+            "offsets",
+            play_skin(
+                r#""offset": [{"name": "o", "id": 40, "x": true}],
+                "image": [{"id": "g", "src": "grid", "w": 4, "h": 4}],
+                "destination": [
+                    {"id": "g", "offset": 40, "dst": [{"w": 4, "h": 4}]},
+                    {"id": "g", "offsets": [4], "dst": [{"w": 4, "h": 4}]}]"#,
+            ),
+        ),
+        (
+            "choices_default",
+            play_skin(
+                r#""filepath": [{"name": "Look", "path": "*.png", "def": "GRID"}],
+                "source": [{"id": "any", "path": "*.png"}],
+                "image": [{"id": "i", "src": "any", "w": -1, "h": -1}],
+                "destination": [{"id": "i", "stretch": 9, "dst": [{"w": 100, "h": 100}]}]"#,
+            ),
+        ),
     ]
 }
 
