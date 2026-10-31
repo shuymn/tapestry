@@ -12,9 +12,9 @@ use image::{ImageFormat, Rgba, RgbaImage};
 use rules::{GaugeValue, Judgment, PerJudgment};
 use skin_model::{
     Anchor, AtlasLimits, Attempt, Blend, Ease, ElementDef, End, FileDef, Filter, Fit, GaugeDesc,
-    ImageDef, KeyDef, LaneView, Layout, LoadError, PLAY, Place, Play, PlayContext, Program,
-    QuadBatch, Region, RegionDef, Scope, Sheet, Side, Skin, SkinDef, SkinFrame, Source, TimerRef,
-    Ty, UvTable, Variant, compile,
+    GaugeLook, ImageDef, KeyDef, LaneView, Layout, LoadError, PLAY, Place, Play, PlayContext,
+    Program, QuadBatch, Region, RegionDef, Scope, Sheet, Side, Skin, SkinDef, SkinFrame, Source,
+    TimerRef, Ty, UvTable, Variant, compile,
 };
 
 pub const MS: i64 = 1_000;
@@ -119,10 +119,14 @@ pub const GAUGES: [GaugeDesc; 2] = [
     GaugeDesc {
         start: GaugeValue(20 * GaugeValue::PERCENT),
         max: GaugeValue::FULL,
+        look: GaugeLook::Normal,
+        border: GaugeValue(80 * GaugeValue::PERCENT),
     },
     GaugeDesc {
         start: GaugeValue(20 * GaugeValue::PERCENT),
         max: GaugeValue::FULL,
+        look: GaugeLook::Normal,
+        border: GaugeValue(80 * GaugeValue::PERCENT),
     },
 ];
 
@@ -201,6 +205,7 @@ pub fn def(whens: Vec<Program>, sheet: Sheet, elements: Vec<ElementDef>) -> Skin
         sheet,
         lanes: None,
         elements,
+        widgets: skin_model::WidgetDefs::default(),
     }
 }
 

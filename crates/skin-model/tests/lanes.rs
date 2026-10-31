@@ -979,6 +979,7 @@ fn def_with(elements: Vec<skin_model::ElementDef>, lanes: Option<LanesDef>) -> S
         sheet: lanes_support::sheet(),
         lanes,
         elements,
+        widgets: skin_model::WidgetDefs::default(),
     }
 }
 

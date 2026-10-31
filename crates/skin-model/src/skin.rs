@@ -16,11 +16,16 @@ use crate::place::{Bind, Bounds, Fill, Place, Placement, Regions, union};
 use crate::play::schema::timer::BUILTIN;
 use crate::play::timers::elapsed_us;
 use crate::play::{Play, PlayContext, PrepareError, SkinFrame};
-use crate::quad::{Blend, ClipId, Filter, Quad, QuadBatch, RunKey};
+use crate::quad::{Blend, ClipId, Filter, QuadBatch, RunKey};
 use crate::schema::Ty;
 use crate::track::Track;
-use crate::widget::ImageRef;
+use crate::widget::digits::{Digits, Number, NumberDef, NumberError};
+use crate::widget::gauge::{Gauge, GaugeDef, GaugeDraw, GaugeError};
+use crate::widget::judge::{
+    ComboStrip, GradeImage, Judge, JudgeDef, JudgeDraw, JudgeError, JudgeSlot,
+};
 use crate::widget::lanes::{Draw, LANE_QUADS, LANE_RESERVED, Lanes, LanesDef, LanesError, Side};
+use crate::widget::{Brush, Frame, ImageRef};
 
 /// The most elements one skin may hold.
 pub const MAX_ELEMENTS: usize = 16_384;
@@ -33,6 +38,10 @@ pub const MAX_SKIN_KEYS: usize = 65_536;
 /// lanes' coordinates, in reference pixels. Placement sums and products
 /// of a few such values stay far inside `i64` and exact in `f64`.
 pub const MAX_COORD: i32 = 1 << 20;
+/// The most quads one frame's widgets other than the lanes may push,
+/// summed over their elements' worst cases.
+#[expect(clippy::cast_possible_truncation, reason = "16 384")]
+pub const MAX_WIDGET_QUADS: u32 = MAX_ELEMENTS as u32;
 
 /// What an element draws.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -42,6 +51,23 @@ pub enum Source {
     /// The lanes widget, on the skin's [`LanesDef`]. Its track gives only
     /// color and alpha.
     Lanes,
+    /// The number at this index of [`WidgetDefs::numbers`]. Its track
+    /// places cell 0 as an image's places its rect.
+    Number(u32),
+    /// The gauge at this index of [`WidgetDefs::gauges`]. Its track places
+    /// the whole gauge as an image's places its rect.
+    Gauge(u32),
+    /// The judge at this index of [`WidgetDefs::judges`]. Its track gives
+    /// only color and alpha; the parts place themselves.
+    Judge(u32),
+}
+
+/// The widgets elements draw by index.
+#[derive(Clone, Debug, Default)]
+pub struct WidgetDefs {
+    pub numbers: Vec<NumberDef>,
+    pub gauges: Vec<GaugeDef>,
+    pub judges: Vec<JudgeDef>,
 }
 
 /// The timer an element's track or an image's cycle runs on.
@@ -80,6 +106,9 @@ pub struct SkinDef {
     pub lanes: Option<LanesDef>,
     /// In draw order.
     pub elements: Vec<ElementDef>,
+    /// The widgets [`Source::Number`], [`Source::Gauge`] and
+    /// [`Source::Judge`] index.
+    pub widgets: WidgetDefs,
 }
 
 /// Why [`Skin::new`] refused a skin; `element` and `when` are indices.
@@ -119,12 +148,41 @@ pub enum LoadError {
     Lanes(#[source] LanesError),
     #[error("the skin's expressions")]
     Ops(#[source] CompileError),
+    #[error("a widget table has {n} widgets, more than {MAX_ELEMENTS}")]
+    TooManyWidgets { n: usize },
+    #[error("element {element}'s widget does not exist")]
+    UnknownWidget { element: usize },
+    #[error("the widgets can push {n} quads a frame, more than {MAX_WIDGET_QUADS}")]
+    TooManyWidgetQuads { n: u64 },
+    #[error("judge element {element} is outside `judge` (`screen` in a fixed-canvas skin)")]
+    JudgeRegion { element: usize },
+    #[error("element {element}'s number")]
+    Number {
+        element: usize,
+        #[source]
+        error: NumberError,
+    },
+    #[error("element {element}'s gauge")]
+    Gauge {
+        element: usize,
+        #[source]
+        error: GaugeError,
+    },
+    #[error("element {element}'s judge")]
+    Judge {
+        element: usize,
+        #[source]
+        error: JudgeError,
+    },
 }
 
 #[derive(Clone, Copy, Debug)]
 enum Kind {
     Image(ImageRef),
     Lanes,
+    Number(usize),
+    Gauge(usize),
+    Judge(usize),
 }
 
 #[derive(Clone, Debug)]
@@ -155,6 +213,11 @@ pub struct Skin {
     frame_count: usize,
     regions: Regions,
     lanes: Option<Lanes>,
+    numbers: Box<[Number]>,
+    gauges: Box<[Gauge]>,
+    judges: Box<[Judge]>,
+    /// The quads one frame's widget elements can push, the lanes aside.
+    widget_quads: u32,
 }
 
 /// The slot `timer` reads with `whens` `when` timers: a built-in slot, or
@@ -170,7 +233,7 @@ fn slot_of(timer: TimerRef, whens: usize) -> Option<usize> {
 
 /// `deg` degrees as radians in `[0, 2π)`, reduced first so large key
 /// values keep their precision.
-fn radians(deg: f32) -> f32 {
+pub(crate) fn radians(deg: f32) -> f32 {
     let r = f32_of(f64::from(deg).rem_euclid(360.0).to_radians());
     if r < std::f32::consts::TAU { r } else { 0.0 }
 }
@@ -179,6 +242,15 @@ fn radians(deg: f32) -> f32 {
 fn check_places(def: &SkinDef) -> Result<(), LoadError> {
     let fixed = def.fit == Fit::Fixed;
     let max = MAX_COORD;
+    let outside = |t: &Track| {
+        t.rects()
+            .any(|r| r.iter().any(|v| !(-max..=max).contains(v)))
+    };
+    let (home, judge_home) = if fixed {
+        (Region::Screen, Region::Screen)
+    } else {
+        (Region::Playfield, Region::Judge)
+    };
     for (element, e) in def.elements.iter().enumerate() {
         let p = e.place;
         if fixed && p.region != Region::Screen {
@@ -187,14 +259,31 @@ fn check_places(def: &SkinDef) -> Result<(), LoadError> {
         if p.fill != Fill::None && p.region != Region::Screen {
             return Err(LoadError::FillOutsideScreen { element });
         }
-        if e.track
-            .rects()
-            .any(|r| r.iter().any(|v| !(-max..=max).contains(v)))
-        {
+        if outside(&e.track) {
             return Err(LoadError::Coordinates { element });
         }
-        if e.source == Source::Lanes && !e.track.is_still() {
+        let widget = matches!(e.source, Source::Lanes | Source::Judge(_));
+        if widget && !e.track.is_still() {
             return Err(LoadError::WidgetGeometry { element });
+        }
+        if let Source::Judge(i) = e.source {
+            let judge = |error| LoadError::Judge { element, error };
+            if p.region != judge_home {
+                return Err(LoadError::JudgeRegion { element });
+            }
+            if p.bind != Bind::None {
+                return Err(judge(JudgeError::Bound));
+            }
+            let def = usize::try_from(i)
+                .ok()
+                .and_then(|i| def.widgets.judges.get(i));
+            if let Some((part, _)) = def
+                .into_iter()
+                .flat_map(JudgeDef::tracks)
+                .find(|(_, t)| outside(t))
+            {
+                return Err(judge(JudgeError::Coordinates { part }));
+            }
         }
     }
     let mut widgets = def.elements.iter().filter(|e| e.source == Source::Lanes);
@@ -202,11 +291,6 @@ fn check_places(def: &SkinDef) -> Result<(), LoadError> {
     if widgets.next().is_some() {
         return Err(LoadError::LanesTwice);
     }
-    let home = if fixed {
-        Region::Screen
-    } else {
-        Region::Playfield
-    };
     if lanes_in.is_some_and(|r| r != home) {
         return Err(LoadError::LanesRegion);
     }
@@ -218,6 +302,113 @@ fn check_places(def: &SkinDef) -> Result<(), LoadError> {
         return Err(LoadError::Unbound { element });
     }
     Ok(())
+}
+
+/// The images checks of [`Skin::new`] for one element's widget, whose
+/// index is valid: every image exists, and glyph images hold whole sets.
+/// `frames` gives an image's frame count, `None` for a missing image.
+fn check_widget_images(
+    element: usize,
+    source: Source,
+    w: &WidgetDefs,
+    frames: &impl Fn(u32) -> Option<u16>,
+) -> Result<(), LoadError> {
+    let at = |i: u32| usize::try_from(i).unwrap_or(usize::MAX);
+    match source {
+        Source::Number(i) => {
+            if let Some(n) = w.numbers.get(at(i)) {
+                n.digits
+                    .check_image(frames(n.digits.image))
+                    .map_err(|error| LoadError::Number { element, error })?;
+            }
+        }
+        Source::Gauge(i) => {
+            if let Some((look, part, below, _)) = w
+                .gauges
+                .get(at(i))
+                .into_iter()
+                .flat_map(GaugeDef::images)
+                .find(|&(.., image)| frames(image).is_none())
+            {
+                let error = GaugeError::UnknownImage { look, part, below };
+                return Err(LoadError::Gauge { element, error });
+            }
+        }
+        Source::Judge(i) => {
+            let Some(j) = w.judges.get(at(i)) else {
+                return Ok(());
+            };
+            let judge = |error| LoadError::Judge { element, error };
+            for (slot, g) in JudgeSlot::ALL.into_iter().zip(&j.grades) {
+                if g.as_ref().is_some_and(|g| frames(g.image).is_none()) {
+                    return Err(judge(JudgeError::UnknownImage { slot }));
+                }
+            }
+            for (slot, c) in JudgeSlot::ALL.into_iter().zip(&j.combos) {
+                if let Some(c) = c {
+                    c.digits
+                        .check_image(frames(c.digits.image))
+                        .map_err(|error| judge(JudgeError::Combo { slot, error }))?;
+                }
+            }
+        }
+        Source::Image(_) | Source::Lanes => {}
+    }
+    Ok(())
+}
+
+/// The widget parameter checks of [`Skin::new`] for one element's
+/// widget, whose index is valid.
+fn check_widget_params(element: usize, source: Source, w: &WidgetDefs) -> Result<(), LoadError> {
+    let at = |i: u32| usize::try_from(i).unwrap_or(usize::MAX);
+    match source {
+        Source::Number(i) => {
+            if let Some(n) = w.numbers.get(at(i)) {
+                n.digits
+                    .check()
+                    .map_err(|error| LoadError::Number { element, error })?;
+            }
+        }
+        Source::Gauge(i) => {
+            if let Some(g) = w.gauges.get(at(i)) {
+                g.check()
+                    .map_err(|error| LoadError::Gauge { element, error })?;
+            }
+        }
+        Source::Judge(i) => {
+            let Some(j) = w.judges.get(at(i)) else {
+                return Ok(());
+            };
+            let judge = |error| LoadError::Judge { element, error };
+            if j.grades.iter().all(Option::is_none) {
+                return Err(judge(JudgeError::Empty));
+            }
+            for (slot, c) in JudgeSlot::ALL.into_iter().zip(&j.combos) {
+                if let Some(c) = c {
+                    c.digits
+                        .check()
+                        .map_err(|error| judge(JudgeError::Combo { slot, error }))?;
+                }
+            }
+        }
+        Source::Image(_) | Source::Lanes => {}
+    }
+    Ok(())
+}
+
+/// The quads one frame of `source`'s element can push at worst, the
+/// lanes' aside (an image's 1 included).
+fn worst(source: Source, w: &WidgetDefs) -> u32 {
+    let at = |i: u32| usize::try_from(i).unwrap_or(usize::MAX);
+    match source {
+        Source::Image(_) | Source::Lanes => 0,
+        Source::Number(i) => w
+            .numbers
+            .get(at(i))
+            .map_or(0, |n| u32::from(n.digits.cells)),
+        Source::Gauge(i) => w.gauges.get(at(i)).map_or(0, GaugeDef::quads),
+        Source::Judge(i) => w.judges.get(at(i)).map_or(0, JudgeDef::quads),
+    }
 }
 
 /// The regions' boxes from the elements' keys and the lanes' rect.
@@ -242,8 +433,18 @@ fn regions(def: &SkinDef, lanes: Option<&Lanes>) -> Regions {
                 }
                 rect
             }
-            Source::Image(_) => {
-                let b = e.track.bounds();
+            Source::Image(_) | Source::Gauge(_) | Source::Number(_) | Source::Judge(_) => {
+                let b = match e.source {
+                    Source::Number(i) => usize::try_from(i)
+                        .ok()
+                        .and_then(|i| def.widgets.numbers.get(i))
+                        .and_then(|n| n.digits.bounds(&e.track)),
+                    Source::Judge(i) => usize::try_from(i)
+                        .ok()
+                        .and_then(|i| def.widgets.judges.get(i))
+                        .and_then(JudgeDef::bounds),
+                    Source::Image(_) | Source::Gauge(_) | Source::Lanes => e.track.bounds(),
+                };
                 if let Some(b) = b {
                     let slot = match e.place.bind {
                         Bind::None => out.fixed.get_mut(r),
@@ -289,22 +490,27 @@ impl Ratio {
 impl Skin {
     /// Loads a skin.
     ///
-    /// Checks, in order: the counts (elements, `when` timers, keys across
-    /// all tracks); every `when` condition and visibility is a bool; every
-    /// timer exists; every element's image and every lane part's image
-    /// exists, and every image's cycle timer; the places (regions under a
-    /// fixed canvas, fills outside `screen`, key coordinates within
-    /// ±[`MAX_COORD`], widget tracks that move, one lanes widget in its
-    /// region, bindings beside it); the lanes' definition and geometry;
-    /// and the total operations, each `when` charged once however many
-    /// elements share it, then each visibility in element order. So the
-    /// per-frame cost is known here. Then each region's box is computed
-    /// from its elements' keys.
+    /// Checks, in order: the counts (elements, `when` timers, each widget
+    /// table, keys across all tracks, judge parts' included); every `when`
+    /// condition and visibility is a bool, judge parts' included, and
+    /// every number's value an int; every timer exists, judge parts'
+    /// included; every element's widget, every element's, widget's and
+    /// lane part's image exists, glyph images hold whole sets, and every
+    /// image's cycle timer exists; the places (regions under a fixed
+    /// canvas, fills outside `screen`, key coordinates within
+    /// ±[`MAX_COORD`], widget tracks that move, judges in `judge` and
+    /// unbound, one lanes widget in its region, bindings beside it); the
+    /// widgets' parameters; the lanes' definition and geometry; the total
+    /// operations, each `when` charged once however many elements share
+    /// it, then each visibility in element order, then per element its
+    /// number's value or its judge parts' visibilities; and the widgets'
+    /// quads within [`MAX_WIDGET_QUADS`]. So the per-frame cost is known
+    /// here. Then each region's box is computed from its elements' keys.
     ///
     /// These counts check what was built. A front end (an importer, the
-    /// authored format's loader) enforces the same element, `when` and key
-    /// limits cumulatively while it builds the input, before it compiles
-    /// or allocates each item.
+    /// authored format's loader) enforces the same element, widget, `when`
+    /// and key limits cumulatively while it builds the input, before it
+    /// compiles or allocates each item.
     ///
     /// # Errors
     ///
@@ -312,15 +518,23 @@ impl Skin {
     pub fn new(def: SkinDef) -> Result<Self, LoadError> {
         let elements = &def.elements;
         let whens = &def.whens;
+        let w = &def.widgets;
         if elements.len() > MAX_ELEMENTS {
             return Err(LoadError::TooManyElements { n: elements.len() });
         }
         if whens.len() > MAX_WHEN_TIMERS {
             return Err(LoadError::TooManyWhenTimers { n: whens.len() });
         }
+        for n in [w.numbers.len(), w.gauges.len(), w.judges.len()] {
+            if n > MAX_ELEMENTS {
+                return Err(LoadError::TooManyWidgets { n });
+            }
+        }
         let keys = elements
             .iter()
-            .fold(0_usize, |n, e| n.saturating_add(e.track.key_count()));
+            .map(|e| &e.track)
+            .chain(w.judges.iter().flat_map(|j| j.tracks().map(|(_, t)| t)))
+            .fold(0_usize, |n, t| n.saturating_add(t.key_count()));
         if keys > MAX_SKIN_KEYS {
             return Err(LoadError::TooManyKeys { n: keys });
         }
@@ -333,18 +547,68 @@ impl Skin {
         {
             return Err(LoadError::VisibleNotBool { element });
         }
+        let at = |i: u32| usize::try_from(i).unwrap_or(usize::MAX);
+        for (element, e) in elements.iter().enumerate() {
+            match e.source {
+                Source::Number(i) => {
+                    if w.numbers
+                        .get(at(i))
+                        .is_some_and(|n| n.value.ty() != Ty::Int)
+                    {
+                        let error = NumberError::NotInt;
+                        return Err(LoadError::Number { element, error });
+                    }
+                }
+                Source::Judge(i) => {
+                    if let Some((part, _)) = w
+                        .judges
+                        .get(at(i))
+                        .into_iter()
+                        .flat_map(JudgeDef::visibles)
+                        .find(|(_, v)| v.ty() != Ty::Bool)
+                    {
+                        let error = JudgeError::VisibleNotBool { part };
+                        return Err(LoadError::Judge { element, error });
+                    }
+                }
+                Source::Image(_) | Source::Lanes | Source::Gauge(_) => {}
+            }
+        }
         let mut slots = Vec::with_capacity(elements.len());
         for (element, e) in elements.iter().enumerate() {
             let slot = slot_of(e.timer, whens.len()).ok_or(LoadError::UnknownTimer { element })?;
             slots.push(slot);
+            if let Source::Judge(i) = e.source
+                && let Some((part, _)) = w
+                    .judges
+                    .get(at(i))
+                    .into_iter()
+                    .flat_map(JudgeDef::timers)
+                    .find(|&(_, t)| slot_of(t, whens.len()).is_none())
+            {
+                let error = JudgeError::UnknownTimer { part };
+                return Err(LoadError::Judge { element, error });
+            }
         }
         let images = def.sheet.images();
         let exists = |i: u32| usize::try_from(i).is_ok_and(|i| i < images.len());
+        let frames = |i: u32| images.get(at(i)).map(|m| m.frames);
+        if let Some(element) = elements.iter().position(|e| match e.source {
+            Source::Image(_) | Source::Lanes => false,
+            Source::Number(i) => w.numbers.get(at(i)).is_none(),
+            Source::Gauge(i) => w.gauges.get(at(i)).is_none(),
+            Source::Judge(i) => w.judges.get(at(i)).is_none(),
+        }) {
+            return Err(LoadError::UnknownWidget { element });
+        }
         if let Some(element) = elements.iter().position(|e| match e.source {
             Source::Image(i) => !exists(i),
-            Source::Lanes => false,
+            Source::Lanes | Source::Number(_) | Source::Gauge(_) | Source::Judge(_) => false,
         }) {
             return Err(LoadError::UnknownImage { element });
+        }
+        for (element, e) in elements.iter().enumerate() {
+            check_widget_images(element, e.source, w, &frames)?;
         }
         if let Some((part, _)) = def
             .lanes
@@ -367,6 +631,9 @@ impl Skin {
             cycles.push(cycle);
         }
         check_places(&def)?;
+        for (element, e) in elements.iter().enumerate() {
+            check_widget_params(element, e.source, w)?;
+        }
         let widget = elements.iter().any(|e| e.source == Source::Lanes);
         let lanes = match (&def.lanes, widget) {
             (None, false) => None,
@@ -378,12 +645,35 @@ impl Skin {
             }
         };
         let mut ops = SkinOps::default();
+        // Each element evaluates its own number's value and its judge's
+        // part visibilities, so they are charged per referencing element.
+        let per_element = elements.iter().flat_map(|e| {
+            let number = match e.source {
+                Source::Number(i) => w.numbers.get(at(i)).map(|n| &n.value),
+                _ => None,
+            };
+            let judge = match e.source {
+                Source::Judge(i) => w.judges.get(at(i)),
+                _ => None,
+            };
+            number
+                .into_iter()
+                .chain(judge.into_iter().flat_map(|j| j.visibles().map(|(_, v)| v)))
+        });
         for program in whens
             .iter()
             .chain(elements.iter().filter_map(|e| e.visible.as_ref()))
+            .chain(per_element)
         {
             ops.charge(program).map_err(LoadError::Ops)?;
         }
+        let widget_quads = elements
+            .iter()
+            .fold(0_u64, |n, e| n + u64::from(worst(e.source, w)));
+        if widget_quads > u64::from(MAX_WIDGET_QUADS) {
+            return Err(LoadError::TooManyWidgetQuads { n: widget_quads });
+        }
+        let widget_quads = u32::try_from(widget_quads).unwrap_or(MAX_WIDGET_QUADS);
         let image = |i: u32| {
             let i = usize::try_from(i).unwrap_or(usize::MAX);
             let m = images.get(i);
@@ -396,6 +686,49 @@ impl Skin {
         };
         let lanes = lanes.map(|l| Lanes::new(l, image));
         let regions = regions(&def, lanes.as_ref());
+        let n_whens = whens.len();
+        // A timer only an unreferenced judge names reads off.
+        let slot = |t: TimerRef| slot_of(t, n_whens).unwrap_or(usize::MAX);
+        let WidgetDefs {
+            numbers,
+            gauges,
+            judges,
+        } = def.widgets;
+        let numbers = numbers
+            .into_iter()
+            .map(|n| Number {
+                digits: Digits::new(&n.digits, image(n.digits.image)),
+                value: n.value,
+            })
+            .collect();
+        let gauges = gauges.iter().map(|g| Gauge::new(g, image)).collect();
+        let judges = judges
+            .into_iter()
+            .map(|j| Judge {
+                grades: j.grades.map(|g| {
+                    g.map(|g| GradeImage {
+                        image: image(g.image),
+                        slot: slot(g.timer),
+                        track: g.track,
+                        pivot: g.pivot.fractions(),
+                        blend: g.blend,
+                        visible: g.visible,
+                    })
+                }),
+                combos: j.combos.map(|c| {
+                    c.map(|c| ComboStrip {
+                        digits: Digits::new(&c.digits, image(c.digits.image)),
+                        slot: slot(c.timer),
+                        track: c.track,
+                        attach: c.attach,
+                        pivot: c.pivot.fractions(),
+                        blend: c.blend,
+                        visible: c.visible,
+                    })
+                }),
+                shift: j.shift,
+            })
+            .collect();
         let elements = def
             .elements
             .into_iter()
@@ -404,6 +737,9 @@ impl Skin {
                 kind: match e.source {
                     Source::Image(i) => Kind::Image(image(i)),
                     Source::Lanes => Kind::Lanes,
+                    Source::Number(i) => Kind::Number(at(i)),
+                    Source::Gauge(i) => Kind::Gauge(at(i)),
+                    Source::Judge(i) => Kind::Judge(at(i)),
                 },
                 track: e.track,
                 slot,
@@ -427,6 +763,10 @@ impl Skin {
             sheet: def.sheet,
             regions,
             lanes,
+            numbers,
+            gauges,
+            judges,
+            widget_quads,
         })
     }
 
@@ -458,8 +798,10 @@ impl Skin {
         self.ops
     }
 
-    /// The quads a frame can push: one per image element, and the lanes'
-    /// budget with its reserved quads.
+    /// The quads a frame can push: one per image element, each widget
+    /// element's worst case (a number's cells, a gauge's segments and its
+    /// flicker's tip, a judge's largest slot with its combo's cells), and
+    /// the lanes' budget with its reserved quads.
     #[must_use]
     pub fn quad_capacity(&self) -> u32 {
         let images = self
@@ -474,10 +816,12 @@ impl Skin {
         };
         u32::try_from(images)
             .unwrap_or(u32::MAX)
+            .saturating_add(self.widget_quads)
             .saturating_add(lanes)
     }
 
-    /// The runs a frame can push: at worst, one per quad.
+    /// The runs a frame can push: at worst, one per quad (a judge pushes
+    /// at most two runs, each of at least one quad).
     #[must_use]
     pub fn run_capacity(&self) -> u32 {
         self.quad_capacity()
@@ -626,28 +970,54 @@ impl Skin {
                 continue;
             };
             let affine = placement.affine(e.region, e.fill);
+            let brush = Brush {
+                key: e.key,
+                affine,
+                map: placement.bind(e.bind),
+                pivot: e.pivot,
+                angle: radians(s.angle),
+                color: s.color,
+            };
+            let at = Frame {
+                play,
+                now: frame.now,
+                uvs,
+            };
             match e.kind {
                 Kind::Image(image) => {
-                    let Some(f) = image.frame(play, frame.now, uvs) else {
-                        continue;
-                    };
-                    let [x, y, w, h] = s.rect;
-                    let [fx, fy] = e.pivot;
-                    let pivot = [x + fx * w, y + fy * h];
-                    let map = placement.bind(e.bind);
-                    let (x, w, px) = (map.x(x), map.w(w), map.x(pivot[0]));
-                    out.push(
-                        e.key,
-                        Quad {
-                            rect: affine.rect([x, y, w, h]),
-                            uv: f.uv,
+                    if let Some(f) = image.frame(play, frame.now, uvs) {
+                        brush.push(out, s.rect, f, image.filter);
+                    }
+                }
+                Kind::Number(i) => {
+                    if let Some(n) = self.numbers.get(i) {
+                        let v = n.value.eval(&state);
+                        n.digits.draw(v, s.rect, &brush, &at, out);
+                    }
+                }
+                Kind::Gauge(i) => {
+                    if let Some(g) = self.gauges.get(i) {
+                        let d = GaugeDraw {
+                            at,
+                            gauges: frame.gauges,
+                            shown: frame.gauge,
+                            t: elapsed_us(frame.now, start),
+                        };
+                        g.draw(&d, s.rect, &brush, out);
+                    }
+                }
+                Kind::Judge(i) => {
+                    if let Some(j) = self.judges.get(i) {
+                        let d = JudgeDraw {
+                            at,
+                            state: &state,
+                            affine,
+                            map: brush.map,
                             color: s.color,
-                            pivot: affine.point([px, pivot[1]]),
-                            angle: radians(s.angle),
-                            layer: f.layer,
-                            filter: image.filter,
-                        },
-                    );
+                            clip: e.key.clip,
+                        };
+                        j.draw(&d, out);
+                    }
                 }
                 Kind::Lanes => {
                     if let Some(lanes) = &self.lanes {
