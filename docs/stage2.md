@@ -75,11 +75,12 @@ Each decision names the alternatives it beat. "Tuned by playing" marks a startin
 **Decision.** `game::app` owns the flow Select → Load → Plays (countdown, play, tail, result, retry) → Select. It is portable and runs headless on a virtual rig.
 
 - **The rig.** `AppRig: Rig` adds:
-  - `choose()`;
+  - `choose()`, which returns a `Pick`: `Play(path)`, or `Practice(path)` for the practice screen;
   - `load_chart(&Loaded)`, which swaps the bank and the renderer's chart;
   - `idle_wait(deadline)`;
   - `show_refusal(&LoadRefusal)`;
-  - `entered_selection()`, called on every entry into selection.
+  - `entered_selection()`, called on every entry into selection;
+  - `entered_practice(&PracticeScreen)`, `show_practice` and `take_practice`, for the practice screen (D15 Setup).
 - **Plays of one chart.** `live::run` becomes `run_chart`, which returns `Leave::Back` or `Leave::Quit`.
 - **A refused load returns to selection.** Today these errors propagate out of `main` and end the process. The screen shows the reason, the threads keep running, and the chart stays selected. The refusals:
   - a chart that does not load;
@@ -93,7 +94,7 @@ Each decision names the alternatives it beat. "Tuned by playing" marks a startin
   - `Command::Quit` means "leave the chart" (crates/game/src/session.rs:224-225).
   - From selection, quit returns to selection; in `tapestry play <chart>` it ends the process.
   - Closing the window ends the run from any scene.
-- **Menu commands.** Retry, Back, NextPreset/PrevPreset and Practice form `MenuCommand`, separate from the in-play `Command`.
+- **Menu commands.** Retry, Back and NextPreset/PrevPreset form `MenuCommand`, separate from the in-play `Command`. Practice is entered from selection (P on the chart under the cursor), not from a result: a `MenuCommand::Practice` is not built.
 - **The library stays outside `game`;** the rig hands it paths.
 - **Session events.** `SessionEvent` (crates/game/src/policy.rs:61-80) gains `Select` and `Result { attempt }`.
 - **Launch (decided).** `tapestry` with no arguments opens selection. Today it exits 2 (crates/player/src/args.rs:93).
@@ -431,7 +432,13 @@ A fractional first stage: 1,000 frames at 44.1 kHz are 1,088.435 frames at 48 kH
 - A BGM event at 20.5 s starts during the ring-out; one at 30 s never starts.
 - A 60 s BGM voice that started at 5 s is playing 3 s in at round 2's lead-in start, restored by `seek`, at full gain.
 
-**Setup.** The practice screen picks the section by measure, the speed, the lead-in (`LEAD_IN`, 2 s, tuned by playing), the initial gauge, and repeat. `--dev-start <ms>` and a scenario step exist in development builds.
+**Setup.** The practice screen picks the section by measure, the speed, the lead-in (`LEAD_IN`, 2 s, tuned by playing), the initial gauge, and repeat. `--dev-start <ms>` and a scenario step (D20) exist in development builds.
+- **Entry.** P on the select screen opens the practice screen for the chart under the cursor (`Pick::Practice`); while the search box has focus, P is typed text. The chart loads at 1×; an autoplay session is refused there (`Refused::Practice(PracticeError::Autoplay)`), and a refused load returns to selection as any chart's does.
+- **The model** (`game::practice_screen`) is built once at entry from the chart loaded at 1× and kept for every return to the page:
+  - the measures: each bar line's start in 1× time, `min(t_p, the earliest note time at or past the bar line)`, where `t_p` is the first microsecond whose position reaches it, so a note on the bar line, one at the start of a STOP included, belongs to its measure; a chart without bar lines is one measure;
+  - the section `from`..`to`, a measure range with `0 ≤ from < to ≤ measures`, where `to` equal to the number of measures means the chart's end (below); the speed on the ladder (k = 10 to 30); the lead-in in 0.5 s steps from 1 to 10 s; the displayed gauge's initial value in 1 % steps, kept where `eval::accepts_initial` holds, every other gauge at its start; repeat, on by default.
+- **Start** always reads the current chart again: a changed speed reloads it through `Loaded::set_speed` (the same seed and transform; the attempt numbering, the shelf and the settings kept), which refuses with `SessionError::ChartChanged` and nothing changed when the file's SHA-256 is not the one loaded at entry; then the practice is set, and the rig's `load_chart` builds the bank at the speed and the screen's chart with the section. A refusal (the speed, a changed file, no targets, the bank, the logic step or the restore at the opening) shows on the page as its notice, and the page stays.
+- **Leaving.** Quit during the rounds, and back on a round's result, return to the page; Back on the page returns to selection; closing the window ends the run.
 - **The chart's end** must stay past the last note at every speed: `practice::chart_end(chart_at_speed, speed)` is `ceil((r_max + 1) × k/20)` in 1× time, where `r_max` is the latest note end of the chart as loaded at that speed, so `floor(end × 20/k) ≥ r_max + 1`. Adding 1 µs to the last 1× end is not enough: at 150 %, a last end at exact time 0.9 µs maps to `floor(0.6) = 0`, and `floor(1 × 2/3)` is also 0.
 - **No targets.** A section none of whose taps or long notes is a target is refused before evaluation (`PracticeError::NoTargets`), a mine-only section included.
 - **One target rule.** `eval::Section::is_target` is the rule the evaluator, the round's schedule and the screen's hidden notes share.
@@ -503,7 +510,9 @@ A fractional first stage: 1,000 frames at 44.1 kHz are 1,088.435 frames at 48 kH
   - a button sends on its press only, with no repeat while held; only the first connected unit of the configured model sends, and none without a configured controller.
   - Events go through a bounded SPSC queue, and the thread unparks the game thread.
   - Menu events are never recorded.
-  - On the result screen (PR17), the scratch's up and down switch presets, the white keys retry and the black keys go back; the keyboard keeps its retry and quit keys and adds the arrow keys. The queues are read only while a result shows, so the select loop's drain never takes the select screen's input.
+  - On the result screen (PR17), the scratch's up and down switch presets, the white keys retry and the black keys go back; the keyboard keeps its retry and quit keys and adds the arrow keys.
+  - On the practice page (PR24b), the keyboard's arrows move between rows (up and down) and step a value (left and right, and up and down while a row is edited), Enter enters or leaves a row's editing (on Start, it starts) and Escape, the quit key, goes back to selection; the controller's scratch moves as the up and down arrows, the white keys confirm and the black keys go back. Retry, text, Tab and P mean nothing there.
+  - **One owner.** The window's queue and the controller's are read only by the screen that owns them: none, selection, a result or the practice page. Each entry takes ownership and drops what was queued, so the select loop's drain never takes a result's or the page's input, and no screen reads input queued for another.
 - **Keyboard lane keys** are not menu events.
 
 ### D19. Record format changes
@@ -529,7 +538,7 @@ Each change is covered by round trips and changes D8's interpretation tuple.
   - `play { input = "auto" | log, until = "end" | { at_ms, command = "retry" | "quit" } }`: every play of one chart uses its first input;
   - `result = "next-preset" | "prev-preset" | "retry" | "back"`;
   - `capture { at, file }`: the first presented frame at or after `at` of the next play that starts, written under `output`;
-  - `practice { … }` (PR24b);
+  - `practice { path | search, from, to, speed, lead_in_ms, gauge, repeat = true, input = log, rounds }`: chooses the chart as `select` does, opens its practice page with P, sets measures `from` to `to` (from 1, both included), the speed in percent (a multiple of 5 from 50 to 150), the lead-in (on the 500 ms grid from 1,000 to 10,000), the displayed gauge's initial value in percent and repeat through the page's keys, starts, plays `rounds` rounds of the log (autoplay refuses practice, so `"auto"` is refused) and quits at the next round's start, then goes back to selection; it stands where `select` does, and `repeat = false` is not built. A `to` past the chart's measures fails the run at that step;
   - `quit`, last.
 - A step out of place (a result where no result shows, a capture no play follows) is refused when the file is loaded, naming the step.
 - `output` is a folder the run creates itself: it must not exist, and no folder below the file's on the way to it may be a link. Each capture is created new, never replacing a file. The run is a development tool started by the user who owns these folders, so a link swapped in during the run is outside its threat model.

@@ -34,6 +34,12 @@
 //! result = "next-preset"         # "prev-preset" | "retry" | "back"
 //!
 //! [[step]]
+//! practice = { path = "library/a/a.bms", from = 1, to = 2, speed = 75, lead_in_ms = 2000, gauge = 20, repeat = true, input = "logs/a.tprl", rounds = 1 }
+//! # or { search = "text", … }; measures from 1, both included; speed in
+//! # percent; the displayed gauge's initial value in percent; rounds
+//! # played, then the quit key at the next round's start and back
+//!
+//! [[step]]
 //! quit = {}
 //! ```
 
@@ -47,9 +53,10 @@ use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::time::Duration;
 
 use anyhow::Context as _;
-use bms_model::TimeUs;
+use bms_model::{Speed, TimeUs};
 use game::Command;
 use input::{QpcClock, ScriptedInput};
+use rules::GaugeValue;
 use serde::Deserialize;
 
 use super::{SelectScript, SelectStep};
@@ -77,6 +84,8 @@ pub enum StepKind {
     Capture,
     /// `quit`.
     Quit,
+    /// `practice`.
+    Practice,
 }
 
 impl fmt::Display for StepKind {
@@ -87,6 +96,7 @@ impl fmt::Display for StepKind {
             Self::Result => "result",
             Self::Capture => "capture",
             Self::Quit => "quit",
+            Self::Practice => "practice",
         })
     }
 }
@@ -200,6 +210,7 @@ enum Step {
     Result(ResultKind),
     Capture(CaptureSpec),
     Quit(Empty),
+    Practice(PracticeSpec),
 }
 
 impl Step {
@@ -210,6 +221,7 @@ impl Step {
             Self::Result(_) => StepKind::Result,
             Self::Capture(_) => StepKind::Capture,
             Self::Quit(_) => StepKind::Quit,
+            Self::Practice(_) => StepKind::Practice,
         }
     }
 }
@@ -274,6 +286,41 @@ struct CaptureSpec {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Empty {}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PracticeSpec {
+    path: Option<PathBuf>,
+    search: Option<String>,
+    from: i64,
+    to: i64,
+    speed: i64,
+    lead_in_ms: i64,
+    gauge: i64,
+    repeat: bool,
+    input: String,
+    rounds: i64,
+}
+
+/// What a `practice` step sets on the practice page, as the page's model
+/// holds it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PracticeGoal {
+    /// The first measure, by index.
+    pub from: usize,
+    /// Just past the last measure, by index.
+    pub to: usize,
+    /// The speed.
+    pub speed: Speed,
+    /// The lead-in.
+    pub lead_in: TimeUs,
+    /// The displayed gauge's initial value.
+    pub value: GaugeValue,
+    /// Whether rounds repeat.
+    pub repeat: bool,
+    /// The rounds' input.
+    pub input: InputRef,
+}
 
 /// A loaded scenario: its library, its compiled steps, and what the run
 /// keeps of it.
@@ -556,6 +603,33 @@ fn compile(file: &File, base: &Path, roots: &[(PathBuf, PathBuf)]) -> Result<Com
                 steps.push((SelectStep::Capture(k), o));
                 seq
             }
+            (Seq::Select, Step::Practice(p)) => {
+                let goal = practice_goal(p, base, &mut log_paths, &mut logs).map_err(at)?;
+                match (&p.path, &p.search) {
+                    (Some(path), None) => {
+                        let target = target(base, path, roots).map_err(at)?;
+                        steps.push((SelectStep::PickPath(target), o));
+                    }
+                    (None, Some(text)) => {
+                        steps.push((SelectStep::Query(text.clone()), o));
+                        steps.push((SelectStep::PickSearched(text.clone()), o));
+                    }
+                    _ => return Err(at("give either path or search".to_owned())),
+                }
+                // The rounds after the last are counted to its start.
+                let n = u16::try_from(p.rounds)
+                    .ok()
+                    .filter(|&n| n >= 1 && n.checked_add(1).is_some())
+                    .ok_or_else(|| at(format!("rounds must be 1 to {}", u16::MAX - 1)))?;
+                steps.push((SelectStep::PracticeKey(goal.input), o));
+                steps.push((SelectStep::PracticeSet(goal), o));
+                steps.push((SelectStep::PracticeStart, o));
+                steps.push((SelectStep::Rounds(n), o));
+                steps.push((SelectStep::PracticeBack, o));
+                waiting.clear();
+                chart_input = None;
+                Seq::Select
+            }
             (Seq::Select | Seq::Result, Step::Quit(Empty {})) => {
                 steps.push((SelectStep::Close, o));
                 Seq::End
@@ -579,6 +653,71 @@ fn compile(file: &File, base: &Path, roots: &[(PathBuf, PathBuf)]) -> Result<Com
         steps,
         logs,
         captures,
+    })
+}
+
+/// A `practice` step's page settings and input, checked: measures from 1
+/// with `to ≥ from`, a speed on the ladder in percent, a lead-in on the
+/// page's grid, a gauge value in percent, repeat on, and an input log (an
+/// autoplay session cannot practice), decoded once by its path.
+fn practice_goal(
+    p: &PracticeSpec,
+    base: &Path,
+    log_paths: &mut Vec<PathBuf>,
+    logs: &mut Vec<ScriptedInput>,
+) -> Result<PracticeGoal, String> {
+    let from = p
+        .from
+        .checked_sub(1)
+        .and_then(|f| usize::try_from(f).ok())
+        .ok_or("from must be 1 or more")?;
+    let to = usize::try_from(p.to)
+        .ok()
+        .filter(|&t| t > from)
+        .ok_or("to must be from or more")?;
+    let speed = (p.speed % 5 == 0)
+        .then(|| u32::try_from(p.speed / 5).ok())
+        .flatten()
+        .and_then(Speed::from_twentieths)
+        .ok_or("speed must be a multiple of 5 from 50 to 150")?;
+    let lead_in = p
+        .lead_in_ms
+        .checked_mul(1_000)
+        .map(TimeUs)
+        .filter(|l| {
+            (game::MIN_LEAD_IN..=game::MAX_LEAD_IN).contains(l) && l.0 % game::LEAD_IN_STEP.0 == 0
+        })
+        .ok_or("lead_in_ms must be from 1000 to 10000 in steps of 500")?;
+    let value = p
+        .gauge
+        .checked_mul(GaugeValue::PERCENT)
+        .filter(|_| (0..=100).contains(&p.gauge))
+        .map(GaugeValue)
+        .ok_or("gauge must be a percentage from 0 to 100")?;
+    if !p.repeat {
+        return Err("repeat = false is not supported; give repeat = true".to_owned());
+    }
+    if p.input == "auto" {
+        return Err("input cannot be auto: an autoplay session cannot practice".to_owned());
+    }
+    let path = resolve(base, Path::new(&p.input))?;
+    let k = match log_paths.iter().position(|l| *l == path) {
+        Some(k) => k,
+        None => {
+            logs.push(super::script(&path).map_err(|e| format!("{e:#}"))?);
+            log_paths.push(path);
+            log_paths.len() - 1
+        }
+    };
+    let input = InputRef::Log(u16::try_from(k).map_err(|_| "too many logs".to_owned())?);
+    Ok(PracticeGoal {
+        from,
+        to,
+        speed,
+        lead_in,
+        value,
+        repeat: true,
+        input,
     })
 }
 
@@ -973,6 +1112,16 @@ pub struct State {
     pub pending: Option<Origin>,
     /// The current play's `until`, until it is sent.
     pub until: Option<(TimeUs, Command)>,
+    /// The practice page as last shown.
+    pub practice: Option<game::PracticeScreen>,
+    /// Whether the page was shown since a step last pressed a key on it:
+    /// a key is pressed only on what the page shows.
+    pub shown: bool,
+    /// The rounds of the current `practice` step started so far.
+    pub rounds: u16,
+    /// The practice page's nearest approach to the goal its step sets,
+    /// in keys: only a page nearer than this is progress.
+    pub nearest: Option<u64>,
 }
 
 /// Runs the scenario of `args`: song selection, headless, on its steps.
@@ -1537,6 +1686,263 @@ mod tests {
         assert!(c.unfinished().is_empty());
         c.arm(2);
         assert_eq!(c.unfinished(), ["step 1 (capture): c.png did not run"]);
+    }
+
+    /// An input log of no events at `dir/log.tprl`.
+    fn write_log(dir: &Path) {
+        use replay::{
+            BuildProvenance, ChartRecord, DeviceRecord, EndStatus, PlayRecord, PlayType,
+            PresetRecord, ReceiveMethod, SourceRecord, Status, Versions,
+        };
+        let profile = game::DeviceSettings::default().profile(&[input::DeviceKind::Keyboard], &[]);
+        let rec = PlayRecord {
+            versions: Versions {
+                evaluator: 1,
+                app: "test".to_owned(),
+                provenance: BuildProvenance::Development,
+            },
+            chart: ChartRecord::default(),
+            preset: PresetRecord::of(&rules::tapestry()),
+            session_policy: "default".to_owned(),
+            devices: DeviceRecord {
+                sources: vec![SourceRecord {
+                    kind: replay::DeviceKind::Keyboard,
+                    receive: ReceiveMethod::Scripted,
+                    profile: profile.sources[0].clone(),
+                    axis_out_of_range: 0,
+                }],
+                audio_offset: TimeUs(0),
+                display_offset: TimeUs(0),
+                wake: replay::WakePolicy::Timer {
+                    heartbeat_us: 1_000,
+                },
+            },
+            play_type: PlayType::Full,
+            speed: bms_model::Speed::NORMAL,
+            start: eval::InputStart {
+                opened_at: TimeUs(-1_000_000),
+                held: Vec::new(),
+            },
+            events: Vec::new(),
+            arrivals: Vec::new(),
+            status: Status {
+                end: EndStatus::PlayedToEnd,
+                finalized: TimeUs(0),
+                incomplete: replay::Incomplete::default(),
+            },
+        };
+        fs::write(dir.join("log.tprl"), replay::encode(&rec)).unwrap();
+    }
+
+    /// A `practice` step of `fields` after the chart's path and before
+    /// `rounds`.
+    fn practice(fields: &str) -> String {
+        format!("practice = {{ path = \"library/a/a.bms\", {fields} }}")
+    }
+
+    /// The fields of a valid `practice` step, but `rounds`.
+    const FIELDS: &str = "from = 2, to = 3, speed = 75, lead_in_ms = 2500, gauge = 20, \
+                          repeat = true, input = \"log.tprl\"";
+
+    /// A `practice` step picks its chart as `select` does, presses P, sets
+    /// the page through its keys, starts, plays its rounds and goes back,
+    /// each compiled step naming it; measures become indices, from 0 and
+    /// past the last, and the input is the log's.
+    #[test]
+    fn practice_step_compiles_to_its_keys() {
+        use super::PracticeGoal;
+        let dir = folder();
+        write_log(dir.path());
+        let s = parse(
+            &file(
+                None,
+                &[
+                    &practice(&format!("{FIELDS}, rounds = 3")),
+                    "select = { search = \"x\" }",
+                    "play = { input = \"log.tprl\", until = \"end\" }",
+                    "quit = {}",
+                ],
+            ),
+            dir.path(),
+        )
+        .unwrap();
+        let mut script = s.script;
+        let mut got = Vec::new();
+        while let Some(step) = script.front().cloned() {
+            got.push((step, script.origin().unwrap()));
+            script.done();
+        }
+        let o = origin(1, StepKind::Practice);
+        let SelectStep::PickPath(target) = &got[0].0 else {
+            panic!("{got:?}");
+        };
+        assert_eq!(
+            target.path,
+            dir.path().join("library").join("a").join("a.bms")
+        );
+        let input = InputRef::Log(0);
+        let goal = PracticeGoal {
+            from: 1,
+            to: 3,
+            speed: bms_model::Speed::from_twentieths(15).unwrap(),
+            lead_in: TimeUs(2_500_000),
+            value: rules::GaugeValue(20 * rules::GaugeValue::PERCENT),
+            repeat: true,
+            input,
+        };
+        assert_eq!(
+            got[1..6],
+            [
+                (SelectStep::PracticeKey(input), o),
+                (SelectStep::PracticeSet(goal), o),
+                (SelectStep::PracticeStart, o),
+                (SelectStep::Rounds(3), o),
+                (SelectStep::PracticeBack, o),
+            ]
+        );
+        // The step stands where `select` does: a select may follow, and
+        // the same log is decoded once.
+        assert_eq!(got[6].1, origin(2, StepKind::Select));
+        assert_eq!(s.session.logs.len(), 1);
+        assert_eq!(
+            origin(1, StepKind::Practice).to_string(),
+            "step 1 (practice)"
+        );
+    }
+
+    /// Autoplay cannot practice: an `auto` input is refused naming the step.
+    #[test]
+    fn practice_with_auto_input_is_refused() {
+        let dir = folder();
+        let fields = FIELDS.replace("\"log.tprl\"", "\"auto\"");
+        assert_eq!(
+            refused(
+                dir.path(),
+                None,
+                &[&practice(&format!("{fields}, rounds = 1")), "quit = {}"]
+            ),
+            "step 1 (practice): input cannot be auto: an autoplay session cannot practice"
+        );
+    }
+
+    /// Only repeated rounds are scripted: `repeat = false` is refused.
+    #[test]
+    fn practice_must_repeat() {
+        let dir = folder();
+        write_log(dir.path());
+        let fields = FIELDS.replace("repeat = true", "repeat = false");
+        assert_eq!(
+            refused(
+                dir.path(),
+                None,
+                &[&practice(&format!("{fields}, rounds = 1")), "quit = {}"]
+            ),
+            "step 1 (practice): repeat = false is not supported; give repeat = true"
+        );
+    }
+
+    /// A practice where a result shows, or where a chosen chart's play is
+    /// due, is out of place.
+    #[test]
+    fn practice_on_a_result_is_refused() {
+        let dir = folder();
+        write_log(dir.path());
+        let step = practice(&format!("{FIELDS}, rounds = 1"));
+        let select = "select = { path = \"library/a/a.bms\" }";
+        let auto = "play = { input = \"auto\", until = \"end\" }";
+        assert_eq!(
+            refused(dir.path(), None, &[select, auto, &step, "quit = {}"]),
+            "step 3 (practice): practice cannot follow step 2 (play)"
+        );
+        assert_eq!(
+            refused(dir.path(), None, &[select, &step, "quit = {}"]),
+            "step 2 (practice): practice cannot follow step 1 (select)"
+        );
+        // A practice is not the last step.
+        assert_eq!(
+            refused(dir.path(), None, &[&step]),
+            "step 1 (practice): the last step must be quit"
+        );
+    }
+
+    /// Measures, speed, lead-in, gauge and rounds outside their bounds are
+    /// refused, the arithmetic checked: from from 1, to from `from`, the
+    /// speed on the ladder, the lead-in on the page's grid, rounds below
+    /// the most a count holds.
+    #[test]
+    fn practice_bounds_are_checked() {
+        let dir = folder();
+        write_log(dir.path());
+        let base = "path = \"library/a/a.bms\", repeat = true, input = \"log.tprl\"";
+        let ok = [
+            ("from", "1"),
+            ("to", "1"),
+            ("speed", "100"),
+            ("lead_in_ms", "1000"),
+            ("gauge", "100"),
+            ("rounds", "65534"),
+        ];
+        let step = |change: (&str, &str)| {
+            let fields: Vec<String> = ok
+                .iter()
+                .map(|&(k, v)| format!("{k} = {}", if k == change.0 { change.1 } else { v }))
+                .collect();
+            format!("practice = {{ {base}, {} }}", fields.join(", "))
+        };
+        assert!(
+            parse(
+                &file(None, &[&step(("from", "1")), "quit = {}"]),
+                dir.path()
+            )
+            .is_ok()
+        );
+        for (change, why) in [
+            (("from", "0"), "from must be 1 or more"),
+            (("from", "-9223372036854775808"), "from must be 1 or more"),
+            (("from", "2"), "to must be from or more"),
+            (("to", "-1"), "to must be from or more"),
+            (
+                ("speed", "45"),
+                "speed must be a multiple of 5 from 50 to 150",
+            ),
+            (
+                ("speed", "155"),
+                "speed must be a multiple of 5 from 50 to 150",
+            ),
+            (
+                ("speed", "77"),
+                "speed must be a multiple of 5 from 50 to 150",
+            ),
+            (
+                ("lead_in_ms", "500"),
+                "lead_in_ms must be from 1000 to 10000 in steps of 500",
+            ),
+            (
+                ("lead_in_ms", "10500"),
+                "lead_in_ms must be from 1000 to 10000 in steps of 500",
+            ),
+            (
+                ("lead_in_ms", "1250"),
+                "lead_in_ms must be from 1000 to 10000 in steps of 500",
+            ),
+            (
+                ("lead_in_ms", "9223372036854775807"),
+                "lead_in_ms must be from 1000 to 10000 in steps of 500",
+            ),
+            (("gauge", "101"), "gauge must be a percentage from 0 to 100"),
+            (
+                ("gauge", "9223372036854775807"),
+                "gauge must be a percentage from 0 to 100",
+            ),
+            (("rounds", "0"), "rounds must be 1 to 65534"),
+            (("rounds", "65535"), "rounds must be 1 to 65534"),
+        ] {
+            assert_eq!(
+                refused(dir.path(), None, &[&step(change), "quit = {}"]),
+                format!("step 1 (practice): {why}"),
+                "{change:?}"
+            );
+        }
     }
 
     /// The render thread stalled in a capture's read-back holds no lock:

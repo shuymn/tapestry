@@ -24,6 +24,7 @@ pub mod live;
 mod logic;
 mod policy;
 mod practice;
+mod practice_screen;
 mod prepare;
 pub mod presets;
 mod queue;
@@ -38,7 +39,7 @@ mod settings;
 mod sound;
 mod tuning;
 
-pub use app::{App, AppRig, IDLE_WAIT, LoadRefusal, Refused};
+pub use app::{App, AppRig, IDLE_WAIT, LoadRefusal, Pick, Refused};
 pub use audio_loop::{
     AudioControl, AudioCounters, AudioCtl, AudioLoadError, AudioProbe, AudioWaitError, AudioWorker,
     Probed, SWITCH_TIMEOUT, audio_control,
@@ -62,6 +63,10 @@ pub use policy::{
 pub use practice::{
     FADE, LEAD_IN, Practice, PracticeError, RESTORE_AHEAD, RESTORE_RETRY, RING_OUT, chart_end,
     mid_chart_start,
+};
+pub use practice_screen::{
+    LEAD_IN_STEP, MAX_LEAD_IN, MIN_LEAD_IN, PracticeActed, PracticeInput, PracticeRow,
+    PracticeScreen, measures,
 };
 pub use prepare::{
     BmsIngest, ChartIngest, ChartTransform, IngestError, Ingested, Passthrough, TransformId,

@@ -215,6 +215,10 @@ pub enum SessionError {
     /// ([`Chart::validate`]).
     #[error("the transformed chart is invalid")]
     Transform(#[source] ModelError),
+    /// The chart file is no longer the one loaded: its SHA-256 changed, so
+    /// it is not read again at another speed. Opening it anew loads it.
+    #[error("the chart file changed since it was loaded; open it again")]
+    ChartChanged(PathBuf),
 }
 
 fn io_error(path: &Path) -> impl FnOnce(io::Error) -> SessionError + '_ {
@@ -337,6 +341,8 @@ pub struct Loaded {
     settings: Settings,
     config: SessionConfig,
     parts: Parts,
+    /// The chart's file, read again at another speed.
+    path: PathBuf,
     chart: Chart,
     chart_record: ChartRecord,
     warnings: Vec<String>,
@@ -471,6 +477,7 @@ impl Loaded {
                     settings,
                     config,
                     parts,
+                    path: chart_path.to_owned(),
                     chart,
                     chart_record,
                     warnings,
@@ -527,6 +534,38 @@ impl Loaded {
     #[must_use]
     pub fn into_shelf(self) -> Shelf {
         self.shelf
+    }
+
+    /// The chart's file.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Reads the chart again from its file at `speed` (design.md "Practice
+    /// Speed Changes"), with the same seed and transform; the attempt
+    /// numbering, the shelf and the settings stay, and the practice set up
+    /// is cleared, its section being in the old speed's real time.
+    ///
+    /// # Errors
+    ///
+    /// [`SessionError::ChartChanged`] when the file's SHA-256 is not the
+    /// one loaded, and what reading it refuses; nothing changes then.
+    pub fn set_speed(&mut self, speed: Speed) -> Result<(), SessionError> {
+        let config = SessionConfig {
+            speed,
+            ..self.config.clone()
+        };
+        let (chart, chart_record, warnings) = Self::read_chart(&self.path, &config, &self.parts)?;
+        if chart_record.identity.sha256 != self.chart_record.identity.sha256 {
+            return Err(SessionError::ChartChanged(self.path.clone()));
+        }
+        self.config = config;
+        self.chart = chart;
+        self.chart_record = chart_record;
+        self.warnings = warnings;
+        self.practice = None;
+        Ok(())
     }
 
     /// Sets up practice (design.md "Mid-Chart Start and Section Repeat"):

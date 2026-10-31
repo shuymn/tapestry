@@ -19,14 +19,15 @@ use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-use bms_model::{Chart, ChartBuilder, SoundId, TimeSource, TimeUs, VirtualClock};
+use bms_model::{Chart, ChartBuilder, SoundId, Speed, TimeSource, TimeUs, VirtualClock};
 use common::{MS, lane};
 use eval::{ControlId, JudgeEventKind};
 use game::{
     AbortCause, App, AppRig, AudioQueue, AudioWaitError, ChartIngest, Closing, Command, DataRoot,
     DeviceSettings, IngestError, Ingested, InputWaitError, LiveError, LoadRefusal, Loaded,
-    LogicError, MenuCommand, Opening, Parts, PlayEnd, PlayReport, Refused, RenderSide, Rig,
-    SessionConfig, SessionError, SessionEvent, SessionEventSink, Settings,
+    LogicError, MenuCommand, Opening, Parts, Pick, PlayEnd, PlayReport, PracticeInput,
+    PracticeScreen, Refused, RenderSide, Rig, SessionConfig, SessionError, SessionEvent,
+    SessionEventSink, Settings,
 };
 use input::{
     Action, DeviceId, DeviceKind, InputAdapter, Packet, ScriptItem, ScriptedInput, SourceReader,
@@ -80,13 +81,19 @@ fn silent() -> Chart {
         .unwrap()
 }
 
-/// The presses that hit `chart`'s notes, on its play timeline.
-fn presses(chart: usize) -> &'static [(i64, ControlId)] {
-    match chart {
-        0 => &[(1_000 * MS, Z), (1_500 * MS, Z)],
-        1 => &[(1_200 * MS, Z), (1_400 * MS, X)],
-        _ => &[],
-    }
+/// The practice chart: 120 BPM, measure 0 empty, four taps on lane 1 in
+/// each of measures 1 and 2 (2.0 s to 5.5 s at 1×).
+const PRACTICE: &str = "#BPM 120\n#00111:01010101\n#00211:01010101\n";
+
+/// The presses that hit the loaded `chart`'s taps on lanes 1 and 3, on its
+/// play timeline.
+fn presses(chart: &Chart) -> Vec<(i64, ControlId)> {
+    let mut hits: Vec<(i64, ControlId)> = [(1, Z), (3, X)]
+        .into_iter()
+        .flat_map(|(l, c)| chart.lanes[l].iter().map(move |n| (n.time.0, c)))
+        .collect();
+    hits.sort_unstable();
+    hits
 }
 
 /// Reads a chart by the file's contents.
@@ -109,6 +116,10 @@ impl ChartIngest for Charts {
         speed: bms_model::Speed,
     ) -> Result<Ingested, IngestError> {
         let chart = match bytes {
+            // BMS text, through the loader at the session's speed.
+            text if text.starts_with(b"#BPM") => {
+                return game::BmsIngest.ingest(text, dir, seed, speed);
+            }
             // A 40-minute BMS chart, through the loader at the session's
             // speed.
             b"slow" => {
@@ -171,6 +182,10 @@ enum Refusal {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Act {
     Choose(usize),
+    /// P on chart `.0`: its practice screen.
+    Practice(usize),
+    /// An input on the practice screen.
+    Page(PracticeInput),
     Retry,
     Quit,
     Back,
@@ -186,6 +201,8 @@ enum Seen {
     Refused(usize),
     Load(usize),
     Shown(u32),
+    /// The practice screen entered, with its notice.
+    Practice(Option<String>),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -215,6 +232,9 @@ struct Headless {
     unsaved: Vec<usize>,
     #[cfg(feature = "dev-tools")]
     configured: Vec<usize>,
+    /// Charts the hook sets to autoplay (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    autoplay: Vec<usize>,
     sounds: Option<AudioQueue>,
     sealed: bool,
     waits_since_seal: usize,
@@ -251,6 +271,20 @@ struct Headless {
     idle_waits: Vec<(i64, i64)>,
     /// Edits of the files run once the clock reaches their time.
     edits: Vec<(i64, Box<dyn FnOnce()>)>,
+    /// The presses that hit the loaded chart's notes.
+    hits: Vec<(i64, ControlId)>,
+    /// Each load's speed, in order.
+    speeds: Vec<Speed>,
+    /// Each entry into the practice screen, with the model it was given.
+    practice_entries: Vec<PracticeScreen>,
+    /// The practice screen as last shown.
+    practice_shown: Option<PracticeScreen>,
+    /// Rounds whose restore is refused before the opening, from the next.
+    restore_fails: usize,
+    /// Rounds opened, by their restore point.
+    restores: Vec<TimeUs>,
+    /// Whether each load was a practice's Start, as `loads`.
+    practiced: Vec<bool>,
     /// Each shelf state selection was shown, with its clock time: the
     /// revision and the chosen file's error, or why it cannot open.
     presets: Vec<(i64, PresetsSeen)>,
@@ -268,12 +302,13 @@ struct Play {
 
 impl Headless {
     fn new(dir: &Path, refusal: Refusal, acts: Vec<(i64, Act)>) -> Self {
-        let paths: Vec<_> = ["a", "b", "refused"]
+        let paths: Vec<_> = ["a", "b", "refused", "practice"]
             .iter()
             .map(|n| dir.join(format!("{n}.chart")))
             .collect();
         std::fs::write(&paths[0], b"a").unwrap();
         std::fs::write(&paths[1], b"b").unwrap();
+        std::fs::write(&paths[3], PRACTICE).unwrap();
         match refusal {
             Refusal::Missing => {}
             Refusal::Bank | Refusal::Preset => std::fs::write(&paths[2], b"a").unwrap(),
@@ -304,6 +339,8 @@ impl Headless {
             unsaved: Vec::new(),
             #[cfg(feature = "dev-tools")]
             configured: Vec::new(),
+            #[cfg(feature = "dev-tools")]
+            autoplay: Vec::new(),
             sounds: None,
             sealed: false,
             waits_since_seal: 0,
@@ -330,6 +367,13 @@ impl Headless {
             idle_waits: Vec::new(),
             edits: Vec::new(),
             presets: Vec::new(),
+            hits: Vec::new(),
+            speeds: Vec::new(),
+            practice_entries: Vec::new(),
+            practice_shown: None,
+            restore_fails: 0,
+            restores: Vec::new(),
+            practiced: Vec::new(),
         }
     }
 
@@ -387,7 +431,9 @@ impl Headless {
         }
     }
 
-    fn play_script(&self, chart: usize, origin: i64) -> ScriptedInput {
+    /// The presses of the loaded chart from `origin` on the clock, those
+    /// not yet past at `now`.
+    fn play_script(&self, origin: i64, now: i64) -> ScriptedInput {
         let key = |at: i64, control: ControlId, value: i32| ScriptItem {
             at: TimeUs(at),
             action: Action::Packet(Packet {
@@ -398,8 +444,9 @@ impl Headless {
             }),
         };
         ScriptedInput::new(
-            presses(chart)
+            self.hits
                 .iter()
+                .filter(|&&(t, _)| origin + t > now)
                 .flat_map(|&(t, c)| [key(origin + t, c, 1), key(origin + t + 50 * MS, c, 0)])
                 .collect(),
         )
@@ -484,7 +531,7 @@ impl Rig for Headless {
         }
         self.sources.gate_mut().reset();
         let start = self.sources.open_play(now, origin);
-        self.script = self.play_script(self.chosen.unwrap(), origin.0);
+        self.script = self.play_script(origin.0, now.0);
         self.opened = true;
         Ok(Opening {
             origin,
@@ -544,7 +591,16 @@ impl Rig for Headless {
     }
 
     fn ring_out(&mut self, _fade_at: TimeUs, _end_at: TimeUs) {
-        panic!("this rig plays no practice round");
+        self.sealed = true;
+    }
+
+    fn restore_ready(&mut self, at: TimeUs) -> Result<(), game::RestoreError> {
+        if self.restore_fails > 0 {
+            self.restore_fails -= 1;
+            return Err(game::RestoreError::NotPrepared);
+        }
+        self.restores.push(at);
+        Ok(())
     }
 
     fn audio_done(&self) -> bool {
@@ -631,11 +687,16 @@ impl AppRig for Headless {
             parts.records = None;
             config.seed = 99;
         }
+        if self.autoplay.contains(&i) {
+            config.autoplay = Some(game::AutoKeySounds::Scheduled);
+        }
     }
 
-    fn choose(&mut self) -> Option<PathBuf> {
-        let Act::Choose(i) = self.due_act()? else {
-            return None;
+    fn choose(&mut self) -> Option<Pick> {
+        let (i, practice) = match self.due_act()? {
+            Act::Choose(i) => (i, false),
+            Act::Practice(i) => (i, true),
+            _ => return None,
         };
         self.consume();
         if !self.in_selection {
@@ -645,10 +706,17 @@ impl AppRig for Headless {
         self.in_selection = false;
         self.chooses += 1;
         self.chosen = Some(i);
-        Some(self.paths[i].clone())
+        let path = self.paths[i].clone();
+        Some(if practice {
+            Pick::Practice(path)
+        } else {
+            Pick::Play(path)
+        })
     }
 
-    fn load_chart(&mut self, _loaded: &Loaded) -> Result<(), BankLost> {
+    fn load_chart(&mut self, loaded: &Loaded) -> Result<(), BankLost> {
+        self.hits = presses(loaded.chart());
+        self.speeds.push(loaded.config().speed);
         let i = self.chosen.unwrap();
         if self.close_in_load {
             self.quitting = true;
@@ -658,6 +726,7 @@ impl AppRig for Headless {
         }
         self.seen.push(Seen::Load(i));
         self.loads.push((i, Vec::new()));
+        self.practiced.push(loaded.practice().is_some());
         Ok(())
     }
 
@@ -666,7 +735,7 @@ impl AppRig for Headless {
             self.violations
                 .push("a refusal shown outside selection".to_owned());
         }
-        if refusal.chart != self.paths[2] {
+        if refusal.chart != self.paths[self.chosen.unwrap()] {
             self.violations
                 .push(format!("refused {}", refusal.chart.display()));
         }
@@ -682,6 +751,8 @@ impl AppRig for Headless {
             Refused::Play(LogicError::Eval(eval::EvalError::NoJudgeableNotes)) => "no notes",
             Refused::Play(LogicError::RecordingTooLarge { .. }) => "too long",
             Refused::Play(e) => panic!("{e:?}"),
+            Refused::Practice(game::PracticeError::Autoplay) => "autoplay",
+            Refused::Practice(e) => panic!("{e:?}"),
         };
         self.refusals.push(kind.to_owned());
         // The player fixes the preset file once its refusal is shown.
@@ -702,6 +773,25 @@ impl AppRig for Headless {
         self.in_selection = true;
         self.entries += 1;
         self.seen.push(Seen::Select);
+    }
+
+    fn entered_practice(&mut self, screen: &PracticeScreen) {
+        self.seen
+            .push(Seen::Practice(screen.notice().map(str::to_owned)));
+        self.practice_entries.push(screen.clone());
+        self.practice_shown = Some(screen.clone());
+    }
+
+    fn show_practice(&mut self, screen: &PracticeScreen) {
+        self.practice_shown = Some(screen.clone());
+    }
+
+    fn take_practice(&mut self) -> Option<PracticeInput> {
+        let Act::Page(input) = self.due_act()? else {
+            return None;
+        };
+        self.consume();
+        Some(input)
     }
 }
 
@@ -1418,6 +1508,333 @@ fn select_poll_runs_at_its_deadline_after_an_early_wake() {
     }
 }
 
+/// The practice chart's index.
+const P: usize = 3;
+
+/// `n` presses of `input` on the practice screen, 10 ms apart.
+fn page(input: PracticeInput, n: usize) -> impl Iterator<Item = (i64, Act)> {
+    std::iter::repeat_n((10, Act::Page(input)), n)
+}
+
+/// From the first row: the speed set `down` steps below 100 %, then the
+/// cursor on Start.
+fn to_start(down: usize) -> Vec<(i64, Act)> {
+    use PracticeInput::{Down, Left};
+    let mut acts: Vec<(i64, Act)> = page(Down, 2).collect();
+    acts.extend(page(Left, down));
+    acts.extend(page(Down, 4));
+    acts
+}
+
+fn notices(rig: &Headless) -> Vec<Option<String>> {
+    rig.seen
+        .iter()
+        .filter_map(|s| match s {
+            Seen::Practice(n) => Some(n.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// P on the practice chart opens its screen at 1×; 75 % with repeat on
+/// and Start load it at that speed and play round 1 to the end of its
+/// ring-out, then round 2 with no result between; the quit key in round
+/// 2 returns to the practice screen, and Back to selection. Round 1's
+/// record is a section repeat at 15/20, attempt 1.
+#[test]
+fn practice_screen_repeats_and_quits() {
+    let mut acts = vec![(0, Act::Practice(P))];
+    acts.extend(to_start(5));
+    acts.push((10, Act::Page(PracticeInput::Confirm)));
+    // Round 1 runs about 11 s at 75 %: the quit falls inside round 2.
+    acts.push((14_000, Act::Quit));
+    acts.push((500, Act::Page(PracticeInput::Back)));
+    acts.push((500, Act::Close));
+    let (rig, events, ran) = run(Refusal::Missing, acts, |_| {});
+    ran.unwrap();
+    assert!(rig.violations.is_empty(), "{:?}", rig.violations);
+    assert_eq!(
+        rig.seen,
+        [
+            Seen::Select,
+            Seen::Practice(None),
+            Seen::Load(P),
+            Seen::Practice(None),
+            Seen::Select,
+        ]
+    );
+    let speed = Speed::from_twentieths(15).unwrap();
+    assert_eq!(rig.speeds, [speed]);
+    let [(P, reports)] = &rig.loads[..] else {
+        panic!("{:?}", rig.seen);
+    };
+    assert_eq!(attempts(reports), [1, 2]);
+    let first = &reports[0];
+    assert_eq!((first.end, first.tail_cut), (PlayEnd::Completed, None));
+    let record = first.record.as_ref().unwrap();
+    assert!(
+        matches!(record.play_type, replay::PlayType::SectionRepeat(_)),
+        "{:?}",
+        record.play_type
+    );
+    assert_eq!(record.speed, speed);
+    assert!(matches!(first.saved, Some(Ok(_))), "{:?}", first.saved);
+    assert!(first.result.as_ref().unwrap().matches_live);
+    // Every tap of the chart is a target, and every one was hit.
+    let judged = first
+        .live
+        .iter()
+        .filter(|e| matches!(e.kind, JudgeEventKind::Judged { .. }))
+        .count();
+    assert_eq!(judged, 8);
+    assert_eq!(reports[1].end, PlayEnd::Aborted(game::AbortCause::Quit));
+    // No result between the rounds, nor after them.
+    assert_eq!(
+        events.count(|e| matches!(e, SessionEvent::Result { .. })),
+        0
+    );
+    // The model came back as it was left: 75 %, its 1× measures.
+    let [entered, back] = &rig.practice_entries[..] else {
+        panic!("{:?}", rig.seen);
+    };
+    assert_eq!(back.speed(), speed);
+    assert_eq!(back.measures(), entered.measures());
+}
+
+/// Every Start loads the chart, at an unchanged speed too: a first entry
+/// at 100 % loads, a second Start loads again, and practicing A then B
+/// at the same speed loads B.
+#[test]
+fn start_always_loads_the_current_chart() {
+    use PracticeInput::{Back, Confirm};
+    let mut acts = vec![(0, Act::Practice(0))];
+    acts.extend(to_start(0));
+    acts.extend([
+        (10, Act::Page(Confirm)),
+        (3_000, Act::Quit),
+        (500, Act::Page(Confirm)),
+        (3_000, Act::Quit),
+        (500, Act::Page(Back)),
+        (500, Act::Practice(1)),
+    ]);
+    acts.extend(to_start(0));
+    acts.extend([
+        (10, Act::Page(Confirm)),
+        (3_000, Act::Quit),
+        (500, Act::Page(Back)),
+        (500, Act::Close),
+    ]);
+    let (rig, _events, ran) = run(Refusal::Missing, acts, |_| {});
+    ran.unwrap();
+    assert!(rig.violations.is_empty(), "{:?}", rig.violations);
+    let loads: Vec<&Seen> = rig
+        .seen
+        .iter()
+        .filter(|s| matches!(s, Seen::Load(_)))
+        .collect();
+    assert_eq!(loads, [&Seen::Load(0), &Seen::Load(0), &Seen::Load(1)]);
+    assert_eq!(rig.speeds, [Speed::NORMAL; 3]);
+}
+
+/// A Start refused for its restore, for a section without targets, and
+/// for the logic step's refusal at the opening each leave the player on
+/// the practice screen with the reason, entered again; a practice in an
+/// autoplay session is refused on the select screen.
+#[test]
+fn practice_refusals_stay_on_the_practice_screen() {
+    use PracticeInput::{Back, Confirm, Down, Left, Up};
+    // The restore refused, then measure 1 alone, which has no targets.
+    let mut acts = vec![(0, Act::Practice(P))];
+    acts.extend(to_start(0));
+    acts.push((10, Act::Page(Confirm)));
+    acts.extend(page(Up, 5));
+    acts.extend(page(Left, 10));
+    acts.extend(page(Down, 5));
+    acts.extend([
+        (10, Act::Page(Confirm)),
+        (500, Act::Page(Back)),
+        (500, Act::Close),
+    ]);
+    let (rig, events, ran) = run(Refusal::Missing, acts, |rig| rig.restore_fails = 1);
+    ran.unwrap();
+    assert!(rig.violations.is_empty(), "{:?}", rig.violations);
+    let n = notices(&rig);
+    assert_eq!(n.len(), 3, "{:?}", rig.seen);
+    assert_eq!(n[0], None);
+    assert!(n[1].as_deref().unwrap().contains("restore"), "{:?}", n[1]);
+    assert!(
+        n[2].as_deref().unwrap().contains("no notes to play"),
+        "{:?}",
+        n[2]
+    );
+    // The restore was refused after the load and before any opening; the
+    // section without targets before any load.
+    assert_eq!(rig.seen.iter().filter(|s| **s == Seen::Load(P)).count(), 1);
+    assert_eq!(rig.starts, 0);
+    assert!(rig.refused_opens.is_empty());
+    assert_eq!(events.count(|e| matches!(e, SessionEvent::Start { .. })), 0);
+    assert_eq!(rig.seen.last(), Some(&Seen::Select));
+
+    // The logic step refuses the 70-minute chart's round at its opening.
+    let mut acts = vec![(0, Act::Practice(2))];
+    acts.extend(to_start(0));
+    acts.extend([
+        (10, Act::Page(Confirm)),
+        (500, Act::Page(Back)),
+        (500, Act::Close),
+    ]);
+    let (rig, _events, ran) = run(Refusal::TooLong, acts, |_| {});
+    ran.unwrap();
+    assert!(rig.violations.is_empty(), "{:?}", rig.violations);
+    let n = notices(&rig);
+    assert_eq!(n.len(), 2, "{:?}", rig.seen);
+    assert!(
+        n[1].as_deref().unwrap().contains("too long to record"),
+        "{:?}",
+        n[1]
+    );
+    assert_eq!(rig.refused_opens, [2]);
+    assert_eq!(rig.starts, 0);
+    assert_eq!(rig.seen.last(), Some(&Seen::Select));
+}
+
+/// An autoplay session's practice is refused on the select screen, which
+/// shows why; the chart's practice screen never opens.
+#[cfg(feature = "dev-tools")]
+#[test]
+fn an_autoplay_practice_is_refused_on_selection() {
+    let acts = vec![(0, Act::Practice(P)), (500, Act::Close)];
+    let (rig, _events, ran) = run(Refusal::Missing, acts, |rig| rig.autoplay = vec![P]);
+    ran.unwrap();
+    assert!(rig.violations.is_empty(), "{:?}", rig.violations);
+    assert_eq!(rig.seen, [Seen::Select, Seen::Select, Seen::Refused(P)]);
+    assert_eq!(rig.refusals, ["autoplay"]);
+}
+
+/// Every return to the practice screen enters it again with the model it
+/// opened with: after the logic step's refusal at the opening, and after
+/// a round's result (repeat off) is left with Back. The model is never
+/// built again from the chart at the round's speed.
+#[test]
+fn every_return_reenters_the_practice_screen() {
+    use PracticeInput::{Confirm, Down, Right};
+    let mut acts = vec![(0, Act::Practice(P))];
+    acts.extend(page(Down, 2));
+    acts.extend(page(PracticeInput::Left, 5));
+    acts.extend(page(Down, 3));
+    // Repeat off.
+    acts.push((10, Act::Page(Right)));
+    acts.extend(page(Down, 1));
+    acts.push((10, Act::Page(Confirm)));
+    // Round 1 completes and shows its result.
+    acts.push((14_000, Act::Back));
+    acts.extend([(500, Act::Page(PracticeInput::Back)), (500, Act::Close)]);
+    let (rig, events, ran) = run(Refusal::Missing, acts, |_| {});
+    ran.unwrap();
+    assert!(rig.violations.is_empty(), "{:?}", rig.violations);
+    assert_eq!(
+        rig.seen,
+        [
+            Seen::Select,
+            Seen::Practice(None),
+            Seen::Load(P),
+            Seen::Shown(1),
+            Seen::Practice(None),
+            Seen::Select,
+        ]
+    );
+    assert_eq!(
+        events.count(|e| matches!(e, SessionEvent::Result { .. })),
+        1
+    );
+    let [(P, reports)] = &rig.loads[..] else {
+        panic!("{:?}", rig.seen);
+    };
+    let record = reports[0].record.as_ref().unwrap();
+    assert!(
+        matches!(record.play_type, replay::PlayType::MidChartStart(_)),
+        "{:?}",
+        record.play_type
+    );
+    let [entered, back] = &rig.practice_entries[..] else {
+        panic!("{:?}", rig.seen);
+    };
+    // The 1× measures the screen opened with, and the values left there.
+    assert_eq!(back.measures(), entered.measures());
+    assert_eq!(back.measures()[1], TimeUs(2_000 * MS));
+    assert_eq!(back.speed(), Speed::from_twentieths(15).unwrap());
+    assert!(!back.repeat());
+
+    // After a refusal at the opening too.
+    let mut acts = vec![(0, Act::Practice(2))];
+    acts.extend(to_start(0));
+    acts.extend([
+        (10, Act::Page(Confirm)),
+        (500, Act::Page(PracticeInput::Back)),
+        (500, Act::Close),
+    ]);
+    let (rig, _events, ran) = run(Refusal::TooLong, acts, |_| {});
+    ran.unwrap();
+    let [entered, back] = &rig.practice_entries[..] else {
+        panic!("{:?}", rig.seen);
+    };
+    assert_eq!(back.measures(), entered.measures());
+    assert!(back.notice().is_some());
+}
+
+/// A speed change whose chart file changed since the practice screen
+/// opened is refused on the screen, with no load and the screen as it was;
+/// opening practice again reads the new file and plays.
+#[test]
+fn a_changed_chart_file_refuses_a_speed_change() {
+    use PracticeInput::{Back, Confirm};
+    let mut acts = vec![(0, Act::Practice(P))];
+    acts.extend(to_start(5));
+    acts.extend([
+        (10, Act::Page(Confirm)),
+        (500, Act::Page(Back)),
+        (500, Act::Practice(P)),
+    ]);
+    acts.extend(to_start(0));
+    acts.extend([
+        (10, Act::Page(Confirm)),
+        (3_000, Act::Quit),
+        (500, Act::Page(Back)),
+        (500, Act::Close),
+    ]);
+    let (rig, _events, ran) = run(Refusal::Missing, acts, |rig| {
+        let path = rig.paths[P].clone();
+        let at = CLOCK_START + 20 * MS;
+        rig.edits.push((
+            at,
+            Box::new(move || {
+                std::fs::write(path, format!("{PRACTICE}#00411:01\n")).unwrap();
+            }),
+        ));
+    });
+    ran.unwrap();
+    assert!(rig.violations.is_empty(), "{:?}", rig.violations);
+    let n = notices(&rig);
+    assert!(
+        n[1].as_deref().unwrap().contains("changed"),
+        "{:?}",
+        rig.seen
+    );
+    // The refused Start loaded nothing; the screen kept its 75 %.
+    assert_eq!(rig.speeds, [Speed::NORMAL]);
+    assert_eq!(
+        rig.practice_entries[1].speed(),
+        Speed::from_twentieths(15).unwrap()
+    );
+    // Opened again, the new file's measures 3 and 4 are there.
+    let reopened = &rig.practice_entries[2];
+    assert_eq!(
+        reopened.measures().len(),
+        rig.practice_entries[0].measures().len() + 2
+    );
+    assert_eq!(rig.loads.len(), 1);
+}
+
 fn act() -> impl Strategy<Value = Act> {
     prop_oneof![
         6 => (0..3_usize).prop_map(Act::Choose),
@@ -1427,6 +1844,26 @@ fn act() -> impl Strategy<Value = Act> {
         1 => Just(Act::Next),
         1 => Just(Act::Prev),
         1 => Just(Act::Close),
+    ]
+}
+
+/// One action, or a practice: P on a chart (the practice chart among
+/// them), Start at 100 %, the quit key some time in, and Back on the page.
+fn step() -> impl Strategy<Value = Vec<(i64, Act)>> {
+    let practice =
+        (0..3_000_i64, 0..=P, 0..4_000_i64, 0..3_000_i64).prop_map(|(after, chart, quit, back)| {
+            let mut acts = vec![(after, Act::Practice(chart))];
+            acts.extend(to_start(0));
+            acts.extend([
+                (10, Act::Page(PracticeInput::Confirm)),
+                (quit, Act::Quit),
+                (back, Act::Page(PracticeInput::Back)),
+            ]);
+            acts
+        });
+    prop_oneof![
+        8 => (0..3_000_i64, act()).prop_map(|a| vec![a]),
+        2 => practice,
     ]
 }
 
@@ -1442,9 +1879,10 @@ fn refusal() -> impl Strategy<Value = Refusal> {
 proptest! {
     #![proptest_config(ProptestConfig { cases: 64, ..ProptestConfig::default() })]
 
-    /// Random selections, retries, quits, backs, preset switches and
-    /// closes at random times, over two built charts and one refused
-    /// chart: the run ends cleanly; every play that finalized anything has
+    /// Random selections, retries, quits, backs, preset switches, closes
+    /// and practices (P, Start, the quit key, Back) at random times, over
+    /// two built charts, one refused chart and the practice chart: the run
+    /// ends cleanly; every play that finalized anything has
     /// a saved record that re-evaluates equal to live; attempts count from
     /// 1 per chart; every play is reserved at its countdown's start, before
     /// any wait and with nothing allocated after its handoff; and every
@@ -1453,9 +1891,11 @@ proptest! {
     fn any_command_sequence_ends_cleanly(
         refusal in refusal(),
         first in 0..3_usize,
-        rest in proptest::collection::vec((0..3_000_i64, act()), 0..20),
+        rest in proptest::collection::vec(step(), 0..20),
     ) {
-        let acts = std::iter::once((0, Act::Choose(first))).chain(rest).collect();
+        let acts = std::iter::once((0, Act::Choose(first)))
+            .chain(rest.into_iter().flatten())
+            .collect();
         counting::track(true);
         counting::thread_self_check();
         counting::track(false);
@@ -1463,8 +1903,15 @@ proptest! {
         prop_assert!(ran.is_ok(), "{:?}", ran);
         prop_assert!(rig.quitting);
         prop_assert!(rig.violations.is_empty(), "{:?}", rig.violations);
-        for (chart, plays) in &rig.loads {
-            let expected: Vec<u32> = (1..).take(plays.len()).collect();
+        // A chart's plays count from 1; a practice's Starts go on counting
+        // the plays of its one load.
+        for ((chart, plays), &practiced) in rig.loads.iter().zip(&rig.practiced) {
+            let from = if practiced {
+                plays.first().map_or(1, |p| p.attempt)
+            } else {
+                1
+            };
+            let expected: Vec<u32> = (from..).take(plays.len()).collect();
             prop_assert_eq!(attempts(plays), expected, "chart {}", chart);
         }
         // Every play handed over was closed and reported, and each that

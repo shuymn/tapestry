@@ -465,6 +465,22 @@ impl Run {
                     section,
                     reply,
                 }) => {
+                    // What the screen draws of the chart (dev-tools): a
+                    // section's targets only.
+                    #[cfg(feature = "dev-tools")]
+                    {
+                        let notes = || chart.lanes.iter().flatten();
+                        match &section {
+                            Some(s) => println!(
+                                "dev: render: a section's {} targets of {} notes are drawn",
+                                notes().filter(|n| s.is_target(n)).count(),
+                                notes().count()
+                            ),
+                            None => {
+                                println!("dev: render: all {} notes are drawn", notes().count())
+                            }
+                        }
+                    }
                     self.chart = Some(chart);
                     self.section = section;
                     let ready = self.prepare();

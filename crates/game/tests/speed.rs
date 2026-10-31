@@ -216,3 +216,59 @@ fn windows_stay_in_real_time_at_half_speed() {
     // time too.
     assert_eq!((half_tail, normal_tail), (180 * MS, 180 * MS));
 }
+
+/// A speed change reads the chart again from its file at the new speed,
+/// with the same seed and transform, and keeps the session: the attempt
+/// numbering, the preset and the settings go on, and the practice set up
+/// at the old speed is cleared. A file whose SHA-256 changed, or one that
+/// cannot be read, is refused with nothing changed.
+#[test]
+fn set_speed_reloads_the_chart_and_keeps_the_session() {
+    let (_dir, root) = temp_root();
+    let settings = tapestry_settings(&root);
+    let parts = Parts::standard(&root, &settings.player);
+    let path = chart_file(&root, SECONDS);
+    let mut loaded =
+        Loaded::load(root.clone(), settings, &path, config(Speed::NORMAL), parts).unwrap();
+    let practice = game::mid_chart_start(
+        loaded.chart(),
+        Speed::NORMAL,
+        loaded.preset(),
+        TimeUs(4_000 * MS),
+    );
+    loaded.set_practice(Some(practice)).unwrap();
+    assert_eq!(loaded.begin_play().attempt, 1);
+    let normal = loaded.chart().clone();
+    let (preset, settings) = (loaded.preset().clone(), loaded.settings().clone());
+    loaded.set_speed(Speed::SLOWEST).unwrap();
+    assert_eq!(loaded.config().speed, Speed::SLOWEST);
+    assert_eq!(loaded.path(), path);
+    assert_eq!(loaded.practice(), None);
+    assert_eq!(loaded.section(), None);
+    let times = |c: &bms_model::Chart| c.lanes[1].iter().map(|n| n.time.0).collect::<Vec<_>>();
+    let doubled: Vec<i64> = times(&normal).iter().map(|t| t * 2).collect();
+    assert_eq!(times(loaded.chart()), doubled);
+    let id = |c: &bms_model::Chart| (c.identity.sha256, c.identity.resolved_hash);
+    assert_eq!(id(loaded.chart()), id(&normal));
+    assert_eq!(loaded.preset(), &preset);
+    assert_eq!(loaded.settings(), &settings);
+    assert_eq!(loaded.begin_play().attempt, 2);
+    // The file changed: refused, nothing changed.
+    let slowest = loaded.chart().clone();
+    fs::write(&path, format!("{SECONDS}#00411:01\n")).unwrap();
+    let e = loaded.set_speed(Speed::NORMAL).unwrap_err();
+    assert_eq!(e, game::SessionError::ChartChanged(path.clone()));
+    assert_eq!(loaded.config().speed, Speed::SLOWEST);
+    assert_eq!(loaded.chart(), &slowest);
+    // The file gone: refused, nothing changed.
+    fs::remove_file(&path).unwrap();
+    let e = loaded.set_speed(Speed::NORMAL).unwrap_err();
+    assert!(matches!(e, game::SessionError::Io { .. }), "{e:?}");
+    assert_eq!(loaded.config().speed, Speed::SLOWEST);
+    assert_eq!(loaded.chart(), &slowest);
+    // The same file again: the speed changes, the numbering goes on.
+    fs::write(&path, SECONDS).unwrap();
+    loaded.set_speed(Speed::NORMAL).unwrap();
+    assert_eq!(loaded.chart().lanes, normal.lanes);
+    assert_eq!(loaded.begin_play().attempt, 3);
+}

@@ -447,7 +447,7 @@ impl Shelf {
 
     /// Whether a pause is requested and not released.
     #[cfg(test)]
-    const fn paused(&self) -> bool {
+    pub const fn paused(&self) -> bool {
         self.paused
     }
 

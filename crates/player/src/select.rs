@@ -50,6 +50,8 @@ pub enum MenuKey {
     Tab,
     Backspace,
     Escape,
+    /// P: the practice screen of the chart under the cursor.
+    Practice,
 }
 
 /// What the window hands the select screen.
@@ -212,6 +214,8 @@ pub enum Acted {
     Focus(bool),
     /// The chart under the cursor was chosen.
     Choose(PathBuf),
+    /// The chart under the cursor is to be practiced.
+    Practice(PathBuf),
 }
 
 /// The orders, in the order Left and Right cycle them, with their labels.
@@ -421,12 +425,16 @@ impl SelectScreen {
                 self.searching = true;
                 return Acted::Focus(true);
             }
-            MenuKey::Enter => {
+            MenuKey::Enter | MenuKey::Practice => {
                 return match self.selected() {
                     Some(e) => {
                         let path = e.path.clone();
                         self.notice = None;
-                        Acted::Choose(path)
+                        if key == MenuKey::Practice {
+                            Acted::Practice(path)
+                        } else {
+                            Acted::Choose(path)
+                        }
                     }
                     None => Acted::Nothing,
                 };
@@ -532,7 +540,7 @@ impl SelectScreen {
             lines.push(line(String::new(), LineStyle::Chart));
         }
         lines.push(line(
-            "↑↓ 選択  Enter 決定  Tab 検索  ←→ 並び順  F1-F8 設定  ウィンドウを閉じて終了"
+            "↑↓ 選択  Enter 決定  P 練習  Tab 検索  ←→ 並び順  F1-F8 設定  ウィンドウを閉じて終了"
                 .to_owned(),
             LineStyle::Help,
         ));
@@ -779,6 +787,28 @@ mod tests {
         // The retry and quit keys do nothing here.
         assert_eq!(s.input(key(MenuKey::Backspace)), Acted::Nothing);
         assert_eq!(s.input(key(MenuKey::Escape)), Acted::Nothing);
+    }
+
+    /// P picks the chart under the cursor for practice; while the search
+    /// box has focus it picks nothing, its letter arriving as text; with
+    /// nothing listed it does nothing.
+    #[test]
+    fn practice_key_picks_the_chart_under_the_cursor() {
+        let mut s = screen();
+        s.input(key(MenuKey::Down));
+        s.set_notice(Some("refused".to_owned()));
+        assert_eq!(
+            s.input(key(MenuKey::Practice)),
+            Acted::Practice(PathBuf::from(r"C:\charts\a\2.bms"))
+        );
+        assert_eq!(s.page("").lines[2].text, "");
+        assert_eq!(s.input(key(MenuKey::Tab)), Acted::Focus(true));
+        assert_eq!(s.input(key(MenuKey::Practice)), Acted::Nothing);
+        assert_eq!(s.input(MenuInput::Text("p".to_owned())), Acted::Search);
+        assert_eq!(s.search().text, "p");
+        assert_eq!(super::result_key(MenuKey::Practice), None);
+        let mut empty = SelectScreen::new(Vec::new());
+        assert_eq!(empty.input(key(MenuKey::Practice)), Acted::Nothing);
     }
 
     /// Text reaches the search box only while it has focus; the IME's

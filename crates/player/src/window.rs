@@ -393,6 +393,7 @@ fn menu_key(key: PhysicalKey, repeat: bool) -> Option<MenuKey> {
         KeyCode::Enter | KeyCode::NumpadEnter => (MenuKey::Enter, false),
         KeyCode::Tab => (MenuKey::Tab, false),
         KeyCode::Escape => (MenuKey::Escape, false),
+        KeyCode::KeyP => (MenuKey::Practice, false),
         _ => return None,
     };
     (repeats || !repeat).then_some(key)
@@ -411,6 +412,15 @@ mod tests {
     /// Raw Input's controls for Pause and NumLock (`input::raw::key_control`).
     const PAUSE: u32 = 0xE11D;
     const NUM_LOCK: u32 = 0x45;
+
+    /// P is the practice key, on its first press only.
+    #[test]
+    fn p_is_the_practice_key_on_its_first_press() {
+        use crate::select::MenuKey;
+        let p = PhysicalKey::Code(KeyCode::KeyP);
+        assert_eq!(super::menu_key(p, false), Some(MenuKey::Practice));
+        assert_eq!(super::menu_key(p, true), None);
+    }
 
     /// Pause bound to retry and NumLock to quit, as `tapestry keys`
     /// captures them: the key config is valid, and in the window Pause

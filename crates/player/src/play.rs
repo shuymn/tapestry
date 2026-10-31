@@ -629,7 +629,7 @@ impl Rig for PlayerRig<'_> {
         // the Watermark"); the other values are recorded as they are at the
         // start.
         self.end_lines = None;
-        self.result_input.showing = false;
+        self.result_input.release();
         let t = self.controls.tuning().close_end_screen();
         t.apply_to(settings);
         self.input_offset_us = t.input_offset_us;
