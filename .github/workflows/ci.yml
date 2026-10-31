@@ -88,7 +88,7 @@ jobs:
       - name: Clippy
         run: mise exec -- cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Clippy (dev-tools)
-        run: mise exec -- cargo clippy -p player --all-targets --locked --features dev-tools -- -D warnings
+        run: mise exec -- cargo clippy -p player -p game --all-targets --locked --features player/dev-tools,game/dev-tools -- -D warnings
       - name: Test
         run: mise exec -- cargo test --workspace --locked
       # Also run on Windows: build-dependencies resolve for the host, so the
@@ -119,7 +119,7 @@ jobs:
               "--dev-adjust-at 1" \
               "play x.bms --dev-adjust-at 1" "play x.bms --dev-adjust F1" \
               "play x.bms --dev-adjust-end F1" "keys --dev-scripted-keys 1" \
-              "measure play x.bms"; do
+              "measure play x.bms" "--dev-scenario x"; do
             arg=$(echo "$args" | grep -o -e "--dev-[a-z-]*" -e "^measure")
             set +e
             # shellcheck disable=SC2086 # split into arguments on purpose
@@ -137,7 +137,7 @@ jobs:
           target/debug/tapestry.exe --dev-tools-probe
       # The game on its threads, driven by a scripted input log, on WARP.
       - name: Test (dev-tools)
-        run: mise exec -- cargo test -p player --features dev-tools --locked
+        run: mise exec -- cargo test -p player -p game --features player/dev-tools,game/dev-tools --locked
 
   linux:
     needs: changes

@@ -88,6 +88,17 @@ pub enum Request {
         /// Its source queue's size.
         queue_capacity: usize,
     },
+    /// Another chart of a development scenario, between plays: the input
+    /// thread starts over from a source set of `sources`, keeping its focus
+    /// gate and menu, and feeds every play from `mode`. Not answered; the
+    /// replaced mode is freed on the input thread, outside any play.
+    #[cfg(feature = "dev-tools")]
+    Switch {
+        /// How the chart's plays are fed.
+        mode: Box<Mode>,
+        /// The source set's sizes.
+        sources: input::SourceConfig,
+    },
 }
 
 /// What a play records, from the key configs.
@@ -184,6 +195,20 @@ impl InputLink {
             queue_capacity,
         };
         if self.failed.is_none() && self.requests.send(feed).is_ok() {
+            self.waker.wake();
+        }
+    }
+
+    /// Hands the input thread another chart's input (a development
+    /// scenario), between plays: sent without waiting, as
+    /// [`feed`](Self::feed). A failed link sends nothing.
+    #[cfg(feature = "dev-tools")]
+    pub fn switch(&self, mode: Mode, sources: input::SourceConfig) {
+        let switch = Request::Switch {
+            mode: Box::new(mode),
+            sources,
+        };
+        if self.failed.is_none() && self.requests.send(switch).is_ok() {
             self.waker.wake();
         }
     }
@@ -399,6 +424,19 @@ impl Hook {
                     }
                     continue;
                 }
+                // Sent only between plays, after the last close was
+                // answered; with recording open, or a set that cannot be
+                // made, the old mode and set stay.
+                #[cfg(feature = "dev-tools")]
+                Request::Switch {
+                    mode,
+                    sources: config,
+                } => {
+                    if self.origin.is_none() && sources.reset(config).is_ok() {
+                        self.mode = *mode;
+                    }
+                    continue;
+                }
             };
             // Published before the reply, so the game thread never reads
             // the previous play's state after it.
@@ -492,18 +530,14 @@ impl Hook {
                 // before it: they connect, with their recorded controls,
                 // before the opening.
                 script.current = script.log.clone();
+                // The same gate: the latch the controls hold trips it.
                 #[expect(
                     clippy::expect_used,
                     reason = "the run's source set was made with these sizes"
                 )]
-                {
-                    let menu = sources.take_menu();
-                    *sources = SourceSet::new(script.sources.clone())
-                        .expect("the run's source set was made with these sizes");
-                    if let Some(menu) = menu {
-                        sources.set_menu(menu);
-                    }
-                }
+                sources
+                    .reset(script.sources.clone())
+                    .expect("the run's source set was made with these sizes");
                 let open_at = TimeUs(-lead_in.0);
                 input::InputAdapter::poll(&mut script.current, TimeUs(open_at.0 - 1), sources);
                 reset_gate(sources, &self.controls);
@@ -1109,6 +1143,94 @@ mod autoplay_tests {
             got.push(e.received);
         }
         assert_eq!(got, [TimeUs(500 * MS), TimeUs(550 * MS)]);
+    }
+
+    /// The set's sizes for a switch.
+    #[cfg(feature = "dev-tools")]
+    fn switched() -> SourceConfig {
+        SourceConfig {
+            max_devices: 4,
+            max_sources: 4,
+            max_held: 4,
+            queue_capacity: 8,
+            max_arrivals: 2,
+        }
+    }
+
+    /// A set whose every device slot holds a keyboard, as a log of many
+    /// sources leaves it.
+    #[cfg(feature = "dev-tools")]
+    fn full_set() -> SourceSet {
+        let mut sources = set();
+        sources.begin_batch(TimeUs(0));
+        for d in 1..=4 {
+            sources.connect(DeviceId(d), DeviceKind::Keyboard);
+        }
+        sources.end_batch(TimeUs(0));
+        sources
+    }
+
+    /// A switch between plays starts the input thread over: the devices a
+    /// log left in every slot go, so the generated keyboard of the next
+    /// chart takes part, and the latch the controls took before still
+    /// trips the gate.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn a_switch_starts_over_and_keeps_the_latch() {
+        let mut sources = full_set();
+        let (controls, mut hook, link) = hooked(&sources);
+        link.switch(Mode::Autoplay(AutoplayInput::new(events())), switched());
+        hook.wake(&mut sources, TimeUs(0));
+        assert_eq!(sources.devices().count(), 0);
+        let opening = open(&mut hook, &link, &mut sources, MS);
+        assert_eq!(opening.kinds, [DeviceKind::Keyboard]);
+        let participants: Vec<_> = sources.participants().map(|(d, _)| d).collect();
+        assert_eq!(participants, [AUTOPLAY_DEVICE]);
+        controls.focus(false);
+        hook.wake(&mut sources, TimeUs(2 * MS));
+        assert!(link.tripped());
+    }
+
+    /// Without the switch, the generated keyboard finds no slot: nothing
+    /// takes part.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn without_a_switch_a_full_set_leaves_autoplay_out() {
+        let mut sources = full_set();
+        let (_controls, mut hook, link) = hooked(&sources);
+        let opening = open(&mut hook, &link, &mut sources, MS);
+        assert!(opening.kinds.is_empty());
+    }
+
+    /// A switch that arrives with recording open is ignored: the open
+    /// play keeps its devices and mode.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn a_switch_while_recording_is_ignored() {
+        let mut sources = set();
+        let (_controls, mut hook, link) = hooked(&sources);
+        let _opening = open(&mut hook, &link, &mut sources, 0);
+        link.switch(Mode::Autoplay(AutoplayInput::new(Vec::new())), switched());
+        hook.wake(&mut sources, TimeUs(MS));
+        assert_eq!(
+            sources.participants().map(|(d, _)| d).collect::<Vec<_>>(),
+            [AUTOPLAY_DEVICE]
+        );
+        assert!(matches!(&hook.mode, Mode::Autoplay(a) if a.fed() == 0));
+        hook.wake(&mut sources, TimeUs(1_600 * MS));
+        assert!(matches!(&hook.mode, Mode::Autoplay(a) if a.fed() == 2));
+    }
+
+    /// A failed link sends no switch: the input thread keeps its set.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn a_failed_link_sends_no_switch() {
+        let mut sources = full_set();
+        let (_controls, mut hook, mut link) = hooked(&sources);
+        link.failed = Some(game::InputWaitError::Timeout);
+        link.switch(Mode::Autoplay(AutoplayInput::new(events())), switched());
+        hook.wake(&mut sources, TimeUs(0));
+        assert_eq!(sources.devices().count(), 4);
     }
 }
 

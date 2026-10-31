@@ -70,7 +70,7 @@ use crate::input_side::Mode;
 use crate::measure::{AudioInfo, Measure, SOUND_QUEUE, STEP_QUEUE, StepSample};
 use crate::menu_screen::MenuScreen;
 use crate::play::PlayerRig;
-use crate::render_side::{MakeScreen, NoFrames, Screen, View};
+use crate::render_side::{MakeScreen, NoFrames, RenderEnd, Screen, View};
 use crate::select::MenuQueue;
 use crate::tuning::{Delivered, LiveTuning, SettingsFiles};
 
@@ -116,6 +116,8 @@ fn main() -> ExitCode {
         Command::DevToolsProbe => dev::probe(),
         #[cfg(feature = "dev-tools")]
         Command::Measure { chart, perfect } => report(measure_play(&chart, perfect, clock)),
+        #[cfg(feature = "dev-tools")]
+        Command::Scenario(s) => report(dev::scenario::run(s, clock)),
     }
 }
 
@@ -131,6 +133,8 @@ fn logged(command: &Command) -> Option<&'static str> {
         Command::Select(_) => Some("select"),
         #[cfg(feature = "dev-tools")]
         Command::Measure { .. } => Some("measure"),
+        #[cfg(feature = "dev-tools")]
+        Command::Scenario(_) => Some("scenario"),
     }
 }
 
@@ -674,6 +678,8 @@ fn rig<'a>(
         queue_line: None,
         #[cfg(feature = "dev-tools")]
         measured_plays: None,
+        #[cfg(feature = "dev-tools")]
+        scenario: None,
         lead_in: LEAD_IN,
         in_play: false,
         #[cfg(feature = "dev-tools")]
@@ -940,7 +946,7 @@ fn play(
     #[cfg(feature = "dev-tools")]
     let script_failed = result_script_failure(&rig);
     let rendered = rig.shut_down();
-    window_thread.close_after(rendered);
+    window_thread.close_after(rendered != RenderEnd::Stuck);
     // Not joined: an input thread that stopped answering must not hold up
     // the exit or the report of why the run ended. Its wake report is not
     // used here.
@@ -969,6 +975,24 @@ fn result_script_failure(rig: &PlayerRig<'_>) -> Option<String> {
 
 /// What makes the extension points of each chart the scene flow loads.
 type MakeParts = Box<dyn FnMut(&Settings) -> Parts>;
+
+/// The parts of a session whose plays are saved under `root`: each saved
+/// play is counted into the bests as its result shows; without the
+/// writer, plays are saved and the next launch's catch-up counts them.
+fn saved_parts(root: &DataRoot, best_writer: Option<library::BestWriter>) -> MakeParts {
+    let records = root.clone();
+    let bests = best_writer.map(|w| Arc::new(std::sync::Mutex::new(w)));
+    Box::new(move |s: &Settings| {
+        let mut parts = Parts::standard(&records, &s.player);
+        if let Some(bests) = &bests {
+            parts.records = Some(Box::new(bests::BestsRecords::new(
+                records.records(),
+                Arc::clone(bests),
+            )));
+        }
+        parts
+    })
+}
 
 /// Opens the shared-mode WASAPI output on the audio thread.
 fn wasapi_audio(clock: QpcClock) -> anyhow::Result<(audio_side::AudioThread, audio_side::Opened)> {
@@ -1019,13 +1043,29 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
     log::info!("{bests}");
     let settings = settings(&root)?;
     let autoplay = matches!(s.input, PlayInput::Autoplay);
-    let roots: Vec<PathBuf> = settings
+    #[cfg_attr(
+        not(feature = "dev-tools"),
+        expect(unused_mut, reason = "a scenario names its own")
+    )]
+    let mut roots: Vec<PathBuf> = settings
         .device
         .library
         .roots
         .iter()
         .map(PathBuf::from)
         .collect();
+    // A scenario's roots, for this run only: nothing is written back.
+    #[cfg(feature = "dev-tools")]
+    let mut s = s;
+    #[cfg(feature = "dev-tools")]
+    let scenario = s.dev.scenario.take();
+    #[cfg(feature = "dev-tools")]
+    if let Some(sc) = &scenario {
+        roots.clone_from(&sc.roots);
+    }
+    // A scenario's plays of input logs are saved and counted live.
+    #[cfg(feature = "dev-tools")]
+    let counted = scenario.is_some();
     #[cfg(feature = "dev-tools")]
     let (headless, rescan) = (
         s.dev.headless,
@@ -1038,6 +1078,13 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
     let shelf = shelf::Shelf::new(library, roots.clone(), rescan, Some(root.records()));
     let best_writer = match shelf.best_writer() {
         Ok(w) => Some(w),
+        #[cfg(feature = "dev-tools")]
+        Err(e) if counted => {
+            anyhow::bail!(
+                "dev: scenario: plays cannot be counted live: {}",
+                game::Chain(&e)
+            );
+        }
         Err(e) => {
             let line = format!("library: plays are not counted live: {}", game::Chain(&e));
             eprintln!("{line}");
@@ -1187,9 +1234,10 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
         &controls,
     );
     #[cfg(feature = "dev-tools")]
-    let frames: Box<dyn render_side::FrameSink> = match s.dev.frames {
-        Some(dir) => Box::new(dev::FrameDump::new(dir, TimeUs(1_000_000))),
-        None => Box::new(NoFrames),
+    let frames: Box<dyn render_side::FrameSink> = match (&scenario, s.dev.frames) {
+        (Some(sc), _) => Box::new(dev::scenario::ScenarioFrames::from_env(sc.captures.clone())),
+        (None, Some(dir)) => Box::new(dev::FrameDump::new(dir, TimeUs(1_000_000))),
+        (None, None) => Box::new(NoFrames),
     };
     #[cfg(not(feature = "dev-tools"))]
     let frames: Box<dyn render_side::FrameSink> = Box::new(NoFrames);
@@ -1232,32 +1280,34 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
         #[cfg(feature = "dev-tools")]
         script: s.dev.script,
     });
-    let (receive, auto, parts): (_, _, MakeParts) = if autoplay {
-        (
-            ReceiveMethod::Scripted,
-            Some(AutoKeySounds::Scheduled),
-            Box::new(|s: &Settings| Parts::unsaved(&s.player)),
-        )
+    // Each chart of a scenario has its input chosen as it loads
+    // (`AppRig::configure`), from autoplay's session.
+    #[cfg(feature = "dev-tools")]
+    if let Some(sc) = scenario {
+        rig.scenario = Some(dev::scenario::State {
+            logs: sc.logs,
+            captures: sc.captures,
+            recorded: rig.recorded.clone(),
+            chart_input: None,
+            pending: None,
+            until: None,
+        });
+    }
+    // Autoplay saves nothing, but in a scenario, whose logs' plays are
+    // saved.
+    #[cfg(feature = "dev-tools")]
+    let saved = !autoplay || counted;
+    #[cfg(not(feature = "dev-tools"))]
+    let saved = !autoplay;
+    let parts: MakeParts = if saved {
+        saved_parts(&root, best_writer)
     } else {
-        let records = root.clone();
-        // Each saved play is counted into the bests as its result shows;
-        // without the writer, plays are saved and the next launch's
-        // catch-up counts them.
-        let bests = best_writer.map(|w| Arc::new(std::sync::Mutex::new(w)));
-        (
-            ReceiveMethod::RawInput,
-            None,
-            Box::new(move |s: &Settings| {
-                let mut parts = Parts::standard(&records, &s.player);
-                if let Some(bests) = &bests {
-                    parts.records = Some(Box::new(bests::BestsRecords::new(
-                        records.records(),
-                        Arc::clone(bests),
-                    )));
-                }
-                parts
-            }),
-        )
+        Box::new(|s: &Settings| Parts::unsaved(&s.player))
+    };
+    let (receive, auto) = if autoplay {
+        (ReceiveMethod::Scripted, Some(AutoKeySounds::Scheduled))
+    } else {
+        (ReceiveMethod::RawInput, None)
     };
     let mut app = game::App::new(
         root,
@@ -1272,9 +1322,14 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
         .selection
         .as_ref()
         .and_then(selection::Selection::script_failure);
+    #[cfg(feature = "dev-tools")]
+    let scenario = rig.scenario.take().map(|sc| {
+        let script = rig.selection.as_mut().and_then(|sel| sel.script.take());
+        (sc, script)
+    });
     let rendered = rig.shut_down();
     if let Some(w) = window_thread {
-        w.close_after(rendered);
+        w.close_after(rendered != RenderEnd::Stuck);
     }
     // As in `play`: not joined.
     if let Some(t) = raw_thread {
@@ -1282,6 +1337,10 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
     }
     if let Some(t) = clocked_thread {
         t.detach();
+    }
+    #[cfg(feature = "dev-tools")]
+    if let Some((sc, script)) = scenario {
+        return dev::scenario::conclude(ran, script.as_ref(), sc.pending, rendered, &sc.captures);
     }
     ran?;
     #[cfg(feature = "dev-tools")]

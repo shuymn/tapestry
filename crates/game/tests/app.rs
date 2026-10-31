@@ -209,6 +209,12 @@ struct Headless {
     due: i64,
     quitting: bool,
     chosen: Option<usize>,
+    /// Charts whose plays the hook leaves unsaved, and each chart the hook
+    /// was asked about, in order (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    unsaved: Vec<usize>,
+    #[cfg(feature = "dev-tools")]
+    configured: Vec<usize>,
     sounds: Option<AudioQueue>,
     sealed: bool,
     waits_since_seal: usize,
@@ -294,6 +300,10 @@ impl Headless {
             due,
             quitting: false,
             chosen: None,
+            #[cfg(feature = "dev-tools")]
+            unsaved: Vec::new(),
+            #[cfg(feature = "dev-tools")]
+            configured: Vec::new(),
             sounds: None,
             sealed: false,
             waits_since_seal: 0,
@@ -613,6 +623,16 @@ impl Rig for Headless {
 impl AppRig for Headless {
     type BankError = BankLost;
 
+    #[cfg(feature = "dev-tools")]
+    fn configure(&mut self, config: &mut SessionConfig, parts: &mut Parts) {
+        let i = self.chosen.unwrap();
+        self.configured.push(i);
+        if self.unsaved.contains(&i) {
+            parts.records = None;
+            config.seed = 99;
+        }
+    }
+
     fn choose(&mut self) -> Option<PathBuf> {
         let Act::Choose(i) = self.due_act()? else {
             return None;
@@ -814,6 +834,30 @@ fn select_play_retry_back_select_again() {
             SessionEvent::Result { attempt: 1 },
         ]
     );
+}
+
+/// The hook sets each chosen chart's session before it loads: chart B's
+/// plays are not saved while chart A's, before and after it, are.
+#[cfg(feature = "dev-tools")]
+#[test]
+fn configure_sets_each_charts_session() {
+    let acts = vec![
+        (0, Act::Choose(0)),
+        (4_000, Act::Back),
+        (500, Act::Choose(1)),
+        (4_000, Act::Back),
+        (500, Act::Choose(0)),
+        (4_000, Act::Close),
+    ];
+    let (rig, _events, ran) = run(Refusal::Missing, acts, |rig| rig.unsaved = vec![1]);
+    ran.unwrap();
+    assert_eq!(rig.configured, [0, 1, 0]);
+    let saved: Vec<(usize, bool)> = rig
+        .loads
+        .iter()
+        .flat_map(|(i, r)| r.iter().map(move |r| (*i, r.saved.is_some())))
+        .collect();
+    assert_eq!(saved, [(0, true), (1, false), (0, true)]);
 }
 
 /// Each refusal returns to selection, signaled, with the reason and the

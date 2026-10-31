@@ -415,6 +415,10 @@ pub struct Drawn<'a> {
     /// (dev-tools).
     #[cfg(feature = "dev-tools")]
     pub menu: bool,
+    /// The generation of the play whose figures the frame counts in, until
+    /// they are taken (dev-tools: a scenario's captures).
+    #[cfg(feature = "dev-tools")]
+    pub generation: Option<u64>,
     /// What the frame cost and whether it was presented.
     pub timing: FrameTiming,
     /// The swap chain's frame statistics, read right after the frame.
@@ -570,6 +574,13 @@ impl Measure {
         }
         self.play = Some(play);
         self.drain();
+    }
+
+    /// The measured play's generation, until its figures are taken
+    /// (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    pub fn generation(&self) -> Option<u64> {
+        self.play.as_ref().map(|p| p.generation)
     }
 
     /// Takes the queued samples of the current play; others are dropped.
@@ -1239,6 +1250,8 @@ mod frame_tests {
             play: Some(TimeUs(0)),
             #[cfg(feature = "dev-tools")]
             menu: false,
+            #[cfg(feature = "dev-tools")]
+            generation: Some(1),
             timing: FrameTiming {
                 cpu: Duration::from_micros(cpu_us),
                 sprites: 0,

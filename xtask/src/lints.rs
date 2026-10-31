@@ -214,6 +214,8 @@ pub const IN_PLAY: &[Site] = &[
             "PlayerRig::ring_out",
             "PlayerRig::audio_done",
             "PlayerRig::input_failure",
+            "until_due",
+            "until_fired",
         ],
     ),
     Site::Fns(
@@ -225,6 +227,8 @@ pub const IN_PLAY: &[Site] = &[
             "Controls::quitting",
             "Controls::focused",
             "Controls::wake_game",
+            "Controls::command",
+            "Controls::set_command",
         ],
     ),
     Site::File("crates/player/src/tuning.rs"),

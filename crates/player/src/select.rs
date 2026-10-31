@@ -293,6 +293,12 @@ impl SelectScreen {
         self.searching
     }
 
+    /// The search text (dev-tools: a scenario types toward its own).
+    #[cfg(feature = "dev-tools")]
+    pub fn query(&self) -> &str {
+        &self.query
+    }
+
     /// The charts a search found, in its order; the cursor stays on the
     /// chart it was on when that chart is still listed.
     pub fn set_entries(&mut self, mut entries: Vec<ChartEntry>) {

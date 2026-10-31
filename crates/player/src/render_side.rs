@@ -201,6 +201,17 @@ struct Shared {
     first_frame: AtomicI64,
 }
 
+/// How the render thread ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RenderEnd {
+    /// It ended and was joined.
+    Joined,
+    /// It ended by a panic.
+    Panicked,
+    /// It did not end in time and was left to the process's exit.
+    Stuck,
+}
+
 /// The game thread's end of the render thread.
 pub struct RenderLink {
     tx: Sender<RenderMsg>,
@@ -212,6 +223,8 @@ pub struct RenderLink {
     answer_timeout: Duration,
     /// How long the end of the thread is waited for.
     exit_timeout: Duration,
+    /// How long a play's figures are waited for.
+    finish_timeout: Duration,
 }
 
 impl RenderLink {
@@ -264,7 +277,7 @@ impl RenderLink {
     pub fn finish(&self, end: TimeUs) -> Option<Figures> {
         let (reply, rx) = mpsc::sync_channel(1);
         self.send(RenderMsg::Finish { end, reply });
-        rx.recv_timeout(FINISH_TIMEOUT).ok().flatten()
+        rx.recv_timeout(self.finish_timeout).ok().flatten()
     }
 
     /// When the current play's first frame was drawn.
@@ -273,30 +286,32 @@ impl RenderLink {
         (t != i64::MIN).then_some(TimeUs(t))
     }
 
-    /// Ends the thread and waits for it at most [`EXIT_TIMEOUT`]; `false`
-    /// when it did not end, so the window it draws into must stay open.
-    pub fn exit(self) -> bool {
+    /// Ends the thread and waits for it at most [`EXIT_TIMEOUT`]; when it
+    /// is [`RenderEnd::Stuck`], the window it draws into must stay open.
+    pub fn exit(self) -> RenderEnd {
         self.send(RenderMsg::Exit);
         match self.ended.recv_timeout(self.exit_timeout) {
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 // Detached: a thread stuck in the screen's work must not
                 // hold up the exit. The caller keeps the window open.
                 eprintln!("render: the render thread did not end");
-                false
+                RenderEnd::Stuck
             }
-            _ => {
-                let _ = self.handle.join();
-                true
-            }
+            _ => match self.handle.join() {
+                Ok(()) => RenderEnd::Joined,
+                Err(_) => RenderEnd::Panicked,
+            },
         }
     }
 
-    /// Sets how long a preparation or a chart's load and the end of the
-    /// thread are waited for, in place of [`LOAD_TIMEOUT`] and
-    /// [`EXIT_TIMEOUT`] (tests, and `--dev-render-timeout`).
+    /// Sets how long a preparation, a chart's load or a play's figures
+    /// and the end of the thread are waited for, in place of
+    /// [`LOAD_TIMEOUT`], [`FINISH_TIMEOUT`] and [`EXIT_TIMEOUT`] (tests,
+    /// and `--dev-render-timeout`).
     #[cfg(any(test, feature = "dev-tools"))]
     pub fn set_timeouts(&mut self, answer: Duration, exit: Duration) {
         self.answer_timeout = answer;
+        self.finish_timeout = answer;
         self.exit_timeout = exit;
     }
 }
@@ -365,6 +380,7 @@ pub fn spawn(
             ended,
             answer_timeout: LOAD_TIMEOUT,
             exit_timeout: EXIT_TIMEOUT,
+            finish_timeout: FINISH_TIMEOUT,
         }),
         Ok(Err(e)) => {
             let _ = handle.join();
@@ -597,6 +613,10 @@ impl Run {
                 Ok((timing, play)) => {
                     let d = Drawn {
                         play,
+                        // The measured play's: none once its figures are
+                        // taken, so no frame after a `Finish` is its.
+                        #[cfg(feature = "dev-tools")]
+                        generation: self.measure.generation(),
                         #[cfg(feature = "dev-tools")]
                         menu: matches!(mode, Mode::Menu { .. }),
                         timing,
@@ -931,6 +951,38 @@ mod tests {
         }
     }
 
+    /// A play's figures are waited for as long as the bound set says: a
+    /// render thread blocked in a chart's load does not answer the play's
+    /// end, and the wait gives up at the bound, far below the production
+    /// one.
+    #[test]
+    fn a_blocked_thread_bounds_the_figures_wait() {
+        let (release, blocked) = std::sync::mpsc::channel();
+        let mut blocked = Some(blocked);
+        let make: MakeScreen = Box::new(move || {
+            let release = blocked.take().expect("built once");
+            Ok(Box::new(Blocking { release }) as Box<dyn Screen>)
+        });
+        let clock = QpcClock::start();
+        let mut link = spawn(
+            make,
+            None,
+            clock,
+            view(),
+            measure(clock),
+            Box::new(NoFrames),
+        )
+        .unwrap();
+        link.set_timeouts(Duration::from_millis(200), Duration::from_millis(200));
+        let chart = Arc::new(ChartBuilder::new(120_000).build().unwrap());
+        assert!(matches!(link.load(chart), Err(ScreenError::NoAnswer)));
+        let started = Instant::now();
+        assert!(link.finish(clock.now()).is_none());
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(link.exit(), super::RenderEnd::Stuck);
+        release.send(()).unwrap();
+    }
+
     /// A chart's load that blocks the render thread bounds every wait on
     /// it: the load and a preparation give up, and the close that follows
     /// returns, saying the thread did not end, so the window stays open.
@@ -957,7 +1009,7 @@ mod tests {
         let started = Instant::now();
         assert!(matches!(link.load(chart), Err(ScreenError::NoAnswer)));
         assert!(matches!(link.prepare(), Err(ScreenError::NoAnswer)));
-        assert!(!link.exit());
+        assert_eq!(link.exit(), super::RenderEnd::Stuck);
         assert!(started.elapsed() < Duration::from_secs(5));
         // The thread ends once its screen does.
         release.send(()).unwrap();
@@ -1607,5 +1659,79 @@ mod tests {
     fn the_app_region_counts_the_frame_measurement() {
         let (count, _) = app_region_count(false, true);
         assert!(count.is_some_and(|n| n > 0), "{count:?}");
+    }
+
+    /// A play's end is a barrier for a scenario's captures: the frame drawn
+    /// before the end, which reaches the capture's time, has been written
+    /// when the end is answered; no frame after it counts in the play, so
+    /// a capture bound to it then is never taken.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn a_plays_end_settles_its_captures_after_its_last_frame() {
+        use crate::dev::scenario::{CaptureState, Captures, ScenarioFrames};
+        let chart = ChartBuilder::new(120_000)
+            .tap(Lane::new(1).unwrap(), TimeUs(1_000_000))
+            .build()
+            .unwrap();
+        let (rule, device) = (rules::tapestry(), DeviceProfile::default());
+        let (_logic, side) = Logic::<SourceReader>::new(
+            &chart,
+            &rule,
+            &device,
+            &InputStart::default(),
+            Vec::new(),
+            LogicConfig {
+                inputs: 0,
+                effects: 16,
+            },
+            Vec::new(),
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let (taken, late) = (dir.path().join("taken.png"), dir.path().join("late.png"));
+        let captures = Captures::of(vec![
+            (TimeUs(2_900_000), taken.clone()),
+            (TimeUs(0), late.clone()),
+        ]);
+        let draws = Arc::new(AtomicU32::new(0));
+        let drawn = Arc::clone(&draws);
+        let make: MakeScreen = Box::new(move || {
+            Ok(Box::new(Allocating {
+                in_build: false,
+                draws: Arc::clone(&drawn),
+                read_backs: Arc::new(AtomicU32::new(0)),
+            }) as Box<dyn Screen>)
+        });
+        let clock = QpcClock::start();
+        let link = spawn(
+            make,
+            Some(Arc::new(chart.clone())),
+            clock,
+            view(),
+            measure(clock),
+            Box::new(ScenarioFrames::new(captures.clone())),
+        )
+        .unwrap();
+        captures.arm(0);
+        captures.bind(1);
+        // Chart time 3 s at the play's first frame: past the capture's.
+        link.send(RenderMsg::Play {
+            side,
+            gauge: 0,
+            measure: play_measure(TimeUs(clock.now().0 - 3_000_000)),
+        });
+        assert!(link.finish(clock.now()).is_some());
+        assert_eq!(captures.states()[0], CaptureState::Succeeded);
+        assert!(std::fs::read(&taken).unwrap().starts_with(b"\x89PNG"));
+        // Bound once the play's figures are taken: the frames still drawn
+        // count in no play.
+        captures.arm(1);
+        captures.bind(1);
+        // A frame drawn after the next has started was sunk whole.
+        let after = draws.load(Ordering::Acquire);
+        assert!(wait_until(|| draws.load(Ordering::Acquire) >= after + 2));
+        assert_eq!(captures.states()[1], CaptureState::Bound(1));
+        assert!(!late.exists());
+        link.exit();
     }
 }

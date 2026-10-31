@@ -1041,3 +1041,57 @@ fn a_set_queue_capacity_sizes_the_next_openings_queues() {
     assert!(!set.overflowed());
     assert_eq!(drain(&mut readers[0]).len(), 4);
 }
+
+/// A reset between plays drops every device and applies the new queue
+/// size, and keeps the focus gate, the menu and the axis mode: a latch
+/// handle taken before it still trips the gate after it.
+#[test]
+fn reset_keeps_gate_menu_and_axis_mode() {
+    use input::hid::{HidProduct, axis_cap, axis_control};
+    use input::{MenuBindings, menu_queue};
+    let product = HidProduct {
+        vendor_id: 1,
+        product_id: 2,
+        interface: None,
+    };
+    let x = axis_control(0x01, 0x30);
+    let mut set = keyboards(8);
+    let (tap, _receiver) = menu_queue(MenuBindings {
+        product,
+        controls: Vec::new(),
+        step: 1,
+        relative: None,
+        wrap: None,
+    });
+    set.set_menu(tap);
+    set.set_axis_mode(product, vec![x], true);
+    let latch = set.gate().handle();
+    set.reset(SourceConfig {
+        queue_capacity: 1,
+        ..config()
+    })
+    .unwrap();
+    assert_eq!(set.devices().count(), 0);
+    assert!(set.menu_mut().is_some());
+    set.connect(DeviceId(20), DeviceKind::Controller);
+    set.set_product(DeviceId(20), product);
+    assert!(set.axis_relative(DeviceId(20), &axis_cap(x, true, 0, 255, 8).unwrap()));
+    // A queue of one event: the second press overflows it.
+    set.begin_batch(TimeUs(0));
+    plug(&mut set, DeviceId(0), DeviceKind::Keyboard);
+    set.end_batch(TimeUs(0));
+    set.open_recording(TimeUs(0));
+    batch(&mut set, 1, &[key(0, A, 1), key(0, B, 1)], 2);
+    assert!(set.overflowed());
+    latch.latch();
+    assert!(!set.begin_batch(TimeUs(3)));
+    // A refused configuration leaves the set as it was.
+    assert!(
+        set.reset(SourceConfig {
+            max_sources: input::SOURCE_LIMIT + 1,
+            ..config()
+        })
+        .is_err()
+    );
+    assert!(set.overflowed());
+}
