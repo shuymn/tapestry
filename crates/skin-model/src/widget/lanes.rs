@@ -660,7 +660,6 @@ impl Lanes {
         // Each part's frame once for the lane's pass.
         let [note, head_part, tail_part, on, off, mine] =
             [note, head_part, tail_part, on, off, mine].map(|p| d.shown(p));
-        let held = d.play.hold_note(lane);
         // Positions never decrease along a lane (`Chart::validate`), so the
         // notes meeting [from, to] are one run.
         let start = list.partition_point(|n| n.end_pos() < from).max(lo);
@@ -682,15 +681,15 @@ impl Lanes {
                 _ if !is_target(notes.section, n.time, n.end()) => true,
                 NoteKind::Tap => pen.cap(note, x, w, head, self.note_h),
                 NoteKind::Long { end_pos, .. } => {
-                    // Unless done by a decision before its end, a long
-                    // note is drawn until its end passes the line, and once
-                    // its head's time has passed the head stays on the line.
+                    // Judged or not, a long note is drawn until its end
+                    // passes the line, and once its head's time has passed
+                    // the head stays on the line.
                     if end_pos < scale.at_line {
                         continue;
                     }
                     let tail = scale.y(end_pos);
                     let head = head.min(line);
-                    let body = if held == Some(i) { on } else { off };
+                    let body = if d.play.body_active(lane, i) { on } else { off };
                     let body_ok = match cut(x, w, tail, head, pen.top, pen.bottom) {
                         Some(c) => pen.counted(body, &c),
                         None => true,

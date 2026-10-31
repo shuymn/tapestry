@@ -270,21 +270,29 @@ impl Play {
         &self.scroll
     }
 
-    /// Whether `note` on lane `l` is no longer drawn: a judged tap, a hit
-    /// mine, or a long note decided before its end, as of the last build.
+    /// Whether `note` on lane `l` is no longer drawn: a judged tap or a hit
+    /// mine, as of the last build.
     pub(crate) fn done(&self, l: usize, note: usize) -> bool {
         self.reducer.done(l, note)
     }
 
-    /// The long note whose visual hold `lane` shows, as of the last build:
-    /// the lanes draw its body active.
-    pub(crate) fn hold_note(&self, lane: Lane) -> Option<usize> {
-        self.reducer
-            .hold
-            .get(lane.index())
-            .copied()
-            .flatten()
-            .map(|h| h.note)
+    /// `lane`'s visual hold, as of the last build.
+    fn hold(&self, lane: Lane) -> Option<reducer::Hold> {
+        self.reducer.hold.get(lane.index()).copied().flatten()
+    }
+
+    /// The long note whose visual hold `lane` shows, as of the last build.
+    #[cfg(test)]
+    fn hold_note(&self, lane: Lane) -> Option<usize> {
+        self.hold(lane).map(|h| h.note)
+    }
+
+    /// Whether the lanes draw `note`'s body on `lane` active, as of the
+    /// last build: by the LN mode, from whether the lane's visual hold is
+    /// on it with its head held (not a BAD head).
+    pub(crate) fn body_active(&self, lane: Lane, note: usize) -> bool {
+        let held = self.hold(lane).is_some_and(|h| h.note == note && h.held);
+        reducer::body_active(self.reducer.ln_mode, held)
     }
 }
 
@@ -324,7 +332,6 @@ mod tests {
             .long(lane(5), TimeUs(1_500 * MS), TimeUs(1_800 * MS))
             .tap(lane(5), TimeUs(3_000 * MS))
             .mine(lane(6), TimeUs(3_000 * MS), 10)
-            .long(lane(7), TimeUs(1_000 * MS), TimeUs(1_300 * MS))
             .build()
             .unwrap();
         let region = crate::RegionDef {
@@ -423,6 +430,7 @@ mod tests {
         };
         frame(&mut play, 1_000, &[ev(1_000, held(2, 0, Judgment::Great))]);
         assert_eq!(play.hold_note(lane(2)), Some(0));
+        assert!(play.body_active(lane(2), 0));
         frame(
             &mut play,
             1_250,
@@ -435,25 +443,18 @@ mod tests {
             ],
         );
         assert_eq!(play.hold_note(lane(2)), None);
-        // Decided before its end, a long note is done: here by a release,
-        // and by its head's miss; the other lanes' notes are not.
-        assert!(play.done(2, 0));
-        assert!(!play.done(7, 0) && !play.done(5, 0));
-        frame(
-            &mut play,
-            1_280,
-            &[ev(1_280, judged(7, 0, Judgment::Poor, None, None))],
-        );
-        assert!(play.done(7, 0));
-        assert!(!play.done(5, 0) && !play.done(2, 1));
-        // A BAD head holds without `LnHeld`, and is done at its press.
+        // A judged long note stays drawn: it is never done.
+        assert!(!play.done(2, 0));
+        // A BAD head holds without `LnHeld`, but its body is not active;
+        // it stays drawn.
         frame(
             &mut play,
             1_400,
             &[ev(1_400, judged(5, 0, Judgment::Bad, Some(-100), None))],
         );
         assert_eq!(play.hold_note(lane(5)), Some(0));
-        assert!(play.done(5, 0));
+        assert!(!play.body_active(lane(5), 0));
+        assert!(!play.done(5, 0));
         // Another note's end leaves it; its own ends it.
         frame(&mut play, 1_420, &[ev(1_420, ended(5, 1))]);
         assert_eq!(play.hold_note(lane(5)), Some(0));
@@ -468,13 +469,6 @@ mod tests {
         assert_eq!(play.hold_note(lane(2)), Some(1));
         frame(&mut play, 2_300, &[]);
         assert_eq!(play.hold_note(lane(2)), None);
-        // Held through its end, it is judged there and stays drawn.
-        frame(
-            &mut play,
-            2_300,
-            &[ev(2_300, judged(2, 1, Judgment::Perfect, Some(0), None))],
-        );
-        assert!(!play.done(2, 1));
         // A judged tap and a hit mine are done; a tap's `LnHeld` is no
         // hold, and stray indices are ignored.
         assert!(!play.done(5, 1));

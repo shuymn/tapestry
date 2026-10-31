@@ -6,7 +6,8 @@
 //! the sequence. Feedback follows the play screen's rules: a press gives a
 //! bomb unless it is a POOR, a long note's completion gives its judgment
 //! text but never a bomb or a hold, and the visual hold starts at a head
-//! press before the long note's end.
+//! press before the long note's end. Only a held head (`LnHeld`) draws its
+//! body active; a BAD head's hold runs the `hold` timer alone.
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 #![deny(clippy::float_arithmetic, clippy::float_cmp)]
@@ -53,6 +54,9 @@ pub(crate) struct Hold {
     /// The long note's end: the hold reads off from here even if its
     /// `LnHoldEnded` was dropped.
     pub(crate) end: TimeUs,
+    /// Whether its head is held (`LnHeld`), not a BAD head decided at its
+    /// press.
+    pub(crate) held: bool,
 }
 
 /// The effect-sourced state of one attempt.
@@ -60,13 +64,11 @@ pub(crate) struct Hold {
 pub(crate) struct Reducer {
     /// Per lane and note: the long note's times, `None` for a tap or mine.
     longs: [Box<[Option<Long>]>; LANE_COUNT],
-    /// Per lane: the notes no longer drawn, judged taps, hit mines, and
-    /// long notes whose judgment was decided before their end when the LN
-    /// mode hides them.
+    /// Per lane: the notes no longer drawn, judged taps and hit mines.
     done: [Bits; LANE_COUNT],
     /// The long-note judgment mode the notes are drawn by: LN, the only
     /// mode judged (design.md "LN Judgment Modes").
-    ln_mode: LnMode,
+    pub(crate) ln_mode: LnMode,
     pub(crate) hold: [Option<Hold>; LANE_COUNT],
     pub(crate) bomb: [Option<TimeUs>; LANE_COUNT],
     pub(crate) mine: [Option<TimeUs>; LANE_COUNT],
@@ -84,12 +86,11 @@ pub(crate) struct Reducer {
     empty_poor_breaks_combo: bool,
 }
 
-/// Whether a long note whose judgment is decided before its end stops being
-/// drawn under `mode`: in LN mode its one judgment finishes it, so its
-/// remaining body is not drawn.
-const fn hides_decided(mode: LnMode) -> bool {
+/// Whether a long note's body is drawn active under `mode`, given whether
+/// it is held: in LN mode exactly while held.
+pub(crate) const fn body_active(mode: LnMode, held: bool) -> bool {
     match mode {
-        LnMode::Ln => true,
+        LnMode::Ln => held,
     }
 }
 
@@ -157,9 +158,9 @@ impl Reducer {
         self.targets
     }
 
-    /// Whether `note` on lane `l` is no longer drawn: a judged tap, a hit
-    /// mine, or a long note decided before its end where the LN mode hides
-    /// it. Any other long note is drawn until its end passes the line.
+    /// Whether `note` on lane `l` is no longer drawn: a judged tap or a
+    /// hit mine. A long note is never done; it is drawn until its end
+    /// passes the line.
     pub(crate) fn done(&self, l: usize, note: usize) -> bool {
         self.done.get(l).is_some_and(|b| b.get(note))
     }
@@ -199,15 +200,6 @@ impl Reducer {
                     self.feedback(l, judgment, t);
                     return;
                 };
-                // Decided before its end (a missed head, a BAD head at its
-                // press, a release before the end), a long note stops being
-                // drawn where its mode hides it.
-                if t < end
-                    && hides_decided(self.ln_mode)
-                    && let Some(bits) = self.done.get_mut(l)
-                {
-                    bits.set(note);
-                }
                 // A completion: finished by a release, or at its end after
                 // a head press before the end. Its press already gave the
                 // feedback, even if that press's `LnHeld` was dropped.
@@ -220,7 +212,7 @@ impl Reducer {
                     return;
                 }
                 // A head judged at its press: a press before the end (a
-                // BAD head) starts the visual hold.
+                // BAD head) starts the visual hold, but is not held.
                 if deviation.is_some()
                     && t < end
                     && let Some(hold) = self.hold.get_mut(l)
@@ -229,6 +221,7 @@ impl Reducer {
                         note,
                         start: t,
                         end,
+                        held: false,
                     });
                 }
                 self.feedback(l, judgment, t);
@@ -246,6 +239,7 @@ impl Reducer {
                         note,
                         start: t,
                         end,
+                        held: true,
                     });
                 }
                 self.judge = Some((Grade::of(judgment), t));
