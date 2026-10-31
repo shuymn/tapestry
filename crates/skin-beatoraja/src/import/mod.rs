@@ -341,6 +341,20 @@ impl<'d> Cx<'d> {
             .keys()
             .filter(|n| !names.contains(n.as_str()))
             .count();
+        // A configured value that is not a candidate, "Random" among them
+        // (§6.1), leaves the choice to its default.
+        let not_candidates = self
+            .header
+            .files
+            .iter()
+            .filter(|f| {
+                f.name
+                    .as_ref()
+                    .and_then(|n| self.config.files.get(n))
+                    .is_some_and(|v| !f.candidates.contains(v))
+            })
+            .count();
+        let unknown_files = unknown_files + not_candidates;
         for _ in 0..unknown_files {
             self.note(
                 None,
@@ -705,7 +719,10 @@ impl<'d> Cx<'d> {
             if id == OFFSET_ALL {
                 continue;
             }
-            let Some(v) = self.config.offsets.get(&id).copied() else {
+            // A value for an offset the header does not declare is ignored
+            // (`config_notes`).
+            let declared = self.header.offsets.iter().any(|o| o.id == id);
+            let Some(v) = self.config.offsets.get(&id).copied().filter(|_| declared) else {
                 continue;
             };
             offset.x += i64::from(v.x);
