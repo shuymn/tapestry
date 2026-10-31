@@ -898,14 +898,20 @@ impl<'d> Cx<'d> {
             }
         }
 
-        // Blend (`Skin.java:654-665`).
+        // Blend (`Skin.java:654-665`). A neutral outer destination draws
+        // nothing of its own: its parts keep their blend, so its own is
+        // ignored.
         let blend = match dst.blend {
+            2..=4 | 9 if o.neutral => {
+                self.ignored(at, NoteKind::Ignored { field: "blend" });
+                Blend::Alpha
+            }
             2 => Blend::Add,
             3 => {
                 self.ignored(at, NoteKind::Ignored { field: "blend 3" });
                 Blend::Add
             }
-            4 | 9 if text || o.neutral => {
+            4 | 9 if text => {
                 self.ignored(at, NoteKind::Ignored { field: "blend" });
                 Blend::Alpha
             }

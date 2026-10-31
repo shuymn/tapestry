@@ -15,6 +15,7 @@ use common::{Loaded, has, import_config, import_sized};
 use skin_beatoraja::{
     Config, CriticalPart, DeviationId, ImportError, LaneApprox, NoteKind, OffsetValue, Severity,
 };
+use skin_model::Blend;
 
 fn load(body: &str) -> Loaded {
     import_sized([1_920, 1_080], body, &[])
@@ -240,6 +241,33 @@ fn only_an_exact_cover_maps() {
         },
     );
     refused(moved, CriticalPart::Cover, "dst");
+}
+
+#[test]
+fn the_lanes_blend_ignores_the_outer_blend() {
+    // The notes, SUDDEN+ and LIFT draw in the lanes' run: an additive
+    // note destination would leave a black cover see-through.
+    for blend in [2, 3] {
+        let notes = format!(
+            r#"{{"id": "notes", "blend": {blend}, "dst": [{{"x": 0, "y": 0, "w": 0, "h": 0}}]}}"#
+        );
+        let objects = format!("{}, {}", note(""), lift_object(""));
+        let l = load(&body("", &objects, &[&notes, &cover(""), &lift("")]));
+        assert!(
+            has(l.report(), NoteKind::Ignored { field: "blend" }),
+            "{blend}"
+        );
+        let chart = ChartBuilder::new(150_000)
+            .tap(Lane::new(1).unwrap(), TimeUs(1_300 * MS))
+            .build()
+            .unwrap();
+        let mut d = Drawn::over(l.ok().skin.clone(), &chart);
+        d.view.cover = 500;
+        d.view.lift = 200;
+        assert_eq!(d.frame(1_000, &[]).len(), 3, "{blend}");
+        let keys: Vec<_> = d.batch.runs().iter().map(|r| r.key.blend).collect();
+        assert_eq!(keys, [Blend::Alpha], "{blend}");
+    }
 }
 
 #[test]
