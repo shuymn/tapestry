@@ -1380,6 +1380,7 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
             chart_input: None,
             pending: None,
             until: None,
+            sent: None,
             practice: None,
             shown: false,
             rounds: 0,
