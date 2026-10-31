@@ -453,8 +453,9 @@ pub fn play<R: Rig>(
 /// A play's report, and what follows it.
 struct Played {
     report: PlayReport,
-    /// The command that arrived as recording closed after an abort: the
-    /// run's next step.
+    /// The run's next step: the command that arrived as recording closed
+    /// after an abort, or a retry still pending once a completed play was
+    /// saved.
     next: Option<Command>,
     /// The play's tail stage ran to its end and is followed by the next
     /// round, with no result between.
@@ -668,8 +669,22 @@ fn play_and_next<R: Rig>(
         incomplete,
     });
     // A completed play's tail took the carried command.
-    let next = carried.filter(|_| end != PlayEnd::Completed);
-    let next_round = stage.is_some_and(|s| s.repeats) && tail == TailEnd::RanOut;
+    let mut next = carried.filter(|_| end != PlayEnd::Completed);
+    let mut next_round = stage.is_some_and(|s| s.repeats) && tail == TailEnd::RanOut;
+    // Commands still pending once a completed play's stage is over, pressed
+    // as it ended or during the save, belong to that play: the quit key is
+    // the skip to its result (a repeated round shows its result instead of
+    // starting the next), never the result's back; a retry retries; a
+    // suspend means nothing there.
+    if end == PlayEnd::Completed {
+        while let Some(c) = rig.take() {
+            match TailAction::of(c) {
+                TailAction::SkipToResult => next_round = false,
+                TailAction::Cut(AbortCause::Retry) => next = next.or(Some(c)),
+                TailAction::Cut(_) => {}
+            }
+        }
+    }
     Ok(Some(Played {
         report,
         next,

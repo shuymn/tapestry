@@ -207,6 +207,9 @@ struct Fake {
     idle_waits: Vec<(i64, i64)>,
     /// Menu commands, taken on the result at these clock times.
     menu: Vec<(i64, game::MenuCommand)>,
+    /// Commands pressed by a record sink while the play is saved, taken
+    /// first.
+    pressed: std::sync::Arc<std::sync::Mutex<Vec<Command>>>,
 }
 
 impl Fake {
@@ -262,6 +265,7 @@ impl Fake {
             idle_to_deadline: false,
             idle_waits: Vec::new(),
             menu: Vec::new(),
+            pressed: std::sync::Arc::default(),
         }
     }
 
@@ -325,6 +329,9 @@ impl Rig for Fake {
     }
 
     fn take(&mut self) -> Option<Command> {
+        if let Some(c) = self.pressed.lock().unwrap().pop() {
+            return Some(c);
+        }
         let now = self.clock.now().0;
         let i = self.commands.iter().position(|&(at, _)| at <= now)?;
         Some(self.commands.remove(i).1)
@@ -2512,4 +2519,61 @@ fn a_quit_during_close_after_completion_skips_to_the_result() {
     assert_eq!(one.end, PlayEnd::Completed);
     assert!(one.tail_skipped);
     assert_eq!((rig.cancels, rig.shows), (1, 1));
+}
+
+/// A record sink that saves nothing and presses the quit key while it
+/// saves: a slow save the player does not wait for.
+struct QuitWhileSaving(std::sync::Arc<std::sync::Mutex<Vec<Command>>>);
+
+impl game::RecordSink for QuitWhileSaving {
+    fn save(&mut self, _rec: &replay::PlayRecord) -> Result<game::RecordRef, game::SaveError> {
+        self.0.lock().unwrap().push(Command::Quit);
+        Ok(game::RecordRef {
+            path: "pressed.tprl".into(),
+        })
+    }
+}
+
+/// The quit key pressed while a completed play is saved, after its tail
+/// ran out, is the skip to its result: the result shows and stays until
+/// the next quit at 11 s, instead of reading that press as its back.
+#[test]
+fn a_quit_during_the_save_shows_the_result() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = DataRoot::new(dir.path().to_owned());
+    let settings = tapestry_settings(&root);
+    let chart_path = dir.path().join("play.chart");
+    std::fs::write(&chart_path, b"built in code").unwrap();
+    let pressed = std::sync::Arc::default();
+    let parts = Parts {
+        ingest: Box::new(Built(chart())),
+        records: Some(Box::new(QuitWhileSaving(std::sync::Arc::clone(&pressed)))),
+        ..Parts::standard(&root, &settings.player)
+    };
+    let config = SessionConfig {
+        lead_in: TimeUs(1_000 * MS),
+        step: TimeUs(MS),
+        start: TimeUs(0),
+        effects: 4_096,
+        seed: 11,
+        speed: bms_model::Speed::NORMAL,
+        app_version: "0.0.0-test".to_owned(),
+        provenance: BuildProvenance::Development,
+        receive: ReceiveMethod::Scripted,
+        autoplay: None,
+    };
+    let mut loaded = Loaded::load(root, settings, &chart_path, config, parts).unwrap();
+    let items = vec![key(9_303_000, Z, 1), key(9_353_000, Z, 0)];
+    let mut rig = Fake::new(items, &[(11_000_000, Command::Quit)], i64::MAX);
+    rig.pressed = pressed;
+    let left = game::live::run_chart(&mut loaded, &mut rig).unwrap();
+    assert_eq!(left, game::Leave::Back);
+    let [one] = &rig.reports[..] else {
+        panic!("{} plays", rig.reports.len());
+    };
+    assert_eq!((one.end, one.tail_cut), (PlayEnd::Completed, None));
+    assert_eq!(rig.shows, 1);
+    assert!(rig.pressed.lock().unwrap().is_empty());
+    // Left by the quit at 11 s, not at once.
+    assert!(rig.clock.now().0 >= 11_000_000, "{}", rig.clock.now().0);
 }

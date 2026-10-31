@@ -176,6 +176,9 @@ struct Rounds {
     refuse_restore: Option<RestoreError>,
     /// The results shown, by round.
     shown: Vec<usize>,
+    /// Commands pressed by a record sink while a round is saved, taken
+    /// first.
+    pressed: Rc<RefCell<Vec<Command>>>,
 }
 
 impl Rounds {
@@ -217,6 +220,7 @@ impl Rounds {
             engine_origin: 0,
             refuse_restore: None,
             shown: Vec::new(),
+            pressed: Rc::default(),
         }
     }
 
@@ -267,6 +271,9 @@ impl Rig for Rounds {
     }
 
     fn take(&mut self) -> Option<Command> {
+        if let Some(c) = self.pressed.borrow_mut().pop() {
+            return Some(c);
+        }
         let now = self.at() - self.origin;
         let i = self
             .commands
@@ -459,7 +466,7 @@ impl game::SessionEventSink for Events {
 fn load_with(
     dir: &Path,
     chart: Chart,
-    saves: Saves,
+    saves: impl RecordSink + 'static,
     config: SessionConfig,
     input_offset_us: i64,
     events: Option<Events>,
@@ -508,6 +515,34 @@ impl Run {
 /// Runs the example's rounds with `queued` periods on the output, a save taking
 /// `save_delay`, and `commands`, until a quit in round 2 at 9 s.
 fn example_rounds(queued: u32, save_delay: i64, commands: &[(usize, i64, Command)]) -> Run {
+    example_rounds_pressing(queued, save_delay, commands, false)
+}
+
+/// [`Saves`] that also presses the quit key while it saves round 1.
+struct QuitWhileSaving {
+    saves: Saves,
+    pressed: Rc<RefCell<Vec<Command>>>,
+    saved: usize,
+}
+
+impl RecordSink for QuitWhileSaving {
+    fn save(&mut self, rec: &PlayRecord) -> Result<RecordRef, SaveError> {
+        self.saved += 1;
+        if self.saved == 1 {
+            self.pressed.borrow_mut().push(Command::Quit);
+        }
+        self.saves.save(rec)
+    }
+}
+
+/// [`example_rounds`], with the quit key pressed while round 1 is saved
+/// when `quit_while_saving`.
+fn example_rounds_pressing(
+    queued: u32,
+    save_delay: i64,
+    commands: &[(usize, i64, Command)],
+    quit_while_saving: bool,
+) -> Run {
     let dir = tempfile::tempdir().unwrap();
     let clock = Rc::new(Cell::new(CLOCK_START));
     let log = Log::default();
@@ -518,11 +553,22 @@ fn example_rounds(queued: u32, save_delay: i64, commands: &[(usize, i64, Command
         delay: save_delay,
         records: Rc::clone(&records),
     };
-    let mut loaded = load(dir.path(), example_chart(), saves, config());
+    let pressed: Rc<RefCell<Vec<Command>>> = Rc::default();
+    let mut loaded = if quit_while_saving {
+        let sink = QuitWhileSaving {
+            saves,
+            pressed: Rc::clone(&pressed),
+            saved: 0,
+        };
+        load_with(dir.path(), example_chart(), sink, config(), 0, None)
+    } else {
+        load(dir.path(), example_chart(), saves, config())
+    };
     loaded
         .set_practice(Some(example_practice(&loaded)))
         .unwrap();
     let mut rig = Rounds::new(loaded.audio_schedule(), queued, &log, &clock);
+    rig.pressed = pressed;
     rig.commands = commands.to_vec();
     rig.commands.push((2, 9_000 * MS, Command::Quit));
     let left = game::live::run_chart(&mut loaded, &mut rig).unwrap();
@@ -753,6 +799,28 @@ fn quit_skips_the_ring_out_to_the_rounds_result() {
     let cut = usize::try_from((20_900 - 7_800 + 20) * MS * i64::from(RATE) / 1_000_000).unwrap();
     assert!(left[..cut].iter().any(|&x| x != 0.0));
     assert!(left[cut..].iter().all(|&x| x == 0.0));
+}
+
+/// The quit key pressed while a repeated round is saved, after its
+/// ring-out ran to its end, is the skip to that round's result: the result
+/// shows instead of the next round starting, and the quit key on it at
+/// 25 s leaves the rounds.
+#[test]
+fn a_quit_during_a_rounds_save_shows_its_result() {
+    let run = example_rounds_pressing(2, 0, &[(1, 25_000 * MS, Command::Quit)], true);
+    let [round1] = &run.reports[..] else {
+        panic!("{} rounds", run.reports.len());
+    };
+    assert_eq!((round1.end, round1.tail_cut), (PlayEnd::Completed, None));
+    assert!(!round1.tail_skipped);
+    assert_eq!(run.rig.shown, [1]);
+    assert!(run.rig.pressed.borrow().is_empty());
+    let opens = run
+        .log
+        .iter()
+        .filter(|e| matches!(e, Ev::Open { .. }))
+        .count();
+    assert_eq!(opens, 1);
 }
 
 #[test]
