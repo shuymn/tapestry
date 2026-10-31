@@ -102,7 +102,13 @@ fn a_constant_width_strip_is_exact() {
         &format!(r#"{TEN}, "digit": 5, "space": 1, "ref": 110"#),
         r#""dst": [{"x": 10, "y": 0, "w": 15, "h": 20}]"#,
     );
-    assert_eq!(loaded.rects(0), [[111, 1_050, 23, 30]]);
+    let mut d = loaded.drawn();
+    assert_eq!(d.rects(0), [[111, 1_050, 23, 30]]);
+    // Three digits, a pitch of 23 + 1 apart.
+    d.tally.counts.perfect = 123;
+    let mut lefts: Vec<i32> = d.rects(0).iter().map(|r| r[0]).collect();
+    lefts.sort_unstable();
+    assert_eq!(lefts, [63, 87, 111]);
 }
 
 #[test]
@@ -118,6 +124,16 @@ fn a_varying_width_strip_keeps_each_last_cell() {
     let mut d = loaded.drawn();
     assert_eq!(d.rects(0), [[111, 1_050, 23, 30]]);
     assert_eq!(d.rects(100), [[117, 1_050, 24, 30]]);
+    // Three digits: cells a pitch of w′ + space′ apart, 23 + 2 at 0 ms
+    // and 24 + 2 at 100 ms, ending at the last cell.
+    d.tally.counts.perfect = 123;
+    let lefts = |d: &mut common::play::Drawn, ms| {
+        let mut x: Vec<i32> = d.rects(ms).iter().map(|r| r[0]).collect();
+        x.sort_unstable();
+        x
+    };
+    assert_eq!(lefts(&mut d, 0), [61, 86, 111]);
+    assert_eq!(lefts(&mut d, 100), [65, 91, 117]);
 }
 
 fn with_offset(image: &str, dst: &str) -> common::Loaded {
