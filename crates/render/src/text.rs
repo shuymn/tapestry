@@ -223,6 +223,12 @@ impl TextBlock {
         }
     }
 
+    /// Sets the color's alpha, for the next [`MenuText::prepare`]: a fade
+    /// without laying the text out again.
+    pub const fn set_alpha(&mut self, alpha: u8) {
+        self.style.color[3] = alpha;
+    }
+
     /// The laid-out width of the widest line, in layout pixels.
     #[must_use]
     pub fn width(&self) -> f32 {

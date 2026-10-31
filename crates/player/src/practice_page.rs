@@ -118,7 +118,7 @@ pub fn page(screen: &PracticeScreen, name: &str) -> MenuPage {
         "↑↓ 選択  ←→ 変更  Enter 編集・開始  Esc 戻る  ウィンドウを閉じて終了".to_owned(),
         LineStyle::Help,
     ));
-    MenuPage { lines }
+    MenuPage { lines, caret: None }
 }
 
 #[cfg(test)]
