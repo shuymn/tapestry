@@ -170,6 +170,7 @@ impl Drawn {
             target: [1_920, 1_080],
             layout: &Layout::AUTHOR,
             lanes: self.view,
+            loading: None,
         };
         self.skin
             .build(&mut self.play, &frame, &self.uvs, &mut self.batch);

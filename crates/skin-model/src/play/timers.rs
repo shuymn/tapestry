@@ -92,6 +92,7 @@ impl Play {
             count(t.empty_poor),
             count(self.reducer.targets()),
             gauge,
+            frame.loading.map_or(100, |l| l.percent.clamp(0, 100)),
         ];
     }
 
@@ -132,6 +133,7 @@ impl Play {
             set(grade.timer(), at);
         }
         set(timer::COMBO_UP, self.reducer.combo_up);
+        set(timer::LOADING, frame.loading.map(|l| l.since));
         for lane in Lane::all() {
             let l = lane.index();
             let hold = self.reducer.hold_at(l, now).map(|h| h.start);

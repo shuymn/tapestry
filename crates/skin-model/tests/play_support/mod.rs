@@ -307,6 +307,7 @@ impl Harness {
             target: self.target,
             layout: &self.layout,
             lanes: self.view,
+            loading: None,
         };
         self.skin
             .build(&mut self.play, &frame, &self.uvs, &mut self.batch);

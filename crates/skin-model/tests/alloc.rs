@@ -33,7 +33,8 @@ use skin_model::{
     Variant, lane_timer, timer,
 };
 use skin_model::{
-    ChartText, FontRef, FrameUv, Overflow, TextDef, TextField, TextImage, TextTable, TextValue,
+    ChartText, FontRef, FrameUv, LoadState, Overflow, TextDef, TextField, TextImage, TextTable,
+    TextValue,
 };
 
 struct Counting;
@@ -1118,6 +1119,11 @@ fn stretch(
             target: TARGETS[target_no],
             layout: &views.layouts[layout_no],
             lanes: views.lanes[(frame_no / 23) % views.lanes.len()],
+            // A stretch of loading frames every 50, its progress moving.
+            loading: (frame_no % 50 < 5).then(|| LoadState {
+                since: TimeUs(now - 1_000),
+                percent: i32::try_from(frame_no % 120).unwrap_or(0),
+            }),
         };
         let use_small = frame_no % 100 == 99;
         let out = if use_small { &mut *small } else { &mut *batch };
@@ -1352,6 +1358,7 @@ fn build_does_not_allocate() {
         target: TARGETS[0],
         layout: &views.layouts[0],
         lanes: views.lanes[0],
+        loading: None,
     };
     skin.build(&mut play, &frame, &loaded.uvs, &mut batch);
     assert!(!batch.quads().is_empty());
@@ -1397,6 +1404,7 @@ fn build_does_not_allocate() {
             target: TARGETS[0],
             layout: &views.layouts[0],
             lanes: views.lanes[0],
+            loading: None,
         };
         bitmap.build(&mut play, &frame, &uvs, &mut batch);
         glyphs += batch.quads().len();
@@ -1507,6 +1515,7 @@ fn source_lanes_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
                 cover,
                 lift,
             },
+            loading: None,
         };
         skin.build(&mut play, &frame, &uvs, &mut batch);
         quads += batch.quads().len();

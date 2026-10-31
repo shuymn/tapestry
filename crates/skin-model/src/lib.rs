@@ -40,7 +40,10 @@
 //! current frame from the uv table, turned about its pivot; a number's
 //! glyph cells; a gauge's lit and unlit segments; the judgment's grade
 //! and combo; a text's line; or the lanes' notes, bar lines, judgment line
-//! and covers.
+//! and covers. From a chart's choice to its countdown the frame carries a
+//! [`LoadState`]: the `loading` timer runs and `load.percent` reads the
+//! load's progress, so a skin can draw its loading elements, the chart's
+//! title and artist among its text fields.
 //!
 //! Expressions use integers only; floats appear only in a quad's geometry,
 //! after evaluation. The cast lints below reject `as` casts that may
@@ -101,7 +104,7 @@ pub use place::{Affine, Bind, Fill, MIN_VISIBLE, Place, Placement, RegionPlaceme
 pub use play::schema::{
     GAUGE_PERMILLE, Grade, LaneTimer, MAX_COUNT, PLAY, field, lane_timer, timer,
 };
-pub use play::{Attempt, GaugeDesc, Play, PlayContext, PrepareError, SkinFrame};
+pub use play::{Attempt, GaugeDesc, LoadState, Play, PlayContext, PrepareError, SkinFrame};
 pub use quad::{Blend, ClipId, Filter, Quad, QuadBatch, Run, RunKey};
 pub use schema::{EnumDef, EnumId, Export, Field, FieldTy, Schema, SchemaError, TimerDef, Ty};
 pub use skin::{

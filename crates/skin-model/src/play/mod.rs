@@ -93,6 +93,19 @@ pub struct SkinFrame<'a> {
     pub layout: &'a Layout,
     /// The hi-speed and the covers.
     pub lanes: LaneView,
+    /// The chart's load while the play screen waits for it, from the
+    /// chart's choice to the countdown: the `loading` timer runs and
+    /// `load.percent` reads its progress; `None` once it is loaded.
+    pub loading: Option<LoadState>,
+}
+
+/// The chart's load as the play screen shows it before the countdown.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LoadState {
+    /// When the load began, on the frame's clock.
+    pub since: TimeUs,
+    /// How far it is, in %, clamped to 0..=100.
+    pub percent: i32,
 }
 
 /// Why [`Skin::prepare`](crate::Skin::prepare) refused an attempt.
@@ -428,6 +441,7 @@ mod tests {
                     cover: 0,
                     lift: 0,
                 },
+                loading: None,
             };
             skin.build(play, &frame, &uvs, &mut batch);
         };
@@ -520,5 +534,112 @@ mod tests {
         assert!(!play.done(5, 99));
         assert!(!play.done(6, 70));
         assert!(!play.done(1, 0));
+    }
+
+    /// The loading state: the `loading` timer runs from the load's start
+    /// and `load.percent` reads its progress, clamped, while the frame
+    /// carries one; once it is loaded the timer is off and the field 100.
+    #[test]
+    fn the_loading_timer_and_progress_follow_the_frame() {
+        use super::LoadState;
+        use crate::{field, timer};
+        let chart = ChartBuilder::new(150_000)
+            .tap(lane(1), TimeUs(1_000 * MS))
+            .build()
+            .unwrap();
+        let region = crate::RegionDef {
+            anchor: crate::Anchor::TopLeft,
+            optional: false,
+        };
+        let skin = Skin::new(SkinDef {
+            fit: Fit::Adapt,
+            regions: [region; Region::COUNT],
+            whens: Vec::new(),
+            sheet: Sheet::empty(),
+            lanes: None,
+            elements: Vec::new(),
+            widgets: crate::WidgetDefs::default(),
+        })
+        .unwrap();
+        let limits = AtlasLimits {
+            max_side: 256,
+            max_layers: 2,
+            reserved_layers: 1,
+        };
+        let (_, uvs) = skin.atlas(Variant::Lo, limits).unwrap().into_parts();
+        let ctx = PlayContext {
+            gauges: &[],
+            attempt: Attempt::Full {
+                lead_in: TimeUs(1_000 * MS),
+            },
+            empty_poor_breaks_combo: false,
+            scratch: Side::Left,
+            ln_default: rules::LnMode::Ln,
+        };
+        let mut play = skin.prepare(&chart, &ctx).unwrap();
+        let zero = PerJudgment {
+            perfect: 0,
+            great: 0,
+            good: 0,
+            bad: 0,
+            poor: 0,
+        };
+        let tally = Tally {
+            counts: zero,
+            ex_score: 0,
+            bp: 0,
+            combo: 0,
+            max_combo: 0,
+            empty_poor: 0,
+        };
+        let layout = Layout::AUTHOR;
+        let mut batch = QuadBatch::with_capacity(0, 0);
+        let mut frame = |play: &mut super::Play, loading: Option<LoadState>| {
+            let frame = SkinFrame {
+                now: TimeUs(-5_000 * MS),
+                display_offset: TimeUs(0),
+                tally: &tally,
+                gauges: &[],
+                gauge: 0,
+                effects: &[],
+                complete: false,
+                target: [1_920, 1_080],
+                layout: &layout,
+                lanes: LaneView {
+                    visible_time: TimeUs(600 * MS),
+                    cover: 0,
+                    lift: 0,
+                },
+                loading,
+            };
+            skin.build(play, &frame, &uvs, &mut batch);
+        };
+        let percent = |play: &super::Play| {
+            play.state()
+                .fields
+                .get(usize::from(field::LOAD_PERCENT))
+                .copied()
+        };
+        let since = TimeUs(-5_250 * MS);
+        frame(&mut play, Some(LoadState { since, percent: 40 }));
+        assert_eq!(play.timer(timer::LOADING), Some(since));
+        assert_eq!(
+            play.state().timers.get(usize::from(timer::LOADING)),
+            Some(&250)
+        );
+        assert_eq!(percent(&play), Some(40));
+        frame(
+            &mut play,
+            Some(LoadState {
+                since,
+                percent: 140,
+            }),
+        );
+        assert_eq!(percent(&play), Some(100));
+        // Before the countdown, `ready` stays off while it loads.
+        assert_eq!(play.timer(timer::READY), None);
+        frame(&mut play, None);
+        assert_eq!(play.timer(timer::LOADING), None);
+        assert_eq!(percent(&play), Some(100));
     }
 }
