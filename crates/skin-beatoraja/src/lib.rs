@@ -13,7 +13,8 @@
 //! offsets. [`read_header`] does all three with no option enabled, as the
 //! source's own header pass does.
 //!
-//! [`import`] maps a play skin's images, numbers and text onto a
+//! [`import`] maps a play skin's images, numbers, text and play objects (the
+//! lanes, SUDDEN+, LIFT, the judge and the gauge) onto a
 //! [`skin_model::Skin`] for a [`Config`] (the selected options, file
 //! choices and offsets), and returns it with a [`Report`]: the definition
 //! files read, the file each choice took, a located note for every element
