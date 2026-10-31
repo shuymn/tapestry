@@ -1148,15 +1148,24 @@ impl<O: AudioOutput + Wakes> Session<O> {
     ///
     /// # Errors
     ///
-    /// What [`Logic::new`] refuses (for example a key config binding one
-    /// control twice); recording is closed again and nothing is played.
-    pub fn play(&mut self, script: PlayScript) -> Result<PlayReport, LogicError> {
+    /// [`SessionPlayError::Logic`] for what [`Logic::new`] refuses (for
+    /// example a key config binding one control twice): recording is closed
+    /// again and nothing is played. [`SessionPlayError::Restore`] for a
+    /// round whose schedule is not the engine's (a practice set on the
+    /// [`Loaded`] before [`Loaded::start`] rather than through
+    /// [`set_practice`](Self::set_practice)): refused before recording
+    /// opens.
+    pub fn play(&mut self, script: PlayScript) -> Result<PlayReport, SessionPlayError> {
         let Self {
             loaded,
             audio,
             sources,
             clock,
         } = self;
+        // The round's schedule, which the engine must be playing.
+        let restorer = loaded
+            .section()
+            .map(|_| crate::Restorer::new(audio.engine().seek_source(), loaded.audio_schedule()));
         let mut rig = SessionRig {
             step: loaded.config.step,
             clock,
@@ -1170,12 +1179,14 @@ impl<O: AudioOutput + Wakes> Session<O> {
             screen: None,
             failure: None,
             sealed: false,
+            restorer,
             restore: None,
         };
         match crate::live::play(loaded, &mut rig) {
             Ok(Some(report)) => Ok(report),
             Ok(None) => unreachable!("a session never quits before recording opens"),
-            Err(LiveError::Logic(e)) => Err(e),
+            Err(LiveError::Logic(e)) => Err(SessionPlayError::Logic(e)),
+            Err(LiveError::Restore(e)) => Err(SessionPlayError::Restore(e)),
             Err(LiveError::Screen(e)) => match e {},
             Err(LiveError::Audio(_)) => {
                 unreachable!("a session has no audio thread to fail")
@@ -1183,11 +1194,19 @@ impl<O: AudioOutput + Wakes> Session<O> {
             Err(LiveError::Input(_)) => {
                 unreachable!("a session has no input thread to fail")
             }
-            Err(LiveError::Restore(_)) => {
-                unreachable!("a session plans on its own engine, which plays the round's schedule")
-            }
         }
     }
+}
+
+/// Why [`Session::play`] did not play.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum SessionPlayError {
+    /// The logic step refused to start.
+    #[error("the play cannot start")]
+    Logic(#[source] LogicError),
+    /// A round's audio cannot be restored; the round did not start.
+    #[error("the round's audio cannot be restored")]
+    Restore(#[source] RestoreError),
 }
 
 /// The session's rig: one step of the virtual clock per wait, the script
@@ -1208,8 +1227,10 @@ struct SessionRig<'s, O> {
     screen: Option<RenderSide>,
     failure: Option<OutputError>,
     sealed: bool,
+    /// What restores a round's audio, as the player's rig keeps one.
+    restorer: Option<crate::Restorer>,
     /// A round's restore, planned at its opening, applied with its start.
-    restore: Option<TimeUs>,
+    restore: Option<Box<crate::Restore>>,
 }
 
 impl<O: AudioOutput + Wakes> SessionRig<'_, O> {
@@ -1307,15 +1328,11 @@ impl<O: AudioOutput + Wakes> Rig for SessionRig<'_, O> {
     fn start(&mut self, origin: TimeUs, sounds: AudioQueue, screen: RenderSide) {
         let engine = self.audio.engine_mut();
         engine.restart(origin);
-        // As the audio thread restores a round: on the line of the play's
-        // origin, the lead-in's start, else its fallback, else silence
-        // (design.md "Mid-Chart Start and Section Repeat"). The engine's
-        // own schedule: never refused for it.
-        if let Some(at) = self.restore.take() {
-            let restorer = crate::Restorer::new(engine.seek_source(), engine.schedule().to_vec());
-            if let Ok(restore) = restorer.plan(engine.frame_line(), at) {
-                restore.apply(engine);
-            }
+        // As the audio thread restores a round: the lead-in's start, else
+        // its fallback, else silence (design.md "Mid-Chart Start and
+        // Section Repeat").
+        if let Some(restore) = self.restore.take() {
+            restore.apply(engine);
         }
         self.sounds = Some(sounds);
         self.screen = Some(screen);
@@ -1355,8 +1372,19 @@ impl<O: AudioOutput + Wakes> Rig for SessionRig<'_, O> {
         self.sealed = true;
     }
 
-    fn restore_audio(&mut self, _origin: TimeUs, at: TimeUs) -> Result<(), RestoreError> {
-        self.restore = Some(at);
+    fn restore_ready(&mut self, _at: TimeUs) -> Result<(), RestoreError> {
+        self.restore = None;
+        self.restorer
+            .as_ref()
+            .ok_or(RestoreError::NotPrepared)?
+            .check()
+    }
+
+    fn restore_audio(&mut self, origin: TimeUs, at: TimeUs) -> Result<(), RestoreError> {
+        let restorer = self.restorer.as_ref().ok_or(RestoreError::NotPrepared)?;
+        // On the line of the opening's origin, before the play starts there.
+        let line = self.audio.engine().frame_line_at(origin);
+        self.restore = Some(restorer.plan(line, at)?);
         Ok(())
     }
 

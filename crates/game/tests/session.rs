@@ -1139,7 +1139,9 @@ fn bad_key_config_refuses_to_play_and_closes_recording() {
     let err = s.play(script(vec![connect(0)], &[])).unwrap_err();
     assert!(matches!(
         err,
-        game::LogicError::Eval(eval::EvalError::DuplicateBinding { .. })
+        game::SessionPlayError::Logic(game::LogicError::Eval(
+            eval::EvalError::DuplicateBinding { .. }
+        ))
     ));
 }
 
@@ -2395,4 +2397,62 @@ fn a_session_round_restores_at_its_lead_in_start() {
     let at = |f: usize| (left[f] / audio::HEADROOM * 32_768.0).round();
     assert_eq!(at(first), 301.0);
     assert_eq!(at(first + 480), 302.0);
+}
+
+#[test]
+fn a_practice_set_before_the_session_starts_is_checked_against_its_engine() {
+    // The practice is set on the loaded chart, and the session started
+    // with an engine playing the chart's BGM alone, not the round's
+    // schedule, which also holds the key sound of the tap at 2 s outside
+    // the section: the round is refused before recording opens.
+    let (_dir, root) = temp_root();
+    let mut chart = ChartBuilder::new(120_000)
+        .sound("key.wav")
+        .tap(lane(1), TimeUs(2_000 * MS))
+        .tap(lane(1), TimeUs(10_000 * MS))
+        .build()
+        .unwrap();
+    chart.lanes[1][0].sound = Some(SoundId(0));
+    let events = Events::default();
+    let mut loaded = Loaded::load(
+        root.clone(),
+        tapestry_settings(&root),
+        &chart_file(&root),
+        config(),
+        parts(&root, &chart, &events),
+    )
+    .unwrap();
+    let practice = game::Practice {
+        start: TimeUs(9_000 * MS),
+        end: TimeUs(11_000 * MS),
+        lead_in: game::LEAD_IN,
+        initial_gauges: loaded.preset().gauges.iter().map(|g| g.start).collect(),
+        repeat: false,
+    };
+    loaded.set_practice(Some(practice.clone())).unwrap();
+    assert_ne!(loaded.audio_schedule(), chart.bgm);
+    let audio = steady_audio(&chart, common::bank(&chart));
+    let mut session = loaded.start(audio, SourceSet::new(common::sources()).unwrap());
+    let err = session
+        .play(script(vec![connect(0)], &[(12_000 * MS, Command::Quit)]))
+        .unwrap_err();
+    assert_eq!(
+        err,
+        game::SessionPlayError::Restore(game::RestoreError::Schedule)
+    );
+    assert!(
+        !events
+            .0
+            .borrow()
+            .iter()
+            .any(|e| matches!(e, SessionEvent::Start { .. }))
+    );
+    assert!(!root.path().join("records").exists());
+    // Set through the session, the engine takes the round's schedule and
+    // the round plays.
+    session.set_practice(Some(practice)).unwrap();
+    let report = session
+        .play(script(vec![connect(0)], &[(12_000 * MS, Command::Quit)]))
+        .unwrap();
+    assert!(report.record.is_some());
 }
