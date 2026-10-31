@@ -29,8 +29,9 @@ use skin_beatoraja::{
     Config, Header, ImportError, Imported, InputLimit, Note, Report, import, read_header,
 };
 use skin_model::{
-    ElementDef, ImageDef, KeyDef, MAX_ELEMENTS, MAX_FILES, MAX_FONTS, MAX_SKIN_FRAMES,
-    MAX_SKIN_KEYS, MAX_SKIN_OPS, MAX_TEXT_ELEMENTS, MAX_WIDGET_QUADS, Program,
+    ElementDef, ImageDef, KeyDef, MAX_ELEMENTS, MAX_FILES, MAX_FNT_BYTES, MAX_FNT_PAGES, MAX_FONTS,
+    MAX_SHEET_GLYPHS, MAX_SHEET_KERNINGS, MAX_SKIN_FRAMES, MAX_SKIN_KEYS, MAX_SKIN_OPS,
+    MAX_TEXT_ELEMENTS, MAX_WIDGET_QUADS, Program,
 };
 
 /// The recorded bound: the largest measured peak over the fixtures plus
@@ -278,6 +279,64 @@ fn check_f2(_: &Header, i: Imported) {
     assert_eq!(i.skin.text_slots(), MAX_TEXT_ELEMENTS);
     assert_eq!(i.skin.sheet().font_count(), MAX_FONTS);
     assert_eq!(i.skin.quad_capacity(), MAX_WIDGET_QUADS);
+}
+
+/// F6's glyph lines per font: with its synthesised space, 16 fonts fill
+/// the sheet's glyph cap.
+const F6_GLYPHS: usize = MAX_SHEET_GLYPHS / MAX_FONTS - 1;
+
+/// F6: 64 texts of 128 glyphs in 16 bitmap fonts, the font slots full,
+/// each font at the page cap (16 pages) and the file size cap, so the
+/// fonts fill the total font bytes, and together at the sheet's glyph
+/// and kerning caps.
+fn f6(root: &Path) {
+    assert_eq!(F6_GLYPHS.div_ceil(256), MAX_FNT_PAGES);
+    for i in 0..MAX_FONTS {
+        common::big_fnt(
+            root,
+            &format!("b{i}.fnt"),
+            F6_GLYPHS,
+            MAX_SHEET_KERNINGS / MAX_FONTS,
+            usize::try_from(MAX_FNT_BYTES).unwrap(),
+        );
+    }
+    let fonts = join((0..MAX_FONTS).map(|i| format!(r#"{{"id": "{i}", "path": "b{i}.fnt"}}"#)));
+    let texts = join((0..MAX_TEXT_ELEMENTS).map(|i| {
+        let line: String = (0..128)
+            .map(|c| char::from_u32(common::BIG_FNT_CODE + as_u32(i * 16 + c)).unwrap())
+            .collect();
+        format!(
+            r#"{{"id": "t{i}", "font": "{}", "size": 8, "constantText": "{line}"}}"#,
+            i % MAX_FONTS
+        )
+    }));
+    let dsts = join(
+        (0..MAX_TEXT_ELEMENTS)
+            .map(|i| format!(r#"{{"id": "t{i}", "dst": [{{"w": 1000, "h": 8}}]}}"#)),
+    );
+    write(
+        root,
+        "s.json",
+        common::hd(&format!(
+            r#""font": [{fonts}], "text": [{texts}], "destination": [{dsts}]"#
+        ))
+        .as_bytes(),
+    );
+}
+
+fn check_f6(_: &Header, i: Imported) {
+    let u = i.report.usage;
+    assert_eq!(u.texts, as_u32(MAX_TEXT_ELEMENTS));
+    assert_eq!(u.fonts, as_u32(MAX_FONTS));
+    assert_eq!(u.glyphs, as_u32(MAX_SHEET_GLYPHS));
+    assert_eq!(u.kernings, as_u32(MAX_SHEET_KERNINGS));
+    assert_eq!(u.images, as_u32(MAX_FONTS * MAX_FNT_PAGES));
+    assert_eq!(u.widget_quads, as_u32(MAX_TEXT_ELEMENTS * 128));
+    assert_eq!(i.report.notes, []);
+    assert_eq!(i.skin.sheet().bitmap_font_count(), MAX_FONTS);
+    let mut d = Drawn::new(i.skin, 10);
+    d.attach_bitmap("");
+    assert_eq!(d.frame(0, &[]).len(), MAX_TEXT_ELEMENTS * 128);
 }
 
 /// F5's judges: 5,127 with a 2-digit combo and one with a 1-digit combo.
@@ -655,6 +714,10 @@ fn import_memory_is_measured() {
     let d = tempfile::tempdir().unwrap();
     f5(d.path());
     peaks.push(("F5 play objects", measure(d.path(), check_f5)));
+    drop(d);
+    let d = tempfile::tempdir().unwrap();
+    f6(d.path());
+    peaks.push(("F6 bitmap fonts", measure(d.path(), check_f6)));
     drop(d);
     for (name, p) in &peaks {
         println!("{name}: peak {p} B");
