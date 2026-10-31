@@ -13,6 +13,14 @@
 //! offsets. [`read_header`] does all three with no option enabled, as the
 //! source's own header pass does.
 //!
+//! [`import`] maps a play skin's images, numbers and text onto a
+//! [`skin_model::Skin`] for a [`Config`] (the selected options, file
+//! choices and offsets), and returns it with a [`Report`]: the definition
+//! files read, the file each choice took, a located note for every element
+//! dropped, changed by a listed deviation or ignored, and the charged
+//! counters ([`Usage`]). A play-critical element it cannot reproduce
+//! refuses the import; anything else is dropped with a note.
+//!
 //! Every input bound ([`limits`]) is checked before the work it guards:
 //! file sizes from metadata before reading, the include depth and parse
 //! count before opening, nodes before they are inserted, decoded strings
