@@ -321,6 +321,19 @@ impl PlayerRig<'_> {
     }
 }
 
+/// A round's restore at chart time `at`, its lead-in's start, planned on
+/// the line the audio thread last published for a play whose chart time 0
+/// lies at `origin`, the opening's: `at` is then `RESTORE_AHEAD` in the
+/// output's future (design.md "Mid-Chart Start and Section Repeat").
+fn plan_restore(
+    restorer: &game::Restorer,
+    counters: &game::AudioCounters,
+    origin: TimeUs,
+    at: TimeUs,
+) -> Result<Box<game::Restore>, RestoreError> {
+    restorer.plan(counters.frame_line(origin), at)
+}
+
 pub(crate) fn since(from: TimeUs, to: TimeUs) -> Duration {
     Duration::from_micros(u64::try_from(to.0 - from.0).unwrap_or(0))
 }
@@ -528,10 +541,12 @@ impl Rig for PlayerRig<'_> {
 
     fn restore_audio(&mut self, origin: TimeUs, at: TimeUs) -> Result<(), RestoreError> {
         let restorer = self.restorer.as_ref().ok_or(RestoreError::NotPrepared)?;
-        // On the line of the opening's origin, by the audio thread's last
-        // step: the lead-in's start is `RESTORE_AHEAD` in its future.
-        let line = self.audio.control.counters().frame_line(origin);
-        self.restore = Some(restorer.plan(line, at)?);
+        self.restore = Some(plan_restore(
+            restorer,
+            &self.audio.control.counters(),
+            origin,
+            at,
+        )?);
         Ok(())
     }
 
@@ -683,6 +698,63 @@ impl Rig for PlayerRig<'_> {
         } else {
             self.end_shown = Some(std::time::Instant::now());
         }
+    }
+}
+
+#[cfg(test)]
+mod restore_tests {
+    use std::sync::Arc;
+
+    use audio::{AudioEngine, Gain, RecordingOutput, SimConfig, SimDevice, Sound, SoundBank};
+    use bms_model::{BgmEvent, SoundId, TimeUs};
+    use game::{RESTORE_AHEAD, Restored, Restorer, audio_control, audio_link_at};
+
+    use super::plan_restore;
+
+    /// The player's planning, on the line a stepped audio worker publishes
+    /// over a simulated device, restores a round at its lead-in's start:
+    /// the round opens at chart time 7.8 s when the output is at 30 ms, and
+    /// a 4 s BGM sound at 5 s enters there 3 s in, on time.
+    #[test]
+    fn a_round_planned_on_the_published_line_restores_at_its_lead_in() {
+        let bank = Arc::new(SoundBank::from_sounds(
+            48_000,
+            vec![Sound::mono(vec![1_000; 4 * 48_000])],
+        ));
+        let schedule = vec![BgmEvent {
+            time: TimeUs(5_000_000),
+            sound: SoundId(0),
+        }];
+        let engine =
+            AudioEngine::with_schedule(bank, schedule.clone(), 48_000, 480, 16, 0).unwrap();
+        let (mut control, mut worker) = audio_control(engine);
+        let mut out = RecordingOutput::new(
+            SimDevice::new(SimConfig::steady(48_000, 480, TimeUs(0))),
+            48_000,
+        );
+        for _ in 0..3 {
+            worker.step(&mut out).unwrap();
+        }
+        let at = TimeUs(8_000_000);
+        let origin = TimeUs(30_000 - (at.0 - RESTORE_AHEAD.0));
+        let restorer = Restorer::new(control.seek_source(), schedule);
+        let restore = plan_restore(&restorer, &control.counters(), origin, at).unwrap();
+        assert_eq!(restore.at(), at);
+        let (_sink, queue) = audio_link_at(4, origin);
+        control
+            .play_at(origin, queue, Gain::HEADROOM, Some(restore))
+            .unwrap();
+        for _ in 0..40 {
+            worker.step(&mut out).unwrap();
+        }
+        assert_eq!(
+            control.counters().restored(control.generation()),
+            Some(Restored::First)
+        );
+        // Frame `n` plays at `(n + 480) / 48 kHz`: the lead-in's start, 230
+        // ms, is frame 10 560; silent before it.
+        let left: Vec<f32> = out.samples().iter().step_by(2).copied().collect();
+        assert_eq!(left.iter().position(|&x| x != 0.0), Some(10_560));
     }
 }
 
