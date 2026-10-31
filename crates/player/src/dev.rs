@@ -29,6 +29,8 @@ use crate::args::{Command, UsageError};
 use crate::measure::Drawn;
 use crate::render_side::{FrameSink, Screen};
 
+pub mod scenario;
+
 /// Prints, to the console only, which window took the foreground when the
 /// game's window lost focus: its process's executable name and its window
 /// class, with the time on the game's clock (µs since start). A focus loss
@@ -250,6 +252,9 @@ pub struct SelectOptions {
     /// The render thread's bounds, as [`Options::render_timeout`]
     /// (`--dev-render-timeout`).
     pub render_timeout: Option<std::time::Duration>,
+    /// The scenario the run plays (`--dev-scenario`), which no option of
+    /// selection sets: its roots, captures and inputs.
+    pub scenario: Option<scenario::Session>,
 }
 
 impl SelectOptions {
@@ -299,10 +304,19 @@ pub enum SelectStep {
     /// Wait until the chart of this file name is listed, then move the
     /// cursor onto it with the arrow keys.
     Pick(String),
+    /// Wait until the chart of this file is listed, then move the cursor
+    /// onto it (a scenario's `select { path }`): any query is cleared first.
+    PickPath(scenario::Target),
     /// Wait until the chart of this file name is listed.
     Wait(String),
     /// Type into the search box: Tab, the text, Enter.
     Search(String),
+    /// Replace the search text with this one, as typing does, and wait
+    /// until it is searched (a scenario's `select { search }`).
+    Query(String),
+    /// Move the cursor onto the one chart the search for this text lists,
+    /// once a scan pass has completed.
+    PickSearched(String),
     /// Wait this many milliseconds on the select screen.
     Sleep(u64),
     /// Wait this many milliseconds on the select screen and print how often
@@ -310,6 +324,10 @@ pub enum SelectStep {
     Idle(u64),
     /// Press Enter.
     Enter,
+    /// A play starts, fed as it says (a scenario's `play`).
+    Play(scenario::PlayStep),
+    /// Save the frame its capture names, in the next play that starts.
+    Capture(u16),
     /// On a result: leave it (the quit key).
     Back,
     /// On a result: retry.
@@ -328,17 +346,30 @@ pub const STEP_TIMEOUT: Duration = Duration::from_secs(20);
 /// `--dev-select <steps>`: the select screen's input, comma-separated:
 /// `pick=<file>`, `wait=<file>`, `search=<text>`, `sleep=<ms>`, `enter`,
 /// `back`, `retry`, `next`, `prev` and `close`. Selection steps run on the
-/// select screen, `back`, `retry`, `next` and `prev` on a result; a step out of place, or a chart not listed within
-/// [`STEP_TIMEOUT`], fails the run.
+/// select screen, `back`, `retry`, `next` and `prev` on a result; a step
+/// out of place, or a chart not listed within [`STEP_TIMEOUT`], fails the
+/// run. A scenario ([`scenario`]) compiles into the same steps, each with
+/// the scenario step it comes from.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SelectScript {
-    steps: std::collections::VecDeque<SelectStep>,
+    steps: std::collections::VecDeque<(SelectStep, Option<scenario::Origin>)>,
     /// Since when the front step waits.
     since: Option<std::time::Instant>,
     /// The input thread's wakes when an `idle` step began.
     pub idle_from: Option<u64>,
     /// Why the script failed.
     failed: Option<String>,
+    /// The scenario step last announced.
+    announced: Option<u16>,
+    /// The scenario step of the last step done.
+    last_done: Option<scenario::Origin>,
+    /// The scenario steps a failure dropped.
+    abandoned: Vec<scenario::Origin>,
+    /// Why the chart chosen last was refused, until the next choice.
+    refusal: Option<String>,
+    /// Each listed file's identity, as far as the front step looked them
+    /// up: each at most once per step.
+    pub identities: std::collections::HashMap<PathBuf, Option<PathBuf>>,
 }
 
 impl SelectScript {
@@ -371,32 +402,62 @@ impl SelectScript {
                     "{s} is not pick=, wait=, search=, sleep=, enter, back, retry, next, prev or close"
                 )),
             })
+            .map(|step| step.map(|s| (s, None)))
             .collect::<Result<_, _>>()?;
         Ok(Self {
             steps,
-            since: None,
-            idle_from: None,
-            failed: None,
+            ..Self::default()
         })
+    }
+
+    /// A scenario's steps, each with the scenario step it comes from.
+    pub fn compiled(steps: Vec<(SelectStep, scenario::Origin)>) -> Self {
+        Self {
+            steps: steps.into_iter().map(|(s, o)| (s, Some(o))).collect(),
+            ..Self::default()
+        }
     }
 
     /// The step to run now.
     pub fn front(&self) -> Option<&SelectStep> {
-        self.steps.front()
+        self.steps.front().map(|(s, _)| s)
+    }
+
+    /// The scenario step the front step comes from.
+    pub fn origin(&self) -> Option<scenario::Origin> {
+        self.steps.front().and_then(|&(_, o)| o)
+    }
+
+    /// The scenario step of the last step done.
+    pub const fn last_done(&self) -> Option<scenario::Origin> {
+        self.last_done
+    }
+
+    /// Prints the scenario step the front step comes from, once, when it
+    /// is first due: on the game thread, outside any play.
+    pub fn announce(&mut self) {
+        if let Some(o) = self.origin()
+            && self.announced != Some(o.index)
+        {
+            self.announced = Some(o.index);
+            println!("dev: scenario: {o}");
+        }
     }
 
     /// The front step is done.
     pub fn done(&mut self) {
-        self.steps.pop_front();
+        if let Some((_, origin)) = self.steps.pop_front() {
+            self.last_done = origin;
+        }
         self.since = None;
         self.idle_from = None;
+        self.identities.clear();
     }
 
     /// The front step waits on; `false` once it has waited
     /// [`STEP_TIMEOUT`], which fails the script.
     pub fn waiting(&mut self) -> bool {
-        let since = *self.since.get_or_insert_with(std::time::Instant::now);
-        if since.elapsed() < STEP_TIMEOUT {
+        if !self.expired() {
             return true;
         }
         let step = format!("{:?}", self.front());
@@ -404,11 +465,49 @@ impl SelectScript {
         false
     }
 
-    /// The script failed: no step runs from here on.
+    /// Whether the front step has waited [`STEP_TIMEOUT`] since it became
+    /// the front.
+    pub fn expired(&mut self) -> bool {
+        let since = *self.since.get_or_insert_with(std::time::Instant::now);
+        since.elapsed() >= STEP_TIMEOUT
+    }
+
+    /// The script failed at its front step: no step runs from here on.
     pub fn fail(&mut self, why: String) {
+        let why = match self.origin() {
+            Some(o) => format!("{o}: {why}"),
+            None => why,
+        };
+        self.failed_with(why);
+    }
+
+    /// The script failed at scenario step `origin`, which need not be the
+    /// front (a capture settled after its play).
+    pub fn fail_at(&mut self, origin: scenario::Origin, why: &str) {
+        self.failed_with(format!("{origin}: {why}"));
+    }
+
+    fn failed_with(&mut self, why: String) {
         eprintln!("dev: select script: {why}");
         self.failed.get_or_insert(why);
-        self.steps.clear();
+        let left = std::mem::take(&mut self.steps);
+        for o in left.into_iter().filter_map(|(_, o)| o) {
+            if self.abandoned.last() != Some(&o) {
+                self.abandoned.push(o);
+            }
+        }
+    }
+
+    /// The scenario steps that never ran: those a failure dropped and
+    /// those still queued, each once.
+    pub fn not_run(&self) -> Vec<scenario::Origin> {
+        let mut all = self.abandoned.clone();
+        for o in self.steps.iter().filter_map(|&(_, o)| o) {
+            if all.last() != Some(&o) {
+                all.push(o);
+            }
+        }
+        all
     }
 
     /// Whether the front step has waited `ms` milliseconds since it became
@@ -421,6 +520,21 @@ impl SelectScript {
     /// Why the script failed, if it did.
     pub fn failure(&self) -> Option<&str> {
         self.failed.as_deref()
+    }
+
+    /// A chart was chosen: a refusal from before it is no longer its.
+    pub fn chose(&mut self) {
+        self.refusal = None;
+    }
+
+    /// The chart chosen last was refused, for `why`.
+    pub fn refused(&mut self, why: String) {
+        self.refusal = Some(why);
+    }
+
+    /// Why the chart chosen last was refused, if it was.
+    pub fn refusal(&self) -> Option<&str> {
+        self.refusal.as_deref()
     }
 }
 

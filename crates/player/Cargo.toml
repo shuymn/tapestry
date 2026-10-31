@@ -18,7 +18,7 @@ windows-only = true
 [features]
 default = []
 # Development features. Never enabled in production builds (R3).
-dev-tools = ["game/dev-tools"]
+dev-tools = ["game/dev-tools", "dep:serde", "dep:toml"]
 
 [dependencies]
 anyhow.workspace = true
@@ -34,7 +34,9 @@ render.workspace = true
 replay.workspace = true
 rtrb.workspace = true
 rules.workspace = true
+serde = { workspace = true, optional = true }
 thiserror.workspace = true
+toml = { workspace = true, optional = true }
 windows = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_System_Power",

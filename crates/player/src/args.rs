@@ -29,6 +29,9 @@ pub enum Command {
     /// `measure play [--perfect] <chart>`.
     #[cfg(feature = "dev-tools")]
     Measure { chart: PathBuf, perfect: bool },
+    /// `--dev-scenario <file.toml> [--dev-render-timeout <s>]`.
+    #[cfg(feature = "dev-tools")]
+    Scenario(crate::dev::scenario::ScenarioArgs),
 }
 
 /// `play`'s arguments.
@@ -111,6 +114,8 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, UsageE
             Command::Version
         }
         #[cfg(feature = "dev-tools")]
+        Some(Arg::Long("dev-scenario")) => Command::Scenario(crate::dev::scenario::args(&mut p)?),
+        #[cfg(feature = "dev-tools")]
         Some(Arg::Long("dev-tools-probe")) => {
             end(&mut p)?;
             Command::DevToolsProbe
@@ -133,10 +138,12 @@ pub(crate) fn end(p: &mut Parser) -> Result<(), UsageError> {
 }
 
 /// Whether `--<name>` is an option of song selection: `--auto`, and the
-/// development options.
+/// development options but the commands of their own.
 fn is_select_option(name: &str) -> bool {
     name == "auto"
-        || (cfg!(feature = "dev-tools") && name.starts_with("dev-") && name != "dev-tools-probe")
+        || (cfg!(feature = "dev-tools")
+            && name.starts_with("dev-")
+            && !matches!(name, "dev-tools-probe" | "dev-scenario"))
 }
 
 /// Song selection's options, from `first` (the long option already read,
@@ -514,6 +521,58 @@ mod tests {
             parsed(&["play", "a.bms", "--auto", "--dev-headless"]).unwrap_err(),
             unknown("--dev-headless")
         );
+    }
+
+    /// A production build does not know `--dev-scenario`.
+    #[cfg(not(feature = "dev-tools"))]
+    #[test]
+    fn scenario_is_unknown_in_production() {
+        assert_eq!(
+            parsed(&["--dev-scenario", "x.toml"]).unwrap_err(),
+            unknown("--dev-scenario")
+        );
+    }
+
+    /// `--dev-scenario` takes a file and, once, the render bound; it is no
+    /// option of selection, and nothing else follows it.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn scenario_takes_a_file_and_a_render_bound() {
+        let Command::Scenario(s) =
+            parsed(&["--dev-scenario", "x.toml", "--dev-render-timeout", "9"]).unwrap()
+        else {
+            panic!("not a scenario");
+        };
+        assert_eq!(s.file, Path::new("x.toml"));
+        assert_eq!(s.render_timeout, Some(std::time::Duration::from_secs(9)));
+        for (args, refusal) in [
+            (
+                &["--dev-scenario", "x.toml", "--auto"][..],
+                unknown("--auto"),
+            ),
+            (
+                &[
+                    "--dev-scenario",
+                    "x.toml",
+                    "--dev-render-timeout",
+                    "9",
+                    "--dev-render-timeout",
+                    "9",
+                ],
+                unknown("--dev-render-timeout"),
+            ),
+            (&["--dev-scenario", "x.toml", "y.toml"], unknown("y.toml")),
+            (
+                &["--auto", "--dev-scenario", "x.toml"],
+                unknown("--dev-scenario"),
+            ),
+            (
+                &["--dev-scenario"],
+                UsageError::Usage("--dev-scenario needs a value".to_owned()),
+            ),
+        ] {
+            assert_eq!(parsed(args).unwrap_err(), refusal, "{args:?}");
+        }
     }
 
     #[cfg(feature = "dev-tools")]

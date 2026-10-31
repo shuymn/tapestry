@@ -29,7 +29,7 @@ use crate::measure::{
     AudioBase, Figures, PlayMeasure, Step, StepSample, judgment_samples, limits_line, measure_path,
     process_page_faults, to_toml,
 };
-use crate::render_side::{RenderLink, RenderMsg, ScreenError};
+use crate::render_side::{RenderEnd, RenderLink, RenderMsg, ScreenError};
 use crate::result_input::ResultInput;
 use crate::tuning::{Delivered, SettingsFiles};
 
@@ -125,6 +125,9 @@ pub struct PlayerRig<'a> {
     /// capture of `measure play` (dev-tools).
     #[cfg(feature = "dev-tools")]
     pub measured_plays: Option<MeasuredPlays>,
+    /// The scenario the run plays (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    pub scenario: Option<crate::dev::scenario::State>,
     /// Quit once the end screen has shown this long (scripted runs).
     #[cfg(feature = "dev-tools")]
     pub quit_after_end: Option<Duration>,
@@ -149,10 +152,10 @@ pub struct PlayerRig<'a> {
 
 impl PlayerRig<'_> {
     /// Writes changed settings, then ends the render and audio threads;
-    /// `false` when the render thread did not end, so the window must stay
-    /// open until the process exits.
+    /// how the render thread ended: when [`RenderEnd::Stuck`], the window
+    /// must stay open until the process exits.
     #[must_use]
-    pub fn shut_down(mut self) -> bool {
+    pub fn shut_down(mut self) -> RenderEnd {
         self.persist();
         let ended = self.render.exit();
         self.audio.exit();
@@ -292,6 +295,19 @@ pub(crate) fn since(from: TimeUs, to: TimeUs) -> Duration {
     Duration::from_micros(u64::try_from(to.0 - from.0).unwrap_or(0))
 }
 
+/// Whether chart time `at` has come at `now` for a play whose countdown
+/// started at `countdown_at` and lasts `lead_in`, all on the clock.
+#[cfg(feature = "dev-tools")]
+#[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+pub(crate) const fn until_due(
+    countdown_at: TimeUs,
+    lead_in: TimeUs,
+    at: TimeUs,
+    now: TimeUs,
+) -> bool {
+    now.0 - countdown_at.0 - lead_in.0 >= at.0
+}
+
 impl Rig for PlayerRig<'_> {
     type Reader = SourceReader;
     type ScreenError = ScreenError;
@@ -304,10 +320,19 @@ impl Rig for PlayerRig<'_> {
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn wait(&mut self) {
         thread::park_timeout(if self.in_play { PARK } else { IDLE_PARK });
+        // A scenario's `until`: the command, sent once, as its key would.
+        #[cfg(feature = "dev-tools")]
+        if let Some(sc) = &mut self.scenario
+            && let (Some(c), Some((at, command))) = (self.countdown_at, sc.until)
+            && until_due(c, self.lead_in, at, self.clock.now())
+        {
+            sc.until = None;
+            self.controls.command(command);
+        }
         #[cfg(feature = "dev-tools")]
         if let Some(c) = self.countdown_at
             && !self.adjust_in_play.is_empty()
-            && self.clock.now().0 - c.0 - self.lead_in.0 >= self.adjust_at.0
+            && until_due(c, self.lead_in, self.adjust_at, self.clock.now())
         {
             for a in self.adjust_in_play.drain(..) {
                 self.controls.tuning().adjust(a);
@@ -377,6 +402,8 @@ impl Rig for PlayerRig<'_> {
 
     fn prepare_screen(&mut self) -> Result<(), ScreenError> {
         self.retry_from = self.pending_retry.take();
+        #[cfg(feature = "dev-tools")]
+        self.scenario_pending();
         self.render.prepare()
     }
 
@@ -423,6 +450,8 @@ impl Rig for PlayerRig<'_> {
             audio: Some(audio),
             queued_periods: self.queued_now,
         };
+        #[cfg(feature = "dev-tools")]
+        self.scenario_started();
         self.render.send(RenderMsg::Play {
             side: screen,
             gauge: self.gauge,
@@ -446,6 +475,8 @@ impl Rig for PlayerRig<'_> {
         // Measurement stops at the end of the play, before the save and the
         // re-evaluation, however long they take.
         self.figures = self.render.finish(self.clock.now());
+        #[cfg(feature = "dev-tools")]
+        self.scenario_over();
         // The tail is over: nothing reads the input thread's publications
         // or its focus checks until the next play opens.
         self.in_play = false;
@@ -575,5 +606,25 @@ impl Rig for PlayerRig<'_> {
         } else {
             self.end_shown = Some(std::time::Instant::now());
         }
+    }
+}
+
+#[cfg(all(test, feature = "dev-tools"))]
+mod tests {
+    use bms_model::TimeUs;
+
+    use super::until_due;
+
+    /// A scenario's `until` is due at its chart time exactly: the countdown
+    /// started at 5 s on the clock and lasts 1 s, so chart time 2.25 s is
+    /// clock time 8.25 s.
+    #[test]
+    fn until_is_due_exactly_at_its_time() {
+        let (countdown, lead_in) = (TimeUs(5_000_000), TimeUs(1_000_000));
+        let at = TimeUs(2_250_000);
+        assert!(!until_due(countdown, lead_in, at, TimeUs(8_249_999)));
+        assert!(until_due(countdown, lead_in, at, TimeUs(8_250_000)));
+        assert!(!until_due(countdown, lead_in, TimeUs(0), TimeUs(5_999_999)));
+        assert!(until_due(countdown, lead_in, TimeUs(0), TimeUs(6_000_000)));
     }
 }

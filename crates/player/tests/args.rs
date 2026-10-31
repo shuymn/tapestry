@@ -274,6 +274,14 @@ fn dev_scripted_input_is_unknown_without_feature() {
     assert_unknown(&["keys", "--dev-scripted-keys", "1"], "--dev-scripted-keys");
 }
 
+/// A production build exits 2 on `--dev-scenario`, as on any unknown
+/// argument, before it reads the file.
+#[cfg(not(feature = "dev-tools"))]
+#[test]
+fn scenario_is_unknown_in_production() {
+    assert_unknown(&["--dev-scenario", "x.toml"], "--dev-scenario");
+}
+
 #[test]
 fn extra_argument_exits_two() {
     let out = run(&["--version", "extra"]);
@@ -327,6 +335,7 @@ fn usage_errors_touch_no_data_root() {
         &["play", "a.bms", "--dev-adjust-at", "x"],
         &["keys", "--dev-scripted-keys", "zz"],
         &["measure", "play"],
+        &["--dev-scenario"],
     ];
     #[cfg(not(feature = "dev-tools"))]
     const DEV_CASES: &[&[&str]] = &[];

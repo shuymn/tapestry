@@ -1,0 +1,63 @@
+# The exit scenario: song selection, results and retries, played on the
+# game's threads. The test that runs it makes everything it names: the
+# charts, their sounds and the input log.
+version = 1
+output = "out"
+
+[library]
+roots = ["library"]
+rescan_ms = 50
+
+# 1-2: chart A by autoplay, evaluated under the default preset.
+[[step]]
+select = { path = "library/a/a.bms" }
+
+[[step]]
+play = { input = "auto", until = "end" }
+
+# 3-5: the result under tapestry, LR2-style, and the default again.
+[[step]]
+result = "prev-preset"
+
+[[step]]
+result = "prev-preset"
+
+[[step]]
+result = "prev-preset"
+
+[[step]]
+result = "back"
+
+# 7-12: A again with the log: to the end, retried from the result, retried
+# during the play, then left during the play. The capture is the log's
+# first play's.
+[[step]]
+capture = { at = 3000, file = "a-log.png" }
+
+[[step]]
+select = { path = "library/a/a.bms" }
+
+[[step]]
+play = { input = "logs/a.tprl", until = "end" }
+
+[[step]]
+result = "retry"
+
+[[step]]
+play = { input = "logs/a.tprl", until = { at_ms = 2250, command = "retry" } }
+
+[[step]]
+play = { input = "logs/a.tprl", until = { at_ms = 3250, command = "quit" } }
+
+# 13-16: chart B found by search, by autoplay.
+[[step]]
+select = { search = "譜面B" }
+
+[[step]]
+play = { input = "auto", until = "end" }
+
+[[step]]
+result = "back"
+
+[[step]]
+quit = {}

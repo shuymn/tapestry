@@ -133,6 +133,7 @@ impl Controls {
 
     /// A system control or the system's suspend. Quit latches; a suspend is
     /// never replaced by a later retry, so it always aborts the play.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub fn command(&self, c: Command) {
         self.set_command(c);
         self.wake_game();
@@ -145,6 +146,7 @@ impl Controls {
         self.leaves.store(true, Ordering::Release);
     }
 
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn set_command(&self, c: Command) {
         let new = match c {
             Command::Quit if self.leaves.load(Ordering::Acquire) => {
