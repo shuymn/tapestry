@@ -451,8 +451,9 @@ impl<'d> Cx<'d> {
     /// Whether some destination draws a judge, read ahead of the walk: the
     /// source makes the judge region for it whatever its conditions
     /// (`JsonPlaySkinObjectLoader.java:226, 283-287`). A judge other than
-    /// index 0 refuses the import, and a record this cannot read fails
-    /// the walk at or before it, so neither needs an answer.
+    /// index 0 refuses the import, as does a judge id an image shares, and
+    /// a record this cannot read fails the walk at or before it, so none
+    /// needs an answer.
     fn judge_region(&mut self, destinations: &[u32]) -> bool {
         for &rec in destinations {
             let Ok(id) = object::id_of(self.def, rec) else {
@@ -663,10 +664,29 @@ impl<'d> Cx<'d> {
         };
         // The source draws the character when its file exists and the
         // notes otherwise: one id cannot be both.
-        if object == Object::PmChara && self.objects.is_note(self.def, &self.tables, &id)? {
+        if object == Object::PmChara
+            && self
+                .objects
+                .names(self.def, &self.tables, &id, Object::Note)?
+        {
             return Err(ImportError::Critical {
                 at: self.loc(at),
                 part: CriticalPart::Lanes,
+                why: NoteKind::UnsupportedField { field: "id" },
+            });
+        }
+        // Likewise the source draws the image when its file loads and
+        // makes the judge, with its region, otherwise
+        // (`JsonSkinObjectLoader.java:71`, `JsonPlaySkinObjectLoader.java:31,
+        // 283`): one id cannot be both.
+        if object == Object::Image
+            && self
+                .objects
+                .names(self.def, &self.tables, &id, Object::Judge)?
+        {
+            return Err(ImportError::Critical {
+                at: self.loc(at),
+                part: CriticalPart::Judge,
                 why: NoteKind::UnsupportedField { field: "id" },
             });
         }

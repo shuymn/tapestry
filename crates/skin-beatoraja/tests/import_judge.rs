@@ -446,3 +446,26 @@ fn native_grades_keep_the_combos_anchor() {
         [[99, 560, 12, 20], [109, 560, 12, 20], [136, 566, 8, 8]]
     );
 }
+
+#[test]
+fn an_image_may_not_share_the_judges_id() {
+    // The source makes the judge, and its region, only when the image's
+    // file fails to load (`JsonSkinObjectLoader.java:71`); either way the
+    // id is refused.
+    for src in ["gone", "a"] {
+        let image = format!(r#""image": [{{"id": "j", "src": "{src}", "w": 8, "h": 8}}, "#);
+        let body = format!(
+            r#"{}, "value": [], "judge": [{}], "destination": [{DST}]"#,
+            images().replacen(r#""image": ["#, &image, 1),
+            judge_rec(&grades(1), &[], "")
+        );
+        assert_eq!(
+            critical(import_sized([1_920, 1_080], &body, &[])),
+            (
+                CriticalPart::Judge,
+                NoteKind::UnsupportedField { field: "id" }
+            ),
+            "{src}"
+        );
+    }
+}
