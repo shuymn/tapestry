@@ -691,6 +691,7 @@ fn rig<'a>(
         files: SettingsFiles::new(root.clone(), settings.clone()),
         seen: Delivered::default(),
         end_lines: None,
+        end_graphs: None,
         hints: Hints::new(device.keyboard.retry, device.keyboard.quit),
         result_input: result_input::ResultInput::new(Arc::new(MenuQueue::default()), None),
         viewed: None,

@@ -758,7 +758,15 @@ fn section_round_records_its_conditions() {
         delay: 0,
         records: Rc::clone(&records),
     };
+    // A user preset whose survival gauge has another ID: a what-if under it
+    // starts that gauge at its start value.
+    let presets = dir.path().join("presets");
+    std::fs::create_dir_all(&presets).unwrap();
+    let mut renamed = rules::tapestry();
+    renamed.gauges[1].id = "other".to_owned();
+    std::fs::write(presets.join("renamed.toml"), game::preset_to_toml(&renamed)).unwrap();
     let mut loaded = load(dir.path(), example_chart(), saves, config());
+    let mut reports = Vec::new();
     let ids: Vec<String> = loaded
         .preset()
         .gauges
@@ -778,7 +786,49 @@ fn section_round_records_its_conditions() {
         // Round 1 is left by a quit at 18 s.
         rig.commands.push((1, 18_000 * MS, Command::Quit));
         game::live::run_chart(&mut loaded, &mut rig).unwrap();
+        reports.append(&mut rig.reports);
     }
+    // G9: each round's result is drawn from its section's start, each gauge
+    // from its transferred value; under `renamed` the survival gauge,
+    // which has no transferred value, from its start value, marked so.
+    assert_eq!(reports.len(), 2);
+    for report in &reports {
+        let mut screen = game::ResultScreen::new(
+            report,
+            loaded.shelf(),
+            &example_chart(),
+            game::RECORDING_MEMORY,
+        );
+        assert_eq!(screen.axis().unwrap().origin, TimeUs(SECTION.0));
+        let game::ViewStatus::Ready(own) = screen.status() else {
+            panic!("{:?}", screen.status());
+        };
+        let first = |s: &game::ViewSummary, i: usize| s.graphs.traces[i].unwrap().columns[0];
+        for (i, v) in [(0, pct(50)), (1, pct(70))] {
+            let c = first(own, i);
+            assert!(c.low <= v && v <= c.high, "{i}: {c:?}");
+            assert!(!own.gauges[i].unwrap().started_at_default);
+        }
+        // Quit at 18 s: nothing drawn past it.
+        let w = report.record.as_ref().unwrap().status.finalized;
+        assert_eq!(own.graphs.reached, screen.axis().unwrap().column(w) + 1);
+        while screen.viewed().unwrap().name != "renamed" {
+            screen.step(1, report, &example_chart());
+        }
+        let game::ViewStatus::Ready(what_if) = screen.status() else {
+            panic!("{:?}", screen.status());
+        };
+        let c = first(what_if, 0);
+        assert!(c.low <= pct(50) && pct(50) <= c.high, "{c:?}");
+        let c = first(what_if, 1);
+        assert!(
+            c.low <= GaugeValue::FULL && GaugeValue::FULL <= c.high,
+            "{c:?}"
+        );
+        assert!(what_if.gauges[1].unwrap().started_at_default);
+        assert!(!what_if.gauges[0].unwrap().started_at_default);
+    }
+
     let records = records.borrow();
     assert_eq!(records.len(), 2);
     let round = |attempt| replay::Practice {

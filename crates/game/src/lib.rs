@@ -30,6 +30,7 @@ pub mod presets;
 mod queue;
 mod render;
 mod restore;
+mod result_graphs;
 pub mod result_screen;
 mod results;
 mod runner;
@@ -77,13 +78,17 @@ pub use presets::{
 pub use queue::{DEFAULT_QUEUED_PERIODS, QUEUED_PERIODS, QueueChoice, RAISED_QUEUED_PERIODS};
 pub use render::{PlayView, RenderSide, RenderSink};
 pub use restore::{Restore, RestoreError, RestoreRefusal, Restored, Restorer};
+pub use result_graphs::{
+    Axis, GRAPH_COLUMNS, GaugeColumn, GaugeMark, GaugeTrace, ResultGraphs, TIMING_BIN_US,
+    TIMING_BINS, Timing, condense, listed,
+};
 pub use result_screen::{
-    EntryId, GaugeEnd, NOTICES, Notice, RESULT_CACHE, ResultScreen, SHOWN_GAUGES, ViewEntry,
-    ViewStatus, ViewSummary, what_if_bytes,
+    EntryId, GaugeEnd, NOTICES, Notice, RESULT_CACHE, ResultScreen, SHOWN_GAUGES, SUMMARY_BYTES,
+    ViewEntry, ViewStatus, ViewSummary, what_if_bytes,
 };
 pub use results::{
     MIN_OFFSET_SAMPLES, ReEvaluate, ReEvaluationError, RecommendedOffset, ResultContext,
-    ResultExtension, ResultSummary,
+    ResultExtension, ResultSummary, press_deviations,
 };
 pub use rules_toml::{
     NameError, PresetError, PresetFileCause, PresetFileError, check_user_preset_name,

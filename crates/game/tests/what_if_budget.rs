@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicIsize, Ordering};
 
 use bms_model::{ChartBuilder, TimeUs};
 use common::{MS, device, lane};
-use game::{ReEvaluate, ResultContext, what_if_bytes};
+use game::{ReEvaluate, ResultContext, SUMMARY_BYTES, ViewSummary, what_if_bytes};
 use replay::{
     BuildProvenance, ChartRecord, DeviceKind, DeviceRecord, EndStatus, Incomplete, PlayRecord,
     PlayType, PresetRecord, ReceiveMethod, SourceRecord, Status, Versions, WakePolicy,
@@ -165,11 +165,20 @@ fn what_if_peak_stays_within_its_budget() {
                 live: &[],
             };
             let mut evaluated = None;
-            // The record's own buffers are held throughout, outside the
-            // closure: the estimate counts them.
-            let peak = peak_of(&mut || evaluated = Some(ReEvaluate::under(&ctx, &what_if)))
-                + record_bytes(&record);
-            let evaluated = evaluated.unwrap().unwrap();
+            let mut summary = None;
+            // Evaluated and condensed while the evaluation is alive, as the
+            // result screen does. The record's own buffers are held
+            // throughout, outside the closure: the estimate counts them.
+            let peak = peak_of(&mut || {
+                let r = ReEvaluate::under(&ctx, &what_if).unwrap();
+                summary = Some(of(&r, &what_if));
+                evaluated = Some(r);
+            }) + record_bytes(&record);
+            let evaluated = evaluated.unwrap();
+            assert_eq!(
+                summary.unwrap().graphs.traces.iter().flatten().count(),
+                if gauges <= 6 { gauges } else { 5 }
+            );
             assert!(!evaluated.as_played);
             assert_eq!(evaluated.evaluation.gauges.len(), gauges);
             // What the evaluation still holds was counted.
@@ -193,6 +202,37 @@ fn what_if_peak_stays_within_its_budget() {
             assert!(own < what_if_bytes(&chart, &what_if, &record).unwrap());
         }
     }
+    // A summary holds SUMMARY_BYTES on the heap, its one allocation,
+    // whatever the play: of one gauge or 64, of 64 inputs or all.
+    for gauges in [1, 64] {
+        for inputs in [64, all] {
+            let mut what_if = rules::tapestry();
+            what_if.id = "many".to_owned();
+            what_if.gauges = (0..gauges)
+                .map(|i| rules::GaugeRule {
+                    id: format!("g{i}"),
+                    lamp: u16::try_from(i).unwrap(),
+                    ..normal.clone()
+                })
+                .collect();
+            let mut record = record.clone();
+            record.events.truncate(inputs);
+            let ctx = ResultContext {
+                record: &record,
+                chart: &chart,
+                preset: &played,
+                live: &[],
+            };
+            let r = ReEvaluate::under(&ctx, &what_if).unwrap();
+            let mut summary = None;
+            let peak = peak_of(&mut || summary = Some(of(&r, &what_if)));
+            let held = usize::try_from(LIVE.load(Ordering::Relaxed)).unwrap();
+            assert_eq!(peak, SUMMARY_BYTES, "{gauges} gauges, {inputs} inputs");
+            assert_eq!(held, SUMMARY_BYTES, "{gauges} gauges, {inputs} inputs");
+            drop(summary);
+        }
+    }
+    println!("indicator: SUMMARY_BYTES {SUMMARY_BYTES}");
     // One gauge whose ID is near the preset file's 1 MiB limit, on a few
     // inputs: hashing the preset must not hold its canonical encoding,
     // which would be larger than the evaluation itself.
@@ -225,4 +265,20 @@ fn what_if_peak_stays_within_its_budget() {
 fn record_bytes(record: &PlayRecord) -> usize {
     record.events.capacity() * size_of::<eval::PhysicalInputEvent>()
         + record.start.held.capacity() * eval::HELD_BYTES
+}
+
+/// The summary of `r`, evaluated under `preset`, on its own deadline.
+fn of(r: &replay::verify::ReEvaluation, preset: &rules::RulePreset) -> ViewSummary {
+    ViewSummary::of(
+        &r.evaluation,
+        preset,
+        game::Axis {
+            origin: bms_model::TimeUs(0),
+            end: r.evaluation.final_deadline,
+        },
+        r.coverage,
+        r.as_played,
+        &r.started_at_default,
+        None,
+    )
 }

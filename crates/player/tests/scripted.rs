@@ -903,7 +903,28 @@ fn auto_play_saves_nothing_and_judges_every_note_perfect() {
     );
     assert!(!stdout.lines().any(|l| l.starts_with("saved:")), "{stdout}");
     assert!(!stdout.contains("measure:"), "{stdout}");
-    assert!(frames.join("end.png").is_file());
+    // The end screen draws the view's graphs under its text: the first
+    // gauge's trace (green) across the bottom left, and the histogram's
+    // bar of on-time presses (late side, orange) bottom right.
+    let (w, h, rgba) = png_pixels(&frames.join("end.png"));
+    let count = |left: bool, keep: fn(i32, i32, i32) -> bool| {
+        let mut n = 0;
+        for y in h * 4 / 5..h {
+            for x in 0..w {
+                if (x < w / 2) != left {
+                    continue;
+                }
+                let p = &rgba[(y * w + x) * 4..][..3];
+                let (r, g, b) = (i32::from(p[0]), i32::from(p[1]), i32::from(p[2]));
+                n += usize::from(keep(r, g, b));
+            }
+        }
+        n
+    };
+    let green = count(true, |r, g, b| g > r + 30 && g > b + 30);
+    let orange = count(false, |r, g, b| r > g + 30 && r > b + 60);
+    assert!(green > 288, "{green} green pixels in {w}x{h}");
+    assert!(orange > 0, "{orange} orange pixels in {w}x{h}");
     // The key sounds came from the merged schedule: a start every 0.5 s
     // from 2.0 s (the notes, chords on one frame) to 4.0 s (the long note
     // with the BGM), each exactly 24 000 frames after the last at 48 kHz.
@@ -930,6 +951,45 @@ fn auto_play_saves_nothing_and_judges_every_note_perfect() {
         ["device.toml", "logs\\tapestry.lock", "logs\\tapestry.log"],
         "{kept:?}"
     );
+}
+
+/// The size and RGBA8 pixels of a PNG file the frame dump wrote: one IDAT
+/// chunk of stored deflate blocks, every row unfiltered.
+fn png_pixels(path: &Path) -> (usize, usize, Vec<u8>) {
+    let bytes = fs::read(path).unwrap();
+    let mut at = 8;
+    let (mut w, mut h, mut z) = (0, 0, Vec::new());
+    while at + 8 <= bytes.len() {
+        let len = u32::from_be_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+        let data = &bytes[at + 8..at + 8 + len];
+        match &bytes[at + 4..at + 8] {
+            b"IHDR" => {
+                w = u32::from_be_bytes(data[..4].try_into().unwrap()) as usize;
+                h = u32::from_be_bytes(data[4..8].try_into().unwrap()) as usize;
+            }
+            b"IDAT" => z.extend_from_slice(data),
+            _ => {}
+        }
+        at += 12 + len;
+    }
+    let mut raw = Vec::new();
+    let mut i = 2;
+    loop {
+        let last = z[i] & 1 == 1;
+        let len = usize::from(u16::from_le_bytes([z[i + 1], z[i + 2]]));
+        raw.extend_from_slice(&z[i + 5..i + 5 + len]);
+        i += 5 + len;
+        if last {
+            break;
+        }
+    }
+    let mut rgba = Vec::with_capacity(w * h * 4);
+    for row in raw.chunks(w * 4 + 1) {
+        assert_eq!(row[0], 0, "unfiltered");
+        rgba.extend_from_slice(&row[1..]);
+    }
+    assert_eq!(rgba.len(), w * h * 4);
+    (w, h, rgba)
 }
 
 /// H2: retried by itself after ten input offset steps on the end screen

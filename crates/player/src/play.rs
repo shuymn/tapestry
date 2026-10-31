@@ -30,6 +30,7 @@ use crate::measure::{
     process_page_faults, to_toml,
 };
 use crate::render_side::{RenderEnd, RenderLink, RenderMsg, ScreenError};
+
 use crate::result_input::ResultInput;
 use crate::tuning::{Delivered, SettingsFiles};
 
@@ -90,6 +91,9 @@ pub struct PlayerRig<'a> {
     /// The end screen's summary, while it shows; the settings lines are
     /// added each time it is drawn.
     pub end_lines: Option<Vec<String>>,
+    /// The viewed summary's graphs, drawn under the end screen's lines;
+    /// `None` when the view has none.
+    pub end_graphs: Option<std::sync::Arc<game::ResultGraphs>>,
     /// The end screen's key names.
     pub hints: Hints,
     /// The result screen's input.
@@ -225,12 +229,13 @@ impl PlayerRig<'_> {
         self.send_end(t);
     }
 
+    /// Hands the end screen's page, with the settings lines of `t` and the
+    /// view's graphs, to the render thread, while the end screen shows.
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn send_end(&self, t: Tuning) {
         if let Some(lines) = &self.end_lines {
-            let mut all = lines.clone();
-            all.extend(end_screen::settings_lines(t));
-            self.render.send(RenderMsg::Text(all));
+            let page = end_screen::end_page(lines, self.end_graphs.as_ref(), t);
+            self.render.show_end(page);
         }
     }
 
@@ -629,6 +634,7 @@ impl Rig for PlayerRig<'_> {
         // the Watermark"); the other values are recorded as they are at the
         // start.
         self.end_lines = None;
+        self.end_graphs = None;
         self.result_input.release();
         let t = self.controls.tuning().close_end_screen();
         t.apply_to(settings);
@@ -685,7 +691,9 @@ impl Rig for PlayerRig<'_> {
             &self.hints,
             self.autoplay,
         ));
+        self.end_graphs = end_screen::view_graphs(screen);
         self.send_end(tuning.get());
+
         self.result_shown();
         #[cfg(feature = "dev-tools")]
         for a in self.adjust_on_end.drain(..) {

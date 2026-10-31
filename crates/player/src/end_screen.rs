@@ -2,16 +2,22 @@
 //! numbers from the re-evaluation of the saved record (`ReEvaluate`), in a
 //! fixed layout with the result screen's view of it (design.md "Play
 //! Lifecycle"): the preset strip, what the view shows, its coverage, the
-//! viewed file's error and the latest notices.
+//! viewed file's error and the latest notices. The view's early/late
+//! counts are lines of their own, and the gauge cells sit on the rows the
+//! renderer draws their colour squares beside
+//! ([`render::RESULT_GAUGE_ROW`]).
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use game::{
-    AbortCause, Chain, EntryId, Notice, PlayEnd, PlayReport, PresetFileError, ResultScreen,
-    SHOWN_GAUGES, ShelfError, Tuning, ViewEntry, ViewStatus, ViewSummary,
+    AbortCause, Chain, EntryId, Notice, PlayEnd, PlayReport, PresetFileError, ResultGraphs,
+    ResultScreen, ShelfError, Timing, Tuning, ViewEntry, ViewStatus, ViewSummary,
 };
 use replay::verify::Coverage;
 use rules::{GaugeValue, RulePreset};
+
+use crate::render_side::EndPage;
 
 /// How long loading took, shown on the end screen (design.md "Latency
 /// Figures").
@@ -140,8 +146,12 @@ fn incomplete_line(i: replay::Incomplete) -> Option<String> {
 pub const COLUMNS: usize = 76;
 
 /// Lines of the summary, the key hints last; the settings lines follow,
-/// for 25 in all.
-pub const SUMMARY_LINES: usize = 23;
+/// for 27 in all.
+pub const SUMMARY_LINES: usize = 25;
+
+/// Columns of a gauge cell: two cells and the two spaces between them
+/// fill a line.
+const CELL: usize = (COLUMNS - 2) / 2;
 
 /// `text` as the bitmap font draws it: uppercase, any character it has no
 /// glyph for as `?`, and cut to `width` columns with a trailing `..`.
@@ -221,6 +231,13 @@ pub fn view_log(screen: &ResultScreen) -> Option<(EntryId, String)> {
     Some((entry.id.clone(), line))
 }
 
+/// `t` in seconds with one decimal, truncated toward zero.
+fn tenths(t: bms_model::TimeUs) -> String {
+    let sign = if t.0 < 0 { "-" } else { "" };
+    let a = t.0.unsigned_abs();
+    format!("{sign}{}.{}", a / 1_000_000, a % 1_000_000 / 100_000)
+}
+
 /// `t` in seconds with three decimals.
 fn seconds(t: bms_model::TimeUs) -> String {
     let sign = if t.0 < 0 { "-" } else { "" };
@@ -292,40 +309,66 @@ fn notice_line(n: &Notice) -> String {
     }
 }
 
-/// The gauge cells: `width` columns each, the gauge's name cut to fit, in
-/// the viewed preset's order and named by it; a seventh or later gauge
-/// counts in place of the sixth.
+/// The gauge cells: `width` columns each, the listed gauges in the list's
+/// order, each named by the viewed preset with its name cut to fit, a
+/// failed survival gauge with when it failed; the gauges not listed as a
+/// count after them.
 fn gauge_cells(s: &ViewSummary, preset: Option<&RulePreset>, width: usize) -> Vec<String> {
     let mut cells: Vec<String> = s
         .gauges
         .iter()
-        .enumerate()
-        .filter_map(|(i, g)| g.map(|g| (i, g)))
-        .map(|(i, g)| {
+        .flatten()
+        .map(|g| {
+            let i = usize::from(g.gauge);
             let id = preset
                 .and_then(|p| p.gauges.get(i))
                 .map_or_else(|| format!("GAUGE {}", i + 1), |r| r.id.clone());
             let v = g.value.0;
-            let default = if s.started_at_default & (1 << i) != 0 {
-                " (DEFAULT START)"
-            } else {
-                ""
+            let default = if g.started_at_default { " (DEF)" } else { "" };
+            let end = match (g.cleared, g.failed_at) {
+                (true, _) => "CLEAR".to_owned(),
+                (false, Some(t)) => format!("FAIL {}S", tenths(t)),
+                (false, None) => "NOT CLEAR".to_owned(),
             };
             let rest = format!(
-                " {}.{:03}% {}{default}",
+                " {}.{:03}% {end}{default}",
                 v / GaugeValue::PERCENT,
                 v % GaugeValue::PERCENT / 100,
-                if g.cleared { "CLEAR" } else { "NOT CLEAR" }
             );
             let room = width.saturating_sub(rest.len());
             fit(&format!("{}{rest}", fit(&id, room)), width)
         })
         .collect();
     if s.more_gauges > 0 {
-        cells.truncate(SHOWN_GAUGES - 1);
-        cells.push(format!("+{} MORE", u32::from(s.more_gauges) + 1));
+        cells.push(format!("+{} MORE", s.more_gauges));
     }
     cells
+}
+
+/// The early/late lines: the totals, PERFECT left out, with the presses
+/// exactly on time and the speed when it is not 100 %; then each
+/// judgment's early and late counts, PERFECT included.
+fn timing_lines(t: &Timing, speed: bms_model::Speed) -> [String; 2] {
+    let (e, l) = (&t.early, &t.late);
+    let early = e.great + e.good + e.bad + e.poor;
+    let late = l.great + l.good + l.bad + l.poor;
+    let mut totals = format!(
+        "EARLY {early}  LATE {late}  (NOT PERFECT)  ON TIME {}",
+        t.exact
+    );
+    if speed != bms_model::Speed::NORMAL {
+        totals.push_str(&format!("  AT {}% SPEED", speed.twentieths() * 5));
+    }
+    let split = format!(
+        "PF {}/{} GR {}/{} GD {}/{} BD {}/{} PR {}/{}",
+        e.perfect, l.perfect, e.great, l.great, e.good, l.good, e.bad, l.bad, e.poor, l.poor
+    );
+    let split = if split.len() + 4 <= COLUMNS {
+        format!("E/L {split}")
+    } else {
+        split
+    };
+    [totals, split]
 }
 
 /// The end screen's summary: [`SUMMARY_LINES`] lines in a fixed layout, each
@@ -397,26 +440,36 @@ pub fn lines(
                 t.ex_score, t.max_combo, t.bp, t.empty_poor
             ),
         );
+        let speed = report
+            .record
+            .as_ref()
+            .map_or(bms_model::Speed::NORMAL, |r| r.speed);
+        let [totals, split] = timing_lines(&s.graphs.timing, speed);
+        set(10, totals);
+        set(11, split);
     }
     // The play's best, under the preset it was played with, named, whatever
     // is viewed.
     if let Some(best) = &report.best {
         set(
-            10,
+            12,
             format!("{} {}", report.preset.id, crate::bests::best_line(best)),
         );
     }
     if let ViewStatus::Ready(s) = status {
         let preset = viewed.and_then(|e| e.preset.as_deref());
-        let width = (COLUMNS - 2) / 2;
-        for (row, pair) in gauge_cells(s, preset, width).chunks(2).enumerate() {
-            set(11 + row, pair.join("  "));
+        for (row, pair) in gauge_cells(s, preset, CELL).chunks(2).enumerate() {
+            let line = match pair {
+                [left, right] => format!("{left:<CELL$}  {right}"),
+                _ => pair.concat(),
+            };
+            set(render::RESULT_GAUGE_ROW + row, line);
         }
     }
     let summary = report.result.as_ref();
     if let Some(s) = summary {
         set(
-            14,
+            16,
             if s.matches_live {
                 "RE-EVALUATION MATCHES THE LIVE PLAY"
             } else {
@@ -427,7 +480,7 @@ pub fn lines(
     }
     if let Some(s) = summary.filter(|_| !autoplay) {
         set(
-            15,
+            17,
             match s.recommended_offset {
                 Some(r) => format!(
                     "RECOMMENDED INPUT OFFSET {} MS (NOW {} MS)",
@@ -442,7 +495,7 @@ pub fn lines(
         );
         if let Some(r) = s.recommended_offset {
             set(
-                16,
+                18,
                 format!(
                     "  MEDIAN DEVIATION {} MS, SPREAD {} MS, {} PRESSES",
                     ms(r.median.0),
@@ -457,7 +510,7 @@ pub fn lines(
         .as_ref()
         .and_then(|rec| incomplete_line(rec.status.incomplete))
     {
-        set(17, line);
+        set(19, line);
     }
     match &report.saved {
         Some(Ok(r)) => {
@@ -465,10 +518,10 @@ pub fn lines(
                 .path
                 .file_name()
                 .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
-            set(18, format!("SAVED AS RECORD {name}"));
+            set(20, format!("SAVED AS RECORD {name}"));
         }
-        Some(Err(e)) => set(18, format!("NOT SAVED: {}", Chain(e))),
-        None if autoplay => set(18, "AUTOPLAY: NOT SAVED".to_owned()),
+        Some(Err(e)) => set(20, format!("NOT SAVED: {}", Chain(e))),
+        None if autoplay => set(20, "AUTOPLAY: NOT SAVED".to_owned()),
         None => {}
     }
     let failures: Vec<String> = report
@@ -477,21 +530,42 @@ pub fn lines(
         .into_iter()
         .chain(report.input_error.map(|e| format!("INPUT: {e}")))
         .collect();
-    set(19, failures.join("  "));
-    set(20, queue_line(queue));
+    set(21, failures.join("  "));
+    set(22, queue_line(queue));
     let ms = |d: Option<Duration>| d.map_or_else(|| "-".to_owned(), |d| d.as_millis().to_string());
     set(
-        21,
+        23,
         format!("LOAD {} MS  RETRY {} MS", ms(times.first), ms(times.retry)),
     );
     set(
-        22,
+        SUMMARY_LINES - 1,
         format!(
             "{}: RETRY  {}: BACK  LEFT/RIGHT: PRESET",
             hints.retry, hints.quit
         ),
     );
     l
+}
+
+/// The graphs the view shows: the viewed summary's, shared with the
+/// result screen's cache; none when the view shows no summary (nothing
+/// recorded, a file that cannot load, too large, no re-evaluation).
+pub fn view_graphs(screen: &ResultScreen) -> Option<Arc<ResultGraphs>> {
+    match screen.status() {
+        ViewStatus::Ready(s) => Some(Arc::clone(&s.graphs)),
+        _ => None,
+    }
+}
+
+/// The end screen's page: the summary's `lines`, the settings lines of `t`
+/// under them, and the view's `graphs`, which a settings change keeps.
+pub fn end_page(lines: &[String], graphs: Option<&Arc<ResultGraphs>>, t: Tuning) -> EndPage {
+    let mut all = lines.to_vec();
+    all.extend(settings_lines(t));
+    EndPage {
+        lines: all,
+        graphs: graphs.cloned(),
+    }
 }
 
 /// The settings keys and their values, under the summary, on the two lines
@@ -524,6 +598,8 @@ mod tests {
     use std::path::Path;
 
     use bms_model::{ChartBuilder, Lane, TimeUs};
+    use std::sync::Arc;
+
     use game::{GaugeEnd, Notice, ResultScreen, SHOWN_GAUGES, ViewStatus, ViewSummary};
     use replay::verify::Coverage;
     use rules::GaugeValue;
@@ -718,7 +794,7 @@ mod tests {
         let mut played = report(rules::tapestry());
         played.best = Some(game::BestView::NotCounted("ended midway".to_owned()));
         let mut s = screen(dir.path(), &played);
-        let line = |s: &ResultScreen| lines_of(&played, s, false)[10].clone();
+        let line = |s: &ResultScreen| lines_of(&played, s, false)[12].clone();
         assert_eq!(line(&s), "TAPESTRY BEST NOT UPDATED: ENDED MIDWAY");
         s.step(1, &played, &chart());
         let viewed = s.viewed().unwrap().name.clone();
@@ -751,32 +827,125 @@ mod tests {
             );
         }
         // Another preset's gauges are named by it.
-        let mut what_if = ViewSummary {
-            tally: played.tally,
-            gauges: [None; SHOWN_GAUGES],
-            more_gauges: 0,
-            coverage: Coverage::Recorded,
-            as_played: false,
-            started_at_default: 0b10,
-        };
-        for g in what_if.gauges.iter_mut().take(2) {
+        let mut what_if = summary(played.tally, false);
+        for (i, g) in what_if.gauges.iter_mut().take(2).enumerate() {
             *g = Some(GaugeEnd {
-                value: GaugeValue(5_000_000),
+                started_at_default: i == 1,
                 cleared: true,
+                ..gauge(i, 5_000_000)
             });
         }
         let lr2 = rules::lr2_style();
         let cells = super::gauge_cells(&what_if, Some(&lr2), 37);
+        let rest = " 50.000% CLEAR (DEF)";
         assert_eq!(
             cells,
             [
                 format!("{} 50.000% CLEAR", lr2.gauges[0].id.to_uppercase()),
                 // Cut within its cell, keeping the value.
-                format!(
-                    "{}.. 50.000% CLEAR (DEFAULT START)",
-                    &lr2.gauges[1].id.to_uppercase()[..5]
-                ),
+                format!("{}{rest}", super::fit(&lr2.gauges[1].id, 37 - rest.len())),
             ]
+        );
+    }
+
+    /// A summary of `tally` listing no gauge, with empty graphs.
+    fn summary(tally: eval::Tally, as_played: bool) -> ViewSummary {
+        ViewSummary {
+            tally,
+            gauges: [None; SHOWN_GAUGES],
+            more_gauges: 0,
+            coverage: Coverage::Recorded,
+            as_played,
+            graphs: Arc::new(game::ResultGraphs::EMPTY),
+        }
+    }
+
+    /// The gauge at index `i`, at `value`, not cleared.
+    fn gauge(i: usize, value: i64) -> GaugeEnd {
+        GaugeEnd {
+            gauge: u16::try_from(i).unwrap(),
+            value: GaugeValue(value),
+            cleared: false,
+            failed_at: None,
+            started_at_default: false,
+        }
+    }
+
+    /// P2: a failed survival gauge's cell says when it failed; with the
+    /// largest value, a default start and a long name, every part of the
+    /// cell fits its width, the name cut to make room.
+    #[test]
+    fn failed_survival_cells_say_when_and_fit() {
+        let mut s = summary(report(rules::tapestry()).tally, false);
+        s.gauges[0] = Some(GaugeEnd {
+            failed_at: Some(TimeUs(42_123_000)),
+            ..gauge(1, 0)
+        });
+        s.gauges[1] = Some(GaugeEnd {
+            failed_at: Some(TimeUs(3_599_987_654)),
+            started_at_default: true,
+            ..gauge(0, 100 * GaugeValue::PERCENT)
+        });
+        let mut preset = rules::tapestry();
+        preset.gauges[0].id = "n".repeat(80);
+        let cells = super::gauge_cells(&s, Some(&preset), super::CELL);
+        assert_eq!(cells[0], "SURVIVAL 0.000% FAIL 42.1S");
+        assert_eq!(cells[1].len(), super::CELL);
+        assert!(
+            cells[1].ends_with(".. 100.000% FAIL 3599.9S (DEF)"),
+            "{}",
+            cells[1]
+        );
+        assert!(cells[1].starts_with("NNN"), "{}", cells[1]);
+    }
+
+    /// P1: the early/late lines show the counts, PERFECT left out of the
+    /// totals and split by judgment, and the speed when it is not 100 %;
+    /// at the largest counts a chart can hold they fit the line.
+    #[test]
+    fn early_late_lines_show_the_counts_and_fit() {
+        let per = |perfect, great, good, bad, poor| rules::PerJudgment {
+            perfect,
+            great,
+            good,
+            bad,
+            poor,
+        };
+        let t = game::Timing {
+            early: per(310, 80, 30, 8, 2),
+            late: per(298, 60, 25, 9, 1),
+            exact: 4,
+            ..game::Timing::NONE
+        };
+        assert_eq!(
+            super::timing_lines(&t, bms_model::Speed::NORMAL),
+            [
+                "EARLY 120  LATE 95  (NOT PERFECT)  ON TIME 4",
+                "E/L PF 310/298 GR 80/60 GD 30/25 BD 8/9 PR 2/1",
+            ]
+        );
+        let slow = bms_model::Speed::from_twentieths(15).unwrap();
+        assert!(super::timing_lines(&t, slow)[0].ends_with("  AT 75% SPEED"));
+        // The loader's 500,000 objects: ten 5-digit counts, or one
+        // 6-digit total with the rest small.
+        let wide = game::Timing {
+            early: per(49_999, 49_999, 49_999, 49_999, 49_999),
+            late: per(49_999, 49_999, 49_999, 49_999, 49_999),
+            exact: 99_999,
+            ..game::Timing::NONE
+        };
+        let tall = game::Timing {
+            early: per(0, 499_999, 0, 0, 0),
+            exact: 99_999,
+            ..game::Timing::NONE
+        };
+        for t in [wide, tall] {
+            for line in super::timing_lines(&t, bms_model::Speed::FASTEST) {
+                assert!(line.len() <= COLUMNS, "{line}");
+            }
+        }
+        assert!(
+            super::timing_lines(&wide, bms_model::Speed::NORMAL)[1].starts_with("PF 49999/49999")
         );
     }
 
@@ -784,14 +953,7 @@ mod tests {
     /// gets its own line with the time in seconds to three decimals.
     #[test]
     fn what_if_labels_name_the_preset_and_the_time() {
-        let mut s = ViewSummary {
-            tally: report(rules::tapestry()).tally,
-            gauges: [None; SHOWN_GAUGES],
-            more_gauges: 0,
-            coverage: Coverage::Recorded,
-            as_played: true,
-            started_at_default: 0,
-        };
+        let mut s = summary(report(rules::tapestry()).tally, true);
         let label = |s: &ViewSummary| {
             (
                 super::view_label(ViewStatus::Ready(s), "LR2-STYLE"),
@@ -951,27 +1113,12 @@ mod tests {
         assert!(cut.ends_with(".."));
         let mut preset = rules::tapestry();
         preset.gauges[0].id = "g".repeat(60);
-        let s = ViewSummary {
-            tally: report(rules::tapestry()).tally,
-            gauges: [
-                Some(GaugeEnd {
-                    value: GaugeValue(5_000_000),
-                    cleared: false,
-                }),
-                Some(GaugeEnd {
-                    value: GaugeValue(5_000_000),
-                    cleared: true,
-                }),
-                None,
-                None,
-                None,
-                None,
-            ],
-            more_gauges: 0,
-            coverage: Coverage::Recorded,
-            as_played: true,
-            started_at_default: 0,
-        };
+        let mut s = summary(report(rules::tapestry()).tally, true);
+        s.gauges[0] = Some(gauge(0, 5_000_000));
+        s.gauges[1] = Some(GaugeEnd {
+            cleared: true,
+            ..gauge(1, 5_000_000)
+        });
         let cells = super::gauge_cells(&s, Some(&preset), 37);
         assert_eq!(cells[0].len(), 37);
         assert!(cells[0].ends_with(".. 50.000% NOT CLEAR"), "{}", cells[0]);
@@ -982,25 +1129,63 @@ mod tests {
         );
     }
 
-    /// A seventh gauge or more shows as a count in place of the sixth.
+    /// A seventh gauge or more shows as a count in place of the sixth; the
+    /// list the summary holds, an emphasized gauge in the fifth slot
+    /// included, is named in its order.
     #[test]
     fn gauges_past_six_show_a_count() {
-        let g = Some(GaugeEnd {
-            value: GaugeValue(0),
-            cleared: false,
-        });
-        let s = ViewSummary {
-            tally: report(rules::tapestry()).tally,
-            gauges: [g; SHOWN_GAUGES],
-            more_gauges: 3,
-            coverage: Coverage::Recorded,
-            as_played: true,
-            started_at_default: 0,
-        };
+        let mut s = summary(report(rules::tapestry()).tally, true);
+        for (i, g) in s.gauges.iter_mut().take(5).enumerate() {
+            *g = Some(gauge(if i == 4 { 7 } else { i }, 0));
+        }
+        s.more_gauges = 4;
         let cells = super::gauge_cells(&s, None, 37);
         assert_eq!(cells.len(), SHOWN_GAUGES);
         assert_eq!(cells[5], "+4 MORE");
-        assert_eq!(cells[4], "GAUGE 5 0.000% NOT CLEAR");
+        assert_eq!(cells[3], "GAUGE 4 0.000% NOT CLEAR");
+        assert_eq!(cells[4], "GAUGE 8 0.000% NOT CLEAR");
+    }
+
+    /// The page carries the viewed summary's graphs, the very ones the
+    /// result screen holds; a view it refused (too large) carries none; a
+    /// settings change makes a page with new settings lines and the same
+    /// graphs.
+    #[test]
+    fn the_page_carries_the_view_graphs_until_the_view_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let played = report(rules::tapestry());
+        let shelf = game::Shelf::open(dir.path().join("presets"), "tapestry").unwrap();
+        let mut s = ResultScreen::new(&played, &shelf, &chart(), 1);
+        let ViewStatus::Ready(own) = s.status() else {
+            panic!("{:?}", s.status());
+        };
+        let graphs = super::view_graphs(&s).unwrap();
+        assert!(Arc::ptr_eq(&graphs, &own.graphs));
+        assert!(graphs.traces[0].is_some());
+        let lines = vec!["A".to_owned()];
+        let t = game::Tuning {
+            visible_time_ms: 575,
+            volume_percent: 100,
+            display_offset_us: 0,
+            input_offset_us: 0,
+        };
+        let page = super::end_page(&lines, Some(&graphs), t);
+        let changed = super::end_page(
+            &lines,
+            Some(&graphs),
+            game::Tuning {
+                volume_percent: 35,
+                ..t
+            },
+        );
+        assert_ne!(page.lines, changed.lines);
+        assert_eq!(changed.lines.len(), 3);
+        assert!(Arc::ptr_eq(page.graphs.as_ref().unwrap(), &graphs));
+        assert!(Arc::ptr_eq(changed.graphs.as_ref().unwrap(), &graphs));
+        // The next entry is a what-if over the budget of 1 byte.
+        s.step(1, &played, &chart());
+        assert!(matches!(s.status(), ViewStatus::OverBudget { .. }));
+        assert!(super::view_graphs(&s).is_none());
     }
 
     /// A refused file's stem that is not a name is drawn with `?` for
@@ -1066,9 +1251,21 @@ mod tests {
             display_offset_us: -12_000,
             input_offset_us: -7_500,
         }));
-        assert_eq!(page.len(), 25);
+        // The view's early/late lines under its counts, and its gauge
+        // cells on the rows the renderer marks, the second cell at its
+        // column.
+        assert_eq!(page[10], "EARLY 0  LATE 0  (NOT PERFECT)  ON TIME 0");
+        assert_eq!(page[11], "E/L PF 0/0 GR 0/0 GD 0/0 BD 0/0 PR 0/0");
+        let cells = &page[render::RESULT_GAUGE_ROW];
+        assert!(cells.starts_with("NORMAL 61.234% NOT CLEAR"), "{cells}");
         assert_eq!(
-            page[24],
+            cells.get(render::RESULT_CELL_COLUMN..),
+            Some("SURVIVAL 61.234% NOT CLEAR")
+        );
+        assert_eq!(page.len(), 27);
+
+        assert_eq!(
+            page[26],
             "F7/F8 INPUT OFFSET -7.5 MS FROM THE NEXT PLAY  F9 OVERLAY"
         );
         assert!(page.iter().all(|l| l.len() <= COLUMNS), "{page:?}");

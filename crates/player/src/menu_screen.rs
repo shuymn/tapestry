@@ -180,6 +180,12 @@ impl Screen for MenuScreen {
         self.renderer.text_frame(lines).map(|t| t.presented)
     }
 
+    fn end(&mut self, page: &crate::render_side::EndPage) -> Result<bool, RenderError> {
+        self.renderer
+            .result_frame(&page.lines, page.graphs.as_deref())
+            .map(|t| t.presented)
+    }
+
     fn menu(&mut self, page: &MenuPage, changed: bool) -> Result<FrameTiming, RenderError> {
         if changed || self.text.is_none() {
             self.prepare(page)?;

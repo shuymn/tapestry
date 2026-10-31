@@ -33,6 +33,9 @@ pub use gpu::{AdapterChoice, Gpu};
 pub use renderer::{
     FrameTiming, MAX_SPRITES, RenderError, Renderer, Target, build_frame, letterbox,
 };
-pub use simple::{SimpleSkin, layout, text_screen};
+pub use simple::{
+    RESULT_CELL_COLUMN, RESULT_GAUGE_ROW, SimpleSkin, layout, result_graphs, result_screen,
+    text_screen,
+};
 pub use skin::{FrameInput, PlaySkin, SkinError};
 pub use sprite::{Blend, Sprite, SpriteBatch};
