@@ -241,16 +241,16 @@ fn check_gauge(gauge: &GaugeRule) -> Result<(), RuleError> {
 mod tests {
     use bms_model::TimeUs;
 
-    use crate::{GaugeValue, Judgment, LaneClass, RuleError, Side, WindowPolicy, custom};
+    use crate::{GaugeValue, Judgment, LaneClass, RuleError, Side, WindowPolicy, tapestry};
 
     #[test]
-    fn custom_preset_validates() {
-        assert_eq!(custom().validate(), Ok(()));
+    fn tapestry_preset_validates() {
+        assert_eq!(tapestry().validate(), Ok(()));
     }
 
     #[test]
     fn descending_windows_are_rejected_in_either_table() {
-        let mut preset = custom();
+        let mut preset = tapestry();
         preset.tables.keys.windows.good.late = TimeUs(44_000);
         assert_eq!(
             preset.validate(),
@@ -261,7 +261,7 @@ mod tests {
             })
         );
 
-        let mut preset = custom();
+        let mut preset = tapestry();
         preset.tables.scratch.windows.bad.early = preset.tables.scratch.windows.good.early;
         assert_eq!(
             preset.validate(),
@@ -272,7 +272,7 @@ mod tests {
             })
         );
 
-        let mut preset = custom();
+        let mut preset = tapestry();
         preset.tables.scratch.windows.perfect.early = TimeUs(-1);
         assert_eq!(
             preset.validate(),
@@ -287,9 +287,9 @@ mod tests {
     #[test]
     fn a_scale_not_positive_is_refused() {
         let with_rank_0 = |milli| {
-            let mut preset = custom();
+            let mut preset = tapestry();
             let WindowPolicy::Thousandths(scale) = &mut preset.window_policy else {
-                panic!("custom scales in thousandths");
+                panic!("tapestry scales in thousandths");
             };
             scale.rank_milli[0] = milli;
             preset.validate()
@@ -319,7 +319,7 @@ mod tests {
     #[test]
     fn only_the_supported_standard_version_validates() {
         let with = |version| {
-            let mut preset = custom();
+            let mut preset = tapestry();
             preset.implementation = crate::Implementation::Standard { version };
             preset.validate()
         };
@@ -342,7 +342,7 @@ mod tests {
     #[test]
     fn ln_end_edges_may_tie_but_not_fall() {
         let with = |p: i64, g: i64, d: i64| {
-            let mut preset = custom();
+            let mut preset = tapestry();
             let ln_end = &mut preset.tables.scratch.ln_end;
             ln_end.perfect = TimeUs(p);
             ln_end.great = TimeUs(g);
@@ -370,7 +370,7 @@ mod tests {
 
     #[test]
     fn ln_end_edges_are_at_least_the_note_windows_early_edges() {
-        let mut preset = custom();
+        let mut preset = tapestry();
         preset.tables.keys.windows.perfect.early = TimeUs(0);
         let with = |p: i64, g: i64, d: i64| {
             let mut preset = preset.clone();
@@ -405,7 +405,7 @@ mod tests {
         // The BAD late edge or the GOOD LN-end edge at `top`, with no rank
         // widening it.
         let unscaled = || {
-            let mut preset = custom();
+            let mut preset = tapestry();
             preset.window_policy = WindowPolicy::Thousandths(crate::RankScale {
                 rank_milli: [100_000; 4],
                 absent_milli: 100_000,
@@ -440,7 +440,7 @@ mod tests {
         // 4_294_967_296, the cap; floor(3_435_973_838 × 1.25) =
         // 4_294_967_297, past it.
         let scaled = |edge: i64, ln_end: bool| {
-            let mut preset = custom();
+            let mut preset = tapestry();
             if ln_end {
                 preset.tables.scratch.ln_end.good = TimeUs(edge);
             } else {
@@ -473,7 +473,7 @@ mod tests {
     #[test]
     fn negative_empty_poor_distances_are_rejected() {
         let with = |ahead: i64, behind: i64| {
-            let mut preset = custom();
+            let mut preset = tapestry();
             preset.tables.scratch.empty_poor.ahead = TimeUs(ahead);
             preset.tables.scratch.empty_poor.behind = TimeUs(behind);
             preset.validate()
@@ -496,7 +496,7 @@ mod tests {
     #[test]
     fn gauge_values_outside_bounds_are_rejected() {
         let out = |edit: fn(&mut crate::RulePreset)| {
-            let mut preset = custom();
+            let mut preset = tapestry();
             edit(&mut preset);
             preset.validate()
         };
@@ -551,7 +551,7 @@ mod tests {
     fn gauge_policies_are_checked() {
         use crate::{DefaultTotal, GaugeKind, LowDamage, TotalCorrection};
         let out = |edit: &dyn Fn(&mut crate::RulePreset)| {
-            let mut preset = custom();
+            let mut preset = tapestry();
             edit(&mut preset);
             preset.validate()
         };

@@ -80,7 +80,7 @@ fn removed_source_is_drained_before_retiring() {
         .tap(lane(2), TimeUs(2_000 * MS))
         .build()
         .unwrap();
-    let preset = rules::custom();
+    let preset = rules::tapestry();
     let dev = device(&[0, 0]);
     let mut ev = Evaluator::new(&chart, &preset, &dev, &InputStart::default(), None, 8).unwrap();
     let mut out = Vec::new();
@@ -137,7 +137,7 @@ fn crossing_offsets_judge_in_evaluation_order() {
         .tap(lane(1), TimeUs(1_040 * MS))
         .build()
         .unwrap();
-    let preset = rules::custom();
+    let preset = rules::tapestry();
     let dev = device(&[0, 30 * MS]);
     let mut stages = [
         staged(0, &[press(1_019 * MS, 0, 1), release(1_025 * MS, 0, 1)]),

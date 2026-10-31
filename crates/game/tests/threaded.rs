@@ -49,7 +49,7 @@ fn threaded_logic_matches_threadless() {
     const START: TimeUs = TimeUs(-200_000);
     // 200 notes 11 ms apart, every 5th a 30 ms long note: about 2.4 s.
     let chart = chart(200, 11 * MS, 30 * MS);
-    let rule = rules::custom();
+    let rule = rules::tapestry();
     let dev = device(&[0]);
     let config = LogicConfig {
         inputs: window_capacity(START, TimeUs(4_000 * MS), 8),
@@ -143,7 +143,7 @@ fn publication_wakes_parked_logic() {
     const PARK: Duration = Duration::from_secs(20);
     const WAIT: Duration = Duration::from_secs(5);
     let chart = chart(1, 11 * MS, 30 * MS);
-    let rule = rules::custom();
+    let rule = rules::tapestry();
     let dev = device(&[0]);
     let (mut writer, reader) = input::source_queue(4);
     let config = LogicConfig {

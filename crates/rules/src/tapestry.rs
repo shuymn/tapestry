@@ -1,4 +1,4 @@
-//! The custom preset: this player's own judgment. Every value is a starting
+//! The tapestry preset: this player's own judgment. Every value is a starting
 //! point tuned by playing.
 
 use bms_model::TimeUs;
@@ -25,9 +25,9 @@ const fn damage(v: GaugeValue) -> GaugeDelta {
     GaugeDelta::Fixed(GaugeValue(-v.0))
 }
 
-/// The custom preset.
+/// The tapestry preset.
 #[must_use]
-pub fn custom() -> RulePreset {
+pub fn tapestry() -> RulePreset {
     let full_share = GaugeDelta::TotalShare { num: 1, den: 1 };
     let normal = GaugeRule {
         id: "normal".to_owned(),
@@ -70,7 +70,7 @@ pub fn custom() -> RulePreset {
         }],
     };
     RulePreset {
-        id: "custom".to_owned(),
+        id: "tapestry".to_owned(),
         version: 3,
         implementation: Implementation::Standard { version: 3 },
         // One table for every lane: the scratch states the keys' table.
@@ -164,10 +164,10 @@ mod tests {
         }
     }
 
-    /// The values of design.md "Custom Preset", written out in raw units (µs;
-    /// 1/100000 %), independent of the helpers `custom` uses.
+    /// The values of design.md "The tapestry Preset", written out in raw units (µs;
+    /// 1/100000 %), independent of the helpers `tapestry` uses.
     #[test]
-    fn custom_preset_has_d7_values() {
+    fn tapestry_preset_has_d7_values() {
         let w = |us| Window {
             early: TimeUs(us),
             late: TimeUs(us),
@@ -191,7 +191,7 @@ mod tests {
             },
         };
         let expected = RulePreset {
-            id: "custom".to_owned(),
+            id: "tapestry".to_owned(),
             version: 3,
             implementation: Implementation::Standard { version: 3 },
             tables: PerLaneClass {
@@ -266,6 +266,6 @@ mod tests {
                 per_unit: GaugeValue(50_000),
             },
         };
-        assert_eq!(super::custom(), expected);
+        assert_eq!(super::tapestry(), expected);
     }
 }

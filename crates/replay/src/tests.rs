@@ -123,7 +123,7 @@ fn sample(n_events: usize) -> PlayRecord {
                 version: 2,
             },
         },
-        preset: PresetRecord::of(&rules::custom()),
+        preset: PresetRecord::of(&rules::tapestry()),
         session_policy: "default".to_owned(),
         devices: DeviceRecord {
             sources: vec![
@@ -853,7 +853,7 @@ fn two_thousand_notes_fit_in_tens_of_kb() {
 
 #[test]
 fn preset_hash_is_sha256_of_canonical_bytes() {
-    let preset = rules::custom();
+    let preset = rules::tapestry();
     let hash = preset_hash(&preset);
     assert_eq!(
         hash,

@@ -1,4 +1,4 @@
-//! Hand-computed whole results with the custom preset: counts, combo, EX
+//! Hand-computed whole results with the tapestry preset: counts, combo, EX
 //! score, BP, empty POORs and both gauges.
 //!
 //! Gauges are in 1/100000 %: the normal gauge starts at 2_000_000 (20 %),
@@ -45,7 +45,7 @@ fn summary(e: &Evaluation) -> Summary {
 }
 
 fn play(chart: &Chart, events: Vec<eval::PhysicalInputEvent>) -> Evaluation {
-    play_with(chart, &rules::custom(), events)
+    play_with(chart, &rules::tapestry(), events)
 }
 
 fn play_with(
@@ -457,7 +457,7 @@ fn ln_end_tap_miss_and_held_mine_at_one_time() {
 fn reduced_odd_damage_floors_with_its_sign() {
     // Survival POOR of −3 units, taken below 30 %: −3 / 2 = −1.5, floored
     // to −2.
-    let mut rule = rules::custom();
+    let mut rule = rules::tapestry();
     rule.gauges[1].change.poor = GaugeDelta::Fixed(GaugeValue(-3));
     let chart = ChartBuilder::new(BPM)
         .mine(lane(1), TimeUs(500 * MS), 141)
@@ -603,7 +603,7 @@ fn zero_judgeable_notes_is_an_error() {
         ..EvalInput::default()
     };
     assert_eq!(
-        evaluate(&chart, &input, &rules::custom()),
+        evaluate(&chart, &input, &rules::tapestry()),
         Err(EvalError::NoJudgeableNotes)
     );
 }

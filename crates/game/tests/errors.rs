@@ -5,15 +5,17 @@
 use std::error::Error;
 use std::fmt::Debug;
 use std::io;
+use std::path::PathBuf;
 
 use bms_model::{ModelError, TimeUs};
 use bms_parser::LoadError;
 use eval::EvalError;
 use game::{
     AudioWaitError, Chain, DataRoot, DeviceSettingsError, IngestError, IoFailure, KeyError,
-    LiveError, Loaded, LogicError, Parts, PlayerSettings, PlayerSettingsError, PresetError,
-    ReEvaluationError, ReloadError, Role, SaveError, SessionConfig, SessionError, Settings,
-    SettingsError, load_preset_toml, load_settings,
+    LiveError, Loaded, LogicError, NameError, Parts, PlayerSettings, PlayerSettingsError,
+    PresetError, PresetFileCause, PresetFileError, ReEvaluationError, Role, SaveError,
+    SessionConfig, SessionError, Settings, SettingsError, ShelfError, UnknownPreset,
+    load_preset_toml, load_settings,
 };
 use replay::{BuildProvenance, ReceiveMethod};
 use rules::RuleError;
@@ -113,6 +115,17 @@ fn settings_errors_chain_to_their_causes() {
             "visible_time_ms 1 is outside 100 to 4000",
         ],
     );
+    let unknown = UnknownPreset("custom.toml".to_owned());
+    let e = SettingsError::InvalidPlayer(PlayerSettingsError::Preset(unknown.clone()));
+    assert_chain(
+        &e,
+        &PlayerSettingsError::Preset(unknown),
+        &[
+            "the settings cannot be used: player.toml",
+            "`custom.toml` is neither a built-in preset (tapestry, beatoraja-style, lr2-style) \
+             nor a user preset in the presets folder",
+        ],
+    );
     // The leaves of `validate`.
     for leaf in [
         DeviceSettingsError::ControllerUnnamed,
@@ -171,13 +184,13 @@ fn parse_errors_have_the_toml_error_as_source() {
     );
     assert!(toml.message().contains("volume"), "{toml}");
 
-    let e = load_preset_toml("id = [").unwrap_err();
+    let e = load_preset_toml("mine", "id = [").unwrap_err();
     let PresetError::Parse(toml) = &e else {
         panic!("{e:?}");
     };
-    let refused = "the preset file cannot be read (a file from an older version is refused, \
-                   not converted; deleting a standard preset's file writes its current version \
-                   again)";
+    let refused = "the preset file cannot be read (a file from an older version, one with an \
+                   `id` among them, is refused, not converted; `eval-cli preset export \
+                   <built-in> <path>` writes a built-in preset to a new file to edit)";
     assert_chain(&e, toml, &[refused, &toml.to_string()]);
     let e = PresetError::Invalid(RuleError::NoGauges);
     assert_chain(
@@ -257,7 +270,7 @@ fn live_errors_have_each_side_as_source() {
     }
 }
 
-/// `SessionError::Ingest` and `::Preset` and `ReloadError::Preset` are
+/// `SessionError::Ingest` and `::Preset` and `PresetFileCause::Preset` are
 /// transparent: the wrapped error's message, and its source, not itself.
 #[test]
 fn transparent_wrappers_forward_message_and_source() {
@@ -270,23 +283,49 @@ fn transparent_wrappers_forward_message_and_source() {
         &load,
         &["the chart cannot be loaded", "line 4: too many lines"],
     );
-    let preset = PresetError::Invalid(RuleError::NoGauges);
-    for e in [
-        &SessionError::Preset(preset.clone()) as &(dyn Error + 'static),
-        &ReloadError::Preset(preset.clone()),
-    ] {
-        assert_eq!(e.to_string(), preset.to_string());
-        assert_chain(
-            e,
-            &RuleError::NoGauges,
-            &["the preset is invalid", &RuleError::NoGauges.to_string()],
-        );
-    }
-    let e = ReloadError::Io(io::ErrorKind::NotFound);
-    assert_eq!(
-        e.to_string(),
-        "the preset file cannot be read: entity not found"
+    // A preset file's error names the file; its cause forwards a preset
+    // error's message and source.
+    let file = PresetFileError {
+        path: PathBuf::from("mine.toml"),
+        cause: PresetFileCause::Preset(PresetError::Invalid(RuleError::NoGauges)),
+    };
+    let e = SessionError::Preset(ShelfError::Preset(file.clone()));
+    assert_eq!(e.to_string(), file.to_string());
+    assert_chain(
+        &e,
+        &file.cause,
+        &[
+            "the preset file mine.toml cannot be used",
+            "the preset is invalid",
+            &RuleError::NoGauges.to_string(),
+        ],
     );
+    let e = PresetFileError::io(PathBuf::from("mine.toml"), io::ErrorKind::NotFound);
+    assert_chain(
+        &e,
+        &PresetFileCause::Io(io::ErrorKind::NotFound),
+        &[
+            "the preset file mine.toml cannot be used",
+            "entity not found",
+        ],
+    );
+    // A built-in's name as a stem: the file and the built-in are named.
+    let e = PresetFileError {
+        path: PathBuf::from("tapestry.toml"),
+        cause: PresetFileCause::Preset(PresetError::Name(NameError::BuiltIn(
+            "tapestry".to_owned(),
+        ))),
+    };
+    assert_eq!(
+        messages(&e),
+        [
+            "the preset file tapestry.toml cannot be used",
+            "`tapestry` is the name of a built-in preset"
+        ]
+    );
+    let unknown = UnknownPreset("custom.toml".to_owned());
+    let e = SessionError::Preset(ShelfError::Unknown(unknown.clone()));
+    assert_eq!(e.to_string(), unknown.to_string());
     assert!(e.source().is_none());
     let e = SessionError::InvalidStep(TimeUs(0));
     assert_eq!(e.to_string(), "a step of 0 us does not move the clock");

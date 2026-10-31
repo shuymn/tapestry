@@ -29,7 +29,7 @@ pub struct ReadHeaders {
 /// one. Each variant says whether `#RANK` and `#DEFEXRANK` share a slot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HeaderPolicy {
-    /// The custom reading, which loader version 6 applied itself, with
+    /// The tapestry reading, which loader version 6 applied itself, with
     /// `#RANK` and `#DEFEXRANK` sharing one slot:
     /// - `#RANK`: an integer token that fits `i32`, whatever its value;
     /// - `#DEFEXRANK`: any number of at least 1, in thousandths rounded down;

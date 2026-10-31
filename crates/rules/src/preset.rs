@@ -754,11 +754,11 @@ mod tests {
         Window,
     };
     use crate::JudgeRank;
-    use crate::custom;
+    use crate::tapestry;
 
     #[test]
     fn rank_scale_floors_each_edge() {
-        let preset = custom();
+        let preset = tapestry();
         let scale = |rank| {
             preset
                 .window_policy
@@ -780,7 +780,7 @@ mod tests {
 
     #[test]
     fn ln_end_edges_scale_like_note_windows_and_grade_inclusively() {
-        let ln_end = custom().tables.keys.ln_end;
+        let ln_end = tapestry().tables.keys.ln_end;
         // 100, 150, 200 ms at 33.333 %: 33_333, 49_999.5 and 66_666 µs,
         // floored.
         let third = ln_end.scaled(33_333).unwrap();
@@ -849,7 +849,7 @@ mod tests {
 
     #[test]
     fn mine_damage_is_half_a_percent_per_unit() {
-        let mine = custom().mine;
+        let mine = tapestry().mine;
         // `1E` in base 36 is 1 × 36 + 14 = 50 units; 50 × 0.5 % = 25 %, so a
         // survival gauge at 40 % keeps 15 %.
         assert_eq!(mine.change(50), GaugeValue(-2_500_000));

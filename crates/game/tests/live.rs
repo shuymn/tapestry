@@ -6,15 +6,15 @@
 
 mod common;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use bms_model::{Chart, ChartBuilder, TimeSource, TimeUs, VirtualClock};
-use common::{MS, custom_settings, lane};
+use common::{MS, lane, tapestry_settings};
 use eval::{ControlId, InputKind, JudgeEventKind, SourceId};
 use game::{
     AbortCause, AudioControl, AudioQueue, AudioWaitError, ChartIngest, Closing, Command, DataRoot,
     DeviceSettings, IngestError, Ingested, InputWaitError, LiveError, Loaded, Opening, Parts,
-    PlayEnd, PlayReport, RenderSide, Rig, SessionConfig, Settings,
+    PlayEnd, PlayReport, PresetReload, RenderSide, Rig, SessionConfig, Settings,
 };
 use input::{
     Action, DeviceId, DeviceKind, InputAdapter, Packet, ScriptItem, ScriptedInput, SourceReader,
@@ -67,8 +67,28 @@ fn chart() -> Chart {
 }
 
 fn loaded(dir: &Path) -> Loaded {
+    loaded_with(dir, "tapestry")
+}
+
+/// The user preset `presets/mine.toml` in `dir`, holding `preset`.
+fn write_user_preset(dir: &Path, preset: &rules::RulePreset) -> PathBuf {
+    let presets = dir.join("presets");
+    std::fs::create_dir_all(&presets).unwrap();
+    let path = presets.join("mine.toml");
+    std::fs::write(&path, game::preset_to_toml(preset)).unwrap();
+    path
+}
+
+/// The file at `path` rewritten to hold `preset` ([`common::rewrite`]).
+fn rewrite_preset(path: &Path, preset: &rules::RulePreset) {
+    common::rewrite(path, &game::preset_to_toml(preset));
+}
+
+/// [`loaded`] with the preset named `preset` in `player.toml`.
+fn loaded_with(dir: &Path, preset: &str) -> Loaded {
     let root = DataRoot::new(dir.to_owned());
-    let mut settings = custom_settings(&root);
+    let mut settings = tapestry_settings(&root);
+    settings.player.preset = preset.to_owned();
     settings.device.input_offset_us = OFFSET;
     let chart_path = dir.join("play.chart");
     std::fs::write(&chart_path, b"built in code").unwrap();
@@ -172,6 +192,13 @@ struct Fake {
     failed: Option<InputWaitError>,
     /// Opens attempted, failed ones included.
     opens: usize,
+    /// Actions run once the clock reaches their time, as edits the player
+    /// makes meanwhile.
+    at: Vec<(i64, Box<dyn FnOnce()>)>,
+    /// The clock time of each end screen shown.
+    shown_at: Vec<i64>,
+    /// Each preset reload shown on an end screen, with its clock time.
+    reloads: Vec<(i64, PresetReload)>,
 }
 
 impl Fake {
@@ -221,6 +248,9 @@ impl Fake {
             quit_in_close: false,
             failed: None,
             opens: 0,
+            at: Vec::new(),
+            shown_at: Vec::new(),
+            reloads: Vec::new(),
         }
     }
 
@@ -258,6 +288,9 @@ impl Rig for Fake {
         let now = self.clock.now().0;
         while let Some(i) = self.offset_changes.iter().position(|&(at, _)| at <= now) {
             self.pending_offset = Some(self.offset_changes.remove(i).1);
+        }
+        while let Some(i) = self.at.iter().position(|(at, _)| *at <= now) {
+            (self.at.remove(i).1)();
         }
     }
 
@@ -429,6 +462,11 @@ impl Rig for Fake {
 
     fn show_end(&mut self, _report: &PlayReport) {
         self.shows += 1;
+        self.shown_at.push(self.clock.now().0);
+    }
+
+    fn preset_reloaded(&mut self, _report: &PlayReport, reload: &PresetReload) {
+        self.reloads.push((self.clock.now().0, reload.clone()));
     }
 
     fn before_play(&mut self, settings: &mut Settings) {
@@ -707,19 +745,13 @@ fn a_screen_failure_on_the_end_screen_is_rebuilt_and_shown_again() {
 #[test]
 fn each_report_carries_the_preset_its_play_used() {
     let dir = tempfile::tempdir().unwrap();
-    let mut loaded = loaded(dir.path());
-    let mut renamed = rules::custom();
+    let path = write_user_preset(dir.path(), &rules::tapestry());
+    let mut loaded = loaded_with(dir.path(), "mine");
+    let mut renamed = rules::tapestry();
     for g in &mut renamed.gauges {
         g.id = format!("{}-renamed", g.id);
     }
-    let path = dir.path().join("presets").join("custom.toml");
-    std::fs::write(&path, game::preset_to_toml(&renamed)).unwrap();
-    std::fs::File::options()
-        .write(true)
-        .open(&path)
-        .unwrap()
-        .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(60))
-        .unwrap();
+    rewrite_preset(&path, &renamed);
     let items = vec![key(9_303_000, Z, 1), key(9_353_000, Z, 0)];
     let mut rig = Fake::new(items, &[(9_500_000, Command::Retry)], 12_500_000);
     game::live::run_chart(&mut loaded, &mut rig).unwrap();
@@ -730,7 +762,7 @@ fn each_report_carries_the_preset_its_play_used() {
             .map(|g| g.id.clone())
             .collect::<Vec<_>>()
     };
-    let old: Vec<_> = rules::custom()
+    let old: Vec<_> = rules::tapestry()
         .gauges
         .iter()
         .map(|g| g.id.clone())
@@ -941,7 +973,7 @@ fn every_step_is_measured() {
 /// first, so one step can judge two presses.
 fn chord_loaded(dir: &Path) -> Loaded {
     let root = DataRoot::new(dir.to_owned());
-    let settings = custom_settings(&root);
+    let settings = tapestry_settings(&root);
     let chart_path = dir.join("chord.chart");
     std::fs::write(&chart_path, b"built in code").unwrap();
     let chart = ChartBuilder::new(150_000)
@@ -1015,7 +1047,7 @@ impl game::RecordSink for NotingSink {
 fn the_play_is_over_before_it_is_saved() {
     let dir = tempfile::tempdir().unwrap();
     let root = DataRoot::new(dir.path().to_owned());
-    let settings = custom_settings(&root);
+    let settings = tapestry_settings(&root);
     let chart_path = dir.path().join("play.chart");
     std::fs::write(&chart_path, b"built in code").unwrap();
     let order = std::sync::Arc::default();
@@ -1350,4 +1382,148 @@ fn a_retry_with_a_failed_input_thread_and_screen_ends_with_the_input_cause() {
         "{ran:?}"
     );
     assert_eq!((rig.prepares, rig.opens, rig.shows), (1, 1, 1));
+}
+
+/// The tapestry preset named `mine`, as `presets/mine.toml` loads it.
+fn mine(preset: rules::RulePreset) -> rules::RulePreset {
+    rules::RulePreset {
+        id: "mine".to_owned(),
+        ..preset
+    }
+}
+
+/// The tapestry preset whose normal gauge gains nothing on a PERFECT: a
+/// play re-evaluated under it ends with another gauge value.
+fn flat_normal() -> rules::RulePreset {
+    let mut p = rules::tapestry();
+    p.gauges[0].change.perfect = rules::GaugeDelta::Fixed(rules::GaugeValue(0));
+    p
+}
+
+/// The chosen user preset's file changes while the result shows: the next
+/// check, within one poll interval, reloads it and re-evaluates the play
+/// under it as a what-if; the play's report keeps the preset it played.
+#[test]
+fn changed_user_preset_reloads_within_a_poll() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_user_preset(dir.path(), &rules::tapestry());
+    let mut loaded = loaded_with(dir.path(), "mine");
+    let items = vec![key(9_303_000, Z, 1), key(9_353_000, Z, 0)];
+    let mut rig = Fake::new(items, &[], 12_000_000);
+    let changed = 11_000_000;
+    let edit = path.clone();
+    rig.at.push((
+        changed,
+        Box::new(move || rewrite_preset(&edit, &flat_normal())),
+    ));
+    game::live::run_chart(&mut loaded, &mut rig).unwrap();
+
+    assert!(rig.shown_at[0] < changed, "{:?}", rig.shown_at);
+    let [(at, reload)] = &rig.reloads[..] else {
+        panic!("{:?}", rig.reloads);
+    };
+    assert!(
+        (changed..=changed + game::POLL_INTERVAL.0).contains(at),
+        "reloaded at {at}"
+    );
+    let PresetReload::Reloaded { preset, result } = reload else {
+        panic!("{reload:?}");
+    };
+    assert_eq!(**preset, mine(flat_normal()));
+    let what_if = result.as_deref().unwrap().as_ref().unwrap();
+    assert!(!what_if.as_played);
+    let played = &rig.reports[0];
+    assert_eq!(played.preset, mine(rules::tapestry()));
+    let live = played.result.as_ref().unwrap().evaluation.as_ref().unwrap();
+    assert_ne!(what_if.evaluation.gauges[0].value, live.gauges[0].value);
+    assert_eq!(what_if.evaluation.tally, live.tally);
+    // Chosen for the next play; this chart's plays so far keep theirs.
+    assert_eq!(loaded.shelf().chosen(), &mine(flat_normal()));
+    assert_eq!(loaded.preset(), &mine(rules::tapestry()));
+}
+
+/// The chosen user preset's file changes to text that does not load: the
+/// error is shown once, and the retry plays the previous preset.
+#[test]
+fn failed_reload_keeps_the_previous_preset() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_user_preset(dir.path(), &rules::tapestry());
+    let mut loaded = loaded_with(dir.path(), "mine");
+    let items = vec![key(9_303_000, Z, 1), key(9_353_000, Z, 0)];
+    let mut rig = Fake::new(items, &[(11_500_000, Command::Retry)], 15_000_000);
+    let edit = path.clone();
+    rig.at.push((
+        11_000_000,
+        Box::new(move || common::rewrite(&edit, "windows = [")),
+    ));
+    game::live::run_chart(&mut loaded, &mut rig).unwrap();
+
+    let [(_, PresetReload::Failed(e))] = &rig.reloads[..] else {
+        panic!("{:?}", rig.reloads);
+    };
+    assert_eq!(e.path, path);
+    assert!(
+        matches!(
+            &e.cause,
+            game::PresetFileCause::Preset(game::PresetError::Parse(_))
+        ),
+        "{e:?}"
+    );
+    assert_eq!(rig.reports.len(), 2);
+    for r in &rig.reports {
+        assert_eq!(r.preset, mine(rules::tapestry()));
+        assert_eq!(
+            r.record.as_ref().unwrap().preset.sha256,
+            replay::preset_hash(&mine(rules::tapestry()))
+        );
+    }
+    // Already shown on the result: the retry does not report it again.
+    assert_eq!(rig.reports[1].reload_error, None);
+    let entry = loaded
+        .shelf()
+        .entries()
+        .into_iter()
+        .find(|e| e.name == "mine")
+        .unwrap();
+    assert_eq!(entry.error, Some(e));
+    assert_eq!(entry.preset, Some(&mine(rules::tapestry())));
+}
+
+/// The chosen user preset changes during a play: nothing is polled then, so
+/// that play keeps the preset it started with, and the retry plays the
+/// reloaded one.
+#[test]
+fn plays_use_reloads_from_the_next_play() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_user_preset(dir.path(), &rules::tapestry());
+    let mut loaded = loaded_with(dir.path(), "mine");
+    let items = vec![key(9_303_000, Z, 1), key(9_353_000, Z, 0)];
+    let mut rig = Fake::new(items, &[(11_500_000, Command::Retry)], 15_000_000);
+    // Between the press and the second note, mid-play.
+    let edit = path.clone();
+    rig.at.push((
+        9_400_000,
+        Box::new(move || rewrite_preset(&edit, &flat_normal())),
+    ));
+    game::live::run_chart(&mut loaded, &mut rig).unwrap();
+
+    assert_eq!(rig.reports.len(), 2);
+    assert!(
+        rig.origins[0].0 + 1_500_000 > 9_400_000,
+        "the edit is mid-play"
+    );
+    let [one, two] = &rig.reports[..] else {
+        unreachable!()
+    };
+    assert_eq!(one.preset, mine(rules::tapestry()));
+    assert_eq!(
+        one.record.as_ref().unwrap().preset.sha256,
+        replay::preset_hash(&mine(rules::tapestry()))
+    );
+    assert_eq!(two.preset, mine(flat_normal()));
+    assert_eq!(
+        two.record.as_ref().unwrap().preset.sha256,
+        replay::preset_hash(&mine(flat_normal()))
+    );
+    assert_eq!(two.reload_error, None);
 }

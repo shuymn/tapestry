@@ -35,7 +35,7 @@ fn press(at: i64, value: i32) -> PhysicalInputEvent {
     key(1, at, value)
 }
 
-/// A completed play of `CHART` under the custom preset, both notes hit on
+/// A completed play of `CHART` under the tapestry preset, both notes hit on
 /// time, with the folder its chart loads from.
 fn played() -> (TempDir, PlayRecord) {
     played_from(CHART, 0, 0)
@@ -63,7 +63,7 @@ fn played_from(text: &str, seed: u64, offset: i64) -> (TempDir, PlayRecord) {
             random_seed: seed,
             transform: PASSTHROUGH.record(),
         },
-        preset: PresetRecord::of(&rules::custom()),
+        preset: PresetRecord::of(&rules::tapestry()),
         session_policy: "default".to_owned(),
         devices: DeviceRecord {
             sources: vec![SourceRecord {
@@ -168,7 +168,7 @@ fn refuses_another_evaluator_before_loading() {
             Err(refused.clone())
         );
         assert_eq!(
-            evaluate_record(&other, &chart, Some(&rules::custom())).map(|_| ()),
+            evaluate_record(&other, &chart, Some(&rules::tapestry())).map(|_| ()),
             Err(refused)
         );
     }
@@ -185,8 +185,8 @@ fn old_preset_copy_is_refused_even_with_an_override() {
     let old = u64::from(bytes[0]);
     let other = with_preset_bytes(record, bytes);
     let refused = VerifyError::PresetCopy(CanonicalError::UnsupportedVersion(old));
-    let custom = rules::custom();
-    for preset_override in [None, Some(&custom)] {
+    let tapestry = rules::tapestry();
+    for preset_override in [None, Some(&tapestry)] {
         assert_eq!(
             evaluate_record(&other, &chart, preset_override).map(|_| ()),
             Err(refused.clone())
@@ -205,7 +205,7 @@ fn old_preset_copy_is_refused_even_with_an_override() {
 /// before the judgment-header model, and without the header policy's tag.
 /// The decoder refuses it at the version byte, before any other field.
 fn encoding_4(bytes: &[u8]) -> Vec<u8> {
-    let mut other = rules::custom();
+    let mut other = rules::tapestry();
     other.headers = rules::HeaderPolicy::DefExRankFirst;
     let tag = bytes
         .iter()
@@ -246,7 +246,7 @@ fn record_before_the_header_model_is_refused_at_its_first_failing_check() {
     // every path and under any override.
     let refused = VerifyError::PresetCopy(CanonicalError::UnsupportedVersion(4));
     let style = rules::beatoraja_style();
-    for preset_override in [None, Some(&rules::custom()), Some(&style)] {
+    for preset_override in [None, Some(&rules::tapestry()), Some(&style)] {
         assert_eq!(
             verify(&old, dir.path(), preset_override),
             Err(refused.clone())
@@ -270,7 +270,7 @@ fn refuses_loader_version_6_with_current_fields() {
     old.chart.identity.loader_version = 6;
     let refused = VerifyError::UnsupportedLoader(6);
     let style = rules::beatoraja_style();
-    for preset_override in [None, Some(&rules::custom()), Some(&style)] {
+    for preset_override in [None, Some(&rules::tapestry()), Some(&style)] {
         assert_eq!(
             verify(&old, dir.path(), preset_override),
             Err(refused.clone())
@@ -372,7 +372,7 @@ fn edited_file_resolving_the_same_chart_verifies() {
 fn an_override_is_a_what_if_and_its_own_copy_is_as_played() {
     let (dir, record) = played();
     let chart = load_recorded_chart(&record, CHART.as_bytes(), dir.path()).unwrap();
-    let mut wide = rules::custom();
+    let mut wide = rules::tapestry();
     wide.tables.keys.windows.bad = Window::symmetric(220 * MS);
     let r = evaluate_record(&record, &chart, Some(&wide)).unwrap();
     assert!(!r.as_played);
@@ -427,7 +427,7 @@ fn what_if_ignores_input_recorded_after_the_watermark() {
     assert_eq!(as_played.evaluation.tally.counts.poor, 1);
     // Under a 220 ms BAD edge the press would be a BAD: it is not input of
     // the play, so the note is still missed.
-    let mut wide = rules::custom();
+    let mut wide = rules::tapestry();
     wide.tables.keys.windows.bad = Window::symmetric(220 * MS);
     let r = evaluate_record(&record, &chart, Some(&wide)).unwrap();
     assert_eq!(r.coverage, Coverage::NoInputAfter(TimeUs(4_180 * MS)));
@@ -435,9 +435,9 @@ fn what_if_ignores_input_recorded_after_the_watermark() {
     assert_eq!((counts.perfect, counts.bad, counts.poor), (1, 0, 1));
 }
 
-/// The custom preset with the BAD window `ms` each side.
+/// The tapestry preset with the BAD window `ms` each side.
 fn bad_edge(ms: i64) -> RulePreset {
-    let mut p = rules::custom();
+    let mut p = rules::tapestry();
     p.tables.keys.windows.bad = Window::symmetric(ms * MS);
     p
 }
@@ -687,7 +687,7 @@ fn refuses_a_chart_that_resolves_alike_but_plays_otherwise_at_the_speed() {
     assert_eq!(half.lanes[1][0].time, TimeUs(2_000_001));
     assert_eq!(edited_half.lanes[1][0].time, TimeUs(2_000_000));
     // A play at 50 % pressing 20.000 ms after its note: PERFECT under
-    // custom, and GREAT 20.001 ms after the edited file's.
+    // tapestry, and GREAT 20.001 ms after the edited file's.
     let (_, mut record) = played();
     record.speed = Speed::SLOWEST;
     record.chart.identity = half.identity.clone();
@@ -803,7 +803,7 @@ fn what_if_transfers_initial_gauges_by_id() {
 #[test]
 fn out_of_bounds_initial_gauge_uses_the_default() {
     // A test preset whose `normal` starts at 20 % with bounds 10-100 %.
-    let mut bounded = rules::custom();
+    let mut bounded = rules::tapestry();
     bounded.id = "bounded".to_owned();
     bounded.gauges[0].min = pct(10);
     assert_eq!(bounded.gauges[0].start, pct(20));

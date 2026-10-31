@@ -62,7 +62,7 @@ fn write_log(chart: &bms_model::Chart, path: &Path) -> Vec<eval::PhysicalInputEv
             provenance: BuildProvenance::Development,
         },
         chart: ChartRecord::default(),
-        preset: PresetRecord::of(&rules::custom()),
+        preset: PresetRecord::of(&rules::tapestry()),
         session_policy: "default".to_owned(),
         devices: DeviceRecord {
             sources: vec![SourceRecord {
@@ -869,15 +869,11 @@ fn auto_play_saves_nothing_and_judges_every_note_perfect() {
         .collect();
     kept.sort();
     // The settings and the run's log are kept; no play is (design.md
-    // "Autoplay", "Log File").
+    // "Autoplay", "Log File"), and the built-in preset is never written
+    // (design.md "Standard Presets").
     assert_eq!(
         kept,
-        [
-            "device.toml",
-            "logs\\tapestry.lock",
-            "logs\\tapestry.log",
-            "presets\\beatoraja-style.toml"
-        ],
+        ["device.toml", "logs\\tapestry.lock", "logs\\tapestry.log"],
         "{kept:?}"
     );
 }

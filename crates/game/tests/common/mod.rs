@@ -16,12 +16,24 @@ use rules::Judgment;
 
 pub const MS: i64 = 1_000;
 
-/// The settings in `root`, naming the custom preset: for tests whose values
-/// are the custom preset's.
-pub fn custom_settings(root: &DataRoot) -> Settings {
+/// The settings in `root`, naming the tapestry preset: for tests whose values
+/// are the tapestry preset's.
+pub fn tapestry_settings(root: &DataRoot) -> Settings {
     let mut settings = Settings::load(root).unwrap();
-    settings.player.preset = "custom.toml".to_owned();
+    settings.player.preset = "tapestry".to_owned();
     settings
+}
+
+/// Writes `text` to `path` with a modification time a minute from now,
+/// clearly after any read of the file before, so a check sees it changed.
+pub fn rewrite(path: &std::path::Path, text: &str) {
+    std::fs::write(path, text).unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(60))
+        .unwrap();
 }
 
 /// The control a source binds to `lane`: `0x100 + lane index`, so control

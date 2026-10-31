@@ -68,7 +68,7 @@ fn sounds_and_events(
 }
 
 fn presets() -> [RulePreset; 2] {
-    [rules::custom(), rules::beatoraja_style()]
+    [rules::tapestry(), rules::beatoraja_style()]
 }
 
 #[test]
@@ -93,7 +93,7 @@ fn a_judged_press_plays_its_note() {
 
 #[test]
 fn an_empty_poor_plays_the_note_it_is_against() {
-    let preset = rules::custom();
+    let preset = rules::tapestry();
     // Behind a judged note: 100 ms after note 0, which is judged, with
     // note 1 two seconds later. The empty POOR is against note 0.
     let chart = taps(&[T, T + 2_000 * MS]);
@@ -127,7 +127,7 @@ fn an_empty_poor_plays_the_note_it_is_against() {
 
 #[test]
 fn a_press_on_nothing_plays_the_latest_earlier_note() {
-    let preset = rules::custom();
+    let preset = rules::tapestry();
     let chart = taps(&[T, T + 2_000 * MS, T + 4_000 * MS]);
     let times = [
         // Before the lane's first note: that note's.

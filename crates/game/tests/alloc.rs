@@ -79,7 +79,7 @@ fn logic_does_not_allocate_during_play() {
     for note in chart.lanes.iter_mut().flatten() {
         note.sound = Some(SoundId(0));
     }
-    let rule = rules::custom();
+    let rule = rules::tapestry();
     let dev = device(&[2 * MS]);
     let mut events = autoplay(&chart, &dev.sources[0]).unwrap();
     for k in 0..MASH {

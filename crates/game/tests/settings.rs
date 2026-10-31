@@ -83,7 +83,7 @@ fn changed() -> Settings {
         },
         player: PlayerSettings {
             visible_time_ms: 2_350,
-            preset: "wide.toml".to_owned(),
+            preset: "wide".to_owned(),
             displayed_gauge: 1,
         },
     }
@@ -95,7 +95,7 @@ fn missing_files_give_the_defaults() {
     let s = Settings::load(&root).unwrap();
     assert_eq!(s.device, DeviceSettings::default());
     assert_eq!(s.player, PlayerSettings::default());
-    assert_eq!(s.player.preset, "beatoraja-style.toml");
+    assert_eq!(s.player.preset, "beatoraja-style");
 }
 
 #[test]
@@ -114,7 +114,7 @@ fn device_and_player_settings_round_trip() {
     // A hand-written file in the same units reads the same.
     fs::write(
         root.player_settings(),
-        "visible_time_ms = 2350\npreset = \"wide.toml\"\ndisplayed_gauge = 1\n",
+        "visible_time_ms = 2350\npreset = \"wide\"\ndisplayed_gauge = 1\n",
     )
     .unwrap();
     assert_eq!(Settings::load(&root).unwrap().player, s.player);
@@ -168,7 +168,7 @@ fn device_and_player_settings_round_trip() {
     assert_eq!(back.device.controller, s.device.controller);
     assert_eq!(back.device.controller_device, s.device.controller_device);
     assert_eq!(back.device.audio_offset_us, -12_000);
-    assert_eq!(back.player.preset, "wide.toml");
+    assert_eq!(back.player.preset, "wide");
     assert_eq!(Tuning::of(&back), t);
 }
 
@@ -540,7 +540,7 @@ fn sample() -> replay::PlayRecord {
             provenance: replay::BuildProvenance::Development,
         },
         chart: replay::ChartRecord::default(),
-        preset: replay::PresetRecord::of(&rules::custom()),
+        preset: replay::PresetRecord::of(&rules::tapestry()),
         session_policy: "default".to_owned(),
         devices: replay::DeviceRecord {
             sources: Vec::new(),

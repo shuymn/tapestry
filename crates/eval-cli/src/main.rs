@@ -1,12 +1,15 @@
 //! `eval-cli`: verifies play records against a chart and re-evaluates
 //! their input under presets, without the game (design.md "Verifying
-//! Without Launching the UI").
+//! Without Launching the UI"), and writes built-in presets to files to
+//! edit (design.md "User Presets").
 //!
-//! `eval-cli --chart <chart> [--preset <file.toml>]... <record.tprl>...`
+//! `eval-cli --chart <chart> [--preset <built-in|file.toml>]... <record.tprl>...`
 //!
-//! The chart and the preset files are checked first: a file that cannot
-//! be read or is too large, an invalid preset, or a chart that loads under
-//! none of the records' seeds ends the run before any line.
+//! A `--preset` is a built-in's name or else a user preset file, named by
+//! its stem as the game names it. The chart and the preset files are
+//! checked first: a file that cannot be read or is too large, a stem that
+//! cannot name a user preset, an invalid preset, or a chart that loads
+//! under none of the records' seeds ends the run before any line.
 //! Each record is then decoded, refused if its input is incomplete, and
 //! verified against the chart with `replay::verify` (design.md
 //! "Determinism"). It is evaluated under each `--preset` in order, or under
@@ -16,16 +19,22 @@
 //! `<record> | <preset> | <label> | perfect <n> great <n> good <n> bad <n>
 //! poor <n> | ex <n> | bp <n> | max combo <n> | <gauge> <value>% <cleared>...`
 //!
-//! `<preset>` is `preset <file>` or `recorded preset`. The label is
+//! `<preset>` is `preset <name or file>` or `recorded preset`. The label is
 //! `as played` or `what-if`, followed by the coverage when the input does
 //! not cover all of it. A refused record's lines end in
 //! `refused: <reason>` in place of the label and totals, one per preset.
 //! The output names only the paths given and nothing that varies between
 //! runs.
 //!
-//! Exit codes: 0 when every record was evaluated, 1 when any was refused
-//! or the chart or a preset file cannot be used, and 2 for bad arguments,
-//! with the usage line.
+//! `eval-cli preset export <built-in> <file.toml>` writes the built-in to a
+//! new file, which loads as a user preset named by the file's stem. It
+//! writes nothing when the stem is a built-in's name or not a name, or the
+//! file exists.
+//!
+//! Exit codes: 0 when every record was evaluated or the preset was written,
+//! 1 when any record was refused, the chart or a preset file cannot be
+//! used, or the export wrote nothing, and 2 for bad arguments, with the
+//! usage line.
 
 mod args;
 
@@ -43,7 +52,6 @@ use bms_parser::LoadOptions;
 use replay::verify::{Coverage, ReEvaluation, evaluate_record, load_recorded_chart};
 use replay::{DecodeLimits, Incomplete, PlayRecord};
 use rules::{GaugeValue, RulePreset};
-use rules_toml::MAX_PRESET_FILE_BYTES;
 
 fn main() -> ExitCode {
     let args = match args::parse(std::env::args_os().skip(1)) {
@@ -51,6 +59,18 @@ fn main() -> ExitCode {
         Err(e) => {
             eprintln!("eval-cli: {e}\n{}", args::USAGE);
             return ExitCode::from(2);
+        }
+    };
+    let args = match args {
+        args::Command::Evaluate(args) => args,
+        args::Command::Export { built_in, path } => {
+            return match export(&built_in, &path) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("eval-cli: {}: {e}", shown(&path));
+                    ExitCode::from(1)
+                }
+            };
         }
     };
     let mut out = io::BufWriter::new(io::stdout().lock());
@@ -324,18 +344,46 @@ fn percent(v: GaugeValue) -> String {
     format!("{sign}{}.{:03}%", a / unit, a % unit / (unit / 1_000))
 }
 
-/// The preset file at `path`, read and validated as the game reads it,
-/// within [`MAX_PRESET_FILE_BYTES`].
-fn read_preset(path: &Path) -> Result<RulePreset, String> {
-    let bytes = read_bounded(path, MAX_PRESET_FILE_BYTES)?;
-    if bytes.len() > MAX_PRESET_FILE_BYTES {
-        return Err(format!(
-            "the file is larger than {MAX_PRESET_FILE_BYTES} bytes, the largest preset file \
-             accepted"
-        ));
+/// The built-in named `arg`, or else the user preset file at `arg`, read
+/// and validated as the game reads it (named by its stem, within
+/// [`rules_toml::MAX_PRESET_FILE_BYTES`]).
+fn read_preset(arg: &Path) -> Result<RulePreset, String> {
+    if let Some(p) = arg.to_str().and_then(rules::built_in) {
+        return Ok(p);
     }
-    let text = String::from_utf8(bytes).map_err(|_| "the file is not UTF-8 text".to_owned())?;
-    rules_toml::load_preset_toml(&text).map_err(|e| chain(&e))
+    // The path is named by the caller; the reason follows it.
+    rules_toml::read_preset_file(arg)
+        .map(|(preset, _)| preset)
+        .map_err(|e| chain(&e.cause))
+}
+
+/// Writes the built-in `name` to a new user preset file at `path`, named by
+/// its stem (design.md "User Presets"). Nothing is written when the name
+/// is not a built-in's, the stem cannot name a user preset, or the file
+/// exists. The text is made in full before the file is created; a write
+/// that fails after that leaves the file as far as it got, and says so.
+fn export(name: &str, path: &Path) -> Result<(), String> {
+    let preset = rules::built_in(name).ok_or_else(|| {
+        format!(
+            "`{}` is not a built-in preset ({})",
+            escaped(name),
+            rules::BUILT_IN_PRESETS.join(", ")
+        )
+    })?;
+    rules_toml::user_preset_name(path).map_err(|e| chain(&e))?;
+    let text = rules_toml::preset_to_toml(&preset);
+    // `create_new` refuses an existing file in the same step that creates
+    // the new one, so nothing that appears in between is overwritten.
+    let mut file = fs::File::options()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|e| e.to_string())?;
+    // The file is never removed after this: once created it may be replaced
+    // by another process, whose file a removal would delete.
+    file.write_all(text.as_bytes())
+        .and_then(|()| file.sync_all())
+        .map_err(|e| format!("{e}; the file may be partly written"))
 }
 
 /// Everything in `path` up to one byte past `limit`; a larger file comes

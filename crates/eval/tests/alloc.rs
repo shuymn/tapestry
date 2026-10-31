@@ -129,7 +129,7 @@ fn advance_does_not_allocate() {
             note.sound = Some(SoundId(0));
         }
     }
-    let preset = rules::custom();
+    let preset = rules::tapestry();
     let mut dev = device(&[0]);
     dev.sources[0].axes.push(AxisBinding {
         control: AXIS,

@@ -126,7 +126,7 @@ fn jitter(raw: u8) -> i64 {
 }
 
 /// The rank declarations: none, `#RANK -1` to `#RANK 5` (beatoraja-style
-/// reads 0-4, custom any, and the rank scale takes 0-3), a `#DEFEXRANK` up
+/// reads 0-4, tapestry any, and the rank scale takes 0-3), a `#DEFEXRANK` up
 /// to 200 % as an integer token or a decimal, one that is not a number, or
 /// a `#RANK` followed by one of those, which the header policies may read
 /// differently.
@@ -152,7 +152,7 @@ fn rank(raw: (u8, u32)) -> Vec<JudgmentHeader> {
 
 /// The `#TOTAL` declarations: none, or one from -0.001 to 400 as a decimal,
 /// after a `#TOTAL 200` half the time, so a value not positive keeps the
-/// earlier one under beatoraja-style and the default under custom.
+/// earlier one under beatoraja-style and the default under tapestry.
 fn total(raw: Option<u32>) -> Vec<JudgmentHeader> {
     let declare = |value| JudgmentHeader {
         name: JudgmentHeaderName::Total,
@@ -636,7 +636,7 @@ fn ln_end_of(raw: [u32; 3], early: [i64; 4]) -> LnEndWindows {
 }
 
 fn build_preset(raw: &RawPreset) -> RulePreset {
-    let mut p = rules::custom();
+    let mut p = rules::tapestry();
     let flag = |bit: u32| raw.flags & (1 << bit) != 0;
     let keys = table_of(&raw.keys);
     p.tables = PerLaneClass {
@@ -650,14 +650,14 @@ fn build_preset(raw: &RawPreset) -> RulePreset {
     p.empty_poor.breaks_combo = flag(0);
     p.empty_poor.counts_bp = flag(1);
     p.empty_poor.counted = flag(2);
-    // Both assignment policies: nearest first (custom) and combo priority
+    // Both assignment policies: nearest first (tapestry) and combo priority
     // (beatoraja-style).
     p.assignment = if flag(18) {
         Assignment::ComboPriority
     } else {
         Assignment::NearestTiesEarlier
     };
-    // Both LN-head eligibilities: every head inside BAD (custom,
+    // Both LN-head eligibilities: every head inside BAD (tapestry,
     // beatoraja-style) and no late BAD head (LR2-style), with either
     // assignment.
     p.ln_mode.head_eligibility = if flag(19) {
@@ -670,7 +670,7 @@ fn build_preset(raw: &RawPreset) -> RulePreset {
     } else {
         HeaderPolicy::Decimals
     };
-    // The three window policies: thousandths (custom), scaled
+    // The three window policies: thousandths (tapestry), scaled
     // (beatoraja-style) and interpolated (LR2-style).
     p.window_policy = if flag(17) {
         let scaled = ScaledRank {

@@ -15,7 +15,6 @@ use std::fmt;
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
 
 use ::audio::{AudioOutput, OutputError};
 use bms_model::{BgmEvent, Chart, ModelError, Speed, TimeSource, TimeUs, VirtualClock};
@@ -37,13 +36,17 @@ use crate::policy::{
 };
 use crate::practice::{Practice, PracticeError};
 use crate::prepare::{BmsIngest, ChartIngest, ChartTransform, IngestError, Passthrough};
+use crate::presets::{PresetChange, Shelf, ShelfError};
 use crate::render::PlayView;
 use crate::render::RenderSide;
-use crate::results::{ReEvaluate, ResultContext, ResultExtension, ResultSummary};
-use crate::save::{LocalRecords, RecordRef, RecordSink, SaveError, write_atomic};
+use crate::results::{
+    ReEvaluate, ReEvaluationError, ResultContext, ResultExtension, ResultSummary,
+};
+use crate::save::{LocalRecords, RecordRef, RecordSink, SaveError};
 use crate::settings::{DataRoot, DeviceSettings, KeyConfig, PlayerSettings, SettingsError};
 use crate::sound::{AudioQueue, RunnerAudio, Wakes};
-use rules_toml::{PresetError, load_preset_toml, preset_to_toml};
+use replay::verify::ReEvaluation;
+use rules_toml::PresetFileError;
 
 /// Every extension point the session calls through, each with one
 /// implementation in stage 1.
@@ -205,13 +208,10 @@ pub enum SessionError {
     /// The chart could not be ingested.
     #[error(transparent)]
     Ingest(IngestError),
-    /// The preset file could not be used.
+    /// The preset `player.toml` names cannot be used: it is neither a
+    /// built-in nor a user preset, or its file does not load.
     #[error(transparent)]
-    Preset(PresetError),
-    /// The preset file `player.toml` names does not exist and is not a
-    /// standard preset, so nothing was written.
-    #[error("the preset file {} does not exist", .0.display())]
-    MissingPreset(PathBuf),
+    Preset(ShelfError),
     /// The chart transform's output breaks a chart invariant
     /// ([`Chart::validate`]).
     #[error("the transformed chart is invalid")]
@@ -283,17 +283,6 @@ pub enum PlayEnd {
     Aborted(AbortCause),
 }
 
-/// Why a reload of the preset at a retry was not used.
-#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
-pub enum ReloadError {
-    /// The file could not be read.
-    #[error("the preset file cannot be read: {0}")]
-    Io(io::ErrorKind),
-    /// The file is not a valid preset.
-    #[error(transparent)]
-    Preset(PresetError),
-}
-
 /// What happened in one play.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlayReport {
@@ -306,7 +295,7 @@ pub struct PlayReport {
     pub tail_cut: Option<AbortCause>,
     /// Why the preset file changed at this retry but was not used; the
     /// previous preset played instead.
-    pub reload_error: Option<ReloadError>,
+    pub reload_error: Option<PresetFileError>,
     /// The audio output's failure, if it stopped the play.
     pub output_error: Option<OutputError>,
     /// The input thread's failure, if it ended the play, its recording or
@@ -349,8 +338,7 @@ pub struct Loaded {
     chart_record: ChartRecord,
     warnings: Vec<String>,
     preset: RulePreset,
-    preset_path: PathBuf,
-    preset_modified: Option<SystemTime>,
+    shelf: Shelf,
     attempt: u32,
     /// Where the session events go, out of the parts so a play can report
     /// its start while its logic step borrows the chart.
@@ -368,7 +356,24 @@ pub struct PlayStart {
     pub attempt: u32,
     /// Why the preset file changed at this retry but was not used; the
     /// previous preset plays instead.
-    pub reload_error: Option<ReloadError>,
+    pub reload_error: Option<PresetFileError>,
+}
+
+/// What a poll of the presets found while a result screen shows
+/// ([`Loaded::poll_presets`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PresetReload {
+    /// The chosen preset reloaded: the next play uses it.
+    Reloaded {
+        /// The reloaded preset.
+        preset: Box<RulePreset>,
+        /// The play's record re-evaluated under it; `None` without a
+        /// record.
+        result: Option<Box<Result<ReEvaluation, ReEvaluationError>>>,
+    },
+    /// The chosen preset's file changed and does not load: the previous
+    /// preset stays in use.
+    Failed(PresetFileError),
 }
 
 /// What one play is sized and evaluated with, once its participating
@@ -421,16 +426,16 @@ pub struct PlayOutcome {
 }
 
 impl Loaded {
-    /// Reads the preset named in `player.toml`, then ingests the chart and
-    /// applies the transform. A missing standard preset file is written
-    /// first: `custom.toml` or `beatoraja-style.toml`.
+    /// Opens the shelf with the preset named in `player.toml` chosen (a
+    /// built-in or a user preset; nothing is written), then ingests the
+    /// chart and applies the transform.
     ///
     /// # Errors
     ///
-    /// [`SessionError`] for a step that is not positive, a missing preset
-    /// file that is not a standard preset
-    /// ([`SessionError::MissingPreset`]), an unreadable preset or chart, or
-    /// a chart no adapter reads.
+    /// [`SessionError`] for a step that is not positive, a preset that is
+    /// neither a built-in nor a user preset or whose file does not load
+    /// ([`SessionError::Preset`]), an unreadable chart, or a chart no
+    /// adapter reads.
     pub fn load(
         root: DataRoot,
         settings: Settings,
@@ -458,23 +463,9 @@ impl Loaded {
         if config.step.0 <= 0 {
             return Err(SessionError::InvalidStep(config.step));
         }
-        let preset_path = root.preset(&settings.player.preset);
-        if !preset_path.exists() {
-            let standard = standard_preset(&settings.player.preset)
-                .ok_or_else(|| SessionError::MissingPreset(preset_path.clone()))?;
-            if let Some(dir) = preset_path.parent() {
-                fs::create_dir_all(dir).map_err(io_error(dir))?;
-            }
-            let text = preset_to_toml(&standard);
-            write_atomic(&preset_path, text.as_bytes()).map_err(io_error(&preset_path))?;
-        }
-        let (preset, preset_modified) = read_preset(&preset_path).map_err(|e| match e {
-            ReloadError::Io(kind) => SessionError::Io {
-                path: preset_path.clone(),
-                kind,
-            },
-            ReloadError::Preset(e) => SessionError::Preset(e),
-        })?;
+        let shelf =
+            Shelf::open(root.presets(), &settings.player.preset).map_err(SessionError::Preset)?;
+        let preset = shelf.chosen().clone();
         if !parts.ingest.accepts(chart_path) {
             return Err(SessionError::UnsupportedChart(chart_path.to_owned()));
         }
@@ -512,8 +503,7 @@ impl Loaded {
             chart_record,
             warnings: ingested.warnings,
             preset,
-            preset_path,
-            preset_modified,
+            shelf,
             attempt: 0,
             events,
             practice: None,
@@ -600,6 +590,41 @@ impl Loaded {
         &self.preset
     }
 
+    /// The shelf: the built-ins and the user presets, with the chosen one.
+    #[must_use]
+    pub const fn shelf(&self) -> &Shelf {
+        &self.shelf
+    }
+
+    /// While a result screen shows: checks the user preset files if
+    /// [`POLL_INTERVAL`](crate::POLL_INTERVAL) has passed at `now`
+    /// (design.md "Tuning Without Restart"). When the chosen preset
+    /// reloaded, `report`'s play is re-evaluated under it; plays take it from
+    /// the next one on. `None` when nothing changed for the chosen preset.
+    pub fn poll_presets(&mut self, now: TimeUs, report: &PlayReport) -> Option<PresetReload> {
+        match self.shelf.poll(now)? {
+            PresetChange::Failed(e) => Some(PresetReload::Failed(e)),
+            PresetChange::Reloaded => {
+                let preset = self.shelf.chosen().clone();
+                let result = report.record.as_ref().map(|record| {
+                    Box::new(ReEvaluate::under(
+                        &ResultContext {
+                            record,
+                            chart: &self.chart,
+                            preset: &report.preset,
+                            live: &report.live,
+                        },
+                        &preset,
+                    ))
+                });
+                Some(PresetReload::Reloaded {
+                    preset: Box::new(preset),
+                    result,
+                })
+            }
+        }
+    }
+
     /// The settings the session runs with.
     #[must_use]
     pub const fn settings(&self) -> &Settings {
@@ -671,21 +696,19 @@ impl Loaded {
         });
     }
 
-    /// At a retry: uses the preset file from now on if its modification
-    /// time changed; a file that fails to load leaves the current preset.
-    fn reload_preset(&mut self) -> Option<ReloadError> {
-        let modified = fs::metadata(&self.preset_path).and_then(|m| m.modified());
-        match modified {
-            Ok(m) if Some(m) == self.preset_modified => None,
-            _ => match read_preset(&self.preset_path) {
-                Ok((preset, modified)) => {
-                    self.preset = preset;
-                    self.preset_modified = modified;
-                    None
-                }
-                Err(e) => Some(e),
-            },
+    /// At a retry: checks the user preset files, and plays the shelf's
+    /// chosen preset from now on, reloaded at this check or at a poll since
+    /// the previous play. A chosen file that changed and fails to load
+    /// leaves the current preset, and its error is returned.
+    fn reload_preset(&mut self) -> Option<PresetFileError> {
+        let error = match self.shelf.check() {
+            Some(PresetChange::Failed(e)) => Some(e),
+            Some(PresetChange::Reloaded) | None => None,
+        };
+        if self.preset != *self.shelf.chosen() {
+            self.preset.clone_from(self.shelf.chosen());
         }
+        error
     }
 
     /// The device profile and the logic step's sizes for a play whose
@@ -1020,30 +1043,6 @@ fn generated() -> eval::SourceProfile {
     }
 }
 
-/// The standard preset a missing file of this name is written with
-/// (design.md "Standard Presets"): `custom.toml` and
-/// `beatoraja-style.toml`. `None` for any other name.
-fn standard_preset(file: &str) -> Option<RulePreset> {
-    match file {
-        "custom.toml" => Some(rules::custom()),
-        "beatoraja-style.toml" => Some(rules::beatoraja_style()),
-        _ => None,
-    }
-}
-
-/// Reads and validates a preset file, with its modification time.
-fn read_preset(path: &Path) -> Result<(RulePreset, Option<SystemTime>), ReloadError> {
-    // Content and time come from one open file, so a save that replaces
-    // the file in between cannot pair old content with the new time.
-    let io = |e: io::Error| ReloadError::Io(e.kind());
-    let mut file = fs::File::open(path).map_err(io)?;
-    let modified = file.metadata().and_then(|m| m.modified()).ok();
-    let mut text = String::new();
-    file.read_to_string(&mut text).map_err(io)?;
-    let preset = load_preset_toml(&text).map_err(ReloadError::Preset)?;
-    Ok((preset, modified))
-}
-
 /// The session: a loaded chart, its audio and input, played any number of
 /// times without threads, on a virtual clock.
 #[derive(Debug)]
@@ -1059,6 +1058,12 @@ impl<O: AudioOutput + Wakes> Session<O> {
     #[must_use]
     pub const fn preset(&self) -> &RulePreset {
         self.loaded.preset()
+    }
+
+    /// The shelf: the built-ins and the user presets, with the chosen one.
+    #[must_use]
+    pub const fn shelf(&self) -> &Shelf {
+        self.loaded.shelf()
     }
 
     /// Calls `f` with each sound start the engine scheduled and kept (the

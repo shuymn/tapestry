@@ -1,5 +1,5 @@
 //! Hand examples for tap judgment: "this input gives this judgment".
-//! The preset is the custom preset (windows ±20/45/100/180 ms at #RANK 2,
+//! The preset is the tapestry preset (windows ±20/45/100/180 ms at #RANK 2,
 //! empty POOR up to 500 ms before and 150 ms after a note).
 
 mod common;
@@ -39,7 +39,7 @@ fn miss_waits_for_watermark() {
         .build()
         .unwrap();
     let dev = device(&[0]);
-    let preset = rules::custom();
+    let preset = rules::tapestry();
     let mut ev = Evaluator::new(&chart, &preset, &dev, &InputStart::default(), None, 8).unwrap();
     let mut out = Vec::new();
     // A press on the late edge (1180 ms) is queued, but the watermark is
@@ -71,7 +71,7 @@ fn finalized_or_unordered_input_and_backward_advance_are_refused() {
         .build()
         .unwrap();
     let dev = device(&[0]);
-    let preset = rules::custom();
+    let preset = rules::tapestry();
     let mut ev = Evaluator::new(&chart, &preset, &dev, &InputStart::default(), None, 2).unwrap();
     let mut out = Vec::new();
     ev.advance_to(TimeUs(1_180 * MS), &mut out).unwrap();
@@ -119,7 +119,7 @@ fn finalization_compares_evaluation_time_not_receive_time() {
         .tap(lane(1), TimeUs(2_000 * MS))
         .build()
         .unwrap();
-    let preset = rules::custom();
+    let preset = rules::tapestry();
     let w = TimeUs(1_000 * MS);
 
     // +5 ms: received after the watermark, but evaluated at or before it.
@@ -238,7 +238,7 @@ fn overtaking_press_misses_the_earlier_note() {
     // 1040 ms lies inside the first note's GOOD window (+40 ms), but the
     // second note is nearer (-20 ms): it is judged, and the first note is
     // passed, a POOR at the press, before the press's own judgment.
-    let (events, tally) = overtaking(&rules::custom());
+    let (events, tally) = overtaking(&rules::tapestry());
     assert_eq!(
         judgments(&events),
         [(1, 0, Poor, None), (1, 1, Perfect, Some(-20 * MS))]

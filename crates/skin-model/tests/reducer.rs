@@ -653,7 +653,7 @@ fn real_streams_without_ln_held() {
         .long(lane(1), TimeUs(HEAD), TimeUs(END))
         .build()
         .unwrap();
-    let preset = rules::custom();
+    let preset = rules::tapestry();
     let device = DeviceProfile {
         sources: vec![SourceProfile {
             input_offset: TimeUs(0),

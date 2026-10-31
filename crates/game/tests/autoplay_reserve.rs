@@ -20,7 +20,7 @@ use audio::{AudioEngine, MAX_VOICES};
 use bms_model::{
     BgmEvent, Chart, ChartBuilder, HeaderValue, JudgmentHeader, JudgmentHeaderName, SoundId, TimeUs,
 };
-use common::{MS, custom_settings, lane};
+use common::{MS, lane, tapestry_settings};
 use eval::{EvalError, PhysicalInputEvent};
 use game::{
     AutoplayError, ChartIngest, DataRoot, DeviceSettings, IngestError, Ingested, KeyConfig, Loaded,
@@ -129,7 +129,7 @@ fn chart(notes: i64, bgm: usize) -> Chart {
 
 fn loaded(dir: &Path, chart: &Chart) -> Loaded {
     let root = DataRoot::new(dir.to_owned());
-    let settings = custom_settings(&root);
+    let settings = tapestry_settings(&root);
     let path = dir.join("play.chart");
     std::fs::write(&path, b"built in code").unwrap();
     let parts = Parts {
@@ -164,7 +164,7 @@ fn expected(chart: &Chart) -> (usize, usize) {
     let notes: usize = chart.lanes.iter().map(Vec::len).sum();
     let events = 2 * notes;
     let schedule = chart.bgm.len() + notes;
-    let r = Reservation::of(chart, &rules::custom(), &device, EFFECTS).unwrap();
+    let r = Reservation::of(chart, &rules::tapestry(), &device, EFFECTS).unwrap();
     let own = 2 * events * size_of::<PhysicalInputEvent>() + schedule * size_of::<BgmEvent>();
     (r.bytes(events) + own, own)
 }

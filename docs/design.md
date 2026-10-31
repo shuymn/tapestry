@@ -442,7 +442,7 @@ A mine's trigger is shared (the lane held as the mine passes, built) and each ga
 
 ### Standard Presets
 
-The standard presets are built into the code, not files: each is chosen by its name, which is also its preset ID in records, and the game never writes one to disk (not built yet: today the tapestry preset is `rules::custom()`, with the ID `custom`).
+The standard presets are built into the code, not files: each is chosen by its name, which is also its preset ID in records, and the game never writes one to disk.
 
 - **beatoraja-style (default)** (`beatoraja-style`), **LR2-style** (`lr2-style`): Aim for similar behavior based on public information. They are named "-style", not "compatible", and an exact match is not promised ("What a -style Preset Reproduces").
 - **tapestry** (`tapestry`): Judgment specific to this player ("The tapestry Preset"). Its values differ from the judgment of the commercial game this is based on.
@@ -457,10 +457,11 @@ Items are added when a preset that needs them appears. Unused tuning items are n
 
 ### User Presets
 
-A preset the player changes is the player's own: a user preset, a TOML file in `presets\` (not built yet). Only these files are read, validated and polled ("Tuning Without Restart").
+A preset the player changes is the player's own: a user preset, a TOML file in `presets\`. Only these files are read, validated and polled ("Tuning Without Restart").
 
 - **Name:** the file stem. The file has no name field; the loader gives the preset its stem as its preset ID, so the file name is the name's one source and two user presets cannot share a name. Renaming the file renames the preset, and records then see another preset, since the ID is part of the hash. A name is 1 to 64 characters of lowercase ASCII letters, digits, `-` and `_`, and a stem that is not one is refused, naming the file: names then compare exactly on every file system, `TAPESTRY.toml` cannot stand for a built-in, and no older value such as `custom.toml` can be a name.
 - **No passing for a built-in:** a file whose stem is a built-in's name is refused, with an error naming the file and the built-in it conflicts with, so no file can pass for a built-in in records.
+- **Files only:** an entry of `presets\` that is a symbolic link is refused, naming it, so no preset is read from outside the folder and a target's changes cannot hide behind the link's own modification time.
 - **Creating one:** `eval-cli preset export <built-in> <path>` writes that built-in to a new TOML file, and refuses a path whose file exists or whose stem is a built-in's name; the player puts the file in `presets\`. `eval-cli` is portable and does not locate the data root, so it takes the path. Its `--preset` takes a built-in's name or a user preset file. Creating and editing presets in a game screen is not built yet: it arrives with an in-game settings screen ("Libraries", settings screens).
 
 ### The tapestry Preset
@@ -986,14 +987,11 @@ Built with the screen transition and session events, as a later variation. A gen
 
 ### Tuning Without Restart
 
-- When a user preset file ("User Presets") changes, it is reloaded at the next check, every 250 ms while a select or result screen shows; skin files are checked between plays. A built-in preset changes only with the code.
+- The shelf (`game::presets::Shelf`) holds the built-ins and the user preset files ("User Presets"). A check lists `presets\` and reads each file whose modification time changed; it runs every 250 ms while a result screen shows, and at every retry. Each chart's shelf is opened when the chart loads, so a file changed while the select screen shows is read then. Nothing is checked during play, and a built-in preset changes only with the code; skin files are checked between plays.
 - A reloaded preset is used for play from the next retry on. If the rule changed in the middle of play, the play could no longer be reproduced with a single preset.
-- Re-evaluation on the result screen may use the reloaded preset immediately. Combined with `eval-cli`, the cycle of writing a preset, recomputing with local input logs, comparing the results, and fixing it runs without a restart.
+- A file that fails to load leaves the preset it last loaded in use, and its error goes to the result screen, or with the report of the retry that found it. A file that loads again after failing is reported as reloaded even with the same rules, so the error shown can be cleared.
+- Re-evaluation on the result screen uses the reloaded preset immediately: the play is re-evaluated under it as a what-if, and the result goes to the result screen. The player's end screen does not draw a reload or its error yet; that arrives with preset switching on the result screen. Combined with `eval-cli`, the cycle of writing a preset, recomputing with local input logs, comparing the results, and fixing it runs without a restart.
 - Skin reloading is done on a separate thread, and the fully assembled result is swapped in between plays. This is so that render work during play does not allocate memory. A failed reload keeps the current skin, and skin files are not polled during play.
-
-> **For now: the preset reloads at the next retry**
->
-> Files are not polled yet. At each retry the session checks the preset file's modification time, and a changed file is loaded and used from that retry on, which is the earliest point a reloaded preset may be used in play. A file that fails to load leaves the previous preset in use, and the error is reported. Polling, and immediate re-evaluation on the result screen, arrive with the result screen in stage 2.
 
 ## Settings Scopes
 
@@ -1011,7 +1009,7 @@ Results and replays display and record where the values used came from ("preset 
 ### Settings Files
 
 - Settings are TOML in two files, and from stage 3 one file of skin layout adjustments per skin: `device.toml` (the keyboard key config, the controller key config with its controller's model, the three offsets, the audio device, master volume, queued audio periods, the monitor, and the library roots under `[library] roots`, since they are per PC) and `player.toml` (hi-speed, the preset, by default `beatoraja-style`, and the displayed gauge). A `player.toml` without a `preset` keeps the default; one that names a preset keeps that choice. Files are written atomically: to a temporary file, then renamed.
-- `preset` names a built-in or a user preset by its name ("Standard Presets", "User Presets"; not built yet). Any other value, a file name from an older version such as `beatoraja-style.toml` among them, is refused with an error naming it; nothing is converted or written.
+- `preset` names a built-in or a user preset by its name ("Standard Presets", "User Presets"). Any other value, a file name from an older version such as `beatoraja-style.toml` among them, is refused with an error naming it; nothing is converted or written.
 - Everything lives in one data root, `%LOCALAPPDATA%\tapestry\`, which also holds `presets\`, `records\`, `logs\`, `measure\` and `layouts\` (one file of layout adjustments per skin, from stage 3). Local, not roaming, AppData, because device settings must not follow a profile to another PC and records are large; one root keeps backup simple, and the scopes stay separated by file. The registry is not used: it is not human-editable and does not fit presets distributed as files.
 
 ## IR (Rankings)

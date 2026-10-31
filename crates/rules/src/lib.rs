@@ -21,18 +21,19 @@
 )]
 
 mod beatoraja_style;
+mod built_in;
 mod canonical;
-mod custom;
 mod error;
 mod gauge_rules;
 mod headers;
 mod lr2_style;
 mod preset;
+mod tapestry;
 mod validate;
 mod windows;
 
 pub use beatoraja_style::beatoraja_style;
-pub use custom::custom;
+pub use built_in::{BUILT_IN_PRESETS, built_in};
 pub use error::{CanonicalError, RuleError, Side};
 pub use headers::{HeaderPolicy, JudgeRank, ReadHeaders};
 pub use lr2_style::lr2_style;
@@ -43,4 +44,5 @@ pub use preset::{
     PerJudgment, RankScale, RulePreset, SCALE_FULL_MILLI, SameTimeOrder, ScoreWeights,
     TotalCorrection, TotalMode, Window, scale_edge, scale_edge_by,
 };
+pub use tapestry::tapestry;
 pub use windows::{EmptyPoorRange, LaneClass, LaneTable, PerLaneClass, ScaledRank, WindowPolicy};

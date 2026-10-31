@@ -77,7 +77,7 @@ fn play(notes: i64) -> (Chart, Vec<PhysicalInputEvent>) {
 }
 
 fn bench_batch(c: &mut Criterion) {
-    let preset = rules::custom();
+    let preset = rules::tapestry();
     let mut group = c.benchmark_group("batch");
     for notes in [2_000, 10_000] {
         let (chart, events) = play(notes);
@@ -123,7 +123,7 @@ fn live(chart: &Chart, preset: &RulePreset, device: &DeviceProfile, events: &[Ph
 }
 
 fn bench_live(c: &mut Criterion) {
-    let preset = rules::custom();
+    let preset = rules::tapestry();
     let device = device();
     let mut group = c.benchmark_group("live_1ms_steps");
     group.sample_size(20);
@@ -139,7 +139,7 @@ fn bench_live(c: &mut Criterion) {
 /// A dense window (design.md "Evaluation Stages": dense windows are
 /// benchmarked): `notes` taps on key 1 every 5 ms, so about 100 notes lie
 /// inside one press's BAD window and empty POOR range, each pressed 30 ms
-/// late, under each assignment policy (custom's nearest first and
+/// late, under each assignment policy (tapestry's nearest first and
 /// beatoraja-style's combo priority).
 fn dense(notes: i64) -> (Chart, Vec<PhysicalInputEvent>) {
     let mut builder = ChartBuilder::new(150_000);
@@ -163,7 +163,7 @@ fn bench_dense_window(c: &mut Criterion) {
         ..EvalInput::default()
     };
     for preset in [
-        rules::custom(),
+        rules::tapestry(),
         rules::beatoraja_style(),
         rules::lr2_style(),
     ] {
