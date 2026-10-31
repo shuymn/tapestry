@@ -340,14 +340,16 @@ struct Lines<'a> {
     no: usize,
 }
 
-impl<'a> Iterator for Lines<'a> {
-    type Item = (usize, Result<&'a [u8], FntError>);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let rest = self.rest?;
+impl<'a> Lines<'a> {
+    /// The next line and its number; `None` past the end, numbered as
+    /// the line after the last.
+    fn line(&mut self) -> Result<(usize, Option<&'a [u8]>), FntError> {
+        let Some(rest) = self.rest else {
+            return Ok((self.no + 1, None));
+        };
         self.no += 1;
         let (line, next) = match rest.iter().position(|&b| b == b'\n') {
-            Some(i) => (rest.get(..i)?, rest.get(i + 1..)),
+            Some(i) => (rest.get(..i).unwrap_or_default(), rest.get(i + 1..)),
             None => (rest, None),
         };
         self.rest = next;
@@ -356,22 +358,10 @@ impl<'a> Iterator for Lines<'a> {
             Some(_) => line.strip_suffix(b"\r").unwrap_or(line),
             None => line,
         };
-        let line = if line.contains(&b'\r') {
-            Err(err(self.no, FntErrorKind::LoneCr))
-        } else {
-            Ok(line)
-        };
-        Some((self.no, line))
-    }
-}
-
-impl<'a> Lines<'a> {
-    /// The next line and its number; `None` past the end.
-    fn line(&mut self) -> Result<(usize, Option<&'a [u8]>), FntError> {
-        match self.next() {
-            Some((no, line)) => line.map(|l| (no, Some(l))),
-            None => Ok((self.no + 1, None)),
+        if line.contains(&b'\r') {
+            return Err(err(self.no, FntErrorKind::LoneCr));
         }
+        Ok((self.no, Some(line)))
     }
 }
 
@@ -453,7 +443,8 @@ impl Chars {
 
     /// The glyphs sorted by code; a repeated code refuses.
     fn sorted(&mut self) -> Result<(), FntError> {
-        self.glyphs.sort_by_key(|(g, no)| (g.code, *no));
+        // Line numbers are unique, so the order is total.
+        self.glyphs.sort_unstable_by_key(|(g, no)| (g.code, *no));
         if let Some(pair) = self.glyphs.windows(2).find(|p| match p {
             [(a, _), (b, _)] => a.code == b.code,
             _ => false,
@@ -495,27 +486,28 @@ impl FntFile {
             no: 0,
         };
 
-        // Line 1: the padding, then `info`, then the size.
-        let (no, info) = lines.line()?;
-        let info = info.unwrap_or_default();
-        let [pad_top, pad_right, pad_bottom, pad_left] =
-            padding(info).ok_or(err(no, FntErrorKind::Padding))?;
-        let info = without_face(info);
-        let info = text(no, &info)?;
-        if [pad_top, pad_right, pad_bottom, pad_left]
-            .iter()
-            .any(|p| !(0..=MAX_FNT_VALUE).contains(p))
-        {
-            return Err(err(no, FntErrorKind::Value("padding")));
-        }
-        if !info.starts_with("info ") {
-            return Err(err(no, FntErrorKind::Info));
-        }
-        let size = info
-            .split(' ')
-            .find_map(|t| keyed(t, "size"))
-            .ok_or(err(no, FntErrorKind::Metadata("size")))?;
-        let size = ranged(size, 1, MAX_FNT_VALUE).ok_or(err(no, FntErrorKind::Value("size")))?;
+        // Line 1: the padding, then `info`, then the size. The copy
+        // without `face` ends with the block.
+        let ([pad_top, pad_right, pad_bottom, pad_left], size) = {
+            let (no, info) = lines.line()?;
+            let info = info.unwrap_or_default();
+            let pad = padding(info).ok_or(err(no, FntErrorKind::Padding))?;
+            let info = without_face(info);
+            let info = text(no, &info)?;
+            if pad.iter().any(|p| !(0..=MAX_FNT_VALUE).contains(p)) {
+                return Err(err(no, FntErrorKind::Value("padding")));
+            }
+            if !info.starts_with("info ") {
+                return Err(err(no, FntErrorKind::Info));
+            }
+            let size = info
+                .split(' ')
+                .find_map(|t| keyed(t, "size"))
+                .ok_or(err(no, FntErrorKind::Metadata("size")))?;
+            let size =
+                ranged(size, 1, MAX_FNT_VALUE).ok_or(err(no, FntErrorKind::Value("size")))?;
+            (pad, size)
+        };
 
         // Line 2, by position (gdx 1.9.9 `load`:503-517).
         let (no, common) = lines.line()?;
@@ -562,7 +554,6 @@ impl FntFile {
             anchors: [None; 13],
         };
         let mut declared_chars = None;
-        let mut char_lines = 0_usize;
         let mut kerning_header = None;
         loop {
             let (no, line) = lines.line()?;
@@ -570,7 +561,6 @@ impl FntFile {
             let line = text(no, line)?;
             if line.starts_with("char ") {
                 chars.push(no, line, pages, limits)?;
-                char_lines += 1;
             } else if line.starts_with("chars ") {
                 // One declaration; a second is not allowed.
                 if declared_chars.is_some() {
@@ -584,7 +574,7 @@ impl FntFile {
                 return Err(err(no, FntErrorKind::Unexpected));
             }
         }
-        if declared_chars.is_some_and(|n| n != char_lines) {
+        if declared_chars.is_some_and(|n| n != chars.count) {
             return Err(err(0, FntErrorKind::Count("chars")));
         }
         chars.sorted()?;
