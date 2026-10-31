@@ -47,20 +47,6 @@ pub enum Variant {
     Hi,
 }
 
-/// The variant for a target of `target` pixels showing a canvas of
-/// `canvas` pixels: `Hi` when the canvas is magnified, that is when the
-/// target is larger on both axes, and `Lo` otherwise.
-#[must_use]
-pub fn variant_for(target: [u32; 2], canvas: [u32; 2]) -> Variant {
-    let [tw, th] = target;
-    let [cw, ch] = canvas;
-    if tw > cw && th > ch {
-        Variant::Hi
-    } else {
-        Variant::Lo
-    }
-}
-
 /// What the device allows: its largest texture side and array layers, and
 /// the layers kept for other use before the skin's pages (the bitmap font).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

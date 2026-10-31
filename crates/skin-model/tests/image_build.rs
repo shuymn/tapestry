@@ -9,7 +9,7 @@ use bms_model::{Chart, ChartBuilder, TimeUs};
 use image::{Rgba, RgbaImage};
 use image_support::{dir, file, save, whole};
 use play_support::{
-    Harness, MS, bool_program, element, ev, full, judged, lane, tally, uvs, white_sheet,
+    Harness, MS, bool_program, def, element, ev, full, judged, lane, tally, uvs, white_sheet,
 };
 use rules::Judgment;
 use skin_model::{
@@ -78,11 +78,11 @@ fn skin(d: &TempDir) -> Skin {
     )
     .unwrap();
     let ready = TimerRef::Builtin(timer::READY);
-    Skin::new(
+    Skin::new(def(
         vec![bool_program("combo >= 2")],
         sheet,
         vec![shows(0, ready), shows(1, ready), shows(2, ready)],
-    )
+    ))
     .unwrap()
 }
 
@@ -145,7 +145,7 @@ fn the_longest_period_at_the_latest_time_stays_in_range() {
     )
     .unwrap();
     let ready = TimerRef::Builtin(timer::READY);
-    let skin = Skin::new(Vec::new(), sheet, vec![shows(0, ready)]).unwrap();
+    let skin = Skin::new(def(Vec::new(), sheet, vec![shows(0, ready)])).unwrap();
     let ctx = skin_model::PlayContext {
         attempt: skin_model::Attempt::Full {
             lead_in: TimeUs(i64::MAX),
@@ -187,7 +187,7 @@ fn a_table_of_another_sheet_draws_nothing() {
     assert_eq!(h.batch.quads().len(), 3);
     let own = h.uvs.clone();
     // Another length.
-    let one = Skin::new(Vec::new(), white_sheet(), Vec::new()).unwrap();
+    let one = Skin::new(def(Vec::new(), white_sheet(), Vec::new())).unwrap();
     h.uvs = uvs(&one);
     assert_eq!(h.uvs.frames().len(), 1);
     h.frame(10, &[]);
@@ -219,17 +219,17 @@ fn image_references_are_checked_at_load() {
     };
     let ready = TimerRef::Builtin(timer::READY);
     for bad in [TimerRef::Builtin(timer::BUILTIN), TimerRef::When(1)] {
-        let err = Skin::new(vec![bool_program("true")], sheet(bad), Vec::new()).unwrap_err();
+        let err = Skin::new(def(vec![bool_program("true")], sheet(bad), Vec::new())).unwrap_err();
         assert!(
             matches!(err, LoadError::UnknownImageTimer { image: 1 }),
             "{err:?}"
         );
     }
-    let err = Skin::new(
+    let err = Skin::new(def(
         Vec::new(),
         sheet(ready),
         vec![shows(1, ready), shows(2, ready)],
-    )
+    ))
     .unwrap_err();
     assert!(
         matches!(err, LoadError::UnknownImage { element: 1 }),

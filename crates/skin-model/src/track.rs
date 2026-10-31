@@ -210,12 +210,27 @@ impl Track {
         self.at.len()
     }
 
-    /// Whether any key has an angle other than 0.
-    #[must_use]
-    pub fn has_rotation(&self) -> bool {
+    /// Each key's rect `[x, y, w, h]`.
+    pub(crate) fn rects(&self) -> impl Iterator<Item = [i32; 4]> + '_ {
+        self.v.iter().map(|&[x, y, w, h, ..]| [x, y, w, h])
+    }
+
+    /// The union of every key's rect, each with a negative size flipped,
+    /// as `[x0, y0, x1, y1]`; rotation is ignored.
+    pub(crate) fn bounds(&self) -> Option<[i64; 4]> {
+        self.rects().fold(None, |acc, [x, y, w, h]| {
+            let (x, y, w, h) = (i64::from(x), i64::from(y), i64::from(w), i64::from(h));
+            let r = [x.min(x + w), y.min(y + h), x.max(x + w), y.max(y + h)];
+            Some(crate::place::union(acc, r))
+        })
+    }
+
+    /// Whether every key leaves the geometry and the angle at 0, so the
+    /// track gives only color and alpha.
+    pub(crate) fn is_still(&self) -> bool {
         self.v
             .iter()
-            .any(|k| k.get(Prop::Angle as usize).is_some_and(|&a| a != 0))
+            .all(|&[x, y, w, h, _, _, _, _, angle]| [x, y, w, h, angle] == [0; 5])
     }
 
     /// The track at local time `t_us` (µs since its timer started), or

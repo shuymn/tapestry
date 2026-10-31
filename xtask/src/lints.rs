@@ -283,6 +283,13 @@ pub const IN_PLAY: &[Site] = &[
     Site::File("crates/skin-model/src/play/timers.rs"),
     // A frame of an image from its cycle and its place in the atlas.
     Site::File("crates/skin-model/src/atlas/uv.rs"),
+    // The canvas, the regions' placement and the lanes widget.
+    Site::File("crates/skin-model/src/canvas.rs"),
+    Site::File("crates/skin-model/src/layout.rs"),
+    Site::File("crates/skin-model/src/place.rs"),
+    Site::File("crates/skin-model/src/widget/mod.rs"),
+    Site::File("crates/skin-model/src/widget/lanes.rs"),
+    Site::File("crates/skin-model/src/widget/scroll.rs"),
     Site::Fns(
         "crates/render/src/atlas.rs",
         &["glyph_uv", "solid_uv", "texels", "cell_of"],

@@ -37,7 +37,7 @@ sha2 = { version = "0.11.1", default-features = false }
 # replay
 zstd = { version = "0.14.3", default-features = false }
 
-# eval, bms-parser, library and render (dev only): benchmarks (docs/setup.md "Benchmarks")
+# eval, bms-parser, library, render and skin-model (dev only): benchmarks (docs/setup.md "Benchmarks")
 criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
 
 # eval, replay and skin-model (dev only): property tests

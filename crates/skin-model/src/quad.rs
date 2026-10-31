@@ -16,11 +16,19 @@ pub struct Quad {
     pub uv: [f32; 4],
     /// Color multiplied with the atlas sample, RGBA.
     pub color: [f32; 4],
+    /// The point on the canvas the rect rotates about.
+    pub pivot: [f32; 2],
+    /// The clockwise rotation about `pivot`, in radians in `[0, 2π)`;
+    /// applied last, to the rect as placed.
+    pub angle: f32,
     /// The atlas texture array's layer the uv points into.
     pub layer: u16,
     /// How the atlas is sampled.
     pub filter: Filter,
 }
+
+// The renderer's sprite carries the same 64 bytes.
+const _: () = assert!(std::mem::size_of::<Quad>() == 64);
 
 /// How an image is sampled. Both use the atlas's box-filtered mip levels
 /// when shrinking.
@@ -110,8 +118,13 @@ impl QuadBatch {
     }
 
     fn drop_one(&mut self) -> bool {
-        self.dropped = self.dropped.saturating_add(1);
+        self.count_drop();
         false
+    }
+
+    /// Counts work a widget left undrawn because its budget ran out.
+    pub(crate) fn count_drop(&mut self) {
+        self.dropped = self.dropped.saturating_add(1);
     }
 
     /// Adds `quad` with `key`, extending the last run when its key is

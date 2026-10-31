@@ -152,7 +152,6 @@ fn eases_and_carried_props() {
     assert_eq!(s.rect[2], 0.0);
     assert_eq!(s.color, [1.0; 4]);
     assert_eq!(s.angle, 0.0);
-    assert!(!carried.has_rotation());
 }
 
 #[test]
@@ -174,7 +173,6 @@ fn colors_map_to_unit_range() {
     let s = track.sample(0).unwrap();
     assert_eq!(s.color, [1.0, 0.2, 1.0, 0.0]);
     assert_eq!(s.angle, 90.0);
-    assert!(track.has_rotation());
 }
 
 /// Opposite extreme endpoints across the widest key span: every product

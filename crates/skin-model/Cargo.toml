@@ -1,7 +1,7 @@
 [package]
 name = "skin-model"
 version = "0.0.0"
-description = "The skin runtime model: state schema, expressions, tracks, timers, images, atlas pages and quads."
+description = "The skin runtime model: state schema, expressions, tracks, timers, images, atlas pages, canvas and regions, the lanes widget and quads."
 edition.workspace = true
 license = "GPL-3.0-or-later"
 repository.workspace = true
@@ -16,9 +16,16 @@ rules.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+# The lanes tests load charts as a session does.
+bms-parser.workspace = true
+criterion.workspace = true
 png.workspace = true
 proptest.workspace = true
 tempfile.workspace = true
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "build"
+harness = false
