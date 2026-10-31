@@ -253,22 +253,25 @@ mod tests {
     /// source lists them.
     #[test]
     fn node_tables_invert() {
-        let four = node_of(4).unwrap();
-        // Front and tip from nodes 0 (above) and 1 (below), back from 2
-        // and 3, for every look.
-        for look in 0..6 {
-            let b = look * 6;
-            assert_eq!(&four[b..b + 6], [0, 1, 2, 3, 0, 1]);
+        // Every index of every table, by look (six indices each): front
+        // above and below, back above and below, tip above and below.
+        let looks = |rows: [[usize; 6]; 6]| -> [usize; NODES] {
+            std::array::from_fn(|i| rows[i / 6][i % 6])
+        };
+        // Front and tip from nodes 0 and 1, back from 2 and 3.
+        let four = [0, 1, 2, 3, 0, 1];
+        assert_eq!(node_of(4), Some(looks([four; 6])));
+        // Looks 2 and 3 from nodes 0-3, the others from 4-7.
+        let (a, b) = ([4, 5, 6, 7, 4, 5], [0, 1, 2, 3, 0, 1]);
+        assert_eq!(node_of(8), Some(looks([a, a, b, b, a, a])));
+        // As eight, with the tips from 10 and 11, and 8 and 9.
+        let (a, b) = ([4, 5, 6, 7, 10, 11], [0, 1, 2, 3, 8, 9]);
+        assert_eq!(node_of(12), Some(looks([a, a, b, b, a, a])));
+        let own: [usize; NODES] = std::array::from_fn(|i| i);
+        assert_eq!(node_of(36), Some(own));
+        for n in [0, 1, 3, 5, 7, 9, 13, 35, 37] {
+            assert_eq!(node_of(n), None, "{n}");
         }
-        let eight = node_of(8).unwrap();
-        assert_eq!(&eight[..6], [4, 5, 6, 7, 4, 5]);
-        assert_eq!(&eight[12..18], [0, 1, 2, 3, 0, 1]);
-        assert_eq!(&eight[24..30], [4, 5, 6, 7, 4, 5]);
-        let twelve = node_of(12).unwrap();
-        assert_eq!(&twelve[..6], [4, 5, 6, 7, 10, 11]);
-        assert_eq!(&twelve[12..18], [0, 1, 2, 3, 8, 9]);
-        assert_eq!(node_of(36).unwrap()[35], 35);
-        assert_eq!(node_of(5), None);
     }
 
     #[test]
