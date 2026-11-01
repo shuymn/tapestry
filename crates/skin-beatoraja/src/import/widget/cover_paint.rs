@@ -38,7 +38,7 @@ use super::super::policy::{CriticalPart, Role};
 use super::super::report::{LaneApprox, NoteKind, Object};
 use super::super::track::Stretch;
 use super::super::{Common, Cx, Dst, OFFSET_HIDDEN, OFFSET_LIFT, Opts, Prop};
-use super::SrcImage;
+use super::{Painted, SrcImage};
 use crate::error::ImportError;
 
 /// The rate a `slider` of this `type` shows: SUDDEN+'s share of the whole
@@ -46,10 +46,6 @@ use crate::error::ImportError;
 const RATE_LANECOVER: i32 = 4;
 /// The slider direction that moves down (`skin/SkinSlider.java:116-120`).
 const DOWN: i32 = 2;
-
-/// A paint's image, its keys' model rects and the native size its quads
-/// keep.
-type Painted = (u32, Vec<[i32; 4]>, Option<Native>);
 
 impl Cx<'_> {
     /// Adds the cover paint `def` and the element `c` drawing it on
@@ -115,14 +111,7 @@ impl Cx<'_> {
             self.drop_el(c.role, at, NoteKind::Stretch(c.stretch_mode))?;
             return Ok(None);
         }
-        let Some((image, cell)) = self.add_src_image(c, rec, s, s.div)? else {
-            return Ok(None);
-        };
-        let Some((rects, native)) = self.baked_rects(c, cell)? else {
-            self.drop_el(c.role, at, NoteKind::Stretch(c.stretch_mode))?;
-            return Ok(None);
-        };
-        Ok(Some((image, rects, native)))
+        self.src_image_rects(c, rec, s)
     }
 
     /// SUDDEN+'s paint from image record `rec` (`s`) in `role`, its keys
