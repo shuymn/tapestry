@@ -2129,7 +2129,9 @@ mod tests {
         fn paced(&self) -> bool {
             false
         }
-        fn build(&mut self, _f: &render::FrameInput<'_>) {}
+        fn build(&mut self, _f: &render::FrameInput<'_>) -> Result<(), skin_model::BuildError> {
+            Ok(())
+        }
         fn draw(&mut self) -> Result<render::FrameTiming, render::RenderError> {
             Err(render::RenderError::SurfaceLost)
         }

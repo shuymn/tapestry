@@ -1,68 +1,29 @@
 //! Sprites, the per-frame batch a skin fills, and the GPU instances the
 //! batch is staged into.
 //!
-//! The batch keeps one ordered list, so a sprite pushed after another is
-//! drawn over it whatever their blends, and splits it into runs wherever the
-//! blend or the clip changes; the renderer draws the runs in order, each
-//! under its clip's scissor.
+//! The batch is the runtime model's [`QuadBatch`]: one ordered list, so a
+//! sprite pushed after another is drawn over it whatever their blends,
+//! split into runs wherever the blend or the clip changes; the renderer
+//! draws the runs in order, each under its clip's scissor. The simple skin
+//! pushes sprites through [`SpriteBatch`], and a skin of the runtime model
+//! writes its quads into the same batch ([`SpriteBatch::quads_mut`]), so
+//! both reach staging the same way, with nothing copied between them.
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
 use bytemuck::{Pod, Zeroable};
-use skin_model::{ClipId, Filter};
+pub use skin_model::{Blend, Run};
+use skin_model::{ClipId, Filter, Quad, QuadBatch, RunKey};
 
 /// One quad, in canvas pixels (the 1920×1080 layout of the built-in
-/// screens, origin at the top left).
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct Sprite {
-    /// Left, top, width, height.
-    pub rect: [f32; 4],
-    /// Atlas coordinates: left, top, right, bottom. On layer 0 they are
-    /// the built-in atlas's ([`glyph_rows`](crate::glyph_rows),
-    /// [`solid_uv`](crate::solid_uv)), whatever the array's page side:
-    /// staging rescales them ([`Instance::of`]).
-    pub uv: [f32; 4],
-    /// Color multiplied with the atlas sample, straight RGBA: staging
-    /// premultiplies it ([`Instance::of`]).
-    pub color: [f32; 4],
-    /// The point in canvas pixels the rect rotates about.
-    pub pivot: [f32; 2],
-    /// The clockwise rotation about `pivot`, in radians; applied to the rect
-    /// as placed. 0 draws the rect as it is.
-    pub angle: f32,
-    /// The atlas texture array's layer: 0 is the built-in atlas (the
-    /// bitmap font and the solid block), a skin's pages follow it.
-    pub layer: u16,
-    /// How a skin page is sampled. Layer 0 is always sampled at its
-    /// nearest level-0 texel, so the bitmap font stays sharp.
-    pub filter: Filter,
-}
-
-/// How a sprite is blended over what is under it. Either way the colour
-/// is premultiplied, and the target's alpha composites over (source 1,
-/// destination 1 − source alpha).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Blend {
-    /// Ordinary alpha blending: source 1, destination 1 − source alpha.
-    Alpha,
-    /// Added on top (beams, bombs): source 1, destination 1.
-    Additive,
-}
-
-/// The sprites `start..end` of a batch, all blended with `blend` under
-/// `clip`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Run {
-    /// The blend of every sprite in the run.
-    pub blend: Blend,
-    /// The clip of every sprite in the run, an index into the clip table
-    /// installed with the atlas; `None` draws on the whole target.
-    pub clip: Option<ClipId>,
-    /// The run's first sprite.
-    pub start: u32,
-    /// One past the run's last sprite.
-    pub end: u32,
-}
+/// screens, origin at the top left): the runtime model's [`Quad`].
+///
+/// Its uv on layer 0 is the built-in atlas's ([`glyph_rows`](crate::glyph_rows),
+/// [`solid_uv`](crate::solid_uv)), whatever the array's page side: staging
+/// rescales it ([`Instance::of`]). Its colour is straight RGBA: staging
+/// premultiplies it. Layer 0 is always sampled at its nearest level-0
+/// texel, so the bitmap font stays sharp, whatever its filter.
+pub type Sprite = Quad;
 
 /// The atlas layer and filter bits of [`Instance::flags`]: the layer in
 /// the low 16 bits, and this bit set when the atlas is sampled at its
@@ -121,45 +82,54 @@ impl Instance {
     }
 }
 
-/// The sprites of one frame, in drawing order, at most `capacity` of them.
+/// The sprites of one frame, in drawing order: the runtime model's
+/// [`QuadBatch`], at most `capacity` sprites in at most `runs` runs for the
+/// skin, and a reserve after them that only the batch's owner fills (the
+/// measurement overlay, [`Staging::build`](crate::Staging::build)).
 ///
 /// The sprite and run lists are allocated once, at full capacity, so
-/// pushing never allocates: a run starts at a sprite, so there are never
-/// more runs than sprites. A push beyond the capacity is dropped and
-/// counted.
+/// pushing never allocates. A push beyond the capacity in force is
+/// dropped and counted.
 #[derive(Debug)]
 pub struct SpriteBatch {
-    sprites: Vec<Sprite>,
-    runs: Vec<Run>,
-    capacity: u32,
-    dropped: u32,
+    quads: QuadBatch,
 }
 
 impl SpriteBatch {
     /// An empty batch holding up to `capacity` sprites (at most
-    /// `u32::MAX`).
+    /// `u32::MAX`) in as many runs, with no reserve: a run starts at a
+    /// sprite, so the runs never run out before the sprites.
     #[must_use]
     pub fn with_capacity(capacity: usize) -> Self {
-        let capacity = u32::try_from(capacity).unwrap_or(u32::MAX);
-        let n = usize::try_from(capacity).unwrap_or(usize::MAX);
+        let n = u32::try_from(capacity).unwrap_or(u32::MAX);
+        Self::with_reserve(n, n, 0, 0)
+    }
+
+    /// An empty batch holding up to `sprites` sprites in up to `runs` runs
+    /// for the skin, and `reserved_sprites` more in `reserved_runs` more
+    /// runs after them ([`QuadBatch::with_reserve`]).
+    #[must_use]
+    pub fn with_reserve(
+        sprites: u32,
+        runs: u32,
+        reserved_sprites: u32,
+        reserved_runs: u32,
+    ) -> Self {
         Self {
-            sprites: Vec::with_capacity(n),
-            runs: Vec::with_capacity(n),
-            capacity,
-            dropped: 0,
+            quads: QuadBatch::with_reserve(sprites, runs, reserved_sprites, reserved_runs),
         }
     }
 
-    /// Empties the batch and its drop count for the next frame.
+    /// Empties the batch and its drop count for the next frame, and closes
+    /// the reserve.
     pub fn clear(&mut self) {
-        self.sprites.clear();
-        self.runs.clear();
-        self.dropped = 0;
+        self.quads.clear();
     }
 
-    /// The number of sprites held: the end of the last run.
-    fn held(&self) -> u32 {
-        self.runs.last().map_or(0, |r| r.end)
+    /// Opens the reserve for the rest of the frame, after the skin's
+    /// build.
+    pub(crate) fn open_reserve(&mut self) {
+        self.quads.open_reserve();
     }
 
     /// Adds `sprite` unclipped: [`push_clipped`](Self::push_clipped) with
@@ -170,60 +140,64 @@ impl SpriteBatch {
 
     /// Adds `sprite` after every sprite already held, extending the last
     /// run when its blend is `blend` and its clip `clip`; or counts it as
-    /// dropped and returns `false` when the batch is full.
+    /// dropped and returns `false` when the batch is full, or when it needs
+    /// a new run and the runs are full.
     pub fn push_clipped(&mut self, blend: Blend, clip: Option<ClipId>, sprite: Sprite) -> bool {
-        let held = self.held();
-        if held >= self.capacity {
-            self.dropped = self.dropped.saturating_add(1);
-            return false;
-        }
-        match self.runs.last_mut() {
-            Some(run) if run.blend == blend && run.clip == clip => run.end = held + 1,
-            _ => self.runs.push(Run {
-                blend,
-                clip,
-                start: held,
-                end: held + 1,
-            }),
-        }
-        self.sprites.push(sprite);
-        true
+        self.quads.push(RunKey { blend, clip }, sprite)
+    }
+
+    /// The batch as the runtime model's, for a skin of that model to build
+    /// its quads into directly.
+    pub fn quads_mut(&mut self) -> &mut QuadBatch {
+        &mut self.quads
     }
 
     /// Whether another push would be dropped.
     #[must_use]
     pub fn is_full(&self) -> bool {
-        self.held() >= self.capacity
+        self.quads.is_full()
     }
 
     /// Sprites held.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.sprites.len()
+        self.quads.quads().len()
     }
 
     /// Whether the batch holds no sprite.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.sprites.is_empty()
+        self.quads.quads().is_empty()
     }
 
-    /// The most sprites the batch holds.
+    /// The most sprites the skin pushes, the reserve left out.
     #[must_use]
     pub fn capacity(&self) -> usize {
-        usize::try_from(self.capacity).unwrap_or(usize::MAX)
+        usize::try_from(self.quads.capacity().0).unwrap_or(usize::MAX)
+    }
+
+    /// The most runs the skin's sprites take, the reserve left out.
+    #[must_use]
+    pub fn run_capacity(&self) -> usize {
+        usize::try_from(self.quads.capacity().1).unwrap_or(usize::MAX)
+    }
+
+    /// The most sprites the batch holds, the reserve included.
+    #[must_use]
+    pub fn total_capacity(&self) -> usize {
+        usize::try_from(self.quads.total_capacity().0).unwrap_or(usize::MAX)
     }
 
     /// Converts the batch into `out` in drawing order ([`Instance::of`]
     /// with `font_scale`), after clearing it: the per-frame instance
     /// staging for the GPU buffer. It never allocates: it stages at most
     /// `out`'s capacity, and the renderer's staging has room for the
-    /// batch's [`capacity`](Self::capacity).
+    /// batch's [`total_capacity`](Self::total_capacity).
     pub fn stage(&self, out: &mut Vec<Instance>, font_scale: f32) {
         out.clear();
         let room = out.capacity();
         out.extend(
-            self.sprites
+            self.sprites()
                 .iter()
                 .take(room)
                 .map(|s| Instance::of(s, font_scale)),
@@ -234,32 +208,33 @@ impl SpriteBatch {
     /// indicator: a skin may stop at its first refused push, so this is a
     /// lower bound on what the frame left out, never a count of it.
     #[must_use]
-    pub const fn dropped(&self) -> u32 {
-        self.dropped
+    pub fn dropped(&self) -> u32 {
+        self.quads.dropped()
     }
 
     /// The sprites, in drawing order.
     #[must_use]
     pub fn sprites(&self) -> &[Sprite] {
-        &self.sprites
+        self.quads.quads()
     }
 
     /// The runs, in drawing order: they cover the sprites contiguously,
     /// and neighbouring runs differ in blend or clip.
     #[must_use]
     pub fn runs(&self) -> &[Run] {
-        &self.runs
+        self.quads.runs()
     }
 
     /// The sprites blended with `blend`, in drawing order.
     pub fn blended(&self, blend: Blend) -> impl Iterator<Item = &Sprite> {
-        self.runs
+        let sprites = self.sprites();
+        self.runs()
             .iter()
-            .filter(move |r| r.blend == blend)
-            .flat_map(|r| {
+            .filter(move |r| r.key.blend == blend)
+            .flat_map(move |r| {
                 let range = usize::try_from(r.start).unwrap_or(usize::MAX)
                     ..usize::try_from(r.end).unwrap_or(usize::MAX);
-                self.sprites.get(range).unwrap_or_default()
+                sprites.get(range).unwrap_or_default()
             })
     }
 }
@@ -279,8 +254,11 @@ mod tests {
 
     fn run(blend: Blend, clip: Option<u16>, start: u32, end: u32) -> Run {
         Run {
-            blend,
-            clip: clip.map(ClipId),
+            key: RunKey {
+                blend,
+                clip: clip.map(ClipId),
+            },
+            clip_rect: None,
             start,
             end,
         }
@@ -290,11 +268,11 @@ mod tests {
     fn push_beyond_capacity_is_dropped_and_counted() {
         let mut batch = SpriteBatch::with_capacity(3);
         assert!(batch.push(Blend::Alpha, sprite(1.0)));
-        assert!(batch.push(Blend::Additive, sprite(5.0)));
+        assert!(batch.push(Blend::Add, sprite(5.0)));
         assert!(!batch.is_full());
         assert!(batch.push(Blend::Alpha, sprite(7.0)));
         assert!(batch.is_full());
-        assert!(!batch.push(Blend::Additive, sprite(9.0)));
+        assert!(!batch.push(Blend::Add, sprite(9.0)));
         assert!(!batch.push_clipped(Blend::Alpha, Some(ClipId(0)), sprite(11.0)));
         assert_eq!(batch.len(), 3);
         assert_eq!(batch.dropped(), 2);
@@ -302,7 +280,7 @@ mod tests {
         assert!(batch.is_empty());
         assert!(batch.runs().is_empty());
         assert_eq!(batch.dropped(), 0);
-        assert!(batch.push(Blend::Additive, sprite(13.0)));
+        assert!(batch.push(Blend::Add, sprite(13.0)));
     }
 
     #[test]
@@ -312,13 +290,13 @@ mod tests {
         let mut batch = SpriteBatch::with_capacity(8);
         assert!(batch.push(Blend::Alpha, sprite(1.0)));
         assert!(batch.push(Blend::Alpha, sprite(2.0)));
-        assert!(batch.push(Blend::Additive, sprite(3.0)));
+        assert!(batch.push(Blend::Add, sprite(3.0)));
         assert!(batch.push(Blend::Alpha, sprite(4.0)));
         assert_eq!(
             batch.runs(),
             [
                 run(Blend::Alpha, None, 0, 2),
-                run(Blend::Additive, None, 2, 3),
+                run(Blend::Add, None, 2, 3),
                 run(Blend::Alpha, None, 3, 4),
             ]
         );
@@ -328,7 +306,7 @@ mod tests {
         assert_eq!(xs(&staged), [1.0, 2.0, 3.0, 4.0]);
         let alpha: Vec<_> = batch.blended(Blend::Alpha).map(|s| s.rect[0]).collect();
         assert_eq!(alpha, [1.0, 2.0, 4.0]);
-        let additive: Vec<_> = batch.blended(Blend::Additive).map(|s| s.rect[0]).collect();
+        let additive: Vec<_> = batch.blended(Blend::Add).map(|s| s.rect[0]).collect();
         assert_eq!(additive, [3.0]);
     }
 
@@ -343,16 +321,16 @@ mod tests {
         assert!(batch.push_clipped(Blend::Alpha, a, sprite(2.0)));
         assert!(batch.push_clipped(Blend::Alpha, b, sprite(3.0)));
         assert!(batch.push(Blend::Alpha, sprite(4.0)));
-        assert!(batch.push_clipped(Blend::Additive, None, sprite(5.0)));
-        assert!(batch.push_clipped(Blend::Additive, b, sprite(6.0)));
+        assert!(batch.push_clipped(Blend::Add, None, sprite(5.0)));
+        assert!(batch.push_clipped(Blend::Add, b, sprite(6.0)));
         assert_eq!(
             batch.runs(),
             [
                 run(Blend::Alpha, Some(0), 0, 2),
                 run(Blend::Alpha, Some(1), 2, 3),
                 run(Blend::Alpha, None, 3, 4),
-                run(Blend::Additive, None, 4, 5),
-                run(Blend::Additive, Some(1), 5, 6),
+                run(Blend::Add, None, 4, 5),
+                run(Blend::Add, Some(1), 5, 6),
             ]
         );
     }

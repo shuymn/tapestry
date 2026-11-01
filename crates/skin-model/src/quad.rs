@@ -97,16 +97,24 @@ pub struct Run {
 }
 
 /// The quads of one frame, in draw order, at most `quads` of them in at
-/// most `runs` runs.
+/// most `runs` runs, and after them, once the batch's owner opens it
+/// ([`open_reserve`](QuadBatch::open_reserve)), its reserve.
 ///
-/// Both lists are allocated once, at full capacity, so pushing never
-/// allocates. A push beyond either capacity is dropped and counted.
+/// Both lists are allocated once, at full capacity, the reserve included,
+/// so pushing never allocates. A push beyond either capacity in force is
+/// dropped and counted.
 #[derive(Debug)]
 pub struct QuadBatch {
     quads: Vec<Quad>,
     runs: Vec<Run>,
+    /// The capacities in force: `own`'s until the reserve opens, then
+    /// `all`'s.
     quad_cap: u32,
     run_cap: u32,
+    /// The capacities of the skin that fills the batch: quads, runs.
+    own: (u32, u32),
+    /// Those with the reserve: quads, runs.
+    all: (u32, u32),
     dropped: u32,
 }
 
@@ -117,26 +125,61 @@ fn reserve(n: u32) -> (usize, u32) {
 }
 
 impl QuadBatch {
-    /// An empty batch holding up to `quads` quads in up to `runs` runs.
+    /// An empty batch holding up to `quads` quads in up to `runs` runs,
+    /// with no reserve.
     #[must_use]
     pub fn with_capacity(quads: u32, runs: u32) -> Self {
-        let (quad_len, quad_cap) = reserve(quads);
-        let (run_len, run_cap) = reserve(runs);
+        Self::with_reserve(quads, runs, 0, 0)
+    }
+
+    /// An empty batch holding up to `quads` quads in up to `runs` runs for
+    /// the skin that fills it, and `reserved_quads` more quads in
+    /// `reserved_runs` more runs that only its owner fills, after the
+    /// skin, once it opens them ([`open_reserve`](Self::open_reserve)).
+    /// Totals past `u32::MAX` are cut to it.
+    #[must_use]
+    pub fn with_reserve(quads: u32, runs: u32, reserved_quads: u32, reserved_runs: u32) -> Self {
+        let (quad_len, quad_all) = reserve(quads.saturating_add(reserved_quads));
+        let (run_len, run_all) = reserve(runs.saturating_add(reserved_runs));
+        let own = (quads.min(quad_all), runs.min(run_all));
         Self {
             quads: Vec::with_capacity(quad_len),
             runs: Vec::with_capacity(run_len),
-            quad_cap,
-            run_cap,
+            quad_cap: own.0,
+            run_cap: own.1,
+            own,
+            all: (quad_all, run_all),
             dropped: 0,
         }
     }
 
     /// Empties the batch and its drop count for the next frame, keeping its
-    /// capacity.
+    /// capacity, and closes the reserve again.
     pub fn clear(&mut self) {
         self.quads.clear();
         self.runs.clear();
+        (self.quad_cap, self.run_cap) = self.own;
         self.dropped = 0;
+    }
+
+    /// Opens the reserve until the next [`clear`](Self::clear): later
+    /// pushes may fill it, after whatever the skin pushed, however full
+    /// the skin left its own capacities. The batch's owner calls it once
+    /// the skin's build is over.
+    pub fn open_reserve(&mut self) {
+        (self.quad_cap, self.run_cap) = self.all;
+    }
+
+    /// The skin's capacities, without the reserve: quads, runs.
+    #[must_use]
+    pub const fn capacity(&self) -> (u32, u32) {
+        self.own
+    }
+
+    /// The capacities with the reserve: quads, runs.
+    #[must_use]
+    pub const fn total_capacity(&self) -> (u32, u32) {
+        self.all
     }
 
     /// The number of quads held: the end of the last run.

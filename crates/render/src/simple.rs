@@ -18,6 +18,7 @@ use bms_model::{Chart, LANE_COUNT, Lane, Note, NoteKind, Position, ScrollMap, Ti
 use eval::{JudgeEvent, JudgeEventKind, Section};
 use game::ResultGraphs;
 use rules::{GaugeValue, Judgment, LnMode};
+use skin_model::BuildError;
 
 use crate::atlas::{GLYPH_H, GLYPH_W, glyph_uv, solid_uv};
 use crate::{Blend, FrameInput, Gpu, PlaySkin, SkinError, Sprite, SpriteBatch};
@@ -134,7 +135,7 @@ const LN_BODY_ACTIVE: f32 = 0.6;
 const LN_BODY_INACTIVE: f32 = 0.3;
 const GAUGE_BG: Rgba = [0.12, 0.12, 0.12, 1.0];
 const GAUGE_FILL: Rgba = [0.2, 0.85, 0.3, 1.0];
-const TEXT: Rgba = [0.9, 0.9, 0.9, 1.0];
+pub(crate) const TEXT: Rgba = [0.9, 0.9, 0.9, 1.0];
 const COUNTDOWN: Rgba = [1.0, 0.9, 0.4, 1.0];
 const BEAM: Rgba = [0.25, 0.3, 0.55, 0.8];
 const BOMB: Rgba = [1.0, 0.6, 0.15, 1.0];
@@ -484,7 +485,7 @@ impl SimpleSkin {
             #[expect(clippy::indexing_slicing, reason = "`Lane::index` is below LANE_COUNT")]
             if let Some(f) = self.pressed[lane.index()].and_then(|t| fade(at, t, BEAM_US)) {
                 let c = [BEAM[0], BEAM[1], BEAM[2], BEAM[3] * f];
-                rect(out, Blend::Additive, x, LANE_TOP, w, JUDGE_Y - LANE_TOP, c);
+                rect(out, Blend::Add, x, LANE_TOP, w, JUDGE_Y - LANE_TOP, c);
             }
             #[expect(clippy::indexing_slicing, reason = "`Lane::index` is below LANE_COUNT")]
             if let Some(f) = self.hit[lane.index()].and_then(|t| fade(at, t, BOMB_US)) {
@@ -493,7 +494,7 @@ impl SimpleSkin {
                 let c = [BOMB[0], BOMB[1], BOMB[2], f];
                 rect(
                     out,
-                    Blend::Additive,
+                    Blend::Add,
                     cx - side / 2.0,
                     JUDGE_Y - side / 2.0,
                     side,
@@ -586,7 +587,8 @@ impl PlaySkin for SimpleSkin {
         rect(out, Blend::Alpha, LANE_LEFT, GAUGE_Y, w, GAUGE_H, GAUGE_BG);
     }
 
-    fn build(&mut self, f: &FrameInput<'_>, out: &mut SpriteBatch) {
+    /// Never refuses a frame.
+    fn build(&mut self, f: &FrameInput<'_>, out: &mut SpriteBatch) -> Result<(), BuildError> {
         for ev in f.effects {
             self.apply(ev);
         }
@@ -604,24 +606,7 @@ impl PlaySkin for SimpleSkin {
         // notes only.
         self.hud(f, out, f.now);
         self.effects(out, f.now);
-        overlay(f.overlay, out);
-    }
-}
-
-/// Left edge and top of the measurement overlay's first line, its glyph
-/// scale and the distance between its lines, in layout pixels: right of
-/// the lanes, glyphs 15×21, up to 50 characters a line.
-const OVERLAY_LEFT: f32 = 1000.0;
-const OVERLAY_TOP: f32 = 80.0;
-const OVERLAY_SCALE: f32 = 3.0;
-const OVERLAY_LINE: f32 = 28.0;
-
-/// The measurement overlay (design.md "Latency Figures"): lines of text right
-/// of the lanes.
-fn overlay(lines: &[&str], out: &mut SpriteBatch) {
-    for (i, line) in lines.iter().enumerate() {
-        let y = OVERLAY_TOP + i as f32 * OVERLAY_LINE;
-        text(out, OVERLAY_LEFT, y, OVERLAY_SCALE, TEXT, line.as_bytes());
+        Ok(())
     }
 }
 
@@ -664,7 +649,7 @@ fn text_width(chars: usize, scale: f32) -> f32 {
     chars as f32 * (GLYPH_W + 1) as f32 * scale
 }
 
-fn text(out: &mut SpriteBatch, x: f32, y: f32, scale: f32, color: Rgba, s: &[u8]) {
+pub(crate) fn text(out: &mut SpriteBatch, x: f32, y: f32, scale: f32, color: Rgba, s: &[u8]) {
     let advance = (GLYPH_W + 1) as f32 * scale;
     for (i, &c) in s.iter().enumerate() {
         if c == b' ' {
@@ -1075,7 +1060,7 @@ mod tests {
 
     fn build(skin: &mut SimpleSkin, f: &FrameInput<'_>) -> SpriteBatch {
         let mut batch = SpriteBatch::with_capacity(4096);
-        skin.build(f, &mut batch);
+        skin.build(f, &mut batch).unwrap();
         batch
     }
 
@@ -1287,7 +1272,7 @@ mod tests {
         let mut s = skin(&chart);
         let bombs = |batch: &SpriteBatch| {
             batch
-                .blended(Blend::Additive)
+                .blended(Blend::Add)
                 .filter(|s| s.color[..3] == BOMB[..3])
                 .count()
         };
@@ -1553,7 +1538,7 @@ mod tests {
         let v = view();
         let f = frame(&v, 1_000 * MS, &[]);
         let mut batch = SpriteBatch::with_capacity(4_000);
-        s.build(&f, &mut batch);
+        s.build(&f, &mut batch).unwrap();
         assert!(batch.is_full());
         assert!(batch.dropped() >= 1);
         let lane1 = in_lane(&batch, lane(1), NOTE_WHITE);
@@ -1561,7 +1546,7 @@ mod tests {
         let gap = lane1[0][1] - lane1[1][1];
         assert!((gap - 800.0 / 6_000.0).abs() < 1e-3, "gap {gap}");
         let mut roomy = SpriteBatch::with_capacity(8_192);
-        s.build(&f, &mut roomy);
+        s.build(&f, &mut roomy).unwrap();
         assert_eq!(roomy.dropped(), 0);
         assert_eq!(in_lane(&roomy, lane(7), NOTE_WHITE).len(), 3_000);
     }
@@ -1854,13 +1839,13 @@ mod tests {
         let batch = build(&mut s, &f);
         let (x, _) = layout::lane_x(lane(6));
         let beam: Vec<f32> = batch
-            .blended(Blend::Additive)
+            .blended(Blend::Add)
             .filter(|s| s.rect[0] == x && s.color[..3] == BEAM[..3])
             .map(|s| s.color[3])
             .collect();
         assert_eq!(beam, [BEAM[3]]);
         let bombs: Vec<f32> = batch
-            .blended(Blend::Additive)
+            .blended(Blend::Add)
             .filter(|s| s.color[..3] == BOMB[..3])
             .map(|s| s.rect[2])
             .collect();
@@ -1951,19 +1936,24 @@ mod tests {
         assert_eq!(ys[24], 1040.0);
     }
 
+    /// The overlay is the staging's, drawn after the skin's sprites: the
+    /// skin's own build leaves it out.
     #[test]
     fn overlay_lines_draw_right_of_the_lanes() {
         let chart = ChartBuilder::new(120_000).build().unwrap();
         let mut s = skin(&chart);
         let v = view();
-        let plain = build(&mut s, &frame(&v, 0, &[]));
+        let mut staging = crate::Staging::new(4096, &s.canvas([1920, 1080]));
+        staging.build(&mut s, &frame(&v, 0, &[])).unwrap();
+        let plain = staging.batch().len();
         let lines = ["P5", "9"];
         let f = FrameInput {
             overlay: &lines,
             ..frame(&v, 0, &[])
         };
-        let batch = build(&mut s, &f);
-        let added: Vec<_> = batch.sprites()[plain.len()..]
+        assert_eq!(build(&mut s, &f).len(), plain);
+        staging.build(&mut s, &f).unwrap();
+        let added: Vec<_> = staging.batch().sprites()[plain..]
             .iter()
             .map(|s| (s.rect, s.uv))
             .collect();
@@ -1976,6 +1966,92 @@ mod tests {
                 ([1000.0, 108.0, 15.0, 21.0], glyph_uv(b'9')),
             ]
         );
+    }
+
+    /// A skin that pushes `pushes` sprites of alternating blends, so each
+    /// takes a run of its own, then refuses the frame with `refuse`.
+    struct Pushes {
+        pushes: u16,
+        refuse: Option<BuildError>,
+    }
+
+    impl PlaySkin for Pushes {
+        fn prepare(&mut self, _: &Gpu, _: &Chart, _: Option<&Section>) -> Result<(), SkinError> {
+            Ok(())
+        }
+
+        fn build(&mut self, _: &FrameInput<'_>, out: &mut SpriteBatch) -> Result<(), BuildError> {
+            for i in 0..self.pushes {
+                let blend = if i % 2 == 0 { Blend::Alpha } else { Blend::Add };
+                let sprite = Sprite {
+                    rect: [f32::from(i), 0.0, 1.0, 1.0],
+                    ..Sprite::default()
+                };
+                out.push(blend, sprite);
+            }
+            self.refuse.map_or(Ok(()), Err)
+        }
+    }
+
+    /// A skin that fills both its sprites and its runs, the last one
+    /// additive, leaves the overlay whole: its glyphs follow from the
+    /// reserve, in a run of their own, and only the skin's own pushes past
+    /// its capacity are dropped.
+    #[test]
+    fn the_overlay_follows_a_skin_that_fills_its_sprites_and_runs() {
+        let mut skin = Pushes {
+            pushes: 6,
+            refuse: None,
+        };
+        let mut staging = crate::Staging::new(4, &skin.canvas([1920, 1080]));
+        assert_eq!((staging.capacity(), staging.run_capacity()), (4, 4));
+        let v = view();
+        let lines = ["AB"];
+        let f = FrameInput {
+            overlay: &lines,
+            ..frame(&v, 0, &[])
+        };
+        staging.build(&mut skin, &f).unwrap();
+        let batch = staging.batch();
+        let xs: Vec<f32> = batch.sprites()[..4].iter().map(|s| s.rect[0]).collect();
+        assert_eq!(xs, [0.0, 1.0, 2.0, 3.0]);
+        let glyphs: Vec<_> = batch.sprites()[4..].iter().map(|s| s.uv).collect();
+        assert_eq!(glyphs, [glyph_uv(b'A'), glyph_uv(b'B')]);
+        assert_eq!(batch.runs().len(), 5);
+        let last = batch.runs()[4];
+        assert_eq!(
+            (last.key.blend, last.key.clip, last.start, last.end),
+            (Blend::Alpha, None, 4, 6)
+        );
+        assert_eq!(batch.dropped(), 2);
+        assert_eq!(staging.instances().len(), 6);
+    }
+
+    /// A refused frame leaves nothing staged: neither the frame before it
+    /// nor the sprites it pushed before refusing, nor the overlay.
+    #[test]
+    fn a_refused_frame_leaves_nothing_staged() {
+        let mut skin = Pushes {
+            pushes: 3,
+            refuse: None,
+        };
+        let mut staging = crate::Staging::new(8, &skin.canvas([1920, 1080]));
+        let v = view();
+        let lines = ["AB"];
+        let f = FrameInput {
+            overlay: &lines,
+            ..frame(&v, 0, &[])
+        };
+        staging.build(&mut skin, &f).unwrap();
+        assert_eq!(staging.instances().len(), 5);
+        skin.refuse = Some(BuildError::InconsistentTally);
+        assert_eq!(
+            staging.build(&mut skin, &f),
+            Err(BuildError::InconsistentTally)
+        );
+        assert!(staging.instances().is_empty());
+        assert!(staging.batch().is_empty());
+        assert!(staging.batch().runs().is_empty());
     }
 
     #[test]

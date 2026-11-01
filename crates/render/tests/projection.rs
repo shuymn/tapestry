@@ -1,6 +1,8 @@
 //! A skin's atlas array, canvas and clips drawn on WARP and read back, and
 //! one renderer resized across aspects, minimized and restored with its
-//! play state kept.
+//! play state kept; a skin's refused frame submitting nothing and the
+//! next attempt drawing with the resources kept; and the measurement
+//! overlay drawn over a skin that fills its batch.
 //!
 //! An adapted canvas (`Fit::Adapt`) on 1920×1080, 1920×1200 or 2560×1080
 //! is the target's own size at scale 1, and the fixed canvas on 1920×1080
@@ -10,6 +12,8 @@
 mod common;
 
 use std::f32::consts::FRAC_PI_2;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use bms_model::{Chart, ChartBuilder, TimeUs};
 use common::{MS, input, lane, note_center_in, offscreen, view, warp, white_rows_in};
@@ -19,7 +23,7 @@ use render::{
     Renderer, SkinError, Sprite, SpriteBatch, UploadError, solid_uv,
 };
 use rules::Judgment;
-use skin_model::{Canvas, ClipId, Filter, Fit};
+use skin_model::{BuildError, Canvas, ClipId, Filter, Fit};
 
 type Placed = (Blend, Option<ClipId>, Sprite);
 
@@ -45,10 +49,11 @@ impl PlaySkin for Scene {
         Ok(())
     }
 
-    fn build(&mut self, f: &FrameInput<'_>, out: &mut SpriteBatch) {
+    fn build(&mut self, f: &FrameInput<'_>, out: &mut SpriteBatch) -> Result<(), BuildError> {
         for (blend, clip, sprite) in (self.layout)(self.canvas(f.target).size()) {
             out.push_clipped(blend, clip, sprite);
         }
+        Ok(())
     }
 
     fn capacity(&self) -> u32 {
@@ -271,7 +276,7 @@ fn clips_layout(_: [f32; 2]) -> Vec<Placed> {
         (Blend::Alpha, c2, band(400.0, [0.0, 0.0, 1.0, 1.0])),
         (Blend::Alpha, None, band(500.0, [1.0, 1.0, 0.0, 1.0])),
         (Blend::Alpha, c1, band(600.0, [0.2, 0.2, 0.2, 1.0])),
-        (Blend::Additive, c1, band(600.0, [1.0, 0.0, 0.0, 0.6])),
+        (Blend::Add, c1, band(600.0, [1.0, 0.0, 0.0, 0.6])),
     ]
 }
 
@@ -523,4 +528,160 @@ fn one_renderer_resized_minimized_and_restored() {
     assert!(!timing.presented);
     shown(&mut r, (1_920, 1_200), (544, 672, 673.33));
     shown(&mut r, (1_280, 1_024), (362, 448, 560.89));
+}
+
+/// What [`Refusing`] saw: its preparations, and the preparation each of
+/// its build calls came in.
+#[derive(Debug, Default)]
+struct Calls {
+    epoch: u32,
+    builds: Vec<u32>,
+}
+
+/// A skin drawing page 1 over the whole fixed canvas under clip 0, or,
+/// while `refuse` is set, a white sprite over the whole canvas, unclipped,
+/// then refusing the frame; it records every preparation and build call.
+struct Refusing {
+    calls: Arc<Mutex<Calls>>,
+    refuse: Arc<AtomicBool>,
+}
+
+impl PlaySkin for Refusing {
+    fn prepare(&mut self, _: &Gpu, _: &Chart, _: Option<&Section>) -> Result<(), SkinError> {
+        self.calls.lock().unwrap().epoch += 1;
+        Ok(())
+    }
+
+    fn build(&mut self, _: &FrameInput<'_>, out: &mut SpriteBatch) -> Result<(), BuildError> {
+        let mut calls = self.calls.lock().unwrap();
+        let epoch = calls.epoch;
+        calls.builds.push(epoch);
+        let whole = [0.0, 0.0, 1_920.0, 1_080.0];
+        if self.refuse.load(Ordering::Relaxed) {
+            out.push(Blend::Alpha, solid(whole, [1.0; 4]));
+            return Err(BuildError::InconsistentTally);
+        }
+        out.push_clipped(
+            Blend::Alpha,
+            Some(ClipId(0)),
+            paged(1, Filter::Linear, whole, WHOLE),
+        );
+        Ok(())
+    }
+}
+
+/// A refused frame is staged and then never submitted: the frame drawn
+/// before it stays on the target, the white sprite pushed before the
+/// refusal never reaching it, nor a frame built before the refusal and not
+/// yet submitted (submitted, its staging emptied by the refusal, it would
+/// present black over the red). Every later frame opportunity calls the
+/// skin no more and submits nothing, even once the skin would build
+/// again; only the next preparation builds again, drawing page 1 with the
+/// atlas and clip kept through the refusal.
+///
+/// Page 1 is magnified, so level 0, red, under clip 0, the left half: red
+/// at (480, 540) and black at (1440, 540). A refused frame submitted
+/// would show white at (1440, 540); built again in the refused
+/// preparation, a build call of epoch 1 would follow the refusal; with
+/// the atlas or the clip dropped, the next attempt would not draw red on
+/// the left half only.
+#[test]
+fn a_refused_frame_submits_nothing_until_the_next_preparation() {
+    let chart = ChartBuilder::new(120_000).build().unwrap();
+    let mut r = offscreen(1_920, 1_080);
+    install(&mut r, vec![[0.0, 0.0, 960.0, 1_080.0]]);
+    let calls = Arc::new(Mutex::new(Calls::default()));
+    let refuse = Arc::new(AtomicBool::new(false));
+    r.set_skin(Box::new(Refusing {
+        calls: Arc::clone(&calls),
+        refuse: Arc::clone(&refuse),
+    }))
+    .unwrap();
+    r.load(&chart, None).unwrap();
+    let page_1 = |r: &Renderer, p: &[u8]| {
+        near(px(r, p, 480.0, 540.0), RED, 2);
+        near(px(r, p, 1_440.0, 540.0), BLACK, 2);
+    };
+    let drawn = |r: &mut Renderer| {
+        let p = frame(r);
+        page_1(r, &p);
+    };
+    drawn(&mut r);
+    assert_eq!(calls.lock().unwrap().builds, [1]);
+
+    // A frame built and not submitted, then a refused one: the refusal
+    // drops the pending frame too.
+    let v = view(0, 0);
+    let f = input(&v, TimeUs(0), TimeUs(0), &[]);
+    assert_eq!(r.build(&f), Ok(()));
+    refuse.store(true, Ordering::Relaxed);
+    assert_eq!(r.build(&f), Err(BuildError::InconsistentTally));
+    assert_eq!(r.refused(), Some(BuildError::InconsistentTally));
+    let not_submitted = |r: &mut Renderer| {
+        let timing = r.submit().unwrap();
+        assert!(!timing.presented);
+        assert_eq!((timing.sprites, timing.dropped), (0, 0));
+        let p = r.read_back();
+        page_1(r, &p);
+    };
+    not_submitted(&mut r);
+    assert_eq!(calls.lock().unwrap().builds, [1, 1, 1]);
+    for _ in 0..3 {
+        assert_eq!(r.build(&f), Err(BuildError::InconsistentTally));
+        not_submitted(&mut r);
+    }
+    refuse.store(false, Ordering::Relaxed);
+    assert_eq!(r.build(&f), Err(BuildError::InconsistentTally));
+    not_submitted(&mut r);
+    assert!(matches!(
+        r.frame(&f),
+        Err(RenderError::Build(BuildError::InconsistentTally))
+    ));
+    assert_eq!(calls.lock().unwrap().builds, [1, 1, 1]);
+
+    r.load(&chart, None).unwrap();
+    assert_eq!(r.refused(), None);
+    assert_eq!(r.atlas_size(), (256, 3));
+    drawn(&mut r);
+    assert_eq!(calls.lock().unwrap().builds, [1, 1, 1, 2]);
+}
+
+/// Sprites of alternating blends, each in a run of its own, past the
+/// batch's 8,192 sprites and runs, all off the canvas.
+fn filling_layout(_: [f32; 2]) -> Vec<Placed> {
+    let away = solid([-20.0, -20.0, 10.0, 10.0], [1.0; 4]);
+    (0..MAX_SPRITES + 8)
+        .map(|i| {
+            let blend = if i % 2 == 0 { Blend::Alpha } else { Blend::Add };
+            (blend, None, away)
+        })
+        .collect()
+}
+
+/// A skin filling its 8,192 sprites and as many runs still has the
+/// measurement overlay drawn over it: the overlay's "8" from the reserve,
+/// at canvas (1000, 80), glyphs 15×21, its pixels note white. Drawn by the
+/// skin, or from the skin's capacity, it would be dropped with the 8
+/// sprites past it, and the box would stay black.
+#[test]
+fn the_overlay_is_drawn_over_a_skin_that_fills_its_batch() {
+    let mut r = offscreen(1_920, 1_080);
+    r.set_skin(Box::new(Scene::new(Fit::Fixed, filling_layout)))
+        .unwrap();
+    let v = view(0, 0);
+    let lines = ["8"];
+    let f = FrameInput {
+        overlay: &lines,
+        ..input(&v, TimeUs(0), TimeUs(0), &[])
+    };
+    let timing = r.frame(&f).unwrap();
+    assert!(timing.presented);
+    assert_eq!(timing.sprites, MAX_SPRITES + 1);
+    assert_eq!(timing.dropped, 8);
+    let p = r.read_back();
+    let lit = (1_000..1_015)
+        .flat_map(|x| (80..101).map(move |y| (x, y)))
+        .filter(|&(x, y)| px(&r, &p, x as f32, y as f32).iter().all(|&c| c > 200))
+        .count();
+    assert!(lit > 0, "the overlay's glyph is not drawn");
 }

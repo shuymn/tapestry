@@ -5,13 +5,14 @@
 //! A thread also counts what it allocates inside its app region apart, which
 //! the render thread marks around its own per-frame work (design.md "Scope of
 //! No Allocation"). The allocator itself never allocates: the tag, the region
-//! flag and its count are const-initialized thread-locals and the counters are
+//! depth and its count are const-initialized thread-locals and the counters are
 //! atomics.
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
+use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The threads counted apart; untagged threads count together, unshown.
@@ -34,8 +35,9 @@ static COUNTS: [AtomicU64; 5] = [ZERO; 5];
 
 thread_local! {
     static TAG: Cell<u8> = const { Cell::new(0) };
-    /// Whether this thread is inside its app region.
-    static IN_APP: Cell<bool> = const { Cell::new(false) };
+    /// How many of this thread's app region guards are alive: it is inside
+    /// the region while any is.
+    static IN_APP: Cell<u32> = const { Cell::new(0) };
     /// This thread's allocations inside its app region.
     static APP: Cell<u64> = const { Cell::new(0) };
     /// This thread's allocations, for the allocation tests.
@@ -54,9 +56,27 @@ pub fn counts() -> [u64; 4] {
     [input, logic, audio, render].map(|c| c.load(Ordering::Relaxed))
 }
 
-/// Enters (`true`) or leaves this thread's app region.
-pub fn app_region(on: bool) {
-    IN_APP.set(on);
+/// This thread's app region, entered when made and left when dropped: on
+/// every way out of the code it spans, an early return with an error or an
+/// unwind included, so nothing after it, such as the error's report, is
+/// counted as the region's. Guards nest, the region lasting while any of
+/// them lives; a guard stays on the thread that made it, whose region it
+/// marks.
+#[must_use = "the app region is left when this is dropped"]
+pub struct AppRegion(PhantomData<*const ()>);
+
+impl AppRegion {
+    /// Enters this thread's app region.
+    pub fn enter() -> Self {
+        IN_APP.set(IN_APP.get().saturating_add(1));
+        Self(PhantomData)
+    }
+}
+
+impl Drop for AppRegion {
+    fn drop(&mut self) {
+        IN_APP.set(IN_APP.get().saturating_sub(1));
+    }
 }
 
 /// This thread's allocations inside its app region so far.
@@ -73,7 +93,7 @@ pub fn this_thread() -> u64 {
 fn note() {
     #[cfg(test)]
     let _ = MINE.try_with(|m| m.set(m.get() + 1));
-    if IN_APP.try_with(Cell::get).unwrap_or(false) {
+    if IN_APP.try_with(Cell::get).unwrap_or(0) > 0 {
         let _ = APP.try_with(|a| a.set(a.get() + 1));
     }
     let t = TAG.try_with(Cell::get).unwrap_or(0);
@@ -120,7 +140,7 @@ static GLOBAL: Counting = Counting;
 mod tests {
     use std::hint::black_box;
 
-    use super::{Tag, app_allocations, app_region, counts, tag};
+    use super::{AppRegion, Tag, app_allocations, counts, tag};
 
     /// A tagged thread's allocation counts against its tag only.
     #[test]
@@ -145,12 +165,80 @@ mod tests {
             let before = app_allocations();
             black_box(Vec::<u8>::with_capacity(64));
             let outside = app_allocations() - before;
-            app_region(true);
+            let region = AppRegion::enter();
             black_box(Vec::<u8>::with_capacity(64));
-            app_region(false);
+            drop(region);
             black_box(Vec::<u8>::with_capacity(64));
             (outside, app_allocations() - before)
         });
         assert_eq!(h.join().unwrap(), (0, 1));
+    }
+
+    /// Work in the region that leaves it early with an error: the region
+    /// ends on that way out, so the error's report made after it, which
+    /// allocates, is not the region's.
+    #[test]
+    fn the_app_region_ends_on_an_early_error() {
+        fn work(fail: bool) -> Result<(), &'static str> {
+            let _region = AppRegion::enter();
+            black_box(Vec::<u8>::with_capacity(64));
+            if fail {
+                return Err("refused");
+            }
+            Ok(())
+        }
+        let h = std::thread::spawn(|| {
+            let before = app_allocations();
+            let e = work(true).unwrap_err();
+            let report = black_box(format!("render: {e}"));
+            assert!(!report.is_empty());
+            work(false).unwrap();
+            app_allocations() - before
+        });
+        assert_eq!(h.join().unwrap(), 2);
+    }
+
+    /// A guard stays on its thread: were it `Send`, both impls below would
+    /// apply and the item's path would be ambiguous, which fails to compile.
+    const _: fn() = || {
+        trait AmbiguousIfSend<A> {
+            fn item() {}
+        }
+        impl<T: ?Sized> AmbiguousIfSend<()> for T {}
+        impl<T: ?Sized + Send> AmbiguousIfSend<u8> for T {}
+        let _ = <AppRegion as AmbiguousIfSend<_>>::item;
+    };
+
+    /// A region inside another: leaving the inner one keeps the outer one,
+    /// and the thread is outside the region once both are left.
+    #[test]
+    fn a_nested_region_keeps_the_outer_one() {
+        let h = std::thread::spawn(|| {
+            let before = app_allocations();
+            let outer = AppRegion::enter();
+            drop(AppRegion::enter());
+            black_box(Vec::<u8>::with_capacity(64));
+            drop(outer);
+            black_box(Vec::<u8>::with_capacity(64));
+            app_allocations() - before
+        });
+        assert_eq!(h.join().unwrap(), 1);
+    }
+
+    /// Work in the region that unwinds: the region ends on that way out, so
+    /// what the thread allocates after catching it is not the region's.
+    #[test]
+    fn the_app_region_ends_on_an_unwind() {
+        let h = std::thread::spawn(|| {
+            let caught = std::panic::catch_unwind(|| {
+                let _region = AppRegion::enter();
+                std::panic::resume_unwind(Box::new(()));
+            });
+            assert!(caught.is_err());
+            let before = app_allocations();
+            black_box(Vec::<u8>::with_capacity(64));
+            app_allocations() - before
+        });
+        assert_eq!(h.join().unwrap(), 0);
     }
 }
