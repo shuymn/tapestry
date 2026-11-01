@@ -270,6 +270,9 @@ fn skin_json_seeds_resolve_or_fail_as_built() {
             "missing",
             "configured_fails",
             "bar_group_limit",
+            "note_parts_null",
+            "note_parts_unsized",
+            "note_parts_broken",
             "images",
             "numbers",
             "text",
@@ -288,6 +291,7 @@ fn skin_json_seeds_resolve_or_fail_as_built() {
             "rates",
             "readouts",
             "selectors",
+            "note_fallbacks",
         ],
     );
     let imports: Vec<&str> = seeds::skin_imports().iter().map(|(n, _)| *n).collect();
@@ -311,6 +315,29 @@ fn skin_json_seeds_resolve_or_fail_as_built() {
                 "{name}: {:?}",
                 imported.map(|i| i.report)
             );
+            continue;
+        }
+        if let Some(why) = note_part_refusal(name) {
+            // The header resolves; the lanes refuse before any part is
+            // admitted or generated, never with fallback paint.
+            let (_, imported) = skin_json(&data).unwrap_or_else(|e| panic!("{name}: {e}"));
+            match imported {
+                Err(ImportError::Critical {
+                    part: skin_beatoraja::CriticalPart::Lanes,
+                    why: got,
+                    ..
+                }) => match why {
+                    Some(want) => assert_eq!(got, want, "{name}"),
+                    None => assert!(
+                        !matches!(
+                            got,
+                            NoteKind::NotePart { .. } | NoteKind::NotePartFallback { .. }
+                        ),
+                        "{name}: {got:?}"
+                    ),
+                },
+                other => panic!("{name}: {:?}", other.map(|i| i.report)),
+            }
             continue;
         }
         let result = skin_json(&data).map(|(h, _)| h);
@@ -372,6 +399,19 @@ fn skin_json_seeds_resolve_or_fail_as_built() {
             ),
             _ => panic!("no expectation for seed {name}"),
         }
+    }
+}
+
+/// The refusal a malformed note part seed meets: its reason, or `None`
+/// for a broken image that refuses as any broken part does.
+fn note_part_refusal(name: &str) -> Option<Option<NoteKind>> {
+    use skin_beatoraja::PartWhy;
+    let part = |field, why| Some(Some(NoteKind::NotePart { field, why }));
+    match name {
+        "note_parts_null" => part("mine", PartWhy::NullEntry { index: 8 }),
+        "note_parts_unsized" => part("note", PartWhy::MissingSize { lane: 2 }),
+        "note_parts_broken" => Some(None),
+        _ => None,
     }
 }
 
@@ -646,6 +686,36 @@ fn skin_import_seeds_import_and_draw_as_built() {
                 // selecting `a`, and the perfect count 1 selects `b`; every
                 // switch is on.
                 assert_eq!(drawn, [3 + 4; 4], "{name}");
+            }
+            "note_fallbacks" => {
+                use skin_beatoraja::{NoteFallback, Severity};
+                // Eight unresolved taps and tails and eight empty mine
+                // ids: 24 parts on three generated images beside `p`,
+                // no file but `p`'s; the active body aliases selected.
+                assert_eq!(u.note_fallbacks, 24, "{name}");
+                assert_eq!((u.images, u.frames, u.files), (4, 4, 1), "{name}");
+                let fallbacks: Vec<(&str, NoteFallback)> = i
+                    .report
+                    .notes
+                    .iter()
+                    .filter(|n| n.severity == Severity::Fallback)
+                    .filter_map(|n| match n.kind {
+                        NoteKind::NotePartFallback { field, paint, .. } => Some((field, paint)),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(fallbacks.len(), 24, "{name}");
+                for (field, paint) in [
+                    ("note", NoteFallback::Tap),
+                    ("lnend", NoteFallback::Long),
+                    ("mine", NoteFallback::Mine),
+                ] {
+                    let n = fallbacks.iter().filter(|&&f| f == (field, paint)).count();
+                    assert_eq!(n, 8, "{name}: {field}");
+                }
+                // The 100-tap chart: at 500 ms the eleven taps from 1 s to
+                // 1.1 s are on screen, in white.
+                assert_eq!(drawn, [0, 0, 11, 0], "{name}");
             }
             _ => panic!("no expectation for seed {name}"),
         }
