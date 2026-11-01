@@ -102,6 +102,7 @@ impl Drawn {
             gauges: &GAUGES,
             attempt: Attempt::Full { lead_in: TimeUs(0) },
             empty_poor_breaks_combo: false,
+            empty_poor_counted: false,
             scratch: Side::Left,
             ln_default: rules::LnMode::Ln,
             last_note_end: NO_END,
@@ -182,7 +183,8 @@ impl Drawn {
             playing: true,
         };
         self.skin
-            .build(&mut self.play, &frame, &self.uvs, &mut self.batch);
+            .build(&mut self.play, &frame, &self.uvs, &mut self.batch)
+            .expect("the frame builds");
         self.batch.quads().to_vec()
     }
 

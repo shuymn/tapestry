@@ -104,9 +104,12 @@ pub use place::{
     Affine, Bind, Fill, Follow, MIN_VISIBLE, Native, Place, Placement, RegionPlacement,
 };
 pub use play::schema::{
-    GAUGE_PERMILLE, Grade, LaneTimer, MAX_COUNT, PLAY, field, lane_timer, timer,
+    GAUGE_KIND_ENUM, GAUGE_PERMILLE, Grade, LaneTimer, MAX_COUNT, PLAY, RATE_BASIS_POINTS, field,
+    lane_timer, timer,
 };
-pub use play::{Attempt, GaugeDesc, LoadState, Play, PlayContext, PrepareError, SkinFrame};
+pub use play::{
+    Attempt, BuildError, GaugeDesc, LoadState, Play, PlayContext, PrepareError, SkinFrame,
+};
 pub use quad::{Blend, ClipId, Filter, Quad, QuadBatch, Run, RunKey};
 pub use schema::{EnumDef, EnumId, Export, Field, FieldTy, Schema, SchemaError, TimerDef, Ty};
 pub use skin::{

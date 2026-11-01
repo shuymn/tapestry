@@ -60,6 +60,10 @@ pub struct PlayContext<'a> {
     /// Whether an empty POOR breaks the combo (the preset's
     /// `empty_poor.breaks_combo`), which turns `combo.up` off.
     pub empty_poor_breaks_combo: bool,
+    /// Whether an empty POOR is counted as a POOR (the preset's
+    /// `empty_poor.counted`): the snapshot's POOR count then includes its
+    /// empty POORs, which the score rates do not count as judged targets.
+    pub empty_poor_counted: bool,
     /// The player's scratch side, which the lanes are laid out for.
     pub scratch: Side,
     /// The preset's long-note mode for a chart that declares none
@@ -129,12 +133,29 @@ pub enum PrepareError {
     Overflow,
 }
 
+/// Why [`Skin::build`](crate::Skin::build) refused a frame. The frame's
+/// effects were not applied and the [`Play`] is poisoned: every later
+/// build returns the same error until a fresh
+/// [`prepare`](crate::Skin::prepare), so the caller stops the attempt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum BuildError {
+    /// The snapshot counts more empty POORs as POORs than it has POORs,
+    /// which the evaluator never produces.
+    #[error("the snapshot counts more empty POORs than POORs")]
+    InconsistentTally,
+}
+
 /// One attempt's skin state: the reducer, every timer's start and reading,
 /// and the fields, as of the last build. [`Skin::prepare`](crate::Skin::prepare)
 /// makes a fresh one per attempt, so a retry starts clean.
 #[derive(Clone, Debug)]
 pub struct Play {
     reducer: Reducer,
+    /// The context's [`PlayContext::empty_poor_counted`].
+    empty_poor_counted: bool,
+    /// Set by a refused build ([`BuildError`]); every later build is
+    /// refused.
+    poisoned: bool,
     /// Per timer slot (built-in, then `when`): its start, `None` while off.
     starts: Box<[Option<TimeUs>]>,
     /// Per timer slot: elapsed ms, or [`TIMER_OFF`].
@@ -233,6 +254,8 @@ impl Play {
         });
         Ok(Self {
             reducer,
+            empty_poor_counted: ctx.empty_poor_counted,
+            poisoned: false,
             starts: vec![None; slots].into_boxed_slice(),
             ms: vec![TIMER_OFF; slots].into_boxed_slice(),
             fields: [0; field::COUNT],
@@ -424,6 +447,7 @@ mod tests {
             gauges: &gauges,
             attempt: Attempt::Full { lead_in: TimeUs(0) },
             empty_poor_breaks_combo: false,
+            empty_poor_counted: false,
             scratch: Side::Left,
             ln_default: rules::LnMode::Ln,
             last_note_end: TimeUs(3_000 * MS),
@@ -471,7 +495,7 @@ mod tests {
                 },
                 loading: None,
             };
-            skin.build(play, &frame, &uvs, &mut batch);
+            skin.build(play, &frame, &uvs, &mut batch).unwrap();
         };
         let held = |n: u8, note: usize, kind: Judgment| JudgeEventKind::LnHeld {
             lane: lane(n),
@@ -606,6 +630,7 @@ mod tests {
                 lead_in: TimeUs(1_000 * MS),
             },
             empty_poor_breaks_combo: false,
+            empty_poor_counted: false,
             scratch: Side::Left,
             ln_default: rules::LnMode::Ln,
             last_note_end: TimeUs(1_000 * MS),
@@ -648,7 +673,7 @@ mod tests {
                 loading,
                 playing: false,
             };
-            skin.build(play, &frame, &uvs, &mut batch);
+            skin.build(play, &frame, &uvs, &mut batch).unwrap();
         };
         let percent = |play: &super::Play| {
             play.state()

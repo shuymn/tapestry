@@ -42,6 +42,7 @@ fn in_section(s: &Section) -> PlayContext<'_> {
         gauges: &GAUGES,
         attempt: Attempt::Section(s),
         empty_poor_breaks_combo: false,
+        empty_poor_counted: false,
         scratch: Side::Left,
         ln_default: rules::LnMode::Ln,
         last_note_end: TimeUs(0),
@@ -400,6 +401,7 @@ fn targets_match_the_evaluators() {
         gauges: &gauges,
         attempt: Attempt::Full { lead_in: TimeUs(0) },
         empty_poor_breaks_combo: preset.empty_poor.breaks_combo,
+        empty_poor_counted: preset.empty_poor.counted,
         scratch: Side::Left,
         ln_default: rules::LnMode::Ln,
         last_note_end: TimeUs(0),
@@ -674,4 +676,286 @@ fn operations_are_charged_once_per_program() {
         load(fewer, vec![one]).unwrap().ops().total(),
         255 * MAX_OPS + 1
     );
+}
+
+/// A snapshot with the counts `[PERFECT, GREAT, GOOD, BAD, POOR]`, `empty`
+/// empty POORs and the EX score `ex`.
+fn scored(counts: [u32; 5], empty: u32, ex: u32) -> eval::Tally {
+    let [perfect, great, good, bad, poor] = counts;
+    eval::Tally {
+        counts: rules::PerJudgment {
+            perfect,
+            great,
+            good,
+            bad,
+            poor,
+        },
+        ex_score: ex,
+        empty_poor: empty,
+        ..tally(0)
+    }
+}
+
+/// The two rates as of the last build, in basis points.
+fn rates(h: &Harness) -> (i32, i32) {
+    (
+        h.field(field::RATE_CURRENT_BP),
+        h.field(field::RATE_WHOLE_BP),
+    )
+}
+
+/// The whole-percent and fraction portions an importer maps the rate
+/// `field` to, as of the last build.
+fn portions(h: &Harness, field: &str) -> (i32, i32) {
+    let int = |src: String| {
+        compile(&src, &Scope::new(&PLAY), Ty::Int)
+            .unwrap()
+            .eval(&h.play.state())
+    };
+    (int(format!("{field} / 100")), int(format!("{field} % 100")))
+}
+
+#[test]
+fn rates_divide_the_ex_score_by_twice_the_targets() {
+    let chart = taps(&[1_000, 2_000, 3_000, 4_000]);
+    let mut h = Harness::empty(&chart, &full(0));
+    // Before any judgment: the current rate's denominator is empty.
+    h.frame(0, &[]);
+    assert_eq!(rates(&h), (10_000, 0));
+    assert_eq!(portions(&h, "rate.current_bp"), (100, 0));
+    assert_eq!(portions(&h, "rate.whole_bp"), (0, 0));
+    // EX 3 over 2 judged of 4 targets.
+    h.tally = scored([1, 1, 0, 0, 0], 0, 3);
+    h.frame(2_000, &[]);
+    assert_eq!(rates(&h), (7_500, 3_750));
+    assert_eq!(portions(&h, "rate.current_bp"), (75, 0));
+    assert_eq!(portions(&h, "rate.whole_bp"), (37, 50));
+    // BP, combo and the empty POORs alone judge no target.
+    h.tally = eval::Tally {
+        bp: 7,
+        combo: 5,
+        max_combo: 5,
+        ..scored([0; 5], 3, 0)
+    };
+    h.frame(2_100, &[]);
+    assert_eq!(rates(&h), (10_000, 0));
+    // No target at all: both denominators are empty.
+    let none = ChartBuilder::new(BPM_150)
+        .mine(lane(4), TimeUs(1_000 * MS), 10)
+        .build()
+        .unwrap();
+    let mut h = Harness::empty(&none, &full(0));
+    h.frame(0, &[]);
+    assert_eq!(rates(&h), (10_000, 10_000));
+}
+
+#[test]
+fn a_rate_floors_one_basis_point_value() {
+    // 100 taps.
+    let times: Vec<i64> = (1..=100).map(|i| i * 100).collect();
+    let mut h = Harness::empty(&taps(&times), &full(0));
+    h.tally = scored([39, 0, 0, 0, 61], 0, 39);
+    h.frame(0, &[]);
+    assert_eq!(rates(&h), (1_950, 1_950));
+    assert_eq!(portions(&h, "rate.current_bp"), (19, 50));
+    assert_eq!(portions(&h, "rate.whole_bp"), (19, 50));
+    // The source rounds each portion from its own float product
+    // (`ScoreDataProperty.java:94-99`) and shows 19.49 here; the model's
+    // portions come from the one floored value.
+    let source = 39.0_f32 / 200.0;
+    #[expect(clippy::cast_possible_truncation, reason = "the source's casts")]
+    let source = ((source * 100.0) as i32, ((source * 10_000.0) as i32) % 100);
+    assert_eq!(source, (19, 49));
+}
+
+#[test]
+fn a_rate_is_not_capped_and_never_overflows() {
+    // A custom EX weighting: 3 for one target.
+    let mut h = Harness::empty(&taps(&[1_000]), &full(0));
+    h.tally = scored([1, 0, 0, 0, 0], 0, 3);
+    h.frame(0, &[]);
+    assert_eq!(rates(&h), (15_000, 15_000));
+    assert_eq!(portions(&h, "rate.current_bp"), (150, 0));
+    // The largest counts: 10 000 · ex / (2 · 5 · (2^32 − 1)).
+    h.tally = scored([u32::MAX; 5], 0, u32::MAX);
+    h.frame(16, &[]);
+    assert_eq!(rates(&h), (1_000, i32::MAX));
+    // One judged target and the largest EX: the field's bound.
+    h.tally = scored([1, 0, 0, 0, 0], 0, u32::MAX);
+    h.frame(32, &[]);
+    assert_eq!(rates(&h), (i32::MAX, i32::MAX));
+    assert_eq!(portions(&h, "rate.current_bp"), (i32::MAX / 100, 47));
+}
+
+#[test]
+fn the_empty_poor_policy_leaves_the_judged_targets_alone() {
+    // A PERFECT at 1 s, an empty press at 1.6 s and a missed tap at 2 s,
+    // evaluated with empty POORs counted and not.
+    let chart = taps(&[1_000, 2_000]);
+    let device = eval::DeviceProfile {
+        sources: vec![eval::SourceProfile {
+            input_offset: TimeUs(0),
+            bindings: vec![eval::Binding {
+                control: eval::ControlId(1),
+                lane: lane(1),
+            }],
+            axes: Vec::new(),
+        }],
+    };
+    let key = |ms: i64, value: i32| eval::PhysicalInputEvent {
+        received: TimeUs(ms * MS),
+        source: eval::SourceId(0),
+        kind: eval::InputKind::Control {
+            control: eval::ControlId(1),
+            value,
+        },
+    };
+    let mut seen = Vec::new();
+    for counted in [false, true] {
+        let mut preset = rules::tapestry();
+        preset.empty_poor.counted = counted;
+        let evaluation = eval::evaluate(
+            &chart,
+            &EvalInput {
+                events: vec![key(1_000, 1), key(1_050, 0), key(1_600, 1), key(1_650, 0)],
+                device: device.clone(),
+                ..EvalInput::default()
+            },
+            &preset,
+        )
+        .unwrap();
+        let t = evaluation.tally;
+        assert_eq!(t.empty_poor, 1, "counted {counted}");
+        assert_eq!(t.counts.poor, 1 + u32::from(counted));
+        let ctx = PlayContext {
+            empty_poor_counted: counted,
+            ..full(0)
+        };
+        let mut h = Harness::empty(&chart, &ctx);
+        h.tally = t;
+        h.frame(3_000, &[]);
+        seen.push((t.ex_score, rates(&h)));
+    }
+    assert_eq!(seen[0], seen[1]);
+    let (ex, (current, whole)) = seen[0];
+    let want = i32::try_from(10_000 * u64::from(ex) / 4).unwrap();
+    assert_eq!((current, whole), (want, want));
+}
+
+#[test]
+fn the_rates_read_the_snapshot_in_the_same_frame() {
+    let chart = taps(&[1_000, 2_000]);
+    let skin = load(
+        vec![bool_program(
+            "rate.current_bp >= 5000 && rate.whole_bp < 5000",
+        )],
+        vec![element(TimerRef::When(0), 1)],
+    )
+    .unwrap();
+    let mut h = Harness::new(skin, &chart, &full(0));
+    // The snapshot is ahead of the drain: no effect carries the judgment.
+    h.tally = scored([0, 1, 0, 0, 0], 0, 1);
+    h.frame(1_000, &[]);
+    assert_eq!(rates(&h), (5_000, 2_500));
+    assert_eq!(h.start(timer::BUILTIN), Some(1_000 * MS));
+    assert_eq!(h.batch.quads().len(), 1);
+}
+
+#[test]
+fn the_attempt_targets_are_prepared_per_attempt() {
+    let chart = practice_chart();
+    let mut h = Harness::empty(&chart, &full(0));
+    h.tally = scored([1, 0, 0, 0, 0], 0, 2);
+    h.frame(0, &[]);
+    // Five taps and two long notes; the mine is no target.
+    assert_eq!(rates(&h), (10_000, 1_428));
+    // A round from 10 s to 20 s: the taps at 10 s and 15 s and the long
+    // note from 16 s; the tap at its end and the long note spanning its
+    // start are not targets.
+    let s = section(10_000, 20_000, 2_000);
+    h.play = h.skin.prepare(&chart, &in_section(&s)).unwrap();
+    h.frame(0, &[]);
+    assert_eq!(h.field(field::NOTES), 3);
+    assert_eq!(rates(&h), (10_000, 3_333));
+}
+
+#[test]
+fn an_inconsistent_snapshot_poisons_the_play() {
+    use skin_model::{BuildError, LaneTimer, lane_timer};
+    let chart = ChartBuilder::new(BPM_150)
+        .long(lane(2), TimeUs(1_000 * MS), TimeUs(1_300 * MS))
+        .build()
+        .unwrap();
+    let skin = || {
+        load(
+            Vec::new(),
+            vec![element(TimerRef::Builtin(timer::READY), 1)],
+        )
+        .unwrap()
+    };
+    let ctx = PlayContext {
+        empty_poor_counted: true,
+        ..full(0)
+    };
+    let hold = lane_timer(LaneTimer::Hold, lane(2));
+    let mut h = Harness::new(skin(), &chart, &ctx);
+    h.frame(
+        1_000,
+        &[ev(1_000, play_support::ln_held(2, 0, Judgment::Great))],
+    );
+    assert_eq!(h.start(hold), Some(1_000 * MS));
+    let state = |h: &Harness| {
+        let s = h.play.state();
+        (s.fields.to_vec(), s.timers.to_vec())
+    };
+    let before = state(&h);
+    let quads = h.batch.quads().to_vec();
+    assert_eq!(quads.len(), 1);
+    let frame = |h: &mut Harness, now: i64, effects: &[eval::JudgeEvent]| {
+        let tally = h.tally;
+        let gauges = h.gauges.clone();
+        let layout = h.layout;
+        let f = skin_model::SkinFrame {
+            now: TimeUs(now * MS),
+            display_offset: TimeUs(0),
+            tally: &tally,
+            gauges: &gauges,
+            gauge: 0,
+            effects,
+            complete: false,
+            playing: true,
+            target: h.target,
+            layout: &layout,
+            lanes: h.view,
+            loading: None,
+        };
+        // Not cleared: a refused build appends nothing.
+        h.skin.build(&mut h.play, &f, &h.uvs, &mut h.batch)
+    };
+    // One more empty POOR counted than POORs: refused before the effects.
+    h.tally = scored([0, 1, 0, 0, 1], 2, 2);
+    let ended = [ev(1_100, play_support::hold_ended(2, 0))];
+    assert_eq!(
+        frame(&mut h, 1_100, &ended),
+        Err(BuildError::InconsistentTally)
+    );
+    assert_eq!(state(&h), before);
+    assert_eq!(h.batch.quads(), &quads[..]);
+    // A valid snapshot after it is refused too: the end it carries is not
+    // applied, so the hold would otherwise survive it.
+    h.tally = scored([0, 1, 0, 0, 2], 2, 2);
+    assert_eq!(
+        frame(&mut h, 1_150, &ended),
+        Err(BuildError::InconsistentTally)
+    );
+    assert_eq!(state(&h), before);
+    assert_eq!(h.start(hold), Some(1_000 * MS));
+    assert_eq!(h.batch.quads(), &quads[..]);
+    // As many empty POORs as POORs is consistent; a fresh prepare draws.
+    h.play = h.skin.prepare(&chart, &ctx).unwrap();
+    h.tally = scored([0, 1, 0, 0, 2], 2, 2);
+    h.batch.clear();
+    assert_eq!(frame(&mut h, 1_200, &[]), Ok(()));
+    assert_eq!(h.batch.quads().len(), 1);
+    assert_eq!(rates(&h), (10_000, 10_000));
 }

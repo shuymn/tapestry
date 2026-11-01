@@ -4,7 +4,9 @@
 //! regions' placement as the target, the layout and the scratch side
 //! change, the lanes, number, gauge, judge and text widgets, and the
 //! elements into the batch, image quads at their native size where they
-//! keep one.
+//! keep one; the score rates and the gauge kind under both empty-POOR
+//! policies as the shown gauge switches, and a refused inconsistent
+//! snapshot.
 //!
 //! A counting global allocator counts allocations made on threads that opt
 //! in (a thread-local flag), so the test harness's own threads do not
@@ -26,12 +28,12 @@ use image_support::{dir, file, save, solid, whole};
 use play_support::{bool_program, state, tally};
 use rules::{GaugeValue, Judgment};
 use skin_model::{
-    Adjust, Align, Anchor, AtlasLimits, Attach, Attempt, Bind, Blend, ClipId, ComboPart, CycleDef,
-    DigitsDef, Ease, ElementDef, End, Fill, Filter, Fit, Follow, GaugeDef, GaugeDesc, GaugeLook,
-    GaugeParts, GlyphSet, GradePart, ImageDef, JudgeDef, JudgeSlot, KeyDef, LaneParts, LaneTimer,
-    LaneView, Layout as SkinLayout, Motion, Native, NumberDef, Pad, Place, Play, PlayContext,
-    QuadBatch, Region, RegionDef, Sheet, Side, Skin, SkinDef, SkinFrame, Source, TimerRef, Track,
-    UvTable, Variant, lane_timer, timer,
+    Adjust, Align, Anchor, AtlasLimits, Attach, Attempt, Bind, Blend, BuildError, ClipId,
+    ComboPart, CycleDef, DigitsDef, Ease, ElementDef, End, Fill, Filter, Fit, Follow, GaugeDef,
+    GaugeDesc, GaugeLook, GaugeParts, GlyphSet, GradePart, ImageDef, JudgeDef, JudgeSlot, KeyDef,
+    LaneParts, LaneTimer, LaneView, Layout as SkinLayout, Motion, Native, NumberDef, Pad, Place,
+    Play, PlayContext, QuadBatch, Region, RegionDef, Sheet, Side, Skin, SkinDef, SkinFrame, Source,
+    TimerRef, Track, UvTable, Variant, field, lane_timer, timer,
 };
 use skin_model::{
     ChartText, FontRef, FrameUv, LoadState, Overflow, TextDef, TextField, TextImage, TextTable,
@@ -775,14 +777,16 @@ fn skin() -> Loaded {
         "on(bomb.3) && !on(hold.3)",
         "on(gauge_max)",
         "elapsed(beat) < 100",
+        "rate.current_bp >= 5000 && rate.whole_bp / 100 < 100",
+        "gauge.valid && (gauge.kind == hard || gauge.kind == ex_hard)",
     ];
     let whens: Vec<_> = (0..32)
         .map(|i| bool_program(conditions[i % conditions.len()]))
         .collect();
     let visible = [
         bool_program("combo % 2 == 0"),
-        bool_program("bp < 1000"),
-        bool_program("on(play)"),
+        bool_program("bp < 1000 && rate.current_bp % 100 < 100"),
+        bool_program("on(play) && !(gauge.valid && gauge.kind == normal)"),
     ];
     let eases = [Ease::Linear, Ease::In, Ease::Out, Ease::Step];
     let builtin = 30 * timer::BUILTIN;
@@ -912,6 +916,10 @@ struct Witness {
     /// Per built-in slot: whether an element on it reached the batch.
     drawn: [bool; timer::BUILTIN as usize],
     when_started: bool,
+    /// Whether the current rate differed from the whole rate and from its
+    /// empty value, and each gauge kind read.
+    rates_apart: bool,
+    kinds: [bool; GaugeLook::COUNT],
     empty_frames_after_ready: u32,
     /// Whether a quad showed a frame other than an image's first.
     later_frame: bool,
@@ -1018,6 +1026,8 @@ impl Witness {
             on: [false; timer::BUILTIN as usize],
             drawn: [false; timer::BUILTIN as usize],
             when_started: false,
+            rates_apart: false,
+            kinds: [false; GaugeLook::COUNT],
             empty_frames_after_ready: 0,
             later_frame: false,
             later_layer: false,
@@ -1110,6 +1120,7 @@ fn stretch(
     small: &mut QuadBatch,
     from: i64,
     to: i64,
+    counted: bool,
     w: &mut Witness,
 ) {
     let skin = &loaded.skin;
@@ -1137,9 +1148,31 @@ fn stretch(
         // The snapshot follows the drain.
         for e in drain {
             match e.kind {
-                JudgeEventKind::Judged { combo, .. } => {
+                JudgeEventKind::Judged {
+                    combo, judgment, ..
+                } => {
                     tally.combo = combo;
                     tally.max_combo = tally.max_combo.max(combo);
+                    let c = &mut tally.counts;
+                    match judgment {
+                        Judgment::Perfect => {
+                            c.perfect += 1;
+                            tally.ex_score += 2;
+                        }
+                        Judgment::Great => {
+                            c.great += 1;
+                            tally.ex_score += 1;
+                        }
+                        Judgment::Good => c.good += 1,
+                        Judgment::Bad => c.bad += 1,
+                        Judgment::Poor => c.poor += 1,
+                    }
+                }
+                JudgeEventKind::EmptyPoor { .. } => {
+                    tally.empty_poor += 1;
+                    if counted {
+                        tally.counts.poor += 1;
+                    }
                 }
                 JudgeEventKind::Gauge { gauge, value, .. } => {
                     if let Some(g) = gauges.get_mut(gauge) {
@@ -1175,7 +1208,8 @@ fn stretch(
         let use_small = frame_no % 100 == 99;
         let out = if use_small { &mut *small } else { &mut *batch };
         out.clear();
-        skin.build(play, &frame, &loaded.uvs, out);
+        skin.build(play, &frame, &loaded.uvs, out)
+            .expect("the frame builds");
         if use_small {
             w.small_drops += out.dropped();
         } else {
@@ -1212,6 +1246,16 @@ fn stretch(
             *on |= play.timer(slot).is_some();
         }
         w.when_started |= play.timer(timer::BUILTIN).is_some();
+        let fields = play.state().fields;
+        let read = |slot: u16| fields.get(usize::from(slot)).copied();
+        let (current, whole) = (read(field::RATE_CURRENT_BP), read(field::RATE_WHOLE_BP));
+        w.rates_apart |= current != whole && current != Some(10_000);
+        if let Some(seen) = read(field::GAUGE_KIND)
+            .and_then(|k| usize::try_from(k).ok())
+            .and_then(|k| w.kinds.get_mut(k))
+        {
+            *seen = true;
+        }
         frame_no += 1;
         now += 16 * MS;
     }
@@ -1246,6 +1290,7 @@ fn build_does_not_allocate() {
             lead_in: TimeUs(lead_in),
         },
         empty_poor_breaks_combo: true,
+        empty_poor_counted: false,
         scratch: Side::Left,
         ln_default: rules::LnMode::Ln,
         last_note_end: TimeUs(0),
@@ -1263,7 +1308,8 @@ fn build_does_not_allocate() {
     };
     // (name, context, effects, first frame): the whole chart with breaks,
     // a practice round with breaks after a retry with the scratch on the
-    // right, and a round played to a full combo on the left again.
+    // right, and a round played to a full combo on the left again, its
+    // empty POORs counted.
     let attempts = [
         ("play", full, effects(&chart, None, false), -lead_in),
         (
@@ -1280,6 +1326,7 @@ fn build_does_not_allocate() {
             "clean round",
             PlayContext {
                 attempt: Attempt::Section(&clean_round),
+                empty_poor_counted: true,
                 ..full
             },
             effects(&chart, Some(&clean_round), true),
@@ -1300,6 +1347,7 @@ fn build_does_not_allocate() {
         let mut gauges = initial.map(state);
         let to = events.last().unwrap().time.0 + 1_000 * MS;
         let mut w = Witness::new();
+        let counted = ctx.empty_poor_counted;
 
         TRACK.with(|t| t.set(true));
         // The count works: an allocation that escapes is counted in any
@@ -1317,6 +1365,7 @@ fn build_does_not_allocate() {
             &mut small,
             *from,
             to,
+            counted,
             &mut w,
         );
         TRACK.with(|t| t.set(false));
@@ -1333,6 +1382,11 @@ fn build_does_not_allocate() {
         assert!(w.active_body, "{name}: no long note drew active");
         assert!(w.turned, "{name}: no quad turned");
         assert!(w.literal_moved, "{name}: the covers never moved a follower");
+        assert!(w.rates_apart, "{name}: the rates never moved apart");
+        assert!(
+            w.kinds[GaugeLook::Normal.index()] && w.kinds[GaugeLook::Hard.index()],
+            "{name}: the shown gauge's kind never switched"
+        );
         // The playfield is centred: 21:9 moves the beam 320 right of 16:9.
         let [Some(at_16_9), _, Some(at_21_9), ..] = w.beam else {
             panic!(
@@ -1414,9 +1468,32 @@ fn build_does_not_allocate() {
         loading: None,
         playing: true,
     };
-    skin.build(&mut play, &frame, &loaded.uvs, &mut batch);
+    skin.build(&mut play, &frame, &loaded.uvs, &mut batch)
+        .expect("the frame builds");
     assert!(!batch.quads().is_empty());
     assert_eq!(batch.dropped(), 0);
+    // An inconsistent snapshot is refused, and the poisoned play after
+    // it, without allocating.
+    let counted = PlayContext {
+        empty_poor_counted: true,
+        ..full
+    };
+    let mut play = skin.prepare(&chart, &counted).unwrap();
+    let bad = Tally {
+        empty_poor: 1,
+        ..tally(0)
+    };
+    let refused = |play: &mut Play, t: &Tally, batch: &mut QuadBatch| {
+        let frame = SkinFrame { tally: t, ..frame };
+        skin.build(play, &frame, &loaded.uvs, batch)
+    };
+    TRACK.with(|t| t.set(true));
+    let first = refused(&mut play, &bad, &mut batch);
+    let after = refused(&mut play, &t, &mut batch);
+    TRACK.with(|t| t.set(false));
+    assert_eq!(ALLOCS.load(Ordering::Relaxed), 0, "refused: allocations");
+    assert_eq!(first, Err(BuildError::InconsistentTally));
+    assert_eq!(after, Err(BuildError::InconsistentTally));
     // Both text elements ask for a line; the title is the chart's.
     let chart_text = ChartText {
         title: "Title",
@@ -1461,7 +1538,9 @@ fn build_does_not_allocate() {
             loading: None,
             playing: true,
         };
-        bitmap.build(&mut play, &frame, &uvs, &mut batch);
+        bitmap
+            .build(&mut play, &frame, &uvs, &mut batch)
+            .expect("the frame builds");
         glyphs += batch.quads().len();
     }
     TRACK.with(|t| t.set(false));
@@ -1584,7 +1663,8 @@ fn source_lanes_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
             loading: None,
             playing: true,
         };
-        skin.build(&mut play, &frame, &uvs, &mut batch);
+        skin.build(&mut play, &frame, &uvs, &mut batch)
+            .expect("the frame builds");
         quads += batch.quads().len();
         tails += batch.quads().iter().filter(|q| q.uv == tail).count();
         hiddens += batch

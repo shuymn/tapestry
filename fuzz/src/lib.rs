@@ -287,6 +287,7 @@ pub fn draw(imported: &Imported) -> Vec<usize> {
         gauges: &gauges,
         attempt: Attempt::Full { lead_in: TimeUs(0) },
         empty_poor_breaks_combo: false,
+        empty_poor_counted: false,
         scratch: Side::Left,
         ln_default: rules::LnMode::Ln,
         last_note_end: TimeUs(0),
@@ -369,7 +370,8 @@ pub fn draw(imported: &Imported) -> Vec<usize> {
             loading: None,
             playing: true,
         };
-        skin.build(&mut play, &frame, &uvs, &mut batch);
+        skin.build(&mut play, &frame, &uvs, &mut batch)
+            .expect("the frame builds");
         let n = batch.quads().len();
         assert!(
             n <= usize::try_from(skin.quad_capacity()).unwrap_or(usize::MAX),
@@ -405,7 +407,8 @@ pub fn draw(imported: &Imported) -> Vec<usize> {
             loading: None,
             playing: true,
         };
-        skin.build(&mut play, &frame, &uvs, &mut batch);
+        skin.build(&mut play, &frame, &uvs, &mut batch)
+            .expect("the frame builds");
         assert_eq!(batch.dropped(), 0, "quads past the capacity");
         assert!(
             batch.runs().len() <= usize::try_from(skin.run_capacity()).unwrap_or(usize::MAX),

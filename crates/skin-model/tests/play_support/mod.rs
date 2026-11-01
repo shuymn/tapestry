@@ -11,10 +11,10 @@ use eval::{GaugeState, JudgeEvent, JudgeEventKind, Tally};
 use image::{ImageFormat, Rgba, RgbaImage};
 use rules::{GaugeValue, Judgment, PerJudgment};
 use skin_model::{
-    Anchor, AtlasLimits, Attempt, Blend, Ease, ElementDef, End, FileDef, Filter, Fit, GaugeDesc,
-    GaugeLook, ImageDef, KeyDef, LaneView, Layout, LoadError, PLAY, Place, Play, PlayContext,
-    Program, QuadBatch, Region, RegionDef, Scope, Sheet, Side, Skin, SkinDef, SkinFrame, Source,
-    TimerRef, Ty, UvTable, Variant, compile,
+    Anchor, AtlasLimits, Attempt, Blend, BuildError, Ease, ElementDef, End, FileDef, Filter, Fit,
+    GaugeDesc, GaugeLook, ImageDef, KeyDef, LaneView, Layout, LoadError, PLAY, Place, Play,
+    PlayContext, Program, QuadBatch, Region, RegionDef, Scope, Sheet, Side, Skin, SkinDef,
+    SkinFrame, Source, TimerRef, Ty, UvTable, Variant, compile,
 };
 
 pub const MS: i64 = 1_000;
@@ -141,6 +141,7 @@ pub fn full(lead_in_ms: i64) -> PlayContext<'static> {
             lead_in: TimeUs(lead_in_ms * MS),
         },
         empty_poor_breaks_combo: false,
+        empty_poor_counted: false,
         scratch: Side::Left,
         ln_default: rules::LnMode::Ln,
         last_note_end: NO_END,
@@ -302,8 +303,14 @@ impl Harness {
         Self::new(load(Vec::new(), Vec::new()).unwrap(), chart, ctx)
     }
 
-    /// Builds the frame at `now_us` with `effects`.
+    /// Builds the frame at `now_us` with `effects`, which must build.
     pub fn frame_us(&mut self, now_us: i64, effects: &[JudgeEvent]) {
+        self.try_frame_us(now_us, effects)
+            .expect("the frame builds");
+    }
+
+    /// Builds the frame at `now_us` with `effects`.
+    pub fn try_frame_us(&mut self, now_us: i64, effects: &[JudgeEvent]) -> Result<(), BuildError> {
         self.batch.clear();
         let frame = SkinFrame {
             now: TimeUs(now_us),
@@ -320,7 +327,7 @@ impl Harness {
             playing: self.playing,
         };
         self.skin
-            .build(&mut self.play, &frame, &self.uvs, &mut self.batch);
+            .build(&mut self.play, &frame, &self.uvs, &mut self.batch)
     }
 
     /// Builds the frame at `now_ms` with `effects`.
