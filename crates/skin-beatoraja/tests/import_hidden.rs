@@ -282,7 +282,7 @@ fn a_negative_size_rounding_to_zero_is_still_refused() {
     // At 3840×2160 (r = 1/2) a width of −1 is −0.5 reference pixels and
     // its edges round to one x; a height of −1 from y 1941 likewise. The
     // line 1920 is at 120, below either rect [0, 100, 0, 10] or
-    // [0, 100, 10, 0]: an unchecked stretch-9 paint would draw whole.
+    // [0, 110, 10, 0]: an unchecked stretch-9 paint would draw whole.
     for key in [
         r#"{"x": 0, "y": 1940, "w": -1, "h": 20}"#,
         r#"{"x": 0, "y": 1941, "w": 20, "h": -1}"#,
