@@ -575,9 +575,60 @@ The following three are not rules but policies for how play proceeds, and they a
 >
 > A result recomputed under another rule is the value of "what if the same input were judged under that rule", not "what would have happened had you been playing under that rule". Players change how they press based on the judgment display on screen, and once play stops on failure there is no input after that. The screen shows this difference in its wording, and the part after the stop is shown as "no input". With the policy of playing to the end, the input log is always complete through the end.
 
+### State Model
+
+The game's states from startup to exit, and what may run in each. This is the one place for it: the sections it names give each state's details, and other sections link here instead of restating it. States marked planned are not built yet.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Startup
+    Startup --> Selection: song selection
+    Startup --> Loading: tapestry play
+    Selection --> PracticePage: P
+    Selection --> Loading: Enter (today)
+    Selection --> DecisionScreen: Enter (planned)
+    DecisionScreen --> Loading: after 1.5 s (planned)
+    PracticePage --> Loading: Start
+    PracticePage --> Selection: Back
+    Loading --> Preparing: load ready
+    Loading --> Selection: quit, refusal
+    Preparing --> Countdown: recording opens
+    Preparing --> Selection: quit, refusal
+    Countdown --> Playing: chart start
+    Countdown --> Save: abort
+    Playing --> AudioTail: evaluation complete
+    Playing --> Save: abort
+    AudioTail --> Save
+    Save --> Result
+    Save --> Preparing: retry, next round
+    Save --> Selection: quit in the countdown
+    Result --> Preparing: retry
+    Result --> Selection: back
+    Result --> PracticePage: back after a round
+    Selection --> [*]: window closed
+```
+
+Closing the window ends the run from every state, and so does a failure of the input or audio thread, or a screen that cannot be built again; the arrows leave them out. A practice round, and `tapestry play <chart>`, return to the practice page or end the run where the diagram shows selection. Within Loading, the planned loading state after the decision screen holds until its end condition holds, and Preparing then runs its opening transition ("Play Lifecycle").
+
+Every state has the same threads: the game thread runs the flow; the window thread turns window messages into controls (the settings keys adjust the tuning in every state but the decision screen's input epoch); the input thread receives Raw Input, with MMCSS "Games" for its whole life; the audio thread renders the WASAPI stream with MMCSS "Pro Audio", silent until a chart's bank arrives; the render thread draws the current screen. Beside them run the scan's thread and the background loudness thread, both in background mode, and during a load the bank's decode threads at normal priority. Allocation is allowed except where the in-play rule applies ("Scope of No Allocation"). "Pause" below is the scan's pause ("Loading and Song Selection"), which the background loudness measurement follows.
+
+| State | Game thread and input | Allocation and GPU | Background work | Quit key, close, failure |
+| --- | --- | --- | --- | --- |
+| Startup | Opens the data root and the library (its lock refuses a second player), reads the settings, starts the audio stream silent, the window, the input thread and the render thread with the built-in skin (planned: a declarative skin's chart-independent resources installed here); no input is read | Allowed; the renderer, its atlas and fonts are created | The scan's first pass starts; the background loudness thread waits | A failure ends the run with its error before any screen shows |
+| Selection | Waits idly (at most `IDLE_WAIT`, or the preset files' poll) for a choice; arrows, Enter, F11 and F12, Tab and P act; chart commands and result commands are dropped | Allowed; menu text uploads | Scan passes and the background loudness measurement run (the pause is released on entry). Planned: cursor and folder prefetch and the summary pass on speculative permits ("Load Pipeline"), paused while the list scrolls | The quit key does nothing; close ends the run; a failed screen is built again, or the run ends; an input-thread failure ends the run |
+| Decision screen (planned) | Shows the chosen chart for 1,500,000 µs; the input epoch discards every command and tuning change | Allowed; the play skin installs if not built, and the chosen chart's screen data in steps bounded per frame | Paused from the choice; the chosen chart loads on foreground permits at normal priority, speculation paused while the skin builds | Quit is discarded; close or a thread failure ends the run; a refused load waits for the end of the presentation, then returns to selection |
+| Practice page | Waits idly on the page; its controls set the section, speed, lead-in, gauge and repeat; Start and Back act | Allowed | The pause is released on entry, so the scan runs | As in selection; Back returns to selection |
+| Loading | Reads the chart, decodes the bank on its decode threads and measures the loudness when not cached, asking the quit key and a close between files, packets, chunks and blocks; the render thread draws the loading state and prepares the screen's chart. Planned: the coordinator's workers load instead, and after the decision screen the loading state's end condition and tuning wait apply | Allowed; the screen's chart and the attempt's skin state are created and uploaded | The pause is requested at the choice (each Start too); the running background measurement of the chosen chart goes on, and the load waits for it | The quit key cancels the load and returns to selection (a round: the page), leaving a cancelled measurement to the background; a refused load returns with its reason; close or a thread failure ends the run |
+| Preparing | Prepares each attempt in the order of "Preparing each attempt", commits it, ends the loading state with the render thread's acknowledgement, waits for the pause's acknowledgement, then opens recording; retries and rounds start here | Allowed; the attempt's skin state is staged and committed before recording opens, never after | Waits until the scan and the background measurement acknowledge the pause | The quit key returns to where the chart was chosen, recording never opening; a refusal returns with its reason; a logic refusal closes recording again and saves nothing; close or a thread failure ends the run |
+| Countdown | Recording is open: the game thread is the logic thread ("Overall Architecture"), stepping the evaluator; lanes are judged; the input thread publishes at least every 1 ms | In-play rule for the input thread, the logic step, the audio callback and the render thread's per-frame work; no new GPU resources, only per-frame writes into prepared buffers | Paused | The quit key aborts and leaves the chart; retry aborts and retries; close aborts and ends the run; focus loss and a failure abort with a result ("Play Lifecycle") |
+| Playing | As in the countdown, from the chart's start | As in the countdown | Paused | The quit key aborts with a result; otherwise as in the countdown |
+| Audio tail | Evaluation is complete and recording closed; the screen stays until the audio ends | The in-play rule for the audio callback and the render frames | Paused | The quit key skips to the result; retry, close, focus loss and failures cut the tail with their cause |
+| Save | The record is written and counted ("Personal Bests"), the report printed | Allowed | Paused | Commands pressed as the play ended belong to it ("Play Lifecycle") |
+| Result | Waits idly for retry, back or a view switch; the preset files are polled; the input offset keys work | Allowed; result text uploads | The pause is released | The quit key leaves the chart; close ends the run; a failed screen is built again |
+
 ### Play Lifecycle
 
-- **Screens**: the game moves through song selection → loading → the plays of the chosen chart → song selection. A song decision screen between selection and loading is planned (docs/stage3.md S10, after S10-07; below). This flow lives in `game`, is portable, and runs on the game thread through a rig, so it runs headless in tests; the library and the select screen's own controls stay with the rig, which hands the flow a chart's path.
+- **Screens**: the game moves through song selection → loading → the plays of the chosen chart → song selection. The states and what may run in each are in "State Model". A song decision screen between selection and loading is planned (docs/stage3.md S10, after S10-07; below). This flow lives in `game`, is portable, and runs on the game thread through a rig, so it runs headless in tests; the library and the select screen's own controls stay with the rig, which hands the flow a chart's path.
   - **Selection** waits idly for a chart. `tapestry` with no arguments opens it, listing the library's charts grouped by folder: the arrow keys move and change the order, Enter chooses, F11 and F12 choose the previous and next play preset, and Tab gives the search box focus, which takes typed text and the IME's while it has it (F11 and F12 do nothing then). The chart under the cursor stays selected after a refusal, whose reason the screen shows, and whenever the list changes: a search, an order, or a scan pass that lists, removes or re-reads charts. The list scrolls so that chart keeps its line where the list allows; when it is no longer listed, the cursor moves to the nearest chart after it in the old list that still is, else the nearest before it, and an empty list that gains charts puts it on the first. Every entry into it is signaled to the rig and as a session event. Commands that belong to a chart or a result are ignored there.
   - **The play preset** is chosen on the select screen. Each step moves to the previous or next entry of the shelf's list (the built-ins in their order, then the user preset files by name), wrapping at both ends and passing over an entry that does not load now: a file that never loaded, that is refused, or whose last check failed; while the presets folder cannot be listed, only the built-ins. The shelf is checked first, so a step sees the files as they are. The chosen preset keeps playing its last good version while its file fails, until a step leaves it. A step while the shelf cannot open opens it on the default, beatoraja-style. The title names the chosen preset and the list shows its bests. A batch of steps that changes the choice writes `preset` to `player.toml` at once ("Settings Files"). Steps queued before a choice in one batch apply to it; those after it are dropped with the queue. The next chart's plays, its retries, its practice and autoplay use the choice; a chart's plays never see a step, since steps are taken only while selection shows. `tapestry play <chart>` plays the preset `player.toml` names. F11 and F12 are reserved: no lane, retry or quit can be bound to them.
   - **Practice**: P on the select screen opens the practice screen for the chart under the cursor (typed text while the search box has focus). It loads the chart at 1× and waits idly on its page, which sets the section, speed, lead-in, initial gauge and repeat ("Mid-Chart Start and Section Repeat"); Start loads the chart again at the speed with the section and plays its rounds as below. A refusal at Start shows on the page, which stays; quit in a round's countdown (before its section starts) and back on a round's result return to the page, quit while the round plays ends it on its result, and quit during a round's ring-out shows that round's result ("Audio tail"); Back returns to selection. An autoplay session cannot practice, and is refused on the select screen.
@@ -1032,13 +1083,13 @@ Many people play while streaming or recording, so the game does not, for the sak
 
 | Resource | Rule |
 | --- | --- |
-| CPU | No busy-waiting (spin loops); every thread sleeps on events or waitable timers. Only the input thread during a play and its audio tail keeps a 1 ms heartbeat; outside them it has no timer and wakes only for input, a request, a focus change or stop, and the game thread parks up to 250 ms unless the window wakes it. Process priority stays normal, and only the short work of the input and audio threads is registered with MMCSS. Background work has a parallelism cap, and heavy work (library scanning, etc.) is paused during play. CPU affinity is not pinned |
+| CPU | No busy-waiting (spin loops); every thread sleeps on events or waitable timers. Only the input thread during a play and its audio tail keeps a 1 ms heartbeat; outside them it has no timer and wakes only for input, a request, a focus change or stop, and the game thread parks up to 250 ms unless the window wakes it. Process priority stays normal, and only the short work of the input and audio threads is registered with MMCSS. Background work has a parallelism cap, and what runs in each state is in "State Model". CPU affinity is not pinned |
 | GPU | Never render beyond the display refresh rate. With VRR, the cap is set slightly below the top of the VRR range. GPU queue priority stays normal. The GPU can be saturated even when capped at the refresh rate, so the streaming settings lower the cap and lighten the effects |
 | Audio | Use shared mode so as not to interfere with other apps' audio or with capture by streaming software (the "Audio" section) |
 | Display | Use the borderless flip model so that OBS game capture and window capture can capture it |
 | Input | Do not use methods that monopolize input (exclusive DirectInput, low-level keyboard hooks). Do not interfere with other apps' hotkeys (such as controls for streaming software) |
 | System-wide settings | Do not change the timer resolution request (`timeBeginPeriod`), the power plan, or other processes' priorities. Avoid unnecessary timer requests, and get the needed precision from high-resolution waitable timers (waitable timers do not guarantee the wake time either, so the latency is measured) |
-| Disk and memory | Loading, library scanning and the background loudness measurement run on low-priority threads (with lowered I/O priority as well); planned prefetch runs under a permit cap and a shared CPU budget ("Load Pipeline"). Memory stays within the "Memory Budget" |
+| Disk and memory | Library scanning and the background loudness measurement run in background mode (lowered CPU, I/O and memory priority), and a chart's load at normal priority only between its choice and its countdown ("State Model"); planned prefetch runs under a permit cap and a shared CPU budget ("Load Pipeline"). Memory stays within the "Memory Budget" |
 
 ### Settings Profiles
 
