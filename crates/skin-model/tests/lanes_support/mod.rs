@@ -10,10 +10,10 @@ use std::sync::OnceLock;
 use bms_model::{Lane, TimeUs};
 use image::{ImageFormat, Rgba, RgbaImage};
 use skin_model::{
-    Anchor, Bind, Blend, CoverImage, CoverPaintDef, Ease, ElementDef, End, FileDef, Filter, Fit,
-    Follow, HiddenTrim, ImageDef, KeyDef, LanePaint, LaneParts, LaneStyle, LanesDef, LoadError,
-    Place, Quad, Region, RegionDef, Sheet, Side, Skin, SkinDef, Source, SourceLanes, TimerRef,
-    Track, WidgetDefs, timer,
+    Anchor, BarGroupDef, Bind, Blend, CoverImage, CoverPaintDef, Ease, ElementDef, End, FileDef,
+    Filter, Fit, Follow, HiddenTrim, ImageDef, KeyDef, LanePaint, LaneParts, LaneStyle, LanesDef,
+    LoadError, Place, Quad, Region, RegionDef, Sheet, Side, Skin, SkinDef, Source, SourceLanes,
+    TimerRef, Track, WidgetDefs, timer,
 };
 
 use crate::play_support::{Harness, REGIONS};
@@ -93,10 +93,29 @@ pub fn sheet() -> Sheet {
     .unwrap()
 }
 
+/// A bar group of [`BAR`] over the span, bound to it, `h` tall from `y`
+/// at the line's position, following the lift, on `ready` in the
+/// playfield.
+pub fn bar_group(y: i32, h: i32) -> BarGroupDef {
+    BarGroupDef {
+        image: BAR,
+        track: rect([160, y, 544, h]),
+        timer: TimerRef::Builtin(timer::READY),
+        visible: None,
+        blend: Blend::Alpha,
+        place: Place {
+            region: Region::Playfield,
+            bind: Bind::Lanes,
+            follow: Follow::Lift,
+            ..Place::SCREEN
+        },
+    }
+}
+
 /// The simple skin's lanes: the scratch at 160 (96 wide), the keys 64
-/// wide from 256, top 80, line 880, bottom 960; notes 16, mines 8, bar
-/// lines 2 and the line 6 tall; HIDDEN+ 800 tall from the line, trimmed
-/// at the line as it rises.
+/// wide from 256, top 80, line 880, bottom 960; notes 16, mines 8 and the
+/// line 6 tall, a bar group 2 tall centred on the line ([`bar_group`]);
+/// HIDDEN+ 800 tall from the line, trimmed at the line as it rises.
 pub fn simple() -> LanesDef {
     let mut lanes = [[160, 96]; 8];
     for (k, lane) in lanes.iter_mut().enumerate().skip(1) {
@@ -116,7 +135,6 @@ pub fn simple() -> LanesDef {
         hidden_trim: HiddenTrim::Lift(880.0),
         note_h: 16,
         mine_h: 8,
-        bar_h: 2,
         line_h: 6,
         parts: LaneParts {
             note: [NOTE; 8],
@@ -125,20 +143,20 @@ pub fn simple() -> LanesDef {
             body_on: [BODY_ON; 8],
             body_off: [BODY_OFF; 8],
             mine: [MINE; 8],
-            bar: Some(BAR),
             line: Some(LINE),
             lift: Some(LIFT),
             hidden: Some(HIDDEN),
         },
+        bar_groups: vec![bar_group(879, 2)],
     }
 }
 
 /// The source player's lanes on the simple skin's columns, as an imported
 /// skin's: the source region's lower edge at 880 and 600 high, notes and
 /// mines 20 high; `top` half a note above the region (270), `line` a
-/// note's centre at its judgment time (870), LIFT 200 high at its bottom
-/// and HIDDEN+ 600 high from its bottom, trimmed there as it rises with
-/// the lift.
+/// note's centre at its judgment time (870), a bar group 2 tall centred
+/// there, LIFT 200 high at its bottom and HIDDEN+ 600 high from its
+/// bottom, trimmed there as it rises with the lift.
 pub fn source() -> LanesDef {
     LanesDef {
         style: LaneStyle::Source(SourceLanes {
@@ -157,6 +175,7 @@ pub fn source() -> LanesDef {
         hidden_trim: HiddenTrim::Lift(880.0),
         note_h: 20,
         mine_h: 20,
+        bar_groups: vec![bar_group(869, 2)],
         ..simple()
     }
 }

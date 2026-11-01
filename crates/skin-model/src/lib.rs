@@ -121,6 +121,7 @@ pub use skin::{
 pub use track::{
     Ease, End, KeyDef, MAX_GEOMETRY, MAX_KEY_US, MAX_TRACK_KEYS, Prop, Sample, Track, TrackError,
 };
+pub use widget::bar::{BarGroupDef, BarGroupError, MAX_BAR_GROUPS};
 pub use widget::cover_paint::{
     CoverImage, CoverPaintDef, CoverPaintError, LanePaint, LanePaintError,
 };

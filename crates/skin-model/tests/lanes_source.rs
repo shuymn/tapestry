@@ -430,9 +430,9 @@ fn with_no_scroll_left_only_taps_and_mines_are_drawn_on_the_line() {
 #[test]
 fn with_no_scroll_left_both_budgets_bound_the_frame() {
     let mut def = source();
-    def.parts.bar = None;
+    def.bar_groups.clear();
     let run = |chart: &Chart| {
-        let mut h = harness_of(def, chart);
+        let mut h = harness_of(def.clone(), chart);
         h.view.cover = 1_000;
         h.frame(900, &[]);
         h

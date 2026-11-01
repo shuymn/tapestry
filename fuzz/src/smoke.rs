@@ -269,6 +269,7 @@ fn skin_json_seeds_resolve_or_fail_as_built() {
             "syntax",
             "missing",
             "configured_fails",
+            "bar_group_limit",
             "images",
             "numbers",
             "text",
@@ -278,6 +279,7 @@ fn skin_json_seeds_resolve_or_fail_as_built() {
             "offsets",
             "choices_default",
             "lanes",
+            "bar_groups",
             "paints",
             "followers",
             "judge",
@@ -290,6 +292,24 @@ fn skin_json_seeds_resolve_or_fail_as_built() {
     let imports: Vec<&str> = seeds::skin_imports().iter().map(|(n, _)| *n).collect();
     for (name, data) in seeds {
         if imports.contains(&name) {
+            continue;
+        }
+        if name == "bar_group_limit" {
+            // Within the runner's 64 KiB inputs (docs/setup.md "Fuzzing").
+            assert!(data.len() <= 64 * 1_024, "{name}: {} bytes", data.len());
+            // The header resolves; the import stops at the groups' count.
+            let (_, imported) = skin_json(&data).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert!(
+                matches!(
+                    imported,
+                    Err(ImportError::Limit {
+                        limit: skin_beatoraja::ImportLimit::BarGroups,
+                        ..
+                    })
+                ),
+                "{name}: {:?}",
+                imported.map(|i| i.report)
+            );
             continue;
         }
         let result = skin_json(&data).map(|(h, _)| h);
@@ -456,6 +476,29 @@ fn skin_import_seeds_import_and_draw_as_built() {
                     .quad_capacity()
                     .checked_sub(skin_model::LANE_QUADS + skin_model::LANE_RESERVED);
                 assert_eq!(paint, Some(1), "{name}");
+            }
+            "bar_groups" => {
+                use skin_beatoraja::{DeviationId, LaneApprox};
+                // Four groups charged with their keys, three kept, each
+                // noted once; the follower and SUDDEN+'s paint followed
+                // once each; the undefined image dropped; the image's
+                // `len` and `ref` unused.
+                assert_eq!(u.bar_groups, 4, "{name}");
+                assert_eq!(i.skin.bar_group_count(), 3, "{name}");
+                assert_eq!((u.elements, u.keys, u.images), (4, 8, 6), "{name}");
+                let d9 = |a| NoteKind::Deviation(DeviationId::D9(a));
+                let k = kinds(&i);
+                let count = |n: NoteKind| k.iter().filter(|&&m| m == n).count();
+                assert_eq!(count(d9(LaneApprox::BarLine)), 3, "{name}: {k:?}");
+                assert_eq!(count(d9(LaneApprox::CoverMotion)), 2, "{name}: {k:?}");
+                assert_eq!(count(NoteKind::UndefinedObject), 1, "{name}: {k:?}");
+                assert!(
+                    !k.iter()
+                        .any(|n| matches!(n, NoteKind::UnsupportedProperty { .. })),
+                    "{name}: {k:?}"
+                );
+                // The draw's chart has no bars: as the lanes.
+                assert_eq!(drawn, [1, 1, 12, 1], "{name}");
             }
             "paints" => {
                 // The lanes, LIFT's and HIDDEN+'s markers and four paints.

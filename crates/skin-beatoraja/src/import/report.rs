@@ -148,8 +148,10 @@ pub enum LaneApprox {
     /// h: a long note within one note height of its end draws no body
     /// (the source draws one of negative height).
     LnBody,
-    /// j: bar lines are drawn across the lanes at note centres, white and
-    /// opaque, until they leave the lanes' bottom.
+    /// j: a bar line group is drawn while it overlaps the lanes, through
+    /// STOPs and past its bar's time, where the source stops drawing a
+    /// line once its time has passed (`play/LaneRenderer.java:357-359`);
+    /// with no scroll span it is not drawn.
     BarLine,
     /// n: HIDDEN+ is cut at its trim line after its stretch, where the
     /// source decides what to draw and clip from its unstretched
@@ -300,6 +302,8 @@ pub struct Usage {
     /// Image choice entries, holes and repeats included.
     pub choice_refs: u32,
     pub notes: u32,
+    /// Bar line groups, dropped ones included.
+    pub bar_groups: u32,
 }
 
 /// What an import changed, dropped or ignored.

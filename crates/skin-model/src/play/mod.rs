@@ -16,6 +16,7 @@ use self::reducer::Reducer;
 use self::schema::{field, timer};
 use crate::expr::{State, TIMER_OFF};
 use crate::layout::Layout;
+use crate::widget::bar::BarScratch;
 use crate::widget::gauge::GaugeLook;
 use crate::widget::glyphs::GlyphLine;
 use crate::widget::lanes::{LaneView, Side};
@@ -262,6 +263,9 @@ pub struct Play {
     text: TextTable,
     /// The attempt's bitmap lines by text slot, empty until laid out.
     bitmap: Box<[Option<GlyphLine>]>,
+    /// The bar groups' per-frame work, for a skin with lanes and groups;
+    /// a build lends it to the lanes.
+    bars: Option<BarScratch>,
 }
 
 /// The chart's notes and bar lines, kept for a skin with lanes.
@@ -286,13 +290,14 @@ fn last_object(chart: &Chart) -> TimeUs {
 
 impl Play {
     /// A fresh attempt with `whens` `when` timers, keeping the chart's
-    /// notes when the skin has `lanes`; grades up to `bomb_up_to` give a
-    /// bomb.
+    /// notes and the work of `bar_groups` checked groups when the skin has
+    /// `lanes`; grades up to `bomb_up_to` give a bomb.
     pub(crate) fn new(
         chart: &Chart,
         ctx: &PlayContext<'_>,
         whens: usize,
         lanes: bool,
+        bar_groups: usize,
         bomb_up_to: Option<schema::Grade>,
     ) -> Result<Self, PrepareError> {
         let (play_at, lead_in, section) = match ctx.attempt {
@@ -379,7 +384,23 @@ impl Play {
             gauges: ctx.gauges.into(),
             text: TextTable::default(),
             bitmap: Box::new([]),
+            bars: (lanes && bar_groups > 0).then(|| BarScratch::new(bar_groups)),
         })
+    }
+
+    /// The bar groups the play holds work for.
+    pub(crate) fn bar_capacity(&self) -> usize {
+        self.bars.as_ref().map_or(0, |b| b.capacity())
+    }
+
+    /// Lends out the bar groups' work; allocates nothing.
+    pub(crate) fn take_bars(&mut self) -> Option<BarScratch> {
+        self.bars.take()
+    }
+
+    /// Takes back the work [`take_bars`](Self::take_bars) lent.
+    pub(crate) fn restore_bars(&mut self, bars: Option<BarScratch>) {
+        self.bars = bars;
     }
 
     /// The number of timer slots, built-in and `when`.

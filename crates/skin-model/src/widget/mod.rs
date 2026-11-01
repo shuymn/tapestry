@@ -3,10 +3,11 @@
 //! adds the glyph strips of `number` and the judge's combo, the `judge`
 //! and the `gauge`; S5c adds `text`; S6c-04 adds expression-selected
 //! images (`image_choice`); S6c-05 paints SUDDEN+ apart from the lanes
-//! (`cover_paint`).
+//! (`cover_paint`); S6c-06 draws the lanes' bar groups (`bar`).
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
+pub(crate) mod bar;
 pub(crate) mod cover_paint;
 pub(crate) mod digits;
 pub(crate) mod gauge;
@@ -84,62 +85,73 @@ pub(crate) struct Brush {
 }
 
 impl Brush {
-    /// Pushes the quad showing `f` over the reference rect `[x, y, w, h]`:
-    /// moved with its lane (when bound), then by the affine, resized to
-    /// its native size (when it has one), turned about its own pivot in
-    /// that rect. `false` when the batch refused it.
-    pub(crate) fn push(
-        &self,
-        out: &mut QuadBatch,
-        [x, y, w, h]: [f32; 4],
-        f: FrameUv,
-        filter: Filter,
-    ) -> bool {
+    /// The quad showing `f` over the reference rect `[x, y, w, h]`: moved
+    /// with its lane (when bound), then by the affine, resized to its
+    /// native size (when it has one), turned about its own pivot in that
+    /// rect.
+    pub(crate) fn quad(&self, [x, y, w, h]: [f32; 4], f: FrameUv, filter: Filter) -> Quad {
         let [fx, fy] = self.pivot;
         let Some(native) = self.native else {
             let pivot = [x + fx * w, y + fy * h];
-            return self.push_about(out, [x, y, w, h], pivot, f, filter);
+            return self.quad_about([x, y, w, h], pivot, f, filter);
         };
         let placed = self.affine.rect([self.map.x(x), y, self.map.w(w), h]);
         let rect @ [qx, qy, qw, qh] = native.fit(placed, self.scale);
-        out.push(
-            self.key,
-            Quad {
-                rect,
-                uv: f.uv,
-                color: self.color,
-                pivot: [qx + fx * qw, qy + fy * qh],
-                angle: self.angle,
-                layer: f.layer,
-                filter,
-            },
-        )
+        Quad {
+            rect,
+            uv: f.uv,
+            color: self.color,
+            pivot: [qx + fx * qw, qy + fy * qh],
+            angle: self.angle,
+            layer: f.layer,
+            filter,
+        }
     }
 
-    /// Pushes the quad showing `f` over the reference rect `[x, y, w, h]`
-    /// turned about the reference point `pivot`, both moved as
-    /// [`push`](Self::push) moves them. `false` when the batch refused it.
-    pub(crate) fn push_about(
+    /// The quad showing `f` over the reference rect `[x, y, w, h]` turned
+    /// about the reference point `pivot`, both moved as
+    /// [`quad`](Self::quad) moves them.
+    pub(crate) fn quad_about(
         &self,
-        out: &mut QuadBatch,
         [x, y, w, h]: [f32; 4],
         pivot: [f32; 2],
         f: FrameUv,
         filter: Filter,
-    ) -> bool {
+    ) -> Quad {
         let (x, w, px) = (self.map.x(x), self.map.w(w), self.map.x(pivot[0]));
-        out.push(
-            self.key,
-            Quad {
-                rect: self.affine.rect([x, y, w, h]),
-                uv: f.uv,
-                color: self.color,
-                pivot: self.affine.point([px, pivot[1]]),
-                angle: self.angle,
-                layer: f.layer,
-                filter,
-            },
-        )
+        Quad {
+            rect: self.affine.rect([x, y, w, h]),
+            uv: f.uv,
+            color: self.color,
+            pivot: self.affine.point([px, pivot[1]]),
+            angle: self.angle,
+            layer: f.layer,
+            filter,
+        }
+    }
+
+    /// Pushes [`quad`](Self::quad); `false` when the batch refused it.
+    pub(crate) fn push(
+        &self,
+        out: &mut QuadBatch,
+        rect: [f32; 4],
+        f: FrameUv,
+        filter: Filter,
+    ) -> bool {
+        out.push(self.key, self.quad(rect, f, filter))
+    }
+
+    /// Pushes [`quad_about`](Self::quad_about); `false` when the batch
+    /// refused it.
+    pub(crate) fn push_about(
+        &self,
+        out: &mut QuadBatch,
+        rect: [f32; 4],
+        pivot: [f32; 2],
+        f: FrameUv,
+        filter: Filter,
+    ) -> bool {
+        out.push(self.key, self.quad_about(rect, pivot, f, filter))
     }
 }
 

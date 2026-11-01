@@ -1,6 +1,7 @@
 //! Elements by object kind: images here, image selection (image groups
 //! and image sets), numbers, text and the play objects in their modules.
 
+pub(super) mod bar;
 pub(super) mod cover_paint;
 pub(super) mod gauge;
 pub(super) mod image_choice;

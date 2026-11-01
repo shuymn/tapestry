@@ -1,20 +1,20 @@
 //! The lanes: the lane map and scratch side, the rects and the vertical
 //! mapping, the preconditions, the parts, the lifetime, the offsets, the
-//! bar line and the lane approximations, through `build`.
+//! bar line groups and the lane approximations, through `build`.
 
 mod common;
 
 use bms_model::{Chart, ChartBuilder, Lane, LnMode, TimeUs};
 use common::lanes::{NOTES, body, cover, eight, lane_rects, lift_object, note, note_with};
 use common::play::{Drawn, MS, judged, round};
-use common::{Loaded, has, import_body, import_config, import_sized};
+use common::{Loaded, dst, has, import_body, import_config, import_sized};
 use eval::{JudgeEvent, JudgeEventKind};
 use rules::Judgment;
 use skin_beatoraja::{
-    Config, CriticalPart, DeviationId, ImportError, LaneApprox, NoteKind, OffsetValue, Severity,
-    TrackWhy,
+    Config, CriticalPart, DeviationId, ImportError, Imported, LaneApprox, NoteKind, OffsetValue,
+    Severity, TrackWhy,
 };
-use skin_model::{LanesError, LoadError, Side};
+use skin_model::{BarGroupError, LanesError, LoadError, Side};
 
 /// The lanes skin with `note_extra` note fields and `dsts` after the
 /// note destination.
@@ -452,91 +452,344 @@ fn grouped(groups: &str) -> Loaded {
     lanes(&format!(r#""group": [{groups}]"#), &[])
 }
 
-const BAR: &str = r#"{"id": "bar", "dst": [{"x": 0, "y": 0, "w": 8, "h": 2}]}"#;
+/// The bar image across the lanes on their bottom edge (source y 200).
+const ACROSS: &str = r#""x": 20, "y": 200, "w": 430, "h": 2"#;
+
+/// A tap at 5 s and bars at `ms`.
+fn barred(ms: &[i64]) -> Chart {
+    let mut chart = tap(1, 5_000);
+    chart.bar_lines = ms
+        .iter()
+        .map(|&t| chart.scroll.position_at(TimeUs(t * MS)))
+        .collect();
+    chart
+}
+
+/// Whether `r` drops something for `kind`.
+fn drops(r: &skin_beatoraja::Report, kind: NoteKind) -> bool {
+    r.notes
+        .iter()
+        .any(|n| n.severity == Severity::Dropped && n.kind == kind)
+}
+
+const BAR_LINE: NoteKind = NoteKind::Deviation(DeviationId::D9(LaneApprox::BarLine));
 
 #[test]
-fn a_plain_bar_maps() {
-    let bar = |l: &Loaded| {
-        let mut chart = tap(1, 5_000);
-        chart.bar_lines = vec![chart.scroll.position_at(TimeUs(1_000 * MS))];
-        drawn(l, &chart).rects(1_000)
-    };
-    let l = grouped(BAR);
-    assert!(has(
-        l.report(),
-        NoteKind::Deviation(DeviationId::D9(LaneApprox::BarLine))
-    ));
-    assert_eq!(bar(&l), [[20, 869, 430, 2]]);
-    // The model keeps a passed bar until it leaves the bottom.
-    let mut chart = tap(1, 5_000);
-    chart.bar_lines = vec![chart.scroll.position_at(TimeUs(1_000 * MS))];
-    assert_eq!(drawn(&l, &chart).rects(1_001), [[20, 870, 430, 2]]);
-    // During a STOP at the bar, it holds on the line.
+fn a_group_draws_where_its_destination_stands() {
+    let l = grouped(&dst("bar", "", ACROSS));
+    let r = l.report();
+    assert!(has(r, BAR_LINE));
+    assert_eq!(r.usage.bar_groups, 1);
+    // At its time the bar is drawn at its destination, not at the
+    // notes' centre line.
+    assert_eq!(
+        rects_over(&l, &barred(&[1_000]), 1_000),
+        [[20, 878, 430, 2]]
+    );
+    // A coming bar is higher by its distance, a passed one lower, kept
+    // while it overlaps the lanes: one pixel, then none, its top on
+    // their bottom.
+    assert_eq!(
+        rects_over(&l, &barred(&[1_100]), 1_000),
+        [[20, 778, 430, 2]]
+    );
+    assert_eq!(
+        rects_over(&l, &barred(&[1_000]), 1_001),
+        [[20, 879, 430, 2]]
+    );
+    assert_eq!(
+        rects_over(&l, &barred(&[1_000]), 1_002),
+        Vec::<[i32; 4]>::new()
+    );
+    assert_eq!(
+        rects_over(&l, &barred(&[1_000]), 1_100),
+        Vec::<[i32; 4]>::new()
+    );
+    // During a STOP at the bar, it holds.
     let mut chart = ChartBuilder::new(150_000)
         .tap(Lane::new(1).unwrap(), TimeUs(5_000 * MS))
         .stop(TimeUs(1_000 * MS), TimeUs(500 * MS))
         .build()
         .unwrap();
     chart.bar_lines = vec![chart.scroll.position_at(TimeUs(1_000 * MS))];
-    assert_eq!(drawn(&l, &chart).rects(1_400), [[20, 869, 430, 2]]);
-    // Four frames with no cycle: frame 0 for good.
-    let four = r#"{"id": "bar4", "src": "a", "x": 0, "y": 20, "w": 8, "h": 8, "divy": 4}"#;
-    let l = import_body(&body(
-        four,
-        &note(&format!(
-            r#""group": [{}]"#,
-            BAR.replace("\"bar\"", "\"bar4\"")
-        )),
-        &[NOTES],
-    ));
-    assert_eq!(bar(&l), [[20, 869, 430, 2]]);
+    assert_eq!(rects_over(&l, &chart, 1_400), [[20, 878, 430, 2]]);
 }
 
 #[test]
-fn other_bars_drop() {
-    let cyc = r#"{"id": "bar4", "src": "a", "x": 0, "y": 20, "w": 8, "h": 8, "divy": 4, "cycle": 100, "timer": 41}"#;
-    let dropped = |l: Loaded| {
+fn groups_keep_their_own_look_in_bar_then_group_order() {
+    let tinted = dst(
+        "deco",
+        r#""blend": 2"#,
+        r#""x": 100, "y": 197, "w": 50, "h": 6, "a": 128, "r": 255, "g": 0, "b": 0"#,
+    );
+    let bar = dst("bar", "", ACROSS);
+    let l = grouped(&format!("{bar}, {tinted}, {bar}"));
+    let r = l.report();
+    assert_eq!(r.usage.bar_groups, 3);
+    assert_eq!(r.notes.iter().filter(|n| n.kind == BAR_LINE).count(), 3);
+    let q = drawn(&l, &barred(&[1_000, 1_100])).frame(1_000, &[]);
+    let rects: Vec<[i32; 4]> = q.iter().map(|q| round(q.rect)).collect();
+    assert_eq!(
+        rects,
+        [
+            [20, 878, 430, 2],
+            [100, 877, 50, 6],
+            [20, 878, 430, 2],
+            [20, 778, 430, 2],
+            [100, 777, 50, 6],
+            [20, 778, 430, 2],
+        ]
+    );
+    assert_eq!(q[1].color, [1.0, 0.0, 0.0, 128.0 / 255.0]);
+    assert_eq!(q[0].color, [1.0; 4]);
+}
+
+#[test]
+fn groups_on_timers_conditions_and_cycles_map() {
+    let cycled = r#"{"id": "bar4", "src": "a", "x": 0, "y": 20, "w": 8, "h": 8, "divy": 4, "cycle": 100, "timer": 41}"#;
+    for (images, g) in [
+        ("", dst("bar", r#""timer": 41"#, ACROSS)),
+        ("", dst("bar", r#""op": [271]"#, ACROSS)),
+        (
+            "",
+            dst(
+                "bar",
+                r#""loop": -1"#,
+                r#""time": 0, "x": 20, "y": 200, "w": 430, "h": 2"#,
+            ),
+        ),
+        ("", dst("bar", "", &format!(r#"{ACROSS}, "angle": 30"#))),
+        (cycled, dst("bar4", "", ACROSS)),
+    ] {
+        let l = import_body(&body(
+            images,
+            &note(&format!(r#""group": [{g}]"#)),
+            &[NOTES],
+        ));
         let r = l.report();
+        assert!(has(r, BAR_LINE), "{g}: {:?}", r.notes);
         assert!(
-            r.notes.iter().any(|n| n.severity == Severity::Dropped
-                && n.kind == NoteKind::UnsupportedField { field: "group" }),
-            "{:?}",
+            r.notes.iter().all(|n| n.severity != Severity::Dropped),
+            "{g}: {:?}",
             r.notes
         );
-        assert!(!has(
-            r,
-            NoteKind::Deviation(DeviationId::D9(LaneApprox::BarLine))
-        ));
-    };
-    dropped(import_body(&body(
-        cyc,
-        &note(&format!(
-            r#""group": [{}]"#,
-            BAR.replace("\"bar\"", "\"bar4\"")
-        )),
+    }
+}
+
+#[test]
+fn an_image_of_an_image_group_gives_its_ordinary_frames() {
+    // `len` and `ref` are unused: no selector, the whole grid cycling.
+    let frames = r#"{"id": "bars", "src": "a", "x": 0, "y": 20, "w": 8, "h": 8, "divy": 4, "len": 4, "ref": 500, "cycle": 400}"#;
+    let l = import_body(&body(
+        frames,
+        &note(&format!(r#""group": [{}]"#, dst("bars", "", ACROSS))),
         &[NOTES],
-    )));
-    dropped(grouped(
-        r#"{"id": "bar", "dst": [{"x": 0, "y": 0, "w": 8, "h": 2, "a": 128}]}"#,
     ));
-    dropped(grouped(&format!("{BAR}, {BAR}")));
-    dropped(grouped(
-        r#"{"id": "bar", "timer": 41, "dst": [{"x": 0, "y": 0, "w": 8, "h": 2}]}"#,
-    ));
-    dropped(grouped(
-        r#"{"id": "bar", "loop": -1, "dst": [{"time": 0, "x": 0, "y": 0, "w": 8, "h": 2}]}"#,
-    ));
-    dropped(grouped(
-        r#"{"id": "bar", "op": [40], "dst": [{"x": 0, "y": 0, "w": 8, "h": 2}]}"#,
-    ));
-    // A held key at 0 is perpetual.
-    let held = grouped(
-        r#"{"id": "bar", "loop": 0, "dst": [{"time": 0, "x": 0, "y": 0, "w": 8, "h": 2}]}"#,
+    let r = l.report();
+    assert!(has(r, BAR_LINE));
+    assert!(
+        r.notes.iter().all(|n| n.severity != Severity::Dropped),
+        "{:?}",
+        r.notes
     );
-    assert!(has(
-        held.report(),
-        NoteKind::Deviation(DeviationId::D9(LaneApprox::BarLine))
+    let uv = |ms: i64| drawn(&l, &barred(&[ms])).frame(ms, &[])[0].uv;
+    assert_ne!(uv(1_000), uv(1_100));
+    assert_eq!(uv(1_000), uv(1_400));
+}
+
+#[test]
+fn a_group_following_the_lift_moves_with_it() {
+    let follower = dst("bar", r#""offset": 3"#, ACROSS);
+    let still = dst("bar", "", ACROSS);
+    let l = grouped(&format!("{follower}, {still}"));
+    let r = l.report();
+    let motion = NoteKind::Deviation(DeviationId::D9(LaneApprox::CoverMotion));
+    assert_eq!(r.notes.iter().filter(|n| n.kind == motion).count(), 1);
+    let mut d = drawn(&l, &barred(&[1_000]));
+    d.view.lift = 250;
+    // LIFT raises the follower by its 150 px; the other stays.
+    assert_eq!(d.rects(1_000), [[20, 728, 430, 2], [20, 878, 430, 2]]);
+}
+
+#[test]
+fn groups_that_cannot_draw_drop_alone() {
+    let gone = r#"{"id": "gone", "src": "zz", "x": 0, "y": 0, "w": 8, "h": 2}"#;
+    let cases = [
+        (dst("nope", "", ACROSS), NoteKind::UndefinedObject),
+        (
+            format!(r#"{{"id": null, "dst": [{{{ACROSS}}}]}}"#),
+            NoteKind::UndefinedObject,
+        ),
+        (dst("gone", "", ACROSS), NoteKind::MissingAsset),
+        (dst("bar", r#""stretch": 3"#, ACROSS), NoteKind::Stretch(3)),
+        (
+            dst(
+                "bar",
+                r#""mouseRect": {"x": 0, "y": 0, "w": 1, "h": 1}"#,
+                ACROSS,
+            ),
+            NoteKind::UnsupportedField { field: "mouseRect" },
+        ),
+        (
+            dst("bar", r#""offset": 1"#, ACROSS),
+            NoteKind::RuntimeOffset(1),
+        ),
+    ];
+    for (g, why) in cases {
+        let kept = dst("bar", "", ACROSS);
+        let l = import_body(&body(
+            gone,
+            &note(&format!(r#""group": [{g}, {kept}]"#)),
+            &[NOTES],
+        ));
+        let r = l.report();
+        assert!(drops(r, why), "{g}: {:?}", r.notes);
+        assert_eq!(r.usage.bar_groups, 2, "{g}");
+        assert_eq!(
+            r.notes.iter().filter(|n| n.kind == BAR_LINE).count(),
+            1,
+            "{g}"
+        );
+        // The kept group and the notes still draw.
+        let mut chart = tap(1, 1_000);
+        chart.bar_lines = vec![chart.scroll.position_at(TimeUs(1_000 * MS))];
+        assert_eq!(
+            rects_over(&l, &chart, 1_000),
+            [[20, 878, 430, 2], [100, 860, 50, 20]],
+            "{g}"
+        );
+    }
+}
+
+#[test]
+fn a_group_without_keys_refuses() {
+    for g in [r#"{"id": "bar", "dst": []}"#, r#"{"id": "bar"}"#] {
+        match grouped(g).err() {
+            ImportError::Type {
+                field: "dst",
+                expected: "a non-empty array",
+                ..
+            } => {}
+            e => panic!("{g}: {e:?}"),
+        }
+    }
+}
+
+#[test]
+fn a_native_group_of_an_empty_destination_draws_its_frame() {
+    // Stretch 9 keeps the 8×2 frame, centred on the empty rect at
+    // (100, 880).
+    let l = grouped(&dst(
+        "bar",
+        r#""stretch": 9"#,
+        r#""x": 100, "y": 200, "w": 0, "h": 0"#,
     ));
+    assert_eq!(rects_over(&l, &barred(&[1_000]), 1_000), [[96, 879, 8, 2]]);
+}
+
+#[test]
+fn a_group_clip_is_ignored() {
+    let clipped = dst(
+        "bar",
+        "",
+        &format!(r#"{ACROSS}, "clip_x": 0, "clip_y": 0, "clip_w": 9, "clip_h": 9"#),
+    );
+    let l = grouped(&clipped);
+    let r = l.report();
+    assert!(has(r, NoteKind::Ignored { field: "clip" }));
+    assert!(has(r, BAR_LINE));
+    assert_eq!(
+        rects_over(&l, &barred(&[1_000]), 1_000),
+        [[20, 878, 430, 2]]
+    );
+}
+
+#[test]
+fn a_group_model_error_points_at_the_group() {
+    // A follower whose keys LIFT can move past the coordinate bound, on a
+    // line of its own, apart from the lanes' destination.
+    let far = dst(
+        "bar",
+        r#""offset": 3"#,
+        r#""x": 20, "y": 1049400, "w": 430, "h": 2"#,
+    );
+    let groups = format!("{},\n{far}\n", dst("bar", "", ACROSS));
+    let note = note(&format!(r#""group": [{groups}]"#));
+    let src = body("", &note, &[NOTES]);
+    // The import's text starts its body on line 2.
+    let line = 2 + src[..src.find("1049400").unwrap()].matches('\n').count();
+    assert_eq!(
+        model(import_body(&src)),
+        (
+            LanesError::BarGroup {
+                group: 1,
+                error: BarGroupError::Coordinates,
+            },
+            u32::try_from(line).unwrap()
+        )
+    );
+}
+
+/// Imports a 1920×1080 skin of `body` beside the files `files`.
+fn import_beside(body: &str, files: &[(&str, &str)]) -> Result<Imported, ImportError> {
+    let json = format!(
+        r#"{{"type": 0, "w": 1920, "h": 1080, "source": [{{"id": "a", "path": "a.png"}}], {body}}}"#
+    );
+    let d = common::skin_with(&json, &[("a.png", 64, 64)]);
+    for (name, text) in files {
+        common::write(d.path(), name, text.as_bytes());
+    }
+    common::import_dir(d.path())
+}
+
+#[test]
+fn malformed_groups_refuse() {
+    let bar = dst("bar", "", ACROSS);
+    let typed = |field: &str, files: &[(&str, &str)]| {
+        let src = body("", &note(&format!(r#""group": {field}"#)), &[NOTES]);
+        match import_beside(&src, files) {
+            Err(ImportError::Type {
+                field, expected, ..
+            }) => (field, expected),
+            other => panic!("{field}: {other:?}"),
+        }
+    };
+    assert_eq!(typed("42", &[]), ("group", "an array"));
+    assert_eq!(
+        typed(r#"{"include": "g.json"}"#, &[("g.json", "42")]),
+        ("group", "an array")
+    );
+    assert_eq!(
+        typed(r#"[{"include": "g.json"}]"#, &[("g.json", "[true]")]),
+        ("group", "an object")
+    );
+    assert_eq!(typed("[42]", &[]), ("group", "an object"));
+    assert_eq!(
+        typed(r#"[{"id": "bar", "dst": 5}]"#, &[]),
+        ("dst", "an array")
+    );
+    assert_eq!(
+        typed(r#"[{"id": "bar", "dst": [5]}]"#, &[]),
+        ("dst", "an object")
+    );
+    // A wrapper choosing nothing, or a null field, gives no group.
+    for field in [
+        format!(r#"[{{"if": 901, "value": {bar}}}]"#),
+        r#"[{"if": 901, "values": 42}]"#.to_owned(),
+        "null".to_owned(),
+    ] {
+        let src = body("", &note(&format!(r#""group": {field}"#)), &[NOTES]);
+        let i = import_beside(&src, &[]).unwrap();
+        assert_eq!(i.report.usage.bar_groups, 0, "{field}");
+    }
+    // Chosen, a wrapper's group maps.
+    let src = body(
+        "",
+        &note(&format!(r#""group": [{{"if": -901, "value": {bar}}}]"#)),
+        &[NOTES],
+    );
+    let i = import_beside(&src, &[]).unwrap();
+    assert_eq!(i.report.usage.bar_groups, 1);
 }
 
 fn mine_hit(ms: i64, l: u8) -> JudgeEvent {

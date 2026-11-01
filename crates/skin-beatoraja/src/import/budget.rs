@@ -5,7 +5,7 @@
 use std::fmt;
 
 use skin_model::{
-    Charge, MAX_ELEMENTS, MAX_FILES, MAX_FONTS, MAX_IMAGE_CHOICE_REFS, MAX_IMAGES,
+    Charge, MAX_BAR_GROUPS, MAX_ELEMENTS, MAX_FILES, MAX_FONTS, MAX_IMAGE_CHOICE_REFS, MAX_IMAGES,
     MAX_SHEET_GLYPHS, MAX_SHEET_KERNINGS, MAX_SKIN_FRAMES, MAX_SKIN_KEYS, MAX_SKIN_OPS,
     MAX_TEXT_ELEMENTS, MAX_TOTAL_FILE_BYTES, MAX_TOTAL_FONT_BYTES, MAX_TRACK_KEYS, MAX_WHEN_TIMERS,
     MAX_WIDGET_QUADS, Program, SkinOps,
@@ -46,6 +46,9 @@ pub enum ImportLimit {
     /// More than [`MAX_IMAGE_CHOICE_REFS`] image choice entries, holes and
     /// repeats included.
     ChoiceRefs,
+    /// More than [`MAX_BAR_GROUPS`] bar line groups, dropped ones
+    /// included.
+    BarGroups,
 }
 
 impl fmt::Display for ImportLimit {
@@ -65,6 +68,7 @@ impl fmt::Display for ImportLimit {
             Self::Texts => write!(f, "more than {MAX_TEXT_ELEMENTS} text elements"),
             Self::WidgetQuads => write!(f, "more than {MAX_WIDGET_QUADS} widget quads"),
             Self::ChoiceRefs => write!(f, "more than {MAX_IMAGE_CHOICE_REFS} image choice entries"),
+            Self::BarGroups => write!(f, "more than {MAX_BAR_GROUPS} bar line groups"),
         }
     }
 }
@@ -213,6 +217,16 @@ impl Budget {
         )
     }
 
+    /// The lanes' `n` bar line groups, before any is read.
+    pub(crate) fn bar_groups(&mut self, n: usize) -> Result<(), ImportLimit> {
+        charge(
+            &mut self.usage.bar_groups,
+            n,
+            MAX_BAR_GROUPS,
+            ImportLimit::BarGroups,
+        )
+    }
+
     /// One text element and its `quads` at worst.
     pub(crate) fn text(&mut self, quads: u32) -> Result<(), ImportLimit> {
         charge(
@@ -252,6 +266,14 @@ mod tests {
         assert_eq!(b.image(1), Err(ImportLimit::Images));
         assert_eq!(b.usage.images as usize, MAX_IMAGES);
         assert_eq!(b.usage.frames as usize, MAX_IMAGES);
+    }
+
+    #[test]
+    fn bar_groups_are_capped() {
+        let mut b = Budget::default();
+        b.bar_groups(MAX_BAR_GROUPS).unwrap();
+        assert_eq!(b.bar_groups(1), Err(ImportLimit::BarGroups));
+        assert_eq!(b.usage.bar_groups as usize, MAX_BAR_GROUPS);
     }
 
     #[test]

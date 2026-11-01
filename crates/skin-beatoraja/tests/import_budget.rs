@@ -10,8 +10,8 @@ use std::fs;
 use common::{Loaded, font, hd, import_with, join, png, skin};
 use skin_beatoraja::{ImportError, ImportLimit};
 use skin_model::{
-    MAX_ELEMENTS, MAX_FILES, MAX_FONTS, MAX_IMAGE_CHOICE_REFS, MAX_SKIN_FRAMES, MAX_SKIN_KEYS,
-    MAX_SKIN_OPS, MAX_TEXT_ELEMENTS, MAX_TOTAL_FILE_BYTES, MAX_WIDGET_QUADS,
+    MAX_BAR_GROUPS, MAX_ELEMENTS, MAX_FILES, MAX_FONTS, MAX_IMAGE_CHOICE_REFS, MAX_SKIN_FRAMES,
+    MAX_SKIN_KEYS, MAX_SKIN_OPS, MAX_TEXT_ELEMENTS, MAX_TOTAL_FILE_BYTES, MAX_WIDGET_QUADS,
 };
 
 fn as_u32(n: usize) -> u32 {
@@ -586,4 +586,52 @@ fn a_shared_selector_is_charged_per_destination() {
         assert_eq!(l.report().usage.ops, 2 * one, "{dsts:?}");
         assert_eq!(l.ok().skin.ops().total(), 2 * one as usize, "{dsts:?}");
     }
+}
+
+/// The lanes with `n` bar groups of image `bar`, the first `first`.
+fn bar_groups(n: usize, first: &str) -> Loaded {
+    let bar = r#"{"id": "bar", "dst": [{"x": 20, "y": 200, "w": 430, "h": 2}]}"#;
+    let groups =
+        join(std::iter::once(first.to_owned()).chain(std::iter::repeat_n(bar.to_owned(), n - 1)));
+    let note = common::lanes::note(&format!(r#""group": [{groups}]"#));
+    play(&note, &[common::lanes::NOTES.to_owned()])
+}
+
+#[test]
+fn bar_groups_cap() {
+    let bar = r#"{"id": "bar", "dst": [{"x": 20, "y": 200, "w": 430, "h": 2}]}"#;
+    let l = bar_groups(MAX_BAR_GROUPS, bar);
+    assert_eq!(l.report().usage.bar_groups, as_u32(MAX_BAR_GROUPS));
+    assert_eq!(l.ok().skin.bar_group_count(), MAX_BAR_GROUPS);
+    // One group more is the limit before any group is read: a malformed
+    // key is never met.
+    limit(bar_groups(MAX_BAR_GROUPS + 1, bar), ImportLimit::BarGroups);
+    let malformed = r#"{"id": "bar", "dst": [{"time": [], "w": 1, "h": 1}]}"#;
+    assert!(matches!(
+        bar_groups(1, malformed).err(),
+        ImportError::Type { .. }
+    ));
+    limit(
+        bar_groups(MAX_BAR_GROUPS + 1, malformed),
+        ImportLimit::BarGroups,
+    );
+}
+
+#[test]
+fn bar_groups_charge_their_keys_before_reading_them() {
+    // The lanes emit one key, a group its two as written.
+    let group = |keys: &str| format!(r#""group": [{{"id": "bar", "dst": [{keys}]}}]"#);
+    let with = |n: usize, keys: &str| {
+        let mut dsts = filler(n);
+        dsts.push(common::lanes::NOTES.to_owned());
+        play(&common::lanes::note(&group(keys)), &dsts)
+    };
+    let good = r#"{"time": 0, "w": 1, "h": 1}, {"time": 9, "w": 1, "h": 1}"#;
+    let l = with(MAX_SKIN_KEYS - 3, good);
+    assert_eq!(l.report().usage.keys, as_u32(MAX_SKIN_KEYS));
+    limit(with(MAX_SKIN_KEYS - 2, good), ImportLimit::Keys);
+    // Past the keys their charge comes before the unreadable key.
+    let bad = r#"{"time": 0, "w": 1, "h": 1}, {"time": [], "w": 1, "h": 1}"#;
+    assert!(matches!(with(0, bad).err(), ImportError::Type { .. }));
+    limit(with(MAX_SKIN_KEYS - 2, bad), ImportLimit::Keys);
 }

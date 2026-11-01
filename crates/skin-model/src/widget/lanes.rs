@@ -1,11 +1,12 @@
-//! The lanes widget: notes, long notes, mines, bar lines, the judgment line
-//! and the hidden and lift covers on lanes a skin authors as rects, drawn
+//! The lanes widget: notes, long notes, mines, bar groups, the judgment
+//! line and the hidden and lift covers on lanes a skin authors as rects, drawn
 //! as the simple skin draws them (crates/render/src/simple.rs) or as the
 //! source player draws an imported skin ([`LaneStyle`]).
 //!
 //! Its work per frame is bounded twice: [`LANE_VISITS`] candidates
-//! (notes and bar lines met, drawn or skipped) and [`LANE_QUADS`] quads
-//! for them. The judgment line and the two covers are reserved and drawn
+//! (notes and bars of each group met, drawn or skipped) and [`LANE_QUADS`]
+//! quads for them, which the bar groups ([`BarGroupDef`]) and the notes
+//! share. The judgment line and the two covers are reserved and drawn
 //! whatever the notes spent.
 //!
 //! The lift raises the judgment line by its share of the lane; the lane
@@ -26,20 +27,23 @@
 
 use bms_model::{LANE_COUNT, Lane, Note, NoteKind, Position, TimeUs};
 
-use super::ImageRef;
+use super::bar::{BarGroup, BarGroupDef, BarScratch, Field, Template};
 use super::scroll::Scale;
+use super::{Brush, ImageRef, sample, tint};
 use crate::atlas::uv::{FrameUv, UvTable};
 use crate::canvas::f32_of;
-use crate::place::Affine;
+use crate::expr::State;
+use crate::place::{Affine, Placement};
 use crate::play::reducer::is_target;
 use crate::play::{Notes, Play};
 use crate::quad::{Filter, Quad, QuadBatch, RunKey};
-use crate::skin::MAX_COORD;
+use crate::skin::{MAX_COORD, TimerRef, radians};
 
-/// The quads one frame's bar lines and notes may take.
+/// The quads one frame's bars and notes may take.
 pub const LANE_QUADS: u32 = 8_192;
-/// The candidates one frame may visit: each bar line and note the visible
-/// range meets, whether drawn, judged, outside the section or culled.
+/// The candidates one frame may visit: each bar a group's window and each
+/// note the visible range meets, whether drawn, judged, outside the
+/// section or culled.
 pub const LANE_VISITS: u32 = 2 * LANE_QUADS;
 /// The quads reserved beyond [`LANE_QUADS`]: the judgment line, the
 /// hidden cover and the lift cover.
@@ -54,6 +58,7 @@ pub enum Side {
 
 /// The images of the lanes' parts, each a sheet image index. Per-lane
 /// parts are indexed by [`Lane::index`]. A part left out is not drawn.
+/// The bar lines are groups of their own ([`LanesDef::bar_groups`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LaneParts {
     pub note: [u32; LANE_COUNT],
@@ -64,7 +69,6 @@ pub struct LaneParts {
     /// A long note's body otherwise.
     pub body_off: [u32; LANE_COUNT],
     pub mine: [u32; LANE_COUNT],
-    pub bar: Option<u32>,
     pub line: Option<u32>,
     pub lift: Option<u32>,
     /// The hidden cover (HIDDEN+).
@@ -134,14 +138,15 @@ pub enum LanePart {
     BodyOn,
     BodyOff,
     Mine,
-    Bar,
+    /// The bar group at this index of [`LanesDef::bar_groups`].
+    BarGroup(usize),
     Line,
     Lift,
     Hidden,
 }
 
 /// The lanes as a skin authors them, in reference pixels.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct LanesDef {
     /// How notes are placed and kept.
     pub style: LaneStyle,
@@ -170,9 +175,12 @@ pub struct LanesDef {
     pub hidden_trim: HiddenTrim,
     pub note_h: u16,
     pub mine_h: u16,
-    pub bar_h: u16,
     pub line_h: u16,
     pub parts: LaneParts,
+    /// The bar groups, drawn at every bar line in this order, each in the
+    /// lanes element's region ([`BarGroupDef`]); at most
+    /// [`MAX_BAR_GROUPS`](crate::MAX_BAR_GROUPS).
+    pub bar_groups: Vec<BarGroupDef>,
 }
 
 /// What the lanes show this frame: the hi-speed and the covers.
@@ -219,6 +227,14 @@ pub enum LanesError {
     Source,
     #[error("a {part:?} image does not exist")]
     UnknownPart { part: LanePart },
+    #[error("the lanes have {n} bar groups, more than {max}", max = super::bar::MAX_BAR_GROUPS)]
+    TooManyBarGroups { n: usize },
+    #[error("bar group {group}")]
+    BarGroup {
+        group: usize,
+        #[source]
+        error: super::bar::BarGroupError,
+    },
 }
 
 impl LanesDef {
@@ -234,7 +250,6 @@ impl LanesDef {
             (LanePart::Mine, &p.mine),
         ];
         let single = [
-            (LanePart::Bar, p.bar),
             (LanePart::Line, p.line),
             (LanePart::Lift, p.lift),
             (LanePart::Hidden, p.hidden),
@@ -246,6 +261,12 @@ impl LanesDef {
                 single
                     .into_iter()
                     .filter_map(|(part, i)| i.map(|i| (part, i))),
+            )
+            .chain(
+                self.bar_groups
+                    .iter()
+                    .enumerate()
+                    .map(|(g, b)| (LanePart::BarGroup(g), b.image)),
             )
     }
 
@@ -282,7 +303,7 @@ impl LanesDef {
         }
         let [top, line, bottom] = [self.top, self.line, self.bottom].map(i64::from);
         if !(within(top) && within(bottom) && top < line && line <= bottom)
-            || [self.note_h, self.mine_h, self.bar_h, self.line_h].contains(&0)
+            || [self.note_h, self.mine_h, self.line_h].contains(&0)
         {
             return Err(LanesError::Heights);
         }
@@ -362,14 +383,13 @@ pub(crate) struct Parts {
     pub(crate) body_on: [ImageRef; LANE_COUNT],
     pub(crate) body_off: [ImageRef; LANE_COUNT],
     pub(crate) mine: [ImageRef; LANE_COUNT],
-    pub(crate) bar: Option<ImageRef>,
     pub(crate) line: Option<ImageRef>,
     pub(crate) lift: Option<ImageRef>,
     pub(crate) hidden: Option<ImageRef>,
 }
 
 /// Loaded lanes.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct Lanes {
     /// `(x, w)` per lane, as authored.
     lanes: [[i64; 2]; LANE_COUNT],
@@ -388,14 +408,20 @@ pub(crate) struct Lanes {
     hidden_trim: HiddenTrim,
     note_h: f32,
     mine_h: f32,
-    bar_h: f32,
     line_h: f32,
     parts: Parts,
+    pub(crate) bar_groups: Box<[BarGroup]>,
 }
 
 impl Lanes {
-    /// Lanes from a checked definition, with its parts resolved.
-    pub(crate) fn new(def: &LanesDef, image: impl Fn(u32) -> ImageRef) -> Self {
+    /// Lanes from a checked definition, with its parts and its groups'
+    /// images and timer slots resolved; the groups' tracks and programs
+    /// move.
+    pub(crate) fn new(
+        def: LanesDef,
+        image: impl Fn(u32) -> ImageRef,
+        slot: impl Fn(TimerRef) -> usize,
+    ) -> Self {
         let lanes = def.lanes.map(|[x, w]| [i64::from(x), i64::from(w)]);
         let edges = |l: &[[i64; 2]]| {
             l.iter().fold([i64::MAX, i64::MIN], |[a, b], &[x, w]| {
@@ -420,7 +446,6 @@ impl Lanes {
             hidden_trim: def.hidden_trim,
             note_h: f32::from(def.note_h),
             mine_h: f32::from(def.mine_h),
-            bar_h: f32::from(def.bar_h),
             line_h: f32::from(def.line_h),
             parts: Parts {
                 note: p.note.map(&image),
@@ -429,11 +454,25 @@ impl Lanes {
                 body_on: p.body_on.map(&image),
                 body_off: p.body_off.map(&image),
                 mine: p.mine.map(&image),
-                bar: p.bar.map(&image),
                 line: p.line.map(&image),
                 lift: p.lift.map(&image),
                 hidden: p.hidden.map(&image),
             },
+            bar_groups: def
+                .bar_groups
+                .into_iter()
+                .map(|g| BarGroup {
+                    image: image(g.image),
+                    track: g.track,
+                    slot: slot(g.timer),
+                    visible: g.visible,
+                    blend: g.blend,
+                    pivot: g.place.pivot.fractions(),
+                    bind: g.place.bind,
+                    native: g.place.native,
+                    follow: g.place.follow,
+                })
+                .collect(),
         }
     }
 
@@ -497,6 +536,9 @@ impl Lanes {
 /// What the lanes draw from this frame.
 pub(crate) struct Draw<'a> {
     pub(crate) play: &'a Play,
+    /// The frame's fields and timers, which the bar groups' visibilities
+    /// read.
+    pub(crate) state: &'a State<'a>,
     /// The frame's clock, which image cycles age on.
     pub(crate) now: TimeUs,
     /// The display clock, which positions follow.
@@ -508,10 +550,14 @@ pub(crate) struct Draw<'a> {
     /// without notes.
     pub(crate) complete: bool,
     pub(crate) geometry: &'a Geometry,
+    /// The regions' placement, whose bind maps the bar groups read.
+    pub(crate) placement: &'a Placement,
     pub(crate) affine: Affine,
     pub(crate) color: [f32; 4],
     pub(crate) key: RunKey,
     pub(crate) uvs: &'a UvTable,
+    /// Target pixels per canvas pixel.
+    pub(crate) scale: f32,
 }
 
 /// A part as one frame draws it: its current frame (`None` draws nothing
@@ -602,9 +648,9 @@ impl<'a, 'b> Pen<'a, 'b> {
         self.out.count_drop();
     }
 
-    /// Pushes a bar line or note quad; `false` once the quads are spent or
-    /// the batch is full.
-    fn counted(&mut self, part: Shown, cut: &Cut) -> bool {
+    /// Charges one quad and pushes it with `push`; `false` once the quads
+    /// are spent or the batch is full.
+    fn charged(&mut self, push: impl FnOnce(&mut Self) -> bool) -> bool {
         if self.stopped {
             return false;
         }
@@ -613,11 +659,23 @@ impl<'a, 'b> Pen<'a, 'b> {
             return false;
         }
         self.quads += 1;
-        if !self.push(part, cut) {
+        if !push(self) {
             self.stopped = true;
             return false;
         }
         true
+    }
+
+    /// Pushes a note quad; `false` once the quads are spent or the batch
+    /// is full.
+    fn counted(&mut self, part: Shown, cut: &Cut) -> bool {
+        self.charged(|pen| pen.push(part, cut))
+    }
+
+    /// Pushes a bar's quad with `key`; `false` once the quads are spent or
+    /// the batch is full.
+    fn bar(&mut self, key: RunKey, quad: Quad) -> bool {
+        self.charged(|pen| pen.out.push(key, quad))
     }
 
     /// A cap of height `h` centred at `y`, cut to the lanes.
@@ -685,9 +743,10 @@ pub(crate) struct LaneFrameGeometry {
 }
 
 impl Lanes {
-    /// Draws the lanes into `out`: the bar lines, the judgment line and
-    /// every lane's notes. Allocates nothing.
-    pub(crate) fn draw(&self, d: &Draw<'_>, out: &mut QuadBatch) {
+    /// Draws the lanes into `out`: the bar groups, with `scratch` when
+    /// they have any, the judgment line and every lane's notes. Allocates
+    /// nothing.
+    pub(crate) fn draw(&self, d: &Draw<'_>, scratch: Option<&mut BarScratch>, out: &mut QuadBatch) {
         let Some(notes) = d.play.notes() else {
             return;
         };
@@ -701,6 +760,12 @@ impl Lanes {
         );
         let mut pen = Pen::new(d, out);
         let ringing_out = d.complete && notes.section.is_some();
+        // With no scroll left nothing is scaled and no bar is drawn.
+        if g.span > 0.0
+            && let Some(scratch) = scratch
+        {
+            self.bars(&mut pen, notes, &scale, scratch);
+        }
         match self.style {
             LaneStyle::Simple => self.simple(&mut pen, notes, &scale, g.span, ringing_out),
             LaneStyle::Source(s) => self.source(&mut pen, notes, &scale, s, g.span, ringing_out),
@@ -766,27 +831,70 @@ impl Lanes {
         }
     }
 
-    /// The bar lines at positions `[from, to]`, centred `shift` below
-    /// their position's y.
-    fn bars(
-        &self,
-        pen: &mut Pen<'_, '_>,
-        notes: &Notes,
-        scale: &Scale,
-        [from, to]: [Position; 2],
-        shift: f32,
-    ) {
+    /// The bar groups at every bar line: each group sampled once and its
+    /// window found, then the candidates in chart order, a bar's groups
+    /// in group order, each spending a visit and each drawn one a quad of
+    /// the pen's budgets.
+    fn bars(&self, pen: &mut Pen<'_, '_>, notes: &Notes, scale: &Scale, scratch: &mut BarScratch) {
         let d = pen.d;
-        let [sx, sw] = d.geometry.span.map(f32_of);
-        if let Some(bar) = self.parts.bar.map(|p| d.shown(&p)) {
-            let bars = &notes.bars;
-            let start = bars.partition_point(|&p| p < from);
-            for &p in bars.iter().skip(start).take_while(|&&p| p <= to) {
-                if !(pen.visit() && pen.cap(bar, sx, sw, scale.y(p) + shift, self.bar_h)) {
-                    break;
-                }
-            }
+        let [b0, b1] = [d.frame.top, d.frame.bottom].map(|y| d.affine.point([0.0, f32_of(y)])[1]);
+        let field = Field {
+            bars: &notes.bars,
+            scale,
+            band: [b0.min(b1), b0.max(b1)],
+        };
+        for (i, g) in self.bar_groups.iter().enumerate() {
+            scratch.set(i, self.template(d, g), &field);
         }
+        scratch.walk(&field, |c| {
+            if !pen.visit() {
+                return false;
+            }
+            let Some(quad) = c.quad else {
+                return true;
+            };
+            let blend = self
+                .bar_groups
+                .get(c.group)
+                .map_or(d.key.blend, |g| g.blend);
+            let key = RunKey {
+                blend,
+                clip: d.key.clip,
+            };
+            pen.bar(key, quad)
+        });
+    }
+
+    /// Group `g`'s template this frame, on the frame's clock: none while
+    /// its timer is off, it is hidden, its track does not draw, its image
+    /// shows no frame or its quad, natively sized, has no area.
+    fn template(&self, d: &Draw<'_>, g: &BarGroup) -> Option<Template> {
+        let (_, s) = sample(d.play, d.now, d.state, g.slot, g.visible.as_ref(), &g.track)?;
+        let frame = g.image.frame(d.play, d.now, d.uvs)?;
+        let [x, y, w, h] = s.rect;
+        let t = Template {
+            brush: Brush {
+                key: RunKey {
+                    blend: g.blend,
+                    clip: d.key.clip,
+                },
+                affine: d.affine,
+                map: d.placement.bind(g.bind),
+                pivot: g.pivot,
+                angle: radians(s.angle),
+                color: tint(s.color, d.color),
+                native: g.native,
+                scale: d.scale,
+            },
+            x,
+            w,
+            h,
+            base: f64::from(y) + g.follow.dy(Some(d.frame)),
+            frame,
+            filter: g.image.filter,
+        };
+        let [.., qw, qh] = t.quad(0.0).rect;
+        (qw != 0.0 && qh != 0.0).then_some(t)
     }
 
     /// The frame's geometry for `view`, each amount at most 1 000 ‰: the
@@ -834,9 +942,9 @@ impl Lanes {
         }
     }
 
-    /// The simple skin's bar lines, judgment line and notes; with no
-    /// scroll left (`span` 0) nothing is scaled and only the line is
-    /// drawn, the covers hiding the whole lane.
+    /// The simple skin's judgment line and notes; with no scroll left
+    /// (`span` 0) nothing is scaled and only the line is drawn, the covers
+    /// hiding the whole lane.
     fn simple(
         &self,
         pen: &mut Pen<'_, '_>,
@@ -850,12 +958,11 @@ impl Lanes {
             self.line(pen, line);
             return;
         }
-        let pad = self.note_h.max(self.mine_h).max(self.bar_h) / 2.0;
+        let pad = self.note_h.max(self.mine_h) / 2.0;
         let (from, to) = scale.positions(
             f32_of(f64::from(self.bottom) - scale.line_y) + pad,
             f32_of(scale.line_y - f64::from(self.top)) + pad,
         );
-        self.bars(pen, notes, scale, [from, to], 0.0);
         self.line(pen, line);
         if !ringing_out {
             for lane in Lane::all() {
@@ -927,11 +1034,10 @@ impl Lanes {
         true
     }
 
-    /// The source player's bar lines, judgment line and notes
-    /// ([`SourceLanes`]). With no scroll left (`span` 0) nothing is
-    /// scaled: every tap and mine whose time has not passed is drawn on
-    /// the line, as the source then draws every note there, and no long
-    /// note or bar line is drawn.
+    /// The source player's judgment line and notes ([`SourceLanes`]).
+    /// With no scroll left (`span` 0) nothing is scaled: every tap and
+    /// mine whose time has not passed is drawn on the line, as the source
+    /// then draws every note there, and no long note is drawn.
     fn source(
         &self,
         pen: &mut Pen<'_, '_>,
@@ -943,17 +1049,13 @@ impl Lanes {
     ) {
         let range = (span > 0.0).then(|| {
             // A note's lower edge sits `offset_y` above its position's y.
-            let pad = s.note_h.max(self.bar_h);
+            let pad = s.note_h;
             let (from, to) = scale.positions(
                 f32_of(f64::from(s.bottom) - scale.line_y) + s.offset_y + pad,
                 f32_of(scale.line_y - f64::from(self.top)) + pad,
             );
             [from, to]
         });
-        if let Some(range) = range {
-            // At the notes' centres.
-            self.bars(pen, notes, scale, range, -s.offset_y - s.note_h / 2.0);
-        }
         self.line(pen, f32_of(scale.line_y));
         if !ringing_out {
             for lane in Lane::all() {

@@ -10,9 +10,9 @@ mod play_support;
 use bms_model::{Chart, ChartBuilder, Lane, TimeUs};
 use eval::{JudgeEvent, JudgeEventKind, Section};
 use lanes_support::{
-    BAR, BODY_OFF, BODY_ON, COVER, HEAD, HIDDEN, LIFT, LINE, MINE, NOTE, TAIL, WHITE, bound,
-    cover_image, image, in_column, in_lane, in_region, lanes_element, lanes_skin, paint, quads_of,
-    rects, simple, skin_with, skin_with_widgets, still, with_markers,
+    BAR, BODY_OFF, BODY_ON, COVER, HEAD, HIDDEN, LIFT, LINE, MINE, NOTE, TAIL, WHITE, bar_group,
+    bound, cover_image, image, in_column, in_lane, in_region, lanes_element, lanes_skin, paint,
+    quads_of, rects, simple, skin_with, skin_with_widgets, still, with_markers,
 };
 use play_support::{GAUGES, Harness, MS, REGIONS, ev, full, hold_ended, judged, lane, ln_held};
 use rules::Judgment;
@@ -422,9 +422,12 @@ fn loaded(text: &str) -> Chart {
     chart
 }
 
-/// Whole bar lines (cut ones excluded).
+/// The bar lines wholly inside the lanes (y from 80 to 960).
 fn bars(h: &Harness) -> Vec<[f32; 4]> {
-    rects(h, BAR).into_iter().filter(|r| r[3] == 2.0).collect()
+    rects(h, BAR)
+        .into_iter()
+        .filter(|r| r[1] >= 80.0 && r[1] + r[3] <= 960.0)
+        .collect()
 }
 
 #[test]
@@ -591,8 +594,9 @@ fn display_offset_moves_notes() {
 fn the_culling_range_follows_the_tallest_part() {
     // A tap, a mine and a bar line 615 ms ahead: at 800 px per 600 ms
     // their centres are 20 px above the top (80). Made 64 tall, each
-    // reaches 12 px into the lanes, so it is drawn cut to [80, 92], though
-    // a padding of half the default note (8) would have culled it.
+    // reaches 12 px into the lanes, so a note is drawn cut to [80, 92],
+    // though a padding of half the default note (8) would have culled it,
+    // and the bar whole: its window is its own, not the notes'.
     let at = TimeUs(1_600 * MS);
     let mut chart = ChartBuilder::new(BPM)
         .tap(lane(3), at)
@@ -611,8 +615,8 @@ fn the_culling_range_follows_the_tallest_part() {
     assert_eq!(in_lane(&h, NOTE, lane(3)), [[384.0, 80.0, 64.0, 12.0]]);
     let h = tall(|d| d.mine_h = 64);
     assert_eq!(in_lane(&h, MINE, lane(5)), [[512.0, 80.0, 64.0, 12.0]]);
-    let h = tall(|d| d.bar_h = 64);
-    assert_eq!(rects(&h, BAR), [[160.0, 80.0, 544.0, 12.0]]);
+    let h = tall(|d| d.bar_groups = vec![bar_group(848, 64)]);
+    assert_eq!(rects(&h, BAR), [[160.0, 28.0, 544.0, 64.0]]);
     // At the default heights all three are culled there.
     let h = tall(|_| {});
     assert!(in_lane(&h, NOTE, lane(3)).is_empty());
@@ -1152,7 +1156,7 @@ fn taps(per_lane: i64, step: i64, extra: i64) -> Chart {
 /// elements beside them and a SUDDEN+ paint after them.
 fn budget_skin() -> Skin {
     let mut def = simple();
-    def.parts.bar = None;
+    def.bar_groups.clear();
     let screen = Place::SCREEN;
     skin_with_widgets(
         REGIONS,
@@ -1370,8 +1374,11 @@ fn places_and_lanes_are_checked_at_load() {
         err(def_with(vec![elsewhere.clone()], Some(simple()))),
         LoadError::LanesRegion
     ));
-    // Under a fixed canvas the lanes sit in `screen`, and only there.
-    let mut fixed = def_with(vec![elsewhere], Some(simple()));
+    // Under a fixed canvas the lanes sit in `screen`, and only there,
+    // their bar groups with them.
+    let mut screen_lanes = simple();
+    screen_lanes.bar_groups[0].place.region = Region::Screen;
+    let mut fixed = def_with(vec![elsewhere], Some(screen_lanes));
     fixed.fit = Fit::Fixed;
     assert!(Skin::new(fixed).is_ok());
     let beam = |region| {
@@ -1435,7 +1442,9 @@ fn places_and_lanes_are_checked_at_load() {
         (bad.top, bad.line, bad.bottom) = (top, line, bottom);
         assert_eq!(lanes_err(bad), LanesError::Heights, "{top} {line} {bottom}");
     }
+    // The lift's reach here would move the following bar group out.
     let mut edge = simple();
+    edge.bar_groups.clear();
     (edge.top, edge.line, edge.bottom) = (-MAX_COORD, 880, 880);
     let max = MAX_COORD as f32;
     edge.lift_at = max - 880.0;

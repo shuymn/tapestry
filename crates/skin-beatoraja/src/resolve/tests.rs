@@ -1,7 +1,8 @@
 //! The bounds the input caps make unreachable at their standard values,
 //! at lowered values: every expanded record is a node of its own, since a
 //! repeated file is parsed again, and every decoded byte comes from a
-//! retained input byte, so the node and input caps fire first.
+//! retained input byte, so the node and input caps fire first. Then the
+//! structure of the bar line groups, checked as they resolve.
 
 use std::collections::BTreeSet;
 
@@ -110,4 +111,109 @@ fn successful_resolution_builds_no_location() {
     // The counter sees a location when one is built.
     let _ = def.loc(def.top);
     assert_eq!(RESCANS.with(std::cell::Cell::get), 1);
+}
+
+/// The `note` record's groups of a skin whose `group` field is `group`,
+/// beside the files `files`, with option 901 enabled: each group's
+/// record and its `dst` keys, or what resolution refuses as a type error.
+fn groups(group: &str, files: &[(&str, &str)]) -> Result<Vec<usize>, (&'static str, &'static str)> {
+    let d = skin(&format!(r#"{{"type": 0, "note": {{"group": {group}}}}}"#));
+    for (name, text) in files {
+        std::fs::write(d.path().join(name), text).unwrap();
+    }
+    let mut def = Definition::read_with(d.path(), "s.json", Limits::STANDARD).unwrap();
+    let enabled = BTreeSet::from([901]);
+    let tables = resolve(&mut def, &enabled).and_then(|mut r| r.tables(&enabled));
+    match tables {
+        Ok(t) => {
+            let note = t.records[3].unwrap();
+            let [field] = def.fields(note, ["group"]);
+            let list = field
+                .and_then(|f| t.nested.get(&f))
+                .cloned()
+                .unwrap_or_default();
+            Ok(list
+                .iter()
+                .map(|&g| {
+                    let [dst] = def.fields(g, ["dst"]);
+                    dst.and_then(|f| t.nested.get(&f)).map_or(0, Vec::len)
+                })
+                .collect())
+        }
+        Err(ImportError::Type {
+            field, expected, ..
+        }) => Err((field, expected)),
+        Err(e) => panic!("{group}: {e:?}"),
+    }
+}
+
+#[test]
+fn groups_resolve_through_their_wrappers() {
+    let bar = r#"{"id": "bar", "dst": [{"x": 0}, {"x": 1}]}"#;
+    assert_eq!(groups(&format!("[{bar}, {bar}]"), &[]), Ok(vec![2, 2]));
+    assert_eq!(
+        groups(
+            &format!(r#"[{{"if": 901, "value": {bar}}}, {{"if": -901, "values": 42}}]"#),
+            &[]
+        ),
+        Ok(vec![2])
+    );
+    assert_eq!(
+        groups(
+            r#"{"include": "g.json"}"#,
+            &[("g.json", &format!("[{bar}]"))]
+        ),
+        Ok(vec![2])
+    );
+    // A wrapper choosing nothing, or a null field, gives no group.
+    assert_eq!(groups(r#"[{"if": -901, "value": 42}]"#, &[]), Ok(vec![]));
+    assert_eq!(groups("null", &[]), Ok(vec![]));
+    assert_eq!(groups(r#"[{"id": "bar", "dst": null}]"#, &[]), Ok(vec![0]));
+}
+
+#[test]
+fn malformed_groups_are_refused() {
+    let array = Err(("group", "an array"));
+    let object = Err(("group", "an object"));
+    assert_eq!(groups("42", &[]), array);
+    assert_eq!(groups(r#""bar""#, &[]), array);
+    assert_eq!(
+        groups(r#"{"include": "g.json"}"#, &[("g.json", "42")]),
+        array
+    );
+    assert_eq!(groups(r#"[{"if": 901, "values": true}]"#, &[]), array);
+    // A single record where the array stands, written there or included.
+    let bar = r#"{"id": "bar", "dst": [{"x": 0}]}"#;
+    assert_eq!(groups(bar, &[]), array);
+    assert_eq!(
+        groups(r#"{"include": "g.json"}"#, &[("g.json", bar)]),
+        array
+    );
+    assert_eq!(
+        groups(&format!(r#"[{{"if": 901, "values": {bar}}}]"#), &[]),
+        array
+    );
+    assert_eq!(groups("[42]", &[]), object);
+    assert_eq!(groups(r#"[{"if": 901, "value": 42}]"#, &[]), object);
+    assert_eq!(
+        groups(r#"[{"include": "g.json"}]"#, &[("g.json", "[true]")]),
+        object
+    );
+    assert_eq!(
+        groups(r#"[{"id": "bar", "dst": 5}]"#, &[]),
+        Err(("dst", "an array"))
+    );
+    for dst in [r#"{"x": 0}"#, r#"{"include": "d.json"}"#] {
+        assert_eq!(
+            groups(
+                &format!(r#"[{{"id": "bar", "dst": {dst}}}]"#),
+                &[("d.json", r#"{"x": 0}"#)]
+            ),
+            Err(("dst", "an array"))
+        );
+    }
+    assert_eq!(
+        groups(r#"[{"id": "bar", "dst": [{"x": 0}, 5]}]"#, &[]),
+        Err(("dst", "an object"))
+    );
 }
