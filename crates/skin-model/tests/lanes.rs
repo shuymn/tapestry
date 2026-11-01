@@ -610,12 +610,11 @@ fn the_cover_and_the_lift_shorten_the_visible_span() {
 }
 
 /// A harness over `chart` on the simple lanes changed by `set`, its view
-/// set to `cover` and `lift`, at `now` ms.
+/// set to `[cover, lift, hidden]`, at `now` ms.
 fn covered(
     chart: &Chart,
     set: impl FnOnce(&mut LanesDef),
-    cover: u16,
-    lift: u16,
+    [cover, lift, hidden]: [u16; 3],
     now: i64,
 ) -> Harness {
     let mut def = simple();
@@ -623,6 +622,7 @@ fn covered(
     let mut h = Harness::new(lanes_skin(def), chart, &full(0));
     h.view.cover = cover;
     h.view.lift = lift;
+    h.view.hidden = hidden;
     h.frame(now, &[]);
     h
 }
@@ -637,11 +637,11 @@ fn the_cover_is_painted_from_its_anchor() {
     // 10 px under the top (80), and one at 10 ‰ (8 px) 18 px.
     let below = |d: &mut LanesDef| d.cover_at = 90.0;
     assert_eq!(
-        rects(&covered(&chart, below, 0, 0, 700), COVER),
+        rects(&covered(&chart, below, [0, 0, 0], 700), COVER),
         [[160.0, 80.0, 544.0, 10.0]]
     );
     assert_eq!(
-        rects(&covered(&chart, below, 10, 0, 700), COVER),
+        rects(&covered(&chart, below, [10, 0, 0], 700), COVER),
         [[160.0, 80.0, 544.0, 18.0]]
     );
 }
@@ -651,7 +651,7 @@ fn the_cover_keeps_its_own_height() {
     // 200 tall: at 500 ‰ (400 px) its lower edge is at 480, and the whole
     // image is drawn above it.
     let chart = ChartBuilder::new(BPM).build().unwrap();
-    let h = covered(&chart, |d| d.cover_h = 200.0, 500, 0, 700);
+    let h = covered(&chart, |d| d.cover_h = 200.0, [500, 0, 0], 700);
     let [cover] = quads_of(&h, COVER)[..] else {
         panic!("one cover");
     };
@@ -666,8 +666,7 @@ fn the_lift_cover_keeps_its_own_height() {
     let h = covered(
         &chart,
         |d| (d.lift_at, d.lift_h) = (960.0, 50.0),
-        0,
-        200,
+        [0, 200, 0],
         700,
     );
     let [lift] = quads_of(&h, LIFT)[..] else {
@@ -690,10 +689,10 @@ fn the_covers_may_hide_the_whole_lane() {
     let anchors = |d: &mut LanesDef| {
         (d.top, d.line, d.bottom, d.cover_at, d.lift_at) = (200, 800, 800, 260.0, 800.0);
     };
-    let h = covered(&chart, anchors, 900, 0, 700);
+    let h = covered(&chart, anchors, [900, 0, 0], 700);
     let r = rects(&h, COVER)[0];
     assert_eq!(r[1] + r[3], 800.0);
-    let h = covered(&chart, anchors, 900, 0, 1_000);
+    let h = covered(&chart, anchors, [900, 0, 0], 1_000);
     let centres: Vec<f32> = in_lane(&h, NOTE, lane(3))
         .iter()
         .map(|r| r[1] + r[3] / 2.0)
@@ -702,7 +701,7 @@ fn the_covers_may_hide_the_whole_lane() {
     // With no scroll left, by the lift, the cover or both, nothing is
     // divided by it: no note is drawn, only the line and the covers.
     for (cover, lift, line) in [(0, 1_000, 200.0), (1_000, 0, 800.0), (1_000, 1_000, 200.0)] {
-        let h = covered(&chart, anchors, cover, lift, 1_000);
+        let h = covered(&chart, anchors, [cover, lift, 0], 1_000);
         let case = format!("cover {cover}, lift {lift}");
         assert!(rects(&h, NOTE).is_empty(), "{case}");
         assert!(rects(&h, BAR).is_empty(), "{case}");
@@ -715,27 +714,9 @@ fn the_covers_may_hide_the_whole_lane() {
 fn the_lift_cover_hangs_from_its_anchor() {
     // Anchored at the bottom (960), a lift of 100 ‰ (80) paints from 880.
     let chart = ChartBuilder::new(BPM).build().unwrap();
-    let h = covered(&chart, |d| d.lift_at = 960.0, 0, 100, 700);
+    let h = covered(&chart, |d| d.lift_at = 960.0, [0, 100, 0], 700);
     assert_eq!(rects(&h, LIFT), [[160.0, 880.0, 544.0, 80.0]]);
     assert_eq!(rects(&h, LINE), [[160.0, 797.0, 544.0, 6.0]]);
-}
-
-/// A harness over `chart` on the simple lanes changed by `set`, its view
-/// set to `[cover, lift, hidden]`, at `now` ms.
-fn hidden_view(
-    chart: &Chart,
-    set: impl FnOnce(&mut LanesDef),
-    [cover, lift, hidden]: [u16; 3],
-    now: i64,
-) -> Harness {
-    let mut def = simple();
-    set(&mut def);
-    let mut h = Harness::new(lanes_skin(def), chart, &full(0));
-    h.view.cover = cover;
-    h.view.lift = lift;
-    h.view.hidden = hidden;
-    h.frame(now, &[]);
-    h
 }
 
 /// `part`'s uv with its lower end cut to the share `to` of its height.
@@ -758,35 +739,35 @@ fn hidden_plus_rises_over_the_notes_from_its_anchor() {
     // its anchor lies above the lanes' bottom.
     let untrimmed = |d: &mut LanesDef| d.hidden_trim = HiddenTrim::None;
     for lift in [0, 300] {
-        let h = hidden_view(&chart, untrimmed, [0, lift, 0], 700);
+        let h = covered(&chart, untrimmed, [0, lift, 0], 700);
         assert!(rects(&h, HIDDEN).is_empty(), "lift {lift}");
     }
     let up = (880.0_f64 - 0.8) as f32;
     assert_eq!(
-        rects(&hidden_view(&chart, untrimmed, [0, 0, 1], 700), HIDDEN),
+        rects(&covered(&chart, untrimmed, [0, 0, 1], 700), HIDDEN),
         [[160.0, up, 544.0, 960.0 - up]]
     );
 
     // 500 ‰ raises it 400 px: its upper edge at 480, its upper half
     // drawn down to the line. 1 000 ‰ raises it to the top, whole.
-    let h = hidden_view(&chart, keep, [0, 0, 500], 700);
+    let h = covered(&chart, keep, [0, 0, 500], 700);
     let [q] = quads_of(&h, HIDDEN)[..] else {
         panic!("one HIDDEN+");
     };
     assert_eq!(q.rect, [160.0, 480.0, 544.0, 400.0]);
     assert_eq!(q.uv, cut_uv(&h, HIDDEN, 0.5));
-    let h = hidden_view(&chart, keep, [0, 0, 1_000], 700);
+    let h = covered(&chart, keep, [0, 0, 1_000], 700);
     let [q] = quads_of(&h, HIDDEN)[..] else {
         panic!("one HIDDEN+");
     };
     assert_eq!(q.rect, [160.0, 80.0, 544.0, 800.0]);
     assert_eq!(q.uv, h.uvs.get(HIDDEN).unwrap().uv);
     // It changes neither the scroll nor the notes under it.
-    let notes = |hidden| rects(&hidden_view(&chart, keep, [250, 100, hidden], 700), NOTE);
+    let notes = |hidden| rects(&covered(&chart, keep, [250, 100, hidden], 700), NOTE);
     assert_eq!(notes(1_000), notes(0));
     assert_eq!(notes(0).len(), 2);
     // A fraction of a pixel is kept: 333 ‰ raises it 266.4 px.
-    let h = hidden_view(&chart, keep, [0, 0, 333], 700);
+    let h = covered(&chart, keep, [0, 0, 333], 700);
     let upper = (880.0_f64 - 800.0 * 333.0 / 1_000.0) as f32;
     assert_eq!(rects(&h, HIDDEN), [[160.0, upper, 544.0, 880.0 - upper]]);
 }
@@ -797,14 +778,14 @@ fn hidden_plus_takes_its_share_of_the_length_above_the_lift() {
     // HIDDEN+ 500 ‰ takes 280 of them on top of the lift: its upper edge
     // at 880 − 240 − 280 = 360, trimmed at the raised line, 640.
     let chart = ChartBuilder::new(BPM).build().unwrap();
-    let h = hidden_view(&chart, |_| {}, [0, 300, 500], 700);
+    let h = covered(&chart, |_| {}, [0, 300, 500], 700);
     let [q] = quads_of(&h, HIDDEN)[..] else {
         panic!("one HIDDEN+");
     };
     assert_eq!(q.rect, [160.0, 360.0, 544.0, 280.0]);
     assert_eq!(q.uv, cut_uv(&h, HIDDEN, 280.0 / 800.0));
     // At 1 000 ‰ it reaches the top whatever the lift.
-    let h = hidden_view(&chart, |_| {}, [0, 300, 1_000], 700);
+    let h = covered(&chart, |_| {}, [0, 300, 1_000], 700);
     assert_eq!(rects(&h, HIDDEN), [[160.0, 80.0, 544.0, 560.0]]);
     // A fixed trim stays put as the lift rises; without one it is cut at
     // the lanes' bottom (960), and so is a trim below the bottom.
@@ -815,7 +796,7 @@ fn hidden_plus_takes_its_share_of_the_length_above_the_lift() {
         (HiddenTrim::Lift(1_300.0), 960.0),
         (HiddenTrim::Lift(900.5), 660.5),
     ] {
-        let h = hidden_view(&chart, |d| d.hidden_trim = trim, [0, 300, 500], 700);
+        let h = covered(&chart, |d| d.hidden_trim = trim, [0, 300, 500], 700);
         assert_eq!(
             rects(&h, HIDDEN),
             [[160.0, 360.0, 544.0, lower - 360.0]],
@@ -824,7 +805,7 @@ fn hidden_plus_takes_its_share_of_the_length_above_the_lift() {
     }
     // A cover shorter than the space above its trim keeps its own
     // height: 100 tall, it ends at 460, whole.
-    let h = hidden_view(&chart, |d| d.hidden_h = 100.0, [0, 300, 500], 700);
+    let h = covered(&chart, |d| d.hidden_h = 100.0, [0, 300, 500], 700);
     let [q] = quads_of(&h, HIDDEN)[..] else {
         panic!("one HIDDEN+");
     };
@@ -837,7 +818,7 @@ fn hidden_plus_takes_its_share_of_the_length_above_the_lift() {
         d.hidden_at = 1_180.0;
         d.hidden_trim = HiddenTrim::Fixed(700.0);
     };
-    assert!(rects(&hidden_view(&chart, low, [0, 0, 500], 700), HIDDEN).is_empty());
+    assert!(rects(&covered(&chart, low, [0, 0, 500], 700), HIDDEN).is_empty());
     // A full lift leaves it no share, but it stays on, hanging from the
     // raised line (80): cut at a fixed trim or at the lanes' bottom, and
     // gone under a trim raised with the line.
@@ -846,16 +827,16 @@ fn hidden_plus_takes_its_share_of_the_length_above_the_lift() {
         (HiddenTrim::None, vec![[160.0, 80.0, 544.0, 800.0]]),
         (HiddenTrim::Lift(880.0), vec![]),
     ] {
-        let h = hidden_view(&chart, |d| d.hidden_trim = trim, [0, 1_000, 500], 700);
+        let h = covered(&chart, |d| d.hidden_trim = trim, [0, 1_000, 500], 700);
         assert_eq!(rects(&h, HIDDEN), want, "{trim:?}");
     }
     // Without its image nothing is drawn.
-    let none = hidden_view(&chart, |d| d.parts.hidden = None, [0, 0, 500], 700);
+    let none = covered(&chart, |d| d.parts.hidden = None, [0, 0, 500], 700);
     assert!(rects(&none, HIDDEN).is_empty());
     // Above 1 000 ‰ counts as 1 000: a cover 100 tall stays at the top.
     let short = |d: &mut LanesDef| d.hidden_h = 100.0;
     assert_eq!(
-        rects(&hidden_view(&chart, short, [0, 300, 1_200], 700), HIDDEN),
+        rects(&covered(&chart, short, [0, 300, 1_200], 700), HIDDEN),
         [[160.0, 80.0, 544.0, 100.0]]
     );
 }
@@ -873,7 +854,7 @@ fn hidden_plus_is_drawn_under_sudden_plus_and_lift() {
     let all = [NOTE, HIDDEN, COVER, LIFT];
     // With no scroll left no note is drawn.
     for (view, want) in [([750, 0, 500], &all[..3]), ([1_000, 200, 1_000], &all[1..])] {
-        let h = hidden_view(&chart, |_| {}, view, 999);
+        let h = covered(&chart, |_| {}, view, 999);
         let order: Vec<u32> = h
             .batch
             .quads()
@@ -887,7 +868,7 @@ fn hidden_plus_is_drawn_under_sudden_plus_and_lift() {
             .collect();
         assert_eq!(order, want, "{view:?}");
     }
-    let h = hidden_view(&chart, |_| {}, [750, 0, 500], 999);
+    let h = covered(&chart, |_| {}, [750, 0, 500], 999);
     assert_eq!(rects(&h, HIDDEN), [[160.0, 480.0, 544.0, 400.0]]);
     assert_eq!(rects(&h, COVER), [[160.0, 80.0, 544.0, 600.0]]);
 }
