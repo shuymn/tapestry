@@ -422,6 +422,7 @@ pub fn draw(imported: &Imported) -> Vec<usize> {
         );
     }
     rate_and_kind_probes(skin, &chart, &uvs, &mut batch);
+    readout_probes(skin, &chart, &uvs, &mut batch);
     counts
 }
 
@@ -565,6 +566,177 @@ fn readouts_for(view: skin_model::LaneView) -> skin_model::FrameReadouts {
             hidden_enabled: true,
             adjusting: false,
         },
+    }
+}
+
+/// The readouts at their extremes, each frame consistent: explicit
+/// tempo, hi-speed and duration, hi-speed unavailable, every cover at
+/// 1 000, covers off with stored amounts, durations of wide integer
+/// ratios and the largest readouts, before, during and past the chart,
+/// each inside the schema's ranges and the skin's capacities.
+fn readout_probes(
+    skin: &skin_model::Skin,
+    chart: &bms_model::Chart,
+    uvs: &skin_model::UvTable,
+    batch: &mut skin_model::QuadBatch,
+) {
+    use bms_model::TimeUs;
+    use eval::{GaugeState, Tally};
+    use rules::{GaugeValue, PerJudgment};
+    use skin_model::{
+        Attempt, BpmRange, CoverSettings, DurationRatio, FrameReadouts, GaugeDesc, GaugeLook,
+        LaneView, Layout, PLAY, PlayContext, READOUT_MAX, Side, SkinFrame, field,
+    };
+
+    let descs = [GaugeDesc {
+        start: GaugeValue(50 * GaugeValue::PERCENT),
+        max: GaugeValue::FULL,
+        look: GaugeLook::Normal,
+        border: GaugeValue(80 * GaugeValue::PERCENT),
+    }];
+    let states = [GaugeState {
+        value: descs[0].start,
+        reference: descs[0].start,
+        failed_at: None,
+    }];
+    let tally = Tally {
+        counts: PerJudgment {
+            perfect: 0,
+            great: 0,
+            good: 0,
+            bad: 0,
+            poor: 0,
+        },
+        ex_score: 0,
+        bp: 0,
+        combo: 0,
+        max_combo: 0,
+        empty_poor: 0,
+    };
+    let top = READOUT_MAX.unsigned_abs();
+    for range in [
+        None,
+        Some(BpmRange {
+            min_x100: 0,
+            max_x100: top,
+        }),
+        Some(BpmRange {
+            min_x100: 15_000,
+            max_x100: 15_000,
+        }),
+    ] {
+        let ctx = PlayContext {
+            gauges: &descs,
+            attempt: Attempt::Full { lead_in: TimeUs(0) },
+            empty_poor_breaks_combo: false,
+            empty_poor_counted: false,
+            scratch: Side::Left,
+            ln_default: rules::LnMode::Ln,
+            last_note_end: TimeUs(0),
+            bpm_range: range,
+        };
+        let mut play = skin
+            .prepare(chart, &ctx)
+            .expect("an imported skin prepares");
+        let ratios = [
+            (6_675, 10),
+            (u128::MAX, 1),
+            (u128::MAX, u128::MAX),
+            (u128::from(top) * 2 + 1, 2),
+            (1, u128::MAX),
+            (0, 7),
+        ];
+        let probes = [
+            (Some(15_000), Some(105), 0, 1_000, 1_000, 1_000, true, false),
+            (Some(0), None, 1, 500, 250, 0, false, true),
+            (Some(top), Some(top), 2, 1_000, 0, 1_000, true, true),
+            (None, Some(0), 3, 0, 1_000, 500, false, false),
+            (Some(1), None, 4, 251, 999, 1, true, false),
+            (None, None, 5, 0, 0, 0, false, false),
+        ];
+        for (now_ms, (bpm, hs, ratio, cover, lift, hidden, on, adjusting)) in
+            [-1_000_i64, 0, 999, 1_500, 2_000, 9_000_000]
+                .into_iter()
+                .zip(probes)
+        {
+            // A duration rounding past the maximum is refused; this probe
+            // draws only valid frames, so those leave the duration unknown.
+            let duration = ratios
+                .get(ratio)
+                .filter(|&&(n, d)| n / d < u128::from(top))
+                .map(|&(numerator, denominator)| DurationRatio {
+                    numerator,
+                    denominator,
+                });
+            let covers = CoverSettings {
+                cover,
+                lift,
+                hidden,
+                cover_enabled: on,
+                lift_enabled: !on,
+                hidden_enabled: on,
+                adjusting,
+            };
+            let effective = |enabled: bool, v: u16| if enabled { v } else { 0 };
+            let lanes = LaneView {
+                visible_time: TimeUs(600_000),
+                cover: effective(on, cover),
+                lift: effective(!on, lift),
+                hidden: effective(on, hidden),
+            };
+            batch.clear();
+            let frame = SkinFrame {
+                now: TimeUs(now_ms * 1_000),
+                display_offset: TimeUs(0),
+                tally: &tally,
+                gauges: &states,
+                gauge: 0,
+                effects: &[],
+                complete: false,
+                target: [1_920, 1_080],
+                layout: &Layout::AUTHOR,
+                lanes,
+                loading: None,
+                readouts: FrameReadouts {
+                    bpm_current_x100: bpm,
+                    hispeed_x100: hs,
+                    duration,
+                    covers,
+                },
+                playing: true,
+            };
+            skin.build(&mut play, &frame, uvs, batch)
+                .expect("consistent readouts build");
+            let fields = play.state().fields;
+            for (f, &v) in PLAY.fields.iter().zip(fields) {
+                if let skin_model::FieldTy::Int { lo, hi } = f.ty {
+                    assert!((lo..=hi).contains(&v), "{} outside its range", f.name);
+                }
+            }
+            let read = |slot: u16| fields.get(usize::from(slot)).copied();
+            assert_eq!(read(field::HISPEED_VALID), Some(i32::from(hs.is_some())));
+            assert_eq!(
+                read(field::DURATION_VALID),
+                Some(i32::from(duration.is_some()))
+            );
+            assert_eq!(
+                read(field::BPM_RANGE_VALID),
+                Some(i32::from(range.is_some()))
+            );
+            assert_eq!(read(field::COVER_PERMILLE), Some(i32::from(cover)));
+            assert_eq!(batch.dropped(), 0, "quads past the capacity");
+            assert!(
+                batch.runs().len() <= usize::try_from(skin.run_capacity()).unwrap_or(usize::MAX),
+                "more runs than the capacity"
+            );
+            assert!(
+                batch
+                    .quads()
+                    .iter()
+                    .all(|q| q.rect.iter().chain(&q.pivot).all(|v| v.is_finite())),
+                "a quad off the finite plane"
+            );
+        }
     }
 }
 
