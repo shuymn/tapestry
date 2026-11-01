@@ -8,7 +8,7 @@ use bms_model::{Chart, Speed, TimeUs};
 use eval::Section;
 use rules::{GaugeRule, LnMode, RulePreset};
 
-use crate::practice::mapped;
+use crate::practice::mapped_wide;
 use crate::prepare::ChartLabels;
 
 /// How a play's preparation on the screen ended ([`crate::Rig::prepare_attempt`]).
@@ -83,12 +83,16 @@ pub struct Attempt {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NoteEnd {
     /// A normal play: the last note's time, a long note's end and a mine
-    /// included.
+    /// included; 0 for a chart without notes.
     Play,
-    /// Autoplay: the last timeline's, background sounds included.
+    /// Autoplay: the last timeline's, background sounds included; a chart
+    /// with background sounds and no notes ends at its last one, and one
+    /// with neither at 0.
     Autoplay,
     /// A practice round: the section's end in the chart's 1× time plus
-    /// 1 s, mapped to the real time of a chart loaded at `speed`.
+    /// 1 s, mapped to the real time of a chart loaded at `speed`, whatever
+    /// notes the chart has; the sum and the mapping are exact, and only
+    /// the end saturates.
     Practice {
         /// The section's end, in the chart's 1× time.
         end: TimeUs,
@@ -98,7 +102,7 @@ pub enum NoteEnd {
 }
 
 impl NoteEnd {
-    /// The end on `chart`'s play clock; 0 for a chart without notes.
+    /// The end on `chart`'s play clock, as each variant says.
     #[must_use]
     pub fn of(self, chart: &Chart) -> TimeUs {
         let notes = || chart.lanes.iter().flatten().map(|n| n.end());
@@ -109,7 +113,7 @@ impl NoteEnd {
                 .max()
                 .unwrap_or(TimeUs(0)),
             Self::Practice { end, speed } => {
-                mapped(TimeUs(end.0.saturating_add(PRACTICE_PAD.0)), speed)
+                mapped_wide(i128::from(end.0) + i128::from(PRACTICE_PAD.0), speed)
             }
         }
     }
@@ -161,8 +165,8 @@ mod tests {
     /// A normal play's notes end at the last note's time, a long note's
     /// end and a mine included; autoplay's at the last timeline's, a
     /// background sound after the notes included; a round's at its 1×
-    /// section end plus 1 s, mapped to the loaded speed; a chart without
-    /// notes at 0.
+    /// section end plus 1 s, mapped to the loaded speed, exactly at the
+    /// edge of the time range too.
     #[test]
     fn the_note_end_follows_how_the_attempt_plays() {
         let lane = |i| Lane::new(i).unwrap();
@@ -191,7 +195,34 @@ mod tests {
             speed: Speed::NORMAL,
         };
         assert_eq!(practice.of(&chart), TimeUs(5_000 * MS));
-        let empty = ChartBuilder::new(150_000).build().unwrap();
+        // The pad and the scaling are exact past `TimeUs`'s range:
+        // floor((i64::MAX + 1 000 000) · 100 / 150).
+        let practice = NoteEnd::Practice {
+            end: TimeUs(i64::MAX),
+            speed: Speed::from_twentieths(30).unwrap(),
+        };
+        assert_eq!(practice.of(&chart), TimeUs(6_148_914_691_237_183_871));
+    }
+
+    /// Without notes, a normal play ends at 0, autoplay at its last
+    /// background sound or 0 without one, and a round at its section's
+    /// padded end still.
+    #[test]
+    fn the_note_end_without_notes() {
+        let mut empty = ChartBuilder::new(150_000).build().unwrap();
         assert_eq!(NoteEnd::Play.of(&empty), TimeUs(0));
+        assert_eq!(NoteEnd::Autoplay.of(&empty), TimeUs(0));
+        let practice = NoteEnd::Practice {
+            end: TimeUs(4_000 * MS),
+            speed: Speed::NORMAL,
+        };
+        assert_eq!(practice.of(&empty), TimeUs(5_000 * MS));
+        empty.bgm.push(BgmEvent {
+            time: TimeUs(7_000 * MS),
+            sound: SoundId(1),
+        });
+        assert_eq!(NoteEnd::Play.of(&empty), TimeUs(0));
+        assert_eq!(NoteEnd::Autoplay.of(&empty), TimeUs(7_000 * MS));
+        assert_eq!(practice.of(&empty), TimeUs(5_000 * MS));
     }
 }
