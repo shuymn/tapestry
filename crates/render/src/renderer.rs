@@ -5,6 +5,7 @@
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -15,6 +16,7 @@ use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
 use windows::Win32::Graphics::Dxgi::{DXGI_FRAME_STATISTICS, IDXGISwapChain3};
 use windows::Win32::System::Threading::WaitForSingleObject;
 
+use crate::decl::{DeclSkin, SkinBundle};
 use crate::gpu::{self, AdapterChoice, Gpu};
 use crate::measure::{FrameStatistics, Presentation};
 use crate::pace::Pacer;
@@ -25,7 +27,8 @@ use crate::skin_atlas::{self, AtlasPages, AtlasTexture, UploadError};
 use crate::staging::{Scissor, Staging};
 use crate::text::MenuText;
 use crate::{
-    Blend, FrameInput, Instance, OVERLAY_SPRITES, PlaySkin, SimpleSkin, SkinError, SpriteBatch,
+    AttemptInput, Blend, FrameInput, Instance, OVERLAY_SPRITES, PlaySkin, SimpleSkin, SkinError,
+    SpriteBatch,
 };
 
 /// The next [`Renderer`]'s id.
@@ -180,6 +183,125 @@ pub enum RenderError {
     TextPrepare(#[from] crate::text::TextError),
 }
 
+impl RenderError {
+    /// Whether this is a refusal of what was asked while the device stays
+    /// healthy (design.md "Play Lifecycle", preparing each attempt): the
+    /// skin cannot draw the attempt, its atlas is past the checks or was
+    /// refused by the device for memory or validation, or its sprites do
+    /// not fit a buffer. The renderer is unchanged and goes on drawing; an
+    /// attempt is refused, not the screen. Anything else, the device or
+    /// the surface failing, drops the screen.
+    #[must_use]
+    pub const fn is_refusal(&self) -> bool {
+        match self {
+            Self::Skin(_) | Self::Capacity { .. } => true,
+            Self::Atlas(UploadError::Device(e)) => matches!(
+                e,
+                wgpu::Error::OutOfMemory { .. } | wgpu::Error::Validation { .. }
+            ),
+            Self::Atlas(_) => true,
+            _ => false,
+        }
+    }
+}
+
+/// An installation staged by [`Renderer::stage`] and not yet committed:
+/// the request it answers and the renderer, so its device, it was staged
+/// on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PreparedToken {
+    /// The preparation request it answers.
+    pub request: u64,
+    /// [`Renderer::device_generation`] of the renderer that staged it.
+    pub device: u64,
+}
+
+/// Why [`Renderer::commit`] installed nothing. The installation in use
+/// stays.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum CommitError {
+    /// Nothing is staged: it was discarded, superseded, or never staged.
+    #[error("no installation is staged")]
+    NothingStaged,
+    /// The staged installation answers another request.
+    #[error("the staged installation answers request {staged}, not {asked}")]
+    Request {
+        /// The request staged.
+        staged: u64,
+        /// The request committed.
+        asked: u64,
+    },
+    /// The token was staged on another renderer, whose device this one
+    /// replaced.
+    #[error("the installation was staged on another device")]
+    Device,
+}
+
+/// The GPU and CPU resources a declarative skin's installation replaces
+/// together: its atlas array and bind group, and the staging and instance
+/// buffer sized for its capacities, with its clips.
+struct Resources {
+    atlas: AtlasTexture,
+    atlas_bind: wgpu::BindGroup,
+    staging: Staging,
+    instances: wgpu::Buffer,
+}
+
+/// An installation staged and not yet committed: the fresh skin with its
+/// prepared attempt, and its own resources, or `None` when it reuses the
+/// installed bundle's.
+struct Pending {
+    token: PreparedToken,
+    skin: DeclSkin,
+    resources: Option<Resources>,
+}
+
+/// What a renderer holds in memory for its play skin, in bytes, as a
+/// witness of the peak a skin's replacement reaches (design.md "Memory
+/// Budget"): the installed resources and the staged ones live together
+/// until the commit.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MemoryWitness {
+    /// The installed bundle's CPU description, kept for recovery.
+    pub committed_cpu: u64,
+    /// The staged bundle's CPU description, when it is another.
+    pub staged_cpu: u64,
+    /// The installed atlas array: every layer's levels.
+    pub atlas: u64,
+    /// The staged atlas array, when it is a new one.
+    pub staged_atlas: u64,
+    /// The bytes the queue's staging belt took for the staged atlas's
+    /// upload: each row padded to 256 bytes.
+    pub upload: u64,
+    /// The installed batch's sprites and runs, its staged instances and
+    /// its instance buffer.
+    pub batch: u64,
+    /// The same for the staged resources.
+    pub staged_batch: u64,
+    /// The installed skin's prepared attempt: its state and every buffer
+    /// it holds ([`PlaySkin::attempt_bytes`]).
+    pub attempt: u64,
+    /// The staged attempt's, beside it until the commit, even when the
+    /// staging reuses the installed resources.
+    pub staged_attempt: u64,
+}
+
+impl MemoryWitness {
+    /// Everything counted.
+    #[must_use]
+    pub const fn total(&self) -> u64 {
+        self.committed_cpu
+            .saturating_add(self.staged_cpu)
+            .saturating_add(self.atlas)
+            .saturating_add(self.staged_atlas)
+            .saturating_add(self.upload)
+            .saturating_add(self.batch)
+            .saturating_add(self.staged_batch)
+            .saturating_add(self.attempt)
+            .saturating_add(self.staged_attempt)
+    }
+}
+
 /// What one frame cost and drew.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FrameTiming {
@@ -303,6 +425,14 @@ pub struct Renderer {
     /// play skin's projection and clip scissors.
     staging: Staging,
     skin: Box<dyn PlaySkin>,
+    /// The declarative skin's bundle installed, `None` for the simple
+    /// skin or one set with [`set_skin`](Self::set_skin).
+    installed: Option<Arc<SkinBundle>>,
+    /// Bumped each time the atlas and the staging are replaced: a test of
+    /// whether an installation reused them.
+    resources: u64,
+    /// The installation staged and not yet committed.
+    pending: Option<Pending>,
     /// When the built frame's work began, until [`submit`](Self::submit)
     /// takes it.
     started: Option<Instant>,
@@ -321,6 +451,11 @@ pub struct Renderer {
     /// group exist: a unit test makes the device refuse something there.
     #[cfg(test)]
     atlas_fault: Option<fn(&Gpu)>,
+    /// A staging's instance buffer is made invalid (both map modes, which
+    /// every device's validation refuses), as a device refusing its
+    /// allocation would: a unit test.
+    #[cfg(test)]
+    buffer_fault: bool,
 }
 
 impl Renderer {
@@ -400,12 +535,17 @@ impl Renderer {
             instances,
             staging,
             skin,
+            installed: None,
+            resources: 0,
+            pending: None,
             started: None,
             refused: None,
             pacer: Pacer::default(),
             clear: wgpu::Color::BLACK,
             #[cfg(test)]
             atlas_fault: None,
+            #[cfg(test)]
+            buffer_fault: false,
             id: RENDERERS.fetch_add(1, Ordering::Relaxed),
         })
     }
@@ -512,6 +652,7 @@ impl Renderer {
             }
         }
         self.skin = skin;
+        self.installed = None;
         self.refused = None;
         self.project();
         Ok(())
@@ -569,6 +710,7 @@ impl Renderer {
         self.staging.set_font_scale(atlas.font_scale());
         self.staging.set_clips(clips);
         self.atlas = atlas;
+        self.resources += 1;
         Ok(())
     }
 
@@ -590,21 +732,293 @@ impl Renderer {
         &self.gpu
     }
 
-    /// Prepares the skin for `chart` and resets its play state, before the
-    /// countdown and at each retry; with a practice round's `section`, only
-    /// its targets are drawn. Once prepared, the skin's frames are built
-    /// again after a refused one ([`build`](Self::build)).
+    /// A chart was chosen: the play skin takes what it needs of `chart`
+    /// alone ([`PlaySkin::load_chart`]), with a practice's `section`, and
+    /// nothing that depends on the play preset; a declarative skin drops
+    /// its previous attempt. Frames are built again after a refused one
+    /// ([`build`](Self::build)): the attempt refused is gone.
     ///
     /// # Errors
     ///
     /// Returns the skin's error when it cannot draw `chart`.
     pub fn load(&mut self, chart: &Chart, section: Option<&Section>) -> Result<(), RenderError> {
         self.skin
-            .prepare(&self.gpu, chart, section)
+            .load_chart(chart, section)
             .map_err(RenderError::Skin)?;
         self.refused = None;
         self.project();
         finish_uploads(&self.gpu)
+    }
+
+    /// Prepares the play skin in use for the attempt `a`, in place, before
+    /// its countdown: the simple skin's way, whose preparation replaces no
+    /// resource. Its frames are built again after a refused one. The
+    /// target in `a` is replaced by [`target`](Self::target).
+    ///
+    /// # Errors
+    ///
+    /// The skin's refusal of the attempt ([`RenderError::Skin`]).
+    pub fn prepare_attempt(&mut self, a: &AttemptInput<'_>) -> Result<(), RenderError> {
+        let a = AttemptInput {
+            target: self.target(),
+            ..*a
+        };
+        self.skin
+            .prepare(&self.gpu, &a)
+            .map_err(RenderError::Skin)?;
+        self.refused = None;
+        self.project();
+        finish_uploads(&self.gpu)
+    }
+
+    /// Identifies this renderer's device among the process's renderers: a
+    /// renderer built again after a failure has another.
+    #[must_use]
+    pub const fn device_generation(&self) -> u64 {
+        self.id
+    }
+
+    /// The declarative bundle installed, if any.
+    #[must_use]
+    pub const fn installed(&self) -> Option<&Arc<SkinBundle>> {
+        self.installed.as_ref()
+    }
+
+    /// How many times the atlas and the staging were replaced.
+    #[must_use]
+    pub const fn resource_generation(&self) -> u64 {
+        self.resources
+    }
+
+    /// The sprites and runs a frame of the play skin holds, the
+    /// overlay's reserve left out.
+    #[must_use]
+    pub fn capacity(&self) -> (usize, usize) {
+        (self.staging.capacity(), self.staging.run_capacity())
+    }
+
+    /// The play skin's fixed clips in use.
+    #[must_use]
+    pub const fn clips(&self) -> &ClipTable {
+        self.staging.clips()
+    }
+
+    /// The installation staged and not yet committed, if any.
+    #[must_use]
+    pub fn staged(&self) -> Option<PreparedToken> {
+        self.pending.as_ref().map(|p| p.token)
+    }
+
+    /// Stages the installation of `bundle` with a fresh attempt `a` for
+    /// `request`, before the countdown, leaving what is installed drawing
+    /// until [`commit`](Self::commit): a previous staging is discarded;
+    /// unless `bundle` is the one installed, its atlas is uploaded with the
+    /// built-in atlas in layer 0, and a staging and an instance buffer are
+    /// sized for its capacities, with its clips projected; then the fresh
+    /// skin is prepared for the attempt, its prepared text attached. Every
+    /// upload is finished before the token is returned. Allocates and
+    /// waits for the GPU. The target in `a` is replaced by
+    /// [`target`](Self::target).
+    ///
+    /// # Errors
+    ///
+    /// Whatever refused the staging, which is then discarded: the
+    /// installation in use is untouched and goes on drawing.
+    /// [`RenderError::is_refusal`] tells a refusal on a healthy device
+    /// from a failure of the device.
+    pub fn stage(
+        &mut self,
+        bundle: &Arc<SkinBundle>,
+        a: &AttemptInput<'_>,
+        request: u64,
+    ) -> Result<PreparedToken, RenderError> {
+        self.pending = None;
+        let reuse = self
+            .installed
+            .as_ref()
+            .is_some_and(|b| Arc::ptr_eq(b, bundle));
+        let resources = if reuse {
+            None
+        } else {
+            Some(self.resources_for(bundle)?)
+        };
+        let mut skin = DeclSkin::new(Arc::clone(bundle));
+        let a = AttemptInput {
+            target: self.target(),
+            ..*a
+        };
+        skin.prepare(&self.gpu, &a).map_err(RenderError::Skin)?;
+        let token = PreparedToken {
+            request,
+            device: self.id,
+        };
+        self.pending = Some(Pending {
+            token,
+            skin,
+            resources,
+        });
+        Ok(token)
+    }
+
+    /// The resources of `bundle`: a staging sized for its capacities with
+    /// its clips, then, inside one transaction of error scopes, its atlas
+    /// uploaded with its bind group and an instance buffer for the staging,
+    /// all finished on the GPU. A device refusing any of them (memory,
+    /// validation) is answered as a refusal, never an uncaptured error.
+    fn resources_for(&self, bundle: &Arc<SkinBundle>) -> Result<Resources, RenderError> {
+        let device = self.gpu.device();
+        let skin = DeclSkin::new(Arc::clone(bundle));
+        let (capacity, runs) = sizes(&skin);
+        let instances =
+            usize::try_from(capacity.saturating_add(OVERLAY_SPRITES)).unwrap_or(usize::MAX);
+        let max = device.limits().max_buffer_size;
+        if instance_bytes(instances) > max {
+            return Err(RenderError::Capacity {
+                sprites: capacity,
+                max,
+            });
+        }
+        let mut staging = Staging::with_runs(capacity, runs, &skin.canvas(self.target()));
+        staging.set_clips(bundle.clips().clone());
+        let ((atlas, atlas_bind, buffer), refused) = bundle.with_pages(|pages| {
+            let layers =
+                skin_atlas::check_pages(pages, &device.limits()).map_err(RenderError::Atlas)?;
+            Ok::<_, RenderError>(skin_atlas::scoped(device, || {
+                let atlas = AtlasTexture::upload(&self.gpu, pages, layers);
+                let bind = self.bindings.bind(device, &atlas);
+                #[cfg(test)]
+                if let Some(fault) = self.atlas_fault {
+                    fault(&self.gpu);
+                }
+                let buffer = self.staged_buffer(staging.instance_capacity());
+                self.gpu.queue().submit([]);
+                (atlas, bind, buffer)
+            }))
+        })?;
+        if let Some(e) = refused {
+            return Err(RenderError::Atlas(UploadError::Device(e)));
+        }
+        staging.set_font_scale(atlas.font_scale());
+        wait_for_gpu(&self.gpu)?;
+        Ok(Resources {
+            atlas,
+            atlas_bind,
+            staging,
+            instances: buffer,
+        })
+    }
+
+    /// A staging's instance buffer of `instances` sprites.
+    fn staged_buffer(&self, instances: usize) -> wgpu::Buffer {
+        #[cfg(test)]
+        if self.buffer_fault {
+            return self.gpu.device().create_buffer(&wgpu::BufferDescriptor {
+                label: Some("refused"),
+                size: 4,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::MAP_WRITE,
+                mapped_at_creation: false,
+            });
+        }
+        instance_buffer(self.gpu.device(), instances)
+    }
+
+    /// Installs the staging of `token` whole, between frames: its skin
+    /// with its prepared attempt, and its atlas, bind group, clips,
+    /// staging and instance buffer together when it has its own; the ones
+    /// they replace are dropped. Frames are built again after a refused
+    /// one.
+    ///
+    /// # Errors
+    ///
+    /// [`CommitError`] when `token` is not the staging's, by its renderer
+    /// or its request: nothing changes, and the staging stays staged.
+    pub fn commit(&mut self, token: PreparedToken) -> Result<(), CommitError> {
+        if token.device != self.id {
+            return Err(CommitError::Device);
+        }
+        let Some(staged) = self.pending.as_ref().map(|p| p.token) else {
+            return Err(CommitError::NothingStaged);
+        };
+        if staged.request != token.request {
+            return Err(CommitError::Request {
+                staged: staged.request,
+                asked: token.request,
+            });
+        }
+        let Some(pending) = self.pending.take() else {
+            return Err(CommitError::NothingStaged);
+        };
+        if let Some(r) = pending.resources {
+            self.install(r);
+        }
+        self.activate_decl_skin(pending.skin);
+        Ok(())
+    }
+
+    /// Puts `skin` in use, its bundle the one installed, and builds frames
+    /// afresh: no refusal kept, no frame started, the projection made
+    /// again for its canvas.
+    fn activate_decl_skin(&mut self, skin: DeclSkin) {
+        self.installed = Some(Arc::clone(skin.bundle()));
+        self.skin = Box::new(skin);
+        self.refused = None;
+        self.started = None;
+        self.project();
+    }
+
+    /// Replaces the atlas, its bind group, the staging and the instance
+    /// buffer with `r`, together.
+    fn install(&mut self, r: Resources) {
+        self.atlas = r.atlas;
+        self.atlas_bind = r.atlas_bind;
+        self.staging = r.staging;
+        self.instances = r.instances;
+        self.resources += 1;
+    }
+
+    /// Drops the staged installation, if any: its resources go, and the
+    /// installation in use stays.
+    pub fn discard(&mut self) {
+        self.pending = None;
+    }
+
+    /// Installs `bundle` with no attempt prepared, at once: a renderer
+    /// built again after a device failure restores the committed bundle
+    /// from memory this way, and the next attempt is prepared afresh
+    /// through [`stage`](Self::stage), which reuses its resources.
+    ///
+    /// # Errors
+    ///
+    /// As [`stage`](Self::stage); the installation in use stays.
+    pub fn restore(&mut self, bundle: &Arc<SkinBundle>) -> Result<(), RenderError> {
+        self.pending = None;
+        let r = self.resources_for(bundle)?;
+        self.install(r);
+        self.activate_decl_skin(DeclSkin::new(Arc::clone(bundle)));
+        Ok(())
+    }
+
+    /// The bytes held for the play skin now, the staged installation's
+    /// included ([`MemoryWitness`]).
+    #[must_use]
+    pub fn memory(&self) -> MemoryWitness {
+        let staged = self.pending.as_ref();
+        let installed = self.installed.as_ref();
+        let other = staged
+            .map(|p| p.skin.bundle())
+            .filter(|b| !installed.is_some_and(|i| Arc::ptr_eq(i, b)));
+        let res = staged.and_then(|p| p.resources.as_ref());
+        MemoryWitness {
+            committed_cpu: installed.map_or(0, |b| b.resident_bytes()),
+            staged_cpu: other.map_or(0, |b| b.resident_bytes()),
+            atlas: self.atlas.bytes(),
+            staged_atlas: res.map_or(0, |r| r.atlas.bytes()),
+            upload: res.map_or(0, |r| r.atlas.upload_bytes()),
+            batch: self.staging.bytes(),
+            staged_batch: res.map_or(0, |r| r.staging.bytes()),
+            attempt: self.skin.attempt_bytes(),
+            staged_attempt: staged.map_or(0, |p| p.skin.attempt_bytes()),
+        }
     }
 
     /// Waits up to `timeout_ms` for the swap chain to take another frame
@@ -1439,6 +1853,47 @@ mod tests {
         let alpha = |x: usize| pixels[(100 * 960 + x) * 4 + 3];
         assert!(alpha(50).abs_diff(159) <= 2, "alpha blend: {}", alpha(50));
         assert!(alpha(150).abs_diff(159) <= 2, "additive: {}", alpha(150));
+    }
+
+    /// A staging whose instance buffer the device refuses, past its atlas's
+    /// upload, is a refusal on a healthy device, typed, never an uncaptured
+    /// error that would panic: nothing is staged, and the installation in
+    /// use draws the next frame, red on the left half.
+    #[test]
+    fn a_refused_instance_buffer_keeps_the_installation() {
+        use crate::test_common::{GAUGES, attempt, context, input, offscreen, view};
+        use crate::test_decl::{Look, bundle};
+        use bms_model::TimeUs;
+
+        let chart = bms_model::ChartBuilder::new(120_000).build().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut r = offscreen(1_920, 1_080);
+        let (a, _) = bundle(&r, dir.path(), &Look::left([255, 0, 0, 255]));
+        let (b, _) = bundle(&r, dir.path(), &Look::left([0, 0, 255, 255]));
+        let ctx = context(&GAUGES, false);
+        let token = r.stage(&a, &attempt(&r, &chart, &ctx), 1).unwrap();
+        r.commit(token).unwrap();
+        let generation = r.resource_generation();
+
+        r.buffer_fault = true;
+        let e = r.stage(&b, &attempt(&r, &chart, &ctx), 2).unwrap_err();
+        r.buffer_fault = false;
+        assert!(
+            matches!(e, RenderError::Atlas(UploadError::Device(_))),
+            "{e:?}"
+        );
+        assert!(e.is_refusal());
+        assert!(r.staged().is_none());
+        assert_eq!(r.resource_generation(), generation);
+        let v = view(0, 0);
+        let timing = r.frame(&input(&v, TimeUs(0), TimeUs(0), &[])).unwrap();
+        assert_eq!(timing.sprites, 1);
+        let p = r.read_back();
+        let at = |x: u32| {
+            let [r, _, b] = crate::test_common::rgb_at(&p, 1_920, (x, 540));
+            [r, b]
+        };
+        assert_eq!((at(480), at(1_440)), ([255, 0], [0, 0]));
     }
 
     /// A refusal after the texture exists, injected between the candidate's

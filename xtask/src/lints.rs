@@ -285,6 +285,7 @@ pub const IN_PLAY: &[Site] = &[
     ),
     Site::File("crates/player/src/audio_side.rs"),
     // The render thread's frame.
+    Site::File("crates/render/src/decl.rs"),
     Site::File("crates/render/src/measure.rs"),
     Site::File("crates/render/src/overlay.rs"),
     Site::File("crates/render/src/pace.rs"),

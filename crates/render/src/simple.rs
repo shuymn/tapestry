@@ -21,7 +21,7 @@ use rules::{GaugeValue, Judgment, LnMode};
 use skin_model::BuildError;
 
 use crate::atlas::{GLYPH_H, GLYPH_W, glyph_uv, solid_uv};
-use crate::{Blend, FrameInput, Gpu, PlaySkin, SkinError, Sprite, SpriteBatch};
+use crate::{AttemptInput, Blend, FrameInput, Gpu, PlaySkin, SkinError, Sprite, SpriteBatch};
 
 /// The layout, in layout pixels of the 1920×1080 base resolution, and the
 /// placement of notes in it.
@@ -569,12 +569,14 @@ impl SimpleSkin {
 }
 
 impl PlaySkin for SimpleSkin {
-    fn prepare(
-        &mut self,
-        _gpu: &Gpu,
-        chart: &Chart,
-        section: Option<&Section>,
-    ) -> Result<(), SkinError> {
+    /// The chart's notes and bar lines, the section's targets only, and
+    /// fresh feedback: nothing of the preset.
+    fn prepare(&mut self, _gpu: &Gpu, a: &AttemptInput<'_>) -> Result<(), SkinError> {
+        self.load(a.chart, a.section());
+        Ok(())
+    }
+
+    fn load_chart(&mut self, chart: &Chart, section: Option<&Section>) -> Result<(), SkinError> {
         self.load(chart, section);
         Ok(())
     }
@@ -607,6 +609,28 @@ impl PlaySkin for SimpleSkin {
         self.hud(f, out, f.now);
         self.effects(out, f.now);
         Ok(())
+    }
+
+    /// Itself, the chart's notes, bar lines and scroll copied for the
+    /// attempt, and its held and done bits, by their allocations.
+    fn attempt_bytes(&self) -> u64 {
+        let lanes: usize = self
+            .lanes
+            .iter()
+            .map(|l| l.capacity() * size_of::<Note>())
+            .sum();
+        let bits: usize = self
+            .held
+            .iter()
+            .chain(&self.done)
+            .map(|b| b.0.capacity() * size_of::<u64>())
+            .sum();
+        let bytes = size_of::<Self>()
+            + lanes
+            + self.bar_lines.capacity() * size_of::<Position>()
+            + size_of_val(self.scroll.segments())
+            + bits;
+        u64::try_from(bytes).unwrap_or(u64::MAX)
     }
 }
 
@@ -1976,7 +2000,7 @@ mod tests {
     }
 
     impl PlaySkin for Pushes {
-        fn prepare(&mut self, _: &Gpu, _: &Chart, _: Option<&Section>) -> Result<(), SkinError> {
+        fn prepare(&mut self, _: &Gpu, _: &crate::AttemptInput<'_>) -> Result<(), SkinError> {
             Ok(())
         }
 

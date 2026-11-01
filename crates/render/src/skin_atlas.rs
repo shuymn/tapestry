@@ -163,6 +163,7 @@ pub(crate) struct AtlasTexture {
     view: wgpu::TextureView,
     side: u32,
     layers: u32,
+    levels: u32,
 }
 
 impl AtlasTexture {
@@ -170,7 +171,7 @@ impl AtlasTexture {
     pub(crate) fn builtin(gpu: &Gpu) -> Self {
         let texture = create(gpu.device(), ATLAS_SIZE, 1, 1);
         write(gpu.queue(), &texture, 0, 0, ATLAS_SIZE, &build_atlas());
-        Self::of(&texture, ATLAS_SIZE, 1)
+        Self::of(&texture, ATLAS_SIZE, 1, 1)
     }
 
     /// The array of `pages`, of `layers` layers as [`check_pages`] gave
@@ -190,16 +191,21 @@ impl AtlasTexture {
                 write(gpu.queue(), &texture, layer, level, side >> level, bytes);
             }
         }
-        Self::of(&texture, side, layers)
+        Self::of(&texture, side, layers, levels)
     }
 
-    fn of(texture: &wgpu::Texture, side: u32, layers: u32) -> Self {
+    fn of(texture: &wgpu::Texture, side: u32, layers: u32, levels: u32) -> Self {
         let view = texture.create_view(&wgpu::TextureViewDescriptor {
             label: Some("atlas"),
             dimension: Some(wgpu::TextureViewDimension::D2Array),
             ..wgpu::TextureViewDescriptor::default()
         });
-        Self { view, side, layers }
+        Self {
+            view,
+            side,
+            layers,
+            levels,
+        }
     }
 
     /// The array's view, for the sprites' bind group.
@@ -217,11 +223,39 @@ impl AtlasTexture {
         self.layers
     }
 
+    /// The array's bytes on the GPU: every layer at its levels, RGBA8.
+    pub(crate) fn bytes(&self) -> u64 {
+        u64::from(self.layers)
+            * (0..self.levels)
+                .map(|k| level_bytes(self.side >> k))
+                .sum::<u64>()
+    }
+
+    /// The bytes its upload staged through the queue: each written level's
+    /// rows padded to `COPY_BYTES_PER_ROW_ALIGNMENT`, the built-in atlas in
+    /// layer 0 and every level of the skin's layers.
+    pub(crate) fn upload_bytes(&self) -> u64 {
+        let padded = |side: u32| {
+            let row = u64::from(side) * 4;
+            let align = u64::from(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+            row.div_ceil(align) * align * u64::from(side)
+        };
+        let skin = (0..self.levels)
+            .map(|k| padded(self.side >> k))
+            .sum::<u64>();
+        padded(ATLAS_SIZE) + u64::from(self.layers.saturating_sub(RESERVED_LAYERS)) * skin
+    }
+
     /// What layer 0's uv is multiplied by at staging: the built-in atlas's
     /// side over the page side, a power of two, so exact.
     pub(crate) fn font_scale(&self) -> f32 {
         ATLAS_SIZE as f32 / self.side as f32
     }
+}
+
+/// The bytes of one `side`-texel-square RGBA8 level.
+fn level_bytes(side: u32) -> u64 {
+    u64::from(side) * u64::from(side) * 4
 }
 
 fn create(device: &wgpu::Device, side: u32, layers: u32, levels: u32) -> wgpu::Texture {

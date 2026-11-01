@@ -182,6 +182,12 @@ impl SpriteBatch {
         usize::try_from(self.quads.capacity().1).unwrap_or(usize::MAX)
     }
 
+    /// The most runs the batch holds, the reserve included.
+    #[must_use]
+    pub fn total_run_capacity(&self) -> usize {
+        usize::try_from(self.quads.total_capacity().1).unwrap_or(usize::MAX)
+    }
+
     /// The most sprites the batch holds, the reserve included.
     #[must_use]
     pub fn total_capacity(&self) -> usize {

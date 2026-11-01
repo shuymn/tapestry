@@ -430,6 +430,15 @@ impl Rig for Fake {
         }
     }
 
+    fn commit_attempt(&mut self) -> Result<(), SurfaceLost> {
+        self.steps.push("commit");
+        Ok(())
+    }
+
+    fn discard_attempt(&mut self) {
+        self.steps.push("discard");
+    }
+
     fn end_loading(&mut self) -> Result<(), SurfaceLost> {
         self.steps.push("end loading");
         Ok(())
@@ -2741,8 +2750,8 @@ fn quit_during_the_save(abort: Option<i64>, end: PlayEnd) {
 }
 
 /// Before each opening: the device, then the preset refreshed, then audio
-/// and the attempt on the screen with that preset, then the end of the
-/// loading state; a retry goes through the same steps.
+/// and the attempt on the screen with that preset, then its commit and the
+/// end of the loading state; a retry goes through the same steps.
 #[test]
 fn the_attempt_is_prepared_after_the_preset_refresh_and_before_loading_ends() {
     let dir = tempfile::tempdir().unwrap();
@@ -2755,6 +2764,7 @@ fn the_attempt_is_prepared_after_the_preset_refresh_and_before_loading_ends() {
         "before play",
         "audio",
         "attempt",
+        "commit",
         "end loading",
         "open",
     ];
@@ -2819,6 +2829,13 @@ fn a_refused_preparation_opens_nothing_and_gives_the_number_back() {
     assert_eq!(why.to_string(), "skin.json:7: a font cannot be drawn");
     assert_eq!((rig.opens, rig.reports.len()), (0, 0));
     assert!(!rig.steps.contains(&"end loading"));
+    // What the refused preparation readied is dropped, never committed.
+    assert!(
+        rig.steps.ends_with(&["attempt", "discard"]),
+        "{:?}",
+        rig.steps
+    );
+    assert!(!rig.steps.contains(&"commit"));
     assert_eq!(loaded.begin_play().attempt, 1);
 }
 
@@ -2863,6 +2880,14 @@ fn a_slow_preparation_stays_cancellable_and_never_opens_recording() {
         assert_eq!(left, leave);
         assert_eq!((rig.opens, rig.reports.len()), (0, 0), "{leave:?}");
         assert!(!rig.steps.contains(&"end loading"), "{leave:?}");
+        // A late answer of the cancelled preparation can never install:
+        // it is discarded, and nothing is committed.
+        assert!(
+            rig.steps.ends_with(&["attempt", "discard"]),
+            "{leave:?}: {:?}",
+            rig.steps
+        );
+        assert!(!rig.steps.contains(&"commit"), "{leave:?}");
         // Cancelled at the wait that saw it, not at the preparation's end.
         assert_eq!(rig.clock.now().0, 7_400_000, "{leave:?}");
         assert!(rig.commands.is_empty(), "{leave:?}");
@@ -2963,4 +2988,24 @@ fn the_step_processing_a_gauge_failure_enters_playing() {
     );
     assert_eq!(rig.phases[0].last().map(|&(_, p)| p), Some(true));
     assert_eq!(rig.closed_phases, [false]);
+}
+
+/// A quit key already pending when the preparation answers at once: the
+/// attempt is never committed, but discarded, and recording never opens.
+#[test]
+fn a_quit_pending_at_an_immediate_preparation_commits_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut loaded = loaded(dir.path());
+    let mut rig = Fake::new(Vec::new(), &[(i64::MIN, Command::Quit)], i64::MAX);
+    assert_eq!(rig.prepare_waits, 0);
+    let left = game::live::run_chart(&mut loaded, &mut rig).unwrap();
+    assert_eq!(left, game::Leave::Back);
+    assert_eq!((rig.opens, rig.reports.len()), (0, 0));
+    assert!(!rig.steps.contains(&"commit"), "{:?}", rig.steps);
+    assert!(
+        rig.steps.ends_with(&["attempt", "discard"]),
+        "{:?}",
+        rig.steps
+    );
+    assert!(rig.commands.is_empty());
 }

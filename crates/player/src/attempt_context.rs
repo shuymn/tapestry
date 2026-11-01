@@ -1,13 +1,14 @@
 //! The attempt a play's screen prepares, as a skin takes it (design.md
 //! "Play Lifecycle"): the game's [`Attempt`] translated into owned skin
 //! data, sent to the render thread in its message, from which a borrowed
-//! [`PlayContext`] is made only for the call that prepares the screen.
+//! [`PlayContext`] is made only for the call that prepares the screen,
+//! with the chart's labels as [`ChartText`].
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
 use bms_model::TimeUs;
-use game::{Attempt, AttemptKind};
-use skin_model::{GaugeDesc, PlayContext, Side};
+use game::{Attempt, AttemptKind, ChartLabels};
+use skin_model::{ChartText, GaugeDesc, PlayContext, Side};
 
 /// The scratch side the simple skin draws, its author's layout: it has no
 /// imported side and no player layout.
@@ -25,6 +26,8 @@ pub struct AttemptContext {
     scratch: Side,
     ln_default: rules::LnMode,
     last_note_end: TimeUs,
+    /// The chart's labels, which its prepared text shows.
+    labels: ChartLabels,
 }
 
 impl AttemptContext {
@@ -38,6 +41,19 @@ impl AttemptContext {
             scratch,
             ln_default: attempt.ln_default,
             last_note_end: attempt.last_note_end,
+            labels: attempt.labels,
+        }
+    }
+
+    /// The chart's five labels, borrowed for one preparation.
+    pub fn text(&self) -> ChartText<'_> {
+        let l = &self.labels;
+        ChartText {
+            title: &l.title,
+            subtitle: &l.subtitle,
+            artist: &l.artist,
+            subartist: &l.subartist,
+            genre: &l.genre,
         }
     }
 
@@ -71,7 +87,8 @@ mod tests {
 
     /// The context carries the preset's gauges in its order, its flags and
     /// LN default, the section and the note end as the game made them,
-    /// the scratch side given, and no BPM range.
+    /// the scratch side given, and no BPM range; and the chart's five
+    /// labels.
     #[test]
     fn the_context_is_the_attempts_own_data() {
         let mut preset = rules::tapestry();
@@ -89,7 +106,13 @@ mod tests {
             TimeUs(2_000_000),
             Some(&section),
             TimeUs(1_000_000),
-            &ChartLabels::default(),
+            &ChartLabels {
+                title: "t".to_owned(),
+                subtitle: "s".to_owned(),
+                artist: "a".to_owned(),
+                subartist: "sa".to_owned(),
+                genre: "g".to_owned(),
+            },
         );
         let owned = AttemptContext::new(attempt, Side::Right);
         let ctx = owned.context();
@@ -102,5 +125,16 @@ mod tests {
         assert_eq!(ctx.scratch, Side::Right);
         assert_eq!(ctx.last_note_end, TimeUs(1_000_000));
         assert_eq!(ctx.bpm_range, None);
+        let text = owned.text();
+        assert_eq!(
+            [
+                text.title,
+                text.subtitle,
+                text.artist,
+                text.subartist,
+                text.genre
+            ],
+            ["t", "s", "a", "sa", "g"]
+        );
     }
 }

@@ -28,7 +28,19 @@
 //! "Latency Figures", and [`Renderer::frame_statistics`] reads the swap chain's
 //! DXGI frame statistics it pairs to frames.
 
+// The integration tests' fixtures, shared with the unit tests, which name
+// this crate as they do.
+#[cfg(test)]
+extern crate self as render;
+#[cfg(test)]
+#[path = "../tests/common/mod.rs"]
+mod test_common;
+#[cfg(test)]
+#[path = "../tests/decl_support/mod.rs"]
+mod test_decl;
+
 mod atlas;
+mod decl;
 mod gpu;
 pub mod measure;
 mod overlay;
@@ -43,15 +55,19 @@ mod staging;
 pub mod text;
 
 pub use atlas::{ATLAS_SIZE, GLYPH_H, GLYPH_W, glyph_rows, solid_uv};
+pub use decl::{AttemptText, BundleError, DeclSkin, SkinBundle, skin_frame};
 pub use gpu::{AdapterChoice, Gpu};
 pub use overlay::{OVERLAY_RUNS, OVERLAY_SPRITES};
 pub use projection::{ClipError, ClipTable, MAX_CLIPS, Projection};
-pub use renderer::{FrameTiming, MAX_SPRITES, RenderError, Renderer, Target, letterbox};
+pub use renderer::{
+    CommitError, FrameTiming, MAX_SPRITES, MemoryWitness, PreparedToken, RenderError, Renderer,
+    Target, letterbox,
+};
 pub use simple::{
     RESULT_CELL_COLUMN, RESULT_GAUGE_ROW, SimpleSkin, layout, result_graphs, result_screen,
     text_screen,
 };
-pub use skin::{FrameInput, PlaySkin, SkinError};
+pub use skin::{AttemptInput, FrameInput, PlaySkin, SkinError};
 pub use skin_atlas::{AtlasPages, PageLevels, RESERVED_LAYERS, UploadError, atlas_limits};
 pub use sprite::{Blend, FLAG_NEAREST, Instance, Run, Sprite, SpriteBatch};
 pub use staging::{Scissor, Staging};

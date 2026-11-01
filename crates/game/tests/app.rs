@@ -282,6 +282,12 @@ struct Headless {
     loading_end_fails: bool,
     /// Each loading state the flow ended, by the chart showing it.
     loading_ended: Vec<Option<usize>>,
+    /// Each attempt committed, by the chart whose loading state was
+    /// showing then: `None` with no loading state.
+    committed: Vec<Option<usize>>,
+    /// The attempt's handshakes, in order: `attempt`, `restore`,
+    /// `commit`, `discard`, `end loading` and `open`.
+    order: Vec<&'static str>,
     /// Recordings opened.
     opens: usize,
     close_in_load: bool,
@@ -427,6 +433,8 @@ impl Headless {
             cancel_at_failure: false,
             loading_end_fails: false,
             loading_ended: Vec::new(),
+            committed: Vec::new(),
+            order: Vec::new(),
             opens: 0,
             close_in_load: false,
             load_ms: 0,
@@ -640,6 +648,7 @@ impl Rig for Headless {
     }
 
     fn prepare_attempt(&mut self, loaded: &Loaded) -> Result<game::Preparation, SurfaceLost> {
+        self.order.push("attempt");
         self.attempts.push(loaded.attempt());
         match self.fails_after_attempt.take() {
             // A loading frame drops the prepared screen.
@@ -661,7 +670,18 @@ impl Rig for Headless {
         Ok(game::Preparation::Ready)
     }
 
+    fn commit_attempt(&mut self) -> Result<(), SurfaceLost> {
+        self.order.push("commit");
+        self.committed.push(self.loading);
+        Ok(())
+    }
+
+    fn discard_attempt(&mut self) {
+        self.order.push("discard");
+    }
+
     fn end_loading(&mut self) -> Result<(), SurfaceLost> {
+        self.order.push("end loading");
         self.loading_ended.push(self.loading);
         if self.loading_end_fails {
             return Err(SurfaceLost);
@@ -680,6 +700,7 @@ impl Rig for Headless {
         if let Some(e) = self.input_failure() {
             return Err(e);
         }
+        self.order.push("open");
         if self.in_selection {
             self.violations
                 .push("recording opened in selection".to_owned());
@@ -761,6 +782,7 @@ impl Rig for Headless {
     }
 
     fn restore_ready(&mut self, at: TimeUs) -> Result<(), game::RestoreError> {
+        self.order.push("restore");
         if self.restore_fails > 0 {
             self.restore_fails -= 1;
             return Err(game::RestoreError::NotPrepared);
@@ -2003,6 +2025,11 @@ fn recording_opens_only_once_the_loading_state_ended() {
     ran.unwrap();
     assert_eq!(rig.loading_ended, [Some(0), None]);
     assert_eq!(rig.opens, 2);
+    // Each play's attempt is committed before its loading state ends, the
+    // retry's with no loading state.
+    let one = ["attempt", "commit", "end loading", "open"];
+    assert_eq!(rig.order, [one, one].concat());
+    assert_eq!(rig.committed, [Some(0), None]);
 
     let acts = vec![(0, Act::Choose(0)), (4_000, Act::Close)];
     let (rig, _, ran) = run(Refusal::Missing, acts, |r| r.loading_end_fails = true);
@@ -2013,6 +2040,7 @@ fn recording_opens_only_once_the_loading_state_ended() {
     assert_eq!(rig.loading_ended, [Some(0)]);
     assert_eq!(rig.opens, 0);
     assert_eq!(rig.starts, 0);
+    assert_eq!(rig.order, ["attempt", "commit", "end loading"]);
 }
 
 /// A refused load leaves its loading state for where the chart was chosen,
@@ -2456,6 +2484,11 @@ fn practice_screen_repeats_and_quits() {
         panic!("{:?}", rig.seen);
     };
     assert_eq!(attempts(reports), [1, 2]);
+    // Each round's attempt is committed after its restore check and
+    // before recording opens; round 2, with no loading state, too.
+    let round = ["attempt", "restore", "commit", "end loading", "open"];
+    assert_eq!(rig.order, [round, round].concat());
+    assert_eq!(rig.committed, [Some(P), None]);
     let first = &reports[0];
     assert_eq!((first.end, first.tail_cut), (PlayEnd::Completed, None));
     let record = first.record.as_ref().unwrap();
@@ -2894,6 +2927,9 @@ fn a_failure_after_the_preparation_opens_nothing() {
         assert!(cause_seen, "{after:?}: {ran:?}");
         assert_eq!(rig.attempts.len(), 1, "{after:?}");
         assert_eq!(rig.opens, 0, "{after:?}");
+        // The failure is seen before the commit: what the preparation
+        // readied is discarded and never installed.
+        assert_eq!(rig.order, ["attempt", "discard"], "{after:?} {ended:?}");
         assert_eq!(
             events.count(|e| matches!(e, SessionEvent::Start { .. })),
             0,

@@ -6,7 +6,7 @@
 use bms_model::{Chart, TimeUs};
 use eval::{JudgeEvent, Section};
 use game::PlayView;
-use skin_model::{BuildError, Canvas, Fit};
+use skin_model::{BuildError, Canvas, ChartText, Fit, PlayContext};
 
 use crate::{Gpu, MAX_SPRITES, SpriteBatch};
 
@@ -50,6 +50,38 @@ impl FrameInput<'_> {
     }
 }
 
+/// What one attempt's preparation gives a skin (design.md "Play
+/// Lifecycle"): the chart, the attempt's context made from the refreshed
+/// play preset, the chart's labels from the ingestion that read it, and
+/// the target's size as the renderer applied it. Every borrow lasts the
+/// one call.
+#[derive(Clone, Copy, Debug)]
+pub struct AttemptInput<'a> {
+    /// The chart.
+    pub chart: &'a Chart,
+    /// The attempt: the preset's gauges and rules, the whole chart or a
+    /// section, the scratch side and the notes' end.
+    pub context: &'a PlayContext<'a>,
+    /// The chart's labels, for the skin's text.
+    pub text: &'a ChartText<'a>,
+    /// The target's size in pixels as last applied, never zero
+    /// ([`Renderer::target`](crate::Renderer::target)); the renderer sets
+    /// it.
+    pub target: [u32; 2],
+}
+
+impl AttemptInput<'_> {
+    /// The section a practice round draws only the targets of; `None` for
+    /// the whole chart.
+    #[must_use]
+    pub const fn section(&self) -> Option<&Section> {
+        match self.context.attempt {
+            skin_model::Attempt::Full { .. } => None,
+            skin_model::Attempt::Section(s) => Some(s),
+        }
+    }
+}
+
 /// A skin that cannot draw a chart.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 #[error("{reason}")]
@@ -58,23 +90,33 @@ pub struct SkinError {
     pub reason: String,
 }
 
-/// A play screen layout. The renderer calls `prepare` before the countdown
-/// and `build` once per frame. `build` must not allocate: everything it
-/// needs is sized in `prepare`.
+/// A play screen layout. The renderer calls `load_chart` when a chart is
+/// chosen, `prepare` before each attempt's countdown and `build` once per
+/// frame. `build` must not allocate: everything it needs is sized in
+/// `prepare`.
 pub trait PlaySkin: Send {
-    /// Takes what the skin needs from `chart` and the GPU, and resets any
-    /// per-play state, so a retry calls it again. With a practice round's
-    /// `section`, only its targets are drawn ([`Section::is_target`]).
+    /// Takes what the skin needs from the attempt `a` and the GPU, and
+    /// starts the attempt's state fresh, so each retry and practice round
+    /// calls it again. With a practice round's section, only its targets
+    /// are drawn ([`Section::is_target`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns why the skin cannot draw this attempt.
+    fn prepare(&mut self, gpu: &Gpu, a: &AttemptInput<'_>) -> Result<(), SkinError>;
+
+    /// A chart was chosen, before its attempt's preset is known: takes
+    /// what the skin needs of `chart` alone (`section`, a practice's first
+    /// round, the targets it draws), and nothing that depends on the play
+    /// preset. The default takes nothing.
     ///
     /// # Errors
     ///
     /// Returns why the skin cannot draw this chart.
-    fn prepare(
-        &mut self,
-        gpu: &Gpu,
-        chart: &Chart,
-        section: Option<&Section>,
-    ) -> Result<(), SkinError>;
+    fn load_chart(&mut self, chart: &Chart, section: Option<&Section>) -> Result<(), SkinError> {
+        let _ = (chart, section);
+        Ok(())
+    }
 
     /// Fills `out`, which arrives empty, with the frame's sprites, or
     /// refuses the frame with the runtime model's error. A refused frame
@@ -104,6 +146,13 @@ pub trait PlaySkin: Send {
     /// [`capacity`](Self::capacity).
     fn run_capacity(&self) -> u32 {
         self.capacity()
+    }
+
+    /// The bytes the prepared attempt's own state holds, for the memory
+    /// witness ([`Renderer::memory`](crate::Renderer::memory)). The default
+    /// is 0: a skin whose preparation keeps nothing per attempt.
+    fn attempt_bytes(&self) -> u64 {
+        0
     }
 
     /// The canvas the skin draws on for a `target`-pixel target, which the
