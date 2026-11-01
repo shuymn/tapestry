@@ -9,12 +9,13 @@ mod widget_support;
 use bms_model::TimeUs;
 use rules::Judgment;
 use skin_model::{
-    Adjust, Align, Bind, DigitsDef, ElementDef, Fit, GlyphSet, JudgeSlot, Layout, LoadError,
-    MAX_SEGMENTS, MAX_WIDGET_QUADS, Motion, Pad, Place, Region, Source, Variant, WidgetDefs,
+    Adjust, Align, Bind, ComboPart, DigitsDef, ElementDef, Fit, Follow, GlyphSet, GradePart,
+    JudgeSlot, Layout, LoadError, MAX_SEGMENTS, MAX_WIDGET_QUADS, Motion, Pad, Place, Region,
+    Source, TimerRef, Variant, WidgetDefs, timer,
 };
 use widget_support::{
-    TEN, combo, digits, element, gauge, harness, judge_all, judge_element, judgment, load,
-    load_fit, number,
+    ELEVEN, GAUGE, GRADE, TEN, combo, digits, drawn, element, gauge, grade, harness, judge_all,
+    judge_element, judgment, load, load_fit, number, shown,
 };
 
 fn adjust(scale: u16) -> Adjust {
@@ -168,5 +169,217 @@ fn widget_quads_are_capped_per_skin() {
     assert!(matches!(
         with(6),
         Err(LoadError::TooManyWidgetQuads { n: 16_385 })
+    ));
+}
+
+#[test]
+fn followed_widgets_move_once_by_the_covers() {
+    // The simple lanes are 800 long. A lift of 250 ‰ raises the line
+    // L = 200 and leaves 600; a cover of 400 ‰ takes C = 240 of it. The
+    // number follows the cover (+240), the gauge both (+40), GREAT's grade
+    // the lift (−200); its combo, on another timer, attaches to the moved
+    // grade and moves with it once, the shift unchanged. The image follows
+    // nothing. The lanes' own timer is off.
+    let lanes = ElementDef {
+        timer: TimerRef::Builtin(timer::FULL_COMBO),
+        ..lanes_support::lanes_element()
+    };
+    let at = |follow| Place {
+        follow,
+        ..Place::SCREEN
+    };
+    let mut j = judge_all([800, 500, 200, 80]);
+    j.grades[JudgeSlot::Great.index()] = Some(GradePart {
+        follow: Follow::Lift,
+        ..grade(GRADE + 1, [800, 500, 200, 80])
+    });
+    j.combos[JudgeSlot::Great.index()] = Some(ComboPart {
+        timer: TimerRef::Builtin(timer::READY),
+        ..combo(
+            digits(TEN, GlyphSet::Ten, 4, Align::Center, Pad::Blank),
+            [210, 10, 20, 60],
+        )
+    });
+    let skin = load_fit(
+        Fit::Adapt,
+        play_support::REGIONS,
+        Some(lanes_support::simple()),
+        vec![
+            lanes,
+            element(Source::Number(0), [100, 50, 20, 30], at(Follow::Cover)),
+            element(
+                Source::Gauge(0),
+                [0, 100, 500, 20],
+                at(Follow::LiftAndCover),
+            ),
+            judge_element(0),
+            element(Source::Image(0), [0, 0, 10, 10], at(Follow::None)),
+        ],
+        WidgetDefs {
+            numbers: vec![number(
+                digits(ELEVEN, GlyphSet::Eleven, 3, Align::Right, Pad::Blank),
+                "123",
+            )],
+            gauges: vec![gauge(10, Motion::Still)],
+            judges: vec![j],
+            texts: Vec::new(),
+        },
+    )
+    .unwrap();
+    let mut h = harness(skin);
+    h.tally = play_support::tally(12);
+    h.frame(500, &[judgment(500, Judgment::Great, 12)]);
+    let before = drawn(&h);
+    h.view.lift = 250;
+    h.view.cover = 400;
+    h.frame(500, &[]);
+    let after = drawn(&h);
+    assert_eq!(before.len(), after.len());
+    let mut seen = [false; 5];
+    for ((image, frame, a), (i2, f2, b)) in before.into_iter().zip(after) {
+        assert_eq!((image, frame), (i2, f2));
+        let (k, dy) = match image {
+            ELEVEN => (0, 240.0),
+            GAUGE.. => (1, 40.0),
+            TEN => (2, -200.0),
+            g if g == GRADE + 1 => (3, -200.0),
+            _ => (4, 0.0),
+        };
+        seen[k] = true;
+        let [x, y, w, hh] = a.rect;
+        assert_eq!(b.rect, [x, y + dy, w, hh], "image {image}");
+    }
+    assert_eq!(seen, [true; 5]);
+}
+
+#[test]
+fn followers_keep_the_transform_order() {
+    // A lift follower moves before its lane binding and its region: at a
+    // region scale of 200 % it moves twice as far on the canvas, its x
+    // and width follow the scratch side and the lane width as unmoved,
+    // its pivot moves with it, and its clip and run stay.
+    let follower = |follow| {
+        let place = Place {
+            follow,
+            pivot: skin_model::Anchor::Center,
+            ..lanes_support::bound(Bind::Lane(bms_model::Lane::SCRATCH))
+        };
+        let mut props = [None; 9];
+        props[..4].copy_from_slice(&[Some(160), Some(400), Some(96), Some(20)]);
+        props[8] = Some(30);
+        ElementDef {
+            track: lanes_support::still(props),
+            clip: Some(skin_model::ClipId(2)),
+            ..element(Source::Image(0), [0; 4], place)
+        }
+    };
+    let quads = |follow, lift: u16, scratch_right: bool| {
+        let skin = load_fit(
+            Fit::Adapt,
+            play_support::REGIONS,
+            Some(lanes_support::simple()),
+            vec![lanes_support::lanes_element(), follower(follow)],
+            WidgetDefs::default(),
+        )
+        .unwrap();
+        let ctx = skin_model::PlayContext {
+            scratch: if scratch_right {
+                skin_model::Side::Right
+            } else {
+                skin_model::Side::Left
+            },
+            ..play_support::full(0)
+        };
+        let mut h = play_support::Harness::new(skin, &widget_support::chart(), &ctx);
+        let mut layout = Layout::AUTHOR;
+        layout
+            .set(
+                Region::Playfield,
+                Adjust {
+                    x: 30,
+                    y: -20,
+                    scale: 200,
+                    visible: true,
+                },
+            )
+            .unwrap();
+        layout.set_lane_width(150).unwrap();
+        h.layout = layout;
+        h.target = [2_560, 1_080];
+        h.view.lift = lift;
+        h.frame(0, &[]);
+        let q = h
+            .batch
+            .quads()
+            .iter()
+            .find(|q| shown(&h, q) == Some((0, 0)))
+            .copied()
+            .unwrap();
+        let run = h
+            .batch
+            .runs()
+            .iter()
+            .find(|r| (r.start..r.end).any(|i| h.batch.quads()[i as usize].uv == q.uv))
+            .map(|r| r.key)
+            .unwrap();
+        (q, run)
+    };
+    for right in [false, true] {
+        let (still, still_run) = quads(Follow::None, 250, right);
+        let (moved, moved_run) = quads(Follow::Lift, 250, right);
+        let (unlifted, _) = quads(Follow::Lift, 0, right);
+        // L = 200 reference pixels, 400 on the canvas at 200 %.
+        let [x, y, w, hh] = still.rect;
+        assert_eq!(moved.rect, [x, y - 400.0, w, hh], "right {right}");
+        assert_eq!(moved.pivot, [still.pivot[0], still.pivot[1] - 400.0]);
+        assert_eq!(moved.angle, still.angle);
+        assert_eq!(unlifted.rect, still.rect);
+        assert_eq!(moved_run, still_run);
+        assert_eq!(moved_run.clip, Some(skin_model::ClipId(2)));
+    }
+}
+
+#[test]
+fn judges_follow_only_through_their_grades() {
+    let following = ElementDef {
+        place: Place {
+            region: Region::Judge,
+            follow: Follow::Cover,
+            ..Place::SCREEN
+        },
+        ..judge_element(0)
+    };
+    let widgets = || WidgetDefs {
+        judges: vec![judge_all([800, 500, 200, 80])],
+        ..WidgetDefs::default()
+    };
+    assert!(matches!(
+        load(vec![following], widgets()),
+        Err(LoadError::UnsupportedFollow { element: 0 })
+    ));
+    // A followed grade's keys moved the lanes' 800 stay within ±MAX_COORD.
+    let mut j = judge_all([800, 500, 200, 80]);
+    j.grades[2] = Some(GradePart {
+        follow: Follow::Cover,
+        ..grade(GRADE + 2, [800, skin_model::MAX_COORD - 799, 200, 80])
+    });
+    let r = load_fit(
+        Fit::Adapt,
+        play_support::REGIONS,
+        Some(lanes_support::simple()),
+        vec![lanes_support::lanes_element(), judge_element(0)],
+        WidgetDefs {
+            judges: vec![j],
+            ..WidgetDefs::default()
+        },
+    );
+    assert!(matches!(
+        r,
+        Err(LoadError::Judge {
+            element: 1,
+            error: skin_model::JudgeError::Coordinates {
+                part: skin_model::JudgePart::Grade(JudgeSlot::Good)
+            }
+        })
     ));
 }

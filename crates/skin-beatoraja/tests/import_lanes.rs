@@ -430,11 +430,11 @@ fn the_lifetime_starts_at_zero() {
 
 #[test]
 fn runtime_offsets_on_the_lanes_refuse() {
-    // Offset 4 on anything but an image is SUDDEN+'s refusal.
+    // The lanes take no run-time offset.
     for (id, part) in [
         (1, CriticalPart::Lanes),
         (3, CriticalPart::Lanes),
-        (4, CriticalPart::Cover),
+        (4, CriticalPart::Lanes),
     ] {
         let notes = format!(
             r#"{{"id": "notes", "offset": {id}, "dst": [{{"x": 0, "y": 0, "w": 0, "h": 0}}]}}"#

@@ -49,8 +49,14 @@
 //!     stretched over the covered area.
 //! 13. A bar line outside the accepted mapping is dropped with a note
 //!     instead of refusing the skin ([`super::widget::lanes`]).
-//! 14. Judgment and gauge parts that move with LIFT (offset 3) are
-//!     refused, as every run-time offset on them is.
+//! 14. Images, numbers, text, gauges and judgment grades that list LIFT
+//!     (offset 3) or SUDDEN+ (offset 4) follow them by this frame's lane
+//!     geometry (D9 item p); a combo drawn relative to its grade takes the
+//!     grade's motion and none of its own. A configured x, width, height,
+//!     angle or alpha on either id, or on an id SUDDEN+, LIFT or HIDDEN+
+//!     consumes (listed or added by the source), is refused as the
+//!     element's role says, its configured y ignored; offset 5 outside
+//!     HIDDEN+ and offsets 1 and 2 stay refused.
 //! 15. HIDDEN+ is optional for the player, so it is decorative: outside
 //!     the mapped subset it is dropped with a note and the skin still
 //!     imports ([`super::widget::lanes`]). Its differences from the source

@@ -258,6 +258,81 @@ fn repeated_conditions_add_nothing() {
     assert!(loaded.ok().skin.ops().total() > 0);
 }
 
+const D4: NoteKind = NoteKind::Deviation(skin_beatoraja::DeviationId::D4);
+
+#[test]
+fn gauge_families_read_the_shown_kind() {
+    // The drawn play shows one normal gauge: groove, neither hard nor ex.
+    for (op, shown) in [
+        ("42", true),
+        ("-42", false),
+        ("43", false),
+        (r#""!gauge_hard""#, true),
+        (r#""gauge_ex""#, false),
+        ("-1046", true),
+    ] {
+        let loaded = image(&format!(r#""op": [{op}]"#));
+        assert_eq!(common::kinds(loaded.report()), [D4], "{op}");
+        let mut d = loaded.drawn();
+        assert_eq!(d.frame(0, &[]).len(), usize::from(shown), "{op}");
+        // With no shown gauge every family is false and every negation
+        // true.
+        d.gauges.clear();
+        let negated = op.starts_with('-') || op.contains('!');
+        assert_eq!(d.frame(16, &[]).len(), usize::from(negated), "{op}");
+    }
+    // Through `draw` too, and repeated: one condition, one note.
+    let once = image(r#""op": [42]"#);
+    let repeated = image(r#""op": [42, "gauge_groove", 42], "draw": "gauge_groove""#);
+    assert_eq!(common::kinds(repeated.report()), [D4]);
+    assert_eq!(
+        repeated.ok().skin.ops().total(),
+        once.ok().skin.ops().total()
+    );
+    // The rank conditions stay unsupported.
+    let loaded = image(r#""op": [200]"#);
+    let why = NoteKind::UnsupportedProperty {
+        kind: PropertyKind::Boolean,
+        id: Some(200),
+    };
+    assert!(has(loaded.report(), why));
+}
+
+#[test]
+fn a_rate_number_under_a_kind_condition_has_one_deviation() {
+    let loaded = import_body(
+        r#""value": [{"id": "v", "src": "n", "w": 120, "h": 20, "divx": 10, "digit": 3,
+                      "ref": 102}],
+           "destination": [{"id": "v", "op": [43], "dst": [{"w": 12, "h": 20}]}]"#,
+    );
+    assert_eq!(common::kinds(loaded.report()), [D4]);
+    // A critical EX score under one is kept, with its note.
+    let loaded = critical(r#""op": [-43]"#);
+    assert_eq!(common::kinds(loaded.report()), [D4]);
+    assert_eq!(loaded.drawn().frame(0, &[]).len(), 1);
+}
+
+#[test]
+fn every_condition_together_passes_the_source_limit() {
+    let all: Vec<String> = (0..=10)
+        .map(|k| format!(r#""gauge_1p_{}""#, gauge_name(k)))
+        .chain(
+            ["judge_1p_perfect", "gauge_groove", "gauge_hard", "gauge_ex"]
+                .map(|n| format!(r#""{n}""#)),
+        )
+        .flat_map(|n| [n.clone(), n.replacen('"', "\"!", 1)])
+        .collect();
+    let e = judged_image(&format!(r#""op": [{}]"#, all.join(",")), false).err();
+    let ImportError::Expr { at, source } = &e else {
+        panic!("{e:?}");
+    };
+    assert!(
+        matches!(source.kind, skin_model::ErrorKind::TooLong { .. }),
+        "{e:?}"
+    );
+    assert!(at.line > 0, "{e:?}");
+}
+
 fn gauge_name(k: u32) -> String {
     if k == 10 {
         "100".to_owned()

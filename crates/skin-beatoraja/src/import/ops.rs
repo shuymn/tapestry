@@ -243,12 +243,24 @@ const GAUGE_RANGE: i32 = 230;
 /// `judge_1p_perfect`: the latest judgment was a PERFECT
 /// (`BooleanPropertyFactory.java:234-247`).
 const JUDGE_PERFECT: i32 = 241;
+/// The shown gauge's families (`BooleanPropertyFactory.java:394-414,
+/// 693-704`): `gauge_groove`, the source's gauge types up to 2;
+/// `gauge_hard`, from 3; `gauge_ex`, types 0, 1, 4, 5, 7 and 8. The model
+/// reads the shown gauge's look (D4): its six looks stand for the source's
+/// types 0-5, and a preset's other gauges show as normal or hard.
+const GAUGE_GROOVE: i32 = 42;
+const GAUGE_HARD: i32 = 43;
+const GAUGE_EX: i32 = 1_046;
 
 /// A condition as the importer reads it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Cond {
-    /// A model expression (a `bool`).
-    Expr(String),
+    /// A model expression (a `bool`), and whether what it tests differs
+    /// from the source's in an owner-decided way (D4).
+    Expr {
+        src: String,
+        display_deviation: bool,
+    },
     /// A built-in the model has no value for.
     Unsupported(i32),
     /// A declared option item, folded: whether it holds.
@@ -257,14 +269,36 @@ pub(crate) enum Cond {
     Undefined(i32),
 }
 
-/// The model expression of supported built-in `id` (positive).
-fn builtin(id: i32) -> Option<String> {
+/// The shown gauge's kind is one of `kinds`, while it has one.
+fn gauge_kind(kinds: &[&str]) -> String {
+    let mut src = String::from("gauge.valid && (");
+    for (i, k) in kinds.iter().enumerate() {
+        if i > 0 {
+            src.push_str(" || ");
+        }
+        src.push_str("gauge.kind == ");
+        src.push_str(k);
+    }
+    src.push(')');
+    src
+}
+
+/// The model expression of supported built-in `id` (positive), and
+/// whether it is D4.
+fn builtin(id: i32) -> Option<(String, bool)> {
     match id {
         GAUGE_RANGE..=240 => {
             let k = id - GAUGE_RANGE;
-            Some(format!("gauge >= {} && gauge < {}", 100 * k, 100 * (k + 1)))
+            let src = format!("gauge >= {} && gauge < {}", 100 * k, 100 * (k + 1));
+            Some((src, false))
         }
-        JUDGE_PERFECT => Some("on(judge.perfect)".to_owned()),
+        JUDGE_PERFECT => Some(("on(judge.perfect)".to_owned(), false)),
+        GAUGE_GROOVE => Some((gauge_kind(&["assist_easy", "easy", "normal"]), true)),
+        GAUGE_HARD => Some((gauge_kind(&["hard", "ex_hard", "hazard"]), true)),
+        GAUGE_EX => Some((
+            gauge_kind(&["assist_easy", "easy", "ex_hard", "hazard"]),
+            true,
+        )),
         _ => None,
     }
 }
@@ -286,8 +320,10 @@ fn built_in_cond(id: i32, negative: bool, judge_region: bool) -> Cond {
         return Cond::Fold(negative);
     }
     match builtin(id) {
-        Some(e) if negative => Cond::Expr(format!("!({e})")),
-        Some(e) => Cond::Expr(e),
+        Some((e, display_deviation)) => Cond::Expr {
+            src: if negative { format!("!({e})") } else { e },
+            display_deviation,
+        },
         None => Cond::Unsupported(if negative { -id } else { id }),
     }
 }
@@ -380,9 +416,12 @@ mod tests {
         // destination's conditions come from, deduplicated.
         let mut exprs = Vec::new();
         for &(id, _) in KNOWN_BOOLEAN_IDS {
+            if [GAUGE_GROOVE, GAUGE_HARD, GAUGE_EX].contains(&id) {
+                continue;
+            }
             for op in [id, -id] {
-                if let Cond::Expr(e) = numeric(op, &BTreeMap::new(), true) {
-                    exprs.push(e);
+                if let Cond::Expr { src, .. } = numeric(op, &BTreeMap::new(), true) {
+                    exprs.push(src);
                 }
             }
         }
@@ -393,11 +432,81 @@ mod tests {
         assert!(joined <= skin_model::MAX_SOURCE_BYTES);
     }
 
+    fn expr(src: &str, display_deviation: bool) -> Cond {
+        Cond::Expr {
+            src: src.to_owned(),
+            display_deviation,
+        }
+    }
+
+    #[test]
+    fn gauge_families_test_the_shown_kind() {
+        let groove = "gauge.valid && (gauge.kind == assist_easy || gauge.kind == easy \
+                      || gauge.kind == normal)";
+        let hard = "gauge.valid && (gauge.kind == hard || gauge.kind == ex_hard \
+                    || gauge.kind == hazard)";
+        let ex = "gauge.valid && (gauge.kind == assist_easy || gauge.kind == easy \
+                  || gauge.kind == ex_hard || gauge.kind == hazard)";
+        let none = BTreeMap::new();
+        assert_eq!(numeric(42, &none, true), expr(groove, true));
+        assert_eq!(
+            numeric(-42, &none, false),
+            expr(&format!("!({groove})"), true)
+        );
+        assert_eq!(numeric(43, &none, true), expr(hard, true));
+        assert_eq!(
+            named("!gauge_hard", true),
+            Some(expr(&format!("!({hard})"), true))
+        );
+        assert_eq!(named("!!gauge_ex", true), Some(expr(ex, true)));
+        assert_eq!(
+            numeric(-1_046, &none, true),
+            expr(&format!("!({ex})"), true)
+        );
+        // The built-ins win over items declared with their numbers.
+        let items = BTreeMap::from([(42, false), (1_046, true)]);
+        assert_eq!(numeric(42, &items, true), expr(groove, true));
+        assert_eq!(
+            numeric(-1_046, &items, true),
+            expr(&format!("!({ex})"), true)
+        );
+        // Every one compiles against the play schema.
+        for op in [42, -42, 43, -43, 1_046, -1_046] {
+            let Cond::Expr { src, .. } = numeric(op, &none, true) else {
+                panic!("{op}");
+            };
+            let scope = skin_model::Scope::new(&skin_model::PLAY);
+            assert!(skin_model::compile(&src, &scope, skin_model::Ty::Bool).is_ok());
+        }
+        // The rank conditions stay unsupported.
+        for id in [200, 207, 220, 300, 320, 340, 347] {
+            assert_eq!(numeric(id, &none, true), Cond::Unsupported(id));
+        }
+    }
+
+    /// Every supported condition, each sign, joined as one destination's
+    /// visibility: past the compiler's source limit.
+    #[test]
+    fn the_whole_union_passes_the_source_limit() {
+        let mut exprs = Vec::new();
+        for &(id, _) in KNOWN_BOOLEAN_IDS {
+            for op in [id, -id] {
+                if let Cond::Expr { src, .. } = numeric(op, &BTreeMap::new(), true) {
+                    exprs.push(src);
+                }
+            }
+        }
+        assert_eq!(exprs.len(), 30);
+        let joined: usize =
+            exprs.iter().map(|e| e.len() + 2).sum::<usize>() + 4 * (exprs.len() - 1);
+        assert!(joined > skin_model::MAX_SOURCE_BYTES, "{joined}");
+    }
+
     #[test]
     fn names_negate_and_patterns_parse() {
         assert_eq!(
             named("!!judge_1p_perfect", true),
-            Some(Cond::Expr("on(judge.perfect)".into()))
+            Some(expr("on(judge.perfect)", false))
         );
         assert_eq!(
             named("!practice_item+2_selected", true),
@@ -417,7 +526,7 @@ mod tests {
         let items = BTreeMap::from([(241, false), (900, true)]);
         assert_eq!(
             numeric(-241, &items, true),
-            Cond::Expr("!(on(judge.perfect))".into())
+            expr("!(on(judge.perfect))", false)
         );
         assert_eq!(numeric(900, &items, true), Cond::Fold(true));
         assert_eq!(numeric(-900, &items, true), Cond::Fold(false));

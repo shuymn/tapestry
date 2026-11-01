@@ -37,6 +37,7 @@ fn harness_with(g: GaugeDef, descs: &[GaugeDesc]) -> Harness {
         gauges: descs,
         attempt: Attempt::Full { lead_in: TimeUs(0) },
         empty_poor_breaks_combo: false,
+        empty_poor_counted: false,
         scratch: Side::Left,
         ln_default: rules::LnMode::Ln,
         last_note_end: TimeUs(0),
@@ -344,4 +345,97 @@ fn gauges_are_checked_at_their_limits() {
             below: true,
         })
     );
+}
+
+/// The family conditions an importer writes for the shown gauge's kind.
+const GROOVE: &str =
+    "gauge.valid && (gauge.kind == assist_easy || gauge.kind == easy || gauge.kind == normal)";
+const HARD: &str =
+    "gauge.valid && (gauge.kind == hard || gauge.kind == ex_hard || gauge.kind == hazard)";
+const EX: &str = "gauge.valid && (gauge.kind == assist_easy || gauge.kind == easy \
+                  || gauge.kind == ex_hard || gauge.kind == hazard)";
+
+/// `gauge.kind`, `gauge.valid` and the three family conditions with their
+/// negations, as of the last build.
+fn kind(h: &Harness) -> (i32, i32, [bool; 6]) {
+    use skin_model::{PLAY, Scope, Ty, compile, field};
+    let state = h.play.state();
+    let cond = |src: &str| {
+        compile(src, &Scope::new(&PLAY), Ty::Bool)
+            .unwrap()
+            .eval_bool(&state)
+    };
+    let not = |src: &str| cond(&format!("!({src})"));
+    (
+        h.field(field::GAUGE_KIND),
+        h.field(field::GAUGE_VALID),
+        [
+            cond(GROOVE),
+            cond(HARD),
+            cond(EX),
+            not(GROOVE),
+            not(HARD),
+            not(EX),
+        ],
+    )
+}
+
+#[test]
+fn the_gauge_kind_follows_the_shown_gauge() {
+    let descs: Vec<_> = GaugeLook::ALL.iter().map(|&l| desc(l, 80)).collect();
+    let mut h = harness_with(still(), &descs);
+    h.gauges = vec![play_support::state(pct(50)); GaugeLook::COUNT];
+    // (groove, hard, ex) per look, in look order.
+    let families = [
+        [true, false, true],
+        [true, false, true],
+        [true, false, false],
+        [false, true, false],
+        [false, true, true],
+        [false, true, true],
+    ];
+    // Every look, switched with no gauge effect: the enum, the conditions
+    // and the widget's look set agree in the same build.
+    for (i, (look, want)) in GaugeLook::ALL.iter().zip(families).enumerate() {
+        h.gauge = i;
+        h.frame(i64::try_from(i).unwrap() * 16, &[]);
+        let (k, valid, conds) = kind(&h);
+        assert_eq!(usize::try_from(k).unwrap(), look.index(), "{look:?}");
+        assert_eq!(valid, 1);
+        assert_eq!(conds[..3], want, "{look:?}");
+        assert_eq!(conds[3..], want.map(|c| !c), "{look:?}");
+        let set = u32::from(*look == GaugeLook::Hard);
+        assert!(segs(&h).iter().all(|s| s.set == set), "{look:?}");
+    }
+    // A shown index past the snapshot: invalid, `normal`, every family
+    // false and every negation true; the widget draws nothing.
+    h.gauges.truncate(2);
+    h.gauge = 3;
+    h.frame(200, &[]);
+    assert_eq!(kind(&h), (2, 0, [false, false, false, true, true, true]));
+    assert!(h.batch.quads().is_empty());
+    // Past the descriptors, with a snapshot.
+    let mut one = harness_with(still(), &[desc(GaugeLook::Hard, 0)]);
+    one.gauge = 1;
+    one.frame(0, &[]);
+    assert_eq!(kind(&one), (2, 0, [false, false, false, true, true, true]));
+    one.gauge = 0;
+    one.frame(16, &[]);
+    assert_eq!(kind(&one), (3, 1, [false, true, false, true, false, true]));
+}
+
+#[test]
+fn custom_gauges_show_their_fallback_kind() {
+    let preset = rules::beatoraja_style();
+    let mut end = preset.gauges[0].clone();
+    end.id = "groove".to_owned();
+    let mut survival = preset.gauges[3].clone();
+    survival.id = "grade".to_owned();
+    let descs = [GaugeDesc::from_rule(&end), GaugeDesc::from_rule(&survival)];
+    let mut h = harness_with(still(), &descs);
+    h.frame(0, &[]);
+    assert_eq!(kind(&h), (2, 1, [true, false, false, false, true, true]));
+    h.gauge = 1;
+    h.frame(16, &[]);
+    assert_eq!(kind(&h), (3, 1, [false, true, false, true, false, true]));
 }

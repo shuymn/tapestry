@@ -12,10 +12,15 @@ use skin_model::{ImageDef, MAX_SKIN_FRAMES, Source};
 use super::asset::{self, Crop, Failed, ImageKey, Path};
 use super::budget::ImportLimit;
 use super::policy::Role;
+use super::property::{self, IndexProp, IntProp};
 use super::report::{NoteKind, Object, PropertyKind, Span, TrackWhy};
 use super::track::{self, Stretch};
-use super::{Common, Cx, Dst, Prop};
+use super::{Common, Cx, Dst, Opts, Prop};
 use crate::error::ImportError;
+
+/// The field an image selector the mapping does not run yet is reported
+/// under: one choosing by the shown gauge's type (S6c-04).
+const IMAGE_SELECTION: &str = "image selection";
 
 /// The source-image fields an image or a number reads
 /// (`JsonSkinObjectLoader.java:601-621` at `0.8.9`).
@@ -290,23 +295,29 @@ impl Cx<'_> {
     ) -> Result<(), ImportError> {
         let at = dst.span;
         let s = self.src_image(rec)?;
-        let [len, act] = self.def.fields(rec, ["len", "act"]);
-        // A selector group (`len` above 1) is the image object's own; an
-        // image set draws the image's frames whatever its `len`
-        // (`JsonSkinObjectLoader.java:76-84`).
+        let [len, act, r] = self.def.fields(rec, ["len", "act", "ref"]);
+        // A selector group (`len` above 1) is the image object's own,
+        // choosing by its `ref` in the image-index namespace; an image set
+        // draws the image's frames whatever its `len` and `ref`
+        // (`JsonSkinObjectLoader.java:49-64, 76-84`).
         let group = set.is_none() && self.int_or(len, "len", 0)? > 1;
-        if dst.offsets.contains(&super::OFFSET_LANECOVER) {
+        let field =
+            if group && property::index_by_id(self.int_or(r, "ref", 0)?) == IndexProp::GaugeKind {
+                IMAGE_SELECTION
+            } else {
+                "len"
+            };
+        // Listing offset 4, it follows SUDDEN+ when it cannot reach the
+        // lanes, and is SUDDEN+ otherwise; its keys are charged once.
+        let charged = dst.offsets.contains(&super::OFFSET_LANECOVER);
+        if charged && !self.offset4_outside(&dst)? {
             if group {
-                return self.lane_cover_selector(dst, "len");
+                return self.lane_cover_selector(dst, field);
             }
             return self.lane_cover_image(dst, rec, &s);
         }
         if group {
-            self.drop_el(
-                Role::Decorative,
-                at,
-                NoteKind::UnsupportedField { field: "len" },
-            )?;
+            self.drop_el(Role::Decorative, at, NoteKind::UnsupportedField { field })?;
             return Ok(());
         }
         // An image set's click action is its own, the image's unused.
@@ -325,7 +336,12 @@ impl Cx<'_> {
             self.drop_el(Role::Decorative, at, NoteKind::Stretch(dst.stretch))?;
             return Ok(());
         }
-        let Some(c) = self.common(Role::Decorative, &dst, false)? else {
+        let o = Opts {
+            follow: true,
+            charged,
+            ..Opts::default()
+        };
+        let Some(c) = self.common_with(Role::Decorative, &dst, o)? else {
             return Ok(());
         };
         let Some((image, cell)) = self.add_src_image(&c, rec, &s, s.div)? else {
@@ -349,26 +365,60 @@ impl Cx<'_> {
             return Ok(());
         }
         let t = self.model_track(&c, &rects)?;
-        self.push_native(c, Source::Image(image), t, native);
+        self.push_native(c, Source::Image(image), t, native)?;
         Ok(())
     }
 
     /// An image set (`JsonSkinObjectLoader.java:74-98`): only one without
-    /// a frame expression, drawing its first image.
+    /// a frame expression, drawing its first image. Its `value`, when it
+    /// resolves as a value property, chooses the frame; else its `ref`
+    /// does, as an image-index property (`JsonSkinObjectLoader.java:91`).
     pub(super) fn image_set(&mut self, dst: Dst, rec: u32) -> Result<(), ImportError> {
         let at = dst.span;
         let [r, value, images] = self.def.fields(rec, ["ref", "value", "images"]);
-        let by_ref = self.int_or(r, "ref", 0)? != 0;
-        let by_value = self.prop(value, "value")? != Prop::Null;
-        // Listing offset 4, it is classified before the selector drops it.
-        if (by_ref || by_value) && dst.offsets.contains(&super::OFFSET_LANECOVER) {
-            return self.lane_cover_selector(dst, if by_ref { "ref" } else { "value" });
-        }
-        if by_ref || by_value {
-            let why = NoteKind::UnsupportedProperty {
-                kind: PropertyKind::Integer,
-                id: None,
-            };
+        let r = self.int_or(r, "ref", 0)?;
+        let value = self.prop(value, "value")?;
+        let selector = match property::value_prop(&value) {
+            IntProp::Null if r == 0 => None,
+            IntProp::Null => Some(match property::index_by_id(r) {
+                IndexProp::GaugeKind => (
+                    IMAGE_SELECTION,
+                    NoteKind::UnsupportedField {
+                        field: IMAGE_SELECTION,
+                    },
+                ),
+                IndexProp::Unsupported(id) => (
+                    "ref",
+                    NoteKind::UnsupportedProperty {
+                        kind: PropertyKind::ImageIndex,
+                        id: Some(id),
+                    },
+                ),
+            }),
+            IntProp::Shown(_) => Some((
+                "value",
+                NoteKind::UnsupportedProperty {
+                    kind: PropertyKind::Integer,
+                    id: match value {
+                        Prop::Id(id) => Some(id),
+                        _ => None,
+                    },
+                },
+            )),
+            IntProp::Unsupported(id) => Some((
+                "value",
+                NoteKind::UnsupportedProperty {
+                    kind: PropertyKind::Integer,
+                    id,
+                },
+            )),
+        };
+        if let Some((field, why)) = selector {
+            // Listing offset 4, it is classified before the selector drops
+            // it.
+            if dst.offsets.contains(&super::OFFSET_LANECOVER) && !self.offset4_outside(&dst)? {
+                return self.lane_cover_selector(dst, field);
+            }
             self.drop_el(Role::Decorative, at, why)?;
             return Ok(());
         }
