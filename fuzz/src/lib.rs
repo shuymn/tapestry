@@ -418,7 +418,7 @@ pub fn draw(imported: &Imported) -> Vec<usize> {
 }
 
 /// The bar line groups over a bounded chart of bars: one every 125 ms
-/// across a STOP, then a run of equal bars where a note stands, drawn
+/// across a STOP, eight more equal to the one where a note stands, drawn
 /// before the play, through the STOP and past the last bar, with display
 /// offsets and the covers moving. Each frame stays inside the skin's
 /// capacities; the lanes' budgets drop at most one quad.
@@ -440,7 +440,9 @@ fn bar_probes(
     let at = |ms: i64| chart.scroll.position_at(TimeUs(ms * 1_000));
     let mut bars: Vec<_> = (0..40).map(|i| at(i * 125)).collect();
     bars.extend(std::iter::repeat_n(at(3_000), 8));
+    bars.sort_unstable();
     chart.bar_lines = bars;
+    chart.validate().expect("the bar chart is valid");
     let mut play = skin
         .prepare(&chart, ctx)
         .expect("an imported skin prepares");

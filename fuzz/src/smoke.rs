@@ -295,6 +295,8 @@ fn skin_json_seeds_resolve_or_fail_as_built() {
             continue;
         }
         if name == "bar_group_limit" {
+            // Within the runner's 64 KiB inputs (docs/setup.md "Fuzzing").
+            assert!(data.len() <= 64 * 1_024, "{name}: {} bytes", data.len());
             // The header resolves; the import stops at the groups' count.
             let (_, imported) = skin_json(&data).unwrap_or_else(|e| panic!("{name}: {e}"));
             assert!(

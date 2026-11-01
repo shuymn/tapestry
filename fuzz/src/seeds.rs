@@ -1039,8 +1039,8 @@ fn bar_groups_body() -> String {
 
 /// [`lanes_body`] with one bar line group past the cap.
 fn bar_group_limit_body() -> String {
-    let group = r#"{"id": "bar", "dst": [{"w": 1, "h": 1}]}"#;
-    let groups = vec![group; skin_model::MAX_BAR_GROUPS + 1].join(",");
+    // Empty records: the count is refused before any record is read.
+    let groups = vec!["{}"; skin_model::MAX_BAR_GROUPS + 1].join(",");
     lanes_body().replace(LANES_GROUP, &format!(r#""group": [{groups}]"#))
 }
 
