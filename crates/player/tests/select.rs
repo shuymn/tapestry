@@ -11,6 +11,10 @@ use std::process::{Command, Output, Stdio};
 
 use game::{DataRoot, DeviceSettings, LibrarySettings, save_settings};
 
+/// The rule a slow load holds by, shared with it.
+#[path = "../src/dev/checkpoints.rs"]
+mod checkpoints;
+
 /// A 50 ms mono 16-bit square wave of `amplitude` at 44.1 kHz.
 fn write_wav(path: &Path, amplitude: i16) {
     let samples: Vec<i16> = (0..2_205)
@@ -482,10 +486,10 @@ fn the_play_screen_loads_from_the_choice_through_a_slow_load() {
     let ready = at(held, "load: the chart is ready ");
     at(ready, "play started");
     assert!(lines(&stdout, "load: cancelled").is_empty(), "{stdout}");
-    // Frames keep being presented through the hold: after the first
-    // loading frame, the count grows at two or more of its checkpoints.
-    // The hold waits for frames following one another (at most 20 s), so
-    // a slow machine passes and a screen that drew once and stopped fails.
+    // Frames keep being presented through the hold: its checkpoints show
+    // them following one another, by the rule the hold itself waits for
+    // (at most 20 s), so a slow machine passes and a screen that drew
+    // once and stopped fails.
     let presented: Vec<u64> = lines(&stdout, "dev: presented loading frames: ")
         .iter()
         .map(|l| {
@@ -494,15 +498,10 @@ fn the_play_screen_loads_from_the_choice_through_a_slow_load() {
                 .unwrap()
         })
         .collect();
-    let first = presented
-        .iter()
-        .position(|&n| n > 0)
-        .unwrap_or_else(|| panic!("no loading frame in the hold:\n{stdout}"));
-    let grew = presented[first..]
-        .windows(2)
-        .filter(|w| w[1] > w[0])
-        .count();
-    assert!(grew >= 2, "{presented:?}\n{stdout}");
+    assert!(
+        checkpoints::frames_follow(&presented),
+        "{presented:?}\n{stdout}"
+    );
     assert_eq!(frames_of(&stdout, "loading").len(), 1, "{stdout}");
     // The loading frame is the play screen's: its judgment line spans the
     // lanes, as in play, and the select screen has none.

@@ -31,6 +31,7 @@ use crate::measure::Drawn;
 use crate::recording::SoundRecording;
 use crate::render_side::{FrameSink, Screen};
 
+pub mod checkpoints;
 pub mod scenario;
 
 /// Prints, to the console only, which window took the foreground when the

@@ -959,36 +959,39 @@ const HOLD_MOST: Duration = Duration::from_secs(20);
 
 /// Holds a load for a script's slow load (dev-tools), pressing the quit
 /// key or closing the window halfway if it says; whether the quit key or a
-/// close cancelled it, checked as the measurement does. It holds its time,
-/// and on until the loading state has presented three frames after its
-/// first, at most [`HOLD_MOST`], so even a slow machine shows frames
-/// following one another; every [`HOLD_CHECKPOINT`], and at its end, it
-/// prints the loading frames presented so far (`drawn`).
+/// close cancelled it, checked as the measurement does. Every
+/// [`HOLD_CHECKPOINT`] it reports the loading frames presented so far
+/// (`drawn`, to `report`), and it holds its time, and on until those printed
+/// checkpoints show the frames following one another
+/// ([`crate::dev::checkpoints::frames_follow`], the rule its test checks),
+/// at most [`HOLD_MOST`], so even a slow machine shows them.
 #[cfg(feature = "dev-tools")]
-fn hold(controls: &Controls, slow: crate::dev::SlowLoad, drawn: &dyn Fn() -> u64) -> bool {
+fn hold(
+    controls: &Controls,
+    slow: crate::dev::SlowLoad,
+    drawn: &dyn Fn() -> u64,
+    report: &mut dyn FnMut(u64),
+) -> bool {
     println!("dev: the load holds {} ms", slow.ms);
     let began = Instant::now();
     let total = Duration::from_millis(slow.ms);
     let mut acted = false;
     let mut checkpoint = began;
-    // The frames presented when the first loading frame was seen.
-    let mut first = None;
+    // Every checkpoint printed.
+    let mut printed = Vec::new();
     loop {
         if controls.quitting() || controls.leaving() {
             return true;
         }
         let held = began.elapsed();
-        let frames = drawn();
-        if first.is_none() && frames > 0 {
-            first = Some(frames);
-        }
         if checkpoint.elapsed() >= HOLD_CHECKPOINT {
             checkpoint = Instant::now();
-            println!("dev: presented loading frames: {frames}");
+            let frames = drawn();
+            report(frames);
+            printed.push(frames);
         }
-        let following = first.is_some_and(|f| frames >= f + 3);
-        if held >= total && (following || held >= HOLD_MOST) {
-            println!("dev: presented loading frames: {frames}");
+        if held >= total && (crate::dev::checkpoints::frames_follow(&printed) || held >= HOLD_MOST)
+        {
             return false;
         }
         if !acted && held >= total / 2 {
@@ -1468,7 +1471,12 @@ impl AppRig for PlayerRig<'_> {
         );
         #[cfg(feature = "dev-tools")]
         if let Some(slow) = slow
-            && hold(self.controls, slow, &|| self.render.loading_drawn())
+            && hold(
+                self.controls,
+                slow,
+                &|| self.render.loading_drawn(),
+                &mut |n| println!("dev: presented loading frames: {n}"),
+            )
         {
             println!("load: cancelled");
             return Ok(Loading::Cancelled);
@@ -1758,6 +1766,34 @@ mod tests {
     use crate::result_input::{Pad, ResultInput};
     use crate::select::{MenuInput, MenuKey, MenuQueue, SelectScreen};
     use crate::shelf::{Shelf, open};
+
+    /// A healthy screen whose first loading frame comes after the hold's
+    /// time, then one every 40 ms: the hold goes on until its reported
+    /// checkpoints show the frames following one another, the rule its
+    /// test checks, not only until enough frames came between two of them.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn a_slow_load_holds_until_its_checkpoints_show_frames_following() {
+        let controls = crate::controls::Controls::new(input::QpcClock::start());
+        let began = Instant::now();
+        let drawn = || {
+            let ms = u64::try_from(began.elapsed().as_millis()).unwrap();
+            // The first frame at 300 ms, then one every 40 ms.
+            if ms < 300 { 0 } else { 1 + (ms - 300) / 40 }
+        };
+        let slow = crate::dev::SlowLoad {
+            ms: 0,
+            quit: false,
+            close: false,
+        };
+        let mut reported = Vec::new();
+        assert!(!super::hold(&controls, slow, &drawn, &mut |n| reported.push(n)));
+        assert!(
+            crate::dev::checkpoints::frames_follow(&reported),
+            "{reported:?}"
+        );
+        assert!(began.elapsed() < Duration::from_secs(5));
+    }
 
     /// The chart a pick plays.
     fn played(pick: game::Pick) -> std::path::PathBuf {
