@@ -1991,6 +1991,22 @@ fn bar_groups_do_not_allocate(ctx: &PlayContext<'_>) {
     let t = tally(0);
     let gauges = [state(GaugeValue::FULL), state(GaugeValue::FULL)];
     let layout = SkinLayout::AUTHOR;
+    // A frame at `now` µs, shown `offset` µs ahead, on the stack.
+    let frame_at = |now: i64, offset: i64, target, lanes, readouts| SkinFrame {
+        now: TimeUs(now),
+        display_offset: TimeUs(offset),
+        tally: &t,
+        gauges: &gauges,
+        gauge: 0,
+        effects: &[],
+        complete: false,
+        target,
+        layout: &layout,
+        lanes,
+        readouts,
+        loading: None,
+        playing: true,
+    };
     let bar_uv = |uvs: &UvTable| uvs.get(lanes_support::BAR).unwrap().uv;
     let (mut quads, mut turned, mut drops) = (0_usize, 0_usize, 0_u32);
     for def in [simple, source] {
@@ -2011,21 +2027,13 @@ fn bar_groups_do_not_allocate(ctx: &PlayContext<'_>) {
                 lift: [0, 0, 250][i / 60 % 3],
                 hidden: 0,
             };
-            let frame = SkinFrame {
-                now: TimeUs(now),
-                display_offset: TimeUs([0, 40 * MS, -25 * MS][i % 3]),
-                tally: &t,
-                gauges: &gauges,
-                gauge: 0,
-                effects: &[],
-                complete: false,
-                target: TARGETS[i % TARGETS.len()],
-                layout: &layout,
+            let frame = frame_at(
+                now,
+                [0, 40 * MS, -25 * MS][i % 3],
+                TARGETS[i % TARGETS.len()],
                 lanes,
-                readouts: readouts_for(lanes),
-                loading: None,
-                playing: true,
-            };
+                readouts_for(lanes),
+            );
             skin.build(&mut play, &frame, &uvs, &mut batch)
                 .expect("the frame builds");
             quads += batch.quads().iter().filter(|q| q.uv == bar).count();
@@ -2047,21 +2055,7 @@ fn bar_groups_do_not_allocate(ctx: &PlayContext<'_>) {
         bad.covers.cover = 500;
         for _ in 0..3 {
             batch.clear();
-            let frame = SkinFrame {
-                now: TimeUs(5_000 * MS),
-                display_offset: TimeUs(0),
-                tally: &t,
-                gauges: &gauges,
-                gauge: 0,
-                effects: &[],
-                complete: false,
-                target: TARGETS[0],
-                layout: &layout,
-                lanes,
-                readouts: bad,
-                loading: None,
-                playing: true,
-            };
+            let frame = frame_at(5_000 * MS, 0, TARGETS[0], lanes, bad);
             assert_eq!(
                 skin.build(&mut play, &frame, &uvs, &mut batch),
                 Err(BuildError::InvalidReadouts)
@@ -2073,21 +2067,7 @@ fn bar_groups_do_not_allocate(ctx: &PlayContext<'_>) {
         let mut stranger = other.prepare(&chart, ctx).unwrap();
         TRACK.with(|t| t.set(true));
         batch.clear();
-        let frame = SkinFrame {
-            now: TimeUs(5_000 * MS),
-            display_offset: TimeUs(0),
-            tally: &t,
-            gauges: &gauges,
-            gauge: 0,
-            effects: &[],
-            complete: false,
-            target: TARGETS[0],
-            layout: &layout,
-            lanes,
-            readouts: readouts_for(lanes),
-            loading: None,
-            playing: true,
-        };
+        let frame = frame_at(5_000 * MS, 0, TARGETS[0], lanes, readouts_for(lanes));
         skin.build(&mut stranger, &frame, &uvs, &mut batch)
             .expect("a wrong play draws nothing");
         assert!(batch.quads().is_empty());
