@@ -250,7 +250,7 @@ impl Cx<'_> {
     }
 
     /// Notes lane approximation `a` at `at`, which the owner accepts
-    /// (decision 12); `part` is what a rejected one would refuse.
+    /// (decisions 12 and 15); `part` is what a rejected one would refuse.
     #[cfg_attr(
         not(test),
         expect(unused_variables, reason = "only a test rejects an approximation")

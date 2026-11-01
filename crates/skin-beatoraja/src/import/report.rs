@@ -121,7 +121,7 @@ pub enum DeviationId {
     D5,
     D6,
     D8,
-    /// A lane approximation (owner decision 12).
+    /// A lane approximation (owner decisions 12 and 15).
     D9(LaneApprox),
     /// The gauge motion's phase, random sequence and flicker curve.
     D10,
