@@ -5546,9 +5546,14 @@ mod tests {
         commits: Vec<(u64, Probing)>,
     }
 
-    /// A probe frame's sprites and its halves' centres (RGB), or its
-    /// error.
-    type Probing = Result<(usize, [[u8; 3]; 2]), RenderError>;
+    /// A probe frame's sprites and the RGB of its samples ([`SAMPLES`]),
+    /// or its error.
+    type Probing = Result<(usize, [[u8; 3]; 4]), RenderError>;
+
+    /// Where a probe frame is sampled: the left half's centre and the
+    /// right half's, then the gauge-look marker's centre and the judgment
+    /// marker's ([`crate::render_decl::GAUGE_MARKER`], `JUDGE_MARKER`).
+    const SAMPLES: [(usize, usize); 4] = [(480, 540), (1_440, 540), (1_250, 150), (1_550, 150)];
 
     const RED: [u8; 3] = [255, 0, 0];
     const BLACK: [u8; 3] = [0; 3];
@@ -5556,30 +5561,50 @@ mod tests {
     /// A real menu screen on WARP whose menu frames fail while `fail` is
     /// set, so the render thread drops it and builds another. It notes
     /// what its renderer installed and stages, and draws a play frame of
-    /// [`crate::render_common::view`] with `gauges` gauges straight after
+    /// [`crate::render_common::view`] with `gauges` gauges, and one
+    /// judgment among its effects while `judge` is set, straight after
     /// each restore and each commit ([`Probed`]).
     struct Probe {
         menu: crate::menu_screen::MenuScreen,
         fail: Arc<AtomicBool>,
+        judge: Arc<AtomicBool>,
         gauges: Arc<std::sync::atomic::AtomicUsize>,
         probed: Arc<std::sync::Mutex<Probed>>,
     }
 
     impl Probe {
-        /// A frame of the installed skin at chart time 0, read back.
+        /// A frame of the installed skin at 1 ms, read back.
         fn frame(&mut self) -> Probing {
             let mut v = crate::render_common::view(0, 0);
             let gauge = v.gauges[0];
             v.gauges.resize(self.gauges.load(Ordering::Acquire), gauge);
+            let judged = [eval::JudgeEvent {
+                seq: 1,
+                time: TimeUs(0),
+                origin: Some(TimeUs(0)),
+                kind: eval::JudgeEventKind::Judged {
+                    lane: Lane::new(1).unwrap(),
+                    note: 0,
+                    judgment: rules::Judgment::Great,
+                    deviation: Some(TimeUs(0)),
+                    release: None,
+                    combo: 1,
+                },
+            }];
+            let effects: &[eval::JudgeEvent] = if self.judge.load(Ordering::Acquire) {
+                &judged
+            } else {
+                &[]
+            };
             let r = self.menu.renderer_mut();
-            let f = crate::render_common::input(&v, TimeUs(0), TimeUs(0), &[]);
+            let f = crate::render_common::input(&v, TimeUs(1_000), TimeUs(0), effects);
             let sprites = r.frame(&f)?.sprites;
             let p = r.read_back();
-            let px = |x: usize| {
-                let i = (540 * 1_920 + x) * 4;
+            let px = |(x, y): (usize, usize)| {
+                let i = (y * 1_920 + x) * 4;
                 [p[i], p[i + 1], p[i + 2]]
             };
-            Ok((sprites, [px(480), px(1_440)]))
+            Ok((sprites, SAMPLES.map(px)))
         }
 
         fn probed(&self) -> std::sync::MutexGuard<'_, Probed> {
@@ -5676,14 +5701,15 @@ mod tests {
     }
 
     /// The attempt of `chart` the game would make under `preset`: the
-    /// whole chart or `section`'s round, titled "T".
+    /// whole chart or `section`'s round, titled `title`.
     fn preset_attempt(
         chart: &Chart,
         preset: &rules::RulePreset,
         section: Option<&eval::Section>,
+        title: &str,
     ) -> AttemptContext {
         let labels = game::ChartLabels {
-            title: "T".to_owned(),
+            title: title.to_owned(),
             ..game::ChartLabels::default()
         };
         let attempt = game::Attempt::new(
@@ -5701,13 +5727,20 @@ mod tests {
     /// menu screen built again restores the committed bundle from memory,
     /// its image files deleted: installed at once and drawing nothing
     /// without an attempt, its resources reused by every later attempt.
-    /// Each attempt starts fresh from its own preset: one counting empty
-    /// POORs refuses the frames of a snapshot with more of them than
-    /// POORs, and the retry after it, its gauges reordered and empty POORs
-    /// apart, draws; a practice round of a one-gauge preset prepares with
-    /// one initial gauge, which the two-gauge preset before it would
-    /// refuse. Each attempt's text is prepared afresh, and a refused text
-    /// refuses the attempt with the producer's own reason.
+    /// Each attempt on it starts fresh from its own preset and labels:
+    /// - a healthy attempt shows its judgment (the judgment marker) and
+    ///   its title's text line;
+    /// - the next, counting empty POORs, refuses the frames of a snapshot
+    ///   with more of them than POORs;
+    /// - the retry after it, its gauges reordered so the shown gauge 0 is
+    ///   the survival gauge (the gauge-look marker), empty POORs apart and
+    ///   untitled, draws neither the judgment nor a text line;
+    /// - a practice round of a one-gauge preset prepares with one initial
+    ///   gauge, which the two-gauge preset before it would refuse, and
+    ///   shows its judgment and its line; the round again, untitled and
+    ///   unjudged, shows neither.
+    ///
+    /// A refused text refuses the attempt with the producer's own reason.
     #[test]
     fn a_menu_screen_built_again_restores_the_bundle_and_starts_each_attempt_afresh() {
         use crate::render_decl::{Look, bundle};
@@ -5716,6 +5749,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let look = Look {
             text: true,
+            markers: true,
             ..Look::left([255, 0, 0, 255])
         };
         let (skin, text) = bundle(
@@ -5725,11 +5759,13 @@ mod tests {
         );
         let text = text.unwrap();
         let fail = Arc::new(AtomicBool::new(false));
+        let judge = Arc::new(AtomicBool::new(false));
         let gauges = Arc::new(std::sync::atomic::AtomicUsize::new(2));
         let probed = Arc::new(std::sync::Mutex::new(Probed::default()));
         let builds = Arc::new(AtomicU32::new(0));
-        let (f, g, p, b) = (
+        let (f, j, g, p, b) = (
             Arc::clone(&fail),
+            Arc::clone(&judge),
             Arc::clone(&gauges),
             Arc::clone(&probed),
             Arc::clone(&builds),
@@ -5746,6 +5782,7 @@ mod tests {
             Ok(Box::new(Probe {
                 menu: crate::menu_screen::MenuScreen::new(renderer, None),
                 fail: Arc::clone(&f),
+                judge: Arc::clone(&j),
                 gauges: Arc::clone(&g),
                 probed: Arc::clone(&p),
             }) as Box<dyn Screen>)
@@ -5753,13 +5790,22 @@ mod tests {
         let link = spawn_empty(make);
         link.load(Arc::clone(&chart), None).unwrap();
         link.select(Some(Arc::clone(&skin)));
-        let ready = |preset: &rules::RulePreset, section: Option<&eval::Section>| {
-            link.prepare_attempt(preset_attempt(&chart, preset, section), || false)
+        let play = |preset: &rules::RulePreset,
+                    section: Option<&eval::Section>,
+                    title: &str,
+                    judged: bool| {
+            judge.store(judged, Ordering::Release);
+            let attempt = preset_attempt(&chart, preset, section, title);
+            assert_eq!(
+                link.prepare_attempt(attempt, || false).unwrap(),
+                Preparation::Ready
+            );
+            link.commit_attempt().unwrap();
         };
+        let tapestry = rules::tapestry();
 
         // The first attempt uploads the bundle and draws it.
-        assert_eq!(ready(&rules::tapestry(), None).unwrap(), Preparation::Ready);
-        link.commit_attempt().unwrap();
+        play(&tapestry, None, "T", false);
         dir.close().unwrap();
 
         // The screen fails and is dropped; the next attempt builds another.
@@ -5767,19 +5813,17 @@ mod tests {
         link.send(RenderMsg::Menu(Box::default()));
         assert!(wait_until(|| link.failed()));
         fail.store(false, Ordering::Release);
-        let mut counted = rules::tapestry();
-        counted.empty_poor.counted = true;
-        assert_eq!(ready(&counted, None).unwrap(), Preparation::Ready);
-        link.commit_attempt().unwrap();
+        play(&tapestry, None, "T", true);
         assert_eq!(builds.load(Ordering::SeqCst), 2);
 
-        // A retry with the gauges reordered and empty POORs apart.
+        let mut counted = rules::tapestry();
+        counted.empty_poor.counted = true;
+        play(&counted, None, "T", false);
+
         let mut reordered = rules::tapestry();
         reordered.gauges.reverse();
-        assert_eq!(ready(&reordered, None).unwrap(), Preparation::Ready);
-        link.commit_attempt().unwrap();
+        play(&reordered, None, "", false);
 
-        // A practice round of a one-gauge preset.
         let mut one = rules::tapestry();
         one.gauges.truncate(1);
         gauges.store(1, Ordering::Release);
@@ -5789,13 +5833,14 @@ mod tests {
             lead_in: TimeUs(2_000_000),
             initial_gauges: vec![rules::GaugeValue(20 * rules::GaugeValue::PERCENT)],
         };
-        assert_eq!(ready(&one, Some(&round)).unwrap(), Preparation::Ready);
-        link.commit_attempt().unwrap();
-        assert_eq!(text.calls.load(Ordering::SeqCst), 4, "each attempt's text");
+        play(&one, Some(&round), "T", true);
+        play(&one, Some(&round), "", false);
+        assert_eq!(text.calls.load(Ordering::SeqCst), 6, "each attempt's text");
 
         // A refused text: the producer's reason reaches the refusal.
         text.refuse.store(true, Ordering::SeqCst);
-        let refused = ready(&rules::tapestry(), None).unwrap();
+        let attempt = preset_attempt(&chart, &tapestry, None, "T");
+        let refused = link.prepare_attempt(attempt, || false).unwrap();
         let Preparation::Refused(refusal) = refused else {
             panic!("{refused:?}");
         };
@@ -5815,25 +5860,42 @@ mod tests {
             panic!("{:?}", probed.restores);
         };
         assert!(same, "the restored bundle is not installed");
-        assert!(matches!(drew, Ok((0, [BLACK, BLACK]))), "{drew:?}");
+        assert!(
+            matches!(drew, Ok((0, [BLACK, BLACK, BLACK, BLACK]))),
+            "{drew:?}"
+        );
         // Uploaded once per screen: the restore's resources are reused.
         assert!(probed.staged_atlas[0] > 0);
-        assert_eq!(probed.staged_atlas[1..], [0, 0, 0]);
+        assert_eq!(probed.staged_atlas[1..], [0; 5]);
         let generations: Vec<u64> = probed.commits.iter().map(|c| c.0).collect();
-        assert_eq!(generations[1..], [*restored; 3]);
+        assert_eq!(generations[1..], [*restored; 5]);
+        // Each commit's frame: the sprites (the image, the text line, the
+        // gauge-look marker, the judgment marker) and the samples (left,
+        // right, gauge look, judgment).
         let drew: Vec<&Probing> = probed.commits.iter().map(|c| &c.1).collect();
-        assert!(matches!(drew[0], Ok((2, [RED, BLACK]))), "{:?}", drew[0]);
+        let expect = |i: usize, sprites: usize, gauge: [u8; 3], judgment: [u8; 3]| {
+            let want = (sprites, [RED, BLACK, gauge, judgment]);
+            assert!(
+                matches!(drew[i], Ok(got) if *got == want),
+                "attempt {}: {:?}, not {want:?}",
+                i + 1,
+                drew[i]
+            );
+        };
+        expect(0, 2, BLACK, BLACK);
+        expect(1, 3, BLACK, RED);
         assert!(
             matches!(
-                drew[1],
+                drew[2],
                 Err(RenderError::Build(
                     skin_model::BuildError::InconsistentTally
                 ))
             ),
             "{:?}",
-            drew[1]
+            drew[2]
         );
-        assert!(matches!(drew[2], Ok((2, [RED, BLACK]))), "{:?}", drew[2]);
-        assert!(matches!(drew[3], Ok((2, [RED, BLACK]))), "{:?}", drew[3]);
+        expect(3, 2, RED, BLACK);
+        expect(4, 3, BLACK, RED);
+        expect(5, 1, BLACK, BLACK);
     }
 }

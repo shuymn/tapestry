@@ -1,7 +1,8 @@
 //! Declarative skin bundles for the render tests, built here: a solid
 //! image written as PNG into a temporary folder, a fixed 1920×1080 skin
-//! drawing it, optionally under clip 0 and with a text element whose
-//! prepared line a supplied producer gives.
+//! drawing it, optionally under clip 0, with a text element whose
+//! prepared line a supplied producer gives, and with markers of the shown
+//! gauge's look and of the judgment timer.
 
 #![allow(dead_code)]
 
@@ -15,9 +16,9 @@ use bms_model::TimeUs;
 use render::{AttemptText, ClipTable, Renderer, SkinBundle, SkinError};
 use skin_model::{
     Align, Anchor, Blend, ChartText, ClipId, Ease, ElementDef, End, FileDef, Filter, Fit, FontRef,
-    FrameUv, ImageDef, KeyDef, Overflow, Place, Region, RegionDef, Sheet, Side, Skin, SkinDef,
-    Source, TextDef, TextField, TextImage, TextTable, TextValue, TimerRef, Track, Variant,
-    WidgetDefs,
+    FrameUv, ImageDef, KeyDef, Overflow, PLAY, Place, Region, RegionDef, Scope, Sheet, Side, Skin,
+    SkinDef, Source, TextDef, TextField, TextImage, TextTable, TextValue, TimerRef, Track, Ty,
+    Variant, WidgetDefs, compile,
 };
 
 /// Writes a `side`-texel-square PNG of `rgba` at `path`.
@@ -70,7 +71,16 @@ pub struct Look {
     pub copies: usize,
     /// A text element on the right half with its prepared line.
     pub text: bool,
+    /// Two markers drawing the image unclipped: over [`GAUGE_MARKER`]
+    /// while the shown gauge's look is `hard` (a survival gauge's), and
+    /// over [`JUDGE_MARKER`] once a judgment started its timer.
+    pub markers: bool,
 }
+
+/// Where the gauge-look marker draws, in canvas pixels.
+pub const GAUGE_MARKER: [i32; 4] = [1_200, 100, 100, 100];
+/// Where the judgment marker draws.
+pub const JUDGE_MARKER: [i32; 4] = [1_500, 100, 100, 100];
 
 impl Look {
     /// `rgba` over the left half, under a clip of the left half.
@@ -82,12 +92,14 @@ impl Look {
             clip: Some([0.0, 0.0, 960.0, 1_080.0]),
             copies: 0,
             text: false,
+            markers: false,
         }
     }
 }
 
-/// A text producer giving slot 0 the image of the fixture's frame 0 and
-/// counting its calls, or refusing while `refuse` is set.
+/// A text producer giving slot 0 the image of the fixture's frame 0 for a
+/// chart with a title, and no line for one without, counting its calls,
+/// or refusing while `refuse` is set.
 #[derive(Debug)]
 pub struct Text {
     pub uv: FrameUv,
@@ -99,7 +111,7 @@ impl AttemptText for Text {
     fn prepare(
         &self,
         skin: &Skin,
-        _chart: &ChartText<'_>,
+        chart: &ChartText<'_>,
         _target: [u32; 2],
     ) -> Result<Option<TextTable>, SkinError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
@@ -110,7 +122,9 @@ impl AttemptText for Text {
         }
         let line = TextImage::new(self.uv, [0.0, 0.0, 1.0, 1.0], 1.0);
         let mut slots = vec![None; skin.text_slots()];
-        if let Some(slot) = slots.first_mut() {
+        if !chart.title.is_empty()
+            && let Some(slot) = slots.first_mut()
+        {
             *slot = line;
         }
         Ok(Some(TextTable::new(slots)))
@@ -152,6 +166,18 @@ pub fn skin(dir: &Path, look: &Look) -> Skin {
         let mut text = image([1_000, 500, 100, 100], false);
         text.source = Source::Text(0);
         elements.push(text);
+    }
+    if look.markers {
+        let scope = Scope::new(&PLAY);
+        let hard = compile("gauge.valid && gauge.kind == hard", &scope, Ty::Bool).unwrap();
+        elements.push(ElementDef {
+            visible: Some(hard),
+            ..image(GAUGE_MARKER, false)
+        });
+        elements.push(ElementDef {
+            timer: TimerRef::Builtin(skin_model::timer::JUDGE),
+            ..image(JUDGE_MARKER, false)
+        });
     }
     Skin::new(SkinDef {
         fit: Fit::Fixed,
