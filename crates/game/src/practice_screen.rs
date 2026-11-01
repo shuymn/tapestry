@@ -368,10 +368,43 @@ impl PracticeScreen {
         }
     }
 
+    /// Whether the displayed gauge's value was set away from its start.
+    fn set_away(&self) -> bool {
+        self.rule.as_ref().is_some_and(|r| self.value != r.start)
+    }
+
+    /// Shows what `loaded`'s last fit of this screen's practice to the
+    /// play preset gave ([`Loaded::start_practice`],
+    /// [`Loaded::refit_practice`]), never the screen's own copy: the
+    /// displayed gauge, followed by its ID, at the fit's value for it, or
+    /// its start without one. A displayed gauge the preset no longer has
+    /// gives way to the gauge a fit put in its place
+    /// ([`Loaded::replacement`], the one the reset's reason names), at its
+    /// start, or without one to the preset's gauge at the same place, as
+    /// [`new`](Self::new) shows one. A reset was the reason no round
+    /// opened, which the page states.
+    pub fn sync(&mut self, loaded: &Loaded) {
+        let gauges = &loaded.preset().gauges;
+        let position = |id: &str| gauges.iter().position(|g| g.id == id);
+        let found = self
+            .rule
+            .as_ref()
+            .and_then(|r| position(&r.id).or_else(|| loaded.replacement(&r.id).and_then(position)));
+        self.gauge = found.unwrap_or_else(|| self.gauge.min(gauges.len().saturating_sub(1)));
+        self.rule = gauges.get(self.gauge).cloned();
+        self.value = self.rule.as_ref().map_or(GaugeValue::EMPTY, |r| {
+            loaded
+                .initial_gauge(&r.id)
+                .filter(|v| eval::accepts_initial(r, *v))
+                .unwrap_or(r.start)
+        });
+    }
+
     /// The practice set up for `loaded`, read at the chosen speed: the
     /// section from measure `from` to the start of measure `to`, or to the
-    /// chart's end ([`chart_end`]) for the last; the displayed gauge at its
-    /// value and every other gauge of the current preset at its start.
+    /// chart's end ([`chart_end`]) for the last; the displayed gauge, by
+    /// its ID, at its value while its rule accepts it, and every other
+    /// gauge of the current preset at its start.
     #[must_use]
     pub fn practice(&self, loaded: &Loaded) -> Practice {
         let at = |i: usize| self.measures.get(i).copied();
@@ -384,8 +417,14 @@ impl PracticeScreen {
             .preset()
             .gauges
             .iter()
-            .enumerate()
-            .map(|(i, g)| if i == self.gauge { self.value } else { g.start })
+            .map(|g| match &self.rule {
+                Some(r)
+                    if r.id == g.id && self.set_away() && eval::accepts_initial(g, self.value) =>
+                {
+                    self.value
+                }
+                _ => g.start,
+            })
             .collect();
         Practice {
             start,

@@ -24,16 +24,24 @@ pub fn tapestry_settings(root: &DataRoot) -> Settings {
     settings
 }
 
-/// Writes `text` to `path` with a modification time a minute from now,
-/// clearly after any read of the file before, so a check sees it changed.
+/// Writes `text` to `path` with a modification time a minute after the
+/// file's last one (a minute from now for a new file): distinct from every
+/// time a check saw before, whatever the clock's resolution, so a check
+/// sees it changed. The stored time is checked to have changed.
 pub fn rewrite(path: &std::path::Path, text: &str) {
+    let minute = std::time::Duration::from_secs(60);
+    let before = std::fs::metadata(path).and_then(|m| m.modified()).ok();
+    let at = before.unwrap_or_else(std::time::SystemTime::now) + minute;
     std::fs::write(path, text).unwrap();
     std::fs::File::options()
         .write(true)
         .open(path)
         .unwrap()
-        .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(60))
+        .set_modified(at)
         .unwrap();
+    let stored = std::fs::metadata(path).unwrap().modified().unwrap();
+    assert_eq!(stored, at, "{}", path.display());
+    assert_ne!(Some(stored), before, "{}", path.display());
 }
 
 /// The control a source binds to `lane`: `0x100 + lane index`, so control

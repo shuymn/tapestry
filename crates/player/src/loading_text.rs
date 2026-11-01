@@ -52,6 +52,40 @@ impl Stage {
     }
 }
 
+/// The chosen chart's descriptive fields as its library entry has them,
+/// each `None` when unknown: what a skin's loading frame may show of the
+/// chart. Never filled from the file's name or another chart's fields; the
+/// lines' fallbacks stay in [`LoadingText`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ChosenChart {
+    /// `#TITLE`.
+    pub title: Option<String>,
+    /// `#SUBTITLE`.
+    pub subtitle: Option<String>,
+    /// `#ARTIST`.
+    pub artist: Option<String>,
+    /// `#SUBARTIST`.
+    pub subartist: Option<String>,
+    /// `#GENRE`.
+    pub genre: Option<String>,
+}
+
+/// One loading update, typed, beside its lines (design.md "Play
+/// Lifecycle"): what the load is doing and the chart chosen, bound to the
+/// loading lifetime it was shown in. Nothing reads these back out of the
+/// formatted lines.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LoadingUpdate {
+    /// What the load is doing.
+    pub stage: Stage,
+    /// The chart chosen.
+    pub chart: ChosenChart,
+    /// The play preset's name.
+    pub preset: String,
+    /// Whether it is a practice's Start.
+    pub practice: bool,
+}
+
 /// The chart being loaded, as its lines name it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LoadingText {
@@ -63,9 +97,21 @@ pub struct LoadingText {
     pub preset: String,
     /// Whether it is a practice's Start.
     pub practice: bool,
+    /// The chart's own fields, for the typed updates.
+    pub chart: ChosenChart,
 }
 
 impl LoadingText {
+    /// The typed update at `stage`, beside [`lines`](Self::lines).
+    pub fn update(&self, stage: Stage) -> LoadingUpdate {
+        LoadingUpdate {
+            stage,
+            chart: self.chart.clone(),
+            preset: self.preset.clone(),
+            practice: self.practice,
+        }
+    }
+
     /// The lines at `stage`: the heading, the chart's lines and the stage.
     pub fn lines(&self, stage: Stage) -> MenuPage {
         let line = |text: String, style| MenuLine { text, style };
@@ -101,6 +147,7 @@ mod tests {
             artist: "テスト".to_owned(),
             preset: "lr2-style".to_owned(),
             practice: false,
+            chart: super::ChosenChart::default(),
         };
         let strings = |stage| {
             text.lines(stage)

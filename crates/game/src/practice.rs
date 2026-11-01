@@ -54,6 +54,114 @@ pub struct Practice {
     pub repeat: bool,
 }
 
+/// A value the player set that fitting a practice to an edited play preset
+/// reset ([`Loaded::refit_practice`](crate::Loaded::refit_practice)), as
+/// the practice page states it: a round never plays a reset value the
+/// player set, so the page states the reset and the player starts again.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Reset {
+    /// The gauge's rule no longer accepts the value set: it starts at its
+    /// start.
+    Refused {
+        /// The gauge's ID.
+        gauge: String,
+        /// The value set.
+        set: GaugeValue,
+        /// Its start, which the round plays.
+        start: GaugeValue,
+    },
+    /// The preset lost the gauge set, and its value with it; the practice
+    /// page shows the gauge at its place instead, at its start.
+    Lost {
+        /// The gauge's ID.
+        gauge: String,
+        /// The value set.
+        set: GaugeValue,
+        /// The gauge shown in its place and its start; `None` for a preset
+        /// without gauges.
+        shown: Option<(String, GaugeValue)>,
+    },
+}
+
+impl std::fmt::Display for Reset {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Refused { gauge, set, start } => write!(
+                f,
+                "the gauge {gauge} no longer accepts {}; it starts at {}",
+                Percent(*set),
+                Percent(*start)
+            ),
+            Self::Lost { gauge, set, shown } => {
+                write!(f, "the gauge {gauge} ({}) left the preset", Percent(*set))?;
+                match shown {
+                    Some((id, start)) => write!(f, "; showing {id} at {}", Percent(*start)),
+                    None => Ok(()),
+                }
+            }
+        }
+    }
+}
+
+/// Why a practice fitted to an edited play preset opens no round
+/// ([`Loaded::refit_practice`](crate::Loaded::refit_practice),
+/// [`Loaded::start_practice`](crate::Loaded::start_practice)): what the fit
+/// reset of what the player set, and what the section's check refused,
+/// each told when it happened.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Unfit {
+    /// What the fit reset of what the player set.
+    pub resets: Vec<Reset>,
+    /// What the section's check refused under the edited preset.
+    pub refused: Option<PracticeError>,
+}
+
+impl std::fmt::Display for Unfit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut sep = "";
+        if let Some(e) = &self.refused {
+            write!(f, "{}", crate::Chain(e))?;
+            sep = "; ";
+        }
+        for reset in &self.resets {
+            write!(f, "{sep}{reset}")?;
+            sep = "; ";
+        }
+        Ok(())
+    }
+}
+
+/// The resets of one fit, as one notice: `None` when nothing was reset.
+#[must_use]
+pub fn reset_notice(resets: &[Reset]) -> Option<String> {
+    let notice = resets
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("; ");
+    (!notice.is_empty()).then_some(notice)
+}
+
+/// A gauge value as a percentage, with as many decimals as it has:
+/// `20%`, `20.5%`.
+struct Percent(GaugeValue);
+
+impl std::fmt::Display for Percent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let v = self.0.0;
+        let sign = if v < 0 { "-" } else { "" };
+        let (whole, frac) = (
+            v.unsigned_abs() / GaugeValue::PERCENT.unsigned_abs(),
+            v.unsigned_abs() % GaugeValue::PERCENT.unsigned_abs(),
+        );
+        if frac == 0 {
+            return write!(f, "{sign}{whole}%");
+        }
+        let digits = format!("{frac:05}");
+        write!(f, "{sign}{whole}.{}%", digits.trim_end_matches('0'))
+    }
+}
+
 /// Why a practice cannot be set up.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum PracticeError {
@@ -75,7 +183,14 @@ pub enum PracticeError {
 /// "Practice Speed Changes").
 #[must_use]
 pub(crate) fn mapped(t: TimeUs, speed: Speed) -> TimeUs {
-    let real = (i128::from(t.0) * 20).div_euclid(i128::from(speed.twentieths()));
+    mapped_wide(i128::from(t.0), speed)
+}
+
+/// [`mapped`] for a 1× time wider than a [`TimeUs`], such as one past its
+/// range by an added pad: only the real time saturates.
+#[must_use]
+pub(crate) fn mapped_wide(t: i128, speed: Speed) -> TimeUs {
+    let real = (t * 20).div_euclid(i128::from(speed.twentieths()));
     TimeUs(i64::try_from(real).unwrap_or(if real < 0 { i64::MIN } else { i64::MAX }))
 }
 
@@ -176,4 +291,35 @@ pub(crate) fn check(
 #[must_use]
 pub(crate) fn schedule(chart: &Chart, section: &Section) -> Vec<BgmEvent> {
     crate::autoplay::schedule_where(chart, |n| !section.is_target(n))
+}
+
+#[cfg(test)]
+mod tests {
+    use rules::GaugeValue;
+
+    use super::{Reset, reset_notice};
+
+    /// A reset names the gauge and the values, each with the decimals it
+    /// has; several join into one notice, and none gives none.
+    #[test]
+    fn a_reset_says_its_values() {
+        let refused = Reset::Refused {
+            gauge: "normal".to_owned(),
+            set: GaugeValue(2_050_000),
+            start: GaugeValue(2_000_000),
+        };
+        let lost = Reset::Lost {
+            gauge: "hard".to_owned(),
+            set: GaugeValue(1),
+            shown: None,
+        };
+        assert_eq!(
+            reset_notice(&[refused, lost]).as_deref(),
+            Some(
+                "the gauge normal no longer accepts 20.5%; it starts at 20%; \
+                 the gauge hard (0.00001%) left the preset"
+            )
+        );
+        assert_eq!(reset_notice(&[]), None);
+    }
 }

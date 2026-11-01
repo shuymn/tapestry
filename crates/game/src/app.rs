@@ -11,7 +11,9 @@
 //!   before anything is read; it lasts until the countdown or the way back.
 //! - A refused load returns to selection with the reason, and the chart
 //!   stays selected: a chart or preset file that cannot be used, a bank
-//!   that does not load, and a play the logic step refuses at the opening.
+//!   that does not load, a play whose attempt the screen refuses to
+//!   prepare, and a play the logic step refuses at the opening. A practice
+//!   Start shows the same refusals on its page.
 //! - Only the screen, audio and input-thread failures [`LiveError`] carries
 //!   end the run; closing the window ends it from any scene.
 //! - One shelf of presets serves the run (design.md "Tuning Without
@@ -26,8 +28,9 @@ use bms_model::TimeUs;
 
 use bms_model::Speed;
 
+use crate::attempt::PreparationRefusal;
 use crate::error::Chain;
-use crate::live::{Leave, LiveError, Rig, run_chart, run_over};
+use crate::live::{Leave, LiveError, Rig, run_chart, run_over, threads_over};
 use crate::logic::LogicError;
 use crate::policy::{SessionEvent, SessionEventSink, SharedEvents};
 use crate::practice::PracticeError;
@@ -141,6 +144,10 @@ pub enum Refused<B> {
     /// The chart cannot be practiced (an autoplay session).
     #[error("the chart cannot be practiced")]
     Practice(#[source] PracticeError),
+    /// The screen refused to prepare a play of the chart, and stays
+    /// usable for selection.
+    #[error("the play cannot be prepared")]
+    Preparation(#[source] PreparationRefusal),
 }
 
 /// A chosen chart that was refused, and why; it stays selected.
@@ -358,7 +365,12 @@ impl App {
             match self.play_chart(&chart, practice, rig)? {
                 Chosen::Left(Leave::Back) => {}
                 Chosen::Left(Leave::Quit) => return Ok(()),
-                Chosen::Refused(reason) => refusal = Some(LoadRefusal { chart, reason }),
+                // A refusal never hides a thread's failure: the run ends
+                // with it instead.
+                Chosen::Refused(reason) => {
+                    threads_over(rig)?;
+                    refusal = Some(LoadRefusal { chart, reason });
+                }
             }
         }
     }
@@ -442,6 +454,7 @@ impl App {
                 Ok(Loading::Ready) => match run_chart(&mut loaded, rig) {
                     Ok(leave) => Ok(Chosen::Left(leave)),
                     Err(LiveError::Logic(e)) => Ok(Chosen::Refused(Refused::Play(e))),
+                    Err(LiveError::Preparation(e)) => Ok(Chosen::Refused(Refused::Preparation(e))),
                     Err(e) => Err(e),
                 },
             }
@@ -506,10 +519,23 @@ fn practice_chart<R: AppRig>(
             }
         }
         if start {
-            let notice = match start_rounds(loaded, &screen, rig) {
+            // The play preset changes only at a Start and as a round
+            // begins: once this Start's practice was fitted to it, the page
+            // shows what the last fit gave, so what it shows is what the
+            // next round plays.
+            let mut set_up = false;
+            let ran = start_rounds(loaded, &screen, rig, &mut set_up);
+            if set_up {
+                screen.sync(loaded);
+            }
+            let notice = match ran {
                 Ok(Leave::Quit) => return Ok(Leave::Quit),
                 Ok(Leave::Back) => None,
-                Err(Stopped::Notice(n)) => Some(n),
+                // A refusal never hides a thread's failure.
+                Err(Stopped::Notice(n)) => {
+                    threads_over(rig)?;
+                    Some(n)
+                }
                 Err(Stopped::Run(e)) => return Err(e),
             };
             screen.set_notice(notice);
@@ -535,11 +561,14 @@ enum Stopped<S> {
 /// One Start of the practice screen: the chart read again at the chosen
 /// speed, the practice set up, the bank and the screen's chart loaded
 /// (every time, so no bank of another chart or speed is reused), and the
-/// rounds played until they are left.
+/// rounds played until they are left. `set_up` turns true once the
+/// screen's practice was fitted to the refreshed play preset
+/// ([`Loaded::start_practice`]).
 fn start_rounds<R: AppRig>(
     loaded: &mut Loaded,
     screen: &PracticeScreen,
     rig: &mut R,
+    set_up: &mut bool,
 ) -> Result<Leave, Stopped<R::ScreenError>> {
     let notice = |e: &(dyn std::error::Error + 'static)| Stopped::Notice(Chain(e).to_string());
     rig.entered_loading(loaded.path());
@@ -547,9 +576,9 @@ fn start_rounds<R: AppRig>(
         loaded.set_speed(screen.speed()).map_err(|e| notice(&e))?;
     }
     let practice = screen.practice(loaded);
-    loaded
-        .set_practice(Some(practice))
-        .map_err(|e| notice(&e))?;
+    let started = loaded.start_practice(practice);
+    *set_up = true;
+    started.map_err(|e| Stopped::Notice(e.to_string()))?;
     if rig.load_chart(loaded).map_err(|e| notice(&e))? == Loading::Cancelled {
         return cancelled(rig).map_err(Stopped::Run);
     }
@@ -557,6 +586,7 @@ fn start_rounds<R: AppRig>(
         Ok(leave) => Ok(leave),
         Err(LiveError::Logic(e)) => Err(notice(&e)),
         Err(LiveError::Restore(e)) => Err(notice(&e)),
+        Err(LiveError::Preparation(e)) => Err(notice(&e)),
         Err(e) => Err(Stopped::Run(e)),
     }
 }
