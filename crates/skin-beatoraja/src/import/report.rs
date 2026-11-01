@@ -25,7 +25,7 @@ pub enum Severity {
     /// An element the source draws was left out.
     Dropped,
     /// The element is kept and drawn differently from the source, by an
-    /// owner decision (D1–D11).
+    /// owner decision (D1–D13).
     Deviation,
     /// Something the source does not draw either, or a field with no
     /// effect, was left out.
@@ -125,16 +125,15 @@ pub enum DeviationId {
     D9(LaneApprox),
     /// The gauge motion's phase, random sequence and flicker curve.
     D10,
-    /// HIDDEN+ is never drawn (owner decision 15).
-    D11,
     /// A bitmap font's size rounded to a whole reference pixel.
     D12,
     /// A distance-field bitmap font drawn with the default font.
     D13,
 }
 
-/// How the lanes, SUDDEN+ and LIFT are drawn differently from the source
-/// (owner decision 12, items a–k).
+/// How the lanes and their covers are drawn differently from the source:
+/// SUDDEN+ and LIFT by owner decision 12 (items a–l), HIDDEN+ by its
+/// mapping (owner decision 15, items m–o).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LaneApprox {
     /// a: notes and long-note bodies stop at the top of the lanes.
@@ -151,9 +150,19 @@ pub enum LaneApprox {
     /// j: bar lines are drawn across the lanes at note centres, white and
     /// opaque, until they leave the lanes' bottom.
     BarLine,
-    /// k: what the skin draws between the notes and SUDDEN+ or LIFT is
-    /// drawn above them.
+    /// k: what the skin draws between the notes and SUDDEN+, LIFT or
+    /// HIDDEN+ is drawn above them.
     CoverOrder,
+    /// m: HIDDEN+ is drawn under SUDDEN+ and LIFT, where the source draws
+    /// it above the one it comes after.
+    HiddenOrder,
+    /// n: HIDDEN+ is cut at its trim line after its stretch, where the
+    /// source decides what to draw and clip from its unstretched
+    /// destination.
+    HiddenStretch,
+    /// o: HIDDEN+ is never drawn outside the lanes, where the source can
+    /// draw it above or below them.
+    HiddenClip,
 }
 
 /// What a note is about.

@@ -429,14 +429,18 @@ fn skin_import_seeds_import_and_draw_as_built() {
             "lanes" => {
                 use skin_beatoraja::{DeviationId, LaneApprox};
                 // The lanes, SUDDEN+, LIFT and HIDDEN+; the notes, bar,
-                // SUDDEN+ and LIFT images over one file.
-                assert_eq!((u.elements, u.keys, u.images), (4, 4, 4), "{name}");
+                // SUDDEN+, LIFT and HIDDEN+ images over one file.
+                assert_eq!((u.elements, u.keys, u.images), (4, 5, 5), "{name}");
                 assert!(i.scratch.is_some(), "{name}");
                 let d9 = |a| NoteKind::Deviation(DeviationId::D9(a));
-                for a in [LaneApprox::BarLine, LaneApprox::CoverAbove] {
+                for a in [
+                    LaneApprox::BarLine,
+                    LaneApprox::CoverAbove,
+                    LaneApprox::HiddenOrder,
+                ] {
                     assert!(kinds(&i).contains(&d9(a)), "{name}: {a:?}");
                 }
-                assert!(kinds(&i).contains(&NoteKind::Deviation(DeviationId::D11)));
+
                 // At 500 ms the eleven notes from 1 s to 1.1 s are on
                 // screen, the last with its lower edge on the region's
                 // top. SUDDEN+ at 0 shows the strip above the region in

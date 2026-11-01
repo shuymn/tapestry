@@ -896,12 +896,12 @@ fn lanes_body() -> String {
             "note": {{"id": "notes", {lists}, "size": [20, 20, 20, 20, 20, 20, 20, 20], "dst": [{}],
                      "group": [{{"id": "bar", "dst": [{{"x": 0, "y": 0, "w": 4, "h": 2}}]}}]}},
             "liftCover": [{{"id": "lc", "src": "grid", "x": 4, "y": 4, "w": 4, "h": 4, "disapearLine": 200}}],
-            "hiddenCover": [{{"id": "hid", "src": "grid"}}],
+            "hiddenCover": [{{"id": "hid", "src": "grid", "y": 4, "w": 4, "h": 4, "disapearLine": 200}}],
             "destination": [
                 {{"id": "notes", "dst": [{{"w": 0, "h": 0}}]}},
                 {{"id": "cv", "offset": 4, "dst": [{{"x": 20, "y": 800, "w": 430, "h": 600}}]}},
                 {{"id": "lc", "dst": [{{"x": 20, "y": 0, "w": 430, "h": 200}}]}},
-                {{"id": "hid", "dst": [{{"x": 20, "y": 200, "w": 430, "h": 600}}]}}]"#,
+                {{"id": "hid", "dst": [{{"x": 20, "y": -400, "w": 430, "h": 600}}]}}]"#,
         lanes.join(", ")
     )
 }

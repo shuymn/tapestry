@@ -50,7 +50,12 @@
 //!     instead of refusing the skin ([`super::widget::lanes`]).
 //! 14. Judgment and gauge parts that move with LIFT (offset 3) are
 //!     refused, as every run-time offset on them is.
-//! 15. HIDDEN+ is never drawn (D11): the skin imports with a note.
+//! 15. HIDDEN+ is optional for the player, so it is decorative: outside
+//!     the mapped subset it is dropped with a note and the skin still
+//!     imports ([`super::widget::lanes`]). Its differences from the source
+//!     are noted as lane approximations (D9): m drawn under SUDDEN+ and
+//!     LIFT, n cut at its trim line after its stretch, o never drawn
+//!     outside the lanes.
 
 use std::fmt;
 

@@ -5,7 +5,7 @@ use std::path::Path;
 
 use super::asset::ADMITS;
 use super::report::WALKED;
-use super::{Config, Event, Imported, NoteKind, TRACE, import};
+use super::{Config, Event, Imported, NoteKind, Severity, TRACE, import};
 use crate::error::ImportError;
 
 fn png(root: &Path, name: &str, w: u32, h: u32) {
@@ -187,17 +187,20 @@ fn lift(id: &str, src: &str) -> (String, String) {
 }
 
 #[test]
-fn refused_and_ignored_covers_admit_nothing() {
+fn refused_and_dropped_covers_admit_nothing() {
     let (r, _, base) = run(&lanes("", ""));
     r.unwrap();
     assert_eq!(base, 1);
-    // HIDDEN+ of the malformed file.
+    // HIDDEN+ of the malformed file outside the subset: nothing read.
     let hidden = lanes(
         r#""hiddenCover": [{"id": "hid", "src": "b", "w": 8, "h": 8}]"#,
-        r#", {"id": "hid", "dst": [{"x": 20, "y": 200, "w": 430, "h": 600}]}"#,
+        r#", {"id": "hid", "timer": 41, "dst": [{"x": 20, "y": 200, "w": 430, "h": 600}]}"#,
     );
     let (r, _, admits) = run(&hidden);
-    r.unwrap();
+    let dropped = r.unwrap().report.notes.iter().any(|n| {
+        n.severity == Severity::Dropped && n.kind == NoteKind::UnsupportedField { field: "dst" }
+    });
+    assert!(dropped);
     assert_eq!(admits, base);
     // A second LIFT of the malformed file.
     let (o1, d1) = lift("l1", "a");
@@ -227,6 +230,25 @@ fn refused_and_ignored_covers_admit_nothing() {
         })
     ));
     assert_eq!(admits, base);
+}
+
+#[test]
+fn hidden_plus_of_a_malformed_file_is_admitted_then_dropped() {
+    let (r, _, base) = run(&lanes("", ""));
+    r.unwrap();
+    let hidden = lanes(
+        r#""hiddenCover": [{"id": "hid", "src": "b", "w": 8, "h": 8}]"#,
+        r#", {"id": "hid", "dst": [{"x": 20, "y": 200, "w": 430, "h": 600}]}"#,
+    );
+    let (r, _, admits) = run(&hidden);
+    let imported = r.unwrap();
+    let dropped = imported
+        .report
+        .notes
+        .iter()
+        .any(|n| n.severity == Severity::Dropped && n.kind == NoteKind::MissingAsset);
+    assert!(dropped);
+    assert_eq!(admits, base + 1);
 }
 
 #[test]

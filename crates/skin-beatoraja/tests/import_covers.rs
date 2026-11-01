@@ -1,4 +1,4 @@
-//! SUDDEN+, LIFT and HIDDEN+: which elements become the covers, which
+//! SUDDEN+ and LIFT: which elements become the covers, which
 //! offset-4 elements stay decorative, and what each refuses, through
 //! `build`.
 //!
@@ -449,44 +449,6 @@ fn only_an_exact_lift_maps() {
         CriticalPart::Lift,
         "liftCover",
     );
-}
-
-#[test]
-fn hidden_plus_is_never_drawn() {
-    let images = with("", &[]).report().usage.images;
-    for (obj, d) in [
-        (
-            r#"{"id": "hid", "src": "a"}"#,
-            r#"{"id": "hid", "dst": [{"x": 20, "y": 200, "w": 430, "h": 600}]}"#,
-        ),
-        (
-            r#"{"id": "hid", "src": "a"}"#,
-            r#"{"id": "hid", "dst": [{"time": 0, "x": 20, "y": 200, "w": 430, "h": 600, "r": 0}, {"time": 100, "x": 20, "y": 200, "w": 430, "h": 600}]}"#,
-        ),
-        (
-            r#"{"id": "hid", "src": "a"}"#,
-            r#"{"id": "hid", "timer": 41, "dst": [{"x": 20, "y": 200, "w": 430, "h": 600}]}"#,
-        ),
-        (
-            r#"{"id": "hid", "src": "a"}"#,
-            r#"{"id": "hid", "offsets": [5], "dst": [{"x": 20, "y": 200, "w": 430, "h": 600}]}"#,
-        ),
-        // A missing source still imports.
-        (
-            r#"{"id": "hid", "src": "nothing"}"#,
-            r#"{"id": "hid", "dst": [{"x": 20, "y": 200, "w": 430, "h": 600}]}"#,
-        ),
-    ] {
-        let l = with(&format!(r#""hiddenCover": [{obj}]"#), &[d]);
-        let r = l.report();
-        assert!(
-            r.notes.iter().any(|n| n.severity == Severity::Ignored
-                && n.kind == NoteKind::Deviation(DeviationId::D11)),
-            "{d}"
-        );
-        assert_eq!(r.usage.images, images, "{d}");
-        assert_eq!(rects(&l, 5_000, 0, 0), Vec::<[i32; 4]>::new(), "{d}");
-    }
 }
 
 /// The lanes over a 64×256 `a.png` with image records `extra` and `dsts`
