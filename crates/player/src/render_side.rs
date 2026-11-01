@@ -212,12 +212,19 @@ impl Extent {
         }
     }
 
-    /// The newest size published, if any; a publish after this read wakes
-    /// the render thread again. Allocates nothing: the render thread calls
-    /// it between play frames.
+    /// Takes the wake on its way: the render thread calls it as it takes a
+    /// [`RenderMsg::Resize`] (or the [`RenderMsg::Follow`] that stands for
+    /// any wake left unsent before it followed), before it reads the size.
+    /// A publish after this sends again; one before it was seen through
+    /// the flag it set, so its size is the one read next.
+    fn acknowledge(&self) {
+        self.queued.swap(false, Ordering::AcqRel);
+    }
+
+    /// The newest size published, if any. Reading it takes no wake, so a
+    /// wake still on its way stays the only one. Allocates nothing: the
+    /// render thread calls it between play frames.
     fn latest(&self) -> Option<(u32, u32)> {
-        // Cleared first: a publish after the read sends again.
-        self.queued.store(false, Ordering::Release);
         let packed = self.size.load(Ordering::Acquire);
         // The halves of a packed size.
         #[expect(
@@ -1045,11 +1052,18 @@ impl Run {
                     let _ = reply.send(self.measure.finish(end));
                 }
                 Ok(RenderMsg::Follow(extent)) => {
+                    // A publish before the wake's sender was set marked a
+                    // wake that was never sent.
+                    extent.acknowledge();
                     self.extent = Some(extent);
                     self.applied = None;
                 }
-                // Applied below, with any other message's loop.
-                Ok(RenderMsg::Resize) => {}
+                // Applied below, as every loop applies the newest size.
+                Ok(RenderMsg::Resize) => {
+                    if let Some(extent) = &self.extent {
+                        extent.acknowledge();
+                    }
+                }
                 Ok(RenderMsg::Exit) | Err(TryRecvError::Disconnected) => return,
                 Err(TryRecvError::Empty) => {}
             }
@@ -3573,28 +3587,38 @@ mod tests {
     }
 
     /// Publishes coalesce: one wake waits however many sizes are
-    /// published, and the newest is read; a publish after the read wakes
-    /// again. Before any publish there is no size, and without a follower
-    /// a publish wakes nothing. With the queued flag left set by the read,
-    /// the fourth publish would send nothing; with it never set, each
-    /// publish would send one, three before the first read.
+    /// published, and the newest is read. Reading the size between frames
+    /// while that wake is still in the channel takes nothing: a publish
+    /// after the read sends no second wake. Only taking the wake re-arms
+    /// it, and the size read after that is the newest. A publish before
+    /// the render thread followed marks a wake never sent, which following
+    /// takes. With the read clearing the flag (the polling a wake used to
+    /// share), the publish after it would send a second wake; with the
+    /// wake never re-armed, the last publish would send none.
     #[test]
     fn extent_publishes_coalesce() {
         let extent = super::Extent::default();
         assert_eq!(extent.latest(), None);
+        // No sender yet: marked, not sent; following takes it.
         extent.publish(640, 480);
         assert_eq!(extent.latest(), Some((640, 480)));
         let (tx, rx) = std::sync::mpsc::channel();
         *extent.wake.lock().unwrap() = Some(tx);
+        extent.acknowledge();
         extent.publish(800, 600);
         extent.publish(0, 0);
+        // A frame reads the size while the wake waits.
+        assert_eq!(extent.latest(), Some((0, 0)));
         extent.publish(2_560, 1_080);
         assert!(matches!(rx.try_recv(), Ok(RenderMsg::Resize)));
-        assert!(rx.try_recv().is_err());
+        assert!(rx.try_recv().is_err(), "one wake for three publishes");
+        // The render thread takes the wake, then reads the newest.
+        extent.acknowledge();
         assert_eq!(extent.latest(), Some((2_560, 1_080)));
         extent.publish(u32::MAX, 1);
         assert!(matches!(rx.try_recv(), Ok(RenderMsg::Resize)));
         assert!(rx.try_recv().is_err());
+        extent.acknowledge();
         assert_eq!(extent.latest(), Some((u32::MAX, 1)));
     }
 
