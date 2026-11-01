@@ -82,12 +82,13 @@ fn red() -> Look {
 }
 
 /// Blue over the right half, from a 300-texel image (a 512-texel page),
-/// with 9 000 more image elements than one, past [`MAX_SPRITES`].
+/// with 9 500 more image elements than one: past [`MAX_SPRITES`], and past
+/// the 9 216 instances (with the overlay's reserve) of the least buffer.
 fn blue() -> Look {
     Look {
         side: 300,
         clip: Some([960.0, 0.0, 960.0, 1_080.0]),
-        copies: 9_000,
+        copies: 9_500,
         ..Look::left([0, 0, 255, 255])
     }
 }
@@ -136,7 +137,7 @@ fn a_bundle_checks_its_clips_and_its_layers() {
 /// until its commit switches the skin, the uv table, the atlas, the clips
 /// and the capacities together: red under the left clip, from a 256-texel
 /// page and the least capacity, then blue under the right clip, from a
-/// 512-texel page and 9 001 sprites. Any of them switched alone would
+/// 512-texel page and 9 501 sprites. Any of them switched alone would
 /// draw the wrong colour or half, or keep the other size.
 #[test]
 fn a_commit_switches_the_whole_installation_together() {
@@ -171,9 +172,9 @@ fn a_commit_switches_the_whole_installation_together() {
     r.commit(token).unwrap();
     assert!(Arc::ptr_eq(r.installed().unwrap(), &b));
     assert_eq!(r.atlas_size().0, 512);
-    assert_eq!(r.capacity(), (9_001, 9_001));
+    assert_eq!(r.capacity(), (9_501, 9_501));
     let (sprites, p) = frame(&mut r);
-    assert_eq!(sprites, 9_001);
+    assert_eq!(sprites, 9_501);
     halves(&p, BLACK, BLUE);
 }
 
@@ -222,7 +223,7 @@ fn a_refused_staging_leaves_the_installation_in_use_drawing() {
     let token = stage(&mut r, &b, &chart, 3).unwrap();
     r.commit(token).unwrap();
     let (sprites, p) = frame(&mut r);
-    assert_eq!(sprites, 9_002);
+    assert_eq!(sprites, 9_502);
     assert_eq!(px(&p, LEFT), BLACK);
 }
 
