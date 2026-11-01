@@ -19,7 +19,8 @@
 //! one signal waits in the channel ([`LoadingSink`]), so a slow render
 //! thread never falls behind on the load's progress. A window target
 //! paces frames on the swap chain's waitable object; an offscreen one at about
-//! 60 Hz at most, each frame waiting for the GPU to finish the one before.
+//! 60 Hz at most, each frame waiting for the GPU to finish the one before
+//! or skipped while it has not.
 //!
 //! A frame that fails (the surface was lost) drops the screen and tells
 //! the game thread, which ends the play; the next play's preparation builds
@@ -275,6 +276,9 @@ struct Shared {
     /// saw it (dev-tools).
     #[cfg(feature = "dev-tools")]
     end_drawn: AtomicU64,
+    /// Loading frames presented (dev-tools: a slow load's checkpoints).
+    #[cfg(feature = "dev-tools")]
+    loading_drawn: AtomicU64,
     /// The loading state's slot.
     loading: Mutex<LoadingSlot>,
 }
@@ -493,6 +497,12 @@ impl RenderLink {
         PendingLoad(rx)
     }
 
+    /// Loading frames presented so far (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    pub fn loading_drawn(&self) -> u64 {
+        self.shared.loading_drawn.load(Ordering::Relaxed)
+    }
+
     /// Where the current loading lifetime's lines are shown from, on any
     /// thread.
     pub fn loading(&self) -> LoadingSink {
@@ -633,6 +643,8 @@ pub fn spawn(
         end_page: Mutex::new(EndSlot::default()),
         #[cfg(feature = "dev-tools")]
         end_drawn: AtomicU64::new(0),
+        #[cfg(feature = "dev-tools")]
+        loading_drawn: AtomicU64::new(0),
         loading: Mutex::new(LoadingSlot::default()),
     });
     let thread_shared = Arc::clone(&shared);
@@ -1074,6 +1086,9 @@ impl Run {
                             &mut self.menu_stats
                         };
                         stats.frame(t.cpu, after - before, *changed);
+                        if loading_frame && t.presented {
+                            self.shared.loading_drawn.fetch_add(1, Ordering::Relaxed);
+                        }
                         // What a refusal put on the screen, once drawn.
                         if *changed
                             && let Some(notice) = page.lines.iter().find(|l| {

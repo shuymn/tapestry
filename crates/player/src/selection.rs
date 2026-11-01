@@ -948,21 +948,47 @@ impl Progress {
     }
 }
 
+/// How often a slow load prints the loading frames presented (dev-tools).
+#[cfg(feature = "dev-tools")]
+const HOLD_CHECKPOINT: Duration = Duration::from_millis(200);
+
+/// The longest a slow load holds waiting for its loading frames
+/// (dev-tools).
+#[cfg(feature = "dev-tools")]
+const HOLD_MOST: Duration = Duration::from_secs(20);
+
 /// Holds a load for a script's slow load (dev-tools), pressing the quit
 /// key or closing the window halfway if it says; whether the quit key or a
-/// close cancelled it, checked as the measurement does.
+/// close cancelled it, checked as the measurement does. It holds its time,
+/// and on until the loading state has presented three frames after its
+/// first, at most [`HOLD_MOST`], so even a slow machine shows frames
+/// following one another; every [`HOLD_CHECKPOINT`], and at its end, it
+/// prints the loading frames presented so far (`drawn`).
 #[cfg(feature = "dev-tools")]
-fn hold(controls: &Controls, slow: crate::dev::SlowLoad) -> bool {
+fn hold(controls: &Controls, slow: crate::dev::SlowLoad, drawn: &dyn Fn() -> u64) -> bool {
     println!("dev: the load holds {} ms", slow.ms);
     let began = Instant::now();
     let total = Duration::from_millis(slow.ms);
     let mut acted = false;
+    let mut checkpoint = began;
+    // The frames presented when the first loading frame was seen.
+    let mut first = None;
     loop {
         if controls.quitting() || controls.leaving() {
             return true;
         }
         let held = began.elapsed();
-        if held >= total {
+        let frames = drawn();
+        if first.is_none() && frames > 0 {
+            first = Some(frames);
+        }
+        if checkpoint.elapsed() >= HOLD_CHECKPOINT {
+            checkpoint = Instant::now();
+            println!("dev: presented loading frames: {frames}");
+        }
+        let following = first.is_some_and(|f| frames >= f + 3);
+        if held >= total && (following || held >= HOLD_MOST) {
+            println!("dev: presented loading frames: {frames}");
             return false;
         }
         if !acted && held >= total / 2 {
@@ -975,7 +1001,7 @@ fn hold(controls: &Controls, slow: crate::dev::SlowLoad) -> bool {
             }
             continue;
         }
-        std::thread::sleep((total - held).min(Duration::from_millis(10)));
+        std::thread::sleep(Duration::from_millis(10));
     }
 }
 
@@ -1442,7 +1468,7 @@ impl AppRig for PlayerRig<'_> {
         );
         #[cfg(feature = "dev-tools")]
         if let Some(slow) = slow
-            && hold(self.controls, slow)
+            && hold(self.controls, slow, &|| self.render.loading_drawn())
         {
             println!("load: cancelled");
             return Ok(Loading::Cancelled);
