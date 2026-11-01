@@ -21,7 +21,7 @@ use rules::{GaugeValue, Judgment, LnMode};
 use skin_model::BuildError;
 
 use crate::atlas::{GLYPH_H, GLYPH_W, glyph_uv, solid_uv};
-use crate::{Blend, FrameInput, Gpu, PlaySkin, SkinError, Sprite, SpriteBatch};
+use crate::{AttemptInput, Blend, FrameInput, Gpu, PlaySkin, SkinError, Sprite, SpriteBatch};
 
 /// The layout, in layout pixels of the 1920×1080 base resolution, and the
 /// placement of notes in it.
@@ -569,12 +569,14 @@ impl SimpleSkin {
 }
 
 impl PlaySkin for SimpleSkin {
-    fn prepare(
-        &mut self,
-        _gpu: &Gpu,
-        chart: &Chart,
-        section: Option<&Section>,
-    ) -> Result<(), SkinError> {
+    /// The chart's notes and bar lines, the section's targets only, and
+    /// fresh feedback: nothing of the preset.
+    fn prepare(&mut self, _gpu: &Gpu, a: &AttemptInput<'_>) -> Result<(), SkinError> {
+        self.load(a.chart, a.section());
+        Ok(())
+    }
+
+    fn load_chart(&mut self, chart: &Chart, section: Option<&Section>) -> Result<(), SkinError> {
         self.load(chart, section);
         Ok(())
     }
@@ -1976,7 +1978,7 @@ mod tests {
     }
 
     impl PlaySkin for Pushes {
-        fn prepare(&mut self, _: &Gpu, _: &Chart, _: Option<&Section>) -> Result<(), SkinError> {
+        fn prepare(&mut self, _: &Gpu, _: &crate::AttemptInput<'_>) -> Result<(), SkinError> {
             Ok(())
         }
 

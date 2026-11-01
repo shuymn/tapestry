@@ -6,8 +6,9 @@
 use bms_model::{Chart, Lane, TimeUs};
 use eval::{GaugeState, JudgeEvent, Tally};
 use game::PlayView;
-use render::{AdapterChoice, FrameInput, Renderer, Target};
+use render::{AdapterChoice, AttemptInput, FrameInput, Renderer, Target};
 use rules::{GaugeValue, PerJudgment};
+use skin_model::{Attempt, ChartText, GaugeDesc, GaugeLook, PlayContext, Side};
 
 pub const MS: i64 = 1_000;
 /// A 5:4 target: the layout is scaled by 2/3 to 1280×720 with 152 rows of
@@ -40,6 +41,59 @@ pub fn warp(chart: &Chart) -> Renderer {
     let mut r = offscreen(WIDTH, HEIGHT);
     r.load(chart, None).expect("load the chart");
     r
+}
+
+/// The one gauge the test attempts have, starting at 20 %.
+pub const GAUGES: [GaugeDesc; 1] = [GaugeDesc {
+    start: GaugeValue(20 * GaugeValue::PERCENT),
+    max: GaugeValue::FULL,
+    look: GaugeLook::Normal,
+    border: GaugeValue(80 * GaugeValue::PERCENT),
+}];
+
+/// A whole-chart attempt with `gauges`, counting empty POORs as POORs
+/// when `counted`: [`view`] then counts more empty POORs than POORs, a
+/// snapshot a declarative skin refuses.
+pub fn context(gauges: &[GaugeDesc], counted: bool) -> PlayContext<'_> {
+    PlayContext {
+        gauges,
+        attempt: Attempt::Full {
+            lead_in: TimeUs(1_000 * MS),
+        },
+        empty_poor_breaks_combo: false,
+        empty_poor_counted: counted,
+        scratch: Side::Left,
+        ln_default: rules::LnMode::Ln,
+        last_note_end: TimeUs(3_600_000 * MS),
+        bpm_range: None,
+    }
+}
+
+/// The chart labels the test attempts are prepared with.
+pub const TEXT: ChartText<'static> = ChartText {
+    title: "title",
+    subtitle: "",
+    artist: "artist",
+    subartist: "",
+    genre: "genre",
+};
+
+/// `chart`'s attempt for `ctx` on `r`'s target.
+pub fn attempt<'a>(r: &Renderer, chart: &'a Chart, ctx: &'a PlayContext<'a>) -> AttemptInput<'a> {
+    AttemptInput {
+        chart,
+        context: ctx,
+        text: &TEXT,
+        target: r.target(),
+    }
+}
+
+/// Prepares the play skin in use for an attempt of `chart` with
+/// [`GAUGES`].
+pub fn prepare(r: &mut Renderer, chart: &Chart) {
+    let ctx = context(&GAUGES, false);
+    r.prepare_attempt(&attempt(r, chart, &ctx))
+        .expect("prepare the attempt");
 }
 
 pub fn view(combo: u32, ex_score: u32) -> PlayView {

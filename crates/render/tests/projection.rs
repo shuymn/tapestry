@@ -15,9 +15,9 @@ use std::f32::consts::FRAC_PI_2;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use bms_model::{Chart, ChartBuilder, TimeUs};
-use common::{MS, input, lane, note_center_in, offscreen, view, warp, white_rows_in};
-use eval::{JudgeEvent, JudgeEventKind, Section};
+use bms_model::{ChartBuilder, TimeUs};
+use common::{MS, input, lane, note_center_in, offscreen, prepare, view, warp, white_rows_in};
+use eval::{JudgeEvent, JudgeEventKind};
 use render::{
     AtlasPages, Blend, ClipTable, FrameInput, Gpu, MAX_SPRITES, PageLevels, PlaySkin, RenderError,
     Renderer, SkinError, Sprite, SpriteBatch, UploadError, solid_uv,
@@ -45,7 +45,7 @@ impl Scene {
 }
 
 impl PlaySkin for Scene {
-    fn prepare(&mut self, _: &Gpu, _: &Chart, _: Option<&Section>) -> Result<(), SkinError> {
+    fn prepare(&mut self, _: &Gpu, _: &render::AttemptInput<'_>) -> Result<(), SkinError> {
         Ok(())
     }
 
@@ -547,7 +547,7 @@ struct Refusing {
 }
 
 impl PlaySkin for Refusing {
-    fn prepare(&mut self, _: &Gpu, _: &Chart, _: Option<&Section>) -> Result<(), SkinError> {
+    fn prepare(&mut self, _: &Gpu, _: &render::AttemptInput<'_>) -> Result<(), SkinError> {
         self.calls.lock().unwrap().epoch += 1;
         Ok(())
     }
@@ -597,7 +597,7 @@ fn a_refused_frame_submits_nothing_until_the_next_preparation() {
         refuse: Arc::clone(&refuse),
     }))
     .unwrap();
-    r.load(&chart, None).unwrap();
+    prepare(&mut r, &chart);
     let page_1 = |r: &Renderer, p: &[u8]| {
         near(px(r, p, 480.0, 540.0), RED, 2);
         near(px(r, p, 1_440.0, 540.0), BLACK, 2);
@@ -639,7 +639,7 @@ fn a_refused_frame_submits_nothing_until_the_next_preparation() {
     ));
     assert_eq!(calls.lock().unwrap().builds, [1, 1, 1]);
 
-    r.load(&chart, None).unwrap();
+    prepare(&mut r, &chart);
     assert_eq!(r.refused(), None);
     assert_eq!(r.atlas_size(), (256, 3));
     drawn(&mut r);

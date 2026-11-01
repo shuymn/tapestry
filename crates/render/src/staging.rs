@@ -95,6 +95,25 @@ impl Staging {
         self.batch = batch;
     }
 
+    /// The fixed clips taken.
+    #[must_use]
+    pub const fn clips(&self) -> &ClipTable {
+        &self.clips
+    }
+
+    /// The bytes it holds: the batch's sprites and runs at their whole
+    /// capacity, the reserve included, and the instances staged for it
+    /// twice, on the CPU and in the GPU's instance buffer of the same
+    /// size; the clips and their scissors.
+    #[must_use]
+    pub fn bytes(&self) -> u64 {
+        let sprites = self.batch.total_capacity() * size_of::<crate::Sprite>();
+        let runs = self.batch.total_run_capacity() * size_of::<crate::Run>();
+        let instances = 2 * self.instances.capacity() * size_of::<Instance>();
+        let clips = self.clips.len() * (size_of::<[f32; 4]>() + size_of::<Option<[u32; 4]>>());
+        u64::try_from(sprites + runs + instances + clips).unwrap_or(u64::MAX)
+    }
+
     /// Takes `clips` and projects them: allocates, so before play.
     pub fn set_clips(&mut self, clips: ClipTable) {
         self.scissors = vec![None; clips.len()];
