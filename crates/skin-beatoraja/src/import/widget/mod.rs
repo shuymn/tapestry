@@ -246,7 +246,7 @@ impl Cx<'_> {
             .map_err(|l| self.limit(at, l))?
         {
             Ok(f) => f,
-            Err(Failed::File) if matches!(role, Role::Critical(_)) => {
+            Err(Failed::File { .. }) if matches!(role, Role::Critical(_)) => {
                 if let Some(source) = self.assets.take_error(&name) {
                     return Err(ImportError::Asset {
                         at: self.loc(at),
@@ -255,7 +255,11 @@ impl Cx<'_> {
                 }
                 return missing(NoteKind::MissingAsset);
             }
-            Err(_) => return missing(NoteKind::MissingAsset),
+            Err(Failed::File { refused: false }) => return missing(NoteKind::MissingAsset),
+            // Only this importer refuses it: no hole stands for it.
+            Err(Failed::File { refused: true } | Failed::Name) => {
+                return refused(NoteKind::MissingAsset);
+            }
         };
         let [fw, fh] = self.assets.file_dims(file).unwrap_or([0, 0]);
         let [x, y, w, h] = s.rect;

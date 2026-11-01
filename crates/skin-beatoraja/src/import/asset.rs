@@ -139,8 +139,33 @@ pub(crate) fn join(dir: &str, name: &str) -> String {
 pub(crate) enum Failed {
     /// A name of the wrong form: no file was looked at.
     Name,
-    /// The file failed a check ([`Assets::take_error`]).
-    File,
+    /// The file failed a check ([`Assets::take_error`]): `refused` when
+    /// only this importer's confinement, format or limits refuse it, so
+    /// the source may draw it, else it is missing or unreadable for the
+    /// source too.
+    File { refused: bool },
+}
+
+/// A cached file failure: whether it was refused ([`Failed::File`]) and
+/// its error until a critical user takes it.
+type FileFailure = (bool, Option<ImageError>);
+
+/// Whether `e` refuses a file the source may still draw: its name or
+/// place, its size or dimensions past the caps, or a format only the
+/// source decodes.
+fn refused(e: &ImageError) -> bool {
+    matches!(
+        e,
+        ImageError::PathRejected { .. }
+            | ImageError::PathEscapes { .. }
+            | ImageError::FileTooLarge { .. }
+            | ImageError::TotalBytesTooLarge { .. }
+            | ImageError::HeaderTooLarge { .. }
+            | ImageError::Unsupported { .. }
+            | ImageError::TooWide { .. }
+            | ImageError::TooManyTexels { .. }
+            | ImageError::TotalTooLarge { .. }
+    )
 }
 
 /// A font as a text element uses it.
@@ -174,8 +199,9 @@ pub(crate) type Crop = [u32; 2];
 /// The sheet being built, with the importer's caches.
 pub(crate) struct Assets {
     builder: SheetBuilder,
-    /// Admitted files and cached failures, by name and @2x name.
-    files: HashMap<(String, Option<String>), Result<u32, Option<ImageError>>>,
+    /// Admitted files and cached failures (whether refused, and the error
+    /// until a critical user takes it), by name and @2x name.
+    files: HashMap<(String, Option<String>), Result<u32, FileFailure>>,
     /// Each key's uncropped image and cell, once one of its images is
     /// added.
     bases: HashMap<ImageKey, (ImageDef, [u32; 2])>,
@@ -221,7 +247,10 @@ impl Assets {
     ) -> Result<Result<u32, Failed>, ImportLimit> {
         let key = (def.path, def.hi);
         if let Some(r) = self.files.get(&key) {
-            return Ok(r.as_ref().copied().map_err(|_| Failed::File));
+            return Ok(r
+                .as_ref()
+                .copied()
+                .map_err(|&(refused, _)| Failed::File { refused }));
         }
         budget.file_attempt()?;
         let names = std::iter::once(&key.0).chain(key.1.as_ref());
@@ -248,7 +277,10 @@ impl Assets {
                 return Err(ImportLimit::FileAttempts);
             }
             Err(AdmitError::Limit(_)) => return Err(ImportLimit::FileTotals),
-            Err(AdmitError::File(e)) => (Err(Failed::File), Err(Some(e))),
+            Err(AdmitError::File(e)) => {
+                let refused = refused(&e);
+                (Err(Failed::File { refused }), Err((refused, Some(e))))
+            }
         };
         self.files.insert(key, entry);
         Ok(result)
@@ -259,7 +291,7 @@ impl Assets {
     pub(crate) fn take_error(&mut self, path: &str) -> Option<ImageError> {
         let key = (path.to_owned(), None);
         match self.files.get_mut(&key) {
-            Some(Err(e)) => e.take(),
+            Some(Err((_, e))) => e.take(),
             _ => None,
         }
     }

@@ -150,8 +150,13 @@ fn group_refs_resolve_as_image_indices() {
 fn set(images: &str, set: &str) -> common::Loaded {
     let json = format!(
         r#"{{"type": 0, "w": 1920, "h": 1080,
-           "source": [{{"id": "a", "path": "a.png"}}, {{"id": "m", "path": "clip.mp4"}}],
+           "source": [{{"id": "a", "path": "a.png"}}, {{"id": "m", "path": "clip.mp4"}},
+                      {{"id": "w", "path": "w.webp"}}, {{"id": "far", "path": "../far.png"}},
+                      {{"id": "lost", "path": "lost.png"}}],
            "image": [{{"id": "i0", "src": "a", "w": 16, "h": 16}},
+                     {{"id": "web", "src": "w", "w": 16, "h": 16}},
+                     {{"id": "far", "src": "far", "w": 16, "h": 16}},
+                     {{"id": "lost", "src": "lost", "w": 16, "h": 16}},
                      {{"id": "i1", "src": "a", "x": 16, "w": 16, "h": 16, "len": 4, "ref": 42}},
                      {{"id": "i2", "src": "a", "x": 32, "w": 16, "h": 16}},
                      {{"id": "mv", "src": "m"}},
@@ -160,6 +165,11 @@ fn set(images: &str, set: &str) -> common::Loaded {
            "destination": [{{"id": "s", {KEY}}}]}}"#
     );
     let dir = common::skin_with(&json, &[("a.png", 64, 64)]);
+    common::write(
+        dir.path(),
+        "w.webp",
+        b"RIFF\x1a\0\0\0WEBPVP8L\x0d\0\0\0/\0\0\0\x10\x07\x10\x11\x11\x88\x88\xfe\x07\0",
+    );
     let result = common::import_dir(dir.path());
     common::Loaded { dir, result }
 }
@@ -261,6 +271,40 @@ fn an_image_set_keeps_holes_and_repeats() {
     let l = set(r#"[null, "none"]"#, "");
     assert!(has(l.report(), NoteKind::Track(TrackWhy::NeverDrawn)));
     assert_eq!(l.ok().skin.choice_ref_count(), 0);
+}
+
+#[test]
+fn an_entry_the_source_could_draw_drops_the_set() {
+    // A format only the source decodes and a name leaving the folder are
+    // this importer's refusals, not missing files: the whole set drops.
+    for item in ["web", "far"] {
+        let l = set(&format!(r#"["i0", "{item}"]"#), r#", "value": 71"#);
+        let dropped: Vec<_> = l
+            .report()
+            .notes
+            .iter()
+            .filter(|n| n.severity == Severity::Dropped)
+            .map(|n| n.kind)
+            .collect();
+        assert_eq!(dropped, [NoteKind::MissingAsset], "{item}");
+        assert_eq!(l.ok().skin.choice_ref_count(), 0, "{item}");
+        assert!(frames(&mut l.drawn(), 0).is_empty(), "{item}");
+    }
+    // A file that is not there is a hole beside the valid entry.
+    let l = set(r#"["i0", "lost"]"#, r#", "value": 71"#);
+    assert!(
+        l.report()
+            .notes
+            .iter()
+            .all(|n| n.severity != Severity::Dropped),
+        "{:?}",
+        l.report().notes
+    );
+    assert_eq!(l.ok().skin.choice_ref_count(), 2);
+    let mut d = l.drawn();
+    assert_eq!(frames(&mut d, 0), [0]);
+    d.tally = tally(1, 0);
+    assert!(frames(&mut d, 0).is_empty());
 }
 
 #[test]
