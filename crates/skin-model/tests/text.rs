@@ -590,6 +590,7 @@ fn a_following_line_moves_without_changing_its_request() {
             vec![plain()],
         );
         def.lanes = Some(lanes_support::simple());
+        def.elements = lanes_support::with_markers(def.lanes.as_ref(), def.elements);
         Skin::new(def).unwrap()
     };
     let chart = ChartText {

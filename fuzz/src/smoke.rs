@@ -278,6 +278,7 @@ fn skin_json_seeds_resolve_or_fail_as_built() {
             "offsets",
             "choices_default",
             "lanes",
+            "paints",
             "followers",
             "judge",
             "gauge",
@@ -436,34 +437,47 @@ fn skin_import_seeds_import_and_draw_as_built() {
             }
             "lanes" => {
                 use skin_beatoraja::{DeviationId, LaneApprox};
-                // The lanes, SUDDEN+, LIFT and HIDDEN+; the notes, bar,
-                // SUDDEN+, LIFT and HIDDEN+ images over one file.
+                // The lanes, SUDDEN+'s paint, LIFT and HIDDEN+; the notes,
+                // bar, SUDDEN+, LIFT and HIDDEN+ images over one file.
                 assert_eq!((u.elements, u.keys, u.images), (4, 5, 5), "{name}");
                 assert!(i.scratch.is_some(), "{name}");
                 let d9 = |a| NoteKind::Deviation(DeviationId::D9(a));
-                for a in [
-                    LaneApprox::BarLine,
-                    LaneApprox::CoverAbove,
-                    LaneApprox::HiddenOrder,
-                ] {
+                for a in [LaneApprox::BarLine, LaneApprox::CoverMotion] {
                     assert!(kinds(&i).contains(&d9(a)), "{name}: {a:?}");
                 }
 
                 // At 500 ms the eleven notes from 1 s to 1.1 s are on
                 // screen, the last with its lower edge on the region's
-                // top. SUDDEN+ at 0 shows the strip above the region in
-                // every frame; LIFT at 0 is not drawn.
+                // top. SUDDEN+'s paint is drawn whole in every frame;
+                // LIFT and HIDDEN+ at 0 are not drawn.
                 assert_eq!(drawn, [1, 1, 12, 1], "{name}");
+                let paint = i
+                    .skin
+                    .quad_capacity()
+                    .checked_sub(skin_model::LANE_QUADS + skin_model::LANE_RESERVED);
+                assert_eq!(paint, Some(1), "{name}");
+            }
+            "paints" => {
+                // The lanes, LIFT's and HIDDEN+'s markers and four paints.
+                assert_eq!(u.elements, 7, "{name}");
+                assert_eq!(
+                    i.skin.quad_capacity(),
+                    4 + skin_model::LANE_QUADS + skin_model::LANE_RESERVED,
+                    "{name}"
+                );
+                // Each paint in every frame beside the notes on screen.
+                assert_eq!(drawn, [4, 4, 15, 4], "{name}");
             }
             "followers" => {
                 use skin_beatoraja::{DeviationId, LaneApprox};
-                // The image, the number and the grade follow, each noted
-                // once; the combo and HIDDEN+ take their offsets silently.
+                // SUDDEN+'s paint, the image, the number and the grade
+                // follow, each noted once; the combo and HIDDEN+ take their
+                // offsets silently.
                 let motion = NoteKind::Deviation(DeviationId::D9(LaneApprox::CoverMotion));
                 let k = kinds(&i);
                 assert_eq!(
                     k.iter().filter(|&&n| n == motion).count(),
-                    3,
+                    4,
                     "{name}: {k:?}"
                 );
                 assert!(

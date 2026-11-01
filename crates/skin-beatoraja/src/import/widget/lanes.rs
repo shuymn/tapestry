@@ -1,19 +1,20 @@
-//! The lanes (`note`), SUDDEN+ (an image listing offset 4 that can reach
-//! the lanes; one that cannot follows SUDDEN+), LIFT (`liftCover`) and
-//! HIDDEN+ (`hiddenCover`).
+//! The lanes (`note`), LIFT (`liftCover`) and HIDDEN+ (`hiddenCover`),
+//! and the offset-4 rule that tells SUDDEN+'s paint (`cover_paint`) from
+//! an image following it.
 //!
 //! The source draws the lanes from eight lane rects
 //! (`JsonPlaySkinObjectLoader.java:79-93`, `play/LaneRenderer.java:
 //! 288-727` at `0.8.9`); the model draws them as one widget whose parts
-//! are the notes, the bar line, SUDDEN+, LIFT and HIDDEN+. The covers map
+//! are the notes, the bar line, LIFT and HIDDEN+. LIFT and HIDDEN+ map
 //! only in a narrow subset: static, white, exactly over the lanes, on the
-//! lanes' own timer, conditions and window. SUDDEN+ and LIFT are
-//! play-critical and refuse outside it; HIDDEN+, which the player may
-//! leave off, is dropped with a note (owner decision 15).
+//! lanes' own timer, conditions and window, each painted where its
+//! destination stands by a marker element. LIFT is play-critical and
+//! refuses outside it; HIDDEN+, which the player may leave off, is
+//! dropped with a note (owner decision 15).
 
 use skin_model::{
-    Blend, End, Filter, HiddenTrim, LaneParts, LaneStyle, LanesDef, MAX_COORD, Side, Source,
-    SourceLanes, TimerRef,
+    Blend, ElementDef, End, Filter, HiddenTrim, LanePaint, LaneParts, LaneStyle, LanesDef,
+    MAX_COORD, Region, Side, Source, SourceLanes, TimerRef,
 };
 
 use super::super::asset::Crop;
@@ -21,9 +22,7 @@ use super::super::geom::{HEIGHT, Offset, Q, Rect};
 use super::super::policy::{self, CriticalPart, Role};
 use super::super::report::{DeviationId, LaneApprox, NoteKind, PropertyKind, Severity, Span};
 use super::super::track::{self, Accepted, Stretch};
-use super::super::{
-    Common, Cx, Dst, OFFSET_HIDDEN, OFFSET_LANECOVER, OFFSET_LIFT, Op, Opts, Prop, RUNTIME_OFFSETS,
-};
+use super::super::{Common, Cx, Dst, OFFSET_HIDDEN, OFFSET_LIFT, Op, Opts, Prop, RUNTIME_OFFSETS};
 use super::SrcImage;
 use crate::error::ImportError;
 use crate::tree::Scalar;
@@ -71,8 +70,6 @@ pub(crate) struct LaneState {
     window: Window,
     /// Some user offset moves the lanes.
     moved: bool,
-    /// An element was kept after the notes.
-    pub(crate) kept_after: bool,
 }
 
 /// The texels of a frame of `[iw, ih]` that stretch 5 keeps for
@@ -489,7 +486,6 @@ impl Cx<'_> {
             i32_of(self, line)?,
             i32_of(self, bottom)?,
         ];
-        let region_top = base.sub(h_up).ok_or_else(|| range(self))?;
         // The source draws a note's lower edge `y` offset above the lifted
         // region's lower edge at its judgment time
         // (`play/LaneRenderer.java:521-524`). An offset that puts that note
@@ -523,7 +519,6 @@ impl Cx<'_> {
             mine: [0; LANES],
             bar: None,
             line: None,
-            cover: None,
             lift: None,
             hidden: None,
         };
@@ -569,9 +564,7 @@ impl Cx<'_> {
                 top,
                 line,
                 bottom,
-                // SUDDEN+, LIFT and HIDDEN+ set their own extents when they map.
-                cover_at: region_top.to_f32(),
-                cover_h: 0.0,
+                // LIFT and HIDDEN+ set their own extents when they map.
                 lift_at: source.bottom,
                 lift_h: 0.0,
                 hidden_at: source.bottom,
@@ -591,7 +584,6 @@ impl Cx<'_> {
             cond_src: c.cond_src.clone(),
             window: window(&c.track),
             moved,
-            kept_after: false,
         };
         self.push(c, Source::Lanes, t)?;
         self.lanes = Some(state);
@@ -771,87 +763,14 @@ impl Cx<'_> {
 
     /// Charges an image listing offset 4 its keys as written, once before
     /// either reading, and tells whether it cannot move over the lanes:
-    /// `true` for an ordinary image following SUDDEN+, `false` for a
-    /// SUDDEN+ candidate.
+    /// `true` for an ordinary image following SUDDEN+, `false` for
+    /// SUDDEN+'s paint, which is play-critical.
     pub(super) fn offset4_outside(&mut self, dst: &Dst) -> Result<bool, ImportError> {
         let at = dst.span;
         self.budget
             .keys(dst.keys.len())
             .map_err(|l| self.limit(at, l))?;
         self.decorative_offset4(dst)
-    }
-
-    /// A SUDDEN+ candidate ([`Self::offset4_outside`]) that selects its
-    /// frames by `field`, an expression the mapping does not run: refused.
-    pub(super) fn lane_cover_selector(
-        &mut self,
-        dst: Dst,
-        field: &'static str,
-    ) -> Result<(), ImportError> {
-        Err(ImportError::Critical {
-            at: self.loc(dst.span),
-            part: CriticalPart::Cover,
-            why: NoteKind::UnsupportedField { field },
-        })
-    }
-
-    /// A SUDDEN+ candidate ([`Self::offset4_outside`]), its keys charged:
-    /// SUDDEN+ when it is the first exact match, else refused.
-    pub(super) fn lane_cover_image(
-        &mut self,
-        dst: Dst,
-        rec: u32,
-        s: &SrcImage,
-    ) -> Result<(), ImportError> {
-        let at = dst.span;
-        let part = CriticalPart::Cover;
-        let refuse = |cx: &Self, field: &'static str| {
-            Err(ImportError::Critical {
-                at: cx.loc(at),
-                part,
-                why: NoteKind::UnsupportedField { field },
-            })
-        };
-        let Some(l) = self.lanes.as_ref() else {
-            return refuse(self, "offset");
-        };
-        if l.def.parts.cover.is_some() {
-            return refuse(self, "offset");
-        }
-        let Some(c) = self.cover_common(&dst, Role::Critical(part), &[OFFSET_LANECOVER])? else {
-            return Ok(());
-        };
-        let Some(l) = self.lanes.as_ref() else {
-            return refuse(self, "offset");
-        };
-        // Exactly over the lanes, its lower edge on their top; the source
-        // moves it by an offset and draws it at its own height
-        // (`play/LaneRenderer.java:332-333`).
-        let [xc, yc, wc, hc] = c.track.keys.first().map_or([0; 4], |k| k.rect);
-        if !self.over_lanes(at, xc, wc)?
-            || i64::from(yc) != i64::from(l.y0) + i64::from(l.h0)
-            || hc < 0
-        {
-            return refuse(self, "dst");
-        }
-        let Some((image, r)) = self.add_cover_image(&c, &dst, rec, s)? else {
-            return refuse(self, "src");
-        };
-        if r.h <= Q::int(0) {
-            return refuse(self, "dst");
-        }
-        let [_, lower] = self.cover_edges(at, r)?;
-        let kept_after = self.lanes.as_ref().is_some_and(|l| l.kept_after);
-        if let Some(l) = self.lanes.as_mut() {
-            l.def.parts.cover = Some(image);
-            l.def.cover_at = lower.to_f32();
-            l.def.cover_h = r.h.to_f32();
-        }
-        self.lane_approx(at, part, LaneApprox::CoverAbove)?;
-        if kept_after {
-            self.lane_approx(at, part, LaneApprox::CoverOrder)?;
-        }
-        Ok(())
     }
 
     /// A cover's destination in reference pixels, y up.
@@ -870,7 +789,7 @@ impl Cx<'_> {
     /// a single frame can (`:65-68, 143-153`). `None` when the image was
     /// dropped, also as its role says, before anything is added, when the
     /// crop cannot be reproduced.
-    fn add_cover_image(
+    pub(super) fn add_cover_image(
         &mut self,
         c: &Common,
         dst: &Dst,
@@ -954,7 +873,6 @@ impl Cx<'_> {
             dst,
             Opts {
                 allow,
-                charged: role == Role::Critical(CriticalPart::Cover),
                 ..Opts::default()
             },
         )?
@@ -1051,15 +969,30 @@ impl Cx<'_> {
             });
         }
         let [upper, _] = self.cover_edges(at, r)?;
-        let kept_after = self.lanes.as_ref().is_some_and(|l| l.kept_after);
         if let Some(l) = self.lanes.as_mut() {
             l.def.parts.lift = Some(image);
             l.def.lift_at = upper.to_f32();
             l.def.lift_h = r.h.to_f32();
         }
-        if kept_after {
-            self.lane_approx(at, part, LaneApprox::CoverOrder)?;
+        self.lane_marker(LanePaint::Lift, at, dst.keys.len())
+    }
+
+    /// The marker of the lanes' `part` at destination `at`, which wrote
+    /// `written` keys: it paints the part there in the draw order
+    /// (`JSONSkinLoader.java:316-337`). Its one key is the destination's
+    /// first, charged as written; a destination of none is charged it.
+    fn lane_marker(
+        &mut self,
+        part: LanePaint,
+        at: Span,
+        written: usize,
+    ) -> Result<(), ImportError> {
+        if written == 0 {
+            self.budget.keys(1).map_err(|l| self.limit(at, l))?;
         }
+        self.elements
+            .push(ElementDef::lane_paint(part, Region::Screen));
+        self.element_spans.push(at);
         Ok(())
     }
 
@@ -1165,23 +1098,14 @@ impl Cx<'_> {
             Some(y) if link => HiddenTrim::Lift(y.to_f32()),
             Some(y) => HiddenTrim::Fixed(y.to_f32()),
         };
-        let (kept_after, before) = self.lanes.as_ref().map_or((false, false), |l| {
-            let p = &l.def.parts;
-            (l.kept_after, p.cover.is_some() || p.lift.is_some())
-        });
         if let Some(l) = self.lanes.as_mut() {
             l.def.parts.hidden = Some(image);
             l.def.hidden_at = upper.to_f32();
             l.def.hidden_h = r.h.to_f32();
             l.def.hidden_trim = trim;
         }
+        self.lane_marker(LanePaint::Hidden, at, dst.keys.len())?;
         let part = CriticalPart::Lanes;
-        if kept_after {
-            self.lane_approx(at, part, LaneApprox::CoverOrder)?;
-        }
-        if before {
-            self.lane_approx(at, part, LaneApprox::HiddenOrder)?;
-        }
         if trim_y.is_some() && (r.y, r.h) != (unstretched.y, unstretched.h) {
             self.lane_approx(at, part, LaneApprox::HiddenStretch)?;
         }

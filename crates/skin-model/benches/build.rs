@@ -113,6 +113,7 @@ fn bench_widgets(c: &mut Criterion) {
             judges: vec![j],
             texts: vec![text(Overflow::Shrink), text(Overflow::Spill)],
             image_choices: Vec::new(),
+            cover_paints: Vec::new(),
         },
     )
     .expect("valid skin");

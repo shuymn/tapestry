@@ -223,10 +223,10 @@ fn the_vertical_mapping_follows_the_source() {
         rects_over(&l, &tap(1, 1_000), 1_005),
         Vec::<[i32; 4]>::new()
     );
-    // SUDDEN+ anchors at the region's top (180), LIFT at the bottom
-    // (780): the lift of 100 ‰ takes 60 px from 780, and a cover of
-    // 500 ‰ lowers SUDDEN+'s edge by half of the 540 px left, to 450;
-    // the cover, 600 high, shows from the lanes' top.
+    // SUDDEN+'s share runs from the region's top (180), LIFT's from the
+    // bottom (780): the lift of 100 ‰ takes 60 px from 780, and a cover
+    // of 500 ‰ lowers SUDDEN+'s paint by half of the 540 px left, its
+    // lower edge to 450; the paint, 600 high, is drawn whole.
     let sudden =
         r#"{"id": "cover", "offset": 4, "dst": [{"x": 20, "y": 600, "w": 430, "h": 400}]}"#;
     let lift_dst = r#"{"id": "liftc", "dst": [{"x": 20, "y": 0, "w": 430, "h": 200}]}"#;
@@ -236,7 +236,7 @@ fn the_vertical_mapping_follows_the_source() {
     d.view.cover = 500;
     d.view.lift = 100;
     let r = d.rects(1_000);
-    assert_eq!(r, [[30, 170, 645, 280], [30, 720, 645, 60]]);
+    assert_eq!(r, [[30, -150, 645, 600], [30, 720, 645, 60]]);
     // Without them, 100 ‰ of lift still raises the line by 60 px of the
     // region: a note's lower edge on 720.
     let l = at(objects(""), &[NOTES]);

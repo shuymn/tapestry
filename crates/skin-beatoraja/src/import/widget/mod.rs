@@ -1,6 +1,7 @@
 //! Elements by object kind: images here, image selection (image groups
 //! and image sets), numbers, text and the play objects in their modules.
 
+pub(super) mod cover_paint;
 pub(super) mod gauge;
 pub(super) mod image_choice;
 pub(super) mod judge;
@@ -14,11 +15,11 @@ use super::asset::{self, Crop, Failed, ImageKey, Path};
 use super::budget::ImportLimit;
 use super::policy::Role;
 use super::property::{self, IndexProp};
-use super::report::{NoteKind, Object, Span, TrackWhy};
+use super::report::{NoteKind, Object, Span};
 use super::track::{self, Stretch};
 use super::{Common, Cx, Dst, Opts, Prop};
 use crate::error::ImportError;
-use image_choice::SetSelector;
+use image_choice::{Lowered, SetSelector};
 
 /// A placed source image: its admitted file, its rect in texels and its
 /// cell.
@@ -315,25 +316,23 @@ impl Cx<'_> {
         let group = len > 1;
         let index = property::index_by_id(self.int_or(r, "ref", 0)?);
         // Listing offset 4, it follows SUDDEN+ when it cannot reach the
-        // lanes, and is SUDDEN+ otherwise; its keys are charged once.
+        // lanes, and is SUDDEN+'s paint otherwise; its keys are charged
+        // once.
         let charged = dst.offsets.contains(&super::OFFSET_LANECOVER);
-        if charged && !self.offset4_outside(&dst)? {
-            if group {
-                let field = match index {
-                    IndexProp::Null | IndexProp::Unsupported(_) => "len",
-                    _ => "image selection",
-                };
-                return self.lane_cover_selector(dst, field);
-            }
-            return self.lane_cover_image(dst, rec, &s);
-        }
+        let lowered = if charged && !self.offset4_outside(&dst)? {
+            Lowered::Paint
+        } else {
+            Lowered::Image
+        };
+        let role = lowered.role();
         if act.is_some() {
             self.ignored(at, NoteKind::Ignored { field: "act" });
         }
-        let stretch = Stretch::of(dst.stretch);
-        if stretch == Stretch::Trimmed {
-            self.drop_el(Role::Decorative, at, NoteKind::Stretch(dst.stretch))?;
-            return Ok(());
+        if lowered == Lowered::Paint && !group {
+            return self.cover_paint_image(dst, rec, &s, role, None);
+        }
+        if Stretch::of(dst.stretch) == Stretch::Trimmed {
+            return self.drop_el(role, at, NoteKind::Stretch(dst.stretch));
         }
         if group {
             let Some(src) = index.selector() else {
@@ -342,10 +341,10 @@ impl Cx<'_> {
                     _ => 0,
                 };
                 let why = image_choice::index_unsupported(id);
-                return self.drop_el(Role::Decorative, at, why);
+                return self.drop_el(role, at, why);
             };
             let selector = (src, index.deviates());
-            return self.image_group(dst, rec, &s, len, selector, charged);
+            return self.image_group(dst, rec, &s, len, selector, charged, lowered);
         }
         let o = Opts {
             follow: true,
@@ -392,20 +391,18 @@ impl Cx<'_> {
         let r = self.int_or(r, "ref", 0)?;
         let value = self.prop(value, "value")?;
         let selector = image_choice::set_selector(&value, r);
-        // Listing offset 4, it is classified before its selector: one
-        // without a selector is SUDDEN+ by its first image, as an image
-        // is; a selecting one is refused.
+        // Listing offset 4, it is SUDDEN+'s paint showing its table unless
+        // it cannot reach the lanes; its keys are charged once.
         let charged = dst.offsets.contains(&super::OFFSET_LANECOVER);
-        if charged && !self.offset4_outside(&dst)? {
-            let field = match &selector {
-                SetSelector::Null => return self.lane_cover_set(dst, images),
-                SetSelector::Expr { field, .. } | SetSelector::Unsupported { field, .. } => field,
-            };
-            return self.lane_cover_selector(dst, field);
-        }
+        let lowered = if charged && !self.offset4_outside(&dst)? {
+            Lowered::Paint
+        } else {
+            Lowered::Image
+        };
+        let role = lowered.role();
         let (src, deviates) = match selector {
             SetSelector::Unsupported { why, .. } => {
-                return self.drop_el(Role::Decorative, at, why);
+                return self.drop_el(role, at, why);
             }
             SetSelector::Null => ("0".to_owned(), false),
             SetSelector::Expr { src, deviates, .. } => (src, deviates),
@@ -414,34 +411,8 @@ impl Cx<'_> {
             self.ignored(at, NoteKind::Ignored { field: "act" });
         }
         if Stretch::of(dst.stretch) == Stretch::Trimmed {
-            return self.drop_el(Role::Decorative, at, NoteKind::Stretch(dst.stretch));
+            return self.drop_el(role, at, NoteKind::Stretch(dst.stretch));
         }
-        self.image_set_choices(dst, images, &src, deviates, charged)
-    }
-
-    /// An image set without a selector that may reach the lanes: SUDDEN+
-    /// by its first image, as an image listing offset 4 is.
-    fn lane_cover_set(&mut self, dst: Dst, images: Option<u32>) -> Result<(), ImportError> {
-        let at = dst.span;
-        let first = match images {
-            Some(list) if self.def.arena.node(list).kind == crate::tree::Kind::Array => {
-                self.def.arena.children(list).next()
-            }
-            _ => None,
-        };
-        let Some(first) = first else {
-            self.ignored(at, NoteKind::Track(TrackWhy::NeverDrawn));
-            return Ok(());
-        };
-        let Some(name) = self.def.string(first, "images")? else {
-            self.ignored(at, NoteKind::Track(TrackWhy::NeverDrawn));
-            return Ok(());
-        };
-        let Some(image) = self.image_rec(&name)? else {
-            self.ignored(at, NoteKind::Track(TrackWhy::NeverDrawn));
-            return Ok(());
-        };
-        let s = self.src_image(image)?;
-        self.lane_cover_image(dst, image, &s)
+        self.image_set_choices(dst, images, &src, deviates, charged, lowered)
     }
 }

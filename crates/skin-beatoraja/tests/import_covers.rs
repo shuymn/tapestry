@@ -1,10 +1,12 @@
-//! SUDDEN+ and LIFT: which elements become the covers, which
-//! offset-4 elements stay decorative, and what each refuses, through
-//! `build`.
+//! SUDDEN+'s paint and LIFT: which elements paint SUDDEN+ (offset-4
+//! images and image selections that may reach the lanes, type-4
+//! sliders), which offset-4 elements stay decorative, how each moves,
+//! and what each refuses, through `build`.
 //!
 //! The default lanes (r = 1, y 200, h 600, size 20): top 270, line 870,
-//! bottom 880, SUDDEN+ anchored at 280, LIFT at 880, a 600 px lane over
-//! x [20, 450].
+//! bottom 880, SUDDEN+'s share measured from 280, LIFT at 880, a 600 px
+//! lane over x [20, 450]. The default SUDDEN+ destination spans y −320 to
+//! 280 (y down).
 
 mod common;
 
@@ -14,9 +16,9 @@ use common::play::{Drawn, MS};
 use common::{Loaded, has, import_body, import_config, import_sized};
 use skin_beatoraja::{
     Config, CriticalPart, DeviationId, ImportError, LaneApprox, NoteKind, OffsetValue,
-    PropertyKind, Severity,
+    PropertyKind, Severity, TimerWhy,
 };
-use skin_beatoraja::{ImportLimit, Usage};
+use skin_beatoraja::{ImportLimit, Object, Usage};
 use skin_model::Blend;
 use skin_model::MAX_IMAGES;
 
@@ -55,18 +57,43 @@ fn d9(a: LaneApprox) -> NoteKind {
     NoteKind::Deviation(DeviationId::D9(a))
 }
 
+/// An image record whose source does not exist: a critical element
+/// drawing it refuses, a decorative one is dropped.
+const GHOST: &str = r#"{"id": "ghost", "src": "zz", "w": 16, "h": 16}"#;
+
+/// `d` drawing [`GHOST`].
+fn ghostly(d: &str) -> String {
+    d.replace(r#""id": "cover""#, r#""id": "ghost""#)
+        .replace(r#""id": "deco""#, r#""id": "ghost""#)
+}
+
+/// The notes of `l` the lanes alone do not carry, but
+/// [`LaneApprox::CoverMotion`].
+fn added_notes(l: &Loaded) -> Vec<NoteKind> {
+    let lanes: Vec<NoteKind> = with("", &[])
+        .report()
+        .notes
+        .iter()
+        .map(|n| n.kind)
+        .collect();
+    l.report()
+        .notes
+        .iter()
+        .map(|n| n.kind)
+        .filter(|k| !lanes.contains(k) && *k != d9(LaneApprox::CoverMotion))
+        .collect()
+}
+
 #[test]
-fn sudden_plus_maps_from_its_anchor() {
+fn sudden_plus_paint_moves_down_with_the_cover() {
     let l = with("", &[&cover("")]);
-    assert!(has(l.report(), d9(LaneApprox::CoverAbove)));
-    assert!(!has(l.report(), d9(LaneApprox::CoverOrder)));
-    // 500 ‰ of the lane: the cover's lower edge at 280 + 300, the cover
-    // 600 high above it and cut at the lanes' top.
-    assert_eq!(rects(&l, 5_000, 500, 0), [[20, 270, 430, 310]]);
-    // At 0 ‰ its lower edge is the anchor: what shows is the strip
-    // between the lanes' top and the anchor; 10 ‰ lowers it by 6.
-    assert_eq!(rects(&l, 5_000, 0, 0), [[20, 270, 430, 10]]);
-    assert_eq!(rects(&l, 5_000, 10, 0), [[20, 270, 430, 16]]);
+    assert_eq!(added_notes(&l), []);
+    assert!(has(l.report(), d9(LaneApprox::CoverMotion)));
+    // Its whole destination, uncut: at 0 ‰ where it stands, 500 ‰ of the
+    // lane lowers it 300 px, 10 ‰ by 6.
+    assert_eq!(rects(&l, 5_000, 0, 0), [[20, -320, 430, 600]]);
+    assert_eq!(rects(&l, 5_000, 500, 0), [[20, -20, 430, 600]]);
+    assert_eq!(rects(&l, 5_000, 10, 0), [[20, -314, 430, 600]]);
 }
 
 #[test]
@@ -91,15 +118,15 @@ fn lift_keeps_its_own_height() {
 #[test]
 fn lift_and_sudden_plus_share_the_lane() {
     let l = with(&lift_object(""), &[&cover(""), &lift("")]);
-    assert!(!has(l.report(), d9(LaneApprox::CoverOrder)));
+    assert_eq!(added_notes(&l), []);
     // LIFT 200 ‰ takes 120 px, raising the line to 750; SUDDEN+ 500 ‰
-    // takes half of the 480 px left: its edge at 520 (the source's
-    // 1080 − 800 + 240), LIFT's top at 760 (the source's `hl`), and a
-    // note half the visible time ahead halfway down the 240 px left.
-    // Each cover keeps its own height, cut to the lanes.
+    // takes half of the 480 px left: its paint's lower edge at 520 (the
+    // source's 1080 − 800 + 240), LIFT's top at 760 (the source's `hl`),
+    // and a note half the visible time ahead halfway down the 240 px
+    // left. The paint is drawn whole, LIFT cut to the lanes.
     assert_eq!(
         rects(&l, 1_300, 500, 200),
-        [[100, 620, 50, 20], [20, 270, 430, 250], [20, 760, 430, 120]]
+        [[100, 620, 50, 20], [20, -80, 430, 600], [20, 760, 430, 120]]
     );
 }
 
@@ -148,34 +175,37 @@ fn offset_four_images_off_the_lanes_follow_sudden_plus() {
 
 #[test]
 fn an_unknown_span_keeps_offset_four_critical() {
+    let missing = (CriticalPart::Cover, NoteKind::MissingAsset);
     // A full cover before the notes, past destinations naming nothing,
-    // reaches the lanes: no SUDDEN+ maps before them.
-    let early = cover("");
+    // reaches the lanes: SUDDEN+'s paint, whose missing file refuses.
+    let early = ghostly(&cover(""));
     for none in [
         r#"{"dst": [{"w": 1, "h": 1}]}"#,
         r#"{"id": "nothing", "dst": [{"w": 1, "h": 1}]}"#,
     ] {
-        refused(
-            import_body(&body("", &note(""), &[none, &early, NOTES])),
-            CriticalPart::Cover,
-            "offset",
-        );
+        let l = import_body(&body(GHOST, &note(""), &[none, &early, NOTES]));
+        assert_eq!(critical(l), missing, "{none}");
     }
     // Lanes that cannot be read ahead leave the span unknown.
     let all = common::lanes::lane_rects(200, 600);
     let seven: Vec<&str> = all.rsplitn(2, "}, ").collect();
     let seven = seven[1].to_owned() + "}";
     let notes = common::lanes::note_with(&seven, "");
-    let off = deco("", r#"{"x": 0, "y": 0, "w": 10, "h": 10}"#);
-    refused(
-        import_body(&body("", &notes, &[&off, NOTES])),
-        CriticalPart::Cover,
-        "offset",
+    let off = ghostly(&deco("", r#"{"x": 0, "y": 0, "w": 10, "h": 10}"#));
+    let l = import_body(&body(GHOST, &notes, &[&off, NOTES]));
+    assert_eq!(critical(l), missing);
+    // Off readable lanes the same image is decorative: dropped.
+    let l = import_body(&body(GHOST, &note(""), &[NOTES, &off]));
+    assert!(
+        l.report()
+            .notes
+            .iter()
+            .any(|n| n.severity == Severity::Dropped && n.kind == NoteKind::MissingAsset)
     );
 }
 
 #[test]
-fn offset_four_elements_that_may_reach_the_lanes_refuse() {
+fn offset_four_elements_that_may_reach_the_lanes_are_sudden_plus() {
     let header = r#""offset": [{"name": "r", "id": 40, "r": true}]"#;
     let cases = [
         // A stretch on a static key that would stay left of the lanes:
@@ -207,10 +237,13 @@ fn offset_four_elements_that_may_reach_the_lanes_refuse() {
             r#"{"x": 0, "y": 0, "w": 10, "h": 10}"#,
         ),
     ];
+    // Each is SUDDEN+'s paint, play-critical: drawing a missing file, it
+    // refuses.
     for d in &cases {
+        let d = &ghostly(d);
         let l = import_config(
             [1_920, 1_080],
-            &body("", &format!("{header}, {}", note("")), &[NOTES, d]),
+            &body(GHOST, &format!("{header}, {}", note("")), &[NOTES, d]),
             &[],
             |c: &mut Config| {
                 c.offsets.insert(
@@ -227,7 +260,9 @@ fn offset_four_elements_that_may_reach_the_lanes_refuse() {
     // Frames selected by an expression: an image group and image sets.
     // A `ref` is an image-index property, 40 the shown gauge's type and 42
     // one the model cannot read; a `value` of 40 is no value property, so
-    // the `ref` chooses. Off the lanes each draws but the unreadable one.
+    // the `ref` chooses. Over the lanes each is SUDDEN+'s paint showing
+    // its choice, but the unreadable one refuses; off them each draws but
+    // the unreadable one.
     let selectors = r#""imageset": [{"id": "byref", "images": ["cover"], "ref": 42},
                                     {"id": "byvalue", "images": ["cover"], "value": 71},
                                     {"id": "bykind", "images": ["cover"], "value": 40, "ref": 40}]"#;
@@ -237,23 +272,28 @@ fn offset_four_elements_that_may_reach_the_lanes_refuse() {
         kind: PropertyKind::ImageIndex,
         id: Some(42),
     };
-    for (id, field, why) in [
-        ("byref", "ref", vec![unreadable]),
-        ("byvalue", "value", vec![]),
-        ("bykind", "image selection", vec![]),
-        ("group", "len", vec![]),
-        ("kindgroup", "image selection", vec![]),
+    for (id, why) in [
+        ("byref", vec![unreadable]),
+        ("byvalue", vec![]),
+        ("bykind", vec![]),
+        ("group", vec![]),
+        ("kindgroup", vec![]),
     ] {
         let over = cover("").replace(r#""id": "cover""#, &format!(r#""id": "{id}""#));
         let off = deco("", r#"{"x": 0, "y": 0, "w": 10, "h": 10}"#)
             .replace(r#""id": "deco""#, &format!(r#""id": "{id}""#));
         let objects = format!("{}, {selectors}", note(""));
         let l = import_body(&body(group, &objects, &[NOTES, &over]));
-        assert_eq!(
-            critical(l),
-            (CriticalPart::Cover, NoteKind::UnsupportedField { field }),
-            "{id}"
-        );
+        if let [why] = why.as_slice() {
+            assert_eq!(critical(l), (CriticalPart::Cover, *why), "{id}");
+        } else {
+            let still = rects(&l, 5_000, 0, 0);
+            let moved: Vec<_> = still
+                .iter()
+                .map(|&[x, y, w, h]| [x, y + 300, w, h])
+                .collect();
+            assert_eq!(rects(&l, 5_000, 500, 0), moved, "{id}");
+        }
         // Off the lanes it is an ordinary image.
         let l = import_body(&body(group, &objects, &[NOTES, &off]));
         let dropped: Vec<NoteKind> = l
@@ -265,13 +305,16 @@ fn offset_four_elements_that_may_reach_the_lanes_refuse() {
             .collect();
         assert_eq!(dropped, why, "{id}");
     }
-    // An image set whose `ref` is no image-index property selects nothing:
-    // SUDDEN+ by its first image.
+    // An image set whose `ref` is no image-index property shows its first
+    // image; an image group without one its first frame.
     let null = r#""imageset": [{"id": "s", "images": ["cover"], "ref": 1}]"#;
     let over = cover("").replace(r#""id": "cover""#, r#""id": "s""#);
     let l = with(null, &[&over]);
-    assert!(has(l.report(), d9(LaneApprox::CoverAbove)));
-    assert_eq!(rects(&l, 5_000, 500, 0), [[20, 270, 430, 310]]);
+    assert_eq!(rects(&l, 5_000, 500, 0), [[20, -20, 430, 600]]);
+    let objects = format!("{}, {selectors}", note(""));
+    let over = cover("").replace(r#""id": "cover""#, r#""id": "group""#);
+    let l = import_body(&body(group, &objects, &[NOTES, &over]));
+    assert_eq!(rects(&l, 5_000, 500, 0), [[20, -20, 430, 600]]);
 }
 
 #[test]
@@ -446,46 +489,66 @@ fn covers_refuse_configured_components_besides_y() {
 }
 
 #[test]
-fn only_an_exact_cover_maps() {
+fn sudden_plus_paint_draws_as_authored() {
     let at = |rect: &str| cover("").replace(r#""x": 20, "y": 800, "w": 430, "h": 600"#, rect);
-    for (d, field) in [
-        // Split, one pixel wider, without height, too high.
-        (at(r#""x": 20, "y": 800, "w": 215, "h": 600"#), "dst"),
-        (at(r#""x": 20, "y": 800, "w": 431, "h": 600"#), "dst"),
-        (at(r#""x": 20, "y": 800, "w": 430, "h": 0"#), "dst"),
-        (at(r#""x": 20, "y": 801, "w": 430, "h": 600"#), "dst"),
-        // Not white or not alpha-blended.
-        (cover(r#""blend": 2"#), "dst"),
+    // Split, wider, lower or without height: drawn where it stands,
+    // 300 px lower at 500 ‰.
+    for (d, want) in [
         (
-            cover("").replace(r#""h": 600}"#, r#""h": 600, "a": 200}"#),
-            "dst",
+            at(r#""x": 20, "y": 800, "w": 215, "h": 600"#),
+            [20, -20, 215, 600],
         ),
-        // Its own timer, conditions or window.
-        (cover(r#""timer": 41"#), "dst"),
-        (cover(r#""op": [240]"#), "dst"),
         (
-            cover(r#""loop": -1"#).replace(
-                r#""dst": [{"x": 20, "y": 800, "w": 430, "h": 600}]"#,
-                r#""dst": [{"time": 0, "x": 20, "y": 800, "w": 430, "h": 600},
-                           {"time": 500, "x": 20, "y": 800, "w": 430, "h": 600}]"#,
-            ),
-            "dst",
+            at(r#""x": 0, "y": 801, "w": 500, "h": 600"#),
+            [0, -21, 500, 600],
+        ),
+        (
+            at(r#""x": 20, "y": 500, "w": 430, "h": 300"#),
+            [20, 580, 430, 300],
         ),
     ] {
-        refused(with("", &[&d]), CriticalPart::Cover, field);
+        let l = with("", &[&d]);
+        assert_eq!(rects(&l, 5_000, 500, 0), [want], "{d}");
     }
-    // A second exact cover, and one before the notes.
-    refused(
-        with("", &[&cover(""), &cover("")]),
-        CriticalPart::Cover,
-        "offset",
+    // Its own blend, colour, timer and conditions: each kept.
+    for d in [
+        cover(r#""blend": 2"#),
+        cover("").replace(r#""h": 600}"#, r#""h": 600, "a": 200}"#),
+        cover(r#""timer": 41"#),
+        cover(r#""op": [240]"#),
+    ] {
+        let l = with("", &[&d]);
+        assert_eq!(added_notes(&l), [], "{d}");
+    }
+    // Play-critical, it may not depend on when the state started
+    // without a timer of its own (D3): a window ending is refused.
+    let ending = cover(r#""loop": -1"#).replace(
+        r#""dst": [{"x": 20, "y": 800, "w": 430, "h": 600}]"#,
+        r#""dst": [{"time": 0, "x": 20, "y": 800, "w": 430, "h": 600},
+                       {"time": 500, "x": 20, "y": 800, "w": 430, "h": 600}]"#,
     );
-    refused(
-        import_body(&body("", &note(""), &[&cover(""), NOTES])),
-        CriticalPart::Cover,
-        "offset",
+    assert_eq!(
+        critical(with("", &[&ending])),
+        (CriticalPart::Cover, NoteKind::Timer(TimerWhy::Untimed))
     );
-    // Moved lanes.
+    let l = with("", &[&cover(r#""blend": 2"#)]);
+    let chart = ChartBuilder::new(150_000)
+        .tap(Lane::new(1).unwrap(), TimeUs(5_000 * MS))
+        .build()
+        .unwrap();
+    let mut d = Drawn::over(l.ok().skin.clone(), &chart);
+    d.frame(1_000, &[]);
+    let keys: Vec<_> = d.batch.runs().iter().map(|r| r.key.blend).collect();
+    assert_eq!(keys, [Blend::Add]);
+    // Two paints, each drawn; one before the notes is drawn below them.
+    let l = with("", &[&cover(""), &cover("")]);
+    assert_eq!(rects(&l, 5_000, 500, 0), [[20, -20, 430, 600]; 2]);
+    let l = import_body(&body("", &note(""), &[&cover(""), NOTES]));
+    assert_eq!(
+        rects(&l, 1_300, 0, 0),
+        [[20, -320, 430, 600], [100, 560, 50, 20]]
+    );
+    // Moved lanes leave it where it stands.
     let header = r#""offset": [{"name": "x", "id": 40, "x": true}]"#;
     let notes = r#"{"id": "notes", "offset": 40, "dst": [{"x": 0, "y": 0, "w": 0, "h": 0}]}"#;
     let moved = import_config(
@@ -502,13 +565,14 @@ fn only_an_exact_cover_maps() {
             );
         },
     );
-    refused(moved, CriticalPart::Cover, "dst");
+    assert_eq!(rects(&moved, 5_000, 500, 0), [[20, -20, 430, 600]]);
 }
 
 #[test]
 fn the_lanes_blend_ignores_the_outer_blend() {
-    // The notes, SUDDEN+ and LIFT draw in the lanes' run: an additive
-    // note destination would leave a black cover see-through.
+    // The notes and LIFT draw in the lanes' run, SUDDEN+'s paint in its
+    // own alpha-blended one: an additive note destination would leave a
+    // black cover see-through.
     for blend in [2, 3] {
         let notes = format!(
             r#"{{"id": "notes", "blend": {blend}, "dst": [{{"x": 0, "y": 0, "w": 0, "h": 0}}]}}"#
@@ -534,25 +598,30 @@ fn the_lanes_blend_ignores_the_outer_blend() {
 
 #[test]
 fn windows_compare_by_what_they_show() {
-    // The lanes looping a still track show for good, as a held cover.
+    // The lanes looping a still track show for good, as a held paint.
     let notes = r#"{"id": "notes", "loop": 1000, "dst": [
         {"time": 0, "x": 0, "y": 0, "w": 0, "h": 0},
         {"time": 1000, "x": 0, "y": 0, "w": 0, "h": 0}]}"#;
     let l = import_body(&body("", &note(""), &[notes, &cover(r#""loop": 0"#)]));
-    assert_eq!(rects(&l, 5_000, 500, 0), [[20, 270, 430, 310]]);
+    assert_eq!(rects(&l, 5_000, 500, 0), [[20, -20, 430, 600]]);
 }
 
 #[test]
-fn a_kept_element_between_notes_and_cover_is_noted() {
+fn the_covers_are_drawn_where_their_destinations_stand() {
+    // A plain image, SUDDEN+'s paint and LIFT in either order: each drawn
+    // in its destination's place, with nothing noted.
     let plain = r#"{"id": "deco", "dst": [{"x": 0, "y": 0, "w": 10, "h": 10}]}"#;
-    let l = with(&lift_object(""), &[plain, &cover(""), &lift("")]);
-    let order = l
-        .report()
-        .notes
-        .iter()
-        .filter(|n| n.kind == d9(LaneApprox::CoverOrder))
-        .count();
-    assert_eq!(order, 2);
+    let (p, c, li) = ([0, 1_070, 10, 10], [20, -80, 430, 600], [20, 760, 430, 120]);
+    for (dsts, want) in [
+        ([plain.to_owned(), cover(""), lift("")], [p, c, li]),
+        ([cover(""), plain.to_owned(), lift("")], [c, p, li]),
+        ([lift(""), cover(""), plain.to_owned()], [li, c, p]),
+    ] {
+        let dsts: Vec<&str> = dsts.iter().map(String::as_str).collect();
+        let l = with(&lift_object(""), &dsts);
+        assert_eq!(added_notes(&l), [], "{dsts:?}");
+        assert_eq!(rects(&l, 5_000, 500, 200), want, "{dsts:?}");
+    }
 }
 
 #[test]
@@ -652,13 +721,14 @@ fn tall_with(head: &str, extra: &str, dsts: &[&str]) -> Loaded {
     )
 }
 
-/// A SUDDEN+ destination of image `id` with stretch `mode` over the
-/// default lanes.
+/// A SUDDEN+ paint destination of image `id` with stretch `mode` over
+/// the default lanes.
 fn stretched(id: &str, mode: i32) -> String {
     cover(&format!(r#""stretch": {mode}"#)).replace(r#""id": "cover""#, &format!(r#""id": "{id}""#))
 }
 
-/// The rows of its frame SUDDEN+ keeps at 1 000 ‰ (see [`rows_at`]).
+/// The rows of its frame SUDDEN+'s paint keeps at 1 000 ‰ (see
+/// [`rows_at`]).
 fn rows_drawn(l: &Loaded, width: f32) -> f32 {
     rows_at(l, [20.0, 280.0, 430.0, 600.0], width)
 }
@@ -672,7 +742,7 @@ fn rows_at(l: &Loaded, rect: [f32; 4], width: f32) -> f32 {
         .build()
         .unwrap();
     let mut d = Drawn::over(l.ok().skin.clone(), &chart);
-    // At 1 000 ‰ a 600 px SUDDEN+ spans [280, 880], uncut.
+    // At 1 000 ‰ the default 600 px paint spans [280, 880].
     d.view.cover = 1_000;
     let q: Vec<_> = d
         .frame(1_000, &[])
@@ -689,11 +759,10 @@ const WIDE: &str = r#"{"id": "cw", "src": "a", "x": 0, "y": 24, "w": 43, "h": 30
 #[test]
 fn fit_width_covers_take_the_frames_aspect() {
     // A 43×30 frame over 430 px is 300 high, centred on the 600 px
-    // destination: its lower edge at 130, 150 above the region's top.
+    // destination: from −170 to 130.
     for mode in [4, 5] {
         let l = tall(WIDE, &[&stretched("cw", mode)]);
-        // 500 ‰ lowers it by 300 to 430, cut at the lanes' top.
-        assert_eq!(rects(&l, 5_000, 500, 0), [[20, 270, 430, 160]], "{mode}");
+        assert_eq!(rects(&l, 5_000, 0, 0), [[20, -170, 430, 300]], "{mode}");
         // At 1 000 ‰ it spans 430–730: the tap at its judgment time
         // stays visible below it, on the line.
         assert_eq!(
@@ -708,13 +777,9 @@ fn fit_width_covers_take_the_frames_aspect() {
 fn a_fit_width_cover_takes_its_height_from_the_frame() {
     // A destination with no height: stretch 4 makes the 43×30 frame 300
     // high, centred on the destination's lower edge, 280: from 130 to 430.
-    let flat = |h: i32| stretched("cw", 4).replace(r#""h": 600"#, &format!(r#""h": {h}"#));
-    let l = tall(WIDE, &[&flat(0)]);
-    assert_eq!(rects(&l, 5_000, 0, 0), [[20, 270, 430, 160]]);
-    // Without a stretch it has no height, and a negative height refuses.
-    let none = cover("").replace(r#""h": 600"#, r#""h": 0"#);
-    refused(tall(WIDE, &[&none]), CriticalPart::Cover, "dst");
-    refused(tall(WIDE, &[&flat(-1)]), CriticalPart::Cover, "dst");
+    let flat = stretched("cw", 4).replace(r#""h": 600"#, r#""h": 0"#);
+    let l = tall(WIDE, &[&flat]);
+    assert_eq!(rects(&l, 5_000, 0, 0), [[20, 130, 430, 300]]);
 }
 
 #[test]
@@ -723,12 +788,12 @@ fn fit_width_trimmed_covers_crop_the_frames_rows() {
     // 600 px destination and the frame's middle 60 rows (30 to 90).
     let frame = r#"{"id": "ct", "src": "a", "x": 0, "y": 0, "w": 43, "h": 120}"#;
     let l = tall(frame, &[&stretched("ct", 5)]);
-    assert_eq!(rects(&l, 5_000, 500, 0), [[20, 270, 430, 310]]);
+    assert_eq!(rects(&l, 5_000, 500, 0), [[20, -20, 430, 600]]);
     assert_eq!(rows_drawn(&l, 43.0), 60.0);
     // Stretch 4 keeps every row and fits the height: 1 200 centred on
-    // the destination puts its lower edge at 580.
+    // the destination.
     let l = tall(frame, &[&stretched("ct", 4)]);
-    assert_eq!(rects(&l, 5_000, 0, 0), [[20, 270, 430, 310]]);
+    assert_eq!(rects(&l, 5_000, 0, 0), [[20, -620, 430, 1_200]]);
     // Only a single frame crops: two rows of frames refuse.
     let grid = r#"{"id": "ct", "src": "a", "x": 0, "y": 0, "w": 43, "h": 240, "divy": 2}"#;
     assert_eq!(
@@ -738,6 +803,16 @@ fn fit_width_trimmed_covers_crop_the_frames_rows() {
     // Uncropped, a grid fits as stretch 4 does.
     let grid = grid.replace(r#""h": 240"#, r#""h": 40"#);
     tall(&grid, &[&stretched("ct", 5)]).ok();
+    // Only a static track crops: a moving one refuses.
+    let moving = stretched("ct", 5).replace(
+        r#""dst": [{"x": 20, "y": 800, "w": 430, "h": 600}]"#,
+        r#""dst": [{"time": 0, "x": 20, "y": 800, "w": 430, "h": 600},
+                   {"time": 500, "x": 20, "y": 700, "w": 430, "h": 600}]"#,
+    );
+    assert_eq!(
+        critical(tall(frame, &[&moving])),
+        (CriticalPart::Cover, NoteKind::Stretch(5))
+    );
 }
 
 #[test]
@@ -764,13 +839,16 @@ fn a_cropped_cover_is_its_own_image_of_the_same_file() {
 
 #[test]
 fn other_stretches_refuse_the_covers() {
+    // SUDDEN+'s paint refuses the other trimming stretches; LIFT every
+    // stretch that changes its frame.
     for mode in [1, 2, 3, 6, 7, 8, 9, 10] {
         let want = NoteKind::Stretch(mode);
-        assert_eq!(
-            critical(tall(WIDE, &[&stretched("cw", mode)])),
-            (CriticalPart::Cover, want),
-            "{mode}"
-        );
+        let paint = tall(WIDE, &[&stretched("cw", mode)]);
+        if matches!(mode, 3 | 7 | 10) {
+            assert_eq!(critical(paint), (CriticalPart::Cover, want), "{mode}");
+        } else {
+            paint.ok();
+        }
         let l = with(&lift_object(""), &[&lift(&format!(r#""stretch": {mode}"#))]);
         assert_eq!(critical(l), (CriticalPart::Lift, want), "{mode}");
     }
@@ -845,4 +923,166 @@ fn a_cropped_cover_is_charged_before_its_file_is_read() {
         Err(ImportError::Limit { limit, .. }) => assert_eq!(limit, ImportLimit::Images),
         other => panic!("{:?}", other.map(|i| i.report)),
     }
+}
+
+/// A `slider` record of `a.png`'s cover cell with `fields`, drawn over
+/// the default SUDDEN+ destination with `dst` fields.
+fn slider(fields: &str, dst: &str) -> (String, String) {
+    let object = format!(
+        r#""slider": [{{"id": "sl", "src": "a", "x": 0, "y": 24, "w": 16, "h": 16{fields}}}]"#
+    );
+    let sep = if dst.is_empty() { "" } else { ", " };
+    let d =
+        format!(r#"{{"id": "sl"{sep}{dst}, "dst": [{{"x": 20, "y": 800, "w": 430, "h": 600}}]}}"#);
+    (object, d)
+}
+
+const SLIDES: &str = r#", "type": 4, "angle": 2, "range": 600"#;
+
+#[test]
+fn a_type_four_slider_paints_sudden_plus() {
+    let (object, d) = slider(SLIDES, "");
+    let l = with(&object, &[&d]);
+    assert_eq!(added_notes(&l), []);
+    assert!(!has(l.report(), d9(LaneApprox::CoverMotion)));
+    // Its range times SUDDEN+'s share of the whole lane: 600 × 500 ‰
+    // lowers it 300; under LIFT 200 ‰, 600 × 500 ‰ × 800 ‰ = 240, as
+    // far as offset 4 moves.
+    assert_eq!(rects(&l, 5_000, 0, 0), [[20, -320, 430, 600]]);
+    assert_eq!(rects(&l, 5_000, 500, 0), [[20, -20, 430, 600]]);
+    assert_eq!(rects(&l, 5_000, 500, 200), [[20, -80, 430, 600]]);
+    // Listing offset 4 too, it moves by both.
+    let (_, d4) = slider(SLIDES, r#""offset": 4"#);
+    let l = with(&object, &[&d4]);
+    assert_eq!(rects(&l, 5_000, 500, 0), [[20, 280, 430, 600]]);
+    // `changeable` needs nothing; an `event` is unused.
+    let (object, d) = slider(&format!(r#"{SLIDES}, "changeable": false, "event": 1"#), "");
+    let l = with(&object, &[&d]);
+    assert!(has(l.report(), NoteKind::Ignored { field: "event" }));
+    assert_eq!(rects(&l, 5_000, 500, 0), [[20, -20, 430, 600]]);
+}
+
+#[test]
+fn a_slider_range_scales_to_the_reference_height() {
+    // ⌊1080 × range / height⌋: 499.5 truncates to 499 on a 720 px skin;
+    // 1 000 ‰ moves it exactly that far.
+    let (object, d) = slider(r#", "type": 4, "angle": 2, "range": 333"#, "");
+    let l = import_sized(
+        [1_280, 720],
+        &body("", &format!("{}, {object}", note("")), &[NOTES, &d]),
+        &[],
+    );
+    // The paint is drawn last, after any note 1 000 ‰ uncovers.
+    let at = |c: u16| rects(&l, 5_000, c, 0).last().unwrap()[1];
+    assert_eq!(at(1_000) - at(0), 499);
+    // Truncated once at the reference height (D1): range 5 of a 720 px
+    // skin is 7 reference pixels, and 3/8 of the lane moves it 2.625,
+    // 1.75 pixels of a 1 280×720 target; the source keeps 5 at that
+    // resolution and moves it 1.875.
+    let (object, d) = slider(r#", "type": 4, "angle": 2, "range": 5"#, "");
+    let l = import_sized(
+        [1_280, 720],
+        &body("", &format!("{}, {object}", note("")), &[NOTES, &d]),
+        &[],
+    );
+    let chart = ChartBuilder::new(150_000).build().unwrap();
+    let mut drawn = Drawn::over(l.ok().skin.clone(), &chart);
+    let mut y = |c: u16| {
+        drawn.view.cover = c;
+        drawn.frame(1_000, &[]).last().unwrap().rect[1]
+    };
+    let (still, moved) = (y(0), y(375));
+    assert!((moved - still - 2.625).abs() < 1e-3, "{still} {moved}");
+    // A range beyond the coordinates refuses.
+    let (object, d) = slider(r#", "type": 4, "angle": 2, "range": 2000000000"#, "");
+    match with(&object, &[&d]).err() {
+        ImportError::Range { field, .. } => assert_eq!(field, "range"),
+        e => panic!("{e:?}"),
+    }
+}
+
+#[test]
+fn a_native_paint_counts_one_quad() {
+    // Stretch 9 keeps the 16×16 cell: one image quad beside the lanes'
+    // budget, whose reservations include the judgment line.
+    let l = with("", &[&cover(r#""stretch": 9"#)]);
+    assert_eq!(
+        l.ok().skin.quad_capacity(),
+        1 + skin_model::LANE_QUADS + skin_model::LANE_RESERVED
+    );
+    let r = rects(&l, 5_000, 500, 0);
+    assert_eq!(r.len(), 1);
+    assert_eq!([r[0][2], r[0][3]], [16, 16]);
+}
+
+#[test]
+fn other_sliders_are_dropped() {
+    let dropped = |fields: &str| {
+        let (object, d) = slider(fields, "");
+        let l = with(&object, &[&d]);
+        let kinds: Vec<NoteKind> = l
+            .report()
+            .notes
+            .iter()
+            .filter(|n| n.severity == Severity::Dropped)
+            .map(|n| n.kind)
+            .collect();
+        assert_eq!(rects(&l, 5_000, 500, 0), Vec::<[i32; 4]>::new(), "{fields}");
+        kinds
+    };
+    let field = |field| vec![NoteKind::UnsupportedField { field }];
+    assert_eq!(
+        dropped(r#", "type": 1, "angle": 2, "range": 600"#),
+        [NoteKind::Unsupported {
+            object: Object::Slider
+        }]
+    );
+    assert_eq!(
+        dropped(r#", "type": 4, "angle": 1, "range": 600"#),
+        field("angle")
+    );
+    assert_eq!(
+        dropped(r#", "type": 4, "angle": 2, "range": -1"#),
+        field("range")
+    );
+    assert_eq!(
+        dropped(&format!(r#"{SLIDES}, "value": 71"#)),
+        field("value")
+    );
+    assert_eq!(
+        dropped(&format!(r#"{SLIDES}, "isRefNum": true"#)),
+        field("isRefNum")
+    );
+}
+
+#[test]
+fn a_slider_off_the_lanes_is_decorative() {
+    // Drawing a missing file: refused over the lanes, dropped off them.
+    let ghost = |rect: &str| {
+        let object =
+            format!(r#""slider": [{{"id": "sl", "src": "zz", "w": 16, "h": 16{SLIDES}}}]"#);
+        let d = format!(r#"{{"id": "sl", "dst": [{rect}]}}"#);
+        with(&object, &[&d])
+    };
+    assert_eq!(
+        critical(ghost(r#"{"x": 20, "y": 800, "w": 430, "h": 600}"#)),
+        (CriticalPart::Cover, NoteKind::MissingAsset)
+    );
+    let l = ghost(r#"{"x": 0, "y": 0, "w": 10, "h": 10}"#);
+    assert!(
+        l.report()
+            .notes
+            .iter()
+            .any(|n| n.severity == Severity::Dropped && n.kind == NoteKind::MissingAsset)
+    );
+}
+
+#[test]
+fn a_slider_paints_without_lanes() {
+    let (object, d) = slider(SLIDES, "");
+    let l = import_body(&body("", &object, &[&d]));
+    let chart = ChartBuilder::new(150_000).build().unwrap();
+    let mut drawn = Drawn::over(l.ok().skin.clone(), &chart);
+    drawn.view.cover = 500;
+    assert_eq!(drawn.rects(1_000), [[20, -20, 430, 600]]);
 }
