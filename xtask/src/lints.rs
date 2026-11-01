@@ -303,6 +303,7 @@ pub const IN_PLAY: &[Site] = &[
     Site::File("crates/skin-model/src/skin.rs"),
     Site::File("crates/skin-model/src/track.rs"),
     Site::File("crates/skin-model/src/play/mod.rs"),
+    Site::File("crates/skin-model/src/play/loading.rs"),
     Site::File("crates/skin-model/src/play/reducer.rs"),
     Site::File("crates/skin-model/src/play/schema.rs"),
     Site::File("crates/skin-model/src/play/timers.rs"),

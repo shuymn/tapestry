@@ -38,8 +38,8 @@ use skin_model::{
     Source, TimerRef, Track, UvTable, Variant, field, lane_timer, timer,
 };
 use skin_model::{
-    ChartText, FontRef, FrameUv, LoadState, Overflow, TextDef, TextField, TextImage, TextTable,
-    TextValue,
+    ChartText, FontRef, FrameUv, LoadState, LoadingFrame, LoadingGauge, Overflow, TextDef,
+    TextField, TextImage, TextSlots, TextTable, TextValue,
 };
 
 struct Counting;
@@ -1391,11 +1391,6 @@ fn stretch(
             layout: &views.layouts[layout_no],
             lanes: view,
             readouts: stretch_readouts(frame_no, view),
-            // A stretch of loading frames every 50, its progress moving.
-            loading: (frame_no % 50 < 5).then(|| LoadState {
-                since: TimeUs(now - 1_000),
-                percent: i32::try_from(frame_no % 120).unwrap_or(0),
-            }),
             playing: true,
         };
         let use_small = frame_no % 100 == 99;
@@ -1645,6 +1640,12 @@ fn build_does_not_allocate() {
             seen.drawn[slot] = true;
         }
     }
+    // `loading` runs only in the loading runtime, which draws an element
+    // on it in `loading_does_not_allocate`.
+    let slot = usize::from(timer::LOADING);
+    assert!(!seen.on[slot] && !seen.drawn[slot], "`loading` in a play");
+    seen.on[slot] = true;
+    seen.drawn[slot] = true;
     let missing = |flags: [bool; timer::BUILTIN as usize]| -> Vec<u16> {
         (0..)
             .zip(flags)
@@ -1680,7 +1681,6 @@ fn build_does_not_allocate() {
         layout: &views.layouts[0],
         lanes: views.lanes[0],
         readouts: readouts_for(views.lanes[0]),
-        loading: None,
         playing: true,
     };
     skin.build(&mut play, &frame, &loaded.uvs, &mut batch)
@@ -1710,6 +1710,7 @@ fn build_does_not_allocate() {
     assert_eq!(first, Err(BuildError::InconsistentTally));
     assert_eq!(after, Err(BuildError::InconsistentTally));
     readouts_do_not_allocate(&loaded, &descs);
+    loading_does_not_allocate(&loaded, &views, &descs);
     // Both text elements ask for a line; the title is the chart's.
     let chart_text = ChartText {
         title: "Title",
@@ -1752,7 +1753,6 @@ fn build_does_not_allocate() {
             layout: &views.layouts[0],
             lanes: views.lanes[0],
             readouts: readouts_for(views.lanes[0]),
-            loading: None,
             playing: true,
         };
         bitmap
@@ -1767,6 +1767,106 @@ fn build_does_not_allocate() {
         "bitmap text: allocations"
     );
     assert!(glyphs > 0, "no glyph drew");
+
+    // Its loading state's bitmap lines, installed untracked, draw alike.
+    let mut loading = bitmap.prepare_loading(Side::Left);
+    bitmap.install_loading_bitmap_text(
+        &mut loading,
+        TextSlots::ALL,
+        &ChartText {
+            title: "ABAB",
+            ..ChartText::default()
+        },
+    );
+    let mut glyphs = 0;
+    TRACK.with(|t| t.set(true));
+    for ms in (0..2_000).step_by(16) {
+        batch.clear();
+        let frame = LoadingFrame {
+            now: TimeUs(ms * MS),
+            load: LoadState {
+                since: TimeUs(0),
+                percent: 0,
+            },
+            target: TARGETS[0],
+            layout: &views.layouts[0],
+            lanes: views.lanes[0],
+            covers: readouts_for(views.lanes[0]).covers,
+            gauge: None,
+        };
+        bitmap
+            .build_loading(&mut loading, &frame, &uvs, &mut batch)
+            .expect("the loading frame builds");
+        glyphs += batch.quads().len();
+    }
+    TRACK.with(|t| t.set(false));
+    assert_eq!(
+        ALLOCS.load(Ordering::Relaxed),
+        0,
+        "loading bitmap text: allocations"
+    );
+    assert!(glyphs > 0, "no loading glyph drew");
+}
+
+/// The loading runtime's builds allocate nothing: its first build after
+/// preparation and the installation of its lines, later builds as the
+/// clock, the progress, the target, the layout, the covers and the gauge
+/// descriptor change, with it given and taken away, and a refused build
+/// and one after it.
+fn loading_does_not_allocate(loaded: &Loaded, views: &Views, descs: &[GaugeDesc]) {
+    let skin = &loaded.skin;
+    let mut loading = skin.prepare_loading(Side::Left);
+    skin.install_loading_text(&mut loading, TextSlots::ALL, &text_table())
+        .unwrap();
+    let mut batch = QuadBatch::with_capacity(skin.quad_capacity(), skin.run_capacity());
+    let since = TimeUs(-5_000 * MS);
+    let mut drawn = 0;
+    // Whether an element on `loading`, `screen` and `ready` drew.
+    let mut timed = [false; 3];
+    let frame = |no: usize| {
+        let view = views.lanes[(no / 7) % views.lanes.len()];
+        LoadingFrame {
+            now: TimeUs(since.0 + i64::try_from(no).unwrap() * 16 * MS),
+            load: LoadState {
+                since,
+                percent: i32::try_from(no % 120).unwrap(),
+            },
+            target: TARGETS[(no / 5) % TARGETS.len()],
+            layout: &views.layouts[(no / 11) % views.layouts.len()],
+            lanes: view,
+            covers: readouts_for(view).covers,
+            gauge: (no % 3 != 2).then(|| LoadingGauge::of(no % 2, &descs[no % 2])),
+        }
+    };
+    TRACK.with(|t| t.set(true));
+    for no in 0..600 {
+        batch.clear();
+        skin.build_loading(&mut loading, &frame(no), &loaded.uvs, &mut batch)
+            .expect("the loading frame builds");
+        drawn += batch.quads().len();
+        for q in batch.quads() {
+            if let Some(&(image, _)) = loaded.shows.get(&uv_key(q.uv, q.layer)) {
+                timed[0] |= image == timer::LOADING;
+                timed[1] |= image == timer::SCREEN;
+                timed[2] |= image == timer::READY;
+            }
+        }
+    }
+    let bad = LoadingFrame {
+        covers: CoverSettings {
+            cover: 1_001,
+            ..readouts_for(views.lanes[0]).covers
+        },
+        ..frame(0)
+    };
+    let first = skin.build_loading(&mut loading, &bad, &loaded.uvs, &mut batch);
+    let after = skin.build_loading(&mut loading, &frame(1), &loaded.uvs, &mut batch);
+    TRACK.with(|t| t.set(false));
+    assert_eq!(ALLOCS.load(Ordering::Relaxed), 0, "loading: allocations");
+    assert!(drawn > 0, "no loading quad drew");
+    assert_eq!(timed, [true, true, false], "loading, screen, ready");
+    assert_eq!(first, Err(BuildError::InvalidReadouts));
+    assert_eq!(after, Err(BuildError::InvalidReadouts));
 }
 
 const LIMITS_SMALL: AtlasLimits = AtlasLimits {
@@ -1808,7 +1908,7 @@ fn bitmap_skin() -> (tempfile::TempDir, Skin) {
     let element = |i: u16| ElementDef {
         source: Source::Text(u32::from(i)),
         track: track(i, Ease::Linear, End::Hold),
-        timer: TimerRef::Builtin(timer::READY),
+        timer: TimerRef::Builtin(timer::SCREEN),
         visible: None,
         blend: Blend::Alpha,
         clip: None,
@@ -1896,7 +1996,6 @@ fn source_lanes_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
             layout: &layout,
             lanes,
             readouts: readouts_for(lanes),
-            loading: None,
             playing: true,
         };
         skin.build(&mut play, &frame, &uvs, &mut batch)
@@ -2002,7 +2101,6 @@ fn fallback_lanes_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
                 layout: &layout,
                 lanes,
                 readouts: readouts_for(lanes),
-                loading: None,
                 playing: true,
             };
             let out = if i % 50 == 49 { &mut small } else { &mut batch };
@@ -2039,7 +2137,6 @@ fn fallback_lanes_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
                 layout: &layout,
                 lanes,
                 readouts: bad,
-                loading: None,
                 playing: true,
             };
             assert_eq!(
@@ -2258,7 +2355,6 @@ fn cover_trims_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
             layout: &layout,
             lanes,
             readouts,
-            loading: None,
             playing: true,
         };
         let out = if i % 50 == 49 { &mut small } else { &mut batch };
@@ -2311,7 +2407,6 @@ fn cover_trims_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
             layout: &layout,
             lanes,
             readouts: bad,
-            loading: None,
             playing: true,
         };
         assert_eq!(
@@ -2442,7 +2537,6 @@ fn bar_groups_do_not_allocate(ctx: &PlayContext<'_>) {
         layout: &layout,
         lanes,
         readouts,
-        loading: None,
         playing: true,
     };
     let bar_uv = |uvs: &UvTable| uvs.get(lanes_support::BAR).unwrap().uv;
@@ -2621,7 +2715,6 @@ fn readouts_do_not_allocate(loaded: &Loaded, descs: &[GaugeDesc]) {
         layout: &SkinLayout::AUTHOR,
         lanes,
         readouts,
-        loading: None,
         playing: true,
     };
     let invalid = FrameReadouts {

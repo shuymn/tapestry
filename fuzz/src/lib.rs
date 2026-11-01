@@ -363,7 +363,6 @@ pub fn draw(imported: &Imported) -> Vec<usize> {
             target: [1_920, 1_080],
             layout: &Layout::AUTHOR,
             lanes: LANES_OFF,
-            loading: None,
             readouts: readouts_for(LANES_OFF),
             playing: true,
         };
@@ -411,7 +410,6 @@ pub fn draw(imported: &Imported) -> Vec<usize> {
             target: [1_920, 1_080],
             layout: &Layout::AUTHOR,
             lanes: frame_lanes,
-            loading: None,
             readouts,
             playing: true,
         };
@@ -489,7 +487,6 @@ fn long_note_probes(
                 target: [1_920, 1_080],
                 layout: &Layout::AUTHOR,
                 lanes,
-                loading: None,
                 readouts: readouts_for(lanes),
                 playing: true,
             };
@@ -554,7 +551,6 @@ fn bar_probes(
             target: [1_920, 1_080],
             layout: &Layout::AUTHOR,
             lanes,
-            loading: None,
             readouts: readouts_for(lanes),
             playing: true,
         };
@@ -654,7 +650,6 @@ fn choice_probes(
             target: [1_920, 1_080],
             layout: &Layout::AUTHOR,
             lanes: LANES_OFF,
-            loading: None,
             readouts: readouts_for(LANES_OFF),
             playing: true,
         };
@@ -741,7 +736,6 @@ fn rate_and_kind_probes(
                 target: [1_920, 1_080],
                 layout: &Layout::AUTHOR,
                 lanes: LANES_OFF,
-                loading: None,
                 readouts: readouts_for(LANES_OFF),
                 playing: true,
             };
@@ -975,7 +969,6 @@ fn readout_probes(
                 target: [1_920, 1_080],
                 layout: &Layout::AUTHOR,
                 lanes,
-                loading: None,
                 readouts: FrameReadouts {
                     bpm_current_x100: bpm,
                     hispeed_x100: hs,

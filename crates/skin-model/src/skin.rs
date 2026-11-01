@@ -5,14 +5,18 @@
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
 use bms_model::{Chart, LANE_COUNT, TimeUs};
+use eval::GaugeState;
+use rules::GaugeValue;
 
 use crate::atlas::uv::{Cycle, UvTable};
 use crate::atlas::{Atlas, AtlasError, AtlasLimits, Variant};
 use crate::canvas::{Canvas, Fit, MAX_CANVAS, f32_of};
+use crate::expr::State;
 use crate::expr::{CompileError, Program, SkinOps};
 use crate::image::Sheet;
 use crate::layout::{Controls, Layout, Region, RegionDef};
 use crate::place::{Bind, Bounds, Fill, Follow, Native, Place, Placement, Regions, union};
+use crate::play::loading::{Loading, LoadingFrame, LoadingGauge, Need};
 use crate::play::schema::Grade;
 use crate::play::schema::timer::BUILTIN;
 use crate::play::{BuildError, Play, PlayContext, PrepareError, SkinFrame};
@@ -27,18 +31,20 @@ use crate::widget::cover_paint::{
 use crate::widget::digits::{Align, Digits, Number, NumberDef, NumberError};
 use crate::widget::gauge::{Gauge, GaugeDef, GaugeDraw, GaugeError, Shown};
 use crate::widget::glyphs;
+use crate::widget::glyphs::GlyphLine;
 use crate::widget::image_choice::{
     ChoicePart, ImageChoice, ImageChoiceDef, ImageChoiceError, MAX_IMAGE_CHOICE_REFS,
 };
 use crate::widget::judge::{
     ComboStrip, GradeImage, Judge, JudgeDef, JudgeDraw, JudgeError, JudgePart, JudgeSlot,
 };
+use crate::widget::lanes::LaneView;
 use crate::widget::lanes::{Draw, LANE_QUADS, LANE_RESERVED, Lanes, LanesDef, LanesError, Side};
 use crate::widget::text::{
     self, ChartText, FontRef, MAX_TEXT_ELEMENTS, MAX_TEXT_EM_PX, Overflow, Text, TextDef,
-    TextError, TextRequest, TextTable, TextTableError, TextValue,
+    TextError, TextRequest, TextSlots, TextTable, TextTableError, TextValue,
 };
-use crate::widget::{Brush, Frame, ImageRef, sample};
+use crate::widget::{Brush, Frame, ImageRef, Starts, sample};
 
 /// The most elements one skin may hold.
 pub const MAX_ELEMENTS: usize = 16_384;
@@ -269,6 +275,47 @@ struct Element {
     fill: Fill,
     native: Option<Native>,
     follow: Follow,
+    /// What its visibility and its number's value or image selector need
+    /// to be read while loading.
+    loading: Need,
+}
+
+/// The runtime state a frame draws from: a play's, or the loading
+/// runtime's.
+struct Runtime<'a> {
+    starts: Starts<'a>,
+    state: State<'a>,
+    text: &'a TextTable,
+    bitmap: &'a [Option<GlyphLine>],
+}
+
+/// What a frame's drawing reads of its frame.
+struct Scene<'a> {
+    /// The frame's clock, which timers age on.
+    now: TimeUs,
+    /// The display clock, which the notes and bar lines follow.
+    display: TimeUs,
+    lanes: LaneView,
+    /// Whether evaluation is complete.
+    complete: bool,
+    /// Whether HIDDEN+ is on, which its paint shows only while.
+    hidden_enabled: bool,
+    phase: Phase<'a>,
+}
+
+/// A play's frame or a loading one.
+#[derive(Clone, Copy)]
+enum Phase<'a> {
+    /// A play: its notes, its latest judgment and the snapshot's shown
+    /// gauge.
+    Play {
+        play: &'a Play,
+        gauges: &'a [GaugeState],
+        shown: usize,
+    },
+    /// The loading runtime: no chart, the gauge from the frame's
+    /// descriptor, if any.
+    Loading { gauge: Option<LoadingGauge> },
 }
 
 /// A loaded skin.
@@ -276,6 +323,8 @@ struct Element {
 pub struct Skin {
     elements: Box<[Element]>,
     whens: Box<[Program]>,
+    /// What each `when` condition needs to be read while loading.
+    whens_need: Box<[Need]>,
     ops: SkinOps,
     sheet: Sheet,
     /// The sheet's identity and frame count, kept so a build never reads
@@ -1178,7 +1227,7 @@ impl Skin {
             image_choices,
             cover_paints,
         } = def.widgets;
-        let cover_paints = cover_paints
+        let cover_paints: Box<[CoverPaint]> = cover_paints
             .into_iter()
             .map(|p| CoverPaint {
                 image: match p.image {
@@ -1191,7 +1240,7 @@ impl Skin {
                 gate: p.gate_track,
             })
             .collect();
-        let image_choices = image_choices
+        let image_choices: Box<[ImageChoice]> = image_choices
             .into_iter()
             .map(|d| ImageChoice {
                 value: d.value,
@@ -1219,7 +1268,7 @@ impl Skin {
                     .collect(),
             })
             .collect();
-        let numbers = numbers
+        let numbers: Box<[Number]> = numbers
             .into_iter()
             .map(|n| Number {
                 digits: Digits::new(&n.digits, image(n.digits.image)),
@@ -1264,6 +1313,21 @@ impl Skin {
             .into_iter()
             .zip(slots)
             .map(|(e, slot)| Element {
+                loading: {
+                    let choice = |i: usize| image_choices.get(i).map(|c| &c.value);
+                    let value = match e.source {
+                        Source::Number(i) => numbers.get(index(i)).map(|n| &n.value),
+                        Source::ImageChoice(i) => choice(index(i)),
+                        Source::CoverPaint(p) => {
+                            match cover_paints.get(index(p)).map(|p| p.image) {
+                                Some(PaintImage::Choice(i)) => choice(i),
+                                _ => None,
+                            }
+                        }
+                        _ => None,
+                    };
+                    Need::of(e.visible.as_ref()).max(Need::of(value))
+                },
                 kind: match e.source {
                     Source::Image(i) => Kind::Image(image(i)),
                     Source::Lanes => Kind::Lanes,
@@ -1302,9 +1366,11 @@ impl Skin {
                 follow: e.place.follow,
             })
             .collect();
+        let whens_need = def.whens.iter().map(|w| Need::of(Some(w))).collect();
         Ok(Self {
             elements,
             whens: def.whens.into_boxed_slice(),
+            whens_need,
             ops,
             sheet_id: def.sheet.id(),
             frame_count: def.sheet.frame_count(),
@@ -1631,6 +1697,92 @@ impl Skin {
         Ok(())
     }
 
+    /// A fresh loading state ([`Loading`]) for the play screen before a
+    /// chart's countdown, its lanes laid out for `scratch`: no chart, every
+    /// timer off and every text slot empty until a build or an install.
+    #[must_use]
+    pub fn prepare_loading(&self, scratch: Side) -> Loading {
+        Loading::new(self.whens.len(), self.text_slots(), scratch)
+    }
+
+    /// The text elements `which` names, as `(slot, its value, its
+    /// bitmap font)`.
+    fn named_slots(
+        &self,
+        which: TextSlots,
+    ) -> impl Iterator<Item = (u16, &TextValue, Option<u32>)> {
+        self.elements.iter().filter_map(move |e| match e.kind {
+            Kind::Text(i, t) => self
+                .texts
+                .get(i)
+                .filter(|d| which.names(&d.value))
+                .map(|d| (t.slot, &d.value, t.bitmap)),
+            _ => None,
+        })
+    }
+
+    /// Installs `table`'s rasterized lines into `loading`'s slots that
+    /// `which` names (a composite with its parts), each from the table's
+    /// line for that slot, an empty one clearing it; other slots keep
+    /// theirs, and no timer changes. The lines show from the next
+    /// [`build_loading`](Self::build_loading).
+    ///
+    /// # Errors
+    ///
+    /// A table whose length is not [`text_slots`](Self::text_slots);
+    /// nothing changes.
+    pub fn install_loading_text(
+        &self,
+        loading: &mut Loading,
+        which: TextSlots,
+        table: &TextTable,
+    ) -> Result<(), TextTableError> {
+        let expected = self.text_slots();
+        if table.len() != expected {
+            return Err(TextTableError::Len {
+                expected,
+                got: table.len(),
+            });
+        }
+        for (slot, ..) in self.named_slots(which) {
+            loading.text_mut().set(slot, table.get(slot).copied());
+        }
+        Ok(())
+    }
+
+    /// Lays out `chart`'s lines in bitmap fonts for `loading`'s slots that
+    /// `which` names, as [`attach_bitmap_text`](Self::attach_bitmap_text)
+    /// does for a play, and installs them; other slots keep theirs, and no
+    /// timer changes. For between frames, not in a build: it allocates.
+    pub fn install_loading_bitmap_text(
+        &self,
+        loading: &mut Loading,
+        which: TextSlots,
+        chart: &ChartText<'_>,
+    ) {
+        for (slot, value, font) in self.named_slots(which) {
+            let Some(font) = font else {
+                continue;
+            };
+            let line = glyphs::layout(&self.sheet, font, &text::clean(&value.resolve(chart)));
+            if let Some(s) = loading.bitmap_mut().get_mut(usize::from(slot)) {
+                *s = line;
+            }
+        }
+    }
+
+    /// Clears `loading`'s slots that `which` names, rasterized and bitmap
+    /// lines alike, so they draw nothing from the next
+    /// [`build_loading`](Self::build_loading); no timer changes.
+    pub fn clear_loading_text(&self, loading: &mut Loading, which: TextSlots) {
+        for (slot, ..) in self.named_slots(which) {
+            loading.text_mut().set(slot, None);
+            if let Some(s) = loading.bitmap_mut().get_mut(usize::from(slot)) {
+                *s = None;
+            }
+        }
+    }
+
     /// A fresh [`Play`] for one attempt of `chart`; a retry or the next
     /// practice round calls this again and starts clean.
     ///
@@ -1708,36 +1860,127 @@ impl Skin {
         play.fill(frame, &self.whens)?;
         // The bar groups' work, lent to the lanes for this frame.
         let mut bars = play.take_bars();
-        self.draw(play, bars.as_mut(), frame, uvs, &canvas, &placement, out);
+        let shown = &*play;
+        let rt = Runtime {
+            starts: shown.starts(),
+            state: shown.state(),
+            text: shown.text(),
+            bitmap: shown.bitmap(),
+        };
+        let scene = Scene {
+            now: frame.now,
+            display: TimeUs(frame.now.0.saturating_add(frame.display_offset.0)),
+            lanes: frame.lanes,
+            complete: frame.complete,
+            hidden_enabled: frame.readouts.covers.hidden_enabled,
+            phase: Phase::Play {
+                play: shown,
+                gauges: frame.gauges,
+                shown: frame.gauge,
+            },
+        };
+        self.draw(&rt, &scene, bars.as_mut(), uvs, &canvas, &placement, out);
         play.restore_bars(bars);
         Ok(())
     }
 
-    /// The elements of [`build`](Self::build) once `play` is filled, the
-    /// lanes drawing their bar groups with `bars`.
+    /// Builds one loading frame of `loading`, which must come from this
+    /// skin's [`prepare_loading`](Self::prepare_loading): fills its fields
+    /// and timers from `frame` ([`LoadingFrame`]), places the regions,
+    /// then appends each drawn element's quads to `out` in draw order
+    /// with a play's own drawing (the caller clears `out`). Allocates
+    /// nothing.
+    ///
+    /// `loading` and `screen` run from the frame's origin and every other
+    /// built-in timer is off. An element whose visibility, number value or
+    /// image selector reads a field unavailable while loading draws
+    /// nothing, nor one reading the gauge's kind while the frame gives no
+    /// descriptor; a `when` timer whose condition does is off. The lanes
+    /// draw their judgment line alone, the gauge its empty frame from the
+    /// descriptor, and a judge nothing. A text slot draws the line
+    /// installed in it ([`install_loading_text`](Self::install_loading_text)).
+    /// A state with another number of timers, or a uv table of another
+    /// sheet or length, draws nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`BuildError::InvalidReadouts`] when a stored cover setting is
+    /// above 1 000 or disagrees with the lanes; then the same error on
+    /// every later build of `loading`, which keeps its state.
+    pub fn build_loading(
+        &self,
+        loading: &mut Loading,
+        frame: &LoadingFrame<'_>,
+        uvs: &UvTable,
+        out: &mut QuadBatch,
+    ) -> Result<(), BuildError> {
+        if let Some(e) = loading.refused() {
+            return Err(e);
+        }
+        if loading.slots() != usize::from(BUILTIN) + self.whens.len()
+            || uvs.sheet_id() != self.sheet_id
+            || uvs.frames().len() != self.frame_count
+        {
+            return Ok(());
+        }
+        let canvas = self.canvas(frame.target);
+        let placement = self.placement(&canvas, frame.layout, loading.scratch());
+        loading.fill(frame, &self.whens, &self.whens_need)?;
+        let rt = Runtime {
+            starts: loading.starts(),
+            state: loading.state(),
+            text: loading.text(),
+            bitmap: loading.bitmap(),
+        };
+        let scene = Scene {
+            now: frame.now,
+            display: frame.now,
+            lanes: frame.lanes,
+            complete: false,
+            hidden_enabled: frame.covers.hidden_enabled,
+            phase: Phase::Loading { gauge: frame.gauge },
+        };
+        self.draw(&rt, &scene, None, uvs, &canvas, &placement, out);
+        Ok(())
+    }
+
+    /// The elements of a build once its state is filled, the lanes drawing
+    /// their bar groups with `bars`.
     #[expect(
         clippy::too_many_arguments,
         reason = "the build's own state, split once"
     )]
     fn draw(
         &self,
-        play: &Play,
+        rt: &Runtime<'_>,
+        scene: &Scene<'_>,
         mut bars: Option<&mut BarScratch>,
-        frame: &SkinFrame<'_>,
         uvs: &UvTable,
         canvas: &Canvas,
         placement: &Placement,
         out: &mut QuadBatch,
     ) {
-        let state = play.state();
+        let state = &rt.state;
+        let now = scene.now;
         // A table of another length draws no text.
-        let texts = play.text().len() == self.text_slots();
-        let bitmaps = play.bitmap().len() == self.text_slots();
-        let display = TimeUs(frame.now.0.saturating_add(frame.display_offset.0));
+        let texts = rt.text.len() == self.text_slots();
+        let bitmaps = rt.bitmap.len() == self.text_slots();
         // The lanes' geometry, once for every element, whether or not the
         // lanes draw.
-        let lanes = self.lanes.as_ref().map(|l| l.frame_geometry(frame.lanes));
+        let lanes = self.lanes.as_ref().map(|l| l.frame_geometry(scene.lanes));
+        let play = match scene.phase {
+            Phase::Play { play, .. } => Some(play),
+            Phase::Loading { .. } => None,
+        };
         for e in &self.elements {
+            // While loading, an element reading what loading lacks draws
+            // nothing: its condition is false, its value or selector
+            // unread.
+            if let Phase::Loading { gauge } = scene.phase
+                && !e.loading.met(gauge.is_some())
+            {
+                continue;
+            }
             if let Kind::Lanes = e.kind {
                 let (Some(widget), Some(geometry)) = (&self.lanes, lanes.as_ref()) else {
                     continue;
@@ -1745,25 +1988,20 @@ impl Skin {
                 if !placement.region(e.region).visible {
                     continue;
                 }
-                let Some((_, s)) = sample(
-                    play.starts(),
-                    frame.now,
-                    &state,
-                    e.slot,
-                    e.visible.as_ref(),
-                    &e.track,
-                ) else {
+                let Some((_, s)) =
+                    sample(rt.starts, now, state, e.slot, e.visible.as_ref(), &e.track)
+                else {
                     continue;
                 };
                 let d = Draw {
-                    play: Some(play),
-                    starts: play.starts(),
-                    state: &state,
-                    now: frame.now,
-                    display,
-                    view: frame.lanes,
+                    play,
+                    starts: rt.starts,
+                    state,
+                    now,
+                    display: scene.display,
+                    view: scene.lanes,
                     frame: geometry,
-                    complete: frame.complete,
+                    complete: scene.complete,
                     geometry: placement.geometry(),
                     placement,
                     affine: placement.affine(e.region, e.fill),
@@ -1783,9 +2021,7 @@ impl Skin {
                 _ => None,
             };
             // HIDDEN+'s paint shows only while HIDDEN+ is on, at any amount.
-            if paint.is_some_and(|p| p.motion == CoverMotion::Hidden)
-                && !frame.readouts.covers.hidden_enabled
-            {
+            if paint.is_some_and(|p| p.motion == CoverMotion::Hidden) && !scene.hidden_enabled {
                 continue;
             }
             // An image choice's entry, before its track is sampled.
@@ -1795,7 +2031,7 @@ impl Skin {
             };
             let choice = match table {
                 Some(i) => {
-                    let Some(p) = self.image_choices.get(i).and_then(|c| c.select(&state)) else {
+                    let Some(p) = self.image_choices.get(i).and_then(|c| c.select(state)) else {
                         continue;
                     };
                     Some(p)
@@ -1803,14 +2039,8 @@ impl Skin {
                 None => None,
             };
             let track = choice.and_then(|p| p.track.as_ref()).unwrap_or(&e.track);
-            let Some((t, s)) = sample(
-                play.starts(),
-                frame.now,
-                &state,
-                e.slot,
-                e.visible.as_ref(),
-                track,
-            ) else {
+            let Some((t, s)) = sample(rt.starts, now, state, e.slot, e.visible.as_ref(), track)
+            else {
                 continue;
             };
             let affine = placement.affine(e.region, e.fill);
@@ -1824,7 +2054,7 @@ impl Skin {
                 Some(p) => {
                     let [x, y, w, h] = s.rect;
                     let g = lanes.as_ref();
-                    let dy = e.follow.dy(g) + p.motion_dy(g) + p.slider_dy(frame.lanes);
+                    let dy = e.follow.dy(g) + p.motion_dy(g) + p.slider_dy(scene.lanes);
                     let gate = match &p.gate {
                         Some(gate) => match gate.sample(t) {
                             Some(gs) => gs.rect,
@@ -1852,8 +2082,8 @@ impl Skin {
                 scale: canvas.scale(),
             };
             let at = Frame {
-                starts: play.starts(),
-                now: frame.now,
+                starts: rt.starts,
+                now,
                 uvs,
             };
             match e.kind {
@@ -1865,34 +2095,44 @@ impl Skin {
                         _ => None,
                     };
                     if let Some(image) = image
-                        && let Some(f) = image.frame(play.starts(), frame.now, uvs)
+                        && let Some(f) = image.frame(rt.starts, now, uvs)
                     {
                         brush.push_clipped(out, rect, f, image.filter, trim);
                     }
                 }
                 Kind::Number(i) => {
                     if let Some(n) = self.numbers.get(i) {
-                        let v = n.value.eval(&state);
+                        let v = n.value.eval(state);
                         n.digits.draw(v, rect, &brush, &at, out);
                     }
                 }
                 Kind::Gauge(i) => {
                     if let Some(g) = self.gauges.get(i) {
-                        let desc = play.gauge_desc(frame.gauge);
-                        let d = GaugeDraw {
-                            at,
-                            shown: Shown::of(frame.gauges, desc, frame.gauge),
-                            t,
+                        let shown = match scene.phase {
+                            Phase::Play {
+                                play,
+                                gauges,
+                                shown,
+                            } => Shown::of(gauges, play.gauge_desc(shown), shown),
+                            // The empty frame: no value while loading.
+                            Phase::Loading { gauge } => gauge.map(|g| Shown {
+                                look: g.look,
+                                max: g.max,
+                                border: g.border,
+                                value: GaugeValue(0),
+                            }),
                         };
+                        let d = GaugeDraw { at, shown, t };
                         g.draw(&d, rect, &brush, out);
                     }
                 }
                 Kind::Judge(i) => {
-                    if let Some(j) = self.judges.get(i) {
+                    // Judgment feedback never draws while loading.
+                    if let (Some(j), Some(play)) = (self.judges.get(i), play) {
                         let d = JudgeDraw {
                             at,
                             grade: play.judge(),
-                            state: &state,
+                            state,
                             affine,
                             map: brush.map,
                             lanes: lanes.as_ref(),
@@ -1906,11 +2146,11 @@ impl Skin {
                 Kind::Text(_, t) => {
                     if t.bitmap.is_some() {
                         if let Some(Some(line)) =
-                            play.bitmap().get(usize::from(t.slot)).filter(|_| bitmaps)
+                            rt.bitmap.get(usize::from(t.slot)).filter(|_| bitmaps)
                         {
                             t.draw_glyphs(line, rect, &brush, uvs, out);
                         }
-                    } else if let Some(image) = play.text().get(t.slot).filter(|_| texts) {
+                    } else if let Some(image) = rt.text.get(t.slot).filter(|_| texts) {
                         t.draw(image, rect, &brush, out);
                     }
                 }

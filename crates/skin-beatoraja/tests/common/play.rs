@@ -243,7 +243,6 @@ impl Drawn {
             target: self.target,
             layout: &Layout::AUTHOR,
             lanes: self.view,
-            loading: None,
             playing: true,
             readouts: self.readouts.unwrap_or_else(|| readouts_for(self.view)),
         };

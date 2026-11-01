@@ -277,7 +277,6 @@ pub fn skin_frame<'a>(f: &FrameInput<'a>) -> SkinFrame<'a> {
             lift: 0,
             hidden: 0,
         },
-        loading: None,
         readouts: READOUTS,
     }
 }

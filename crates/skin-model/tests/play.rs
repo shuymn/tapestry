@@ -956,7 +956,6 @@ fn an_inconsistent_snapshot_poisons_the_play() {
             target: h.target,
             layout: &layout,
             lanes: h.view,
-            loading: None,
             readouts: play_support::readouts_for(h.view),
         };
         // Not cleared: a refused build appends nothing.

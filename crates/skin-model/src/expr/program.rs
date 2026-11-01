@@ -134,6 +134,16 @@ impl Program {
         }
     }
 
+    /// The field slots the program reads: its read set. Evaluation runs
+    /// every operation, so both arms of a conditional that survived
+    /// folding are read.
+    pub(crate) fn fields(&self) -> impl Iterator<Item = u16> + '_ {
+        self.ops.iter().filter_map(|op| match *op {
+            Op::Load { slot, .. } => Some(slot),
+            _ => None,
+        })
+    }
+
     /// The stack slots evaluation uses.
     #[must_use]
     pub fn stack_depth(&self) -> usize {

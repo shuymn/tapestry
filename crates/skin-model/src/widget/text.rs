@@ -231,6 +231,84 @@ impl TextTable {
     pub(crate) fn get(&self, slot: u16) -> Option<&TextImage> {
         self.0.get(usize::from(slot)).and_then(Option::as_ref)
     }
+
+    /// Sets `slot`'s line; a slot past the table is ignored.
+    pub(crate) fn set(&mut self, slot: u16, line: Option<TextImage>) {
+        if let Some(s) = self.0.get_mut(usize::from(slot)) {
+            *s = line;
+        }
+    }
+}
+
+/// A set of text slots named by what they show: chart fields and
+/// literals. A composite field is named with its parts, so naming the
+/// title names the full title's slots too, and naming the full title names
+/// only them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TextSlots {
+    /// One bit per [`TextField`], by [`TextSlots::bit`].
+    fields: u8,
+    literals: bool,
+}
+
+impl TextSlots {
+    /// No slot.
+    pub const NONE: Self = Self {
+        fields: 0,
+        literals: false,
+    };
+    /// Every slot: every field and every literal.
+    pub const ALL: Self = Self {
+        fields: u8::MAX,
+        literals: true,
+    };
+    /// Every literal's slot.
+    pub const LITERALS: Self = Self {
+        fields: 0,
+        literals: true,
+    };
+
+    const fn bit(f: TextField) -> u8 {
+        1 << f as u8
+    }
+
+    /// The slots of `f`'s field, and of the composites it is part of.
+    #[must_use]
+    pub const fn field(f: TextField) -> Self {
+        Self {
+            fields: Self::bit(f),
+            literals: false,
+        }
+    }
+
+    /// Both sets' slots.
+    #[must_use]
+    pub const fn with(self, other: Self) -> Self {
+        Self {
+            fields: self.fields | other.fields,
+            literals: self.literals || other.literals,
+        }
+    }
+
+    /// Whether a slot showing `value` is in the set: a literal while the
+    /// set has the literals, a field while the set names it or one of its
+    /// parts.
+    pub(crate) fn names(self, value: &TextValue) -> bool {
+        let f = match value {
+            TextValue::Literal(_) => return self.literals,
+            TextValue::Field(f) => *f,
+        };
+        let parts = match f {
+            TextField::FullTitle => Self::bit(TextField::Title) | Self::bit(TextField::Subtitle),
+            TextField::FullArtist => Self::bit(TextField::Artist) | Self::bit(TextField::Subartist),
+            TextField::Title
+            | TextField::Subtitle
+            | TextField::Artist
+            | TextField::Subartist
+            | TextField::Genre => 0,
+        };
+        self.fields & (Self::bit(f) | parts) != 0
+    }
 }
 
 /// Why [`Skin::attach_text`](crate::Skin::attach_text) refused a table.

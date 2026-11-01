@@ -12,9 +12,10 @@ use super::schema::{
     COVER_PERMILLE, GAUGE_PERMILLE, Grade, LaneTimer, MAX_COUNT, RATE_BASIS_POINTS,
     READOUT_MAX_U32, lane_timer, timer,
 };
-use super::{BuildError, DurationRatio, Play, SkinFrame};
+use super::{BuildError, CoverSettings, DurationRatio, Play, SkinFrame};
 use crate::expr::{Program, State, TIMER_OFF};
 use crate::widget::gauge::GaugeLook;
+use crate::widget::lanes::LaneView;
 
 /// How long past the notes' end the play keeps playing before it
 /// finishes, in ms (`play/BMSPlayer.java:66`).
@@ -74,19 +75,103 @@ struct Readouts {
     bpm_range_valid: i32,
     remaining_s: i32,
     elapsed_s: i32,
-    cover: i32,
-    lift: i32,
-    hidden: i32,
-    cover_absolute: i32,
-    cover_enabled: i32,
-    lift_enabled: i32,
-    hidden_enabled: i32,
-    adjusting: i32,
+    covers: Covers,
     hispeed: i32,
     hispeed_valid: i32,
     duration_ms: i32,
     green: i32,
     duration_valid: i32,
+}
+
+/// The cover fields of one frame, `field::COVER_PERMILLE` to
+/// `field::COVER_ADJUSTING`: the stored settings, a play's and a loading
+/// frame's alike.
+#[derive(Clone, Copy)]
+pub(crate) struct Covers {
+    pub(crate) cover: i32,
+    pub(crate) lift: i32,
+    pub(crate) hidden: i32,
+    pub(crate) absolute: i32,
+    pub(crate) cover_enabled: i32,
+    pub(crate) lift_enabled: i32,
+    pub(crate) hidden_enabled: i32,
+    pub(crate) adjusting: i32,
+}
+
+/// The cover fields of the stored settings `c`, or `None` when a setting
+/// is above 1 000 ‰ or disagrees with the effective amount `lanes` paints
+/// (stage3.md R4, R6).
+pub(crate) fn covers(lanes: &LaneView, c: &CoverSettings) -> Option<Covers> {
+    let max = COVER_PERMILLE.unsigned_abs();
+    if [c.cover, c.lift, c.hidden]
+        .into_iter()
+        .any(|v| u32::from(v) > max)
+    {
+        return None;
+    }
+    // The lanes cap their amounts at 1 000 (`LaneView`); a cover that is
+    // off draws 0 whatever it stores.
+    let effective = |on: bool, v: u16| if on { v } else { 0 };
+    let full = u16::try_from(max).ok()?;
+    if lanes.cover.min(full) != effective(c.cover_enabled, c.cover)
+        || lanes.lift.min(full) != effective(c.lift_enabled, c.lift)
+        || lanes.hidden.min(full) != effective(c.hidden_enabled, c.hidden)
+    {
+        return None;
+    }
+    let (cover, lift) = (i32::from(c.cover), i32::from(c.lift));
+    Some(Covers {
+        cover,
+        lift,
+        hidden: i32::from(c.hidden),
+        // Both at most 1 000, so the product fits.
+        absolute: (COVER_PERMILLE - lift) * cover / COVER_PERMILLE,
+        cover_enabled: i32::from(c.cover_enabled),
+        lift_enabled: i32::from(c.lift_enabled),
+        hidden_enabled: i32::from(c.hidden_enabled),
+        adjusting: i32::from(c.adjusting),
+    })
+}
+
+/// Reads every timer at `now` from `starts` into `ms`: the built-in ones,
+/// then each `when` timer, which starts on its condition's rising edge
+/// over `fields` and the built-in readings and turns off on its falling
+/// edge. A condition `admit` rejects reads as false. A play and the
+/// loading runtime read their timers through this one rule.
+pub(crate) fn read_timers(
+    now: TimeUs,
+    fields: &[i32],
+    starts: &mut [Option<TimeUs>],
+    ms: &mut [i32],
+    whens: &[Program],
+    admit: impl Fn(usize) -> bool,
+) {
+    let builtin = usize::from(timer::BUILTIN);
+    for (ms, start) in ms.iter_mut().zip(starts.iter()).take(builtin) {
+        *ms = reading(now, *start);
+    }
+    let (Some((builtin_ms, when_ms)), Some(when_starts)) =
+        (ms.split_at_mut_checked(builtin), starts.get_mut(builtin..))
+    else {
+        return;
+    };
+    let state = State {
+        fields,
+        timers: builtin_ms,
+    };
+    for (i, ((program, start), ms)) in whens
+        .iter()
+        .zip(when_starts.iter_mut())
+        .zip(when_ms.iter_mut())
+        .enumerate()
+    {
+        if !admit(i) || !program.eval_bool(&state) {
+            *start = None;
+        } else if start.is_none() {
+            *start = Some(now);
+        }
+        *ms = reading(now, *start);
+    }
 }
 
 /// An optional readout up to the maximum: its value (0 when absent) and
@@ -153,25 +238,7 @@ impl Play {
     /// amount (stage3.md R4, R6).
     fn readouts(&self, frame: &SkinFrame<'_>) -> Option<Readouts> {
         let r = &frame.readouts;
-        let c = &r.covers;
-        let max = COVER_PERMILLE.unsigned_abs();
-        if [c.cover, c.lift, c.hidden]
-            .into_iter()
-            .any(|v| u32::from(v) > max)
-        {
-            return None;
-        }
-        // The lanes cap their amounts at 1 000 (`LaneView`); a cover that
-        // is off draws 0 whatever it stores.
-        let effective = |on: bool, v: u16| if on { v } else { 0 };
-        let lanes = &frame.lanes;
-        let full = u16::try_from(max).ok()?;
-        if lanes.cover.min(full) != effective(c.cover_enabled, c.cover)
-            || lanes.lift.min(full) != effective(c.lift_enabled, c.lift)
-            || lanes.hidden.min(full) != effective(c.hidden_enabled, c.hidden)
-        {
-            return None;
-        }
+        let covers = covers(&frame.lanes, &r.covers)?;
         let (bpm_current, bpm_current_valid) = readout(r.bpm_current_x100)?;
         let (hispeed, hispeed_valid) = readout(r.hispeed_x100)?;
         let (duration_ms, duration_valid) = match r.duration {
@@ -191,7 +258,6 @@ impl Play {
         let now = i128::from(frame.now.0);
         let start = i128::from(self.play_at.0);
         let end = i128::from(self.readout_end.0);
-        let (cover, lift) = (i32::from(c.cover), i32::from(c.lift));
         Some(Readouts {
             bpm_current,
             bpm_min,
@@ -200,15 +266,7 @@ impl Play {
             bpm_range_valid,
             remaining_s: seconds(end - now.max(start), true),
             elapsed_s: seconds(now - start, false),
-            cover,
-            lift,
-            hidden: i32::from(c.hidden),
-            // Both at most 1 000, so the product fits.
-            cover_absolute: (COVER_PERMILLE - lift) * cover / COVER_PERMILLE,
-            cover_enabled: i32::from(c.cover_enabled),
-            lift_enabled: i32::from(c.lift_enabled),
-            hidden_enabled: i32::from(c.hidden_enabled),
-            adjusting: i32::from(c.adjusting),
+            covers,
             hispeed,
             hispeed_valid,
             duration_ms,
@@ -243,33 +301,14 @@ impl Play {
         }
         self.fill_fields(frame, judged, &readouts);
         self.fill_builtin(frame);
-        let now = frame.now;
-        let builtin = usize::from(timer::BUILTIN);
-        for (ms, start) in self.ms.iter_mut().zip(&self.starts).take(builtin) {
-            *ms = reading(now, *start);
-        }
-        let (Some((builtin_ms, when_ms)), Some(when_starts)) = (
-            self.ms.split_at_mut_checked(builtin),
-            self.starts.get_mut(builtin..),
-        ) else {
-            return Ok(());
-        };
-        let state = State {
-            fields: &self.fields,
-            timers: builtin_ms,
-        };
-        for ((program, start), ms) in whens
-            .iter()
-            .zip(when_starts.iter_mut())
-            .zip(when_ms.iter_mut())
-        {
-            if !program.eval_bool(&state) {
-                *start = None;
-            } else if start.is_none() {
-                *start = Some(now);
-            }
-            *ms = reading(now, *start);
-        }
+        read_timers(
+            frame.now,
+            &self.fields,
+            &mut self.starts,
+            &mut self.ms,
+            whens,
+            |_| true,
+        );
         Ok(())
     }
 
@@ -305,7 +344,8 @@ impl Play {
             count(t.empty_poor),
             count(self.reducer.targets()),
             gauge,
-            frame.loading.map_or(100, |l| l.percent.clamp(0, 100)),
+            // Loaded: a play's frames never load (the loading runtime's do).
+            100,
             rate_bp(t.ex_score, judged),
             rate_bp(t.ex_score, targets),
             kind.unwrap_or(GaugeLook::Normal).schema_value(),
@@ -317,14 +357,14 @@ impl Play {
             r.bpm_range_valid,
             r.remaining_s,
             r.elapsed_s,
-            r.cover,
-            r.lift,
-            r.hidden,
-            r.cover_absolute,
-            r.cover_enabled,
-            r.lift_enabled,
-            r.hidden_enabled,
-            r.adjusting,
+            r.covers.cover,
+            r.covers.lift,
+            r.covers.hidden,
+            r.covers.absolute,
+            r.covers.cover_enabled,
+            r.covers.lift_enabled,
+            r.covers.hidden_enabled,
+            r.covers.adjusting,
             r.hispeed,
             r.hispeed_valid,
             r.duration_ms,
@@ -384,7 +424,8 @@ impl Play {
             set(grade.timer(), at);
         }
         set(timer::COMBO_UP, self.reducer.combo_up);
-        set(timer::LOADING, frame.loading.map(|l| l.since));
+        // Loading is the loading runtime's (`loading.rs`).
+        set(timer::LOADING, None);
         for lane in Lane::all() {
             let l = lane.index();
             let hold = self.reducer.hold_at(l, now).map(|h| h.start);

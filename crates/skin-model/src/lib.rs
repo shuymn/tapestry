@@ -41,10 +41,17 @@
 //! glyph cells; a gauge's lit and unlit segments; the judgment's grade
 //! and combo; a text's line; a cover's paint moved by the covers and cut
 //! at its trim line; or the lanes' notes, bar lines and judgment line.
-//! From a chart's choice to its countdown the frame carries a
-//! [`LoadState`]: the `loading` timer runs and `load.percent` reads the
-//! load's progress, so a skin can draw its loading elements, the chart's
-//! title and artist among its text fields.
+//! From a chart's choice to its countdown the play screen draws a
+//! [`Loading`] state instead, which [`Skin::prepare_loading`] makes
+//! without a chart and [`Skin::build_loading`] builds from each
+//! [`LoadingFrame`] through the same evaluation and drawing: `loading`
+//! and `screen` run from the load's origin ([`LoadState`]),
+//! `load.percent` reads its progress, the gauge draws its empty frame from
+//! a [`LoadingGauge`], the lanes their judgment line, and an expression
+//! reading a field loading lacks ([`loading_field`]) draws nothing. Its
+//! text slots show the lines installed for the chosen chart
+//! ([`Skin::install_loading_text`]) until they are cleared
+//! ([`Skin::clear_loading_text`]).
 //!
 //! Expressions use integers only; floats appear only in a quad's geometry,
 //! after evaluation. The cast lints below reject `as` casts that may
@@ -104,6 +111,9 @@ pub use layout::{
 pub use place::{
     Affine, Bind, Fill, Follow, MIN_VISIBLE, Native, Place, Placement, RegionPlacement,
 };
+pub use play::loading::{
+    Loading, LoadingField, LoadingFrame, LoadingGauge, LoadingTimer, loading_field, loading_timer,
+};
 pub use play::schema::{
     COVER_PERMILLE, GAUGE_KIND_ENUM, GAUGE_PERMILLE, GREEN_MAX, Grade, LaneTimer, MAX_COUNT, PLAY,
     RATE_BASIS_POINTS, READOUT_MAX, field, lane_timer, timer,
@@ -140,5 +150,6 @@ pub use widget::lanes::{
 pub use widget::scroll::Scale;
 pub use widget::text::{
     ChartText, FontRef, MAX_TEXT_BYTES, MAX_TEXT_ELEMENTS, MAX_TEXT_EM, MAX_TEXT_EM_PX, Overflow,
-    TextDef, TextError, TextField, TextImage, TextRequest, TextTable, TextTableError, TextValue,
+    TextDef, TextError, TextField, TextImage, TextRequest, TextSlots, TextTable, TextTableError,
+    TextValue,
 };
