@@ -153,16 +153,15 @@ pub enum LaneApprox {
     /// line once its time has passed (`play/LaneRenderer.java:357-359`);
     /// with no scroll span it is not drawn.
     BarLine,
-    /// n: HIDDEN+ is cut at its trim line after its stretch, where the
-    /// source decides what to draw and clip from its unstretched
-    /// destination.
-    HiddenStretch,
-    /// o: HIDDEN+ is never drawn outside the lanes, where the source can
-    /// draw it above or below them.
-    HiddenClip,
-    /// p: what follows LIFT or SUDDEN+ (offsets 3 and 4) moves by this
-    /// frame's lane geometry, from the first frame and while the lanes
-    /// are hidden or off, and not at all in a skin without lanes. The
+    /// q: HIDDEN+'s paint with animated colour is hidden whenever HIDDEN+
+    /// is off, where the source hides it by an alpha offset that it skips
+    /// while the colour interpolates (`play/LaneRenderer.java:335-345`,
+    /// `skin/SkinObject.java:480-519`).
+    HiddenDisable,
+    /// p: what follows LIFT or SUDDEN+ (offsets 3 and 4), and LIFT's and
+    /// HIDDEN+'s paint, move by this frame's lane geometry, from the first
+    /// frame and while the lanes are hidden or off, and not at all in a
+    /// skin without lanes. The
     /// source prepares every object before it draws (`skin/Skin.java:
     /// 316-328`) but sets the offsets while it draws the lanes
     /// (`play/LaneRenderer.java:332-345`), so its followers can show the

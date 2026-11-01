@@ -827,6 +827,7 @@ pub fn skin_imports() -> Vec<Seed> {
         ("bar_groups", play_skin(&bar_groups_body())),
         ("paints", play_skin(&paints_body())),
         ("followers", play_skin(&followers_body())),
+        ("trims", play_skin(&trims_body())),
         (
             "judge",
             play_skin(
@@ -1068,6 +1069,38 @@ fn followers_body() -> String {
                 {"id": "j", "dst": [{"w": 0, "h": 0}]},
                 {"id": "hid", "offsets": [3, 5, 3], "dst""#,
         )
+}
+
+/// [`lanes_body`] with LIFT's and HIDDEN+'s paint trimmed every way: LIFT
+/// split in two at the fixed line, a fit-width LIFT gated away by its
+/// unstretched destination below its line, a linked line following
+/// SUDDEN+ as well, a negative line; HIDDEN+ fading, at a fixed line and
+/// listing its offsets again.
+fn trims_body() -> String {
+    let body = lanes_body();
+    let at = body.find(r#""liftCover""#).unwrap_or(body.len());
+    format!(
+        r#"{}"liftCover": [
+                {{"id": "lc", "src": "grid", "x": 4, "y": 4, "w": 4, "h": 4, "disapearLine": 200}},
+                {{"id": "lx", "src": "grid", "x": 4, "y": 4, "w": 4, "h": 4, "disapearLine": 990}},
+                {{"id": "ll", "src": "grid", "x": 4, "y": 4, "w": 4, "h": 4, "disapearLine": 120, "isDisapearLineLinkLift": true}},
+                {{"id": "ln", "src": "grid", "x": 4, "y": 4, "w": 4, "h": 4, "disapearLine": -5}}],
+            "hiddenCover": [
+                {{"id": "hid", "src": "grid", "y": 4, "w": 4, "h": 4, "disapearLine": 200}},
+                {{"id": "hf", "src": "grid", "y": 4, "w": 4, "h": 4, "disapearLine": 150, "isDisapearLineLinkLift": false}}],
+            "destination": [
+                {{"id": "notes", "dst": [{{"w": 0, "h": 0}}]}},
+                {{"id": "cv", "offset": 4, "dst": [{{"x": 20, "y": 800, "w": 430, "h": 600}}]}},
+                {{"id": "lc", "dst": [{{"x": 20, "y": 0, "w": 215, "h": 200}}]}},
+                {{"id": "lc", "dst": [{{"x": 235, "y": 0, "w": 215, "h": 200}}]}},
+                {{"id": "lx", "stretch": 4, "dst": [{{"x": 20, "y": 970, "w": 40, "h": 10}}]}},
+                {{"id": "ll", "offset": 4, "dst": [{{"x": 20, "y": 0, "w": 430, "h": 200}}]}},
+                {{"id": "ln", "dst": [{{"x": 20, "y": 0, "w": 430, "h": 200}}]}},
+                {{"id": "hid", "dst": [{{"time": 0, "x": 20, "y": -400, "w": 430, "h": 600, "a": 255}}, {{"time": 1000, "a": 0}}]}},
+                {{"id": "hf", "dst": [{{"x": 20, "y": -400, "w": 430, "h": 600}}]}},
+                {{"id": "hid", "offsets": [3, 5], "dst": [{{"x": 20, "y": -400, "w": 430, "h": 600}}]}}]"#,
+        body.get(..at).unwrap_or_default()
+    )
 }
 
 /// [`lanes_body`] with SUDDEN+ painted four ways between LIFT and HIDDEN+:

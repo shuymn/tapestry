@@ -1,25 +1,25 @@
-//! SUDDEN+ paint apart from the logical coverage, on the source player's
+//! Cover paint apart from the logical coverage, on the source player's
 //! lanes (`lanes_support::source`: the region 600 high from 280 to 880,
 //! the lanes' top at 270) at 1920×1080 with the author's layout: offset
 //! and slider motion, the coverage extremes, paint that never changes the
-//! notes, whole authored rects, the draw order with the lane paint
-//! markers, independent clocks, choices, the load checks, the capacity
-//! and the variant.
+//! notes, whole authored rects, the draw order of every cover's paint,
+//! independent clocks, choices, the load checks, the capacity and the
+//! variant. The trim lines are `cover_trim.rs`'s.
 
 mod lanes_support;
 mod play_support;
 
 use bms_model::{Chart, ChartBuilder, TimeUs};
 use lanes_support::{
-    COVER, HIDDEN, LIFT, NOTE, WHITE, cover_image, image, in_lane, lanes_element, marker, paint,
-    quads_of, rects, sheet, simple, source, with_markers,
+    COVER, HIDDEN, LIFT, NOTE, WHITE, cover_image, image, in_lane, lanes_element, moving, paint,
+    quads_of, rects, sheet, simple, source,
 };
 use play_support::{Harness, MS, REGIONS, bool_program, full, lane, readouts_for};
 use skin_model::{
-    Blend, ClipId, CoverImage, CoverPaintDef, CoverPaintError, CycleDef, ElementDef, Fit, Follow,
-    ImageChoiceDef, ImageChoicePart, ImageSpan, LANE_QUADS, LANE_RESERVED, LanePaint,
-    LanePaintError, LaneView, LanesDef, Layout, LoadError, MAX_COORD, MAX_ELEMENTS, Native, PLAY,
-    Place, Region, Scope, Skin, SkinDef, TimerRef, Track, Ty, Variant, WidgetDefs, compile, timer,
+    Blend, ClipId, CoverImage, CoverMotion, CoverPaintDef, CoverPaintError, CoverTrim, CycleDef,
+    ElementDef, Fit, Follow, ImageChoiceDef, ImageChoicePart, ImageSpan, LANE_QUADS, LANE_RESERVED,
+    LaneView, LanesDef, Layout, LoadError, MAX_COORD, MAX_ELEMENTS, Native, PLAY, Place, Scope,
+    Skin, SkinDef, TimerRef, Ty, Variant, WidgetDefs, compile, timer,
 };
 
 /// 150 BPM, in thousandths.
@@ -31,7 +31,7 @@ fn def(lanes: Option<LanesDef>, elements: Vec<ElementDef>, widgets: WidgetDefs) 
         regions: REGIONS,
         whens: Vec::new(),
         sheet: sheet(),
-        elements: with_markers(lanes.as_ref(), elements),
+        elements,
         lanes,
         widgets,
         bomb_up_to: Some(skin_model::Grade::Bad),
@@ -192,6 +192,7 @@ fn paint_never_changes_the_notes() {
         vec![CoverPaintDef {
             image: CoverImage::Choice(0),
             slider_range: Some(200),
+            ..cover_image(None)
         }]
     };
     for (what, elements, defs, choices, drawn) in [
@@ -274,11 +275,32 @@ fn order(h: &Harness, parts: &[u32]) -> Vec<u32> {
         .collect()
 }
 
+/// SUDDEN+'s paint at 0, then LIFT's (1) over `[160, 880, 544, 200]`
+/// trimmed at the region's bottom, and HIDDEN+'s (2) over the region,
+/// trimmed there as it rises with the lift.
+fn three_paints() -> Vec<CoverPaintDef> {
+    vec![
+        cover_image(None),
+        moving(LIFT, CoverMotion::Lift, CoverTrim::Fixed(880)),
+        moving(HIDDEN, CoverMotion::Hidden, CoverTrim::Lift(880)),
+    ]
+}
+
+fn lift_paint() -> ElementDef {
+    paint(1, [160, 880, 544, 200], Follow::None)
+}
+
+fn hidden_paint() -> ElementDef {
+    paint(2, [160, 280, 544, 600], Follow::None)
+}
+
 #[test]
-fn paint_and_markers_draw_in_list_order() {
+fn every_cover_paint_draws_in_list_order() {
     // SUDDEN+, an additive image, LIFT, SUDDEN+, HIDDEN+, an additive
-    // SUDDEN+: drawn in that order after the lanes, the markers with the
-    // lanes' alpha blend, so the runs go alpha, add, alpha, add.
+    // SUDDEN+: drawn in that order after the lanes. Lift 100 ‰ (L = 60)
+    // and HIDDEN+ 500 ‰ (K = 270) cut LIFT at 880, a run of its own
+    // clip, and leave HIDDEN+ (−50 to 550) wholly above the raised line
+    // (820), so it shares the plain alpha run before it.
     let add = |e: ElementDef| ElementDef {
         blend: Blend::Add,
         ..e
@@ -287,57 +309,62 @@ fn paint_and_markers_draw_in_list_order() {
         lanes_element(),
         paint(0, [160, -320, 544, 600], Follow::Cover),
         add(image(WHITE, [0, 0, 10, 10], Place::SCREEN)),
-        marker(LanePaint::Lift),
+        lift_paint(),
         paint(0, [160, 0, 544, 100], Follow::None),
-        marker(LanePaint::Hidden),
+        hidden_paint(),
         add(paint(0, [160, 100, 544, 100], Follow::None)),
     ];
-    let skin = Skin::new(def(
-        Some(source()),
-        elements,
-        paints(vec![cover_image(None)]),
-    ))
-    .unwrap();
+    let skin = Skin::new(def(Some(source()), elements, paints(three_paints()))).unwrap();
     let h = shown(skin, [200, 100, 500]);
     let parts = [COVER, WHITE, LIFT, HIDDEN];
     assert_eq!(
         order(&h, &parts),
         [COVER, WHITE, LIFT, COVER, HIDDEN, COVER]
     );
-    let blends: Vec<Blend> = h.batch.runs().iter().map(|r| r.key.blend).collect();
-    assert_eq!(blends, [Blend::Alpha, Blend::Add, Blend::Alpha, Blend::Add]);
-    // The markers work before the lanes too, reading this frame.
+    let runs: Vec<(Blend, Option<[f32; 4]>)> = h
+        .batch
+        .runs()
+        .iter()
+        .map(|r| (r.key.blend, r.clip_rect.map(|c| c.rect())))
+        .collect();
+    assert_eq!(
+        runs,
+        [
+            (Blend::Alpha, None),
+            (Blend::Add, None),
+            (Blend::Alpha, Some([160.0, 820.0, 544.0, 60.0])),
+            (Blend::Alpha, None),
+            (Blend::Add, None),
+        ]
+    );
+    // Before the lanes too, reading this frame.
     let before = vec![
-        marker(LanePaint::Hidden),
+        hidden_paint(),
         paint(0, [160, 0, 544, 100], Follow::None),
-        marker(LanePaint::Lift),
+        lift_paint(),
         lanes_element(),
     ];
-    let skin = Skin::new(def(Some(source()), before, paints(vec![cover_image(None)]))).unwrap();
+    let skin = Skin::new(def(Some(source()), before, paints(three_paints()))).unwrap();
     let h = shown(skin, [200, 100, 500]);
     assert_eq!(
         order(&h, &[NOTE, COVER, LIFT, HIDDEN])[..3],
         [HIDDEN, COVER, LIFT]
     );
-    assert_eq!(rects(&h, LIFT), [[160.0, 820.0, 544.0, 60.0]]);
+    // LIFT's whole rect, moved up by L, is drawn under its clip.
+    assert_eq!(rects(&h, LIFT), [[160.0, 820.0, 544.0, 200.0]]);
 }
 
 #[test]
-fn paint_keeps_its_own_clock_and_the_markers_the_lanes() {
+fn every_paint_keeps_its_own_clock() {
     let run = |lanes: ElementDef, p: ElementDef| {
-        let elements = vec![lanes, p];
-        let skin = Skin::new(def(
-            Some(source()),
-            elements,
-            paints(vec![cover_image(None)]),
-        ))
-        .unwrap();
+        let elements = vec![lanes, p, lift_paint(), hidden_paint()];
+        let skin = Skin::new(def(Some(source()), elements, paints(three_paints()))).unwrap();
         let h = shown(skin, [200, 100, 500]);
         [COVER, HIDDEN, LIFT, NOTE].map(|part| rects(&h, part).len())
     };
     let p = || paint(0, [160, 0, 544, 100], Follow::None);
-    // The lanes' timer off, or the lanes hidden: no notes and no markers,
-    // the paint on its own.
+    // The lanes' timer off, or the lanes hidden: no notes, every paint on
+    // its own.
     let off = ElementDef {
         timer: TimerRef::Builtin(timer::FULL_COMBO),
         ..lanes_element()
@@ -346,9 +373,9 @@ fn paint_keeps_its_own_clock_and_the_markers_the_lanes() {
         visible: Some(bool_program("false")),
         ..lanes_element()
     };
-    assert_eq!(run(off, p()), [1, 0, 0, 0]);
-    assert_eq!(run(hidden, p()), [1, 0, 0, 0]);
-    // The paint's timer off: the lanes and markers draw, the paint not.
+    assert_eq!(run(off, p()), [1, 1, 1, 0]);
+    assert_eq!(run(hidden, p()), [1, 1, 1, 0]);
+    // A paint's timer off: the lanes and the other paints draw.
     let late = ElementDef {
         timer: TimerRef::Builtin(timer::FULL_COMBO),
         ..p()
@@ -397,6 +424,7 @@ fn chosen_paint_keeps_each_entry_track_and_native_size() {
         cover_paints: vec![CoverPaintDef {
             image: CoverImage::Choice(0),
             slider_range: Some(800),
+            ..cover_image(None)
         }],
         ..WidgetDefs::default()
     };
@@ -432,136 +460,6 @@ fn chosen_paint_keeps_each_entry_track_and_native_size() {
 }
 
 #[test]
-fn markers_are_checked_at_load() {
-    let err = |elements: Vec<ElementDef>, lanes: Option<LanesDef>| {
-        let d = SkinDef {
-            elements,
-            ..def(lanes, Vec::new(), WidgetDefs::default())
-        };
-        match Skin::new(d) {
-            Err(LoadError::LanePaint(e)) => e,
-            other => panic!("{other:?}"),
-        }
-    };
-    let both = |extra: Vec<ElementDef>| {
-        let mut v = vec![lanes_element()];
-        v.extend(extra);
-        v
-    };
-    assert_eq!(
-        err(both(vec![marker(LanePaint::Hidden)]), Some(simple())),
-        LanePaintError::Missing {
-            part: LanePaint::Lift
-        }
-    );
-    assert_eq!(
-        err(
-            both(vec![
-                marker(LanePaint::Hidden),
-                marker(LanePaint::Lift),
-                marker(LanePaint::Hidden)
-            ]),
-            Some(simple())
-        ),
-        LanePaintError::Duplicate {
-            part: LanePaint::Hidden,
-            element: 3
-        }
-    );
-    let mut no_hidden = simple();
-    no_hidden.parts.hidden = None;
-    assert_eq!(
-        err(
-            both(vec![marker(LanePaint::Hidden), marker(LanePaint::Lift)]),
-            Some(no_hidden)
-        ),
-        LanePaintError::Absent {
-            part: LanePaint::Hidden,
-            element: 1
-        }
-    );
-    assert_eq!(
-        err(vec![marker(LanePaint::Lift)], None),
-        LanePaintError::Absent {
-            part: LanePaint::Lift,
-            element: 0
-        }
-    );
-    let canonical = || marker(LanePaint::Lift);
-    let mut moved = [None; 9];
-    moved[0] = Some(1);
-    for (what, odd) in [
-        (
-            "visible",
-            ElementDef {
-                visible: Some(bool_program("true")),
-                ..canonical()
-            },
-        ),
-        (
-            "blend",
-            ElementDef {
-                blend: Blend::Add,
-                ..canonical()
-            },
-        ),
-        (
-            "clip",
-            ElementDef {
-                clip: Some(ClipId(0)),
-                ..canonical()
-            },
-        ),
-        (
-            "timer",
-            ElementDef {
-                timer: TimerRef::Builtin(timer::PLAY),
-                ..canonical()
-            },
-        ),
-        (
-            "track",
-            ElementDef {
-                track: lanes_support::still(moved),
-                ..canonical()
-            },
-        ),
-        (
-            "region",
-            ElementDef::lane_paint(LanePaint::Lift, Region::Screen),
-        ),
-        (
-            "follow",
-            ElementDef {
-                place: Place {
-                    follow: Follow::Lift,
-                    ..canonical().place
-                },
-                ..canonical()
-            },
-        ),
-    ] {
-        assert_eq!(
-            err(both(vec![marker(LanePaint::Hidden), odd]), Some(simple())),
-            LanePaintError::Noncanonical { element: 2 },
-            "{what}"
-        );
-    }
-    // The canonical pair loads, before or after the lanes.
-    let ok = SkinDef {
-        elements: vec![
-            marker(LanePaint::Lift),
-            lanes_element(),
-            marker(LanePaint::Hidden),
-        ],
-        ..def(Some(simple()), Vec::new(), WidgetDefs::default())
-    };
-    assert!(Skin::new(ok).is_ok());
-    // A marker's track is the neutral one.
-    assert_eq!(marker(LanePaint::Lift).track, Track::neutral());
-}
-
-#[test]
 fn paints_are_checked_at_load() {
     let load =
         |elements: Vec<ElementDef>, widgets: WidgetDefs| Skin::new(def(None, elements, widgets));
@@ -574,7 +472,7 @@ fn paints_are_checked_at_load() {
     // An unreferenced definition is checked too.
     let bad_image = CoverPaintDef {
         image: CoverImage::Image(99),
-        slider_range: None,
+        ..cover_image(None)
     };
     assert_eq!(
         paint_err(load(Vec::new(), paints(vec![cover_image(None), bad_image]))),
@@ -582,10 +480,10 @@ fn paints_are_checked_at_load() {
     );
     let bad_choice = CoverPaintDef {
         image: CoverImage::Choice(0),
-        slider_range: None,
+        ..cover_image(None)
     };
     assert_eq!(
-        paint_err(load(Vec::new(), one(bad_choice))),
+        paint_err(load(Vec::new(), one(bad_choice.clone()))),
         (0, CoverPaintError::UnknownChoice)
     );
     let range = |r: u32| one(cover_image(Some(r)));
@@ -637,16 +535,22 @@ fn paints_are_checked_at_load() {
 }
 
 #[test]
-fn a_paint_is_one_quad_and_the_markers_none() {
+fn a_paint_is_one_quad_and_the_lanes_reserve_only_the_line() {
     let skin = skin(
         vec![
             paint(0, [0, 0, 10, 10], Follow::None),
             paint(0, [0, 0, 10, 10], Follow::Cover),
+            lift_paint(),
+            hidden_paint(),
         ],
-        vec![cover_image(Some(10))],
+        vec![
+            cover_image(Some(10)),
+            three_paints()[1].clone(),
+            three_paints()[2].clone(),
+        ],
     );
-    assert_eq!(LANE_RESERVED, 3);
-    assert_eq!(skin.quad_capacity(), 2 + LANE_QUADS + LANE_RESERVED);
+    assert_eq!(LANE_RESERVED, 1);
+    assert_eq!(skin.quad_capacity(), 4 + LANE_QUADS + LANE_RESERVED);
     // Without lanes a slider still moves by the view; a follower does not.
     let skin = Skin::new(def(
         None,
@@ -668,9 +572,9 @@ fn a_paint_is_one_quad_and_the_markers_none() {
 }
 
 #[test]
-fn markers_leave_the_variant_to_the_lanes() {
+fn the_lanes_leave_the_variant_to_the_lane_width() {
     // At 3840×2160 (scale 2) with the lanes at 50 %: the lanes are 1, not
-    // magnified; an unbound marker would be 2.
+    // magnified.
     let only_lanes = |lanes: ElementDef| {
         Skin::new(def(Some(simple()), vec![lanes], WidgetDefs::default())).unwrap()
     };
@@ -679,7 +583,7 @@ fn markers_leave_the_variant_to_the_lanes() {
     let skin = only_lanes(lanes_element());
     assert_eq!(skin.variant([3_840, 2_160], &half), Variant::Lo);
     assert_eq!(skin.variant([3_840, 2_160], &Layout::AUTHOR), Variant::Hi);
-    // Lanes never drawn: their markers are not either.
+    // Lanes never drawn do not count.
     let never = ElementDef {
         visible: Some(bool_program("false")),
         ..lanes_element()

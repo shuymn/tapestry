@@ -273,6 +273,37 @@ impl Drawn {
     pub fn rects(&mut self, ms: i64) -> Vec<[i32; 4]> {
         self.frame(ms, &[]).iter().map(|q| round(q.rect)).collect()
     }
+
+    /// The rects, rounded, of the frame at `ms`, each with its run's
+    /// inline clip rect, rounded, when one.
+    pub fn clipped(&mut self, ms: i64) -> Vec<([i32; 4], Option<[i32; 4]>)> {
+        self.frame(ms, &[]);
+        let mut out = Vec::new();
+        for r in self.batch.runs() {
+            for i in r.start..r.end {
+                let q = self.batch.quads()[i as usize];
+                out.push((round(q.rect), r.clip_rect.map(|c| round(c.rect()))));
+            }
+        }
+        out
+    }
+
+    /// The rects, rounded, of the frame at `ms`, each unturned quad cut
+    /// to its run's inline clip rect: what shows.
+    pub fn shown(&mut self, ms: i64) -> Vec<[i32; 4]> {
+        self.clipped(ms)
+            .into_iter()
+            .map(|(r, c)| match c {
+                None => r,
+                Some([cx, cy, cw, ch]) => {
+                    let [x, y, w, h] = r;
+                    let (l, t) = (x.max(cx), y.max(cy));
+                    let (rt, b) = ((x + w).min(cx + cw), (y + h).min(cy + ch));
+                    [l, t, (rt - l).max(0), (b - t).max(0)]
+                }
+            })
+            .collect()
+    }
 }
 
 /// A float rect as whole pixels.

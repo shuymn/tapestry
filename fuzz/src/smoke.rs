@@ -282,6 +282,7 @@ fn skin_json_seeds_resolve_or_fail_as_built() {
             "bar_groups",
             "paints",
             "followers",
+            "trims",
             "judge",
             "gauge",
             "rates",
@@ -469,20 +470,22 @@ fn skin_import_seeds_import_and_draw_as_built() {
                 // At 500 ms the eleven notes from 1 s to 1.1 s are on
                 // screen, the last with its lower edge on the region's
                 // top. SUDDEN+'s paint is drawn whole in every frame;
-                // LIFT and HIDDEN+ at 0 are not drawn.
+                // LIFT's and HIDDEN+'s at 0 lie at their lines and are not
+                // drawn.
                 assert_eq!(drawn, [1, 1, 12, 1], "{name}");
                 let paint = i
                     .skin
                     .quad_capacity()
                     .checked_sub(skin_model::LANE_QUADS + skin_model::LANE_RESERVED);
-                assert_eq!(paint, Some(1), "{name}");
+                assert_eq!(paint, Some(3), "{name}");
             }
             "bar_groups" => {
                 use skin_beatoraja::{DeviationId, LaneApprox};
                 // Four groups charged with their keys, three kept, each
-                // noted once; the follower and SUDDEN+'s paint followed
-                // once each; the undefined image dropped; the image's
-                // `len` and `ref` unused.
+                // noted once; the follower and SUDDEN+'s paint followed,
+                // and LIFT's and HIDDEN+'s paint moved, once each; the
+                // undefined image dropped; the image's `len` and `ref`
+                // unused.
                 assert_eq!(u.bar_groups, 4, "{name}");
                 assert_eq!(i.skin.bar_group_count(), 3, "{name}");
                 assert_eq!((u.elements, u.keys, u.images), (4, 8, 6), "{name}");
@@ -490,7 +493,7 @@ fn skin_import_seeds_import_and_draw_as_built() {
                 let k = kinds(&i);
                 let count = |n: NoteKind| k.iter().filter(|&&m| m == n).count();
                 assert_eq!(count(d9(LaneApprox::BarLine)), 3, "{name}: {k:?}");
-                assert_eq!(count(d9(LaneApprox::CoverMotion)), 2, "{name}: {k:?}");
+                assert_eq!(count(d9(LaneApprox::CoverMotion)), 4, "{name}: {k:?}");
                 assert_eq!(count(NoteKind::UndefinedObject), 1, "{name}: {k:?}");
                 assert!(
                     !k.iter()
@@ -501,11 +504,11 @@ fn skin_import_seeds_import_and_draw_as_built() {
                 assert_eq!(drawn, [1, 1, 12, 1], "{name}");
             }
             "paints" => {
-                // The lanes, LIFT's and HIDDEN+'s markers and four paints.
+                // The lanes, LIFT's and HIDDEN+'s paint and four paints.
                 assert_eq!(u.elements, 7, "{name}");
                 assert_eq!(
                     i.skin.quad_capacity(),
-                    4 + skin_model::LANE_QUADS + skin_model::LANE_RESERVED,
+                    6 + skin_model::LANE_QUADS + skin_model::LANE_RESERVED,
                     "{name}"
                 );
                 // Each paint in every frame beside the notes on screen.
@@ -514,13 +517,14 @@ fn skin_import_seeds_import_and_draw_as_built() {
             "followers" => {
                 use skin_beatoraja::{DeviationId, LaneApprox};
                 // SUDDEN+'s paint, the image, the number and the grade
-                // follow, each noted once; the combo and HIDDEN+ take their
-                // offsets silently.
+                // follow, and LIFT's and HIDDEN+'s paint move, each noted
+                // once; the combo takes its offsets silently, and HIDDEN+
+                // its repeated ones.
                 let motion = NoteKind::Deviation(DeviationId::D9(LaneApprox::CoverMotion));
                 let k = kinds(&i);
                 assert_eq!(
                     k.iter().filter(|&&n| n == motion).count(),
-                    4,
+                    6,
                     "{name}: {k:?}"
                 );
                 assert!(
@@ -531,6 +535,26 @@ fn skin_import_seeds_import_and_draw_as_built() {
                 // The lanes' frames, then the image, the number's two
                 // digits, the grade and its combo of 1.
                 assert_eq!(drawn, [1 + 5, 1 + 5, 12 + 5, 1 + 5], "{name}");
+            }
+            "trims" => {
+                use skin_beatoraja::{DeviationId, LaneApprox};
+                // The lanes, SUDDEN+'s paint and eight of LIFT's and
+                // HIDDEN+'s, each moving with the covers; twelve keys and
+                // one for the gate track; the fading HIDDEN+ noted.
+                assert_eq!((u.elements, u.keys), (10, 13), "{name}");
+                assert_eq!(
+                    i.skin.quad_capacity(),
+                    9 + skin_model::LANE_QUADS + skin_model::LANE_RESERVED,
+                    "{name}"
+                );
+                let d9 = |a| NoteKind::Deviation(DeviationId::D9(a));
+                let k = kinds(&i);
+                let count = |n: NoteKind| k.iter().filter(|&&m| m == n).count();
+                assert_eq!(count(d9(LaneApprox::HiddenDisable)), 1, "{name}: {k:?}");
+                assert_eq!(count(d9(LaneApprox::CoverMotion)), 9, "{name}: {k:?}");
+                // At rest SUDDEN+'s paint and three trimmed paints draw;
+                // the rest lie at or past their lines.
+                assert_eq!(drawn, [4, 4, 15, 4], "{name}");
             }
             "judge" => {
                 // Seven grades, combos of slots 0, 1, 2 and 6 (slots 3-5

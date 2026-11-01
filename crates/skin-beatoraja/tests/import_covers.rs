@@ -22,7 +22,7 @@ use skin_beatoraja::{ImportLimit, Object, Usage};
 use skin_model::Blend;
 use skin_model::MAX_IMAGES;
 
-/// The rects at 1,000 ms over a tap on lane 1 at `tap` ms, with the
+/// The rects shown at 1,000 ms over a tap on lane 1 at `tap` ms, with the
 /// covers at `cover` and `lift` ‰.
 fn rects(l: &Loaded, tap: i64, cover: u16, lift: u16) -> Vec<[i32; 4]> {
     let chart = ChartBuilder::new(150_000)
@@ -32,7 +32,7 @@ fn rects(l: &Loaded, tap: i64, cover: u16, lift: u16) -> Vec<[i32; 4]> {
     let mut d = Drawn::over(l.ok().skin.clone(), &chart);
     d.view.cover = cover;
     d.view.lift = lift;
-    d.rects(1_000)
+    d.shown(1_000)
 }
 
 #[track_caller]
@@ -41,11 +41,6 @@ fn critical(l: Loaded) -> (CriticalPart, NoteKind) {
         ImportError::Critical { part, why, .. } => (part, why),
         e => panic!("{e:?}"),
     }
-}
-
-#[track_caller]
-fn refused(l: Loaded, part: CriticalPart, field: &'static str) {
-    assert_eq!(critical(l), (part, NoteKind::UnsupportedField { field }));
 }
 
 /// An offset-4 image destination of `deco` with `fields` and `keys`.
@@ -570,8 +565,8 @@ fn sudden_plus_paint_draws_as_authored() {
 
 #[test]
 fn the_lanes_blend_ignores_the_outer_blend() {
-    // The notes and LIFT draw in the lanes' run, SUDDEN+'s paint in its
-    // own alpha-blended one: an additive note destination would leave a
+    // The notes and SUDDEN+'s paint draw in alpha-blended runs, LIFT's in
+    // its own under its clip: an additive note destination would leave a
     // black cover see-through.
     for blend in [2, 3] {
         let notes = format!(
@@ -591,8 +586,17 @@ fn the_lanes_blend_ignores_the_outer_blend() {
         d.view.cover = 500;
         d.view.lift = 200;
         assert_eq!(d.frame(1_000, &[]).len(), 3, "{blend}");
-        let keys: Vec<_> = d.batch.runs().iter().map(|r| r.key.blend).collect();
-        assert_eq!(keys, [Blend::Alpha], "{blend}");
+        let keys: Vec<_> = d
+            .batch
+            .runs()
+            .iter()
+            .map(|r| (r.key.blend, r.clip_rect.is_some()))
+            .collect();
+        assert_eq!(
+            keys,
+            [(Blend::Alpha, false), (Blend::Alpha, true)],
+            "{blend}"
+        );
     }
 }
 
@@ -625,50 +629,45 @@ fn the_covers_are_drawn_where_their_destinations_stand() {
 }
 
 #[test]
-fn only_an_exact_lift_maps() {
-    refused(
-        with(
-            &lift_object(r#""disapearLine": -1"#).replace(r#""disapearLine": 200, "#, ""),
-            &[&lift("")],
-        ),
-        CriticalPart::Lift,
-        "disapearLine",
+fn every_lift_destination_paints() {
+    let lifted = |l: &Loaded| rects(l, 5_000, 0, 200);
+    // Without a line, whole; LIFT 200 ‰ raises it 120 px.
+    let unlined = lift_object("").replace(
+        r#""disapearLine": 200"#,
+        r#""isDisapearLineLinkLift": false"#,
     );
-    for extra in [
-        r#""disapearLine": 201"#,
-        r#""isDisapearLineLinkLift": true"#,
-    ] {
-        let obj = lift_object(extra).replace(r#""disapearLine": 200, "#, "");
-        let obj = if extra.contains("Link") {
-            lift_object(extra)
-        } else {
-            obj
-        };
-        refused(with(&obj, &[&lift("")]), CriticalPart::Lift, "disapearLine");
-    }
+    assert_eq!(lifted(&with(&unlined, &[&lift("")])), [[20, 760, 430, 200]]);
+    // A negative line is none.
+    let negative = lift_object("").replace("200", "-5");
     assert_eq!(
-        critical(with(&lift_object(""), &[&lift(r#""offset": 5"#)])),
-        (CriticalPart::Lift, NoteKind::RuntimeOffset(5))
+        lifted(&with(&negative, &[&lift("")])),
+        [[20, 760, 430, 200]]
     );
-    refused(
-        with(
-            &lift_object(""),
-            &[&lift("").replace(r#""h": 200"#, r#""h": 199"#)],
-        ),
-        CriticalPart::Lift,
-        "dst",
+    // A fixed line at 879 cuts it there.
+    let higher = lift_object("").replace("200", "201");
+    assert_eq!(lifted(&with(&higher, &[&lift("")])), [[20, 760, 430, 119]]);
+    // A line rising with the lift reaches the raised upper edge: nothing.
+    let linked = lift_object(r#""isDisapearLineLinkLift": true"#);
+    assert!(lifted(&with(&linked, &[&lift("")])).is_empty());
+    // Any height: 199 high from 881, raised to 761.
+    let short = lift("").replace(r#""h": 200"#, r#""h": 199"#);
+    assert_eq!(
+        lifted(&with(&lift_object(""), &[&short])),
+        [[20, 761, 430, 119]]
     );
-    // Before the notes.
-    refused(
-        import_body(&body(
-            "",
-            &format!("{}, {}", note(""), lift_object("")),
-            &[&lift(""), NOTES],
-        )),
-        CriticalPart::Lift,
-        "liftCover",
+    // Before the notes, twice, and another object besides.
+    let two = lift_object("").replace(
+        r#""disapearLine": 200}]"#,
+        r#""disapearLine": 200}, {"id": "lift2", "src": "a", "x": 0, "y": 0, "w": 8, "h": 8, "disapearLine": 200}]"#,
     );
-    // A user offset on it.
+    let second = lift("").replace("liftc", "lift2");
+    let l = import_body(&body(
+        "",
+        &format!("{}, {two}", note("")),
+        &[&lift(""), NOTES, &lift(""), &second],
+    ));
+    assert_eq!(lifted(&l).len(), 3);
+    // A user offset moves it as any image's.
     let header = r#""offset": [{"name": "y", "id": 40, "y": true}]"#;
     let objects = format!("{header}, {}, {}", note(""), lift_object(""));
     let l = import_config(
@@ -679,28 +678,17 @@ fn only_an_exact_lift_maps() {
             c.offsets.insert(
                 40,
                 OffsetValue {
-                    y: 1,
+                    y: 10,
                     ..OffsetValue::default()
                 },
             );
         },
     );
-    refused(l, CriticalPart::Lift, "dst");
-    // A second LIFT: the same destination again, or another object.
-    refused(
-        with(&lift_object(""), &[&lift(""), &lift("")]),
-        CriticalPart::Lift,
-        "liftCover",
-    );
-    let two = lift_object("").replace(
-        r#""disapearLine": 200}]"#,
-        r#""disapearLine": 200}, {"id": "lift2", "src": "a", "x": 0, "y": 0, "w": 8, "h": 8, "disapearLine": 200}]"#,
-    );
-    let second = lift("").replace("liftc", "lift2");
-    refused(
-        with(&two, &[&lift(""), &second]),
-        CriticalPart::Lift,
-        "liftCover",
+    assert_eq!(lifted(&l), [[20, 750, 430, 130]]);
+    // Offset 5 is HIDDEN+'s alone.
+    assert_eq!(
+        critical(with(&lift_object(""), &[&lift(r#""offset": 5"#)])),
+        (CriticalPart::Lift, NoteKind::RuntimeOffset(5))
     );
 }
 
@@ -839,47 +827,50 @@ fn a_cropped_cover_is_its_own_image_of_the_same_file() {
 
 #[test]
 fn other_stretches_refuse_the_covers() {
-    // SUDDEN+'s paint refuses the other trimming stretches; LIFT every
-    // stretch that changes its frame.
+    // SUDDEN+'s and LIFT's paint refuse the other trimming stretches and
+    // map every other.
     for mode in [1, 2, 3, 6, 7, 8, 9, 10] {
         let want = NoteKind::Stretch(mode);
         let paint = tall(WIDE, &[&stretched("cw", mode)]);
+        let l = with(&lift_object(""), &[&lift(&format!(r#""stretch": {mode}"#))]);
         if matches!(mode, 3 | 7 | 10) {
             assert_eq!(critical(paint), (CriticalPart::Cover, want), "{mode}");
+            assert_eq!(critical(l), (CriticalPart::Lift, want), "{mode}");
         } else {
             paint.ok();
+            l.ok();
         }
-        let l = with(&lift_object(""), &[&lift(&format!(r#""stretch": {mode}"#))]);
-        assert_eq!(critical(l), (CriticalPart::Lift, want), "{mode}");
     }
     // Unknown modes are identity.
     tall(WIDE, &[&stretched("cw", 11)]).ok();
 }
 
 #[test]
-fn lift_fits_its_width_only_in_place() {
-    // The source clips LIFT to its destination before stretching it: a
-    // fit that changes the 200 px height refuses. A 16×16 frame over
-    // 430 px grows to 430; a 43×10 frame shrinks to 100.
+fn a_fitted_lift_is_gated_by_its_destination() {
+    // The source gates and clips LIFT by its destination before
+    // stretching it: at LIFT 200 ‰ the destination [880, 1080] rises to
+    // [760, 960] and is cut at 880. A 16×16 frame over 430 px grows to
+    // 430 tall, a 43×10 one shrinks to 100: either is drawn whole, under
+    // that clip.
     let lift_mode = |mode: i32| lift(&format!(r#""stretch": {mode}"#));
     let small = lift_object("").replace(r#""w": 16, "h": 16"#, r#""w": 43, "h": 10"#);
-    for (object, mode) in [(lift_object(""), 4), (small.clone(), 4), (small, 5)] {
-        let l = with(&object, &[&lift_mode(mode)]);
-        assert_eq!(
-            critical(l),
-            (CriticalPart::Lift, NoteKind::Stretch(mode)),
-            "{object} {mode}"
-        );
-    }
+    let at = |object: &str, mode: i32| {
+        let l = with(object, &[&lift_mode(mode)]);
+        let chart = ChartBuilder::new(150_000).build().unwrap();
+        let mut d = Drawn::over(l.ok().skin.clone(), &chart);
+        d.view.lift = 200;
+        d.clipped(1_000)
+    };
+    let clip = Some([20, 760, 430, 120]);
+    assert_eq!(at(&lift_object(""), 4), [([20, 645, 430, 430], clip)]);
+    assert_eq!(at(&small, 4), [([20, 810, 430, 100], clip)]);
+    assert_eq!(at(&small, 5), [([20, 810, 430, 100], clip)]);
     // Stretch 5 crops the 16×16 frame's rows and keeps the destination.
-    let l = with(&lift_object(""), &[&lift_mode(5)]);
-    assert_eq!(rects(&l, 5_000, 0, 200), [[20, 760, 430, 120]]);
-    // A 43×20 frame fits 430×200 exactly and maps.
+    assert_eq!(at(&lift_object(""), 5), [([20, 760, 430, 200], clip)]);
+    // A 43×20 frame fits 430×200 exactly.
     let exact = lift_object("").replace(r#""w": 16, "h": 16"#, r#""w": 43, "h": 20"#);
     for mode in [4, 5] {
-        let l = with(&exact, &[&lift(&format!(r#""stretch": {mode}"#))]);
-        // LIFT 200 ‰ raises its upper edge 120 px to 760.
-        assert_eq!(rects(&l, 5_000, 0, 200), [[20, 760, 430, 120]], "{mode}");
+        assert_eq!(at(&exact, mode), [([20, 760, 430, 200], clip)], "{mode}");
     }
 }
 

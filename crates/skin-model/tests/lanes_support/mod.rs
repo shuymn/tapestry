@@ -10,16 +10,16 @@ use std::sync::OnceLock;
 use bms_model::{Lane, TimeUs};
 use image::{ImageFormat, Rgba, RgbaImage};
 use skin_model::{
-    Anchor, BarGroupDef, Bind, Blend, CoverImage, CoverPaintDef, Ease, ElementDef, End, FileDef,
-    Filter, Fit, Follow, HiddenTrim, ImageDef, KeyDef, LanePaint, LaneParts, LaneStyle, LanesDef,
-    LoadError, Place, Quad, Region, RegionDef, Sheet, Side, Skin, SkinDef, Source, SourceLanes,
-    TimerRef, Track, WidgetDefs, timer,
+    Anchor, BarGroupDef, Bind, Blend, CoverImage, CoverMotion, CoverPaintDef, CoverTrim, Ease,
+    ElementDef, End, FileDef, Filter, Fit, Follow, ImageDef, KeyDef, LaneParts, LaneStyle,
+    LanesDef, LoadError, Place, Quad, Region, RegionDef, Sheet, Side, Skin, SkinDef, Source,
+    SourceLanes, TimerRef, Track, WidgetDefs, timer,
 };
 
 use crate::play_support::{Harness, REGIONS};
 
 /// The images, by index: a white texel for plain elements, then one per
-/// lane part and SUDDEN+'s paint, each its own size so none shares a
+/// lane part and the covers' paints, each its own size so none shares a
 /// packed frame.
 pub const WHITE: u32 = 0;
 pub const NOTE: u32 = 1;
@@ -114,8 +114,7 @@ pub fn bar_group(y: i32, h: i32) -> BarGroupDef {
 
 /// The simple skin's lanes: the scratch at 160 (96 wide), the keys 64
 /// wide from 256, top 80, line 880, bottom 960; notes 16, mines 8 and the
-/// line 6 tall, a bar group 2 tall centred on the line ([`bar_group`]);
-/// HIDDEN+ 800 tall from the line, trimmed at the line as it rises.
+/// line 6 tall, a bar group 2 tall centred on the line ([`bar_group`]).
 pub fn simple() -> LanesDef {
     let mut lanes = [[160, 96]; 8];
     for (k, lane) in lanes.iter_mut().enumerate().skip(1) {
@@ -128,11 +127,6 @@ pub fn simple() -> LanesDef {
         top: 80,
         line: 880,
         bottom: 960,
-        lift_at: 880.0,
-        lift_h: 880.0,
-        hidden_at: 880.0,
-        hidden_h: 800.0,
-        hidden_trim: HiddenTrim::Lift(880.0),
         note_h: 16,
         mine_h: 8,
         line_h: 6,
@@ -144,8 +138,6 @@ pub fn simple() -> LanesDef {
             body_off: [BODY_OFF; 8],
             mine: [MINE; 8],
             line: Some(LINE),
-            lift: Some(LIFT),
-            hidden: Some(HIDDEN),
         },
         bar_groups: vec![bar_group(879, 2)],
     }
@@ -155,8 +147,7 @@ pub fn simple() -> LanesDef {
 /// skin's: the source region's lower edge at 880 and 600 high, notes and
 /// mines 20 high; `top` half a note above the region (270), `line` a
 /// note's centre at its judgment time (870), a bar group 2 tall centred
-/// there, LIFT 200 high at its bottom and HIDDEN+ 600 high from its
-/// bottom, trimmed there as it rises with the lift.
+/// there.
 pub fn source() -> LanesDef {
     LanesDef {
         style: LaneStyle::Source(SourceLanes {
@@ -168,11 +159,6 @@ pub fn source() -> LanesDef {
         top: 270,
         line: 870,
         bottom: 880,
-        lift_at: 880.0,
-        lift_h: 200.0,
-        hidden_at: 880.0,
-        hidden_h: 600.0,
-        hidden_trim: HiddenTrim::Lift(880.0),
         note_h: 20,
         mine_h: 20,
         bar_groups: vec![bar_group(869, 2)],
@@ -255,37 +241,8 @@ pub fn lanes_element() -> ElementDef {
     }
 }
 
-/// A marker of the lanes' `part` in the playfield.
-pub fn marker(part: LanePaint) -> ElementDef {
-    ElementDef::lane_paint(part, Region::Playfield)
-}
-
-/// `elements` with the markers of `lanes`' HIDDEN+ and LIFT, in that
-/// order, after them (so the authored elements keep their indices),
-/// unless some marker is there.
-pub fn with_markers(lanes: Option<&LanesDef>, mut elements: Vec<ElementDef>) -> Vec<ElementDef> {
-    let marked = elements
-        .iter()
-        .any(|e| matches!(e.source, Source::LanePaint(_)));
-    let region = elements
-        .iter()
-        .find(|e| e.source == Source::Lanes)
-        .map(|e| e.place.region);
-    if let (Some(l), Some(region), false) = (lanes, region, marked) {
-        for (part, present) in [
-            (LanePaint::Hidden, l.parts.hidden.is_some()),
-            (LanePaint::Lift, l.parts.lift.is_some()),
-        ] {
-            if present {
-                elements.push(ElementDef::lane_paint(part, region));
-            }
-        }
-    }
-    elements
-}
-
 /// An adapted skin over [`sheet`] with `regions`, `lanes`, `elements`
-/// (and the lanes' markers, [`with_markers`]) and `widgets`.
+/// and `widgets`.
 pub fn skin_with_widgets(
     regions: [RegionDef; Region::COUNT],
     lanes: Option<LanesDef>,
@@ -297,15 +254,14 @@ pub fn skin_with_widgets(
         regions,
         whens: Vec::new(),
         sheet: sheet(),
-        elements: with_markers(lanes.as_ref(), elements),
+        elements,
         lanes,
         widgets,
         bomb_up_to: Some(skin_model::Grade::Bad),
     })
 }
 
-/// An adapted skin over [`sheet`] with `regions`, `lanes` and `elements`,
-/// and the lanes' markers ([`with_markers`]).
+/// An adapted skin over [`sheet`] with `regions`, `lanes` and `elements`.
 pub fn skin_with(
     regions: [RegionDef; Region::COUNT],
     lanes: Option<LanesDef>,
@@ -314,8 +270,8 @@ pub fn skin_with(
     skin_with_widgets(regions, lanes, elements, WidgetDefs::default())
 }
 
-/// A SUDDEN+ paint element on `ready` drawing paint `index` over `r` in
-/// the playfield, following `follow`.
+/// A cover paint element on `ready` drawing paint `index` over `r` in the
+/// playfield, following `follow`.
 pub fn paint(index: u32, r: [i32; 4], follow: Follow) -> ElementDef {
     ElementDef {
         source: Source::CoverPaint(index),
@@ -337,6 +293,21 @@ pub fn cover_image(range: Option<u32>) -> CoverPaintDef {
     CoverPaintDef {
         image: CoverImage::Image(COVER),
         slider_range: range,
+        motion: CoverMotion::None,
+        trim: CoverTrim::None,
+        gate_track: None,
+    }
+}
+
+/// The paint of `image` moving with `motion`, trimmed by `trim`, gated by
+/// its paint track.
+pub fn moving(image: u32, motion: CoverMotion, trim: CoverTrim) -> CoverPaintDef {
+    CoverPaintDef {
+        image: CoverImage::Image(image),
+        slider_range: None,
+        motion,
+        trim,
+        gate_track: None,
     }
 }
 

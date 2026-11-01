@@ -26,7 +26,8 @@ use skin_beatoraja::limits::{
     MAX_OPTION_ITEMS, MAX_OPTIONS,
 };
 use skin_beatoraja::{
-    Config, Header, ImportError, Imported, InputLimit, Note, Report, import, read_header,
+    Config, Header, ImportError, ImportLimit, Imported, InputLimit, Note, Report, import,
+    read_header,
 };
 use skin_model::{
     ElementDef, ImageChoiceDef, ImageChoicePart, ImageDef, KeyDef, MAX_BAR_GROUPS, MAX_ELEMENTS,
@@ -527,12 +528,12 @@ fn check_f8a(_: &Header, i: Imported) {
     );
 }
 
-/// F8b's paints: every element but the lanes and their two markers.
+/// F8b's paints: every element but the lanes, LIFT and HIDDEN+.
 const PAINTS: usize = MAX_ELEMENTS - 3;
 
 /// F8b: [`PAINTS`] SUDDEN+ paints over the lanes, each a four-entry image
 /// set over four one-frame images of one file chosen by the gauge's
-/// percent, and the lanes with LIFT and HIDDEN+.
+/// percent, after the lanes, LIFT's paint and HIDDEN+'s.
 fn f8b(root: &Path) {
     use common::lanes::{body, hidden, hidden_object, lift, lift_object, note};
     png(root, "a.png", 64, 64);
@@ -577,7 +578,7 @@ fn check_f8b(_: &Header, i: Imported) {
     // Each paint charges its own selector.
     let ops = i.skin.ops().total();
     assert_eq!(ops, PAINTS, "{ops}");
-    // Dense notes on every lane, both legacy parts and every paint.
+    // Dense notes on every lane, LIFT's and HIDDEN+'s paint and every paint.
     let mut chart = bms_model::ChartBuilder::new(150_000);
     for t in 0..2_000 {
         for lane in 0..8 {
@@ -614,7 +615,7 @@ fn check_f8b(_: &Header, i: Imported) {
 /// F5's judges: 5,127 with a 2-digit combo and one with a 1-digit combo.
 const JUDGES: usize = 5_128;
 /// Judges whose grade has 11 keys; the rest have 10.
-const ELEVEN_KEYS: usize = 3_992;
+const ELEVEN_KEYS: usize = 3_989;
 /// Judges whose grade has the 7-op predicate; the rest the 17-op one.
 const SEVEN_OPS: usize = 2_165;
 /// The grades' offsets in turn: none, LIFT, SUDDEN+, both repeated.
@@ -635,7 +636,8 @@ const F5_GROUPS: &str = r#"
 
 /// F5: the play objects at the key, op and widget quad caps. Lanes of 48
 /// distinct part images with three bar line groups ([`F5_GROUPS`]),
-/// SUDDEN+, LIFT and HIDDEN+; a 36-node
+/// SUDDEN+'s paint, LIFT's and HIDDEN+'s on two keys each on their own
+/// timers, and a second LIFT of one key; a 36-node
 /// gauge of 1,000 flickering parts (1,001 quads); 5,128 judges, each one
 /// grade of 10 or 11 timed keys under a 7- or 17-op predicate and a combo
 /// of 2 digits (3 quads), one of 1 digit (2 quads).
@@ -707,8 +709,9 @@ fn f5(root: &Path) {
             r#"{"id": "notes", "dst": [{"w": 0, "h": 0}]}"#.to_owned(),
             r#"{"id": "cv", "offset": 4, "dst": [{"x": 20, "y": 800, "w": 430, "h": 600}]}"#
                 .to_owned(),
-            r#"{"id": "lc", "dst": [{"x": 20, "y": 0, "w": 430, "h": 200}]}"#.to_owned(),
-            r#"{"id": "hid", "dst": [{"x": 20, "y": -400, "w": 430, "h": 600}]}"#.to_owned(),
+            r#"{"id": "lc", "timer": 40, "dst": [{"time": 0, "x": 20, "y": 0, "w": 430, "h": 200}, {"time": 2000}]}"#.to_owned(),
+            r#"{"id": "hid", "timer": 41, "dst": [{"time": 0, "x": 20, "y": -400, "w": 430, "h": 600}, {"time": 2000}]}"#.to_owned(),
+            r#"{"id": "lc2", "dst": [{"x": 20, "y": 50, "w": 430, "h": 100}]}"#.to_owned(),
             r#"{"id": "gg", "offset": 3, "dst": [{"x": 600, "y": 100, "w": 1000, "h": 10}]}"#
                 .to_owned(),
         ]
@@ -725,7 +728,9 @@ fn f5(root: &Path) {
                  {{"id": "v1", "src": "a", "x": 0, "y": 200, "w": 60, "h": 6, "divx": 10, "digit": 1}}],
                "note": {note},
                "liftCover": [{{"id": "lc", "src": "a", "x": 0, "y": 220, "w": 8, "h": 8,
-                               "disapearLine": 200}}],
+                               "disapearLine": 200}},
+                             {{"id": "lc2", "src": "a", "x": 8, "y": 220, "w": 8, "h": 8,
+                               "disapearLine": 100, "isDisapearLineLinkLift": true}}],
                "hiddenCover": [{{"id": "hid", "src": "a", "x": 0, "y": 240, "w": 8, "h": 8,
                                  "disapearLine": 200}}],
                "gauge": {{"id": "gg", "nodes": [{nodes}], "parts": 1000, "type": 3, "cycle": 100}},
@@ -759,13 +764,14 @@ fn check_f5(_: &Header, i: Imported) {
     assert_eq!(u.keys, as_u32(MAX_SKIN_KEYS));
     assert_eq!(u.ops, as_u32(MAX_SKIN_OPS));
     assert_eq!(u.widget_quads, MAX_WIDGET_QUADS);
-    assert_eq!(u.elements, as_u32(JUDGES) + 5);
+    assert_eq!(u.elements, as_u32(JUDGES) + 6);
     assert!(i.scratch.is_some());
-    // One image element, SUDDEN+'s paint: the widgets' worst cases, its
-    // quad and the lanes' budget.
+    // Four image elements, the covers' paint: the widgets' worst cases,
+    // their quads and the lanes' budget with the judgment line.
+    assert_eq!(skin_model::LANE_RESERVED, 1);
     assert_eq!(
         i.skin.quad_capacity(),
-        MAX_WIDGET_QUADS + 1 + skin_model::LANE_QUADS + skin_model::LANE_RESERVED
+        MAX_WIDGET_QUADS + 4 + skin_model::LANE_QUADS + skin_model::LANE_RESERVED
     );
     // The snapshot: a PERFECT with combo 12, the gauge full, SUDDEN+ at
     // 300 ‰, LIFT at 100 ‰ and HIDDEN+ at 500 ‰, no note on screen, two
@@ -790,7 +796,7 @@ fn check_f5(_: &Header, i: Imported) {
     let q = d.frame(1_000, &[judged(1_000, Judgment::Perfect, 12)]);
     // Each emission by its drawn size: every judge's 80×20 grade, the
     // 6×6 cells of "1" and "2" for each but the last, whose one-digit
-    // combo draws "2" alone; SUDDEN+, LIFT and HIDDEN+ over the 430 px
+    // combo draws "2" alone; the four covers' paint over the 430 px
     // lanes; the gauge's 1,000 one-pixel segments, and its tip while the
     // flicker shows it.
     let mut by_size = std::collections::BTreeMap::<[i32; 2], usize>::new();
@@ -806,10 +812,12 @@ fn check_f5(_: &Header, i: Imported) {
         .filter(|(s, _)| s[0] == 430)
         .map(|(_, n)| n)
         .sum();
-    assert_eq!(covers, 3, "{by_size:?}");
+    assert_eq!(covers, 4, "{by_size:?}");
     // In destination order: SUDDEN+'s paint whole, 162 below its
     // destination's −320, every row of its square 8×8 cell (the atlas
-    // pages are square); then LIFT and HIDDEN+, cut to the lanes.
+    // pages are square); then LIFT's raised 60 and cut at 880, HIDDEN+'s
+    // raised 60 + 270 and cut at its line raised to 820, and the second
+    // LIFT's raised 60 and cut at its linked line, 980 raised to 920.
     let lane_wide: Vec<(&skin_model::Quad, [i32; 4])> = q
         .iter()
         .map(|quad| (quad, common::play::round(quad.rect)))
@@ -820,10 +828,33 @@ fn check_f5(_: &Header, i: Imported) {
         rects,
         [
             [20, -158, 430, 600],
-            [20, 820, 430, 60],
-            [20, 550, 430, 270]
+            [20, 820, 430, 200],
+            [20, 550, 430, 600],
+            [20, 870, 430, 100]
         ],
         "{rects:?}"
+    );
+    let clips: Vec<Option<[i32; 4]>> = d
+        .batch
+        .runs()
+        .iter()
+        .flat_map(|r| (r.start..r.end).map(move |i| (i, r)))
+        .filter(|&(i, _)| common::play::round(d.batch.quads()[i as usize].rect)[2] == 430)
+        .map(|(_, r)| r.clip_rect.map(|c| common::play::round(c.rect())))
+        .collect();
+    assert_eq!(
+        clips,
+        [
+            None,
+            Some([20, 820, 430, 60]),
+            Some([20, 550, 430, 270]),
+            Some([20, 870, 430, 50])
+        ]
+    );
+    assert!(
+        lane_wide
+            .iter()
+            .all(|(q, _)| q.color == [1.0; 4] && q.angle == 0.0)
     );
     let [u0, v0, u1, v1] = lane_wide[0].0.uv;
     assert!(
@@ -862,7 +893,7 @@ fn check_f5(_: &Header, i: Imported) {
     assert_ne!(shown[0].2, shown[1].2);
     assert_eq!(
         q.len(),
-        JUDGES + 2 * JUDGES - 1 + 3 + gauge + 4,
+        JUDGES + 2 * JUDGES - 1 + 4 + gauge + 4,
         "{by_size:?}"
     );
     // Each follower moves once: LIFT at 100 ‰ of the 600 px lane lifts
@@ -904,6 +935,149 @@ fn check_f5(_: &Header, i: Imported) {
         [([21, 878, 428, 2], grey), ([100, 876, 50, 6], [1.0; 4])]
     );
     assert_ne!(shown[0].2, shown[1].2);
+}
+
+/// F10's LIFT destinations: every element but the lanes.
+const LIFTS: usize = MAX_ELEMENTS - 1;
+
+/// How F10 is varied past its caps.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum F10 {
+    /// At the caps.
+    Caps,
+    /// One destination more.
+    OneMore,
+    /// The last destination with two keys more, trimmed: its gate's two
+    /// more pass the key cap.
+    GateKeys,
+    /// The same untrimmed: no gate, within the key cap.
+    Untrimmed,
+}
+
+/// The `i`th F10 destination's y (skin pixels, y up): its 100 px
+/// destination's upper edge between 783 and 879 (y down), crossed by
+/// the line at 880 at every lift of 0.
+fn f10_y(i: usize) -> usize {
+    101 + i % 97
+}
+
+/// F10: the lanes and [`LIFTS`] destinations of one LIFT record, each of
+/// two keys on the play timer fitting its 16×16 frame to 430 px wide
+/// (430 tall) over its 430×100 destination, trimmed at the lanes' bottom:
+/// two paint keys and two gate keys each, 65,533 keys in all, every clip
+/// its own.
+fn f10(root: &Path, variant: F10) {
+    use common::lanes::{NOTES, body, note};
+    png(root, "a.png", 64, 64);
+    let objects = format!(
+        r#"{},
+           "liftCover": [{{"id": "lc", "src": "a", "x": 16, "y": 24, "w": 16, "h": 16, "disapearLine": 200}},
+                         {{"id": "lu", "src": "a", "x": 16, "y": 24, "w": 16, "h": 16}}]"#,
+        note("")
+    );
+    let n = if variant == F10::OneMore {
+        LIFTS + 1
+    } else {
+        LIFTS
+    };
+    let mut dsts = vec![NOTES.to_owned()];
+    dsts.extend((0..n).map(|i| {
+        let y = f10_y(i);
+        let last = i + 1 == n;
+        let id = if last && variant == F10::Untrimmed {
+            "lu"
+        } else {
+            "lc"
+        };
+        let more = if last && matches!(variant, F10::GateKeys | F10::Untrimmed) {
+            format!(r#", {{"time": 2000, "y": {y}}}, {{"time": 3000, "y": {y}}}"#)
+        } else {
+            String::new()
+        };
+        format!(
+            r#"{{"id": "{id}", "timer": 41, "stretch": 4, "dst": [{{"time": 0, "x": 20, "y": {y}, "w": 430, "h": 100}}, {{"time": 1000, "y": {}}}{more}]}}"#,
+            y + 1
+        )
+    }));
+    let dsts: Vec<&str> = dsts.iter().map(String::as_str).collect();
+    write(
+        root,
+        "s.json",
+        common::hd(&format!(
+            r#""source": [{{"id": "a", "path": "a.png"}}], {}"#,
+            body("", &objects, &dsts)
+        ))
+        .as_bytes(),
+    );
+}
+
+/// F10's chart: one note far ahead.
+fn f10_chart() -> bms_model::Chart {
+    bms_model::ChartBuilder::new(150_000)
+        .tap(
+            bms_model::Lane::new(1).unwrap(),
+            bms_model::TimeUs(100_000_000),
+        )
+        .build()
+        .unwrap()
+}
+
+fn check_f10(_: &Header, i: Imported) {
+    let u = i.report.usage;
+    assert_eq!(u.elements, as_u32(MAX_ELEMENTS));
+    assert_eq!(u.keys, 65_533);
+    // One paint image besides the lanes' parts.
+    assert_eq!(u.images, 7);
+    // A quad for each paint and the lanes' budget with the judgment line:
+    // no cover reserves lane quads.
+    assert_eq!(
+        i.skin.quad_capacity(),
+        as_u32(LIFTS) + skin_model::LANE_QUADS + skin_model::LANE_RESERVED
+    );
+    let mut d = Drawn::over(i.skin, &f10_chart());
+    d.frame(0, &[]);
+    // Every paint 430 tall, each under its own clip, in destination order.
+    let paints: Vec<([i32; 4], Option<[i32; 4]>)> = d
+        .clipped(0)
+        .into_iter()
+        .filter(|(r, _)| r[3] == 430)
+        .collect();
+    assert_eq!(paints.len(), LIFTS);
+    for (k, (r, clip)) in paints.iter().enumerate() {
+        let top = 1_080 - i32::try_from(f10_y(k)).unwrap() - 100;
+        assert_eq!(*r, [20, top - 165, 430, 430], "{k}");
+        assert_eq!(*clip, Some([20, top, 430, 880 - top]), "{k}");
+    }
+    let clipped_runs = d
+        .batch
+        .runs()
+        .iter()
+        .filter(|r| r.clip_rect.is_some())
+        .count();
+    assert_eq!(clipped_runs, LIFTS);
+}
+
+/// F10 past its caps: one destination more, or a gate's keys more.
+fn f10_refuses_past_its_caps() {
+    for (variant, want) in [
+        (F10::OneMore, Some(ImportLimit::Elements)),
+        (F10::GateKeys, Some(ImportLimit::Keys)),
+        (F10::Untrimmed, None),
+    ] {
+        let d = tempfile::tempdir().unwrap();
+        f10(d.path(), variant);
+        match want {
+            Some(want) => match refused(d.path()) {
+                ImportError::Limit { limit, .. } => assert_eq!(limit, want),
+                other => panic!("{other:?}"),
+            },
+            None => {
+                let (mut def, header) = read_header(d.path(), "s.json").unwrap();
+                let i = import(&mut def, &header, &Config::defaults(&header)).unwrap();
+                assert_eq!(i.report.usage.keys, 65_533);
+            }
+        }
+    }
 }
 
 /// F9: the bar line groups at their cap, one key and the one-op
@@ -1179,10 +1353,12 @@ fn import_memory_is_measured() {
         size_of::<skin_model::DurationRatio>(),
     );
     println!(
-        "sizes: ImageChoiceDef {}, Option<ImageChoicePart> {}, CoverPaintDef {}",
+        "sizes: ImageChoiceDef {}, Option<ImageChoicePart> {}, CoverPaintDef {}, Run {}, Quad {}",
         size_of::<ImageChoiceDef>(),
         size_of::<Option<ImageChoicePart>>(),
         size_of::<skin_model::CoverPaintDef>(),
+        size_of::<skin_model::Run>(),
+        size_of::<skin_model::Quad>(),
     );
     // A group's work in a play: its frame record and its heap slot of 2 B,
     // 32 768 B of heap at the cap.
@@ -1223,7 +1399,7 @@ fn import_memory_is_measured() {
         MAX_SKIN_OPS
     );
     assert_eq!(
-        8 + 2 * JUDGES + ELEVEN_KEYS * 11 + (JUDGES - ELEVEN_KEYS) * 10,
+        11 + 2 * JUDGES + ELEVEN_KEYS * 11 + (JUDGES - ELEVEN_KEYS) * 10,
         MAX_SKIN_KEYS
     );
     let d = tempfile::tempdir().unwrap();
@@ -1256,6 +1432,14 @@ fn import_memory_is_measured() {
         measure_prepared(d.path(), &f9_chart(), check_f9),
     ));
     drop(d);
+    let d = tempfile::tempdir().unwrap();
+    f10(d.path(), F10::Caps);
+    peaks.push((
+        "F10 trimmed covers",
+        measure_prepared(d.path(), &f10_chart(), check_f10),
+    ));
+    drop(d);
+    f10_refuses_past_its_caps();
     for (name, p) in &peaks {
         println!("{name}: peak {p} B");
     }

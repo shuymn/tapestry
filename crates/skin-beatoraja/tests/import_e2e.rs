@@ -147,13 +147,20 @@ fn the_play_objects_draw_together() {
         .map(|q| round(q.rect))
         .collect();
     // The lift raises the line by 60 to 810; SUDDEN+'s paint lowers by
-    // 54 px, drawn whole.
+    // 54 px, drawn whole; LIFT's rises 60, clipped at the lanes' bottom.
     assert!(
         r.contains(&[150, 800, 50, 20]),
         "the held head on the line: {r:?}"
     );
     assert!(r.contains(&[20, -266, 430, 600]), "SUDDEN+: {r:?}");
-    assert!(r.contains(&[20, 820, 430, 60]), "LIFT: {r:?}");
+    assert!(r.contains(&[20, 820, 430, 200]), "LIFT: {r:?}");
+    let clips: Vec<[i32; 4]> = d
+        .batch
+        .runs()
+        .iter()
+        .filter_map(|run| run.clip_rect.map(|c| round(c.rect())))
+        .collect();
+    assert_eq!(clips, [[20, 820, 430, 60]]);
     assert!(r.contains(&[600, 560, 80, 20]), "the grade: {r:?}");
     // Ten gauge segments, the grade, two digits, the held long note's
     // head, body and tail, the covers; the judged tap is gone.
