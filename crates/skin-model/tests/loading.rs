@@ -546,7 +546,7 @@ const UV: skin_model::FrameUv = skin_model::FrameUv {
 
 /// Installed text lines draw until their slots are cleared, a composite
 /// cleared with its parts, and draw again once installed; neither touches
-/// a timer.
+/// a timer: a `when` started before keeps its start and ages.
 #[test]
 fn loading_text_draws_until_cleared() {
     let text = |value: TextValue| TextDef {
@@ -571,7 +571,7 @@ fn loading_text_draws_until_cleared() {
         })
         .collect();
     let mut l = Loader::new(skin(
-        Vec::new(),
+        vec![boolean("load.percent >= 0")],
         None,
         elements,
         WidgetDefs {
@@ -592,22 +592,28 @@ fn loading_text_draws_until_cleared() {
         x.sort_unstable();
         x
     };
+    // The `when` on the progress starts with the first build.
+    let when = |l: &Loader| (l.start(timer::BUILTIN), l.reading(timer::BUILTIN));
     l.build(100);
     assert_eq!(lines(&l), [] as [i32; 0]);
+    assert_eq!(when(&l), (Some(100 * MS), 0));
     l.skin
         .install_loading_text(&mut l.loading, TextSlots::ALL, &table)
         .unwrap();
     l.build(200);
     assert_eq!(lines(&l), [0, 1, 2, 3]);
+    assert_eq!(when(&l), (Some(100 * MS), 100));
     let start = l.start(timer::LOADING);
     l.skin
         .clear_loading_text(&mut l.loading, TextSlots::field(TextField::Title));
     l.build(300);
     assert_eq!(lines(&l), [2, 3]);
+    assert_eq!(when(&l), (Some(100 * MS), 200));
     l.skin
         .clear_loading_text(&mut l.loading, TextSlots::LITERALS);
     l.build(400);
     assert_eq!(lines(&l), [2]);
+    assert_eq!(when(&l), (Some(100 * MS), 300));
     l.skin
         .install_loading_text(
             &mut l.loading,
@@ -619,6 +625,7 @@ fn loading_text_draws_until_cleared() {
     assert_eq!(lines(&l), [1, 2]);
     assert_eq!(l.start(timer::LOADING), start);
     assert_eq!(l.reading(timer::LOADING), 500);
+    assert_eq!(when(&l), (Some(100 * MS), 400));
     // A table of another length is refused and installs nothing.
     assert!(
         l.skin
@@ -631,6 +638,105 @@ fn loading_text_draws_until_cleared() {
     );
     l.build(600);
     assert_eq!(lines(&l), [1, 2]);
+}
+
+/// A skin of a title and a full title in a bitmap font of "A" with a
+/// fallback font of "B", each glyph 8 px apart.
+fn bitmap_text_skin(dir: &std::path::Path) -> Skin {
+    for (name, code) in [("a", 65), ("b", 66)] {
+        std::fs::write(
+            dir.join(format!("{name}.fnt")),
+            format!(
+                "info face=\"t\" size=10 padding=0,0,0,0\n\
+                 common lineHeight=12 base=10 scaleW=16 scaleH=16 pages=1\n\
+                 page id=0 file=\"{name}.png\"\n\
+                 char id={code} x=0 y=0 width=6 height=9 xoffset=1 yoffset=1 xadvance=8 page=0\n"
+            ),
+        )
+        .unwrap();
+        image::RgbaImage::from_pixel(16, 16, image::Rgba([255; 4]))
+            .save(dir.join(format!("{name}.png")))
+            .unwrap();
+    }
+    let mut b = skin_model::SheetBuilder::new(&skin_model::Root::new(dir).unwrap());
+    let a = b.admit_fnt("a.fnt", &mut |_| Ok(())).unwrap();
+    let f = b.admit_fnt("b.fnt", &mut |_| Ok(())).unwrap();
+    b.add_bitmap_font(a, &[f]).unwrap();
+    let text = |f| TextDef {
+        value: TextValue::Field(f),
+        font: skin_model::FontRef::Bitmap(0),
+        align: Align::Left,
+        overflow: skin_model::Overflow::Spill,
+    };
+    Skin::new(SkinDef {
+        fit: Fit::Adapt,
+        regions: play_support::REGIONS,
+        whens: vec![boolean("load.percent >= 0")],
+        sheet: b.finish(),
+        lanes: None,
+        elements: vec![
+            untimed(Source::Text(0), [0, 0, 200, 20], Place::SCREEN),
+            untimed(Source::Text(1), [0, 100, 200, 20], Place::SCREEN),
+        ],
+        widgets: WidgetDefs {
+            texts: vec![text(TextField::Title), text(TextField::FullTitle)],
+            ..WidgetDefs::default()
+        },
+        bomb_up_to: Some(skin_model::Grade::Bad),
+    })
+    .unwrap()
+}
+
+/// Bitmap lines draw what was installed, are replaced by other text and
+/// draw nothing once cleared, a composite with its parts; a `when`
+/// started before keeps its start and ages.
+#[test]
+fn loading_bitmap_text_is_replaced_and_cleared() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut l = Loader::new(bitmap_text_skin(dir.path()));
+    // Glyphs per line, by the line's y: the title, then the full title.
+    let glyphs = |l: &Loader| {
+        let q = l.batch.quads();
+        [0.0, 100.0].map(|y| {
+            q.iter()
+                .filter(|q| q.rect[1] >= y && q.rect[1] < y + 20.0)
+                .count()
+        })
+    };
+    let when = |l: &Loader| (l.start(timer::BUILTIN), l.reading(timer::BUILTIN));
+    let chart = |title| skin_model::ChartText {
+        title,
+        subtitle: "B",
+        ..skin_model::ChartText::default()
+    };
+    l.build(100);
+    assert_eq!(glyphs(&l), [0, 0]);
+    assert_eq!(when(&l), (Some(100 * MS), 0));
+    l.skin
+        .install_loading_bitmap_text(&mut l.loading, TextSlots::ALL, &chart("AB"));
+    l.build(200);
+    // "AB", and "AB" and "B" joined by a space the fonts lack.
+    let first = glyphs(&l);
+    assert_eq!(first[0], 2);
+    assert!(first[1] > first[0], "{first:?}");
+    assert_eq!(when(&l), (Some(100 * MS), 100));
+    l.skin.install_loading_bitmap_text(
+        &mut l.loading,
+        TextSlots::field(TextField::Title),
+        &chart("ABAB"),
+    );
+    l.build(300);
+    assert_eq!(glyphs(&l), [4, first[1] + 2]);
+    assert_eq!(when(&l), (Some(100 * MS), 200));
+    l.skin
+        .clear_loading_text(&mut l.loading, TextSlots::field(TextField::Subtitle));
+    l.build(400);
+    assert_eq!(glyphs(&l), [4, 0]);
+    l.skin
+        .clear_loading_text(&mut l.loading, TextSlots::field(TextField::Title));
+    l.build(500);
+    assert_eq!(glyphs(&l), [0, 0]);
+    assert_eq!(when(&l), (Some(100 * MS), 400));
 }
 
 /// A refused loading build leaves the state refused: later builds return
