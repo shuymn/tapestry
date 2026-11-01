@@ -610,6 +610,28 @@ impl PlaySkin for SimpleSkin {
         self.effects(out, f.now);
         Ok(())
     }
+
+    /// Itself, the chart's notes, bar lines and scroll copied for the
+    /// attempt, and its held and done bits, by their allocations.
+    fn attempt_bytes(&self) -> u64 {
+        let lanes: usize = self
+            .lanes
+            .iter()
+            .map(|l| l.capacity() * size_of::<Note>())
+            .sum();
+        let bits: usize = self
+            .held
+            .iter()
+            .chain(&self.done)
+            .map(|b| b.0.capacity() * size_of::<u64>())
+            .sum();
+        let bytes = size_of::<Self>()
+            + lanes
+            + self.bar_lines.capacity() * size_of::<Position>()
+            + size_of_val(self.scroll.segments())
+            + bits;
+        u64::try_from(bytes).unwrap_or(u64::MAX)
+    }
 }
 
 /// The share of an effect started at `t` still shown at `at`, from 1 down,

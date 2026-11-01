@@ -12,9 +12,10 @@ use play_support::{
 use rules::{GaugeValue, Judgment};
 use skin_model::{
     Attempt, Blend, BpmRange, ClipId, CoverSettings, DurationRatio, Ease, ElementDef, End,
-    ErrorKind, Export, FrameReadouts, GREEN_MAX, KeyDef, LaneView, LoadError, MAX_ELEMENTS,
-    MAX_OPS, MAX_SKIN_KEYS, MAX_WHEN_TIMERS, PLAY, PlayContext, PrepareError, Prop, READOUT_MAX,
-    Schema, Scope, Side, TIMER_OFF, TimerDef, TimerRef, Track, Ty, compile, field, timer,
+    ErrorKind, Export, FrameReadouts, GREEN_MAX, GaugeDesc, KeyDef, LaneView, LoadError,
+    MAX_ELEMENTS, MAX_OPS, MAX_SKIN_KEYS, MAX_WHEN_TIMERS, PLAY, PlayContext, PrepareError, Prop,
+    READOUT_MAX, Schema, Scope, Side, TIMER_OFF, TimerDef, TimerRef, Track, Ty, compile, field,
+    timer,
 };
 
 const BPM_150: i64 = 150_000;
@@ -1501,4 +1502,22 @@ fn an_attempts_state_counts_its_buffers() {
     assert!(base >= size_of::<skin_model::Play>() as u64, "{base}");
     // 100 notes of at least 16 bytes each, copied for the attempt.
     assert!(notes >= base + 100 * 16, "{base} {notes}");
+}
+
+/// Each gauge adds its descriptor and the reducer's record of its maximum
+/// and when it reached it, no more and no less.
+#[test]
+fn an_attempts_state_counts_each_gauge() {
+    let chart = ChartBuilder::new(BPM_150).build().unwrap();
+    let bytes = |gauges: &[GaugeDesc]| {
+        let ctx = PlayContext {
+            gauges,
+            ..full(1_000)
+        };
+        Harness::empty(&chart, &ctx).play.resident_bytes()
+    };
+    let one = bytes(&GAUGES[..1]);
+    let three = bytes(&[GAUGES[0], GAUGES[1], GAUGES[0]]);
+    let each = size_of::<GaugeDesc>() + size_of::<Option<TimeUs>>() + size_of::<GaugeValue>();
+    assert_eq!(three - one, 2 * each as u64);
 }

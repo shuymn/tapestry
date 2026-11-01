@@ -498,3 +498,36 @@ fn a_skin_frame_reads_one_view() {
     assert_eq!(s.readouts.hispeed_x100, None);
     assert!(!s.readouts.covers.adjusting);
 }
+
+/// The simple skin's attempt state counts what it copies of the chart, so
+/// the first replacement by a declarative skin counts it beside the staged
+/// attempt's until the commit, which leaves the declarative attempt's.
+#[test]
+fn a_first_replacement_counts_the_simple_attempt() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut r = offscreen(1_920, 1_080);
+    common::prepare(&mut r, &chart());
+    let bare = r.memory().attempt;
+    let mut b = ChartBuilder::new(120_000);
+    for k in 0..100 {
+        b = b.tap(common::lane(1), TimeUs(1_000_000 + k * 10_000));
+    }
+    let notes = b.build().unwrap();
+    common::prepare(&mut r, &notes);
+    let simple = r.memory();
+    let copied = 100 * size_of::<bms_model::Note>() as u64;
+    assert!(simple.attempt >= bare + copied, "{bare} {simple:?}");
+
+    let (a, _) = bundle(&r, dir.path(), &red());
+    let token = stage(&mut r, &a, &notes, 1).unwrap();
+    let peak = r.memory();
+    assert_eq!(peak.attempt, simple.attempt);
+    assert!(peak.staged_attempt > 0);
+    assert!(peak.total() >= simple.total() + peak.staged_attempt);
+    r.commit(token).unwrap();
+    let after = r.memory();
+    assert_eq!(
+        (after.attempt, after.staged_attempt),
+        (peak.staged_attempt, 0)
+    );
+}

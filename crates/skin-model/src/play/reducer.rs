@@ -98,11 +98,12 @@ pub(crate) fn is_target(section: Option<(TimeUs, TimeUs)>, time: TimeUs, end: Ti
 }
 
 impl Reducer {
-    /// The bytes its buffers hold: every lane's long notes and done bits.
+    /// The bytes its buffers hold: every lane's long notes and done bits,
+    /// and each gauge's maximum and when it reached it.
     pub(crate) fn heap_bytes(&self) -> usize {
         let longs: usize = self.longs.iter().map(|l| size_of_val(&**l)).sum();
         let done: usize = self.done.iter().map(|d| size_of_val(&*d.0)).sum();
-        longs + done
+        longs + done + size_of_val(&*self.gauge_max) + size_of_val(&*self.gauge_top)
     }
 
     /// A clean reducer for one attempt: `initial` gives each gauge's
