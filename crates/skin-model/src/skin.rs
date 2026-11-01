@@ -299,14 +299,15 @@ pub(crate) fn radians(deg: f32) -> f32 {
     if r < std::f32::consts::TAU { r } else { 0.0 }
 }
 
+/// Whether a key of `t` leaves ±[`MAX_COORD`].
+fn track_outside(t: &Track) -> bool {
+    t.rects()
+        .any(|r| r.iter().any(|v| !(-MAX_COORD..=MAX_COORD).contains(v)))
+}
+
 /// The places checks of [`Skin::new`], in element order.
 fn check_places(def: &SkinDef) -> Result<(), LoadError> {
     let fixed = def.fit == Fit::Fixed;
-    let max = MAX_COORD;
-    let outside = |t: &Track| {
-        t.rects()
-            .any(|r| r.iter().any(|v| !(-max..=max).contains(v)))
-    };
     let (home, judge_home) = if fixed {
         (Region::Screen, Region::Screen)
     } else {
@@ -320,7 +321,7 @@ fn check_places(def: &SkinDef) -> Result<(), LoadError> {
         if p.fill != Fill::None && p.region != Region::Screen {
             return Err(LoadError::FillOutsideScreen { element });
         }
-        if outside(&e.track) {
+        if track_outside(&e.track) {
             return Err(LoadError::Coordinates { element });
         }
         let widget = matches!(e.source, Source::Lanes | Source::Judge(_));
@@ -339,7 +340,7 @@ fn check_places(def: &SkinDef) -> Result<(), LoadError> {
             if let Some((part, _)) = def
                 .into_iter()
                 .flat_map(JudgeDef::tracks)
-                .find(|(_, t)| outside(t))
+                .find(|(_, t)| track_outside(t))
             {
                 return Err(judge(JudgeError::Coordinates { part }));
             }
@@ -405,7 +406,7 @@ fn check_follows(def: &SkinDef, reach: i64) -> Result<(), LoadError> {
                 || overrides
                     .into_iter()
                     .flat_map(ImageChoiceDef::tracks)
-                    .any(|(_, t)| moved_out(t))
+                    .any(moved_out)
             {
                 return Err(LoadError::Coordinates { element });
             }
@@ -632,7 +633,7 @@ fn regions(def: &SkinDef, lanes: Option<&Lanes>) -> Regions {
 fn choice_bounds(c: &ImageChoiceDef, track: &Track) -> Option<Bounds> {
     let own = c.uses_element_track().then(|| track.bounds()).flatten();
     c.tracks()
-        .filter_map(|(_, t)| t.bounds())
+        .filter_map(Track::bounds)
         .fold(own, |acc, b| Some(union(acc, b)))
 }
 
@@ -645,7 +646,6 @@ fn check_image_choices(
     frames: &impl Fn(u32) -> Option<u16>,
     whens: usize,
 ) -> Result<(), LoadError> {
-    let max = MAX_COORD;
     for (table, d) in w.image_choices.iter().enumerate() {
         let fail = |error| Err(LoadError::ImageChoice { table, error });
         if d.value.ty() != Ty::Int {
@@ -673,11 +673,7 @@ fn check_image_choices(
                     return fail(ImageChoiceError::UnknownTimer { choice });
                 }
             }
-            let outside = |t: &Track| {
-                t.rects()
-                    .any(|r| r.iter().any(|v| !(-max..=max).contains(v)))
-            };
-            if c.track.as_ref().is_some_and(outside) {
+            if c.track.as_ref().is_some_and(track_outside) {
                 return fail(ImageChoiceError::Coordinates { choice });
             }
         }
@@ -787,11 +783,7 @@ impl Skin {
             .iter()
             .map(|e| &e.track)
             .chain(w.judges.iter().flat_map(|j| j.tracks().map(|(_, t)| t)))
-            .chain(
-                w.image_choices
-                    .iter()
-                    .flat_map(|c| c.tracks().map(|(_, t)| t)),
-            )
+            .chain(w.image_choices.iter().flat_map(ImageChoiceDef::tracks))
             .fold(0_usize, |n, t| n.saturating_add(t.key_count()));
         if keys > MAX_SKIN_KEYS {
             return Err(LoadError::TooManyKeys { n: keys });
@@ -919,21 +911,17 @@ impl Skin {
         // Each element evaluates its own number's value and its judge's
         // part visibilities, so they are charged per referencing element.
         let per_element = elements.iter().flat_map(|e| {
-            let number = match e.source {
+            let value = match e.source {
                 Source::Number(i) => w.numbers.get(index(i)).map(|n| &n.value),
+                Source::ImageChoice(i) => w.image_choices.get(index(i)).map(|c| &c.value),
                 _ => None,
             };
             let judge = match e.source {
                 Source::Judge(i) => w.judges.get(index(i)),
                 _ => None,
             };
-            let choice = match e.source {
-                Source::ImageChoice(i) => w.image_choices.get(index(i)).map(|c| &c.value),
-                _ => None,
-            };
-            number
+            value
                 .into_iter()
-                .chain(choice)
                 .chain(judge.into_iter().flat_map(|j| j.visibles().map(|(_, v)| v)))
         });
         for program in whens

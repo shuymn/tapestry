@@ -80,11 +80,11 @@ pub enum ImageChoiceError {
 
 impl ImageChoiceDef {
     /// The present entries' override tracks.
-    pub(crate) fn tracks(&self) -> impl Iterator<Item = (usize, &Track)> + '_ {
+    pub(crate) fn tracks(&self) -> impl Iterator<Item = &Track> + '_ {
         self.choices
             .iter()
-            .enumerate()
-            .filter_map(|(i, c)| Some((i, c.as_ref()?.track.as_ref()?)))
+            .flatten()
+            .filter_map(|c| c.track.as_ref())
     }
 
     /// Whether a present entry samples the element's own track.
