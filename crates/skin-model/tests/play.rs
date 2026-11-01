@@ -1483,3 +1483,22 @@ fn a_skin_counts_the_clips_its_elements_name() {
     .unwrap();
     assert_eq!(skin.clip_count(), 3);
 }
+
+/// An attempt's state counts what it copies of the chart: the notes per
+/// lane and the timers, past the bare state of an empty chart.
+#[test]
+fn an_attempts_state_counts_its_buffers() {
+    let empty = ChartBuilder::new(BPM_150).build().unwrap();
+    let mut b = ChartBuilder::new(BPM_150);
+    for k in 0..100 {
+        b = b.tap(lane(1), TimeUs(1_000 * MS + k * 10 * MS));
+    }
+    let full_chart = b.build().unwrap();
+    let base = Harness::empty(&empty, &full(1_000)).play.resident_bytes();
+    let notes = Harness::empty(&full_chart, &full(1_000))
+        .play
+        .resident_bytes();
+    assert!(base >= size_of::<skin_model::Play>() as u64, "{base}");
+    // 100 notes of at least 16 bytes each, copied for the attempt.
+    assert!(notes >= base + 100 * 16, "{base} {notes}");
+}

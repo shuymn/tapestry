@@ -423,6 +423,42 @@ fn a_replacement_peaks_with_both_installations() {
     assert_eq!(r.commit(token), Err(CommitError::NothingStaged));
 }
 
+/// A staging of the installed bundle reuses its resources, yet its fresh
+/// attempt's state lives beside the installed attempt's until the commit
+/// or a discard: the witness counts both.
+#[test]
+fn a_reused_bundle_still_counts_both_attempts() {
+    let chart = chart();
+    let dir = tempfile::tempdir().unwrap();
+    let mut r = offscreen(1_920, 1_080);
+    let (a, _) = bundle(&r, dir.path(), &red());
+    let token = stage(&mut r, &a, &chart, 1).unwrap();
+    r.commit(token).unwrap();
+    let installed = r.memory();
+    assert!(installed.attempt > 0);
+    assert_eq!(installed.staged_attempt, 0);
+
+    let token = stage(&mut r, &a, &chart, 2).unwrap();
+    let both = r.memory();
+    assert_eq!((both.staged_atlas, both.staged_batch), (0, 0));
+    assert_eq!(both.staged_attempt, installed.attempt);
+    assert_eq!(both.total(), installed.total() + installed.attempt);
+    r.discard();
+    assert_eq!(r.memory(), installed);
+
+    let token2 = stage(&mut r, &a, &chart, 3).unwrap();
+    assert!(r.memory().total() > installed.total());
+    assert_eq!(
+        r.commit(token),
+        Err(CommitError::Request {
+            staged: 3,
+            asked: 2
+        })
+    );
+    r.commit(token2).unwrap();
+    assert_eq!(r.memory(), installed);
+}
+
 /// A frame's model input comes from the frame alone: the tally, the
 /// gauges, the completion and the play phase from its one view, the
 /// effects as drained, its target and visible time, the author's layout,

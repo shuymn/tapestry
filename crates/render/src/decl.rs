@@ -359,6 +359,11 @@ impl PlaySkin for DeclSkin {
         self.bundle.skin.quad_capacity()
     }
 
+    /// The attempt's `Play`, its buffers included; 0 with none prepared.
+    fn attempt_bytes(&self) -> u64 {
+        self.play.as_ref().map_or(0, Play::resident_bytes)
+    }
+
     fn run_capacity(&self) -> u32 {
         self.bundle.skin.run_capacity()
     }

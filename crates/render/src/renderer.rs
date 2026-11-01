@@ -278,6 +278,12 @@ pub struct MemoryWitness {
     pub batch: u64,
     /// The same for the staged resources.
     pub staged_batch: u64,
+    /// The installed skin's prepared attempt: its state and every buffer
+    /// it holds ([`PlaySkin::attempt_bytes`]).
+    pub attempt: u64,
+    /// The staged attempt's, beside it until the commit, even when the
+    /// staging reuses the installed resources.
+    pub staged_attempt: u64,
 }
 
 impl MemoryWitness {
@@ -291,6 +297,8 @@ impl MemoryWitness {
             .saturating_add(self.upload)
             .saturating_add(self.batch)
             .saturating_add(self.staged_batch)
+            .saturating_add(self.attempt)
+            .saturating_add(self.staged_attempt)
     }
 }
 
@@ -1006,6 +1014,8 @@ impl Renderer {
             upload: res.map_or(0, |r| r.atlas.upload_bytes()),
             batch: self.staging.bytes(),
             staged_batch: res.map_or(0, |r| r.staging.bytes()),
+            attempt: self.skin.attempt_bytes(),
+            staged_attempt: staged.map_or(0, |p| p.skin.attempt_bytes()),
         }
     }
 

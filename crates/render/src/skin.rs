@@ -148,6 +148,13 @@ pub trait PlaySkin: Send {
         self.capacity()
     }
 
+    /// The bytes the prepared attempt's own state holds, for the memory
+    /// witness ([`Renderer::memory`](crate::Renderer::memory)). The default
+    /// is 0: a skin whose preparation keeps nothing per attempt.
+    fn attempt_bytes(&self) -> u64 {
+        0
+    }
+
     /// The canvas the skin draws on for a `target`-pixel target, which the
     /// renderer projects its frames and clips onto. The default is the
     /// fixed 1920×1080 layout, letterboxed.
