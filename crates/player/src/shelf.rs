@@ -16,7 +16,8 @@
 //!   waits until the scan acknowledges it ([`Shelf::wait_paused`]); every
 //!   entry into selection and every result screen releases it.
 //! - **Priority.** The scan thread runs in background mode (lowered CPU and
-//!   I/O priority), set by its start hook.
+//!   I/O priority), set by its start hook; when the system refuses it, at
+//!   the lowest CPU priority, the refusal reported once on the console.
 //! - **Loudness.** The shelf also holds the loaded chart's loudness
 //!   ([`Loudness`]): a miss is measured during the chart's load, and its
 //!   measurements are stored only while the scan is quiet. A load
@@ -691,12 +692,31 @@ fn stop_together<W>(
 
 /// The scan thread's start hook: background mode, which lowers its CPU,
 /// I/O and memory priority (design.md "Coexisting with Other Software").
+/// When the system refuses it, the thread falls back to the lowest CPU
+/// priority, and the first refusal of the run is reported on the console.
 fn background_mode() {
+    use std::sync::atomic::{AtomicBool, Ordering};
     use windows::Win32::System::Threading::{
-        GetCurrentThread, SetThreadPriority, THREAD_MODE_BACKGROUND_BEGIN,
+        GetCurrentThread, SetThreadPriority, THREAD_MODE_BACKGROUND_BEGIN, THREAD_PRIORITY_LOWEST,
     };
+    static REPORTED: AtomicBool = AtomicBool::new(false);
     // SAFETY: the pseudo handle of the calling thread, always valid.
-    let _ = unsafe { SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN) };
+    let Err(e) = (unsafe { SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN) })
+    else {
+        return;
+    };
+    // SAFETY: as above.
+    let lowest = unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST) };
+    if !REPORTED.swap(true, Ordering::Relaxed) {
+        match lowest {
+            Ok(()) => {
+                eprintln!("library: background mode refused ({e}); lowest CPU priority instead")
+            }
+            Err(l) => {
+                eprintln!("library: background mode refused ({e}); lowest CPU priority too ({l})")
+            }
+        }
+    }
 }
 
 /// The file name of `path`, for console lines.
