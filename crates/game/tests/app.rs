@@ -2897,10 +2897,13 @@ fn the_first_round_prepares_with_the_preset_edited_on_the_practice_page() {
     acts.extend(page(Down, 4));
     acts.extend(page(Left, 5));
     acts.extend(page(Down, 2));
+    // Start, back from the round's result to the page, and Start again.
     acts.extend([
         (500, Act::Page(PracticeInput::Confirm)),
         (3_000, Act::Quit),
-        (500, Act::Page(PracticeInput::Back)),
+        (500, Act::Quit),
+        (500, Act::Page(PracticeInput::Confirm)),
+        (3_000, Act::Quit),
         (500, Act::Close),
     ]);
     let edited = reordered();
@@ -2926,10 +2929,21 @@ fn the_first_round_prepares_with_the_preset_edited_on_the_practice_page() {
     assert_eq!(section.initial_gauges, expected);
     // A round's notes end 1 s after its section, at 1×.
     assert_eq!(first.last_note_end, TimeUs(section.end.0 + 1_000_000));
-    let [(P, rounds)] = &rig.loads[..] else {
+    let Some((P, rounds)) = rig.loads.first() else {
         panic!("{:?}", rig.seen);
     };
-    assert_eq!(rounds[0].preset, mine(edited));
+    assert_eq!(rounds[0].preset, mine(edited.clone()));
+    // Back on the page, it shows the gauge set where the edit moved it,
+    // with its value, and the next Start plays just that.
+    let page = &rig.practice_entries[1];
+    let at = edited.gauges.iter().position(|g| g.id == displayed.id);
+    assert_eq!(Some(page.gauge()), at);
+    assert_eq!(page.gauge_name(), Some(displayed.id.as_str()));
+    assert_eq!(page.value(), set);
+    let game::AttemptKind::Section(again) = &rig.attempts[1].kind else {
+        panic!("{:?}", rig.attempts[1].kind);
+    };
+    assert_eq!(again.initial_gauges, expected);
 }
 
 /// The tapestry preset's gauges reversed, with a copy of its first added
@@ -2954,7 +2968,9 @@ fn a_round_whose_set_gauge_left_the_preset_is_refused() {
     acts.extend(page(Down, 4));
     acts.extend(page(Left, 5));
     acts.extend(page(Down, 2));
+    // Start, refused, and Start again.
     acts.extend([
+        (500, Act::Page(PracticeInput::Confirm)),
         (500, Act::Page(PracticeInput::Confirm)),
         (500, Act::Page(PracticeInput::Back)),
         (500, Act::Close),
@@ -2967,12 +2983,22 @@ fn a_round_whose_set_gauge_left_the_preset_is_refused() {
     });
     ran.unwrap();
     assert!(rig.violations.is_empty(), "{:?}", rig.violations);
+    // Both Starts refused: the second never moves the value onto another
+    // gauge, and the page still shows the gauge set, with its value.
+    let gone = format!("no longer has the gauge {}", displayed.id);
     let n = notices(&rig);
-    assert!(
-        n.iter()
-            .flatten()
-            .any(|n| n.contains(&format!("no longer has the gauge {}", displayed.id))),
-        "{n:?}"
+    assert_eq!(n.len(), 3, "{n:?}");
+    for notice in &n[1..] {
+        assert!(
+            notice.as_deref().is_some_and(|n| n.contains(&gone)),
+            "{n:?}"
+        );
+    }
+    let page = rig.practice_entries.last().unwrap();
+    assert_eq!(page.gauge_name(), Some(displayed.id.as_str()));
+    assert_eq!(
+        page.value(),
+        rules::GaugeValue(displayed.start.0 - 5 * rules::GaugeValue::PERCENT)
     );
     assert_eq!(rig.opens, 0);
     assert!(rig.attempts.is_empty());

@@ -519,7 +519,13 @@ fn practice_chart<R: AppRig>(
             }
         }
         if start {
-            let notice = match start_rounds(loaded, &screen, rig) {
+            // The page follows the play preset by gauge ID before Start
+            // and again after the rounds refreshed it, so what it shows
+            // is what the next round plays.
+            screen.fit(loaded.preset());
+            let ran = start_rounds(loaded, &screen, rig);
+            screen.fit(loaded.preset());
+            let notice = match ran {
                 Ok(Leave::Quit) => return Ok(Leave::Quit),
                 Ok(Leave::Back) => None,
                 // A refusal never hides a thread's failure.
@@ -563,7 +569,7 @@ fn start_rounds<R: AppRig>(
     if loaded.config().speed != screen.speed() {
         loaded.set_speed(screen.speed()).map_err(|e| notice(&e))?;
     }
-    let practice = screen.practice(loaded);
+    let practice = screen.practice(loaded).map_err(|e| notice(&e))?;
     loaded
         .set_practice(Some(practice))
         .map_err(|e| notice(&e))?;
