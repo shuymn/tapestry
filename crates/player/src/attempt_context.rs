@@ -7,7 +7,7 @@
 
 use bms_model::TimeUs;
 use game::{Attempt, AttemptKind};
-use skin_model::{BpmRange, GaugeDesc, PlayContext, Side};
+use skin_model::{GaugeDesc, PlayContext, Side};
 
 /// The scratch side the simple skin draws, its author's layout: it has no
 /// imported side and no player layout.
@@ -25,9 +25,6 @@ pub struct AttemptContext {
     scratch: Side,
     ln_default: rules::LnMode,
     last_note_end: TimeUs,
-    /// No authoritative BPM range is known yet: `None` hides its readouts
-    /// rather than inferring them from the scroll.
-    bpm_range: Option<BpmRange>,
 }
 
 impl AttemptContext {
@@ -41,7 +38,6 @@ impl AttemptContext {
             scratch,
             ln_default: attempt.ln_default,
             last_note_end: attempt.last_note_end,
-            bpm_range: None,
         }
     }
 
@@ -58,7 +54,9 @@ impl AttemptContext {
             scratch: self.scratch,
             ln_default: self.ln_default,
             last_note_end: self.last_note_end,
-            bpm_range: self.bpm_range,
+            // No authoritative BPM range is known yet: `None` hides its
+            // readouts rather than inferring them from the scroll.
+            bpm_range: None,
         }
     }
 }

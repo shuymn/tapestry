@@ -468,8 +468,7 @@ struct Shared {
 #[derive(Debug, Default)]
 struct LoadingSlot {
     lifetime: u64,
-    page: Option<Box<MenuPage>>,
-    update: Option<Box<LoadingUpdate>>,
+    pending: Option<TakenLoading>,
     signaled: bool,
 }
 
@@ -527,8 +526,7 @@ impl Shared {
             return None;
         }
         slot.signaled = false;
-        let update = slot.update.take();
-        slot.page.take().map(|page| (page, update))
+        slot.pending.take()
     }
 
     /// Whether loading lifetime `lifetime` is still the current one.
@@ -542,8 +540,7 @@ impl Shared {
         let mut slot = self.loading_slot();
         slot.lifetime = slot.lifetime.wrapping_add(1);
         slot.signaled = false;
-        drop(slot.page.take());
-        drop(slot.update.take());
+        drop(slot.pending.take());
     }
 }
 
@@ -580,8 +577,7 @@ impl LoadingSink {
         if slot.lifetime != self.lifetime {
             return;
         }
-        drop(slot.page.replace(Box::new(page)));
-        drop(std::mem::replace(&mut slot.update, update));
+        drop(slot.pending.replace((Box::new(page), update)));
         if !slot.signaled {
             slot.signaled = true;
             // A thread that already ended ignores it.
@@ -2415,6 +2411,22 @@ mod tests {
         AttemptContext::new(attempt, crate::attempt_context::SIMPLE_SCRATCH)
     }
 
+    /// A render thread on the screens `make` builds, with no chart, no
+    /// section and no frame sink.
+    fn spawn_empty(make: MakeScreen) -> super::RenderLink {
+        let clock = QpcClock::start();
+        spawn(
+            make,
+            None,
+            None,
+            clock,
+            view(),
+            measure(clock),
+            Box::new(NoFrames),
+        )
+        .unwrap()
+    }
+
     /// A screen whose skin refuses every section's attempt and fails its
     /// device on a whole chart's while `lost` is set; it notes its menu
     /// frames by the number of the build that made it.
@@ -2485,17 +2497,7 @@ mod tests {
                 seen: Arc::clone(&noted),
             }) as Box<dyn Screen>)
         });
-        let clock = QpcClock::start();
-        let link = spawn(
-            make,
-            None,
-            None,
-            clock,
-            view(),
-            measure(clock),
-            Box::new(NoFrames),
-        )
-        .unwrap();
+        let link = spawn_empty(make);
         let chart = Arc::new(ChartBuilder::new(120_000).build().unwrap());
         link.load(Arc::clone(&chart), None).unwrap();
         let round = eval::Section {
@@ -2579,17 +2581,7 @@ mod tests {
         let held = Arc::clone(&hold);
         let make: MakeScreen =
             Box::new(move || Ok(Box::new(Held(Arc::clone(&held))) as Box<dyn Screen>));
-        let clock = QpcClock::start();
-        let link = spawn(
-            make,
-            None,
-            None,
-            clock,
-            view(),
-            measure(clock),
-            Box::new(NoFrames),
-        )
-        .unwrap();
+        let link = spawn_empty(make);
         let chart = Arc::new(ChartBuilder::new(120_000).build().unwrap());
         link.load(Arc::clone(&chart), None).unwrap();
         for cause in ["leave", "input", "audio"] {
@@ -2630,17 +2622,7 @@ mod tests {
                 seen: Arc::clone(&noted),
             }) as Box<dyn Screen>)
         });
-        let clock = QpcClock::start();
-        let link = spawn(
-            make,
-            None,
-            None,
-            clock,
-            view(),
-            measure(clock),
-            Box::new(NoFrames),
-        )
-        .unwrap();
+        let link = spawn_empty(make);
         let chart = Arc::new(ChartBuilder::new(120_000).build().unwrap());
         link.load(Arc::clone(&chart), None).unwrap();
         let ready = link.prepare_attempt(attempt(&chart, None), || false);
@@ -2711,17 +2693,7 @@ mod tests {
                 seen: Arc::clone(&noted),
             }) as Box<dyn Screen>)
         });
-        let clock = QpcClock::start();
-        let link = spawn(
-            make,
-            None,
-            None,
-            clock,
-            view(),
-            measure(clock),
-            Box::new(NoFrames),
-        )
-        .unwrap();
+        let link = spawn_empty(make);
         let update = |stage, title: &str| LoadingUpdate {
             stage,
             chart: crate::loading_text::ChosenChart {
