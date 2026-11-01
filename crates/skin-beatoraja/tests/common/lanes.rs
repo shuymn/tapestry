@@ -97,6 +97,26 @@ pub fn lift(extra: &str) -> String {
     )
 }
 
+/// The `hiddenCover` member: a 16×16 cell of `a.png` trimmed at y 200,
+/// the default lanes' lower edge; `extra` fields.
+pub fn hidden_object(extra: &str) -> String {
+    let sep = if extra.is_empty() { "" } else { ", " };
+    format!(
+        r#""hiddenCover": [{{"id": "hid", "src": "a", "x": 32, "y": 24, "w": 16, "h": 16,
+            "disapearLine": 200{sep}{extra}}}]"#
+    )
+}
+
+/// A HIDDEN+ destination across the default lanes, 600 tall with its
+/// upper edge on their lower edge (y 200); `extra` fields.
+pub fn hidden(extra: &str) -> String {
+    let sep = if extra.is_empty() { "" } else { ", " };
+    format!(
+        r#"{{"id": "hid"{sep}{extra},
+            "dst": [{{"x": 20, "y": -400, "w": 430, "h": 600}}]}}"#
+    )
+}
+
 /// A body of [`PARTS`] with `extra` images, `objects` members, and the
 /// destinations `dsts`.
 pub fn body(extra: &str, objects: &str, dsts: &[&str]) -> String {
@@ -106,4 +126,16 @@ pub fn body(extra: &str, objects: &str, dsts: &[&str]) -> String {
         parts(extra),
         dsts.join(", ")
     )
+}
+
+/// The lanes with `objects` beside the note and `dsts` after it.
+pub fn with(objects: &str, dsts: &[&str]) -> super::Loaded {
+    let objects = if objects.is_empty() {
+        note("")
+    } else {
+        format!("{}, {objects}", note(""))
+    };
+    let mut all = vec![NOTES];
+    all.extend_from_slice(dsts);
+    super::import_body(&body("", &objects, &all))
 }

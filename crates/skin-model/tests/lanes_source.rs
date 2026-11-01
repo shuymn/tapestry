@@ -10,12 +10,14 @@ mod play_support;
 use bms_model::{Chart, ChartBuilder, Lane, LnMode, NoteKind, TimeUs};
 use eval::JudgeEvent;
 use lanes_support::{
-    BAR, BODY_OFF, BODY_ON, COVER, HEAD, LIFT, LINE, MINE, NOTE, TAIL, in_lane, lanes_element,
-    lanes_skin, rects, skin_with, source, source_with,
+    BAR, BODY_OFF, BODY_ON, COVER, HEAD, HIDDEN, LIFT, LINE, MINE, NOTE, TAIL, in_lane,
+    lanes_element, lanes_skin, rects, skin_with, source, source_with,
 };
 use play_support::{Harness, MS, REGIONS, ev, full, hold_ended, judged, lane, ln_held, mine};
 use rules::Judgment;
-use skin_model::{LANE_QUADS, LANE_VISITS, LanesDef, LanesError, LoadError};
+use skin_model::{
+    HiddenTrim, LANE_QUADS, LANE_VISITS, LaneStyle, LanesDef, LanesError, LoadError, SourceLanes,
+};
 
 /// 150 BPM, in thousandths.
 const BPM: i64 = 150_000;
@@ -322,6 +324,78 @@ fn the_lift_and_the_cover_take_their_shares_of_the_region() {
     );
     let lift = rects(&h, LIFT);
     assert_eq!(lift.iter().map(|r| r[1]).collect::<Vec<_>>(), [760.0]);
+}
+
+#[test]
+fn hidden_plus_takes_its_share_of_the_region_above_the_lift() {
+    // The region is 600 high. Lift 200 ‰ takes 120 and HIDDEN+ 500 ‰
+    // half of the 480 left, 240: its upper edge at 880 − 360 = 520,
+    // trimmed at the raised line, 760. The notes do not move.
+    let chart = tap_at(3, 1_300);
+    let mut h = harness(&chart);
+    h.view.lift = 200;
+    h.frame(1_000, &[]);
+    let notes = in_lane(&h, NOTE, lane(3));
+    h.view.hidden = 500;
+    h.frame(1_000, &[]);
+    assert_eq!(in_lane(&h, NOTE, lane(3)), notes);
+    assert_eq!(rects(&h, HIDDEN), [[160.0, 520.0, 544.0, 240.0]]);
+    // Its own share at 1 000 ‰: up to the region's top, 280.
+    h.view.hidden = 1_000;
+    h.frame(1_000, &[]);
+    assert_eq!(rects(&h, HIDDEN), [[160.0, 280.0, 544.0, 480.0]]);
+    // A full lift leaves it no share, but it stays on, hanging from the
+    // region's top (280): cut at a fixed trim, or whole down to the
+    // region's lower edge without one.
+    for (trim, want) in [
+        (HiddenTrim::Fixed(700.0), [160.0, 280.0, 544.0, 420.0]),
+        (HiddenTrim::None, [160.0, 280.0, 544.0, 600.0]),
+    ] {
+        let def = LanesDef {
+            hidden_trim: trim,
+            ..source()
+        };
+        let mut h = harness_of(def, &chart);
+        (h.view.lift, h.view.hidden) = (1_000, 500);
+        h.frame(1_000, &[]);
+        assert_eq!(rects(&h, HIDDEN), [want], "{trim:?}");
+    }
+}
+
+#[test]
+fn hidden_plus_draws_nothing_above_its_raised_trim() {
+    // The source region's lower edge at 140 of 1 080, y up (940 y down),
+    // 580 high; HIDDEN+ hangs from the region's lower edge, its trim
+    // linked to the lift at 357 (723 y down). LIFT 300 ‰ (174) and
+    // HIDDEN+ 500 ‰ (203 of the 406 left) raise its upper edge to 563,
+    // below the trim raised to 549: nothing is drawn, as in the source.
+    let def = LanesDef {
+        style: LaneStyle::Source(SourceLanes {
+            bottom: 940.0,
+            height: 580.0,
+            offset_y: 0.0,
+            note_h: 20.0,
+        }),
+        top: 350,
+        line: 930,
+        bottom: 940,
+        cover_at: 360.0,
+        lift_at: 940.0,
+        hidden_at: 940.0,
+        hidden_h: 580.0,
+        hidden_trim: HiddenTrim::Lift(723.0),
+        ..source()
+    };
+    let chart = tap_at(3, 5_000);
+    let mut h = harness_of(def, &chart);
+    (h.view.lift, h.view.hidden) = (300, 500);
+    h.frame(1_000, &[]);
+    assert!(rects(&h, HIDDEN).is_empty());
+    // At 600 ‰ (243.6) its edge rises to 522.4, above the trim.
+    h.view.hidden = 600;
+    h.frame(1_000, &[]);
+    let upper = (940.0_f64 - 174.0 - 243.6) as f32;
+    assert_eq!(rects(&h, HIDDEN), [[160.0, upper, 544.0, 549.0 - upper]]);
 }
 
 #[test]

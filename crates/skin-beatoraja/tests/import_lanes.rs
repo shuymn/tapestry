@@ -666,15 +666,23 @@ fn a_note_offset_off_the_lanes_refuses() {
 
 #[test]
 fn ids_resolve_in_the_source_order() {
-    // HIDDEN+ is looked up before the note: the destination is HIDDEN+.
+    // HIDDEN+ is looked up before the note: the destination is HIDDEN+,
+    // dropped without lanes.
     let hidden = format!(
         r#"{}, "hiddenCover": [{{"id": "notes", "src": "a"}}]"#,
         note("")
     );
     let l = import_body(&body("", &hidden, &[NOTES]));
-    assert!(l.report().notes.iter().any(
-        |n| n.severity == Severity::Ignored && n.kind == NoteKind::Deviation(DeviationId::D11)
-    ));
+    assert!(
+        l.report()
+            .notes
+            .iter()
+            .any(|n| n.severity == Severity::Dropped
+                && n.kind
+                    == NoteKind::UnsupportedField {
+                        field: "hiddenCover"
+                    })
+    );
     assert_eq!(l.ok().scratch, None);
     // A pmchara sharing the note's id refuses.
     let chara = format!(

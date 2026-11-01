@@ -36,7 +36,7 @@ use skin_model::{
 
 /// The recorded bound: the largest measured peak over the fixtures plus
 /// 25 %.
-const BOUND: i64 = 153_276_380;
+const BOUND: i64 = 153_286_620;
 
 struct Counting;
 
@@ -309,7 +309,7 @@ fn check_f6(_: &Header, i: Imported) {
 /// F5's judges: 5,127 with a 2-digit combo and one with a 1-digit combo.
 const JUDGES: usize = 5_128;
 /// Judges whose grade has 11 keys; the rest have 10.
-const ELEVEN_KEYS: usize = 3_995;
+const ELEVEN_KEYS: usize = 3_994;
 /// Judges whose grade has the 7-op predicate; the rest the 17-op one.
 const SEVEN_OPS: usize = 2_164;
 
@@ -378,7 +378,7 @@ fn f5(root: &Path) {
             r#"{"id": "cv", "offset": 4, "dst": [{"x": 20, "y": 800, "w": 430, "h": 600}]}"#
                 .to_owned(),
             r#"{"id": "lc", "dst": [{"x": 20, "y": 0, "w": 430, "h": 200}]}"#.to_owned(),
-            r#"{"id": "hid", "dst": [{"x": 20, "y": 200, "w": 430, "h": 600}]}"#.to_owned(),
+            r#"{"id": "hid", "dst": [{"x": 20, "y": -400, "w": 430, "h": 600}]}"#.to_owned(),
             r#"{"id": "gg", "dst": [{"x": 600, "y": 100, "w": 1000, "h": 10}]}"#.to_owned(),
         ]
         .into_iter()
@@ -395,7 +395,8 @@ fn f5(root: &Path) {
                "note": {note},
                "liftCover": [{{"id": "lc", "src": "a", "x": 0, "y": 220, "w": 8, "h": 8,
                                "disapearLine": 200}}],
-               "hiddenCover": [{{"id": "hid", "src": "a"}}],
+               "hiddenCover": [{{"id": "hid", "src": "a", "x": 0, "y": 240, "w": 8, "h": 8,
+                                 "disapearLine": 200}}],
                "gauge": {{"id": "gg", "nodes": [{nodes}], "parts": 1000, "type": 3, "cycle": 100}},
                "judge": [{judges}],
                "destination": [{dsts}]"#,
@@ -418,7 +419,7 @@ fn check_f5(_: &Header, i: Imported) {
         MAX_WIDGET_QUADS + skin_model::LANE_QUADS + skin_model::LANE_RESERVED
     );
     // The snapshot: a PERFECT with combo 12, the gauge full, SUDDEN+ at
-    // 300 ‰ and LIFT at 100 ‰, no note on screen.
+    // 300 ‰, LIFT at 100 ‰ and HIDDEN+ at 500 ‰, no note on screen.
     let chart = bms_model::ChartBuilder::new(150_000)
         .tap(
             bms_model::Lane::new(1).unwrap(),
@@ -431,6 +432,7 @@ fn check_f5(_: &Header, i: Imported) {
     d.gauges[0].value = GaugeValue::FULL;
     d.view.cover = 300;
     d.view.lift = 100;
+    d.view.hidden = 500;
     let full = eval::JudgeEvent {
         seq: 0,
         time: bms_model::TimeUs(900_000),
@@ -445,9 +447,9 @@ fn check_f5(_: &Header, i: Imported) {
     let q = d.frame(1_000, &[judged(1_000, Judgment::Perfect, 12)]);
     // Each emission by its drawn size: every judge's 80×20 grade, the
     // 6×6 cells of "1" and "2" for each but the last, whose one-digit
-    // combo draws "2" alone; SUDDEN+ and LIFT over the 430 px lanes; the
-    // gauge's 1,000 one-pixel segments, and its tip while the flicker
-    // shows it.
+    // combo draws "2" alone; SUDDEN+, LIFT and HIDDEN+ over the 430 px
+    // lanes; the gauge's 1,000 one-pixel segments, and its tip while the
+    // flicker shows it.
     let mut by_size = std::collections::BTreeMap::<[i32; 2], usize>::new();
     for quad in &q {
         let [_, _, w, h] = common::play::round(quad.rect);
@@ -461,14 +463,14 @@ fn check_f5(_: &Header, i: Imported) {
         .filter(|(s, _)| s[0] == 430)
         .map(|(_, n)| n)
         .sum();
-    assert_eq!(covers, 2, "{by_size:?}");
+    assert_eq!(covers, 3, "{by_size:?}");
     let gauge: usize = by_size
         .iter()
         .filter(|(s, _)| s[1] == 10)
         .map(|(_, n)| n)
         .sum();
     assert!((1_000..=1_001).contains(&gauge), "{by_size:?}");
-    assert_eq!(q.len(), JUDGES + 2 * JUDGES - 1 + 2 + gauge, "{by_size:?}");
+    assert_eq!(q.len(), JUDGES + 2 * JUDGES - 1 + 3 + gauge, "{by_size:?}");
 }
 
 /// A relative name of `len` bytes ending in `tail`, in folders of at most
@@ -675,7 +677,7 @@ fn import_memory_is_measured() {
     assert_eq!(ops_of("-230, -231"), 17);
     assert_eq!(SEVEN_OPS * 7 + (JUDGES - SEVEN_OPS) * 17, MAX_SKIN_OPS);
     assert_eq!(
-        5 + 2 * JUDGES + ELEVEN_KEYS * 11 + (JUDGES - ELEVEN_KEYS) * 10,
+        6 + 2 * JUDGES + ELEVEN_KEYS * 11 + (JUDGES - ELEVEN_KEYS) * 10,
         MAX_SKIN_KEYS
     );
     let d = tempfile::tempdir().unwrap();

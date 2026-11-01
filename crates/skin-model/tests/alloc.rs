@@ -413,6 +413,7 @@ fn lanes() -> skin_model::LanesDef {
             line: Some(part(7)),
             cover: Some(part(8)),
             lift: Some(part(9)),
+            hidden: Some(part(8)),
         },
         ..lanes_support::simple()
     }
@@ -1007,13 +1008,13 @@ impl Witness {
 /// What a stretch's frames cycle through besides the target.
 struct Views {
     layouts: Vec<SkinLayout>,
-    lanes: [LaneView; 4],
+    lanes: [LaneView; 5],
 }
 
 impl Views {
     /// The author's layout first, then a moved and scaled playfield, a
     /// hidden judge, a lane width, an inset and a HUD pushed off the
-    /// canvas; no covers, a cover, a lift, both.
+    /// canvas; no covers, a cover, a lift, both, and all three covers.
     fn new() -> Self {
         let adjust = |x, y, scale| Adjust {
             x,
@@ -1045,14 +1046,21 @@ impl Views {
         pushed
             .set(Region::Right, adjust(4_320, -4_320, 50))
             .unwrap();
-        let view = |cover, lift| LaneView {
+        let view = |cover, lift, hidden| LaneView {
             visible_time: TimeUs(600 * MS),
             cover,
             lift,
+            hidden,
         };
         Self {
             layouts: vec![SkinLayout::AUTHOR, moved, hidden, wide, inset, pushed],
-            lanes: [view(0, 0), view(250, 0), view(0, 100), view(950, 300)],
+            lanes: [
+                view(0, 0, 0),
+                view(250, 0, 0),
+                view(0, 100, 0),
+                view(950, 300, 0),
+                view(300, 200, 400),
+            ],
         }
     }
 }
@@ -1489,8 +1497,9 @@ fn bitmap_skin() -> (tempfile::TempDir, Skin) {
 
 /// The source player's lanes (`lanes_support::source`) on `chart` played
 /// as CN, so every long note shows its end cap, through frames every 16 ms
-/// under covers that leave scroll and covers that leave none: nothing
-/// allocated, and notes, end caps and bodies drawn.
+/// under covers that leave scroll and covers that leave none, all three
+/// together among them: nothing allocated, and notes, end caps, bodies and
+/// HIDDEN+ drawn.
 fn source_lanes_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
     let skin = lanes_support::lanes_skin(lanes_support::source());
     let uvs = play_support::uvs(&skin);
@@ -1501,12 +1510,20 @@ fn source_lanes_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
     let t = tally(0);
     let gauges = [state(GaugeValue::FULL), state(GaugeValue::FULL)];
     let layout = SkinLayout::AUTHOR;
-    let views = [(0, 0), (500, 200), (1_000, 0), (0, 1_000), (1_000, 1_000)];
+    let views = [
+        (0, 0, 0),
+        (500, 200, 0),
+        (300, 200, 500),
+        (1_000, 0, 0),
+        (0, 1_000, 0),
+        (1_000, 1_000, 1_000),
+    ];
     let tail = uvs.get(lanes_support::TAIL).unwrap().uv;
-    let (mut quads, mut tails) = (0_usize, 0_usize);
+    let hidden = uvs.get(lanes_support::HIDDEN).unwrap();
+    let (mut quads, mut tails, mut hiddens) = (0_usize, 0_usize, 0_usize);
     TRACK.with(|t| t.set(true));
     for (i, now) in (0..12_000 * MS).step_by(16 * MS as usize).enumerate() {
-        let (cover, lift) = views[i / 50 % views.len()];
+        let (cover, lift, hidden_view) = views[i / 50 % views.len()];
         batch.clear();
         let frame = SkinFrame {
             now: TimeUs(now),
@@ -1522,12 +1539,20 @@ fn source_lanes_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
                 visible_time: TimeUs(600 * MS),
                 cover,
                 lift,
+                hidden: hidden_view,
             },
             playing: true,
         };
         skin.build(&mut play, &frame, &uvs, &mut batch);
         quads += batch.quads().len();
         tails += batch.quads().iter().filter(|q| q.uv == tail).count();
+        hiddens += batch
+            .quads()
+            .iter()
+            .filter(|q| {
+                q.layer == hidden.layer && [q.uv[0], q.uv[2]] == [hidden.uv[0], hidden.uv[2]]
+            })
+            .count();
     }
     TRACK.with(|t| t.set(false));
     assert_eq!(
@@ -1536,7 +1561,7 @@ fn source_lanes_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
         "source lanes: allocations"
     );
     assert!(
-        quads > 0 && tails > 0,
-        "source lanes drew {quads} quads, {tails} end caps"
+        quads > 0 && tails > 0 && hiddens > 0,
+        "source lanes drew {quads} quads, {tails} end caps, {hiddens} HIDDEN+"
     );
 }

@@ -132,6 +132,8 @@ const RUNTIME_OFFSETS: std::ops::RangeInclusive<i32> = 1..=5;
 const OFFSET_LIFT: i32 = 3;
 /// The offset SUDDEN+ moves (`SkinProperty.java:947`).
 const OFFSET_LANECOVER: i32 = 4;
+/// The offset HIDDEN+ moves (`SkinProperty.java:948`).
+const OFFSET_HIDDEN: i32 = 5;
 /// The all-elements offset, set by the player's settings (S11).
 const OFFSET_ALL: i32 = 10;
 /// The highest offset id (`SkinProperty.java:972`).
@@ -711,7 +713,7 @@ impl<'d> Cx<'d> {
             Object::Value => self.number(dst, orec)?,
             Object::Text => self.text(dst, orec)?,
             Object::Note => self.lanes_element(dst, orec)?,
-            Object::HiddenCover => self.hidden_cover(at),
+            Object::HiddenCover => self.hidden_cover(dst, orec)?,
             Object::LiftCover => self.lift_cover(dst, orec)?,
             Object::Judge => self.judge(dst, orec)?,
             Object::Gauge => self.gauge(dst, orec)?,
@@ -719,7 +721,9 @@ impl<'d> Cx<'d> {
                 self.drop_el(Role::Decorative, at, NoteKind::Unsupported { object })?;
             }
         }
-        // An element kept after the notes is drawn below SUDDEN+ and LIFT.
+        // An element kept after the notes is drawn below SUDDEN+, LIFT and
+        // HIDDEN+.
+
         if object != Object::Note
             && self.elements.len() > lanes
             && let Some(l) = self.lanes.as_mut()
