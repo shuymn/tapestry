@@ -1059,8 +1059,13 @@ fn resample(
     Ok(Some(out))
 }
 
-/// Runs `f(0..jobs)` on `threads` threads, results in job order.
+/// Runs `f(0..jobs)` on `threads` threads, results in job order; one
+/// thread is the caller's own, so a decode limited to one thread keeps the
+/// caller's priority (the background loudness measurement's).
 fn pool<T: Send>(threads: usize, jobs: usize, f: impl Fn(usize) -> T + Sync) -> Vec<T> {
+    if threads <= 1 {
+        return (0..jobs).map(f).collect();
+    }
     let next = AtomicUsize::new(0);
     let mut done: Vec<(usize, T)> = thread::scope(|s| {
         let workers: Vec<_> = (0..threads)
