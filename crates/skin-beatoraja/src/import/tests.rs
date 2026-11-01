@@ -191,10 +191,11 @@ fn refused_and_dropped_covers_admit_nothing() {
     let (r, _, base) = run(&lanes("", ""));
     r.unwrap();
     assert_eq!(base, 1);
-    // HIDDEN+ of the malformed file outside the subset: nothing read.
+    // HIDDEN+ of the malformed file trimmed over a destination of
+    // negative height: nothing read.
     let hidden = lanes(
-        r#""hiddenCover": [{"id": "hid", "src": "b", "w": 8, "h": 8}]"#,
-        r#", {"id": "hid", "timer": 41, "dst": [{"x": 20, "y": 200, "w": 430, "h": 600}]}"#,
+        r#""hiddenCover": [{"id": "hid", "src": "b", "w": 8, "h": 8, "disapearLine": 0}]"#,
+        r#", {"id": "hid", "dst": [{"x": 20, "y": 200, "w": 430, "h": -600}]}"#,
     );
     let (r, _, admits) = run(&hidden);
     let dropped = r.unwrap().report.notes.iter().any(|n| {
@@ -202,12 +203,11 @@ fn refused_and_dropped_covers_admit_nothing() {
     });
     assert!(dropped);
     assert_eq!(admits, base);
-    // A second LIFT of the malformed file.
-    let (o1, d1) = lift("l1", "a");
-    let (o2, d2) = lift("l2", "b");
+    // LIFT of the malformed file, likewise.
+    let (o, d) = lift("l", "b");
     let (r, _, admits) = run(&lanes(
-        &format!(r#""liftCover": [{o1}, {o2}]"#),
-        &format!("{d1}{d2}"),
+        &format!(r#""liftCover": [{o}]"#),
+        &d.replace(r#""h": 200"#, r#""h": -200"#),
     ));
     assert!(matches!(
         r,

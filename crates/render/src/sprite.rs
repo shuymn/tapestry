@@ -264,6 +264,7 @@ mod tests {
                 blend,
                 clip: clip.map(ClipId),
             },
+            clip_rect: None,
             start,
             end,
         }

@@ -1,59 +1,26 @@
-//! The lanes (`note`), LIFT (`liftCover`) and HIDDEN+ (`hiddenCover`),
-//! and the offset-4 rule that tells SUDDEN+'s paint (`cover_paint`) from
-//! an image following it.
+//! The lanes (`note`), and the offset-4 rule that tells SUDDEN+'s paint
+//! (`cover_paint`) from an image following it.
 //!
 //! The source draws the lanes from eight lane rects
 //! (`JsonPlaySkinObjectLoader.java:79-93`, `play/LaneRenderer.java:
 //! 288-727` at `0.8.9`); the model draws them as one widget whose parts
-//! are the notes, the bar line groups ([`super::bar`]), LIFT and HIDDEN+. LIFT and HIDDEN+ map
-//! only in a narrow subset: static, white, exactly over the lanes, on the
-//! lanes' own timer, conditions and window, each painted where its
-//! destination stands by a marker element. LIFT is play-critical and
-//! refuses outside it; HIDDEN+, which the player may leave off, is
-//! dropped with a note (owner decision 15).
+//! are the notes, the judgment line and the bar line groups
+//! ([`super::bar`]). The covers' paint is apart ([`super::cover_paint`]).
 
-use skin_model::{
-    Blend, ElementDef, End, Filter, HiddenTrim, LanePaint, LaneParts, LaneStyle, LanesDef,
-    MAX_COORD, Region, Side, Source, SourceLanes, TimerRef,
-};
+use skin_model::{Filter, LaneParts, LaneStyle, LanesDef, Side, Source, SourceLanes};
 
 use super::super::asset::Crop;
 use super::super::geom::{HEIGHT, Offset, Q, Rect};
 use super::super::policy::{self, CriticalPart, Role};
-use super::super::report::{DeviationId, LaneApprox, NoteKind, PropertyKind, Severity, Span};
-use super::super::track::{self, Accepted, Stretch};
-use super::super::{Common, Cx, Dst, OFFSET_HIDDEN, OFFSET_LIFT, Op, Opts, Prop, RUNTIME_OFFSETS};
+use super::super::report::{DeviationId, LaneApprox, NoteKind, Severity, Span};
+use super::super::track::{self, Stretch};
+use super::super::{Common, Cx, Dst, Opts, RUNTIME_OFFSETS};
 use super::SrcImage;
 use crate::error::ImportError;
 use crate::tree::Scalar;
 
 /// The lanes the source draws.
 const LANES: usize = 8;
-
-/// HIDDEN+'s own switch, `hidden1_on` (`SkinProperty.java:860`).
-const OP_HIDDEN: i32 = 273;
-
-/// The polarity of `name`, a boolean property name, when it is
-/// `hidden1_on`: `true` with an even number of `!` before it, `false`
-/// with an odd one; `None` for any other name.
-fn hidden_name(name: &str) -> Option<bool> {
-    let rest = name.trim_start_matches('!');
-    (rest == "hidden1_on").then(|| (name.len() - rest.len()).is_multiple_of(2))
-}
-
-/// When an element shows: from its first key to its last under `Hide`,
-/// from its first key on otherwise (`None`).
-type Window = (i64, Option<i64>);
-
-/// The window of an accepted track.
-fn window(t: &Accepted) -> Window {
-    let k0 = t.keys.first().map_or(0, |k| k.at);
-    let kn = t.keys.last().map_or(0, |k| k.at);
-    match t.end {
-        End::Hide => (k0, Some(kn)),
-        End::Hold | End::Loop { .. } => (k0, None),
-    }
-}
 
 /// The lanes once their destination is mapped.
 pub(crate) struct LaneState {
@@ -64,14 +31,6 @@ pub(crate) struct LaneState {
     pub(crate) bar_spans: Vec<Span>,
     /// The lanes' rounded left and right edges.
     lane_span: [i128; 2],
-    /// Lane 0's source `y` and `h` (`play/LaneRenderer.java:324-326`).
-    y0: i32,
-    h0: i32,
-    timer: TimerRef,
-    cond_src: String,
-    window: Window,
-    /// Some user offset moves the lanes.
-    moved: bool,
 }
 
 /// The texels of a frame of `[iw, ih]` that stretch 5 keeps for
@@ -391,7 +350,6 @@ impl Cx<'_> {
             self.ignored(at, NoteKind::Ignored { field: "stretch" });
         }
         let o = c.offset;
-        let moved = [o.x, o.y, o.w, o.h].iter().any(|&v| v != 0);
         let Some(xs) = self.lane_xs(rec, o)? else {
             return refuse(self, "dst");
         };
@@ -520,8 +478,6 @@ impl Cx<'_> {
             body_off: [0; LANES],
             mine: [0; LANES],
             line: None,
-            lift: None,
-            hidden: None,
         };
         for (u, ([x0, x1], imgs)) in xs.iter().zip(images).enumerate() {
             let m = model(u);
@@ -563,12 +519,6 @@ impl Cx<'_> {
                 top,
                 line,
                 bottom,
-                // LIFT and HIDDEN+ set their own extents when they map.
-                lift_at: source.bottom,
-                lift_h: 0.0,
-                hidden_at: source.bottom,
-                hidden_h: 0.0,
-                hidden_trim: HiddenTrim::None,
                 note_h,
                 mine_h: note_h,
                 line_h: 1,
@@ -578,12 +528,6 @@ impl Cx<'_> {
             span: at,
             bar_spans,
             lane_span: span,
-            y0,
-            h0,
-            timer: c.timer,
-            cond_src: c.cond_src.clone(),
-            window: window(&c.track),
-            moved,
         };
         self.push(c, Source::Lanes, t)?;
         self.lanes = Some(state);
@@ -757,352 +701,6 @@ impl Cx<'_> {
         }
         Ok(Some((image, r)))
     }
-
-    /// A cover's upper and lower edges, y down, each within
-    /// ±[`MAX_COORD`].
-    fn cover_edges(&self, at: Span, r: Rect) -> Result<[Q; 2], ImportError> {
-        let max = i128::from(MAX_COORD);
-        let near = |v: Q| Q::int(-max) <= v && v <= Q::int(max);
-        let lower = Q::int(HEIGHT).sub(r.y);
-        match (lower.and_then(|v| v.sub(r.h)), lower) {
-            (Some(upper), Some(lower)) if near(upper) && near(lower) => Ok([upper, lower]),
-            _ => Err(self.range(at, "dst")),
-        }
-    }
-
-    /// Whether `x` and `w` (source pixels) round to the lanes' span.
-    fn over_lanes(&self, at: Span, x: i32, w: i32) -> Result<bool, ImportError> {
-        let Some([s0, s1]) = self.lanes.as_ref().map(|l| l.lane_span) else {
-            return Ok(false);
-        };
-        let left = Q::int(x).mul(self.r).and_then(Q::round);
-        let right = Q::int(i64::from(x) + i64::from(w))
-            .mul(self.r)
-            .and_then(Q::round);
-        let (Some(left), Some(right)) = (left, right) else {
-            return Err(self.range(at, "dst"));
-        };
-        Ok(left == s0 && right == s1)
-    }
-
-    /// A cover's common part, refused as `role` says unless it is static,
-    /// white, opaque, alpha-blended, unrotated, unstretched or fit to its
-    /// width (stretch 4 or 5), not moved by any user offset, and shown
-    /// exactly when the lanes are.
-    fn cover_common(
-        &mut self,
-        dst: &Dst,
-        role: Role,
-        allow: &[i32],
-    ) -> Result<Option<Common>, ImportError> {
-        let at = dst.span;
-        let Some(c) = self.common_with(
-            role,
-            dst,
-            Opts {
-                allow,
-                ..Opts::default()
-            },
-        )?
-        else {
-            return Ok(None);
-        };
-        let Some(l) = self.lanes.as_ref() else {
-            return Ok(None);
-        };
-        if !(Stretch::of(dst.stretch) == Stretch::Identity || matches!(dst.stretch, 4 | 5)) {
-            self.drop_el(role, at, NoteKind::Stretch(dst.stretch))?;
-            return Ok(None);
-        }
-        let still = c.track.identical()
-            && c.track
-                .keys
-                .first()
-                .is_some_and(|k| k.color == [255; 4] && k.angle == 0)
-            && c.blend == Blend::Alpha
-            && dst.blend != 3
-            && c.offset == Offset::default()
-            && !l.moved;
-        let same = c.timer == l.timer && c.cond_src == l.cond_src && window(&c.track) == l.window;
-        if !(still && same) {
-            self.drop_el(role, at, NoteKind::UnsupportedField { field: "dst" })?;
-            return Ok(None);
-        }
-        Ok(Some(c))
-    }
-
-    /// A `liftCover` destination: LIFT when it is the first, static, exact
-    /// cover under the lanes trimmed at their bottom; refused otherwise.
-    pub(in super::super) fn lift_cover(&mut self, dst: Dst, rec: u32) -> Result<(), ImportError> {
-        let at = dst.span;
-        let part = CriticalPart::Lift;
-        let refuse = |cx: &Self, field: &'static str| {
-            Err(ImportError::Critical {
-                at: cx.loc(at),
-                part,
-                why: NoteKind::UnsupportedField { field },
-            })
-        };
-        let Some(l) = self.lanes.as_ref() else {
-            return refuse(self, "liftCover");
-        };
-        if l.def.parts.lift.is_some() {
-            return refuse(self, "liftCover");
-        }
-        let y0 = l.y0;
-        let [line, link] = self
-            .def
-            .fields(rec, ["disapearLine", "isDisapearLineLinkLift"]);
-        let line = self.int_or(line, "disapearLine", -1)?;
-        let link = match link {
-            Some(f) => self.def.bool(f, "isDisapearLineLinkLift")?,
-            None => false,
-        };
-        // Trimmed at the lanes' bottom and not following LIFT
-        // (`play/SkinHidden.java:63-66, 75-90`).
-        if line != y0 || link {
-            return refuse(self, "disapearLine");
-        }
-        // The source adds the LIFT offset (`JsonPlaySkinObjectLoader.java:
-        // 207-210`).
-        let s = self.src_image(rec)?;
-        let Some(c) = self.cover_common(&dst, Role::Critical(part), &[OFFSET_LIFT])? else {
-            return Ok(());
-        };
-        let [xl, yl, wl, hl] = c.track.keys.first().map_or([0; 4], |k| k.rect);
-        // A destination without height refuses, even with stretch 4: at
-        // zero lift the source hides it, but a lift can pass its trim gate
-        // and stretch 4 would then grow it, changing its vertical extent
-        // (below).
-        if !self.over_lanes(at, xl, wl)?
-            || hl <= 0
-            || i64::from(yl) + i64::from(hl) != i64::from(y0)
-        {
-            return refuse(self, "dst");
-        }
-        let unstretched = self.cover_rect(&c)?;
-        let Some((image, r)) = self.add_cover_image(&c, &dst, rec, &s)? else {
-            return refuse(self, "src");
-        };
-        // The source clips LIFT to its unstretched destination before
-        // stretching it (`play/SkinHidden.java:75-88`,
-        // `skin/SkinObject.java:655-656`): a stretch maps only when it
-        // keeps the destination's vertical extent, so the cover's upper
-        // edge stays on the raised line.
-        if (r.y, r.h) != (unstretched.y, unstretched.h) {
-            return Err(ImportError::Critical {
-                at: self.loc(at),
-                part,
-                why: NoteKind::Stretch(dst.stretch),
-            });
-        }
-        let [upper, _] = self.cover_edges(at, r)?;
-        if let Some(l) = self.lanes.as_mut() {
-            l.def.parts.lift = Some(image);
-            l.def.lift_at = upper.to_f32();
-            l.def.lift_h = r.h.to_f32();
-        }
-        self.lane_marker(LanePaint::Lift, at, dst.keys.len())
-    }
-
-    /// The marker of the lanes' `part` at destination `at`, which wrote
-    /// `written` keys: it paints the part there in the draw order
-    /// (`JSONSkinLoader.java:316-337`). Its one key is the destination's
-    /// first, charged as written; a destination of none is charged it.
-    fn lane_marker(
-        &mut self,
-        part: LanePaint,
-        at: Span,
-        written: usize,
-    ) -> Result<(), ImportError> {
-        if written == 0 {
-            self.budget.keys(1).map_err(|l| self.limit(at, l))?;
-        }
-        self.elements
-            .push(ElementDef::lane_paint(part, Region::Screen));
-        self.element_spans.push(at);
-        Ok(())
-    }
-
-    /// A `hiddenCover` destination: HIDDEN+ when it is the first, static,
-    /// exact cover across the lanes; dropped with a note otherwise (owner
-    /// decision 15).
-    ///
-    /// The source raises it by the LIFT and HIDDEN+ offsets (3 and 5,
-    /// `JsonPlaySkinObjectLoader.java:182-194`, `play/LaneRenderer.java:
-    /// 324-345`), which the model's geometry is, so they are consumed
-    /// however they are listed. Its enable switch, op 273, is the player's
-    /// setting: the model draws HIDDEN+ exactly while its amount is above
-    /// 0, so a positive op 273 is taken from its conditions. Its
-    /// `disapearLine` trims it below (`play/SkinHidden.java:61-90`):
-    /// fixed, or rising with the lift when `isDisapearLineLinkLift`
-    /// (default true, `skin/json/JsonSkin.java:391-392`); a negative line
-    /// is no trim.
-    pub(in super::super) fn hidden_cover(&mut self, dst: Dst, rec: u32) -> Result<(), ImportError> {
-        let at = dst.span;
-        let role = Role::Decorative;
-        let drop = |cx: &mut Self, field: &'static str| {
-            cx.drop_el(role, at, NoteKind::UnsupportedField { field })
-        };
-        let Some(l) = self.lanes.as_ref() else {
-            return drop(self, "hiddenCover");
-        };
-        if l.def.parts.hidden.is_some() {
-            return drop(self, "hiddenCover");
-        }
-        let (y0, h0) = (l.y0, l.h0);
-        let [line, link] = self
-            .def
-            .fields(rec, ["disapearLine", "isDisapearLineLinkLift"]);
-        let line = self.int_or(line, "disapearLine", -1)?;
-        let link = match link {
-            Some(f) => self.def.bool(f, "isDisapearLineLinkLift")?,
-            None => true,
-        };
-        let s = self.src_image(rec)?;
-        let mut dst = dst;
-        dst.ops.retain(|op| match op {
-            Op::Id(n) => *n != OP_HIDDEN,
-            Op::Name(name) => hidden_name(name) != Some(true),
-        });
-        // Its negation would hide HIDDEN+ while it is on: unsupported here,
-        // though the switch is a condition elsewhere.
-        let negated = |op: &Op| match op {
-            Op::Id(n) => *n == -OP_HIDDEN,
-            Op::Name(name) => hidden_name(name) == Some(false),
-        };
-        if dst.ops.iter().any(negated)
-            || match &dst.draw {
-                Prop::Id(n) => *n == -OP_HIDDEN,
-                Prop::Name(name) => hidden_name(name) == Some(false),
-                Prop::Null => false,
-            }
-        {
-            let why = NoteKind::UnsupportedProperty {
-                kind: PropertyKind::Boolean,
-                id: Some(-OP_HIDDEN),
-            };
-            return self.drop_el(role, at, why);
-        }
-        if match &dst.draw {
-            Prop::Id(n) => *n == OP_HIDDEN,
-            Prop::Name(name) => hidden_name(name) == Some(true),
-            Prop::Null => false,
-        } {
-            dst.draw = Prop::Null;
-        }
-        let Some(c) = self.cover_common(&dst, role, &[OFFSET_LIFT, OFFSET_HIDDEN])? else {
-            return Ok(());
-        };
-        // Across the lanes, at any height; a destination without height
-        // takes one only from a stretch.
-        let [xh, _, wh, hh] = c.track.keys.first().map_or([0; 4], |k| k.rect);
-        let identity = Stretch::of(dst.stretch) == Stretch::Identity;
-        if !self.over_lanes(at, xh, wh)? || hh < 0 || (hh == 0 && identity) {
-            return drop(self, "dst");
-        }
-        let unstretched = self.cover_rect(&c)?;
-        let Some((image, r)) = self.add_cover_image(&c, &dst, rec, &s)? else {
-            return Ok(());
-        };
-        if r.h <= Q::int(0) {
-            return drop(self, "dst");
-        }
-        let [upper, lower] = self.cover_edges(at, r)?;
-        // The trim line, y down; checked within ±MAX_COORD as the edges.
-        let max = i128::from(MAX_COORD);
-        let trim_y = if line < 0 {
-            None
-        } else {
-            let y = Q::int(line)
-                .mul(self.r)
-                .and_then(|v| Q::int(HEIGHT).sub(v))
-                .filter(|&y| Q::int(-max) <= y && y <= Q::int(max))
-                .ok_or_else(|| self.range(at, "disapearLine"))?;
-            Some(y)
-        };
-        let trim = match trim_y {
-            None => HiddenTrim::None,
-            Some(y) if link => HiddenTrim::Lift(y.to_f32()),
-            Some(y) => HiddenTrim::Fixed(y.to_f32()),
-        };
-        if let Some(l) = self.lanes.as_mut() {
-            l.def.parts.hidden = Some(image);
-            l.def.hidden_at = upper.to_f32();
-            l.def.hidden_h = r.h.to_f32();
-            l.def.hidden_trim = trim;
-        }
-        self.lane_marker(LanePaint::Hidden, at, dst.keys.len())?;
-        let part = CriticalPart::Lanes;
-        if trim_y.is_some() && (r.y, r.h) != (unstretched.y, unstretched.h) {
-            self.lane_approx(at, part, LaneApprox::HiddenStretch)?;
-        }
-        // Where the source can draw it over its whole travel; the model
-        // cuts it to the lanes.
-        let range = |cx: &Self| cx.range(at, "dst");
-        let h_up = Q::int(h0).mul(self.r).ok_or_else(|| range(self))?;
-        let bottom = Q::int(y0)
-            .mul(self.r)
-            .and_then(|v| Q::int(HEIGHT).sub(v))
-            .ok_or_else(|| range(self))?;
-        let source = self.cover_edges(at, unstretched)?;
-        let reach =
-            source_reach([upper, lower], source, trim_y, h_up).ok_or_else(|| range(self))?;
-        let top = Q::int(self.lanes.as_ref().map_or(0, |l| l.def.top));
-        if let Some([highest, lowest]) = reach
-            && (highest < top || lowest > bottom)
-        {
-            self.lane_approx(at, part, LaneApprox::HiddenClip)?;
-        }
-        Ok(())
-    }
-}
-
-/// How far up and down the source draws HIDDEN+ over its travel, y down,
-/// or `None` where it never draws it; `None` outside on overflow. `[fu, fl]`
-/// are its stretched destination's edges at rest, `[su, sl]` its
-/// unstretched one's, `trim` its trim line at rest and `travel` the lane's
-/// height.
-///
-/// The source decides from the unstretched destination
-/// (`play/SkinHidden.java:73-90`): raised by `k`, nothing while its upper
-/// edge is at or below the trim; the stretched one clipped to the
-/// unstretched upper edge and the trim while the unstretched lower edge is
-/// below the trim; otherwise the stretched one whole. A linked trim rises with the lift as the
-/// cover does, so only the cover's own share moves it against the trim and
-/// the extremes are those of a fixed trim. Every edge falls as `k` grows
-/// within each case: the highest edge is at `k = travel`, and the lowest at
-/// the smallest `k` of each case.
-fn source_reach(
-    [fu, fl]: [Q; 2],
-    [su, sl]: [Q; 2],
-    trim: Option<Q>,
-    travel: Q,
-) -> Option<Option<[Q; 2]>> {
-    let Some(t) = trim else {
-        return Some(Some([fu.sub(travel)?, fl]));
-    };
-    // Even a destination without height must rise strictly above it.
-    if su.sub(travel)? >= t {
-        return Some(None);
-    }
-    let zero = Q::int(0);
-    let clip_up = fu.max(su);
-    let highest = if sl.sub(travel)? <= t {
-        fu.sub(travel)?
-    } else if clip_up.sub(travel)? < t {
-        clip_up.sub(travel)?
-    } else {
-        return Some(None);
-    };
-    let whole_from = sl.sub(t)?.max(zero);
-    let mut lowest = (whole_from <= travel).then(|| fl.sub(whole_from)).flatten();
-    let clip_from = clip_up.sub(t)?.max(zero);
-    if clip_from < whole_from.min(travel) {
-        let c = fl.sub(clip_from)?.min(t);
-        lowest = Some(lowest.map_or(c, |l| l.max(c)));
-    }
-    Some(lowest.map(|l| [highest, l]))
 }
 
 #[cfg(test)]

@@ -11,15 +11,15 @@ use bms_model::{Chart, ChartBuilder, Lane, TimeUs};
 use eval::{JudgeEvent, JudgeEventKind, Section};
 use lanes_support::{
     BAR, BODY_OFF, BODY_ON, COVER, HEAD, HIDDEN, LIFT, LINE, MINE, NOTE, TAIL, WHITE, bar_group,
-    bound, cover_image, image, in_column, in_lane, in_region, lanes_element, lanes_skin, paint,
-    quads_of, rects, simple, skin_with, skin_with_widgets, still, with_markers,
+    bound, cover_image, image, in_column, in_lane, in_region, lanes_element, lanes_skin, moving,
+    paint, quads_of, rects, simple, skin_with, skin_with_widgets, still,
 };
 use play_support::{GAUGES, Harness, MS, REGIONS, ev, full, hold_ended, judged, lane, ln_held};
 use rules::Judgment;
 use skin_model::{
-    Attempt, Bind, Canvas, Fill, Fit, Follow, HiddenTrim, LANE_QUADS, LANE_RESERVED, LANE_VISITS,
-    LanePart, LaneView, LanesDef, LanesError, Layout, LoadError, MAX_COORD, Place, PlayContext,
-    QuadBatch, Region, Scale, Side, Skin, SkinDef,
+    Attempt, Bind, Canvas, CoverMotion, CoverTrim, Fill, Fit, Follow, LANE_QUADS, LANE_RESERVED,
+    LANE_VISITS, LanePart, LaneView, LanesDef, LanesError, Layout, LoadError, MAX_COORD, Place,
+    PlayContext, QuadBatch, Region, Scale, Side, Skin, SkinDef,
 };
 
 /// 150 BPM, in thousandths.
@@ -677,20 +677,18 @@ fn the_cover_and_the_lift_shorten_the_visible_span() {
     h.view.cover = 250;
     h.view.lift = 100;
     h.frame(700, &[]);
-    // The judgment line follows the lift; the lift cover runs from it to
-    // the bottom.
+    // The judgment line follows the lift; the lanes paint no cover of
+    // their own.
     assert_eq!(rects(&h, LINE), [[160.0, 797.0, 544.0, 6.0]]);
-    assert_eq!(rects(&h, LIFT), [[160.0, 800.0, 544.0, 160.0]]);
-    // The lanes paint no SUDDEN+ of their own.
-    assert!(rects(&h, COVER).is_empty());
+    for part in [COVER, LIFT, HIDDEN] {
+        assert!(rects(&h, part).is_empty(), "part {part}");
+    }
     // Lift 500 ‰ raises the line 400 to 480; cover 500 ‰ of the 400 left
     // is 200: the edge is 280 and a note 300 ms ahead sits halfway down
     // the 200 px span.
     assert_eq!(centres(&chart, 700, 500, 500), [380.0, 280.0]);
-    // Without a lift, the lift cover is not drawn.
     let mut h = harness(&chart);
     h.frame(700, &[]);
-    assert!(rects(&h, LIFT).is_empty());
     assert_eq!(rects(&h, LINE), [[160.0, 877.0, 544.0, 6.0]]);
 }
 
@@ -713,23 +711,6 @@ fn covered(
 }
 
 #[test]
-fn the_lift_cover_keeps_its_own_height() {
-    // Anchored at 960, 50 tall: a lift of 200 ‰ (160) moves it to 800.
-    let chart = ChartBuilder::new(BPM).build().unwrap();
-    let h = covered(
-        &chart,
-        |d| (d.lift_at, d.lift_h) = (960.0, 50.0),
-        [0, 200, 0],
-        700,
-    );
-    let [lift] = quads_of(&h, LIFT)[..] else {
-        panic!("one lift cover");
-    };
-    assert_eq!(lift.rect, [160.0, 800.0, 544.0, 50.0]);
-    assert_eq!(lift.uv, h.uvs.get(LIFT).unwrap().uv);
-}
-
-#[test]
 fn the_covers_may_hide_the_whole_lane() {
     // Top 200, line and bottom 800: the lane is 600 long. A cover of
     // 900 ‰ takes 540, the scroll's top at 740, a 60 px span; a note
@@ -740,7 +721,7 @@ fn the_covers_may_hide_the_whole_lane() {
         .build()
         .unwrap();
     let anchors = |d: &mut LanesDef| {
-        (d.top, d.line, d.bottom, d.lift_at) = (200, 800, 800, 800.0);
+        (d.top, d.line, d.bottom) = (200, 800, 800);
     };
     let h = covered(&chart, anchors, [900, 0, 0], 1_000);
     let centres: Vec<f32> = in_lane(&h, NOTE, lane(3))
@@ -749,146 +730,14 @@ fn the_covers_may_hide_the_whole_lane() {
         .collect();
     assert_eq!(centres[1..], [770.0]);
     // With no scroll left, by the lift, the cover or both, nothing is
-    // divided by it: no note is drawn, only the line and the covers.
+    // divided by it: no note is drawn, only the line.
     for (cover, lift, line) in [(0, 1_000, 200.0), (1_000, 0, 800.0), (1_000, 1_000, 200.0)] {
         let h = covered(&chart, anchors, [cover, lift, 0], 1_000);
         let case = format!("cover {cover}, lift {lift}");
         assert!(rects(&h, NOTE).is_empty(), "{case}");
         assert!(rects(&h, BAR).is_empty(), "{case}");
         assert_eq!(rects(&h, LINE), [[160.0, line - 3.0, 544.0, 6.0]], "{case}");
-        assert_eq!(rects(&h, LIFT).len(), usize::from(lift > 0), "{case}");
     }
-}
-
-#[test]
-fn the_lift_cover_hangs_from_its_anchor() {
-    // Anchored at the bottom (960), a lift of 100 ‰ (80) paints from 880.
-    let chart = ChartBuilder::new(BPM).build().unwrap();
-    let h = covered(&chart, |d| d.lift_at = 960.0, [0, 100, 0], 700);
-    assert_eq!(rects(&h, LIFT), [[160.0, 880.0, 544.0, 80.0]]);
-    assert_eq!(rects(&h, LINE), [[160.0, 797.0, 544.0, 6.0]]);
-}
-
-/// `part`'s uv with its lower end cut to the share `to` of its height.
-fn cut_uv(h: &Harness, part: u32, to: f32) -> [f32; 4] {
-    let [u0, v0, u1, v1] = h.uvs.get(part).unwrap().uv;
-    [u0, v0, u1, v0 + (v1 - v0) * to]
-}
-
-#[test]
-fn hidden_plus_rises_over_the_notes_from_its_anchor() {
-    // The lane is 800 long; HIDDEN+ is 800 tall from the line (880),
-    // trimmed at the line as it rises.
-    let chart = ChartBuilder::new(BPM)
-        .tap(lane(3), TimeUs(1_000 * MS))
-        .tap(lane(3), TimeUs(1_300 * MS))
-        .build()
-        .unwrap();
-    let keep = |_: &mut LanesDef| {};
-    // At 0 ‰ nothing is drawn, whatever the lift, even untrimmed where
-    // its anchor lies above the lanes' bottom.
-    let untrimmed = |d: &mut LanesDef| d.hidden_trim = HiddenTrim::None;
-    for lift in [0, 300] {
-        let h = covered(&chart, untrimmed, [0, lift, 0], 700);
-        assert!(rects(&h, HIDDEN).is_empty(), "lift {lift}");
-    }
-    let up = (880.0_f64 - 0.8) as f32;
-    assert_eq!(
-        rects(&covered(&chart, untrimmed, [0, 0, 1], 700), HIDDEN),
-        [[160.0, up, 544.0, 960.0 - up]]
-    );
-
-    // 500 ‰ raises it 400 px: its upper edge at 480, its upper half
-    // drawn down to the line. 1 000 ‰ raises it to the top, whole.
-    let h = covered(&chart, keep, [0, 0, 500], 700);
-    let [q] = quads_of(&h, HIDDEN)[..] else {
-        panic!("one HIDDEN+");
-    };
-    assert_eq!(q.rect, [160.0, 480.0, 544.0, 400.0]);
-    assert_eq!(q.uv, cut_uv(&h, HIDDEN, 0.5));
-    let h = covered(&chart, keep, [0, 0, 1_000], 700);
-    let [q] = quads_of(&h, HIDDEN)[..] else {
-        panic!("one HIDDEN+");
-    };
-    assert_eq!(q.rect, [160.0, 80.0, 544.0, 800.0]);
-    assert_eq!(q.uv, h.uvs.get(HIDDEN).unwrap().uv);
-    // It changes neither the scroll nor the notes under it.
-    let notes = |hidden| rects(&covered(&chart, keep, [250, 100, hidden], 700), NOTE);
-    assert_eq!(notes(1_000), notes(0));
-    assert_eq!(notes(0).len(), 2);
-    // A fraction of a pixel is kept: 333 ‰ raises it 266.4 px.
-    let h = covered(&chart, keep, [0, 0, 333], 700);
-    let upper = (880.0_f64 - 800.0 * 333.0 / 1_000.0) as f32;
-    assert_eq!(rects(&h, HIDDEN), [[160.0, upper, 544.0, 880.0 - upper]]);
-}
-
-#[test]
-fn hidden_plus_takes_its_share_of_the_length_above_the_lift() {
-    // Lift 300 ‰ raises the line 240 px to 640 and leaves 560 above it;
-    // HIDDEN+ 500 ‰ takes 280 of them on top of the lift: its upper edge
-    // at 880 − 240 − 280 = 360, trimmed at the raised line, 640.
-    let chart = ChartBuilder::new(BPM).build().unwrap();
-    let h = covered(&chart, |_| {}, [0, 300, 500], 700);
-    let [q] = quads_of(&h, HIDDEN)[..] else {
-        panic!("one HIDDEN+");
-    };
-    assert_eq!(q.rect, [160.0, 360.0, 544.0, 280.0]);
-    assert_eq!(q.uv, cut_uv(&h, HIDDEN, 280.0 / 800.0));
-    // At 1 000 ‰ it reaches the top whatever the lift.
-    let h = covered(&chart, |_| {}, [0, 300, 1_000], 700);
-    assert_eq!(rects(&h, HIDDEN), [[160.0, 80.0, 544.0, 560.0]]);
-    // A fixed trim stays put as the lift rises; without one it is cut at
-    // the lanes' bottom (960), and so is a trim below the bottom.
-    for (trim, lower) in [
-        (HiddenTrim::Fixed(700.0), 700.0),
-        (HiddenTrim::None, 960.0),
-        (HiddenTrim::Fixed(1_000.0), 960.0),
-        (HiddenTrim::Lift(1_300.0), 960.0),
-        (HiddenTrim::Lift(900.5), 660.5),
-    ] {
-        let h = covered(&chart, |d| d.hidden_trim = trim, [0, 300, 500], 700);
-        assert_eq!(
-            rects(&h, HIDDEN),
-            [[160.0, 360.0, 544.0, lower - 360.0]],
-            "{trim:?}"
-        );
-    }
-    // A cover shorter than the space above its trim keeps its own
-    // height: 100 tall, it ends at 460, whole.
-    let h = covered(&chart, |d| d.hidden_h = 100.0, [0, 300, 500], 700);
-    let [q] = quads_of(&h, HIDDEN)[..] else {
-        panic!("one HIDDEN+");
-    };
-    assert_eq!(q.rect, [160.0, 360.0, 544.0, 100.0]);
-    assert_eq!(q.uv, h.uvs.get(HIDDEN).unwrap().uv);
-    // Nothing is left once its upper edge is at or below the trim: an
-    // anchor 300 below the line at 500 ‰ (400) leaves its edge at 780,
-    // under a trim at 700.
-    let low = |d: &mut LanesDef| {
-        d.hidden_at = 1_180.0;
-        d.hidden_trim = HiddenTrim::Fixed(700.0);
-    };
-    assert!(rects(&covered(&chart, low, [0, 0, 500], 700), HIDDEN).is_empty());
-    // A full lift leaves it no share, but it stays on, hanging from the
-    // raised line (80): cut at a fixed trim or at the lanes' bottom, and
-    // gone under a trim raised with the line.
-    for (trim, want) in [
-        (HiddenTrim::Fixed(700.0), vec![[160.0, 80.0, 544.0, 620.0]]),
-        (HiddenTrim::None, vec![[160.0, 80.0, 544.0, 800.0]]),
-        (HiddenTrim::Lift(880.0), vec![]),
-    ] {
-        let h = covered(&chart, |d| d.hidden_trim = trim, [0, 1_000, 500], 700);
-        assert_eq!(rects(&h, HIDDEN), want, "{trim:?}");
-    }
-    // Without its image nothing is drawn.
-    let none = covered(&chart, |d| d.parts.hidden = None, [0, 0, 500], 700);
-    assert!(rects(&none, HIDDEN).is_empty());
-    // Above 1 000 ‰ counts as 1 000: a cover 100 tall stays at the top.
-    let short = |d: &mut LanesDef| d.hidden_h = 100.0;
-    assert_eq!(
-        rects(&covered(&chart, short, [0, 300, 1_200], 700), HIDDEN),
-        [[160.0, 80.0, 544.0, 100.0]]
-    );
 }
 
 #[test]
@@ -1152,12 +1001,14 @@ fn taps(per_lane: i64, step: i64, extra: i64) -> Chart {
     b.build().unwrap()
 }
 
-/// The simple lanes without bar lines and their markers, two image
-/// elements beside them and a SUDDEN+ paint after them.
+/// The simple lanes without bar lines, two image elements beside them and
+/// the paints of SUDDEN+, HIDDEN+ and LIFT after them, each trimmed one at
+/// the line, rising with it.
 fn budget_skin() -> Skin {
     let mut def = simple();
     def.bar_groups.clear();
     let screen = Place::SCREEN;
+    let trim = CoverTrim::Lift(880);
     skin_with_widgets(
         REGIONS,
         Some(def),
@@ -1165,10 +1016,16 @@ fn budget_skin() -> Skin {
             image(WHITE, [0, 0, 10, 10], screen),
             lanes_element(),
             paint(0, [160, -720, 544, 800], Follow::Cover),
+            paint(1, [160, 880, 544, 800], Follow::None),
+            paint(2, [160, 960, 544, 80], Follow::None),
             image(WHITE, [20, 0, 10, 10], screen),
         ],
         skin_model::WidgetDefs {
-            cover_paints: vec![cover_image(None)],
+            cover_paints: vec![
+                cover_image(None),
+                moving(HIDDEN, CoverMotion::Hidden, trim),
+                moving(LIFT, CoverMotion::Lift, CoverTrim::Fixed(960)),
+            ],
             ..skin_model::WidgetDefs::default()
         },
     )
@@ -1193,12 +1050,11 @@ fn the_quad_budget_fills_exactly_and_keeps_the_reserved_quads() {
     for part in [LINE, HIDDEN, LIFT, COVER] {
         assert_eq!(rects(&h, part).len(), 1, "part {part}");
     }
-    // Every image element and the paint drew too: the batch is exactly
-    // full. The reservation is the line, HIDDEN+ and LIFT; the paint is
-    // an image of its own.
+    // Every image element and paint drew too: the batch is exactly full.
+    // The reservation is the line; each paint is an image of its own.
     assert_eq!(rects(&h, WHITE).len(), 2);
-    assert_eq!(LANE_RESERVED, 3);
-    assert_eq!(h.skin.quad_capacity(), 3 + LANE_QUADS + LANE_RESERVED);
+    assert_eq!(LANE_RESERVED, 1);
+    assert_eq!(h.skin.quad_capacity(), 5 + LANE_QUADS + LANE_RESERVED);
     assert_eq!(h.batch.quads().len(), h.skin.quad_capacity() as usize);
     assert!(h.batch.is_full());
     // One more: still the budget's notes, one drop, the covers and the
@@ -1296,7 +1152,7 @@ fn def_with(elements: Vec<skin_model::ElementDef>, lanes: Option<LanesDef>) -> S
         regions: REGIONS,
         whens: Vec::new(),
         sheet: lanes_support::sheet(),
-        elements: with_markers(lanes.as_ref(), elements),
+        elements,
         lanes,
         widgets: skin_model::WidgetDefs::default(),
         bomb_up_to: Some(skin_model::Grade::Bad),
@@ -1446,84 +1302,10 @@ fn places_and_lanes_are_checked_at_load() {
     let mut edge = simple();
     edge.bar_groups.clear();
     (edge.top, edge.line, edge.bottom) = (-MAX_COORD, 880, 880);
-    let max = MAX_COORD as f32;
-    edge.lift_at = max - 880.0;
     assert!(Skin::new(def_with(vec![lanes_element()], Some(edge))).is_ok());
     let mut bad = simple();
     bad.mine_h = 0;
     assert_eq!(lanes_err(bad), LanesError::Heights);
-    // The covers' anchors may lie anywhere within ±MAX_COORD with their
-    // extents, above the top or below the bottom; a cover drawn needs a
-    // height.
-    for (what, set, ok) in [
-        (
-            "above the top",
-            (|d| d.hidden_at = 30.0) as fn(&mut LanesDef),
-            true,
-        ),
-        ("below the bottom", |d| d.lift_at = 1_000.0, true),
-        ("near the line", |d| d.lift_at = 870.0, true),
-        (
-            "lift beyond",
-            |d| d.lift_at = MAX_COORD as f32 - 879.0,
-            false,
-        ),
-        ("no lift height", |d| d.lift_h = 0.0, false),
-        ("no hidden height", |d| d.hidden_h = 0.0, false),
-        ("not finite", |d| d.lift_at = f32::NAN, false),
-        ("hidden not finite", |d| d.hidden_at = f32::INFINITY, false),
-        (
-            "hidden at the edge",
-            |d| d.hidden_at = 800.0 - MAX_COORD as f32,
-            true,
-        ),
-        (
-            "hidden beyond",
-            |d| d.hidden_at = MAX_COORD as f32 - 799.0,
-            false,
-        ),
-        (
-            "hidden above",
-            |d| d.hidden_at = -1.0 - MAX_COORD as f32,
-            false,
-        ),
-        (
-            "fixed trim at the edge",
-            |d| d.hidden_trim = HiddenTrim::Fixed(MAX_COORD as f32),
-            true,
-        ),
-        (
-            "fixed trim beyond",
-            |d| d.hidden_trim = HiddenTrim::Fixed(MAX_COORD as f32 + 1.0),
-            false,
-        ),
-        (
-            "lift trim beyond",
-            |d| d.hidden_trim = HiddenTrim::Lift(-1.0 - MAX_COORD as f32),
-            false,
-        ),
-        (
-            "trim not finite",
-            |d| d.hidden_trim = HiddenTrim::Fixed(f32::NAN),
-            false,
-        ),
-        (
-            "no height, not drawn",
-            |d| {
-                (d.lift_h, d.hidden_h) = (0.0, 0.0);
-                (d.parts.lift, d.parts.hidden) = (None, None);
-            },
-            true,
-        ),
-    ] {
-        let mut def = simple();
-        set(&mut def);
-        match Skin::new(def_with(vec![lanes_element()], Some(def))) {
-            Ok(_) => assert!(ok, "{what}"),
-            Err(LoadError::Lanes(LanesError::Anchors)) => assert!(!ok, "{what}"),
-            Err(e) => panic!("{e:?}"),
-        }
-    }
     // Authored on the right: the scratch is left of a key.
     let mut bad = simple();
     bad.scratch = Side::Right;
@@ -1540,11 +1322,11 @@ fn places_and_lanes_are_checked_at_load() {
         }
     );
     let mut bad = simple();
-    bad.parts.lift = Some(99);
+    bad.parts.line = Some(99);
     assert_eq!(
         lanes_err(bad),
         LanesError::UnknownPart {
-            part: LanePart::Lift
+            part: LanePart::Line
         }
     );
 }

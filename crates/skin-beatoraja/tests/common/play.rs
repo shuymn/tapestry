@@ -225,6 +225,12 @@ impl Drawn {
 
     /// The quads of the frame at `ms` with `effects`.
     pub fn frame(&mut self, ms: i64, effects: &[JudgeEvent]) -> Vec<Quad> {
+        self.build_frame(ms, effects);
+        self.batch.quads().to_vec()
+    }
+
+    /// Builds the frame at `ms` with `effects` into the batch.
+    fn build_frame(&mut self, ms: i64, effects: &[JudgeEvent]) {
         self.batch.clear();
         let frame = SkinFrame {
             now: TimeUs(ms * MS),
@@ -244,7 +250,6 @@ impl Drawn {
         self.skin
             .build(&mut self.play, &frame, &self.uvs, &mut self.batch)
             .expect("the frame builds");
-        self.batch.quads().to_vec()
     }
 
     /// Each digit by the uv of its glyph, read from the frames at `ms`
@@ -271,7 +276,39 @@ impl Drawn {
 
     /// The rects, rounded, of the frame at `ms`.
     pub fn rects(&mut self, ms: i64) -> Vec<[i32; 4]> {
-        self.frame(ms, &[]).iter().map(|q| round(q.rect)).collect()
+        self.build_frame(ms, &[]);
+        self.batch.quads().iter().map(|q| round(q.rect)).collect()
+    }
+
+    /// The rects, rounded, of the frame at `ms`, each with its run's
+    /// inline clip rect, rounded, when one.
+    pub fn clipped(&mut self, ms: i64) -> Vec<([i32; 4], Option<[i32; 4]>)> {
+        self.build_frame(ms, &[]);
+        let mut out = Vec::new();
+        for r in self.batch.runs() {
+            for i in r.start..r.end {
+                let q = self.batch.quads()[i as usize];
+                out.push((round(q.rect), r.clip_rect.map(|c| round(c.rect()))));
+            }
+        }
+        out
+    }
+
+    /// The rects, rounded, of the frame at `ms`, each unturned quad cut
+    /// to its run's inline clip rect: what shows.
+    pub fn shown(&mut self, ms: i64) -> Vec<[i32; 4]> {
+        self.clipped(ms)
+            .into_iter()
+            .map(|(r, c)| match c {
+                None => r,
+                Some([cx, cy, cw, ch]) => {
+                    let [x, y, w, h] = r;
+                    let (l, t) = (x.max(cx), y.max(cy));
+                    let (rt, b) = ((x + w).min(cx + cw), (y + h).min(cy + ch));
+                    [l, t, (rt - l).max(0), (b - t).max(0)]
+                }
+            })
+            .collect()
     }
 }
 

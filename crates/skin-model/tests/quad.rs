@@ -1,7 +1,8 @@
 //! `QuadBatch`: draw order across blends, runs split on blend and clip,
-//! drops past either capacity, and a fixed allocation.
+//! split on an inline clip rect, drops past either capacity, and a fixed
+//! allocation.
 
-use skin_model::{Blend, ClipId, Quad, QuadBatch, Run, RunKey};
+use skin_model::{Blend, ClipId, ClipRect, Quad, QuadBatch, Run, RunKey};
 
 const ALPHA: RunKey = RunKey {
     blend: Blend::Alpha,
@@ -28,7 +29,12 @@ fn quad(x: f32) -> Quad {
 }
 
 fn run(key: RunKey, start: u32, end: u32) -> Run {
-    Run { key, start, end }
+    Run {
+        key,
+        clip_rect: None,
+        start,
+        end,
+    }
 }
 
 /// Runs cover the quads contiguously from 0, and neighbours differ.
@@ -41,7 +47,10 @@ fn assert_runs_tile(batch: &QuadBatch) {
     }
     assert_eq!(usize::try_from(next).unwrap(), batch.quads().len());
     for pair in batch.runs().windows(2) {
-        assert_ne!(pair[0].key, pair[1].key);
+        assert_ne!(
+            (pair[0].key, pair[0].clip_rect),
+            (pair[1].key, pair[1].clip_rect)
+        );
     }
 }
 
@@ -152,6 +161,72 @@ fn filling_to_capacity_does_not_reallocate() {
         assert_eq!(batch.quads().as_ptr(), quads, "frame {frame}");
         assert_eq!(batch.runs().as_ptr(), runs, "frame {frame}");
     }
+}
+
+fn rect(y: f32) -> ClipRect {
+    ClipRect::new([0.0, y, 10.0, 5.0]).unwrap()
+}
+
+#[test]
+fn a_clip_rect_is_finite_with_positive_area() {
+    assert_eq!(rect(1.0).rect(), [0.0, 1.0, 10.0, 5.0]);
+    for bad in [
+        [0.0, 0.0, 0.0, 1.0],
+        [0.0, 0.0, 1.0, 0.0],
+        [0.0, 0.0, -1.0, 1.0],
+        [0.0, 0.0, 1.0, -1.0],
+        [f32::NAN, 0.0, 1.0, 1.0],
+        [0.0, f32::INFINITY, 1.0, 1.0],
+        [0.0, 0.0, f32::INFINITY, 1.0],
+    ] {
+        assert_eq!(ClipRect::new(bad), None, "{bad:?}");
+    }
+}
+
+/// A run breaks where either its key or its clip rect changes, and merges
+/// only where both match; a plain push has no clip rect.
+#[test]
+fn a_clip_rect_change_splits_a_run() {
+    let mut batch = QuadBatch::with_capacity(16, 16);
+    let (a, b) = (rect(1.0), rect(2.0));
+    assert!(batch.push_clipped(ALPHA, quad(0.0), a));
+    assert!(batch.push_clipped(ALPHA, quad(1.0), a));
+    assert!(batch.push_clipped(ALPHA, quad(2.0), b));
+    assert!(batch.push(ALPHA, quad(3.0)));
+    assert!(batch.push_clipped(ADD, quad(4.0), b));
+    assert!(batch.push_clipped(clipped(1), quad(5.0), b));
+    assert!(batch.push(ALPHA, quad(6.0)));
+    let with = |key, clip_rect, start, end| Run {
+        key,
+        clip_rect,
+        start,
+        end,
+    };
+    assert_eq!(
+        batch.runs(),
+        [
+            with(ALPHA, Some(a), 0, 2),
+            with(ALPHA, Some(b), 2, 3),
+            with(ALPHA, None, 3, 4),
+            with(ADD, Some(b), 4, 5),
+            with(clipped(1), Some(b), 5, 6),
+            with(ALPHA, None, 6, 7),
+        ]
+    );
+    assert_runs_tile(&batch);
+}
+
+/// A clipped push that needs a new run past the run cap is dropped like
+/// any other.
+#[test]
+fn a_clipped_push_respects_both_capacities() {
+    let mut batch = QuadBatch::with_capacity(2, 1);
+    assert!(batch.push(ALPHA, quad(0.0)));
+    assert!(!batch.push_clipped(ALPHA, quad(1.0), rect(0.0)));
+    assert!(batch.push(ALPHA, quad(2.0)));
+    assert!(!batch.push_clipped(ALPHA, quad(3.0), rect(0.0)));
+    assert_eq!(batch.dropped(), 2);
+    assert_runs_tile(&batch);
 }
 
 /// A skin that fills its own quads and runs leaves the reserve whole: the

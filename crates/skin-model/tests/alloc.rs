@@ -30,12 +30,12 @@ use play_support::{bool_program, readouts_for, state, tally};
 use rules::{GaugeValue, Judgment};
 use skin_model::{
     Adjust, Align, Anchor, AtlasLimits, Attach, Attempt, Bind, Blend, BpmRange, BuildError, ClipId,
-    ComboPart, CoverImage, CoverPaintDef, CoverSettings, CycleDef, DigitsDef, DurationRatio, Ease,
-    ElementDef, End, Fill, Filter, Fit, Follow, FrameReadouts, GaugeDef, GaugeDesc, GaugeLook,
-    GaugeParts, GlyphSet, GradePart, ImageDef, JudgeDef, JudgeSlot, KeyDef, LanePaint, LaneParts,
-    LaneTimer, LaneView, Layout as SkinLayout, Motion, Native, NumberDef, Pad, Place, Play,
-    PlayContext, QuadBatch, Region, RegionDef, Sheet, Side, Skin, SkinDef, SkinFrame, Source,
-    TimerRef, Track, UvTable, Variant, field, lane_timer, timer,
+    ComboPart, CoverImage, CoverMotion, CoverPaintDef, CoverSettings, CoverTrim, CycleDef,
+    DigitsDef, DurationRatio, Ease, ElementDef, End, Fill, Filter, Fit, Follow, FrameReadouts,
+    GaugeDef, GaugeDesc, GaugeLook, GaugeParts, GlyphSet, GradePart, ImageDef, JudgeDef, JudgeSlot,
+    KeyDef, LaneParts, LaneTimer, LaneView, Layout as SkinLayout, Motion, Native, NumberDef, Pad,
+    Place, Play, PlayContext, QuadBatch, Region, RegionDef, Sheet, Side, Skin, SkinDef, SkinFrame,
+    Source, TimerRef, Track, UvTable, Variant, field, lane_timer, timer,
 };
 use skin_model::{
     ChartText, FontRef, FrameUv, LoadState, Overflow, TextDef, TextField, TextImage, TextTable,
@@ -432,8 +432,6 @@ fn lanes() -> skin_model::LanesDef {
             body_off: [part(4); 8],
             mine: [part(5); 8],
             line: Some(part(7)),
-            lift: Some(part(9)),
-            hidden: Some(part(8)),
         },
         bar_groups: vec![skin_model::BarGroupDef {
             image: part(6),
@@ -983,10 +981,15 @@ fn skin() -> Loaded {
         visible: Some(bool_program("combo % 5 != 1")),
         ..lanes_support::lanes_element()
     });
-    // HIDDEN+, then SUDDEN+ painted apart: following the cover on
+    // HIDDEN+ (drawn while its amount is above 0, trimmed at the line as
+    // it rises), then SUDDEN+ painted apart: following the cover on
     // `judge`, an additive image between, a slider hidden on some frames
-    // and a choice of table 0 following both with a slider; then LIFT.
-    elements.push(ElementDef::lane_paint(LanePaint::Hidden, Region::Playfield));
+    // and a choice of table 0 following both with a slider; then LIFT,
+    // trimmed at the lanes' bottom by its own gate track.
+    elements.push(ElementDef {
+        visible: Some(bool_program("hidden.permille > 0")),
+        ..lanes_support::paint(3, [160, 880, 544, 800], Follow::Cover)
+    });
     elements.push(ElementDef {
         timer: TimerRef::Builtin(timer::JUDGE),
         ..lanes_support::paint(0, [160, -720, 544, 800], Follow::Cover)
@@ -1004,7 +1007,7 @@ fn skin() -> Loaded {
         [160, -400, 544, 480],
         Follow::LiftAndCover,
     ));
-    elements.push(ElementDef::lane_paint(LanePaint::Lift, Region::Playfield));
+    elements.push(lanes_support::paint(4, [160, 940, 544, 120], Follow::None));
     let beam = lanes_support::bound(Bind::Lane(Lane::SCRATCH));
     elements.push(ElementDef {
         blend: Blend::Add,
@@ -1012,17 +1015,20 @@ fn skin() -> Loaded {
     });
     let mut widgets = widgets(&mut elements);
     widgets.cover_paints = vec![
+        lanes_support::moving(u32::from(SUDDEN), CoverMotion::None, CoverTrim::None),
         CoverPaintDef {
-            image: CoverImage::Image(u32::from(SUDDEN)),
-            slider_range: None,
-        },
-        CoverPaintDef {
-            image: CoverImage::Image(u32::from(LIFT)),
             slider_range: Some(300),
+            ..lanes_support::moving(u32::from(LIFT), CoverMotion::None, CoverTrim::None)
         },
         CoverPaintDef {
             image: CoverImage::Choice(0),
             slider_range: Some(0),
+            ..lanes_support::moving(0, CoverMotion::None, CoverTrim::None)
+        },
+        lanes_support::moving(u32::from(SUDDEN), CoverMotion::Hidden, CoverTrim::Lift(880)),
+        CoverPaintDef {
+            gate_track: Some(lanes_support::rect([160, 960, 544, 80])),
+            ..lanes_support::moving(u32::from(LIFT), CoverMotion::Lift, CoverTrim::Fixed(960))
         },
     ];
     let (_dir, sheet) = images();
@@ -1650,6 +1656,7 @@ fn build_does_not_allocate() {
     );
     source_lanes_do_not_allocate(&chart, &full);
     bar_groups_do_not_allocate(&full);
+    cover_trims_do_not_allocate(&chart, &full);
     // The next attempt, prepared untracked after the stretches, builds.
     let mut play = skin.prepare(&chart, &full).unwrap();
     skin.attach_text(&mut play, text_table()).unwrap();
@@ -1820,12 +1827,29 @@ fn bitmap_skin() -> (tempfile::TempDir, Skin) {
 }
 
 /// The source player's lanes (`lanes_support::source`) on `chart` played
-/// as CN, so every long note shows its end cap, through frames every 16 ms
-/// under covers that leave scroll and covers that leave none, all three
-/// together among them: nothing allocated, and notes, end caps, bodies and
-/// HIDDEN+ drawn.
+/// as CN, so every long note shows its end cap, with HIDDEN+'s paint over
+/// the region, trimmed at its bottom as it rises, through frames every
+/// 16 ms under covers that leave scroll and covers that leave none, all
+/// three together among them: nothing allocated, and notes, end caps,
+/// bodies and HIDDEN+ drawn.
 fn source_lanes_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
-    let skin = lanes_support::lanes_skin(lanes_support::source());
+    let skin = lanes_support::skin_with_widgets(
+        play_support::REGIONS,
+        Some(lanes_support::source()),
+        vec![
+            lanes_support::lanes_element(),
+            lanes_support::paint(0, [160, 280, 544, 600], Follow::None),
+        ],
+        skin_model::WidgetDefs {
+            cover_paints: vec![lanes_support::moving(
+                lanes_support::HIDDEN,
+                CoverMotion::Hidden,
+                CoverTrim::Lift(880),
+            )],
+            ..skin_model::WidgetDefs::default()
+        },
+    )
+    .unwrap();
     let uvs = play_support::uvs(&skin);
     let mut cn = chart.clone();
     cn.meta.ln_mode = Some(bms_model::LnMode::Cn);
@@ -1891,6 +1915,274 @@ fn source_lanes_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
     assert!(
         quads > 0 && tails > 0 && hiddens > 0,
         "source lanes drew {quads} quads, {tails} end caps, {hiddens} HIDDEN+"
+    );
+}
+
+/// The trimmed cover paints of [`cover_trims_do_not_allocate`] over the
+/// simple lanes: HIDDEN+ turning as it moves, trimmed at the line as it
+/// rises; LIFT gated by its own track at the lanes' bottom, kept at a
+/// native size; a choice of LIFT or HIDDEN+ on its entries' tracks,
+/// trimmed at a fixed line; and a LIFT whose gate track ends, so it draws
+/// nothing past 2 s.
+fn trim_skin() -> Skin {
+    use lanes_support::{HIDDEN, LIFT, moving, paint, rect};
+    let turning = Track::new(
+        &[
+            KeyDef {
+                at: TimeUs(0),
+                props: [
+                    Some(160),
+                    Some(880),
+                    Some(544),
+                    Some(800),
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(0),
+                ],
+            },
+            KeyDef {
+                at: TimeUs(3_000 * MS),
+                props: [
+                    Some(160),
+                    Some(800),
+                    Some(544),
+                    Some(800),
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(90),
+                ],
+            },
+        ],
+        Ease::Linear,
+        End::Loop { from: TimeUs(0) },
+    )
+    .unwrap();
+    let ending = Track::new(
+        &[
+            KeyDef {
+                at: TimeUs(0),
+                props: [
+                    Some(160),
+                    Some(900),
+                    Some(544),
+                    Some(60),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                ],
+            },
+            KeyDef {
+                at: TimeUs(2_000 * MS),
+                props: [
+                    Some(160),
+                    Some(900),
+                    Some(544),
+                    Some(60),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                ],
+            },
+        ],
+        Ease::Linear,
+        End::Hide,
+    )
+    .unwrap();
+    let choice = skin_model::ImageChoiceDef {
+        value: skin_model::compile(
+            "combo % 3",
+            &skin_model::Scope::new(&skin_model::PLAY),
+            skin_model::Ty::Int,
+        )
+        .unwrap(),
+        choices: [LIFT, HIDDEN]
+            .map(|image| {
+                Some(skin_model::ImageChoicePart {
+                    span: skin_model::ImageSpan {
+                        image,
+                        first: 0,
+                        frames: 1,
+                    },
+                    cycle: None,
+                    track: Some(rect([
+                        160,
+                        700 + 50 * i32::try_from(image).unwrap(),
+                        544,
+                        300,
+                    ])),
+                    native: None,
+                })
+            })
+            .into_iter()
+            .chain([None])
+            .collect(),
+    };
+    let native = Place {
+        native: Some(Native::Exact([13, 32])),
+        ..lanes_support::in_region(Region::Playfield)
+    };
+    lanes_support::skin_with_widgets(
+        play_support::REGIONS,
+        Some(lanes_support::simple()),
+        vec![
+            lanes_support::lanes_element(),
+            ElementDef {
+                track: turning,
+                ..paint(0, [0; 4], Follow::Cover)
+            },
+            ElementDef {
+                place: native,
+                ..paint(1, [160, 900, 544, 0], Follow::None)
+            },
+            paint(2, [160, 700, 544, 300], Follow::None),
+            paint(3, [160, 900, 544, 60], Follow::None),
+        ],
+        skin_model::WidgetDefs {
+            image_choices: vec![choice],
+            cover_paints: vec![
+                moving(HIDDEN, CoverMotion::Hidden, CoverTrim::Lift(880)),
+                CoverPaintDef {
+                    gate_track: Some(rect([160, 940, 544, 40])),
+                    ..moving(LIFT, CoverMotion::Lift, CoverTrim::Fixed(960))
+                },
+                CoverPaintDef {
+                    image: CoverImage::Choice(0),
+                    ..moving(0, CoverMotion::Lift, CoverTrim::Fixed(850))
+                },
+                CoverPaintDef {
+                    gate_track: Some(ending),
+                    ..moving(LIFT, CoverMotion::Lift, CoverTrim::Lift(930))
+                },
+            ],
+            ..skin_model::WidgetDefs::default()
+        },
+    )
+    .unwrap()
+}
+
+/// Trimmed cover paints build without allocating, each play prepared
+/// untracked: the first build and later ones, the lift changing the
+/// linked trims, HIDDEN+ switched on and off, choices changing, rotation,
+/// every target, a full batch, a gate track that ends, and an invalid
+/// frame poisoning the play. Clipped, whole and suppressed paint all
+/// occur.
+fn cover_trims_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
+    let skin = trim_skin();
+    let uvs = play_support::uvs(&skin);
+    let mut batch = QuadBatch::with_capacity(skin.quad_capacity(), skin.run_capacity());
+    let mut small =
+        QuadBatch::with_capacity(skin_model::LANE_QUADS / 2, skin_model::LANE_QUADS / 2);
+    let gauges = [state(GaugeValue::FULL), state(GaugeValue::FULL)];
+    let layout = SkinLayout::AUTHOR;
+    let (mut clipped, mut whole, mut suppressed, mut turned) = (0_usize, 0_usize, 0_usize, 0_usize);
+    let paint_uvs = [lanes_support::LIFT, lanes_support::HIDDEN].map(|i| {
+        let uv = uvs.get(i).unwrap().uv;
+        [uv[0].to_bits(), uv[2].to_bits()]
+    });
+    let mut play = skin.prepare(chart, ctx).unwrap();
+    TRACK.with(|t| t.set(true));
+    for (i, now) in (0..6_000 * MS).step_by(16 * MS as usize).enumerate() {
+        let on = i / 40 % 2 == 0;
+        let lanes = LaneView {
+            visible_time: TimeUs(600 * MS),
+            cover: [0, 300, 900][i / 7 % 3],
+            lift: [0, 100, 250, 1_000][i / 11 % 4],
+            hidden: if on { [0, 400, 1_000][i / 13 % 3] } else { 0 },
+        };
+        let mut readouts = readouts_for(lanes);
+        readouts.covers.hidden_enabled = on;
+        let t = tally(u32::try_from(i / 17).unwrap_or(0));
+        let frame = SkinFrame {
+            now: TimeUs(now),
+            display_offset: TimeUs(0),
+            tally: &t,
+            gauges: &gauges,
+            gauge: 0,
+            effects: &[],
+            complete: false,
+            target: TARGETS[i / 5 % TARGETS.len()],
+            layout: &layout,
+            lanes,
+            readouts,
+            loading: None,
+            playing: true,
+        };
+        let out = if i % 50 == 49 { &mut small } else { &mut batch };
+        out.clear();
+        skin.build(&mut play, &frame, &uvs, out)
+            .expect("the frame builds");
+        // The paints' quads, each with its run's clip rect.
+        let mut drawn = 0;
+        for r in out.runs() {
+            for q in out
+                .quads()
+                .get(r.start as usize..r.end as usize)
+                .unwrap_or_default()
+            {
+                if !paint_uvs.contains(&[q.uv[0].to_bits(), q.uv[2].to_bits()]) {
+                    continue;
+                }
+                drawn += 1;
+                if r.clip_rect.is_some() {
+                    clipped += 1;
+                } else {
+                    whole += 1;
+                }
+                turned += usize::from(q.angle != 0.0);
+            }
+        }
+        suppressed += usize::from(drawn < 4);
+    }
+    // An invalid frame poisons the play; every later build refuses.
+    let lanes = LaneView {
+        visible_time: TimeUs(600 * MS),
+        cover: 0,
+        lift: 100,
+        hidden: 0,
+    };
+    let mut bad = readouts_for(lanes);
+    bad.covers.lift = 500;
+    let t = tally(0);
+    for _ in 0..3 {
+        batch.clear();
+        let frame = SkinFrame {
+            now: TimeUs(1_000 * MS),
+            display_offset: TimeUs(0),
+            tally: &t,
+            gauges: &gauges,
+            gauge: 0,
+            effects: &[],
+            complete: false,
+            target: TARGETS[0],
+            layout: &layout,
+            lanes,
+            readouts: bad,
+            loading: None,
+            playing: true,
+        };
+        assert_eq!(
+            skin.build(&mut play, &frame, &uvs, &mut batch),
+            Err(BuildError::InvalidReadouts)
+        );
+    }
+    TRACK.with(|t| t.set(false));
+    assert_eq!(
+        ALLOCS.swap(0, Ordering::Relaxed),
+        0,
+        "cover trims: allocations"
+    );
+    assert!(
+        clipped > 0 && whole > 0 && suppressed > 0 && turned > 0,
+        "cover trims: {clipped} clipped, {whole} whole, {suppressed} frames with a paint \
+         suppressed, {turned} turned"
     );
 }
 

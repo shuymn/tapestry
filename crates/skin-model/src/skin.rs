@@ -21,7 +21,8 @@ use crate::schema::Ty;
 use crate::track::{MAX_KEY_US, Track};
 use crate::widget::bar::{BarGroupError, BarScratch, MAX_BAR_GROUPS};
 use crate::widget::cover_paint::{
-    CoverImage, CoverPaint, CoverPaintDef, CoverPaintError, LanePaint, LanePaintError, PaintImage,
+    CoverImage, CoverMotion, CoverPaint, CoverPaintDef, CoverPaintError, CoverTrim, PaintImage,
+    TrimOutcome,
 };
 use crate::widget::digits::{Align, Digits, Number, NumberDef, NumberError};
 use crate::widget::gauge::{Gauge, GaugeDef, GaugeDraw, GaugeError};
@@ -80,14 +81,11 @@ pub enum Source {
     /// entry's track or else the element's, at the frame the entry's own
     /// cycle shows.
     ImageChoice(u32),
-    /// The SUDDEN+ paint at this index of [`WidgetDefs::cover_paints`]:
-    /// its image or its choice's entry, on its track (or the entry's),
-    /// moved by the covers it follows and by its slider.
+    /// The cover paint at this index of [`WidgetDefs::cover_paints`]: its
+    /// image or its choice's entry, on its track (or the entry's), moved
+    /// by its motion, the covers it follows and its slider, and gated and
+    /// clipped by its trim line.
     CoverPaint(u32),
-    /// Where the lanes paint a legacy cover part in the draw order: a
-    /// canonical marker ([`ElementDef::lane_paint`]) drawn with the lanes
-    /// element's visibility, lifetime, color, blend, clip and placement.
-    LanePaint(LanePaint),
 }
 
 /// The widgets elements draw by index.
@@ -123,44 +121,6 @@ pub struct ElementDef {
     pub blend: Blend,
     pub clip: Option<ClipId>,
     pub place: Place,
-}
-
-impl ElementDef {
-    /// The marker of the lanes' `part` in `region`, the lanes': a neutral
-    /// held key at 0 ([`Track::neutral`]) on `ready`, always visible,
-    /// alpha-blended, unclipped, its pivot at the top left, unbound,
-    /// unfilled, without a native size and following nothing. A marker of
-    /// any other shape is refused at load.
-    #[must_use]
-    pub fn lane_paint(part: LanePaint, region: Region) -> Self {
-        Self {
-            source: Source::LanePaint(part),
-            track: Track::neutral(),
-            timer: TimerRef::Builtin(crate::play::schema::timer::READY),
-            visible: None,
-            blend: Blend::Alpha,
-            clip: None,
-            place: Place {
-                region,
-                ..Place::SCREEN
-            },
-        }
-    }
-
-    /// Whether this is [`lane_paint`](Self::lane_paint)'s marker of its
-    /// part in `region`.
-    fn is_lane_paint(&self, region: Region) -> bool {
-        let Source::LanePaint(part) = self.source else {
-            return false;
-        };
-        let canonical = Self::lane_paint(part, region);
-        self.track == canonical.track
-            && self.timer == canonical.timer
-            && self.visible.is_none()
-            && self.blend == canonical.blend
-            && self.clip.is_none()
-            && self.place == canonical.place
-    }
 }
 
 /// Everything a skin is loaded from.
@@ -209,7 +169,8 @@ pub enum LoadError {
     #[error("element {element}'s keys leave ±{MAX_COORD}")]
     Coordinates { element: usize },
     #[error(
-        "element {element} follows the covers, which only an image, a number, a gauge or a text may"
+        "element {element} follows the covers, which only an image, a number, a gauge, a text or a \
+         cover paint may, and a moving cover's paint only SUDDEN+"
     )]
     UnsupportedFollow { element: usize },
     #[error("element {element}'s widget track moves, sizes or rotates it")]
@@ -274,8 +235,8 @@ pub enum LoadError {
         #[source]
         error: CoverPaintError,
     },
-    #[error("the lane paint markers")]
-    LanePaint(#[source] LanePaintError),
+    #[error("element {element}'s trimmed cover paint has a negative width or height")]
+    CoverGate { element: usize },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -291,7 +252,6 @@ enum Kind {
     ImageChoice(usize),
     /// The cover paint's index.
     CoverPaint(usize),
-    LanePaint(LanePaint),
 }
 
 #[derive(Clone, Debug)]
@@ -330,8 +290,6 @@ pub struct Skin {
     texts: Box<[TextDef]>,
     image_choices: Box<[ImageChoice]>,
     cover_paints: Box<[CoverPaint]>,
-    /// The lanes element's index, whose drawing the markers share.
-    lanes_at: Option<usize>,
     /// The text elements: the length of the table
     /// [`attach_text`](Skin::attach_text) takes.
     text_slots: u16,
@@ -470,39 +428,46 @@ fn check_places(def: &SkinDef) -> Result<(), LoadError> {
 
 /// The follow checks of [`Skin::new`], in element order, with `reach` the
 /// lanes' length rounded up (0 without lanes): only an image, a number, a
-/// gauge, a text or a cover paint follows the covers, and every key of a
-/// follower, and of a followed grade of a judge an element draws, keeps
-/// its y within ±[`MAX_COORD`] when moved `reach` either way; a slider
-/// paint's keys keep it moved down by its range as well.
+/// gauge, a text or a cover paint follows the covers, a moving cover's
+/// paint following SUDDEN+ alone, and every key of a follower or a moving
+/// paint, its gate's among them, and of a followed grade of a judge an
+/// element draws, keeps its y within ±[`MAX_COORD`] when moved `reach`
+/// either way; a slider paint's keys keep it moved down by its range as
+/// well, and a linked trim line stays within it raised by `reach`.
 fn check_follows(def: &SkinDef, reach: i64) -> Result<(), LoadError> {
     let moved_out = |t: &Track| track_moved_outside(t, reach, reach);
     for (element, e) in def.elements.iter().enumerate() {
         let follow = e.place.follow;
-        let slider = match e.source {
-            Source::CoverPaint(p) => def
-                .widgets
-                .cover_paints
-                .get(index(p))
-                .and_then(|p| p.slider_range),
+        let paint = match e.source {
+            Source::CoverPaint(p) => def.widgets.cover_paints.get(index(p)),
             _ => None,
         };
-        if follow != Follow::None || slider.is_some() {
-            if matches!(
-                e.source,
-                Source::Lanes | Source::Judge(_) | Source::LanePaint(_)
-            ) {
+        let slider = paint.and_then(|p| p.slider_range);
+        let motion = paint.map_or(CoverMotion::None, |p| p.motion);
+        if motion != CoverMotion::None && matches!(follow, Follow::Lift | Follow::LiftAndCover) {
+            return Err(LoadError::UnsupportedFollow { element });
+        }
+        if follow != Follow::None || slider.is_some() || motion != CoverMotion::None {
+            if matches!(e.source, Source::Lanes | Source::Judge(_)) {
                 return Err(LoadError::UnsupportedFollow { element });
             }
-            let follows = if follow == Follow::None { 0 } else { reach };
+            let moves = follow != Follow::None || motion != CoverMotion::None;
+            let follows = if moves { reach } else { 0 };
             let (up, down) = (follows, follows + slider.map_or(0, i64::from));
             if track_moved_outside(&e.track, up, down)
                 || choice_of(def, e.source)
                     .into_iter()
                     .flat_map(ImageChoiceDef::tracks)
+                    .chain(paint.and_then(|p| p.gate_track.as_ref()))
                     .any(|t| track_moved_outside(t, up, down))
             {
                 return Err(LoadError::Coordinates { element });
             }
+        }
+        if let Some(CoverTrim::Lift(y)) = paint.map(|p| p.trim)
+            && i64::from(y) - reach < -i64::from(MAX_COORD)
+        {
+            return Err(LoadError::Coordinates { element });
         }
         if let Source::Judge(i) = e.source
             && let Some(slot) = def.widgets.judges.get(index(i)).and_then(|j| {
@@ -586,11 +551,7 @@ fn check_widget_images(
                 return Err(LoadError::Text { element, error });
             }
         }
-        Source::Image(_)
-        | Source::Lanes
-        | Source::ImageChoice(_)
-        | Source::CoverPaint(_)
-        | Source::LanePaint(_) => {}
+        Source::Image(_) | Source::Lanes | Source::ImageChoice(_) | Source::CoverPaint(_) => {}
     }
     Ok(())
 }
@@ -636,27 +597,19 @@ fn check_widget_params(element: usize, source: Source, w: &WidgetDefs) -> Result
                 return Err(LoadError::Text { element, error });
             }
         }
-        Source::Image(_)
-        | Source::Lanes
-        | Source::ImageChoice(_)
-        | Source::CoverPaint(_)
-        | Source::LanePaint(_) => {}
+        Source::Image(_) | Source::Lanes | Source::ImageChoice(_) | Source::CoverPaint(_) => {}
     }
     Ok(())
 }
 
 /// The widget quads one frame of `source`'s element can push at worst:
-/// 0 for an image, a cover paint, the lanes or a lane paint marker, which
-/// `quad_capacity` counts apart; for a
+/// 0 for an image, a cover paint or the lanes, which `quad_capacity`
+/// counts apart; for a
 /// text, 1, or with a bitmap font one per character: a literal's
 /// characters, or [`MAX_TEXT_BYTES`] for a field.
 fn worst(source: Source, w: &WidgetDefs) -> u32 {
     match source {
-        Source::Image(_)
-        | Source::Lanes
-        | Source::ImageChoice(_)
-        | Source::CoverPaint(_)
-        | Source::LanePaint(_) => 0,
+        Source::Image(_) | Source::Lanes | Source::ImageChoice(_) | Source::CoverPaint(_) => 0,
         Source::Text(i) => w.texts.get(index(i)).map_or(0, TextDef::quads),
         Source::Number(i) => w
             .numbers
@@ -689,8 +642,6 @@ fn regions(def: &SkinDef, lanes: Option<&Lanes>) -> Regions {
                 }
                 rect
             }
-            // A marker draws with the lanes, whose rect counts already.
-            Source::LanePaint(_) => None,
             Source::Image(_)
             | Source::Gauge(_)
             | Source::Number(_)
@@ -707,7 +658,8 @@ fn regions(def: &SkinDef, lanes: Option<&Lanes>) -> Regions {
                     Source::Judge(i) => def.widgets.judges.get(index(i)).and_then(JudgeDef::bounds),
                     // Every present entry's track, so a change of entry
                     // moves no region; a paint's authored keys, neither
-                    // its following nor its slider counted.
+                    // its following, motion, slider, gate and trim not
+                    // counted.
                     Source::ImageChoice(_) | Source::CoverPaint(_) => {
                         match choice_of(def, e.source) {
                             Some(c) => choice_bounds(c, &e.track),
@@ -715,11 +667,9 @@ fn regions(def: &SkinDef, lanes: Option<&Lanes>) -> Regions {
                         }
                     }
                     // A text's box only: spilled ink does not count.
-                    Source::Image(_)
-                    | Source::Gauge(_)
-                    | Source::Text(_)
-                    | Source::Lanes
-                    | Source::LanePaint(_) => e.track.bounds(),
+                    Source::Image(_) | Source::Gauge(_) | Source::Text(_) | Source::Lanes => {
+                        e.track.bounds()
+                    }
                 };
                 if let Some(b) = b {
                     let slot = match e.place.bind {
@@ -795,22 +745,73 @@ fn check_image_choices(
 }
 
 /// The paint checks of [`Skin::new`], every definition in order,
-/// referenced or not: its image or choice table exists and its slider's
-/// range is at most [`MAX_COORD`].
+/// referenced or not: its image or choice table exists, its slider's range
+/// is at most [`MAX_COORD`] and comes without a motion, a trim or a gate
+/// track, a gate track comes with a trim, its keys lie within
+/// ±[`MAX_COORD`] with no negative width or height, and a trim base lies
+/// within ±[`MAX_COORD`].
 fn check_cover_paints(w: &WidgetDefs, images: usize) -> Result<(), LoadError> {
+    let max = i64::from(MAX_COORD);
     for (paint, p) in w.cover_paints.iter().enumerate() {
-        let error = match p.image {
+        let image = match p.image {
             CoverImage::Image(i) if index(i) >= images => Some(CoverPaintError::UnknownImage),
             CoverImage::Choice(i) if index(i) >= w.image_choices.len() => {
                 Some(CoverPaintError::UnknownChoice)
             }
             CoverImage::Image(_) | CoverImage::Choice(_) => None,
         };
-        let range = p
-            .slider_range
-            .is_some_and(|r| i64::from(r) > i64::from(MAX_COORD));
-        if let Some(error) = error.or(range.then_some(CoverPaintError::Range)) {
+        let range = p.slider_range.is_some_and(|r| i64::from(r) > max);
+        let slider_moves = p.slider_range.is_some()
+            && (p.motion != CoverMotion::None
+                || p.trim != CoverTrim::None
+                || p.gate_track.is_some());
+        let gate = p.gate_track.as_ref();
+        let trim = match p.trim {
+            CoverTrim::None => 0,
+            CoverTrim::Fixed(y) | CoverTrim::Lift(y) => i64::from(y),
+        };
+        let error = image
+            .or(range.then_some(CoverPaintError::Range))
+            .or(slider_moves.then_some(CoverPaintError::SliderMotion))
+            .or((gate.is_some() && p.trim == CoverTrim::None)
+                .then_some(CoverPaintError::GateWithoutTrim))
+            .or(gate
+                .is_some_and(track_outside)
+                .then_some(CoverPaintError::GateCoordinates))
+            .or(gate
+                .is_some_and(|t| t.rects().any(|[.., w, h]| w < 0 || h < 0))
+                .then_some(CoverPaintError::GateSize))
+            .or((trim.abs() > max).then_some(CoverPaintError::TrimRange));
+        if let Some(error) = error {
             return Err(LoadError::CoverPaint { paint, error });
+        }
+    }
+    Ok(())
+}
+
+/// The gate checks of [`Skin::new`], in element order: a trimmed paint
+/// without a gate track is gated by its effective paint tracks, the
+/// element's and its choice's entries', none of which has a key of
+/// negative width or height.
+fn check_cover_gates(def: &SkinDef) -> Result<(), LoadError> {
+    let negative = |t: &Track| t.rects().any(|[.., w, h]| w < 0 || h < 0);
+    for (element, e) in def.elements.iter().enumerate() {
+        let Source::CoverPaint(p) = e.source else {
+            continue;
+        };
+        let Some(p) = def.widgets.cover_paints.get(index(p)) else {
+            continue;
+        };
+        if p.trim == CoverTrim::None || p.gate_track.is_some() {
+            continue;
+        }
+        if negative(&e.track)
+            || choice_of(def, e.source)
+                .into_iter()
+                .flat_map(ImageChoiceDef::tracks)
+                .any(negative)
+        {
+            return Err(LoadError::CoverGate { element });
         }
     }
     Ok(())
@@ -862,53 +863,6 @@ fn check_bar_groups(
     Ok(())
 }
 
-/// The marker checks of [`Skin::new`], with `lanes` the checked lanes and
-/// `region` their element's: every marker is canonical in the lanes'
-/// region, and each present part has exactly one marker and an absent
-/// one none.
-fn check_lane_paints(
-    elements: &[ElementDef],
-    lanes: Option<&LanesDef>,
-    region: Option<Region>,
-) -> Result<(), LoadError> {
-    let fail = |e| Err(LoadError::LanePaint(e));
-    let (mut hidden, mut lift) = (false, false);
-    for (element, e) in elements.iter().enumerate() {
-        let Source::LanePaint(part) = e.source else {
-            continue;
-        };
-        let present = lanes.is_some_and(|l| match part {
-            LanePaint::Hidden => l.parts.hidden.is_some(),
-            LanePaint::Lift => l.parts.lift.is_some(),
-        });
-        if !present {
-            return fail(LanePaintError::Absent { part, element });
-        }
-        if !region.is_some_and(|r| e.is_lane_paint(r)) {
-            return fail(LanePaintError::Noncanonical { element });
-        }
-        let slot = match part {
-            LanePaint::Hidden => &mut hidden,
-            LanePaint::Lift => &mut lift,
-        };
-        if *slot {
-            return fail(LanePaintError::Duplicate { part, element });
-        }
-        *slot = true;
-    }
-    if let Some(l) = lanes {
-        for (part, present, seen) in [
-            (LanePaint::Hidden, l.parts.hidden.is_some(), hidden),
-            (LanePaint::Lift, l.parts.lift.is_some(), lift),
-        ] {
-            if present && !seen {
-                return fail(LanePaintError::Missing { part });
-            }
-        }
-    }
-    Ok(())
-}
-
 /// A magnification as an exact fraction.
 #[derive(Clone, Copy)]
 struct Ratio(u128, u128);
@@ -948,12 +902,13 @@ impl Skin {
     /// without a fill and with every key's height positive and width not
     /// negative, one lanes widget in its region, bindings beside it); the
     /// widgets' parameters (a literal's length and characters); the
-    /// lanes' definition and geometry; the lane paint markers (each
-    /// canonical, one for each legacy part the lanes have and none for
-    /// another); the followers (only an image, a number, a gauge, a text
-    /// or a cover paint, or a judge's grade, follows the covers, each
-    /// key's y within ±[`MAX_COORD`] moved the lanes' length either way,
-    /// and a slider paint's moved down by its range as well); the total
+    /// lanes' definition and geometry; the trimmed paints' gates (no
+    /// negative width or height); the followers (only an image, a number,
+    /// a gauge, a text or a cover paint, or a judge's grade, follows the
+    /// covers, a moving cover's paint SUDDEN+ alone, each key's y, a moving
+    /// paint's and its gate's among them, within ±[`MAX_COORD`] moved the
+    /// lanes' length either way, a slider paint's moved down by its range
+    /// as well, and a linked trim line raised by the lanes' length); the total
     /// operations, each `when` charged once however many elements share
     /// it, then each visibility in element order, then per element its
     /// number's value, its image choice's selector or its judge parts'
@@ -1020,6 +975,7 @@ impl Skin {
             .map(|e| &e.track)
             .chain(w.judges.iter().flat_map(|j| j.tracks().map(|(_, t)| t)))
             .chain(w.image_choices.iter().flat_map(ImageChoiceDef::tracks))
+            .chain(w.cover_paints.iter().filter_map(|p| p.gate_track.as_ref()))
             .chain(
                 def.lanes
                     .iter()
@@ -1066,8 +1022,7 @@ impl Skin {
                 | Source::Gauge(_)
                 | Source::Text(_)
                 | Source::ImageChoice(_)
-                | Source::CoverPaint(_)
-                | Source::LanePaint(_) => {}
+                | Source::CoverPaint(_) => {}
             }
         }
         let mut slots = Vec::with_capacity(elements.len());
@@ -1090,7 +1045,7 @@ impl Skin {
         let exists = |i: u32| usize::try_from(i).is_ok_and(|i| i < images.len());
         let frames = |i: u32| images.get(index(i)).map(|m| m.frames);
         if let Some(element) = elements.iter().position(|e| match e.source {
-            Source::Image(_) | Source::Lanes | Source::LanePaint(_) => false,
+            Source::Image(_) | Source::Lanes => false,
             Source::CoverPaint(p) => w.cover_paints.get(index(p)).is_none(),
             Source::Number(i) => w.numbers.get(index(i)).is_none(),
             Source::Gauge(i) => w.gauges.get(index(i)).is_none(),
@@ -1108,8 +1063,7 @@ impl Skin {
             | Source::Judge(_)
             | Source::Text(_)
             | Source::ImageChoice(_)
-            | Source::CoverPaint(_)
-            | Source::LanePaint(_) => false,
+            | Source::CoverPaint(_) => false,
         }) {
             return Err(LoadError::UnknownImage { element });
         }
@@ -1157,7 +1111,7 @@ impl Skin {
             .iter()
             .find(|e| e.source == Source::Lanes)
             .map(|e| e.place.region);
-        check_lane_paints(elements, lanes, lanes_in)?;
+        check_cover_gates(&def)?;
         if let Some(l) = lanes {
             check_bar_groups(l, whens.len(), lanes_in, l.reach())?;
         }
@@ -1232,6 +1186,9 @@ impl Skin {
                     CoverImage::Choice(i) => PaintImage::Choice(index(i)),
                 },
                 slider: p.slider_range,
+                motion: p.motion,
+                trim: p.trim,
+                gate: p.gate_track,
             })
             .collect();
         let image_choices = image_choices
@@ -1300,7 +1257,6 @@ impl Skin {
                 shift: j.shift,
             })
             .collect();
-        let lanes_at = def.elements.iter().position(|e| e.source == Source::Lanes);
         // Text slots in draw order; at most `MAX_TEXT_ELEMENTS`.
         let mut text_slots = 0_u16;
         let elements = def
@@ -1316,7 +1272,6 @@ impl Skin {
                     Source::Judge(i) => Kind::Judge(index(i)),
                     Source::ImageChoice(i) => Kind::ImageChoice(index(i)),
                     Source::CoverPaint(p) => Kind::CoverPaint(index(p)),
-                    Source::LanePaint(part) => Kind::LanePaint(part),
                     Source::Text(i) => {
                         let def = texts.get(index(i));
                         let text = Text {
@@ -1362,7 +1317,6 @@ impl Skin {
             texts: texts.into_boxed_slice(),
             image_choices,
             cover_paints,
-            lanes_at,
             text_slots,
             widget_quads,
             bomb_up_to: def.bomb_up_to,
@@ -1423,7 +1377,7 @@ impl Skin {
     /// element's worst case (a number's cells, a gauge's segments and its
     /// flicker's tip, a judge's largest slot with its combo's cells, a
     /// text's one line or its bitmap glyphs), and the lanes' budget with
-    /// its reserved quads, which the lane paint markers draw on.
+    /// its reserved judgment line.
     #[must_use]
     pub fn quad_capacity(&self) -> u32 {
         let images = self
@@ -1483,9 +1437,10 @@ impl Skin {
     /// fill, and for lane-bound images and the lane parts a lane width
     /// below 100 % (lane width alone never picks `Hi`). A bar group counts with
     /// the lanes element, under its region and visibility, by its own
-    /// binding: an unbound group has no lane width. Hidden regions,
-    /// elements and groups whose visibility folds to false and lane paint
-    /// markers, whose images the lanes element counts, do not count.
+    /// binding: an unbound group has no lane width. Hidden regions and
+    /// elements and groups whose visibility folds to false do not count;
+    /// a cover paint counts by its authored tracks, its gate, trim and
+    /// motion not counted.
     /// Exact rationals, no float. For `prepare`, not in play.
     #[must_use]
     pub fn variant(&self, target: [u32; 2], layout: &Layout) -> Variant {
@@ -1498,7 +1453,7 @@ impl Skin {
             // A hidden region, or a visibility folded to false, never draws;
             // a text has its own pixel size.
             let never = e.visible.as_ref().and_then(Program::constant) == Some(0);
-            if !adjust.visible || never || matches!(e.kind, Kind::Text(..) | Kind::LanePaint(_)) {
+            if !adjust.visible || never || matches!(e.kind, Kind::Text(..)) {
                 return false;
             }
             let fill = match e.fill {
@@ -1769,60 +1724,57 @@ impl Skin {
         // The lanes' geometry, once for every element, whether or not the
         // lanes draw.
         let lanes = self.lanes.as_ref().map(|l| l.frame_geometry(frame.lanes));
-        // The lanes element's drawing, once, wherever it stands: its
-        // markers draw with it.
-        let lane_draw = self.lanes_at.and_then(|i| {
-            let e = self.elements.get(i)?;
-            if !placement.region(e.region).visible {
-                return None;
-            }
-            let (_, s) = sample(
-                play,
-                frame.now,
-                &state,
-                e.slot,
-                e.visible.as_ref(),
-                &e.track,
-            )?;
-            Some(Draw {
-                play,
-                state: &state,
-                now: frame.now,
-                display,
-                view: frame.lanes,
-                frame: lanes.as_ref()?,
-                complete: frame.complete,
-                geometry: placement.geometry(),
-                placement,
-                affine: placement.affine(e.region, e.fill),
-                color: s.color,
-                key: e.key,
-                uvs,
-                scale: canvas.scale(),
-            })
-        });
         for e in &self.elements {
-            match e.kind {
-                Kind::Lanes | Kind::LanePaint(_) => {
-                    if let (Some(widget), Some(d)) = (&self.lanes, &lane_draw) {
-                        match e.kind {
-                            Kind::LanePaint(LanePaint::Hidden) => widget.draw_hidden(d, out),
-                            Kind::LanePaint(LanePaint::Lift) => widget.draw_lift(d, out),
-                            _ => widget.draw(d, bars.as_deref_mut(), out),
-                        }
-                    }
+            if let Kind::Lanes = e.kind {
+                let (Some(widget), Some(geometry)) = (&self.lanes, lanes.as_ref()) else {
+                    continue;
+                };
+                if !placement.region(e.region).visible {
                     continue;
                 }
-                _ => {}
+                let Some((_, s)) = sample(
+                    play,
+                    frame.now,
+                    &state,
+                    e.slot,
+                    e.visible.as_ref(),
+                    &e.track,
+                ) else {
+                    continue;
+                };
+                let d = Draw {
+                    play,
+                    state: &state,
+                    now: frame.now,
+                    display,
+                    view: frame.lanes,
+                    frame: geometry,
+                    complete: frame.complete,
+                    geometry: placement.geometry(),
+                    placement,
+                    affine: placement.affine(e.region, e.fill),
+                    color: s.color,
+                    key: e.key,
+                    uvs,
+                    scale: canvas.scale(),
+                };
+                widget.draw(&d, bars.as_deref_mut(), out);
+                continue;
             }
             if !placement.region(e.region).visible {
                 continue;
             }
-            // An image choice's entry, before its track is sampled.
             let paint = match e.kind {
                 Kind::CoverPaint(i) => self.cover_paints.get(i),
                 _ => None,
             };
+            // HIDDEN+'s paint shows only while HIDDEN+ is on, at any amount.
+            if paint.is_some_and(|p| p.motion == CoverMotion::Hidden)
+                && !frame.readouts.covers.hidden_enabled
+            {
+                continue;
+            }
+            // An image choice's entry, before its track is sampled.
             let table = match (e.kind, paint.map(|p| p.image)) {
                 (Kind::ImageChoice(i), _) | (_, Some(PaintImage::Choice(i))) => Some(i),
                 _ => None,
@@ -1841,23 +1793,38 @@ impl Skin {
             else {
                 continue;
             };
+            let affine = placement.affine(e.region, e.fill);
+            let map = placement.bind(e.bind);
             // The covers' motion, after the track and before the lane map
-            // and the region; lanes and judges never follow. A slider
-            // paint also moves by its own share, both kept in `f64` until
-            // the sum is drawn.
-            let rect = match paint {
+            // and the region; lanes and judges never follow. A paint also
+            // moves with its cover and its slider, the sum kept in `f64`
+            // until it is drawn, and its gate, the track's rect or its own,
+            // moves alike for its trim.
+            let (rect, trim) = match paint {
                 Some(p) => {
                     let [x, y, w, h] = s.rect;
-                    let dy = e.follow.dy(lanes.as_ref()) + p.slider_dy(frame.lanes);
-                    [x, f32_of(f64::from(y) + dy), w, h]
+                    let g = lanes.as_ref();
+                    let dy = e.follow.dy(g) + p.motion_dy(g) + p.slider_dy(frame.lanes);
+                    let gate = match &p.gate {
+                        Some(gate) => match gate.sample(t) {
+                            Some(gs) => gs.rect,
+                            None => continue,
+                        },
+                        None => s.rect,
+                    };
+                    let clip = match p.outcome(gate, dy, g, map, affine) {
+                        TrimOutcome::Suppressed => continue,
+                        TrimOutcome::Unclipped => None,
+                        TrimOutcome::Clipped(c) => Some(c),
+                    };
+                    ([x, f32_of(f64::from(y) + dy), w, h], clip)
                 }
-                None => e.follow.translate(s.rect, lanes.as_ref()),
+                None => (e.follow.translate(s.rect, lanes.as_ref()), None),
             };
-            let affine = placement.affine(e.region, e.fill);
             let brush = Brush {
                 key: e.key,
                 affine,
-                map: placement.bind(e.bind),
+                map,
                 pivot: e.pivot,
                 angle: radians(s.angle),
                 color: s.color,
@@ -1880,7 +1847,7 @@ impl Skin {
                     if let Some(image) = image
                         && let Some(f) = image.frame(play, frame.now, uvs)
                     {
-                        brush.push(out, rect, f, image.filter);
+                        brush.push_clipped(out, rect, f, image.filter, trim);
                     }
                 }
                 Kind::Number(i) => {
@@ -1926,7 +1893,7 @@ impl Skin {
                         t.draw(image, rect, &brush, out);
                     }
                 }
-                Kind::Lanes | Kind::LanePaint(_) => {}
+                Kind::Lanes => {}
             }
         }
     }

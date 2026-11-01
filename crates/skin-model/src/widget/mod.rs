@@ -25,7 +25,7 @@ use crate::expr::{Program, State};
 use crate::place::{Affine, LaneMap, Native};
 use crate::play::Play;
 use crate::play::timers::elapsed_us;
-use crate::quad::{Filter, Quad, QuadBatch, RunKey};
+use crate::quad::{ClipRect, Filter, Quad, QuadBatch, RunKey};
 use crate::track::{Sample, Track};
 
 /// An image as a build reads it: its first frame in the uv table, its
@@ -139,6 +139,22 @@ impl Brush {
         filter: Filter,
     ) -> bool {
         out.push(self.key, self.quad(rect, f, filter))
+    }
+
+    /// [`push`](Self::push) clipped to `clip` as well when one.
+    pub(crate) fn push_clipped(
+        &self,
+        out: &mut QuadBatch,
+        rect: [f32; 4],
+        f: FrameUv,
+        filter: Filter,
+        clip: Option<ClipRect>,
+    ) -> bool {
+        let quad = self.quad(rect, f, filter);
+        match clip {
+            Some(c) => out.push_clipped(self.key, quad, c),
+            None => out.push(self.key, quad),
+        }
     }
 
     /// Pushes [`quad_about`](Self::quad_about); `false` when the batch
