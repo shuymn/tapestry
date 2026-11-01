@@ -93,19 +93,6 @@ pub fn atlas_limits(device: &wgpu::Device) -> AtlasLimits {
     }
 }
 
-/// Checks `pages` against `device`'s limits and against themselves, before
-/// anything is allocated; returns the array's layers.
-///
-/// # Errors
-///
-/// The first check that fails ([`check`]).
-pub(crate) fn check_pages(
-    pages: &AtlasPages<'_>,
-    device: &wgpu::Device,
-) -> Result<u32, UploadError> {
-    check(pages, &device.limits())
-}
-
 /// Runs `work` inside out-of-memory and validation error scopes on
 /// `device`, and returns its result with the first error the device
 /// reported meanwhile: validation first, then out of memory.
@@ -125,7 +112,14 @@ pub(crate) fn scoped<T>(
 /// Checks `pages` against the device's `limits` and against themselves,
 /// in that order, before anything is allocated: the side, the layers,
 /// the texels, then each level's bytes. Returns the array's layers.
-fn check(pages: &AtlasPages<'_>, limits: &wgpu::Limits) -> Result<u32, UploadError> {
+///
+/// # Errors
+///
+/// The first check that fails.
+pub(crate) fn check_pages(
+    pages: &AtlasPages<'_>,
+    limits: &wgpu::Limits,
+) -> Result<u32, UploadError> {
     let side = pages.side;
     let max = limits.max_texture_dimension_2d;
     if !side.is_power_of_two() || side < ATLAS_SIZE || side > max {
@@ -286,7 +280,7 @@ fn write(
 mod tests {
     use skin_model::MIP_LEVELS;
 
-    use super::{AtlasPages, PageLevels, UploadError, check};
+    use super::{AtlasPages, PageLevels, UploadError, check_pages};
 
     fn limits() -> wgpu::Limits {
         wgpu::Limits::default()
@@ -304,14 +298,14 @@ mod tests {
         for side in [0, 64, 100, 129, 16_384] {
             assert!(
                 matches!(
-                    check(&some(side, 1), &limits()),
+                    check_pages(&some(side, 1), &limits()),
                     Err(UploadError::Side { side: s, max: 8_192 }) if s == side
                 ),
                 "side {side}"
             );
         }
         assert!(matches!(
-            check(&some(256, 256), &limits()),
+            check_pages(&some(256, 256), &limits()),
             Err(UploadError::Layers {
                 layers: 257,
                 max: 256
@@ -319,13 +313,13 @@ mod tests {
         ));
         // 8192² × 3 layers: 192 Mi texels, past 128 Mi.
         assert!(matches!(
-            check(&some(8_192, 2), &limits()),
+            check_pages(&some(8_192, 2), &limits()),
             Err(UploadError::Texels { texels }) if texels == 3 << 26
         ));
         // Within the limits, the bytes are checked: level 0 of page 0 is
         // 256 × 256 × 4.
         assert!(matches!(
-            check(&some(256, 1), &limits()),
+            check_pages(&some(256, 1), &limits()),
             Err(UploadError::Level {
                 page: 0,
                 level: 0,
@@ -348,7 +342,7 @@ mod tests {
             side: 256,
             pages: &pages,
         };
-        assert_eq!(check(&ok, &limits()).unwrap(), 3);
+        assert_eq!(check_pages(&ok, &limits()).unwrap(), 3);
         let bad_page: PageLevels<'_> = [&l0, &l1, &l2, &short];
         let pages = [page, bad_page];
         let bad = AtlasPages {
@@ -356,7 +350,7 @@ mod tests {
             pages: &pages,
         };
         assert!(matches!(
-            check(&bad, &limits()),
+            check_pages(&bad, &limits()),
             Err(UploadError::Level {
                 page: 1,
                 level: 3,
@@ -369,6 +363,6 @@ mod tests {
             side: 512,
             pages: &[],
         };
-        assert_eq!(check(&none, &limits()).unwrap(), 1);
+        assert_eq!(check_pages(&none, &limits()).unwrap(), 1);
     }
 }

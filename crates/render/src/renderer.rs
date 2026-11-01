@@ -515,7 +515,8 @@ impl Renderer {
         #[cfg(test)]
         let fault = self.atlas_fault.take();
         let device = self.gpu.device();
-        let layers = skin_atlas::check_pages(pages, device).map_err(RenderError::Atlas)?;
+        let layers =
+            skin_atlas::check_pages(pages, &device.limits()).map_err(RenderError::Atlas)?;
         // The whole candidate inside the error scopes: the texture, its
         // view and writes, its bind group, and the one submission of the
         // uploads; the wait after them submits nothing. Nothing in use
