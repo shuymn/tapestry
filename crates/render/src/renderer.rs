@@ -904,21 +904,13 @@ fn pipelines(
             cache: None,
         })
     };
-    let alpha = pipeline(wgpu::BlendState {
-        color: wgpu::BlendComponent {
-            src_factor: wgpu::BlendFactor::One,
-            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-            operation: wgpu::BlendOperation::Add,
-        },
-        alpha: wgpu::BlendComponent::OVER,
-    });
+    // Both components over (source 1, destination 1 − source alpha).
+    let alpha = pipeline(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING);
+    // Colour source 1, destination 1; the alpha channel still over, not
+    // `ADDITIVE`'s 1, 1.
     let additive = pipeline(wgpu::BlendState {
-        color: wgpu::BlendComponent {
-            src_factor: wgpu::BlendFactor::One,
-            dst_factor: wgpu::BlendFactor::One,
-            operation: wgpu::BlendOperation::Add,
-        },
         alpha: wgpu::BlendComponent::OVER,
+        ..wgpu::BlendState::ADDITIVE
     });
     (alpha, additive, bind)
 }
