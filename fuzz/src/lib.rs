@@ -20,8 +20,8 @@ use input::raw;
 use replay::{DecodeError, DecodeLimits, FORMAT_VERSION, MAGIC, PlayRecord};
 use rules::{CanonicalError, RulePreset};
 use skin_beatoraja::{
-    Config, DeviationId, Header, ImportError, Imported, NoteKind, SIZES, Severity, import,
-    read_header, resolve,
+    Config, DeviationId, Header, ImportError, Imported, NoteFallback, NoteKind, SIZES, Severity,
+    import, read_header, resolve,
 };
 use skin_model::{FntError, FntFile, FntLimits};
 
@@ -1144,14 +1144,18 @@ fn check_usage(i: &Imported) {
     // is named, on a model lane, sharing at most three generated images;
     // only lanes draw it.
     assert!(u.note_fallbacks <= 48, "more fallbacks than mapped parts");
-    let mut paints = BTreeSet::new();
+    let mut paints = 0_u8;
     let mut entries = 0_u32;
     for n in &i.report.notes {
         if let NoteKind::NotePartFallback { lane, paint, .. } = n.kind {
             assert_eq!(n.severity, Severity::Fallback, "a fallback's severity");
             assert!(n.at.is_some(), "an unlocated fallback");
             assert!(lane < 8, "a fallback off the lanes");
-            paints.insert(format!("{paint:?}"));
+            paints |= match paint {
+                NoteFallback::Tap => 1,
+                NoteFallback::Long => 2,
+                NoteFallback::Mine => 4,
+            };
             entries += 1;
         } else {
             assert_ne!(n.severity, Severity::Fallback, "a fallback of another kind");
@@ -1162,7 +1166,7 @@ fn check_usage(i: &Imported) {
         "fallback entries and usage differ"
     );
     assert!(
-        u.images as usize >= paints.len(),
+        u.images >= paints.count_ones(),
         "generated images not charged"
     );
     if u.note_fallbacks > 0 {
