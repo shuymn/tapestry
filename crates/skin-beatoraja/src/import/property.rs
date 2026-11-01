@@ -543,8 +543,7 @@ const INDEX_KNOWN: &[(i32, i32)] = &[
     (370, 371),
     (380, 399),
     (400, 400),
-    (450, 458),
-    (460, 466),
+    (450, 466),
     (469, 469),
     (500, 519),
     (1_510, 1_699),
@@ -730,11 +729,16 @@ mod tests {
             assert_eq!(index_by_id(b), IndexProp::Unsupported(b));
         }
         for id in [
-            0, 1, 9, 13, 41, 44, 186, 300, 309, 329, 333, 459, 467, 520, 1_700,
+            0, 1, 9, 13, 41, 44, 186, 300, 309, 329, 333, 467, 468, 520, 1_700,
         ] {
             assert_eq!(index_by_id(id), IndexProp::Null, "{id}");
         }
         assert!(INDEX_KNOWN.windows(2).all(|w| w[0].1 < w[1].0));
+        // The whole of 450-466 is known (`IntegerPropertyFactory.java:1369`
+        // among them).
+        for id in 450..=466 {
+            assert_eq!(index_by_id(id), IndexProp::Unsupported(id), "{id}");
+        }
         let scope = skin_model::Scope::new(&skin_model::PLAY);
         let ops = |p: IndexProp| {
             let src = p.selector().unwrap();

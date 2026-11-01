@@ -128,10 +128,16 @@ fn group_refs_resolve_as_image_indices() {
         kind: PropertyKind::ImageIndex,
         id: Some(id),
     };
-    for id in [10, 42, 90, 170, 302, 342, 386, 469, 500, 507, 1_510] {
-        let l = group(2, &format!(r#", "ref": {id}"#));
-        assert_eq!(common::kinds(l.report()), [prop(id)], "{id}");
-        assert_eq!(l.report().usage.images, 0, "{id}");
+    // A group and an image set alike.
+    for id in [
+        10, 42, 90, 170, 302, 342, 386, 450, 459, 466, 469, 500, 507, 1_510,
+    ] {
+        let fields = format!(r#", "ref": {id}"#);
+        for l in [group(2, &fields), set(r#"["i0", "i2"]"#, &fields)] {
+            assert_eq!(common::kinds(l.report()), [prop(id)], "{id}");
+            assert_eq!(l.report().usage.images, 0, "{id}");
+            assert_eq!(l.ok().skin.choice_ref_count(), 0, "{id}");
+        }
     }
     // A `len` of 1 or less is an ordinary image whatever its `ref`.
     let l = group(1, r#", "ref": 42"#);
@@ -144,8 +150,14 @@ fn group_refs_resolve_as_image_indices() {
 fn set(images: &str, set: &str) -> common::Loaded {
     let json = format!(
         r#"{{"type": 0, "w": 1920, "h": 1080,
-           "source": [{{"id": "a", "path": "a.png"}}, {{"id": "m", "path": "clip.mp4"}}],
+           "source": [{{"id": "a", "path": "a.png"}}, {{"id": "m", "path": "clip.mp4"}},
+                      {{"id": "w", "path": "w.webp"}}, {{"id": "far", "path": "../far.png"}},
+                      {{"id": "lost", "path": "lost.png"}}, {{"id": "wide", "path": "wide.png"}}],
            "image": [{{"id": "i0", "src": "a", "w": 16, "h": 16}},
+                     {{"id": "web", "src": "w", "w": 16, "h": 16}},
+                     {{"id": "far", "src": "far", "w": 16, "h": 16}},
+                     {{"id": "lost", "src": "lost", "w": 16, "h": 16}},
+                     {{"id": "wide", "src": "wide", "w": 16, "h": 16}},
                      {{"id": "i1", "src": "a", "x": 16, "w": 16, "h": 16, "len": 4, "ref": 42}},
                      {{"id": "i2", "src": "a", "x": 32, "w": 16, "h": 16}},
                      {{"id": "mv", "src": "m"}},
@@ -154,6 +166,16 @@ fn set(images: &str, set: &str) -> common::Loaded {
            "destination": [{{"id": "s", {KEY}}}]}}"#
     );
     let dir = common::skin_with(&json, &[("a.png", 64, 64)]);
+    common::write(
+        dir.path(),
+        "w.webp",
+        b"RIFF\x1a\0\0\0WEBPVP8L\x0d\0\0\0/\0\0\0\x10\x07\x10\x11\x11\x88\x88\xfe\x07\0",
+    );
+    if images.contains("wide") {
+        // Under the file size cap, but its row buffer is past the header
+        // reader's allocation cap.
+        common::png(dir.path(), "wide.png", 1_100_000, 1);
+    }
     let result = common::import_dir(dir.path());
     common::Loaded { dir, result }
 }
@@ -255,6 +277,53 @@ fn an_image_set_keeps_holes_and_repeats() {
     let l = set(r#"[null, "none"]"#, "");
     assert!(has(l.report(), NoteKind::Track(TrackWhy::NeverDrawn)));
     assert_eq!(l.ok().skin.choice_ref_count(), 0);
+}
+
+#[test]
+fn an_entry_the_source_could_draw_drops_the_set() {
+    // A format only the source decodes, a name leaving the folder and a
+    // header past the decoder's allocation cap are this importer's
+    // refusals, not missing files: the whole set drops, however often the
+    // entry repeats.
+    for item in [
+        r#"["i0", "web"]"#,
+        r#"["i0", "far"]"#,
+        r#"["i0", "wide"]"#,
+        r#"["i0", "web", "web"]"#,
+    ] {
+        let l = set(item, r#", "value": 71"#);
+        let dropped: Vec<_> = l
+            .report()
+            .notes
+            .iter()
+            .filter(|n| n.severity == Severity::Dropped)
+            .map(|n| n.kind)
+            .collect();
+        assert_eq!(dropped, [NoteKind::MissingAsset], "{item}");
+        assert_eq!(l.report().usage.file_attempts, 2, "{item}");
+        assert_eq!(l.ok().skin.choice_ref_count(), 0, "{item}");
+        assert!(frames(&mut l.drawn(), 0).is_empty(), "{item}");
+    }
+    // A file that is not there is a hole beside the valid entry, each
+    // time it repeats; it is looked for once.
+    let l = set(r#"["i0", "lost", "lost"]"#, r#", "value": 71"#);
+    assert!(
+        l.report()
+            .notes
+            .iter()
+            .all(|n| n.severity != Severity::Dropped),
+        "{:?}",
+        l.report().notes
+    );
+    let u = l.report().usage;
+    assert_eq!((u.file_attempts, u.files), (2, 1));
+    assert_eq!(l.ok().skin.choice_ref_count(), 3);
+    let mut d = l.drawn();
+    assert_eq!(frames(&mut d, 0), [0]);
+    for ex in [1, 2] {
+        d.tally = tally(ex, 0);
+        assert!(frames(&mut d, 0).is_empty(), "{ex}");
+    }
 }
 
 #[test]

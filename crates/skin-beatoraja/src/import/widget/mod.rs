@@ -9,7 +9,7 @@ pub(super) mod lanes;
 pub(super) mod number;
 pub(super) mod text;
 
-use skin_model::{ImageDef, MAX_SKIN_FRAMES, Source};
+use skin_model::{ImageDef, MAX_SKIN_FRAMES, Native, Source};
 
 use super::asset::{self, Crop, Failed, ImageKey, Path};
 use super::budget::ImportLimit;
@@ -20,6 +20,10 @@ use super::track::{self, Stretch};
 use super::{Common, Cx, Dst, Opts, Prop};
 use crate::error::ImportError;
 use image_choice::{Lowered, SetSelector};
+
+/// A track's keys baked against a cell, and the native size kept instead
+/// under stretch 8 and 9.
+pub(super) type Baked = (Vec<[i32; 4]>, Option<Native>);
 
 /// A placed source image: its admitted file, its rect in texels and its
 /// cell.
@@ -247,7 +251,7 @@ impl Cx<'_> {
             .map_err(|l| self.limit(at, l))?
         {
             Ok(f) => f,
-            Err(Failed::File) if matches!(role, Role::Critical(_)) => {
+            Err(Failed::File { .. }) if matches!(role, Role::Critical(_)) => {
                 if let Some(source) = self.assets.take_error(&name) {
                     return Err(ImportError::Asset {
                         at: self.loc(at),
@@ -256,7 +260,11 @@ impl Cx<'_> {
                 }
                 return missing(NoteKind::MissingAsset);
             }
-            Err(_) => return missing(NoteKind::MissingAsset),
+            Err(Failed::File { refused: false }) => return missing(NoteKind::MissingAsset),
+            // Only this importer refuses it: no hole stands for it.
+            Err(Failed::File { refused: true } | Failed::Name) => {
+                return refused(NoteKind::MissingAsset);
+            }
         };
         let [fw, fh] = self.assets.file_dims(file).unwrap_or([0, 0]);
         let [x, y, w, h] = s.rect;
@@ -357,11 +365,29 @@ impl Cx<'_> {
         let Some((image, cell)) = self.add_src_image(&c, rec, &s, s.div)? else {
             return Ok(());
         };
+        let Some((rects, native)) = self.baked_rects(&c, cell)? else {
+            self.drop_el(c.role, at, NoteKind::Stretch(c.stretch_mode))?;
+            return Ok(());
+        };
+        let t = self.model_track(&c, &rects)?;
+        self.push_native(c, Source::Image(image), t, native)?;
+        Ok(())
+    }
+
+    /// `c`'s keys with its stretch baked against a `cell`, and the native
+    /// size stretch 8 and 9 keep instead; `None` when the stretch changes
+    /// branch between keys.
+    pub(super) fn baked_rects(
+        &self,
+        c: &Common,
+        cell: [u32; 2],
+    ) -> Result<Option<Baked>, ImportError> {
+        let at = c.span;
         let native = c.stretch.native(cell);
         let mut rects = Vec::with_capacity(c.track.keys.len());
         let mut shared = track::ANY_BRANCH;
         for k in &c.track.keys {
-            let r = self.key_rect(&c, k)?;
+            let r = self.key_rect(c, k)?;
             let (r, b) = if native.is_some() {
                 (r, 0b1)
             } else {
@@ -370,13 +396,7 @@ impl Cx<'_> {
             shared &= b;
             rects.push(r.model().ok_or_else(|| self.range(at, "dst"))?);
         }
-        if !track::one_branch(shared) {
-            self.drop_el(c.role, at, NoteKind::Stretch(c.stretch_mode))?;
-            return Ok(());
-        }
-        let t = self.model_track(&c, &rects)?;
-        self.push_native(c, Source::Image(image), t, native)?;
-        Ok(())
+        Ok(track::one_branch(shared).then_some((rects, native)))
     }
 
     /// An image set (`JsonSkinObjectLoader.java:74-98`): a table of its

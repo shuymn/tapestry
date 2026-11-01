@@ -408,18 +408,7 @@ pub fn draw(imported: &Imported) -> Vec<usize> {
         };
         skin.build(&mut play, &frame, &uvs, &mut batch)
             .expect("the frame builds");
-        assert_eq!(batch.dropped(), 0, "quads past the capacity");
-        assert!(
-            batch.runs().len() <= usize::try_from(skin.run_capacity()).unwrap_or(usize::MAX),
-            "more runs than the capacity"
-        );
-        assert!(
-            batch
-                .quads()
-                .iter()
-                .all(|q| q.rect.iter().chain(&q.pivot).all(|v| v.is_finite())),
-            "a quad off the finite plane"
-        );
+        check_batch(skin, &batch);
     }
     rate_and_kind_probes(skin, &chart, &uvs, &mut batch);
     readout_probes(skin, &chart, &uvs, &mut batch);
@@ -466,7 +455,6 @@ fn choice_probes(
     let mut play = skin
         .prepare(chart, &ctx)
         .expect("an imported skin prepares");
-    let runs = usize::try_from(skin.run_capacity()).unwrap_or(usize::MAX);
     let probes = [
         (i64::MIN, 0),
         (-1_000_000, 1),
@@ -509,15 +497,7 @@ fn choice_probes(
         };
         skin.build(&mut play, &frame, uvs, batch)
             .expect("a consistent snapshot builds");
-        assert_eq!(batch.dropped(), 0, "quads past the capacity");
-        assert!(batch.runs().len() <= runs, "more runs than the capacity");
-        assert!(
-            batch
-                .quads()
-                .iter()
-                .all(|q| q.rect.iter().chain(&q.pivot).all(|v| v.is_finite())),
-            "a quad off the finite plane"
-        );
+        check_batch(skin, batch);
     }
 }
 
@@ -547,7 +527,6 @@ fn rate_and_kind_probes(
         reference: d.start,
         failed_at: None,
     });
-    let runs = usize::try_from(skin.run_capacity()).unwrap_or(usize::MAX);
     let max = u32::MAX;
     let tally = Tally {
         counts: PerJudgment {
@@ -621,17 +600,27 @@ fn rate_and_kind_probes(
             let current = if counted { 1_250 } else { 1_000 };
             assert_eq!(read(field::RATE_CURRENT_BP), Some(current));
             assert_eq!(read(field::RATE_WHOLE_BP), Some(i32::MAX));
-            assert_eq!(batch.dropped(), 0, "quads past the capacity");
-            assert!(batch.runs().len() <= runs, "more runs than the capacity");
-            assert!(
-                batch
-                    .quads()
-                    .iter()
-                    .all(|q| q.rect.iter().chain(&q.pivot).all(|v| v.is_finite())),
-                "a quad off the finite plane"
-            );
+            check_batch(skin, batch);
         }
     }
+}
+
+/// A built frame's batch is inside `skin`'s capacities: no quad dropped,
+/// no more runs than reserved, and every quad on the finite plane.
+#[track_caller]
+fn check_batch(skin: &skin_model::Skin, batch: &skin_model::QuadBatch) {
+    assert_eq!(batch.dropped(), 0, "quads past the capacity");
+    assert!(
+        batch.runs().len() <= usize::try_from(skin.run_capacity()).unwrap_or(usize::MAX),
+        "more runs than the capacity"
+    );
+    assert!(
+        batch
+            .quads()
+            .iter()
+            .all(|q| q.rect.iter().chain(&q.pivot).all(|v| v.is_finite())),
+        "a quad off the finite plane"
+    );
 }
 
 /// Lanes at 600 ms with no cover.
@@ -817,18 +806,7 @@ fn readout_probes(
                 Some(i32::from(range.is_some()))
             );
             assert_eq!(read(field::COVER_PERMILLE), Some(i32::from(cover)));
-            assert_eq!(batch.dropped(), 0, "quads past the capacity");
-            assert!(
-                batch.runs().len() <= usize::try_from(skin.run_capacity()).unwrap_or(usize::MAX),
-                "more runs than the capacity"
-            );
-            assert!(
-                batch
-                    .quads()
-                    .iter()
-                    .all(|q| q.rect.iter().chain(&q.pivot).all(|v| v.is_finite())),
-                "a quad off the finite plane"
-            );
+            check_batch(skin, batch);
         }
     }
 }
