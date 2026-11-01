@@ -10,15 +10,17 @@ use std::sync::OnceLock;
 use bms_model::{Lane, TimeUs};
 use image::{ImageFormat, Rgba, RgbaImage};
 use skin_model::{
-    Anchor, Bind, Blend, Ease, ElementDef, End, FileDef, Filter, Fit, HiddenTrim, ImageDef, KeyDef,
-    LaneParts, LaneStyle, LanesDef, LoadError, Place, Quad, Region, RegionDef, Sheet, Side, Skin,
-    SkinDef, Source, SourceLanes, TimerRef, Track, timer,
+    Anchor, Bind, Blend, CoverImage, CoverPaintDef, Ease, ElementDef, End, FileDef, Filter, Fit,
+    Follow, HiddenTrim, ImageDef, KeyDef, LanePaint, LaneParts, LaneStyle, LanesDef, LoadError,
+    Place, Quad, Region, RegionDef, Sheet, Side, Skin, SkinDef, Source, SourceLanes, TimerRef,
+    Track, WidgetDefs, timer,
 };
 
 use crate::play_support::{Harness, REGIONS};
 
 /// The images, by index: a white texel for plain elements, then one per
-/// lane part, each its own size so none shares a packed frame.
+/// lane part and SUDDEN+'s paint, each its own size so none shares a
+/// packed frame.
 pub const WHITE: u32 = 0;
 pub const NOTE: u32 = 1;
 pub const HEAD: u32 = 2;
@@ -107,8 +109,6 @@ pub fn simple() -> LanesDef {
         top: 80,
         line: 880,
         bottom: 960,
-        cover_at: 80.0,
-        cover_h: 800.0,
         lift_at: 880.0,
         lift_h: 880.0,
         hidden_at: 880.0,
@@ -127,7 +127,6 @@ pub fn simple() -> LanesDef {
             mine: [MINE; 8],
             bar: Some(BAR),
             line: Some(LINE),
-            cover: Some(COVER),
             lift: Some(LIFT),
             hidden: Some(HIDDEN),
         },
@@ -137,9 +136,9 @@ pub fn simple() -> LanesDef {
 /// The source player's lanes on the simple skin's columns, as an imported
 /// skin's: the source region's lower edge at 880 and 600 high, notes and
 /// mines 20 high; `top` half a note above the region (270), `line` a
-/// note's centre at its judgment time (870), SUDDEN+ 600 high anchored at
-/// the region's top (280), LIFT 200 high at its bottom and HIDDEN+ 600
-/// high from its bottom, trimmed there as it rises with the lift.
+/// note's centre at its judgment time (870), LIFT 200 high at its bottom
+/// and HIDDEN+ 600 high from its bottom, trimmed there as it rises with
+/// the lift.
 pub fn source() -> LanesDef {
     LanesDef {
         style: LaneStyle::Source(SourceLanes {
@@ -151,8 +150,6 @@ pub fn source() -> LanesDef {
         top: 270,
         line: 870,
         bottom: 880,
-        cover_at: 280.0,
-        cover_h: 600.0,
         lift_at: 880.0,
         lift_h: 200.0,
         hidden_at: 880.0,
@@ -239,22 +236,89 @@ pub fn lanes_element() -> ElementDef {
     }
 }
 
-/// An adapted skin over [`sheet`] with `regions`, `lanes` and `elements`.
-pub fn skin_with(
+/// A marker of the lanes' `part` in the playfield.
+pub fn marker(part: LanePaint) -> ElementDef {
+    ElementDef::lane_paint(part, Region::Playfield)
+}
+
+/// `elements` with the markers of `lanes`' HIDDEN+ and LIFT, in that
+/// order, after them (so the authored elements keep their indices),
+/// unless some marker is there.
+pub fn with_markers(lanes: Option<&LanesDef>, mut elements: Vec<ElementDef>) -> Vec<ElementDef> {
+    let marked = elements
+        .iter()
+        .any(|e| matches!(e.source, Source::LanePaint(_)));
+    let region = elements
+        .iter()
+        .find(|e| e.source == Source::Lanes)
+        .map(|e| e.place.region);
+    if let (Some(l), Some(region), false) = (lanes, region, marked) {
+        for (part, present) in [
+            (LanePaint::Hidden, l.parts.hidden.is_some()),
+            (LanePaint::Lift, l.parts.lift.is_some()),
+        ] {
+            if present {
+                elements.push(ElementDef::lane_paint(part, region));
+            }
+        }
+    }
+    elements
+}
+
+/// An adapted skin over [`sheet`] with `regions`, `lanes`, `elements`
+/// (and the lanes' markers, [`with_markers`]) and `widgets`.
+pub fn skin_with_widgets(
     regions: [RegionDef; Region::COUNT],
     lanes: Option<LanesDef>,
     elements: Vec<ElementDef>,
+    widgets: WidgetDefs,
 ) -> Result<Skin, LoadError> {
     Skin::new(SkinDef {
         fit: Fit::Adapt,
         regions,
         whens: Vec::new(),
         sheet: sheet(),
+        elements: with_markers(lanes.as_ref(), elements),
         lanes,
-        elements,
-        widgets: skin_model::WidgetDefs::default(),
+        widgets,
         bomb_up_to: Some(skin_model::Grade::Bad),
     })
+}
+
+/// An adapted skin over [`sheet`] with `regions`, `lanes` and `elements`,
+/// and the lanes' markers ([`with_markers`]).
+pub fn skin_with(
+    regions: [RegionDef; Region::COUNT],
+    lanes: Option<LanesDef>,
+    elements: Vec<ElementDef>,
+) -> Result<Skin, LoadError> {
+    skin_with_widgets(regions, lanes, elements, WidgetDefs::default())
+}
+
+/// A SUDDEN+ paint element on `ready` drawing paint `index` over `r` in
+/// the playfield, following `follow`.
+pub fn paint(index: u32, r: [i32; 4], follow: Follow) -> ElementDef {
+    ElementDef {
+        source: Source::CoverPaint(index),
+        track: rect(r),
+        timer: TimerRef::Builtin(timer::READY),
+        visible: None,
+        blend: Blend::Alpha,
+        clip: None,
+        place: Place {
+            region: Region::Playfield,
+            follow,
+            ..Place::SCREEN
+        },
+    }
+}
+
+/// The paint of [`COVER`], without a slider or with `range`.
+pub fn cover_image(range: Option<u32>) -> CoverPaintDef {
+    CoverPaintDef {
+        image: CoverImage::Image(COVER),
+        slider_range: range,
+    }
 }
 
 /// A skin of just the simple lanes.

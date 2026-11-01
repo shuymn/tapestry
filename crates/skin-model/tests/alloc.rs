@@ -30,12 +30,12 @@ use play_support::{bool_program, readouts_for, state, tally};
 use rules::{GaugeValue, Judgment};
 use skin_model::{
     Adjust, Align, Anchor, AtlasLimits, Attach, Attempt, Bind, Blend, BpmRange, BuildError, ClipId,
-    ComboPart, CoverSettings, CycleDef, DigitsDef, DurationRatio, Ease, ElementDef, End, Fill,
-    Filter, Fit, Follow, FrameReadouts, GaugeDef, GaugeDesc, GaugeLook, GaugeParts, GlyphSet,
-    GradePart, ImageDef, JudgeDef, JudgeSlot, KeyDef, LaneParts, LaneTimer, LaneView,
-    Layout as SkinLayout, Motion, Native, NumberDef, Pad, Place, Play, PlayContext, QuadBatch,
-    Region, RegionDef, Sheet, Side, Skin, SkinDef, SkinFrame, Source, TimerRef, Track, UvTable,
-    Variant, field, lane_timer, timer,
+    ComboPart, CoverImage, CoverPaintDef, CoverSettings, CycleDef, DigitsDef, DurationRatio, Ease,
+    ElementDef, End, Fill, Filter, Fit, Follow, FrameReadouts, GaugeDef, GaugeDesc, GaugeLook,
+    GaugeParts, GlyphSet, GradePart, ImageDef, JudgeDef, JudgeSlot, KeyDef, LanePaint, LaneParts,
+    LaneTimer, LaneView, Layout as SkinLayout, Motion, Native, NumberDef, Pad, Place, Play,
+    PlayContext, QuadBatch, Region, RegionDef, Sheet, Side, Skin, SkinDef, SkinFrame, Source,
+    TimerRef, Track, UvTable, Variant, field, lane_timer, timer,
 };
 use skin_model::{
     ChartText, FontRef, FrameUv, LoadState, Overflow, TextDef, TextField, TextImage, TextTable,
@@ -272,9 +272,12 @@ const WHEN_IMAGES: u16 = 5;
 const PARTS: u16 = timer::BUILTIN + WHEN_IMAGES;
 /// The lane parts' images from [`PARTS`] on: the note (a cycle of 4 frames
 /// on `ready`), head, tail, active and inactive body, mine, bar line,
-/// judgment line, cover and lift; then the scratch beam's.
+/// judgment line, SUDDEN+ (also HIDDEN+) and lift; then the scratch
+/// beam's.
 const NOTE: u16 = PARTS;
 const BODY_ON: u16 = PARTS + 3;
+const SUDDEN: u16 = PARTS + 8;
+const LIFT: u16 = PARTS + 9;
 const BEAM: u16 = PARTS + 10;
 /// The widgets' images after the beam: the numbers' glyphs (two sets of
 /// ten and of twenty-four, cycled; eleven), the combos' (ten, eleven,
@@ -430,7 +433,6 @@ fn lanes() -> skin_model::LanesDef {
             mine: [part(5); 8],
             bar: Some(part(6)),
             line: Some(part(7)),
-            cover: Some(part(8)),
             lift: Some(part(9)),
             hidden: Some(part(8)),
         },
@@ -753,6 +755,7 @@ fn widgets(elements: &mut Vec<ElementDef>) -> skin_model::WidgetDefs {
             ),
         ],
         image_choices,
+        cover_paints: Vec::new(),
     }
 }
 
@@ -977,12 +980,48 @@ fn skin() -> Loaded {
         visible: Some(bool_program("combo % 5 != 1")),
         ..lanes_support::lanes_element()
     });
+    // HIDDEN+, then SUDDEN+ painted apart: following the cover on
+    // `judge`, an additive image between, a slider hidden on some frames
+    // and a choice of table 0 following both with a slider; then LIFT.
+    elements.push(ElementDef::lane_paint(LanePaint::Hidden, Region::Playfield));
+    elements.push(ElementDef {
+        timer: TimerRef::Builtin(timer::JUDGE),
+        ..lanes_support::paint(0, [160, -720, 544, 800], Follow::Cover)
+    });
+    elements.push(ElementDef {
+        blend: Blend::Add,
+        ..lanes_support::image(u32::from(timer::READY), [160, 0, 544, 40], Place::SCREEN)
+    });
+    elements.push(ElementDef {
+        visible: Some(bool_program("combo % 3 != 1")),
+        ..lanes_support::paint(1, [160, 0, 544, 80], Follow::None)
+    });
+    elements.push(lanes_support::paint(
+        2,
+        [160, -400, 544, 480],
+        Follow::LiftAndCover,
+    ));
+    elements.push(ElementDef::lane_paint(LanePaint::Lift, Region::Playfield));
     let beam = lanes_support::bound(Bind::Lane(Lane::SCRATCH));
     elements.push(ElementDef {
         blend: Blend::Add,
         ..lanes_support::image(u32::from(BEAM), [152, 824, 112, 112], beam)
     });
-    let widgets = widgets(&mut elements);
+    let mut widgets = widgets(&mut elements);
+    widgets.cover_paints = vec![
+        CoverPaintDef {
+            image: CoverImage::Image(u32::from(SUDDEN)),
+            slider_range: None,
+        },
+        CoverPaintDef {
+            image: CoverImage::Image(u32::from(LIFT)),
+            slider_range: Some(300),
+        },
+        CoverPaintDef {
+            image: CoverImage::Choice(0),
+            slider_range: Some(0),
+        },
+    ];
     let (_dir, sheet) = images();
     let skin = Skin::new(SkinDef {
         fit: Fit::Adapt,
@@ -1063,6 +1102,13 @@ struct Witness {
     /// showed a frame past its entry's first.
     choices: [bool; 3],
     choice_later: bool,
+    /// SUDDEN+'s paint drew while HIDDEN+, which shares its image, was
+    /// off; the slider paint's y at the first target and the author's
+    /// layout while LIFT, which shares its image, was off, and whether it
+    /// moved there.
+    paint: bool,
+    slider: Option<f32>,
+    slider_moved: bool,
     /// The widgets': a combo drew and the shifting judge's grade lay apart
     /// from the other's; the full-gauge PERFECT showed; a sign glyph drew;
     /// the flicker's tip was pushed; each shown gauge drew its own look.
@@ -1166,6 +1212,9 @@ impl Witness {
             literal_moved: false,
             choices: [false; 3],
             choice_later: false,
+            paint: false,
+            slider: None,
+            slider_moved: false,
         }
     }
 }
@@ -1316,6 +1365,7 @@ fn stretch(
         let shown = usize::from(stalled && !frame_no.is_multiple_of(4));
         let target_no = (frame_no / 5) % TARGETS.len();
         let layout_no = (frame_no / 37) % views.layouts.len();
+        let view = views.lanes[(frame_no / 23) % views.lanes.len()];
         let frame = SkinFrame {
             now: TimeUs(now),
             display_offset: offset,
@@ -1326,8 +1376,8 @@ fn stretch(
             complete: now > last,
             target: TARGETS[target_no],
             layout: &views.layouts[layout_no],
-            lanes: views.lanes[(frame_no / 23) % views.lanes.len()],
-            readouts: stretch_readouts(frame_no, views.lanes[(frame_no / 23) % views.lanes.len()]),
+            lanes: view,
+            readouts: stretch_readouts(frame_no, view),
             // A stretch of loading frames every 50, its progress moving.
             loading: (frame_no % 50 < 5).then(|| LoadState {
                 since: TimeUs(now - 1_000),
@@ -1356,6 +1406,11 @@ fn stretch(
                 }
                 match loaded.parts.get(&part_key(q.uv, q.layer)) {
                     Some(&NOTE) => w.notes = true,
+                    Some(&SUDDEN) if view.hidden == 0 => w.paint = true,
+                    Some(&LIFT) if view.lift == 0 && target_no == 0 && layout_no == 0 => {
+                        let y = *w.slider.get_or_insert(q.rect[1]);
+                        w.slider_moved |= y != q.rect[1];
+                    }
                     Some(&BODY_ON) => w.active_body = true,
                     Some(&BEAM) if layout_no == 0 => {
                         w.beam[target_no].get_or_insert(q.rect[0]);
@@ -1521,6 +1576,8 @@ fn build_does_not_allocate() {
         assert!(w.active_body, "{name}: no long note drew active");
         assert!(w.turned, "{name}: no quad turned");
         assert!(w.literal_moved, "{name}: the covers never moved a follower");
+        assert!(w.paint, "{name}: SUDDEN+'s paint never drew");
+        assert!(w.slider_moved, "{name}: the slider paint never moved");
         assert_eq!(w.choices, [true; 3], "{name}: an image choice never drew");
         assert!(w.choice_later, "{name}: no image choice entry animated");
         assert!(w.rates_apart, "{name}: the rates never moved apart");

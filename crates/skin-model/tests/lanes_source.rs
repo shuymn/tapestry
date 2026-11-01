@@ -298,9 +298,9 @@ fn a_note_is_within_a_microsecond_of_scroll_of_the_line_at_its_judgment_time() {
 
 #[test]
 fn the_lift_and_the_cover_take_their_shares_of_the_region() {
-    // Lift 200 ‰ of 600: the line at 760. Cover 500 ‰ of the 480 left:
-    // SUDDEN+'s lower edge 240 below its anchor (280), and 240 px of
-    // scroll for 600 ms: a long note of 300 ms is 120 px long.
+    // Lift 200 ‰ of 600: the line at 760. Cover 500 ‰ of the 480 left
+    // is 240, leaving 240 px of scroll for 600 ms: a long note of 300 ms
+    // is 120 px long.
     let chart = ChartBuilder::new(BPM)
         .tap(lane(3), TimeUs(1_000 * MS))
         .long(lane(2), TimeUs(1_000 * MS), TimeUs(1_300 * MS))
@@ -317,11 +317,8 @@ fn the_lift_and_the_cover_take_their_shares_of_the_region() {
         in_lane(&h, BODY_OFF, lane(2)),
         [[320.0, 640.0, 64.0, 100.0]]
     );
-    let cover = rects(&h, COVER);
-    assert_eq!(
-        cover.iter().map(|r| r[1] + r[3]).collect::<Vec<_>>(),
-        [520.0]
-    );
+    // The lanes paint no SUDDEN+ of their own.
+    assert!(rects(&h, COVER).is_empty());
     let lift = rects(&h, LIFT);
     assert_eq!(lift.iter().map(|r| r[1]).collect::<Vec<_>>(), [760.0]);
 }
@@ -379,7 +376,6 @@ fn hidden_plus_draws_nothing_above_its_raised_trim() {
         top: 350,
         line: 930,
         bottom: 940,
-        cover_at: 360.0,
         lift_at: 940.0,
         hidden_at: 940.0,
         hidden_h: 580.0,
@@ -396,25 +392,6 @@ fn hidden_plus_draws_nothing_above_its_raised_trim() {
     h.frame(1_000, &[]);
     let upper = (940.0_f64 - 174.0 - 243.6) as f32;
     assert_eq!(rects(&h, HIDDEN), [[160.0, upper, 544.0, 549.0 - upper]]);
-}
-
-#[test]
-fn sudden_plus_slides_at_its_own_height_over_the_whole_region() {
-    let chart = tap_at(3, 5_000);
-    let cover = |cover: u16, lift: u16| {
-        let mut h = harness(&chart);
-        h.view.cover = cover;
-        h.view.lift = lift;
-        h.frame(1_000, &[]);
-        rects(&h, COVER)
-    };
-    // At 0 ‰ its lowest half note shows above the region (from the
-    // lanes' top, 270, to its anchor, 280); at 1 000 ‰ its lower edge
-    // reaches the line, 600 below, and with the lift at 500 ‰ the raised
-    // line, 300 below.
-    assert_eq!(cover(0, 0), [[160.0, 270.0, 544.0, 10.0]]);
-    assert_eq!(cover(1_000, 0), [[160.0, 280.0, 544.0, 600.0]]);
-    assert_eq!(cover(1_000, 500), [[160.0, 270.0, 544.0, 310.0]]);
 }
 
 #[test]
