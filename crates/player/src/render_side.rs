@@ -171,6 +171,11 @@ pub trait Screen: Send {
 /// render thread with a [`RenderMsg::Resize`] only when none is on its
 /// way, so however often the window resizes, one size and one message
 /// wait.
+///
+/// Its invariant: `queued` is set only by a publish that sends a `Resize`
+/// under the sender's lock, which [`RenderLink::follow`] holds through
+/// sending its `Follow`, so every `Resize` reaches the render thread after
+/// that `Follow` and is acknowledged as it is taken, clearing `queued`.
 #[derive(Debug)]
 pub struct Extent {
     /// Width in the high 32 bits, height in the low; [`UNKNOWN`] before
@@ -533,7 +538,10 @@ impl RenderLink {
     /// newest size published, and every later one, is applied to the
     /// screen between frames, and to each screen built again.
     pub fn follow(&self, extent: &Arc<Extent>) {
-        *extent.wake.lock().unwrap_or_else(PoisonError::into_inner) = Some(self.tx.clone());
+        // Held through the `Follow`, so no `Resize` overtakes it
+        // ([`Extent`]'s invariant).
+        let mut wake = extent.wake.lock().unwrap_or_else(PoisonError::into_inner);
+        *wake = Some(self.tx.clone());
         self.send(RenderMsg::Follow(Arc::clone(extent)));
     }
 
@@ -3627,6 +3635,68 @@ mod tests {
         assert!(rx.try_recv().is_err());
         extent.acknowledge();
         assert_eq!(extent.latest(), Some((u32::MAX, 1)));
+    }
+
+    /// Publishes racing the render thread's registration: a thread
+    /// publishes without pause while the link follows the slot again and
+    /// again, so publishes land between the sender's registration and its
+    /// `Follow`. With nothing drawn (no page), only a message wakes the
+    /// render thread; a size published after the race is applied, so its
+    /// wake was sent and the earlier ones were taken. With the sender
+    /// registered before the lock is let go and `Follow` sent after, a
+    /// `Resize` could reach the render thread before it followed, be left
+    /// unacknowledged, and leave `queued` set: the last publish would wake
+    /// nothing, and its size would never be applied.
+    #[test]
+    fn publishes_during_registration_still_wake_the_render_thread() {
+        let resized = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let r = Arc::clone(&resized);
+        let make: MakeScreen = Box::new(move || {
+            Ok(Box::new(Resizing {
+                id: 1,
+                size: (1_920, 1_080),
+                resized: Arc::clone(&r),
+                frames: Arc::new(std::sync::Mutex::new(Vec::new())),
+                waited_minimized: Arc::new(AtomicU32::new(0)),
+                fail: Arc::new(AtomicBool::new(false)),
+            }) as Box<dyn Screen>)
+        });
+        let clock = QpcClock::start();
+        let link = spawn(
+            make,
+            None,
+            None,
+            clock,
+            view(),
+            measure(clock),
+            Box::new(NoFrames),
+        )
+        .unwrap();
+        let extent = Arc::new(super::Extent::default());
+        let stop = Arc::new(AtomicBool::new(false));
+        let (published, done) = (Arc::clone(&extent), Arc::clone(&stop));
+        let publisher = std::thread::spawn(move || {
+            let mut w = 1;
+            while !done.load(Ordering::SeqCst) {
+                published.publish(w, 1);
+                w = w % 1_000 + 1;
+            }
+        });
+        for _ in 0..500 {
+            link.follow(&extent);
+        }
+        stop.store(true, Ordering::SeqCst);
+        publisher.join().unwrap();
+        extent.publish(4_096, 2_160);
+        let last = || resized.lock().unwrap().last().copied();
+        assert!(
+            wait_until(|| last() == Some((1, 4_096, 2_160))),
+            "{:?}",
+            last()
+        );
+        extent.publish(800, 600);
+        assert!(wait_until(|| last() == Some((1, 800, 600))), "{:?}", last());
+        link.exit();
     }
 
     /// A screen paced as a swap chain is, each the `id`th built, noting
