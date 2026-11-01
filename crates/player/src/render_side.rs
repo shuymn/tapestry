@@ -2233,10 +2233,10 @@ mod tests {
     fn attempt(chart: &Chart, section: Option<&eval::Section>) -> AttemptContext {
         let attempt = game::Attempt::new(
             1,
-            chart,
             &rules::tapestry(),
             TimeUs(1_000_000),
             section,
+            game::NoteEnd::Play.of(chart),
             &game::ChartLabels::default(),
         );
         AttemptContext::new(attempt, crate::attempt_context::SIMPLE_SCRATCH)

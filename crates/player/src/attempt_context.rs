@@ -65,7 +65,7 @@ impl AttemptContext {
 
 #[cfg(test)]
 mod tests {
-    use bms_model::{ChartBuilder, Lane, TimeUs};
+    use bms_model::TimeUs;
     use game::{Attempt, ChartLabels};
     use skin_model::{GaugeDesc, Side};
 
@@ -76,11 +76,6 @@ mod tests {
     /// the scratch side given, and no BPM range.
     #[test]
     fn the_context_is_the_attempts_own_data() {
-        let chart = ChartBuilder::new(120_000)
-            .tap(Lane::new(1).unwrap(), TimeUs(1_000_000))
-            .tap(Lane::new(2).unwrap(), TimeUs(3_000_000))
-            .build()
-            .unwrap();
         let mut preset = rules::tapestry();
         preset.gauges.reverse();
         preset.empty_poor.counted = !preset.empty_poor.counted;
@@ -92,10 +87,10 @@ mod tests {
         };
         let attempt = Attempt::new(
             2,
-            &chart,
             &preset,
             TimeUs(2_000_000),
             Some(&section),
+            TimeUs(1_000_000),
             &ChartLabels::default(),
         );
         let owned = AttemptContext::new(attempt, Side::Right);

@@ -4,10 +4,11 @@
 //! ended. Everything here is ordinary game data: the player translates it
 //! into whatever a skin takes, so the game depends on no skin crate.
 
-use bms_model::{Chart, NoteKind, TimeUs};
+use bms_model::{Chart, Speed, TimeUs};
 use eval::Section;
 use rules::{GaugeRule, LnMode, RulePreset};
 
+use crate::practice::mapped;
 use crate::prepare::ChartLabels;
 
 /// How a play's preparation on the screen ended ([`crate::Rig::prepare_attempt`]).
@@ -69,42 +70,71 @@ pub struct Attempt {
     pub ln_default: LnMode,
     /// The whole chart or a section.
     pub kind: AttemptKind,
-    /// The end of the attempt's notes on its play clock: the latest end of
-    /// a note it evaluates (a long note's at its end; mines and background
-    /// sounds do not count), or its start when it has none. This is the
-    /// endpoint a skin's `last_note` timer samples from, kept apart from
-    /// any remaining-time readout.
+    /// The end of the attempt's notes on its play clock ([`NoteEnd`]):
+    /// the endpoint a skin's `last_note` timer samples from, kept apart
+    /// from any remaining-time readout.
     pub last_note_end: TimeUs,
     /// The chart's labels, from the ingestion that read the chart.
     pub labels: ChartLabels,
 }
 
+/// What an attempt's notes end at (design.md "Play Lifecycle"; the skin
+/// runtime's `last_note_end`), by how it plays.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NoteEnd {
+    /// A normal play: the last note's time, a long note's end and a mine
+    /// included.
+    Play,
+    /// Autoplay: the last timeline's, background sounds included.
+    Autoplay,
+    /// A practice round: the section's end in the chart's 1× time plus
+    /// 1 s, mapped to the real time of a chart loaded at `speed`.
+    Practice {
+        /// The section's end, in the chart's 1× time.
+        end: TimeUs,
+        /// The speed the chart is loaded at.
+        speed: Speed,
+    },
+}
+
+impl NoteEnd {
+    /// The end on `chart`'s play clock; 0 for a chart without notes.
+    #[must_use]
+    pub fn of(self, chart: &Chart) -> TimeUs {
+        let notes = || chart.lanes.iter().flatten().map(|n| n.end());
+        match self {
+            Self::Play => notes().max().unwrap_or(TimeUs(0)),
+            Self::Autoplay => notes()
+                .chain(chart.bgm.iter().map(|b| b.time))
+                .max()
+                .unwrap_or(TimeUs(0)),
+            Self::Practice { end, speed } => {
+                mapped(TimeUs(end.0.saturating_add(PRACTICE_PAD.0)), speed)
+            }
+        }
+    }
+}
+
+/// What a practice round's note end adds to its section's end, in the
+/// chart's 1× time.
+const PRACTICE_PAD: TimeUs = TimeUs(1_000_000);
+
 impl Attempt {
     /// The attempt numbered `number` of `chart` under `preset`: the whole
-    /// chart with a `lead_in` countdown, or the round of `section`.
+    /// chart with a `lead_in` countdown, or the round of `section`, its
+    /// notes ending at `last_note_end` ([`NoteEnd::of`]).
     #[must_use]
     pub fn new(
         number: u32,
-        chart: &Chart,
         preset: &RulePreset,
         lead_in: TimeUs,
         section: Option<&Section>,
+        last_note_end: TimeUs,
         labels: &ChartLabels,
     ) -> Self {
-        let notes = chart
-            .lanes
-            .iter()
-            .flatten()
-            .filter(|n| !matches!(n.kind, NoteKind::Mine { .. }));
-        let (kind, last_note_end) = match section {
-            Some(s) => {
-                let last = notes.filter(|n| s.is_target(n)).map(|n| n.end()).max();
-                (AttemptKind::Section(s.clone()), last.unwrap_or(s.start))
-            }
-            None => {
-                let last = notes.map(|n| n.end()).max();
-                (AttemptKind::Full { lead_in }, last.unwrap_or(TimeUs(0)))
-            }
+        let kind = match section {
+            Some(s) => AttemptKind::Section(s.clone()),
+            None => AttemptKind::Full { lead_in },
         };
         Self {
             number,
@@ -122,66 +152,46 @@ impl Attempt {
 
 #[cfg(test)]
 mod tests {
-    use bms_model::{ChartBuilder, Lane, TimeUs};
-    use eval::Section;
+    use bms_model::{BgmEvent, ChartBuilder, Lane, SoundId, Speed, TimeUs};
 
-    use super::{Attempt, AttemptKind};
-    use crate::prepare::ChartLabels;
+    use super::NoteEnd;
 
     const MS: i64 = 1_000;
 
-    /// The endpoint is the latest end of the attempt's own notes: a long
-    /// note's end counts, a mine after it does not, and a round counts only
-    /// its targets.
+    /// A normal play's notes end at the last note's time, a long note's
+    /// end and a mine included; autoplay's at the last timeline's, a
+    /// background sound after the notes included; a round's at its 1×
+    /// section end plus 1 s, mapped to the loaded speed; a chart without
+    /// notes at 0.
     #[test]
-    fn the_last_note_end_is_the_attempts_latest_note_end() {
+    fn the_note_end_follows_how_the_attempt_plays() {
         let lane = |i| Lane::new(i).unwrap();
-        let chart = ChartBuilder::new(150_000)
+        let mut chart = ChartBuilder::new(150_000)
             .tap(lane(1), TimeUs(1_000 * MS))
             .long(lane(2), TimeUs(2_000 * MS), TimeUs(3_500 * MS))
             .tap(lane(3), TimeUs(5_000 * MS))
             .mine(lane(4), TimeUs(9_000 * MS), 1)
             .build()
             .unwrap();
-        let preset = rules::tapestry();
-        let labels = ChartLabels::default();
-        let full = Attempt::new(1, &chart, &preset, TimeUs(1_000 * MS), None, &labels);
-        assert_eq!(full.last_note_end, TimeUs(5_000 * MS));
-        assert_eq!(
-            full.kind,
-            AttemptKind::Full {
-                lead_in: TimeUs(1_000 * MS)
-            }
-        );
-        let section = Section {
-            start: TimeUs(500 * MS),
+        assert_eq!(NoteEnd::Play.of(&chart), TimeUs(9_000 * MS));
+        chart.bgm.push(BgmEvent {
+            time: TimeUs(12_000 * MS),
+            sound: SoundId(1),
+        });
+        assert_eq!(NoteEnd::Play.of(&chart), TimeUs(9_000 * MS));
+        assert_eq!(NoteEnd::Autoplay.of(&chart), TimeUs(12_000 * MS));
+        // (4 000 ms + 1 000 ms) · 100 / 75.
+        let practice = NoteEnd::Practice {
             end: TimeUs(4_000 * MS),
-            lead_in: TimeUs(2_000 * MS),
-            initial_gauges: preset.gauges.iter().map(|g| g.start).collect(),
+            speed: Speed::from_twentieths(15).unwrap(),
         };
-        let round = Attempt::new(
-            2,
-            &chart,
-            &preset,
-            TimeUs(1_000 * MS),
-            Some(&section),
-            &labels,
-        );
-        assert_eq!(round.last_note_end, TimeUs(3_500 * MS));
-        // A section without targets ends where it starts.
-        let empty = Section {
-            start: TimeUs(6_000 * MS),
-            end: TimeUs(8_000 * MS),
-            ..section
+        assert_eq!(practice.of(&chart), TimeUs(6_666_666));
+        let practice = NoteEnd::Practice {
+            end: TimeUs(4_000 * MS),
+            speed: Speed::NORMAL,
         };
-        let none = Attempt::new(
-            3,
-            &chart,
-            &preset,
-            TimeUs(1_000 * MS),
-            Some(&empty),
-            &labels,
-        );
-        assert_eq!(none.last_note_end, TimeUs(6_000 * MS));
+        assert_eq!(practice.of(&chart), TimeUs(5_000 * MS));
+        let empty = ChartBuilder::new(150_000).build().unwrap();
+        assert_eq!(NoteEnd::Play.of(&empty), TimeUs(0));
     }
 }

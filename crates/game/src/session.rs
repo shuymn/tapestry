@@ -27,7 +27,7 @@ use replay::{
 };
 use rules::{GaugeKind, RulePreset};
 
-use crate::attempt::Attempt;
+use crate::attempt::{Attempt, NoteEnd};
 use crate::autoplay::{Autoplay, AutoplayError};
 use crate::bests::{BestView, SavedPlay};
 use crate::live::{Closing, InputWaitError, LiveError, Opening, Rig};
@@ -927,12 +927,20 @@ impl Loaded {
     /// it with, made afresh for each play.
     #[must_use]
     pub fn attempt(&self) -> Attempt {
+        let ends = match (&self.practice, self.config.autoplay) {
+            (Some((practice, _)), _) => NoteEnd::Practice {
+                end: practice.end,
+                speed: self.config.speed,
+            },
+            (None, Some(_)) => NoteEnd::Autoplay,
+            (None, None) => NoteEnd::Play,
+        };
         Attempt::new(
             self.attempt,
-            &self.chart,
             &self.preset,
             self.config.lead_in,
             self.section(),
+            ends.of(&self.chart),
             &self.labels,
         )
     }
