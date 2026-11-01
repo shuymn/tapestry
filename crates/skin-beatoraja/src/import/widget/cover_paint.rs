@@ -83,13 +83,9 @@ impl Cx<'_> {
         if c.stretch == Stretch::Trimmed {
             return self.drop_el(c.role, at, NoteKind::Stretch(c.stretch_mode));
         }
-        let Some((image, cell)) = self.add_src_image(&c, rec, s, s.div)? else {
+        let Some((image, t, native)) = self.src_image_track(&c, rec, s)? else {
             return Ok(());
         };
-        let Some((rects, native)) = self.baked_rects(&c, cell)? else {
-            return self.drop_el(c.role, at, NoteKind::Stretch(c.stretch_mode));
-        };
-        let t = self.model_track(&c, &rects)?;
         self.push_paint(c, CoverImage::Image(image), range, t, native)
     }
 

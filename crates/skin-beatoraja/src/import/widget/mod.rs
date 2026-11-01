@@ -9,7 +9,7 @@ pub(super) mod lanes;
 pub(super) mod number;
 pub(super) mod text;
 
-use skin_model::{CycleDef, ImageDef, MAX_SKIN_FRAMES, Native, Source};
+use skin_model::{CycleDef, ImageDef, MAX_SKIN_FRAMES, Native, Source, Track};
 
 use super::asset::{self, Crop, Failed, ImageKey, Path};
 use super::budget::ImportLimit;
@@ -406,16 +406,32 @@ impl Cx<'_> {
         let Some(c) = self.image_common(&dst, charged, Role::Decorative)? else {
             return Ok(());
         };
-        let Some((image, cell)) = self.add_src_image(&c, rec, &s, s.div)? else {
+        let Some((image, t, native)) = self.src_image_track(&c, rec, &s)? else {
             return Ok(());
         };
-        let Some((rects, native)) = self.baked_rects(&c, cell)? else {
-            self.drop_el(c.role, at, NoteKind::Stretch(c.stretch_mode))?;
-            return Ok(());
-        };
-        let t = self.model_track(&c, &rects)?;
         self.push_native(c, Source::Image(image), t, native)?;
         Ok(())
+    }
+
+    /// `rec`'s whole-sheet image admitted for `c`, with `c`'s track baked
+    /// against its cell and the native size stretch 8 and 9 keep; `None`
+    /// once `c` is dropped, as a stretch changing branch between keys
+    /// drops it.
+    pub(super) fn src_image_track(
+        &mut self,
+        c: &Common,
+        rec: u32,
+        s: &SrcImage,
+    ) -> Result<Option<(u32, Track, Option<Native>)>, ImportError> {
+        let Some((image, cell)) = self.add_src_image(c, rec, s, s.div)? else {
+            return Ok(None);
+        };
+        let Some((rects, native)) = self.baked_rects(c, cell)? else {
+            self.drop_el(c.role, c.span, NoteKind::Stretch(c.stretch_mode))?;
+            return Ok(None);
+        };
+        let t = self.model_track(c, &rects)?;
+        Ok(Some((image, t, native)))
     }
 
     /// `c`'s keys with its stretch baked against a `cell`, and the native
