@@ -19,7 +19,7 @@ use super::super::geom::HEIGHT;
 use super::super::policy::{CriticalPart, Role};
 use super::super::report::{NoteKind, Object};
 use super::super::track::Stretch;
-use super::super::{Common, Cx, Dst, Opts, Prop};
+use super::super::{Common, Cx, Dst, Prop};
 use super::SrcImage;
 use crate::error::ImportError;
 
@@ -65,12 +65,7 @@ impl Cx<'_> {
         range: Option<u32>,
     ) -> Result<(), ImportError> {
         let at = dst.span;
-        let o = Opts {
-            follow: true,
-            charged: true,
-            ..Opts::default()
-        };
-        let Some(c) = self.common_with(role, &dst, o)? else {
+        let Some(c) = self.image_common(&dst, true, role)? else {
             return Ok(());
         };
         if dst.stretch == 5 {

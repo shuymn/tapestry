@@ -20,7 +20,7 @@ use skin_model::{
 use super::super::policy::{CriticalPart, Role};
 use super::super::property::{self, IndexProp, IntProp, Value};
 use super::super::report::{NoteKind, PropertyKind, Span, TrackWhy};
-use super::super::{Common, Cx, Dst, Opts, Prop, TimerWhy};
+use super::super::{Common, Cx, Dst, Prop, TimerWhy};
 #[cfg(test)]
 use super::super::{Event, trace};
 use super::{SrcImage, Unplaced, untimed_refused};
@@ -174,23 +174,6 @@ impl Cx<'_> {
         })
     }
 
-    /// The common part of a selecting element, in the role `lowered`
-    /// gives it and following the covers; `charged` when its keys were
-    /// charged as an offset-4 candidate.
-    fn choice_common(
-        &mut self,
-        dst: &Dst,
-        charged: bool,
-        lowered: Lowered,
-    ) -> Result<Option<Common>, ImportError> {
-        let o = Opts {
-            follow: true,
-            charged,
-            ..Opts::default()
-        };
-        self.common_with(lowered.role(), dst, o)
-    }
-
     /// An image group (`len` above 1) selecting by `src`: `len` runs of
     /// `⌊N / len⌋` of its `N` frames, the remainder never shown; never
     /// drawn when a run would be empty. The cycle is resolved for a run's
@@ -220,7 +203,7 @@ impl Cx<'_> {
             .map_err(|l| self.limit(at, l))?;
         #[cfg(test)]
         trace(Event::Refs);
-        let Some(c) = self.choice_common(&dst, charged, lowered)? else {
+        let Some(c) = self.image_common(&dst, charged, lowered.role())? else {
             return Ok(());
         };
         let (src, deviates) = selector;
@@ -285,7 +268,7 @@ impl Cx<'_> {
         self.budget.choice_refs(n).map_err(|l| self.limit(at, l))?;
         #[cfg(test)]
         trace(Event::Refs);
-        let Some(c) = self.choice_common(&dst, charged, lowered)? else {
+        let Some(c) = self.image_common(&dst, charged, lowered.role())? else {
             return Ok(());
         };
         let value = self.selector(src, at)?;

@@ -323,6 +323,23 @@ impl Cx<'_> {
         }
     }
 
+    /// The common part of an image, image choice or paint image in
+    /// `role`, following the covers; `charged` when its keys were charged
+    /// as an offset-4 candidate.
+    pub(super) fn image_common(
+        &mut self,
+        dst: &Dst,
+        charged: bool,
+        role: Role,
+    ) -> Result<Option<Common>, ImportError> {
+        let o = Opts {
+            follow: true,
+            charged,
+            ..Opts::default()
+        };
+        self.common_with(role, dst, o)
+    }
+
     /// Whether an image or image set's destination lists offset 4, its
     /// keys then charged once, and what it lowers to: SUDDEN+'s paint
     /// unless it cannot reach the lanes, where it follows SUDDEN+.
@@ -370,12 +387,7 @@ impl Cx<'_> {
             let selector = (src, index.deviates());
             return self.image_group(dst, rec, &s, len, selector, charged, lowered);
         }
-        let o = Opts {
-            follow: true,
-            charged,
-            ..Opts::default()
-        };
-        let Some(c) = self.common_with(Role::Decorative, &dst, o)? else {
+        let Some(c) = self.image_common(&dst, charged, Role::Decorative)? else {
             return Ok(());
         };
         let Some((image, cell)) = self.add_src_image(&c, rec, &s, s.div)? else {
