@@ -2989,3 +2989,23 @@ fn the_step_processing_a_gauge_failure_enters_playing() {
     assert_eq!(rig.phases[0].last().map(|&(_, p)| p), Some(true));
     assert_eq!(rig.closed_phases, [false]);
 }
+
+/// A quit key already pending when the preparation answers at once: the
+/// attempt is never committed, but discarded, and recording never opens.
+#[test]
+fn a_quit_pending_at_an_immediate_preparation_commits_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut loaded = loaded(dir.path());
+    let mut rig = Fake::new(Vec::new(), &[(i64::MIN, Command::Quit)], i64::MAX);
+    assert_eq!(rig.prepare_waits, 0);
+    let left = game::live::run_chart(&mut loaded, &mut rig).unwrap();
+    assert_eq!(left, game::Leave::Back);
+    assert_eq!((rig.opens, rig.reports.len()), (0, 0));
+    assert!(!rig.steps.contains(&"commit"), "{:?}", rig.steps);
+    assert!(
+        rig.steps.ends_with(&["attempt", "discard"]),
+        "{:?}",
+        rig.steps
+    );
+    assert!(rig.commands.is_empty());
+}

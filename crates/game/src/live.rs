@@ -614,9 +614,12 @@ fn ready_to_commit<R: Rig>(
     if let Some(at) = loaded.restore_at() {
         rig.restore_ready(at).map_err(LiveError::Restore)?;
     }
-    // What happened during the preparation, before its commit.
+    // What happened during the preparation, before its commit: a quit key
+    // pressed while it ran (or before it, when it answered at once) leaves
+    // the play here, before anything is installed. A retry or suspend from
+    // before this play belongs to no play.
     preflight(rig)?;
-    Ok(!rig.quitting())
+    Ok(!(rig.quitting() || rig.take() == Some(Command::Quit)))
 }
 
 /// A play's report, and what follows it.
