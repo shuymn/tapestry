@@ -107,9 +107,7 @@ impl Staging {
     /// drawing order: a play frame's app work, which calls nothing in wgpu
     /// and allocates nothing.
     pub fn build(&mut self, skin: &mut dyn PlaySkin, f: &FrameInput<'_>) {
-        self.batch.clear();
-        skin.build(f, &mut self.batch);
-        self.batch.stage(&mut self.instances, self.font_scale);
+        self.fill(|batch| skin.build(f, batch));
     }
 
     /// `push` fills the emptied batch, which is then staged: the built-in
