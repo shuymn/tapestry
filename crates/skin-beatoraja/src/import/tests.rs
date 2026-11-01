@@ -217,10 +217,10 @@ fn refused_and_dropped_covers_admit_nothing() {
         })
     ));
     assert_eq!(admits, base);
-    // An offset-4 image that may reach the lanes, of the malformed file.
+    // SUDDEN+'s paint of the malformed file in a stretch it refuses.
     let (r, _, admits) = run(&lanes(
         "",
-        r#", {"id": "bad", "offset": 4, "dst": [{"x": 0, "y": 0, "w": 100, "h": 8}]}"#,
+        r#", {"id": "bad", "offset": 4, "stretch": 3, "dst": [{"x": 0, "y": 0, "w": 100, "h": 8}]}"#,
     ));
     assert!(matches!(
         r,

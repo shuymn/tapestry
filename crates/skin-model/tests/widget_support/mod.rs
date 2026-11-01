@@ -103,6 +103,22 @@ pub fn load_fit(
     elements: Vec<ElementDef>,
     widgets: WidgetDefs,
 ) -> Result<Skin, LoadError> {
+    // The lanes' HIDDEN+ and LIFT markers, after the elements.
+    let mut elements = elements;
+    let region = elements
+        .iter()
+        .find(|e| e.source == skin_model::Source::Lanes)
+        .map(|e| e.place.region);
+    if let (Some(l), Some(region)) = (&lanes, region) {
+        for (part, present) in [
+            (skin_model::LanePaint::Hidden, l.parts.hidden.is_some()),
+            (skin_model::LanePaint::Lift, l.parts.lift.is_some()),
+        ] {
+            if present {
+                elements.push(ElementDef::lane_paint(part, region));
+            }
+        }
+    }
     Skin::new(SkinDef {
         fit,
         regions,

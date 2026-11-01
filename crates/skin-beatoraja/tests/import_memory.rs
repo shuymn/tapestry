@@ -468,6 +468,129 @@ fn check_f7(_: &Header, i: Imported) {
     assert_eq!(i.skin.sheet().image_count(), 2);
 }
 
+/// F8a: 16,384 type-4 sliders over one one-frame image, without lanes:
+/// one quad each and nothing reserved.
+fn f8a(root: &Path) {
+    png(root, "a.png", 1, 1);
+    let dsts =
+        join((0..MAX_ELEMENTS).map(|_| r#"{"id": "s", "dst": [{"w": 1, "h": 1}]}"#.to_owned()));
+    write(
+        root,
+        "s.json",
+        common::hd(&format!(
+            r#""source": [{{"id": "a", "path": "a.png"}}],
+               "slider": [{{"id": "s", "src": "a", "w": 1, "h": 1, "type": 4, "angle": 2,
+                            "range": 600}}],
+               "destination": [{dsts}]"#
+        ))
+        .as_bytes(),
+    );
+}
+
+fn check_f8a(_: &Header, i: Imported) {
+    let u = i.report.usage;
+    let n = as_u32(MAX_ELEMENTS);
+    assert_eq!((u.elements, u.keys), (n, n));
+    assert_eq!((u.images, u.frames, u.files), (1, 1, 1));
+    assert_eq!(i.report.notes, []);
+    assert!(i.scratch.is_none());
+    assert_eq!(i.skin.quad_capacity(), n);
+    let chart = bms_model::ChartBuilder::new(150_000).build().unwrap();
+    let mut d = Drawn::over(i.skin, &chart);
+    d.view.cover = 500;
+    let q = d.frame(1_000, &[]);
+    assert_eq!(q.len(), MAX_ELEMENTS);
+    // 600 × 500 ‰ lowers each from 1 079 to 1 379.
+    assert!(
+        q.iter()
+            .all(|q| common::play::round(q.rect) == [0, 1_379, 1, 1])
+    );
+}
+
+/// F8b's paints: every element but the lanes and their two markers.
+const PAINTS: usize = MAX_ELEMENTS - 3;
+
+/// F8b: [`PAINTS`] SUDDEN+ paints over the lanes, each a four-entry image
+/// set over four one-frame images of one file chosen by the gauge's
+/// percent, and the lanes with LIFT and HIDDEN+.
+fn f8b(root: &Path) {
+    use common::lanes::{body, hidden, hidden_object, lift, lift_object, note};
+    png(root, "a.png", 64, 64);
+    let images = r#"{"id": "c0", "src": "a", "x": 48, "y": 48, "w": 1, "h": 1},
+                    {"id": "c1", "src": "a", "x": 49, "y": 48, "w": 1, "h": 1},
+                    {"id": "c2", "src": "a", "x": 50, "y": 48, "w": 1, "h": 1},
+                    {"id": "c3", "src": "a", "x": 51, "y": 48, "w": 1, "h": 1}"#;
+    let objects = format!(
+        r#"{}, {}, {},
+           "imageset": [{{"id": "s", "images": ["c0", "c1", "c2", "c3"], "value": 110}}]"#,
+        note(""),
+        lift_object(""),
+        hidden_object("")
+    );
+    let paint = r#"{"id": "s", "offset": 4, "dst": [{"x": 100, "y": 900, "w": 10, "h": 10}]}"#;
+    let mut dsts = vec![common::lanes::NOTES.to_owned(), lift(""), hidden("")];
+    dsts.extend((0..PAINTS).map(|_| paint.to_owned()));
+    let dsts: Vec<&str> = dsts.iter().map(String::as_str).collect();
+    write(
+        root,
+        "s.json",
+        common::hd(&format!(
+            r#""source": [{{"id": "a", "path": "a.png"}}], {}"#,
+            body(images, &objects, &dsts)
+        ))
+        .as_bytes(),
+    );
+}
+
+fn check_f8b(_: &Header, i: Imported) {
+    let u = i.report.usage;
+    assert_eq!(u.elements, as_u32(MAX_ELEMENTS));
+    assert_eq!(u.choice_refs, as_u32(4 * PAINTS));
+    assert_eq!(i.skin.choice_ref_count(), 65_524);
+    // The four choices share their file with the lanes' parts.
+    assert_eq!(u.files, 1);
+    assert_eq!(
+        i.skin.quad_capacity(),
+        as_u32(MAX_ELEMENTS) + skin_model::LANE_QUADS
+    );
+    assert_eq!(i.skin.quad_capacity(), 24_576);
+    // Each paint charges its own selector.
+    let ops = i.skin.ops().total();
+    assert_eq!(ops, PAINTS, "{ops}");
+    // Dense notes on every lane, both legacy parts and every paint.
+    let mut chart = bms_model::ChartBuilder::new(150_000);
+    for t in 0..2_000 {
+        for lane in 0..8 {
+            chart = chart.tap(
+                bms_model::Lane::new(lane).unwrap(),
+                bms_model::TimeUs(1_000_000 + 1_000 * t),
+            );
+        }
+    }
+    let chart = chart.build().unwrap();
+    let mut d = Drawn::over(i.skin, &chart);
+    d.gauges[0].value = GaugeValue::FULL;
+    d.view.cover = 300;
+    d.view.lift = 100;
+    d.view.hidden = 500;
+    let q = d.frame(1_000, &[]);
+    let size = |w: i32, h: i32| {
+        q.iter()
+            .filter(|q| {
+                let [_, _, qw, qh] = common::play::round(q.rect);
+                [qw, qh] == [w, h]
+            })
+            .count()
+    };
+    assert_eq!(size(10, 10), PAINTS);
+    let covers = q
+        .iter()
+        .filter(|q| common::play::round(q.rect)[2] == 430)
+        .count();
+    assert_eq!(covers, 2);
+    assert!(q.len() > PAINTS + 2 + 1_000, "{}", q.len());
+}
+
 /// F5's judges: 5,127 with a 2-digit combo and one with a 1-digit combo.
 const JUDGES: usize = 5_128;
 /// Judges whose grade has 11 keys; the rest have 10.
@@ -584,10 +707,11 @@ fn check_f5(_: &Header, i: Imported) {
     assert_eq!(u.widget_quads, MAX_WIDGET_QUADS);
     assert_eq!(u.elements, as_u32(JUDGES) + 5);
     assert!(i.scratch.is_some());
-    // No image element: the widgets' worst cases and the lanes' budget.
+    // One image element, SUDDEN+'s paint: the widgets' worst cases, its
+    // quad and the lanes' budget.
     assert_eq!(
         i.skin.quad_capacity(),
-        MAX_WIDGET_QUADS + skin_model::LANE_QUADS + skin_model::LANE_RESERVED
+        MAX_WIDGET_QUADS + 1 + skin_model::LANE_QUADS + skin_model::LANE_RESERVED
     );
     // The snapshot: a PERFECT with combo 12, the gauge full, SUDDEN+ at
     // 300 ‰, LIFT at 100 ‰ and HIDDEN+ at 500 ‰, no note on screen.
@@ -635,6 +759,30 @@ fn check_f5(_: &Header, i: Imported) {
         .map(|(_, n)| n)
         .sum();
     assert_eq!(covers, 3, "{by_size:?}");
+    // In destination order: SUDDEN+'s paint whole, 162 below its
+    // destination's −320, every row of its square 8×8 cell (the atlas
+    // pages are square); then LIFT and HIDDEN+, cut to the lanes.
+    let lane_wide: Vec<(&skin_model::Quad, [i32; 4])> = q
+        .iter()
+        .map(|quad| (quad, common::play::round(quad.rect)))
+        .filter(|(_, r)| r[2] == 430)
+        .collect();
+    let rects: Vec<[i32; 4]> = lane_wide.iter().map(|&(_, r)| r).collect();
+    assert_eq!(
+        rects,
+        [
+            [20, -158, 430, 600],
+            [20, 820, 430, 60],
+            [20, 550, 430, 270]
+        ],
+        "{rects:?}"
+    );
+    let [u0, v0, u1, v1] = lane_wide[0].0.uv;
+    assert!(
+        ((v1 - v0) / (u1 - u0) - 1.0).abs() < 1e-6,
+        "{:?}",
+        lane_wide[0].0.uv
+    );
     let gauge: usize = by_size
         .iter()
         .filter(|(s, _)| s[1] == 10)
@@ -861,9 +1009,10 @@ fn import_memory_is_measured() {
         size_of::<skin_model::DurationRatio>(),
     );
     println!(
-        "sizes: ImageChoiceDef {}, Option<ImageChoicePart> {}",
+        "sizes: ImageChoiceDef {}, Option<ImageChoicePart> {}, CoverPaintDef {}",
         size_of::<ImageChoiceDef>(),
         size_of::<Option<ImageChoicePart>>(),
+        size_of::<skin_model::CoverPaintDef>(),
     );
     let mut peaks = Vec::new();
     let d = tempfile::tempdir().unwrap();
@@ -902,6 +1051,14 @@ fn import_memory_is_measured() {
     let d = tempfile::tempdir().unwrap();
     f7(d.path());
     peaks.push(("F7 image choices", measure(d.path(), check_f7)));
+    drop(d);
+    let d = tempfile::tempdir().unwrap();
+    f8a(d.path());
+    peaks.push(("F8a sliders", measure(d.path(), check_f8a)));
+    drop(d);
+    let d = tempfile::tempdir().unwrap();
+    f8b(d.path());
+    peaks.push(("F8b paints", measure(d.path(), check_f8b)));
     drop(d);
     for (name, p) in &peaks {
         println!("{name}: peak {p} B");

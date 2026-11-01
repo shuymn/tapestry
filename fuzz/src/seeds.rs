@@ -823,6 +823,7 @@ pub fn skin_imports() -> Vec<Seed> {
             ),
         ),
         ("lanes", play_skin(&lanes_body())),
+        ("paints", play_skin(&paints_body())),
         ("followers", play_skin(&followers_body())),
         (
             "judge",
@@ -1035,8 +1036,29 @@ fn followers_body() -> String {
         )
 }
 
+/// [`lanes_body`] with SUDDEN+ painted four ways between LIFT and HIDDEN+:
+/// a split image, an additive one overhanging the lanes, a type-4 slider
+/// and an image set chosen by the gauge's percent.
+fn paints_body() -> String {
+    let body = lanes_body();
+    let at = body.find(r#""destination""#).unwrap_or(body.len());
+    format!(
+        r#"{}"slider": [{{"id": "sl", "src": "grid", "x": 4, "w": 4, "h": 4, "type": 4, "angle": 2, "range": 600}}],
+            "imageset": [{{"id": "cs", "images": ["cv", "p"], "value": 110}}],
+            "destination": [
+                {{"id": "notes", "dst": [{{"w": 0, "h": 0}}]}},
+                {{"id": "lc", "dst": [{{"x": 20, "y": 0, "w": 430, "h": 200}}]}},
+                {{"id": "cv", "offset": 4, "dst": [{{"x": 20, "y": 800, "w": 215, "h": 600}}]}},
+                {{"id": "cv", "offset": 4, "blend": 2, "dst": [{{"x": 0, "y": 700, "w": 500, "h": 300}}]}},
+                {{"id": "sl", "dst": [{{"x": 235, "y": 800, "w": 215, "h": 600}}]}},
+                {{"id": "cs", "offset": 4, "dst": [{{"x": 20, "y": 760, "w": 430, "h": 40}}]}},
+                {{"id": "hid", "dst": [{{"x": 20, "y": -400, "w": 430, "h": 600}}]}}]"#,
+        body.get(..at).unwrap_or_default()
+    )
+}
+
 /// Lanes of `grid` parts over x 20..450, y 200..800, with a bar line,
-/// SUDDEN+, LIFT and HIDDEN+.
+/// SUDDEN+'s paint, LIFT and HIDDEN+.
 fn lanes_body() -> String {
     let eight = [r#""p""#; 8].join(", ");
     let lists = [

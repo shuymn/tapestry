@@ -32,7 +32,7 @@
 //! 11. The scratch side of an imported skin: the side the skin draws it
 //!     on, given to the caller as `Imported::scratch` (a setting comes
 //!     with S11).
-//! 12. The lane approximations of the notes, SUDDEN+ and LIFT (D9 items
+//! 12. The lane approximations of the notes and LIFT (D9 items
 //!     a–l, [`super::report::LaneApprox`]), each accepted by the owner:
 //!     a notes and long-note bodies stop at the top of the lanes; b an
 //!     unhit tap keeps falling below the line until it is judged a miss
@@ -41,12 +41,11 @@
 //!     source does); e `dst2` is ignored;
 //!     f `expansionrate` is ignored; g a long note's end cap is drawn and a
 //!     skin without one is refused; h a long note's body runs between the
-//!     caps' centres; i the part of SUDDEN+ above the lanes is never
-//!     drawn; j bar lines are drawn across the lanes at note centres, white
-//!     and opaque, until they leave the lanes' bottom, also before the
-//!     chart starts and through a STOP; k what the skin draws between the
-//!     notes and SUDDEN+ or LIFT is drawn above them; l the LIFT image is
-//!     stretched over the covered area.
+//!     caps' centres; j bar lines are drawn across the lanes at note
+//!     centres, white and opaque, until they leave the lanes' bottom, also
+//!     before the chart starts and through a STOP; l the LIFT image is
+//!     stretched over the covered area. SUDDEN+'s paint, LIFT and HIDDEN+
+//!     are drawn in their destinations' order, as the source draws them.
 //! 13. A bar line outside the accepted mapping is dropped with a note
 //!     instead of refusing the skin ([`super::widget::lanes`]).
 //! 14. Images, numbers, text, gauges and judgment grades that list LIFT
@@ -60,9 +59,8 @@
 //! 15. HIDDEN+ is optional for the player, so it is decorative: outside
 //!     the mapped subset it is dropped with a note and the skin still
 //!     imports ([`super::widget::lanes`]). Its differences from the source
-//!     are noted as lane approximations (D9): m drawn under SUDDEN+ and
-//!     LIFT, n cut at its trim line after its stretch, o never drawn
-//!     outside the lanes.
+//!     are noted as lane approximations (D9): n cut at its trim line
+//!     after its stretch, o never drawn outside the lanes.
 
 use std::fmt;
 

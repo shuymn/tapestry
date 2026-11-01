@@ -164,7 +164,7 @@ pub fn import(
         w: i32::try_from(size[0]).unwrap_or(i32::MAX),
         h: i32::try_from(size[1]).unwrap_or(i32::MAX),
     })?;
-    let mut cx = Cx::new(def, header, config, tables, choices, r)?;
+    let mut cx = Cx::new(def, header, config, tables, choices, r, size[1])?;
     let destinations = object::records(&cx.tables, "destination").to_vec();
     cx.span_hint = cx.lane_span_hint(&destinations);
     cx.custom.judge_region = cx.judge_region(&destinations);
@@ -273,6 +273,9 @@ pub(crate) struct Cx<'d> {
     tables: Tables,
     /// The scale from the skin's pixels to reference pixels.
     r: Q,
+    /// The skin's own height in its pixels, which scales a slider's
+    /// vertical range.
+    height: u32,
     entry_dir: String,
     budget: Budget,
     notes: Notes,
@@ -339,6 +342,7 @@ impl<'d> Cx<'d> {
         tables: Tables,
         choices: Choices,
         r: Q,
+        height: u32,
     ) -> Result<Self, ImportError> {
         let entry_dir = def.entry_dir().to_owned();
         let assets = Assets::new(def.root());
@@ -355,6 +359,7 @@ impl<'d> Cx<'d> {
             config,
             tables,
             r,
+            height,
             entry_dir,
             budget: Budget::default(),
             notes: Notes::default(),
@@ -720,7 +725,6 @@ impl<'d> Cx<'d> {
                 why: NoteKind::UnsupportedField { field: "id" },
             });
         }
-        let lanes = self.elements.len();
         match object {
             Object::Image => self.image(dst, orec)?,
             Object::ImageSet => self.image_set(dst, orec)?,
@@ -731,18 +735,10 @@ impl<'d> Cx<'d> {
             Object::LiftCover => self.lift_cover(dst, orec)?,
             Object::Judge => self.judge(dst, orec)?,
             Object::Gauge => self.gauge(dst, orec)?,
+            Object::Slider => self.slider(dst, orec)?,
             _ => {
                 self.drop_el(Role::Decorative, at, NoteKind::Unsupported { object })?;
             }
-        }
-        // An element kept after the notes is drawn below SUDDEN+, LIFT and
-        // HIDDEN+.
-
-        if object != Object::Note
-            && self.elements.len() > lanes
-            && let Some(l) = self.lanes.as_mut()
-        {
-            l.kept_after = true;
         }
         Ok(())
     }
