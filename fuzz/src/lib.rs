@@ -243,12 +243,14 @@ fn write_png(path: &Path, w: u32, h: u32) {
 
 /// What an imported skin draws: the quads of frames at a few times of a
 /// 100-note play with a perfect judgment at each, each frame within the
-/// skin's quad capacity.
+/// skin's quad capacity; its loading state is built too, within the same
+/// capacities.
 ///
 /// # Panics
 ///
-/// If the atlas, the play or the text table is refused, or a frame holds
-/// more quads than the skin's capacity.
+/// If the atlas, the play or the text table is refused, a play or loading
+/// frame holds more quads than the skin's capacity, or a refused loading
+/// state builds again.
 #[must_use]
 pub fn draw(imported: &Imported) -> Vec<usize> {
     use bms_model::{ChartBuilder, Lane, TimeUs};
@@ -422,7 +424,103 @@ pub fn draw(imported: &Imported) -> Vec<usize> {
     choice_probes(skin, &chart, &uvs, &mut batch);
     bar_probes(skin, &ctx, (&tally, &states), &uvs, &mut batch);
     long_note_probes(skin, &ctx, (&tally, &states), &uvs, &mut batch);
+    loading_probes(skin, &text, &gauges[0], &uvs, &mut batch);
     counts
+}
+
+/// The skin's loading state with the chart's lines installed, built as
+/// its clock and progress advance, with its gauge descriptor given,
+/// changed and taken away, the covers moving and the lines cleared, each
+/// frame inside the skin's capacities; a refused build refuses the state
+/// for good.
+fn loading_probes(
+    skin: &skin_model::Skin,
+    text: &skin_model::ChartText<'_>,
+    desc: &skin_model::GaugeDesc,
+    uvs: &skin_model::UvTable,
+    batch: &mut skin_model::QuadBatch,
+) {
+    use bms_model::TimeUs;
+    use skin_model::{
+        BuildError, FrameUv, GaugeLook, LaneView, Layout, LoadState, LoadingFrame, LoadingGauge,
+        Side, TextImage, TextSlots, TextTable,
+    };
+
+    let mut loading = skin.prepare_loading(Side::Left);
+    let mut lines = vec![None; skin.text_slots()];
+    for r in skin.text_requests(text, [1_920, 1_080], &Layout::AUTHOR) {
+        let uv = FrameUv {
+            uv: [0.0, 0.0, 0.5, 0.5],
+            layer: 1,
+        };
+        if let Some(slot) = lines.get_mut(usize::from(r.slot)) {
+            *slot = TextImage::new(uv, [0.0, 0.0, 1.0, 1.0], 1.0);
+        }
+    }
+    skin.install_loading_text(&mut loading, TextSlots::ALL, &TextTable::new(lines))
+        .expect("one line per slot");
+    skin.install_loading_bitmap_text(&mut loading, TextSlots::ALL, text);
+    let normal = LoadingGauge::of(0, desc);
+    let hard = LoadingGauge {
+        look: GaugeLook::Hard,
+        ..normal
+    };
+    for (ms, percent, gauge, cover) in [
+        (0_i64, 0, Some(normal), 0_u16),
+        (50, 10, Some(normal), 300),
+        (500, 40, None, 1_000),
+        (900, 40, Some(hard), 1_500),
+        (5_000, 100, Some(normal), 0),
+    ] {
+        if ms == 900 {
+            skin.clear_loading_text(&mut loading, TextSlots::ALL);
+        }
+        batch.clear();
+        let lanes = LaneView {
+            visible_time: TimeUs(600_000),
+            cover,
+            lift: 0,
+            hidden: 0,
+        };
+        let frame = LoadingFrame {
+            now: TimeUs(ms * 1_000),
+            load: LoadState {
+                since: TimeUs(0),
+                percent,
+            },
+            target: [1_920, 1_080],
+            layout: &Layout::AUTHOR,
+            lanes,
+            covers: readouts_for(lanes).covers,
+            gauge,
+        };
+        skin.build_loading(&mut loading, &frame, uvs, batch)
+            .expect("the loading frame builds");
+        check_batch(skin, batch);
+    }
+    // Covers the frame's lanes do not show: refused, then for good.
+    let mut frame = LoadingFrame {
+        now: TimeUs(6_000_000),
+        load: LoadState {
+            since: TimeUs(0),
+            percent: 100,
+        },
+        target: [1_920, 1_080],
+        layout: &Layout::AUTHOR,
+        lanes: LANES_OFF,
+        covers: readouts_for(LANES_OFF).covers,
+        gauge: Some(normal),
+    };
+    frame.covers.cover = 500;
+    assert_eq!(
+        skin.build_loading(&mut loading, &frame, uvs, batch),
+        Err(BuildError::InvalidReadouts)
+    );
+    frame.covers = readouts_for(LANES_OFF).covers;
+    assert_eq!(
+        skin.build_loading(&mut loading, &frame, uvs, batch),
+        Err(BuildError::InvalidReadouts)
+    );
 }
 
 /// A long note held and released in LN and CN, with its end in view and
