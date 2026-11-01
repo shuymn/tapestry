@@ -18,7 +18,7 @@ use skin_model::{CoverImage, CoverPaintDef, MAX_COORD, Native, Source, Track};
 use super::super::geom::HEIGHT;
 use super::super::policy::{CriticalPart, Role};
 use super::super::report::{NoteKind, Object};
-use super::super::track::{self, Stretch};
+use super::super::track::Stretch;
 use super::super::{Common, Cx, Dst, Opts, Prop};
 use super::SrcImage;
 use crate::error::ImportError;
@@ -91,22 +91,9 @@ impl Cx<'_> {
         let Some((image, cell)) = self.add_src_image(&c, rec, s, s.div)? else {
             return Ok(());
         };
-        let native = c.stretch.native(cell);
-        let mut rects = Vec::with_capacity(c.track.keys.len());
-        let mut shared = track::ANY_BRANCH;
-        for k in &c.track.keys {
-            let r = self.key_rect(&c, k)?;
-            let (r, b) = if native.is_some() {
-                (r, 0b1)
-            } else {
-                track::stretch(c.stretch, r, cell).ok_or_else(|| self.range(at, "dst"))?
-            };
-            shared &= b;
-            rects.push(r.model().ok_or_else(|| self.range(at, "dst"))?);
-        }
-        if !track::one_branch(shared) {
+        let Some((rects, native)) = self.baked_rects(&c, cell)? else {
             return self.drop_el(c.role, at, NoteKind::Stretch(c.stretch_mode));
-        }
+        };
         let t = self.model_track(&c, &rects)?;
         self.push_paint(c, CoverImage::Image(image), range, t, native)
     }
