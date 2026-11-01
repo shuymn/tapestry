@@ -17,7 +17,6 @@ use skin_model::{
 use super::super::policy::Role;
 use super::super::property::{self, IndexProp, IntProp, Value};
 use super::super::report::{NoteKind, PropertyKind, Span, TrackWhy};
-use super::super::track;
 use super::super::{Common, Cx, Dst, Opts, Prop};
 #[cfg(test)]
 use super::super::{Event, trace};
@@ -329,22 +328,9 @@ impl Cx<'_> {
                 choices.push(None);
                 continue;
             };
-            let native = c.stretch.native(e.cell);
-            let mut rects = Vec::with_capacity(c.track.keys.len());
-            let mut shared = track::ANY_BRANCH;
-            for k in &c.track.keys {
-                let r = self.key_rect(&c, k)?;
-                let (r, b) = if native.is_some() {
-                    (r, 0b1)
-                } else {
-                    track::stretch(c.stretch, r, e.cell).ok_or_else(|| self.range(at, "dst"))?
-                };
-                shared &= b;
-                rects.push(r.model().ok_or_else(|| self.range(at, "dst"))?);
-            }
-            if !track::one_branch(shared) {
+            let Some((rects, native)) = self.baked_rects(&c, e.cell)? else {
                 return self.drop_el(c.role, at, NoteKind::Stretch(c.stretch_mode));
-            }
+            };
             let own: Option<Track> = match &element {
                 None => {
                     element = Some(rects);
