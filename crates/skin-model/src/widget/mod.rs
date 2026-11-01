@@ -98,7 +98,13 @@ impl Brush {
             return self.quad_about([x, y, w, h], pivot, f, filter);
         };
         let placed = self.affine.rect([self.map.x(x), y, self.map.w(w), h]);
-        let rect @ [qx, qy, qw, qh] = native.fit(placed, self.scale);
+        self.quad_at(native.fit(placed, self.scale), f, filter)
+    }
+
+    /// The quad showing `f` over the placed canvas rect `rect`, turned
+    /// about its own pivot in it.
+    fn quad_at(&self, rect @ [qx, qy, qw, qh]: [f32; 4], f: FrameUv, filter: Filter) -> Quad {
+        let [fx, fy] = self.pivot;
         Quad {
             rect,
             uv: f.uv,
@@ -130,20 +136,11 @@ impl Brush {
         let s = f64::from(self.scale);
         let add = |v: f32, dv: i32| f32_of(f64::from(v) + f64::from(dv) / s);
         let moved = [add(px, d.dx), add(py, d.dy), add(pw, d.dw), add(ph, d.dh)];
-        let rect @ [qx, qy, qw, qh] = match self.native {
+        let rect = match self.native {
             Some(native) => native.fit(moved, self.scale),
             None => moved,
         };
-        let [fx, fy] = self.pivot;
-        Quad {
-            rect,
-            uv: f.uv,
-            color: self.color,
-            pivot: [qx + fx * qw, qy + fy * qh],
-            angle: self.angle,
-            layer: f.layer,
-            filter,
-        }
+        self.quad_at(rect, f, filter)
     }
 
     /// The quad showing `f` over the reference rect `[x, y, w, h]` turned
