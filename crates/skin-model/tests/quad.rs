@@ -192,3 +192,19 @@ fn the_reserve_follows_a_full_skin() {
         batch.clear();
     }
 }
+
+/// A clear closes the run reserve on its own: with quads to spare, a blend
+/// change past the skin's own runs is still refused.
+#[test]
+fn a_clear_closes_the_run_reserve() {
+    let mut batch = QuadBatch::with_reserve(4, 1, 0, 1);
+    batch.open_reserve();
+    assert!(batch.push(ALPHA, quad(0.0)));
+    assert!(batch.push(ADD, quad(1.0)));
+    batch.clear();
+    assert!(batch.push(ALPHA, quad(0.0)));
+    assert!(!batch.push(ADD, quad(1.0)));
+    assert!(batch.push(ALPHA, quad(2.0)));
+    assert_eq!(batch.runs(), [run(ALPHA, 0, 2)]);
+    assert_eq!(batch.dropped(), 1);
+}
