@@ -257,6 +257,104 @@ fn a_long_note_turns_inactive_at_its_logic_end_while_its_tail_still_shows() {
     }
 }
 
+/// The long notes' parts in `l` drawn at `now` (µs), after the events the
+/// evaluator emits up to then for key 2 pressed at `press` and released at
+/// `release`.
+fn played(chart: &Chart, l: u8, press: i64, release: i64, now: i64) -> [Vec<[f32; 4]>; 3] {
+    let effects = evaluated(chart, press, release, now);
+    let mut h = harness(chart);
+    h.frame_us(now, &effects);
+    long_parts(&h, lane(l))
+}
+
+#[test]
+fn a_long_note_is_drawn_until_its_end_active_only_while_held() {
+    // Key 2's long note from 1 s to 2 s, and key 3's from 1.3 s to 2.3 s,
+    // never pressed. Played with real evaluator events, key 2's body is
+    // drawn at each check time, active or inactive, whatever its judgment.
+    let chart = ChartBuilder::new(BPM)
+        .long(lane(2), TimeUs(1_000 * MS), TimeUs(2_000 * MS))
+        .long(lane(3), TimeUs(1_300 * MS), TimeUs(2_300 * MS))
+        .build()
+        .unwrap();
+    let end = 2_000 * MS;
+    // (case, press, release, [(at, active)]), in ms.
+    type Case = (&'static str, i64, i64, &'static [(i64, bool)]);
+    let cases: [Case; 6] = [
+        (
+            "a missed head",
+            2_500,
+            2_550,
+            &[(1_170, false), (1_200, false), (1_900, false)],
+        ),
+        (
+            "a BAD head released before the end",
+            850,
+            1_400,
+            &[
+                (849, false),
+                (850, true),
+                (1_399, true),
+                (1_400, false),
+                (1_900, false),
+            ],
+        ),
+        (
+            "a BAD head held through its end",
+            850,
+            2_500,
+            &[(850, true), (1_999, true)],
+        ),
+        (
+            "a release before the end",
+            1_000,
+            1_400,
+            &[(1_399, true), (1_400, false), (1_900, false)],
+        ),
+        (
+            "released at its end",
+            1_000,
+            2_000,
+            &[(1_000, true), (1_999, true)],
+        ),
+        (
+            "held through its end",
+            1_000,
+            2_500,
+            &[(1_000, true), (1_999, true)],
+        ),
+    ];
+    for (name, press, release, checks) in cases {
+        let (press, release) = (press * MS, release * MS);
+        for &(at, active) in checks {
+            let at = at * MS;
+            let [on, off, caps] = played(&chart, 2, press, release, at);
+            assert_eq!(
+                (on.len(), off.len()),
+                (usize::from(active), usize::from(!active)),
+                "{name} at {at}"
+            );
+            assert!(!caps.is_empty(), "{name} at {at}");
+            // Key 3's long note is drawn as without any effect.
+            let mut h = harness(&chart);
+            h.frame_us(at, &[]);
+            let plain = long_parts(&h, lane(3));
+            assert!(!plain[1].is_empty(), "{name} at {at}");
+            assert_eq!(
+                played(&chart, 3, press, release, at),
+                plain,
+                "{name} at {at}"
+            );
+        }
+        // At its end the tail is on the line with both caps and no body;
+        // once the end passes the line nothing is drawn.
+        let [on, off, caps] = played(&chart, 2, press, release, end);
+        assert_eq!((on.len(), off.len(), caps.len()), (0, 0, 2), "{name}");
+        let past = played(&chart, 2, press, release, end + 1);
+        assert_eq!(past, <[Vec<[f32; 4]>; 3]>::default(), "{name}");
+    }
+}
+
 #[test]
 fn a_long_note_is_culled_once_its_tail_passes_below_the_line() {
     let chart = long_note();

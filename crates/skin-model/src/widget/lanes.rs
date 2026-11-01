@@ -797,7 +797,11 @@ impl Lanes {
                     }
                     let tail = scale.y(end_pos);
                     let head = head.min(line);
-                    let body = if l.held == Some(i) { l.on } else { l.off };
+                    let body = if d.play.body_active(lane, i) {
+                        l.on
+                    } else {
+                        l.off
+                    };
                     pen.span(body, x, w, tail, head)
                         && pen.cap(l.tail, x, w, tail, self.note_h)
                         && pen.cap(l.head, x, w, head, self.note_h)
@@ -908,7 +912,11 @@ impl Lanes {
                         continue;
                     }
                     let (head, tail) = (scale.y(head_pos) - oy, scale.y(end_pos) - oy);
-                    let body = if l.held == Some(i) { l.on } else { l.off };
+                    let body = if d.play.body_active(lane, i) {
+                        l.on
+                    } else {
+                        l.off
+                    };
                     pen.span(body, x, w, tail, head - nh)
                         && (!tail_shown || pen.span(l.tail, x, w, tail - nh, tail))
                         && pen.span(l.head, x, w, head - nh, head)
@@ -930,7 +938,6 @@ struct LaneOf<'n> {
     hi: usize,
     x: f32,
     w: f32,
-    held: Option<usize>,
     note: Shown,
     head: Shown,
     tail: Shown,
@@ -968,7 +975,6 @@ impl<'n> LaneOf<'n> {
             hi,
             x: f32_of(x),
             w: f32_of(w),
-            held: d.play.hold_note(lane),
             note: d.shown(note),
             head: d.shown(head),
             tail: d.shown(tail),

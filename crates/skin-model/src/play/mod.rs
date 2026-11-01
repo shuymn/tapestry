@@ -322,15 +322,23 @@ impl Play {
         self.reducer.done(l, note)
     }
 
-    /// The long note whose visual hold `lane` shows, as of the last build:
-    /// the lanes draw its body active.
-    pub(crate) fn hold_note(&self, lane: Lane) -> Option<usize> {
-        self.reducer
-            .hold
-            .get(lane.index())
-            .copied()
-            .flatten()
-            .map(|h| h.note)
+    /// `lane`'s visual hold, as of the last build.
+    fn hold(&self, lane: Lane) -> Option<reducer::Hold> {
+        self.reducer.hold.get(lane.index()).copied().flatten()
+    }
+
+    /// The long note whose visual hold `lane` shows, as of the last build.
+    #[cfg(test)]
+    fn hold_note(&self, lane: Lane) -> Option<usize> {
+        self.hold(lane).map(|h| h.note)
+    }
+
+    /// Whether the lanes draw `note`'s body on `lane` active, as of the
+    /// last build: by the LN mode, from whether the lane's visual hold is
+    /// on it.
+    pub(crate) fn body_active(&self, lane: Lane, note: usize) -> bool {
+        let held = self.hold(lane).is_some_and(|h| h.note == note);
+        reducer::body_active(self.reducer.ln_mode, held)
     }
 }
 
@@ -472,6 +480,7 @@ mod tests {
         };
         frame(&mut play, 1_000, &[ev(1_000, held(2, 0, Judgment::Great))]);
         assert_eq!(play.hold_note(lane(2)), Some(0));
+        assert!(play.body_active(lane(2), 0));
         frame(
             &mut play,
             1_250,
@@ -486,13 +495,16 @@ mod tests {
         assert_eq!(play.hold_note(lane(2)), None);
         // A judged long note stays drawn: it is never done.
         assert!(!play.done(2, 0));
-        // A BAD head holds without `LnHeld`.
+        // A BAD head holds without `LnHeld`, its body active; it stays
+        // drawn.
         frame(
             &mut play,
             1_400,
             &[ev(1_400, judged(5, 0, Judgment::Bad, Some(-100), None))],
         );
         assert_eq!(play.hold_note(lane(5)), Some(0));
+        assert!(play.body_active(lane(5), 0));
+        assert!(!play.done(5, 0));
         // Another note's end leaves it; its own ends it.
         frame(&mut play, 1_420, &[ev(1_420, ended(5, 1))]);
         assert_eq!(play.hold_note(lane(5)), Some(0));

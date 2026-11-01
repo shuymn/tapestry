@@ -10,10 +10,10 @@ mod play_support;
 use bms_model::{Chart, ChartBuilder, Lane, LnMode, NoteKind, TimeUs};
 use eval::JudgeEvent;
 use lanes_support::{
-    BAR, BODY_OFF, COVER, HEAD, LIFT, LINE, MINE, NOTE, TAIL, in_lane, lanes_element, lanes_skin,
-    rects, skin_with, source, source_with,
+    BAR, BODY_OFF, BODY_ON, COVER, HEAD, LIFT, LINE, MINE, NOTE, TAIL, in_lane, lanes_element,
+    lanes_skin, rects, skin_with, source, source_with,
 };
-use play_support::{Harness, MS, REGIONS, ev, full, judged, lane, mine};
+use play_support::{Harness, MS, REGIONS, ev, full, hold_ended, judged, lane, ln_held, mine};
 use rules::Judgment;
 use skin_model::{LANE_QUADS, LANE_VISITS, LanesDef, LanesError, LoadError};
 
@@ -144,6 +144,52 @@ fn a_long_notes_body_runs_between_the_caps_inner_edges() {
     // source draws one of negative height).
     h.frame(1_290, &[]);
     assert_eq!(ln_parts(&h).map(|p| p.len()), [0, 1, 1]);
+}
+
+#[test]
+fn a_long_notes_body_is_active_only_while_held() {
+    // At 1.15 s, after each script of effects: whether the body is drawn
+    // active. A head held, or graded BAD at its press, is active until its
+    // hold ends; a missed head is inactive. The note stays drawn.
+    let ln =
+        |ms, judgment, deviation, release| ev(ms, judged(2, 0, judgment, deviation, release, 1));
+    let cases: [(&str, Vec<JudgeEvent>, bool); 5] = [
+        ("never pressed", vec![], false),
+        (
+            "head missed",
+            vec![ln(1_180, Judgment::Poor, None, None)],
+            false,
+        ),
+        (
+            "held",
+            vec![ev(1_000, ln_held(2, 0, Judgment::Great))],
+            true,
+        ),
+        (
+            "a BAD head held",
+            vec![ln(850, Judgment::Bad, Some(-150), None)],
+            true,
+        ),
+        (
+            "a BAD head released",
+            vec![
+                ln(850, Judgment::Bad, Some(-150), None),
+                ev(1_100, hold_ended(2, 0)),
+            ],
+            false,
+        ),
+    ];
+    for (name, effects, active) in cases {
+        let mut h = harness(&long_note(None));
+        h.frame(1_150, &effects);
+        let on = in_lane(&h, BODY_ON, lane(2)).len();
+        let [off, _, head] = ln_parts(&h).map(|p| p.len());
+        assert_eq!(
+            (on, off, head),
+            (usize::from(active), usize::from(!active), 1),
+            "{name}"
+        );
+    }
 }
 
 #[test]
