@@ -97,9 +97,10 @@ pub use rules_toml::{
 pub use runner::{HANDOFF_WAKES, RunOutcome, Runner};
 pub use save::{LocalRecords, RecordRef, RecordSink, SAVE_ATTEMPTS, SaveError, write_atomic};
 pub use session::{
-    AutoKeySounds, Command, Loaded, MenuCommand, Parts, PlayEnd, PlayOutcome, PlayPlan, PlayReport,
-    PlayScript, PlayStart, RECORDING_MEMORY, Reservation, SMALL_PARTS_BYTES, SYSTEM_CONTROL_INPUTS,
-    Session, SessionConfig, SessionError, SessionPlayError, Settings, wake_policy,
+    AutoKeySounds, ChartSource, Command, Loaded, MenuCommand, Parts, PlayEnd, PlayOutcome,
+    PlayPlan, PlayReport, PlayScript, PlayStart, RECORDING_MEMORY, Reservation, SMALL_PARTS_BYTES,
+    SYSTEM_CONTROL_INPUTS, Session, SessionConfig, SessionError, SessionPlayError, Settings,
+    wake_policy,
 };
 pub use settings::{
     ControllerDevice, DataRoot, DeviceSettings, DeviceSettingsError, KeyConfig, KeyError, LaneKey,
