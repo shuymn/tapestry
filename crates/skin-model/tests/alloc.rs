@@ -1962,8 +1962,12 @@ fn fallback_lanes_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
     let events = effects(chart, None, false);
     let uv_of = |i: u32| uvs.get(i).unwrap().uv;
     let [tap_uv, long_uv, mine_uv] = [tap, long, mine].map(uv_of);
-    let mut counts = HashMap::new();
-    for mode in [bms_model::LnMode::Ln, bms_model::LnMode::Cn] {
+    // The most long-note quads in one frame, LN then CN.
+    let mut max = [0_usize; 2];
+    for (slot, mode) in max
+        .iter_mut()
+        .zip([bms_model::LnMode::Ln, bms_model::LnMode::Cn])
+    {
         let mut c = chart.clone();
         c.meta.ln_mode = Some(mode);
         let mut play = skin.prepare(&c, ctx).unwrap();
@@ -2044,7 +2048,7 @@ fn fallback_lanes_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
             taps > 0 && mines > 0 && longs > 0,
             "{mode:?}: {taps} {mines} {longs}"
         );
-        counts.insert(format!("{mode:?}"), max_longs);
+        *slot = max_longs;
     }
     assert_eq!(
         ALLOCS.swap(0, Ordering::Relaxed),
@@ -2052,7 +2056,8 @@ fn fallback_lanes_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
         "fallback lanes: allocations"
     );
     // CN draws its end caps besides LN's body and head.
-    assert!(counts["Cn"] > counts["Ln"], "{counts:?}");
+    let [ln, cn] = max;
+    assert!(cn > ln, "LN {ln}, CN {cn}");
 }
 
 /// The trimmed cover paints of [`cover_trims_do_not_allocate`] over the
