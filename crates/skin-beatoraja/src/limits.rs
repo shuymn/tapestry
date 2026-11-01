@@ -38,6 +38,10 @@ pub const MAX_FILE_CHOICES: usize = 1_024;
 /// The most offsets a header holds.
 pub const MAX_OFFSETS: usize = 1_024;
 
+/// The most digit offset rows resolved across the `value` records' tables,
+/// used or not, each charged before it is read.
+pub const MAX_RESOLVED_DIGIT_OFFSETS: usize = 65_536;
+
 /// The bounds one definition is read and resolved with: the constants
 /// above, lowered only by tests of bounds the input caps make unreachable.
 #[derive(Clone, Copy, Debug)]

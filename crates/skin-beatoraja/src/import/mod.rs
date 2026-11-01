@@ -13,7 +13,7 @@
 
 mod asset;
 mod budget;
-mod geom;
+pub(crate) mod geom;
 mod object;
 mod ops;
 mod policy;
@@ -382,6 +382,8 @@ impl<'d> Cx<'d> {
             judges: Vec::new(),
             selectors: HashMap::new(),
         };
+        cx.budget.usage.resolved_digit_offsets =
+            u32::try_from(cx.tables.digit_offsets.len()).unwrap_or(u32::MAX);
         cx.config_notes();
         cx.custom_timers()?;
         Ok(cx)

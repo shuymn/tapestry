@@ -5,10 +5,10 @@
 use std::fmt;
 
 use skin_model::{
-    Charge, MAX_BAR_GROUPS, MAX_ELEMENTS, MAX_FILES, MAX_FONTS, MAX_IMAGE_CHOICE_REFS, MAX_IMAGES,
-    MAX_SHEET_GLYPHS, MAX_SHEET_KERNINGS, MAX_SKIN_FRAMES, MAX_SKIN_KEYS, MAX_SKIN_OPS,
-    MAX_TEXT_ELEMENTS, MAX_TOTAL_FILE_BYTES, MAX_TOTAL_FONT_BYTES, MAX_TRACK_KEYS, MAX_WHEN_TIMERS,
-    MAX_WIDGET_QUADS, Program, SkinOps,
+    Charge, MAX_BAR_GROUPS, MAX_DIGIT_OFFSETS, MAX_ELEMENTS, MAX_FILES, MAX_FONTS,
+    MAX_IMAGE_CHOICE_REFS, MAX_IMAGES, MAX_SHEET_GLYPHS, MAX_SHEET_KERNINGS, MAX_SKIN_FRAMES,
+    MAX_SKIN_KEYS, MAX_SKIN_OPS, MAX_TEXT_ELEMENTS, MAX_TOTAL_FILE_BYTES, MAX_TOTAL_FONT_BYTES,
+    MAX_TRACK_KEYS, MAX_WHEN_TIMERS, MAX_WIDGET_QUADS, Program, SkinOps,
 };
 
 use super::report::Usage;
@@ -49,6 +49,9 @@ pub enum ImportLimit {
     /// More than [`MAX_BAR_GROUPS`] bar line groups, dropped ones
     /// included.
     BarGroups,
+    /// More than [`MAX_DIGIT_OFFSETS`] digit offsets across the numbers
+    /// and combos, each copy counted.
+    DigitOffsets,
 }
 
 impl fmt::Display for ImportLimit {
@@ -69,6 +72,7 @@ impl fmt::Display for ImportLimit {
             Self::WidgetQuads => write!(f, "more than {MAX_WIDGET_QUADS} widget quads"),
             Self::ChoiceRefs => write!(f, "more than {MAX_IMAGE_CHOICE_REFS} image choice entries"),
             Self::BarGroups => write!(f, "more than {MAX_BAR_GROUPS} bar line groups"),
+            Self::DigitOffsets => write!(f, "more than {MAX_DIGIT_OFFSETS} digit offsets"),
         }
     }
 }
@@ -227,6 +231,18 @@ impl Budget {
         )
     }
 
+    /// A strip's `n` retained digit offsets, before they are allocated or
+    /// copied into its definition; spent even when the element is later
+    /// refused.
+    pub(crate) fn digit_offsets(&mut self, n: usize) -> Result<(), ImportLimit> {
+        charge(
+            &mut self.usage.digit_offsets,
+            n,
+            MAX_DIGIT_OFFSETS,
+            ImportLimit::DigitOffsets,
+        )
+    }
+
     /// One text element and its `quads` at worst.
     pub(crate) fn text(&mut self, quads: u32) -> Result<(), ImportLimit> {
         charge(
@@ -253,6 +269,15 @@ mod tests {
         }
         assert_eq!(b.when(), Err(ImportLimit::Whens));
         assert_eq!(b.usage.whens as usize, MAX_WHEN_TIMERS);
+    }
+
+    #[test]
+    fn digit_offsets_are_capped() {
+        let mut b = Budget::default();
+        b.digit_offsets(MAX_DIGIT_OFFSETS - 1).unwrap();
+        b.digit_offsets(1).unwrap();
+        assert_eq!(b.digit_offsets(1), Err(ImportLimit::DigitOffsets));
+        assert_eq!(b.usage.digit_offsets as usize, MAX_DIGIT_OFFSETS);
     }
 
     /// The image cap equals the element cap, so the mapping meets the

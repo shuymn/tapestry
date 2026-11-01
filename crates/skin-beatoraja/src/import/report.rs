@@ -380,6 +380,11 @@ pub struct Usage {
     /// Note parts drawn with fallback paint, at most 48: six parts on
     /// eight lanes.
     pub note_fallbacks: u32,
+    /// Digit offset rows resolved across the `value` records' tables,
+    /// used or not.
+    pub resolved_digit_offsets: u32,
+    /// Digit offsets the numbers and combos keep, each copy counted.
+    pub digit_offsets: u32,
 }
 
 /// What an import changed, dropped or ignored.

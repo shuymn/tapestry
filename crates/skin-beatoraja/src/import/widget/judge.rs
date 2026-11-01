@@ -282,10 +282,7 @@ impl Cx<'_> {
     fn combo(&mut self, ndst: &Dst, value: u32) -> Result<Option<ComboPart>, ImportError> {
         let at = ndst.span;
         let role = Role::Critical(CriticalPart::Judge);
-        let [digit, space, offset] = self.def.fields(value, ["digit", "space", "offset"]);
-        if self.digit_offsets(offset)? {
-            self.drop_el(role, at, NoteKind::UnsupportedField { field: "offset" })?;
-        }
+        let [digit, space] = self.def.fields(value, ["digit", "space"]);
         let digit = self.int_or(digit, "digit", 0)?;
         let spaces = self.int_or(space, "space", 0)?;
         let s = self.src_image(value)?;
@@ -333,9 +330,11 @@ impl Cx<'_> {
         let range = |cx: &Self| cx.range(at, "dst");
         let sr = Q::int(spaces).mul(self.r).ok_or_else(|| range(self))?;
         let e = Q::int(extra);
-        // Stretch 8 and 9 apply per glyph at placement
-        // (`skin/SkinNumber.java:191`).
+        // Stretch 8 and 9 apply per glyph at placement, after its digit
+        // offset (`skin/SkinNumber.java:191-205`).
         let native = c.stretch.native(cell);
+        let rows_kept = c.stretch == Stretch::Identity
+            || self.digit_rows_keep_aspect(value, extra, cells, cell);
         let mut keys = Vec::with_capacity(c.track.keys.len());
         for k in &c.track.keys {
             let rect = Rect::scaled(k.rect, self.r)
@@ -343,7 +342,7 @@ impl Cx<'_> {
                 .ok_or_else(|| range(self))?;
             let (stretched, _) =
                 track::stretch(c.stretch, rect, cell).ok_or_else(|| range(self))?;
-            if native.is_none() && stretched != rect {
+            if native.is_none() && (stretched != rect || !rows_kept) {
                 self.drop_el(role, at, NoteKind::Stretch(c.stretch_mode))?;
             }
             let p = rect.w.add(sr).ok_or_else(|| range(self))?;
@@ -373,6 +372,7 @@ impl Cx<'_> {
         }
         let track = self.model_track(&c, &rects)?;
         self.retained(&c)?;
+        let offsets = self.digit_offsets(at, value, extra, cells)?;
         Ok(Some(ComboPart {
             digits: DigitsDef {
                 image,
@@ -381,7 +381,7 @@ impl Cx<'_> {
                 align: Align::Center,
                 pad,
                 space: i32::try_from(space).map_err(|_| range(self))?,
-                offsets: Vec::new(),
+                offsets,
             },
             track,
             timer: c.timer,

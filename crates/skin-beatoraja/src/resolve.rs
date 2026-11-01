@@ -44,7 +44,9 @@ use std::path::Path;
 
 use skin_model::{FileId, Root, RootError};
 
+use self::digit_offsets::DigitOffsetTables;
 use crate::error::{ImportError, InputLimit, Loc};
+use crate::import::geom::Q;
 use crate::json;
 use crate::limits::{
     Limits, MAX_FILE_BYTES, MAX_INCLUDE_DEPTH, MAX_INCLUDE_PARSES, MAX_INPUT_BYTES,
@@ -288,6 +290,27 @@ impl Definition {
         }
     }
 
+    /// An `int` field read exactly: as [`Self::int`], except that a
+    /// number token with a point or an exponent must be a whole number
+    /// ([`Q::decimal`]) rather than truncated (an intentional policy for
+    /// paint geometry: the source truncates through `f64`).
+    pub(crate) fn exact_int(&mut self, id: u32, field: &'static str) -> Result<i32, ImportError> {
+        let Scalar::Double(raw) = self.arena.scalar(id) else {
+            return self.int(id, field);
+        };
+        let q = Q::decimal(raw).ok_or_else(|| ImportError::Range {
+            at: self.loc(id),
+            field,
+        })?;
+        let n = q
+            .integer()
+            .ok_or_else(|| self.type_error(id, field, "an integer"))?;
+        i32::try_from(n).map_err(|_| ImportError::Range {
+            at: self.loc(id),
+            field,
+        })
+    }
+
     /// A `boolean` field (Json.java:1042): `true`, or a string equal to
     /// `true` ignoring case; any other string or number is false.
     pub(crate) fn bool(&self, id: u32, field: &'static str) -> Result<bool, ImportError> {
@@ -449,6 +472,8 @@ pub(crate) struct Tables {
     /// `Animation[]` have array serializers). Primitive arrays stay
     /// literal.
     pub(crate) nested: HashMap<u32, Vec<u32>>,
+    /// The `offset` tables of the `value` records.
+    pub(crate) digit_offsets: DigitOffsetTables,
 }
 
 impl Resolved<'_> {
@@ -507,6 +532,13 @@ impl Resolved<'_> {
             for list in [bpm, stop, time].into_iter().flatten() {
                 r.nested_destinations(list, 3, &mut t.nested)?;
             }
+        }
+        if let Some(values) = ARRAYS
+            .iter()
+            .position(|n| *n == "value")
+            .and_then(|i| t.arrays.get(i))
+        {
+            r.digit_offsets(values, 3, &mut t.digit_offsets)?;
         }
         if let Some(i) = ARRAYS.iter().position(|n| *n == "judge") {
             let judges = t.arrays.get(i).cloned().unwrap_or_default();
@@ -635,6 +667,13 @@ impl Resolver<'_, '_> {
 
     /// Adds `record` to `out`, counting it first.
     fn emit(&mut self, record: u32, out: &mut Vec<u32>) -> Result<(), ImportError> {
+        self.count(record)?;
+        out.push(record);
+        Ok(())
+    }
+
+    /// Counts `record` as one expanded value.
+    fn count(&mut self, record: u32) -> Result<(), ImportError> {
         if self.def.run.expanded >= self.def.limits.expanded {
             return Err(ImportError::Input {
                 at: Some(self.def.loc(record)),
@@ -642,7 +681,6 @@ impl Resolver<'_, '_> {
             });
         }
         self.def.run.expanded += 1;
-        out.push(record);
         Ok(())
     }
 
@@ -868,5 +906,6 @@ impl Resolver<'_, '_> {
     }
 }
 
+pub(crate) mod digit_offsets;
 #[cfg(test)]
 mod tests;
