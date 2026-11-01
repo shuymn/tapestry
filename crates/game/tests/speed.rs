@@ -256,10 +256,17 @@ fn set_speed_reloads_the_chart_and_keeps_the_session() {
     // The 1× chart read beside it, the session unchanged.
     assert_eq!(loaded.chart_at(Speed::NORMAL).unwrap(), normal);
     assert_eq!(loaded.config().speed, Speed::SLOWEST);
+    // And away from the session, with parts of its own.
+    let source = loaded.source();
+    let own = Parts::unsaved(&loaded.settings().player);
+    assert_eq!(source.path(), path);
+    assert_eq!(source.read(&own, Speed::NORMAL).unwrap(), normal);
     // The file changed: refused, nothing changed.
     let slowest = loaded.chart().clone();
     fs::write(&path, format!("{SECONDS}#00411:01\n")).unwrap();
     let e = loaded.chart_at(Speed::NORMAL).unwrap_err();
+    assert_eq!(e, game::SessionError::ChartChanged(path.clone()));
+    let e = source.read(&own, Speed::NORMAL).unwrap_err();
     assert_eq!(e, game::SessionError::ChartChanged(path.clone()));
     let e = loaded.set_speed(Speed::NORMAL).unwrap_err();
     assert_eq!(e, game::SessionError::ChartChanged(path.clone()));

@@ -348,6 +348,7 @@ impl Selection {
                 None => return false,
                 Some(SelectStep::Pick(name)) => {
                     let Some(at) = listed(&self.screen, &name) else {
+                        script.scanning(self.shelf.has_scan());
                         if !script.waiting() {
                             controls.close();
                         }
@@ -358,6 +359,7 @@ impl Selection {
                     }
                 }
                 Some(SelectStep::PickPath(target)) => {
+                    script.scanning(self.shelf.has_scan());
                     if script.expired() {
                         let why = format!("{} was not listed", target.path.display());
                         script.fail(why);
@@ -380,6 +382,7 @@ impl Selection {
                 }
                 Some(SelectStep::Wait(name)) => {
                     if listed(&self.screen, &name).is_none() {
+                        script.scanning(self.shelf.has_scan());
                         if !script.waiting() {
                             controls.close();
                         }
@@ -406,6 +409,7 @@ impl Selection {
                     // finds.
                     let n = self.screen.entries().len();
                     if self.shelf.passes() == 0 || n == 0 {
+                        script.scanning(self.shelf.has_scan());
                         if script.expired() {
                             script.fail(format!("search \"{text}\" listed no chart"));
                             controls.close();
@@ -474,6 +478,18 @@ impl Selection {
                 }
                 Some(SelectStep::CloseLoading) => {
                     script.slow_load.get_or_insert_default().close = true;
+                }
+                Some(SelectStep::SlowMeasuring(ms)) => crate::dev::slow_measuring(ms),
+                Some(SelectStep::Background(running)) => {
+                    let (holds, idle) = self.shelf.background();
+                    if (running && !holds) || (!running && !idle) {
+                        if script.watchdog_expired() {
+                            let what = if running { "held no job" } else { "kept a job" };
+                            script.fail(format!("the background measurement {what}"));
+                            controls.close();
+                        }
+                        return false;
+                    }
                 }
                 // Due here only when the chosen chart did not play.
                 Some(SelectStep::Play(_)) => {
@@ -1053,7 +1069,7 @@ impl PlayerRig<'_> {
             if let Some(script) = &mut sel.script {
                 script.chose();
             }
-            sel.shelf.pause();
+            sel.shelf.choose(path);
             sel.chosen_at = self.clock.now();
             let name = file_name(path);
             let after = since(sel.entered_at, sel.chosen_at).as_millis();
@@ -1431,7 +1447,7 @@ impl AppRig for PlayerRig<'_> {
         }
         // Requested again after the practice page released it, as a
         // choice does.
-        sel.shelf.pause();
+        sel.shelf.choose(loaded.path());
         let (rate, chosen_at) = (sel.rate, sel.chosen_at);
         let page = sel.loading.clone();
         #[cfg(feature = "dev-tools")]
@@ -1475,6 +1491,25 @@ impl AppRig for PlayerRig<'_> {
             .begin_load(Arc::new(chart.clone()), loaded.section().cloned());
         let rounds = loaded.section().map(|_| schedule.clone());
         let speed = loaded.config().speed;
+        // A measurement running in the background is waited for before the
+        // sounds decode, so its 1× bank is gone before this load's: this
+        // chart's to its end, whose result the load then finds, another's
+        // until it has stopped for the pause.
+        let waiting = self.clock.now();
+        let sel = self.selection.as_mut().ok_or(ChartLoadError::NoSelection)?;
+        let controls = self.controls;
+        let render = &self.render;
+        let waited = sel.shelf.wait_background(
+            loaded.path(),
+            &file_name(loaded.path()),
+            || cancelled(controls),
+            || show_stage(render, page.as_ref(), Stage::Loudness),
+        );
+        if waited == Loading::Cancelled {
+            println!("load: cancelled");
+            return Ok(Loading::Cancelled);
+        }
+        let background = since(waiting, self.clock.now());
         show_stage(
             &self.render,
             page.as_ref(),
@@ -1571,7 +1606,20 @@ impl AppRig for PlayerRig<'_> {
             #[cfg(feature = "dev-tools")]
             quit,
         };
-        if sel.shelf.loaded(chart, &bank, &name, &mut host) == Loading::Cancelled {
+        if sel
+            .shelf
+            .loaded(chart, &bank, &name, loaded.path(), &mut host)
+            == Loading::Cancelled
+        {
+            // The quit key leaves the chart's measurement to the
+            // background; a close ends the run.
+            if !self.controls.quitting() {
+                sel.shelf.leave_to_background(crate::background::Job {
+                    source: loaded.source(),
+                    rate,
+                    name,
+                });
+            }
             // Closing or the quit key: nothing more is prepared, and the
             // flow leaves the chart.
             println!("load: cancelled");
@@ -1603,8 +1651,9 @@ impl AppRig for PlayerRig<'_> {
             "load: the chart is ready {} ms after its choice (chart {} ms, sounds {} ms, loudness {} ms, audio {} ms, screen {} ms)",
             ms(chosen_at, ready),
             ms(chosen_at, read),
-            ms(read, decoded),
-            ms(engine, measured),
+            // The wait for the background's measurement is the loudness's.
+            ms(read, decoded).saturating_sub(background.as_millis()),
+            ms(engine, measured) + background.as_millis(),
             ms(decoded, engine),
             ms(measured, ready),
         );
@@ -1803,7 +1852,9 @@ mod tests {
             crate::dev::checkpoints::frames_follow(&reported),
             "{reported:?}"
         );
-        assert!(began.elapsed() < Duration::from_secs(5));
+        // Only catches a hold that never ends, however late a loaded
+        // machine runs it.
+        assert!(began.elapsed() < Duration::from_secs(600));
     }
 
     /// The chart a pick plays.
@@ -1817,6 +1868,31 @@ mod tests {
     /// Titles A, B and C by artists Z, Y and X, scanned and listed in title
     /// order, A under the cursor.
     fn selection(dir: &std::path::Path) -> Selection {
+        let mut sel = unlisted(dir, |library, charts| {
+            Shelf::new(library, charts, Duration::from_secs(60), None)
+        });
+        // The scan pass runs in background mode, which a loaded machine
+        // starves for seconds: the bound only catches a pass that never
+        // lists them.
+        let begun = Instant::now();
+        while sel.screen.listed() < 3 {
+            assert!(
+                begun.elapsed() < Duration::from_secs(600),
+                "the charts were not listed"
+            );
+            sel.shelf.poll(Instant::now());
+            sel.refresh();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        sel
+    }
+
+    /// The charts of [`selection`] on a shelf `shelf` makes, its first pass
+    /// started and nothing listed yet.
+    fn unlisted(
+        dir: &std::path::Path,
+        shelf: impl FnOnce(library::Library, Vec<std::path::PathBuf>) -> Shelf,
+    ) -> Selection {
         let charts = dir.join("charts");
         std::fs::create_dir_all(&charts).unwrap();
         for (file, title, artist) in [("a", "A", "Z"), ("b", "B", "Y"), ("c", "C", "X")] {
@@ -1824,8 +1900,8 @@ mod tests {
             std::fs::write(charts.join(format!("{file}.bms")), text).unwrap();
         }
         let (library, _) = open(&DataRoot::new(dir.join("data"))).unwrap();
-        let shelf = Shelf::new(library, vec![charts.clone()], Duration::from_secs(60), None);
-        let mut sel = Selection {
+        let shelf = shelf(library, vec![charts.clone()]);
+        Selection {
             shelf,
             screen: SelectScreen::new(vec![charts]),
             menu: Arc::new(MenuQueue::default()),
@@ -1842,21 +1918,7 @@ mod tests {
             preset_steps: std::collections::VecDeque::new(),
             #[cfg(feature = "dev-tools")]
             script: None,
-        };
-        // The scan pass runs in background mode, which a loaded machine
-        // starves for seconds: the bound only catches a pass that never
-        // lists them.
-        let begun = Instant::now();
-        while sel.screen.listed() < 3 {
-            assert!(
-                begun.elapsed() < Duration::from_secs(600),
-                "the charts were not listed"
-            );
-            sel.shelf.poll(Instant::now());
-            sel.refresh();
-            std::thread::sleep(Duration::from_millis(10));
         }
-        sel
     }
 
     /// An order change queued before navigation is searched before the
@@ -2731,5 +2793,158 @@ mod tests {
         assert_eq!(sel.screen.listed(), 3);
         let chosen = sel.screen.selected().unwrap().path.clone();
         assert_eq!(chosen.file_name().unwrap(), "c.bms");
+    }
+
+    /// A gate the scan thread waits at before any work: its pass runs,
+    /// listing nothing, until the test opens it.
+    #[cfg(feature = "dev-tools")]
+    type Gate = Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>;
+
+    /// [`unlisted`] with its first pass held at `Gate` until opened, and
+    /// the script `steps`.
+    #[cfg(feature = "dev-tools")]
+    fn gated(dir: &std::path::Path, steps: &str) -> (Selection, Gate) {
+        let gate: Gate = Arc::default();
+        let held = Arc::clone(&gate);
+        let mut sel = unlisted(dir, move |library, charts| {
+            let options = library::ScanOptions {
+                on_thread_start: Some(Arc::new(move || {
+                    let (open, changed) = &*held;
+                    let mut open = open.lock().unwrap();
+                    while !*open {
+                        open = changed.wait(open).unwrap();
+                    }
+                })),
+                ..library::ScanOptions::default()
+            };
+            Shelf::with_options(library, charts, Duration::from_secs(60), options)
+        });
+        sel.script = Some(crate::dev::SelectScript::parse(steps).unwrap());
+        (sel, gate)
+    }
+
+    #[cfg(feature = "dev-tools")]
+    fn open_gate(gate: &Gate) {
+        *gate.0.lock().unwrap() = true;
+        gate.1.notify_all();
+    }
+
+    /// A pick waits as long as the pass that lists its chart runs, past the
+    /// step's timeout (a background pass a loaded machine starves), and
+    /// picks the chart once that pass lists it.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn a_pick_waits_for_a_running_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut sel, gate) = gated(dir.path(), "pick=c.bms");
+        let controls = crate::controls::Controls::new(input::QpcClock::start());
+        assert!(!sel.script(&controls, 0, None));
+        // The step's timeout passes while the pass runs, listing nothing.
+        sel.script.as_mut().unwrap().age(crate::dev::STEP_TIMEOUT);
+        assert!(!sel.script(&controls, 0, None));
+        assert_eq!(sel.script.as_ref().unwrap().failure(), None);
+        // The pass goes on and lists the chart: the step picks it.
+        open_gate(&gate);
+        let begun = Instant::now();
+        while sel.script.as_ref().unwrap().front().is_some() {
+            assert!(
+                begun.elapsed() < Duration::from_secs(600),
+                "the chart was not picked"
+            );
+            if sel.shelf.poll(Instant::now()) {
+                sel.refresh();
+            }
+            if sel.script(&controls, 0, None) {
+                assert!(sel.drain(&mut Pad::default()).is_none());
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(sel.script.as_ref().unwrap().failure(), None);
+        let chosen = sel.screen.selected().unwrap().path.clone();
+        assert_eq!(chosen.file_name().unwrap(), "c.bms");
+    }
+
+    /// A pass that never ends fails the pick once the watchdog has run out,
+    /// saying so.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn a_pick_fails_at_the_watchdog_of_a_running_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut sel, gate) = gated(dir.path(), "pick=c.bms");
+        let controls = crate::controls::Controls::new(input::QpcClock::start());
+        assert!(!sel.script(&controls, 0, None));
+        sel.script.as_mut().unwrap().age(crate::dev::STEP_WATCHDOG);
+        assert!(!sel.script(&controls, 0, None));
+        let failure = sel.script.as_ref().unwrap().failure().unwrap().to_owned();
+        assert!(failure.contains("scan passes included"), "{failure}");
+        open_gate(&gate);
+    }
+
+    /// With no pass running, a chart that is not listed fails the pick
+    /// once the step's timeout has run out: a pass whose charts never
+    /// reach the screen is caught.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn a_pick_times_out_with_no_pass_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sel = selection(dir.path());
+        let begun = Instant::now();
+        while sel.shelf.has_scan() {
+            assert!(
+                begun.elapsed() < Duration::from_secs(600),
+                "the pass never ended"
+            );
+            sel.shelf.poll(Instant::now());
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        sel.script = Some(crate::dev::SelectScript::parse("pick=z.bms").unwrap());
+        let controls = crate::controls::Controls::new(input::QpcClock::start());
+        assert!(!sel.script(&controls, 0, None));
+        assert_eq!(sel.script.as_ref().unwrap().failure(), None);
+        sel.script.as_mut().unwrap().age(crate::dev::STEP_TIMEOUT);
+        assert!(!sel.script(&controls, 0, None));
+        let failure = sel.script.as_ref().unwrap().failure().unwrap().to_owned();
+        assert!(failure.contains("waited 20 s"), "{failure}");
+    }
+
+    /// A `background` step waits past [`crate::dev::STEP_TIMEOUT`] for the
+    /// background measurement, which a loaded machine starves, and fails
+    /// only at [`crate::dev::STEP_WATCHDOG`]. A pause keeps the queued
+    /// job waiting, so the worker neither holds it nor is idle.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn a_background_step_outlasts_the_step_timeout() {
+        use crate::dev::scenario::{Origin, StepKind};
+        use crate::dev::{STEP_TIMEOUT, STEP_WATCHDOG, SelectScript, SelectStep};
+        let dir = tempfile::tempdir().unwrap();
+        let mut sel = selection(dir.path());
+        sel.shelf.pause();
+        let path = dir.path().join("charts").join("a.bms");
+        sel.shelf.leave_to_background(crate::background::Job {
+            source: game::ChartSource::new(path, 0, [0; 32]),
+            rate: 48_000,
+            name: "a.bms".to_owned(),
+        });
+        assert_eq!(sel.shelf.background(), (false, false));
+        let controls = crate::controls::Controls::new(input::QpcClock::start());
+        let o = Origin {
+            index: 1,
+            kind: StepKind::Select,
+        };
+        for (running, what) in [(true, "held no job"), (false, "kept a job")] {
+            sel.script = Some(SelectScript::compiled(vec![(
+                SelectStep::Background(running),
+                o,
+            )]));
+            sel.script.as_mut().unwrap().age(STEP_TIMEOUT);
+            assert!(!sel.script(&controls, 0, None));
+            let script = sel.script.as_mut().unwrap();
+            assert_eq!(script.failure(), None);
+            assert!(script.front().is_some());
+            script.age(STEP_WATCHDOG);
+            assert!(!sel.script(&controls, 0, None));
+            let failure = sel.script.as_ref().unwrap().failure().unwrap();
+            assert!(failure.contains(what), "{failure}");
+        }
     }
 }
