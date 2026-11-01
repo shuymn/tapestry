@@ -299,8 +299,9 @@ fn lane_rows_must_share_their_y() {
     import_body(&body("", &note_with(&short, ""), &[NOTES])).ok();
 }
 
+/// Seven lane rects refuse; the part arrays are in `import_note_parts`.
 #[test]
-fn the_part_lists_are_checked() {
+fn the_lane_rects_are_checked() {
     let all = lane_rects(200, 600);
     let seven: Vec<&str> = all.rsplitn(2, "}, ").collect();
     let seven = seven[1].to_owned() + "}";
@@ -308,36 +309,6 @@ fn the_part_lists_are_checked() {
         import_body(&body("", &note_with(&seven, ""), &[NOTES])),
         "dst",
     );
-    let with = |from: &str, to: &str| {
-        let n = note("");
-        assert!(n.contains(from), "{from}");
-        import_body(&body("", &n.replacen(from, to, 1), &[NOTES]))
-    };
-    let short = format!(r#""hcnbody": {}"#, eight("lb"));
-    refused(with(&short, r#""hcnbody": ["lb"]"#), "lnend");
-    let notes = eight("nt");
-    let bad = notes.replacen(r#""nt", "nt", "nt", "nt""#, r#""nt", "nt", "nt", "no""#, 1);
-    refused(
-        with(&format!(r#""note": {notes}"#), &format!(r#""note": {bad}"#)),
-        "note",
-    );
-    let mines = format!(r#""mine": {}, "#, eight("mi"));
-    refused(with(&mines, ""), "mine");
-    // An image of the empty id resolves an empty name, never a missing
-    // entry or a `null` one.
-    let empty = r#"{"id": "", "src": "a", "x": 40, "y": 0, "w": 8, "h": 20}"#;
-    let with_empty = |to: &str| {
-        let n = note("").replacen(&mines, to, 1);
-        import_body(&body(empty, &n, &[NOTES]))
-    };
-    with_empty(&format!(r#""mine": {}, "#, eight(""))).ok();
-    refused(with_empty(""), "mine");
-    let seven = r#""mine": ["", "", "", "", "", "", ""], "#;
-    refused(with_empty(seven), "mine");
-    let null = r#""mine": ["", "", "", "", "", "", "", null], "#;
-    refused(with_empty(null), "mine");
-    let ends = format!(r#""lnend": {}"#, eight("le"));
-    refused(with(&ends, r#""lnends": []"#), "lnend");
 }
 
 #[test]

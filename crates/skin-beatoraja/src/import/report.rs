@@ -30,6 +30,61 @@ pub enum Severity {
     /// Something the source does not draw either, or a field with no
     /// effect, was left out.
     Ignored,
+    /// The element is kept with the paint the source itself draws in
+    /// place of a part it could not find, such as a note part's generated
+    /// colour: a recovery the source also makes, neither a deviation nor
+    /// a dropped part.
+    Fallback,
+}
+
+/// The generated paint a note part without an image draws, as the source
+/// generates it (`play/SkinNote.java:112-140` at `0.8.9`): 32×8 texels of
+/// one opaque colour.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NoteFallback {
+    /// A tap: white.
+    Tap,
+    /// A long note's head, tail or body: yellow.
+    Long,
+    /// A mine: red.
+    Mine,
+}
+
+/// Why a note part array, or its height, was refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PartWhy {
+    /// An array the lanes draw from is not given.
+    Missing,
+    /// The array is `null`.
+    Null,
+    /// The field is not an array.
+    NotArray,
+    /// The array has `len` entries where it needs `need` (exactly 8 for
+    /// `note`, at least that many for the others).
+    Length { len: u32, need: u32 },
+    /// Entry `index` is `null`.
+    NullEntry { index: u32 },
+    /// Entry `index` is an object or an array, not an id.
+    BadEntry { index: u32 },
+    /// The tap of source lane `lane` names no image and `size` gives it
+    /// no height: the source has no height to read there either.
+    MissingSize { lane: u8 },
+}
+
+impl fmt::Display for PartWhy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Missing => f.write_str("missing"),
+            Self::Null => f.write_str("null"),
+            Self::NotArray => f.write_str("not an array"),
+            Self::Length { len, need } => write!(f, "{len} entries where {need} are needed"),
+            Self::NullEntry { index } => write!(f, "entry {index} is null"),
+            Self::BadEntry { index } => write!(f, "entry {index} is not an id"),
+            Self::MissingSize { lane } => {
+                write!(f, "lane {lane}'s tap has no image and no `size`")
+            }
+        }
+    }
 }
 
 /// A source object kind.
@@ -216,6 +271,18 @@ pub enum NoteKind {
     Ignored {
         field: &'static str,
     },
+    /// A note part array the lanes cannot be built from.
+    NotePart {
+        field: &'static str,
+        why: PartWhy,
+    },
+    /// A note part whose id names no image, drawn with the source's
+    /// generated `paint` on model lane `lane`.
+    NotePartFallback {
+        field: &'static str,
+        lane: u8,
+        paint: NoteFallback,
+    },
 }
 
 impl fmt::Display for NoteKind {
@@ -242,6 +309,13 @@ impl fmt::Display for NoteKind {
             Self::SourceRect => f.write_str("a mirrored or out-of-file source rectangle"),
             Self::BitmapFont(e) => write!(f, "a bitmap font refused ({e})"),
             Self::Ignored { field } => write!(f, "`{field}` ignored"),
+            Self::NotePart { field, why } => write!(f, "note part `{field}`: {why}"),
+            Self::NotePartFallback { field, lane, paint } => {
+                write!(
+                    f,
+                    "`{field}` names no image on lane {lane}: {paint:?} fallback paint"
+                )
+            }
         }
     }
 }
@@ -303,6 +377,9 @@ pub struct Usage {
     pub notes: u32,
     /// Bar line groups, dropped ones included.
     pub bar_groups: u32,
+    /// Note parts drawn with fallback paint, at most 48: six parts on
+    /// eight lanes.
+    pub note_fallbacks: u32,
 }
 
 /// What an import changed, dropped or ignored.

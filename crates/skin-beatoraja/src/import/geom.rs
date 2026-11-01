@@ -91,6 +91,59 @@ impl Q {
         self.mul(Self { n: 1, d: 2 })
     }
 
+    /// A number token as written, exactly: an optional sign, digits with
+    /// an optional point, and an optional exponent, as the source's float
+    /// fields accept (`20`, `20.0`, `2e1` and `+200E-1` are one value).
+    /// `None` for another form, or a value whose reduced numerator or
+    /// power-of-ten denominator passes `i128`.
+    pub(crate) fn decimal(raw: &str) -> Option<Self> {
+        let (negative, rest) = match raw.as_bytes().first() {
+            Some(b'-') => (true, raw.get(1..)?),
+            Some(b'+') => (false, raw.get(1..)?),
+            _ => (false, raw),
+        };
+        let (mantissa, exp) = match rest.find(['e', 'E']) {
+            Some(i) => (rest.get(..i)?, rest.get(i + 1..)?.parse::<i64>().ok()?),
+            None => (rest, 0),
+        };
+        let (int, frac) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+        let digits = || int.bytes().chain(frac.bytes());
+        if int.len() + frac.len() == 0 || !digits().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        // The significant digits, their trailing zeros moved to the
+        // exponent.
+        let (mut n, mut zeros) = (0_i128, 0_u32);
+        for b in digits() {
+            if b == b'0' {
+                zeros = zeros.checked_add(1)?;
+                continue;
+            }
+            let d = i128::from(b - b'0');
+            n = if n == 0 {
+                d
+            } else {
+                n.checked_mul(10_i128.checked_pow(zeros.checked_add(1)?)?)?
+                    .checked_add(d)?
+            };
+            zeros = 0;
+        }
+        if n == 0 {
+            return Some(Self::ZERO);
+        }
+        if negative {
+            n = -n;
+        }
+        let frac_len = i64::try_from(frac.len()).ok()?;
+        let e = exp.checked_sub(frac_len)?.checked_add(i64::from(zeros))?;
+        let p = 10_i128.checked_pow(u32::try_from(e.unsigned_abs()).ok()?)?;
+        if e >= 0 {
+            Self::new(n.checked_mul(p)?, 1)
+        } else {
+            Self::new(n, p)
+        }
+    }
+
     /// The nearest `f32`, for geometry the model keeps unrounded: exact
     /// for the integers and halves of ordinary skins.
     #[expect(
@@ -226,6 +279,39 @@ mod tests {
 
     fn q(n: i128, d: i128) -> Q {
         Q::new(n, d).unwrap()
+    }
+
+    #[test]
+    fn decimals_are_exact() {
+        let dec = Q::decimal;
+        for raw in [
+            "20",
+            "20.0",
+            "2e1",
+            "+200E-1",
+            "0.2e2",
+            "20.",
+            "000020.000000",
+        ] {
+            assert_eq!(dec(raw), Some(Q::int(20)), "{raw}");
+        }
+        assert_eq!(dec("0.1"), Some(q(1, 10)));
+        assert_eq!(dec("-.5"), Some(q(-1, 2)));
+        assert_eq!(dec("-0"), Some(Q::ZERO));
+        assert_eq!(dec("0e999999999999"), Some(Q::ZERO));
+        // Two values one `f32` rounds together stay apart.
+        assert_ne!(dec("20.000001"), dec("20.0000011"));
+        // Trailing zeros far past i128 are only an exponent.
+        let long = format!("1{}e-60", "0".repeat(60));
+        assert_eq!(dec(&long), Some(Q::int(1)));
+        // Past the rationals: a numerator, a denominator, an exponent.
+        assert_eq!(dec("1e39"), None);
+        assert_eq!(dec("1e-39"), None);
+        assert_eq!(dec("1e99999999999999999999"), None);
+        assert_eq!(dec("170141183460469231731687303715884105728"), None);
+        for bad in ["", ".", "e5", "1e", "1.2.3", "--1", "0x10", "1_0"] {
+            assert_eq!(dec(bad), None, "{bad}");
+        }
     }
 
     #[test]
