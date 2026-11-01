@@ -225,6 +225,12 @@ impl Drawn {
 
     /// The quads of the frame at `ms` with `effects`.
     pub fn frame(&mut self, ms: i64, effects: &[JudgeEvent]) -> Vec<Quad> {
+        self.build_frame(ms, effects);
+        self.batch.quads().to_vec()
+    }
+
+    /// Builds the frame at `ms` with `effects` into the batch.
+    fn build_frame(&mut self, ms: i64, effects: &[JudgeEvent]) {
         self.batch.clear();
         let frame = SkinFrame {
             now: TimeUs(ms * MS),
@@ -244,7 +250,6 @@ impl Drawn {
         self.skin
             .build(&mut self.play, &frame, &self.uvs, &mut self.batch)
             .expect("the frame builds");
-        self.batch.quads().to_vec()
     }
 
     /// Each digit by the uv of its glyph, read from the frames at `ms`
@@ -271,13 +276,14 @@ impl Drawn {
 
     /// The rects, rounded, of the frame at `ms`.
     pub fn rects(&mut self, ms: i64) -> Vec<[i32; 4]> {
-        self.frame(ms, &[]).iter().map(|q| round(q.rect)).collect()
+        self.build_frame(ms, &[]);
+        self.batch.quads().iter().map(|q| round(q.rect)).collect()
     }
 
     /// The rects, rounded, of the frame at `ms`, each with its run's
     /// inline clip rect, rounded, when one.
     pub fn clipped(&mut self, ms: i64) -> Vec<([i32; 4], Option<[i32; 4]>)> {
-        self.frame(ms, &[]);
+        self.build_frame(ms, &[]);
         let mut out = Vec::new();
         for r in self.batch.runs() {
             for i in r.start..r.end {
