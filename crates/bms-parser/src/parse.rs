@@ -9,7 +9,7 @@ use num_traits::{Signed, Zero};
 
 use crate::branch::Branches;
 use crate::decimal::{Rational, header_value, parse_base36, parse_decimal, parse_hex};
-use crate::{Limits, LoadError, Warning, WarningKind};
+use crate::{Labels, Limits, LoadError, Warning, WarningKind};
 
 /// What an object does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -52,6 +52,8 @@ pub struct Defined<T> {
 pub struct Source {
     /// Title, judgment headers and long-note mode.
     pub meta: ChartMeta,
+    /// The descriptive labels besides the title.
+    pub labels: Labels,
     pub bpm: Option<Rational>,
     pub bpm_defs: BTreeMap<u16, Rational>,
     pub stop_defs: BTreeMap<u16, Rational>,
@@ -73,10 +75,6 @@ pub struct Source {
 /// Headers read and ignored without a warning: descriptive ones, and ones
 /// for what stage 1 does not show or use.
 const IGNORED_HEADERS: &[&str] = &[
-    "ARTIST",
-    "SUBARTIST",
-    "SUBTITLE",
-    "GENRE",
     "PLAYLEVEL",
     "DIFFICULTY",
     "STAGEFILE",
@@ -312,6 +310,10 @@ fn parse_header(
     };
     match upper {
         "TITLE" => source.meta.title = value.to_owned(),
+        "SUBTITLE" => source.labels.subtitle = value.to_owned(),
+        "ARTIST" => source.labels.artist = value.to_owned(),
+        "SUBARTIST" => source.labels.subartist = value.to_owned(),
+        "GENRE" => source.labels.genre = value.to_owned(),
         "BPM" => {
             source.bpm = Some(bpm(value, line, "#BPM")?);
         }

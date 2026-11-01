@@ -1,6 +1,6 @@
 //! `read_header` over self-made chart text.
 
-use bms_parser::{Header, Limits, LoadError, LoadOptions, read_header};
+use bms_parser::{Header, Labels, Limits, LoadError, LoadOptions, read_header};
 
 #[test]
 fn read_header_resolves_no_time_and_no_random() {
@@ -71,4 +71,44 @@ fn read_header_takes_the_loaders_file_cap() {
         read_header(b"#TITLE ab", &limits),
         Err(LoadError::FileTooLarge { bytes: 9 })
     );
+}
+
+/// The loader's labels come from the resolved chart: a taken `#IF`
+/// branch's declarations count and an untaken one's do not, unlike
+/// `read_header`, which skips every block; the last declaration wins.
+#[test]
+fn the_loaders_labels_come_from_the_taken_branches() {
+    let text = "\
+#PLAYER 1
+#TITLE Outer
+#ARTIST Someone
+#SUBTITLE First
+#SUBTITLE [ANOTHER]
+#BPM 120
+#SETRANDOM 2
+#IF 1
+#GENRE Untaken
+#ENDIF
+#IF 2
+#ARTIST Branch two
+#SUBARTIST Two
+#ENDIF
+#ENDRANDOM
+#00111:01
+";
+    let dir = tempfile::tempdir().unwrap();
+    let loaded =
+        bms_parser::load_bms(text.as_bytes(), dir.path(), &LoadOptions::default()).unwrap();
+    assert_eq!(loaded.chart.meta.title, "Outer");
+    assert_eq!(
+        loaded.labels,
+        Labels {
+            subtitle: "[ANOTHER]".to_owned(),
+            artist: "Branch two".to_owned(),
+            subartist: "Two".to_owned(),
+            genre: String::new(),
+        }
+    );
+    let header = read_header(text.as_bytes(), &Limits::default()).unwrap();
+    assert_eq!(header.artist.as_deref(), Some("Someone"));
 }
