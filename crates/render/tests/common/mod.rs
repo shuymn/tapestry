@@ -22,21 +22,22 @@ pub fn lane(i: u8) -> Lane {
     Lane::new(i).unwrap()
 }
 
-/// A renderer on WARP with `chart` loaded. No adapter is a failure, never
-/// a skip (design.md "Testing Strategy").
-pub fn warp(chart: &Chart) -> Renderer {
-    let mut r = Renderer::new(
-        Target::Offscreen {
-            width: WIDTH,
-            height: HEIGHT,
-        },
-        AdapterChoice::Warp,
-    )
-    .expect("WARP renderer");
+/// A renderer on WARP drawing into a `width`×`height` offscreen target.
+/// No adapter is a failure, never a skip (design.md "Testing Strategy").
+pub fn offscreen(width: u32, height: u32) -> Renderer {
+    let r = Renderer::new(Target::Offscreen { width, height }, AdapterChoice::Warp)
+        .expect("WARP renderer");
     let name = &r.gpu().adapter().name;
     println!("adapter: {name}");
     assert_eq!(name, WARP);
     assert!(!r.has_frame_waitable());
+    r
+}
+
+/// A renderer on WARP ([`offscreen`], [`WIDTH`]×[`HEIGHT`]) with `chart`
+/// loaded.
+pub fn warp(chart: &Chart) -> Renderer {
+    let mut r = offscreen(WIDTH, HEIGHT);
     r.load(chart, None).expect("load the chart");
     r
 }
@@ -86,19 +87,33 @@ pub fn input<'a>(
     }
 }
 
-/// Rows of pixel column `x` that are note white (every channel above 200).
+/// Rows of pixel column `x` that are note white (every channel above 200),
+/// in a read back of a [`WIDTH`]×[`HEIGHT`] target.
 pub fn white_rows(pixels: &[u8], x: u32) -> Vec<u32> {
-    (0..HEIGHT)
+    white_rows_in(pixels, (WIDTH, HEIGHT), x)
+}
+
+/// [`white_rows`] in a read back of a `width`×`height` target.
+pub fn white_rows_in(pixels: &[u8], (width, height): (u32, u32), x: u32) -> Vec<u32> {
+    (0..height)
         .filter(|&y| {
-            let i = ((y * WIDTH + x) * 4) as usize;
+            let i = ((y * width + x) * 4) as usize;
             pixels[i..i + 3].iter().all(|&c| c > 200)
         })
         .collect()
 }
 
-/// The middle of the single run of note rows in column `x`.
+/// The middle of the single run of note rows in column `x`, in a read
+/// back of a [`WIDTH`]×[`HEIGHT`] target.
+#[track_caller]
 pub fn note_center(pixels: &[u8], x: u32) -> f64 {
-    let rows = white_rows(pixels, x);
+    note_center_in(pixels, (WIDTH, HEIGHT), x)
+}
+
+/// [`note_center`] in a read back of a `width`×`height` target.
+#[track_caller]
+pub fn note_center_in(pixels: &[u8], size: (u32, u32), x: u32) -> f64 {
+    let rows = white_rows_in(pixels, size, x);
     assert!(!rows.is_empty(), "no note in column {x}");
     let (first, last) = (rows[0], rows[rows.len() - 1]);
     assert_eq!(

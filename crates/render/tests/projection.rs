@@ -12,11 +12,11 @@ mod common;
 use std::f32::consts::FRAC_PI_2;
 
 use bms_model::{Chart, ChartBuilder, TimeUs};
-use common::{MS, input, lane, view, warp};
+use common::{MS, input, lane, note_center_in, offscreen, view, warp, white_rows_in};
 use eval::{JudgeEvent, JudgeEventKind, Section};
 use render::{
-    AdapterChoice, AtlasPages, Blend, ClipTable, FrameInput, Gpu, MAX_SPRITES, PageLevels,
-    PlaySkin, RenderError, Renderer, SkinError, Sprite, SpriteBatch, Target, UploadError, solid_uv,
+    AtlasPages, Blend, ClipTable, FrameInput, Gpu, MAX_SPRITES, PageLevels, PlaySkin, RenderError,
+    Renderer, SkinError, Sprite, SpriteBatch, UploadError, solid_uv,
 };
 use rules::Judgment;
 use skin_model::{Canvas, ClipId, Filter, Fit};
@@ -58,13 +58,6 @@ impl PlaySkin for Scene {
     fn canvas(&self, target: [u32; 2]) -> Canvas {
         Canvas::new(target, self.fit)
     }
-}
-
-fn offscreen(width: u32, height: u32) -> Renderer {
-    let r = Renderer::new(Target::Offscreen { width, height }, AdapterChoice::Warp)
-        .expect("WARP renderer");
-    assert_eq!(r.gpu().adapter().name, common::WARP);
-    r
 }
 
 /// One frame of the renderer's skin, presented, read back.
@@ -457,28 +450,6 @@ fn a_skin_sizes_the_batch() {
     near(px(&r, &p, 125.0, 125.0), WHITE, 2);
 }
 
-/// The rows of column `x` that are note white (every channel above 200).
-fn white_rows(r: &Renderer, pixels: &[u8], x: u32) -> Vec<u32> {
-    let (w, h) = r.size();
-    (0..h)
-        .filter(|&y| {
-            let i = ((y * w + x) * 4) as usize;
-            pixels[i..i + 3].iter().all(|&c| c > 200)
-        })
-        .collect()
-}
-
-/// The middle of column `x`'s note, which is one run of rows.
-#[track_caller]
-fn note_row(r: &Renderer, pixels: &[u8], x: u32) -> f64 {
-    let rows = white_rows(r, pixels, x);
-    let (Some(&first), Some(&last)) = (rows.first(), rows.last()) else {
-        panic!("no note in column {x}");
-    };
-    assert_eq!((last - first + 1) as usize, rows.len(), "{rows:?}");
-    f64::from(first + last + 1) / 2.0
-}
-
 /// One renderer with the simple skin, notes at 2.0 s in lanes 5 and 7 and
 /// the lane 7 one judged, resized between frames shown at 1.8 s: the
 /// lane 5 note is 0.4 beats ahead, layout row 613.33, at the layout's
@@ -526,12 +497,16 @@ fn one_renderer_resized_minimized_and_restored() {
         let timing = r.frame(&input(&v, now, TimeUs(0), &[])).unwrap();
         assert!(timing.presented);
         let p = r.read_back();
-        let got = note_row(r, &p, l5);
+        let got = note_center_in(&p, r.size(), l5);
         assert!(
             (got - row).abs() <= 1.0,
             "{w}×{h}: row {got}, expected {row}"
         );
-        assert_eq!(white_rows(r, &p, l7), Vec::<u32>::new(), "{w}×{h}");
+        assert_eq!(
+            white_rows_in(&p, r.size(), l7),
+            Vec::<u32>::new(),
+            "{w}×{h}"
+        );
     };
     shown(&mut r, (1_280, 1_024), (362, 448, 560.89));
     shown(&mut r, (1_920, 1_080), (544, 672, 613.33));
