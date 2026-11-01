@@ -18,6 +18,32 @@ pub const RATE_BASIS_POINTS: i32 = 10_000;
 /// The enum `gauge.kind` reads: the shown gauge's look
 /// ([`GaugeLook`](crate::GaugeLook)), its variants in look order.
 pub const GAUGE_KIND_ENUM: EnumId = EnumId(0);
+/// The largest BPM, hi-speed or duration readout: one below `i32::MAX`,
+/// which a source number widget reserves.
+pub const READOUT_MAX: i32 = i32::MAX - 1;
+/// [`READOUT_MAX`] as a `u32`.
+pub(crate) const READOUT_MAX_U32: u32 = READOUT_MAX.unsigned_abs();
+/// A cover setting's full amount, ‰.
+pub const COVER_PERMILLE: i32 = 1_000;
+/// The largest `duration.green`: three fifths of [`READOUT_MAX`], rounded
+/// down.
+pub const GREEN_MAX: i32 = READOUT_MAX / 5 * 3 + READOUT_MAX % 5 * 3 / 5;
+
+const fn int(name: &'static str, hi: i32, export: Export) -> Field {
+    Field {
+        name,
+        ty: FieldTy::Int { lo: 0, hi },
+        export,
+    }
+}
+
+const fn flag(name: &'static str, export: Export) -> Field {
+    Field {
+        name,
+        ty: FieldTy::Bool,
+        export,
+    }
+}
 
 const fn rate(name: &'static str) -> Field {
     Field {
@@ -49,9 +75,10 @@ const E: Export = Export::Exportable;
 const T: Export = Export::TapestryOnly;
 
 /// The play screen's state. Fields come from the play view's snapshot,
-/// the rates' whole-attempt denominator and the gauge kind from the play
-/// context; timers from the play context, the scroll map, the snapshot's
-/// fail time and the drained effects (stage3.md R3).
+/// the rates' whole-attempt denominator, the gauge kind and the BPM range
+/// from the play context, the readouts from the frame and the clocks from
+/// the prepared chart; timers from the play context, the scroll map, the
+/// snapshot's fail time and the drained effects (stage3.md R3).
 pub static PLAY: Schema = Schema {
     fields: &[
         count("combo", E),
@@ -90,6 +117,26 @@ pub static PLAY: Schema = Schema {
             ty: FieldTy::Bool,
             export: E,
         },
+        int("bpm.current_x100", READOUT_MAX, T),
+        int("bpm.min_x100", READOUT_MAX, T),
+        int("bpm.max_x100", READOUT_MAX, T),
+        flag("bpm.current_valid", T),
+        flag("bpm.range_valid", T),
+        int("time.remaining_s", i32::MAX, T),
+        int("time.elapsed_s", i32::MAX, E),
+        int("cover.permille", COVER_PERMILLE, E),
+        int("lift.permille", COVER_PERMILLE, E),
+        int("hidden.permille", COVER_PERMILLE, E),
+        int("cover.absolute_permille", COVER_PERMILLE, E),
+        flag("cover.enabled", E),
+        flag("lift.enabled", E),
+        flag("hidden.enabled", E),
+        flag("cover.adjusting", E),
+        int("hispeed.x100", READOUT_MAX, E),
+        flag("hispeed.valid", E),
+        int("duration.ms", READOUT_MAX, E),
+        int("duration.green", GREEN_MAX, E),
+        flag("duration.valid", E),
     ],
     timers: &[
         timer("ready", E),
@@ -183,8 +230,56 @@ pub mod field {
     pub const GAUGE_KIND: u16 = 15;
     /// Whether the shown gauge has both a descriptor and a snapshot.
     pub const GAUGE_VALID: u16 = 16;
+    /// The tempo at the display head, in floored hundredths of a BPM; 0
+    /// while `bpm.current_valid` is false.
+    pub const BPM_CURRENT_X100: u16 = 17;
+    /// The chart's lowest BPM, in floored hundredths; 0 while
+    /// `bpm.range_valid` is false.
+    pub const BPM_MIN_X100: u16 = 18;
+    /// The chart's highest BPM, in floored hundredths; 0 while
+    /// `bpm.range_valid` is false.
+    pub const BPM_MAX_X100: u16 = 19;
+    /// Whether the frame gives the current tempo.
+    pub const BPM_CURRENT_VALID: u16 = 20;
+    /// Whether the play context gives the chart's BPM range.
+    pub const BPM_RANGE_VALID: u16 = 21;
+    /// The whole seconds, rounded up, from the later of now and the
+    /// attempt's start to the last object or the section's end.
+    pub const TIME_REMAINING_S: u16 = 22;
+    /// The whole seconds, rounded down, since the attempt's start.
+    pub const TIME_ELAPSED_S: u16 = 23;
+    /// The configured lane cover, in ‰, kept while it is off.
+    pub const COVER_PERMILLE: u16 = 24;
+    /// The configured lift, in ‰, kept while it is off.
+    pub const LIFT_PERMILLE: u16 = 25;
+    /// The configured hidden cover, in ‰, kept while it is off.
+    pub const HIDDEN_PERMILLE: u16 = 26;
+    /// The configured lane cover over the lane's whole length, in ‰:
+    /// `⌊(1 000 − lift) · cover / 1 000⌋` from the configured amounts.
+    pub const COVER_ABSOLUTE_PERMILLE: u16 = 27;
+    /// Whether the lane cover is on.
+    pub const COVER_ENABLED: u16 = 28;
+    /// Whether the lift is on.
+    pub const LIFT_ENABLED: u16 = 29;
+    /// Whether the hidden cover is on.
+    pub const HIDDEN_ENABLED: u16 = 30;
+    /// Whether the cover-adjustment mode is active.
+    pub const COVER_ADJUSTING: u16 = 31;
+    /// The multiplicative hi-speed, in floored hundredths; 0 while
+    /// `hispeed.valid` is false.
+    pub const HISPEED_X100: u16 = 32;
+    /// Whether the scroll policy has a multiplicative hi-speed.
+    pub const HISPEED_VALID: u16 = 33;
+    /// The travel duration, rounded half up to whole ms; 0 while
+    /// `duration.valid` is false.
+    pub const DURATION_MS: u16 = 34;
+    /// `⌊3 · duration.ms / 5⌋`, the green number derived from the rounded
+    /// duration.
+    pub const DURATION_GREEN: u16 = 35;
+    /// Whether the frame gives the travel duration.
+    pub const DURATION_VALID: u16 = 36;
     /// The number of fields.
-    pub const COUNT: usize = 17;
+    pub const COUNT: usize = 37;
 }
 
 /// The built-in timer slots of [`PLAY`]; `when` timers follow from
@@ -318,6 +413,50 @@ mod tests {
         ));
     }
 
+    /// The readouts' ranges, and which have no counterpart in the export
+    /// format.
+    #[test]
+    fn readout_fields_declare_their_ranges_and_exports() {
+        assert_eq!(READOUT_MAX, 2_147_483_646);
+        assert_eq!(i64::from(GREEN_MAX), i64::from(READOUT_MAX) * 3 / 5);
+        let ty = |name: &str| PLAY.field(name).map(|(_, f)| (f.ty, f.export));
+        let int = |hi| FieldTy::Int { lo: 0, hi };
+        for (name, hi, export) in [
+            ("bpm.current_x100", READOUT_MAX, T),
+            ("bpm.min_x100", READOUT_MAX, T),
+            ("bpm.max_x100", READOUT_MAX, T),
+            ("time.remaining_s", i32::MAX, T),
+            ("time.elapsed_s", i32::MAX, E),
+            ("cover.permille", 1_000, E),
+            ("lift.permille", 1_000, E),
+            ("hidden.permille", 1_000, E),
+            ("cover.absolute_permille", 1_000, E),
+            ("hispeed.x100", READOUT_MAX, E),
+            ("duration.ms", READOUT_MAX, E),
+            ("duration.green", GREEN_MAX, E),
+        ] {
+            assert!(
+                matches!(ty(name), Some((t, e)) if t == int(hi) && e == export),
+                "{name}"
+            );
+        }
+        for (name, export) in [
+            ("bpm.current_valid", T),
+            ("bpm.range_valid", T),
+            ("cover.enabled", E),
+            ("lift.enabled", E),
+            ("hidden.enabled", E),
+            ("cover.adjusting", E),
+            ("hispeed.valid", E),
+            ("duration.valid", E),
+        ] {
+            assert!(
+                matches!(ty(name), Some((FieldTy::Bool, e)) if e == export),
+                "{name}"
+            );
+        }
+    }
+
     #[test]
     fn slot_constants_match_names() {
         let fields = [
@@ -338,6 +477,26 @@ mod tests {
             ("rate.whole_bp", field::RATE_WHOLE_BP),
             ("gauge.kind", field::GAUGE_KIND),
             ("gauge.valid", field::GAUGE_VALID),
+            ("bpm.current_x100", field::BPM_CURRENT_X100),
+            ("bpm.min_x100", field::BPM_MIN_X100),
+            ("bpm.max_x100", field::BPM_MAX_X100),
+            ("bpm.current_valid", field::BPM_CURRENT_VALID),
+            ("bpm.range_valid", field::BPM_RANGE_VALID),
+            ("time.remaining_s", field::TIME_REMAINING_S),
+            ("time.elapsed_s", field::TIME_ELAPSED_S),
+            ("cover.permille", field::COVER_PERMILLE),
+            ("lift.permille", field::LIFT_PERMILLE),
+            ("hidden.permille", field::HIDDEN_PERMILLE),
+            ("cover.absolute_permille", field::COVER_ABSOLUTE_PERMILLE),
+            ("cover.enabled", field::COVER_ENABLED),
+            ("lift.enabled", field::LIFT_ENABLED),
+            ("hidden.enabled", field::HIDDEN_ENABLED),
+            ("cover.adjusting", field::COVER_ADJUSTING),
+            ("hispeed.x100", field::HISPEED_X100),
+            ("hispeed.valid", field::HISPEED_VALID),
+            ("duration.ms", field::DURATION_MS),
+            ("duration.green", field::DURATION_GREEN),
+            ("duration.valid", field::DURATION_VALID),
         ];
         for (name, slot) in fields {
             assert_eq!(PLAY.field(name).map(|(s, _)| s), Some(slot), "{name}");

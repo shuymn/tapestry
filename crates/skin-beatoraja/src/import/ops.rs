@@ -251,6 +251,14 @@ const JUDGE_PERFECT: i32 = 241;
 const GAUGE_GROOVE: i32 = 42;
 const GAUGE_HARD: i32 = 43;
 const GAUGE_EX: i32 = 1_046;
+/// The cover switches (`BooleanPropertyFactory.java:565-572`):
+/// `lanecover1_changing`, here the cover-adjustment mode where the source
+/// tests START or SELECT held (D4); `lanecover1_on`, `lift1_on` and
+/// `hidden1_on`, the stored switches.
+const COVER_CHANGING: i32 = 270;
+const COVER_ON: i32 = 271;
+const LIFT_ON: i32 = 272;
+const HIDDEN_ON: i32 = 273;
 
 /// A condition as the importer reads it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -299,6 +307,10 @@ fn builtin(id: i32) -> Option<(String, bool)> {
             gauge_kind(&["assist_easy", "easy", "ex_hard", "hazard"]),
             true,
         )),
+        COVER_CHANGING => Some(("cover.adjusting".to_owned(), true)),
+        COVER_ON => Some(("cover.enabled".to_owned(), false)),
+        LIFT_ON => Some(("lift.enabled".to_owned(), false)),
+        HIDDEN_ON => Some(("hidden.enabled".to_owned(), false)),
         _ => None,
     }
 }
@@ -425,11 +437,22 @@ mod tests {
                 }
             }
         }
-        assert_eq!(exprs.len(), 24);
+        assert_eq!(exprs.len(), 32);
         let joined: usize =
             exprs.iter().map(|e| e.len() + 2).sum::<usize>() + 4 * (exprs.len() - 1);
-        assert_eq!(joined, 806);
-        assert!(joined <= skin_model::MAX_SOURCE_BYTES);
+        assert_eq!(joined, 974);
+        // A number's availability joins them: the longest still fits.
+        let guard = [
+            "bpm.range_valid",
+            "bpm.current_valid",
+            "hispeed.valid",
+            "duration.valid",
+        ]
+        .iter()
+        .map(|g| g.len() + 2 + 4)
+        .max()
+        .unwrap_or(0);
+        assert!(joined + guard <= skin_model::MAX_SOURCE_BYTES);
     }
 
     fn expr(src: &str, display_deviation: bool) -> Cond {
@@ -496,10 +519,32 @@ mod tests {
                 }
             }
         }
-        assert_eq!(exprs.len(), 30);
+        assert_eq!(exprs.len(), 38);
         let joined: usize =
             exprs.iter().map(|e| e.len() + 2).sum::<usize>() + 4 * (exprs.len() - 1);
         assert!(joined > skin_model::MAX_SOURCE_BYTES, "{joined}");
+    }
+
+    #[test]
+    fn cover_switches_read_the_stored_settings() {
+        let none = BTreeMap::new();
+        for (id, name, src, d4) in [
+            (270, "lanecover1_changing", "cover.adjusting", true),
+            (271, "lanecover1_on", "cover.enabled", false),
+            (272, "lift1_on", "lift.enabled", false),
+            (273, "hidden1_on", "hidden.enabled", false),
+        ] {
+            assert_eq!(numeric(id, &none, true), expr(src, d4));
+            assert_eq!(numeric(-id, &none, false), expr(&format!("!({src})"), d4));
+            assert_eq!(named(name, true), Some(expr(src, d4)));
+            assert_eq!(
+                named(&format!("!{name}"), true),
+                Some(expr(&format!("!({src})"), d4))
+            );
+            // The built-ins win over items declared with their numbers.
+            let items = BTreeMap::from([(id, false)]);
+            assert_eq!(numeric(id, &items, true), expr(src, d4));
+        }
     }
 
     #[test]

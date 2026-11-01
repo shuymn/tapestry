@@ -19,7 +19,7 @@ use skin_model::{
 use super::super::asset::Crop;
 use super::super::geom::{HEIGHT, Offset, Q, Rect};
 use super::super::policy::{self, CriticalPart, Role};
-use super::super::report::{DeviationId, LaneApprox, NoteKind, Severity, Span};
+use super::super::report::{DeviationId, LaneApprox, NoteKind, PropertyKind, Severity, Span};
 use super::super::track::{self, Accepted, Stretch};
 use super::super::{
     Common, Cx, Dst, OFFSET_HIDDEN, OFFSET_LANECOVER, OFFSET_LIFT, Op, Opts, Prop, RUNTIME_OFFSETS,
@@ -34,11 +34,12 @@ const LANES: usize = 8;
 /// HIDDEN+'s own switch, `hidden1_on` (`SkinProperty.java:860`).
 const OP_HIDDEN: i32 = 273;
 
-/// Whether `name`, a boolean property name, is `hidden1_on` with an even
-/// number of `!` before it.
-fn hidden_on_name(name: &str) -> bool {
+/// The polarity of `name`, a boolean property name, when it is
+/// `hidden1_on`: `true` with an even number of `!` before it, `false`
+/// with an odd one; `None` for any other name.
+fn hidden_name(name: &str) -> Option<bool> {
     let rest = name.trim_start_matches('!');
-    rest == "hidden1_on" && (name.len() - rest.len()).is_multiple_of(2)
+    (rest == "hidden1_on").then(|| (name.len() - rest.len()).is_multiple_of(2))
 }
 
 /// When an element shows: from its first key to its last under `Hide`,
@@ -1101,11 +1102,30 @@ impl Cx<'_> {
         let mut dst = dst;
         dst.ops.retain(|op| match op {
             Op::Id(n) => *n != OP_HIDDEN,
-            Op::Name(name) => !hidden_on_name(name),
+            Op::Name(name) => hidden_name(name) != Some(true),
         });
+        // Its negation would hide HIDDEN+ while it is on: unsupported here,
+        // though the switch is a condition elsewhere.
+        let negated = |op: &Op| match op {
+            Op::Id(n) => *n == -OP_HIDDEN,
+            Op::Name(name) => hidden_name(name) == Some(false),
+        };
+        if dst.ops.iter().any(negated)
+            || match &dst.draw {
+                Prop::Id(n) => *n == -OP_HIDDEN,
+                Prop::Name(name) => hidden_name(name) == Some(false),
+                Prop::Null => false,
+            }
+        {
+            let why = NoteKind::UnsupportedProperty {
+                kind: PropertyKind::Boolean,
+                id: Some(-OP_HIDDEN),
+            };
+            return self.drop_el(role, at, why);
+        }
         if match &dst.draw {
             Prop::Id(n) => *n == OP_HIDDEN,
-            Prop::Name(name) => hidden_on_name(name),
+            Prop::Name(name) => hidden_name(name) == Some(true),
             Prop::Null => false,
         } {
             dst.draw = Prop::Null;

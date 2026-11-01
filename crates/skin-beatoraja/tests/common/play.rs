@@ -3,12 +3,15 @@
 
 #![allow(dead_code)]
 
+use std::collections::HashMap;
+
 use bms_model::{ChartBuilder, Lane, TimeUs};
 use eval::{GaugeState, JudgeEvent, JudgeEventKind, Tally};
 use rules::{GaugeValue, Judgment, PerJudgment};
 use skin_model::{
-    AtlasLimits, Attempt, ChartText, FrameUv, GaugeDesc, GaugeLook, LaneView, Layout, PlayContext,
-    Quad, QuadBatch, Side, Skin, SkinFrame, TextImage, TextTable, UvTable, Variant,
+    AtlasLimits, Attempt, BpmRange, ChartText, CoverSettings, FrameReadouts, FrameUv, GaugeDesc,
+    GaugeLook, LaneView, Layout, PlayContext, Quad, QuadBatch, Side, Skin, SkinFrame, TextImage,
+    TextTable, UvTable, Variant,
 };
 
 pub const MS: i64 = 1_000;
@@ -28,6 +31,26 @@ const LIMITS: AtlasLimits = AtlasLimits {
     max_layers: 8,
     reserved_layers: 1,
 };
+
+/// The readouts of a frame showing `view`: no tempo, hi-speed or duration,
+/// and every cover chosen on, stored at the amount `view` draws (capped
+/// at 1 000).
+pub fn readouts_for(view: LaneView) -> FrameReadouts {
+    FrameReadouts {
+        bpm_current_x100: None,
+        hispeed_x100: None,
+        duration: None,
+        covers: CoverSettings {
+            cover: view.cover.min(1_000),
+            lift: view.lift.min(1_000),
+            hidden: view.hidden.min(1_000),
+            cover_enabled: true,
+            lift_enabled: true,
+            hidden_enabled: true,
+            adjusting: false,
+        },
+    }
+}
 
 pub fn tally(ex_score: u32, combo: u32) -> Tally {
     Tally {
@@ -75,10 +98,18 @@ pub struct Drawn {
     pub view: LaneView,
     /// The render target's size each frame draws at.
     pub target: [u32; 2],
+    /// The readouts each frame gives; `None` gives [`readouts_for`] the
+    /// view.
+    pub readouts: Option<FrameReadouts>,
 }
 
 /// The attempt every drawn import plays: the whole chart, no lead-in.
 fn context() -> PlayContext<'static> {
+    context_with(None)
+}
+
+/// [`context`] with the chart's BPM range `bpm_range`.
+fn context_with(bpm_range: Option<BpmRange>) -> PlayContext<'static> {
     PlayContext {
         gauges: &GAUGES,
         attempt: Attempt::Full { lead_in: TimeUs(0) },
@@ -87,6 +118,7 @@ fn context() -> PlayContext<'static> {
         scratch: Side::Left,
         ln_default: rules::LnMode::Ln,
         last_note_end: NO_END,
+        bpm_range,
     }
 }
 
@@ -117,8 +149,13 @@ impl Drawn {
 
     /// `skin` played over `chart`.
     pub fn over(skin: Skin, chart: &bms_model::Chart) -> Self {
+        Self::over_with(skin, chart, None)
+    }
+
+    /// `skin` played over `chart` whose BPM range is `bpm_range`.
+    pub fn over_with(skin: Skin, chart: &bms_model::Chart, bpm_range: Option<BpmRange>) -> Self {
         let uvs = skin.atlas(Variant::Lo, LIMITS).unwrap().into_parts().1;
-        let ctx = context();
+        let ctx = context_with(bpm_range);
         let play = skin.prepare(chart, &ctx).unwrap();
         let batch = QuadBatch::with_capacity(skin.quad_capacity(), skin.run_capacity());
         Self {
@@ -139,6 +176,7 @@ impl Drawn {
                 hidden: 0,
             },
             target: [1_920, 1_080],
+            readouts: None,
         }
     }
 
@@ -193,11 +231,34 @@ impl Drawn {
             lanes: self.view,
             loading: None,
             playing: true,
+            readouts: self.readouts.unwrap_or_else(|| readouts_for(self.view)),
         };
         self.skin
             .build(&mut self.play, &frame, &self.uvs, &mut self.batch)
             .expect("the frame builds");
         self.batch.quads().to_vec()
+    }
+
+    /// Each digit by the uv of its glyph, read from the frames at `ms`
+    /// with the EX score at 0 to 9, its number the lowest on the canvas;
+    /// the tally is restored.
+    pub fn ex_glyphs(&mut self, ms: i64) -> HashMap<[u32; 4], char> {
+        let tally = self.tally;
+        let mut glyph = HashMap::new();
+        for digit in 0..10_u32 {
+            self.tally.ex_score = digit;
+            let q = self.frame(ms, &[]);
+            let ex = q
+                .iter()
+                .max_by(|a, b| a.rect[1].total_cmp(&b.rect[1]))
+                .unwrap();
+            glyph.insert(
+                ex.uv.map(f32::to_bits),
+                char::from_digit(digit, 10).unwrap(),
+            );
+        }
+        self.tally = tally;
+        glyph
     }
 
     /// The rects, rounded, of the frame at `ms`.

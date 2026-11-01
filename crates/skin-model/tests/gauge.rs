@@ -41,6 +41,7 @@ fn harness_with(g: GaugeDef, descs: &[GaugeDesc]) -> Harness {
         scratch: Side::Left,
         ln_default: rules::LnMode::Ln,
         last_note_end: TimeUs(0),
+        bpm_range: None,
     };
     Harness::new(skin_of(g).unwrap(), &chart(), &ctx)
 }

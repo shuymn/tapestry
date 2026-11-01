@@ -1784,3 +1784,52 @@ fn only_drawing_widgets_follow_within_the_coordinate_range() {
     }
     assert!(skin_with(REGIONS, None, vec![at(MAX_COORD)]).is_ok());
 }
+
+/// The lanes paint the effective amounts only: stored settings of covers
+/// that are off, the adjustment mode and HIDDEN+ on at 0 draw exactly
+/// what no cover draws.
+#[test]
+fn stored_cover_settings_do_not_paint() {
+    use skin_model::{CoverSettings, FrameReadouts};
+    let chart = ChartBuilder::new(BPM)
+        .tap(lane(3), TimeUs(1_000 * MS))
+        .build()
+        .unwrap();
+    let quads = |covers: CoverSettings| {
+        let mut h = Harness::new(lanes_skin(simple()), &chart, &full(0));
+        h.readouts = Some(FrameReadouts {
+            bpm_current_x100: None,
+            hispeed_x100: None,
+            duration: None,
+            covers,
+        });
+        h.frame(700, &[]);
+        h.batch.quads().to_vec()
+    };
+    let none = CoverSettings {
+        cover: 0,
+        lift: 0,
+        hidden: 0,
+        cover_enabled: false,
+        lift_enabled: false,
+        hidden_enabled: false,
+        adjusting: false,
+    };
+    let reference = quads(none);
+    assert!(!reference.is_empty());
+    let stored = CoverSettings {
+        cover: 500,
+        lift: 250,
+        hidden: 700,
+        adjusting: true,
+        ..none
+    };
+    assert_eq!(quads(stored), reference);
+    let on_at_zero = CoverSettings {
+        cover_enabled: true,
+        lift_enabled: true,
+        hidden_enabled: true,
+        ..none
+    };
+    assert_eq!(quads(on_at_zero), reference);
+}

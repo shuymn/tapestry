@@ -236,6 +236,9 @@ struct Opts<'a> {
     digits: Option<i32>,
     /// The keys as written were charged before this read.
     charged: bool,
+    /// A condition the element is drawn under besides its own: a value's
+    /// availability ([`property::Value::availability`]), joined first.
+    guard: Option<&'static str>,
 }
 
 /// What the common part of an element decided.
@@ -825,8 +828,8 @@ impl<'d> Cx<'d> {
             }
         };
 
-        // Conditions.
-        let mut conds: Vec<String> = Vec::new();
+        // Conditions, after the value's availability.
+        let mut conds: Vec<String> = o.guard.into_iter().map(str::to_owned).collect();
         let mut deviates = false;
         let mut seen = BTreeSet::new();
         for op in &dst.ops {

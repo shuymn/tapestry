@@ -271,6 +271,39 @@ pub(crate) enum Value {
     /// (`IntegerPropertyFactory.java:187-188, 200-201, 690-699`).
     WholeRatePercent,
     WholeRateFraction,
+    /// The chart's highest and lowest BPM, whole (`maxbpm`, `minbpm`;
+    /// `IntegerPropertyFactory.java:161-166`), while the range is known.
+    BpmMax,
+    BpmMin,
+    /// The tempo at the display head, whole (`nowbpm`, `:204`), while it
+    /// is known.
+    BpmNow,
+    /// The elapsed play time's minutes and seconds (`playtime_minute`,
+    /// `playtime_second`, `:205-206`).
+    ElapsedMinutes,
+    ElapsedSeconds,
+    /// The remaining time's minutes and seconds (`timeleft_minute`,
+    /// `timeleft_second`, `:207-222`), rounded up without the source's
+    /// added second and margin.
+    RemainingMinutes,
+    RemainingSeconds,
+    /// The configured lane cover, lift and hidden cover in ‰, and the lane
+    /// cover over the whole lane (`lanecover1`, `lift1`, `hidden1`,
+    /// `lanecover2`, `:68-89`), whatever their switches.
+    CoverPermille,
+    LiftPermille,
+    HiddenPermille,
+    CoverAbsolutePermille,
+    /// The multiplicative hi-speed in hundredths, whole and its
+    /// hundredths (`hispeed_lr2`, `hispeed`, `hispeed_afterdot`,
+    /// `:586-602`), while the scroll policy has one.
+    HispeedX100,
+    HispeedWhole,
+    HispeedFraction,
+    /// The travel duration in ms and its green number (`duration`,
+    /// `duration_green`, `:292-314`), while it is known.
+    Duration,
+    DurationGreen,
 }
 
 impl Value {
@@ -292,19 +325,42 @@ impl Value {
             Self::CurrentRateFraction => "rate.current_bp % 100",
             Self::WholeRatePercent => "rate.whole_bp / 100",
             Self::WholeRateFraction => "rate.whole_bp % 100",
+            Self::BpmMax => "bpm.max_x100 / 100",
+            Self::BpmMin => "bpm.min_x100 / 100",
+            Self::BpmNow => "bpm.current_x100 / 100",
+            Self::ElapsedMinutes => "time.elapsed_s / 60",
+            Self::ElapsedSeconds => "time.elapsed_s % 60",
+            Self::RemainingMinutes => "time.remaining_s / 60",
+            Self::RemainingSeconds => "time.remaining_s % 60",
+            Self::CoverPermille => "cover.permille",
+            Self::LiftPermille => "lift.permille",
+            Self::HiddenPermille => "hidden.permille",
+            Self::CoverAbsolutePermille => "cover.absolute_permille",
+            Self::HispeedX100 => "hispeed.x100",
+            Self::HispeedWhole => "hispeed.x100 / 100",
+            Self::HispeedFraction => "hispeed.x100 % 100",
+            Self::Duration => "duration.ms",
+            Self::DurationGreen => "duration.green",
+        }
+    }
+
+    /// The condition the value is drawn under, when it can be unknown:
+    /// an unknown value draws nothing rather than a 0.
+    pub(crate) fn availability(self) -> Option<&'static str> {
+        match self {
+            Self::BpmMax | Self::BpmMin => Some("bpm.range_valid"),
+            Self::BpmNow => Some("bpm.current_valid"),
+            Self::HispeedX100 | Self::HispeedWhole | Self::HispeedFraction => Some("hispeed.valid"),
+            Self::Duration | Self::DurationGreen => Some("duration.valid"),
+            _ => None,
         }
     }
 
     /// Whether the value differs from the source in an owner-decided way.
     pub(crate) fn deviates(self) -> bool {
-        matches!(
+        !matches!(
             self,
-            Self::Notes
-                | Self::GaugeTenths
-                | Self::CurrentRatePercent
-                | Self::CurrentRateFraction
-                | Self::WholeRatePercent
-                | Self::WholeRateFraction
+            Self::ExScore | Self::MaxCombo | Self::GaugePercent | Self::Count(_)
         )
     }
 
@@ -350,6 +406,22 @@ fn shown(id: i32) -> Option<Value> {
         116 | 156 => Value::WholeRateFraction,
         110..=114 => Value::Count(u8::try_from(id - 110).ok()?),
         420 => Value::Count(5),
+        90 => Value::BpmMax,
+        91 => Value::BpmMin,
+        160 => Value::BpmNow,
+        161 => Value::ElapsedMinutes,
+        162 => Value::ElapsedSeconds,
+        163 => Value::RemainingMinutes,
+        164 => Value::RemainingSeconds,
+        14 => Value::CoverPermille,
+        314 => Value::LiftPermille,
+        315 => Value::HiddenPermille,
+        316 => Value::CoverAbsolutePermille,
+        10 => Value::HispeedX100,
+        310 => Value::HispeedWhole,
+        311 => Value::HispeedFraction,
+        312 => Value::Duration,
+        313 => Value::DurationGreen,
         _ => return None,
     })
 }
@@ -495,6 +567,61 @@ mod tests {
             assert_eq!(int_by_name(name), Some(IntProp::Shown(value)), "{name}");
             assert!(value.deviates() && !value.critical());
         }
+        // The readouts, each guarded while it can be unknown.
+        for (id, name, value, guard) in [
+            (90, "maxbpm", Value::BpmMax, Some("bpm.range_valid")),
+            (91, "minbpm", Value::BpmMin, Some("bpm.range_valid")),
+            (160, "nowbpm", Value::BpmNow, Some("bpm.current_valid")),
+            (161, "playtime_minute", Value::ElapsedMinutes, None),
+            (162, "playtime_second", Value::ElapsedSeconds, None),
+            (163, "timeleft_minute", Value::RemainingMinutes, None),
+            (164, "timeleft_second", Value::RemainingSeconds, None),
+            (14, "lanecover1", Value::CoverPermille, None),
+            (314, "lift1", Value::LiftPermille, None),
+            (315, "hidden1", Value::HiddenPermille, None),
+            (316, "lanecover2", Value::CoverAbsolutePermille, None),
+            (10, "hispeed_lr2", Value::HispeedX100, Some("hispeed.valid")),
+            (310, "hispeed", Value::HispeedWhole, Some("hispeed.valid")),
+            (
+                311,
+                "hispeed_afterdot",
+                Value::HispeedFraction,
+                Some("hispeed.valid"),
+            ),
+            (312, "duration", Value::Duration, Some("duration.valid")),
+            (
+                313,
+                "duration_green",
+                Value::DurationGreen,
+                Some("duration.valid"),
+            ),
+        ] {
+            assert_eq!(int_by_id(id), IntProp::Shown(value), "{id}");
+            assert_eq!(int_by_name(name), Some(IntProp::Shown(value)), "{name}");
+            assert_eq!(value.availability(), guard, "{name}");
+            assert!(value.deviates() && !value.critical());
+            let scope = skin_model::Scope::new(&skin_model::PLAY);
+            assert!(skin_model::compile(value.expr(), &scope, skin_model::Ty::Int).is_ok());
+            if let Some(g) = guard {
+                assert!(skin_model::compile(g, &scope, skin_model::Ty::Bool).is_ok());
+            }
+        }
+        // Neither is a value property; others keep needing their own data.
+        assert_eq!(int_by_id(15), IntProp::Null);
+        assert_eq!(int_by_id(131), IntProp::Null);
+        for id in [92, 1_163, 1_164, 1_312, 1_327, 372, 373] {
+            assert_eq!(int_by_id(id), IntProp::Unsupported(Some(id)), "{id}");
+        }
+        // The earlier values are never guarded.
+        for v in [
+            Value::ExScore,
+            Value::Notes,
+            Value::GaugePercent,
+            Value::Count(0),
+        ] {
+            assert_eq!(v.availability(), None);
+        }
+        assert!(!Value::GaugePercent.deviates() && !Value::Count(5).deviates());
         // 40 is no value property; as an image index it is the gauge type.
         assert_eq!(int_by_id(40), IntProp::Null);
         assert_eq!(int_by_name("gaugetype_1p"), None);

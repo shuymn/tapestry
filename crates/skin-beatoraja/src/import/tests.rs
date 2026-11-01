@@ -336,3 +336,37 @@ fn judges_retain_every_grade_key() {
     let kept = RETAINED.with(|r| r.take());
     assert_eq!(kept, [[1, 1, 11], [1, 1, 11], [1, 1, 10]]);
 }
+
+/// A value's availability joins its conditions before the one visibility
+/// is compiled: a guarded number compiles its visibility once, with or
+/// without conditions of its own, never an earlier one replaced.
+#[test]
+fn a_guard_joins_the_one_visibility() {
+    let number = |r: i32, op: &str| {
+        format!(
+            r#"{{"type": 0, "w": 1920, "h": 1080,
+                "source": [{{"id": "a", "path": "a.png"}}],
+                "value": [{{"id": "v", "src": "a", "w": 60, "h": 6, "divx": 10, "digit": 3,
+                            "ref": {r}}}],
+                "destination": [{{"id": "v", {op} "dst": [{{"w": 6, "h": 6}}]}}]}}"#
+        )
+    };
+    let compiles = |json: &str| {
+        let (r, trace, _) = run(json);
+        let ops = r.unwrap().skin.ops().total();
+        let n = trace.iter().filter(|e| **e == Event::Compile).count();
+        (n, ops)
+    };
+    // EX score, unguarded: its value alone; with an op, one visibility.
+    let (plain, plain_ops) = compiles(&number(71, ""));
+    assert_eq!(plain, 1);
+    assert_eq!(compiles(&number(71, r#""op": [271],"#)).0, 2);
+    // The duration, guarded: one visibility, with an op joined into it.
+    let (guarded, guarded_ops) = compiles(&number(312, ""));
+    assert_eq!(guarded, 2);
+    let (joined, joined_ops) = compiles(&number(312, r#""op": [271],"#));
+    assert_eq!(joined, 2);
+    assert!(plain_ops < guarded_ops && guarded_ops < joined_ops);
+    // A value that is always known is not guarded.
+    assert_eq!(compiles(&number(163, "")).0, 1);
+}

@@ -9,9 +9,10 @@ use eval::Tally;
 use rules::GaugeValue;
 
 use super::schema::{
-    GAUGE_PERMILLE, Grade, LaneTimer, MAX_COUNT, RATE_BASIS_POINTS, lane_timer, timer,
+    COVER_PERMILLE, GAUGE_PERMILLE, Grade, LaneTimer, MAX_COUNT, RATE_BASIS_POINTS,
+    READOUT_MAX_U32, lane_timer, timer,
 };
-use super::{BuildError, Play, SkinFrame};
+use super::{BuildError, DurationRatio, Play, SkinFrame};
 use crate::expr::{Program, State, TIMER_OFF};
 use crate::widget::gauge::GaugeLook;
 
@@ -62,6 +63,64 @@ fn rate_bp(ex: u32, targets: u64) -> i32 {
     i32::try_from(rate).unwrap_or(i32::MAX)
 }
 
+/// The readout fields of one frame, `field::BPM_CURRENT_X100` to
+/// `field::DURATION_VALID`, validated before anything is applied.
+#[derive(Clone, Copy)]
+struct Readouts {
+    bpm_current: i32,
+    bpm_min: i32,
+    bpm_max: i32,
+    bpm_current_valid: i32,
+    bpm_range_valid: i32,
+    remaining_s: i32,
+    elapsed_s: i32,
+    cover: i32,
+    lift: i32,
+    hidden: i32,
+    cover_absolute: i32,
+    cover_enabled: i32,
+    lift_enabled: i32,
+    hidden_enabled: i32,
+    adjusting: i32,
+    hispeed: i32,
+    hispeed_valid: i32,
+    duration_ms: i32,
+    green: i32,
+    duration_valid: i32,
+}
+
+/// An optional readout up to the maximum: its value (0 when absent) and
+/// whether it is present. `None` past the maximum.
+fn readout(v: Option<u32>) -> Option<(i32, i32)> {
+    match v {
+        None => Some((0, 0)),
+        Some(v) if v <= READOUT_MAX_U32 => Some((i32::try_from(v).ok()?, 1)),
+        Some(_) => None,
+    }
+}
+
+/// `d` in ms rounded half up, exactly: `⌊n / d⌋`, plus 1 when the
+/// remainder is at least `⌈d / 2⌉` (computed as `d / 2 + d % 2`, so
+/// nothing overflows). `None` for a zero denominator or past the maximum.
+fn round_duration(d: DurationRatio) -> Option<i32> {
+    let (n, den) = (d.numerator, d.denominator);
+    let q = n.checked_div(den)?;
+    let r = n.checked_rem(den)?;
+    let q = if r >= den / 2 + den % 2 { q + 1 } else { q };
+    u32::try_from(q)
+        .ok()
+        .filter(|&q| q <= READOUT_MAX_U32)
+        .and_then(|q| i32::try_from(q).ok())
+}
+
+/// Whole seconds of `us` µs (at least 0), up or down, bounded by
+/// `i32::MAX`.
+fn seconds(us: i128, up: bool) -> i32 {
+    let us = us.max(0);
+    let s = us / 1_000_000 + i128::from(up && us % 1_000_000 != 0);
+    i32::try_from(s).unwrap_or(i32::MAX)
+}
+
 /// A timer's reading at `now`: elapsed ms since `start`, at least 0 (an
 /// effect stamped after `now` reads 0), or [`TIMER_OFF`].
 fn reading(now: TimeUs, start: Option<TimeUs>) -> i32 {
@@ -80,21 +139,93 @@ impl Play {
     /// Refuses a poisoned play: one a build refused, until a fresh
     /// prepare.
     pub(crate) fn check(&self) -> Result<(), BuildError> {
-        if self.poisoned {
-            Err(BuildError::InconsistentTally)
-        } else {
-            Ok(())
+        self.poisoned.map_or(Ok(()), Err)
+    }
+
+    /// Refuses the frame with `e` and poisons the play.
+    fn refuse(&mut self, e: BuildError) -> Result<(), BuildError> {
+        self.poisoned = Some(e);
+        Err(e)
+    }
+
+    /// The frame's readout fields, or `None` when a readout is out of
+    /// range or a stored cover setting disagrees with the lanes' effective
+    /// amount (stage3.md R4, R6).
+    fn readouts(&self, frame: &SkinFrame<'_>) -> Option<Readouts> {
+        let r = &frame.readouts;
+        let c = &r.covers;
+        let max = COVER_PERMILLE.unsigned_abs();
+        if [c.cover, c.lift, c.hidden]
+            .into_iter()
+            .any(|v| u32::from(v) > max)
+        {
+            return None;
         }
+        // The lanes cap their amounts at 1 000 (`LaneView`); a cover that
+        // is off draws 0 whatever it stores.
+        let effective = |on: bool, v: u16| if on { v } else { 0 };
+        let lanes = &frame.lanes;
+        let full = u16::try_from(max).ok()?;
+        if lanes.cover.min(full) != effective(c.cover_enabled, c.cover)
+            || lanes.lift.min(full) != effective(c.lift_enabled, c.lift)
+            || lanes.hidden.min(full) != effective(c.hidden_enabled, c.hidden)
+        {
+            return None;
+        }
+        let (bpm_current, bpm_current_valid) = readout(r.bpm_current_x100)?;
+        let (hispeed, hispeed_valid) = readout(r.hispeed_x100)?;
+        let (duration_ms, duration_valid) = match r.duration {
+            None => (0, 0),
+            Some(d) => (round_duration(d)?, 1),
+        };
+        // Sequenced as the source: three fifths of the rounded duration
+        // (`skin/property/IntegerPropertyFactory.java:292-314`).
+        let green = i32::try_from(i64::from(duration_ms) * 3 / 5).ok()?;
+        let (bpm_min, bpm_max, bpm_range_valid) = self.bpm_range.map_or(Some((0, 0, 0)), |b| {
+            Some((
+                i32::try_from(b.min_x100).ok()?,
+                i32::try_from(b.max_x100).ok()?,
+                1,
+            ))
+        })?;
+        let now = i128::from(frame.now.0);
+        let start = i128::from(self.play_at.0);
+        let end = i128::from(self.readout_end.0);
+        let (cover, lift) = (i32::from(c.cover), i32::from(c.lift));
+        Some(Readouts {
+            bpm_current,
+            bpm_min,
+            bpm_max,
+            bpm_current_valid,
+            bpm_range_valid,
+            remaining_s: seconds(end - now.max(start), true),
+            elapsed_s: seconds(now - start, false),
+            cover,
+            lift,
+            hidden: i32::from(c.hidden),
+            // Both at most 1 000, so the product fits.
+            cover_absolute: (COVER_PERMILLE - lift) * cover / COVER_PERMILLE,
+            cover_enabled: i32::from(c.cover_enabled),
+            lift_enabled: i32::from(c.lift_enabled),
+            hidden_enabled: i32::from(c.hidden_enabled),
+            adjusting: i32::from(c.adjusting),
+            hispeed,
+            hispeed_valid,
+            duration_ms,
+            green,
+            duration_valid,
+        })
     }
 
     /// Fills this frame's fields and timers: effects through the reducer,
     /// the snapshot into the fields, the built-in starts, then each `when`
     /// timer from its condition over the built-in timers only.
     ///
-    /// A poisoned play ([`Play::check`]), or a snapshot with more counted
-    /// empty POORs than POORs, is refused before any effect is applied:
-    /// everything stays as it was, and the play is poisoned until a fresh
-    /// prepare.
+    /// A poisoned play ([`Play::check`]), a snapshot with more counted
+    /// empty POORs than POORs, or invalid readouts ([`Play::readouts`]),
+    /// in that order, is refused before any effect is applied: everything
+    /// stays as it was, and the play is poisoned with that error until a
+    /// fresh prepare.
     pub(crate) fn fill(
         &mut self,
         frame: &SkinFrame<'_>,
@@ -102,13 +233,15 @@ impl Play {
     ) -> Result<(), BuildError> {
         self.check()?;
         let Some(judged) = judged_targets(frame.tally, self.empty_poor_counted) else {
-            self.poisoned = true;
-            return Err(BuildError::InconsistentTally);
+            return self.refuse(BuildError::InconsistentTally);
+        };
+        let Some(readouts) = self.readouts(frame) else {
+            return self.refuse(BuildError::InvalidReadouts);
         };
         for ev in frame.effects {
             self.reducer.apply(ev);
         }
-        self.fill_fields(frame, judged);
+        self.fill_fields(frame, judged, &readouts);
         self.fill_builtin(frame);
         let now = frame.now;
         let builtin = usize::from(timer::BUILTIN);
@@ -143,8 +276,9 @@ impl Play {
     /// The fields, in slot order (`field::*`): the snapshot's, `judged`
     /// its judged targets ([`judged_targets`]); the whole-attempt rate
     /// over the prepared target count, and the gauge kind from the shown
-    /// gauge's descriptor.
-    fn fill_fields(&mut self, frame: &SkinFrame<'_>, judged: u64) {
+    /// gauge's descriptor, then the frame's `readouts`.
+    fn fill_fields(&mut self, frame: &SkinFrame<'_>, judged: u64, readouts: &Readouts) {
+        let r = readouts;
         let t = frame.tally;
         let gauge = frame.gauges.get(frame.gauge).map_or(0, |g| {
             let permille = (g.value.0 / GAUGE_UNIT).clamp(0, i64::from(GAUGE_PERMILLE));
@@ -176,6 +310,26 @@ impl Play {
             rate_bp(t.ex_score, targets),
             kind.unwrap_or(GaugeLook::Normal).schema_value(),
             i32::from(kind.is_some()),
+            r.bpm_current,
+            r.bpm_min,
+            r.bpm_max,
+            r.bpm_current_valid,
+            r.bpm_range_valid,
+            r.remaining_s,
+            r.elapsed_s,
+            r.cover,
+            r.lift,
+            r.hidden,
+            r.cover_absolute,
+            r.cover_enabled,
+            r.lift_enabled,
+            r.hidden_enabled,
+            r.adjusting,
+            r.hispeed,
+            r.hispeed_valid,
+            r.duration_ms,
+            r.green,
+            r.duration_valid,
         ];
     }
 

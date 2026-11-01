@@ -1241,11 +1241,14 @@ impl Skin {
     /// # Errors
     ///
     /// [`BuildError::InconsistentTally`] when the snapshot counts more
-    /// empty POORs as POORs than it has POORs, and on every build after
-    /// that until a fresh [`prepare`](Self::prepare): nothing is appended
-    /// and `play` keeps its state, its effects not applied. The caller
-    /// stops the attempt and prepares again, or ends the play with an
-    /// error; it never builds on that `play` again (stage3.md S10).
+    /// empty POORs as POORs than it has POORs, else
+    /// [`BuildError::InvalidReadouts`] when a readout is out of range or
+    /// a stored cover setting disagrees with the lanes; then the same
+    /// error on every build after that until a fresh
+    /// [`prepare`](Self::prepare): nothing is appended and `play` keeps
+    /// its state, its effects not applied. The caller stops the attempt
+    /// and prepares again, or ends the play with an error; it never builds
+    /// on that `play` again (stage3.md S10).
     pub fn build(
         &self,
         play: &mut Play,
@@ -1460,6 +1463,7 @@ mod tests {
             scratch: Side::Left,
             ln_default: rules::LnMode::Ln,
             last_note_end: TimeUs(0),
+            bpm_range: None,
         };
         let mut play = skin.prepare(&chart, &ctx).unwrap();
         skin.attach_bitmap_text(&mut play, &ChartText::default());
