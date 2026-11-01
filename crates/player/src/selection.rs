@@ -479,7 +479,7 @@ impl Selection {
                 Some(SelectStep::Background(running)) => {
                     let (holds, idle) = self.shelf.background();
                     if (running && !holds) || (!running && !idle) {
-                        if script.expired() {
+                        if script.expired_after(crate::dev::BACKGROUND_TIMEOUT) {
                             let what = if running { "held no job" } else { "kept a job" };
                             script.fail(format!("the background measurement {what}"));
                             controls.close();
@@ -2778,5 +2778,46 @@ mod tests {
         assert_eq!(sel.screen.listed(), 3);
         let chosen = sel.screen.selected().unwrap().path.clone();
         assert_eq!(chosen.file_name().unwrap(), "c.bms");
+    }
+
+    /// A `background` step waits past [`crate::dev::STEP_TIMEOUT`] for the
+    /// background measurement, which a loaded machine starves, and fails
+    /// only at [`crate::dev::BACKGROUND_TIMEOUT`]. A pause keeps the queued
+    /// job waiting, so the worker neither holds it nor is idle.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn a_background_step_outlasts_the_step_timeout() {
+        use crate::dev::scenario::{Origin, StepKind};
+        use crate::dev::{BACKGROUND_TIMEOUT, STEP_TIMEOUT, SelectScript, SelectStep};
+        let dir = tempfile::tempdir().unwrap();
+        let mut sel = selection(dir.path());
+        sel.shelf.pause();
+        let path = dir.path().join("charts").join("a.bms");
+        sel.shelf.leave_to_background(crate::background::Job {
+            source: game::ChartSource::new(path, 0, [0; 32]),
+            rate: 48_000,
+            name: "a.bms".to_owned(),
+        });
+        assert_eq!(sel.shelf.background(), (false, false));
+        let controls = crate::controls::Controls::new(input::QpcClock::start());
+        let o = Origin {
+            index: 1,
+            kind: StepKind::Select,
+        };
+        for (running, what) in [(true, "held no job"), (false, "kept a job")] {
+            sel.script = Some(SelectScript::compiled(vec![(
+                SelectStep::Background(running),
+                o,
+            )]));
+            sel.script.as_mut().unwrap().age(STEP_TIMEOUT);
+            assert!(!sel.script(&controls, 0, None));
+            let script = sel.script.as_mut().unwrap();
+            assert_eq!(script.failure(), None);
+            assert!(script.front().is_some());
+            script.age(BACKGROUND_TIMEOUT);
+            assert!(!sel.script(&controls, 0, None));
+            let failure = sel.script.as_ref().unwrap().failure().unwrap();
+            assert!(failure.contains(what), "{failure}");
+        }
     }
 }

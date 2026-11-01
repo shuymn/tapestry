@@ -433,7 +433,7 @@ pub enum SelectStep {
     /// slow measurement, a load's or the background's.
     SlowMeasuring(u64),
     /// Wait until the background measurement holds a job (`true`), or has
-    /// none held or waiting (`false`), at most [`STEP_TIMEOUT`].
+    /// none held or waiting (`false`), at most [`BACKGROUND_TIMEOUT`].
     Background(bool),
     /// Close the window.
     Close,
@@ -441,6 +441,12 @@ pub enum SelectStep {
 
 /// How long a scripted step waits for its chart.
 pub const STEP_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// How long a `background` step waits for the background measurement:
+/// its thread runs in background mode, which a loaded machine starves for
+/// tens of seconds, so the bound only catches a measurement that never
+/// takes or ends its job.
+pub const BACKGROUND_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// A slow load a script asks for (`slow-load`, `quit-loading`,
 /// `close-loading`).
@@ -642,7 +648,7 @@ impl SelectScript {
 
     /// Whether the front step has waited `bound` since it became the
     /// front.
-    fn expired_after(&mut self, bound: Duration) -> bool {
+    pub fn expired_after(&mut self, bound: Duration) -> bool {
         let since = *self.since.get_or_insert_with(std::time::Instant::now);
         since.elapsed() >= bound
     }
