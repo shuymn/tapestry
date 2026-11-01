@@ -19,6 +19,8 @@ use super::super::property::{self, IndexProp, IntProp, Value};
 use super::super::report::{NoteKind, PropertyKind, Span, TrackWhy};
 use super::super::track;
 use super::super::{Common, Cx, Dst, Opts, Prop};
+#[cfg(test)]
+use super::super::{Event, trace};
 use super::{SrcImage, Unplaced};
 use crate::error::ImportError;
 use crate::tree::Kind;
@@ -115,6 +117,8 @@ impl Cx<'_> {
         if let Some(p) = self.selectors.get(src) {
             let p = p.clone();
             self.budget.ops(&p).map_err(|l| self.limit(at, l))?;
+            #[cfg(test)]
+            trace(Event::Charge);
             return Ok(p);
         }
         let p = self.compile(src, Ty::Int, at)?;
@@ -138,7 +142,7 @@ impl Cx<'_> {
         }
         self.budget.image(frames).map_err(|l| self.limit(at, l))?;
         #[cfg(test)]
-        super::super::trace(super::super::Event::Charge);
+        trace(Event::Charge);
         let (file, rect, cell) = match self.src_rect(Role::Decorative, at, s, s.div)? {
             Ok(found) => found,
             Err(u) => return Ok(Err(u)),
@@ -196,6 +200,8 @@ impl Cx<'_> {
         self.budget
             .choice_refs(refs)
             .map_err(|l| self.limit(at, l))?;
+        #[cfg(test)]
+        trace(Event::Refs);
         let Some(c) = self.choice_common(&dst, charged)? else {
             return Ok(());
         };
@@ -211,6 +217,8 @@ impl Cx<'_> {
         };
         // Runs of at most 1 024 frames, as the sheet admitted them.
         let frames = u16::try_from(q).map_err(|_| self.range(at, "len"))?;
+        #[cfg(test)]
+        trace(Event::Table);
         let entries = (0..len)
             .map(|i| {
                 let first = u16::try_from(i * q).ok()?;
@@ -251,10 +259,14 @@ impl Cx<'_> {
             return Ok(());
         }
         self.budget.choice_refs(n).map_err(|l| self.limit(at, l))?;
+        #[cfg(test)]
+        trace(Event::Refs);
         let Some(c) = self.choice_common(&dst, charged)? else {
             return Ok(());
         };
         let value = self.selector(src, at)?;
+        #[cfg(test)]
+        trace(Event::Table);
         let items: Vec<u32> = self.def.arena.children(list).collect();
         let mut entries = Vec::with_capacity(items.len());
         for item in items {

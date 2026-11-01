@@ -1,6 +1,7 @@
 //! The header's record caps are checked before anything is gathered for
 //! a record: one option with far more items than the cap allows refuses
-//! with no allocation sized by the array.
+//! with no allocation sized by the array. Likewise an image set's entries
+//! are charged before its table is gathered.
 //!
 //! A global allocator records the largest single allocation made on a
 //! thread that opts in (a thread-local flag), so the test harness's own
@@ -17,7 +18,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use common::{play, skin};
 use skin_beatoraja::limits::MAX_OPTION_ITEMS;
-use skin_beatoraja::{Definition, ImportError, InputLimit, resolve};
+use skin_beatoraja::{
+    Config, Definition, ImportError, ImportLimit, InputLimit, import, read_header, resolve,
+};
+use skin_model::MAX_IMAGE_CHOICE_REFS;
 
 struct Largest;
 
@@ -97,5 +101,32 @@ fn option_items_are_counted_before_anything_is_gathered() {
     // The items kept up to the cap, doubled while they grow, bound every
     // allocation; one id per item of the array would be 4 MiB.
     let bound = 2 * MAX_OPTION_ITEMS * size_of::<skin_beatoraja::OptionItem>();
+    assert!(seen <= bound, "{seen} > {bound}");
+
+    // One image set of 16 times the choice cap: refused before its 4 MiB
+    // of item ids, or its entries, are gathered.
+    const ENTRIES: usize = 16 * MAX_IMAGE_CHOICE_REFS;
+    let items = vec!["null"; ENTRIES].join(",");
+    let d = skin(&[(
+        "s.json",
+        &play(&format!(
+            r#""w": 1920, "h": 1080, "imageset": [{{"id": "s", "images": [{items}]}}],
+               "destination": [{{"id": "s", "dst": [{{"w": 1, "h": 1}}]}}]"#
+        )),
+    )]);
+    let (mut def, h) = read_header(d.path(), "s.json").unwrap();
+    let config = Config::defaults(&h);
+    let (result, seen) = largest(|| import(&mut def, &h, &config).map(|_| ()));
+    assert!(
+        matches!(
+            result,
+            Err(ImportError::Limit {
+                limit: ImportLimit::ChoiceRefs,
+                ..
+            })
+        ),
+        "{result:?}"
+    );
+    let bound = 1 << 20;
     assert!(seen <= bound, "{seen} > {bound}");
 }

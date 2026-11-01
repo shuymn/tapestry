@@ -312,6 +312,10 @@ pub(crate) enum Event {
     Charge,
     Compile,
     Admit,
+    /// An image choice table's entries charged.
+    Refs,
+    /// An image choice table allocated.
+    Table,
 }
 
 #[cfg(test)]
