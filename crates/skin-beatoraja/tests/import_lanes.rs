@@ -226,7 +226,8 @@ fn the_vertical_mapping_follows_the_source() {
     // SUDDEN+'s share runs from the region's top (180), LIFT's from the
     // bottom (780): the lift of 100 ‰ takes 60 px from 780, and a cover
     // of 500 ‰ lowers SUDDEN+'s paint by half of the 540 px left, its
-    // lower edge to 450; the paint, 600 high, is drawn whole.
+    // lower edge to 450; the paint, 600 high, is drawn whole, and LIFT's,
+    // raised with the line, is cut at the lanes' bottom.
     let sudden =
         r#"{"id": "cover", "offset": 4, "dst": [{"x": 20, "y": 600, "w": 430, "h": 400}]}"#;
     let lift_dst = r#"{"id": "liftc", "dst": [{"x": 20, "y": 0, "w": 430, "h": 200}]}"#;
@@ -235,7 +236,7 @@ fn the_vertical_mapping_follows_the_source() {
     let mut d = drawn(&l, &tap(1, 5_000));
     d.view.cover = 500;
     d.view.lift = 100;
-    let r = d.rects(1_000);
+    let r = d.shown(1_000);
     assert_eq!(r, [[30, -150, 645, 600], [30, 720, 645, 60]]);
     // Without them, 100 ‰ of lift still raises the line by 60 px of the
     // region: a note's lower edge on 720.
@@ -919,24 +920,15 @@ fn a_note_offset_off_the_lanes_refuses() {
 
 #[test]
 fn ids_resolve_in_the_source_order() {
-    // HIDDEN+ is looked up before the note: the destination is HIDDEN+,
-    // dropped without lanes.
+    // HIDDEN+ is looked up before the note: the destination is HIDDEN+'s
+    // paint, dropped without its file, and there are no lanes.
     let hidden = format!(
         r#"{}, "hiddenCover": [{{"id": "notes", "src": "a"}}]"#,
         note("")
     );
     let l = import_body(&body("", &hidden, &[NOTES]));
-    assert!(
-        l.report()
-            .notes
-            .iter()
-            .any(|n| n.severity == Severity::Dropped
-                && n.kind
-                    == NoteKind::UnsupportedField {
-                        field: "hiddenCover"
-                    })
-    );
     assert_eq!(l.ok().scratch, None);
+    assert!(has(l.report(), NoteKind::MissingAsset));
     // A pmchara sharing the note's id refuses.
     let chara = format!(
         r#"{}, "pmchara": [{{"id": "notes", "src": "a"}}]"#,

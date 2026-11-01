@@ -374,23 +374,32 @@ pub fn draw(imported: &Imported) -> Vec<usize> {
             n <= usize::try_from(skin.quad_capacity()).unwrap_or(usize::MAX),
             "more quads than the capacity"
         );
+        check_runs(&batch);
         counts.push(n);
     }
-    // The covers moving, past a whole lane too: followers stay finite and
+    // The covers moving, past a whole lane too, and HIDDEN+ switched off
+    // with an amount stored: followers and trimmed paint stay finite and
     // inside the capacities.
-    for (ms, cover, lift, hidden) in [
-        (600_i64, 300, 100, 500),
-        (700, 1_000, 1_000, 1_000),
-        (800, 1_500, 2_000, u16::MAX),
-        (900, 0, 0, 0),
+    for (ms, cover, lift, hidden, hidden_on) in [
+        (600_i64, 300, 100, 500, true),
+        (700, 1_000, 1_000, 1_000, true),
+        (800, 1_500, 2_000, u16::MAX, true),
+        (900, 0, 0, 0, true),
+        (1_000, 300, 250, 500, false),
+        (1_100, 0, 1_000, 1_000, false),
     ] {
         batch.clear();
         let frame_lanes = LaneView {
             visible_time: TimeUs(600_000),
             cover,
             lift,
-            hidden,
+            hidden: if hidden_on { hidden } else { 0 },
         };
+        let mut readouts = readouts_for(frame_lanes);
+        if !hidden_on {
+            readouts.covers.hidden = hidden.min(1_000);
+            readouts.covers.hidden_enabled = false;
+        }
         let frame = SkinFrame {
             now: TimeUs(ms * 1_000),
             display_offset: TimeUs(0),
@@ -403,7 +412,7 @@ pub fn draw(imported: &Imported) -> Vec<usize> {
             layout: &Layout::AUTHOR,
             lanes: frame_lanes,
             loading: None,
-            readouts: readouts_for(frame_lanes),
+            readouts,
             playing: true,
         };
         skin.build(&mut play, &frame, &uvs, &mut batch)
@@ -700,6 +709,40 @@ fn check_batch(skin: &skin_model::Skin, batch: &skin_model::QuadBatch) {
             .iter()
             .all(|q| q.rect.iter().chain(&q.pivot).all(|v| v.is_finite())),
         "a quad off the finite plane"
+    );
+    check_runs(batch);
+}
+
+/// A batch's runs tile its quads in order, each non-empty; neighbours
+/// differ in their key or their inline clip, which is finite with a
+/// positive area.
+#[track_caller]
+fn check_runs(batch: &skin_model::QuadBatch) {
+    let mut end = 0;
+    let mut last: Option<&skin_model::Run> = None;
+    for r in batch.runs() {
+        assert_eq!(r.start, end, "a gap or overlap between runs");
+        assert!(r.end > r.start, "an empty run");
+        if let Some(c) = r.clip_rect {
+            let [x, y, w, h] = c.rect();
+            assert!(
+                [x, y, w, h].iter().all(|v| v.is_finite()) && w > 0.0 && h > 0.0,
+                "an inline clip without area"
+            );
+        }
+        if let Some(prev) = last {
+            assert!(
+                prev.key != r.key || prev.clip_rect != r.clip_rect,
+                "unmerged neighbouring runs"
+            );
+        }
+        end = r.end;
+        last = Some(r);
+    }
+    assert_eq!(
+        usize::try_from(end).unwrap_or(usize::MAX),
+        batch.quads().len(),
+        "quads past the runs"
     );
 }
 

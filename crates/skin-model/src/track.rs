@@ -204,18 +204,6 @@ impl Track {
         })
     }
 
-    /// One key at 0 leaving every prop at its default (no geometry, opaque
-    /// white, no angle), held: a lane paint marker's track.
-    #[must_use]
-    pub fn neutral() -> Self {
-        Self {
-            at: Box::new([0]),
-            v: Box::new([Prop::ALL.map(Prop::default)]),
-            ease: Ease::Linear,
-            end: End::Hold,
-        }
-    }
-
     /// The number of keys.
     #[must_use]
     pub fn key_count(&self) -> usize {

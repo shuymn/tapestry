@@ -26,6 +26,10 @@ use image_choice::{Lowered, SetSelector};
 /// under stretch 8 and 9.
 pub(super) type Baked = (Vec<[i32; 4]>, Option<Native>);
 
+/// An admitted image, its keys' model rects baked against it, and the
+/// native size its quads keep.
+pub(super) type Painted = (u32, Vec<[i32; 4]>, Option<Native>);
+
 /// A placed source image: its admitted file, its rect in texels and its
 /// cell.
 pub(super) type Placed = (u32, [u32; 4], [u32; 2]);
@@ -424,6 +428,21 @@ impl Cx<'_> {
         rec: u32,
         s: &SrcImage,
     ) -> Result<Option<(u32, Track, Option<Native>)>, ImportError> {
+        let Some((image, rects, native)) = self.src_image_rects(c, rec, s)? else {
+            return Ok(None);
+        };
+        let t = self.model_track(c, &rects)?;
+        Ok(Some((image, t, native)))
+    }
+
+    /// [`Self::src_image_track`]'s image and its baked keys, before the
+    /// track is built.
+    pub(super) fn src_image_rects(
+        &mut self,
+        c: &Common,
+        rec: u32,
+        s: &SrcImage,
+    ) -> Result<Option<Painted>, ImportError> {
         let Some((image, cell)) = self.add_src_image(c, rec, s, s.div)? else {
             return Ok(None);
         };
@@ -431,8 +450,7 @@ impl Cx<'_> {
             self.drop_el(c.role, c.span, NoteKind::Stretch(c.stretch_mode))?;
             return Ok(None);
         };
-        let t = self.model_track(c, &rects)?;
-        Ok(Some((image, t, native)))
+        Ok(Some((image, rects, native)))
     }
 
     /// `c`'s keys with its stretch baked against a `cell`, and the native

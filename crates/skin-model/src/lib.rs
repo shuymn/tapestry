@@ -39,9 +39,9 @@
 //! starts the timers and pushes each drawn element's quads: an image's
 //! current frame from the uv table, turned about its pivot; a number's
 //! glyph cells; a gauge's lit and unlit segments; the judgment's grade
-//! and combo; a text's line; a SUDDEN+ paint moved by the covers; or the
-//! lanes' notes, bar lines and judgment line, and their hidden and lift
-//! covers where markers place them. From a chart's choice to its countdown the frame carries a
+//! and combo; a text's line; a cover's paint moved by the covers and cut
+//! at its trim line; or the lanes' notes, bar lines and judgment line.
+//! From a chart's choice to its countdown the frame carries a
 //! [`LoadState`]: the `loading` timer runs and `load.percent` reads the
 //! load's progress, so a skin can draw its loading elements, the chart's
 //! title and artist among its text fields.
@@ -112,7 +112,7 @@ pub use play::{
     Attempt, BpmRange, BuildError, CoverSettings, DurationRatio, FrameReadouts, GaugeDesc,
     LoadState, Play, PlayContext, PrepareError, SkinFrame,
 };
-pub use quad::{Blend, ClipId, Filter, Quad, QuadBatch, Run, RunKey};
+pub use quad::{Blend, ClipId, ClipRect, Filter, Quad, QuadBatch, Run, RunKey};
 pub use schema::{EnumDef, EnumId, Export, Field, FieldTy, Schema, SchemaError, TimerDef, Ty};
 pub use skin::{
     ElementDef, LoadError, MAX_COORD, MAX_ELEMENTS, MAX_SKIN_KEYS, MAX_WHEN_TIMERS,
@@ -122,9 +122,7 @@ pub use track::{
     Ease, End, KeyDef, MAX_GEOMETRY, MAX_KEY_US, MAX_TRACK_KEYS, Prop, Sample, Track, TrackError,
 };
 pub use widget::bar::{BarGroupDef, BarGroupError, MAX_BAR_GROUPS};
-pub use widget::cover_paint::{
-    CoverImage, CoverPaintDef, CoverPaintError, LanePaint, LanePaintError,
-};
+pub use widget::cover_paint::{CoverImage, CoverMotion, CoverPaintDef, CoverPaintError, CoverTrim};
 pub use widget::digits::{
     Align, DigitsDef, GlyphSet, I32_DIGITS, MAX_CELLS, NumberDef, NumberError, Pad,
 };
@@ -136,8 +134,8 @@ pub use widget::image_choice::{
 };
 pub use widget::judge::{Attach, ComboPart, GradePart, JudgeDef, JudgeError, JudgePart, JudgeSlot};
 pub use widget::lanes::{
-    HiddenTrim, LANE_QUADS, LANE_RESERVED, LANE_VISITS, LanePart, LaneParts, LaneStyle, LaneView,
-    LanesDef, LanesError, Side, SourceLanes,
+    LANE_QUADS, LANE_RESERVED, LANE_VISITS, LanePart, LaneParts, LaneStyle, LaneView, LanesDef,
+    LanesError, Side, SourceLanes,
 };
 pub use widget::scroll::Scale;
 pub use widget::text::{

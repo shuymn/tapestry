@@ -260,8 +260,6 @@ struct Common {
     stretch: Stretch,
     stretch_mode: i32,
     untimed: bool,
-    /// The joined visibility source, empty when always visible.
-    cond_src: String,
     /// Whether a condition differs from the source's in an owner-decided
     /// way, or the element's value does: a D4 note when it is retained.
     display_deviation: bool,
@@ -1084,7 +1082,6 @@ impl<'d> Cx<'d> {
             stretch_mode: dst.stretch,
             untimed,
             track,
-            cond_src: src,
             display_deviation: deviates,
         }))
     }
@@ -1396,6 +1393,7 @@ impl<'d> Cx<'d> {
             | LoadError::RegionInFixed { element }
             | LoadError::FillOutsideScreen { element }
             | LoadError::Coordinates { element }
+            | LoadError::CoverGate { element }
             | LoadError::WidgetGeometry { element }
             | LoadError::Unbound { element }
             | LoadError::UnknownWidget { element }

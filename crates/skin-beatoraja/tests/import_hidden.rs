@@ -1,54 +1,240 @@
-//! HIDDEN+ (`hiddenCover`): the subset that maps, its trim line, offsets
-//! and switch, what is dropped with a note, and the differences noted
-//! against the source, through `build`.
+//! LIFT's (`liftCover`) and HIDDEN+'s (`hiddenCover`) paint: their
+//! motion and implicit offsets, the trim line and the unstretched
+//! destination that gates and clips them, HIDDEN+'s switch, what is
+//! dropped with a note, and the differences noted against the source,
+//! through `build`.
 //!
 //! The default lanes (r = 1, y 200, h 600, size 20): top 270, bottom 880,
-//! a 600 px lane over x [20, 450]. The default HIDDEN+ is 600 tall with
+//! a 600 px region over x [20, 450]. The default HIDDEN+ is 600 tall with
 //! its upper edge on the lanes' bottom (880, y down), trimmed there as
-//! the lift raises it.
+//! the lift raises it; the default LIFT is 200 tall below the lanes,
+//! trimmed at their bottom.
 
 mod common;
 
-use bms_model::{ChartBuilder, Lane, TimeUs};
-use common::lanes::{
-    NOTES, body, cover, hidden, hidden_object, lane_rects, lift, lift_object, note, note_with, with,
-};
-use common::play::{Drawn, MS};
-use common::{Loaded, has, import_body, import_config};
+use bms_model::ChartBuilder;
+use common::lanes::{NOTES, body, hidden, hidden_object, lift, lift_object, note, with};
+use common::play::{Drawn, readouts_for};
+use common::{Loaded, has, import_body, import_sized, kinds};
 use skin_beatoraja::{
-    Config, DeviationId, LaneApprox, NoteKind, OffsetValue, PropertyKind, Severity,
+    Config, CriticalPart, DeviationId, ImportError, LaneApprox, NoteKind, OffsetValue, Severity,
 };
 
-/// The default HIDDEN+ with `extra` object fields and `dst` extra fields.
-fn hid(extra: &str, dst: &str) -> Loaded {
-    with(&hidden_object(extra), &[&hidden(dst)])
-}
-
-/// The quads at 1,000 ms with no note on screen and the covers at
-/// `[cover, lift, hidden]` ‰.
-fn quads(l: &Loaded, [cover, lift, hidden]: [u16; 3]) -> Vec<skin_model::Quad> {
-    let chart = ChartBuilder::new(150_000)
-        .tap(Lane::new(1).unwrap(), TimeUs(5_000 * MS))
-        .build()
-        .unwrap();
+/// What shows at 1,000 ms with the covers at `[cover, lift, hidden]` ‰
+/// and HIDDEN+ `enabled`: every quad cut to its clip.
+fn shown_with(l: &Loaded, [cover, lift, hidden]: [u16; 3], enabled: bool) -> Vec<[i32; 4]> {
+    let chart = ChartBuilder::new(150_000).build().unwrap();
     let mut d = Drawn::over(l.ok().skin.clone(), &chart);
-    (d.view.cover, d.view.lift, d.view.hidden) = (cover, lift, hidden);
-    d.frame(1_000, &[])
+    (d.view.cover, d.view.lift, d.view.hidden) = (cover, lift, if enabled { hidden } else { 0 });
+    let mut readouts = readouts_for(d.view);
+    (readouts.covers.hidden, readouts.covers.hidden_enabled) = (hidden, enabled);
+    d.readouts = Some(readouts);
+    d.shown(1_000)
 }
 
-/// [`quads`]' rects, rounded.
-fn rects(l: &Loaded, view: [u16; 3]) -> Vec<[i32; 4]> {
-    quads(l, view)
-        .iter()
-        .map(|q| common::play::round(q.rect))
-        .collect()
+/// [`shown_with`] HIDDEN+ on.
+fn shown(l: &Loaded, view: [u16; 3]) -> Vec<[i32; 4]> {
+    shown_with(l, view, true)
+}
+
+/// The quads with their clips at 1,000 ms, every cover at rest.
+fn clipped(l: &Loaded) -> Vec<([i32; 4], Option<[i32; 4]>)> {
+    let chart = ChartBuilder::new(150_000).build().unwrap();
+    Drawn::over(l.ok().skin.clone(), &chart).clipped(1_000)
 }
 
 fn d9(a: LaneApprox) -> NoteKind {
     NoteKind::Deviation(DeviationId::D9(a))
 }
 
-/// Whether `l` imported with `kind` dropped and draws no HIDDEN+.
+/// HIDDEN+ with `extra` object fields and `dst` extra fields.
+fn hid(extra: &str, dst: &str) -> Loaded {
+    with(&hidden_object(extra), &[&hidden(dst)])
+}
+
+#[test]
+fn the_paint_rises_with_its_covers() {
+    // H = 600: lift 300 ‰ is 180 px and HIDDEN+ 500 ‰ of the 420 left is
+    // 210: LIFT's paint rises 180, cut at its fixed line 880; HIDDEN+'s
+    // rises 390, cut at its linked line, 880 raised to 700.
+    let objects = format!("{}, {}", hidden_object(""), lift_object(""));
+    let l = with(&objects, &[&hidden(""), &lift("")]);
+    assert_eq!(
+        shown(&l, [0, 300, 500]),
+        [[20, 490, 430, 210], [20, 700, 430, 180]]
+    );
+    // At rest, each lies at or below its line: nothing draws.
+    assert!(shown(&l, [0, 0, 0]).is_empty());
+    // The implicit offsets, listed again in any form, apply once.
+    let listed = hidden(r#""offset": 3, "offsets": [5, 3, 5]"#);
+    let lifted = lift(r#""offsets": [3, 3]"#);
+    let l = with(&objects, &[&listed, &lifted]);
+    assert_eq!(
+        shown(&l, [0, 300, 500]),
+        [[20, 490, 430, 210], [20, 700, 430, 180]]
+    );
+    assert!(!has(l.report(), NoteKind::RuntimeOffset(3)));
+}
+
+#[test]
+fn offset_four_adds_the_cover_once() {
+    // Lift 300 ‰ (180 px), the cover 500 ‰ of the 420 left (210 px):
+    // an untrimmed LIFT's paint listing offset 4, twice, moves 30 down.
+    let untrimmed = lift_object("").replace("200", "-1");
+    let l = with(&untrimmed, &[&lift(r#""offsets": [4, 4]"#)]);
+    assert_eq!(shown(&l, [500, 300, 0]), [[20, 910, 430, 200]]);
+    let motion = d9(LaneApprox::CoverMotion);
+    assert_eq!(
+        kinds(l.report()).iter().filter(|&&k| k == motion).count(),
+        1
+    );
+}
+
+#[test]
+fn the_trim_line_is_fixed_linked_or_absent() {
+    // HIDDEN+ at 1 000 ‰ over the default lanes at lift 200 ‰ (120 px):
+    // it rises 120 + 480; linked, its line rises to 760; fixed, it stays
+    // at 880; a negative line, or none, does not trim.
+    let view = [0, 200, 1_000];
+    assert_eq!(shown(&hid("", ""), view), [[20, 280, 430, 480]]);
+    let fixed = hid(r#""isDisapearLineLinkLift": false"#, "");
+    assert_eq!(shown(&fixed, view), [[20, 280, 430, 600]]);
+    for line in ["-1", "-200"] {
+        let l = with(&hidden_object("").replace("200", line), &[&hidden("")]);
+        assert_eq!(shown(&l, view), [[20, 280, 430, 600]], "{line}");
+    }
+    let unlined = hidden_object("").replace(
+        r#""disapearLine": 200"#,
+        r#""isDisapearLineLinkLift": true"#,
+    );
+    assert_eq!(
+        shown(&with(&unlined, &[&hidden("")]), view),
+        [[20, 280, 430, 600]]
+    );
+    // LIFT's line is fixed unless linked.
+    let linked = lift_object(r#""isDisapearLineLinkLift": true"#);
+    assert!(shown(&with(&linked, &[&lift("")]), [0, 200, 0]).is_empty());
+}
+
+#[test]
+fn the_trim_line_rounds_half_up() {
+    // r = 3/2: line 133 is 199.5 skin pixels up, 880.5 down, rounded to
+    // 881; LIFT's 300 px from 780 is cut 101 down.
+    let objects = format!("{}, {}", note(""), lift_object("").replace("200", "133"));
+    let l = import_sized([1_280, 720], &body("", &objects, &[NOTES, &lift("")]), &[]);
+    assert_eq!(
+        clipped(&l),
+        [([30, 780, 645, 300], Some([30, 780, 645, 101]))]
+    );
+}
+
+/// A 32×32 cell of `a.png` as `id`, trimmed at `line`, drawn by `dst`
+/// with `stretch`, without lanes.
+fn gated(id: &str, line: i32, stretch: i32, dst: [i32; 4]) -> Loaded {
+    let [x, y, w, h] = dst;
+    let object = format!(
+        r#""{id}": [{{"id": "c", "src": "a", "x": 0, "y": 0, "w": 32, "h": 32, "disapearLine": {line}}}]"#
+    );
+    let d = format!(
+        r#"{{"id": "c", "stretch": {stretch}, "dst": [{{"x": {x}, "y": {y}, "w": {w}, "h": {h}}}]}}"#
+    );
+    import_body(&body("", &object, &[&d]))
+}
+
+#[test]
+fn an_empty_gate_crossed_by_the_line_draws_nothing() {
+    // Stretch 9 keeps the 32×32 frame over the empty [0, 100, 0, 10]
+    // (y down): at 105 the part above the line has no area; at 120 the
+    // destination is wholly above it and the paint is whole.
+    for id in ["liftCover", "hiddenCover"] {
+        assert!(
+            clipped(&gated(id, 1_080 - 105, 9, [0, 970, 0, 10])).is_empty(),
+            "{id}"
+        );
+        assert_eq!(
+            clipped(&gated(id, 1_080 - 120, 9, [0, 970, 0, 10])),
+            [([-16, 89, 32, 32], None)],
+            "{id}"
+        );
+    }
+}
+
+#[test]
+fn the_unstretched_destination_gates_a_fitted_paint() {
+    // Stretch 4 fits the 32×32 frame to 100 px: [100, 110] (y down)
+    // becomes [55, 155]. Line 90: nothing, though the fit reaches above
+    // it; line 120: whole, reaching below it; line 105: cut to the
+    // destination above it.
+    let dst = [0, 970, 100, 10];
+    for id in ["liftCover", "hiddenCover"] {
+        assert!(clipped(&gated(id, 1_080 - 90, 4, dst)).is_empty(), "{id}");
+        assert_eq!(
+            clipped(&gated(id, 1_080 - 120, 4, dst)),
+            [([0, 55, 100, 100], None)],
+            "{id}"
+        );
+        assert_eq!(
+            clipped(&gated(id, 1_080 - 105, 4, dst)),
+            [([0, 55, 100, 100], Some([0, 100, 100, 5]))],
+            "{id}"
+        );
+    }
+    // The gate's keys are charged besides the paint's; an unstretched or
+    // untrimmed paint has none.
+    let keys = |line: i32, stretch: i32| gated("liftCover", line, stretch, dst).report().usage.keys;
+    assert_eq!(keys(975, 4), keys(-1, 4) + 1);
+    assert_eq!(keys(975, 0), keys(-1, 0));
+    assert_eq!(keys(975, 9), keys(-1, 9));
+}
+
+#[test]
+fn hidden_paint_shows_only_while_hidden_is_on() {
+    // On at 0 ‰, the paint stands where authored; off at any amount,
+    // nothing.
+    let untrimmed = hidden_object("").replace("200", "-1");
+    let l = with(&untrimmed, &[&hidden("")]);
+    assert_eq!(shown(&l, [0, 0, 0]), [[20, 880, 430, 600]]);
+    for amount in [0, 500] {
+        assert!(shown_with(&l, [0, 0, amount], false).is_empty(), "{amount}");
+    }
+    // Its switch, op 273, is an ordinary condition: compiled, either way.
+    let ops = |l: &Loaded| l.report().usage.ops;
+    let on = with(&untrimmed, &[&hidden(r#""op": [273]"#)]);
+    assert!(ops(&on) > ops(&l));
+    assert_eq!(shown(&on, [0, 0, 0]), [[20, 880, 430, 600]]);
+    let negated = with(&untrimmed, &[&hidden(r#""op": [-273]"#)]);
+    assert!(ops(&negated) > ops(&l));
+    assert!(shown(&negated, [0, 0, 0]).is_empty());
+    // Animated colour is noted: the source can skip the off alpha while
+    // the colour interpolates.
+    assert!(!has(l.report(), d9(LaneApprox::HiddenDisable)));
+    let fading = r#"{"id": "hid", "dst": [
+        {"time": 0, "x": 20, "y": -400, "w": 430, "h": 600, "a": 255},
+        {"time": 1000, "a": 0}]}"#;
+    let l = with(&untrimmed, &[fading]);
+    assert!(has(l.report(), d9(LaneApprox::HiddenDisable)));
+}
+
+#[test]
+fn every_destination_paints_in_its_place() {
+    // Two HIDDEN+ destinations, before the notes and after an image, and
+    // HIDDEN+ without lanes, at its authored rect.
+    let untrimmed = hidden_object("").replace("200", "-1");
+    let plain = r#"{"id": "deco", "dst": [{"x": 0, "y": 0, "w": 10, "h": 10}]}"#;
+    let l = import_body(&body(
+        "",
+        &format!("{}, {untrimmed}", note("")),
+        &[&hidden(""), NOTES, plain, &hidden("")],
+    ));
+    assert_eq!(
+        shown(&l, [0, 0, 0]),
+        [[20, 880, 430, 600], [0, 1_070, 10, 10], [20, 880, 430, 600]]
+    );
+    let l = import_body(&body("", &untrimmed, &[&hidden("")]));
+    assert_eq!(shown(&l, [0, 0, 0]), [[20, 880, 430, 600]]);
+}
+
+/// Whether `l` imported with `kind` dropped.
 #[track_caller]
 fn dropped(l: &Loaded, kind: NoteKind) {
     let r = l.report();
@@ -59,449 +245,63 @@ fn dropped(l: &Loaded, kind: NoteKind) {
         "{kind:?}: {:?}",
         r.notes
     );
-    assert_eq!(rects(l, [0, 0, 1_000]), Vec::<[i32; 4]>::new(), "{kind:?}");
 }
 
 #[test]
-fn hidden_plus_rises_from_its_destination() {
-    let l = hid("", "");
-    let r = l.report();
-    for a in [LaneApprox::HiddenStretch, LaneApprox::HiddenClip] {
-        assert!(!has(r, d9(a)), "{a:?}");
-    }
-    // Nothing at 0 ‰. 500 ‰ raises it 300 px: its upper edge at 580, cut
-    // at the lanes' lower edge. At 1 000 ‰ it covers the whole region.
-    assert_eq!(rects(&l, [0, 0, 0]), Vec::<[i32; 4]>::new());
-    assert_eq!(rects(&l, [0, 0, 500]), [[20, 580, 430, 300]]);
-    assert_eq!(rects(&l, [0, 0, 1_000]), [[20, 280, 430, 600]]);
-    // LIFT 200 ‰ (120 px) raises it and its linked trim; 500 ‰ of the
-    // 480 px left raises it 240 more: from 520 down to the raised 760.
-    assert_eq!(rects(&l, [0, 200, 500]), [[20, 520, 430, 240]]);
-    // Its own image, cached apart from every other one.
-    assert_eq!(
-        r.usage.images,
-        with("", &[]).report().usage.images + 1,
-        "one image more"
-    );
-}
-
-#[test]
-fn the_trim_line_is_fixed_linked_or_absent() {
-    // Unlinked, the trim stays at 880 under the raised line.
-    let fixed = hid(r#""isDisapearLineLinkLift": false"#, "");
-    assert_eq!(rects(&fixed, [0, 200, 500]), [[20, 520, 430, 360]]);
-    // A full lift leaves it no share, but it stays on: drawn after the
-    // judgment line, from the lanes' top (280) down to the fixed trim,
-    // and not at all under a linked one, raised to its upper edge.
-    let line = rects(&fixed, [0, 1_000, 0]);
-    assert_eq!(line.len(), 1);
-    let mut want = line.clone();
-    want.push([20, 280, 430, 600]);
-    assert_eq!(rects(&fixed, [0, 1_000, 500]), want);
-    assert_eq!(rects(&hid("", ""), [0, 1_000, 500]), line);
-    // 100 px higher, at rest 780: 100 ‰ raises it 60 to 720. A line at
-    // 300 trims it at 780, linked or not; none cuts it at the lanes.
-    let up = |obj: &str| {
-        with(
-            &hidden_object(obj),
-            &[&hidden("").replace(r#""y": -400"#, r#""y": -300"#)],
-        )
-    };
-    // (The last of a repeated field wins.)
-    let at300 = up(r#""disapearLine": 300"#);
-    assert_eq!(rects(&at300, [0, 0, 100]), [[20, 720, 430, 60]]);
-    let unlinked = up(r#""disapearLine": 300, "isDisapearLineLinkLift": false"#);
-    assert_eq!(rects(&unlinked, [0, 0, 100]), [[20, 720, 430, 60]]);
-    let none = with(
-        &hidden_object("").replace(r#""disapearLine": 200"#, r#""disapearLine": -1"#),
-        &[&hidden("").replace(r#""y": -400"#, r#""y": -300"#)],
-    );
-    assert_eq!(rects(&none, [0, 0, 100]), [[20, 720, 430, 160]]);
-    // Without the field there is no trim either: the default -1.
-    let absent = with(
-        &hidden_object("").replace(r#", "disapearLine": 200"#, ""),
-        &[&hidden("").replace(r#""y": -400"#, r#""y": -300"#)],
-    );
-    assert_eq!(rects(&absent, [0, 0, 100]), [[20, 720, 430, 160]]);
-    // Untrimmed, the source draws it below the lanes; risen 600 px from
-    // 780, above them.
-    for l in [&none, &absent, &at300] {
-        assert!(has(l.report(), d9(LaneApprox::HiddenClip)));
-    }
-    // From its default place untrimmed, only below them.
-    let below = with(
-        &hidden_object("").replace(r#""disapearLine": 200"#, r#""disapearLine": -1"#),
-        &[&hidden("")],
-    );
-    assert!(has(below.report(), d9(LaneApprox::HiddenClip)));
-    // 100 tall from 800, it rises at most to 200, never above a line at
-    // 980 (100), fixed or linked: the source never draws it, so nothing
-    // is drawn outside the lanes.
-    for link in ["false", "true"] {
-        let obj = hidden_object(&format!(r#""isDisapearLineLinkLift": {link}"#))
-            .replace(r#""disapearLine": 200"#, r#""disapearLine": 980"#);
-        let dst = hidden("").replace(
-            r#""y": -400, "w": 430, "h": 600"#,
-            r#""y": 180, "w": 430, "h": 100"#,
-        );
-        let l = with(&obj, &[&dst]);
-        assert!(!has(l.report(), d9(LaneApprox::HiddenClip)), "{link}");
-        for lift in [0, 300, 1_000] {
-            assert_eq!(
-                rects(&l, [0, lift, 1_000]),
-                rects(&l, [0, lift, 0]),
-                "{link} {lift}"
-            );
-        }
-    }
-}
-
-#[test]
-fn a_raised_trim_above_its_upper_edge_draws_nothing() {
-    // The source region's lower edge at 140, 580 high; HIDDEN+ hangs from
-    // it, its trim linked at 357. LIFT 300 ‰ (174) and HIDDEN+ 500 ‰ (203)
-    // raise its upper edge to 563, under the trim raised to 549.
-    let notes = note_with(&lane_rects(140, 580), "");
-    let objects = format!(
-        "{notes}, {}",
-        hidden_object("").replace(r#""disapearLine": 200"#, r#""disapearLine": 357"#)
-    );
-    let dst = r#"{"id": "hid", "dst": [{"x": 20, "y": -440, "w": 430, "h": 580}]}"#;
-    let l = import_body(&body("", &objects, &[NOTES, dst]));
-    assert_eq!(rects(&l, [0, 300, 500]), Vec::<[i32; 4]>::new());
-    // At 600 ‰ (243.6) it rises to 522.4, above the trim.
-    let q = quads(&l, [0, 300, 600]);
-    let upper = (940.0_f64 - 174.0 - 243.6) as f32;
-    assert_eq!(
-        q.iter().map(|q| q.rect).collect::<Vec<_>>(),
-        [[20.0, upper, 430.0, 549.0 - upper]]
-    );
-}
-
-#[test]
-fn fractional_edges_are_kept() {
-    // A 1280×720 skin scales by 1.5: the lanes' lower edge at 780 and 900
-    // high, HIDDEN+ 900 tall from 780, and a fixed line at 201 trims at
-    // 1 080 − 301.5 = 778.5. 500 ‰ raises it 450 to 330.
-    let objects = format!(
-        "{}, {}",
-        note(""),
-        hidden_object(r#""isDisapearLineLinkLift": false"#)
-            .replace(r#""disapearLine": 200"#, r#""disapearLine": 201"#)
-    );
-    let l = import_config(
-        [1_280, 720],
-        &body("", &objects, &[NOTES, &hidden("")]),
-        &[],
-        |_| {},
-    );
-    let q = quads(&l, [0, 0, 500]);
-    assert_eq!(
-        q.iter().map(|q| q.rect).collect::<Vec<_>>(),
-        [[30.0, 330.0, 645.0, 448.5]]
-    );
-    // Linked, LIFT 100 ‰ (90) raises the trim to 688.5 and the cover by
-    // 90 and 405: to 285.
-    let objects = format!(
-        "{}, {}",
-        note(""),
-        hidden_object("").replace(r#""disapearLine": 200"#, r#""disapearLine": 201"#)
-    );
-    let l = import_config(
-        [1_280, 720],
-        &body("", &objects, &[NOTES, &hidden("")]),
-        &[],
-        |_| {},
-    );
-    let q = quads(&l, [0, 100, 500]);
-    assert_eq!(
-        q.iter().map(|q| q.rect).collect::<Vec<_>>(),
-        [[30.0, 285.0, 645.0, 403.5]]
-    );
-}
-
-#[test]
-fn fit_width_hidden_plus_is_trimmed_after_its_stretch() {
-    // The 16×16 cell fit to 430 is 430 high, centred on the 600 px
-    // destination: its upper edge at 965. 500 ‰ raises it to 665, cut at
-    // 880. The source decides its trim against the unstretched
-    // destination: noted.
-    for mode in [4, 5] {
-        let l = hid("", &format!(r#""stretch": {mode}"#));
-        assert_eq!(rects(&l, [0, 0, 500]), [[20, 665, 430, 215]], "{mode}");
-        assert!(has(l.report(), d9(LaneApprox::HiddenStretch)), "{mode}");
-    }
-    // Without a trim line nothing is decided against it: not noted.
-    let none = hidden_object("").replace(r#""disapearLine": 200"#, r#""disapearLine": -1"#);
-    let l = with(&none, &[&hidden(r#""stretch": 4"#)]);
-    assert!(!has(l.report(), d9(LaneApprox::HiddenStretch)));
-    // Enlarged, it rises above where the source decides: a 43×10 cell
-    // fit to 430 is 100 high, centred on a 10 px destination at rest at
-    // [800, 810]. 500 ‰ raises them to [455, 555] and [500, 510]; a fixed
-    // line at 590 (490) leaves the unstretched edge below it, so the
-    // source draws nothing, and the model draws the stretched one down to
-    // the line.
-    let cell = |link: bool, line: i32| {
-        hidden_object(&format!(r#""isDisapearLineLinkLift": {link}"#))
-            .replace(
-                r#""x": 32, "y": 24, "w": 16, "h": 16"#,
-                r#""x": 0, "y": 0, "w": 43, "h": 10"#,
-            )
-            .replace(
-                r#""disapearLine": 200"#,
-                &format!(r#""disapearLine": {line}"#),
-            )
-    };
-    let small = hidden(r#""stretch": 4"#).replace(
-        r#""y": -400, "w": 430, "h": 600"#,
-        r#""y": 270, "w": 430, "h": 10"#,
-    );
-    let whole = quads(&with(&cell(false, -1), &[&small]), [0, 0, 500]);
-    let [w] = &whole[..] else {
-        panic!("one HIDDEN+: {whole:?}");
-    };
-    assert_eq!(w.rect, [20.0, 455.0, 430.0, 100.0]);
-    let objects = format!("{}, {}", note(""), cell(false, 590));
-    let text = body("", &objects, &[NOTES, &small]);
-    let l = import_body(&text);
-    let cut = quads(&l, [0, 0, 500]);
-    let [q] = &cut[..] else {
-        panic!("one HIDDEN+: {cut:?}");
-    };
-    let [u0, v0, u1, v1] = w.uv;
-    assert_eq!(q.rect, [20.0, 455.0, 430.0, 35.0]);
-    assert_eq!(q.uv, [u0, v0, u1, v0 + (v1 - v0) * 0.35]);
-    // Noted at its destination, which the body starts on the skin's
-    // second line.
-    let found: Vec<_> = l
-        .report()
-        .notes
-        .iter()
-        .filter(|n| n.kind == d9(LaneApprox::HiddenStretch))
-        .map(|n| n.at.map(|at| (at.line, at.col)))
-        .collect();
-    let before = &text[..text.find(r#"{"id": "hid", "stretch""#).unwrap()];
-    let line = 2 + before.matches('\n').count();
-    let col = before.rsplit('\n').next().unwrap().len() + 1;
-    let at = [line, col].map(|v| u32::try_from(v).unwrap());
-    assert_eq!(found, [Some((at[0], at[1]))]);
-    // The source decides whether to draw it from the unstretched edge,
-    // which must pass strictly above the line. Risen by the lane's 600 px,
-    // the 10 px destination reaches 200: a line at 890 (190), fixed or
-    // linked, keeps it from ever drawing, though the stretched edge
-    // reaches 155. A destination without height at 800 also reaches 200:
-    // a line at 880 (200) or 881 (199) keeps it from drawing. A line at
-    // 879 (201) lets either draw above the lanes, the flat one's stretched
-    // [750, 850] at rest.
-    let flat = hidden(r#""stretch": 4"#).replace(
-        r#""y": -400, "w": 430, "h": 600"#,
-        r#""y": 280, "w": 430, "h": 0"#,
-    );
-    for link in [false, true] {
-        for (h, dst, line, outside) in [
-            (10, &small, 890, false),
-            (10, &small, 879, true),
-            (0, &flat, 880, false),
-            (0, &flat, 881, false),
-            (0, &flat, 879, true),
-        ] {
-            let r = with(&cell(link, line), &[dst]);
-            let case = format!("h {h}, line {line}, linked {link}");
-            assert!(has(r.report(), d9(LaneApprox::HiddenStretch)), "{case}");
-            assert_eq!(
-                has(r.report(), d9(LaneApprox::HiddenClip)),
-                outside,
-                "{case}"
-            );
-        }
-    }
-    // Once the unstretched lower edge is at or above the trim, the source
-    // draws the stretched one whole, past the trim: a 64×1 cell fit to 430
-    // is 6.72 high, centred on [876, 880] at [874.64, 881.36], so under a
-    // line at 200 (880), even at 1 ‰ (0.6 px), it reaches below the lanes.
-    let thin = hidden_object("").replace(
-        r#""x": 32, "y": 24, "w": 16, "h": 16"#,
-        r#""x": 0, "y": 0, "w": 64, "h": 1"#,
-    );
-    let low = hidden(r#""stretch": 4"#).replace(
-        r#""y": -400, "w": 430, "h": 600"#,
-        r#""y": 200, "w": 430, "h": 4"#,
-    );
-    assert!(has(
-        with(&thin, &[&low]).report(),
-        d9(LaneApprox::HiddenClip)
-    ));
-    // A 16×32 cell fit to 430 would be 860 high: stretch 5 keeps the
-    // destination and crops the cell's middle rows, as SUDDEN+.
-    let tall = hidden_object("").replace(r#""h": 16"#, r#""h": 32"#);
-    let l = with(&tall, &[&hidden(r#""stretch": 5"#)]);
-    assert_eq!(rects(&l, [0, 0, 500]), [[20, 580, 430, 300]]);
-    assert!(!has(l.report(), d9(LaneApprox::HiddenStretch)));
-    // A grid cannot crop: dropped.
-    let grid = hidden_object("").replace(
-        r#""x": 32, "y": 24, "w": 16, "h": 16"#,
-        r#""x": 32, "y": 0, "w": 16, "h": 64, "divy": 2"#,
-    );
+fn unsupported_hidden_plus_is_dropped() {
+    // A trimming stretch.
+    dropped(&hid("", r#""stretch": 3"#), NoteKind::Stretch(3));
+    // A trimmed destination of negative height.
+    let flipped = hidden("").replace(r#""h": 600"#, r#""h": -600"#);
     dropped(
-        &with(&grid, &[&hidden(r#""stretch": 5"#)]),
-        NoteKind::Stretch(5),
+        &with(&hidden_object(""), &[&flipped]),
+        NoteKind::UnsupportedField { field: "dst" },
     );
-}
-
-#[test]
-fn hidden_plus_shares_its_file_with_sudden_plus() {
-    // SUDDEN+ draws `cover` of `a.png`; HIDDEN+ its own cell of it.
-    let alone = with("", &[&cover("")]);
-    let both = with(&hidden_object(""), &[&cover(""), &hidden("")]);
-    let (a, b) = (alone.report().usage, both.report().usage);
-    assert_eq!((b.images, b.files), (a.images + 1, a.files));
-}
-
-#[test]
-fn its_switch_is_the_amount() {
-    // A positive op 273, by number or name, or `draw` 273: HIDDEN+ is
-    // drawn exactly while its amount is above 0.
-    for extra in [
-        r#""op": [273]"#,
-        r#""op": [273, 273]"#,
-        r#""op": ["hidden1_on"]"#,
-        r#""op": ["!!hidden1_on"]"#,
-        r#""draw": 273"#,
-        r#""draw": "hidden1_on""#,
-    ] {
-        let l = hid("", extra);
-        assert_eq!(rects(&l, [0, 0, 0]), Vec::<[i32; 4]>::new(), "{extra}");
-        assert_eq!(rects(&l, [0, 0, 500]), [[20, 580, 430, 300]], "{extra}");
-    }
-    // Its negation is unsupported, as the global switch.
-    let neg = |id| NoteKind::UnsupportedProperty {
-        kind: PropertyKind::Boolean,
-        id: Some(id),
-    };
-    dropped(&hid("", r#""op": [-273]"#), neg(-273));
-    dropped(&hid("", r#""op": ["!hidden1_on"]"#), neg(-273));
-}
-
-#[test]
-fn lift_and_hidden_offsets_are_its_geometry() {
-    // Offsets 3 and 5, however listed, are what the model moves it by.
-    for extra in [
-        r#""offset": 5"#,
-        r#""offset": 3"#,
-        r#""offsets": [3, 5, 5], "offset": 3"#,
-        r#""offsets": [5]"#,
-    ] {
-        let l = hid("", extra);
-        assert_eq!(rects(&l, [0, 200, 500]), [[20, 520, 430, 240]], "{extra}");
-    }
-    for id in [1, 2, 4] {
-        dropped(
-            &hid("", &format!(r#""offset": {id}"#)),
-            NoteKind::RuntimeOffset(id),
-        );
-    }
-}
-
-#[test]
-fn hidden_plus_outside_the_subset_is_dropped() {
-    let dst = NoteKind::UnsupportedField { field: "dst" };
-    let at = |rect: &str| hidden("").replace(r#""x": 20, "y": -400, "w": 430, "h": 600"#, rect);
-    for d in [
-        // Not across the lanes, without height, or of negative height.
-        at(r#""x": 20, "y": -400, "w": 215, "h": 600"#),
-        at(r#""x": 20, "y": -400, "w": 430, "h": 0"#),
-        at(r#""x": 20, "y": -400, "w": 430, "h": -1"#),
-        // Rotated, coloured, translucent or animated.
-        at(r#""x": 20, "y": -400, "w": 430, "h": 600, "angle": 10"#),
-        at(r#""x": 20, "y": -400, "w": 430, "h": 600, "r": 0"#),
-        at(r#""x": 20, "y": -400, "w": 430, "h": 600, "a": 200"#),
-        hidden(r#""loop": -1"#).replace(
-            r#""dst": [{"x": 20, "y": -400, "w": 430, "h": 600}]"#,
-            r#""dst": [{"time": 0, "x": 20, "y": -400, "w": 430, "h": 600, "a": 0},
-                       {"time": 1600, "x": 20, "y": -400, "w": 430, "h": 600}]"#,
-        ),
-        // Its own timer, conditions or blend.
-        hidden(r#""timer": 41"#),
-        hidden(r#""op": [240]"#),
-        hidden(r#""op": [273, 240]"#),
-        hidden(r#""blend": 2"#),
-    ] {
-        dropped(&with(&hidden_object(""), &[&d]), dst);
-    }
-    dropped(&hid("", r#""stretch": 1"#), NoteKind::Stretch(1));
-    // A negative height, even where a stretch would give it one.
-    let negative = hidden(r#""stretch": 4"#).replace(r#""h": 600"#, r#""h": -1"#);
-    dropped(&with(&hidden_object(""), &[&negative]), dst);
-    // Before the notes, or a second one.
-    let early = import_body(&body(
-        "",
-        &format!("{}, {}", note(""), hidden_object("")),
-        &[&hidden(""), NOTES],
-    ));
-    dropped(
-        &early,
-        NoteKind::UnsupportedField {
-            field: "hiddenCover",
-        },
-    );
-    let twice = with(&hidden_object(""), &[&hidden(""), &hidden("")]);
-    assert!(has(
-        twice.report(),
-        NoteKind::UnsupportedField {
-            field: "hiddenCover"
-        }
-    ));
-    assert_eq!(rects(&twice, [0, 0, 500]), [[20, 580, 430, 300]]);
-    // A missing file.
-    let missing = hidden_object("").replace(r#""src": "a""#, r#""src": "nothing""#);
-    dropped(&with(&missing, &[&hidden("")]), NoteKind::MissingAsset);
-    // A user offset moving it.
-    let header = r#""offset": [{"name": "y", "id": 40, "y": true}]"#;
+    // A configured offset 5 moving it other than up.
+    let header = r#""offset": [{"name": "h", "id": 5, "x": true}]"#;
     let objects = format!("{header}, {}, {}", note(""), hidden_object(""));
-    let moved = import_config(
+    let l = common::import_config(
         [1_920, 1_080],
-        &body("", &objects, &[NOTES, &hidden(r#""offsets": [40]"#)]),
+        &body("", &objects, &[NOTES, &hidden("")]),
         &[],
         |c: &mut Config| {
             c.offsets.insert(
-                40,
+                5,
                 OffsetValue {
-                    y: 1,
+                    x: 3,
                     ..OffsetValue::default()
                 },
             );
         },
     );
-    dropped(&moved, dst);
+    dropped(&l, NoteKind::RuntimeOffset(5));
 }
 
 #[test]
-fn hidden_plus_is_drawn_where_its_destination_stands() {
-    // LIFT and HIDDEN+ under a fixed trim overlap from 760 at LIFT
-    // 200 ‰, HIDDEN+ 500 ‰; whichever destination comes later is drawn
-    // above, as in the source, with nothing noted.
-    let fixed = format!(
-        "{}, {}",
-        lift_object(""),
-        hidden_object(r#""isDisapearLineLinkLift": false"#)
-    );
-    let (hidden_rect, lift_rect) = ([20, 520, 430, 360], [20, 760, 430, 120]);
-    let mut notes = Vec::new();
-    for (dsts, want) in [
-        ([lift(""), hidden("")], [lift_rect, hidden_rect]),
-        ([hidden(""), lift("")], [hidden_rect, lift_rect]),
+fn a_negative_size_rounding_to_zero_is_still_refused() {
+    // At 3840×2160 (r = 1/2) a width of −1 is −0.5 reference pixels and
+    // its edges round to one x; a height of −1 from y 1941 likewise. The
+    // line 1920 is at 120, below either rect [0, 100, 0, 10] or
+    // [0, 110, 10, 0]: an unchecked stretch-9 paint would draw whole.
+    for key in [
+        r#"{"x": 0, "y": 1940, "w": -1, "h": 20}"#,
+        r#"{"x": 0, "y": 1941, "w": 20, "h": -1}"#,
     ] {
-        let dsts: Vec<&str> = dsts.iter().map(String::as_str).collect();
-        let l = with(&fixed, &dsts);
-        assert_eq!(rects(&l, [0, 200, 500]), want, "{dsts:?}");
-        let kinds: Vec<NoteKind> = l.report().notes.iter().map(|n| n.kind).collect();
-        notes.push(kinds);
+        let at = |object: &str, id: &str| {
+            let objects = format!("{}, {}", note(""), object.replace("200", "1920"));
+            let dst = format!(r#"{{"id": "{id}", "stretch": 9, "dst": [{key}]}}"#);
+            import_sized([3_840, 2_160], &body("", &objects, &[NOTES, &dst]), &[])
+        };
+        dropped(
+            &at(&hidden_object(""), "hid"),
+            NoteKind::UnsupportedField { field: "dst" },
+        );
+        match at(&lift_object(""), "liftc").err() {
+            ImportError::Critical { part, why, .. } => {
+                assert_eq!(part, CriticalPart::Lift, "{key}");
+                assert_eq!(why, NoteKind::UnsupportedField { field: "dst" }, "{key}");
+            }
+            e => panic!("{key}: {e:?}"),
+        }
     }
-    // The order adds no note.
-    assert_eq!(notes[0], notes[1]);
-    // An element kept between the notes and HIDDEN+ is drawn below it.
-    let plain = r#"{"id": "deco", "dst": [{"x": 0, "y": 0, "w": 10, "h": 10}]}"#;
-    let l = with(&hidden_object(""), &[plain, &hidden("")]);
-    let all = rects(&l, [0, 0, 500]);
-    assert_eq!(all.last(), Some(&[20, 580, 430, 300]), "{all:?}");
 }
