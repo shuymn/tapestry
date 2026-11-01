@@ -325,6 +325,12 @@ impl MenuScreen {
         self.sent = Some(area);
     }
 
+    /// Its renderer, for the tests that draw on it directly.
+    #[cfg(test)]
+    pub(crate) const fn renderer_mut(&mut self) -> &mut Renderer {
+        &mut self.renderer
+    }
+
     /// Tells the window a frame was `presented`, with nothing allocated (a
     /// play's frame calls it); passes it on.
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
@@ -357,7 +363,8 @@ impl Screen for MenuScreen {
         };
         Some(match done {
             Ok(()) => Ok(Preparation::Ready),
-            Err(e) if e.is_refusal() => Ok(refusal(e.to_string())),
+            // The whole chain: the skin's or the device's own reason too.
+            Err(e) if e.is_refusal() => Ok(refusal(game::Chain(&e).to_string())),
             Err(e) => Err(e),
         })
     }

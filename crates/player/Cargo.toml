@@ -50,6 +50,7 @@ winit.workspace = true
 
 [dev-dependencies]
 bms-parser.workspace = true
+png.workspace = true
 rusqlite.workspace = true
 tempfile.workspace = true
 toml.workspace = true

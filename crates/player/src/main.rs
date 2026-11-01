@@ -50,6 +50,15 @@ mod shelf;
 mod tuning;
 mod window;
 
+// The render crate's WARP helpers and declarative skin fixtures, for the
+// tests that drive a real menu screen.
+#[cfg(test)]
+#[path = "../../render/tests/common/mod.rs"]
+mod render_common;
+#[cfg(test)]
+#[path = "../../render/tests/decl_support/mod.rs"]
+mod render_decl;
+
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;

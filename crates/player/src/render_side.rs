@@ -5532,4 +5532,308 @@ mod tests {
         let playing = logic.view().playing;
         assert!(frames.iter().all(|&(_, p)| p == playing));
     }
+
+    /// What the [`Probe`]s of one render thread saw.
+    #[derive(Debug, Default)]
+    struct Probed {
+        /// Per restore: whether the bundle installed is the one restored,
+        /// the resource generation, and a frame drawn at once.
+        restores: Vec<(bool, u64, Probing)>,
+        /// Per ready preparation: the atlas bytes staged beside the
+        /// installed atlas.
+        staged_atlas: Vec<u64>,
+        /// Per commit: the resource generation and a frame drawn at once.
+        commits: Vec<(u64, Probing)>,
+    }
+
+    /// A probe frame's sprites and its halves' centres (RGB), or its
+    /// error.
+    type Probing = Result<(usize, [[u8; 3]; 2]), RenderError>;
+
+    const RED: [u8; 3] = [255, 0, 0];
+    const BLACK: [u8; 3] = [0; 3];
+
+    /// A real menu screen on WARP whose menu frames fail while `fail` is
+    /// set, so the render thread drops it and builds another. It notes
+    /// what its renderer installed and stages, and draws a play frame of
+    /// [`crate::render_common::view`] with `gauges` gauges straight after
+    /// each restore and each commit ([`Probed`]).
+    struct Probe {
+        menu: crate::menu_screen::MenuScreen,
+        fail: Arc<AtomicBool>,
+        gauges: Arc<std::sync::atomic::AtomicUsize>,
+        probed: Arc<std::sync::Mutex<Probed>>,
+    }
+
+    impl Probe {
+        /// A frame of the installed skin at chart time 0, read back.
+        fn frame(&mut self) -> Probing {
+            let mut v = crate::render_common::view(0, 0);
+            let gauge = v.gauges[0];
+            v.gauges.resize(self.gauges.load(Ordering::Acquire), gauge);
+            let r = self.menu.renderer_mut();
+            let f = crate::render_common::input(&v, TimeUs(0), TimeUs(0), &[]);
+            let sprites = r.frame(&f)?.sprites;
+            let p = r.read_back();
+            let px = |x: usize| {
+                let i = (540 * 1_920 + x) * 4;
+                [p[i], p[i + 1], p[i + 2]]
+            };
+            Ok((sprites, [px(480), px(1_440)]))
+        }
+
+        fn probed(&self) -> std::sync::MutexGuard<'_, Probed> {
+            self.probed.lock().unwrap()
+        }
+    }
+
+    impl Screen for Probe {
+        fn load(
+            &mut self,
+            chart: &Chart,
+            section: Option<&eval::Section>,
+        ) -> Result<(), RenderError> {
+            self.menu.load(chart, section)
+        }
+        fn prepare_attempt(
+            &mut self,
+            a: &render::AttemptInput<'_>,
+            skin: Option<&Arc<render::SkinBundle>>,
+            request: u64,
+        ) -> Option<Result<Preparation, RenderError>> {
+            let answer = self.menu.prepare_attempt(a, skin, request);
+            if matches!(answer, Some(Ok(Preparation::Ready))) {
+                let staged = self.menu.renderer_mut().memory().staged_atlas;
+                self.probed().staged_atlas.push(staged);
+            }
+            answer
+        }
+        fn device(&self) -> u64 {
+            self.menu.device()
+        }
+        fn commit(&mut self, token: render::PreparedToken) -> Result<(), render::CommitError> {
+            self.menu.commit(token)?;
+            let generation = self.menu.renderer_mut().resource_generation();
+            let drew = self.frame();
+            self.probed().commits.push((generation, drew));
+            Ok(())
+        }
+        fn discard(&mut self) {
+            self.menu.discard();
+        }
+        fn restore(&mut self, bundle: &Arc<render::SkinBundle>) -> Result<(), RenderError> {
+            self.menu.restore(bundle)?;
+            let r = self.menu.renderer_mut();
+            let same = r.installed().is_some_and(|i| Arc::ptr_eq(i, bundle));
+            let generation = r.resource_generation();
+            let drew = self.frame();
+            self.probed().restores.push((same, generation, drew));
+            Ok(())
+        }
+        fn wait(&self) -> bool {
+            self.menu.wait()
+        }
+        fn paced(&self) -> bool {
+            self.menu.paced()
+        }
+        fn build(&mut self, f: &FrameInput<'_>) -> Result<(), skin_model::BuildError> {
+            self.menu.build(f)
+        }
+        fn draw(&mut self) -> Result<FrameTiming, RenderError> {
+            self.menu.draw()
+        }
+        fn text(&mut self, lines: &[&str]) -> Result<bool, RenderError> {
+            self.menu.text(lines)
+        }
+        fn menu(
+            &mut self,
+            page: &crate::menu_screen::MenuPage,
+            changed: bool,
+        ) -> Result<FrameTiming, RenderError> {
+            if self.fail.load(Ordering::Acquire) {
+                return Err(RenderError::SurfaceLost);
+            }
+            self.menu.menu(page, changed)
+        }
+        fn loading(
+            &mut self,
+            page: &crate::menu_screen::MenuPage,
+            update: Option<&LoadingUpdate>,
+            changed: bool,
+        ) -> Result<FrameTiming, RenderError> {
+            self.menu.loading(page, update, changed)
+        }
+        fn resize(&mut self, width: u32, height: u32) {
+            self.menu.resize(width, height);
+        }
+        fn target(&self) -> [u32; 2] {
+            self.menu.target()
+        }
+        #[cfg(feature = "dev-tools")]
+        fn read_back(&self) -> Option<(u32, u32, Vec<u8>)> {
+            self.menu.read_back()
+        }
+    }
+
+    /// The attempt of `chart` the game would make under `preset`: the
+    /// whole chart or `section`'s round, titled "T".
+    fn preset_attempt(
+        chart: &Chart,
+        preset: &rules::RulePreset,
+        section: Option<&eval::Section>,
+    ) -> AttemptContext {
+        let labels = game::ChartLabels {
+            title: "T".to_owned(),
+            ..game::ChartLabels::default()
+        };
+        let attempt = game::Attempt::new(
+            1,
+            preset,
+            TimeUs(1_000_000),
+            section,
+            game::NoteEnd::Play.of(chart),
+            &labels,
+        );
+        AttemptContext::new(attempt, crate::attempt_context::SIMPLE_SCRATCH)
+    }
+
+    /// Through the render thread's own screen drop and recovery, a real
+    /// menu screen built again restores the committed bundle from memory,
+    /// its image files deleted: installed at once and drawing nothing
+    /// without an attempt, its resources reused by every later attempt.
+    /// Each attempt starts fresh from its own preset: one counting empty
+    /// POORs refuses the frames of a snapshot with more of them than
+    /// POORs, and the retry after it, its gauges reordered and empty POORs
+    /// apart, draws; a practice round of a one-gauge preset prepares with
+    /// one initial gauge, which the two-gauge preset before it would
+    /// refuse. Each attempt's text is prepared afresh, and a refused text
+    /// refuses the attempt with the producer's own reason.
+    #[test]
+    fn a_menu_screen_built_again_restores_the_bundle_and_starts_each_attempt_afresh() {
+        use crate::render_decl::{Look, bundle};
+
+        let chart = Arc::new(ChartBuilder::new(120_000).build().unwrap());
+        let dir = tempfile::tempdir().unwrap();
+        let look = Look {
+            text: true,
+            ..Look::left([255, 0, 0, 255])
+        };
+        let (skin, text) = bundle(
+            &crate::render_common::offscreen(1_920, 1_080),
+            dir.path(),
+            &look,
+        );
+        let text = text.unwrap();
+        let fail = Arc::new(AtomicBool::new(false));
+        let gauges = Arc::new(std::sync::atomic::AtomicUsize::new(2));
+        let probed = Arc::new(std::sync::Mutex::new(Probed::default()));
+        let builds = Arc::new(AtomicU32::new(0));
+        let (f, g, p, b) = (
+            Arc::clone(&fail),
+            Arc::clone(&gauges),
+            Arc::clone(&probed),
+            Arc::clone(&builds),
+        );
+        let make: MakeScreen = Box::new(move || {
+            b.fetch_add(1, Ordering::SeqCst);
+            let renderer = render::Renderer::new(
+                render::Target::Offscreen {
+                    width: 1_920,
+                    height: 1_080,
+                },
+                render::AdapterChoice::Warp,
+            )?;
+            Ok(Box::new(Probe {
+                menu: crate::menu_screen::MenuScreen::new(renderer, None),
+                fail: Arc::clone(&f),
+                gauges: Arc::clone(&g),
+                probed: Arc::clone(&p),
+            }) as Box<dyn Screen>)
+        });
+        let link = spawn_empty(make);
+        link.load(Arc::clone(&chart), None).unwrap();
+        link.select(Some(Arc::clone(&skin)));
+        let ready = |preset: &rules::RulePreset, section: Option<&eval::Section>| {
+            link.prepare_attempt(preset_attempt(&chart, preset, section), || false)
+        };
+
+        // The first attempt uploads the bundle and draws it.
+        assert_eq!(ready(&rules::tapestry(), None).unwrap(), Preparation::Ready);
+        link.commit_attempt().unwrap();
+        dir.close().unwrap();
+
+        // The screen fails and is dropped; the next attempt builds another.
+        fail.store(true, Ordering::Release);
+        link.send(RenderMsg::Menu(Box::default()));
+        assert!(wait_until(|| link.failed()));
+        fail.store(false, Ordering::Release);
+        let mut counted = rules::tapestry();
+        counted.empty_poor.counted = true;
+        assert_eq!(ready(&counted, None).unwrap(), Preparation::Ready);
+        link.commit_attempt().unwrap();
+        assert_eq!(builds.load(Ordering::SeqCst), 2);
+
+        // A retry with the gauges reordered and empty POORs apart.
+        let mut reordered = rules::tapestry();
+        reordered.gauges.reverse();
+        assert_eq!(ready(&reordered, None).unwrap(), Preparation::Ready);
+        link.commit_attempt().unwrap();
+
+        // A practice round of a one-gauge preset.
+        let mut one = rules::tapestry();
+        one.gauges.truncate(1);
+        gauges.store(1, Ordering::Release);
+        let round = eval::Section {
+            start: TimeUs(0),
+            end: TimeUs(1_000_000),
+            lead_in: TimeUs(2_000_000),
+            initial_gauges: vec![rules::GaugeValue(20 * rules::GaugeValue::PERCENT)],
+        };
+        assert_eq!(ready(&one, Some(&round)).unwrap(), Preparation::Ready);
+        link.commit_attempt().unwrap();
+        assert_eq!(text.calls.load(Ordering::SeqCst), 4, "each attempt's text");
+
+        // A refused text: the producer's reason reaches the refusal.
+        text.refuse.store(true, Ordering::SeqCst);
+        let refused = ready(&rules::tapestry(), None).unwrap();
+        let Preparation::Refused(refusal) = refused else {
+            panic!("{refused:?}");
+        };
+        assert!(
+            refusal.reason.contains("the text cannot be prepared"),
+            "{}",
+            refusal.reason
+        );
+        assert!(!link.failed());
+        link.exit();
+        assert_eq!(builds.load(Ordering::SeqCst), 2);
+
+        let probed = probed.lock().unwrap();
+        // The second screen restored the very bundle, files gone, before
+        // anything else: installed, and nothing drawn without an attempt.
+        let [(same, restored, drew)] = &probed.restores[..] else {
+            panic!("{:?}", probed.restores);
+        };
+        assert!(same, "the restored bundle is not installed");
+        assert!(matches!(drew, Ok((0, [BLACK, BLACK]))), "{drew:?}");
+        // Uploaded once per screen: the restore's resources are reused.
+        assert!(probed.staged_atlas[0] > 0);
+        assert_eq!(probed.staged_atlas[1..], [0, 0, 0]);
+        let generations: Vec<u64> = probed.commits.iter().map(|c| c.0).collect();
+        assert_eq!(generations[1..], [*restored; 3]);
+        let drew: Vec<&Probing> = probed.commits.iter().map(|c| &c.1).collect();
+        assert!(matches!(drew[0], Ok((2, [RED, BLACK]))), "{:?}", drew[0]);
+        assert!(
+            matches!(
+                drew[1],
+                Err(RenderError::Build(
+                    skin_model::BuildError::InconsistentTally
+                ))
+            ),
+            "{:?}",
+            drew[1]
+        );
+        assert!(matches!(drew[2], Ok((2, [RED, BLACK]))), "{:?}", drew[2]);
+        assert!(matches!(drew[3], Ok((2, [RED, BLACK]))), "{:?}", drew[3]);
+    }
 }
