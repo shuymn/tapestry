@@ -490,6 +490,10 @@ fn one_renderer_resized_minimized_and_restored() {
             .unwrap()
             .presented
     );
+    // An offscreen frame waits at most 100 ms for the one before and is
+    // skipped past it; the first frame on WARP can take longer, so it is
+    // waited for here, as every frame shown below is by its read back.
+    let _ = r.read_back();
     let shown = |r: &mut Renderer, (w, h): (u32, u32), (l5, l7, row): (u32, u32, f64)| {
         r.resize(w, h);
         assert!(!r.is_minimized());
