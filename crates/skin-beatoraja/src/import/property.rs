@@ -473,19 +473,91 @@ pub(crate) fn int_by_name(name: &str) -> Option<IntProp> {
 /// properties, where 40 resolves to nothing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum IndexProp {
+    /// The factory returns null: the source selects entry 0
+    /// (`SkinImage.java:123-125`).
+    Null,
     /// `gaugetype_1p` (40, `IntegerPropertyFactory.java:1128-1135`): the
     /// shown gauge's type, 0-5 in ordinary play, read from `gauge.kind`
     /// while `gauge.valid`.
     GaugeKind,
-    /// Any other id: the model reads none.
+    /// `lanecover`, `lift`, `hidden` (330-332, `:1261-1295`): whether
+    /// each cover is switched on, read from the play's current switches.
+    /// The source reads the configuration's flags while its lanes draw
+    /// from a copy (`LaneRenderer.java:91`), so a switch toggled in play
+    /// (`ControlInputProcessor.java:162-166`) changes ours, not its.
+    CoverEnabled,
+    LiftEnabled,
+    HiddenEnabled,
+    /// A property the model has no value for.
     Unsupported(i32),
 }
+
+impl IndexProp {
+    /// The integer selector in the model: `None` for an unsupported one.
+    /// The gauge's type compares `gauge.kind` with every variant, never
+    /// casting it, and hides while the gauge is invalid.
+    pub(crate) fn selector(self) -> Option<&'static str> {
+        Some(match self {
+            Self::Null => "0",
+            Self::GaugeKind => {
+                "if gauge.valid then (if gauge.kind == assist_easy then 0 \
+                 else if gauge.kind == easy then 1 else if gauge.kind == normal then 2 \
+                 else if gauge.kind == hard then 3 else if gauge.kind == ex_hard then 4 \
+                 else if gauge.kind == hazard then 5 else -1) else -1"
+            }
+            Self::CoverEnabled => "if cover.enabled then 1 else 0",
+            Self::LiftEnabled => "if lift.enabled then 1 else 0",
+            Self::HiddenEnabled => "if hidden.enabled then 1 else 0",
+            Self::Unsupported(_) => return None,
+        })
+    }
+
+    /// Whether the selector differs from the source in an owner-decided
+    /// way (D4): the gauge's type projected onto the six looks, and the
+    /// switches read from the play rather than the configuration.
+    pub(crate) fn deviates(self) -> bool {
+        !matches!(self, Self::Null | Self::Unsupported(_))
+    }
+}
+
+/// The image-index ids the factory knows besides the supported ones
+/// (`IntegerPropertyFactory.java:920-961, 1088-1383`): the `IndexType`
+/// entries, the ranking patterns 380-399, the skin-selection ids
+/// (`SkinPropertyMapper.java:101-104`) and the judge readings 500-519 and
+/// 1510-1699 (`SkinProperty.java:1054-1067`).
+const INDEX_KNOWN: &[(i32, i32)] = &[
+    (10, 12),
+    (42, 43),
+    (54, 55),
+    (61, 63),
+    (72, 72),
+    (75, 75),
+    (78, 78),
+    (89, 90),
+    (170, 185),
+    (301, 308),
+    (321, 324),
+    (340, 343),
+    (350, 353),
+    (360, 361),
+    (370, 371),
+    (380, 399),
+    (400, 400),
+    (450, 466),
+    (469, 469),
+    (500, 519),
+    (1_510, 1_699),
+];
 
 /// The image-index property `id`.
 pub(crate) fn index_by_id(id: i32) -> IndexProp {
     match id {
         40 => IndexProp::GaugeKind,
-        _ => IndexProp::Unsupported(id),
+        330 => IndexProp::CoverEnabled,
+        331 => IndexProp::LiftEnabled,
+        332 => IndexProp::HiddenEnabled,
+        _ if INDEX_KNOWN.iter().any(|&(a, b)| (a..=b).contains(&id)) => IndexProp::Unsupported(id),
+        _ => IndexProp::Null,
     }
 }
 
@@ -647,5 +719,45 @@ mod tests {
             str_by_name("targetnamep10"),
             Some(StrProp::Unsupported(None))
         );
+    }
+
+    #[test]
+    fn image_indices_resolve() {
+        // Each known range's ends are known, one past them null.
+        for &(a, b) in INDEX_KNOWN {
+            assert_eq!(index_by_id(a), IndexProp::Unsupported(a));
+            assert_eq!(index_by_id(b), IndexProp::Unsupported(b));
+        }
+        for id in [
+            0, 1, 9, 13, 41, 44, 186, 300, 309, 329, 333, 467, 468, 520, 1_700,
+        ] {
+            assert_eq!(index_by_id(id), IndexProp::Null, "{id}");
+        }
+        assert!(INDEX_KNOWN.windows(2).all(|w| w[0].1 < w[1].0));
+        // The whole of 450-466 is known (`IntegerPropertyFactory.java:1369`
+        // among them).
+        for id in 450..=466 {
+            assert_eq!(index_by_id(id), IndexProp::Unsupported(id), "{id}");
+        }
+        let scope = skin_model::Scope::new(&skin_model::PLAY);
+        let ops = |p: IndexProp| {
+            let src = p.selector().unwrap();
+            skin_model::compile(src, &scope, skin_model::Ty::Int)
+                .unwrap()
+                .op_count()
+        };
+        for (id, p, n) in [
+            (40, IndexProp::GaugeKind, 34),
+            (330, IndexProp::CoverEnabled, 4),
+            (331, IndexProp::LiftEnabled, 4),
+            (332, IndexProp::HiddenEnabled, 4),
+        ] {
+            assert_eq!(index_by_id(id), p);
+            assert!(p.deviates());
+            assert_eq!(ops(p), n, "{id}");
+        }
+        assert_eq!(ops(IndexProp::Null), 1);
+        assert!(!IndexProp::Null.deviates());
+        assert_eq!(IndexProp::Unsupported(42).selector(), None);
     }
 }

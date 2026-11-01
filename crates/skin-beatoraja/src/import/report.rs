@@ -305,6 +305,8 @@ pub struct Usage {
     pub kernings: u32,
     pub texts: u32,
     pub widget_quads: u32,
+    /// Image choice entries, holes and repeats included.
+    pub choice_refs: u32,
     pub notes: u32,
 }
 

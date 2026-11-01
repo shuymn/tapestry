@@ -10,8 +10,8 @@ use std::fs;
 use common::{Loaded, font, hd, import_with, join, png, skin};
 use skin_beatoraja::{ImportError, ImportLimit};
 use skin_model::{
-    MAX_ELEMENTS, MAX_FILES, MAX_FONTS, MAX_SKIN_FRAMES, MAX_SKIN_KEYS, MAX_SKIN_OPS,
-    MAX_TEXT_ELEMENTS, MAX_TOTAL_FILE_BYTES, MAX_WIDGET_QUADS,
+    MAX_ELEMENTS, MAX_FILES, MAX_FONTS, MAX_IMAGE_CHOICE_REFS, MAX_SKIN_FRAMES, MAX_SKIN_KEYS,
+    MAX_SKIN_OPS, MAX_TEXT_ELEMENTS, MAX_TOTAL_FILE_BYTES, MAX_WIDGET_QUADS,
 };
 
 fn as_u32(n: usize) -> u32 {
@@ -529,4 +529,61 @@ fn judges_and_gauges_charge_their_quads() {
     let l = quads_play(1);
     assert_eq!(l.report().usage.widget_quads, MAX_WIDGET_QUADS);
     limit(quads_play(2), ImportLimit::WidgetQuads);
+}
+
+/// `MAX_ELEMENTS - 1` destinations of a four-entry image set, then one
+/// of a set of `last` entries.
+fn choices_skin(last: usize) -> String {
+    let items = |n: usize| join((0..n).map(|_| r#""i""#.to_owned()));
+    let dsts = join(
+        std::iter::repeat_n("s4", MAX_ELEMENTS - 1)
+            .chain(["sl"])
+            .map(|id| format!(r#"{{"id": "{id}", "dst": [{KEY}]}}"#)),
+    );
+    format!(
+        r#""image": [{{"id": "i", "src": "a", "w": 1, "h": 1}}],
+           "imageset": [{{"id": "s4", "images": [{}], "value": 110}},
+                        {{"id": "sl", "images": [{}], "value": 110}}],
+           "destination": [{dsts}]"#,
+        items(4),
+        items(last)
+    )
+}
+
+#[test]
+fn choice_refs() {
+    // Every entry counts, repeats included, and each destination keeps
+    // its own table: 16 384 × 4 at the cap, one entry more past it, the
+    // elements still within theirs.
+    assert_eq!(MAX_ELEMENTS * 4, MAX_IMAGE_CHOICE_REFS);
+    let l = load(&choices_skin(4), |_| {});
+    let u = l.report().usage;
+    assert_eq!(u.choice_refs, as_u32(MAX_IMAGE_CHOICE_REFS));
+    assert_eq!(l.ok().skin.choice_ref_count(), MAX_IMAGE_CHOICE_REFS);
+    assert_eq!((u.elements, u.images), (as_u32(MAX_ELEMENTS), 1));
+    limit(load(&choices_skin(5), |_| {}), ImportLimit::ChoiceRefs);
+}
+
+#[test]
+fn a_shared_selector_is_charged_per_destination() {
+    // The gauge-type selector is compiled once and kept by each
+    // destination, the image set and the group alike.
+    let body = |dsts: &[&str]| {
+        let dsts = join(
+            dsts.iter()
+                .map(|id| format!(r#"{{"id": "{id}", "dst": [{KEY}]}}"#)),
+        );
+        format!(
+            r#""image": [{{"id": "i", "src": "a", "w": 2, "h": 1, "divx": 2, "len": 2, "ref": 40}}],
+               "imageset": [{{"id": "s", "images": ["i"], "ref": 40}}],
+               "destination": [{dsts}]"#
+        )
+    };
+    let one = load(&body(&["s"]), |_| {}).report().usage.ops;
+    assert!(one > 1);
+    for dsts in [&["s", "s"][..], &["s", "i"], &["i", "i"]] {
+        let l = load(&body(dsts), |_| {});
+        assert_eq!(l.report().usage.ops, 2 * one, "{dsts:?}");
+        assert_eq!(l.ok().skin.ops().total(), 2 * one as usize, "{dsts:?}");
+    }
 }

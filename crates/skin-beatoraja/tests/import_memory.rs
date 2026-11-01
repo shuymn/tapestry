@@ -29,9 +29,10 @@ use skin_beatoraja::{
     Config, Header, ImportError, Imported, InputLimit, Note, Report, import, read_header,
 };
 use skin_model::{
-    ElementDef, ImageDef, KeyDef, MAX_ELEMENTS, MAX_FILES, MAX_FNT_BYTES, MAX_FNT_PAGES, MAX_FONTS,
-    MAX_SHEET_GLYPHS, MAX_SHEET_KERNINGS, MAX_SKIN_FRAMES, MAX_SKIN_KEYS, MAX_SKIN_OPS,
-    MAX_TEXT_ELEMENTS, MAX_WIDGET_QUADS, Program,
+    ElementDef, ImageChoiceDef, ImageChoicePart, ImageDef, KeyDef, MAX_ELEMENTS, MAX_FILES,
+    MAX_FNT_BYTES, MAX_FNT_PAGES, MAX_FONTS, MAX_IMAGE_CHOICE_REFS, MAX_SHEET_GLYPHS,
+    MAX_SHEET_KERNINGS, MAX_SKIN_FRAMES, MAX_SKIN_KEYS, MAX_SKIN_OPS, MAX_TEXT_ELEMENTS,
+    MAX_WIDGET_QUADS, Program,
 };
 
 /// The recorded bound: the largest measured peak over the fixtures plus
@@ -432,6 +433,41 @@ fn check_f6(_: &Header, i: Imported) {
     assert_eq!(d.frame(0, &[]).len(), MAX_TEXT_ELEMENTS * 128);
 }
 
+/// F7: 16,384 destinations of one four-entry image set over two one-frame
+/// images, each repeated, chosen by the perfect count: each destination
+/// keeps its own table, filling the choice entries.
+fn f7(root: &Path) {
+    png(root, "a.png", 2, 1);
+    let dsts =
+        join((0..MAX_ELEMENTS).map(|_| r#"{"id": "s", "dst": [{"w": 1, "h": 1}]}"#.to_owned()));
+    write(
+        root,
+        "s.json",
+        common::hd(&format!(
+            r#""source": [{{"id": "a", "path": "a.png"}}],
+               "image": [{{"id": "i", "src": "a", "w": 1, "h": 1}},
+                         {{"id": "j", "src": "a", "x": 1, "w": 1, "h": 1}}],
+               "imageset": [{{"id": "s", "images": ["i", "j", "i", "j"], "value": 110}}],
+               "destination": [{dsts}]"#
+        ))
+        .as_bytes(),
+    );
+}
+
+fn check_f7(_: &Header, i: Imported) {
+    let u = i.report.usage;
+    assert_eq!(u.choice_refs, as_u32(MAX_IMAGE_CHOICE_REFS));
+    assert_eq!(i.skin.choice_ref_count(), MAX_IMAGE_CHOICE_REFS);
+    let n = as_u32(MAX_ELEMENTS);
+    assert_eq!((u.elements, u.keys, u.ops), (n, n, n));
+    assert_eq!(u.widget_quads, 0);
+    assert_eq!((u.images, u.frames, u.files), (2, 2, 1));
+    assert_eq!(i.report.notes, []);
+    assert_eq!(i.skin.quad_capacity(), n);
+    assert_eq!(i.skin.ops().total(), MAX_ELEMENTS);
+    assert_eq!(i.skin.sheet().image_count(), 2);
+}
+
 /// F5's judges: 5,127 with a 2-digit combo and one with a 1-digit combo.
 const JUDGES: usize = 5_128;
 /// Judges whose grade has 11 keys; the rest have 10.
@@ -824,6 +860,11 @@ fn import_memory_is_measured() {
         size_of::<skin_model::FrameReadouts>(),
         size_of::<skin_model::DurationRatio>(),
     );
+    println!(
+        "sizes: ImageChoiceDef {}, Option<ImageChoicePart> {}",
+        size_of::<ImageChoiceDef>(),
+        size_of::<Option<ImageChoicePart>>(),
+    );
     let mut peaks = Vec::new();
     let d = tempfile::tempdir().unwrap();
     f1(d.path());
@@ -857,6 +898,10 @@ fn import_memory_is_measured() {
     let d = tempfile::tempdir().unwrap();
     f6(d.path());
     peaks.push(("F6 bitmap fonts", measure(d.path(), check_f6)));
+    drop(d);
+    let d = tempfile::tempdir().unwrap();
+    f7(d.path());
+    peaks.push(("F7 image choices", measure(d.path(), check_f7)));
     drop(d);
     for (name, p) in &peaks {
         println!("{name}: peak {p} B");

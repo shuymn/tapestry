@@ -1,26 +1,40 @@
-//! Elements by object kind: images and image sets here, numbers, text
-//! and the play objects in their modules.
+//! Elements by object kind: images here, image selection (image groups
+//! and image sets), numbers, text and the play objects in their modules.
 
 pub(super) mod gauge;
+pub(super) mod image_choice;
 pub(super) mod judge;
 pub(super) mod lanes;
 pub(super) mod number;
 pub(super) mod text;
 
-use skin_model::{ImageDef, MAX_SKIN_FRAMES, Source};
+use skin_model::{ImageDef, MAX_SKIN_FRAMES, Native, Source};
 
 use super::asset::{self, Crop, Failed, ImageKey, Path};
 use super::budget::ImportLimit;
 use super::policy::Role;
-use super::property::{self, IndexProp, IntProp};
-use super::report::{NoteKind, Object, PropertyKind, Span, TrackWhy};
+use super::property::{self, IndexProp};
+use super::report::{NoteKind, Object, Span, TrackWhy};
 use super::track::{self, Stretch};
 use super::{Common, Cx, Dst, Opts, Prop};
 use crate::error::ImportError;
+use image_choice::SetSelector;
 
-/// The field an image selector the mapping does not run yet is reported
-/// under: one choosing by the shown gauge's type (S6c-04).
-const IMAGE_SELECTION: &str = "image selection";
+/// A track's keys baked against a cell, and the native size kept instead
+/// under stretch 8 and 9.
+pub(super) type Baked = (Vec<[i32; 4]>, Option<Native>);
+
+/// A placed source image: its admitted file, its rect in texels and its
+/// cell.
+pub(super) type Placed = (u32, [u32; 4], [u32; 2]);
+
+/// Why a source image was not placed: `missing` when its source is proven
+/// absent (no source, a missing or unreadable file, a movie), which an
+/// image set keeps as a hole, else a stricter refusal.
+pub(super) struct Unplaced {
+    pub(super) why: NoteKind,
+    pub(super) missing: bool,
+}
 
 /// The source-image fields an image or a number reads
 /// (`JsonSkinObjectLoader.java:601-621` at `0.8.9`).
@@ -148,7 +162,7 @@ impl Cx<'_> {
             return Ok(None);
         }
         let linear = c.filter == skin_model::Filter::Linear;
-        let key = (rec, linear, grid);
+        let key = (rec, linear, grid, false);
         if let Some((def, cell)) = self.assets.base(key) {
             let crop = match crop(self, def.rect.unwrap_or_default())? {
                 Ok(crop) => crop,
@@ -168,83 +182,13 @@ impl Cx<'_> {
         self.budget.image(frames).map_err(|l| self.limit(at, l))?;
         #[cfg(test)]
         super::trace(super::Event::Charge);
-        let Some(path) = self.source_path(s.src.as_deref())? else {
-            self.drop_el(role, at, NoteKind::MissingAsset)?;
-            return Ok(None);
-        };
-        if asset::is_movie(&path) {
-            self.drop_el(
-                role,
-                at,
-                NoteKind::Unsupported {
-                    object: Object::Movie,
-                },
-            )?;
-            return Ok(None);
-        }
-        let name = match self.choices.substitute(&path) {
-            Path::File(p) => asset::join(&self.entry_dir, &p),
-            Path::Missing => {
-                self.drop_el(role, at, NoteKind::MissingAsset)?;
-                return Ok(None);
-            }
-            Path::Glob => {
-                self.drop_el(
-                    role,
-                    at,
-                    NoteKind::UnsupportedField {
-                        field: "source glob",
-                    },
-                )?;
+        let (file, rect, cell) = match self.src_rect(role, at, s, grid)? {
+            Ok(found) => found,
+            Err(Unplaced { why, .. }) => {
+                self.drop_el(role, at, why)?;
                 return Ok(None);
             }
         };
-        let def = skin_model::FileDef {
-            path: name.clone(),
-            hi: None,
-        };
-        let file = match self
-            .assets
-            .admit(&mut self.budget, def)
-            .map_err(|l| self.limit(at, l))?
-        {
-            Ok(f) => f,
-            Err(Failed::File) if matches!(role, Role::Critical(_)) => {
-                if let Some(source) = self.assets.take_error(&name) {
-                    return Err(ImportError::Asset {
-                        at: self.loc(at),
-                        source,
-                    });
-                }
-                self.drop_el(role, at, NoteKind::MissingAsset)?;
-                return Ok(None);
-            }
-            Err(_) => {
-                self.drop_el(role, at, NoteKind::MissingAsset)?;
-                return Ok(None);
-            }
-        };
-        let [fw, fh] = self.assets.file_dims(file).unwrap_or([0, 0]);
-        let [x, y, w, h] = s.rect;
-        let w = if w == -1 { i64::from(fw) } else { i64::from(w) };
-        let h = if h == -1 { i64::from(fh) } else { i64::from(h) };
-        let (Ok(x), Ok(y), Ok(w), Ok(h)) = (
-            u32::try_from(x),
-            u32::try_from(y),
-            u32::try_from(w),
-            u32::try_from(h),
-        ) else {
-            self.drop_el(role, at, NoteKind::SourceRect)?;
-            return Ok(None);
-        };
-        let [dx, dy] = s.div;
-        let cell = [w / dx, h / dy];
-        let rect = [x, y, cell[0] * grid[0], cell[1] * grid[1]];
-        let inside = |at: u32, len: u32, max: u32| at.checked_add(len).is_some_and(|e| e <= max);
-        if !inside(x, rect[2], fw) || !inside(y, rect[3], fh) {
-            self.drop_el(role, at, NoteKind::SourceRect)?;
-            return Ok(None);
-        }
         let def = ImageDef {
             file,
             rect: Some(rect),
@@ -260,6 +204,87 @@ impl Cx<'_> {
             }
         };
         self.add_image(c, key, crop, def, cell)
+    }
+
+    /// Where `s`'s first `grid` columns and rows lie, its image charged:
+    /// its admitted file, its rect in texels and its cell. A file that
+    /// fails a check refuses a critical element with its error.
+    pub(super) fn src_rect(
+        &mut self,
+        role: Role,
+        at: Span,
+        s: &SrcImage,
+        grid: [u32; 2],
+    ) -> Result<Result<Placed, Unplaced>, ImportError> {
+        let missing = |why| Ok(Err(Unplaced { why, missing: true }));
+        let refused = |why| {
+            Ok(Err(Unplaced {
+                why,
+                missing: false,
+            }))
+        };
+        let Some(path) = self.source_path(s.src.as_deref())? else {
+            return missing(NoteKind::MissingAsset);
+        };
+        if asset::is_movie(&path) {
+            return missing(NoteKind::Unsupported {
+                object: Object::Movie,
+            });
+        }
+        let name = match self.choices.substitute(&path) {
+            Path::File(p) => asset::join(&self.entry_dir, &p),
+            Path::Missing => return missing(NoteKind::MissingAsset),
+            Path::Glob => {
+                return refused(NoteKind::UnsupportedField {
+                    field: "source glob",
+                });
+            }
+        };
+        let def = skin_model::FileDef {
+            path: name.clone(),
+            hi: None,
+        };
+        let file = match self
+            .assets
+            .admit(&mut self.budget, def)
+            .map_err(|l| self.limit(at, l))?
+        {
+            Ok(f) => f,
+            Err(Failed::File { .. }) if matches!(role, Role::Critical(_)) => {
+                if let Some(source) = self.assets.take_error(&name) {
+                    return Err(ImportError::Asset {
+                        at: self.loc(at),
+                        source,
+                    });
+                }
+                return missing(NoteKind::MissingAsset);
+            }
+            Err(Failed::File { refused: false }) => return missing(NoteKind::MissingAsset),
+            // Only this importer refuses it: no hole stands for it.
+            Err(Failed::File { refused: true } | Failed::Name) => {
+                return refused(NoteKind::MissingAsset);
+            }
+        };
+        let [fw, fh] = self.assets.file_dims(file).unwrap_or([0, 0]);
+        let [x, y, w, h] = s.rect;
+        let w = if w == -1 { i64::from(fw) } else { i64::from(w) };
+        let h = if h == -1 { i64::from(fh) } else { i64::from(h) };
+        let (Ok(x), Ok(y), Ok(w), Ok(h)) = (
+            u32::try_from(x),
+            u32::try_from(y),
+            u32::try_from(w),
+            u32::try_from(h),
+        ) else {
+            return refused(NoteKind::SourceRect);
+        };
+        let [dx, dy] = s.div;
+        let cell = [w / dx, h / dy];
+        let rect = [x, y, cell[0] * grid[0], cell[1] * grid[1]];
+        let inside = |at: u32, len: u32, max: u32| at.checked_add(len).is_some_and(|e| e <= max);
+        if !inside(x, rect[2], fw) || !inside(y, rect[3], fh) {
+            return refused(NoteKind::SourceRect);
+        }
+        Ok(Ok((file, rect, cell)))
     }
 
     /// Adds `def` cut to `crop` under `key`: a failure refuses a critical
@@ -287,47 +312,29 @@ impl Cx<'_> {
     }
 
     /// An image object.
-    pub(super) fn image(
-        &mut self,
-        dst: Dst,
-        rec: u32,
-        set: Option<u32>,
-    ) -> Result<(), ImportError> {
+    pub(super) fn image(&mut self, dst: Dst, rec: u32) -> Result<(), ImportError> {
         let at = dst.span;
         let s = self.src_image(rec)?;
         let [len, act, r] = self.def.fields(rec, ["len", "act", "ref"]);
-        // A selector group (`len` above 1) is the image object's own,
-        // choosing by its `ref` in the image-index namespace; an image set
-        // draws the image's frames whatever its `len` and `ref`
-        // (`JsonSkinObjectLoader.java:49-64, 76-84`).
-        let group = set.is_none() && self.int_or(len, "len", 0)? > 1;
-        let field =
-            if group && property::index_by_id(self.int_or(r, "ref", 0)?) == IndexProp::GaugeKind {
-                IMAGE_SELECTION
-            } else {
-                "len"
-            };
+        // A group (`len` above 1) selects its run of frames by its `ref`
+        // in the image-index namespace (`JsonSkinObjectLoader.java:49-64`);
+        // a `len` of 1 or less is an ordinary image whatever its `ref`.
+        let len = self.int_or(len, "len", 0)?;
+        let group = len > 1;
+        let index = property::index_by_id(self.int_or(r, "ref", 0)?);
         // Listing offset 4, it follows SUDDEN+ when it cannot reach the
         // lanes, and is SUDDEN+ otherwise; its keys are charged once.
         let charged = dst.offsets.contains(&super::OFFSET_LANECOVER);
         if charged && !self.offset4_outside(&dst)? {
             if group {
+                let field = match index {
+                    IndexProp::Null | IndexProp::Unsupported(_) => "len",
+                    _ => "image selection",
+                };
                 return self.lane_cover_selector(dst, field);
             }
             return self.lane_cover_image(dst, rec, &s);
         }
-        if group {
-            self.drop_el(Role::Decorative, at, NoteKind::UnsupportedField { field })?;
-            return Ok(());
-        }
-        // An image set's click action is its own, the image's unused.
-        let act = match set {
-            Some(set) => {
-                let [act] = self.def.fields(set, ["act"]);
-                act
-            }
-            None => act,
-        };
         if act.is_some() {
             self.ignored(at, NoteKind::Ignored { field: "act" });
         }
@@ -335,6 +342,18 @@ impl Cx<'_> {
         if stretch == Stretch::Trimmed {
             self.drop_el(Role::Decorative, at, NoteKind::Stretch(dst.stretch))?;
             return Ok(());
+        }
+        if group {
+            let Some(src) = index.selector() else {
+                let id = match index {
+                    IndexProp::Unsupported(id) => id,
+                    _ => 0,
+                };
+                let why = image_choice::index_unsupported(id);
+                return self.drop_el(Role::Decorative, at, why);
+            };
+            let selector = (src, index.deviates());
+            return self.image_group(dst, rec, &s, len, selector, charged);
         }
         let o = Opts {
             follow: true,
@@ -347,11 +366,29 @@ impl Cx<'_> {
         let Some((image, cell)) = self.add_src_image(&c, rec, &s, s.div)? else {
             return Ok(());
         };
+        let Some((rects, native)) = self.baked_rects(&c, cell)? else {
+            self.drop_el(c.role, at, NoteKind::Stretch(c.stretch_mode))?;
+            return Ok(());
+        };
+        let t = self.model_track(&c, &rects)?;
+        self.push_native(c, Source::Image(image), t, native)?;
+        Ok(())
+    }
+
+    /// `c`'s keys with its stretch baked against a `cell`, and the native
+    /// size stretch 8 and 9 keep instead; `None` when the stretch changes
+    /// branch between keys.
+    pub(super) fn baked_rects(
+        &self,
+        c: &Common,
+        cell: [u32; 2],
+    ) -> Result<Option<Baked>, ImportError> {
+        let at = c.span;
         let native = c.stretch.native(cell);
         let mut rects = Vec::with_capacity(c.track.keys.len());
         let mut shared = track::ANY_BRANCH;
         for k in &c.track.keys {
-            let r = self.key_rect(&c, k)?;
+            let r = self.key_rect(c, k)?;
             let (r, b) = if native.is_some() {
                 (r, 0b1)
             } else {
@@ -360,68 +397,52 @@ impl Cx<'_> {
             shared &= b;
             rects.push(r.model().ok_or_else(|| self.range(at, "dst"))?);
         }
-        if !track::one_branch(shared) {
-            self.drop_el(c.role, at, NoteKind::Stretch(c.stretch_mode))?;
-            return Ok(());
-        }
-        let t = self.model_track(&c, &rects)?;
-        self.push_native(c, Source::Image(image), t, native)?;
-        Ok(())
+        Ok(track::one_branch(shared).then_some((rects, native)))
     }
 
-    /// An image set (`JsonSkinObjectLoader.java:74-98`): only one without
-    /// a frame expression, drawing its first image. Its `value`, when it
-    /// resolves as a value property, chooses the frame; else its `ref`
-    /// does, as an image-index property (`JsonSkinObjectLoader.java:91`).
+    /// An image set (`JsonSkinObjectLoader.java:74-98`): a table of its
+    /// `images`, chosen by its `value` when that resolves as a value
+    /// property, else by its `ref` as an image-index property
+    /// (`JsonSkinObjectLoader.java:91`), entry 0 when neither does. Its
+    /// images' `len`, `ref` and actions are unused; its own action is
+    /// ignored.
     pub(super) fn image_set(&mut self, dst: Dst, rec: u32) -> Result<(), ImportError> {
         let at = dst.span;
-        let [r, value, images] = self.def.fields(rec, ["ref", "value", "images"]);
+        let [r, value, images, act] = self.def.fields(rec, ["ref", "value", "images", "act"]);
         let r = self.int_or(r, "ref", 0)?;
         let value = self.prop(value, "value")?;
-        let selector = match property::value_prop(&value) {
-            IntProp::Null if r == 0 => None,
-            IntProp::Null => Some(match property::index_by_id(r) {
-                IndexProp::GaugeKind => (
-                    IMAGE_SELECTION,
-                    NoteKind::UnsupportedField {
-                        field: IMAGE_SELECTION,
-                    },
-                ),
-                IndexProp::Unsupported(id) => (
-                    "ref",
-                    NoteKind::UnsupportedProperty {
-                        kind: PropertyKind::ImageIndex,
-                        id: Some(id),
-                    },
-                ),
-            }),
-            IntProp::Shown(_) => Some((
-                "value",
-                NoteKind::UnsupportedProperty {
-                    kind: PropertyKind::Integer,
-                    id: match value {
-                        Prop::Id(id) => Some(id),
-                        _ => None,
-                    },
-                },
-            )),
-            IntProp::Unsupported(id) => Some((
-                "value",
-                NoteKind::UnsupportedProperty {
-                    kind: PropertyKind::Integer,
-                    id,
-                },
-            )),
-        };
-        if let Some((field, why)) = selector {
-            // Listing offset 4, it is classified before the selector drops
-            // it.
-            if dst.offsets.contains(&super::OFFSET_LANECOVER) && !self.offset4_outside(&dst)? {
-                return self.lane_cover_selector(dst, field);
-            }
-            self.drop_el(Role::Decorative, at, why)?;
-            return Ok(());
+        let selector = image_choice::set_selector(&value, r);
+        // Listing offset 4, it is classified before its selector: one
+        // without a selector is SUDDEN+ by its first image, as an image
+        // is; a selecting one is refused.
+        let charged = dst.offsets.contains(&super::OFFSET_LANECOVER);
+        if charged && !self.offset4_outside(&dst)? {
+            let field = match &selector {
+                SetSelector::Null => return self.lane_cover_set(dst, images),
+                SetSelector::Expr { field, .. } | SetSelector::Unsupported { field, .. } => field,
+            };
+            return self.lane_cover_selector(dst, field);
         }
+        let (src, deviates) = match selector {
+            SetSelector::Unsupported { why, .. } => {
+                return self.drop_el(Role::Decorative, at, why);
+            }
+            SetSelector::Null => ("0".to_owned(), false),
+            SetSelector::Expr { src, deviates, .. } => (src, deviates),
+        };
+        if act.is_some() {
+            self.ignored(at, NoteKind::Ignored { field: "act" });
+        }
+        if Stretch::of(dst.stretch) == Stretch::Trimmed {
+            return self.drop_el(Role::Decorative, at, NoteKind::Stretch(dst.stretch));
+        }
+        self.image_set_choices(dst, images, &src, deviates, charged)
+    }
+
+    /// An image set without a selector that may reach the lanes: SUDDEN+
+    /// by its first image, as an image listing offset 4 is.
+    fn lane_cover_set(&mut self, dst: Dst, images: Option<u32>) -> Result<(), ImportError> {
+        let at = dst.span;
         let first = match images {
             Some(list) if self.def.arena.node(list).kind == crate::tree::Kind::Array => {
                 self.def.arena.children(list).next()
@@ -440,6 +461,7 @@ impl Cx<'_> {
             self.ignored(at, NoteKind::Track(TrackWhy::NeverDrawn));
             return Ok(());
         };
-        self.image(dst, image, Some(rec))
+        let s = self.src_image(image)?;
+        self.lane_cover_image(dst, image, &s)
     }
 }

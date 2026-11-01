@@ -239,3 +239,88 @@ fn numbers_take_the_identity_eight_or_nine() {
     assert!(has(loaded.report(), NoteKind::Stretch(1)));
     assert!(loaded.quads(0).is_empty());
 }
+
+/// An image set choosing by EX score between a 16×16 and a 64×32 cell of
+/// a.png, with `stretch` over `keys`, beside image `i` (the 3×2 frame)
+/// at x 100 with stretch 6; a `size` skin.
+fn shapes(size: [u32; 2], stretch: i32, keys: &str) -> common::Loaded {
+    import_sized(
+        size,
+        &format!(
+            r#""image": [{{"id": "small", "src": "a", "w": 16, "h": 16}},
+                         {{"id": "wide", "src": "a", "w": 64, "h": 32}},
+                         {{"id": "i", "src": "a", "w": 3, "h": 2}}],
+               "imageset": [{{"id": "s", "images": ["small", "wide"], "value": 71}}],
+               "destination": [{{"id": "s", "stretch": {stretch}, "dst": [{keys}]}},
+                               {{"id": "i", "stretch": 6, "dst": [{{"x": 100, "y": 0, "w": 10, "h": 4}}]}}]"#
+        ),
+        &[],
+    )
+}
+
+/// The rects at 0 ms with EX score `ex` (0 selects the 16×16 cell, 1 the
+/// 64×32), drawn on `target` and scaled from the 1920×1080 canvas.
+fn shape_rects(l: common::Loaded, ex: u32, target: [u32; 2]) -> Vec<[i32; 4]> {
+    let mut d = l.drawn();
+    d.tally = common::play::tally(ex, 0);
+    d.target = target;
+    let scale = target[0] as f32 / 1_920.0;
+    d.frame(0, &[])
+        .iter()
+        .map(|q| common::play::round(q.rect.map(|v| v * scale)))
+        .collect()
+}
+
+#[test]
+fn each_selected_image_bakes_its_own_aspect() {
+    // Fit height 4 in a 10 wide box: the 16×16 cell is 4 wide at x 3,
+    // the 64×32 one 8 wide at x 1; the plain image's 3×2 is 6 wide at 102
+    // whichever is selected.
+    let keys = r#"{"x": 0, "y": 0, "w": 10, "h": 4}"#;
+    let plain = [102, 1_076, 6, 4];
+    let rects = |ex| shape_rects(shapes([1_920, 1_080], 6, keys), ex, [1_920, 1_080]);
+    assert_eq!(rects(0), [[3, 1_076, 4, 4], plain]);
+    assert_eq!(rects(1), [[1, 1_076, 8, 4], plain]);
+    // Animated: each choice's own track between its baked keys.
+    let keys = r#"{"time": 0, "x": 0, "y": 0, "w": 10, "h": 4},
+                  {"time": 100, "x": 0, "y": 0, "w": 10, "h": 8}"#;
+    let mut d = shapes([1_920, 1_080], 6, keys).drawn();
+    d.tally = common::play::tally(1, 0);
+    // 64×32 at height 6 (the midpoint) is 12 wide, centred in 10 at -1.
+    assert_eq!(d.rects(50)[0], [-1, 1_074, 12, 6]);
+    d.tally = common::play::tally(0, 0);
+    assert_eq!(d.rects(50)[0], [2, 1_074, 6, 6]);
+}
+
+#[test]
+fn each_selected_image_keeps_its_own_native_size() {
+    // No resize, 200×100 at 1280×720: each cell keeps its texels in
+    // target pixels, centred in the box.
+    let keys = r#"{"x": 0, "y": 0, "w": 200, "h": 100}"#;
+    let native = |stretch, ex, target| {
+        let l = shapes([1_280, 720], stretch, keys);
+        shape_rects(l, ex, target)[0]
+    };
+    for stretch in [8, 9] {
+        assert_eq!(native(stretch, 0, [1_280, 720]), [92, 662, 16, 16]);
+        assert_eq!(native(stretch, 1, [1_280, 720]), [68, 654, 64, 32]);
+        assert_eq!(native(stretch, 0, [1_920, 1_080]), [142, 997, 16, 16]);
+        assert_eq!(native(stretch, 1, [1_920, 1_080]), [118, 989, 64, 32]);
+        assert_eq!(native(stretch, 0, [3_840, 2_160]), [292, 2_002, 16, 16]);
+        assert_eq!(native(stretch, 1, [3_840, 2_160]), [268, 1_994, 64, 32]);
+    }
+    // No expanding in a 40×20 box: the 16×16 cell always fits; the 64×32
+    // one shrinks to the box (40×20, then 60×30 target pixels) until the
+    // 3840×2160 target's 120×60 holds it.
+    let keys = r#"{"x": 0, "y": 0, "w": 40, "h": 20}"#;
+    let shrink = |ex, target| shape_rects(shapes([1_280, 720], 8, keys), ex, target)[0];
+    assert_eq!(shrink(0, [1_280, 720]), [12, 702, 16, 16]);
+    assert_eq!(shrink(1, [1_280, 720]), [0, 700, 40, 20]);
+    assert_eq!(shrink(0, [1_920, 1_080]), [22, 1_057, 16, 16]);
+    assert_eq!(shrink(1, [1_920, 1_080]), [0, 1_050, 60, 30]);
+    assert_eq!(shrink(0, [3_840, 2_160]), [52, 2_122, 16, 16]);
+    assert_eq!(shrink(1, [3_840, 2_160]), [28, 2_114, 64, 32]);
+    // No resize ignores the box: the 64×32 cell overflows it.
+    let keep = |ex, target| shape_rects(shapes([1_280, 720], 9, keys), ex, target)[0];
+    assert_eq!(keep(1, [1_280, 720]), [-12, 694, 64, 32]);
+}
