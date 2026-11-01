@@ -11,29 +11,19 @@
 //! strip whose leading `E` blank cells the model drops, retained cell `j`
 //! takes row `E + j`; trailing zero rows are dropped.
 
-use skin_model::{DigitOffset, MAX_COORD};
+use skin_model::DigitOffset;
 
 use super::super::Cx;
+use super::super::geom::coords;
 use super::super::report::Span;
 use crate::error::ImportError;
 use crate::resolve::digit_offsets::RawDigitOffset;
 
 /// Row `r` lowered; `None` past the model's coordinates.
 fn lower(r: &RawDigitOffset) -> Option<DigitOffset> {
-    let [x, y, w, h] = r.xywh.map(i64::from);
-    let max = i64::from(MAX_COORD);
-    let coord = |v: i64| {
-        (-max..=max)
-            .contains(&v)
-            .then(|| i32::try_from(v).ok())
-            .flatten()
-    };
-    Some(DigitOffset {
-        dx: coord(x)?,
-        dy: coord(y.checked_neg()?.checked_sub(h)?)?,
-        dw: coord(w)?,
-        dh: coord(h)?,
-    })
+    let [x, y, w, h] = r.xywh.map(i128::from);
+    let [dx, dy, dw, dh] = coords([x, -y - h, w, h])?;
+    Some(DigitOffset { dx, dy, dw, dh })
 }
 
 /// Whether `r` moves nothing.
