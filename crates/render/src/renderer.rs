@@ -505,8 +505,11 @@ impl Renderer {
                     max,
                 });
             }
+            let staged = self.staging.instance_capacity();
             self.staging.set_capacity(capacity, runs);
-            self.instances = instance_buffer(device, self.staging.instance_capacity());
+            if self.staging.instance_capacity() != staged {
+                self.instances = instance_buffer(device, self.staging.instance_capacity());
+            }
         }
         self.skin = skin;
         self.refused = None;

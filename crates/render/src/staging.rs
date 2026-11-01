@@ -83,11 +83,16 @@ impl Staging {
     }
 
     /// Makes room for `capacity` sprites of the skin in `runs` runs, and
-    /// the overlay's reserve, emptying the batch: allocates, so before
-    /// play.
+    /// the overlay's reserve, emptying the batch and the instances, whose
+    /// storage stays while their capacity does: allocates, so before play.
     pub fn set_capacity(&mut self, capacity: u32, runs: u32) {
-        self.batch = Self::sized(capacity, runs);
-        self.instances = Vec::with_capacity(self.batch.total_capacity());
+        let batch = Self::sized(capacity, runs);
+        if batch.total_capacity() == self.batch.total_capacity() {
+            self.instances.clear();
+        } else {
+            self.instances = Vec::with_capacity(batch.total_capacity());
+        }
+        self.batch = batch;
     }
 
     /// Takes `clips` and projects them: allocates, so before play.
