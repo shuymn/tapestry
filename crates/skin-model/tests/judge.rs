@@ -15,10 +15,10 @@ use lanes_support::rect;
 use play_support::{Harness, MS, empty_poor, ev, gauge as gauge_effect, tally};
 use rules::{GaugeValue, Judgment};
 use skin_model::{
-    Adjust, Align, Anchor, Attach, Bind, Blend, Canvas, ComboPart, DigitsDef, Ease, ElementDef,
-    End, Fit, GlyphSet, GradePart, JudgeDef, JudgeError, JudgePart, JudgeSlot, KeyDef, Layout,
-    LoadError, MAX_COORD, MAX_SKIN_KEYS, MAX_TRACK_KEYS, NumberError, Pad, Place, Region, Side,
-    Skin, Source, TimerRef, Track, WidgetDefs, timer,
+    Adjust, Align, Anchor, Attach, Bind, Blend, Canvas, ComboPart, DigitOffset, DigitsDef, Ease,
+    ElementDef, End, Fit, GlyphSet, GradePart, JudgeDef, JudgeError, JudgePart, JudgeSlot, KeyDef,
+    Layout, LoadError, MAX_COORD, MAX_SKIN_KEYS, MAX_TRACK_KEYS, NumberError, Pad, Place, Region,
+    Side, Skin, Source, TimerRef, Track, WidgetDefs, timer,
 };
 use widget_support::{
     ELEVEN, GRADE, TEN, boolean, combo, digits, drawn, element, empty_judge, grade, harness,
@@ -101,6 +101,72 @@ fn the_grade_moves_left_by_half_the_drawn_combo() {
     h.tally = tally(123);
     h.frame(0, &[judgment(0, Judgment::Great, 10)]);
     assert_eq!(quads(&h)[3], (great(), 0, [800.0, 500.0, 200.0, 80.0]));
+}
+
+#[test]
+fn moved_combo_glyphs_keep_the_baseline_shift() {
+    // Rows 1–3 move and grow the drawn cells 1–3; the grade still moves
+    // by half the 60 px baseline width.
+    let grow = |j: i32| DigitOffset {
+        dx: 5 * j,
+        dy: -j,
+        dw: 10,
+        dh: 2 * j,
+    };
+    let mut j = judge();
+    j.combos[JudgeSlot::Great.index()] = Some(combo(
+        DigitsDef {
+            offsets: (0..4).map(grow).collect(),
+            ..strip()
+        },
+        COMBO_KEY,
+    ));
+    let mut h = harness(skin_of(j));
+    h.tally = tally(123);
+    h.frame(0, &[judgment(0, Judgment::Great, 10)]);
+    assert_eq!(
+        quads(&h),
+        [
+            (TEN, 1, [1_025.0, 509.0, 30.0, 62.0]),
+            (TEN, 2, [1_050.0, 508.0, 30.0, 64.0]),
+            (TEN, 3, [1_075.0, 507.0, 30.0, 66.0]),
+            (great(), 0, [770.0, 500.0, 200.0, 80.0]),
+        ]
+    );
+}
+
+#[test]
+fn a_full_gauge_combo_falls_back_with_its_offsets() {
+    // PERFECT's combo stands in for the full-gauge slot, its rows with it.
+    let mut j = judge_all(GRADE_KEY);
+    j.combos[0] = Some(combo(
+        DigitsDef {
+            offsets: vec![DigitOffset::default(), down(4), down(5), down(6)],
+            ..strip()
+        },
+        COMBO_KEY,
+    ));
+    let mut h = harness(skin_of(j));
+    h.tally = tally(7);
+    h.gauges[0].value = GaugeValue::FULL;
+    h.frame(0, &[ev(0, gauge_effect(0, GaugeValue::FULL))]);
+    h.frame(10, &[judgment(10, Judgment::Perfect, 7)]);
+    // One digit of four cells, centred: cell 3 at 1010 + 60 − 30.
+    assert_eq!(
+        quads(&h),
+        [
+            (TEN, 7, [1_040.0, 516.0, 20.0, 60.0]),
+            (GRADE + 6, 0, [790.0, 500.0, 200.0, 80.0]),
+        ]
+    );
+}
+
+/// A delta of `dy` alone.
+fn down(dy: i32) -> DigitOffset {
+    DigitOffset {
+        dy,
+        ..DigitOffset::default()
+    }
 }
 
 #[test]

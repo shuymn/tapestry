@@ -381,6 +381,7 @@ impl Cx<'_> {
                 align: Align::Center,
                 pad,
                 space: i32::try_from(space).map_err(|_| range(self))?,
+                offsets: Vec::new(),
             },
             track,
             timer: c.timer,

@@ -77,7 +77,7 @@ fn bench_widgets(c: &mut Criterion) {
         ..digits(TEN, GlyphSet::Ten, 4, Align::Right, Pad::Zero)
     };
     for s in JudgeSlot::ALL {
-        j.combos[s.index()] = Some(combo(strip, [210, 10, 20, 60]));
+        j.combos[s.index()] = Some(combo(strip.clone(), [210, 10, 20, 60]));
     }
     let values = ["combo", "ex_score", "combo * 7", "bp"];
     let mut elements: Vec<_> = (0..4_u32)

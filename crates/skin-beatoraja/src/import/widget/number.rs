@@ -287,6 +287,7 @@ impl Cx<'_> {
                 align,
                 pad,
                 space: i32::try_from(space).map_err(|_| range(self))?,
+                offsets: Vec::new(),
             },
             value: program,
         });

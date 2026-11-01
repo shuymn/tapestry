@@ -154,6 +154,7 @@ pub fn digits(image: u32, set: GlyphSet, cells: u8, align: Align, pad: Pad) -> D
         align,
         pad,
         space: 2,
+        offsets: Vec::new(),
     }
 }
 
