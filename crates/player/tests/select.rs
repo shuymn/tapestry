@@ -608,16 +608,24 @@ fn a_quit_after_the_last_file_is_decoded_cancels_the_load() {
     assert!(lines(&stdout, "loudness: measuring").is_empty(), "{stdout}");
 }
 
-/// The quit key during the loudness measurement stops it at the next
-/// block: the load returns to selection, nothing is stored, and the next
-/// choice measures the chart again and plays it.
+/// How many lines of `stdout` are exactly `line`.
+fn count(stdout: &str, line: &str) -> usize {
+    stdout.lines().filter(|l| *l == line).count()
+}
+
+/// The quit key during a slow loudness measurement stops it at the next
+/// block and returns to selection at once, before the measurement could
+/// have ended; the chart is then measured in the background and its
+/// result kept, so the next choice measures nothing and plays it, and
+/// stored at that countdown, so the next run measures nothing either.
 #[test]
-fn the_quit_key_stops_the_loudness_measurement() {
+fn the_quit_key_leaves_the_measurement_to_the_background() {
     let fx = fixture();
     write_chart(&fx.library, "a", "a.bms", "譜面A", 4_000);
     let (_, stdout) = run(
         &fx,
-        "pick=a.bms,quit-measuring,enter,pick=a.bms,enter,back,close",
+        "slow-measuring=1500,pick=a.bms,quit-measuring,enter,background=idle,\
+         pick=a.bms,enter,back,close",
         &[],
     );
     let at = |from: usize, line: &str| {
@@ -625,13 +633,108 @@ fn the_quit_key_stops_the_loudness_measurement() {
     };
     let measuring = at(0, "loudness: measuring a.bms");
     let stopped = at(measuring, "loudness: a.bms: the measurement was cancelled");
-    let cancelled = at(stopped, "load: cancelled");
+    let left = at(stopped, "loudness: a.bms is left to the background");
+    let cancelled = at(left, "load: cancelled");
     let back = at(cancelled, "select: 1 charts listed");
-    let again = at(back, "loudness: measuring a.bms");
-    let measured = at(again, "loudness: a.bms measured in ");
-    at(measured, "play started");
+    // Measured after selection was back: the quit did not wait for it.
+    let measured = at(back, "loudness: a.bms measured in the background in ");
+    let again = at(measured, "select: chose a.bms");
+    let before = at(again, "loudness: a.bms: gain ");
+    assert!(
+        stdout
+            .lines()
+            .nth(before)
+            .unwrap()
+            .ends_with("measured before")
+    );
+    at(before, "play started");
+    assert_eq!(count(&stdout, "loudness: measuring a.bms"), 1, "{stdout}");
+    assert_eq!(
+        count(&stdout, "loudness: measuring a.bms in the background"),
+        1
+    );
     assert_eq!(lines(&stdout, "loudness: a.bms measured in ").len(), 1);
     assert_eq!(lines(&stdout, "play started").len(), 1, "{stdout}");
+    // Stored: the next run measures nothing.
+    let (_, next) = run(&fx, "pick=a.bms,enter,back,close", &[]);
+    assert!(lines(&next, "loudness: measuring").is_empty(), "{next}");
+    assert_eq!(lines(&next, "play started").len(), 1, "{next}");
+}
+
+/// Choosing the chart again while its background measurement runs waits
+/// for that measurement, saying it measures the loudness, and does not
+/// measure the chart a second time.
+#[test]
+fn choosing_the_chart_again_waits_for_its_background_measurement() {
+    let fx = fixture();
+    write_chart(&fx.library, "a", "a.bms", "譜面A", 4_000);
+    let (_, stdout) = run(
+        &fx,
+        "slow-measuring=3000,pick=a.bms,quit-measuring,enter,background=running,\
+         pick=a.bms,enter,back,close",
+        &[],
+    );
+    let at = |from: usize, line: &str| {
+        find_from(&stdout, from, line).unwrap_or_else(|| panic!("no {line}:\n{stdout}"))
+    };
+    let cancelled = at(0, "load: cancelled");
+    let again = at(cancelled, "select: chose a.bms");
+    let waiting = at(
+        again,
+        "loudness: waiting for a.bms's measurement in the background",
+    );
+    let measured = at(waiting, "loudness: a.bms measured in the background in ");
+    let before = at(measured, "loudness: a.bms: gain ");
+    assert!(
+        stdout
+            .lines()
+            .nth(before)
+            .unwrap()
+            .ends_with("measured before")
+    );
+    at(before, "play started");
+    // The loading state said so before the sounds.
+    let stage = at(again, "load: measuring the loudness");
+    assert!(stage < measured, "{stdout}");
+    assert_eq!(count(&stdout, "loudness: measuring a.bms"), 1, "{stdout}");
+    assert_eq!(
+        count(&stdout, "loudness: measuring a.bms in the background"),
+        1
+    );
+    assert_eq!(lines(&stdout, "loudness: a.bms measured in ").len(), 1);
+    assert_eq!(lines(&stdout, "play started").len(), 1, "{stdout}");
+}
+
+/// Closing the window while the background measures stops it: the run
+/// ends without waiting for it, nothing of it is stored, and the next run
+/// measures the chart in its load.
+#[test]
+fn closing_while_measuring_in_the_background_stores_nothing() {
+    let fx = fixture();
+    write_chart(&fx.library, "a", "a.bms", "譜面A", 4_000);
+    let out = select(
+        &fx,
+        "slow-measuring=5000,pick=a.bms,quit-measuring,enter,background=running,close",
+        &[],
+    )
+    .output()
+    .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+    assert_eq!(
+        count(&stdout, "loudness: measuring a.bms in the background"),
+        1,
+        "{stdout}"
+    );
+    assert!(
+        lines(&stdout, "loudness: a.bms measured in ").is_empty(),
+        "{stdout}"
+    );
+    assert!(!stderr.contains("did not stop"), "{stderr}");
+    let (_, next) = run(&fx, "pick=a.bms,enter,back,close", &[]);
+    assert_eq!(count(&next, "loudness: measuring a.bms"), 1, "{next}");
+    assert_eq!(lines(&next, "play started").len(), 1, "{next}");
 }
 
 /// Closing the window during a load cancels it and ends the run at once

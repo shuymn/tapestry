@@ -14,7 +14,9 @@
 //!   same 1× key. An analysis that fails (a panic included), is cancelled,
 //!   or cannot get its 1× bank leaves the 0.5 headroom and keeps nothing,
 //!   so the next load measures again; a sound that cannot be read is
-//!   measured as it plays, silent.
+//!   measured as it plays, silent. A load cancelled during its measurement
+//!   leaves the chart to the background measurement ([`crate::background`]),
+//!   whose result is kept here as a load's own ([`Loudness::adopt`]).
 //! - **Results.** A measurement is kept in memory by its whole key and
 //!   stored in the library only before a countdown, once the scan's pause
 //!   is acknowledged (or no scan runs), or at a graceful exit whose scan
@@ -52,10 +54,10 @@ pub trait Host {
 
 /// How an analysis ended.
 #[derive(Debug)]
-enum Analyzed {
+pub(crate) enum Analyzed {
     /// Measured, in this much time.
     Done(Measurement, Duration),
-    /// The load was cancelled.
+    /// The load was cancelled, or the background measurement stopped.
     Cancelled,
     /// Why it gave no measurement.
     Failed(String),
@@ -63,12 +65,21 @@ enum Analyzed {
 
 /// Mixes and meters `chart`'s 1× autoplay schedule over `bank`, asking
 /// `cancelled` before each block. A panic of the analysis is a failure.
-fn analyze(chart: &Chart, bank: Arc<SoundBank>, cancelled: &mut dyn FnMut() -> bool) -> Analyzed {
+pub(crate) fn analyze(
+    chart: &Chart,
+    bank: Arc<SoundBank>,
+    cancelled: &mut dyn FnMut() -> bool,
+) -> Analyzed {
     let began = Instant::now();
     let run = panic::catch_unwind(AssertUnwindSafe(
         || -> Result<Option<Measurement>, AnalysisError> {
             let mut analysis = Analysis::new(bank)?;
             let mut events = game::schedule_iter(chart);
+            // A script's slow measurement (dev-tools).
+            #[cfg(feature = "dev-tools")]
+            if !crate::dev::hold_measuring(&mut *cancelled) {
+                return Ok(None);
+            }
             loop {
                 if cancelled() {
                     return Ok(None);
@@ -120,19 +131,7 @@ pub fn measure(
     };
     match analyzed {
         Analyzed::Done(m, took) => {
-            let g = audio::normalization_gain(&m);
-            log_line(
-                &format!(
-                    "loudness: {name} measured in {} ms: {} LUFS{}, {:.2} dBTP; gain {:.2} dB",
-                    took.as_millis(),
-                    m.integrated
-                        .map_or_else(|| "-".to_owned(), |l| format!("{l:.2}")),
-                    if m.over_range { " (over range)" } else { "" },
-                    20.0 * m.true_peak.max(1e-10).log10(),
-                    20.0 * f64::from(g).log10(),
-                ),
-                false,
-            );
+            log_measured(name, &m, took, "");
             Ok(Some(m))
         }
         Analyzed::Cancelled => {
@@ -150,6 +149,24 @@ pub fn measure(
             Ok(None)
         }
     }
+}
+
+/// Logs `name`'s measurement `m`, taken in `took` (`place` says where:
+/// empty for a load's own).
+pub(crate) fn log_measured(name: &str, m: &Measurement, took: Duration, place: &str) {
+    let g = audio::normalization_gain(m);
+    log_line(
+        &format!(
+            "loudness: {name} measured{place} in {} ms: {} LUFS{}, {:.2} dBTP; gain {:.2} dB",
+            took.as_millis(),
+            m.integrated
+                .map_or_else(|| "-".to_owned(), |l| format!("{l:.2}")),
+            if m.over_range { " (over range)" } else { "" },
+            20.0 * m.true_peak.max(1e-10).log10(),
+            20.0 * f64::from(g).log10(),
+        ),
+        false,
+    );
 }
 
 /// The load was cancelled during the measurement.
@@ -203,7 +220,7 @@ pub fn key(chart: &Chart, bank: &SoundBank) -> Option<LoudnessKey> {
     })
 }
 
-fn log_line(line: &str, warn: bool) {
+pub(crate) fn log_line(line: &str, warn: bool) {
     if warn {
         eprintln!("{line}");
         log::warn!("{line}");
@@ -283,6 +300,17 @@ impl Loudness {
             Ok(None) => Loading::Ready,
             Err(Cancelled) => Loading::Cancelled,
         }
+    }
+
+    /// A measurement taken in the background ([`crate::background`]): kept
+    /// in memory unless its key already has one, in memory or in
+    /// `library`. Whether it was kept.
+    pub fn adopt(&mut self, library: &Library, key: LoudnessKey, row: LoudnessRow) -> bool {
+        if self.lookup(library, &key).is_some() {
+            return false;
+        }
+        self.measured.insert(key, row);
+        true
     }
 
     /// The row of `key`: in memory, else in `library`; a database error is

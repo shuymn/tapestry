@@ -33,6 +33,39 @@ use crate::render_side::{FrameSink, Screen};
 
 pub mod scenario;
 
+/// How long each loudness measurement holds before its first block, in
+/// milliseconds (a script's `slow-measuring`): a load's and the
+/// background's alike.
+static SLOW_MEASURING: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Every loudness measurement from now on holds `ms` before its first
+/// block (`slow-measuring`).
+pub fn slow_measuring(ms: u64) {
+    SLOW_MEASURING.store(ms, Ordering::Relaxed);
+}
+
+/// Holds a measurement as `slow-measuring` says, asking `stop` every
+/// 10 ms as a measurement asks before each block: `false` once it says
+/// to stop.
+pub fn hold_measuring(stop: &mut dyn FnMut() -> bool) -> bool {
+    let total = Duration::from_millis(SLOW_MEASURING.load(Ordering::Relaxed));
+    if total.is_zero() {
+        return true;
+    }
+    println!("dev: the measurement holds {} ms", total.as_millis());
+    let began = std::time::Instant::now();
+    loop {
+        if stop() {
+            return false;
+        }
+        let held = began.elapsed();
+        if held >= total {
+            return true;
+        }
+        std::thread::sleep((total - held).min(Duration::from_millis(10)));
+    }
+}
+
 /// Prints, to the console only, which window took the foreground when the
 /// game's window lost focus: its process's executable name and its window
 /// class, with the time on the game's clock (µs since start). A focus loss
@@ -394,6 +427,13 @@ pub enum SelectStep {
     QuitLoading,
     /// Halfway through the next slow load, close the window.
     CloseLoading,
+    /// Every loudness measurement from here on holds this many
+    /// milliseconds before its first block, stopped as a measurement is: a
+    /// slow measurement, a load's or the background's.
+    SlowMeasuring(u64),
+    /// Wait until the background measurement holds a job (`true`), or has
+    /// none held or waiting (`false`), at most [`STEP_TIMEOUT`].
+    Background(bool),
     /// Close the window.
     Close,
 }
@@ -417,14 +457,18 @@ pub struct SlowLoad {
 /// `pick=<file>`, `wait=<file>`, `search=<text>`, `sleep=<ms>`,
 /// `idle=<ms>`, `enter`, `prev-preset`, `next-preset`, `drawn`,
 /// `back`, `retry`, `next`, `prev`, `close-measuring`, `quit-measuring`,
-/// `quit-decoding`, `slow-load=<ms>`, `quit-loading`, `close-loading` and
-/// `close`. Selection steps run on the select screen (`prev-preset` and
+/// `quit-decoding`, `slow-load=<ms>`, `quit-loading`, `close-loading`,
+/// `slow-measuring=<ms>`, `background=<running|idle>` and `close`.
+/// Selection steps run on the select screen (`prev-preset` and
 /// `next-preset` press F11 and F12; `close-measuring` and
 /// `quit-measuring` close the window or press the quit key once the next
 /// load measures a chart's loudness, `quit-decoding` once it has decoded
 /// its first sound file; `slow-load` holds the next load that long, and
 /// `quit-loading` and `close-loading` press the quit key or close the
-/// window halfway through it),
+/// window halfway through it; `slow-measuring` holds every loudness
+/// measurement from then on that long before its first block, a load's and
+/// the background's; `background` waits until the background measurement
+/// holds a job, or has none at all),
 /// `drawn` (wait until the result's page is drawn), `back`, `retry`, `next`
 /// and `prev` on a result; a step out of place, or a chart not
 /// listed within [`STEP_TIMEOUT`], fails the run. A scenario
@@ -478,7 +522,7 @@ impl SelectScript {
                 Some(("wait", f)) => Ok(SelectStep::Wait(f.to_owned())),
                 Some(("search", t)) => Ok(SelectStep::Search(t.to_owned())),
                 Some(("sleep", ms)) => ms.parse().map(SelectStep::Sleep).map_err(|_| {
-                    format!("{s} is not pick=, wait=, search=, sleep=, idle=, slow-load=, enter, prev-preset, next-preset, drawn, back, retry, next, prev, close-measuring, quit-measuring, quit-decoding, quit-loading, close-loading or close")
+                    format!("{s} is not pick=, wait=, search=, sleep=, idle=, slow-load=, slow-measuring=, background=running, background=idle, enter, prev-preset, next-preset, drawn, back, retry, next, prev, close-measuring, quit-measuring, quit-decoding, quit-loading, close-loading or close")
                 }),
                 Some(("idle", ms)) => ms
                     .parse()
@@ -488,6 +532,12 @@ impl SelectScript {
                     .parse()
                     .map(SelectStep::SlowLoad)
                     .map_err(|_| format!("{s} takes milliseconds")),
+                Some(("slow-measuring", ms)) => ms
+                    .parse()
+                    .map(SelectStep::SlowMeasuring)
+                    .map_err(|_| format!("{s} takes milliseconds")),
+                Some(("background", "running")) => Ok(SelectStep::Background(true)),
+                Some(("background", "idle")) => Ok(SelectStep::Background(false)),
                 None if s == "enter" => Ok(SelectStep::Enter),
                 None if s == "prev-preset" => Ok(SelectStep::PrevPreset),
                 None if s == "next-preset" => Ok(SelectStep::NextPreset),
@@ -503,7 +553,7 @@ impl SelectScript {
                 None if s == "close-loading" => Ok(SelectStep::CloseLoading),
                 None if s == "close" => Ok(SelectStep::Close),
                 _ => Err(format!(
-                    "{s} is not pick=, wait=, search=, sleep=, idle=, slow-load=, enter, prev-preset, next-preset, drawn, back, retry, next, prev, close-measuring, quit-measuring, quit-decoding, quit-loading, close-loading or close"
+                    "{s} is not pick=, wait=, search=, sleep=, idle=, slow-load=, slow-measuring=, background=running, background=idle, enter, prev-preset, next-preset, drawn, back, retry, next, prev, close-measuring, quit-measuring, quit-decoding, quit-loading, close-loading or close"
                 )),
             })
             .map(|step| step.map(|s| (s, None)))

@@ -464,6 +464,18 @@ impl Selection {
                 Some(SelectStep::CloseLoading) => {
                     script.slow_load.get_or_insert_default().close = true;
                 }
+                Some(SelectStep::SlowMeasuring(ms)) => crate::dev::slow_measuring(ms),
+                Some(SelectStep::Background(running)) => {
+                    let (holds, idle) = self.shelf.background();
+                    if (running && !holds) || (!running && !idle) {
+                        if script.expired() {
+                            let what = if running { "held no job" } else { "kept a job" };
+                            script.fail(format!("the background measurement {what}"));
+                            controls.close();
+                        }
+                        return false;
+                    }
+                }
                 // Due here only when the chosen chart did not play.
                 Some(SelectStep::Play(_)) => {
                     if let Some(why) = script.refusal() {
@@ -1013,7 +1025,7 @@ impl PlayerRig<'_> {
             if let Some(script) = &mut sel.script {
                 script.chose();
             }
-            sel.shelf.pause();
+            sel.shelf.choose(path);
             sel.chosen_at = self.clock.now();
             let name = file_name(path);
             let after = since(sel.entered_at, sel.chosen_at).as_millis();
@@ -1391,7 +1403,7 @@ impl AppRig for PlayerRig<'_> {
         }
         // Requested again after the practice page released it, as a
         // choice does.
-        sel.shelf.pause();
+        sel.shelf.choose(loaded.path());
         let (rate, chosen_at) = (sel.rate, sel.chosen_at);
         let page = sel.loading.clone();
         #[cfg(feature = "dev-tools")]
@@ -1435,6 +1447,24 @@ impl AppRig for PlayerRig<'_> {
             .begin_load(Arc::new(chart.clone()), loaded.section().cloned());
         let rounds = loaded.section().map(|_| schedule.clone());
         let speed = loaded.config().speed;
+        // The chart's measurement running in the background is waited for
+        // before the sounds decode, so its 1× bank is gone before this
+        // load's: the load then finds its result.
+        let waiting = self.clock.now();
+        let sel = self.selection.as_mut().ok_or(ChartLoadError::NoSelection)?;
+        let controls = self.controls;
+        let render = &self.render;
+        let waited = sel.shelf.wait_background(
+            loaded.path(),
+            &file_name(loaded.path()),
+            || cancelled(controls),
+            || show_stage(render, page.as_ref(), Stage::Loudness),
+        );
+        if waited == Loading::Cancelled {
+            println!("load: cancelled");
+            return Ok(Loading::Cancelled);
+        }
+        let background = since(waiting, self.clock.now());
         show_stage(
             &self.render,
             page.as_ref(),
@@ -1526,7 +1556,20 @@ impl AppRig for PlayerRig<'_> {
             #[cfg(feature = "dev-tools")]
             quit,
         };
-        if sel.shelf.loaded(chart, &bank, &name, &mut host) == Loading::Cancelled {
+        if sel
+            .shelf
+            .loaded(chart, &bank, &name, loaded.path(), &mut host)
+            == Loading::Cancelled
+        {
+            // The quit key leaves the chart's measurement to the
+            // background; a close ends the run.
+            if !self.controls.quitting() {
+                sel.shelf.leave_to_background(crate::background::Job {
+                    source: loaded.source(),
+                    rate,
+                    name,
+                });
+            }
             // Closing or the quit key: nothing more is prepared, and the
             // flow leaves the chart.
             println!("load: cancelled");
@@ -1558,8 +1601,9 @@ impl AppRig for PlayerRig<'_> {
             "load: the chart is ready {} ms after its choice (chart {} ms, sounds {} ms, loudness {} ms, audio {} ms, screen {} ms)",
             ms(chosen_at, ready),
             ms(chosen_at, read),
-            ms(read, decoded),
-            ms(engine, measured),
+            // The wait for the background's measurement is the loudness's.
+            ms(read, decoded).saturating_sub(background.as_millis()),
+            ms(engine, measured) + background.as_millis(),
             ms(decoded, engine),
             ms(measured, ready),
         );
