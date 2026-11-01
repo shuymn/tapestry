@@ -282,6 +282,7 @@ fn skin_json_seeds_resolve_or_fail_as_built() {
             "judge",
             "gauge",
             "rates",
+            "readouts",
         ],
     );
     let imports: Vec<&str> = seeds::skin_imports().iter().map(|(n, _)| *n).collect();
@@ -514,6 +515,29 @@ fn skin_import_seeds_import_and_draw_as_built() {
                 // now, its whole percent past 3 cells; 75.00 overall,
                 // "00" twice; and the first image.
                 assert_eq!(drawn, [3 + 2 + 2 + 1; 4], "{name}");
+            }
+            "readouts" => {
+                use skin_beatoraja::{DeviationId, PropertyKind};
+                // Each readout number D4, and the adjustment condition
+                // twice; 15 is no value property, so `ref` 71 shows; 131
+                // resolves to nothing; 92 is unsupported.
+                let mut k = kinds(&i);
+                k.sort_by_key(|n| format!("{n:?}"));
+                let mut want = vec![NoteKind::Deviation(DeviationId::D4); 18];
+                want.push(NoteKind::Ignored { field: "value" });
+                want.push(NoteKind::UnsupportedProperty {
+                    kind: PropertyKind::Integer,
+                    id: Some(92),
+                });
+                want.sort_by_key(|n| format!("{n:?}"));
+                assert_eq!(k, want, "{name}");
+                assert_eq!(u.elements, 24, "{name}");
+                // No tempo, hi-speed or duration: their numbers stay
+                // hidden. Played: 0 min and "00" s; left: 0 min and 2 s;
+                // four covers at 0; EX 150 by `ref`; the covers on, not
+                // adjusting.
+                let images = 1 + 1 + 1;
+                assert_eq!(drawn, [1 + 2 + 1 + 1 + 4 + 3 + images; 4], "{name}");
             }
             _ => panic!("no expectation for seed {name}"),
         }
