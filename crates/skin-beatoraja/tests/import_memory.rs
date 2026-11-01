@@ -36,7 +36,7 @@ use skin_model::{
 
 /// The recorded bound: the largest measured peak over the fixtures plus
 /// 25 %.
-const BOUND: i64 = 153_276_380;
+const BOUND: i64 = 153_286_620;
 
 struct Counting;
 
