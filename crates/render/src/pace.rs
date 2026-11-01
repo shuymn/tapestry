@@ -2,7 +2,10 @@
 //! offscreen target's frames, so the renderer keeps at most one submitted
 //! frame whose GPU work is not known to be done, as a swap chain's frame
 //! latency bounds a window's. The bookkeeping is apart from wgpu, so tests
-//! drive completion and timeouts directly.
+//! drive completion and timeouts directly. It runs with every offscreen
+//! frame, play frames included.
+
+#![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
 /// The offscreen frame left pending on the GPU, of submission index `I`.
 #[derive(Debug)]
