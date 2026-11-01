@@ -56,6 +56,11 @@ pub static PLAY: Schema = Schema {
             },
             export: E,
         },
+        Field {
+            name: "load.percent",
+            ty: FieldTy::Int { lo: 0, hi: 100 },
+            export: E,
+        },
     ],
     timers: &[
         timer("ready", E),
@@ -113,6 +118,7 @@ pub static PLAY: Schema = Schema {
         timer("mine.5", T),
         timer("mine.6", T),
         timer("mine.7", T),
+        timer("loading", E),
     ],
     enums: &[],
 };
@@ -134,8 +140,10 @@ pub mod field {
     pub const NOTES: u16 = 10;
     /// The shown gauge, in ‰.
     pub const GAUGE: u16 = 11;
+    /// The chart's load, in %: 100 once it is loaded.
+    pub const LOAD_PERCENT: u16 = 12;
     /// The number of fields.
-    pub const COUNT: usize = 12;
+    pub const COUNT: usize = 13;
 }
 
 /// The built-in timer slots of [`PLAY`]; `when` timers follow from
@@ -166,8 +174,11 @@ pub mod timer {
     pub const COMBO_UP: u16 = 14;
     /// The first per-lane slot; see [`lane_timer`](super::lane_timer).
     pub const LANES: u16 = 15;
+    /// The chart's load, from its choice to the countdown
+    /// ([`SkinFrame::loading`](crate::SkinFrame::loading)).
+    pub const LOADING: u16 = 55;
     /// The number of built-in timers.
-    pub const BUILTIN: u16 = 55;
+    pub const BUILTIN: u16 = 56;
 }
 
 /// A judgment as the skin shows it: the five grades and the empty POOR.
@@ -263,6 +274,7 @@ mod tests {
             ("count.empty_poor", field::COUNT_EMPTY_POOR),
             ("notes", field::NOTES),
             ("gauge", field::GAUGE),
+            ("load.percent", field::LOAD_PERCENT),
         ];
         for (name, slot) in fields {
             assert_eq!(PLAY.field(name).map(|(s, _)| s), Some(slot), "{name}");
@@ -284,6 +296,7 @@ mod tests {
             ("judge.empty_poor", Grade::EmptyPoor.timer()),
             ("judge.empty_poor", timer::JUDGE_EMPTY_POOR),
             ("combo.up", timer::COMBO_UP),
+            ("loading", timer::LOADING),
         ];
         for (name, slot) in timers {
             assert_eq!(PLAY.timer(name).map(|(s, _)| s), Some(slot), "{name}");

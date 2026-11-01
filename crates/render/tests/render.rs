@@ -259,3 +259,48 @@ fn render_cpu_indicator() {
         us(100)
     );
 }
+
+/// Offscreen pacing on WARP (design.md "Headless runs"), printed, never
+/// compared: frames submitted as fast as the loop goes, then the time a
+/// read back waits for the GPU. The bound itself is the pacer's unit tests
+/// (`pace.rs`); timings here vary with the machine and its load.
+#[test]
+fn offscreen_pacing_indicator() {
+    const FRAMES: i64 = 60;
+    let mut r = Renderer::new(
+        render::Target::Offscreen {
+            width: 1_920,
+            height: 1_080,
+        },
+        render::AdapterChoice::Warp,
+    )
+    .expect("WARP renderer");
+    let mut b = ChartBuilder::new(150_000);
+    for i in 0..400 {
+        let l = u8::try_from(i % 8).unwrap();
+        b = b.tap(lane(l), TimeUs(i64::from(i) * 5 * MS));
+    }
+    r.load(&b.build().unwrap(), None).unwrap();
+    let v = view(42, 1_234);
+    let (mut slowest, mut skipped) = (std::time::Duration::ZERO, 0);
+    let began = std::time::Instant::now();
+    for k in 0..FRAMES {
+        let at = std::time::Instant::now();
+        let timing = r
+            .frame(&input(&v, TimeUs(k * 1_000), TimeUs(0), &[]))
+            .unwrap();
+        slowest = slowest.max(at.elapsed());
+        skipped += usize::from(!timing.presented);
+    }
+    let frames = began.elapsed();
+    let at = std::time::Instant::now();
+    let _ = r.read_back();
+    let read = at.elapsed();
+    println!(
+        "{FRAMES} frames ({skipped} skipped) in {} ms, the slowest {} ms; read back in {} ms",
+        frames.as_millis(),
+        slowest.as_millis(),
+        read.as_millis()
+    );
+    assert!(!r.read_back().is_empty());
+}

@@ -178,6 +178,7 @@ impl Drawn {
             target: self.target,
             layout: &Layout::AUTHOR,
             lanes: self.view,
+            loading: None,
             playing: true,
         };
         self.skin

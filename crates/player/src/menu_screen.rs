@@ -190,11 +190,21 @@ pub fn caret_area(page: &MenuPage, mut width: impl FnMut(&str) -> f32) -> Option
     ])
 }
 
-/// The top of line `i`, in layout pixels.
+/// The top of line `i` of the select screen, in layout pixels.
 fn line_top(i: usize) -> f32 {
-    // At most `PAGE_LINES` lines: exact in f32.
-    TOP + LINE_STEP * i as f32
+    lines_from(TOP, i)
 }
+
+/// The top of line `i` of lines starting at `top`.
+fn lines_from(top: f32, i: usize) -> f32 {
+    // At most `PAGE_LINES` lines: exact in f32.
+    top + LINE_STEP * i as f32
+}
+
+/// Where the load's lines start on the play screen while a chart loads:
+/// right of the lanes, under the measurement overlay's place.
+const LOADING_LEFT: f32 = 1_000.0;
+const LOADING_TOP: f32 = 400.0;
 
 /// The renderer, with the select screen's text when it draws menus.
 pub struct MenuScreen {
@@ -243,8 +253,9 @@ impl MenuScreen {
         self
     }
 
-    /// Lays `page` out and prepares it as this renderer's text.
-    fn prepare(&mut self, page: &MenuPage) -> Result<(), RenderError> {
+    /// Lays `page` out from `left` and `top` and prepares it as this
+    /// renderer's text.
+    fn prepare(&mut self, page: &MenuPage, left: f32, top: f32) -> Result<(), RenderError> {
         let Some(fonts) = self.fonts.as_mut() else {
             // A screen made for plays only: no font was looked for.
             return Err(render::text::TextError::NoFont {
@@ -259,8 +270,8 @@ impl MenuScreen {
             .enumerate()
             .map(|(i, line)| {
                 let style = TextStyle {
-                    left: LEFT,
-                    top: line_top(i),
+                    left,
+                    top: lines_from(top, i),
                     size: TEXT_SIZE,
                     color: line.style.color(),
                 };
@@ -376,6 +387,18 @@ impl Screen for MenuScreen {
         })
     }
 
+    fn loading(&mut self, page: &MenuPage, changed: bool) -> Result<FrameTiming, RenderError> {
+        if changed || self.text.is_none() {
+            self.prepare(page, LOADING_LEFT, LOADING_TOP)?;
+        }
+        let Some(text) = &self.text else {
+            return Err(RenderError::OtherRenderersText);
+        };
+        let timing = self.renderer.loading_frame(text)?;
+        self.shown(timing.presented);
+        Ok(timing)
+    }
+
     fn menu(&mut self, page: &MenuPage, changed: bool) -> Result<FrameTiming, RenderError> {
         let timing = self.menu_frame(page, changed)?;
         self.shown(timing.presented);
@@ -426,7 +449,7 @@ impl MenuScreen {
     /// Draws `page`, laid out again when `changed`.
     fn menu_frame(&mut self, page: &MenuPage, changed: bool) -> Result<FrameTiming, RenderError> {
         if changed || self.text.is_none() {
-            self.prepare(page)?;
+            self.prepare(page, LEFT, TOP)?;
         }
         let cursor = self.cursor;
         let underline = self.underline;

@@ -316,6 +316,7 @@ impl Harness {
             target: self.target,
             layout: &self.layout,
             lanes: self.view,
+            loading: None,
             playing: self.playing,
         };
         self.skin

@@ -6,6 +6,9 @@
 //! it, and waits idly on menus. The flow only asks it what happened and
 //! tells it what to do, as [`crate::live`] does for a play.
 //!
+//! - A chart chosen to play, and each practice Start, switches to the play
+//!   screen in its loading state at once ([`AppRig::entered_loading`]),
+//!   before anything is read; it lasts until the countdown or the way back.
 //! - A refused load returns to selection with the reason, and the chart
 //!   stays selected: a chart or preset file that cannot be used, a bank
 //!   that does not load, and a play the logic step refuses at the opening.
@@ -54,6 +57,13 @@ pub trait AppRig: Rig {
     ///
     /// Why the bank cannot be built: the chart is refused.
     fn load_chart(&mut self, loaded: &Loaded) -> Result<Loading, Self::BankError>;
+    /// A chart's load for play began: the play screen shows in its loading
+    /// state from here, before anything of `chart` is read, until the
+    /// play's countdown or a return to where the chart was chosen
+    /// (selection with a refusal or after a cancel, the practice page), or
+    /// the run's end. Called at every chosen chart to play and at every
+    /// practice Start, never at a retry, which loads nothing.
+    fn entered_loading(&mut self, chart: &Path);
     /// Shows on the select screen why the chosen chart was refused.
     fn show_refusal(&mut self, refusal: &LoadRefusal<Self::BankError>);
     /// Song selection was entered: called on every entry, before anything
@@ -402,6 +412,10 @@ impl App {
             }
             // The screen's measures are the chart's 1× times.
             config.speed = Speed::NORMAL;
+        } else {
+            // The loading state shows before the chart is read; a practice
+            // shows it at each Start instead.
+            rig.entered_loading(chart);
         }
         // Every chart reports to the run's one sink, never the parts' own.
         let mut loaded = match Loaded::load_reporting_to(
@@ -528,6 +542,7 @@ fn start_rounds<R: AppRig>(
     rig: &mut R,
 ) -> Result<Leave, Stopped<R::ScreenError>> {
     let notice = |e: &(dyn std::error::Error + 'static)| Stopped::Notice(Chain(e).to_string());
+    rig.entered_loading(loaded.path());
     if loaded.config().speed != screen.speed() {
         loaded.set_speed(screen.speed()).map_err(|e| notice(&e))?;
     }
