@@ -21,9 +21,11 @@ use bms_model::{Chart, ChartBuilder, TimeUs};
 use common::{GAUGES, attempt, context, input, offscreen, view};
 use decl_support::{Look, bundle};
 use eval::GaugeState;
-use render::{CommitError, MAX_SPRITES, PreparedToken, RenderError, Renderer, SkinBundle};
+use render::{
+    BundleError, CommitError, MAX_SPRITES, PreparedToken, RenderError, Renderer, SkinBundle,
+};
 use rules::GaugeValue;
-use skin_model::{BuildError, GaugeDesc, GaugeLook};
+use skin_model::{BuildError, GaugeDesc, GaugeLook, Side};
 
 const BLACK: [u8; 3] = [0; 3];
 const RED: [u8; 3] = [255, 0, 0];
@@ -88,6 +90,46 @@ fn blue() -> Look {
         copies: 9_000,
         ..Look::left([0, 0, 255, 255])
     }
+}
+
+/// A bundle is refused before anything is uploaded when its clip table
+/// lacks a clip the skin draws under, or when its atlas was built for
+/// another layer reservation than the renderer's, whose pages would be
+/// uploaded at the wrong layers.
+#[test]
+fn a_bundle_checks_its_clips_and_its_layers() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = offscreen(64, 64);
+    let skin = decl_support::skin(dir.path(), &red());
+    assert_eq!(skin.clip_count(), 1);
+    let limits = |reserved_layers| skin_model::AtlasLimits {
+        reserved_layers,
+        ..r.atlas_limits()
+    };
+    let atlas = |reserved| {
+        skin.atlas(skin_model::Variant::Lo, limits(reserved))
+            .unwrap()
+    };
+    let clip = || render::ClipTable::new(vec![[0.0, 0.0, 960.0, 1_080.0]]).unwrap();
+    let (no_clip, two, good) = (atlas(1), atlas(2), atlas(1));
+    let skin = Arc::new(skin);
+    let new = |atlas, clips| SkinBundle::new(Arc::clone(&skin), atlas, clips, Side::Left);
+    assert_eq!(
+        new(no_clip, render::ClipTable::default()).unwrap_err(),
+        BundleError::Clips {
+            referenced: 1,
+            clips: 0
+        }
+    );
+    assert_eq!(
+        new(two, clip()).unwrap_err(),
+        BundleError::Layers {
+            first: 2,
+            last: 2,
+            end: 1
+        }
+    );
+    assert!(new(good, clip()).is_ok());
 }
 
 /// A staged installation leaves the one in use drawing, through frames,

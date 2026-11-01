@@ -1465,3 +1465,21 @@ fn invalid_readouts_poison_the_play() {
         assert_eq!(h.try_frame_us(1_200 * MS, &[]), Ok(()));
     }
 }
+
+/// The clips a skin draws under: one past the highest clip an element
+/// names, and none without one.
+#[test]
+fn a_skin_counts_the_clips_its_elements_name() {
+    let clipped = |id: Option<u16>| ElementDef {
+        clip: id.map(ClipId),
+        ..element(TimerRef::Builtin(timer::READY), 0)
+    };
+    let skin = load(Vec::new(), vec![clipped(None)]).unwrap();
+    assert_eq!(skin.clip_count(), 0);
+    let skin = load(
+        Vec::new(),
+        vec![clipped(Some(2)), clipped(None), clipped(Some(0))],
+    )
+    .unwrap();
+    assert_eq!(skin.clip_count(), 3);
+}

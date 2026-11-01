@@ -1371,6 +1371,19 @@ impl Skin {
         self.image_choices.iter().map(|c| c.parts.len()).sum()
     }
 
+    /// The fixed clips its elements draw under: one past the highest
+    /// [`ClipId`] an element names, 0 when none does. A clip table of fewer
+    /// rectangles would leave some of them unclipped or undrawn.
+    #[must_use]
+    pub fn clip_count(&self) -> usize {
+        self.elements
+            .iter()
+            .filter_map(|e| e.key.clip)
+            .map(|c| usize::from(c.0) + 1)
+            .max()
+            .unwrap_or(0)
+    }
+
     /// The quads a frame can push: one per image element (an image choice
     /// element and a cover paint included, however long its table), each
     /// widget

@@ -29,7 +29,7 @@ use skin_model::{
 };
 
 use crate::projection::ClipTable;
-use crate::skin_atlas::{AtlasPages, PageLevels};
+use crate::skin_atlas::{AtlasPages, PageLevels, RESERVED_LAYERS};
 use crate::{AttemptInput, FrameInput, Gpu, PlaySkin, SkinError, SpriteBatch};
 
 /// Prepares the rasterized text of one attempt: the installation seam a
@@ -62,6 +62,25 @@ pub enum BundleError {
         frames: usize,
         /// The skin's.
         expected: usize,
+    },
+    /// The atlas's frames do not lie on its pages after the renderer's
+    /// reserved layers: it was built for another reservation.
+    #[error("the atlas's frames lie on layers {first} to {last}, not {RESERVED_LAYERS} to {end}")]
+    Layers {
+        /// The lowest layer a frame lies on.
+        first: u16,
+        /// The highest.
+        last: u16,
+        /// The highest layer the pages fill after the reserved ones.
+        end: u32,
+    },
+    /// The skin's elements name more fixed clips than the table has.
+    #[error("the skin draws under {referenced} clips, the table has {clips}")]
+    Clips {
+        /// The clips the skin names ([`Skin::clip_count`]).
+        referenced: usize,
+        /// The table's.
+        clips: usize,
     },
 }
 
@@ -100,7 +119,11 @@ impl SkinBundle {
     ///
     /// # Errors
     ///
-    /// [`BundleError::Atlas`] for an atlas of another sheet or length.
+    /// [`BundleError::Atlas`] for an atlas of another sheet or length,
+    /// [`BundleError::Layers`] for one built for another reservation than
+    /// the renderer's [`RESERVED_LAYERS`] (its pages are uploaded after
+    /// them), and [`BundleError::Clips`] for a clip table without every
+    /// clip the skin names.
     pub fn new(
         skin: Arc<Skin>,
         atlas: Atlas,
@@ -113,6 +136,23 @@ impl SkinBundle {
             return Err(BundleError::Atlas {
                 frames: uvs.frames().len(),
                 expected: skin.frame_count(),
+            });
+        }
+        // The packer fills its pages in order, so a frame lies on the
+        // first one; none lies past the last.
+        let layers = uvs.frames().iter().map(|f| f.layer);
+        if let (Some(first), Some(last)) = (layers.clone().min(), layers.max()) {
+            let pages = u32::try_from(pages.len()).unwrap_or(u32::MAX);
+            let end = RESERVED_LAYERS.saturating_add(pages).saturating_sub(1);
+            if u32::from(first) != RESERVED_LAYERS || u32::from(last) > end {
+                return Err(BundleError::Layers { first, last, end });
+            }
+        }
+        let referenced = skin.clip_count();
+        if referenced > clips.len() {
+            return Err(BundleError::Clips {
+                referenced,
+                clips: clips.len(),
             });
         }
         Ok(Self {

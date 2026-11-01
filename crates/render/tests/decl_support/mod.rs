@@ -117,9 +117,8 @@ impl AttemptText for Text {
     }
 }
 
-/// A bundle of `look` for `r`'s device, its image in `dir`, with its text
-/// producer when it has a text element.
-pub fn bundle(r: &Renderer, dir: &Path, look: &Look) -> (Arc<SkinBundle>, Option<Arc<Text>>) {
+/// The compiled skin of `look`, its image written in `dir`.
+pub fn skin(dir: &Path, look: &Look) -> Skin {
     let name = format!(
         "{:02x}{:02x}{:02x}-{}.png",
         look.rgba[0], look.rgba[1], look.rgba[2], look.side
@@ -154,7 +153,7 @@ pub fn bundle(r: &Renderer, dir: &Path, look: &Look) -> (Arc<SkinBundle>, Option
         text.source = Source::Text(0);
         elements.push(text);
     }
-    let skin = Skin::new(SkinDef {
+    Skin::new(SkinDef {
         fit: Fit::Fixed,
         regions: [RegionDef {
             anchor: Anchor::TopLeft,
@@ -167,7 +166,13 @@ pub fn bundle(r: &Renderer, dir: &Path, look: &Look) -> (Arc<SkinBundle>, Option
         widgets,
         bomb_up_to: None,
     })
-    .unwrap();
+    .unwrap()
+}
+
+/// A bundle of `look` for `r`'s device, its image in `dir`, with its text
+/// producer when it has a text element.
+pub fn bundle(r: &Renderer, dir: &Path, look: &Look) -> (Arc<SkinBundle>, Option<Arc<Text>>) {
+    let skin = skin(dir, look);
     let atlas = skin.atlas(Variant::Lo, r.atlas_limits()).unwrap();
     let uv = atlas.uvs().get(0).unwrap();
     let clips = ClipTable::new(look.clip.into_iter().collect()).unwrap();
