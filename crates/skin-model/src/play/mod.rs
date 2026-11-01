@@ -180,7 +180,7 @@ pub struct SkinFrame<'a> {
 }
 
 /// The chart's load as the play screen shows it before the countdown
-/// ([`LoadingFrame::load`]).
+/// ([`LoadingFrame::load`](crate::LoadingFrame::load)).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LoadState {
     /// The loading lifetime's origin on the loading clock: the moment the
