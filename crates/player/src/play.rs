@@ -16,11 +16,13 @@ use audio::OutputError;
 use bms_model::{TimeSource, TimeUs};
 use eval::JudgeEvent;
 use game::{
-    Advance, AudioQueue, AudioWaitError, Chain, Closing, Command, InputWaitError, MenuCommand,
-    Opening, PlayReport, RenderSide, RestoreError, Restored, ResultScreen, Rig, Settings, Tuning,
+    Advance, AudioQueue, AudioWaitError, Chain, Closing, Command, InputWaitError, Loaded,
+    MenuCommand, Opening, PlayReport, Preparation, RenderSide, RestoreError, Restored,
+    ResultScreen, Rig, Settings, Tuning,
 };
 use input::{QpcClock, SourceReader};
 
+use crate::attempt_context::{AttemptContext, SIMPLE_SCRATCH};
 use crate::audio_side::AudioLink;
 use crate::controls::Controls;
 use crate::end_screen::{self, Hints, LoadTimes, QueueLine};
@@ -479,6 +481,15 @@ impl Rig for PlayerRig<'_> {
         #[cfg(feature = "dev-tools")]
         self.scenario_pending();
         prepare_render(&mut self.end_page, &self.render)
+    }
+
+    /// The render thread prepares the attempt from its owned context; a
+    /// quit key or a close while it does cancels the wait.
+    fn prepare_attempt(&mut self, loaded: &Loaded) -> Result<Preparation, ScreenError> {
+        let attempt = AttemptContext::new(loaded.attempt(), SIMPLE_SCRATCH);
+        let rig = &*self;
+        rig.render
+            .prepare_attempt(attempt, || rig.quitting() || rig.controls.leaving())
     }
 
     fn open(&mut self, lead_in: TimeUs) -> Result<Opening<SourceReader>, InputWaitError> {

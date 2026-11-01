@@ -20,6 +20,7 @@ compile_error!("player is Windows-only");
 #[cfg(feature = "dev-tools")]
 mod alloc_count;
 mod args;
+mod attempt_context;
 mod audio_side;
 mod background;
 mod bests;

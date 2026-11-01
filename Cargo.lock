@@ -1782,6 +1782,7 @@ dependencies = [
  "rules",
  "rusqlite",
  "serde",
+ "skin-model",
  "tempfile",
  "thiserror 2.0.21",
  "toml",

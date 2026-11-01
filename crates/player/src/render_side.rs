@@ -36,11 +36,13 @@ use std::time::{Duration, Instant};
 
 use bms_model::{Chart, TimeSource, TimeUs};
 use eval::{JudgeEvent, Section};
-use game::{Chain, RenderSide, ResultGraphs};
+use game::{Chain, Preparation, PreparationRefusal, RenderSide, ResultGraphs};
 use input::QpcClock;
 use render::measure::{FrameStatistics, Presentation};
 use render::{FrameInput, FrameTiming, RenderError};
+use skin_model::PlayContext;
 
+use crate::attempt_context::AttemptContext;
 use crate::loading_text::LoadingUpdate;
 use crate::measure::{Drawn, Figures, Measure, PlayMeasure};
 use crate::menu_screen::{MenuPage, SPLASH};
@@ -55,6 +57,34 @@ pub trait Screen: Send {
     ///
     /// Why it cannot draw the chart.
     fn load(&mut self, chart: &Chart, section: Option<&Section>) -> Result<(), RenderError>;
+    /// Prepares `chart` for one attempt, `ctx`, borrowed for this call only,
+    /// and resets the play state. A skin that cannot draw the attempt
+    /// refuses it, and the screen stays usable for the menus. The default
+    /// prepares with [`load`](Self::load), the section's targets only for a
+    /// section, and takes its skin's refusal as the attempt's.
+    ///
+    /// # Errors
+    ///
+    /// Why the screen or its device cannot draw at all: the screen must be
+    /// built again.
+    fn prepare_attempt(
+        &mut self,
+        chart: &Chart,
+        ctx: &PlayContext<'_>,
+    ) -> Result<Preparation, RenderError> {
+        let section = match ctx.attempt {
+            skin_model::Attempt::Full { .. } => None,
+            skin_model::Attempt::Section(section) => Some(section),
+        };
+        match self.load(chart, section) {
+            Ok(()) => Ok(Preparation::Ready),
+            Err(RenderError::Skin(e)) => Ok(Preparation::Refused(PreparationRefusal {
+                location: None,
+                reason: e.reason,
+            })),
+            Err(e) => Err(e),
+        }
+    }
     /// Waits until a frame may start; `false` on a timeout. Returns at
     /// once without a frame latency waitable object.
     fn wait(&self) -> bool;
@@ -182,9 +212,20 @@ pub struct EndPage {
 
 /// What the game thread tells the render thread.
 pub enum RenderMsg {
-    /// Ready the screen for a play (build it again if it failed) and
-    /// answer when ready.
+    /// Make sure the screen can draw, building it again if it failed (the
+    /// device's recovery, for a play and the menus alike), and answer when
+    /// it can. It prepares no attempt.
     Prepare(mpsc::SyncSender<Result<(), RenderError>>),
+    /// Prepare the chart loaded last for this attempt, building the screen
+    /// again first if it failed, and answer how the preparation ended: a
+    /// refusal keeps the screen. Never [`Preparation::Cancelled`], which is
+    /// the game thread's.
+    PrepareAttempt {
+        /// The attempt, owned.
+        attempt: Box<AttemptContext>,
+        /// Where the answer goes.
+        reply: mpsc::SyncSender<Result<Preparation, RenderError>>,
+    },
     /// Another chart: prepare it, building the screen again if it failed,
     /// and answer when ready. Every play draws it until the next.
     Load {
@@ -245,6 +286,10 @@ pub struct View {
 /// How long the game thread waits for a chart's load: the render thread
 /// answers between frames, after the skin's uploads.
 const LOAD_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How often a waiting attempt's preparation looks at whether the player
+/// left.
+const CANCEL_POLL: Duration = Duration::from_millis(10);
 
 /// How long the end of the render thread is waited for: past it, the thread
 /// is left to the process's exit.
@@ -491,15 +536,54 @@ impl RenderLink {
         }
     }
 
-    /// Readies the screen for a play and waits until it is.
+    /// Makes sure the screen can draw, built again if it failed, and
+    /// waits until it can.
     ///
     /// # Errors
     ///
-    /// Why the screen cannot be built or cannot draw the chart.
+    /// Why the screen cannot be built.
     pub fn prepare(&self) -> Result<(), ScreenError> {
         let (tx, rx) = mpsc::sync_channel(1);
         self.send(RenderMsg::Prepare(tx));
         self.answer(&rx)
+    }
+
+    /// Prepares the chart loaded last for `attempt` and waits for the
+    /// answer, at most the answer's bound, looking at `cancelled` every
+    /// [`CANCEL_POLL`]: once it says so, the preparation is
+    /// [`Preparation::Cancelled`] without waiting further, and its answer
+    /// goes nowhere.
+    ///
+    /// # Errors
+    ///
+    /// Why the screen or its device cannot draw at all,
+    /// [`ScreenError::NoAnswer`] past the bound and [`ScreenError::Ended`]
+    /// when the render thread is gone.
+    pub fn prepare_attempt(
+        &self,
+        attempt: AttemptContext,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<Preparation, ScreenError> {
+        let (reply, rx) = mpsc::sync_channel(1);
+        self.send(RenderMsg::PrepareAttempt {
+            attempt: Box::new(attempt),
+            reply,
+        });
+        let deadline = Instant::now() + self.answer_timeout;
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match rx.recv_timeout(left.min(CANCEL_POLL)) {
+                Ok(answer) => return Ok(answer?),
+                Err(mpsc::RecvTimeoutError::Disconnected) => return Err(ScreenError::Ended),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+            }
+            if cancelled() {
+                return Ok(Preparation::Cancelled);
+            }
+            if Instant::now() >= deadline {
+                return Err(ScreenError::NoAnswer);
+            }
+        }
     }
 
     /// Prepares `chart` for every play from now on, and waits until it is.
@@ -839,7 +923,10 @@ impl Run {
             if msg.is_ok()
                 && !matches!(
                     msg,
-                    Ok(RenderMsg::Loading(_) | RenderMsg::Load { .. } | RenderMsg::Prepare(_))
+                    Ok(RenderMsg::Loading(_)
+                        | RenderMsg::Load { .. }
+                        | RenderMsg::Prepare(_)
+                        | RenderMsg::PrepareAttempt { .. })
                 )
             {
                 self.loading_stats.report("loading");
@@ -925,8 +1012,14 @@ impl Run {
                     continue;
                 }
                 Ok(RenderMsg::Prepare(reply)) => {
-                    let ready = self.prepare();
+                    let ready = self.recover();
                     let _ = reply.send(ready);
+                    mode = after_preparing(mode);
+                    continue;
+                }
+                Ok(RenderMsg::PrepareAttempt { attempt, reply }) => {
+                    let answer = self.prepare_attempt(&attempt);
+                    let _ = reply.send(answer);
                     mode = after_preparing(mode);
                     continue;
                 }
@@ -1209,7 +1302,38 @@ impl Run {
         }
     }
 
-    /// Resets the screen's play state, building it again after a failure.
+    /// Builds the screen again after a failure, without a chart: the
+    /// device's recovery. A screen that can draw is kept as it is.
+    fn recover(&mut self) -> Result<(), RenderError> {
+        if self.screen.is_none() {
+            self.granted = false;
+            self.screen = Some((self.make)()?);
+        }
+        self.shared.failed.store(false, Ordering::Release);
+        Ok(())
+    }
+
+    /// Prepares the chart loaded last for `attempt`, recovering the screen
+    /// first. A refusal keeps the screen and reports no failure; an error
+    /// drops it, to be built again.
+    fn prepare_attempt(&mut self, attempt: &AttemptContext) -> Result<Preparation, RenderError> {
+        self.recover()?;
+        let (Some(screen), Some(chart)) = (&mut self.screen, self.chart.as_deref()) else {
+            return Ok(Preparation::Refused(PreparationRefusal {
+                location: None,
+                reason: "no chart is loaded".to_owned(),
+            }));
+        };
+        let answer = screen.prepare_attempt(chart, &attempt.context());
+        if answer.is_err() {
+            self.screen = None;
+            self.granted = false;
+        }
+        answer
+    }
+
+    /// Prepares the chart loaded last and resets the screen's play state,
+    /// building it again after a failure.
     fn prepare(&mut self) -> Result<(), RenderError> {
         let chart = self.chart.as_deref();
         let section = self.section.as_ref();
@@ -1240,7 +1364,10 @@ mod tests {
     use input::{QpcClock, SourceReader};
     use render::{FrameInput, FrameTiming, RenderError, SkinError};
 
+    use game::Preparation;
+
     use super::{MakeScreen, NoFrames, RenderMsg, Screen, ScreenError, View, spawn};
+    use crate::attempt_context::AttemptContext;
     use crate::loading_text::{LoadingUpdate, Stage};
     use crate::measure::{Measure, PlayMeasure};
 
@@ -2051,11 +2178,11 @@ mod tests {
         }
     }
 
-    /// The section a chart is spawned or loaded with reaches the screen,
-    /// and every later preparation (a retry's) prepares with it, until a
-    /// load without one.
+    /// The section a chart is spawned or loaded with reaches the screen;
+    /// the screen's recovery prepares nothing, and every attempt prepares
+    /// the chart with its own section, or none for the whole chart.
     #[test]
-    fn load_carries_the_section_to_the_screen() {
+    fn each_attempt_prepares_with_its_own_section() {
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let noted = Arc::clone(&seen);
         let make: MakeScreen =
@@ -2080,18 +2207,219 @@ mod tests {
         .unwrap();
         link.load(Arc::clone(&chart), Some(section(2))).unwrap();
         link.prepare().unwrap();
-        link.load(chart, None).unwrap();
+        let ready = link.prepare_attempt(attempt(&chart, Some(&section(3))), || false);
+        assert_eq!(ready.unwrap(), Preparation::Ready);
         link.prepare().unwrap();
+        let ready = link.prepare_attempt(attempt(&chart, None), || false);
+        assert_eq!(ready.unwrap(), Preparation::Ready);
         assert_eq!(
             *seen.lock().unwrap(),
-            [
-                Some(section(1)),
-                Some(section(2)),
-                Some(section(2)),
-                None,
-                None
-            ]
+            [Some(section(1)), Some(section(2)), Some(section(3)), None]
         );
+        link.exit();
+    }
+
+    /// The attempt of `chart` the game would make: the default preset,
+    /// the whole chart or `section`'s round.
+    fn attempt(chart: &Chart, section: Option<&eval::Section>) -> AttemptContext {
+        let attempt = game::Attempt::new(
+            1,
+            chart,
+            &rules::tapestry(),
+            TimeUs(1_000_000),
+            section,
+            &game::ChartLabels::default(),
+        );
+        AttemptContext::new(attempt, crate::attempt_context::SIMPLE_SCRATCH)
+    }
+
+    /// A screen whose skin refuses every section's attempt and fails its
+    /// device on a whole chart's while `lost` is set; it notes its menu
+    /// frames by the number of the build that made it.
+    struct Refusing {
+        id: u32,
+        lost: Arc<AtomicBool>,
+        seen: Arc<std::sync::Mutex<Vec<u32>>>,
+    }
+
+    impl Screen for Refusing {
+        fn load(
+            &mut self,
+            _chart: &Chart,
+            section: Option<&eval::Section>,
+        ) -> Result<(), RenderError> {
+            if section.is_some() {
+                Err(RenderError::Skin(SkinError {
+                    reason: "no section".to_owned(),
+                }))
+            } else if self.lost.load(Ordering::Acquire) {
+                Err(RenderError::SurfaceLost)
+            } else {
+                Ok(())
+            }
+        }
+        fn wait(&self) -> bool {
+            true
+        }
+        fn paced(&self) -> bool {
+            false
+        }
+        fn build(&mut self, _f: &FrameInput<'_>) {}
+        fn draw(&mut self) -> Result<FrameTiming, RenderError> {
+            Ok(timing(true))
+        }
+        fn text(&mut self, _lines: &[&str]) -> Result<bool, RenderError> {
+            Ok(true)
+        }
+        fn menu(
+            &mut self,
+            _page: &crate::menu_screen::MenuPage,
+            _changed: bool,
+        ) -> Result<FrameTiming, RenderError> {
+            self.seen.lock().unwrap().push(self.id);
+            Ok(timing(true))
+        }
+        #[cfg(feature = "dev-tools")]
+        fn read_back(&self) -> Option<(u32, u32, Vec<u8>)> {
+            None
+        }
+    }
+
+    /// An attempt the skin refuses is answered with the skin's reason,
+    /// reports no failure and keeps the screen, which goes on drawing the
+    /// menus without being built again; a device failure while preparing
+    /// is an error that drops the screen, which the recovery builds again.
+    #[test]
+    fn a_refused_attempt_keeps_the_screen_and_reports_no_failure() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let lost = Arc::new(AtomicBool::new(false));
+        let builds = Arc::new(AtomicU32::new(0));
+        let (made, noted, gone) = (Arc::clone(&builds), Arc::clone(&seen), Arc::clone(&lost));
+        let make: MakeScreen = Box::new(move || {
+            let id = made.fetch_add(1, Ordering::SeqCst) + 1;
+            Ok(Box::new(Refusing {
+                id,
+                lost: Arc::clone(&gone),
+                seen: Arc::clone(&noted),
+            }) as Box<dyn Screen>)
+        });
+        let clock = QpcClock::start();
+        let link = spawn(
+            make,
+            None,
+            None,
+            clock,
+            view(),
+            measure(clock),
+            Box::new(NoFrames),
+        )
+        .unwrap();
+        let chart = Arc::new(ChartBuilder::new(120_000).build().unwrap());
+        link.load(Arc::clone(&chart), None).unwrap();
+        let round = eval::Section {
+            start: TimeUs(0),
+            end: TimeUs(1_000_000),
+            lead_in: TimeUs(2_000_000),
+            initial_gauges: Vec::new(),
+        };
+        let refused = link.prepare_attempt(attempt(&chart, Some(&round)), || false);
+        assert_eq!(
+            refused.unwrap(),
+            Preparation::Refused(game::PreparationRefusal {
+                location: None,
+                reason: "no section".to_owned(),
+            })
+        );
+        assert!(!link.failed(), "a refusal reported a failure");
+        link.send(RenderMsg::Menu(Box::default()));
+        assert!(wait_until(|| seen.lock().unwrap().len() >= 3));
+        assert!(!link.failed());
+        assert_eq!(
+            builds.load(Ordering::SeqCst),
+            1,
+            "the screen was built again"
+        );
+        assert!(seen.lock().unwrap().iter().all(|id| *id == 1));
+        let ready = link.prepare_attempt(attempt(&chart, None), || false);
+        assert_eq!(ready.unwrap(), Preparation::Ready);
+
+        lost.store(true, Ordering::Release);
+        let failed = link.prepare_attempt(attempt(&chart, None), || false);
+        assert!(
+            matches!(failed, Err(ScreenError::Render(RenderError::SurfaceLost))),
+            "{failed:?}"
+        );
+        lost.store(false, Ordering::Release);
+        link.prepare().unwrap();
+        assert_eq!(builds.load(Ordering::SeqCst), 2);
+        link.exit();
+    }
+
+    /// A screen whose chart preparation blocks while `hold` is set.
+    struct Held(Arc<AtomicBool>);
+
+    impl Screen for Held {
+        fn load(
+            &mut self,
+            _chart: &Chart,
+            _section: Option<&eval::Section>,
+        ) -> Result<(), RenderError> {
+            while self.0.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Ok(())
+        }
+        fn wait(&self) -> bool {
+            true
+        }
+        fn paced(&self) -> bool {
+            false
+        }
+        fn build(&mut self, _f: &FrameInput<'_>) {}
+        fn draw(&mut self) -> Result<FrameTiming, RenderError> {
+            Ok(timing(true))
+        }
+        fn text(&mut self, _lines: &[&str]) -> Result<bool, RenderError> {
+            Ok(true)
+        }
+        #[cfg(feature = "dev-tools")]
+        fn read_back(&self) -> Option<(u32, u32, Vec<u8>)> {
+            None
+        }
+    }
+
+    /// A slow attempt's preparation is cancelled as soon as the player
+    /// leaves, without waiting for the screen's answer.
+    #[test]
+    fn a_slow_attempt_is_cancelled_when_the_player_leaves() {
+        let hold = Arc::new(AtomicBool::new(false));
+        let held = Arc::clone(&hold);
+        let make: MakeScreen =
+            Box::new(move || Ok(Box::new(Held(Arc::clone(&held))) as Box<dyn Screen>));
+        let clock = QpcClock::start();
+        let link = spawn(
+            make,
+            None,
+            None,
+            clock,
+            view(),
+            measure(clock),
+            Box::new(NoFrames),
+        )
+        .unwrap();
+        let chart = Arc::new(ChartBuilder::new(120_000).build().unwrap());
+        link.load(Arc::clone(&chart), None).unwrap();
+        hold.store(true, Ordering::Release);
+        let started = Instant::now();
+        let leave = started + Duration::from_millis(100);
+        let answer = link.prepare_attempt(attempt(&chart, None), || Instant::now() >= leave);
+        assert_eq!(answer.unwrap(), Preparation::Cancelled);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        hold.store(false, Ordering::Release);
         link.exit();
     }
 

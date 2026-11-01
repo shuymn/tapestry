@@ -34,6 +34,7 @@ render.workspace = true
 replay.workspace = true
 rtrb.workspace = true
 rules.workspace = true
+skin-model.workspace = true
 serde = { workspace = true, optional = true }
 thiserror.workspace = true
 toml = { workspace = true, optional = true }
