@@ -3687,8 +3687,9 @@ mod tests {
     /// The render thread follows the window's size: the size published
     /// before it followed is applied, then each newest one, each once;
     /// minimized, the select page is drawn on unpaced and unpresented and
-    /// a preparation is answered, with no wait on the screen; the newest
-    /// size after the burst is the one left applied; and a screen built
+    /// a preparation is answered, with no wait on the screen; after the
+    /// burst the newest size is the one applied, and the page, sent again
+    /// since a preparation stops it, is drawn presented; and a screen built
     /// again takes the size afresh. With the size applied only on a
     /// message, the first size would never reach the screen; with the
     /// pacing kept while minimized, the screen would be waited on.
@@ -3739,6 +3740,9 @@ mod tests {
         assert!(wait_until(|| frames.lock().unwrap().len() >= before + 3));
         assert!(frames.lock().unwrap().last() == Some(&true));
         assert!(link.prepare().is_ok());
+        // A preparation stops the select screen (`after_preparing`): the
+        // page is sent again, as selection sends it after a load.
+        link.send(RenderMsg::Menu(Box::default()));
         assert_eq!(waited_minimized.load(Ordering::SeqCst), 0);
         for size in [(1_024, 768), (1_280, 720), (2_560, 1_080)] {
             extent.publish(size.0, size.1);
