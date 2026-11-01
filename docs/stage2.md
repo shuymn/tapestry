@@ -1238,9 +1238,14 @@ Choosing a refused chart and seeing a chart added are covered by `unrunnable_ste
 1. **Library.** Set `[library] roots` and start `tapestry`. The library fills, Japanese titles read correctly, and search works by kana and by a romanized word present in some chart's metadata.
 2. **Default preset.** On a fresh data root, plays use beatoraja-style and `presets\` stays empty. A `player.toml` naming `tapestry` plays tapestry, and one naming `custom.toml` is refused with an error naming it.
 3. **The loop.**
-   - Choose a chart; play starts within 1-2 s.
-   - Play to the end, step through the three presets, retry several times, go back and change charts. Do this with both keyboard and controller.
-   - A refused chart shows why, and new charts still appear.
+   - Choose a chart: the screen goes straight to the play screen, which shows the load's stage over the lanes, and the countdown starts once it is ready. A chart played before starts within 1-2 s; a chart's first play also measures its loudness first.
+   - Quit during the load: selection returns at once, and a measurement in progress finishes in the background, so the next choice of that chart starts without measuring.
+   - Choose the play preset on the select screen (F11 and F12, or the controller's preset key).
+   - Play to the end and read the result: the gauge history and the early/late distribution. Step through the three presets, retry several times, go back and change charts. Do this with both keyboard and controller, and scroll the list with the scratch in both directions.
+   - Quit during a play: the result shows the play as aborted. Quit during the countdown: selection returns. After the last note, quit skips the remaining sound to the result.
+   - Long notes stay drawn to their end, lit while held.
+   - A refused chart shows why, and new charts still appear; while the scan adds charts, the chart under the cursor stays where it is.
+   - Search with the IME: its candidates appear at the search box.
 4. **Preset reload.** Export LR2-style as a user preset (`eval-cli preset export lr2-style %LOCALAPPDATA%\tapestry\presets\my-rules.toml`), choose it, and edit `presets\my-rules.toml` while it is shown; it updates at the next poll.
 5. **Practice.** Practice a section at 75 % with repeat. After the section is judged the BGM plays on briefly without notes and fades out, the next round starts, and long BGM is already playing at its start.
 6. **eval-cli.** Run it over saved records with two presets, and see a refusal for a record from before a version bump.
