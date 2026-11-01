@@ -20,10 +20,10 @@ use skin_model::{
 use super::super::policy::{CriticalPart, Role};
 use super::super::property::{self, IndexProp, IntProp, Value};
 use super::super::report::{NoteKind, PropertyKind, Span, TrackWhy};
-use super::super::{Common, Cx, Dst, Prop, TimerWhy};
+use super::super::{Common, Cx, Dst, Prop};
 #[cfg(test)]
 use super::super::{Event, trace};
-use super::{SrcImage, Unplaced, untimed_refused};
+use super::{SrcImage, Unplaced};
 use crate::error::ImportError;
 use crate::tree::Kind;
 
@@ -208,13 +208,8 @@ impl Cx<'_> {
         };
         let (src, deviates) = selector;
         let value = self.selector(src, at)?;
-        let cycle = match self.cycle(at, q, &s.timer, s.cycle)? {
-            Ok((cycle, on_timer)) => {
-                if untimed_refused(&c, cycle.is_none() || on_timer) {
-                    return self.drop_el(c.role, at, NoteKind::Timer(TimerWhy::Untimed));
-                }
-                cycle
-            }
+        let cycle = match self.src_cycle(&c, q, s)? {
+            Ok(cycle) => cycle,
             Err(why) => return self.drop_el(c.role, at, why),
         };
         let (image, cell) = match self.admit_choice(&c, rec, s)? {
@@ -288,13 +283,8 @@ impl Cx<'_> {
             };
             let s = self.src_image(rec)?;
             let n = self.grid_frames(at, s.div)?;
-            let cycle = match self.cycle(at, n, &s.timer, s.cycle)? {
-                Ok((cycle, on_timer)) => {
-                    if untimed_refused(&c, cycle.is_none() || on_timer) {
-                        return self.drop_el(c.role, at, NoteKind::Timer(TimerWhy::Untimed));
-                    }
-                    cycle
-                }
+            let cycle = match self.src_cycle(&c, n, &s)? {
+                Ok(cycle) => cycle,
                 Err(why) => return self.drop_el(c.role, at, why),
             };
             match self.admit_choice(&c, rec, &s)? {

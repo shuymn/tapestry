@@ -9,7 +9,7 @@ pub(super) mod lanes;
 pub(super) mod number;
 pub(super) mod text;
 
-use skin_model::{ImageDef, MAX_SKIN_FRAMES, Native, Source};
+use skin_model::{CycleDef, ImageDef, MAX_SKIN_FRAMES, Native, Source};
 
 use super::asset::{self, Crop, Failed, ImageKey, Path};
 use super::budget::ImportLimit;
@@ -51,7 +51,7 @@ pub(super) struct SrcImage {
 /// Whether `c`, critical and untimed, would draw what depends on when
 /// the state started (owner decision 7, D3): its track static from 0 and
 /// perpetual, and every cycle it shows `cycle_ok` (absent or on a timer).
-pub(super) fn untimed_refused(c: &Common, cycle_ok: bool) -> bool {
+fn untimed_refused(c: &Common, cycle_ok: bool) -> bool {
     c.untimed
         && matches!(c.role, Role::Critical(_))
         && !super::policy::untimed_ok(
@@ -71,6 +71,26 @@ impl Cx<'_> {
             .ok()
             .filter(|&n| usize::try_from(n).is_ok_and(|n| n <= MAX_SKIN_FRAMES))
             .ok_or_else(|| self.limit(at, ImportLimit::Frames))
+    }
+
+    /// The cycle of `s` over `frames` for `c`, resolved before its sheet
+    /// is admitted, or why `c` is dropped: its timer or cycle refused, or
+    /// `c` critical and untimed where it shows what the state's start
+    /// decides (D3).
+    pub(super) fn src_cycle(
+        &mut self,
+        c: &Common,
+        frames: u32,
+        s: &SrcImage,
+    ) -> Result<Result<Option<CycleDef>, NoteKind>, ImportError> {
+        let (cycle, on_timer) = match self.cycle(c.span, frames, &s.timer, s.cycle)? {
+            Ok(v) => v,
+            Err(why) => return Ok(Err(why)),
+        };
+        if untimed_refused(c, cycle.is_none() || on_timer) {
+            return Ok(Err(NoteKind::Timer(super::TimerWhy::Untimed)));
+        }
+        Ok(Ok(cycle))
     }
 
     /// The `image` record of id `id`, the first of it: the play objects
@@ -157,17 +177,13 @@ impl Cx<'_> {
         let at = c.span;
         let role = c.role;
         let frames = self.grid_frames(at, grid)?;
-        let (cycle, cycle_on_timer) = match self.cycle(at, frames, &s.timer, s.cycle)? {
-            Ok(v) => v,
+        let cycle = match self.src_cycle(c, frames, s)? {
+            Ok(cycle) => cycle,
             Err(why) => {
                 self.drop_el(role, at, why)?;
                 return Ok(None);
             }
         };
-        if untimed_refused(c, cycle.is_none() || cycle_on_timer) {
-            self.drop_el(role, at, NoteKind::Timer(super::TimerWhy::Untimed))?;
-            return Ok(None);
-        }
         let linear = c.filter == skin_model::Filter::Linear;
         let key = (rec, linear, grid, false);
         if let Some((def, cell)) = self.assets.base(key) {
