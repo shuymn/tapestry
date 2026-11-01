@@ -118,12 +118,16 @@ pub struct Unfit {
 
 impl std::fmt::Display for Unfit {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let refused = self.refused.as_ref().map(|e| crate::Chain(e).to_string());
-        let parts: Vec<String> = refused
-            .into_iter()
-            .chain(reset_notice(&self.resets))
-            .collect();
-        f.write_str(&parts.join("; "))
+        let mut sep = "";
+        if let Some(e) = &self.refused {
+            write!(f, "{}", crate::Chain(e))?;
+            sep = "; ";
+        }
+        for reset in &self.resets {
+            write!(f, "{sep}{reset}")?;
+            sep = "; ";
+        }
+        Ok(())
     }
 }
 

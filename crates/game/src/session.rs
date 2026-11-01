@@ -650,11 +650,16 @@ impl Loaded {
         self.chart_record = read.record;
         self.labels = read.labels;
         self.warnings = read.warnings;
+        self.clear_practice();
+        Ok(())
+    }
+
+    /// Drops the practice set up, its fit and the gauges it lost.
+    fn clear_practice(&mut self) {
         self.practice = None;
         self.practiced = None;
         self.fitted = None;
         self.lost.clear();
-        Ok(())
     }
 
     /// The chart read again from its file at `speed`, with the same seed
@@ -706,10 +711,7 @@ impl Loaded {
     /// this chart under the current preset; the setup is unchanged.
     pub fn set_practice(&mut self, practice: Option<Practice>) -> Result<(), PracticeError> {
         let Some(practice) = practice else {
-            self.practice = None;
-            self.practiced = None;
-            self.fitted = None;
-            self.lost.clear();
+            self.clear_practice();
             return Ok(());
         };
         if self.config.autoplay.is_some() {
@@ -741,14 +743,7 @@ impl Loaded {
             self.first_error = Some(e);
         }
         self.lost.clear();
-        let (initial_gauges, resets) = self.fit(&set_under, &practice.initial_gauges);
-        self.settle(
-            Practice {
-                initial_gauges,
-                ..practice
-            },
-            resets,
-        )
+        self.settle(&set_under, practice)
     }
 
     /// Fits values set under `from`, in its gauges' order, to the play
@@ -794,14 +789,16 @@ impl Loaded {
                 _ => g.start,
             })
             .collect();
-        self.fitted = Some(initial_gauges.clone());
         (initial_gauges, resets)
     }
 
-    /// Sets up the fitted `practice`, refused with the `resets` when there
-    /// are any or when its section is: a round never plays a reset value
-    /// the player set.
-    fn settle(&mut self, practice: Practice, resets: Vec<Reset>) -> Result<(), Unfit> {
+    /// Sets up `practice`, its values set under `from`, fitted to the play
+    /// preset ([`fit`](Self::fit)); refused with what the fit reset when it
+    /// reset any value or the section is refused: a round never plays a
+    /// reset value the player set.
+    fn settle(&mut self, from: &RulePreset, mut practice: Practice) -> Result<(), Unfit> {
+        let resets;
+        (practice.initial_gauges, resets) = self.fit(from, &practice.initial_gauges);
         let fitted = practice.initial_gauges.clone();
         let refused = self.set_practice(Some(practice)).err();
         // What the page shows stays the fit's, the section refused or not.
@@ -837,14 +834,7 @@ impl Loaded {
             return Ok(());
         }
         let (practice, practiced) = (practice.clone(), practiced.clone());
-        let (initial_gauges, resets) = self.fit(&practiced, &practice.initial_gauges);
-        self.settle(
-            Practice {
-                initial_gauges,
-                ..practice
-            },
-            resets,
-        )
+        self.settle(&practiced, practice)
     }
 
     /// The initial value of the gauge `id` the last fit to the play preset

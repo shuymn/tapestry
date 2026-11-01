@@ -30,12 +30,20 @@ pub enum Preparation {
 /// where it was found when that is known (a skin file and its position),
 /// for selection, the practice page or the console.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
-#[error("{}", match .location { Some(at) => format!("{at}: {}", .reason), None => .reason.clone() })]
 pub struct PreparationRefusal {
     /// Where the problem was found, if known.
     pub location: Option<String>,
     /// What it is.
     pub reason: String,
+}
+
+impl std::fmt::Display for PreparationRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(at) = &self.location {
+            write!(f, "{at}: ")?;
+        }
+        f.write_str(&self.reason)
+    }
 }
 
 /// What an attempt plays.
