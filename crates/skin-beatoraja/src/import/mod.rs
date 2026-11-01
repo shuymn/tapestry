@@ -948,7 +948,6 @@ impl<'d> Cx<'d> {
             if o.allow.contains(&id) {
                 continue;
             }
-            let value = value(self, id);
             if reserved(id) {
                 if o.follow {
                     lift |= id == OFFSET_LIFT;
@@ -963,7 +962,7 @@ impl<'d> Cx<'d> {
             if id == OFFSET_ALL {
                 continue;
             }
-            let Some(v) = value else {
+            let Some(v) = value(self, id) else {
                 continue;
             };
             offset.x += i64::from(v.x);
