@@ -2,7 +2,8 @@
 //!
 //! The batch keeps one ordered list, so an alpha quad pushed after an
 //! additive one is drawn after it, and splits it into runs wherever the
-//! blend or the clip changes; a renderer draws the runs in order.
+//! blend, the clip or the inline clip rect changes; a renderer draws the
+//! runs in order, each under both of its clips.
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
@@ -61,10 +62,36 @@ pub struct RunKey {
     pub clip: Option<ClipId>,
 }
 
-/// The quads `start..end` of a batch, all with `key`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// A clip rect a quad carries itself, in canvas pixels: left, top, width
+/// and height, every value finite and the width and height positive.
+///
+/// A renderer draws a run under the intersection of its key's clip
+/// ([`RunKey::clip`]) and this rect; an empty intersection draws nothing.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ClipRect([f32; 4]);
+
+impl ClipRect {
+    /// The rect `[x, y, w, h]`; `None` unless every value is finite and
+    /// the width and height are positive.
+    #[must_use]
+    pub fn new(rect: [f32; 4]) -> Option<Self> {
+        let [.., w, h] = rect;
+        (rect.iter().all(|v| v.is_finite()) && w > 0.0 && h > 0.0).then_some(Self(rect))
+    }
+
+    /// Left, top, width, height.
+    #[must_use]
+    pub fn rect(self) -> [f32; 4] {
+        self.0
+    }
+}
+
+/// The quads `start..end` of a batch, all with `key` and `clip_rect`.
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Run {
     pub key: RunKey,
+    /// The rect every quad of the run is clipped to besides `key.clip`.
+    pub clip_rect: Option<ClipRect>,
     pub start: u32,
     pub end: u32,
 }
@@ -127,16 +154,28 @@ impl QuadBatch {
         self.dropped = self.dropped.saturating_add(1);
     }
 
-    /// Adds `quad` with `key`, extending the last run when its key is
-    /// equal. Returns `false` and counts the quad as dropped when the quad
-    /// list is full, or when it needs a new run and the run list is full.
+    /// Adds `quad` with `key` and no clip rect, extending the last run when
+    /// its key is equal and it has no clip rect. Returns `false` and counts
+    /// the quad as dropped when the quad list is full, or when it needs a
+    /// new run and the run list is full.
     pub fn push(&mut self, key: RunKey, quad: Quad) -> bool {
+        self.push_in(key, None, quad)
+    }
+
+    /// [`push`](Self::push) with the quad clipped to `rect` as well: the
+    /// last run is extended only when its key and its clip rect are both
+    /// equal.
+    pub fn push_clipped(&mut self, key: RunKey, quad: Quad, rect: ClipRect) -> bool {
+        self.push_in(key, Some(rect), quad)
+    }
+
+    fn push_in(&mut self, key: RunKey, clip_rect: Option<ClipRect>, quad: Quad) -> bool {
         let len = self.len();
         if len >= self.quad_cap {
             return self.drop_one();
         }
         match self.runs.last_mut() {
-            Some(run) if run.key == key => run.end = len + 1,
+            Some(run) if run.key == key && run.clip_rect == clip_rect => run.end = len + 1,
             _ => {
                 let runs_full = u32::try_from(self.runs.len()).map_or(true, |n| n >= self.run_cap);
                 if runs_full {
@@ -144,6 +183,7 @@ impl QuadBatch {
                 }
                 self.runs.push(Run {
                     key,
+                    clip_rect,
                     start: len,
                     end: len + 1,
                 });
@@ -160,7 +200,7 @@ impl QuadBatch {
     }
 
     /// The runs, in push order; they cover the quads contiguously, and
-    /// neighbouring runs have different keys.
+    /// neighbouring runs differ in key or clip rect.
     #[must_use]
     pub fn runs(&self) -> &[Run] {
         &self.runs

@@ -112,7 +112,7 @@ pub use play::{
     Attempt, BpmRange, BuildError, CoverSettings, DurationRatio, FrameReadouts, GaugeDesc,
     LoadState, Play, PlayContext, PrepareError, SkinFrame,
 };
-pub use quad::{Blend, ClipId, Filter, Quad, QuadBatch, Run, RunKey};
+pub use quad::{Blend, ClipId, ClipRect, Filter, Quad, QuadBatch, Run, RunKey};
 pub use schema::{EnumDef, EnumId, Export, Field, FieldTy, Schema, SchemaError, TimerDef, Ty};
 pub use skin::{
     ElementDef, LoadError, MAX_COORD, MAX_ELEMENTS, MAX_SKIN_KEYS, MAX_WHEN_TIMERS,
