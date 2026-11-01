@@ -252,6 +252,56 @@ fn fit_width_hidden_plus_is_trimmed_after_its_stretch() {
     let none = hidden_object("").replace(r#""disapearLine": 200"#, r#""disapearLine": -1"#);
     let l = with(&none, &[&hidden(r#""stretch": 4"#)]);
     assert!(!has(l.report(), d9(LaneApprox::HiddenStretch)));
+    // Enlarged, it rises above where the source decides: a 43×10 cell
+    // fit to 430 is 100 high, centred on a 10 px destination at rest at
+    // [800, 810]. 500 ‰ raises them to [455, 555] and [500, 510]; a fixed
+    // line at 590 (490) leaves the unstretched edge below it, so the
+    // source draws nothing, and the model draws the stretched one down to
+    // the line.
+    let cell = |line: &str| {
+        hidden_object(r#""isDisapearLineLinkLift": false"#)
+            .replace(
+                r#""x": 32, "y": 24, "w": 16, "h": 16"#,
+                r#""x": 0, "y": 0, "w": 43, "h": 10"#,
+            )
+            .replace(r#""disapearLine": 200"#, line)
+    };
+    let small = hidden(r#""stretch": 4"#).replace(
+        r#""y": -400, "w": 430, "h": 600"#,
+        r#""y": 270, "w": 430, "h": 10"#,
+    );
+    let whole = quads(
+        &with(&cell(r#""disapearLine": -1"#), &[&small]),
+        [0, 0, 500],
+    );
+    let [w] = &whole[..] else {
+        panic!("one HIDDEN+: {whole:?}");
+    };
+    assert_eq!(w.rect, [20.0, 455.0, 430.0, 100.0]);
+    let objects = format!("{}, {}", note(""), cell(r#""disapearLine": 590"#));
+    let text = body("", &objects, &[NOTES, &small]);
+    let l = import_body(&text);
+    let cut = quads(&l, [0, 0, 500]);
+    let [q] = &cut[..] else {
+        panic!("one HIDDEN+: {cut:?}");
+    };
+    let [u0, v0, u1, v1] = w.uv;
+    assert_eq!(q.rect, [20.0, 455.0, 430.0, 35.0]);
+    assert_eq!(q.uv, [u0, v0, u1, v0 + (v1 - v0) * 0.35]);
+    // Noted at its destination, which the body starts on the skin's
+    // second line.
+    let found: Vec<_> = l
+        .report()
+        .notes
+        .iter()
+        .filter(|n| n.kind == d9(LaneApprox::HiddenStretch))
+        .map(|n| n.at.map(|at| (at.line, at.col)))
+        .collect();
+    let before = &text[..text.find(r#"{"id": "hid", "stretch""#).unwrap()];
+    let line = 2 + before.matches('\n').count();
+    let col = before.rsplit('\n').next().unwrap().len() + 1;
+    let at = [line, col].map(|v| u32::try_from(v).unwrap());
+    assert_eq!(found, [Some((at[0], at[1]))]);
     // A 16×32 cell fit to 430 would be 860 high: stretch 5 keeps the
     // destination and crops the cell's middle rows, as SUDDEN+.
     let tall = hidden_object("").replace(r#""h": 16"#, r#""h": 32"#);
