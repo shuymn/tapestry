@@ -15,7 +15,7 @@ use crate::layout::{Controls, Layout, Region, RegionDef};
 use crate::place::{Bind, Bounds, Fill, Follow, Native, Place, Placement, Regions, union};
 use crate::play::schema::Grade;
 use crate::play::schema::timer::BUILTIN;
-use crate::play::{Play, PlayContext, PrepareError, SkinFrame};
+use crate::play::{BuildError, Play, PlayContext, PrepareError, SkinFrame};
 use crate::quad::{Blend, ClipId, Filter, QuadBatch, RunKey};
 use crate::schema::Ty;
 use crate::track::Track;
@@ -1237,22 +1237,32 @@ impl Skin {
     /// while the snapshot's gauge is below its maximum; if a below-maximum
     /// effect is dropped and the gauge later refills, it keeps the earlier
     /// start.
+    ///
+    /// # Errors
+    ///
+    /// [`BuildError::InconsistentTally`] when the snapshot counts more
+    /// empty POORs as POORs than it has POORs, and on every build after
+    /// that until a fresh [`prepare`](Self::prepare): nothing is appended
+    /// and `play` keeps its state, its effects not applied. The caller
+    /// stops the attempt and prepares again, or ends the play with an
+    /// error; it never builds on that `play` again (stage3.md S10).
     pub fn build(
         &self,
         play: &mut Play,
         frame: &SkinFrame<'_>,
         uvs: &UvTable,
         out: &mut QuadBatch,
-    ) {
+    ) -> Result<(), BuildError> {
+        play.check()?;
         if play.slots() != usize::from(BUILTIN) + self.whens.len()
             || uvs.sheet_id() != self.sheet_id
             || uvs.frames().len() != self.frame_count
         {
-            return;
+            return Ok(());
         }
         let canvas = self.canvas(frame.target);
         let placement = self.placement(&canvas, frame.layout, play.scratch());
-        play.fill(frame, &self.whens);
+        play.fill(frame, &self.whens)?;
         let play = &*play;
         let state = play.state();
         // A table of another length draws no text.
@@ -1364,6 +1374,7 @@ impl Skin {
                 }
             }
         }
+        Ok(())
     }
 }
 
@@ -1445,6 +1456,7 @@ mod tests {
             gauges: &[],
             attempt: Attempt::Full { lead_in: TimeUs(0) },
             empty_poor_breaks_combo: false,
+            empty_poor_counted: false,
             scratch: Side::Left,
             ln_default: rules::LnMode::Ln,
             last_note_end: TimeUs(0),

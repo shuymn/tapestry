@@ -57,6 +57,19 @@ impl GaugeLook {
         self as usize
     }
 
+    /// The look's value in the `gauge_kind` enum of `gauge.kind`
+    /// ([`GAUGE_KIND_ENUM`](crate::GAUGE_KIND_ENUM)).
+    pub(crate) const fn schema_value(self) -> i32 {
+        match self {
+            Self::AssistEasy => 0,
+            Self::Easy => 1,
+            Self::Normal => 2,
+            Self::Hard => 3,
+            Self::ExHard => 4,
+            Self::Hazard => 5,
+        }
+    }
+
     /// The look of a preset's gauge: by its id when it is one of the
     /// built-in presets' (`assist_easy`, `easy`, `normal`, `hard`,
     /// `ex_hard`, `hazard`), else by its kind (`Normal` for an end

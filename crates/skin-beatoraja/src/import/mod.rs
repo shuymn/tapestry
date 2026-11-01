@@ -257,6 +257,9 @@ struct Common {
     untimed: bool,
     /// The joined visibility source, empty when always visible.
     cond_src: String,
+    /// Whether a condition differs from the source's in an owner-decided
+    /// way, or the element's value does: a D4 note when it is retained.
+    display_deviation: bool,
 }
 
 /// The import's running state.
@@ -824,6 +827,7 @@ impl<'d> Cx<'d> {
 
         // Conditions.
         let mut conds: Vec<String> = Vec::new();
+        let mut deviates = false;
         let mut seen = BTreeSet::new();
         for op in &dst.ops {
             let cond = match op {
@@ -846,7 +850,7 @@ impl<'d> Cx<'d> {
                     }
                 },
             };
-            if !self.condition(role, at, cond, &mut conds)? {
+            if !self.condition(role, at, cond, &mut conds, &mut deviates)? {
                 return Ok(None);
             }
         }
@@ -855,7 +859,7 @@ impl<'d> Cx<'d> {
             Prop::Id(n) => {
                 if ops::is_builtin(i32::try_from(n.unsigned_abs()).unwrap_or(0)) {
                     let c = ops::numeric(*n, &BTreeMap::new(), self.custom.judge_region);
-                    if !self.condition(role, at, c, &mut conds)? {
+                    if !self.condition(role, at, c, &mut conds, &mut deviates)? {
                         return Ok(None);
                     }
                 } else {
@@ -871,7 +875,7 @@ impl<'d> Cx<'d> {
                     self.drop_el(role, at, why)?;
                     return Ok(None);
                 };
-                if !self.condition(role, at, c, &mut conds)? {
+                if !self.condition(role, at, c, &mut conds, &mut deviates)? {
                     return Ok(None);
                 }
             }
@@ -1068,24 +1072,31 @@ impl<'d> Cx<'d> {
             untimed,
             track,
             cond_src: src,
+            display_deviation: deviates,
         }))
     }
 
-    /// Applies one condition: `Ok(false)` when the element is dropped or
-    /// never drawn. A repeated expression adds nothing: the supported
-    /// conditions are a closed set whose joined source fits the
-    /// compiler's limit (`ops`' tests), so a long list builds no more.
+    /// Applies one condition, setting `deviates` for a D4 one: `Ok(false)`
+    /// when the element is dropped or never drawn. A repeated expression
+    /// adds nothing: the supported conditions are a closed set, so a long
+    /// list builds no more; one destination listing more of them than one
+    /// source holds is refused at its location (`ops`' tests).
     fn condition(
         &mut self,
         role: Role,
         at: Span,
         c: Cond,
         conds: &mut Vec<String>,
+        deviates: &mut bool,
     ) -> Result<bool, ImportError> {
         match c {
-            Cond::Expr(e) => {
-                if !conds.contains(&e) {
-                    conds.push(e);
+            Cond::Expr {
+                src,
+                display_deviation,
+            } => {
+                *deviates |= display_deviation;
+                if !conds.contains(&src) {
+                    conds.push(src);
                 }
                 Ok(true)
             }
@@ -1243,7 +1254,7 @@ impl<'d> Cx<'d> {
         track: Track,
         native: Option<Native>,
     ) -> Result<(), ImportError> {
-        self.cover_motion(&c)?;
+        self.retained(&c)?;
         self.elements.push(ElementDef {
             source,
             track,
@@ -1260,6 +1271,20 @@ impl<'d> Cx<'d> {
         });
         self.element_spans.push(c.span);
         Ok(())
+    }
+
+    /// Notes what a retained element or judge part carries: D4 once when
+    /// it deviates ([`Common::display_deviation`]), and D9
+    /// [`LaneApprox::CoverMotion`] once when it follows the covers.
+    fn retained(&mut self, c: &Common) -> Result<(), ImportError> {
+        if c.display_deviation {
+            self.note(
+                Some(c.span),
+                Severity::Deviation,
+                NoteKind::Deviation(DeviationId::D4),
+            );
+        }
+        self.cover_motion(c)
     }
 
     /// Notes D9 [`LaneApprox::CoverMotion`] once for a retained element

@@ -6,13 +6,29 @@
 
 use bms_model::Lane;
 
-use crate::schema::{Export, Field, FieldTy, Schema, TimerDef};
+use crate::schema::{EnumDef, EnumId, Export, Field, FieldTy, Schema, TimerDef};
 
 /// The largest count a field reads: a 7-digit number, and `x * 100` stays
 /// inside `i32`.
 pub const MAX_COUNT: i32 = 9_999_999;
 /// A full gauge in the gauge field's unit, ‰.
 pub const GAUGE_PERMILLE: i32 = 1_000;
+/// 100 % in the score rates' unit, basis points.
+pub const RATE_BASIS_POINTS: i32 = 10_000;
+/// The enum `gauge.kind` reads: the shown gauge's look
+/// ([`GaugeLook`](crate::GaugeLook)), its variants in look order.
+pub const GAUGE_KIND_ENUM: EnumId = EnumId(0);
+
+const fn rate(name: &'static str) -> Field {
+    Field {
+        name,
+        ty: FieldTy::Int {
+            lo: 0,
+            hi: i32::MAX,
+        },
+        export: E,
+    }
+}
 
 const fn count(name: &'static str, export: Export) -> Field {
     Field {
@@ -32,8 +48,9 @@ const fn timer(name: &'static str, export: Export) -> TimerDef {
 const E: Export = Export::Exportable;
 const T: Export = Export::TapestryOnly;
 
-/// The play screen's state. Fields come only from the play view's
-/// snapshot; timers from the play context, the scroll map, the snapshot's
+/// The play screen's state. Fields come from the play view's snapshot,
+/// the rates' whole-attempt denominator and the gauge kind from the play
+/// context; timers from the play context, the scroll map, the snapshot's
 /// fail time and the drained effects (stage3.md R3).
 pub static PLAY: Schema = Schema {
     fields: &[
@@ -59,6 +76,18 @@ pub static PLAY: Schema = Schema {
         Field {
             name: "load.percent",
             ty: FieldTy::Int { lo: 0, hi: 100 },
+            export: E,
+        },
+        rate("rate.current_bp"),
+        rate("rate.whole_bp"),
+        Field {
+            name: "gauge.kind",
+            ty: FieldTy::Enum(GAUGE_KIND_ENUM),
+            export: E,
+        },
+        Field {
+            name: "gauge.valid",
+            ty: FieldTy::Bool,
             export: E,
         },
     ],
@@ -120,7 +149,10 @@ pub static PLAY: Schema = Schema {
         timer("mine.7", T),
         timer("loading", E),
     ],
-    enums: &[],
+    enums: &[EnumDef {
+        name: "gauge_kind",
+        variants: &["assist_easy", "easy", "normal", "hard", "ex_hard", "hazard"],
+    }],
 };
 
 /// The field slots of [`PLAY`].
@@ -142,8 +174,17 @@ pub mod field {
     pub const GAUGE: u16 = 11;
     /// The chart's load, in %: 100 once it is loaded.
     pub const LOAD_PERCENT: u16 = 12;
+    /// The score rate over the targets judged so far, in basis points.
+    pub const RATE_CURRENT_BP: u16 = 13;
+    /// The score rate over the attempt's targets, in basis points.
+    pub const RATE_WHOLE_BP: u16 = 14;
+    /// The shown gauge's look, a [`GAUGE_KIND_ENUM`](super::GAUGE_KIND_ENUM)
+    /// value; `normal` while `gauge.valid` is false.
+    pub const GAUGE_KIND: u16 = 15;
+    /// Whether the shown gauge has both a descriptor and a snapshot.
+    pub const GAUGE_VALID: u16 = 16;
     /// The number of fields.
-    pub const COUNT: usize = 13;
+    pub const COUNT: usize = 17;
 }
 
 /// The built-in timer slots of [`PLAY`]; `when` timers follow from
@@ -260,6 +301,24 @@ mod tests {
     }
 
     #[test]
+    fn gauge_kind_values_follow_the_looks() {
+        let variants = PLAY
+            .enums
+            .get(usize::from(GAUGE_KIND_ENUM.0))
+            .map(|e| e.variants);
+        let names = ["assist_easy", "easy", "normal", "hard", "ex_hard", "hazard"];
+        assert_eq!(variants, Some(&names[..]));
+        for (i, look) in crate::GaugeLook::ALL.into_iter().enumerate() {
+            assert_eq!(usize::try_from(look.schema_value()).ok(), Some(i));
+            assert_eq!(look.index(), i);
+        }
+        assert!(matches!(
+            PLAY.field("gauge.kind").map(|(_, f)| f.ty),
+            Some(FieldTy::Enum(GAUGE_KIND_ENUM))
+        ));
+    }
+
+    #[test]
     fn slot_constants_match_names() {
         let fields = [
             ("combo", field::COMBO),
@@ -275,6 +334,10 @@ mod tests {
             ("notes", field::NOTES),
             ("gauge", field::GAUGE),
             ("load.percent", field::LOAD_PERCENT),
+            ("rate.current_bp", field::RATE_CURRENT_BP),
+            ("rate.whole_bp", field::RATE_WHOLE_BP),
+            ("gauge.kind", field::GAUGE_KIND),
+            ("gauge.valid", field::GAUGE_VALID),
         ];
         for (name, slot) in fields {
             assert_eq!(PLAY.field(name).map(|(s, _)| s), Some(slot), "{name}");

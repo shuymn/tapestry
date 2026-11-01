@@ -725,3 +725,54 @@ fn a_schema_error_is_the_source_of_a_compile_error() {
 fn the_test_schema_is_valid() {
     assert_eq!(SCHEMA.check(), Ok(()));
 }
+
+/// The play schema's gauge kind compares only with its own variants; its
+/// rates are integers, its validity a bool.
+#[test]
+fn the_play_gauge_kind_is_an_enum_only() {
+    use skin_model::{GAUGE_KIND_ENUM, PLAY};
+    let play = |src: &str, want: Ty| compile(src, &Scope::new(&PLAY), want);
+    let kind = Ty::Enum(GAUGE_KIND_ENUM);
+    for src in [
+        "gauge.kind == hazard",
+        "assist_easy != gauge.kind",
+        "gauge.valid && gauge.kind == ex_hard",
+    ] {
+        assert!(play(src, Ty::Bool).is_ok(), "{src}");
+    }
+    assert!(play("gauge.kind", kind).is_ok());
+    assert!(play("rate.current_bp / 100 + rate.whole_bp % 100", Ty::Int).is_ok());
+    let refused = |src: &str, want: Ty| play(src, want).unwrap_err().kind;
+    assert_eq!(
+        refused("gauge.kind == 2", Ty::Bool),
+        ErrorKind::Type {
+            expected: kind,
+            found: Ty::Int
+        }
+    );
+    assert_eq!(
+        refused("gauge.kind + 1", Ty::Int),
+        ErrorKind::NotOrdered { found: kind }
+    );
+    assert_eq!(
+        refused("gauge.kind < hard", Ty::Bool),
+        ErrorKind::NotOrdered { found: kind }
+    );
+    assert_eq!(
+        refused("gauge.kind", Ty::Int),
+        ErrorKind::Type {
+            expected: Ty::Int,
+            found: kind
+        }
+    );
+    assert_eq!(
+        refused("gauge.kind == groove", Ty::Bool),
+        ErrorKind::UnknownVariant {
+            name: "groove".into()
+        }
+    );
+    assert_eq!(
+        refused("gauge.valid + 1", Ty::Int),
+        ErrorKind::NotOrdered { found: Ty::Bool }
+    );
+}

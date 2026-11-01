@@ -13,7 +13,8 @@ use common::lanes::{NOTES, body, cover, lift, lift_object, note, with};
 use common::play::{Drawn, MS};
 use common::{Loaded, has, import_body, import_config, import_sized};
 use skin_beatoraja::{
-    Config, CriticalPart, DeviationId, ImportError, LaneApprox, NoteKind, OffsetValue, Severity,
+    Config, CriticalPart, DeviationId, ImportError, LaneApprox, NoteKind, OffsetValue,
+    PropertyKind, Severity,
 };
 use skin_beatoraja::{ImportLimit, Usage};
 use skin_model::Blend;
@@ -224,10 +225,24 @@ fn offset_four_elements_that_may_reach_the_lanes_refuse() {
         assert_eq!(critical(l).0, CriticalPart::Cover, "{d}");
     }
     // Frames selected by an expression: an image group and image sets.
+    // A `ref` is an image-index property, 40 the shown gauge's type; a
+    // `value` of 40 is no value property, so the `ref` chooses.
     let selectors = r#""imageset": [{"id": "byref", "images": ["cover"], "ref": 1},
-                                    {"id": "byvalue", "images": ["cover"], "value": 71}]"#;
-    let group = r#"{"id": "group", "src": "a", "w": 16, "h": 16, "divx": 2, "len": 2}"#;
-    for (id, field) in [("byref", "ref"), ("byvalue", "value"), ("group", "len")] {
+                                    {"id": "byvalue", "images": ["cover"], "value": 71},
+                                    {"id": "bykind", "images": ["cover"], "value": 40, "ref": 40}]"#;
+    let group = r#"{"id": "group", "src": "a", "w": 16, "h": 16, "divx": 2, "len": 2},
+                   {"id": "kindgroup", "src": "a", "w": 16, "h": 16, "divx": 2, "len": 2, "ref": 40}"#;
+    let kind = |kind, id| NoteKind::UnsupportedProperty { kind, id };
+    let selection = NoteKind::UnsupportedField {
+        field: "image selection",
+    };
+    for (id, field, why) in [
+        ("byref", "ref", kind(PropertyKind::ImageIndex, Some(1))),
+        ("byvalue", "value", kind(PropertyKind::Integer, Some(71))),
+        ("bykind", "image selection", selection),
+        ("group", "len", NoteKind::UnsupportedField { field: "len" }),
+        ("kindgroup", "image selection", selection),
+    ] {
         let over = cover("").replace(r#""id": "cover""#, &format!(r#""id": "{id}""#));
         let off = deco("", r#"{"x": 0, "y": 0, "w": 10, "h": 10}"#)
             .replace(r#""id": "deco""#, &format!(r#""id": "{id}""#));
@@ -247,14 +262,6 @@ fn offset_four_elements_that_may_reach_the_lanes_refuse() {
             .filter(|n| n.severity == Severity::Dropped)
             .map(|n| n.kind)
             .collect();
-        let why = if id == "group" {
-            NoteKind::UnsupportedField { field }
-        } else {
-            NoteKind::UnsupportedProperty {
-                kind: skin_beatoraja::PropertyKind::Integer,
-                id: None,
-            }
-        };
         assert_eq!(dropped, [why], "{id}");
     }
 }
