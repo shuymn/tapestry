@@ -7,14 +7,14 @@
 //! empty POOR included, gives a bomb when its grade is within the skin's
 //! bomb threshold, a long note's completion gives its judgment text but
 //! never a bomb or a hold, and the visual hold starts at a head press
-//! before the long note's end.
+//! before the long note's end, a BAD head included.
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 #![deny(clippy::float_arithmetic, clippy::float_cmp)]
 
 use bms_model::{Chart, LANE_COUNT, NoteKind, TimeUs};
 use eval::{JudgeEvent, JudgeEventKind, Section};
-use rules::GaugeValue;
+use rules::{GaugeValue, LnMode};
 
 use super::schema::Grade;
 
@@ -63,6 +63,9 @@ pub(crate) struct Reducer {
     longs: [Box<[Option<Long>]>; LANE_COUNT],
     /// Per lane: the notes no longer drawn, judged taps and hit mines.
     done: [Bits; LANE_COUNT],
+    /// The long-note judgment mode the notes are drawn by: LN, the only
+    /// mode judged (design.md "LN Judgment Modes").
+    pub(crate) ln_mode: LnMode,
     pub(crate) hold: [Option<Hold>; LANE_COUNT],
     pub(crate) bomb: [Option<TimeUs>; LANE_COUNT],
     pub(crate) mine: [Option<TimeUs>; LANE_COUNT],
@@ -78,6 +81,14 @@ pub(crate) struct Reducer {
     empty_poor_breaks_combo: bool,
     /// The last grade that gives a bomb, `None` for none.
     bomb_up_to: Option<Grade>,
+}
+
+/// Whether a long note's body is drawn active under `mode`, given whether
+/// it is held: in LN mode exactly while held.
+pub(crate) const fn body_active(mode: LnMode, held: bool) -> bool {
+    match mode {
+        LnMode::Ln => held,
+    }
 }
 
 /// Whether a note from `time` to `end` is a target of the section from
@@ -125,6 +136,7 @@ impl Reducer {
         Self {
             longs,
             done,
+            ln_mode: LnMode::Ln,
             hold: [None; LANE_COUNT],
             bomb: [None; LANE_COUNT],
             mine: [None; LANE_COUNT],

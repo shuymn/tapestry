@@ -285,6 +285,17 @@ impl Selection {
             self.dirty = false;
             let shelf = self.shelf.status();
             let page = self.screen.page(status.unwrap_or(&shelf));
+            // Where the cursor shows, for a script's checks (dev-tools).
+            #[cfg(feature = "dev-tools")]
+            if self.script.is_some()
+                && let (Some(line), Some(chart)) =
+                    (self.screen.cursor_line(), self.screen.selected())
+            {
+                println!(
+                    "dev: select cursor: line {line}: {}",
+                    file_name(&chart.path)
+                );
+            }
             render.send(RenderMsg::Menu(Box::new(page)));
         }
     }
