@@ -28,6 +28,17 @@
 //! "Latency Figures", and [`Renderer::frame_statistics`] reads the swap chain's
 //! DXGI frame statistics it pairs to frames.
 
+// The integration tests' fixtures, shared with the unit tests, which name
+// this crate as they do.
+#[cfg(test)]
+extern crate self as render;
+#[cfg(test)]
+#[path = "../tests/common/mod.rs"]
+mod test_common;
+#[cfg(test)]
+#[path = "../tests/decl_support/mod.rs"]
+mod test_decl;
+
 mod atlas;
 mod decl;
 mod gpu;

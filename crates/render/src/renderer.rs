@@ -443,6 +443,11 @@ pub struct Renderer {
     /// group exist: a unit test makes the device refuse something there.
     #[cfg(test)]
     atlas_fault: Option<fn(&Gpu)>,
+    /// A staging's instance buffer is made invalid (both map modes, which
+    /// every device's validation refuses), as a device refusing its
+    /// allocation would: a unit test.
+    #[cfg(test)]
+    buffer_fault: bool,
 }
 
 impl Renderer {
@@ -531,6 +536,8 @@ impl Renderer {
             clear: wgpu::Color::BLACK,
             #[cfg(test)]
             atlas_fault: None,
+            #[cfg(test)]
+            buffer_fault: false,
             id: RENDERERS.fetch_add(1, Ordering::Relaxed),
         })
     }
@@ -845,9 +852,11 @@ impl Renderer {
         Ok(token)
     }
 
-    /// The resources of `bundle`: its atlas uploaded inside error scopes,
-    /// and a staging and instance buffer sized for its capacities with its
-    /// clips, all finished on the GPU.
+    /// The resources of `bundle`: a staging sized for its capacities with
+    /// its clips, then, inside one transaction of error scopes, its atlas
+    /// uploaded with its bind group and an instance buffer for the staging,
+    /// all finished on the GPU. A device refusing any of them (memory,
+    /// validation) is answered as a refusal, never an uncaptured error.
     fn resources_for(&self, bundle: &Arc<SkinBundle>) -> Result<Resources, RenderError> {
         let device = self.gpu.device();
         let skin = DeclSkin::new(Arc::clone(bundle));
@@ -861,7 +870,10 @@ impl Renderer {
                 max,
             });
         }
-        let ((atlas, atlas_bind), refused) = bundle.with_pages(|pages| {
+        let mut staging = Staging::new(capacity, &skin.canvas(self.target()));
+        staging.set_capacity(capacity, runs);
+        staging.set_clips(bundle.clips().clone());
+        let ((atlas, atlas_bind, buffer), refused) = bundle.with_pages(|pages| {
             let layers =
                 skin_atlas::check_pages(pages, &device.limits()).map_err(RenderError::Atlas)?;
             Ok::<_, RenderError>(skin_atlas::scoped(device, || {
@@ -871,18 +883,15 @@ impl Renderer {
                 if let Some(fault) = self.atlas_fault {
                     fault(&self.gpu);
                 }
+                let buffer = self.staged_buffer(staging.instance_capacity());
                 self.gpu.queue().submit([]);
-                (atlas, bind)
+                (atlas, bind, buffer)
             }))
         })?;
         if let Some(e) = refused {
             return Err(RenderError::Atlas(UploadError::Device(e)));
         }
-        let mut staging = Staging::new(capacity, &skin.canvas(self.target()));
-        staging.set_capacity(capacity, runs);
         staging.set_font_scale(atlas.font_scale());
-        staging.set_clips(bundle.clips().clone());
-        let buffer = instance_buffer(device, staging.instance_capacity());
         wait_for_gpu(&self.gpu)?;
         Ok(Resources {
             atlas,
@@ -890,6 +899,20 @@ impl Renderer {
             staging,
             instances: buffer,
         })
+    }
+
+    /// A staging's instance buffer of `instances` sprites.
+    fn staged_buffer(&self, instances: usize) -> wgpu::Buffer {
+        #[cfg(test)]
+        if self.buffer_fault {
+            return self.gpu.device().create_buffer(&wgpu::BufferDescriptor {
+                label: Some("refused"),
+                size: 4,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::MAP_WRITE,
+                mapped_at_creation: false,
+            });
+        }
+        instance_buffer(self.gpu.device(), instances)
     }
 
     /// Installs the staging of `token` whole, between frames: its skin
@@ -1818,6 +1841,44 @@ mod tests {
         let alpha = |x: usize| pixels[(100 * 960 + x) * 4 + 3];
         assert!(alpha(50).abs_diff(159) <= 2, "alpha blend: {}", alpha(50));
         assert!(alpha(150).abs_diff(159) <= 2, "additive: {}", alpha(150));
+    }
+
+    /// A staging whose instance buffer the device refuses, past its atlas's
+    /// upload, is a refusal on a healthy device, typed, never an uncaptured
+    /// error that would panic: nothing is staged, and the installation in
+    /// use draws the next frame, red on the left half.
+    #[test]
+    fn a_refused_instance_buffer_keeps_the_installation() {
+        use crate::test_common::{GAUGES, attempt, context, input, offscreen, view};
+        use crate::test_decl::{Look, bundle};
+        use bms_model::TimeUs;
+
+        let chart = bms_model::ChartBuilder::new(120_000).build().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut r = offscreen(1_920, 1_080);
+        let (a, _) = bundle(&r, dir.path(), &Look::left([255, 0, 0, 255]));
+        let (b, _) = bundle(&r, dir.path(), &Look::left([0, 0, 255, 255]));
+        let ctx = context(&GAUGES, false);
+        let token = r.stage(&a, &attempt(&r, &chart, &ctx), 1).unwrap();
+        r.commit(token).unwrap();
+        let generation = r.resource_generation();
+
+        r.buffer_fault = true;
+        let e = r.stage(&b, &attempt(&r, &chart, &ctx), 2).unwrap_err();
+        r.buffer_fault = false;
+        assert!(
+            matches!(e, RenderError::Atlas(UploadError::Device(_))),
+            "{e:?}"
+        );
+        assert!(e.is_refusal());
+        assert!(r.staged().is_none());
+        assert_eq!(r.resource_generation(), generation);
+        let v = view(0, 0);
+        let timing = r.frame(&input(&v, TimeUs(0), TimeUs(0), &[])).unwrap();
+        assert_eq!(timing.sprites, 1);
+        let p = r.read_back();
+        let at = |x: usize| [p[(540 * 1_920 + x) * 4], p[(540 * 1_920 + x) * 4 + 2]];
+        assert_eq!((at(480), at(1_440)), ([255, 0], [0, 0]));
     }
 
     /// A refusal after the texture exists, injected between the candidate's
