@@ -172,6 +172,12 @@ fn an_image_set_selects_by_value_then_by_ref() {
     for (ex, want) in [(0, [0]), (1, [1]), (2, [2]), (3, [0]), (99, [0])] {
         assert_eq!(shown(r#", "value": 71"#, ex), want, "{ex}");
     }
+    let notes = |fields: &str| common::kinds(set(three, fields).report());
+    assert_eq!(
+        notes(r#", "value": 71"#),
+        [NoteKind::Deviation(DeviationId::D4)]
+    );
+    assert_eq!(notes(r#", "value": 110"#), []);
     // A known value wins over ref 40; value 40 is no value property, so
     // ref 40 (normal: 2) selects; a null value and no ref select 0.
     assert_eq!(shown(r#", "value": 101, "ref": 40"#, 1), [1]);
@@ -249,6 +255,22 @@ fn an_image_set_keeps_holes_and_repeats() {
     let l = set(r#"[null, "none"]"#, "");
     assert!(has(l.report(), NoteKind::Track(TrackWhy::NeverDrawn)));
     assert_eq!(l.ok().skin.choice_ref_count(), 0);
+}
+
+#[test]
+fn an_image_drawn_alone_keeps_its_cycle_beside_a_set() {
+    // Four 16×16 frames over 400 ms, admitted for the set first: the set
+    // cycles them as its entry, the image as its own sheet cycle.
+    let l = import_body(
+        r#""image": [{"id": "s", "src": "a", "w": 64, "h": 16, "divx": 4, "cycle": 400}],
+           "imageset": [{"id": "t", "images": ["s"]}],
+           "destination": [{"id": "t", "dst": [{"w": 10, "h": 10}]},
+                           {"id": "s", "dst": [{"w": 10, "h": 10}]}]"#,
+    );
+    assert_eq!(l.report().usage.images, 2);
+    let mut d = l.drawn();
+    assert_eq!(frames(&mut d, 0), [0, 0]);
+    assert_eq!(frames(&mut d, 150), [1, 1]);
 }
 
 #[test]
