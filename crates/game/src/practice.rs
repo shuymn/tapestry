@@ -56,8 +56,8 @@ pub struct Practice {
 
 /// A value the player set that fitting a practice to an edited play preset
 /// reset ([`Loaded::refit_practice`](crate::Loaded::refit_practice)), as
-/// the player is told it: a round never plays a reset value the player was
-/// not told about.
+/// the practice page states it: a round never plays a reset value the
+/// player set, so the page states the reset and the player starts again.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Reset {
     /// The gauge's rule no longer accepts the value set: it starts at its
@@ -100,6 +100,30 @@ impl std::fmt::Display for Reset {
                 }
             }
         }
+    }
+}
+
+/// Why a practice fitted to an edited play preset opens no round
+/// ([`Loaded::refit_practice`](crate::Loaded::refit_practice),
+/// [`Loaded::start_practice`](crate::Loaded::start_practice)): what the fit
+/// reset of what the player set, and what the section's check refused,
+/// each told when it happened.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Unfit {
+    /// What the fit reset of what the player set.
+    pub resets: Vec<Reset>,
+    /// What the section's check refused under the edited preset.
+    pub refused: Option<PracticeError>,
+}
+
+impl std::fmt::Display for Unfit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let refused = self.refused.as_ref().map(|e| crate::Chain(e).to_string());
+        let parts: Vec<String> = refused
+            .into_iter()
+            .chain(reset_notice(&self.resets))
+            .collect();
+        f.write_str(&parts.join("; "))
     }
 }
 

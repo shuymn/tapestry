@@ -36,7 +36,7 @@ use crate::policy::{
     DefaultPolicy, FailureAction, GaugeIndex, NoSessionEvents, SessionEvent, SessionEventSink,
     SessionPolicy, SharedEvents,
 };
-use crate::practice::{Practice, PracticeError, RESTORE_AHEAD, Reset};
+use crate::practice::{Practice, PracticeError, RESTORE_AHEAD, Reset, Unfit};
 use crate::prepare::{
     BmsIngest, ChartIngest, ChartLabels, ChartTransform, IngestError, Passthrough,
 };
@@ -369,6 +369,14 @@ pub struct Loaded {
     /// The play preset the practice was checked under: a round under
     /// another refits it first ([`refit_practice`](Self::refit_practice)).
     practiced: Option<RulePreset>,
+    /// The gauges' initial values the last fit to the play preset gave, in
+    /// its order, whether or not the section passed its check: what the
+    /// practice page shows ([`initial_gauge`](Self::initial_gauge)).
+    fitted: Option<Vec<GaugeValue>>,
+    /// Each gauge a fit since the practice page's Start found gone, with
+    /// the gauge the page shows in its place
+    /// ([`replacement`](Self::replacement)).
+    lost: Vec<(String, Option<String>)>,
 }
 
 /// What one read of a chart's file gave: the chart, its record, its labels
@@ -563,6 +571,8 @@ impl Loaded {
                     events,
                     practice: None,
                     practiced: None,
+                    fitted: None,
+                    lost: Vec::new(),
                 })
             }
             Err(e) => Err(Box::new((e, shelf))),
@@ -642,6 +652,8 @@ impl Loaded {
         self.warnings = read.warnings;
         self.practice = None;
         self.practiced = None;
+        self.fitted = None;
+        self.lost.clear();
         Ok(())
     }
 
@@ -696,6 +708,8 @@ impl Loaded {
         let Some(practice) = practice else {
             self.practice = None;
             self.practiced = None;
+            self.fitted = None;
+            self.lost.clear();
             return Ok(());
         };
         if self.config.autoplay.is_some() {
@@ -703,9 +717,99 @@ impl Loaded {
         }
         let section = practice.section(self.config.speed);
         crate::practice::check(&self.chart, &self.preset, &section)?;
+        self.fitted = Some(practice.initial_gauges.clone());
         self.practice = Some((practice, section));
         self.practiced = Some(self.preset.clone());
         Ok(())
+    }
+
+    /// Sets up the practice page's Start: the play preset refreshed first,
+    /// since the page can wait while its file is repaired or edited, then
+    /// `practice`, whose initial values were set under the play preset
+    /// before the refresh, fitted to it as a round's are
+    /// ([`refit_practice`](Self::refit_practice)). A file that fails to
+    /// load leaves the current preset, and its error goes with the next
+    /// play.
+    ///
+    /// # Errors
+    ///
+    /// [`Unfit`] when the fit reset a value the player set or the section
+    /// is refused under the refreshed preset: no round opens.
+    pub fn start_practice(&mut self, practice: Practice) -> Result<(), Unfit> {
+        let set_under = self.preset.clone();
+        if let Some(e) = self.reload_preset() {
+            self.first_error = Some(e);
+        }
+        self.lost.clear();
+        let (initial_gauges, resets) = self.fit(&set_under, &practice.initial_gauges);
+        self.settle(
+            Practice {
+                initial_gauges,
+                ..practice
+            },
+            resets,
+        )
+    }
+
+    /// Fits values set under `from`, in its gauges' order, to the play
+    /// preset: each gauge's value follows it by ID and stays while it was
+    /// set away from its start and the gauge still accepts it; any other
+    /// gauge takes its start. What the player set and the fit reset comes
+    /// back with them, and each gauge gone is remembered with the gauge the
+    /// practice page shows in its place, the one now at its place.
+    fn fit(&mut self, from: &RulePreset, values: &[GaugeValue]) -> (Vec<GaugeValue>, Vec<Reset>) {
+        let old = from.gauges.iter().zip(values);
+        let new = &self.preset.gauges;
+        let at = |i: usize| new.get(i.min(new.len().saturating_sub(1)));
+        let mut resets = Vec::new();
+        for (i, (rule, &set)) in old.clone().enumerate() {
+            let found = new.iter().find(|g| g.id == rule.id);
+            if found.is_none() {
+                self.lost
+                    .push((rule.id.clone(), at(i).map(|g| g.id.clone())));
+            }
+            if set == rule.start {
+                continue;
+            }
+            match found {
+                Some(g) if eval::accepts_initial(g, set) => {}
+                Some(g) => resets.push(Reset::Refused {
+                    gauge: g.id.clone(),
+                    set,
+                    start: g.start,
+                }),
+                None => resets.push(Reset::Lost {
+                    gauge: rule.id.clone(),
+                    set,
+                    shown: at(i).map(|g| (g.id.clone(), g.start)),
+                }),
+            }
+        }
+        let initial_gauges: Vec<_> = new
+            .iter()
+            .map(|g| match old.clone().find(|(rule, _)| rule.id == g.id) {
+                Some((rule, value)) if *value != rule.start && eval::accepts_initial(g, *value) => {
+                    *value
+                }
+                _ => g.start,
+            })
+            .collect();
+        self.fitted = Some(initial_gauges.clone());
+        (initial_gauges, resets)
+    }
+
+    /// Sets up the fitted `practice`, refused with the `resets` when there
+    /// are any or when its section is: a round never plays a reset value
+    /// the player set.
+    fn settle(&mut self, practice: Practice, resets: Vec<Reset>) -> Result<(), Unfit> {
+        let fitted = practice.initial_gauges.clone();
+        let refused = self.set_practice(Some(practice)).err();
+        // What the page shows stays the fit's, the section refused or not.
+        self.fitted = Some(fitted);
+        if refused.is_none() && resets.is_empty() {
+            return Ok(());
+        }
+        Err(Unfit { resets, refused })
     }
 
     /// Fits the practice to the play preset refreshed for this round
@@ -716,79 +820,62 @@ impl Loaded {
     /// accepts its value, takes the new start, a gauge the preset gained
     /// starts at its start, and a gauge the preset lost is dropped with its
     /// value. The section is then checked again under the new preset, and
-    /// the practice page shows what it now plays
-    /// ([`PracticeScreen::sync`](crate::PracticeScreen::sync)). What the
-    /// player set and the fit reset comes back, in the preset's order of
-    /// the gauges set: a round never plays a reset value the player was
-    /// not told about, so the round announces it or does not open
-    /// ([`crate::live`]).
+    /// the practice page shows what the fit gave
+    /// ([`PracticeScreen::sync`](crate::PracticeScreen::sync)).
     ///
     /// # Errors
     ///
-    /// What [`set_practice`](Self::set_practice) refuses; the practice is
-    /// then unchanged, and the round must not open.
-    pub fn refit_practice(&mut self) -> Result<Vec<Reset>, PracticeError> {
+    /// [`Unfit`] when the fit reset a value the player set, with what it
+    /// reset, or the section is refused under the new preset, with what the
+    /// fit reset too: the round does not open, so no round plays a reset
+    /// value the player set, and the page states why.
+    pub fn refit_practice(&mut self) -> Result<(), Unfit> {
         let (Some((practice, _)), Some(practiced)) = (&self.practice, &self.practiced) else {
-            return Ok(Vec::new());
+            return Ok(());
         };
         if *practiced == self.preset {
-            return Ok(Vec::new());
+            return Ok(());
         }
-        let old = practiced.gauges.iter().zip(&practice.initial_gauges);
-        let new = &self.preset.gauges;
-        let mut resets = Vec::new();
-        for (i, (rule, &set)) in old.clone().enumerate() {
-            if set == rule.start {
-                continue;
-            }
-            match new.iter().find(|g| g.id == rule.id) {
-                Some(g) if eval::accepts_initial(g, set) => {}
-                Some(g) => resets.push(Reset::Refused {
-                    gauge: g.id.clone(),
-                    set,
-                    start: g.start,
-                }),
-                // The practice page shows the gauge at its place instead.
-                None => resets.push(Reset::Lost {
-                    gauge: rule.id.clone(),
-                    set,
-                    shown: new
-                        .get(i.min(new.len().saturating_sub(1)))
-                        .map(|g| (g.id.clone(), g.start)),
-                }),
-            }
-        }
-        let initial_gauges = new
-            .iter()
-            .map(|g| match old.clone().find(|(rule, _)| rule.id == g.id) {
-                Some((rule, value)) if *value != rule.start && eval::accepts_initial(g, *value) => {
-                    *value
-                }
-                _ => g.start,
-            })
-            .collect();
-        let refit = Practice {
-            initial_gauges,
-            ..practice.clone()
-        };
-        self.set_practice(Some(refit))?;
-        Ok(resets)
+        let (practice, practiced) = (practice.clone(), practiced.clone());
+        let (initial_gauges, resets) = self.fit(&practiced, &practice.initial_gauges);
+        self.settle(
+            Practice {
+                initial_gauges,
+                ..practice
+            },
+            resets,
+        )
     }
 
-    /// The initial value of the gauge `id` in the practice set up, while
-    /// its gauge is in the play preset it was checked under; `None`
-    /// otherwise.
+    /// The initial value of the gauge `id` the last fit to the play preset
+    /// gave, or the practice set up; `None` for a gauge the preset does
+    /// not have, or without a practice.
     #[must_use]
     pub fn initial_gauge(&self, id: &str) -> Option<GaugeValue> {
-        let (Some((practice, _)), Some(practiced)) = (&self.practice, &self.practiced) else {
-            return None;
-        };
-        practiced
-            .gauges
-            .iter()
-            .zip(&practice.initial_gauges)
-            .find(|(g, _)| g.id == id)
-            .map(|(_, v)| *v)
+        let i = self.preset.gauges.iter().position(|g| g.id == id)?;
+        self.fitted.as_ref()?.get(i).copied()
+    }
+
+    /// The gauge the practice page shows in place of `id`, which a fit
+    /// since its Start found gone: the gauge then at its place, followed
+    /// while that one went too; `None` for a gauge no fit lost, or a
+    /// preset left without gauges.
+    #[must_use]
+    pub fn replacement(&self, id: &str) -> Option<&str> {
+        let mut id = id;
+        let mut shown = None;
+        // Each step follows one loss, so the chain ends within them.
+        for _ in 0..self.lost.len() {
+            match self.lost.iter().find(|(gone, _)| gone == id) {
+                Some((_, Some(next))) => {
+                    shown = Some(next.as_str());
+                    id = next;
+                }
+                Some((_, None)) => return None,
+                None => break,
+            }
+        }
+        shown
     }
 
     /// The practice set up, if any.

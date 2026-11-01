@@ -373,20 +373,23 @@ impl PracticeScreen {
         self.rule.as_ref().is_some_and(|r| self.value != r.start)
     }
 
-    /// Shows what `loaded`'s practice plays now, once rounds of the
-    /// practice this screen set up refitted it to the play preset
-    /// ([`Loaded::refit_practice`]), never the screen's own copy: the
-    /// displayed gauge, followed by its ID, at the practice's value for it,
-    /// or its start without one. A displayed gauge the preset no longer has
-    /// gives way to the preset's gauge at the same place, at its start, as
-    /// [`new`](Self::new) shows one. What was reset was announced already,
-    /// before the round that plays it or as the reason no round opened.
+    /// Shows what `loaded`'s last fit of this screen's practice to the
+    /// play preset gave ([`Loaded::start_practice`],
+    /// [`Loaded::refit_practice`]), never the screen's own copy: the
+    /// displayed gauge, followed by its ID, at the fit's value for it, or
+    /// its start without one. A displayed gauge the preset no longer has
+    /// gives way to the gauge a fit put in its place
+    /// ([`Loaded::replacement`], the one the reset's reason names), at its
+    /// start, or without one to the preset's gauge at the same place, as
+    /// [`new`](Self::new) shows one. A reset was the reason no round
+    /// opened, which the page states.
     pub fn sync(&mut self, loaded: &Loaded) {
         let gauges = &loaded.preset().gauges;
+        let position = |id: &str| gauges.iter().position(|g| g.id == id);
         let found = self
             .rule
             .as_ref()
-            .and_then(|r| gauges.iter().position(|g| g.id == r.id));
+            .and_then(|r| position(&r.id).or_else(|| loaded.replacement(&r.id).and_then(position)));
         self.gauge = found.unwrap_or_else(|| self.gauge.min(gauges.len().saturating_sub(1)));
         self.rule = gauges.get(self.gauge).cloned();
         self.value = self.rule.as_ref().map_or(GaugeValue::EMPTY, |r| {

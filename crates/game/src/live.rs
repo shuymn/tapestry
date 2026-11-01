@@ -209,14 +209,6 @@ pub trait Rig {
     fn end_loading(&mut self) -> Result<(), Self::ScreenError> {
         Ok(())
     }
-    /// Shows `notice` in the chart's loading state, before recording
-    /// opens: what a round's refit reset of what the player set
-    /// ([`Loaded::refit_practice`]). Whether it shows: `false` without a
-    /// loading state (a retry, a repeated round), and by default.
-    fn announce(&mut self, notice: &str) -> bool {
-        let _ = notice;
-        false
-    }
     /// Waits until audio is ready for a play: the previous play's switch
     /// taken. Before recording opens.
     ///
@@ -629,23 +621,13 @@ fn play_and_next<R: Rig>(
     // it, whatever a result screen viewed.
     let start = loaded.begin_play();
     // A round's practice follows the refreshed preset, or the round is
-    // refused before anything is prepared. A round never plays a reset
-    // value the player was not told about: a reset is announced in the
-    // loading state, and a round without one (a retry, a repeat) does not
-    // open, its reason telling the player instead.
+    // refused before anything is prepared: one that would play a reset
+    // value the player set does not open, the reset its reason.
     let ready = match loaded.refit_practice() {
-        Ok(resets) => match crate::practice::reset_notice(&resets) {
-            Some(notice) if !rig.announce(&notice) => {
-                Err(LiveError::Preparation(PreparationRefusal {
-                    location: None,
-                    reason: notice,
-                }))
-            }
-            _ => ready_to_open(loaded, rig),
-        },
-        Err(e) => Err(LiveError::Preparation(PreparationRefusal {
+        Ok(()) => ready_to_open(loaded, rig),
+        Err(unfit) => Err(LiveError::Preparation(PreparationRefusal {
             location: None,
-            reason: crate::Chain(&e).to_string(),
+            reason: unfit.to_string(),
         })),
     };
     match ready {

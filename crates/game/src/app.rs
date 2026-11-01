@@ -519,10 +519,10 @@ fn practice_chart<R: AppRig>(
             }
         }
         if start {
-            // The play preset changes only as a round begins: once the
-            // rounds of this Start's practice return, the page shows what
-            // they left it playing, so what it shows is what the next
-            // round plays.
+            // The play preset changes only at a Start and as a round
+            // begins: once this Start's practice was fitted to it, the page
+            // shows what the last fit gave, so what it shows is what the
+            // next round plays.
             let mut set_up = false;
             let ran = start_rounds(loaded, &screen, rig, &mut set_up);
             if set_up {
@@ -562,7 +562,8 @@ enum Stopped<S> {
 /// speed, the practice set up, the bank and the screen's chart loaded
 /// (every time, so no bank of another chart or speed is reused), and the
 /// rounds played until they are left. `set_up` turns true once the
-/// screen's practice is set up.
+/// screen's practice was fitted to the refreshed play preset
+/// ([`Loaded::start_practice`]).
 fn start_rounds<R: AppRig>(
     loaded: &mut Loaded,
     screen: &PracticeScreen,
@@ -575,10 +576,9 @@ fn start_rounds<R: AppRig>(
         loaded.set_speed(screen.speed()).map_err(|e| notice(&e))?;
     }
     let practice = screen.practice(loaded);
-    loaded
-        .set_practice(Some(practice))
-        .map_err(|e| notice(&e))?;
+    let started = loaded.start_practice(practice);
     *set_up = true;
+    started.map_err(|e| Stopped::Notice(e.to_string()))?;
     if rig.load_chart(loaded).map_err(|e| notice(&e))? == Loading::Cancelled {
         return cancelled(rig).map_err(Stopped::Run);
     }
