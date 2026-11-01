@@ -602,10 +602,15 @@ fn play_and_next<R: Rig>(
     // Repeat").
     let opens_at = loaded.opens_at();
     let restore_at = loaded.restore_at();
-    // A quit during the wait is latched and taken by the first step.
-    let opening = rig
-        .open(TimeUs(opens_at.0.saturating_neg()))
-        .map_err(LiveError::Input)?;
+    // A quit during the wait is latched and taken by the first step. A
+    // failed opening opened nothing: its number goes back.
+    let opening = match rig.open(TimeUs(opens_at.0.saturating_neg())) {
+        Ok(opening) => opening,
+        Err(e) => {
+            loaded.withdraw(start);
+            return Err(LiveError::Input(e));
+        }
+    };
     let origin = opening.origin;
     // The refusal is the error reported; a failed close adds nothing to it.
     let plan = match loaded.plan(&opening.kinds, &opening.axes) {

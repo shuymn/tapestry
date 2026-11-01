@@ -1201,8 +1201,8 @@ fn the_play_is_over_before_it_is_saved() {
 }
 
 /// T1, T2: the input thread is gone, or does not answer, when recording
-/// opens: no play exists, so the run ends with that cause and nothing is
-/// saved.
+/// opens: no play exists, so the run ends with that cause, nothing is
+/// saved, and the play's number is given back.
 #[test]
 fn an_input_thread_gone_at_the_open_ends_the_run_with_its_cause() {
     for cause in [InputWaitError::Gone, InputWaitError::Timeout] {
@@ -1218,6 +1218,7 @@ fn an_input_thread_gone_at_the_open_ends_the_run_with_its_cause() {
         assert_eq!(rig.opens, 1, "{cause:?}");
         assert!(rig.reports.is_empty(), "{cause:?}");
         assert!(!dir.path().join("records").exists(), "{cause:?}");
+        assert_eq!(loaded.attempt().number, 0, "{cause:?}");
     }
 }
 
