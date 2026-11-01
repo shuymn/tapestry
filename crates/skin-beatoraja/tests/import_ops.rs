@@ -340,3 +340,26 @@ fn gauge_name(k: u32) -> String {
         format!("{}_{}", 10 * k, 10 * (k + 1))
     }
 }
+
+#[test]
+fn cover_switches_by_number_and_name_build_one_condition() {
+    let once = image(r#""op": [271]"#);
+    let repeated = image(r#""op": [271, "lanecover1_on", "!!lanecover1_on"], "draw": 271"#);
+    assert!(common::kinds(repeated.report()).is_empty());
+    assert_eq!(
+        repeated.ok().skin.ops().total(),
+        once.ok().skin.ops().total()
+    );
+    // 270's control reading is D4, once however often it is listed.
+    let changing = image(r#""op": [270, "lanecover1_changing"]"#);
+    assert_eq!(common::kinds(changing.report()), [D4]);
+    // The built-in wins over an item declared with its number.
+    let declared = import_body(
+        r#""property": [{"name": "p", "item": [{"name": "x", "op": 272}], "def": "x"}],
+           "image": [{"id": "i", "src": "a", "w": 64, "h": 64}],
+           "destination": [{"id": "i", "op": [-272], "dst": [{"w": 10, "h": 10}]}]"#,
+    );
+    let mut d = declared.drawn();
+    // The drawn play's covers are on: the negated switch hides it.
+    assert!(d.frame(0, &[]).is_empty());
+}

@@ -19,7 +19,7 @@ use skin_model::{
 use super::super::asset::Crop;
 use super::super::geom::{HEIGHT, Offset, Q, Rect};
 use super::super::policy::{self, CriticalPart, Role};
-use super::super::report::{DeviationId, LaneApprox, NoteKind, Severity, Span};
+use super::super::report::{DeviationId, LaneApprox, NoteKind, PropertyKind, Severity, Span};
 use super::super::track::{self, Accepted, Stretch};
 use super::super::{
     Common, Cx, Dst, OFFSET_HIDDEN, OFFSET_LANECOVER, OFFSET_LIFT, Op, Opts, Prop, RUNTIME_OFFSETS,
@@ -39,6 +39,12 @@ const OP_HIDDEN: i32 = 273;
 fn hidden_on_name(name: &str) -> bool {
     let rest = name.trim_start_matches('!');
     rest == "hidden1_on" && (name.len() - rest.len()).is_multiple_of(2)
+}
+
+/// Whether `name` is `hidden1_on` with an odd number of `!` before it.
+fn hidden_off_name(name: &str) -> bool {
+    let rest = name.trim_start_matches('!');
+    rest == "hidden1_on" && !(name.len() - rest.len()).is_multiple_of(2)
 }
 
 /// When an element shows: from its first key to its last under `Hide`,
@@ -1103,6 +1109,25 @@ impl Cx<'_> {
             Op::Id(n) => *n != OP_HIDDEN,
             Op::Name(name) => !hidden_on_name(name),
         });
+        // Its negation would hide HIDDEN+ while it is on: unsupported here,
+        // though the switch is a condition elsewhere.
+        let negated = |op: &Op| match op {
+            Op::Id(n) => *n == -OP_HIDDEN,
+            Op::Name(name) => hidden_off_name(name),
+        };
+        if dst.ops.iter().any(negated)
+            || match &dst.draw {
+                Prop::Id(n) => *n == -OP_HIDDEN,
+                Prop::Name(name) => hidden_off_name(name),
+                Prop::Null => false,
+            }
+        {
+            let why = NoteKind::UnsupportedProperty {
+                kind: PropertyKind::Boolean,
+                id: Some(-OP_HIDDEN),
+            };
+            return self.drop_el(role, at, why);
+        }
         if match &dst.draw {
             Prop::Id(n) => *n == OP_HIDDEN,
             Prop::Name(name) => hidden_on_name(name),

@@ -200,6 +200,7 @@ impl Cx<'_> {
         }
         let o = Opts {
             follow: true,
+            guard: shown.availability(),
             ..Opts::default()
         };
         let Some(mut c) = self.common_with(role, &dst, o)? else {

@@ -238,12 +238,16 @@ fn check_f1(_: &Header, i: Imported) {
     }
 }
 
-/// The six rate aliases (D4): current and whole, whole percent and
-/// hundredths, each 3 operations.
-const RATE_REFS: [i32; 6] = [102, 103, 115, 116, 155, 156];
+/// The numbers F2 rotates through, all D4: the six rate aliases (3
+/// operations each), then the sixteen readouts, 42 operations with their
+/// availability guards; 60 a cycle.
+const ROTATION: [i32; 22] = [
+    102, 103, 115, 116, 155, 156, 90, 91, 160, 161, 162, 163, 164, 14, 314, 315, 316, 10, 310, 311,
+    312, 313,
+];
 
-/// F2: 64 texts in 16 fonts, and rates and a count filling the widget
-/// quads.
+/// F2: 64 texts in 16 fonts, and rates, readouts and a count filling the
+/// widget quads.
 fn f2(root: &Path) {
     png(root, "n.png", 60, 6);
     for i in 0..MAX_FONTS {
@@ -265,12 +269,12 @@ fn f2(root: &Path) {
             .chain((0..full).map(|k| {
                 format!(
                     r#"{{"id": "v11_{}", "dst": [{{"w": 6, "h": 6}}]}}"#,
-                    k % RATE_REFS.len()
+                    k % ROTATION.len()
                 )
             }))
             .chain([r#"{"id": "v7", "dst": [{"w": 6, "h": 6}]}"#.to_owned()]),
     );
-    let rates = join(RATE_REFS.iter().enumerate().map(|(k, r)| {
+    let rates = join(ROTATION.iter().enumerate().map(|(k, r)| {
         format!(
             r#"{{"id": "v11_{k}", "src": "n", "w": 60, "h": 6, "divx": 10, "digit": 11,
                  "ref": {r}}}"#
@@ -297,8 +301,10 @@ fn check_f2(_: &Header, i: Imported) {
     assert_eq!(i.skin.text_slots(), MAX_TEXT_ELEMENTS);
     assert_eq!(i.skin.sheet().font_count(), MAX_FONTS);
     assert_eq!(i.skin.quad_capacity(), MAX_WIDGET_QUADS);
-    // Each rate strip's program is 3 operations, the count's 1.
-    assert_eq!(u.ops, 1_483 * 3 + 1);
+    // 67 whole cycles of 60 operations, then the rates and the three BPMs
+    // (30), and the count's 1.
+    assert_eq!(1_483, 67 * ROTATION.len() + 9);
+    assert_eq!(u.ops, 4_051);
     let d4 = skin_beatoraja::NoteKind::Deviation(skin_beatoraja::DeviationId::D4);
     let deviations = i.report.notes.iter().filter(|n| n.kind == d4).count();
     assert_eq!(deviations, 1_483);
@@ -707,12 +713,16 @@ fn import_memory_is_measured() {
         size_of::<Report>(),
     );
     println!(
-        "sizes: JudgeDef {}, GaugeDef {}, LanesDef {}, Play {}, PlayContext {}",
+        "sizes: JudgeDef {}, GaugeDef {}, LanesDef {}, Play {}, PlayContext {}, SkinFrame {}, \
+         FrameReadouts {}, DurationRatio {}",
         size_of::<skin_model::JudgeDef>(),
         size_of::<skin_model::GaugeDef>(),
         size_of::<skin_model::LanesDef>(),
         size_of::<skin_model::Play>(),
         size_of::<skin_model::PlayContext<'_>>(),
+        size_of::<skin_model::SkinFrame<'_>>(),
+        size_of::<skin_model::FrameReadouts>(),
+        size_of::<skin_model::DurationRatio>(),
     );
     let mut peaks = Vec::new();
     let d = tempfile::tempdir().unwrap();
