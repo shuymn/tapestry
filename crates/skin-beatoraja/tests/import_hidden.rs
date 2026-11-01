@@ -107,6 +107,15 @@ fn the_trim_line_is_fixed_linked_or_absent() {
     // Unlinked, the trim stays at 880 under the raised line.
     let fixed = hid(r#""isDisapearLineLinkLift": false"#, "");
     assert_eq!(rects(&fixed, [0, 200, 500]), [[20, 520, 430, 360]]);
+    // A full lift leaves it no share, but it stays on: drawn after the
+    // judgment line, from the lanes' top (280) down to the fixed trim,
+    // and not at all under a linked one, raised to its upper edge.
+    let line = rects(&fixed, [0, 1_000, 0]);
+    assert_eq!(line.len(), 1);
+    let mut want = line.clone();
+    want.push([20, 280, 430, 600]);
+    assert_eq!(rects(&fixed, [0, 1_000, 500]), want);
+    assert_eq!(rects(&hid("", ""), [0, 1_000, 500]), line);
     // 100 px higher, at rest 780: 100 ‰ raises it 60 to 720. A line at
     // 300 trims it at 780, linked or not; none cuts it at the lanes.
     let up = |obj: &str| {

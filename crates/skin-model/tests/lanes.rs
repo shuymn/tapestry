@@ -838,6 +838,17 @@ fn hidden_plus_takes_its_share_of_the_length_above_the_lift() {
         d.hidden_trim = HiddenTrim::Fixed(700.0);
     };
     assert!(rects(&hidden_view(&chart, low, [0, 0, 500], 700), HIDDEN).is_empty());
+    // A full lift leaves it no share, but it stays on, hanging from the
+    // raised line (80): cut at a fixed trim or at the lanes' bottom, and
+    // gone under a trim raised with the line.
+    for (trim, want) in [
+        (HiddenTrim::Fixed(700.0), vec![[160.0, 80.0, 544.0, 620.0]]),
+        (HiddenTrim::None, vec![[160.0, 80.0, 544.0, 800.0]]),
+        (HiddenTrim::Lift(880.0), vec![]),
+    ] {
+        let h = hidden_view(&chart, |d| d.hidden_trim = trim, [0, 1_000, 500], 700);
+        assert_eq!(rects(&h, HIDDEN), want, "{trim:?}");
+    }
     // Without its image nothing is drawn.
     let none = hidden_view(&chart, |d| d.parts.hidden = None, [0, 0, 500], 700);
     assert!(rects(&none, HIDDEN).is_empty());

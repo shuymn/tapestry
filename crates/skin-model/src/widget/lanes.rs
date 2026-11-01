@@ -705,9 +705,10 @@ impl Lanes {
         }
         // Each cover keeps its own height and slides by its share, cut to
         // the lanes with its image. The hidden cover rises by the lift and
-        // its share and is cut off below at its trim line
+        // its share and is cut off below at its trim line; it is on while
+        // its amount is, even when a full lift leaves it no share
         // (`play/LaneRenderer.java:335-345`, `play/SkinHidden.java:65-90`).
-        if g.hidden_px > 0.0
+        if d.view.hidden > 0
             && let Some(part) = self.parts.hidden.map(|p| d.shown(&p))
         {
             let upper = f32_of(f64::from(self.hidden_at) - g.lift_px - g.hidden_px);

@@ -298,6 +298,22 @@ fn hidden_plus_takes_its_share_of_the_region_above_the_lift() {
     h.view.hidden = 1_000;
     h.frame(1_000, &[]);
     assert_eq!(rects(&h, HIDDEN), [[160.0, 280.0, 544.0, 480.0]]);
+    // A full lift leaves it no share, but it stays on, hanging from the
+    // region's top (280): cut at a fixed trim, or whole down to the
+    // region's lower edge without one.
+    for (trim, want) in [
+        (HiddenTrim::Fixed(700.0), [160.0, 280.0, 544.0, 420.0]),
+        (HiddenTrim::None, [160.0, 280.0, 544.0, 600.0]),
+    ] {
+        let def = LanesDef {
+            hidden_trim: trim,
+            ..source()
+        };
+        let mut h = harness_of(def, &chart);
+        (h.view.lift, h.view.hidden) = (1_000, 500);
+        h.frame(1_000, &[]);
+        assert_eq!(rects(&h, HIDDEN), [want], "{trim:?}");
+    }
 }
 
 #[test]
