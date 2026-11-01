@@ -1153,7 +1153,7 @@ impl Skin {
             cover_paints,
         } = def.widgets;
         let cover_paints = cover_paints
-            .iter()
+            .into_iter()
             .map(|p| CoverPaint {
                 image: match p.image {
                     CoverImage::Image(i) => PaintImage::Image(image(i)),
