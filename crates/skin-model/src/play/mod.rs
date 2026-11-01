@@ -441,11 +441,7 @@ impl Play {
     /// Timer `slot`'s start as of the last build, `None` while off.
     #[must_use]
     pub fn timer(&self, slot: u16) -> Option<TimeUs> {
-        self.timer_at(usize::from(slot))
-    }
-
-    pub(crate) fn timer_at(&self, slot: usize) -> Option<TimeUs> {
-        self.starts().at(slot)
+        self.starts().at(usize::from(slot))
     }
 
     /// Every timer slot's start as of the last build.
