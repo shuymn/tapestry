@@ -1484,6 +1484,8 @@ impl Run {
         if self.screen.is_none() {
             self.granted = false;
             self.screen = Some((self.make)()?);
+            // The new screen takes the window's size afresh.
+            self.applied = None;
         }
         self.shared.failed.store(false, Ordering::Release);
         Ok(())
