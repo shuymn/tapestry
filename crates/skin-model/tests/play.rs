@@ -992,9 +992,9 @@ fn ratio(numerator: u128, denominator: u128) -> Option<DurationRatio> {
 }
 
 /// The readout fields, `bpm.current_x100` to `duration.valid`.
-fn readout_fields(h: &Harness) -> Vec<i32> {
+fn readout_fields(h: &Harness) -> &[i32] {
     let fields = h.play.state().fields;
-    fields[usize::from(field::BPM_CURRENT_X100)..=usize::from(field::DURATION_VALID)].to_vec()
+    &fields[usize::from(field::BPM_CURRENT_X100)..=usize::from(field::DURATION_VALID)]
 }
 
 /// `time.remaining_s` and `time.elapsed_s`.
