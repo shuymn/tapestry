@@ -951,12 +951,19 @@ impl Renderer {
         if let Some(r) = pending.resources {
             self.install(r);
         }
-        self.installed = Some(Arc::clone(pending.skin.bundle()));
-        self.skin = Box::new(pending.skin);
+        self.activate_decl_skin(pending.skin);
+        Ok(())
+    }
+
+    /// Puts `skin` in use, its bundle the one installed, and builds frames
+    /// afresh: no refusal kept, no frame started, the projection made
+    /// again for its canvas.
+    fn activate_decl_skin(&mut self, skin: DeclSkin) {
+        self.installed = Some(Arc::clone(skin.bundle()));
+        self.skin = Box::new(skin);
         self.refused = None;
         self.started = None;
         self.project();
-        Ok(())
     }
 
     /// Replaces the atlas, its bind group, the staging and the instance
@@ -987,11 +994,7 @@ impl Renderer {
         self.pending = None;
         let r = self.resources_for(bundle)?;
         self.install(r);
-        self.skin = Box::new(DeclSkin::new(Arc::clone(bundle)));
-        self.installed = Some(Arc::clone(bundle));
-        self.refused = None;
-        self.started = None;
-        self.project();
+        self.activate_decl_skin(DeclSkin::new(Arc::clone(bundle)));
         Ok(())
     }
 
