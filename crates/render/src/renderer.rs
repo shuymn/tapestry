@@ -505,9 +505,35 @@ impl Renderer {
         pages: &AtlasPages<'_>,
         clips: ClipTable,
     ) -> Result<(), RenderError> {
-        let atlas = AtlasTexture::upload(&self.gpu, pages).map_err(RenderError::Atlas)?;
+        self.install(pages, clips, |_, _| {})
+    }
+
+    /// [`install_atlas`](Self::install_atlas), with `fault` run on the
+    /// candidate inside its error scopes: tests make the device refuse
+    /// something after the texture exists.
+    fn install(
+        &mut self,
+        pages: &AtlasPages<'_>,
+        clips: ClipTable,
+        fault: impl FnOnce(&Gpu, &AtlasTexture),
+    ) -> Result<(), RenderError> {
+        let device = self.gpu.device();
+        let layers = skin_atlas::check_pages(pages, device).map_err(RenderError::Atlas)?;
+        // The whole candidate inside the error scopes: the texture, its
+        // view and writes, its bind group, and the submission of the
+        // uploads. Nothing in use changes until all of it was accepted.
+        let ((atlas, bind), refused) = skin_atlas::scoped(device, || {
+            let atlas = AtlasTexture::upload(&self.gpu, pages, layers);
+            let bind = self.bindings.bind(device, &atlas);
+            fault(&self.gpu, &atlas);
+            self.gpu.queue().submit([]);
+            (atlas, bind)
+        });
+        if let Some(e) = refused {
+            return Err(RenderError::Atlas(UploadError::Device(e)));
+        }
         finish_uploads(&self.gpu)?;
-        self.atlas_bind = self.bindings.bind(self.gpu.device(), &atlas);
+        self.atlas_bind = bind;
         self.staging.set_font_scale(atlas.font_scale());
         self.staging.set_clips(clips);
         self.atlas = atlas;
@@ -1176,7 +1202,7 @@ mod tests {
 
     use wgpu::wgc::instance as core;
 
-    use super::{RenderError, Renderer, Target, letterbox};
+    use super::{AtlasPages, ClipTable, RenderError, Renderer, Target, letterbox};
     use crate::text::MenuText;
     use crate::{AdapterChoice, Blend, SkinError, Sprite, UploadError, solid_uv};
 
@@ -1314,5 +1340,76 @@ mod tests {
         let alpha = |x: usize| pixels[(100 * 960 + x) * 4 + 3];
         assert!(alpha(50).abs_diff(159) <= 2, "alpha blend: {}", alpha(50));
         assert!(alpha(150).abs_diff(159) <= 2, "additive: {}", alpha(150));
+    }
+
+    /// A refusal after the texture exists, injected between the candidate's
+    /// bind group and the upload's submission (a buffer whose usage mixes
+    /// both map modes, which every device's validation refuses), is the
+    /// typed `Atlas(Device)` error, not an uncaptured one that would panic,
+    /// and the built-in atlas stays: 128 texels, one layer, its font scale
+    /// 1, so the solid block still draws white at layout (100, 100), target
+    /// pixel (50, 50). With the refused 256-texel array's font scale (1/2)
+    /// taken anyway, the solid uv would read texel 62 of the built-in atlas,
+    /// a glyph cell's empty corner. The same pages without the fault are
+    /// then installed: 256 texels, two layers.
+    #[test]
+    fn a_refusal_after_the_texture_keeps_the_atlas() {
+        let mut r = Renderer::new(
+            Target::Offscreen {
+                width: 960,
+                height: 540,
+            },
+            AdapterChoice::Warp,
+        )
+        .expect("WARP renderer");
+        let (l0, l1, l2, l3) = (
+            vec![0u8; 256 * 256 * 4],
+            vec![0u8; 128 * 128 * 4],
+            vec![0u8; 64 * 64 * 4],
+            vec![0u8; 32 * 32 * 4],
+        );
+        let page: crate::PageLevels<'_> = [&l0, &l1, &l2, &l3];
+        let pages = AtlasPages {
+            side: 256,
+            pages: &[page],
+        };
+        let e = r
+            .install(&pages, ClipTable::default(), |gpu, _| {
+                let _ = gpu.device().create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("refused"),
+                    size: 4,
+                    usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::MAP_WRITE,
+                    mapped_at_creation: false,
+                });
+            })
+            .unwrap_err();
+        assert!(
+            matches!(e, RenderError::Atlas(UploadError::Device(_))),
+            "{e:?}"
+        );
+        assert_eq!(r.atlas_size(), (128, 1));
+        let text = MenuText::new(&r);
+        let timing = r
+            .menu_frame(
+                |b| {
+                    b.push(
+                        Blend::Alpha,
+                        Sprite {
+                            rect: [0.0, 0.0, 400.0, 400.0],
+                            uv: solid_uv(),
+                            color: [1.0; 4],
+                            ..Sprite::default()
+                        },
+                    );
+                },
+                &text,
+            )
+            .unwrap();
+        assert!(timing.presented);
+        let pixels = r.read_back();
+        let i = (50 * 960 + 50) * 4;
+        assert_eq!(&pixels[i..i + 3], &[255, 255, 255]);
+        r.install_atlas(&pages, ClipTable::default()).unwrap();
+        assert_eq!(r.atlas_size(), (256, 2));
     }
 }

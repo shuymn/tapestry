@@ -5,10 +5,11 @@
 //! (docs/stage3.md R7). Without a skin's pages the array is the built-in
 //! atlas alone, one 128-texel layer.
 //!
-//! Uploading is preparation work, never a frame's: it checks the pages
+//! Uploading is preparation work, never a frame's: the pages are checked
 //! against the device's limits and against themselves before anything is
-//! allocated on the GPU, catches what the device still refuses as a typed
-//! error, and leaves the atlas in use untouched when it fails.
+//! allocated on the GPU ([`check_pages`]), and the renderer builds the
+//! whole replacement inside error scopes ([`scoped`]), so what the device
+//! still refuses is a typed error and the atlas in use stays untouched.
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
@@ -74,8 +75,8 @@ pub enum UploadError {
         /// The bytes its side needs.
         expected: u64,
     },
-    /// The device refused the texture or its upload (out of memory, or a
-    /// validation the checks above did not foresee).
+    /// The device refused the atlas's texture, its upload or its binding
+    /// (out of memory, or a validation the checks above did not foresee).
     #[error("the device refused the atlas")]
     Device(#[source] wgpu::Error),
 }
@@ -90,6 +91,35 @@ pub fn atlas_limits(device: &wgpu::Device) -> AtlasLimits {
         max_layers: l.max_texture_array_layers,
         reserved_layers: RESERVED_LAYERS,
     }
+}
+
+/// Checks `pages` against `device`'s limits and against themselves, before
+/// anything is allocated; returns the array's layers.
+///
+/// # Errors
+///
+/// The first check that fails ([`check`]).
+pub(crate) fn check_pages(
+    pages: &AtlasPages<'_>,
+    device: &wgpu::Device,
+) -> Result<u32, UploadError> {
+    check(pages, &device.limits())
+}
+
+/// Runs `work` inside out-of-memory and validation error scopes on
+/// `device`, and returns its result with the first error the device
+/// reported meanwhile: validation first, then out of memory.
+pub(crate) fn scoped<T>(
+    device: &wgpu::Device,
+    work: impl FnOnce() -> T,
+) -> (T, Option<wgpu::Error>) {
+    let out_of_memory = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+    let invalid = device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let out = work();
+    // Popped in the reverse order of their pushes.
+    let refused = pollster::block_on(invalid.pop());
+    let refused = refused.or(pollster::block_on(out_of_memory.pop()));
+    (out, refused)
 }
 
 /// Checks `pages` against the device's `limits` and against themselves,
@@ -149,20 +179,13 @@ impl AtlasTexture {
         Self::of(&texture, ATLAS_SIZE, 1)
     }
 
-    /// The array of `pages` with the built-in atlas in layer 0, uploaded.
-    ///
-    /// # Errors
-    ///
-    /// The first check that fails ([`UploadError`]); [`UploadError::Device`]
-    /// when the device refuses the texture or a write. The uploads are
-    /// queued, not yet finished.
-    pub(crate) fn upload(gpu: &Gpu, pages: &AtlasPages<'_>) -> Result<Self, UploadError> {
+    /// The array of `pages`, of `layers` layers as [`check_pages`] gave
+    /// them, with the built-in atlas in layer 0. The uploads are queued,
+    /// not yet submitted; what the device refuses is reported to its error
+    /// scopes ([`scoped`]).
+    pub(crate) fn upload(gpu: &Gpu, pages: &AtlasPages<'_>, layers: u32) -> Self {
         let device = gpu.device();
-        let layers = check(pages, &device.limits())?;
         let side = pages.side;
-        // Popped in the reverse order of their pushes.
-        let out_of_memory = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
-        let invalid = device.push_error_scope(wgpu::ErrorFilter::Validation);
         let levels = u32::try_from(MIP_LEVELS).unwrap_or(1);
         let texture = create(device, side, layers, levels);
         // The built-in atlas at the top left of layer 0's level 0; the
@@ -173,12 +196,7 @@ impl AtlasTexture {
                 write(gpu.queue(), &texture, layer, level, side >> level, bytes);
             }
         }
-        let refused = pollster::block_on(invalid.pop());
-        let refused = refused.or(pollster::block_on(out_of_memory.pop()));
-        match refused {
-            Some(e) => Err(UploadError::Device(e)),
-            None => Ok(Self::of(&texture, side, layers)),
-        }
+        Self::of(&texture, side, layers)
     }
 
     fn of(texture: &wgpu::Texture, side: u32, layers: u32) -> Self {
