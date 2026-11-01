@@ -5,6 +5,7 @@
 //! Unless stated: the loading lifetime's origin at 0, its progress 0, a
 //! 1 920 × 1 080 target, the author's layout, no covers.
 
+mod image_support;
 mod lanes_support;
 mod play_support;
 mod widget_support;
@@ -14,14 +15,15 @@ use skin_model::{
     Align, BarGroupDef, BuildError, CoverSettings, ElementDef, Fit, GaugeLook, GlyphSet,
     ImageChoiceDef, ImageChoicePart, ImageSpan, JudgeSlot, LaneParts, LanesDef, Layout, LoadState,
     Loading, LoadingFrame, LoadingGauge, Motion, NumberDef, PLAY, Pad, Place, Program, Quad,
-    QuadBatch, Region, Scope, Skin, SkinDef, Source, TextDef, TextField, TextImage, TextSlots,
-    TextTable, TextValue, TimerRef, Ty, UvTable, WidgetDefs, compile, field, timer,
+    QuadBatch, Region, Skin, SkinDef, Source, TextDef, TextField, TextImage, TextSlots, TextTable,
+    TextValue, TimerRef, UvTable, WidgetDefs, field, timer,
 };
 
 use lanes_support::{bar_group, simple};
 use play_support::{Harness, MS, VIEW, readouts_for, uvs};
 use widget_support::{
-    GAUGE, GRADE, IMAGES, TEN, desc, digits, empty_judge, frames_of, gauge, grade, int, sheet,
+    GAUGE, GRADE, TEN, boolean, desc, digits, empty_judge, frame_of, frames_of, gauge, grade, int,
+    sheet,
 };
 
 /// Image 0 is the background; the grade images past the first one stand
@@ -37,10 +39,6 @@ const OTHER: u32 = GRADE + 5;
 const FRONT: [u32; 2] = [GAUGE, GAUGE + 1];
 const BACK: [u32; 2] = [GAUGE + 2, GAUGE + 3];
 const TIP: [u32; 2] = [GAUGE + 4, GAUGE + 5];
-
-fn boolean(src: &str) -> Program {
-    compile(src, &Scope::new(&PLAY), Ty::Bool).unwrap()
-}
 
 /// An element on `screen` drawing `source` over `r` in `place`.
 fn untimed(source: Source, r: [i32; 4], place: Place) -> ElementDef {
@@ -163,22 +161,7 @@ impl Loader {
         self.batch
             .quads()
             .iter()
-            .filter_map(|q| {
-                let mut first = 0;
-                for i in 0..IMAGES {
-                    for f in 0..frames_of(i) {
-                        if self
-                            .uvs
-                            .get(first + u32::from(f))
-                            .is_some_and(|u| u.uv == q.uv && u.layer == q.layer)
-                        {
-                            return Some((i, f, *q));
-                        }
-                    }
-                    first += u32::from(frames_of(i));
-                }
-                None
-            })
+            .filter_map(|q| frame_of(&self.uvs, q).map(|(i, f)| (i, f, *q)))
             .collect()
     }
 
@@ -640,28 +623,10 @@ fn loading_text_draws_until_cleared() {
     assert_eq!(lines(&l), [1, 2]);
 }
 
-/// A skin of a title and a full title in a bitmap font of "A" with a
-/// fallback font of "B", each glyph 8 px apart.
-fn bitmap_text_skin(dir: &std::path::Path) -> Skin {
-    for (name, code) in [("a", 65), ("b", 66)] {
-        std::fs::write(
-            dir.join(format!("{name}.fnt")),
-            format!(
-                "info face=\"t\" size=10 padding=0,0,0,0\n\
-                 common lineHeight=12 base=10 scaleW=16 scaleH=16 pages=1\n\
-                 page id=0 file=\"{name}.png\"\n\
-                 char id={code} x=0 y=0 width=6 height=9 xoffset=1 yoffset=1 xadvance=8 page=0\n"
-            ),
-        )
-        .unwrap();
-        image::RgbaImage::from_pixel(16, 16, image::Rgba([255; 4]))
-            .save(dir.join(format!("{name}.png")))
-            .unwrap();
-    }
-    let mut b = skin_model::SheetBuilder::new(&skin_model::Root::new(dir).unwrap());
-    let a = b.admit_fnt("a.fnt", &mut |_| Ok(())).unwrap();
-    let f = b.admit_fnt("b.fnt", &mut |_| Ok(())).unwrap();
-    b.add_bitmap_font(a, &[f]).unwrap();
+/// A skin of a title and a full title in bitmap font 0 of `sheet`
+/// ([`image_support::ab_fonts`]: "A", falling back to "B", each glyph 8 px
+/// apart).
+fn bitmap_text_skin(sheet: skin_model::Sheet) -> Skin {
     let text = |f| TextDef {
         value: TextValue::Field(f),
         font: skin_model::FontRef::Bitmap(0),
@@ -672,7 +637,7 @@ fn bitmap_text_skin(dir: &std::path::Path) -> Skin {
         fit: Fit::Adapt,
         regions: play_support::REGIONS,
         whens: vec![boolean("load.percent >= 0")],
-        sheet: b.finish(),
+        sheet,
         lanes: None,
         elements: vec![
             untimed(Source::Text(0), [0, 0, 200, 20], Place::SCREEN),
@@ -692,8 +657,8 @@ fn bitmap_text_skin(dir: &std::path::Path) -> Skin {
 /// started before keeps its start and ages.
 #[test]
 fn loading_bitmap_text_is_replaced_and_cleared() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut l = Loader::new(bitmap_text_skin(dir.path()));
+    let (_dir, sheet) = image_support::ab_fonts();
+    let mut l = Loader::new(bitmap_text_skin(sheet));
     // Glyphs per line, by the line's y: the title, then the full title.
     let glyphs = |l: &Loader| {
         let q = l.batch.quads();

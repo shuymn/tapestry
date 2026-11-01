@@ -15,7 +15,8 @@ use skin_model::{
     Align, Anchor, Attach, Blend, ComboPart, CycleDef, DigitsDef, ElementDef, FileDef, Filter, Fit,
     Follow, GaugeDef, GaugeDesc, GaugeLook, GaugeParts, GlyphSet, GradePart, ImageDef, JudgeDef,
     JudgeSlot, LanesDef, LoadError, Motion, NumberDef, PLAY, Pad, Place, Program, Quad, Region,
-    RegionDef, Scope, Sheet, Skin, SkinDef, Source, TimerRef, Ty, WidgetDefs, compile, timer,
+    RegionDef, Scope, Sheet, Skin, SkinDef, Source, TimerRef, Ty, UvTable, WidgetDefs, compile,
+    timer,
 };
 
 use crate::lanes_support::rect;
@@ -256,12 +257,13 @@ pub fn judgment(ms: i64, judgment: Judgment, combo: u32) -> eval::JudgeEvent {
     ev(ms, judged(1, 0, judgment, Some(0), None, combo))
 }
 
-/// The image and frame of a quad, by its uv.
-pub fn shown(h: &Harness, q: &Quad) -> Option<(u32, u16)> {
+/// The image and frame of a quad, by its uv in `uvs`; `None` for a quad
+/// of no sheet frame, such as a text line.
+pub fn frame_of(uvs: &UvTable, q: &Quad) -> Option<(u32, u16)> {
     let mut first = 0;
     for i in 0..IMAGES {
         for f in 0..frames_of(i) {
-            if h.uvs
+            if uvs
                 .get(first + u32::from(f))
                 .is_some_and(|u| u.uv == q.uv && u.layer == q.layer)
             {
@@ -271,6 +273,11 @@ pub fn shown(h: &Harness, q: &Quad) -> Option<(u32, u16)> {
         first += u32::from(frames_of(i));
     }
     None
+}
+
+/// The image and frame of a quad, by its uv.
+pub fn shown(h: &Harness, q: &Quad) -> Option<(u32, u16)> {
+    frame_of(&h.uvs, q)
 }
 
 /// The batch's quads with their image and frame.

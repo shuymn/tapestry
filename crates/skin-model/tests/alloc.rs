@@ -2042,27 +2042,7 @@ const LIMITS_SMALL: AtlasLimits = AtlasLimits {
 /// Two bitmap texts of the title: `A` from the primary file, `B` from its
 /// fallback; the second squeezed into its box.
 fn bitmap_skin() -> (tempfile::TempDir, Skin) {
-    let root = dir();
-    let fnt = |name: &str, code: u32| {
-        let s = format!(
-            "info face=\"t\" size=10 padding=0,0,0,0\n\
-             common lineHeight=12 base=10 scaleW=16 scaleH=16 pages=1\n\
-             page id=0 file=\"{name}.png\"\n\
-             char id={code} x=0 y=0 width=6 height=9 xoffset=1 yoffset=1 xadvance=8 page=0\n"
-        );
-        std::fs::write(root.path().join(format!("{name}.fnt")), s).unwrap();
-        save(
-            root.path(),
-            &format!("{name}.png"),
-            &solid(16, 16, [255; 4]),
-        );
-    };
-    fnt("a", 65);
-    fnt("b", 66);
-    let mut b = skin_model::SheetBuilder::new(&skin_model::Root::new(root.path()).unwrap());
-    let a = b.admit_fnt("a.fnt", &mut |_| Ok(())).unwrap();
-    let f = b.admit_fnt("b.fnt", &mut |_| Ok(())).unwrap();
-    b.add_bitmap_font(a, &[f]).unwrap();
+    let (root, sheet) = image_support::ab_fonts();
     let text = |overflow| TextDef {
         value: TextValue::Field(TextField::Title),
         font: FontRef::Bitmap(0),
@@ -2082,7 +2062,7 @@ fn bitmap_skin() -> (tempfile::TempDir, Skin) {
         fit: Fit::Adapt,
         regions: regions(),
         whens: Vec::new(),
-        sheet: b.finish(),
+        sheet,
         lanes: None,
         elements: vec![element(0), element(1)],
         widgets: skin_model::WidgetDefs {
