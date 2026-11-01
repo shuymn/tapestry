@@ -115,11 +115,13 @@ impl Cx<'_> {
     /// destination that keeps a copy.
     fn selector(&mut self, src: &str, at: Span) -> Result<Program, ImportError> {
         if let Some(p) = self.selectors.get(src) {
-            let p = p.clone();
-            self.budget.ops(&p).map_err(|l| self.limit(at, l))?;
+            // Charged before the copy is made.
+            if let Err(l) = self.budget.ops(p) {
+                return Err(self.limit(at, l));
+            }
             #[cfg(test)]
             trace(Event::Charge);
-            return Ok(p);
+            return Ok(p.clone());
         }
         let p = self.compile(src, Ty::Int, at)?;
         self.selectors.insert(src.to_owned(), p.clone());
