@@ -130,7 +130,7 @@ fn readouts_show_their_fields() {
     let later = rows(&mut d, 61_500);
     assert_eq!(&later[3..7], ["1", "01", "1", "04"]);
     // Unknown values draw nothing, the clocks and covers still do.
-    let mut d = Drawn::over_with(loaded.ok().skin.clone(), &chart(), None);
+    let mut d = Drawn::over(d.skin, &chart());
     d.readouts = Some(FrameReadouts {
         bpm_current_x100: None,
         hispeed_x100: None,
