@@ -491,30 +491,22 @@ fn skin_import_seeds_import_and_draw_as_built() {
                 assert_eq!(drawn, [51, 51, 51, 51], "{name}");
             }
             "rates" => {
-                use skin_beatoraja::{DeviationId, PropertyKind};
+                use skin_beatoraja::DeviationId;
                 // Each rate number once D4, its conditions with it; the
-                // gauge-type set waits for the image selection, the one
-                // choosing by value is unsupported, the one whose value
-                // resolves to nothing draws its first image.
-                let mut k = kinds(&i);
-                k.sort_by_key(|n| format!("{n:?}"));
-                let mut want = vec![NoteKind::Deviation(DeviationId::D4); 6];
-                want.push(NoteKind::UnsupportedField {
-                    field: "image selection",
-                });
-                want.push(NoteKind::UnsupportedProperty {
-                    kind: PropertyKind::Integer,
-                    id: Some(71),
-                });
-                want.sort_by_key(|n| format!("{n:?}"));
-                assert_eq!(k, want, "{name}");
-                // Every object is charged, the dropped image sets too.
+                // sets selecting by gauge type and by EX score D4 too.
+                assert_eq!(
+                    kinds(&i),
+                    [NoteKind::Deviation(DeviationId::D4); 8],
+                    "{name}"
+                );
                 assert_eq!(u.elements, 9, "{name}");
+                assert_eq!(u.choice_refs, 3, "{name}");
                 // A normal gauge: the groove, not-hard and not-ex numbers
                 // draw. EX 150 over one judged of 100 targets: 750 000 bp
                 // now, its whole percent past 3 cells; 75.00 overall,
-                // "00" twice; and the first image.
-                assert_eq!(drawn, [3 + 2 + 2 + 1; 4], "{name}");
+                // "00" twice. Each set has one image: gauge type 2, EX 150
+                // and the unresolved value all select it.
+                assert_eq!(drawn, [3 + 2 + 2 + 3; 4], "{name}");
             }
             "readouts" => {
                 use skin_beatoraja::{DeviationId, PropertyKind};

@@ -225,23 +225,24 @@ fn offset_four_elements_that_may_reach_the_lanes_refuse() {
         assert_eq!(critical(l).0, CriticalPart::Cover, "{d}");
     }
     // Frames selected by an expression: an image group and image sets.
-    // A `ref` is an image-index property, 40 the shown gauge's type; a
-    // `value` of 40 is no value property, so the `ref` chooses.
-    let selectors = r#""imageset": [{"id": "byref", "images": ["cover"], "ref": 1},
+    // A `ref` is an image-index property, 40 the shown gauge's type and 42
+    // one the model cannot read; a `value` of 40 is no value property, so
+    // the `ref` chooses. Off the lanes each draws but the unreadable one.
+    let selectors = r#""imageset": [{"id": "byref", "images": ["cover"], "ref": 42},
                                     {"id": "byvalue", "images": ["cover"], "value": 71},
                                     {"id": "bykind", "images": ["cover"], "value": 40, "ref": 40}]"#;
     let group = r#"{"id": "group", "src": "a", "w": 16, "h": 16, "divx": 2, "len": 2},
                    {"id": "kindgroup", "src": "a", "w": 16, "h": 16, "divx": 2, "len": 2, "ref": 40}"#;
-    let kind = |kind, id| NoteKind::UnsupportedProperty { kind, id };
-    let selection = NoteKind::UnsupportedField {
-        field: "image selection",
+    let unreadable = NoteKind::UnsupportedProperty {
+        kind: PropertyKind::ImageIndex,
+        id: Some(42),
     };
     for (id, field, why) in [
-        ("byref", "ref", kind(PropertyKind::ImageIndex, Some(1))),
-        ("byvalue", "value", kind(PropertyKind::Integer, Some(71))),
-        ("bykind", "image selection", selection),
-        ("group", "len", NoteKind::UnsupportedField { field: "len" }),
-        ("kindgroup", "image selection", selection),
+        ("byref", "ref", vec![unreadable]),
+        ("byvalue", "value", vec![]),
+        ("bykind", "image selection", vec![]),
+        ("group", "len", vec![]),
+        ("kindgroup", "image selection", vec![]),
     ] {
         let over = cover("").replace(r#""id": "cover""#, &format!(r#""id": "{id}""#));
         let off = deco("", r#"{"x": 0, "y": 0, "w": 10, "h": 10}"#)
@@ -253,7 +254,7 @@ fn offset_four_elements_that_may_reach_the_lanes_refuse() {
             (CriticalPart::Cover, NoteKind::UnsupportedField { field }),
             "{id}"
         );
-        // Off the lanes it is an ordinary image, whose selector drops it.
+        // Off the lanes it is an ordinary image.
         let l = import_body(&body(group, &objects, &[NOTES, &off]));
         let dropped: Vec<NoteKind> = l
             .report()
@@ -262,8 +263,15 @@ fn offset_four_elements_that_may_reach_the_lanes_refuse() {
             .filter(|n| n.severity == Severity::Dropped)
             .map(|n| n.kind)
             .collect();
-        assert_eq!(dropped, [why], "{id}");
+        assert_eq!(dropped, why, "{id}");
     }
+    // An image set whose `ref` is no image-index property selects nothing:
+    // SUDDEN+ by its first image.
+    let null = r#""imageset": [{"id": "s", "images": ["cover"], "ref": 1}]"#;
+    let over = cover("").replace(r#""id": "cover""#, r#""id": "s""#);
+    let l = with(null, &[&over]);
+    assert!(has(l.report(), d9(LaneApprox::CoverAbove)));
+    assert_eq!(rects(&l, 5_000, 500, 0), [[20, 270, 430, 310]]);
 }
 
 #[test]

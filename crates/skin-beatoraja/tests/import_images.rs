@@ -1,87 +1,282 @@
-//! Images and image sets: a selector group (`len` above 1) is
-//! unsupported on an image object, while an image set without a frame
-//! expression draws its first image's frames whatever that image's `len`.
+//! Images and image selection: an image group (`len` above 1) selects a
+//! run of its frames by its `ref`, an image set one of its images by its
+//! `value` or else its `ref`; source rectangles and mouse rects.
 
 mod common;
 
+use common::play::{Drawn, readouts_for, tally};
 use common::{has, import_body};
-use skin_beatoraja::{NoteKind, PropertyKind};
-
-/// Image `g`, two 32×64 frames of `a.png` in a selector group of 2, and
-/// image set `s` of it with `set` fields, drawn by `dsts`.
-fn body(set: &str, dsts: &str) -> common::Loaded {
-    import_body(&format!(
-        r#""image": [{{"id": "g", "src": "a", "w": 64, "h": 64, "divx": 2, "len": 2}}],
-           "imageset": [{{"id": "s", "images": ["g"] {set}}}],
-           "destination": [{dsts}]"#
-    ))
-}
+use skin_beatoraja::{DeviationId, NoteKind, PropertyKind, Severity, TrackWhy};
+use skin_model::{FrameReadouts, LaneView};
 
 const KEY: &str = r#""dst": [{"w": 10, "h": 10}]"#;
 
-#[test]
-fn a_selector_group_is_unsupported_on_the_image() {
-    let l = body("", &format!(r#"{{"id": "g", {KEY}}}"#));
-    assert!(has(l.report(), NoteKind::UnsupportedField { field: "len" }));
-    assert_eq!(l.report().usage.images, 0);
+/// Each quad's frame: its index in the uv table.
+fn frames(d: &mut Drawn, ms: i64) -> Vec<usize> {
+    let quads = d.frame(ms, &[]);
+    quads
+        .iter()
+        .map(|q| {
+            d.uvs
+                .frames()
+                .iter()
+                .position(|f| f.uv == q.uv && f.layer == q.layer)
+                .expect("a frame of the sheet")
+        })
+        .collect()
+}
+
+/// The readouts with the lane cover switched `on`.
+fn cover_switch(on: bool) -> FrameReadouts {
+    let mut r = readouts_for(LaneView {
+        visible_time: bms_model::TimeUs(0),
+        cover: 0,
+        lift: 0,
+        hidden: 0,
+    });
+    r.covers.cover_enabled = on;
+    r
+}
+
+/// A group of `len` over ten 10×10 frames of `a.png`, five per row,
+/// cycled over 300 ms, with `extra` fields, drawn on `ready`.
+fn group(len: i32, extra: &str) -> common::Loaded {
+    import_body(&format!(
+        r#""image": [{{"id": "g", "src": "a", "w": 50, "h": 20, "divx": 5, "divy": 2,
+                      "cycle": 300, "len": {len} {extra}}}],
+           "destination": [{{"id": "g", {KEY}}}]"#
+    ))
 }
 
 #[test]
-fn an_image_set_draws_its_image_whatever_its_len() {
-    let l = body("", &format!(r#"{{"id": "s", {KEY}}}"#));
-    assert!(l.report().notes.is_empty(), "{:?}", l.report().notes);
-    assert_eq!(l.report().usage.images, 1);
-    assert_eq!(l.ok().skin.sheet().frame_count(), 2);
-    assert_eq!(l.quads(0).len(), 1);
-}
-
-/// The frame an image set chooses: its `value` as a value property when
-/// it resolves, else its `ref` as an image-index property; ref 40, the
-/// shown gauge's type, waits for the image selection (S6c-04).
-#[test]
-fn an_image_set_chooses_by_value_then_by_ref() {
-    let dropped = |set: &str| {
-        let l = body(set, &format!(r#"{{"id": "s", {KEY}}}"#));
-        assert_eq!(l.report().usage.images, 0, "{set}");
-        common::kinds(l.report())
+fn a_group_cuts_its_frames_into_runs() {
+    // Ten frames in three runs of three: 0–2, 3–5 (across the row) and
+    // 6–8; frame 9 is never shown. Ref 330 selects by the lane cover's
+    // switch, ref 40 by the gauge's look (normal: 2).
+    let run = |r: i32, on: bool| {
+        let mut d = group(3, &format!(r#", "ref": {r}"#)).drawn();
+        d.readouts = Some(cover_switch(on));
+        [0, 99, 100, 200, 299, 300, 900]
+            .map(|ms| frames(&mut d, ms))
+            .concat()
     };
+    assert_eq!(run(330, false), [0, 0, 1, 2, 2, 0, 0]);
+    assert_eq!(run(330, true), [3, 3, 4, 5, 5, 3, 3]);
+    assert_eq!(run(40, true), [6, 6, 7, 8, 8, 6, 6]);
+    // Its image is admitted once, with every frame, and no sheet cycle.
+    let l = group(3, r#", "ref": 40"#);
+    let u = l.report().usage;
+    assert_eq!((u.images, u.frames, u.choice_refs), (1, 10, 3));
+    assert_eq!(l.ok().skin.choice_ref_count(), 3);
+}
+
+#[test]
+fn switching_a_cover_off_mid_play_selects_its_off_image() {
+    // The play's switch, not the configuration's (D4): switched on at
+    // the start, off at 500 ms.
+    let l = group(2, r#", "ref": 330"#);
+    assert!(has(l.report(), NoteKind::Deviation(DeviationId::D4)));
+    let mut d = l.drawn();
+    d.readouts = Some(cover_switch(true));
+    assert_eq!(frames(&mut d, 0), [5]);
+    d.readouts = Some(cover_switch(false));
+    assert_eq!(frames(&mut d, 600), [0]);
+}
+
+#[test]
+fn one_frame_runs_ignore_their_cycle_timer() {
+    // Timer 2 is unsupported: a run of one frame never cycles, so it
+    // does not matter; a run of two does.
+    let l = group(10, r#", "ref": 40, "timer": 2"#);
+    assert!(
+        l.report()
+            .notes
+            .iter()
+            .all(|n| n.severity != Severity::Dropped)
+    );
+    assert_eq!(frames(&mut l.drawn(), 0), [2]);
+    let l = group(5, r#", "ref": 40, "timer": 2"#);
+    assert_eq!(
+        common::kinds(l.report()),
+        [NoteKind::Timer(skin_beatoraja::TimerWhy::Unsupported(2))]
+    );
+    // Runs of no frame: never drawn, nothing admitted.
+    let l = group(11, r#", "ref": 40"#);
+    assert_eq!(
+        common::kinds(l.report()),
+        [NoteKind::Track(TrackWhy::NeverDrawn)]
+    );
+    let u = l.report().usage;
+    assert_eq!((u.images, u.choice_refs), (0, 0));
+}
+
+#[test]
+fn group_refs_resolve_as_image_indices() {
+    // A null image index (unknown, 0, absent, past the factory) selects
+    // run 0, with no note; a known one the model cannot read drops it
+    // with its id.
+    for extra in ["", r#", "ref": 0"#, r#", "ref": 1"#, r#", "ref": 70000"#] {
+        let l = group(2, extra);
+        assert!(
+            l.report().notes.is_empty(),
+            "{extra}: {:?}",
+            l.report().notes
+        );
+        assert_eq!(frames(&mut l.drawn(), 0), [0], "{extra}");
+    }
+    let prop = |id| NoteKind::UnsupportedProperty {
+        kind: PropertyKind::ImageIndex,
+        id: Some(id),
+    };
+    for id in [10, 42, 90, 170, 302, 342, 386, 469, 500, 507, 1_510] {
+        let l = group(2, &format!(r#", "ref": {id}"#));
+        assert_eq!(common::kinds(l.report()), [prop(id)], "{id}");
+        assert_eq!(l.report().usage.images, 0, "{id}");
+    }
+    // A `len` of 1 or less is an ordinary image whatever its `ref`.
+    let l = group(1, r#", "ref": 42"#);
+    assert!(l.report().notes.is_empty());
+    assert_eq!(l.ok().skin.choice_ref_count(), 0);
+}
+
+/// Images `i0`–`i2`, the 16×16 cells of `a.png` at x 0, 16 and 32; image
+/// set `s` of `images` with `set` fields, drawn on `ready`.
+fn set(images: &str, set: &str) -> common::Loaded {
+    let json = format!(
+        r#"{{"type": 0, "w": 1920, "h": 1080,
+           "source": [{{"id": "a", "path": "a.png"}}, {{"id": "m", "path": "clip.mp4"}}],
+           "image": [{{"id": "i0", "src": "a", "w": 16, "h": 16}},
+                     {{"id": "i1", "src": "a", "x": 16, "w": 16, "h": 16, "len": 4, "ref": 42}},
+                     {{"id": "i2", "src": "a", "x": 32, "w": 16, "h": 16}},
+                     {{"id": "mv", "src": "m"}},
+                     {{"id": "gone", "src": "nothing"}}],
+           "imageset": [{{"id": "s", "images": {images} {set}}}],
+           "destination": [{{"id": "s", {KEY}}}]}}"#
+    );
+    let dir = common::skin_with(&json, &[("a.png", 64, 64)]);
+    let result = common::import_dir(dir.path());
+    common::Loaded { dir, result }
+}
+
+#[test]
+fn an_image_set_selects_by_value_then_by_ref() {
+    let three = r#"["i0", "i1", "i2"]"#;
+    // EX score selects (D4: the source hides it before its score
+    // exists); 3 is past the table and selects entry 0.
+    let shown = |fields: &str, ex: u32| {
+        let l = set(three, fields);
+        let mut d = l.drawn();
+        d.tally = tally(ex, 0);
+        frames(&mut d, 0)
+    };
+    for (ex, want) in [(0, [0]), (1, [1]), (2, [2]), (3, [0]), (99, [0])] {
+        assert_eq!(shown(r#", "value": 71"#, ex), want, "{ex}");
+    }
+    // A known value wins over ref 40; value 40 is no value property, so
+    // ref 40 (normal: 2) selects; a null value and no ref select 0.
+    assert_eq!(shown(r#", "value": 101, "ref": 40"#, 1), [1]);
+    assert_eq!(shown(r#", "value": 40, "ref": 40"#, 1), [2]);
+    assert_eq!(shown(r#", "ref": 40"#, 1), [2]);
+    assert_eq!(shown(r#", "value": 40"#, 1), [0]);
+    assert_eq!(shown(r#", "ref": 1"#, 1), [0]);
+    // A value the model cannot show, or a script, does not fall back.
     let prop = |kind, id| NoteKind::UnsupportedProperty { kind, id };
-    let selection = NoteKind::UnsupportedField {
-        field: "image selection",
-    };
-    assert_eq!(
-        dropped(r#", "ref": 1"#),
-        [prop(PropertyKind::ImageIndex, Some(1))]
-    );
-    assert_eq!(dropped(r#", "ref": 40"#), [selection]);
-    // Value 40 is no value property: the `ref` chooses.
-    assert_eq!(dropped(r#", "value": 40, "ref": 40"#), [selection]);
-    // A known value, or a script, wins over ref 40.
-    assert_eq!(
-        dropped(r#", "value": 71, "ref": 40"#),
-        [prop(PropertyKind::Integer, Some(71))]
-    );
-    assert_eq!(
-        dropped(r#", "value": 150, "ref": 40"#),
-        [prop(PropertyKind::Integer, Some(150))]
-    );
-    assert_eq!(
-        dropped(r#", "value": "myscript", "ref": 40"#),
-        [prop(PropertyKind::Integer, None)]
-    );
-    // A value resolving to nothing over no `ref` chooses nothing: the
-    // first image is drawn.
-    let l = body(r#", "value": 40"#, &format!(r#"{{"id": "s", {KEY}}}"#));
+    for (fields, why) in [
+        (
+            r#", "value": 150, "ref": 40"#,
+            prop(PropertyKind::Integer, Some(150)),
+        ),
+        (
+            r#", "value": "myscript", "ref": 40"#,
+            prop(PropertyKind::Integer, None),
+        ),
+        (r#", "ref": 42"#, prop(PropertyKind::ImageIndex, Some(42))),
+    ] {
+        let l = set(three, fields);
+        assert_eq!(common::kinds(l.report()), [why], "{fields}");
+        assert_eq!(l.report().usage.images, 0, "{fields}");
+    }
+    // A value that may be unknown hides while it is.
+    let l = set(three, r#", "value": 160"#);
+    assert!(frames(&mut l.drawn(), 0).is_empty());
+    // Every entry is admitted, the selector constant or not.
+    let l = set(three, "");
     assert!(l.report().notes.is_empty(), "{:?}", l.report().notes);
-    assert_eq!(l.quads(0).len(), 1);
-    // A selector group chooses by its `ref` too; a plain image ignores it.
-    let l = import_body(&format!(
-        r#""image": [{{"id": "g", "src": "a", "w": 64, "h": 64, "divx": 2, "len": 2, "ref": 40}},
-                     {{"id": "p", "src": "a", "w": 64, "h": 64, "ref": 40}}],
-           "destination": [{{"id": "g", {KEY}}}, {{"id": "p", {KEY}}}]"#
+    assert_eq!(l.report().usage.images, 3);
+}
+
+#[test]
+fn an_image_set_keeps_holes_and_repeats() {
+    // A null item, an undefined id, a movie and a missing file are holes,
+    // located at their item; a repeat shares its image.
+    let l = set(
+        r#"["i2", null, "none", "mv", "gone", "i2"]"#,
+        r#", "value": 71"#,
+    );
+    let r = l.report();
+    let u = r.usage;
+    // The movie and the missing file were charged before they failed.
+    assert_eq!((u.images, u.choice_refs), (3, 6));
+    assert_eq!(l.ok().skin.sheet().image_count(), 1);
+    assert_eq!(l.ok().skin.choice_ref_count(), 6);
+    let holes: Vec<_> = r
+        .notes
+        .iter()
+        .filter(|n| n.severity == Severity::Ignored)
+        .map(|n| n.kind)
+        .collect();
+    assert_eq!(
+        holes,
+        [
+            NoteKind::UndefinedObject,
+            NoteKind::Unsupported {
+                object: skin_beatoraja::Object::Movie
+            },
+            NoteKind::MissingAsset,
+        ]
+    );
+    let at: Vec<_> = r.notes.iter().filter_map(|n| n.at.as_ref()).collect();
+    assert!(
+        at.windows(2)
+            .all(|w| (w[0].line, w[0].col) < (w[1].line, w[1].col))
+    );
+    let mut d = l.drawn();
+    for (ex, want) in [(0, vec![0]), (1, vec![]), (2, vec![]), (5, vec![0])] {
+        d.tally = tally(ex, 0);
+        assert_eq!(frames(&mut d, 0), want, "{ex}");
+    }
+    // Only holes: never drawn.
+    let l = set(r#"[null, "none"]"#, "");
+    assert!(has(l.report(), NoteKind::Track(TrackWhy::NeverDrawn)));
+    assert_eq!(l.ok().skin.choice_ref_count(), 0);
+}
+
+#[test]
+fn an_image_set_s_images_must_be_an_array_of_names() {
+    // Absent or empty: never drawn; null, an object or an object item: a
+    // type error.
+    let absent = import_body(&format!(
+        r#""imageset": [{{"id": "s"}}], "destination": [{{"id": "s", {KEY}}}]"#
     ));
-    assert_eq!(common::kinds(l.report()), [selection]);
-    assert_eq!(l.quads(0).len(), 1);
+    for l in [set("[]", ""), absent] {
+        assert_eq!(
+            common::kinds(l.report()),
+            [NoteKind::Track(TrackWhy::NeverDrawn)]
+        );
+    }
+    for images in ["null", "{}", r#"[{}]"#, r#"["i0", []]"#] {
+        let e = set(images, "").err();
+        assert!(
+            matches!(
+                e,
+                skin_beatoraja::ImportError::Type {
+                    field: "images",
+                    ..
+                }
+            ),
+            "{images}: {e:?}"
+        );
+    }
 }
 
 /// An image with `src` fields over the 64×64 `a.png`, drawn with `dst`

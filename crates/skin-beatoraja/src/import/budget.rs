@@ -5,9 +5,10 @@
 use std::fmt;
 
 use skin_model::{
-    Charge, MAX_ELEMENTS, MAX_FILES, MAX_FONTS, MAX_IMAGES, MAX_SHEET_GLYPHS, MAX_SHEET_KERNINGS,
-    MAX_SKIN_FRAMES, MAX_SKIN_KEYS, MAX_SKIN_OPS, MAX_TEXT_ELEMENTS, MAX_TOTAL_FILE_BYTES,
-    MAX_TOTAL_FONT_BYTES, MAX_TRACK_KEYS, MAX_WHEN_TIMERS, MAX_WIDGET_QUADS, Program, SkinOps,
+    Charge, MAX_ELEMENTS, MAX_FILES, MAX_FONTS, MAX_IMAGE_CHOICE_REFS, MAX_IMAGES,
+    MAX_SHEET_GLYPHS, MAX_SHEET_KERNINGS, MAX_SKIN_FRAMES, MAX_SKIN_KEYS, MAX_SKIN_OPS,
+    MAX_TEXT_ELEMENTS, MAX_TOTAL_FILE_BYTES, MAX_TOTAL_FONT_BYTES, MAX_TRACK_KEYS, MAX_WHEN_TIMERS,
+    MAX_WIDGET_QUADS, Program, SkinOps,
 };
 
 use super::report::Usage;
@@ -42,6 +43,9 @@ pub enum ImportLimit {
     Texts,
     /// More than [`MAX_WIDGET_QUADS`] widget quads a frame.
     WidgetQuads,
+    /// More than [`MAX_IMAGE_CHOICE_REFS`] image choice entries, holes and
+    /// repeats included.
+    ChoiceRefs,
 }
 
 impl fmt::Display for ImportLimit {
@@ -60,6 +64,7 @@ impl fmt::Display for ImportLimit {
             Self::Kernings => write!(f, "more than {MAX_SHEET_KERNINGS} bitmap kerning pairs"),
             Self::Texts => write!(f, "more than {MAX_TEXT_ELEMENTS} text elements"),
             Self::WidgetQuads => write!(f, "more than {MAX_WIDGET_QUADS} widget quads"),
+            Self::ChoiceRefs => write!(f, "more than {MAX_IMAGE_CHOICE_REFS} image choice entries"),
         }
     }
 }
@@ -194,6 +199,17 @@ impl Budget {
             n,
             cap,
             ImportLimit::WidgetQuads,
+        )
+    }
+
+    /// An image choice table's `n` entries, holes and repeats included,
+    /// before the table is reserved or its images admitted.
+    pub(crate) fn choice_refs(&mut self, n: usize) -> Result<(), ImportLimit> {
+        charge(
+            &mut self.usage.choice_refs,
+            n,
+            MAX_IMAGE_CHOICE_REFS,
+            ImportLimit::ChoiceRefs,
         )
     }
 
