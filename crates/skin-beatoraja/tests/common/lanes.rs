@@ -127,3 +127,15 @@ pub fn body(extra: &str, objects: &str, dsts: &[&str]) -> String {
         dsts.join(", ")
     )
 }
+
+/// The lanes with `objects` beside the note and `dsts` after it.
+pub fn with(objects: &str, dsts: &[&str]) -> super::Loaded {
+    let objects = if objects.is_empty() {
+        note("")
+    } else {
+        format!("{}, {objects}", note(""))
+    };
+    let mut all = vec![NOTES];
+    all.extend_from_slice(dsts);
+    super::import_body(&body("", &objects, &all))
+}

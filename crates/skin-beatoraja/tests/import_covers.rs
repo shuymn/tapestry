@@ -9,7 +9,7 @@
 mod common;
 
 use bms_model::{ChartBuilder, Lane, TimeUs};
-use common::lanes::{NOTES, body, cover, lift, lift_object, note};
+use common::lanes::{NOTES, body, cover, lift, lift_object, note, with};
 use common::play::{Drawn, MS};
 use common::{Loaded, has, import_body, import_config, import_sized};
 use skin_beatoraja::ImportLimit;
@@ -18,18 +18,6 @@ use skin_beatoraja::{
 };
 use skin_model::Blend;
 use skin_model::MAX_IMAGES;
-
-/// The lanes with `objects` beside the note and `dsts` after it.
-fn with(objects: &str, dsts: &[&str]) -> Loaded {
-    let objects = if objects.is_empty() {
-        note("")
-    } else {
-        format!("{}, {objects}", note(""))
-    };
-    let mut all = vec![NOTES];
-    all.extend_from_slice(dsts);
-    import_body(&body("", &objects, &all))
-}
 
 /// The rects at 1,000 ms over a tap on lane 1 at `tap` ms, with the
 /// covers at `cover` and `lift` ‰.

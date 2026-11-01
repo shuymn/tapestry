@@ -11,25 +11,13 @@ mod common;
 
 use bms_model::{ChartBuilder, Lane, TimeUs};
 use common::lanes::{
-    NOTES, body, cover, hidden, hidden_object, lane_rects, lift, lift_object, note, note_with,
+    NOTES, body, cover, hidden, hidden_object, lane_rects, lift, lift_object, note, note_with, with,
 };
 use common::play::{Drawn, MS};
 use common::{Loaded, has, import_body, import_config};
 use skin_beatoraja::{
     Config, DeviationId, LaneApprox, NoteKind, OffsetValue, PropertyKind, Severity,
 };
-
-/// The lanes with `objects` beside the note and `dsts` after it.
-fn with(objects: &str, dsts: &[&str]) -> Loaded {
-    let objects = if objects.is_empty() {
-        note("")
-    } else {
-        format!("{}, {objects}", note(""))
-    };
-    let mut all = vec![NOTES];
-    all.extend_from_slice(dsts);
-    import_body(&body("", &objects, &all))
-}
 
 /// The default HIDDEN+ with `extra` object fields and `dst` extra fields.
 fn hid(extra: &str, dst: &str) -> Loaded {
