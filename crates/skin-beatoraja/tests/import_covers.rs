@@ -292,6 +292,36 @@ fn widgets_listing_offset_four_follow_sudden_plus() {
 }
 
 #[test]
+fn selecting_images_listing_offset_four_follow_sudden_plus() {
+    // Off the lanes, a group choosing by the gauge's type and a set
+    // choosing by EX score each draw their choice and follow: 300 down at
+    // 500 ‰.
+    let group = r#"{"id": "g", "src": "a", "w": 16, "h": 16, "divx": 2, "len": 2, "ref": 40}"#;
+    let objects = format!(
+        r#"{}, "imageset": [{{"id": "s", "images": ["g", "g"], "value": 71}}]"#,
+        note("")
+    );
+    for id in ["g", "s"] {
+        let d = format!(
+            r#"{{"id": "{id}", "offset": 4, "dst": [{{"x": 0, "y": 0, "w": 10, "h": 10}}]}}"#
+        );
+        let l = import_body(&body(group, &objects, &[NOTES, &d]));
+        assert!(has(l.report(), d9(LaneApprox::CoverMotion)), "{id}");
+        assert!(
+            has(l.report(), NoteKind::Deviation(DeviationId::D4)),
+            "{id}"
+        );
+        let still = rects(&l, 5_000, 0, 0);
+        assert_eq!(still.len(), 1, "{id}");
+        let moved: Vec<_> = still
+            .iter()
+            .map(|&[x, y, w, h]| [x, y + 300, w, h])
+            .collect();
+        assert_eq!(rects(&l, 5_000, 500, 0), moved, "{id}");
+    }
+}
+
+#[test]
 fn static_offsets_keep_beside_repeated_cover_offsets() {
     // Offset 40 moves the image 5 right; 3 and 4, each listed twice and
     // 4 configured with a y the play overrides, move it once by both

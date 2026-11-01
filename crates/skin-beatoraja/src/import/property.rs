@@ -721,4 +721,39 @@ mod tests {
             Some(StrProp::Unsupported(None))
         );
     }
+
+    #[test]
+    fn image_indices_resolve() {
+        // Each known range's ends are known, one past them null.
+        for &(a, b) in INDEX_KNOWN {
+            assert_eq!(index_by_id(a), IndexProp::Unsupported(a));
+            assert_eq!(index_by_id(b), IndexProp::Unsupported(b));
+        }
+        for id in [
+            0, 1, 9, 13, 41, 44, 186, 300, 309, 329, 333, 459, 467, 520, 1_700,
+        ] {
+            assert_eq!(index_by_id(id), IndexProp::Null, "{id}");
+        }
+        assert!(INDEX_KNOWN.windows(2).all(|w| w[0].1 < w[1].0));
+        let scope = skin_model::Scope::new(&skin_model::PLAY);
+        let ops = |p: IndexProp| {
+            let src = p.selector().unwrap();
+            skin_model::compile(src, &scope, skin_model::Ty::Int)
+                .unwrap()
+                .op_count()
+        };
+        for (id, p, n) in [
+            (40, IndexProp::GaugeKind, 34),
+            (330, IndexProp::CoverEnabled, 4),
+            (331, IndexProp::LiftEnabled, 4),
+            (332, IndexProp::HiddenEnabled, 4),
+        ] {
+            assert_eq!(index_by_id(id), p);
+            assert!(p.deviates());
+            assert_eq!(ops(p), n, "{id}");
+        }
+        assert_eq!(ops(IndexProp::Null), 1);
+        assert!(!IndexProp::Null.deviates());
+        assert_eq!(IndexProp::Unsupported(42).selector(), None);
+    }
 }
