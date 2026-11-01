@@ -366,6 +366,9 @@ pub struct Loaded {
     /// The practice set up, with its section in the chart's real time:
     /// each play is then a round of it.
     practice: Option<(Practice, Section)>,
+    /// The play preset the practice was checked under: a round under
+    /// another refits it first ([`refit_practice`](Self::refit_practice)).
+    practiced: Option<RulePreset>,
 }
 
 /// What one read of a chart's file gave: the chart, its record, its labels
@@ -559,6 +562,7 @@ impl Loaded {
                     attempt: 0,
                     events,
                     practice: None,
+                    practiced: None,
                 })
             }
             Err(e) => Err(Box::new((e, shelf))),
@@ -637,6 +641,7 @@ impl Loaded {
         self.labels = read.labels;
         self.warnings = read.warnings;
         self.practice = None;
+        self.practiced = None;
         Ok(())
     }
 
@@ -690,6 +695,7 @@ impl Loaded {
     pub fn set_practice(&mut self, practice: Option<Practice>) -> Result<(), PracticeError> {
         let Some(practice) = practice else {
             self.practice = None;
+            self.practiced = None;
             return Ok(());
         };
         if self.config.autoplay.is_some() {
@@ -698,7 +704,50 @@ impl Loaded {
         let section = practice.section(self.config.speed);
         crate::practice::check(&self.chart, &self.preset, &section)?;
         self.practice = Some((practice, section));
+        self.practiced = Some(self.preset.clone());
         Ok(())
+    }
+
+    /// Fits the practice to the play preset refreshed for this round
+    /// ([`begin_play`](Self::begin_play)) when it changed since the
+    /// practice was checked: each gauge's initial value follows its gauge
+    /// by ID, a gauge left at its start takes the new start, and a gauge
+    /// the preset gained starts at its start; the section is then checked
+    /// again under the new preset.
+    ///
+    /// # Errors
+    ///
+    /// [`PracticeError::GaugeGone`] when a gauge set to another value than
+    /// its start is no longer in the preset, and what
+    /// [`set_practice`](Self::set_practice) refuses; the practice is then
+    /// unchanged, and the round must not open.
+    pub fn refit_practice(&mut self) -> Result<(), PracticeError> {
+        let (Some((practice, _)), Some(practiced)) = (&self.practice, &self.practiced) else {
+            return Ok(());
+        };
+        if *practiced == self.preset {
+            return Ok(());
+        }
+        let old = practiced.gauges.iter().zip(&practice.initial_gauges);
+        if let Some((gone, _)) = old.clone().find(|(rule, value)| {
+            **value != rule.start && !self.preset.gauges.iter().any(|g| g.id == rule.id)
+        }) {
+            return Err(PracticeError::GaugeGone(gone.id.clone()));
+        }
+        let initial_gauges = self
+            .preset
+            .gauges
+            .iter()
+            .map(|g| match old.clone().find(|(rule, _)| rule.id == g.id) {
+                Some((rule, value)) if *value != rule.start => *value,
+                _ => g.start,
+            })
+            .collect();
+        let refit = Practice {
+            initial_gauges,
+            ..practice.clone()
+        };
+        self.set_practice(Some(refit))
     }
 
     /// The practice set up, if any.

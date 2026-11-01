@@ -2790,36 +2790,94 @@ fn a_refused_round_preparation_shows_on_the_practice_page() {
 }
 
 /// The play preset is refreshed before the first round too: the preset
-/// file edited while the practice page waits is the one the first round's
-/// attempt is prepared with and played under.
+/// file edited while the practice page waits, its gauges reordered and one
+/// added, is the one the first round's attempt is prepared with and played
+/// under, and the initial value set on the page stays with its gauge.
 #[test]
 fn the_first_round_prepares_with_the_preset_edited_on_the_practice_page() {
+    use PracticeInput::{Down, Left};
     let mut acts = vec![(0, Act::Practice(P))];
-    acts.extend(to_start(0));
+    // The displayed gauge 5 % below its start, then Start.
+    acts.extend(page(Down, 4));
+    acts.extend(page(Left, 5));
+    acts.extend(page(Down, 2));
     acts.extend([
         (500, Act::Page(PracticeInput::Confirm)),
         (3_000, Act::Quit),
         (500, Act::Page(PracticeInput::Back)),
         (500, Act::Close),
     ]);
+    let edited = reordered();
+    let file = game::preset_to_toml(&edited);
     let (rig, _app, _dir, ran) = run_mine(Refusal::Missing, acts, |r, dir| {
         // While the page waits, before Start.
-        edit(
-            r,
-            CLOCK_START + 300 * MS,
-            &mine_path(dir),
-            game::preset_to_toml(&flat_normal()),
-        );
+        edit(r, CLOCK_START + 300 * MS, &mine_path(dir), file);
     });
     ran.unwrap();
     assert!(rig.violations.is_empty(), "{:?}", rig.violations);
     let first = &rig.attempts[0];
-    assert_eq!(first.gauges, flat_normal().gauges);
-    assert_ne!(first.gauges, rules::tapestry().gauges);
+    assert_eq!(first.gauges, edited.gauges);
+    let game::AttemptKind::Section(section) = &first.kind else {
+        panic!("{:?}", first.kind);
+    };
+    let displayed = &rules::tapestry().gauges[0];
+    let set = rules::GaugeValue(displayed.start.0 - 5 * rules::GaugeValue::PERCENT);
+    let expected: Vec<_> = edited
+        .gauges
+        .iter()
+        .map(|g| if g.id == displayed.id { set } else { g.start })
+        .collect();
+    assert_eq!(section.initial_gauges, expected);
     let [(P, rounds)] = &rig.loads[..] else {
         panic!("{:?}", rig.seen);
     };
-    assert_eq!(rounds[0].preset, mine(flat_normal()));
+    assert_eq!(rounds[0].preset, mine(edited));
+}
+
+/// The tapestry preset's gauges reversed, with a copy of its first added
+/// at the end under another name and start.
+fn reordered() -> rules::RulePreset {
+    let mut p = flat_normal();
+    let mut extra = p.gauges[0].clone();
+    extra.id = "extra".to_owned();
+    extra.lamp = 2;
+    extra.start = rules::GaugeValue(50 * rules::GaugeValue::PERCENT);
+    p.gauges.reverse();
+    p.gauges.push(extra);
+    p
+}
+
+/// A gauge set on the practice page that a later edit of the preset
+/// removes refuses the round with a notice on the page; no round opens.
+#[test]
+fn a_round_whose_set_gauge_left_the_preset_is_refused() {
+    use PracticeInput::{Down, Left};
+    let mut acts = vec![(0, Act::Practice(P))];
+    acts.extend(page(Down, 4));
+    acts.extend(page(Left, 5));
+    acts.extend(page(Down, 2));
+    acts.extend([
+        (500, Act::Page(PracticeInput::Confirm)),
+        (500, Act::Page(PracticeInput::Back)),
+        (500, Act::Close),
+    ]);
+    let mut edited = flat_normal();
+    let displayed = edited.gauges.remove(0);
+    let file = game::preset_to_toml(&edited);
+    let (rig, _app, _dir, ran) = run_mine(Refusal::Missing, acts, |r, dir| {
+        edit(r, CLOCK_START + 300 * MS, &mine_path(dir), file);
+    });
+    ran.unwrap();
+    assert!(rig.violations.is_empty(), "{:?}", rig.violations);
+    let n = notices(&rig);
+    assert!(
+        n.iter()
+            .flatten()
+            .any(|n| n.contains(&format!("no longer has the gauge {}", displayed.id))),
+        "{n:?}"
+    );
+    assert_eq!(rig.opens, 0);
+    assert!(rig.attempts.is_empty());
 }
 
 fn act() -> impl Strategy<Value = Act> {

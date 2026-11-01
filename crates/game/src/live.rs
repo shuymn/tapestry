@@ -576,7 +576,16 @@ fn play_and_next<R: Rig>(
     // The play preset is refreshed here, so the attempt is prepared with
     // it, whatever a result screen viewed.
     let start = loaded.begin_play();
-    match ready_to_open(loaded, rig) {
+    // A round's practice follows the refreshed preset, or the round is
+    // refused before anything is prepared.
+    let ready = match loaded.refit_practice() {
+        Ok(()) => ready_to_open(loaded, rig),
+        Err(e) => Err(LiveError::Preparation(PreparationRefusal {
+            location: None,
+            reason: crate::Chain(&e).to_string(),
+        })),
+    };
+    match ready {
         Ok(true) => {}
         Ok(false) => {
             loaded.withdraw(start);
