@@ -930,7 +930,7 @@ fn cancelled(controls: &crate::controls::Controls) -> bool {
 
 /// Shows the load's lines of `page` at `stage` on the play screen, and
 /// says so on the console; nothing without them.
-pub(crate) fn show_stage(render: &RenderLink, page: Option<&LoadingText>, stage: Stage) {
+fn show_stage(render: &RenderLink, page: Option<&LoadingText>, stage: Stage) {
     let Some(page) = page else {
         return;
     };
@@ -1443,7 +1443,6 @@ impl AppRig for PlayerRig<'_> {
                 subartist: h.subartist.clone(),
                 genre: h.genre.clone(),
             }),
-            notice: None,
         };
         println!("load: the play screen loads {}", file_name(chart));
         show_stage(&self.render, Some(&page), Stage::Chart);

@@ -467,18 +467,6 @@ impl Rig for PlayerRig<'_> {
 
     /// The render thread answers once it draws no loading frame any more;
     /// a retry has no loading state to end.
-    /// The reset shows as the loading lines' last, while the screen is
-    /// prepared; a retry or a repeated round has no loading state for it.
-    fn announce(&mut self, notice: &str) -> bool {
-        let Some(page) = self.selection.as_mut().and_then(|s| s.loading.as_mut()) else {
-            return false;
-        };
-        println!("load: {notice}");
-        page.notice = Some(notice.to_owned());
-        crate::selection::show_stage(&self.render, Some(page), crate::loading_text::Stage::Screen);
-        true
-    }
-
     fn end_loading(&mut self) -> Result<(), ScreenError> {
         let loading = self.selection.as_mut().and_then(|s| s.loading.take());
         if loading.is_some() {
