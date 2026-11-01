@@ -1001,28 +1001,41 @@ pub fn skin_imports() -> Vec<Seed> {
     ]
 }
 
+/// The twelve part arrays of a note member.
+const PART_FIELDS: [&str; 12] = [
+    "note",
+    "lnstart",
+    "lnend",
+    "lnbody",
+    "lnactive",
+    "mine",
+    "hcnstart",
+    "hcnend",
+    "hcnbody",
+    "hcnactive",
+    "hcndamage",
+    "hcnreactive",
+];
+
+/// The eight lanes' destinations: keys 50 wide from 100, the scratch
+/// (source lane 7) 80 wide at 20, all from y 200, 600 tall.
+fn lane_dsts() -> String {
+    let mut lanes: Vec<String> = (0..7)
+        .map(|i| format!(r#"{{"x": {}, "y": 200, "w": 50, "h": 600}}"#, 100 + 50 * i))
+        .collect();
+    lanes.push(r#"{"x": 20, "y": 200, "w": 80, "h": 600}"#.to_owned());
+    lanes.join(", ")
+}
+
 /// The lanes alone over one 4×4 part image `p` (`gone` names a source
 /// that does not exist), every part array eight `p`s but those `edits` replace or add;
 /// sized 20 per lane when `sized`.
 fn note_parts_body(edits: &[(&str, &str)], sized: bool) -> String {
     let eight = format!("[{}]", [r#""p""#; 8].join(", "));
-    let mut fields: Vec<(String, String)> = [
-        "note",
-        "lnstart",
-        "lnend",
-        "lnbody",
-        "lnactive",
-        "mine",
-        "hcnstart",
-        "hcnend",
-        "hcnbody",
-        "hcnactive",
-        "hcndamage",
-        "hcnreactive",
-    ]
-    .iter()
-    .map(|f| ((*f).to_owned(), eight.clone()))
-    .collect();
+    let mut fields: Vec<(String, String)> = PART_FIELDS
+        .iter()
+        .map(|f| ((*f).to_owned(), eight.clone()))
+        .collect();
     for &(field, list) in edits {
         match fields.iter_mut().find(|(f, _)| f == field) {
             Some(slot) => slot.1 = list.to_owned(),
@@ -1038,17 +1051,13 @@ fn note_parts_body(edits: &[(&str, &str)], sized: bool) -> String {
     } else {
         ""
     };
-    let mut lanes: Vec<String> = (0..7)
-        .map(|i| format!(r#"{{"x": {}, "y": 200, "w": 50, "h": 600}}"#, 100 + 50 * i))
-        .collect();
-    lanes.push(r#"{"x": 20, "y": 200, "w": 80, "h": 600}"#.to_owned());
     format!(
         r#""image": [{{"id": "p", "src": "grid", "w": 4, "h": 4}},
                      {{"id": "gone", "src": "nosuch", "w": 4, "h": 4}}],
             "note": {{"id": "notes", {}, {size}"dst": [{}]}},
             "destination": [{{"id": "notes", "dst": [{{"w": 0, "h": 0}}]}}]"#,
         lists.join(", "),
-        lanes.join(", ")
+        lane_dsts()
     )
 }
 
@@ -1231,26 +1240,9 @@ fn paints_body() -> String {
 /// group on their bottom edge, SUDDEN+'s paint, LIFT and HIDDEN+.
 fn lanes_body() -> String {
     let eight = [r#""p""#; 8].join(", ");
-    let lists = [
-        "note",
-        "lnstart",
-        "lnend",
-        "lnbody",
-        "lnactive",
-        "mine",
-        "hcnstart",
-        "hcnend",
-        "hcnbody",
-        "hcnactive",
-        "hcndamage",
-        "hcnreactive",
-    ]
-    .map(|f| format!(r#""{f}": [{eight}]"#))
-    .join(", ");
-    let mut lanes: Vec<String> = (0..7)
-        .map(|i| format!(r#"{{"x": {}, "y": 200, "w": 50, "h": 600}}"#, 100 + 50 * i))
-        .collect();
-    lanes.push(r#"{"x": 20, "y": 200, "w": 80, "h": 600}"#.to_owned());
+    let lists = PART_FIELDS
+        .map(|f| format!(r#""{f}": [{eight}]"#))
+        .join(", ");
     format!(
         r#""image": [{{"id": "p", "src": "grid", "w": 4, "h": 4}},
                      {{"id": "bar", "src": "grid", "y": 4, "w": 4, "h": 1}},
@@ -1264,7 +1256,7 @@ fn lanes_body() -> String {
                 {{"id": "cv", "offset": 4, "dst": [{{"x": 20, "y": 800, "w": 430, "h": 600}}]}},
                 {{"id": "lc", "dst": [{{"x": 20, "y": 0, "w": 430, "h": 200}}]}},
                 {{"id": "hid", "dst": [{{"x": 20, "y": -400, "w": 430, "h": 600}}]}}]"#,
-        lanes.join(", ")
+        lane_dsts()
     )
 }
 
