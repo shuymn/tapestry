@@ -1889,7 +1889,10 @@ mod tests {
         let timing = r.frame(&input(&v, TimeUs(0), TimeUs(0), &[])).unwrap();
         assert_eq!(timing.sprites, 1);
         let p = r.read_back();
-        let at = |x: usize| [p[(540 * 1_920 + x) * 4], p[(540 * 1_920 + x) * 4 + 2]];
+        let at = |x: u32| {
+            let [r, _, b] = crate::test_common::rgb_at(&p, 1_920, (x, 540));
+            [r, b]
+        };
         assert_eq!((at(480), at(1_440)), ([255, 0], [0, 0]));
     }
 

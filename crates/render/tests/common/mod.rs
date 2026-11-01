@@ -142,6 +142,12 @@ pub fn input<'a>(
     }
 }
 
+/// The RGB of pixel `(x, y)` of a `width`-wide RGBA8 read back.
+pub fn rgb_at(pixels: &[u8], width: u32, (x, y): (u32, u32)) -> [u8; 3] {
+    let i = ((y * width + x) * 4) as usize;
+    [pixels[i], pixels[i + 1], pixels[i + 2]]
+}
+
 /// Rows of pixel column `x` that are note white (every channel above 200),
 /// in a read back of a [`WIDTH`]×[`HEIGHT`] target.
 pub fn white_rows(pixels: &[u8], x: u32) -> Vec<u32> {

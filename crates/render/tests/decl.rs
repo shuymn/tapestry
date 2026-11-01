@@ -49,9 +49,8 @@ fn frame(r: &mut Renderer) -> (usize, Vec<u8>) {
 }
 
 /// The RGB of pixel `(x, y)` of a 1920-wide read back.
-fn px(pixels: &[u8], (x, y): (u32, u32)) -> [u8; 3] {
-    let i = ((y * 1_920 + x) * 4) as usize;
-    [pixels[i], pixels[i + 1], pixels[i + 2]]
+fn px(pixels: &[u8], point: (u32, u32)) -> [u8; 3] {
+    common::rgb_at(pixels, 1_920, point)
 }
 
 /// `pixels` show `left` on the left half and `right` on the right.

@@ -5553,7 +5553,7 @@ mod tests {
     /// Where a probe frame is sampled: the left half's centre and the
     /// right half's, then the gauge-look marker's centre and the judgment
     /// marker's ([`crate::render_decl::GAUGE_MARKER`], `JUDGE_MARKER`).
-    const SAMPLES: [(usize, usize); 4] = [(480, 540), (1_440, 540), (1_250, 150), (1_550, 150)];
+    const SAMPLES: [(u32, u32); 4] = [(480, 540), (1_440, 540), (1_250, 150), (1_550, 150)];
 
     const RED: [u8; 3] = [255, 0, 0];
     const BLACK: [u8; 3] = [0; 3];
@@ -5600,11 +5600,10 @@ mod tests {
             let f = crate::render_common::input(&v, TimeUs(1_000), TimeUs(0), effects);
             let sprites = r.frame(&f)?.sprites;
             let p = r.read_back();
-            let px = |(x, y): (usize, usize)| {
-                let i = (y * 1_920 + x) * 4;
-                [p[i], p[i + 1], p[i + 2]]
-            };
-            Ok((sprites, SAMPLES.map(px)))
+            Ok((
+                sprites,
+                SAMPLES.map(|at| crate::render_common::rgb_at(&p, 1_920, at)),
+            ))
         }
 
         fn probed(&self) -> std::sync::MutexGuard<'_, Probed> {
