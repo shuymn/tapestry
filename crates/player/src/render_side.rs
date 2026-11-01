@@ -1719,12 +1719,9 @@ impl Run {
     fn recover(&mut self) -> Result<(), RenderError> {
         if self.screen.is_none() {
             self.granted = false;
-            let mut screen = (self.make)()?;
             // The committed bundle, from memory: never read again from its
             // files, never another skin in its place.
-            if let Some(bundle) = &self.committed {
-                screen.restore(bundle)?;
-            }
+            let screen = build(&mut self.make, self.committed.as_ref(), None, None)?;
             self.screen = Some(screen);
             // The new screen takes the window's size afresh.
             self.applied = None;
@@ -2788,15 +2785,7 @@ mod tests {
     /// The attempt of `chart` the game would make: the default preset,
     /// the whole chart or `section`'s round.
     fn attempt(chart: &Chart, section: Option<&eval::Section>) -> AttemptContext {
-        let attempt = game::Attempt::new(
-            1,
-            &rules::tapestry(),
-            TimeUs(1_000_000),
-            section,
-            game::NoteEnd::Play.of(chart),
-            &game::ChartLabels::default(),
-        );
-        AttemptContext::new(attempt, crate::attempt_context::SIMPLE_SCRATCH)
+        preset_attempt(chart, &rules::tapestry(), section, "")
     }
 
     /// A render thread on the screens `make` builds, with no chart, no
@@ -5049,19 +5038,7 @@ mod tests {
 
     /// The attempt of `chart`'s whole play with the title "T".
     fn titled(chart: &Chart) -> AttemptContext {
-        let labels = game::ChartLabels {
-            title: "T".to_owned(),
-            ..game::ChartLabels::default()
-        };
-        let attempt = game::Attempt::new(
-            1,
-            &rules::tapestry(),
-            TimeUs(1_000_000),
-            None,
-            game::NoteEnd::Play.of(chart),
-            &labels,
-        );
-        AttemptContext::new(attempt, crate::attempt_context::SIMPLE_SCRATCH)
+        preset_attempt(chart, &rules::tapestry(), None, "T")
     }
 
     /// What an [`Installer`] was asked, in order.
@@ -5076,17 +5053,15 @@ mod tests {
     /// stalls while `stall` is set.
     struct Installer {
         device: u64,
-        hold: Arc<AtomicBool>,
-        fail: Arc<AtomicBool>,
-        loading: Arc<AtomicU32>,
-        stall: Arc<AtomicBool>,
-        log: Log,
-        restored: Arc<std::sync::Mutex<Vec<Arc<render::SkinBundle>>>>,
+        /// The flags, counters and records of every installer its render
+        /// thread builds.
+        shared: Installers,
     }
 
     impl Installer {
         fn note(&self, step: &str) {
-            self.log
+            self.shared
+                .log
                 .lock()
                 .unwrap()
                 .push(format!("{} {step}", self.device));
@@ -5107,7 +5082,7 @@ mod tests {
             skin: Option<&Arc<render::SkinBundle>>,
             request: u64,
         ) -> Option<Result<Preparation, RenderError>> {
-            if self.hold.load(Ordering::Acquire) {
+            if self.shared.hold.load(Ordering::Acquire) {
                 return None;
             }
             assert!(skin.is_some());
@@ -5132,7 +5107,11 @@ mod tests {
         }
         fn restore(&mut self, bundle: &Arc<render::SkinBundle>) -> Result<(), RenderError> {
             self.note("restore");
-            self.restored.lock().unwrap().push(Arc::clone(bundle));
+            self.shared
+                .restored
+                .lock()
+                .unwrap()
+                .push(Arc::clone(bundle));
             Ok(())
         }
         fn wait(&self) -> bool {
@@ -5155,7 +5134,7 @@ mod tests {
             _page: &crate::menu_screen::MenuPage,
             _changed: bool,
         ) -> Result<FrameTiming, RenderError> {
-            if self.fail.load(Ordering::Acquire) {
+            if self.shared.fail.load(Ordering::Acquire) {
                 return Err(RenderError::SurfaceLost);
             }
             Ok(timing(true))
@@ -5166,8 +5145,8 @@ mod tests {
             _update: Option<&LoadingUpdate>,
             _changed: bool,
         ) -> Result<FrameTiming, RenderError> {
-            self.loading.fetch_add(1, Ordering::AcqRel);
-            while self.stall.load(Ordering::Acquire) {
+            self.shared.loading.fetch_add(1, Ordering::AcqRel);
+            while self.shared.stall.load(Ordering::Acquire) {
                 std::thread::sleep(Duration::from_millis(1));
             }
             Ok(timing(true))
@@ -5200,12 +5179,7 @@ mod tests {
                 let device = u64::from(shared.builds.fetch_add(1, Ordering::SeqCst) + 1);
                 Ok(Box::new(Installer {
                     device,
-                    hold: Arc::clone(&shared.hold),
-                    fail: Arc::clone(&shared.fail),
-                    loading: Arc::clone(&shared.loading),
-                    stall: Arc::clone(&shared.stall),
-                    log: Arc::clone(&shared.log),
-                    restored: Arc::clone(&shared.restored),
+                    shared: shared.clone(),
                 }) as Box<dyn Screen>)
             });
             let link = spawn_empty(make);
