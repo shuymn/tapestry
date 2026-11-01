@@ -292,21 +292,7 @@ fn rates() -> common::Loaded {
 /// The rows' digits as drawn at `ms`, read through the EX score's glyph
 /// for each digit; a blank cell is not drawn.
 fn rows(d: &mut common::play::Drawn, ms: i64) -> Vec<String> {
-    let tally = d.tally;
-    let mut glyph = std::collections::HashMap::new();
-    for digit in 0..10_u32 {
-        d.tally.ex_score = digit;
-        let q = d.frame(ms, &[]);
-        let ex = q
-            .iter()
-            .max_by(|a, b| a.rect[1].total_cmp(&b.rect[1]))
-            .unwrap();
-        glyph.insert(
-            ex.uv.map(f32::to_bits),
-            char::from_digit(digit, 10).unwrap(),
-        );
-    }
-    d.tally = tally;
+    let glyph = d.ex_glyphs(ms);
     let q = d.frame(ms, &[]);
     let mut rows = vec![String::new(); RATES.len()];
     let mut cells: Vec<_> = q.iter().map(|q| (q.rect[1], q.rect[0], q.uv)).collect();

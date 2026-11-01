@@ -62,21 +62,7 @@ fn readouts() -> common::Loaded {
 /// Each row's digits as drawn at `ms`, read through the EX score's
 /// glyphs; a blank cell or an undrawn row is empty.
 fn rows(d: &mut Drawn, ms: i64) -> Vec<String> {
-    let tally = d.tally;
-    let mut glyph = std::collections::HashMap::new();
-    for digit in 0..10_u32 {
-        d.tally.ex_score = digit;
-        let q = d.frame(ms, &[]);
-        let ex = q
-            .iter()
-            .max_by(|a, b| a.rect[1].total_cmp(&b.rect[1]))
-            .unwrap();
-        glyph.insert(
-            ex.uv.map(f32::to_bits),
-            char::from_digit(digit, 10).unwrap(),
-        );
-    }
-    d.tally = tally;
+    let glyph = d.ex_glyphs(ms);
     let q = d.frame(ms, &[]);
     // Rows by their top, from the EX score's (the lowest on the canvas).
     let mut rows = vec![String::new(); ROWS.len()];

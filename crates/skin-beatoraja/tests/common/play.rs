@@ -3,6 +3,8 @@
 
 #![allow(dead_code)]
 
+use std::collections::HashMap;
+
 use bms_model::{ChartBuilder, Lane, TimeUs};
 use eval::{GaugeState, JudgeEvent, JudgeEventKind, Tally};
 use rules::{GaugeValue, Judgment, PerJudgment};
@@ -235,6 +237,28 @@ impl Drawn {
             .build(&mut self.play, &frame, &self.uvs, &mut self.batch)
             .expect("the frame builds");
         self.batch.quads().to_vec()
+    }
+
+    /// Each digit by the uv of its glyph, read from the frames at `ms`
+    /// with the EX score at 0 to 9, its number the lowest on the canvas;
+    /// the tally is restored.
+    pub fn ex_glyphs(&mut self, ms: i64) -> HashMap<[u32; 4], char> {
+        let tally = self.tally;
+        let mut glyph = HashMap::new();
+        for digit in 0..10_u32 {
+            self.tally.ex_score = digit;
+            let q = self.frame(ms, &[]);
+            let ex = q
+                .iter()
+                .max_by(|a, b| a.rect[1].total_cmp(&b.rect[1]))
+                .unwrap();
+            glyph.insert(
+                ex.uv.map(f32::to_bits),
+                char::from_digit(digit, 10).unwrap(),
+            );
+        }
+        self.tally = tally;
+        glyph
     }
 
     /// The rects, rounded, of the frame at `ms`.
