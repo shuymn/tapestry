@@ -253,6 +253,121 @@ fn padding_and_cells() {
     );
 }
 
+/// The rate numbers, one row each from y = 100, each named alias once,
+/// below an EX score of one cell at y = 0 that tells the glyphs apart:
+/// `(id, property, cells, zero padding)`.
+const RATES: [(&str, &str, i32, bool); 6] = [
+    ("cp", r#""ref": 102"#, 3, false),
+    ("cf", r#""value": "score_rate_afterdot""#, 2, true),
+    ("wp", r#""value": 115"#, 3, false),
+    ("wf", r#""ref": 116"#, 2, true),
+    ("wp2", r#""value": "score_rate2""#, 3, false),
+    ("wf2", r#""value": 40, "ref": 156"#, 2, true),
+];
+
+fn rates() -> common::Loaded {
+    let mut values = vec![
+        r#"{"id": "ex", "src": "n", "w": 120, "h": 20, "divx": 10, "digit": 1, "ref": 71}"#
+            .to_owned(),
+    ];
+    let mut dsts = vec![r#"{"id": "ex", "dst": [{"x": 0, "y": 0, "w": 12, "h": 20}]}"#.to_owned()];
+    for (i, (id, prop, digit, zero)) in RATES.iter().enumerate() {
+        let padding = i32::from(*zero);
+        values.push(format!(
+            r#"{{"id": "{id}", "src": "n", "w": 120, "h": 20, "divx": 10, "digit": {digit},
+                 "padding": {padding}, {prop}}}"#
+        ));
+        let y = 100 * (i + 1);
+        dsts.push(format!(
+            r#"{{"id": "{id}", "dst": [{{"x": 0, "y": {y}, "w": 12, "h": 20}}]}}"#
+        ));
+    }
+    import_body(&format!(
+        r#""value": [{}], "destination": [{}]"#,
+        values.join(","),
+        dsts.join(",")
+    ))
+}
+
+/// The rows' digits as drawn at `ms`, read through the EX score's glyph
+/// for each digit; a blank cell is not drawn.
+fn rows(d: &mut common::play::Drawn, ms: i64) -> Vec<String> {
+    let tally = d.tally;
+    let mut glyph = std::collections::HashMap::new();
+    for digit in 0..10_u32 {
+        d.tally.ex_score = digit;
+        let q = d.frame(ms, &[]);
+        let ex = q
+            .iter()
+            .max_by(|a, b| a.rect[1].total_cmp(&b.rect[1]))
+            .unwrap();
+        glyph.insert(
+            ex.uv.map(f32::to_bits),
+            char::from_digit(digit, 10).unwrap(),
+        );
+    }
+    d.tally = tally;
+    let q = d.frame(ms, &[]);
+    let mut rows = vec![String::new(); RATES.len()];
+    let mut cells: Vec<_> = q.iter().map(|q| (q.rect[1], q.rect[0], q.uv)).collect();
+    cells.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.total_cmp(&b.1)));
+    let ys: Vec<f32> = {
+        let mut ys: Vec<f32> = cells.iter().map(|c| c.0).collect();
+        ys.dedup();
+        ys
+    };
+    // The first row is the EX score's.
+    for (y, uv) in cells.iter().map(|c| (c.0, c.2)) {
+        let row = ys.iter().position(|&r| r == y).unwrap();
+        if row > 0 {
+            rows[row - 1].push(glyph[&uv.map(f32::to_bits)]);
+        }
+    }
+    rows
+}
+
+#[test]
+fn rates_show_whole_percent_and_hundredths() {
+    let loaded = rates();
+    // One D4 note at each rate number, none elsewhere.
+    let d4: Vec<_> = loaded
+        .report()
+        .notes
+        .iter()
+        .filter(|n| n.kind == NoteKind::Deviation(skin_beatoraja::DeviationId::D4))
+        .map(|n| n.at.unwrap().line)
+        .collect();
+    assert_eq!(d4.len(), RATES.len(), "{:?}", loaded.report().notes);
+    assert!(
+        loaded
+            .report()
+            .notes
+            .iter()
+            .all(|n| n.kind == NoteKind::Deviation(skin_beatoraja::DeviationId::D4))
+    );
+    // The rates are decorative: an undefined op drops one.
+    let mut d = loaded.drawn_over(4);
+    // Before any judgment, and again after a retry: 100.00 and 0.00 (the
+    // source draws no digits until it has a score).
+    let fresh = ["100", "00", "0", "00", "0", "00"];
+    assert_eq!(rows(&mut d, 0), fresh);
+    // EX 3 over 2 judged of 4 targets: 75.00 and 37.50.
+    d.tally.counts.perfect = 1;
+    d.tally.counts.great = 1;
+    d.tally.ex_score = 3;
+    assert_eq!(rows(&mut d, 16), ["75", "00", "37", "50", "37", "50"]);
+    d.retry(4);
+    d.tally = common::play::tally(0, 0);
+    assert_eq!(rows(&mut d, 0), fresh);
+}
+
+#[test]
+fn rate_numbers_are_decorative() {
+    for (_, prop, ..) in RATES {
+        assert_eq!(critical(prop), None, "{prop}");
+    }
+}
+
 #[test]
 fn a_strip_past_the_model_is_a_range_error() {
     let e = number(

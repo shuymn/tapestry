@@ -238,7 +238,12 @@ fn check_f1(_: &Header, i: Imported) {
     }
 }
 
-/// F2: 64 texts in 16 fonts, and counts filling the widget quads.
+/// The six rate aliases (D4): current and whole, whole percent and
+/// hundredths, each 3 operations.
+const RATE_REFS: [i32; 6] = [102, 103, 115, 116, 155, 156];
+
+/// F2: 64 texts in 16 fonts, and rates and a count filling the widget
+/// quads.
 fn f2(root: &Path) {
     png(root, "n.png", 60, 6);
     for i in 0..MAX_FONTS {
@@ -257,16 +262,26 @@ fn f2(root: &Path) {
     let dsts = join(
         (0..MAX_TEXT_ELEMENTS)
             .map(|i| format!(r#"{{"id": "t{i}", "dst": [{{"w": 10, "h": 10}}]}}"#))
-            .chain((0..full).map(|_| r#"{"id": "v11", "dst": [{"w": 6, "h": 6}]}"#.to_owned()))
+            .chain((0..full).map(|k| {
+                format!(
+                    r#"{{"id": "v11_{}", "dst": [{{"w": 6, "h": 6}}]}}"#,
+                    k % RATE_REFS.len()
+                )
+            }))
             .chain([r#"{"id": "v7", "dst": [{"w": 6, "h": 6}]}"#.to_owned()]),
     );
+    let rates = join(RATE_REFS.iter().enumerate().map(|(k, r)| {
+        format!(
+            r#"{{"id": "v11_{k}", "src": "n", "w": 60, "h": 6, "divx": 10, "digit": 11,
+                 "ref": {r}}}"#
+        )
+    }));
     write(
         root,
         "s.json",
         common::hd(&format!(
             r#""source": [{{"id": "n", "path": "n.png"}}], "font": [{fonts}], "text": [{texts}],
-               "value": [
-                 {{"id": "v11", "src": "n", "w": 60, "h": 6, "divx": 10, "digit": 11, "ref": 110}},
+               "value": [{rates},
                  {{"id": "v7", "src": "n", "w": 60, "h": 6, "divx": 10, "digit": 7, "ref": 110}}],
                "destination": [{dsts}]"#
         ))
@@ -282,6 +297,11 @@ fn check_f2(_: &Header, i: Imported) {
     assert_eq!(i.skin.text_slots(), MAX_TEXT_ELEMENTS);
     assert_eq!(i.skin.sheet().font_count(), MAX_FONTS);
     assert_eq!(i.skin.quad_capacity(), MAX_WIDGET_QUADS);
+    // Each rate strip's program is 3 operations, the count's 1.
+    assert_eq!(u.ops, 1_483 * 3 + 1);
+    let d4 = skin_beatoraja::NoteKind::Deviation(skin_beatoraja::DeviationId::D4);
+    let deviations = i.report.notes.iter().filter(|n| n.kind == d4).count();
+    assert_eq!(deviations, 1_483);
 }
 
 /// F6: [`common::bitmap_fonts`] with each font also at the file size cap,
@@ -687,10 +707,12 @@ fn import_memory_is_measured() {
         size_of::<Report>(),
     );
     println!(
-        "sizes: JudgeDef {}, GaugeDef {}, LanesDef {}",
+        "sizes: JudgeDef {}, GaugeDef {}, LanesDef {}, Play {}, PlayContext {}",
         size_of::<skin_model::JudgeDef>(),
         size_of::<skin_model::GaugeDef>(),
         size_of::<skin_model::LanesDef>(),
+        size_of::<skin_model::Play>(),
+        size_of::<skin_model::PlayContext<'_>>(),
     );
     let mut peaks = Vec::new();
     let d = tempfile::tempdir().unwrap();

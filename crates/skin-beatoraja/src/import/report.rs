@@ -68,6 +68,8 @@ pub enum PropertyKind {
     Integer,
     String,
     Boolean,
+    /// An image selector's `ref`, an image-index property.
+    ImageIndex,
 }
 
 /// Why a track was not imported (design.md, the S6b track rules).

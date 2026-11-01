@@ -567,3 +567,22 @@ fn a_lift_may_not_share_the_judges_id() {
         SHARED
     );
 }
+
+#[test]
+fn a_kind_condition_is_noted_at_its_part() {
+    use skin_beatoraja::DeviationId;
+    // The grade and the combo each under a gauge-family condition, on
+    // lines of their own: one D4 note at each part.
+    let combo = combo("ten", 10).replace(r#""id": "ten""#, "\"id\": \"ten\",\n\"op\": [-43]");
+    let judge = judge_rec(&[grade(0, ",\n\"op\": [42]")], &[combo], "");
+    let l = skin(VALUES, &judge, &[DST]);
+    let d4: Vec<u32> = l
+        .report()
+        .notes
+        .iter()
+        .filter(|n| n.kind == NoteKind::Deviation(DeviationId::D4))
+        .map(|n| n.at.expect("located").line)
+        .collect();
+    assert_eq!(d4.len(), 2, "{:?}", l.report().notes);
+    assert_ne!(d4[0], d4[1]);
+}

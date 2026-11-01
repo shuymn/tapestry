@@ -261,7 +261,7 @@ impl Cx<'_> {
         if !track::one_branch(shared) {
             self.drop_el(role, at, NoteKind::Stretch(c.stretch_mode))?;
         }
-        self.cover_motion(&c)?;
+        self.retained(&c)?;
         let track = self.model_track(&c, &rects)?;
         Ok(Some((
             GradePart {
@@ -372,6 +372,7 @@ impl Cx<'_> {
             rects.push(v);
         }
         let track = self.model_track(&c, &rects)?;
+        self.retained(&c)?;
         Ok(Some(ComboPart {
             digits: DigitsDef {
                 image,

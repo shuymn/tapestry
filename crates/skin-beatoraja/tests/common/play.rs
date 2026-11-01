@@ -77,6 +77,19 @@ pub struct Drawn {
     pub target: [u32; 2],
 }
 
+/// The attempt every drawn import plays: the whole chart, no lead-in.
+fn context() -> PlayContext<'static> {
+    PlayContext {
+        gauges: &GAUGES,
+        attempt: Attempt::Full { lead_in: TimeUs(0) },
+        empty_poor_breaks_combo: false,
+        empty_poor_counted: false,
+        scratch: Side::Left,
+        ln_default: rules::LnMode::Ln,
+        last_note_end: NO_END,
+    }
+}
+
 /// A chart with `notes` notes on lane 1, one every 10 ms from 1 s.
 fn chart(notes: u32) -> bms_model::Chart {
     (0..notes)
@@ -95,18 +108,17 @@ impl Drawn {
         Self::over(skin, &chart(notes))
     }
 
+    /// A fresh attempt over a chart of `notes` notes, as a retry prepares
+    /// it.
+    #[allow(dead_code, reason = "not every test binary retries")]
+    pub fn retry(&mut self, notes: u32) {
+        self.play = self.skin.prepare(&chart(notes), &context()).unwrap();
+    }
+
     /// `skin` played over `chart`.
     pub fn over(skin: Skin, chart: &bms_model::Chart) -> Self {
         let uvs = skin.atlas(Variant::Lo, LIMITS).unwrap().into_parts().1;
-        let ctx = PlayContext {
-            gauges: &GAUGES,
-            attempt: Attempt::Full { lead_in: TimeUs(0) },
-            empty_poor_breaks_combo: false,
-            empty_poor_counted: false,
-            scratch: Side::Left,
-            ln_default: rules::LnMode::Ln,
-            last_note_end: NO_END,
-        };
+        let ctx = context();
         let play = skin.prepare(chart, &ctx).unwrap();
         let batch = QuadBatch::with_capacity(skin.quad_capacity(), skin.run_capacity());
         Self {
