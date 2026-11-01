@@ -327,6 +327,35 @@ fn fit_width_hidden_plus_is_trimmed_after_its_stretch() {
             );
         }
     }
+    // A destination without height at 800 rises at most to 200 and must
+    // pass strictly above the line: one at 880 (200) or 881 (199) keeps it
+    // from drawing, fixed or linked, and one at 879 (201) lets the
+    // stretched one, [750, 850] at rest, draw above the lanes.
+    let flat = hidden(r#""stretch": 4"#).replace(
+        r#""y": -400, "w": 430, "h": 600"#,
+        r#""y": 280, "w": 430, "h": 0"#,
+    );
+    for link in ["false", "true"] {
+        for (line, outside) in [(880, false), (881, false), (879, true)] {
+            let obj = hidden_object(&format!(r#""isDisapearLineLinkLift": {link}"#))
+                .replace(
+                    r#""x": 32, "y": 24, "w": 16, "h": 16"#,
+                    r#""x": 0, "y": 0, "w": 43, "h": 10"#,
+                )
+                .replace(
+                    r#""disapearLine": 200"#,
+                    &format!(r#""disapearLine": {line}"#),
+                );
+            let r = with(&obj, &[&flat]);
+            let case = format!("{link} {line}");
+            assert!(has(r.report(), d9(LaneApprox::HiddenStretch)), "{case}");
+            assert_eq!(
+                has(r.report(), d9(LaneApprox::HiddenClip)),
+                outside,
+                "{case}"
+            );
+        }
+    }
     // Once the unstretched lower edge is at or above the trim, the source
     // draws the stretched one whole, past the trim: a 64×1 cell fit to 430
     // is 6.72 high, centred on [876, 880] at [874.64, 881.36], so under a

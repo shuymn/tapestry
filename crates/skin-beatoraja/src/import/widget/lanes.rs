@@ -1254,6 +1254,10 @@ fn source_reach(
     let Some(t) = trim else {
         return Some(Some([fu.sub(travel)?, fl]));
     };
+    // Even a destination without height must rise strictly above it.
+    if su.sub(travel)? >= t {
+        return Some(None);
+    }
     let zero = Q::int(0);
     let clip_up = fu.max(su);
     let highest = if sl.sub(travel)? <= t {
