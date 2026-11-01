@@ -517,8 +517,9 @@ impl Renderer {
         let device = self.gpu.device();
         let layers = skin_atlas::check_pages(pages, device).map_err(RenderError::Atlas)?;
         // The whole candidate inside the error scopes: the texture, its
-        // view and writes, its bind group, and the submission of the
-        // uploads. Nothing in use changes until all of it was accepted.
+        // view and writes, its bind group, and the one submission of the
+        // uploads; the wait after them submits nothing. Nothing in use
+        // changes until all of it was accepted.
         let ((atlas, bind), refused) = skin_atlas::scoped(device, || {
             let atlas = AtlasTexture::upload(&self.gpu, pages, layers);
             let bind = self.bindings.bind(device, &atlas);
@@ -532,7 +533,7 @@ impl Renderer {
         if let Some(e) = refused {
             return Err(RenderError::Atlas(UploadError::Device(e)));
         }
-        finish_uploads(&self.gpu)?;
+        wait_for_gpu(&self.gpu)?;
         self.atlas_bind = bind;
         self.staging.set_font_scale(atlas.font_scale());
         self.staging.set_clips(clips);
@@ -1008,6 +1009,11 @@ const OFFSCREEN_FRAME_WAIT: Duration = Duration::from_millis(100);
 /// Stutter").
 fn finish_uploads(gpu: &Gpu) -> Result<(), RenderError> {
     gpu.queue().submit([]);
+    wait_for_gpu(gpu)
+}
+
+/// Waits until the GPU has done every submission, submitting nothing.
+fn wait_for_gpu(gpu: &Gpu) -> Result<(), RenderError> {
     gpu.device()
         .poll(wgpu::PollType::wait_indefinitely())
         .map(|_| ())
