@@ -15,6 +15,7 @@ use windows::Win32::System::Threading::WaitForSingleObject;
 use crate::atlas::{ATLAS_SIZE, build_atlas};
 use crate::gpu::{self, AdapterChoice, Gpu};
 use crate::measure::{FrameStatistics, Presentation};
+use crate::pace::Pacer;
 use crate::simple::layout::{HEIGHT, WIDTH};
 use crate::simple::{result_screen, text_screen};
 use crate::text::MenuText;
@@ -200,6 +201,9 @@ pub struct Renderer {
     /// When the built frame's work began, until [`submit`](Self::submit)
     /// takes it.
     started: Option<Instant>,
+    /// An offscreen target's frame left pending on the GPU: at most one,
+    /// as a swap chain's frame latency bounds a window's.
+    pacer: Pacer<wgpu::SubmissionIndex>,
 }
 
 impl Renderer {
@@ -286,6 +290,7 @@ impl Renderer {
             staging: Vec::with_capacity(MAX_SPRITES),
             skin: Box::new(SimpleSkin::new()),
             started: None,
+            pacer: Pacer::default(),
             id: RENDERERS.fetch_add(1, Ordering::Relaxed),
         })
     }
@@ -425,6 +430,26 @@ impl Renderer {
         self.draw(start, None)
     }
 
+    /// Draws the play screen while a chart loads before the countdown, as
+    /// [`frame`](Self::frame) draws: the skin's loading frame
+    /// ([`PlaySkin::build_loading`]), then in a pass of its own the text
+    /// last prepared on `text`, the load's lines. Before recording opens
+    /// only: no play frame draws text this way.
+    ///
+    /// # Errors
+    ///
+    /// As [`menu_frame`](Self::menu_frame).
+    pub fn loading_frame(&mut self, text: &MenuText) -> Result<FrameTiming, RenderError> {
+        if text.owner() != self.id {
+            return Err(RenderError::OtherRenderersText);
+        }
+        let start = Instant::now();
+        self.batch.clear();
+        self.skin.build_loading(&mut self.batch);
+        self.batch.stage(&mut self.staging);
+        self.draw(start, Some(text))
+    }
+
     /// Draws a menu screen, as [`frame`](Self::frame) draws: the sprites
     /// `sprites` pushes, then in a pass of its own the text last prepared
     /// on `text` (design.md "Rendering and Skins"). Menus only; play
@@ -490,7 +515,27 @@ impl Renderer {
                     return Err(RenderError::SurfaceLost);
                 }
             },
-            Output::Offscreen { view, .. } => (None, view.clone()),
+            Output::Offscreen { view, .. } => {
+                // Nothing paces offscreen frames: the frame before must be
+                // done on the GPU first. One not done within the wait stays
+                // pending, and this frame is skipped, not presented, as a
+                // window's frame is when its swap chain image times out.
+                let device = self.gpu.device();
+                let admitted = self.pacer.admit(|previous| {
+                    !matches!(
+                        device.poll(wgpu::PollType::Wait {
+                            submission_index: Some(previous.clone()),
+                            timeout: Some(OFFSCREEN_FRAME_WAIT),
+                        }),
+                        Err(wgpu::PollError::Timeout)
+                    )
+                });
+                if !admitted {
+                    let cpu = start.elapsed().saturating_sub(acquire.elapsed());
+                    return Ok(timing(cpu, false));
+                }
+                (None, view.clone())
+            }
         };
         let acquired = acquire.elapsed();
         let queue = self.gpu.queue();
@@ -544,7 +589,7 @@ impl Renderer {
             });
             text.render(&mut pass).map_err(RenderError::Text)?;
         }
-        queue.submit([encoder.finish()]);
+        let submitted = queue.submit([encoder.finish()]);
         let cpu = start.elapsed() - acquired;
         let mut out = timing(cpu, true);
         match frame {
@@ -556,8 +601,10 @@ impl Renderer {
                 });
             }
             None => {
-                // Offscreen: let the device reclaim finished frames.
-                let _ = self.gpu.device().poll(wgpu::PollType::Poll);
+                // Offscreen: this frame is the one left pending, so a later
+                // wait for the GPU (a chart's preparation, a read back)
+                // waits for about one frame, as behind a swap chain.
+                self.pacer.submitted(submitted);
             }
         }
         Ok(out)
@@ -683,6 +730,11 @@ pub fn build_frame(
     skin.build(f, batch);
     batch.stage(staging);
 }
+
+/// The longest an offscreen frame waits for the previous frame's GPU work;
+/// past it the frame is skipped, and the next frame waits again, so the
+/// render thread still takes its messages behind a slow GPU.
+const OFFSCREEN_FRAME_WAIT: Duration = Duration::from_millis(100);
 
 /// Submits every upload queued on `gpu` and waits until the GPU has done them,
 /// so none is left for the first frame of play (design.md "Display Latency and

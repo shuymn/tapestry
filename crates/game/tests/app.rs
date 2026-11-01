@@ -208,6 +208,23 @@ enum Seen {
     Practice(Option<String>),
 }
 
+/// What happens during a slow load.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InLoad {
+    /// The quit key.
+    Quit,
+    /// The window closes.
+    Close,
+    /// The window loses focus.
+    FocusLoss,
+    /// The input thread ends.
+    InputFails,
+    /// The audio thread goes.
+    AudioFails,
+    /// A frame fails: the screen must be built again.
+    ScreenFails,
+}
+
 #[derive(Debug, thiserror::Error)]
 #[error("the bank cannot be built")]
 struct BankLost;
@@ -254,7 +271,26 @@ struct Headless {
     prepares: usize,
     input_fails_at: i64,
     audio_gone: bool,
+    /// The screen does not confirm the end of the loading state.
+    loading_end_fails: bool,
+    /// Each loading state the flow ended, by the chart showing it.
+    loading_ended: Vec<Option<usize>>,
+    /// Recordings opened.
+    opens: usize,
     close_in_load: bool,
+    /// How long each load takes on the clock, in 1 ms waits: the quit key
+    /// or a close during it cancels it, as the measurement's check does.
+    load_ms: i64,
+    /// What happens this many ms into each slow load.
+    in_load: Option<(i64, InLoad)>,
+    /// A quit key press the rig took during a load, for the flow to take.
+    quit_pressed: bool,
+    /// The chart whose loading state shows.
+    loading: Option<usize>,
+    /// Each entry into the loading state: the chart and the clock time.
+    loading_pages: Vec<(usize, i64)>,
+    /// Whether the loading state showed at each play's start, in order.
+    started_loading: Vec<bool>,
     /// The loads, by count from 0, that are cancelled.
     cancel_loads: Vec<usize>,
     /// How many loads came before each screen preparation.
@@ -368,7 +404,16 @@ impl Headless {
             prepares: 0,
             input_fails_at: i64::MAX,
             audio_gone: false,
+            loading_end_fails: false,
+            loading_ended: Vec::new(),
+            opens: 0,
             close_in_load: false,
+            load_ms: 0,
+            in_load: None,
+            quit_pressed: false,
+            loading: None,
+            loading_pages: Vec::new(),
+            started_loading: Vec::new(),
             cancel_loads: Vec::new(),
             prepared_for: Vec::new(),
             seen: Vec::new(),
@@ -476,6 +521,39 @@ impl Headless {
     fn reports(&self) -> impl Iterator<Item = &PlayReport> {
         self.loads.iter().flat_map(|(_, r)| r)
     }
+
+    /// A load of [`load_ms`](Self::load_ms) on the clock, with what
+    /// [`in_load`](Self::in_load) says happening during it; whether the
+    /// quit key or a close cancelled it.
+    fn slow_load(&mut self) -> bool {
+        let from = self.at();
+        let mut event = self.in_load;
+        while self.at() < from + self.load_ms * MS {
+            if let Some((after, what)) = event
+                && self.at() >= from + after * MS
+            {
+                event = None;
+                let now = self.at();
+                match what {
+                    InLoad::Quit => self.quit_pressed = true,
+                    InLoad::Close => self.quitting = true,
+                    InLoad::FocusLoss => ScriptedInput::new(vec![ScriptItem {
+                        at: TimeUs(now),
+                        action: Action::FocusLoss,
+                    }])
+                    .poll(TimeUs(now), &mut self.sources),
+                    InLoad::InputFails => self.input_fails_at = now,
+                    InLoad::AudioFails => self.audio_gone = true,
+                    InLoad::ScreenFails => self.screen_fails_at = now,
+                }
+            }
+            if self.quitting || self.quit_pressed {
+                return true;
+            }
+            self.wait();
+        }
+        false
+    }
 }
 
 impl Rig for Headless {
@@ -492,6 +570,9 @@ impl Rig for Headless {
     }
 
     fn take(&mut self) -> Option<Command> {
+        if std::mem::take(&mut self.quit_pressed) {
+            return Some(Command::Quit);
+        }
         let c = match self.due_act()? {
             Act::Retry => Command::Retry,
             Act::Quit => Command::Quit,
@@ -529,6 +610,14 @@ impl Rig for Headless {
         Ok(())
     }
 
+    fn end_loading(&mut self) -> Result<(), SurfaceLost> {
+        self.loading_ended.push(self.loading);
+        if self.loading_end_fails {
+            return Err(SurfaceLost);
+        }
+        Ok(())
+    }
+
     fn prepare_audio(&mut self) -> Result<(), AudioWaitError> {
         if self.audio_gone {
             return Err(AudioWaitError::Gone);
@@ -555,6 +644,7 @@ impl Rig for Headless {
         let start = self.sources.open_play(now, origin);
         self.script = self.play_script(origin.0, now.0);
         self.opened = true;
+        self.opens += 1;
         Ok(Opening {
             origin,
             start,
@@ -567,6 +657,8 @@ impl Rig for Headless {
     fn start(&mut self, _origin: TimeUs, sounds: AudioQueue, _screen: RenderSide) {
         self.opened = false;
         self.starts += 1;
+        // The countdown replaces the loading state.
+        self.started_loading.push(self.loading.take().is_some());
         self.sounds = Some(sounds);
         self.sealed = false;
         self.waits_since_seal = 0;
@@ -750,19 +842,43 @@ impl AppRig for Headless {
         self.hits = presses(loaded.chart());
         self.speeds.push(loaded.config().speed);
         let i = self.chosen.unwrap();
+        if self.loading != Some(i) {
+            self.violations
+                .push(format!("chart {i} loaded without its loading state"));
+        }
         if self.close_in_load {
             self.quitting = true;
         }
-        if i == 2 && self.refusal == Refusal::Bank {
+        let cancelled = self.slow_load();
+        if !cancelled && i == 2 && self.refusal == Refusal::Bank {
             return Err(BankLost);
         }
         self.seen.push(Seen::Load(i));
         self.loads.push((i, Vec::new()));
         self.practiced.push(loaded.practice().is_some());
-        if self.cancel_loads.contains(&(self.speeds.len() - 1)) {
+        if cancelled || self.cancel_loads.contains(&(self.speeds.len() - 1)) {
             return Ok(Loading::Cancelled);
         }
         Ok(Loading::Ready)
+    }
+
+    fn entered_loading(&mut self, chart: &Path) {
+        let Some(i) = self.paths.iter().position(|p| p == chart) else {
+            self.violations
+                .push(format!("the loading state of {}", chart.display()));
+            return;
+        };
+        if Some(i) != self.chosen {
+            self.violations.push(format!(
+                "the loading state of chart {i}, not the chosen one"
+            ));
+        }
+        if self.in_selection {
+            self.violations
+                .push("the loading state in selection".to_owned());
+        }
+        self.loading = Some(i);
+        self.loading_pages.push((i, self.at()));
     }
 
     fn show_refusal(&mut self, refusal: &LoadRefusal<BankLost>) {
@@ -808,12 +924,14 @@ impl AppRig for Headless {
     }
 
     fn entered_selection(&mut self) {
+        self.loading = None;
         self.in_selection = true;
         self.entries += 1;
         self.seen.push(Seen::Select);
     }
 
     fn entered_practice(&mut self, screen: &PracticeScreen) {
+        self.loading = None;
         self.seen
             .push(Seen::Practice(screen.notice().map(str::to_owned)));
         self.practice_entries.push(screen.clone());
@@ -921,6 +1039,13 @@ fn select_play_retry_back_select_again() {
     let (rig, events, ran) = run(Refusal::Missing, acts, |_| {});
     ran.unwrap();
     assert!(rig.violations.is_empty(), "{:?}", rig.violations);
+    // Each chosen chart shows its loading state up to its first countdown;
+    // the retry loads nothing and shows none.
+    assert_eq!(
+        rig.loading_pages.iter().map(|p| p.0).collect::<Vec<_>>(),
+        [0, 1]
+    );
+    assert_eq!(rig.started_loading, [true, false, true]);
     assert_eq!(
         rig.seen,
         [
@@ -1658,6 +1783,230 @@ fn a_cancelled_practice_load_returns_to_the_page() {
     };
     assert!(cancelled.is_empty());
     assert!(!played.is_empty());
+}
+
+/// Where a load starts: a chart chosen to play, or a practice Start.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Entry {
+    Choice,
+    Start,
+}
+
+/// How long each load takes in [`loading`], and when its event comes.
+const LOAD_MS: i64 = 1_000;
+const EVENT_MS: i64 = 500;
+
+/// A 1-second load from `entry` of chart A (the choice) or the practice
+/// chart (its Start), with `event` half-way through it, then a close long
+/// after.
+fn loading(
+    entry: Entry,
+    event: Option<InLoad>,
+    setup: impl FnOnce(&mut Headless),
+) -> (Headless, Result<(), LiveError<SurfaceLost>>) {
+    let acts = match entry {
+        Entry::Choice => vec![(0, Act::Choose(0)), (6_000, Act::Close)],
+        Entry::Start => {
+            let mut acts = vec![(0, Act::Practice(P))];
+            acts.extend(to_start(0));
+            acts.extend([
+                (10, Act::Page(PracticeInput::Confirm)),
+                (14_000, Act::Close),
+            ]);
+            acts
+        }
+    };
+    let (rig, _, ran) = run(Refusal::Missing, acts, |r| {
+        r.load_ms = LOAD_MS;
+        r.in_load = event.map(|e| (EVENT_MS, e));
+        setup(r);
+    });
+    (rig, ran)
+}
+
+/// The chart a load's entry loads.
+const fn loaded_chart(entry: Entry) -> usize {
+    match entry {
+        Entry::Choice => 0,
+        Entry::Start => P,
+    }
+}
+
+/// The play screen's loading state × event table (design.md "Play Lifecycle"),
+/// on a slow load from either entry, its page entered at the choice or
+/// the Start, before the load:
+///
+/// | event during the load | a chart chosen to play | a practice Start |
+/// |---|---|---|
+/// | none (ready) | its countdown replaces the page | the same |
+/// | quit key | the load is cancelled; selection | cancelled; the practice page |
+/// | close | cancelled; the run ends | the same |
+/// | focus loss | nothing: the play opens and completes | the same |
+/// | input-thread failure | the run ends with it, before any opening | the same |
+/// | audio failure | the run ends with it, before any opening | the same |
+/// | screen failure | the play's preparation builds it again; the play runs | the same |
+///
+/// Refusals are [`refusals_leave_the_loading_page`]'s; a retry loads
+/// nothing and shows no page ([`select_play_retry_back_select_again`]). On
+/// the select screen a load's events do not arise: its quit key, close
+/// and failures are [`commands_in_selection_are_ignored`],
+/// [`quit_leaves_the_chart_close_ends_the_run`],
+/// [`input_failure_in_selection_ends_the_run`] and
+/// [`screen_failure_in_selection_rebuilds_or_ends_the_run`]; focus loss
+/// and audio are not looked at there.
+#[test]
+fn the_loading_page_through_each_event_of_a_load() {
+    for entry in [Entry::Choice, Entry::Start] {
+        let chart = loaded_chart(entry);
+        let back = match entry {
+            Entry::Choice => Seen::Select,
+            Entry::Start => Seen::Practice(None),
+        };
+        let mut before = vec![Seen::Select];
+        if entry == Entry::Start {
+            before.push(Seen::Practice(None));
+        }
+        before.push(Seen::Load(chart));
+        for event in [
+            None,
+            Some(InLoad::Quit),
+            Some(InLoad::Close),
+            Some(InLoad::FocusLoss),
+            Some(InLoad::InputFails),
+            Some(InLoad::AudioFails),
+            Some(InLoad::ScreenFails),
+        ] {
+            let at = format!("{entry:?} {event:?}");
+            let (rig, ran) = loading(entry, event, |_| {});
+            assert!(rig.violations.is_empty(), "{at}: {:?}", rig.violations);
+            // The page was entered once, for the chart, before its load.
+            assert_eq!(
+                rig.loading_pages.iter().map(|p| p.0).collect::<Vec<_>>(),
+                [chart],
+                "{at}"
+            );
+            assert_eq!(rig.seen[..before.len()], before, "{at}: {:?}", rig.seen);
+            let after = &rig.seen[before.len()..];
+            match event {
+                None | Some(InLoad::FocusLoss | InLoad::ScreenFails) => {
+                    ran.unwrap();
+                    assert_eq!(rig.started_loading.first(), Some(&true), "{at}");
+                    let ends: Vec<_> = rig.reports().map(|r| r.end).collect();
+                    assert_eq!(ends.first(), Some(&PlayEnd::Completed), "{at}");
+                }
+                Some(InLoad::Quit) => {
+                    ran.unwrap();
+                    assert_eq!(after, std::slice::from_ref(&back), "{at}");
+                    assert_eq!(rig.starts, 0, "{at}");
+                    assert!(rig.prepared_for.is_empty(), "{at}");
+                }
+                Some(InLoad::Close) => {
+                    ran.unwrap();
+                    assert!(after.is_empty(), "{at}: {:?}", rig.seen);
+                    assert_eq!(rig.starts, 0, "{at}");
+                    assert!(rig.prepared_for.is_empty(), "{at}");
+                }
+                Some(InLoad::InputFails) => {
+                    assert!(matches!(ran, Err(LiveError::Input(_))), "{at}: {ran:?}");
+                    assert_eq!(rig.starts, 0, "{at}");
+                }
+                Some(InLoad::AudioFails) => {
+                    assert!(
+                        matches!(ran, Err(LiveError::Audio(AudioWaitError::Gone))),
+                        "{at}: {ran:?}"
+                    );
+                    assert_eq!(rig.starts, 0, "{at}");
+                }
+            }
+            if event == Some(InLoad::ScreenFails) {
+                assert!(!rig.prepared_for.is_empty(), "{at}");
+            }
+            // The page is left for the play or the way back; only a run
+            // that ends during the load ends on it.
+            let ended = matches!(
+                event,
+                Some(InLoad::Close | InLoad::InputFails | InLoad::AudioFails)
+            );
+            assert_eq!(rig.loading.is_some(), ended, "{at}");
+        }
+    }
+}
+
+/// The flow ends the loading state after the play's preparation and
+/// before recording opens, at every play, a retry's too (with nothing to
+/// end); a screen that does not confirm it ends the run, as a failed
+/// preparation does, and recording never opens.
+#[test]
+fn recording_opens_only_once_the_loading_state_ended() {
+    let acts = vec![
+        (0, Act::Choose(0)),
+        (4_000, Act::Retry),
+        (4_000, Act::Close),
+    ];
+    let (rig, _, ran) = run(Refusal::Missing, acts, |_| {});
+    ran.unwrap();
+    assert_eq!(rig.loading_ended, [Some(0), None]);
+    assert_eq!(rig.opens, 2);
+
+    let acts = vec![(0, Act::Choose(0)), (4_000, Act::Close)];
+    let (rig, _, ran) = run(Refusal::Missing, acts, |r| r.loading_end_fails = true);
+    assert!(
+        matches!(ran, Err(LiveError::Screen(SurfaceLost))),
+        "{ran:?}"
+    );
+    assert_eq!(rig.loading_ended, [Some(0)]);
+    assert_eq!(rig.opens, 0);
+    assert_eq!(rig.starts, 0);
+}
+
+/// A refused load leaves its loading state for where the chart was chosen,
+/// with the reason: selection for a chart file that cannot be read, a bank
+/// that does not load and a play the logic step refuses at its opening;
+/// the practice page for a round whose restore is refused at its opening.
+#[test]
+fn refusals_leave_the_loading_page() {
+    for (refusal, kind, seen) in [
+        (
+            Refusal::Missing,
+            "io",
+            vec![Seen::Select, Seen::Select, Seen::Refused(2)],
+        ),
+        (
+            Refusal::Bank,
+            "bank",
+            vec![Seen::Select, Seen::Select, Seen::Refused(2)],
+        ),
+        (
+            Refusal::Silent,
+            "no notes",
+            vec![Seen::Select, Seen::Load(2), Seen::Select, Seen::Refused(2)],
+        ),
+    ] {
+        let acts = vec![(0, Act::Choose(2)), (3_000, Act::Close)];
+        let (rig, _, ran) = run(refusal, acts, |r| r.load_ms = LOAD_MS);
+        ran.unwrap();
+        assert!(rig.violations.is_empty(), "{kind}: {:?}", rig.violations);
+        assert_eq!(rig.refusals, [kind]);
+        assert_eq!(rig.seen, seen, "{kind}");
+        assert_eq!(rig.loading_pages.len(), 1, "{kind}");
+        assert_eq!(rig.loading, None, "{kind}");
+    }
+    let (rig, _) = loading(Entry::Start, None, |r| r.restore_fails = 1);
+    assert!(rig.violations.is_empty(), "{:?}", rig.violations);
+    assert_eq!(
+        rig.loading_pages.iter().map(|p| p.0).collect::<Vec<_>>(),
+        [P]
+    );
+    let n = notices(&rig);
+    assert!(
+        n.get(1)
+            .cloned()
+            .flatten()
+            .is_some_and(|n| n.contains("restore")),
+        "{n:?}"
+    );
+    assert_eq!(rig.loading, None);
+    assert_eq!(rig.starts, 0);
 }
 
 /// The user preset `mine`'s file in `dir`.

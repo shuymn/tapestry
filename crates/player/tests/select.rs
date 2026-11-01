@@ -11,6 +11,10 @@ use std::process::{Command, Output, Stdio};
 
 use game::{DataRoot, DeviceSettings, LibrarySettings, save_settings};
 
+/// The rule a slow load holds by, shared with it.
+#[path = "../src/dev/checkpoints.rs"]
+mod checkpoints;
+
 /// A 50 ms mono 16-bit square wave of `amplitude` at 44.1 kHz.
 fn write_wav(path: &Path, amplitude: i16) {
     let samples: Vec<i16> = (0..2_205)
@@ -380,6 +384,291 @@ fn closing_during_the_measurement_leaves_the_load() {
     assert_eq!(lines(&again, "play started").len(), 1, "{again}");
 }
 
+/// Where `line` first starts a line of `stdout`, from line `from` on.
+fn find_from(stdout: &str, from: usize, line: &str) -> Option<usize> {
+    stdout
+        .lines()
+        .enumerate()
+        .skip(from)
+        .find(|(_, l)| l.starts_with(line))
+        .map(|(i, _)| i)
+}
+
+/// The frames a `dev: <screen> frames <n>:` line counts, each report.
+fn frames_of(stdout: &str, screen: &str) -> Vec<u64> {
+    lines(stdout, &format!("dev: {screen} frames "))
+        .iter()
+        .map(|l| {
+            l.trim_start_matches(&format!("dev: {screen} frames "))
+                .split(':')
+                .next()
+                .unwrap()
+                .parse()
+                .unwrap()
+        })
+        .collect()
+}
+
+/// The pixels of a frame the dump wrote (`dev::png`'s stored deflate
+/// blocks, unfiltered RGBA rows): its width, height and RGBA bytes.
+fn dumped_rgba(path: &Path) -> (usize, usize, Vec<u8>) {
+    let png = fs::read(path).unwrap();
+    let be = |b: &[u8]| u32::from_be_bytes(b.try_into().unwrap()) as usize;
+    let (mut at, mut size, mut z) = (8, (0, 0), Vec::new());
+    while at < png.len() {
+        let len = be(&png[at..at + 4]);
+        let kind = &png[at + 4..at + 8];
+        let data = &png[at + 8..at + 8 + len];
+        match kind {
+            b"IHDR" => size = (be(&data[..4]), be(&data[4..8])),
+            b"IDAT" => z.extend_from_slice(data),
+            _ => {}
+        }
+        at += 12 + len;
+    }
+    // Past the zlib header: stored blocks of a 5-byte header each.
+    let (mut raw, mut i) = (Vec::new(), 2);
+    loop {
+        let last = z[i] & 1 == 1;
+        let n = usize::from(u16::from_le_bytes([z[i + 1], z[i + 2]]));
+        raw.extend_from_slice(&z[i + 5..i + 5 + n]);
+        i += 5 + n;
+        if last {
+            break;
+        }
+    }
+    let (w, h) = size;
+    let rgba = raw
+        .chunks(w * 4 + 1)
+        .flat_map(|row| row[1..].to_vec())
+        .collect();
+    (w, h, rgba)
+}
+
+/// Whether a row of `rgba` holds a run of at least `len` red pixels: the
+/// play screen's judgment line.
+fn has_red_run((w, _, rgba): &(usize, usize, Vec<u8>), len: usize) -> bool {
+    rgba.chunks(w * 4).any(|row| {
+        let mut run = 0;
+        row.chunks(4).any(|p| {
+            run = if p[0] > 200 && p[1] < 110 && p[2] < 110 {
+                run + 1
+            } else {
+                0
+            };
+            run >= len
+        })
+    })
+}
+
+/// Choosing a chart switches at once to the play screen in its loading
+/// state, the lanes and judgment line drawn without notes, the chart's
+/// lines saying each stage over it, drawn on (its frame dumped) while a
+/// slow load holds, until the countdown.
+#[test]
+fn the_play_screen_loads_from_the_choice_through_a_slow_load() {
+    let fx = fixture();
+    write_chart(&fx.library, "a", "a.bms", "譜面A", 8_000);
+    let frames = fx.appdata.join("frames");
+    let frames_arg = frames.display().to_string();
+    let (_, stdout) = run(
+        &fx,
+        "pick=a.bms,slow-load=1500,enter,back,close",
+        &["--dev-frames", &frames_arg],
+    );
+    let at = |from: usize, line: &str| {
+        find_from(&stdout, from, line).unwrap_or_else(|| panic!("no {line}:\n{stdout}"))
+    };
+    let chose = at(0, "select: chose a.bms");
+    let shown = at(chose, "load: the play screen loads a.bms");
+    let read = at(shown, "load: reading the chart");
+    let held = at(read, "dev: the load holds 1500 ms");
+    let ready = at(held, "load: the chart is ready ");
+    at(ready, "play started");
+    assert!(lines(&stdout, "load: cancelled").is_empty(), "{stdout}");
+    // Frames keep being presented through the hold: its checkpoints show
+    // them following one another, by the rule the hold itself waits for
+    // (at most 20 s), so a slow machine passes and a screen that drew
+    // once and stopped fails.
+    let presented: Vec<u64> = lines(&stdout, "dev: presented loading frames: ")
+        .iter()
+        .map(|l| {
+            l.trim_start_matches("dev: presented loading frames: ")
+                .parse()
+                .unwrap()
+        })
+        .collect();
+    assert!(
+        checkpoints::frames_follow(&presented),
+        "{presented:?}\n{stdout}"
+    );
+    assert_eq!(frames_of(&stdout, "loading").len(), 1, "{stdout}");
+    // The loading frame is the play screen's: its judgment line spans the
+    // lanes, as in play, and the select screen has none.
+    let loading = dumped_rgba(&frames.join("loading.png"));
+    assert!(has_red_run(&loading, loading.0 / 5), "no judgment line");
+    let select = dumped_rgba(&frames.join("select.png"));
+    assert!(!has_red_run(&select, select.0 / 5));
+}
+
+/// The quit key during a load cancels it and returns to selection: the
+/// chart is not readied and no countdown starts; Enter then plays it.
+#[test]
+fn the_quit_key_during_a_load_returns_to_selection() {
+    let fx = fixture();
+    write_chart(&fx.library, "a", "a.bms", "譜面A", 8_000);
+    let (_, stdout) = run(
+        &fx,
+        "pick=a.bms,slow-load=2000,quit-loading,enter,pick=a.bms,enter,back,close",
+        &[],
+    );
+    let at = |from: usize, line: &str| {
+        find_from(&stdout, from, line).unwrap_or_else(|| panic!("no {line}:\n{stdout}"))
+    };
+    let shown = at(0, "load: the play screen loads a.bms");
+    let cancelled = at(shown, "load: cancelled");
+    let back = at(cancelled, "select: 1 charts listed");
+    let again = at(back, "select: chose a.bms");
+    let ready = at(again, "load: the chart is ready ");
+    at(ready, "play started");
+    assert_eq!(lines(&stdout, "load: cancelled").len(), 1, "{stdout}");
+    assert_eq!(lines(&stdout, "load: the chart is ready ").len(), 1);
+    assert_eq!(lines(&stdout, "play started").len(), 1, "{stdout}");
+    // Its loading state was drawn.
+    assert!(!frames_of(&stdout, "loading").is_empty(), "{stdout}");
+}
+
+/// A chart `name` in folder `folder` whose `files` notes each sound a file
+/// of its own.
+fn write_many_sounds(library: &Path, folder: &str, name: &str, files: usize) {
+    let dir = library.join(folder);
+    fs::create_dir_all(&dir).unwrap();
+    let mut text = "#PLAYER 1\n#TITLE 多い\n#BPM 120\n".to_owned();
+    let mut notes = String::new();
+    for i in 1..=files {
+        // Distinct contents, so none is stored as another's duplicate.
+        let amplitude = i16::try_from(1_000 + i * 50).unwrap();
+        write_wav(&dir.join(format!("s{i}.wav")), amplitude);
+        text.push_str(&format!("#WAV{i:02} s{i}.wav\n"));
+        notes.push_str(&format!("{i:02}"));
+    }
+    text.push_str(&format!("#00101:{notes}\n#00211:01\n"));
+    fs::write(dir.join(name), text).unwrap();
+}
+
+/// The quit key during the sound decode stops it at the next file: the
+/// load returns to selection without decoding the rest or measuring the
+/// loudness, and nothing is kept, so the next choice decodes and measures
+/// the chart whole and plays it.
+#[test]
+fn the_quit_key_stops_the_sound_decode() {
+    let fx = fixture();
+    write_many_sounds(&fx.library, "m", "m.bms", 64);
+    let (_, stdout) = run(
+        &fx,
+        "pick=m.bms,quit-decoding,enter,pick=m.bms,enter,back,close",
+        &[],
+    );
+    let at = |from: usize, line: &str| {
+        find_from(&stdout, from, line).unwrap_or_else(|| panic!("no {line}:\n{stdout}"))
+    };
+    let first = at(0, "load: the play screen loads m.bms");
+    let stopped = at(first, "load: cancelled while loading the sounds");
+    let back = at(stopped, "select: 1 charts listed");
+    assert!(
+        find_from(&stdout, first, "loudness: measuring m.bms").is_some_and(|m| m > back),
+        "measured before the cancel:\n{stdout}"
+    );
+    let again = at(back, "load: the play screen loads m.bms");
+    let ready = at(again, "load: the chart is ready ");
+    at(ready, "play started");
+    assert_eq!(
+        stdout.lines().filter(|l| *l == "load: cancelled").count(),
+        1
+    );
+    assert_eq!(lines(&stdout, "loudness: measuring m.bms").len(), 1);
+}
+
+/// A chart of one sound whose loudness is stored: the quit key as its only
+/// file finishes decoding, after the decode's last check, still cancels
+/// the load there. The bank is not installed and the stored measurement
+/// not even looked up; selection follows, and the next choice plays.
+#[test]
+fn a_quit_after_the_last_file_is_decoded_cancels_the_load() {
+    let fx = fixture();
+    write_chart(&fx.library, "a", "a.bms", "譜面A", 4_000);
+    // The first run measures the chart and stores it at its countdown.
+    let (_, first) = run(&fx, "pick=a.bms,enter,back,close", &[]);
+    assert_eq!(lines(&first, "loudness: a.bms measured in ").len(), 1);
+    let (_, stdout) = run(
+        &fx,
+        "pick=a.bms,quit-decoding,enter,pick=a.bms,enter,back,close",
+        &[],
+    );
+    let at = |from: usize, line: &str| {
+        find_from(&stdout, from, line).unwrap_or_else(|| panic!("no {line}:\n{stdout}"))
+    };
+    let shown = at(0, "load: the play screen loads a.bms");
+    let stopped = at(shown, "load: cancelled while loading the sounds");
+    let back = at(stopped, "select: 1 charts listed");
+    // Nothing of the cancelled load past its sounds.
+    for line in ["loudness: a.bms: gain ", "load: the chart is ready "] {
+        assert!(
+            find_from(&stdout, shown, line).is_some_and(|l| l > back),
+            "{line} before the cancel:\n{stdout}"
+        );
+    }
+    let ready = at(back, "load: the chart is ready ");
+    at(ready, "play started");
+    assert_eq!(lines(&stdout, "play started").len(), 1, "{stdout}");
+    assert!(lines(&stdout, "loudness: measuring").is_empty(), "{stdout}");
+}
+
+/// The quit key during the loudness measurement stops it at the next
+/// block: the load returns to selection, nothing is stored, and the next
+/// choice measures the chart again and plays it.
+#[test]
+fn the_quit_key_stops_the_loudness_measurement() {
+    let fx = fixture();
+    write_chart(&fx.library, "a", "a.bms", "譜面A", 4_000);
+    let (_, stdout) = run(
+        &fx,
+        "pick=a.bms,quit-measuring,enter,pick=a.bms,enter,back,close",
+        &[],
+    );
+    let at = |from: usize, line: &str| {
+        find_from(&stdout, from, line).unwrap_or_else(|| panic!("no {line}:\n{stdout}"))
+    };
+    let measuring = at(0, "loudness: measuring a.bms");
+    let stopped = at(measuring, "loudness: a.bms: the measurement was cancelled");
+    let cancelled = at(stopped, "load: cancelled");
+    let back = at(cancelled, "select: 1 charts listed");
+    let again = at(back, "loudness: measuring a.bms");
+    let measured = at(again, "loudness: a.bms measured in ");
+    at(measured, "play started");
+    assert_eq!(lines(&stdout, "loudness: a.bms measured in ").len(), 1);
+    assert_eq!(lines(&stdout, "play started").len(), 1, "{stdout}");
+}
+
+/// Closing the window during a load cancels it and ends the run at once
+/// with 0, before any countdown.
+#[test]
+fn closing_during_a_load_ends_the_run() {
+    let fx = fixture();
+    write_chart(&fx.library, "a", "a.bms", "譜面A", 8_000);
+    let (_, stdout) = run(&fx, "pick=a.bms,slow-load=2000,close-loading,enter", &[]);
+    assert!(
+        find_from(&stdout, 0, "load: the play screen loads a.bms").is_some(),
+        "{stdout}"
+    );
+    assert_eq!(lines(&stdout, "load: cancelled").len(), 1, "{stdout}");
+    assert!(
+        lines(&stdout, "load: the chart is ready").is_empty(),
+        "{stdout}"
+    );
+    assert!(lines(&stdout, "play started").is_empty(), "{stdout}");
+}
+
 /// A chart that cannot be loaded returns to selection with its reason
 /// shown, and stays selected: Enter chooses it again. The threads keep
 /// running: a valid chart plays after it.
@@ -414,6 +703,13 @@ fn refused_chart_shows_its_reason() {
     );
     assert_eq!(lines(&stdout, "select: chose bad.bms").len(), 2, "{stdout}");
     assert_eq!(lines(&stdout, "play started").len(), 1, "{stdout}");
+    // Each choice showed the loading state, which the refusal left.
+    let mut from = 0;
+    for _ in 0..2 {
+        let shown = find_from(&stdout, from, "load: the play screen loads bad.bms");
+        let shown = shown.unwrap_or_else(|| panic!("{stdout}"));
+        from = find_from(&stdout, shown, "select: refused bad.bms: ").unwrap();
+    }
 }
 
 /// After a refusal, selection releases the scan's pause: a chart added

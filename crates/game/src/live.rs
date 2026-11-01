@@ -167,6 +167,18 @@ pub trait Rig {
     ///
     /// Why the screen cannot draw a play, which ends the run.
     fn prepare_screen(&mut self) -> Result<(), Self::ScreenError>;
+    /// Ends a chart's loading state (design.md "Play Lifecycle"), after
+    /// the audio's preparation and before recording opens: once it
+    /// returns, the screen draws nothing of it. Nothing to end without
+    /// one (a retry); the default has none.
+    ///
+    /// # Errors
+    ///
+    /// Why the screen did not confirm it, which ends the run, as a failed
+    /// preparation does: recording does not open.
+    fn end_loading(&mut self) -> Result<(), Self::ScreenError> {
+        Ok(())
+    }
     /// Waits until audio is ready for a play: the previous play's switch
     /// taken. Before recording opens.
     ///
@@ -486,6 +498,7 @@ fn play_and_next<R: Rig>(
     run_over(rig)?;
     rig.prepare_screen().map_err(LiveError::Screen)?;
     rig.prepare_audio().map_err(LiveError::Audio)?;
+    rig.end_loading().map_err(LiveError::Screen)?;
     // A retry or suspend from before this play belongs to no play.
     if rig.quitting() || rig.take() == Some(Command::Quit) {
         return Ok(None);

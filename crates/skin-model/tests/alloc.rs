@@ -34,7 +34,8 @@ use skin_model::{
     UvTable, Variant, lane_timer, timer,
 };
 use skin_model::{
-    ChartText, FontRef, FrameUv, Overflow, TextDef, TextField, TextImage, TextTable, TextValue,
+    ChartText, FontRef, FrameUv, LoadState, Overflow, TextDef, TextField, TextImage, TextTable,
+    TextValue,
 };
 
 struct Counting;
@@ -1137,6 +1138,11 @@ fn stretch(
             target: TARGETS[target_no],
             layout: &views.layouts[layout_no],
             lanes: views.lanes[(frame_no / 23) % views.lanes.len()],
+            // A stretch of loading frames every 50, its progress moving.
+            loading: (frame_no % 50 < 5).then(|| LoadState {
+                since: TimeUs(now - 1_000),
+                percent: i32::try_from(frame_no % 120).unwrap_or(0),
+            }),
             playing: true,
         };
         let use_small = frame_no % 100 == 99;
@@ -1373,6 +1379,7 @@ fn build_does_not_allocate() {
         target: TARGETS[0],
         layout: &views.layouts[0],
         lanes: views.lanes[0],
+        loading: None,
         playing: true,
     };
     skin.build(&mut play, &frame, &loaded.uvs, &mut batch);
@@ -1419,6 +1426,7 @@ fn build_does_not_allocate() {
             target: TARGETS[0],
             layout: &views.layouts[0],
             lanes: views.lanes[0],
+            loading: None,
             playing: true,
         };
         bitmap.build(&mut play, &frame, &uvs, &mut batch);
@@ -1541,6 +1549,7 @@ fn source_lanes_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
                 lift,
                 hidden: hidden_view,
             },
+            loading: None,
             playing: true,
         };
         skin.build(&mut play, &frame, &uvs, &mut batch);

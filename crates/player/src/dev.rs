@@ -31,6 +31,7 @@ use crate::measure::Drawn;
 use crate::recording::SoundRecording;
 use crate::render_side::{FrameSink, Screen};
 
+pub mod checkpoints;
 pub mod scenario;
 
 /// Prints, to the console only, which window took the foreground when the
@@ -380,6 +381,20 @@ pub enum SelectStep {
     /// Close the window once the next chart's load starts measuring its
     /// loudness: a close during the load.
     CloseMeasuring,
+    /// Press the quit key once the next chart's load starts measuring its
+    /// loudness.
+    QuitMeasuring,
+    /// Press the quit key once the next chart's load has decoded its first
+    /// sound file.
+    QuitDecoding,
+    /// The next chart's load holds this many milliseconds before its
+    /// sounds, cancelled by the quit key or a close as the measurement is:
+    /// a slow load.
+    SlowLoad(u64),
+    /// Halfway through the next slow load, press the quit key.
+    QuitLoading,
+    /// Halfway through the next slow load, close the window.
+    CloseLoading,
     /// Close the window.
     Close,
 }
@@ -387,13 +402,30 @@ pub enum SelectStep {
 /// How long a scripted step waits for its chart.
 pub const STEP_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// A slow load a script asks for (`slow-load`, `quit-loading`,
+/// `close-loading`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SlowLoad {
+    /// How long the load holds.
+    pub ms: u64,
+    /// The quit key is pressed halfway through it.
+    pub quit: bool,
+    /// The window closes halfway through it.
+    pub close: bool,
+}
+
 /// `--dev-select <steps>`: the select screen's input, comma-separated:
 /// `pick=<file>`, `wait=<file>`, `search=<text>`, `sleep=<ms>`,
 /// `idle=<ms>`, `enter`, `prev-preset`, `next-preset`, `drawn`,
-/// `back`, `retry`, `next`, `prev`, `close-measuring` and `close`. Selection
-/// steps run on the select screen (`prev-preset` and `next-preset` press
-/// F11 and F12; `close-measuring` closes the window once the next load
-/// measures a chart's loudness),
+/// `back`, `retry`, `next`, `prev`, `close-measuring`, `quit-measuring`,
+/// `quit-decoding`, `slow-load=<ms>`, `quit-loading`, `close-loading` and
+/// `close`. Selection steps run on the select screen (`prev-preset` and
+/// `next-preset` press F11 and F12; `close-measuring` and
+/// `quit-measuring` close the window or press the quit key once the next
+/// load measures a chart's loudness, `quit-decoding` once it has decoded
+/// its first sound file; `slow-load` holds the next load that long, and
+/// `quit-loading` and `close-loading` press the quit key or close the
+/// window halfway through it),
 /// `drawn` (wait until the result's page is drawn), `back`, `retry`, `next`
 /// and `prev` on a result; a step out of place, or a chart not
 /// listed within [`STEP_TIMEOUT`], fails the run. A scenario
@@ -409,6 +441,15 @@ pub struct SelectScript {
     /// The next load's loudness measurement closes the window
     /// (`close-measuring`).
     pub close_measuring: bool,
+    /// The next load's loudness measurement presses the quit key
+    /// (`quit-measuring`).
+    pub quit_measuring: bool,
+    /// The next load's first decoded file presses the quit key
+    /// (`quit-decoding`).
+    pub quit_decoding: bool,
+    /// How long the next load holds (`slow-load`), and what happens
+    /// halfway through it (`quit-loading`, `close-loading`).
+    pub slow_load: Option<SlowLoad>,
     /// Why the script failed.
     failed: Option<String>,
     /// The scenario step last announced.
@@ -438,11 +479,15 @@ impl SelectScript {
                 Some(("wait", f)) => Ok(SelectStep::Wait(f.to_owned())),
                 Some(("search", t)) => Ok(SelectStep::Search(t.to_owned())),
                 Some(("sleep", ms)) => ms.parse().map(SelectStep::Sleep).map_err(|_| {
-                    format!("{s} is not pick=, wait=, search=, sleep=, idle=, enter, prev-preset, next-preset, drawn, back, retry, next, prev, close-measuring or close")
+                    format!("{s} is not pick=, wait=, search=, sleep=, idle=, slow-load=, enter, prev-preset, next-preset, drawn, back, retry, next, prev, close-measuring, quit-measuring, quit-decoding, quit-loading, close-loading or close")
                 }),
                 Some(("idle", ms)) => ms
                     .parse()
                     .map(SelectStep::Idle)
+                    .map_err(|_| format!("{s} takes milliseconds")),
+                Some(("slow-load", ms)) => ms
+                    .parse()
+                    .map(SelectStep::SlowLoad)
                     .map_err(|_| format!("{s} takes milliseconds")),
                 None if s == "enter" => Ok(SelectStep::Enter),
                 None if s == "prev-preset" => Ok(SelectStep::PrevPreset),
@@ -453,9 +498,13 @@ impl SelectScript {
                 None if s == "next" => Ok(SelectStep::Next),
                 None if s == "prev" => Ok(SelectStep::Prev),
                 None if s == "close-measuring" => Ok(SelectStep::CloseMeasuring),
+                None if s == "quit-measuring" => Ok(SelectStep::QuitMeasuring),
+                None if s == "quit-decoding" => Ok(SelectStep::QuitDecoding),
+                None if s == "quit-loading" => Ok(SelectStep::QuitLoading),
+                None if s == "close-loading" => Ok(SelectStep::CloseLoading),
                 None if s == "close" => Ok(SelectStep::Close),
                 _ => Err(format!(
-                    "{s} is not pick=, wait=, search=, sleep=, idle=, enter, prev-preset, next-preset, drawn, back, retry, next, prev, close-measuring or close"
+                    "{s} is not pick=, wait=, search=, sleep=, idle=, slow-load=, enter, prev-preset, next-preset, drawn, back, retry, next, prev, close-measuring, quit-measuring, quit-decoding, quit-loading, close-loading or close"
                 )),
             })
             .map(|step| step.map(|s| (s, None)))
@@ -614,9 +663,11 @@ impl SelectScript {
     }
 }
 
-/// The select screen's frames (dev-tools): CPU time, the interval between
-/// frames and the render thread's allocations per frame, kept from the
-/// screen's first frame until it is left, then printed.
+/// A menu screen's frames, the select screen's or the play screen's
+/// loading state's
+/// (dev-tools): CPU time, the interval between frames and the render
+/// thread's allocations per frame, kept from the screen's first frame until
+/// it is left, then printed.
 #[derive(Debug, Default)]
 pub struct MenuStats {
     cpu_us: Vec<u64>,
@@ -647,8 +698,9 @@ impl MenuStats {
         }
     }
 
-    /// Prints what was kept, if anything, and starts over.
-    pub fn report(&mut self) {
+    /// Prints what was kept, if anything, as the frames of the `screen`
+    /// named, and starts over.
+    pub fn report(&mut self, screen: &str) {
         if self.cpu_us.is_empty() {
             return;
         }
@@ -672,7 +724,7 @@ impl MenuStats {
         );
         let (gap50, gap99) = (q(&mut self.interval_us, 50), q(&mut self.interval_us, 99));
         println!(
-            "dev: select frames {}: cpu p50 {cpu50} us, p99 {cpu99} us, max {cpumax} us; \
+            "dev: {screen} frames {}: cpu p50 {cpu50} us, p99 {cpu99} us, max {cpumax} us; \
              interval p50 {gap50} us, p99 {gap99} us; allocations per frame: \
              steady mean {:.1} max {}, new page mean {:.1} max {} ({} pages)",
             self.cpu_us.len(),
@@ -995,9 +1047,9 @@ fn onsets(samples: &[f32]) -> Vec<usize> {
 }
 
 /// Writes frames as PNG files: `select.png` at the first select screen
-/// frame, `countdown.png` at the first frame of the lead-in, `play.png` at
-/// the first frame at or after `play_at`, and `end.png` at the first end
-/// screen frame.
+/// frame, `loading.png` at the first loading state frame, `countdown.png` at
+/// the first frame of the lead-in, `play.png` at the first frame at or
+/// after `play_at`, and `end.png` at the first end screen frame.
 pub struct FrameDump {
     dir: PathBuf,
     play_at: TimeUs,
@@ -1005,6 +1057,7 @@ pub struct FrameDump {
     play: bool,
     end: bool,
     select: bool,
+    loading: bool,
 }
 
 impl FrameDump {
@@ -1017,6 +1070,7 @@ impl FrameDump {
             play: false,
             end: false,
             select: false,
+            loading: false,
         }
     }
 
@@ -1051,6 +1105,12 @@ impl FrameSink for FrameDump {
             Some(t) if t >= self.play_at && !self.play => {
                 self.play = true;
                 self.save(screen, "play.png");
+            }
+            None if drawn.loading => {
+                if !self.loading {
+                    self.loading = true;
+                    self.save(screen, "loading.png");
+                }
             }
             None if drawn.menu => {
                 if !self.select {
