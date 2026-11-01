@@ -1159,6 +1159,109 @@ fn check_f9(_: &Header, i: Imported) {
     assert_eq!(q.len(), skin_model::LANE_QUADS as usize + 1);
 }
 
+/// F11: lanes whose 48 mapped parts each name a distinct id with no
+/// image, every required array well formed, explicit equal sizes, no
+/// image record and no file; `extra` more `size` entries past the eight.
+fn f11(root: &Path, extra: usize) {
+    use common::lanes::{NOTES, lane_rects};
+    let ids = |p: &str| {
+        let v: Vec<String> = (0..8).map(|i| format!("\"{p}{i}\"")).collect();
+        format!("[{}]", v.join(", "))
+    };
+    let mut sizes = String::with_capacity(2 * extra + 64);
+    sizes.push_str("20, 20, 20, 20, 20, 20, 20, 20");
+    for _ in 0..extra {
+        sizes.push_str(",0");
+    }
+    let note = format!(
+        r#""note": {{"id": "notes", "note": {n}, "lnstart": {s}, "lnend": {e},
+            "lnbody": {b}, "lnactive": {a}, "hcnstart": {s}, "hcnend": {e},
+            "hcnbody": {b}, "hcnactive": {a}, "hcndamage": {b}, "hcnreactive": {a},
+            "mine": {m}, "size": [{sizes}], "dst": [{dst}]}}"#,
+        n = ids("n"),
+        s = ids("s"),
+        e = ids("e"),
+        b = ids("b"),
+        a = ids("a"),
+        m = ids("m"),
+        dst = lane_rects(200, 600),
+    );
+    write(
+        root,
+        "s.json",
+        common::hd(&format!(r#""image": [], {note}, "destination": [{NOTES}]"#)).as_bytes(),
+    );
+}
+
+/// F11's chart: every lane dense with taps from 1 s, a long note on
+/// model lane 1 across it and mines between the taps, more notes than
+/// the lanes' quads.
+fn f11_chart() -> bms_model::Chart {
+    use bms_model::{Lane, TimeUs};
+    let mut b = bms_model::ChartBuilder::new(150_000).long(
+        Lane::new(1).unwrap(),
+        TimeUs(900_000),
+        TimeUs(3_000_000),
+    );
+    for l in [0, 2, 3, 4, 5, 6, 7] {
+        for k in 0..3_000 {
+            let at = 1_000_000 + k * 400;
+            b = b.tap(Lane::new(l).unwrap(), TimeUs(at));
+            if l == 2 {
+                b = b.mine(Lane::new(l).unwrap(), TimeUs(at + 200), 10);
+            }
+        }
+    }
+    b.build().unwrap()
+}
+
+fn check_f11(_: &Header, i: Imported) {
+    let u = i.report.usage;
+    assert_eq!(u.note_fallbacks, 48);
+    assert_eq!((u.images, u.frames), (3, 3));
+    assert_eq!((u.file_attempts, u.files), (0, 0));
+    let fallbacks = i
+        .report
+        .notes
+        .iter()
+        .filter(|n| n.severity == skin_beatoraja::Severity::Fallback)
+        .count();
+    assert_eq!(fallbacks, 48);
+    // The paint is in the atlas: a tap white, a mine red, the long note
+    // yellow; the lanes spend their quads and drop the rest.
+    let limits = skin_model::AtlasLimits {
+        max_side: 4_096,
+        max_layers: 8,
+        reserved_layers: 1,
+    };
+    let atlas = i.skin.atlas(skin_model::Variant::Lo, limits).unwrap();
+    let mut d = Drawn::over(i.skin, &f11_chart());
+    let q = d.frame(1_000, &[]);
+    assert_eq!(q.len(), skin_model::LANE_QUADS as usize);
+    assert!(d.batch.dropped() > 0);
+    let colour = |q: &skin_model::Quad| {
+        let side = atlas.side();
+        let at = |a: f32, b: f32| ((a + b) / 2.0 * side as f32) as u32;
+        let (x, y) = (at(q.uv[0], q.uv[2]), at(q.uv[1], q.uv[3]));
+        let level = atlas.pages()[usize::from(q.layer) - 1].level(0).unwrap();
+        let k = ((y * side + x) * 4) as usize;
+        <[u8; 4]>::try_from(&level[k..k + 4]).unwrap()
+    };
+    let seen: std::collections::BTreeSet<[u8; 4]> = q.iter().map(colour).collect();
+    let want = [[255, 0, 0, 255], [255, 255, 0, 255], [255, 255, 255, 255]];
+    assert_eq!(seen.into_iter().collect::<Vec<_>>(), want);
+}
+
+/// The peak of importing `s.json` of `root` alone, its header and
+/// definition read before the window: the import's own working storage.
+fn import_peak(root: &Path) -> i64 {
+    let (mut def, header) = read_header(root, "s.json").unwrap();
+    let config = Config::defaults(&header);
+    let (imported, p) = peak(|| import(&mut def, &header, &config).unwrap());
+    assert_eq!(imported.report.usage.note_fallbacks, 48);
+    p
+}
+
 /// A relative name of `len` bytes ending in `tail`, in folders of at most
 /// 200-byte names.
 fn long_name(len: usize, tail: &str) -> String {
@@ -1347,6 +1450,12 @@ fn import_memory_is_measured() {
         size_of::<skin_model::DurationRatio>(),
     );
     println!(
+        "sizes: SolidImageDef {}, Usage {}, NoteKind {}",
+        size_of::<skin_model::SolidImageDef>(),
+        size_of::<skin_beatoraja::Usage>(),
+        size_of::<skin_beatoraja::NoteKind>(),
+    );
+    println!(
         "sizes: ImageChoiceDef {}, Option<ImageChoicePart> {}, CoverPaintDef {}, Run {}, Quad {}",
         size_of::<ImageChoiceDef>(),
         size_of::<Option<ImageChoicePart>>(),
@@ -1434,6 +1543,33 @@ fn import_memory_is_measured() {
     ));
     drop(d);
     f10_refuses_past_its_caps();
+    let d = tempfile::tempdir().unwrap();
+    f11(d.path(), 0);
+    peaks.push((
+        "F11 fallback parts",
+        measure_prepared(d.path(), &f11_chart(), check_f11),
+    ));
+    let small = import_peak(d.path());
+    drop(d);
+    // A `size` array near the node cap: the import peak with its input
+    // stays in the bound, and the size reader keeps no more than eight
+    // sizes, so the import's own working storage does not grow with it.
+    let d = tempfile::tempdir().unwrap();
+    let extra = MAX_NODES - 2_000;
+    f11(d.path(), extra);
+    peaks.push((
+        "F11 long size array",
+        measure_prepared(d.path(), &f11_chart(), |_, i| {
+            assert_eq!(i.report.usage.note_fallbacks, 48);
+        }),
+    ));
+    let large = import_peak(d.path());
+    drop(d);
+    println!("F11 import alone: {small} B, with {extra} more sizes {large} B");
+    assert!(
+        large - small < 4_096,
+        "the size reader grew with the array: {small} B to {large} B"
+    );
     for (name, p) in &peaks {
         println!("{name}: peak {p} B");
     }
