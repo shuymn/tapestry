@@ -423,7 +423,102 @@ pub fn draw(imported: &Imported) -> Vec<usize> {
     }
     rate_and_kind_probes(skin, &chart, &uvs, &mut batch);
     readout_probes(skin, &chart, &uvs, &mut batch);
+    choice_probes(skin, &chart, &uvs, &mut batch);
     counts
+}
+
+/// Image choices over small and extreme selections and clocks: EX scores
+/// selecting each of the first entries and past any table, at times
+/// before the play, within it and far past it, each frame inside the
+/// skin's capacities.
+fn choice_probes(
+    skin: &skin_model::Skin,
+    chart: &bms_model::Chart,
+    uvs: &skin_model::UvTable,
+    batch: &mut skin_model::QuadBatch,
+) {
+    use bms_model::TimeUs;
+    use eval::{GaugeState, Tally};
+    use rules::{GaugeValue, PerJudgment};
+    use skin_model::{Attempt, GaugeDesc, GaugeLook, Layout, PlayContext, Side, SkinFrame};
+
+    let descs = [GaugeDesc {
+        start: GaugeValue(50 * GaugeValue::PERCENT),
+        max: GaugeValue::FULL,
+        look: GaugeLook::Hard,
+        border: GaugeValue(80 * GaugeValue::PERCENT),
+    }];
+    let states = [GaugeState {
+        value: descs[0].start,
+        reference: descs[0].start,
+        failed_at: None,
+    }];
+    let ctx = PlayContext {
+        gauges: &descs,
+        attempt: Attempt::Full { lead_in: TimeUs(0) },
+        empty_poor_breaks_combo: false,
+        empty_poor_counted: false,
+        scratch: Side::Left,
+        ln_default: rules::LnMode::Ln,
+        last_note_end: TimeUs(0),
+        bpm_range: None,
+    };
+    let mut play = skin
+        .prepare(chart, &ctx)
+        .expect("an imported skin prepares");
+    let runs = usize::try_from(skin.run_capacity()).unwrap_or(usize::MAX);
+    let probes = [
+        (i64::MIN, 0),
+        (-1_000_000, 1),
+        (0, 2),
+        (1, 3),
+        (299_999, 4),
+        (1_000_000, 5),
+        (i64::MAX, u32::MAX),
+    ];
+    for (now, ex_score) in probes {
+        let tally = Tally {
+            counts: PerJudgment {
+                perfect: ex_score / 2,
+                great: ex_score % 2,
+                good: 0,
+                bad: 0,
+                poor: 0,
+            },
+            ex_score,
+            bp: 0,
+            combo: 0,
+            max_combo: 0,
+            empty_poor: 0,
+        };
+        batch.clear();
+        let frame = SkinFrame {
+            now: TimeUs(now),
+            display_offset: TimeUs(0),
+            tally: &tally,
+            gauges: &states,
+            gauge: 0,
+            effects: &[],
+            complete: false,
+            target: [1_920, 1_080],
+            layout: &Layout::AUTHOR,
+            lanes: LANES_OFF,
+            loading: None,
+            readouts: readouts_for(LANES_OFF),
+            playing: true,
+        };
+        skin.build(&mut play, &frame, uvs, batch)
+            .expect("a consistent snapshot builds");
+        assert_eq!(batch.dropped(), 0, "quads past the capacity");
+        assert!(batch.runs().len() <= runs, "more runs than the capacity");
+        assert!(
+            batch
+                .quads()
+                .iter()
+                .all(|q| q.rect.iter().chain(&q.pivot).all(|v| v.is_finite())),
+            "a quad off the finite plane"
+        );
+    }
 }
 
 /// The score rates and the gauge kind at their extremes: both empty-POOR
@@ -830,8 +925,8 @@ pub fn skin_json(data: &[u8]) -> Result<(Header, Result<Imported, ImportError>),
 /// An import's charged counters are within the model's caps.
 fn check_usage(i: &Imported) {
     use skin_model::{
-        MAX_ELEMENTS, MAX_FILES, MAX_SHEET_GLYPHS, MAX_SHEET_KERNINGS, MAX_SKIN_FRAMES,
-        MAX_SKIN_KEYS, MAX_SKIN_OPS, MAX_WIDGET_QUADS,
+        MAX_ELEMENTS, MAX_FILES, MAX_IMAGE_CHOICE_REFS, MAX_SHEET_GLYPHS, MAX_SHEET_KERNINGS,
+        MAX_SKIN_FRAMES, MAX_SKIN_KEYS, MAX_SKIN_OPS, MAX_WIDGET_QUADS,
     };
     let u = i.report.usage;
     let within = |n: u32, cap: usize| usize::try_from(n).is_ok_and(|n| n <= cap);
@@ -843,6 +938,16 @@ fn check_usage(i: &Imported) {
     assert!(within(u.frames, MAX_SKIN_FRAMES), "too many frames");
     assert!(within(u.file_attempts, MAX_FILES), "too many file attempts");
     assert!(u.widget_quads <= MAX_WIDGET_QUADS, "too many widget quads");
+    assert!(
+        within(u.choice_refs, MAX_IMAGE_CHOICE_REFS),
+        "too many image choice entries"
+    );
+    // A selecting element dropped after its entries were charged keeps
+    // none of them.
+    assert!(
+        i.skin.choice_ref_count() <= usize::try_from(u.choice_refs).unwrap_or(usize::MAX),
+        "more image choice entries kept than charged"
+    );
     // Lanes reserve their quads beside the elements' and widgets'.
     if i.scratch.is_some() {
         let lanes = skin_model::LANE_QUADS + skin_model::LANE_RESERVED;

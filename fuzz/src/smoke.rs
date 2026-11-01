@@ -283,6 +283,7 @@ fn skin_json_seeds_resolve_or_fail_as_built() {
             "gauge",
             "rates",
             "readouts",
+            "selectors",
         ],
     );
     let imports: Vec<&str> = seeds::skin_imports().iter().map(|(n, _)| *n).collect();
@@ -530,6 +531,39 @@ fn skin_import_seeds_import_and_draw_as_built() {
                 // adjusting.
                 let images = 1 + 1 + 1;
                 assert_eq!(drawn, [1 + 2 + 1 + 1 + 4 + 3 + images; 4], "{name}");
+            }
+            "selectors" => {
+                use skin_beatoraja::{DeviationId, PropertyKind};
+                // Each selector but the gauge's percent and no property
+                // D4; the group past its frames never drawn; each set's
+                // undefined id ignored; 500-507 refused by their id.
+                let mut k = kinds(&i);
+                k.sort_by_key(|n| format!("{n:?}"));
+                let mut want = vec![NoteKind::Deviation(DeviationId::D4); 6];
+                want.push(NoteKind::Track(skin_beatoraja::TrackWhy::NeverDrawn));
+                want.extend([NoteKind::UndefinedObject; 5]);
+                want.extend((500..=507).map(|id| NoteKind::UnsupportedProperty {
+                    kind: PropertyKind::ImageIndex,
+                    id: Some(id),
+                }));
+                want.sort_by_key(|n| format!("{n:?}"));
+                assert_eq!(k, want, "{name}");
+                // Three groups of 4 frames and the sets' three images; 2,
+                // 2 and 4 group entries and 6 per set; the wider image's
+                // own track in each set.
+                assert_eq!(u.elements, 17, "{name}");
+                assert_eq!((u.images, u.frames, u.files), (6, 15, 1), "{name}");
+                assert_eq!(u.choice_refs, 2 + 2 + 4 + 5 * 6, "{name}");
+                assert_eq!(i.skin.choice_ref_count(), 38, "{name}");
+                assert_eq!(u.keys, 3 + 5 + 5, "{name}");
+                // The gauge's type 34 ops twice, a switch 4 thrice, the
+                // rest 1.
+                assert_eq!(u.ops, 2 * 34 + 3 * 4 + 3, "{name}");
+                assert_eq!(u.widget_quads, 0, "{name}");
+                // A normal gauge (2) is past the groups' two entries and
+                // selects the set's hole; EX 150 and the gauge's 20 % are
+                // past the sets, selecting `a`; every switch is on.
+                assert_eq!(drawn, [3 + 4; 4], "{name}");
             }
             _ => panic!("no expectation for seed {name}"),
         }
