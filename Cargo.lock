@@ -2349,6 +2349,7 @@ dependencies = [
  "bms-model",
  "criterion",
  "eval",
+ "image",
  "png",
  "proptest",
  "rules",

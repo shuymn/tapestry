@@ -126,6 +126,9 @@ pub use widget::digits::{
 pub use widget::gauge::{
     GaugeDef, GaugeError, GaugeLook, GaugePart, GaugeParts, MAX_SEGMENTS, Motion,
 };
+pub use widget::image_choice::{
+    ImageChoiceDef, ImageChoiceError, ImageChoicePart, ImageSpan, MAX_IMAGE_CHOICE_REFS,
+};
 pub use widget::judge::{Attach, ComboPart, GradePart, JudgeDef, JudgeError, JudgePart, JudgeSlot};
 pub use widget::lanes::{
     HiddenTrim, LANE_QUADS, LANE_RESERVED, LANE_VISITS, LanePart, LaneParts, LaneStyle, LaneView,

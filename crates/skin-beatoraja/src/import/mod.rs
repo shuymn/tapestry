@@ -300,6 +300,9 @@ pub(crate) struct Cx<'d> {
     span_hint: widget::lanes::SpanHint,
     /// The judge records already drawn.
     judges: Vec<u32>,
+    /// Image selectors compiled once, by source; each copy kept is
+    /// charged.
+    selectors: HashMap<String, Program>,
 }
 
 /// A witness of the order of an import's work.
@@ -309,6 +312,10 @@ pub(crate) enum Event {
     Charge,
     Compile,
     Admit,
+    /// An image choice table's entries charged.
+    Refs,
+    /// An image choice table allocated.
+    Table,
 }
 
 #[cfg(test)]
@@ -368,6 +375,7 @@ impl<'d> Cx<'d> {
             lanes: None,
             span_hint: widget::lanes::SpanHint::NoLanes,
             judges: Vec::new(),
+            selectors: HashMap::new(),
         };
         cx.config_notes();
         cx.custom_timers()?;
@@ -714,7 +722,7 @@ impl<'d> Cx<'d> {
         }
         let lanes = self.elements.len();
         match object {
-            Object::Image => self.image(dst, orec, None)?,
+            Object::Image => self.image(dst, orec)?,
             Object::ImageSet => self.image_set(dst, orec)?,
             Object::Value => self.number(dst, orec)?,
             Object::Text => self.text(dst, orec)?,
