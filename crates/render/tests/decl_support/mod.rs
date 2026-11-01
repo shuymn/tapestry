@@ -67,7 +67,10 @@ pub struct Look {
     pub rect: [i32; 4],
     /// Clip 0, which the image draws under; none draws it unclipped.
     pub clip: Option<[f32; 4]>,
-    /// More copies of the image element, for a larger capacity.
+    /// More image elements, for a larger capacity: each draws the image
+    /// under the same clip over the 10×10 canvas pixels at `rect`'s top
+    /// left, so thousands of them stay cheap to rasterise on WARP, whose
+    /// devices in one process wait on each other's work.
     pub copies: usize,
     /// A text element on the right half with its prepared line.
     pub text: bool,
@@ -154,7 +157,12 @@ pub fn skin(dir: &Path, look: &Look) -> Skin {
     )
     .unwrap();
     let clipped = look.clip.is_some();
-    let mut elements = vec![image(look.rect, clipped); 1 + look.copies];
+    let [x, y, ..] = look.rect;
+    let mut elements = vec![image(look.rect, clipped)];
+    elements.extend(std::iter::repeat_n(
+        image([x, y, 10, 10], clipped),
+        look.copies,
+    ));
     let mut widgets = WidgetDefs::default();
     if look.text {
         widgets.texts.push(TextDef {
