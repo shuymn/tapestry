@@ -446,6 +446,7 @@ mod tests {
                     visible_time: TimeUs(600 * MS),
                     cover: 0,
                     lift: 0,
+                    hidden: 0,
                 },
             };
             skin.build(play, &frame, &uvs, &mut batch);

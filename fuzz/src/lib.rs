@@ -364,6 +364,7 @@ pub fn draw(imported: &Imported) -> Vec<usize> {
                 visible_time: TimeUs(600_000),
                 cover: 0,
                 lift: 0,
+                hidden: 0,
             },
             playing: true,
         };

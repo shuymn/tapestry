@@ -10,8 +10,8 @@
 //! (owner decision 15, D11).
 
 use skin_model::{
-    Blend, End, Filter, LaneParts, LaneStyle, LanesDef, MAX_COORD, Side, Source, SourceLanes,
-    TimerRef,
+    Blend, End, Filter, HiddenTrim, LaneParts, LaneStyle, LanesDef, MAX_COORD, Side, Source,
+    SourceLanes, TimerRef,
 };
 
 use super::super::asset::Crop;
@@ -510,6 +510,7 @@ impl Cx<'_> {
             line: None,
             cover: None,
             lift: None,
+            hidden: None,
         };
         for (u, ([x0, x1], imgs)) in xs.iter().zip(images).enumerate() {
             let m = model(u);
@@ -553,11 +554,14 @@ impl Cx<'_> {
                 top,
                 line,
                 bottom,
-                // SUDDEN+ and LIFT set their own extents when they map.
+                // SUDDEN+, LIFT and HIDDEN+ set their own extents when they map.
                 cover_at: region_top.to_f32(),
                 cover_h: 0.0,
                 lift_at: source.bottom,
                 lift_h: 0.0,
+                hidden_at: source.bottom,
+                hidden_h: 0.0,
+                hidden_trim: HiddenTrim::None,
                 note_h,
                 mine_h: note_h,
                 bar_h: bar_h.unwrap_or(1),

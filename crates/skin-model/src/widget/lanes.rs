@@ -1,5 +1,6 @@
 //! The lanes widget: notes, long notes, mines, bar lines, the judgment line
-//! and the lane and lift covers on lanes a skin authors as rects, drawn as
+//! and the lane, hidden and lift covers on lanes a skin authors as rects,
+//! drawn as
 //! the simple skin draws them (crates/render/src/simple.rs) or as the
 //! source player draws an imported skin ([`LaneStyle`]).
 //!
@@ -12,6 +13,13 @@
 //! then takes its share of the length left above the lift, and the notes
 //! scroll over what both leave. Together they may cover the whole lane, as
 //! in the source player. Each cover keeps its own height.
+//!
+//! The hidden cover (HIDDEN+) rises from its anchor with the lift and by
+//! its own share of the length left above the lift, over the notes: it
+//! changes neither the scroll nor what is drawn under it, and with the
+//! lane cover it may hide the whole lane. It is cut off below at its trim
+//! line ([`HiddenTrim`]). The covers are drawn after the notes in a fixed
+//! order, the hidden cover, the lane cover, then the lift cover.
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
@@ -32,9 +40,9 @@ pub const LANE_QUADS: u32 = 8_192;
 /// The candidates one frame may visit: each bar line and note the visible
 /// range meets, whether drawn, judged, outside the section or culled.
 pub const LANE_VISITS: u32 = 2 * LANE_QUADS;
-/// The quads reserved beyond [`LANE_QUADS`]: the judgment line, the lane
-/// cover and the lift cover.
-pub const LANE_RESERVED: u32 = 3;
+/// The quads reserved beyond [`LANE_QUADS`]: the judgment line, the
+/// hidden cover, the lane cover and the lift cover.
+pub const LANE_RESERVED: u32 = 4;
 
 /// Which side of the key lanes the scratch lane is on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -59,6 +67,22 @@ pub struct LaneParts {
     pub line: Option<u32>,
     pub cover: Option<u32>,
     pub lift: Option<u32>,
+    /// The hidden cover (HIDDEN+).
+    pub hidden: Option<u32>,
+}
+
+/// Where the hidden cover is cut off below: none of it is drawn under
+/// its trim line or the lanes' bottom, whichever is higher. Lines are y
+/// down in reference pixels, unrounded.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum HiddenTrim {
+    /// No trim line: cut at the lanes' bottom.
+    None,
+    /// A fixed line at this y.
+    Fixed(f32),
+    /// A line at this y with the lift at 0 ‰, rising with the lift as
+    /// the judgment line does.
+    Lift(f32),
 }
 
 /// How the lanes place and keep their notes.
@@ -114,6 +138,7 @@ pub enum LanePart {
     Line,
     Cover,
     Lift,
+    Hidden,
 }
 
 /// The lanes as a skin authors them, in reference pixels.
@@ -142,6 +167,12 @@ pub struct LanesDef {
     /// `lift_h` tall below it and drawn only while lifted.
     pub lift_at: f32,
     pub lift_h: f32,
+    /// Where the hidden cover's upper edge sits with the lift and the
+    /// hidden cover at 0 ‰; it is `hidden_h` tall below it, rises by both
+    /// and is drawn only while the hidden cover is above 0 ‰.
+    pub hidden_at: f32,
+    pub hidden_h: f32,
+    pub hidden_trim: HiddenTrim,
     pub note_h: u16,
     pub mine_h: u16,
     pub bar_h: u16,
@@ -163,6 +194,10 @@ pub struct LaneView {
     /// `line − top` in the simple style and the region's height in the
     /// source style.
     pub lift: u16,
+    /// The hidden cover, in ‰ (at most 1 000) of the length left above
+    /// the lift, as the lane cover; 0 draws none of it. The caller passes
+    /// 0 while the player has it off.
+    pub hidden: u16,
 }
 
 /// Why the lanes were refused.
@@ -208,6 +243,7 @@ impl LanesDef {
             (LanePart::Line, p.line),
             (LanePart::Cover, p.cover),
             (LanePart::Lift, p.lift),
+            (LanePart::Hidden, p.hidden),
         ];
         lanes
             .into_iter()
@@ -221,8 +257,8 @@ impl LanesDef {
 
     /// Checks the geometry: every width at least 1, every lane within
     /// ±[`MAX_COORD`], `top < line ≤ bottom` within it, heights of at
-    /// least 1, the covers' extents within it with a height for each one
-    /// drawn, every key lane on the scratch lane's side, and for the source
+    /// least 1, the covers' extents and the hidden cover's trim line within
+    /// it with a height for each cover drawn, every key lane on the scratch lane's side, and for the source
     /// style its geometry ([`LanesError::Source`]).
     pub(crate) fn check(&self) -> Result<(), LanesError> {
         let max = i64::from(MAX_COORD);
@@ -246,15 +282,30 @@ impl LanesDef {
         // cover drawn.
         #[expect(clippy::cast_precision_loss, reason = "within ±2^21, exact in f64")]
         let near = |v: f64| v.abs() <= max as f64;
-        let [cover_at, cover_h, lift_at, lift_h] =
-            [self.cover_at, self.cover_h, self.lift_at, self.lift_h].map(f64::from);
+        let [cover_at, cover_h, lift_at, lift_h, hidden_at, hidden_h] = [
+            self.cover_at,
+            self.cover_h,
+            self.lift_at,
+            self.lift_h,
+            self.hidden_at,
+            self.hidden_h,
+        ]
+        .map(f64::from);
         let sized = |h: f64, drawn: bool| if drawn { h > 0.0 } else { h >= 0.0 };
+        let trim = match self.hidden_trim {
+            HiddenTrim::None => true,
+            HiddenTrim::Fixed(y) | HiddenTrim::Lift(y) => near(f64::from(y)),
+        };
         if !(near(cover_at)
             && near(cover_at - cover_h)
             && near(lift_at)
             && near(lift_at + lift_h)
+            && near(hidden_at)
+            && near(hidden_at + hidden_h)
+            && trim
             && sized(cover_h, self.parts.cover.is_some())
-            && sized(lift_h, self.parts.lift.is_some()))
+            && sized(lift_h, self.parts.lift.is_some())
+            && sized(hidden_h, self.parts.hidden.is_some()))
         {
             return Err(LanesError::Anchors);
         }
@@ -317,6 +368,7 @@ pub(crate) struct Parts {
     pub(crate) line: Option<ImageRef>,
     pub(crate) cover: Option<ImageRef>,
     pub(crate) lift: Option<ImageRef>,
+    pub(crate) hidden: Option<ImageRef>,
 }
 
 /// Loaded lanes.
@@ -336,6 +388,9 @@ pub(crate) struct Lanes {
     cover_h: f32,
     lift_at: f32,
     lift_h: f32,
+    hidden_at: f32,
+    hidden_h: f32,
+    hidden_trim: HiddenTrim,
     note_h: f32,
     mine_h: f32,
     bar_h: f32,
@@ -367,6 +422,9 @@ impl Lanes {
             cover_h: def.cover_h,
             lift_at: def.lift_at,
             lift_h: def.lift_h,
+            hidden_at: def.hidden_at,
+            hidden_h: def.hidden_h,
+            hidden_trim: def.hidden_trim,
             note_h: f32::from(def.note_h),
             mine_h: f32::from(def.mine_h),
             bar_h: f32::from(def.bar_h),
@@ -382,6 +440,7 @@ impl Lanes {
                 line: p.line.map(&image),
                 cover: p.cover.map(&image),
                 lift: p.lift.map(&image),
+                hidden: p.hidden.map(&image),
             },
         }
     }
@@ -599,13 +658,16 @@ struct Covers {
     line_y: f64,
     /// How far the cover's lower edge moves down from its anchor.
     cover_px: f64,
+    /// How far the hidden cover rises by its own share, above the lift.
+    hidden_px: f64,
     /// The scroll's length: from the uncovered top to the line.
     span: f64,
 }
 
 impl Lanes {
     /// Draws the lanes into `out`: the bar lines, the judgment line, every
-    /// lane's notes, the cover, then the lift cover. Allocates nothing.
+    /// lane's notes, the hidden cover, the cover, then the lift cover.
+    /// Allocates nothing.
     pub(crate) fn draw(&self, d: &Draw<'_>, out: &mut QuadBatch) {
         let Some(notes) = d.play.notes() else {
             return;
@@ -642,7 +704,22 @@ impl Lanes {
             LaneStyle::Source(s) => self.source(&mut pen, notes, &scale, s, g.span, ringing_out),
         }
         // Each cover keeps its own height and slides by its share, cut to
-        // the lanes with its image.
+        // the lanes with its image. The hidden cover rises by the lift and
+        // its share and is cut off below at its trim line
+        // (`play/LaneRenderer.java:335-345`, `play/SkinHidden.java:65-90`).
+        if g.hidden_px > 0.0
+            && let Some(part) = self.parts.hidden.map(|p| d.shown(&p))
+        {
+            let upper = f32_of(f64::from(self.hidden_at) - g.lift_px - g.hidden_px);
+            let trim = match self.hidden_trim {
+                HiddenTrim::None => bottom,
+                HiddenTrim::Fixed(y) => y.min(bottom),
+                HiddenTrim::Lift(y) => f32_of(f64::from(y) - g.lift_px).min(bottom),
+            };
+            if let Some(c) = cut(sx, sw, upper, upper + self.hidden_h, top, trim) {
+                pen.push(part, &c);
+            }
+        }
         if let Some(part) = self.parts.cover.map(|p| d.shown(&p)) {
             let lower = f32_of(f64::from(self.cover_at) + g.cover_px);
             if let Some(c) = cut(sx, sw, lower - self.cover_h, lower, top, bottom) {
@@ -701,11 +778,17 @@ impl Lanes {
     /// The covers' geometry for `view`, each at most 1 000 ‰: the lift
     /// takes its share of the lane, the cover its share of what the lift
     /// leaves, and the notes scroll over what both leave, which may be
-    /// nothing (`play/LaneRenderer.java:198-213, 322-333`). The source
+    /// nothing (`play/LaneRenderer.java:198-213, 322-333`); the hidden
+    /// cover takes its share of what the lift leaves, over the notes
+    /// (`:335-345`). The source
     /// style's lane is its region's height, the simple style's the length
     /// from the top to the line.
     fn covers(&self, view: LaneView) -> Covers {
-        let (lift, cover) = (view.lift.min(1_000), view.cover.min(1_000));
+        let (lift, cover, hidden) = (
+            view.lift.min(1_000),
+            view.cover.min(1_000),
+            view.hidden.min(1_000),
+        );
         let (len, line) = match self.style {
             LaneStyle::Simple => (f64::from(self.line - self.top), f64::from(self.line)),
             LaneStyle::Source(s) => (f64::from(s.height), f64::from(s.bottom)),
@@ -717,6 +800,7 @@ impl Lanes {
             lift_px,
             line_y: line - lift_px,
             cover_px: left - span,
+            hidden_px: left * f64::from(hidden) / 1_000.0,
             span,
         }
     }
