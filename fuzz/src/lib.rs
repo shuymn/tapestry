@@ -402,6 +402,7 @@ pub fn draw(imported: &Imported) -> Vec<usize> {
                 lift,
                 hidden,
             },
+            loading: None,
             playing: true,
         };
         skin.build(&mut play, &frame, &uvs, &mut batch);
