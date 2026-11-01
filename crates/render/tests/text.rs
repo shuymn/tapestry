@@ -15,7 +15,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use render::text::{Fonts, MenuText, TextBlock, TextStyle, fonts_dir};
-use render::{AdapterChoice, Renderer, Target, text_screen};
+use render::{AdapterChoice, Blend, Renderer, Sprite, Target, solid_uv, text_screen};
 use sha2::{Digest as _, Sha256};
 
 /// The font file the expected image is drawn with, and its SHA-256.
@@ -153,12 +153,12 @@ fn assert_matches_expected(name: &str, rgb: &[u8]) {
     }
 }
 
-#[test]
-fn japanese_title_renders_on_warp() {
+/// The pinned font, checked by its hash, and a WARP renderer at 1/3 scale.
+fn text_fixture() -> (Fonts, Renderer) {
     let path = fonts_dir().join(PINNED_FONT);
     let data = pinned_font(&path, PINNED_SHA256).unwrap_or_else(|e| panic!("{e}"));
-    let mut fonts = Fonts::from_data(data, "Yu Gothic UI").unwrap();
-    let mut r = Renderer::new(
+    let fonts = Fonts::from_data(data, "Yu Gothic UI").unwrap();
+    let r = Renderer::new(
         Target::Offscreen {
             width: WIDTH,
             height: HEIGHT,
@@ -167,6 +167,70 @@ fn japanese_title_renders_on_warp() {
     )
     .expect("WARP renderer");
     assert_eq!(r.gpu().adapter().name, common::WARP);
+    (fonts, r)
+}
+
+/// Translucent menu text over a sprite composites its straight colour once:
+/// no glyph pixel leaves the range between the background and the text's
+/// full-coverage colour, and the full-coverage pixels are that colour.
+///
+/// The background sprite is (0.2, 0.4, 0.6), stored as (51, 102, 153). The
+/// text is (255, 200, 64) at alpha 128, a = 128/255 = 0.50196, so where a
+/// glyph covers a pixel wholly it is text × a + background × (1 − a):
+/// R 128.00 + 25.40 = 153.4, G 100.39 + 50.80 = 151.2, B 32.13 + 76.20 =
+/// 108.3, so (153, 151, 108). Text whose colour were premultiplied before
+/// glyphon blends it would come out darker, (90, 101, 92).
+#[test]
+fn translucent_text_composites_its_colour_once() {
+    const BACKGROUND: [u8; 3] = [51, 102, 153];
+    const COVERED: [u8; 3] = [153, 151, 108];
+    let (mut fonts, mut r) = text_fixture();
+    // A filled square about 60 target pixels on a side.
+    let square = TextBlock::new(
+        &mut fonts,
+        "■",
+        TextStyle {
+            left: 60.0,
+            top: 40.0,
+            size: 240.0,
+            color: [255, 200, 64, 128],
+        },
+    );
+    let mut text = MenuText::new(&r);
+    text.prepare(&r, &mut fonts, &[&square]).unwrap();
+    r.menu_frame(
+        |b| {
+            b.push(
+                Blend::Alpha,
+                Sprite {
+                    rect: [0.0, 0.0, 1920.0, 1080.0],
+                    uv: solid_uv(),
+                    color: [0.2, 0.4, 0.6, 1.0],
+                    ..Sprite::default()
+                },
+            );
+        },
+        &text,
+    )
+    .unwrap();
+    let pixels = r.read_back();
+    let mut covered = 0;
+    for (i, p) in pixels.as_chunks::<4>().0.iter().enumerate() {
+        for ((&v, bg), full) in p[..3].iter().zip(BACKGROUND).zip(COVERED) {
+            let (lo, hi) = (bg.min(full), bg.max(full));
+            assert!(
+                (lo.saturating_sub(2)..=hi.saturating_add(2)).contains(&v),
+                "pixel {i} is {p:?}, outside {BACKGROUND:?}..{COVERED:?}"
+            );
+        }
+        covered += usize::from(p[..3].iter().zip(COVERED).all(|(&a, b)| a.abs_diff(b) <= 2));
+    }
+    assert!(covered > 1_000, "{covered} wholly covered pixels");
+}
+
+#[test]
+fn japanese_title_renders_on_warp() {
+    let (mut fonts, mut r) = text_fixture();
 
     // A title over the bitmap font's sprites, which it must cover: the
     // text pass comes after the sprite pass.

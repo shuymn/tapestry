@@ -1,7 +1,8 @@
 //! The play screen (design.md "Rendering and Skins"): wgpu on DX12 with one
-//! instanced sprite pipeline over a texture atlas, an ASCII bitmap font baked
-//! into that atlas, and the skin boundary [`PlaySkin`] with its one
-//! implementation, [`SimpleSkin`].
+//! instanced sprite pipeline per blend over a texture atlas, an ASCII bitmap
+//! font baked into that atlas, and the skin boundary [`PlaySkin`] with its
+//! one implementation, [`SimpleSkin`]. A frame's sprites are drawn in the
+//! order they were pushed, with premultiplied colour.
 //!
 //! [`Renderer`] draws into a borderless window's swap chain (FIFO, one frame
 //! of latency, the render thread waiting on the waitable object itself) or
@@ -10,7 +11,7 @@
 //! before the countdown.
 //!
 //! The app's per-frame work, the skin's build into the preallocated
-//! [`SpriteBatch`] and its staging into instances, allocates nothing.
+//! [`SpriteBatch`] and its staging into [`Instance`]s, allocates nothing.
 //!
 //! Menu screens draw Japanese text with [`text`] and
 //! [`Renderer::menu_frame`], which the play screen never calls.
@@ -39,4 +40,4 @@ pub use simple::{
     text_screen,
 };
 pub use skin::{FrameInput, PlaySkin, SkinError};
-pub use sprite::{Blend, Sprite, SpriteBatch};
+pub use sprite::{Blend, FLAG_NEAREST, Instance, Run, Sprite, SpriteBatch};

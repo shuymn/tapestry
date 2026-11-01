@@ -655,6 +655,7 @@ fn rect(out: &mut SpriteBatch, blend: Blend, x: f32, y: f32, w: f32, h: f32, c: 
             rect: [x, y, w, h],
             uv: solid_uv(),
             color: c,
+            ..Sprite::default()
         },
     )
 }
@@ -680,6 +681,7 @@ fn text(out: &mut SpriteBatch, x: f32, y: f32, scale: f32, color: Rgba, s: &[u8]
                 ],
                 uv: glyph_uv(c),
                 color,
+                ..Sprite::default()
             },
         );
     }
@@ -1057,8 +1059,7 @@ mod tests {
     fn in_lane(batch: &SpriteBatch, lane: Lane, color: Rgba) -> Vec<[f32; 4]> {
         let (x, _) = layout::lane_x(lane);
         batch
-            .alpha()
-            .iter()
+            .blended(Blend::Alpha)
             .filter(|s| s.rect[0] == x && s.color == color)
             .map(|s| s.rect)
             .collect()
@@ -1284,8 +1285,7 @@ mod tests {
         let mut s = skin(&chart);
         let bombs = |batch: &SpriteBatch| {
             batch
-                .additive()
-                .iter()
+                .blended(Blend::Additive)
                 .filter(|s| s.color[..3] == BOMB[..3])
                 .count()
         };
@@ -1627,8 +1627,7 @@ mod tests {
             vec![y(5), y(2)],
         );
         let bars: Vec<[f32; 4]> = batch
-            .alpha()
-            .iter()
+            .blended(Blend::Alpha)
             .filter(|s| s.color == BAR_LINE && s.rect[3] == BAR_LINE_H)
             .map(|s| s.rect)
             .collect();
@@ -1656,8 +1655,7 @@ mod tests {
         };
         let batch = build(&mut s, &f);
         let ys: Vec<f32> = batch
-            .alpha()
-            .iter()
+            .blended(Blend::Alpha)
             .filter(|s| s.color == BAR_LINE && s.rect[3] == BAR_LINE_H)
             .map(|s| s.rect[1])
             .collect();
@@ -1805,7 +1803,7 @@ mod tests {
         let batch = build(&mut s, &frame(&v, 700 * MS, &[stray]));
         assert_eq!(in_lane(&batch, lane(5), NOTE_WHITE).len(), 1);
         // No gauge at index 0: only the bar's background.
-        assert!(batch.alpha().iter().all(|s| s.color != GAUGE_FILL));
+        assert!(batch.blended(Blend::Alpha).all(|s| s.color != GAUGE_FILL));
         v.gauges.push(GaugeState {
             value: GaugeValue(GaugeValue::PERCENT * 40),
             reference: GaugeValue(GaugeValue::PERCENT * 41),
@@ -1813,8 +1811,7 @@ mod tests {
         });
         let batch = build(&mut s, &frame(&v, 700 * MS, &[]));
         let fill: Vec<_> = batch
-            .alpha()
-            .iter()
+            .blended(Blend::Alpha)
             .filter(|s| s.color == GAUGE_FILL && s.uv == solid_uv())
             .map(|s| s.rect)
             .collect();
@@ -1855,15 +1852,13 @@ mod tests {
         let batch = build(&mut s, &f);
         let (x, _) = layout::lane_x(lane(6));
         let beam: Vec<f32> = batch
-            .additive()
-            .iter()
+            .blended(Blend::Additive)
             .filter(|s| s.rect[0] == x && s.color[..3] == BEAM[..3])
             .map(|s| s.color[3])
             .collect();
         assert_eq!(beam, [BEAM[3]]);
         let bombs: Vec<f32> = batch
-            .additive()
-            .iter()
+            .blended(Blend::Additive)
             .filter(|s| s.color[..3] == BOMB[..3])
             .map(|s| s.rect[2])
             .collect();
@@ -1878,8 +1873,7 @@ mod tests {
     /// The glyphs drawn in `color`, in drawing order.
     fn glyphs(batch: &SpriteBatch, color: Rgba) -> Vec<[f32; 4]> {
         batch
-            .alpha()
-            .iter()
+            .blended(Blend::Alpha)
             .filter(|s| s.color == color)
             .map(|s| s.uv)
             .collect()
@@ -1917,8 +1911,8 @@ mod tests {
         let mut s = skin(&chart);
         let mut batch = SpriteBatch::with_capacity(4096);
         s.build_loading(&mut batch);
-        assert!(batch.alpha().iter().any(|s| s.color == JUDGE_LINE));
-        assert!(batch.alpha().iter().any(|s| s.color == LANE_BG));
+        assert!(batch.blended(Blend::Alpha).any(|s| s.color == JUDGE_LINE));
+        assert!(batch.blended(Blend::Alpha).any(|s| s.color == LANE_BG));
         assert!(in_lane(&batch, lane(3), NOTE_WHITE).is_empty());
         assert!(in_lane(&batch, lane(3), NOTE_BLUE).is_empty());
         assert!(glyphs(&batch, COUNTDOWN).is_empty());
@@ -1933,7 +1927,10 @@ mod tests {
     fn text_screen_draws_lines_down_to_the_layout_bottom() {
         let mut batch = SpriteBatch::with_capacity(256);
         text_screen(&["AB", "C"], &mut batch);
-        let rects: Vec<_> = batch.alpha().iter().map(|s| (s.rect, s.uv)).collect();
+        let rects: Vec<_> = batch
+            .blended(Blend::Alpha)
+            .map(|s| (s.rect, s.uv))
+            .collect();
         // 4 px per texel: glyphs 20 × 28, advancing 24.
         assert_eq!(
             rects,
@@ -1947,7 +1944,7 @@ mod tests {
         let lines = ["Z"; 30];
         let mut batch = SpriteBatch::with_capacity(256);
         text_screen(&lines, &mut batch);
-        let ys: Vec<f32> = batch.alpha().iter().map(|s| s.rect[1]).collect();
+        let ys: Vec<f32> = batch.blended(Blend::Alpha).map(|s| s.rect[1]).collect();
         assert_eq!(ys.len(), 25);
         assert_eq!(ys[24], 1040.0);
     }
@@ -1964,7 +1961,7 @@ mod tests {
             ..frame(&v, 0, &[])
         };
         let batch = build(&mut s, &f);
-        let added: Vec<_> = batch.alpha()[plain.alpha().len()..]
+        let added: Vec<_> = batch.sprites()[plain.len()..]
             .iter()
             .map(|s| (s.rect, s.uv))
             .collect();
@@ -2023,8 +2020,7 @@ mod tests {
     /// band, narrower than a column or a column wide.
     fn trace_rects(batch: &SpriteBatch) -> Vec<Sprite> {
         batch
-            .alpha()
-            .iter()
+            .blended(Blend::Alpha)
             .filter(|s| {
                 let [x, y, w, h] = s.rect;
                 (GRAPH_LEFT..GRAPH_LEFT + 288.0 * GRAPH_COLUMN_W).contains(&x)
@@ -2086,16 +2082,14 @@ mod tests {
         result_graphs(&g, &mut batch);
         let tall = |color: Rgba, x: f32| {
             batch
-                .alpha()
-                .iter()
+                .blended(Blend::Alpha)
                 .any(|s| s.color == color && s.rect[0] == x && s.rect[3] == BAND_H)
         };
         assert!(tall(FAILED, GRAPH_LEFT + 40.0 * GRAPH_COLUMN_W));
         assert!(tall(NO_INPUT, GRAPH_LEFT + 250.0 * GRAPH_COLUMN_W));
         let bars = |batch: &SpriteBatch| {
             batch
-                .alpha()
-                .iter()
+                .blended(Blend::Alpha)
                 .filter(|s| s.color == EARLY || s.color == LATE)
                 .map(|s| s.rect)
                 .collect::<Vec<_>>()
@@ -2141,8 +2135,7 @@ mod tests {
         result_screen(&lines, Some(&g), &mut batch);
         assert_eq!(batch.dropped(), 0);
         let glyphs = batch
-            .alpha()
-            .iter()
+            .blended(Blend::Alpha)
             .filter(|s| s.uv == glyph_uv(b'W'))
             .collect::<Vec<_>>();
         assert_eq!(glyphs.len(), 27 * 76);

@@ -1,5 +1,8 @@
 //! The simple skin drawn on WARP and read back: notes sit where the scroll
-//! map, the hi-speed visible time and the display latency offset put them.
+//! map, the hi-speed visible time and the display latency offset put them,
+//! and its feedback fades with its colour composited once. Sprites are drawn
+//! in push order whatever their blends, premultiplied, turned about their
+//! pivots.
 //!
 //! Expected rows are worked out by hand from the layout: the lane runs from
 //! y = 80 to the judgment line at y = 880 (800 px), a note is 16 px tall
@@ -13,10 +16,11 @@
 
 mod common;
 
-use bms_model::{Chart, ChartBuilder, TimeUs};
+use bms_model::{Chart, ChartBuilder, SoundId, TimeUs};
 use common::{MS, input, lane, note_center, view, warp, white_rows};
 use eval::{JudgeEvent, JudgeEventKind};
-use render::Renderer;
+use render::text::MenuText;
+use render::{Blend, Renderer, Sprite, SpriteBatch};
 use rules::Judgment;
 
 const LANE_7: u32 = 448;
@@ -303,4 +307,160 @@ fn offscreen_pacing_indicator() {
         read.as_millis()
     );
     assert!(!r.read_back().is_empty());
+}
+
+/// A 960×540 target: the layout at 1/2 scale, no letterbox, so layout pixel
+/// (x, y) is target pixel (x/2, y/2).
+const HALF_W: u32 = 960;
+const HALF_H: u32 = 540;
+
+/// The sprites `push` pushes, drawn on WARP into the half-scale target,
+/// read back.
+fn sprites_frame(push: impl FnOnce(&mut SpriteBatch)) -> Vec<u8> {
+    let mut r = Renderer::new(
+        render::Target::Offscreen {
+            width: HALF_W,
+            height: HALF_H,
+        },
+        render::AdapterChoice::Warp,
+    )
+    .expect("WARP renderer");
+    let text = MenuText::new(&r);
+    let timing = r.menu_frame(push, &text).unwrap();
+    assert!(timing.presented);
+    assert_eq!(timing.dropped, 0);
+    r.read_back()
+}
+
+/// A solid sprite over `rect`, in layout pixels.
+fn solid(rect: [f32; 4], color: [f32; 4]) -> Sprite {
+    Sprite {
+        rect,
+        uv: render::solid_uv(),
+        color,
+        ..Sprite::default()
+    }
+}
+
+/// The RGB of the target pixel under layout pixel (x, y).
+fn rgb(pixels: &[u8], x: u32, y: u32) -> [u8; 3] {
+    let i = ((y / 2 * HALF_W + x / 2) * 4) as usize;
+    [pixels[i], pixels[i + 1], pixels[i + 2]]
+}
+
+/// `got` is `want` within 2 per channel, the GPU's rounding.
+#[track_caller]
+fn assert_rgb(got: [u8; 3], want: [u8; 3]) {
+    assert!(
+        got.iter().zip(want).all(|(&g, w)| g.abs_diff(w) <= 2),
+        "{got:?}, expected {want:?}"
+    );
+}
+
+#[test]
+fn alpha_pushed_after_additive_is_drawn_over_it() {
+    // An opaque grey (0.2: 51), red added over it at alpha 0.6, and an
+    // opaque blue alpha sprite pushed last over the right half. Where the
+    // blue is not, 0.6 + 0.2 = 0.8 red: (204, 51, 51). Under it, blue
+    // alone: (0, 0, 255). Drawn with every additive sprite after every
+    // alpha one, the red would be added over the blue: (153, 0, 255).
+    let pixels = sprites_frame(|b| {
+        b.push(
+            Blend::Alpha,
+            solid([100.0, 100.0, 400.0, 200.0], [0.2, 0.2, 0.2, 1.0]),
+        );
+        b.push(
+            Blend::Additive,
+            solid([100.0, 100.0, 400.0, 200.0], [1.0, 0.0, 0.0, 0.6]),
+        );
+        b.push(
+            Blend::Alpha,
+            solid([300.0, 100.0, 200.0, 200.0], [0.0, 0.0, 1.0, 1.0]),
+        );
+    });
+    assert_rgb(rgb(&pixels, 200, 200), [204, 51, 51]);
+    assert_rgb(rgb(&pixels, 400, 200), [0, 0, 255]);
+}
+
+#[test]
+fn translucent_sprite_composites_its_colour_once() {
+    // (1.0, 0.6, 0.2) at alpha 0.25, premultiplied (0.25, 0.15, 0.05), over
+    // an opaque (0.0, 0.4, 1.0) background, stored as (0, 102, 255), and
+    // over the cleared black target. Over the background: R 0.25 → 63.75,
+    // G 0.15 + 0.4 × 0.75 = 0.45 → 114.75, B 0.05 + 0.75 = 0.8 → 204, so
+    // (64, 115, 204). Over black: (64, 38, 13). Alpha applied twice would
+    // darken it to (16, 86, 194) over the background; not at all, it would
+    // be (255, 230, 242).
+    let pixels = sprites_frame(|b| {
+        b.push(
+            Blend::Alpha,
+            solid([100.0, 100.0, 200.0, 200.0], [0.0, 0.4, 1.0, 1.0]),
+        );
+        b.push(
+            Blend::Alpha,
+            solid([100.0, 100.0, 400.0, 200.0], [1.0, 0.6, 0.2, 0.25]),
+        );
+    });
+    assert_rgb(rgb(&pixels, 200, 200), [64, 115, 204]);
+    assert_rgb(rgb(&pixels, 400, 200), [64, 38, 13]);
+}
+
+#[test]
+fn rotated_sprite_turns_clockwise_about_its_pivot() {
+    // A white bar 200 × 40 from (600, 300), turned a quarter clockwise about
+    // its top left corner: it hangs down from there, x 560..600, y
+    // 300..500. Turned the other way it would stand up, x 600..640, y
+    // 100..300.
+    let pixels = sprites_frame(|b| {
+        b.push(
+            Blend::Alpha,
+            Sprite {
+                pivot: [600.0, 300.0],
+                angle: std::f32::consts::FRAC_PI_2,
+                ..solid([600.0, 300.0, 200.0, 40.0], [1.0; 4])
+            },
+        );
+    });
+    assert_rgb(rgb(&pixels, 580, 450), [255, 255, 255]);
+    assert_rgb(rgb(&pixels, 700, 320), [0, 0, 0]);
+    assert_rgb(rgb(&pixels, 620, 150), [0, 0, 0]);
+}
+
+#[test]
+fn fading_beam_adds_its_colour_once() {
+    // A press on lane 7 at 1.0 s lights its beam, (0.25, 0.3, 0.55) at
+    // alpha 0.8, fading over 100 ms, added over the lane's background,
+    // (0.04, 0.04, 0.05) stored as (10, 10, 13). Sampled at layout (672,
+    // 300), screen (448, 352):
+    // - 25 ms on, alpha 0.6, premultiplied (0.15, 0.18, 0.33): 38.25 + 10,
+    //   45.9 + 10, 84.15 + 13, so (48, 56, 97);
+    // - 75 ms on, alpha 0.2, (0.05, 0.06, 0.11): (23, 25, 41);
+    // - 100 ms on, faded: the background, (10, 10, 13).
+    // Alpha applied twice would give (33, 38, 63) at 25 ms; not at all,
+    // (74, 87, 153).
+    let chart = ChartBuilder::new(120_000)
+        .tap(lane(1), TimeUs(60_000 * MS))
+        .build()
+        .unwrap();
+    let mut r = warp(&chart);
+    let v = view(0, 0);
+    let press = JudgeEvent {
+        seq: 0,
+        time: TimeUs(1_000 * MS),
+        origin: Some(TimeUs(1_000 * MS)),
+        kind: JudgeEventKind::PlaySound {
+            lane: lane(7),
+            sound: SoundId(0),
+        },
+    };
+    let mut at = |now_ms: i64, effects: &[JudgeEvent]| {
+        r.frame(&input(&v, TimeUs(now_ms * MS), TimeUs(0), effects))
+            .unwrap();
+        let pixels = r.read_back();
+        let i = ((352 * common::WIDTH + LANE_7) * 4) as usize;
+        [pixels[i], pixels[i + 1], pixels[i + 2]]
+    };
+    assert_rgb(at(1_025, &[press]), [48, 56, 97]);
+    assert_rgb(at(1_075, &[]), [23, 25, 41]);
+    assert_rgb(at(1_100, &[]), [10, 10, 13]);
 }
