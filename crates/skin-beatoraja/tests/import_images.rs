@@ -128,10 +128,16 @@ fn group_refs_resolve_as_image_indices() {
         kind: PropertyKind::ImageIndex,
         id: Some(id),
     };
-    for id in [10, 42, 90, 170, 302, 342, 386, 469, 500, 507, 1_510] {
-        let l = group(2, &format!(r#", "ref": {id}"#));
-        assert_eq!(common::kinds(l.report()), [prop(id)], "{id}");
-        assert_eq!(l.report().usage.images, 0, "{id}");
+    // A group and an image set alike.
+    for id in [
+        10, 42, 90, 170, 302, 342, 386, 450, 459, 466, 469, 500, 507, 1_510,
+    ] {
+        let fields = format!(r#", "ref": {id}"#);
+        for l in [group(2, &fields), set(r#"["i0", "i2"]"#, &fields)] {
+            assert_eq!(common::kinds(l.report()), [prop(id)], "{id}");
+            assert_eq!(l.report().usage.images, 0, "{id}");
+            assert_eq!(l.ok().skin.choice_ref_count(), 0, "{id}");
+        }
     }
     // A `len` of 1 or less is an ordinary image whatever its `ref`.
     let l = group(1, r#", "ref": 42"#);
