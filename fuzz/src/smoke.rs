@@ -534,7 +534,7 @@ fn skin_import_seeds_import_and_draw_as_built() {
             }
             "selectors" => {
                 use skin_beatoraja::{DeviationId, PropertyKind};
-                // Each selector but the gauge's percent and no property
+                // Each selector but the perfect count and no property
                 // D4; the group past its frames never drawn; each set's
                 // undefined id ignored; 500-507 refused by their id.
                 let mut k = kinds(&i);
@@ -561,8 +561,9 @@ fn skin_import_seeds_import_and_draw_as_built() {
                 assert_eq!(u.ops, 2 * 34 + 3 * 4 + 3, "{name}");
                 assert_eq!(u.widget_quads, 0, "{name}");
                 // A normal gauge (2) is past the groups' two entries and
-                // selects the set's hole; EX 150 and the gauge's 20 % are
-                // past the sets, selecting `a`; every switch is on.
+                // selects the set's hole; EX 150 is past the sets,
+                // selecting `a`, and the perfect count 1 selects `b`; every
+                // switch is on.
                 assert_eq!(drawn, [3 + 4; 4], "{name}");
             }
             _ => panic!("no expectation for seed {name}"),

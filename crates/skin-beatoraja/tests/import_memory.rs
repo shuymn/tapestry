@@ -434,7 +434,7 @@ fn check_f6(_: &Header, i: Imported) {
 }
 
 /// F7: 16,384 destinations of one four-entry image set over two one-frame
-/// images, each repeated, chosen by the gauge's percent: each destination
+/// images, each repeated, chosen by the perfect count: each destination
 /// keeps its own table, filling the choice entries.
 fn f7(root: &Path) {
     png(root, "a.png", 2, 1);
