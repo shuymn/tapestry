@@ -776,3 +776,36 @@ fn the_play_gauge_kind_is_an_enum_only() {
         ErrorKind::NotOrdered { found: Ty::Bool }
     );
 }
+
+/// The play readouts: integers and their validity flags, as declared.
+#[test]
+fn the_play_readouts_are_integers_and_flags() {
+    use skin_model::PLAY;
+    let play = |src: &str, want: Ty| compile(src, &Scope::new(&PLAY), want);
+    for src in [
+        "bpm.current_x100 / 100 + bpm.min_x100 % 100 - bpm.max_x100 / 100",
+        "time.remaining_s / 60 + time.elapsed_s % 60",
+        "cover.permille + lift.permille + hidden.permille + cover.absolute_permille",
+        "hispeed.x100 % 100 + duration.ms / 2 + duration.green / 2",
+    ] {
+        assert!(play(src, Ty::Int).is_ok(), "{src}");
+    }
+    for src in [
+        "bpm.current_valid && bpm.range_valid",
+        "cover.enabled || lift.enabled || hidden.enabled || cover.adjusting",
+        "hispeed.valid && duration.valid",
+    ] {
+        assert!(play(src, Ty::Bool).is_ok(), "{src}");
+    }
+    assert_eq!(
+        play("duration.valid + 1", Ty::Int).unwrap_err().kind,
+        ErrorKind::NotOrdered { found: Ty::Bool }
+    );
+    assert_eq!(
+        play("hispeed.x100", Ty::Bool).unwrap_err().kind,
+        ErrorKind::Type {
+            expected: Ty::Bool,
+            found: Ty::Int
+        }
+    );
+}

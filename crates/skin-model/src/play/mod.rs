@@ -75,6 +75,69 @@ pub struct PlayContext<'a> {
     /// practice the section's end plus 1 s, scaled by the play speed
     /// (`play/BMSPlayer.java:199, 587`).
     pub last_note_end: TimeUs,
+    /// The original 1× chart's BPM range, its initial BPM included, over
+    /// its whole timeline (not narrowed to a practice section, not scaled
+    /// by the play speed), which `bpm.min_x100` and `bpm.max_x100` read;
+    /// `None` when the caller has no exact range, which hides them.
+    pub bpm_range: Option<BpmRange>,
+}
+
+/// A chart's BPM range in floored hundredths of a BPM.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BpmRange {
+    /// The lowest BPM, at most `max_x100`.
+    pub min_x100: u32,
+    /// The highest BPM, at most [`READOUT_MAX`](crate::READOUT_MAX).
+    pub max_x100: u32,
+}
+
+/// An exact nonnegative duration in ms, `numerator / denominator`; the
+/// denominator is not 0.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DurationRatio {
+    pub numerator: u128,
+    pub denominator: u128,
+}
+
+/// The player's cover settings as stored: an amount is kept while its
+/// cover is off.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CoverSettings {
+    /// The configured lane cover, in ‰ (at most 1 000).
+    pub cover: u16,
+    /// The configured lift, in ‰ (at most 1 000).
+    pub lift: u16,
+    /// The configured hidden cover, in ‰ (at most 1 000).
+    pub hidden: u16,
+    /// Whether the lane cover is on.
+    pub cover_enabled: bool,
+    /// Whether the lift is on.
+    pub lift_enabled: bool,
+    /// Whether the hidden cover is on.
+    pub hidden_enabled: bool,
+    /// Whether the cover-adjustment mode is active; not whether an amount
+    /// changed this frame.
+    pub adjusting: bool,
+}
+
+/// What one frame reports of the presentation besides the lanes'
+/// effective amounts ([`LaneView`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FrameReadouts {
+    /// The playback tempo at the display head (`now + display_offset`), in
+    /// floored hundredths of a BPM: the initial tempo before chart time 0,
+    /// the musical tempo through a STOP; `None` when unknown. 0 is a tempo
+    /// below 0.01, not a STOP.
+    pub bpm_current_x100: Option<u32>,
+    /// The scroll policy's explicit multiplicative hi-speed, in floored
+    /// hundredths; `None` when it has none (it is never solved back from
+    /// the duration).
+    pub hispeed_x100: Option<u32>,
+    /// The scroll policy's nominal current travel duration, STOP waiting
+    /// excluded and unrounded; `None` when unknown.
+    pub duration: Option<DurationRatio>,
+    /// The stored cover settings.
+    pub covers: CoverSettings,
 }
 
 /// What one frame gives the skin.
@@ -111,6 +174,10 @@ pub struct SkinFrame<'a> {
     /// chart's choice to the countdown: the `loading` timer runs and
     /// `load.percent` reads its progress; `None` once it is loaded.
     pub loading: Option<LoadState>,
+    /// The tempo, hi-speed, duration and stored covers the readouts show.
+    /// Each effective amount in `lanes` must be its stored setting while
+    /// that cover is on and 0 while it is off, else the build is refused.
+    pub readouts: FrameReadouts,
 }
 
 /// The chart's load as the play screen shows it before the countdown.
@@ -131,6 +198,12 @@ pub enum PrepareError {
     InitialGauges { expected: usize, got: usize },
     #[error("the attempt's countdown starts outside the time range")]
     Overflow,
+    #[error("the attempt's section ends before it starts")]
+    InvalidSectionRange,
+    #[error(
+        "the BPM range's minimum is above its maximum, or its maximum above the readout maximum"
+    )]
+    InvalidBpmRange,
 }
 
 /// Why [`Skin::build`](crate::Skin::build) refused a frame. The frame's
@@ -143,6 +216,13 @@ pub enum BuildError {
     /// which the evaluator never produces.
     #[error("the snapshot counts more empty POORs than POORs")]
     InconsistentTally,
+    /// A readout is out of range (a BPM or hi-speed above
+    /// [`READOUT_MAX`](crate::READOUT_MAX), a cover setting above 1 000, a
+    /// zero duration denominator, a rounded duration above
+    /// [`READOUT_MAX`](crate::READOUT_MAX)), or an effective amount in
+    /// [`SkinFrame::lanes`] is not its stored cover setting.
+    #[error("the frame's readouts are out of range or disagree with the lanes")]
+    InvalidReadouts,
 }
 
 /// One attempt's skin state: the reducer, every timer's start and reading,
@@ -153,9 +233,8 @@ pub struct Play {
     reducer: Reducer,
     /// The context's [`PlayContext::empty_poor_counted`].
     empty_poor_counted: bool,
-    /// Set by a refused build ([`BuildError`]); every later build is
-    /// refused.
-    poisoned: bool,
+    /// The error of a refused build, which every later build returns.
+    poisoned: Option<BuildError>,
     /// Per timer slot (built-in, then `when`): its start, `None` while off.
     starts: Box<[Option<TimeUs>]>,
     /// Per timer slot: elapsed ms, or [`TIMER_OFF`].
@@ -168,6 +247,11 @@ pub struct Play {
     play_at: TimeUs,
     /// The context's [`PlayContext::last_note_end`].
     last_note_end: TimeUs,
+    /// Where `time.remaining_s` counts to: the chart's last resolved
+    /// object ([`last_object`]) or the section's end.
+    readout_end: TimeUs,
+    /// The context's [`PlayContext::bpm_range`], validated.
+    bpm_range: Option<BpmRange>,
     scratch: Side,
     /// Whether a long note's release is judged on its own (CN and HCN).
     separate_end_judgment: bool,
@@ -190,6 +274,14 @@ pub(crate) struct Notes {
     pub(crate) range: [(usize, usize); LANE_COUNT],
     /// The section's start and end.
     pub(crate) section: Option<(TimeUs, TimeUs)>,
+}
+
+/// The chart's last resolved object: the latest note end (mines included)
+/// or background sound start, at least 0. A sound's tail is not an object.
+fn last_object(chart: &Chart) -> TimeUs {
+    let notes = chart.lanes.iter().flatten().map(Note::end);
+    let bgm = chart.bgm.iter().map(|b| b.time);
+    notes.chain(bgm).fold(TimeUs(0), TimeUs::max)
 }
 
 impl Play {
@@ -219,6 +311,16 @@ impl Play {
                 got: s.initial_gauges.len(),
             });
         }
+        if section.is_some_and(|s| s.end < s.start) {
+            return Err(PrepareError::InvalidSectionRange);
+        }
+        if ctx
+            .bpm_range
+            .is_some_and(|r| r.min_x100 > r.max_x100 || r.max_x100 > schema::READOUT_MAX_U32)
+        {
+            return Err(PrepareError::InvalidBpmRange);
+        }
+        let readout_end = section.map_or_else(|| last_object(chart), |s| s.end);
         let initial = ctx.gauges.iter().enumerate().map(|(i, g)| {
             let value = section
                 .and_then(|s| s.initial_gauges.get(i).copied())
@@ -255,7 +357,7 @@ impl Play {
         Ok(Self {
             reducer,
             empty_poor_counted: ctx.empty_poor_counted,
-            poisoned: false,
+            poisoned: None,
             starts: vec![None; slots].into_boxed_slice(),
             ms: vec![TIMER_OFF; slots].into_boxed_slice(),
             fields: [0; field::COUNT],
@@ -264,6 +366,8 @@ impl Play {
             ready_at,
             play_at,
             last_note_end: ctx.last_note_end,
+            readout_end,
+            bpm_range: ctx.bpm_range,
             scratch: ctx.scratch,
             // As eval decides the chart's mode (evaluator.rs, `ln_mode`):
             // a new preset mode must be placed here.
@@ -384,12 +488,29 @@ mod tests {
     use eval::{GaugeState, JudgeEvent, JudgeEventKind, Tally};
     use rules::{GaugeValue, Judgment, PerJudgment};
 
-    use super::{Attempt, GaugeDesc, PlayContext, SkinFrame};
+    use super::{Attempt, CoverSettings, FrameReadouts, GaugeDesc, PlayContext, SkinFrame};
     use crate::{
         AtlasLimits, Fit, LaneView, Layout, QuadBatch, Region, Sheet, Side, Skin, SkinDef, Variant,
     };
 
     const MS: i64 = 1_000;
+
+    /// No tempo, hi-speed or duration, every cover off at 0: the readouts
+    /// of a frame whose lanes draw no cover.
+    pub(crate) const OFF: FrameReadouts = FrameReadouts {
+        bpm_current_x100: None,
+        hispeed_x100: None,
+        duration: None,
+        covers: CoverSettings {
+            cover: 0,
+            lift: 0,
+            hidden: 0,
+            cover_enabled: false,
+            lift_enabled: false,
+            hidden_enabled: false,
+            adjusting: false,
+        },
+    };
 
     fn lane(n: u8) -> Lane {
         Lane::new(n).unwrap()
@@ -451,6 +572,7 @@ mod tests {
             scratch: Side::Left,
             ln_default: rules::LnMode::Ln,
             last_note_end: TimeUs(3_000 * MS),
+            bpm_range: None,
         };
         let mut play = skin.prepare(&chart, &ctx).unwrap();
         let zero = PerJudgment {
@@ -494,6 +616,7 @@ mod tests {
                     hidden: 0,
                 },
                 loading: None,
+                readouts: OFF,
             };
             skin.build(play, &frame, &uvs, &mut batch).unwrap();
         };
@@ -622,13 +745,14 @@ mod tests {
                 hidden: 0,
             },
             loading: None,
+            readouts: OFF,
         };
         assert_eq!(
             skin.build(&mut play, &refused, &uvs, &mut batch),
             Err(super::BuildError::InconsistentTally)
         );
         assert_eq!(play.hold_note(lane(2)), Some(0));
-        assert!(play.poisoned);
+        assert_eq!(play.poisoned, Some(super::BuildError::InconsistentTally));
     }
 
     /// The loading state: the `loading` timer runs from the load's start
@@ -673,6 +797,7 @@ mod tests {
             scratch: Side::Left,
             ln_default: rules::LnMode::Ln,
             last_note_end: TimeUs(1_000 * MS),
+            bpm_range: None,
         };
         let mut play = skin.prepare(&chart, &ctx).unwrap();
         let zero = PerJudgment {
@@ -710,6 +835,7 @@ mod tests {
                     hidden: 0,
                 },
                 loading,
+                readouts: OFF,
                 playing: false,
             };
             skin.build(play, &frame, &uvs, &mut batch).unwrap();

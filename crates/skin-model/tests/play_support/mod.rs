@@ -11,10 +11,10 @@ use eval::{GaugeState, JudgeEvent, JudgeEventKind, Tally};
 use image::{ImageFormat, Rgba, RgbaImage};
 use rules::{GaugeValue, Judgment, PerJudgment};
 use skin_model::{
-    Anchor, AtlasLimits, Attempt, Blend, BuildError, Ease, ElementDef, End, FileDef, Filter, Fit,
-    GaugeDesc, GaugeLook, ImageDef, KeyDef, LaneView, Layout, LoadError, PLAY, Place, Play,
-    PlayContext, Program, QuadBatch, Region, RegionDef, Scope, Sheet, Side, Skin, SkinDef,
-    SkinFrame, Source, TimerRef, Ty, UvTable, Variant, compile,
+    Anchor, AtlasLimits, Attempt, Blend, BuildError, CoverSettings, Ease, ElementDef, End, FileDef,
+    Filter, Fit, FrameReadouts, GaugeDesc, GaugeLook, ImageDef, KeyDef, LaneView, Layout,
+    LoadError, PLAY, Place, Play, PlayContext, Program, QuadBatch, Region, RegionDef, Scope, Sheet,
+    Side, Skin, SkinDef, SkinFrame, Source, TimerRef, Ty, UvTable, Variant, compile,
 };
 
 pub const MS: i64 = 1_000;
@@ -145,6 +145,27 @@ pub fn full(lead_in_ms: i64) -> PlayContext<'static> {
         scratch: Side::Left,
         ln_default: rules::LnMode::Ln,
         last_note_end: NO_END,
+        bpm_range: None,
+    }
+}
+
+/// The readouts of a frame showing `view`: no tempo, hi-speed or duration,
+/// and every cover chosen on, stored at the amount `view` draws (capped
+/// at 1 000), so the frame is consistent.
+pub fn readouts_for(view: LaneView) -> FrameReadouts {
+    FrameReadouts {
+        bpm_current_x100: None,
+        hispeed_x100: None,
+        duration: None,
+        covers: CoverSettings {
+            cover: view.cover.min(1_000),
+            lift: view.lift.min(1_000),
+            hidden: view.hidden.min(1_000),
+            cover_enabled: true,
+            lift_enabled: true,
+            hidden_enabled: true,
+            adjusting: false,
+        },
     }
 }
 
@@ -275,6 +296,8 @@ pub struct Harness {
     pub target: [u32; 2],
     pub layout: Layout,
     pub view: LaneView,
+    /// The frames' readouts; `None` gives [`readouts_for`] the view.
+    pub readouts: Option<FrameReadouts>,
 }
 
 impl Harness {
@@ -295,6 +318,7 @@ impl Harness {
             target: [1_920, 1_080],
             layout: Layout::AUTHOR,
             view: VIEW,
+            readouts: None,
         }
     }
 
@@ -325,6 +349,7 @@ impl Harness {
             lanes: self.view,
             loading: None,
             playing: self.playing,
+            readouts: self.readouts.unwrap_or_else(|| readouts_for(self.view)),
         };
         self.skin
             .build(&mut self.play, &frame, &self.uvs, &mut self.batch)

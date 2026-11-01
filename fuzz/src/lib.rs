@@ -291,6 +291,7 @@ pub fn draw(imported: &Imported) -> Vec<usize> {
         scratch: Side::Left,
         ln_default: rules::LnMode::Ln,
         last_note_end: TimeUs(0),
+        bpm_range: None,
     };
     let mut play = skin
         .prepare(&chart, &ctx)
@@ -361,13 +362,9 @@ pub fn draw(imported: &Imported) -> Vec<usize> {
             complete: false,
             target: [1_920, 1_080],
             layout: &Layout::AUTHOR,
-            lanes: LaneView {
-                visible_time: TimeUs(600_000),
-                cover: 0,
-                lift: 0,
-                hidden: 0,
-            },
+            lanes: LANES_OFF,
             loading: None,
+            readouts: readouts_for(LANES_OFF),
             playing: true,
         };
         skin.build(&mut play, &frame, &uvs, &mut batch)
@@ -388,6 +385,12 @@ pub fn draw(imported: &Imported) -> Vec<usize> {
         (900, 0, 0, 0),
     ] {
         batch.clear();
+        let frame_lanes = LaneView {
+            visible_time: TimeUs(600_000),
+            cover,
+            lift,
+            hidden,
+        };
         let frame = SkinFrame {
             now: TimeUs(ms * 1_000),
             display_offset: TimeUs(0),
@@ -398,13 +401,9 @@ pub fn draw(imported: &Imported) -> Vec<usize> {
             complete: false,
             target: [1_920, 1_080],
             layout: &Layout::AUTHOR,
-            lanes: LaneView {
-                visible_time: TimeUs(600_000),
-                cover,
-                lift,
-                hidden,
-            },
+            lanes: frame_lanes,
             loading: None,
+            readouts: readouts_for(frame_lanes),
             playing: true,
         };
         skin.build(&mut play, &frame, &uvs, &mut batch)
@@ -439,9 +438,7 @@ fn rate_and_kind_probes(
     use bms_model::TimeUs;
     use eval::{GaugeState, Tally};
     use rules::{GaugeValue, PerJudgment};
-    use skin_model::{
-        Attempt, GaugeDesc, GaugeLook, LaneView, Layout, PlayContext, Side, SkinFrame, field,
-    };
+    use skin_model::{Attempt, GaugeDesc, GaugeLook, Layout, PlayContext, Side, SkinFrame, field};
 
     let descs = GaugeLook::ALL.map(|look| GaugeDesc {
         start: GaugeValue(50 * GaugeValue::PERCENT),
@@ -479,6 +476,7 @@ fn rate_and_kind_probes(
             scratch: Side::Left,
             ln_default: rules::LnMode::Ln,
             last_note_end: TimeUs(0),
+            bpm_range: None,
         };
         let mut play = skin
             .prepare(chart, &ctx)
@@ -503,13 +501,9 @@ fn rate_and_kind_probes(
                 complete: false,
                 target: [1_920, 1_080],
                 layout: &Layout::AUTHOR,
-                lanes: LaneView {
-                    visible_time: TimeUs(600_000),
-                    cover: 0,
-                    lift: 0,
-                    hidden: 0,
-                },
+                lanes: LANES_OFF,
                 loading: None,
+                readouts: readouts_for(LANES_OFF),
                 playing: true,
             };
             skin.build(&mut play, &frame, uvs, batch)
@@ -543,6 +537,34 @@ fn rate_and_kind_probes(
                 "a quad off the finite plane"
             );
         }
+    }
+}
+
+/// Lanes at 600 ms with no cover.
+const LANES_OFF: skin_model::LaneView = skin_model::LaneView {
+    visible_time: bms_model::TimeUs(600_000),
+    cover: 0,
+    lift: 0,
+    hidden: 0,
+};
+
+/// The readouts of a frame showing `view`: no tempo, hi-speed or duration,
+/// every cover chosen on and stored at the amount `view` draws (capped at
+/// 1 000), so the frame is consistent.
+fn readouts_for(view: skin_model::LaneView) -> skin_model::FrameReadouts {
+    skin_model::FrameReadouts {
+        bpm_current_x100: None,
+        hispeed_x100: None,
+        duration: None,
+        covers: skin_model::CoverSettings {
+            cover: view.cover.min(1_000),
+            lift: view.lift.min(1_000),
+            hidden: view.hidden.min(1_000),
+            cover_enabled: true,
+            lift_enabled: true,
+            hidden_enabled: true,
+            adjusting: false,
+        },
     }
 }
 

@@ -11,8 +11,9 @@ use play_support::{
 };
 use rules::{GaugeValue, Judgment};
 use skin_model::{
-    Attempt, Blend, ClipId, Ease, ElementDef, End, ErrorKind, Export, KeyDef, LoadError,
-    MAX_ELEMENTS, MAX_OPS, MAX_SKIN_KEYS, MAX_WHEN_TIMERS, PLAY, PlayContext, PrepareError, Prop,
+    Attempt, Blend, BpmRange, ClipId, CoverSettings, DurationRatio, Ease, ElementDef, End,
+    ErrorKind, Export, FrameReadouts, GREEN_MAX, KeyDef, LaneView, LoadError, MAX_ELEMENTS,
+    MAX_OPS, MAX_SKIN_KEYS, MAX_WHEN_TIMERS, PLAY, PlayContext, PrepareError, Prop, READOUT_MAX,
     Schema, Scope, Side, TIMER_OFF, TimerDef, TimerRef, Track, Ty, compile, field, timer,
 };
 
@@ -46,6 +47,7 @@ fn in_section(s: &Section) -> PlayContext<'_> {
         scratch: Side::Left,
         ln_default: rules::LnMode::Ln,
         last_note_end: TimeUs(0),
+        bpm_range: None,
     }
 }
 
@@ -405,6 +407,7 @@ fn targets_match_the_evaluators() {
         scratch: Side::Left,
         ln_default: rules::LnMode::Ln,
         last_note_end: TimeUs(0),
+        bpm_range: None,
     };
     let section_ctx = PlayContext {
         attempt: Attempt::Section(&edge),
@@ -928,6 +931,7 @@ fn an_inconsistent_snapshot_poisons_the_play() {
             layout: &layout,
             lanes: h.view,
             loading: None,
+            readouts: play_support::readouts_for(h.view),
         };
         // Not cleared: a refused build appends nothing.
         h.skin.build(&mut h.play, &f, &h.uvs, &mut h.batch)
@@ -958,4 +962,507 @@ fn an_inconsistent_snapshot_poisons_the_play() {
     assert_eq!(frame(&mut h, 1_200, &[]), Ok(()));
     assert_eq!(h.batch.quads().len(), 1);
     assert_eq!(rates(&h), (10_000, 10_000));
+}
+
+// ---- Play readouts (stage3.md R3, R4, R6) ----
+
+/// Every cover off at 0.
+const COVERS_OFF: CoverSettings = CoverSettings {
+    cover: 0,
+    lift: 0,
+    hidden: 0,
+    cover_enabled: false,
+    lift_enabled: false,
+    hidden_enabled: false,
+    adjusting: false,
+};
+
+/// Nothing known, every cover off at 0.
+const UNKNOWN: FrameReadouts = FrameReadouts {
+    bpm_current_x100: None,
+    hispeed_x100: None,
+    duration: None,
+    covers: COVERS_OFF,
+};
+
+fn ratio(numerator: u128, denominator: u128) -> Option<DurationRatio> {
+    Some(DurationRatio {
+        numerator,
+        denominator,
+    })
+}
+
+/// The readout fields, `bpm.current_x100` to `duration.valid`.
+fn readout_fields(h: &Harness) -> Vec<i32> {
+    let fields = h.play.state().fields;
+    fields[usize::from(field::BPM_CURRENT_X100)..=usize::from(field::DURATION_VALID)].to_vec()
+}
+
+/// `time.remaining_s` and `time.elapsed_s`.
+fn clocks(h: &Harness) -> (i32, i32) {
+    (
+        h.field(field::TIME_REMAINING_S),
+        h.field(field::TIME_ELAPSED_S),
+    )
+}
+
+/// The remaining time counts to the last resolved object: a background
+/// sound's start past the last note, a mine's time, a long note's end;
+/// completion changes nothing.
+#[test]
+fn the_remaining_time_counts_to_the_last_object() {
+    let chart = ChartBuilder::new(BPM_150)
+        .sound("bgm.wav")
+        .tap(lane(1), TimeUs(10_000 * MS))
+        .bgm(TimeUs(17_000 * MS), bms_model::SoundId(0))
+        .build()
+        .unwrap();
+    let mut h = Harness::empty(&chart, &full(0));
+    h.readouts = Some(UNKNOWN);
+    h.frame(0, &[]);
+    assert_eq!(clocks(&h), (17, 0));
+    h.frame(10_500, &[]);
+    assert_eq!(clocks(&h), (7, 10));
+    h.complete = true;
+    h.frame(16_000, &[]);
+    assert_eq!(clocks(&h), (1, 16));
+    // Past the end: none remains, and the elapsed time goes on.
+    h.frame(30_000, &[]);
+    assert_eq!(clocks(&h), (0, 30));
+    for (chart, end_s) in [
+        (
+            ChartBuilder::new(BPM_150)
+                .tap(lane(1), TimeUs(3_000 * MS))
+                .mine(lane(2), TimeUs(9_000 * MS), 10)
+                .build()
+                .unwrap(),
+            9,
+        ),
+        (
+            ChartBuilder::new(BPM_150)
+                .long(lane(2), TimeUs(1_000 * MS), TimeUs(12_000 * MS))
+                .tap(lane(1), TimeUs(5_000 * MS))
+                .build()
+                .unwrap(),
+            12,
+        ),
+        (ChartBuilder::new(BPM_150).build().unwrap(), 0),
+    ] {
+        let mut h = Harness::empty(&chart, &full(0));
+        h.frame(0, &[]);
+        assert_eq!(clocks(&h), (end_s, 0));
+    }
+}
+
+/// Whole remaining seconds round up, elapsed ones down; at the end none
+/// remains.
+#[test]
+fn the_clocks_round_at_whole_seconds() {
+    let chart = taps(&[17_000]);
+    let mut h = Harness::empty(&chart, &full(0));
+    let end = 17_000 * MS;
+    for (left_us, want) in [(0, 0), (1, 1), (999_999, 1), (1_000_000, 1), (1_000_001, 2)] {
+        h.frame_us(end - left_us, &[]);
+        assert_eq!(h.field(field::TIME_REMAINING_S), want, "{left_us} µs left");
+    }
+    for (now_us, want) in [(999_999, 0), (1_000_000, 1), (1_999_999, 1)] {
+        h.frame_us(now_us, &[]);
+        assert_eq!(h.field(field::TIME_ELAPSED_S), want, "{now_us} µs");
+    }
+}
+
+/// The countdown freezes both clocks at the attempt's start, the display
+/// offset never moves them, and a section counts its own real-time length
+/// from its mapped start to its mapped end, reset per round.
+#[test]
+fn the_clocks_follow_the_attempt_not_the_display() {
+    let chart = practice_chart();
+    let mut h = Harness::empty(&chart, &full(3_000));
+    h.frame(-2_000, &[]);
+    assert_eq!(clocks(&h), (25, 0));
+    h.offset = TimeUs(-400 * MS);
+    h.frame(2_000, &[]);
+    assert_eq!(clocks(&h), (23, 2));
+    // [10 s, 20 s) at 50 % is [20 s, 40 s) in real time.
+    let s = section(20_000, 40_000, 2_000);
+    for _round in 0..2 {
+        h.play = h.skin.prepare(&chart, &in_section(&s)).unwrap();
+        h.offset = TimeUs(0);
+        h.frame(18_500, &[]);
+        assert_eq!(clocks(&h), (20, 0));
+        h.offset = TimeUs(700 * MS);
+        h.frame(20_000, &[]);
+        assert_eq!(clocks(&h), (20, 0));
+        h.frame(29_500, &[]);
+        assert_eq!(clocks(&h), (11, 9));
+        h.frame(45_000, &[]);
+        assert_eq!(clocks(&h), (0, 25));
+    }
+    // An empty section, its end at its start, has nothing left.
+    let empty = section(5_000, 5_000, 0);
+    h.play = h.skin.prepare(&chart, &in_section(&empty)).unwrap();
+    h.frame(5_000, &[]);
+    assert_eq!(clocks(&h), (0, 0));
+}
+
+/// A section ending before its start, or a BPM range out of order or
+/// past the readout maximum, is refused after the existing checks.
+#[test]
+fn prepare_refuses_inverted_ranges() {
+    let chart = taps(&[1_000]);
+    let skin = load(Vec::new(), Vec::new()).unwrap();
+    let inverted = section(5_000, 4_999, 0);
+    assert_eq!(
+        skin.prepare(&chart, &in_section(&inverted)).err(),
+        Some(PrepareError::InvalidSectionRange)
+    );
+    // The lead-in check comes first.
+    let both = section(5_000, 4_999, -1);
+    assert_eq!(
+        skin.prepare(&chart, &in_section(&both)).err(),
+        Some(PrepareError::NegativeLeadIn)
+    );
+    let top = READOUT_MAX.unsigned_abs();
+    let with = |min_x100, max_x100| PlayContext {
+        bpm_range: Some(BpmRange { min_x100, max_x100 }),
+        ..full(0)
+    };
+    for (min, max, ok) in [
+        (15_000, 15_000, true),
+        (0, top, true),
+        (15_001, 15_000, false),
+        (0, top + 1, false),
+        (top + 1, top + 1, false),
+    ] {
+        let got = skin.prepare(&chart, &with(min, max)).err();
+        let want = (!ok).then_some(PrepareError::InvalidBpmRange);
+        assert_eq!(got, want, "{min}..{max}");
+    }
+    // The section's order is checked before the range's.
+    let ctx = PlayContext {
+        bpm_range: Some(BpmRange {
+            min_x100: 2,
+            max_x100: 1,
+        }),
+        ..in_section(&inverted)
+    };
+    assert_eq!(
+        skin.prepare(&chart, &ctx).err(),
+        Some(PrepareError::InvalidSectionRange)
+    );
+}
+
+/// Supplied values show as given from the first frame, missing ones read
+/// 0 and invalid, a present 0 stays valid, and they change without any
+/// effect, a STOP included.
+#[test]
+fn readouts_show_what_the_frame_supplies() {
+    let chart = ChartBuilder::new(BPM_150)
+        .tap(lane(1), TimeUs(1_000 * MS))
+        .stop(TimeUs(2_000 * MS), TimeUs(1_000 * MS))
+        .build()
+        .unwrap();
+    let ctx = PlayContext {
+        bpm_range: Some(BpmRange {
+            min_x100: 7_500,
+            max_x100: 30_000,
+        }),
+        ..full(0)
+    };
+    let mut h = Harness::empty(&chart, &ctx);
+    // The 600 ms visible duration at the initial tempo: green 360.
+    h.readouts = Some(FrameReadouts {
+        bpm_current_x100: Some(15_000),
+        hispeed_x100: Some(105),
+        duration: ratio(600, 1),
+        covers: COVERS_OFF,
+    });
+    h.frame(0, &[]);
+    #[rustfmt::skip]
+    assert_eq!(
+        readout_fields(&h),
+        [15_000, 7_500, 30_000, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 105, 1, 600, 360, 1]
+    );
+    // Within the STOP the tempo and duration stay as supplied; a change
+    // within it shows at once.
+    h.readouts = Some(FrameReadouts {
+        bpm_current_x100: Some(0),
+        hispeed_x100: Some(0),
+        duration: ratio(0, 1),
+        covers: COVERS_OFF,
+    });
+    h.frame(2_500, &[]);
+    assert_eq!(h.field(field::BPM_CURRENT_X100), 0);
+    assert_eq!(h.field(field::BPM_CURRENT_VALID), 1);
+    assert_eq!(h.field(field::HISPEED_VALID), 1);
+    assert_eq!(h.field(field::DURATION_VALID), 1);
+    // A duration without a hi-speed: the hi-speed is invalid.
+    h.readouts = Some(FrameReadouts {
+        hispeed_x100: None,
+        duration: ratio(6_675, 10),
+        ..UNKNOWN
+    });
+    h.frame(2_600, &[]);
+    assert_eq!(h.field(field::HISPEED_X100), 0);
+    assert_eq!(h.field(field::HISPEED_VALID), 0);
+    assert_eq!(h.field(field::BPM_CURRENT_VALID), 0);
+    assert_eq!(
+        (
+            h.field(field::DURATION_MS),
+            h.field(field::DURATION_GREEN),
+            h.field(field::DURATION_VALID)
+        ),
+        (668, 400, 1)
+    );
+    // Without a range, both bounds read 0 and invalid; the helper's
+    // covers are on at 0.
+    let mut h = Harness::empty(&chart, &full(0));
+    h.frame(0, &[]);
+    #[rustfmt::skip]
+    assert_eq!(
+        readout_fields(&h),
+        [0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0, 0]
+    );
+}
+
+/// The duration rounds half up exactly before the green number takes
+/// three fifths of it; the largest rounded duration is accepted.
+#[test]
+fn the_duration_rounds_half_up_before_the_green_number() {
+    let chart = taps(&[1_000]);
+    let mut h = Harness::empty(&chart, &full(0));
+    let top = READOUT_MAX.unsigned_abs();
+    for (n, d, ms, green) in [
+        (6_675, 10, 668, 400),
+        (6_674_999, 10_000, 667, 400),
+        (3, 2, 2, 1),
+        (4, 3, 1, 0),
+        (5, 3, 2, 1),
+        (u128::MAX, u128::MAX, 1, 0),
+        (1, u128::MAX, 0, 0),
+        (u128::MAX / 2, u128::MAX, 0, 0),
+        (u128::MAX / 2 + 1, u128::MAX, 1, 0),
+        (u128::from(top) * 2 - 1, 2, READOUT_MAX, GREEN_MAX),
+    ] {
+        h.readouts = Some(FrameReadouts {
+            duration: ratio(n, d),
+            ..UNKNOWN
+        });
+        h.frame(0, &[]);
+        assert_eq!(
+            (h.field(field::DURATION_MS), h.field(field::DURATION_GREEN)),
+            (ms, green),
+            "{n}/{d}"
+        );
+    }
+}
+
+/// Configured amounts show as stored whatever their switches, the
+/// absolute cover from the stored amounts; a switch on at 0 reads on.
+#[test]
+fn configured_covers_show_as_stored() {
+    let chart = taps(&[1_000]);
+    let mut h = Harness::empty(&chart, &full(0));
+    let covers = |h: &Harness| {
+        [
+            field::COVER_PERMILLE,
+            field::LIFT_PERMILLE,
+            field::HIDDEN_PERMILLE,
+            field::COVER_ABSOLUTE_PERMILLE,
+            field::COVER_ENABLED,
+            field::LIFT_ENABLED,
+            field::HIDDEN_ENABLED,
+            field::COVER_ADJUSTING,
+        ]
+        .map(|f| h.field(f))
+    };
+    // Both off, the lanes drawing none of them.
+    h.readouts = Some(FrameReadouts {
+        covers: CoverSettings {
+            cover: 500,
+            lift: 250,
+            ..COVERS_OFF
+        },
+        ..UNKNOWN
+    });
+    h.frame(0, &[]);
+    assert_eq!(covers(&h), [500, 250, 0, 375, 0, 0, 0, 0]);
+    // On at 0, and the adjustment mode.
+    h.readouts = Some(FrameReadouts {
+        covers: CoverSettings {
+            hidden_enabled: true,
+            adjusting: true,
+            ..COVERS_OFF
+        },
+        ..UNKNOWN
+    });
+    h.frame(16, &[]);
+    assert_eq!(covers(&h), [0, 0, 0, 0, 0, 0, 1, 1]);
+    // Everything full: the absolute cover is 0 under a full lift.
+    h.view = LaneView {
+        cover: 1_000,
+        lift: 1_000,
+        hidden: 1_000,
+        ..h.view
+    };
+    h.readouts = None;
+    h.frame(32, &[]);
+    assert_eq!(covers(&h), [1_000, 1_000, 1_000, 0, 1, 1, 1, 0]);
+    // A lanes amount past 1 000 draws as 1 000, so it matches.
+    h.view = LaneView {
+        cover: 1_500,
+        lift: 0,
+        hidden: 0,
+        ..h.view
+    };
+    h.readouts = Some(FrameReadouts {
+        covers: CoverSettings {
+            cover: 1_000,
+            cover_enabled: true,
+            ..COVERS_OFF
+        },
+        ..UNKNOWN
+    });
+    h.frame(48, &[]);
+    assert_eq!(covers(&h), [1_000, 0, 0, 1_000, 1, 0, 0, 0]);
+}
+
+/// Each invalid readout, and each stored setting that is not what the
+/// lanes draw.
+fn invalid_readouts() -> Vec<(FrameReadouts, LaneView)> {
+    let top = READOUT_MAX.unsigned_abs();
+    let on = |cover, lift, hidden| CoverSettings {
+        cover,
+        lift,
+        hidden,
+        cover_enabled: true,
+        lift_enabled: true,
+        hidden_enabled: true,
+        adjusting: false,
+    };
+    let stored = |cover, lift, hidden| CoverSettings {
+        cover,
+        lift,
+        hidden,
+        ..COVERS_OFF
+    };
+    let view = |cover, lift, hidden| LaneView {
+        cover,
+        lift,
+        hidden,
+        ..play_support::VIEW
+    };
+    let none = view(0, 0, 0);
+    let with = |covers| FrameReadouts { covers, ..UNKNOWN };
+    vec![
+        (
+            FrameReadouts {
+                bpm_current_x100: Some(top + 1),
+                ..UNKNOWN
+            },
+            none,
+        ),
+        (
+            FrameReadouts {
+                hispeed_x100: Some(top + 1),
+                ..UNKNOWN
+            },
+            none,
+        ),
+        (
+            FrameReadouts {
+                duration: ratio(1, 0),
+                ..UNKNOWN
+            },
+            none,
+        ),
+        (
+            FrameReadouts {
+                duration: ratio(u128::from(top) * 2 + 1, 2),
+                ..UNKNOWN
+            },
+            none,
+        ),
+        (
+            FrameReadouts {
+                duration: ratio(u128::MAX, 1),
+                ..UNKNOWN
+            },
+            none,
+        ),
+        (with(stored(1_001, 0, 0)), none),
+        (with(stored(0, 1_001, 0)), none),
+        (with(stored(0, 0, 1_001)), none),
+        (with(on(300, 0, 0)), view(301, 0, 0)),
+        (with(on(0, 300, 0)), view(0, 0, 0)),
+        (with(on(0, 0, 999)), view(0, 0, 1_000)),
+        (with(stored(0, 0, 300)), view(0, 0, 300)),
+        (with(stored(300, 0, 0)), view(300, 0, 0)),
+        (with(stored(0, 300, 0)), view(0, 300, 0)),
+    ]
+}
+
+/// An invalid readout refuses the frame before its effects, after the
+/// tally's check, and poisons the play with that error until a prepare.
+#[test]
+fn invalid_readouts_poison_the_play() {
+    use skin_model::{BuildError, LaneTimer, lane_timer};
+    let chart = ChartBuilder::new(BPM_150)
+        .long(lane(2), TimeUs(1_000 * MS), TimeUs(1_300 * MS))
+        .build()
+        .unwrap();
+    let hold = lane_timer(LaneTimer::Hold, lane(2));
+    let skin = load(
+        Vec::new(),
+        vec![element(TimerRef::Builtin(timer::READY), 1)],
+    )
+    .unwrap();
+    let ctx = PlayContext {
+        empty_poor_counted: true,
+        ..full(0)
+    };
+    let state = |h: &Harness| {
+        let s = h.play.state();
+        (s.fields.to_vec(), s.timers.to_vec())
+    };
+    for (i, (bad, bad_view)) in invalid_readouts().into_iter().enumerate() {
+        // An inconsistent tally is reported first.
+        let mut first = Harness::new(skin.clone(), &chart, &ctx);
+        first.tally = scored([0, 0, 0, 0, 0], 1, 0);
+        first.readouts = Some(bad);
+        first.view = bad_view;
+        assert_eq!(
+            first.try_frame_us(0, &[]),
+            Err(BuildError::InconsistentTally),
+            "case {i}"
+        );
+        let mut h = Harness::new(skin.clone(), &chart, &ctx);
+        h.frame(
+            1_000,
+            &[ev(1_000, play_support::ln_held(2, 0, Judgment::Great))],
+        );
+        assert_eq!(h.start(hold), Some(1_000 * MS));
+        let before = state(&h);
+        let ended = [ev(1_100, play_support::hold_ended(2, 0))];
+        h.readouts = Some(bad);
+        h.view = bad_view;
+        assert_eq!(
+            h.try_frame_us(1_100 * MS, &ended),
+            Err(BuildError::InvalidReadouts),
+            "case {i}"
+        );
+        assert_eq!(state(&h), before, "case {i}");
+        assert_eq!(h.start(hold), Some(1_000 * MS));
+        // Valid readouts after it are refused with the same error, and a
+        // fresh prepare builds.
+        h.readouts = None;
+        h.view = play_support::VIEW;
+        assert_eq!(
+            h.try_frame_us(1_200 * MS, &ended),
+            Err(BuildError::InvalidReadouts)
+        );
+        assert_eq!(state(&h), before, "case {i}");
+        h.play = h.skin.prepare(&chart, &ctx).unwrap();
+        assert_eq!(h.try_frame_us(1_200 * MS, &[]), Ok(()));
+    }
 }

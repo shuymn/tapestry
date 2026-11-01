@@ -5,8 +5,9 @@
 //! change, the lanes, number, gauge, judge and text widgets, and the
 //! elements into the batch, image quads at their native size where they
 //! keep one; the score rates and the gauge kind under both empty-POOR
-//! policies as the shown gauge switches, and a refused inconsistent
-//! snapshot.
+//! policies as the shown gauge switches, a refused inconsistent snapshot,
+//! and the readouts per round: known and unknown metrics, the countdown,
+//! a STOP, control changes, an invalid frame and the poisoned play.
 //!
 //! A counting global allocator counts allocations made on threads that opt
 //! in (a thread-local flag), so the test harness's own threads do not
@@ -25,15 +26,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use bms_model::{Chart, ChartBuilder, Lane, NoteKind, SoundId, TimeUs};
 use eval::{GaugeState, JudgeEvent, JudgeEventKind, Section, Tally};
 use image_support::{dir, file, save, solid, whole};
-use play_support::{bool_program, state, tally};
+use play_support::{bool_program, readouts_for, state, tally};
 use rules::{GaugeValue, Judgment};
 use skin_model::{
-    Adjust, Align, Anchor, AtlasLimits, Attach, Attempt, Bind, Blend, BuildError, ClipId,
-    ComboPart, CycleDef, DigitsDef, Ease, ElementDef, End, Fill, Filter, Fit, Follow, GaugeDef,
-    GaugeDesc, GaugeLook, GaugeParts, GlyphSet, GradePart, ImageDef, JudgeDef, JudgeSlot, KeyDef,
-    LaneParts, LaneTimer, LaneView, Layout as SkinLayout, Motion, Native, NumberDef, Pad, Place,
-    Play, PlayContext, QuadBatch, Region, RegionDef, Sheet, Side, Skin, SkinDef, SkinFrame, Source,
-    TimerRef, Track, UvTable, Variant, field, lane_timer, timer,
+    Adjust, Align, Anchor, AtlasLimits, Attach, Attempt, Bind, Blend, BpmRange, BuildError, ClipId,
+    ComboPart, CoverSettings, CycleDef, DigitsDef, DurationRatio, Ease, ElementDef, End, Fill,
+    Filter, Fit, Follow, FrameReadouts, GaugeDef, GaugeDesc, GaugeLook, GaugeParts, GlyphSet,
+    GradePart, ImageDef, JudgeDef, JudgeSlot, KeyDef, LaneParts, LaneTimer, LaneView,
+    Layout as SkinLayout, Motion, Native, NumberDef, Pad, Place, Play, PlayContext, QuadBatch,
+    Region, RegionDef, Sheet, Side, Skin, SkinDef, SkinFrame, Source, TimerRef, Track, UvTable,
+    Variant, field, lane_timer, timer,
 };
 use skin_model::{
     ChartText, FontRef, FrameUv, LoadState, Overflow, TextDef, TextField, TextImage, TextTable,
@@ -1198,6 +1200,7 @@ fn stretch(
             target: TARGETS[target_no],
             layout: &views.layouts[layout_no],
             lanes: views.lanes[(frame_no / 23) % views.lanes.len()],
+            readouts: stretch_readouts(frame_no, views.lanes[(frame_no / 23) % views.lanes.len()]),
             // A stretch of loading frames every 50, its progress moving.
             loading: (frame_no % 50 < 5).then(|| LoadState {
                 since: TimeUs(now - 1_000),
@@ -1294,6 +1297,7 @@ fn build_does_not_allocate() {
         scratch: Side::Left,
         ln_default: rules::LnMode::Ln,
         last_note_end: TimeUs(0),
+        bpm_range: None,
     };
     let round = Section {
         start: TimeUs(30_000 * MS),
@@ -1465,6 +1469,7 @@ fn build_does_not_allocate() {
         target: TARGETS[0],
         layout: &views.layouts[0],
         lanes: views.lanes[0],
+        readouts: readouts_for(views.lanes[0]),
         loading: None,
         playing: true,
     };
@@ -1494,6 +1499,7 @@ fn build_does_not_allocate() {
     assert_eq!(ALLOCS.load(Ordering::Relaxed), 0, "refused: allocations");
     assert_eq!(first, Err(BuildError::InconsistentTally));
     assert_eq!(after, Err(BuildError::InconsistentTally));
+    readouts_do_not_allocate(&loaded, &descs);
     // Both text elements ask for a line; the title is the chart's.
     let chart_text = ChartText {
         title: "Title",
@@ -1535,6 +1541,7 @@ fn build_does_not_allocate() {
             target: TARGETS[0],
             layout: &views.layouts[0],
             lanes: views.lanes[0],
+            readouts: readouts_for(views.lanes[0]),
             loading: None,
             playing: true,
         };
@@ -1644,6 +1651,12 @@ fn source_lanes_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
     for (i, now) in (0..12_000 * MS).step_by(16 * MS as usize).enumerate() {
         let (cover, lift, hidden_view) = views[i / 50 % views.len()];
         batch.clear();
+        let lanes = LaneView {
+            visible_time: TimeUs(600 * MS),
+            cover,
+            lift,
+            hidden: hidden_view,
+        };
         let frame = SkinFrame {
             now: TimeUs(now),
             display_offset: TimeUs(0),
@@ -1654,12 +1667,8 @@ fn source_lanes_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
             complete: false,
             target: TARGETS[i % TARGETS.len()],
             layout: &layout,
-            lanes: LaneView {
-                visible_time: TimeUs(600 * MS),
-                cover,
-                lift,
-                hidden: hidden_view,
-            },
+            lanes,
+            readouts: readouts_for(lanes),
             loading: None,
             playing: true,
         };
@@ -1684,5 +1693,197 @@ fn source_lanes_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
     assert!(
         quads > 0 && tails > 0 && hiddens > 0,
         "source lanes drew {quads} quads, {tails} end caps, {hiddens} HIDDEN+"
+    );
+}
+
+/// The readouts a stretch's frame `frame_no` gives with `view`: nothing
+/// known, then tempo, hi-speed and an exact duration, then a duration
+/// without a hi-speed, changing every 7 frames; a cover the view draws at
+/// 0 is off with a stored amount, and the adjustment mode toggles.
+fn stretch_readouts(frame_no: usize, view: LaneView) -> FrameReadouts {
+    let base = readouts_for(view);
+    let off = |shown: u16, stored: u16| if shown == 0 { stored } else { shown };
+    let covers = CoverSettings {
+        cover: off(view.cover.min(1_000), 400),
+        lift: off(view.lift.min(1_000), 150),
+        cover_enabled: view.cover != 0,
+        lift_enabled: view.lift != 0,
+        adjusting: frame_no % 11 < 3,
+        ..base.covers
+    };
+    let k = u32::try_from(frame_no % 1_000).unwrap_or(0);
+    match frame_no / 7 % 3 {
+        0 => base,
+        1 => FrameReadouts {
+            bpm_current_x100: Some(15_000 + k),
+            hispeed_x100: Some(100 + k),
+            duration: Some(DurationRatio {
+                numerator: 600 * 15_000 * u128::from(k + 1),
+                denominator: u128::from(15_000 + k),
+            }),
+            covers,
+        },
+        _ => FrameReadouts {
+            duration: Some(DurationRatio {
+                numerator: u128::MAX,
+                denominator: u128::MAX / 667,
+            }),
+            covers,
+            ..base
+        },
+    }
+}
+
+/// Readouts allocate nothing per round, each prepared untracked: the
+/// first build and later ones through the countdown, a STOP, tempo and
+/// control changes and past the end, then an invalid frame and a build
+/// on the poisoned play; and an invalid first build.
+fn readouts_do_not_allocate(loaded: &Loaded, descs: &[GaugeDesc]) {
+    let skin = &loaded.skin;
+    let chart = ChartBuilder::new(150_000)
+        .sound("a.wav")
+        .tap(lane(1), TimeUs(1_000 * MS))
+        .stop(TimeUs(2_000 * MS), TimeUs(1_000 * MS))
+        .tap(lane(2), TimeUs(4_000 * MS))
+        .bgm(TimeUs(6_000 * MS), SoundId(0))
+        .build()
+        .unwrap();
+    let section = Section {
+        start: TimeUs(1_500 * MS),
+        end: TimeUs(5_000 * MS),
+        lead_in: TimeUs(1_000 * MS),
+        initial_gauges: vec![GaugeValue(70 * GaugeValue::PERCENT), GaugeValue::FULL],
+    };
+    let full = PlayContext {
+        gauges: descs,
+        attempt: Attempt::Full {
+            lead_in: TimeUs(1_000 * MS),
+        },
+        empty_poor_breaks_combo: false,
+        empty_poor_counted: false,
+        scratch: Side::Left,
+        ln_default: rules::LnMode::Ln,
+        last_note_end: TimeUs(0),
+        bpm_range: Some(BpmRange {
+            min_x100: 15_000,
+            max_x100: 15_000,
+        }),
+    };
+    let round = PlayContext {
+        attempt: Attempt::Section(&section),
+        bpm_range: None,
+        ..full
+    };
+    let t = tally(0);
+    let gauges = [descs[0].start, descs[1].start].map(state);
+    let mut batch = QuadBatch::with_capacity(skin.quad_capacity(), skin.run_capacity());
+    let lanes = LaneView {
+        visible_time: TimeUs(600 * MS),
+        cover: 250,
+        lift: 0,
+        hidden: 0,
+    };
+    let frame = |now: i64, readouts: FrameReadouts| SkinFrame {
+        now: TimeUs(now),
+        display_offset: TimeUs(0),
+        tally: &t,
+        gauges: &gauges,
+        gauge: 0,
+        effects: &[],
+        complete: false,
+        target: TARGETS[0],
+        layout: &SkinLayout::AUTHOR,
+        lanes,
+        readouts,
+        loading: None,
+        playing: true,
+    };
+    let invalid = FrameReadouts {
+        duration: Some(DurationRatio {
+            numerator: 1,
+            denominator: 0,
+        }),
+        ..readouts_for(lanes)
+    };
+    // Per round: the remaining seconds at the first and last frames, and
+    // whether a duration was seen known and unknown.
+    let mut seen = Vec::new();
+    for (name, ctx) in [("readouts", &full), ("readouts round", &round)] {
+        for _round in 0..2 {
+            let mut play = skin.prepare(&chart, ctx).unwrap();
+            let mut results = [Ok(()); 3];
+            let (mut first, mut last, mut known) = (None, 0, [false; 2]);
+            TRACK.with(|t| t.set(true));
+            for (i, now) in (-1_000 * MS..=8_000 * MS)
+                .step_by(16 * MS as usize)
+                .enumerate()
+            {
+                batch.clear();
+                let r = skin.build(
+                    &mut play,
+                    &frame(now, stretch_readouts(i, lanes)),
+                    &loaded.uvs,
+                    &mut batch,
+                );
+                results[0] = results[0].and(r);
+                let fields = play.state().fields;
+                last = fields[usize::from(field::TIME_REMAINING_S)];
+                first.get_or_insert(last);
+                known[usize::from(fields[usize::from(field::DURATION_VALID)] == 1)] = true;
+            }
+            results[1] = skin.build(
+                &mut play,
+                &frame(8_100 * MS, invalid),
+                &loaded.uvs,
+                &mut batch,
+            );
+            results[2] = skin.build(
+                &mut play,
+                &frame(8_200 * MS, readouts_for(lanes)),
+                &loaded.uvs,
+                &mut batch,
+            );
+            TRACK.with(|t| t.set(false));
+            assert_eq!(ALLOCS.load(Ordering::Relaxed), 0, "{name}: allocations");
+            assert_eq!(
+                results,
+                [
+                    Ok(()),
+                    Err(BuildError::InvalidReadouts),
+                    Err(BuildError::InvalidReadouts)
+                ],
+                "{name}"
+            );
+            seen.push((first, last, known));
+        }
+        // An invalid first build, and the poisoned play after it.
+        let mut play = skin.prepare(&chart, ctx).unwrap();
+        TRACK.with(|t| t.set(true));
+        let first = skin.build(&mut play, &frame(0, invalid), &loaded.uvs, &mut batch);
+        let after = skin.build(
+            &mut play,
+            &frame(16 * MS, readouts_for(lanes)),
+            &loaded.uvs,
+            &mut batch,
+        );
+        TRACK.with(|t| t.set(false));
+        assert_eq!(
+            ALLOCS.load(Ordering::Relaxed),
+            0,
+            "{name}: invalid first build"
+        );
+        assert_eq!(first, Err(BuildError::InvalidReadouts));
+        assert_eq!(after, Err(BuildError::InvalidReadouts));
+    }
+    // The chart's last object at 6 s, the round's end at 5 s from 1.5 s;
+    // past both nothing remains.
+    assert_eq!(
+        seen,
+        [
+            (Some(6), 0, [true; 2]),
+            (Some(6), 0, [true; 2]),
+            (Some(4), 0, [true; 2]),
+            (Some(4), 0, [true; 2])
+        ]
     );
 }

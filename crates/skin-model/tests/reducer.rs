@@ -480,6 +480,7 @@ fn last_note_is_sampled_past_the_notes_end() {
     let chart = taps_chart();
     let ctx = PlayContext {
         last_note_end: TimeUs(3_000 * MS),
+        bpm_range: None,
         ..full(0)
     };
     // The frame at the end does not start it; 1 ms after does.
