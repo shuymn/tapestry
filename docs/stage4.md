@@ -374,6 +374,7 @@ bmz-player's IR made the same choice for the same reads.
 - **Over a limit:**
   - A job over a limit parks **that record**, with the reason.
   - An evaluation chart is marked over the server's limits only when its decoding alone fails. Another player's valid record for the same chart is unaffected.
+- **The evaluation chart's encoding** is the chart container's evaluation subset (design.md "Chart Containers"). Its codec is a permissive L2 crate shared by the player and `ir-wasm`, begun in stage 3 for the compact form, and its identity is the SHA-256 of its canonical bytes, confirmed by byte equality (S1). Decoding builds a sound table of unnamed entries from the sound count, or a dedicated evaluation model; which one is decided with `ir-wasm`. The container's specification is written into design.md and this file together.
 - **No loader on the server:** the module decodes evaluation charts and contains no BMS loader, so `bms-parser` and its filesystem calls stay on the client. `replay` depends on `bms-parser` today for `verify`; stage 4 puts that behind a default feature, so `ir-wasm` builds `replay` without it.
 - **Versions:**
   - The server evaluates with its own evaluator, and treats the record's claimed evaluator version as information only (design.md "Threat Model"). It refuses record format versions it cannot decode.
@@ -513,3 +514,4 @@ The pattern follows the kopje project's job runner and bmz-player's send queue.
 This touches no server and no stage-2 file.
 
 - **WASM build in CI:** a Linux CI job building `eval`, `bms-parser` and `replay` for `wasm32-unknown-unknown`. design.md already requires it ("Server Architecture"). setup.md defers the target to "the stage that uses it", and design.md's "kept passing in CI at all times" is the stronger statement.
+- **The chart codec crate:** begun in stage 3 with the compact form (docs/stage3.md S10, item 7), in a permissive L2 crate, so the evaluation subset extends it here.
