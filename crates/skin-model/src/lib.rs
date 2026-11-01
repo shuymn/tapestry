@@ -122,8 +122,8 @@ pub use widget::gauge::{
 };
 pub use widget::judge::{Attach, ComboPart, GradePart, JudgeDef, JudgeError, JudgePart, JudgeSlot};
 pub use widget::lanes::{
-    LANE_QUADS, LANE_RESERVED, LANE_VISITS, LanePart, LaneParts, LaneStyle, LaneView, LanesDef,
-    LanesError, Side, SourceLanes,
+    HiddenTrim, LANE_QUADS, LANE_RESERVED, LANE_VISITS, LanePart, LaneParts, LaneStyle, LaneView,
+    LanesDef, LanesError, Side, SourceLanes,
 };
 pub use widget::scroll::Scale;
 pub use widget::text::{

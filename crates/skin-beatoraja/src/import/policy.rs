@@ -32,12 +32,13 @@
 //! 11. The scratch side of an imported skin: the side the skin draws it
 //!     on, given to the caller as `Imported::scratch` (a setting comes
 //!     with S11).
-//! 12. The lane approximations (D9, [`super::report::LaneApprox`]), each
-//!     accepted by the owner: a notes and long-note bodies
-//!     stop at the top of the lanes; b an unhit tap keeps falling below
-//!     the line until it is judged a miss or leaves the lanes; c a tap hit
-//!     early disappears at once; d a hit mine disappears when hit (an unhit
-//!     one leaves at its time, as the source does); e `dst2` is ignored;
+//! 12. The lane approximations of the notes, SUDDEN+ and LIFT (D9 items
+//!     a–l, [`super::report::LaneApprox`]), each accepted by the owner:
+//!     a notes and long-note bodies stop at the top of the lanes; b an
+//!     unhit tap keeps falling below the line until it is judged a miss
+//!     or leaves the lanes; c a tap hit early disappears at once; d a hit
+//!     mine disappears when hit (an unhit one leaves at its time, as the
+//!     source does); e `dst2` is ignored;
 //!     f `expansionrate` is ignored; g a long note's end cap is drawn and a
 //!     skin without one is refused; h a long note's body runs between the
 //!     caps' centres; i the part of SUDDEN+ above the lanes is never
@@ -50,7 +51,12 @@
 //!     instead of refusing the skin ([`super::widget::lanes`]).
 //! 14. Judgment and gauge parts that move with LIFT (offset 3) are
 //!     refused, as every run-time offset on them is.
-//! 15. HIDDEN+ is never drawn (D11): the skin imports with a note.
+//! 15. HIDDEN+ is optional for the player, so it is decorative: outside
+//!     the mapped subset it is dropped with a note and the skin still
+//!     imports ([`super::widget::lanes`]). Its differences from the source
+//!     are noted as lane approximations (D9): m drawn under SUDDEN+ and
+//!     LIFT, n cut at its trim line after its stretch, o never drawn
+//!     outside the lanes.
 
 use std::fmt;
 

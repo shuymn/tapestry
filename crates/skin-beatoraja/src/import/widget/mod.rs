@@ -104,20 +104,21 @@ impl Cx<'_> {
         s: &SrcImage,
         grid: [u32; 2],
     ) -> Result<Option<(u32, [u32; 2])>, ImportError> {
-        self.add_src_image_cropped(c, rec, s, grid, |_, _| Ok(None))
+        self.add_src_image_cropped(c, rec, s, grid, |_, _| Ok(Ok(None)))
     }
 
     /// [`Self::add_src_image`] with its frame's rows cut to what `crop`
     /// returns for the uncropped rect `[x, y, w, h]` (texels, y down),
     /// asked once that rect is known; a cropped image is cached apart
-    /// from the uncropped one, sharing its file.
+    /// from the uncropped one, sharing its file. A crop `crop` refuses
+    /// with a reason drops the element as its role says.
     pub(super) fn add_src_image_cropped(
         &mut self,
         c: &Common,
         rec: u32,
         s: &SrcImage,
         grid: [u32; 2],
-        crop: impl FnOnce(&Self, [u32; 4]) -> Result<Option<Crop>, ImportError>,
+        crop: impl FnOnce(&Self, [u32; 4]) -> Result<Result<Option<Crop>, NoteKind>, ImportError>,
     ) -> Result<Option<(u32, [u32; 2])>, ImportError> {
         let at = c.span;
         let role = c.role;
@@ -144,7 +145,13 @@ impl Cx<'_> {
         let linear = c.filter == skin_model::Filter::Linear;
         let key = (rec, linear, grid);
         if let Some((def, cell)) = self.assets.base(key) {
-            let crop = crop(self, def.rect.unwrap_or_default())?;
+            let crop = match crop(self, def.rect.unwrap_or_default())? {
+                Ok(crop) => crop,
+                Err(why) => {
+                    self.drop_el(role, at, why)?;
+                    return Ok(None);
+                }
+            };
             if let Some(found) = self.assets.image(key, crop) {
                 return Ok(Some(found));
             }
@@ -240,7 +247,13 @@ impl Cx<'_> {
             cycle,
             filter: c.filter,
         };
-        let crop = crop(self, rect)?;
+        let crop = match crop(self, rect)? {
+            Ok(crop) => crop,
+            Err(why) => {
+                self.drop_el(role, at, why)?;
+                return Ok(None);
+            }
+        };
         self.add_image(c, key, crop, def, cell)
     }
 

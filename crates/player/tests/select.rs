@@ -851,6 +851,73 @@ fn refused_load_releases_the_scan_pause() {
     assert!(lines(&stdout, "play started").is_empty(), "{stdout}");
 }
 
+/// Charts a scan lists above the chart under the cursor while the select
+/// screen is up keep the cursor on that chart and on its line: the list
+/// scrolls down by what was listed, and stays so when that chart is then
+/// chosen and refused.
+#[test]
+fn charts_listed_above_keep_the_cursor_on_its_chart() {
+    let fx = fixture();
+    let m = fx.library.join("m");
+    fs::create_dir_all(&m).unwrap();
+    fs::write(m.join("m00.bms"), "#TITLE M00\n#LNTYPE 2\n#00111:01\n").unwrap();
+    for i in 1..30 {
+        write_chart(
+            &fx.library,
+            "m",
+            &format!("m{i:02}.bms"),
+            &format!("M{i:02}"),
+            8_000,
+        );
+    }
+    let mut child = select(
+        &fx,
+        "pick=m00.bms,wait=a04.bms,enter,close",
+        &["--dev-rescan-ms", "50"],
+    )
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
+    let mut stdout = String::new();
+    let mut added = false;
+    for line in BufReader::new(child.stdout.take().unwrap()).lines() {
+        let line = line.unwrap();
+        if line == "dev: select cursor: line 1: m00.bms" && !added {
+            for i in 0..5 {
+                write_chart(
+                    &fx.library,
+                    "a",
+                    &format!("a{i:02}.bms"),
+                    &format!("A{i:02}"),
+                    8_000,
+                );
+            }
+            added = true;
+        }
+        stdout.push_str(&line);
+        stdout.push('\n');
+    }
+    let out = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(added, "{stdout}\n{stderr}");
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+    assert_eq!(
+        lines(&stdout, "select: refused m00.bms").len(),
+        1,
+        "{stdout}"
+    );
+    // Every page sent, those listing the charts added and the refusal's
+    // among them, has the cursor on its chart and line.
+    let shown = lines(&stdout, "dev: select cursor: ");
+    assert!(
+        shown
+            .iter()
+            .all(|l| *l == "dev: select cursor: line 1: m00.bms"),
+        "{stdout}"
+    );
+}
+
 /// The input thread drops its heartbeat on the select screen: at the first
 /// entry, after a refused chart and after a completed play, it wakes only
 /// for what it is asked.

@@ -10,9 +10,9 @@ use std::sync::OnceLock;
 use bms_model::{Lane, TimeUs};
 use image::{ImageFormat, Rgba, RgbaImage};
 use skin_model::{
-    Anchor, Bind, Blend, Ease, ElementDef, End, FileDef, Filter, Fit, ImageDef, KeyDef, LaneParts,
-    LaneStyle, LanesDef, LoadError, Place, Quad, Region, RegionDef, Sheet, Side, Skin, SkinDef,
-    Source, SourceLanes, TimerRef, Track, timer,
+    Anchor, Bind, Blend, Ease, ElementDef, End, FileDef, Filter, Fit, HiddenTrim, ImageDef, KeyDef,
+    LaneParts, LaneStyle, LanesDef, LoadError, Place, Quad, Region, RegionDef, Sheet, Side, Skin,
+    SkinDef, Source, SourceLanes, TimerRef, Track, timer,
 };
 
 use crate::play_support::{Harness, REGIONS};
@@ -30,7 +30,8 @@ pub const BAR: u32 = 7;
 pub const LINE: u32 = 8;
 pub const COVER: u32 = 9;
 pub const LIFT: u32 = 10;
-const SIZES: [(u32, u32); 11] = [
+pub const HIDDEN: u32 = 11;
+const SIZES: [(u32, u32); 12] = [
     (1, 1),
     (4, 16),
     (5, 16),
@@ -42,6 +43,7 @@ const SIZES: [(u32, u32); 11] = [
     (11, 6),
     (12, 32),
     (13, 32),
+    (14, 32),
 ];
 
 /// A folder of the part images under the target's test folder, written
@@ -91,7 +93,8 @@ pub fn sheet() -> Sheet {
 
 /// The simple skin's lanes: the scratch at 160 (96 wide), the keys 64
 /// wide from 256, top 80, line 880, bottom 960; notes 16, mines 8, bar
-/// lines 2 and the line 6 tall.
+/// lines 2 and the line 6 tall; HIDDEN+ 800 tall from the line, trimmed
+/// at the line as it rises.
 pub fn simple() -> LanesDef {
     let mut lanes = [[160, 96]; 8];
     for (k, lane) in lanes.iter_mut().enumerate().skip(1) {
@@ -108,6 +111,9 @@ pub fn simple() -> LanesDef {
         cover_h: 800.0,
         lift_at: 880.0,
         lift_h: 880.0,
+        hidden_at: 880.0,
+        hidden_h: 800.0,
+        hidden_trim: HiddenTrim::Lift(880.0),
         note_h: 16,
         mine_h: 8,
         bar_h: 2,
@@ -123,6 +129,7 @@ pub fn simple() -> LanesDef {
             line: Some(LINE),
             cover: Some(COVER),
             lift: Some(LIFT),
+            hidden: Some(HIDDEN),
         },
     }
 }
@@ -131,7 +138,8 @@ pub fn simple() -> LanesDef {
 /// skin's: the source region's lower edge at 880 and 600 high, notes and
 /// mines 20 high; `top` half a note above the region (270), `line` a
 /// note's centre at its judgment time (870), SUDDEN+ 600 high anchored at
-/// the region's top (280) and LIFT 200 high at its bottom.
+/// the region's top (280), LIFT 200 high at its bottom and HIDDEN+ 600
+/// high from its bottom, trimmed there as it rises with the lift.
 pub fn source() -> LanesDef {
     LanesDef {
         style: LaneStyle::Source(SourceLanes {
@@ -147,6 +155,9 @@ pub fn source() -> LanesDef {
         cover_h: 600.0,
         lift_at: 880.0,
         lift_h: 200.0,
+        hidden_at: 880.0,
+        hidden_h: 600.0,
+        hidden_trim: HiddenTrim::Lift(880.0),
         note_h: 20,
         mine_h: 20,
         ..simple()

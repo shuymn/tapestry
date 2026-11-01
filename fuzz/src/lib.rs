@@ -364,6 +364,7 @@ pub fn draw(imported: &Imported) -> Vec<usize> {
                 visible_time: TimeUs(600_000),
                 cover: 0,
                 lift: 0,
+                hidden: 0,
             },
             loading: None,
             playing: true,
@@ -489,19 +490,13 @@ fn check_usage(i: &Imported) {
         let lanes = skin_model::LANE_QUADS + skin_model::LANE_RESERVED;
         assert!(i.skin.quad_capacity() >= lanes, "lanes without their quads");
     }
-    // Every lane approximation is one the owner accepted, a deviation;
-    // HIDDEN+ is only ever noted.
+    // Every lane approximation is a deviation.
     for n in &i.report.notes {
-        match n.kind {
-            NoteKind::Deviation(DeviationId::D9(_)) => {
-                assert_eq!(n.severity, Severity::Deviation, "a lane approximation");
-            }
-            NoteKind::Deviation(DeviationId::D11) => {
-                assert_eq!(n.severity, Severity::Ignored, "HIDDEN+ drawn");
-            }
-            _ => {}
+        if let NoteKind::Deviation(DeviationId::D9(_)) = n.kind {
+            assert_eq!(n.severity, Severity::Deviation, "a lane approximation");
         }
     }
+
     // An element dropped after its ops were charged keeps none of them.
     assert!(
         i.skin.ops().total() <= usize::try_from(u.ops).unwrap_or(usize::MAX),

@@ -123,6 +123,7 @@ impl Drawn {
                 visible_time: TimeUs(600 * MS),
                 cover: 0,
                 lift: 0,
+                hidden: 0,
             },
             target: [1_920, 1_080],
         }
