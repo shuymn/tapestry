@@ -299,16 +299,9 @@ impl Cx<'_> {
             }
             let sized = sizes.get(u).is_some_and(Option::is_some);
             if let ([None, ..], [tap, ..], false) = (*lane, *nodes, sized) {
-                return Err(ImportError::Critical {
-                    at: self.loc(self.arena_span(tap)),
-                    part,
-                    why: NoteKind::NotePart {
-                        field: "note",
-                        why: PartWhy::MissingSize {
-                            lane: u8::try_from(u).unwrap_or(u8::MAX),
-                        },
-                    },
-                });
+                let lane = u8::try_from(u).unwrap_or(u8::MAX);
+                let why = PartWhy::MissingSize { lane };
+                return Err(self.part_error(at, Some(tap), "note", why));
             }
         }
 

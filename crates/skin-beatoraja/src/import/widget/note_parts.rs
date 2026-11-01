@@ -81,7 +81,7 @@ pub(super) struct NotePartsPlan {
 impl Cx<'_> {
     /// A refusal of the lanes for note part `field`, at `node` or, when
     /// the field is missing, at the record `at`.
-    fn part_error(
+    pub(super) fn part_error(
         &self,
         at: Span,
         node: Option<u32>,
