@@ -289,7 +289,10 @@ const COMBO_24: u16 = BEAM + 6;
 const GRADES: u16 = BEAM + 7;
 const LOOKS: u16 = GRADES + 7;
 const FLICKER: u16 = LOOKS + 12;
-const IMAGES: u16 = FLICKER + 6;
+/// The image choices' own images: 12, 20 and 24 frames, each with a sheet
+/// cycle the choices do not use.
+const CHOICES: u16 = FLICKER + 6;
+const IMAGES: u16 = CHOICES + 3;
 /// The reserved layers of the atlas.
 const RESERVED: u16 = 1;
 
@@ -334,8 +337,12 @@ fn frames_of(k: u16) -> u16 {
         48
     } else if k == COMBO_10 {
         10
-    } else if k == COMBO_24 {
+    } else if k == COMBO_24 || k == CHOICES + 2 {
         24
+    } else if k == CHOICES {
+        12
+    } else if k == CHOICES + 1 {
+        20
     } else if k < PARTS && k.is_multiple_of(3) {
         4 + k % 5
     } else {
@@ -728,6 +735,7 @@ fn widgets(elements: &mut Vec<ElementDef>) -> skin_model::WidgetDefs {
         align,
         overflow,
     };
+    let image_choices = image_choices(elements, int);
     skin_model::WidgetDefs {
         numbers,
         gauges,
@@ -744,7 +752,120 @@ fn widgets(elements: &mut Vec<ElementDef>) -> skin_model::WidgetDefs {
                 Overflow::Spill,
             ),
         ],
+        image_choices,
     }
+}
+
+/// The selector of the shown gauge's look, invalid hiding.
+const GAUGE_LOOK: &str = "if gauge.valid then (if gauge.kind == assist_easy then 0 \
+    else if gauge.kind == easy then 1 else if gauge.kind == normal then 2 \
+    else if gauge.kind == hard then 3 else if gauge.kind == ex_hard then 4 \
+    else if gauge.kind == hazard then 5 else -1) else -1";
+
+/// The image choice tables, their elements appended to `elements`:
+/// - by `elapsed(ready) / 40 % 7 − 2`: hidden, each entry (a hole among them) and past
+///   the table, the entries on their own clocks (`ready`, `judge`), one
+///   with its own track and one with its own native size, following each
+///   way in turn;
+/// - by the gauge's look, one entry per look with its own track, shared
+///   by two elements;
+/// - by the current tempo, while it is known.
+fn image_choices(
+    elements: &mut Vec<ElementDef>,
+    int: impl Fn(&str) -> skin_model::Program,
+) -> Vec<skin_model::ImageChoiceDef> {
+    use skin_model::{ImageChoiceDef, ImageChoicePart, ImageSpan};
+    let part = |image: u16, first: u16, frames: u16| ImageChoicePart {
+        span: ImageSpan {
+            image: u32::from(image),
+            first,
+            frames,
+        },
+        cycle: None,
+        track: None,
+        native: None,
+    };
+    let cycle = |ms: i64, t: u16| {
+        Some(CycleDef {
+            period: TimeUs(ms * MS),
+            timer: TimerRef::Builtin(t),
+        })
+    };
+    let combo = ImageChoiceDef {
+        value: int("elapsed(ready) / 40 % 7 - 2"),
+        choices: vec![
+            Some(ImageChoicePart {
+                cycle: cycle(300, timer::READY),
+                ..part(CHOICES, 5, 7)
+            }),
+            None,
+            Some(ImageChoicePart {
+                cycle: cycle(170, timer::JUDGE),
+                track: Some(track(900, Ease::In, End::Loop { from: TimeUs(0) })),
+                ..part(CHOICES + 1, 10, 10)
+            }),
+            Some(ImageChoicePart {
+                native: Some(Native::NoLarger([6, 9])),
+                ..part(CHOICES, 3, 1)
+            }),
+        ],
+    };
+    let looks = ImageChoiceDef {
+        value: int(GAUGE_LOOK),
+        choices: (0..6)
+            .map(|k| {
+                Some(ImageChoicePart {
+                    track: Some(track(950 + k, Ease::Out, End::Hold)),
+                    cycle: (k % 2 == 0).then_some(CycleDef {
+                        period: TimeUs(90 * MS),
+                        timer: TimerRef::Builtin(timer::PLAY),
+                    }),
+                    ..part(CHOICES + 2, 4 * k, 4)
+                })
+            })
+            .collect(),
+    };
+    let tempo = ImageChoiceDef {
+        value: int("if bpm.current_valid then bpm.current_x100 / 100 % 3 else -1"),
+        choices: vec![Some(part(GRADES, 0, 1)), Some(part(GRADES + 1, 0, 1)), None],
+    };
+    for (i, (table, place)) in [
+        (0, Place::SCREEN),
+        (
+            0,
+            Place {
+                region: Region::Playfield,
+                bind: Bind::Lanes,
+                pivot: Anchor::Center,
+                ..Place::SCREEN
+            },
+        ),
+        (
+            1,
+            Place {
+                region: Region::Left,
+                pivot: Anchor::Right,
+                ..Place::SCREEN
+            },
+        ),
+        (1, Place::SCREEN),
+        (2, Place::SCREEN),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let i = u16::try_from(i).unwrap();
+        elements.push(widget(
+            Source::ImageChoice(table),
+            track(980 + 5 * i, Ease::Linear, End::Hold),
+            TimerRef::Builtin(timer::READY),
+            Place {
+                follow: FOLLOWS[usize::from(i) % 4],
+                ..place
+            },
+        ));
+    }
+    vec![combo, looks, tempo]
 }
 
 /// The text elements' key height.
@@ -938,6 +1059,10 @@ struct Witness {
     /// and whether the covers moved it there.
     literal: Option<f32>,
     literal_moved: bool,
+    /// Per image choice image: whether a quad showed it, and whether it
+    /// showed a frame past its entry's first.
+    choices: [bool; 3],
+    choice_later: bool,
     /// The widgets': a combo drew and the shifting judge's grade lay apart
     /// from the other's; the full-gauge PERFECT showed; a sign glyph drew;
     /// the flicker's tip was pushed; each shown gauge drew its own look.
@@ -990,7 +1115,7 @@ impl Widgets {
             match image {
                 COMBO_10 | COMBO_11 | COMBO_24 => combo = true,
                 DIGITS_24 if frame % 12 == 11 => self.sign = true,
-                FLICKER..IMAGES => flicker += 1,
+                FLICKER..CHOICES => flicker += 1,
                 LOOKS..FLICKER => {
                     let set = usize::from((image - LOOKS) / 6);
                     if set == shown {
@@ -1039,6 +1164,8 @@ impl Witness {
             beam: [None; TARGETS.len()],
             literal: None,
             literal_moved: false,
+            choices: [false; 3],
+            choice_later: false,
         }
     }
 }
@@ -1241,6 +1368,14 @@ fn stretch(
                 if let Some(d) = w.drawn.get_mut(usize::from(image)) {
                     *d = true;
                 }
+                if let Some(c) = image
+                    .checked_sub(CHOICES)
+                    .and_then(|c| w.choices.get_mut(usize::from(c)))
+                {
+                    *c = true;
+                    // The entries start at frames 5, 10 and multiples of 4.
+                    w.choice_later |= !matches!(frame, 5 | 10) && !frame.is_multiple_of(4);
+                }
                 w.later_frame |= frame > 0;
                 w.later_layer |= q.layer > RESERVED;
             }
@@ -1386,6 +1521,8 @@ fn build_does_not_allocate() {
         assert!(w.active_body, "{name}: no long note drew active");
         assert!(w.turned, "{name}: no quad turned");
         assert!(w.literal_moved, "{name}: the covers never moved a follower");
+        assert_eq!(w.choices, [true; 3], "{name}: an image choice never drew");
+        assert!(w.choice_later, "{name}: no image choice entry animated");
         assert!(w.rates_apart, "{name}: the rates never moved apart");
         assert!(
             w.kinds[GaugeLook::Normal.index()] && w.kinds[GaugeLook::Hard.index()],

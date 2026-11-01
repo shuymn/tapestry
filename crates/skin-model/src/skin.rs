@@ -18,10 +18,13 @@ use crate::play::schema::timer::BUILTIN;
 use crate::play::{BuildError, Play, PlayContext, PrepareError, SkinFrame};
 use crate::quad::{Blend, ClipId, Filter, QuadBatch, RunKey};
 use crate::schema::Ty;
-use crate::track::Track;
+use crate::track::{MAX_KEY_US, Track};
 use crate::widget::digits::{Align, Digits, Number, NumberDef, NumberError};
 use crate::widget::gauge::{Gauge, GaugeDef, GaugeDraw, GaugeError};
 use crate::widget::glyphs;
+use crate::widget::image_choice::{
+    ChoicePart, ImageChoice, ImageChoiceDef, ImageChoiceError, MAX_IMAGE_CHOICE_REFS,
+};
 use crate::widget::judge::{
     ComboStrip, GradeImage, Judge, JudgeDef, JudgeDraw, JudgeError, JudgePart, JudgeSlot,
 };
@@ -68,6 +71,11 @@ pub enum Source {
     /// The text at this index of [`WidgetDefs::texts`]. Its track's rect
     /// is the line's box, whose height is the em.
     Text(u32),
+    /// The image choice table at this index of
+    /// [`WidgetDefs::image_choices`]: the entry its selector picks, on the
+    /// entry's track or else the element's, at the frame the entry's own
+    /// cycle shows.
+    ImageChoice(u32),
 }
 
 /// The widgets elements draw by index.
@@ -77,6 +85,7 @@ pub struct WidgetDefs {
     pub gauges: Vec<GaugeDef>,
     pub judges: Vec<JudgeDef>,
     pub texts: Vec<TextDef>,
+    pub image_choices: Vec<ImageChoiceDef>,
 }
 
 /// The timer an element's track or an image's cycle runs on.
@@ -198,6 +207,16 @@ pub enum LoadError {
         #[source]
         error: TextError,
     },
+    #[error("the image choice tables have {n} entries, more than {MAX_IMAGE_CHOICE_REFS}")]
+    TooManyImageChoiceRefs { n: usize },
+    #[error("image choice table {table}")]
+    ImageChoice {
+        table: usize,
+        #[source]
+        error: ImageChoiceError,
+    },
+    #[error("element {element} chooses its image and names a native size of its own")]
+    ChoiceNative { element: usize },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -209,6 +228,8 @@ enum Kind {
     Judge(usize),
     /// The text definition's index, and its layout.
     Text(usize, Text),
+    /// The image choice table's index.
+    ImageChoice(usize),
 }
 
 #[derive(Clone, Debug)]
@@ -245,6 +266,7 @@ pub struct Skin {
     gauges: Box<[Gauge]>,
     judges: Box<[Judge]>,
     texts: Box<[TextDef]>,
+    image_choices: Box<[ImageChoice]>,
     /// The text elements: the length of the table
     /// [`attach_text`](Skin::attach_text) takes.
     text_slots: u16,
@@ -322,6 +344,9 @@ fn check_places(def: &SkinDef) -> Result<(), LoadError> {
                 return Err(judge(JudgeError::Coordinates { part }));
             }
         }
+        if matches!(e.source, Source::ImageChoice(_)) && p.native.is_some() {
+            return Err(LoadError::ChoiceNative { element });
+        }
         if let Source::Text(_) = e.source {
             let text = |error| LoadError::Text { element, error };
             if p.bind != Bind::None {
@@ -372,7 +397,16 @@ fn check_follows(def: &SkinDef, reach: i64) -> Result<(), LoadError> {
             if matches!(e.source, Source::Lanes | Source::Judge(_)) {
                 return Err(LoadError::UnsupportedFollow { element });
             }
-            if moved_out(&e.track) {
+            let overrides = match e.source {
+                Source::ImageChoice(i) => def.widgets.image_choices.get(index(i)),
+                _ => None,
+            };
+            if moved_out(&e.track)
+                || overrides
+                    .into_iter()
+                    .flat_map(ImageChoiceDef::tracks)
+                    .any(|(_, t)| moved_out(t))
+            {
                 return Err(LoadError::Coordinates { element });
             }
         }
@@ -458,7 +492,7 @@ fn check_widget_images(
                 return Err(LoadError::Text { element, error });
             }
         }
-        Source::Image(_) | Source::Lanes => {}
+        Source::Image(_) | Source::Lanes | Source::ImageChoice(_) => {}
     }
     Ok(())
 }
@@ -504,7 +538,7 @@ fn check_widget_params(element: usize, source: Source, w: &WidgetDefs) -> Result
                 return Err(LoadError::Text { element, error });
             }
         }
-        Source::Image(_) | Source::Lanes => {}
+        Source::Image(_) | Source::Lanes | Source::ImageChoice(_) => {}
     }
     Ok(())
 }
@@ -515,7 +549,7 @@ fn check_widget_params(element: usize, source: Source, w: &WidgetDefs) -> Result
 /// characters, or [`MAX_TEXT_BYTES`] for a field.
 fn worst(source: Source, w: &WidgetDefs) -> u32 {
     match source {
-        Source::Image(_) | Source::Lanes => 0,
+        Source::Image(_) | Source::Lanes | Source::ImageChoice(_) => 0,
         Source::Text(i) => w.texts.get(index(i)).map_or(0, TextDef::quads),
         Source::Number(i) => w
             .numbers
@@ -552,7 +586,8 @@ fn regions(def: &SkinDef, lanes: Option<&Lanes>) -> Regions {
             | Source::Gauge(_)
             | Source::Number(_)
             | Source::Judge(_)
-            | Source::Text(_) => {
+            | Source::Text(_)
+            | Source::ImageChoice(_) => {
                 let b = match e.source {
                     Source::Number(i) => def
                         .widgets
@@ -560,6 +595,13 @@ fn regions(def: &SkinDef, lanes: Option<&Lanes>) -> Regions {
                         .get(index(i))
                         .and_then(|n| n.digits.bounds(&e.track)),
                     Source::Judge(i) => def.widgets.judges.get(index(i)).and_then(JudgeDef::bounds),
+                    // Every present entry's track, so a change of entry
+                    // moves no region.
+                    Source::ImageChoice(i) => def
+                        .widgets
+                        .image_choices
+                        .get(index(i))
+                        .and_then(|c| choice_bounds(c, &e.track)),
                     // A text's box only: spilled ink does not count.
                     Source::Image(_) | Source::Gauge(_) | Source::Text(_) | Source::Lanes => {
                         e.track.bounds()
@@ -583,6 +625,64 @@ fn regions(def: &SkinDef, lanes: Option<&Lanes>) -> Regions {
         }
     }
     out
+}
+
+/// The union of the bounds of every present entry's effective track:
+/// its own, or `track`, the element's.
+fn choice_bounds(c: &ImageChoiceDef, track: &Track) -> Option<Bounds> {
+    let own = c.uses_element_track().then(|| track.bounds()).flatten();
+    c.tracks()
+        .filter_map(|(_, t)| t.bounds())
+        .fold(own, |acc, b| Some(union(acc, b)))
+}
+
+/// The table checks of [`Skin::new`], every table in order, referenced or
+/// not: each selector is an int, each table has an entry, and each present
+/// entry's span lies inside an existing image, its cycle's period and
+/// timer are valid and its track's keys lie within ±[`MAX_COORD`].
+fn check_image_choices(
+    w: &WidgetDefs,
+    frames: &impl Fn(u32) -> Option<u16>,
+    whens: usize,
+) -> Result<(), LoadError> {
+    let max = MAX_COORD;
+    for (table, d) in w.image_choices.iter().enumerate() {
+        let fail = |error| Err(LoadError::ImageChoice { table, error });
+        if d.value.ty() != Ty::Int {
+            return fail(ImageChoiceError::NotInt);
+        }
+        if d.choices.is_empty() {
+            return fail(ImageChoiceError::Empty);
+        }
+        for (choice, c) in d.choices.iter().enumerate() {
+            let Some(c) = c else {
+                continue;
+            };
+            let Some(n) = frames(c.span.image) else {
+                return fail(ImageChoiceError::UnknownImage { choice });
+            };
+            let end = u32::from(c.span.first) + u32::from(c.span.frames);
+            if c.span.frames == 0 || end > u32::from(n) {
+                return fail(ImageChoiceError::Span { choice });
+            }
+            if let Some(cycle) = c.cycle {
+                if !(1..=MAX_KEY_US).contains(&cycle.period.0) {
+                    return fail(ImageChoiceError::Cycle { choice });
+                }
+                if slot_of(cycle.timer, whens).is_none() {
+                    return fail(ImageChoiceError::UnknownTimer { choice });
+                }
+            }
+            let outside = |t: &Track| {
+                t.rects()
+                    .any(|r| r.iter().any(|v| !(-max..=max).contains(v)))
+            };
+            if c.track.as_ref().is_some_and(outside) {
+                return fail(ImageChoiceError::Coordinates { choice });
+            }
+        }
+    }
+    Ok(())
 }
 
 /// A magnification as an exact fraction.
@@ -661,6 +761,7 @@ impl Skin {
             w.gauges.len(),
             w.judges.len(),
             w.texts.len(),
+            w.image_choices.len(),
         ] {
             if n > MAX_ELEMENTS {
                 return Err(LoadError::TooManyWidgets { n });
@@ -673,10 +774,22 @@ impl Skin {
         if n > MAX_TEXT_ELEMENTS {
             return Err(LoadError::TooManyTexts { n });
         }
+        let refs = w
+            .image_choices
+            .iter()
+            .fold(0_usize, |n, c| n.saturating_add(c.choices.len()));
+        if refs > MAX_IMAGE_CHOICE_REFS {
+            return Err(LoadError::TooManyImageChoiceRefs { n: refs });
+        }
         let keys = elements
             .iter()
             .map(|e| &e.track)
             .chain(w.judges.iter().flat_map(|j| j.tracks().map(|(_, t)| t)))
+            .chain(
+                w.image_choices
+                    .iter()
+                    .flat_map(|c| c.tracks().map(|(_, t)| t)),
+            )
             .fold(0_usize, |n, t| n.saturating_add(t.key_count()));
         if keys > MAX_SKIN_KEYS {
             return Err(LoadError::TooManyKeys { n: keys });
@@ -713,7 +826,11 @@ impl Skin {
                         return Err(LoadError::Judge { element, error });
                     }
                 }
-                Source::Image(_) | Source::Lanes | Source::Gauge(_) | Source::Text(_) => {}
+                Source::Image(_)
+                | Source::Lanes
+                | Source::Gauge(_)
+                | Source::Text(_)
+                | Source::ImageChoice(_) => {}
             }
         }
         let mut slots = Vec::with_capacity(elements.len());
@@ -741,6 +858,7 @@ impl Skin {
             Source::Gauge(i) => w.gauges.get(index(i)).is_none(),
             Source::Judge(i) => w.judges.get(index(i)).is_none(),
             Source::Text(i) => w.texts.get(index(i)).is_none(),
+            Source::ImageChoice(i) => w.image_choices.get(index(i)).is_none(),
         }) {
             return Err(LoadError::UnknownWidget { element });
         }
@@ -750,7 +868,8 @@ impl Skin {
             | Source::Number(_)
             | Source::Gauge(_)
             | Source::Judge(_)
-            | Source::Text(_) => false,
+            | Source::Text(_)
+            | Source::ImageChoice(_) => false,
         }) {
             return Err(LoadError::UnknownImage { element });
         }
@@ -758,6 +877,7 @@ impl Skin {
             let fonts = [def.sheet.font_count(), def.sheet.bitmap_font_count()];
             check_widget_images(element, e.source, w, &frames, fonts)?;
         }
+        check_image_choices(w, &frames, whens.len())?;
         if let Some((part, _)) = def
             .lanes
             .iter()
@@ -805,8 +925,13 @@ impl Skin {
                 Source::Judge(i) => w.judges.get(index(i)),
                 _ => None,
             };
+            let choice = match e.source {
+                Source::ImageChoice(i) => w.image_choices.get(index(i)).map(|c| &c.value),
+                _ => None,
+            };
             number
                 .into_iter()
+                .chain(choice)
                 .chain(judge.into_iter().flat_map(|j| j.visibles().map(|(_, v)| v)))
         });
         for program in whens
@@ -842,7 +967,36 @@ impl Skin {
             gauges,
             judges,
             texts,
+            image_choices,
         } = def.widgets;
+        let image_choices = image_choices
+            .into_iter()
+            .map(|d| ImageChoice {
+                value: d.value,
+                parts: d
+                    .choices
+                    .into_iter()
+                    .map(|c| {
+                        c.map(|c| {
+                            let base = image(c.span.image);
+                            ChoicePart {
+                                image: ImageRef {
+                                    first: base.first.saturating_add(u32::from(c.span.first)),
+                                    frames: c.span.frames,
+                                    cycle: c.cycle.map(|cycle| Cycle {
+                                        period: cycle.period.0,
+                                        slot: slot(cycle.timer),
+                                    }),
+                                    filter: base.filter,
+                                },
+                                track: c.track,
+                                native: c.native,
+                            }
+                        })
+                    })
+                    .collect(),
+            })
+            .collect();
         let numbers = numbers
             .into_iter()
             .map(|n| Number {
@@ -894,6 +1048,7 @@ impl Skin {
                     Source::Number(i) => Kind::Number(index(i)),
                     Source::Gauge(i) => Kind::Gauge(index(i)),
                     Source::Judge(i) => Kind::Judge(index(i)),
+                    Source::ImageChoice(i) => Kind::ImageChoice(index(i)),
                     Source::Text(i) => {
                         let def = texts.get(index(i));
                         let text = Text {
@@ -937,6 +1092,7 @@ impl Skin {
             gauges,
             judges,
             texts: texts.into_boxed_slice(),
+            image_choices,
             text_slots,
             widget_quads,
             bomb_up_to: def.bomb_up_to,
@@ -971,7 +1127,14 @@ impl Skin {
         self.ops
     }
 
-    /// The quads a frame can push: one per image element, each widget
+    /// The entries of the image choice tables, holes and repeats included.
+    #[must_use]
+    pub fn choice_ref_count(&self) -> usize {
+        self.image_choices.iter().map(|c| c.parts.len()).sum()
+    }
+
+    /// The quads a frame can push: one per image element (an image choice
+    /// element included, however long its table), each widget
     /// element's worst case (a number's cells, a gauge's segments and its
     /// flicker's tip, a judge's largest slot with its combo's cells, a
     /// text's one line or its bitmap glyphs), and the lanes' budget with
@@ -981,7 +1144,7 @@ impl Skin {
         let images = self
             .elements
             .iter()
-            .filter(|e| matches!(e.kind, Kind::Image(_)))
+            .filter(|e| matches!(e.kind, Kind::Image(_) | Kind::ImageChoice(_)))
             .count();
         let lanes = if self.lanes.is_some() {
             LANE_QUADS + LANE_RESERVED
@@ -1279,14 +1442,19 @@ impl Skin {
             if !placement.region(e.region).visible {
                 continue;
             }
-            let Some((t, s)) = sample(
-                play,
-                frame.now,
-                &state,
-                e.slot,
-                e.visible.as_ref(),
-                &e.track,
-            ) else {
+            // An image choice's entry, before its track is sampled.
+            let choice = match e.kind {
+                Kind::ImageChoice(i) => {
+                    let Some(p) = self.image_choices.get(i).and_then(|c| c.select(&state)) else {
+                        continue;
+                    };
+                    Some(p)
+                }
+                _ => None,
+            };
+            let track = choice.and_then(|p| p.track.as_ref()).unwrap_or(&e.track);
+            let Some((t, s)) = sample(play, frame.now, &state, e.slot, e.visible.as_ref(), track)
+            else {
                 continue;
             };
             // The covers' motion, after the track and before the lane map
@@ -1300,7 +1468,7 @@ impl Skin {
                 pivot: e.pivot,
                 angle: radians(s.angle),
                 color: s.color,
-                native: e.native,
+                native: choice.map_or(e.native, |p| p.native),
                 scale: canvas.scale(),
             };
             let at = Frame {
@@ -1312,6 +1480,13 @@ impl Skin {
                 Kind::Image(image) => {
                     if let Some(f) = image.frame(play, frame.now, uvs) {
                         brush.push(out, rect, f, image.filter);
+                    }
+                }
+                Kind::ImageChoice(_) => {
+                    if let Some(p) = choice
+                        && let Some(f) = p.image.frame(play, frame.now, uvs)
+                    {
+                        brush.push(out, rect, f, p.image.filter);
                     }
                 }
                 Kind::Number(i) => {

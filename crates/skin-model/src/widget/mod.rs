@@ -1,13 +1,15 @@
 //! Widgets: elements that draw many quads from player logic. Stage 3 S5
 //! has the lanes, whose scroll math is a copy of the simple skin's; S5b
 //! adds the glyph strips of `number` and the judge's combo, the `judge`
-//! and the `gauge`; S5c adds `text`.
+//! and the `gauge`; S5c adds `text`; S6c-04 adds expression-selected
+//! images (`image_choice`).
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
 pub(crate) mod digits;
 pub(crate) mod gauge;
 pub(crate) mod glyphs;
+pub(crate) mod image_choice;
 pub(crate) mod judge;
 pub(crate) mod lanes;
 pub(crate) mod scroll;
