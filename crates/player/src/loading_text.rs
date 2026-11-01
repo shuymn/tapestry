@@ -84,6 +84,9 @@ pub struct LoadingUpdate {
     pub preset: String,
     /// Whether it is a practice's Start.
     pub practice: bool,
+    /// What the round's practice reset of what the player set, when an
+    /// edit of the play preset did (`game::Reset`).
+    pub notice: Option<String>,
 }
 
 /// The chart being loaded, as its lines name it.
@@ -99,6 +102,9 @@ pub struct LoadingText {
     pub practice: bool,
     /// The chart's own fields, for the typed updates.
     pub chart: ChosenChart,
+    /// What the round's practice reset of what the player set, announced
+    /// before recording opens.
+    pub notice: Option<String>,
 }
 
 impl LoadingText {
@@ -109,10 +115,12 @@ impl LoadingText {
             chart: self.chart.clone(),
             preset: self.preset.clone(),
             practice: self.practice,
+            notice: self.notice.clone(),
         }
     }
 
-    /// The lines at `stage`: the heading, the chart's lines and the stage.
+    /// The lines at `stage`: the heading, the chart's lines and the stage,
+    /// then what the practice reset, if anything.
     pub fn lines(&self, stage: Stage) -> MenuPage {
         let line = |text: String, style| MenuLine { text, style };
         let heading = if self.practice {
@@ -120,16 +128,17 @@ impl LoadingText {
         } else {
             "NOW LOADING"
         };
-        MenuPage {
-            lines: vec![
-                line(heading.to_owned(), LineStyle::Folder),
-                line(self.title.clone(), LineStyle::Title),
-                line(self.artist.clone(), LineStyle::Chart),
-                line(format!("プリセット: {}", self.preset), LineStyle::Chart),
-                line(stage.text(), LineStyle::Search),
-            ],
-            caret: None,
+        let mut lines = vec![
+            line(heading.to_owned(), LineStyle::Folder),
+            line(self.title.clone(), LineStyle::Title),
+            line(self.artist.clone(), LineStyle::Chart),
+            line(format!("プリセット: {}", self.preset), LineStyle::Chart),
+            line(stage.text(), LineStyle::Search),
+        ];
+        if let Some(notice) = &self.notice {
+            lines.push(line(notice.clone(), LineStyle::Title));
         }
+        MenuPage { lines, caret: None }
     }
 }
 
@@ -148,6 +157,7 @@ mod tests {
             preset: "lr2-style".to_owned(),
             practice: false,
             chart: super::ChosenChart::default(),
+            notice: None,
         };
         let strings = |stage| {
             text.lines(stage)
@@ -172,5 +182,20 @@ mod tests {
             // No cursor: the play screen draws no bar under a line.
             assert!(p.lines.iter().all(|l| l.style != LineStyle::Cursor));
         }
+    }
+
+    /// What a round's practice reset shows as the last line, and in the
+    /// typed update beside it.
+    #[test]
+    fn the_lines_announce_a_reset() {
+        let notice = "the gauge normal no longer accepts 15%; it starts at 20%";
+        let text = LoadingText {
+            practice: true,
+            notice: Some(notice.to_owned()),
+            ..LoadingText::default()
+        };
+        let page = text.lines(Stage::Screen);
+        assert_eq!(page.lines.last().map(|l| l.text.as_str()), Some(notice));
+        assert_eq!(text.update(Stage::Screen).notice.as_deref(), Some(notice));
     }
 }

@@ -2558,6 +2558,7 @@ mod tests {
             },
             preset: "preset".to_owned(),
             practice: false,
+            notice: None,
         };
         let drawn = |line: &str| {
             let line = line.to_owned();
