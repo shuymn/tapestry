@@ -207,12 +207,16 @@ impl Cx<'_> {
         let raw = if trim == CoverTrim::None {
             Vec::new()
         } else {
+            // The signs are the exact sizes', after the offsets: rounding
+            // the edges can turn a negative size into 0.
             let mut raw = Vec::with_capacity(c.track.keys.len());
+            let mut negative = false;
             for k in &c.track.keys {
                 let r = self.key_rect(&c, k)?;
                 raw.push(r.model().ok_or_else(|| self.range(at, "dst"))?);
+                negative |= r.w < Q::int(0) || r.h < Q::int(0);
             }
-            if raw.iter().any(|&[.., w, h]| w < 0 || h < 0) {
+            if negative {
                 return self.drop_el(role, at, NoteKind::UnsupportedField { field: "dst" });
             }
             raw

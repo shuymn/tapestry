@@ -16,7 +16,9 @@ use bms_model::ChartBuilder;
 use common::lanes::{NOTES, body, hidden, hidden_object, lift, lift_object, note, with};
 use common::play::{Drawn, readouts_for};
 use common::{Loaded, has, import_body, import_sized, kinds};
-use skin_beatoraja::{Config, DeviationId, LaneApprox, NoteKind, OffsetValue, Severity};
+use skin_beatoraja::{
+    Config, CriticalPart, DeviationId, ImportError, LaneApprox, NoteKind, OffsetValue, Severity,
+};
 
 /// What shows at 1,000 ms with the covers at `[cover, lift, hidden]` ‰
 /// and HIDDEN+ `enabled`: every quad cut to its clip.
@@ -273,4 +275,33 @@ fn unsupported_hidden_plus_is_dropped() {
         },
     );
     dropped(&l, NoteKind::RuntimeOffset(5));
+}
+
+#[test]
+fn a_negative_size_rounding_to_zero_is_still_refused() {
+    // At 3840×2160 (r = 1/2) a width of −1 is −0.5 reference pixels and
+    // its edges round to one x; a height of −1 from y 1941 likewise. The
+    // line 1920 is at 120, below either rect [0, 100, 0, 10] or
+    // [0, 100, 10, 0]: an unchecked stretch-9 paint would draw whole.
+    for key in [
+        r#"{"x": 0, "y": 1940, "w": -1, "h": 20}"#,
+        r#"{"x": 0, "y": 1941, "w": 20, "h": -1}"#,
+    ] {
+        let at = |object: &str, id: &str| {
+            let objects = format!("{}, {}", note(""), object.replace("200", "1920"));
+            let dst = format!(r#"{{"id": "{id}", "stretch": 9, "dst": [{key}]}}"#);
+            import_sized([3_840, 2_160], &body("", &objects, &[NOTES, &dst]), &[])
+        };
+        dropped(
+            &at(&hidden_object(""), "hid"),
+            NoteKind::UnsupportedField { field: "dst" },
+        );
+        match at(&lift_object(""), "liftc").err() {
+            ImportError::Critical { part, why, .. } => {
+                assert_eq!(part, CriticalPart::Lift, "{key}");
+                assert_eq!(why, NoteKind::UnsupportedField { field: "dst" }, "{key}");
+            }
+            e => panic!("{key}: {e:?}"),
+        }
+    }
 }
