@@ -363,6 +363,56 @@ pub struct Loaded {
     practice: Option<(Practice, Section)>,
 }
 
+/// A loaded chart's file, the seed it was read with and its SHA-256
+/// ([`Loaded::source`]): what reads the chart again away from its session,
+/// with parts of its own.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChartSource {
+    path: PathBuf,
+    seed: u64,
+    sha256: [u8; 32],
+}
+
+impl ChartSource {
+    /// The chart at `path`, read with `seed`, whose file's SHA-256 is
+    /// `sha256`.
+    #[must_use]
+    pub const fn new(path: PathBuf, seed: u64, sha256: [u8; 32]) -> Self {
+        Self { path, seed, sha256 }
+    }
+
+    /// The chart's file.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// The chart read again from its file at `speed`, with `parts`'
+    /// ingestion and transform and the seed it was loaded with, as
+    /// [`Loaded::chart_at`] reads it.
+    ///
+    /// # Errors
+    ///
+    /// [`SessionError::ChartChanged`] when the file's SHA-256 is not the
+    /// one loaded, and what reading it refuses.
+    pub fn read(&self, parts: &Parts, speed: Speed) -> Result<Chart, SessionError> {
+        self.read_with(parts, speed).map(|(chart, _, _)| chart)
+    }
+
+    /// [`read`](Self::read), with the chart's record and warnings.
+    fn read_with(
+        &self,
+        parts: &Parts,
+        speed: Speed,
+    ) -> Result<(Chart, ChartRecord, Vec<String>), SessionError> {
+        let (chart, record, warnings) = Loaded::read_chart(&self.path, self.seed, speed, parts)?;
+        if record.identity.sha256 != self.sha256 {
+            return Err(SessionError::ChartChanged(self.path.clone()));
+        }
+        Ok((chart, record, warnings))
+    }
+}
+
 /// The start of one play: its number, and whether the preset file it
 /// should have reloaded was refused.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -475,7 +525,7 @@ impl Loaded {
             return Err(Box::new((SessionError::InvalidStep(config.step), shelf)));
         }
         shelf.check();
-        match Self::read_chart(chart_path, &config, &parts) {
+        match Self::read_chart(chart_path, config.seed, config.speed, &parts) {
             Ok((chart, chart_record, warnings)) => {
                 events.on_event(&SessionEvent::Load);
                 Ok(Self {
@@ -503,7 +553,8 @@ impl Loaded {
     /// its record and what the loader skipped or assumed.
     fn read_chart(
         chart_path: &Path,
-        config: &SessionConfig,
+        seed: u64,
+        speed: Speed,
         parts: &Parts,
     ) -> Result<(Chart, ChartRecord, Vec<String>), SessionError> {
         if !parts.ingest.accepts(chart_path) {
@@ -520,17 +571,17 @@ impl Loaded {
         let dir = chart_path.parent().unwrap_or_else(|| Path::new("."));
         let ingested = parts
             .ingest
-            .ingest(&bytes, dir, config.seed, config.speed)
+            .ingest(&bytes, dir, seed, speed)
             .map_err(SessionError::Ingest)?;
         let identity = ingested.chart.identity.clone();
-        let chart = parts.transform.apply(ingested.chart, config.seed);
+        let chart = parts.transform.apply(ingested.chart, seed);
         // Rendering culls by position and evaluation walks lanes in time
         // order: a transform must keep both orders (design.md "Chart
         // Model").
         chart.validate().map_err(SessionError::Transform)?;
         let chart_record = ChartRecord {
             identity,
-            random_seed: config.seed,
+            random_seed: seed,
             transform: parts.transform.id().record(),
         };
         Ok((chart, chart_record, ingested.warnings))
@@ -579,6 +630,19 @@ impl Loaded {
         self.read_at(speed).map(|(_, chart, _, _)| chart)
     }
 
+    /// The chart's file, the seed it was read with and its SHA-256: what
+    /// reads it again away from the session, with parts of its own (a
+    /// cancelled load's loudness, measured in the background: design.md
+    /// "Algorithms", per-chart volume normalization).
+    #[must_use]
+    pub fn source(&self) -> ChartSource {
+        ChartSource {
+            path: self.path.clone(),
+            seed: self.config.seed,
+            sha256: self.chart_record.identity.sha256,
+        }
+    }
+
     /// The chart read again at `speed`; refused when its file's SHA-256 is
     /// not the one loaded.
     fn read_at(
@@ -589,10 +653,7 @@ impl Loaded {
             speed,
             ..self.config.clone()
         };
-        let (chart, chart_record, warnings) = Self::read_chart(&self.path, &config, &self.parts)?;
-        if chart_record.identity.sha256 != self.chart_record.identity.sha256 {
-            return Err(SessionError::ChartChanged(self.path.clone()));
-        }
+        let (chart, chart_record, warnings) = self.source().read_with(&self.parts, speed)?;
         Ok((config, chart, chart_record, warnings))
     }
 

@@ -19,7 +19,10 @@
 //!   I/O priority), set by its start hook.
 //! - **Loudness.** The shelf also holds the loaded chart's loudness
 //!   ([`Loudness`]): a miss is measured during the chart's load, and its
-//!   measurements are stored only while the scan is quiet.
+//!   measurements are stored only while the scan is quiet. A load
+//!   cancelled during its measurement leaves the chart to the background
+//!   measurement ([`Worker`]), which pauses and is released with the scan;
+//!   its results are kept and stored as a load's own.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -35,7 +38,13 @@ use library::{
     Search,
 };
 
+use crate::background::{Job, Queued, Worker};
 use crate::loudness::{Host, Loudness};
+
+/// How often a load's wait for its chart's background measurement looks
+/// whether it was cancelled: a measurement asks about as often, before
+/// each block.
+pub const BACKGROUND_SLICE: Duration = Duration::from_millis(10);
 
 /// How long the last pass is over before the next starts, at the select
 /// screen.
@@ -145,6 +154,9 @@ pub struct Shelf {
     status: String,
     /// The loaded chart's loudness.
     loudness: Loudness,
+    /// The background measurement of charts whose load was cancelled
+    /// during theirs; none when its thread could not start.
+    background: Option<Worker>,
     /// Passes completed (dev-tools).
     #[cfg(feature = "dev-tools")]
     passes: u64,
@@ -167,16 +179,46 @@ impl Shelf {
             records,
             ..ScanOptions::default()
         };
-        Self::with_options(library, roots, rescan_after, options)
+        // In background mode as the scan.
+        let hook = options.on_thread_start.clone();
+        Self::with_worker(library, roots, rescan_after, options, || {
+            Worker::start(Box::new(crate::background::measure), hook)
+        })
     }
 
-    /// [`new`](Self::new), each pass's thread starting with `options`.
+    /// [`new`](Self::new), each pass's thread starting with `options`, the
+    /// background measurement's with nothing.
+    #[cfg(test)]
     pub(crate) fn with_options(
         library: Library,
         roots: Vec<PathBuf>,
         rescan_after: Duration,
         options: ScanOptions,
     ) -> Self {
+        Self::with_worker(library, roots, rescan_after, options, || {
+            Worker::start(Box::new(crate::background::measure), None)
+        })
+    }
+
+    /// [`with_options`](Self::with_options), the background measurement
+    /// started by `start`: a shelf whose background cannot start leaves a
+    /// cancelled load's chart to its next choice.
+    fn with_worker(
+        library: Library,
+        roots: Vec<PathBuf>,
+        rescan_after: Duration,
+        options: ScanOptions,
+        start: impl FnOnce() -> std::io::Result<Worker>,
+    ) -> Self {
+        let background = match start() {
+            Ok(worker) => Some(worker),
+            Err(e) => {
+                let line = format!("loudness: the background measurement cannot start: {e}");
+                eprintln!("{line}");
+                log::warn!("{line}");
+                None
+            }
+        };
         let mut shelf = Self {
             library,
             roots,
@@ -188,6 +230,7 @@ impl Shelf {
             seen: 0,
             status: String::new(),
             loudness: Loudness::default(),
+            background,
             #[cfg(feature = "dev-tools")]
             passes: 0,
             #[cfg(feature = "dev-tools")]
@@ -269,6 +312,7 @@ impl Shelf {
     /// next starts when it is due. `true` when the listed charts may have
     /// changed: a batch was committed or a pass ended.
     pub fn poll(&mut self, now: Instant) -> bool {
+        self.adopt();
         if let Some(scan) = &self.scan {
             if !scan.wait_finished(Duration::ZERO) {
                 let r = scan.report();
@@ -363,23 +407,37 @@ impl Shelf {
         }
     }
 
-    /// A chart was chosen: the scan pauses after the file in hand, and no
-    /// pass starts until the release.
+    /// The scan pauses after the file in hand, the background measurement
+    /// at its next check, and no pass starts until the release.
     pub fn pause(&mut self) {
+        self.request_pause(None);
+    }
+
+    /// `chart` was chosen: [`pause`](Self::pause), except that a
+    /// background measurement of `chart` goes on, since its load waits for
+    /// it ([`wait_background`](Self::wait_background)).
+    pub fn choose(&mut self, chart: &Path) {
+        self.request_pause(Some(chart));
+    }
+
+    fn request_pause(&mut self, chosen: Option<&Path>) {
         if !self.paused {
             self.paused = true;
             if let Some(scan) = &self.scan {
                 scan.request_pause();
             }
+            if let Some(worker) = &self.background {
+                worker.request_pause(chosen);
+            }
         }
     }
 
     /// Before a countdown: requests the pause if none is, and waits for the
-    /// scan to acknowledge it, however long that takes (design.md "Loading
-    /// and Song Selection": the countdown starts only after it), or returns
-    /// at once when no scan runs. Every `slice` it asks `cancelled` whether
-    /// to give up; once the wait has run `notice_after`, it calls `notice`
-    /// once.
+    /// scan and the background measurement to acknowledge it, however long
+    /// that takes (design.md "Loading and Song Selection": the countdown
+    /// starts only after it); without a scan it waits for the background
+    /// measurement alone. Every `slice` it asks `cancelled` whether to give
+    /// up; once the wait has run `notice_after`, it calls `notice` once.
     pub fn wait_paused(
         &mut self,
         slice: Duration,
@@ -391,10 +449,18 @@ impl Shelf {
         let started = Instant::now();
         let mut notice = Some(notice);
         loop {
-            match &self.scan {
-                None => return Paused::Idle,
-                Some(scan) if scan.wait_paused(slice) => return Paused::Acknowledged,
-                Some(_) => {}
+            let scan = match &self.scan {
+                None => Some(Paused::Idle),
+                Some(scan) if scan.wait_paused(slice) => Some(Paused::Acknowledged),
+                Some(_) => None,
+            };
+            if let Some(paused) = scan
+                && self
+                    .background
+                    .as_ref()
+                    .is_none_or(|w| w.wait_paused(slice))
+            {
+                return paused;
             }
             if cancelled() {
                 return Paused::Cancelled;
@@ -414,24 +480,126 @@ impl Shelf {
         if let Some(scan) = &self.scan {
             scan.release();
         }
+        if let Some(worker) = &self.background {
+            worker.release();
+        }
     }
 
     /// The chart `name` was loaded with `bank`: its plays' gain is looked
-    /// up, or measured now with `host` ([`Loudness::load`]).
+    /// up, or measured now with `host` ([`Loudness::load`]). A job of the
+    /// chart (its file `path`) waiting in the background is this load's
+    /// own now. [`game::Loading::Cancelled`] when the load was cancelled
+    /// during the measurement, which the quit key then leaves to the
+    /// background ([`leave_to_background`](Self::leave_to_background)).
     pub fn loaded(
         &mut self,
         chart: &Chart,
         bank: &Arc<SoundBank>,
         name: &str,
+        path: &Path,
         host: &mut dyn Host,
     ) -> game::Loading {
+        self.adopt();
+        if let Some(worker) = &self.background
+            && worker.take_waiting(path)
+        {
+            println!("loudness: {name} is no longer waiting in the background");
+        }
         self.loudness.load(&self.library, chart, bank, name, host)
     }
 
+    /// A load the quit key cancelled during its measurement: `job` is
+    /// measured in the background, unless the thread is gone. A close
+    /// leaves nothing to it, since the run ends.
+    pub fn leave_to_background(&self, job: Job) {
+        let Some(worker) = &self.background else {
+            return;
+        };
+        let name = job.name.clone();
+        let line = match worker.queue(job) {
+            Queued::Added => format!("loudness: {name} is left to the background"),
+            Queued::Already => return,
+            Queued::Dropped(old) => format!(
+                "loudness: {name} is left to the background, and {} is dropped from it",
+                file_name(&old)
+            ),
+            Queued::Ended => {
+                format!("loudness: {name} cannot be left to the background, which has ended")
+            }
+        };
+        println!("{line}");
+        log::info!("{line}");
+    }
+
+    /// Before its sounds decode, the load of `chart` (`name` in the log)
+    /// waits for the chart's background measurement if one runs, saying
+    /// so with `measuring`; the result is then kept, so the load finds it.
+    /// A measurement of another chart is waited for until it has stopped
+    /// for the choice's pause and dropped its bank, so this load's bank,
+    /// the engine's and the background's are never held together. Every
+    /// [`BACKGROUND_SLICE`] it asks `cancelled` whether to give up:
+    /// [`game::Loading::Cancelled`] then, and the measurement goes on.
+    pub fn wait_background(
+        &mut self,
+        chart: &Path,
+        name: &str,
+        mut cancelled: impl FnMut() -> bool,
+        measuring: impl FnOnce(),
+    ) -> game::Loading {
+        // Requested at the choice; here again for a load without one.
+        self.choose(chart);
+        let Some(worker) = &self.background else {
+            return game::Loading::Ready;
+        };
+        if !worker.holds(chart) {
+            while !worker.wait_paused(BACKGROUND_SLICE) {
+                if cancelled() {
+                    return game::Loading::Cancelled;
+                }
+            }
+            return game::Loading::Ready;
+        }
+        measuring();
+        let line = format!("loudness: waiting for {name}'s measurement in the background");
+        println!("{line}");
+        log::info!("{line}");
+        while !worker.wait_done(chart, BACKGROUND_SLICE) {
+            if cancelled() {
+                return game::Loading::Cancelled;
+            }
+        }
+        self.adopt();
+        game::Loading::Ready
+    }
+
+    /// Keeps the background's measurements in memory, those still wanted.
+    fn adopt(&mut self) {
+        if let Some(worker) = &self.background {
+            let results = worker.take_results();
+            self.keep(results);
+        }
+    }
+
+    /// Keeps the measurements of `results` still wanted.
+    fn keep(&mut self, results: Vec<crate::background::Finished>) {
+        for (key, row) in results.into_iter().filter_map(|f| f.measured) {
+            self.loudness.adopt(&self.library, key, row);
+        }
+    }
+
     /// Before a countdown, once [`wait_paused`](Self::wait_paused) found
-    /// the scan quiet: stores the measurements taken.
+    /// the scan quiet: stores the measurements taken, the background's
+    /// among them.
     pub fn store_loudness(&mut self) {
+        self.adopt();
         self.loudness.store(&mut self.library);
+    }
+
+    /// Whether the background measurement holds a job, and whether it has
+    /// none at all, held or waiting (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    pub fn background(&self) -> (bool, bool) {
+        self.background.as_ref().map_or((false, true), Worker::busy)
     }
 
     /// The gain of the loaded chart's plays.
@@ -461,14 +629,27 @@ impl Shelf {
 }
 
 impl Drop for Shelf {
-    /// Stops the running pass, waiting at most [`STOP_TIMEOUT`]: a pass
-    /// stuck on its file system is left to end on its own, keeping the
-    /// library's lock until it does or the process exits.
+    /// Stops the running pass and the background measurement, waiting at
+    /// most [`STOP_TIMEOUT`] for both together: a pass stuck on its file
+    /// system is left to end on its own, keeping the library's lock until
+    /// it does or the process exits, and so is a stuck measurement, whose
+    /// result nobody takes. The measurements the background completed are
+    /// stored with the load's.
     fn drop(&mut self) {
-        let quiet = match self.scan.take() {
-            Some(scan) => scan.stop_within(STOP_TIMEOUT),
-            None => true,
-        };
+        let background = self.background.take();
+        // Both stop at once, and share one deadline.
+        let deadline = Instant::now() + STOP_TIMEOUT;
+        if let Some(worker) = &background {
+            worker.stop();
+        }
+        let (quiet, stopped) = stop_together(
+            deadline,
+            Instant::now,
+            self.scan
+                .take()
+                .map(|scan| move |left| scan.stop_within(left)),
+            background.map(|worker| move |left| worker.stop_within(left)),
+        );
         if !quiet {
             let line = format!(
                 "library: the scan did not stop within {} s; it ends with the process",
@@ -477,9 +658,35 @@ impl Drop for Shelf {
             eprintln!("{line}");
             log::warn!("{line}");
         }
+        if let Some((ended, results)) = stopped {
+            if !ended {
+                let line = format!(
+                    "loudness: the background measurement did not stop within {} s; it ends with the process",
+                    STOP_TIMEOUT.as_secs()
+                );
+                eprintln!("{line}");
+                log::warn!("{line}");
+            }
+            self.keep(results);
+        }
         // A measurement is stored only when no scan may still commit.
         self.loudness.close(&mut self.library, quiet);
     }
+}
+
+/// Waits for the scan, then the background measurement, both already told
+/// to stop, until `deadline` on the clock `now`: each wait gets only the
+/// time left, so the two share one bound. Whether the scan stopped (or
+/// none ran), and what the background's wait gave.
+fn stop_together<W>(
+    deadline: Instant,
+    now: impl Fn() -> Instant,
+    scan: Option<impl FnOnce(Duration) -> bool>,
+    background: Option<impl FnOnce(Duration) -> W>,
+) -> (bool, Option<W>) {
+    let quiet = scan.is_none_or(|stop| stop(deadline.saturating_duration_since(now())));
+    let stopped = background.map(|stop| stop(deadline.saturating_duration_since(now())));
+    (quiet, stopped)
 }
 
 /// The scan thread's start hook: background mode, which lowers its CPU,
@@ -664,6 +871,13 @@ mod tests {
     type Gate = std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>;
 
     fn gated(dir: &Path) -> (Shelf, Gate) {
+        gated_with(dir, || {
+            Worker::start(Box::new(crate::background::measure), None)
+        })
+    }
+
+    /// [`gated`], the background started by `start`.
+    fn gated_with(dir: &Path, start: impl FnOnce() -> std::io::Result<Worker>) -> (Shelf, Gate) {
         let root = DataRoot::new(dir.join("data"));
         let charts = dir.join("charts");
         chart(&charts, "a.bms");
@@ -680,7 +894,13 @@ mod tests {
             })),
             ..library::ScanOptions::default()
         };
-        let shelf = Shelf::with_options(library, vec![charts], Duration::from_secs(60), options);
+        let shelf = Shelf::with_worker(
+            library,
+            vec![charts],
+            Duration::from_secs(60),
+            options,
+            start,
+        );
         (shelf, gate)
     }
 
@@ -775,6 +995,10 @@ mod tests {
         }
     }
 
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    use crate::background::{Job, Queued, Worker};
     use crate::loudness::fixture::{self as sound, Host, bank, square, write_sound};
 
     /// A shelf without roots (no scan).
@@ -788,6 +1012,15 @@ mod tests {
         )
     }
 
+    /// The background job of the chart at `path`.
+    fn job(path: &Path) -> Job {
+        Job {
+            source: game::ChartSource::new(path.to_owned(), 0, [0; 32]),
+            rate: sound::RATE,
+            name: "a.bms".to_owned(),
+        }
+    }
+
     /// Loads a chart of a two-second sound into `shelf`, measured during
     /// the load; its key.
     fn load(shelf: &mut Shelf, dir: &Path) -> library::LoudnessKey {
@@ -797,9 +1030,459 @@ mod tests {
         let b = bank(&c);
         let key = crate::loudness::key(&c, &b).unwrap();
         let mut host = Host::default();
-        shelf.loaded(&c, &b, "a.bms", &mut host);
+        shelf.loaded(&c, &b, "a.bms", &songs.join("a.bms"), &mut host);
         assert_eq!(host.measuring, 1);
         key
+    }
+
+    /// The row a fake background measurement gives.
+    const ROW: library::LoudnessRow = library::LoudnessRow {
+        integrated: Some(-30.0),
+        true_peak: 0.25,
+        over_range: false,
+    };
+
+    /// A background measurement as the real one is to the shelf: block
+    /// after block of 10 ms, asking `stop` before each and keeping nothing
+    /// once told to; it gives [`ROW`] under `key` after `blocks`, and not
+    /// before `open` is set.
+    fn fake(
+        key: library::LoudnessKey,
+        blocks: usize,
+        open: &Arc<std::sync::atomic::AtomicBool>,
+    ) -> crate::background::Measure {
+        let open = Arc::clone(open);
+        Box::new(move |_, stop| {
+            let mut n = 0;
+            loop {
+                if stop() {
+                    return crate::background::Outcome::Stopped;
+                }
+                if n >= blocks && open.load(std::sync::atomic::Ordering::SeqCst) {
+                    return crate::background::Outcome::Measured(key, ROW);
+                }
+                n += 1;
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        })
+    }
+
+    /// A shelf without roots whose background measures with `measure`.
+    fn with_background(dir: &Path, measure: crate::background::Measure) -> Shelf {
+        let (library, _) = open(&DataRoot::new(dir.join("data"))).unwrap();
+        Shelf::with_worker(
+            library,
+            Vec::new(),
+            Duration::from_secs(60),
+            library::ScanOptions::default(),
+            || Worker::start(measure, None),
+        )
+    }
+
+    /// A chart of a two-second sound, its bank, key and file.
+    fn song(
+        dir: &Path,
+    ) -> (
+        bms_model::Chart,
+        Arc<audio::SoundBank>,
+        library::LoudnessKey,
+        PathBuf,
+    ) {
+        let songs = dir.join("song");
+        write_sound(&songs, &square(2.0, 3_000));
+        let c = sound::chart(&songs, 1);
+        let b = bank(&c);
+        let key = crate::loudness::key(&c, &b).unwrap();
+        (c, b, key, songs.join("a.bms"))
+    }
+
+    /// The load of `c` chosen as selection does it, cancelled by the quit
+    /// key at its measurement's first block, which leaves the chart to the
+    /// background; back to selection.
+    fn cancelled_load(
+        shelf: &mut Shelf,
+        c: &bms_model::Chart,
+        b: &Arc<audio::SoundBank>,
+        path: &Path,
+    ) {
+        shelf.choose(path);
+        let mut host = Host {
+            cancel_at: Some(0),
+            ..Host::default()
+        };
+        assert_eq!(
+            shelf.loaded(c, b, "a.bms", path, &mut host),
+            game::Loading::Cancelled
+        );
+        shelf.leave_to_background(job(path));
+        shelf.release();
+    }
+
+    fn until(what: &str, mut done: impl FnMut() -> bool) {
+        let begun = Instant::now();
+        while !done() {
+            assert!(begun.elapsed() < WATCHDOG, "{what} never happened");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn worker(shelf: &Shelf) -> &Worker {
+        shelf.background.as_ref().unwrap()
+    }
+
+    /// A load cancelled during its measurement leaves the chart to the
+    /// background, which measures it while selection shows; the result is
+    /// kept and stored at the next countdown, and the chart's next load
+    /// measures nothing.
+    #[test]
+    fn a_cancelled_measurement_is_taken_in_the_background_and_stored() {
+        let dir = tempfile::tempdir().unwrap();
+        let open = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let (c, b, key, path) = song(dir.path());
+        let mut shelf = with_background(dir.path(), fake(key, 5, &open));
+        cancelled_load(&mut shelf, &c, &b, &path);
+        until("the background's end", || {
+            shelf.poll(Instant::now());
+            worker(&shelf).busy().1
+        });
+        shelf.poll(Instant::now());
+        assert_eq!(wait(&mut shelf), Paused::Idle);
+        shelf.store_loudness();
+        assert_eq!(shelf.library.loudness(&key).unwrap(), Some(ROW));
+        let mut host = Host::default();
+        shelf.choose(&path);
+        assert_eq!(
+            shelf.loaded(&c, &b, "a.bms", &path, &mut host),
+            game::Loading::Ready
+        );
+        assert_eq!(host.measuring, 0);
+        assert_eq!(shelf.gain(), crate::loudness::gain(&ROW));
+    }
+
+    /// The chart's load waits for its running background measurement,
+    /// which the choice's pause lets go on; the quit key cancels the wait,
+    /// not the measurement, and the next load takes its result without
+    /// measuring.
+    #[test]
+    fn the_load_waits_for_its_charts_background_measurement() {
+        let dir = tempfile::tempdir().unwrap();
+        let open = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (c, b, key, path) = song(dir.path());
+        let mut shelf = with_background(dir.path(), fake(key, 0, &open));
+        cancelled_load(&mut shelf, &c, &b, &path);
+        until("the background's start", || worker(&shelf).holds(&path));
+        shelf.choose(&path);
+        let (mut asked, mut said) = (0, 0);
+        let waited = shelf.wait_background(
+            &path,
+            "a.bms",
+            || {
+                asked += 1;
+                asked == 3
+            },
+            || said += 1,
+        );
+        assert_eq!(waited, game::Loading::Cancelled);
+        assert_eq!(said, 1);
+        assert!(worker(&shelf).holds(&path));
+        shelf.release();
+        // Chosen again: the measurement goes on through the pause.
+        shelf.choose(&path);
+        open.store(true, std::sync::atomic::Ordering::SeqCst);
+        let waited = shelf.wait_background(&path, "a.bms", || false, || {});
+        assert_eq!(waited, game::Loading::Ready);
+        let mut host = Host::default();
+        shelf.loaded(&c, &b, "a.bms", &path, &mut host);
+        assert_eq!(host.measuring, 0);
+        assert_eq!(shelf.gain(), crate::loudness::gain(&ROW));
+        assert_eq!(wait(&mut shelf), Paused::Idle);
+    }
+
+    /// Another chart's choice pauses the background measurement, and the
+    /// countdown starts only once it has stopped at a block (200 ms long
+    /// here): nothing is measured during the play, until the result
+    /// releases it.
+    #[test]
+    fn the_countdown_waits_for_the_background_to_pause() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let (_, _, key, _) = song(dir.path());
+        let inside = Arc::new(AtomicBool::new(false));
+        let blocks = Arc::new(AtomicUsize::new(0));
+        let (i, n) = (Arc::clone(&inside), Arc::clone(&blocks));
+        let measure: crate::background::Measure = Box::new(move |_, stop| {
+            i.store(true, Ordering::SeqCst);
+            let outcome = loop {
+                if stop() {
+                    break crate::background::Outcome::Stopped;
+                }
+                if n.fetch_add(1, Ordering::SeqCst) > 1_000 {
+                    break crate::background::Outcome::Measured(key, ROW);
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            };
+            i.store(false, Ordering::SeqCst);
+            outcome
+        });
+        let mut shelf = with_background(dir.path(), measure);
+        let other = dir.path().join("other.bms");
+        worker(&shelf).queue(job(&other));
+        until("the background's block", || {
+            blocks.load(Ordering::SeqCst) > 0
+        });
+        shelf.choose(&dir.path().join("a.bms"));
+        // A pause that never comes fails the test rather than hanging it.
+        let begun = Instant::now();
+        let paused = shelf.wait_paused(
+            PAUSE_SLICE,
+            || begun.elapsed() > Duration::from_secs(30),
+            Duration::MAX,
+            || {},
+        );
+        assert_eq!(paused, Paused::Idle);
+        assert!(!inside.load(Ordering::SeqCst));
+        let paused_at = blocks.load(Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(blocks.load(Ordering::SeqCst), paused_at);
+        // The result releases it: measured again from its start.
+        shelf.release();
+        until("the next block", || {
+            blocks.load(Ordering::SeqCst) > paused_at
+        });
+    }
+
+    /// Another chart's load waits, before its sounds decode, until the
+    /// background has stopped for the pause and dropped its bank: the
+    /// background thread is held (descheduled) before its next check
+    /// until the load's wait has begun, and the wait returns only once the
+    /// bank is gone.
+    #[test]
+    fn another_charts_load_waits_for_the_background_bank_to_go() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let (_, _, _, path) = song(dir.path());
+        let other = dir.path().join("other.bms");
+        let bank = Arc::new(AtomicBool::new(false));
+        let (go_tx, go) = std::sync::mpsc::channel::<()>();
+        let held = Arc::clone(&bank);
+        let measure: crate::background::Measure = Box::new(move |_, stop| {
+            /// Drops the "bank" however the measurement ends.
+            struct Bank(Arc<AtomicBool>);
+            impl Drop for Bank {
+                fn drop(&mut self) {
+                    self.0.store(false, Ordering::SeqCst);
+                }
+            }
+            held.store(true, Ordering::SeqCst);
+            let _bank = Bank(Arc::clone(&held));
+            // Descheduled before its next check, until the test lets it on.
+            let _ = go.recv();
+            loop {
+                if stop() {
+                    return crate::background::Outcome::Stopped;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        });
+        let mut shelf = with_background(dir.path(), measure);
+        assert_eq!(worker(&shelf).queue(job(&other)), Queued::Added);
+        until("the background's bank", || bank.load(Ordering::SeqCst));
+        shelf.choose(&path);
+        let mut asked = 0;
+        let begun = Instant::now();
+        let waited = shelf.wait_background(
+            &path,
+            "a.bms",
+            || {
+                // The load waits: only now may the background go on.
+                asked += 1;
+                if asked == 1 {
+                    let _ = go_tx.send(());
+                }
+                // A pause never acknowledged fails the test, not hangs it.
+                begun.elapsed() > WATCHDOG
+            },
+            || panic!("another chart's measurement is not this load's"),
+        );
+        let held_at_return = bank.load(Ordering::SeqCst);
+        // Lets a background the wait did not wait for end too.
+        let _ = go_tx.send(());
+        assert_eq!(waited, game::Loading::Ready);
+        assert!(
+            !held_at_return,
+            "the load went on beside the background's bank"
+        );
+        assert!(asked > 0);
+    }
+
+    /// The scan's and the background's stops share one deadline: on a
+    /// clock the waits move, the background's wait gets only what the
+    /// scan's left, and nothing once the scan used it all.
+    #[test]
+    fn the_scan_and_the_background_share_one_stop_deadline() {
+        use std::cell::Cell;
+        let start = Instant::now();
+        let deadline = start + super::STOP_TIMEOUT;
+        for (scan_took, left) in [
+            (Duration::ZERO, super::STOP_TIMEOUT),
+            (
+                Duration::from_millis(1_500),
+                super::STOP_TIMEOUT - Duration::from_millis(1_500),
+            ),
+            (super::STOP_TIMEOUT * 2, Duration::ZERO),
+        ] {
+            let clock = Cell::new(start);
+            let budgets = Cell::new((None, None));
+            let (quiet, stopped) = super::stop_together(
+                deadline,
+                || clock.get(),
+                Some(|budget| {
+                    budgets.set((Some(budget), None));
+                    clock.set(clock.get() + scan_took);
+                    false
+                }),
+                Some(|budget| {
+                    budgets.set((budgets.get().0, Some(budget)));
+                    "stopped"
+                }),
+            );
+            assert!(!quiet);
+            assert_eq!(stopped, Some("stopped"));
+            assert_eq!(
+                budgets.get(),
+                (Some(super::STOP_TIMEOUT), Some(left)),
+                "after a scan wait of {scan_took:?}"
+            );
+        }
+        // Without a scan the background has the whole bound.
+        let (quiet, stopped) = super::stop_together(
+            deadline,
+            || start,
+            None::<fn(Duration) -> bool>,
+            Some(|budget| budget),
+        );
+        assert!(quiet);
+        assert_eq!(stopped, Some(super::STOP_TIMEOUT));
+    }
+
+    /// The end of a run with both the scan and the background stuck ends:
+    /// neither is joined, so the drop returns (the bound itself is
+    /// [`the_scan_and_the_background_share_one_stop_deadline`]'s).
+    #[test]
+    fn a_stuck_scan_and_background_do_not_hold_the_end() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let (_, _, key, path) = song(dir.path());
+        let (started, open) = (
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let (s, o) = (Arc::clone(&started), Arc::clone(&open));
+        // Stuck on its file system: it asks nothing until opened.
+        let measure: crate::background::Measure = Box::new(move |_, _| {
+            s.store(true, Ordering::SeqCst);
+            while !o.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            crate::background::Outcome::Measured(key, ROW)
+        });
+        let (shelf, gate) = gated_with(dir.path(), || Worker::start(measure, None));
+        worker(&shelf).queue(job(&path));
+        until("the background's start", || started.load(Ordering::SeqCst));
+        let (dropped_tx, dropped) = std::sync::mpsc::channel();
+        let begun = Instant::now();
+        let dropping = std::thread::spawn(move || {
+            drop(shelf);
+            let _ = dropped_tx.send(());
+        });
+        // A join that waits for the stuck ones fails here, not hangs.
+        let ended = dropped.recv_timeout(WATCHDOG);
+        let took = begun.elapsed();
+        open.store(true, Ordering::SeqCst);
+        open_gate(&gate);
+        dropping.join().unwrap();
+        assert!(
+            ended.is_ok(),
+            "the end waited for the stuck scan or background"
+        );
+        assert!(took >= super::STOP_TIMEOUT, "{took:?}");
+    }
+
+    /// A chart whose background job only waits is the load's own: taken
+    /// from the queue and measured by the load.
+    #[test]
+    fn a_waiting_background_job_is_taken_by_its_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let open = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (c, b, key, path) = song(dir.path());
+        let other = dir.path().join("other.bms");
+        let mut shelf = with_background(dir.path(), fake(key, 0, &open));
+        // Another chart runs, this one waits behind it.
+        assert_eq!(worker(&shelf).queue(job(&other)), Queued::Added);
+        until("the other's start", || worker(&shelf).holds(&other));
+        cancelled_load(&mut shelf, &c, &b, &path);
+        shelf.choose(&path);
+        assert_eq!(
+            shelf.wait_background(&path, "a.bms", || false, || {}),
+            game::Loading::Ready
+        );
+        let mut host = Host::default();
+        shelf.loaded(&c, &b, "a.bms", &path, &mut host);
+        assert_eq!(host.measuring, 1);
+        assert!(!worker(&shelf).take_waiting(&path));
+        open.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The end of a run while the background measures stops it at its
+    /// next block: the drop returns before its stop bound, long before the
+    /// measurement could end, and nothing of it is stored.
+    #[test]
+    fn exit_while_measuring_in_the_background_stores_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let open = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let (c, b, key, path) = song(dir.path());
+        // 3 s of blocks.
+        let mut shelf = with_background(dir.path(), fake(key, 300, &open));
+        cancelled_load(&mut shelf, &c, &b, &path);
+        until("the background's start", || worker(&shelf).holds(&path));
+        let begun = Instant::now();
+        drop(shelf);
+        assert!(
+            begun.elapsed() < super::STOP_TIMEOUT,
+            "{:?}",
+            begun.elapsed()
+        );
+        let (library, _) = open_library(dir.path());
+        assert_eq!(library.loudness(&key).unwrap(), None);
+    }
+
+    fn open_library(dir: &Path) -> (library::Library, library::Opened) {
+        open(&DataRoot::new(dir.join("data"))).unwrap()
+    }
+
+    /// A shelf whose background could not start leaves a cancelled load's
+    /// chart to its next choice, which measures it.
+    #[test]
+    fn without_its_background_a_cancelled_chart_is_measured_at_its_next_choice() {
+        let dir = tempfile::tempdir().unwrap();
+        let (c, b, _, path) = song(dir.path());
+        let (library, _) = open_library(dir.path());
+        let mut shelf = Shelf::with_worker(
+            library,
+            Vec::new(),
+            Duration::from_secs(60),
+            library::ScanOptions::default(),
+            || Err(std::io::Error::other("no thread (test)")),
+        );
+        cancelled_load(&mut shelf, &c, &b, &path);
+        assert_eq!(
+            shelf.wait_background(&path, "a.bms", || false, || {}),
+            game::Loading::Ready
+        );
+        let mut host = Host::default();
+        shelf.loaded(&c, &b, "a.bms", &path, &mut host);
+        assert_eq!(host.measuring, 1);
+        assert_eq!(wait(&mut shelf), Paused::Idle);
     }
 
     /// The wait for the pause does not wait for the loudness, which the
