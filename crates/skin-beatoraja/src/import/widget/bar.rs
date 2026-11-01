@@ -94,14 +94,9 @@ impl Cx<'_> {
         let Some(c) = self.common_with(role, &dst, o)? else {
             return Ok(None);
         };
-        let Some((image, cell)) = self.add_src_image(&c, img, &s, s.div)? else {
+        let Some((image, track, native)) = self.src_image_track(&c, img, &s)? else {
             return Ok(None);
         };
-        let Some((rects, native)) = self.baked_rects(&c, cell)? else {
-            self.drop_el(role, at, NoteKind::Stretch(c.stretch_mode))?;
-            return Ok(None);
-        };
-        let track = self.model_track(&c, &rects)?;
         self.retained(&c)?;
         self.lane_approx(at, CriticalPart::Lanes, LaneApprox::BarLine)?;
         let def = BarGroupDef {
