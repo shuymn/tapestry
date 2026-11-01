@@ -1447,9 +1447,10 @@ impl AppRig for PlayerRig<'_> {
             .begin_load(Arc::new(chart.clone()), loaded.section().cloned());
         let rounds = loaded.section().map(|_| schedule.clone());
         let speed = loaded.config().speed;
-        // The chart's measurement running in the background is waited for
-        // before the sounds decode, so its 1× bank is gone before this
-        // load's: the load then finds its result.
+        // A measurement running in the background is waited for before the
+        // sounds decode, so its 1× bank is gone before this load's: this
+        // chart's to its end, whose result the load then finds, another's
+        // until it has stopped for the pause.
         let waiting = self.clock.now();
         let sel = self.selection.as_mut().ok_or(ChartLoadError::NoSelection)?;
         let controls = self.controls;
