@@ -30,6 +30,7 @@ use std::collections::VecDeque;
 use std::io;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -379,9 +380,16 @@ fn run(shared: &Shared, measure: &mut Measure) {
             }
         };
         let path = job.path().to_owned();
+        // Whether the measurement was told to stop: a stop it was told is
+        // a pause's or the end's, whatever the state is when it returns.
+        let told = AtomicBool::new(false);
         let stop = || {
             let s = shared.lock();
-            s.shutdown || !s.may_run(&path)
+            let stop = s.shutdown || !s.may_run(&path);
+            if stop {
+                told.store(true, Ordering::Relaxed);
+            }
+            stop
         };
         let outcome = panic::catch_unwind(AssertUnwindSafe(|| measure(&job, &stop)))
             .unwrap_or_else(|_| {
@@ -389,9 +397,10 @@ fn run(shared: &Shared, measure: &mut Measure) {
             });
         let mut s = shared.lock();
         let measured = match outcome {
-            // Kept as the job in hand: measured again once released, or
-            // dropped at the shutdown.
-            Outcome::Stopped if s.shutdown || !s.may_run(&path) => continue,
+            // Kept as the job in hand, even when the pause was released
+            // meanwhile: measured again from the beginning once it may be,
+            // or dropped at the shutdown.
+            Outcome::Stopped if told.load(Ordering::Relaxed) => continue,
             Outcome::Measured(key, row) => Some((key, row)),
             Outcome::Stopped => {
                 loudness::log_line(
@@ -739,6 +748,63 @@ mod tests {
         assert_eq!(paths(&results), all(&["a", "b"]));
         assert_eq!(results[0].measured, None);
         assert_eq!(results[1].measured, Some((key(Path::new("b")), ROW)));
+    }
+
+    /// A measurement told to stop by a pause, whose pause is released
+    /// before the thread takes the lock again, keeps its job: measured
+    /// again from the beginning, never dropped. The measurement waits at a
+    /// barrier after its stop until the test has released the pause.
+    #[test]
+    fn a_pause_released_before_the_stop_returns_keeps_the_job() {
+        let (stopping_tx, stopping) = std::sync::mpsc::channel();
+        let (go_tx, go) = std::sync::mpsc::channel::<()>();
+        let runs = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&runs);
+        let measure: Measure = Box::new(move |job, stop| {
+            if counted.fetch_add(1, Ordering::SeqCst) > 0 {
+                return Outcome::Measured(key(job.path()), ROW);
+            }
+            while !stop() {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let _ = stopping_tx.send(());
+            let _ = go.recv();
+            Outcome::Stopped
+        });
+        let worker = Worker::start(measure, None).unwrap();
+        worker.queue(job("a"));
+        until("a's start", || runs.load(Ordering::SeqCst) == 1);
+        worker.request_pause(None);
+        stopping.recv_timeout(WATCHDOG).unwrap();
+        worker.release();
+        go_tx.send(()).unwrap();
+        let results = drain(&worker);
+        assert_eq!(
+            results,
+            vec![Finished {
+                path: PathBuf::from("a"),
+                measured: Some((key(Path::new("a")), ROW)),
+            }]
+        );
+        assert_eq!(runs.load(Ordering::SeqCst), 2);
+    }
+
+    /// A measurement that stops without being told gives nothing and is
+    /// not run again.
+    #[test]
+    fn a_stop_not_asked_for_gives_nothing() {
+        let runs = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&runs);
+        let measure: Measure = Box::new(move |_, _| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            Outcome::Stopped
+        });
+        let worker = Worker::start(measure, None).unwrap();
+        worker.queue(job("a"));
+        let results = drain(&worker);
+        assert_eq!(paths(&results), all(&["a"]));
+        assert_eq!(results[0].measured, None);
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
     }
 
     /// A thread that ended (its start hook panicked) takes no job, holds
