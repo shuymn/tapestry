@@ -308,6 +308,106 @@ fn check_f2(_: &Header, i: Imported) {
     let d4 = skin_beatoraja::NoteKind::Deviation(skin_beatoraja::DeviationId::D4);
     let deviations = i.report.notes.iter().filter(|n| n.kind == d4).count();
     assert_eq!(deviations, 1_483);
+    // Drawn with every readout known: each number shows its digits and
+    // nothing is dropped.
+    let chart = bms_model::ChartBuilder::new(150_000)
+        .tap(
+            bms_model::Lane::new(1).unwrap(),
+            bms_model::TimeUs(1_000_000),
+        )
+        .build()
+        .unwrap();
+    let range = skin_model::BpmRange {
+        min_x100: 7_599,
+        max_x100: 30_000,
+    };
+    let known = skin_model::FrameReadouts {
+        bpm_current_x100: Some(15_075),
+        hispeed_x100: Some(105),
+        duration: Some(skin_model::DurationRatio {
+            numerator: 6_675,
+            denominator: 10,
+        }),
+        // All off, their amounts stored; the lanes draw none of them.
+        covers: skin_model::CoverSettings {
+            cover: 500,
+            lift: 250,
+            hidden: 120,
+            cover_enabled: false,
+            lift_enabled: false,
+            hidden_enabled: false,
+            adjusting: false,
+        },
+    };
+    // In ROTATION's order at 0 ms, one note at 1 s: rates 100.00 and 0.00,
+    // BPMs 300, 75 and 150.75, 0 s played, 1 s left, the covers, hi-speed
+    // 1.05 and 667.5 ms.
+    #[rustfmt::skip]
+    let shown = [
+        "100", "0", "0", "0", "0", "0", "300", "75", "150", "0", "0", "0", "1",
+        "500", "250", "120", "375", "105", "1", "5", "668", "400",
+    ];
+    let mut d = Drawn::over_with(i.skin, &chart, Some(range));
+    d.readouts = Some(known);
+    assert_eq!(f2_numbers(&mut d), f2_expected(&shown));
+    // Unknown, the tempo, hi-speed and duration numbers draw nothing.
+    let mut d = Drawn::over_with(d.skin, &chart, None);
+    d.readouts = Some(skin_model::FrameReadouts {
+        bpm_current_x100: None,
+        hispeed_x100: None,
+        duration: None,
+        ..known
+    });
+    let mut hidden = shown;
+    for k in [6, 7, 8, 17, 18, 19, 20, 21] {
+        hidden[k] = "";
+    }
+    assert_eq!(f2_numbers(&mut d), f2_expected(&hidden));
+}
+
+/// What F2 shows when ROTATION's numbers show `shown` (empty when hidden):
+/// its 1 483 numbers in turn, then the count's 0.
+fn f2_expected(shown: &[&str; 22]) -> Vec<String> {
+    (0..1_483)
+        .map(|k| shown[k % shown.len()])
+        .filter(|s| !s.is_empty())
+        .chain(["0"])
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The numbers F2's frame at 0 ms draws, in draw order, with none of its
+/// quads dropped. Every image is a strip of ten digits, so a glyph's frame
+/// index modulo 10 is its digit; the cells of one number advance right,
+/// so a cell not right of the last starts the next number.
+fn f2_numbers(d: &mut Drawn) -> Vec<String> {
+    let quads = d.frame(0, &[]);
+    assert_eq!(d.batch.dropped(), 0);
+    let digit: std::collections::HashMap<_, _> = d
+        .uvs
+        .frames()
+        .iter()
+        .enumerate()
+        .map(|(k, f)| {
+            (
+                f.uv.map(f32::to_bits),
+                char::from_digit(u32::try_from(k % 10).unwrap(), 10).unwrap(),
+            )
+        })
+        .collect();
+    let mut numbers: Vec<String> = Vec::new();
+    let mut last = f32::INFINITY;
+    for q in &quads {
+        if q.rect[0] <= last {
+            numbers.push(String::new());
+        }
+        last = q.rect[0];
+        numbers
+            .last_mut()
+            .unwrap()
+            .push(digit[&q.uv.map(f32::to_bits)]);
+    }
+    numbers
 }
 
 /// F6: [`common::bitmap_fonts`] with each font also at the file size cap,
