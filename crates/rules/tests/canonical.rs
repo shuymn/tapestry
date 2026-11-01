@@ -13,10 +13,10 @@ use proptest::strategy::ValueTree;
 use proptest::test_runner::TestRunner;
 use rules::{
     Assignment, DefaultTotal, Denominator, EmptyPoorRange, EmptyPoorRule, GaugeDelta, GaugeKind,
-    GaugeRule, GaugeValue, HeadEligibility, HeaderPolicy, Implementation, JudgeWindows, LaneTable,
-    LateHeadRule, LnEndWindows, LnMode, LnModeRule, LowDamage, MineRule, MissRule, PerJudgment,
-    PerLaneClass, RankScale, RuleError, RulePreset, SameTimeOrder, ScaledRank, ScoreWeights,
-    TotalCorrection, TotalMode, Window, WindowPolicy,
+    GaugeRule, GaugeValue, HeaderPolicy, Implementation, JudgeWindows, LaneTable, LateHeadRule,
+    LnEndWindows, LnMode, LnModeRule, LowDamage, MineRule, MissRule, PerJudgment, PerLaneClass,
+    RankScale, RuleError, RulePreset, SameTimeOrder, ScaledRank, ScoreWeights, TotalCorrection,
+    TotalMode, Window, WindowPolicy,
 };
 
 const FULL: i64 = GaugeValue::FULL.0;
@@ -294,10 +294,6 @@ fn preset() -> impl Strategy<Value = RulePreset> {
                 Just(Assignment::NearestTiesEarlier),
                 Just(Assignment::ComboPriority)
             ],
-            prop_oneof![
-                Just(HeadEligibility::InsideBad),
-                Just(HeadEligibility::NotLateBad)
-            ],
         ),
         prop_oneof![
             prop_oneof![1_i64..64, 1_i64..=i64::MAX]
@@ -313,7 +309,7 @@ fn preset() -> impl Strategy<Value = RulePreset> {
             |(
                 (id, version, keys, scratch),
                 [breaks_combo, counts_bp, counted],
-                (headers, window_policy, assignment, head_eligibility),
+                (headers, window_policy, assignment),
                 default_total,
                 gauges,
                 (ex, breaks_combo_by, counts_bp_by),
@@ -347,7 +343,6 @@ fn preset() -> impl Strategy<Value = RulePreset> {
                     ln_mode: LnModeRule {
                         default: LnMode::Ln,
                         late_head: LateHeadRule::CompletesAtPress,
-                        head_eligibility,
                     },
                     total_mode: TotalMode::ScalesIncrease,
                     mine: MineRule::WhileHeld {
@@ -374,7 +369,7 @@ proptest! {
 fn generator_reaches_every_variant_and_length_class() {
     let mut runner = TestRunner::deterministic();
     let presets = preset();
-    let mut counts = [0_usize; 36];
+    let mut counts = [0_usize; 34];
     // Per boolean field, whether it was seen false and true.
     let mut bools_seen = [[false; 2]; 13];
     for _ in 0..256 {
@@ -433,8 +428,6 @@ fn generator_reaches_every_variant_and_length_class() {
             p.headers == HeaderPolicy::DefExRankFirst,
             p.assignment == Assignment::NearestTiesEarlier,
             p.assignment == Assignment::ComboPriority,
-            p.ln_mode.head_eligibility == HeadEligibility::InsideBad,
-            p.ln_mode.head_eligibility == HeadEligibility::NotLateBad,
             // Ranks out of list order, spread apart, and of two or three
             // varint bytes.
             p.gauges.windows(2).any(|w| w[0].lamp > w[1].lamp),
@@ -492,8 +485,8 @@ fn canonical_round_trips_lamp_ranks() {
         rules::lr2_style(),
     ] {
         let bytes = preset.canonical_bytes();
-        assert_eq!(bytes.first(), Some(&11));
-        assert_eq!(rules::CANONICAL_VERSION, 11);
+        assert_eq!(bytes.first(), Some(&12));
+        assert_eq!(rules::CANONICAL_VERSION, 12);
         assert_eq!(RulePreset::from_canonical_bytes(&bytes), Ok(preset.clone()));
         let mut changed = preset.clone();
         let top = changed.gauges.iter().map(|g| g.lamp).max().unwrap();

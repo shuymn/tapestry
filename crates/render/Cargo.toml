@@ -1,7 +1,7 @@
 [package]
 name = "render"
 version = "0.0.0"
-description = "The play screen and menu text: wgpu on DX12, the sprite batch, the bitmap font, the skin boundary with the simple skin, and Japanese text for menus."
+description = "The play screen and menu text: wgpu on DX12, the sprite batch and its staging, the atlas texture array with the bitmap font, the canvas projection and clips, the skin boundary with the simple skin, and Japanese text for menus."
 edition.workspace = true
 license = "GPL-3.0-or-later"
 repository.workspace = true
@@ -19,6 +19,7 @@ game.workspace = true
 glyphon.workspace = true
 pollster.workspace = true
 rules.workspace = true
+skin-model.workspace = true
 thiserror.workspace = true
 wgpu.workspace = true
 wgpu-hal.workspace = true

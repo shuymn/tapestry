@@ -1,6 +1,7 @@
-//! The renderer: one instanced sprite pipeline per blend over the atlas,
-//! drawing a skin's batch, run by run in its order, into a swap chain or an
-//! offscreen target.
+//! The renderer: one instanced sprite pipeline per blend over the atlas
+//! texture array, drawing a skin's batch, run by run in its order and
+//! under each run's scissor, projected from the skin's canvas into a swap
+//! chain or an offscreen target.
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
@@ -9,46 +10,58 @@ use std::time::{Duration, Instant};
 
 use bms_model::Chart;
 use eval::Section;
+use skin_model::AtlasLimits;
 use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
 use windows::Win32::Graphics::Dxgi::{DXGI_FRAME_STATISTICS, IDXGISwapChain3};
 use windows::Win32::System::Threading::WaitForSingleObject;
 
-use crate::atlas::{ATLAS_SIZE, build_atlas};
 use crate::gpu::{self, AdapterChoice, Gpu};
 use crate::measure::{FrameStatistics, Presentation};
 use crate::pace::Pacer;
+use crate::projection::{ClipTable, Projection};
 use crate::simple::layout::{HEIGHT, WIDTH};
 use crate::simple::{result_screen, text_screen};
+use crate::skin_atlas::{self, AtlasPages, AtlasTexture, UploadError};
+use crate::staging::{Scissor, Staging};
 use crate::text::MenuText;
 use crate::{Blend, FrameInput, Instance, PlaySkin, SimpleSkin, SkinError, SpriteBatch};
 
 /// The next [`Renderer`]'s id.
 static RENDERERS: AtomicU64 = AtomicU64::new(0);
 
-/// Sprites one frame can draw, across both blends.
+/// Sprites one frame of the built-in screens can draw, across both
+/// blends: the least the renderer's batch holds ([`PlaySkin::capacity`]).
 pub const MAX_SPRITES: usize = 8_192;
 
 const SPRITE_WGSL: &str = r"
-// An `Instance`: its pivot and angle share location 3; its layer and filter
-// flags are not read, as the one atlas is layer 0 sampled nearest.
+// An `Instance`: its pivot and angle share location 3, and its flags hold
+// the atlas layer (low 16 bits) and the nearest-filter bit.
 struct Inst {
     @location(0) rect: vec4f,
     @location(1) uv: vec4f,
     @location(2) color: vec4f,
     @location(3) turn: vec3f,
+    @location(4) flags: u32,
 };
 struct VOut {
     @builtin(position) pos: vec4f,
     @location(0) uv: vec2f,
     @location(1) color: vec4f,
+    @location(2) @interpolate(flat) flags: u32,
 };
-@group(0) @binding(0) var atlas: texture_2d<f32>;
-@group(0) @binding(1) var samp: sampler;
+// Half the canvas's size, in canvas pixels.
+struct Proj {
+    half: vec2f,
+    pad: vec2f,
+};
+@group(0) @binding(0) var atlas: texture_2d_array<f32>;
+@group(0) @binding(1) var smooth_samp: sampler;
+@group(0) @binding(2) var nearest_samp: sampler;
+@group(0) @binding(3) var<uniform> proj: Proj;
 
-// Layout pixels (1920x1080, origin top left, y down) to clip space; the
-// viewport letterboxes the layout into the target. Each corner turns
-// clockwise on screen by the angle about the pivot; an unturned sprite keeps
-// its corners exactly.
+// Canvas pixels (origin top left, y down) to clip space; the viewport places
+// the canvas on the target. Each corner turns clockwise on screen by the
+// angle about the pivot; an unturned sprite keeps its corners exactly.
 @vertex
 fn vs(@builtin(vertex_index) vi: u32, i: Inst) -> VOut {
     let c = vec2f(f32(vi & 1u), f32((vi >> 1u) & 1u));
@@ -59,17 +72,27 @@ fn vs(@builtin(vertex_index) vi: u32, i: Inst) -> VOut {
     let turned = i.turn.xy + vec2f(d.x * k - d.y * s, d.x * s + d.y * k);
     let p = select(turned, placed, i.turn.z == 0.0);
     var o: VOut;
-    o.pos = vec4f(p.x / 960.0 - 1.0, 1.0 - p.y / 540.0, 0.0, 1.0);
+    o.pos = vec4f(p.x / proj.half.x - 1.0, 1.0 - p.y / proj.half.y, 0.0, 1.0);
     o.uv = mix(i.uv.xy, i.uv.zw, c);
     o.color = i.color;
+    o.flags = i.flags;
     return o;
 }
 
-// The atlas holds premultiplied texels (transparent black or opaque white)
-// and the colour arrives premultiplied, so their product is premultiplied.
+// The atlas holds premultiplied texels and the colour arrives premultiplied,
+// so their product is premultiplied. A skin's page is sampled bilinearly
+// between its mip levels, or at the nearest texel of the nearest level with
+// the nearest bit; layer 0, the built-in atlas, always at its nearest
+// level-0 texel. All three are sampled, so every sample stays in uniform
+// control flow, and one is chosen.
 @fragment
 fn fs(v: VOut) -> @location(0) vec4f {
-    return textureSample(atlas, samp, v.uv) * v.color;
+    let layer = i32(v.flags & 0xFFFFu);
+    let smoothed = textureSample(atlas, smooth_samp, v.uv, layer);
+    let nearest = textureSample(atlas, nearest_samp, v.uv, layer);
+    let builtin = textureSampleLevel(atlas, nearest_samp, v.uv, layer, 0.0);
+    let page = select(smoothed, nearest, (v.flags & 0x10000u) != 0u);
+    return select(page, builtin, layer == 0) * v.color;
 }
 ";
 
@@ -123,6 +146,18 @@ pub enum RenderError {
     /// The skin cannot draw the chart.
     #[error("skin")]
     Skin(#[source] SkinError),
+    /// A skin's atlas was not uploaded; the atlas in use stays.
+    #[error("atlas")]
+    Atlas(#[source] UploadError),
+    /// A skin's sprites do not fit the device's largest buffer; the skin
+    /// in use stays.
+    #[error("capacity: {sprites} sprites, past the device's {max} bytes")]
+    Capacity {
+        /// The sprites the skin asked room for.
+        sprites: u32,
+        /// The device's largest buffer, in bytes.
+        max: u64,
+    },
     /// The window's surface was lost or failed validation; the renderer
     /// must be built again.
     #[error("surface lost")]
@@ -194,6 +229,50 @@ enum Output {
     },
 }
 
+/// The sprite pipelines' bindings that outlive an atlas: the layout, the
+/// samplers and the projection's uniform.
+struct Bindings {
+    layout: wgpu::BindGroupLayout,
+    /// Bilinear between mip levels, for a skin's ordinary images.
+    smooth: wgpu::Sampler,
+    /// The nearest texel of the nearest level, for pixel art and, at level
+    /// 0, the built-in atlas.
+    nearest: wgpu::Sampler,
+    /// Half the canvas's size ([`Projection::half`]), padded to 16 bytes.
+    projection: wgpu::Buffer,
+    /// The half last written to [`projection`](Self::projection), `None`
+    /// until the first write: a frame writes it only when it changes.
+    uploaded: Option<[f32; 2]>,
+}
+
+impl Bindings {
+    /// The bind group of `atlas`.
+    fn bind(&self, device: &wgpu::Device, atlas: &AtlasTexture) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("atlas"),
+            layout: &self.layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(atlas.view()),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.smooth),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&self.nearest),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: self.projection.as_entire_binding(),
+                },
+            ],
+        })
+    }
+}
+
 /// The play screen renderer.
 pub struct Renderer {
     /// Unique among the renderers of the process, for the menu text tied to
@@ -201,15 +280,21 @@ pub struct Renderer {
     id: u64,
     gpu: Gpu,
     output: Output,
+    /// The target's size as last applied, never zero.
     size: (u32, u32),
+    /// The window is minimized (the last size applied was zero): nothing
+    /// is configured or presented until a nonzero size comes.
+    minimized: bool,
     format: wgpu::TextureFormat,
     alpha: wgpu::RenderPipeline,
     additive: wgpu::RenderPipeline,
+    bindings: Bindings,
+    atlas: AtlasTexture,
     atlas_bind: wgpu::BindGroup,
     instances: wgpu::Buffer,
-    batch: SpriteBatch,
-    /// The batch in drawing order, copied into `instances` each frame.
-    staging: Vec<Instance>,
+    /// The batch, its staging copied into `instances` each frame, and the
+    /// play skin's projection and clip scissors.
+    staging: Staging,
     skin: Box<dyn PlaySkin>,
     /// When the built frame's work began, until [`submit`](Self::submit)
     /// takes it.
@@ -220,6 +305,11 @@ pub struct Renderer {
     /// What each frame is cleared to: opaque black. A unit test clears to
     /// transparent black to read the blends' alpha channel.
     clear: wgpu::Color,
+    /// Run by the next [`install_atlas`](Self::install_atlas) on its
+    /// candidate, inside its error scopes, after the texture and its bind
+    /// group exist: a unit test makes the device refuse something there.
+    #[cfg(test)]
+    atlas_fault: Option<fn(&Gpu)>,
 }
 
 impl Renderer {
@@ -271,43 +361,37 @@ impl Renderer {
             }
             None => {
                 let format = wgpu::TextureFormat::Rgba8Unorm;
-                let texture = device.create_texture(&wgpu::TextureDescriptor {
-                    label: Some("offscreen"),
-                    size: extent(size.0, size.1),
-                    mip_level_count: 1,
-                    sample_count: 1,
-                    dimension: wgpu::TextureDimension::D2,
-                    format,
-                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-                    view_formats: &[],
-                });
-                let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+                let (texture, view) = offscreen(device, size, format);
                 (Output::Offscreen { texture, view }, format)
             }
         };
-        let (alpha, additive, atlas_bind) = pipelines(&gpu, format);
-        let instances = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("sprites"),
-            size: (MAX_SPRITES * size_of::<Instance>()) as u64,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        let (alpha, additive, bindings) = pipelines(&gpu, format);
+        let atlas = AtlasTexture::builtin(&gpu);
+        let atlas_bind = bindings.bind(device, &atlas);
+        let skin: Box<dyn PlaySkin> = Box::new(SimpleSkin::new());
+        let capacity = skin.capacity().max(MAX_SPRITES as u32);
+        let instances = instance_buffer(device, capacity);
+        let staging = Staging::new(capacity, &skin.canvas([size.0, size.1]));
         finish_uploads(&gpu)?;
         Ok(Self {
             gpu,
             output,
             size,
+            minimized: false,
             format,
             alpha,
             additive,
+            bindings,
+            atlas,
             atlas_bind,
             instances,
-            batch: SpriteBatch::with_capacity(MAX_SPRITES),
-            staging: Vec::with_capacity(MAX_SPRITES),
-            skin: Box::new(SimpleSkin::new()),
+            staging,
+            skin,
             started: None,
             pacer: Pacer::default(),
             clear: wgpu::Color::BLACK,
+            #[cfg(test)]
+            atlas_fault: None,
             id: RENDERERS.fetch_add(1, Ordering::Relaxed),
         })
     }
@@ -318,10 +402,154 @@ impl Renderer {
         self.id
     }
 
-    /// The target's size in pixels.
+    /// The target's size in pixels, as last applied.
     #[must_use]
     pub const fn size(&self) -> (u32, u32) {
         self.size
+    }
+
+    /// The target's size in pixels as last applied, never zero: what a
+    /// frame is projected onto ([`FrameInput::target`]).
+    #[must_use]
+    pub const fn target(&self) -> [u32; 2] {
+        [self.size.0, self.size.1]
+    }
+
+    /// Whether the window is minimized: the last size applied was zero,
+    /// and frames are neither drawn nor presented until another is.
+    #[must_use]
+    pub const fn is_minimized(&self) -> bool {
+        self.minimized
+    }
+
+    /// Applies the target's new physical size, between frames: a window's
+    /// swap chain is configured again (its waitable object and swap chain
+    /// taken again with it), an offscreen texture made again, and the play
+    /// skin's canvas and clips projected again; the skin's play state is
+    /// kept. A zero side minimizes: nothing is configured, and frames are
+    /// skipped, unpresented, until a nonzero size is applied. A side past
+    /// the device's largest texture is clamped to it.
+    pub fn resize(&mut self, width: u32, height: u32) {
+        if width == 0 || height == 0 {
+            self.minimized = true;
+            return;
+        }
+        self.minimized = false;
+        let max = self.gpu.device().limits().max_texture_dimension_2d;
+        let size = (width.min(max), height.min(max));
+        if size == self.size {
+            return;
+        }
+        self.size = size;
+        let device = self.gpu.device();
+        match &mut self.output {
+            Output::Window(w) => {
+                w.config.width = size.0;
+                w.config.height = size.1;
+                w.configure(device);
+            }
+            Output::Offscreen { texture, view } => {
+                (*texture, *view) = offscreen(device, size, self.format);
+            }
+        }
+        self.project();
+    }
+
+    /// Projects the play skin's canvas and clips onto the current target.
+    fn project(&mut self) {
+        let canvas = self.skin.canvas(self.target());
+        self.staging.project(&canvas);
+    }
+
+    /// Replaces the play skin, sizing the batch, the staging and the
+    /// instance buffer for its [`capacity`](PlaySkin::capacity) (at least
+    /// [`MAX_SPRITES`]) and projecting its canvas. Before play: it
+    /// allocates. The skin is prepared with [`load`](Self::load).
+    ///
+    /// # Errors
+    ///
+    /// [`RenderError::Capacity`] when its sprites do not fit the device's
+    /// largest buffer; the skin in use stays.
+    pub fn set_skin(&mut self, skin: Box<dyn PlaySkin>) -> Result<(), RenderError> {
+        let capacity = skin.capacity().max(MAX_SPRITES as u32);
+        if usize::try_from(capacity).ok() != Some(self.staging.capacity()) {
+            let device = self.gpu.device();
+            let max = device.limits().max_buffer_size;
+            let bytes = u64::from(capacity) * size_of::<Instance>() as u64;
+            if bytes > max {
+                return Err(RenderError::Capacity {
+                    sprites: capacity,
+                    max,
+                });
+            }
+            self.instances = instance_buffer(device, capacity);
+            self.staging.set_capacity(capacity);
+        }
+        self.skin = skin;
+        self.project();
+        Ok(())
+    }
+
+    /// The limits a skin's atlas is built within on this device
+    /// (`skin_model::Sheet::atlas`), the built-in atlas's reserved layer
+    /// included.
+    #[must_use]
+    pub fn atlas_limits(&self) -> AtlasLimits {
+        skin_atlas::atlas_limits(self.gpu.device())
+    }
+
+    /// Uploads a skin's atlas `pages` with the built-in atlas in layer 0,
+    /// and takes `clips`, the fixed clips its runs name, projected onto the
+    /// current target; both replace the ones in use together, once the
+    /// upload has finished. Before play: it allocates and waits for the
+    /// GPU.
+    ///
+    /// # Errors
+    ///
+    /// [`RenderError::Atlas`] when the pages are refused, by the checks or
+    /// by the device, and [`RenderError::Poll`] when the device fails
+    /// waiting for the upload; the atlas and clips in use stay, and frames
+    /// go on drawing with them.
+    pub fn install_atlas(
+        &mut self,
+        pages: &AtlasPages<'_>,
+        clips: ClipTable,
+    ) -> Result<(), RenderError> {
+        #[cfg(test)]
+        let fault = self.atlas_fault.take();
+        let device = self.gpu.device();
+        let layers =
+            skin_atlas::check_pages(pages, &device.limits()).map_err(RenderError::Atlas)?;
+        // The whole candidate inside the error scopes: the texture, its
+        // view and writes, its bind group, and the one submission of the
+        // uploads; the wait after them submits nothing. Nothing in use
+        // changes until all of it was accepted.
+        let ((atlas, bind), refused) = skin_atlas::scoped(device, || {
+            let atlas = AtlasTexture::upload(&self.gpu, pages, layers);
+            let bind = self.bindings.bind(device, &atlas);
+            #[cfg(test)]
+            if let Some(fault) = fault {
+                fault(&self.gpu);
+            }
+            self.gpu.queue().submit([]);
+            (atlas, bind)
+        });
+        if let Some(e) = refused {
+            return Err(RenderError::Atlas(UploadError::Device(e)));
+        }
+        wait_for_gpu(&self.gpu)?;
+        self.atlas_bind = bind;
+        self.staging.set_font_scale(atlas.font_scale());
+        self.staging.set_clips(clips);
+        self.atlas = atlas;
+        Ok(())
+    }
+
+    /// The atlas array in use: its page side and its layers, the reserved
+    /// one included.
+    #[must_use]
+    pub const fn atlas_size(&self) -> (u32, u32) {
+        (self.atlas.side(), self.atlas.layers())
     }
 
     /// The target's pixel format.
@@ -346,6 +574,7 @@ impl Renderer {
         self.skin
             .prepare(&self.gpu, chart, section)
             .map_err(RenderError::Skin)?;
+        self.project();
         finish_uploads(&self.gpu)
     }
 
@@ -387,12 +616,18 @@ impl Renderer {
         self.submit()
     }
 
-    /// The app's share of a frame ([`build_frame`]): the skin builds `f`
-    /// and the batch is staged, with no call into wgpu. The frame's CPU
-    /// time starts here; [`submit`](Self::submit) must follow.
+    /// The app's share of a frame ([`Staging::build`]): the skin builds
+    /// `f` and the batch is staged, with no call into wgpu. The frame's CPU
+    /// time starts here; [`submit`](Self::submit) must follow. The skin
+    /// sees [`target`](Self::target) as `f.target`, the size the frame is
+    /// projected onto, whatever the caller put there.
     pub fn build(&mut self, f: &FrameInput<'_>) {
         self.started = Some(Instant::now());
-        build_frame(self.skin.as_mut(), f, &mut self.batch, &mut self.staging);
+        let f = FrameInput {
+            target: self.target(),
+            ..*f
+        };
+        self.staging.build(self.skin.as_mut(), &f);
     }
 
     /// Submits and presents the frame [`build`](Self::build) staged.
@@ -410,7 +645,8 @@ impl Renderer {
     pub fn submit(&mut self) -> Result<FrameTiming, RenderError> {
         debug_assert!(self.started.is_some(), "submit without a build");
         let start = self.started.take().unwrap_or_else(Instant::now);
-        self.draw(start, None)
+        let projection = self.staging.projection();
+        self.draw(start, None, projection)
     }
 
     /// Draws a screen of text lines in the bitmap font instead of the skin
@@ -422,10 +658,8 @@ impl Renderer {
     /// As [`frame`](Self::frame).
     pub fn text_frame(&mut self, lines: &[&str]) -> Result<FrameTiming, RenderError> {
         let start = Instant::now();
-        self.batch.clear();
-        text_screen(lines, &mut self.batch);
-        self.batch.stage(&mut self.staging);
-        self.draw(start, None)
+        self.staging.fill(|b| text_screen(lines, b));
+        self.draw(start, None, Projection::fixed(self.target()))
     }
 
     /// Draws the result screen: `lines` in the bitmap font and, with
@@ -441,10 +675,8 @@ impl Renderer {
         graphs: Option<&game::ResultGraphs>,
     ) -> Result<FrameTiming, RenderError> {
         let start = Instant::now();
-        self.batch.clear();
-        result_screen(lines, graphs, &mut self.batch);
-        self.batch.stage(&mut self.staging);
-        self.draw(start, None)
+        self.staging.fill(|b| result_screen(lines, graphs, b));
+        self.draw(start, None, Projection::fixed(self.target()))
     }
 
     /// Draws the play screen while a chart loads before the countdown, as
@@ -461,10 +693,10 @@ impl Renderer {
             return Err(RenderError::OtherRenderersText);
         }
         let start = Instant::now();
-        self.batch.clear();
-        self.skin.build_loading(&mut self.batch);
-        self.batch.stage(&mut self.staging);
-        self.draw(start, Some(text))
+        let skin = &mut self.skin;
+        self.staging.fill(|b| skin.build_loading(b));
+        let projection = self.staging.projection();
+        self.draw(start, Some(text), projection)
     }
 
     /// Draws a menu screen, as [`frame`](Self::frame) draws: the sprites
@@ -487,28 +719,32 @@ impl Renderer {
             return Err(RenderError::OtherRenderersText);
         }
         let start = Instant::now();
-        self.batch.clear();
-        sprites(&mut self.batch);
-        self.batch.stage(&mut self.staging);
-        self.draw(start, Some(text))
+        self.staging.fill(sprites);
+        self.draw(start, Some(text), Projection::fixed(self.target()))
     }
 
-    /// Submits and presents the staged batch, then `text` in its own pass
-    /// when there is one; `start` is when the frame's work began.
+    /// Submits and presents the staged batch through `projection`, each
+    /// run under its scissor, then `text` in its own pass when there is
+    /// one; `start` is when the frame's work began. While the window is
+    /// minimized nothing is acquired, drawn or presented.
     fn draw(
         &mut self,
         start: Instant,
         text: Option<&MenuText>,
+        projection: Projection,
     ) -> Result<FrameTiming, RenderError> {
-        let sprites = self.staging.len();
+        let sprites = self.staging.instances().len();
         let staged = u32::try_from(sprites).unwrap_or(u32::MAX);
         let timing = |cpu, presented| FrameTiming {
             cpu,
             sprites,
-            dropped: self.batch.dropped(),
+            dropped: self.staging.batch().dropped(),
             presented,
             present_count: None,
         };
+        if self.minimized {
+            return Ok(timing(start.elapsed(), false));
+        }
         let acquire = Instant::now();
         let (frame, view) = match &mut self.output {
             Output::Window(w) => match w.surface.get_current_texture() {
@@ -556,8 +792,25 @@ impl Renderer {
         };
         let acquired = acquire.elapsed();
         let queue = self.gpu.queue();
-        queue.write_buffer(&self.instances, 0, bytemuck::cast_slice(&self.staging));
-        let [x, y, w, h] = letterbox(self.size.0, self.size.1);
+        queue.write_buffer(
+            &self.instances,
+            0,
+            bytemuck::cast_slice(self.staging.instances()),
+        );
+        // Only when it changes: on the first frame, a resize, or between
+        // the menus' fixed canvas and the play skin's.
+        let half = projection.half();
+        if self.bindings.uploaded != Some(half) {
+            let [hx, hy] = half;
+            queue.write_buffer(
+                &self.bindings.projection,
+                0,
+                bytemuck::cast_slice(&[hx, hy, 0.0, 0.0]),
+            );
+            self.bindings.uploaded = Some(half);
+        }
+        let [x, y, w, h] = projection.viewport();
+        let full = [0, 0, self.size.0, self.size.1];
         let mut encoder = self
             .gpu
             .device()
@@ -583,11 +836,25 @@ impl Renderer {
             pass.set_bind_group(0, &self.atlas_bind, &[]);
             pass.set_vertex_buffer(0, self.instances.slice(..));
             // The runs in the batch's order, so each sprite is drawn over
-            // every sprite pushed before it, whatever their blends.
-            for run in self.batch.runs() {
+            // every sprite pushed before it, whatever their blends. Each run
+            // sets its scissor when it differs from the one set: an
+            // unclipped run sets the whole target back, and a run whose clip
+            // keeps no pixel is not drawn.
+            let mut scissor = full;
+            for run in self.staging.batch().runs() {
                 let end = run.end.min(staged);
                 if run.start >= end {
                     break;
+                }
+                let rect = match self.staging.scissor(run.clip) {
+                    Scissor::Full => full,
+                    Scissor::Rect(rect) => rect,
+                    Scissor::Empty => continue,
+                };
+                if rect != scissor {
+                    let [x, y, w, h] = rect;
+                    pass.set_scissor_rect(x, y, w, h);
+                    scissor = rect;
                 }
                 pass.set_pipeline(match run.blend {
                     Blend::Alpha => &self.alpha,
@@ -742,21 +1009,6 @@ impl Renderer {
     }
 }
 
-/// The app's share of a frame, everything [`Renderer::build`] does before
-/// [`Renderer::submit`] calls into wgpu: `skin` builds into the emptied `batch`, which is then
-/// staged into `staging` in drawing order. It allocates nothing once `batch`
-/// and `staging` have room for the batch's capacity.
-pub fn build_frame(
-    skin: &mut dyn PlaySkin,
-    f: &FrameInput<'_>,
-    batch: &mut SpriteBatch,
-    staging: &mut Vec<Instance>,
-) {
-    batch.clear();
-    skin.build(f, batch);
-    batch.stage(staging);
-}
-
 /// The longest an offscreen frame waits for the previous frame's GPU work;
 /// past it the frame is skipped, and the next frame waits again, so the
 /// render thread still takes its messages behind a slow GPU.
@@ -767,6 +1019,11 @@ const OFFSCREEN_FRAME_WAIT: Duration = Duration::from_millis(100);
 /// Stutter").
 fn finish_uploads(gpu: &Gpu) -> Result<(), RenderError> {
     gpu.queue().submit([]);
+    wait_for_gpu(gpu)
+}
+
+/// Waits until the GPU has done every submission, submitting nothing.
+fn wait_for_gpu(gpu: &Gpu) -> Result<(), RenderError> {
     gpu.device()
         .poll(wgpu::PollType::wait_indefinitely())
         .map(|_| ())
@@ -775,13 +1032,44 @@ fn finish_uploads(gpu: &Gpu) -> Result<(), RenderError> {
 
 /// The viewport `[x, y, width, height]` that fits the 1920×1080 layout
 /// into a `width` × `height` target at the largest scale, centered, with
-/// black bars on the other axis.
+/// black bars on the other axis: the fixed canvas's
+/// ([`Projection::fixed`]).
 #[must_use]
 pub fn letterbox(width: u32, height: u32) -> [f32; 4] {
     let (w, h) = (width as f32, height as f32);
     let s = (w / WIDTH).min(h / HEIGHT);
     let (vw, vh) = (WIDTH * s, HEIGHT * s);
     [(w - vw) / 2.0, (h - vh) / 2.0, vw, vh]
+}
+
+/// An offscreen target of `size` and its view.
+fn offscreen(
+    device: &wgpu::Device,
+    size: (u32, u32),
+    format: wgpu::TextureFormat,
+) -> (wgpu::Texture, wgpu::TextureView) {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("offscreen"),
+        size: extent(size.0, size.1),
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    (texture, view)
+}
+
+/// The instance buffer of `capacity` sprites.
+fn instance_buffer(device: &wgpu::Device, capacity: u32) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("sprites"),
+        size: u64::from(capacity) * size_of::<Instance>() as u64,
+        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    })
 }
 
 const fn extent(width: u32, height: u32) -> wgpu::Extent3d {
@@ -792,35 +1080,39 @@ const fn extent(width: u32, height: u32) -> wgpu::Extent3d {
     }
 }
 
-/// The alpha and additive sprite pipelines and the atlas binding, with the
-/// atlas uploaded. Both take premultiplied colour (design.md "Rendering and
-/// Skins"): alpha blending is RGB source 1, destination 1 − source alpha;
-/// additive is RGB source 1, destination 1; in both the alpha channel
-/// composites over.
+/// The alpha and additive sprite pipelines and their bindings. Both take
+/// premultiplied colour (design.md "Rendering and Skins"): alpha blending
+/// is RGB source 1, destination 1 − source alpha; additive is RGB source
+/// 1, destination 1; in both the alpha channel composites over.
 fn pipelines(
     gpu: &Gpu,
     format: wgpu::TextureFormat,
-) -> (wgpu::RenderPipeline, wgpu::RenderPipeline, wgpu::BindGroup) {
-    use wgpu::util::DeviceExt;
-
+) -> (wgpu::RenderPipeline, wgpu::RenderPipeline, Bindings) {
     let device = gpu.device();
-    let atlas = device.create_texture_with_data(
-        gpu.queue(),
-        &wgpu::TextureDescriptor {
-            label: Some("atlas"),
-            size: extent(ATLAS_SIZE, ATLAS_SIZE),
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
-        },
-        wgpu::util::TextureDataOrder::LayerMajor,
-        &build_atlas(),
-    );
-    // Nearest sampling keeps the bitmap font's texels sharp.
-    let sampler = device.create_sampler(&wgpu::SamplerDescriptor::default());
+    let smooth = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("smooth"),
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        mipmap_filter: wgpu::MipmapFilterMode::Linear,
+        ..wgpu::SamplerDescriptor::default()
+    });
+    // Nearest within and between levels: the default.
+    let nearest = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("nearest"),
+        ..wgpu::SamplerDescriptor::default()
+    });
+    let projection = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("projection"),
+        size: PROJECTION_BYTES,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let sampler = |binding| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+        count: None,
+    };
     let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("atlas"),
         entries: &[
@@ -829,31 +1121,22 @@ fn pipelines(
                 visibility: wgpu::ShaderStages::FRAGMENT,
                 ty: wgpu::BindingType::Texture {
                     sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                    view_dimension: wgpu::TextureViewDimension::D2,
+                    view_dimension: wgpu::TextureViewDimension::D2Array,
                     multisampled: false,
                 },
                 count: None,
             },
+            sampler(1),
+            sampler(2),
             wgpu::BindGroupLayoutEntry {
-                binding: 1,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                binding: 3,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: wgpu::BufferSize::new(PROJECTION_BYTES),
+                },
                 count: None,
-            },
-        ],
-    });
-    let view = atlas.create_view(&wgpu::TextureViewDescriptor::default());
-    let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("atlas"),
-        layout: &layout,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::TextureView(&view),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: wgpu::BindingResource::Sampler(&sampler),
             },
         ],
     });
@@ -867,13 +1150,14 @@ fn pipelines(
         immediate_size: 0,
     });
     let pipeline = |blend| {
-        // `Instance`: rect, uv and color, then pivot and angle together;
-        // its last four bytes, the flags, are not read.
+        // `Instance`: rect, uv and color, pivot and angle together, then
+        // the flags.
         let attrs = wgpu::vertex_attr_array![
             0 => Float32x4,
             1 => Float32x4,
             2 => Float32x4,
             3 => Float32x3,
+            4 => Uint32,
         ];
         device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("sprites"),
@@ -916,8 +1200,18 @@ fn pipelines(
         alpha: wgpu::BlendComponent::OVER,
         ..wgpu::BlendState::ADDITIVE
     });
-    (alpha, additive, bind)
+    let bindings = Bindings {
+        layout,
+        smooth,
+        nearest,
+        projection,
+        uploaded: None,
+    };
+    (alpha, additive, bindings)
 }
+
+/// The projection's uniform: half the canvas's size, padded to 16 bytes.
+const PROJECTION_BYTES: u64 = 16;
 
 #[cfg(test)]
 mod tests {
@@ -925,9 +1219,9 @@ mod tests {
 
     use wgpu::wgc::instance as core;
 
-    use super::{RenderError, Renderer, Target, letterbox};
+    use super::{AtlasPages, ClipTable, RenderError, Renderer, Target, letterbox};
     use crate::text::MenuText;
-    use crate::{AdapterChoice, Blend, SkinError, Sprite, solid_uv};
+    use crate::{AdapterChoice, Blend, SkinError, Sprite, UploadError, solid_uv};
 
     /// Checks that `e` names only its step, and that its source is the
     /// wrapped `T`, where the chain ends.
@@ -975,6 +1269,13 @@ mod tests {
         let e = RenderError::Skin(skin.clone());
         assert_eq!(the_cause::<SkinError>(&e, "skin"), &skin);
 
+        let e = RenderError::Atlas(UploadError::Side {
+            side: 100,
+            max: 8_192,
+        });
+        let source = the_cause::<UploadError>(&e, "atlas");
+        assert!(matches!(source, UploadError::Side { side: 100, .. }));
+
         let changed = glyphon::RenderError::ScreenResolutionChanged;
         let e = RenderError::Text(changed);
         assert_eq!(the_cause::<glyphon::RenderError>(&e, "text"), &changed);
@@ -991,6 +1292,15 @@ mod tests {
             names: vec!["GPU".to_owned()],
         };
         assert_eq!(e.to_string(), "adapter: no WARP adapter among [\"GPU\"]");
+        let e = RenderError::Capacity {
+            sprites: 9_000,
+            max: 256,
+        };
+        assert!(e.source().is_none());
+        assert_eq!(
+            e.to_string(),
+            "capacity: 9000 sprites, past the device's 256 bytes"
+        );
     }
 
     #[test]
@@ -1047,5 +1357,75 @@ mod tests {
         let alpha = |x: usize| pixels[(100 * 960 + x) * 4 + 3];
         assert!(alpha(50).abs_diff(159) <= 2, "alpha blend: {}", alpha(50));
         assert!(alpha(150).abs_diff(159) <= 2, "additive: {}", alpha(150));
+    }
+
+    /// A refusal after the texture exists, injected between the candidate's
+    /// bind group and the upload's submission (a buffer whose usage mixes
+    /// both map modes, which every device's validation refuses), is the
+    /// typed `Atlas(Device)` error, not an uncaptured one that would panic,
+    /// and the built-in atlas stays: 128 texels, one layer, its font scale
+    /// 1, so the solid block still draws white at layout (100, 100), target
+    /// pixel (50, 50). With the refused 256-texel array's font scale (1/2)
+    /// taken anyway, the solid uv would read texel 62 of the built-in atlas,
+    /// a glyph cell's empty corner. The same pages without the fault are
+    /// then installed: 256 texels, two layers.
+    #[test]
+    fn a_refusal_after_the_texture_keeps_the_atlas() {
+        let mut r = Renderer::new(
+            Target::Offscreen {
+                width: 960,
+                height: 540,
+            },
+            AdapterChoice::Warp,
+        )
+        .expect("WARP renderer");
+        let (l0, l1, l2, l3) = (
+            vec![0u8; 256 * 256 * 4],
+            vec![0u8; 128 * 128 * 4],
+            vec![0u8; 64 * 64 * 4],
+            vec![0u8; 32 * 32 * 4],
+        );
+        let page: crate::PageLevels<'_> = [&l0, &l1, &l2, &l3];
+        let pages = AtlasPages {
+            side: 256,
+            pages: &[page],
+        };
+        r.atlas_fault = Some(|gpu| {
+            let _ = gpu.device().create_buffer(&wgpu::BufferDescriptor {
+                label: Some("refused"),
+                size: 4,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::MAP_WRITE,
+                mapped_at_creation: false,
+            });
+        });
+        let e = r.install_atlas(&pages, ClipTable::default()).unwrap_err();
+        assert!(
+            matches!(e, RenderError::Atlas(UploadError::Device(_))),
+            "{e:?}"
+        );
+        assert_eq!(r.atlas_size(), (128, 1));
+        let text = MenuText::new(&r);
+        let timing = r
+            .menu_frame(
+                |b| {
+                    b.push(
+                        Blend::Alpha,
+                        Sprite {
+                            rect: [0.0, 0.0, 400.0, 400.0],
+                            uv: solid_uv(),
+                            color: [1.0; 4],
+                            ..Sprite::default()
+                        },
+                    );
+                },
+                &text,
+            )
+            .unwrap();
+        assert!(timing.presented);
+        let pixels = r.read_back();
+        let i = (50 * 960 + 50) * 4;
+        assert_eq!(&pixels[i..i + 3], &[255, 255, 255]);
+        r.install_atlas(&pages, ClipTable::default()).unwrap();
+        assert_eq!(r.atlas_size(), (256, 2));
     }
 }

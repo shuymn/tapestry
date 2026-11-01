@@ -185,8 +185,8 @@ fn preset_canonical_seeds_decode_or_fail_as_built() {
         let result = preset_canonical(&bytes).map(|_| ());
         let expected = match name {
             "tapestry" | "beatoraja_style" | "lr2_style" | "gauge_policies" | "long" => Ok(()),
-            "other_version" => Err(CanonicalError::UnsupportedVersion(12)),
-            "older_version" => Err(CanonicalError::UnsupportedVersion(10)),
+            "other_version" => Err(CanonicalError::UnsupportedVersion(13)),
+            "older_version" => Err(CanonicalError::UnsupportedVersion(11)),
             "wrong_percent_length" => Err(CanonicalError::WrongLength {
                 field: "rank_percent",
                 len: 6,

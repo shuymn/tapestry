@@ -24,8 +24,7 @@
 //! | Empty POOR keeps the combo without adding to it, adds to BP, has its own count | `play/JudgeProperty.java:60` (MS keeps the combo), `play/JudgeManager.java:716-725` (`judge < 5` adds to it); BP and the count as beatoraja's |
 //! | BAD and POOR break the combo and add to BP | `play/JudgeProperty.java:60`, `play/JudgeManager.java:722-725` |
 //! | Note assignment: combo priority ([`Assignment::ComboPriority`]), the default algorithm | `PlayConfig.java:103`, `play/JudgeAlgorithm.java:15-20`; the candidate loop, `play/JudgeManager.java:414-455` |
-//! | A late BAD LN head cannot be the primary ([`HeadEligibility::NotLateBad`]) | `play/JudgeManager.java:435-437` |
-//! | Missed once its late BAD edge has passed (timing: see the known differences) | `play/JudgeManager.java:640-660` |
+//! | Missed once its late BAD edge has passed, taps and LN heads alike (timing, and LN heads: see the known differences) | `play/JudgeManager.java:640-660` |
 //! | Judgment headers ([`HeaderPolicy::DefExRankFirst`]) | jbms-parser, as beatoraja-style reads it |
 //! | `#TOTAL` absent ([`DefaultTotal::NotesLinear`]): `160 + (N + clamp(N − 400, 0, 200)) × 0.16` over the whole chart's notes | `play/BMSPlayerRule.java:73-79`, `:88-89` |
 //! | Gauges `{min, max, start, clear, death}` and changes `{PG, GR, GD, BD, PR, MS}` | `play/GaugeProperty.java:117-122`, field order `:161`; the rule set's gauges, `:52-61` |
@@ -54,7 +53,9 @@
 //! # Known differences
 //!
 //! Implementation structure is not reproduced (design.md "What a -style
-//! Preset Reproduces"); the first six below are instances.
+//! Preset Reproduces"); the first seven below are instances. LR2 itself is
+//! cited where it differs from the source, from the OpenLR2 reconstruction
+//! (<https://github.com/GOMazk/OpenLR2> at `583a3850`, `LR2f.cpp`).
 //!
 //! - **One press judges one note (decided).** The source's multi-BAD
 //!   judges BAD, with the same press, the other unjudged notes in BAD but
@@ -67,16 +68,29 @@
 //!   100 ms on one lane, a press at 190 ms takes the 160 ms tap (GREAT);
 //!   the source gives BAD on the 0 ms tap and the head, here they are POOR
 //!   at the press.
-//! - **An ineligible head keeps the earlier candidate (decided).** The
-//!   source makes a late BAD LN head ineligible by giving it judge 6
-//!   (`play/JudgeManager.java:435-437`), which reuses the existing "no
-//!   judgment here" branch, and that branch also resets the candidate the
-//!   scan had already taken (`:445-452`). The rule only says a late BAD
-//!   head cannot be taken, and LR2 judges the oldest note, so here the
-//!   earlier candidate stays the primary. With a tap at 0 ms and a long
-//!   note from 30 ms on one lane, a press at 190 ms is BAD on the tap here
-//!   and the head is missed at 230 ms; there the press judges nothing, the
-//!   tap is missed at 200 ms and the head at 230 ms.
+//! - **LN heads are judged like taps (decided).** The source makes a late
+//!   BAD LN head ineligible by giving it judge 6
+//!   (`play/JudgeManager.java:435-437`), so it stays unjudged until its late
+//!   BAD edge, to copy LR2. LR2 misses an unpressed head once its late GOOD
+//!   edge passes (`ProcLongnote`, `LR2f.cpp:7542`), while an early press
+//!   still takes BAD (`:7551-7583`) and a tap is missed at its BAD edge
+//!   (`:7464`): the miss check runs before the press branches, so its late
+//!   BAD branch is never reached, a byproduct of the miss check's threshold
+//!   rather than a rule.
+//!   Here a head takes a late BAD and is missed at its late BAD edge, as a
+//!   tap is. At `#RANK 3`, with a long note from 0 to 50 ms left unpressed
+//!   and a tap on another lane at 150 ms hit PERFECT, LR2 has the head POOR
+//!   at 120 ms, before the PERFECT, and here and in the source it is POOR at
+//!   200 ms, after it. A head pressed 150 ms late is BAD here and cannot be
+//!   taken in either reference.
+//! - **An empty POOR from a judged note (decided).** The empty POOR range
+//!   takes judged and unjudged notes alike, as the source does
+//!   (`play/JudgeManager.java:433-434`); LR2 considers only the lane's
+//!   current unjudged note (`LR2f.cpp:7525-7530`). A note already judged
+//!   up to 1000 ms after a press that judges no note makes an empty POOR
+//!   here and in the source, and none in LR2. At `#RANK 3`, a note at
+//!   1000 ms hit early BAD at 830 ms, then a press at 900 ms: an empty POOR
+//!   here, none in LR2.
 //! - **Notes a press passes (decided).** When a press takes a later note,
 //!   the earlier unjudged notes of its lane are POOR at the press here; the
 //!   source keeps them hittable until their own late BAD edge, since its
@@ -160,10 +174,10 @@ use bms_model::TimeUs;
 use crate::gauge_rules::{end_gauge, pct, survival_gauge};
 
 use crate::{
-    Assignment, DefaultTotal, Denominator, EmptyPoorRange, EmptyPoorRule, HeadEligibility,
-    HeaderPolicy, Implementation, JudgeWindows, LaneTable, LateHeadRule, LnEndWindows, LnMode,
-    LnModeRule, LowDamage, MineRule, MissRule, PerJudgment, PerLaneClass, RulePreset,
-    SameTimeOrder, ScaledRank, ScoreWeights, TotalCorrection, TotalMode, Window, WindowPolicy,
+    Assignment, DefaultTotal, Denominator, EmptyPoorRange, EmptyPoorRule, HeaderPolicy,
+    Implementation, JudgeWindows, LaneTable, LateHeadRule, LnEndWindows, LnMode, LnModeRule,
+    LowDamage, MineRule, MissRule, PerJudgment, PerLaneClass, RulePreset, SameTimeOrder,
+    ScaledRank, ScoreWeights, TotalCorrection, TotalMode, Window, WindowPolicy,
 };
 
 const MS: i64 = 1_000;
@@ -230,7 +244,7 @@ pub fn lr2_style() -> RulePreset {
     ];
     RulePreset {
         id: "lr2-style".to_owned(),
-        version: 1,
+        version: 2,
         implementation: Implementation::Standard { version: 3 },
         tables: PerLaneClass::both(table()),
         miss: MissRule::PoorAfterLateBadOrOvertaken,
@@ -276,7 +290,6 @@ pub fn lr2_style() -> RulePreset {
         ln_mode: LnModeRule {
             default: LnMode::Ln,
             late_head: LateHeadRule::CompletesAtPress,
-            head_eligibility: HeadEligibility::NotLateBad,
         },
         total_mode: TotalMode::ScalesIncrease,
         mine: MineRule::WhileHeld { per_unit: pct(1) },
