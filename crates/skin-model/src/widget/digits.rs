@@ -20,6 +20,7 @@
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
 use super::{Brush, Frame, ImageRef};
+use crate::atlas::uv::FrameUv;
 use crate::expr::Program;
 use crate::place::{Bounds, union};
 use crate::quad::QuadBatch;
@@ -306,10 +307,30 @@ impl Digits {
     pub(crate) fn draw(
         &self,
         v: i32,
-        [x, y, w, h]: [f32; 4],
+        rect: [f32; 4],
         brush: &Brush,
         at: &Frame<'_>,
         out: &mut QuadBatch,
+    ) -> Option<f32> {
+        let filter = self.image.filter;
+        if self.offsets.is_empty() {
+            self.draw_cells(v, rect, at, |_, r, f| brush.push(out, r, f, filter))
+        } else {
+            self.draw_cells(v, rect, at, |j, r, f| {
+                let d = self.offsets.get(j).copied().unwrap_or_default();
+                brush.push_offset(out, r, d, f, filter)
+            })
+        }
+    }
+
+    /// [`draw`](Self::draw)'s layout, each drawn cell handed to `push`
+    /// with its index, its rect and its frame.
+    fn draw_cells(
+        &self,
+        v: i32,
+        [x, y, w, h]: [f32; 4],
+        at: &Frame<'_>,
+        mut push: impl FnMut(usize, [f32; 4], FrameUv) -> bool,
     ) -> Option<f32> {
         let cells = self.lay(v);
         let g = self.set.glyphs();
@@ -336,12 +357,7 @@ impl Digits {
                 continue;
             };
             let cx = crate::canvas::f32_of(f64::from(x) + p * f64::from(j) - s);
-            let d = self
-                .offsets
-                .get(usize::from(j))
-                .copied()
-                .unwrap_or_default();
-            if !brush.push_offset(out, [cx, y, w, h], d, f, self.image.filter) {
+            if !push(usize::from(j), [cx, y, w, h], f) {
                 return None;
             }
         }
