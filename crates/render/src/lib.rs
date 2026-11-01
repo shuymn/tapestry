@@ -15,8 +15,11 @@
 //! applied between frames ([`Renderer::resize`]).
 //!
 //! The app's per-frame work, the skin's build into the preallocated
-//! [`SpriteBatch`] and its staging into [`Instance`]s ([`Staging`]),
-//! allocates nothing.
+//! [`SpriteBatch`], the measurement overlay after it from the batch's
+//! reserve, and its staging into [`Instance`]s ([`Staging`]), allocates
+//! nothing. A skin may refuse a frame with the runtime model's
+//! `BuildError`: nothing of it is submitted, and the renderer builds that
+//! skin's attempt no more until it is prepared again.
 //!
 //! Menu screens draw Japanese text with [`text`] and
 //! [`Renderer::menu_frame`], which the play screen never calls.
@@ -28,6 +31,7 @@
 mod atlas;
 mod gpu;
 pub mod measure;
+mod overlay;
 mod pace;
 mod projection;
 mod renderer;
@@ -40,6 +44,7 @@ pub mod text;
 
 pub use atlas::{ATLAS_SIZE, GLYPH_H, GLYPH_W, glyph_rows, solid_uv};
 pub use gpu::{AdapterChoice, Gpu};
+pub use overlay::{OVERLAY_RUNS, OVERLAY_SPRITES};
 pub use projection::{ClipError, ClipTable, MAX_CLIPS, Projection};
 pub use renderer::{FrameTiming, MAX_SPRITES, RenderError, Renderer, Target, letterbox};
 pub use simple::{

@@ -41,6 +41,8 @@ const OVERLAY_REFRESH_US: i64 = 250_000;
 /// Overlay lines, and characters per line.
 const LINES: usize = 13;
 const LINE_LEN: usize = 56;
+// A full overlay's glyphs fit the reserve the play frame keeps for them.
+const _: () = assert!(LINES * LINE_LEN <= render::OVERLAY_SPRITES as usize);
 /// Presents remembered to take the ones after a play's end back out of its
 /// count.
 const RECENT: usize = 16;

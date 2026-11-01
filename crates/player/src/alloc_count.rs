@@ -55,8 +55,29 @@ pub fn counts() -> [u64; 4] {
 }
 
 /// Enters (`true`) or leaves this thread's app region.
-pub fn app_region(on: bool) {
+fn app_region(on: bool) {
     IN_APP.set(on);
+}
+
+/// This thread's app region, entered when made and left when dropped: on
+/// every way out of the code it spans, an early return with an error
+/// included, so nothing after it, such as the error's report, is counted
+/// as the region's.
+#[must_use = "the app region is left when this is dropped"]
+pub struct AppRegion(());
+
+impl AppRegion {
+    /// Enters this thread's app region.
+    pub fn enter() -> Self {
+        app_region(true);
+        Self(())
+    }
+}
+
+impl Drop for AppRegion {
+    fn drop(&mut self) {
+        app_region(false);
+    }
 }
 
 /// This thread's allocations inside its app region so far.
@@ -120,7 +141,7 @@ static GLOBAL: Counting = Counting;
 mod tests {
     use std::hint::black_box;
 
-    use super::{Tag, app_allocations, app_region, counts, tag};
+    use super::{AppRegion, Tag, app_allocations, counts, tag};
 
     /// A tagged thread's allocation counts against its tag only.
     #[test]
@@ -145,12 +166,36 @@ mod tests {
             let before = app_allocations();
             black_box(Vec::<u8>::with_capacity(64));
             let outside = app_allocations() - before;
-            app_region(true);
+            let region = AppRegion::enter();
             black_box(Vec::<u8>::with_capacity(64));
-            app_region(false);
+            drop(region);
             black_box(Vec::<u8>::with_capacity(64));
             (outside, app_allocations() - before)
         });
         assert_eq!(h.join().unwrap(), (0, 1));
+    }
+
+    /// Work in the region that leaves it early with an error: the region
+    /// ends on that way out, so the error's report made after it, which
+    /// allocates, is not the region's.
+    #[test]
+    fn the_app_region_ends_on_an_early_error() {
+        fn work(fail: bool) -> Result<(), &'static str> {
+            let _region = AppRegion::enter();
+            black_box(Vec::<u8>::with_capacity(64));
+            if fail {
+                return Err("refused");
+            }
+            Ok(())
+        }
+        let h = std::thread::spawn(|| {
+            let before = app_allocations();
+            let e = work(true).unwrap_err();
+            let report = black_box(format!("render: {e}"));
+            assert!(!report.is_empty());
+            work(false).unwrap();
+            app_allocations() - before
+        });
+        assert_eq!(h.join().unwrap(), 2);
     }
 }

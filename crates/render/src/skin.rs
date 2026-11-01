@@ -6,7 +6,7 @@
 use bms_model::{Chart, TimeUs};
 use eval::{JudgeEvent, Section};
 use game::PlayView;
-use skin_model::{Canvas, Fit};
+use skin_model::{BuildError, Canvas, Fit};
 
 use crate::{Gpu, MAX_SPRITES, SpriteBatch};
 
@@ -30,7 +30,9 @@ pub struct FrameInput<'a> {
     /// Index into [`PlayView::gauges`] of the gauge to show.
     pub gauge: usize,
     /// Lines of the measurement overlay (design.md "Latency Figures"), drawn
-    /// over the play; empty when it is hidden.
+    /// over the play after the skin's sprites, by the staging and not the
+    /// skin ([`Staging::build`](crate::Staging::build)); empty when it is
+    /// hidden.
     pub overlay: &'a [&'a str],
     /// The target's size in pixels as the renderer last applied it
     /// ([`Renderer::target`](crate::Renderer::target)), never zero: the
@@ -74,15 +76,34 @@ pub trait PlaySkin: Send {
         section: Option<&Section>,
     ) -> Result<(), SkinError>;
 
-    /// Fills `out`, which arrives empty, with the frame's sprites.
-    fn build(&mut self, f: &FrameInput<'_>, out: &mut SpriteBatch);
+    /// Fills `out`, which arrives empty, with the frame's sprites, or
+    /// refuses the frame with the runtime model's error. A refused frame
+    /// is drawn by nothing: the renderer drops whatever was pushed, submits
+    /// nothing, and calls `build` no more until the next
+    /// [`prepare`](Self::prepare), so the attempt stops. Allocation-free,
+    /// the error included.
+    ///
+    /// # Errors
+    ///
+    /// The model's [`BuildError`] for a frame it cannot build.
+    fn build(&mut self, f: &FrameInput<'_>, out: &mut SpriteBatch) -> Result<(), BuildError>;
 
     /// The most sprites a frame of the skin pushes: the renderer's batch,
     /// staging and instance buffer hold this many, and never fewer than
-    /// [`MAX_SPRITES`], which the built-in screens use. The default is
+    /// [`MAX_SPRITES`], which the built-in screens use, and the
+    /// measurement overlay's reserve after them
+    /// ([`OVERLAY_SPRITES`](crate::OVERLAY_SPRITES)). The default is
     /// [`MAX_SPRITES`].
     fn capacity(&self) -> u32 {
         MAX_SPRITES as u32
+    }
+
+    /// The most runs a frame of the skin's sprites take, at least one per
+    /// sprite when it may change blend or clip at every sprite; the
+    /// overlay's run is reserved apart. The default is
+    /// [`capacity`](Self::capacity).
+    fn run_capacity(&self) -> u32 {
+        self.capacity()
     }
 
     /// The canvas the skin draws on for a `target`-pixel target, which the

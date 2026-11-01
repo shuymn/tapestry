@@ -1,17 +1,21 @@
 //! The app's share of a frame, everything before wgpu is called: the
 //! batch a frame fills, its staging into [`Instance`]s, and the play
 //! skin's projection with its clips' scissors, all sized before play so a
-//! frame allocates nothing (design.md "Scope of No Allocation").
+//! frame allocates nothing (design.md "Scope of No Allocation"). A play
+//! frame's batch holds the skin's sprites, then the measurement overlay's
+//! from a reserve the skin cannot fill.
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
-use skin_model::{Canvas, ClipId};
+use skin_model::{BuildError, Canvas, ClipId};
 
+use crate::overlay::{self, OVERLAY_RUNS, OVERLAY_SPRITES};
 use crate::projection::{ClipTable, Projection};
 use crate::{FrameInput, Instance, PlaySkin, SpriteBatch};
 
-/// A frame's batch and staging, sized for `capacity` sprites, and the play
-/// skin's projection and clip scissors for the applied target.
+/// A frame's batch and staging, sized for `capacity` sprites of the skin
+/// and the overlay's reserve after them, and the play skin's projection
+/// and clip scissors for the applied target.
 #[derive(Debug)]
 pub struct Staging {
     batch: SpriteBatch,
@@ -36,14 +40,15 @@ pub enum Scissor {
 }
 
 impl Staging {
-    /// Room for `capacity` sprites, projected onto `canvas`'s target, with
-    /// no clips and the built-in atlas alone.
+    /// Room for `capacity` sprites of the skin in as many runs, and the
+    /// overlay's reserve, projected onto `canvas`'s target, with no clips
+    /// and the built-in atlas alone.
     #[must_use]
     pub fn new(capacity: u32, canvas: &Canvas) -> Self {
-        let n = usize::try_from(capacity).unwrap_or(usize::MAX);
+        let batch = Self::sized(capacity, capacity);
         Self {
-            batch: SpriteBatch::with_capacity(n),
-            instances: Vec::with_capacity(n),
+            instances: Vec::with_capacity(batch.total_capacity()),
+            batch,
             font_scale: 1.0,
             projection: Projection::new(canvas),
             clips: ClipTable::default(),
@@ -51,18 +56,38 @@ impl Staging {
         }
     }
 
-    /// The most sprites a frame stages.
+    /// A batch of `sprites` sprites in `runs` runs and the overlay's
+    /// reserve.
+    fn sized(sprites: u32, runs: u32) -> SpriteBatch {
+        SpriteBatch::with_reserve(sprites, runs, OVERLAY_SPRITES, OVERLAY_RUNS)
+    }
+
+    /// The most sprites a frame of the skin stages, the overlay's reserve
+    /// left out.
     #[must_use]
     pub fn capacity(&self) -> usize {
         self.batch.capacity()
     }
 
-    /// Makes room for `capacity` sprites, emptying the batch: allocates,
-    /// so before play.
-    pub fn set_capacity(&mut self, capacity: u32) {
-        let n = usize::try_from(capacity).unwrap_or(usize::MAX);
-        self.batch = SpriteBatch::with_capacity(n);
-        self.instances = Vec::with_capacity(n);
+    /// The most runs a frame of the skin takes, the overlay's left out.
+    #[must_use]
+    pub fn run_capacity(&self) -> usize {
+        self.batch.run_capacity()
+    }
+
+    /// The most instances a frame stages, the overlay's reserve included:
+    /// what the instance buffer holds.
+    #[must_use]
+    pub fn instance_capacity(&self) -> usize {
+        self.batch.total_capacity()
+    }
+
+    /// Makes room for `capacity` sprites of the skin in `runs` runs, and
+    /// the overlay's reserve, emptying the batch: allocates, so before
+    /// play.
+    pub fn set_capacity(&mut self, capacity: u32, runs: u32) {
+        self.batch = Self::sized(capacity, runs);
+        self.instances = Vec::with_capacity(self.batch.total_capacity());
     }
 
     /// Takes `clips` and projects them: allocates, so before play.
@@ -103,11 +128,26 @@ impl Staging {
         }
     }
 
-    /// The skin builds `f` into the emptied batch, which is then staged in
-    /// drawing order: a play frame's app work, which calls nothing in wgpu
-    /// and allocates nothing.
-    pub fn build(&mut self, skin: &mut dyn PlaySkin, f: &FrameInput<'_>) {
-        self.fill(|batch| skin.build(f, batch));
+    /// The skin builds `f` into the emptied batch, the overlay's lines
+    /// follow from the reserve, and the batch is staged in drawing order:
+    /// a play frame's app work, which calls nothing in wgpu and allocates
+    /// nothing.
+    ///
+    /// # Errors
+    ///
+    /// The skin's refusal of the frame: the batch and the staging are
+    /// left empty, so nothing of the frame, the sprites the skin pushed
+    /// before refusing included, can be drawn.
+    pub fn build(&mut self, skin: &mut dyn PlaySkin, f: &FrameInput<'_>) -> Result<(), BuildError> {
+        self.batch.clear();
+        self.instances.clear();
+        if let Err(e) = skin.build(f, &mut self.batch) {
+            self.batch.clear();
+            return Err(e);
+        }
+        overlay::draw(f.overlay, &mut self.batch);
+        self.batch.stage(&mut self.instances, self.font_scale);
+        Ok(())
     }
 
     /// `push` fills the emptied batch, which is then staged: the built-in

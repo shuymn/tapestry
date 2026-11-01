@@ -33,7 +33,10 @@
 //!
 //! A frame that fails (the surface was lost) drops the screen and tells
 //! the game thread, which ends the play; the next play's preparation builds
-//! the screen again, and if that fails the run ends with the error.
+//! the screen again, and if that fails the run ends with the error. A frame
+//! the skin refuses ([`Screen::build`]) also ends the play, but keeps the
+//! screen and its resources: nothing is drawn or built again for that play,
+//! and the next play's preparation readies the same screen afresh.
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
@@ -49,7 +52,7 @@ use game::{Chain, Preparation, PreparationRefusal, RenderSide, ResultGraphs};
 use input::QpcClock;
 use render::measure::{FrameStatistics, Presentation};
 use render::{FrameInput, FrameTiming, RenderError};
-use skin_model::PlayContext;
+use skin_model::{BuildError, PlayContext};
 
 use crate::attempt_context::AttemptContext;
 use crate::loading_text::LoadingUpdate;
@@ -100,8 +103,15 @@ pub trait Screen: Send {
     /// Whether [`wait`](Self::wait) paces frames.
     fn paced(&self) -> bool;
     /// Builds one play frame from `f`: the app's own work, which calls
-    /// nothing in wgpu. [`draw`](Self::draw) follows.
-    fn build(&mut self, f: &FrameInput<'_>);
+    /// nothing in wgpu. [`draw`](Self::draw) follows a frame built.
+    ///
+    /// # Errors
+    ///
+    /// The skin's refusal of the frame, which allocates nothing: the
+    /// attempt stops, nothing of it is drawn, and no frame of it is built
+    /// again; the screen stays usable, and the next attempt's preparation
+    /// builds again.
+    fn build(&mut self, f: &FrameInput<'_>) -> Result<(), BuildError>;
     /// Draws the play frame [`build`](Self::build) built;
     /// [`FrameTiming::presented`] is `false` when it was not presented (the
     /// swap chain image timed out or the window is occluded).
@@ -1317,9 +1327,11 @@ impl Run {
                 } => {
                     // The app region's first interval (design.md "Scope of
                     // No Allocation"): this frame's own work up to the
-                    // build, before anything calls into wgpu.
+                    // build, before anything calls into wgpu. It ends
+                    // before the build's outcome is looked at, and on any
+                    // other way out.
                     #[cfg(feature = "dev-tools")]
-                    crate::alloc_count::app_region(true);
+                    let region = crate::alloc_count::AppRegion::enter();
                     effects.clear();
                     // At most what the buffer holds: the logic step can push
                     // during the drain, and the rest waits for the next
@@ -1350,9 +1362,21 @@ impl Run {
                         overlay: &overlay[..shown],
                         target: screen.target(),
                     };
-                    screen.build(&f);
+                    let built = screen.build(&f);
                     #[cfg(feature = "dev-tools")]
-                    crate::alloc_count::app_region(false);
+                    drop(region);
+                    if let Err(e) = built {
+                        // The skin refused the frame: nothing of it is
+                        // drawn, and no frame of this attempt is built
+                        // again. The attempt stops as on the screen's
+                        // failure, but the screen, its device and its
+                        // resources stay, for the next preparation.
+                        self.measure.failed(&effects);
+                        eprintln!("render: {}", Chain(&e));
+                        self.shared.failed.store(true, Ordering::Release);
+                        mode = Mode::Idle;
+                        continue;
+                    }
                     let drawn = screen.draw().map(|timing| (timing, Some(now)));
                     // The first frame that reached the screen.
                     if matches!(&drawn, Ok((t, _)) if t.presented) && *first {
@@ -1446,10 +1470,10 @@ impl Run {
                     // measurement. The frame sink (the frame dump) stays
                     // outside it.
                     #[cfg(feature = "dev-tools")]
-                    crate::alloc_count::app_region(play.is_some());
+                    let region = play.is_some().then(crate::alloc_count::AppRegion::enter);
                     self.measure.frame(&d);
                     #[cfg(feature = "dev-tools")]
-                    crate::alloc_count::app_region(false);
+                    drop(region);
                     self.frames.frame(screen.as_ref(), &d);
                     // The end page drawn, for a script waiting on it
                     // (dev-tools).
@@ -1604,7 +1628,9 @@ mod tests {
         fn paced(&self) -> bool {
             false
         }
-        fn build(&mut self, _f: &FrameInput<'_>) {}
+        fn build(&mut self, _f: &FrameInput<'_>) -> Result<(), skin_model::BuildError> {
+            Ok(())
+        }
         fn draw(&mut self) -> Result<FrameTiming, RenderError> {
             self.play_frames += 1;
             let presented = self.play_frames >= 4;
@@ -1655,7 +1681,9 @@ mod tests {
         fn paced(&self) -> bool {
             false
         }
-        fn build(&mut self, _f: &FrameInput<'_>) {}
+        fn build(&mut self, _f: &FrameInput<'_>) -> Result<(), skin_model::BuildError> {
+            Ok(())
+        }
         fn draw(&mut self) -> Result<FrameTiming, RenderError> {
             Ok(timing(true))
         }
@@ -1797,7 +1825,9 @@ mod tests {
         fn paced(&self) -> bool {
             false
         }
-        fn build(&mut self, _f: &FrameInput<'_>) {}
+        fn build(&mut self, _f: &FrameInput<'_>) -> Result<(), skin_model::BuildError> {
+            Ok(())
+        }
         fn draw(&mut self) -> Result<FrameTiming, RenderError> {
             Ok(timing(true))
         }
@@ -1943,7 +1973,9 @@ mod tests {
         fn paced(&self) -> bool {
             true
         }
-        fn build(&mut self, _f: &FrameInput<'_>) {}
+        fn build(&mut self, _f: &FrameInput<'_>) -> Result<(), skin_model::BuildError> {
+            Ok(())
+        }
         fn draw(&mut self) -> Result<FrameTiming, RenderError> {
             Ok(timing(true))
         }
@@ -2142,7 +2174,9 @@ mod tests {
         fn paced(&self) -> bool {
             false
         }
-        fn build(&mut self, _f: &FrameInput<'_>) {}
+        fn build(&mut self, _f: &FrameInput<'_>) -> Result<(), skin_model::BuildError> {
+            Ok(())
+        }
         fn draw(&mut self) -> Result<FrameTiming, RenderError> {
             Ok(timing(true))
         }
@@ -2183,7 +2217,9 @@ mod tests {
         fn paced(&self) -> bool {
             false
         }
-        fn build(&mut self, _f: &FrameInput<'_>) {}
+        fn build(&mut self, _f: &FrameInput<'_>) -> Result<(), skin_model::BuildError> {
+            Ok(())
+        }
         fn draw(&mut self) -> Result<FrameTiming, RenderError> {
             Ok(timing(true))
         }
@@ -2336,7 +2372,9 @@ mod tests {
         fn paced(&self) -> bool {
             false
         }
-        fn build(&mut self, _f: &FrameInput<'_>) {}
+        fn build(&mut self, _f: &FrameInput<'_>) -> Result<(), skin_model::BuildError> {
+            Ok(())
+        }
         fn draw(&mut self) -> Result<FrameTiming, RenderError> {
             Ok(timing(true))
         }
@@ -2458,7 +2496,9 @@ mod tests {
         fn paced(&self) -> bool {
             false
         }
-        fn build(&mut self, _f: &FrameInput<'_>) {}
+        fn build(&mut self, _f: &FrameInput<'_>) -> Result<(), skin_model::BuildError> {
+            Ok(())
+        }
         fn draw(&mut self) -> Result<FrameTiming, RenderError> {
             Ok(timing(true))
         }
@@ -2559,7 +2599,9 @@ mod tests {
         fn paced(&self) -> bool {
             false
         }
-        fn build(&mut self, _f: &FrameInput<'_>) {}
+        fn build(&mut self, _f: &FrameInput<'_>) -> Result<(), skin_model::BuildError> {
+            Ok(())
+        }
         fn draw(&mut self) -> Result<FrameTiming, RenderError> {
             Ok(timing(true))
         }
@@ -2655,7 +2697,9 @@ mod tests {
         fn paced(&self) -> bool {
             false
         }
-        fn build(&mut self, _f: &FrameInput<'_>) {}
+        fn build(&mut self, _f: &FrameInput<'_>) -> Result<(), skin_model::BuildError> {
+            Ok(())
+        }
         fn draw(&mut self) -> Result<FrameTiming, RenderError> {
             Ok(timing(true))
         }
@@ -2791,7 +2835,9 @@ mod tests {
         fn paced(&self) -> bool {
             false
         }
-        fn build(&mut self, _f: &FrameInput<'_>) {}
+        fn build(&mut self, _f: &FrameInput<'_>) -> Result<(), skin_model::BuildError> {
+            Ok(())
+        }
         fn draw(&mut self) -> Result<FrameTiming, RenderError> {
             Ok(timing(true))
         }
@@ -3000,6 +3046,186 @@ mod tests {
         link.exit();
     }
 
+    /// What [`RefusingFrames`] saw, in counters that never allocate: its
+    /// preparations, its build calls, the preparation the last build came
+    /// in, its draws and its end screen frames.
+    #[derive(Default)]
+    struct FrameCalls {
+        epoch: AtomicU32,
+        builds: AtomicU32,
+        last_build_epoch: AtomicU32,
+        draws: AtomicU32,
+        texts: AtomicU32,
+    }
+
+    /// A screen whose skin refuses every frame while `refuse` is set,
+    /// counting what it is called for. It refuses as told, without the
+    /// renderer's own rule of refusing every later frame of a refused
+    /// preparation, so only the render thread keeps it from being built
+    /// again.
+    struct RefusingFrames {
+        calls: Arc<FrameCalls>,
+        refuse: Arc<AtomicBool>,
+    }
+
+    impl Screen for RefusingFrames {
+        fn load(
+            &mut self,
+            _chart: &Chart,
+            _section: Option<&eval::Section>,
+        ) -> Result<(), RenderError> {
+            self.calls.epoch.fetch_add(1, Ordering::AcqRel);
+            Ok(())
+        }
+        fn wait(&self) -> bool {
+            true
+        }
+        fn paced(&self) -> bool {
+            false
+        }
+        fn build(&mut self, _f: &FrameInput<'_>) -> Result<(), skin_model::BuildError> {
+            let epoch = self.calls.epoch.load(Ordering::Acquire);
+            self.calls.last_build_epoch.store(epoch, Ordering::Release);
+            self.calls.builds.fetch_add(1, Ordering::AcqRel);
+            if self.refuse.load(Ordering::Acquire) {
+                return Err(skin_model::BuildError::InconsistentTally);
+            }
+            Ok(())
+        }
+        fn draw(&mut self) -> Result<FrameTiming, RenderError> {
+            self.calls.draws.fetch_add(1, Ordering::AcqRel);
+            Ok(timing(true))
+        }
+        fn text(&mut self, _lines: &[&str]) -> Result<bool, RenderError> {
+            self.calls.texts.fetch_add(1, Ordering::AcqRel);
+            Ok(true)
+        }
+        #[cfg(feature = "dev-tools")]
+        fn read_back(&self) -> Option<(u32, u32, Vec<u8>)> {
+            None
+        }
+    }
+
+    /// A refused frame stops the attempt without dropping the screen: it
+    /// is reported as the screen's failure, so the game ends the play, and
+    /// no frame of that preparation is built or drawn again, however many
+    /// frame opportunities follow. The recovery keeps the screen, built
+    /// once, and only the next attempt's preparation builds again. The
+    /// app region ends on the refusal's way out: the end screen drawn after
+    /// it, which allocates, counts nothing in it (dev-tools).
+    #[test]
+    fn a_refused_frame_stops_the_attempt_and_keeps_the_screen() {
+        let chart = ChartBuilder::new(120_000)
+            .tap(Lane::new(1).unwrap(), TimeUs(60_000_000))
+            .build()
+            .unwrap();
+        let (rule, device) = (rules::tapestry(), DeviceProfile::default());
+        let play = || {
+            Logic::<SourceReader>::new(
+                &chart,
+                &rule,
+                &device,
+                &InputStart::default(),
+                Vec::new(),
+                LogicConfig {
+                    inputs: 0,
+                    effects: 16,
+                },
+                Vec::new(),
+            )
+            .unwrap()
+        };
+        let calls = Arc::new(FrameCalls::default());
+        let refuse = Arc::new(AtomicBool::new(false));
+        let made = Arc::new(AtomicU32::new(0));
+        let (seen, refusing, count) = (Arc::clone(&calls), Arc::clone(&refuse), Arc::clone(&made));
+        let make: MakeScreen = Box::new(move || {
+            count.fetch_add(1, Ordering::AcqRel);
+            Ok(Box::new(RefusingFrames {
+                calls: Arc::clone(&seen),
+                refuse: Arc::clone(&refusing),
+            }) as Box<dyn Screen>)
+        });
+        let clock = QpcClock::start();
+        let shared_chart = Arc::new(chart.clone());
+        let link = spawn(
+            make,
+            Some(Arc::clone(&shared_chart)),
+            None,
+            clock,
+            view(),
+            measure(clock),
+            Box::new(NoFrames),
+        )
+        .unwrap();
+        let ready = link.prepare_attempt(attempt(&shared_chart, None), || false);
+        assert_eq!(ready.unwrap(), Preparation::Ready);
+        let first = calls.epoch.load(Ordering::Acquire);
+        let (_logic, side) = play();
+        link.send(RenderMsg::Play {
+            side,
+            gauge: 0,
+            measure: play_measure(clock.now()),
+        });
+        assert!(wait_until(|| calls.draws.load(Ordering::Acquire) >= 3));
+        assert!(!link.failed());
+
+        refuse.store(true, Ordering::Release);
+        assert!(wait_until(|| link.failed()), "the refusal was not reported");
+        let (builds, draws) = (
+            calls.builds.load(Ordering::Acquire),
+            calls.draws.load(Ordering::Acquire),
+        );
+        assert_eq!(calls.last_build_epoch.load(Ordering::Acquire), first);
+        // Frame opportunities: each wake goes round the render loop.
+        for _ in 0..5 {
+            link.send(RenderMsg::Resize);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(calls.builds.load(Ordering::Acquire), builds, "built again");
+        assert_eq!(calls.draws.load(Ordering::Acquire), draws, "drawn again");
+        link.show_end(super::EndPage {
+            lines: vec!["END".to_owned()],
+            graphs: None,
+        });
+        assert!(wait_until(|| calls.texts.load(Ordering::Acquire) >= 1));
+        let fig = link.finish(clock.now()).expect("the play's figures");
+        #[cfg(feature = "dev-tools")]
+        assert_eq!(fig.render_app_allocations, Some(0));
+        #[cfg(not(feature = "dev-tools"))]
+        assert_eq!(fig.render_app_allocations, None);
+        assert_eq!(calls.builds.load(Ordering::Acquire), builds);
+
+        // The recovery keeps the screen; the next attempt's preparation
+        // builds again, in its own preparation.
+        link.prepare().unwrap();
+        assert!(!link.failed());
+        refuse.store(false, Ordering::Release);
+        let ready = link.prepare_attempt(attempt(&shared_chart, None), || false);
+        assert_eq!(ready.unwrap(), Preparation::Ready);
+        let next = calls.epoch.load(Ordering::Acquire);
+        assert!(next > first);
+        let (_next_logic, side) = play();
+        link.send(RenderMsg::Play {
+            side,
+            gauge: 0,
+            measure: play_measure(clock.now()),
+        });
+        assert!(wait_until(
+            || calls.draws.load(Ordering::Acquire) >= draws + 3
+        ));
+        assert!(calls.builds.load(Ordering::Acquire) > builds);
+        assert_eq!(calls.last_build_epoch.load(Ordering::Acquire), next);
+        assert!(!link.failed());
+        assert_eq!(
+            made.load(Ordering::Acquire),
+            1,
+            "the screen was built again"
+        );
+        let _ = link.finish(clock.now());
+        link.exit();
+    }
+
     #[test]
     fn the_first_frame_is_the_first_presented_one() {
         let chart = ChartBuilder::new(120_000)
@@ -3066,11 +3292,12 @@ mod tests {
         fn paced(&self) -> bool {
             false
         }
-        fn build(&mut self, f: &FrameInput<'_>) {
+        fn build(&mut self, f: &FrameInput<'_>) -> Result<(), skin_model::BuildError> {
             self.0
                 .lock()
                 .unwrap()
                 .push((f.visible_time, f.display_offset));
+            Ok(())
         }
         fn draw(&mut self) -> Result<FrameTiming, RenderError> {
             Ok(timing(true))
@@ -3167,7 +3394,9 @@ mod tests {
         fn paced(&self) -> bool {
             false
         }
-        fn build(&mut self, _f: &FrameInput<'_>) {}
+        fn build(&mut self, _f: &FrameInput<'_>) -> Result<(), skin_model::BuildError> {
+            Ok(())
+        }
         fn draw(&mut self) -> Result<FrameTiming, RenderError> {
             Err(RenderError::SurfaceLost)
         }
@@ -3280,13 +3509,14 @@ mod tests {
         fn paced(&self) -> bool {
             true
         }
-        fn build(&mut self, f: &FrameInput<'_>) {
+        fn build(&mut self, f: &FrameInput<'_>) -> Result<(), skin_model::BuildError> {
             let judged = f
                 .effects
                 .iter()
                 .filter(|e| matches!(e.kind, eval::JudgeEventKind::Judged { .. }))
                 .count();
             self.seen.lock().unwrap().push((f.effects.len(), judged));
+            Ok(())
         }
         fn draw(&mut self) -> Result<FrameTiming, RenderError> {
             Ok(timing(true))
@@ -3423,10 +3653,11 @@ mod tests {
         fn paced(&self) -> bool {
             false
         }
-        fn build(&mut self, _f: &FrameInput<'_>) {
+        fn build(&mut self, _f: &FrameInput<'_>) -> Result<(), skin_model::BuildError> {
             if self.in_build {
                 allocate();
             }
+            Ok(())
         }
         fn draw(&mut self) -> Result<FrameTiming, RenderError> {
             allocate();
@@ -3647,7 +3878,9 @@ mod tests {
         fn paced(&self) -> bool {
             false
         }
-        fn build(&mut self, _f: &FrameInput<'_>) {}
+        fn build(&mut self, _f: &FrameInput<'_>) -> Result<(), skin_model::BuildError> {
+            Ok(())
+        }
         fn draw(&mut self) -> Result<FrameTiming, RenderError> {
             Ok(timing(true))
         }
@@ -3985,7 +4218,9 @@ mod tests {
         fn paced(&self) -> bool {
             true
         }
-        fn build(&mut self, _f: &FrameInput<'_>) {}
+        fn build(&mut self, _f: &FrameInput<'_>) -> Result<(), skin_model::BuildError> {
+            Ok(())
+        }
         fn draw(&mut self) -> Result<FrameTiming, RenderError> {
             self.drawn("<play>".to_owned());
             Ok(timing(true))
@@ -4310,7 +4545,9 @@ mod tests {
         fn paced(&self) -> bool {
             true
         }
-        fn build(&mut self, _f: &FrameInput<'_>) {}
+        fn build(&mut self, _f: &FrameInput<'_>) -> Result<(), skin_model::BuildError> {
+            Ok(())
+        }
         fn draw(&mut self) -> Result<FrameTiming, RenderError> {
             Ok(timing(true))
         }
