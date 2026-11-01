@@ -572,7 +572,9 @@ impl PlaySkin for Refusing {
 
 /// A refused frame is staged and then never submitted: the frame drawn
 /// before it stays on the target, the white sprite pushed before the
-/// refusal never reaching it. Every later frame opportunity calls the
+/// refusal never reaching it, nor a frame built before the refusal and not
+/// yet submitted (submitted, its staging emptied by the refusal, it would
+/// present black over the red). Every later frame opportunity calls the
 /// skin no more and submits nothing, even once the skin would build
 /// again; only the next preparation builds again, drawing page 1 with the
 /// atlas and clip kept through the refusal.
@@ -596,17 +598,23 @@ fn a_refused_frame_submits_nothing_until_the_next_preparation() {
     }))
     .unwrap();
     r.load(&chart, None).unwrap();
+    let page_1 = |r: &Renderer, p: &[u8]| {
+        near(px(r, p, 480.0, 540.0), RED, 2);
+        near(px(r, p, 1_440.0, 540.0), BLACK, 2);
+    };
     let drawn = |r: &mut Renderer| {
         let p = frame(r);
-        near(px(r, &p, 480.0, 540.0), RED, 2);
-        near(px(r, &p, 1_440.0, 540.0), BLACK, 2);
+        page_1(r, &p);
     };
     drawn(&mut r);
     assert_eq!(calls.lock().unwrap().builds, [1]);
 
-    refuse.store(true, Ordering::Relaxed);
+    // A frame built and not submitted, then a refused one: the refusal
+    // drops the pending frame too.
     let v = view(0, 0);
     let f = input(&v, TimeUs(0), TimeUs(0), &[]);
+    assert_eq!(r.build(&f), Ok(()));
+    refuse.store(true, Ordering::Relaxed);
     assert_eq!(r.build(&f), Err(BuildError::InconsistentTally));
     assert_eq!(r.refused(), Some(BuildError::InconsistentTally));
     let not_submitted = |r: &mut Renderer| {
@@ -614,11 +622,10 @@ fn a_refused_frame_submits_nothing_until_the_next_preparation() {
         assert!(!timing.presented);
         assert_eq!((timing.sprites, timing.dropped), (0, 0));
         let p = r.read_back();
-        near(px(r, &p, 480.0, 540.0), RED, 2);
-        near(px(r, &p, 1_440.0, 540.0), BLACK, 2);
+        page_1(r, &p);
     };
     not_submitted(&mut r);
-    assert_eq!(calls.lock().unwrap().builds, [1, 1]);
+    assert_eq!(calls.lock().unwrap().builds, [1, 1, 1]);
     for _ in 0..3 {
         assert_eq!(r.build(&f), Err(BuildError::InconsistentTally));
         not_submitted(&mut r);
@@ -630,13 +637,13 @@ fn a_refused_frame_submits_nothing_until_the_next_preparation() {
         r.frame(&f),
         Err(RenderError::Build(BuildError::InconsistentTally))
     ));
-    assert_eq!(calls.lock().unwrap().builds, [1, 1]);
+    assert_eq!(calls.lock().unwrap().builds, [1, 1, 1]);
 
     r.load(&chart, None).unwrap();
     assert_eq!(r.refused(), None);
     assert_eq!(r.atlas_size(), (256, 3));
     drawn(&mut r);
-    assert_eq!(calls.lock().unwrap().builds, [1, 1, 2]);
+    assert_eq!(calls.lock().unwrap().builds, [1, 1, 1, 2]);
 }
 
 /// Sprites of alternating blends, each in a run of its own, past the

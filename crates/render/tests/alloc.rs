@@ -236,11 +236,11 @@ impl Feed<'_> {
     }
 }
 
-/// The measurement overlay at its fullest: 13 lines of 50 glyphs, none a
+/// The measurement overlay at its fullest: 13 lines of 56 glyphs, none a
 /// space, and the glyphs they draw.
 fn overlay_lines() -> (Vec<String>, usize) {
-    let lines: Vec<String> = (0..13).map(|i| format!("{i:0>50}")).collect();
-    (lines, 13 * 50)
+    let lines: Vec<String> = (0..13).map(|i| format!("{i:0>56}")).collect();
+    (lines, 13 * 56)
 }
 
 /// The overlay's glyphs at the end of the staged batch: 15×21 sprites
