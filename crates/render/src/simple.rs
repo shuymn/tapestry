@@ -1039,6 +1039,7 @@ mod tests {
             },
             gauges: Vec::new(),
             complete: false,
+            playing: true,
             events: 0,
         }
     }

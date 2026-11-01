@@ -15,6 +15,7 @@
 #![forbid(unsafe_code)]
 
 pub mod app;
+mod attempt;
 mod audio_loop;
 mod autoplay;
 mod bests;
@@ -41,6 +42,7 @@ mod sound;
 mod tuning;
 
 pub use app::{App, AppRig, IDLE_WAIT, LoadRefusal, Loading, Pick, Refused};
+pub use attempt::{Attempt, AttemptKind, Preparation, PreparationRefusal};
 pub use audio_loop::{
     AudioControl, AudioCounters, AudioCtl, AudioLoadError, AudioProbe, AudioWaitError, AudioWorker,
     Probed, SWITCH_TIMEOUT, audio_control,
@@ -70,7 +72,8 @@ pub use practice_screen::{
     PracticeScreen, measures,
 };
 pub use prepare::{
-    BmsIngest, ChartIngest, ChartTransform, IngestError, Ingested, Passthrough, TransformId,
+    BmsIngest, ChartIngest, ChartLabels, ChartTransform, IngestError, Ingested, Passthrough,
+    TransformId,
 };
 pub use presets::{
     Entry, POLL_INTERVAL, PollDeadline, PresetChange, PresetStep, Shelf, ShelfError, UnknownPreset,

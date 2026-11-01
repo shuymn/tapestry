@@ -12,10 +12,30 @@ pub use replay::TransformId;
 pub struct Ingested {
     /// The resolved chart, with its identity.
     pub chart: Chart,
+    /// Its descriptive labels, from the same resolution as the chart.
+    pub labels: ChartLabels,
     /// What the adapter skipped or assumed, one line each. Missing sound
     /// files are not among them: the chart's sound table has each one,
     /// without a path, for the caller to sum up.
     pub warnings: Vec<String>,
+}
+
+/// A chart's descriptive labels as its file declares them in the branches
+/// its ingestion took, each empty when it declares none: what a skin's
+/// chart text shows. They come with the chart from one ingestion, never
+/// from reading the file again.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ChartLabels {
+    /// The title.
+    pub title: String,
+    /// The subtitle.
+    pub subtitle: String,
+    /// The artist.
+    pub artist: String,
+    /// The second artist line.
+    pub subartist: String,
+    /// The genre.
+    pub genre: String,
 }
 
 /// Why a chart could not be ingested.
@@ -80,7 +100,15 @@ impl ChartIngest for BmsIngest {
             ..LoadOptions::default()
         };
         let loaded = bms_parser::load_bms(bytes, dir, &opts).map_err(IngestError::Load)?;
+        let l = loaded.labels;
         Ok(Ingested {
+            labels: ChartLabels {
+                title: loaded.chart.meta.title.clone(),
+                subtitle: l.subtitle,
+                artist: l.artist,
+                subartist: l.subartist,
+                genre: l.genre,
+            },
             chart: loaded.chart,
             warnings: loaded
                 .warnings

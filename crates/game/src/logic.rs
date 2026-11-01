@@ -198,6 +198,8 @@ pub struct Logic<'a, R = SourceReader> {
     render: RenderSink,
     sinks: Vec<Box<dyn EventSink + Send + 'a>>,
     view: ViewWriter,
+    /// The play phase the next publication carries ([`PlayView::playing`]).
+    playing: bool,
     finalized: Option<TimeUs>,
     overflowed: bool,
     aborted: Option<AbortCause>,
@@ -288,6 +290,7 @@ impl<'a, R: SourceRead> Logic<'a, R> {
             tally: *evaluator.tally(),
             gauges: evaluator.gauges().to_vec(),
             complete: false,
+            playing: false,
             events: 0,
         };
         let (render, view, side) = render_link(config.effects, &initial);
@@ -310,6 +313,7 @@ impl<'a, R: SourceRead> Logic<'a, R> {
             render,
             sinks,
             view,
+            playing: false,
             finalized: None,
             overflowed: false,
             aborted: None,
@@ -478,6 +482,22 @@ impl<'a, R: SourceRead> Logic<'a, R> {
         }
     }
 
+    /// Sets the play phase the next step publishes with its view
+    /// ([`PlayView::playing`]): the lifecycle's, as the step enters it.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    pub const fn set_playing(&mut self, playing: bool) {
+        self.playing = playing;
+    }
+
+    /// The play left its playing phase (stopped, completed or failed):
+    /// publishes the view again with [`PlayView::playing`] false, so no
+    /// later frame is drawn as playing.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    pub fn stop_playing(&mut self) {
+        self.playing = false;
+        self.publish_view();
+    }
+
     /// The events emitted by the last step.
     #[must_use]
     pub fn events(&self) -> &[JudgeEvent] {
@@ -537,6 +557,7 @@ impl<'a, R: SourceRead> Logic<'a, R> {
             tally: *self.evaluator.tally(),
             gauges: self.evaluator.gauges().to_vec(),
             complete: self.evaluator.is_complete(),
+            playing: self.playing,
             events: self.emitted,
         }
     }
@@ -583,6 +604,7 @@ impl<'a, R: SourceRead> Logic<'a, R> {
         v.gauges.clear();
         v.gauges.extend_from_slice(self.evaluator.gauges());
         v.complete = self.evaluator.is_complete();
+        v.playing = self.playing;
         v.events = self.emitted;
         self.view.publish();
     }

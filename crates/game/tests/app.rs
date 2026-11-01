@@ -134,6 +134,7 @@ impl ChartIngest for Charts {
             other => panic!("no chart {other:?}"),
         };
         Ok(Ingested {
+            labels: game::ChartLabels::default(),
             chart,
             warnings: Vec::new(),
         })
@@ -339,6 +340,10 @@ struct Headless {
     chosen_names: Vec<String>,
     /// Preset steps taken on the select screen, not yet taken by the flow.
     steps: VecDeque<PresetStep>,
+    /// Attempt preparations the screen refuses, from the next.
+    refuse_attempts: usize,
+    /// Every attempt the screen was asked to prepare.
+    attempts: Vec<game::Attempt>,
 }
 
 /// What selection was shown of the shelf.
@@ -440,6 +445,8 @@ impl Headless {
             restore_fails: 0,
             restores: Vec::new(),
             practiced: Vec::new(),
+            refuse_attempts: 0,
+            attempts: Vec::new(),
         }
     }
 
@@ -608,6 +615,18 @@ impl Rig for Headless {
             self.screen_fails_at = i64::MAX;
         }
         Ok(())
+    }
+
+    fn prepare_attempt(&mut self, loaded: &Loaded) -> Result<game::Preparation, SurfaceLost> {
+        self.attempts.push(loaded.attempt());
+        if self.refuse_attempts > 0 {
+            self.refuse_attempts -= 1;
+            return Ok(game::Preparation::Refused(game::PreparationRefusal {
+                location: Some("skin.json:3".to_owned()),
+                reason: "an unknown image".to_owned(),
+            }));
+        }
+        Ok(game::Preparation::Ready)
     }
 
     fn end_loading(&mut self) -> Result<(), SurfaceLost> {
@@ -904,6 +923,7 @@ impl AppRig for Headless {
             Refused::Play(e) => panic!("{e:?}"),
             Refused::Practice(game::PracticeError::Autoplay) => "autoplay",
             Refused::Practice(e) => panic!("{e:?}"),
+            Refused::Preparation(_) => "preparation",
         };
         self.refusals.push(kind.to_owned());
         // The player fixes the preset file once its refusal is shown.
@@ -2701,6 +2721,105 @@ fn a_changed_chart_file_refuses_a_speed_change() {
         rig.practice_entries[0].measures().len() + 2
     );
     assert_eq!(rig.loads.len(), 1);
+}
+
+/// The screen refuses to prepare the chosen chart's attempt: selection
+/// shows the refusal with its located reason, nothing opened or started,
+/// and selection stays usable: the next chart chosen plays, its attempt
+/// numbered 1.
+#[test]
+fn a_refused_preparation_returns_to_selection_which_stays_usable() {
+    let acts = vec![
+        (0, Act::Choose(0)),
+        (500, Act::Choose(1)),
+        (4_000, Act::Close),
+    ];
+    let (rig, events, ran) = run(Refusal::Missing, acts, |rig| rig.refuse_attempts = 1);
+    ran.unwrap();
+    assert!(rig.violations.is_empty(), "{:?}", rig.violations);
+    assert_eq!(rig.refusals, ["preparation"]);
+    assert_eq!(
+        rig.seen,
+        [
+            Seen::Select,
+            Seen::Load(0),
+            Seen::Select,
+            Seen::Refused(0),
+            Seen::Load(1),
+            Seen::Shown(1),
+        ]
+    );
+    // The refused attempt opened nothing; the next chart's opened once.
+    assert_eq!(rig.opens, 1);
+    assert_eq!(events.count(|e| matches!(e, SessionEvent::Start { .. })), 1);
+    let (1, plays) = rig.loads.last().unwrap() else {
+        panic!("{:?}", rig.seen);
+    };
+    assert_eq!(attempts(plays), [1]);
+    assert_eq!(
+        rig.attempts.iter().map(|a| a.number).collect::<Vec<_>>(),
+        [1, 1]
+    );
+}
+
+/// A practice Start whose attempt the screen refuses returns to the
+/// practice page with the reason as its notice; no round opens.
+#[test]
+fn a_refused_round_preparation_shows_on_the_practice_page() {
+    use PracticeInput::{Back, Confirm};
+    let mut acts = vec![(0, Act::Practice(P))];
+    acts.extend(to_start(0));
+    acts.extend([
+        (10, Act::Page(Confirm)),
+        (500, Act::Page(Back)),
+        (500, Act::Close),
+    ]);
+    let (rig, events, ran) = run(Refusal::Missing, acts, |rig| rig.refuse_attempts = 1);
+    ran.unwrap();
+    assert!(rig.violations.is_empty(), "{:?}", rig.violations);
+    let n = notices(&rig);
+    assert_eq!(n.len(), 2, "{:?}", rig.seen);
+    assert!(
+        n[1].as_deref()
+            .is_some_and(|n| n.contains("skin.json:3: an unknown image")),
+        "{n:?}"
+    );
+    assert_eq!(rig.opens, 0);
+    assert_eq!(events.count(|e| matches!(e, SessionEvent::Start { .. })), 0);
+    assert_eq!(rig.seen.last(), Some(&Seen::Select));
+}
+
+/// The play preset is refreshed before the first round too: the preset
+/// file edited while the practice page waits is the one the first round's
+/// attempt is prepared with and played under.
+#[test]
+fn the_first_round_prepares_with_the_preset_edited_on_the_practice_page() {
+    let mut acts = vec![(0, Act::Practice(P))];
+    acts.extend(to_start(0));
+    acts.extend([
+        (500, Act::Page(PracticeInput::Confirm)),
+        (3_000, Act::Quit),
+        (500, Act::Page(PracticeInput::Back)),
+        (500, Act::Close),
+    ]);
+    let (rig, _app, _dir, ran) = run_mine(Refusal::Missing, acts, |r, dir| {
+        // While the page waits, before Start.
+        edit(
+            r,
+            CLOCK_START + 300 * MS,
+            &mine_path(dir),
+            game::preset_to_toml(&flat_normal()),
+        );
+    });
+    ran.unwrap();
+    assert!(rig.violations.is_empty(), "{:?}", rig.violations);
+    let first = &rig.attempts[0];
+    assert_eq!(first.gauges, flat_normal().gauges);
+    assert_ne!(first.gauges, rules::tapestry().gauges);
+    let [(P, rounds)] = &rig.loads[..] else {
+        panic!("{:?}", rig.seen);
+    };
+    assert_eq!(rounds[0].preset, mine(flat_normal()));
 }
 
 fn act() -> impl Strategy<Value = Act> {

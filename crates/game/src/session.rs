@@ -27,6 +27,7 @@ use replay::{
 };
 use rules::{GaugeKind, RulePreset};
 
+use crate::attempt::Attempt;
 use crate::autoplay::{Autoplay, AutoplayError};
 use crate::bests::{BestView, SavedPlay};
 use crate::live::{Closing, InputWaitError, LiveError, Opening, Rig};
@@ -36,7 +37,9 @@ use crate::policy::{
     SessionPolicy, SharedEvents,
 };
 use crate::practice::{Practice, PracticeError, RESTORE_AHEAD};
-use crate::prepare::{BmsIngest, ChartIngest, ChartTransform, IngestError, Passthrough};
+use crate::prepare::{
+    BmsIngest, ChartIngest, ChartLabels, ChartTransform, IngestError, Passthrough,
+};
 use crate::presets::{PresetChange, Shelf, ShelfError};
 use crate::render::PlayView;
 use crate::render::RenderSide;
@@ -348,6 +351,8 @@ pub struct Loaded {
     path: PathBuf,
     chart: Chart,
     chart_record: ChartRecord,
+    /// The chart's labels, from the ingestion that read `chart`.
+    labels: ChartLabels,
     warnings: Vec<String>,
     preset: RulePreset,
     shelf: Shelf,
@@ -361,6 +366,15 @@ pub struct Loaded {
     /// The practice set up, with its section in the chart's real time:
     /// each play is then a round of it.
     practice: Option<(Practice, Section)>,
+}
+
+/// What one read of a chart's file gave: the chart, its record, its labels
+/// and what the loader skipped or assumed, all from one ingestion.
+struct ReadChart {
+    chart: Chart,
+    record: ChartRecord,
+    labels: ChartLabels,
+    warnings: Vec<String>,
 }
 
 /// A loaded chart's file, the seed it was read with and its SHA-256
@@ -396,20 +410,16 @@ impl ChartSource {
     /// [`SessionError::ChartChanged`] when the file's SHA-256 is not the
     /// one loaded, and what reading it refuses.
     pub fn read(&self, parts: &Parts, speed: Speed) -> Result<Chart, SessionError> {
-        self.read_with(parts, speed).map(|(chart, _, _)| chart)
+        self.read_with(parts, speed).map(|read| read.chart)
     }
 
     /// [`read`](Self::read), with the chart's record and warnings.
-    fn read_with(
-        &self,
-        parts: &Parts,
-        speed: Speed,
-    ) -> Result<(Chart, ChartRecord, Vec<String>), SessionError> {
-        let (chart, record, warnings) = Loaded::read_chart(&self.path, self.seed, speed, parts)?;
-        if record.identity.sha256 != self.sha256 {
+    fn read_with(&self, parts: &Parts, speed: Speed) -> Result<ReadChart, SessionError> {
+        let read = Loaded::read_chart(&self.path, self.seed, speed, parts)?;
+        if read.record.identity.sha256 != self.sha256 {
             return Err(SessionError::ChartChanged(self.path.clone()));
         }
-        Ok((chart, record, warnings))
+        Ok(read)
     }
 }
 
@@ -526,7 +536,12 @@ impl Loaded {
         }
         shelf.check();
         match Self::read_chart(chart_path, config.seed, config.speed, &parts) {
-            Ok((chart, chart_record, warnings)) => {
+            Ok(ReadChart {
+                chart,
+                record: chart_record,
+                labels,
+                warnings,
+            }) => {
                 events.on_event(&SessionEvent::Load);
                 Ok(Self {
                     root,
@@ -536,6 +551,7 @@ impl Loaded {
                     path: chart_path.to_owned(),
                     chart,
                     chart_record,
+                    labels,
                     warnings,
                     preset: shelf.chosen().clone(),
                     first_error: shelf.chosen_error().cloned(),
@@ -556,7 +572,7 @@ impl Loaded {
         seed: u64,
         speed: Speed,
         parts: &Parts,
-    ) -> Result<(Chart, ChartRecord, Vec<String>), SessionError> {
+    ) -> Result<ReadChart, SessionError> {
         if !parts.ingest.accepts(chart_path) {
             return Err(SessionError::UnsupportedChart(chart_path.to_owned()));
         }
@@ -584,7 +600,12 @@ impl Loaded {
             random_seed: seed,
             transform: parts.transform.id().record(),
         };
-        Ok((chart, chart_record, ingested.warnings))
+        Ok(ReadChart {
+            chart,
+            record: chart_record,
+            labels: ingested.labels,
+            warnings: ingested.warnings,
+        })
     }
 
     /// The shelf, handed back once the chart's plays are over.
@@ -609,11 +630,12 @@ impl Loaded {
     /// [`SessionError::ChartChanged`] when the file's SHA-256 is not the
     /// one loaded, and what reading it refuses; nothing changes then.
     pub fn set_speed(&mut self, speed: Speed) -> Result<(), SessionError> {
-        let (config, chart, chart_record, warnings) = self.read_at(speed)?;
+        let (config, read) = self.read_at(speed)?;
         self.config = config;
-        self.chart = chart;
-        self.chart_record = chart_record;
-        self.warnings = warnings;
+        self.chart = read.chart;
+        self.chart_record = read.record;
+        self.labels = read.labels;
+        self.warnings = read.warnings;
         self.practice = None;
         Ok(())
     }
@@ -627,7 +649,7 @@ impl Loaded {
     ///
     /// As [`set_speed`](Self::set_speed).
     pub fn chart_at(&self, speed: Speed) -> Result<Chart, SessionError> {
-        self.read_at(speed).map(|(_, chart, _, _)| chart)
+        self.read_at(speed).map(|(_, read)| read.chart)
     }
 
     /// The chart's file, the seed it was read with and its SHA-256: what
@@ -645,16 +667,12 @@ impl Loaded {
 
     /// The chart read again at `speed`; refused when its file's SHA-256 is
     /// not the one loaded.
-    fn read_at(
-        &self,
-        speed: Speed,
-    ) -> Result<(SessionConfig, Chart, ChartRecord, Vec<String>), SessionError> {
+    fn read_at(&self, speed: Speed) -> Result<(SessionConfig, ReadChart), SessionError> {
         let config = SessionConfig {
             speed,
             ..self.config.clone()
         };
-        let (chart, chart_record, warnings) = self.source().read_with(&self.parts, speed)?;
-        Ok((config, chart, chart_record, warnings))
+        Ok((config, self.source().read_with(&self.parts, speed)?))
     }
 
     /// Sets up practice (design.md "Mid-Chart Start and Section Repeat"):
@@ -743,6 +761,13 @@ impl Loaded {
         &self.chart
     }
 
+    /// The chart's labels, from the ingestion that read
+    /// [`chart`](Self::chart).
+    #[must_use]
+    pub const fn labels(&self) -> &ChartLabels {
+        &self.labels
+    }
+
     /// What the loader skipped or assumed.
     #[must_use]
     pub fn warnings(&self) -> &[String] {
@@ -815,24 +840,52 @@ impl Loaded {
         }
     }
 
-    /// Numbers the next play, before recording opens; its start is reported
-    /// once it is [`admitted`](Self::admitted). Every play after the first
-    /// is a retry: a preset file changed since the previous play is used
-    /// from this one on. The first play reports the chosen file's error
-    /// standing when the chart loaded, a retry only an error its check
-    /// found.
+    /// Numbers the next play and refreshes its play preset, before the
+    /// screen prepares its attempt ([`attempt`](Self::attempt)) and
+    /// recording opens; its start is reported once it is
+    /// [`admitted`](Self::admitted). Every play checks the user preset
+    /// files first, the first one included (a practice page can wait
+    /// between the chart's load and its first round), and uses a chosen
+    /// file changed since from this one on. The first play reports the
+    /// chosen file's error standing when the chart loaded unless its check
+    /// found a newer one; a later play only an error its check found.
     pub fn begin_play(&mut self) -> PlayStart {
         self.attempt += 1;
         let attempt = self.attempt;
-        let reload_error = if attempt > 1 {
-            self.reload_preset()
-        } else {
-            self.first_error.take()
-        };
+        let checked = self.reload_preset();
+        let standing = self.first_error.take();
         PlayStart {
             attempt,
-            reload_error,
+            reload_error: checked.or(standing),
         }
+    }
+
+    /// The play `start` stopped before recording opened (its preparation
+    /// was cancelled or refused, or the player quit): its number goes back,
+    /// and the error it would have reported goes with the next play. The
+    /// refreshed preset stays.
+    pub fn withdraw(&mut self, start: PlayStart) {
+        if self.attempt == start.attempt {
+            self.attempt -= 1;
+        }
+        if start.reload_error.is_some() {
+            self.first_error = start.reload_error;
+        }
+    }
+
+    /// The attempt of the play [`begin_play`](Self::begin_play) numbered
+    /// last, under the play preset it refreshed: what the screen prepares
+    /// it with, made afresh for each play.
+    #[must_use]
+    pub fn attempt(&self) -> Attempt {
+        Attempt::new(
+            self.attempt,
+            &self.chart,
+            &self.preset,
+            self.config.lead_in,
+            self.section(),
+            &self.labels,
+        )
     }
 
     /// The play `start` was admitted: recording opened, the play was
@@ -843,7 +896,7 @@ impl Loaded {
         });
     }
 
-    /// At a retry: checks the user preset files, and plays the shelf's
+    /// Before a play: checks the user preset files, and plays the shelf's
     /// chosen preset from now on, reloaded at this check or at a poll since
     /// the previous play. A chosen file that changed and fails to load
     /// leaves the current preset, and its error is returned.
@@ -1327,6 +1380,9 @@ impl<O: AudioOutput + Wakes> Session<O> {
             Err(LiveError::Logic(e)) => Err(SessionPlayError::Logic(e)),
             Err(LiveError::Restore(e)) => Err(SessionPlayError::Restore(e)),
             Err(LiveError::Screen(e)) => match e {},
+            Err(LiveError::Preparation(_)) => {
+                unreachable!("a session has no screen to refuse an attempt")
+            }
             Err(LiveError::Audio(_)) => {
                 unreachable!("a session has no audio thread to fail")
             }

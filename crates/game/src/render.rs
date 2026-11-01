@@ -23,6 +23,12 @@ pub struct PlayView {
     pub gauges: Vec<GaugeState>,
     /// Whether evaluation is complete.
     pub complete: bool,
+    /// Whether the play is in its playing phase, as the lifecycle
+    /// published it with the step that wrote this view
+    /// ([`crate::live`]): false in the countdown and from a stop, the
+    /// completion or a failure on; the step that processed one of those
+    /// still published true. Never derived from `complete`.
+    pub playing: bool,
     /// The number of events emitted so far.
     pub events: u64,
 }
@@ -165,6 +171,7 @@ mod tests {
             },
             gauges: Vec::new(),
             complete: false,
+            playing: false,
             events: 0,
         };
         let (mut sink, _view, mut side) = render_link(QUEUE, &initial);

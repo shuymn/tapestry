@@ -11,7 +11,9 @@
 //!   before anything is read; it lasts until the countdown or the way back.
 //! - A refused load returns to selection with the reason, and the chart
 //!   stays selected: a chart or preset file that cannot be used, a bank
-//!   that does not load, and a play the logic step refuses at the opening.
+//!   that does not load, a play whose attempt the screen refuses to
+//!   prepare, and a play the logic step refuses at the opening. A practice
+//!   Start shows the same refusals on its page.
 //! - Only the screen, audio and input-thread failures [`LiveError`] carries
 //!   end the run; closing the window ends it from any scene.
 //! - One shelf of presets serves the run (design.md "Tuning Without
@@ -26,6 +28,7 @@ use bms_model::TimeUs;
 
 use bms_model::Speed;
 
+use crate::attempt::PreparationRefusal;
 use crate::error::Chain;
 use crate::live::{Leave, LiveError, Rig, run_chart, run_over};
 use crate::logic::LogicError;
@@ -141,6 +144,10 @@ pub enum Refused<B> {
     /// The chart cannot be practiced (an autoplay session).
     #[error("the chart cannot be practiced")]
     Practice(#[source] PracticeError),
+    /// The screen refused to prepare a play of the chart, and stays
+    /// usable for selection.
+    #[error("the play cannot be prepared")]
+    Preparation(#[source] PreparationRefusal),
 }
 
 /// A chosen chart that was refused, and why; it stays selected.
@@ -442,6 +449,7 @@ impl App {
                 Ok(Loading::Ready) => match run_chart(&mut loaded, rig) {
                     Ok(leave) => Ok(Chosen::Left(leave)),
                     Err(LiveError::Logic(e)) => Ok(Chosen::Refused(Refused::Play(e))),
+                    Err(LiveError::Preparation(e)) => Ok(Chosen::Refused(Refused::Preparation(e))),
                     Err(e) => Err(e),
                 },
             }
@@ -557,6 +565,7 @@ fn start_rounds<R: AppRig>(
         Ok(leave) => Ok(leave),
         Err(LiveError::Logic(e)) => Err(notice(&e)),
         Err(LiveError::Restore(e)) => Err(notice(&e)),
+        Err(LiveError::Preparation(e)) => Err(notice(&e)),
         Err(e) => Err(Stopped::Run(e)),
     }
 }
