@@ -48,6 +48,20 @@ pub(super) struct SrcImage {
     cycle: i32,
 }
 
+/// Whether `c`, critical and untimed, would draw what depends on when
+/// the state started (owner decision 7, D3): its track static from 0 and
+/// perpetual, and every cycle it shows `cycle_ok` (absent or on a timer).
+pub(super) fn untimed_refused(c: &Common, cycle_ok: bool) -> bool {
+    c.untimed
+        && matches!(c.role, Role::Critical(_))
+        && !super::policy::untimed_ok(
+            c.track.identical(),
+            c.track.keys.first().is_some_and(|k| k.at == 0),
+            c.track.end,
+            cycle_ok,
+        )
+}
+
 impl Cx<'_> {
     /// The frames of a `div` grid. A grid of more than the skin's frames
     /// is the aggregate frame limit, refused before anything reads it.
@@ -150,15 +164,7 @@ impl Cx<'_> {
                 return Ok(None);
             }
         };
-        if c.untimed
-            && let Role::Critical(_) = role
-            && !super::policy::untimed_ok(
-                c.track.identical(),
-                c.track.keys.first().is_some_and(|k| k.at == 0),
-                c.track.end,
-                cycle.is_none() || cycle_on_timer,
-            )
-        {
+        if untimed_refused(c, cycle.is_none() || cycle_on_timer) {
             self.drop_el(role, at, NoteKind::Timer(super::TimerWhy::Untimed))?;
             return Ok(None);
         }

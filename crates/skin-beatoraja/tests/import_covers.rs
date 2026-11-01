@@ -1086,3 +1086,49 @@ fn a_slider_paints_without_lanes() {
     drawn.view.cover = 500;
     assert_eq!(drawn.rects(1_000), [[20, -20, 430, 600]]);
 }
+
+/// An offset-4 image set `{"id": "s", "images": [...], "value": 110}`
+/// over the default lanes with destination `fields` and `keys`, its
+/// images `extra` and the skin's own `sources`.
+fn cover_set(sources: &str, extra: &str, images: &str, fields: &str, keys: &str) -> Loaded {
+    let objects = format!(
+        r#"{}, "imageset": [{{"id": "s", "images": [{images}], "value": 110}}]"#,
+        note("")
+    );
+    let d = format!(r#"{{"id": "s", "offset": 4{fields}, "dst": [{keys}]}}"#);
+    import_body(&format!("{sources}{}", body(extra, &objects, &[NOTES, &d])))
+}
+
+const OVER: &str = r#"{"x": 20, "y": 800, "w": 430, "h": 600}"#;
+
+#[test]
+fn selecting_paint_may_not_depend_on_the_state_start() {
+    let untimed = (CriticalPart::Cover, NoteKind::Timer(TimerWhy::Untimed));
+    let ending = r#"{"time": 0, "x": 20, "y": 800, "w": 430, "h": 600},
+                    {"time": 500, "x": 20, "y": 800, "w": 430, "h": 600}"#;
+    let moving = r#"{"time": 0, "x": 20, "y": 800, "w": 430, "h": 600},
+                    {"time": 500, "x": 20, "y": 700, "w": 430, "h": 600}"#;
+    let cycling = r#"{"id": "cy", "src": "a", "w": 16, "h": 16, "divx": 2, "cycle": 100}"#;
+    let group = r#"{"id": "s", "src": "a", "w": 16, "h": 16, "divx": 4, "len": 2, "cycle": 100}"#;
+    let group_over = |fields: &str| {
+        let d = format!(r#"{{"id": "s", "offset": 4{fields}, "dst": [{OVER}]}}"#);
+        import_body(&body(group, &note(""), &[NOTES, &d]))
+    };
+    // An ending window, a moving track and an untimed cycle refuse, for
+    // an image set and an image group alike.
+    for (images, fields, keys) in [
+        (r#""cover""#, r#", "loop": -1"#, ending),
+        (r#""cover""#, "", moving),
+        (r#""cy", "cover""#, "", OVER),
+    ] {
+        let l = cover_set("", cycling, images, fields, keys);
+        assert_eq!(critical(l), untimed, "{images} {fields} {keys}");
+        // With a timer of their own each imports.
+        let timed = format!(r#", "timer": 41{fields}"#);
+        cover_set("", cycling, images, &timed, keys).ok();
+    }
+    assert_eq!(critical(group_over("")), untimed);
+    group_over(r#", "timer": 41"#).ok();
+    // A static, perpetual one without a cycle imports untimed.
+    cover_set("", "", r#""cover", "cover""#, "", OVER).ok();
+}
