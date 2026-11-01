@@ -187,7 +187,7 @@ fn advance_does_not_allocate() {
     let mut gev = Evaluator::new(&chart, &gauged, &dev, &InputStart::default(), None, 64).unwrap();
     let mut gauged_out = Vec::with_capacity(gev.max_events(inputs.len()));
     let gauged_capacity = gauged_out.capacity();
-    // A sixth under LR2-style (combo priority, no late BAD head, the 1 s
+    // A sixth under LR2-style (combo priority, the 1 s
     // empty POOR range, tied LN-end edges, damage-corrected gauges failing
     // below 2 %) at #RANK 0, whose windows are interpolated, over the same
     // inputs.

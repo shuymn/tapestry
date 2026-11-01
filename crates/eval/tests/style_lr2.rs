@@ -14,7 +14,7 @@
 //! | Empty POOR: a note 0 to 1000 ms after the press, judged or not, none behind it; not scaled | `play/JudgeProperty.java:54-55`, `play/JudgeManager.java:414-442` |
 //! | Empty POOR keeps the combo without adding to it, adds to BP, has its own count | `play/JudgeProperty.java:60`, `play/JudgeManager.java:716-725` |
 //! | Note assignment: combo priority ([`Assignment::ComboPriority`]) | `PlayConfig.java:103`, the candidate loop `play/JudgeManager.java:414-455` |
-//! | A late BAD LN head cannot be the primary ([`HeadEligibility::NotLateBad`]) | `play/JudgeManager.java:435-437` |
+//! | Missed once its late BAD edge has passed, taps and LN heads alike | `play/JudgeManager.java:640-660` |
 //! | Gauges `{min, max, start, clear, death}` and changes `{PG, GR, GD, BD, PR, MS}` | `play/GaugeProperty.java:117-122`, field order `:161` |
 //! | ASSIST EASY, EASY and NORMAL increases × `TOTAL / notes` | `play/GrooveGauge.java:263` (`TOTAL` modifier), `play/GaugeProperty.java:117-119` |
 //! | HARD and EX HARD damage × `max(fix1, fix2)` ([`TotalCorrection::ScaleDamage`]), MS included | `play/GrooveGauge.java:279-309` (`MODIFY_DAMAGE`), `play/GaugeProperty.java:120-121`; once per chart, `play/GrooveGauge.java:207-211` |
@@ -29,7 +29,6 @@
 //! "What a -style Preset Reproduces").
 //!
 //! [`Assignment::ComboPriority`]: rules::Assignment::ComboPriority
-//! [`HeadEligibility::NotLateBad`]: rules::HeadEligibility::NotLateBad
 //! [`TotalCorrection::ScaleDamage`]: rules::TotalCorrection::ScaleDamage
 //! [`DefaultTotal::NotesLinear`]: rules::DefaultTotal::NotesLinear
 
@@ -42,7 +41,7 @@ use eval::{
     Section, evaluate,
 };
 use rules::Judgment::{Bad, Good, Great, Perfect, Poor};
-use rules::{Assignment, GaugeValue, HeadEligibility, Judgment, RulePreset};
+use rules::{Assignment, GaugeValue, Judgment, RulePreset};
 
 const BPM: i64 = 150_000;
 /// One percent of a gauge.
@@ -415,77 +414,126 @@ fn judged_at(e: &Evaluation) -> Vec<(i64, usize, rules::Judgment, Option<i64>)> 
         .collect()
 }
 
-/// K. A long note from 0 to 50 ms and a tap at 300 ms, pressed at 160 ms:
-/// the head would be a late BAD, so it cannot be the primary, which combo
-/// priority alone would keep since the tap lies outside GOOD. The press
-/// takes the tap, 140 ms early (BAD), and the head it passes is POOR at the
-/// press, before it (`play/JudgeManager.java:435-437`; the passed note is
-/// POOR at the press, a known difference shared with beatoraja-style).
+/// Known difference (the preset's module): an LN head is judged like a tap.
+/// A press inside its late BAD window takes it BAD, where Endless Dream
+/// makes a late BAD head ineligible (play/JudgeManager.java:435-437) and
+/// LR2 has already missed it at its late GOOD edge. At `#RANK 3` (GOOD
+/// ±120 ms, BAD ±200 ms), a long note from 0 to 500 ms pressed 150 ms late
+/// is BAD at the press under either assignment policy, up to the BAD edge
+/// itself. Each chart below judges the same with the head a tap.
 #[test]
-fn ineligible_head_is_passed_and_poor() {
-    let chart = chart(|b| {
-        b.long(lane(1), TimeUs(T), TimeUs(T + 50 * MS))
-            .tap(lane(1), TimeUs(T + 300 * MS))
-    });
-    let at = T + 160 * MS;
-    let e = play_with(&chart, &preset(), hold_at(at, 10));
-    assert_eq!(
-        judged_at(&e),
-        [(at, 0, Poor, None), (at, 1, Bad, Some(-140 * MS))]
-    );
-    // Without the eligibility rule, combo priority keeps the head.
-    let mut inside = preset();
-    inside.ln_mode.head_eligibility = HeadEligibility::InsideBad;
-    let e = play_with(&chart, &inside, hold_at(at, 10));
-    assert_eq!(judged_at(&e)[0], (at, 0, Bad, Some(160 * MS)));
-}
-
-/// K. A late BAD press that reaches an LN head no primary passes leaves the
-/// head where it is: it is not taken, and it is missed at its own deadline
-/// (`play/JudgeManager.java:435-437`). Pressed at 160 ms with the long note
-/// alone, the press takes nothing, under either assignment policy.
-#[test]
-fn late_bad_ln_head_is_not_selectable() {
-    let alone = chart(|b| b.long(lane(1), TimeUs(T), TimeUs(T + 50 * MS)));
+fn late_bad_ln_head_is_taken_like_a_tap() {
+    let alone = |head: bool| {
+        chart(|b| {
+            if head {
+                b.long(lane(1), TimeUs(T), TimeUs(T + 500 * MS))
+            } else {
+                b.tap(lane(1), TimeUs(T))
+            }
+        })
+    };
     for assignment in [Assignment::ComboPriority, Assignment::NearestTiesEarlier] {
         let mut p = preset();
         p.assignment = assignment;
-        let e = play_with(&alone, &p, hold_at(T + 160 * MS, 10));
+        for late in [150 * MS, MISSED] {
+            let at = T + late;
+            for head in [true, false] {
+                let e = play_with(&alone(head), &p, hold_at(at, 10));
+                assert_eq!(
+                    judged_at(&e),
+                    [(at, 0, Bad, Some(late))],
+                    "{assignment:?}, {late}, head {head}"
+                );
+                assert_eq!(empty_poors(&e.events), 0);
+            }
+        }
+    }
+    // A long note from 0 to 50 ms and a tap at 300 ms, pressed at 160 ms:
+    // combo priority keeps the head (BAD), since the tap lies outside GOOD,
+    // and the tap is missed at its own deadline. A tap at 0 ms and a long
+    // note from 30 ms, pressed at 190 ms: the tap is past its late GOOD edge,
+    // so the head (160 ms late, BAD) takes over and the tap is passed.
+    let later_tap = |head: bool| {
+        chart(|b| {
+            let b = if head {
+                b.long(lane(1), TimeUs(T), TimeUs(T + 50 * MS))
+            } else {
+                b.tap(lane(1), TimeUs(T))
+            };
+            b.tap(lane(1), TimeUs(T + 300 * MS))
+        })
+    };
+    let earlier_tap = |head: bool| {
+        chart(|b| {
+            let b = b.tap(lane(1), TimeUs(T));
+            if head {
+                b.long(lane(1), TimeUs(T + 30 * MS), TimeUs(T + 80 * MS))
+            } else {
+                b.tap(lane(1), TimeUs(T + 30 * MS))
+            }
+        })
+    };
+    for head in [true, false] {
+        let at = T + 160 * MS;
+        let e = play_with(&later_tap(head), &preset(), hold_at(at, 10));
         assert_eq!(
             judged_at(&e),
-            [(T + MISSED, 0, Poor, None)],
-            "{assignment:?}"
+            [
+                (at, 0, Bad, Some(160 * MS)),
+                (T + 300 * MS + MISSED, 1, Poor, None)
+            ],
+            "head {head}"
         );
-        assert_eq!(empty_poors(&e.events), 0);
-        assert!(
-            !e.events
-                .iter()
-                .any(|ev| matches!(ev.kind, JudgeEventKind::LnHoldEnded { .. })),
-            "the press took no head"
+        let at = T + 190 * MS;
+        let e = play_with(&earlier_tap(head), &preset(), hold_at(at, 10));
+        assert_eq!(
+            judged_at(&e),
+            [(at, 0, Poor, None), (at, 1, Bad, Some(160 * MS))],
+            "head {head}"
         );
     }
-    // A tap at 0 ms and a long note from 30 ms, pressed at 190 ms: the head
-    // (160 ms late) is not the primary, which stays the tap, BAD at the
-    // press, and the head is missed at its own deadline, 230 ms. Endless
-    // Dream drops the tap too (a known difference, in the preset's module).
-    let before = chart(|b| {
-        b.tap(lane(1), TimeUs(T))
-            .long(lane(1), TimeUs(T + 30 * MS), TimeUs(T + 80 * MS))
-    });
-    let at = T + 190 * MS;
-    let e = play_with(&before, &preset(), hold_at(at, 10));
-    assert_eq!(
-        judged_at(&e),
-        [
-            (at, 0, Bad, Some(190 * MS)),
-            (T + 30 * MS + MISSED, 1, Poor, None)
-        ]
-    );
 }
 
-/// G. A BAD long-note head decides its long note at the press, also under
-/// the head eligibility rule: an early BAD head is eligible, and the
-/// release that follows changes nothing.
+/// Known difference (the preset's module): an unpressed LN head is missed
+/// at its late BAD edge, like a tap, as in Endless Dream
+/// (play/JudgeManager.java:640-660), where LR2 misses it at its late GOOD
+/// edge. At `#RANK 3`, with a long note from 0 to 50 ms on key 1 left
+/// unpressed and a tap at 150 ms on key 2 hit PERFECT, the head is POOR at
+/// 200 ms, after the PERFECT; LR2 has it POOR at 120 ms, before.
+#[test]
+fn unpressed_ln_head_is_poor_at_the_late_bad_edge() {
+    let two_lanes = chart(|b| {
+        b.long(lane(1), TimeUs(T), TimeUs(T + 50 * MS))
+            .tap(lane(2), TimeUs(T + 150 * MS))
+    });
+    let at = T + 150 * MS;
+    let e = play_with(
+        &two_lanes,
+        &preset(),
+        vec![press(at, 0, 2), release(at + 10, 0, 2)],
+    );
+    let order: Vec<_> = e
+        .events
+        .iter()
+        .filter_map(|ev| match ev.kind {
+            JudgeEventKind::Judged { lane, judgment, .. } => {
+                Some((ev.time.0, lane.index(), judgment))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(order, [(at, 2, Perfect), (T + MISSED, 1, Poor)]);
+    // Pressed 1 µs past the edge, the head is already POOR, and nothing
+    // ahead makes the press an empty POOR.
+    let alone = chart(|b| b.long(lane(1), TimeUs(T), TimeUs(T + 500 * MS)));
+    let e = play_with(&alone, &preset(), hold_at(T + MISSED + 1, 10));
+    assert_eq!(judged_at(&e), [(T + MISSED, 0, Poor, None)]);
+    assert_eq!(empty_poors(&e.events), 0);
+}
+
+/// G. A BAD long-note head decides its long note at the press: an early
+/// BAD head is taken like a tap, and the release that follows changes
+/// nothing.
 #[test]
 fn bad_ln_head_is_scored_at_the_press() {
     let chart = chart(|b| b.long(lane(1), TimeUs(T), TimeUs(T + 500 * MS)));
@@ -830,9 +878,8 @@ fn scratch_uses_the_key_windows() {
 /// the notes it passes are POOR at the press. At `#RANK 3`, with taps at 0
 /// and 160 ms and a long note from 50 to 100 ms on one lane, a press at
 /// 190 ms takes the 160 ms tap (GREAT, 30 ms late; by combo priority,
-/// since the 0 ms tap is past its late GOOD edge,
-/// play/JudgeAlgorithm.java:15-20) past the head it may not take (160 ms
-/// late, BAD, play/JudgeManager.java:435-437); the source's multi-BAD
+/// since the 0 ms tap and the head, 140 ms late, are past their late GOOD
+/// edges, play/JudgeAlgorithm.java:15-20); the source's multi-BAD
 /// (play/JudgeManager.java:993-1061) gives BAD on the 0 ms tap and the
 /// head, here both are POOR at the press. With taps at 0 and 160 ms, a
 /// press at 130 ms takes the later tap and passes the earlier one, which a
@@ -869,19 +916,29 @@ fn one_press_judges_one_note() {
     assert_eq!(empty_poors(&e.events), 0);
 }
 
-/// Selection × empty POOR × LN eligibility: a press 160 ms after an LN
-/// head cannot take it (play/JudgeManager.java:435-437), and with no other
-/// note inside BAD it takes nothing; a tap 740 ms ahead then makes it an
-/// empty POOR (the source's scan reaches the tap after the head's judge 6
-/// and takes it as the MS candidate, :433-452), and the head is missed at
-/// its own deadline.
+/// Selection × empty POOR × LN heads: a press 160 ms after an LN head takes
+/// it (BAD), so a tap 740 ms ahead makes no empty POOR; a press past the
+/// head's late BAD edge finds it missed, and the tap 700 ms ahead makes the
+/// press an empty POOR (the MS candidate, play/JudgeManager.java:438-442).
 #[test]
-fn ineligible_head_leaves_an_empty_poor_to_a_later_note() {
+fn missed_head_leaves_an_empty_poor_to_a_later_note() {
     let chart = chart(|b| {
         b.long(lane(1), TimeUs(T), TimeUs(T + 50 * MS))
             .tap(lane(1), TimeUs(T + 900 * MS))
     });
-    let e = play_with(&chart, &preset(), hold_at(T + 160 * MS, 10));
+    let at = T + 160 * MS;
+    let e = play_with(&chart, &preset(), hold_at(at, 10));
+    assert_eq!(empty_poors(&e.events), 0);
+    assert_eq!(
+        judged_at(&e),
+        [
+            (at, 0, Bad, Some(160 * MS)),
+            (T + 900 * MS + MISSED, 1, Poor, None)
+        ]
+    );
+    let e = play_with(&chart, &preset(), hold_at(T + 200 * MS, 10));
+    assert_eq!(empty_poors(&e.events), 0, "the edge itself takes the head");
+    let e = play_with(&chart, &preset(), hold_at(T + 200 * MS + 1, 10));
     assert_eq!(empty_poors(&e.events), 1);
     assert_eq!(
         judged_at(&e),
@@ -891,6 +948,22 @@ fn ineligible_head_leaves_an_empty_poor_to_a_later_note() {
         ]
     );
     assert_eq!((e.tally.empty_poor, e.tally.bp), (1, 3));
+}
+
+/// Known difference (the preset's module): a note already judged makes an
+/// empty POOR when it lies up to 1000 ms after the press, as in Endless
+/// Dream (play/JudgeManager.java:433-434), where LR2 considers only the
+/// lane's current unjudged note. At `#RANK 3`, a note at 1000 ms hit early
+/// BAD at 830 ms, then a press at 900 ms: an empty POOR here and in
+/// Endless Dream, none in LR2.
+#[test]
+fn a_judged_note_ahead_makes_an_empty_poor() {
+    let chart = chart(|b| b.tap(lane(1), TimeUs(T)));
+    let mut events = hold_at(T - 170 * MS, 10);
+    events.extend(hold_at(T - 100 * MS, 10));
+    let e = play_with(&chart, &preset(), events);
+    assert_eq!(judged_at(&e), [(T - 170 * MS, 0, Bad, Some(-170 * MS))]);
+    assert_eq!(empty_poors(&e.events), 1);
 }
 
 /// Known difference (the preset's module): a long note's timing is its
@@ -925,12 +998,13 @@ fn ln_timing_is_the_heads() {
     );
 }
 
-/// Source: play/JudgeManager.java:435-437 (the head 160 ms late is judge 6,
-/// which drops it), :438-449 (the tap 740 ms ahead is the MS candidate),
-/// :500 (the candidate's sound plays). At `#RANK 3`, with a long note from
-/// 1000 to 1050 ms (sound A) and a tap at 1900 ms (sound B) on one lane, a
-/// press at 1160 ms is an empty POOR against the tap and plays B, as there
-/// (design.md "The Only Output Is the Judgment Event Stream").
+/// Source: play/JudgeManager.java:640-660 (the head is missed past its late
+/// BAD edge), :438-449 (the tap 600 ms ahead is the MS candidate), :500
+/// (the candidate's sound plays). At `#RANK 3`, with a long note from 1000
+/// to 1050 ms (sound A) and a tap at 1900 ms (sound B) on one lane, a press
+/// at 1300 ms is an empty POOR against the tap and plays B, not the lane's
+/// latest note before the press, as there (design.md "The Only Output Is
+/// the Judgment Event Stream").
 #[test]
 fn an_empty_poor_plays_the_note_it_is_against() {
     let mut chart = chart(|b| {
@@ -942,7 +1016,7 @@ fn an_empty_poor_plays_the_note_it_is_against() {
     for (k, note) in chart.lanes[1].iter_mut().enumerate() {
         note.sound = Some(bms_model::SoundId(u16::try_from(k).unwrap()));
     }
-    let at = T + 160 * MS;
+    let at = T + 300 * MS;
     let e = play_with(&chart, &preset(), hold_at(at, 10));
     assert_eq!(empty_poors(&e.events), 1);
     let played: Vec<_> = e
