@@ -135,6 +135,12 @@ pub trait Screen: Send {
         let _ = elapsed;
         None
     }
+    /// The target's size in pixels as last applied, never zero: what a
+    /// play frame is projected onto ([`FrameInput::target`]). The default
+    /// is the 1920×1080 layout's.
+    fn target(&self) -> [u32; 2] {
+        [1_920, 1_080]
+    }
     /// The last frame's pixels (RGBA8) and size, for an offscreen target.
     #[cfg(feature = "dev-tools")]
     fn read_back(&self) -> Option<(u32, u32, Vec<u8>)>;
@@ -1052,6 +1058,7 @@ impl Run {
                         effects: &effects,
                         gauge: *gauge,
                         overlay: &overlay[..shown],
+                        target: screen.target(),
                     };
                     screen.build(&f);
                     #[cfg(feature = "dev-tools")]

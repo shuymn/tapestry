@@ -2064,6 +2064,7 @@ dependencies = [
  "pollster",
  "rules",
  "sha2",
+ "skin-model",
  "tempfile",
  "thiserror 2.0.21",
  "wgpu",

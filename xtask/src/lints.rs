@@ -287,10 +287,12 @@ pub const IN_PLAY: &[Site] = &[
     // The render thread's frame.
     Site::File("crates/render/src/measure.rs"),
     Site::File("crates/render/src/pace.rs"),
+    Site::File("crates/render/src/projection.rs"),
     Site::File("crates/render/src/renderer.rs"),
     Site::File("crates/render/src/simple.rs"),
     Site::File("crates/render/src/skin.rs"),
     Site::File("crates/render/src/sprite.rs"),
+    Site::File("crates/render/src/staging.rs"),
     // A skin's per-frame expressions and quad batch.
     Site::File("crates/skin-model/src/expr/arith.rs"),
     Site::File("crates/skin-model/src/expr/program.rs"),
@@ -334,6 +336,7 @@ pub const IN_PLAY: &[Site] = &[
             "MenuScreen::statistics",
             "MenuScreen::presentation",
             "MenuScreen::shown",
+            "MenuScreen::target",
         ],
     ),
     // The development builds' counting allocator, which every allocation

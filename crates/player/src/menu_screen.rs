@@ -405,6 +405,11 @@ impl Screen for MenuScreen {
         Ok(timing)
     }
 
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn target(&self) -> [u32; 2] {
+        self.renderer.target()
+    }
+
     #[cfg(feature = "dev-tools")]
     fn read_back(&self) -> Option<(u32, u32, Vec<u8>)> {
         let (w, h) = self.renderer.size();

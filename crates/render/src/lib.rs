@@ -1,17 +1,22 @@
 //! The play screen (design.md "Rendering and Skins"): wgpu on DX12 with one
-//! instanced sprite pipeline per blend over a texture atlas, an ASCII bitmap
-//! font baked into that atlas, and the skin boundary [`PlaySkin`] with its
-//! one implementation, [`SimpleSkin`]. A frame's sprites are drawn in the
-//! order they were pushed, with premultiplied colour.
+//! instanced sprite pipeline per blend over an atlas texture array, whose
+//! reserved layer 0 holds an ASCII bitmap font baked in at startup and whose
+//! later layers a skin's pages with their mips ([`AtlasPages`]), and the skin
+//! boundary [`PlaySkin`] with its one implementation, [`SimpleSkin`]. A
+//! frame's sprites are drawn in the order they were pushed, with
+//! premultiplied colour, each run under its clip's scissor, projected from the
+//! skin's canvas onto the target ([`Projection`]).
 //!
 //! [`Renderer`] draws into a borderless window's swap chain (FIFO, one frame
 //! of latency, the render thread waiting on the waitable object itself) or
 //! into an offscreen target that tests read back. Every pipeline is created
-//! and every upload finished in [`Renderer::new`] and [`Renderer::load`],
-//! before the countdown.
+//! and every upload finished in [`Renderer::new`], [`Renderer::load`] and
+//! [`Renderer::install_atlas`], before the countdown; a new target size is
+//! applied between frames ([`Renderer::resize`]).
 //!
 //! The app's per-frame work, the skin's build into the preallocated
-//! [`SpriteBatch`] and its staging into [`Instance`]s, allocates nothing.
+//! [`SpriteBatch`] and its staging into [`Instance`]s ([`Staging`]),
+//! allocates nothing.
 //!
 //! Menu screens draw Japanese text with [`text`] and
 //! [`Renderer::menu_frame`], which the play screen never calls.
@@ -24,20 +29,24 @@ mod atlas;
 mod gpu;
 pub mod measure;
 mod pace;
+mod projection;
 mod renderer;
 mod simple;
 mod skin;
+mod skin_atlas;
 mod sprite;
+mod staging;
 pub mod text;
 
 pub use atlas::{ATLAS_SIZE, GLYPH_H, GLYPH_W, glyph_rows, solid_uv};
 pub use gpu::{AdapterChoice, Gpu};
-pub use renderer::{
-    FrameTiming, MAX_SPRITES, RenderError, Renderer, Target, build_frame, letterbox,
-};
+pub use projection::{ClipError, ClipTable, MAX_CLIPS, Projection};
+pub use renderer::{FrameTiming, MAX_SPRITES, RenderError, Renderer, Target, letterbox};
 pub use simple::{
     RESULT_CELL_COLUMN, RESULT_GAUGE_ROW, SimpleSkin, layout, result_graphs, result_screen,
     text_screen,
 };
 pub use skin::{FrameInput, PlaySkin, SkinError};
+pub use skin_atlas::{AtlasPages, PageLevels, RESERVED_LAYERS, UploadError, atlas_limits};
 pub use sprite::{Blend, FLAG_NEAREST, Instance, Run, Sprite, SpriteBatch};
+pub use staging::{Scissor, Staging};

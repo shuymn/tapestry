@@ -82,6 +82,7 @@ pub fn input<'a>(
         effects,
         gauge: 0,
         overlay: &[],
+        target: [WIDTH, HEIGHT],
     }
 }
 
