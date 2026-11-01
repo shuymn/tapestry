@@ -34,7 +34,7 @@ Stage 3 of the roadmap (design.md "Roadmap") is the look and effects of the play
 **Out:**
 - **The LR2 importer**, which comes right after stage 3 (§7, decision 1).
 - **Graphs and visualizers** (score graph, judgment graph, hit-error), double play, mouse dragging in the adjust mode (it comes with `egui`), SVG images, SDF shapes, MSDF text.
-- **Other screens' skins** (song selection, results). Stage 3 skins the play screen and, planned after S10-07, the song decision screen (§6, S10).
+- **Other screens' skins** (song selection, the song decision screen, results). Stage 3 skins the play screen only; the decision screen, planned after S10-07, has a built-in presentation (§6, S10).
 
 ## 2. The runtime model (`skin-model`)
 
