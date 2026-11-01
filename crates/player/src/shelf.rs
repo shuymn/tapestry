@@ -188,6 +188,7 @@ impl Shelf {
 
     /// [`new`](Self::new), each pass's thread starting with `options`, the
     /// background measurement's with nothing.
+    #[cfg(test)]
     pub(crate) fn with_options(
         library: Library,
         roots: Vec<PathBuf>,
