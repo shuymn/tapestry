@@ -1776,6 +1776,7 @@ dependencies = [
  "lexopt",
  "library",
  "log",
+ "png",
  "render",
  "replay",
  "rtrb",

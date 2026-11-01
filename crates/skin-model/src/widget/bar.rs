@@ -129,6 +129,13 @@ pub(crate) struct BarScratch {
     heap: Box<[u16]>,
 }
 
+impl BarScratch {
+    /// The bytes its buffers hold: the groups' frame records and the heap.
+    pub(crate) fn heap_bytes(&self) -> usize {
+        size_of_val(&*self.frames) + size_of_val(&*self.heap)
+    }
+}
+
 impl fmt::Debug for BarScratch {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("BarScratch")

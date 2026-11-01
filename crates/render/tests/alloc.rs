@@ -11,7 +11,10 @@
 //! frame after it and the later ones. A batch that fills up counts what it
 //! refuses without allocating, the overlay still drawn whole, and the
 //! result screen's page, drawn every frame while it shows, allocates
-//! nothing either.
+//! nothing either. A declarative skin prepared for an attempt, its clips
+//! and its prepared text included, does the same with the snapshot's
+//! gauges changing: its first and later frames, a refused one, the frames
+//! around a resize, and a full batch with the overlay kept whole.
 //!
 //! The counting allocator counts only on the thread that opted in, so the
 //! harness's own threads do not disturb it. This file holds a single test
@@ -21,17 +24,19 @@
 //! design.md "Scope of No Allocation".
 
 mod common;
+mod decl_support;
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bms_model::{Chart, ChartBuilder, TimeUs};
-use common::{MS, input, lane, view};
-use eval::{JudgeEvent, JudgeEventKind, Section};
+use common::{GAUGES, MS, attempt, context, input, lane, offscreen, view};
+use decl_support::{Look, bundle};
+use eval::{JudgeEvent, JudgeEventKind};
 use render::{
-    Blend, ClipTable, FrameInput, Gpu, MAX_SPRITES, PlaySkin, Scissor, SimpleSkin, SkinError,
-    Sprite, SpriteBatch, Staging,
+    Blend, ClipTable, DeclSkin, FrameInput, Gpu, MAX_SPRITES, PlaySkin, Scissor, SimpleSkin,
+    SkinError, Sprite, SpriteBatch, Staging,
 };
 use rules::Judgment;
 use skin_model::{BuildError, ClipId};
@@ -259,7 +264,7 @@ fn overlay_drawn(staging: &Staging) -> usize {
 struct Refusing;
 
 impl PlaySkin for Refusing {
-    fn prepare(&mut self, _: &Gpu, _: &Chart, _: Option<&Section>) -> Result<(), SkinError> {
+    fn prepare(&mut self, _: &Gpu, _: &render::AttemptInput<'_>) -> Result<(), SkinError> {
         Ok(())
     }
 
@@ -414,4 +419,123 @@ fn frames_do_not_allocate_from_the_first() {
     });
     assert!(staged > 27 * 60);
     assert_eq!(result_allocs, 0, "the result page allocated");
+
+    declarative_frames(&chart, &taps, &overlay, glyphs);
+}
+
+/// A declarative skin prepared for an attempt of `chart`, as the
+/// renderer stages it: 64 image elements under a clip and a text element
+/// with its prepared line, over a staging sized for the skin. Its frames,
+/// with `taps` judged as effects and the shown gauge's value changing
+/// every frame, allocate nothing from the first; nor does a refused one, a
+/// resize and the frames after it, or a batch too small with the overlay
+/// following whole.
+fn declarative_frames(chart: &Chart, taps: &[(u8, TimeUs)], overlay: &[&str], glyphs: usize) {
+    let r = offscreen(1_920, 1_080);
+    let dir = tempfile::tempdir().unwrap();
+    let look = Look {
+        copies: 63,
+        text: true,
+        ..Look::left([255, 0, 0, 255])
+    };
+    let (b, text) = bundle(&r, dir.path(), &look);
+    let ctx = context(&GAUGES, false);
+    let mut skin = DeclSkin::new(b.clone());
+    skin.prepare(r.gpu(), &attempt(&r, chart, &ctx)).unwrap();
+    assert_eq!(text.unwrap().calls.load(Ordering::SeqCst), 1);
+    let (capacity, runs) = (skin.capacity(), skin.run_capacity());
+    assert_eq!(capacity, 65);
+    let mut staging = Staging::with_runs(capacity, runs, &skin.canvas([1920, 1080]));
+    staging.set_clips(b.clips().clone());
+    // Views whose shown gauge differs frame to frame.
+    let views: Vec<_> = (0..4)
+        .map(|k| {
+            let mut v = view(k, 100 * k);
+            v.gauges[0].value = rules::GaugeValue(rules::GaugeValue::PERCENT * i64::from(20 * k));
+            v
+        })
+        .collect();
+    let mut effects: Vec<JudgeEvent> = Vec::with_capacity(64);
+    let mut feed = Feed {
+        chart,
+        taps,
+        next: 0,
+        seq: 0,
+        held: 0,
+        ended: 0,
+    };
+    let mut frame = |staging: &mut Staging, skin: &mut DeclSkin, k: i64| {
+        let now = TimeUs(k * FRAME_US);
+        feed.fill(now, &mut effects);
+        let v = &views[usize::try_from(k).unwrap() % views.len()];
+        let f = FrameInput {
+            overlay,
+            ..input(v, now, TimeUs(8 * MS), &effects)
+        };
+        staging.build(skin, &f).map(|()| staging.instances().len())
+    };
+
+    let (first, first_allocs) = counted(|| frame(&mut staging, &mut skin, 0));
+    assert_eq!(first.unwrap(), 65 + glyphs, "every quad and the overlay");
+    assert_eq!(
+        first_allocs, 0,
+        "a declarative skin's first frame allocated"
+    );
+    let (drawn, later_allocs) = counted(|| {
+        (1..FRAMES)
+            .map(|k| frame(&mut staging, &mut skin, k))
+            .sum::<Result<usize, BuildError>>()
+    });
+    assert!(drawn.unwrap() > 0);
+    assert_eq!(
+        later_allocs, 0,
+        "a declarative skin's later frame allocated"
+    );
+    assert_eq!(overlay_drawn(&staging), glyphs, "the overlay was cut");
+
+    let (resized, resize_allocs) = counted(|| {
+        staging.project(&skin.canvas([2560, 1080]));
+        (FRAMES..FRAMES + 60)
+            .map(|k| frame(&mut staging, &mut skin, k))
+            .sum::<Result<usize, BuildError>>()
+    });
+    assert!(resized.unwrap() > 0);
+    assert_eq!(resize_allocs, 0, "a declarative skin's resize allocated");
+    // The fixed canvas letterboxed with 320 columns of bars: the clip of
+    // the left half moves with it.
+    assert_eq!(
+        staging.scissor(Some(ClipId(0))),
+        Scissor::Rect([320, 0, 960, 1080])
+    );
+
+    // An attempt counting empty POORs as POORs, with a snapshot counting
+    // more of them than POORs: refused, allocating nothing.
+    let refusing_ctx = context(&GAUGES, true);
+    let mut refusing = DeclSkin::new(b.clone());
+    refusing
+        .prepare(r.gpu(), &attempt(&r, chart, &refusing_ctx))
+        .unwrap();
+    let v = view(0, 0);
+    let f = FrameInput {
+        overlay,
+        ..input(&v, TimeUs(0), TimeUs(8 * MS), &[])
+    };
+    let (refused, error_allocs) = counted(|| staging.build(&mut refusing, &f));
+    assert_eq!(refused, Err(BuildError::InconsistentTally));
+    assert_eq!(
+        error_allocs, 0,
+        "a declarative skin's refused frame allocated"
+    );
+    assert!(staging.instances().is_empty());
+
+    // A batch of 8 sprites for 65 quads: the batch counts what it refuses
+    // and the overlay follows whole from its reserve.
+    let mut small = Staging::new(8, &skin.canvas([1920, 1080]));
+    small.set_clips(b.clips().clone());
+    let (dropped, full_allocs) =
+        counted(|| small.build(&mut skin, &f).map(|()| small.batch().dropped()));
+    assert!(dropped.unwrap() > 0, "the full batch counted no refusal");
+    assert_eq!(small.instances().len(), 8 + glyphs);
+    assert_eq!(overlay_drawn(&small), glyphs, "the overlay was cut");
+    assert_eq!(full_allocs, 0, "a declarative skin's full batch allocated");
 }

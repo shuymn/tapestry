@@ -197,9 +197,28 @@ pub trait Rig {
         let _ = loaded;
         Ok(Preparation::Ready)
     }
+    /// Finalizes the attempt [`prepare_attempt`](Self::prepare_attempt)
+    /// readied (design.md "Play Lifecycle"): what it prepared is installed
+    /// for the play, after the attempt's readiness, a round's restore
+    /// check and the look at a quit or a failure, and before the loading
+    /// state ends; on every play, a retry and a practice round without a
+    /// loading state included. Nothing to install by default.
+    ///
+    /// # Errors
+    ///
+    /// Why the screen did not install it, which ends the run: recording
+    /// does not open.
+    fn commit_attempt(&mut self) -> Result<(), Self::ScreenError> {
+        Ok(())
+    }
+    /// Drops what [`prepare_attempt`](Self::prepare_attempt) readied and
+    /// was not committed: the play was cancelled, refused or failed before
+    /// its commit, so a preparation answered late never installs. Nothing
+    /// by default.
+    fn discard_attempt(&mut self) {}
     /// Ends a chart's loading state (design.md "Play Lifecycle"), after
-    /// the audio's and the attempt's preparation and before recording
-    /// opens: once it returns, the screen draws nothing of it. Nothing to end without
+    /// the audio's and the attempt's preparation and its commit, and
+    /// before recording opens: once it returns, the screen draws nothing of it. Nothing to end without
     /// one (a retry); the default has none.
     ///
     /// # Errors
@@ -545,16 +564,39 @@ pub fn play<R: Rig>(
 
 /// The rest of a play's preparation, once its preset was refreshed
 /// (design.md "Play Lifecycle"): audio, the attempt on the screen and a
-/// practice round's restore check, then the end of the loading state, with
-/// a quit or a failure looked for again before and after it. `false` when
-/// the player cancelled or quit before recording opens: the commands that
-/// did are taken, so they leave only this play.
+/// practice round's restore check, then, after a look for a quit or a
+/// failure, the attempt's commit and the end of the loading state, with a
+/// quit or a failure looked for again after it. `false` when the player
+/// cancelled or quit before recording opens: the commands that did are
+/// taken, so they leave only this play. Whatever ends it before the
+/// commit discards what the preparation readied.
 ///
 /// # Errors
 ///
 /// What [`play`] reports; a refused attempt is [`LiveError::Preparation`].
 #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 fn ready_to_open<R: Rig>(loaded: &Loaded, rig: &mut R) -> Result<bool, LiveError<R::ScreenError>> {
+    let ready = ready_to_commit(loaded, rig);
+    if !matches!(ready, Ok(true)) {
+        rig.discard_attempt();
+        return ready;
+    }
+    rig.commit_attempt().map_err(LiveError::Screen)?;
+    rig.end_loading().map_err(LiveError::Screen)?;
+    // And again once no loading frame can follow: the last look before
+    // recording opens. A retry or suspend from before this play belongs to
+    // no play.
+    preflight(rig)?;
+    Ok(!(rig.quitting() || rig.take() == Some(Command::Quit)))
+}
+
+/// [`ready_to_open`] up to the commit: `true` once the attempt is ready,
+/// a round's restore checked and no quit or failure came meanwhile.
+#[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+fn ready_to_commit<R: Rig>(
+    loaded: &Loaded,
+    rig: &mut R,
+) -> Result<bool, LiveError<R::ScreenError>> {
     rig.prepare_audio().map_err(LiveError::Audio)?;
     match rig.prepare_attempt(loaded).map_err(LiveError::Screen)? {
         Preparation::Ready => {}
@@ -572,15 +614,10 @@ fn ready_to_open<R: Rig>(loaded: &Loaded, rig: &mut R) -> Result<bool, LiveError
     if let Some(at) = loaded.restore_at() {
         rig.restore_ready(at).map_err(LiveError::Restore)?;
     }
-    // What happened during the preparation, before loading ends.
-    preflight(rig)?;
-    if rig.quitting() {
-        return Ok(false);
-    }
-    rig.end_loading().map_err(LiveError::Screen)?;
-    // And again once no loading frame can follow: the last look before
-    // recording opens. A retry or suspend from before this play belongs to
-    // no play.
+    // What happened during the preparation, before its commit: a quit key
+    // pressed while it ran (or before it, when it answered at once) leaves
+    // the play here, before anything is installed. A retry or suspend from
+    // before this play belongs to no play.
     preflight(rig)?;
     Ok(!(rig.quitting() || rig.take() == Some(Command::Quit)))
 }

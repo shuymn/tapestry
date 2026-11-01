@@ -289,6 +289,36 @@ fn last_object(chart: &Chart) -> TimeUs {
 }
 
 impl Play {
+    /// The bytes this attempt's state holds, itself and every buffer it
+    /// owns: the reducer, the timers, the chart's scroll segments and
+    /// notes copied for it, the gauges, the attached and bitmap lines, and
+    /// the bar groups' scratch. For a memory witness; it allocates nothing.
+    #[must_use]
+    pub fn resident_bytes(&self) -> u64 {
+        let notes = self.notes.as_deref().map_or(0, |n| {
+            let lanes: usize = n.lanes.iter().map(|l| size_of_val(&**l)).sum();
+            size_of::<Notes>() + lanes + size_of_val(&*n.bars)
+        });
+        let bitmap: usize = self
+            .bitmap
+            .iter()
+            .flatten()
+            .map(|l| size_of_val(&*l.quads))
+            .sum();
+        let bytes = size_of::<Self>()
+            + self.reducer.heap_bytes()
+            + size_of_val(&*self.starts)
+            + size_of_val(&*self.ms)
+            + size_of_val(self.scroll.segments())
+            + notes
+            + size_of_val(&*self.gauges)
+            + self.text.heap_bytes()
+            + size_of_val(&*self.bitmap)
+            + bitmap
+            + self.bars.as_ref().map_or(0, BarScratch::heap_bytes);
+        u64::try_from(bytes).unwrap_or(u64::MAX)
+    }
+
     /// A fresh attempt with `whens` `when` timers, keeping the chart's
     /// notes and the work of `bar_groups` checked groups when the skin has
     /// `lanes`; grades up to `bomb_up_to` give a bomb.

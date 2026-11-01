@@ -223,6 +223,11 @@ impl TextTable {
         self.0.is_empty()
     }
 
+    /// The bytes its lines take.
+    pub(crate) fn heap_bytes(&self) -> usize {
+        size_of_val(&*self.0)
+    }
+
     pub(crate) fn get(&self, slot: u16) -> Option<&TextImage> {
         self.0.get(usize::from(slot)).and_then(Option::as_ref)
     }

@@ -50,6 +50,7 @@ winit.workspace = true
 
 [dev-dependencies]
 bms-parser.workspace = true
+png.workspace = true
 rusqlite.workspace = true
 tempfile.workspace = true
 toml.workspace = true
@@ -57,7 +58,8 @@ toml.workspace = true
 [lints]
 workspace = true
 
-# The bests tests include the library's shared test fixture by path, which
-# opens the database with rusqlite; cargo-machete does not follow #[path].
+# Tests include fixtures from other crates by path, which cargo-machete does not
+# follow: the library's (the bests tests open its database with rusqlite) and
+# render's declarative skin support (it writes PNG files).
 [package.metadata.cargo-machete]
-ignored = ["rusqlite"]
+ignored = ["png", "rusqlite"]
