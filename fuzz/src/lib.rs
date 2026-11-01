@@ -454,12 +454,12 @@ fn long_note_probes(
             deviation: TimeUs(0),
         },
     }];
+    let mut chart = ChartBuilder::new(150_000)
+        .long(lane, TimeUs(1_000_000), TimeUs(4_000_000))
+        .mine(Lane::new(2).expect("lane 2"), TimeUs(1_200_000), 10)
+        .build()
+        .expect("a chart of a long note");
     for mode in [LnMode::Ln, LnMode::Cn] {
-        let mut chart = ChartBuilder::new(150_000)
-            .long(lane, TimeUs(1_000_000), TimeUs(4_000_000))
-            .mine(Lane::new(2).expect("lane 2"), TimeUs(1_200_000), 10)
-            .build()
-            .expect("a chart of a long note");
         chart.meta.ln_mode = Some(mode);
         let mut play = skin
             .prepare(&chart, ctx)
