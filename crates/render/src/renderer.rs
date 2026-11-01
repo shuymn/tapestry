@@ -302,6 +302,11 @@ pub struct Renderer {
     /// What each frame is cleared to: opaque black. A unit test clears to
     /// transparent black to read the blends' alpha channel.
     clear: wgpu::Color,
+    /// Run by the next [`install_atlas`](Self::install_atlas) on its
+    /// candidate, inside its error scopes, after the texture and its bind
+    /// group exist: a unit test makes the device refuse something there.
+    #[cfg(test)]
+    atlas_fault: Option<fn(&Gpu)>,
 }
 
 impl Renderer {
@@ -382,6 +387,8 @@ impl Renderer {
             started: None,
             pacer: Pacer::default(),
             clear: wgpu::Color::BLACK,
+            #[cfg(test)]
+            atlas_fault: None,
             id: RENDERERS.fetch_add(1, Ordering::Relaxed),
         })
     }
@@ -505,18 +512,8 @@ impl Renderer {
         pages: &AtlasPages<'_>,
         clips: ClipTable,
     ) -> Result<(), RenderError> {
-        self.install(pages, clips, |_, _| {})
-    }
-
-    /// [`install_atlas`](Self::install_atlas), with `fault` run on the
-    /// candidate inside its error scopes: tests make the device refuse
-    /// something after the texture exists.
-    fn install(
-        &mut self,
-        pages: &AtlasPages<'_>,
-        clips: ClipTable,
-        fault: impl FnOnce(&Gpu, &AtlasTexture),
-    ) -> Result<(), RenderError> {
+        #[cfg(test)]
+        let fault = self.atlas_fault.take();
         let device = self.gpu.device();
         let layers = skin_atlas::check_pages(pages, device).map_err(RenderError::Atlas)?;
         // The whole candidate inside the error scopes: the texture, its
@@ -525,7 +522,10 @@ impl Renderer {
         let ((atlas, bind), refused) = skin_atlas::scoped(device, || {
             let atlas = AtlasTexture::upload(&self.gpu, pages, layers);
             let bind = self.bindings.bind(device, &atlas);
-            fault(&self.gpu, &atlas);
+            #[cfg(test)]
+            if let Some(fault) = fault {
+                fault(&self.gpu);
+            }
             self.gpu.queue().submit([]);
             (atlas, bind)
         });
@@ -1373,16 +1373,15 @@ mod tests {
             side: 256,
             pages: &[page],
         };
-        let e = r
-            .install(&pages, ClipTable::default(), |gpu, _| {
-                let _ = gpu.device().create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("refused"),
-                    size: 4,
-                    usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::MAP_WRITE,
-                    mapped_at_creation: false,
-                });
-            })
-            .unwrap_err();
+        r.atlas_fault = Some(|gpu| {
+            let _ = gpu.device().create_buffer(&wgpu::BufferDescriptor {
+                label: Some("refused"),
+                size: 4,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::MAP_WRITE,
+                mapped_at_creation: false,
+            });
+        });
+        let e = r.install_atlas(&pages, ClipTable::default()).unwrap_err();
         assert!(
             matches!(e, RenderError::Atlas(UploadError::Device(_))),
             "{e:?}"
