@@ -10,10 +10,17 @@
 //! fill the strip). Without it, a negative value shows its magnitude.
 //! Blank cells are always leading; the alignment moves the drawn cells
 //! left by all of them (left) or half of them (centre).
+//!
+//! A strip may carry per-cell paint deltas ([`DigitOffset`]): constant
+//! moves and resizes of each fixed cell's rect in target pixels, added
+//! after the cell is placed and before its native size and pivot. They
+//! change neither the pitch, the alignment, the drawn width a judge's
+//! shift reads, nor the strip's logical box.
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
 use super::{Brush, Frame, ImageRef};
+use crate::atlas::uv::FrameUv;
 use crate::expr::Program;
 use crate::place::{Bounds, union};
 use crate::quad::QuadBatch;
@@ -24,6 +31,30 @@ use crate::track::Track;
 pub const I32_DIGITS: u8 = 10;
 /// The most cells a strip holds: every digit of an `i32` and a sign.
 pub const MAX_CELLS: u8 = I32_DIGITS + 1;
+
+/// The most digit offsets a skin holds across its strips: every number
+/// definition and every judge combo, referenced or not.
+pub const MAX_DIGIT_OFFSETS: usize = 65_536;
+
+/// A paint delta of one cell of a strip, in target pixels, y down: added
+/// to the cell's placed rect `[x, y, w, h]` before its native size and
+/// pivot. Constant paint data, never sampled or keyed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DigitOffset {
+    pub dx: i32,
+    pub dy: i32,
+    pub dw: i32,
+    pub dh: i32,
+}
+
+impl DigitOffset {
+    /// Whether every component is within ±[`MAX_COORD`].
+    fn in_range(self) -> bool {
+        [self.dx, self.dy, self.dw, self.dh]
+            .iter()
+            .all(|v| (-MAX_COORD..=MAX_COORD).contains(v))
+    }
+}
 
 /// The glyphs of one set, in frame order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -70,7 +101,7 @@ pub enum Pad {
 
 /// A glyph strip. Its element's sampled rect is cell 0, and cell `j` is
 /// `j · (w + space)` to its right.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DigitsDef {
     /// The sheet image: `k · glyphs` frames hold `k` sets, cycled by the
     /// image's own cycle.
@@ -82,6 +113,10 @@ pub struct DigitsDef {
     pub pad: Pad,
     /// Reference pixels between cells, within ±[`MAX_COORD`].
     pub space: i32,
+    /// Entry `j` moves cell `j`, counted from the left before the
+    /// alignment, blank or not; a cell past the end does not move. At
+    /// most `cells` entries, each component within ±[`MAX_COORD`].
+    pub offsets: Vec<DigitOffset>,
 }
 
 /// A `number` element's strip and value, an `int` over the play schema.
@@ -108,6 +143,10 @@ pub enum NumberError {
     Space,
     #[error("the image does not exist")]
     UnknownImage,
+    #[error("{n} digit offsets for fewer cells")]
+    OffsetCount { n: usize },
+    #[error("digit offset {cell} leaves ±{MAX_COORD}")]
+    OffsetRange { cell: usize },
 }
 
 impl DigitsDef {
@@ -135,6 +174,13 @@ impl DigitsDef {
         }
         if !(-MAX_COORD..=MAX_COORD).contains(&self.space) {
             return Err(NumberError::Space);
+        }
+        let n = self.offsets.len();
+        if n > usize::from(self.cells) {
+            return Err(NumberError::OffsetCount { n });
+        }
+        if let Some(cell) = self.offsets.iter().position(|o| !o.in_range()) {
+            return Err(NumberError::OffsetRange { cell });
         }
         Ok(())
     }
@@ -182,7 +228,7 @@ const SIGN: u8 = 11;
 const PAD: u8 = 10;
 
 /// A strip as a build reads it.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct Digits {
     pub(crate) image: ImageRef,
     pub(crate) set: GlyphSet,
@@ -190,6 +236,8 @@ pub(crate) struct Digits {
     pub(crate) align: Align,
     pub(crate) pad: Pad,
     pub(crate) space: f32,
+    /// Per fixed cell; empty when no cell moves.
+    pub(crate) offsets: Box<[DigitOffset]>,
 }
 
 impl Digits {
@@ -197,14 +245,16 @@ impl Digits {
         clippy::cast_precision_loss,
         reason = "the space is within ±2^20, exact in f32"
     )]
-    pub(crate) fn new(d: &DigitsDef, image: ImageRef) -> Self {
+    /// The strip of `d`, its offsets moved in, its image from `image`.
+    pub(crate) fn new(d: DigitsDef, image: impl Fn(u32) -> ImageRef) -> Self {
         Self {
-            image,
+            image: image(d.image),
             set: d.set,
             cells: d.cells,
             align: d.align,
             pad: d.pad,
             space: d.space as f32,
+            offsets: d.offsets.into_boxed_slice(),
         }
     }
 
@@ -250,16 +300,37 @@ impl Digits {
     }
 
     /// Draws `v` with cell 0 at `rect` through `brush`, the glyph set its
-    /// image's cycle shows at `now`. A cell whose frame is missing is
-    /// skipped. Returns the drawn width `(w + space) · drawn cells`, or
-    /// `None` when the batch refused a push, which stops the strip.
+    /// image's cycle shows at `now`, each cell moved by its offset. A
+    /// cell whose frame is missing is skipped. Returns the drawn width
+    /// `(w + space) · drawn cells`, the offsets aside, or `None` when the
+    /// batch refused a push, which stops the strip.
     pub(crate) fn draw(
         &self,
         v: i32,
-        [x, y, w, h]: [f32; 4],
+        rect: [f32; 4],
         brush: &Brush,
         at: &Frame<'_>,
         out: &mut QuadBatch,
+    ) -> Option<f32> {
+        let filter = self.image.filter;
+        if self.offsets.is_empty() {
+            self.draw_cells(v, rect, at, |_, r, f| brush.push(out, r, f, filter))
+        } else {
+            self.draw_cells(v, rect, at, |j, r, f| {
+                let d = self.offsets.get(j).copied().unwrap_or_default();
+                brush.push_offset(out, r, d, f, filter)
+            })
+        }
+    }
+
+    /// [`draw`](Self::draw)'s layout, each drawn cell handed to `push`
+    /// with its index, its rect and its frame.
+    fn draw_cells(
+        &self,
+        v: i32,
+        [x, y, w, h]: [f32; 4],
+        at: &Frame<'_>,
+        mut push: impl FnMut(usize, [f32; 4], FrameUv) -> bool,
     ) -> Option<f32> {
         let cells = self.lay(v);
         let g = self.set.glyphs();
@@ -286,7 +357,7 @@ impl Digits {
                 continue;
             };
             let cx = crate::canvas::f32_of(f64::from(x) + p * f64::from(j) - s);
-            if !brush.push(out, [cx, y, w, h], f, self.image.filter) {
+            if !push(usize::from(j), [cx, y, w, h], f) {
                 return None;
             }
         }

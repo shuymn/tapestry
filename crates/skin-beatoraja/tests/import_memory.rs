@@ -23,7 +23,7 @@ use common::{font, join, png, write};
 use rules::{GaugeValue, Judgment};
 use skin_beatoraja::limits::{
     MAX_FILE_CHOICES, MAX_INPUT_BYTES, MAX_LIST_ENTRIES, MAX_NODES, MAX_NOTES, MAX_OFFSETS,
-    MAX_OPTION_ITEMS, MAX_OPTIONS,
+    MAX_OPTION_ITEMS, MAX_OPTIONS, MAX_RESOLVED_DIGIT_OFFSETS,
 };
 use skin_beatoraja::{
     Config, Header, ImportError, ImportLimit, Imported, InputLimit, Note, Report, import,
@@ -634,7 +634,8 @@ const F5_GROUPS: &str = r#"
 /// timers, and a second LIFT of one key; a 36-node
 /// gauge of 1,000 flickering parts (1,001 quads); 5,128 judges, each one
 /// grade of 10 or 11 timed keys under a 7- or 17-op predicate and a combo
-/// of 2 digits (3 quads), one of 1 digit (2 quads).
+/// of 2 digits (3 quads) moved by two digit offset rows, one of 1 digit
+/// (2 quads) by one: 10,255 offsets kept.
 fn f5(root: &Path) {
     png(root, "a.png", 256, 256);
     let cell = |id: &str, i: usize, w: usize, h: usize| {
@@ -718,8 +719,10 @@ fn f5(root: &Path) {
         common::hd(&format!(
             r#""source": [{{"id": "a", "path": "a.png"}}], "image": [{}],
                "value": [
-                 {{"id": "v", "src": "a", "x": 0, "y": 200, "w": 60, "h": 6, "divx": 10, "digit": 2}},
-                 {{"id": "v1", "src": "a", "x": 0, "y": 200, "w": 60, "h": 6, "divx": 10, "digit": 1}}],
+                 {{"id": "v", "src": "a", "x": 0, "y": 200, "w": 60, "h": 6, "divx": 10, "digit": 2,
+                   "offset": [{{"x": 1}}, {{"x": 2}}]}},
+                 {{"id": "v1", "src": "a", "x": 0, "y": 200, "w": 60, "h": 6, "divx": 10, "digit": 1,
+                   "offset": [{{"x": 3}}]}}],
                "note": {note},
                "liftCover": [{{"id": "lc", "src": "a", "x": 0, "y": 220, "w": 8, "h": 8,
                                "disapearLine": 200}},
@@ -759,6 +762,9 @@ fn check_f5(_: &Header, i: Imported) {
     assert_eq!(u.ops, as_u32(MAX_SKIN_OPS));
     assert_eq!(u.widget_quads, MAX_WIDGET_QUADS);
     assert_eq!(u.elements, as_u32(JUDGES) + 6);
+    assert_eq!(u.resolved_digit_offsets, 3);
+    assert_eq!(u.digit_offsets, as_u32(2 * (JUDGES - 1) + 1));
+    assert_eq!(i.skin.digit_offset_count(), 10_255);
     assert!(i.scratch.is_some());
     // Four image elements, the covers' paint: the widgets' worst cases,
     // their quads and the lanes' budget with the judgment line.
@@ -801,6 +807,27 @@ fn check_f5(_: &Header, i: Imported) {
     let count = |size: [i32; 2]| by_size.get(&size).copied().unwrap_or(0);
     assert_eq!(count([80, 20]), JUDGES, "{by_size:?}");
     assert_eq!(count([6, 6]), 2 * (JUDGES - 1) + 1, "{by_size:?}");
+    let xs = |size: [i32; 2]| {
+        let mut xs = std::collections::BTreeMap::<i32, usize>::new();
+        for quad in &q {
+            let [x, _, w, h] = common::play::round(quad.rect);
+            if [w, h] == size {
+                *xs.entry(x).or_default() += 1;
+            }
+        }
+        xs
+    };
+    // Every grade at 100, unshifted. Each combo starts its 6 px cells
+    // half its baseline width left of 110: "12" from 104, moved 1 and 2;
+    // the last judge's "2" from 107, moved 3.
+    assert_eq!(
+        xs([80, 20]).into_iter().collect::<Vec<_>>(),
+        [(100, JUDGES)]
+    );
+    assert_eq!(
+        xs([6, 6]).into_iter().collect::<Vec<_>>(),
+        [(105, JUDGES - 1), (110, 1), (112, JUDGES - 1)]
+    );
     let covers: usize = by_size
         .iter()
         .filter(|(s, _)| s[0] == 430)
@@ -1243,7 +1270,65 @@ fn check_f11(i: Imported, chart: &bms_model::Chart) {
     assert_eq!(seen.into_iter().collect::<Vec<_>>(), want);
 }
 
-/// The peak of importing `s.json` of `root` alone, its header and
+/// F13a: one one-digit value whose `offset` table holds `rows` rows, the
+/// one cell reading the first, and an unknown `pad` array of `pad` more
+/// values.
+fn f13a(root: &Path, rows: usize, pad: usize) {
+    png(root, "a.png", 120, 20);
+    let mut table = String::with_capacity(9 * rows);
+    for k in 0..rows {
+        if k > 0 {
+            table.push(',');
+        }
+        let _ = write!(table, r#"{{"x":{}}}"#, k % 7 + 1);
+    }
+    let mut zeros = String::with_capacity(2 * pad);
+    for k in 0..pad {
+        if k > 0 {
+            zeros.push(',');
+        }
+        zeros.push('0');
+    }
+    write(
+        root,
+        "s.json",
+        common::hd(&format!(
+            r#""source": [{{"id": "a", "path": "a.png"}}],
+               "value": [{{"id": "v", "src": "a", "w": 120, "h": 20, "divx": 10, "digit": 1,
+                 "ref": 110, "offset": [{table}], "pad": [{zeros}]}}],
+               "destination": [{{"id": "v", "dst": [{{"x": 0, "y": 0, "w": 12, "h": 20}}]}}]"#
+        ))
+        .as_bytes(),
+    );
+}
+
+fn check_f13a(_: &Header, i: Imported) {
+    let u = i.report.usage;
+    assert_eq!(u.resolved_digit_offsets, as_u32(MAX_RESOLVED_DIGIT_OFFSETS));
+    assert_eq!(u.digit_offsets, 1);
+    assert_eq!(i.skin.digit_offset_count(), 1);
+    assert_eq!(u.elements, 1);
+}
+
+/// The value records of F13c and F13d: `n` of `record`, unreferenced.
+fn offset_tables(root: &Path, n: usize, record: &str) {
+    let mut values = String::with_capacity((record.len() + 1) * n);
+    for k in 0..n {
+        if k > 0 {
+            values.push(',');
+        }
+        values.push_str(record);
+    }
+    write(
+        root,
+        "s.json",
+        common::hd(&format!(r#""value": [{values}]"#)).as_bytes(),
+    );
+}
+
+/// F13c's empty tables: two values each, as many as the node cap holds.
+const EMPTY_TABLES: usize = MAX_NODES / 2 - 1_000;
+
 /// definition read before the window: the import's own working storage.
 fn import_peak(root: &Path) -> i64 {
     let (mut def, header) = read_header(root, "s.json").unwrap();
@@ -1441,7 +1526,11 @@ fn import_memory_is_measured() {
         size_of::<skin_model::DurationRatio>(),
     );
     println!(
-        "sizes: SolidImageDef {}, Usage {}, NoteKind {}",
+        "sizes: DigitOffset {}, DigitsDef {}, NumberDef {}, SolidImageDef {}, Usage {}, \
+         NoteKind {}",
+        size_of::<skin_model::DigitOffset>(),
+        size_of::<skin_model::DigitsDef>(),
+        size_of::<skin_model::NumberDef>(),
         size_of::<skin_model::SolidImageDef>(),
         size_of::<skin_beatoraja::Usage>(),
         size_of::<skin_beatoraja::NoteKind>(),
@@ -1562,6 +1651,70 @@ fn import_memory_is_measured() {
         large - small < 4_096,
         "the size reader grew with the array: {small} B to {large} B"
     );
+    // F13a: the resolution cap in one table, one row kept; a row more is
+    // refused before it is read.
+    let rows = MAX_RESOLVED_DIGIT_OFFSETS;
+    let d = tempfile::tempdir().unwrap();
+    f13a(d.path(), rows, 0);
+    peaks.push(("F13a long offset table", measure(d.path(), check_f13a)));
+    drop(d);
+    let d = tempfile::tempdir().unwrap();
+    f13a(d.path(), rows + 1, 0);
+    match refused(d.path()) {
+        ImportError::Input {
+            limit: InputLimit::DigitOffsets,
+            at: Some(_),
+        } => {}
+        other => panic!("{other:?}"),
+    }
+    drop(d);
+    // The same table with the input near the node cap: each row two
+    // values, the rest of the skin about a dozen.
+    let d = tempfile::tempdir().unwrap();
+    let pad = MAX_NODES - 2 * rows - 2_000;
+    f13a(d.path(), rows, pad);
+    peaks.push(("F13a near the node cap", measure(d.path(), check_f13a)));
+    drop(d);
+    // F13c: empty tables cost their input alone, as much as the same
+    // records with an unknown field.
+    let d = tempfile::tempdir().unwrap();
+    offset_tables(d.path(), EMPTY_TABLES, r#"{"offset":[]}"#);
+    let empty = measure(d.path(), |_, i| {
+        assert_eq!(i.report.usage.resolved_digit_offsets, 0);
+        assert_eq!(i.report.usage.digit_offsets, 0);
+    });
+    peaks.push(("F13c empty offset tables", empty));
+    drop(d);
+    let d = tempfile::tempdir().unwrap();
+    offset_tables(d.path(), EMPTY_TABLES, r#"{"offsex":[]}"#);
+    let unknown = measure(d.path(), |_, _| {});
+    drop(d);
+    println!("F13c {EMPTY_TABLES} empty tables: {empty} B, unknown fields {unknown} B");
+    assert!(
+        (empty - unknown).abs() < 4_096,
+        "empty tables cost {empty} B against {unknown} B"
+    );
+    // F13d: the resolution cap in single-row tables, one range each.
+    let d = tempfile::tempdir().unwrap();
+    offset_tables(d.path(), rows, r#"{"offset":[{"x":1}]}"#);
+    peaks.push((
+        "F13d single-row offset tables",
+        measure(d.path(), |_, i| {
+            assert_eq!(
+                i.report.usage.resolved_digit_offsets,
+                as_u32(MAX_RESOLVED_DIGIT_OFFSETS)
+            );
+            assert_eq!(i.report.usage.digit_offsets, 0);
+        }),
+    ));
+    drop(d);
+    let d = tempfile::tempdir().unwrap();
+    offset_tables(d.path(), rows, r#"{"offsex":[{"x":1}]}"#);
+    println!(
+        "F13d with unknown fields instead: {} B",
+        measure(d.path(), |_, _| {})
+    );
+    drop(d);
     for (name, p) in &peaks {
         println!("{name}: peak {p} B");
     }

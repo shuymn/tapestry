@@ -145,6 +145,14 @@ pub fn judge_element(i: u32) -> ElementDef {
     )
 }
 
+/// A digit offset of `dy` alone.
+pub fn down(dy: i32) -> skin_model::DigitOffset {
+    skin_model::DigitOffset {
+        dy,
+        ..skin_model::DigitOffset::default()
+    }
+}
+
 /// A strip of `cells` over `image` with `set`, `align` and `pad`, space 2.
 pub fn digits(image: u32, set: GlyphSet, cells: u8, align: Align, pad: Pad) -> DigitsDef {
     DigitsDef {
@@ -154,6 +162,7 @@ pub fn digits(image: u32, set: GlyphSet, cells: u8, align: Align, pad: Pad) -> D
         align,
         pad,
         space: 2,
+        offsets: Vec::new(),
     }
 }
 

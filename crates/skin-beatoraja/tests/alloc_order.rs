@@ -3,7 +3,8 @@
 //! with no allocation sized by the array. Likewise an image set's entries
 //! are charged before its table is gathered, a shared selector's ops
 //! before its copy is made, and the lanes' bar groups and each group's
-//! keys before their ids are copied.
+//! keys before their ids are copied, and a strip's digit offsets before they
+//! are copied.
 //!
 //! A global allocator records the largest single allocation made on a
 //! thread that opts in (a thread-local flag), and how many were of one
@@ -217,4 +218,41 @@ fn option_items_are_counted_before_anything_is_gathered() {
         );
         assert_eq!(SEEN.load(Ordering::Relaxed), 1, "{want:?}");
     }
+
+    // Digit offsets: the last number's ten offsets (160 B) are copied
+    // when the cap admits them, and not when their charge passes it. The
+    // refused imports of nine and of ten make as many allocations of that
+    // size; the admitted one of ten makes more.
+    let ten = 10 * size_of::<skin_model::DigitOffset>();
+    let mut seen = Vec::new();
+    for (judges, last, kept) in [(2_729, 10, true), (2_730, 10, false), (2_730, 9, false)] {
+        let d = skin(&[("s.json", &common::kept_offsets(judges, last))]);
+        common::png(d.path(), "n.png", 120, 20);
+        let (mut def, h) = read_header(d.path(), "s.json").unwrap();
+        let config = Config::defaults(&h);
+        WATCHED.store(ten, Ordering::Relaxed);
+        SEEN.store(0, Ordering::Relaxed);
+        let (result, _) = largest(|| import(&mut def, &h, &config).map(|_| ()));
+        WATCHED.store(usize::MAX, Ordering::Relaxed);
+        if kept {
+            assert!(result.is_ok(), "{result:?}");
+        } else {
+            assert!(
+                matches!(
+                    result,
+                    Err(ImportError::Limit {
+                        limit: ImportLimit::DigitOffsets,
+                        ..
+                    })
+                ),
+                "{result:?}"
+            );
+        }
+        seen.push(SEEN.load(Ordering::Relaxed));
+    }
+    let [admitted, refused, nine] = seen[..] else {
+        panic!("{seen:?}");
+    };
+    assert_eq!(refused, nine, "{seen:?}");
+    assert!(admitted > refused, "{seen:?}");
 }
