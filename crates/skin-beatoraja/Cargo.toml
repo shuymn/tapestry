@@ -9,6 +9,7 @@ publish.workspace = true
 
 [dependencies]
 bms-model.workspace = true
+image.workspace = true
 skin-model.workspace = true
 
 [dev-dependencies]

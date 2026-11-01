@@ -152,11 +152,12 @@ fn set(images: &str, set: &str) -> common::Loaded {
         r#"{{"type": 0, "w": 1920, "h": 1080,
            "source": [{{"id": "a", "path": "a.png"}}, {{"id": "m", "path": "clip.mp4"}},
                       {{"id": "w", "path": "w.webp"}}, {{"id": "far", "path": "../far.png"}},
-                      {{"id": "lost", "path": "lost.png"}}],
+                      {{"id": "lost", "path": "lost.png"}}, {{"id": "wide", "path": "wide.png"}}],
            "image": [{{"id": "i0", "src": "a", "w": 16, "h": 16}},
                      {{"id": "web", "src": "w", "w": 16, "h": 16}},
                      {{"id": "far", "src": "far", "w": 16, "h": 16}},
                      {{"id": "lost", "src": "lost", "w": 16, "h": 16}},
+                     {{"id": "wide", "src": "wide", "w": 16, "h": 16}},
                      {{"id": "i1", "src": "a", "x": 16, "w": 16, "h": 16, "len": 4, "ref": 42}},
                      {{"id": "i2", "src": "a", "x": 32, "w": 16, "h": 16}},
                      {{"id": "mv", "src": "m"}},
@@ -170,6 +171,11 @@ fn set(images: &str, set: &str) -> common::Loaded {
         "w.webp",
         b"RIFF\x1a\0\0\0WEBPVP8L\x0d\0\0\0/\0\0\0\x10\x07\x10\x11\x11\x88\x88\xfe\x07\0",
     );
+    if images.contains("wide") {
+        // Under the file size cap, but its row buffer is past the header
+        // reader's allocation cap.
+        common::png(dir.path(), "wide.png", 1_100_000, 1);
+    }
     let result = common::import_dir(dir.path());
     common::Loaded { dir, result }
 }
@@ -275,10 +281,17 @@ fn an_image_set_keeps_holes_and_repeats() {
 
 #[test]
 fn an_entry_the_source_could_draw_drops_the_set() {
-    // A format only the source decodes and a name leaving the folder are
-    // this importer's refusals, not missing files: the whole set drops.
-    for item in ["web", "far"] {
-        let l = set(&format!(r#"["i0", "{item}"]"#), r#", "value": 71"#);
+    // A format only the source decodes, a name leaving the folder and a
+    // header past the decoder's allocation cap are this importer's
+    // refusals, not missing files: the whole set drops, however often the
+    // entry repeats.
+    for item in [
+        r#"["i0", "web"]"#,
+        r#"["i0", "far"]"#,
+        r#"["i0", "wide"]"#,
+        r#"["i0", "web", "web"]"#,
+    ] {
+        let l = set(item, r#", "value": 71"#);
         let dropped: Vec<_> = l
             .report()
             .notes
@@ -287,11 +300,13 @@ fn an_entry_the_source_could_draw_drops_the_set() {
             .map(|n| n.kind)
             .collect();
         assert_eq!(dropped, [NoteKind::MissingAsset], "{item}");
+        assert_eq!(l.report().usage.file_attempts, 2, "{item}");
         assert_eq!(l.ok().skin.choice_ref_count(), 0, "{item}");
         assert!(frames(&mut l.drawn(), 0).is_empty(), "{item}");
     }
-    // A file that is not there is a hole beside the valid entry.
-    let l = set(r#"["i0", "lost"]"#, r#", "value": 71"#);
+    // A file that is not there is a hole beside the valid entry, each
+    // time it repeats; it is looked for once.
+    let l = set(r#"["i0", "lost", "lost"]"#, r#", "value": 71"#);
     assert!(
         l.report()
             .notes
@@ -300,11 +315,15 @@ fn an_entry_the_source_could_draw_drops_the_set() {
         "{:?}",
         l.report().notes
     );
-    assert_eq!(l.ok().skin.choice_ref_count(), 2);
+    let u = l.report().usage;
+    assert_eq!((u.file_attempts, u.files), (2, 1));
+    assert_eq!(l.ok().skin.choice_ref_count(), 3);
     let mut d = l.drawn();
     assert_eq!(frames(&mut d, 0), [0]);
-    d.tally = tally(1, 0);
-    assert!(frames(&mut d, 0).is_empty());
+    for ex in [1, 2] {
+        d.tally = tally(ex, 0);
+        assert!(frames(&mut d, 0).is_empty(), "{ex}");
+    }
 }
 
 #[test]

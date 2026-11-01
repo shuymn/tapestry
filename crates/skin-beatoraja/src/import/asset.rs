@@ -151,12 +151,15 @@ pub(crate) enum Failed {
 type FileFailure = (bool, Option<ImageError>);
 
 /// Whether `e` refuses a file the source may still draw: its name or
-/// place, its size or dimensions past the caps, or a format only the
-/// source decodes.
+/// place, its size or dimensions past the caps, a header past the
+/// decoder's allocation cap, or a format only the source decodes.
 fn refused(e: &ImageError) -> bool {
     matches!(
         e,
-        ImageError::PathRejected { .. }
+        ImageError::Decode {
+            source: image::ImageError::Limits(_),
+            ..
+        } | ImageError::PathRejected { .. }
             | ImageError::PathEscapes { .. }
             | ImageError::FileTooLarge { .. }
             | ImageError::TotalBytesTooLarge { .. }
@@ -538,6 +541,41 @@ mod tests {
         assert_eq!(assets.fnt_file(&mut budget, "p.fnt"), Ok(Ok(0)));
         assert_eq!((budget.usage.images, budget.usage.file_attempts), (2, 3));
         assert_eq!((budget.usage.fonts, budget.usage.glyphs), (1, 2));
+    }
+
+    #[test]
+    fn a_failed_file_keeps_its_class_on_every_reference() {
+        let dir = tempfile::tempdir().unwrap();
+        // A WebP file: only the source decodes it.
+        std::fs::write(
+            dir.path().join("w.webp"),
+            b"RIFF\x1a\0\0\0WEBPVP8L\x0d\0\0\0/\0\0\0\x10\x07\x10\x11\x11\x88\x88\xfe\x07\0",
+        )
+        .unwrap();
+        let mut assets = Assets::new(&Root::new(dir.path()).unwrap());
+        let mut budget = Budget::default();
+        ADMITS.with(|n| n.set(0));
+        let mut admit = |assets: &mut Assets, path: &str| {
+            let def = FileDef {
+                path: path.to_owned(),
+                hi: None,
+            };
+            assets.admit(&mut budget, def).unwrap()
+        };
+        for (path, refused) in [("w.webp", true), ("lost.png", false)] {
+            let failed = Err(Failed::File { refused });
+            assert_eq!(admit(&mut assets, path), failed, "{path}");
+            assert_eq!(admit(&mut assets, path), failed, "{path}");
+            // A critical user takes the error once; later references keep
+            // the class.
+            assert!(assets.take_error(path).is_some(), "{path}");
+            assert_eq!(admit(&mut assets, path), failed, "{path}");
+            assert!(assets.take_error(path).is_none(), "{path}");
+            assert_eq!(admit(&mut assets, path), failed, "{path}");
+        }
+        // Each file was read once and none admitted.
+        assert_eq!(ADMITS.with(std::cell::Cell::get), 2);
+        assert_eq!((budget.usage.file_attempts, budget.usage.files), (2, 0));
     }
 
     #[test]
