@@ -172,10 +172,16 @@ pub trait Screen: Send {
 /// way, so however often the window resizes, one size and one message
 /// wait.
 ///
-/// Its invariant: `queued` is set only by a publish that sends a `Resize`
-/// under the sender's lock, which [`RenderLink::follow`] holds through
-/// sending its `Follow`, so every `Resize` reaches the render thread after
-/// that `Follow` and is acknowledged as it is taken, clearing `queued`.
+/// Its invariant, for each registration: while a render thread follows the
+/// slot, `queued` is set only while a `Resize` sent after that
+/// registration's `Follow` waits in the channel, because
+/// [`RenderLink::follow`] clears it and sends its `Follow` under the lock
+/// every publish sends under, and the render thread acknowledges the slot
+/// it follows as it takes each `Resize`. A flag an earlier registration
+/// left set (its wake sent to a thread that ended, or taken while another
+/// slot was followed) is cleared by the next one; a `Resize` from a slot
+/// no longer followed may clear the followed slot's flag early, which
+/// costs one extra wake, never a lost one.
 #[derive(Debug)]
 pub struct Extent {
     /// Width in the high 32 bits, height in the low; [`UNKNOWN`] before
@@ -215,7 +221,8 @@ impl Extent {
         if let Some(tx) = wake.as_ref()
             && !self.queued.swap(true, Ordering::AcqRel)
         {
-            // A render thread that ended ignores it.
+            // A render thread that ended ignores it; the flag stays set
+            // until the next registration clears it.
             let _ = tx.send(RenderMsg::Resize);
         }
     }
@@ -538,10 +545,12 @@ impl RenderLink {
     /// newest size published, and every later one, is applied to the
     /// screen between frames, and to each screen built again.
     pub fn follow(&self, extent: &Arc<Extent>) {
-        // Held through the `Follow`, so no `Resize` overtakes it
-        // ([`Extent`]'s invariant).
+        // Held through the `Follow`, so no `Resize` overtakes it, and a
+        // flag an earlier registration left set is cleared ([`Extent`]'s
+        // invariant).
         let mut wake = extent.wake.lock().unwrap_or_else(PoisonError::into_inner);
         *wake = Some(self.tx.clone());
+        extent.queued.store(false, Ordering::Release);
         self.send(RenderMsg::Follow(Arc::clone(extent)));
     }
 
@@ -3637,18 +3646,13 @@ mod tests {
         assert_eq!(extent.latest(), Some((u32::MAX, 1)));
     }
 
-    /// Publishes racing the render thread's registration: a thread
-    /// publishes without pause while the link follows the slot again and
-    /// again, so publishes land between the sender's registration and its
-    /// `Follow`. With nothing drawn (no page), only a message wakes the
-    /// render thread; a size published after the race is applied, so its
-    /// wake was sent and the earlier ones were taken. With the sender
-    /// registered before the lock is let go and `Follow` sent after, a
-    /// `Resize` could reach the render thread before it followed, be left
-    /// unacknowledged, and leave `queued` set: the last publish would wake
-    /// nothing, and its size would never be applied.
-    #[test]
-    fn publishes_during_registration_still_wake_the_render_thread() {
+    /// The sizes applied to a [`Resizing`] screen, each with the screen's
+    /// `id`.
+    type Applied = Arc<std::sync::Mutex<Vec<(u32, u32, u32)>>>;
+
+    /// A render thread with nothing drawn (no page), so only a message
+    /// wakes it, built on a [`Resizing`] screen; with the sizes applied.
+    fn resizing_thread() -> (super::RenderLink, Applied) {
         let resized = Arc::new(std::sync::Mutex::new(Vec::new()));
         let r = Arc::clone(&resized);
         let make: MakeScreen = Box::new(move || {
@@ -3672,30 +3676,94 @@ mod tests {
             Box::new(NoFrames),
         )
         .unwrap();
-        let extent = Arc::new(super::Extent::default());
-        let stop = Arc::new(AtomicBool::new(false));
-        let (published, done) = (Arc::clone(&extent), Arc::clone(&stop));
-        let publisher = std::thread::spawn(move || {
-            let mut w = 1;
-            while !done.load(Ordering::SeqCst) {
-                published.publish(w, 1);
-                w = w % 1_000 + 1;
-            }
-        });
-        for _ in 0..500 {
-            link.follow(&extent);
-        }
-        stop.store(true, Ordering::SeqCst);
-        publisher.join().unwrap();
-        extent.publish(4_096, 2_160);
+        (link, resized)
+    }
+
+    /// Publishes racing each registration: a thread publishes on a fresh
+    /// slot, released with the registration by a barrier, so publishes
+    /// land between the sender's registration and its `Follow`. Once every
+    /// message sent is taken, only a wake applies a size published after,
+    /// so the slot's flag was left clear. Were the lock let go before the
+    /// `Follow` is sent, a `Resize` could reach the render thread before it
+    /// follows the slot, be left unacknowledged, and leave the flag set, so
+    /// that later publishes would wake nothing.
+    #[test]
+    fn publishes_during_registration_still_wake_the_render_thread() {
+        let (link, resized) = resizing_thread();
         let last = || resized.lock().unwrap().last().copied();
+        for round in 1..=100 {
+            let extent = Arc::new(super::Extent::default());
+            let start = Arc::new(std::sync::Barrier::new(2));
+            let (published, go) = (Arc::clone(&extent), Arc::clone(&start));
+            let publisher = std::thread::spawn(move || {
+                go.wait();
+                for w in 1..=200 {
+                    published.publish(w, 1);
+                }
+            });
+            start.wait();
+            link.follow(&extent);
+            publisher.join().unwrap();
+            link.end_loading().unwrap();
+            extent.publish(4_096, round);
+            assert!(
+                wait_until(|| last() == Some((1, 4_096, round))),
+                "{round}: {:?}",
+                last()
+            );
+        }
+        link.exit();
+    }
+
+    /// A slot followed again by a new render thread: the wake published
+    /// after the first thread ended was sent nowhere, and its flag does
+    /// not keep the new thread from being woken.
+    #[test]
+    fn a_new_render_thread_is_woken_after_the_last_ended() {
+        let extent = Arc::new(super::Extent::default());
+        let (first, _) = resizing_thread();
+        first.follow(&extent);
+        first.end_loading().unwrap();
+        assert_eq!(first.exit(), super::RenderEnd::Joined);
+        extent.publish(800, 600);
+        let (second, resized) = resizing_thread();
+        let last = || resized.lock().unwrap().last().copied();
+        second.follow(&extent);
+        assert!(wait_until(|| last() == Some((1, 800, 600))), "{:?}", last());
+        second.end_loading().unwrap();
+        extent.publish(1_280, 720);
         assert!(
-            wait_until(|| last() == Some((1, 4_096, 2_160))),
+            wait_until(|| last() == Some((1, 1_280, 720))),
             "{:?}",
             last()
         );
-        extent.publish(800, 600);
+        second.exit();
+    }
+
+    /// Following `a`, then `b`, then `a` again: `a`'s wake, sent after
+    /// `b`'s `Follow`, is taken while `b` is followed, so it acknowledges
+    /// `b`; following `a` again clears the flag that wake left, and `a`'s
+    /// later publishes wake the render thread.
+    #[test]
+    fn a_slot_followed_again_is_woken() {
+        let (link, resized) = resizing_thread();
+        let last = || resized.lock().unwrap().last().copied();
+        let (a, b) = (
+            Arc::new(super::Extent::default()),
+            Arc::new(super::Extent::default()),
+        );
+        link.follow(&a);
+        link.follow(&b);
+        a.publish(800, 600);
+        link.follow(&a);
         assert!(wait_until(|| last() == Some((1, 800, 600))), "{:?}", last());
+        link.end_loading().unwrap();
+        a.publish(1_280, 720);
+        assert!(
+            wait_until(|| last() == Some((1, 1_280, 720))),
+            "{:?}",
+            last()
+        );
         link.exit();
     }
 
