@@ -217,6 +217,9 @@ pub struct Renderer {
     /// An offscreen target's frame left pending on the GPU: at most one,
     /// as a swap chain's frame latency bounds a window's.
     pacer: Pacer<wgpu::SubmissionIndex>,
+    /// What each frame is cleared to: opaque black. A unit test clears to
+    /// transparent black to read the blends' alpha channel.
+    clear: wgpu::Color,
 }
 
 impl Renderer {
@@ -304,6 +307,7 @@ impl Renderer {
             skin: Box::new(SimpleSkin::new()),
             started: None,
             pacer: Pacer::default(),
+            clear: wgpu::Color::BLACK,
             id: RENDERERS.fetch_add(1, Ordering::Relaxed),
         })
     }
@@ -566,7 +570,7 @@ impl Renderer {
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        load: wgpu::LoadOp::Clear(self.clear),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -921,8 +925,9 @@ mod tests {
 
     use wgpu::wgc::instance as core;
 
-    use super::{RenderError, letterbox};
-    use crate::SkinError;
+    use super::{RenderError, Renderer, Target, letterbox};
+    use crate::text::MenuText;
+    use crate::{AdapterChoice, Blend, SkinError, Sprite, solid_uv};
 
     /// Checks that `e` names only its step, and that its source is the
     /// wrapped `T`, where the chain ends.
@@ -996,5 +1001,51 @@ mod tests {
         assert_eq!(letterbox(1280, 1024), [0.0, 152.0, 1280.0, 720.0]);
         // 21:9: scaled to the height, bars left and right.
         assert_eq!(letterbox(2560, 1080), [320.0, 0.0, 1920.0, 1080.0]);
+    }
+
+    /// Both blends composite the alpha channel over: source 1, destination
+    /// 1 − source alpha. On a transparent target, white at alpha 0.5 is
+    /// drawn, then white at alpha 0.25 over it, blended alpha on the left
+    /// and additive on the right: 0.25 + 0.5 × 0.75 = 0.625, 159.4 (or
+    /// 160.0 when the 0.5 below was stored as 128), so 159 within 2 on
+    /// both sides. An additive alpha channel of 1, 1 (`ADDITIVE`'s) would
+    /// give 0.75, 191, on the right; one blended like the colour of
+    /// straight alpha (source alpha, 1 − source alpha) would give 0.25 for
+    /// the first sprite and 0.0625 + 0.1875 = 0.25, 64, on the left.
+    #[test]
+    fn both_blends_composite_alpha_over() {
+        let mut r = Renderer::new(
+            Target::Offscreen {
+                width: 960,
+                height: 540,
+            },
+            AdapterChoice::Warp,
+        )
+        .expect("WARP renderer");
+        r.clear = wgpu::Color::TRANSPARENT;
+        let solid = |rect, alpha| Sprite {
+            rect,
+            uv: solid_uv(),
+            color: [1.0, 1.0, 1.0, alpha],
+            ..Sprite::default()
+        };
+        let text = MenuText::new(&r);
+        let timing = r
+            .menu_frame(
+                |b| {
+                    b.push(Blend::Alpha, solid([0.0, 0.0, 400.0, 400.0], 0.5));
+                    b.push(Blend::Alpha, solid([0.0, 0.0, 200.0, 400.0], 0.25));
+                    b.push(Blend::Additive, solid([200.0, 0.0, 200.0, 400.0], 0.25));
+                },
+                &text,
+            )
+            .unwrap();
+        assert!(timing.presented);
+        let pixels = r.read_back();
+        // Layout (100, 200) and (300, 200): target pixels (50, 100) and
+        // (150, 100) at half scale.
+        let alpha = |x: usize| pixels[(100 * 960 + x) * 4 + 3];
+        assert!(alpha(50).abs_diff(159) <= 2, "alpha blend: {}", alpha(50));
+        assert!(alpha(150).abs_diff(159) <= 2, "additive: {}", alpha(150));
     }
 }
