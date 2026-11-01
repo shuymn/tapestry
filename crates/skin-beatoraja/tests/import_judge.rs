@@ -527,7 +527,7 @@ fn a_lifted_grade_carries_its_combo_once() {
     let objects = format!(r#"{}, {VALUES}, "judge": [{judge}]"#, note(""));
     let l = common::import_body(&body("", &objects, &[NOTES, DST]));
     let motion = NoteKind::Deviation(DeviationId::D9(LaneApprox::CoverMotion));
-    let kinds: Vec<NoteKind> = l.report().notes.iter().map(|n| n.kind).collect();
+    let kinds = common::kinds(l.report());
     assert_eq!(kinds.iter().filter(|&&k| k == motion).count(), 1);
     assert!(
         !kinds
