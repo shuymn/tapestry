@@ -199,6 +199,10 @@ pub enum ScreenError {
     /// The render thread did not answer a chart's load in time.
     #[error("the render thread did not answer")]
     NoAnswer,
+    /// The screen failed after the play's attempt was prepared, before
+    /// recording opened.
+    #[error("the screen failed before the play opened")]
+    Lost,
 }
 
 /// The end screen: its lines and the view's graphs, if it has them.
@@ -244,8 +248,9 @@ pub enum RenderMsg {
     /// lifetime has ended ([`RenderLink::clear_loading`]).
     Loading(u64),
     /// Loading has ended: stop drawing the loading state, and answer once
-    /// no loading frame can be drawn any more ([`RenderLink::end_loading`]).
-    EndLoading(mpsc::SyncSender<()>),
+    /// no loading frame can be drawn any more, with whether the screen is
+    /// still there ([`RenderLink::end_loading`]).
+    EndLoading(mpsc::SyncSender<bool>),
     /// A play starts: chart time 0 at the measurement's `origin` on the
     /// clock.
     Play {
@@ -642,15 +647,17 @@ impl RenderLink {
     ///
     /// # Errors
     ///
-    /// [`ScreenError::NoAnswer`] after [`LOAD_TIMEOUT`], and
-    /// [`ScreenError::Ended`] when the render thread is gone: recording
-    /// must not open.
+    /// [`ScreenError::NoAnswer`] after [`LOAD_TIMEOUT`],
+    /// [`ScreenError::Ended`] when the render thread is gone, and
+    /// [`ScreenError::Lost`] when its screen failed after the attempt was
+    /// prepared (a loading frame failed): recording must not open.
     pub fn end_loading(&self) -> Result<(), ScreenError> {
         self.clear_loading();
         let (reply, rx) = mpsc::sync_channel(1);
         self.send(RenderMsg::EndLoading(reply));
         match rx.recv_timeout(self.answer_timeout) {
-            Ok(()) => Ok(()),
+            Ok(true) => Ok(()),
+            Ok(false) => Err(ScreenError::Lost),
             Err(mpsc::RecvTimeoutError::Timeout) => Err(ScreenError::NoAnswer),
             Err(mpsc::RecvTimeoutError::Disconnected) => Err(ScreenError::Ended),
         }
@@ -1008,7 +1015,9 @@ impl Run {
                     ) {
                         mode = Mode::Idle;
                     }
-                    let _ = reply.send(());
+                    // Whether the screen prepared for the attempt is still
+                    // there.
+                    let _ = reply.send(self.screen.is_some());
                     continue;
                 }
                 Ok(RenderMsg::Prepare(reply)) => {
@@ -2420,6 +2429,41 @@ mod tests {
             started.elapsed()
         );
         hold.store(false, Ordering::Release);
+        link.exit();
+    }
+
+    /// A loading frame that fails after the attempt was prepared drops the
+    /// screen: the end of loading says so, and recording must not open.
+    #[test]
+    fn the_end_of_loading_reports_a_screen_lost_after_the_preparation() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let noted = Arc::clone(&seen);
+        let make: MakeScreen = Box::new(move || {
+            Ok(Box::new(Menus {
+                // The first build: its third frame fails.
+                id: 1,
+                frames: 0,
+                seen: Arc::clone(&noted),
+            }) as Box<dyn Screen>)
+        });
+        let clock = QpcClock::start();
+        let link = spawn(
+            make,
+            None,
+            None,
+            clock,
+            view(),
+            measure(clock),
+            Box::new(NoFrames),
+        )
+        .unwrap();
+        let chart = Arc::new(ChartBuilder::new(120_000).build().unwrap());
+        link.load(Arc::clone(&chart), None).unwrap();
+        let ready = link.prepare_attempt(attempt(&chart, None), || false);
+        assert_eq!(ready.unwrap(), Preparation::Ready);
+        link.loading().show(one_line("L"));
+        assert!(wait_until(|| link.failed()));
+        assert!(matches!(link.end_loading(), Err(ScreenError::Lost)));
         link.exit();
     }
 
