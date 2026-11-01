@@ -106,23 +106,17 @@ fn peak<T>(f: impl FnOnce() -> T) -> (T, i64) {
     (out, PEAK.load(Ordering::Relaxed))
 }
 
-/// Reads and imports `s.json` of `root` within the window, the header
-/// and definition kept with the import, then checks them with `check`
-/// outside it.
+/// [`measure_prepared`] over an empty chart: every fixture's peak counts
+/// a prepared play and its batch, runs included.
 fn measure(root: &Path, check: impl FnOnce(&Header, Imported)) -> i64 {
-    let ((def, header, imported), p) = peak(|| {
-        let (mut def, header) = read_header(root, "s.json").unwrap();
-        let imported = import(&mut def, &header, &Config::defaults(&header)).unwrap();
-        (def, header, imported)
-    });
-    check(&header, imported);
-    drop(def);
-    p
+    let chart = bms_model::ChartBuilder::new(150_000).build().unwrap();
+    measure_prepared(root, &chart, check)
 }
 
-/// [`measure`] with a play of the import over `chart` prepared in the
-/// window, its state and batch: what the import keeps plus the most
-/// preparing adds.
+/// Reads and imports `s.json` of `root` and prepares a play of the import
+/// over `chart` within the window, the header, definition and import kept
+/// beside the play's state and batch, then checks them with `check`
+/// outside it.
 fn measure_prepared(
     root: &Path,
     chart: &bms_model::Chart,
