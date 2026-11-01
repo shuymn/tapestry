@@ -16,6 +16,7 @@ mod decl_support;
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use bms_model::{Chart, ChartBuilder, TimeUs};
 use common::{GAUGES, attempt, context, input, offscreen, view};
@@ -38,6 +39,24 @@ fn chart() -> Chart {
     ChartBuilder::new(120_000).build().unwrap()
 }
 
+/// The longest the GPU may take over the frames before a read back. Each
+/// test's frames take milliseconds on WARP; one past this fails here
+/// instead of holding every WARP device in the process until the job's
+/// timeout.
+const FRAME_BUDGET: Duration = Duration::from_secs(10);
+
+/// `r`'s read back once its submitted frames finished within
+/// [`FRAME_BUDGET`].
+#[track_caller]
+fn read_back(r: &Renderer) -> Vec<u8> {
+    let done = r.gpu().device().poll(wgpu::PollType::Wait {
+        submission_index: None,
+        timeout: Some(FRAME_BUDGET),
+    });
+    assert!(done.is_ok(), "frames past {FRAME_BUDGET:?}: {done:?}");
+    r.read_back()
+}
+
 /// Draws a frame of the default view and reads it back: its sprites and
 /// the pixels.
 fn frame(r: &mut Renderer) -> (usize, Vec<u8>) {
@@ -45,7 +64,7 @@ fn frame(r: &mut Renderer) -> (usize, Vec<u8>) {
     let timing = r.frame(&input(&v, TimeUs(0), TimeUs(0), &[])).unwrap();
     assert!(timing.presented);
     assert_eq!(timing.dropped, 0);
-    (timing.sprites, r.read_back())
+    (timing.sprites, read_back(r))
 }
 
 /// The RGB of pixel `(x, y)` of a 1920-wide read back.
@@ -330,7 +349,7 @@ fn a_retry_reuses_the_resources_with_a_fresh_attempt() {
     let f = input(&v, TimeUs(0), TimeUs(0), &[]);
     let timing = r.frame(&f).unwrap();
     assert_eq!(timing.sprites, 2);
-    halves(&r.read_back(), RED, BLACK);
+    halves(&read_back(&r), RED, BLACK);
 }
 
 /// A renderer made again after a device failure restores the committed
