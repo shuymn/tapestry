@@ -261,19 +261,20 @@ fn every_gauge_policy_round_trips() {
     );
 }
 
+/// A file with an LN head eligibility, which presets no longer have, is a
+/// file from an older version.
 #[test]
-fn head_eligibility_reads_back_and_is_required() {
+fn head_eligibility_is_refused() {
     let text = preset_to_toml(&rules::tapestry());
-    let inside = "head_eligibility = \"inside_bad\"\n";
-    assert_eq!(text.matches(inside).count(), 1, "{text}");
-    let p = load(&text.replacen(inside, "head_eligibility = \"not_late_bad\"\n", 1)).unwrap();
-    assert_eq!(
-        p.ln_mode.head_eligibility,
-        rules::HeadEligibility::NotLateBad
+    let late_head = "late_head = \"completes_at_press\"\n";
+    assert_eq!(text.matches(late_head).count(), 1, "{text}");
+    assert!(!text.contains("head_eligibility"), "{text}");
+    let older = text.replacen(
+        late_head,
+        &format!("{late_head}head_eligibility = \"inside_bad\"\n"),
+        1,
     );
-    assert_eq!(load(&preset_to_toml(&p)), Ok(p));
-    // A file from before the LN head eligibility has no such key.
-    let e = load(&text.replacen(inside, "", 1)).unwrap_err();
+    let e = load(&older).unwrap_err();
     assert!(
         matches!(&e, PresetError::Parse(m) if m.message().contains("head_eligibility")),
         "{e}"

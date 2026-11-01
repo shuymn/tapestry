@@ -236,9 +236,6 @@ fn check_gauges(preset: &RulePreset, e: &Evaluation) -> Result<(), TestCaseError
 /// head a press took before its end (held, or a BAD) ends its visual hold
 /// exactly once, at or before its end and before a held one's judgment. A
 /// release distance is given only for a long note, and never positive.
-/// Under [`rules::HeadEligibility::NotLateBad`], no head is taken late BAD:
-/// a long note judged with a head deviation and no release is not BAD on
-/// the late side.
 fn check_long_notes(play: &Play, e: &Evaluation) -> Result<(), TestCaseError> {
     use eval::JudgeEventKind as K;
     use std::collections::BTreeSet;
@@ -275,16 +272,6 @@ fn check_long_notes(play: &Play, e: &Evaluation) -> Result<(), TestCaseError> {
                 let long = matches!(note_of(lane, note).kind, bms_model::NoteKind::Long { .. });
                 prop_assert!(release.is_none() || long);
                 prop_assert!(release.is_none_or(|r| r.0 <= 0));
-                prop_assert!(
-                    !(long
-                        && play.preset.ln_mode.head_eligibility
-                            == rules::HeadEligibility::NotLateBad
-                        && release.is_none()
-                        && deviation.is_some_and(|d| d.0 > 0)
-                        && judgment == rules::Judgment::Bad),
-                    "a late BAD head taken: {:?}",
-                    ev
-                );
                 if long
                     && deviation.is_some()
                     && release.is_none()
@@ -367,9 +354,7 @@ proptest! {
     /// A long note pressed inside its scaled BAD window and held at least
     /// as long as it lasts gets exactly its head's judgment, under any
     /// valid preset and rank scale: its release is at or after `h` from
-    /// its end, which the LN-end edges grade no worse than the head. A
-    /// head the press would grade late BAD is not taken under
-    /// [`rules::HeadEligibility::NotLateBad`], and is missed instead.
+    /// its end, which the LN-end edges grade no worse than the head.
     #[test]
     fn holding_as_long_as_the_long_note_keeps_the_head_judgment(raw in raw_held_through()) {
         let p = build_held_through(&raw);
@@ -392,14 +377,7 @@ proptest! {
                 _ => None,
             })
             .collect();
-        let not_taken = p.preset.ln_mode.head_eligibility == rules::HeadEligibility::NotLateBad
-            && expected == rules::Judgment::Bad
-            && p.deviation > 0;
-        if not_taken {
-            prop_assert_eq!(judgments, vec![(rules::Judgment::Poor, None)]);
-        } else {
-            prop_assert_eq!(judgments, vec![(expected, Some(TimeUs(p.deviation)))]);
-        }
+        prop_assert_eq!(judgments, vec![(expected, Some(TimeUs(p.deviation)))]);
     }
 }
 
@@ -768,17 +746,6 @@ fn count_play(play: &Play, c: &mut Coverage) {
                     )
             }),
     );
-    // The other LN-head eligibility changes the play: a late BAD head
-    // taken under one is passed or left under the other.
-    let mut other = play.preset.clone();
-    other.ln_mode.head_eligibility = match other.ln_mode.head_eligibility {
-        rules::HeadEligibility::InsideBad => rules::HeadEligibility::NotLateBad,
-        rules::HeadEligibility::NotLateBad => rules::HeadEligibility::InsideBad,
-    };
-    c.hit(
-        "head_eligibility_shows",
-        evaluate(&play.chart, &play.input, &other).unwrap().events != whole.events,
-    );
     c.hit(
         "empty_poor",
         has(&|k| matches!(k, JudgeEventKind::EmptyPoor { .. })),
@@ -1018,7 +985,6 @@ fn generators_reach_the_fragile_spots() {
         ("choices_of_lr2_style", SAMPLES / 8),
         ("policies_of_lr2_style", 1),
         ("combo_priority_passes_a_note", 1),
-        ("head_eligibility_shows", 1),
         ("headers_decimals", 1),
         ("headers_def_ex_rank_first", 1),
         ("header_policies_differ", 1),

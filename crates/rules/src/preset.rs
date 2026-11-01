@@ -575,8 +575,8 @@ pub enum SameTimeOrder {
 
 /// Which note a press takes, the primary of press resolution (design.md
 /// "Evaluation Stages"). Only unjudged notes inside the lane class's BAD
-/// window are eligible, less the LN heads [`HeadEligibility`] excludes, and
-/// the notes before the one taken are passed ([`MissRule`]).
+/// window are eligible, taps and LN heads alike, and the notes before the
+/// one taken are passed ([`MissRule`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Assignment {
     /// The nearest unjudged note inside the BAD window; at equal distance,
@@ -611,21 +611,6 @@ pub enum LateHeadRule {
     CompletesAtPress,
 }
 
-/// Which unjudged LN heads inside the BAD window a press may take as its
-/// primary (design.md "Evaluation Stages", LN transitions). A head that is
-/// not eligible is not taken: when the primary is a later note, the head is
-/// passed and missed at the press like any note before it ([`MissRule`]);
-/// otherwise it stays to its own miss deadline, which does not move.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum HeadEligibility {
-    /// Every unjudged head inside the BAD window is eligible, like a tap.
-    InsideBad,
-    /// A head the press would grade BAD on its late side, strictly past the
-    /// late GOOD edge, is not eligible; every other head inside the BAD
-    /// window is.
-    NotLateBad,
-}
-
 /// The long-note judgment rules.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LnModeRule {
@@ -633,8 +618,6 @@ pub struct LnModeRule {
     pub default: LnMode,
     /// What a head pressed after its LN's end does.
     pub late_head: LateHeadRule,
-    /// Which heads a press may take.
-    pub head_eligibility: HeadEligibility,
 }
 
 /// How `#TOTAL` applies.
