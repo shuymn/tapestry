@@ -643,6 +643,36 @@ fn offsets_are_target_pixels_at_any_resolution() {
 }
 
 #[test]
+fn an_offset_is_added_in_f64() {
+    // At 1280×720 a cell placed at x 1 000 000 moved by −666 667 target
+    // pixels, −1 000 000.47 canvas pixels, lands at −0.470 197 68; in
+    // `f32` the quotient rounds to −1 000 000.5 and the cell to −0.5.
+    let skin = load(
+        vec![element(
+            Source::Number(0),
+            [1_000_000, 50, 20, 30],
+            Place::SCREEN,
+        )],
+        WidgetDefs {
+            numbers: vec![number(
+                single(vec![DigitOffset {
+                    dx: -666_667,
+                    ..DigitOffset::default()
+                }]),
+                "7",
+            )],
+            ..WidgetDefs::default()
+        },
+    )
+    .unwrap();
+    let mut h = harness(skin);
+    h.target = [1_280, 720];
+    h.frame(0, &[]);
+    let x = cells(&h)[0].1[0];
+    assert!((x + 0.470_197_68).abs() < 1e-6, "{x}");
+}
+
+#[test]
 fn offsets_follow_the_fixed_cells_under_every_alignment() {
     // 12 in four blank-padded cells is cells 2 and 3: rows 2 and 3 move
     // them wherever the alignment draws them; row 0 stays cell 0's.
