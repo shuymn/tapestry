@@ -2830,7 +2830,11 @@ fn a_refused_preparation_opens_nothing_and_gives_the_number_back() {
     assert_eq!((rig.opens, rig.reports.len()), (0, 0));
     assert!(!rig.steps.contains(&"end loading"));
     // What the refused preparation readied is dropped, never committed.
-    assert!(rig.steps.ends_with(&["attempt", "discard"]), "{:?}", rig.steps);
+    assert!(
+        rig.steps.ends_with(&["attempt", "discard"]),
+        "{:?}",
+        rig.steps
+    );
     assert!(!rig.steps.contains(&"commit"));
     assert_eq!(loaded.begin_play().attempt, 1);
 }
