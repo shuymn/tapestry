@@ -81,8 +81,9 @@ fn red() -> Look {
 }
 
 /// Blue over the right half, from a 300-texel image (a 512-texel page),
-/// with 9 500 more image elements than one: past [`MAX_SPRITES`], and past
-/// the 9 216 instances (with the overlay's reserve) of the least buffer.
+/// with 9 500 more image elements than one, each over a 10×10 corner: past
+/// [`MAX_SPRITES`], and past the 9 216 instances (with the overlay's
+/// reserve) of the least buffer.
 fn blue() -> Look {
     Look {
         side: 300,
