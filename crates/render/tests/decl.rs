@@ -227,7 +227,7 @@ fn a_commit_checks_the_request_and_the_device_apart() {
     assert_eq!(r.commit(token), Err(CommitError::NothingStaged));
 }
 
-/// Two more gauges for the retry.
+/// The retry's two gauges: the first attempt's, then another.
 const TWO: [GaugeDesc; 2] = [
     GAUGES[0],
     GaugeDesc {
@@ -266,6 +266,10 @@ fn a_retry_reuses_the_resources_with_a_fresh_attempt() {
         Err(RenderError::Build(BuildError::InconsistentTally))
     ));
     assert_eq!(r.refused(), Some(BuildError::InconsistentTally));
+    // Its poisoned `Play` is never built again: every frame answers the
+    // refusal and presents nothing.
+    assert_eq!(r.build(&f), Err(BuildError::InconsistentTally));
+    assert!(!r.submit().unwrap().presented);
 
     let retry = context(&TWO, false);
     let token = r.stage(&a, &attempt(&r, &chart, &retry), 2).unwrap();
