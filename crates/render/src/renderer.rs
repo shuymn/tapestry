@@ -1,5 +1,6 @@
 //! The renderer: one instanced sprite pipeline per blend over the atlas,
-//! drawing a skin's batch into a swap chain or an offscreen target.
+//! drawing a skin's batch, run by run in its order, into a swap chain or an
+//! offscreen target.
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
@@ -19,7 +20,7 @@ use crate::pace::Pacer;
 use crate::simple::layout::{HEIGHT, WIDTH};
 use crate::simple::{result_screen, text_screen};
 use crate::text::MenuText;
-use crate::{FrameInput, PlaySkin, SimpleSkin, SkinError, Sprite, SpriteBatch};
+use crate::{Blend, FrameInput, Instance, PlaySkin, SimpleSkin, SkinError, SpriteBatch};
 
 /// The next [`Renderer`]'s id.
 static RENDERERS: AtomicU64 = AtomicU64::new(0);
@@ -28,10 +29,13 @@ static RENDERERS: AtomicU64 = AtomicU64::new(0);
 pub const MAX_SPRITES: usize = 8_192;
 
 const SPRITE_WGSL: &str = r"
+// An `Instance`: its pivot and angle share location 3; its layer and filter
+// flags are not read, as the one atlas is layer 0 sampled nearest.
 struct Inst {
     @location(0) rect: vec4f,
     @location(1) uv: vec4f,
     @location(2) color: vec4f,
+    @location(3) turn: vec3f,
 };
 struct VOut {
     @builtin(position) pos: vec4f,
@@ -41,12 +45,19 @@ struct VOut {
 @group(0) @binding(0) var atlas: texture_2d<f32>;
 @group(0) @binding(1) var samp: sampler;
 
-// Layout pixels (1920x1080, origin top left) to clip space; the viewport
-// letterboxes the layout into the target.
+// Layout pixels (1920x1080, origin top left, y down) to clip space; the
+// viewport letterboxes the layout into the target. Each corner turns
+// clockwise on screen by the angle about the pivot; an unturned sprite keeps
+// its corners exactly.
 @vertex
 fn vs(@builtin(vertex_index) vi: u32, i: Inst) -> VOut {
     let c = vec2f(f32(vi & 1u), f32((vi >> 1u) & 1u));
-    let p = i.rect.xy + c * i.rect.zw;
+    let placed = i.rect.xy + c * i.rect.zw;
+    let d = placed - i.turn.xy;
+    let s = sin(i.turn.z);
+    let k = cos(i.turn.z);
+    let turned = i.turn.xy + vec2f(d.x * k - d.y * s, d.x * s + d.y * k);
+    let p = select(turned, placed, i.turn.z == 0.0);
     var o: VOut;
     o.pos = vec4f(p.x / 960.0 - 1.0, 1.0 - p.y / 540.0, 0.0, 1.0);
     o.uv = mix(i.uv.xy, i.uv.zw, c);
@@ -54,6 +65,8 @@ fn vs(@builtin(vertex_index) vi: u32, i: Inst) -> VOut {
     return o;
 }
 
+// The atlas holds premultiplied texels (transparent black or opaque white)
+// and the colour arrives premultiplied, so their product is premultiplied.
 @fragment
 fn fs(v: VOut) -> @location(0) vec4f {
     return textureSample(atlas, samp, v.uv) * v.color;
@@ -196,7 +209,7 @@ pub struct Renderer {
     instances: wgpu::Buffer,
     batch: SpriteBatch,
     /// The batch in drawing order, copied into `instances` each frame.
-    staging: Vec<Sprite>,
+    staging: Vec<Instance>,
     skin: Box<dyn PlaySkin>,
     /// When the built frame's work began, until [`submit`](Self::submit)
     /// takes it.
@@ -272,7 +285,7 @@ impl Renderer {
         let (alpha, additive, atlas_bind) = pipelines(&gpu, format);
         let instances = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("sprites"),
-            size: (MAX_SPRITES * size_of::<Sprite>()) as u64,
+            size: (MAX_SPRITES * size_of::<Instance>()) as u64,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -483,8 +496,8 @@ impl Renderer {
         start: Instant,
         text: Option<&MenuText>,
     ) -> Result<FrameTiming, RenderError> {
-        let alpha = self.batch.alpha().len() as u32;
         let sprites = self.staging.len();
+        let staged = u32::try_from(sprites).unwrap_or(u32::MAX);
         let timing = |cpu, presented| FrameTiming {
             cpu,
             sprites,
@@ -565,10 +578,19 @@ impl Renderer {
             pass.set_viewport(x, y, w, h, 0.0, 1.0);
             pass.set_bind_group(0, &self.atlas_bind, &[]);
             pass.set_vertex_buffer(0, self.instances.slice(..));
-            pass.set_pipeline(&self.alpha);
-            pass.draw(0..4, 0..alpha);
-            pass.set_pipeline(&self.additive);
-            pass.draw(0..4, alpha..sprites as u32);
+            // The runs in the batch's order, so each sprite is drawn over
+            // every sprite pushed before it, whatever their blends.
+            for run in self.batch.runs() {
+                let end = run.end.min(staged);
+                if run.start >= end {
+                    break;
+                }
+                pass.set_pipeline(match run.blend {
+                    Blend::Alpha => &self.alpha,
+                    Blend::Additive => &self.additive,
+                });
+                pass.draw(0..4, run.start..end);
+            }
         }
         if let Some(text) = text {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -724,7 +746,7 @@ pub fn build_frame(
     skin: &mut dyn PlaySkin,
     f: &FrameInput<'_>,
     batch: &mut SpriteBatch,
-    staging: &mut Vec<Sprite>,
+    staging: &mut Vec<Instance>,
 ) {
     batch.clear();
     skin.build(f, batch);
@@ -767,7 +789,10 @@ const fn extent(width: u32, height: u32) -> wgpu::Extent3d {
 }
 
 /// The alpha and additive sprite pipelines and the atlas binding, with the
-/// atlas uploaded.
+/// atlas uploaded. Both take premultiplied colour (design.md "Rendering and
+/// Skins"): alpha blending is RGB source 1, destination 1 − source alpha;
+/// additive is RGB source 1, destination 1; in both the alpha channel
+/// composites over.
 fn pipelines(
     gpu: &Gpu,
     format: wgpu::TextureFormat,
@@ -838,7 +863,14 @@ fn pipelines(
         immediate_size: 0,
     });
     let pipeline = |blend| {
-        let attrs = wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x4, 2 => Float32x4];
+        // `Instance`: rect, uv and color, then pivot and angle together;
+        // its last four bytes, the flags, are not read.
+        let attrs = wgpu::vertex_attr_array![
+            0 => Float32x4,
+            1 => Float32x4,
+            2 => Float32x4,
+            3 => Float32x3,
+        ];
         device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("sprites"),
             layout: Some(&pipeline_layout),
@@ -847,7 +879,7 @@ fn pipelines(
                 entry_point: Some("vs"),
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
                 buffers: &[Some(wgpu::VertexBufferLayout {
-                    array_stride: size_of::<Sprite>() as u64,
+                    array_stride: size_of::<Instance>() as u64,
                     step_mode: wgpu::VertexStepMode::Instance,
                     attributes: &attrs,
                 })],
@@ -872,10 +904,17 @@ fn pipelines(
             cache: None,
         })
     };
-    let alpha = pipeline(wgpu::BlendState::ALPHA_BLENDING);
+    let alpha = pipeline(wgpu::BlendState {
+        color: wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::One,
+            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+            operation: wgpu::BlendOperation::Add,
+        },
+        alpha: wgpu::BlendComponent::OVER,
+    });
     let additive = pipeline(wgpu::BlendState {
         color: wgpu::BlendComponent {
-            src_factor: wgpu::BlendFactor::SrcAlpha,
+            src_factor: wgpu::BlendFactor::One,
             dst_factor: wgpu::BlendFactor::One,
             operation: wgpu::BlendOperation::Add,
         },

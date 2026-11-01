@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use bms_model::{ChartBuilder, TimeUs};
 use common::{MS, input, lane, view};
 use eval::{JudgeEvent, JudgeEventKind};
-use render::{MAX_SPRITES, SimpleSkin, Sprite, SpriteBatch};
+use render::{Instance, MAX_SPRITES, SimpleSkin, SpriteBatch};
 use rules::Judgment;
 
 struct Counting;
@@ -92,7 +92,7 @@ fn frame_does_not_allocate_after_warmup() {
     let mut skin = SimpleSkin::new();
     skin.load(&chart, None);
     let mut batch = SpriteBatch::with_capacity(MAX_SPRITES);
-    let mut staging: Vec<Sprite> = Vec::with_capacity(MAX_SPRITES);
+    let mut staging: Vec<Instance> = Vec::with_capacity(MAX_SPRITES);
     let v = view(42, 1_234);
     let mut effects: Vec<JudgeEvent> = Vec::with_capacity(64);
     let (mut next, mut seq, mut drawn, mut held, mut ended) = (0, 0, 0, 0, 0);

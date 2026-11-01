@@ -579,6 +579,7 @@ mod tests {
                             rect: [left, 600.0, 45.0, 45.0],
                             uv: solid_uv(),
                             color: [1.0, 0.0, 0.0, 1.0],
+                            ..Sprite::default()
                         },
                     );
                 }
@@ -632,6 +633,7 @@ mod tests {
                             rect: [x, 600.0, 100.0, 50.0],
                             uv: solid_uv(),
                             color: [1.0, 0.0, 0.0, 1.0],
+                            ..Sprite::default()
                         },
                     );
                 }
