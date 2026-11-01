@@ -10,7 +10,7 @@ use bms_model::{Chart, Position, Speed, TimeUs};
 use rules::{GaugeRule, GaugeValue, RulePreset};
 
 use crate::Loaded;
-use crate::practice::{LEAD_IN, Practice, PracticeError, chart_end};
+use crate::practice::{LEAD_IN, Practice, chart_end};
 
 /// The shortest lead-in the screen sets.
 pub const MIN_LEAD_IN: TimeUs = TimeUs(1_000_000);
@@ -374,78 +374,86 @@ impl PracticeScreen {
     }
 
     /// Fits the screen to `preset`, the play preset now, as
-    /// [`Loaded::refit_practice`] fits the practice: the displayed gauge is
-    /// followed by its ID, keeping a value set away from its start and
-    /// taking the new start otherwise. A gauge the preset no longer has
-    /// stays shown with its value while that value is set away, so Start
-    /// is refused ([`practice`](Self::practice)) until the player steps it
-    /// back to its start; it never moves onto another gauge. A gauge at
-    /// its start gives way to the preset's gauge at the same place, at its
-    /// start, as [`new`](Self::new) shows one. Whether what it shows
-    /// changed.
-    pub fn fit(&mut self, preset: &RulePreset) -> bool {
-        let found = self
-            .rule
-            .as_ref()
-            .and_then(|r| preset.gauges.iter().enumerate().find(|(_, g)| g.id == r.id));
-        let (gauge, rule, value) = match found {
+    /// [`Loaded::refit_practice`] fits the practice, so the page never
+    /// shows a value the next round would not play or the player could
+    /// not step out of. The displayed gauge is followed by its ID: a value
+    /// set away from its start stays while the gauge's rule accepts it, and
+    /// otherwise the gauge takes its new start. A displayed gauge the
+    /// preset no longer has gives way, with its value, to the preset's
+    /// gauge at the same place, at its start, as [`new`](Self::new) shows
+    /// one. What a player set and lost is said: the notice for the page,
+    /// or `None` when nothing set was reset.
+    pub fn fit(&mut self, preset: &RulePreset) -> Option<String> {
+        let shown = self.rule.clone()?;
+        let found = preset
+            .gauges
+            .iter()
+            .enumerate()
+            .find(|(_, g)| g.id == shown.id);
+        let mut notice = None;
+        match found {
             Some((j, g)) => {
-                let value = if self.set_away() { self.value } else { g.start };
-                (j, Some(g.clone()), value)
+                if !self.set_away() {
+                    self.value = g.start;
+                } else if !eval::accepts_initial(g, self.value) {
+                    self.value = g.start;
+                    notice = Some(format!(
+                        "the gauge {} no longer accepts the value set; it is back at its start",
+                        g.id
+                    ));
+                }
+                self.gauge = j;
+                self.rule = Some(g.clone());
             }
-            None if self.set_away() => return false,
             None => {
-                let gauge = self.gauge.min(preset.gauges.len().saturating_sub(1));
-                let rule = preset.gauges.get(gauge).cloned();
-                let value = rule.as_ref().map_or(GaugeValue::EMPTY, |r| r.start);
-                (gauge, rule, value)
+                self.gauge = self.gauge.min(preset.gauges.len().saturating_sub(1));
+                self.rule = preset.gauges.get(self.gauge).cloned();
+                self.value = self.rule.as_ref().map_or(GaugeValue::EMPTY, |r| r.start);
+                notice = Some(match &self.rule {
+                    Some(r) => format!(
+                        "the gauge {} left the preset; showing {} at its start",
+                        shown.id, r.id
+                    ),
+                    None => format!("the gauge {} left the preset", shown.id),
+                });
             }
-        };
-        let changed = (gauge, &rule, value) != (self.gauge, &self.rule, self.value);
-        self.gauge = gauge;
-        self.rule = rule;
-        self.value = value;
-        changed
+        }
+        notice
     }
 
     /// The practice set up for `loaded`, read at the chosen speed: the
     /// section from measure `from` to the start of measure `to`, or to the
     /// chart's end ([`chart_end`]) for the last; the displayed gauge, by
-    /// its ID, at its value and every other gauge of the current preset at
-    /// its start.
-    ///
-    /// # Errors
-    ///
-    /// [`PracticeError::GaugeGone`] when the displayed gauge's value is set
-    /// away from its start and the current preset no longer has it.
-    pub fn practice(&self, loaded: &Loaded) -> Result<Practice, PracticeError> {
+    /// its ID, at its value while its rule accepts it, and every other
+    /// gauge of the current preset at its start.
+    #[must_use]
+    pub fn practice(&self, loaded: &Loaded) -> Practice {
         let at = |i: usize| self.measures.get(i).copied();
         let start = at(self.from).unwrap_or(TimeUs(0));
         let end = match at(self.to) {
             Some(t) if self.to < self.measures.len() => t,
             _ => chart_end(loaded.chart(), loaded.config().speed),
         };
-        let gauges = &loaded.preset().gauges;
-        if let Some(r) = &self.rule
-            && self.set_away()
-            && !gauges.iter().any(|g| g.id == r.id)
-        {
-            return Err(PracticeError::GaugeGone(r.id.clone()));
-        }
-        let initial_gauges = gauges
+        let initial_gauges = loaded
+            .preset()
+            .gauges
             .iter()
             .map(|g| match &self.rule {
-                Some(r) if r.id == g.id && self.set_away() => self.value,
+                Some(r)
+                    if r.id == g.id && self.set_away() && eval::accepts_initial(g, self.value) =>
+                {
+                    self.value
+                }
                 _ => g.start,
             })
             .collect();
-        Ok(Practice {
+        Practice {
             start,
             end,
             lead_in: self.lead_in,
             initial_gauges,
             repeat: self.repeat,
-        })
+        }
     }
 }
 
@@ -587,56 +595,95 @@ mod tests {
         assert_eq!(s.input(Back), PracticeActed::Back);
     }
 
-    /// The screen follows its gauge by ID through an edited preset: a
-    /// value set away from the start moves with the gauge, a value at the
-    /// start takes the gauge's new start, and a gauge removed while set
-    /// stays shown until stepped back to its start, then gives way to the
-    /// preset's gauge at its place, at its start.
-    #[test]
-    fn the_screen_follows_its_gauge_by_id() {
-        use PracticeInput::{Down, Left, Right};
+    /// The screen at 5 % below its first gauge's start.
+    fn set_below(preset: &rules::RulePreset) -> PracticeScreen {
+        use PracticeInput::{Down, Left};
         let chart = load("#BPM 120\n#00111:01\n#00211:01\n");
-        let preset = rules::tapestry();
-        let shown = preset.gauges[0].clone();
-        let set = GaugeValue(shown.start.0 - 5 * GaugeValue::PERCENT);
-        let mut s = PracticeScreen::new(&chart, &preset, 0);
+        let mut s = PracticeScreen::new(&chart, preset, 0);
         for _ in 0..4 {
             s.input(Down);
         }
         for _ in 0..5 {
             s.input(Left);
         }
+        s
+    }
+
+    /// The screen follows its gauge by ID through an edited preset, saying
+    /// only what it reset: a value set away from the start moves with the
+    /// gauge, and a value at the start takes the gauge's new start.
+    #[test]
+    fn the_screen_follows_its_gauge_by_id() {
+        let preset = rules::tapestry();
+        let shown = preset.gauges[0].clone();
+        let set = GaugeValue(shown.start.0 - 5 * GaugeValue::PERCENT);
+        let mut s = set_below(&preset);
         assert_eq!(s.value(), set);
-        // Reordered: the set value moves with its gauge.
         let mut reversed = preset.clone();
         reversed.gauges.reverse();
         let at = reversed.gauges.len() - 1;
-        assert!(s.fit(&reversed));
+        assert_eq!(s.fit(&reversed), None);
         assert_eq!(
             (s.gauge(), s.gauge_name(), s.value()),
             (at, Some(shown.id.as_str()), set)
         );
-        // Removed while set: nothing moves.
-        let mut removed = preset.clone();
+        let mut s = PracticeScreen::new(&load("#BPM 120\n#00111:01\n"), &preset, 0);
+        let mut moved = preset.clone();
+        moved.gauges[0].start = GaugeValue(shown.start.0 - GaugeValue::PERCENT);
+        assert_eq!(s.fit(&moved), None);
+        assert_eq!(s.value(), moved.gauges[0].start);
+    }
+
+    /// A set value the gauge's narrowed rule refuses goes back to the
+    /// gauge's start, and the screen says so; the value can be set again.
+    #[test]
+    fn a_value_the_narrowed_gauge_refuses_goes_back_to_its_start() {
+        let preset = rules::tapestry();
+        let mut s = set_below(&preset);
+        let mut narrowed = preset.clone();
+        narrowed.gauges[0].min = narrowed.gauges[0].start;
+        let notice = s.fit(&narrowed).unwrap();
+        assert!(
+            notice.contains("gauge normal no longer accepts"),
+            "{notice}"
+        );
+        assert_eq!(s.value(), narrowed.gauges[0].start);
+        assert_eq!(s.input(PracticeInput::Right), PracticeActed::Changed);
+    }
+
+    /// A set gauge the preset lost gives way, with its value, to the
+    /// preset's gauge at its place, at its start, and the screen names
+    /// both; so after a start moved off the 1 % steps, too, which the set
+    /// value could never have been stepped back to.
+    #[test]
+    fn a_removed_gauge_gives_way_to_the_gauge_at_its_place() {
+        let preset = rules::tapestry();
+        let mut s = set_below(&preset);
+        let mut odd = preset.clone();
+        odd.gauges[0].start = GaugeValue(20 * GaugeValue::PERCENT + GaugeValue::PERCENT / 2);
+        assert_eq!(s.fit(&odd), None);
+        let mut removed = odd.clone();
         removed.gauges.remove(0);
-        assert!(!s.fit(&removed));
-        assert_eq!((s.gauge_name(), s.value()), (Some(shown.id.as_str()), set));
-        // Stepped back to its start: the gauge at its place, at its start.
-        for _ in 0..5 {
-            s.input(Right);
-        }
-        assert_eq!(s.value(), shown.start);
-        assert!(s.fit(&removed));
-        let place = at.min(removed.gauges.len() - 1);
-        let other = &removed.gauges[place];
+        let notice = s.fit(&removed).unwrap();
+        let other = &removed.gauges[0];
+        assert_eq!(
+            notice,
+            format!(
+                "the gauge normal left the preset; showing {} at its start",
+                other.id
+            )
+        );
         assert_eq!(
             (s.gauge(), s.gauge_name(), s.value()),
-            (place, Some(other.id.as_str()), other.start)
+            (0, Some(other.id.as_str()), other.start)
         );
-        // At its start, a gauge takes its new start.
-        let mut moved = removed.clone();
-        moved.gauges[place].start = GaugeValue(other.start.0 - GaugeValue::PERCENT);
-        assert!(s.fit(&moved));
-        assert_eq!(s.value(), moved.gauges[place].start);
+        // Nothing left to show.
+        let mut none = removed.clone();
+        none.gauges.clear();
+        assert_eq!(
+            s.fit(&none).as_deref(),
+            Some(format!("the gauge {} left the preset", other.id).as_str())
+        );
+        assert_eq!(s.gauge_name(), None);
     }
 }

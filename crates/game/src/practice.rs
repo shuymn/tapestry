@@ -68,9 +68,6 @@ pub enum PracticeError {
     /// is nothing to play.
     #[error("the section has no notes to play")]
     NoTargets,
-    /// The play preset no longer has a gauge whose initial value was set.
-    #[error("the preset no longer has the gauge {0}")]
-    GaugeGone(String),
 }
 
 /// `t` of the chart's 1× time in the real time of a chart loaded at

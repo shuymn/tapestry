@@ -2959,49 +2959,140 @@ fn reordered() -> rules::RulePreset {
     p
 }
 
-/// A gauge set on the practice page that a later edit of the preset
-/// removes refuses the round with a notice on the page; no round opens.
-#[test]
-fn a_round_whose_set_gauge_left_the_preset_is_refused() {
-    use PracticeInput::{Down, Left};
+/// The practice page's first gauge set 5 % below its start, then two
+/// Starts, each round left through its result, with the preset file
+/// rewritten at each `(at, preset)` of `edits` (ms after the clock's
+/// start): the first edit at 300 ms lands in the first round, one at
+/// 12 s in the second.
+fn two_starts(edits: Vec<(i64, rules::RulePreset)>) -> Headless {
+    use PracticeInput::{Confirm, Down, Left};
     let mut acts = vec![(0, Act::Practice(P))];
     acts.extend(page(Down, 4));
     acts.extend(page(Left, 5));
     acts.extend(page(Down, 2));
-    // Start, refused, and Start again.
     acts.extend([
-        (500, Act::Page(PracticeInput::Confirm)),
-        (500, Act::Page(PracticeInput::Confirm)),
-        (500, Act::Page(PracticeInput::Back)),
+        (500, Act::Page(Confirm)),
+        (3_000, Act::Quit),
+        (500, Act::Quit),
+        (20_000, Act::Page(Confirm)),
+        (3_000, Act::Quit),
+        (500, Act::Quit),
         (500, Act::Close),
     ]);
-    let mut edited = flat_normal();
-    let displayed = edited.gauges.remove(0);
-    let file = game::preset_to_toml(&edited);
     let (rig, _app, _dir, ran) = run_mine(Refusal::Missing, acts, |r, dir| {
-        edit(r, CLOCK_START + 300 * MS, &mine_path(dir), file);
+        for (at, preset) in edits {
+            let file = game::preset_to_toml(&preset);
+            edit(r, CLOCK_START + at * MS, &mine_path(dir), file);
+        }
     });
     ran.unwrap();
     assert!(rig.violations.is_empty(), "{:?}", rig.violations);
-    // Both Starts refused: the second never moves the value onto another
-    // gauge, and the page still shows the gauge set, with its value.
-    let gone = format!("no longer has the gauge {}", displayed.id);
+    rig
+}
+
+/// The section's initial gauges of each attempt.
+fn initial_gauges(rig: &Headless) -> Vec<Vec<rules::GaugeValue>> {
+    rig.attempts
+        .iter()
+        .map(|a| match &a.kind {
+            game::AttemptKind::Section(s) => s.initial_gauges.clone(),
+            other => panic!("{other:?}"),
+        })
+        .collect()
+}
+
+fn starts(preset: &rules::RulePreset) -> Vec<rules::GaugeValue> {
+    preset.gauges.iter().map(|g| g.start).collect()
+}
+
+/// A gauge set on the practice page that an edit of the preset removes
+/// gives way: the round plays every gauge at its start, the page shows the
+/// preset's gauge at its place, at its start, and says so, and the next
+/// Start plays as well.
+#[test]
+fn a_set_gauge_the_preset_lost_gives_way() {
+    let mut edited = flat_normal();
+    let lost = edited.gauges.remove(0);
+    let rig = two_starts(vec![(300, edited.clone())]);
+    assert_eq!(initial_gauges(&rig), [starts(&edited), starts(&edited)]);
     let n = notices(&rig);
-    assert_eq!(n.len(), 3, "{n:?}");
-    for notice in &n[1..] {
-        assert!(
-            notice.as_deref().is_some_and(|n| n.contains(&gone)),
-            "{n:?}"
-        );
-    }
-    let page = rig.practice_entries.last().unwrap();
-    assert_eq!(page.gauge_name(), Some(displayed.id.as_str()));
+    let shown = &edited.gauges[0];
     assert_eq!(
-        page.value(),
-        rules::GaugeValue(displayed.start.0 - 5 * rules::GaugeValue::PERCENT)
+        n[1].as_deref(),
+        Some(
+            format!(
+                "the gauge {} left the preset; showing {} at its start",
+                lost.id, shown.id
+            )
+            .as_str()
+        )
     );
-    assert_eq!(rig.opens, 0);
-    assert!(rig.attempts.is_empty());
+    assert_eq!(n[2], None);
+    let page = &rig.practice_entries[1];
+    assert_eq!(
+        (page.gauge(), page.gauge_name(), page.value()),
+        (0, Some(shown.id.as_str()), shown.start)
+    );
+}
+
+/// A gauge set on the practice page to a value an edit of the preset no
+/// longer accepts goes back to its start: the round plays it there, the
+/// page shows it there and says so, and the next Start plays as well.
+#[test]
+fn a_set_value_the_preset_refuses_goes_back_to_its_start() {
+    let mut edited = flat_normal();
+    edited.gauges[0].min = edited.gauges[0].start;
+    let rig = two_starts(vec![(300, edited.clone())]);
+    assert_eq!(initial_gauges(&rig), [starts(&edited), starts(&edited)]);
+    let n = notices(&rig);
+    assert_eq!(
+        n[1].as_deref(),
+        Some("the gauge normal no longer accepts the value set; it is back at its start")
+    );
+    assert_eq!(n[2], None);
+    let page = &rig.practice_entries[1];
+    assert_eq!(
+        (page.gauge(), page.gauge_name(), page.value()),
+        (0, Some("normal"), edited.gauges[0].start)
+    );
+}
+
+/// A gauge kept at a set value while an edit moves its start off the 1 %
+/// steps, and then removed by another edit, which a step back to its start
+/// could never undo: the second round plays every gauge at its start, and
+/// the page gives way to the gauge at its place and says so.
+#[test]
+fn a_set_gauge_lost_after_its_start_moved_gives_way() {
+    let mut odd = flat_normal();
+    odd.gauges[0].start =
+        rules::GaugeValue(20 * rules::GaugeValue::PERCENT + rules::GaugeValue::PERCENT / 2);
+    let mut removed = odd.clone();
+    removed.gauges.remove(0);
+    let rig = two_starts(vec![(300, odd.clone()), (12_000, removed.clone())]);
+    let set = rules::GaugeValue(15 * rules::GaugeValue::PERCENT);
+    let mut first = starts(&odd);
+    first[0] = set;
+    assert_eq!(initial_gauges(&rig), [first, starts(&removed)]);
+    let n = notices(&rig);
+    assert_eq!(n[1], None);
+    let kept = &rig.practice_entries[1];
+    assert_eq!((kept.gauge_name(), kept.value()), (Some("normal"), set));
+    let shown = &removed.gauges[0];
+    assert_eq!(
+        n[2].as_deref(),
+        Some(
+            format!(
+                "the gauge normal left the preset; showing {} at its start",
+                shown.id
+            )
+            .as_str()
+        )
+    );
+    let page = &rig.practice_entries[2];
+    assert_eq!(
+        (page.gauge(), page.gauge_name(), page.value()),
+        (0, Some(shown.id.as_str()), shown.start)
+    );
 }
 
 fn act() -> impl Strategy<Value = Act> {

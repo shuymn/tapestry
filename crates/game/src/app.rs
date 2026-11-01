@@ -519,12 +519,11 @@ fn practice_chart<R: AppRig>(
             }
         }
         if start {
-            // The page follows the play preset by gauge ID before Start
-            // and again after the rounds refreshed it, so what it shows
-            // is what the next round plays.
-            screen.fit(loaded.preset());
+            // The play preset changes only as a round begins: the page
+            // follows it by gauge ID once the rounds return, so what it
+            // shows is what the next round plays.
             let ran = start_rounds(loaded, &screen, rig);
-            screen.fit(loaded.preset());
+            let fitted = screen.fit(loaded.preset());
             let notice = match ran {
                 Ok(Leave::Quit) => return Ok(Leave::Quit),
                 Ok(Leave::Back) => None,
@@ -534,6 +533,11 @@ fn practice_chart<R: AppRig>(
                     Some(n)
                 }
                 Err(Stopped::Run(e)) => return Err(e),
+            };
+            // What the fit reset follows the Start's own notice.
+            let notice = match (notice, fitted) {
+                (Some(n), Some(f)) => Some(format!("{n}; {f}")),
+                (n, f) => n.or(f),
             };
             screen.set_notice(notice);
             rig.entered_practice(&screen);
@@ -569,7 +573,7 @@ fn start_rounds<R: AppRig>(
     if loaded.config().speed != screen.speed() {
         loaded.set_speed(screen.speed()).map_err(|e| notice(&e))?;
     }
-    let practice = screen.practice(loaded).map_err(|e| notice(&e))?;
+    let practice = screen.practice(loaded);
     loaded
         .set_practice(Some(practice))
         .map_err(|e| notice(&e))?;

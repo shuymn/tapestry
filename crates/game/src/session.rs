@@ -711,16 +711,18 @@ impl Loaded {
     /// Fits the practice to the play preset refreshed for this round
     /// ([`begin_play`](Self::begin_play)) when it changed since the
     /// practice was checked: each gauge's initial value follows its gauge
-    /// by ID, a gauge left at its start takes the new start, and a gauge
-    /// the preset gained starts at its start; the section is then checked
-    /// again under the new preset.
+    /// by ID and keeps a value set away from its start while the gauge
+    /// still accepts it; a gauge left at its start, or whose rule no longer
+    /// accepts its value, takes the new start, a gauge the preset gained
+    /// starts at its start, and a gauge the preset lost is dropped with its
+    /// value. The section is then checked again under the new preset. The
+    /// practice page fits itself the same way and says what it reset
+    /// ([`PracticeScreen::fit`](crate::PracticeScreen::fit)).
     ///
     /// # Errors
     ///
-    /// [`PracticeError::GaugeGone`] when a gauge set to another value than
-    /// its start is no longer in the preset, and what
-    /// [`set_practice`](Self::set_practice) refuses; the practice is then
-    /// unchanged, and the round must not open.
+    /// What [`set_practice`](Self::set_practice) refuses; the practice is
+    /// then unchanged, and the round must not open.
     pub fn refit_practice(&mut self) -> Result<(), PracticeError> {
         let (Some((practice, _)), Some(practiced)) = (&self.practice, &self.practiced) else {
             return Ok(());
@@ -729,17 +731,14 @@ impl Loaded {
             return Ok(());
         }
         let old = practiced.gauges.iter().zip(&practice.initial_gauges);
-        if let Some((gone, _)) = old.clone().find(|(rule, value)| {
-            **value != rule.start && !self.preset.gauges.iter().any(|g| g.id == rule.id)
-        }) {
-            return Err(PracticeError::GaugeGone(gone.id.clone()));
-        }
         let initial_gauges = self
             .preset
             .gauges
             .iter()
             .map(|g| match old.clone().find(|(rule, _)| rule.id == g.id) {
-                Some((rule, value)) if *value != rule.start => *value,
+                Some((rule, value)) if *value != rule.start && eval::accepts_initial(g, *value) => {
+                    *value
+                }
                 _ => g.start,
             })
             .collect();
