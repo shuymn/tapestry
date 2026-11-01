@@ -304,14 +304,12 @@ fn frames_do_not_allocate_from_the_first() {
     graphs.timing.bins = [3; game::TIMING_BINS];
     let lines = vec!["RESULT".repeat(12); 27];
     let (staged, result_allocs) = counted(|| {
-        let mut staged = 0;
         for _ in 0..3 {
             batch.clear();
             render::result_screen(&lines, Some(&graphs), &mut batch);
             batch.stage(&mut staging);
-            staged = staging.len();
         }
-        staged
+        staging.len()
     });
     assert!(staged > 27 * 60);
     assert_eq!(result_allocs, 0, "the result page allocated");
