@@ -42,7 +42,7 @@ Stage 3 of the roadmap (design.md "Roadmap") is the look and effects of the play
 
 A compiled skin is a list of elements in draw order. Each element has a source (an image frame, a number, text, a bar, or a widget), a keyframe track, a timer, a visibility condition, a blend, a region and the covers it follows (`Follow`: none, LIFT, SUDDEN+ or both; R6, "Followers"). The runtime model carries the union of what imported skins need: five blends (alpha, add, subtract, multiply, invert), quadratic and cubic eases, per-object or per-keyframe ease, clip rectangles, and derived edge timers. Each of these enters with the PR that first needs it: an importer PR for import-only features, the LR2 importer for the LR2-only ones.
 
-**Draw order across blends.** The runtime model's `QuadBatch` is one ordered list with preallocated runs; a run breaks wherever the blend or the clip rectangle changes, so two neighbouring elements with different clips never share a scissor. Render's `SpriteBatch` is ordered the same way, with runs broken at each blend change, and the renderer draws the runs in order (S10-01), so an alpha element over an additive one is drawn over it; clip runs come with the canvas projection (§6, "Render"). The CPU preview applies the same runs.
+**Draw order across blends.** The runtime model's `QuadBatch` is one ordered list with preallocated runs; a run breaks wherever the blend or the clip rectangle changes, so two neighbouring elements with different clips never share a scissor. Render's `SpriteBatch` is ordered the same way, with runs broken at each blend change, and the renderer draws the runs in order (S10-01), so an alpha element over an additive one is drawn over it; clip runs are planned for S10-02 (§6, "Render integration"). The CPU preview applies the same runs.
 
 ### R2. Animation
 
@@ -271,9 +271,9 @@ Before play, never per frame, so per-frame cost is unchanged apart from trilinea
 
 All are `GPL-3.0-or-later` (design.md "Licenses") and portable: each goes into `REQUIRED_PORTABLE`, the baseline workspace of `xtask/src/fixture.rs`, the license table of `check-arch`, and its in-play functions into `IN_PLAY`. A skin that tapestry exports is the author's work and data, not a derivative of tapestry.
 
-### Render, after stage 2 exits
+### Render integration
 
-- `SpriteBatch` is one ordered list with runs broken at each blend change, drawn in order with a pipeline per blend (S10-01); clip changes break runs too, with a scissor per clip.
+- `SpriteBatch` is one ordered list with runs broken at each blend change, drawn in order with a pipeline per blend (S10-01). Planned for S10-02: clip changes break runs too, with a scissor per clip.
 - A sprite is staged into a 64-byte `Instance`, converted field by field: rect, uv, colour, the quad's pivot and angle, turned in the vertex shader, and the atlas layer and filter packed into flags (S10-01, the one atlas as layer 0 sampled nearest). The atlas becomes a texture array of one page side, the bitmap font in reserved layer 0 and the skin's pages after it (R7), uploaded with their mips as `Rgba8Unorm`, with a linear and a nearest sampler chosen per quad. `AtlasLimits` comes from `Device::limits()`. The uv table and the uploaded pages have one owner, and the memory budget counts the old atlas alive during a reload and the upload staging.
 - Premultiplied alpha throughout the sprite pipelines, the bitmap font and `text_screen` included (S10-01): staging multiplies a tint's RGB by its alpha once; alpha blending is RGB 1, 1 − source alpha, additive RGB 1, 1, and the alpha channel composites over in both. Menu text keeps its straight colour (`TextStyle.color`), blended by glyphon.
 - The canvas projection replaces the letterbox (renderer.rs:678), and `FrameInput` carries the target size.
@@ -351,7 +351,7 @@ Deferred beyond S6c: `dst2`, `expansionrate`, and the multiply and invert blends
 
 S10, in order (each a planned contract until its PR lands, except where marked done):
 
-1. **Ordered batches and premultiplied colour** (S10-01): `SpriteBatch` as one ordered list of runs drawn in order; the explicit 64-byte `Instance` with rotation about the pivot in the shader; premultiplied colour with the blend equations of §6, "Render"; the atlas and the fixed 1920×1080 projection kept; built-in sprites, menus and results migrated. WARP tests of alpha-additive-alpha overlap, translucent coloured sprites, fading feedback and translucent menu text over known backgrounds, with the Japanese title's expected image unchanged; the allocation test counts the first frame, later frames and a full batch, each span stopping its count before anything is asserted. Done.
+1. **Ordered batches and premultiplied colour** (S10-01): `SpriteBatch` as one ordered list of runs drawn in order; the explicit 64-byte `Instance` with rotation about the pivot in the shader; premultiplied colour with the blend equations of §6, "Render integration"; the atlas and the fixed 1920×1080 projection kept; built-in sprites, menus and results migrated. WARP tests of alpha-additive-alpha overlap, translucent coloured sprites, fading feedback and translucent menu text over known backgrounds, with the Japanese title's expected image unchanged; the allocation test counts the first frame, later frames and a full batch, each span stopping its count before anything is asserted. Done.
 
 The JSON import is complete only after S6c: S6a and S6b alone do not meet it. S6a to S11 make existing beatoraja skins playable before S12 starts the authored format. The exit (design.md "Roadmap"): an existing beatoraja skin and the standard skin both play, and playing with the standard skin is fun.
 
