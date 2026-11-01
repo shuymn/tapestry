@@ -10,8 +10,8 @@ use eval::{GaugeState, JudgeEvent, JudgeEventKind, Tally};
 use rules::{GaugeValue, Judgment, PerJudgment};
 use skin_model::{
     Atlas, AtlasLimits, Attempt, BpmRange, ChartText, CoverSettings, FrameReadouts, FrameUv,
-    GaugeDesc, GaugeLook, LaneView, Layout, PlayContext, Quad, QuadBatch, Side, Skin, SkinFrame,
-    TextImage, TextTable, UvTable, Variant,
+    GaugeDesc, GaugeLook, LaneView, Layout, LoadState, Loading, LoadingFrame, LoadingGauge,
+    PlayContext, Quad, QuadBatch, Side, Skin, SkinFrame, TextImage, TextTable, UvTable, Variant,
 };
 
 pub const MS: i64 = 1_000;
@@ -308,6 +308,66 @@ impl Drawn {
                 }
             })
             .collect()
+    }
+}
+
+/// An imported skin's loading state, its origin at 0, built at chosen
+/// times with the shown gauge's descriptor and the progress.
+pub struct Loader {
+    pub skin: Skin,
+    pub uvs: UvTable,
+    pub loading: Loading,
+    pub batch: QuadBatch,
+    /// The descriptor each frame gives: by default the drawn play's gauge.
+    pub gauge: Option<LoadingGauge>,
+    pub percent: i32,
+}
+
+impl Loader {
+    pub fn new(skin: Skin) -> Self {
+        let uvs = skin.atlas(Variant::Lo, LIMITS).unwrap().into_parts().1;
+        let loading = skin.prepare_loading(Side::Left);
+        let batch = QuadBatch::with_capacity(skin.quad_capacity(), skin.run_capacity());
+        Self {
+            skin,
+            uvs,
+            loading,
+            batch,
+            gauge: Some(LoadingGauge::of(0, &GAUGES[0])),
+            percent: 0,
+        }
+    }
+
+    /// The quads of the loading frame at `ms`.
+    pub fn frame(&mut self, ms: i64) -> Vec<Quad> {
+        self.batch.clear();
+        let view = LaneView {
+            visible_time: TimeUs(600 * MS),
+            cover: 0,
+            lift: 0,
+            hidden: 0,
+        };
+        let frame = LoadingFrame {
+            now: TimeUs(ms * MS),
+            load: LoadState {
+                since: TimeUs(0),
+                percent: self.percent,
+            },
+            target: [1_920, 1_080],
+            layout: &Layout::AUTHOR,
+            lanes: view,
+            covers: readouts_for(view).covers,
+            gauge: self.gauge,
+        };
+        self.skin
+            .build_loading(&mut self.loading, &frame, &self.uvs, &mut self.batch)
+            .expect("the loading frame builds");
+        self.batch.quads().to_vec()
+    }
+
+    /// The rects, rounded, of the loading frame at `ms`.
+    pub fn rects(&mut self, ms: i64) -> Vec<[i32; 4]> {
+        self.frame(ms).iter().map(|q| round(q.rect)).collect()
     }
 }
 
