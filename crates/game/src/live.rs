@@ -321,6 +321,14 @@ pub enum LiveError<S> {
     /// Audio cannot play.
     #[error("audio cannot play")]
     Audio(#[source] AudioWaitError),
+    /// The audio output failed before recording opened; recording did not
+    /// open.
+    #[error("the audio output failed")]
+    Output(#[source] OutputError),
+    /// The screen failed after the attempt was prepared and before
+    /// recording opened; recording did not open.
+    #[error("the screen failed before the play opened")]
+    ScreenLost,
     /// The input thread is gone or did not answer.
     #[error("the input thread failed")]
     Input(#[source] InputWaitError),
@@ -335,6 +343,26 @@ pub enum LiveError<S> {
 pub(crate) fn run_over<R: Rig>(rig: &R) -> Result<(), LiveError<R::ScreenError>> {
     rig.input_failure()
         .map_or(Ok(()), |e| Err(LiveError::Input(e)))
+}
+
+/// The other threads' failures that end the run before recording opens:
+/// the input thread's ([`run_over`]), then the audio output's.
+fn threads_over<R: Rig>(rig: &R) -> Result<(), LiveError<R::ScreenError>> {
+    run_over(rig)?;
+    rig.audio_failure()
+        .map_or(Ok(()), |e| Err(LiveError::Output(e)))
+}
+
+/// Whether recording may open as far as the threads go: none of them
+/// failed ([`threads_over`]), and the screen prepared for the attempt is
+/// still there. A screen that failed now has no prepared attempt, so the
+/// run ends rather than opening a play nothing draws.
+fn preflight<R: Rig>(rig: &R) -> Result<(), LiveError<R::ScreenError>> {
+    threads_over(rig)?;
+    if rig.screen_failed() {
+        return Err(LiveError::ScreenLost);
+    }
+    Ok(())
 }
 
 /// How the plays of a chart were left.
@@ -517,8 +545,10 @@ fn ready_to_open<R: Rig>(loaded: &Loaded, rig: &mut R) -> Result<bool, LiveError
     rig.prepare_audio().map_err(LiveError::Audio)?;
     match rig.prepare_attempt(loaded).map_err(LiveError::Screen)? {
         Preparation::Ready => {}
+        // The player left, or another thread failed: a failure is the
+        // run's end, with its cause.
         Preparation::Cancelled => {
-            run_over(rig)?;
+            threads_over(rig)?;
             while rig.take().is_some() {}
             return Ok(false);
         }
@@ -530,14 +560,15 @@ fn ready_to_open<R: Rig>(loaded: &Loaded, rig: &mut R) -> Result<bool, LiveError
         rig.restore_ready(at).map_err(LiveError::Restore)?;
     }
     // What happened during the preparation, before loading ends.
-    run_over(rig)?;
+    preflight(rig)?;
     if rig.quitting() {
         return Ok(false);
     }
     rig.end_loading().map_err(LiveError::Screen)?;
-    // And again once no loading frame can follow. A retry or suspend from
-    // before this play belongs to no play.
-    run_over(rig)?;
+    // And again once no loading frame can follow: the last look before
+    // recording opens. A retry or suspend from before this play belongs to
+    // no play.
+    preflight(rig)?;
     Ok(!(rig.quitting() || rig.take() == Some(Command::Quit)))
 }
 

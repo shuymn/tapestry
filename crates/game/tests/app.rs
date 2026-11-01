@@ -272,6 +272,12 @@ struct Headless {
     prepares: usize,
     input_fails_at: i64,
     audio_gone: bool,
+    /// The audio output has failed.
+    output_failed: bool,
+    /// What fails right after the attempt was prepared.
+    fails_after_attempt: Option<AfterAttempt>,
+    /// The preparation stops at that failure, as the player's does.
+    cancel_at_failure: bool,
     /// The screen does not confirm the end of the loading state.
     loading_end_fails: bool,
     /// Each loading state the flow ended, by the chart showing it.
@@ -409,6 +415,9 @@ impl Headless {
             prepares: 0,
             input_fails_at: i64::MAX,
             audio_gone: false,
+            output_failed: false,
+            fails_after_attempt: None,
+            cancel_at_failure: false,
             loading_end_fails: false,
             loading_ended: Vec::new(),
             opens: 0,
@@ -619,6 +628,16 @@ impl Rig for Headless {
 
     fn prepare_attempt(&mut self, loaded: &Loaded) -> Result<game::Preparation, SurfaceLost> {
         self.attempts.push(loaded.attempt());
+        match self.fails_after_attempt.take() {
+            // A loading frame drops the prepared screen.
+            Some(AfterAttempt::Screen) => self.screen_fails_at = self.at(),
+            Some(AfterAttempt::Output) => self.output_failed = true,
+            Some(AfterAttempt::Input) => self.input_fails_at = self.at(),
+            None => {}
+        }
+        if self.cancel_at_failure {
+            return Ok(game::Preparation::Cancelled);
+        }
         if self.refuse_attempts > 0 {
             self.refuse_attempts -= 1;
             return Ok(game::Preparation::Refused(game::PreparationRefusal {
@@ -706,7 +725,7 @@ impl Rig for Headless {
     }
 
     fn audio_failure(&self) -> Option<audio::OutputError> {
-        None
+        self.output_failed.then_some(audio::OutputError::DeviceLost)
     }
 
     fn screen_failed(&self) -> bool {
@@ -2787,6 +2806,47 @@ fn a_refused_round_preparation_shows_on_the_practice_page() {
     assert_eq!(rig.opens, 0);
     assert_eq!(events.count(|e| matches!(e, SessionEvent::Start { .. })), 0);
     assert_eq!(rig.seen.last(), Some(&Seen::Select));
+}
+
+/// What fails right after an attempt was prepared, before recording opens.
+#[derive(Clone, Copy, Debug)]
+enum AfterAttempt {
+    Screen,
+    Output,
+    Input,
+}
+
+/// A thread that fails after the attempt was prepared and before recording
+/// opens ends the run with its cause: nothing opens, no play starts. So
+/// does an audio or input failure that stopped the preparation itself.
+#[test]
+fn a_failure_after_the_preparation_opens_nothing() {
+    for (after, cancel) in [
+        (AfterAttempt::Screen, false),
+        (AfterAttempt::Output, false),
+        (AfterAttempt::Input, false),
+        (AfterAttempt::Output, true),
+        (AfterAttempt::Input, true),
+    ] {
+        let acts = vec![(0, Act::Choose(0)), (4_000, Act::Close)];
+        let (rig, events, ran) = run(Refusal::Missing, acts, |rig| {
+            rig.fails_after_attempt = Some(after);
+            rig.cancel_at_failure = cancel;
+        });
+        let cause_seen = match after {
+            AfterAttempt::Screen => matches!(ran, Err(LiveError::ScreenLost)),
+            AfterAttempt::Output => matches!(ran, Err(LiveError::Output(_))),
+            AfterAttempt::Input => matches!(ran, Err(LiveError::Input(_))),
+        };
+        assert!(cause_seen, "{after:?}: {ran:?}");
+        assert_eq!(rig.attempts.len(), 1, "{after:?}");
+        assert_eq!(rig.opens, 0, "{after:?}");
+        assert_eq!(
+            events.count(|e| matches!(e, SessionEvent::Start { .. })),
+            0,
+            "{after:?}"
+        );
+    }
 }
 
 /// The play preset is refreshed before the first round too: the preset

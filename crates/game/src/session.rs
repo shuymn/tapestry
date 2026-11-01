@@ -1429,11 +1429,12 @@ impl<O: AudioOutput + Wakes> Session<O> {
             Err(LiveError::Logic(e)) => Err(SessionPlayError::Logic(e)),
             Err(LiveError::Restore(e)) => Err(SessionPlayError::Restore(e)),
             Err(LiveError::Screen(e)) => match e {},
-            Err(LiveError::Preparation(_)) => {
-                unreachable!("a session has no screen to refuse an attempt")
+            Err(LiveError::Preparation(e)) => Err(SessionPlayError::Refused(e)),
+            Err(LiveError::Audio(_) | LiveError::Output(_)) => {
+                unreachable!("a session's audio cannot fail before its play opens")
             }
-            Err(LiveError::Audio(_)) => {
-                unreachable!("a session has no audio thread to fail")
+            Err(LiveError::ScreenLost) => {
+                unreachable!("a session has no screen to fail")
             }
             Err(LiveError::Input(_)) => {
                 unreachable!("a session has no input thread to fail")
@@ -1451,6 +1452,10 @@ pub enum SessionPlayError {
     /// A round's audio cannot be restored; the round did not start.
     #[error("the round's audio cannot be restored")]
     Restore(#[source] RestoreError),
+    /// The round cannot be prepared under the refreshed preset; it did
+    /// not start.
+    #[error("the round cannot be prepared")]
+    Refused(#[source] crate::PreparationRefusal),
 }
 
 /// The session's rig: one step of the virtual clock per wait, the script
