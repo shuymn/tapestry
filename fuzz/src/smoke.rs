@@ -413,7 +413,7 @@ fn skin_import_seeds_import_and_draw_as_built() {
                 assert_eq!(u.elements, 3, "{name}");
                 assert_eq!(kinds(&i), [NoteKind::UndefinedOp(7_777)], "{name}");
                 assert!(i.skin.ops().total() > 0, "{name}");
-                // The perfect shows with the 20 % gauge range.
+                // Both gauge conditions hold at 20 %.
                 assert_eq!(drawn, [2, 2, 2, 2], "{name}");
             }
             "offsets" => {
@@ -471,7 +471,7 @@ fn skin_json_accepts_ops_charged_for_a_dropped_element() {
     let data = br#"{"type": 0, "w": 1920, "h": 1080,
         "source": [{"id": "gone", "path": "gone.png"}],
         "image": [{"id": "g", "src": "gone", "w": 4, "h": 4}],
-        "destination": [{"id": "g", "op": [241], "dst": [{"w": 4, "h": 4}]}]}"#;
+        "destination": [{"id": "g", "op": [232], "dst": [{"w": 4, "h": 4}]}]}"#;
     let (_, imported) = skin_json(data).expect("the header resolves");
     let i = imported.expect("the skin imports");
     assert!(i.report.usage.ops > 0);

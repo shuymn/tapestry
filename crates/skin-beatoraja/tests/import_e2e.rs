@@ -20,7 +20,7 @@ fn json() -> String {
         "image": [
             {"id": "plain", "src": "a", "x": 0, "y": 0, "w": 64, "h": 64},
             {"id": "cyc", "src": "a", "x": 0, "y": 0, "w": 64, "h": 32, "divx": 2,
-             "timer": 46, "cycle": 100},
+             "timer": 51, "cycle": 100},
             {"id": "rank", "src": "a", "x": 0, "y": 32, "w": 64, "h": 32}
         ],
         "value": [
@@ -35,7 +35,7 @@ fn json() -> String {
         ],
         "destination": [
             {"id": "plain", "dst": [{"x": 10, "y": 20, "w": 64, "h": 64}]},
-            {"id": "cyc", "timer": 46, "dst": [{"x": 100, "y": 20, "w": 32, "h": 32}]},
+            {"id": "cyc", "timer": 51, "dst": [{"x": 100, "y": 20, "w": 32, "h": 32}]},
             {"id": "ex", "timer": 41, "dst": [{"x": 200, "y": 500, "w": 10, "h": 20}]},
             {"id": "pg", "timer": 41, "dst": [{"x": 200, "y": 600, "w": 10, "h": 20}]},
             {"id": "rank", "timer": 348, "dst": [{"x": 300, "y": 20, "w": 64, "h": 32}]},

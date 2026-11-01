@@ -155,7 +155,8 @@ pub mod timer {
     pub const PLAY: u16 = 1;
     /// The shown gauge's fail time.
     pub const FAILED: u16 = 2;
-    /// The last target's judgment.
+    /// The first playing frame past the notes' end
+    /// ([`PlayContext::last_note_end`](crate::PlayContext::last_note_end)).
     pub const LAST_NOTE: u16 = 3;
     /// The judgment that made the combo equal the target count.
     pub const FULL_COMBO: u16 = 4;
@@ -227,7 +228,8 @@ pub enum LaneTimer {
     Press,
     /// The lane's latest release: off, as `Press`.
     Release,
-    /// The lane's latest judgment other than POOR, from a press.
+    /// The lane's latest judgment within the skin's bomb threshold, from a
+    /// press.
     Bomb,
     /// The lane's visual long-note hold.
     Hold,

@@ -116,6 +116,7 @@ fn load(sheet: Sheet, texts: Vec<(TextDef, [i32; 4])>) -> Result<Skin, LoadError
             texts: texts.into_iter().map(|(t, _)| t).collect(),
             ..WidgetDefs::default()
         },
+        bomb_up_to: Some(skin_model::Grade::Bad),
     })
 }
 
@@ -429,6 +430,7 @@ fn bitmap_text_is_laid_out_only_when_asked() {
             texts: vec![def.0],
             ..WidgetDefs::default()
         },
+        bomb_up_to: Some(skin_model::Grade::Bad),
     })
     .unwrap();
     assert!(drawn(skin).1.is_empty());
@@ -510,6 +512,7 @@ fn bitmap_texts_fill_the_widget_quads() {
             numbers,
             ..WidgetDefs::default()
         },
+        bomb_up_to: Some(skin_model::Grade::Bad),
     };
     let skin = Skin::new(def(elements.clone(), Vec::new())).unwrap();
     assert_eq!(skin.quad_capacity(), MAX_WIDGET_QUADS);

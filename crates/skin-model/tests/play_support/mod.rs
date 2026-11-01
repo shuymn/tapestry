@@ -130,6 +130,10 @@ pub const GAUGES: [GaugeDesc; 2] = [
     },
 ];
 
+/// A notes' end past every frame these tests build, so `last_note` stays
+/// off unless a test sets its own.
+pub const NO_END: TimeUs = TimeUs(3_600_000 * MS);
+
 pub fn full(lead_in_ms: i64) -> PlayContext<'static> {
     PlayContext {
         gauges: &GAUGES,
@@ -139,6 +143,7 @@ pub fn full(lead_in_ms: i64) -> PlayContext<'static> {
         empty_poor_breaks_combo: false,
         scratch: Side::Left,
         ln_default: rules::LnMode::Ln,
+        last_note_end: NO_END,
     }
 }
 
@@ -207,6 +212,7 @@ pub fn def(whens: Vec<Program>, sheet: Sheet, elements: Vec<ElementDef>) -> Skin
         lanes: None,
         elements,
         widgets: skin_model::WidgetDefs::default(),
+        bomb_up_to: Some(skin_model::Grade::Bad),
     }
 }
 
@@ -263,6 +269,7 @@ pub struct Harness {
     pub offset: TimeUs,
     pub batch: QuadBatch,
     pub complete: bool,
+    pub playing: bool,
     pub target: [u32; 2],
     pub layout: Layout,
     pub view: LaneView,
@@ -282,6 +289,7 @@ impl Harness {
             offset: TimeUs(0),
             batch,
             complete: false,
+            playing: true,
             target: [1_920, 1_080],
             layout: Layout::AUTHOR,
             view: VIEW,
@@ -308,6 +316,7 @@ impl Harness {
             layout: &self.layout,
             lanes: self.view,
             loading: None,
+            playing: self.playing,
         };
         self.skin
             .build(&mut self.play, &frame, &self.uvs, &mut self.batch);

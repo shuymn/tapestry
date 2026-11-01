@@ -27,9 +27,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use bms_model::TimeUs;
 use skin_model::{
-    Anchor, Blend, CycleDef, Ease, ElementDef, Filter, Fit, KeyDef, LoadError, MAX_GEOMETRY, PLAY,
-    Place, Program, Region, RegionDef, Scope, Skin, SkinDef, Source, TimerRef, Track, Ty,
-    WidgetDefs, compile, timer as slot,
+    Anchor, Blend, CycleDef, Ease, ElementDef, Filter, Fit, Grade, KeyDef, LoadError, MAX_GEOMETRY,
+    Native, PLAY, Place, Program, Region, RegionDef, Scope, Skin, SkinDef, Source, TimerRef, Track,
+    Ty, WidgetDefs, compile, timer as slot,
 };
 
 pub use budget::ImportLimit;
@@ -53,12 +53,13 @@ use crate::header::Header;
 use crate::resolve::{Definition, Resolved, Tables, resolve};
 use crate::tree::{Kind, Scalar};
 
-/// What the user configured for one skin: the selected option items, the
-/// file chosen for each file choice, and the offsets.
+/// What the user configured for one skin: the item selected in each
+/// option, the file chosen for each file choice, and the offsets.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Config {
-    /// The selected option items' numbers.
-    pub options: BTreeSet<i32>,
+    /// Per option of the header, in its order: the selected item's
+    /// number, `None` for none. An option past the end selects none.
+    pub options: Vec<Option<i32>>,
     /// File choice name to the chosen candidate's name.
     pub files: BTreeMap<String, String>,
     pub offsets: BTreeMap<i32, OffsetValue>,
@@ -85,7 +86,7 @@ impl Config {
         let options = header
             .options
             .iter()
-            .filter_map(|o| {
+            .map(|o| {
                 let by_def = o
                     .def
                     .as_ref()
@@ -97,6 +98,13 @@ impl Config {
             options,
             ..Self::default()
         }
+    }
+
+    /// Every selected item's number: what the source tree's conditions
+    /// see (`JSONSkinLoader.java:254-260`).
+    #[must_use]
+    pub fn enabled(&self) -> BTreeSet<i32> {
+        self.options.iter().flatten().copied().collect()
     }
 }
 
@@ -143,8 +151,9 @@ pub fn import(
     header: &Header,
     config: &Config,
 ) -> Result<Imported, ImportError> {
-    let mut resolved = resolve(def, &config.options)?;
-    let tables = resolved.tables(&config.options)?;
+    let enabled = config.enabled();
+    let mut resolved = resolve(def, &enabled)?;
+    let tables = resolved.tables(&enabled)?;
     let Resolved { def, size, .. } = resolved;
     let mut files = Vec::new();
     let choices = Choices::new(header, config, &mut files);
@@ -156,6 +165,7 @@ pub fn import(
     let mut cx = Cx::new(def, header, config, tables, choices, r)?;
     let destinations = object::records(&cx.tables, "destination").to_vec();
     cx.span_hint = cx.lane_span_hint(&destinations);
+    cx.custom.judge_region = cx.judge_region(&destinations);
     for (index, rec) in destinations.into_iter().enumerate() {
         cx.destination(index, rec)?;
     }
@@ -255,8 +265,11 @@ pub(crate) struct Cx<'d> {
     custom: Custom,
     assets: Assets,
     choices: Choices,
-    /// Every declared option item's number.
-    declared: BTreeSet<i32>,
+    /// What a destination's numeric op reads of each declared option
+    /// item: whether it is its option's selection, a later option's entry
+    /// replacing an earlier one's for a shared number
+    /// (`JSONSkinLoader.java:291-297`).
+    items: BTreeMap<i32, bool>,
     whens: Vec<Program>,
     when_spans: Vec<Span>,
     ranks: [Option<u16>; 3],
@@ -304,11 +317,13 @@ impl<'d> Cx<'d> {
     ) -> Result<Self, ImportError> {
         let entry_dir = def.entry_dir().to_owned();
         let assets = Assets::new(def.root());
-        let declared = header
-            .options
-            .iter()
-            .flat_map(|o| o.items.iter().map(|i| i.op))
-            .collect();
+        let mut items = BTreeMap::new();
+        for (i, o) in header.options.iter().enumerate() {
+            let selected = config.options.get(i).copied().flatten();
+            for item in &o.items {
+                items.insert(item.op, Some(item.op) == selected);
+            }
+        }
         let mut cx = Self {
             def,
             header,
@@ -325,7 +340,7 @@ impl<'d> Cx<'d> {
             custom: Custom::default(),
             assets,
             choices,
-            declared,
+            items,
             whens: Vec::new(),
             when_spans: Vec::new(),
             ranks: [None; 3],
@@ -433,6 +448,29 @@ impl<'d> Cx<'d> {
         }
     }
 
+    /// Whether some destination draws a judge, read ahead of the walk: the
+    /// source makes the judge region for it whatever its conditions
+    /// (`JsonPlaySkinObjectLoader.java:226, 283-287`). A judge other than
+    /// index 0 refuses the import, as does a judge id an image, text,
+    /// slider, graph or LIFT shares, and a record this cannot read fails
+    /// the walk at or before it, so none needs an answer.
+    fn judge_region(&mut self, destinations: &[u32]) -> bool {
+        for &rec in destinations {
+            let Ok(id) = object::id_of(self.def, rec) else {
+                return false;
+            };
+            let Some(id) = id.filter(|id| !id.parse::<i32>().is_ok_and(|n| n < 0)) else {
+                continue;
+            };
+            match self.objects.lookup(self.def, &self.tables, &id) {
+                Ok(Some((Object::Judge, _))) => return true,
+                Ok(_) => {}
+                Err(_) => return false,
+            }
+        }
+        false
+    }
+
     /// The custom timers (`Skin.java:741-743`, `CustomTimer.java:20-58`):
     /// the last of an id wins; one in the built-in range has no effect.
     fn custom_timers(&mut self) -> Result<(), ImportError> {
@@ -452,7 +490,7 @@ impl<'d> Cx<'d> {
                 self.ignored(at, NoteKind::Timer(TimerWhy::CustomBuiltin(id)));
                 continue;
             }
-            self.custom.0.insert(id, target);
+            self.custom.aliases.insert(id, target);
         }
         Ok(())
     }
@@ -626,10 +664,33 @@ impl<'d> Cx<'d> {
         };
         // The source draws the character when its file exists and the
         // notes otherwise: one id cannot be both.
-        if object == Object::PmChara && self.objects.is_note(self.def, &self.tables, &id)? {
+        if object == Object::PmChara
+            && self
+                .objects
+                .names(self.def, &self.tables, &id, Object::Note)?
+        {
             return Err(ImportError::Critical {
                 at: self.loc(at),
                 part: CriticalPart::Lanes,
+                why: NoteKind::UnsupportedField { field: "id" },
+            });
+        }
+        // Likewise the source falls through to the judge, and makes its
+        // region, when an image's or LIFT's file or a text's font does not
+        // load or a slider or graph has no texture
+        // (`JsonSkinObjectLoader.java:71, 387-391, 396-416, 420-453, 628`,
+        // `JsonPlaySkinObjectLoader.java:31, 200-213, 283`): one id cannot
+        // be both.
+        if matches!(
+            object,
+            Object::Image | Object::Text | Object::Slider | Object::Graph | Object::LiftCover
+        ) && self
+            .objects
+            .names(self.def, &self.tables, &id, Object::Judge)?
+        {
+            return Err(ImportError::Critical {
+                at: self.loc(at),
+                part: CriticalPart::Judge,
                 why: NoteKind::UnsupportedField { field: "id" },
             });
         }
@@ -695,8 +756,11 @@ impl<'d> Cx<'d> {
     ) -> Result<Option<Common>, ImportError> {
         let text = o.text;
         let at = dst.span;
+        // The source draws it only while the mouse is inside its rect
+        // (`SkinObject.java:603-607`); the play has no mouse.
         if dst.mouse {
-            self.ignored(at, NoteKind::Ignored { field: "mouseRect" });
+            self.drop_el(role, at, NoteKind::UnsupportedField { field: "mouseRect" })?;
+            return Ok(None);
         }
         // Keys: charged as written before they are read, then as emitted
         // when more (a neutral track emits its first and last).
@@ -774,9 +838,9 @@ impl<'d> Cx<'d> {
                     if !seen.insert(*n) {
                         continue;
                     }
-                    ops::numeric(*n, &self.declared, &self.config.options)
+                    ops::numeric(*n, &self.items, self.custom.judge_region)
                 }
-                Op::Name(s) => match ops::named(s) {
+                Op::Name(s) => match ops::named(s, self.custom.judge_region) {
                     Some(c) => c,
                     None => {
                         let why = NoteKind::UnsupportedProperty {
@@ -796,7 +860,7 @@ impl<'d> Cx<'d> {
             Prop::Null => {}
             Prop::Id(n) => {
                 if ops::is_builtin(i32::try_from(n.unsigned_abs()).unwrap_or(0)) {
-                    let c = ops::numeric(*n, &BTreeSet::new(), &BTreeSet::new());
+                    let c = ops::numeric(*n, &BTreeMap::new(), self.custom.judge_region);
                     if !self.condition(role, at, c, &mut conds)? {
                         return Ok(None);
                     }
@@ -805,7 +869,7 @@ impl<'d> Cx<'d> {
                 }
             }
             Prop::Name(s) => {
-                let Some(c) = ops::named(s) else {
+                let Some(c) = ops::named(s, self.custom.judge_region) else {
                     let why = NoteKind::UnsupportedProperty {
                         kind: PropertyKind::Boolean,
                         id: None,
@@ -1135,6 +1199,11 @@ impl<'d> Cx<'d> {
 
     /// Adds an element and its location.
     fn push(&mut self, c: Common, source: Source, track: Track) {
+        self.push_native(c, source, track, None);
+    }
+
+    /// [`Self::push`] with the native size its quads keep.
+    fn push_native(&mut self, c: Common, source: Source, track: Track, native: Option<Native>) {
         self.elements.push(ElementDef {
             source,
             track,
@@ -1144,6 +1213,7 @@ impl<'d> Cx<'d> {
             clip: None,
             place: Place {
                 pivot: c.pivot,
+                native,
                 ..Place::SCREEN
             },
         });
@@ -1165,7 +1235,20 @@ impl<'d> Cx<'d> {
         self.opt_string(path, "path")
     }
 
+    /// The grades that give a bomb, from the top-level `judgetimer`
+    /// (`JsonSkin.java:20`, default 1): a judgment at or below it, PERFECT
+    /// 0 to empty POOR 5 (`play/JudgeManager.java:673`). Its whole domain
+    /// maps exactly: below 0 none, above 5 every grade.
+    fn bomb_up_to(&mut self) -> Result<Option<Grade>, ImportError> {
+        let [f] = self.def.fields(self.def.top(), ["judgetimer"]);
+        let n = self.int_or(f, "judgetimer", 1)?;
+        Ok(usize::try_from(n)
+            .ok()
+            .map(|i| Grade::ALL.get(i).copied().unwrap_or(Grade::EmptyPoor)))
+    }
+
     fn finish(mut self, files: Vec<FileChoice>) -> Result<Imported, ImportError> {
+        let bomb_up_to = self.bomb_up_to()?;
         let assets = std::mem::replace(&mut self.assets, Assets::new(self.def.root()));
         let sheet = assets.finish();
         let def = SkinDef {
@@ -1176,6 +1259,7 @@ impl<'d> Cx<'d> {
             lanes: self.lanes.as_ref().map(|l| l.def),
             elements: std::mem::take(&mut self.elements),
             widgets: std::mem::take(&mut self.widgets),
+            bomb_up_to,
         };
         let skin = Skin::new(def).map_err(|source| {
             let at = self.load_loc(&source);

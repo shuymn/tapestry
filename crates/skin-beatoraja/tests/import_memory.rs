@@ -146,14 +146,17 @@ fn ops_of(ops: &str) -> u32 {
 /// files, 65,536 ops, a note each, in 1,024 included files.
 fn f1(root: &Path) {
     // Two condition lists around 4 ops: x elements of the cheaper and the
-    // rest of the dearer reach 65,536 exactly.
+    // rest of the dearer reach 65,536 exactly. Every supported condition
+    // with a judge region's 241 aside (no element is left for a judge)
+    // costs more than 4, so the cheaper is none.
     let lists = [
-        "241",
+        "",
         "232",
-        "241,-241",
-        "232,241",
-        "232,-232",
-        "241,232,-241",
+        "-233",
+        "232,-233",
+        "-231,232",
+        "232,-233,-234",
+        "-231,232,-233",
     ];
     let costs: Vec<(String, u32)> = lists.iter().map(|l| ((*l).to_owned(), ops_of(l))).collect();
     let n = as_u32(MAX_ELEMENTS);
@@ -189,7 +192,7 @@ fn f1(root: &Path) {
                 &lo
             };
             format!(
-                r#"{{"id": "{i}", "op": [{ops}], "loop": 3, "mouseRect": {{}}, "dst": [
+                r#"{{"id": "{i}", "op": [{ops}], "loop": 3, "draw": 900, "dst": [
                     {{"time": 0, "w": 1, "h": 1}}, {{"time": 1, "x": 1}},
                     {{"time": 2, "x": 3}}, {{"time": 3, "x": 2}}]}}"#
             )
@@ -222,8 +225,8 @@ fn check_f1(_: &Header, i: Imported) {
     assert_eq!(i.skin.sheet().image_count(), MAX_ELEMENTS);
     assert_eq!(i.skin.sheet().frame_count(), MAX_SKIN_FRAMES);
     assert_eq!(i.skin.quad_capacity(), as_u32(MAX_ELEMENTS));
-    // Every element keeps its four keys: with the gauge at 25 % and a
-    // perfect judgment both conditions hold, and each key's x shows at
+    // Every element keeps its four keys: with the gauge at 25 % every
+    // condition holds, and each key's x shows at
     // its time (x 0, 1, 3, 2: no key lies on its neighbours' line).
     let mut d = Drawn::new(i.skin, 100);
     d.gauges[0].value = GaugeValue(25 * GaugeValue::PERCENT);
