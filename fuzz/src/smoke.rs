@@ -292,6 +292,11 @@ fn skin_json_seeds_resolve_or_fail_as_built() {
             "readouts",
             "selectors",
             "note_fallbacks",
+            "digit_offsets",
+            "digit_offset_fraction",
+            "digit_offset_unselected",
+            "digit_offset_stretch",
+            "digit_offset_rows_limit",
         ],
     );
     let imports: Vec<&str> = seeds::skin_imports().iter().map(|(n, _)| *n).collect();
@@ -337,6 +342,16 @@ fn skin_json_seeds_resolve_or_fail_as_built() {
                     ),
                 },
                 other => panic!("{name}: {:?}", other.map(|i| i.report)),
+            }
+            continue;
+        }
+        if let Some(want) = digit_offset_refusal(name) {
+            // The header resolves; the import refuses the table.
+            assert!(data.len() <= 64 * 1_024, "{name}: {} bytes", data.len());
+            let (_, imported) = skin_json(&data).unwrap_or_else(|e| panic!("{name}: {e}"));
+            match imported {
+                Err(e) => assert!(want(&e), "{name}: {e:?}"),
+                Ok(i) => panic!("{name}: {:?}", i.report),
             }
             continue;
         }
@@ -411,6 +426,55 @@ fn note_part_refusal(name: &str) -> Option<Option<NoteKind>> {
         "note_parts_null" => part("mine", PartWhy::NullEntry { index: 8 }),
         "note_parts_unsized" => part("note", PartWhy::MissingSize { lane: 2 }),
         "note_parts_broken" => Some(None),
+        _ => None,
+    }
+}
+
+/// The refusal a malformed digit offset seed meets: a row read exactly,
+/// a choice that must select a row, a row breaking its aspect stretch,
+/// and the resolved rows' cap.
+fn digit_offset_refusal(name: &str) -> Option<fn(&ImportError) -> bool> {
+    use skin_beatoraja::{CriticalPart, InputLimit};
+    match name {
+        "digit_offset_fraction" => Some(|e| {
+            matches!(
+                e,
+                ImportError::Type {
+                    field: "y",
+                    expected: "an integer",
+                    ..
+                }
+            )
+        }),
+        "digit_offset_unselected" => Some(|e| {
+            matches!(
+                e,
+                ImportError::Type {
+                    field: "offset",
+                    expected: "a row",
+                    ..
+                }
+            )
+        }),
+        "digit_offset_stretch" => Some(|e| {
+            matches!(
+                e,
+                ImportError::Critical {
+                    part: CriticalPart::ExScore,
+                    why: NoteKind::Stretch(1),
+                    ..
+                }
+            )
+        }),
+        "digit_offset_rows_limit" => Some(|e| {
+            matches!(
+                e,
+                ImportError::Input {
+                    limit: InputLimit::DigitOffsets,
+                    at: Some(_),
+                }
+            )
+        }),
         _ => None,
     }
 }
@@ -716,6 +780,17 @@ fn skin_import_seeds_import_and_draw_as_built() {
                 // The 100-tap chart: at 500 ms the eleven taps from 1 s to
                 // 1.1 s are on screen, in white.
                 assert_eq!(drawn, [0, 0, 11, 0], "{name}");
+            }
+            "digit_offsets" => {
+                // Four rows of the EX score's, a choice's and an included
+                // file's; one of the perfect count's; the combo's three,
+                // its trailing zero row dropped.
+                assert_eq!(u.resolved_digit_offsets, 4 + 1 + 3, "{name}");
+                assert_eq!(u.digit_offsets, 4 + 1 + 2, "{name}");
+                assert_eq!(i.skin.digit_offset_count(), 7, "{name}");
+                assert_eq!(kinds(&i), [], "{name}");
+                // "150", "1", and the grade with its combo of 1.
+                assert_eq!(drawn, [3 + 1 + 2; 4], "{name}");
             }
             _ => panic!("no expectation for seed {name}"),
         }
