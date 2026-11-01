@@ -315,7 +315,8 @@ pub fn draw(imported: &Imported) -> Vec<usize> {
             *slot = TextImage::new(uv, [0.0, 0.0, 1.0, 1.0], 1.0);
         }
     }
-    skin.attach_text(&mut play, TextTable::new(lines))
+    let table = TextTable::new(lines);
+    skin.attach_text(&mut play, table.clone())
         .expect("one line per slot");
     skin.attach_bitmap_text(&mut play, &text);
     let tally = Tally {
@@ -424,40 +425,31 @@ pub fn draw(imported: &Imported) -> Vec<usize> {
     choice_probes(skin, &chart, &uvs, &mut batch);
     bar_probes(skin, &ctx, (&tally, &states), &uvs, &mut batch);
     long_note_probes(skin, &ctx, (&tally, &states), &uvs, &mut batch);
-    loading_probes(skin, &text, &gauges[0], &uvs, &mut batch);
+    loading_probes(skin, (&text, &table), &gauges[0], &uvs, &mut batch);
     counts
 }
 
-/// The skin's loading state with the chart's lines installed, built as
+/// The skin's loading state with the chart's lines (`table`, the lines
+/// the play attached) installed, built as
 /// its clock and progress advance, with its gauge descriptor given,
 /// changed and taken away, the covers moving and the lines cleared, each
 /// frame inside the skin's capacities; a refused build refuses the state
 /// for good.
 fn loading_probes(
     skin: &skin_model::Skin,
-    text: &skin_model::ChartText<'_>,
+    (text, table): (&skin_model::ChartText<'_>, &skin_model::TextTable),
     desc: &skin_model::GaugeDesc,
     uvs: &skin_model::UvTable,
     batch: &mut skin_model::QuadBatch,
 ) {
     use bms_model::TimeUs;
     use skin_model::{
-        BuildError, FrameUv, GaugeLook, LaneView, Layout, LoadState, LoadingFrame, LoadingGauge,
-        Side, TextImage, TextSlots, TextTable,
+        BuildError, GaugeLook, LaneView, Layout, LoadState, LoadingFrame, LoadingGauge, Side,
+        TextSlots,
     };
 
     let mut loading = skin.prepare_loading(Side::Left);
-    let mut lines = vec![None; skin.text_slots()];
-    for r in skin.text_requests(text, [1_920, 1_080], &Layout::AUTHOR) {
-        let uv = FrameUv {
-            uv: [0.0, 0.0, 0.5, 0.5],
-            layer: 1,
-        };
-        if let Some(slot) = lines.get_mut(usize::from(r.slot)) {
-            *slot = TextImage::new(uv, [0.0, 0.0, 1.0, 1.0], 1.0);
-        }
-    }
-    skin.install_loading_text(&mut loading, TextSlots::ALL, &TextTable::new(lines))
+    skin.install_loading_text(&mut loading, TextSlots::ALL, table)
         .expect("one line per slot");
     skin.install_loading_bitmap_text(&mut loading, TextSlots::ALL, text);
     let normal = LoadingGauge::of(0, desc);
