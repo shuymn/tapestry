@@ -13,9 +13,9 @@ use image::{ImageFormat, Rgba, RgbaImage};
 use rules::{GaugeValue, Judgment};
 use skin_model::{
     Align, Anchor, Attach, Blend, ComboPart, CycleDef, DigitsDef, ElementDef, FileDef, Filter, Fit,
-    GaugeDef, GaugeDesc, GaugeLook, GaugeParts, GlyphSet, GradePart, ImageDef, JudgeDef, JudgeSlot,
-    LanesDef, LoadError, Motion, NumberDef, PLAY, Pad, Place, Program, Quad, Region, RegionDef,
-    Scope, Sheet, Skin, SkinDef, Source, TimerRef, Ty, WidgetDefs, compile, timer,
+    Follow, GaugeDef, GaugeDesc, GaugeLook, GaugeParts, GlyphSet, GradePart, ImageDef, JudgeDef,
+    JudgeSlot, LanesDef, LoadError, Motion, NumberDef, PLAY, Pad, Place, Program, Quad, Region,
+    RegionDef, Scope, Sheet, Skin, SkinDef, Source, TimerRef, Ty, WidgetDefs, compile, timer,
 };
 
 use crate::lanes_support::rect;
@@ -204,6 +204,7 @@ pub fn grade(image: u32, r: [i32; 4]) -> GradePart {
         blend: Blend::Alpha,
         visible: None,
         native: None,
+        follow: Follow::None,
     }
 }
 

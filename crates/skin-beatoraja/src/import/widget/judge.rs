@@ -267,6 +267,7 @@ impl Cx<'_> {
                 blend: c.blend,
                 visible: c.visible,
                 native,
+                follow: skin_model::Follow::None,
             },
             moved,
         )))

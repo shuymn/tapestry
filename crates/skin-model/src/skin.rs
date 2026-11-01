@@ -12,7 +12,7 @@ use crate::canvas::{Canvas, Fit, MAX_CANVAS, f32_of};
 use crate::expr::{CompileError, Program, SkinOps};
 use crate::image::Sheet;
 use crate::layout::{Controls, Layout, Region, RegionDef};
-use crate::place::{Bind, Bounds, Fill, Native, Place, Placement, Regions, union};
+use crate::place::{Bind, Bounds, Fill, Follow, Native, Place, Placement, Regions, union};
 use crate::play::schema::Grade;
 use crate::play::schema::timer::BUILTIN;
 use crate::play::{Play, PlayContext, PrepareError, SkinFrame};
@@ -23,7 +23,7 @@ use crate::widget::digits::{Align, Digits, Number, NumberDef, NumberError};
 use crate::widget::gauge::{Gauge, GaugeDef, GaugeDraw, GaugeError};
 use crate::widget::glyphs;
 use crate::widget::judge::{
-    ComboStrip, GradeImage, Judge, JudgeDef, JudgeDraw, JudgeError, JudgeSlot,
+    ComboStrip, GradeImage, Judge, JudgeDef, JudgeDraw, JudgeError, JudgePart, JudgeSlot,
 };
 use crate::widget::lanes::{Draw, LANE_QUADS, LANE_RESERVED, Lanes, LanesDef, LanesError, Side};
 use crate::widget::text::{
@@ -148,6 +148,10 @@ pub enum LoadError {
     FillOutsideScreen { element: usize },
     #[error("element {element}'s keys leave ±{MAX_COORD}")]
     Coordinates { element: usize },
+    #[error(
+        "element {element} follows the covers, which only an image, a number, a gauge or a text may"
+    )]
+    UnsupportedFollow { element: usize },
     #[error("element {element}'s widget track moves, sizes or rotates it")]
     WidgetGeometry { element: usize },
     #[error("the skin draws the lanes twice")]
@@ -221,6 +225,7 @@ struct Element {
     bind: Bind,
     fill: Fill,
     native: Option<Native>,
+    follow: Follow,
 }
 
 /// A loaded skin.
@@ -344,6 +349,50 @@ fn check_places(def: &SkinDef) -> Result<(), LoadError> {
         .position(|e| e.place.bind != Bind::None && lanes_in != Some(e.place.region))
     {
         return Err(LoadError::Unbound { element });
+    }
+    Ok(())
+}
+
+/// The follow checks of [`Skin::new`], in element order, with `reach` the
+/// lanes' length rounded up (0 without lanes): only an image, a number, a
+/// gauge or a text follows the covers, and every key of a follower, and
+/// of a followed grade of a judge an element draws, keeps its y within
+/// ±[`MAX_COORD`] when moved `reach` either way.
+fn check_follows(def: &SkinDef, reach: i64) -> Result<(), LoadError> {
+    let max = i64::from(MAX_COORD);
+    let moved_out = |t: &Track| {
+        t.rects().any(|[_, y, ..]| {
+            let y = i64::from(y);
+            y - reach < -max || y + reach > max
+        })
+    };
+    for (element, e) in def.elements.iter().enumerate() {
+        let follow = e.place.follow;
+        if follow != Follow::None {
+            if matches!(e.source, Source::Lanes | Source::Judge(_)) {
+                return Err(LoadError::UnsupportedFollow { element });
+            }
+            if moved_out(&e.track) {
+                return Err(LoadError::Coordinates { element });
+            }
+        }
+        if let Source::Judge(i) = e.source
+            && let Some(slot) = def.widgets.judges.get(index(i)).and_then(|j| {
+                JudgeSlot::ALL
+                    .into_iter()
+                    .zip(&j.grades)
+                    .find_map(|(s, g)| {
+                        g.as_ref()
+                            .filter(|g| g.follow != Follow::None && moved_out(&g.track))
+                            .map(|_| s)
+                    })
+            })
+        {
+            let error = JudgeError::Coordinates {
+                part: JudgePart::Grade(slot),
+            };
+            return Err(LoadError::Judge { element, error });
+        }
     }
     Ok(())
 }
@@ -574,7 +623,10 @@ impl Skin {
     /// without a fill and with every key's height positive and width not
     /// negative, one lanes widget in its region, bindings beside it); the
     /// widgets' parameters (a literal's length and characters); the
-    /// lanes' definition and geometry; the total
+    /// lanes' definition and geometry; the followers (only an image, a
+    /// number, a gauge or a text, or a judge's grade, follows the covers,
+    /// each key's y within ±[`MAX_COORD`] moved the lanes' length either
+    /// way); the total
     /// operations, each `when` charged once however many elements share
     /// it, then each visibility in element order, then per element its
     /// number's value or its judge parts' visibilities; and the widgets'
@@ -740,6 +792,7 @@ impl Skin {
                 Some(l)
             }
         };
+        check_follows(&def, lanes.map_or(0, LanesDef::reach))?;
         let mut ops = SkinOps::default();
         // Each element evaluates its own number's value and its judge's
         // part visibilities, so they are charged per referencing element.
@@ -810,6 +863,7 @@ impl Skin {
                         blend: g.blend,
                         visible: g.visible,
                         native: g.native,
+                        follow: g.follow,
                     })
                 }),
                 combos: j.combos.map(|c| {
@@ -867,6 +921,7 @@ impl Skin {
                 bind: e.place.bind,
                 fill: e.place.fill,
                 native: e.place.native,
+                follow: e.place.follow,
             })
             .collect();
         Ok(Self {
@@ -1170,8 +1225,9 @@ impl Skin {
     ///
     /// Each element shows its image's frame at the image's cycle timer:
     /// frame 0 while that timer is off, without a cycle, or with one frame.
-    /// An image element's quad is its sampled rect moved with its lane
-    /// (when bound), then by its fill or its region; its pivot is the
+    /// An image element's quad is its sampled rect moved by the covers it
+    /// follows ([`Follow`](crate::Follow)), then with its lane (when
+    /// bound), then by its fill or its region; its pivot is the
     /// named point of the sampled rect moved alike, and its angle turns
     /// the placed rect about it.
     ///
@@ -1220,6 +1276,9 @@ impl Skin {
             ) else {
                 continue;
             };
+            // The covers' motion, after the track and before the lane map
+            // and the region; lanes and judges never follow.
+            let rect = e.follow.translate(s.rect, lanes.as_ref());
             let affine = placement.affine(e.region, e.fill);
             let brush = Brush {
                 key: e.key,
@@ -1239,13 +1298,13 @@ impl Skin {
             match e.kind {
                 Kind::Image(image) => {
                     if let Some(f) = image.frame(play, frame.now, uvs) {
-                        brush.push(out, s.rect, f, image.filter);
+                        brush.push(out, rect, f, image.filter);
                     }
                 }
                 Kind::Number(i) => {
                     if let Some(n) = self.numbers.get(i) {
                         let v = n.value.eval(&state);
-                        n.digits.draw(v, s.rect, &brush, &at, out);
+                        n.digits.draw(v, rect, &brush, &at, out);
                     }
                 }
                 Kind::Gauge(i) => {
@@ -1256,7 +1315,7 @@ impl Skin {
                             shown: frame.gauge,
                             t,
                         };
-                        g.draw(&d, s.rect, &brush, out);
+                        g.draw(&d, rect, &brush, out);
                     }
                 }
                 Kind::Judge(i) => {
@@ -1266,6 +1325,7 @@ impl Skin {
                             state: &state,
                             affine,
                             map: brush.map,
+                            lanes: lanes.as_ref(),
                             color: s.color,
                             clip: e.key.clip,
                             scale: canvas.scale(),
@@ -1278,10 +1338,10 @@ impl Skin {
                         if let Some(Some(line)) =
                             play.bitmap().get(usize::from(t.slot)).filter(|_| bitmaps)
                         {
-                            t.draw_glyphs(line, s.rect, &brush, uvs, out);
+                            t.draw_glyphs(line, rect, &brush, uvs, out);
                         }
                     } else if let Some(image) = play.text().get(t.slot).filter(|_| texts) {
-                        t.draw(image, s.rect, &brush, out);
+                        t.draw(image, rect, &brush, out);
                     }
                 }
                 Kind::Lanes => {

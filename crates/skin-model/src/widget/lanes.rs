@@ -255,6 +255,20 @@ impl LanesDef {
             )
     }
 
+    /// The lane's length `H`, rounded up to a whole reference pixel: the
+    /// farthest a follower moves either way. For checked lanes it is at
+    /// most 2^22.
+    pub(crate) fn reach(&self) -> i64 {
+        match self.style {
+            LaneStyle::Simple => i64::from(self.line) - i64::from(self.top),
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "a checked source height is positive and at most 2^21"
+            )]
+            LaneStyle::Source(s) => f64::from(s.height).ceil() as i64,
+        }
+    }
+
     /// Checks the geometry: every width at least 1, every lane within
     /// ±[`MAX_COORD`], `top < line ≤ bottom` within it, heights of at
     /// least 1, the covers' extents and the hidden cover's trim line within
