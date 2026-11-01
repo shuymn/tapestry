@@ -93,6 +93,42 @@ pub fn sheet() -> Sheet {
     .unwrap()
 }
 
+/// [`sheet`] through a builder, with three generated images after its
+/// part images: white, yellow and red, 32×8, as an importer's fallback
+/// paint ([`FALLBACK`] on).
+pub fn fallback_sheet() -> Sheet {
+    let mut b = skin_model::SheetBuilder::new(&skin_model::Root::new(root()).unwrap());
+    for i in 0..SIZES.len() {
+        let file = b
+            .admit_file(FileDef {
+                path: format!("{i}.png"),
+                hi: None,
+            })
+            .unwrap();
+        b.add_image(ImageDef {
+            file,
+            rect: None,
+            grid: [1, 1],
+            cycle: None,
+            filter: Filter::Linear,
+        })
+        .unwrap();
+    }
+    for color in [[255; 4], [255, 255, 0, 255], [255, 0, 0, 255]] {
+        b.add_solid_image(skin_model::SolidImageDef {
+            size: [32, 8],
+            color,
+            filter: Filter::Nearest,
+        })
+        .unwrap();
+    }
+    b.finish()
+}
+
+/// The first generated image of [`fallback_sheet`]: the tap's; the long
+/// note's and the mine's follow.
+pub const FALLBACK: u32 = 12;
+
 /// A bar group of [`BAR`] over the span, bound to it, `h` tall from `y`
 /// at the line's position, following the lift, on `ready` in the
 /// playfield.
