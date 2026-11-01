@@ -1970,8 +1970,8 @@ fn track_loading(
 /// preparation and the installation of its lines, later builds as the
 /// clock, the progress, the target, the layout, the covers and the gauge
 /// descriptor change, with it given and taken away, and a refused build
-/// and one after it, which draw nothing. Over the play fixture its text
-/// and the elements on `loading` and `screen` draw, none on `ready`; over
+/// and one after it, which draw nothing. Over the play fixture the
+/// elements on `loading` and `screen` draw, none on `ready`; over
 /// the structural fixture its background, the lanes' line, the gauges'
 /// empty frames, the cover paints, the gauge look's choice and the `when`
 /// images draw, in the first build and in later ones.
