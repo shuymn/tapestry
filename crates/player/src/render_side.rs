@@ -37,6 +37,17 @@
 //! the skin refuses ([`Screen::build`]) also ends the play, but keeps the
 //! screen and its resources: nothing is drawn or built again for that play,
 //! and the next play's preparation readies the same screen afresh.
+//!
+//! An attempt's preparation is a request the render thread answers
+//! between frames, numbered by the link: a screen may take several polls
+//! to answer ([`Screen::prepare_attempt`]), and loading frames go on
+//! meanwhile. What a ready preparation staged is installed only by the
+//! commit of that request ([`RenderLink::commit_attempt`]), after the
+//! game's last checks; a cancelled, refused, timed out or superseded
+//! request is discarded, so an answer that comes late never installs.
+//! The declarative bundle committed is kept apart from the screen: a
+//! screen built again after a failure restores exactly it from memory
+//! ([`Screen::restore`]).
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
@@ -51,7 +62,9 @@ use eval::{JudgeEvent, Section};
 use game::{Chain, Preparation, PreparationRefusal, RenderSide, ResultGraphs};
 use input::QpcClock;
 use render::measure::{FrameStatistics, Presentation};
-use render::{FrameInput, FrameTiming, RenderError};
+use render::{
+    AttemptInput, CommitError, FrameInput, FrameTiming, PreparedToken, RenderError, SkinBundle,
+};
 use skin_model::{BuildError, PlayContext};
 
 use crate::attempt_context::AttemptContext;
@@ -69,11 +82,17 @@ pub trait Screen: Send {
     ///
     /// Why it cannot draw the chart.
     fn load(&mut self, chart: &Chart, section: Option<&Section>) -> Result<(), RenderError>;
-    /// Prepares `chart` for one attempt, `ctx`, borrowed for this call only,
-    /// and resets the play state. A skin that cannot draw the attempt
-    /// refuses it, and the screen stays usable for the menus. The default
-    /// prepares with [`load`](Self::load), the section's targets only for a
-    /// section, and takes its skin's refusal as the attempt's.
+    /// Prepares the attempt `a` (its chart, its context and its labels,
+    /// borrowed for this call only) for preparation request `request`,
+    /// staging `skin`'s installation when one is chosen, else readying the
+    /// skin in use; nothing it stages draws before its
+    /// [`commit`](Self::commit). `None` while the answer is not ready: it
+    /// is asked again between frames with the same attempt, until it
+    /// answers or the request is discarded. A skin that cannot draw the
+    /// attempt refuses it, and the screen stays usable for the menus. The
+    /// default prepares with [`load`](Self::load), the section's targets
+    /// only for a section, and takes its skin's refusal as the attempt's;
+    /// it refuses a declarative skin, which it cannot draw.
     ///
     /// # Errors
     ///
@@ -81,21 +100,52 @@ pub trait Screen: Send {
     /// built again.
     fn prepare_attempt(
         &mut self,
-        chart: &Chart,
-        ctx: &PlayContext<'_>,
-    ) -> Result<Preparation, RenderError> {
-        let section = match ctx.attempt {
-            skin_model::Attempt::Full { .. } => None,
-            skin_model::Attempt::Section(section) => Some(section),
-        };
-        match self.load(chart, section) {
-            Ok(()) => Ok(Preparation::Ready),
-            Err(RenderError::Skin(e)) => Ok(Preparation::Refused(PreparationRefusal {
-                location: None,
-                reason: e.reason,
-            })),
-            Err(e) => Err(e),
+        a: &AttemptInput<'_>,
+        skin: Option<&Arc<SkinBundle>>,
+        request: u64,
+    ) -> Option<Result<Preparation, RenderError>> {
+        let _ = request;
+        if skin.is_some() {
+            return Some(Ok(refusal("this screen draws no declarative skin")));
         }
+        Some(match self.load(a.chart, a.section()) {
+            Ok(()) => Ok(Preparation::Ready),
+            Err(RenderError::Skin(e)) => Ok(refusal(e.reason)),
+            Err(e) => Err(e),
+        })
+    }
+    /// Identifies the device this screen draws with: a screen built again
+    /// has another. The default is 0.
+    fn device(&self) -> u64 {
+        0
+    }
+    /// Installs what the preparation of `token` staged, whole, between
+    /// frames; with nothing staged (the skin in use was readied in place)
+    /// only the token's device is checked. The default installs nothing.
+    ///
+    /// # Errors
+    ///
+    /// Why it was not installed: nothing changes.
+    fn commit(&mut self, token: PreparedToken) -> Result<(), CommitError> {
+        if token.device == self.device() {
+            Ok(())
+        } else {
+            Err(CommitError::Device)
+        }
+    }
+    /// Drops what a preparation staged and was not committed. The default
+    /// has nothing to drop.
+    fn discard(&mut self) {}
+    /// Installs the committed `bundle` on a screen built again after a
+    /// failure, from memory, with no attempt prepared. The default
+    /// installs nothing.
+    ///
+    /// # Errors
+    ///
+    /// Why it could not be installed: the screen must be built again.
+    fn restore(&mut self, bundle: &Arc<SkinBundle>) -> Result<(), RenderError> {
+        let _ = bundle;
+        Ok(())
     }
     /// Waits until a frame may start; `false` on a timeout. Returns at
     /// once without a frame latency waitable object.
@@ -338,6 +388,14 @@ pub struct EndPage {
     pub graphs: Option<Arc<ResultGraphs>>,
 }
 
+/// An attempt's refusal for `reason`, at no location.
+pub(crate) fn refusal(reason: impl Into<String>) -> Preparation {
+    Preparation::Refused(PreparationRefusal {
+        location: None,
+        reason: reason.into(),
+    })
+}
+
 /// What the game thread tells the render thread.
 pub enum RenderMsg {
     /// Make sure the screen can draw, building it again if it failed (the
@@ -347,8 +405,10 @@ pub enum RenderMsg {
     /// Prepare the chart loaded last for this attempt, building the screen
     /// again first if it failed, and answer how the preparation ended: a
     /// refusal keeps the screen. Never [`Preparation::Cancelled`], which is
-    /// the game thread's.
+    /// the game thread's. It supersedes every earlier request.
     PrepareAttempt {
+        /// The request's number.
+        request: u64,
         /// The attempt, owned.
         attempt: Box<AttemptContext>,
         /// Where the answer goes.
@@ -364,6 +424,22 @@ pub enum RenderMsg {
         /// Where the answer goes.
         reply: mpsc::SyncSender<Result<(), RenderError>>,
     },
+    /// Install what the preparation of this request staged, and answer
+    /// whether it was: not when the request was discarded or superseded,
+    /// or its screen was built again since.
+    Commit {
+        /// The request.
+        request: u64,
+        /// Where the answer goes.
+        reply: mpsc::SyncSender<Result<(), CommitError>>,
+    },
+    /// Drop the preparation of this request, answered or not, unless
+    /// committed: it was cancelled, refused or timed out.
+    Discard(u64),
+    /// Prepare every later attempt with this declarative skin, or with the
+    /// skin in use (tests: production draws the simple skin).
+    #[cfg(test)]
+    Select(Option<Arc<SkinBundle>>),
     /// Draw the select screen's page instead of a play.
     Menu(Box<MenuPage>),
     /// Draw the play screen's loading state of this loading lifetime with
@@ -622,6 +698,8 @@ pub struct RenderLink {
     finish_timeout: Duration,
     /// The number of the last end page shown.
     end_pages: AtomicU64,
+    /// The number of the last attempt's preparation requested.
+    requests: AtomicU64,
 }
 
 impl RenderLink {
@@ -693,11 +771,12 @@ impl RenderLink {
         self.answer(&rx)
     }
 
-    /// Prepares the chart loaded last for `attempt` and waits for the
-    /// answer, at most the answer's bound, looking at `cancelled` every
-    /// [`CANCEL_POLL`]: once it says so, the preparation is
-    /// [`Preparation::Cancelled`] without waiting further, and its answer
-    /// goes nowhere.
+    /// Prepares the chart loaded last for `attempt`, as a new request that
+    /// supersedes the ones before, and waits for the answer, at most the
+    /// answer's bound, looking at `cancelled` every [`CANCEL_POLL`]: once
+    /// it says so, the preparation is [`Preparation::Cancelled`] without
+    /// waiting further. A cancelled or timed out request is discarded, so
+    /// its answer, however late, installs nothing.
     ///
     /// # Errors
     ///
@@ -709,8 +788,10 @@ impl RenderLink {
         attempt: AttemptContext,
         cancelled: impl Fn() -> bool,
     ) -> Result<Preparation, ScreenError> {
+        let request = self.requests.fetch_add(1, Ordering::Relaxed) + 1;
         let (reply, rx) = mpsc::sync_channel(1);
         self.send(RenderMsg::PrepareAttempt {
+            request,
             attempt: Box::new(attempt),
             reply,
         });
@@ -723,12 +804,52 @@ impl RenderLink {
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
             }
             if cancelled() {
+                self.send(RenderMsg::Discard(request));
                 return Ok(Preparation::Cancelled);
             }
             if Instant::now() >= deadline {
+                self.send(RenderMsg::Discard(request));
                 return Err(ScreenError::NoAnswer);
             }
         }
+    }
+
+    /// Installs what the last attempt's preparation staged, and waits
+    /// until it is, at most the answer's bound.
+    ///
+    /// # Errors
+    ///
+    /// [`ScreenError::Lost`] when it was not installed: the request was
+    /// discarded or superseded, or the screen was built again since it
+    /// was prepared; [`ScreenError::NoAnswer`] past the bound and
+    /// [`ScreenError::Ended`] when the render thread is gone.
+    pub fn commit_attempt(&self) -> Result<(), ScreenError> {
+        let request = self.requests.load(Ordering::Relaxed);
+        let (reply, rx) = mpsc::sync_channel(1);
+        self.send(RenderMsg::Commit { request, reply });
+        match rx.recv_timeout(self.answer_timeout) {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => {
+                eprintln!("render: the attempt was not installed: {e}");
+                Err(ScreenError::Lost)
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(ScreenError::NoAnswer),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(ScreenError::Ended),
+        }
+    }
+
+    /// Drops what the last attempt's preparation staged, if it was not
+    /// committed; it never installs.
+    pub fn discard_attempt(&self) {
+        self.send(RenderMsg::Discard(self.requests.load(Ordering::Relaxed)));
+    }
+
+    /// Prepares every later attempt with the declarative `skin`, or with
+    /// the skin in use for `None` (tests: production draws the simple
+    /// skin).
+    #[cfg(test)]
+    pub fn select(&self, skin: Option<Arc<SkinBundle>>) {
+        self.send(RenderMsg::Select(skin));
     }
 
     /// Prepares `chart` for every play from now on, and waits until it is.
@@ -916,7 +1037,7 @@ pub fn spawn(
             let _ended = ended_tx;
             #[cfg(feature = "dev-tools")]
             crate::alloc_count::tag(crate::alloc_count::Tag::Render);
-            let screen = match build(&mut make, chart.as_deref(), section.as_ref()) {
+            let screen = match build(&mut make, None, chart.as_deref(), section.as_ref()) {
                 Ok(screen) => {
                     let _ = ready_tx.send(Ok(()));
                     screen
@@ -941,6 +1062,10 @@ pub fn spawn(
                 granted: false,
                 extent: None,
                 applied: None,
+                selected: None,
+                committed: None,
+                attempt: None,
+                prepared: None,
                 #[cfg(feature = "dev-tools")]
                 menu_stats: crate::dev::MenuStats::default(),
                 #[cfg(feature = "dev-tools")]
@@ -959,6 +1084,7 @@ pub fn spawn(
             exit_timeout: EXIT_TIMEOUT,
             finish_timeout: FINISH_TIMEOUT,
             end_pages: AtomicU64::new(0),
+            requests: AtomicU64::new(0),
         }),
         Ok(Err(e)) => {
             let _ = handle.join();
@@ -984,12 +1110,18 @@ fn after_preparing(mode: Mode) -> Mode {
     }
 }
 
+/// A screen made afresh, with the `committed` bundle restored and `chart`
+/// loaded.
 fn build(
     make: &mut MakeScreen,
+    committed: Option<&Arc<SkinBundle>>,
     chart: Option<&Chart>,
     section: Option<&Section>,
 ) -> Result<Box<dyn Screen>, RenderError> {
     let mut s = make()?;
+    if let Some(bundle) = committed {
+        s.restore(bundle)?;
+    }
     if let Some(chart) = chart {
         s.load(chart, section)?;
     }
@@ -1022,6 +1154,22 @@ enum Mode {
     },
 }
 
+/// An attempt's preparation the screen has not answered yet.
+struct Preparing {
+    request: u64,
+    attempt: Box<AttemptContext>,
+    /// The declarative skin it stages, if one is chosen.
+    skin: Option<Arc<SkinBundle>>,
+    reply: mpsc::SyncSender<Result<Preparation, RenderError>>,
+}
+
+/// An attempt's preparation answered ready: its token and the declarative
+/// skin it staged, if any.
+struct Prepared {
+    token: PreparedToken,
+    skin: Option<Arc<SkinBundle>>,
+}
+
 struct Run {
     screen: Option<Box<dyn Screen>>,
     /// When the render thread started: the launch screen's time runs from it.
@@ -1048,6 +1196,16 @@ struct Run {
     /// The size last applied to the screen; `None` until one is, and for
     /// a screen built again.
     applied: Option<(u32, u32)>,
+    /// The declarative skin later attempts are prepared with; `None`
+    /// prepares the skin in use (tests choose one).
+    selected: Option<Arc<SkinBundle>>,
+    /// The declarative bundle committed last, kept apart from the screen:
+    /// a screen built again restores exactly it.
+    committed: Option<Arc<SkinBundle>>,
+    /// The attempt's preparation not yet answered.
+    attempt: Option<Preparing>,
+    /// The attempt's preparation answered ready and not yet committed.
+    prepared: Option<Prepared>,
     /// The select screen's frames (dev-tools).
     #[cfg(feature = "dev-tools")]
     menu_stats: crate::dev::MenuStats,
@@ -1062,7 +1220,14 @@ impl Run {
         let mut effects: Vec<JudgeEvent> = Vec::with_capacity(self.view.effects);
         loop {
             let idle = matches!(mode, Mode::Idle) || self.screen.is_none();
-            let msg = if idle {
+            let msg = if idle && self.attempt.is_some() {
+                // A preparation not yet answered is asked again between
+                // messages.
+                rx.recv_timeout(CANCEL_POLL).map_err(|e| match e {
+                    mpsc::RecvTimeoutError::Timeout => TryRecvError::Empty,
+                    mpsc::RecvTimeoutError::Disconnected => TryRecvError::Disconnected,
+                })
+            } else if idle {
                 rx.recv().map_err(|_| TryRecvError::Disconnected)
             } else {
                 rx.try_recv()
@@ -1080,7 +1245,9 @@ impl Run {
                     Ok(RenderMsg::Loading(_)
                         | RenderMsg::Load { .. }
                         | RenderMsg::Prepare(_)
-                        | RenderMsg::PrepareAttempt { .. })
+                        | RenderMsg::PrepareAttempt { .. }
+                        | RenderMsg::Commit { .. }
+                        | RenderMsg::Discard(_))
                 )
             {
                 self.loading_stats.report("loading");
@@ -1173,10 +1340,31 @@ impl Run {
                     mode = after_preparing(mode);
                     continue;
                 }
-                Ok(RenderMsg::PrepareAttempt { attempt, reply }) => {
-                    let answer = self.prepare_attempt(&attempt);
-                    let _ = reply.send(answer);
+                Ok(RenderMsg::PrepareAttempt {
+                    request,
+                    attempt,
+                    reply,
+                }) => {
+                    self.begin_attempt(Preparing {
+                        request,
+                        attempt,
+                        skin: self.selected.clone(),
+                        reply,
+                    });
                     mode = after_preparing(mode);
+                    continue;
+                }
+                Ok(RenderMsg::Commit { request, reply }) => {
+                    let _ = reply.send(self.commit(request));
+                    continue;
+                }
+                Ok(RenderMsg::Discard(request)) => {
+                    self.discard(request);
+                    continue;
+                }
+                #[cfg(test)]
+                Ok(RenderMsg::Select(skin)) => {
+                    self.selected = skin;
                     continue;
                 }
                 Ok(RenderMsg::Play {
@@ -1231,6 +1419,7 @@ impl Run {
                 Ok(RenderMsg::Exit) | Err(TryRecvError::Disconnected) => return,
                 Err(TryRecvError::Empty) => {}
             }
+            self.poll_attempt();
             let Some(screen) = &mut self.screen else {
                 continue;
             };
@@ -1503,7 +1692,13 @@ impl Run {
     fn recover(&mut self) -> Result<(), RenderError> {
         if self.screen.is_none() {
             self.granted = false;
-            self.screen = Some((self.make)()?);
+            let mut screen = (self.make)()?;
+            // The committed bundle, from memory: never read again from its
+            // files, never another skin in its place.
+            if let Some(bundle) = &self.committed {
+                screen.restore(bundle)?;
+            }
+            self.screen = Some(screen);
             // The new screen takes the window's size afresh.
             self.applied = None;
         }
@@ -1511,23 +1706,142 @@ impl Run {
         Ok(())
     }
 
-    /// Prepares the chart loaded last for `attempt`, recovering the screen
-    /// first. A refusal keeps the screen and reports no failure; an error
-    /// drops it, to be built again.
-    fn prepare_attempt(&mut self, attempt: &AttemptContext) -> Result<Preparation, RenderError> {
-        self.recover()?;
-        let (Some(screen), Some(chart)) = (&mut self.screen, self.chart.as_deref()) else {
-            return Ok(Preparation::Refused(PreparationRefusal {
-                location: None,
-                reason: "no chart is loaded".to_owned(),
-            }));
+    /// Starts preparing the chart loaded last for `p`, recovering the
+    /// screen first: whatever an earlier request staged is discarded, and
+    /// `p` is asked of the screen at once and between frames until it
+    /// answers ([`poll_attempt`](Self::poll_attempt)).
+    fn begin_attempt(&mut self, p: Preparing) {
+        self.attempt = None;
+        self.drop_prepared();
+        if let Err(e) = self.recover() {
+            let _ = p.reply.send(Err(e));
+            return;
+        }
+        self.attempt = Some(p);
+        self.poll_attempt();
+    }
+
+    /// Asks the screen for the answer of the preparation in progress, and
+    /// sends it once there is one: ready, it is kept for its commit. A
+    /// refusal keeps the screen and reports no failure; an error drops it,
+    /// to be built again. A screen dropped meanwhile is built again first.
+    fn poll_attempt(&mut self) {
+        if self.attempt.is_none() {
+            return;
+        }
+        if self.screen.is_none()
+            && let Err(e) = self.recover()
+        {
+            self.answer(Err(e));
+            return;
+        }
+        if self.chart.is_none() {
+            self.answer(Ok(refusal("no chart is loaded")));
+            return;
+        }
+        let (Some(p), Some(screen), Some(chart)) =
+            (&self.attempt, &mut self.screen, self.chart.as_deref())
+        else {
+            return;
         };
-        let answer = screen.prepare_attempt(chart, &attempt.context());
+        let base = p.attempt.context();
+        // A declarative skin's lanes are laid out for its own scratch side.
+        let context = match &p.skin {
+            Some(bundle) => PlayContext {
+                scratch: bundle.scratch(),
+                ..base
+            },
+            None => base,
+        };
+        let text = p.attempt.text();
+        let a = AttemptInput {
+            chart,
+            context: &context,
+            text: &text,
+            target: screen.target(),
+        };
+        let Some(answer) = screen.prepare_attempt(&a, p.skin.as_ref(), p.request) else {
+            return;
+        };
+        if matches!(answer, Ok(Preparation::Ready)) {
+            self.prepared = Some(Prepared {
+                token: PreparedToken {
+                    request: p.request,
+                    device: screen.device(),
+                },
+                skin: p.skin.clone(),
+            });
+        }
         if answer.is_err() {
             self.screen = None;
             self.granted = false;
         }
-        answer
+        self.answer(answer);
+    }
+
+    /// Sends the preparation in progress its `answer`, and ends it.
+    fn answer(&mut self, answer: Result<Preparation, RenderError>) {
+        if let Some(p) = self.attempt.take() {
+            let _ = p.reply.send(answer);
+        }
+    }
+
+    /// Installs what the preparation of `request` staged: it must be the
+    /// one answered ready last, on the screen it was prepared on (its
+    /// device's). Another request's commit changes nothing; one refused by
+    /// the screen discards the staging. Committed, a declarative bundle is
+    /// kept for a screen built again.
+    fn commit(&mut self, request: u64) -> Result<(), CommitError> {
+        let Some(staged) = self.prepared.as_ref().map(|p| p.token.request) else {
+            return Err(CommitError::NothingStaged);
+        };
+        if staged != request {
+            return Err(CommitError::Request {
+                staged,
+                asked: request,
+            });
+        }
+        let Some(p) = self.prepared.take() else {
+            return Err(CommitError::NothingStaged);
+        };
+        let Some(screen) = &mut self.screen else {
+            return Err(CommitError::Device);
+        };
+        if let Err(e) = screen.commit(p.token) {
+            screen.discard();
+            return Err(e);
+        }
+        if p.skin.is_some() {
+            self.committed = p.skin;
+        }
+        Ok(())
+    }
+
+    /// Drops the preparation of `request`, in progress or answered, unless
+    /// committed: what it staged never installs.
+    fn discard(&mut self, request: u64) {
+        if self.attempt.as_ref().is_some_and(|p| p.request == request) {
+            self.attempt = None;
+            if let Some(screen) = &mut self.screen {
+                screen.discard();
+            }
+        }
+        if self
+            .prepared
+            .as_ref()
+            .is_some_and(|p| p.token.request == request)
+        {
+            self.drop_prepared();
+        }
+    }
+
+    /// Drops the preparation answered ready and not committed, if any.
+    fn drop_prepared(&mut self) {
+        if self.prepared.take().is_some()
+            && let Some(screen) = &mut self.screen
+        {
+            screen.discard();
+        }
     }
 
     /// Prepares the chart loaded last and resets the screen's play state,
@@ -1538,7 +1852,7 @@ impl Run {
         let ready = match (&mut self.screen, chart) {
             (Some(s), Some(chart)) => s.load(chart, section),
             (Some(_), None) => Ok(()),
-            (None, _) => build(&mut self.make, chart, section).map(|s| {
+            (None, _) => build(&mut self.make, self.committed.as_ref(), chart, section).map(|s| {
                 self.screen = Some(s);
                 // The new screen takes the window's size afresh.
                 self.applied = None;
@@ -4658,5 +4972,479 @@ mod tests {
         assert_eq!(resized.first(), Some(&(1, 800, 600)));
         assert_eq!(resized.iter().filter(|r| r.0 == 2).count(), 1);
         assert_eq!(builds.load(Ordering::SeqCst), 2);
+    }
+
+    /// A real declarative bundle with nothing to draw: no image, no
+    /// element, its lanes laid out for the right scratch side, which no
+    /// attempt of the simple skin's has.
+    fn bundle() -> Arc<render::SkinBundle> {
+        use skin_model::{Anchor, AtlasLimits, Fit, Region, RegionDef, Sheet, SkinDef, Variant};
+        let sheet = Sheet::new(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")),
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        let skin = skin_model::Skin::new(SkinDef {
+            fit: Fit::Fixed,
+            regions: [RegionDef {
+                anchor: Anchor::TopLeft,
+                optional: false,
+            }; Region::COUNT],
+            whens: Vec::new(),
+            sheet,
+            lanes: None,
+            elements: Vec::new(),
+            widgets: skin_model::WidgetDefs::default(),
+            bomb_up_to: None,
+        })
+        .unwrap();
+        let limits = AtlasLimits {
+            max_side: 256,
+            max_layers: 4,
+            reserved_layers: 1,
+        };
+        let atlas = skin.atlas(Variant::Lo, limits).unwrap();
+        let clips = render::ClipTable::new(Vec::new()).unwrap();
+        Arc::new(
+            render::SkinBundle::new(Arc::new(skin), atlas, clips, skin_model::Side::Right).unwrap(),
+        )
+    }
+
+    /// The attempt of `chart`'s whole play with the title "T".
+    fn titled(chart: &Chart) -> AttemptContext {
+        let labels = game::ChartLabels {
+            title: "T".to_owned(),
+            ..game::ChartLabels::default()
+        };
+        let attempt = game::Attempt::new(
+            1,
+            &rules::tapestry(),
+            TimeUs(1_000_000),
+            None,
+            game::NoteEnd::Play.of(chart),
+            &labels,
+        );
+        AttemptContext::new(attempt, crate::attempt_context::SIMPLE_SCRATCH)
+    }
+
+    /// What an [`Installer`] was asked, in order.
+    type Log = Arc<std::sync::Mutex<Vec<String>>>;
+
+    /// A screen that stages a declarative skin's installation as the
+    /// renderer does, noting each step with its device: a preparation
+    /// answered (`prepare` with its request, the context's scratch side
+    /// and the attempt's title), a commit, a discard and a restore. While
+    /// `hold` is set, its preparations do not answer. Its menu frames fail
+    /// while `fail` is set; it counts its loading frames.
+    struct Installer {
+        device: u64,
+        hold: Arc<AtomicBool>,
+        fail: Arc<AtomicBool>,
+        loading: Arc<AtomicU32>,
+        log: Log,
+        restored: Arc<std::sync::Mutex<Vec<Arc<render::SkinBundle>>>>,
+    }
+
+    impl Installer {
+        fn note(&self, step: &str) {
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("{} {step}", self.device));
+        }
+    }
+
+    impl Screen for Installer {
+        fn load(
+            &mut self,
+            _chart: &Chart,
+            _section: Option<&eval::Section>,
+        ) -> Result<(), RenderError> {
+            Ok(())
+        }
+        fn prepare_attempt(
+            &mut self,
+            a: &render::AttemptInput<'_>,
+            skin: Option<&Arc<render::SkinBundle>>,
+            request: u64,
+        ) -> Option<Result<Preparation, RenderError>> {
+            if self.hold.load(Ordering::Acquire) {
+                return None;
+            }
+            assert!(skin.is_some());
+            self.note(&format!(
+                "prepare {request} {:?} {}",
+                a.context.scratch, a.text.title
+            ));
+            Some(Ok(Preparation::Ready))
+        }
+        fn device(&self) -> u64 {
+            self.device
+        }
+        fn commit(&mut self, token: render::PreparedToken) -> Result<(), render::CommitError> {
+            if token.device != self.device {
+                return Err(render::CommitError::Device);
+            }
+            self.note(&format!("commit {}", token.request));
+            Ok(())
+        }
+        fn discard(&mut self) {
+            self.note("discard");
+        }
+        fn restore(&mut self, bundle: &Arc<render::SkinBundle>) -> Result<(), RenderError> {
+            self.note("restore");
+            self.restored.lock().unwrap().push(Arc::clone(bundle));
+            Ok(())
+        }
+        fn wait(&self) -> bool {
+            true
+        }
+        fn paced(&self) -> bool {
+            false
+        }
+        fn build(&mut self, _f: &FrameInput<'_>) -> Result<(), skin_model::BuildError> {
+            Ok(())
+        }
+        fn draw(&mut self) -> Result<FrameTiming, RenderError> {
+            Ok(timing(true))
+        }
+        fn text(&mut self, _lines: &[&str]) -> Result<bool, RenderError> {
+            Ok(true)
+        }
+        fn menu(
+            &mut self,
+            _page: &crate::menu_screen::MenuPage,
+            _changed: bool,
+        ) -> Result<FrameTiming, RenderError> {
+            if self.fail.load(Ordering::Acquire) {
+                return Err(RenderError::SurfaceLost);
+            }
+            Ok(timing(true))
+        }
+        fn loading(
+            &mut self,
+            _page: &crate::menu_screen::MenuPage,
+            _update: Option<&LoadingUpdate>,
+            _changed: bool,
+        ) -> Result<FrameTiming, RenderError> {
+            self.loading.fetch_add(1, Ordering::AcqRel);
+            Ok(timing(true))
+        }
+        #[cfg(feature = "dev-tools")]
+        fn read_back(&self) -> Option<(u32, u32, Vec<u8>)> {
+            None
+        }
+    }
+
+    /// The shared state of the [`Installer`]s a render thread builds,
+    /// their devices numbered from 1.
+    #[derive(Clone, Default)]
+    struct Installers {
+        builds: Arc<AtomicU32>,
+        hold: Arc<AtomicBool>,
+        fail: Arc<AtomicBool>,
+        loading: Arc<AtomicU32>,
+        log: Log,
+        restored: Arc<std::sync::Mutex<Vec<Arc<render::SkinBundle>>>>,
+    }
+
+    impl Installers {
+        /// A render thread on these installers with `chart` loaded and
+        /// `skin` chosen for its attempts.
+        fn spawn(&self, chart: &Arc<Chart>, skin: &Arc<render::SkinBundle>) -> super::RenderLink {
+            let shared = self.clone();
+            let make: MakeScreen = Box::new(move || {
+                let device = u64::from(shared.builds.fetch_add(1, Ordering::SeqCst) + 1);
+                Ok(Box::new(Installer {
+                    device,
+                    hold: Arc::clone(&shared.hold),
+                    fail: Arc::clone(&shared.fail),
+                    loading: Arc::clone(&shared.loading),
+                    log: Arc::clone(&shared.log),
+                    restored: Arc::clone(&shared.restored),
+                }) as Box<dyn Screen>)
+            });
+            let link = spawn_empty(make);
+            link.load(Arc::clone(chart), None).unwrap();
+            link.select(Some(Arc::clone(skin)));
+            link
+        }
+
+        fn log(&self) -> Vec<String> {
+            self.log.lock().unwrap().clone()
+        }
+    }
+
+    /// A ready preparation installs only by its own request's commit:
+    /// prepared with the chosen bundle's scratch side and the attempt's
+    /// labels, it is committed; one superseded by the next request is
+    /// discarded, and a commit naming it changes nothing and leaves the
+    /// newer one to commit; one discarded (refused, cancelled) cannot be
+    /// committed.
+    #[test]
+    fn an_attempt_installs_only_by_its_own_commit() {
+        let chart = Arc::new(ChartBuilder::new(120_000).build().unwrap());
+        let skin = bundle();
+        let screens = Installers::default();
+        let link = screens.spawn(&chart, &skin);
+        let ready = |link: &super::RenderLink| link.prepare_attempt(titled(&chart), || false);
+
+        assert_eq!(ready(&link).unwrap(), Preparation::Ready);
+        link.commit_attempt().unwrap();
+        // Request 2, superseded by 3 before its commit.
+        assert_eq!(ready(&link).unwrap(), Preparation::Ready);
+        assert_eq!(ready(&link).unwrap(), Preparation::Ready);
+        let (reply, rx) = std::sync::mpsc::sync_channel(1);
+        link.send(RenderMsg::Commit { request: 2, reply });
+        assert_eq!(
+            rx.recv().unwrap(),
+            Err(render::CommitError::Request {
+                staged: 3,
+                asked: 2
+            })
+        );
+        link.commit_attempt().unwrap();
+        // Request 4, discarded.
+        assert_eq!(ready(&link).unwrap(), Preparation::Ready);
+        link.discard_attempt();
+        assert!(matches!(link.commit_attempt(), Err(ScreenError::Lost)));
+        link.exit();
+        assert_eq!(
+            screens.log(),
+            [
+                "1 prepare 1 Right T",
+                "1 commit 1",
+                "1 prepare 2 Right T",
+                "1 discard",
+                "1 prepare 3 Right T",
+                "1 commit 3",
+                "1 prepare 4 Right T",
+                "1 discard",
+            ]
+        );
+    }
+
+    /// While a preparation is held unanswered, loading frames go on being
+    /// presented; released, it answers. A preparation cancelled while held,
+    /// or past the answer's bound, is discarded: released later, it never
+    /// answers or installs, and its commit is refused.
+    #[test]
+    fn loading_frames_go_on_while_a_preparation_is_held() {
+        let chart = Arc::new(ChartBuilder::new(120_000).build().unwrap());
+        let skin = bundle();
+        let screens = Installers::default();
+        let mut link = screens.spawn(&chart, &skin);
+        let frames = || screens.loading.load(Ordering::Acquire);
+        link.loading().show(one_line("loading"));
+        assert!(wait_until(|| frames() > 0));
+
+        // Held until three more loading frames were presented.
+        screens.hold.store(true, Ordering::Release);
+        let from = frames();
+        let ready = link.prepare_attempt(titled(&chart), || {
+            if frames() >= from + 3 {
+                screens.hold.store(false, Ordering::Release);
+            }
+            false
+        });
+        assert_eq!(ready.unwrap(), Preparation::Ready);
+        assert!(frames() >= from + 3);
+        link.commit_attempt().unwrap();
+
+        // Cancelled while held, then released: the late answer never
+        // comes, and nothing commits.
+        screens.hold.store(true, Ordering::Release);
+        let from = frames();
+        let cancelled = link.prepare_attempt(titled(&chart), || frames() >= from + 3);
+        assert_eq!(cancelled.unwrap(), Preparation::Cancelled);
+        screens.hold.store(false, Ordering::Release);
+        let from = frames();
+        assert!(wait_until(|| frames() >= from + 3));
+        assert!(matches!(link.commit_attempt(), Err(ScreenError::Lost)));
+
+        // Past the bound while held: the same.
+        link.set_timeouts(Duration::from_millis(100), Duration::from_secs(5));
+        screens.hold.store(true, Ordering::Release);
+        let late = link.prepare_attempt(titled(&chart), || false);
+        assert!(matches!(late, Err(ScreenError::NoAnswer)), "{late:?}");
+        screens.hold.store(false, Ordering::Release);
+        let from = frames();
+        assert!(wait_until(|| frames() >= from + 3));
+        link.set_timeouts(Duration::from_secs(10), Duration::from_secs(5));
+        assert!(matches!(link.commit_attempt(), Err(ScreenError::Lost)));
+        link.exit();
+        assert_eq!(
+            screens.log(),
+            [
+                "1 prepare 1 Right T",
+                "1 commit 1",
+                "1 discard",
+                "1 discard"
+            ]
+        );
+    }
+
+    /// A screen built again after a failure restores the bundle committed
+    /// last, the very one, before anything else; a preparation answered on
+    /// the failed screen is refused at its commit by its device, and the
+    /// next attempt prepares and commits on the new screen.
+    #[test]
+    fn a_screen_built_again_restores_the_committed_bundle() {
+        let chart = Arc::new(ChartBuilder::new(120_000).build().unwrap());
+        let skin = bundle();
+        let screens = Installers::default();
+        let link = screens.spawn(&chart, &skin);
+        let ready = |link: &super::RenderLink| link.prepare_attempt(titled(&chart), || false);
+        assert_eq!(ready(&link).unwrap(), Preparation::Ready);
+        link.commit_attempt().unwrap();
+        assert_eq!(ready(&link).unwrap(), Preparation::Ready);
+
+        screens.fail.store(true, Ordering::Release);
+        link.send(RenderMsg::Menu(Box::default()));
+        assert!(wait_until(|| link.failed()));
+        screens.fail.store(false, Ordering::Release);
+        link.prepare().unwrap();
+        assert_eq!(screens.builds.load(Ordering::SeqCst), 2);
+        let restored = screens.restored.lock().unwrap().clone();
+        assert_eq!(restored.len(), 1);
+        assert!(Arc::ptr_eq(&restored[0], &skin));
+        assert!(matches!(link.commit_attempt(), Err(ScreenError::Lost)));
+
+        assert_eq!(ready(&link).unwrap(), Preparation::Ready);
+        link.commit_attempt().unwrap();
+        link.exit();
+        assert_eq!(
+            screens.log(),
+            [
+                "1 prepare 1 Right T",
+                "1 commit 1",
+                "1 prepare 2 Right T",
+                "2 restore",
+                "2 discard",
+                "2 prepare 3 Right T",
+                "2 commit 3",
+            ]
+        );
+    }
+
+    /// Each frame's effect sequence numbers and play phase.
+    type Adaptations = Arc<std::sync::Mutex<Vec<(Vec<u64>, bool)>>>;
+
+    /// A screen that builds every play frame through the declarative
+    /// skin's frame adapter, noting the effects' sequence numbers and the
+    /// play phase it reads.
+    struct Adapted {
+        seen: Adaptations,
+    }
+
+    impl Screen for Adapted {
+        fn load(
+            &mut self,
+            _chart: &Chart,
+            _section: Option<&eval::Section>,
+        ) -> Result<(), RenderError> {
+            Ok(())
+        }
+        fn wait(&self) -> bool {
+            true
+        }
+        fn paced(&self) -> bool {
+            false
+        }
+        fn build(&mut self, f: &FrameInput<'_>) -> Result<(), skin_model::BuildError> {
+            let frame = render::skin_frame(f);
+            assert!(std::ptr::eq(frame.tally, &f.view.tally));
+            let seqs = frame.effects.iter().map(|e| e.seq).collect();
+            self.seen.lock().unwrap().push((seqs, frame.playing));
+            Ok(())
+        }
+        fn draw(&mut self) -> Result<FrameTiming, RenderError> {
+            Ok(timing(true))
+        }
+        fn text(&mut self, _lines: &[&str]) -> Result<bool, RenderError> {
+            Ok(true)
+        }
+        #[cfg(feature = "dev-tools")]
+        fn read_back(&self) -> Option<(u32, u32, Vec<u8>)> {
+            None
+        }
+    }
+
+    /// The effects reach the declarative skin's frames in the order the
+    /// logic step queued them, across drains of a buffer of 2: every
+    /// effect once, none reordered, each frame at most a buffer's worth,
+    /// with the play phase of the frame's own view.
+    #[test]
+    fn effects_reach_the_skin_frames_in_order_across_drains() {
+        use game::DeviceSettings;
+        use input::DeviceKind;
+
+        let buffer = Vec::<eval::JudgeEvent>::with_capacity(2).capacity();
+        let mut builder = ChartBuilder::new(120_000);
+        for k in 0..6 {
+            builder = builder.tap(Lane::new(1).unwrap(), TimeUs(1_000_000 + k * 200_000));
+        }
+        let chart = builder.build().unwrap();
+        let rule = rules::tapestry();
+        let device = DeviceSettings::default().profile(&[DeviceKind::Keyboard], &[]);
+        let (mut writer, reader) = input::source_queue(32);
+        for e in input::autoplay(&chart, &device.sources[0]).unwrap() {
+            writer.push(e).unwrap();
+        }
+        writer.publish(TimeUs(3_000_000));
+        let (mut logic, side) = Logic::<SourceReader>::new(
+            &chart,
+            &rule,
+            &device,
+            &InputStart::default(),
+            vec![reader],
+            LogicConfig {
+                inputs: 32,
+                effects: 64,
+            },
+            Vec::new(),
+        )
+        .unwrap();
+        logic.advance_to(TimeUs(3_000_001));
+        let queued: Vec<u64> = logic.events().iter().map(|e| e.seq).collect();
+        assert!(queued.len() > 2 * buffer);
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let noted = Arc::clone(&seen);
+        let make: MakeScreen = Box::new(move || {
+            Ok(Box::new(Adapted {
+                seen: Arc::clone(&noted),
+            }) as Box<dyn Screen>)
+        });
+        let clock = QpcClock::start();
+        let link = spawn(
+            make,
+            Some(Arc::new(chart.clone())),
+            None,
+            clock,
+            View {
+                effects: buffer,
+                ..view()
+            },
+            measure(clock),
+            Box::new(NoFrames),
+        )
+        .unwrap();
+        link.send(RenderMsg::Play {
+            side,
+            gauge: 0,
+            measure: play_measure(clock.now()),
+        });
+        let drawn = || -> usize { seen.lock().unwrap().iter().map(|(s, _)| s.len()).sum() };
+        assert!(wait_until(|| drawn() >= queued.len()));
+        let _ = link.finish(clock.now());
+        link.exit();
+        let frames = seen.lock().unwrap().clone();
+        assert!(frames.iter().all(|(s, _)| s.len() <= buffer), "{frames:?}");
+        assert!(frames.iter().filter(|(s, _)| !s.is_empty()).count() > 1);
+        let order: Vec<u64> = frames.iter().flat_map(|(s, _)| s.iter().copied()).collect();
+        assert_eq!(order, queued);
+        let playing = logic.view().playing;
+        assert!(frames.iter().all(|&(_, p)| p == playing));
     }
 }

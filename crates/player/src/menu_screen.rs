@@ -30,10 +30,14 @@ use std::time::Duration;
 
 use bms_model::Chart;
 use eval::Section;
+use game::Preparation;
 use render::text::{Fonts, MenuText, TextBlock, TextStyle};
-use render::{Blend, FrameTiming, RenderError, Renderer, Sprite, solid_uv};
+use render::{
+    AttemptInput, Blend, CommitError, FrameTiming, PreparedToken, RenderError, Renderer,
+    SkinBundle, Sprite, solid_uv,
+};
 
-use crate::render_side::Screen;
+use crate::render_side::{Screen, refusal};
 
 /// The size of a line's text, in layout pixels (1920×1080).
 pub const TEXT_SIZE: f32 = 30.0;
@@ -335,6 +339,49 @@ impl MenuScreen {
 impl Screen for MenuScreen {
     fn load(&mut self, chart: &Chart, section: Option<&Section>) -> Result<(), RenderError> {
         self.renderer.load(chart, section)
+    }
+
+    /// Stages `skin` with the attempt's fresh state, or readies the skin
+    /// in use in place, answering at once; a refusal on a healthy device
+    /// ([`RenderError::is_refusal`]) refuses the attempt and keeps the
+    /// installation in use.
+    fn prepare_attempt(
+        &mut self,
+        a: &AttemptInput<'_>,
+        skin: Option<&Arc<SkinBundle>>,
+        request: u64,
+    ) -> Option<Result<Preparation, RenderError>> {
+        let done = match skin {
+            Some(bundle) => self.renderer.stage(bundle, a, request).map(|_| ()),
+            None => self.renderer.prepare_attempt(a),
+        };
+        Some(match done {
+            Ok(()) => Ok(Preparation::Ready),
+            Err(e) if e.is_refusal() => Ok(refusal(e.to_string())),
+            Err(e) => Err(e),
+        })
+    }
+
+    fn device(&self) -> u64 {
+        self.renderer.device_generation()
+    }
+
+    fn commit(&mut self, token: PreparedToken) -> Result<(), CommitError> {
+        if self.renderer.staged().is_some() {
+            self.renderer.commit(token)
+        } else if token.device == self.renderer.device_generation() {
+            Ok(())
+        } else {
+            Err(CommitError::Device)
+        }
+    }
+
+    fn discard(&mut self) {
+        self.renderer.discard();
+    }
+
+    fn restore(&mut self, bundle: &Arc<SkinBundle>) -> Result<(), RenderError> {
+        self.renderer.restore(bundle)
     }
 
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]

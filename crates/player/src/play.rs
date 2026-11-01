@@ -467,6 +467,16 @@ impl Rig for PlayerRig<'_> {
 
     /// The render thread answers once it draws no loading frame any more;
     /// a retry has no loading state to end.
+    /// The render thread installs what the attempt's preparation staged:
+    /// on every play, a retry and a practice round included.
+    fn commit_attempt(&mut self) -> Result<(), ScreenError> {
+        self.render.commit_attempt()
+    }
+
+    fn discard_attempt(&mut self) {
+        self.render.discard_attempt();
+    }
+
     fn end_loading(&mut self) -> Result<(), ScreenError> {
         let loading = self.selection.as_mut().and_then(|s| s.loading.take());
         if loading.is_some() {
