@@ -290,8 +290,6 @@ pub struct Skin {
     texts: Box<[TextDef]>,
     image_choices: Box<[ImageChoice]>,
     cover_paints: Box<[CoverPaint]>,
-    /// The lanes element's index.
-    lanes_at: Option<usize>,
     /// The text elements: the length of the table
     /// [`attach_text`](Skin::attach_text) takes.
     text_slots: u16,
@@ -1259,7 +1257,6 @@ impl Skin {
                 shift: j.shift,
             })
             .collect();
-        let lanes_at = def.elements.iter().position(|e| e.source == Source::Lanes);
         // Text slots in draw order; at most `MAX_TEXT_ELEMENTS`.
         let mut text_slots = 0_u16;
         let elements = def
@@ -1320,7 +1317,6 @@ impl Skin {
             texts: texts.into_boxed_slice(),
             image_choices,
             cover_paints,
-            lanes_at,
             text_slots,
             widget_quads,
             bomb_up_to: def.bomb_up_to,
@@ -1728,42 +1724,41 @@ impl Skin {
         // The lanes' geometry, once for every element, whether or not the
         // lanes draw.
         let lanes = self.lanes.as_ref().map(|l| l.frame_geometry(frame.lanes));
-        // The lanes element's drawing.
-        let lane_draw = self.lanes_at.and_then(|i| {
-            let e = self.elements.get(i)?;
-            if !placement.region(e.region).visible {
-                return None;
-            }
-            let (_, s) = sample(
-                play,
-                frame.now,
-                &state,
-                e.slot,
-                e.visible.as_ref(),
-                &e.track,
-            )?;
-            Some(Draw {
-                play,
-                state: &state,
-                now: frame.now,
-                display,
-                view: frame.lanes,
-                frame: lanes.as_ref()?,
-                complete: frame.complete,
-                geometry: placement.geometry(),
-                placement,
-                affine: placement.affine(e.region, e.fill),
-                color: s.color,
-                key: e.key,
-                uvs,
-                scale: canvas.scale(),
-            })
-        });
         for e in &self.elements {
             if let Kind::Lanes = e.kind {
-                if let (Some(widget), Some(d)) = (&self.lanes, &lane_draw) {
-                    widget.draw(d, bars.as_deref_mut(), out);
+                let (Some(widget), Some(geometry)) = (&self.lanes, lanes.as_ref()) else {
+                    continue;
+                };
+                if !placement.region(e.region).visible {
+                    continue;
                 }
+                let Some((_, s)) = sample(
+                    play,
+                    frame.now,
+                    &state,
+                    e.slot,
+                    e.visible.as_ref(),
+                    &e.track,
+                ) else {
+                    continue;
+                };
+                let d = Draw {
+                    play,
+                    state: &state,
+                    now: frame.now,
+                    display,
+                    view: frame.lanes,
+                    frame: geometry,
+                    complete: frame.complete,
+                    geometry: placement.geometry(),
+                    placement,
+                    affine: placement.affine(e.region, e.fill),
+                    color: s.color,
+                    key: e.key,
+                    uvs,
+                    scale: canvas.scale(),
+                };
+                widget.draw(&d, bars.as_deref_mut(), out);
                 continue;
             }
             if !placement.region(e.region).visible {
