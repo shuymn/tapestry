@@ -911,8 +911,14 @@ fn check_f5(_: &Header, i: Imported) {
 fn f9(root: &Path) {
     use common::lanes::{body, cover, note};
     png(root, "a.png", 64, 64);
-    let group = r#"{"id": "bar", "op": [271], "dst": [{"x": 20, "y": 200, "w": 430, "h": 2}]}"#;
-    let groups = join(std::iter::repeat_n(group.to_owned(), MAX_BAR_GROUPS));
+    // Each group's index in its colour, red the low byte, green the high.
+    let groups = join((0..MAX_BAR_GROUPS).map(|g| {
+        format!(
+            r#"{{"id": "bar", "op": [271], "dst": [{{"x": 20, "y": 200, "w": 430, "h": 2, "r": {}, "g": {}}}]}}"#,
+            g % 256,
+            g / 256
+        )
+    }));
     let objects = note(&format!(r#""group": [{groups}]"#));
     let dsts = [common::lanes::NOTES.to_owned(), cover("")];
     let dsts: Vec<&str> = dsts.iter().map(String::as_str).collect();
@@ -958,11 +964,19 @@ fn check_f9(_: &Header, i: Imported) {
     let mut d = Drawn::over(i.skin, &f9_chart());
     d.view.cover = 300;
     let q = d.frame(1_000, &[]);
-    let bars = q
+    let bars: Vec<usize> = q
         .iter()
         .filter(|q| common::play::round(q.rect) == [20, 878, 430, 2])
-        .count();
-    assert_eq!(bars, skin_model::LANE_QUADS as usize);
+        .map(|q| {
+            let [r, g] = [q.color[0], q.color[1]].map(|c| (c * 255.0).round() as usize);
+            g * 256 + r
+        })
+        .collect();
+    assert!(
+        bars.iter().copied().eq(0..skin_model::LANE_QUADS as usize),
+        "{:?}",
+        &bars[..bars.len().min(8)]
+    );
     let notes = q
         .iter()
         .filter(|q| common::play::round(q.rect)[2] == 50)
