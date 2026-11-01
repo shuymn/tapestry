@@ -323,6 +323,19 @@ impl Cx<'_> {
         }
     }
 
+    /// Whether an image or image set's destination lists offset 4, its
+    /// keys then charged once, and what it lowers to: SUDDEN+'s paint
+    /// unless it cannot reach the lanes, where it follows SUDDEN+.
+    fn lowered(&mut self, dst: &Dst) -> Result<(bool, Lowered), ImportError> {
+        let charged = dst.offsets.contains(&super::OFFSET_LANECOVER);
+        let lowered = if charged && !self.offset4_outside(dst)? {
+            Lowered::Paint
+        } else {
+            Lowered::Image
+        };
+        Ok((charged, lowered))
+    }
+
     /// An image object.
     pub(super) fn image(&mut self, dst: Dst, rec: u32) -> Result<(), ImportError> {
         let at = dst.span;
@@ -334,15 +347,7 @@ impl Cx<'_> {
         let len = self.int_or(len, "len", 0)?;
         let group = len > 1;
         let index = property::index_by_id(self.int_or(r, "ref", 0)?);
-        // Listing offset 4, it follows SUDDEN+ when it cannot reach the
-        // lanes, and is SUDDEN+'s paint otherwise; its keys are charged
-        // once.
-        let charged = dst.offsets.contains(&super::OFFSET_LANECOVER);
-        let lowered = if charged && !self.offset4_outside(&dst)? {
-            Lowered::Paint
-        } else {
-            Lowered::Image
-        };
+        let (charged, lowered) = self.lowered(&dst)?;
         let role = lowered.role();
         if act.is_some() {
             self.ignored(at, NoteKind::Ignored { field: "act" });
@@ -422,14 +427,7 @@ impl Cx<'_> {
         let r = self.int_or(r, "ref", 0)?;
         let value = self.prop(value, "value")?;
         let selector = image_choice::set_selector(&value, r);
-        // Listing offset 4, it is SUDDEN+'s paint showing its table unless
-        // it cannot reach the lanes; its keys are charged once.
-        let charged = dst.offsets.contains(&super::OFFSET_LANECOVER);
-        let lowered = if charged && !self.offset4_outside(&dst)? {
-            Lowered::Paint
-        } else {
-            Lowered::Image
-        };
+        let (charged, lowered) = self.lowered(&dst)?;
         let role = lowered.role();
         let (src, deviates) = match selector {
             SetSelector::Unsupported { why, .. } => {
