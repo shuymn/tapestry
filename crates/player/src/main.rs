@@ -1013,6 +1013,7 @@ fn play(
             return Err(e.into());
         }
     };
+    render.follow(&window_thread.extent());
     let threads = Threads {
         input,
         audio,
@@ -1353,6 +1354,9 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
     #[cfg(feature = "dev-tools")]
     if let Some(bound) = s.dev.render_timeout {
         render.set_timeouts(bound, bound);
+    }
+    if let Some(w) = &window_thread {
+        render.follow(&w.extent());
     }
     let threads = Threads {
         input,

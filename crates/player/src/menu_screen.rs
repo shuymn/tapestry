@@ -5,8 +5,9 @@
 //! A [`MenuPage`] comes from the game thread whenever what it shows
 //! changes; its lines are laid out and the screen's text prepared then,
 //! and every frame in between draws what was prepared. A screen built
-//! again after a failure lays out its page again. All of it runs on menus,
-//! where allocation is allowed.
+//! again after a failure lays out its page again, and so does one whose
+//! target changed size, since the text is prepared for the target's
+//! pixels. All of it runs on menus, where allocation is allowed.
 //!
 //! A page with a text caret (the search box with focus) has the caret's
 //! area measured as its line is laid out: the IME's composition is
@@ -226,6 +227,9 @@ pub struct MenuScreen {
     sent: Option<Option<[f32; 4]>>,
     /// The launch screen, once drawn.
     splash: Option<Splash>,
+    /// The target changed size since the text was last prepared: the
+    /// page shown is prepared again before its next frame.
+    stale: bool,
 }
 
 impl MenuScreen {
@@ -241,6 +245,7 @@ impl MenuScreen {
             presented: None,
             sent: None,
             splash: None,
+            stale: false,
         }
     }
 
@@ -292,6 +297,7 @@ impl MenuScreen {
             .text
             .get_or_insert_with(|| MenuText::new(&self.renderer));
         text.prepare(&self.renderer, fonts, &refs)?;
+        self.stale = false;
         self.cursor = page
             .lines
             .iter()
@@ -388,7 +394,7 @@ impl Screen for MenuScreen {
     }
 
     fn loading(&mut self, page: &MenuPage, changed: bool) -> Result<FrameTiming, RenderError> {
-        if changed || self.text.is_none() {
+        if changed || self.stale || self.text.is_none() {
             self.prepare(page, LOADING_LEFT, LOADING_TOP)?;
         }
         let Some(text) = &self.text else {
@@ -405,9 +411,28 @@ impl Screen for MenuScreen {
         Ok(timing)
     }
 
+    /// A new size invalidates the text prepared: the page shown, or the
+    /// launch screen, is prepared again before its next frame.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn resize(&mut self, width: u32, height: u32) {
+        let before = self.renderer.target();
+        self.renderer.resize(width, height);
+        if self.renderer.target() != before {
+            self.stale = true;
+            if let Some(splash) = &mut self.splash {
+                splash.alpha = None;
+            }
+        }
+    }
+
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn target(&self) -> [u32; 2] {
         self.renderer.target()
+    }
+
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn minimized(&self) -> bool {
+        self.renderer.is_minimized()
     }
 
     #[cfg(feature = "dev-tools")]
@@ -436,6 +461,7 @@ impl MenuScreen {
             .get_or_insert_with(|| MenuText::new(&self.renderer));
         text.prepare(&self.renderer, fonts, &[&splash.name, &splash.version])?;
         splash.alpha = Some(alpha);
+        self.stale = false;
         // The page prepared before, if any, is gone from the text.
         self.cursor = None;
         self.underline = None;
@@ -453,7 +479,7 @@ impl MenuScreen {
 
     /// Draws `page`, laid out again when `changed`.
     fn menu_frame(&mut self, page: &MenuPage, changed: bool) -> Result<FrameTiming, RenderError> {
-        if changed || self.text.is_none() {
+        if changed || self.stale || self.text.is_none() {
             self.prepare(page, LEFT, TOP)?;
         }
         let cursor = self.cursor;

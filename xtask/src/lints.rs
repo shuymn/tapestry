@@ -336,7 +336,9 @@ pub const IN_PLAY: &[Site] = &[
             "MenuScreen::statistics",
             "MenuScreen::presentation",
             "MenuScreen::shown",
+            "MenuScreen::resize",
             "MenuScreen::target",
+            "MenuScreen::minimized",
         ],
     ),
     // The development builds' counting allocator, which every allocation
