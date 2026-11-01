@@ -2397,10 +2397,11 @@ mod tests {
         }
     }
 
-    /// A slow attempt's preparation is cancelled as soon as the player
-    /// leaves, without waiting for the screen's answer.
+    /// A slow attempt's preparation stops as soon as the player leaves or
+    /// the input or audio thread fails, without waiting for the screen's
+    /// answer; the game then looks at the threads for the cause.
     #[test]
-    fn a_slow_attempt_is_cancelled_when_the_player_leaves() {
+    fn a_slow_attempt_stops_when_the_player_leaves_or_a_thread_fails() {
         let hold = Arc::new(AtomicBool::new(false));
         let held = Arc::clone(&hold);
         let make: MakeScreen =
@@ -2418,17 +2419,27 @@ mod tests {
         .unwrap();
         let chart = Arc::new(ChartBuilder::new(120_000).build().unwrap());
         link.load(Arc::clone(&chart), None).unwrap();
-        hold.store(true, Ordering::Release);
-        let started = Instant::now();
-        let leave = started + Duration::from_millis(100);
-        let answer = link.prepare_attempt(attempt(&chart, None), || Instant::now() >= leave);
-        assert_eq!(answer.unwrap(), Preparation::Cancelled);
-        assert!(
-            started.elapsed() < Duration::from_secs(2),
-            "{:?}",
-            started.elapsed()
-        );
-        hold.store(false, Ordering::Release);
+        for cause in ["leave", "input", "audio"] {
+            hold.store(true, Ordering::Release);
+            let started = Instant::now();
+            let at = started + Duration::from_millis(100);
+            let answer = link.prepare_attempt(attempt(&chart, None), || {
+                let now = Instant::now() >= at;
+                crate::play::preparation_stops(
+                    false,
+                    now && cause == "leave",
+                    (now && cause == "input").then_some(game::InputWaitError::Gone),
+                    (now && cause == "audio").then_some(audio::OutputError::DeviceLost),
+                )
+            });
+            assert_eq!(answer.unwrap(), Preparation::Cancelled, "{cause}");
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "{cause}: {:?}",
+                started.elapsed()
+            );
+            hold.store(false, Ordering::Release);
+        }
         link.exit();
     }
 
