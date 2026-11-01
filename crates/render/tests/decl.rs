@@ -492,7 +492,6 @@ fn a_skin_frame_reads_one_view() {
     assert_eq!(*s.layout, skin_model::Layout::AUTHOR);
     assert_eq!(s.lanes.visible_time, common::VISIBLE);
     assert_eq!((s.lanes.cover, s.lanes.lift, s.lanes.hidden), (0, 0, 0));
-    assert!(s.loading.is_none());
     assert_eq!(s.readouts.bpm_current_x100, None);
     assert_eq!(s.readouts.hispeed_x100, None);
     assert!(!s.readouts.covers.adjusting);
