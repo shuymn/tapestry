@@ -426,6 +426,7 @@ pub fn draw(imported: &Imported) -> Vec<usize> {
     bar_probes(skin, &ctx, (&tally, &states), &uvs, &mut batch);
     long_note_probes(skin, &ctx, (&tally, &states), &uvs, &mut batch);
     loading_probes(skin, (&text, &table), &gauges[0], &uvs, &mut batch);
+    digit_probes(skin, &ctx, &states, &uvs, &mut batch);
     counts
 }
 
@@ -513,6 +514,83 @@ fn loading_probes(
         skin.build_loading(&mut loading, &frame, uvs, batch),
         Err(BuildError::InvalidReadouts)
     );
+}
+
+/// Numbers and combos over a few values, signs and combo lengths, at
+/// targets smaller, equal to and larger than the skin's: digit offsets
+/// move cells by target pixels, so each frame stays inside the skin's
+/// capacities and on the finite plane.
+fn digit_probes(
+    skin: &skin_model::Skin,
+    ctx: &skin_model::PlayContext<'_>,
+    states: &[eval::GaugeState],
+    uvs: &skin_model::UvTable,
+    batch: &mut skin_model::QuadBatch,
+) {
+    use bms_model::{Lane, TimeUs};
+    use eval::{JudgeEvent, JudgeEventKind, Tally};
+    use rules::{Judgment, PerJudgment};
+    use skin_model::{Layout, SkinFrame};
+
+    let chart = bms_model::ChartBuilder::new(150_000)
+        .build()
+        .expect("an empty chart");
+    let mut play = skin
+        .prepare(&chart, ctx)
+        .expect("an imported skin prepares");
+    let lane = Lane::new(1).expect("lane 1");
+    for (k, (value, target)) in [0_u32, 7, 12, 1_234_567]
+        .into_iter()
+        .flat_map(|v| [[1_920, 1_080], [640, 360], [3_840, 2_160], [1, 1]].map(|t| (v, t)))
+        .enumerate()
+    {
+        let now = TimeUs(i64::try_from(k).unwrap_or(0) * 100_000);
+        let tally = Tally {
+            counts: PerJudgment {
+                perfect: value,
+                great: 0,
+                good: 0,
+                bad: 0,
+                poor: 0,
+            },
+            ex_score: value,
+            bp: 0,
+            combo: value,
+            max_combo: value,
+            empty_poor: 0,
+        };
+        let effects = [JudgeEvent {
+            seq: 0,
+            time: now,
+            origin: None,
+            kind: JudgeEventKind::Judged {
+                lane,
+                note: 0,
+                judgment: Judgment::Perfect,
+                deviation: Some(TimeUs(0)),
+                release: None,
+                combo: value,
+            },
+        }];
+        batch.clear();
+        let frame = SkinFrame {
+            now,
+            display_offset: TimeUs(0),
+            tally: &tally,
+            gauges: states,
+            gauge: 0,
+            effects: &effects,
+            complete: false,
+            target,
+            layout: &Layout::AUTHOR,
+            lanes: LANES_OFF,
+            readouts: readouts_for(LANES_OFF),
+            playing: true,
+        };
+        skin.build(&mut play, &frame, uvs, batch)
+            .expect("the frame builds");
+        check_batch(skin, batch);
+    }
 }
 
 /// A long note held and released in LN and CN, with its end in view and
@@ -1260,6 +1338,23 @@ fn check_usage(i: &Imported) {
     assert!(
         i.skin.ops().total() <= usize::try_from(u.ops).unwrap_or(usize::MAX),
         "more ops kept than charged"
+    );
+    // Digit offsets: the rows resolved and the copies kept within their
+    // caps; a strip dropped after its rows were charged keeps none.
+    assert!(
+        within(
+            u.resolved_digit_offsets,
+            skin_beatoraja::limits::MAX_RESOLVED_DIGIT_OFFSETS
+        ),
+        "too many digit offset rows resolved"
+    );
+    assert!(
+        within(u.digit_offsets, skin_model::MAX_DIGIT_OFFSETS),
+        "too many digit offsets"
+    );
+    assert!(
+        i.skin.digit_offset_count() <= usize::try_from(u.digit_offsets).unwrap_or(usize::MAX),
+        "more digit offsets kept than charged"
     );
 }
 

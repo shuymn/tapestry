@@ -9,7 +9,7 @@ use crate::import::{CriticalPart, ImportLimit, NoteKind};
 use crate::limits::{
     MAX_DEPTH, MAX_EXPANDED, MAX_FILE_BYTES, MAX_FILE_CHOICES, MAX_INCLUDE_DEPTH,
     MAX_INCLUDE_PARSES, MAX_INPUT_BYTES, MAX_LIST_ENTRIES, MAX_NODES, MAX_OFFSETS,
-    MAX_OPTION_ITEMS, MAX_OPTIONS, MAX_STRING_BYTES,
+    MAX_OPTION_ITEMS, MAX_OPTIONS, MAX_RESOLVED_DIGIT_OFFSETS, MAX_STRING_BYTES,
 };
 
 /// A place in a definition file: its name relative to the skin folder,
@@ -92,6 +92,7 @@ pub enum InputLimit {
     OptionItems,
     FileChoices,
     Offsets,
+    DigitOffsets,
 }
 
 impl fmt::Display for InputLimit {
@@ -111,6 +112,12 @@ impl fmt::Display for InputLimit {
             Self::OptionItems => write!(f, "more than {MAX_OPTION_ITEMS} option items"),
             Self::FileChoices => write!(f, "more than {MAX_FILE_CHOICES} file choices"),
             Self::Offsets => write!(f, "more than {MAX_OFFSETS} offsets"),
+            Self::DigitOffsets => {
+                write!(
+                    f,
+                    "more than {MAX_RESOLVED_DIGIT_OFFSETS} digit offset rows"
+                )
+            }
         }
     }
 }

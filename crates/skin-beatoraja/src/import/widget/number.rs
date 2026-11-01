@@ -72,29 +72,10 @@ impl Cx<'_> {
         }
     }
 
-    /// Whether a value's `offset` array moves any digit.
-    pub(super) fn digit_offsets(&mut self, field: Option<u32>) -> Result<bool, ImportError> {
-        let Some(list) = field else {
-            return Ok(false);
-        };
-        if self.def.arena.node(list).kind != crate::tree::Kind::Array {
-            return Ok(false);
-        }
-        let items: Vec<u32> = self.def.arena.children(list).collect();
-        for item in items {
-            for f in self.def.fields(item, ["x", "y", "w", "h"]) {
-                if self.int_or(f, "offset", 0)? != 0 {
-                    return Ok(true);
-                }
-            }
-        }
-        Ok(false)
-    }
-
     /// A number object.
     pub(in super::super) fn number(&mut self, dst: Dst, rec: u32) -> Result<(), ImportError> {
         let at = dst.span;
-        let [value, r, digit, padding, zeropadding, space, align, offset] = self.def.fields(
+        let [value, r, digit, padding, zeropadding, space, align] = self.def.fields(
             rec,
             [
                 "value",
@@ -104,7 +85,6 @@ impl Cx<'_> {
                 "zeropadding",
                 "space",
                 "align",
-                "offset",
             ],
         );
         let value = self.prop(value, "value")?;
@@ -130,10 +110,6 @@ impl Cx<'_> {
             _ => Role::Decorative,
         };
         debug_assert_eq!(shown.critical(), role != Role::Decorative);
-        if self.digit_offsets(offset)? {
-            self.drop_el(role, at, NoteKind::UnsupportedField { field: "offset" })?;
-            return Ok(());
-        }
         let digit = self.int_or(digit, "digit", 0)?;
         let padding = self.int_or(padding, "padding", 0)?;
         let zeropadding = self.int_or(zeropadding, "zeropadding", 0)?;
@@ -216,16 +192,18 @@ impl Cx<'_> {
         let sr = Q::int(spaces).mul(self.r).ok_or_else(|| range(self))?;
         let n = Q::int(cells - 1);
         let e = Q::int(extra);
-        // Stretch 8 and 9 apply per glyph at placement
-        // (`skin/SkinNumber.java:191`); any other mode must leave each
-        // key's cell as it is.
+        // Stretch 8 and 9 apply per glyph at placement, after its digit
+        // offset (`skin/SkinNumber.java:191-205`); any other mode must
+        // leave each key's cell, moved by each row, as it is.
         let native = c.stretch.native(cell);
+        let rows_kept =
+            c.stretch == Stretch::Identity || self.digit_rows_keep_aspect(rec, extra, cells, cell);
         let mut keys = Vec::with_capacity(c.track.keys.len());
         for k in &c.track.keys {
             let rect = self.key_rect(&c, k)?;
             let (stretched, _) =
                 track::stretch(c.stretch, rect, cell).ok_or_else(|| range(self))?;
-            if native.is_none() && stretched != rect {
+            if native.is_none() && (stretched != rect || !rows_kept) {
                 self.drop_el(role, at, NoteKind::Stretch(c.stretch_mode))?;
                 return Ok(());
             }
@@ -276,6 +254,7 @@ impl Cx<'_> {
         self.budget
             .widget_quads(quads)
             .map_err(|l| self.limit(at, l))?;
+        let offsets = self.digit_offsets(at, rec, extra, cells)?;
         // One D4 note for the value and the conditions.
         c.display_deviation |= shown.deviates();
         let index = u32::try_from(self.widgets.numbers.len()).unwrap_or(u32::MAX);
@@ -287,6 +266,7 @@ impl Cx<'_> {
                 align,
                 pad,
                 space: i32::try_from(space).map_err(|_| range(self))?,
+                offsets,
             },
             value: program,
         });

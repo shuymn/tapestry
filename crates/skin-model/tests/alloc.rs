@@ -31,11 +31,11 @@ use rules::{GaugeValue, Judgment};
 use skin_model::{
     Adjust, Align, Anchor, AtlasLimits, Attach, Attempt, Bind, Blend, BpmRange, BuildError, ClipId,
     ComboPart, CoverImage, CoverMotion, CoverPaintDef, CoverSettings, CoverTrim, CycleDef,
-    DigitsDef, DurationRatio, Ease, ElementDef, End, Fill, Filter, Fit, Follow, FrameReadouts,
-    GaugeDef, GaugeDesc, GaugeLook, GaugeParts, GlyphSet, GradePart, ImageDef, JudgeDef, JudgeSlot,
-    KeyDef, LaneParts, LaneTimer, LaneView, Layout as SkinLayout, Motion, Native, NumberDef, Pad,
-    Place, Play, PlayContext, QuadBatch, Region, RegionDef, Sheet, Side, Skin, SkinDef, SkinFrame,
-    Source, TimerRef, Track, UvTable, Variant, field, lane_timer, timer,
+    DigitOffset, DigitsDef, DurationRatio, Ease, ElementDef, End, Fill, Filter, Fit, Follow,
+    FrameReadouts, GaugeDef, GaugeDesc, GaugeLook, GaugeParts, GlyphSet, GradePart, ImageDef,
+    JudgeDef, JudgeSlot, KeyDef, LaneParts, LaneTimer, LaneView, Layout as SkinLayout, Motion,
+    Native, NumberDef, Pad, Place, Play, PlayContext, QuadBatch, Region, RegionDef, Sheet, Side,
+    Skin, SkinDef, SkinFrame, Source, TimerRef, Track, UvTable, Variant, field, lane_timer, timer,
 };
 use skin_model::{
     ChartText, FontRef, FrameUv, LoadState, LoadingFrame, LoadingGauge, Overflow, TextDef,
@@ -479,21 +479,42 @@ fn widgets(elements: &mut Vec<ElementDef>) -> skin_model::WidgetDefs {
         )
         .unwrap()
     };
-    let strip = |image: u16, set, cells, align, pad, space| DigitsDef {
+    // Digit offsets on the first `n` cells, signed, some growing and some
+    // shrinking past zero.
+    let moves = |n: i32| {
+        (0..n)
+            .map(|j| DigitOffset {
+                dx: 3 * j - 4,
+                dy: 5 - 2 * j,
+                dw: j % 3 - 1,
+                dh: 2 - j,
+            })
+            .collect::<Vec<_>>()
+    };
+    let strip = |image: u16, set, cells, align, pad, space, offsets: i32| DigitsDef {
         image: u32::from(image),
         set,
         cells,
         align,
         pad,
         space,
+        offsets: moves(offsets),
     };
     let numbers = vec![
         (
-            strip(DIGITS_10, GlyphSet::Ten, 4, Align::Right, Pad::Blank, 2),
+            strip(DIGITS_10, GlyphSet::Ten, 4, Align::Right, Pad::Blank, 2, 2),
             "combo * 100",
         ),
         (
-            strip(DIGITS_11, GlyphSet::Eleven, 6, Align::Left, Pad::Glyph, -3),
+            strip(
+                DIGITS_11,
+                GlyphSet::Eleven,
+                6,
+                Align::Left,
+                Pad::Glyph,
+                -3,
+                0,
+            ),
             "ex_score - 50",
         ),
         (
@@ -504,6 +525,7 @@ fn widgets(elements: &mut Vec<ElementDef>) -> skin_model::WidgetDefs {
                 Align::Center,
                 Pad::Blank,
                 0,
+                5,
             ),
             "combo - 10",
         ),
@@ -515,11 +537,12 @@ fn widgets(elements: &mut Vec<ElementDef>) -> skin_model::WidgetDefs {
                 Align::Right,
                 Pad::Zero,
                 1,
+                11,
             ),
             "if combo % 2 == 0 then -2147483647 - 1 else combo",
         ),
         (
-            strip(DIGITS_10, GlyphSet::Ten, 3, Align::Center, Pad::Zero, 4),
+            strip(DIGITS_10, GlyphSet::Ten, 3, Align::Center, Pad::Zero, 4, 1),
             "bp - 3",
         ),
     ];
@@ -590,8 +613,16 @@ fn widgets(elements: &mut Vec<ElementDef>) -> skin_model::WidgetDefs {
         ));
     }
     let combos = [
-        strip(COMBO_10, GlyphSet::Ten, 4, Align::Center, Pad::Blank, 0),
-        strip(COMBO_11, GlyphSet::Eleven, 5, Align::Right, Pad::Glyph, 2),
+        strip(COMBO_10, GlyphSet::Ten, 4, Align::Center, Pad::Blank, 0, 4),
+        strip(
+            COMBO_11,
+            GlyphSet::Eleven,
+            5,
+            Align::Right,
+            Pad::Glyph,
+            2,
+            3,
+        ),
         strip(
             COMBO_24,
             GlyphSet::TwentyFour,
@@ -599,6 +630,7 @@ fn widgets(elements: &mut Vec<ElementDef>) -> skin_model::WidgetDefs {
             Align::Left,
             Pad::Zero,
             -2,
+            11,
         ),
     ];
     let judge = |shift: bool| {
@@ -637,7 +669,7 @@ fn widgets(elements: &mut Vec<ElementDef>) -> skin_model::WidgetDefs {
                 follow: FOLLOWS[usize::from(k) % 4],
             });
             j.combos[s.index()] = Some(ComboPart {
-                digits: combos[s.index() % 3],
+                digits: combos[s.index() % 3].clone(),
                 track: track(10 + k, Ease::Linear, End::Hold),
                 timer: if k == 4 {
                     TimerRef::Builtin(timer::COMBO_UP)

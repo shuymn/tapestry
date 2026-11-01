@@ -3,6 +3,7 @@
 
 pub(super) mod bar;
 pub(super) mod cover_paint;
+pub(super) mod digit_offsets;
 pub(super) mod gauge;
 pub(super) mod image_choice;
 pub(super) mod judge;

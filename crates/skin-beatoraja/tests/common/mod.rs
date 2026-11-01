@@ -27,6 +27,59 @@ pub fn join(items: impl Iterator<Item = String>) -> String {
     items.collect::<Vec<_>>().join(",")
 }
 
+/// `s.json` over n.png (12×20 glyphs) of `judges` judges of four combos
+/// each (24 digit offsets kept, two quads drawn) and numbers of 11 and
+/// `last` kept offsets.
+pub fn kept_offsets(judges: usize, last: usize) -> String {
+    let value = |id: &str, digit: usize| {
+        let rows = join((0..digit).map(|_| r#"{"x": 1}"#.to_owned()));
+        format!(
+            r#"{{"id": "{id}", "src": "n", "w": 120, "h": 20, "divx": 10, "digit": {digit},
+                "ref": 110, "offset": [{rows}]}}"#
+        )
+    };
+    let none = r#"{"id": "none", "dst": []}"#;
+    let combo =
+        |v: &str| format!(r#"{{"id": "{v}", "dst": [{{"x": 0, "y": 0, "w": 10, "h": 20}}]}}"#);
+    // Combos 1 and 2 have no grade: kept, never drawn.
+    let numbers = join(
+        [combo("c1"), combo("c11"), combo("c11")]
+            .into_iter()
+            .chain((0..3).map(|_| none.to_owned()))
+            .chain([combo("c1")]),
+    );
+    let images = join(
+        [r#"{"id": "g", "dst": [{"x": 0, "y": 0, "w": 80, "h": 20}]}"#.to_owned()]
+            .into_iter()
+            .chain((0..6).map(|_| none.to_owned())),
+    );
+    let records = join((0..judges).map(|i| {
+        format!(r#"{{"id": "j{i}", "index": 0, "images": [{images}], "numbers": [{numbers}]}}"#)
+    }));
+    let dsts = join(
+        (0..judges)
+            .map(|i| format!(r#"{{"id": "j{i}", "dst": [{{"w": 0, "h": 0}}]}}"#))
+            .chain(
+                ["n11", "nl"]
+                    .map(|id| format!(r#"{{"id": "{id}", "dst": [{{"w": 10, "h": 20}}]}}"#)),
+            ),
+    );
+    let values = join(
+        [
+            value("c1", 1),
+            value("c11", 11),
+            value("n11", 11),
+            value("nl", last),
+        ]
+        .into_iter(),
+    );
+    format!(
+        r#"{{"type": 0, "w": 1920, "h": 1080, "source": [{{"id": "n", "path": "n.png"}}],
+            "image": [{{"id": "g", "src": "n", "w": 12, "h": 20}}],
+            "value": [{values}], "judge": [{records}], "destination": [{dsts}]}}"#
+    )
+}
+
 pub fn write(root: &Path, name: &str, bytes: &[u8]) {
     let path = root.join(name);
     fs::create_dir_all(path.parent().unwrap()).unwrap();

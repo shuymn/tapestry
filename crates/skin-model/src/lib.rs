@@ -134,7 +134,8 @@ pub use track::{
 pub use widget::bar::{BarGroupDef, BarGroupError, MAX_BAR_GROUPS};
 pub use widget::cover_paint::{CoverImage, CoverMotion, CoverPaintDef, CoverPaintError, CoverTrim};
 pub use widget::digits::{
-    Align, DigitsDef, GlyphSet, I32_DIGITS, MAX_CELLS, NumberDef, NumberError, Pad,
+    Align, DigitOffset, DigitsDef, GlyphSet, I32_DIGITS, MAX_CELLS, MAX_DIGIT_OFFSETS, NumberDef,
+    NumberError, Pad,
 };
 pub use widget::gauge::{
     GaugeDef, GaugeError, GaugeLook, GaugePart, GaugeParts, MAX_SEGMENTS, Motion,

@@ -43,9 +43,7 @@ const VALUES: &str = r#""value": [
     {"id": "five", "src": "n", "w": 120, "h": 20, "divx": 10, "digit": 5},
     {"id": "two", "src": "n", "w": 120, "h": 20, "divx": 10, "digit": 2},
     {"id": "zero", "src": "n", "w": 120, "h": 20, "divx": 10, "digit": 0},
-    {"id": "wide", "src": "n", "w": 120, "h": 20, "divx": 10, "digit": 13},
-    {"id": "offs", "src": "n", "w": 120, "h": 20, "divx": 10, "digit": 3,
-     "offset": [{"x": 1}]}]"#;
+    {"id": "wide", "src": "n", "w": 120, "h": 20, "divx": 10, "digit": 13}]"#;
 
 /// Seven grade images over `a`, and `gone` from a missing file.
 fn images() -> String {
@@ -367,15 +365,6 @@ fn judges_refuse_what_the_model_cannot_share() {
     assert_eq!(
         critical(skin(VALUES, &hidden, &[DST])),
         (CriticalPart::Judge, NoteKind::RuntimeOffset(5))
-    );
-    // Per-digit offsets.
-    let l = judge(&grades(1), &[combo("offs", 10)]);
-    assert_eq!(
-        critical(l),
-        (
-            CriticalPart::Judge,
-            NoteKind::UnsupportedField { field: "offset" }
-        )
     );
     // A missing texture.
     let gone = judge_rec(

@@ -246,11 +246,6 @@ fn padding_and_cells() {
     );
     assert_eq!(loaded.ok().skin.quad_capacity(), 3);
     assert_eq!(loaded.quads(0).len(), 3);
-    // A digit offset is not imported.
-    drop(
-        &format!(r#"{TEN}, "digit": 3, "ref": 110, "offset": [{{"x": 0}}, {{"y": 2}}]"#),
-        "offset",
-    );
 }
 
 /// The rate numbers, one row each from y = 100, each named alias once,

@@ -179,6 +179,11 @@ impl Q {
         (self.n as f64 / self.d as f64) as f32
     }
 
+    /// The value when it is a whole number.
+    pub(crate) fn integer(self) -> Option<i128> {
+        (self.d == 1).then_some(self.n)
+    }
+
     /// The nearest integer, halves rounded up: `⌊self + ½⌋`.
     pub(crate) fn round(self) -> Option<i128> {
         let num = self.n.checked_mul(2)?.checked_add(self.d)?;
