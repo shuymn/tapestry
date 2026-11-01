@@ -52,7 +52,7 @@ fn judged_targets(tally: &Tally, empty_poor_counted: bool) -> Option<u64> {
 /// The score rate of `ex` over `targets`, in basis points:
 /// `⌊10 000 · ex / (2 · targets)⌋`, 10 000 with no target. Not capped at
 /// 100 %: a custom EX weighting may pass it; only the field's `i32` range
-/// bounds it. `10 000 · ex` is below 2^46 and `2 · targets` below 2^35, so
+/// bounds it. `10 000 · ex` is below 2^46 and `2 · targets` below 2^36, so
 /// neither overflows `u64`.
 fn rate_bp(ex: u32, targets: u64) -> i32 {
     let bp = u64::from(RATE_BASIS_POINTS.unsigned_abs());

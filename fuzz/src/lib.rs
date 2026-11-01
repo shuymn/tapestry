@@ -452,6 +452,7 @@ fn rate_and_kind_probes(
         reference: d.start,
         failed_at: None,
     });
+    let runs = usize::try_from(skin.run_capacity()).unwrap_or(usize::MAX);
     let max = u32::MAX;
     let tally = Tally {
         counts: PerJudgment {
@@ -526,10 +527,7 @@ fn rate_and_kind_probes(
             assert_eq!(read(field::RATE_CURRENT_BP), Some(current));
             assert_eq!(read(field::RATE_WHOLE_BP), Some(i32::MAX));
             assert_eq!(batch.dropped(), 0, "quads past the capacity");
-            assert!(
-                batch.runs().len() <= usize::try_from(skin.run_capacity()).unwrap_or(usize::MAX),
-                "more runs than the capacity"
-            );
+            assert!(batch.runs().len() <= runs, "more runs than the capacity");
             assert!(
                 batch
                     .quads()

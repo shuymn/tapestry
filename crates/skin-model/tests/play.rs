@@ -916,13 +916,12 @@ fn an_inconsistent_snapshot_poisons_the_play() {
     assert_eq!(quads.len(), 1);
     let frame = |h: &mut Harness, now: i64, effects: &[eval::JudgeEvent]| {
         let tally = h.tally;
-        let gauges = h.gauges.clone();
         let layout = h.layout;
         let f = skin_model::SkinFrame {
             now: TimeUs(now * MS),
             display_offset: TimeUs(0),
             tally: &tally,
-            gauges: &gauges,
+            gauges: &h.gauges,
             gauge: 0,
             effects,
             complete: false,
