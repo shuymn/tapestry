@@ -240,6 +240,9 @@ struct Bindings {
     nearest: wgpu::Sampler,
     /// Half the canvas's size ([`Projection::half`]), padded to 16 bytes.
     projection: wgpu::Buffer,
+    /// The half last written to [`projection`](Self::projection), `None`
+    /// until the first write: a frame writes it only when it changes.
+    uploaded: Option<[f32; 2]>,
 }
 
 impl Bindings {
@@ -794,12 +797,18 @@ impl Renderer {
             0,
             bytemuck::cast_slice(self.staging.instances()),
         );
-        let [hx, hy] = projection.half();
-        queue.write_buffer(
-            &self.bindings.projection,
-            0,
-            bytemuck::cast_slice(&[hx, hy, 0.0, 0.0]),
-        );
+        // Only when it changes: on the first frame, a resize, or between
+        // the menus' fixed canvas and the play skin's.
+        let half = projection.half();
+        if self.bindings.uploaded != Some(half) {
+            let [hx, hy] = half;
+            queue.write_buffer(
+                &self.bindings.projection,
+                0,
+                bytemuck::cast_slice(&[hx, hy, 0.0, 0.0]),
+            );
+            self.bindings.uploaded = Some(half);
+        }
         let [x, y, w, h] = projection.viewport();
         let full = [0, 0, self.size.0, self.size.1];
         let mut encoder = self
@@ -1196,6 +1205,7 @@ fn pipelines(
         smooth,
         nearest,
         projection,
+        uploaded: None,
     };
     (alpha, additive, bindings)
 }
