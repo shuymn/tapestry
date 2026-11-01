@@ -544,6 +544,19 @@ struct Shared {
     loading_drawn: AtomicU64,
     /// The loading state's slot.
     loading: Mutex<LoadingSlot>,
+    /// The commits answered and given up on, which the game thread and the
+    /// render thread settle under its lock.
+    commits: Mutex<Commits>,
+}
+
+/// The last request committed and the last whose commit the game thread
+/// stopped waiting for: a commit is installed only while its request is
+/// not withdrawn, and a withdrawal finds a commit already installed, so
+/// the two never disagree.
+#[derive(Debug, Default)]
+struct Commits {
+    committed: u64,
+    withdrawn: u64,
 }
 
 /// The loading state's lifetime, its newest page and the typed update
@@ -596,6 +609,10 @@ impl Shared {
     /// The number of the last page cleared.
     fn end_cleared(&self) -> u64 {
         self.slot().cleared
+    }
+
+    fn commits(&self) -> std::sync::MutexGuard<'_, Commits> {
+        self.commits.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     fn loading_slot(&self) -> std::sync::MutexGuard<'_, LoadingSlot> {
@@ -815,7 +832,9 @@ impl RenderLink {
     }
 
     /// Installs what the last attempt's preparation staged, and waits
-    /// until it is, at most the answer's bound.
+    /// until it is, at most the answer's bound. Past the bound the commit
+    /// is withdrawn: still waiting in the channel, it installs nothing,
+    /// and one installed meanwhile is answered as installed.
     ///
     /// # Errors
     ///
@@ -833,7 +852,14 @@ impl RenderLink {
                 eprintln!("render: the attempt was not installed: {e}");
                 Err(ScreenError::Lost)
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => Err(ScreenError::NoAnswer),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let mut commits = self.shared.commits();
+                if commits.committed >= request {
+                    return Ok(());
+                }
+                commits.withdrawn = commits.withdrawn.max(request);
+                Err(ScreenError::NoAnswer)
+            }
             Err(mpsc::RecvTimeoutError::Disconnected) => Err(ScreenError::Ended),
         }
     }
@@ -1027,6 +1053,7 @@ pub fn spawn(
         #[cfg(feature = "dev-tools")]
         loading_drawn: AtomicU64::new(0),
         loading: Mutex::new(LoadingSlot::default()),
+        commits: Mutex::new(Commits::default()),
     });
     let thread_shared = Arc::clone(&shared);
     let (ended_tx, ended) = mpsc::sync_channel::<()>(0);
@@ -1787,11 +1814,19 @@ impl Run {
     }
 
     /// Installs what the preparation of `request` staged: it must be the
-    /// one answered ready last, on the screen it was prepared on (its
-    /// device's). Another request's commit changes nothing; one refused by
+    /// one answered ready last, not withdrawn by a game thread that stopped
+    /// waiting, on the screen it was prepared on (its device's). Another request's commit changes nothing; one refused by
     /// the screen discards the staging. Committed, a declarative bundle is
     /// kept for a screen built again.
     fn commit(&mut self, request: u64) -> Result<(), CommitError> {
+        // Held through the installation: a withdrawal waits for it, or it
+        // sees the withdrawal and installs nothing.
+        let shared = Arc::clone(&self.shared);
+        let mut commits = shared.commits();
+        if commits.withdrawn >= request {
+            self.discard(request);
+            return Err(CommitError::NothingStaged);
+        }
         let Some(staged) = self.prepared.as_ref().map(|p| p.token.request) else {
             return Err(CommitError::NothingStaged);
         };
@@ -1814,6 +1849,7 @@ impl Run {
         if p.skin.is_some() {
             self.committed = p.skin;
         }
+        commits.committed = request;
         Ok(())
     }
 
@@ -5036,12 +5072,14 @@ mod tests {
     /// answered (`prepare` with its request, the context's scratch side
     /// and the attempt's title), a commit, a discard and a restore. While
     /// `hold` is set, its preparations do not answer. Its menu frames fail
-    /// while `fail` is set; it counts its loading frames.
+    /// while `fail` is set; it counts its loading frames, each of which
+    /// stalls while `stall` is set.
     struct Installer {
         device: u64,
         hold: Arc<AtomicBool>,
         fail: Arc<AtomicBool>,
         loading: Arc<AtomicU32>,
+        stall: Arc<AtomicBool>,
         log: Log,
         restored: Arc<std::sync::Mutex<Vec<Arc<render::SkinBundle>>>>,
     }
@@ -5129,6 +5167,9 @@ mod tests {
             _changed: bool,
         ) -> Result<FrameTiming, RenderError> {
             self.loading.fetch_add(1, Ordering::AcqRel);
+            while self.stall.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
             Ok(timing(true))
         }
         #[cfg(feature = "dev-tools")]
@@ -5145,6 +5186,7 @@ mod tests {
         hold: Arc<AtomicBool>,
         fail: Arc<AtomicBool>,
         loading: Arc<AtomicU32>,
+        stall: Arc<AtomicBool>,
         log: Log,
         restored: Arc<std::sync::Mutex<Vec<Arc<render::SkinBundle>>>>,
     }
@@ -5161,6 +5203,7 @@ mod tests {
                     hold: Arc::clone(&shared.hold),
                     fail: Arc::clone(&shared.fail),
                     loading: Arc::clone(&shared.loading),
+                    stall: Arc::clone(&shared.stall),
                     log: Arc::clone(&shared.log),
                     restored: Arc::clone(&shared.restored),
                 }) as Box<dyn Screen>)
@@ -5281,6 +5324,48 @@ mod tests {
                 "1 commit 1",
                 "1 discard",
                 "1 discard"
+            ]
+        );
+    }
+
+    /// A commit the render thread takes only after the game thread stopped
+    /// waiting for it is withdrawn: it installs nothing and is discarded,
+    /// so a play the game gave up on never draws; the next attempt
+    /// commits.
+    #[test]
+    fn a_commit_past_its_bound_installs_nothing() {
+        let chart = Arc::new(ChartBuilder::new(120_000).build().unwrap());
+        let skin = bundle();
+        let screens = Installers::default();
+        let mut link = screens.spawn(&chart, &skin);
+        let frames = || screens.loading.load(Ordering::Acquire);
+        link.loading().show(one_line("loading"));
+        assert!(wait_until(|| frames() > 0));
+        let ready = link.prepare_attempt(titled(&chart), || false);
+        assert_eq!(ready.unwrap(), Preparation::Ready);
+
+        // The render thread stalls in a loading frame past the bound.
+        screens.stall.store(true, Ordering::Release);
+        let from = frames();
+        assert!(wait_until(|| frames() > from));
+        link.set_timeouts(Duration::from_millis(100), Duration::from_secs(5));
+        assert!(matches!(link.commit_attempt(), Err(ScreenError::NoAnswer)));
+        screens.stall.store(false, Ordering::Release);
+        let from = frames();
+        assert!(wait_until(|| frames() >= from + 3));
+        link.set_timeouts(Duration::from_secs(10), Duration::from_secs(5));
+
+        let ready = link.prepare_attempt(titled(&chart), || false);
+        assert_eq!(ready.unwrap(), Preparation::Ready);
+        link.commit_attempt().unwrap();
+        link.exit();
+        assert_eq!(
+            screens.log(),
+            [
+                "1 prepare 1 Right T",
+                "1 discard",
+                "1 prepare 2 Right T",
+                "1 commit 2"
             ]
         );
     }
