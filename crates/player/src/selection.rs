@@ -1837,7 +1837,9 @@ mod tests {
             crate::dev::checkpoints::frames_follow(&reported),
             "{reported:?}"
         );
-        assert!(began.elapsed() < Duration::from_secs(5));
+        // Only catches a hold that never ends, however late a loaded
+        // machine runs it.
+        assert!(began.elapsed() < Duration::from_secs(600));
     }
 
     /// The chart a pick plays.

@@ -790,20 +790,39 @@ mod tests {
     }
 
     /// A measurement that stops without being told gives nothing and is
-    /// not run again.
+    /// not kept, even when a pause comes while it returns: it is held at
+    /// a barrier, the pause is requested, and only then does it return
+    /// its stop. The job ends once, with no result, and is not measured
+    /// again after the release.
     #[test]
     fn a_stop_not_asked_for_gives_nothing() {
+        let (started_tx, started) = std::sync::mpsc::channel();
+        let (go_tx, go) = std::sync::mpsc::channel::<()>();
         let runs = Arc::new(AtomicUsize::new(0));
         let counted = Arc::clone(&runs);
         let measure: Measure = Box::new(move |_, _| {
             counted.fetch_add(1, Ordering::SeqCst);
+            let _ = started_tx.send(());
+            let _ = go.recv();
             Outcome::Stopped
         });
         let worker = Worker::start(measure, None).unwrap();
         worker.queue(job("a"));
-        let results = drain(&worker);
-        assert_eq!(paths(&results), all(&["a"]));
-        assert_eq!(results[0].measured, None);
+        started.recv_timeout(WATCHDOG).unwrap();
+        worker.request_pause(None);
+        go_tx.send(()).unwrap();
+        // Paused either way: with the job ended, or kept and acknowledged.
+        assert!(worker.wait_paused(WATCHDOG));
+        assert_eq!(
+            worker.take_results(),
+            vec![Finished {
+                path: PathBuf::from("a"),
+                measured: None,
+            }]
+        );
+        assert!(!worker.holds(Path::new("a")));
+        worker.release();
+        assert!(drain(&worker).is_empty());
         assert_eq!(runs.load(Ordering::SeqCst), 1);
     }
 

@@ -610,10 +610,14 @@ impl Drop for Shelf {
         if let Some(worker) = &background {
             worker.stop();
         }
-        let quiet = match self.scan.take() {
-            Some(scan) => scan.stop_within(deadline.saturating_duration_since(Instant::now())),
-            None => true,
-        };
+        let (quiet, stopped) = stop_together(
+            deadline,
+            Instant::now,
+            self.scan
+                .take()
+                .map(|scan| move |left| scan.stop_within(left)),
+            background.map(|worker| move |left| worker.stop_within(left)),
+        );
         if !quiet {
             let line = format!(
                 "library: the scan did not stop within {} s; it ends with the process",
@@ -622,9 +626,7 @@ impl Drop for Shelf {
             eprintln!("{line}");
             log::warn!("{line}");
         }
-        if let Some(worker) = background {
-            let left = deadline.saturating_duration_since(Instant::now());
-            let (ended, results) = worker.stop_within(left);
+        if let Some((ended, results)) = stopped {
             if !ended {
                 let line = format!(
                     "loudness: the background measurement did not stop within {} s; it ends with the process",
@@ -638,6 +640,21 @@ impl Drop for Shelf {
         // A measurement is stored only when no scan may still commit.
         self.loudness.close(&mut self.library, quiet);
     }
+}
+
+/// Waits for the scan, then the background measurement, both already told
+/// to stop, until `deadline` on the clock `now`: each wait gets only the
+/// time left, so the two share one bound. Whether the scan stopped (or
+/// none ran), and what the background's wait gave.
+fn stop_together<W>(
+    deadline: Instant,
+    now: impl Fn() -> Instant,
+    scan: Option<impl FnOnce(Duration) -> bool>,
+    background: Option<impl FnOnce(Duration) -> W>,
+) -> (bool, Option<W>) {
+    let quiet = scan.is_none_or(|stop| stop(deadline.saturating_duration_since(now())));
+    let stopped = background.map(|stop| stop(deadline.saturating_duration_since(now())));
+    (quiet, stopped)
 }
 
 /// The scan thread's start hook: background mode, which lowers its CPU,
@@ -1240,6 +1257,7 @@ mod tests {
         until("the background's bank", || bank.load(Ordering::SeqCst));
         shelf.choose(&path);
         let mut asked = 0;
+        let begun = Instant::now();
         let waited = shelf.wait_background(
             &path,
             "a.bms",
@@ -1249,7 +1267,8 @@ mod tests {
                 if asked == 1 {
                     let _ = go_tx.send(());
                 }
-                false
+                // A pause never acknowledged fails the test, not hangs it.
+                begun.elapsed() > WATCHDOG
             },
             || panic!("another chart's measurement is not this load's"),
         );
@@ -1264,11 +1283,61 @@ mod tests {
         assert!(asked > 0);
     }
 
-    /// The end of a run with both the scan and the background stuck waits
-    /// for them together, within one [`super::STOP_TIMEOUT`], not one
-    /// each.
+    /// The scan's and the background's stops share one deadline: on a
+    /// clock the waits move, the background's wait gets only what the
+    /// scan's left, and nothing once the scan used it all.
     #[test]
-    fn a_stuck_scan_and_background_share_one_stop_bound() {
+    fn the_scan_and_the_background_share_one_stop_deadline() {
+        use std::cell::Cell;
+        let start = Instant::now();
+        let deadline = start + super::STOP_TIMEOUT;
+        for (scan_took, left) in [
+            (Duration::ZERO, super::STOP_TIMEOUT),
+            (
+                Duration::from_millis(1_500),
+                super::STOP_TIMEOUT - Duration::from_millis(1_500),
+            ),
+            (super::STOP_TIMEOUT * 2, Duration::ZERO),
+        ] {
+            let clock = Cell::new(start);
+            let budgets = Cell::new((None, None));
+            let (quiet, stopped) = super::stop_together(
+                deadline,
+                || clock.get(),
+                Some(|budget| {
+                    budgets.set((Some(budget), None));
+                    clock.set(clock.get() + scan_took);
+                    false
+                }),
+                Some(|budget| {
+                    budgets.set((budgets.get().0, Some(budget)));
+                    "stopped"
+                }),
+            );
+            assert!(!quiet);
+            assert_eq!(stopped, Some("stopped"));
+            assert_eq!(
+                budgets.get(),
+                (Some(super::STOP_TIMEOUT), Some(left)),
+                "after a scan wait of {scan_took:?}"
+            );
+        }
+        // Without a scan the background has the whole bound.
+        let (quiet, stopped) = super::stop_together(
+            deadline,
+            || start,
+            None::<fn(Duration) -> bool>,
+            Some(|budget| budget),
+        );
+        assert!(quiet);
+        assert_eq!(stopped, Some(super::STOP_TIMEOUT));
+    }
+
+    /// The end of a run with both the scan and the background stuck ends:
+    /// neither is joined, so the drop returns (the bound itself is
+    /// [`the_scan_and_the_background_share_one_stop_deadline`]'s).
+    #[test]
+    fn a_stuck_scan_and_background_do_not_hold_the_end() {
         use std::sync::atomic::{AtomicBool, Ordering};
         let dir = tempfile::tempdir().unwrap();
         let (_, _, key, path) = song(dir.path());
@@ -1288,13 +1357,23 @@ mod tests {
         let (shelf, gate) = gated_with(dir.path(), || Worker::start(measure, None));
         worker(&shelf).queue(job(&path));
         until("the background's start", || started.load(Ordering::SeqCst));
+        let (dropped_tx, dropped) = std::sync::mpsc::channel();
         let begun = Instant::now();
-        drop(shelf);
+        let dropping = std::thread::spawn(move || {
+            drop(shelf);
+            let _ = dropped_tx.send(());
+        });
+        // A join that waits for the stuck ones fails here, not hangs.
+        let ended = dropped.recv_timeout(WATCHDOG);
         let took = begun.elapsed();
         open.store(true, Ordering::SeqCst);
         open_gate(&gate);
+        dropping.join().unwrap();
+        assert!(
+            ended.is_ok(),
+            "the end waited for the stuck scan or background"
+        );
         assert!(took >= super::STOP_TIMEOUT, "{took:?}");
-        assert!(took < super::STOP_TIMEOUT * 3 / 2, "{took:?}");
     }
 
     /// A chart whose background job only waits is the load's own: taken
