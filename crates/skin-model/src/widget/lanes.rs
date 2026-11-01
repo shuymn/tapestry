@@ -24,7 +24,7 @@ use bms_model::{LANE_COUNT, Lane, Note, NoteKind, Position, TimeUs};
 
 use super::bar::{BarGroup, BarGroupDef, BarScratch, Field, Template};
 use super::scroll::Scale;
-use super::{Brush, ImageRef, sample, tint};
+use super::{Brush, ImageRef, Starts, sample, tint};
 use crate::atlas::uv::{FrameUv, UvTable};
 use crate::canvas::f32_of;
 use crate::expr::State;
@@ -453,7 +453,11 @@ impl Lanes {
 
 /// What the lanes draw from this frame.
 pub(crate) struct Draw<'a> {
-    pub(crate) play: &'a Play,
+    /// The attempt whose notes and bar lines the lanes draw; `None` draws
+    /// the judgment line alone (the loading state's chart-free lanes).
+    pub(crate) play: Option<&'a Play>,
+    /// The timers' starts, which the parts' cycles and the bar groups read.
+    pub(crate) starts: Starts<'a>,
     /// The frame's fields and timers, which the bar groups' visibilities
     /// read.
     pub(crate) state: &'a State<'a>,
@@ -490,7 +494,7 @@ impl Draw<'_> {
     /// `part`'s frame this frame.
     fn shown(&self, part: &ImageRef) -> Shown {
         Shown {
-            frame: part.frame(self.play, self.now, self.uvs),
+            frame: part.frame(self.starts, self.now, self.uvs),
             filter: part.filter,
         }
     }
@@ -660,15 +664,20 @@ pub(crate) struct LaneFrameGeometry {
 
 impl Lanes {
     /// Draws the lanes into `out`: the bar groups, with `scratch` when
-    /// they have any, the judgment line and every lane's notes. Allocates
+    /// they have any, the judgment line and every lane's notes; without a
+    /// play, the judgment line alone at the frame's line. Allocates
     /// nothing.
     pub(crate) fn draw(&self, d: &Draw<'_>, scratch: Option<&mut BarScratch>, out: &mut QuadBatch) {
-        let Some(notes) = d.play.notes() else {
+        let g = d.frame;
+        let Some(play) = d.play else {
+            self.line(&mut Pen::new(d, out), f32_of(g.line_y));
             return;
         };
-        let g = d.frame;
+        let Some(notes) = play.notes() else {
+            return;
+        };
         let scale = Scale::new(
-            d.play.scroll(),
+            play.scroll(),
             d.display,
             d.view.visible_time,
             g.span,
@@ -683,8 +692,8 @@ impl Lanes {
             self.bars(&mut pen, notes, &scale, scratch);
         }
         match self.style {
-            LaneStyle::Simple => self.simple(&mut pen, notes, &scale, g.span, ringing_out),
-            LaneStyle::Source(s) => self.source(&mut pen, notes, &scale, s, g.span, ringing_out),
+            LaneStyle::Simple => self.simple(&mut pen, play, &scale, g.span, ringing_out),
+            LaneStyle::Source(s) => self.source(&mut pen, play, &scale, s, g.span, ringing_out),
         }
     }
 
@@ -742,8 +751,15 @@ impl Lanes {
     /// its timer is off, it is hidden, its track does not draw, its image
     /// shows no frame or its quad, natively sized, has no area.
     fn template(&self, d: &Draw<'_>, g: &BarGroup) -> Option<Template> {
-        let (_, s) = sample(d.play, d.now, d.state, g.slot, g.visible.as_ref(), &g.track)?;
-        let frame = g.image.frame(d.play, d.now, d.uvs)?;
+        let (_, s) = sample(
+            d.starts,
+            d.now,
+            d.state,
+            g.slot,
+            g.visible.as_ref(),
+            &g.track,
+        )?;
+        let frame = g.image.frame(d.starts, d.now, d.uvs)?;
         let [x, y, w, h] = s.rect;
         let t = Template {
             brush: Brush {
@@ -816,7 +832,7 @@ impl Lanes {
     fn simple(
         &self,
         pen: &mut Pen<'_, '_>,
-        notes: &Notes,
+        play: &Play,
         scale: &Scale,
         span: f64,
         ringing_out: bool,
@@ -834,7 +850,7 @@ impl Lanes {
         self.line(pen, line);
         if !ringing_out {
             for lane in Lane::all() {
-                if !self.simple_lane(pen, notes, scale, lane, [from, to]) {
+                if !self.simple_lane(pen, play, scale, lane, [from, to]) {
                     break;
                 }
             }
@@ -846,12 +862,15 @@ impl Lanes {
     fn simple_lane(
         &self,
         pen: &mut Pen<'_, '_>,
-        notes: &Notes,
+        play: &Play,
         scale: &Scale,
         lane: Lane,
         [from, to]: [Position; 2],
     ) -> bool {
         let d = pen.d;
+        let Some(notes) = play.notes() else {
+            return true;
+        };
         let Some(l) = LaneOf::new(self, d, notes, lane) else {
             return true;
         };
@@ -866,7 +885,7 @@ impl Lanes {
             if !pen.visit() {
                 return false;
             }
-            if d.play.done(l.index, i) {
+            if play.done(l.index, i) {
                 continue;
             }
             let head = scale.y(n.pos);
@@ -885,7 +904,7 @@ impl Lanes {
                     }
                     let tail = scale.y(end_pos);
                     let head = head.min(line);
-                    let body = if d.play.body_active(lane, i) {
+                    let body = if play.body_active(lane, i) {
                         l.on
                     } else {
                         l.off
@@ -909,7 +928,7 @@ impl Lanes {
     fn source(
         &self,
         pen: &mut Pen<'_, '_>,
-        notes: &Notes,
+        play: &Play,
         scale: &Scale,
         s: SourceLanes,
         span: f64,
@@ -927,7 +946,7 @@ impl Lanes {
         self.line(pen, f32_of(scale.line_y));
         if !ringing_out {
             for lane in Lane::all() {
-                if !self.source_lane(pen, notes, scale, lane, s, range) {
+                if !self.source_lane(pen, play, scale, lane, s, range) {
                     break;
                 }
             }
@@ -940,19 +959,22 @@ impl Lanes {
     fn source_lane(
         &self,
         pen: &mut Pen<'_, '_>,
-        notes: &Notes,
+        play: &Play,
         scale: &Scale,
         lane: Lane,
         s: SourceLanes,
         range: Option<[Position; 2]>,
     ) -> bool {
         let d = pen.d;
+        let Some(notes) = play.notes() else {
+            return true;
+        };
         let Some(l) = LaneOf::new(self, d, notes, lane) else {
             return true;
         };
         let (x, w, oy, nh) = (l.x, l.w, s.offset_y, s.note_h);
         let line = f32_of(scale.line_y);
-        let tail_shown = d.play.separate_end_judgment();
+        let tail_shown = play.separate_end_judgment();
         // Times and positions never decrease along a lane
         // (`Chart::validate`).
         let start = match range {
@@ -995,7 +1017,7 @@ impl Lanes {
                         continue;
                     }
                     let (head, tail) = (scale.y(head_pos) - oy, scale.y(end_pos) - oy);
-                    let body = if d.play.body_active(lane, i) {
+                    let body = if play.body_active(lane, i) {
                         l.on
                     } else {
                         l.off

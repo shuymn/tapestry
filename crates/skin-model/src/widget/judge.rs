@@ -301,6 +301,8 @@ pub(crate) struct Judge {
 /// What a judge draws from this frame.
 pub(crate) struct JudgeDraw<'a> {
     pub(crate) at: Frame<'a>,
+    /// The latest judgment's grade, `None` before the first.
+    pub(crate) grade: Option<Grade>,
     pub(crate) state: &'a State<'a>,
     pub(crate) affine: Affine,
     pub(crate) map: LaneMap,
@@ -321,7 +323,7 @@ fn sample(
     slot: usize,
     visible: Option<&Program>,
 ) -> Option<crate::track::Sample> {
-    super::sample(d.at.play, d.at.now, d.state, slot, visible, track).map(|(_, s)| s)
+    super::sample(d.at.starts, d.at.now, d.state, slot, visible, track).map(|(_, s)| s)
 }
 
 impl Judge {
@@ -329,12 +331,11 @@ impl Judge {
     /// grade. Nothing before the first judgment, for an empty slot, or
     /// while the grade is not drawn.
     pub(crate) fn draw(&self, d: &JudgeDraw<'_>, out: &mut QuadBatch) {
-        let Some(grade) = d.at.play.judge() else {
+        let Some(grade) = d.grade else {
             return;
         };
         let mut slot = JudgeSlot::of(grade);
-        if slot == JudgeSlot::Perfect && d.at.play.timer_at(usize::from(timer::GAUGE_MAX)).is_some()
-        {
+        if slot == JudgeSlot::Perfect && d.at.starts.at(usize::from(timer::GAUGE_MAX)).is_some() {
             slot = JudgeSlot::PerfectAtMax;
         }
         let Some(g) = resolve(&self.grades, slot) else {
@@ -383,7 +384,7 @@ impl Judge {
                 shift = width / 2.0;
             }
         }
-        let Some(f) = g.image.frame(d.at.play, d.at.now, d.at.uvs) else {
+        let Some(f) = g.image.frame(d.at.starts, d.at.now, d.at.uvs) else {
             return;
         };
         let brush = Brush {

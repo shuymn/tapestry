@@ -25,7 +25,7 @@ use crate::widget::cover_paint::{
     TrimOutcome,
 };
 use crate::widget::digits::{Align, Digits, Number, NumberDef, NumberError};
-use crate::widget::gauge::{Gauge, GaugeDef, GaugeDraw, GaugeError};
+use crate::widget::gauge::{Gauge, GaugeDef, GaugeDraw, GaugeError, Shown};
 use crate::widget::glyphs;
 use crate::widget::image_choice::{
     ChoicePart, ImageChoice, ImageChoiceDef, ImageChoiceError, MAX_IMAGE_CHOICE_REFS,
@@ -1746,7 +1746,7 @@ impl Skin {
                     continue;
                 }
                 let Some((_, s)) = sample(
-                    play,
+                    play.starts(),
                     frame.now,
                     &state,
                     e.slot,
@@ -1756,7 +1756,8 @@ impl Skin {
                     continue;
                 };
                 let d = Draw {
-                    play,
+                    play: Some(play),
+                    starts: play.starts(),
                     state: &state,
                     now: frame.now,
                     display,
@@ -1802,8 +1803,14 @@ impl Skin {
                 None => None,
             };
             let track = choice.and_then(|p| p.track.as_ref()).unwrap_or(&e.track);
-            let Some((t, s)) = sample(play, frame.now, &state, e.slot, e.visible.as_ref(), track)
-            else {
+            let Some((t, s)) = sample(
+                play.starts(),
+                frame.now,
+                &state,
+                e.slot,
+                e.visible.as_ref(),
+                track,
+            ) else {
                 continue;
             };
             let affine = placement.affine(e.region, e.fill);
@@ -1845,7 +1852,7 @@ impl Skin {
                 scale: canvas.scale(),
             };
             let at = Frame {
-                play,
+                starts: play.starts(),
                 now: frame.now,
                 uvs,
             };
@@ -1858,7 +1865,7 @@ impl Skin {
                         _ => None,
                     };
                     if let Some(image) = image
-                        && let Some(f) = image.frame(play, frame.now, uvs)
+                        && let Some(f) = image.frame(play.starts(), frame.now, uvs)
                     {
                         brush.push_clipped(out, rect, f, image.filter, trim);
                     }
@@ -1871,10 +1878,10 @@ impl Skin {
                 }
                 Kind::Gauge(i) => {
                     if let Some(g) = self.gauges.get(i) {
+                        let desc = play.gauge_desc(frame.gauge);
                         let d = GaugeDraw {
                             at,
-                            gauges: frame.gauges,
-                            shown: frame.gauge,
+                            shown: Shown::of(frame.gauges, desc, frame.gauge),
                             t,
                         };
                         g.draw(&d, rect, &brush, out);
@@ -1884,6 +1891,7 @@ impl Skin {
                     if let Some(j) = self.judges.get(i) {
                         let d = JudgeDraw {
                             at,
+                            grade: play.judge(),
                             state: &state,
                             affine,
                             map: brush.map,

@@ -16,6 +16,7 @@ use self::reducer::Reducer;
 use self::schema::{field, timer};
 use crate::expr::{State, TIMER_OFF};
 use crate::layout::Layout;
+use crate::widget::Starts;
 use crate::widget::bar::BarScratch;
 use crate::widget::gauge::GaugeLook;
 use crate::widget::glyphs::GlyphLine;
@@ -445,7 +446,12 @@ impl Play {
     }
 
     pub(crate) fn timer_at(&self, slot: usize) -> Option<TimeUs> {
-        self.starts.get(slot).copied().flatten()
+        self.starts().at(slot)
+    }
+
+    /// Every timer slot's start as of the last build.
+    pub(crate) fn starts(&self) -> Starts<'_> {
+        Starts(&self.starts)
     }
 
     /// The fields and timer readings as of the last build.

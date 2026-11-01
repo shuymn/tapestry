@@ -23,7 +23,6 @@ use bms_model::TimeUs;
 use crate::atlas::uv::{Cycle, FrameUv, UvTable};
 use crate::expr::{Program, State};
 use crate::place::{Affine, LaneMap, Native};
-use crate::play::Play;
 use crate::play::timers::elapsed_us;
 use crate::quad::{ClipRect, Filter, Quad, QuadBatch, RunKey};
 use crate::track::{Sample, Track};
@@ -38,30 +37,44 @@ pub(crate) struct ImageRef {
     pub(crate) filter: Filter,
 }
 
+/// Every timer slot's start as of the last fill, `None` while off: what
+/// tracks and image cycles age from, a play's or the loading runtime's.
+#[derive(Clone, Copy)]
+pub(crate) struct Starts<'a>(pub(crate) &'a [Option<TimeUs>]);
+
+impl Starts<'_> {
+    /// Timer `slot`'s start, `None` while off or past the slots.
+    pub(crate) fn at(self, slot: usize) -> Option<TimeUs> {
+        self.0.get(slot).copied().flatten()
+    }
+}
+
 impl ImageRef {
     /// The frame the image shows at `now`, from its cycle's timer: frame 0
     /// while that timer is off, without a cycle, or with one frame.
-    pub(crate) fn frame(&self, play: &Play, now: TimeUs, uvs: &UvTable) -> Option<FrameUv> {
-        let shown = self.group(play, now, self.frames);
+    pub(crate) fn frame(&self, starts: Starts<'_>, now: TimeUs, uvs: &UvTable) -> Option<FrameUv> {
+        let shown = self.group(starts, now, self.frames);
         self.first.checked_add(shown).and_then(|i| uvs.get(i))
     }
 
     /// Which of `groups` equal runs of the image's frames its cycle shows
     /// at `now`: run 0 while the cycle's timer is off, without a cycle, or
     /// with one run. With `groups` the frame count, a run is a frame.
-    pub(crate) fn group(&self, play: &Play, now: TimeUs, groups: u16) -> u32 {
+    pub(crate) fn group(&self, starts: Starts<'_>, now: TimeUs, groups: u16) -> u32 {
         self.cycle.map_or(0, |c| {
-            play.timer_at(c.slot)
+            starts
+                .at(c.slot)
                 .map_or(0, |at| c.frame(elapsed_us(now, at), groups))
         })
     }
 }
 
-/// What every widget reads of this frame: the play state as of the last
-/// build, the frame's clock, which image cycles age on, and the uv table.
+/// What every widget reads of this frame: the timers' starts as of the
+/// last fill, the frame's clock, which image cycles age on, and the uv
+/// table.
 #[derive(Clone, Copy)]
 pub(crate) struct Frame<'a> {
-    pub(crate) play: &'a Play,
+    pub(crate) starts: Starts<'a>,
     pub(crate) now: TimeUs,
     pub(crate) uvs: &'a UvTable,
 }
@@ -175,14 +188,14 @@ impl Brush {
 /// started: nothing while the timer is off, `visible` is false, or the
 /// track does not draw.
 pub(crate) fn sample(
-    play: &Play,
+    starts: Starts<'_>,
     now: TimeUs,
     state: &State<'_>,
     slot: usize,
     visible: Option<&Program>,
     track: &Track,
 ) -> Option<(i64, Sample)> {
-    let start = play.timer_at(slot)?;
+    let start = starts.at(slot)?;
     if visible.is_some_and(|v| !v.eval_bool(state)) {
         return None;
     }
