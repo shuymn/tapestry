@@ -91,6 +91,23 @@ impl Q {
         self.mul(Self { n: 1, d: 2 })
     }
 
+    /// `(k + self) / 10` for a digit `k` and `0 ≤ self < 1`, the next
+    /// fraction of a decimal read from its last digit. With `self = n/d`
+    /// reduced, the sum is `N / 10d` for `N = kd + n`; `N` and `d` are
+    /// coprime, so the only common factor is `g = gcd(N, 10)`, found from
+    /// the last digits, and `N / g` is built from `d / g`, `n / g` and
+    /// their remainders. No intermediate passes the reduced result.
+    fn digit_in(self, k: u8) -> Option<Self> {
+        let (n, d, k) = (self.n, self.d, i128::from(k));
+        let g = gcd(k.checked_mul(d % 10)?.checked_add(n % 10)?, 10)?;
+        let rem = k.checked_mul(d % g)?.checked_add(n % g)?.checked_div(g)?;
+        let num = k
+            .checked_mul(d.checked_div(g)?)?
+            .checked_add(n.checked_div(g)?)?
+            .checked_add(rem)?;
+        Self::new(num, d.checked_mul(10_i128.checked_div(g)?)?)
+    }
+
     /// A number token as written, exactly: an optional sign, digits with
     /// an optional point, and an optional exponent, as the source's float
     /// fields accept (`20`, `20.0`, `2e1` and `+200E-1` are one value).
@@ -99,12 +116,11 @@ impl Q {
     ///
     /// The exponent moves the point among the digits. The whole part
     /// before it is read from its first digit; the fraction after it from
-    /// its last, `(digit + rest) / 10` reduced at every step, so factors
-    /// of 2 and 5 cancel as they arise and no step's denominator passes
-    /// the fraction's own reduced one. A point moved past either end
-    /// multiplies or divides by ten a step at a time, which grows a
-    /// nonzero value or its denominator each step and so overflows within
-    /// a few hundred steps however large the exponent.
+    /// its last, each step [`Q::digit_in`], so no step's numerator or
+    /// denominator passes the fraction's own reduced ones. A point moved
+    /// past either end multiplies or divides by ten a step at a time,
+    /// which grows a nonzero value or its denominator each step and so
+    /// overflows within a few hundred steps however large the exponent.
     pub(crate) fn decimal(raw: &str) -> Option<Self> {
         let (negative, rest) = match raw.as_bytes().first() {
             Some(b'-') => (true, raw.get(1..)?),
@@ -124,14 +140,14 @@ impl Q {
             return Some(Self::ZERO);
         }
         let ten = Self::int(10);
-        let digit = |b: u8| Self::int(b - b'0');
+        let digit = |b: u8| Some(Self::int(b.checked_sub(b'0')?));
         let len = int.len().checked_add(frac.len())?;
         // The point's place among the digits, and where it splits them.
         let point = i64::try_from(int.len()).ok()?.checked_add(exp)?;
         let split = usize::try_from(point.clamp(0, i64::try_from(len).ok()?)).ok()?;
         let mut whole = Self::ZERO;
         for b in digits().take(split) {
-            whole = whole.mul(ten)?.add(digit(b))?;
+            whole = whole.mul(ten)?.add(digit(b)?)?;
         }
         let mut part = Self::ZERO;
         for i in (split..len).rev() {
@@ -139,14 +155,14 @@ impl Q {
                 Some(j) => frac.as_bytes().get(j),
                 None => int.as_bytes().get(i),
             };
-            part = digit(*b?).div(ten)?.add(part.div(ten)?)?;
+            part = part.digit_in(b?.checked_sub(b'0')?)?;
         }
         let len = i64::try_from(len).ok()?;
         for _ in len..point {
             whole = whole.mul(ten)?;
         }
         for _ in point..0 {
-            part = part.div(ten)?;
+            part = part.digit_in(0)?;
         }
         let v = whole.add(part)?;
         if negative { Self::ZERO.sub(v) } else { Some(v) }
@@ -327,6 +343,16 @@ mod tests {
         assert_eq!(dec("123.456"), Some(q(15_432, 125)));
         assert_eq!(dec("1234.5e-2"), Some(q(2_469, 200)));
         assert_eq!(dec("0.0012e3"), Some(q(6, 5)));
+        // (9 + 2^-124) / 10: a fraction whose last step would pass
+        // i128 before its factor of 5 cancels.
+        let edge = "0.90000000000000000000000000000000000000470197740328915003187494614888898271127466222708835008603500682511366903781890869140625";
+        assert_eq!(
+            dec(edge),
+            Some(q(
+                38_281_766_278_605_577_139_629_643_336_073_923_789,
+                1 << 125
+            ))
+        );
         // Past the rationals after reduction: a numerator, a denominator,
         // an exponent.
         assert_eq!(dec("1e39"), None);
@@ -339,6 +365,24 @@ mod tests {
         for bad in ["", ".", "e5", "1e", "1.2.3", "--1", "0x10", "1_0"] {
             assert_eq!(dec(bad), None, "{bad}");
         }
+    }
+
+    #[test]
+    fn a_digit_step_is_the_reduced_sum() {
+        // Every reduced n/d in [0, 1) with d ≤ 400, every digit.
+        for d in 1..=400_i128 {
+            for n in (0..d).filter(|&n| gcd(n, d) == Some(1) || n == 0) {
+                let part = q(n, d);
+                for k in 0..=9_u8 {
+                    let want = Q::new(i128::from(k) * d + n, 10 * d);
+                    assert_eq!(part.digit_in(k), want, "{k} + {n}/{d}");
+                }
+            }
+        }
+        // Near the bound: the factor cancels before anything is built.
+        let top = 1_i128 << 124;
+        assert_eq!(q(1, top).digit_in(9), Some(q(9 * (top / 5) + 2, top * 2)));
+        assert_eq!(q(1, top).digit_in(8), None);
     }
 
     #[test]
