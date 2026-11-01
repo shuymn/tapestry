@@ -387,7 +387,14 @@ impl Screen for MenuScreen {
         })
     }
 
-    fn loading(&mut self, page: &MenuPage, changed: bool) -> Result<FrameTiming, RenderError> {
+    /// The lines only: the typed update is for a skin's loading frame,
+    /// which the simple skin does not draw.
+    fn loading(
+        &mut self,
+        page: &MenuPage,
+        _update: Option<&crate::loading_text::LoadingUpdate>,
+        changed: bool,
+    ) -> Result<FrameTiming, RenderError> {
         if changed || self.text.is_none() {
             self.prepare(page, LOADING_LEFT, LOADING_TOP)?;
         }

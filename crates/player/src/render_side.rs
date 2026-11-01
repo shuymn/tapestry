@@ -41,6 +41,7 @@ use input::QpcClock;
 use render::measure::{FrameStatistics, Presentation};
 use render::{FrameInput, FrameTiming, RenderError};
 
+use crate::loading_text::LoadingUpdate;
 use crate::measure::{Drawn, Figures, Measure, PlayMeasure};
 use crate::menu_screen::{MenuPage, SPLASH};
 use crate::tuning::LiveTuning;
@@ -115,13 +116,20 @@ pub trait Screen: Send {
     }
     /// Draws the play screen while a chart loads before the countdown:
     /// the skin's loading frame with `page`, the load's lines, over it,
-    /// laid out again when `changed` (design.md "Play Lifecycle"). The
-    /// default draws them as a menu page.
+    /// laid out again when `changed` (design.md "Play Lifecycle"). `update`
+    /// is the same moment typed, when the lines came with it, of the same
+    /// loading lifetime. The default draws the lines as a menu page.
     ///
     /// # Errors
     ///
     /// As [`menu`](Self::menu).
-    fn loading(&mut self, page: &MenuPage, changed: bool) -> Result<FrameTiming, RenderError> {
+    fn loading(
+        &mut self,
+        page: &MenuPage,
+        update: Option<&LoadingUpdate>,
+        changed: bool,
+    ) -> Result<FrameTiming, RenderError> {
+        let _ = update;
         self.menu(page, changed)
     }
     /// Draws the launch screen `elapsed` after the render thread started,
@@ -283,16 +291,21 @@ struct Shared {
     loading: Mutex<LoadingSlot>,
 }
 
-/// The loading state's lifetime, its newest page until the render thread
-/// takes it or the lifetime ends, and whether a [`RenderMsg::Loading`] of
-/// this lifetime waits in the channel. Each clear starts a new lifetime: a
-/// sink, a signal or a frame of an older one does nothing.
+/// The loading state's lifetime, its newest page and the typed update
+/// shown with it until the render thread takes them or the lifetime ends,
+/// and whether a [`RenderMsg::Loading`] of this lifetime waits in the
+/// channel. Each clear starts a new lifetime: a sink, a signal or a frame
+/// of an older one does nothing.
 #[derive(Debug, Default)]
 struct LoadingSlot {
     lifetime: u64,
     page: Option<Box<MenuPage>>,
+    update: Option<Box<LoadingUpdate>>,
     signaled: bool,
 }
+
+/// A loading page taken from the slot, with its typed update if it had one.
+type TakenLoading = (Box<MenuPage>, Option<Box<LoadingUpdate>>);
 
 /// The end screen's newest page with its number, until the render thread
 /// takes it or the end screen is left, and the number of the last page
@@ -335,16 +348,18 @@ impl Shared {
         self.loading.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Takes the waiting lines of loading lifetime `lifetime`, if it is
-    /// still the current one: the signal that came for them is taken with
-    /// them. A signal of an ended lifetime takes nothing.
-    fn take_loading(&self, lifetime: u64) -> Option<Box<MenuPage>> {
+    /// Takes the waiting lines of loading lifetime `lifetime` and their
+    /// typed update, if it is still the current one: the signal that came
+    /// for them is taken with them. A signal of an ended lifetime takes
+    /// nothing.
+    fn take_loading(&self, lifetime: u64) -> Option<TakenLoading> {
         let mut slot = self.loading_slot();
         if slot.lifetime != lifetime {
             return None;
         }
         slot.signaled = false;
-        slot.page.take()
+        let update = slot.update.take();
+        slot.page.take().map(|page| (page, update))
     }
 
     /// Whether loading lifetime `lifetime` is still the current one.
@@ -359,6 +374,7 @@ impl Shared {
         slot.lifetime = slot.lifetime.wrapping_add(1);
         slot.signaled = false;
         drop(slot.page.take());
+        drop(slot.update.take());
     }
 }
 
@@ -377,13 +393,26 @@ pub struct LoadingSink {
 
 impl LoadingSink {
     /// Shows `page` as the loading state, if the sink's lifetime is still
-    /// the current one.
+    /// the current one, without a typed update.
+    #[cfg(test)]
     pub fn show(&self, page: MenuPage) {
+        self.put(page, None);
+    }
+
+    /// Shows `page` as the loading state with `update`, the same moment
+    /// typed, if the sink's lifetime is still the current one: the two
+    /// replace a waiting pair together.
+    pub fn show_typed(&self, page: MenuPage, update: LoadingUpdate) {
+        self.put(page, Some(Box::new(update)));
+    }
+
+    fn put(&self, page: MenuPage, update: Option<Box<LoadingUpdate>>) {
         let mut slot = self.shared.loading_slot();
         if slot.lifetime != self.lifetime {
             return;
         }
         drop(slot.page.replace(Box::new(page)));
+        drop(std::mem::replace(&mut slot.update, update));
         if !slot.signaled {
             slot.signaled = true;
             // A thread that already ended ignores it.
@@ -750,10 +779,11 @@ enum Mode {
     /// The end screen: [`Run::end_page`].
     End,
     /// The select screen, or with `loading` the play screen's loading
-    /// state of that loading lifetime and its lines; `changed` until the
-    /// page is laid out.
+    /// state of that loading lifetime, its lines and their typed `update`;
+    /// `changed` until the page is laid out.
     Menu {
         page: Box<MenuPage>,
+        update: Option<Box<LoadingUpdate>>,
         changed: bool,
         loading: Option<u64>,
     },
@@ -862,6 +892,7 @@ impl Run {
                         },
                         _ => Mode::Menu {
                             page,
+                            update: None,
                             changed: true,
                             loading: None,
                         },
@@ -870,9 +901,10 @@ impl Run {
                 Ok(RenderMsg::Loading(lifetime)) => {
                     // Lines the slot no longer holds (taken, or their
                     // lifetime ended) change nothing.
-                    if let Some(page) = self.shared.take_loading(lifetime) {
+                    if let Some((page, update)) = self.shared.take_loading(lifetime) {
                         mode = Mode::Menu {
                             page,
+                            update,
                             changed: true,
                             loading: Some(lifetime),
                         };
@@ -984,6 +1016,7 @@ impl Run {
             {
                 mode = Mode::Menu {
                     page,
+                    update: None,
                     changed: true,
                     loading: None,
                 };
@@ -997,6 +1030,7 @@ impl Run {
                         // comes next.
                         mode = pending.take().map_or(Mode::Idle, |page| Mode::Menu {
                             page,
+                            update: None,
                             changed: true,
                             loading: None,
                         });
@@ -1066,13 +1100,18 @@ impl Run {
                     }
                     drawn
                 }
-                Mode::Menu { page, changed, .. } => {
+                Mode::Menu {
+                    page,
+                    update,
+                    changed,
+                    ..
+                } => {
                     // A screen built again after a failure lays the page
                     // out again.
                     #[cfg(feature = "dev-tools")]
                     let [_, _, _, before] = crate::alloc_count::counts();
                     let drawn = if loading_frame {
-                        screen.loading(page, *changed)
+                        screen.loading(page, update.as_deref(), *changed)
                     } else {
                         screen.menu(page, *changed)
                     }
@@ -1202,6 +1241,7 @@ mod tests {
     use render::{FrameInput, FrameTiming, RenderError, SkinError};
 
     use super::{MakeScreen, NoFrames, RenderMsg, Screen, ScreenError, View, spawn};
+    use crate::loading_text::{LoadingUpdate, Stage};
     use crate::measure::{Measure, PlayMeasure};
 
     fn timing(presented: bool) -> FrameTiming {
@@ -1615,6 +1655,7 @@ mod tests {
         fn loading(
             &mut self,
             page: &crate::menu_screen::MenuPage,
+            _update: Option<&crate::loading_text::LoadingUpdate>,
             _changed: bool,
         ) -> Result<FrameTiming, RenderError> {
             Ok(self.note(true, page))
@@ -2052,6 +2093,115 @@ mod tests {
             ]
         );
         link.exit();
+    }
+
+    /// A screen that notes every loading frame's first line and typed
+    /// update.
+    type Typed = Arc<std::sync::Mutex<Vec<(String, Option<LoadingUpdate>)>>>;
+
+    struct TypedLoading {
+        seen: Typed,
+    }
+
+    impl Screen for TypedLoading {
+        fn load(
+            &mut self,
+            _chart: &Chart,
+            _section: Option<&eval::Section>,
+        ) -> Result<(), RenderError> {
+            Ok(())
+        }
+        fn wait(&self) -> bool {
+            true
+        }
+        fn paced(&self) -> bool {
+            false
+        }
+        fn build(&mut self, _f: &FrameInput<'_>) {}
+        fn draw(&mut self) -> Result<FrameTiming, RenderError> {
+            Ok(timing(true))
+        }
+        fn text(&mut self, _lines: &[&str]) -> Result<bool, RenderError> {
+            Ok(true)
+        }
+        fn loading(
+            &mut self,
+            page: &crate::menu_screen::MenuPage,
+            update: Option<&LoadingUpdate>,
+            _changed: bool,
+        ) -> Result<FrameTiming, RenderError> {
+            let line = page
+                .lines
+                .first()
+                .map_or_else(String::new, |l| l.text.clone());
+            self.seen.lock().unwrap().push((line, update.cloned()));
+            Ok(timing(true))
+        }
+        #[cfg(feature = "dev-tools")]
+        fn read_back(&self) -> Option<(u32, u32, Vec<u8>)> {
+            None
+        }
+    }
+
+    /// The typed update shown with a loading page reaches the screen with
+    /// that page; a page shown without one carries none, not the one
+    /// before; and an update of an ended loading lifetime is never drawn.
+    #[test]
+    fn typed_loading_updates_travel_with_their_page_and_lifetime() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let noted = Arc::clone(&seen);
+        let make: MakeScreen = Box::new(move || {
+            Ok(Box::new(TypedLoading {
+                seen: Arc::clone(&noted),
+            }) as Box<dyn Screen>)
+        });
+        let clock = QpcClock::start();
+        let link = spawn(
+            make,
+            None,
+            None,
+            clock,
+            view(),
+            measure(clock),
+            Box::new(NoFrames),
+        )
+        .unwrap();
+        let update = |stage, title: &str| LoadingUpdate {
+            stage,
+            chart: crate::loading_text::ChosenChart {
+                title: Some(title.to_owned()),
+                genre: Some("Genre".to_owned()),
+                ..crate::loading_text::ChosenChart::default()
+            },
+            preset: "preset".to_owned(),
+            practice: false,
+        };
+        let drawn = |line: &str| {
+            let line = line.to_owned();
+            let seen = Arc::clone(&seen);
+            move || seen.lock().unwrap().iter().any(|(l, _)| *l == line)
+        };
+        let sink = link.loading();
+        let chart_stage = update(Stage::Chart, "One");
+        sink.show_typed(one_line("A"), chart_stage.clone());
+        assert!(wait_until(drawn("A")));
+        sink.show(one_line("B"));
+        assert!(wait_until(drawn("B")));
+        // The old lifetime's sink after loading ended, then the next one's.
+        link.clear_loading();
+        sink.show_typed(one_line("stale"), update(Stage::Loudness, "Old"));
+        let next = link.loading();
+        let sounds = update(Stage::Sounds { done: 1, files: 2 }, "Two");
+        next.show_typed(one_line("C"), sounds.clone());
+        assert!(wait_until(drawn("C")));
+        std::thread::sleep(Duration::from_millis(50));
+        link.exit();
+        let seen = seen.lock().unwrap().clone();
+        let first = |line: &str| seen.iter().find(|(l, _)| l == line).map(|(_, u)| u.clone());
+        assert_eq!(first("A"), Some(Some(chart_stage)), "{seen:?}");
+        assert_eq!(first("B"), Some(None), "{seen:?}");
+        assert_eq!(first("C"), Some(Some(sounds)), "{seen:?}");
+        assert!(!seen.iter().any(|(l, _)| l == "stale"), "{seen:?}");
     }
 
     /// A chart the screen cannot draw is refused, and the select screen
