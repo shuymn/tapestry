@@ -203,15 +203,6 @@ pub(crate) type Crop = [u32; 2];
 /// it (`play/SkinNote.java:113-138`).
 pub(crate) const FALLBACK_SIZE: [u32; 2] = [32, 8];
 
-/// The straight RGBA of `paint`: the source's white, yellow and red.
-fn fallback_color(paint: NoteFallback) -> [u8; 4] {
-    match paint {
-        NoteFallback::Tap => [255, 255, 255, 255],
-        NoteFallback::Long => [255, 255, 0, 255],
-        NoteFallback::Mine => [255, 0, 0, 255],
-    }
-}
-
 /// The sheet being built, with the importer's caches.
 pub(crate) struct Assets {
     builder: SheetBuilder,
@@ -265,10 +256,12 @@ impl Assets {
         budget: &mut Budget,
         paint: NoteFallback,
     ) -> Result<u32, ImportLimit> {
-        let slot = match paint {
-            NoteFallback::Tap => 0,
-            NoteFallback::Long => 1,
-            NoteFallback::Mine => 2,
+        // The cache slot and the straight RGBA: the source's white,
+        // yellow and red.
+        let (slot, color) = match paint {
+            NoteFallback::Tap => (0, [255, 255, 255, 255]),
+            NoteFallback::Long => (1, [255, 255, 0, 255]),
+            NoteFallback::Mine => (2, [255, 0, 0, 255]),
         };
         if let Some(&Some(i)) = self.note_fallbacks.get(slot) {
             return Ok(i);
@@ -276,7 +269,7 @@ impl Assets {
         budget.image(1)?;
         let def = SolidImageDef {
             size: FALLBACK_SIZE,
-            color: fallback_color(paint),
+            color,
             filter: Filter::Nearest,
         };
         let i = self.builder.add_solid_image(def).map_err(|e| match e {
