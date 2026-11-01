@@ -9,18 +9,17 @@
 
 use skin_model::{Filter, LaneParts, LaneStyle, LanesDef, Side, Source, SourceLanes};
 
-use super::super::asset::Crop;
+use super::super::asset::{Crop, FALLBACK_SIZE};
 use super::super::geom::{HEIGHT, Offset, Q, Rect};
 use super::super::policy::{self, CriticalPart, Role};
-use super::super::report::{DeviationId, LaneApprox, NoteKind, Severity, Span};
+use super::super::report::{
+    DeviationId, LaneApprox, NoteFallback, NoteKind, PartWhy, Severity, Span,
+};
 use super::super::track::{self, Stretch};
 use super::super::{Common, Cx, Dst, Opts, RUNTIME_OFFSETS};
 use super::SrcImage;
+use super::note_parts::LANES;
 use crate::error::ImportError;
-use crate::tree::Scalar;
-
-/// The lanes the source draws.
-const LANES: usize = 8;
 
 /// The lanes once their destination is mapped.
 pub(crate) struct LaneState {
@@ -53,32 +52,6 @@ fn crop_rows(y: u32, h: u32, kept: Q) -> Option<Crop> {
         .ok()
         .filter(|&n| n > 0)?;
     Some([u32::try_from(first).ok()?, rows])
-}
-
-/// `v` exactly; `None` for one beyond the rationals' range.
-fn f32_q(v: f32) -> Option<Q> {
-    if !v.is_finite() {
-        return None;
-    }
-    let bits = v.to_bits();
-    let negative = bits >> 31 == 1;
-    let exp = i32::try_from((bits >> 23) & 0xFF).ok()?;
-    let frac = i128::from(bits & 0x7F_FFFF);
-    let (m, e) = if exp == 0 {
-        (frac, -149)
-    } else {
-        (frac | 0x80_0000, exp - 150)
-    };
-    let m = if negative { -m } else { m };
-    if e >= 0 {
-        Q::new(m.checked_mul(1_i128.checked_shl(e.unsigned_abs())?)?, 1)
-    } else {
-        let d = 1_i128.checked_shl(e.unsigned_abs())?;
-        if d <= 0 {
-            return None;
-        }
-        Q::new(m, d)
-    }
 }
 
 /// The lanes' span as read ahead of the walk, for the offset-4 rule.
@@ -249,72 +222,16 @@ impl Cx<'_> {
         if self.lanes.is_some() {
             return refuse(self, "note");
         }
-        const FIELDS: [&str; 22] = [
-            "note",
-            "lnstart",
-            "lnend",
-            "lnbody",
-            "lnbodyActive",
-            "lnactive",
-            "hcnstart",
-            "hcnend",
-            "hcnbody",
-            "hcnactive",
-            "hcnbodyActive",
-            "hcndamage",
-            "hcnbodyMiss",
-            "hcnreactive",
-            "hcnbodyReactive",
-            "mine",
-            "hidden",
-            "processed",
-            "dst2",
-            "expansionrate",
-            "size",
-            "group",
-        ];
-        let fields = self.def.fields(rec, FIELDS);
-        let mut lists: Vec<Vec<Option<String>>> = Vec::with_capacity(18);
-        for (f, name) in fields.iter().zip(FIELDS).take(18) {
-            lists.push(self.opt_strings(*f, name)?);
-        }
-        let none = Vec::new();
-        let list = |i: usize| lists.get(i).unwrap_or(&none);
-        let [note, lnstart, lnend, lnbody, lnbody_active, lnactive] = [0, 1, 2, 3, 4, 5].map(list);
-        let hcn: Vec<&Vec<Option<String>>> = (6..15).map(list).collect();
-        let [mine, hidden, processed] = [15, 16, 17].map(list);
-        let [.., dst2, expansion, size, group] = fields;
+        let [dst2, expansion, size, group] = self
+            .def
+            .fields(rec, ["dst2", "expansionrate", "size", "group"]);
 
-        // Preconditions (`SkinNote.java:27-40`, `JsonPlaySkinObjectLoader.
-        // java:50-93`): eight notes and lanes, long-note arrays at least
-        // `lnend`'s length, eight mines.
+        // Preconditions: the part arrays whole (`note_parts`), eight
+        // lanes on one row.
+        let plan = self.note_parts(rec)?;
         let lane_rects = self.lane_rects(rec)?;
-        if note.len() != LANES || lane_rects.len() != LANES {
+        if lane_rects.len() != LANES {
             return refuse(self, "dst");
-        }
-        let (on, off) = if lnbody_active.is_empty() {
-            (lnbody, lnactive)
-        } else {
-            (lnbody_active, lnbody)
-        };
-        let hcn_len = |i: usize| hcn.get(i).map_or(0, |l| l.len());
-        let hcn_lists: [usize; 6] = if hcn_len(4) == 0 {
-            // hcnstart, hcnend, hcnbody, hcnactive, hcndamage, hcnreactive
-            [0, 1, 2, 3, 5, 7]
-        } else {
-            // hcnstart, hcnend, hcnbodyActive, hcnbody, hcnbodyReactive,
-            // hcnbodyMiss
-            [0, 1, 4, 2, 8, 6]
-        };
-        let tail = lnend.len();
-        if tail < LANES
-            || [lnstart, on, off].iter().any(|l| l.len() < tail)
-            || hcn_lists.iter().any(|&i| hcn_len(i) < tail)
-        {
-            return refuse(self, "lnend");
-        }
-        if mine.len() < LANES {
-            return refuse(self, "mine");
         }
         let ys: Vec<i32> = lane_rects.iter().map(|(_, r)| r[1]).collect();
         if ys.windows(2).any(|w| matches!(w, [a, b] if a != b)) {
@@ -365,50 +282,91 @@ impl Cx<'_> {
         }
         let span = span_of(&xs);
 
-        // The parts, each its lane's image in the image table, drawn nearest.
+        // Note heights: `size[i]·r` exactly, else the note's cell height
+        // (`JsonPlaySkinObjectLoader.java:85-92`), plus the h offset.
+        let sizes = self.note_sizes(size)?;
+
+        // The parts: each the first image of its id in the image table
+        // (`JsonSkinObjectLoader.java:584-598`). An id naming none draws
+        // the source's generated paint (`play/SkinNote.java:112-140`),
+        // except an unsized tap: the source reads its height from the
+        // missing image (`JsonPlaySkinObjectLoader.java:91`).
+        let mut resolved = [[None::<u32>; 6]; LANES];
+        for (u, (lane, nodes)) in resolved.iter_mut().zip(&plan.nodes).enumerate() {
+            for ((slot, &node), &field) in lane.iter_mut().zip(nodes).zip(&plan.fields) {
+                let name = self.def.string(node, field)?.unwrap_or_default();
+                *slot = self.image_rec(&name)?;
+            }
+            let sized = sizes.get(u).is_some_and(Option::is_some);
+            if let ([None, ..], [tap, ..], false) = (*lane, *nodes, sized) {
+                let lane = u8::try_from(u).unwrap_or(u8::MAX);
+                let why = PartWhy::MissingSize { lane };
+                return Err(self.part_error(at, Some(tap), "note", why));
+            }
+        }
+
+        // Each part added, drawn nearest; the generated paint shared by
+        // every part that draws it, each reported where it is named.
+        // The lane map (`play/LaneProperty.java:46-50`): source lane 7 is
+        // the scratch, model lane 0.
+        let model = |u: usize| if u == LANES - 1 { 0 } else { u + 1 };
         c.filter = Filter::Nearest;
+        let paints = [
+            NoteFallback::Tap,
+            NoteFallback::Long,
+            NoteFallback::Long,
+            NoteFallback::Long,
+            NoteFallback::Long,
+            NoteFallback::Mine,
+        ];
         let mut cells = [[0_u32; 2]; LANES];
         let mut images = [[0_u32; 6]; LANES];
-        let names: [(&Vec<Option<String>>, &'static str); 6] = [
-            (note, "note"),
-            (lnstart, "lnstart"),
-            (lnend, "lnend"),
-            (on, "lnbody"),
-            (off, "lnbody"),
-            (mine, "mine"),
-        ];
-        for u in 0..LANES {
-            for (p, (names, field)) in names.iter().enumerate() {
-                // A `null` entry names no image, unlike an empty id
-                // (`JsonSkinObjectLoader.java:584-599` fails on it).
-                let Some(Some(name)) = names.get(u) else {
-                    return refuse(self, field);
+        for (u, ((recs, nodes), (lane_images, lane_cell))) in resolved
+            .iter()
+            .zip(&plan.nodes)
+            .zip(images.iter_mut().zip(&mut cells))
+            .enumerate()
+        {
+            let parts = recs.iter().zip(nodes).zip(plan.fields.iter().zip(paints));
+            for (p, ((img, &node), (&field, paint))) in parts.enumerate() {
+                let (image, cell) = match *img {
+                    Some(img) => {
+                        let s = self.src_image(img)?;
+                        let Some(found) = self.add_src_image(&c, img, &s, s.div)? else {
+                            return refuse(self, field);
+                        };
+                        found
+                    }
+                    None => {
+                        let span = self.arena_span(node);
+                        let image = self
+                            .assets
+                            .note_fallback(&mut self.budget, paint)
+                            .map_err(|l| self.limit(span, l))?;
+                        let usage = &mut self.budget.usage;
+                        usage.note_fallbacks = usage.note_fallbacks.saturating_add(1);
+                        let lane = u8::try_from(model(u)).unwrap_or(u8::MAX);
+                        self.note(
+                            Some(span),
+                            Severity::Fallback,
+                            NoteKind::NotePartFallback { field, lane, paint },
+                        );
+                        (image, FALLBACK_SIZE)
+                    }
                 };
-                let Some(img) = self.image_rec(name)? else {
-                    return refuse(self, field);
-                };
-                let s = self.src_image(img)?;
-                let Some((image, cell)) = self.add_src_image(&c, img, &s, s.div)? else {
-                    return refuse(self, field);
-                };
-                if let Some(slot) = images.get_mut(u).and_then(|i| i.get_mut(p)) {
+                if let Some(slot) = lane_images.get_mut(p) {
                     *slot = image;
                 }
-                if p == 0
-                    && let Some(c) = cells.get_mut(u)
-                {
-                    *c = cell;
+                if p == 0 {
+                    *lane_cell = cell;
                 }
             }
         }
 
-        // Note heights: `size[i]·r`, else the note's cell height
-        // (`JsonPlaySkinObjectLoader.java:88-92`), plus the h offset.
-        let sizes = self.floats(size, "size")?;
         let mut heights = [Q::ZERO; LANES];
-        for ((u, cell), h) in cells.iter().enumerate().zip(&mut heights) {
-            *h = match sizes.get(u) {
-                Some(&v) => f32_q(v).and_then(|q| q.mul(self.r)),
+        for ((size, cell), h) in sizes.iter().zip(&cells).zip(&mut heights) {
+            *h = match size {
+                Some(v) => v.mul(self.r),
                 None => Q::int(cell[1]).mul(self.r),
             }
             .and_then(|q| q.add(Q::int(o.h)))
@@ -466,9 +424,6 @@ impl Cx<'_> {
             note_h: nh.to_f32(),
         };
 
-        // The lane map (`play/LaneProperty.java:46-50`): source lane 7 is
-        // the scratch, model lane 0.
-        let model = |u: usize| if u == LANES - 1 { 0 } else { u + 1 };
         let mut lanes = [[0_i32; 2]; LANES];
         let mut parts = LaneParts {
             note: [0; LANES],
@@ -533,12 +488,12 @@ impl Cx<'_> {
         self.lanes = Some(state);
 
         // What the source draws that the model does not.
-        for (field, list) in [("hidden", hidden), ("processed", processed)] {
-            if !list.is_empty() {
+        for (field, set) in [("hidden", plan.hidden), ("processed", plan.processed)] {
+            if set {
                 self.ignored(at, NoteKind::Ignored { field });
             }
         }
-        if hcn.iter().any(|l| !l.is_empty()) {
+        if plan.hcn {
             self.ignored(at, NoteKind::Ignored { field: "hcn" });
         }
         // The BPM, STOP and time guides, which the source draws only under
@@ -565,29 +520,6 @@ impl Cx<'_> {
             self.lane_approx(at, part, LaneApprox::Expansion)?;
         }
         Ok(())
-    }
-
-    /// A `float[]` field's items as the source reads them, as `f32`.
-    fn floats(&self, field: Option<u32>, name: &'static str) -> Result<Vec<f32>, ImportError> {
-        let Some(f) = field else {
-            return Ok(Vec::new());
-        };
-        let arena = &self.def.arena;
-        if arena.node(f).kind != crate::tree::Kind::Array {
-            return Err(self.def.type_error(f, name, "an array"));
-        }
-        arena
-            .children(f)
-            .map(|i| {
-                #[expect(clippy::cast_possible_truncation, reason = "the source's float field")]
-                let v = match arena.scalar(i) {
-                    Scalar::Long(raw) => raw.parse::<i64>().ok().map(|v| v as f32),
-                    Scalar::Double(raw) => raw.parse::<f64>().ok().map(|v| v as f32),
-                    _ => None,
-                };
-                v.ok_or_else(|| self.def.type_error(i, name, "a number"))
-            })
-            .collect()
     }
 
     /// Whether an image listing offset 4 cannot move over the lanes
@@ -726,15 +658,6 @@ fn ops_negative(id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn floats_are_exact() {
-        assert_eq!(f32_q(13.0), Q::new(13, 1));
-        assert_eq!(f32_q(12.5), Q::new(25, 2));
-        assert_eq!(f32_q(0.1), Q::new(13_421_773, 134_217_728));
-        assert_eq!(f32_q(f32::INFINITY), None);
-        assert_eq!(f32_q(f32::MAX), None);
-    }
 
     fn rect(w: Q, h: Q) -> Rect {
         Rect {

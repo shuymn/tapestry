@@ -252,6 +252,28 @@ fn hidden_plus_of_a_malformed_file_is_admitted_then_dropped() {
 }
 
 #[test]
+fn a_trailing_null_part_admits_nothing() {
+    let eight = format!("[{}]", [r#""p""#; 8].join(", "));
+    let json = lanes("", "").replace(
+        &format!(r#""mine": {eight}"#),
+        &format!(r#""mine": [{}, null]"#, [r#""p""#; 8].join(", ")),
+    );
+    let (r, _, admits) = run(&json);
+    assert!(matches!(
+        r,
+        Err(ImportError::Critical {
+            part: super::CriticalPart::Lanes,
+            why: NoteKind::NotePart {
+                field: "mine",
+                why: super::PartWhy::NullEntry { index: 8 },
+            },
+            ..
+        })
+    ));
+    assert_eq!(admits, 0);
+}
+
+#[test]
 fn a_short_mine_list_admits_nothing() {
     let eight = format!("[{}]", [r#""p""#; 8].join(", "));
     let seven = format!("[{}]", [r#""p""#; 7].join(", "));
@@ -264,7 +286,10 @@ fn a_short_mine_list_admits_nothing() {
         r,
         Err(ImportError::Critical {
             part: super::CriticalPart::Lanes,
-            why: NoteKind::UnsupportedField { field: "mine" },
+            why: NoteKind::NotePart {
+                field: "mine",
+                why: super::PartWhy::Length { len: 7, need: 8 },
+            },
             ..
         })
     ));

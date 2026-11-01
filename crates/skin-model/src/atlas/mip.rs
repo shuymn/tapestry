@@ -51,6 +51,23 @@ pub(crate) fn blit(
     }
 }
 
+/// Fills the allocation `alloc` of a page `side` texels wide, gutter
+/// included, with straight colour `[r, g, b, a]` premultiplied: a
+/// generated cell's every texel, with no source image.
+pub(crate) fn blit_solid(page: &mut [u8], side: u32, [r, g, b, a]: [u8; 4], alloc: [u32; 4]) {
+    let [ax, ay, aw, ah] = alloc;
+    let texel = [premultiply(r, a), premultiply(g, a), premultiply(b, a), a];
+    for dy in 0..ah {
+        let start = (to_usize(ay + dy) * to_usize(side) + to_usize(ax)) * 4;
+        let Some(row) = page.get_mut(start..start + to_usize(aw) * 4) else {
+            continue;
+        };
+        for t in row.as_chunks_mut::<4>().0 {
+            *t = texel;
+        }
+    }
+}
+
 /// The 2×2 average of four texels' channel, rounded to nearest.
 fn mean(a: u8, b: u8, c: u8, d: u8) -> u8 {
     let sum = u16::from(a) + u16::from(b) + u16::from(c) + u16::from(d);

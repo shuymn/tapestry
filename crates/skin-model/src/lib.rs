@@ -95,7 +95,7 @@ pub use image::path::{Entry, FileId, Listing, Root, RootError};
 pub use image::{
     CycleDef, FileAt, FileDef, HEADER_BYTES, ImageDef, ImageError, MAX_FILE_BYTES, MAX_FILES,
     MAX_IMAGE_FRAMES, MAX_IMAGE_TEXELS, MAX_IMAGES, MAX_PATH_BYTES, MAX_SIDE, MAX_SKIN_FRAMES,
-    MAX_TOTAL_FILE_BYTES, MAX_TOTAL_TEXELS, Sheet,
+    MAX_TOTAL_FILE_BYTES, MAX_TOTAL_TEXELS, Sheet, SolidImageDef,
 };
 pub use layout::{
     Adjust, Anchor, Controls, LANE_WIDTH_PCT, Layout, LayoutError, MAX_INSET, MAX_OFFSET, Region,

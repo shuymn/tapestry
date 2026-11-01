@@ -35,8 +35,8 @@ use skin_model::{
 pub use budget::ImportLimit;
 pub use policy::CriticalPart;
 pub use report::{
-    DeviationId, FileChoice, LaneApprox, Note, NoteKind, NoteLoc, Object, PropertyKind, Report,
-    Rule, Severity, TimerWhy, TrackWhy, Usage,
+    DeviationId, FileChoice, LaneApprox, Note, NoteFallback, NoteKind, NoteLoc, Object, PartWhy,
+    PropertyKind, Report, Rule, Severity, TimerWhy, TrackWhy, Usage,
 };
 
 use self::asset::{Assets, Choices};

@@ -20,8 +20,8 @@ use input::raw;
 use replay::{DecodeError, DecodeLimits, FORMAT_VERSION, MAGIC, PlayRecord};
 use rules::{CanonicalError, RulePreset};
 use skin_beatoraja::{
-    Config, DeviationId, Header, ImportError, Imported, NoteKind, SIZES, Severity, import,
-    read_header, resolve,
+    Config, DeviationId, Header, ImportError, Imported, NoteFallback, NoteKind, SIZES, Severity,
+    import, read_header, resolve,
 };
 use skin_model::{FntError, FntFile, FntLimits};
 
@@ -423,7 +423,81 @@ pub fn draw(imported: &Imported) -> Vec<usize> {
     readout_probes(skin, &chart, &uvs, &mut batch);
     choice_probes(skin, &chart, &uvs, &mut batch);
     bar_probes(skin, &ctx, (&tally, &states), &uvs, &mut batch);
+    long_note_probes(skin, &ctx, (&tally, &states), &uvs, &mut batch);
     counts
+}
+
+/// A long note held and released in LN and CN, with its end in view and
+/// past the lanes' top, before, inside and after it: fallback paint and
+/// file paint alike, each frame inside the skin's capacities.
+fn long_note_probes(
+    skin: &skin_model::Skin,
+    ctx: &skin_model::PlayContext<'_>,
+    (tally, gauges): (&eval::Tally, &[eval::GaugeState]),
+    uvs: &skin_model::UvTable,
+    batch: &mut skin_model::QuadBatch,
+) {
+    use bms_model::{ChartBuilder, Lane, LnMode, TimeUs};
+    use eval::{JudgeEvent, JudgeEventKind};
+    use rules::Judgment;
+    use skin_model::{LaneView, Layout, SkinFrame};
+
+    let lane = Lane::new(1).expect("lane 1");
+    let held = [JudgeEvent {
+        seq: 0,
+        time: TimeUs(1_000_000),
+        origin: None,
+        kind: JudgeEventKind::LnHeld {
+            lane,
+            note: 0,
+            judgment: Judgment::Perfect,
+            deviation: TimeUs(0),
+        },
+    }];
+    let mut chart = ChartBuilder::new(150_000)
+        .long(lane, TimeUs(1_000_000), TimeUs(4_000_000))
+        .mine(Lane::new(2).expect("lane 2"), TimeUs(1_200_000), 10)
+        .build()
+        .expect("a chart of a long note");
+    for mode in [LnMode::Ln, LnMode::Cn] {
+        chart.meta.ln_mode = Some(mode);
+        let mut play = skin
+            .prepare(&chart, ctx)
+            .expect("an imported skin prepares");
+        for (ms, effects, cover) in [
+            (500_i64, &[][..], 0),
+            (1_000, &held[..], 300),
+            (2_000, &[][..], 0),
+            (3_990, &[][..], 1_000),
+            (4_500, &[][..], 0),
+        ] {
+            batch.clear();
+            let lanes = LaneView {
+                visible_time: TimeUs(600_000),
+                cover,
+                lift: 0,
+                hidden: 0,
+            };
+            let frame = SkinFrame {
+                now: TimeUs(ms * 1_000),
+                display_offset: TimeUs(0),
+                tally,
+                gauges,
+                gauge: 0,
+                effects,
+                complete: false,
+                target: [1_920, 1_080],
+                layout: &Layout::AUTHOR,
+                lanes,
+                loading: None,
+                readouts: readouts_for(lanes),
+                playing: true,
+            };
+            skin.build(&mut play, &frame, uvs, batch)
+                .expect("the frame builds");
+            check_batch(skin, batch);
+        }
+    }
 }
 
 /// The bar line groups over a bounded chart of bars: one every 125 ms
@@ -1065,6 +1139,38 @@ fn check_usage(i: &Imported) {
         if let NoteKind::Deviation(DeviationId::D9(_)) = n.kind {
             assert_eq!(n.severity, Severity::Deviation, "a lane approximation");
         }
+    }
+    // Fallback paint: at most the 48 mapped parts, each reported where it
+    // is named, on a model lane, sharing at most three generated images;
+    // only lanes draw it.
+    assert!(u.note_fallbacks <= 48, "more fallbacks than mapped parts");
+    let mut paints = 0_u8;
+    let mut entries = 0_u32;
+    for n in &i.report.notes {
+        if let NoteKind::NotePartFallback { lane, paint, .. } = n.kind {
+            assert_eq!(n.severity, Severity::Fallback, "a fallback's severity");
+            assert!(n.at.is_some(), "an unlocated fallback");
+            assert!(lane < 8, "a fallback off the lanes");
+            paints |= match paint {
+                NoteFallback::Tap => 1,
+                NoteFallback::Long => 2,
+                NoteFallback::Mine => 4,
+            };
+            entries += 1;
+        } else {
+            assert_ne!(n.severity, Severity::Fallback, "a fallback of another kind");
+        }
+    }
+    assert!(
+        entries == u.note_fallbacks || i.report.suppressed > 0,
+        "fallback entries and usage differ"
+    );
+    assert!(
+        u.images >= paints.count_ones(),
+        "generated images not charged"
+    );
+    if u.note_fallbacks > 0 {
+        assert!(i.scratch.is_some(), "fallback paint without lanes");
     }
 
     // An element dropped after its ops were charged keeps none of them.
