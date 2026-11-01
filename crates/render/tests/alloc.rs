@@ -1,11 +1,13 @@
 //! A frame's app work allocates nothing, from the first frame on (design.md
-//! "Scope of No Allocation"): [`render::build_frame`], the skin's build into
-//! the preallocated [`SpriteBatch`], with effects, and the staging of the
-//! batch into [`Instance`]s. `Renderer::build` runs the same function before
+//! "Scope of No Allocation"): [`Staging::build`], the skin's build into the
+//! preallocated batch, with effects, and the staging of the batch into
+//! instances. `Renderer::build` runs the same function before
 //! `Renderer::submit` calls into wgpu, whose own allocations are out of
-//! scope, so the test drives it without a GPU. A batch that fills up counts
-//! what it refuses without allocating, and the result screen's page, drawn
-//! every frame while it shows, allocates nothing either.
+//! scope, so the test drives it without a GPU. A resize applied between
+//! frames projects the canvas and the clips again without allocating, and
+//! so do the first frame after it and the later ones. A batch that fills up
+//! counts what it refuses without allocating, and the result screen's page,
+//! drawn every frame while it shows, allocates nothing either.
 //!
 //! The counting allocator counts only on the thread that opted in, so the
 //! harness's own threads do not disturb it. This file holds a single test
@@ -23,8 +25,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use bms_model::{Chart, ChartBuilder, TimeUs};
 use common::{MS, input, lane, view};
 use eval::{JudgeEvent, JudgeEventKind};
-use render::{Instance, MAX_SPRITES, SimpleSkin, SpriteBatch};
+use render::{ClipTable, MAX_SPRITES, PlaySkin, Scissor, SimpleSkin, Staging};
 use rules::Judgment;
+use skin_model::ClipId;
 
 struct Counting;
 
@@ -231,8 +234,11 @@ fn frames_do_not_allocate_from_the_first() {
     let (chart, taps) = chart();
     let mut skin = SimpleSkin::new();
     skin.load(&chart, None);
-    let mut batch = SpriteBatch::with_capacity(MAX_SPRITES);
-    let mut staging: Vec<Instance> = Vec::with_capacity(MAX_SPRITES);
+    let capacity = u32::try_from(MAX_SPRITES).unwrap();
+    let mut staging = Staging::new(capacity, &skin.canvas([1920, 1080]));
+    // A clip over the lanes' rows: its scissor is projected with the
+    // canvas.
+    staging.set_clips(ClipTable::new(vec![[0.0, 80.0, 1920.0, 800.0]]).unwrap());
     let v = view(42, 1_234);
     let mut effects: Vec<JudgeEvent> = Vec::with_capacity(64);
     let mut feed = Feed {
@@ -245,23 +251,54 @@ fn frames_do_not_allocate_from_the_first() {
     };
     // What `Renderer::build` does, before `submit` calls into wgpu, for
     // frame `k`: the instances it staged.
-    let mut frame = |k: i64| {
+    let mut frame = |staging: &mut Staging, skin: &mut SimpleSkin, k: i64| {
         let now = TimeUs(k * FRAME_US);
         feed.fill(now, &mut effects);
         let f = input(&v, now, TimeUs(8 * MS), &effects);
-        render::build_frame(&mut skin, &f, &mut batch, &mut staging);
-        staging.len()
+        staging.build(skin, &f);
+        staging.instances().len()
     };
 
     // The first frame, with the batch and the staging fresh from their
     // reservation.
-    let (first, first_allocs) = counted(|| frame(0));
+    let (first, first_allocs) = counted(|| frame(&mut staging, &mut skin, 0));
     assert!(first > 0);
     assert_eq!(first_allocs, 0, "the first frame allocated");
     // Every later frame.
-    let (drawn, later_allocs) = counted(|| (1..FRAMES).map(&mut frame).sum::<usize>());
+    let (drawn, later_allocs) = counted(|| {
+        (1..FRAMES)
+            .map(|k| frame(&mut staging, &mut skin, k))
+            .sum::<usize>()
+    });
     assert!(drawn > 0);
     assert_eq!(later_allocs, 0, "a later frame allocated");
+
+    // A resize to 21:9 applied between frames, as `Renderer::resize`
+    // applies it: the canvas and the clip projected again, then the first
+    // frame after it, then later ones.
+    let (resized, resize_allocs) = counted(|| {
+        staging.project(&skin.canvas([2560, 1080]));
+        frame(&mut staging, &mut skin, FRAMES)
+    });
+    assert!(resized > 0);
+    assert_eq!(
+        resize_allocs, 0,
+        "the resize or the frame after it allocated"
+    );
+    // The layout letterboxed at scale 1 with 320 columns of bars: the clip
+    // moves with it.
+    assert_eq!(staging.projection().target(), [2560, 1080]);
+    assert_eq!(
+        staging.scissor(Some(ClipId(0))),
+        Scissor::Rect([320, 80, 1920, 800])
+    );
+    let (drawn, after_allocs) = counted(|| {
+        (FRAMES + 1..FRAMES + 60)
+            .map(|k| frame(&mut staging, &mut skin, k))
+            .sum::<usize>()
+    });
+    assert!(drawn > 0);
+    assert_eq!(after_allocs, 0, "a later frame after the resize allocated");
     assert_eq!(feed.next, taps.len(), "every tap judged");
     assert_eq!(
         (feed.held, feed.ended),
@@ -273,15 +310,14 @@ fn frames_do_not_allocate_from_the_first() {
     // its notes not yet judged: the batch counts what it refuses, and
     // nothing allocates.
     skin.load(&chart, None);
-    let mut small = SpriteBatch::with_capacity(32);
-    let mut small_staging: Vec<Instance> = Vec::with_capacity(32);
+    let mut small = Staging::new(32, &skin.canvas([1920, 1080]));
     let f = input(&v, TimeUs(3_000 * MS), TimeUs(8 * MS), &[]);
     let (dropped, full_allocs) = counted(|| {
-        render::build_frame(&mut skin, &f, &mut small, &mut small_staging);
-        small.dropped()
+        small.build(&mut skin, &f);
+        small.batch().dropped()
     });
     assert!(dropped > 0, "the full batch counted no refusal");
-    assert_eq!(small_staging.len(), 32);
+    assert_eq!(small.instances().len(), 32);
     assert_eq!(full_allocs, 0, "a full batch allocated");
 
     // The result screen's page, its graphs at their fullest, allocates
@@ -305,11 +341,9 @@ fn frames_do_not_allocate_from_the_first() {
     let lines = vec!["RESULT".repeat(12); 27];
     let (staged, result_allocs) = counted(|| {
         for _ in 0..3 {
-            batch.clear();
-            render::result_screen(&lines, Some(&graphs), &mut batch);
-            batch.stage(&mut staging);
+            staging.fill(|b| render::result_screen(&lines, Some(&graphs), b));
         }
-        staging.len()
+        staging.instances().len()
     });
     assert!(staged > 27 * 60);
     assert_eq!(result_allocs, 0, "the result page allocated");

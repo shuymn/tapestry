@@ -13,9 +13,12 @@
 //! ([`crate::select::MenuInput`], design.md "Play Lifecycle"), through a
 //! queue that drops only keys past its bound ([`MenuQueue`]); the IME is
 //! allowed only while the search box has focus, and told where its caret
-//! is ([`ImeState`]) so the candidate window opens beside it. The event
-//! loop runs on a thread of its own, so the game keeps the main thread and
-//! the loaded chart never has to move.
+//! is ([`ImeState`]) so the candidate window opens beside it. The client
+//! size in physical pixels, at the window's making, on each resize and
+//! each DPI change, goes to the render thread through the slot of the
+//! newest size ([`Extent`]); a minimized window publishes zero sides. The
+//! event loop runs on a thread of its own, so the game keeps the main
+//! thread and the loaded chart never has to move.
 
 use std::num::NonZeroIsize;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -43,6 +46,7 @@ use winit::window::{Fullscreen, Window, WindowId};
 
 use crate::controls::Controls;
 use crate::menu_screen::WindowSink;
+use crate::render_side::Extent;
 use crate::select::{MenuInput, MenuKey, MenuQueue};
 
 /// What the game and render threads ask of the window thread.
@@ -69,6 +73,8 @@ struct Shared {
     caret: Mutex<Option<[f32; 4]>>,
     /// An [`Ask::Caret`] is on its way for [`caret`](Self::caret).
     caret_queued: AtomicBool,
+    /// The client size, for the render thread.
+    extent: Arc<Extent>,
     /// Whether the window was shown, for [`WindowShown`].
     shown: Mutex<bool>,
     shown_changed: Condvar,
@@ -286,6 +292,7 @@ impl ApplicationHandler<Ask> for App {
                 self.controls.focus(w.has_focus());
                 let surface = surface(&w);
                 let _ = ready.send(surface);
+                publish(&self.shared.extent, &w);
                 self.window = Some(w);
                 self.showing = Some(Showing::new(Instant::now()));
                 self.poll_showing(event_loop);
@@ -333,9 +340,17 @@ impl ApplicationHandler<Ask> for App {
                     }
                 }
             }
-            WindowEvent::Resized(_) => {
+            WindowEvent::Resized(size) => {
+                self.shared.extent.publish(size.width, size.height);
                 if let Some(w) = &self.window {
                     self.ime.report(w);
+                }
+            }
+            // The new size follows as a resize too; the size read here is
+            // the newest either way.
+            WindowEvent::ScaleFactorChanged { .. } => {
+                if let Some(w) = &self.window {
+                    publish(&self.shared.extent, w);
                 }
             }
             WindowEvent::CloseRequested => self.controls.close(),
@@ -437,6 +452,18 @@ impl WindowThread {
     pub fn shown(&self) -> WindowShown {
         WindowShown(Arc::clone(&self.shared))
     }
+
+    /// The window's client size, for the render thread to follow
+    /// ([`crate::render_side::RenderLink::follow`]).
+    pub fn extent(&self) -> Arc<Extent> {
+        Arc::clone(&self.shared.extent)
+    }
+}
+
+/// Publishes `window`'s client size in physical pixels.
+fn publish(extent: &Extent, window: &Window) {
+    let size = window.inner_size();
+    extent.publish(size.width, size.height);
 }
 
 /// The render thread's line to the window: the caret's area of each menu

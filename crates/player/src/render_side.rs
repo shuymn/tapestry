@@ -22,6 +22,15 @@
 //! 60 Hz at most, each frame waiting for the GPU to finish the one before
 //! or skipped while it has not.
 //!
+//! The window's physical size reaches the render thread through a slot
+//! that holds the newest only ([`Extent`]): the window thread publishes
+//! every resize and DPI change there and wakes the render thread with at
+//! most one message waiting, and the render thread applies the newest
+//! between frames, again to a screen built anew. While the window is
+//! minimized (a zero side) frames go on being built, unpaced and
+//! unpresented, and messages and handshakes are answered as ever; the
+//! newest nonzero size is applied when it comes back.
+//!
 //! A frame that fails (the surface was lost) drops the screen and tells
 //! the game thread, which ends the play; the next play's preparation builds
 //! the screen again, and if that fails the run ends with the error.
@@ -135,9 +144,114 @@ pub trait Screen: Send {
         let _ = elapsed;
         None
     }
+    /// Applies the window's newest physical size between frames: a zero
+    /// side minimizes ([`minimized`](Self::minimized)), and the play state
+    /// is kept. The default ignores it.
+    fn resize(&mut self, width: u32, height: u32) {
+        let _ = (width, height);
+    }
+    /// The target's size in pixels as last applied, never zero: what a
+    /// play frame is projected onto ([`FrameInput::target`]). The default
+    /// is the 1920×1080 layout's.
+    fn target(&self) -> [u32; 2] {
+        [1_920, 1_080]
+    }
+    /// Whether the window is minimized: frames are neither paced nor
+    /// presented until a nonzero size is applied. The default is never.
+    fn minimized(&self) -> bool {
+        false
+    }
     /// The last frame's pixels (RGBA8) and size, for an offscreen target.
     #[cfg(feature = "dev-tools")]
     fn read_back(&self) -> Option<(u32, u32, Vec<u8>)>;
+}
+
+/// The window's newest physical size, from the window thread to the render
+/// thread: each publish replaces the size not yet applied, and wakes the
+/// render thread with a [`RenderMsg::Resize`] only when none is on its
+/// way, so however often the window resizes, one size and one message
+/// wait.
+///
+/// One render thread is woken: the one whose link registered last
+/// ([`RenderLink::follow`]); a link that registered before is superseded
+/// and gets no later wake.
+///
+/// Its invariant, for each registration: while a render thread follows the
+/// slot, `queued` is set only while a `Resize` sent after that
+/// registration's `Follow` waits in the channel, because
+/// [`RenderLink::follow`] clears it and sends its `Follow` under the lock
+/// every publish sends under, and the render thread acknowledges the slot
+/// it follows as it takes each `Resize`. A flag an earlier registration
+/// left set (its wake sent to a thread that ended, or taken while another
+/// slot was followed) is cleared by the next one; a `Resize` from a slot
+/// no longer followed may clear the followed slot's flag early, which
+/// costs one extra wake, never a lost one.
+#[derive(Debug)]
+pub struct Extent {
+    /// Width in the high 32 bits, height in the low; [`UNKNOWN`] before
+    /// the first publish.
+    size: AtomicU64,
+    /// A [`RenderMsg::Resize`] is on its way for [`size`](Self::size).
+    queued: AtomicBool,
+    /// Where the wake goes, once a render thread follows the slot
+    /// ([`RenderLink::follow`]).
+    wake: Mutex<Option<Sender<RenderMsg>>>,
+}
+
+/// No size published yet.
+const UNKNOWN: u64 = u64::MAX;
+
+impl Default for Extent {
+    fn default() -> Self {
+        Self {
+            size: AtomicU64::new(UNKNOWN),
+            queued: AtomicBool::new(false),
+            wake: Mutex::new(None),
+        }
+    }
+}
+
+impl Extent {
+    /// Publishes the window's client size in physical pixels, zero sides
+    /// when minimized, and wakes the render thread unless a wake is on its
+    /// way already.
+    pub fn publish(&self, width: u32, height: u32) {
+        let packed = (u64::from(width) << 32) | u64::from(height);
+        self.size.store(packed, Ordering::Release);
+        // Under the sender's lock, so a wake is marked only when it is
+        // sent: before a render thread follows, none is, and the
+        // [`RenderMsg::Follow`] that comes after reads the newest size.
+        let wake = self.wake.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(tx) = wake.as_ref()
+            && !self.queued.swap(true, Ordering::AcqRel)
+        {
+            // A render thread that ended ignores it; the flag stays set
+            // until the next registration clears it.
+            let _ = tx.send(RenderMsg::Resize);
+        }
+    }
+
+    /// Takes the wake on its way: the render thread calls it as it takes a
+    /// [`RenderMsg::Resize`], before it reads the size.
+    /// A publish after this sends again; one before it was seen through
+    /// the flag it set, so its size is the one read next.
+    fn acknowledge(&self) {
+        self.queued.swap(false, Ordering::AcqRel);
+    }
+
+    /// The newest size published, if any. Reading it takes no wake, so a
+    /// wake still on its way stays the only one. Allocates nothing: the
+    /// render thread calls it between play frames.
+    fn latest(&self) -> Option<(u32, u32)> {
+        let packed = self.size.load(Ordering::Acquire);
+        // The halves of a packed size.
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "each half holds one u32 side"
+        )]
+        let size = ((packed >> 32) as u32, packed as u32);
+        (packed != UNKNOWN).then_some(size)
+    }
 }
 
 /// Builds the screen on the render thread, at startup and after a failure.
@@ -215,6 +329,11 @@ pub enum RenderMsg {
         /// Where the figures go.
         reply: mpsc::SyncSender<Option<Figures>>,
     },
+    /// The window's size changed: apply the newest in the [`Extent`]
+    /// followed, between frames.
+    Resize,
+    /// Follow this window's size from here ([`RenderLink::follow`]).
+    Follow(Arc<Extent>),
     /// Draw the end screen instead of a play: the newest page in the slot
     /// ([`RenderLink::show_end`]), or the one drawn last when an earlier
     /// signal already took this one's page or a newer one; nothing once
@@ -424,6 +543,21 @@ impl RenderLink {
     /// Sends a message; a thread that already ended ignores it.
     pub fn send(&self, msg: RenderMsg) {
         let _ = self.tx.send(msg);
+    }
+
+    /// Makes the render thread follow the window's size in `extent`: the
+    /// newest size published, and every later one, is applied to the
+    /// screen between frames, and to each screen built again. The slot
+    /// wakes one render thread, this link's from now on: a link that
+    /// followed it before gets no later wake.
+    pub fn follow(&self, extent: &Arc<Extent>) {
+        // Held through the `Follow`, so no `Resize` overtakes it, and a
+        // flag an earlier registration left set is cleared ([`Extent`]'s
+        // invariant).
+        let mut wake = extent.wake.lock().unwrap_or_else(PoisonError::into_inner);
+        *wake = Some(self.tx.clone());
+        extent.queued.store(false, Ordering::Release);
+        self.send(RenderMsg::Follow(Arc::clone(extent)));
     }
 
     /// Shows the end screen's `page`: it replaces a page the render thread
@@ -679,6 +813,8 @@ pub fn spawn(
                 shared: thread_shared,
                 end_page: (0, EndPage::default()),
                 granted: false,
+                extent: None,
+                applied: None,
                 #[cfg(feature = "dev-tools")]
                 menu_stats: crate::dev::MenuStats::default(),
                 #[cfg(feature = "dev-tools")]
@@ -780,6 +916,11 @@ struct Run {
     /// frame of latency), so the next frame takes it instead of waiting
     /// again, which would never end; until a new screen is built.
     granted: bool,
+    /// The window's size followed, if any.
+    extent: Option<Arc<Extent>>,
+    /// The size last applied to the screen; `None` until one is, and for
+    /// a screen built again.
+    applied: Option<(u32, u32)>,
     /// The select screen's frames (dev-tools).
     #[cfg(feature = "dev-tools")]
     menu_stats: crate::dev::MenuStats,
@@ -935,13 +1076,36 @@ impl Run {
                     }
                     let _ = reply.send(self.measure.finish(end));
                 }
+                Ok(RenderMsg::Follow(extent)) => {
+                    // A wake sent since the sender was set is still in
+                    // the channel, after this: it is taken there.
+                    self.extent = Some(extent);
+                    self.applied = None;
+                }
+                // Applied below, as every loop applies the newest size.
+                Ok(RenderMsg::Resize) => {
+                    if let Some(extent) = &self.extent {
+                        extent.acknowledge();
+                    }
+                }
                 Ok(RenderMsg::Exit) | Err(TryRecvError::Disconnected) => return,
                 Err(TryRecvError::Empty) => {}
             }
             let Some(screen) = &mut self.screen else {
                 continue;
             };
-            if screen.paced() {
+            // The window's newest size, between frames.
+            if let Some(size) = self.extent.as_ref().and_then(|e| e.latest())
+                && self.applied != Some(size)
+            {
+                screen.resize(size.0, size.1);
+                self.applied = Some(size);
+            }
+            // Minimized, nothing is presented, so the swap chain's waitable
+            // object would not be signaled: frames are paced by the clock
+            // instead, and a frame granted before stays granted.
+            let minimized = screen.minimized();
+            if screen.paced() && !minimized {
                 if !self.granted && !screen.wait() {
                     continue;
                 }
@@ -1052,6 +1216,7 @@ impl Run {
                         effects: &effects,
                         gauge: *gauge,
                         overlay: &overlay[..shown],
+                        target: screen.target(),
                     };
                     screen.build(&f);
                     #[cfg(feature = "dev-tools")]
@@ -1113,7 +1278,9 @@ impl Run {
                     (timing, None)
                 }),
             };
-            self.granted = false;
+            if !minimized {
+                self.granted = false;
+            }
             match drawn {
                 Ok((timing, play)) => {
                     let d = Drawn {
@@ -1177,7 +1344,11 @@ impl Run {
         let ready = match (&mut self.screen, chart) {
             (Some(s), Some(chart)) => s.load(chart, section),
             (Some(_), None) => Ok(()),
-            (None, _) => build(&mut self.make, chart, section).map(|s| self.screen = Some(s)),
+            (None, _) => build(&mut self.make, chart, section).map(|s| {
+                self.screen = Some(s);
+                // The new screen takes the window's size afresh.
+                self.applied = None;
+            }),
         };
         if ready.is_ok() {
             self.shared.failed.store(false, Ordering::Release);
@@ -3437,5 +3608,311 @@ mod tests {
         });
         assert!(drawn(&drew, "<play>"), "{:?}", drew.lock().unwrap());
         link.exit();
+    }
+
+    /// Publishes coalesce: one wake waits however many sizes are
+    /// published, and the newest is read. Reading the size between frames
+    /// while that wake is still in the channel takes nothing: a publish
+    /// after the read sends no second wake. Only taking the wake re-arms
+    /// it, and the size read after that is the newest. Before a render
+    /// thread follows, a publish marks no wake, so the first publish after
+    /// the sender is set sends one; a wake sent between the sender's
+    /// registration and the `Follow` being taken stays the only one, since
+    /// taking `Follow` takes no wake. With the read clearing the flag, the
+    /// publish after it would send a second wake; with a publish marking a
+    /// wake before a sender exists, the first publish after it would send
+    /// none; with `Follow` taking the wake, the publish after it would send
+    /// a second one.
+    #[test]
+    fn extent_publishes_coalesce() {
+        let extent = super::Extent::default();
+        assert_eq!(extent.latest(), None);
+        // No sender yet: nothing is marked.
+        extent.publish(640, 480);
+        assert_eq!(extent.latest(), Some((640, 480)));
+        // `RenderLink::follow`: the sender is set, then `Follow` is sent;
+        // a publish lands before the render thread takes `Follow`.
+        let (tx, rx) = std::sync::mpsc::channel();
+        *extent.wake.lock().unwrap() = Some(tx);
+        extent.publish(800, 600);
+        assert!(matches!(rx.try_recv(), Ok(RenderMsg::Resize)));
+        // `Follow` is taken, then a frame reads the size while the wake
+        // waits, then more publishes.
+        assert_eq!(extent.latest(), Some((800, 600)));
+        extent.publish(0, 0);
+        extent.publish(2_560, 1_080);
+        assert!(rx.try_recv().is_err(), "one wake for three publishes");
+        // The render thread takes the wake, then reads the newest.
+        extent.acknowledge();
+        assert_eq!(extent.latest(), Some((2_560, 1_080)));
+        extent.publish(u32::MAX, 1);
+        assert!(matches!(rx.try_recv(), Ok(RenderMsg::Resize)));
+        assert!(rx.try_recv().is_err());
+        extent.acknowledge();
+        assert_eq!(extent.latest(), Some((u32::MAX, 1)));
+    }
+
+    /// The sizes applied to a [`Resizing`] screen, each with the screen's
+    /// `id`.
+    type Applied = Arc<std::sync::Mutex<Vec<(u32, u32, u32)>>>;
+
+    /// A render thread with nothing drawn (no page), so only a message
+    /// wakes it, built on a [`Resizing`] screen; with the sizes applied.
+    fn resizing_thread() -> (super::RenderLink, Applied) {
+        let resized = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let r = Arc::clone(&resized);
+        let make: MakeScreen = Box::new(move || {
+            Ok(Box::new(Resizing {
+                id: 1,
+                size: (1_920, 1_080),
+                resized: Arc::clone(&r),
+                frames: Arc::new(std::sync::Mutex::new(Vec::new())),
+                waited_minimized: Arc::new(AtomicU32::new(0)),
+                fail: Arc::new(AtomicBool::new(false)),
+            }) as Box<dyn Screen>)
+        });
+        let clock = QpcClock::start();
+        let link = spawn(
+            make,
+            None,
+            None,
+            clock,
+            view(),
+            measure(clock),
+            Box::new(NoFrames),
+        )
+        .unwrap();
+        (link, resized)
+    }
+
+    /// Publishes racing each registration: a thread publishes on a fresh
+    /// slot, released with the registration by a barrier, so publishes
+    /// land between the sender's registration and its `Follow`. Once every
+    /// message sent is taken, only a wake applies a size published after,
+    /// so the slot's flag was left clear. Were the lock let go before the
+    /// `Follow` is sent, a `Resize` could reach the render thread before it
+    /// follows the slot, be left unacknowledged, and leave the flag set, so
+    /// that later publishes would wake nothing.
+    #[test]
+    fn publishes_during_registration_still_wake_the_render_thread() {
+        let (link, resized) = resizing_thread();
+        let last = || resized.lock().unwrap().last().copied();
+        for round in 1..=100 {
+            let extent = Arc::new(super::Extent::default());
+            let start = Arc::new(std::sync::Barrier::new(2));
+            let (published, go) = (Arc::clone(&extent), Arc::clone(&start));
+            let publisher = std::thread::spawn(move || {
+                go.wait();
+                for w in 1..=200 {
+                    published.publish(w, 1);
+                }
+            });
+            start.wait();
+            link.follow(&extent);
+            publisher.join().unwrap();
+            link.end_loading().unwrap();
+            extent.publish(4_096, round);
+            assert!(
+                wait_until(|| last() == Some((1, 4_096, round))),
+                "{round}: {:?}",
+                last()
+            );
+        }
+        link.exit();
+    }
+
+    /// A slot followed again by a new render thread: the wake published
+    /// after the first thread ended was sent nowhere, and its flag does
+    /// not keep the new thread from being woken.
+    #[test]
+    fn a_new_render_thread_is_woken_after_the_last_ended() {
+        let extent = Arc::new(super::Extent::default());
+        let (first, _) = resizing_thread();
+        first.follow(&extent);
+        first.end_loading().unwrap();
+        assert_eq!(first.exit(), super::RenderEnd::Joined);
+        extent.publish(800, 600);
+        let (second, resized) = resizing_thread();
+        let last = || resized.lock().unwrap().last().copied();
+        second.follow(&extent);
+        assert!(wait_until(|| last() == Some((1, 800, 600))), "{:?}", last());
+        second.end_loading().unwrap();
+        extent.publish(1_280, 720);
+        assert!(
+            wait_until(|| last() == Some((1, 1_280, 720))),
+            "{:?}",
+            last()
+        );
+        second.exit();
+    }
+
+    /// Following `a`, then `b`, then `a` again: `a`'s wake, sent after
+    /// `b`'s `Follow`, is taken while `b` is followed, so it acknowledges
+    /// `b`; following `a` again clears the flag that wake left, and `a`'s
+    /// later publishes wake the render thread.
+    #[test]
+    fn a_slot_followed_again_is_woken() {
+        let (link, resized) = resizing_thread();
+        let last = || resized.lock().unwrap().last().copied();
+        let (a, b) = (
+            Arc::new(super::Extent::default()),
+            Arc::new(super::Extent::default()),
+        );
+        link.follow(&a);
+        link.follow(&b);
+        a.publish(800, 600);
+        link.follow(&a);
+        assert!(wait_until(|| last() == Some((1, 800, 600))), "{:?}", last());
+        link.end_loading().unwrap();
+        a.publish(1_280, 720);
+        assert!(
+            wait_until(|| last() == Some((1, 1_280, 720))),
+            "{:?}",
+            last()
+        );
+        link.exit();
+    }
+
+    /// A screen paced as a swap chain is, each the `id`th built, noting
+    /// every size applied to it and every menu frame with whether it was
+    /// minimized, and how often it was waited on while minimized. Its menu
+    /// frame fails once when `fail` is set.
+    struct Resizing {
+        id: u32,
+        size: (u32, u32),
+        resized: Arc<std::sync::Mutex<Vec<(u32, u32, u32)>>>,
+        frames: Arc<std::sync::Mutex<Vec<bool>>>,
+        waited_minimized: Arc<AtomicU32>,
+        fail: Arc<AtomicBool>,
+    }
+
+    impl Screen for Resizing {
+        fn load(
+            &mut self,
+            _chart: &Chart,
+            _section: Option<&eval::Section>,
+        ) -> Result<(), RenderError> {
+            Ok(())
+        }
+        fn wait(&self) -> bool {
+            if self.minimized() {
+                self.waited_minimized.fetch_add(1, Ordering::SeqCst);
+            }
+            true
+        }
+        fn paced(&self) -> bool {
+            true
+        }
+        fn build(&mut self, _f: &FrameInput<'_>) {}
+        fn draw(&mut self) -> Result<FrameTiming, RenderError> {
+            Ok(timing(true))
+        }
+        fn text(&mut self, _lines: &[&str]) -> Result<bool, RenderError> {
+            Ok(true)
+        }
+        fn menu(
+            &mut self,
+            _page: &crate::menu_screen::MenuPage,
+            _changed: bool,
+        ) -> Result<FrameTiming, RenderError> {
+            if self.fail.swap(false, Ordering::SeqCst) {
+                return Err(RenderError::SurfaceLost);
+            }
+            let minimized = self.minimized();
+            self.frames.lock().unwrap().push(minimized);
+            Ok(timing(!minimized))
+        }
+        fn resize(&mut self, width: u32, height: u32) {
+            self.resized.lock().unwrap().push((self.id, width, height));
+            self.size = (width, height);
+        }
+        fn minimized(&self) -> bool {
+            self.size.0 == 0 || self.size.1 == 0
+        }
+        #[cfg(feature = "dev-tools")]
+        fn read_back(&self) -> Option<(u32, u32, Vec<u8>)> {
+            None
+        }
+    }
+
+    /// The render thread follows the window's size: the size published
+    /// before it followed is applied, then each newest one, each once;
+    /// minimized, the select page is drawn on unpaced and unpresented and
+    /// a preparation is answered, with no wait on the screen; after the
+    /// burst the newest size is the one applied, and the page, sent again
+    /// since a preparation stops it, is drawn presented; and a screen built
+    /// again takes the size afresh. With the size applied only on a
+    /// message, the first size would never reach the screen; with the
+    /// pacing kept while minimized, the screen would be waited on.
+    #[test]
+    fn the_render_thread_follows_the_newest_size() {
+        let resized = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let frames = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let waited_minimized = Arc::new(AtomicU32::new(0));
+        let fail = Arc::new(AtomicBool::new(false));
+        let builds = Arc::new(AtomicU32::new(0));
+        let (r, f, w, x, b) = (
+            Arc::clone(&resized),
+            Arc::clone(&frames),
+            Arc::clone(&waited_minimized),
+            Arc::clone(&fail),
+            Arc::clone(&builds),
+        );
+        let make: MakeScreen = Box::new(move || {
+            Ok(Box::new(Resizing {
+                id: b.fetch_add(1, Ordering::SeqCst) + 1,
+                size: (1_920, 1_080),
+                resized: Arc::clone(&r),
+                frames: Arc::clone(&f),
+                waited_minimized: Arc::clone(&w),
+                fail: Arc::clone(&x),
+            }) as Box<dyn Screen>)
+        });
+        let clock = QpcClock::start();
+        let link = spawn(
+            make,
+            None,
+            None,
+            clock,
+            view(),
+            measure(clock),
+            Box::new(NoFrames),
+        )
+        .unwrap();
+        let last = || resized.lock().unwrap().last().copied();
+        let extent = Arc::new(super::Extent::default());
+        extent.publish(800, 600);
+        link.follow(&extent);
+        link.send(RenderMsg::Menu(Box::default()));
+        assert!(wait_until(|| last() == Some((1, 800, 600))));
+        extent.publish(0, 0);
+        assert!(wait_until(|| last() == Some((1, 0, 0))));
+        let before = frames.lock().unwrap().len();
+        assert!(wait_until(|| frames.lock().unwrap().len() >= before + 3));
+        assert!(frames.lock().unwrap().last() == Some(&true));
+        assert!(link.prepare().is_ok());
+        // A preparation stops the select screen (`after_preparing`): the
+        // page is sent again, as selection sends it after a load.
+        link.send(RenderMsg::Menu(Box::default()));
+        assert_eq!(waited_minimized.load(Ordering::SeqCst), 0);
+        for size in [(1_024, 768), (1_280, 720), (2_560, 1_080)] {
+            extent.publish(size.0, size.1);
+        }
+        assert!(wait_until(|| last() == Some((1, 2_560, 1_080))));
+        let before = frames.lock().unwrap().len();
+        assert!(wait_until(|| frames.lock().unwrap().len() > before));
+        assert!(frames.lock().unwrap().last() == Some(&false));
+        fail.store(true, Ordering::SeqCst);
+        assert!(wait_until(|| link.failed()));
+        assert!(link.prepare().is_ok());
+        link.send(RenderMsg::Menu(Box::default()));
+        assert!(wait_until(|| last() == Some((2, 2_560, 1_080))));
+        link.exit();
+        let resized = resized.lock().unwrap().clone();
+        // Each size applied once, in order.
+        assert!(resized.windows(2).all(|p| p[0] != p[1]), "{resized:?}");
+        assert_eq!(resized.first(), Some(&(1, 800, 600)));
+        assert_eq!(resized.iter().filter(|r| r.0 == 2).count(), 1);
+        assert_eq!(builds.load(Ordering::SeqCst), 2);
     }
 }
