@@ -27,10 +27,6 @@ use super::SrcImage;
 use crate::error::ImportError;
 use crate::tree::Scalar;
 
-/// A cover's image and its stretched destination, or why its stretch
-/// cannot be reproduced.
-type Fitted = Result<(u32, Rect), NoteKind>;
-
 /// The lanes the source draws.
 const LANES: usize = 8;
 
@@ -851,16 +847,8 @@ impl Cx<'_> {
         {
             return refuse(self, "dst");
         }
-        let (image, r) = match self.add_cover_image(&c, &dst, rec, s)? {
-            Some(Ok(found)) => found,
-            Some(Err(why)) => {
-                return Err(ImportError::Critical {
-                    at: self.loc(at),
-                    part,
-                    why,
-                });
-            }
-            None => return refuse(self, "src"),
+        let Some((image, r)) = self.add_cover_image(&c, &dst, rec, s)? else {
+            return refuse(self, "src");
         };
         if r.h <= Q::int(0) {
             return refuse(self, "dst");
@@ -893,55 +881,47 @@ impl Cx<'_> {
     /// unless the fitted frame is taller than the destination, when the
     /// destination stays and the frame keeps its middle rows, which only
     /// a single frame can (`:65-68, 143-153`). `None` when the image was
-    /// dropped; `Some(Err(why))`, before anything is added, when the crop
-    /// cannot be reproduced.
+    /// dropped, also as its role says, before anything is added, when the
+    /// crop cannot be reproduced.
     fn add_cover_image(
         &mut self,
         c: &Common,
         dst: &Dst,
         rec: u32,
         s: &SrcImage,
-    ) -> Result<Option<Fitted>, ImportError> {
+    ) -> Result<Option<(u32, Rect)>, ImportError> {
         let at = c.span;
         let r = self.cover_rect(c)?;
         let (mode, grid) = (dst.stretch, s.div);
         let mut cropped = false;
-        // Why the crop cannot be reproduced; the error returned with it
-        // only stops the admission.
-        let mut refused = None;
         let found = self.add_src_image_cropped(c, rec, s, grid, |cx, [_, y, w, h]| {
             if mode != 5 {
-                return Ok(None);
+                return Ok(Ok(None));
             }
             let cell = [w / grid[0].max(1), h / grid[1].max(1)];
             let Some(kept) = trimmed(r, cell).ok_or_else(|| cx.range(at, "dst"))? else {
-                return Ok(None);
+                return Ok(Ok(None));
             };
             if grid != [1, 1] {
-                refused = Some(NoteKind::Stretch(mode));
-                return Err(cx.range(at, "dst"));
+                return Ok(Err(NoteKind::Stretch(mode)));
             }
             let Some(crop) = crop_rows(y, h, kept) else {
-                refused = Some(NoteKind::UnsupportedField { field: "dst" });
-                return Err(cx.range(at, "dst"));
+                return Ok(Err(NoteKind::UnsupportedField { field: "dst" }));
             };
             cropped = true;
-            Ok(Some(crop))
-        });
-        if let Some(why) = refused {
-            return Ok(Some(Err(why)));
-        }
-        let Some((image, cell)) = found? else {
+            Ok(Ok(Some(crop)))
+        })?;
+        let Some((image, cell)) = found else {
             return Ok(None);
         };
         if matches!(mode, 4 | 5) && !cropped {
             let fitted = track::stretch(Stretch::FitWidth, r, cell);
             return match fitted {
-                Some((r, _)) => Ok(Some(Ok((image, r)))),
+                Some((r, _)) => Ok(Some((image, r))),
                 None => Err(self.range(at, "dst")),
             };
         }
-        Ok(Some(Ok((image, r))))
+        Ok(Some((image, r)))
     }
 
     /// A cover's upper and lower edges, y down, each within
@@ -1068,16 +1048,8 @@ impl Cx<'_> {
             return refuse(self, "dst");
         }
         let unstretched = self.cover_rect(&c)?;
-        let (image, r) = match self.add_cover_image(&c, &dst, rec, &s)? {
-            Some(Ok(found)) => found,
-            Some(Err(why)) => {
-                return Err(ImportError::Critical {
-                    at: self.loc(at),
-                    part,
-                    why,
-                });
-            }
-            None => return refuse(self, "src"),
+        let Some((image, r)) = self.add_cover_image(&c, &dst, rec, &s)? else {
+            return refuse(self, "src");
         };
         // The source clips LIFT to its unstretched destination before
         // stretching it (`play/SkinHidden.java:75-88`,
@@ -1163,10 +1135,8 @@ impl Cx<'_> {
             return drop(self, "dst");
         }
         let unstretched = self.cover_rect(&c)?;
-        let (image, r) = match self.add_cover_image(&c, &dst, rec, &s)? {
-            Some(Ok(found)) => found,
-            Some(Err(why)) => return self.drop_el(role, at, why),
-            None => return Ok(()),
+        let Some((image, r)) = self.add_cover_image(&c, &dst, rec, &s)? else {
+            return Ok(());
         };
         if r.h <= Q::int(0) {
             return drop(self, "dst");
