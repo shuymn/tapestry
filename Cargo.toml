@@ -107,7 +107,7 @@ cargo_metadata = "0.23.1"
 # The lint site check parses Rust source.
 proc-macro2 = { version = "1.0.107", default-features = false }
 quote = { version = "1.0.47", default-features = false }
-syn = { version = "2.0.119", default-features = false, features = ["full", "parsing", "printing"] }
+syn = { version = "3.0.0", default-features = false, features = ["full", "parsing", "printing"] }
 
 # Used by the `cargo xtask` alias (.cargo/config.toml).
 [profile.xtask]
