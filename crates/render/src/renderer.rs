@@ -1,5 +1,6 @@
 //! The renderer: one instanced sprite pipeline per blend over the atlas,
-//! drawing a skin's batch into a swap chain or an offscreen target.
+//! drawing a skin's batch, run by run in its order, into a swap chain or an
+//! offscreen target.
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
@@ -19,7 +20,7 @@ use crate::pace::Pacer;
 use crate::simple::layout::{HEIGHT, WIDTH};
 use crate::simple::{result_screen, text_screen};
 use crate::text::MenuText;
-use crate::{FrameInput, PlaySkin, SimpleSkin, SkinError, Sprite, SpriteBatch};
+use crate::{Blend, FrameInput, Instance, PlaySkin, SimpleSkin, SkinError, SpriteBatch};
 
 /// The next [`Renderer`]'s id.
 static RENDERERS: AtomicU64 = AtomicU64::new(0);
@@ -28,10 +29,13 @@ static RENDERERS: AtomicU64 = AtomicU64::new(0);
 pub const MAX_SPRITES: usize = 8_192;
 
 const SPRITE_WGSL: &str = r"
+// An `Instance`: its pivot and angle share location 3; its layer and filter
+// flags are not read, as the one atlas is layer 0 sampled nearest.
 struct Inst {
     @location(0) rect: vec4f,
     @location(1) uv: vec4f,
     @location(2) color: vec4f,
+    @location(3) turn: vec3f,
 };
 struct VOut {
     @builtin(position) pos: vec4f,
@@ -41,12 +45,19 @@ struct VOut {
 @group(0) @binding(0) var atlas: texture_2d<f32>;
 @group(0) @binding(1) var samp: sampler;
 
-// Layout pixels (1920x1080, origin top left) to clip space; the viewport
-// letterboxes the layout into the target.
+// Layout pixels (1920x1080, origin top left, y down) to clip space; the
+// viewport letterboxes the layout into the target. Each corner turns
+// clockwise on screen by the angle about the pivot; an unturned sprite keeps
+// its corners exactly.
 @vertex
 fn vs(@builtin(vertex_index) vi: u32, i: Inst) -> VOut {
     let c = vec2f(f32(vi & 1u), f32((vi >> 1u) & 1u));
-    let p = i.rect.xy + c * i.rect.zw;
+    let placed = i.rect.xy + c * i.rect.zw;
+    let d = placed - i.turn.xy;
+    let s = sin(i.turn.z);
+    let k = cos(i.turn.z);
+    let turned = i.turn.xy + vec2f(d.x * k - d.y * s, d.x * s + d.y * k);
+    let p = select(turned, placed, i.turn.z == 0.0);
     var o: VOut;
     o.pos = vec4f(p.x / 960.0 - 1.0, 1.0 - p.y / 540.0, 0.0, 1.0);
     o.uv = mix(i.uv.xy, i.uv.zw, c);
@@ -54,6 +65,8 @@ fn vs(@builtin(vertex_index) vi: u32, i: Inst) -> VOut {
     return o;
 }
 
+// The atlas holds premultiplied texels (transparent black or opaque white)
+// and the colour arrives premultiplied, so their product is premultiplied.
 @fragment
 fn fs(v: VOut) -> @location(0) vec4f {
     return textureSample(atlas, samp, v.uv) * v.color;
@@ -196,7 +209,7 @@ pub struct Renderer {
     instances: wgpu::Buffer,
     batch: SpriteBatch,
     /// The batch in drawing order, copied into `instances` each frame.
-    staging: Vec<Sprite>,
+    staging: Vec<Instance>,
     skin: Box<dyn PlaySkin>,
     /// When the built frame's work began, until [`submit`](Self::submit)
     /// takes it.
@@ -204,6 +217,9 @@ pub struct Renderer {
     /// An offscreen target's frame left pending on the GPU: at most one,
     /// as a swap chain's frame latency bounds a window's.
     pacer: Pacer<wgpu::SubmissionIndex>,
+    /// What each frame is cleared to: opaque black. A unit test clears to
+    /// transparent black to read the blends' alpha channel.
+    clear: wgpu::Color,
 }
 
 impl Renderer {
@@ -272,7 +288,7 @@ impl Renderer {
         let (alpha, additive, atlas_bind) = pipelines(&gpu, format);
         let instances = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("sprites"),
-            size: (MAX_SPRITES * size_of::<Sprite>()) as u64,
+            size: (MAX_SPRITES * size_of::<Instance>()) as u64,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -291,6 +307,7 @@ impl Renderer {
             skin: Box::new(SimpleSkin::new()),
             started: None,
             pacer: Pacer::default(),
+            clear: wgpu::Color::BLACK,
             id: RENDERERS.fetch_add(1, Ordering::Relaxed),
         })
     }
@@ -483,8 +500,8 @@ impl Renderer {
         start: Instant,
         text: Option<&MenuText>,
     ) -> Result<FrameTiming, RenderError> {
-        let alpha = self.batch.alpha().len() as u32;
         let sprites = self.staging.len();
+        let staged = u32::try_from(sprites).unwrap_or(u32::MAX);
         let timing = |cpu, presented| FrameTiming {
             cpu,
             sprites,
@@ -553,7 +570,7 @@ impl Renderer {
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        load: wgpu::LoadOp::Clear(self.clear),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -565,10 +582,19 @@ impl Renderer {
             pass.set_viewport(x, y, w, h, 0.0, 1.0);
             pass.set_bind_group(0, &self.atlas_bind, &[]);
             pass.set_vertex_buffer(0, self.instances.slice(..));
-            pass.set_pipeline(&self.alpha);
-            pass.draw(0..4, 0..alpha);
-            pass.set_pipeline(&self.additive);
-            pass.draw(0..4, alpha..sprites as u32);
+            // The runs in the batch's order, so each sprite is drawn over
+            // every sprite pushed before it, whatever their blends.
+            for run in self.batch.runs() {
+                let end = run.end.min(staged);
+                if run.start >= end {
+                    break;
+                }
+                pass.set_pipeline(match run.blend {
+                    Blend::Alpha => &self.alpha,
+                    Blend::Additive => &self.additive,
+                });
+                pass.draw(0..4, run.start..end);
+            }
         }
         if let Some(text) = text {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -724,7 +750,7 @@ pub fn build_frame(
     skin: &mut dyn PlaySkin,
     f: &FrameInput<'_>,
     batch: &mut SpriteBatch,
-    staging: &mut Vec<Sprite>,
+    staging: &mut Vec<Instance>,
 ) {
     batch.clear();
     skin.build(f, batch);
@@ -767,7 +793,10 @@ const fn extent(width: u32, height: u32) -> wgpu::Extent3d {
 }
 
 /// The alpha and additive sprite pipelines and the atlas binding, with the
-/// atlas uploaded.
+/// atlas uploaded. Both take premultiplied colour (design.md "Rendering and
+/// Skins"): alpha blending is RGB source 1, destination 1 − source alpha;
+/// additive is RGB source 1, destination 1; in both the alpha channel
+/// composites over.
 fn pipelines(
     gpu: &Gpu,
     format: wgpu::TextureFormat,
@@ -838,7 +867,14 @@ fn pipelines(
         immediate_size: 0,
     });
     let pipeline = |blend| {
-        let attrs = wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x4, 2 => Float32x4];
+        // `Instance`: rect, uv and color, then pivot and angle together;
+        // its last four bytes, the flags, are not read.
+        let attrs = wgpu::vertex_attr_array![
+            0 => Float32x4,
+            1 => Float32x4,
+            2 => Float32x4,
+            3 => Float32x3,
+        ];
         device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("sprites"),
             layout: Some(&pipeline_layout),
@@ -847,7 +883,7 @@ fn pipelines(
                 entry_point: Some("vs"),
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
                 buffers: &[Some(wgpu::VertexBufferLayout {
-                    array_stride: size_of::<Sprite>() as u64,
+                    array_stride: size_of::<Instance>() as u64,
                     step_mode: wgpu::VertexStepMode::Instance,
                     attributes: &attrs,
                 })],
@@ -872,14 +908,13 @@ fn pipelines(
             cache: None,
         })
     };
-    let alpha = pipeline(wgpu::BlendState::ALPHA_BLENDING);
+    // Both components over (source 1, destination 1 − source alpha).
+    let alpha = pipeline(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING);
+    // Colour source 1, destination 1; the alpha channel still over, not
+    // `ADDITIVE`'s 1, 1.
     let additive = pipeline(wgpu::BlendState {
-        color: wgpu::BlendComponent {
-            src_factor: wgpu::BlendFactor::SrcAlpha,
-            dst_factor: wgpu::BlendFactor::One,
-            operation: wgpu::BlendOperation::Add,
-        },
         alpha: wgpu::BlendComponent::OVER,
+        ..wgpu::BlendState::ADDITIVE
     });
     (alpha, additive, bind)
 }
@@ -890,8 +925,9 @@ mod tests {
 
     use wgpu::wgc::instance as core;
 
-    use super::{RenderError, letterbox};
-    use crate::SkinError;
+    use super::{RenderError, Renderer, Target, letterbox};
+    use crate::text::MenuText;
+    use crate::{AdapterChoice, Blend, SkinError, Sprite, solid_uv};
 
     /// Checks that `e` names only its step, and that its source is the
     /// wrapped `T`, where the chain ends.
@@ -965,5 +1001,51 @@ mod tests {
         assert_eq!(letterbox(1280, 1024), [0.0, 152.0, 1280.0, 720.0]);
         // 21:9: scaled to the height, bars left and right.
         assert_eq!(letterbox(2560, 1080), [320.0, 0.0, 1920.0, 1080.0]);
+    }
+
+    /// Both blends composite the alpha channel over: source 1, destination
+    /// 1 − source alpha. On a transparent target, white at alpha 0.5 is
+    /// drawn, then white at alpha 0.25 over it, blended alpha on the left
+    /// and additive on the right: 0.25 + 0.5 × 0.75 = 0.625, 159.4 (or
+    /// 160.0 when the 0.5 below was stored as 128), so 159 within 2 on
+    /// both sides. An additive alpha channel of 1, 1 (`ADDITIVE`'s) would
+    /// give 0.75, 191, on the right; one blended like the colour of
+    /// straight alpha (source alpha, 1 − source alpha) would give 0.25 for
+    /// the first sprite and 0.0625 + 0.1875 = 0.25, 64, on the left.
+    #[test]
+    fn both_blends_composite_alpha_over() {
+        let mut r = Renderer::new(
+            Target::Offscreen {
+                width: 960,
+                height: 540,
+            },
+            AdapterChoice::Warp,
+        )
+        .expect("WARP renderer");
+        r.clear = wgpu::Color::TRANSPARENT;
+        let solid = |rect, alpha| Sprite {
+            rect,
+            uv: solid_uv(),
+            color: [1.0, 1.0, 1.0, alpha],
+            ..Sprite::default()
+        };
+        let text = MenuText::new(&r);
+        let timing = r
+            .menu_frame(
+                |b| {
+                    b.push(Blend::Alpha, solid([0.0, 0.0, 400.0, 400.0], 0.5));
+                    b.push(Blend::Alpha, solid([0.0, 0.0, 200.0, 400.0], 0.25));
+                    b.push(Blend::Additive, solid([200.0, 0.0, 200.0, 400.0], 0.25));
+                },
+                &text,
+            )
+            .unwrap();
+        assert!(timing.presented);
+        let pixels = r.read_back();
+        // Layout (100, 200) and (300, 200): target pixels (50, 100) and
+        // (150, 100) at half scale.
+        let alpha = |x: usize| pixels[(100 * 960 + x) * 4 + 3];
+        assert!(alpha(50).abs_diff(159) <= 2, "alpha blend: {}", alpha(50));
+        assert!(alpha(150).abs_diff(159) <= 2, "additive: {}", alpha(150));
     }
 }

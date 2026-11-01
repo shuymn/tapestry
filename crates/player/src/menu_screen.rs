@@ -465,6 +465,7 @@ impl MenuScreen {
                             rect: [LEFT - 20.0, line_top(i) - 3.0, 1_840.0, LINE_STEP - 2.0],
                             uv: solid_uv(),
                             color: [0.15, 0.3, 0.6, 1.0],
+                            ..Sprite::default()
                         },
                     );
                 }
@@ -475,6 +476,7 @@ impl MenuScreen {
                             rect,
                             uv: solid_uv(),
                             color: [1.0; 4],
+                            ..Sprite::default()
                         },
                     );
                 }
