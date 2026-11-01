@@ -19,7 +19,7 @@
 //! one signal waits in the channel ([`LoadingSink`]), so a slow render
 //! thread never falls behind on the load's progress. A window target
 //! paces frames on the swap chain's waitable object; an offscreen one at about
-//! 60 Hz.
+//! 60 Hz at most, each frame waiting for the GPU to finish the one before.
 //!
 //! A frame that fails (the surface was lost) drops the screen and tells
 //! the game thread, which ends the play; the next play's preparation builds

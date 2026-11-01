@@ -259,3 +259,54 @@ fn render_cpu_indicator() {
         us(100)
     );
 }
+
+/// Offscreen, nothing paces the frames: each frame waits for the one
+/// before it on the GPU, so however fast frames are submitted, the GPU is
+/// never more than one frame behind, and a wait for it (a read back here;
+/// a chart's preparation in the game) takes about one frame, not the
+/// backlog of every frame submitted. A full-HD target keeps WARP's share of a
+/// frame well above its submission's.
+#[test]
+fn offscreen_frames_leave_at_most_one_frame_of_gpu_work() {
+    const FRAMES: i64 = 60;
+    let mut r = Renderer::new(
+        render::Target::Offscreen {
+            width: 1_920,
+            height: 1_080,
+        },
+        render::AdapterChoice::Warp,
+    )
+    .expect("WARP renderer");
+    let mut b = ChartBuilder::new(150_000);
+    for i in 0..400 {
+        let l = u8::try_from(i % 8).unwrap();
+        b = b.tap(lane(l), TimeUs(i64::from(i) * 5 * MS));
+    }
+    r.load(&b.build().unwrap(), None).unwrap();
+    let v = view(42, 1_234);
+    let mut slowest = std::time::Duration::ZERO;
+    let began = std::time::Instant::now();
+    for k in 0..FRAMES {
+        let at = std::time::Instant::now();
+        r.frame(&input(&v, TimeUs(k * 1_000), TimeUs(0), &[]))
+            .unwrap();
+        slowest = slowest.max(at.elapsed());
+    }
+    let frames = began.elapsed();
+    let at = std::time::Instant::now();
+    let _ = r.read_back();
+    let read = at.elapsed();
+    println!(
+        "{FRAMES} frames in {} ms, the slowest {} ms; read back in {} ms",
+        frames.as_millis(),
+        slowest.as_millis(),
+        read.as_millis()
+    );
+    // One frame of GPU work, the read back's own copy and slack; a backlog
+    // of the frames before would take a good share of their time.
+    assert!(
+        read <= slowest * 3 + std::time::Duration::from_millis(100),
+        "the read back waited {} ms",
+        read.as_millis()
+    );
+}
