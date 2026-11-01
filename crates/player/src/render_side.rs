@@ -172,6 +172,10 @@ pub trait Screen: Send {
 /// way, so however often the window resizes, one size and one message
 /// wait.
 ///
+/// One render thread is woken: the one whose link registered last
+/// ([`RenderLink::follow`]); a link that registered before is superseded
+/// and gets no later wake.
+///
 /// Its invariant, for each registration: while a render thread follows the
 /// slot, `queued` is set only while a `Resize` sent after that
 /// registration's `Follow` waits in the channel, because
@@ -543,7 +547,9 @@ impl RenderLink {
 
     /// Makes the render thread follow the window's size in `extent`: the
     /// newest size published, and every later one, is applied to the
-    /// screen between frames, and to each screen built again.
+    /// screen between frames, and to each screen built again. The slot
+    /// wakes one render thread, this link's from now on: a link that
+    /// followed it before gets no later wake.
     pub fn follow(&self, extent: &Arc<Extent>) {
         // Held through the `Follow`, so no `Resize` overtakes it, and a
         // flag an earlier registration left set is cleared ([`Extent`]'s
