@@ -275,13 +275,27 @@ pub(crate) fn window(t: &Template, f: &Field<'_>) -> Option<[usize; 2]> {
     if !(lo.is_finite() && hi.is_finite()) {
         return None;
     }
+    // A relative bound past `i128` leaves its end open; otherwise `as`
+    // saturates the far side of each bound and the sum saturates past
+    // the range, either only widening the window.
+    let at = f.scale.at_line.0;
     #[expect(
         clippy::cast_possible_truncation,
-        reason = "`as` saturates, which only widens the window"
+        clippy::cast_precision_loss,
+        reason = "checked against the range first; `as` saturates, which only widens"
     )]
-    let (lo, hi) = (lo as i128, hi as i128);
-    let at = f.scale.at_line.0;
-    let (from, to) = (at.saturating_add(lo), at.saturating_add(hi));
+    let (from, to) = (
+        if lo < i128::MIN as f64 {
+            i128::MIN
+        } else {
+            at.saturating_add(lo as i128)
+        },
+        if hi >= i128::MAX as f64 {
+            i128::MAX
+        } else {
+            at.saturating_add(hi as i128)
+        },
+    );
     let start = f.bars.partition_point(|p| p.0 < from);
     let end = f.bars.partition_point(|p| p.0 <= to);
     (start < end).then_some([start, end])

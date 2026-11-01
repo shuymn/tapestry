@@ -184,6 +184,14 @@ fn groups() -> Vec<Option<Template>> {
             2.5,
             None,
         )),
+        Some(template(
+            500.0,
+            [0.0, 10.0, 10.0],
+            id,
+            [0.0, 0.0],
+            0.0,
+            None,
+        )),
     ]
 }
 
@@ -197,6 +205,8 @@ fn bar_lists() -> Vec<Vec<Position>> {
         (0..30).map(|i| p(i * i * 11)).collect(),
         vec![p(i128::MIN), p(-1), p(0), p(1), p(i128::MAX)],
         vec![p(i128::MIN + 7), p(i128::MAX - 7)],
+        // 2^127 positions past a playhead at −2^126: beyond `i128`.
+        vec![p(-1), p(1 << 126)],
     ]
 }
 
@@ -213,6 +223,12 @@ fn scales() -> Vec<Scale> {
             });
         }
     }
+    // A bar 2^127 positions ahead travels 170 px.
+    out.push(Scale {
+        at_line: Position(-(1 << 126)),
+        px_per_pos: 1e-36,
+        line_y: 880.0,
+    });
     out
 }
 
@@ -265,7 +281,7 @@ fn a_quad_merely_touching_the_band_draws_nothing() {
     };
     // Travel 0 ends the quad at 80, the band's top; one pixel down it
     // overlaps by one.
-    let bars = [Position(0), Position(-1), Position(-882)];
+    let bars = [Position(-882), Position(-1), Position(0)];
     let f = Field {
         bars: &bars,
         scale: &scale,
