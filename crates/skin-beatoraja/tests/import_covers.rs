@@ -338,6 +338,69 @@ fn static_offsets_keep_beside_repeated_cover_offsets() {
 }
 
 #[test]
+fn covers_refuse_configured_components_besides_y() {
+    // SUDDEN+ lists 4; the source adds 3 to LIFT and 3 and 5 to HIDDEN+
+    // unlisted. Their y is the play's; any other component moves the
+    // source's cover and is refused, HIDDEN+ dropped as decorative.
+    let header =
+        r#""offset": [{"name": "l", "id": 3}, {"name": "c", "id": 4}, {"name": "h", "id": 5}]"#;
+    let objects = format!(
+        "{}, {}, {}, {header}",
+        note(""),
+        lift_object(""),
+        common::lanes::hidden_object("")
+    );
+    let load = |with_lift: bool, id: i32, v: OffsetValue| {
+        let (c, l, h) = (cover(""), lift(""), common::lanes::hidden(""));
+        let dsts: Vec<&str> = if with_lift {
+            vec![NOTES, &c, &l, &h]
+        } else {
+            vec![NOTES, &h]
+        };
+        let dsts = dsts.join(", ");
+        import_config([1_920, 1_080], &body("", &objects, &[&dsts]), &[], |c| {
+            c.offsets.insert(id, v);
+        })
+    };
+    let dropped = |l: &Loaded| -> Vec<NoteKind> {
+        l.report()
+            .notes
+            .iter()
+            .filter(|n| n.severity == Severity::Dropped)
+            .map(|n| n.kind)
+            .collect()
+    };
+    let d = OffsetValue::default();
+    for (name, v) in [
+        ("x", OffsetValue { x: 16, ..d }),
+        ("w", OffsetValue { w: 16, ..d }),
+        ("h", OffsetValue { h: 16, ..d }),
+        ("r", OffsetValue { r: 16, ..d }),
+        ("a", OffsetValue { a: -16, ..d }),
+    ] {
+        assert_eq!(
+            critical(load(true, 4, v)),
+            (CriticalPart::Cover, NoteKind::RuntimeOffset(4)),
+            "{name}"
+        );
+        assert_eq!(
+            critical(load(true, 3, v)),
+            (CriticalPart::Lift, NoteKind::RuntimeOffset(3)),
+            "{name}"
+        );
+        for id in [3, 5] {
+            let l = load(false, id, v);
+            assert_eq!(dropped(&l), [NoteKind::RuntimeOffset(id)], "{name} {id}");
+        }
+    }
+    for id in [3, 4, 5] {
+        let l = load(true, id, OffsetValue { y: 16, ..d });
+        l.ok();
+        assert_eq!(dropped(&l), [], "{id}");
+    }
+}
+
+#[test]
 fn only_an_exact_cover_maps() {
     let at = |rect: &str| cover("").replace(r#""x": 20, "y": 800, "w": 430, "h": 600"#, rect);
     for (d, field) in [

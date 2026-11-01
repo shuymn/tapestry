@@ -929,22 +929,37 @@ impl<'d> Cx<'d> {
             self.ignored(at, NoteKind::Ignored { field: "offset" });
             ids.clear();
         }
+        // A value for an offset the header does not declare is ignored
+        // (`config_notes`).
+        let value = |cx: &Self, id: i32| {
+            let declared = cx.header.offsets.iter().any(|o| o.id == id);
+            cx.config.offsets.get(&id).copied().filter(|_| declared)
+        };
+        // The play sets the y of the offsets the covers move by
+        // (`play/LaneRenderer.java:332-345`), so a configured y is
+        // overridden; their other components, which the source adds too
+        // (`skin/SkinObject.java:404-428`), are not reproduced. That holds
+        // for the ids a cover consumes, listed or added by the source, and
+        // for 3 and 4 on a follower or a relative part.
+        let reserved = |id: i32| {
+            o.allow.contains(&id)
+                || (matches!(id, OFFSET_LIFT | OFFSET_LANECOVER) && (o.follow || o.relative))
+        };
+        let moved = o.allow.iter().chain(&ids).copied().find(|&id| {
+            reserved(id)
+                && value(self, id)
+                    .is_some_and(|v| v.x != 0 || v.w != 0 || v.h != 0 || v.r != 0 || v.a != 0)
+        });
+        if let Some(id) = moved {
+            self.drop_el(role, at, NoteKind::RuntimeOffset(id))?;
+            return Ok(None);
+        }
         for id in ids {
             if o.allow.contains(&id) {
                 continue;
             }
-            // A value for an offset the header does not declare is ignored
-            // (`config_notes`).
-            let declared = self.header.offsets.iter().any(|o| o.id == id);
-            let value = self.config.offsets.get(&id).copied().filter(|_| declared);
-            if matches!(id, OFFSET_LIFT | OFFSET_LANECOVER) && (o.follow || o.relative) {
-                // The play sets their y (`play/LaneRenderer.java:332-333`);
-                // a configured y is overridden, any other component is
-                // not reproduced.
-                if value.is_some_and(|v| v.x != 0 || v.w != 0 || v.h != 0 || v.r != 0 || v.a != 0) {
-                    self.drop_el(role, at, NoteKind::RuntimeOffset(id))?;
-                    return Ok(None);
-                }
+            let value = value(self, id);
+            if reserved(id) {
                 if o.follow {
                     lift |= id == OFFSET_LIFT;
                     cover |= id == OFFSET_LANECOVER;
