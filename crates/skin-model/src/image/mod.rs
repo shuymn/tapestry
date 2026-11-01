@@ -86,6 +86,18 @@ pub struct ImageDef {
     pub filter: Filter,
 }
 
+/// An image of one colour that no file holds, such as a play part's
+/// fallback paint: a single frame, never animated, the same size in both
+/// variants.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SolidImageDef {
+    /// Width and height in texels.
+    pub size: [u32; 2],
+    /// Straight (not premultiplied) RGBA.
+    pub color: [u8; 4],
+    pub filter: Filter,
+}
+
 /// A file of a sheet, or its high-resolution version.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FileAt {
@@ -149,6 +161,13 @@ pub enum ImageError {
     TotalTooLarge { at: FileAt },
     #[error("file {file}'s @2x version is not exactly twice its size")]
     HiSizeMismatch { file: usize },
+    #[error(
+        "generated image {image} is {w}×{h}: empty, wider or taller than {MAX_SIDE}, \
+         or more than {MAX_IMAGE_TEXELS} texels"
+    )]
+    SolidSize { image: usize, w: u32, h: u32 },
+    #[error("generated image {image} passes {MAX_TOTAL_TEXELS} texels in a variant")]
+    SolidTotalTooLarge { image: usize },
     #[error("image {image}'s rectangle is outside its file")]
     RectOutside { image: usize },
     #[error("image {image}'s frames are empty")]
@@ -249,11 +268,23 @@ pub(crate) struct Image {
     pub filter: Filter,
 }
 
-/// A rectangle of a file packed once, however many frames show it.
+/// Where a cell's texels come from. File cells order before generated
+/// ones, so the atlas reads the files first, in file order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum CellSource {
+    /// An index into the files.
+    File(u32),
+    /// One straight RGBA colour ([`SolidImageDef`]).
+    Solid([u8; 4]),
+}
+
+/// A rectangle of a file, or a generated colour, packed once however many
+/// frames show it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct Cell {
-    pub file: u32,
-    /// Left, top, width, height in 1x pixels.
+    pub source: CellSource,
+    /// Left, top, width, height in 1x pixels; `[0, 0, w, h]` for a
+    /// generated cell, which has no @2x version.
     pub rect: [u32; 4],
 }
 
@@ -476,7 +507,7 @@ fn push_frames(
     for r in 0..u32::from(rows) {
         for c in 0..u32::from(cols) {
             let cell = Cell {
-                file: def.file,
+                source: CellSource::File(def.file),
                 rect: [x + c * cw, y + r * ch, cw, ch],
             };
             let next = u32::try_from(cell_ids.len()).unwrap_or(u32::MAX);
@@ -491,9 +522,32 @@ fn push_frames(
     }
 }
 
+/// Appends a checked generated image's single frame, its cell's id in
+/// first-sight order, and returns how the skin draws it.
+fn push_solid(
+    def: &SolidImageDef,
+    cell_ids: &mut BTreeMap<Cell, u32>,
+    frames: &mut Vec<u32>,
+) -> Image {
+    let first = u32::try_from(frames.len()).unwrap_or(u32::MAX);
+    let [w, h] = def.size;
+    let cell = Cell {
+        source: CellSource::Solid(def.color),
+        rect: [0, 0, w, h],
+    };
+    let next = u32::try_from(cell_ids.len()).unwrap_or(u32::MAX);
+    frames.push(*cell_ids.entry(cell).or_insert(next));
+    Image {
+        first,
+        frames: 1,
+        cycle: None,
+        filter: def.filter,
+    }
+}
+
 /// The distinct cells in cell order, with `frames` renumbered from
 /// first-sight ids to that order, so the atlas reads each file once, in
-/// file order.
+/// file order, before the generated cells.
 fn renumber(cell_ids: BTreeMap<Cell, u32>, frames: &mut [u32]) -> Vec<Cell> {
     let mut cells = Vec::with_capacity(cell_ids.len());
     let mut renumber = vec![0_u32; cell_ids.len()];
