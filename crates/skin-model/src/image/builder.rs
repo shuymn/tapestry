@@ -22,8 +22,9 @@ use super::font::{self, FontDef, FontError, MAX_FONTS, MAX_TOTAL_FONT_BYTES};
 use super::path::{self, PathError, Root};
 use super::{
     Cell, File, FileAt, FileDef, Image, ImageDef, ImageError, MAX_FILE_BYTES, MAX_FILES,
-    MAX_IMAGES, NEXT_SHEET, Sheet, Total, Version, add_frames, check_cycle, checked_header, cut,
-    decode, image_frames, push_frames, read_encoded, read_file, renumber, resolve_file, texels,
+    MAX_IMAGE_TEXELS, MAX_IMAGES, MAX_SIDE, NEXT_SHEET, Sheet, SolidImageDef, Total, Version,
+    add_frames, check_cycle, checked_header, cut, decode, image_frames, push_frames, push_solid,
+    read_encoded, read_file, renumber, resolve_file, texels,
 };
 use crate::quad::Filter;
 use crate::widget::text::MAX_TEXT_ELEMENTS;
@@ -310,6 +311,41 @@ impl SheetBuilder {
         let drawn = push_frames(&def, rect, cell, &mut self.cell_ids, &mut self.frames);
         self.images.push(drawn);
         u32::try_from(image).map_err(|_| ImageError::TooManyImages { n: image + 1 })
+    }
+
+    /// Adds a generated image of one colour, returning its index. No file
+    /// is read, admitted or attempted.
+    ///
+    /// Checks, in order: at most [`MAX_IMAGES`] images; one more frame
+    /// within [`MAX_SKIN_FRAMES`](super::MAX_SKIN_FRAMES); a size with
+    /// texels, at most [`MAX_SIDE`] per side and [`MAX_IMAGE_TEXELS`] in
+    /// all; each variant's running texel total, which the image adds to
+    /// at the same size in both. Nothing is kept unless every check
+    /// passes.
+    ///
+    /// # Errors
+    ///
+    /// The first check that fails; `image` in it is the index the image
+    /// would have had.
+    pub fn add_solid_image(&mut self, def: SolidImageDef) -> Result<u32, ImageError> {
+        let image = self.images.len();
+        let index = u32::try_from(image)
+            .ok()
+            .filter(|_| image < MAX_IMAGES)
+            .ok_or(ImageError::TooManyImages { n: image + 1 })?;
+        add_frames(self.frames.len(), 1)?;
+        let [w, h] = def.size;
+        let n = texels(def.size);
+        if w == 0 || h == 0 || w > MAX_SIDE || h > MAX_SIDE || n > MAX_IMAGE_TEXELS {
+            return Err(ImageError::SolidSize { image, w, h });
+        }
+        let (Some(lo), Some(hi)) = (self.lo_texels.with(n), self.hi_texels.with(n)) else {
+            return Err(ImageError::SolidTotalTooLarge { image });
+        };
+        let drawn = push_solid(&def, &mut self.cell_ids, &mut self.frames);
+        self.images.push(drawn);
+        (self.lo_texels, self.hi_texels) = (lo, hi);
+        Ok(index)
     }
 
     /// Admits a font file, returning its index.
@@ -625,7 +661,7 @@ mod tests {
 
     use ::image::{ImageFormat, Rgba, RgbaImage};
 
-    use super::super::{HEADER_READS, MAX_SKIN_FRAMES};
+    use super::super::{CellSource, HEADER_READS, MAX_SKIN_FRAMES};
     use super::*;
     use crate::quad::Filter;
 
@@ -694,7 +730,7 @@ mod tests {
         assert_eq!(sheet.image_count(), 1);
         assert_eq!(sheet.frame_count(), 2);
         assert_eq!(sheet.files().len(), 2);
-        assert_eq!(sheet.cells()[0].file, 1);
+        assert_eq!(sheet.cells()[0].source, CellSource::File(1));
     }
 
     #[test]
@@ -817,6 +853,125 @@ mod tests {
             assert!(want(&e), "{e:?}");
             assert_eq!((b.images.len(), b.frames.len()), (0, 0));
         }
+    }
+
+    fn solid(size: [u32; 2]) -> SolidImageDef {
+        SolidImageDef {
+            size,
+            color: [255, 255, 255, 255],
+            filter: Filter::Nearest,
+        }
+    }
+
+    /// What a generated image changes: images, frames, cells, texel
+    /// totals, files and attempts.
+    fn solid_state(b: &SheetBuilder) -> (usize, usize, usize, u64, u64, usize, usize) {
+        (
+            b.images.len(),
+            b.frames.len(),
+            b.cell_ids.len(),
+            b.lo_texels.sum,
+            b.hi_texels.sum,
+            b.files.len(),
+            b.attempts,
+        )
+    }
+
+    #[test]
+    fn a_generated_image_takes_no_file_and_counts_its_texels_once_per_variant() {
+        let dir = tempfile::tempdir().unwrap();
+        png(dir.path(), "a.png", 4, 2);
+        let mut b = builder(dir.path());
+        let before = reads();
+        assert_eq!(b.add_solid_image(solid([32, 8])).unwrap(), 0);
+        assert_eq!(reads(), before);
+        assert_eq!(solid_state(&b), (1, 1, 1, 256, 256, 0, 0));
+        // A file's image after it: indices in add order.
+        b.admit_file(file("a.png")).unwrap();
+        assert_eq!(b.add_image(image(0, [2, 1])).unwrap(), 1);
+        // The same colour and size: a new image, the same cell.
+        assert_eq!(b.add_solid_image(solid([32, 8])).unwrap(), 2);
+        assert_eq!(
+            solid_state(&b),
+            (3, 4, 3, 256 + 8 + 256, 256 + 8 + 256, 1, 1)
+        );
+        let sheet = b.finish();
+        // The file's cells first, then the generated one; frames follow.
+        let sources: Vec<_> = sheet.cells().iter().map(|c| c.source).collect();
+        let white = CellSource::Solid([255; 4]);
+        assert_eq!(sources, [CellSource::File(0), CellSource::File(0), white]);
+        assert_eq!(sheet.cells()[2].rect, [0, 0, 32, 8]);
+        assert_eq!(sheet.frames(), [2, 0, 1, 2]);
+    }
+
+    #[test]
+    fn each_generated_image_refusal_keeps_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut b = builder(dir.path());
+        let side = super::super::MAX_SIDE;
+        // Empty, too wide or tall, or 4097 × 2048, past the per-image
+        // texels by one column of rows.
+        for size in [[0, 8], [8, 0], [side + 1, 1], [1, side + 1], [4_097, 2_048]] {
+            let e = b.add_solid_image(solid(size)).unwrap_err();
+            assert!(
+                matches!(e, ImageError::SolidSize { image: 0, .. }),
+                "{size:?}: {e:?}"
+            );
+            assert_eq!(solid_state(&b), (0, 0, 0, 0, 0, 0, 0), "{size:?}");
+        }
+        // The per-image cap itself is accepted.
+        b.add_solid_image(solid([4_096, 2_048])).unwrap();
+    }
+
+    #[test]
+    fn generated_texels_meet_each_variants_total() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut b = builder(dir.path());
+        // 16 images of 8 Mi texels fill 128 Mi exactly.
+        for i in 0..16 {
+            b.add_solid_image(solid([4_096, 2_048])).unwrap();
+            assert_eq!(b.lo_texels.sum, (i + 1) * (8 << 20));
+        }
+        let full = solid_state(&b);
+        let e = b.add_solid_image(solid([1, 1])).unwrap_err();
+        assert!(
+            matches!(e, ImageError::SolidTotalTooLarge { image: 16 }),
+            "{e:?}"
+        );
+        assert_eq!(solid_state(&b), full);
+        // Either variant's total refuses alone.
+        let mut b = builder(dir.path());
+        b.hi_texels.sum = b.hi_texels.cap;
+        let e = b.add_solid_image(solid([1, 1])).unwrap_err();
+        assert!(
+            matches!(e, ImageError::SolidTotalTooLarge { image: 0 }),
+            "{e:?}"
+        );
+        assert_eq!((b.images.len(), b.lo_texels.sum), (0, 0));
+    }
+
+    #[test]
+    fn generated_images_meet_the_image_and_frame_caps() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut b = builder(dir.path());
+        for _ in 0..MAX_IMAGES {
+            b.add_solid_image(solid([1, 1])).unwrap();
+        }
+        let full = solid_state(&b);
+        let e = b.add_solid_image(solid([1, 1])).unwrap_err();
+        assert!(matches!(e, ImageError::TooManyImages { .. }), "{e:?}");
+        assert_eq!(solid_state(&b), full);
+        // A frame table at its cap refuses one more frame.
+        png(dir.path(), "a.png", 32, 32);
+        let mut b = builder(dir.path());
+        b.admit_file(file("a.png")).unwrap();
+        for _ in 0..MAX_SKIN_FRAMES / 1024 {
+            b.add_image(image(0, [32, 32])).unwrap();
+        }
+        let full = solid_state(&b);
+        let e = b.add_solid_image(solid([1, 1])).unwrap_err();
+        assert!(matches!(e, ImageError::TooManySkinFrames), "{e:?}");
+        assert_eq!(solid_state(&b), full);
     }
 
     #[test]

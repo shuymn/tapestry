@@ -5,14 +5,14 @@
 use std::collections::HashMap;
 
 use skin_model::{
-    AdmitError, BitmapFontError, Charge, FileDef, FntAdmitError, FntError, FntFileError, FntLimit,
-    FontAdmitError, FontDef, FontError, ImageDef, ImageError, MAX_PATH_BYTES, Refused, Root, Sheet,
-    SheetBuilder,
+    AdmitError, BitmapFontError, Charge, FileDef, Filter, FntAdmitError, FntError, FntFileError,
+    FntLimit, FontAdmitError, FontDef, FontError, ImageDef, ImageError, MAX_PATH_BYTES, Refused,
+    Root, Sheet, SheetBuilder, SolidImageDef,
 };
 
 use super::Config;
 use super::budget::{Budget, ImportLimit};
-use super::report::{FileChoice, Rule};
+use super::report::{FileChoice, NoteFallback, Rule};
 use crate::header::Header;
 
 /// The movie extensions the source plays as images
@@ -199,6 +199,10 @@ pub(crate) type ImageKey = (u32, bool, [u32; 2], bool);
 /// the count.
 pub(crate) type Crop = [u32; 2];
 
+/// The size of a note part's generated paint, as the source generates
+/// it (`play/SkinNote.java:113-138`).
+pub(crate) const FALLBACK_SIZE: [u32; 2] = [32, 8];
+
 /// The sheet being built, with the importer's caches.
 pub(crate) struct Assets {
     builder: SheetBuilder,
@@ -214,6 +218,9 @@ pub(crate) struct Assets {
     fnt_files: HashMap<String, Result<u16, FntFailure>>,
     /// Bitmap fonts by font record, or the primary file's failure.
     bitmap_fonts: HashMap<u32, Result<u32, FntFailure>>,
+    /// The generated note part images, by [`NoteFallback`]: at most
+    /// three, however many parts draw them.
+    note_fallbacks: [Option<u32>; 3],
 }
 
 #[cfg(test)]
@@ -233,7 +240,47 @@ impl Assets {
             fonts: HashMap::new(),
             fnt_files: HashMap::new(),
             bitmap_fonts: HashMap::new(),
+            note_fallbacks: [None; 3],
         }
+    }
+
+    /// The generated image of `paint`, added once: its image and frame
+    /// are charged before it is added, and a later request charges
+    /// nothing. No file is admitted or attempted.
+    ///
+    /// # Errors
+    ///
+    /// The image or frame budget, or a variant's texel total.
+    pub(crate) fn note_fallback(
+        &mut self,
+        budget: &mut Budget,
+        paint: NoteFallback,
+    ) -> Result<u32, ImportLimit> {
+        // The cache slot and the straight RGBA: the source's white,
+        // yellow and red.
+        let (slot, color) = match paint {
+            NoteFallback::Tap => (0, [255, 255, 255, 255]),
+            NoteFallback::Long => (1, [255, 255, 0, 255]),
+            NoteFallback::Mine => (2, [255, 0, 0, 255]),
+        };
+        if let Some(&Some(i)) = self.note_fallbacks.get(slot) {
+            return Ok(i);
+        }
+        budget.image(1)?;
+        let def = SolidImageDef {
+            size: FALLBACK_SIZE,
+            color,
+            filter: Filter::Nearest,
+        };
+        let i = self.builder.add_solid_image(def).map_err(|e| match e {
+            ImageError::TooManyImages { .. } => ImportLimit::Images,
+            ImageError::TooManySkinFrames => ImportLimit::Frames,
+            _ => ImportLimit::FileTotals,
+        })?;
+        if let Some(cached) = self.note_fallbacks.get_mut(slot) {
+            *cached = Some(i);
+        }
+        Ok(i)
     }
 
     /// Admits `def` once: a repeated request returns the first outcome. A
@@ -541,6 +588,37 @@ mod tests {
         assert_eq!(assets.fnt_file(&mut budget, "p.fnt"), Ok(Ok(0)));
         assert_eq!((budget.usage.images, budget.usage.file_attempts), (2, 3));
         assert_eq!((budget.usage.fonts, budget.usage.glyphs), (1, 2));
+    }
+
+    #[test]
+    fn a_fallback_is_charged_once_and_shared() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut assets = Assets::new(&Root::new(dir.path()).unwrap());
+        // One image allowance left: the first paint takes it.
+        let mut budget = Budget::default();
+        budget.usage.images = u32::try_from(skin_model::MAX_IMAGES - 1).unwrap();
+        assert_eq!(assets.note_fallback(&mut budget, NoteFallback::Tap), Ok(0));
+        assert_eq!(budget.usage.frames, 1);
+        // A miss at the cap stops; the cached paint is still shared and
+        // charges nothing more.
+        assert_eq!(
+            assets.note_fallback(&mut budget, NoteFallback::Long),
+            Err(ImportLimit::Images)
+        );
+        let charged = budget.usage;
+        assert_eq!(assets.note_fallback(&mut budget, NoteFallback::Tap), Ok(0));
+        assert_eq!(budget.usage, charged);
+        // The frame cap stops a miss the same way.
+        let mut budget = Budget::default();
+        budget.usage.frames = u32::try_from(skin_model::MAX_SKIN_FRAMES).unwrap();
+        assert_eq!(
+            assets.note_fallback(&mut budget, NoteFallback::Mine),
+            Err(ImportLimit::Frames)
+        );
+        assert_eq!(assets.note_fallback(&mut budget, NoteFallback::Tap), Ok(0));
+        // No file was attempted.
+        assert_eq!(budget.usage.file_attempts, 0);
+        assert_eq!(assets.finish().image_count(), 1);
     }
 
     #[test]

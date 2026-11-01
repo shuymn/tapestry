@@ -1655,6 +1655,7 @@ fn build_does_not_allocate() {
         "built-in timers never drawn"
     );
     source_lanes_do_not_allocate(&chart, &full);
+    fallback_lanes_do_not_allocate(&chart, &full);
     bar_groups_do_not_allocate(&full);
     cover_trims_do_not_allocate(&chart, &full);
     // The next attempt, prepared untracked after the stretches, builds.
@@ -1916,6 +1917,147 @@ fn source_lanes_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
         quads > 0 && tails > 0 && hiddens > 0,
         "source lanes drew {quads} quads, {tails} end caps, {hiddens} HIDDEN+"
     );
+}
+
+/// The source player's lanes drawn wholly with generated fallback paint
+/// (`lanes_support::fallback_sheet`), as an importer draws parts whose
+/// ids name no image: LN then CN, each attempt prepared untracked, frames
+/// every 16 ms with the hold events drained as they come, under covers
+/// that leave scroll and none, at every target and into a batch of half
+/// the lanes' quads; then an invalid frame poisoning the play and builds
+/// refused on it. Nothing allocated; taps, end caps (CN only), bodies and
+/// mines drawn.
+fn fallback_lanes_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
+    let [tap, long, mine] = [0, 1, 2].map(|k| lanes_support::FALLBACK + k);
+    let lanes = skin_model::LanesDef {
+        parts: LaneParts {
+            note: [tap; 8],
+            head: [long; 8],
+            tail: [long; 8],
+            body_on: [long; 8],
+            body_off: [long; 8],
+            mine: [mine; 8],
+            line: None,
+        },
+        ..lanes_support::source()
+    };
+    let skin = Skin::new(SkinDef {
+        fit: Fit::Adapt,
+        regions: play_support::REGIONS,
+        whens: Vec::new(),
+        sheet: lanes_support::fallback_sheet(),
+        elements: vec![lanes_support::lanes_element()],
+        lanes: Some(lanes),
+        widgets: skin_model::WidgetDefs::default(),
+        bomb_up_to: Some(skin_model::Grade::Bad),
+    })
+    .unwrap();
+    let uvs = play_support::uvs(&skin);
+    let mut batch = QuadBatch::with_capacity(skin.quad_capacity(), skin.run_capacity());
+    let mut small =
+        QuadBatch::with_capacity(skin_model::LANE_QUADS / 2, skin_model::LANE_QUADS / 2);
+    let t = tally(0);
+    let gauges = [state(GaugeValue::FULL), state(GaugeValue::FULL)];
+    let layout = SkinLayout::AUTHOR;
+    let events = effects(chart, None, false);
+    let uv_of = |i: u32| uvs.get(i).unwrap().uv;
+    let [tap_uv, long_uv, mine_uv] = [tap, long, mine].map(uv_of);
+    // The most long-note quads in one frame, LN then CN.
+    let mut max = [0_usize; 2];
+    for (slot, mode) in max
+        .iter_mut()
+        .zip([bms_model::LnMode::Ln, bms_model::LnMode::Cn])
+    {
+        let mut c = chart.clone();
+        c.meta.ln_mode = Some(mode);
+        let mut play = skin.prepare(&c, ctx).unwrap();
+        let mut next = 0;
+        let (mut taps, mut longs, mut mines, mut max_longs) = (0_usize, 0_usize, 0_usize, 0);
+        TRACK.with(|t| t.set(true));
+        for (i, now) in (0..12_000 * MS).step_by(16 * MS as usize).enumerate() {
+            let cover = [0, 300, 1_000][i / 50 % 3];
+            let lanes = LaneView {
+                visible_time: TimeUs(600 * MS),
+                cover,
+                lift: 0,
+                hidden: 0,
+            };
+            let rest = events.get(next..).unwrap_or_default();
+            let n = rest.partition_point(|e| e.time.0 <= now);
+            let drain = rest.get(..n).unwrap_or_default();
+            next += n;
+            let frame = SkinFrame {
+                now: TimeUs(now),
+                display_offset: TimeUs(0),
+                tally: &t,
+                gauges: &gauges,
+                gauge: 0,
+                effects: drain,
+                complete: false,
+                target: TARGETS[i % TARGETS.len()],
+                layout: &layout,
+                lanes,
+                readouts: readouts_for(lanes),
+                loading: None,
+                playing: true,
+            };
+            let out = if i % 50 == 49 { &mut small } else { &mut batch };
+            out.clear();
+            skin.build(&mut play, &frame, &uvs, out)
+                .expect("the frame builds");
+            let count = |uv: [f32; 4]| out.quads().iter().filter(|q| q.uv == uv).count();
+            taps += count(tap_uv);
+            mines += count(mine_uv);
+            let l = count(long_uv);
+            longs += l;
+            max_longs = max_longs.max(l);
+        }
+        // An invalid frame poisons the play; every later build refuses.
+        let lanes = LaneView {
+            visible_time: TimeUs(600 * MS),
+            cover: 0,
+            lift: 100,
+            hidden: 0,
+        };
+        let mut bad = readouts_for(lanes);
+        bad.covers.lift = 500;
+        for _ in 0..3 {
+            batch.clear();
+            let frame = SkinFrame {
+                now: TimeUs(1_000 * MS),
+                display_offset: TimeUs(0),
+                tally: &t,
+                gauges: &gauges,
+                gauge: 0,
+                effects: &[],
+                complete: false,
+                target: TARGETS[0],
+                layout: &layout,
+                lanes,
+                readouts: bad,
+                loading: None,
+                playing: true,
+            };
+            assert_eq!(
+                skin.build(&mut play, &frame, &uvs, &mut batch),
+                Err(BuildError::InvalidReadouts)
+            );
+        }
+        TRACK.with(|t| t.set(false));
+        assert!(
+            taps > 0 && mines > 0 && longs > 0,
+            "{mode:?}: {taps} {mines} {longs}"
+        );
+        *slot = max_longs;
+    }
+    assert_eq!(
+        ALLOCS.swap(0, Ordering::Relaxed),
+        0,
+        "fallback lanes: allocations"
+    );
+    // CN draws its end caps besides LN's body and head.
+    let [ln, cn] = max;
+    assert!(cn > ln, "LN {ln}, CN {cn}");
 }
 
 /// The trimmed cover paints of [`cover_trims_do_not_allocate`] over the

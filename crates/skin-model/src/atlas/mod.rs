@@ -19,7 +19,7 @@ pub(crate) mod uv;
 
 use crate::image::path;
 use crate::image::{self, decode};
-use crate::image::{FileAt, ImageError, MAX_FILE_BYTES, MAX_TOTAL_FILE_BYTES, Sheet};
+use crate::image::{CellSource, FileAt, ImageError, MAX_FILE_BYTES, MAX_TOTAL_FILE_BYTES, Sheet};
 use pack::PackError;
 use uv::{FrameUv, UvTable};
 
@@ -164,7 +164,9 @@ impl Sheet {
     /// every file to be read again (its path, at most [`MAX_FILE_BYTES`],
     /// and at most [`MAX_TOTAL_FILE_BYTES`] across them), and reads and
     /// decodes one file at a time, each into memory freed before the next:
-    /// a file whose dimensions changed since load is refused.
+    /// a file whose dimensions changed since load is refused. Generated
+    /// cells ([`SolidImageDef`](crate::SolidImageDef)) are written last,
+    /// at one size in both variants, reading nothing.
     ///
     /// # Errors
     ///
@@ -177,8 +179,14 @@ impl Sheet {
         let mut rects = Vec::with_capacity(self.cells().len());
         let mut padded = Vec::with_capacity(self.cells().len());
         for cell in self.cells() {
-            let file = usize::try_from(cell.file).ok().and_then(|f| files.get(f));
-            let hi = file.is_some_and(|f| f.version(variant).1);
+            // A generated cell has one size in both variants.
+            let hi = match cell.source {
+                CellSource::File(f) => usize::try_from(f)
+                    .ok()
+                    .and_then(|f| files.get(f))
+                    .is_some_and(|f| f.version(variant).1),
+                CellSource::Solid(_) => false,
+            };
             let rect = if hi {
                 cell.rect.map(|v| v * 2)
             } else {
@@ -249,7 +257,8 @@ impl Sheet {
         })
     }
 
-    /// Reads each file with cells, in file order, and writes its cells.
+    /// Reads each file with cells, in file order, and writes its cells;
+    /// then writes each generated cell's colour, reading nothing.
     fn fill(
         &self,
         variant: Variant,
@@ -260,18 +269,17 @@ impl Sheet {
         let files = self.files();
         let cells = self.cells();
         // The files with cells, checked and summed before any is read.
+        // File cells come first ([`CellSource`]'s order).
         let mut used: Vec<(usize, usize, usize)> = Vec::new();
         let mut start = 0;
-        while let Some(first) = cells.get(start) {
+        while let Some(&CellSource::File(file)) = cells.get(start).map(|c| &c.source) {
             let end = start
                 + cells.get(start..).map_or(0, |rest| {
-                    rest.iter().take_while(|c| c.file == first.file).count()
+                    rest.iter()
+                        .take_while(|c| c.source == CellSource::File(file))
+                        .count()
                 });
-            used.push((
-                usize::try_from(first.file).unwrap_or(usize::MAX),
-                start,
-                end,
-            ));
+            used.push((usize::try_from(file).unwrap_or(usize::MAX), start, end));
             start = end;
         }
         let mut total = 0_u64;
@@ -311,6 +319,24 @@ impl Sheet {
                 };
                 mip::blit(level, packing.side, &image, rect, place.alloc);
             }
+        }
+
+        // The generated cells, after the files.
+        for (i, cell) in cells.iter().enumerate().skip(start) {
+            let CellSource::Solid(color) = cell.source else {
+                continue;
+            };
+            let Some(place) = packing.places.get(i) else {
+                continue;
+            };
+            let Some(level) = usize::try_from(place.page)
+                .ok()
+                .and_then(|p| pages.get_mut(p))
+                .and_then(|page| page.levels.first_mut())
+            else {
+                continue;
+            };
+            mip::blit_solid(level, packing.side, color, place.alloc);
         }
         Ok(())
     }
