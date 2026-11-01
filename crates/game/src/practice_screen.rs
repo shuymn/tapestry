@@ -373,52 +373,28 @@ impl PracticeScreen {
         self.rule.as_ref().is_some_and(|r| self.value != r.start)
     }
 
-    /// Fits the screen to `preset`, the play preset now, as
-    /// [`Loaded::refit_practice`] fits the practice, so the page never
-    /// shows a value the next round would not play or the player could
-    /// not step out of. The displayed gauge is followed by its ID: a value
-    /// set away from its start stays while the gauge's rule accepts it, and
-    /// otherwise the gauge takes its new start. A displayed gauge the
-    /// preset no longer has gives way, with its value, to the preset's
-    /// gauge at the same place, at its start, as [`new`](Self::new) shows
-    /// one. What a player set and lost is said: the notice for the page,
-    /// or `None` when nothing set was reset.
-    pub fn fit(&mut self, preset: &RulePreset) -> Option<String> {
-        let shown = self.rule.clone()?;
-        let found = preset
-            .gauges
-            .iter()
-            .enumerate()
-            .find(|(_, g)| g.id == shown.id);
-        let mut notice = None;
-        match found {
-            Some((j, g)) => {
-                if !self.set_away() {
-                    self.value = g.start;
-                } else if !eval::accepts_initial(g, self.value) {
-                    self.value = g.start;
-                    notice = Some(format!(
-                        "the gauge {} no longer accepts the value set; it is back at its start",
-                        g.id
-                    ));
-                }
-                self.gauge = j;
-                self.rule = Some(g.clone());
-            }
-            None => {
-                self.gauge = self.gauge.min(preset.gauges.len().saturating_sub(1));
-                self.rule = preset.gauges.get(self.gauge).cloned();
-                self.value = self.rule.as_ref().map_or(GaugeValue::EMPTY, |r| r.start);
-                notice = Some(match &self.rule {
-                    Some(r) => format!(
-                        "the gauge {} left the preset; showing {} at its start",
-                        shown.id, r.id
-                    ),
-                    None => format!("the gauge {} left the preset", shown.id),
-                });
-            }
-        }
-        notice
+    /// Shows what `loaded`'s practice plays now, once rounds of the
+    /// practice this screen set up refitted it to the play preset
+    /// ([`Loaded::refit_practice`]), never the screen's own copy: the
+    /// displayed gauge, followed by its ID, at the practice's value for it,
+    /// or its start without one. A displayed gauge the preset no longer has
+    /// gives way to the preset's gauge at the same place, at its start, as
+    /// [`new`](Self::new) shows one. What was reset was announced already,
+    /// before the round that plays it or as the reason no round opened.
+    pub fn sync(&mut self, loaded: &Loaded) {
+        let gauges = &loaded.preset().gauges;
+        let found = self
+            .rule
+            .as_ref()
+            .and_then(|r| gauges.iter().position(|g| g.id == r.id));
+        self.gauge = found.unwrap_or_else(|| self.gauge.min(gauges.len().saturating_sub(1)));
+        self.rule = gauges.get(self.gauge).cloned();
+        self.value = self.rule.as_ref().map_or(GaugeValue::EMPTY, |r| {
+            loaded
+                .initial_gauge(&r.id)
+                .filter(|v| eval::accepts_initial(r, *v))
+                .unwrap_or(r.start)
+        });
     }
 
     /// The practice set up for `loaded`, read at the chosen speed: the
@@ -593,97 +569,5 @@ mod tests {
         assert_eq!(s.input(Confirm), PracticeActed::Start);
         assert_eq!(s.notice(), None);
         assert_eq!(s.input(Back), PracticeActed::Back);
-    }
-
-    /// The screen at 5 % below its first gauge's start.
-    fn set_below(preset: &rules::RulePreset) -> PracticeScreen {
-        use PracticeInput::{Down, Left};
-        let chart = load("#BPM 120\n#00111:01\n#00211:01\n");
-        let mut s = PracticeScreen::new(&chart, preset, 0);
-        for _ in 0..4 {
-            s.input(Down);
-        }
-        for _ in 0..5 {
-            s.input(Left);
-        }
-        s
-    }
-
-    /// The screen follows its gauge by ID through an edited preset, saying
-    /// only what it reset: a value set away from the start moves with the
-    /// gauge, and a value at the start takes the gauge's new start.
-    #[test]
-    fn the_screen_follows_its_gauge_by_id() {
-        let preset = rules::tapestry();
-        let shown = preset.gauges[0].clone();
-        let set = GaugeValue(shown.start.0 - 5 * GaugeValue::PERCENT);
-        let mut s = set_below(&preset);
-        assert_eq!(s.value(), set);
-        let mut reversed = preset.clone();
-        reversed.gauges.reverse();
-        let at = reversed.gauges.len() - 1;
-        assert_eq!(s.fit(&reversed), None);
-        assert_eq!(
-            (s.gauge(), s.gauge_name(), s.value()),
-            (at, Some(shown.id.as_str()), set)
-        );
-        let mut s = PracticeScreen::new(&load("#BPM 120\n#00111:01\n"), &preset, 0);
-        let mut moved = preset.clone();
-        moved.gauges[0].start = GaugeValue(shown.start.0 - GaugeValue::PERCENT);
-        assert_eq!(s.fit(&moved), None);
-        assert_eq!(s.value(), moved.gauges[0].start);
-    }
-
-    /// A set value the gauge's narrowed rule refuses goes back to the
-    /// gauge's start, and the screen says so; the value can be set again.
-    #[test]
-    fn a_value_the_narrowed_gauge_refuses_goes_back_to_its_start() {
-        let preset = rules::tapestry();
-        let mut s = set_below(&preset);
-        let mut narrowed = preset.clone();
-        narrowed.gauges[0].min = narrowed.gauges[0].start;
-        let notice = s.fit(&narrowed).unwrap();
-        assert!(
-            notice.contains("gauge normal no longer accepts"),
-            "{notice}"
-        );
-        assert_eq!(s.value(), narrowed.gauges[0].start);
-        assert_eq!(s.input(PracticeInput::Right), PracticeActed::Changed);
-    }
-
-    /// A set gauge the preset lost gives way, with its value, to the
-    /// preset's gauge at its place, at its start, and the screen names
-    /// both; so after a start moved off the 1 % steps, too, which the set
-    /// value could never have been stepped back to.
-    #[test]
-    fn a_removed_gauge_gives_way_to_the_gauge_at_its_place() {
-        let preset = rules::tapestry();
-        let mut s = set_below(&preset);
-        let mut odd = preset.clone();
-        odd.gauges[0].start = GaugeValue(20 * GaugeValue::PERCENT + GaugeValue::PERCENT / 2);
-        assert_eq!(s.fit(&odd), None);
-        let mut removed = odd.clone();
-        removed.gauges.remove(0);
-        let notice = s.fit(&removed).unwrap();
-        let other = &removed.gauges[0];
-        assert_eq!(
-            notice,
-            format!(
-                "the gauge normal left the preset; showing {} at its start",
-                other.id
-            )
-        );
-        assert_eq!(
-            (s.gauge(), s.gauge_name(), s.value()),
-            (0, Some(other.id.as_str()), other.start)
-        );
-        // Nothing left to show.
-        let mut none = removed.clone();
-        none.gauges.clear();
-        assert_eq!(
-            s.fit(&none).as_deref(),
-            Some(format!("the gauge {} left the preset", other.id).as_str())
-        );
-        assert_eq!(s.gauge_name(), None);
     }
 }

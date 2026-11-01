@@ -25,7 +25,7 @@ use replay::{
     Arrival, BuildProvenance, ChartRecord, DeviceRecord, EndStatus, Incomplete, PlayRecord,
     PlayType, PresetRecord, ReceiveMethod, SourceRecord, Status, Versions, WakePolicy,
 };
-use rules::{GaugeKind, RulePreset};
+use rules::{GaugeKind, GaugeValue, RulePreset};
 
 use crate::attempt::{Attempt, NoteEnd};
 use crate::autoplay::{Autoplay, AutoplayError};
@@ -36,7 +36,7 @@ use crate::policy::{
     DefaultPolicy, FailureAction, GaugeIndex, NoSessionEvents, SessionEvent, SessionEventSink,
     SessionPolicy, SharedEvents,
 };
-use crate::practice::{Practice, PracticeError, RESTORE_AHEAD};
+use crate::practice::{Practice, PracticeError, RESTORE_AHEAD, Reset};
 use crate::prepare::{
     BmsIngest, ChartIngest, ChartLabels, ChartTransform, IngestError, Passthrough,
 };
@@ -715,25 +715,50 @@ impl Loaded {
     /// still accepts it; a gauge left at its start, or whose rule no longer
     /// accepts its value, takes the new start, a gauge the preset gained
     /// starts at its start, and a gauge the preset lost is dropped with its
-    /// value. The section is then checked again under the new preset. The
-    /// practice page fits itself the same way and says what it reset
-    /// ([`PracticeScreen::fit`](crate::PracticeScreen::fit)).
+    /// value. The section is then checked again under the new preset, and
+    /// the practice page shows what it now plays
+    /// ([`PracticeScreen::sync`](crate::PracticeScreen::sync)). What the
+    /// player set and the fit reset comes back, in the preset's order of
+    /// the gauges set: a round never plays a reset value the player was
+    /// not told about, so the round announces it or does not open
+    /// ([`crate::live`]).
     ///
     /// # Errors
     ///
     /// What [`set_practice`](Self::set_practice) refuses; the practice is
     /// then unchanged, and the round must not open.
-    pub fn refit_practice(&mut self) -> Result<(), PracticeError> {
+    pub fn refit_practice(&mut self) -> Result<Vec<Reset>, PracticeError> {
         let (Some((practice, _)), Some(practiced)) = (&self.practice, &self.practiced) else {
-            return Ok(());
+            return Ok(Vec::new());
         };
         if *practiced == self.preset {
-            return Ok(());
+            return Ok(Vec::new());
         }
         let old = practiced.gauges.iter().zip(&practice.initial_gauges);
-        let initial_gauges = self
-            .preset
-            .gauges
+        let new = &self.preset.gauges;
+        let mut resets = Vec::new();
+        for (i, (rule, &set)) in old.clone().enumerate() {
+            if set == rule.start {
+                continue;
+            }
+            match new.iter().find(|g| g.id == rule.id) {
+                Some(g) if eval::accepts_initial(g, set) => {}
+                Some(g) => resets.push(Reset::Refused {
+                    gauge: g.id.clone(),
+                    set,
+                    start: g.start,
+                }),
+                // The practice page shows the gauge at its place instead.
+                None => resets.push(Reset::Lost {
+                    gauge: rule.id.clone(),
+                    set,
+                    shown: new
+                        .get(i.min(new.len().saturating_sub(1)))
+                        .map(|g| (g.id.clone(), g.start)),
+                }),
+            }
+        }
+        let initial_gauges = new
             .iter()
             .map(|g| match old.clone().find(|(rule, _)| rule.id == g.id) {
                 Some((rule, value)) if *value != rule.start && eval::accepts_initial(g, *value) => {
@@ -746,7 +771,24 @@ impl Loaded {
             initial_gauges,
             ..practice.clone()
         };
-        self.set_practice(Some(refit))
+        self.set_practice(Some(refit))?;
+        Ok(resets)
+    }
+
+    /// The initial value of the gauge `id` in the practice set up, while
+    /// its gauge is in the play preset it was checked under; `None`
+    /// otherwise.
+    #[must_use]
+    pub fn initial_gauge(&self, id: &str) -> Option<GaugeValue> {
+        let (Some((practice, _)), Some(practiced)) = (&self.practice, &self.practiced) else {
+            return None;
+        };
+        practiced
+            .gauges
+            .iter()
+            .zip(&practice.initial_gauges)
+            .find(|(g, _)| g.id == id)
+            .map(|(_, v)| *v)
     }
 
     /// The practice set up, if any.

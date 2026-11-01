@@ -64,8 +64,8 @@ pub use policy::{
     SessionPolicy,
 };
 pub use practice::{
-    FADE, LEAD_IN, Practice, PracticeError, RESTORE_AHEAD, RESTORE_RETRY, RING_OUT, chart_end,
-    mid_chart_start,
+    FADE, LEAD_IN, Practice, PracticeError, RESTORE_AHEAD, RESTORE_RETRY, RING_OUT, Reset,
+    chart_end, mid_chart_start, reset_notice,
 };
 pub use practice_screen::{
     LEAD_IN_STEP, MAX_LEAD_IN, MIN_LEAD_IN, PracticeActed, PracticeInput, PracticeRow,

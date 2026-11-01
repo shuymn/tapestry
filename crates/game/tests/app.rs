@@ -294,6 +294,12 @@ struct Headless {
     quit_pressed: bool,
     /// The chart whose loading state shows.
     loading: Option<usize>,
+    /// Each reset announced, with the openings before it.
+    announced: Vec<(String, usize)>,
+    /// Edits made as the play numbered by their key (counted from 0 over
+    /// the run's attempts) prepares its screen, before its preset's
+    /// refresh.
+    round_edits: Vec<(usize, Box<dyn FnOnce()>)>,
     /// Each entry into the loading state: the chart and the clock time.
     loading_pages: Vec<(usize, i64)>,
     /// Whether the loading state showed at each play's start, in order.
@@ -426,6 +432,8 @@ impl Headless {
             in_load: None,
             quit_pressed: false,
             loading: None,
+            announced: Vec::new(),
+            round_edits: Vec::new(),
             loading_pages: Vec::new(),
             started_loading: Vec::new(),
             cancel_loads: Vec::new(),
@@ -615,6 +623,10 @@ impl Rig for Headless {
     }
 
     fn prepare_screen(&mut self) -> Result<(), SurfaceLost> {
+        let play = self.attempts.len();
+        while let Some(i) = self.round_edits.iter().position(|(at, _)| *at == play) {
+            (self.round_edits.remove(i).1)();
+        }
         self.prepares += 1;
         self.prepared_for.push(self.loads.len());
         if self.prepares >= self.prepare_fails_from {
@@ -646,6 +658,14 @@ impl Rig for Headless {
             }));
         }
         Ok(game::Preparation::Ready)
+    }
+
+    fn announce(&mut self, notice: &str) -> bool {
+        if self.loading.is_none() {
+            return false;
+        }
+        self.announced.push((notice.to_owned(), self.opens));
+        true
     }
 
     fn end_loading(&mut self) -> Result<(), SurfaceLost> {
@@ -2959,30 +2979,23 @@ fn reordered() -> rules::RulePreset {
     p
 }
 
-/// The practice page's first gauge set 5 % below its start, then two
-/// Starts, each round left through its result, with the preset file
-/// rewritten at each `(at, preset)` of `edits` (ms after the clock's
-/// start): the first edit at 300 ms lands in the first round, one at
-/// 12 s in the second.
-fn two_starts(edits: Vec<(i64, rules::RulePreset)>) -> Headless {
+/// The practice page's first gauge, normal, set to 15 %, 5 % below its
+/// start, then Start, then `after`; the preset file is rewritten with each
+/// `(play, preset)` of `edits` as the play numbered `play` (from 0)
+/// prepares its screen, before its preset's refresh.
+fn practice_with_edits(after: Vec<(i64, Act)>, edits: Vec<(usize, rules::RulePreset)>) -> Headless {
     use PracticeInput::{Confirm, Down, Left};
     let mut acts = vec![(0, Act::Practice(P))];
     acts.extend(page(Down, 4));
     acts.extend(page(Left, 5));
     acts.extend(page(Down, 2));
-    acts.extend([
-        (500, Act::Page(Confirm)),
-        (3_000, Act::Quit),
-        (500, Act::Quit),
-        (20_000, Act::Page(Confirm)),
-        (3_000, Act::Quit),
-        (500, Act::Quit),
-        (500, Act::Close),
-    ]);
+    acts.push((500, Act::Page(Confirm)));
+    acts.extend(after);
     let (rig, _app, _dir, ran) = run_mine(Refusal::Missing, acts, |r, dir| {
-        for (at, preset) in edits {
-            let file = game::preset_to_toml(&preset);
-            edit(r, CLOCK_START + at * MS, &mine_path(dir), file);
+        for (play, preset) in edits {
+            let (path, text) = (mine_path(dir), game::preset_to_toml(&preset));
+            r.round_edits
+                .push((play, Box::new(move || common::rewrite(&path, &text))));
         }
     });
     ran.unwrap();
@@ -3001,33 +3014,90 @@ fn initial_gauges(rig: &Headless) -> Vec<Vec<rules::GaugeValue>> {
         .collect()
 }
 
-fn starts(preset: &rules::RulePreset) -> Vec<rules::GaugeValue> {
-    preset.gauges.iter().map(|g| g.start).collect()
+fn pct(n: i64) -> rules::GaugeValue {
+    rules::GaugeValue(n * rules::GaugeValue::PERCENT)
 }
 
-/// A gauge set on the practice page that an edit of the preset removes
-/// gives way: the round plays every gauge at its start, the page shows the
-/// preset's gauge at its place, at its start, and says so, and the next
-/// Start plays as well.
+/// The tapestry preset whose normal gauge accepts nothing below its start.
+fn narrowed() -> rules::RulePreset {
+    let mut p = rules::tapestry();
+    p.gauges[0].min = p.gauges[0].start;
+    p
+}
+
+const REFUSED_15: &str = "the gauge normal no longer accepts 15%; it starts at 20%";
+
+/// A set value the first round's refreshed preset no longer accepts is
+/// announced in the loading state before recording opens, with its values;
+/// the round plays the start, and the page then shows it, with nothing to
+/// announce again.
 #[test]
-fn a_set_gauge_the_preset_lost_gives_way() {
-    let mut edited = flat_normal();
-    let lost = edited.gauges.remove(0);
-    let rig = two_starts(vec![(300, edited.clone())]);
-    assert_eq!(initial_gauges(&rig), [starts(&edited), starts(&edited)]);
+fn a_reset_is_announced_before_the_first_round_records() {
+    let after = vec![
+        (3_000, Act::Quit),
+        (500, Act::Back),
+        (500, Act::Page(PracticeInput::Back)),
+        (500, Act::Close),
+    ];
+    let rig = practice_with_edits(after, vec![(0, narrowed())]);
+    assert_eq!(rig.announced, [(REFUSED_15.to_owned(), 0)]);
+    assert_eq!(initial_gauges(&rig)[0][0], pct(20));
+    let page = &rig.practice_entries[1];
+    assert_eq!((page.gauge_name(), page.value()), (Some("normal"), pct(20)));
+    assert_eq!(notices(&rig)[1], None);
+}
+
+/// A repeated round whose refreshed preset no longer accepts the value set
+/// does not open: no loading state shows to announce it, so the rounds end
+/// with it on the page, which shows the start the next round plays.
+#[test]
+fn a_reset_stops_the_repeat() {
+    let after = vec![(20_000, Act::Page(PracticeInput::Back)), (500, Act::Close)];
+    let rig = practice_with_edits(after, vec![(1, narrowed())]);
+    assert!(rig.announced.is_empty());
+    assert_eq!(rig.opens, 1);
+    assert_eq!(
+        initial_gauges(&rig),
+        [rules::tapestry()
+            .gauges
+            .iter()
+            .map(|g| g.start)
+            .enumerate()
+            .map(|(i, s)| if i == 0 { pct(15) } else { s })
+            .collect::<Vec<_>>()]
+    );
     let n = notices(&rig);
-    let shown = &edited.gauges[0];
+    assert_eq!(n[1].as_deref(), Some(REFUSED_15));
+    let page = &rig.practice_entries[1];
+    assert_eq!((page.gauge_name(), page.value()), (Some("normal"), pct(20)));
+}
+
+/// A retry whose refreshed preset lost the gauge set does not open: the
+/// rounds end with the reset on the page, which shows the gauge at its
+/// place, at its start. The gauge's start moved off the 1 % steps first,
+/// keeping the value set, which no step back could have reached.
+#[test]
+fn a_reset_stops_the_retry() {
+    let mut odd = rules::tapestry();
+    odd.gauges[0].start = rules::GaugeValue(pct(20).0 + pct(1).0 / 2);
+    let mut lost = odd.clone();
+    lost.gauges.remove(0);
+    let after = vec![
+        (3_000, Act::Quit),
+        (500, Act::Retry),
+        (500, Act::Page(PracticeInput::Back)),
+        (500, Act::Close),
+    ];
+    let rig = practice_with_edits(after, vec![(0, odd), (1, lost.clone())]);
+    assert!(rig.announced.is_empty());
+    assert_eq!(rig.opens, 1);
+    assert_eq!(initial_gauges(&rig)[0][0], pct(15));
+    let shown = &lost.gauges[0];
+    let n = notices(&rig);
     assert_eq!(
         n[1].as_deref(),
-        Some(
-            format!(
-                "the gauge {} left the preset; showing {} at its start",
-                lost.id, shown.id
-            )
-            .as_str()
-        )
+        Some("the gauge normal (15%) left the preset; showing survival at 100%")
     );
-    assert_eq!(n[2], None);
     let page = &rig.practice_entries[1];
     assert_eq!(
         (page.gauge(), page.gauge_name(), page.value()),
@@ -3035,64 +3105,52 @@ fn a_set_gauge_the_preset_lost_gives_way() {
     );
 }
 
-/// A gauge set on the practice page to a value an edit of the preset no
-/// longer accepts goes back to its start: the round plays it there, the
-/// page shows it there and says so, and the next Start plays as well.
+/// An edit that resets nothing the player set, reordering the gauges and
+/// adding one, does not stop the repeat: the next round plays the value
+/// set under its gauge, and the page shows it there, with no notice.
 #[test]
-fn a_set_value_the_preset_refuses_goes_back_to_its_start() {
-    let mut edited = flat_normal();
-    edited.gauges[0].min = edited.gauges[0].start;
-    let rig = two_starts(vec![(300, edited.clone())]);
-    assert_eq!(initial_gauges(&rig), [starts(&edited), starts(&edited)]);
-    let n = notices(&rig);
-    assert_eq!(
-        n[1].as_deref(),
-        Some("the gauge normal no longer accepts the value set; it is back at its start")
-    );
-    assert_eq!(n[2], None);
+fn a_sync_only_edit_keeps_the_repeat() {
+    let after = vec![
+        (14_000, Act::Quit),
+        (500, Act::Back),
+        (500, Act::Page(PracticeInput::Back)),
+        (500, Act::Close),
+    ];
+    let edited = reordered();
+    let rig = practice_with_edits(after, vec![(1, edited.clone())]);
+    assert!(rig.announced.is_empty());
+    assert_eq!(rig.opens, 2);
+    let at = edited.gauges.iter().position(|g| g.id == "normal").unwrap();
+    assert_eq!(initial_gauges(&rig)[1][at], pct(15));
     let page = &rig.practice_entries[1];
     assert_eq!(
         (page.gauge(), page.gauge_name(), page.value()),
-        (0, Some("normal"), edited.gauges[0].start)
+        (at, Some("normal"), pct(15))
     );
+    assert_eq!(notices(&rig)[1], None);
 }
 
-/// A gauge kept at a set value while an edit moves its start off the 1 %
-/// steps, and then removed by another edit, which a step back to its start
-/// could never undo: the second round plays every gauge at its start, and
-/// the page gives way to the gauge at its place and says so.
+/// A value reset to its start in the first round stays reset when the
+/// rule is restored before a retry: the retry plays the start and the page
+/// shows it, not the value the page held before the reset.
 #[test]
-fn a_set_gauge_lost_after_its_start_moved_gives_way() {
-    let mut odd = flat_normal();
-    odd.gauges[0].start =
-        rules::GaugeValue(20 * rules::GaugeValue::PERCENT + rules::GaugeValue::PERCENT / 2);
-    let mut removed = odd.clone();
-    removed.gauges.remove(0);
-    let rig = two_starts(vec![(300, odd.clone()), (12_000, removed.clone())]);
-    let set = rules::GaugeValue(15 * rules::GaugeValue::PERCENT);
-    let mut first = starts(&odd);
-    first[0] = set;
-    assert_eq!(initial_gauges(&rig), [first, starts(&removed)]);
-    let n = notices(&rig);
-    assert_eq!(n[1], None);
-    let kept = &rig.practice_entries[1];
-    assert_eq!((kept.gauge_name(), kept.value()), (Some("normal"), set));
-    let shown = &removed.gauges[0];
-    assert_eq!(
-        n[2].as_deref(),
-        Some(
-            format!(
-                "the gauge normal left the preset; showing {} at its start",
-                shown.id
-            )
-            .as_str()
-        )
-    );
-    let page = &rig.practice_entries[2];
-    assert_eq!(
-        (page.gauge(), page.gauge_name(), page.value()),
-        (0, Some(shown.id.as_str()), shown.start)
-    );
+fn a_reset_survives_the_rule_restored_before_a_retry() {
+    let after = vec![
+        (3_000, Act::Quit),
+        (500, Act::Retry),
+        (3_000, Act::Quit),
+        (500, Act::Back),
+        (500, Act::Page(PracticeInput::Back)),
+        (500, Act::Close),
+    ];
+    let rig = practice_with_edits(after, vec![(0, narrowed()), (1, rules::tapestry())]);
+    assert_eq!(rig.announced, [(REFUSED_15.to_owned(), 0)]);
+    assert_eq!(rig.opens, 2);
+    let gauges = initial_gauges(&rig);
+    assert_eq!((gauges[0][0], gauges[1][0]), (pct(20), pct(20)));
+    let page = &rig.practice_entries[1];
+    assert_eq!((page.gauge_name(), page.value()), (Some("normal"), pct(20)));
+    assert_eq!(notices(&rig)[1], None);
 }
 
 fn act() -> impl Strategy<Value = Act> {

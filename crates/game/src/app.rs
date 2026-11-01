@@ -519,11 +519,15 @@ fn practice_chart<R: AppRig>(
             }
         }
         if start {
-            // The play preset changes only as a round begins: the page
-            // follows it by gauge ID once the rounds return, so what it
-            // shows is what the next round plays.
-            let ran = start_rounds(loaded, &screen, rig);
-            let fitted = screen.fit(loaded.preset());
+            // The play preset changes only as a round begins: once the
+            // rounds of this Start's practice return, the page shows what
+            // they left it playing, so what it shows is what the next
+            // round plays.
+            let mut set_up = false;
+            let ran = start_rounds(loaded, &screen, rig, &mut set_up);
+            if set_up {
+                screen.sync(loaded);
+            }
             let notice = match ran {
                 Ok(Leave::Quit) => return Ok(Leave::Quit),
                 Ok(Leave::Back) => None,
@@ -533,11 +537,6 @@ fn practice_chart<R: AppRig>(
                     Some(n)
                 }
                 Err(Stopped::Run(e)) => return Err(e),
-            };
-            // What the fit reset follows the Start's own notice.
-            let notice = match (notice, fitted) {
-                (Some(n), Some(f)) => Some(format!("{n}; {f}")),
-                (n, f) => n.or(f),
             };
             screen.set_notice(notice);
             rig.entered_practice(&screen);
@@ -562,11 +561,13 @@ enum Stopped<S> {
 /// One Start of the practice screen: the chart read again at the chosen
 /// speed, the practice set up, the bank and the screen's chart loaded
 /// (every time, so no bank of another chart or speed is reused), and the
-/// rounds played until they are left.
+/// rounds played until they are left. `set_up` turns true once the
+/// screen's practice is set up.
 fn start_rounds<R: AppRig>(
     loaded: &mut Loaded,
     screen: &PracticeScreen,
     rig: &mut R,
+    set_up: &mut bool,
 ) -> Result<Leave, Stopped<R::ScreenError>> {
     let notice = |e: &(dyn std::error::Error + 'static)| Stopped::Notice(Chain(e).to_string());
     rig.entered_loading(loaded.path());
@@ -577,6 +578,7 @@ fn start_rounds<R: AppRig>(
     loaded
         .set_practice(Some(practice))
         .map_err(|e| notice(&e))?;
+    *set_up = true;
     if rig.load_chart(loaded).map_err(|e| notice(&e))? == Loading::Cancelled {
         return cancelled(rig).map_err(Stopped::Run);
     }
