@@ -154,7 +154,7 @@ impl Cx<'_> {
         self.budget.image(frames).map_err(|l| self.limit(at, l))?;
         #[cfg(test)]
         trace(Event::Charge);
-        let (file, rect, cell) = match self.src_rect(c.role, at, s, s.div)? {
+        let (file, rect, cell) = match self.src_rect(c.role, at, s, s.div, true)? {
             Ok(found) => found,
             Err(u) => return Ok(Err(u)),
         };

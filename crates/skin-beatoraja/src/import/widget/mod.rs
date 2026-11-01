@@ -189,7 +189,7 @@ impl Cx<'_> {
         self.budget.image(frames).map_err(|l| self.limit(at, l))?;
         #[cfg(test)]
         super::trace(super::Event::Charge);
-        let (file, rect, cell) = match self.src_rect(role, at, s, grid)? {
+        let (file, rect, cell) = match self.src_rect(role, at, s, grid, false)? {
             Ok(found) => found,
             Err(Unplaced { why, .. }) => {
                 self.drop_el(role, at, why)?;
@@ -215,13 +215,16 @@ impl Cx<'_> {
 
     /// Where `s`'s first `grid` columns and rows lie, its image charged:
     /// its admitted file, its rect in texels and its cell. A file that
-    /// fails a check refuses a critical element with its error.
+    /// fails a check refuses a critical element with its error, except
+    /// that with `holes` a file missing for the source too stays missing,
+    /// a hole its table keeps.
     pub(super) fn src_rect(
         &mut self,
         role: Role,
         at: Span,
         s: &SrcImage,
         grid: [u32; 2],
+        holes: bool,
     ) -> Result<Result<Placed, Unplaced>, ImportError> {
         let missing = |why| Ok(Err(Unplaced { why, missing: true }));
         let refused = |why| {
@@ -257,7 +260,9 @@ impl Cx<'_> {
             .map_err(|l| self.limit(at, l))?
         {
             Ok(f) => f,
-            Err(Failed::File { .. }) if matches!(role, Role::Critical(_)) => {
+            Err(Failed::File { refused })
+                if matches!(role, Role::Critical(_)) && (refused || !holes) =>
+            {
                 if let Some(source) = self.assets.take_error(&name) {
                     return Err(ImportError::Asset {
                         at: self.loc(at),

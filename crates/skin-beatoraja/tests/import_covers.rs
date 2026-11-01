@@ -1132,3 +1132,26 @@ fn selecting_paint_may_not_depend_on_the_state_start() {
     // A static, perpetual one without a cycle imports untimed.
     cover_set("", "", r#""cover", "cover""#, "", OVER).ok();
 }
+
+#[test]
+fn a_critical_set_keeps_missing_files_as_holes() {
+    // `m.png` does not exist, for the source too: each reference to it is
+    // a hole, noted, and the paint shows the entries that load.
+    let sources = r#""source": [{"id": "a", "path": "a.png"}, {"id": "m", "path": "m.png"},
+        {"id": "bad", "path": "../x.png"}], "#;
+    let gone = r#"{"id": "gone", "src": "m", "w": 16, "h": 16}"#;
+    let l = cover_set(sources, gone, r#""cover", "gone", "gone""#, "", OVER);
+    let holes = l
+        .report()
+        .notes
+        .iter()
+        .filter(|n| n.kind == NoteKind::MissingAsset)
+        .count();
+    assert_eq!(holes, 2);
+    assert_eq!(rects(&l, 5_000, 500, 0).len(), 1);
+    // A file only this importer refuses is no hole: refused with its
+    // error.
+    let refused = r#"{"id": "gone", "src": "bad", "w": 16, "h": 16}"#;
+    let l = cover_set(sources, refused, r#""cover", "gone""#, "", OVER);
+    assert!(matches!(l.err(), ImportError::Asset { .. }));
+}
