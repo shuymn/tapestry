@@ -371,6 +371,7 @@ impl Play {
             }
         };
         set(timer::READY, ready);
+        set(timer::SCREEN, ready);
         set(timer::PLAY, play);
         set(timer::FAILED, failed);
         set(timer::LAST_NOTE, last_note);

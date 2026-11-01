@@ -21,7 +21,7 @@
 //!    ([`super::property::Value::critical`]).
 //! 6. A decorative element whose image or font fails: only it is dropped;
 //!    aggregate limits still refuse ([`unsupported`]).
-//! 7. Elements without a timer start at `ready`; a critical one only with
+//! 7. Elements without a timer run on the `screen` timer; a critical one only with
 //!    output independent of the start time (D3, [`untimed_ok`]).
 //! 8. Play-state display differences on decorative elements are accepted
 //!    (D4, [`super::ops`], [`super::property`]).

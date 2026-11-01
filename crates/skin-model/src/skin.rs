@@ -109,7 +109,7 @@ pub enum TimerRef {
 }
 
 /// One element as a front end builds it. Every element names its timer;
-/// a front end gives an element without one `ready`.
+/// a front end gives an element without one `screen`.
 #[derive(Clone, Debug)]
 pub struct ElementDef {
     pub source: Source,

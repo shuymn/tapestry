@@ -309,9 +309,9 @@ const TARGETS: [[u32; 2]; 5] = [
     [4_321, 1_080],
 ];
 
-/// A uv rectangle as a map key.
-fn uv_key(uv: [f32; 4]) -> [u32; 4] {
-    uv.map(f32::to_bits)
+/// A frame as a map key: its uv rectangle and its layer.
+fn uv_key(uv: [f32; 4], layer: u16) -> ([u32; 4], u16) {
+    (uv.map(f32::to_bits), layer)
 }
 
 /// A lane part's key whatever its crop: the uv's horizontal extent and the
@@ -324,7 +324,7 @@ fn part_key(uv: [f32; 4], layer: u16) -> ([u32; 2], u16) {
 struct Loaded {
     skin: Skin,
     uvs: UvTable,
-    shows: HashMap<[u32; 4], (u16, u16)>,
+    shows: HashMap<([u32; 4], u16), (u16, u16)>,
     parts: HashMap<([u32; 2], u16), u16>,
 }
 
@@ -1059,7 +1059,11 @@ fn skin() -> Loaded {
     for k in 0..IMAGES {
         for f in 0..frames_of(k) {
             let frame = uvs.get(next).unwrap();
-            assert!(shows.insert(uv_key(frame.uv), (k, f)).is_none());
+            assert!(
+                shows
+                    .insert(uv_key(frame.uv, frame.layer), (k, f))
+                    .is_none()
+            );
             if (PARTS..=BEAM).contains(&k) {
                 let old = parts.insert(part_key(frame.uv, frame.layer), k);
                 // A cycle's frames may share a column.
@@ -1164,7 +1168,7 @@ impl Widgets {
                 let [.., iw, ih] = TEXT_INK;
                 self.text_squeezed |= q.uv == TITLE_UV && q.rect[2] * ih < q.rect[3] * iw * 0.99;
             }
-            let Some(&(image, frame)) = loaded.shows.get(&uv_key(q.uv)) else {
+            let Some(&(image, frame)) = loaded.shows.get(&uv_key(q.uv, q.layer)) else {
                 continue;
             };
             match image {
@@ -1426,7 +1430,7 @@ fn stretch(
                     }
                     _ => {}
                 }
-                let Some(&(image, frame)) = loaded.shows.get(&uv_key(q.uv)) else {
+                let Some(&(image, frame)) = loaded.shows.get(&uv_key(q.uv, q.layer)) else {
                     continue;
                 };
                 if let Some(d) = w.drawn.get_mut(usize::from(image)) {

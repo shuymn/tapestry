@@ -195,6 +195,7 @@ pub static PLAY: Schema = Schema {
         timer("mine.6", T),
         timer("mine.7", T),
         timer("loading", E),
+        timer("screen", E),
     ],
     enums: &[EnumDef {
         name: "gauge_kind",
@@ -310,11 +311,14 @@ pub mod timer {
     pub const COMBO_UP: u16 = 14;
     /// The first per-lane slot; see [`lane_timer`](super::lane_timer).
     pub const LANES: u16 = 15;
-    /// The chart's load, from its choice to the countdown
-    /// ([`SkinFrame::loading`](crate::SkinFrame::loading)).
+    /// The loading lifetime's origin while the play screen loads
+    /// ([`LoadState::since`](crate::LoadState::since)); off in a play.
     pub const LOADING: u16 = 55;
+    /// The screen's start, which an untimed element runs on: the loading
+    /// lifetime's origin while loading, `ready`'s start in a play.
+    pub const SCREEN: u16 = 56;
     /// The number of built-in timers.
-    pub const BUILTIN: u16 = 56;
+    pub const BUILTIN: u16 = 57;
 }
 
 /// A judgment as the skin shows it: the five grades and the empty POOR.
@@ -519,6 +523,7 @@ mod tests {
             ("judge.empty_poor", timer::JUDGE_EMPTY_POOR),
             ("combo.up", timer::COMBO_UP),
             ("loading", timer::LOADING),
+            ("screen", timer::SCREEN),
         ];
         for (name, slot) in timers {
             assert_eq!(PLAY.timer(name).map(|(s, _)| s), Some(slot), "{name}");
