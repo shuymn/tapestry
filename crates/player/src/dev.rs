@@ -433,20 +433,21 @@ pub enum SelectStep {
     /// slow measurement, a load's or the background's.
     SlowMeasuring(u64),
     /// Wait until the background measurement holds a job (`true`), or has
-    /// none held or waiting (`false`), at most [`BACKGROUND_TIMEOUT`].
+    /// none held or waiting (`false`), at most [`STEP_WATCHDOG`]: its
+    /// thread runs in background mode, which a loaded machine starves for
+    /// tens of seconds, so only the watchdog bounds the wait.
     Background(bool),
     /// Close the window.
     Close,
 }
 
-/// How long a scripted step waits for its chart.
+/// How long a scripted step waits for its chart while no scan pass runs.
 pub const STEP_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// How long a `background` step waits for the background measurement:
-/// its thread runs in background mode, which a loaded machine starves for
-/// tens of seconds, so the bound only catches a measurement that never
-/// takes or ends its job.
-pub const BACKGROUND_TIMEOUT: Duration = Duration::from_secs(600);
+/// How long a scripted step waits in all, scan passes included: a pass
+/// runs in background mode, which a loaded machine starves for many
+/// seconds, so this bound only catches a pass that never ends.
+pub const STEP_WATCHDOG: Duration = Duration::from_secs(600);
 
 /// A slow load a script asks for (`slow-load`, `quit-loading`,
 /// `close-loading`).
@@ -478,14 +479,20 @@ pub struct SlowLoad {
 /// holds a job, or has none at all),
 /// `drawn` (wait until the result's page is drawn), `back`, `retry`, `next`
 /// and `prev` on a result; a step out of place, or a chart not
-/// listed within [`STEP_TIMEOUT`], fails the run. A scenario
+/// listed within [`STEP_TIMEOUT`] of no scan pass running (or
+/// [`STEP_WATCHDOG`] in all), fails the run. A scenario
 /// ([`scenario`]) compiles into the same steps, each with the scenario step
 /// it comes from.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SelectScript {
     steps: std::collections::VecDeque<(SelectStep, Option<scenario::Origin>)>,
-    /// Since when the front step waits.
+    /// Since when the front step waits, moved on by the time a scan pass
+    /// ran while it waited for a listing ([`scanning`](Self::scanning)).
     since: Option<std::time::Instant>,
+    /// Since when the front step waits in all, for [`STEP_WATCHDOG`].
+    began: Option<std::time::Instant>,
+    /// When a step waiting for a listing last looked at the scan.
+    looked: Option<std::time::Instant>,
     /// The input thread's wakes when an `idle` step began.
     pub idle_from: Option<u64>,
     /// The next load's loudness measurement closes the window
@@ -611,6 +618,8 @@ impl SelectScript {
             self.last_done = origin;
         }
         self.since = None;
+        self.began = None;
+        self.looked = None;
         self.idle_from = None;
         self.identities.clear();
     }
@@ -622,7 +631,15 @@ impl SelectScript {
             return true;
         }
         let step = format!("{:?}", self.front());
-        self.fail(format!("{step} waited {} s", STEP_TIMEOUT.as_secs()));
+        let why = if self.watchdog_expired() {
+            format!(
+                "{step} waited {} s, scan passes included",
+                STEP_WATCHDOG.as_secs()
+            )
+        } else {
+            format!("{step} waited {} s", STEP_TIMEOUT.as_secs())
+        };
+        self.fail(why);
         false
     }
 
@@ -630,14 +647,32 @@ impl SelectScript {
     /// many moves times out only once it stalls.
     pub fn progressed(&mut self) {
         self.since = None;
+        self.began = None;
     }
 
-    /// Moves the front step's wait `by` into the past, as if that much
-    /// time had passed (tests).
+    /// The front step waits for a listing and looks at the scan: while a
+    /// pass runs (`running`), the time since its last look does not count
+    /// toward [`STEP_TIMEOUT`], since the pass may yet list the chart
+    /// however long a loaded machine takes to run it. Only
+    /// [`STEP_WATCHDOG`] bounds that.
+    pub fn scanning(&mut self, running: bool) {
+        let now = std::time::Instant::now();
+        if running && let (Some(since), Some(looked)) = (self.since, self.looked) {
+            self.since = Some((since + now.saturating_duration_since(looked)).min(now));
+        }
+        self.looked = Some(now);
+    }
+
+    /// Moves the front step's wait, and its last look at the scan, `by`
+    /// into the past, as if that much time had passed (tests).
     #[cfg(test)]
     pub fn age(&mut self, by: Duration) {
+        let back = |t: std::time::Instant| t.checked_sub(by).unwrap_or(t);
         let since = *self.since.get_or_insert_with(std::time::Instant::now);
-        self.since = Some(since.checked_sub(by).unwrap_or(since));
+        self.since = Some(back(since));
+        let began = *self.began.get_or_insert(since);
+        self.began = Some(back(began));
+        self.looked = self.looked.map(back);
     }
 
     /// Whether the front step has waited [`STEP_TIMEOUT`] since it became
@@ -647,10 +682,17 @@ impl SelectScript {
     }
 
     /// Whether the front step has waited `bound` since it became the
-    /// front.
-    pub fn expired_after(&mut self, bound: Duration) -> bool {
+    /// front, less the time a scan pass ran while it waited for a listing,
+    /// or [`STEP_WATCHDOG`] in all.
+    fn expired_after(&mut self, bound: Duration) -> bool {
         let since = *self.since.get_or_insert_with(std::time::Instant::now);
-        since.elapsed() >= bound
+        since.elapsed() >= bound || self.watchdog_expired()
+    }
+
+    /// Whether the front step has waited [`STEP_WATCHDOG`] in all.
+    pub fn watchdog_expired(&mut self) -> bool {
+        let began = *self.began.get_or_insert_with(std::time::Instant::now);
+        began.elapsed() >= STEP_WATCHDOG
     }
 
     /// The script failed at its front step: no step runs from here on.

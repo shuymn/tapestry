@@ -160,6 +160,9 @@ pub struct Shelf {
     /// Passes completed (dev-tools).
     #[cfg(feature = "dev-tools")]
     passes: u64,
+    /// When the running pass started (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    pass_started: Option<Instant>,
 }
 
 impl Shelf {
@@ -185,8 +188,7 @@ impl Shelf {
 
     /// [`new`](Self::new), each pass's thread starting with `options`, the
     /// background measurement's with nothing.
-    #[cfg(test)]
-    fn with_options(
+    pub(crate) fn with_options(
         library: Library,
         roots: Vec<PathBuf>,
         rescan_after: Duration,
@@ -230,6 +232,8 @@ impl Shelf {
             background,
             #[cfg(feature = "dev-tools")]
             passes: 0,
+            #[cfg(feature = "dev-tools")]
+            pass_started: None,
         };
         shelf.start_pass();
         shelf
@@ -287,6 +291,11 @@ impl Shelf {
             Ok(scan) => {
                 self.scan = Some(scan);
                 self.seen = 0;
+                #[cfg(feature = "dev-tools")]
+                {
+                    println!("dev: scan: pass {} started", self.passes + 1);
+                    self.pass_started = Some(Instant::now());
+                }
             }
             Err(e) => {
                 let line = format!("library: the scan cannot start: {}", Chain(&e));
@@ -310,6 +319,15 @@ impl Shelf {
                 let batches = (r.read + r.removed) / library::BATCH as u64 + r.bests.commits;
                 let changed = batches != self.seen;
                 self.seen = batches;
+                #[cfg(feature = "dev-tools")]
+                if changed {
+                    println!(
+                        "dev: scan: pass {} committed {} read, {} removed",
+                        self.passes + 1,
+                        r.read,
+                        r.removed
+                    );
+                }
                 return changed;
             }
             if let Some(scan) = self.scan.take() {
@@ -328,6 +346,18 @@ impl Shelf {
     }
 
     fn finished(&mut self, done: Result<ScanReport, library::ScanError>) {
+        #[cfg(feature = "dev-tools")]
+        if let Some(started) = self.pass_started.take() {
+            let outcome = match &done {
+                Ok(r) => format!("{} found, {} read", r.found, r.read),
+                Err(_) => "failed".to_owned(),
+            };
+            println!(
+                "dev: scan: pass {} ended after {} ms: {outcome}",
+                self.passes + 1,
+                started.elapsed().as_millis()
+            );
+        }
         match done {
             Ok(r) => {
                 // Logged only when it found something to do.
@@ -589,9 +619,10 @@ impl Shelf {
         self.paused
     }
 
-    /// Whether a pass runs.
-    #[cfg(test)]
-    fn has_scan(&self) -> bool {
+    /// Whether a pass runs (dev-tools): a script's wait for a listing
+    /// stands still meanwhile.
+    #[cfg(any(test, feature = "dev-tools"))]
+    pub const fn has_scan(&self) -> bool {
         self.scan.is_some()
     }
 }
