@@ -1209,26 +1209,68 @@ impl Cx<'_> {
         if trim_y.is_some() && (r.y, r.h) != (unstretched.y, unstretched.h) {
             self.lane_approx(at, part, LaneApprox::HiddenStretch)?;
         }
-        // Where the source can draw it over its whole travel: from its
-        // upper edge raised by the lane's height to its lower edge at rest
-        // or the trim line above it. A trim line, fixed or raised with the
-        // lift, at or above its highest upper edge leaves nothing drawn.
-        // The model cuts it to the lanes.
+        // Where the source can draw it over its whole travel; the model
+        // cuts it to the lanes.
         let range = |cx: &Self| cx.range(at, "dst");
         let h_up = Q::int(h0).mul(self.r).ok_or_else(|| range(self))?;
         let bottom = Q::int(y0)
             .mul(self.r)
             .and_then(|v| Q::int(HEIGHT).sub(v))
             .ok_or_else(|| range(self))?;
-        let highest = upper.sub(h_up).ok_or_else(|| range(self))?;
-        let lowest = trim_y.map_or(lower, |y| y.min(lower));
-        let top = self.lanes.as_ref().map_or(0, |l| l.def.top);
-        let drawn = trim_y.is_none_or(|y| highest < y);
-        if drawn && (highest < Q::int(top) || lowest > bottom) {
+        let source = self.cover_edges(at, unstretched)?;
+        let reach =
+            source_reach([upper, lower], source, trim_y, h_up).ok_or_else(|| range(self))?;
+        let top = Q::int(self.lanes.as_ref().map_or(0, |l| l.def.top));
+        if let Some([highest, lowest]) = reach
+            && (highest < top || lowest > bottom)
+        {
             self.lane_approx(at, part, LaneApprox::HiddenClip)?;
         }
         Ok(())
     }
+}
+
+/// How far up and down the source draws HIDDEN+ over its travel, y down,
+/// or `None` where it never draws it; `None` outside on overflow. `[fu, fl]`
+/// are its stretched destination's edges at rest, `[su, sl]` its
+/// unstretched one's, `trim` its trim line at rest and `travel` the lane's
+/// height.
+///
+/// The source decides from the unstretched destination
+/// (`play/SkinHidden.java:73-90`): raised by `k`, nothing while its upper
+/// edge is at or below the trim; the stretched one clipped to the
+/// unstretched upper edge and the trim while the unstretched lower edge is
+/// below the trim; otherwise the stretched one whole. A linked trim rises with the lift as the
+/// cover does, so only the cover's own share moves it against the trim and
+/// the extremes are those of a fixed trim. Every edge falls as `k` grows
+/// within each case: the highest edge is at `k = travel`, and the lowest at
+/// the smallest `k` of each case.
+fn source_reach(
+    [fu, fl]: [Q; 2],
+    [su, sl]: [Q; 2],
+    trim: Option<Q>,
+    travel: Q,
+) -> Option<Option<[Q; 2]>> {
+    let Some(t) = trim else {
+        return Some(Some([fu.sub(travel)?, fl]));
+    };
+    let zero = Q::int(0);
+    let clip_up = fu.max(su);
+    let highest = if sl.sub(travel)? <= t {
+        fu.sub(travel)?
+    } else if clip_up.sub(travel)? < t {
+        clip_up.sub(travel)?
+    } else {
+        return Some(None);
+    };
+    let whole_from = sl.sub(t)?.max(zero);
+    let mut lowest = (whole_from <= travel).then(|| fl.sub(whole_from)).flatten();
+    let clip_from = clip_up.sub(t)?.max(zero);
+    if clip_from < whole_from.min(travel) {
+        let c = fl.sub(clip_from)?.min(t);
+        lowest = Some(lowest.map_or(c, |l| l.max(c)));
+    }
+    Some(lowest.map(|l| [highest, l]))
 }
 
 #[cfg(test)]

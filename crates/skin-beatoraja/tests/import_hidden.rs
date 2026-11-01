@@ -302,6 +302,47 @@ fn fit_width_hidden_plus_is_trimmed_after_its_stretch() {
     let col = before.rsplit('\n').next().unwrap().len() + 1;
     let at = [line, col].map(|v| u32::try_from(v).unwrap());
     assert_eq!(found, [Some((at[0], at[1]))]);
+    // The source decides whether to draw it from the unstretched edge, so
+    // risen by the lane's 600 px it reaches 200: a line at 890 (190),
+    // fixed or linked, keeps it from ever drawing, though the stretched
+    // edge reaches 155. One at 879 (201) lets it draw above the lanes.
+    for link in ["false", "true"] {
+        for (line, outside) in [(890, false), (879, true)] {
+            let obj = hidden_object(&format!(r#""isDisapearLineLinkLift": {link}"#))
+                .replace(
+                    r#""x": 32, "y": 24, "w": 16, "h": 16"#,
+                    r#""x": 0, "y": 0, "w": 43, "h": 10"#,
+                )
+                .replace(
+                    r#""disapearLine": 200"#,
+                    &format!(r#""disapearLine": {line}"#),
+                );
+            let r = with(&obj, &[&small]);
+            let case = format!("{link} {line}");
+            assert!(has(r.report(), d9(LaneApprox::HiddenStretch)), "{case}");
+            assert_eq!(
+                has(r.report(), d9(LaneApprox::HiddenClip)),
+                outside,
+                "{case}"
+            );
+        }
+    }
+    // Once the unstretched lower edge is at or above the trim, the source
+    // draws the stretched one whole, past the trim: a 64×1 cell fit to 430
+    // is 6.72 high, centred on [876, 880] at [874.64, 881.36], so under a
+    // line at 200 (880), even at 1 ‰ (0.6 px), it reaches below the lanes.
+    let thin = hidden_object("").replace(
+        r#""x": 32, "y": 24, "w": 16, "h": 16"#,
+        r#""x": 0, "y": 0, "w": 64, "h": 1"#,
+    );
+    let low = hidden(r#""stretch": 4"#).replace(
+        r#""y": -400, "w": 430, "h": 600"#,
+        r#""y": 200, "w": 430, "h": 4"#,
+    );
+    assert!(has(
+        with(&thin, &[&low]).report(),
+        d9(LaneApprox::HiddenClip)
+    ));
     // A 16×32 cell fit to 430 would be 860 high: stretch 5 keeps the
     // destination and crops the cell's middle rows, as SUDDEN+.
     let tall = hidden_object("").replace(r#""h": 16"#, r#""h": 32"#);
