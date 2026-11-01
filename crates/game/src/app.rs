@@ -30,7 +30,7 @@ use bms_model::Speed;
 
 use crate::attempt::PreparationRefusal;
 use crate::error::Chain;
-use crate::live::{Leave, LiveError, Rig, run_chart, run_over};
+use crate::live::{Leave, LiveError, Rig, run_chart, run_over, threads_over};
 use crate::logic::LogicError;
 use crate::policy::{SessionEvent, SessionEventSink, SharedEvents};
 use crate::practice::PracticeError;
@@ -365,7 +365,12 @@ impl App {
             match self.play_chart(&chart, practice, rig)? {
                 Chosen::Left(Leave::Back) => {}
                 Chosen::Left(Leave::Quit) => return Ok(()),
-                Chosen::Refused(reason) => refusal = Some(LoadRefusal { chart, reason }),
+                // A refusal never hides a thread's failure: the run ends
+                // with it instead.
+                Chosen::Refused(reason) => {
+                    threads_over(rig)?;
+                    refusal = Some(LoadRefusal { chart, reason });
+                }
             }
         }
     }
@@ -517,7 +522,11 @@ fn practice_chart<R: AppRig>(
             let notice = match start_rounds(loaded, &screen, rig) {
                 Ok(Leave::Quit) => return Ok(Leave::Quit),
                 Ok(Leave::Back) => None,
-                Err(Stopped::Notice(n)) => Some(n),
+                // A refusal never hides a thread's failure.
+                Err(Stopped::Notice(n)) => {
+                    threads_over(rig)?;
+                    Some(n)
+                }
                 Err(Stopped::Run(e)) => return Err(e),
             };
             screen.set_notice(notice);

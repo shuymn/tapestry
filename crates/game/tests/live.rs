@@ -219,6 +219,8 @@ struct Fake {
     attempts: Vec<game::Attempt>,
     /// How each preparation ends, in order; then ready.
     preparations: Vec<Preparation>,
+    /// The audio output failed.
+    output_failed: bool,
     /// Waits each preparation takes, a quit or a close during which
     /// cancels it.
     prepare_waits: usize,
@@ -288,6 +290,7 @@ impl Fake {
             steps: Vec::new(),
             attempts: Vec::new(),
             preparations: Vec::new(),
+            output_failed: false,
             prepare_waits: 0,
             side: None,
             phases: Vec::new(),
@@ -479,7 +482,7 @@ impl Rig for Fake {
     }
 
     fn audio_failure(&self) -> Option<audio::OutputError> {
-        None
+        self.output_failed.then_some(audio::OutputError::DeviceLost)
     }
 
     fn screen_failed(&self) -> bool {
@@ -2817,6 +2820,24 @@ fn a_refused_preparation_opens_nothing_and_gives_the_number_back() {
     assert_eq!((rig.opens, rig.reports.len()), (0, 0));
     assert!(!rig.steps.contains(&"end loading"));
     assert_eq!(loaded.begin_play().attempt, 1);
+}
+
+/// A refusal of the attempt that comes with a failed audio output ends the
+/// run with the output's failure, not with the refusal the player could go
+/// back from; nothing opens.
+#[test]
+fn a_refused_preparation_never_hides_a_failed_output() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut loaded = loaded(dir.path());
+    let mut rig = Fake::new(Vec::new(), &[], 12_500_000);
+    rig.preparations = vec![Preparation::Refused(PreparationRefusal {
+        location: None,
+        reason: "a font cannot be drawn".to_owned(),
+    })];
+    rig.output_failed = true;
+    let ran = game::live::run_chart(&mut loaded, &mut rig);
+    assert!(matches!(ran, Err(LiveError::Output(_))), "{ran:?}");
+    assert_eq!((rig.opens, rig.reports.len()), (0, 0));
 }
 
 /// A preparation slower than the player: the quit key during it cancels it

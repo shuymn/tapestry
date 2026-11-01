@@ -2816,23 +2816,48 @@ enum AfterAttempt {
     Input,
 }
 
+/// How the preparation a thread failed during ended.
+#[derive(Clone, Copy, Debug)]
+enum Ended {
+    Ready,
+    /// The failure stopped it.
+    Stopped,
+    /// The screen refused the attempt as well.
+    Refused,
+}
+
 /// A thread that fails after the attempt was prepared and before recording
 /// opens ends the run with its cause: nothing opens, no play starts. So
-/// does an audio or input failure that stopped the preparation itself.
+/// does an audio or input failure that stopped the preparation itself, or
+/// that came with the screen's refusal of the attempt, which then shows
+/// nowhere, on selection or on the practice page.
 #[test]
 fn a_failure_after_the_preparation_opens_nothing() {
-    for (after, cancel) in [
-        (AfterAttempt::Screen, false),
-        (AfterAttempt::Output, false),
-        (AfterAttempt::Input, false),
-        (AfterAttempt::Output, true),
-        (AfterAttempt::Input, true),
+    use PracticeInput::Confirm;
+    let mut round = vec![(0, Act::Practice(P))];
+    round.extend(to_start(0));
+    round.extend([(10, Act::Page(Confirm)), (4_000, Act::Close)]);
+    let choose = vec![(0, Act::Choose(0)), (4_000, Act::Close)];
+    for (after, ended, acts) in [
+        (AfterAttempt::Screen, Ended::Ready, &choose),
+        (AfterAttempt::Output, Ended::Ready, &choose),
+        (AfterAttempt::Input, Ended::Ready, &choose),
+        (AfterAttempt::Output, Ended::Stopped, &choose),
+        (AfterAttempt::Input, Ended::Stopped, &choose),
+        (AfterAttempt::Output, Ended::Refused, &choose),
+        (AfterAttempt::Input, Ended::Refused, &choose),
+        (AfterAttempt::Output, Ended::Refused, &round),
     ] {
-        let acts = vec![(0, Act::Choose(0)), (4_000, Act::Close)];
-        let (rig, events, ran) = run(Refusal::Missing, acts, |rig| {
+        let (rig, events, ran) = run(Refusal::Missing, acts.clone(), |rig| {
             rig.fails_after_attempt = Some(after);
-            rig.cancel_at_failure = cancel;
+            rig.cancel_at_failure = matches!(ended, Ended::Stopped);
+            rig.refuse_attempts = usize::from(matches!(ended, Ended::Refused));
         });
+        assert!(rig.refusals.is_empty(), "{after:?} {ended:?}");
+        assert!(
+            notices(&rig).iter().all(Option::is_none),
+            "{after:?} {ended:?}"
+        );
         let cause_seen = match after {
             AfterAttempt::Screen => matches!(ran, Err(LiveError::ScreenLost)),
             AfterAttempt::Output => matches!(ran, Err(LiveError::Output(_))),
@@ -2847,6 +2872,17 @@ fn a_failure_after_the_preparation_opens_nothing() {
             "{after:?}"
         );
     }
+}
+
+/// A chart refused before any play while the audio output has failed ends
+/// the run with the output's failure: selection shows no refusal.
+#[test]
+fn a_refused_chart_never_hides_a_failed_output() {
+    let acts = vec![(0, Act::Choose(2)), (4_000, Act::Close)];
+    let (rig, _events, ran) = run(Refusal::Missing, acts, |rig| rig.output_failed = true);
+    assert!(matches!(ran, Err(LiveError::Output(_))), "{ran:?}");
+    assert!(rig.refusals.is_empty(), "{:?}", rig.refusals);
+    assert_eq!(rig.opens, 0);
 }
 
 /// The play preset is refreshed before the first round too: the preset

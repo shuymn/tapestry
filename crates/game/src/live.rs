@@ -347,10 +347,23 @@ pub(crate) fn run_over<R: Rig>(rig: &R) -> Result<(), LiveError<R::ScreenError>>
 
 /// The other threads' failures that end the run before recording opens:
 /// the input thread's ([`run_over`]), then the audio output's.
-fn threads_over<R: Rig>(rig: &R) -> Result<(), LiveError<R::ScreenError>> {
+pub(crate) fn threads_over<R: Rig>(rig: &R) -> Result<(), LiveError<R::ScreenError>> {
     run_over(rig)?;
     rig.audio_failure()
         .map_or(Ok(()), |e| Err(LiveError::Output(e)))
+}
+
+/// What a play's error reports: a refusal the player can go back from
+/// (its preparation, its restore, its logic step) gives way to the input
+/// thread's or the audio output's failure when one came meanwhile, so it
+/// never hides the run's end; any other error is the run's end already.
+fn refused<R: Rig>(rig: &R, error: LiveError<R::ScreenError>) -> LiveError<R::ScreenError> {
+    match error {
+        LiveError::Preparation(_) | LiveError::Restore(_) | LiveError::Logic(_) => {
+            threads_over(rig).err().unwrap_or(error)
+        }
+        other => other,
+    }
 }
 
 /// Whether recording may open as far as the threads go: none of them
@@ -624,7 +637,7 @@ fn play_and_next<R: Rig>(
         }
         Err(e) => {
             loaded.withdraw(start);
-            return Err(e);
+            return Err(refused(rig, e));
         }
     }
     // A full play's recording opens its countdown before chart time 0, a
@@ -648,7 +661,7 @@ fn play_and_next<R: Rig>(
         Ok(plan) => plan,
         Err(e) => {
             let _ = rig.close();
-            return Err(LiveError::Logic(e));
+            return Err(refused(rig, LiveError::Logic(e)));
         }
     };
     let (mut logic, screen) = match Logic::with_section(
@@ -664,7 +677,7 @@ fn play_and_next<R: Rig>(
         Ok(pair) => pair,
         Err(e) => {
             let _ = rig.close();
-            return Err(LiveError::Logic(e));
+            return Err(refused(rig, LiveError::Logic(e)));
         }
     };
     // The restore is planned on the opening's origin, in the play's setup,
@@ -674,7 +687,7 @@ fn play_and_next<R: Rig>(
         && let Err(e) = rig.restore_audio(origin, at)
     {
         let _ = rig.close();
-        return Err(LiveError::Restore(e));
+        return Err(refused(rig, LiveError::Restore(e)));
     }
     // Admitted: only now does the play start, so a refused opening reports
     // no start.
