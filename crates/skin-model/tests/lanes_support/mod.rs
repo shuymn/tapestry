@@ -364,3 +364,27 @@ pub fn lane_x(lane: Lane) -> f32 {
 pub fn in_lane(h: &Harness, image: u32, lane: Lane) -> Vec<[f32; 4]> {
     in_column(h, image, lane_x(lane))
 }
+
+/// Two taps on lane 3, at 1 000 and 1 300 ms, at 150 BPM.
+pub fn tap_chart() -> bms_model::Chart {
+    bms_model::ChartBuilder::new(150_000)
+        .tap(
+            crate::play_support::lane(3),
+            TimeUs(1_000 * crate::play_support::MS),
+        )
+        .tap(
+            crate::play_support::lane(3),
+            TimeUs(1_300 * crate::play_support::MS),
+        )
+        .build()
+        .unwrap()
+}
+
+/// A harness on `skin` over [`tap_chart`] showing `[cover, lift, hidden]`
+/// at 700 ms.
+pub fn shown(skin: Skin, [cover, lift, hidden]: [u16; 3]) -> Harness {
+    let mut h = Harness::new(skin, &tap_chart(), &crate::play_support::full(0));
+    (h.view.cover, h.view.lift, h.view.hidden) = (cover, lift, hidden);
+    h.frame(700, &[]);
+    h
+}

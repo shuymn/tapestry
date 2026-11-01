@@ -9,33 +9,26 @@
 mod lanes_support;
 mod play_support;
 
-use bms_model::{Chart, ChartBuilder, TimeUs};
+use bms_model::TimeUs;
 use lanes_support::{
     COVER, HIDDEN, LIFT, NOTE, WHITE, cover_image, image, in_lane, lanes_element, moving, paint,
-    quads_of, rects, sheet, simple, source,
+    quads_of, rects, shown, simple, skin_with_widgets, source, tap_chart,
 };
 use play_support::{Harness, MS, REGIONS, bool_program, full, lane, readouts_for};
 use skin_model::{
     Blend, ClipId, CoverImage, CoverMotion, CoverPaintDef, CoverPaintError, CoverTrim, CycleDef,
-    ElementDef, Fit, Follow, ImageChoiceDef, ImageChoicePart, ImageSpan, LANE_QUADS, LANE_RESERVED,
+    ElementDef, Follow, ImageChoiceDef, ImageChoicePart, ImageSpan, LANE_QUADS, LANE_RESERVED,
     LaneView, LanesDef, Layout, LoadError, MAX_COORD, MAX_ELEMENTS, Native, PLAY, Place, Scope,
-    Skin, SkinDef, TimerRef, Ty, Variant, WidgetDefs, compile, timer,
+    Skin, TimerRef, Ty, Variant, WidgetDefs, compile, timer,
 };
 
-/// 150 BPM, in thousandths.
-const BPM: i64 = 150_000;
-
-fn def(lanes: Option<LanesDef>, elements: Vec<ElementDef>, widgets: WidgetDefs) -> SkinDef {
-    SkinDef {
-        fit: Fit::Adapt,
-        regions: REGIONS,
-        whens: Vec::new(),
-        sheet: sheet(),
-        elements,
-        lanes,
-        widgets,
-        bomb_up_to: Some(skin_model::Grade::Bad),
-    }
+/// A skin over `REGIONS` with `lanes`, `elements` and `widgets`.
+fn def(
+    lanes: Option<LanesDef>,
+    elements: Vec<ElementDef>,
+    widgets: WidgetDefs,
+) -> Result<Skin, LoadError> {
+    skin_with_widgets(REGIONS, lanes, elements, widgets)
 }
 
 fn paints(defs: Vec<CoverPaintDef>) -> WidgetDefs {
@@ -49,23 +42,7 @@ fn paints(defs: Vec<CoverPaintDef>) -> WidgetDefs {
 fn skin(elements: Vec<ElementDef>, defs: Vec<CoverPaintDef>) -> Skin {
     let mut all = vec![lanes_element()];
     all.extend(elements);
-    Skin::new(def(Some(source()), all, paints(defs))).unwrap()
-}
-
-fn tap_chart() -> Chart {
-    ChartBuilder::new(BPM)
-        .tap(lane(3), TimeUs(1_000 * MS))
-        .tap(lane(3), TimeUs(1_300 * MS))
-        .build()
-        .unwrap()
-}
-
-/// A harness on `skin` showing `[cover, lift, hidden]` at 700 ms.
-fn shown(skin: Skin, [cover, lift, hidden]: [u16; 3]) -> Harness {
-    let mut h = Harness::new(skin, &tap_chart(), &full(0));
-    (h.view.cover, h.view.lift, h.view.hidden) = (cover, lift, hidden);
-    h.frame(700, &[]);
-    h
+    def(Some(source()), all, paints(defs)).unwrap()
 }
 
 /// An offset paint (`+C`), a slider of 800 and a slider of 800 that also
@@ -170,7 +147,7 @@ fn paint_never_changes_the_notes() {
             image_choices: choices,
             ..WidgetDefs::default()
         };
-        let skin = Skin::new(def(Some(source()), all, widgets)).unwrap();
+        let skin = def(Some(source()), all, widgets).unwrap();
         let h = shown(skin, [300, 100, 0]);
         (in_lane(&h, NOTE, lane(3)), rects(&h, COVER).len())
     };
@@ -314,7 +291,7 @@ fn every_cover_paint_draws_in_list_order() {
         hidden_paint(),
         add(paint(0, [160, 100, 544, 100], Follow::None)),
     ];
-    let skin = Skin::new(def(Some(source()), elements, paints(three_paints()))).unwrap();
+    let skin = def(Some(source()), elements, paints(three_paints())).unwrap();
     let h = shown(skin, [200, 100, 500]);
     let parts = [COVER, WHITE, LIFT, HIDDEN];
     assert_eq!(
@@ -344,7 +321,7 @@ fn every_cover_paint_draws_in_list_order() {
         lift_paint(),
         lanes_element(),
     ];
-    let skin = Skin::new(def(Some(source()), before, paints(three_paints()))).unwrap();
+    let skin = def(Some(source()), before, paints(three_paints())).unwrap();
     let h = shown(skin, [200, 100, 500]);
     assert_eq!(
         order(&h, &[NOTE, COVER, LIFT, HIDDEN])[..3],
@@ -358,7 +335,7 @@ fn every_cover_paint_draws_in_list_order() {
 fn every_paint_keeps_its_own_clock() {
     let run = |lanes: ElementDef, p: ElementDef| {
         let elements = vec![lanes, p, lift_paint(), hidden_paint()];
-        let skin = Skin::new(def(Some(source()), elements, paints(three_paints()))).unwrap();
+        let skin = def(Some(source()), elements, paints(three_paints())).unwrap();
         let h = shown(skin, [200, 100, 500]);
         [COVER, HIDDEN, LIFT, NOTE].map(|part| rects(&h, part).len())
     };
@@ -429,7 +406,7 @@ fn chosen_paint_keeps_each_entry_track_and_native_size() {
         ..WidgetDefs::default()
     };
     let elements = vec![lanes_element(), paint(0, [160, 0, 544, 100], Follow::None)];
-    let skin = Skin::new(def(Some(source()), elements, widgets)).unwrap();
+    let skin = def(Some(source()), elements, widgets).unwrap();
     let mut h = Harness::new(skin, &tap_chart(), &full(0));
     h.view.cover = 500;
     // The slider moves either entry by 400.
@@ -461,8 +438,7 @@ fn chosen_paint_keeps_each_entry_track_and_native_size() {
 
 #[test]
 fn paints_are_checked_at_load() {
-    let load =
-        |elements: Vec<ElementDef>, widgets: WidgetDefs| Skin::new(def(None, elements, widgets));
+    let load = |elements: Vec<ElementDef>, widgets: WidgetDefs| def(None, elements, widgets);
     let one = |d: CoverPaintDef| paints(vec![d]);
     let p = |y: i32| paint(0, [0, y, 10, 10], Follow::None);
     let paint_err = |r: Result<Skin, LoadError>| match r {
@@ -552,14 +528,14 @@ fn a_paint_is_one_quad_and_the_lanes_reserve_only_the_line() {
     assert_eq!(LANE_RESERVED, 1);
     assert_eq!(skin.quad_capacity(), 4 + LANE_QUADS + LANE_RESERVED);
     // Without lanes a slider still moves by the view; a follower does not.
-    let skin = Skin::new(def(
+    let skin = def(
         None,
         vec![
             paint(0, [0, 0, 10, 10], Follow::None),
             paint(1, [0, 0, 10, 10], Follow::Cover),
         ],
         paints(vec![cover_image(Some(100)), cover_image(None)]),
-    ))
+    )
     .unwrap();
     assert_eq!(skin.quad_capacity(), 2);
     let mut h = Harness::new(skin, &tap_chart(), &full(0));
@@ -575,9 +551,8 @@ fn a_paint_is_one_quad_and_the_lanes_reserve_only_the_line() {
 fn the_lanes_leave_the_variant_to_the_lane_width() {
     // At 3840×2160 (scale 2) with the lanes at 50 %: the lanes are 1, not
     // magnified.
-    let only_lanes = |lanes: ElementDef| {
-        Skin::new(def(Some(simple()), vec![lanes], WidgetDefs::default())).unwrap()
-    };
+    let only_lanes =
+        |lanes: ElementDef| def(Some(simple()), vec![lanes], WidgetDefs::default()).unwrap();
     let mut half = Layout::AUTHOR;
     half.set_lane_width(50).unwrap();
     let skin = only_lanes(lanes_element());

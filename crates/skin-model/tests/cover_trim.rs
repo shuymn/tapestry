@@ -8,57 +8,36 @@
 mod lanes_support;
 mod play_support;
 
-use bms_model::{Chart, ChartBuilder, TimeUs};
+use bms_model::TimeUs;
 use lanes_support::{
-    HIDDEN, LIFT, NOTE, WHITE, image, lanes_element, moving, paint, quads_of, rect, rects, sheet,
-    source,
+    HIDDEN, LIFT, NOTE, WHITE, image, lanes_element, moving, paint, quads_of, rect, rects, shown,
+    skin_with_widgets, source, still, tap_chart,
 };
-use play_support::{Harness, MS, REGIONS, full, lane, readouts_for};
+use play_support::{Harness, MS, REGIONS, full, readouts_for};
 use skin_model::{
     Adjust, Anchor, Bind, Blend, CoverMotion, CoverPaintDef, CoverPaintError, CoverTrim, Ease,
-    ElementDef, End, Fit, Follow, KeyDef, LanesDef, Layout, LoadError, MAX_COORD, Native, Place,
-    Quad, Region, Skin, SkinDef, Track, WidgetDefs,
+    ElementDef, End, Follow, KeyDef, LanesDef, Layout, LoadError, MAX_COORD, Native, Place, Region,
+    Skin, Track, WidgetDefs,
 };
 
-const BPM: i64 = 150_000;
-
-fn def(lanes: Option<LanesDef>, elements: Vec<ElementDef>, defs: Vec<CoverPaintDef>) -> SkinDef {
-    SkinDef {
-        fit: Fit::Adapt,
-        regions: REGIONS,
-        whens: Vec::new(),
-        sheet: sheet(),
-        elements,
-        lanes,
-        widgets: WidgetDefs {
-            cover_paints: defs,
-            ..WidgetDefs::default()
-        },
-        bomb_up_to: Some(skin_model::Grade::Bad),
-    }
+/// A skin over `REGIONS` with `lanes`, `elements` and the paints `defs`.
+fn def(
+    lanes: Option<LanesDef>,
+    elements: Vec<ElementDef>,
+    defs: Vec<CoverPaintDef>,
+) -> Result<Skin, LoadError> {
+    let widgets = WidgetDefs {
+        cover_paints: defs,
+        ..WidgetDefs::default()
+    };
+    skin_with_widgets(REGIONS, lanes, elements, widgets)
 }
 
 /// The source lanes, then `elements`, with the paints `defs`.
 fn skin(elements: Vec<ElementDef>, defs: Vec<CoverPaintDef>) -> Skin {
     let mut all = vec![lanes_element()];
     all.extend(elements);
-    Skin::new(def(Some(source()), all, defs)).unwrap()
-}
-
-fn tap_chart() -> Chart {
-    ChartBuilder::new(BPM)
-        .tap(lane(3), TimeUs(1_000 * MS))
-        .tap(lane(3), TimeUs(1_300 * MS))
-        .build()
-        .unwrap()
-}
-
-/// A harness on `skin` showing `[cover, lift, hidden]` at 700 ms.
-fn shown(skin: Skin, [cover, lift, hidden]: [u16; 3]) -> Harness {
-    let mut h = Harness::new(skin, &tap_chart(), &full(0));
-    (h.view.cover, h.view.lift, h.view.hidden) = (cover, lift, hidden);
-    h.frame(700, &[]);
-    h
+    def(Some(source()), all, defs).unwrap()
 }
 
 /// The inline clip of every quad in the batch, in draw order.
@@ -146,7 +125,7 @@ fn following_the_cover_adds_its_motion_once() {
 fn fitted(trim: i32) -> Harness {
     let elements = vec![paint(0, [160, 55, 544, 100], Follow::None)];
     let defs = vec![lift_def(CoverTrim::Fixed(trim), Some([160, 100, 544, 10]))];
-    let skin = Skin::new(def(None, elements, defs)).unwrap();
+    let skin = def(None, elements, defs).unwrap();
     let mut h = Harness::new(skin, &tap_chart(), &full(0));
     h.frame(700, &[]);
     h
@@ -180,7 +159,7 @@ fn native_on_empty(trim: i32) -> Harness {
     let mut e = paint(0, [0, 100, 0, 10], Follow::None);
     e.place.native = Some(Native::Exact([32, 32]));
     let defs = vec![lift_def(CoverTrim::Fixed(trim), None)];
-    let skin = Skin::new(def(None, vec![e], defs)).unwrap();
+    let skin = def(None, vec![e], defs).unwrap();
     let mut h = Harness::new(skin, &tap_chart(), &full(0));
     h.frame(700, &[]);
     h
@@ -190,7 +169,7 @@ fn native_on_empty(trim: i32) -> Harness {
 fn an_empty_scissor_draws_nothing() {
     // The line crosses the empty gate: its part above has no area, so
     // nothing draws.
-    assert!(h_quads(&native_on_empty(105)).is_empty());
+    assert!(native_on_empty(105).batch.quads().is_empty());
     // The gate wholly above the line: the native paint is whole.
     assert_eq!(
         clipped(&native_on_empty(120), LIFT),
@@ -198,31 +177,19 @@ fn an_empty_scissor_draws_nothing() {
     );
 }
 
-fn h_quads(h: &Harness) -> Vec<Quad> {
-    h.batch.quads().to_vec()
-}
-
 /// A track holding `[x, y, w, h]` turned `angle` degrees.
 fn turned([x, y, w, h]: [i32; 4], angle: i32) -> Track {
-    Track::new(
-        &[KeyDef {
-            at: TimeUs(0),
-            props: [
-                Some(x),
-                Some(y),
-                Some(w),
-                Some(h),
-                None,
-                None,
-                None,
-                None,
-                Some(angle),
-            ],
-        }],
-        Ease::Linear,
-        End::Hold,
-    )
-    .unwrap()
+    still([
+        Some(x),
+        Some(y),
+        Some(w),
+        Some(h),
+        None,
+        None,
+        None,
+        None,
+        Some(angle),
+    ])
 }
 
 /// The author's layout, and the playfield moved, scaled and its lanes
@@ -352,25 +319,17 @@ fn notes(view: [u16; 3], with_paint: bool) -> Vec<[f32; 4]> {
     let mut elements = Vec::new();
     if with_paint {
         let mut clear = paint(1, [160, 280, 544, 600], Follow::None);
-        clear.track = Track::new(
-            &[KeyDef {
-                at: TimeUs(0),
-                props: [
-                    Some(160),
-                    Some(280),
-                    Some(544),
-                    Some(600),
-                    Some(0),
-                    None,
-                    None,
-                    None,
-                    None,
-                ],
-            }],
-            Ease::Linear,
-            End::Hold,
-        )
-        .unwrap();
+        clear.track = still([
+            Some(160),
+            Some(280),
+            Some(544),
+            Some(600),
+            Some(0),
+            None,
+            None,
+            None,
+            None,
+        ]);
         let off = ElementDef {
             timer: skin_model::TimerRef::Builtin(skin_model::timer::FULL_COMBO),
             ..paint(0, [160, 880, 544, 200], Follow::None)
@@ -457,7 +416,7 @@ fn hidden_paint_shows_only_while_hidden_is_on() {
 /// When `ready` starts, in ms.
 fn h_ready_ms() -> i64 {
     let mut h = Harness::new(
-        Skin::new(def(None, Vec::new(), Vec::new())).unwrap(),
+        def(None, Vec::new(), Vec::new()).unwrap(),
         &tap_chart(),
         &full(0),
     );
@@ -500,14 +459,14 @@ fn neither_gates_nor_trims_change_the_layout() {
     // A far, vast gate and line: the same variant at every target and
     // the same controls.
     let at = |defs| {
-        Skin::new(def(
+        def(
             Some(source()),
             vec![
                 lanes_element(),
                 paint(0, [160, 700, 544, 200], Follow::None),
             ],
             defs,
-        ))
+        )
         .unwrap()
     };
     let plain = at(vec![moving(LIFT, CoverMotion::Lift, CoverTrim::None)]);
@@ -532,11 +491,11 @@ fn dbg(e: LoadError) -> String {
 }
 
 fn paint_err(def_: CoverPaintDef) -> String {
-    Skin::new(def(
+    def(
         None,
         vec![paint(0, [0, 0, 10, 10], Follow::None)],
         vec![def_],
-    ))
+    )
     .map(drop)
     .map_err(dbg)
     .unwrap_err()
@@ -575,11 +534,11 @@ fn paints_are_checked_at_load() {
         );
     }
     assert!(
-        Skin::new(def(
+        def(
             None,
             vec![paint(0, [0, 0, 10, 10], Follow::None)],
             vec![lift_def(CoverTrim::Fixed(0), Some([0, MAX_COORD, 0, 0]))],
-        ))
+        )
         .is_ok()
     );
     for r in [[0, 0, -1, 1], [0, 0, 1, -1]] {
@@ -601,11 +560,11 @@ fn paints_are_checked_at_load() {
     }
     for trim in [CoverTrim::Fixed(MAX_COORD), CoverTrim::Lift(-MAX_COORD)] {
         assert!(
-            Skin::new(def(
+            def(
                 None,
                 vec![paint(0, [0, 0, 10, 10], Follow::None)],
                 vec![moving(LIFT, CoverMotion::Lift, trim)],
-            ))
+            )
             .is_ok()
         );
     }
@@ -614,7 +573,7 @@ fn paints_are_checked_at_load() {
 #[test]
 fn trimmed_paint_elements_are_checked_at_load() {
     let load = |e: ElementDef, d: CoverPaintDef| {
-        Skin::new(def(Some(source()), vec![lanes_element(), e], vec![d])).map_err(dbg)
+        def(Some(source()), vec![lanes_element(), e], vec![d]).map_err(dbg)
     };
     // Gated by its own track, a trimmed paint has no negative size.
     for r in [[0, 0, -1, 10], [0, 0, 10, -1]] {
