@@ -270,6 +270,41 @@ fn a_broken_resolved_image_refuses_without_fallback() {
     }
 }
 
+/// The refusal's file, line and column, and those of the first `marker`
+/// in that file, `skip` bytes into it.
+#[track_caller]
+fn refusal_and_marker(l: Loaded, marker: &str, skip: usize) -> [(String, u32, u32); 2] {
+    let Loaded { dir, result } = l;
+    let at = match result {
+        Err(ImportError::Critical {
+            at,
+            why: NoteKind::NotePart { .. },
+            ..
+        }) => at,
+        r => panic!("{:?}", r.err()),
+    };
+    let text = std::fs::read_to_string(dir.path().join(&at.file)).unwrap();
+    let offset = text.find(marker).unwrap() + skip;
+    let before = &text[..offset];
+    let line = before.matches('\n').count() + 1;
+    let col = offset - before.rfind('\n').map_or(0, |i| i + 1) + 1;
+    let marked = (at.file.clone(), line as u32, col as u32);
+    [(at.file, at.line, at.col), marked]
+}
+
+#[test]
+fn part_refusals_are_located_in_the_note_record() {
+    // A missing array: at the note record, not its destination.
+    let mines = format!("{}, ", list("mine", "mi"));
+    let record = r#""note": {"id": "notes""#;
+    let [got, want] = refusal_and_marker(lanes_edit(&[(&mines, "")], ""), record, 8);
+    assert_eq!(got, want);
+    // A malformed array: at its value.
+    let null = lanes_edit(&[(&list("mine", "mi"), r#""mine": null"#)], "");
+    let [got, want] = refusal_and_marker(null, r#""mine": null"#, 8);
+    assert_eq!(got, want);
+}
+
 #[test]
 fn malformed_selected_arrays_refuse() {
     let mines = format!("{}, ", list("mine", "mi"));

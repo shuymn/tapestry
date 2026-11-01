@@ -144,14 +144,15 @@ impl Cx<'_> {
         Ok(scan)
     }
 
-    /// Record `rec`'s part arrays checked (at `at`, the record), in
-    /// order: every supplied array's form and entries, in field order;
-    /// then each array the source selects present and long enough:
-    /// exactly eight notes, `lnend` of at least eight (`N`), the start,
-    /// the selected bodies and the selected HCN arrays of at least `N`,
-    /// at least eight mines. An unselected alias may be absent, but one
-    /// supplied must be well formed.
-    pub(super) fn note_parts(&self, rec: u32, at: Span) -> Result<NotePartsPlan, ImportError> {
+    /// Record `rec`'s part arrays checked, in order: every supplied
+    /// array's form and entries, in field order; then each array the
+    /// source selects present and long enough: exactly eight notes,
+    /// `lnend` of at least eight (`N`), the start, the selected bodies
+    /// and the selected HCN arrays of at least `N`, at least eight mines.
+    /// An unselected alias may be absent, but one supplied must be well
+    /// formed. A missing array is located at the record.
+    pub(super) fn note_parts(&self, rec: u32) -> Result<NotePartsPlan, ImportError> {
+        let at = self.arena_span(rec);
         let nodes = self.def.fields(rec, FIELDS);
         let mut scans = [Scan::default(); FIELDS.len()];
         for (i, (scan, node)) in scans.iter_mut().zip(nodes).enumerate() {

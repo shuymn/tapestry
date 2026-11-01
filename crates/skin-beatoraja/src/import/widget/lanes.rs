@@ -228,7 +228,7 @@ impl Cx<'_> {
 
         // Preconditions: the part arrays whole (`note_parts`), eight
         // lanes on one row.
-        let plan = self.note_parts(rec, at)?;
+        let plan = self.note_parts(rec)?;
         let lane_rects = self.lane_rects(rec)?;
         if lane_rects.len() != LANES {
             return refuse(self, "dst");
