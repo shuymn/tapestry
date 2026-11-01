@@ -402,59 +402,27 @@ fn resolved_rows_are_capped_before_they_are_read() {
         }) => {}
         other => panic!("{other:?}"),
     }
+    // The row past the cap is refused before it is read: malformed, it
+    // still meets the cap.
+    for bad in ["null", "7", r#"{"x": 1.5}"#, r#"{"h": true}"#] {
+        let rows = join(
+            (0..MAX_RESOLVED_DIGIT_OFFSETS)
+                .map(|_| "{}".to_owned())
+                .chain([bad.to_owned()]),
+        );
+        match load(&json(&format!("[{rows}]")), &[]).result {
+            Err(ImportError::Input {
+                limit: InputLimit::DigitOffsets,
+                at: Some(_),
+            }) => {}
+            other => panic!("{bad}: {other:?}"),
+        }
+    }
 }
 
-/// `judges` judges of four combos each (24 rows kept, two quads drawn)
-/// and numbers of 11 and `last` kept rows.
+/// [`common::kept_offsets`] imported beside n.png.
 fn kept(judges: usize, last: usize) -> Loaded {
-    let value = |id: &str, digit: usize| {
-        let rows = join((0..digit).map(|_| r#"{"x": 1}"#.to_owned()));
-        format!(
-            r#"{{"id": "{id}", "src": "n", "w": 120, "h": 20, "divx": 10, "digit": {digit},
-                "ref": 110, "offset": [{rows}]}}"#
-        )
-    };
-    let none = r#"{"id": "none", "dst": []}"#;
-    let combo =
-        |v: &str| format!(r#"{{"id": "{v}", "dst": [{{"x": 0, "y": 0, "w": 10, "h": 20}}]}}"#);
-    // Combos 1 and 2 have no grade: kept, never drawn.
-    let numbers = join(
-        [combo("c1"), combo("c11"), combo("c11")]
-            .into_iter()
-            .chain((0..3).map(|_| none.to_owned()))
-            .chain([combo("c1")]),
-    );
-    let images = join(
-        [r#"{"id": "g", "dst": [{"x": 0, "y": 0, "w": 80, "h": 20}]}"#.to_owned()]
-            .into_iter()
-            .chain((0..6).map(|_| none.to_owned())),
-    );
-    let records = join((0..judges).map(|i| {
-        format!(r#"{{"id": "j{i}", "index": 0, "images": [{images}], "numbers": [{numbers}]}}"#)
-    }));
-    let dsts = join(
-        (0..judges)
-            .map(|i| format!(r#"{{"id": "j{i}", "dst": [{{"w": 0, "h": 0}}]}}"#))
-            .chain(
-                ["n11", "nl"]
-                    .map(|id| format!(r#"{{"id": "{id}", "dst": [{{"w": 10, "h": 20}}]}}"#)),
-            ),
-    );
-    let values = join(
-        [
-            value("c1", 1),
-            value("c11", 11),
-            value("n11", 11),
-            value("nl", last),
-        ]
-        .into_iter(),
-    );
-    let j = format!(
-        r#"{{"type": 0, "w": 1920, "h": 1080, "source": [{{"id": "n", "path": "n.png"}}],
-            "image": [{{"id": "g", "src": "n", "w": 12, "h": 20}}],
-            "value": [{values}], "judge": [{records}], "destination": [{dsts}]}}"#
-    );
-    load(&j, &[])
+    load(&common::kept_offsets(judges, last), &[])
 }
 
 #[test]
