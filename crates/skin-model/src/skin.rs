@@ -729,14 +729,16 @@ impl Skin {
     /// way); the total
     /// operations, each `when` charged once however many elements share
     /// it, then each visibility in element order, then per element its
-    /// number's value or its judge parts' visibilities; and the widgets'
+    /// number's value, its image choice's selector or its judge parts'
+    /// visibilities; and the widgets'
     /// quads within [`MAX_WIDGET_QUADS`]. So the per-frame cost is known
     /// here. Then each region's box is computed from its elements' keys.
     ///
     /// The widget checks past the table counts and the key count cover the
     /// definitions an element references; an unreferenced definition is
     /// not checked and never drawn, its missing images and timers falling
-    /// back to nothing and off.
+    /// back to nothing and off. Image choice tables are the exception:
+    /// every table is checked, referenced or not.
     ///
     /// These counts check what was built. A front end (an importer, the
     /// authored format's loader) enforces the same element, widget, `when`

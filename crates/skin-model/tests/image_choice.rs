@@ -17,7 +17,8 @@ use rules::Judgment;
 use skin_model::{
     CycleDef, Ease, End, ImageChoiceDef, ImageChoiceError, ImageChoicePart, ImageSpan, KeyDef,
     LoadError, MAX_COORD, MAX_ELEMENTS, MAX_IMAGE_CHOICE_REFS, MAX_KEY_US, MAX_SKIN_KEYS,
-    MAX_TRACK_KEYS, Native, Place, Region, Source, TimerRef, Track, WidgetDefs, timer,
+    MAX_SKIN_OPS, MAX_TRACK_KEYS, Native, Place, Region, Source, TimerRef, Track, WidgetDefs,
+    timer,
 };
 use widget_support::{
     ELEVEN, TEN, TWENTY_FOUR, boolean, drawn, element, harness, int, judgment, load,
@@ -260,12 +261,25 @@ fn each_entry_keeps_its_own_native_size() {
 
 #[test]
 fn one_quad_per_element_and_ops_per_reference() {
-    let t = table("combo - 1", vec![Some(part(TEN, 0, 1)); 5]);
-    let ops = t.value.op_count();
-    let skin = load(vec![chooser(0), chooser(0)], widgets(vec![t.clone(), t])).unwrap();
+    // Table 0 (4 ops) referenced by every element, table 1 (6 ops) by the
+    // last one or by none: each reference charges its table's selector,
+    // an unreferenced table nothing.
+    let shared = table("abs(combo - 1)", vec![Some(part(TEN, 0, 1)); 5]);
+    let other = table("abs(combo - 1) + 1", vec![Some(part(TEN, 0, 1))]);
+    assert_eq!((shared.value.op_count(), other.value.op_count()), (4, 6));
+    let tables = || widgets(vec![shared.clone(), other.clone()]);
+    let skin = load(vec![chooser(0), chooser(0)], tables()).unwrap();
     assert_eq!(skin.quad_capacity(), 2);
-    assert_eq!(skin.ops().total(), 2 * ops);
-    assert_eq!(skin.choice_ref_count(), 10);
+    assert_eq!(skin.ops().total(), 2 * 4);
+    assert_eq!(skin.choice_ref_count(), 6);
+    // At the op cap: every element references table 0.
+    assert_eq!(MAX_ELEMENTS * 4, MAX_SKIN_OPS);
+    let skin = load(vec![chooser(0); MAX_ELEMENTS], tables()).unwrap();
+    assert_eq!(skin.ops().total(), MAX_SKIN_OPS);
+    // Past it: the last references table 1 instead.
+    let mut elements = vec![chooser(0); MAX_ELEMENTS - 1];
+    elements.push(chooser(1));
+    assert!(matches!(load(elements, tables()), Err(LoadError::Ops(_))));
 }
 
 /// A track of [`MAX_TRACK_KEYS`] keys, 1 ms apart.
