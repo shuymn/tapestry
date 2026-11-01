@@ -153,6 +153,23 @@ fn assert_matches_expected(name: &str, rgb: &[u8]) {
     }
 }
 
+/// The pinned font, checked by its hash, and a WARP renderer at 1/3 scale.
+fn text_fixture() -> (Fonts, Renderer) {
+    let path = fonts_dir().join(PINNED_FONT);
+    let data = pinned_font(&path, PINNED_SHA256).unwrap_or_else(|e| panic!("{e}"));
+    let fonts = Fonts::from_data(data, "Yu Gothic UI").unwrap();
+    let r = Renderer::new(
+        Target::Offscreen {
+            width: WIDTH,
+            height: HEIGHT,
+        },
+        AdapterChoice::Warp,
+    )
+    .expect("WARP renderer");
+    assert_eq!(r.gpu().adapter().name, common::WARP);
+    (fonts, r)
+}
+
 /// Translucent menu text over a sprite composites its straight colour once:
 /// no glyph pixel leaves the range between the background and the text's
 /// full-coverage colour, and the full-coverage pixels are that colour.
@@ -167,17 +184,7 @@ fn assert_matches_expected(name: &str, rgb: &[u8]) {
 fn translucent_text_composites_its_colour_once() {
     const BACKGROUND: [u8; 3] = [51, 102, 153];
     const COVERED: [u8; 3] = [153, 151, 108];
-    let path = fonts_dir().join(PINNED_FONT);
-    let data = pinned_font(&path, PINNED_SHA256).unwrap_or_else(|e| panic!("{e}"));
-    let mut fonts = Fonts::from_data(data, "Yu Gothic UI").unwrap();
-    let mut r = Renderer::new(
-        Target::Offscreen {
-            width: WIDTH,
-            height: HEIGHT,
-        },
-        AdapterChoice::Warp,
-    )
-    .expect("WARP renderer");
+    let (mut fonts, mut r) = text_fixture();
     // A filled square about 60 target pixels on a side.
     let square = TextBlock::new(
         &mut fonts,
@@ -223,18 +230,7 @@ fn translucent_text_composites_its_colour_once() {
 
 #[test]
 fn japanese_title_renders_on_warp() {
-    let path = fonts_dir().join(PINNED_FONT);
-    let data = pinned_font(&path, PINNED_SHA256).unwrap_or_else(|e| panic!("{e}"));
-    let mut fonts = Fonts::from_data(data, "Yu Gothic UI").unwrap();
-    let mut r = Renderer::new(
-        Target::Offscreen {
-            width: WIDTH,
-            height: HEIGHT,
-        },
-        AdapterChoice::Warp,
-    )
-    .expect("WARP renderer");
-    assert_eq!(r.gpu().adapter().name, common::WARP);
+    let (mut fonts, mut r) = text_fixture();
 
     // A title over the bitmap font's sprites, which it must cover: the
     // text pass comes after the sprite pass.
