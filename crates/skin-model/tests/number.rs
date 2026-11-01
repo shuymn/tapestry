@@ -643,6 +643,42 @@ fn offsets_are_target_pixels_at_any_resolution() {
 }
 
 #[test]
+fn an_unreferenced_strip_is_counted_not_checked() {
+    // Number 1, which no element draws, has more offsets than cells and
+    // one past ±2^20: the skin loads, counting its offsets, and draws
+    // number 0 alone. The same strip drawn is refused.
+    let past = DigitOffset {
+        dx: MAX_COORD + 1,
+        ..DigitOffset::default()
+    };
+    let bad = single(vec![past, past]);
+    let skin = |source| {
+        load(
+            vec![element(source, RECT, Place::SCREEN)],
+            WidgetDefs {
+                numbers: vec![number(single(vec![MOVE]), "7"), number(bad.clone(), "7")],
+                ..WidgetDefs::default()
+            },
+        )
+    };
+    let unreferenced = skin(Source::Number(0)).unwrap();
+    assert_eq!(unreferenced.digit_offset_count(), 3);
+    let h = {
+        let mut h = harness(unreferenced);
+        h.frame(0, &[]);
+        h
+    };
+    assert_eq!(cells(&h).len(), 1);
+    assert!(matches!(
+        skin(Source::Number(1)),
+        Err(LoadError::Number {
+            error: NumberError::OffsetCount { n: 2 },
+            ..
+        })
+    ));
+}
+
+#[test]
 fn an_offset_is_added_in_f64() {
     // At 1280×720 a cell placed at x 1 000 000 moved by −666 667 target
     // pixels, −1 000 000.47 canvas pixels, lands at −0.470 197 68; in
