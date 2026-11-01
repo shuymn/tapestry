@@ -1203,6 +1203,9 @@ impl Skin {
         let texts = play.text().len() == self.text_slots();
         let bitmaps = play.bitmap().len() == self.text_slots();
         let display = TimeUs(frame.now.0.saturating_add(frame.display_offset.0));
+        // The lanes' geometry, once for every element, whether or not the
+        // lanes draw.
+        let lanes = self.lanes.as_ref().map(|l| l.frame_geometry(frame.lanes));
         for e in &self.elements {
             if !placement.region(e.region).visible {
                 continue;
@@ -1282,12 +1285,13 @@ impl Skin {
                     }
                 }
                 Kind::Lanes => {
-                    if let Some(lanes) = &self.lanes {
+                    if let (Some(widget), Some(g)) = (&self.lanes, lanes.as_ref()) {
                         let d = Draw {
                             play,
                             now: frame.now,
                             display,
                             view: frame.lanes,
+                            frame: g,
                             complete: frame.complete,
                             geometry: placement.geometry(),
                             affine,
@@ -1295,7 +1299,7 @@ impl Skin {
                             key: e.key,
                             uvs,
                         };
-                        lanes.draw(&d, out);
+                        widget.draw(&d, out);
                     }
                 }
             }
