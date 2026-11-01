@@ -863,6 +863,33 @@ pub fn skin_imports() -> Vec<Seed> {
                 "destination": [{"id": "gg", "dst": [{"x": 600, "y": 100, "w": 500, "h": 10}]}]"#,
             ),
         ),
+        (
+            "rates",
+            play_skin(
+                r#""image": [{"id": "g", "src": "grid", "w": 4, "h": 4}],
+                "imageset": [
+                    {"id": "kind", "images": ["g"], "ref": 40},
+                    {"id": "first", "images": ["g"], "value": 40},
+                    {"id": "byvalue", "images": ["g"], "value": 71, "ref": 40}],
+                "value": [
+                    {"id": "r102", "src": "strip", "w": 100, "h": 10, "divx": 10, "digit": 3, "ref": 102},
+                    {"id": "r103", "src": "strip", "w": 100, "h": 10, "divx": 10, "digit": 2, "padding": 1, "value": "score_rate_afterdot"},
+                    {"id": "r115", "src": "strip", "w": 100, "h": 10, "divx": 10, "digit": 3, "value": 115},
+                    {"id": "r116", "src": "strip", "w": 100, "h": 10, "divx": 10, "digit": 2, "padding": 1, "value": 40, "ref": 116},
+                    {"id": "r155", "src": "strip", "w": 100, "h": 10, "divx": 10, "digit": 3, "value": "score_rate2"},
+                    {"id": "r156", "src": "strip", "w": 100, "h": 10, "divx": 10, "digit": 2, "padding": 1, "ref": 156}],
+                "destination": [
+                    {"id": "r102", "op": [42], "dst": [{"x": 10, "y": 100, "w": 10, "h": 10}]},
+                    {"id": "r103", "op": [-42], "dst": [{"x": 10, "y": 120, "w": 10, "h": 10}]},
+                    {"id": "r115", "op": [43, 43], "dst": [{"x": 10, "y": 140, "w": 10, "h": 10}]},
+                    {"id": "r116", "draw": "!gauge_hard", "dst": [{"x": 10, "y": 160, "w": 10, "h": 10}]},
+                    {"id": "r155", "op": ["gauge_ex"], "dst": [{"x": 10, "y": 180, "w": 10, "h": 10}]},
+                    {"id": "r156", "op": [-1046], "dst": [{"x": 10, "y": 200, "w": 10, "h": 10}]},
+                    {"id": "kind", "dst": [{"x": 100, "y": 100, "w": 4, "h": 4}]},
+                    {"id": "first", "dst": [{"x": 100, "y": 120, "w": 4, "h": 4}]},
+                    {"id": "byvalue", "dst": [{"x": 100, "y": 140, "w": 4, "h": 4}]}]"#,
+            ),
+        ),
     ]
 }
 

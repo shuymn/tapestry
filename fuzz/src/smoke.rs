@@ -281,6 +281,7 @@ fn skin_json_seeds_resolve_or_fail_as_built() {
             "followers",
             "judge",
             "gauge",
+            "rates",
         ],
     );
     let imports: Vec<&str> = seeds::skin_imports().iter().map(|(n, _)| *n).collect();
@@ -487,6 +488,32 @@ fn skin_import_seeds_import_and_draw_as_built() {
                     [NoteKind::Deviation(skin_beatoraja::DeviationId::D10)]
                 );
                 assert_eq!(drawn, [51, 51, 51, 51], "{name}");
+            }
+            "rates" => {
+                use skin_beatoraja::{DeviationId, PropertyKind};
+                // Each rate number once D4, its conditions with it; the
+                // gauge-type set waits for the image selection, the one
+                // choosing by value is unsupported, the one whose value
+                // resolves to nothing draws its first image.
+                let mut k = kinds(&i);
+                k.sort_by_key(|n| format!("{n:?}"));
+                let mut want = vec![NoteKind::Deviation(DeviationId::D4); 6];
+                want.push(NoteKind::UnsupportedField {
+                    field: "image selection",
+                });
+                want.push(NoteKind::UnsupportedProperty {
+                    kind: PropertyKind::Integer,
+                    id: Some(71),
+                });
+                want.sort_by_key(|n| format!("{n:?}"));
+                assert_eq!(k, want, "{name}");
+                // Every object is charged, the dropped image sets too.
+                assert_eq!(u.elements, 9, "{name}");
+                // A normal gauge: the groove, not-hard and not-ex numbers
+                // draw. EX 150 over one judged of 100 targets: 750 000 bp
+                // now, its whole percent past 3 cells; 75.00 overall,
+                // "00" twice; and the first image.
+                assert_eq!(drawn, [3 + 2 + 2 + 1; 4], "{name}");
             }
             _ => panic!("no expectation for seed {name}"),
         }

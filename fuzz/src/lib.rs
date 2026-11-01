@@ -422,7 +422,128 @@ pub fn draw(imported: &Imported) -> Vec<usize> {
             "a quad off the finite plane"
         );
     }
+    rate_and_kind_probes(skin, &chart, &uvs, &mut batch);
     counts
+}
+
+/// The score rates and the gauge kind at their extremes: both empty-POOR
+/// policies over the largest consistent counts, every look shown and
+/// indices past the snapshot and the descriptors, each frame inside the
+/// schema's ranges and the skin's capacities.
+fn rate_and_kind_probes(
+    skin: &skin_model::Skin,
+    chart: &bms_model::Chart,
+    uvs: &skin_model::UvTable,
+    batch: &mut skin_model::QuadBatch,
+) {
+    use bms_model::TimeUs;
+    use eval::{GaugeState, Tally};
+    use rules::{GaugeValue, PerJudgment};
+    use skin_model::{
+        Attempt, GaugeDesc, GaugeLook, LaneView, Layout, PlayContext, Side, SkinFrame, field,
+    };
+
+    let descs = GaugeLook::ALL.map(|look| GaugeDesc {
+        start: GaugeValue(50 * GaugeValue::PERCENT),
+        max: GaugeValue::FULL,
+        look,
+        border: GaugeValue(80 * GaugeValue::PERCENT),
+    });
+    let states = descs.map(|d| GaugeState {
+        value: d.start,
+        reference: d.start,
+        failed_at: None,
+    });
+    let max = u32::MAX;
+    let tally = Tally {
+        counts: PerJudgment {
+            perfect: max,
+            great: max,
+            good: max,
+            bad: max,
+            poor: max,
+        },
+        ex_score: max,
+        bp: max,
+        combo: max,
+        max_combo: max,
+        // As many as the POORs: consistent under either policy.
+        empty_poor: max,
+    };
+    for counted in [false, true] {
+        let ctx = PlayContext {
+            gauges: &descs,
+            attempt: Attempt::Full { lead_in: TimeUs(0) },
+            empty_poor_breaks_combo: counted,
+            empty_poor_counted: counted,
+            scratch: Side::Left,
+            ln_default: rules::LnMode::Ln,
+            last_note_end: TimeUs(0),
+        };
+        let mut play = skin
+            .prepare(chart, &ctx)
+            .expect("an imported skin prepares");
+        // Every look, then past the descriptors; a short snapshot leaves
+        // the later looks without one.
+        for (k, snapshot) in [
+            (0..=descs.len(), &states[..]),
+            (0..=descs.len(), &states[..3]),
+        ]
+        .into_iter()
+        .flat_map(|(ks, s)| ks.map(move |k| (k, s)))
+        {
+            batch.clear();
+            let frame = SkinFrame {
+                now: TimeUs(2_000_000),
+                display_offset: TimeUs(0),
+                tally: &tally,
+                gauges: snapshot,
+                gauge: k,
+                effects: &[],
+                complete: false,
+                target: [1_920, 1_080],
+                layout: &Layout::AUTHOR,
+                lanes: LaneView {
+                    visible_time: TimeUs(600_000),
+                    cover: 0,
+                    lift: 0,
+                    hidden: 0,
+                },
+                loading: None,
+                playing: true,
+            };
+            skin.build(&mut play, &frame, uvs, batch)
+                .expect("a consistent snapshot builds");
+            let fields = play.state().fields;
+            let read = |slot: u16| fields.get(usize::from(slot)).copied();
+            let valid = k < snapshot.len() && k < descs.len();
+            assert_eq!(read(field::GAUGE_VALID), Some(i32::from(valid)));
+            let kind = descs
+                .get(k)
+                .filter(|_| valid)
+                .map_or(GaugeLook::Normal, |d| d.look);
+            let kind = i32::try_from(kind.index()).expect("six looks");
+            assert_eq!(read(field::GAUGE_KIND), Some(kind));
+            // 10 000 · (2^32 − 1) / (10 · (2^32 − 1)) of the judged
+            // targets, less the empty POORs counted; the whole rate over
+            // the chart's 100 taps past the field's bound.
+            let current = if counted { 1_250 } else { 1_000 };
+            assert_eq!(read(field::RATE_CURRENT_BP), Some(current));
+            assert_eq!(read(field::RATE_WHOLE_BP), Some(i32::MAX));
+            assert_eq!(batch.dropped(), 0, "quads past the capacity");
+            assert!(
+                batch.runs().len() <= usize::try_from(skin.run_capacity()).unwrap_or(usize::MAX),
+                "more runs than the capacity"
+            );
+            assert!(
+                batch
+                    .quads()
+                    .iter()
+                    .all(|q| q.rect.iter().chain(&q.pivot).all(|v| v.is_finite())),
+                "a quad off the finite plane"
+            );
+        }
+    }
 }
 
 /// The header's counts are inside their caps, its size is an accepted
