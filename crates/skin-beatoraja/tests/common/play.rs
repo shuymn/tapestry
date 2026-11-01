@@ -5,13 +5,13 @@
 
 use std::collections::HashMap;
 
-use bms_model::{ChartBuilder, Lane, TimeUs};
+use bms_model::{Chart, ChartBuilder, Lane, LnMode, TimeUs};
 use eval::{GaugeState, JudgeEvent, JudgeEventKind, Tally};
 use rules::{GaugeValue, Judgment, PerJudgment};
 use skin_model::{
-    AtlasLimits, Attempt, BpmRange, ChartText, CoverSettings, FrameReadouts, FrameUv, GaugeDesc,
-    GaugeLook, LaneView, Layout, PlayContext, Quad, QuadBatch, Side, Skin, SkinFrame, TextImage,
-    TextTable, UvTable, Variant,
+    Atlas, AtlasLimits, Attempt, BpmRange, ChartText, CoverSettings, FrameReadouts, FrameUv,
+    GaugeDesc, GaugeLook, LaneView, Layout, PlayContext, Quad, QuadBatch, Side, Skin, SkinFrame,
+    TextImage, TextTable, UvTable, Variant,
 };
 
 pub const MS: i64 = 1_000;
@@ -310,6 +310,38 @@ impl Drawn {
             })
             .collect()
     }
+}
+
+/// The atlas texel at the middle of `q`'s uv, from its first level.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss,
+    reason = "test atlases are small"
+)]
+pub fn quad_texel(atlas: &Atlas, q: &Quad) -> [u8; 4] {
+    let side = atlas.side();
+    let at = |a: f32, b: f32| ((a + b) / 2.0 * side as f32) as u32;
+    let (x, y) = (at(q.uv[0], q.uv[2]), at(q.uv[1], q.uv[3]));
+    let level = atlas.pages()[usize::from(q.layer) - 1].level(0).unwrap();
+    let i = ((y * side + x) * 4) as usize;
+    level[i..i + 4].try_into().unwrap()
+}
+
+/// A long note on model lane 1 from 1 s to 1.3 s in `mode`, with a STOP
+/// of `stop` ms at its end.
+pub fn long_note(mode: Option<LnMode>, stop: i64) -> Chart {
+    let mut b = ChartBuilder::new(150_000).long(
+        Lane::new(1).unwrap(),
+        TimeUs(1_000 * MS),
+        TimeUs(1_300 * MS),
+    );
+    if stop > 0 {
+        b = b.stop(TimeUs(1_300 * MS), TimeUs(stop * MS));
+    }
+    let mut chart = b.build().unwrap();
+    chart.meta.ln_mode = mode;
+    chart
 }
 
 /// A float rect as whole pixels.

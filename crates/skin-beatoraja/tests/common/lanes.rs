@@ -44,6 +44,12 @@ pub fn eight(name: &str) -> String {
     format!("[{}]", v.join(", "))
 }
 
+/// Eight distinct ids `{prefix}0` to `{prefix}7`, as a JSON list.
+pub fn indexed_ids(prefix: &str) -> String {
+    let v: Vec<String> = (0..8).map(|i| format!("\"{prefix}{i}\"")).collect();
+    format!("[{}]", v.join(", "))
+}
+
 /// The `note` member with `extra` fields; `dst` is its lane rects.
 pub fn note_with(dst: &str, extra: &str) -> String {
     let sep = if extra.is_empty() { "" } else { ", " };

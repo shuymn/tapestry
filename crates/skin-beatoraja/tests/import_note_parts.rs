@@ -5,11 +5,11 @@
 mod common;
 
 use bms_model::{Chart, ChartBuilder, Lane, LnMode, TimeUs};
-use common::lanes::{NOTES, body, eight, note};
-use common::play::{Drawn, MS};
+use common::lanes::{NOTES, body, eight, indexed_ids, note};
+use common::play::{Drawn, MS, long_note, quad_texel, round};
 use common::{Loaded, import_body};
 use skin_beatoraja::{CriticalPart, ImportError, NoteFallback, NoteKind, PartWhy, Severity};
-use skin_model::{Atlas, AtlasLimits, Quad, Variant};
+use skin_model::{AtlasLimits, Variant};
 
 const LIMITS: AtlasLimits = AtlasLimits {
     max_side: 4_096,
@@ -20,12 +20,6 @@ const WHITE: [u8; 4] = [255, 255, 255, 255];
 const YELLOW: [u8; 4] = [255, 255, 0, 255];
 const RED: [u8; 4] = [255, 0, 0, 255];
 const SIZES: &str = r#""size": [20, 20, 20, 20, 20, 20, 20, 20]"#;
-
-/// Eight distinct ids `{prefix}0` to `{prefix}7`, as a JSON list.
-fn ids(prefix: &str) -> String {
-    let v: Vec<String> = (0..8).map(|i| format!("\"{prefix}{i}\"")).collect();
-    format!("[{}]", v.join(", "))
-}
 
 /// The default note member with `from` replaced by `to` once, and
 /// `extra` fields.
@@ -80,16 +74,6 @@ fn fallbacks(l: &Loaded) -> Vec<(&'static str, u8, NoteFallback)> {
         .collect()
 }
 
-/// The atlas texel at the middle of `q`'s uv.
-fn texel(atlas: &Atlas, q: &Quad) -> [u8; 4] {
-    let side = atlas.side();
-    let at = |a: f32, b: f32| ((a + b) / 2.0 * side as f32) as u32;
-    let (x, y) = (at(q.uv[0], q.uv[2]), at(q.uv[1], q.uv[3]));
-    let level = atlas.pages()[usize::from(q.layer) - 1].level(0).unwrap();
-    let i = ((y * side + x) * 4) as usize;
-    level[i..i + 4].try_into().unwrap()
-}
-
 /// The rounded rects at `ms` of `l` over `chart`, each with its atlas
 /// colour.
 fn painted(l: &Loaded, chart: &Chart, ms: i64) -> Vec<([i32; 4], [u8; 4])> {
@@ -100,23 +84,9 @@ fn painted(l: &Loaded, chart: &Chart, ms: i64) -> Vec<([i32; 4], [u8; 4])> {
         .iter()
         .map(|q| {
             assert_eq!(q.color, [1.0; 4], "fallback colour is in the texture");
-            (q.rect.map(|v| v.round() as i32), texel(&atlas, q))
+            (round(q.rect), quad_texel(&atlas, q))
         })
         .collect()
-}
-
-/// A long note on model lane 1 from 1 s to 1.3 s in `mode`.
-fn long_note(mode: Option<LnMode>) -> Chart {
-    let mut chart = ChartBuilder::new(150_000)
-        .long(
-            Lane::new(1).unwrap(),
-            TimeUs(1_000 * MS),
-            TimeUs(1_300 * MS),
-        )
-        .build()
-        .unwrap();
-    chart.meta.ln_mode = mode;
-    chart
 }
 
 #[test]
@@ -124,15 +94,30 @@ fn every_unresolved_part_draws_shared_generated_paint() {
     // F11's shape: every mapped id distinct and unresolved, sizes
     // explicit, no image record at all.
     let edits = [
-        (list("note", "nt"), format!(r#""note": {}"#, ids("n"))),
-        (list("lnstart", "ls"), format!(r#""lnstart": {}"#, ids("s"))),
-        (list("lnend", "le"), format!(r#""lnend": {}"#, ids("e"))),
-        (list("lnbody", "lb"), format!(r#""lnbody": {}"#, ids("b"))),
+        (
+            list("note", "nt"),
+            format!(r#""note": {}"#, indexed_ids("n")),
+        ),
+        (
+            list("lnstart", "ls"),
+            format!(r#""lnstart": {}"#, indexed_ids("s")),
+        ),
+        (
+            list("lnend", "le"),
+            format!(r#""lnend": {}"#, indexed_ids("e")),
+        ),
+        (
+            list("lnbody", "lb"),
+            format!(r#""lnbody": {}"#, indexed_ids("b")),
+        ),
         (
             list("lnactive", "la"),
-            format!(r#""lnactive": {}"#, ids("a")),
+            format!(r#""lnactive": {}"#, indexed_ids("a")),
         ),
-        (list("mine", "mi"), format!(r#""mine": {}"#, ids("m"))),
+        (
+            list("mine", "mi"),
+            format!(r#""mine": {}"#, indexed_ids("m")),
+        ),
     ];
     let edits: Vec<(&str, &str)> = edits.iter().map(|(a, b)| (&a[..], &b[..])).collect();
     let n = note_edit(&edits, SIZES);
@@ -172,7 +157,7 @@ fn every_unresolved_part_draws_shared_generated_paint() {
         [([100, 860, 50, 20], WHITE), ([150, 860, 50, 20], RED)]
     );
     assert_eq!(
-        painted(&l, &long_note(Some(LnMode::Cn)), 1_150),
+        painted(&l, &long_note(Some(LnMode::Cn), 0), 1_150),
         [
             ([100, 730, 50, 130], YELLOW),
             ([100, 710, 50, 20], YELLOW),
@@ -183,7 +168,7 @@ fn every_unresolved_part_draws_shared_generated_paint() {
 
 #[test]
 fn an_unresolved_tail_keeps_the_mode_tail_rule() {
-    let to = format!(r#""lnend": {}"#, ids("x"));
+    let to = format!(r#""lnend": {}"#, indexed_ids("x"));
     let l = lanes_edit(&[(&list("lnend", "le"), &to)], SIZES);
     assert_eq!(l.report().usage.note_fallbacks, 8);
     // LN draws body and head, no tail; CN and HCN draw the yellow tail.
@@ -193,7 +178,7 @@ fn an_unresolved_tail_keeps_the_mode_tail_rule() {
         (Some(LnMode::Cn), true),
         (Some(LnMode::Hcn), true),
     ] {
-        let p = painted(&l, &long_note(mode), 1_150);
+        let p = painted(&l, &long_note(mode, 0), 1_150);
         let rects: Vec<[i32; 4]> = p.iter().map(|e| e.0).collect();
         let mut want = vec![[100, 730, 50, 130]];
         if tail {
@@ -421,7 +406,7 @@ fn body_aliases_keep_their_selection() {
     // The fallback field names follow the selection.
     let l = lanes_edit(
         &[(&drop_active, "")],
-        &format!(r#""lnbodyActive": {}"#, ids("q")),
+        &format!(r#""lnbodyActive": {}"#, indexed_ids("q")),
     );
     assert!(fallbacks(&l).iter().all(|e| e.0 == "lnbodyActive"));
     assert_eq!(fallbacks(&l).len(), 8);

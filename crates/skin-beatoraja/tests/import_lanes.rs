@@ -6,7 +6,7 @@ mod common;
 
 use bms_model::{Chart, ChartBuilder, Lane, LnMode, TimeUs};
 use common::lanes::{NOTES, body, cover, eight, lane_rects, lift_object, note, note_with};
-use common::play::{Drawn, MS, judged, round};
+use common::play::{Drawn, MS, judged, long_note, round};
 use common::{Loaded, dst, has, import_body, import_config, import_sized};
 use eval::{JudgeEvent, JudgeEventKind};
 use rules::Judgment;
@@ -797,22 +797,6 @@ fn taps_and_mines_stay_until_their_time() {
     let mut d = drawn(&l, &mines);
     d.frame(900, &[mine_hit(900, 2)]);
     assert_eq!(d.rects(910), [[150, 770, 50, 20]]);
-}
-
-/// A long note on model lane 1 from 1 s to 1.3 s in `mode`, with a STOP
-/// of `stop` ms at its end.
-fn long_note(mode: Option<LnMode>, stop: i64) -> Chart {
-    let mut b = ChartBuilder::new(150_000).long(
-        Lane::new(1).unwrap(),
-        TimeUs(1_000 * MS),
-        TimeUs(1_300 * MS),
-    );
-    if stop > 0 {
-        b = b.stop(TimeUs(1_300 * MS), TimeUs(stop * MS));
-    }
-    let mut chart = b.build().unwrap();
-    chart.meta.ln_mode = mode;
-    chart
 }
 
 #[test]
