@@ -384,6 +384,16 @@ fn track_outside(t: &Track) -> bool {
         .any(|r| r.iter().any(|v| !(-MAX_COORD..=MAX_COORD).contains(v)))
 }
 
+/// Whether a key of `t` leaves ±[`MAX_COORD`] on y when moved `up` up or
+/// `down` down.
+fn track_moved_outside(t: &Track, up: i64, down: i64) -> bool {
+    let max = i64::from(MAX_COORD);
+    t.rects().any(|[_, y, ..]| {
+        let y = i64::from(y);
+        y - up < -max || y + down > max
+    })
+}
+
 /// The places checks of [`Skin::new`], in element order.
 fn check_places(def: &SkinDef) -> Result<(), LoadError> {
     let fixed = def.fit == Fit::Fixed;
@@ -465,14 +475,7 @@ fn check_places(def: &SkinDef) -> Result<(), LoadError> {
 /// its y within ±[`MAX_COORD`] when moved `reach` either way; a slider
 /// paint's keys keep it moved down by its range as well.
 fn check_follows(def: &SkinDef, reach: i64) -> Result<(), LoadError> {
-    let max = i64::from(MAX_COORD);
-    let moved = |t: &Track, up: i64, down: i64| {
-        t.rects().any(|[_, y, ..]| {
-            let y = i64::from(y);
-            y - up < -max || y + down > max
-        })
-    };
-    let moved_out = |t: &Track| moved(t, reach, reach);
+    let moved_out = |t: &Track| track_moved_outside(t, reach, reach);
     for (element, e) in def.elements.iter().enumerate() {
         let follow = e.place.follow;
         let slider = match e.source {
@@ -492,11 +495,11 @@ fn check_follows(def: &SkinDef, reach: i64) -> Result<(), LoadError> {
             }
             let follows = if follow == Follow::None { 0 } else { reach };
             let (up, down) = (follows, follows + slider.map_or(0, i64::from));
-            if moved(&e.track, up, down)
+            if track_moved_outside(&e.track, up, down)
                 || choice_of(def, e.source)
                     .into_iter()
                     .flat_map(ImageChoiceDef::tracks)
-                    .any(|t| moved(t, up, down))
+                    .any(|t| track_moved_outside(t, up, down))
             {
                 return Err(LoadError::Coordinates { element });
             }
@@ -827,14 +830,19 @@ fn check_bar_groups(
 ) -> Result<(), LoadError> {
     let fail = |group, error| Err(LoadError::Lanes(LanesError::BarGroup { group, error }));
     let groups = &l.bar_groups;
-    let find = |bad: &dyn Fn(&crate::BarGroupDef) -> bool| groups.iter().position(bad);
-    if let Some(g) = find(&|g| slot_of(g.timer, whens).is_none()) {
+    if let Some(g) = groups
+        .iter()
+        .position(|g| slot_of(g.timer, whens).is_none())
+    {
         return fail(g, BarGroupError::UnknownTimer);
     }
-    if let Some(g) = find(&|g| g.visible.as_ref().is_some_and(|v| v.ty() != Ty::Bool)) {
+    if let Some(g) = groups
+        .iter()
+        .position(|g| g.visible.as_ref().is_some_and(|v| v.ty() != Ty::Bool))
+    {
         return fail(g, BarGroupError::VisibleNotBool);
     }
-    if let Some(g) = find(&|g| track_outside(&g.track)) {
+    if let Some(g) = groups.iter().position(|g| track_outside(&g.track)) {
         return fail(g, BarGroupError::Coordinates);
     }
     for (g, b) in groups.iter().enumerate() {
@@ -845,14 +853,10 @@ fn check_bar_groups(
             return fail(g, BarGroupError::Fill);
         }
     }
-    let max = i64::from(MAX_COORD);
-    let moved_out = |t: &Track| {
-        t.rects().any(|[_, y, ..]| {
-            let y = i64::from(y);
-            y - reach < -max || y + reach > max
-        })
-    };
-    if let Some(g) = find(&|g| g.place.follow != Follow::None && moved_out(&g.track)) {
+    if let Some(g) = groups
+        .iter()
+        .position(|g| g.place.follow != Follow::None && track_moved_outside(&g.track, reach, reach))
+    {
         return fail(g, BarGroupError::Coordinates);
     }
     Ok(())
@@ -1736,15 +1740,7 @@ impl Skin {
         play.fill(frame, &self.whens)?;
         // The bar groups' work, lent to the lanes for this frame.
         let mut bars = play.take_bars();
-        self.draw(
-            play,
-            bars.as_deref_mut(),
-            frame,
-            uvs,
-            &canvas,
-            &placement,
-            out,
-        );
+        self.draw(play, bars.as_mut(), frame, uvs, &canvas, &placement, out);
         play.restore_bars(bars);
         Ok(())
     }

@@ -265,7 +265,7 @@ pub struct Play {
     bitmap: Box<[Option<GlyphLine>]>,
     /// The bar groups' per-frame work, for a skin with lanes and groups;
     /// a build lends it to the lanes.
-    bars: Option<Box<BarScratch>>,
+    bars: Option<BarScratch>,
 }
 
 /// The chart's notes and bar lines, kept for a skin with lanes.
@@ -384,7 +384,7 @@ impl Play {
             gauges: ctx.gauges.into(),
             text: TextTable::default(),
             bitmap: Box::new([]),
-            bars: (lanes && bar_groups > 0).then(|| Box::new(BarScratch::new(bar_groups))),
+            bars: (lanes && bar_groups > 0).then(|| BarScratch::new(bar_groups)),
         })
     }
 
@@ -394,12 +394,12 @@ impl Play {
     }
 
     /// Lends out the bar groups' work; allocates nothing.
-    pub(crate) fn take_bars(&mut self) -> Option<Box<BarScratch>> {
+    pub(crate) fn take_bars(&mut self) -> Option<BarScratch> {
         self.bars.take()
     }
 
     /// Takes back the work [`take_bars`](Self::take_bars) lent.
-    pub(crate) fn restore_bars(&mut self, bars: Option<Box<BarScratch>>) {
+    pub(crate) fn restore_bars(&mut self, bars: Option<BarScratch>) {
         self.bars = bars;
     }
 
