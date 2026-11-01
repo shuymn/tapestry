@@ -16,8 +16,8 @@ use skin_model::{
     Pad, Place, Region, Skin, Source, TimerRef, Track, WidgetDefs, timer,
 };
 use widget_support::{
-    ELEVEN, TEN, TEN_CYCLED, TWENTY_FIVE, TWENTY_FOUR, boolean, digits, drawn, element, glyphs,
-    harness, int, judgment, load, number,
+    ELEVEN, TEN, TEN_CYCLED, TWENTY_FIVE, TWENTY_FOUR, boolean, digits, down, drawn, element,
+    glyphs, harness, int, judgment, load, number,
 };
 
 const RECT: [i32; 4] = [100, 50, 20, 30];
@@ -93,7 +93,7 @@ fn a_value_longer_than_the_strip_keeps_its_low_digits() {
     };
     assert_eq!(show(left.clone(), "9999"), at([9, 9, 9, 9]));
     assert_eq!(show(left.clone(), "10000"), at([0, 0, 0, 0]));
-    assert_eq!(show(left.clone(), "12345"), at([2, 3, 4, 5]));
+    assert_eq!(show(left, "12345"), at([2, 3, 4, 5]));
 }
 
 #[test]
@@ -111,7 +111,7 @@ fn blank_padding_puts_the_sign_in_the_first_blank() {
         [(23, 100.0), (21, 122.0), (21, 144.0), (21, 166.0)]
     );
     assert_eq!(
-        show(d.clone(), "-1000"),
+        show(d, "-1000"),
         [(13, 100.0), (12, 122.0), (12, 144.0), (12, 166.0)]
     );
 }
@@ -124,7 +124,7 @@ fn zero_padding_keeps_cell_0_for_the_sign() {
         [(23, 100.0), (12, 122.0), (16, 144.0), (14, 166.0)]
     );
     assert_eq!(
-        show(d.clone(), "-1234"),
+        show(d, "-1234"),
         [(23, 100.0), (14, 122.0), (15, 144.0), (16, 166.0)]
     );
 }
@@ -367,7 +367,7 @@ fn strips_are_checked_at_their_limits() {
     let unknown = load(
         vec![element(Source::Number(1), RECT, Place::SCREEN)],
         WidgetDefs {
-            numbers: vec![number(base.clone(), "1")],
+            numbers: vec![number(base, "1")],
             ..WidgetDefs::default()
         },
     );
@@ -477,14 +477,6 @@ const MOVE: DigitOffset = DigitOffset {
 /// `d` with `offsets`.
 fn moved(d: DigitsDef, offsets: Vec<DigitOffset>) -> DigitsDef {
     DigitsDef { offsets, ..d }
-}
-
-/// A delta of `dy` alone.
-fn down(dy: i32) -> DigitOffset {
-    DigitOffset {
-        dy,
-        ..DigitOffset::default()
-    }
 }
 
 /// A one-cell strip of ten glyphs.

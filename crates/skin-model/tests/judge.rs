@@ -21,7 +21,7 @@ use skin_model::{
     Side, Skin, Source, TimerRef, Track, WidgetDefs, timer,
 };
 use widget_support::{
-    ELEVEN, GRADE, TEN, boolean, combo, digits, drawn, element, empty_judge, grade, harness,
+    ELEVEN, GRADE, TEN, boolean, combo, digits, down, drawn, element, empty_judge, grade, harness,
     judge_all, judge_element, judgment, load, load_fit,
 };
 
@@ -159,14 +159,6 @@ fn a_full_gauge_combo_falls_back_with_its_offsets() {
             (GRADE + 6, 0, [790.0, 500.0, 200.0, 80.0]),
         ]
     );
-}
-
-/// A delta of `dy` alone.
-fn down(dy: i32) -> DigitOffset {
-    DigitOffset {
-        dy,
-        ..DigitOffset::default()
-    }
 }
 
 #[test]
