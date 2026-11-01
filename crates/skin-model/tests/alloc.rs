@@ -1379,8 +1379,8 @@ fn stretch(
             complete: now > last,
             target: TARGETS[target_no],
             layout: &views.layouts[layout_no],
-            lanes: views.lanes[(frame_no / 23) % views.lanes.len()],
-            readouts: stretch_readouts(frame_no, views.lanes[(frame_no / 23) % views.lanes.len()]),
+            lanes: view,
+            readouts: stretch_readouts(frame_no, view),
             // A stretch of loading frames every 50, its progress moving.
             loading: (frame_no % 50 < 5).then(|| LoadState {
                 since: TimeUs(now - 1_000),

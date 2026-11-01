@@ -807,6 +807,30 @@ fn check_f5(_: &Header, i: Imported) {
         .map(|(_, n)| n)
         .sum();
     assert_eq!(covers, 3, "{by_size:?}");
+    // In destination order: SUDDEN+'s paint whole, 162 below its
+    // destination's −320, every row of its square 8×8 cell (the atlas
+    // pages are square); then LIFT and HIDDEN+, cut to the lanes.
+    let lane_wide: Vec<(&skin_model::Quad, [i32; 4])> = q
+        .iter()
+        .map(|quad| (quad, common::play::round(quad.rect)))
+        .filter(|(_, r)| r[2] == 430)
+        .collect();
+    let rects: Vec<[i32; 4]> = lane_wide.iter().map(|&(_, r)| r).collect();
+    assert_eq!(
+        rects,
+        [
+            [20, -158, 430, 600],
+            [20, 820, 430, 60],
+            [20, 550, 430, 270]
+        ],
+        "{rects:?}"
+    );
+    let [u0, v0, u1, v1] = lane_wide[0].0.uv;
+    assert!(
+        ((v1 - v0) / (u1 - u0) - 1.0).abs() < 1e-6,
+        "{:?}",
+        lane_wide[0].0.uv
+    );
     let gauge: usize = by_size
         .iter()
         .filter(|(s, _)| s[1] == 10)

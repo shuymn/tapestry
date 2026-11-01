@@ -19,7 +19,7 @@ use super::super::geom::HEIGHT;
 use super::super::policy::{CriticalPart, Role};
 use super::super::report::{NoteKind, Object};
 use super::super::track::Stretch;
-use super::super::{Common, Cx, Dst, Opts, Prop};
+use super::super::{Common, Cx, Dst, Prop};
 use super::SrcImage;
 use crate::error::ImportError;
 
@@ -65,12 +65,7 @@ impl Cx<'_> {
         range: Option<u32>,
     ) -> Result<(), ImportError> {
         let at = dst.span;
-        let o = Opts {
-            follow: true,
-            charged: true,
-            ..Opts::default()
-        };
-        let Some(c) = self.common_with(role, &dst, o)? else {
+        let Some(c) = self.image_common(&dst, true, role)? else {
             return Ok(());
         };
         if dst.stretch == 5 {
@@ -88,13 +83,9 @@ impl Cx<'_> {
         if c.stretch == Stretch::Trimmed {
             return self.drop_el(c.role, at, NoteKind::Stretch(c.stretch_mode));
         }
-        let Some((image, cell)) = self.add_src_image(&c, rec, s, s.div)? else {
+        let Some((image, t, native)) = self.src_image_track(&c, rec, s)? else {
             return Ok(());
         };
-        let Some((rects, native)) = self.baked_rects(&c, cell)? else {
-            return self.drop_el(c.role, at, NoteKind::Stretch(c.stretch_mode));
-        };
-        let t = self.model_track(&c, &rects)?;
         self.push_paint(c, CoverImage::Image(image), range, t, native)
     }
 

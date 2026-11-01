@@ -20,7 +20,7 @@ use skin_model::{
 use super::super::policy::{CriticalPart, Role};
 use super::super::property::{self, IndexProp, IntProp, Value};
 use super::super::report::{NoteKind, PropertyKind, Span, TrackWhy};
-use super::super::{Common, Cx, Dst, Opts, Prop};
+use super::super::{Common, Cx, Dst, Prop};
 #[cfg(test)]
 use super::super::{Event, trace};
 use super::{SrcImage, Unplaced};
@@ -154,7 +154,7 @@ impl Cx<'_> {
         self.budget.image(frames).map_err(|l| self.limit(at, l))?;
         #[cfg(test)]
         trace(Event::Charge);
-        let (file, rect, cell) = match self.src_rect(c.role, at, s, s.div)? {
+        let (file, rect, cell) = match self.src_rect(c.role, at, s, s.div, true)? {
             Ok(found) => found,
             Err(u) => return Ok(Err(u)),
         };
@@ -172,23 +172,6 @@ impl Cx<'_> {
                 missing: false,
             }),
         })
-    }
-
-    /// The common part of a selecting element, in the role `lowered`
-    /// gives it and following the covers; `charged` when its keys were
-    /// charged as an offset-4 candidate.
-    fn choice_common(
-        &mut self,
-        dst: &Dst,
-        charged: bool,
-        lowered: Lowered,
-    ) -> Result<Option<Common>, ImportError> {
-        let o = Opts {
-            follow: true,
-            charged,
-            ..Opts::default()
-        };
-        self.common_with(lowered.role(), dst, o)
     }
 
     /// An image group (`len` above 1) selecting by `src`: `len` runs of
@@ -220,13 +203,13 @@ impl Cx<'_> {
             .map_err(|l| self.limit(at, l))?;
         #[cfg(test)]
         trace(Event::Refs);
-        let Some(c) = self.choice_common(&dst, charged, lowered)? else {
+        let Some(c) = self.image_common(&dst, charged, lowered.role())? else {
             return Ok(());
         };
         let (src, deviates) = selector;
         let value = self.selector(src, at)?;
-        let cycle = match self.cycle(at, q, &s.timer, s.cycle)? {
-            Ok((cycle, _)) => cycle,
+        let cycle = match self.src_cycle(&c, q, s)? {
+            Ok(cycle) => cycle,
             Err(why) => return self.drop_el(c.role, at, why),
         };
         let (image, cell) = match self.admit_choice(&c, rec, s)? {
@@ -280,7 +263,7 @@ impl Cx<'_> {
         self.budget.choice_refs(n).map_err(|l| self.limit(at, l))?;
         #[cfg(test)]
         trace(Event::Refs);
-        let Some(c) = self.choice_common(&dst, charged, lowered)? else {
+        let Some(c) = self.image_common(&dst, charged, lowered.role())? else {
             return Ok(());
         };
         let value = self.selector(src, at)?;
@@ -300,8 +283,8 @@ impl Cx<'_> {
             };
             let s = self.src_image(rec)?;
             let n = self.grid_frames(at, s.div)?;
-            let cycle = match self.cycle(at, n, &s.timer, s.cycle)? {
-                Ok((cycle, _)) => cycle,
+            let cycle = match self.src_cycle(&c, n, &s)? {
+                Ok(cycle) => cycle,
                 Err(why) => return self.drop_el(c.role, at, why),
             };
             match self.admit_choice(&c, rec, &s)? {
