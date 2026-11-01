@@ -203,18 +203,20 @@ impl Extent {
     pub fn publish(&self, width: u32, height: u32) {
         let packed = (u64::from(width) << 32) | u64::from(height);
         self.size.store(packed, Ordering::Release);
-        if !self.queued.swap(true, Ordering::AcqRel) {
-            let wake = self.wake.lock().unwrap_or_else(PoisonError::into_inner);
+        // Under the sender's lock, so a wake is marked only when it is
+        // sent: before a render thread follows, none is, and the
+        // [`RenderMsg::Follow`] that comes after reads the newest size.
+        let wake = self.wake.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(tx) = wake.as_ref()
+            && !self.queued.swap(true, Ordering::AcqRel)
+        {
             // A render thread that ended ignores it.
-            if let Some(tx) = wake.as_ref() {
-                let _ = tx.send(RenderMsg::Resize);
-            }
+            let _ = tx.send(RenderMsg::Resize);
         }
     }
 
     /// Takes the wake on its way: the render thread calls it as it takes a
-    /// [`RenderMsg::Resize`] (or the [`RenderMsg::Follow`] that stands for
-    /// any wake left unsent before it followed), before it reads the size.
+    /// [`RenderMsg::Resize`], before it reads the size.
     /// A publish after this sends again; one before it was seen through
     /// the flag it set, so its size is the one read next.
     fn acknowledge(&self) {
@@ -1052,9 +1054,8 @@ impl Run {
                     let _ = reply.send(self.measure.finish(end));
                 }
                 Ok(RenderMsg::Follow(extent)) => {
-                    // A publish before the wake's sender was set marked a
-                    // wake that was never sent.
-                    extent.acknowledge();
+                    // A wake sent since the sender was set is still in
+                    // the channel, after this: it is taken there.
                     self.extent = Some(extent);
                     self.applied = None;
                 }
@@ -3590,27 +3591,33 @@ mod tests {
     /// published, and the newest is read. Reading the size between frames
     /// while that wake is still in the channel takes nothing: a publish
     /// after the read sends no second wake. Only taking the wake re-arms
-    /// it, and the size read after that is the newest. A publish before
-    /// the render thread followed marks a wake never sent, which following
-    /// takes. With the read clearing the flag (the polling a wake used to
-    /// share), the publish after it would send a second wake; with the
-    /// wake never re-armed, the last publish would send none.
+    /// it, and the size read after that is the newest. Before a render
+    /// thread follows, a publish marks no wake, so the first publish after
+    /// the sender is set sends one; a wake sent between the sender's
+    /// registration and the `Follow` being taken stays the only one, since
+    /// taking `Follow` takes no wake. With the read clearing the flag, the
+    /// publish after it would send a second wake; with a publish marking a
+    /// wake before a sender exists, the first publish after it would send
+    /// none; with `Follow` taking the wake, the publish after it would send
+    /// a second one.
     #[test]
     fn extent_publishes_coalesce() {
         let extent = super::Extent::default();
         assert_eq!(extent.latest(), None);
-        // No sender yet: marked, not sent; following takes it.
+        // No sender yet: nothing is marked.
         extent.publish(640, 480);
         assert_eq!(extent.latest(), Some((640, 480)));
+        // `RenderLink::follow`: the sender is set, then `Follow` is sent;
+        // a publish lands before the render thread takes `Follow`.
         let (tx, rx) = std::sync::mpsc::channel();
         *extent.wake.lock().unwrap() = Some(tx);
-        extent.acknowledge();
         extent.publish(800, 600);
-        extent.publish(0, 0);
-        // A frame reads the size while the wake waits.
-        assert_eq!(extent.latest(), Some((0, 0)));
-        extent.publish(2_560, 1_080);
         assert!(matches!(rx.try_recv(), Ok(RenderMsg::Resize)));
+        // `Follow` is taken, then a frame reads the size while the wake
+        // waits, then more publishes.
+        assert_eq!(extent.latest(), Some((800, 600)));
+        extent.publish(0, 0);
+        extent.publish(2_560, 1_080);
         assert!(rx.try_recv().is_err(), "one wake for three publishes");
         // The render thread takes the wake, then reads the newest.
         extent.acknowledge();
