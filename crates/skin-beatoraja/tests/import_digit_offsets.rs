@@ -10,9 +10,7 @@ mod common;
 use common::play::tally;
 use common::{Loaded, has, import_sized, join, png};
 use skin_beatoraja::limits::MAX_RESOLVED_DIGIT_OFFSETS;
-use skin_beatoraja::{
-    CriticalPart, ImportError, ImportLimit, InputLimit, NoteKind, import, read_header,
-};
+use skin_beatoraja::{CriticalPart, ImportError, ImportLimit, InputLimit, NoteKind};
 use skin_model::{MAX_COORD, MAX_DIGIT_OFFSETS};
 
 /// A value `v` of `fields` drawn at `dst`, on a skin `size` pixels.
@@ -152,10 +150,7 @@ fn load(json: &str, files: &[(&str, &str)]) -> Loaded {
     all.extend_from_slice(files);
     let dir = common::skin(&all);
     png(dir.path(), "n.png", 120, 20);
-    let result = read_header(dir.path(), "s.json").and_then(|(mut def, h)| {
-        let config = skin_beatoraja::Config::defaults(&h);
-        import(&mut def, &h, &config)
-    });
+    let result = common::import_dir(dir.path());
     Loaded { dir, result }
 }
 
