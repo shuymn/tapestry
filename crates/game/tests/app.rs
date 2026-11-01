@@ -3239,6 +3239,37 @@ fn a_gauge_moved_then_lost_gives_way_to_the_one_named() {
     );
 }
 
+/// A gauge removed, added back and then shown in place of the set gauge
+/// removed in a later round: the page shows the gauge the reset names,
+/// not one an older loss mapped it to.
+#[test]
+fn a_gauge_back_in_the_preset_ends_the_replacement() {
+    let all = reordered();
+    let [survival, normal, extra] = [0, 1, 2].map(|i| all.gauges[i].clone());
+    let with = |gauges: Vec<rules::GaugeRule>| rules::RulePreset {
+        gauges,
+        ..all.clone()
+    };
+    let after = vec![(40_000, Act::Page(PracticeInput::Back)), (500, Act::Close)];
+    let edits = vec![
+        (EditAt::Round(1), with(vec![extra.clone(), normal.clone()])),
+        (
+            EditAt::Round(2),
+            with(vec![extra.clone(), normal, survival.clone()]),
+        ),
+        (EditAt::Round(3), with(vec![extra, survival])),
+    ];
+    let rig = practice_with_edits(None, after, edits);
+    assert_eq!(rig.opens, 3);
+    let notice = notices(&rig)[1].clone().unwrap_or_default();
+    assert!(
+        notice.starts_with("the gauge normal (15%) left the preset; showing survival at"),
+        "{notice}"
+    );
+    let page = &rig.practice_entries[1];
+    assert_eq!((page.gauge(), page.gauge_name()), (1, Some("survival")));
+}
+
 fn act() -> impl Strategy<Value = Act> {
     prop_oneof![
         6 => (0..3_usize).prop_map(Act::Choose),

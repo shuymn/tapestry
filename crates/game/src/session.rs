@@ -857,25 +857,23 @@ impl Loaded {
     }
 
     /// The gauge the practice page shows in place of `id`, which a fit
-    /// since its Start found gone: the gauge then at its place, followed
-    /// while that one went too; `None` for a gauge no fit lost, or a
-    /// preset left without gauges.
+    /// since its Start found gone: the gauge at its place when it went
+    /// last, followed while that one is gone too, up to one the play
+    /// preset has; `None` for a gauge no fit lost, or one whose
+    /// replacements all left the preset.
     #[must_use]
     pub fn replacement(&self, id: &str) -> Option<&str> {
         let mut id = id;
-        let mut shown = None;
         // Each step follows one loss, so the chain ends within them.
         for _ in 0..self.lost.len() {
-            match self.lost.iter().find(|(gone, _)| gone == id) {
-                Some((_, Some(next))) => {
-                    shown = Some(next.as_str());
-                    id = next;
-                }
-                Some((_, None)) => return None,
-                None => break,
+            let (_, next) = self.lost.iter().rev().find(|(gone, _)| gone == id)?;
+            let next = next.as_deref()?;
+            if self.preset.gauges.iter().any(|g| g.id == next) {
+                return Some(next);
             }
+            id = next;
         }
-        shown
+        None
     }
 
     /// The practice set up, if any.
