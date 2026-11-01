@@ -1163,11 +1163,7 @@ fn check_f9(_: &Header, i: Imported) {
 /// image, every required array well formed, explicit equal sizes, no
 /// image record and no file; `extra` more `size` entries past the eight.
 fn f11(root: &Path, extra: usize) {
-    use common::lanes::{NOTES, lane_rects};
-    let ids = |p: &str| {
-        let v: Vec<String> = (0..8).map(|i| format!("\"{p}{i}\"")).collect();
-        format!("[{}]", v.join(", "))
-    };
+    use common::lanes::{NOTES, indexed_ids as ids, lane_rects};
     let mut sizes = String::with_capacity(2 * extra + 64);
     sizes.push_str("20, 20, 20, 20, 20, 20, 20, 20");
     for _ in 0..extra {
@@ -1215,7 +1211,7 @@ fn f11_chart() -> bms_model::Chart {
     b.build().unwrap()
 }
 
-fn check_f11(_: &Header, i: Imported) {
+fn check_f11(i: Imported, chart: &bms_model::Chart) {
     let u = i.report.usage;
     assert_eq!(u.note_fallbacks, 48);
     assert_eq!((u.images, u.frames), (3, 3));
@@ -1235,19 +1231,14 @@ fn check_f11(_: &Header, i: Imported) {
         reserved_layers: 1,
     };
     let atlas = i.skin.atlas(skin_model::Variant::Lo, limits).unwrap();
-    let mut d = Drawn::over(i.skin, &f11_chart());
+    let mut d = Drawn::over(i.skin, chart);
     let q = d.frame(1_000, &[]);
     assert_eq!(q.len(), skin_model::LANE_QUADS as usize);
     assert!(d.batch.dropped() > 0);
-    let colour = |q: &skin_model::Quad| {
-        let side = atlas.side();
-        let at = |a: f32, b: f32| ((a + b) / 2.0 * side as f32) as u32;
-        let (x, y) = (at(q.uv[0], q.uv[2]), at(q.uv[1], q.uv[3]));
-        let level = atlas.pages()[usize::from(q.layer) - 1].level(0).unwrap();
-        let k = ((y * side + x) * 4) as usize;
-        <[u8; 4]>::try_from(&level[k..k + 4]).unwrap()
-    };
-    let seen: std::collections::BTreeSet<[u8; 4]> = q.iter().map(colour).collect();
+    let seen: std::collections::BTreeSet<[u8; 4]> = q
+        .iter()
+        .map(|q| common::play::quad_texel(&atlas, q))
+        .collect();
     let want = [[255, 0, 0, 255], [255, 255, 0, 255], [255, 255, 255, 255]];
     assert_eq!(seen.into_iter().collect::<Vec<_>>(), want);
 }
@@ -1543,11 +1534,12 @@ fn import_memory_is_measured() {
     ));
     drop(d);
     f10_refuses_past_its_caps();
+    let chart = f11_chart();
     let d = tempfile::tempdir().unwrap();
     f11(d.path(), 0);
     peaks.push((
         "F11 fallback parts",
-        measure_prepared(d.path(), &f11_chart(), check_f11),
+        measure_prepared(d.path(), &chart, |_, i| check_f11(i, &chart)),
     ));
     let small = import_peak(d.path());
     drop(d);
@@ -1559,7 +1551,7 @@ fn import_memory_is_measured() {
     f11(d.path(), extra);
     peaks.push((
         "F11 long size array",
-        measure_prepared(d.path(), &f11_chart(), |_, i| {
+        measure_prepared(d.path(), &chart, |_, i| {
             assert_eq!(i.report.usage.note_fallbacks, 48);
         }),
     ));
