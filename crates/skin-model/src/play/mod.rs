@@ -590,6 +590,45 @@ mod tests {
         assert!(!play.done(5, 99));
         assert!(!play.done(6, 70));
         assert!(!play.done(1, 0));
+
+        // A refused frame applies none of its effects: the hold its end
+        // would close stays.
+        let counted = PlayContext {
+            empty_poor_counted: true,
+            ..ctx
+        };
+        let mut play = skin.prepare(&chart, &counted).unwrap();
+        frame(&mut play, 1_000, &[ev(1_000, held(2, 0, Judgment::Great))]);
+        assert_eq!(play.hold_note(lane(2)), Some(0));
+        let inconsistent = Tally {
+            empty_poor: 1,
+            ..tally
+        };
+        let refused = SkinFrame {
+            now: TimeUs(1_250 * MS),
+            display_offset: TimeUs(0),
+            tally: &inconsistent,
+            gauges: &snapshot,
+            gauge: 0,
+            effects: &[ev(1_250, ended(2, 0))],
+            complete: false,
+            playing: true,
+            target: [1_920, 1_080],
+            layout: &layout,
+            lanes: LaneView {
+                visible_time: TimeUs(600 * MS),
+                cover: 0,
+                lift: 0,
+                hidden: 0,
+            },
+            loading: None,
+        };
+        assert_eq!(
+            skin.build(&mut play, &refused, &uvs, &mut batch),
+            Err(super::BuildError::InconsistentTally)
+        );
+        assert_eq!(play.hold_note(lane(2)), Some(0));
+        assert!(play.poisoned);
     }
 
     /// The loading state: the `loading` timer runs from the load's start
