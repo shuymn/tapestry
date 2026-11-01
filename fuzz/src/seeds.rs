@@ -1120,7 +1120,7 @@ fn lanes_body() -> String {
                      {{"id": "bar", "src": "grid", "y": 4, "w": 4, "h": 1}},
                      {{"id": "cv", "src": "grid", "x": 4, "w": 4, "h": 4}}],
             "note": {{"id": "notes", {lists}, "size": [20, 20, 20, 20, 20, 20, 20, 20], "dst": [{}],
-                     "group": [{{"id": "bar", "dst": [{{"x": 20, "y": 200, "w": 430, "h": 2}}]}}]}},
+                     {LANES_GROUP}}},
             "liftCover": [{{"id": "lc", "src": "grid", "x": 4, "y": 4, "w": 4, "h": 4, "disapearLine": 200}}],
             "hiddenCover": [{{"id": "hid", "src": "grid", "y": 4, "w": 4, "h": 4, "disapearLine": 200}}],
             "destination": [
