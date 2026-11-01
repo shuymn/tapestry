@@ -1,6 +1,6 @@
 //! Offsets: ids from both fields once each, values from the
 //! configuration in unscaled reference pixels, alpha folded only on fixed
-//! colour with one sign, run-time ids refused.
+//! colour with one sign, cover ids followed, other run-time ids refused.
 
 mod common;
 
@@ -8,7 +8,7 @@ use std::f32::consts::PI;
 
 use common::play::round;
 use common::{has, import_config};
-use skin_beatoraja::{Config, NoteKind, OffsetValue};
+use skin_beatoraja::{Config, DeviationId, LaneApprox, NoteKind, OffsetValue};
 
 /// Offsets 40 (axis flags all off) and 41 declared.
 const HEADER: &str = r#""offset": [
@@ -45,6 +45,10 @@ fn load(size: [u32; 2], dst: &str, edit: impl FnOnce(&mut Config)) -> common::Lo
 }
 
 const RECT: &str = r#""dst": [{"x": 100, "y": 100, "w": 20, "h": 20}]"#;
+
+fn motion() -> NoteKind {
+    NoteKind::Deviation(DeviationId::D9(LaneApprox::CoverMotion))
+}
 
 #[test]
 fn ids_apply_once_from_both_fields() {
@@ -118,8 +122,14 @@ fn alpha_folds_on_fixed_colour_with_one_sign() {
 
 #[test]
 fn runtime_and_unknown_offsets() {
-    // 4 is set by the play: unsupported.
-    let loaded = load([1_920, 1_080], &format!(r#""offset": 4, {RECT}"#), |_| {});
+    // 4 follows the cover, which is closed without lanes; its configured
+    // y is ignored, but any other configured component is refused.
+    let dst = format!(r#""offsets": [4, 4], {RECT}"#);
+    let loaded = load([1_920, 1_080], &dst, |c| set(c, 4, ov(0, 30, 0, 0)));
+    assert!(!has(loaded.report(), NoteKind::RuntimeOffset(4)));
+    assert!(has(loaded.report(), motion()));
+    assert_eq!(loaded.rects(0), [[100, 960, 20, 20]]);
+    let loaded = load([1_920, 1_080], &dst, |c| set(c, 4, ov(7, 0, 0, 0)));
     assert!(has(loaded.report(), NoteKind::RuntimeOffset(4)));
     // 10 belongs to the player's settings; an undeclared id is ignored.
     let dst = format!(r#""offsets": [10, 50], {RECT}"#);

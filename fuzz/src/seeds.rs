@@ -823,6 +823,7 @@ pub fn skin_imports() -> Vec<Seed> {
             ),
         ),
         ("lanes", play_skin(&lanes_body())),
+        ("followers", play_skin(&followers_body())),
         (
             "judge",
             play_skin(
@@ -862,7 +863,60 @@ pub fn skin_imports() -> Vec<Seed> {
                 "destination": [{"id": "gg", "dst": [{"x": 600, "y": 100, "w": 500, "h": 10}]}]"#,
             ),
         ),
+        (
+            "rates",
+            play_skin(
+                r#""image": [{"id": "g", "src": "grid", "w": 4, "h": 4}],
+                "imageset": [
+                    {"id": "kind", "images": ["g"], "ref": 40},
+                    {"id": "first", "images": ["g"], "value": 40},
+                    {"id": "byvalue", "images": ["g"], "value": 71, "ref": 40}],
+                "value": [
+                    {"id": "r102", "src": "strip", "w": 100, "h": 10, "divx": 10, "digit": 3, "ref": 102},
+                    {"id": "r103", "src": "strip", "w": 100, "h": 10, "divx": 10, "digit": 2, "padding": 1, "value": "score_rate_afterdot"},
+                    {"id": "r115", "src": "strip", "w": 100, "h": 10, "divx": 10, "digit": 3, "value": 115},
+                    {"id": "r116", "src": "strip", "w": 100, "h": 10, "divx": 10, "digit": 2, "padding": 1, "value": 40, "ref": 116},
+                    {"id": "r155", "src": "strip", "w": 100, "h": 10, "divx": 10, "digit": 3, "value": "score_rate2"},
+                    {"id": "r156", "src": "strip", "w": 100, "h": 10, "divx": 10, "digit": 2, "padding": 1, "ref": 156}],
+                "destination": [
+                    {"id": "r102", "op": [42], "dst": [{"x": 10, "y": 100, "w": 10, "h": 10}]},
+                    {"id": "r103", "op": [-42], "dst": [{"x": 10, "y": 120, "w": 10, "h": 10}]},
+                    {"id": "r115", "op": [43, 43], "dst": [{"x": 10, "y": 140, "w": 10, "h": 10}]},
+                    {"id": "r116", "draw": "!gauge_hard", "dst": [{"x": 10, "y": 160, "w": 10, "h": 10}]},
+                    {"id": "r155", "op": ["gauge_ex"], "dst": [{"x": 10, "y": 180, "w": 10, "h": 10}]},
+                    {"id": "r156", "op": [-1046], "dst": [{"x": 10, "y": 200, "w": 10, "h": 10}]},
+                    {"id": "kind", "dst": [{"x": 100, "y": 100, "w": 4, "h": 4}]},
+                    {"id": "first", "dst": [{"x": 100, "y": 120, "w": 4, "h": 4}]},
+                    {"id": "byvalue", "dst": [{"x": 100, "y": 140, "w": 4, "h": 4}]}]"#,
+            ),
+        ),
     ]
+}
+
+/// [`lanes_body`] with what follows the covers, each id repeated: an image
+/// beside the lanes following SUDDEN+, a number following LIFT, and a
+/// judge whose grade follows LIFT, its relative combo taking 3 and 4
+/// without motion of its own; HIDDEN+ keeps 3 and 5 as its own.
+fn followers_body() -> String {
+    lanes_body()
+        .replace(
+            r#"{"id": "cv", "src": "grid", "x": 4, "w": 4, "h": 4}],"#,
+            r#"{"id": "cv", "src": "grid", "x": 4, "w": 4, "h": 4},
+               {"id": "f", "src": "grid", "w": 4, "h": 4}],
+            "value": [
+                {"id": "num", "src": "strip", "w": 100, "h": 10, "divx": 10, "digit": 2, "ref": 71},
+                {"id": "ten", "src": "strip", "w": 100, "h": 10, "divx": 10, "digit": 4}],
+            "judge": [{"id": "j", "index": 0,
+                "images": [{"id": "f", "timer": 46, "offsets": [3, 3], "dst": [{"x": 600, "y": 500, "w": 80, "h": 20}]}],
+                "numbers": [{"id": "ten", "timer": 46, "offset": 3, "offsets": [4, 3, 4], "dst": [{"x": 10, "y": 0, "w": 10, "h": 20}]}]}],"#,
+        )
+        .replace(
+            r#"{"id": "hid", "dst""#,
+            r#"{"id": "f", "offsets": [4, 4], "dst": [{"x": 500, "y": 300, "w": 4, "h": 4}]},
+                {"id": "num", "offset": 3, "offsets": [3], "dst": [{"x": 500, "y": 400, "w": 10, "h": 10}]},
+                {"id": "j", "dst": [{"w": 0, "h": 0}]},
+                {"id": "hid", "offsets": [3, 5, 3], "dst""#,
+        )
 }
 
 /// Lanes of `grid` parts over x 20..450, y 200..800, with a bar line,

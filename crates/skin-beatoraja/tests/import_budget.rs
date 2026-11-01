@@ -447,8 +447,8 @@ fn a_key_overflow_wins_over_a_malformed_key() {
 
 #[test]
 fn offset_four_images_charge_their_keys() {
-    // An image listing offset 4 clear of the lanes is dropped, its key
-    // charged; SUDDEN+ charges its key once.
+    // An image listing offset 4 clear of the lanes follows SUDDEN+ and
+    // SUDDEN+ is mapped; each charges its key once.
     let deco = r#"{"id": "deco", "offset": 4, "dst": [{"x": 600, "w": 10, "h": 10}]}"#;
     for last in [deco.to_owned(), common::lanes::cover("")] {
         let with = |n: usize| {

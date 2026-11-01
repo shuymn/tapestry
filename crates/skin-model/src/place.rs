@@ -18,7 +18,7 @@ use bms_model::{LANE_COUNT, Lane};
 
 use crate::canvas::{Canvas, Fit, f32_of};
 use crate::layout::{Adjust, Anchor, Controls, Layout, Region, RegionDef};
-use crate::widget::lanes::{Geometry, Lanes, Side};
+use crate::widget::lanes::{Geometry, LaneFrameGeometry, Lanes, Side};
 
 /// The overlap with the canvas a region's box keeps on each axis, in
 /// reference pixels (all of a smaller box).
@@ -37,18 +37,70 @@ pub struct Place {
     /// A size in target pixels each image quad of the element keeps; text
     /// and the lanes ignore it.
     pub native: Option<Native>,
+    /// The covers the element moves with; only an image, a number, a
+    /// gauge or a text may follow them.
+    pub follow: Follow,
 }
 
 impl Place {
     /// In `screen`, pivot at the top left, unbound, no fill, no native
-    /// size.
+    /// size, following nothing.
     pub const SCREEN: Self = Self {
         region: Region::Screen,
         pivot: Anchor::TopLeft,
         bind: Bind::None,
         fill: Fill::None,
         native: None,
+        follow: Follow::None,
     };
+}
+
+/// The covers an element or a judge's grade moves with, vertically and
+/// in the frame's own geometry: up by the lift's raise, down by the lane
+/// cover's travel, or by both.
+///
+/// The motion is a translation of the sampled rect, in reference pixels,
+/// after the track and before the lane binding and the region's
+/// transform, so it scales with the region and moves the pivot along;
+/// it changes no key, clock, clip or region placement. Without lanes it
+/// is zero.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Follow {
+    #[default]
+    None,
+    /// Up by the lift's raise.
+    Lift,
+    /// Down by the lane cover's travel.
+    Cover,
+    /// By both: the cover's travel less the lift's raise.
+    LiftAndCover,
+}
+
+impl Follow {
+    /// The vertical displacement in reference pixels, y down, for the
+    /// frame's geometry `g`.
+    pub(crate) fn dy(self, g: Option<&LaneFrameGeometry>) -> f64 {
+        let Some(g) = g else {
+            return 0.0;
+        };
+        match self {
+            Self::None => 0.0,
+            Self::Lift => -g.lift_px,
+            Self::Cover => g.cover_px,
+            Self::LiftAndCover => g.cover_px - g.lift_px,
+        }
+    }
+
+    /// `[x, y, w, h]` moved by [`dy`](Self::dy): x, w and h kept, y summed
+    /// in `f64`.
+    pub(crate) fn translate(self, rect: [f32; 4], g: Option<&LaneFrameGeometry>) -> [f32; 4] {
+        if self == Self::None {
+            return rect;
+        }
+        let [x, y, w, h] = rect;
+        [x, f32_of(f64::from(y) + self.dy(g)), w, h]
+    }
 }
 
 /// A quad size kept in target pixels whatever the canvas's scale, centred

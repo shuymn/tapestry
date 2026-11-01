@@ -33,15 +33,55 @@ fn an_image_set_draws_its_image_whatever_its_len() {
     assert_eq!(l.report().usage.images, 1);
     assert_eq!(l.ok().skin.sheet().frame_count(), 2);
     assert_eq!(l.quads(0).len(), 1);
-    // A frame expression is S6c's.
-    let l = body(r#", "ref": 1"#, &format!(r#"{{"id": "s", {KEY}}}"#));
-    assert!(has(
-        l.report(),
-        NoteKind::UnsupportedProperty {
-            kind: PropertyKind::Integer,
-            id: None
-        }
+}
+
+/// The frame an image set chooses: its `value` as a value property when
+/// it resolves, else its `ref` as an image-index property; ref 40, the
+/// shown gauge's type, waits for the image selection (S6c-04).
+#[test]
+fn an_image_set_chooses_by_value_then_by_ref() {
+    let dropped = |set: &str| {
+        let l = body(set, &format!(r#"{{"id": "s", {KEY}}}"#));
+        assert_eq!(l.report().usage.images, 0, "{set}");
+        common::kinds(l.report())
+    };
+    let prop = |kind, id| NoteKind::UnsupportedProperty { kind, id };
+    let selection = NoteKind::UnsupportedField {
+        field: "image selection",
+    };
+    assert_eq!(
+        dropped(r#", "ref": 1"#),
+        [prop(PropertyKind::ImageIndex, Some(1))]
+    );
+    assert_eq!(dropped(r#", "ref": 40"#), [selection]);
+    // Value 40 is no value property: the `ref` chooses.
+    assert_eq!(dropped(r#", "value": 40, "ref": 40"#), [selection]);
+    // A known value, or a script, wins over ref 40.
+    assert_eq!(
+        dropped(r#", "value": 71, "ref": 40"#),
+        [prop(PropertyKind::Integer, Some(71))]
+    );
+    assert_eq!(
+        dropped(r#", "value": 150, "ref": 40"#),
+        [prop(PropertyKind::Integer, Some(150))]
+    );
+    assert_eq!(
+        dropped(r#", "value": "myscript", "ref": 40"#),
+        [prop(PropertyKind::Integer, None)]
+    );
+    // A value resolving to nothing over no `ref` chooses nothing: the
+    // first image is drawn.
+    let l = body(r#", "value": 40"#, &format!(r#"{{"id": "s", {KEY}}}"#));
+    assert!(l.report().notes.is_empty(), "{:?}", l.report().notes);
+    assert_eq!(l.quads(0).len(), 1);
+    // A selector group chooses by its `ref` too; a plain image ignores it.
+    let l = import_body(&format!(
+        r#""image": [{{"id": "g", "src": "a", "w": 64, "h": 64, "divx": 2, "len": 2, "ref": 40}},
+                     {{"id": "p", "src": "a", "w": 64, "h": 64, "ref": 40}}],
+           "destination": [{{"id": "g", {KEY}}}, {{"id": "p", {KEY}}}]"#
     ));
+    assert_eq!(common::kinds(l.report()), [selection]);
+    assert_eq!(l.quads(0).len(), 1);
 }
 
 /// An image with `src` fields over the 64×64 `a.png`, drawn with `dst`

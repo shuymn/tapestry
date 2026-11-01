@@ -7,16 +7,19 @@
 //! runs its own track on its own timer, with its own pivot, blend and
 //! visibility. The combo is the snapshot's `combo` and shows only above
 //! 0. With `shift`, the grade moves left by half the combo's drawn width.
+//! A grade may follow the covers ([`Follow`]): it moves before the combo
+//! attaches to it, so both move once.
 //! The element's own track gives color and alpha, multiplied into every
 //! part's.
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
 use super::digits::{Digits, DigitsDef, NumberError};
+use super::lanes::LaneFrameGeometry;
 use super::{Brush, Frame, ImageRef, tint};
 use crate::expr::{Program, State};
 use crate::layout::Anchor;
-use crate::place::{Affine, Bounds, LaneMap, Native, union};
+use crate::place::{Affine, Bounds, Follow, LaneMap, Native, union};
 use crate::play::schema::{Grade, field, timer};
 use crate::quad::{Blend, ClipId, QuadBatch, RunKey};
 use crate::skin::{MAX_COORD, TimerRef, radians};
@@ -89,6 +92,9 @@ pub struct GradePart {
     pub visible: Option<Program>,
     /// The size its quad keeps at the canvas's scale, if any.
     pub native: Option<Native>,
+    /// The covers it moves with ([`Follow`]); its combo, attached to its
+    /// moved rect, moves with it.
+    pub follow: Follow,
 }
 
 /// A slot's combo strip.
@@ -268,6 +274,7 @@ pub(crate) struct GradeImage {
     pub(crate) blend: Blend,
     pub(crate) visible: Option<Program>,
     pub(crate) native: Option<Native>,
+    pub(crate) follow: Follow,
 }
 
 /// A combo as a build reads it.
@@ -297,6 +304,9 @@ pub(crate) struct JudgeDraw<'a> {
     pub(crate) state: &'a State<'a>,
     pub(crate) affine: Affine,
     pub(crate) map: LaneMap,
+    /// The frame's lane geometry, which a grade follows; `None` without
+    /// lanes.
+    pub(crate) lanes: Option<&'a LaneFrameGeometry>,
     /// The element's color and clip.
     pub(crate) color: [f32; 4],
     pub(crate) clip: Option<ClipId>,
@@ -333,7 +343,9 @@ impl Judge {
         let Some(gs) = sample(d, &g.track, g.slot, g.visible.as_ref()) else {
             return;
         };
-        let [gx, gy, gw, gh] = gs.rect;
+        // The grade moves before the combo attaches to it, so both move
+        // once.
+        let [gx, gy, gw, gh] = g.follow.translate(gs.rect, d.lanes);
         let combo = d
             .state
             .fields

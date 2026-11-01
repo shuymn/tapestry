@@ -6,9 +6,9 @@ use skin_model::{Align, DigitsDef, GlyphSet, MAX_COORD, NumberDef, Pad, Source, 
 use super::super::geom::{HEIGHT, Q, Rect};
 use super::super::policy::{CriticalPart, Role};
 use super::super::property::{self, IntProp, Value};
-use super::super::report::{DeviationId, NoteKind, PropertyKind, Severity};
+use super::super::report::{NoteKind, PropertyKind};
 use super::super::track::{self, Stretch};
-use super::super::{Cx, Dst, Prop};
+use super::super::{Cx, Dst, Opts, Prop};
 use crate::error::ImportError;
 
 /// The most cells the model draws.
@@ -65,13 +65,8 @@ pub(super) fn cell_space(keys: &[(Q, Rect, Q)], sr: Q) -> Option<i128> {
 impl Cx<'_> {
     /// The effective integer property (`JsonSkinObjectLoader.java:
     /// 104-160`): `value` when it resolves, else `ref`.
-    fn int_prop(&mut self, value: Prop, r: i32) -> IntProp {
-        let resolved = match value {
-            Prop::Id(n) => property::int_by_id(n),
-            Prop::Name(s) => property::int_by_name(&s).unwrap_or(IntProp::Unsupported(None)),
-            Prop::Null => IntProp::Null,
-        };
-        match resolved {
+    fn int_prop(&mut self, value: &Prop, r: i32) -> IntProp {
+        match property::value_prop(value) {
             IntProp::Null => property::int_by_id(r),
             p => p,
         }
@@ -114,7 +109,7 @@ impl Cx<'_> {
         );
         let value = self.prop(value, "value")?;
         let r = self.int_or(r, "ref", 0)?;
-        let shown = match self.int_prop(value, r) {
+        let shown = match self.int_prop(&value, r) {
             IntProp::Null => {
                 self.ignored(at, NoteKind::Ignored { field: "value" });
                 return Ok(());
@@ -203,7 +198,11 @@ impl Cx<'_> {
             self.drop_el(role, at, NoteKind::Stretch(dst.stretch))?;
             return Ok(());
         }
-        let Some(c) = self.common(role, &dst, false)? else {
+        let o = Opts {
+            follow: true,
+            ..Opts::default()
+        };
+        let Some(mut c) = self.common_with(role, &dst, o)? else {
             return Ok(());
         };
         let program = self.compile(shown.expr(), Ty::Int, at)?;
@@ -276,13 +275,8 @@ impl Cx<'_> {
         self.budget
             .widget_quads(quads)
             .map_err(|l| self.limit(at, l))?;
-        if shown.deviates() {
-            self.note(
-                Some(at),
-                Severity::Deviation,
-                NoteKind::Deviation(DeviationId::D4),
-            );
-        }
+        // One D4 note for the value and the conditions.
+        c.display_deviation |= shown.deviates();
         let index = u32::try_from(self.widgets.numbers.len()).unwrap_or(u32::MAX);
         self.widgets.numbers.push(NumberDef {
             digits: DigitsDef {
@@ -295,7 +289,7 @@ impl Cx<'_> {
             },
             value: program,
         });
-        self.push_native(c, Source::Number(index), t, native);
+        self.push_native(c, Source::Number(index), t, native)?;
         Ok(())
     }
 }

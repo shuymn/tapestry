@@ -261,6 +261,16 @@ pub(crate) enum Value {
     /// A judgment count: `count.perfect`..`count.poor`, then
     /// `count.empty_poor`.
     Count(u8),
+    /// The rate over the targets judged so far, whole percent and
+    /// hundredths (D4): the source's `getNowRate*`
+    /// (`IntegerPropertyFactory.java:176-180`).
+    CurrentRatePercent,
+    CurrentRateFraction,
+    /// The rate over the attempt's targets, whole percent and hundredths
+    /// (D4): the source's `getRate*`
+    /// (`IntegerPropertyFactory.java:187-188, 200-201, 690-699`).
+    WholeRatePercent,
+    WholeRateFraction,
 }
 
 impl Value {
@@ -278,12 +288,24 @@ impl Value {
             Self::Count(3) => "count.bad",
             Self::Count(4) => "count.poor",
             Self::Count(_) => "count.empty_poor",
+            Self::CurrentRatePercent => "rate.current_bp / 100",
+            Self::CurrentRateFraction => "rate.current_bp % 100",
+            Self::WholeRatePercent => "rate.whole_bp / 100",
+            Self::WholeRateFraction => "rate.whole_bp % 100",
         }
     }
 
     /// Whether the value differs from the source in an owner-decided way.
     pub(crate) fn deviates(self) -> bool {
-        matches!(self, Self::Notes | Self::GaugeTenths)
+        matches!(
+            self,
+            Self::Notes
+                | Self::GaugeTenths
+                | Self::CurrentRatePercent
+                | Self::CurrentRateFraction
+                | Self::WholeRatePercent
+                | Self::WholeRateFraction
+        )
     }
 
     /// The play-critical values (owner decision 5).
@@ -303,6 +325,17 @@ pub(crate) enum IntProp {
     Unsupported(Option<i32>),
 }
 
+/// A `value` field as the value-property factory resolves it
+/// (`JsonSkinSerializer.java:103-104`): an id or a name; a name the
+/// factory does not know is a script, which the model does not run.
+pub(crate) fn value_prop(value: &super::Prop) -> IntProp {
+    match value {
+        super::Prop::Id(n) => int_by_id(*n),
+        super::Prop::Name(s) => int_by_name(s).unwrap_or(IntProp::Unsupported(None)),
+        super::Prop::Null => IntProp::Null,
+    }
+}
+
 /// The model value of known integer property `id`.
 fn shown(id: i32) -> Option<Value> {
     Some(match id {
@@ -311,6 +344,10 @@ fn shown(id: i32) -> Option<Value> {
         74 | 106 => Value::Notes,
         107 => Value::GaugePercent,
         407 => Value::GaugeTenths,
+        102 => Value::CurrentRatePercent,
+        103 => Value::CurrentRateFraction,
+        115 | 155 => Value::WholeRatePercent,
+        116 | 156 => Value::WholeRateFraction,
         110..=114 => Value::Count(u8::try_from(id - 110).ok()?),
         420 => Value::Count(5),
         _ => return None,
@@ -356,6 +393,28 @@ pub(crate) fn int_by_name(name: &str) -> Option<IntProp> {
                 .any(|c| name == format!("ir_player_{c}{suffix}"))
         });
     pattern.then_some(IntProp::Unsupported(None))
+}
+
+/// An image-index property (`getImageIndexProperty(int)`,
+/// `IntegerPropertyFactory.java:920-961`), the namespace of an image
+/// group's `ref` and an image set's `ref`: apart from the value
+/// properties, where 40 resolves to nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum IndexProp {
+    /// `gaugetype_1p` (40, `IntegerPropertyFactory.java:1128-1135`): the
+    /// shown gauge's type, 0-5 in ordinary play, read from `gauge.kind`
+    /// while `gauge.valid`.
+    GaugeKind,
+    /// Any other id: the model reads none.
+    Unsupported(i32),
+}
+
+/// The image-index property `id`.
+pub(crate) fn index_by_id(id: i32) -> IndexProp {
+    match id {
+        40 => IndexProp::GaugeKind,
+        _ => IndexProp::Unsupported(id),
+    }
 }
 
 /// A string property as the factory resolves it.
@@ -424,6 +483,23 @@ mod tests {
         assert_eq!(int_by_id(9_999), IntProp::Null);
         assert_eq!(int_by_id(0), IntProp::Null);
         assert_eq!(int_by_id(150), IntProp::Unsupported(Some(150)));
+        for (id, name, value) in [
+            (102, "score_rate", Value::CurrentRatePercent),
+            (103, "score_rate_afterdot", Value::CurrentRateFraction),
+            (115, "total_rate", Value::WholeRatePercent),
+            (116, "total_rate_afterdot", Value::WholeRateFraction),
+            (155, "score_rate2", Value::WholeRatePercent),
+            (156, "score_rate_afterdot2", Value::WholeRateFraction),
+        ] {
+            assert_eq!(int_by_id(id), IntProp::Shown(value), "{id}");
+            assert_eq!(int_by_name(name), Some(IntProp::Shown(value)), "{name}");
+            assert!(value.deviates() && !value.critical());
+        }
+        // 40 is no value property; as an image index it is the gauge type.
+        assert_eq!(int_by_id(40), IntProp::Null);
+        assert_eq!(int_by_name("gaugetype_1p"), None);
+        assert_eq!(index_by_id(40), IndexProp::GaugeKind);
+        assert_eq!(index_by_id(42), IndexProp::Unsupported(42));
         assert_eq!(
             int_by_name("maxcombo2"),
             Some(IntProp::Shown(Value::MaxCombo))

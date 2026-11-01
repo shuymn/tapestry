@@ -11,7 +11,7 @@ use super::super::geom::{Q, coords};
 use super::super::policy::Role;
 use super::super::property::{self, StrProp};
 use super::super::report::{DeviationId, NoteKind, PropertyKind, Severity, Span};
-use super::super::{Cx, Dst, Prop};
+use super::super::{Cx, Dst, Opts, Prop};
 use crate::error::ImportError;
 use crate::tree::{Kind, Scalar};
 
@@ -199,7 +199,12 @@ impl Cx<'_> {
         let [path] = self.def.fields(font_rec, ["path"]);
         let path = self.opt_string(path, "path")?.unwrap_or_default();
 
-        let Some(mut c) = self.common(role, &dst, true)? else {
+        let o = Opts {
+            text: true,
+            follow: true,
+            ..Opts::default()
+        };
+        let Some(mut c) = self.common_with(role, &dst, o)? else {
             return Ok(());
         };
         if dst.stretch > 0 {
@@ -297,7 +302,7 @@ impl Cx<'_> {
         });
         // D5: text always blends normally.
         c.blend = skin_model::Blend::Alpha;
-        self.push(c, Source::Text(index), t);
+        self.push(c, Source::Text(index), t)?;
         Ok(())
     }
 

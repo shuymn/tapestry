@@ -278,8 +278,10 @@ fn skin_json_seeds_resolve_or_fail_as_built() {
             "offsets",
             "choices_default",
             "lanes",
+            "followers",
             "judge",
             "gauge",
+            "rates",
         ],
     );
     let imports: Vec<&str> = seeds::skin_imports().iter().map(|(n, _)| *n).collect();
@@ -417,8 +419,12 @@ fn skin_import_seeds_import_and_draw_as_built() {
                 assert_eq!(drawn, [2, 2, 2, 2], "{name}");
             }
             "offsets" => {
-                assert_eq!(kinds(&i), [NoteKind::RuntimeOffset(4)], "{name}");
-                assert_eq!(drawn, [1, 1, 1, 1], "{name}");
+                // Offset 4 follows SUDDEN+, at rest without lanes.
+                let motion = NoteKind::Deviation(skin_beatoraja::DeviationId::D9(
+                    skin_beatoraja::LaneApprox::CoverMotion,
+                ));
+                assert_eq!(kinds(&i), [motion], "{name}");
+                assert_eq!(drawn, [2, 2, 2, 2], "{name}");
             }
             "choices_default" => {
                 assert_eq!(i.report.files.len(), 1, "{name}");
@@ -447,6 +453,26 @@ fn skin_import_seeds_import_and_draw_as_built() {
                 // every frame; LIFT at 0 is not drawn.
                 assert_eq!(drawn, [1, 1, 12, 1], "{name}");
             }
+            "followers" => {
+                use skin_beatoraja::{DeviationId, LaneApprox};
+                // The image, the number and the grade follow, each noted
+                // once; the combo and HIDDEN+ take their offsets silently.
+                let motion = NoteKind::Deviation(DeviationId::D9(LaneApprox::CoverMotion));
+                let k = kinds(&i);
+                assert_eq!(
+                    k.iter().filter(|&&n| n == motion).count(),
+                    3,
+                    "{name}: {k:?}"
+                );
+                assert!(
+                    !k.iter().any(|n| matches!(n, NoteKind::RuntimeOffset(_))),
+                    "{name}: {k:?}"
+                );
+                assert_eq!(u.elements, 7, "{name}");
+                // The lanes' frames, then the image, the number's two
+                // digits, the grade and its combo of 1.
+                assert_eq!(drawn, [1 + 5, 1 + 5, 12 + 5, 1 + 5], "{name}");
+            }
             "judge" => {
                 // Seven grades, combos of slots 0, 1, 2 and 6 (slots 3-5
                 // noted): the widest state is a grade and 4 cells.
@@ -462,6 +488,32 @@ fn skin_import_seeds_import_and_draw_as_built() {
                     [NoteKind::Deviation(skin_beatoraja::DeviationId::D10)]
                 );
                 assert_eq!(drawn, [51, 51, 51, 51], "{name}");
+            }
+            "rates" => {
+                use skin_beatoraja::{DeviationId, PropertyKind};
+                // Each rate number once D4, its conditions with it; the
+                // gauge-type set waits for the image selection, the one
+                // choosing by value is unsupported, the one whose value
+                // resolves to nothing draws its first image.
+                let mut k = kinds(&i);
+                k.sort_by_key(|n| format!("{n:?}"));
+                let mut want = vec![NoteKind::Deviation(DeviationId::D4); 6];
+                want.push(NoteKind::UnsupportedField {
+                    field: "image selection",
+                });
+                want.push(NoteKind::UnsupportedProperty {
+                    kind: PropertyKind::Integer,
+                    id: Some(71),
+                });
+                want.sort_by_key(|n| format!("{n:?}"));
+                assert_eq!(k, want, "{name}");
+                // Every object is charged, the dropped image sets too.
+                assert_eq!(u.elements, 9, "{name}");
+                // A normal gauge: the groove, not-hard and not-ex numbers
+                // draw. EX 150 over one judged of 100 targets: 750 000 bp
+                // now, its whole percent past 3 cells; 75.00 overall,
+                // "00" twice; and the first image.
+                assert_eq!(drawn, [3 + 2 + 2 + 1; 4], "{name}");
             }
             _ => panic!("no expectation for seed {name}"),
         }

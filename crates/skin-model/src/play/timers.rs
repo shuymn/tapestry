@@ -5,11 +5,15 @@
 #![deny(clippy::float_arithmetic, clippy::float_cmp)]
 
 use bms_model::{BEAT, DOMAIN, Lane, TimeUs};
+use eval::Tally;
 use rules::GaugeValue;
 
-use super::schema::{GAUGE_PERMILLE, Grade, LaneTimer, MAX_COUNT, lane_timer, timer};
-use super::{Play, SkinFrame};
+use super::schema::{
+    GAUGE_PERMILLE, Grade, LaneTimer, MAX_COUNT, RATE_BASIS_POINTS, lane_timer, timer,
+};
+use super::{BuildError, Play, SkinFrame};
 use crate::expr::{Program, State, TIMER_OFF};
+use crate::widget::gauge::GaugeLook;
 
 /// How long past the notes' end the play keeps playing before it
 /// finishes, in ms (`play/BMSPlayer.java:66`).
@@ -21,6 +25,41 @@ const GAUGE_UNIT: i64 = GaugeValue::FULL.0 / GAUGE_PERMILLE as i64;
 /// A count as a field value, clamped to the field's range.
 fn count(v: u32) -> i32 {
     i32::try_from(v).map_or(MAX_COUNT, |v| v.min(MAX_COUNT))
+}
+
+/// The targets `tally` has judged: its five grades, less the empty POORs
+/// counted among its POORs when `empty_poor_counted` (the evaluator then
+/// adds each to both counts, `eval/src/evaluator.rs:1179-1183`). `None`
+/// when it counts more empty POORs than POORs.
+fn judged_targets(tally: &Tally, empty_poor_counted: bool) -> Option<u64> {
+    let c = &tally.counts;
+    let poor = if empty_poor_counted {
+        c.poor.checked_sub(tally.empty_poor)?
+    } else {
+        c.poor
+    };
+    // Five u32 sum to at most 5 · (2^32 − 1), well inside u64.
+    Some(
+        u64::from(c.perfect)
+            + u64::from(c.great)
+            + u64::from(c.good)
+            + u64::from(c.bad)
+            + u64::from(poor),
+    )
+}
+
+/// The score rate of `ex` over `targets`, in basis points:
+/// `⌊10 000 · ex / (2 · targets)⌋`, 10 000 with no target. Not capped at
+/// 100 %: a custom EX weighting may pass it; only the field's `i32` range
+/// bounds it. `10 000 · ex` is below 2^46 and `2 · targets` below 2^36, so
+/// neither overflows `u64`.
+fn rate_bp(ex: u32, targets: u64) -> i32 {
+    let bp = u64::from(RATE_BASIS_POINTS.unsigned_abs());
+    let Some(den) = targets.checked_mul(2).filter(|&d| d > 0) else {
+        return RATE_BASIS_POINTS;
+    };
+    let rate = bp.saturating_mul(u64::from(ex)) / den;
+    i32::try_from(rate).unwrap_or(i32::MAX)
 }
 
 /// A timer's reading at `now`: elapsed ms since `start`, at least 0 (an
@@ -38,14 +77,38 @@ pub(crate) fn elapsed_us(now: TimeUs, start: TimeUs) -> i64 {
 }
 
 impl Play {
+    /// Refuses a poisoned play: one a build refused, until a fresh
+    /// prepare.
+    pub(crate) fn check(&self) -> Result<(), BuildError> {
+        if self.poisoned {
+            Err(BuildError::InconsistentTally)
+        } else {
+            Ok(())
+        }
+    }
+
     /// Fills this frame's fields and timers: effects through the reducer,
     /// the snapshot into the fields, the built-in starts, then each `when`
     /// timer from its condition over the built-in timers only.
-    pub(crate) fn fill(&mut self, frame: &SkinFrame<'_>, whens: &[Program]) {
+    ///
+    /// A poisoned play ([`Play::check`]), or a snapshot with more counted
+    /// empty POORs than POORs, is refused before any effect is applied:
+    /// everything stays as it was, and the play is poisoned until a fresh
+    /// prepare.
+    pub(crate) fn fill(
+        &mut self,
+        frame: &SkinFrame<'_>,
+        whens: &[Program],
+    ) -> Result<(), BuildError> {
+        self.check()?;
+        let Some(judged) = judged_targets(frame.tally, self.empty_poor_counted) else {
+            self.poisoned = true;
+            return Err(BuildError::InconsistentTally);
+        };
         for ev in frame.effects {
             self.reducer.apply(ev);
         }
-        self.fill_fields(frame);
+        self.fill_fields(frame, judged);
         self.fill_builtin(frame);
         let now = frame.now;
         let builtin = usize::from(timer::BUILTIN);
@@ -56,7 +119,7 @@ impl Play {
             self.ms.split_at_mut_checked(builtin),
             self.starts.get_mut(builtin..),
         ) else {
-            return;
+            return Ok(());
         };
         let state = State {
             fields: &self.fields,
@@ -74,15 +137,27 @@ impl Play {
             }
             *ms = reading(now, *start);
         }
+        Ok(())
     }
 
-    /// The fields, in slot order (`field::*`), from the snapshot alone.
-    fn fill_fields(&mut self, frame: &SkinFrame<'_>) {
+    /// The fields, in slot order (`field::*`): the snapshot's, `judged`
+    /// its judged targets ([`judged_targets`]); the whole-attempt rate
+    /// over the prepared target count, and the gauge kind from the shown
+    /// gauge's descriptor.
+    fn fill_fields(&mut self, frame: &SkinFrame<'_>, judged: u64) {
         let t = frame.tally;
         let gauge = frame.gauges.get(frame.gauge).map_or(0, |g| {
             let permille = (g.value.0 / GAUGE_UNIT).clamp(0, i64::from(GAUGE_PERMILLE));
             i32::try_from(permille).unwrap_or(0)
         });
+        // The shown gauge's look, while it has a descriptor and a snapshot
+        // (the gauge widget's rule); `normal` otherwise.
+        let kind = frame
+            .gauges
+            .get(frame.gauge)
+            .and(self.gauge_desc(frame.gauge))
+            .map(|d| d.look);
+        let targets = u64::from(self.reducer.targets());
         self.fields = [
             count(t.combo),
             count(t.max_combo),
@@ -97,6 +172,10 @@ impl Play {
             count(self.reducer.targets()),
             gauge,
             frame.loading.map_or(100, |l| l.percent.clamp(0, 100)),
+            rate_bp(t.ex_score, judged),
+            rate_bp(t.ex_score, targets),
+            kind.unwrap_or(GaugeLook::Normal).schema_value(),
+            i32::from(kind.is_some()),
         ];
     }
 

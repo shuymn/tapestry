@@ -255,6 +255,20 @@ impl LanesDef {
             )
     }
 
+    /// The lane's length `H`, rounded up to a whole reference pixel: the
+    /// farthest a follower moves either way. For checked lanes it is at
+    /// most 2^22.
+    pub(crate) fn reach(&self) -> i64 {
+        match self.style {
+            LaneStyle::Simple => i64::from(self.line) - i64::from(self.top),
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "a checked source height is positive and at most 2^21"
+            )]
+            LaneStyle::Source(s) => f64::from(s.height).ceil() as i64,
+        }
+    }
+
     /// Checks the geometry: every width at least 1, every lane within
     /// ±[`MAX_COORD`], `top < line ≤ bottom` within it, heights of at
     /// least 1, the covers' extents and the hidden cover's trim line within
@@ -510,6 +524,8 @@ pub(crate) struct Draw<'a> {
     /// The display clock, which positions follow.
     pub(crate) display: TimeUs,
     pub(crate) view: LaneView,
+    /// The frame's geometry, computed once for every element.
+    pub(crate) frame: &'a LaneFrameGeometry,
     /// Whether evaluation is complete: a section attempt rings out
     /// without notes.
     pub(crate) complete: bool,
@@ -651,17 +667,29 @@ impl Pen<'_, '_> {
     }
 }
 
-/// The covers' geometry for one frame, in reference pixels.
-struct Covers {
-    /// How far the lift raises the line, and the raised line.
-    lift_px: f64,
-    line_y: f64,
+/// The lanes' logical geometry for one frame, in reference pixels, y
+/// down: computed once per build from the frame's [`LaneView`], before
+/// any element draws, and read by the lanes and by every element that
+/// follows the covers ([`Follow`](crate::Follow)). It depends on the
+/// amounts only, never on which parts exist or are drawn.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct LaneFrameGeometry {
+    /// How far the lift raises the line.
+    pub(crate) lift_px: f64,
     /// How far the cover's lower edge moves down from its anchor.
-    cover_px: f64,
+    pub(crate) cover_px: f64,
     /// How far the hidden cover rises by its own share, above the lift.
-    hidden_px: f64,
+    pub(crate) hidden_px: f64,
+    /// The raised judgment line.
+    pub(crate) line_y: f64,
     /// The scroll's length: from the uncovered top to the line.
-    span: f64,
+    pub(crate) span: f64,
+    /// The lanes' top and bottom, where notes and covers are cut.
+    pub(crate) top: f64,
+    pub(crate) bottom: f64,
+    /// The hidden cover's trim line this frame; `None` cuts it at the
+    /// bottom only.
+    pub(crate) hidden_trim: Option<f64>,
 }
 
 impl Lanes {
@@ -672,7 +700,7 @@ impl Lanes {
         let Some(notes) = d.play.notes() else {
             return;
         };
-        let g = self.covers(d.view);
+        let g = d.frame;
         let scale = Scale::new(
             d.play.scroll(),
             d.display,
@@ -681,13 +709,7 @@ impl Lanes {
             g.line_y,
         );
         // Coordinates within ±2^20 are exact in `f32`.
-        #[expect(clippy::cast_precision_loss, reason = "within ±2^20")]
-        let top = self.top as f32;
-        #[expect(clippy::cast_precision_loss, reason = "within ±2^20")]
-        let bottom = match self.style {
-            LaneStyle::Simple => self.bottom as f32,
-            LaneStyle::Source(s) => s.bottom,
-        };
+        let (top, bottom) = (f32_of(g.top), f32_of(g.bottom));
         let [sx, sw] = d.geometry.span.map(f32_of);
         let mut pen = Pen {
             d,
@@ -712,11 +734,7 @@ impl Lanes {
             && let Some(part) = self.parts.hidden.map(|p| d.shown(&p))
         {
             let upper = f32_of(f64::from(self.hidden_at) - g.lift_px - g.hidden_px);
-            let trim = match self.hidden_trim {
-                HiddenTrim::None => bottom,
-                HiddenTrim::Fixed(y) => y.min(bottom),
-                HiddenTrim::Lift(y) => f32_of(f64::from(y) - g.lift_px).min(bottom),
-            };
+            let trim = g.hidden_trim.map_or(bottom, |y| f32_of(y).min(bottom));
             if let Some(c) = cut(sx, sw, upper, upper + self.hidden_h, top, trim) {
                 pen.push(part, &c);
             }
@@ -776,33 +794,48 @@ impl Lanes {
         }
     }
 
-    /// The covers' geometry for `view`, each at most 1 000 ‰: the lift
-    /// takes its share of the lane, the cover its share of what the lift
-    /// leaves, and the notes scroll over what both leave, which may be
-    /// nothing (`play/LaneRenderer.java:198-213, 322-333`); the hidden
+    /// The frame's geometry for `view`, each amount at most 1 000 ‰: the
+    /// lift takes its share of the lane, the cover its share of what the
+    /// lift leaves, and the notes scroll over what both leave, which may
+    /// be nothing (`play/LaneRenderer.java:198-213, 322-333`); the hidden
     /// cover takes its share of what the lift leaves, over the notes
-    /// (`:335-345`). The source
-    /// style's lane is its region's height, the simple style's the length
-    /// from the top to the line.
-    fn covers(&self, view: LaneView) -> Covers {
+    /// (`:335-345`). The source style's lane is its region's height, the
+    /// simple style's the length from the top to the line. Edges keep
+    /// their fractions; only drawing converts them to `f32`.
+    pub(crate) fn frame_geometry(&self, view: LaneView) -> LaneFrameGeometry {
         let (lift, cover, hidden) = (
             view.lift.min(1_000),
             view.cover.min(1_000),
             view.hidden.min(1_000),
         );
-        let (len, line) = match self.style {
-            LaneStyle::Simple => (f64::from(self.line - self.top), f64::from(self.line)),
-            LaneStyle::Source(s) => (f64::from(s.height), f64::from(s.bottom)),
+        let (len, line, bottom) = match self.style {
+            LaneStyle::Simple => (
+                f64::from(self.line - self.top),
+                f64::from(self.line),
+                f64::from(self.bottom),
+            ),
+            LaneStyle::Source(s) => (
+                f64::from(s.height),
+                f64::from(s.bottom),
+                f64::from(s.bottom),
+            ),
         };
         let left = len * f64::from(1_000 - lift) / 1_000.0;
         let span = left * f64::from(1_000 - cover) / 1_000.0;
         let lift_px = len - left;
-        Covers {
+        LaneFrameGeometry {
             lift_px,
-            line_y: line - lift_px,
             cover_px: left - span,
             hidden_px: left * f64::from(hidden) / 1_000.0,
+            line_y: line - lift_px,
             span,
+            top: f64::from(self.top),
+            bottom,
+            hidden_trim: match self.hidden_trim {
+                HiddenTrim::None => None,
+                HiddenTrim::Fixed(y) => Some(f64::from(y)),
+                HiddenTrim::Lift(y) => Some(f64::from(y) - lift_px),
+            },
         }
     }
 

@@ -27,9 +27,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use bms_model::TimeUs;
 use skin_model::{
-    Anchor, Blend, CycleDef, Ease, ElementDef, Filter, Fit, Grade, KeyDef, LoadError, MAX_GEOMETRY,
-    Native, PLAY, Place, Program, Region, RegionDef, Scope, Skin, SkinDef, Source, TimerRef, Track,
-    Ty, WidgetDefs, compile, timer as slot,
+    Anchor, Blend, CycleDef, Ease, ElementDef, Filter, Fit, Follow, Grade, KeyDef, LoadError,
+    MAX_GEOMETRY, Native, PLAY, Place, Program, Region, RegionDef, Scope, Skin, SkinDef, Source,
+    TimerRef, Track, Ty, WidgetDefs, compile, timer as slot,
 };
 
 pub use budget::ImportLimit;
@@ -215,8 +215,16 @@ struct Opts<'a> {
     /// Drawn unrotated: the keys' angles are cleared before the track is
     /// accepted, and an angle is only noted.
     unrotated: bool,
-    /// Run-time offsets the element takes.
+    /// Run-time offsets the receiving widget consumes itself (the covers).
     allow: &'a [i32],
+    /// Offsets 3 and 4 become [`Follow`]: the element moves with LIFT and
+    /// SUDDEN+ (`play/LaneRenderer.java:332-333`).
+    follow: bool,
+    /// A relative element (a judge's combo): offsets 3 and 4 are taken
+    /// and move nothing, as the source skips a relative element's own
+    /// translation and attaches it to its grade (`skin/SkinObject.java:
+    /// 404-428`, `play/SkinJudge.java:122-125`).
+    relative: bool,
     /// A play widget's outer destination: the source's constructor key
     /// at 0 joins the keys, every key is neutral (rect 0, white, opaque),
     /// and blend and colour are not consumed.
@@ -242,11 +250,16 @@ struct Common {
     filter: Filter,
     pivot: Anchor,
     offset: Offset,
+    /// The covers it moves with, from offsets 3 and 4.
+    follow: Follow,
     stretch: Stretch,
     stretch_mode: i32,
     untimed: bool,
     /// The joined visibility source, empty when always visible.
     cond_src: String,
+    /// Whether a condition differs from the source's in an owner-decided
+    /// way, or the element's value does: a D4 note when it is retained.
+    display_deviation: bool,
 }
 
 /// The import's running state.
@@ -696,16 +709,6 @@ impl<'d> Cx<'d> {
                 why: NoteKind::UnsupportedField { field: "id" },
             });
         }
-        // Only an image can be decorative while it lists SUDDEN+'s offset
-        // (`widget::lanes`).
-        let image = matches!(object, Object::Image | Object::ImageSet);
-        if !image && object != Object::HiddenCover && dst.offsets.contains(&OFFSET_LANECOVER) {
-            return Err(ImportError::Critical {
-                at: self.loc(at),
-                part: CriticalPart::Cover,
-                why: NoteKind::RuntimeOffset(OFFSET_LANECOVER),
-            });
-        }
         let lanes = self.elements.len();
         match object {
             Object::Image => self.image(dst, orec, None)?,
@@ -733,25 +736,15 @@ impl<'d> Cx<'d> {
         Ok(())
     }
 
-    /// The common part of an element: track, conditions,
-    /// timer, offsets, blend and pivot, each through the role policy.
+    /// The common part of an element, read as `o` says: track,
+    /// conditions, timer, offsets, blend and pivot, each through the role
+    /// policy.
     /// `None` when the element was dropped or is never drawn.
     ///
     /// A `text` consumes neither the angle nor the blend
     /// (`SkinTextFont.java:158-176`): its keys' angles are cleared before
-    /// the track is accepted, and an angle or a blend is only noted.
-    fn common(&mut self, role: Role, dst: &Dst, text: bool) -> Result<Option<Common>, ImportError> {
-        self.common_with(
-            role,
-            dst,
-            Opts {
-                text,
-                ..Opts::default()
-            },
-        )
-    }
-
-    /// [`Self::common`] read as `o` says.
+    /// the track is accepted, and an angle or a blend is only noted
+    /// (`Opts::text`).
     fn common_with(
         &mut self,
         role: Role,
@@ -834,6 +827,7 @@ impl<'d> Cx<'d> {
 
         // Conditions.
         let mut conds: Vec<String> = Vec::new();
+        let mut deviates = false;
         let mut seen = BTreeSet::new();
         for op in &dst.ops {
             let cond = match op {
@@ -856,7 +850,7 @@ impl<'d> Cx<'d> {
                     }
                 },
             };
-            if !self.condition(role, at, cond, &mut conds)? {
+            if !self.condition(role, at, cond, &mut conds, &mut deviates)? {
                 return Ok(None);
             }
         }
@@ -865,7 +859,7 @@ impl<'d> Cx<'d> {
             Prop::Id(n) => {
                 if ops::is_builtin(i32::try_from(n.unsigned_abs()).unwrap_or(0)) {
                     let c = ops::numeric(*n, &BTreeMap::new(), self.custom.judge_region);
-                    if !self.condition(role, at, c, &mut conds)? {
+                    if !self.condition(role, at, c, &mut conds, &mut deviates)? {
                         return Ok(None);
                     }
                 } else {
@@ -881,7 +875,7 @@ impl<'d> Cx<'d> {
                     self.drop_el(role, at, why)?;
                     return Ok(None);
                 };
-                if !self.condition(role, at, c, &mut conds)? {
+                if !self.condition(role, at, c, &mut conds, &mut deviates)? {
                     return Ok(None);
                 }
             }
@@ -913,7 +907,9 @@ impl<'d> Cx<'d> {
             },
         };
 
-        // Offsets.
+        // Offsets: each valid id once, whether listed as `offset` or among
+        // `offsets` (`skin/json/JsonSkinLoader.java:473-478`,
+        // `skin/SkinObject.java:832-844`).
         let mut ids: Vec<i32> = Vec::new();
         for &id in &dst.offsets {
             if (1..=OFFSET_MAX).contains(&id) && !ids.contains(&id) {
@@ -922,12 +918,45 @@ impl<'d> Cx<'d> {
         }
         let mut offset = Offset::default();
         let mut alpha: Vec<i64> = Vec::new();
+        let (mut lift, mut cover) = (false, false);
         if o.no_offsets && !ids.is_empty() {
             self.ignored(at, NoteKind::Ignored { field: "offset" });
             ids.clear();
         }
+        // A value for an offset the header does not declare is ignored
+        // (`config_notes`).
+        let value = |cx: &Self, id: i32| {
+            let declared = cx.header.offsets.iter().any(|o| o.id == id);
+            cx.config.offsets.get(&id).copied().filter(|_| declared)
+        };
+        // The play sets the y of the offsets the covers move by
+        // (`play/LaneRenderer.java:332-345`), so a configured y is
+        // overridden; their other components, which the source adds too
+        // (`skin/SkinObject.java:404-428`), are not reproduced. That holds
+        // for the ids a cover consumes, listed or added by the source, and
+        // for 3 and 4 on a follower or a relative part.
+        let reserved = |id: i32| {
+            o.allow.contains(&id)
+                || (matches!(id, OFFSET_LIFT | OFFSET_LANECOVER) && (o.follow || o.relative))
+        };
+        let moved = o.allow.iter().chain(&ids).copied().find(|&id| {
+            reserved(id)
+                && value(self, id)
+                    .is_some_and(|v| v.x != 0 || v.w != 0 || v.h != 0 || v.r != 0 || v.a != 0)
+        });
+        if let Some(id) = moved {
+            self.drop_el(role, at, NoteKind::RuntimeOffset(id))?;
+            return Ok(None);
+        }
         for id in ids {
             if o.allow.contains(&id) {
+                continue;
+            }
+            if reserved(id) {
+                if o.follow {
+                    lift |= id == OFFSET_LIFT;
+                    cover |= id == OFFSET_LANECOVER;
+                }
                 continue;
             }
             if RUNTIME_OFFSETS.contains(&id) {
@@ -937,10 +966,7 @@ impl<'d> Cx<'d> {
             if id == OFFSET_ALL {
                 continue;
             }
-            // A value for an offset the header does not declare is ignored
-            // (`config_notes`).
-            let declared = self.header.offsets.iter().any(|o| o.id == id);
-            let Some(v) = self.config.offsets.get(&id).copied().filter(|_| declared) else {
+            let Some(v) = value(self, id) else {
                 continue;
             };
             offset.x += i64::from(v.x);
@@ -1035,29 +1061,42 @@ impl<'d> Cx<'d> {
             },
             pivot: pivot(dst.center),
             offset,
+            follow: match (lift, cover) {
+                (false, false) => Follow::None,
+                (true, false) => Follow::Lift,
+                (false, true) => Follow::Cover,
+                (true, true) => Follow::LiftAndCover,
+            },
             stretch: Stretch::of(dst.stretch),
             stretch_mode: dst.stretch,
             untimed,
             track,
             cond_src: src,
+            display_deviation: deviates,
         }))
     }
 
-    /// Applies one condition: `Ok(false)` when the element is dropped or
-    /// never drawn. A repeated expression adds nothing: the supported
-    /// conditions are a closed set whose joined source fits the
-    /// compiler's limit (`ops`' tests), so a long list builds no more.
+    /// Applies one condition, setting `deviates` for a D4 one: `Ok(false)`
+    /// when the element is dropped or never drawn. A repeated expression
+    /// adds nothing: the supported conditions are a closed set, so a long
+    /// list builds no more; one destination listing more of them than one
+    /// source holds is refused at its location (`ops`' tests).
     fn condition(
         &mut self,
         role: Role,
         at: Span,
         c: Cond,
         conds: &mut Vec<String>,
+        deviates: &mut bool,
     ) -> Result<bool, ImportError> {
         match c {
-            Cond::Expr(e) => {
-                if !conds.contains(&e) {
-                    conds.push(e);
+            Cond::Expr {
+                src,
+                display_deviation,
+            } => {
+                *deviates |= display_deviation;
+                if !conds.contains(&src) {
+                    conds.push(src);
                 }
                 Ok(true)
             }
@@ -1202,12 +1241,20 @@ impl<'d> Cx<'d> {
     }
 
     /// Adds an element and its location.
-    fn push(&mut self, c: Common, source: Source, track: Track) {
-        self.push_native(c, source, track, None);
+    fn push(&mut self, c: Common, source: Source, track: Track) -> Result<(), ImportError> {
+        self.push_native(c, source, track, None)
     }
 
-    /// [`Self::push`] with the native size its quads keep.
-    fn push_native(&mut self, c: Common, source: Source, track: Track, native: Option<Native>) {
+    /// [`Self::push`] with the native size its quads keep. An element
+    /// that follows the covers is noted as D9 [`LaneApprox::CoverMotion`].
+    fn push_native(
+        &mut self,
+        c: Common,
+        source: Source,
+        track: Track,
+        native: Option<Native>,
+    ) -> Result<(), ImportError> {
+        self.retained(&c)?;
         self.elements.push(ElementDef {
             source,
             track,
@@ -1218,10 +1265,39 @@ impl<'d> Cx<'d> {
             place: Place {
                 pivot: c.pivot,
                 native,
+                follow: c.follow,
                 ..Place::SCREEN
             },
         });
         self.element_spans.push(c.span);
+        Ok(())
+    }
+
+    /// Notes what a retained element or judge part carries: D4 once when
+    /// it deviates ([`Common::display_deviation`]), and D9
+    /// [`LaneApprox::CoverMotion`] once when it follows the covers.
+    fn retained(&mut self, c: &Common) -> Result<(), ImportError> {
+        if c.display_deviation {
+            self.note(
+                Some(c.span),
+                Severity::Deviation,
+                NoteKind::Deviation(DeviationId::D4),
+            );
+        }
+        self.cover_motion(c)
+    }
+
+    /// Notes D9 [`LaneApprox::CoverMotion`] once for a retained element
+    /// or grade that follows the covers.
+    fn cover_motion(&mut self, c: &Common) -> Result<(), ImportError> {
+        if c.follow == Follow::None {
+            return Ok(());
+        }
+        let part = match c.role {
+            Role::Critical(part) => part,
+            Role::Decorative => CriticalPart::Cover,
+        };
+        self.lane_approx(c.span, part, LaneApprox::CoverMotion)
     }
 
     /// The source's `source` table, by id: the last of an id wins

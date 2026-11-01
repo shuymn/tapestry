@@ -238,7 +238,12 @@ fn check_f1(_: &Header, i: Imported) {
     }
 }
 
-/// F2: 64 texts in 16 fonts, and counts filling the widget quads.
+/// The six rate aliases (D4): current and whole, whole percent and
+/// hundredths, each 3 operations.
+const RATE_REFS: [i32; 6] = [102, 103, 115, 116, 155, 156];
+
+/// F2: 64 texts in 16 fonts, and rates and a count filling the widget
+/// quads.
 fn f2(root: &Path) {
     png(root, "n.png", 60, 6);
     for i in 0..MAX_FONTS {
@@ -257,16 +262,26 @@ fn f2(root: &Path) {
     let dsts = join(
         (0..MAX_TEXT_ELEMENTS)
             .map(|i| format!(r#"{{"id": "t{i}", "dst": [{{"w": 10, "h": 10}}]}}"#))
-            .chain((0..full).map(|_| r#"{"id": "v11", "dst": [{"w": 6, "h": 6}]}"#.to_owned()))
+            .chain((0..full).map(|k| {
+                format!(
+                    r#"{{"id": "v11_{}", "dst": [{{"w": 6, "h": 6}}]}}"#,
+                    k % RATE_REFS.len()
+                )
+            }))
             .chain([r#"{"id": "v7", "dst": [{"w": 6, "h": 6}]}"#.to_owned()]),
     );
+    let rates = join(RATE_REFS.iter().enumerate().map(|(k, r)| {
+        format!(
+            r#"{{"id": "v11_{k}", "src": "n", "w": 60, "h": 6, "divx": 10, "digit": 11,
+                 "ref": {r}}}"#
+        )
+    }));
     write(
         root,
         "s.json",
         common::hd(&format!(
             r#""source": [{{"id": "n", "path": "n.png"}}], "font": [{fonts}], "text": [{texts}],
-               "value": [
-                 {{"id": "v11", "src": "n", "w": 60, "h": 6, "divx": 10, "digit": 11, "ref": 110}},
+               "value": [{rates},
                  {{"id": "v7", "src": "n", "w": 60, "h": 6, "divx": 10, "digit": 7, "ref": 110}}],
                "destination": [{dsts}]"#
         ))
@@ -282,6 +297,11 @@ fn check_f2(_: &Header, i: Imported) {
     assert_eq!(i.skin.text_slots(), MAX_TEXT_ELEMENTS);
     assert_eq!(i.skin.sheet().font_count(), MAX_FONTS);
     assert_eq!(i.skin.quad_capacity(), MAX_WIDGET_QUADS);
+    // Each rate strip's program is 3 operations, the count's 1.
+    assert_eq!(u.ops, 1_483 * 3 + 1);
+    let d4 = skin_beatoraja::NoteKind::Deviation(skin_beatoraja::DeviationId::D4);
+    let deviations = i.report.notes.iter().filter(|n| n.kind == d4).count();
+    assert_eq!(deviations, 1_483);
 }
 
 /// F6: [`common::bitmap_fonts`] with each font also at the file size cap,
@@ -312,6 +332,13 @@ const JUDGES: usize = 5_128;
 const ELEVEN_KEYS: usize = 3_994;
 /// Judges whose grade has the 7-op predicate; the rest the 17-op one.
 const SEVEN_OPS: usize = 2_164;
+/// The grades' offsets in turn: none, LIFT, SUDDEN+, both repeated.
+const FOLLOWS: [&str; 4] = [
+    "",
+    r#""offset": 3, "#,
+    r#""offsets": [4], "#,
+    r#""offsets": [3, 4, 3], "offset": 4, "#,
+];
 
 /// F5: the play objects at the key, op and widget quad caps. Lanes of 48
 /// distinct part images with a bar, SUDDEN+, LIFT and HIDDEN+; a 36-node
@@ -365,10 +392,11 @@ fn f5(root: &Path) {
             )
         }));
         let value = if i + 1 < JUDGES { "v" } else { "v1" };
+        let follow = FOLLOWS[i % FOLLOWS.len()];
         format!(
             r#"{{"id": "j{i}", "index": 0,
-                "images": [{{"id": "g", "timer": 46, "op": [{op}], "loop": 0, "dst": [{track}]}}],
-                "numbers": [{{"id": "{value}", "dst": [{{"x": 10, "y": 0, "w": 6, "h": 6}}]}}]}}"#
+                "images": [{{"id": "g", "timer": 46, "op": [{op}], "loop": 0, {follow}"dst": [{track}]}}],
+                "numbers": [{{"id": "{value}", "offset": 3, "offsets": [4, 3, 4], "dst": [{{"x": 10, "y": 0, "w": 6, "h": 6}}]}}]}}"#
         )
     }));
     let nodes = join((0..36).map(|n| format!("\"n{n}\"")));
@@ -379,7 +407,8 @@ fn f5(root: &Path) {
                 .to_owned(),
             r#"{"id": "lc", "dst": [{"x": 20, "y": 0, "w": 430, "h": 200}]}"#.to_owned(),
             r#"{"id": "hid", "dst": [{"x": 20, "y": -400, "w": 430, "h": 600}]}"#.to_owned(),
-            r#"{"id": "gg", "dst": [{"x": 600, "y": 100, "w": 1000, "h": 10}]}"#.to_owned(),
+            r#"{"id": "gg", "offset": 3, "dst": [{"x": 600, "y": 100, "w": 1000, "h": 10}]}"#
+                .to_owned(),
         ]
         .into_iter()
         .chain((0..JUDGES).map(|i| format!(r#"{{"id": "j{i}", "dst": [{{"w": 0, "h": 0}}]}}"#))),
@@ -471,6 +500,35 @@ fn check_f5(_: &Header, i: Imported) {
         .sum();
     assert!((1_000..=1_001).contains(&gauge), "{by_size:?}");
     assert_eq!(q.len(), JUDGES + 2 * JUDGES - 1 + 3 + gauge, "{by_size:?}");
+    // Each follower moves once: LIFT at 100 ‰ of the 600 px lane lifts
+    // by 60, SUDDEN+ at 300 ‰ of the 540 px left lowers by 162. The
+    // grades cycle through none, LIFT, SUDDEN+ and both, each combo
+    // with its grade; the gauge follows LIFT.
+    let rows = |size: [i32; 2]| {
+        let mut rows = std::collections::BTreeMap::<i32, usize>::new();
+        for quad in &q {
+            let [_, y, w, h] = common::play::round(quad.rect);
+            if [w, h] == size {
+                *rows.entry(y).or_default() += 1;
+            }
+        }
+        rows
+    };
+    let each = JUDGES / FOLLOWS.len();
+    let grade = [(500, each), (560, each), (662, each), (722, each)];
+    assert_eq!(rows([80, 20]).into_iter().collect::<Vec<_>>(), grade);
+    let combo = rows([6, 6]);
+    let tops: Vec<i32> = combo.keys().copied().collect();
+    assert_eq!(tops.len(), FOLLOWS.len(), "{combo:?}");
+    let first = tops.first().copied().unwrap_or_default();
+    let moved: Vec<i32> = tops.iter().map(|y| y - first).collect();
+    assert_eq!(moved, [0, 60, 162, 222], "{combo:?}");
+    let gauge_rows = rows([1, 10]);
+    assert_eq!(
+        gauge_rows.keys().copied().collect::<Vec<_>>(),
+        [910],
+        "{gauge_rows:?}"
+    );
 }
 
 /// A relative name of `len` bytes ending in `tail`, in folders of at most
@@ -649,10 +707,12 @@ fn import_memory_is_measured() {
         size_of::<Report>(),
     );
     println!(
-        "sizes: JudgeDef {}, GaugeDef {}, LanesDef {}",
+        "sizes: JudgeDef {}, GaugeDef {}, LanesDef {}, Play {}, PlayContext {}",
         size_of::<skin_model::JudgeDef>(),
         size_of::<skin_model::GaugeDef>(),
         size_of::<skin_model::LanesDef>(),
+        size_of::<skin_model::Play>(),
+        size_of::<skin_model::PlayContext<'_>>(),
     );
     let mut peaks = Vec::new();
     let d = tempfile::tempdir().unwrap();
