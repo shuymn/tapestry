@@ -2389,6 +2389,17 @@ fn page(input: PracticeInput, n: usize) -> impl Iterator<Item = (i64, Act)> {
     std::iter::repeat_n((10, Act::Page(input)), n)
 }
 
+/// The practice page opened on the practice chart, its displayed gauge,
+/// normal, set 5 % below its start, then the cursor on Start.
+fn gauge_set_below_start() -> Vec<(i64, Act)> {
+    use PracticeInput::{Down, Left};
+    let mut acts = vec![(0, Act::Practice(P))];
+    acts.extend(page(Down, 4));
+    acts.extend(page(Left, 5));
+    acts.extend(page(Down, 2));
+    acts
+}
+
 /// From the first row: the speed set `down` steps below 100 %, then the
 /// cursor on Start.
 fn to_start(down: usize) -> Vec<(i64, Act)> {
@@ -2908,12 +2919,7 @@ fn a_refused_chart_never_hides_a_failed_output() {
 /// under, and the initial value set on the page stays with its gauge.
 #[test]
 fn the_first_round_prepares_with_the_preset_edited_on_the_practice_page() {
-    use PracticeInput::{Down, Left};
-    let mut acts = vec![(0, Act::Practice(P))];
-    // The displayed gauge 5 % below its start, then Start.
-    acts.extend(page(Down, 4));
-    acts.extend(page(Left, 5));
-    acts.extend(page(Down, 2));
+    let mut acts = gauge_set_below_start();
     // Start, back from the round's result to the page, and Start again.
     acts.extend([
         (500, Act::Page(PracticeInput::Confirm)),
@@ -2995,12 +3001,8 @@ fn practice_with_edits(
     after: Vec<(i64, Act)>,
     edits: Vec<(EditAt, rules::RulePreset)>,
 ) -> Headless {
-    use PracticeInput::{Confirm, Down, Left};
-    let mut acts = vec![(0, Act::Practice(P))];
-    acts.extend(page(Down, 4));
-    acts.extend(page(Left, 5));
-    acts.extend(page(Down, 2));
-    acts.push((500, Act::Page(Confirm)));
+    let mut acts = gauge_set_below_start();
+    acts.push((500, Act::Page(PracticeInput::Confirm)));
     acts.extend(after);
     let (rig, _app, _dir, ran) = run_mine(Refusal::Missing, acts, |r, dir| {
         if let Some(text) = chart {
