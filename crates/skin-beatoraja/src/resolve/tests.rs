@@ -182,6 +182,17 @@ fn malformed_groups_are_refused() {
         array
     );
     assert_eq!(groups(r#"[{"if": 901, "values": true}]"#, &[]), array);
+    // A single record where the array stands, written there or included.
+    let bar = r#"{"id": "bar", "dst": [{"x": 0}]}"#;
+    assert_eq!(groups(bar, &[]), array);
+    assert_eq!(
+        groups(r#"{"include": "g.json"}"#, &[("g.json", bar)]),
+        array
+    );
+    assert_eq!(
+        groups(&format!(r#"[{{"if": 901, "values": {bar}}}]"#), &[]),
+        array
+    );
     assert_eq!(groups("[42]", &[]), object);
     assert_eq!(groups(r#"[{"if": 901, "value": 42}]"#, &[]), object);
     assert_eq!(
@@ -192,6 +203,15 @@ fn malformed_groups_are_refused() {
         groups(r#"[{"id": "bar", "dst": 5}]"#, &[]),
         Err(("dst", "an array"))
     );
+    for dst in [r#"{"x": 0}"#, r#"{"include": "d.json"}"#] {
+        assert_eq!(
+            groups(
+                &format!(r#"[{{"id": "bar", "dst": {dst}}}]"#),
+                &[("d.json", r#"{"x": 0}"#)]
+            ),
+            Err(("dst", "an array"))
+        );
+    }
     assert_eq!(
         groups(r#"[{"id": "bar", "dst": [{"x": 0}, 5]}]"#, &[]),
         Err(("dst", "an object"))

@@ -536,8 +536,8 @@ struct Resolver<'d, 'e> {
     /// The entry file and the includes being resolved, outermost first.
     chain: Vec<FileId>,
     /// The field whose structure is checked while it resolves: a value
-    /// other than `null` where an array belongs is refused under its name
-    /// rather than read as no records.
+    /// other than `null`, a single object included, where an array belongs
+    /// is refused under its name rather than read as no records.
     strict: Option<&'static str>,
 }
 
@@ -662,9 +662,12 @@ impl Resolver<'_, '_> {
                 }
                 Ok(())
             }
-            Kind::Object => match self.record(id, depth)? {
-                Some(rec) => self.emit(rec, out),
-                None => Ok(()),
+            Kind::Object => match self.strict {
+                Some(field) => Err(self.def.type_error(id, field, "an array")),
+                None => match self.record(id, depth)? {
+                    Some(rec) => self.emit(rec, out),
+                    None => Ok(()),
+                },
             },
             Kind::Quoted | Kind::Bare => match self.strict {
                 Some(field) if !matches!(self.arena().scalar(id), Scalar::Null) => {
