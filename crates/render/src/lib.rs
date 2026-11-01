@@ -22,6 +22,7 @@
 mod atlas;
 mod gpu;
 pub mod measure;
+mod pace;
 mod renderer;
 mod simple;
 mod skin;

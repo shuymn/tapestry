@@ -11,6 +11,10 @@ use std::process::{Command, Output, Stdio};
 
 use game::{DataRoot, DeviceSettings, LibrarySettings, save_settings};
 
+/// The rule a slow load holds by, shared with it.
+#[path = "../src/dev/checkpoints.rs"]
+mod checkpoints;
+
 /// A 50 ms mono 16-bit square wave of `amplitude` at 44.1 kHz.
 fn write_wav(path: &Path, amplitude: i16) {
     let samples: Vec<i16> = (0..2_205)
@@ -390,17 +394,6 @@ fn find_from(stdout: &str, from: usize, line: &str) -> Option<usize> {
         .map(|(i, _)| i)
 }
 
-/// The interval p50, µs, of the first `dev: <screen> frames` report.
-fn interval_p50_us(stdout: &str, screen: &str) -> u64 {
-    let line = lines(stdout, &format!("dev: {screen} frames "))[0];
-    line.split("interval p50 ")
-        .nth(1)
-        .and_then(|r| r.split(" us").next())
-        .unwrap()
-        .parse()
-        .unwrap()
-}
-
 /// The frames a `dev: <screen> frames <n>:` line counts, each report.
 fn frames_of(stdout: &str, screen: &str) -> Vec<u64> {
     lines(stdout, &format!("dev: {screen} frames "))
@@ -493,17 +486,23 @@ fn the_play_screen_loads_from_the_choice_through_a_slow_load() {
     let ready = at(held, "load: the chart is ready ");
     at(ready, "play started");
     assert!(lines(&stdout, "load: cancelled").is_empty(), "{stdout}");
-    // Drawn on through the 1.5 s hold at the pace this machine drew the
-    // select screen: at least a third of the frames that pace gives, so a
-    // slow machine is not mistaken for a stopped screen, nor a screen
-    // that stopped for a slow machine.
-    let drawn = frames_of(&stdout, "loading");
-    assert_eq!(drawn.len(), 1, "{stdout}");
-    let pace_us = interval_p50_us(&stdout, "select");
+    // Frames keep being presented through the hold: its checkpoints show
+    // them following one another, by the rule the hold itself waits for
+    // (at most 20 s), so a slow machine passes and a screen that drew
+    // once and stopped fails.
+    let presented: Vec<u64> = lines(&stdout, "dev: presented loading frames: ")
+        .iter()
+        .map(|l| {
+            l.trim_start_matches("dev: presented loading frames: ")
+                .parse()
+                .unwrap()
+        })
+        .collect();
     assert!(
-        drawn[0] * 3 * pace_us >= 1_500_000,
-        "{drawn:?} at a {pace_us} us pace\n{stdout}"
+        checkpoints::frames_follow(&presented),
+        "{presented:?}\n{stdout}"
     );
+    assert_eq!(frames_of(&stdout, "loading").len(), 1, "{stdout}");
     // The loading frame is the play screen's: its judgment line spans the
     // lanes, as in play, and the select screen has none.
     let loading = dumped_rgba(&frames.join("loading.png"));

@@ -31,6 +31,7 @@ use crate::measure::Drawn;
 use crate::recording::SoundRecording;
 use crate::render_side::{FrameSink, Screen};
 
+pub mod checkpoints;
 pub mod scenario;
 
 /// How long each loudness measurement holds before its first block, in

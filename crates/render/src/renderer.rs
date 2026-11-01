@@ -15,6 +15,7 @@ use windows::Win32::System::Threading::WaitForSingleObject;
 use crate::atlas::{ATLAS_SIZE, build_atlas};
 use crate::gpu::{self, AdapterChoice, Gpu};
 use crate::measure::{FrameStatistics, Presentation};
+use crate::pace::Pacer;
 use crate::simple::layout::{HEIGHT, WIDTH};
 use crate::simple::{result_screen, text_screen};
 use crate::text::MenuText;
@@ -200,10 +201,9 @@ pub struct Renderer {
     /// When the built frame's work began, until [`submit`](Self::submit)
     /// takes it.
     started: Option<Instant>,
-    /// An offscreen target's last frame submitted, until the next one: the
-    /// GPU work of at most one frame is left pending, as a swap chain's
-    /// frame latency bounds it.
-    in_flight: Option<wgpu::SubmissionIndex>,
+    /// An offscreen target's frame left pending on the GPU: at most one,
+    /// as a swap chain's frame latency bounds a window's.
+    pacer: Pacer<wgpu::SubmissionIndex>,
 }
 
 impl Renderer {
@@ -290,7 +290,7 @@ impl Renderer {
             staging: Vec::with_capacity(MAX_SPRITES),
             skin: Box::new(SimpleSkin::new()),
             started: None,
-            in_flight: None,
+            pacer: Pacer::default(),
             id: RENDERERS.fetch_add(1, Ordering::Relaxed),
         })
     }
@@ -515,7 +515,27 @@ impl Renderer {
                     return Err(RenderError::SurfaceLost);
                 }
             },
-            Output::Offscreen { view, .. } => (None, view.clone()),
+            Output::Offscreen { view, .. } => {
+                // Nothing paces offscreen frames: the frame before must be
+                // done on the GPU first. One not done within the wait stays
+                // pending, and this frame is skipped, not presented, as a
+                // window's frame is when its swap chain image times out.
+                let device = self.gpu.device();
+                let admitted = self.pacer.admit(|previous| {
+                    !matches!(
+                        device.poll(wgpu::PollType::Wait {
+                            submission_index: Some(previous.clone()),
+                            timeout: Some(OFFSCREEN_FRAME_WAIT),
+                        }),
+                        Err(wgpu::PollError::Timeout)
+                    )
+                });
+                if !admitted {
+                    let cpu = start.elapsed().saturating_sub(acquire.elapsed());
+                    return Ok(timing(cpu, false));
+                }
+                (None, view.clone())
+            }
         };
         let acquired = acquire.elapsed();
         let queue = self.gpu.queue();
@@ -581,17 +601,10 @@ impl Renderer {
                 });
             }
             None => {
-                // Offscreen nothing paces the frames: the previous frame's
-                // work is waited for (bounded), so the GPU never falls
-                // behind by more than this frame, and a later wait for the
-                // GPU (a chart's preparation, a read back) waits for at
-                // most that much, as behind a swap chain.
-                if let Some(previous) = self.in_flight.replace(submitted) {
-                    let _ = self.gpu.device().poll(wgpu::PollType::Wait {
-                        submission_index: Some(previous),
-                        timeout: Some(OFFSCREEN_FRAME_WAIT),
-                    });
-                }
+                // Offscreen: this frame is the one left pending, so a later
+                // wait for the GPU (a chart's preparation, a read back)
+                // waits for about one frame, as behind a swap chain.
+                self.pacer.submitted(submitted);
             }
         }
         Ok(out)
@@ -719,8 +732,9 @@ pub fn build_frame(
 }
 
 /// The longest an offscreen frame waits for the previous frame's GPU work;
-/// past it the frame goes on, and the next frame waits for it.
-const OFFSCREEN_FRAME_WAIT: Duration = Duration::from_secs(1);
+/// past it the frame is skipped, and the next frame waits again, so the
+/// render thread still takes its messages behind a slow GPU.
+const OFFSCREEN_FRAME_WAIT: Duration = Duration::from_millis(100);
 
 /// Submits every upload queued on `gpu` and waits until the GPU has done them,
 /// so none is left for the first frame of play (design.md "Display Latency and
