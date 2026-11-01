@@ -568,49 +568,7 @@ fn widgets(elements: &mut Vec<ElementDef>) -> skin_model::WidgetDefs {
             value: int(src),
         })
         .collect();
-    let look = |first: u16| {
-        let at = |k: u16| [u32::from(first + 2 * k), u32::from(first + 2 * k + 1)];
-        GaugeParts {
-            front: at(0),
-            back: at(1),
-            tip: at(2),
-        }
-    };
-    let looks = |hard: GaugeParts| {
-        let mut out = [look(LOOKS); GaugeLook::COUNT];
-        out[GaugeLook::Hard.index()] = hard;
-        out
-    };
-    let step = TimeUs(70 * MS);
-    let gauges = vec![
-        GaugeDef {
-            segments: 50,
-            looks: looks(look(LOOKS + 6)),
-            motion: Motion::Still,
-        },
-        GaugeDef {
-            segments: 40,
-            looks: looks(look(LOOKS + 6)),
-            motion: Motion::Random { range: 5, step },
-        },
-        GaugeDef {
-            segments: 30,
-            looks: looks(look(LOOKS + 6)),
-            motion: Motion::Rise { range: 3, step },
-        },
-        GaugeDef {
-            segments: 20,
-            looks: looks(look(LOOKS + 6)),
-            motion: Motion::Fall { range: 2, step },
-        },
-        GaugeDef {
-            segments: 50,
-            looks: [look(FLICKER); GaugeLook::COUNT],
-            motion: Motion::Flicker {
-                period: TimeUs(330 * MS),
-            },
-        },
-    ];
+    let gauges = gauges();
     let regions = [
         Region::Bottom,
         Region::Right,
@@ -760,22 +718,55 @@ fn widgets(elements: &mut Vec<ElementDef>) -> skin_model::WidgetDefs {
     }
 }
 
-/// The selector of the shown gauge's look, invalid hiding.
-const GAUGE_LOOK: &str = "if gauge.valid then (if gauge.kind == assist_easy then 0 \
-    else if gauge.kind == easy then 1 else if gauge.kind == normal then 2 \
-    else if gauge.kind == hard then 3 else if gauge.kind == ex_hard then 4 \
-    else if gauge.kind == hazard then 5 else -1) else -1";
+/// The gauges: one in each motion, the flicker's with its own images.
+fn gauges() -> Vec<GaugeDef> {
+    let look = |first: u16| {
+        let at = |k: u16| [u32::from(first + 2 * k), u32::from(first + 2 * k + 1)];
+        GaugeParts {
+            front: at(0),
+            back: at(1),
+            tip: at(2),
+        }
+    };
+    let looks = |hard: GaugeParts| {
+        let mut out = [look(LOOKS); GaugeLook::COUNT];
+        out[GaugeLook::Hard.index()] = hard;
+        out
+    };
+    let step = TimeUs(70 * MS);
+    vec![
+        GaugeDef {
+            segments: 50,
+            looks: looks(look(LOOKS + 6)),
+            motion: Motion::Still,
+        },
+        GaugeDef {
+            segments: 40,
+            looks: looks(look(LOOKS + 6)),
+            motion: Motion::Random { range: 5, step },
+        },
+        GaugeDef {
+            segments: 30,
+            looks: looks(look(LOOKS + 6)),
+            motion: Motion::Rise { range: 3, step },
+        },
+        GaugeDef {
+            segments: 20,
+            looks: looks(look(LOOKS + 6)),
+            motion: Motion::Fall { range: 2, step },
+        },
+        GaugeDef {
+            segments: 50,
+            looks: [look(FLICKER); GaugeLook::COUNT],
+            motion: Motion::Flicker {
+                period: TimeUs(330 * MS),
+            },
+        },
+    ]
+}
 
-/// The image choice tables, their elements appended to `elements`:
-/// - by `elapsed(ready) / 40 % 7 − 2`: hidden, each entry (a hole among them) and past
-///   the table, the entries on their own clocks (`ready`, `judge`), one
-///   with its own track and one with its own native size, following each
-///   way in turn;
-/// - by the gauge's look, one entry per look with its own track, shared
-///   by two elements;
-/// - by the current tempo, while it is known.
-fn image_choices(
-    elements: &mut Vec<ElementDef>,
+/// The image choice tables [`image_choices`] draws.
+fn image_choice_tables(
     int: impl Fn(&str) -> skin_model::Program,
 ) -> Vec<skin_model::ImageChoiceDef> {
     use skin_model::{ImageChoiceDef, ImageChoicePart, ImageSpan};
@@ -833,6 +824,28 @@ fn image_choices(
         value: int("if bpm.current_valid then bpm.current_x100 / 100 % 3 else -1"),
         choices: vec![Some(part(GRADES, 0, 1)), Some(part(GRADES + 1, 0, 1)), None],
     };
+    vec![combo, looks, tempo]
+}
+
+/// The selector of the shown gauge's look, invalid hiding.
+const GAUGE_LOOK: &str = "if gauge.valid then (if gauge.kind == assist_easy then 0 \
+    else if gauge.kind == easy then 1 else if gauge.kind == normal then 2 \
+    else if gauge.kind == hard then 3 else if gauge.kind == ex_hard then 4 \
+    else if gauge.kind == hazard then 5 else -1) else -1";
+
+/// The image choice tables, their elements appended to `elements`:
+/// - by `elapsed(ready) / 40 % 7 − 2`: hidden, each entry (a hole among them) and past
+///   the table, the entries on their own clocks (`ready`, `judge`), one
+///   with its own track and one with its own native size, following each
+///   way in turn;
+/// - by the gauge's look, one entry per look with its own track, shared
+///   by two elements;
+/// - by the current tempo, while it is known.
+fn image_choices(
+    elements: &mut Vec<ElementDef>,
+    int: impl Fn(&str) -> skin_model::Program,
+) -> Vec<skin_model::ImageChoiceDef> {
+    let tables = image_choice_tables(int);
     for (i, (table, place)) in [
         (0, Place::SCREEN),
         (
@@ -869,7 +882,7 @@ fn image_choices(
             },
         ));
     }
-    vec![combo, looks, tempo]
+    tables
 }
 
 /// The text elements' key height.
@@ -1171,9 +1184,20 @@ fn loading_skin() -> Loaded {
             Place::SCREEN,
         ));
     }
-    let mut widgets = widgets(&mut Vec::new());
-    widgets.cover_paints = cover_paints();
-    widgets.texts = Vec::new();
+    let int = |src: &str| {
+        skin_model::compile(
+            src,
+            &skin_model::Scope::new(&skin_model::PLAY),
+            skin_model::Ty::Int,
+        )
+        .unwrap()
+    };
+    let widgets = skin_model::WidgetDefs {
+        gauges: gauges(),
+        image_choices: image_choice_tables(int),
+        cover_paints: cover_paints(),
+        ..skin_model::WidgetDefs::default()
+    };
     load(whens, elements, widgets)
 }
 
