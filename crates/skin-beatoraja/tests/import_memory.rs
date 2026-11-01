@@ -985,9 +985,10 @@ fn import_memory_is_measured() {
         size_of::<skin_model::DurationRatio>(),
     );
     println!(
-        "sizes: ImageChoiceDef {}, Option<ImageChoicePart> {}",
+        "sizes: ImageChoiceDef {}, Option<ImageChoicePart> {}, CoverPaintDef {}",
         size_of::<ImageChoiceDef>(),
         size_of::<Option<ImageChoicePart>>(),
+        size_of::<skin_model::CoverPaintDef>(),
     );
     let mut peaks = Vec::new();
     let d = tempfile::tempdir().unwrap();
