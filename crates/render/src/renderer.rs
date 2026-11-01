@@ -878,8 +878,7 @@ impl Renderer {
                 max,
             });
         }
-        let mut staging = Staging::new(capacity, &skin.canvas(self.target()));
-        staging.set_capacity(capacity, runs);
+        let mut staging = Staging::with_runs(capacity, runs, &skin.canvas(self.target()));
         staging.set_clips(bundle.clips().clone());
         let ((atlas, atlas_bind, buffer), refused) = bundle.with_pages(|pages| {
             let layers =

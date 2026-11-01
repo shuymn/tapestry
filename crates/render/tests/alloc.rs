@@ -445,8 +445,7 @@ fn declarative_frames(chart: &Chart, taps: &[(u8, TimeUs)], overlay: &[&str], gl
     assert_eq!(text.unwrap().calls.load(Ordering::SeqCst), 1);
     let (capacity, runs) = (skin.capacity(), skin.run_capacity());
     assert_eq!(capacity, 65);
-    let mut staging = Staging::new(capacity, &skin.canvas([1920, 1080]));
-    staging.set_capacity(capacity, runs);
+    let mut staging = Staging::with_runs(capacity, runs, &skin.canvas([1920, 1080]));
     staging.set_clips(b.clips().clone());
     // Views whose shown gauge differs frame to frame.
     let views: Vec<_> = (0..4)

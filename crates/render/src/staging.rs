@@ -45,7 +45,13 @@ impl Staging {
     /// and the built-in atlas alone.
     #[must_use]
     pub fn new(capacity: u32, canvas: &Canvas) -> Self {
-        let batch = Self::sized(capacity, capacity);
+        Self::with_runs(capacity, capacity, canvas)
+    }
+
+    /// As [`new`](Self::new), with room for `runs` runs.
+    #[must_use]
+    pub fn with_runs(capacity: u32, runs: u32, canvas: &Canvas) -> Self {
+        let batch = Self::sized(capacity, runs);
         Self {
             instances: Vec::with_capacity(batch.total_capacity()),
             batch,
