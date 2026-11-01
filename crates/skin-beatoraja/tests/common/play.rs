@@ -122,6 +122,14 @@ fn context_with(bpm_range: Option<BpmRange>) -> PlayContext<'static> {
     }
 }
 
+/// What a play of `skin` over `chart` keeps besides the atlas: its
+/// prepared state and its batch.
+pub fn prepared(skin: &Skin, chart: &bms_model::Chart) -> (skin_model::Play, QuadBatch) {
+    let play = skin.prepare(chart, &context()).unwrap();
+    let batch = QuadBatch::with_capacity(skin.quad_capacity(), skin.run_capacity());
+    (play, batch)
+}
+
 /// A chart with `notes` notes on lane 1, one every 10 ms from 1 s.
 fn chart(notes: u32) -> bms_model::Chart {
     (0..notes)

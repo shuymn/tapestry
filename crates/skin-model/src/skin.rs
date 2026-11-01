@@ -19,6 +19,7 @@ use crate::play::{BuildError, Play, PlayContext, PrepareError, SkinFrame};
 use crate::quad::{Blend, ClipId, Filter, QuadBatch, RunKey};
 use crate::schema::Ty;
 use crate::track::{MAX_KEY_US, Track};
+use crate::widget::bar::{BarGroupError, BarScratch, MAX_BAR_GROUPS};
 use crate::widget::cover_paint::{
     CoverImage, CoverPaint, CoverPaintDef, CoverPaintError, LanePaint, LanePaintError, PaintImage,
 };
@@ -812,6 +813,51 @@ fn check_cover_paints(w: &WidgetDefs, images: usize) -> Result<(), LoadError> {
     Ok(())
 }
 
+/// The bar group checks of [`Skin::new`], each over every group in order,
+/// with `whens` `when` timers, `region` the lanes element's and `reach`
+/// the lanes' length rounded up: every timer exists, every visibility is
+/// a bool, every key lies within ±[`MAX_COORD`], every group sits in
+/// `region` without a fill, and a follower's keys keep their y within it
+/// moved `reach` either way.
+fn check_bar_groups(
+    l: &LanesDef,
+    whens: usize,
+    region: Option<Region>,
+    reach: i64,
+) -> Result<(), LoadError> {
+    let fail = |group, error| Err(LoadError::Lanes(LanesError::BarGroup { group, error }));
+    let groups = &l.bar_groups;
+    let find = |bad: &dyn Fn(&crate::BarGroupDef) -> bool| groups.iter().position(bad);
+    if let Some(g) = find(&|g| slot_of(g.timer, whens).is_none()) {
+        return fail(g, BarGroupError::UnknownTimer);
+    }
+    if let Some(g) = find(&|g| g.visible.as_ref().is_some_and(|v| v.ty() != Ty::Bool)) {
+        return fail(g, BarGroupError::VisibleNotBool);
+    }
+    if let Some(g) = find(&|g| track_outside(&g.track)) {
+        return fail(g, BarGroupError::Coordinates);
+    }
+    for (g, b) in groups.iter().enumerate() {
+        if Some(b.place.region) != region {
+            return fail(g, BarGroupError::Region);
+        }
+        if b.place.fill != Fill::None {
+            return fail(g, BarGroupError::Fill);
+        }
+    }
+    let max = i64::from(MAX_COORD);
+    let moved_out = |t: &Track| {
+        t.rects().any(|[_, y, ..]| {
+            let y = i64::from(y);
+            y - reach < -max || y + reach > max
+        })
+    };
+    if let Some(g) = find(&|g| g.place.follow != Follow::None && moved_out(&g.track)) {
+        return fail(g, BarGroupError::Coordinates);
+    }
+    Ok(())
+}
+
 /// The marker checks of [`Skin::new`], with `lanes` the checked lanes and
 /// `region` their element's: every marker is canonical in the lanes'
 /// region, and each present part has exactly one marker and an absent
@@ -925,7 +971,7 @@ impl Skin {
     /// # Errors
     ///
     /// The first check that fails.
-    pub fn new(def: SkinDef) -> Result<Self, LoadError> {
+    pub fn new(mut def: SkinDef) -> Result<Self, LoadError> {
         let elements = &def.elements;
         let whens = &def.whens;
         let w = &def.widgets;
@@ -947,6 +993,10 @@ impl Skin {
                 return Err(LoadError::TooManyWidgets { n });
             }
         }
+        let groups = def.lanes.as_ref().map_or(0, |l| l.bar_groups.len());
+        if groups > MAX_BAR_GROUPS {
+            return Err(LoadError::Lanes(LanesError::TooManyBarGroups { n: groups }));
+        }
         let n = elements
             .iter()
             .filter(|e| matches!(e.source, Source::Text(_)))
@@ -966,6 +1016,11 @@ impl Skin {
             .map(|e| &e.track)
             .chain(w.judges.iter().flat_map(|j| j.tracks().map(|(_, t)| t)))
             .chain(w.image_choices.iter().flat_map(ImageChoiceDef::tracks))
+            .chain(
+                def.lanes
+                    .iter()
+                    .flat_map(|l| l.bar_groups.iter().map(|g| &g.track)),
+            )
             .fold(0_usize, |n, t| n.saturating_add(t.key_count()));
         if keys > MAX_SKIN_KEYS {
             return Err(LoadError::TooManyKeys { n: keys });
@@ -1099,6 +1154,9 @@ impl Skin {
             .find(|e| e.source == Source::Lanes)
             .map(|e| e.place.region);
         check_lane_paints(elements, lanes, lanes_in)?;
+        if let Some(l) = lanes {
+            check_bar_groups(l, whens.len(), lanes_in, l.reach())?;
+        }
         check_follows(&def, lanes.map_or(0, LanesDef::reach))?;
         let mut ops = SkinOps::default();
         // Each element evaluates its own number's value and its judge's
@@ -1116,10 +1174,15 @@ impl Skin {
                 .into_iter()
                 .chain(judge.into_iter().flat_map(|j| j.visibles().map(|(_, v)| v)))
         });
+        // The lanes element samples each bar group's visibility once.
+        let groups = lanes
+            .into_iter()
+            .flat_map(|l| l.bar_groups.iter().filter_map(|g| g.visible.as_ref()));
         for program in whens
             .iter()
             .chain(elements.iter().filter_map(|e| e.visible.as_ref()))
             .chain(per_element)
+            .chain(groups)
         {
             ops.charge(program).map_err(LoadError::Ops)?;
         }
@@ -1139,11 +1202,16 @@ impl Skin {
                 filter: m.map_or(Filter::Linear, |m| m.filter),
             }
         };
-        let lanes = lanes.map(|l| Lanes::new(l, image));
-        let regions = regions(&def, lanes.as_ref());
         let n_whens = whens.len();
         // A timer only an unreferenced judge names reads off.
         let slot = |t: TimerRef| slot_of(t, n_whens).unwrap_or(usize::MAX);
+        let checked = lanes.is_some();
+        let lanes = def
+            .lanes
+            .take()
+            .filter(|_| checked)
+            .map(|l| Lanes::new(l, image, slot));
+        let regions = regions(&def, lanes.as_ref());
         let WidgetDefs {
             numbers,
             gauges,
@@ -1325,6 +1393,20 @@ impl Skin {
         self.ops
     }
 
+    /// The lanes' bar groups: the groups a [`Play`] from
+    /// [`prepare`](Self::prepare) holds work for.
+    #[must_use]
+    pub fn bar_group_count(&self) -> usize {
+        self.lanes.as_ref().map_or(0, |l| l.bar_groups.len())
+    }
+
+    /// The bytes of one bar group's per-attempt work in a [`Play`]: its
+    /// frame record and heap slot.
+    #[must_use]
+    pub fn bar_group_scratch_bytes() -> usize {
+        BarScratch::group_bytes()
+    }
+
     /// The entries of the image choice tables, holes and repeats included.
     #[must_use]
     pub fn choice_ref_count(&self) -> usize {
@@ -1395,10 +1477,12 @@ impl Skin {
     /// when some image the skin can draw is magnified on its smaller axis,
     /// counting the canvas scale, its region's scale, a cover or stretch
     /// fill, and for lane-bound images and the lane parts a lane width
-    /// below 100 % (lane width alone never picks `Hi`). Hidden regions,
-    /// elements whose visibility folds to false and lane paint markers,
-    /// whose images the lanes element counts, do not count. Exact
-    /// rationals, no float. For `prepare`, not in play.
+    /// below 100 % (lane width alone never picks `Hi`). A bar group counts with
+    /// the lanes element, under its region and visibility, by its own
+    /// binding: an unbound group has no lane width. Hidden regions,
+    /// elements and groups whose visibility folds to false and lane paint
+    /// markers, whose images the lanes element counts, do not count.
+    /// Exact rationals, no float. For `prepare`, not in play.
     #[must_use]
     pub fn variant(&self, target: [u32; 2], layout: &Layout) -> Variant {
         let (fit, cw, ch) = self.fit(target);
@@ -1419,9 +1503,22 @@ impl Skin {
                 Fill::Stretch => fw.min(fh),
             };
             let scale = Ratio(u128::from(adjust.scale), 100);
-            let bound = matches!(e.kind, Kind::Lanes) || e.bind != Bind::None;
-            let lane = if bound { Ratio(k, 100) } else { one };
-            fit.mul(scale).mul(fill).mul(lane).gt(one)
+            let placed = fit.mul(scale).mul(fill);
+            let lane = |bind: Bind| {
+                if bind == Bind::None {
+                    one
+                } else {
+                    Ratio(k, 100)
+                }
+            };
+            if matches!(e.kind, Kind::Lanes) {
+                let groups = self.lanes.iter().flat_map(|l| &l.bar_groups);
+                return placed.mul(Ratio(k, 100)).gt(one)
+                    || groups
+                        .filter(|g| g.visible.as_ref().and_then(Program::constant) != Some(0))
+                        .any(|g| placed.mul(lane(g.bind)).gt(one));
+            }
+            placed.mul(lane(e.bind)).gt(one)
         });
         if hi { Variant::Hi } else { Variant::Lo }
     }
@@ -1575,6 +1672,7 @@ impl Skin {
             ctx,
             self.whens.len(),
             self.lanes.is_some(),
+            self.bar_group_count(),
             self.bomb_up_to,
         )
     }
@@ -1585,7 +1683,7 @@ impl Skin {
     /// order (the caller clears `out`). Allocates nothing.
     ///
     /// `play` must come from this skin's [`prepare`](Self::prepare); one
-    /// with another number of timers draws nothing. `uvs` must come from an
+    /// with another number of timers or bar groups draws nothing. `uvs` must come from an
     /// atlas of this skin's sheet; a table of another sheet, or of another
     /// length, draws nothing. A text element draws its slot's line from
     /// the table attached to `play` ([`attach_text`](Self::attach_text));
@@ -1627,6 +1725,7 @@ impl Skin {
     ) -> Result<(), BuildError> {
         play.check()?;
         if play.slots() != usize::from(BUILTIN) + self.whens.len()
+            || play.bar_capacity() != self.bar_group_count()
             || uvs.sheet_id() != self.sheet_id
             || uvs.frames().len() != self.frame_count
         {
@@ -1635,7 +1734,37 @@ impl Skin {
         let canvas = self.canvas(frame.target);
         let placement = self.placement(&canvas, frame.layout, play.scratch());
         play.fill(frame, &self.whens)?;
-        let play = &*play;
+        // The bar groups' work, lent to the lanes for this frame.
+        let mut bars = play.take_bars();
+        self.draw(
+            play,
+            bars.as_deref_mut(),
+            frame,
+            uvs,
+            &canvas,
+            &placement,
+            out,
+        );
+        play.restore_bars(bars);
+        Ok(())
+    }
+
+    /// The elements of [`build`](Self::build) once `play` is filled, the
+    /// lanes drawing their bar groups with `bars`.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the build's own state, split once"
+    )]
+    fn draw(
+        &self,
+        play: &Play,
+        mut bars: Option<&mut BarScratch>,
+        frame: &SkinFrame<'_>,
+        uvs: &UvTable,
+        canvas: &Canvas,
+        placement: &Placement,
+        out: &mut QuadBatch,
+    ) {
         let state = play.state();
         // A table of another length draws no text.
         let texts = play.text().len() == self.text_slots();
@@ -1661,16 +1790,19 @@ impl Skin {
             )?;
             Some(Draw {
                 play,
+                state: &state,
                 now: frame.now,
                 display,
                 view: frame.lanes,
                 frame: lanes.as_ref()?,
                 complete: frame.complete,
                 geometry: placement.geometry(),
+                placement,
                 affine: placement.affine(e.region, e.fill),
                 color: s.color,
                 key: e.key,
                 uvs,
+                scale: canvas.scale(),
             })
         });
         for e in &self.elements {
@@ -1680,7 +1812,7 @@ impl Skin {
                         match e.kind {
                             Kind::LanePaint(LanePaint::Hidden) => widget.draw_hidden(d, out),
                             Kind::LanePaint(LanePaint::Lift) => widget.draw_lift(d, out),
-                            _ => widget.draw(d, out),
+                            _ => widget.draw(d, bars.as_deref_mut(), out),
                         }
                     }
                     continue;
@@ -1801,7 +1933,6 @@ impl Skin {
                 Kind::Lanes | Kind::LanePaint(_) => {}
             }
         }
-        Ok(())
     }
 }
 

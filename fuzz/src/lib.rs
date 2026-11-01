@@ -413,7 +413,85 @@ pub fn draw(imported: &Imported) -> Vec<usize> {
     rate_and_kind_probes(skin, &chart, &uvs, &mut batch);
     readout_probes(skin, &chart, &uvs, &mut batch);
     choice_probes(skin, &chart, &uvs, &mut batch);
+    bar_probes(skin, &ctx, (&tally, &states), &uvs, &mut batch);
     counts
+}
+
+/// The bar line groups over a bounded chart of bars: one every 125 ms
+/// across a STOP, then a run of equal bars where a note stands, drawn
+/// before the play, through the STOP and past the last bar, with display
+/// offsets and the covers moving. Each frame stays inside the skin's
+/// capacities; the lanes' budgets drop at most one quad.
+fn bar_probes(
+    skin: &skin_model::Skin,
+    ctx: &skin_model::PlayContext<'_>,
+    (tally, gauges): (&eval::Tally, &[eval::GaugeState]),
+    uvs: &skin_model::UvTable,
+    batch: &mut skin_model::QuadBatch,
+) {
+    use bms_model::{ChartBuilder, Lane, TimeUs};
+    use skin_model::{LaneView, Layout, SkinFrame};
+
+    let mut chart = ChartBuilder::new(150_000)
+        .stop(TimeUs(1_000_000), TimeUs(500_000))
+        .tap(Lane::new(1).expect("lane 1"), TimeUs(3_000_000))
+        .build()
+        .expect("a chart of a tap");
+    let at = |ms: i64| chart.scroll.position_at(TimeUs(ms * 1_000));
+    let mut bars: Vec<_> = (0..40).map(|i| at(i * 125)).collect();
+    bars.extend(std::iter::repeat_n(at(3_000), 8));
+    chart.bar_lines = bars;
+    let mut play = skin
+        .prepare(&chart, ctx)
+        .expect("an imported skin prepares");
+    for (ms, offset, cover, lift) in [
+        (-500_i64, 0_i64, 0, 0),
+        (0, 40, 300, 100),
+        (1_200, -25, 0, 250),
+        (3_000, 0, 1_000, 1_000),
+        (9_000, 0, 0, 0),
+    ] {
+        batch.clear();
+        let lanes = LaneView {
+            visible_time: TimeUs(600_000),
+            cover,
+            lift,
+            hidden: 0,
+        };
+        let frame = SkinFrame {
+            now: TimeUs(ms * 1_000),
+            display_offset: TimeUs(offset * 1_000),
+            tally,
+            gauges,
+            gauge: 0,
+            effects: &[],
+            complete: false,
+            target: [1_920, 1_080],
+            layout: &Layout::AUTHOR,
+            lanes,
+            loading: None,
+            readouts: readouts_for(lanes),
+            playing: true,
+        };
+        skin.build(&mut play, &frame, uvs, batch)
+            .expect("the frame builds");
+        assert!(batch.dropped() <= 1, "more than the lanes' one drop");
+        assert!(
+            batch.quads().len() <= usize::try_from(skin.quad_capacity()).unwrap_or(usize::MAX),
+            "more quads than the capacity"
+        );
+        assert!(
+            batch.runs().len() <= usize::try_from(skin.run_capacity()).unwrap_or(usize::MAX),
+            "more runs than the capacity"
+        );
+        assert!(
+            batch
+                .quads()
+                .iter()
+                .all(|q| q.rect.iter().chain(&q.pivot).all(|v| v.is_finite())),
+            "a quad off the finite plane"
+        );
+    }
 }
 
 /// Image choices over small and extreme selections and clocks: EX scores
@@ -903,8 +981,8 @@ pub fn skin_json(data: &[u8]) -> Result<(Header, Result<Imported, ImportError>),
 /// An import's charged counters are within the model's caps.
 fn check_usage(i: &Imported) {
     use skin_model::{
-        MAX_ELEMENTS, MAX_FILES, MAX_IMAGE_CHOICE_REFS, MAX_SHEET_GLYPHS, MAX_SHEET_KERNINGS,
-        MAX_SKIN_FRAMES, MAX_SKIN_KEYS, MAX_SKIN_OPS, MAX_WIDGET_QUADS,
+        MAX_BAR_GROUPS, MAX_ELEMENTS, MAX_FILES, MAX_IMAGE_CHOICE_REFS, MAX_SHEET_GLYPHS,
+        MAX_SHEET_KERNINGS, MAX_SKIN_FRAMES, MAX_SKIN_KEYS, MAX_SKIN_OPS, MAX_WIDGET_QUADS,
     };
     let u = i.report.usage;
     let within = |n: u32, cap: usize| usize::try_from(n).is_ok_and(|n| n <= cap);
@@ -916,6 +994,12 @@ fn check_usage(i: &Imported) {
     assert!(within(u.frames, MAX_SKIN_FRAMES), "too many frames");
     assert!(within(u.file_attempts, MAX_FILES), "too many file attempts");
     assert!(u.widget_quads <= MAX_WIDGET_QUADS, "too many widget quads");
+    assert!(within(u.bar_groups, MAX_BAR_GROUPS), "too many bar groups");
+    // A group dropped after it was charged is not kept.
+    assert!(
+        i.skin.bar_group_count() <= usize::try_from(u.bar_groups).unwrap_or(usize::MAX),
+        "more bar groups kept than charged"
+    );
     assert!(
         within(u.choice_refs, MAX_IMAGE_CHOICE_REFS),
         "too many image choice entries"

@@ -5,7 +5,7 @@
 //! The source draws the lanes from eight lane rects
 //! (`JsonPlaySkinObjectLoader.java:79-93`, `play/LaneRenderer.java:
 //! 288-727` at `0.8.9`); the model draws them as one widget whose parts
-//! are the notes, the bar line, LIFT and HIDDEN+. LIFT and HIDDEN+ map
+//! are the notes, the bar line groups ([`super::bar`]), LIFT and HIDDEN+. LIFT and HIDDEN+ map
 //! only in a narrow subset: static, white, exactly over the lanes, on the
 //! lanes' own timer, conditions and window, each painted where its
 //! destination stands by a marker element. LIFT is play-critical and
@@ -60,6 +60,8 @@ pub(crate) struct LaneState {
     pub(crate) def: LanesDef,
     /// The note destination.
     pub(crate) span: Span,
+    /// Each kept bar line group's record.
+    pub(crate) bar_spans: Vec<Span>,
     /// The lanes' rounded left and right edges.
     lane_span: [i128; 2],
     /// Lane 0's source `y` and `h` (`play/LaneRenderer.java:324-326`).
@@ -517,7 +519,6 @@ impl Cx<'_> {
             body_on: [0; LANES],
             body_off: [0; LANES],
             mine: [0; LANES],
-            bar: None,
             line: None,
             lift: None,
             hidden: None,
@@ -550,9 +551,7 @@ impl Cx<'_> {
             Side::Right
         };
 
-        // The bar line, from the first group (decision 13).
-        let (bar, bar_h) = self.bar_line(group, at)?.unzip();
-        parts.bar = bar;
+        let (bar_groups, bar_spans) = self.bar_groups(group, at)?;
 
         // The element.
         let t = self.neutral_track(&c)?;
@@ -572,11 +571,12 @@ impl Cx<'_> {
                 hidden_trim: HiddenTrim::None,
                 note_h,
                 mine_h: note_h,
-                bar_h: bar_h.unwrap_or(1),
                 line_h: 1,
                 parts,
+                bar_groups,
             },
             span: at,
+            bar_spans,
             lane_span: span,
             y0,
             h0,
@@ -620,9 +620,6 @@ impl Cx<'_> {
         if expansion.is_some() && self.ints(expansion, "expansionrate")? != [100, 100] {
             self.lane_approx(at, part, LaneApprox::Expansion)?;
         }
-        if bar.is_some() {
-            self.lane_approx(at, part, LaneApprox::BarLine)?;
-        }
         Ok(())
     }
 
@@ -647,75 +644,6 @@ impl Cx<'_> {
                 v.ok_or_else(|| self.def.type_error(i, name, "a number"))
             })
             .collect()
-    }
-
-    /// The bar line of the note's `group` (`JsonPlaySkinObjectLoader.
-    /// java:94-113`): its image and height when the first and only group
-    /// is a plain, perpetual, white image; dropped with a note otherwise
-    /// (decision 13). The source draws it on the chart clock
-    /// (`play/LaneRenderer.java:300-301, 442-446`), so it maps only when
-    /// that clock cannot show.
-    fn bar_line(
-        &mut self,
-        group: Option<u32>,
-        at: Span,
-    ) -> Result<Option<(u32, u16)>, ImportError> {
-        let groups = group
-            .and_then(|f| self.tables.nested.get(&f))
-            .cloned()
-            .unwrap_or_default();
-        let drop = |cx: &mut Self, field: &'static str| {
-            cx.drop_el(Role::Decorative, at, NoteKind::UnsupportedField { field })
-                .map(|()| None)
-        };
-        let [g] = groups[..] else {
-            return if groups.is_empty() {
-                Ok(None)
-            } else {
-                drop(self, "group")
-            };
-        };
-        let (id, gdst) = self.read_nested(g)?;
-        let Some(img) = id.map(|id| self.image_rec(&id)).transpose()?.flatten() else {
-            return drop(self, "group");
-        };
-        let s = self.src_image(img)?;
-        let frames = self.grid_frames(at, s.div)?;
-        let plain = gdst.timer == super::super::Prop::Null
-            && gdst.ops.is_empty()
-            && gdst.draw == super::super::Prop::Null
-            && (frames == 1 || s.cycle == 0)
-            && Stretch::of(gdst.stretch) == Stretch::Identity
-            && !matches!(gdst.blend, 2..=4 | 9)
-            && !gdst.offsets.iter().any(|id| RUNTIME_OFFSETS.contains(id));
-        if !plain {
-            return drop(self, "group");
-        }
-        let Some(c) = self.common_with(Role::Decorative, &gdst, Opts::default())? else {
-            return Ok(None);
-        };
-        let still = c.track.identical()
-            && c.track.keys.first().is_some_and(|k| {
-                k.at == 0 && k.color == [255; 4] && k.angle == 0 && c.offset.r == 0
-            })
-            && matches!(c.track.end, End::Hold | End::Loop { .. })
-            && c.offset == Offset::default();
-        if !still {
-            return drop(self, "group");
-        }
-        let h = c.track.keys.first().map_or(0, |k| k.rect[3]);
-        let bar_h = Q::int(h)
-            .mul(self.r)
-            .and_then(Q::round)
-            .and_then(|h| u16::try_from(h).ok())
-            .filter(|&h| h >= 1);
-        let Some(bar_h) = bar_h else {
-            return drop(self, "group");
-        };
-        let Some((image, _)) = self.add_src_image(&c, img, &s, s.div)? else {
-            return Ok(None);
-        };
-        Ok(Some((image, bar_h)))
     }
 
     /// Whether an image listing offset 4 cannot move over the lanes

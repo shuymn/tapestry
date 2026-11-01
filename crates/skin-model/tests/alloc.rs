@@ -431,11 +431,14 @@ fn lanes() -> skin_model::LanesDef {
             body_on: [part(3); 8],
             body_off: [part(4); 8],
             mine: [part(5); 8],
-            bar: Some(part(6)),
             line: Some(part(7)),
             lift: Some(part(9)),
             hidden: Some(part(8)),
         },
+        bar_groups: vec![skin_model::BarGroupDef {
+            image: part(6),
+            ..lanes_support::bar_group(879, 2)
+        }],
         ..lanes_support::simple()
     }
 }
@@ -1646,6 +1649,7 @@ fn build_does_not_allocate() {
         "built-in timers never drawn"
     );
     source_lanes_do_not_allocate(&chart, &full);
+    bar_groups_do_not_allocate(&full);
     // The next attempt, prepared untracked after the stretches, builds.
     let mut play = skin.prepare(&chart, &full).unwrap();
     skin.attach_text(&mut play, text_table()).unwrap();
@@ -1887,6 +1891,216 @@ fn source_lanes_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
     assert!(
         quads > 0 && tails > 0 && hiddens > 0,
         "source lanes drew {quads} quads, {tails} end caps, {hiddens} HIDDEN+"
+    );
+}
+
+/// Bar groups of every kind: following each cover, turned as they
+/// animate, kept at a native size, added, on `play`, hidden by a
+/// condition and fading on `ready`.
+fn bar_group_defs() -> Vec<skin_model::BarGroupDef> {
+    let base = lanes_support::bar_group(879, 2);
+    let keys = |angle: i32| {
+        [0, 2_000].map(|t| KeyDef {
+            at: TimeUs(t * MS),
+            props: [
+                Some(160),
+                Some(800),
+                Some(544),
+                Some(4),
+                Some(if t == 0 { 0 } else { 255 }),
+                None,
+                None,
+                None,
+                Some(if t == 0 { 0 } else { angle }),
+            ],
+        })
+    };
+    let animated = |angle| Track::new(&keys(angle), Ease::Linear, End::Loop { from: TimeUs(0) });
+    let mut out: Vec<_> = FOLLOWS
+        .iter()
+        .map(|&follow| skin_model::BarGroupDef {
+            place: Place {
+                follow,
+                ..base.place
+            },
+            ..base.clone()
+        })
+        .collect();
+    out.push(skin_model::BarGroupDef {
+        track: animated(270).unwrap(),
+        place: Place {
+            pivot: Anchor::Center,
+            ..base.place
+        },
+        ..base.clone()
+    });
+    out.push(skin_model::BarGroupDef {
+        place: Place {
+            native: Some(Native::Exact([4, 300])),
+            bind: Bind::None,
+            ..base.place
+        },
+        blend: Blend::Add,
+        ..base.clone()
+    });
+    out.push(skin_model::BarGroupDef {
+        timer: TimerRef::Builtin(timer::PLAY),
+        place: Place {
+            native: Some(Native::NoLarger([600, 1])),
+            ..base.place
+        },
+        ..base.clone()
+    });
+    out.push(skin_model::BarGroupDef {
+        visible: Some(bool_program("combo > 0 || cover.enabled")),
+        track: animated(0).unwrap(),
+        ..base
+    });
+    out
+}
+
+/// Bar groups build without allocating: the first build and later ones,
+/// both lane styles, a STOP, the lead-in, every following, turned and
+/// native quads, every budget run out, a play of another group count and
+/// an invalid frame poisoning the play.
+fn bar_groups_do_not_allocate(ctx: &PlayContext<'_>) {
+    let groups = bar_group_defs();
+    let simple = skin_model::LanesDef {
+        bar_groups: groups.clone(),
+        ..lanes_support::simple()
+    };
+    let source = skin_model::LanesDef {
+        bar_groups: groups,
+        ..lanes_support::source()
+    };
+    // Bars every 100 ms over a STOP, then a run of equal bars that spends
+    // every budget.
+    let mut chart = ChartBuilder::new(150_000)
+        .stop(TimeUs(2_000 * MS), TimeUs(1_000 * MS))
+        .tap(lane(3), TimeUs(9_000 * MS))
+        .build()
+        .unwrap();
+    let mut bars: Vec<_> = (0..80)
+        .map(|i| chart.scroll.position_at(TimeUs(i * 100 * MS)))
+        .collect();
+    bars.extend(std::iter::repeat_n(
+        chart.scroll.position_at(TimeUs(9_000 * MS)),
+        usize::try_from(skin_model::LANE_VISITS).unwrap(),
+    ));
+    chart.bar_lines = bars;
+    let t = tally(0);
+    let gauges = [state(GaugeValue::FULL), state(GaugeValue::FULL)];
+    let layout = SkinLayout::AUTHOR;
+    let bar_uv = |uvs: &UvTable| uvs.get(lanes_support::BAR).unwrap().uv;
+    let (mut quads, mut turned, mut drops) = (0_usize, 0_usize, 0_u32);
+    for def in [simple, source] {
+        let skin = lanes_support::lanes_skin(def);
+        let uvs = play_support::uvs(&skin);
+        let mut play = skin.prepare(&chart, ctx).unwrap();
+        let mut batch = QuadBatch::with_capacity(skin.quad_capacity(), skin.run_capacity());
+        let bar = bar_uv(&uvs);
+        TRACK.with(|t| t.set(true));
+        for (i, now) in (-1_000 * MS..10_000 * MS)
+            .step_by(16 * MS as usize)
+            .enumerate()
+        {
+            batch.clear();
+            let lanes = LaneView {
+                visible_time: TimeUs(600 * MS),
+                cover: [0, 300, 0][i / 60 % 3],
+                lift: [0, 0, 250][i / 60 % 3],
+                hidden: 0,
+            };
+            let frame = SkinFrame {
+                now: TimeUs(now),
+                display_offset: TimeUs([0, 40 * MS, -25 * MS][i % 3]),
+                tally: &t,
+                gauges: &gauges,
+                gauge: 0,
+                effects: &[],
+                complete: false,
+                target: TARGETS[i % TARGETS.len()],
+                layout: &layout,
+                lanes,
+                readouts: readouts_for(lanes),
+                loading: None,
+                playing: true,
+            };
+            skin.build(&mut play, &frame, &uvs, &mut batch)
+                .expect("the frame builds");
+            quads += batch.quads().iter().filter(|q| q.uv == bar).count();
+            turned += batch
+                .quads()
+                .iter()
+                .filter(|q| q.uv == bar && q.angle != 0.0)
+                .count();
+            drops += batch.dropped();
+        }
+        // An invalid frame poisons the play; every later build refuses.
+        let lanes = LaneView {
+            visible_time: TimeUs(600 * MS),
+            cover: 0,
+            lift: 0,
+            hidden: 0,
+        };
+        let mut bad = readouts_for(lanes);
+        bad.covers.cover = 500;
+        for _ in 0..3 {
+            batch.clear();
+            let frame = SkinFrame {
+                now: TimeUs(5_000 * MS),
+                display_offset: TimeUs(0),
+                tally: &t,
+                gauges: &gauges,
+                gauge: 0,
+                effects: &[],
+                complete: false,
+                target: TARGETS[0],
+                layout: &layout,
+                lanes,
+                readouts: bad,
+                loading: None,
+                playing: true,
+            };
+            assert_eq!(
+                skin.build(&mut play, &frame, &uvs, &mut batch),
+                Err(BuildError::InvalidReadouts)
+            );
+        }
+        TRACK.with(|t| t.set(false));
+        // A play of another group count draws nothing, allocating nothing.
+        let other = lanes_support::lanes_skin(lanes_support::simple());
+        let mut stranger = other.prepare(&chart, ctx).unwrap();
+        TRACK.with(|t| t.set(true));
+        batch.clear();
+        let frame = SkinFrame {
+            now: TimeUs(5_000 * MS),
+            display_offset: TimeUs(0),
+            tally: &t,
+            gauges: &gauges,
+            gauge: 0,
+            effects: &[],
+            complete: false,
+            target: TARGETS[0],
+            layout: &layout,
+            lanes,
+            readouts: readouts_for(lanes),
+            loading: None,
+            playing: true,
+        };
+        skin.build(&mut stranger, &frame, &uvs, &mut batch)
+            .expect("a wrong play draws nothing");
+        assert!(batch.quads().is_empty());
+        TRACK.with(|t| t.set(false));
+    }
+    assert_eq!(
+        ALLOCS.swap(0, Ordering::Relaxed),
+        0,
+        "bar groups: allocations"
+    );
+    assert!(
+        quads > 0 && turned > 0 && drops > 0,
+        "bar groups drew {quads} bars, {turned} turned, {drops} drops"
     );
 }
 

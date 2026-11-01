@@ -375,6 +375,7 @@ pub fn resolve<'d>(
         chain: vec![def.entry.clone()],
         def,
         enabled,
+        strict: None,
     };
     let mut lists = [Vec::new(), Vec::new(), Vec::new()];
     for (field, out) in [property, filepath, offset].into_iter().zip(&mut lists) {
@@ -467,6 +468,7 @@ impl Resolved<'_> {
             chain: vec![def.entry.clone()],
             def,
             enabled,
+            strict: None,
         };
         let mut t = Tables::default();
         for (name, out) in ARRAYS.iter().zip(&mut t.arrays) {
@@ -499,7 +501,10 @@ impl Resolved<'_> {
             if let Some(dst) = dst {
                 r.nested_array(dst, 3, &mut t.nested)?;
             }
-            for list in [group, bpm, stop, time].into_iter().flatten() {
+            if let Some(group) = group {
+                r.groups(group, 3, &mut t.nested)?;
+            }
+            for list in [bpm, stop, time].into_iter().flatten() {
                 r.nested_destinations(list, 3, &mut t.nested)?;
             }
         }
@@ -530,6 +535,10 @@ struct Resolver<'d, 'e> {
     enabled: &'e BTreeSet<i32>,
     /// The entry file and the includes being resolved, outermost first.
     chain: Vec<FileId>,
+    /// The field whose structure is checked while it resolves: a value
+    /// other than `null` where an array belongs is refused under its name
+    /// rather than read as no records.
+    strict: Option<&'static str>,
 }
 
 impl Resolver<'_, '_> {
@@ -572,6 +581,58 @@ impl Resolver<'_, '_> {
         Ok(())
     }
 
+    /// The `note` record's `group` field at `depth` (`Destination[]`,
+    /// `JsonSkinSerializer.java:69-94`), and each group's `dst`, resolved
+    /// as [`Self::nested_destinations`] does with their structure
+    /// checked once the wrappers have chosen: the field and each `dst`
+    /// an array, each group and each key an object. A wrapper that
+    /// chooses nothing leaves its list empty.
+    fn groups(
+        &mut self,
+        id: u32,
+        depth: u32,
+        nested: &mut HashMap<u32, Vec<u32>>,
+    ) -> Result<(), ImportError> {
+        self.strict_array(id, depth, "group", nested)?;
+        let mut i = 0;
+        while let Some(&d) = nested.get(&id).and_then(|l| l.get(i)) {
+            i += 1;
+            if self.arena().node(d).kind != Kind::Object {
+                return Err(self.def.type_error(d, "group", "an object"));
+            }
+            let Some(dst) = self.def.fields(d, ["dst"])[0] else {
+                continue;
+            };
+            self.strict_array(dst, depth + 2, "dst", nested)?;
+            let bad = nested
+                .get(&dst)
+                .and_then(|keys| {
+                    keys.iter()
+                        .find(|&&k| self.arena().node(k).kind != Kind::Object)
+                })
+                .copied();
+            if let Some(k) = bad {
+                return Err(self.def.type_error(k, "dst", "an object"));
+            }
+        }
+        Ok(())
+    }
+
+    /// [`Self::nested_array`] with `field`'s structure checked
+    /// ([`Self::strict`]).
+    fn strict_array(
+        &mut self,
+        id: u32,
+        depth: u32,
+        field: &'static str,
+        nested: &mut HashMap<u32, Vec<u32>>,
+    ) -> Result<(), ImportError> {
+        self.strict = Some(field);
+        let r = self.nested_array(id, depth, nested);
+        self.strict = None;
+        r
+    }
+
     /// Adds `record` to `out`, counting it first.
     fn emit(&mut self, record: u32, out: &mut Vec<u32>) -> Result<(), ImportError> {
         if self.def.run.expanded >= self.def.limits.expanded {
@@ -605,7 +666,12 @@ impl Resolver<'_, '_> {
                 Some(rec) => self.emit(rec, out),
                 None => Ok(()),
             },
-            Kind::Quoted | Kind::Bare => Ok(()),
+            Kind::Quoted | Kind::Bare => match self.strict {
+                Some(field) if !matches!(self.arena().scalar(id), Scalar::Null) => {
+                    Err(self.def.type_error(id, field, "an array"))
+                }
+                _ => Ok(()),
+            },
         }
     }
 

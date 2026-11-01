@@ -27,9 +27,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use bms_model::TimeUs;
 use skin_model::{
-    Anchor, Blend, CycleDef, Ease, ElementDef, Filter, Fit, Follow, Grade, KeyDef, LoadError,
-    MAX_GEOMETRY, Native, PLAY, Place, Program, Region, RegionDef, Scope, Skin, SkinDef, Source,
-    TimerRef, Track, Ty, WidgetDefs, compile, timer as slot,
+    Anchor, Blend, CycleDef, Ease, ElementDef, Filter, Fit, Follow, Grade, KeyDef, LanesDef,
+    LanesError, LoadError, MAX_GEOMETRY, Native, PLAY, Place, Program, Region, RegionDef, Scope,
+    Skin, SkinDef, Source, TimerRef, Track, Ty, WidgetDefs, compile, timer as slot,
 };
 
 pub use budget::ImportLimit;
@@ -236,6 +236,8 @@ struct Opts<'a> {
     digits: Option<i32>,
     /// The keys as written were charged before this read.
     charged: bool,
+    /// The keys' clip is unused: noted, never refused.
+    unclipped: bool,
     /// A condition the element is drawn under besides its own: a value's
     /// availability ([`property::Value::availability`]), joined first.
     guard: Option<&'static str>,
@@ -806,6 +808,10 @@ impl<'d> Cx<'d> {
                 k.angle = 0;
             }
         }
+        if keys.clip && o.unclipped {
+            self.ignored(at, NoteKind::Ignored { field: "clip" });
+            keys.clip = false;
+        }
         if keys.clip {
             self.drop_el(role, at, NoteKind::UnsupportedField { field: "clip" })?;
             return Ok(None);
@@ -1338,12 +1344,20 @@ impl<'d> Cx<'d> {
         let bomb_up_to = self.bomb_up_to()?;
         let assets = std::mem::replace(&mut self.assets, Assets::new(self.def.root()));
         let sheet = assets.finish();
+        // The lanes' groups move to the skin; the rest is copied.
+        let lanes = self.lanes.as_mut().map(|l| {
+            let bar_groups = std::mem::take(&mut l.def.bar_groups);
+            LanesDef {
+                bar_groups,
+                ..l.def.clone()
+            }
+        });
         let def = SkinDef {
             fit: Fit::Fixed,
             regions: REGIONS,
             whens: std::mem::take(&mut self.whens),
             sheet,
-            lanes: self.lanes.as_ref().map(|l| l.def),
+            lanes,
             elements: std::mem::take(&mut self.elements),
             widgets: std::mem::take(&mut self.widgets),
             bomb_up_to,
@@ -1391,6 +1405,9 @@ impl<'d> Cx<'d> {
             | LoadError::Judge { element, .. }
             | LoadError::Text { element, .. } => Some(self.element_spans.get(element)?),
             LoadError::WhenNotBool { when } => Some(self.when_spans.get(when)?),
+            LoadError::Lanes(LanesError::BarGroup { group, .. }) => {
+                Some(self.lanes.as_ref()?.bar_spans.get(group)?)
+            }
             LoadError::Lanes(_) | LoadError::LanesTwice | LoadError::LanesRegion => {
                 Some(&self.lanes.as_ref()?.span)
             }

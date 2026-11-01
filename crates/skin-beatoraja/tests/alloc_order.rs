@@ -1,8 +1,9 @@
 //! The header's record caps are checked before anything is gathered for
 //! a record: one option with far more items than the cap allows refuses
 //! with no allocation sized by the array. Likewise an image set's entries
-//! are charged before its table is gathered, and a shared selector's ops
-//! before its copy is made.
+//! are charged before its table is gathered, a shared selector's ops
+//! before its copy is made, and the lanes' bar groups and each group's
+//! keys before their ids are copied.
 //!
 //! A global allocator records the largest single allocation made on a
 //! thread that opts in (a thread-local flag), and how many were of one
@@ -22,7 +23,9 @@ use skin_beatoraja::limits::MAX_OPTION_ITEMS;
 use skin_beatoraja::{
     Config, Definition, ImportError, ImportLimit, InputLimit, import, read_header, resolve,
 };
-use skin_model::{MAX_IMAGE_CHOICE_REFS, MAX_SKIN_OPS, PLAY, Scope, Ty, compile};
+use skin_model::{
+    MAX_BAR_GROUPS, MAX_IMAGE_CHOICE_REFS, MAX_SKIN_KEYS, MAX_SKIN_OPS, PLAY, Scope, Ty, compile,
+};
 
 struct Largest;
 
@@ -179,4 +182,39 @@ fn option_items_are_counted_before_anything_is_gathered() {
         "{result:?}"
     );
     assert_eq!(SEEN.load(Ordering::Relaxed), 2);
+
+    // Bar groups 16 times their cap, then one group of 4 times the skin's
+    // keys: each list's ids are gathered once by the resolution and
+    // refused before the import copies them.
+    let groups = vec!["{}"; 16 * MAX_BAR_GROUPS].join(",");
+    let keys = vec![r#"{"w": 1, "h": 1}"#; 4 * MAX_SKIN_KEYS].join(",");
+    for (group, n, want) in [
+        (groups, 16 * MAX_BAR_GROUPS, ImportLimit::BarGroups),
+        (
+            format!(r#"{{"id": "bar", "dst": [{keys}]}}"#),
+            4 * MAX_SKIN_KEYS,
+            ImportLimit::Keys,
+        ),
+    ] {
+        let note = common::lanes::note(&format!(r#""group": [{group}]"#));
+        let d = skin(&[(
+            "s.json",
+            &common::hd(&format!(
+                r#""source": [{{"id": "a", "path": "a.png"}}], {}"#,
+                common::lanes::body("", &note, &[common::lanes::NOTES])
+            )),
+        )]);
+        common::png(d.path(), "a.png", 64, 64);
+        let (mut def, h) = read_header(d.path(), "s.json").unwrap();
+        let config = Config::defaults(&h);
+        WATCHED.store(n * size_of::<u32>(), Ordering::Relaxed);
+        SEEN.store(0, Ordering::Relaxed);
+        let (result, _) = largest(|| import(&mut def, &h, &config).map(|_| ()));
+        WATCHED.store(usize::MAX, Ordering::Relaxed);
+        assert!(
+            matches!(result, Err(ImportError::Limit { limit, .. }) if limit == want),
+            "{result:?}"
+        );
+        assert_eq!(SEEN.load(Ordering::Relaxed), 1, "{want:?}");
+    }
 }

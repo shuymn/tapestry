@@ -667,6 +667,7 @@ pub fn skin_jsons() -> Vec<Seed> {
             skin_input(&[r#"{"type": 0, "offset": [{"include": "none.json"}]}"#]),
         ),
         ("configured_fails", skin_input(&[&configured_fails, "[]"])),
+        ("bar_group_limit", play_skin(&bar_group_limit_body())),
     ]
     .into_iter()
     .chain(skin_imports())
@@ -823,6 +824,7 @@ pub fn skin_imports() -> Vec<Seed> {
             ),
         ),
         ("lanes", play_skin(&lanes_body())),
+        ("bar_groups", play_skin(&bar_groups_body())),
         ("paints", play_skin(&paints_body())),
         ("followers", play_skin(&followers_body())),
         (
@@ -1010,6 +1012,38 @@ fn selectors_body() -> String {
     )
 }
 
+/// The bar line group of [`lanes_body`].
+const LANES_GROUP: &str =
+    r#""group": [{"id": "bar", "dst": [{"x": 20, "y": 200, "w": 430, "h": 2}]}]"#;
+
+/// [`lanes_body`] with four bar line groups: the plain one; an added,
+/// translucent one following LIFT on the play timer over an image of two
+/// frames whose `len` and `ref` (500) are unused; a turned one while
+/// SUDDEN+ is on; and one of an undefined image, dropped.
+fn bar_groups_body() -> String {
+    lanes_body()
+        .replace(
+            r#"{"id": "cv", "src": "grid", "x": 4, "w": 4, "h": 4}],"#,
+            r#"{"id": "cv", "src": "grid", "x": 4, "w": 4, "h": 4},
+               {"id": "anim", "src": "grid", "w": 4, "h": 4, "divx": 2, "cycle": 100, "len": 2, "ref": 500}],"#,
+        )
+        .replace(
+            LANES_GROUP,
+            r#""group": [
+                {"id": "bar", "dst": [{"x": 20, "y": 200, "w": 430, "h": 2}]},
+                {"id": "anim", "blend": 2, "offset": 3, "timer": 41, "dst": [{"x": 20, "y": 199, "w": 430, "h": 4, "a": 128}]},
+                {"id": "bar", "op": [271], "dst": [{"x": 100, "y": 198, "w": 50, "h": 6, "angle": 10}]},
+                {"id": "nope", "dst": [{"x": 0, "y": 0, "w": 1, "h": 1}]}]"#,
+        )
+}
+
+/// [`lanes_body`] with one bar line group past the cap.
+fn bar_group_limit_body() -> String {
+    let group = r#"{"id": "bar", "dst": [{"w": 1, "h": 1}]}"#;
+    let groups = vec![group; skin_model::MAX_BAR_GROUPS + 1].join(",");
+    lanes_body().replace(LANES_GROUP, &format!(r#""group": [{groups}]"#))
+}
+
 /// [`lanes_body`] with what follows the covers, each id repeated: an image
 /// beside the lanes following SUDDEN+, a number following LIFT, and a
 /// judge whose grade follows LIFT, its relative combo taking 3 and 4
@@ -1057,8 +1091,8 @@ fn paints_body() -> String {
     )
 }
 
-/// Lanes of `grid` parts over x 20..450, y 200..800, with a bar line,
-/// SUDDEN+'s paint, LIFT and HIDDEN+.
+/// Lanes of `grid` parts over x 20..450, y 200..800, with a bar line
+/// group on their bottom edge, SUDDEN+'s paint, LIFT and HIDDEN+.
 fn lanes_body() -> String {
     let eight = [r#""p""#; 8].join(", ");
     let lists = [
@@ -1086,7 +1120,7 @@ fn lanes_body() -> String {
                      {{"id": "bar", "src": "grid", "y": 4, "w": 4, "h": 1}},
                      {{"id": "cv", "src": "grid", "x": 4, "w": 4, "h": 4}}],
             "note": {{"id": "notes", {lists}, "size": [20, 20, 20, 20, 20, 20, 20, 20], "dst": [{}],
-                     "group": [{{"id": "bar", "dst": [{{"x": 0, "y": 0, "w": 4, "h": 2}}]}}]}},
+                     "group": [{{"id": "bar", "dst": [{{"x": 20, "y": 200, "w": 430, "h": 2}}]}}]}},
             "liftCover": [{{"id": "lc", "src": "grid", "x": 4, "y": 4, "w": 4, "h": 4, "disapearLine": 200}}],
             "hiddenCover": [{{"id": "hid", "src": "grid", "y": 4, "w": 4, "h": 4, "disapearLine": 200}}],
             "destination": [

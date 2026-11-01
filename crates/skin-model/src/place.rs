@@ -608,6 +608,10 @@ impl Placement {
 pub(crate) struct LaneMap(Option<[f64; 3]>);
 
 impl LaneMap {
+    /// The map of an unbound element.
+    #[cfg(test)]
+    pub(crate) const IDENTITY: Self = Self(None);
+
     /// A point's x.
     pub(crate) fn x(self, x: f32) -> f32 {
         self.0

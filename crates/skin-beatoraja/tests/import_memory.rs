@@ -29,10 +29,10 @@ use skin_beatoraja::{
     Config, Header, ImportError, Imported, InputLimit, Note, Report, import, read_header,
 };
 use skin_model::{
-    ElementDef, ImageChoiceDef, ImageChoicePart, ImageDef, KeyDef, MAX_ELEMENTS, MAX_FILES,
-    MAX_FNT_BYTES, MAX_FNT_PAGES, MAX_FONTS, MAX_IMAGE_CHOICE_REFS, MAX_SHEET_GLYPHS,
+    ElementDef, ImageChoiceDef, ImageChoicePart, ImageDef, KeyDef, MAX_BAR_GROUPS, MAX_ELEMENTS,
+    MAX_FILES, MAX_FNT_BYTES, MAX_FNT_PAGES, MAX_FONTS, MAX_IMAGE_CHOICE_REFS, MAX_SHEET_GLYPHS,
     MAX_SHEET_KERNINGS, MAX_SKIN_FRAMES, MAX_SKIN_KEYS, MAX_SKIN_OPS, MAX_TEXT_ELEMENTS,
-    MAX_WIDGET_QUADS, Program,
+    MAX_WIDGET_QUADS, Program, Skin,
 };
 
 /// The recorded bound: the largest measured peak over the fixtures plus
@@ -114,6 +114,26 @@ fn measure(root: &Path, check: impl FnOnce(&Header, Imported)) -> i64 {
         let imported = import(&mut def, &header, &Config::defaults(&header)).unwrap();
         (def, header, imported)
     });
+    check(&header, imported);
+    drop(def);
+    p
+}
+
+/// [`measure`] with a play of the import over `chart` prepared in the
+/// window, its state and batch: what the import keeps plus the most
+/// preparing adds.
+fn measure_prepared(
+    root: &Path,
+    chart: &bms_model::Chart,
+    check: impl FnOnce(&Header, Imported),
+) -> i64 {
+    let ((def, header, imported, prepared), p) = peak(|| {
+        let (mut def, header) = read_header(root, "s.json").unwrap();
+        let imported = import(&mut def, &header, &Config::defaults(&header)).unwrap();
+        let prepared = common::play::prepared(&imported.skin, chart);
+        (def, header, imported, prepared)
+    });
+    drop(prepared);
     check(&header, imported);
     drop(def);
     p
@@ -594,9 +614,9 @@ fn check_f8b(_: &Header, i: Imported) {
 /// F5's judges: 5,127 with a 2-digit combo and one with a 1-digit combo.
 const JUDGES: usize = 5_128;
 /// Judges whose grade has 11 keys; the rest have 10.
-const ELEVEN_KEYS: usize = 3_994;
+const ELEVEN_KEYS: usize = 3_992;
 /// Judges whose grade has the 7-op predicate; the rest the 17-op one.
-const SEVEN_OPS: usize = 2_164;
+const SEVEN_OPS: usize = 2_165;
 /// The grades' offsets in turn: none, LIFT, SUDDEN+, both repeated.
 const FOLLOWS: [&str; 4] = [
     "",
@@ -605,8 +625,17 @@ const FOLLOWS: [&str; 4] = [
     r#""offsets": [3, 4, 3], "offset": 4, "#,
 ];
 
+/// F5's bar line groups: grey under a full gauge on the ready timer; red,
+/// translucent and added on a PERFECT on the play timer; a smaller one
+/// otherwise; the latter two over images of two frames.
+const F5_GROUPS: &str = r#"
+    {"id": "bar", "op": [240], "dst": [{"x": 21, "y": 200, "w": 428, "h": 2, "r": 128, "g": 128, "b": 128}]},
+    {"id": "bar2", "timer": 41, "blend": 2, "op": [241], "dst": [{"x": 21, "y": 199, "w": 428, "h": 4, "a": 128, "r": 255, "g": 0, "b": 0}]},
+    {"id": "bar3", "op": [-241], "dst": [{"x": 100, "y": 198, "w": 50, "h": 6}]}"#;
+
 /// F5: the play objects at the key, op and widget quad caps. Lanes of 48
-/// distinct part images with a bar, SUDDEN+, LIFT and HIDDEN+; a 36-node
+/// distinct part images with three bar line groups ([`F5_GROUPS`]),
+/// SUDDEN+, LIFT and HIDDEN+; a 36-node
 /// gauge of 1,000 flickering parts (1,001 quads); 5,128 judges, each one
 /// grade of 10 or 11 timed keys under a 7- or 17-op predicate and a combo
 /// of 2 digits (3 quads), one of 1 digit (2 quads).
@@ -624,6 +653,14 @@ fn f5(root: &Path) {
         .map(|i| cell(&format!("p{}_{}", i / 6, i % 6), i, 8, 20))
         .collect();
     images.push(cell("bar", 48, 8, 2));
+    images.push(
+        r#"{"id": "bar2", "src": "a", "x": 64, "y": 220, "w": 16, "h": 2, "divx": 2, "cycle": 100}"#
+            .to_owned(),
+    );
+    images.push(
+        r#"{"id": "bar3", "src": "a", "x": 96, "y": 220, "w": 8, "h": 8, "divy": 2, "cycle": 200}"#
+            .to_owned(),
+    );
     images.push(cell("cv", 49, 8, 8));
     images.push(cell("g", 50, 8, 8));
     images.extend((0..36).map(|n| cell(&format!("n{n}"), 51 + n, 8, 8)));
@@ -632,7 +669,7 @@ fn f5(root: &Path) {
         r#"{{"id": "notes", "note": [{}], "lnstart": [{}], "lnend": [{}], "lnbody": [{}],
             "lnactive": [{}], "mine": [{}], "hcnstart": [{}], "hcnend": [{}], "hcnbody": [{}],
             "hcnactive": [{}], "hcndamage": [{}], "hcnreactive": [{}], "dst": [{}],
-            "group": [{{"id": "bar", "dst": [{{"x": 0, "y": 0, "w": 8, "h": 2}}]}}]}}"#,
+            "group": [{F5_GROUPS}]}}"#,
         list(0),
         list(1),
         list(2),
@@ -700,8 +737,25 @@ fn f5(root: &Path) {
     );
 }
 
+/// F5's chart: no note on screen, bars at 1 000 and 1 050 ms.
+fn f5_chart() -> bms_model::Chart {
+    let mut chart = bms_model::ChartBuilder::new(150_000)
+        .tap(
+            bms_model::Lane::new(1).unwrap(),
+            bms_model::TimeUs(100_000_000),
+        )
+        .build()
+        .unwrap();
+    chart.bar_lines = [1_000_000, 1_050_000]
+        .map(|t| chart.scroll.position_at(bms_model::TimeUs(t)))
+        .to_vec();
+    chart
+}
+
 fn check_f5(_: &Header, i: Imported) {
     let u = i.report.usage;
+    assert_eq!(u.bar_groups, 3);
+    assert_eq!(i.skin.bar_group_count(), 3);
     assert_eq!(u.keys, as_u32(MAX_SKIN_KEYS));
     assert_eq!(u.ops, as_u32(MAX_SKIN_OPS));
     assert_eq!(u.widget_quads, MAX_WIDGET_QUADS);
@@ -714,15 +768,9 @@ fn check_f5(_: &Header, i: Imported) {
         MAX_WIDGET_QUADS + 1 + skin_model::LANE_QUADS + skin_model::LANE_RESERVED
     );
     // The snapshot: a PERFECT with combo 12, the gauge full, SUDDEN+ at
-    // 300 ‰, LIFT at 100 ‰ and HIDDEN+ at 500 ‰, no note on screen.
-    let chart = bms_model::ChartBuilder::new(150_000)
-        .tap(
-            bms_model::Lane::new(1).unwrap(),
-            bms_model::TimeUs(100_000_000),
-        )
-        .build()
-        .unwrap();
-    let mut d = Drawn::over(i.skin, &chart);
+    // 300 ‰, LIFT at 100 ‰ and HIDDEN+ at 500 ‰, no note on screen, two
+    // bars.
+    let mut d = Drawn::over(i.skin, &f5_chart());
     d.tally = common::play::tally(2, 12);
     d.gauges[0].value = GaugeValue::FULL;
     d.view.cover = 300;
@@ -765,7 +813,34 @@ fn check_f5(_: &Header, i: Imported) {
         .map(|(_, n)| n)
         .sum();
     assert!((1_000..=1_001).contains(&gauge), "{by_size:?}");
-    assert_eq!(q.len(), JUDGES + 2 * JUDGES - 1 + 3 + gauge, "{by_size:?}");
+    // Each bar, the one at the line then the coming one higher,
+    // draws the full-gauge group then the PERFECT one, before the notes;
+    // the third group is off.
+    let bars = |q: &[skin_model::Quad]| -> Vec<([i32; 4], [f32; 4], [u32; 4])> {
+        q.iter()
+            .filter(|q| matches!(common::play::round(q.rect), [_, _, 428 | 50, _]))
+            .map(|q| (common::play::round(q.rect), q.color, q.uv.map(f32::to_bits)))
+            .collect()
+    };
+    let grey = [128.0 / 255.0, 128.0 / 255.0, 128.0 / 255.0, 1.0];
+    let red = [1.0, 0.0, 0.0, 128.0 / 255.0];
+    let shown = bars(&q);
+    let looks: Vec<([i32; 4], [f32; 4])> = shown.iter().map(|&(r, c, _)| (r, c)).collect();
+    assert_eq!(
+        looks,
+        [
+            ([21, 878, 428, 2], grey),
+            ([21, 877, 428, 4], red),
+            ([21, 847, 428, 2], grey),
+            ([21, 846, 428, 4], red),
+        ]
+    );
+    assert_ne!(shown[0].2, shown[1].2);
+    assert_eq!(
+        q.len(),
+        JUDGES + 2 * JUDGES - 1 + 3 + gauge + 4,
+        "{by_size:?}"
+    );
     // Each follower moves once: LIFT at 100 ‰ of the 600 px lane lifts
     // by 60, SUDDEN+ at 300 ‰ of the 540 px left lowers by 162. The
     // grades cycle through none, LIFT, SUDDEN+ and both, each combo
@@ -795,6 +870,87 @@ fn check_f5(_: &Header, i: Imported) {
         [910],
         "{gauge_rows:?}"
     );
+    // On a GREAT 50 ms later the second bar is at the line and the first
+    // gone: the full-gauge group, then the third in its own size.
+    let q = d.frame(1_050, &[judged(1_050, Judgment::Great, 13)]);
+    let shown = bars(&q);
+    let looks: Vec<([i32; 4], [f32; 4])> = shown.iter().map(|&(r, c, _)| (r, c)).collect();
+    assert_eq!(
+        looks,
+        [([21, 878, 428, 2], grey), ([100, 876, 50, 6], [1.0; 4])]
+    );
+    assert_ne!(shown[0].2, shown[1].2);
+}
+
+/// F9: the bar line groups at their cap, one key and the one-op
+/// condition `cover.enabled` each, over one image, and SUDDEN+.
+fn f9(root: &Path) {
+    use common::lanes::{body, cover, note};
+    png(root, "a.png", 64, 64);
+    let group = r#"{"id": "bar", "op": [271], "dst": [{"x": 20, "y": 200, "w": 430, "h": 2}]}"#;
+    let groups = join(std::iter::repeat_n(group.to_owned(), MAX_BAR_GROUPS));
+    let objects = note(&format!(r#""group": [{groups}]"#));
+    let dsts = [common::lanes::NOTES.to_owned(), cover("")];
+    let dsts: Vec<&str> = dsts.iter().map(String::as_str).collect();
+    write(
+        root,
+        "s.json",
+        common::hd(&format!(
+            r#""source": [{{"id": "a", "path": "a.png"}}], {}"#,
+            body("", &objects, &dsts)
+        ))
+        .as_bytes(),
+    );
+}
+
+/// F9's chart: a note and a bar on the line at 1 s.
+fn f9_chart() -> bms_model::Chart {
+    let mut chart = bms_model::ChartBuilder::new(150_000)
+        .tap(
+            bms_model::Lane::new(1).unwrap(),
+            bms_model::TimeUs(1_000_000),
+        )
+        .build()
+        .unwrap();
+    chart.bar_lines = vec![chart.scroll.position_at(bms_model::TimeUs(1_000_000))];
+    chart
+}
+
+fn check_f9(_: &Header, i: Imported) {
+    let u = i.report.usage;
+    let n = as_u32(MAX_BAR_GROUPS);
+    assert_eq!(u.bar_groups, n);
+    assert_eq!(i.skin.bar_group_count(), MAX_BAR_GROUPS);
+    assert_eq!((u.elements, u.keys, u.ops), (2, n + 2, n));
+    assert_eq!(i.skin.ops().total(), MAX_BAR_GROUPS);
+    assert_eq!(u.images, 8);
+    // The groups add no quads of their own to the batch.
+    assert_eq!(
+        i.skin.quad_capacity(),
+        1 + skin_model::LANE_QUADS + skin_model::LANE_RESERVED
+    );
+    // The bar's groups spend the lanes' quads in group order, then one
+    // drop; the note on the line gets none; SUDDEN+ still draws.
+    let mut d = Drawn::over(i.skin, &f9_chart());
+    d.view.cover = 300;
+    let q = d.frame(1_000, &[]);
+    let bars = q
+        .iter()
+        .filter(|q| common::play::round(q.rect) == [20, 878, 430, 2])
+        .count();
+    assert_eq!(bars, skin_model::LANE_QUADS as usize);
+    let notes = q
+        .iter()
+        .filter(|q| common::play::round(q.rect)[2] == 50)
+        .count();
+    assert_eq!(notes, 0);
+    assert_eq!(d.batch.dropped(), 1);
+    let covers = q
+        .iter()
+        .filter(|q| common::play::round(q.rect)[2..] == [430, 600])
+        .count();
+    assert_eq!(covers, 1, "{:?}", q.last().map(|q| q.rect));
+    assert_eq!(q.len(), skin_model::LANE_QUADS as usize + 1);
 }
 
 /// A relative name of `len` bytes ending in `tail`, in folders of at most
@@ -990,6 +1146,17 @@ fn import_memory_is_measured() {
         size_of::<Option<ImageChoicePart>>(),
         size_of::<skin_model::CoverPaintDef>(),
     );
+    // A group's work in a play: its frame record and its heap slot of 2 B,
+    // 32 768 B of heap at the cap.
+    let scratch = Skin::bar_group_scratch_bytes();
+    println!(
+        "sizes: BarGroupDef {}, bar group scratch {scratch} (frame record {}), \
+         at the cap {} (heap {})",
+        size_of::<skin_model::BarGroupDef>(),
+        scratch - 2,
+        MAX_BAR_GROUPS * scratch,
+        MAX_BAR_GROUPS * 2,
+    );
     let mut peaks = Vec::new();
     let d = tempfile::tempdir().unwrap();
     f1(d.path());
@@ -1011,14 +1178,22 @@ fn import_memory_is_measured() {
     drop(d);
     assert_eq!(ops_of("240"), 7);
     assert_eq!(ops_of("-230, -231"), 17);
-    assert_eq!(SEVEN_OPS * 7 + (JUDGES - SEVEN_OPS) * 17, MAX_SKIN_OPS);
+    // The groups' conditions: the full gauge (7), and with the judges'
+    // region a PERFECT (1) and its negation (2), as F5's total checks.
     assert_eq!(
-        6 + 2 * JUDGES + ELEVEN_KEYS * 11 + (JUDGES - ELEVEN_KEYS) * 10,
+        SEVEN_OPS * 7 + (JUDGES - SEVEN_OPS) * 17 + 7 + 1 + 2,
+        MAX_SKIN_OPS
+    );
+    assert_eq!(
+        8 + 2 * JUDGES + ELEVEN_KEYS * 11 + (JUDGES - ELEVEN_KEYS) * 10,
         MAX_SKIN_KEYS
     );
     let d = tempfile::tempdir().unwrap();
     f5(d.path());
-    peaks.push(("F5 play objects", measure(d.path(), check_f5)));
+    peaks.push((
+        "F5 play objects",
+        measure_prepared(d.path(), &f5_chart(), check_f5),
+    ));
     drop(d);
     let d = tempfile::tempdir().unwrap();
     f6(d.path());
@@ -1035,6 +1210,13 @@ fn import_memory_is_measured() {
     let d = tempfile::tempdir().unwrap();
     f8b(d.path());
     peaks.push(("F8b paints", measure(d.path(), check_f8b)));
+    drop(d);
+    let d = tempfile::tempdir().unwrap();
+    f9(d.path());
+    peaks.push((
+        "F9 bar groups",
+        measure_prepared(d.path(), &f9_chart(), check_f9),
+    ));
     drop(d);
     for (name, p) in &peaks {
         println!("{name}: peak {p} B");
