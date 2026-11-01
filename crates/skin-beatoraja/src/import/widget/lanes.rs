@@ -698,7 +698,7 @@ impl Cx<'_> {
         if !plain {
             return drop(self, "group");
         }
-        let Some(c) = self.common(Role::Decorative, &gdst, false)? else {
+        let Some(c) = self.common_with(Role::Decorative, &gdst, Opts::default())? else {
             return Ok(None);
         };
         let still = c.track.identical()

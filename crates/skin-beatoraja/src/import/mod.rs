@@ -733,25 +733,15 @@ impl<'d> Cx<'d> {
         Ok(())
     }
 
-    /// The common part of an element: track, conditions,
-    /// timer, offsets, blend and pivot, each through the role policy.
+    /// The common part of an element, read as `o` says: track,
+    /// conditions, timer, offsets, blend and pivot, each through the role
+    /// policy.
     /// `None` when the element was dropped or is never drawn.
     ///
     /// A `text` consumes neither the angle nor the blend
     /// (`SkinTextFont.java:158-176`): its keys' angles are cleared before
-    /// the track is accepted, and an angle or a blend is only noted.
-    fn common(&mut self, role: Role, dst: &Dst, text: bool) -> Result<Option<Common>, ImportError> {
-        self.common_with(
-            role,
-            dst,
-            Opts {
-                text,
-                ..Opts::default()
-            },
-        )
-    }
-
-    /// [`Self::common`] read as `o` says.
+    /// the track is accepted, and an angle or a blend is only noted
+    /// (`Opts::text`).
     fn common_with(
         &mut self,
         role: Role,
