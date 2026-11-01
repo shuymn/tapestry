@@ -205,7 +205,7 @@ impl Cx<'_> {
         #[cfg(test)]
         RETAINED.with(|r| r.borrow_mut().push(retained(&def, &t)));
         self.widgets.judges.push(def);
-        self.push(c, Source::Judge(index), t);
+        self.push(c, Source::Judge(index), t)?;
         Ok(())
     }
 
@@ -229,7 +229,11 @@ impl Cx<'_> {
             self.drop_el(role, at, NoteKind::Stretch(gdst.stretch))?;
         }
         let s = self.src_image(img)?;
-        let Some(c) = self.common(role, gdst, false)? else {
+        let o = Opts {
+            follow: true,
+            ..Opts::default()
+        };
+        let Some(c) = self.common_with(role, gdst, o)? else {
             return Ok(None);
         };
         let Some((image, cell)) = self.add_src_image(&c, img, &s, s.div)? else {
@@ -257,6 +261,7 @@ impl Cx<'_> {
         if !track::one_branch(shared) {
             self.drop_el(role, at, NoteKind::Stretch(c.stretch_mode))?;
         }
+        self.cover_motion(&c)?;
         let track = self.model_track(&c, &rects)?;
         Ok(Some((
             GradePart {
@@ -267,6 +272,7 @@ impl Cx<'_> {
                 blend: c.blend,
                 visible: c.visible,
                 native,
+                follow: c.follow,
             },
             moved,
         )))
@@ -311,6 +317,7 @@ impl Cx<'_> {
             ndst,
             Opts {
                 digits: Some(digit),
+                relative: true,
                 ..Opts::default()
             },
         )?

@@ -17,9 +17,9 @@ use lanes_support::{
 use play_support::{GAUGES, Harness, MS, REGIONS, ev, full, hold_ended, judged, lane, ln_held};
 use rules::Judgment;
 use skin_model::{
-    Attempt, Bind, Canvas, Fill, Fit, HiddenTrim, LANE_QUADS, LANE_RESERVED, LANE_VISITS, LanePart,
-    LanesDef, LanesError, Layout, LoadError, MAX_COORD, Place, PlayContext, QuadBatch, Region,
-    Scale, Side, Skin, SkinDef,
+    Attempt, Bind, Canvas, Fill, Fit, Follow, HiddenTrim, LANE_QUADS, LANE_RESERVED, LANE_VISITS,
+    LanePart, LaneView, LanesDef, LanesError, Layout, LoadError, MAX_COORD, Place, PlayContext,
+    QuadBatch, Region, Scale, Side, Skin, SkinDef,
 };
 
 /// 150 BPM, in thousandths.
@@ -1639,4 +1639,148 @@ fn the_lanes_draw_in_one_run_with_the_widgets_color() {
         assert_eq!(q.color, [1.0, 1.0, 1.0, 0.2]);
         assert_eq!(q.angle, 0.0);
     }
+}
+
+/// A follower of `follow` showing white over `[x, 400, 10, 10]` in the
+/// playfield.
+fn follower(x: i32, follow: Follow) -> skin_model::ElementDef {
+    let place = Place {
+        follow,
+        ..in_region(Region::Playfield)
+    };
+    image(WHITE, [x, 400, 10, 10], place)
+}
+
+/// The white quads' `(x, y)`, sorted by x.
+fn followers_at(h: &Harness) -> Vec<[f32; 2]> {
+    let mut out: Vec<[f32; 2]> = rects(h, WHITE).iter().map(|r| [r[0], r[1]]).collect();
+    out.sort_by(|a, b| a[0].total_cmp(&b[0]));
+    out
+}
+
+fn view(lift: u16, cover: u16, hidden: u16) -> LaneView {
+    LaneView {
+        lift,
+        cover,
+        hidden,
+        ..play_support::VIEW
+    }
+}
+
+#[test]
+fn followers_move_by_this_frames_cover_geometry() {
+    // The source lanes are 600 high (H). A lift of 300 ‰ raises the line
+    // by L = 180 and leaves 420; a cover of 500 ‰ takes C = 210 of it,
+    // leaving a scroll of 210. A lift follower moves −L, a cover follower
+    // +C, one following both C − L = +30. HIDDEN+ at 500 ‰ (K = 210)
+    // moves none of them. Followers before and after the lanes, and with
+    // the lanes' timer off, read the same frame.
+    let off = skin_model::ElementDef {
+        timer: skin_model::TimerRef::Builtin(skin_model::timer::FULL_COMBO),
+        ..lanes_element()
+    };
+    let elements = |lanes: skin_model::ElementDef| {
+        vec![
+            follower(600, Follow::None),
+            follower(620, Follow::Lift),
+            lanes,
+            follower(640, Follow::Cover),
+            follower(660, Follow::LiftAndCover),
+        ]
+    };
+    let chart = long_note();
+    for lanes in [lanes_element(), off] {
+        let skin = skin_with(REGIONS, Some(lanes_support::source()), elements(lanes)).unwrap();
+        let mut h = Harness::new(skin, &chart, &full(0));
+        h.view = view(300, 500, 0);
+        h.frame(0, &[]);
+        let moved = [
+            [600.0, 400.0],
+            [620.0, 220.0],
+            [640.0, 610.0],
+            [660.0, 430.0],
+        ];
+        assert_eq!(followers_at(&h), moved);
+        h.view = view(300, 500, 500);
+        h.frame(16, &[]);
+        assert_eq!(followers_at(&h), moved);
+        // The next build uses its own amounts at once.
+        h.view = view(0, 0, 0);
+        h.frame(32, &[]);
+        let still = [
+            [600.0, 400.0],
+            [620.0, 400.0],
+            [640.0, 400.0],
+            [660.0, 400.0],
+        ];
+        assert_eq!(followers_at(&h), still);
+    }
+}
+
+#[test]
+fn cover_amounts_cap_at_a_whole_lane() {
+    // The simple lanes are 800 long (top 80, line 880). Amounts cap at
+    // 1 000 ‰: a full lift raises the line 800 and leaves no cover
+    // travel; a full cover with no lift travels 800; past 1 000 reads as
+    // 1 000. Every follower stays finite, with no scroll left.
+    let elements = vec![
+        lanes_element(),
+        follower(600, Follow::Lift),
+        follower(620, Follow::Cover),
+        follower(640, Follow::LiftAndCover),
+    ];
+    let skin = skin_with(REGIONS, Some(simple()), elements).unwrap();
+    let chart = long_note();
+    let mut h = Harness::new(skin, &chart, &full(0));
+    let cases = [
+        (view(0, 0, 0), [400.0, 400.0, 400.0]),
+        (view(1_000, 0, 0), [-400.0, 400.0, -400.0]),
+        (view(65_535, 65_535, 65_535), [-400.0, 400.0, -400.0]),
+        (view(0, 1_000, 0), [400.0, 1_200.0, 1_200.0]),
+        (view(0, 5_000, 1_000), [400.0, 1_200.0, 1_200.0]),
+        (view(500, 1_000, 0), [0.0, 800.0, 400.0]),
+    ];
+    for (i, (v, ys)) in cases.into_iter().enumerate() {
+        h.view = v;
+        h.frame(16 * i64::try_from(i).unwrap(), &[]);
+        let got: Vec<f32> = followers_at(&h).iter().map(|p| p[1]).collect();
+        assert_eq!(got, ys, "{v:?}");
+    }
+}
+
+#[test]
+fn only_drawing_widgets_follow_within_the_coordinate_range() {
+    let lanes_following = skin_model::ElementDef {
+        place: Place {
+            follow: Follow::Cover,
+            ..in_region(Region::Playfield)
+        },
+        ..lanes_element()
+    };
+    assert!(matches!(
+        skin_with(REGIONS, Some(simple()), vec![lanes_following]),
+        Err(LoadError::UnsupportedFollow { element: 0 })
+    ));
+    // A follower's keys moved the lanes' 800 either way stay within
+    // ±MAX_COORD: one more pixel refuses; without lanes nothing moves.
+    let at = |y: i32| {
+        let place = Place {
+            follow: Follow::Lift,
+            ..in_region(Region::Playfield)
+        };
+        image(WHITE, [0, y, 10, 10], place)
+    };
+    for (y, ok) in [
+        (MAX_COORD - 800, true),
+        (MAX_COORD - 799, false),
+        (-MAX_COORD + 800, true),
+        (-MAX_COORD + 799, false),
+    ] {
+        let r = skin_with(REGIONS, Some(simple()), vec![lanes_element(), at(y)]);
+        assert_eq!(r.is_ok(), ok, "{y}");
+        if !ok {
+            assert!(matches!(r, Err(LoadError::Coordinates { element: 1 })));
+        }
+    }
+    assert!(skin_with(REGIONS, None, vec![at(MAX_COORD)]).is_ok());
 }

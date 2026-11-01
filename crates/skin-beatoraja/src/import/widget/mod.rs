@@ -14,7 +14,7 @@ use super::budget::ImportLimit;
 use super::policy::Role;
 use super::report::{NoteKind, Object, PropertyKind, Span, TrackWhy};
 use super::track::{self, Stretch};
-use super::{Common, Cx, Dst, Prop};
+use super::{Common, Cx, Dst, Opts, Prop};
 use crate::error::ImportError;
 
 /// The source-image fields an image or a number reads
@@ -295,7 +295,10 @@ impl Cx<'_> {
         // image set draws the image's frames whatever its `len`
         // (`JsonSkinObjectLoader.java:76-84`).
         let group = set.is_none() && self.int_or(len, "len", 0)? > 1;
-        if dst.offsets.contains(&super::OFFSET_LANECOVER) {
+        // Listing offset 4, it follows SUDDEN+ when it cannot reach the
+        // lanes, and is SUDDEN+ otherwise; its keys are charged once.
+        let charged = dst.offsets.contains(&super::OFFSET_LANECOVER);
+        if charged && !self.offset4_outside(&dst)? {
             if group {
                 return self.lane_cover_selector(dst, "len");
             }
@@ -325,7 +328,12 @@ impl Cx<'_> {
             self.drop_el(Role::Decorative, at, NoteKind::Stretch(dst.stretch))?;
             return Ok(());
         }
-        let Some(c) = self.common(Role::Decorative, &dst, false)? else {
+        let o = Opts {
+            follow: true,
+            charged,
+            ..Opts::default()
+        };
+        let Some(c) = self.common_with(Role::Decorative, &dst, o)? else {
             return Ok(());
         };
         let Some((image, cell)) = self.add_src_image(&c, rec, &s, s.div)? else {
@@ -349,7 +357,7 @@ impl Cx<'_> {
             return Ok(());
         }
         let t = self.model_track(&c, &rects)?;
-        self.push_native(c, Source::Image(image), t, native);
+        self.push_native(c, Source::Image(image), t, native)?;
         Ok(())
     }
 
@@ -361,7 +369,10 @@ impl Cx<'_> {
         let by_ref = self.int_or(r, "ref", 0)? != 0;
         let by_value = self.prop(value, "value")? != Prop::Null;
         // Listing offset 4, it is classified before the selector drops it.
-        if (by_ref || by_value) && dst.offsets.contains(&super::OFFSET_LANECOVER) {
+        if (by_ref || by_value)
+            && dst.offsets.contains(&super::OFFSET_LANECOVER)
+            && !self.offset4_outside(&dst)?
+        {
             return self.lane_cover_selector(dst, if by_ref { "ref" } else { "value" });
         }
         if by_ref || by_value {

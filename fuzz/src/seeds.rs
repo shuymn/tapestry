@@ -823,6 +823,7 @@ pub fn skin_imports() -> Vec<Seed> {
             ),
         ),
         ("lanes", play_skin(&lanes_body())),
+        ("followers", play_skin(&followers_body())),
         (
             "judge",
             play_skin(
@@ -863,6 +864,32 @@ pub fn skin_imports() -> Vec<Seed> {
             ),
         ),
     ]
+}
+
+/// [`lanes_body`] with what follows the covers, each id repeated: an image
+/// beside the lanes following SUDDEN+, a number following LIFT, and a
+/// judge whose grade follows LIFT, its relative combo taking 3 and 4
+/// without motion of its own; HIDDEN+ keeps 3 and 5 as its own.
+fn followers_body() -> String {
+    lanes_body()
+        .replace(
+            r#"{"id": "cv", "src": "grid", "x": 4, "w": 4, "h": 4}],"#,
+            r#"{"id": "cv", "src": "grid", "x": 4, "w": 4, "h": 4},
+               {"id": "f", "src": "grid", "w": 4, "h": 4}],
+            "value": [
+                {"id": "num", "src": "strip", "w": 100, "h": 10, "divx": 10, "digit": 2, "ref": 71},
+                {"id": "ten", "src": "strip", "w": 100, "h": 10, "divx": 10, "digit": 4}],
+            "judge": [{"id": "j", "index": 0,
+                "images": [{"id": "f", "timer": 46, "offsets": [3, 3], "dst": [{"x": 600, "y": 500, "w": 80, "h": 20}]}],
+                "numbers": [{"id": "ten", "timer": 46, "offset": 3, "offsets": [4, 3, 4], "dst": [{"x": 10, "y": 0, "w": 10, "h": 20}]}]}],"#,
+        )
+        .replace(
+            r#"{"id": "hid", "dst""#,
+            r#"{"id": "f", "offsets": [4, 4], "dst": [{"x": 500, "y": 300, "w": 4, "h": 4}]},
+                {"id": "num", "offset": 3, "offsets": [3], "dst": [{"x": 500, "y": 400, "w": 10, "h": 10}]},
+                {"id": "j", "dst": [{"w": 0, "h": 0}]},
+                {"id": "hid", "offsets": [3, 5, 3], "dst""#,
+        )
 }
 
 /// Lanes of `grid` parts over x 20..450, y 200..800, with a bar line,

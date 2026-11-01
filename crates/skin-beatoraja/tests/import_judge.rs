@@ -356,11 +356,17 @@ fn judges_refuse_what_the_model_cannot_share() {
         critical(judge_two()).1,
         NoteKind::UnsupportedField { field: "judge" }
     );
-    // A grade moved by LIFT.
-    let lifted = judge_rec(&[grade(0, r#", "offset": 3"#)], &[combo("ten", 10)], "");
+    // HIDDEN+'s offset on a grade or its combo.
+    let hidden = judge_rec(&[grade(0, r#", "offset": 5"#)], &[combo("ten", 10)], "");
     assert_eq!(
-        critical(skin(VALUES, &lifted, &[DST])),
-        (CriticalPart::Judge, NoteKind::RuntimeOffset(3))
+        critical(skin(VALUES, &hidden, &[DST])),
+        (CriticalPart::Judge, NoteKind::RuntimeOffset(5))
+    );
+    let hidden = combo("ten", 10).replace(r#""id": "ten""#, r#""id": "ten", "offsets": [3, 5]"#);
+    let hidden = judge_rec(&grades(1), &[hidden], "");
+    assert_eq!(
+        critical(skin(VALUES, &hidden, &[DST])),
+        (CriticalPart::Judge, NoteKind::RuntimeOffset(5))
     );
     // Per-digit offsets.
     let l = judge(&grades(1), &[combo("offs", 10)]);
@@ -503,6 +509,54 @@ fn a_graph_may_not_share_the_judges_id() {
         let graph = format!(r#"{{"id": "j", "src": "gone", "type": {kind}}}"#);
         assert_eq!(shared_id("graph", &graph), SHARED, "{kind}");
     }
+}
+
+#[test]
+fn a_lifted_grade_carries_its_combo_once() {
+    use common::lanes::{NOTES, body, note};
+    use skin_beatoraja::{DeviationId, LaneApprox};
+    // Over the default lanes (600 px), LIFT at 300 ‰ raises the line
+    // 180: the grade listing offset 3 rises 180, and its combo, listing
+    // 3 and 4 several times, rises with it once. The combo's own
+    // offsets move nothing; only the grade is noted.
+    let combo = combo("ten", 10).replace(
+        r#""id": "ten""#,
+        r#""id": "ten", "offsets": [3, 4, 3], "offset": 3"#,
+    );
+    let judge = judge_rec(&[grade(0, r#", "offsets": [3, 3]"#)], &[combo], "");
+    let objects = format!(r#"{}, {VALUES}, "judge": [{judge}]"#, note(""));
+    let l = common::import_body(&body("", &objects, &[NOTES, DST]));
+    let motion = NoteKind::Deviation(DeviationId::D9(LaneApprox::CoverMotion));
+    let kinds = common::kinds(l.report());
+    assert_eq!(kinds.iter().filter(|&&k| k == motion).count(), 1);
+    assert!(
+        !kinds
+            .iter()
+            .any(|k| matches!(k, NoteKind::RuntimeOffset(_)))
+    );
+    let at = |lift: u16| {
+        // One note, judged and past: the lanes draw nothing.
+        let chart = bms_model::ChartBuilder::new(150_000)
+            .tap(Lane::new(1).unwrap(), TimeUs(1_000 * MS))
+            .build()
+            .unwrap();
+        let mut d = Drawn::over(l.ok().skin.clone(), &chart);
+        d.tally = tally(0, 12);
+        d.view.lift = lift;
+        d.frame(
+            1_000,
+            &[event(1_000, judged(1_000, Judgment::Perfect, 12).kind)],
+        );
+        d.rects(1_001)
+    };
+    let still = at(0);
+    // The combo's two glyphs and the grade.
+    assert_eq!(still.len(), 3);
+    let lifted: Vec<_> = still
+        .iter()
+        .map(|&[x, y, w, h]| [x, y - 180, w, h])
+        .collect();
+    assert_eq!(at(300), lifted);
 }
 
 #[test]

@@ -8,10 +8,11 @@ mod widget_support;
 use bms_model::{Lane, TimeUs};
 use proptest::prelude::*;
 use skin_model::{
-    Adjust, Align, Anchor, Bind, ChartText, Ease, ElementDef, End, Fill, Fit, FontDef, FontRef,
-    FrameUv, KeyDef, Layout, LoadError, MAX_TEXT_BYTES, MAX_TEXT_ELEMENTS, MAX_TEXT_EM, Overflow,
-    Place, Quad, Region, RegionDef, Sheet, Skin, SkinDef, Source, TextDef, TextError, TextField,
-    TextImage, TextRequest, TextTable, TextTableError, TextValue, Track, Variant, WidgetDefs,
+    Adjust, Align, Anchor, Bind, ChartText, Ease, ElementDef, End, Fill, Fit, Follow, FontDef,
+    FontRef, FrameUv, KeyDef, Layout, LoadError, MAX_TEXT_BYTES, MAX_TEXT_ELEMENTS, MAX_TEXT_EM,
+    Overflow, Place, Quad, Region, RegionDef, Sheet, Skin, SkinDef, Source, TextDef, TextError,
+    TextField, TextImage, TextRequest, TextTable, TextTableError, TextValue, Track, Variant,
+    WidgetDefs,
 };
 
 use play_support::{Harness, MS, REGIONS, full};
@@ -564,6 +565,58 @@ fn a_line_turns_about_the_box() {
         assert_eq!(q.angle, quarter);
         assert_eq!(q.rect, [100.0, 55.0, 80.0, 50.0]);
     }
+}
+
+#[test]
+fn a_following_line_moves_without_changing_its_request() {
+    // The simple lanes are 800 long; a cover of 500 ‰ travels C = 400. A
+    // line following the cover moves 400 down with its pivot; its
+    // request, from its keys, is that of a line following nothing.
+    let skin = |follow| {
+        let lanes = ElementDef {
+            timer: skin_model::TimerRef::Builtin(skin_model::timer::FULL_COMBO),
+            ..lanes_support::lanes_element()
+        };
+        let place = Place {
+            follow,
+            pivot: Anchor::Center,
+            ..Place::SCREEN
+        };
+        let mut def = skin_def(
+            Fit::Adapt,
+            REGIONS,
+            lanes_support::sheet(),
+            vec![lanes, element(Source::Text(0), BOX, place)],
+            vec![plain()],
+        );
+        def.lanes = Some(lanes_support::simple());
+        Skin::new(def).unwrap()
+    };
+    let chart = ChartText {
+        title: "T",
+        ..NO_CHART
+    };
+    assert_eq!(
+        requests(&skin(Follow::Cover), &chart),
+        requests(&skin(Follow::None), &chart)
+    );
+    let at = |follow, cover| {
+        let mut h = widget_support::harness(skin(follow));
+        h.skin
+            .attach_text(&mut h.play, TextTable::new(vec![Some(line(INK, 2.0))]))
+            .unwrap();
+        h.view.cover = cover;
+        h.frame(100, &[]);
+        let q = h.batch.quads()[0];
+        (q.rect, q.pivot)
+    };
+    let (rect, pivot) = at(Follow::None, 500);
+    assert_eq!(at(Follow::Cover, 0), (rect, pivot));
+    let [x, y, w, hh] = rect;
+    assert_eq!(
+        at(Follow::Cover, 500),
+        ([x, y + 400.0, w, hh], [pivot[0], pivot[1] + 400.0])
+    );
 }
 
 #[test]

@@ -377,6 +377,48 @@ pub fn draw(imported: &Imported) -> Vec<usize> {
         );
         counts.push(n);
     }
+    // The covers moving, past a whole lane too: followers stay finite and
+    // inside the capacities.
+    for (ms, cover, lift, hidden) in [
+        (600_i64, 300, 100, 500),
+        (700, 1_000, 1_000, 1_000),
+        (800, 1_500, 2_000, u16::MAX),
+        (900, 0, 0, 0),
+    ] {
+        batch.clear();
+        let frame = SkinFrame {
+            now: TimeUs(ms * 1_000),
+            display_offset: TimeUs(0),
+            tally: &tally,
+            gauges: &states,
+            gauge: 0,
+            effects: &[],
+            complete: false,
+            target: [1_920, 1_080],
+            layout: &Layout::AUTHOR,
+            lanes: LaneView {
+                visible_time: TimeUs(600_000),
+                cover,
+                lift,
+                hidden,
+            },
+            loading: None,
+            playing: true,
+        };
+        skin.build(&mut play, &frame, &uvs, &mut batch);
+        assert_eq!(batch.dropped(), 0, "quads past the capacity");
+        assert!(
+            batch.runs().len() <= usize::try_from(skin.run_capacity()).unwrap_or(usize::MAX),
+            "more runs than the capacity"
+        );
+        assert!(
+            batch
+                .quads()
+                .iter()
+                .all(|q| q.rect.iter().chain(&q.pivot).all(|v| v.is_finite())),
+            "a quad off the finite plane"
+        );
+    }
     counts
 }
 

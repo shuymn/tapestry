@@ -11,8 +11,9 @@ use bms_model::ChartBuilder;
 use lanes_support::{WHITE, image, in_region, lanes_element, simple, skin_with};
 use play_support::{Harness, REGIONS, full};
 use skin_model::{
-    Adjust, Anchor, Controls, ElementDef, Fill, Fit, LANE_WIDTH_PCT, Layout, LayoutError,
-    MAX_INSET, MAX_OFFSET, MIN_VISIBLE, Place, Region, RegionDef, SCALE_PCT, Side, Skin, SkinDef,
+    Adjust, Anchor, Controls, ElementDef, Fill, Fit, Follow, LANE_WIDTH_PCT, Layout, LayoutError,
+    MAX_INSET, MAX_OFFSET, MIN_VISIBLE, Place, Region, RegionDef, RegionPlacement, SCALE_PCT, Side,
+    Skin, SkinDef,
 };
 
 /// `REGIONS` with `changes` applied.
@@ -526,4 +527,73 @@ fn fills_cover_or_stretch_the_canvas() {
             [320.0, 0.0, 1_920.0, 1_080.0]
         ]
     );
+}
+
+/// The left region, anchored at its centre, with an image following
+/// `follow` over `[100, 100, 40, 20]` and one following nothing over
+/// `[200, 105, 40, 10]`; the source lanes (600 high) in the playfield.
+fn followed(follow: Follow) -> Skin {
+    let left = |r, follow| {
+        let place = Place {
+            follow,
+            ..in_region(Region::Left)
+        };
+        image(WHITE, r, place)
+    };
+    skin_with(
+        regions(&[(Region::Left, Anchor::Center, false)]),
+        Some(lanes_support::source()),
+        vec![
+            lanes_element(),
+            left([100, 100, 40, 20], follow),
+            left([200, 105, 40, 10], Follow::None),
+        ],
+    )
+    .unwrap()
+}
+
+/// The white quads of `skin` with `layout` and a cover of `cover` ‰, and
+/// the left region's placement.
+fn left_at(skin: Skin, layout: Layout, cover: u16) -> (Vec<[f32; 4]>, RegionPlacement) {
+    let chart = ChartBuilder::new(150_000).build().unwrap();
+    let canvas = skin.canvas([1_920, 1_080]);
+    let placed = skin
+        .placement(&canvas, &layout, Side::Left)
+        .region(Region::Left);
+    let mut h = Harness::new(skin, &chart, &full(0));
+    h.layout = layout;
+    h.view.cover = cover;
+    h.frame(0, &[]);
+    (lanes_support::rects(&h, WHITE), placed)
+}
+
+#[test]
+fn followers_are_placed_as_if_they_followed_nothing() {
+    // Placement reads the authored box [100, 120] whatever follows the
+    // covers. At 200 % the box scales about its centre y 110: the
+    // follower's y is 110 − 2·110 + 2·100 = 90 (with the cover's travel
+    // of up to 600 counted, the pivot would be 410 and its y −210).
+    let scaled = with(&[(Region::Left, adjust(0, 0, 200))]);
+    // Pushed up 4000 at 100 %, the 20-high box keeps all of itself on the
+    // canvas, moved −100 (counting the travel, −656).
+    let pushed = with(&[(Region::Left, adjust(0, -4_000, 100))]);
+    for (layout, y) in [(scaled, 90.0), (pushed, 0.0)] {
+        let (none, placed_none) = left_at(followed(Follow::None), layout, 0);
+        for follow in [Follow::Lift, Follow::Cover, Follow::LiftAndCover] {
+            let (got, placed) = left_at(followed(follow), layout, 0);
+            assert_eq!(got, none, "{follow:?}");
+            assert_eq!(placed, placed_none, "{follow:?}");
+        }
+        assert_eq!(none[0][1], y);
+    }
+    let (_, placed) = left_at(followed(Follow::Cover), pushed, 0);
+    assert_eq!(placed.affine.offset[1], -100.0);
+    // A cover of 500 ‰ travels C = 300: the follower moves 600 at 200 %,
+    // the other image and the region stay.
+    let (rest, placed_rest) = left_at(followed(Follow::Cover), scaled, 0);
+    let (moved, placed_moved) = left_at(followed(Follow::Cover), scaled, 500);
+    assert_eq!(placed_moved, placed_rest);
+    assert_eq!(moved[1], rest[1]);
+    let [x, y, w, h] = rest[0];
+    assert_eq!(moved[0], [x, y + 600.0, w, h]);
 }

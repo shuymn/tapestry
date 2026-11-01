@@ -12,10 +12,10 @@ use bms_model::{ChartBuilder, Lane, TimeUs};
 use common::lanes::{NOTES, body, cover, lift, lift_object, note, with};
 use common::play::{Drawn, MS};
 use common::{Loaded, has, import_body, import_config, import_sized};
-use skin_beatoraja::ImportLimit;
 use skin_beatoraja::{
     Config, CriticalPart, DeviationId, ImportError, LaneApprox, NoteKind, OffsetValue, Severity,
 };
+use skin_beatoraja::{ImportLimit, Usage};
 use skin_model::Blend;
 use skin_model::MAX_IMAGES;
 
@@ -103,7 +103,7 @@ fn lift_and_sudden_plus_share_the_lane() {
 }
 
 #[test]
-fn offset_four_elements_off_the_lanes_stay_decorative() {
+fn offset_four_images_off_the_lanes_follow_sudden_plus() {
     for d in [
         // Left of the lanes, then touching their left edge.
         deco("", r#"{"x": 0, "y": 0, "w": 10, "h": 10}"#),
@@ -118,14 +118,21 @@ fn offset_four_elements_off_the_lanes_stay_decorative() {
     ] {
         let l = with("", &[&d]);
         let r = l.report();
-        assert!(
-            r.notes
-                .iter()
-                .any(|n| n.severity == Severity::Dropped && n.kind == NoteKind::RuntimeOffset(4)),
-            "{d}: {:?}",
-            r.notes
+        assert!(!has(r, NoteKind::RuntimeOffset(4)), "{d}: {:?}", r.notes);
+        let motion = d9(LaneApprox::CoverMotion);
+        assert_eq!(
+            r.notes.iter().filter(|n| n.kind == motion).count(),
+            1,
+            "{d}"
         );
-        assert_eq!(rects(&l, 5_000, 500, 0), Vec::<[i32; 4]>::new(), "{d}");
+        // SUDDEN+ at 500 ‰ of the 600 px lane moves it 300 down.
+        let still = rects(&l, 5_000, 0, 0);
+        assert_eq!(still.len(), 1, "{d}");
+        let moved: Vec<_> = still
+            .iter()
+            .map(|&[x, y, w, h]| [x, y + 300, w, h])
+            .collect();
+        assert_eq!(rects(&l, 5_000, 500, 0), moved, "{d}");
     }
     // Before the notes, the lanes' span is known ahead.
     let early = deco("", r#"{"x": 0, "y": 0, "w": 10, "h": 10}"#);
@@ -231,22 +238,166 @@ fn offset_four_elements_that_may_reach_the_lanes_refuse() {
             (CriticalPart::Cover, NoteKind::UnsupportedField { field }),
             "{id}"
         );
+        // Off the lanes it is an ordinary image, whose selector drops it.
         let l = import_body(&body(group, &objects, &[NOTES, &off]));
-        assert!(
-            l.report()
-                .notes
-                .iter()
-                .any(|n| n.severity == Severity::Dropped && n.kind == NoteKind::RuntimeOffset(4)),
-            "{id}"
-        );
+        let dropped: Vec<NoteKind> = l
+            .report()
+            .notes
+            .iter()
+            .filter(|n| n.severity == Severity::Dropped)
+            .map(|n| n.kind)
+            .collect();
+        let why = if id == "group" {
+            NoteKind::UnsupportedField { field }
+        } else {
+            NoteKind::UnsupportedProperty {
+                kind: skin_beatoraja::PropertyKind::Integer,
+                id: None,
+            }
+        };
+        assert_eq!(dropped, [why], "{id}");
     }
-    // A number listing offset 4.
-    let number = r#""value": [{"id": "num", "src": "n", "w": 120, "h": 20, "divx": 10, "digit": 3, "ref": 71}]"#;
+}
+
+#[test]
+fn widgets_listing_offset_four_follow_sudden_plus() {
+    // A number keeps its own role and follows: 300 down at 500 ‰.
+    let number = r#""value": [{"id": "num", "src": "a", "w": 60, "h": 6, "divx": 10, "digit": 1, "ref": 71}]"#;
     let num = r#"{"id": "num", "offset": 4, "dst": [{"x": 0, "y": 0, "w": 10, "h": 10}]}"#;
+    let l = with(number, &[num]);
+    assert!(has(l.report(), d9(LaneApprox::CoverMotion)));
+    assert!(!has(l.report(), NoteKind::RuntimeOffset(4)));
+    let still = rects(&l, 5_000, 0, 0);
+    assert_eq!(still.len(), 1);
+    let moved: Vec<_> = still
+        .iter()
+        .map(|&[x, y, w, h]| [x, y + 300, w, h])
+        .collect();
+    assert_eq!(rects(&l, 5_000, 500, 0), moved);
+}
+
+#[test]
+fn static_offsets_keep_beside_repeated_cover_offsets() {
+    // Offset 40 moves the image 5 right; 3 and 4, each listed twice and
+    // 4 configured with a y the play overrides, move it once by both
+    // covers, charging what the static offset alone charges.
+    let header = r#""offset": [
+        {"name": "s", "id": 40}, {"name": "l", "id": 3}, {"name": "c", "id": 4}
+    ]"#;
+    let load = |fields: &str| {
+        let d =
+            format!(r#"{{"id": "deco", {fields}, "dst": [{{"x": 0, "y": 0, "w": 10, "h": 10}}]}}"#);
+        let objects = format!("{}, {header}", note(""));
+        import_config(
+            [1_920, 1_080],
+            &body("", &objects, &[NOTES, &d]),
+            &[],
+            |c| {
+                c.offsets.insert(
+                    40,
+                    OffsetValue {
+                        x: 5,
+                        ..OffsetValue::default()
+                    },
+                );
+                c.offsets.insert(
+                    4,
+                    OffsetValue {
+                        y: 30,
+                        ..OffsetValue::default()
+                    },
+                );
+            },
+        )
+    };
+    let l = load(r#""offset": 3, "offsets": [40, 4, 3, 4]"#);
+    let fixed = load(r#""offsets": [40]"#);
+    let motion = d9(LaneApprox::CoverMotion);
     assert_eq!(
-        critical(with(number, &[num])),
-        (CriticalPart::Cover, NoteKind::RuntimeOffset(4))
+        l.report().notes.iter().filter(|n| n.kind == motion).count(),
+        1
     );
+    let still = rects(&l, 5_000, 0, 0);
+    assert_eq!(still, rects(&fixed, 5_000, 0, 0));
+    assert_eq!(still.first().map(|r| r[0]), Some(5));
+    // SUDDEN+ at 500 ‰ under LIFT at 200 ‰: 240 down, 120 up.
+    let moved: Vec<_> = still
+        .iter()
+        .map(|&[x, y, w, h]| [x, y + 120, w, h])
+        .collect();
+    assert_eq!(rects(&l, 5_000, 500, 200), moved);
+    // Only the motion note is added.
+    let u = fixed.report().usage;
+    assert_eq!(
+        l.report().usage,
+        Usage {
+            notes: u.notes + 1,
+            ..u
+        }
+    );
+}
+
+#[test]
+fn covers_refuse_configured_components_besides_y() {
+    // SUDDEN+ lists 4; the source adds 3 to LIFT and 3 and 5 to HIDDEN+
+    // unlisted. Their y is the play's; any other component moves the
+    // source's cover and is refused, HIDDEN+ dropped as decorative.
+    let header =
+        r#""offset": [{"name": "l", "id": 3}, {"name": "c", "id": 4}, {"name": "h", "id": 5}]"#;
+    let objects = format!(
+        "{}, {}, {}, {header}",
+        note(""),
+        lift_object(""),
+        common::lanes::hidden_object("")
+    );
+    let load = |with_lift: bool, id: i32, v: OffsetValue| {
+        let (c, l, h) = (cover(""), lift(""), common::lanes::hidden(""));
+        let dsts: Vec<&str> = if with_lift {
+            vec![NOTES, &c, &l, &h]
+        } else {
+            vec![NOTES, &h]
+        };
+        let dsts = dsts.join(", ");
+        import_config([1_920, 1_080], &body("", &objects, &[&dsts]), &[], |c| {
+            c.offsets.insert(id, v);
+        })
+    };
+    let dropped = |l: &Loaded| -> Vec<NoteKind> {
+        l.report()
+            .notes
+            .iter()
+            .filter(|n| n.severity == Severity::Dropped)
+            .map(|n| n.kind)
+            .collect()
+    };
+    let d = OffsetValue::default();
+    for (name, v) in [
+        ("x", OffsetValue { x: 16, ..d }),
+        ("w", OffsetValue { w: 16, ..d }),
+        ("h", OffsetValue { h: 16, ..d }),
+        ("r", OffsetValue { r: 16, ..d }),
+        ("a", OffsetValue { a: -16, ..d }),
+    ] {
+        assert_eq!(
+            critical(load(true, 4, v)),
+            (CriticalPart::Cover, NoteKind::RuntimeOffset(4)),
+            "{name}"
+        );
+        assert_eq!(
+            critical(load(true, 3, v)),
+            (CriticalPart::Lift, NoteKind::RuntimeOffset(3)),
+            "{name}"
+        );
+        for id in [3, 5] {
+            let l = load(false, id, v);
+            assert_eq!(dropped(&l), [NoteKind::RuntimeOffset(id)], "{name} {id}");
+        }
+    }
+    for id in [3, 4, 5] {
+        let l = load(true, id, OffsetValue { y: 16, ..d });
+        l.ok();
+        assert_eq!(dropped(&l), [], "{id}");
+    }
 }
 
 #[test]

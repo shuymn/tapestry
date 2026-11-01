@@ -27,7 +27,7 @@ use play_support::{bool_program, state, tally};
 use rules::{GaugeValue, Judgment};
 use skin_model::{
     Adjust, Align, Anchor, AtlasLimits, Attach, Attempt, Bind, Blend, ClipId, ComboPart, CycleDef,
-    DigitsDef, Ease, ElementDef, End, Fill, Filter, Fit, GaugeDef, GaugeDesc, GaugeLook,
+    DigitsDef, Ease, ElementDef, End, Fill, Filter, Fit, Follow, GaugeDef, GaugeDesc, GaugeLook,
     GaugeParts, GlyphSet, GradePart, ImageDef, JudgeDef, JudgeSlot, KeyDef, LaneParts, LaneTimer,
     LaneView, Layout as SkinLayout, Motion, Native, NumberDef, Pad, Place, Play, PlayContext,
     QuadBatch, Region, RegionDef, Sheet, Side, Skin, SkinDef, SkinFrame, Source, TimerRef, Track,
@@ -79,6 +79,13 @@ const MS: i64 = 1_000;
 const NOTES: i64 = 2_000;
 /// The most effects one frame drains; the rest wait for the next frame.
 const DRAIN: usize = 64;
+/// Every way an element or a grade follows the covers, cycled through.
+const FOLLOWS: [Follow; 4] = [
+    Follow::None,
+    Follow::Lift,
+    Follow::Cover,
+    Follow::LiftAndCover,
+];
 
 fn lane(n: i64) -> Lane {
     Lane::new(u8::try_from(n.rem_euclid(8)).unwrap()).unwrap()
@@ -509,6 +516,7 @@ fn widgets(elements: &mut Vec<ElementDef>) -> skin_model::WidgetDefs {
             pivot: Anchor::Center,
             fill: Fill::None,
             native: Some(Native::NoLarger([4, 4])),
+            follow: Follow::None,
         },
         Place {
             region: Region::Left,
@@ -533,7 +541,10 @@ fn widgets(elements: &mut Vec<ElementDef>) -> skin_model::WidgetDefs {
             Source::Number(u32::from(i)),
             track(300 + 7 * i, Ease::Linear, End::Hold),
             TimerRef::Builtin(timer::READY),
-            place,
+            Place {
+                follow: FOLLOWS[usize::from(i) % 4],
+                ..place
+            },
         ));
     }
     let numbers = numbers
@@ -601,6 +612,7 @@ fn widgets(elements: &mut Vec<ElementDef>) -> skin_model::WidgetDefs {
             Place {
                 region,
                 pivot: Anchor::ALL[usize::from(i)],
+                follow: FOLLOWS[usize::from(i) % 4],
                 ..Place::SCREEN
             },
         ));
@@ -650,6 +662,7 @@ fn widgets(elements: &mut Vec<ElementDef>) -> skin_model::WidgetDefs {
                 blend: if k % 2 == 0 { Blend::Alpha } else { Blend::Add },
                 visible: (k == 3).then(|| bool_program("bp < 100000")),
                 native: (k % 2 == 1).then_some(Native::Exact([2, 3])),
+                follow: FOLLOWS[usize::from(k) % 4],
             });
             j.combos[s.index()] = Some(ComboPart {
                 digits: combos[s.index() % 3],
@@ -700,6 +713,7 @@ fn widgets(elements: &mut Vec<ElementDef>) -> skin_model::WidgetDefs {
     elements.push(widget(Source::Text(0), squeeze, ready, Place::SCREEN));
     let top = Place {
         region: Region::Top,
+        follow: Follow::Cover,
         ..Place::SCREEN
     };
     let fixed = lanes_support::rect([900, 20, 300, TEXT_H]);
@@ -815,6 +829,7 @@ fn skin() -> Loaded {
                     3 => Some(Native::Exact([2, 2])),
                     _ => None,
                 },
+                follow: FOLLOWS[usize::from(i / 4) % 4],
             },
         });
     }
@@ -830,7 +845,11 @@ fn skin() -> Loaded {
     });
     elements.push(background(timer::READY, Fill::Cover));
     elements.push(background(timer::READY, Fill::Stretch));
-    elements.push(lanes_support::lanes_element());
+    // The lanes hide on some frames; their followers still move.
+    elements.push(ElementDef {
+        visible: Some(bool_program("combo % 5 != 1")),
+        ..lanes_support::lanes_element()
+    });
     let beam = lanes_support::bound(Bind::Lane(Lane::SCRATCH));
     elements.push(ElementDef {
         blend: Blend::Add,
@@ -905,6 +924,10 @@ struct Witness {
     turned: bool,
     /// The beam's x per target, at the author's layout.
     beam: [Option<f32>; TARGETS.len()],
+    /// The literal's y at the first target and the author's layout,
+    /// and whether the covers moved it there.
+    literal: Option<f32>,
+    literal_moved: bool,
     /// The widgets': a combo drew and the shifting judge's grade lay apart
     /// from the other's; the full-gauge PERFECT showed; a sign glyph drew;
     /// the flicker's tip was pushed; each shown gauge drew its own look.
@@ -1002,6 +1025,8 @@ impl Witness {
             active_body: false,
             turned: false,
             beam: [None; TARGETS.len()],
+            literal: None,
+            literal_moved: false,
         }
     }
 }
@@ -1009,13 +1034,14 @@ impl Witness {
 /// What a stretch's frames cycle through besides the target.
 struct Views {
     layouts: Vec<SkinLayout>,
-    lanes: [LaneView; 5],
+    lanes: [LaneView; 6],
 }
 
 impl Views {
     /// The author's layout first, then a moved and scaled playfield, a
     /// hidden judge, a lane width, an inset and a HUD pushed off the
-    /// canvas; no covers, a cover, a lift, both, and all three covers.
+    /// canvas; no covers, a cover, a lift, both, all three covers, and
+    /// all three past 1 000 ‰.
     fn new() -> Self {
         let adjust = |x, y, scale| Adjust {
             x,
@@ -1061,6 +1087,7 @@ impl Views {
                 view(0, 100, 0),
                 view(950, 300, 0),
                 view(300, 200, 400),
+                view(1_500, 1_200, 2_000),
             ],
         }
     }
@@ -1159,6 +1186,10 @@ fn stretch(
             }
             for q in out.quads() {
                 w.turned |= q.angle != 0.0;
+                if q.uv == LITERAL_UV && target_no == 0 && layout_no == 0 {
+                    let y = *w.literal.get_or_insert(q.rect[1]);
+                    w.literal_moved |= y != q.rect[1];
+                }
                 match loaded.parts.get(&part_key(q.uv, q.layer)) {
                     Some(&NOTE) => w.notes = true,
                     Some(&BODY_ON) => w.active_body = true,
@@ -1301,6 +1332,7 @@ fn build_does_not_allocate() {
         assert!(w.notes, "{name}: the lanes drew no note");
         assert!(w.active_body, "{name}: no long note drew active");
         assert!(w.turned, "{name}: no quad turned");
+        assert!(w.literal_moved, "{name}: the covers never moved a follower");
         // The playfield is centred: 21:9 moves the beam 320 right of 16:9.
         let [Some(at_16_9), _, Some(at_21_9), ..] = w.beam else {
             panic!(
