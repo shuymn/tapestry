@@ -287,10 +287,12 @@ pub const IN_PLAY: &[Site] = &[
     // The render thread's frame.
     Site::File("crates/render/src/measure.rs"),
     Site::File("crates/render/src/pace.rs"),
+    Site::File("crates/render/src/projection.rs"),
     Site::File("crates/render/src/renderer.rs"),
     Site::File("crates/render/src/simple.rs"),
     Site::File("crates/render/src/skin.rs"),
     Site::File("crates/render/src/sprite.rs"),
+    Site::File("crates/render/src/staging.rs"),
     // A skin's per-frame expressions and quad batch.
     Site::File("crates/skin-model/src/expr/arith.rs"),
     Site::File("crates/skin-model/src/expr/program.rs"),
@@ -309,8 +311,10 @@ pub const IN_PLAY: &[Site] = &[
     Site::File("crates/skin-model/src/layout.rs"),
     Site::File("crates/skin-model/src/place.rs"),
     Site::File("crates/skin-model/src/widget/mod.rs"),
+    Site::File("crates/skin-model/src/widget/cover_paint.rs"),
     Site::File("crates/skin-model/src/widget/digits.rs"),
     Site::File("crates/skin-model/src/widget/gauge.rs"),
+    Site::File("crates/skin-model/src/widget/image_choice.rs"),
     Site::File("crates/skin-model/src/widget/judge.rs"),
     Site::File("crates/skin-model/src/widget/lanes.rs"),
     Site::File("crates/skin-model/src/widget/scroll.rs"),
@@ -334,6 +338,9 @@ pub const IN_PLAY: &[Site] = &[
             "MenuScreen::statistics",
             "MenuScreen::presentation",
             "MenuScreen::shown",
+            "MenuScreen::resize",
+            "MenuScreen::target",
+            "MenuScreen::minimized",
         ],
     ),
     // The development builds' counting allocator, which every allocation

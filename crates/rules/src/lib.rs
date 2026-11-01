@@ -40,10 +40,10 @@ pub use headers::{HeaderPolicy, JudgeRank, ReadHeaders};
 pub use lr2_style::lr2_style;
 pub use preset::{
     Assignment, CorrectionFactors, DefaultTotal, Denominator, EmptyPoorRule, Factor, GaugeDelta,
-    GaugeKind, GaugeRule, GaugeValue, HeadEligibility, Implementation, JudgeWindows, Judgment,
-    LateHeadRule, LnEndWindows, LnMode, LnModeRule, LowDamage, MAX_WINDOW_EDGE, MineRule, MissRule,
-    PerJudgment, RankScale, RulePreset, SCALE_FULL_MILLI, SameTimeOrder, ScoreWeights,
-    TotalCorrection, TotalMode, Window, scale_edge, scale_edge_by,
+    GaugeKind, GaugeRule, GaugeValue, Implementation, JudgeWindows, Judgment, LateHeadRule,
+    LnEndWindows, LnMode, LnModeRule, LowDamage, MAX_WINDOW_EDGE, MineRule, MissRule, PerJudgment,
+    RankScale, RulePreset, SCALE_FULL_MILLI, SameTimeOrder, ScoreWeights, TotalCorrection,
+    TotalMode, Window, scale_edge, scale_edge_by,
 };
 pub use tapestry::tapestry;
 pub use windows::{EmptyPoorRange, LaneClass, LaneTable, PerLaneClass, ScaledRank, WindowPolicy};

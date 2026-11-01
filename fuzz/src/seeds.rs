@@ -823,6 +823,7 @@ pub fn skin_imports() -> Vec<Seed> {
             ),
         ),
         ("lanes", play_skin(&lanes_body())),
+        ("paints", play_skin(&paints_body())),
         ("followers", play_skin(&followers_body())),
         (
             "judge",
@@ -941,7 +942,72 @@ pub fn skin_imports() -> Vec<Seed> {
                     {"id": "g", "op": [-273], "dst": [{"x": 100, "y": 180, "w": 4, "h": 4}]}]"#,
             ),
         ),
+        ("selectors", play_skin(&selectors_body())),
     ]
+}
+
+/// Image selection, generated: groups of the grid's four frames by the
+/// gauge's type, the cover's switch, no property and past their frames;
+/// image sets with a hole, an undefined id, a wider image and a repeat,
+/// by each supported selector; and sets by image indices 500-507, which
+/// the model cannot read.
+fn selectors_body() -> String {
+    let group = |id: &str, fields: &str| {
+        format!(
+            r#"{{"id": "{id}", "src": "grid", "w": 8, "h": 8, "divx": 2, "divy": 2,
+                "timer": 41, "cycle": 100{fields}}}"#
+        )
+    };
+    let groups = [
+        ("q40", r#", "len": 2, "ref": 40"#),
+        ("q330", r#", "len": 2, "ref": 330"#),
+        ("qnull", r#", "len": 4"#),
+        ("qnever", r#", "len": 5, "ref": 40"#),
+    ];
+    let sets: Vec<(String, String)> = [
+        ("v71", r#""value": 71"#),
+        ("v110", r#""value": 110"#),
+        ("r40", r#""ref": 40"#),
+        ("r331", r#""ref": 331"#),
+        ("r332", r#""value": 40, "ref": 332"#),
+    ]
+    .into_iter()
+    .map(|(id, f)| (id.to_owned(), f.to_owned()))
+    .chain((500..=507).map(|r| (format!("r{r}"), format!(r#""ref": {r}"#))))
+    .collect();
+    let images: Vec<String> = groups
+        .iter()
+        .map(|(id, f)| group(id, f))
+        .chain([
+            r#"{"id": "a", "src": "grid", "w": 4, "h": 4}"#.to_owned(),
+            r#"{"id": "b", "src": "grid", "x": 4, "w": 4, "h": 4}"#.to_owned(),
+            r#"{"id": "wide", "src": "grid", "y": 4, "w": 8, "h": 4}"#.to_owned(),
+        ])
+        .collect();
+    let imagesets: Vec<String> = sets
+        .iter()
+        .map(|(id, f)| {
+            format!(r#"{{"id": "{id}", "images": ["a", "b", null, "none", "wide", "a"], {f}}}"#)
+        })
+        .collect();
+    let dsts: Vec<String> = groups
+        .iter()
+        .map(|(id, _)| (*id).to_owned())
+        .chain(sets.iter().map(|(id, _)| id.clone()))
+        .enumerate()
+        .map(|(i, id)| {
+            format!(
+                r#"{{"id": "{id}", "stretch": 1, "dst": [{{"x": {}, "y": 700, "w": 8, "h": 4}}]}}"#,
+                10 + 20 * i
+            )
+        })
+        .collect();
+    format!(
+        r#""image": [{}], "imageset": [{}], "destination": [{}]"#,
+        images.join(", "),
+        imagesets.join(", "),
+        dsts.join(", ")
+    )
 }
 
 /// [`lanes_body`] with what follows the covers, each id repeated: an image
@@ -970,8 +1036,29 @@ fn followers_body() -> String {
         )
 }
 
+/// [`lanes_body`] with SUDDEN+ painted four ways between LIFT and HIDDEN+:
+/// a split image, an additive one overhanging the lanes, a type-4 slider
+/// and an image set chosen by the gauge's percent.
+fn paints_body() -> String {
+    let body = lanes_body();
+    let at = body.find(r#""destination""#).unwrap_or(body.len());
+    format!(
+        r#"{}"slider": [{{"id": "sl", "src": "grid", "x": 4, "w": 4, "h": 4, "type": 4, "angle": 2, "range": 600}}],
+            "imageset": [{{"id": "cs", "images": ["cv", "p"], "value": 110}}],
+            "destination": [
+                {{"id": "notes", "dst": [{{"w": 0, "h": 0}}]}},
+                {{"id": "lc", "dst": [{{"x": 20, "y": 0, "w": 430, "h": 200}}]}},
+                {{"id": "cv", "offset": 4, "dst": [{{"x": 20, "y": 800, "w": 215, "h": 600}}]}},
+                {{"id": "cv", "offset": 4, "blend": 2, "dst": [{{"x": 0, "y": 700, "w": 500, "h": 300}}]}},
+                {{"id": "sl", "dst": [{{"x": 235, "y": 800, "w": 215, "h": 600}}]}},
+                {{"id": "cs", "offset": 4, "dst": [{{"x": 20, "y": 760, "w": 430, "h": 40}}]}},
+                {{"id": "hid", "dst": [{{"x": 20, "y": -400, "w": 430, "h": 600}}]}}]"#,
+        body.get(..at).unwrap_or_default()
+    )
+}
+
 /// Lanes of `grid` parts over x 20..450, y 200..800, with a bar line,
-/// SUDDEN+, LIFT and HIDDEN+.
+/// SUDDEN+'s paint, LIFT and HIDDEN+.
 fn lanes_body() -> String {
     let eight = [r#""p""#; 8].join(", ");
     let lists = [

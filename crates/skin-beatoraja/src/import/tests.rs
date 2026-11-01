@@ -217,10 +217,10 @@ fn refused_and_dropped_covers_admit_nothing() {
         })
     ));
     assert_eq!(admits, base);
-    // An offset-4 image that may reach the lanes, of the malformed file.
+    // SUDDEN+'s paint of the malformed file in a stretch it refuses.
     let (r, _, admits) = run(&lanes(
         "",
-        r#", {"id": "bad", "offset": 4, "dst": [{"x": 0, "y": 0, "w": 100, "h": 8}]}"#,
+        r#", {"id": "bad", "offset": 4, "stretch": 3, "dst": [{"x": 0, "y": 0, "w": 100, "h": 8}]}"#,
     ));
     assert!(matches!(
         r,
@@ -369,4 +369,43 @@ fn a_guard_joins_the_one_visibility() {
     assert!(plain_ops < guarded_ops && guarded_ops < joined_ops);
     // A value that is always known is not guarded.
     assert_eq!(compiles(&number(163, "")).0, 1);
+}
+
+#[test]
+fn image_choices_charge_their_entries_before_their_tables_and_images() {
+    use Event::{Admit, Charge, Compile, Refs, Table};
+    let json = |objects: &str, dsts: &str| {
+        format!(
+            r#"{{"type": 0, "w": 1920, "h": 1080,
+                "source": [{{"id": "a", "path": "a.png"}}], {objects},
+                "destination": [{dsts}]}}"#
+        )
+    };
+    // An image set of two images, drawn twice: its entries, then its
+    // selector, its table, each image before its file; the second copy
+    // charges its entries and selector again but admits nothing.
+    let set = json(
+        r#""image": [{"id": "i", "src": "a", "w": 8, "h": 8},
+                     {"id": "j", "src": "a", "x": 8, "w": 8, "h": 8}],
+           "imageset": [{"id": "s", "images": ["i", "j"], "value": 110}]"#,
+        r#"{"id": "s", "dst": [{"w": 1, "h": 1}]}, {"id": "s", "dst": [{"w": 1, "h": 1}]}"#,
+    );
+    let (r, trace, admits) = run(&set);
+    r.unwrap();
+    assert_eq!(
+        trace,
+        [
+            Charge, Refs, Compile, Table, Charge, Admit, Charge, //
+            Charge, Refs, Charge, Table,
+        ]
+    );
+    assert_eq!(admits, 1);
+    // A group: its entries, its selector, its image, then its table.
+    let group = json(
+        r#""image": [{"id": "g", "src": "a", "w": 16, "h": 8, "divx": 2, "len": 2, "ref": 40}]"#,
+        r#"{"id": "g", "dst": [{"w": 1, "h": 1}]}"#,
+    );
+    let (r, trace, _) = run(&group);
+    r.unwrap();
+    assert_eq!(trace, [Charge, Refs, Compile, Charge, Admit, Table]);
 }

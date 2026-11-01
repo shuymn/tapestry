@@ -1053,6 +1053,7 @@ mod tests {
             effects,
             gauge: 0,
             overlay: &[],
+            target: [1920, 1080],
         }
     }
 

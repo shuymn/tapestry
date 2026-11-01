@@ -185,8 +185,8 @@ fn preset_canonical_seeds_decode_or_fail_as_built() {
         let result = preset_canonical(&bytes).map(|_| ());
         let expected = match name {
             "tapestry" | "beatoraja_style" | "lr2_style" | "gauge_policies" | "long" => Ok(()),
-            "other_version" => Err(CanonicalError::UnsupportedVersion(12)),
-            "older_version" => Err(CanonicalError::UnsupportedVersion(10)),
+            "other_version" => Err(CanonicalError::UnsupportedVersion(13)),
+            "older_version" => Err(CanonicalError::UnsupportedVersion(11)),
             "wrong_percent_length" => Err(CanonicalError::WrongLength {
                 field: "rank_percent",
                 len: 6,
@@ -278,11 +278,13 @@ fn skin_json_seeds_resolve_or_fail_as_built() {
             "offsets",
             "choices_default",
             "lanes",
+            "paints",
             "followers",
             "judge",
             "gauge",
             "rates",
             "readouts",
+            "selectors",
         ],
     );
     let imports: Vec<&str> = seeds::skin_imports().iter().map(|(n, _)| *n).collect();
@@ -435,34 +437,47 @@ fn skin_import_seeds_import_and_draw_as_built() {
             }
             "lanes" => {
                 use skin_beatoraja::{DeviationId, LaneApprox};
-                // The lanes, SUDDEN+, LIFT and HIDDEN+; the notes, bar,
-                // SUDDEN+, LIFT and HIDDEN+ images over one file.
+                // The lanes, SUDDEN+'s paint, LIFT and HIDDEN+; the notes,
+                // bar, SUDDEN+, LIFT and HIDDEN+ images over one file.
                 assert_eq!((u.elements, u.keys, u.images), (4, 5, 5), "{name}");
                 assert!(i.scratch.is_some(), "{name}");
                 let d9 = |a| NoteKind::Deviation(DeviationId::D9(a));
-                for a in [
-                    LaneApprox::BarLine,
-                    LaneApprox::CoverAbove,
-                    LaneApprox::HiddenOrder,
-                ] {
+                for a in [LaneApprox::BarLine, LaneApprox::CoverMotion] {
                     assert!(kinds(&i).contains(&d9(a)), "{name}: {a:?}");
                 }
 
                 // At 500 ms the eleven notes from 1 s to 1.1 s are on
                 // screen, the last with its lower edge on the region's
-                // top. SUDDEN+ at 0 shows the strip above the region in
-                // every frame; LIFT at 0 is not drawn.
+                // top. SUDDEN+'s paint is drawn whole in every frame;
+                // LIFT and HIDDEN+ at 0 are not drawn.
                 assert_eq!(drawn, [1, 1, 12, 1], "{name}");
+                let paint = i
+                    .skin
+                    .quad_capacity()
+                    .checked_sub(skin_model::LANE_QUADS + skin_model::LANE_RESERVED);
+                assert_eq!(paint, Some(1), "{name}");
+            }
+            "paints" => {
+                // The lanes, LIFT's and HIDDEN+'s markers and four paints.
+                assert_eq!(u.elements, 7, "{name}");
+                assert_eq!(
+                    i.skin.quad_capacity(),
+                    4 + skin_model::LANE_QUADS + skin_model::LANE_RESERVED,
+                    "{name}"
+                );
+                // Each paint in every frame beside the notes on screen.
+                assert_eq!(drawn, [4, 4, 15, 4], "{name}");
             }
             "followers" => {
                 use skin_beatoraja::{DeviationId, LaneApprox};
-                // The image, the number and the grade follow, each noted
-                // once; the combo and HIDDEN+ take their offsets silently.
+                // SUDDEN+'s paint, the image, the number and the grade
+                // follow, each noted once; the combo and HIDDEN+ take their
+                // offsets silently.
                 let motion = NoteKind::Deviation(DeviationId::D9(LaneApprox::CoverMotion));
                 let k = kinds(&i);
                 assert_eq!(
                     k.iter().filter(|&&n| n == motion).count(),
-                    3,
+                    4,
                     "{name}: {k:?}"
                 );
                 assert!(
@@ -491,30 +506,22 @@ fn skin_import_seeds_import_and_draw_as_built() {
                 assert_eq!(drawn, [51, 51, 51, 51], "{name}");
             }
             "rates" => {
-                use skin_beatoraja::{DeviationId, PropertyKind};
+                use skin_beatoraja::DeviationId;
                 // Each rate number once D4, its conditions with it; the
-                // gauge-type set waits for the image selection, the one
-                // choosing by value is unsupported, the one whose value
-                // resolves to nothing draws its first image.
-                let mut k = kinds(&i);
-                k.sort_by_key(|n| format!("{n:?}"));
-                let mut want = vec![NoteKind::Deviation(DeviationId::D4); 6];
-                want.push(NoteKind::UnsupportedField {
-                    field: "image selection",
-                });
-                want.push(NoteKind::UnsupportedProperty {
-                    kind: PropertyKind::Integer,
-                    id: Some(71),
-                });
-                want.sort_by_key(|n| format!("{n:?}"));
-                assert_eq!(k, want, "{name}");
-                // Every object is charged, the dropped image sets too.
+                // sets selecting by gauge type and by EX score D4 too.
+                assert_eq!(
+                    kinds(&i),
+                    [NoteKind::Deviation(DeviationId::D4); 8],
+                    "{name}"
+                );
                 assert_eq!(u.elements, 9, "{name}");
+                assert_eq!(u.choice_refs, 3, "{name}");
                 // A normal gauge: the groove, not-hard and not-ex numbers
                 // draw. EX 150 over one judged of 100 targets: 750 000 bp
                 // now, its whole percent past 3 cells; 75.00 overall,
-                // "00" twice; and the first image.
-                assert_eq!(drawn, [3 + 2 + 2 + 1; 4], "{name}");
+                // "00" twice. Each set has one image: gauge type 2, EX 150
+                // and the unresolved value all select it.
+                assert_eq!(drawn, [3 + 2 + 2 + 3; 4], "{name}");
             }
             "readouts" => {
                 use skin_beatoraja::{DeviationId, PropertyKind};
@@ -538,6 +545,40 @@ fn skin_import_seeds_import_and_draw_as_built() {
                 // adjusting.
                 let images = 1 + 1 + 1;
                 assert_eq!(drawn, [1 + 2 + 1 + 1 + 4 + 3 + images; 4], "{name}");
+            }
+            "selectors" => {
+                use skin_beatoraja::{DeviationId, PropertyKind};
+                // Each selector but the perfect count and no property
+                // D4; the group past its frames never drawn; each set's
+                // undefined id ignored; 500-507 refused by their id.
+                let mut k = kinds(&i);
+                k.sort_by_key(|n| format!("{n:?}"));
+                let mut want = vec![NoteKind::Deviation(DeviationId::D4); 6];
+                want.push(NoteKind::Track(skin_beatoraja::TrackWhy::NeverDrawn));
+                want.extend([NoteKind::UndefinedObject; 5]);
+                want.extend((500..=507).map(|id| NoteKind::UnsupportedProperty {
+                    kind: PropertyKind::ImageIndex,
+                    id: Some(id),
+                }));
+                want.sort_by_key(|n| format!("{n:?}"));
+                assert_eq!(k, want, "{name}");
+                // Three groups of 4 frames and the sets' three images; 2,
+                // 2 and 4 group entries and 6 per set; the wider image's
+                // own track in each set.
+                assert_eq!(u.elements, 17, "{name}");
+                assert_eq!((u.images, u.frames, u.files), (6, 15, 1), "{name}");
+                assert_eq!(u.choice_refs, 2 + 2 + 4 + 5 * 6, "{name}");
+                assert_eq!(i.skin.choice_ref_count(), 38, "{name}");
+                assert_eq!(u.keys, 3 + 5 + 5, "{name}");
+                // The gauge's type 34 ops twice, a switch 4 thrice, the
+                // rest 1.
+                assert_eq!(u.ops, 2 * 34 + 3 * 4 + 3, "{name}");
+                assert_eq!(u.widget_quads, 0, "{name}");
+                // A normal gauge (2) is past the groups' two entries and
+                // selects the set's hole; EX 150 is past the sets,
+                // selecting `a`, and the perfect count 1 selects `b`; every
+                // switch is on.
+                assert_eq!(drawn, [3 + 4; 4], "{name}");
             }
             _ => panic!("no expectation for seed {name}"),
         }

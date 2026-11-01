@@ -18,23 +18,23 @@ use bms_model::TimeUs;
 
 use crate::{
     Assignment, CanonicalError, DefaultTotal, Denominator, EmptyPoorRange, EmptyPoorRule,
-    GaugeDelta, GaugeKind, GaugeRule, GaugeValue, HeadEligibility, HeaderPolicy, Implementation,
-    JudgeWindows, LaneTable, LateHeadRule, LnEndWindows, LnMode, LnModeRule, LowDamage, MineRule,
-    MissRule, PerJudgment, PerLaneClass, RankScale, RulePreset, SameTimeOrder, ScaledRank,
-    ScoreWeights, TotalCorrection, TotalMode, Window, WindowPolicy,
+    GaugeDelta, GaugeKind, GaugeRule, GaugeValue, HeaderPolicy, Implementation, JudgeWindows,
+    LaneTable, LateHeadRule, LnEndWindows, LnMode, LnModeRule, LowDamage, MineRule, MissRule,
+    PerJudgment, PerLaneClass, RankScale, RulePreset, SameTimeOrder, ScaledRank, ScoreWeights,
+    TotalCorrection, TotalMode, Window, WindowPolicy,
 };
 
-/// The encoding layout, which every encoding starts with. Version 11 has a
+/// The encoding layout, which every encoding starts with. Version 12 has a
 /// table per lane class (keys, then scratch: windows, LN-end edges, empty
 /// POOR range), the window policy after the header policy (thousandths 0;
 /// scaled 1 and interpolated 2, each with five rank percentages, the absent
 /// and the `#DEFEXRANK` percentage), two assignment variants (nearest first
-/// 0, combo priority 1), the LN head eligibility after the late head rule
-/// (inside BAD 0, not late BAD 1), the default `#TOTAL` as a policy, and per
-/// gauge its lamp rank after its id, a survival gauge's failure threshold,
-/// its `#TOTAL` correction and a list of low-damage bands. Another version
-/// is refused, never converted.
-pub const CANONICAL_VERSION: u64 = 11;
+/// 0, combo priority 1), the LN mode's default and late head rule with no
+/// head eligibility, the default `#TOTAL` as a policy, and per gauge its
+/// lamp rank after its id, a survival gauge's failure threshold, its
+/// `#TOTAL` correction and a list of low-damage bands. Another version is
+/// refused, never converted.
+pub const CANONICAL_VERSION: u64 = 12;
 
 /// The fewest bytes a gauge takes: an empty id's length, a one-byte lamp
 /// rank, the survival tag and a one-byte threshold, three one-byte values,
@@ -469,20 +469,12 @@ impl<S: Sink> Writer<S> {
     }
 
     fn ln_mode(&mut self, rule: &LnModeRule) {
-        let LnModeRule {
-            default,
-            late_head,
-            head_eligibility,
-        } = *rule;
+        let LnModeRule { default, late_head } = *rule;
         self.uint(match default {
             LnMode::Ln => 0,
         });
         self.uint(match late_head {
             LateHeadRule::CompletesAtPress => 0,
-        });
-        self.uint(match head_eligibility {
-            HeadEligibility::InsideBad => 0,
-            HeadEligibility::NotLateBad => 1,
         });
     }
 
@@ -781,11 +773,6 @@ impl Reader<'_> {
             late_head: self.tag("ln_mode.late_head", |t| {
                 (t == 0).then_some(LateHeadRule::CompletesAtPress)
             })?,
-            head_eligibility: self.tag("ln_mode.head_eligibility", |t| match t {
-                0 => Some(HeadEligibility::InsideBad),
-                1 => Some(HeadEligibility::NotLateBad),
-                _ => None,
-            })?,
         })
     }
 
@@ -852,10 +839,10 @@ mod tests {
     }
 
     #[test]
-    fn canonical_bytes_start_with_format_11_and_change_with_any_table_edge() {
+    fn canonical_bytes_start_with_format_12_and_change_with_any_table_edge() {
         let base = tapestry();
         let base_bytes = base.canonical_bytes();
-        assert_eq!(base_bytes.first(), Some(&11));
+        assert_eq!(base_bytes.first(), Some(&12));
         let edges: [fn(&mut crate::LaneTable) -> &mut TimeUs; 5] = [
             |t| &mut t.ln_end.perfect,
             |t| &mut t.ln_end.great,
@@ -995,12 +982,11 @@ mod tests {
             den: 5,
         });
         p.assignment = crate::Assignment::ComboPriority;
-        p.ln_mode.head_eligibility = crate::HeadEligibility::NotLateBad;
         p
     }
 
     /// The bytes of [`representative`], written by hand from the module docs
-    /// field by field: the format version 11, then `rep`, version 7, the
+    /// field by field: the format version 12, then `rep`, version 7, the
     /// implementation; the keys' table: the windows, the LN-end edges (90 ms
     /// is zigzag 180000 = `a0 fe 0a`, 140 ms is `c0 8b 11`, 210 ms is `a0 d1
     /// 19`) and the empty POOR range (`ahead` 250 ms is zigzag 500000 = `a0
@@ -1010,14 +996,13 @@ mod tests {
     /// the window policy (`Interpolated`, 2: five percentages `19 32 4b 64 7d`, 80
     /// `50`, 70 `46`), the default `#TOTAL` (`Fixed`, 0: 123.456 is zigzag
     /// 246912 = `80 89 0f`), and the rest in declaration order, the
-    /// assignment `ComboPriority` (1) and the head eligibility `NotLateBad`
-    /// (1) among them. Each gauge's lamp rank follows its id (normal 7,
+    /// assignment `ComboPriority` (1) among them. Each gauge's lamp rank follows its id (normal 7,
     /// survival 300 = `ac 02`), and each gauge ends with its correction's tag and its
     /// bands: normal's `00 00`; survival, after its kind (1) and 2 %
     /// threshold (`80 b5 18`), ends with `ScaleDamage` (2), two bands, 30 %
     /// (`80 9b ee 02`) × 1/2 and 50 % (`80 ad e2 04`) × 4/5.
-    const PINNED: [u8; 246] = [
-        0x0b, 0x03, 0x72, 0x65, 0x70, 0x07, 0x08, 0x73, 0x74, 0x61, 0x6e, 0x64, //
+    const PINNED: [u8; 245] = [
+        0x0c, 0x03, 0x72, 0x65, 0x70, 0x07, 0x08, 0x73, 0x74, 0x61, 0x6e, 0x64, //
         0x61, 0x72, 0x64, 0x04, 0xa0, 0x99, 0x02, 0xe0, 0xd7, 0x02, 0x80, 0xf1, //
         0x04, 0xa0, 0x8d, 0x06, 0xa0, 0xfe, 0x0a, 0xe0, 0xb6, 0x0d, 0xa0, 0xe0, //
         0x14, 0x80, 0xb5, 0x18, 0xa0, 0xfe, 0x0a, 0xc0, 0x8b, 0x11, 0xa0, 0xd1, //
@@ -1037,7 +1022,7 @@ mod tests {
         0x9f, 0xf7, 0x36, 0x02, 0x02, 0x80, 0x9b, 0xee, 0x02, 0x01, 0x02, 0x80, //
         0xad, 0xe2, 0x04, 0x04, 0x05, 0x02, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, //
         0x00, 0x01, 0x01, 0x00, 0x00, 0x00, 0x01, 0x01, 0x00, 0x01, 0x00, 0x00, //
-        0x01, 0x00, 0x00, 0xa0, 0x8d, 0x06,
+        0x00, 0x00, 0xa0, 0x8d, 0x06,
     ];
 
     /// The layout, pinned, so a reordered or dropped field fails here; an
@@ -1163,18 +1148,10 @@ mod tests {
     }
 
     #[test]
-    fn head_eligibilities_decode_and_differ() {
-        let mut p = tapestry();
-        p.ln_mode.head_eligibility = crate::HeadEligibility::NotLateBad;
-        assert_ne!(p.canonical_bytes(), tapestry().canonical_bytes());
-        assert_eq!(decode(&p.canonical_bytes()), Ok(p));
-    }
-
-    #[test]
     fn other_canonical_version_is_refused() {
-        // Version 10, the layout before lamp ranks, among them.
-        assert_eq!(CANONICAL_VERSION, 11);
-        for v in [0, 10, CANONICAL_VERSION + 1, u64::MAX] {
+        // Version 11, the layout with an LN head eligibility, among them.
+        assert_eq!(CANONICAL_VERSION, 12);
+        for v in [0, 11, CANONICAL_VERSION + 1, u64::MAX] {
             assert_eq!(
                 decode(&with_uint_at(0, v)),
                 Err(CanonicalError::UnsupportedVersion(v))
@@ -1188,19 +1165,19 @@ mod tests {
         // The id's length: one more than the bytes left is refused; exactly
         // the bytes left is read, and the next field finds nothing.
         assert_eq!(
-            decode(&[11, 4, b'a', b'b', b'c']),
+            decode(&[12, 4, b'a', b'b', b'c']),
             Err(CanonicalError::CountBeyondData {
                 field: "id",
                 count: 4
             })
         );
         assert_eq!(
-            decode(&[11, 3, b'a', b'b', b'c']),
+            decode(&[12, 3, b'a', b'b', b'c']),
             Err(CanonicalError::Truncated)
         );
         assert_eq!(
             decode(&[
-                11, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x01
+                12, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x01
             ]),
             Err(CanonicalError::CountBeyondData {
                 field: "id",
@@ -1434,17 +1411,17 @@ mod tests {
         mine.mine(&tapestry().mine);
         let mine = bytes.len() - mine.0.len();
         assert_eq!(decode(&with_uint_at(mine, 1)), unknown("mine", 1));
-        // The assignment precedes the LN mode's three tags and the `#TOTAL`
-        // mode's; the head eligibility is the LN mode's last.
-        let assignment = mine - 5;
-        assert_eq!(&bytes[assignment..mine], [0, 0, 0, 0, 0]);
+        // The assignment precedes the LN mode's two tags and the `#TOTAL`
+        // mode's; the late head rule is the LN mode's last.
+        let assignment = mine - 4;
+        assert_eq!(&bytes[assignment..mine], [0, 0, 0, 0]);
         assert_eq!(
             decode(&with_uint_at(assignment, 2)),
             unknown("assignment", 2)
         );
         assert_eq!(
-            decode(&with_uint_at(mine - 2, 2)),
-            unknown("ln_mode.head_eligibility", 2)
+            decode(&with_uint_at(mine - 2, 1)),
+            unknown("ln_mode.late_head", 1)
         );
 
         // The implementation's tag is its name.

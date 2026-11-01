@@ -6,8 +6,9 @@
 use bms_model::{Chart, TimeUs};
 use eval::{JudgeEvent, Section};
 use game::PlayView;
+use skin_model::{Canvas, Fit};
 
-use crate::{Gpu, SpriteBatch};
+use crate::{Gpu, MAX_SPRITES, SpriteBatch};
 
 /// What one frame draws from.
 #[derive(Clone, Copy, Debug)]
@@ -31,6 +32,11 @@ pub struct FrameInput<'a> {
     /// Lines of the measurement overlay (design.md "Latency Figures"), drawn
     /// over the play; empty when it is hidden.
     pub overlay: &'a [&'a str],
+    /// The target's size in pixels as the renderer last applied it
+    /// ([`Renderer::target`](crate::Renderer::target)), never zero: the
+    /// size the frame is projected onto ([`PlaySkin::canvas`]).
+    /// [`Renderer::build`](crate::Renderer::build) sets it so.
+    pub target: [u32; 2],
 }
 
 impl FrameInput<'_> {
@@ -70,6 +76,21 @@ pub trait PlaySkin: Send {
 
     /// Fills `out`, which arrives empty, with the frame's sprites.
     fn build(&mut self, f: &FrameInput<'_>, out: &mut SpriteBatch);
+
+    /// The most sprites a frame of the skin pushes: the renderer's batch,
+    /// staging and instance buffer hold this many, and never fewer than
+    /// [`MAX_SPRITES`], which the built-in screens use. The default is
+    /// [`MAX_SPRITES`].
+    fn capacity(&self) -> u32 {
+        MAX_SPRITES as u32
+    }
+
+    /// The canvas the skin draws on for a `target`-pixel target, which the
+    /// renderer projects its frames and clips onto. The default is the
+    /// fixed 1920×1080 layout, letterboxed.
+    fn canvas(&self, target: [u32; 2]) -> Canvas {
+        Canvas::new(target, Fit::Fixed)
+    }
 
     /// Fills `out`, which arrives empty, with the play screen's frame while
     /// a chart loads before the countdown (design.md "Play Lifecycle"):
