@@ -424,6 +424,14 @@ fn sizes_are_exact() {
     // checked as a number only.
     let l = sizes("1e39, 20, 20, 20, 20, 20, 20, 20");
     assert!(matches!(l.err(), ImportError::Range { field: "size", .. }));
+    // Precision past i128 that reduces into it is a size.
+    let fine = ["20.00000000000000000000000000000000003125"; 8].join(", ");
+    sizes(&fine).ok();
+    let coarse = ["20.000000000000000000000000000000000000001"; 8].join(", ");
+    assert!(matches!(
+        sizes(&coarse).err(),
+        ImportError::Range { field: "size", .. }
+    ));
     sizes("20, 20, 20, 20, 20, 20, 20, 20, 1e39").ok();
     let l = sizes(r#"20, 20, 20, 20, 20, 20, 20, 20, "x""#);
     assert!(matches!(l.err(), ImportError::Type { field: "size", .. }));

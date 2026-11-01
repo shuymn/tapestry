@@ -95,7 +95,16 @@ impl Q {
     /// an optional point, and an optional exponent, as the source's float
     /// fields accept (`20`, `20.0`, `2e1` and `+200E-1` are one value).
     /// `None` for another form, or a value whose reduced numerator or
-    /// power-of-ten denominator passes `i128`.
+    /// denominator passes `i128`.
+    ///
+    /// The exponent moves the point among the digits. The whole part
+    /// before it is read from its first digit; the fraction after it from
+    /// its last, `(digit + rest) / 10` reduced at every step, so factors
+    /// of 2 and 5 cancel as they arise and no step's denominator passes
+    /// the fraction's own reduced one. A point moved past either end
+    /// multiplies or divides by ten a step at a time, which grows a
+    /// nonzero value or its denominator each step and so overflows within
+    /// a few hundred steps however large the exponent.
     pub(crate) fn decimal(raw: &str) -> Option<Self> {
         let (negative, rest) = match raw.as_bytes().first() {
             Some(b'-') => (true, raw.get(1..)?),
@@ -111,37 +120,36 @@ impl Q {
         if int.len() + frac.len() == 0 || !digits().all(|b| b.is_ascii_digit()) {
             return None;
         }
-        // The significant digits, their trailing zeros moved to the
-        // exponent.
-        let (mut n, mut zeros) = (0_i128, 0_u32);
-        for b in digits() {
-            if b == b'0' {
-                zeros = zeros.checked_add(1)?;
-                continue;
-            }
-            let d = i128::from(b - b'0');
-            n = if n == 0 {
-                d
-            } else {
-                n.checked_mul(10_i128.checked_pow(zeros.checked_add(1)?)?)?
-                    .checked_add(d)?
-            };
-            zeros = 0;
-        }
-        if n == 0 {
+        if digits().all(|b| b == b'0') {
             return Some(Self::ZERO);
         }
-        if negative {
-            n = -n;
+        let ten = Self::int(10);
+        let digit = |b: u8| Self::int(b - b'0');
+        let len = int.len().checked_add(frac.len())?;
+        // The point's place among the digits, and where it splits them.
+        let point = i64::try_from(int.len()).ok()?.checked_add(exp)?;
+        let split = usize::try_from(point.clamp(0, i64::try_from(len).ok()?)).ok()?;
+        let mut whole = Self::ZERO;
+        for b in digits().take(split) {
+            whole = whole.mul(ten)?.add(digit(b))?;
         }
-        let frac_len = i64::try_from(frac.len()).ok()?;
-        let e = exp.checked_sub(frac_len)?.checked_add(i64::from(zeros))?;
-        let p = 10_i128.checked_pow(u32::try_from(e.unsigned_abs()).ok()?)?;
-        if e >= 0 {
-            Self::new(n.checked_mul(p)?, 1)
-        } else {
-            Self::new(n, p)
+        let mut part = Self::ZERO;
+        for i in (split..len).rev() {
+            let b = match i.checked_sub(int.len()) {
+                Some(j) => frac.as_bytes().get(j),
+                None => int.as_bytes().get(i),
+            };
+            part = digit(*b?).div(ten)?.add(part.div(ten)?)?;
         }
+        let len = i64::try_from(len).ok()?;
+        for _ in len..point {
+            whole = whole.mul(ten)?;
+        }
+        for _ in point..0 {
+            part = part.div(ten)?;
+        }
+        let v = whole.add(part)?;
+        if negative { Self::ZERO.sub(v) } else { Some(v) }
     }
 
     /// The nearest `f32`, for geometry the model keeps unrounded: exact
@@ -304,9 +312,28 @@ mod tests {
         // Trailing zeros far past i128 are only an exponent.
         let long = format!("1{}e-60", "0".repeat(60));
         assert_eq!(dec(&long), Some(Q::int(1)));
-        // Past the rationals: a numerator, a denominator, an exponent.
+        // Digits or a power of ten past i128 whose reduced value fits:
+        // 3125 / 10^38 = 1 / (2^5 · 10^33), 3125 / 10^40 = 1 / (2^5 · 10^35).
+        let fine = 32 * 10_i128.pow(33);
+        assert_eq!(
+            dec("20.00000000000000000000000000000000003125"),
+            Some(q(20 * fine + 1, fine))
+        );
+        assert_eq!(dec("-3125e-40"), Some(q(-1, 32 * 10_i128.pow(35))));
+        let tiny = format!("0.{}3125e2", "0".repeat(36));
+        assert_eq!(dec(&tiny), Some(q(1, fine)));
+        assert_eq!(dec("2.5e-38"), Some(q(1, 4 * 10_i128.pow(37))));
+        // A fraction from its last digit up, the integer from its first.
+        assert_eq!(dec("123.456"), Some(q(15_432, 125)));
+        assert_eq!(dec("1234.5e-2"), Some(q(2_469, 200)));
+        assert_eq!(dec("0.0012e3"), Some(q(6, 5)));
+        // Past the rationals after reduction: a numerator, a denominator,
+        // an exponent.
         assert_eq!(dec("1e39"), None);
         assert_eq!(dec("1e-39"), None);
+        assert_eq!(dec("20.000000000000000000000000000000000000001"), None);
+        assert_eq!(dec("2.00000000000000000000000000000000000001"), None);
+        assert_eq!(dec("1e-9223372036854775807"), None);
         assert_eq!(dec("1e99999999999999999999"), None);
         assert_eq!(dec("170141183460469231731687303715884105728"), None);
         for bad in ["", ".", "e5", "1e", "1.2.3", "--1", "0x10", "1_0"] {
