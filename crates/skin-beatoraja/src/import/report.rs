@@ -133,7 +133,8 @@ pub enum DeviationId {
 
 /// How the lanes and their covers are drawn differently from the source:
 /// SUDDEN+ and LIFT by owner decision 12 (items a–l), HIDDEN+ by its
-/// mapping (owner decision 15, items m–o).
+/// mapping (owner decision 15, items m–o), their followers by item p
+/// (owner decision 14).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LaneApprox {
     /// a: notes and long-note bodies stop at the top of the lanes.
@@ -163,6 +164,16 @@ pub enum LaneApprox {
     /// o: HIDDEN+ is never drawn outside the lanes, where the source can
     /// draw it above or below them.
     HiddenClip,
+    /// p: what follows LIFT or SUDDEN+ (offsets 3 and 4) moves by this
+    /// frame's lane geometry, from the first frame and while the lanes
+    /// are hidden or off, and not at all in a skin without lanes. The
+    /// source prepares every object before it draws (`skin/Skin.java:
+    /// 316-328`) but sets the offsets while it draws the lanes
+    /// (`play/LaneRenderer.java:332-345`), so its followers can show the
+    /// last frame's motion, and keeps the offsets on the controller
+    /// across states (`MainController.java:124-137`, `MainState.java:
+    /// 146-147`).
+    CoverMotion,
 }
 
 /// What a note is about.

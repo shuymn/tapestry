@@ -8,7 +8,7 @@ use super::super::policy::{CriticalPart, Role};
 use super::super::property::{self, IntProp, Value};
 use super::super::report::{DeviationId, NoteKind, PropertyKind, Severity};
 use super::super::track::{self, Stretch};
-use super::super::{Cx, Dst, Prop};
+use super::super::{Cx, Dst, Opts, Prop};
 use crate::error::ImportError;
 
 /// The most cells the model draws.
@@ -203,7 +203,11 @@ impl Cx<'_> {
             self.drop_el(role, at, NoteKind::Stretch(dst.stretch))?;
             return Ok(());
         }
-        let Some(c) = self.common(role, &dst, false)? else {
+        let o = Opts {
+            follow: true,
+            ..Opts::default()
+        };
+        let Some(c) = self.common_with(role, &dst, o)? else {
             return Ok(());
         };
         let program = self.compile(shown.expr(), Ty::Int, at)?;
@@ -295,7 +299,7 @@ impl Cx<'_> {
             },
             value: program,
         });
-        self.push_native(c, Source::Number(index), t, native);
+        self.push_native(c, Source::Number(index), t, native)?;
         Ok(())
     }
 }

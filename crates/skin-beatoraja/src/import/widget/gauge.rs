@@ -150,6 +150,7 @@ impl Cx<'_> {
         // stretch or filter of its own.
         let o = Opts {
             unrotated: true,
+            follow: true,
             ..Opts::default()
         };
         let Some(mut c) = self.common_with(role, &dst, o)? else {
@@ -226,7 +227,7 @@ impl Cx<'_> {
         );
         let index = u32::try_from(self.widgets.gauges.len()).unwrap_or(u32::MAX);
         self.widgets.gauges.push(def);
-        self.push(c, Source::Gauge(index), t);
+        self.push(c, Source::Gauge(index), t)?;
         Ok(())
     }
 }

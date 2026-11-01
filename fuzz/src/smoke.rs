@@ -278,6 +278,7 @@ fn skin_json_seeds_resolve_or_fail_as_built() {
             "offsets",
             "choices_default",
             "lanes",
+            "followers",
             "judge",
             "gauge",
         ],
@@ -417,8 +418,12 @@ fn skin_import_seeds_import_and_draw_as_built() {
                 assert_eq!(drawn, [2, 2, 2, 2], "{name}");
             }
             "offsets" => {
-                assert_eq!(kinds(&i), [NoteKind::RuntimeOffset(4)], "{name}");
-                assert_eq!(drawn, [1, 1, 1, 1], "{name}");
+                // Offset 4 follows SUDDEN+, at rest without lanes.
+                let motion = NoteKind::Deviation(skin_beatoraja::DeviationId::D9(
+                    skin_beatoraja::LaneApprox::CoverMotion,
+                ));
+                assert_eq!(kinds(&i), [motion], "{name}");
+                assert_eq!(drawn, [2, 2, 2, 2], "{name}");
             }
             "choices_default" => {
                 assert_eq!(i.report.files.len(), 1, "{name}");
@@ -446,6 +451,26 @@ fn skin_import_seeds_import_and_draw_as_built() {
                 // top. SUDDEN+ at 0 shows the strip above the region in
                 // every frame; LIFT at 0 is not drawn.
                 assert_eq!(drawn, [1, 1, 12, 1], "{name}");
+            }
+            "followers" => {
+                use skin_beatoraja::{DeviationId, LaneApprox};
+                // The image, the number and the grade follow, each noted
+                // once; the combo and HIDDEN+ take their offsets silently.
+                let motion = NoteKind::Deviation(DeviationId::D9(LaneApprox::CoverMotion));
+                let k = kinds(&i);
+                assert_eq!(
+                    k.iter().filter(|&&n| n == motion).count(),
+                    3,
+                    "{name}: {k:?}"
+                );
+                assert!(
+                    !k.iter().any(|n| matches!(n, NoteKind::RuntimeOffset(_))),
+                    "{name}: {k:?}"
+                );
+                assert_eq!(u.elements, 7, "{name}");
+                // The lanes' frames, then the image, the number's two
+                // digits, the grade and its combo of 1.
+                assert_eq!(drawn, [1 + 5, 1 + 5, 12 + 5, 1 + 5], "{name}");
             }
             "judge" => {
                 // Seven grades, combos of slots 0, 1, 2 and 6 (slots 3-5

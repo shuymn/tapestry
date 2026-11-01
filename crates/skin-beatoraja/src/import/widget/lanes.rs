@@ -1,5 +1,6 @@
-//! The lanes (`note`), SUDDEN+ (an image listing offset 4), LIFT
-//! (`liftCover`) and HIDDEN+ (`hiddenCover`).
+//! The lanes (`note`), SUDDEN+ (an image listing offset 4 that can reach
+//! the lanes; one that cannot follows SUDDEN+), LIFT (`liftCover`) and
+//! HIDDEN+ (`hiddenCover`).
 //!
 //! The source draws the lanes from eight lane rects
 //! (`JsonPlaySkinObjectLoader.java:79-93`, `play/LaneRenderer.java:
@@ -591,7 +592,7 @@ impl Cx<'_> {
             moved,
             kept_after: false,
         };
-        self.push(c, Source::Lanes, t);
+        self.push(c, Source::Lanes, t)?;
         self.lanes = Some(state);
 
         // What the source draws that the model does not.
@@ -768,35 +769,24 @@ impl Cx<'_> {
     }
 
     /// Charges an image listing offset 4 its keys as written, once before
-    /// either reading, and drops it as decorative when it cannot move
-    /// over the lanes: `true` when dropped.
-    fn offset4_dropped(&mut self, dst: &Dst) -> Result<bool, ImportError> {
+    /// either reading, and tells whether it cannot move over the lanes:
+    /// `true` for an ordinary image following SUDDEN+, `false` for a
+    /// SUDDEN+ candidate.
+    pub(super) fn offset4_outside(&mut self, dst: &Dst) -> Result<bool, ImportError> {
         let at = dst.span;
         self.budget
             .keys(dst.keys.len())
             .map_err(|l| self.limit(at, l))?;
-        if !self.decorative_offset4(dst)? {
-            return Ok(false);
-        }
-        self.drop_el(
-            Role::Decorative,
-            at,
-            NoteKind::RuntimeOffset(OFFSET_LANECOVER),
-        )?;
-        Ok(true)
+        self.decorative_offset4(dst)
     }
 
-    /// An image listing offset 4 that selects its frames by `field`, an
-    /// expression the mapping does not run: decorative and dropped when
-    /// it cannot move over the lanes, refused otherwise.
+    /// A SUDDEN+ candidate ([`Self::offset4_outside`]) that selects its
+    /// frames by `field`, an expression the mapping does not run: refused.
     pub(super) fn lane_cover_selector(
         &mut self,
         dst: Dst,
         field: &'static str,
     ) -> Result<(), ImportError> {
-        if self.offset4_dropped(&dst)? {
-            return Ok(());
-        }
         Err(ImportError::Critical {
             at: self.loc(dst.span),
             part: CriticalPart::Cover,
@@ -804,9 +794,8 @@ impl Cx<'_> {
         })
     }
 
-    /// An image listing offset 4: decorative and dropped when it cannot
-    /// move over the lanes, else SUDDEN+ when it is the first exact match,
-    /// else refused.
+    /// A SUDDEN+ candidate ([`Self::offset4_outside`]), its keys charged:
+    /// SUDDEN+ when it is the first exact match, else refused.
     pub(super) fn lane_cover_image(
         &mut self,
         dst: Dst,
@@ -814,9 +803,6 @@ impl Cx<'_> {
         s: &SrcImage,
     ) -> Result<(), ImportError> {
         let at = dst.span;
-        if self.offset4_dropped(&dst)? {
-            return Ok(());
-        }
         let part = CriticalPart::Cover;
         let refuse = |cx: &Self, field: &'static str| {
             Err(ImportError::Critical {
