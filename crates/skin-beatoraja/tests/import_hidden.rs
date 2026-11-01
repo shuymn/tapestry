@@ -151,6 +151,26 @@ fn the_trim_line_is_fixed_linked_or_absent() {
         &[&hidden("")],
     );
     assert!(has(below.report(), d9(LaneApprox::HiddenClip)));
+    // 100 tall from 800, it rises at most to 200, never above a line at
+    // 980 (100), fixed or linked: the source never draws it, so nothing
+    // is drawn outside the lanes.
+    for link in ["false", "true"] {
+        let obj = hidden_object(&format!(r#""isDisapearLineLinkLift": {link}"#))
+            .replace(r#""disapearLine": 200"#, r#""disapearLine": 980"#);
+        let dst = hidden("").replace(
+            r#""y": -400, "w": 430, "h": 600"#,
+            r#""y": 180, "w": 430, "h": 100"#,
+        );
+        let l = with(&obj, &[&dst]);
+        assert!(!has(l.report(), d9(LaneApprox::HiddenClip)), "{link}");
+        for lift in [0, 300, 1_000] {
+            assert_eq!(
+                rects(&l, [0, lift, 1_000]),
+                rects(&l, [0, lift, 0]),
+                "{link} {lift}"
+            );
+        }
+    }
 }
 
 #[test]

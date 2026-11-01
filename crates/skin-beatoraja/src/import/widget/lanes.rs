@@ -1211,7 +1211,9 @@ impl Cx<'_> {
         }
         // Where the source can draw it over its whole travel: from its
         // upper edge raised by the lane's height to its lower edge at rest
-        // or the trim line above it. The model cuts it to the lanes.
+        // or the trim line above it. A trim line, fixed or raised with the
+        // lift, at or above its highest upper edge leaves nothing drawn.
+        // The model cuts it to the lanes.
         let range = |cx: &Self| cx.range(at, "dst");
         let h_up = Q::int(h0).mul(self.r).ok_or_else(|| range(self))?;
         let bottom = Q::int(y0)
@@ -1221,7 +1223,8 @@ impl Cx<'_> {
         let highest = upper.sub(h_up).ok_or_else(|| range(self))?;
         let lowest = trim_y.map_or(lower, |y| y.min(lower));
         let top = self.lanes.as_ref().map_or(0, |l| l.def.top);
-        if highest < Q::int(top) || lowest > bottom {
+        let drawn = trim_y.is_none_or(|y| highest < y);
+        if drawn && (highest < Q::int(top) || lowest > bottom) {
             self.lane_approx(at, part, LaneApprox::HiddenClip)?;
         }
         Ok(())
