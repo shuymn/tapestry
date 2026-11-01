@@ -112,6 +112,7 @@ fn worst() -> skin_model::Skin {
             judges: vec![j],
             texts: Vec::new(),
             image_choices: Vec::new(),
+            cover_paints: Vec::new(),
         },
     )
     .unwrap()
@@ -225,6 +226,7 @@ fn followed_widgets_move_once_by_the_covers() {
             judges: vec![j],
             texts: Vec::new(),
             image_choices: Vec::new(),
+            cover_paints: Vec::new(),
         },
     )
     .unwrap();

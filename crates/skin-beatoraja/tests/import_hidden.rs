@@ -66,12 +66,7 @@ fn dropped(l: &Loaded, kind: NoteKind) {
 fn hidden_plus_rises_from_its_destination() {
     let l = hid("", "");
     let r = l.report();
-    for a in [
-        LaneApprox::HiddenOrder,
-        LaneApprox::HiddenStretch,
-        LaneApprox::HiddenClip,
-        LaneApprox::CoverOrder,
-    ] {
+    for a in [LaneApprox::HiddenStretch, LaneApprox::HiddenClip] {
         assert!(!has(r, d9(a)), "{a:?}");
     }
     // Nothing at 0 ‰. 500 ‰ raises it 300 px: its upper edge at 580, cut
@@ -481,36 +476,32 @@ fn hidden_plus_outside_the_subset_is_dropped() {
 }
 
 #[test]
-fn hidden_plus_is_drawn_under_the_other_covers() {
-    // After SUDDEN+ or LIFT in the source's order, the source draws
-    // HIDDEN+ above it; the model always draws it below: noted.
-    let order = d9(LaneApprox::HiddenOrder);
-    let objects = format!("{}, {}", lift_object(""), hidden_object(""));
-    for (dsts, noted) in [
-        (vec![cover(""), hidden("")], true),
-        (vec![lift(""), hidden("")], true),
-        (vec![hidden(""), cover(""), lift("")], false),
-    ] {
-        let dsts: Vec<&str> = dsts.iter().map(String::as_str).collect();
-        let l = with(&objects, &dsts);
-        assert_eq!(has(l.report(), order), noted, "{dsts:?}");
-    }
-    // Notes, LIFT, then HIDDEN+ under a fixed trim: they overlap from
-    // 760, and LIFT is drawn above.
+fn hidden_plus_is_drawn_where_its_destination_stands() {
+    // LIFT and HIDDEN+ under a fixed trim overlap from 760 at LIFT
+    // 200 ‰, HIDDEN+ 500 ‰; whichever destination comes later is drawn
+    // above, as in the source, with nothing noted.
     let fixed = format!(
         "{}, {}",
         lift_object(""),
         hidden_object(r#""isDisapearLineLinkLift": false"#)
     );
-    let l = with(&fixed, &[&lift(""), &hidden("")]);
-    assert!(has(l.report(), order));
-    assert_eq!(
-        rects(&l, [0, 200, 500]),
-        [[20, 520, 430, 360], [20, 760, 430, 120]]
-    );
-    // An element kept between the notes and HIDDEN+ is drawn above it.
+    let (hidden_rect, lift_rect) = ([20, 520, 430, 360], [20, 760, 430, 120]);
+    let mut notes = Vec::new();
+    for (dsts, want) in [
+        ([lift(""), hidden("")], [lift_rect, hidden_rect]),
+        ([hidden(""), lift("")], [hidden_rect, lift_rect]),
+    ] {
+        let dsts: Vec<&str> = dsts.iter().map(String::as_str).collect();
+        let l = with(&fixed, &dsts);
+        assert_eq!(rects(&l, [0, 200, 500]), want, "{dsts:?}");
+        let kinds: Vec<NoteKind> = l.report().notes.iter().map(|n| n.kind).collect();
+        notes.push(kinds);
+    }
+    // The order adds no note.
+    assert_eq!(notes[0], notes[1]);
+    // An element kept between the notes and HIDDEN+ is drawn below it.
     let plain = r#"{"id": "deco", "dst": [{"x": 0, "y": 0, "w": 10, "h": 10}]}"#;
     let l = with(&hidden_object(""), &[plain, &hidden("")]);
-    assert!(has(l.report(), d9(LaneApprox::CoverOrder)));
-    assert!(!has(l.report(), order));
+    let all = rects(&l, [0, 0, 500]);
+    assert_eq!(all.last(), Some(&[20, 580, 430, 300]), "{all:?}");
 }

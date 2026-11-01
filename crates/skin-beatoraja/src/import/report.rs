@@ -148,17 +148,9 @@ pub enum LaneApprox {
     /// h: a long note within one note height of its end draws no body
     /// (the source draws one of negative height).
     LnBody,
-    /// i: the part of SUDDEN+ above the lanes is never drawn.
-    CoverAbove,
     /// j: bar lines are drawn across the lanes at note centres, white and
     /// opaque, until they leave the lanes' bottom.
     BarLine,
-    /// k: what the skin draws between the notes and SUDDEN+, LIFT or
-    /// HIDDEN+ is drawn above them.
-    CoverOrder,
-    /// m: HIDDEN+ is drawn under SUDDEN+ and LIFT, where the source draws
-    /// it above the one it comes after.
-    HiddenOrder,
     /// n: HIDDEN+ is cut at its trim line after its stretch, where the
     /// source decides what to draw and clip from its unstretched
     /// destination.

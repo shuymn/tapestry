@@ -9,38 +9,33 @@
 //! a hole. Selection follows the source (`SkinImage.java:123-139`): a
 //! negative value hides, a value past the table selects entry 0, and a
 //! hole hides.
+//!
+//! A selecting image that SUDDEN+ may paint lowers to a play-critical
+//! cover paint showing its table ([`Lowered::Paint`]).
 
 use skin_model::{
-    CycleDef, ImageChoiceDef, ImageChoicePart, ImageSpan, Program, Source, Track, Ty,
+    CoverImage, CycleDef, ImageChoiceDef, ImageChoicePart, ImageSpan, Program, Source, Track, Ty,
 };
 
-use super::super::policy::Role;
+use super::super::policy::{CriticalPart, Role};
 use super::super::property::{self, IndexProp, IntProp, Value};
 use super::super::report::{NoteKind, PropertyKind, Span, TrackWhy};
-use super::super::{Common, Cx, Dst, Opts, Prop};
+use super::super::{Common, Cx, Dst, Prop};
 #[cfg(test)]
 use super::super::{Event, trace};
 use super::{SrcImage, Unplaced};
 use crate::error::ImportError;
 use crate::tree::Kind;
 
-/// The field a lane cover candidate selecting its frames is refused
-/// under, by what selects them.
-const SELECTION: &str = "image selection";
-
 /// An image set's selector as the source resolves it: its `value` through
 /// the value-property factory, else its `ref` as an image-index property.
 pub(in super::super) enum SetSelector {
-    /// A selector the model runs; `field` names it for a refusal.
-    Expr {
-        src: String,
-        deviates: bool,
-        field: &'static str,
-    },
+    /// A selector the model runs.
+    Expr { src: String, deviates: bool },
     /// Neither resolves: entry 0.
     Null,
     /// A property the model has no value for.
-    Unsupported { field: &'static str, why: NoteKind },
+    Unsupported { why: NoteKind },
 }
 
 /// The selector source of value `v`: hidden (−1) while it is unknown.
@@ -67,10 +62,8 @@ pub(in super::super) fn set_selector(value: &Prop, r: i32) -> SetSelector {
         IntProp::Shown(v) => SetSelector::Expr {
             src: value_selector(v),
             deviates: value_deviates(v),
-            field: "value",
         },
         IntProp::Unsupported(id) => SetSelector::Unsupported {
-            field: "value",
             why: NoteKind::UnsupportedProperty {
                 kind: PropertyKind::Integer,
                 id,
@@ -79,13 +72,11 @@ pub(in super::super) fn set_selector(value: &Prop, r: i32) -> SetSelector {
         IntProp::Null => match property::index_by_id(r) {
             IndexProp::Null => SetSelector::Null,
             IndexProp::Unsupported(id) => SetSelector::Unsupported {
-                field: "ref",
                 why: index_unsupported(id),
             },
             p => SetSelector::Expr {
                 src: p.selector().unwrap_or("0").to_owned(),
                 deviates: p.deviates(),
-                field: SELECTION,
             },
         },
     }
@@ -96,6 +87,25 @@ pub(in super::super) fn index_unsupported(id: i32) -> NoteKind {
     NoteKind::UnsupportedProperty {
         kind: PropertyKind::ImageIndex,
         id: Some(id),
+    }
+}
+
+/// What a selecting element lowers to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in super::super) enum Lowered {
+    /// A decorative image choice element.
+    Image,
+    /// SUDDEN+'s paint showing the choice: play-critical.
+    Paint,
+}
+
+impl Lowered {
+    /// The role its element takes.
+    pub(in super::super) fn role(self) -> Role {
+        match self {
+            Self::Image => Role::Decorative,
+            Self::Paint => Role::Critical(CriticalPart::Cover),
+        }
     }
 }
 
@@ -144,7 +154,7 @@ impl Cx<'_> {
         self.budget.image(frames).map_err(|l| self.limit(at, l))?;
         #[cfg(test)]
         trace(Event::Charge);
-        let (file, rect, cell) = match self.src_rect(Role::Decorative, at, s, s.div)? {
+        let (file, rect, cell) = match self.src_rect(c.role, at, s, s.div, true)? {
             Ok(found) => found,
             Err(u) => return Ok(Err(u)),
         };
@@ -164,22 +174,11 @@ impl Cx<'_> {
         })
     }
 
-    /// The common part of a selecting element, decorative and following
-    /// the covers; `charged` when its keys were charged as an offset-4
-    /// candidate.
-    fn choice_common(&mut self, dst: &Dst, charged: bool) -> Result<Option<Common>, ImportError> {
-        let o = Opts {
-            follow: true,
-            charged,
-            ..Opts::default()
-        };
-        self.common_with(Role::Decorative, dst, o)
-    }
-
     /// An image group (`len` above 1) selecting by `src`: `len` runs of
     /// `⌊N / len⌋` of its `N` frames, the remainder never shown; never
     /// drawn when a run would be empty. The cycle is resolved for a run's
     /// frames, so a run of one frame ignores its timer.
+    #[expect(clippy::too_many_arguments, reason = "the group's parts as read")]
     pub(in super::super) fn image_group(
         &mut self,
         dst: Dst,
@@ -188,6 +187,7 @@ impl Cx<'_> {
         len: i32,
         selector: (&'static str, bool),
         charged: bool,
+        lowered: Lowered,
     ) -> Result<(), ImportError> {
         let at = dst.span;
         let n = self.grid_frames(at, s.div)?;
@@ -203,13 +203,13 @@ impl Cx<'_> {
             .map_err(|l| self.limit(at, l))?;
         #[cfg(test)]
         trace(Event::Refs);
-        let Some(c) = self.choice_common(&dst, charged)? else {
+        let Some(c) = self.image_common(&dst, charged, lowered.role())? else {
             return Ok(());
         };
         let (src, deviates) = selector;
         let value = self.selector(src, at)?;
-        let cycle = match self.cycle(at, q, &s.timer, s.cycle)? {
-            Ok((cycle, _)) => cycle,
+        let cycle = match self.src_cycle(&c, q, s)? {
+            Ok(cycle) => cycle,
             Err(why) => return self.drop_el(c.role, at, why),
         };
         let (image, cell) = match self.admit_choice(&c, rec, s)? {
@@ -232,7 +232,7 @@ impl Cx<'_> {
                 })
             })
             .collect();
-        self.push_choices(c, value, entries, deviates)
+        self.push_choices(c, value, entries, deviates, lowered)
     }
 
     /// An image set selecting by `src`: one entry per item of its
@@ -245,6 +245,7 @@ impl Cx<'_> {
         src: &str,
         deviates: bool,
         charged: bool,
+        lowered: Lowered,
     ) -> Result<(), ImportError> {
         let at = dst.span;
         let Some(list) = images else {
@@ -262,7 +263,7 @@ impl Cx<'_> {
         self.budget.choice_refs(n).map_err(|l| self.limit(at, l))?;
         #[cfg(test)]
         trace(Event::Refs);
-        let Some(c) = self.choice_common(&dst, charged)? else {
+        let Some(c) = self.image_common(&dst, charged, lowered.role())? else {
             return Ok(());
         };
         let value = self.selector(src, at)?;
@@ -282,8 +283,8 @@ impl Cx<'_> {
             };
             let s = self.src_image(rec)?;
             let n = self.grid_frames(at, s.div)?;
-            let cycle = match self.cycle(at, n, &s.timer, s.cycle)? {
-                Ok((cycle, _)) => cycle,
+            let cycle = match self.src_cycle(&c, n, &s)? {
+                Ok(cycle) => cycle,
                 Err(why) => return self.drop_el(c.role, at, why),
             };
             match self.admit_choice(&c, rec, &s)? {
@@ -305,20 +306,22 @@ impl Cx<'_> {
             self.ignored(at, NoteKind::Track(TrackWhy::NeverDrawn));
             return Ok(());
         }
-        self.push_choices(c, value, entries, deviates)
+        self.push_choices(c, value, entries, deviates, lowered)
     }
 
     /// Bakes each present entry's stretch against its own cell: the first
     /// entry's track becomes the element's, and an entry whose keys differ
     /// keeps its own, its keys charged before it is built. Stretch 8 and 9
     /// keep each entry's native size instead. A stretch whose branch
-    /// changes between keys drops the element.
+    /// changes between keys drops the element. The element is an image
+    /// choice, or as `lowered` says SUDDEN+'s paint showing the table.
     fn push_choices(
         &mut self,
         mut c: Common,
         value: Program,
         entries: Vec<Option<Entry>>,
         deviates: bool,
+        lowered: Lowered,
     ) -> Result<(), ImportError> {
         let at = c.span;
         let mut element: Option<Vec<[i32; 4]>> = None;
@@ -365,6 +368,9 @@ impl Cx<'_> {
         self.widgets
             .image_choices
             .push(ImageChoiceDef { value, choices });
-        self.push(c, Source::ImageChoice(index), t)
+        match lowered {
+            Lowered::Image => self.push(c, Source::ImageChoice(index), t),
+            Lowered::Paint => self.push_paint(c, CoverImage::Choice(index), None, t, None),
+        }
     }
 }

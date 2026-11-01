@@ -1,6 +1,7 @@
 //! Elements by object kind: images here, image selection (image groups
 //! and image sets), numbers, text and the play objects in their modules.
 
+pub(super) mod cover_paint;
 pub(super) mod gauge;
 pub(super) mod image_choice;
 pub(super) mod judge;
@@ -8,17 +9,17 @@ pub(super) mod lanes;
 pub(super) mod number;
 pub(super) mod text;
 
-use skin_model::{ImageDef, MAX_SKIN_FRAMES, Native, Source};
+use skin_model::{CycleDef, ImageDef, MAX_SKIN_FRAMES, Native, Source, Track};
 
 use super::asset::{self, Crop, Failed, ImageKey, Path};
 use super::budget::ImportLimit;
 use super::policy::Role;
 use super::property::{self, IndexProp};
-use super::report::{NoteKind, Object, Span, TrackWhy};
+use super::report::{NoteKind, Object, Span};
 use super::track::{self, Stretch};
 use super::{Common, Cx, Dst, Opts, Prop};
 use crate::error::ImportError;
-use image_choice::SetSelector;
+use image_choice::{Lowered, SetSelector};
 
 /// A track's keys baked against a cell, and the native size kept instead
 /// under stretch 8 and 9.
@@ -47,6 +48,20 @@ pub(super) struct SrcImage {
     cycle: i32,
 }
 
+/// Whether `c`, critical and untimed, would draw what depends on when
+/// the state started (owner decision 7, D3): its track static from 0 and
+/// perpetual, and every cycle it shows `cycle_ok` (absent or on a timer).
+fn untimed_refused(c: &Common, cycle_ok: bool) -> bool {
+    c.untimed
+        && matches!(c.role, Role::Critical(_))
+        && !super::policy::untimed_ok(
+            c.track.identical(),
+            c.track.keys.first().is_some_and(|k| k.at == 0),
+            c.track.end,
+            cycle_ok,
+        )
+}
+
 impl Cx<'_> {
     /// The frames of a `div` grid. A grid of more than the skin's frames
     /// is the aggregate frame limit, refused before anything reads it.
@@ -56,6 +71,26 @@ impl Cx<'_> {
             .ok()
             .filter(|&n| usize::try_from(n).is_ok_and(|n| n <= MAX_SKIN_FRAMES))
             .ok_or_else(|| self.limit(at, ImportLimit::Frames))
+    }
+
+    /// The cycle of `s` over `frames` for `c`, resolved before its sheet
+    /// is admitted, or why `c` is dropped: its timer or cycle refused, or
+    /// `c` critical and untimed where it shows what the state's start
+    /// decides (D3).
+    pub(super) fn src_cycle(
+        &mut self,
+        c: &Common,
+        frames: u32,
+        s: &SrcImage,
+    ) -> Result<Result<Option<CycleDef>, NoteKind>, ImportError> {
+        let (cycle, on_timer) = match self.cycle(c.span, frames, &s.timer, s.cycle)? {
+            Ok(v) => v,
+            Err(why) => return Ok(Err(why)),
+        };
+        if untimed_refused(c, cycle.is_none() || on_timer) {
+            return Ok(Err(NoteKind::Timer(super::TimerWhy::Untimed)));
+        }
+        Ok(Ok(cycle))
     }
 
     /// The `image` record of id `id`, the first of it: the play objects
@@ -142,25 +177,13 @@ impl Cx<'_> {
         let at = c.span;
         let role = c.role;
         let frames = self.grid_frames(at, grid)?;
-        let (cycle, cycle_on_timer) = match self.cycle(at, frames, &s.timer, s.cycle)? {
-            Ok(v) => v,
+        let cycle = match self.src_cycle(c, frames, s)? {
+            Ok(cycle) => cycle,
             Err(why) => {
                 self.drop_el(role, at, why)?;
                 return Ok(None);
             }
         };
-        if c.untimed
-            && let Role::Critical(_) = role
-            && !super::policy::untimed_ok(
-                c.track.identical(),
-                c.track.keys.first().is_some_and(|k| k.at == 0),
-                c.track.end,
-                cycle.is_none() || cycle_on_timer,
-            )
-        {
-            self.drop_el(role, at, NoteKind::Timer(super::TimerWhy::Untimed))?;
-            return Ok(None);
-        }
         let linear = c.filter == skin_model::Filter::Linear;
         let key = (rec, linear, grid, false);
         if let Some((def, cell)) = self.assets.base(key) {
@@ -182,7 +205,7 @@ impl Cx<'_> {
         self.budget.image(frames).map_err(|l| self.limit(at, l))?;
         #[cfg(test)]
         super::trace(super::Event::Charge);
-        let (file, rect, cell) = match self.src_rect(role, at, s, grid)? {
+        let (file, rect, cell) = match self.src_rect(role, at, s, grid, false)? {
             Ok(found) => found,
             Err(Unplaced { why, .. }) => {
                 self.drop_el(role, at, why)?;
@@ -208,13 +231,16 @@ impl Cx<'_> {
 
     /// Where `s`'s first `grid` columns and rows lie, its image charged:
     /// its admitted file, its rect in texels and its cell. A file that
-    /// fails a check refuses a critical element with its error.
+    /// fails a check refuses a critical element with its error, except
+    /// that with `holes` a file missing for the source too stays missing,
+    /// a hole its table keeps.
     pub(super) fn src_rect(
         &mut self,
         role: Role,
         at: Span,
         s: &SrcImage,
         grid: [u32; 2],
+        holes: bool,
     ) -> Result<Result<Placed, Unplaced>, ImportError> {
         let missing = |why| Ok(Err(Unplaced { why, missing: true }));
         let refused = |why| {
@@ -250,7 +276,9 @@ impl Cx<'_> {
             .map_err(|l| self.limit(at, l))?
         {
             Ok(f) => f,
-            Err(Failed::File { .. }) if matches!(role, Role::Critical(_)) => {
+            Err(Failed::File { refused })
+                if matches!(role, Role::Critical(_)) && (refused || !holes) =>
+            {
                 if let Some(source) = self.assets.take_error(&name) {
                     return Err(ImportError::Asset {
                         at: self.loc(at),
@@ -311,6 +339,36 @@ impl Cx<'_> {
         }
     }
 
+    /// The common part of an image, image choice or paint image in
+    /// `role`, following the covers; `charged` when its keys were charged
+    /// as an offset-4 candidate.
+    pub(super) fn image_common(
+        &mut self,
+        dst: &Dst,
+        charged: bool,
+        role: Role,
+    ) -> Result<Option<Common>, ImportError> {
+        let o = Opts {
+            follow: true,
+            charged,
+            ..Opts::default()
+        };
+        self.common_with(role, dst, o)
+    }
+
+    /// Whether an image or image set's destination lists offset 4, its
+    /// keys then charged once, and what it lowers to: SUDDEN+'s paint
+    /// unless it cannot reach the lanes, where it follows SUDDEN+.
+    fn lowered(&mut self, dst: &Dst) -> Result<(bool, Lowered), ImportError> {
+        let charged = dst.offsets.contains(&super::OFFSET_LANECOVER);
+        let lowered = if charged && !self.offset4_outside(dst)? {
+            Lowered::Paint
+        } else {
+            Lowered::Image
+        };
+        Ok((charged, lowered))
+    }
+
     /// An image object.
     pub(super) fn image(&mut self, dst: Dst, rec: u32) -> Result<(), ImportError> {
         let at = dst.span;
@@ -322,26 +380,16 @@ impl Cx<'_> {
         let len = self.int_or(len, "len", 0)?;
         let group = len > 1;
         let index = property::index_by_id(self.int_or(r, "ref", 0)?);
-        // Listing offset 4, it follows SUDDEN+ when it cannot reach the
-        // lanes, and is SUDDEN+ otherwise; its keys are charged once.
-        let charged = dst.offsets.contains(&super::OFFSET_LANECOVER);
-        if charged && !self.offset4_outside(&dst)? {
-            if group {
-                let field = match index {
-                    IndexProp::Null | IndexProp::Unsupported(_) => "len",
-                    _ => "image selection",
-                };
-                return self.lane_cover_selector(dst, field);
-            }
-            return self.lane_cover_image(dst, rec, &s);
-        }
+        let (charged, lowered) = self.lowered(&dst)?;
+        let role = lowered.role();
         if act.is_some() {
             self.ignored(at, NoteKind::Ignored { field: "act" });
         }
-        let stretch = Stretch::of(dst.stretch);
-        if stretch == Stretch::Trimmed {
-            self.drop_el(Role::Decorative, at, NoteKind::Stretch(dst.stretch))?;
-            return Ok(());
+        if lowered == Lowered::Paint && !group {
+            return self.cover_paint_image(dst, rec, &s, role, None);
+        }
+        if Stretch::of(dst.stretch) == Stretch::Trimmed {
+            return self.drop_el(role, at, NoteKind::Stretch(dst.stretch));
         }
         if group {
             let Some(src) = index.selector() else {
@@ -350,29 +398,40 @@ impl Cx<'_> {
                     _ => 0,
                 };
                 let why = image_choice::index_unsupported(id);
-                return self.drop_el(Role::Decorative, at, why);
+                return self.drop_el(role, at, why);
             };
             let selector = (src, index.deviates());
-            return self.image_group(dst, rec, &s, len, selector, charged);
+            return self.image_group(dst, rec, &s, len, selector, charged, lowered);
         }
-        let o = Opts {
-            follow: true,
-            charged,
-            ..Opts::default()
-        };
-        let Some(c) = self.common_with(Role::Decorative, &dst, o)? else {
+        let Some(c) = self.image_common(&dst, charged, Role::Decorative)? else {
             return Ok(());
         };
-        let Some((image, cell)) = self.add_src_image(&c, rec, &s, s.div)? else {
+        let Some((image, t, native)) = self.src_image_track(&c, rec, &s)? else {
             return Ok(());
         };
-        let Some((rects, native)) = self.baked_rects(&c, cell)? else {
-            self.drop_el(c.role, at, NoteKind::Stretch(c.stretch_mode))?;
-            return Ok(());
-        };
-        let t = self.model_track(&c, &rects)?;
         self.push_native(c, Source::Image(image), t, native)?;
         Ok(())
+    }
+
+    /// `rec`'s whole-sheet image admitted for `c`, with `c`'s track baked
+    /// against its cell and the native size stretch 8 and 9 keep; `None`
+    /// once `c` is dropped, as a stretch changing branch between keys
+    /// drops it.
+    pub(super) fn src_image_track(
+        &mut self,
+        c: &Common,
+        rec: u32,
+        s: &SrcImage,
+    ) -> Result<Option<(u32, Track, Option<Native>)>, ImportError> {
+        let Some((image, cell)) = self.add_src_image(c, rec, s, s.div)? else {
+            return Ok(None);
+        };
+        let Some((rects, native)) = self.baked_rects(c, cell)? else {
+            self.drop_el(c.role, c.span, NoteKind::Stretch(c.stretch_mode))?;
+            return Ok(None);
+        };
+        let t = self.model_track(c, &rects)?;
+        Ok(Some((image, t, native)))
     }
 
     /// `c`'s keys with its stretch baked against a `cell`, and the native
@@ -412,20 +471,11 @@ impl Cx<'_> {
         let r = self.int_or(r, "ref", 0)?;
         let value = self.prop(value, "value")?;
         let selector = image_choice::set_selector(&value, r);
-        // Listing offset 4, it is classified before its selector: one
-        // without a selector is SUDDEN+ by its first image, as an image
-        // is; a selecting one is refused.
-        let charged = dst.offsets.contains(&super::OFFSET_LANECOVER);
-        if charged && !self.offset4_outside(&dst)? {
-            let field = match &selector {
-                SetSelector::Null => return self.lane_cover_set(dst, images),
-                SetSelector::Expr { field, .. } | SetSelector::Unsupported { field, .. } => field,
-            };
-            return self.lane_cover_selector(dst, field);
-        }
+        let (charged, lowered) = self.lowered(&dst)?;
+        let role = lowered.role();
         let (src, deviates) = match selector {
             SetSelector::Unsupported { why, .. } => {
-                return self.drop_el(Role::Decorative, at, why);
+                return self.drop_el(role, at, why);
             }
             SetSelector::Null => ("0".to_owned(), false),
             SetSelector::Expr { src, deviates, .. } => (src, deviates),
@@ -434,34 +484,8 @@ impl Cx<'_> {
             self.ignored(at, NoteKind::Ignored { field: "act" });
         }
         if Stretch::of(dst.stretch) == Stretch::Trimmed {
-            return self.drop_el(Role::Decorative, at, NoteKind::Stretch(dst.stretch));
+            return self.drop_el(role, at, NoteKind::Stretch(dst.stretch));
         }
-        self.image_set_choices(dst, images, &src, deviates, charged)
-    }
-
-    /// An image set without a selector that may reach the lanes: SUDDEN+
-    /// by its first image, as an image listing offset 4 is.
-    fn lane_cover_set(&mut self, dst: Dst, images: Option<u32>) -> Result<(), ImportError> {
-        let at = dst.span;
-        let first = match images {
-            Some(list) if self.def.arena.node(list).kind == crate::tree::Kind::Array => {
-                self.def.arena.children(list).next()
-            }
-            _ => None,
-        };
-        let Some(first) = first else {
-            self.ignored(at, NoteKind::Track(TrackWhy::NeverDrawn));
-            return Ok(());
-        };
-        let Some(name) = self.def.string(first, "images")? else {
-            self.ignored(at, NoteKind::Track(TrackWhy::NeverDrawn));
-            return Ok(());
-        };
-        let Some(image) = self.image_rec(&name)? else {
-            self.ignored(at, NoteKind::Track(TrackWhy::NeverDrawn));
-            return Ok(());
-        };
-        let s = self.src_image(image)?;
-        self.lane_cover_image(dst, image, &s)
+        self.image_set_choices(dst, images, &src, deviates, charged, lowered)
     }
 }
