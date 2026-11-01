@@ -208,11 +208,30 @@ pub struct LoadOptions {
     pub limits: Limits,
 }
 
+/// The descriptive labels a chart declares besides its title
+/// ([`ChartMeta::title`](bms_model::ChartMeta::title)), as written
+/// (trimmed), from the commands left after `#RANDOM`/`#IF` resolution; the
+/// last declaration wins, and an undeclared one is empty. They are not part
+/// of the chart's identity.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Labels {
+    /// `#SUBTITLE`.
+    pub subtitle: String,
+    /// `#ARTIST`.
+    pub artist: String,
+    /// `#SUBARTIST`.
+    pub subartist: String,
+    /// `#GENRE`.
+    pub genre: String,
+}
+
 /// A loaded chart and what the loader skipped or assumed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Loaded {
     /// The resolved chart.
     pub chart: Chart,
+    /// Its labels besides the title, from the same resolution.
+    pub labels: Labels,
     /// Warnings in the order they arose.
     pub warnings: Vec<Warning>,
 }
@@ -241,6 +260,7 @@ pub fn load_bms(bytes: &[u8], chart_dir: &Path, opts: &LoadOptions) -> Result<Lo
         .map_err(|e| LoadError::ChartDir { kind: e.kind() })?;
     let mut ids = BTreeMap::new();
     let wavs = std::mem::take(&mut source.wavs);
+    let labels = std::mem::take(&mut source.labels);
     let mut sounds = Vec::with_capacity(wavs.len());
     for (id, wav) in wavs {
         let path = if wav.value.is_empty() {
@@ -328,7 +348,11 @@ pub fn load_bms(bytes: &[u8], chart_dir: &Path, opts: &LoadOptions) -> Result<Lo
         chart.validate().map_err(LoadError::Model)?;
         chart.identity.played_hash = hash::played_hash(&chart, opts.speed);
     }
-    Ok(Loaded { chart, warnings })
+    Ok(Loaded {
+        chart,
+        labels,
+        warnings,
+    })
 }
 
 /// Decodes the text in the encoding of the "Text encoding" rule, warning with

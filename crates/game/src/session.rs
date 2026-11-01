@@ -25,8 +25,9 @@ use replay::{
     Arrival, BuildProvenance, ChartRecord, DeviceRecord, EndStatus, Incomplete, PlayRecord,
     PlayType, PresetRecord, ReceiveMethod, SourceRecord, Status, Versions, WakePolicy,
 };
-use rules::{GaugeKind, RulePreset};
+use rules::{GaugeKind, GaugeValue, RulePreset};
 
+use crate::attempt::{Attempt, NoteEnd};
 use crate::autoplay::{Autoplay, AutoplayError};
 use crate::bests::{BestView, SavedPlay};
 use crate::live::{Closing, InputWaitError, LiveError, Opening, Rig};
@@ -35,8 +36,10 @@ use crate::policy::{
     DefaultPolicy, FailureAction, GaugeIndex, NoSessionEvents, SessionEvent, SessionEventSink,
     SessionPolicy, SharedEvents,
 };
-use crate::practice::{Practice, PracticeError, RESTORE_AHEAD};
-use crate::prepare::{BmsIngest, ChartIngest, ChartTransform, IngestError, Passthrough};
+use crate::practice::{Practice, PracticeError, RESTORE_AHEAD, Reset, Unfit};
+use crate::prepare::{
+    BmsIngest, ChartIngest, ChartLabels, ChartTransform, IngestError, Passthrough,
+};
 use crate::presets::{PresetChange, Shelf, ShelfError};
 use crate::render::PlayView;
 use crate::render::RenderSide;
@@ -348,6 +351,8 @@ pub struct Loaded {
     path: PathBuf,
     chart: Chart,
     chart_record: ChartRecord,
+    /// The chart's labels, from the ingestion that read `chart`.
+    labels: ChartLabels,
     warnings: Vec<String>,
     preset: RulePreset,
     shelf: Shelf,
@@ -361,6 +366,26 @@ pub struct Loaded {
     /// The practice set up, with its section in the chart's real time:
     /// each play is then a round of it.
     practice: Option<(Practice, Section)>,
+    /// The play preset the practice was checked under: a round under
+    /// another refits it first ([`refit_practice`](Self::refit_practice)).
+    practiced: Option<RulePreset>,
+    /// The gauges' initial values the last fit to the play preset gave, in
+    /// its order, whether or not the section passed its check: what the
+    /// practice page shows ([`initial_gauge`](Self::initial_gauge)).
+    fitted: Option<Vec<GaugeValue>>,
+    /// Each gauge a fit since the practice page's Start found gone, with
+    /// the gauge the page shows in its place
+    /// ([`replacement`](Self::replacement)).
+    lost: Vec<(String, Option<String>)>,
+}
+
+/// What one read of a chart's file gave: the chart, its record, its labels
+/// and what the loader skipped or assumed, all from one ingestion.
+struct ReadChart {
+    chart: Chart,
+    record: ChartRecord,
+    labels: ChartLabels,
+    warnings: Vec<String>,
 }
 
 /// A loaded chart's file, the seed it was read with and its SHA-256
@@ -396,20 +421,16 @@ impl ChartSource {
     /// [`SessionError::ChartChanged`] when the file's SHA-256 is not the
     /// one loaded, and what reading it refuses.
     pub fn read(&self, parts: &Parts, speed: Speed) -> Result<Chart, SessionError> {
-        self.read_with(parts, speed).map(|(chart, _, _)| chart)
+        self.read_with(parts, speed).map(|read| read.chart)
     }
 
     /// [`read`](Self::read), with the chart's record and warnings.
-    fn read_with(
-        &self,
-        parts: &Parts,
-        speed: Speed,
-    ) -> Result<(Chart, ChartRecord, Vec<String>), SessionError> {
-        let (chart, record, warnings) = Loaded::read_chart(&self.path, self.seed, speed, parts)?;
-        if record.identity.sha256 != self.sha256 {
+    fn read_with(&self, parts: &Parts, speed: Speed) -> Result<ReadChart, SessionError> {
+        let read = Loaded::read_chart(&self.path, self.seed, speed, parts)?;
+        if read.record.identity.sha256 != self.sha256 {
             return Err(SessionError::ChartChanged(self.path.clone()));
         }
-        Ok((chart, record, warnings))
+        Ok(read)
     }
 }
 
@@ -526,7 +547,12 @@ impl Loaded {
         }
         shelf.check();
         match Self::read_chart(chart_path, config.seed, config.speed, &parts) {
-            Ok((chart, chart_record, warnings)) => {
+            Ok(ReadChart {
+                chart,
+                record: chart_record,
+                labels,
+                warnings,
+            }) => {
                 events.on_event(&SessionEvent::Load);
                 Ok(Self {
                     root,
@@ -536,6 +562,7 @@ impl Loaded {
                     path: chart_path.to_owned(),
                     chart,
                     chart_record,
+                    labels,
                     warnings,
                     preset: shelf.chosen().clone(),
                     first_error: shelf.chosen_error().cloned(),
@@ -543,6 +570,9 @@ impl Loaded {
                     attempt: 0,
                     events,
                     practice: None,
+                    practiced: None,
+                    fitted: None,
+                    lost: Vec::new(),
                 })
             }
             Err(e) => Err(Box::new((e, shelf))),
@@ -556,7 +586,7 @@ impl Loaded {
         seed: u64,
         speed: Speed,
         parts: &Parts,
-    ) -> Result<(Chart, ChartRecord, Vec<String>), SessionError> {
+    ) -> Result<ReadChart, SessionError> {
         if !parts.ingest.accepts(chart_path) {
             return Err(SessionError::UnsupportedChart(chart_path.to_owned()));
         }
@@ -584,7 +614,12 @@ impl Loaded {
             random_seed: seed,
             transform: parts.transform.id().record(),
         };
-        Ok((chart, chart_record, ingested.warnings))
+        Ok(ReadChart {
+            chart,
+            record: chart_record,
+            labels: ingested.labels,
+            warnings: ingested.warnings,
+        })
     }
 
     /// The shelf, handed back once the chart's plays are over.
@@ -609,13 +644,22 @@ impl Loaded {
     /// [`SessionError::ChartChanged`] when the file's SHA-256 is not the
     /// one loaded, and what reading it refuses; nothing changes then.
     pub fn set_speed(&mut self, speed: Speed) -> Result<(), SessionError> {
-        let (config, chart, chart_record, warnings) = self.read_at(speed)?;
+        let (config, read) = self.read_at(speed)?;
         self.config = config;
-        self.chart = chart;
-        self.chart_record = chart_record;
-        self.warnings = warnings;
-        self.practice = None;
+        self.chart = read.chart;
+        self.chart_record = read.record;
+        self.labels = read.labels;
+        self.warnings = read.warnings;
+        self.clear_practice();
         Ok(())
+    }
+
+    /// Drops the practice set up, its fit and the gauges it lost.
+    fn clear_practice(&mut self) {
+        self.practice = None;
+        self.practiced = None;
+        self.fitted = None;
+        self.lost.clear();
     }
 
     /// The chart read again from its file at `speed`, with the same seed
@@ -627,7 +671,7 @@ impl Loaded {
     ///
     /// As [`set_speed`](Self::set_speed).
     pub fn chart_at(&self, speed: Speed) -> Result<Chart, SessionError> {
-        self.read_at(speed).map(|(_, chart, _, _)| chart)
+        self.read_at(speed).map(|(_, read)| read.chart)
     }
 
     /// The chart's file, the seed it was read with and its SHA-256: what
@@ -645,16 +689,12 @@ impl Loaded {
 
     /// The chart read again at `speed`; refused when its file's SHA-256 is
     /// not the one loaded.
-    fn read_at(
-        &self,
-        speed: Speed,
-    ) -> Result<(SessionConfig, Chart, ChartRecord, Vec<String>), SessionError> {
+    fn read_at(&self, speed: Speed) -> Result<(SessionConfig, ReadChart), SessionError> {
         let config = SessionConfig {
             speed,
             ..self.config.clone()
         };
-        let (chart, chart_record, warnings) = self.source().read_with(&self.parts, speed)?;
-        Ok((config, chart, chart_record, warnings))
+        Ok((config, self.source().read_with(&self.parts, speed)?))
     }
 
     /// Sets up practice (design.md "Mid-Chart Start and Section Repeat"):
@@ -671,7 +711,7 @@ impl Loaded {
     /// this chart under the current preset; the setup is unchanged.
     pub fn set_practice(&mut self, practice: Option<Practice>) -> Result<(), PracticeError> {
         let Some(practice) = practice else {
-            self.practice = None;
+            self.clear_practice();
             return Ok(());
         };
         if self.config.autoplay.is_some() {
@@ -679,8 +719,151 @@ impl Loaded {
         }
         let section = practice.section(self.config.speed);
         crate::practice::check(&self.chart, &self.preset, &section)?;
+        self.fitted = Some(practice.initial_gauges.clone());
         self.practice = Some((practice, section));
+        self.practiced = Some(self.preset.clone());
         Ok(())
+    }
+
+    /// Sets up the practice page's Start: the play preset refreshed first,
+    /// since the page can wait while its file is repaired or edited, then
+    /// `practice`, whose initial values were set under the play preset
+    /// before the refresh, fitted to it as a round's are
+    /// ([`refit_practice`](Self::refit_practice)). A file that fails to
+    /// load leaves the current preset, and its error goes with the next
+    /// play.
+    ///
+    /// # Errors
+    ///
+    /// [`Unfit`] when the fit reset a value the player set or the section
+    /// is refused under the refreshed preset: no round opens.
+    pub fn start_practice(&mut self, practice: Practice) -> Result<(), Unfit> {
+        let set_under = self.preset.clone();
+        if let Some(e) = self.reload_preset() {
+            self.first_error = Some(e);
+        }
+        self.lost.clear();
+        self.settle(&set_under, practice)
+    }
+
+    /// Fits values set under `from`, in its gauges' order, to the play
+    /// preset: each gauge's value follows it by ID and stays while it was
+    /// set away from its start and the gauge still accepts it; any other
+    /// gauge takes its start. What the player set and the fit reset comes
+    /// back with them, and each gauge gone is remembered with the gauge the
+    /// practice page shows in its place, the one now at its place.
+    fn fit(&mut self, from: &RulePreset, values: &[GaugeValue]) -> (Vec<GaugeValue>, Vec<Reset>) {
+        let old = from.gauges.iter().zip(values);
+        let new = &self.preset.gauges;
+        let at = |i: usize| new.get(i.min(new.len().saturating_sub(1)));
+        let mut resets = Vec::new();
+        for (i, (rule, &set)) in old.clone().enumerate() {
+            let found = new.iter().find(|g| g.id == rule.id);
+            if found.is_none() {
+                self.lost
+                    .push((rule.id.clone(), at(i).map(|g| g.id.clone())));
+            }
+            if set == rule.start {
+                continue;
+            }
+            match found {
+                Some(g) if eval::accepts_initial(g, set) => {}
+                Some(g) => resets.push(Reset::Refused {
+                    gauge: g.id.clone(),
+                    set,
+                    start: g.start,
+                }),
+                None => resets.push(Reset::Lost {
+                    gauge: rule.id.clone(),
+                    set,
+                    shown: at(i).map(|g| (g.id.clone(), g.start)),
+                }),
+            }
+        }
+        let initial_gauges: Vec<_> = new
+            .iter()
+            .map(|g| match old.clone().find(|(rule, _)| rule.id == g.id) {
+                Some((rule, value)) if *value != rule.start && eval::accepts_initial(g, *value) => {
+                    *value
+                }
+                _ => g.start,
+            })
+            .collect();
+        (initial_gauges, resets)
+    }
+
+    /// Sets up `practice`, its values set under `from`, fitted to the play
+    /// preset ([`fit`](Self::fit)); refused with what the fit reset when it
+    /// reset any value or the section is refused: a round never plays a
+    /// reset value the player set.
+    fn settle(&mut self, from: &RulePreset, mut practice: Practice) -> Result<(), Unfit> {
+        let resets;
+        (practice.initial_gauges, resets) = self.fit(from, &practice.initial_gauges);
+        let fitted = practice.initial_gauges.clone();
+        let refused = self.set_practice(Some(practice)).err();
+        // What the page shows stays the fit's, the section refused or not.
+        self.fitted = Some(fitted);
+        if refused.is_none() && resets.is_empty() {
+            return Ok(());
+        }
+        Err(Unfit { resets, refused })
+    }
+
+    /// Fits the practice to the play preset refreshed for this round
+    /// ([`begin_play`](Self::begin_play)) when it changed since the
+    /// practice was checked: each gauge's initial value follows its gauge
+    /// by ID and keeps a value set away from its start while the gauge
+    /// still accepts it; a gauge left at its start, or whose rule no longer
+    /// accepts its value, takes the new start, a gauge the preset gained
+    /// starts at its start, and a gauge the preset lost is dropped with its
+    /// value. The section is then checked again under the new preset, and
+    /// the practice page shows what the fit gave
+    /// ([`PracticeScreen::sync`](crate::PracticeScreen::sync)).
+    ///
+    /// # Errors
+    ///
+    /// [`Unfit`] when the fit reset a value the player set, with what it
+    /// reset, or the section is refused under the new preset, with what the
+    /// fit reset too: the round does not open, so no round plays a reset
+    /// value the player set, and the page states why.
+    pub fn refit_practice(&mut self) -> Result<(), Unfit> {
+        let (Some((practice, _)), Some(practiced)) = (&self.practice, &self.practiced) else {
+            return Ok(());
+        };
+        if *practiced == self.preset {
+            return Ok(());
+        }
+        let (practice, practiced) = (practice.clone(), practiced.clone());
+        self.settle(&practiced, practice)
+    }
+
+    /// The initial value of the gauge `id` the last fit to the play preset
+    /// gave, or the practice set up; `None` for a gauge the preset does
+    /// not have, or without a practice.
+    #[must_use]
+    pub fn initial_gauge(&self, id: &str) -> Option<GaugeValue> {
+        let i = self.preset.gauges.iter().position(|g| g.id == id)?;
+        self.fitted.as_ref()?.get(i).copied()
+    }
+
+    /// The gauge the practice page shows in place of `id`, which a fit
+    /// since its Start found gone: the gauge at its place when it went
+    /// last, followed while that one is gone too, up to one the play
+    /// preset has; `None` for a gauge no fit lost, or one whose
+    /// replacements all left the preset.
+    #[must_use]
+    pub fn replacement(&self, id: &str) -> Option<&str> {
+        let mut id = id;
+        // Each step follows one loss, so the chain ends within them.
+        for _ in 0..self.lost.len() {
+            let (_, next) = self.lost.iter().rev().find(|(gone, _)| gone == id)?;
+            let next = next.as_deref()?;
+            if self.preset.gauges.iter().any(|g| g.id == next) {
+                return Some(next);
+            }
+            id = next;
+        }
+        None
     }
 
     /// The practice set up, if any.
@@ -741,6 +924,13 @@ impl Loaded {
     #[must_use]
     pub const fn chart(&self) -> &Chart {
         &self.chart
+    }
+
+    /// The chart's labels, from the ingestion that read
+    /// [`chart`](Self::chart).
+    #[must_use]
+    pub const fn labels(&self) -> &ChartLabels {
+        &self.labels
     }
 
     /// What the loader skipped or assumed.
@@ -815,24 +1005,60 @@ impl Loaded {
         }
     }
 
-    /// Numbers the next play, before recording opens; its start is reported
-    /// once it is [`admitted`](Self::admitted). Every play after the first
-    /// is a retry: a preset file changed since the previous play is used
-    /// from this one on. The first play reports the chosen file's error
-    /// standing when the chart loaded, a retry only an error its check
-    /// found.
+    /// Numbers the next play and refreshes its play preset, before the
+    /// screen prepares its attempt ([`attempt`](Self::attempt)) and
+    /// recording opens; its start is reported once it is
+    /// [`admitted`](Self::admitted). Every play checks the user preset
+    /// files first, the first one included (a practice page can wait
+    /// between the chart's load and its first round), and uses a chosen
+    /// file changed since from this one on. The first play reports the
+    /// chosen file's error standing when the chart loaded unless its check
+    /// found a newer one; a later play only an error its check found.
     pub fn begin_play(&mut self) -> PlayStart {
         self.attempt += 1;
         let attempt = self.attempt;
-        let reload_error = if attempt > 1 {
-            self.reload_preset()
-        } else {
-            self.first_error.take()
-        };
+        let checked = self.reload_preset();
+        let standing = self.first_error.take();
         PlayStart {
             attempt,
-            reload_error,
+            reload_error: checked.or(standing),
         }
+    }
+
+    /// The play `start` stopped before recording opened (its preparation
+    /// was cancelled or refused, or the player quit): its number goes back,
+    /// and the error it would have reported goes with the next play. The
+    /// refreshed preset stays.
+    pub fn withdraw(&mut self, start: PlayStart) {
+        if self.attempt == start.attempt {
+            self.attempt -= 1;
+        }
+        if start.reload_error.is_some() {
+            self.first_error = start.reload_error;
+        }
+    }
+
+    /// The attempt of the play [`begin_play`](Self::begin_play) numbered
+    /// last, under the play preset it refreshed: what the screen prepares
+    /// it with, made afresh for each play.
+    #[must_use]
+    pub fn attempt(&self) -> Attempt {
+        let ends = match (&self.practice, self.config.autoplay) {
+            (Some((practice, _)), _) => NoteEnd::Practice {
+                end: practice.end,
+                speed: self.config.speed,
+            },
+            (None, Some(_)) => NoteEnd::Autoplay,
+            (None, None) => NoteEnd::Play,
+        };
+        Attempt::new(
+            self.attempt,
+            &self.preset,
+            self.config.lead_in,
+            self.section(),
+            ends.of(&self.chart),
+            &self.labels,
+        )
     }
 
     /// The play `start` was admitted: recording opened, the play was
@@ -843,7 +1069,7 @@ impl Loaded {
         });
     }
 
-    /// At a retry: checks the user preset files, and plays the shelf's
+    /// Before a play: checks the user preset files, and plays the shelf's
     /// chosen preset from now on, reloaded at this check or at a poll since
     /// the previous play. A chosen file that changed and fails to load
     /// leaves the current preset, and its error is returned.
@@ -1327,8 +1553,12 @@ impl<O: AudioOutput + Wakes> Session<O> {
             Err(LiveError::Logic(e)) => Err(SessionPlayError::Logic(e)),
             Err(LiveError::Restore(e)) => Err(SessionPlayError::Restore(e)),
             Err(LiveError::Screen(e)) => match e {},
-            Err(LiveError::Audio(_)) => {
-                unreachable!("a session has no audio thread to fail")
+            Err(LiveError::Preparation(e)) => Err(SessionPlayError::Refused(e)),
+            Err(LiveError::Audio(_) | LiveError::Output(_)) => {
+                unreachable!("a session's audio cannot fail before its play opens")
+            }
+            Err(LiveError::ScreenLost) => {
+                unreachable!("a session has no screen to fail")
             }
             Err(LiveError::Input(_)) => {
                 unreachable!("a session has no input thread to fail")
@@ -1346,6 +1576,10 @@ pub enum SessionPlayError {
     /// A round's audio cannot be restored; the round did not start.
     #[error("the round's audio cannot be restored")]
     Restore(#[source] RestoreError),
+    /// The round cannot be prepared under the refreshed preset; it did
+    /// not start.
+    #[error("the round cannot be prepared")]
+    Refused(#[source] crate::PreparationRefusal),
 }
 
 /// The session's rig: one step of the virtual clock per wait, the script

@@ -95,6 +95,7 @@ impl ChartIngest for Built {
         _speed: bms_model::Speed,
     ) -> Result<Ingested, IngestError> {
         Ok(Ingested {
+            labels: game::ChartLabels::default(),
             chart: self.0.clone(),
             warnings: Vec::new(),
         })

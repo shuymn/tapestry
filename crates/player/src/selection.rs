@@ -34,7 +34,7 @@ use game::{
 #[cfg(feature = "dev-tools")]
 use crate::controls::Controls;
 use crate::end_screen::{LoadTimes, preset_error_text, shelf_error_text, view_log};
-use crate::loading_text::{LoadingText, Stage};
+use crate::loading_text::{ChosenChart, LoadingText, Stage};
 use crate::log_file;
 use crate::play::{PlayerRig, since};
 use crate::render_side::{LoadingSink, RenderLink, RenderMsg, ScreenError};
@@ -935,7 +935,9 @@ fn show_stage(render: &RenderLink, page: Option<&LoadingText>, stage: Stage) {
         return;
     };
     println!("load: {}", stage.label());
-    render.loading().show(page.lines(stage));
+    render
+        .loading()
+        .show_typed(page.lines(stage), page.update(stage));
 }
 
 /// How often the sounds' progress is shown at most: more often would only
@@ -971,7 +973,9 @@ impl Progress {
             return;
         }
         *shown = Some(now);
-        self.render.show(page.lines(Stage::Sounds { done, files }));
+        let stage = Stage::Sounds { done, files };
+        self.render
+            .show_typed(page.lines(stage), page.update(stage));
     }
 }
 
@@ -1432,6 +1436,13 @@ impl AppRig for PlayerRig<'_> {
             artist: header.and_then(|h| h.artist.clone()).unwrap_or_default(),
             preset: sel.screen.preset().to_owned(),
             practice: sel.practicing,
+            chart: header.map_or_else(ChosenChart::default, |h| ChosenChart {
+                title: h.title.clone(),
+                subtitle: h.subtitle.clone(),
+                artist: h.artist.clone(),
+                subartist: h.subartist.clone(),
+                genre: h.genre.clone(),
+            }),
         };
         println!("load: the play screen loads {}", file_name(chart));
         show_stage(&self.render, Some(&page), Stage::Chart);

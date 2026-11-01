@@ -134,6 +134,7 @@ impl ChartIngest for Charts {
             other => panic!("no chart {other:?}"),
         };
         Ok(Ingested {
+            labels: game::ChartLabels::default(),
             chart,
             warnings: Vec::new(),
         })
@@ -271,6 +272,12 @@ struct Headless {
     prepares: usize,
     input_fails_at: i64,
     audio_gone: bool,
+    /// The audio output has failed.
+    output_failed: bool,
+    /// What fails right after the attempt was prepared.
+    fails_after_attempt: Option<AfterAttempt>,
+    /// The preparation stops at that failure, as the player's does.
+    cancel_at_failure: bool,
     /// The screen does not confirm the end of the loading state.
     loading_end_fails: bool,
     /// Each loading state the flow ended, by the chart showing it.
@@ -287,6 +294,13 @@ struct Headless {
     quit_pressed: bool,
     /// The chart whose loading state shows.
     loading: Option<usize>,
+    /// Edits made as the play numbered by their key (counted from 0 over
+    /// the run's screen preparations) prepares its screen, before its
+    /// preset's refresh.
+    round_edits: Vec<(usize, Box<dyn FnOnce()>)>,
+    /// Edits made as the practice page is entered for the time numbered
+    /// by their key (counted from 0).
+    page_edits: Vec<(usize, Box<dyn FnOnce()>)>,
     /// Each entry into the loading state: the chart and the clock time.
     loading_pages: Vec<(usize, i64)>,
     /// Whether the loading state showed at each play's start, in order.
@@ -339,6 +353,10 @@ struct Headless {
     chosen_names: Vec<String>,
     /// Preset steps taken on the select screen, not yet taken by the flow.
     steps: VecDeque<PresetStep>,
+    /// Attempt preparations the screen refuses, from the next.
+    refuse_attempts: usize,
+    /// Every attempt the screen was asked to prepare.
+    attempts: Vec<game::Attempt>,
 }
 
 /// What selection was shown of the shelf.
@@ -404,6 +422,9 @@ impl Headless {
             prepares: 0,
             input_fails_at: i64::MAX,
             audio_gone: false,
+            output_failed: false,
+            fails_after_attempt: None,
+            cancel_at_failure: false,
             loading_end_fails: false,
             loading_ended: Vec::new(),
             opens: 0,
@@ -412,6 +433,8 @@ impl Headless {
             in_load: None,
             quit_pressed: false,
             loading: None,
+            round_edits: Vec::new(),
+            page_edits: Vec::new(),
             loading_pages: Vec::new(),
             started_loading: Vec::new(),
             cancel_loads: Vec::new(),
@@ -440,6 +463,8 @@ impl Headless {
             restore_fails: 0,
             restores: Vec::new(),
             practiced: Vec::new(),
+            refuse_attempts: 0,
+            attempts: Vec::new(),
         }
     }
 
@@ -599,6 +624,10 @@ impl Rig for Headless {
     }
 
     fn prepare_screen(&mut self) -> Result<(), SurfaceLost> {
+        let play = self.prepares;
+        while let Some(i) = self.round_edits.iter().position(|(at, _)| *at == play) {
+            (self.round_edits.remove(i).1)();
+        }
         self.prepares += 1;
         self.prepared_for.push(self.loads.len());
         if self.prepares >= self.prepare_fails_from {
@@ -608,6 +637,28 @@ impl Rig for Headless {
             self.screen_fails_at = i64::MAX;
         }
         Ok(())
+    }
+
+    fn prepare_attempt(&mut self, loaded: &Loaded) -> Result<game::Preparation, SurfaceLost> {
+        self.attempts.push(loaded.attempt());
+        match self.fails_after_attempt.take() {
+            // A loading frame drops the prepared screen.
+            Some(AfterAttempt::Screen) => self.screen_fails_at = self.at(),
+            Some(AfterAttempt::Output) => self.output_failed = true,
+            Some(AfterAttempt::Input) => self.input_fails_at = self.at(),
+            None => {}
+        }
+        if self.cancel_at_failure {
+            return Ok(game::Preparation::Cancelled);
+        }
+        if self.refuse_attempts > 0 {
+            self.refuse_attempts -= 1;
+            return Ok(game::Preparation::Refused(game::PreparationRefusal {
+                location: Some("skin.json:3".to_owned()),
+                reason: "an unknown image".to_owned(),
+            }));
+        }
+        Ok(game::Preparation::Ready)
     }
 
     fn end_loading(&mut self) -> Result<(), SurfaceLost> {
@@ -687,7 +738,7 @@ impl Rig for Headless {
     }
 
     fn audio_failure(&self) -> Option<audio::OutputError> {
-        None
+        self.output_failed.then_some(audio::OutputError::DeviceLost)
     }
 
     fn screen_failed(&self) -> bool {
@@ -904,6 +955,7 @@ impl AppRig for Headless {
             Refused::Play(e) => panic!("{e:?}"),
             Refused::Practice(game::PracticeError::Autoplay) => "autoplay",
             Refused::Practice(e) => panic!("{e:?}"),
+            Refused::Preparation(_) => "preparation",
         };
         self.refusals.push(kind.to_owned());
         // The player fixes the preset file once its refusal is shown.
@@ -934,6 +986,10 @@ impl AppRig for Headless {
         self.loading = None;
         self.seen
             .push(Seen::Practice(screen.notice().map(str::to_owned)));
+        let entry = self.practice_entries.len();
+        while let Some(i) = self.page_edits.iter().position(|(at, _)| *at == entry) {
+            (self.page_edits.remove(i).1)();
+        }
         self.practice_entries.push(screen.clone());
         self.practice_shown = Some(screen.clone());
     }
@@ -2333,6 +2389,17 @@ fn page(input: PracticeInput, n: usize) -> impl Iterator<Item = (i64, Act)> {
     std::iter::repeat_n((10, Act::Page(input)), n)
 }
 
+/// The practice page opened on the practice chart, its displayed gauge,
+/// normal, set 5 % below its start, then the cursor on Start.
+fn gauge_set_below_start() -> Vec<(i64, Act)> {
+    use PracticeInput::{Down, Left};
+    let mut acts = vec![(0, Act::Practice(P))];
+    acts.extend(page(Down, 4));
+    acts.extend(page(Left, 5));
+    acts.extend(page(Down, 2));
+    acts
+}
+
 /// From the first row: the speed set `down` steps below 100 %, then the
 /// cursor on Start.
 fn to_start(down: usize) -> Vec<(i64, Act)> {
@@ -2701,6 +2768,508 @@ fn a_changed_chart_file_refuses_a_speed_change() {
         rig.practice_entries[0].measures().len() + 2
     );
     assert_eq!(rig.loads.len(), 1);
+}
+
+/// The screen refuses to prepare the chosen chart's attempt: selection
+/// shows the refusal with its located reason, nothing opened or started,
+/// and selection stays usable: the next chart chosen plays, its attempt
+/// numbered 1.
+#[test]
+fn a_refused_preparation_returns_to_selection_which_stays_usable() {
+    let acts = vec![
+        (0, Act::Choose(0)),
+        (500, Act::Choose(1)),
+        (4_000, Act::Close),
+    ];
+    let (rig, events, ran) = run(Refusal::Missing, acts, |rig| rig.refuse_attempts = 1);
+    ran.unwrap();
+    assert!(rig.violations.is_empty(), "{:?}", rig.violations);
+    assert_eq!(rig.refusals, ["preparation"]);
+    assert_eq!(
+        rig.seen,
+        [
+            Seen::Select,
+            Seen::Load(0),
+            Seen::Select,
+            Seen::Refused(0),
+            Seen::Load(1),
+            Seen::Shown(1),
+        ]
+    );
+    // The refused attempt opened nothing; the next chart's opened once.
+    assert_eq!(rig.opens, 1);
+    assert_eq!(events.count(|e| matches!(e, SessionEvent::Start { .. })), 1);
+    let (1, plays) = rig.loads.last().unwrap() else {
+        panic!("{:?}", rig.seen);
+    };
+    assert_eq!(attempts(plays), [1]);
+    assert_eq!(
+        rig.attempts.iter().map(|a| a.number).collect::<Vec<_>>(),
+        [1, 1]
+    );
+}
+
+/// A practice Start whose attempt the screen refuses returns to the
+/// practice page with the reason as its notice; no round opens.
+#[test]
+fn a_refused_round_preparation_shows_on_the_practice_page() {
+    use PracticeInput::{Back, Confirm};
+    let mut acts = vec![(0, Act::Practice(P))];
+    acts.extend(to_start(0));
+    acts.extend([
+        (10, Act::Page(Confirm)),
+        (500, Act::Page(Back)),
+        (500, Act::Close),
+    ]);
+    let (rig, events, ran) = run(Refusal::Missing, acts, |rig| rig.refuse_attempts = 1);
+    ran.unwrap();
+    assert!(rig.violations.is_empty(), "{:?}", rig.violations);
+    let n = notices(&rig);
+    assert_eq!(n.len(), 2, "{:?}", rig.seen);
+    assert!(
+        n[1].as_deref()
+            .is_some_and(|n| n.contains("skin.json:3: an unknown image")),
+        "{n:?}"
+    );
+    assert_eq!(rig.opens, 0);
+    assert_eq!(events.count(|e| matches!(e, SessionEvent::Start { .. })), 0);
+    assert_eq!(rig.seen.last(), Some(&Seen::Select));
+}
+
+/// What fails right after an attempt was prepared, before recording opens.
+#[derive(Clone, Copy, Debug)]
+enum AfterAttempt {
+    Screen,
+    Output,
+    Input,
+}
+
+/// How the preparation a thread failed during ended.
+#[derive(Clone, Copy, Debug)]
+enum Ended {
+    Ready,
+    /// The failure stopped it.
+    Stopped,
+    /// The screen refused the attempt as well.
+    Refused,
+}
+
+/// A thread that fails after the attempt was prepared and before recording
+/// opens ends the run with its cause: nothing opens, no play starts. So
+/// does an audio or input failure that stopped the preparation itself, or
+/// that came with the screen's refusal of the attempt, which then shows
+/// nowhere, on selection or on the practice page.
+#[test]
+fn a_failure_after_the_preparation_opens_nothing() {
+    use PracticeInput::Confirm;
+    let mut round = vec![(0, Act::Practice(P))];
+    round.extend(to_start(0));
+    round.extend([(10, Act::Page(Confirm)), (4_000, Act::Close)]);
+    let choose = vec![(0, Act::Choose(0)), (4_000, Act::Close)];
+    for (after, ended, acts) in [
+        (AfterAttempt::Screen, Ended::Ready, &choose),
+        (AfterAttempt::Output, Ended::Ready, &choose),
+        (AfterAttempt::Input, Ended::Ready, &choose),
+        (AfterAttempt::Output, Ended::Stopped, &choose),
+        (AfterAttempt::Input, Ended::Stopped, &choose),
+        (AfterAttempt::Output, Ended::Refused, &choose),
+        (AfterAttempt::Input, Ended::Refused, &choose),
+        (AfterAttempt::Output, Ended::Refused, &round),
+    ] {
+        let (rig, events, ran) = run(Refusal::Missing, acts.clone(), |rig| {
+            rig.fails_after_attempt = Some(after);
+            rig.cancel_at_failure = matches!(ended, Ended::Stopped);
+            rig.refuse_attempts = usize::from(matches!(ended, Ended::Refused));
+        });
+        assert!(rig.refusals.is_empty(), "{after:?} {ended:?}");
+        assert!(
+            notices(&rig).iter().all(Option::is_none),
+            "{after:?} {ended:?}"
+        );
+        let cause_seen = match after {
+            AfterAttempt::Screen => matches!(ran, Err(LiveError::ScreenLost)),
+            AfterAttempt::Output => matches!(ran, Err(LiveError::Output(_))),
+            AfterAttempt::Input => matches!(ran, Err(LiveError::Input(_))),
+        };
+        assert!(cause_seen, "{after:?}: {ran:?}");
+        assert_eq!(rig.attempts.len(), 1, "{after:?}");
+        assert_eq!(rig.opens, 0, "{after:?}");
+        assert_eq!(
+            events.count(|e| matches!(e, SessionEvent::Start { .. })),
+            0,
+            "{after:?}"
+        );
+    }
+}
+
+/// A chart refused before any play while the audio output has failed ends
+/// the run with the output's failure: selection shows no refusal.
+#[test]
+fn a_refused_chart_never_hides_a_failed_output() {
+    let acts = vec![(0, Act::Choose(2)), (4_000, Act::Close)];
+    let (rig, _events, ran) = run(Refusal::Missing, acts, |rig| rig.output_failed = true);
+    assert!(matches!(ran, Err(LiveError::Output(_))), "{ran:?}");
+    assert!(rig.refusals.is_empty(), "{:?}", rig.refusals);
+    assert_eq!(rig.opens, 0);
+}
+
+/// The play preset is refreshed before the first round too: the preset
+/// file edited while the practice page waits, its gauges reordered and one
+/// added, is the one the first round's attempt is prepared with and played
+/// under, and the initial value set on the page stays with its gauge.
+#[test]
+fn the_first_round_prepares_with_the_preset_edited_on_the_practice_page() {
+    let mut acts = gauge_set_below_start();
+    // Start, back from the round's result to the page, and Start again.
+    acts.extend([
+        (500, Act::Page(PracticeInput::Confirm)),
+        (3_000, Act::Quit),
+        (500, Act::Quit),
+        (500, Act::Page(PracticeInput::Confirm)),
+        (3_000, Act::Quit),
+        (500, Act::Close),
+    ]);
+    let edited = reordered();
+    let file = game::preset_to_toml(&edited);
+    let (rig, _app, _dir, ran) = run_mine(Refusal::Missing, acts, |r, dir| {
+        // While the page waits, before Start.
+        edit(r, CLOCK_START + 300 * MS, &mine_path(dir), file);
+    });
+    ran.unwrap();
+    assert!(rig.violations.is_empty(), "{:?}", rig.violations);
+    let first = &rig.attempts[0];
+    assert_eq!(first.gauges, edited.gauges);
+    let game::AttemptKind::Section(section) = &first.kind else {
+        panic!("{:?}", first.kind);
+    };
+    let displayed = &rules::tapestry().gauges[0];
+    let set = rules::GaugeValue(displayed.start.0 - 5 * rules::GaugeValue::PERCENT);
+    let expected: Vec<_> = edited
+        .gauges
+        .iter()
+        .map(|g| if g.id == displayed.id { set } else { g.start })
+        .collect();
+    assert_eq!(section.initial_gauges, expected);
+    // A round's notes end 1 s after its section, at 1×.
+    assert_eq!(first.last_note_end, TimeUs(section.end.0 + 1_000_000));
+    let Some((P, rounds)) = rig.loads.first() else {
+        panic!("{:?}", rig.seen);
+    };
+    assert_eq!(rounds[0].preset, mine(edited.clone()));
+    // Back on the page, it shows the gauge set where the edit moved it,
+    // with its value, and the next Start plays just that.
+    let page = &rig.practice_entries[1];
+    let at = edited.gauges.iter().position(|g| g.id == displayed.id);
+    assert_eq!(Some(page.gauge()), at);
+    assert_eq!(page.gauge_name(), Some(displayed.id.as_str()));
+    assert_eq!(page.value(), set);
+    let game::AttemptKind::Section(again) = &rig.attempts[1].kind else {
+        panic!("{:?}", rig.attempts[1].kind);
+    };
+    assert_eq!(again.initial_gauges, expected);
+}
+
+/// The tapestry preset's gauges reversed, with a copy of its first added
+/// at the end under another name and start.
+fn reordered() -> rules::RulePreset {
+    let mut p = flat_normal();
+    let mut extra = p.gauges[0].clone();
+    extra.id = "extra".to_owned();
+    extra.lamp = 2;
+    extra.start = rules::GaugeValue(50 * rules::GaugeValue::PERCENT);
+    p.gauges.reverse();
+    p.gauges.push(extra);
+    p
+}
+
+/// When the preset file is rewritten during [`practice_with_edits`].
+#[derive(Clone, Copy, Debug)]
+enum EditAt {
+    /// As the screen preparation numbered so (from 0) begins, before
+    /// that play's preset refresh.
+    Round(usize),
+    /// As the practice page is entered for the time numbered so (from 0).
+    Page(usize),
+}
+
+/// The practice page's first gauge, normal, set to 15 %, 5 % below its
+/// start, then Start, then `after`; the preset file is rewritten with each
+/// preset of `edits` at its time, and the practice chart with `chart`
+/// first when there is one.
+fn practice_with_edits(
+    chart: Option<&str>,
+    after: Vec<(i64, Act)>,
+    edits: Vec<(EditAt, rules::RulePreset)>,
+) -> Headless {
+    let mut acts = gauge_set_below_start();
+    acts.push((500, Act::Page(PracticeInput::Confirm)));
+    acts.extend(after);
+    let (rig, _app, _dir, ran) = run_mine(Refusal::Missing, acts, |r, dir| {
+        if let Some(text) = chart {
+            std::fs::write(&r.paths[P], text).unwrap();
+        }
+        for (at, preset) in edits {
+            let (path, text) = (mine_path(dir), game::preset_to_toml(&preset));
+            let edit: Box<dyn FnOnce()> = Box::new(move || common::rewrite(&path, &text));
+            match at {
+                EditAt::Round(n) => r.round_edits.push((n, edit)),
+                EditAt::Page(n) => r.page_edits.push((n, edit)),
+            }
+        }
+    });
+    ran.unwrap();
+    assert!(rig.violations.is_empty(), "{:?}", rig.violations);
+    rig
+}
+
+/// The section's initial gauges of each attempt.
+fn initial_gauges(rig: &Headless) -> Vec<Vec<rules::GaugeValue>> {
+    rig.attempts
+        .iter()
+        .map(|a| match &a.kind {
+            game::AttemptKind::Section(s) => s.initial_gauges.clone(),
+            other => panic!("{other:?}"),
+        })
+        .collect()
+}
+
+fn pct(n: i64) -> rules::GaugeValue {
+    rules::GaugeValue(n * rules::GaugeValue::PERCENT)
+}
+
+/// The tapestry preset whose normal gauge accepts nothing below its start.
+fn narrowed() -> rules::RulePreset {
+    let mut p = rules::tapestry();
+    p.gauges[0].min = p.gauges[0].start;
+    p
+}
+
+/// `preset` with a BAD window of ±3,000 s: within the edge cap at every
+/// fixed rank, past it at `#DEFEXRANK 200`.
+fn widened(mut preset: rules::RulePreset) -> rules::RulePreset {
+    let bad = rules::Window::symmetric(3_000_000_000);
+    preset.tables.keys.windows.bad = bad;
+    preset.tables.scratch.windows.bad = bad;
+    preset
+}
+
+/// The practice chart at `#DEFEXRANK 200`.
+fn defexrank_200() -> String {
+    PRACTICE.replacen('\n', "\n#DEFEXRANK 200\n", 1)
+}
+
+const REFUSED_15: &str = "the gauge normal no longer accepts 15%; it starts at 20%";
+
+/// Start again, play into the round, leave its result and the page.
+fn start_again() -> Vec<(i64, Act)> {
+    vec![
+        (500, Act::Page(PracticeInput::Confirm)),
+        (3_000, Act::Quit),
+        (500, Act::Back),
+        (500, Act::Page(PracticeInput::Back)),
+        (500, Act::Close),
+    ]
+}
+
+/// A Start's first round whose refreshed preset no longer accepts the
+/// value set does not open: its number goes back, the page shows the
+/// start with the reset's values, and the next Start plays what it shows.
+#[test]
+fn a_reset_stops_the_first_round() {
+    let rig = practice_with_edits(None, start_again(), vec![(EditAt::Round(0), narrowed())]);
+    assert_eq!(rig.opens, 1);
+    assert_eq!(notices(&rig)[1].as_deref(), Some(REFUSED_15));
+    let page = &rig.practice_entries[1];
+    assert_eq!((page.gauge_name(), page.value()), (Some("normal"), pct(20)));
+    assert_eq!(initial_gauges(&rig), [[pct(20), pct(100)]]);
+    assert_eq!(rig.attempts[0].number, 1);
+}
+
+/// A repeated round whose refreshed preset no longer accepts the value set
+/// does not open: the rounds end with the reset on the page, which shows
+/// the start the next round plays.
+#[test]
+fn a_reset_stops_the_repeat() {
+    let after = vec![(20_000, Act::Page(PracticeInput::Back)), (500, Act::Close)];
+    let rig = practice_with_edits(None, after, vec![(EditAt::Round(1), narrowed())]);
+    assert_eq!(rig.opens, 1);
+    assert_eq!(initial_gauges(&rig), [[pct(15), pct(100)]]);
+    assert_eq!(notices(&rig)[1].as_deref(), Some(REFUSED_15));
+    let page = &rig.practice_entries[1];
+    assert_eq!((page.gauge_name(), page.value()), (Some("normal"), pct(20)));
+}
+
+/// A retry whose refreshed preset lost the gauge set does not open: the
+/// rounds end with the reset on the page, which shows the gauge at its
+/// place, at its start. The gauge's start moved off the 1 % steps first,
+/// keeping the value set, which no step back could have reached.
+#[test]
+fn a_reset_stops_the_retry() {
+    let mut odd = rules::tapestry();
+    odd.gauges[0].start = rules::GaugeValue(pct(20).0 + pct(1).0 / 2);
+    let mut lost = odd.clone();
+    lost.gauges.remove(0);
+    let after = vec![
+        (3_000, Act::Quit),
+        (500, Act::Retry),
+        (500, Act::Page(PracticeInput::Back)),
+        (500, Act::Close),
+    ];
+    let edits = vec![(EditAt::Round(0), odd), (EditAt::Round(1), lost.clone())];
+    let rig = practice_with_edits(None, after, edits);
+    assert_eq!(rig.opens, 1);
+    assert_eq!(initial_gauges(&rig)[0][0], pct(15));
+    let shown = &lost.gauges[0];
+    assert_eq!(
+        notices(&rig)[1].as_deref(),
+        Some("the gauge normal (15%) left the preset; showing survival at 100%")
+    );
+    let page = &rig.practice_entries[1];
+    assert_eq!(
+        (page.gauge(), page.gauge_name(), page.value()),
+        (0, Some(shown.id.as_str()), shown.start)
+    );
+}
+
+/// An edit that resets nothing the player set, reordering the gauges and
+/// adding one, does not stop the repeat: the next round plays the value
+/// set under its gauge, and the page shows it there, with no notice.
+#[test]
+fn a_sync_only_edit_keeps_the_repeat() {
+    let after = vec![
+        (14_000, Act::Quit),
+        (500, Act::Back),
+        (500, Act::Page(PracticeInput::Back)),
+        (500, Act::Close),
+    ];
+    let edited = reordered();
+    let rig = practice_with_edits(None, after, vec![(EditAt::Round(1), edited.clone())]);
+    assert_eq!(rig.opens, 2);
+    let at = edited.gauges.iter().position(|g| g.id == "normal").unwrap();
+    assert_eq!(initial_gauges(&rig)[1][at], pct(15));
+    let page = &rig.practice_entries[1];
+    assert_eq!(
+        (page.gauge(), page.gauge_name(), page.value()),
+        (at, Some("normal"), pct(15))
+    );
+    assert_eq!(notices(&rig)[1], None);
+}
+
+/// A value reset to its start stays reset when the rule is restored
+/// before the next Start's round: that round plays the start, and the
+/// page shows it, not the value the page held before the reset.
+#[test]
+fn a_reset_survives_the_rule_restored() {
+    let edits = vec![
+        (EditAt::Round(0), narrowed()),
+        (EditAt::Round(1), rules::tapestry()),
+    ];
+    let rig = practice_with_edits(None, start_again(), edits);
+    assert_eq!(rig.opens, 1);
+    assert_eq!(initial_gauges(&rig), [[pct(20), pct(100)]]);
+    let page = &rig.practice_entries[2];
+    assert_eq!((page.gauge_name(), page.value()), (Some("normal"), pct(20)));
+    assert_eq!(notices(&rig)[2], None);
+}
+
+/// A preset the chart's section refuses, repaired while the page waits,
+/// is the one the next Start checks and plays.
+#[test]
+fn a_preset_repaired_on_the_page_plays_at_the_next_start() {
+    let edits = vec![
+        (EditAt::Round(0), widened(rules::tapestry())),
+        (EditAt::Page(1), rules::tapestry()),
+    ];
+    let rig = practice_with_edits(Some(&defexrank_200()), start_again(), edits);
+    let n = notices(&rig);
+    assert!(
+        n[1].as_deref()
+            .is_some_and(|n| n.contains("judgment window")),
+        "{n:?}"
+    );
+    assert_eq!(rig.opens, 1);
+    assert_eq!(initial_gauges(&rig), [[pct(15), pct(100)]]);
+    assert_eq!(n[2], None);
+}
+
+/// A reset and a section refusal of the same edit are both stated, and the
+/// page shows the reset value.
+#[test]
+fn a_reset_with_a_section_refusal_states_both() {
+    let edits = vec![(EditAt::Round(0), widened(narrowed()))];
+    let after = vec![(500, Act::Page(PracticeInput::Back)), (500, Act::Close)];
+    let rig = practice_with_edits(Some(&defexrank_200()), after, edits);
+    assert_eq!(rig.opens, 0);
+    assert_eq!(
+        notices(&rig)[1].as_deref(),
+        Some(
+            "the section cannot be evaluated: the chart's rank gives no usable judgment \
+             window; the gauge normal no longer accepts 15%; it starts at 20%"
+        )
+    );
+    let page = &rig.practice_entries[1];
+    assert_eq!((page.gauge_name(), page.value()), (Some("normal"), pct(20)));
+}
+
+/// A set gauge moved by one edit and lost in a later round's: the reset
+/// names the gauge now at its place, and the page shows that one.
+#[test]
+fn a_gauge_moved_then_lost_gives_way_to_the_one_named() {
+    let moved = reordered();
+    assert_eq!(
+        moved
+            .gauges
+            .iter()
+            .map(|g| g.id.as_str())
+            .collect::<Vec<_>>(),
+        ["survival", "normal", "extra"]
+    );
+    let mut lost = moved.clone();
+    lost.gauges.remove(1);
+    let after = vec![(30_000, Act::Page(PracticeInput::Back)), (500, Act::Close)];
+    let edits = vec![(EditAt::Round(1), moved), (EditAt::Round(2), lost)];
+    let rig = practice_with_edits(None, after, edits);
+    assert_eq!(rig.opens, 2);
+    assert_eq!(
+        notices(&rig)[1].as_deref(),
+        Some("the gauge normal (15%) left the preset; showing extra at 50%")
+    );
+    let page = &rig.practice_entries[1];
+    assert_eq!(
+        (page.gauge(), page.gauge_name(), page.value()),
+        (1, Some("extra"), pct(50))
+    );
+}
+
+/// A gauge removed, added back and then shown in place of the set gauge
+/// removed in a later round: the page shows the gauge the reset names,
+/// not one an older loss mapped it to.
+#[test]
+fn a_gauge_back_in_the_preset_ends_the_replacement() {
+    let all = reordered();
+    let [survival, normal, extra] = [0, 1, 2].map(|i| all.gauges[i].clone());
+    let with = |gauges: Vec<rules::GaugeRule>| rules::RulePreset {
+        gauges,
+        ..all.clone()
+    };
+    let after = vec![(40_000, Act::Page(PracticeInput::Back)), (500, Act::Close)];
+    let edits = vec![
+        (EditAt::Round(1), with(vec![extra.clone(), normal.clone()])),
+        (
+            EditAt::Round(2),
+            with(vec![extra.clone(), normal, survival.clone()]),
+        ),
+        (EditAt::Round(3), with(vec![extra, survival])),
+    ];
+    let rig = practice_with_edits(None, after, edits);
+    assert_eq!(rig.opens, 3);
+    let notice = notices(&rig)[1].clone().unwrap_or_default();
+    assert!(
+        notice.starts_with("the gauge normal (15%) left the preset; showing survival at"),
+        "{notice}"
+    );
+    let page = &rig.practice_entries[1];
+    assert_eq!((page.gauge(), page.gauge_name()), (1, Some("survival")));
 }
 
 fn act() -> impl Strategy<Value = Act> {

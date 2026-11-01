@@ -73,6 +73,7 @@ impl ChartIngest for Built {
         _speed: bms_model::Speed,
     ) -> Result<Ingested, IngestError> {
         Ok(Ingested {
+            labels: game::ChartLabels::default(),
             chart: self.0.clone(),
             warnings: Vec::new(),
         })
@@ -432,15 +433,15 @@ fn presets_folder(root: &DataRoot) -> Vec<String> {
     names
 }
 
+/// A preset file changed between two plays is used from the next one on,
+/// never by the play already played.
 #[test]
-fn changed_preset_file_applies_from_next_retry_only() {
+fn changed_preset_file_applies_from_next_play_only() {
     let (_dir, root) = temp_root();
     let chart = taps(&[(1, 1_000)]);
     let events = Events::default();
     let path = write_user_preset(&root, "wide", &rules::tapestry());
     let mut s = session_named(&root, &chart, &events, "wide");
-    // Changed after loading, before the first play.
-    rewrite(&path, &preset_to_toml(&wide_perfect()));
     // A press 25 ms late: GREAT under the tapestry preset, PERFECT under the
     // changed one.
     let late = |items: Vec<ScriptItem>| {
@@ -450,6 +451,7 @@ fn changed_preset_file_applies_from_next_retry_only() {
         v
     };
     let one = s.play(script(late(vec![connect(0)]), &[])).unwrap();
+    rewrite(&path, &preset_to_toml(&wide_perfect()));
     let two = s.play(script(late(Vec::new()), &[])).unwrap();
 
     assert_eq!(
@@ -1563,6 +1565,7 @@ impl ChartIngest for Capped {
     ) -> Result<Ingested, IngestError> {
         *self.seen.borrow_mut() = Some(bytes.len());
         Ok(Ingested {
+            labels: game::ChartLabels::default(),
             chart: self.chart.clone(),
             warnings: Vec::new(),
         })

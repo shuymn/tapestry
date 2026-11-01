@@ -9,8 +9,15 @@
 //! tests. The rig owns the clock and every wait; the transitions here only
 //! ask it what happened and tell it what to do.
 //!
-//! - The screen and audio are prepared, and acknowledge it, before recording
-//!   opens, so the countdown origin is chosen only once that work is done.
+//! - Before recording opens, in this order: the screen's device is made
+//!   usable, the play preset is refreshed, then audio and the play's
+//!   attempt are prepared on the screen with that preset, the loading
+//!   state ends, and a quit or a failure is looked for again at each step
+//!   ([`ready_to_open`]); the countdown origin is chosen only once that
+//!   work is done. A preparation the screen refuses goes back to where the
+//!   chart was chosen with the reason ([`LiveError::Preparation`]), and
+//!   one the player cancels, or a quit before the opening, opens nothing;
+//!   either gives the play's number back ([`Loaded::withdraw`]).
 //!   The play's setup follows the opening, at the countdown's start: the
 //!   plan, the reservation of the whole recording window and the logic
 //!   step's construction, bounded by the chart and the reservation, then the
@@ -35,6 +42,11 @@
 //!   stage to the result instead of aborting the play ([`TailAction`]). A
 //!   repeated round whose stage ran to its end is followed by the next
 //!   round at the following step, with no result between.
+//! - Each step publishes whether the play is playing (design.md "Play
+//!   Lifecycle"), as the step entered it: from the chart's start until a
+//!   terminal transition, so the countdown is not, the step that processes
+//!   a gauge failure or the completion still is, and the stop, the tail and
+//!   the ring-out are not. It is the lifecycle's phase, not `!complete`.
 //! - A practice round opens recording [`RESTORE_AHEAD`](crate::RESTORE_AHEAD)
 //!   before its lead-in, has its audio restored at the lead-in's start
 //!   ([`crate::restore`]), and is evaluated in its section.
@@ -50,6 +62,7 @@ use input::{Arrival, DeviceKind};
 use replay::Incomplete;
 
 use crate::app::IDLE_WAIT;
+use crate::attempt::{Preparation, PreparationRefusal};
 use crate::audio_loop::AudioWaitError;
 use crate::logic::{AbortCause, Advance, Logic, LogicError, SourceRead};
 use crate::policy::SessionEvent;
@@ -160,16 +173,33 @@ pub trait Rig {
     /// Whether the player quit or the window is closing: latched, never
     /// cleared.
     fn quitting(&self) -> bool;
-    /// Readies the screen for a play (its play state reset) and waits for
-    /// it to acknowledge.
+    /// Makes sure the screen and its device can draw (built again if they
+    /// failed) and waits for it to acknowledge: the device's recovery, for
+    /// a play and for the menus alike. It prepares no attempt, which
+    /// depends on the play preset ([`prepare_attempt`](Self::prepare_attempt)).
     ///
     /// # Errors
     ///
-    /// Why the screen cannot draw a play, which ends the run.
+    /// Why the screen cannot draw, which ends the run.
     fn prepare_screen(&mut self) -> Result<(), Self::ScreenError>;
+    /// Prepares the screen for the attempt [`Loaded::attempt`] describes,
+    /// fresh for every play, after the play preset was refreshed for it and
+    /// before recording opens, and waits for it while servicing the
+    /// player: a quit key or a close during the wait cancels it
+    /// ([`Preparation::Cancelled`]) without waiting for the screen. A
+    /// refusal leaves the screen usable for the menus. By default, for rigs
+    /// without a screen, it is ready at once.
+    ///
+    /// # Errors
+    ///
+    /// Why the screen or its device cannot draw at all, which ends the run.
+    fn prepare_attempt(&mut self, loaded: &Loaded) -> Result<Preparation, Self::ScreenError> {
+        let _ = loaded;
+        Ok(Preparation::Ready)
+    }
     /// Ends a chart's loading state (design.md "Play Lifecycle"), after
-    /// the audio's preparation and before recording opens: once it
-    /// returns, the screen draws nothing of it. Nothing to end without
+    /// the audio's and the attempt's preparation and before recording
+    /// opens: once it returns, the screen draws nothing of it. Nothing to end without
     /// one (a retry); the default has none.
     ///
     /// # Errors
@@ -284,9 +314,21 @@ pub enum LiveError<S> {
     /// The screen cannot draw a play: the rig's [`Rig::ScreenError`].
     #[error("the screen cannot draw the play")]
     Screen(#[source] S),
+    /// The screen refused to prepare the play's attempt; it can still
+    /// draw the menus, and recording did not open.
+    #[error("the play cannot be prepared")]
+    Preparation(#[source] PreparationRefusal),
     /// Audio cannot play.
     #[error("audio cannot play")]
     Audio(#[source] AudioWaitError),
+    /// The audio output failed before recording opened; recording did not
+    /// open.
+    #[error("the audio output failed")]
+    Output(#[source] OutputError),
+    /// The screen failed after the attempt was prepared and before
+    /// recording opened; recording did not open.
+    #[error("the screen failed before the play opened")]
+    ScreenLost,
     /// The input thread is gone or did not answer.
     #[error("the input thread failed")]
     Input(#[source] InputWaitError),
@@ -301,6 +343,39 @@ pub enum LiveError<S> {
 pub(crate) fn run_over<R: Rig>(rig: &R) -> Result<(), LiveError<R::ScreenError>> {
     rig.input_failure()
         .map_or(Ok(()), |e| Err(LiveError::Input(e)))
+}
+
+/// The other threads' failures that end the run before recording opens:
+/// the input thread's ([`run_over`]), then the audio output's.
+pub(crate) fn threads_over<R: Rig>(rig: &R) -> Result<(), LiveError<R::ScreenError>> {
+    run_over(rig)?;
+    rig.audio_failure()
+        .map_or(Ok(()), |e| Err(LiveError::Output(e)))
+}
+
+/// What a play's error reports: a refusal the player can go back from
+/// (its preparation, its restore, its logic step) gives way to the input
+/// thread's or the audio output's failure when one came meanwhile, so it
+/// never hides the run's end; any other error is the run's end already.
+fn refused<R: Rig>(rig: &R, error: LiveError<R::ScreenError>) -> LiveError<R::ScreenError> {
+    match error {
+        LiveError::Preparation(_) | LiveError::Restore(_) | LiveError::Logic(_) => {
+            threads_over(rig).err().unwrap_or(error)
+        }
+        other => other,
+    }
+}
+
+/// Whether recording may open as far as the threads go: none of them
+/// failed ([`threads_over`]), and the screen prepared for the attempt is
+/// still there. A screen that failed now has no prepared attempt, so the
+/// run ends rather than opening a play nothing draws.
+fn preflight<R: Rig>(rig: &R) -> Result<(), LiveError<R::ScreenError>> {
+    threads_over(rig)?;
+    if rig.screen_failed() {
+        return Err(LiveError::ScreenLost);
+    }
+    Ok(())
 }
 
 /// How the plays of a chart were left.
@@ -468,6 +543,48 @@ pub fn play<R: Rig>(
     Ok(play_and_next(loaded, rig)?.map(|p| p.report))
 }
 
+/// The rest of a play's preparation, once its preset was refreshed
+/// (design.md "Play Lifecycle"): audio, the attempt on the screen and a
+/// practice round's restore check, then the end of the loading state, with
+/// a quit or a failure looked for again before and after it. `false` when
+/// the player cancelled or quit before recording opens: the commands that
+/// did are taken, so they leave only this play.
+///
+/// # Errors
+///
+/// What [`play`] reports; a refused attempt is [`LiveError::Preparation`].
+#[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+fn ready_to_open<R: Rig>(loaded: &Loaded, rig: &mut R) -> Result<bool, LiveError<R::ScreenError>> {
+    rig.prepare_audio().map_err(LiveError::Audio)?;
+    match rig.prepare_attempt(loaded).map_err(LiveError::Screen)? {
+        Preparation::Ready => {}
+        // The player left, or another thread failed: a failure is the
+        // run's end, with its cause.
+        Preparation::Cancelled => {
+            threads_over(rig)?;
+            while rig.take().is_some() {}
+            return Ok(false);
+        }
+        Preparation::Refused(why) => return Err(LiveError::Preparation(why)),
+    }
+    // A round whose audio cannot be restored is refused before loading
+    // ends, and before anything opens.
+    if let Some(at) = loaded.restore_at() {
+        rig.restore_ready(at).map_err(LiveError::Restore)?;
+    }
+    // What happened during the preparation, before loading ends.
+    preflight(rig)?;
+    if rig.quitting() {
+        return Ok(false);
+    }
+    rig.end_loading().map_err(LiveError::Screen)?;
+    // And again once no loading frame can follow: the last look before
+    // recording opens. A retry or suspend from before this play belongs to
+    // no play.
+    preflight(rig)?;
+    Ok(!(rig.quitting() || rig.take() == Some(Command::Quit)))
+}
+
 /// A play's report, and what follows it.
 struct Played {
     report: PlayReport,
@@ -496,35 +613,56 @@ fn play_and_next<R: Rig>(
     // A failed input thread is known before another handshake could mask
     // or delay it.
     run_over(rig)?;
+    // The device first, for the play and the menus alike; it prepares no
+    // attempt.
     rig.prepare_screen().map_err(LiveError::Screen)?;
-    rig.prepare_audio().map_err(LiveError::Audio)?;
-    rig.end_loading().map_err(LiveError::Screen)?;
-    // A retry or suspend from before this play belongs to no play.
-    if rig.quitting() || rig.take() == Some(Command::Quit) {
-        return Ok(None);
-    }
     rig.before_play(loaded.settings_mut());
+    // The play preset is refreshed here, so the attempt is prepared with
+    // it, whatever a result screen viewed.
     let start = loaded.begin_play();
+    // A round's practice follows the refreshed preset, or the round is
+    // refused before anything is prepared: one that would play a reset
+    // value the player set does not open, the reset its reason.
+    let ready = match loaded.refit_practice() {
+        Ok(()) => ready_to_open(loaded, rig),
+        Err(unfit) => Err(LiveError::Preparation(PreparationRefusal {
+            location: None,
+            reason: unfit.to_string(),
+        })),
+    };
+    match ready {
+        Ok(true) => {}
+        Ok(false) => {
+            loaded.withdraw(start);
+            return Ok(None);
+        }
+        Err(e) => {
+            loaded.withdraw(start);
+            return Err(refused(rig, e));
+        }
+    }
     // A full play's recording opens its countdown before chart time 0, a
     // practice round's `RESTORE_AHEAD` before its lead-in, whose start its
     // audio is restored at (design.md "Mid-Chart Start and Section
-    // Repeat"): checked before anything opens.
+    // Repeat").
     let opens_at = loaded.opens_at();
     let restore_at = loaded.restore_at();
-    if let Some(at) = restore_at {
-        rig.restore_ready(at).map_err(LiveError::Restore)?;
-    }
-    // A quit during the wait is latched and taken by the first step.
-    let opening = rig
-        .open(TimeUs(opens_at.0.saturating_neg()))
-        .map_err(LiveError::Input)?;
+    // A quit during the wait is latched and taken by the first step. A
+    // failed opening opened nothing: its number goes back.
+    let opening = match rig.open(TimeUs(opens_at.0.saturating_neg())) {
+        Ok(opening) => opening,
+        Err(e) => {
+            loaded.withdraw(start);
+            return Err(LiveError::Input(e));
+        }
+    };
     let origin = opening.origin;
     // The refusal is the error reported; a failed close adds nothing to it.
     let plan = match loaded.plan(&opening.kinds, &opening.axes) {
         Ok(plan) => plan,
         Err(e) => {
             let _ = rig.close();
-            return Err(LiveError::Logic(e));
+            return Err(refused(rig, LiveError::Logic(e)));
         }
     };
     let (mut logic, screen) = match Logic::with_section(
@@ -540,7 +678,7 @@ fn play_and_next<R: Rig>(
         Ok(pair) => pair,
         Err(e) => {
             let _ = rig.close();
-            return Err(LiveError::Logic(e));
+            return Err(refused(rig, LiveError::Logic(e)));
         }
     };
     // The restore is planned on the opening's origin, in the play's setup,
@@ -550,7 +688,7 @@ fn play_and_next<R: Rig>(
         && let Err(e) = rig.restore_audio(origin, at)
     {
         let _ = rig.close();
-        return Err(LiveError::Restore(e));
+        return Err(refused(rig, LiveError::Restore(e)));
     }
     // Admitted: only now does the play start, so a refused opening reports
     // no start.
@@ -575,8 +713,14 @@ fn play_and_next<R: Rig>(
     // The play time of the last step: where an abort came.
     let mut last;
 
+    let starts_at = loaded.starts_at();
     let end = loop {
         rig.wait();
+        let now = TimeUs(rig.now().0 - origin.0);
+        // The step's phase as it enters it, before anything below ends the
+        // play: playing from the chart's start on, until a terminal
+        // transition. The step that processes one still enters playing.
+        logic.set_playing(now >= starts_at && !logic.is_complete() && logic.aborted().is_none());
         // Anything seen in a step is handled before the step advances.
         // Every pending command is taken, so a suspend is never left behind
         // a quit or a retry.
@@ -602,7 +746,6 @@ fn play_and_next<R: Rig>(
         } else if rig.screen_failed() {
             logic.abort(AbortCause::ScreenFailed);
         }
-        let now = TimeUs(rig.now().0 - origin.0);
         last = now;
         let advance = logic.advance_to(now);
         live.extend_from_slice(logic.events());
@@ -631,6 +774,9 @@ fn play_and_next<R: Rig>(
             break PlayEnd::Aborted(AbortCause::GaugeFailed);
         }
     };
+    // Stopped, completed or failed: no frame from here on is playing, the
+    // tail's and the ring-out's included.
+    logic.stop_playing();
 
     // Recording closes at the end of evaluation (design.md "Play Lifecycle");
     // an aborted play then takes what reached its queues after the abort.

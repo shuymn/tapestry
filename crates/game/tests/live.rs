@@ -14,8 +14,8 @@ use eval::{ControlId, InputKind, JudgeEventKind, SourceId};
 use game::{
     AbortCause, AudioControl, AudioQueue, AudioWaitError, ChartIngest, Closing, Command, DataRoot,
     DeviceSettings, EntryId, IngestError, Ingested, InputWaitError, LiveError, Loaded, Notice,
-    Opening, Parts, PlayEnd, PlayReport, RenderSide, ResultScreen, Rig, SessionConfig, Settings,
-    ViewStatus,
+    Opening, Parts, PlayEnd, PlayReport, Preparation, PreparationRefusal, RenderSide, ResultScreen,
+    Rig, SessionConfig, Settings, ViewStatus,
 };
 use input::{
     Action, DeviceId, DeviceKind, InputAdapter, Packet, ScriptItem, ScriptedInput, SourceReader,
@@ -52,6 +52,7 @@ impl ChartIngest for Built {
         _speed: bms_model::Speed,
     ) -> Result<Ingested, IngestError> {
         Ok(Ingested {
+            labels: game::ChartLabels::default(),
             chart: self.0.clone(),
             warnings: Vec::new(),
         })
@@ -138,6 +139,8 @@ struct Fake {
     script: ScriptedInput,
     commands: Vec<(i64, Command)>,
     quit_at: i64,
+    /// The current play's origin, once it started.
+    origin: Option<TimeUs>,
     /// The close request takes effect after the input thread's batches up
     /// to this much later.
     close_lag: i64,
@@ -210,6 +213,23 @@ struct Fake {
     /// Commands pressed by a record sink while the play is saved, taken
     /// first.
     pressed: std::sync::Arc<std::sync::Mutex<Vec<Command>>>,
+    /// The handshakes before each opening, in order.
+    steps: Vec<&'static str>,
+    /// Every attempt the screen was asked to prepare.
+    attempts: Vec<game::Attempt>,
+    /// How each preparation ends, in order; then ready.
+    preparations: Vec<Preparation>,
+    /// The audio output failed.
+    output_failed: bool,
+    /// Waits each preparation takes, a quit or a close during which
+    /// cancels it.
+    prepare_waits: usize,
+    /// The play's screen end, read at each step.
+    side: Option<RenderSide>,
+    /// Each step's play time and the phase its view published, by play.
+    phases: Vec<Vec<(i64, bool)>>,
+    /// The phase published once each play's recording closes.
+    closed_phases: Vec<bool>,
 }
 
 impl Fake {
@@ -228,6 +248,7 @@ impl Fake {
             script,
             commands: commands.to_vec(),
             quit_at,
+            origin: None,
             close_lag: 0,
             quit_in_prepare: false,
             quitting: false,
@@ -266,6 +287,14 @@ impl Fake {
             idle_waits: Vec::new(),
             menu: Vec::new(),
             pressed: std::sync::Arc::default(),
+            steps: Vec::new(),
+            attempts: Vec::new(),
+            preparations: Vec::new(),
+            output_failed: false,
+            prepare_waits: 0,
+            side: None,
+            phases: Vec::new(),
+            closed_phases: Vec::new(),
         }
     }
 
@@ -354,6 +383,7 @@ impl Rig for Fake {
     }
 
     fn prepare_screen(&mut self) -> Result<(), SurfaceLost> {
+        self.steps.push("screen");
         self.prepares += 1;
         if self.quit_in_prepare {
             // The window closes while the screen gets ready.
@@ -373,10 +403,40 @@ impl Rig for Fake {
     }
 
     fn prepare_audio(&mut self) -> Result<(), AudioWaitError> {
+        self.steps.push("audio");
         self.audio.as_mut().map_or(Ok(()), AudioControl::ready)
     }
 
+    /// Takes [`Self::prepare_waits`] waits, servicing the quit key and a
+    /// close at each, as the player's rig does while the screen prepares.
+    fn prepare_attempt(&mut self, loaded: &Loaded) -> Result<Preparation, SurfaceLost> {
+        self.steps.push("attempt");
+        self.attempts.push(loaded.attempt());
+        for _ in 0..self.prepare_waits {
+            self.wait();
+            let now = self.clock.now().0;
+            let quit = self
+                .commands
+                .iter()
+                .any(|&(at, c)| at <= now && c == Command::Quit);
+            if self.quitting() || quit {
+                return Ok(Preparation::Cancelled);
+            }
+        }
+        if self.preparations.is_empty() {
+            Ok(Preparation::Ready)
+        } else {
+            Ok(self.preparations.remove(0))
+        }
+    }
+
+    fn end_loading(&mut self) -> Result<(), SurfaceLost> {
+        self.steps.push("end loading");
+        Ok(())
+    }
+
     fn open(&mut self, lead_in: TimeUs) -> Result<Opening<SourceReader>, InputWaitError> {
+        self.steps.push("open");
         self.opens += 1;
         if let Some(e) = self.input_failure().or(self.open_fails) {
             self.failed = Some(e);
@@ -404,7 +464,10 @@ impl Rig for Fake {
         })
     }
 
-    fn start(&mut self, _origin: TimeUs, sounds: AudioQueue, _screen: RenderSide) {
+    fn start(&mut self, origin: TimeUs, sounds: AudioQueue, screen: RenderSide) {
+        self.origin = Some(origin);
+        self.side = Some(screen);
+        self.phases.push(Vec::new());
         self.sounds = Some(sounds);
         self.sealed = false;
         self.waits_since_seal = 0;
@@ -419,7 +482,7 @@ impl Rig for Fake {
     }
 
     fn audio_failure(&self) -> Option<audio::OutputError> {
-        None
+        self.output_failed.then_some(audio::OutputError::DeviceLost)
     }
 
     fn screen_failed(&self) -> bool {
@@ -444,6 +507,9 @@ impl Rig for Fake {
     }
 
     fn close(&mut self) -> Result<Closing, InputWaitError> {
+        if let Some(side) = &mut self.side {
+            self.closed_phases.push(side.view().playing);
+        }
         // Batches the input thread received before it took the request.
         if let Some(c) = self.in_close.take() {
             self.commands.push((i64::MIN, c));
@@ -488,6 +554,14 @@ impl Rig for Fake {
         self.order.lock().unwrap().push("play over");
     }
 
+    fn stepped(&mut self, _aborted: bool) {
+        if let (Some(side), Some(origin), Some(phases)) =
+            (&mut self.side, self.origin, self.phases.last_mut())
+        {
+            phases.push((self.clock.now().0 - origin.0, side.view().playing));
+        }
+    }
+
     fn measured(
         &mut self,
         advance: &game::Advance,
@@ -516,6 +590,7 @@ impl Rig for Fake {
     }
 
     fn before_play(&mut self, settings: &mut Settings) {
+        self.steps.push("before play");
         if let Some(o) = self.pending_offset.take() {
             settings.device.input_offset_us = o;
         }
@@ -786,8 +861,8 @@ fn a_screen_failure_on_the_end_screen_is_rebuilt_and_shown_again() {
     assert_eq!((rig.prepares, rig.shows), (2, 2));
 }
 
-/// The gauges change in the preset file before a retry: each play's report
-/// carries the preset it was evaluated under.
+/// The gauges change in the preset file during the first play, before a
+/// retry: each play's report carries the preset it was evaluated under.
 #[test]
 fn each_report_carries_the_preset_its_play_used() {
     let dir = tempfile::tempdir().unwrap();
@@ -797,9 +872,11 @@ fn each_report_carries_the_preset_its_play_used() {
     for g in &mut renamed.gauges {
         g.id = format!("{}-renamed", g.id);
     }
-    rewrite_preset(&path, &renamed);
     let items = vec![key(9_303_000, Z, 1), key(9_353_000, Z, 0)];
     let mut rig = Fake::new(items, &[(9_500_000, Command::Retry)], 12_500_000);
+    let edited = renamed.clone();
+    rig.at
+        .push((8_000_000, Box::new(move || rewrite_preset(&path, &edited))));
     game::live::run_chart(&mut loaded, &mut rig).unwrap();
     let ids = |r: &PlayReport| {
         r.preset
@@ -1127,8 +1204,8 @@ fn the_play_is_over_before_it_is_saved() {
 }
 
 /// T1, T2: the input thread is gone, or does not answer, when recording
-/// opens: no play exists, so the run ends with that cause and nothing is
-/// saved.
+/// opens: no play exists, so the run ends with that cause, nothing is
+/// saved, and the play's number is given back.
 #[test]
 fn an_input_thread_gone_at_the_open_ends_the_run_with_its_cause() {
     for cause in [InputWaitError::Gone, InputWaitError::Timeout] {
@@ -1144,6 +1221,7 @@ fn an_input_thread_gone_at_the_open_ends_the_run_with_its_cause() {
         assert_eq!(rig.opens, 1, "{cause:?}");
         assert!(rig.reports.is_empty(), "{cause:?}");
         assert!(!dir.path().join("records").exists(), "{cause:?}");
+        assert_eq!(loaded.attempt().number, 0, "{cause:?}");
     }
 }
 
@@ -2660,4 +2738,229 @@ fn quit_during_the_save(abort: Option<i64>, end: PlayEnd) {
         "{end:?}: {}",
         rig.clock.now().0
     );
+}
+
+/// Before each opening: the device, then the preset refreshed, then audio
+/// and the attempt on the screen with that preset, then the end of the
+/// loading state; a retry goes through the same steps.
+#[test]
+fn the_attempt_is_prepared_after_the_preset_refresh_and_before_loading_ends() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut loaded = loaded(dir.path());
+    let items = vec![key(9_303_000, Z, 1), key(9_353_000, Z, 0)];
+    let mut rig = Fake::new(items, &[(9_500_000, Command::Retry)], 12_500_000);
+    game::live::run_chart(&mut loaded, &mut rig).unwrap();
+    let one = [
+        "screen",
+        "before play",
+        "audio",
+        "attempt",
+        "end loading",
+        "open",
+    ];
+    assert_eq!(rig.steps, [one, one].concat());
+    assert_eq!(
+        rig.attempts.iter().map(|a| a.number).collect::<Vec<_>>(),
+        [1, 2]
+    );
+}
+
+/// The play preset is edited while the result views another preset: the
+/// retry's attempt is prepared, fresh, with the refreshed play preset, its
+/// gauges in their order, never with the viewed one.
+#[test]
+fn a_retry_prepares_with_the_refreshed_play_preset_not_the_viewed_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_user_preset(dir.path(), &rules::tapestry());
+    let mut loaded = loaded_with(dir.path(), "mine");
+    let items = vec![key(9_303_000, Z, 1), key(9_353_000, Z, 0)];
+    let mut rig = Fake::new(items, &[(11_500_000, Command::Retry)], 15_000_000);
+    rig.menu = vec![(10_500_000, game::MenuCommand::NextPreset)];
+    let mut edited = rules::tapestry();
+    edited.gauges.reverse();
+    for g in &mut edited.gauges {
+        g.id = format!("{}-edited", g.id);
+    }
+    let to = edited.clone();
+    rig.at
+        .push((11_000_000, Box::new(move || rewrite_preset(&path, &to))));
+    game::live::run_chart(&mut loaded, &mut rig).unwrap();
+    // The result viewed another preset when the retry was taken.
+    assert_ne!(viewed(shown(&rig, 11_400_000)), user("mine"));
+    let [one, two, ..] = &rig.attempts[..] else {
+        panic!("{:?}", rig.attempts.len());
+    };
+    assert_eq!(one.gauges, rules::tapestry().gauges);
+    assert_eq!(two.gauges, edited.gauges);
+    assert_eq!(two.preset.0, "mine");
+    assert_eq!(rig.reports[1].preset, mine(edited));
+    // Fresh per attempt: its own number, from the same chart.
+    assert_eq!((one.number, two.number), (1, 2));
+    assert_eq!(one.kind, two.kind);
+}
+
+/// The screen refuses the attempt: the run stops with the refusal before
+/// anything opens or is reported, and the play's number goes back.
+#[test]
+fn a_refused_preparation_opens_nothing_and_gives_the_number_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut loaded = loaded(dir.path());
+    let mut rig = Fake::new(Vec::new(), &[], 12_500_000);
+    let why = PreparationRefusal {
+        location: Some("skin.json:7".to_owned()),
+        reason: "a font cannot be drawn".to_owned(),
+    };
+    rig.preparations = vec![Preparation::Refused(why.clone())];
+    let ran = game::live::run_chart(&mut loaded, &mut rig);
+    match ran {
+        Err(LiveError::Preparation(r)) => assert_eq!(r, why),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(why.to_string(), "skin.json:7: a font cannot be drawn");
+    assert_eq!((rig.opens, rig.reports.len()), (0, 0));
+    assert!(!rig.steps.contains(&"end loading"));
+    assert_eq!(loaded.begin_play().attempt, 1);
+}
+
+/// A refusal of the attempt that comes with a failed audio output ends the
+/// run with the output's failure, not with the refusal the player could go
+/// back from; nothing opens.
+#[test]
+fn a_refused_preparation_never_hides_a_failed_output() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut loaded = loaded(dir.path());
+    let mut rig = Fake::new(Vec::new(), &[], 12_500_000);
+    rig.preparations = vec![Preparation::Refused(PreparationRefusal {
+        location: None,
+        reason: "a font cannot be drawn".to_owned(),
+    })];
+    rig.output_failed = true;
+    let ran = game::live::run_chart(&mut loaded, &mut rig);
+    assert!(matches!(ran, Err(LiveError::Output(_))), "{ran:?}");
+    assert_eq!((rig.opens, rig.reports.len()), (0, 0));
+}
+
+/// A preparation slower than the player: the quit key during it cancels it
+/// at the next wait, recording never opens and the chart is left; the
+/// quit is taken with it. A close during it ends the run the same way.
+#[test]
+fn a_slow_preparation_stays_cancellable_and_never_opens_recording() {
+    for (quit, close, leave) in [
+        (7_400_000, i64::MAX, game::Leave::Back),
+        (i64::MAX, 7_400_000, game::Leave::Quit),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut loaded = loaded(dir.path());
+        let commands = if quit == i64::MAX {
+            Vec::new()
+        } else {
+            vec![(quit, Command::Quit)]
+        };
+        let mut rig = Fake::new(Vec::new(), &commands, close);
+        // Ten seconds of preparation.
+        rig.prepare_waits = 10_000;
+        let left = game::live::run_chart(&mut loaded, &mut rig).unwrap();
+        assert_eq!(left, leave);
+        assert_eq!((rig.opens, rig.reports.len()), (0, 0), "{leave:?}");
+        assert!(!rig.steps.contains(&"end loading"), "{leave:?}");
+        // Cancelled at the wait that saw it, not at the preparation's end.
+        assert_eq!(rig.clock.now().0, 7_400_000, "{leave:?}");
+        assert!(rig.commands.is_empty(), "{leave:?}");
+        assert_eq!(loaded.begin_play().attempt, 1, "{leave:?}");
+    }
+}
+
+/// Whether each step's view published playing: false through the
+/// countdown, true from the chart's start through the step that completes
+/// the play, and false through the tail and once recording closed.
+#[test]
+fn the_play_phase_is_published_as_each_step_enters_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut loaded = loaded(dir.path());
+    let items = vec![key(9_303_000, Z, 1), key(9_353_000, Z, 0)];
+    let mut rig = Fake::new(items, &[], 12_500_000);
+    rig.tail_waits = 50;
+    game::live::run_chart(&mut loaded, &mut rig).unwrap();
+    assert_eq!(rig.reports[0].end, PlayEnd::Completed);
+    let phases = &rig.phases[0];
+    let completed = rig.measured[0].iter().position(|a| a.complete).unwrap();
+    for (i, &(t, playing)) in phases.iter().enumerate() {
+        let expected = t >= 0 && i <= completed;
+        assert_eq!(playing, expected, "step {i} at {t}");
+    }
+    // The completing step entered playing; the tail did not.
+    assert!(phases[completed].1);
+    assert!(phases.len() > completed + 40);
+    assert_eq!(rig.closed_phases, [false]);
+}
+
+/// The quit key during play stops it: no frame from the stop on is
+/// playing.
+#[test]
+fn a_stopped_play_publishes_that_it_is_not_playing() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut loaded = loaded(dir.path());
+    let mut rig = Fake::new(Vec::new(), &[(9_000_000, Command::Quit)], 12_500_000);
+    game::live::run_chart(&mut loaded, &mut rig).unwrap();
+    assert_eq!(rig.reports[0].end, PlayEnd::Aborted(AbortCause::Quit));
+    assert!(rig.phases[0].iter().any(|&(_, p)| p));
+    assert_eq!(rig.closed_phases, [false]);
+}
+
+/// A policy that ends the play when a survival gauge fails.
+struct Strict;
+
+impl game::SessionPolicy for Strict {
+    fn id(&self) -> &str {
+        "strict"
+    }
+    fn displayed_gauge(&self, _gauges: &[eval::GaugeState]) -> game::GaugeIndex {
+        game::GaugeIndex(1)
+    }
+    fn on_survival_failure(&self) -> game::FailureAction {
+        game::FailureAction::EndPlay
+    }
+}
+
+/// The step that processes a survival gauge's failure entered playing and
+/// publishes so; the stop that follows does not.
+#[test]
+fn the_step_processing_a_gauge_failure_enters_playing() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = DataRoot::new(dir.path().to_owned());
+    let mut settings = tapestry_settings(&root);
+    settings.device.input_offset_us = OFFSET;
+    let chart_path = dir.path().join("play.chart");
+    std::fs::write(&chart_path, b"built in code").unwrap();
+    // Sixteen unpressed notes 100 ms apart: the survival gauge fails at
+    // the fifteenth miss.
+    let notes = (0..16).fold(ChartBuilder::new(150_000), |b, i| {
+        b.tap(lane(1), TimeUs((1_000 + i * 100) * MS))
+    });
+    let parts = Parts {
+        ingest: Box::new(Built(notes.build().unwrap())),
+        policy: Box::new(Strict),
+        ..Parts::standard(&root, &settings.player)
+    };
+    let config = SessionConfig {
+        lead_in: TimeUs(1_000 * MS),
+        step: TimeUs(MS),
+        start: TimeUs(0),
+        effects: 4_096,
+        seed: 11,
+        speed: bms_model::Speed::NORMAL,
+        app_version: "0.0.0-test".to_owned(),
+        provenance: BuildProvenance::Development,
+        receive: ReceiveMethod::Scripted,
+        autoplay: None,
+    };
+    let mut loaded = Loaded::load(root, settings, &chart_path, config, parts).unwrap();
+    let mut rig = Fake::new(Vec::new(), &[], 15_000_000);
+    game::live::run_chart(&mut loaded, &mut rig).unwrap();
+    assert_eq!(
+        rig.reports[0].end,
+        PlayEnd::Aborted(AbortCause::GaugeFailed)
+    );
+    assert_eq!(rig.phases[0].last().map(|&(_, p)| p), Some(true));
+    assert_eq!(rig.closed_phases, [false]);
 }

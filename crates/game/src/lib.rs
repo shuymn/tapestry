@@ -15,6 +15,7 @@
 #![forbid(unsafe_code)]
 
 pub mod app;
+mod attempt;
 mod audio_loop;
 mod autoplay;
 mod bests;
@@ -41,6 +42,7 @@ mod sound;
 mod tuning;
 
 pub use app::{App, AppRig, IDLE_WAIT, LoadRefusal, Loading, Pick, Refused};
+pub use attempt::{Attempt, AttemptKind, NoteEnd, Preparation, PreparationRefusal};
 pub use audio_loop::{
     AudioControl, AudioCounters, AudioCtl, AudioLoadError, AudioProbe, AudioWaitError, AudioWorker,
     Probed, SWITCH_TIMEOUT, audio_control,
@@ -62,15 +64,16 @@ pub use policy::{
     SessionPolicy,
 };
 pub use practice::{
-    FADE, LEAD_IN, Practice, PracticeError, RESTORE_AHEAD, RESTORE_RETRY, RING_OUT, chart_end,
-    mid_chart_start,
+    FADE, LEAD_IN, Practice, PracticeError, RESTORE_AHEAD, RESTORE_RETRY, RING_OUT, Reset, Unfit,
+    chart_end, mid_chart_start, reset_notice,
 };
 pub use practice_screen::{
     LEAD_IN_STEP, MAX_LEAD_IN, MIN_LEAD_IN, PracticeActed, PracticeInput, PracticeRow,
     PracticeScreen, measures,
 };
 pub use prepare::{
-    BmsIngest, ChartIngest, ChartTransform, IngestError, Ingested, Passthrough, TransformId,
+    BmsIngest, ChartIngest, ChartLabels, ChartTransform, IngestError, Ingested, Passthrough,
+    TransformId,
 };
 pub use presets::{
     Entry, POLL_INTERVAL, PollDeadline, PresetChange, PresetStep, Shelf, ShelfError, UnknownPreset,

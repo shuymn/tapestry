@@ -16,11 +16,13 @@ use audio::OutputError;
 use bms_model::{TimeSource, TimeUs};
 use eval::JudgeEvent;
 use game::{
-    Advance, AudioQueue, AudioWaitError, Chain, Closing, Command, InputWaitError, MenuCommand,
-    Opening, PlayReport, RenderSide, RestoreError, Restored, ResultScreen, Rig, Settings, Tuning,
+    Advance, AudioQueue, AudioWaitError, Chain, Closing, Command, InputWaitError, Loaded,
+    MenuCommand, Opening, PlayReport, Preparation, RenderSide, RestoreError, Restored,
+    ResultScreen, Rig, Settings, Tuning,
 };
 use input::{QpcClock, SourceReader};
 
+use crate::attempt_context::{AttemptContext, SIMPLE_SCRATCH};
 use crate::audio_side::AudioLink;
 use crate::controls::Controls;
 use crate::end_screen::{self, Hints, LoadTimes, QueueLine};
@@ -481,6 +483,23 @@ impl Rig for PlayerRig<'_> {
         prepare_render(&mut self.end_page, &self.render)
     }
 
+    /// The render thread prepares the attempt from its owned context; a
+    /// quit key, a close, or a failure of the input or audio thread while
+    /// it does stops the wait ([`preparation_stops`]), and the game looks
+    /// at the threads for a failure's cause.
+    fn prepare_attempt(&mut self, loaded: &Loaded) -> Result<Preparation, ScreenError> {
+        let attempt = AttemptContext::new(loaded.attempt(), SIMPLE_SCRATCH);
+        let rig = &*self;
+        rig.render.prepare_attempt(attempt, || {
+            preparation_stops(
+                rig.quitting(),
+                rig.controls.leaving(),
+                rig.input_failure(),
+                rig.audio_failure(),
+            )
+        })
+    }
+
     fn open(&mut self, lead_in: TimeUs) -> Result<Opening<SourceReader>, InputWaitError> {
         // The window gains its focus when shown: an opening before it
         // would latch the play's focus loss at once.
@@ -728,6 +747,18 @@ impl Rig for PlayerRig<'_> {
             self.end_shown = Some(std::time::Instant::now());
         }
     }
+}
+
+/// Whether a waiting attempt's preparation stops early: the player quit or
+/// left, or the input or audio thread failed, which ends the run with its
+/// cause, never as the render thread's silence.
+pub(crate) const fn preparation_stops(
+    quitting: bool,
+    leaving: bool,
+    input: Option<InputWaitError>,
+    output: Option<OutputError>,
+) -> bool {
+    quitting || leaving || input.is_some() || output.is_some()
 }
 
 /// Readies the screen for a play: the end screen, if it shows, is left
