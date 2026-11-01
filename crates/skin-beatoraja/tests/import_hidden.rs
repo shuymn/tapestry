@@ -246,27 +246,27 @@ fn fit_width_hidden_plus_is_trimmed_after_its_stretch() {
     // line at 590 (490) leaves the unstretched edge below it, so the
     // source draws nothing, and the model draws the stretched one down to
     // the line.
-    let cell = |line: &str| {
-        hidden_object(r#""isDisapearLineLinkLift": false"#)
+    let cell = |link: bool, line: i32| {
+        hidden_object(&format!(r#""isDisapearLineLinkLift": {link}"#))
             .replace(
                 r#""x": 32, "y": 24, "w": 16, "h": 16"#,
                 r#""x": 0, "y": 0, "w": 43, "h": 10"#,
             )
-            .replace(r#""disapearLine": 200"#, line)
+            .replace(
+                r#""disapearLine": 200"#,
+                &format!(r#""disapearLine": {line}"#),
+            )
     };
     let small = hidden(r#""stretch": 4"#).replace(
         r#""y": -400, "w": 430, "h": 600"#,
         r#""y": 270, "w": 430, "h": 10"#,
     );
-    let whole = quads(
-        &with(&cell(r#""disapearLine": -1"#), &[&small]),
-        [0, 0, 500],
-    );
+    let whole = quads(&with(&cell(false, -1), &[&small]), [0, 0, 500]);
     let [w] = &whole[..] else {
         panic!("one HIDDEN+: {whole:?}");
     };
     assert_eq!(w.rect, [20.0, 455.0, 430.0, 100.0]);
-    let objects = format!("{}, {}", note(""), cell(r#""disapearLine": 590"#));
+    let objects = format!("{}, {}", note(""), cell(false, 590));
     let text = body("", &objects, &[NOTES, &small]);
     let l = import_body(&text);
     let cut = quads(&l, [0, 0, 500]);
@@ -290,52 +290,28 @@ fn fit_width_hidden_plus_is_trimmed_after_its_stretch() {
     let col = before.rsplit('\n').next().unwrap().len() + 1;
     let at = [line, col].map(|v| u32::try_from(v).unwrap());
     assert_eq!(found, [Some((at[0], at[1]))]);
-    // The source decides whether to draw it from the unstretched edge, so
-    // risen by the lane's 600 px it reaches 200: a line at 890 (190),
-    // fixed or linked, keeps it from ever drawing, though the stretched
-    // edge reaches 155. One at 879 (201) lets it draw above the lanes.
-    for link in ["false", "true"] {
-        for (line, outside) in [(890, false), (879, true)] {
-            let obj = hidden_object(&format!(r#""isDisapearLineLinkLift": {link}"#))
-                .replace(
-                    r#""x": 32, "y": 24, "w": 16, "h": 16"#,
-                    r#""x": 0, "y": 0, "w": 43, "h": 10"#,
-                )
-                .replace(
-                    r#""disapearLine": 200"#,
-                    &format!(r#""disapearLine": {line}"#),
-                );
-            let r = with(&obj, &[&small]);
-            let case = format!("{link} {line}");
-            assert!(has(r.report(), d9(LaneApprox::HiddenStretch)), "{case}");
-            assert_eq!(
-                has(r.report(), d9(LaneApprox::HiddenClip)),
-                outside,
-                "{case}"
-            );
-        }
-    }
-    // A destination without height at 800 rises at most to 200 and must
-    // pass strictly above the line: one at 880 (200) or 881 (199) keeps it
-    // from drawing, fixed or linked, and one at 879 (201) lets the
-    // stretched one, [750, 850] at rest, draw above the lanes.
+    // The source decides whether to draw it from the unstretched edge,
+    // which must pass strictly above the line. Risen by the lane's 600 px,
+    // the 10 px destination reaches 200: a line at 890 (190), fixed or
+    // linked, keeps it from ever drawing, though the stretched edge
+    // reaches 155. A destination without height at 800 also reaches 200:
+    // a line at 880 (200) or 881 (199) keeps it from drawing. A line at
+    // 879 (201) lets either draw above the lanes, the flat one's stretched
+    // [750, 850] at rest.
     let flat = hidden(r#""stretch": 4"#).replace(
         r#""y": -400, "w": 430, "h": 600"#,
         r#""y": 280, "w": 430, "h": 0"#,
     );
-    for link in ["false", "true"] {
-        for (line, outside) in [(880, false), (881, false), (879, true)] {
-            let obj = hidden_object(&format!(r#""isDisapearLineLinkLift": {link}"#))
-                .replace(
-                    r#""x": 32, "y": 24, "w": 16, "h": 16"#,
-                    r#""x": 0, "y": 0, "w": 43, "h": 10"#,
-                )
-                .replace(
-                    r#""disapearLine": 200"#,
-                    &format!(r#""disapearLine": {line}"#),
-                );
-            let r = with(&obj, &[&flat]);
-            let case = format!("{link} {line}");
+    for link in [false, true] {
+        for (h, dst, line, outside) in [
+            (10, &small, 890, false),
+            (10, &small, 879, true),
+            (0, &flat, 880, false),
+            (0, &flat, 881, false),
+            (0, &flat, 879, true),
+        ] {
+            let r = with(&cell(link, line), &[dst]);
+            let case = format!("h {h}, line {line}, linked {link}");
             assert!(has(r.report(), d9(LaneApprox::HiddenStretch)), "{case}");
             assert_eq!(
                 has(r.report(), d9(LaneApprox::HiddenClip)),
