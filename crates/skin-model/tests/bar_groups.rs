@@ -280,6 +280,12 @@ fn a_tall_displaced_turned_or_native_bar_draws_whole() {
     let mut h = harness(with_groups(simple(), vec![native]), &chart);
     h.frame(1_000, &[]);
     assert_eq!(rects(&h, BAR), [[403.0, 730.0, 4.0, 300.0]]);
+    // A native frame gives an empty rect its area, as an image's.
+    let mut empty = group(BAR, [100, 500, 0, 0], Follow::None);
+    empty.place.native = Some(Native::Exact([4, 300]));
+    let mut h = harness(with_groups(simple(), vec![empty]), &chart);
+    h.frame(1_000, &[]);
+    assert_eq!(rects(&h, BAR), [[98.0, 350.0, 4.0, 300.0]]);
 }
 
 #[test]

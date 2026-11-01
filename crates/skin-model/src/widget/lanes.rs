@@ -867,15 +867,12 @@ impl Lanes {
 
     /// Group `g`'s template this frame, on the frame's clock: none while
     /// its timer is off, it is hidden, its track does not draw, its image
-    /// shows no frame or its rect has no area.
+    /// shows no frame or its quad, natively sized, has no area.
     fn template(&self, d: &Draw<'_>, g: &BarGroup) -> Option<Template> {
         let (_, s) = sample(d.play, d.now, d.state, g.slot, g.visible.as_ref(), &g.track)?;
         let frame = g.image.frame(d.play, d.now, d.uvs)?;
         let [x, y, w, h] = s.rect;
-        if w == 0.0 || h == 0.0 {
-            return None;
-        }
-        Some(Template {
+        let t = Template {
             brush: Brush {
                 key: RunKey {
                     blend: g.blend,
@@ -895,7 +892,9 @@ impl Lanes {
             base: f64::from(y) + g.follow.dy(Some(d.frame)),
             frame,
             filter: g.image.filter,
-        })
+        };
+        let [.., qw, qh] = t.quad(0.0).rect;
+        (qw != 0.0 && qh != 0.0).then_some(t)
     }
 
     /// The frame's geometry for `view`, each amount at most 1 000 ‰: the

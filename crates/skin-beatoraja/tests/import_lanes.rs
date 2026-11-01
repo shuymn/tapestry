@@ -686,6 +686,18 @@ fn a_group_without_keys_refuses() {
 }
 
 #[test]
+fn a_native_group_of_an_empty_destination_draws_its_frame() {
+    // Stretch 9 keeps the 8×2 frame, centred on the empty rect at
+    // (100, 880).
+    let l = grouped(&group(
+        "bar",
+        r#""x": 100, "y": 200, "w": 0, "h": 0"#,
+        r#""stretch": 9"#,
+    ));
+    assert_eq!(rects_over(&l, &barred(&[1_000]), 1_000), [[96, 879, 8, 2]]);
+}
+
+#[test]
 fn a_group_clip_is_ignored() {
     let clipped = group(
         "bar",
