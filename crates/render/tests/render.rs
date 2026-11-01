@@ -370,7 +370,7 @@ fn alpha_pushed_after_additive_is_drawn_over_it() {
             solid([100.0, 100.0, 400.0, 200.0], [0.2, 0.2, 0.2, 1.0]),
         );
         b.push(
-            Blend::Additive,
+            Blend::Add,
             solid([100.0, 100.0, 400.0, 200.0], [1.0, 0.0, 0.0, 0.6]),
         );
         b.push(

@@ -35,13 +35,14 @@ fn bench_build(c: &mut Criterion) {
     let now = TimeUs(10_000 * MS);
     let f = input(&v, now, TimeUs(8 * MS), &[]);
     batch.clear();
-    skin.build(&f, &mut batch);
+    skin.build(&f, &mut batch).expect("the simple skin builds");
     assert!(batch.len() > 500, "a dense frame");
     assert_eq!(batch.dropped(), 0, "the batch has room");
     c.bench_function("simple_skin_build_dense_frame", |b| {
         b.iter(|| {
             batch.clear();
-            skin.build(black_box(&f), &mut batch);
+            skin.build(black_box(&f), &mut batch)
+                .expect("the simple skin builds");
             black_box(batch.len())
         });
     });

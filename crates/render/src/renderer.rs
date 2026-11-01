@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use bms_model::Chart;
 use eval::Section;
-use skin_model::AtlasLimits;
+use skin_model::{AtlasLimits, BuildError};
 use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
 use windows::Win32::Graphics::Dxgi::{DXGI_FRAME_STATISTICS, IDXGISwapChain3};
 use windows::Win32::System::Threading::WaitForSingleObject;
@@ -24,7 +24,9 @@ use crate::simple::{result_screen, text_screen};
 use crate::skin_atlas::{self, AtlasPages, AtlasTexture, UploadError};
 use crate::staging::{Scissor, Staging};
 use crate::text::MenuText;
-use crate::{Blend, FrameInput, Instance, PlaySkin, SimpleSkin, SkinError, SpriteBatch};
+use crate::{
+    Blend, FrameInput, Instance, OVERLAY_SPRITES, PlaySkin, SimpleSkin, SkinError, SpriteBatch,
+};
 
 /// The next [`Renderer`]'s id.
 static RENDERERS: AtomicU64 = AtomicU64::new(0);
@@ -146,6 +148,11 @@ pub enum RenderError {
     /// The skin cannot draw the chart.
     #[error("skin")]
     Skin(#[source] SkinError),
+    /// The skin refused a frame ([`Renderer::frame`] only; the player
+    /// builds with [`Renderer::build`], whose refusal is typed): the
+    /// attempt is over, and the renderer stays usable.
+    #[error("skin build")]
+    Build(#[source] BuildError),
     /// A skin's atlas was not uploaded; the atlas in use stays.
     #[error("atlas")]
     Atlas(#[source] UploadError),
@@ -299,6 +306,10 @@ pub struct Renderer {
     /// When the built frame's work began, until [`submit`](Self::submit)
     /// takes it.
     started: Option<Instant>,
+    /// The skin's refusal of a frame of this attempt: no frame of it is
+    /// built again, and nothing submitted, until the next
+    /// [`load`](Self::load) prepares a fresh one.
+    refused: Option<BuildError>,
     /// An offscreen target's frame left pending on the GPU: at most one,
     /// as a swap chain's frame latency bounds a window's.
     pacer: Pacer<wgpu::SubmissionIndex>,
@@ -369,9 +380,11 @@ impl Renderer {
         let atlas = AtlasTexture::builtin(&gpu);
         let atlas_bind = bindings.bind(device, &atlas);
         let skin: Box<dyn PlaySkin> = Box::new(SimpleSkin::new());
-        let capacity = skin.capacity().max(MAX_SPRITES as u32);
-        let instances = instance_buffer(device, capacity);
+        // The simple skin's runs are as many as its sprites, the staging's
+        // default.
+        let (capacity, _) = sizes(skin.as_ref());
         let staging = Staging::new(capacity, &skin.canvas([size.0, size.1]));
+        let instances = instance_buffer(device, staging.instance_capacity());
         finish_uploads(&gpu)?;
         Ok(Self {
             gpu,
@@ -388,6 +401,7 @@ impl Renderer {
             staging,
             skin,
             started: None,
+            refused: None,
             pacer: Pacer::default(),
             clear: wgpu::Color::BLACK,
             #[cfg(test)]
@@ -462,30 +476,43 @@ impl Renderer {
     }
 
     /// Replaces the play skin, sizing the batch, the staging and the
-    /// instance buffer for its [`capacity`](PlaySkin::capacity) (at least
-    /// [`MAX_SPRITES`]) and projecting its canvas. Before play: it
-    /// allocates. The skin is prepared with [`load`](Self::load).
+    /// instance buffer for its [`capacity`](PlaySkin::capacity) and
+    /// [`run_capacity`](PlaySkin::run_capacity) (each at least
+    /// [`MAX_SPRITES`]) with the measurement overlay's reserve after them,
+    /// and projecting its canvas. Before play: it allocates. The skin is
+    /// prepared with [`load`](Self::load).
     ///
     /// # Errors
     ///
-    /// [`RenderError::Capacity`] when its sprites do not fit the device's
-    /// largest buffer; the skin in use stays.
+    /// [`RenderError::Capacity`] when its sprites and the overlay's do not
+    /// fit the device's largest buffer; the skin in use stays.
     pub fn set_skin(&mut self, skin: Box<dyn PlaySkin>) -> Result<(), RenderError> {
-        let capacity = skin.capacity().max(MAX_SPRITES as u32);
-        if usize::try_from(capacity).ok() != Some(self.staging.capacity()) {
+        let (capacity, runs) = sizes(skin.as_ref());
+        let held = (usize::try_from(capacity).ok(), usize::try_from(runs).ok());
+        if held
+            != (
+                Some(self.staging.capacity()),
+                Some(self.staging.run_capacity()),
+            )
+        {
             let device = self.gpu.device();
             let max = device.limits().max_buffer_size;
-            let bytes = u64::from(capacity) * size_of::<Instance>() as u64;
-            if bytes > max {
+            let instances = capacity.saturating_add(OVERLAY_SPRITES);
+            let instances = usize::try_from(instances).unwrap_or(usize::MAX);
+            if instance_bytes(instances) > max {
                 return Err(RenderError::Capacity {
                     sprites: capacity,
                     max,
                 });
             }
-            self.instances = instance_buffer(device, capacity);
-            self.staging.set_capacity(capacity);
+            let staged = self.staging.instance_capacity();
+            self.staging.set_capacity(capacity, runs);
+            if self.staging.instance_capacity() != staged {
+                self.instances = instance_buffer(device, self.staging.instance_capacity());
+            }
         }
         self.skin = skin;
+        self.refused = None;
         self.project();
         Ok(())
     }
@@ -565,7 +592,8 @@ impl Renderer {
 
     /// Prepares the skin for `chart` and resets its play state, before the
     /// countdown and at each retry; with a practice round's `section`, only
-    /// its targets are drawn.
+    /// its targets are drawn. Once prepared, the skin's frames are built
+    /// again after a refused one ([`build`](Self::build)).
     ///
     /// # Errors
     ///
@@ -574,6 +602,7 @@ impl Renderer {
         self.skin
             .prepare(&self.gpu, chart, section)
             .map_err(RenderError::Skin)?;
+        self.refused = None;
         self.project();
         finish_uploads(&self.gpu)
     }
@@ -610,29 +639,57 @@ impl Renderer {
     ///
     /// # Errors
     ///
-    /// As [`submit`](Self::submit).
+    /// [`RenderError::Build`] when the skin refuses the frame, which is
+    /// then not submitted; otherwise as [`submit`](Self::submit).
     pub fn frame(&mut self, f: &FrameInput<'_>) -> Result<FrameTiming, RenderError> {
-        self.build(f);
+        self.build(f).map_err(RenderError::Build)?;
         self.submit()
     }
 
     /// The app's share of a frame ([`Staging::build`]): the skin builds
-    /// `f` and the batch is staged, with no call into wgpu. The frame's CPU
-    /// time starts here; [`submit`](Self::submit) must follow. The skin
-    /// sees [`target`](Self::target) as `f.target`, the size the frame is
-    /// projected onto, whatever the caller put there.
-    pub fn build(&mut self, f: &FrameInput<'_>) {
-        self.started = Some(Instant::now());
+    /// `f`, the overlay follows, and the batch is staged, with no call into
+    /// wgpu. The frame's CPU time starts here; [`submit`](Self::submit)
+    /// follows. The skin sees [`target`](Self::target) as `f.target`, the
+    /// size the frame is projected onto, whatever the caller put there.
+    ///
+    /// # Errors
+    ///
+    /// The skin's refusal of this frame, or of an earlier frame since the
+    /// last [`load`](Self::load): the skin is not called again for that
+    /// attempt, nothing is staged, and the next [`submit`](Self::submit)
+    /// submits nothing. The atlas, the clips and the device stay as they
+    /// are, for the next attempt's [`load`](Self::load). Nothing allocates,
+    /// the error included.
+    pub fn build(&mut self, f: &FrameInput<'_>) -> Result<(), BuildError> {
+        self.started = None;
+        if let Some(e) = self.refused {
+            return Err(e);
+        }
+        let start = Instant::now();
         let f = FrameInput {
             target: self.target(),
             ..*f
         };
-        self.staging.build(self.skin.as_mut(), &f);
+        if let Err(e) = self.staging.build(self.skin.as_mut(), &f) {
+            self.refused = Some(e);
+            return Err(e);
+        }
+        self.started = Some(start);
+        Ok(())
     }
 
-    /// Submits and presents the frame [`build`](Self::build) staged.
-    /// Submitting without a build first is a logic error (a debug build
-    /// asserts it); the staged batch is drawn again, timed from here.
+    /// Whether the skin refused a frame of the attempt prepared last: no
+    /// frame of it is built or submitted until the next
+    /// [`load`](Self::load).
+    #[must_use]
+    pub const fn refused(&self) -> Option<BuildError> {
+        self.refused
+    }
+
+    /// Submits and presents the frame [`build`](Self::build) staged, once.
+    /// Without a frame built since the last submit, a refused one
+    /// included, nothing is acquired or submitted, and the frame is not
+    /// presented (`presented` is `false`, no sprite drawn).
     ///
     /// A frame whose swap chain image times out or is occluded is skipped
     /// (`presented` is `false`); an outdated swap chain is configured again
@@ -643,8 +700,15 @@ impl Renderer {
     /// Returns [`RenderError::SurfaceLost`] when the surface is lost or
     /// fails validation: the renderer must be built again.
     pub fn submit(&mut self) -> Result<FrameTiming, RenderError> {
-        debug_assert!(self.started.is_some(), "submit without a build");
-        let start = self.started.take().unwrap_or_else(Instant::now);
+        let Some(start) = self.started.take() else {
+            return Ok(FrameTiming {
+                cpu: Duration::ZERO,
+                sprites: 0,
+                dropped: 0,
+                presented: false,
+                present_count: None,
+            });
+        };
         let projection = self.staging.projection();
         self.draw(start, None, projection)
     }
@@ -733,6 +797,9 @@ impl Renderer {
         text: Option<&MenuText>,
         projection: Projection,
     ) -> Result<FrameTiming, RenderError> {
+        // Whatever is drawn now, a play frame built before it is not
+        // submitted again.
+        self.started = None;
         let sprites = self.staging.instances().len();
         let staged = u32::try_from(sprites).unwrap_or(u32::MAX);
         let timing = |cpu, presented| FrameTiming {
@@ -846,7 +913,7 @@ impl Renderer {
                 if run.start >= end {
                     break;
                 }
-                let rect = match self.staging.scissor(run.clip) {
+                let rect = match self.staging.scissor(run.key.clip) {
                     Scissor::Full => full,
                     Scissor::Rect(rect) => rect,
                     Scissor::Empty => continue,
@@ -856,9 +923,9 @@ impl Renderer {
                     pass.set_scissor_rect(x, y, w, h);
                     scissor = rect;
                 }
-                pass.set_pipeline(match run.blend {
+                pass.set_pipeline(match run.key.blend {
                     Blend::Alpha => &self.alpha,
-                    Blend::Additive => &self.additive,
+                    Blend::Add => &self.additive,
                 });
                 pass.draw(0..4, run.start..end);
             }
@@ -1062,11 +1129,26 @@ fn offscreen(
     (texture, view)
 }
 
-/// The instance buffer of `capacity` sprites.
-fn instance_buffer(device: &wgpu::Device, capacity: u32) -> wgpu::Buffer {
+/// The sprites and runs the batch holds for `skin`, the overlay's reserve
+/// left out: the skin's own, and never fewer than the built-in screens'
+/// [`MAX_SPRITES`], which share the batch.
+fn sizes(skin: &dyn PlaySkin) -> (u32, u32) {
+    let least = MAX_SPRITES as u32;
+    (skin.capacity().max(least), skin.run_capacity().max(least))
+}
+
+/// The bytes of `instances` instances.
+fn instance_bytes(instances: usize) -> u64 {
+    u64::try_from(instances)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(size_of::<Instance>() as u64)
+}
+
+/// The instance buffer of `instances` sprites.
+fn instance_buffer(device: &wgpu::Device, instances: usize) -> wgpu::Buffer {
     device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("sprites"),
-        size: u64::from(capacity) * size_of::<Instance>() as u64,
+        size: instance_bytes(instances),
         usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     })
@@ -1345,7 +1427,7 @@ mod tests {
                 |b| {
                     b.push(Blend::Alpha, solid([0.0, 0.0, 400.0, 400.0], 0.5));
                     b.push(Blend::Alpha, solid([0.0, 0.0, 200.0, 400.0], 0.25));
-                    b.push(Blend::Additive, solid([200.0, 0.0, 200.0, 400.0], 0.25));
+                    b.push(Blend::Add, solid([200.0, 0.0, 200.0, 400.0], 0.25));
                 },
                 &text,
             )

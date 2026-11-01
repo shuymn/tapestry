@@ -1,13 +1,17 @@
 //! A frame's app work allocates nothing, from the first frame on (design.md
 //! "Scope of No Allocation"): [`Staging::build`], the skin's build into the
 //! preallocated batch, with effects, and the staging of the batch into
-//! instances. `Renderer::build` runs the same function before
+//! instances, the measurement overlay at its fullest after the skin's
+//! sprites. `Renderer::build` runs the same function before
 //! `Renderer::submit` calls into wgpu, whose own allocations are out of
-//! scope, so the test drives it without a GPU. A resize applied between
-//! frames projects the canvas and the clips again without allocating, and
-//! so do the first frame after it and the later ones. A batch that fills up
-//! counts what it refuses without allocating, and the result screen's page,
-//! drawn every frame while it shows, allocates nothing either.
+//! scope, so the test drives it without a GPU. A skin's refused frame
+//! allocates nothing, and counting ends on its way out before its
+//! diagnostic is made. A resize applied between frames projects the
+//! canvas and the clips again without allocating, and so do the first
+//! frame after it and the later ones. A batch that fills up counts what it
+//! refuses without allocating, the overlay still drawn whole, and the
+//! result screen's page, drawn every frame while it shows, allocates
+//! nothing either.
 //!
 //! The counting allocator counts only on the thread that opted in, so the
 //! harness's own threads do not disturb it. This file holds a single test
@@ -24,10 +28,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use bms_model::{Chart, ChartBuilder, TimeUs};
 use common::{MS, input, lane, view};
-use eval::{JudgeEvent, JudgeEventKind};
-use render::{ClipTable, MAX_SPRITES, PlaySkin, Scissor, SimpleSkin, Staging};
+use eval::{JudgeEvent, JudgeEventKind, Section};
+use render::{
+    Blend, ClipTable, FrameInput, Gpu, MAX_SPRITES, PlaySkin, Scissor, SimpleSkin, SkinError,
+    Sprite, SpriteBatch, Staging,
+};
 use rules::Judgment;
-use skin_model::ClipId;
+use skin_model::{BuildError, ClipId};
 
 struct Counting;
 
@@ -229,6 +236,39 @@ impl Feed<'_> {
     }
 }
 
+/// The measurement overlay at its fullest: 13 lines of 56 glyphs, none a
+/// space, and the glyphs they draw.
+fn overlay_lines() -> (Vec<String>, usize) {
+    let lines: Vec<String> = (0..13).map(|i| format!("{i:0>56}")).collect();
+    (lines, 13 * 56)
+}
+
+/// The overlay's glyphs at the end of the staged batch: 15×21 sprites
+/// right of x 1000.
+fn overlay_drawn(staging: &Staging) -> usize {
+    staging
+        .batch()
+        .sprites()
+        .iter()
+        .rev()
+        .take_while(|s| s.rect[0] >= 1000.0 && s.rect[2] == 15.0 && s.rect[3] == 21.0)
+        .count()
+}
+
+/// A skin that pushes a sprite, then refuses the frame.
+struct Refusing;
+
+impl PlaySkin for Refusing {
+    fn prepare(&mut self, _: &Gpu, _: &Chart, _: Option<&Section>) -> Result<(), SkinError> {
+        Ok(())
+    }
+
+    fn build(&mut self, _: &FrameInput<'_>, out: &mut SpriteBatch) -> Result<(), BuildError> {
+        out.push(Blend::Alpha, Sprite::default());
+        Err(BuildError::InvalidReadouts)
+    }
+}
+
 #[test]
 fn frames_do_not_allocate_from_the_first() {
     let (chart, taps) = chart();
@@ -249,29 +289,54 @@ fn frames_do_not_allocate_from_the_first() {
         held: 0,
         ended: 0,
     };
+    let (lines, glyphs) = overlay_lines();
+    let overlay: Vec<&str> = lines.iter().map(String::as_str).collect();
     // What `Renderer::build` does, before `submit` calls into wgpu, for
-    // frame `k`: the instances it staged.
+    // frame `k`: the instances it staged, the overlay's included.
     let mut frame = |staging: &mut Staging, skin: &mut SimpleSkin, k: i64| {
         let now = TimeUs(k * FRAME_US);
         feed.fill(now, &mut effects);
-        let f = input(&v, now, TimeUs(8 * MS), &effects);
-        staging.build(skin, &f);
-        staging.instances().len()
+        let f = FrameInput {
+            overlay: &overlay,
+            ..input(&v, now, TimeUs(8 * MS), &effects)
+        };
+        staging.build(skin, &f).map(|()| staging.instances().len())
     };
 
     // The first frame, with the batch and the staging fresh from their
     // reservation.
     let (first, first_allocs) = counted(|| frame(&mut staging, &mut skin, 0));
-    assert!(first > 0);
+    assert!(first.unwrap() > glyphs);
     assert_eq!(first_allocs, 0, "the first frame allocated");
     // Every later frame.
     let (drawn, later_allocs) = counted(|| {
         (1..FRAMES)
             .map(|k| frame(&mut staging, &mut skin, k))
-            .sum::<usize>()
+            .sum::<Result<usize, BuildError>>()
     });
-    assert!(drawn > 0);
+    assert!(drawn.unwrap() > 0);
     assert_eq!(later_allocs, 0, "a later frame allocated");
+    assert_eq!(overlay_drawn(&staging), glyphs, "the overlay was cut");
+
+    // A skin refusing a frame after pushing a sprite: the refusal leaves
+    // nothing staged and allocates nothing. Counting ended on the error's
+    // way out, before anything formats it: the diagnostic made after it
+    // is not counted.
+    let mut refusing = Refusing;
+    let f = FrameInput {
+        overlay: &overlay,
+        ..input(&v, TimeUs(0), TimeUs(8 * MS), &[])
+    };
+    let (refused, error_allocs) = counted(|| staging.build(&mut refusing, &f));
+    let reason = refused.unwrap_err().to_string();
+    assert_eq!(
+        ALLOCS.load(Ordering::Relaxed),
+        0,
+        "counting went on past the refusal"
+    );
+    assert!(!reason.is_empty());
+    assert_eq!(error_allocs, 0, "a refused frame allocated");
+    assert!(staging.instances().is_empty());
 
     // A resize to 21:9 applied between frames, as `Renderer::resize`
     // applies it: the canvas and the clip projected again, then the first
@@ -280,7 +345,7 @@ fn frames_do_not_allocate_from_the_first() {
         staging.project(&skin.canvas([2560, 1080]));
         frame(&mut staging, &mut skin, FRAMES)
     });
-    assert!(resized > 0);
+    assert!(resized.unwrap() > glyphs);
     assert_eq!(
         resize_allocs, 0,
         "the resize or the frame after it allocated"
@@ -295,9 +360,9 @@ fn frames_do_not_allocate_from_the_first() {
     let (drawn, after_allocs) = counted(|| {
         (FRAMES + 1..FRAMES + 60)
             .map(|k| frame(&mut staging, &mut skin, k))
-            .sum::<usize>()
+            .sum::<Result<usize, BuildError>>()
     });
-    assert!(drawn > 0);
+    assert!(drawn.unwrap() > 0);
     assert_eq!(after_allocs, 0, "a later frame after the resize allocated");
     assert_eq!(feed.next, taps.len(), "every tap judged");
     assert_eq!(
@@ -307,17 +372,19 @@ fn frames_do_not_allocate_from_the_first() {
     );
 
     // A batch and staging too small for a frame of the chart loaded again,
-    // its notes not yet judged: the batch counts what it refuses, and
-    // nothing allocates.
+    // its notes not yet judged: the batch counts what it refuses, the
+    // overlay follows whole from its reserve, and nothing allocates.
     skin.load(&chart, None);
     let mut small = Staging::new(32, &skin.canvas([1920, 1080]));
-    let f = input(&v, TimeUs(3_000 * MS), TimeUs(8 * MS), &[]);
-    let (dropped, full_allocs) = counted(|| {
-        small.build(&mut skin, &f);
-        small.batch().dropped()
-    });
-    assert!(dropped > 0, "the full batch counted no refusal");
-    assert_eq!(small.instances().len(), 32);
+    let f = FrameInput {
+        overlay: &overlay,
+        ..input(&v, TimeUs(3_000 * MS), TimeUs(8 * MS), &[])
+    };
+    let (dropped, full_allocs) =
+        counted(|| small.build(&mut skin, &f).map(|()| small.batch().dropped()));
+    assert!(dropped.unwrap() > 0, "the full batch counted no refusal");
+    assert_eq!(small.instances().len(), 32 + glyphs);
+    assert_eq!(overlay_drawn(&small), glyphs, "the overlay was cut");
     assert_eq!(full_allocs, 0, "a full batch allocated");
 
     // The result screen's page, its graphs at their fullest, allocates
