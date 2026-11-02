@@ -2312,6 +2312,16 @@ mod gate_tests {
         // Released: one boundary seals and reopens, allocating nothing.
         batch(&mut hook, &mut sources, 150, &[packet(1, Q, 0)]);
         link.rearms.push(rearm).unwrap();
+        // The positive control: this thread's allocations are counted.
+        #[cfg(feature = "dev-tools")]
+        {
+            let control = crate::alloc_count::this_thread();
+            drop(std::hint::black_box(vec![1_u8; 8]));
+            assert!(
+                crate::alloc_count::this_thread() > control,
+                "the allocation was not counted"
+            );
+        }
         #[cfg(feature = "dev-tools")]
         let before = crate::alloc_count::this_thread();
         batch(&mut hook, &mut sources, 160, &[]);
