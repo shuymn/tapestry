@@ -1056,7 +1056,7 @@ impl Lanes {
                 None => list.partition_point(|n| n.time < display),
             },
             range.map(|[_, to]| to),
-            |pen, l, i, n| self.source_note(pen, play, scale, s, range, l, i, n),
+            |pen, l, i, n| self.source_note(pen, play, scale, s.offset_y, range, l, i, n),
         );
     }
 
@@ -1064,14 +1064,14 @@ impl Lanes {
     /// the frame's lanes stop.
     #[expect(
         clippy::too_many_arguments,
-        reason = "the frame's scale and source geometry beside the note"
+        reason = "the frame's scale and the source's offset beside the note"
     )]
     fn source_note(
         &self,
         pen: &mut Pen<'_, '_>,
         play: &Play,
         scale: &Scale,
-        s: SourceLanes,
+        offset_y: f32,
         range: Option<[Position; 2]>,
         l: &LaneOf<'_>,
         i: usize,
@@ -1084,7 +1084,7 @@ impl Lanes {
         if !is_target(notes.section, n.time, n.end()) {
             return true;
         }
-        let (x, w, oy, nh) = (l.x, l.w, s.offset_y, l.note_h);
+        let (x, w, oy, nh) = (l.x, l.w, offset_y, l.note_h);
         match n.kind {
             // Judged or not, until its time passes.
             NoteKind::Tap | NoteKind::Mine { .. } => {

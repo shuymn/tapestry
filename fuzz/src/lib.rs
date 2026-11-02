@@ -74,10 +74,15 @@ pub fn bms_load(data: &[u8]) -> Result<Loaded, LoadError> {
                 }
             }
             assert_eq!(one.bar_ids(), at.bar_ids());
-            let ids = |c: &bms_model::Chart| -> Vec<_> {
-                c.lanes.iter().flatten().map(|n| n.anchors).collect()
-            };
-            assert_eq!(ids(&loaded.chart), ids(&mapped.chart));
+            let (one_notes, at_notes) = (&loaded.chart.lanes, &mapped.chart.lanes);
+            assert!(
+                one_notes
+                    .iter()
+                    .flatten()
+                    .map(|n| n.anchors)
+                    .eq(at_notes.iter().flatten().map(|n| n.anchors)),
+                "a mapped note moved rows"
+            );
             assert_eq!(
                 loaded.chart.identity.resolved_hash,
                 mapped.chart.identity.resolved_hash
