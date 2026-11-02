@@ -364,6 +364,35 @@ fn installations_and_attempts_keep_the_newer_request() {
     let token = r.install(&b, 7).unwrap();
     r.commit(token).unwrap();
     assert!(Arc::ptr_eq(r.installed().unwrap(), &b));
+    // A discarded staging and a refused one still bound what stages: a
+    // late older request never stages after them.
+    stage(&mut r, &a, &chart, 9).unwrap();
+    r.discard();
+    assert!(matches!(
+        r.install(&a, 8),
+        Err(RenderError::Superseded {
+            request: 8,
+            newer: 9
+        })
+    ));
+    let (refusing, text) = bundle(
+        &r,
+        dir.path(),
+        &Look {
+            text: true,
+            ..Look::left([0, 0, 255, 255])
+        },
+    );
+    text.unwrap().refuse.store(true, Ordering::SeqCst);
+    assert!(stage(&mut r, &refusing, &chart, 11).is_err());
+    assert!(matches!(
+        r.install(&a, 10),
+        Err(RenderError::Superseded {
+            request: 10,
+            newer: 11
+        })
+    ));
+    assert!(Arc::ptr_eq(r.installed().unwrap(), &b));
 }
 
 /// A replacement refused after its resources were made leaves the

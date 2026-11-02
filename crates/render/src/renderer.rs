@@ -459,6 +459,9 @@ pub struct Renderer {
     /// The request committed last ([`commit`](Self::commit)): no staging
     /// or commit of a request up to it is taken.
     committed: u64,
+    /// The newest request a staging was asked for, kept through its
+    /// discard or refusal: no staging of a request up to it is taken.
+    requested: u64,
     /// Bumped each time the atlas and the staging are replaced: a test of
     /// whether an installation reused them.
     resources: u64,
@@ -571,6 +574,7 @@ impl Renderer {
             skin,
             installed: None,
             committed: 0,
+            requested: 0,
             resources: 0,
             pending: None,
             started: None,
@@ -901,22 +905,21 @@ impl Renderer {
 
     /// [`stage`](Self::stage) with attempt `a`, or
     /// [`install`](Self::install) without one. A request not newer than
-    /// the one staged or committed is refused, the staging kept; any
-    /// other refusal drops the staging. The bundle installed keeps its
-    /// loading presentation; another gets a fresh one.
+    /// every one asked for or committed (staged, discarded or refused
+    /// included) is refused, the staging kept; any other refusal drops
+    /// the staging. The bundle installed keeps its loading presentation;
+    /// another gets a fresh one.
     fn stage_with(
         &mut self,
         bundle: &Arc<SkinBundle>,
         a: Option<&AttemptInput<'_>>,
         request: u64,
     ) -> Result<PreparedToken, RenderError> {
-        let newer = self
-            .pending
-            .as_ref()
-            .map_or(self.committed, |p| p.token.request.max(self.committed));
+        let newer = self.requested.max(self.committed);
         if request <= newer {
             return Err(RenderError::Superseded { request, newer });
         }
+        self.requested = request;
         self.pending = None;
         let installed = self
             .installed

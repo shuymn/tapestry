@@ -1345,6 +1345,7 @@ pub fn spawn(
                 committed: None,
                 loading_since: None,
                 loading_refused: None,
+                requested: 0,
                 attempt: None,
                 prepared: None,
                 #[cfg(feature = "dev-tools")]
@@ -1491,6 +1492,9 @@ struct Run {
     /// The loading lifetime whose loading frame the skin refused, and
     /// why: none of it is drawn again, and its end reports the refusal.
     loading_refused: Option<(u64, BuildError)>,
+    /// The newest request asked, an attempt's preparation or a
+    /// selection: an older one arriving late changes nothing.
+    requested: u64,
     /// The attempt's preparation not yet answered.
     attempt: Option<Preparing>,
     /// The attempt's preparation answered ready and not yet committed.
@@ -2033,6 +2037,11 @@ impl Run {
     /// `p` is asked of the screen at once and between frames until it
     /// answers ([`poll_attempt`](Self::poll_attempt)).
     fn begin_attempt(&mut self, p: Preparing) {
+        // An older request than one asked already changes nothing.
+        if !self.newest(p.request) {
+            let _ = p.reply.send(Ok(refusal("a newer request superseded it")));
+            return;
+        }
         self.attempt = None;
         self.drop_prepared();
         if let Err(e) = self.recover() {
@@ -2148,18 +2157,32 @@ impl Run {
         Ok(())
     }
 
-    /// Selects `skin` for request `request`: an attempt preparing or
-    /// prepared, older, is discarded; `skin`'s chart-independent
-    /// installation is staged and committed, unless the game thread
-    /// withdrew the request, and every later attempt prepares with it.
-    /// `None` prepares later attempts with the skin in use. A refusal or
-    /// a withdrawal keeps the installation in use and the selection
-    /// before; an error drops the screen, to be built again.
+    /// Whether `request` is newer than every request asked of the render
+    /// thread so far, an attempt's or a selection's, and then the newest.
+    fn newest(&mut self, request: u64) -> bool {
+        if request <= self.requested {
+            return false;
+        }
+        self.requested = request;
+        true
+    }
+
+    /// Selects `skin` for request `request`: a request not newer than one
+    /// asked already is refused, changing nothing; else an attempt
+    /// preparing or prepared, older, is discarded; `skin`'s
+    /// chart-independent installation is staged and committed, unless the
+    /// game thread withdrew the request, and every later attempt prepares
+    /// with it. `None` prepares later attempts with the skin in use. A
+    /// refusal or a withdrawal keeps the installation in use and the
+    /// selection before; an error drops the screen, to be built again.
     fn select(
         &mut self,
         request: u64,
         skin: Option<Arc<SkinBundle>>,
     ) -> Result<Preparation, RenderError> {
+        if !self.newest(request) {
+            return Ok(refusal("a newer request superseded it"));
+        }
         if let Some(p) = self.attempt.take() {
             let _ = p
                 .reply
@@ -5980,6 +6003,47 @@ pub(crate) mod tests {
                 "1 commit 3",
                 "1 prepare 4 Right T",
                 "1 commit 4",
+            ]
+        );
+    }
+
+    /// A request older than one the render thread was asked already
+    /// changes nothing when it arrives late: a selection behind an
+    /// attempt's preparation neither discards the preparation, which still
+    /// commits, nor installs; an attempt behind a selection is refused.
+    #[test]
+    fn a_late_older_request_changes_nothing() {
+        let chart = Arc::new(ChartBuilder::new(120_000).build().unwrap());
+        let (first, late) = (bundle(), bundle());
+        let screens = Installers::default();
+        let link = screens.spawn(&chart, &first);
+        let ready = link.prepare_attempt(titled(&chart), || false);
+        assert_eq!(ready.unwrap(), Preparation::Ready);
+        let (reply, rx) = std::sync::mpsc::sync_channel(1);
+        link.send(RenderMsg::Select {
+            request: 1,
+            skin: Some(Arc::clone(&late)),
+            reply,
+        });
+        let answer = rx.recv().unwrap().unwrap();
+        assert!(matches!(answer, Preparation::Refused(_)), "{answer:?}");
+        link.commit_attempt().unwrap();
+        let (reply, rx) = std::sync::mpsc::sync_channel(1);
+        link.send(RenderMsg::PrepareAttempt {
+            request: 2,
+            attempt: Box::new(titled(&chart)),
+            reply,
+        });
+        let answer = rx.recv().unwrap().unwrap();
+        assert!(matches!(answer, Preparation::Refused(_)), "{answer:?}");
+        link.exit();
+        assert_eq!(
+            screens.log(),
+            [
+                "1 install 1",
+                "1 commit 1",
+                "1 prepare 2 Right T",
+                "1 commit 2"
             ]
         );
     }
