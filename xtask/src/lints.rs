@@ -265,7 +265,12 @@ pub const IN_PLAY: &[Site] = &[
     Site::File("crates/game/src/audio_loop.rs"),
     Site::Fns(
         "crates/game/src/restore.rs",
-        &["Restore::apply", "Restored::code", "refusal"],
+        &[
+            "Restore::apply",
+            "Restorer::replan",
+            "Restored::code",
+            "refusal",
+        ],
     ),
     Site::File("crates/player/src/recording.rs"),
     Site::File("crates/audio/src/clock.rs"),
@@ -299,6 +304,7 @@ pub const IN_PLAY: &[Site] = &[
             "SeekPlan::budget",
             "SeekPlan::seq",
             "SeekPlan::slots",
+            "SeekPlan::replan",
         ],
     ),
     Site::File("crates/player/src/audio_side.rs"),

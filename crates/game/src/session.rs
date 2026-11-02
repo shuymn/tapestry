@@ -1768,7 +1768,8 @@ struct SessionRig<'s, O> {
     sealed: bool,
     /// What restores a round's audio, as the player's rig keeps one.
     restorer: Option<crate::Restorer>,
-    /// A round's restore, planned at its opening, applied with its start.
+    /// A round's restore, planned at its opening and again in place at
+    /// each rearm, applied with each start.
     restore: Option<Box<crate::Restore>>,
     /// The start gate, in a gated session.
     gate: Option<crate::start_gate::ScriptedGate<'s>>,
@@ -1786,7 +1787,7 @@ impl<O: AudioOutput + Wakes> SessionRig<'_, O> {
     fn restart_audio(&mut self, origin: TimeUs) {
         let engine = self.audio.engine_mut();
         engine.restart(origin);
-        if let Some(restore) = self.restore.take() {
+        if let Some(restore) = self.restore.as_deref() {
             restore.apply(engine);
         }
         if let Some(g) = &self.gate {
@@ -1973,7 +1974,6 @@ impl<O: AudioOutput + Wakes> Rig for SessionRig<'_, O> {
 
     fn cancel_candidate(&mut self, generation: u32) {
         self.cancel_audio();
-        self.restore = None;
         let now = self.play_time().unwrap_or(TimeUs(0));
         if let Some(g) = &mut self.gate {
             g.cancelled(generation, now);
@@ -2087,7 +2087,11 @@ impl<O: AudioOutput + Wakes> Rig for SessionRig<'_, O> {
         let restorer = self.restorer.as_ref().ok_or(RestoreError::NotPrepared)?;
         // On the line of the opening's origin, before the play starts there.
         let line = self.audio.engine().frame_line_at(origin);
-        self.restore = Some(restorer.plan(line, at)?);
+        // A rearmed candidate's restore is planned again in the same storage.
+        match self.restore.as_deref_mut() {
+            Some(restore) => restorer.replan(restore, line, at)?,
+            None => self.restore = Some(restorer.plan(line, at)?),
+        }
         Ok(())
     }
 

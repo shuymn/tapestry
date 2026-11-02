@@ -1001,3 +1001,69 @@ fn pre_zero_bgm_waits_for_the_commit_in_a_gated_play() {
         "{frames:?}"
     );
 }
+
+/// A practice round under the gate (design.md "Play Lifecycle", the start
+/// gate): its transport commits at the lead-in's start, where its audio is
+/// restored, not at chart time 0; a hold just before that cancels the round
+/// and a release rearms it, its restore planned again; a hold after it is
+/// an ordinary adjustment while the round stays in READY until its section
+/// starts. Through `game::live::play_and_next` on a session with practice.
+#[test]
+fn a_practice_round_commits_at_its_lead_in_start() {
+    let chart = ChartBuilder::new(150_000)
+        .sound("bgm.wav")
+        .tap(lane(1), TimeUs(10_000 * MS))
+        .tap(lane(1), TimeUs(12_000 * MS))
+        .bgm(TimeUs(0), SoundId(0))
+        .build()
+        .unwrap();
+    let round = |root: &DataRoot| {
+        let device = audio::SimDevice::new(audio::SimConfig::steady(RATE, PERIOD, TimeUs(0)));
+        let out = audio::RecordingOutput::new(device, 0);
+        let mut s = session_of(
+            root,
+            &Events::default(),
+            &chart,
+            common::sources(),
+            out,
+            true,
+        );
+        let practice = game::Practice {
+            start: TimeUs(10_000 * MS),
+            end: TimeUs(13_000 * MS),
+            lead_in: game::LEAD_IN,
+            initial_gauges: s.preset().gauges.iter().map(|g| g.start).collect(),
+            repeat: false,
+        };
+        s.set_practice(Some(practice)).unwrap();
+        s
+    };
+    // READY opens at 7.8 s of the round's chart time; the lead-in, where
+    // the transport commits, starts at 8.0 s.
+    let notes = |zero: i64| [tap(1, zero + 10_000), tap(1, zero + 12_000)].concat();
+
+    // Held after the commit, through the section's start: ordinary.
+    let (_dir, root) = temp_root();
+    let mut s = round(&root);
+    let mut items = vec![connect(0), raw(8_050, 0, Q, 1), raw(10_500, 0, Q, 0)];
+    items.extend(notes(0));
+    let report = s.play(script(items, &[])).unwrap();
+    let r = record(&report);
+    assert!(matches!(r.play_type, replay::PlayType::MidChartStart(_)));
+    assert_eq!(r.status.end, EndStatus::PlayedToEnd);
+    assert!(r.history.openings.is_empty(), "a hold after the commit");
+    assert_eq!(count_judged(&report.live, Judgment::Perfect), 2);
+
+    // Held before the commit: cancelled; released at 8.2 s, a fresh READY
+    // opens there, its lead-in starting 200 ms later, its chart 400 ms on.
+    let (_dir, root) = temp_root();
+    let mut s = round(&root);
+    let mut items = vec![connect(0), raw(7_950, 0, Q, 1), raw(8_200, 0, Q, 0)];
+    items.extend(notes(400));
+    let report = s.play(script(items, &[])).unwrap();
+    let r = record(&report);
+    assert_eq!(r.status.end, EndStatus::PlayedToEnd);
+    assert_eq!(r.history.openings.len(), 1);
+    assert_eq!(r.history.openings[0].origin, TimeUs(-400 * MS));
+    assert_eq!(count_judged(&report.live, Judgment::Perfect), 2);
+}
