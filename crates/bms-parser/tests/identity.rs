@@ -84,6 +84,31 @@ fn positions_that_quantize_together_stay_distinct() {
                 (TimeUs(0), Position(1180), Some(SoundId(0))),
             ]
         );
+        // Each keeps its own timeline row: row 0 is the bar line, rows 1
+        // and 2 the two positions, alike in time and position yet never
+        // merged.
+        let heads: Vec<_> = lane.iter().map(|n| n.anchors).collect();
+        let on = |row| NoteAnchors {
+            head: TimelineId(row),
+            end: TimelineId(row),
+        };
+        assert_eq!(heads, [on(1), on(2)]);
+        let rows: Vec<_> = loaded
+            .chart
+            .timeline
+            .points()
+            .iter()
+            .map(|p| (p.at, p.pos))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                (TimeUs(0), Position(0)),
+                (TimeUs(0), Position(1180)),
+                (TimeUs(0), Position(1180)),
+            ]
+        );
+        assert_eq!(loaded.chart.validate_presentation(), Ok(()));
         assert_eq!(kinds(&loaded), []);
     }
 }
