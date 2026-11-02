@@ -49,7 +49,8 @@ pub(crate) struct Keys {
 /// (`JSONSkinLoader.java:425-482` at `0.8.9`): the first key's omitted
 /// fields default to 0 (255 for colour), a later key's to the previous
 /// key's. Colour is clamped per key, as libGDX's `Color` constructor
-/// does (`Color.java:88` at 1.9.9).
+/// does (`Color.java:88` at 1.9.9), so an imported skin looks as its
+/// author saw it rather than being refused.
 ///
 /// With `digits`, as for a judge's combo, whose raw `x` moves left by
 /// half its raw `w` times its digits (`JsonPlaySkinObjectLoader.java:

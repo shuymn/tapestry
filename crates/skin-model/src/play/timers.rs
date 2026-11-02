@@ -242,7 +242,9 @@ impl Play {
             Some(d) => (round_duration(d)?, 1),
         };
         // Sequenced as the source: three fifths of the rounded duration
-        // (`skin/property/IntegerPropertyFactory.java:292-314`).
+        // (`skin/property/IntegerPropertyFactory.java:292-314`), so an
+        // imported skin shows the green number players compare to carry
+        // their settings over.
         let green = i32::try_from(i64::from(duration_ms) * 3 / 5).ok()?;
         let (bpm_min, bpm_max, bpm_range_valid) = self.bpm_range.map_or(Some((0, 0, 0)), |b| {
             Some((
@@ -380,9 +382,10 @@ impl Play {
         let play = (now >= self.play_at).then_some(self.play_at);
         let shown = frame.gauges.get(frame.gauge);
         let failed = shown.and_then(|g| g.failed_at);
-        // The reducer's start, masked during READY and while the
-        // snapshot is below the maximum: a dropped below-maximum effect
-        // cannot leave it on (`play/BMSPlayer.java:639`).
+        // The reducer's start, masked during READY, so skins animate the
+        // full gauge from the start of play, and while the snapshot is
+        // below the maximum: a dropped below-maximum effect cannot leave
+        // it on (`play/BMSPlayer.java:639`).
         let gauge_max = match (
             play,
             self.reducer.gauge_max.get(frame.gauge).copied().flatten(),

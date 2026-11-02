@@ -40,10 +40,13 @@ pub const MAX_FNT_VALUE: i32 = 16_384;
 /// The highest code point.
 const MAX_CODE: i32 = 0x10_FFFF;
 /// The glyphs whose height is the cap height, in order
-/// (`BitmapFont$BitmapFontData` `capChars`, gdx 1.9.9 `load`:643-658).
+/// (`BitmapFont$BitmapFontData` `capChars`, gdx 1.9.9 `load`:643-658):
+/// authors placed text against this decision, so imported text lands
+/// where its author put it.
 const CAP_CHARS: &[u8] = b"MNBDCEFKAGHIJLOPQRSTUVWXYZ";
 /// The glyphs whose raw y offset represents the font, in order
-/// (`SkinTextBitmap.java:869` at `0.8.9`).
+/// (`SkinTextBitmap.java:869` at `0.8.9`), kept for the same reason as
+/// [`CAP_CHARS`].
 const ANCHORS: [u32; 13] = [
     'S' as u32, 'P' as u32, 'A' as u32, 'N' as u32, 'O' as u32, 'T' as u32, 'H' as u32, 'E' as u32,
     'R' as u32, '[' as u32, ']' as u32, 'M' as u32, '0' as u32,

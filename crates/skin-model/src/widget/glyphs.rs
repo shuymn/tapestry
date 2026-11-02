@@ -112,6 +112,9 @@ struct Pick<'a> {
 /// The glyph for `code` by the missing-glyph chain.
 fn pick<'a>(primary: &'a Fnt, fallbacks: &[&'a Fnt], code: u32) -> Option<Pick<'a>> {
     let own = |code: u32| primary.file.glyph(code).copied();
+    // A fallback's glyph moves by the representative offsets' difference,
+    // as the source aligns it, so imported text lands where its author
+    // placed it.
     let copy = |glyph, font: &'a Fnt| Pick {
         glyph,
         font,
