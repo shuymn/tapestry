@@ -58,6 +58,7 @@ jobs:
           install: true
           install_args: rust
           cache: true
+          cache_save: ${{ github.ref == 'refs/heads/main' }}
       # Both builds use the toolchain of the head: `mise exec` runs in the
       # head's checkout and cargo is pointed at the merge base's manifest.
       # `--bench` names keep the libtest unit-test harnesses, which do not
@@ -136,6 +137,7 @@ jobs:
           install: true
           install_args: rust
           cache: true
+          cache_save: ${{ github.ref == 'refs/heads/main' }}
       - name: Benchmark the merge base
         id: base
         run: |
