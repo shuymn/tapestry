@@ -53,19 +53,30 @@ pub struct RenderSink {
     rearmed: Arc<Rearmed>,
 }
 
-/// What a READY candidate's rearm tells the render side: the effects
-/// queued before it are the cancelled candidate's, and how many rearms
-/// there were, so the screen starts its candidate's clocks and timers
-/// over.
+/// What a READY candidate's rearm tells the render side: how many rearms
+/// there were and how many effects were queued before the latest, in one
+/// word so the two are always read together, and the latest rearmed
+/// candidate's origin.
 #[derive(Debug, Default)]
 struct Rearmed {
-    /// Effects queued before the latest rearm: the side discards them.
-    skip_to: AtomicU64,
-    /// Rearms so far.
-    count: AtomicU64,
+    /// The rearms so far above [`QUEUED_BITS`], the effects queued before
+    /// the latest rearm below: those are a cancelled candidate's.
+    word: AtomicU64,
     /// The latest rearmed candidate's chart time 0 on the rig's clock,
-    /// stored before the count.
+    /// stored before the word.
     origin: AtomicI64,
+}
+
+/// The bits of [`Rearmed::word`] counting queued effects: far beyond any
+/// play's events.
+const QUEUED_BITS: u32 = 40;
+
+impl Rearmed {
+    /// The rearms so far and the effects queued before the latest.
+    fn read(&self) -> (u64, u64) {
+        let w = self.word.load(Ordering::Acquire);
+        (w >> QUEUED_BITS, w & ((1 << QUEUED_BITS) - 1))
+    }
 }
 
 impl EventSink for RenderSink {
@@ -78,9 +89,12 @@ impl EventSink for RenderSink {
     }
 
     fn rearm(&mut self, origin: TimeUs) {
-        self.rearmed.skip_to.store(self.pushed, Ordering::Release);
         self.rearmed.origin.store(origin.0, Ordering::Release);
-        self.rearmed.count.fetch_add(1, Ordering::Release);
+        let (count, _) = self.rearmed.read();
+        let queued = self.pushed & ((1 << QUEUED_BITS) - 1);
+        self.rearmed
+            .word
+            .store(((count + 1) << QUEUED_BITS) | queued, Ordering::Release);
     }
 }
 
@@ -96,16 +110,26 @@ pub struct RenderSide {
 }
 
 impl RenderSide {
-    /// Pops the next effect of the current READY candidate, discarding
-    /// those a rearm left behind.
-    fn pop(&mut self) -> Option<JudgeEvent> {
-        let skip_to = self.rearmed.skip_to.load(Ordering::Acquire);
+    /// Pops the next effect, discarding those a rearm left behind. With
+    /// `seen`, the rearms the caller's state is of, an effect of a later
+    /// candidate stays queued: a drain never hands a newer candidate's
+    /// effects to state that has not started over for it.
+    fn pop(&mut self, seen: Option<u64>) -> Option<JudgeEvent> {
         loop {
-            let ev = self.effects.pop().ok()?;
-            self.popped += 1;
-            if self.popped > skip_to {
+            if self.effects.is_empty() {
+                return None;
+            }
+            let (count, queued) = self.rearmed.read();
+            if self.popped >= queued {
+                if seen.is_some_and(|s| s != count) {
+                    return None;
+                }
+                let ev = self.effects.pop().ok()?;
+                self.popped += 1;
                 return Some(ev);
             }
+            let _ = self.effects.pop();
+            self.popped += 1;
         }
     }
 
@@ -115,16 +139,29 @@ impl RenderSide {
     /// [`drain_effects_up_to`](Self::drain_effects_up_to). A cancelled
     /// READY candidate's effects are never handed over.
     pub fn drain_effects(&mut self, mut f: impl FnMut(&JudgeEvent)) {
-        while let Some(ev) = self.pop() {
+        while let Some(ev) = self.pop(None) {
             f(&ev);
         }
     }
 
     /// Hands up to `n` queued effects to `f`, in emission order, and stops
     /// popping there: the rest stay queued, in order, for the next drain.
-    pub fn drain_effects_up_to(&mut self, n: usize, mut f: impl FnMut(&JudgeEvent)) {
+    pub fn drain_effects_up_to(&mut self, n: usize, f: impl FnMut(&JudgeEvent)) {
+        self.drain(n, None, f);
+    }
+
+    /// [`drain_effects_up_to`](Self::drain_effects_up_to) for state of the
+    /// candidate after `seen` rearms ([`rearms`](Self::rearms), read
+    /// before the state started over): a later candidate's effects stay
+    /// queued until the caller's state has started over for it, so a
+    /// rearm between the caller's look and its drain loses none of them.
+    pub fn drain_effects_of(&mut self, seen: u64, n: usize, f: impl FnMut(&JudgeEvent)) {
+        self.drain(n, Some(seen), f);
+    }
+
+    fn drain(&mut self, n: usize, seen: Option<u64>, mut f: impl FnMut(&JudgeEvent)) {
         for _ in 0..n {
-            let Some(ev) = self.pop() else {
+            let Some(ev) = self.pop(seen) else {
                 return;
             };
             f(&ev);
@@ -148,7 +185,7 @@ impl RenderSide {
     /// Lifecycle", the start gate).
     #[must_use]
     pub fn rearms(&self) -> u64 {
-        self.rearmed.count.load(Ordering::Acquire)
+        self.rearmed.read().0
     }
 
     /// Where the latest rearmed READY candidate puts its chart time 0 on
@@ -270,5 +307,59 @@ mod tests {
         side.drain_effects(|e| left.push(*e));
         assert_eq!(seqs(&left), [7, 8]);
         assert_eq!(side.dropped(), 0);
+    }
+
+    /// A rearm landing between a frame's look at the rearms and its drain
+    /// (design.md "Play Lifecycle", the start gate): the drain discards the
+    /// cancelled candidate's effects and leaves the new candidate's queued,
+    /// so the next frame, which starts its state over first, gets every one
+    /// of them; the rearm's word is read whole, never a count with another
+    /// rearm's queued effects.
+    #[test]
+    fn a_rearm_between_the_look_and_the_drain_loses_no_effect() {
+        let initial = PlayView {
+            finalized: None,
+            tally: Tally {
+                counts: PerJudgment {
+                    perfect: 0,
+                    great: 0,
+                    good: 0,
+                    bad: 0,
+                    poor: 0,
+                },
+                ex_score: 0,
+                bp: 0,
+                combo: 0,
+                max_combo: 0,
+                empty_poor: 0,
+            },
+            gauges: Vec::new(),
+            complete: false,
+            playing: false,
+            events: 0,
+        };
+        let (mut sink, _view, mut side) = render_link(8, &initial);
+        sink.receive(&effect(0));
+        sink.receive(&effect(1));
+        // The frame looks: candidate 0, whose effects it takes.
+        let seen = side.rearms();
+        assert_eq!(seen, 0);
+        let mut frame = Vec::new();
+        side.drain_effects_of(seen, 1, |e| frame.push(*e));
+        assert_eq!(seqs(&frame), [0]);
+        // Next frame: it looks, then the logic step rearms and candidate 1
+        // judges, all before the frame drains.
+        let seen = side.rearms();
+        sink.rearm(TimeUs(5_000));
+        sink.receive(&effect(10));
+        sink.receive(&effect(11));
+        frame.clear();
+        side.drain_effects_of(seen, 8, |e| frame.push(*e));
+        assert!(frame.is_empty(), "{:?}", seqs(&frame));
+        // The frame after sees the rearm, starts over, and gets them all.
+        let seen = side.rearms();
+        assert_eq!((seen, side.rearmed_origin()), (1, TimeUs(5_000)));
+        side.drain_effects_of(seen, 8, |e| frame.push(*e));
+        assert_eq!(seqs(&frame), [10, 11]);
     }
 }

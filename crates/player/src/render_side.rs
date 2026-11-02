@@ -2037,12 +2037,14 @@ impl Run {
                     #[cfg(feature = "dev-tools")]
                     let region = crate::alloc_count::AppRegion::enter();
                     effects.clear();
-                    // At most what the buffer holds: the logic step can push
-                    // during the drain, and the rest waits for the next
-                    // frame.
                     // A rearmed READY candidate is drawn from its own origin,
-                    // the skin's runtime starting over first; the drain
-                    // after it never hands over the cancelled one's effects.
+                    // the skin's runtime starting over first. The drain then
+                    // hands over only that candidate's effects: a cancelled
+                    // one's are discarded, and those of a candidate rearmed
+                    // since the look stay queued for the next frame, which
+                    // starts over for it first. At most what the buffer
+                    // holds: the logic step can push during the drain, and
+                    // the rest waits for the next frame.
                     let rearmed = side.rearms();
                     if rearmed != *rearms {
                         *rearms = rearmed;
@@ -2050,7 +2052,7 @@ impl Run {
                         screen.rearm();
                     }
                     let room = effects.capacity();
-                    side.drain_effects_up_to(room, |e| effects.push(*e));
+                    side.drain_effects_of(*rearms, room, |e| effects.push(*e));
                     let now = TimeUs(self.clock.now().0 - origin.0);
                     // Hi-speed and the display offset change anytime and move
                     // the notes only: they reach the screen here and nowhere
