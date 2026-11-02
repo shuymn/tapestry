@@ -364,8 +364,8 @@ mod tests {
             preset.implementation = crate::Implementation::Standard { version };
             preset.validate()
         };
-        assert_eq!(with(3), Ok(()));
-        for version in [0, 1, 2, 4, u32::MAX] {
+        assert_eq!(with(4), Ok(()));
+        for version in [0, 1, 2, 3, 5, u32::MAX] {
             assert_eq!(
                 with(version),
                 Err(RuleError::UnsupportedImplementation {

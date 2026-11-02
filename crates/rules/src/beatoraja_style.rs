@@ -212,7 +212,7 @@ pub fn beatoraja_style() -> RulePreset {
     RulePreset {
         id: "beatoraja-style".to_owned(),
         version: 1,
-        implementation: Implementation::Standard { version: 3 },
+        implementation: Implementation::Standard { version: 4 },
         tables: PerLaneClass {
             keys: LaneTable {
                 windows: JudgeWindows {

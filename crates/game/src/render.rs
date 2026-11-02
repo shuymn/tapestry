@@ -303,6 +303,8 @@ mod tests {
                 combo: 0,
                 max_combo: 0,
                 empty_poor: 0,
+                fast: 0,
+                slow: 0,
             },
             gauges: Vec::new(),
             notes: NoteFacts::default(),

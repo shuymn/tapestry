@@ -1490,6 +1490,7 @@ impl Loaded {
                 chart: &self.chart,
                 preset,
                 live: &live,
+                tally: &view.tally,
             })
         });
         let best = match (

@@ -74,7 +74,7 @@ pub fn tapestry() -> RulePreset {
     RulePreset {
         id: "tapestry".to_owned(),
         version: 3,
-        implementation: Implementation::Standard { version: 3 },
+        implementation: Implementation::Standard { version: 4 },
         // One table for every lane: the scratch states the keys' table.
         tables: PerLaneClass::both(LaneTable {
             windows: JudgeWindows {
@@ -194,7 +194,7 @@ mod tests {
         let expected = RulePreset {
             id: "tapestry".to_owned(),
             version: 3,
-            implementation: Implementation::Standard { version: 3 },
+            implementation: Implementation::Standard { version: 4 },
             tables: PerLaneClass {
                 keys: table,
                 scratch: table,

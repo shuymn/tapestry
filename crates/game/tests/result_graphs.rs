@@ -109,6 +109,7 @@ fn re(chart: &Chart, rec: &PlayRecord, preset: &RulePreset) -> replay::verify::R
         chart,
         preset: &rules::tapestry(),
         live: &[],
+        tally: &eval::Tally::default(),
     };
     ReEvaluate::under(&ctx, preset).unwrap()
 }
@@ -479,6 +480,7 @@ fn own_timing_matches_the_recommendation_and_emphasis_follows_the_display() {
         chart: &chart,
         preset: &preset,
         live: &[],
+        tally: &eval::Tally::default(),
     };
     let result = ReEvaluate.on_play_end(&ctx);
     let offset = result.recommended_offset.unwrap();
@@ -623,6 +625,7 @@ fn the_first_what_if_fixes_the_axis_without_an_own_evaluation() {
         chart: &chart,
         preset: &preset,
         live: &[],
+        tally: &eval::Tally::default(),
     };
     let r = ReEvaluate::under(&ctx, &late_edge("early", 110)).unwrap();
     assert!(r.evaluation.final_deadline < late_end);

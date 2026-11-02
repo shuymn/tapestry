@@ -2,7 +2,7 @@
 //! of the saved record.
 
 use bms_model::{Chart, TimeUs};
-use eval::{EvalError, Evaluation, JudgeEvent, JudgeEventKind};
+use eval::{EvalError, Evaluation, JudgeEvent, JudgeEventKind, Tally};
 use replay::PlayRecord;
 use replay::verify::ReEvaluation;
 use rules::{Implementation, Judgment, RulePreset};
@@ -18,6 +18,8 @@ pub struct ResultContext<'a> {
     pub preset: &'a RulePreset,
     /// The live judgment event stream.
     pub live: &'a [JudgeEvent],
+    /// The live totals.
+    pub tally: &'a Tally,
 }
 
 /// A suggested input offset from the play's timing (design.md "Automatic
@@ -60,8 +62,8 @@ pub enum ReEvaluationError {
 pub struct ResultSummary {
     /// The re-evaluation: totals, gauges and its event stream.
     pub evaluation: Result<Evaluation, ReEvaluationError>,
-    /// Whether the re-evaluated stream equals the live one; a mismatch is
-    /// flagged, never hidden.
+    /// Whether the re-evaluated stream and totals equal the live ones; a
+    /// mismatch is flagged, never hidden.
     pub matches_live: bool,
     /// The suggested input offset, once enough presses were judged.
     pub recommended_offset: Option<RecommendedOffset>,
@@ -131,7 +133,9 @@ impl ResultExtension for ReEvaluate {
             check_reevaluable(rec).and(Err(ReEvaluationError::PresetMismatch))
         };
         ResultSummary {
-            matches_live: evaluation.as_ref().is_ok_and(|e| e.events == ctx.live),
+            matches_live: evaluation
+                .as_ref()
+                .is_ok_and(|e| e.events == ctx.live && e.tally == *ctx.tally),
             recommended_offset: evaluation.as_ref().ok().and_then(|e| recommend(&e.events)),
             evaluation,
         }

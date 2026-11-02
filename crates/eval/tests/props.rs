@@ -85,6 +85,30 @@ fn check_stream(e: &Evaluation) -> Result<(), TestCaseError> {
     Ok(())
 }
 
+/// FAST and SLOW are the stream's judgments other than PERFECT that carry
+/// a deviation, by its sign: one per judgment, a long note's at its
+/// judgment, never a miss, an empty POOR or feedback.
+fn check_fast_slow(e: &Evaluation) -> Result<(), TestCaseError> {
+    let (mut fast, mut slow) = (0, 0);
+    for ev in &e.events {
+        if let eval::JudgeEventKind::Judged {
+            judgment,
+            deviation: Some(d),
+            ..
+        } = ev.kind
+            && judgment != rules::Judgment::Perfect
+        {
+            if d.0 < 0 {
+                fast += 1;
+            } else if d.0 > 0 {
+                slow += 1;
+            }
+        }
+    }
+    prop_assert_eq!((e.tally.fast, e.tally.slow), (fast, slow));
+    Ok(())
+}
+
 /// An evaluation's final deadline is its evaluator's, whether it completed
 /// or stopped at a finalized watermark before it.
 fn check_final_deadline(play: &Play, e: &Evaluation) -> Result<(), TestCaseError> {
@@ -116,6 +140,7 @@ fn check_live(play: &Play, delivery: &Delivery) -> Result<Live, TestCaseError> {
     let batch = eval_ok(play, &at_t)?;
     check_stream(&batch)?;
     check_final_deadline(play, &batch)?;
+    check_fast_slow(&batch)?;
     prop_assert_eq!(run.watermarks.last(), Some(&t));
     prop_assert_eq!(&run.events, &batch.events);
     prop_assert_eq!(run.tally, batch.tally);
@@ -349,6 +374,7 @@ proptest! {
         check_play(&play)?;
         let whole = eval_ok(&play, &play.input)?;
         check_long_notes(&play, &whole)?;
+        check_fast_slow(&whole)?;
     }
 
     /// A long note pressed inside its scaled BAD window and held at least

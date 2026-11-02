@@ -164,6 +164,7 @@ fn what_if_peak_stays_within_its_budget() {
                 chart: &chart,
                 preset: &played,
                 live: &[],
+                tally: &eval::Tally::default(),
             };
             let mut evaluated = None;
             let mut summary = None;
@@ -223,6 +224,7 @@ fn what_if_peak_stays_within_its_budget() {
                 chart: &chart,
                 preset: &played,
                 live: &[],
+                tally: &eval::Tally::default(),
             };
             let r = ReEvaluate::under(&ctx, &what_if).unwrap();
             let mut summary = None;
@@ -251,6 +253,7 @@ fn what_if_peak_stays_within_its_budget() {
         chart: &chart,
         preset: &played,
         live: &[],
+        tally: &eval::Tally::default(),
     };
     let mut evaluated = None;
     let peak =

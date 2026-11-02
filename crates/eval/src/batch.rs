@@ -64,7 +64,7 @@ pub struct GaugeResult {
 pub struct Evaluation {
     /// Every event, as live play emits them.
     pub events: Vec<JudgeEvent>,
-    /// Counts, EX score, BP, combo and empty POORs.
+    /// Counts, EX score, BP, combo, empty POORs, FAST and SLOW.
     pub tally: Tally,
     /// Every gauge, in the preset's order.
     pub gauges: Vec<GaugeResult>,

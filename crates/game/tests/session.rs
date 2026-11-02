@@ -926,6 +926,82 @@ fn reevaluation_matches_live_summary() {
     assert_eq!(one.displayed_gauge, GaugeIndex(0));
 }
 
+/// FAST and SLOW through the whole path: a live play with presses on both
+/// sides of their notes, its saved file decoded and re-evaluated as
+/// played, gives the live stream, totals and final gauges; a preset with
+/// a wider PERFECT counts its own; and a re-evaluation whose totals
+/// differ from the live ones is flagged though the streams agree.
+#[test]
+fn fast_and_slow_survive_the_record_and_its_reevaluation() {
+    let (_dir, root) = temp_root();
+    // Pressed 25 ms early (GREAT, FAST), 25 ms late (GREAT, SLOW), 60 ms
+    // late (GOOD, SLOW), 150 ms early (BAD, FAST), on time, and not at all
+    // (POOR), in turn.
+    let offsets = [Some(-25), Some(25), Some(60), Some(-150), Some(0), None];
+    let notes: Vec<(u8, i64)> = (0..12)
+        .map(|i| ((i % 7) as u8 + 1, 1_000 + i * 400))
+        .collect();
+    let chart = taps(&notes);
+    let mut s = session(&root, &chart, &Events::default());
+    let mut items = vec![connect(0)];
+    for (i, &(n, t)) in notes.iter().enumerate() {
+        if let Some(d) = offsets[i % offsets.len()] {
+            items.push(key((t + d) * MS, 0, n, 1));
+            items.push(key((t + d + 40) * MS, 0, n, 0));
+        }
+    }
+    let one = s.play(script(items, &[])).unwrap();
+    assert_eq!(one.end, PlayEnd::Completed);
+    assert_eq!((one.tally.fast, one.tally.slow), (4, 4));
+    assert_eq!(one.tally.counts.poor, 2);
+
+    let path = &one.saved.as_ref().unwrap().as_ref().unwrap().path;
+    let decoded = replay::decode(&fs::read(path).unwrap(), &DecodeLimits::STANDARD).unwrap();
+    assert_eq!(Some(&decoded), one.record.as_ref());
+    let preset = rules::tapestry();
+    let ctx = game::ResultContext {
+        record: &decoded,
+        chart: &chart,
+        preset: &preset,
+        live: &one.live,
+        tally: &one.tally,
+    };
+    let again = ReEvaluate::under(&ctx, &preset).unwrap().evaluation;
+    assert_eq!(again.events, one.live);
+    assert_eq!(again.tally, one.tally);
+    // Each gauge's final value is its last report in the live stream.
+    for (i, g) in again.gauges.iter().enumerate() {
+        let live = one.live.iter().rev().find_map(|e| match e.kind {
+            eval::JudgeEventKind::Gauge {
+                gauge,
+                value,
+                reference,
+            } if gauge == i => Some((value, reference)),
+            _ => None,
+        });
+        assert_eq!(live, Some((g.value, g.reference)), "gauge {i}");
+    }
+    assert!(game::ResultExtension::on_play_end(&mut ReEvaluate, &ctx).matches_live);
+
+    // PERFECT at ±30 ms takes in the 25 ms presses.
+    let wide = ReEvaluate::under(&ctx, &wide_perfect()).unwrap().evaluation;
+    assert_eq!((wide.tally.fast, wide.tally.slow), (2, 2));
+
+    let other = eval::Tally {
+        slow: one.tally.slow + 1,
+        ..one.tally
+    };
+    let summary = game::ResultExtension::on_play_end(
+        &mut ReEvaluate,
+        &game::ResultContext {
+            tally: &other,
+            ..ctx
+        },
+    );
+    assert_eq!(summary.evaluation.unwrap().events, one.live);
+    assert!(!summary.matches_live);
+}
+
 /// A chart with two taps on lane 1 at 1.0 and 1.1 s and a BGM sound at
 /// 1.0 s that lasts 3 s, and a bank where sound 0 is that long sound.
 fn tail_chart() -> (Chart, Arc<SoundBank>) {
@@ -1478,6 +1554,7 @@ fn reevaluation_refuses_a_record_of_another_preset() {
             chart: &chart,
             preset: &other,
             live: &one.live,
+            tally: &one.tally,
         },
     );
     assert_eq!(
@@ -1499,7 +1576,7 @@ fn reevaluation_refuses_a_record_of_another_evaluator_version() {
     let preset = rules::tapestry();
     let record = one.record.as_ref().unwrap();
     // The session records the version the preset runs on, and its preset.
-    assert_eq!(record.versions.evaluator, 3);
+    assert_eq!(record.versions.evaluator, 4);
     assert_eq!(record.preset.sha256, replay::preset_hash(&preset));
     let reevaluate = |record: &replay::PlayRecord| {
         game::ResultExtension::on_play_end(
@@ -1509,13 +1586,14 @@ fn reevaluation_refuses_a_record_of_another_evaluator_version() {
                 chart: &chart,
                 preset: &preset,
                 live: &one.live,
+                tally: &one.tally,
             },
         )
     };
     assert!(reevaluate(record).matches_live);
     // The same record under another evaluator version, its preset hash
     // still matching: refused before the hash is compared.
-    for version in [2, 4] {
+    for version in [3, 5] {
         let mut other = record.clone();
         other.versions.evaluator = version;
         let summary = reevaluate(&other);
@@ -2216,6 +2294,7 @@ fn under(
         chart,
         preset: &tapestry,
         live: &report.live,
+        tally: &report.tally,
     };
     ReEvaluate::under(&ctx, preset).unwrap()
 }
@@ -2359,18 +2438,19 @@ fn under_checks_the_evaluator_version_first() {
     items.extend(presses(&NOTES));
     let one = s.play(script(items, &[])).unwrap();
     let mut record = one.record.clone().unwrap();
-    record.versions.evaluator = 4;
+    record.versions.evaluator = 5;
     let tapestry = rules::tapestry();
     let ctx = game::ResultContext {
         record: &record,
         chart: &chart,
         preset: &tapestry,
         live: &one.live,
+        tally: &one.tally,
     };
     for preset in [tapestry.clone(), bad_edge(220)] {
         assert_eq!(
             ReEvaluate::under(&ctx, &preset).map(|_| ()),
-            Err(game::ReEvaluationError::UnsupportedEvaluator(4))
+            Err(game::ReEvaluationError::UnsupportedEvaluator(5))
         );
     }
     // A capture cancelled before playback is refused before that: it has
@@ -2397,6 +2477,7 @@ fn under_checks_the_evaluator_version_first() {
         chart: &chart,
         preset: &tapestry,
         live: &one.live,
+        tally: &one.tally,
     };
     for preset in [tapestry.clone(), bad_edge(220)] {
         assert_eq!(

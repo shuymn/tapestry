@@ -158,6 +158,20 @@ pub struct Tally {
     pub max_combo: u32,
     /// Number of empty POORs.
     pub empty_poor: u32,
+    /// FAST: the scored judgments other than PERFECT whose press came
+    /// before its note (a negative deviation), a long note once, at its
+    /// judgment, by its head's press.
+    pub fast: u32,
+    /// SLOW: the scored judgments other than PERFECT whose press came after
+    /// its note (a positive deviation), counted as [`fast`](Self::fast).
+    pub slow: u32,
+}
+
+impl Default for Tally {
+    /// Nothing judged yet.
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Tally {
@@ -175,6 +189,8 @@ impl Tally {
             combo: 0,
             max_combo: 0,
             empty_poor: 0,
+            fast: 0,
+            slow: 0,
         }
     }
 
@@ -1326,8 +1342,8 @@ impl<'a> Evaluator<'a> {
         self.score(lane, target, judgment, deviation, None, time, origin, out);
     }
 
-    /// Scores a taken target: counts, EX score, combo, BP, its
-    /// [`JudgeEventKind::Judged`] and the gauges.
+    /// Scores a taken target: counts, EX score, combo, BP, FAST and SLOW,
+    /// its [`JudgeEventKind::Judged`] and the gauges.
     #[allow(clippy::too_many_arguments)]
     fn score(
         &mut self,
@@ -1353,6 +1369,19 @@ impl<'a> Evaluator<'a> {
             *score.breaks_combo.get(judgment),
             *score.counts_bp.get(judgment),
         );
+        // FAST or SLOW: a press judged other than PERFECT, by its side of
+        // the note; a miss, a press exactly on the note and PERFECT count
+        // neither.
+        if judgment != Judgment::Perfect {
+            let side = match deviation.map(|d| d.0.signum()) {
+                Some(-1) => Some(&mut self.tally.fast),
+                Some(1) => Some(&mut self.tally.slow),
+                _ => None,
+            };
+            if let Some(n) = side {
+                *n = n.saturating_add(1);
+            }
+        }
         let kind = JudgeEventKind::Judged {
             lane: lane_of(lane),
             note,

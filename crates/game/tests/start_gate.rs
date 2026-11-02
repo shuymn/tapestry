@@ -389,6 +389,51 @@ fn every_rearm_takes_a_fresh_origin_and_keeps_every_opening() {
     saved_decodes(&report);
 }
 
+/// FAST and SLOW are the winning READY's alone: a press 160 ms before
+/// a note at 100 ms in a cancelled candidate (BAD, FAST) is gone with it;
+/// the winner's press 30 ms late on that note counts SLOW, live and in
+/// the record's re-evaluation alike.
+#[test]
+fn fast_and_slow_count_the_winning_ready_only() {
+    let (_dir, root) = temp_root();
+    let chart = ChartBuilder::new(150_000)
+        .sound("bgm.wav")
+        .tap(lane(1), TimeUs(100 * MS))
+        .tap(lane(1), TimeUs(1_000 * MS))
+        .tap(lane(2), TimeUs(1_200 * MS))
+        .tap(lane(3), TimeUs(1_400 * MS))
+        .bgm(TimeUs(0), SoundId(0))
+        .build()
+        .unwrap();
+    let device = audio::SimDevice::new(audio::SimConfig::steady(RATE, PERIOD, TimeUs(0)));
+    let out = audio::RecordingOutput::new(device, 0);
+    let mut s = session_of(
+        &root,
+        &Events::default(),
+        &chart,
+        common::sources(),
+        out,
+        true,
+    );
+    let mut items = vec![connect(0)];
+    items.extend(tap(1, -60));
+    items.push(raw(-50, 0, Q, 1));
+    items.push(raw(200, 0, Q, 0));
+    items.extend(tap(1, 1_200 + 130));
+    items.extend(notes_from(1_200));
+    let report = s.play(script(items, &[])).unwrap();
+
+    assert_eq!(report.end, PlayEnd::Completed);
+    assert_eq!(record(&report).history.openings.len(), 1);
+    assert_eq!(count_judged(&report.live, Judgment::Great), 1);
+    assert_eq!(count_judged(&report.live, Judgment::Perfect), 3);
+    assert_eq!((report.tally.fast, report.tally.slow), (0, 1));
+    let result = report.result.as_ref().unwrap();
+    assert!(result.matches_live);
+    assert_eq!(result.evaluation.as_ref().unwrap().tally, report.tally);
+    saved_decodes(&report);
+}
+
 #[test]
 fn a_hold_in_the_last_100_ms_before_the_commit_cancels_it() {
     let (_dir, root) = temp_root();

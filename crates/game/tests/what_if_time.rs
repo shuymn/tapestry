@@ -85,6 +85,7 @@ fn what_if_on_a_chart_near_the_object_limit() {
         chart: &chart,
         preset: &played,
         live: &[],
+        tally: &eval::Tally::default(),
     };
     for what_if in [rules::beatoraja_style(), rules::lr2_style()] {
         let began = Instant::now();
