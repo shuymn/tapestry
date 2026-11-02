@@ -1457,3 +1457,26 @@ fn an_opposite_press_takes_back_a_repeat_at_its_time_in_either_order() {
         }
     }
 }
+
+#[test]
+fn a_step_applied_in_an_ended_context_is_never_taken_back() {
+    // At one time: the scratch's +1 applies when `Ownership` ends its
+    // context; the auxiliary +10 opens a new group, which the opposite
+    // press must leave whole.
+    let o = options(SpeedMode::Classic, 200, 300, sudden(500));
+    let mut rig = Rig::prepared(o, constant(150));
+    rig.at(0).press(START);
+    rig.at(10 * MS)
+        .press(SCRATCH_POS)
+        .ev(Event::Ownership)
+        .press(AUX_POS)
+        .press(SCRATCH_NEG);
+    rig.now += 1;
+    rig.ev(Event::Tick);
+    let log = rig.log.clone();
+    let whole = drained(o, &log, &[]);
+    assert_eq!(whole.options.covers().sudden.amount, 511);
+    for i in 0..=log.len() {
+        assert_eq!(drained(o, &log, &[i]), whole, "split {i}");
+    }
+}

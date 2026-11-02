@@ -297,9 +297,11 @@ enum Hold {
         pressed: TimeUs,
         /// The next repeat, for a digital scratch.
         next: TimeUs,
-        /// A digital scratch's request in the open group, and its time: an
-        /// opposite press at that time takes it back.
-        pending: Option<(TimeUs, Request)>,
+        /// A digital scratch's request in the open group, with its time and
+        /// dispatch context: an opposite press at that time in that context
+        /// takes it back. Once its context ends, the group it was in has
+        /// applied, and nothing is taken back.
+        pending: Option<(TimeUs, u64, Request)>,
     },
 }
 
@@ -667,8 +669,9 @@ impl Adjustment {
                     {
                         // What it asked at this time, press or repeat, is
                         // taken back: neither direction acts at this time.
-                        if let Some((at, request)) = pending.take()
+                        if let Some((at, c, request)) = pending.take()
                             && at == time
+                            && c == context
                         {
                             group.retract(time, request);
                         }
@@ -837,9 +840,12 @@ impl Adjustment {
             return;
         };
         if let Some(Hold::Held { pending, .. }) = self.holds.get_mut(usize::from(control.0)) {
+            let context = self.context;
             *pending = Some(match *pending {
-                Some((at, earlier)) if at == time => (time, earlier.plus(request)),
-                _ => (time, request),
+                Some((at, c, earlier)) if at == time && c == context => {
+                    (time, context, earlier.plus(request))
+                }
+                _ => (time, context, request),
             });
         }
     }
