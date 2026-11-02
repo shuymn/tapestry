@@ -136,6 +136,15 @@ fn options() -> PlayOptions {
 /// A session of `chart()` with the start gate on the default bindings:
 /// START on Q, SELECT on W.
 fn session(root: &DataRoot, events: &Events) -> Session<Out> {
+    session_with_sources(root, events, common::sources())
+}
+
+/// [`session`] with the source set's limits.
+fn session_with_sources(
+    root: &DataRoot,
+    events: &Events,
+    sources: input::SourceConfig,
+) -> Session<Out> {
     let chart = chart();
     let parts = Parts {
         ingest: Box::new(Built(chart.clone())),
@@ -161,7 +170,7 @@ fn session(root: &DataRoot, events: &Events) -> Session<Out> {
     .unwrap();
     let device = audio::SimDevice::new(audio::SimConfig::steady(RATE, PERIOD, TimeUs(0)));
     let audio = RunnerAudio::new(engine, audio::RecordingOutput::new(device, 0));
-    let mut s = loaded.start(audio, SourceSet::new(common::sources()).unwrap());
+    let mut s = loaded.start(audio, SourceSet::new(sources).unwrap());
     let d = DeviceSettings::default();
     let keys = KeyConfigs {
         keyboard: d.keyboard,
@@ -615,4 +624,128 @@ fn a_device_removed_and_reconnected_across_a_rearm_keeps_its_source_id() {
     );
     assert_eq!(count_judged(&report.live, Judgment::Perfect), 3);
     saved_decodes(&report);
+}
+
+/// An ending and the commit observed in the same step are settled on the
+/// start gate: whichever of the quit's cancellation and the transport's
+/// commit won decides the capture, so a play whose transport started is
+/// never saved as cancelled before playback, and one saved so never
+/// started it. Quits around chart time 0, one per millisecond, go through
+/// `game::live::play_and_next` with the scripted audio side committing.
+#[test]
+fn an_ending_in_the_commits_step_is_settled_by_the_gate() {
+    let (mut played, mut unplayed) = (0, 0);
+    for at in -40..=5 {
+        let (_dir, root) = temp_root();
+        let mut s = session(&root, &Events::default());
+        let report = s
+            .play(script(vec![connect(0)], &[(at, Command::Quit)]))
+            .unwrap();
+        let started = bgm_starts(&mut s) > 0;
+        assert_eq!(
+            record(&report).status.end != EndStatus::CancelledBeforePlayback,
+            started,
+            "quit at {at} ms"
+        );
+        if started {
+            played += 1;
+        } else {
+            unplayed += 1;
+        }
+    }
+    assert!(played > 0 && unplayed > 0, "the quits straddle the commit");
+}
+
+/// A cancelled opening whose arrivals run the history out seals the
+/// capture: no candidate follows, and the attempt ends cancelled before
+/// playback, incomplete (overflow), with what fit. Through
+/// `game::live::play_and_next` and the scripted rig's rearm.
+#[test]
+fn a_history_run_out_while_waiting_ends_the_attempt() {
+    let (_dir, root) = temp_root();
+    let mut s = session_with_sources(
+        &root,
+        &Events::default(),
+        input::SourceConfig {
+            max_devices: 32,
+            max_sources: 4,
+            max_held: 16,
+            queue_capacity: 1_024,
+            max_arrivals: 32,
+        },
+    );
+    // START held; 17 keyboards arrive while waiting; START released.
+    let mut items = vec![connect(0), raw(-300, 0, Q, 1)];
+    for d in 1..=17_i64 {
+        items.push(item(
+            (-250 + d) * MS,
+            Action::Connect(DeviceId(d.unsigned_abs()), DeviceKind::Keyboard),
+        ));
+    }
+    items.push(raw(0, 0, Q, 0));
+    items.extend(notes_from(1_000));
+    let report = s.play(script(items, &[])).unwrap();
+
+    assert_eq!(report.end, PlayEnd::Aborted(AbortCause::Overflow));
+    assert_cancelled(&report, CancelReason::Held);
+    let r = record(&report);
+    assert!(r.status.incomplete.overflow);
+    assert_eq!(r.history.openings.len(), 1);
+    assert_eq!(r.history.arrivals.len(), replay::MAX_OPENING_ARRIVALS);
+    assert_eq!(bgm_starts(&mut s), 0, "no further candidate ran");
+}
+
+/// A gated play admits its own storage with its recording: a window that
+/// fits the reservation only without the gate's history and snapshots is
+/// refused for a gated play, while the same play without the gate is
+/// admitted (`Loaded::plan_gated`, which `game::live::play_and_next`
+/// calls with the input side's snapshot storage).
+#[test]
+fn the_gates_storage_counts_in_the_recording_admission() {
+    let (_dir, root) = temp_root();
+    let kinds = [DeviceKind::Keyboard; 4];
+    let axes = vec![Vec::new(); 4];
+    let held = 4 * (16 + input::hid::MAX_AXES);
+    let at = |last_s: i64| {
+        let chart = ChartBuilder::new(150_000)
+            .tap(lane(1), TimeUs(1_000 * MS))
+            .tap(lane(1), TimeUs(last_s * 1_000 * MS))
+            .build()
+            .unwrap();
+        let parts = Parts {
+            ingest: Box::new(Built(chart)),
+            ..Parts::standard(&root, &tapestry_settings(&root).player)
+        };
+        let loaded = Loaded::load(
+            root.clone(),
+            tapestry_settings(&root),
+            &chart_file(&root),
+            config(),
+            parts,
+        )
+        .unwrap();
+        (
+            loaded.plan_gated(&kinds, &axes, None).is_ok(),
+            loaded.plan_gated(&kinds, &axes, Some(held)).is_ok(),
+        )
+    };
+    // The longest chart a plain play admits, by bisection.
+    let (mut lo, mut hi) = (2, 4_000);
+    assert_eq!(at(lo), (true, true));
+    assert!(!at(hi).0);
+    while hi - lo > 1 {
+        let mid = (lo + hi) / 2;
+        if at(mid).0 {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    // Just below it the gate's storage tips the window over; well below
+    // it both fit.
+    assert!(
+        (lo - 40..=lo).any(|t| at(t) == (true, false)),
+        "no window fits only without the gate below {lo} s"
+    );
+    assert_eq!(at(lo - 60), (true, true));
 }

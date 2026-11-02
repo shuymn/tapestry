@@ -84,7 +84,7 @@ fn one_of_commit_and_cancel_wins_by_generation() {
     assert!(!gate.commit(4), "the cancellation won");
     assert_eq!(gate.state(), state(4, GatePhase::Cancelled));
     gate.disarm();
-    assert_eq!(gate.state(), state(0, GatePhase::Idle));
+    assert_eq!(gate.state(), state(4, GatePhase::Idle));
 }
 
 #[test]
@@ -172,5 +172,49 @@ fn a_rearm_waits_for_the_release_and_arms_a_fresh_generation() {
     );
     assert!(gate.commit(2));
     set.close_recording();
-    assert_eq!(gate.state(), state(0, GatePhase::Idle));
+    assert_eq!(gate.state(), state(2, GatePhase::Idle));
+}
+
+/// The commit and the cancellation race on two threads, released together
+/// each round: exactly one wins every round, and the gate ends in that
+/// winner's phase.
+#[test]
+fn a_concurrent_commit_and_cancel_have_exactly_one_winner() {
+    use std::sync::{Arc, Barrier};
+
+    const ROUNDS: u32 = 2_000;
+    let gate = StartGate::new();
+    let start = Arc::new(Barrier::new(2));
+    let done = Arc::new(Barrier::new(2));
+    let canceller = {
+        let (gate, start, done) = (gate.clone(), Arc::clone(&start), Arc::clone(&done));
+        std::thread::spawn(move || {
+            (1..=ROUNDS)
+                .map(|g| {
+                    start.wait();
+                    let won = gate.cancel() == Some(g);
+                    done.wait();
+                    won
+                })
+                .collect::<Vec<bool>>()
+        })
+    };
+    let mut committed = Vec::new();
+    for g in 1..=ROUNDS {
+        gate.arm(g);
+        start.wait();
+        committed.push(gate.commit(g));
+        done.wait();
+        let phase = gate.state().phase;
+        assert!(matches!(phase, GatePhase::Committed | GatePhase::Cancelled));
+        assert_eq!(
+            committed[committed.len() - 1],
+            phase == GatePhase::Committed
+        );
+    }
+    let cancelled = canceller.join().unwrap();
+    assert!(
+        committed.iter().zip(&cancelled).all(|(c, x)| c != x),
+        "exactly one of the commit and the cancellation wins each round"
+    );
 }

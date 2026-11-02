@@ -365,6 +365,17 @@ pub trait Rig {
             phase: input::GatePhase::Idle,
         }
     }
+    /// Settles candidate `generation` against an ending: cancels it on the
+    /// start gate unless its transport already committed, in one atomic
+    /// outcome; `true` when it committed, so the attempt was played.
+    /// Gated rigs only; by default, whether the gate shows it committed.
+    fn settle_candidate(&mut self, generation: u32) -> bool {
+        self.candidate()
+            == input::GateState {
+                generation,
+                phase: input::GatePhase::Committed,
+            }
+    }
     /// Candidate `generation` was cancelled: its key sounds stop, and its
     /// scheduled chart start and audio restore are dropped; returns once
     /// the audio side acknowledged it, so no authorization of it is left
@@ -783,10 +794,12 @@ fn play_and_next<R: Rig>(
     let opens_at = loaded.opens_at();
     let restore_at = loaded.restore_at();
     let lead_in = TimeUs(opens_at.0.saturating_neg());
-    // A gated rig opens READY candidates, the first numbered 1; otherwise
-    // the first READY opened is the play.
+    // A gated rig opens READY candidates, numbered after the gate's last,
+    // so no authorization or acknowledgement of an earlier attempt's
+    // candidate matches one of this attempt; otherwise the first READY
+    // opened is the play.
     let gated = rig.gated();
-    let mut generation = 1_u32;
+    let mut generation = rig.candidate().generation.wrapping_add(1).max(1);
     // A quit during the wait is latched and taken by the first step. A
     // failed opening opened nothing: its number goes back, and so does an
     // attempt left while its opening was deferred.
@@ -808,7 +821,9 @@ fn play_and_next<R: Rig>(
     };
     let mut origin = opening.origin;
     // The refusal is the error reported; a failed close adds nothing to it.
-    let plan = match loaded.plan(&opening.kinds, &opening.axes) {
+    // A gated play's own storage is admitted with its recording.
+    let held = gated.then(|| rig.snapshot_capacity());
+    let plan = match loaded.plan_gated(&opening.kinds, &opening.axes, held) {
         Ok(plan) => plan,
         Err(e) => {
             let _ = rig.close();
@@ -834,8 +849,7 @@ fn play_and_next<R: Rig>(
     // A gated play's candidates: the history of cancelled openings and the
     // rearmed snapshot, reserved with the play's setup and reused by every
     // rearm.
-    let mut gate = gated.then(|| {
-        let held = rig.snapshot_capacity();
+    let mut gate = held.map(|held| {
         logic.reserve_start(held);
         Candidates::new(held)
     });
@@ -910,9 +924,14 @@ fn play_and_next<R: Rig>(
         };
         // Before its transport commits, a gated attempt's candidate is
         // cancelled by a hold and rearmed by a release, and whatever ends
-        // the attempt ends it without a played attempt.
-        if let Some(g) = gate.as_mut().filter(|g| !g.committed) {
-            if let Some(cause) = ending {
+        // the attempt ends it without a played attempt. An ending is
+        // settled on the start gate in one atomic outcome: a transport that
+        // committed meanwhile makes the attempt played, and it ends as any
+        // play does.
+        if let Some(g) = gate.as_mut().filter(|g| !g.committed)
+            && let Some(cause) = ending
+        {
+            if g.waiting || !rig.settle_candidate(generation) {
                 if !g.waiting {
                     logic.abort(cause);
                 }
@@ -920,6 +939,9 @@ fn play_and_next<R: Rig>(
                 last = now;
                 break PlayEnd::Aborted(cause);
             }
+            g.committed = true;
+        }
+        if let Some(g) = gate.as_mut().filter(|g| !g.committed) {
             let step = if g.waiting {
                 g.wait_release(rig, &mut logic, lead_in, &mut generation)
             } else {
@@ -1132,9 +1154,9 @@ fn play_and_next<R: Rig>(
 /// Lifecycle", the start gate): the input side opens it only where START
 /// and SELECT are verifiably released. A hold there defers it
 /// ([`Rig::defer`]): the attempt serves the quit key, a close and the
-/// threads' failures until the latch reads released, then quiesces the
-/// loading state again and asks again. `None` when the player left before
-/// it opened: nothing opened, so nothing is saved.
+/// threads' and the screen's failures until the latch reads released,
+/// then quiesces the loading state again and asks again. `None` when the
+/// player left before it opened: nothing opened, so nothing is saved.
 ///
 /// # Errors
 ///
@@ -1156,7 +1178,9 @@ fn open_gated<R: Rig>(
         rig.defer();
         loop {
             rig.wait();
-            threads_over(rig)?;
+            // The threads and the screen prepared for the attempt, as
+            // before any opening: a screen lost while held ends the run.
+            preflight(rig)?;
             // A retry or suspend before recording opens belongs to no
             // play.
             if rig.quitting() || rig.take() == Some(Command::Quit) {

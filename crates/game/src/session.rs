@@ -1126,6 +1126,24 @@ impl Loaded {
         kinds: &[DeviceKind],
         axes: &[Vec<input::hid::AxisCap>],
     ) -> Result<PlayPlan, LogicError> {
+        self.plan_gated(kinds, axes, None)
+    }
+
+    /// [`plan`](Self::plan) for a play whose READY candidates run the
+    /// start gate when `gate` gives the input side's held-snapshot
+    /// storage: the reservation then also counts the gate's own storage
+    /// ([`Reservation::with_gate`]), so a recording window that fits only
+    /// without it is refused.
+    ///
+    /// # Errors
+    ///
+    /// As [`plan`](Self::plan).
+    pub fn plan_gated(
+        &self,
+        kinds: &[DeviceKind],
+        axes: &[Vec<input::hid::AxisCap>],
+        gate: Option<usize>,
+    ) -> Result<PlayPlan, LogicError> {
         if self.config.autoplay.is_some() {
             return self.autoplay_plan(kinds, axes);
         }
@@ -1178,6 +1196,7 @@ impl Loaded {
         let inputs = window_inputs(&device, window, &rates).saturating_add(system);
         if let Ok(probe) = &probe
             && let r = Reservation::from_probe(probe, &device, self.config.effects)
+            && let r = gate.map_or(r, |held| r.with_gate(held))
             && !r.fits(inputs)
         {
             return Err(LogicError::RecordingTooLarge {
@@ -1752,9 +1771,10 @@ struct SessionRig<'s, O> {
 
 impl<O: AudioOutput + Wakes> SessionRig<'_, O> {
     /// Every buffer event due before `now` (with `through`, at `now` too),
-    /// until the output fails. In a gated session, the pass whose block
-    /// reaches the armed candidate's commit point commits it first; one
-    /// that finds it cancelled or stale stops its audio before the pass.
+    /// until the output fails. In a gated session the engine holds the
+    /// armed candidate's transport: the pass whose block reaches its commit
+    /// point, by that pass's own wake, commits it first, and one that finds
+    /// it cancelled or stale stops its audio there.
     fn step_audio(&mut self, now: TimeUs, through: bool) {
         let Some(sounds) = &mut self.sounds else {
             return;
@@ -1767,14 +1787,17 @@ impl<O: AudioOutput + Wakes> SessionRig<'_, O> {
             if at > now || (at == now && !through) {
                 return;
             }
-            if let Some(g) = &mut self.gate
-                && !g.before_pass(self.audio.engine())
-            {
-                self.audio.cancel(sounds);
-            }
-            if let Err(e) = self.audio.wake(sounds) {
-                self.failure = Some(e);
-                return;
+            let woke = match &mut self.gate {
+                Some(g) => self.audio.wake_admitting(sounds, &mut || g.admit()),
+                None => self.audio.wake(sounds).map(|()| None),
+            };
+            match woke {
+                Ok(Some(false)) => self.audio.cancel(sounds),
+                Ok(_) => {}
+                Err(e) => {
+                    self.failure = Some(e);
+                    return;
+                }
             }
         }
     }
@@ -1900,7 +1923,7 @@ impl<O: AudioOutput + Wakes> Rig for SessionRig<'_, O> {
         };
         let origin = TimeUs(script_origin.0 + chart0.0);
         if let Some(g) = &mut self.gate {
-            g.opened(generation, origin, now, chart0);
+            g.opened(generation, now, chart0);
         }
         Ok(Some(self.opening(origin, start)))
     }
@@ -1917,6 +1940,10 @@ impl<O: AudioOutput + Wakes> Rig for SessionRig<'_, O> {
             },
             crate::start_gate::ScriptedGate::state,
         )
+    }
+
+    fn settle_candidate(&mut self, generation: u32) -> bool {
+        self.gate.as_ref().is_some_and(|g| g.settle(generation))
     }
 
     fn cancel_candidate(&mut self, generation: u32) {
@@ -1946,9 +1973,13 @@ impl<O: AudioOutput + Wakes> Rig for SessionRig<'_, O> {
         }
         let now = TimeUs(self.clock.now().0 - script_origin.0);
         let chart0 = TimeUs(now.0 + lead_in.0);
-        let _ = history.drain(readers);
+        let drained = history.drain(readers);
         let closed = TimeUs(now.0 - (origin.0 - script_origin.0));
-        let _ = history.seal(closed, self.sources.arrivals(), replay::CancelReason::Held);
+        let sealed = history.seal(closed, self.sources.arrivals(), replay::CancelReason::Held);
+        // A history that ran out seals the capture: no candidate follows.
+        if drained.is_err() || sealed.is_err() {
+            return Ok(crate::live::Rearm::Held);
+        }
         self.sources.return_readers(std::mem::take(readers));
         let reopened = self
             .sources
@@ -1967,7 +1998,7 @@ impl<O: AudioOutput + Wakes> Rig for SessionRig<'_, O> {
         let origin = TimeUs(script_origin.0 + chart0.0);
         self.origin = Some(origin);
         if let Some(g) = &mut self.gate {
-            g.opened(generation, origin, now, chart0);
+            g.opened(generation, now, chart0);
         }
         Ok(crate::live::Rearm::Opened { origin })
     }
@@ -1977,6 +2008,9 @@ impl<O: AudioOutput + Wakes> Rig for SessionRig<'_, O> {
         engine.restart(origin);
         if let Some(restore) = self.restore.take() {
             restore.apply(engine);
+        }
+        if let Some(g) = &self.gate {
+            g.hold(engine);
         }
         self.sealed = false;
     }
@@ -1993,6 +2027,9 @@ impl<O: AudioOutput + Wakes> Rig for SessionRig<'_, O> {
         // Section Repeat").
         if let Some(restore) = self.restore.take() {
             restore.apply(engine);
+        }
+        if let Some(g) = &self.gate {
+            g.hold(engine);
         }
         self.sounds = Some(sounds);
         self.screen = Some(screen);
@@ -2214,6 +2251,21 @@ impl Reservation {
                 .fixed
                 .saturating_add(crate::HistoryRecorder::bytes(held)),
             per_input: self.per_input,
+        }
+    }
+
+    /// This reservation with a gated play's own storage (design.md "Play
+    /// Lifecycle", the start gate): the history of cancelled openings
+    /// ([`with_history`](Self::with_history)) and the two held-input
+    /// snapshots of `held` entries a rearm copies into, the logic step's
+    /// and the next candidate's.
+    #[must_use]
+    pub const fn with_gate(self, held: usize) -> Self {
+        let snapshots = held.saturating_mul(2 * size_of::<(eval::SourceId, ControlId, i32)>());
+        let r = self.with_history(held);
+        Self {
+            fixed: r.fixed.saturating_add(snapshots),
+            per_input: r.per_input,
         }
     }
 

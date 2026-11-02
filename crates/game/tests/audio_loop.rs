@@ -971,3 +971,115 @@ fn a_gated_transport_commits_only_its_own_armed_candidate() {
     assert_eq!(gate.state().phase, GatePhase::Armed);
     assert!(control.counters().dropped(2));
 }
+
+/// The transport is arbitrated against the wake that writes it: a cold
+/// output's first pass writes two periods at once, and a pass after an
+/// underrun refills the queue, re-anchoring the clock; chart time 0
+/// inside either block is admitted only by that pass, so a candidate
+/// cancelled before it never sounds, and one armed commits there. Drives
+/// `AudioWorker::step`, whose engine holds the transport
+/// (`AudioEngine::step_admitting`).
+#[test]
+fn the_transport_is_admitted_by_the_pass_that_writes_it_cold_or_after_an_underrun() {
+    use game::TransportGate;
+    use input::{GatePhase, StartGate};
+
+    let chart = chart();
+    let sounding = |out: &RecordingOutput<SimDevice>| out.samples().iter().any(|&s| s != 0.0);
+    // (the device, chart time 0 on the output, steps before the play)
+    let cold = SimConfig::steady(RATE, PERIOD, TimeUs(0));
+    let mut underrun = SimConfig::steady(RATE, PERIOD, TimeUs(0));
+    underrun.missed_wakes = vec![5];
+    for (config, origin, before) in [(cold, 15 * MS, 0), (underrun, 75 * MS, 4)] {
+        for cancelled in [true, false] {
+            let engine =
+                AudioEngine::new(bank(&chart), &chart.bgm, RATE, PERIOD, MAX_VOICES, 0).unwrap();
+            let (mut control, mut worker) = audio_control(engine);
+            let mut out = RecordingOutput::new(SimDevice::new(config.clone()), RATE as usize);
+            for _ in 0..before {
+                worker.step(&mut out).unwrap();
+            }
+            let gate = StartGate::new();
+            gate.arm(1);
+            let (_sink, queue) = audio_link_at(4, TimeUs(origin));
+            let transport = TransportGate {
+                gate: gate.clone(),
+                generation: 1,
+                commit_at: TimeUs(0),
+            };
+            control
+                .play_gated(
+                    TimeUs(origin),
+                    queue,
+                    audio::Gain::HEADROOM,
+                    None,
+                    transport,
+                )
+                .unwrap();
+            if cancelled {
+                assert_eq!(gate.cancel(), Some(1));
+            }
+            for _ in 0..20 {
+                worker.step(&mut out).unwrap();
+            }
+            assert_eq!(
+                sounding(&out),
+                !cancelled,
+                "origin {origin}, cancelled {cancelled}"
+            );
+            assert_eq!(control.counters().dropped(1), cancelled);
+            let phase = if cancelled {
+                GatePhase::Cancelled
+            } else {
+                GatePhase::Committed
+            };
+            assert_eq!(gate.state().phase, phase);
+        }
+    }
+}
+
+/// Candidate numbers are unique over the gate's life, so a drop the worker
+/// acknowledged for an earlier attempt never stands for this one: two
+/// attempts on one worker, the first's candidate dropped.
+#[test]
+fn a_drop_acknowledgement_belongs_to_its_own_attempt() {
+    use game::TransportGate;
+    use input::StartGate;
+
+    let chart = chart();
+    let (mut control, mut worker, mut out) = rig(&chart);
+    let gate = StartGate::new();
+    let play = |control: &mut AudioControl, generation, origin| {
+        gate.arm(generation);
+        let (_sink, queue) = audio_link_at(4, TimeUs(origin));
+        let transport = TransportGate {
+            gate: gate.clone(),
+            generation,
+            commit_at: TimeUs(0),
+        };
+        control
+            .play_gated(
+                TimeUs(origin),
+                queue,
+                audio::Gain::HEADROOM,
+                None,
+                transport,
+            )
+            .unwrap();
+    };
+    // The first attempt's candidate is cancelled and dropped.
+    play(&mut control, 1, 100 * MS);
+    gate.cancel();
+    for _ in 0..20 {
+        worker.step(&mut out).unwrap();
+    }
+    assert!(control.counters().dropped(1));
+    gate.disarm();
+    // The next attempt numbers after the gate's last: its candidate is
+    // not acknowledged as dropped by the first's drop.
+    let next = gate.state().generation + 1;
+    assert_eq!(next, 2);
+    play(&mut control, next, 400 * MS);
+    worker.step(&mut out).unwrap();
+    assert!(!control.counters().dropped(next));
+}

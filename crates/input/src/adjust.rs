@@ -254,9 +254,13 @@ impl StartGate {
             .then_some(state.generation)
     }
 
-    /// No candidate: the attempt is over.
+    /// No candidate: the attempt is over. The last generation stays, so
+    /// the next attempt numbers its candidates after it and no
+    /// authorization or acknowledgement of an earlier one matches them.
     pub fn disarm(&self) {
-        self.0.store(0, Ordering::Release);
+        let generation = self.state().generation;
+        self.0
+            .store(Self::word(generation, GatePhase::Idle), Ordering::Release);
     }
 }
 

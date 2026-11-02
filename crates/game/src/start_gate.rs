@@ -7,9 +7,10 @@
 //! The input side is the session's [`SourceSet`] with its adjustment tap:
 //! it opens a candidate only where START and SELECT are verifiably
 //! released and cancels the armed candidate as it accepts a hold. The
-//! audio side commits the candidate's transport by generation before the
-//! engine pass whose block reaches the commit point (chart time 0, or a
-//! round's lead-in start); a commit that finds the candidate cancelled
+//! audio side's engine holds the candidate's transport, and the pass whose
+//! block reaches the commit point (chart time 0, or a round's lead-in
+//! start), by its own wake, commits it by generation before anything of
+//! the schedule starts; a commit that finds the candidate cancelled
 //! stops its audio there, so its scheduled chart start and restore never
 //! run.
 
@@ -118,9 +119,9 @@ pub(crate) struct ScriptedGate<'a> {
     commit_at: TimeUs,
     /// Where the attempt opens, in chart time: the frozen head's base.
     opens_at: TimeUs,
-    /// The armed candidate's generation and its chart time 0 on the
-    /// session clock, until the audio side commits or drops it.
-    pending: Option<(u32, TimeUs)>,
+    /// The armed candidate's generation, until the audio side commits
+    /// or drops it.
+    pending: Option<u32>,
     adjust: Option<&'a mut SessionAdjust>,
 }
 
@@ -145,11 +146,10 @@ impl<'a> ScriptedGate<'a> {
         self.gate.state()
     }
 
-    /// Candidate `generation` opened with chart time 0 at `origin` on the
-    /// session clock, at script time `at`, its chart time 0 at `chart0` on
-    /// the script's timeline.
-    pub(crate) fn opened(&mut self, generation: u32, origin: TimeUs, at: TimeUs, chart0: TimeUs) {
-        self.pending = Some((generation, origin));
+    /// Candidate `generation` opened at script time `at`, its chart time
+    /// 0 at `chart0` on the script's timeline.
+    pub(crate) fn opened(&mut self, generation: u32, at: TimeUs, chart0: TimeUs) {
+        self.pending = Some(generation);
         if let Some(a) = &mut self.adjust {
             a.phase(
                 at,
@@ -166,7 +166,7 @@ impl<'a> ScriptedGate<'a> {
     /// of it is left to commit, and the presentation head freezes at the
     /// attempt's `opens_at()` until the rearm.
     pub(crate) fn cancelled(&mut self, generation: u32, at: TimeUs) {
-        if self.pending.is_some_and(|(g, _)| g == generation) {
+        if self.pending == Some(generation) {
             self.pending = None;
         }
         let opens_at = self.opens_at;
@@ -175,22 +175,33 @@ impl<'a> ScriptedGate<'a> {
         }
     }
 
-    /// Before an engine pass: commits the pending candidate when the
-    /// pass's block reaches its commit point. `false` when the commit
-    /// found it cancelled or stale: its audio must stop before the pass.
-    pub(crate) fn before_pass(&mut self, engine: &AudioEngine) -> bool {
-        let Some((generation, origin)) = self.pending else {
-            return true;
-        };
-        let line = engine.frame_line_at(origin);
-        let end = i64::try_from(line.block_start)
-            .unwrap_or(i64::MAX)
-            .saturating_add(i64::from(line.period));
-        if line.frame(self.commit_at) >= end {
-            return true;
+    /// Cancels candidate `generation` unless its transport committed
+    /// first: `true` when it committed.
+    pub(crate) fn settle(&self, generation: u32) -> bool {
+        let _ = self.gate.cancel();
+        self.gate.state()
+            == GateState {
+                generation,
+                phase: input::GatePhase::Committed,
+            }
+    }
+
+    /// After the engine restarted for the pending candidate: its
+    /// transport holds at the commit point
+    /// ([`AudioEngine::hold_transport`]).
+    pub(crate) fn hold(&self, engine: &mut AudioEngine) {
+        if self.pending.is_some() {
+            engine.hold_transport(self.commit_at);
         }
-        self.pending = None;
-        self.gate.commit(generation)
+    }
+
+    /// The admission the engine pass reaching the commit point asks:
+    /// commits the pending candidate by generation, `false` when the
+    /// commit finds it cancelled or stale.
+    pub(crate) fn admit(&mut self) -> bool {
+        self.pending
+            .take()
+            .is_some_and(|generation| self.gate.commit(generation))
     }
 
     /// The reducer's side, after the input side's batch.

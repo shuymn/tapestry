@@ -77,6 +77,10 @@ pub struct StepReport {
     pub active_voices: usize,
     /// BGM events not yet started.
     pub bgm_left: usize,
+    /// What the pass did with a held transport whose commit point its
+    /// block reached: `Some(true)` admitted, `Some(false)` refused (every
+    /// sound stopped, the schedule and a seek dropped).
+    pub transport: Option<bool>,
 }
 
 /// Why an engine could not be built.
@@ -177,6 +181,12 @@ pub struct AudioEngine {
     /// The output frame a placed ring-out ends at: no BGM event starts
     /// from there.
     ring_end: Option<i64>,
+    /// A held transport's commit point in chart time ([`hold_transport`]):
+    /// no BGM event and no seek starts until the pass whose block reaches
+    /// it is admitted.
+    ///
+    /// [`hold_transport`]: Self::hold_transport
+    held: Option<TimeUs>,
     scheduled: Vec<Scheduled>,
     scheduled_dropped: u64,
     underruns: u64,
@@ -244,6 +254,7 @@ impl AudioEngine {
             seek_to: None,
             ring_out: None,
             ring_end: None,
+            held: None,
             scheduled: Vec::with_capacity(schedule_log),
             scheduled_dropped: 0,
             underruns: 0,
@@ -325,6 +336,19 @@ impl AudioEngine {
         self.seek_to = None;
         self.clear_ring_out();
         self.play_origin = origin;
+        self.held = None;
+    }
+
+    /// Holds the play's transport at chart time `commit_at`, after a
+    /// [`restart`](Self::restart) (design.md "Play Lifecycle", the start
+    /// gate): key sounds play, but no BGM event and no seek starts until
+    /// the pass whose block, as that pass's own wake maps it, reaches the
+    /// frame of `commit_at`; that pass asks its admission
+    /// ([`step_admitting`](Self::step_admitting)) before starting
+    /// anything of the schedule. A refused transport stops every sound
+    /// and drops the schedule and the seek.
+    pub const fn hold_transport(&mut self, commit_at: TimeUs) {
+        self.held = Some(commit_at);
     }
 
     fn clear_ring_out(&mut self) {
@@ -472,6 +496,7 @@ impl AudioEngine {
         self.next_bgm = self.bgm.len();
         self.seek_to = None;
         self.clear_ring_out();
+        self.held = None;
     }
 
     /// Plays another chart from here on: `bank` and `bgm` (sorted by time)
@@ -555,6 +580,23 @@ impl AudioEngine {
         out: &mut impl AudioOutput,
         cmds: &mut Consumer<SoundCmd>,
     ) -> Result<StepReport, OutputError> {
+        self.step_admitting(out, cmds, &mut || true)
+    }
+
+    /// [`step`](Self::step), asking `admit` for a held transport
+    /// ([`hold_transport`](Self::hold_transport)) in the pass whose block
+    /// reaches its commit point, by this pass's re-anchored clock and its
+    /// actual block, before anything of the schedule starts in it.
+    ///
+    /// # Errors
+    ///
+    /// The output's failure.
+    pub fn step_admitting(
+        &mut self,
+        out: &mut impl AudioOutput,
+        cmds: &mut Consumer<SoundCmd>,
+        admit: &mut dyn FnMut() -> bool,
+    ) -> Result<StepReport, OutputError> {
         let wake = out.wait();
         let mut report = StepReport::default();
         if wake.priming {
@@ -594,7 +636,25 @@ impl AudioEngine {
             // places a seek, by what its plan admitted there.
             let mut budget = usize::MAX;
             let mut held = false;
-            if let Some((t, left)) = self.seek_to {
+            // A held transport: nothing of the schedule starts before the
+            // pass whose block reaches its commit point, which asks first.
+            if let Some(at) = self.held {
+                let frame = self.frame_line().frame(at);
+                if frame < i64::try_from(block_end).unwrap_or(i64::MAX) {
+                    self.held = None;
+                    let admitted = admit();
+                    report.transport = Some(admitted);
+                    if !admitted {
+                        self.mixer.stop_all();
+                        self.next_bgm = self.bgm.len();
+                        self.seek_to = None;
+                        self.clear_ring_out();
+                    }
+                } else {
+                    held = true;
+                }
+            }
+            if let Some((t, left)) = self.seek_to.filter(|_| !held) {
                 // Placed by the clock of the pass that reaches it, as a BGM
                 // event at `t` is. Until then the schedule after the plan
                 // waits, so none of it starts before the seek's voices.

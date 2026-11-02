@@ -207,6 +207,23 @@ impl<O: AudioOutput + Wakes> RunnerAudio<O> {
             .map(|_| ())
     }
 
+    /// [`wake`](Self::wake), asking `admit` for a held transport in the
+    /// pass whose block reaches its commit point
+    /// ([`AudioEngine::step_admitting`]): what that pass did with it.
+    ///
+    /// # Errors
+    ///
+    /// The output's failure.
+    pub(crate) fn wake_admitting(
+        &mut self,
+        queue: &mut AudioQueue,
+        admit: &mut dyn FnMut() -> bool,
+    ) -> Result<Option<bool>, OutputError> {
+        self.engine
+            .step_admitting(&mut self.output, queue.commands(), admit)
+            .map(|r| r.transport)
+    }
+
     /// Stops the play's audio (an abort): voices, pending starts and the
     /// remaining BGM stop, and queued key sounds are discarded.
     pub(crate) fn cancel(&mut self, queue: &mut AudioQueue) {

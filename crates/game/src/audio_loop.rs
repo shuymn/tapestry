@@ -167,11 +167,12 @@ pub enum AudioCtl {
 }
 
 /// A READY candidate's transport authorization (design.md "Play
-/// Lifecycle", the start gate): before the engine pass whose block reaches
-/// chart time `commit_at` (0, or a round's lead-in start), the audio
-/// thread commits `generation` on `gate`; when the commit finds it
-/// cancelled or stale, every sound of the play stops there, so its
-/// scheduled chart start and restore never run.
+/// Lifecycle", the start gate): the engine holds the play's transport,
+/// and the pass whose block reaches chart time `commit_at` (0, or a
+/// round's lead-in start), by that pass's own wake and its actual block,
+/// commits `generation` on `gate` before anything of the schedule starts;
+/// when the commit finds it cancelled or stale, every sound of the play
+/// stops there, so its scheduled chart start and restore never run.
 #[derive(Clone, Debug)]
 pub struct TransportGate {
     /// The start gate the input thread cancels.
@@ -544,7 +545,7 @@ impl AudioControl {
 
     /// [`play_at`](Self::play_at) for a READY candidate whose transport
     /// waits for `gate` (design.md "Play Lifecycle", the start gate): the
-    /// audio thread commits it before the pass reaching its commit point,
+    /// audio thread commits it in the pass reaching its commit point,
     /// and drops the play's sounds there when it was cancelled.
     ///
     /// # Errors
@@ -869,6 +870,9 @@ impl AudioWorker {
                     let restored = restore
                         .as_deref()
                         .map_or(0, |r| r.apply(&mut self.engine).code());
+                    if let Some(t) = &self.transport {
+                        self.engine.hold_transport(t.commit_at);
+                    }
                     self.shared
                         .restored
                         .store(generation << 8 | u64::from(restored), Ordering::Release);
@@ -892,6 +896,7 @@ impl AudioWorker {
                 AudioCtl::Cancel => self.drop_play(),
                 AudioCtl::Rearm { origin, gate } => {
                     self.engine.restart(origin);
+                    self.engine.hold_transport(gate.commit_at);
                     self.origin = origin;
                     self.transport = Some(gate);
                     self.steady_from = Some(origin);
@@ -921,25 +926,33 @@ impl AudioWorker {
         }
     }
 
-    /// Before an engine pass: commits the READY candidate's transport when
-    /// the pass's block reaches its commit point, or drops the play when
-    /// the commit finds the candidate cancelled or stale.
-    fn commit_transport(&mut self) {
-        let Some(t) = &self.transport else {
-            return;
+    /// One engine pass, the READY candidate's transport held: the pass
+    /// whose block reaches its commit point, by that pass's own wake and
+    /// actual block, commits it before anything of the schedule starts,
+    /// or drops the play when the commit finds the candidate cancelled or
+    /// stale.
+    fn engine_step(
+        &mut self,
+        out: &mut impl AudioOutput,
+    ) -> Result<::audio::StepReport, OutputError> {
+        let Self {
+            engine,
+            queue,
+            transport,
+            ..
+        } = self;
+        let mut admit = || {
+            transport
+                .as_ref()
+                .is_some_and(|t| t.gate.commit(t.generation))
         };
-        let line = self.engine.frame_line_at(self.origin);
-        let end = i64::try_from(line.block_start)
-            .unwrap_or(i64::MAX)
-            .saturating_add(i64::from(line.period));
-        if line.frame(t.commit_at) >= end {
-            return;
+        let report = engine.step_admitting(out, queue.commands(), &mut admit)?;
+        match report.transport {
+            Some(true) => self.transport = None,
+            Some(false) => self.drop_play(),
+            None => {}
         }
-        if t.gate.commit(t.generation) {
-            self.transport = None;
-        } else {
-            self.drop_play();
-        }
+        Ok(report)
     }
 
     /// Publishes where a play's chart times fall on the output now
@@ -986,8 +999,7 @@ impl AudioWorker {
             return Ok(false);
         }
         self.change_queue(out);
-        self.commit_transport();
-        let stepped = self.engine.step(out, self.queue.commands());
+        let stepped = self.engine_step(out);
         // A failed write may have mixed, and stolen voices, first.
         self.shared
             .deferred_wakes

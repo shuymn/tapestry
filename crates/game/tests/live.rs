@@ -234,6 +234,7 @@ struct Fake {
     /// resumes a loading lifetime.
     gated: bool,
     lifetime: bool,
+    generation: u32,
 }
 
 impl Fake {
@@ -301,6 +302,7 @@ impl Fake {
             closed_phases: Vec::new(),
             gated: false,
             lifetime: false,
+            generation: 0,
         }
     }
 
@@ -486,12 +488,13 @@ impl Rig for Fake {
     fn open_candidate(
         &mut self,
         lead_in: TimeUs,
-        _generation: u32,
+        generation: u32,
     ) -> Result<Option<Opening<SourceReader>>, InputWaitError> {
         if self.sources.holding() {
             self.steps.push("deferred");
             return Ok(None);
         }
+        self.generation = generation;
         self.open(lead_in).map(Some)
     }
 
@@ -510,7 +513,7 @@ impl Rig for Fake {
     /// The transport commits as soon as it is asked.
     fn candidate(&self) -> input::GateState {
         input::GateState {
-            generation: 1,
+            generation: self.generation,
             phase: input::GatePhase::Committed,
         }
     }
@@ -2849,6 +2852,35 @@ fn a_retry_prepares_with_the_refreshed_play_preset_not_the_viewed_one() {
     // Fresh per attempt: its own number, from the same chart.
     assert_eq!((one.number, two.number), (1, 2));
     assert_eq!(one.kind, two.kind);
+}
+
+/// A screen lost while a held START defers the opening ends the run as
+/// before any opening, without waiting for the release: recording never
+/// opens. Exercises `game::live::play_and_next` through `open_gated`.
+#[test]
+fn a_screen_lost_while_the_opening_is_deferred_opens_nothing() {
+    const Q: ControlId = ControlId(0x10);
+    let dir = tempfile::tempdir().unwrap();
+    let mut loaded = loaded(dir.path());
+    let items = vec![key(CLOCK_START, Q, 1), key(9_000_000, Q, 0)];
+    let mut rig = Fake::new(items, &[], 11_000_000);
+    let (mut tap, _rx) = input::adjustment_queue(input::AdjustmentBindings {
+        controls: vec![(input::TapControl::Key(Q), 0)],
+        latched: 1,
+        wrap: None,
+    })
+    .unwrap();
+    tap.set_active(true);
+    rig.sources.set_adjustment(tap);
+    rig.gated = true;
+    rig.screen_fails_at = 8_000_000;
+    let ran = game::live::run_chart(&mut loaded, &mut rig);
+    assert!(matches!(ran, Err(LiveError::ScreenLost)), "{ran:?}");
+    assert_eq!(rig.opens, 0);
+    assert!(
+        rig.clock.now().0 < 9_000_000,
+        "it did not wait for the release"
+    );
 }
 
 /// With the start gate (design.md "Play Lifecycle", the start gate), a
