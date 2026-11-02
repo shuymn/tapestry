@@ -405,6 +405,9 @@ pub struct AudioWorker {
     rearmed: rtrb::Producer<Box<Restore>>,
     /// A replaced restore the full queue did not take.
     unreturned_restore: Option<Box<Restore>>,
+    /// What waits aside for that one to go back, out of the control
+    /// queue, so the commands behind it are still taken.
+    held: Option<Held>,
     /// Where key sound latencies go, if anywhere; a full queue drops them.
     probe: Option<rtrb::Producer<AudioProbe>>,
     /// The number of the latest queue change applied.
@@ -413,6 +416,21 @@ pub struct AudioWorker {
     steady_from: Option<TimeUs>,
     /// The play's underruns counted so far.
     steady: u32,
+}
+
+/// A rearm the audio thread set aside while the restore it would replace
+/// had nowhere to go back: applied once that one went back, or, cancelled
+/// or superseded first, its own restore going back in its place.
+#[derive(Debug)]
+enum Held {
+    /// A rearm not yet applied.
+    Rearm {
+        origin: TimeUs,
+        gate: TransportGate,
+        restore: Box<Restore>,
+    },
+    /// A rearm's restore that never played, to go back.
+    Returning(Box<Restore>),
 }
 
 /// The two ends around `engine`, which is stopped until the first play.
@@ -463,6 +481,7 @@ pub fn audio_control(mut engine: AudioEngine) -> (AudioControl, AudioWorker) {
         unreturned: None,
         rearmed: rearm_tx,
         unreturned_restore: None,
+        held: None,
         probe: None,
         queue_change: 0,
         steady_from: None,
@@ -605,8 +624,9 @@ impl AudioControl {
     /// `restore` ([`AudioCtl::Rearm`]). Send it once the cancellation is
     /// acknowledged ([`AudioCounters::dropped`]). The restore it replaces
     /// comes back ([`take_restore`](Self::take_restore)); while one
-    /// replaced earlier is neither taken back nor queued, the rearm waits
-    /// on the audio thread, so none is freed there.
+    /// replaced earlier is neither taken back nor queued, the audio thread
+    /// sets the rearm aside until it is, still taking a cancel or an exit
+    /// behind it, so none is freed there.
     pub fn rearm(&mut self, origin: TimeUs, gate: TransportGate, restore: Option<Box<Restore>>) {
         self.send(AudioCtl::Rearm {
             origin,
@@ -837,10 +857,22 @@ impl AudioWorker {
             // Checked by `set_volume`.
             let _ = self.engine.set_volume(f32::from_bits(volume as u32));
         }
-        if let Some(old) = self.unreturned_restore.take()
-            && let Err(rtrb::PushError::Full(old)) = self.rearmed.push(old)
-        {
-            self.unreturned_restore = Some(old);
+        if let Some(old) = self.unreturned_restore.take() {
+            self.give_back(old);
+        }
+        // What waits aside goes ahead of every command behind it.
+        match self.held.take() {
+            Some(Held::Rearm {
+                origin,
+                gate,
+                restore,
+            }) if self.unreturned_restore.is_none() => {
+                self.rearm(origin, gate, Some(restore));
+            }
+            Some(Held::Returning(restore)) if self.unreturned_restore.is_none() => {
+                self.give_back(restore);
+            }
+            held => self.held = held,
         }
         if let Some(old) = self.unreturned.take()
             && let Err(rtrb::PushError::Full(old)) = self.retired.push(old)
@@ -862,9 +894,12 @@ impl AudioWorker {
                 break;
             }
             // Nor is a replaced restore not yet handed back: a rearm
-            // carrying another waits in the queue until the return queue
-            // takes it, so no restore is ever freed on this thread.
-            if self.unreturned_restore.is_some()
+            // carrying another is set aside until it is (below), and one
+            // more, with that place taken, waits in the queue, so no
+            // restore is ever freed on this thread. The game thread takes
+            // the returns back at every replan and attempt start, so the
+            // place is free whenever a rearm can follow.
+            if self.held.is_some()
                 && matches!(
                     self.ctl.peek(),
                     Ok(AudioCtl::Rearm {
@@ -908,6 +943,8 @@ impl AudioWorker {
                     restore,
                     gate,
                 } => {
+                    // A rearm set aside belonged to the play before.
+                    self.release_held(false);
                     // A `Gain` is always in range.
                     let _ = self.engine.set_gain(gain.get());
                     self.begin(origin, gate, restore.as_deref(), generation);
@@ -928,25 +965,26 @@ impl AudioWorker {
                     self.steady = 0;
                     self.publish_steady();
                 }
-                AudioCtl::Cancel => self.drop_play(),
+                AudioCtl::Cancel => {
+                    self.release_held(true);
+                    self.drop_play();
+                }
+                AudioCtl::Rearm {
+                    origin,
+                    gate,
+                    restore: Some(restore),
+                } if self.unreturned_restore.is_some() => {
+                    self.held = Some(Held::Rearm {
+                        origin,
+                        gate,
+                        restore,
+                    });
+                }
                 AudioCtl::Rearm {
                     origin,
                     gate,
                     restore,
-                } => {
-                    self.begin(origin, Some(gate), restore.as_deref(), self.generation);
-                    self.steady_from = Some(origin);
-                    if restore.is_some() {
-                        let old = std::mem::replace(&mut self.restore, restore);
-                        // One rearm's restore is in flight at a time; were
-                        // the queue full, it would wait here, still owned.
-                        if let Some(old) = old
-                            && let Err(rtrb::PushError::Full(old)) = self.rearmed.push(old)
-                        {
-                            self.unreturned_restore = Some(old);
-                        }
-                    }
-                }
+                } => self.rearm(origin, gate, restore),
                 AudioCtl::Seal => self.sealed = true,
                 AudioCtl::RingOut { fade_at, end_at } => {
                     self.engine.ring_out(fade_at, end_at);
@@ -956,6 +994,41 @@ impl AudioWorker {
             }
         }
         !self.exited
+    }
+
+    /// The rearmed candidate's start, chart time 0 at `origin`, waiting
+    /// for `gate`; a round's `restore` replaces the play's, which goes
+    /// back to the game thread.
+    fn rearm(&mut self, origin: TimeUs, gate: TransportGate, restore: Option<Box<Restore>>) {
+        self.begin(origin, Some(gate), restore.as_deref(), self.generation);
+        self.steady_from = Some(origin);
+        if restore.is_some()
+            && let Some(old) = std::mem::replace(&mut self.restore, restore)
+        {
+            self.give_back(old);
+        }
+    }
+
+    /// Hands `restore` back to the game thread, or keeps it until the
+    /// return queue has room; never freed here.
+    fn give_back(&mut self, restore: Box<Restore>) {
+        if let Err(rtrb::PushError::Full(restore)) = self.rearmed.push(restore) {
+            self.unreturned_restore = Some(restore);
+        }
+    }
+
+    /// A rearm set aside is cancelled, or superseded by a play, before it
+    /// was applied: its restore goes back unplayed, and a cancellation
+    /// acknowledges its candidate's drop (`acknowledge`).
+    fn release_held(&mut self, acknowledge: bool) {
+        if let Some(Held::Rearm { gate, restore, .. }) = self.held.take() {
+            if acknowledge {
+                self.shared
+                    .dropped
+                    .store(u64::from(gate.generation) + 1, Ordering::Release);
+            }
+            self.held = Some(Held::Returning(restore));
+        }
     }
 
     /// A play's or a rearmed candidate's start, chart time 0 at `origin`:

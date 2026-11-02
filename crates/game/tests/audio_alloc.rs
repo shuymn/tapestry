@@ -142,10 +142,11 @@ fn audio_loop_neither_allocates_nor_frees_across_retries() {
     }
     assert_eq!(counting::calls(), 0);
     // Three gated practice attempts with one rearm each, the game thread
-    // taking none of the restores the rearms replace until the third: the
-    // first fills the return queue, the second's waits on the audio thread,
-    // and the third rearm waits in the control queue rather than free
-    // either there; once the game thread takes one back, it applies.
+    // taking back none of the restores the rearms replace: the first fills
+    // the return queue, the second's waits on the audio thread, and the
+    // third rearm is set aside rather than free either there. Its
+    // cancellation is still taken and acknowledged, and so is the exit,
+    // with every restore still owned.
     let gate = input::StartGate::new();
     let transport = |generation| game::TransportGate {
         gate: gate.clone(),
@@ -180,17 +181,18 @@ fn audio_loop_neither_allocates_nor_frees_across_retries() {
         gate.arm(generation);
         control.rearm(origin, transport(generation), Some(spare));
         steps(&mut worker, 2);
-        if attempt == 2 {
-            assert!(control.take_restore().is_some());
-            steps(&mut worker, 2);
-        }
         assert_eq!(gate.cancel(), Some(generation));
         control.cancel();
         steps(&mut worker, 2);
         assert!(control.counters().dropped(generation), "attempt {attempt}");
     }
-    while control.take_restore().is_some() {
-        steps(&mut worker, 1);
-    }
+    control.exit();
+    counting::track(true);
+    let running = worker.step(&mut out).unwrap();
+    counting::track(false);
+    assert!(!running, "the exit was not taken");
     assert_eq!(counting::calls(), 0, "the audio thread allocated or freed");
+    // The restores the game thread never took are still owned, and go
+    // back once it takes them.
+    assert!(control.take_restore().is_some());
 }
