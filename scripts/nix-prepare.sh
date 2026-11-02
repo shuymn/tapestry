@@ -9,10 +9,10 @@ set -euo pipefail
 [ "$#" -ge 1 ] || { echo "usage: scripts/nix-prepare.sh <shell>..." >&2; exit 2; }
 cd "$(git -C "$(dirname -- "${BASH_SOURCE[0]}")" rev-parse --show-toplevel)"
 
-# A try normally takes under a minute; three of them and the pauses stay
-# well inside the jobs' 30 minutes.
+# A try normally takes under a minute; at most 3 min with the kill, two
+# shells of three tries and the pauses leave the jobs time for their checks.
 tries=3
-try_seconds=240
+try_seconds=150
 profiles=${RUNNER_TEMP:-${TMPDIR:-/tmp}}/nix-shells
 mkdir -p "$profiles"
 for shell in "$@"; do
