@@ -2,23 +2,30 @@
 # Realise the flake's dev shells before CI uses them, trying each up to three
 # times: cache.nixos.org drops a download now and then, and a later step
 # would fail on it. Only the shells' inputs are retried here, never a test.
+# Each shell is kept as a profile (a GC root) for the rest of the job.
 # Usage: scripts/nix-prepare.sh <shell>...
 set -euo pipefail
 
 [ "$#" -ge 1 ] || { echo "usage: scripts/nix-prepare.sh <shell>..." >&2; exit 2; }
 cd "$(git -C "$(dirname -- "${BASH_SOURCE[0]}")" rev-parse --show-toplevel)"
 
+# A try normally takes under a minute; three of them and the pauses stay
+# well inside the jobs' 30 minutes.
 tries=3
+try_seconds=240
+profiles=${RUNNER_TEMP:-${TMPDIR:-/tmp}}/nix-shells
+mkdir -p "$profiles"
 for shell in "$@"; do
   for try in $(seq "$tries"); do
-    if timeout 900 nix develop ".#$shell" --command true; then
-      break
-    fi
+    status=0
+    timeout --kill-after=30 "$try_seconds" \
+      nix develop ".#$shell" --profile "$profiles/$shell" --command true || status=$?
+    [ "$status" -eq 0 ] && break
     if [ "$try" -eq "$tries" ]; then
-      echo "the $shell shell failed $tries times" >&2
+      echo "the $shell shell failed $tries times, last with status $status" >&2
       exit 1
     fi
-    echo "::warning::the $shell shell failed (try $try of $tries); trying again"
+    echo "::warning::the $shell shell failed with status $status (try $try of $tries); trying again"
     sleep $((try * 15))
   done
 done
