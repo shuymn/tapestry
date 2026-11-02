@@ -114,9 +114,11 @@ pub enum NoteOrder {
     /// order.
     #[default]
     LaneMajor,
-    /// Every lane's notes merged by their heads: by position, then time,
-    /// then the lane's place in `lanes`, then the note's place in its
-    /// lane. `lanes` lists every [`Lane::index`] once, first painted
+    /// Every lane's notes merged by their heads: by the head's timeline
+    /// row ([`NoteAnchors::head`](bms_model::NoteAnchors::head)), then the
+    /// lane's place in `lanes`, then the note's place in its lane. Rows
+    /// are exact identities, so heads whose distinct source positions
+    /// floor to one µs and one position keep their positions' order. `lanes` lists every [`Lane::index`] once, first painted
     /// first. A long note's parts stay together at its head's place.
     Timeline { lanes: [u8; LANE_COUNT] },
 }
