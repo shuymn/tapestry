@@ -25,8 +25,9 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use bms_model::{Chart, TimeUs};
 use eval::Section;
 use skin_model::{
-    Atlas, BuildError, Canvas, ChartText, CoverSettings, FrameReadouts, LaneView, Layout, Loading,
-    Page, Play, Side, Skin, SkinFrame, TextSlots, TextTable, TextTableError, UvTable,
+    Atlas, BitmapLines, BuildError, Canvas, ChartText, CoverSettings, FrameReadouts, LaneView,
+    Layout, Loading, Page, Play, Side, Skin, SkinFrame, TextSlots, TextTable, TextTableError,
+    UvTable,
 };
 
 use crate::projection::ClipTable;
@@ -327,16 +328,18 @@ impl LoadingPresentation {
     }
 
     /// Installs the chosen chart's text of `revision` for `lifetime` into
-    /// the slots `which` names, `table`'s lines, or clears them without
-    /// one, if the state belongs to `lifetime` and no newer revision is
-    /// installed for it; no timer changes.
+    /// the slots `which` names, if the state belongs to `lifetime` and no
+    /// newer revision is installed for it: the rasterized slots take
+    /// `table`'s lines, or are cleared without one, and the bitmap-font
+    /// slots take `bitmap`'s, moved in with nothing laid out; no timer
+    /// changes.
     ///
     /// # Errors
     ///
     /// [`LoadingTextError::Lifetime`](crate::LoadingTextError::Lifetime)
     /// and [`LoadingTextError::Older`](crate::LoadingTextError::Older) for
-    /// text of another lifetime or an older revision, and a table that
-    /// does not fit: nothing changes.
+    /// text of another lifetime or an older revision, and a table or
+    /// bitmap lines that do not fit: nothing changes.
     pub(crate) fn install_revision(
         &self,
         bundle: &SkinBundle,
@@ -344,6 +347,7 @@ impl LoadingPresentation {
         revision: u64,
         which: TextSlots,
         table: Option<&TextTable>,
+        bitmap: BitmapLines,
     ) -> Result<(), crate::LoadingTextError> {
         let mut p = self.lock();
         if p.lifetime != Some(lifetime) {
@@ -355,10 +359,21 @@ impl LoadingPresentation {
                 revision,
             });
         }
+        let expected = bundle.skin.text_slots();
+        if bitmap.len() != expected {
+            return Err(TextTableError::Len {
+                expected,
+                got: bitmap.len(),
+            }
+            .into());
+        }
         match table {
             Some(t) => bundle.skin.install_loading_text(&mut p.loading, which, t)?,
             None => bundle.skin.clear_loading_text(&mut p.loading, which),
         }
+        bundle
+            .skin
+            .install_loading_bitmap_lines(&mut p.loading, which, bitmap)?;
         p.text = Some(revision);
         Ok(())
     }

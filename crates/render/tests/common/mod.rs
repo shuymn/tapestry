@@ -3,10 +3,14 @@
 
 #![allow(dead_code)]
 
+use std::sync::Arc;
+use std::time::Duration;
+
 use bms_model::{Chart, Lane, TimeUs};
 use eval::{GaugeState, JudgeEvent, Tally};
 use game::PlayView;
-use render::{AdapterChoice, AttemptInput, FrameInput, Renderer, Target};
+use render::text::MenuText;
+use render::{AdapterChoice, AttemptInput, FrameInput, LoadingFrame, Renderer, SkinBundle, Target};
 use rules::{GaugeValue, PerJudgment};
 use skin_model::{Attempt, ChartText, GaugeDesc, GaugeLook, PlayContext, Side};
 
@@ -140,6 +144,31 @@ pub fn input<'a>(
         overlay: &[],
         target: [WIDTH, HEIGHT],
     }
+}
+
+/// `r`'s read back once its submitted frames finished, within 10 s.
+#[track_caller]
+pub fn read_back(r: &Renderer) -> Vec<u8> {
+    let done = r.gpu().device().poll(wgpu::PollType::Wait {
+        submission_index: None,
+        timeout: Some(Duration::from_secs(10)),
+    });
+    assert!(done.is_ok(), "frames: {done:?}");
+    r.read_back()
+}
+
+/// Draws loading frame `f` with `text` and reads it back.
+#[track_caller]
+pub fn loading(r: &mut Renderer, text: &MenuText, f: &LoadingFrame<'_>) -> Vec<u8> {
+    let timing = r.loading_frame(f, text).unwrap().unwrap();
+    assert!(timing.presented);
+    read_back(r)
+}
+
+/// Installs `b` chart-independently for `request` and commits it.
+pub fn install(r: &mut Renderer, b: &Arc<SkinBundle>, request: u64) {
+    let token = r.install(b, request).unwrap();
+    r.commit(token).unwrap();
 }
 
 /// The RGB of pixel `(x, y)` of a `width`-wide RGBA8 read back.

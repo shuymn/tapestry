@@ -11,7 +11,9 @@ use std::time::{Duration, Instant};
 
 use bms_model::Chart;
 use eval::Section;
-use skin_model::{AtlasLimits, BuildError, ChartText, TextSlots, TextTable, TextTableError};
+use skin_model::{
+    AtlasLimits, BitmapLines, BuildError, ChartText, TextSlots, TextTable, TextTableError,
+};
 use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
 use windows::Win32::Graphics::Dxgi::{DXGI_FRAME_STATISTICS, IDXGISwapChain3};
 use windows::Win32::System::Threading::WaitForSingleObject;
@@ -143,18 +145,21 @@ struct StagedText {
     lifetime: u64,
     revision: u64,
     which: TextSlots,
-    /// The producer's lines; `None` clears the slots.
+    /// The producer's lines; `None` clears the rasterized slots.
     table: Option<TextTable>,
+    /// The bitmap-font slots' lines, laid out by the skin.
+    bitmap: BitmapLines,
 }
 
 impl StagedText {
-    /// The bytes it holds, itself and its lines.
+    /// The bytes it holds: itself, its rasterized lines, and its bitmap
+    /// lines with their glyphs.
     fn bytes(&self) -> u64 {
         let lines = self
             .table
             .as_ref()
             .map_or(0, |t| t.len() * size_of::<Option<skin_model::TextImage>>());
-        u64::try_from(size_of::<Self>() + lines).unwrap_or(u64::MAX)
+        u64::try_from(size_of::<Self>() + lines + self.bitmap.heap_bytes()).unwrap_or(u64::MAX)
     }
 }
 
@@ -1447,14 +1452,15 @@ impl Renderer {
     }
 
     /// Prepares the chosen chart's text `chart` of `revision` for loading
-    /// lifetime `lifetime`, the slots `which` names, with the producer of
-    /// the installation in use, and holds it staged until
+    /// lifetime `lifetime`, the slots `which` names: the rasterized lines
+    /// with the producer of the installation in use, and the bitmap-font
+    /// lines laid out by its skin. It holds both staged until
     /// [`install_staged_loading_text`](Self::install_staged_loading_text),
-    /// replacing text staged before: at most one table waits. Before
+    /// replacing text staged before: at most one preparation waits. Before
     /// recording opens and outside a frame's build, such as in a loading
     /// frame's call before it builds: it allocates. Nothing is staged without
     /// a declarative installation; without a producer, the staged text
-    /// clears the slots.
+    /// clears the rasterized slots, and its bitmap lines still install.
     ///
     /// # Errors
     ///
@@ -1476,12 +1482,14 @@ impl Renderer {
             Some(text) => text.prepare(bundle.skin(), chart, self.target())?,
             None => None,
         };
+        let bitmap = bundle.skin().loading_bitmap_lines(which, chart);
         self.staged_text = Some(StagedText {
             key,
             lifetime,
             revision,
             which,
             table,
+            bitmap,
         });
         Ok(())
     }
@@ -1517,6 +1525,7 @@ impl Renderer {
             staged.revision,
             staged.which,
             staged.table.as_ref(),
+            staged.bitmap,
         )?;
         Ok(true)
     }
@@ -1680,16 +1689,17 @@ impl Renderer {
             pass.set_vertex_buffer(0, self.instances.slice(..));
             // The runs in the batch's order, so each sprite is drawn over
             // every sprite pushed before it, whatever their blends. Each run
-            // sets its scissor when it differs from the one set: an
-            // unclipped run sets the whole target back, and a run whose clip
-            // keeps no pixel is not drawn.
+            // sets its scissor, its fixed clip's intersected with its inline
+            // clip rect's, when it differs from the one set: an unclipped
+            // run sets the whole target back, and a run whose clips keep no
+            // pixel is not drawn.
             let mut scissor = full;
             for run in self.staging.batch().runs() {
                 let end = run.end.min(staged);
                 if run.start >= end {
                     break;
                 }
-                let rect = match self.staging.scissor(run.key.clip) {
+                let rect = match self.staging.run_scissor(run) {
                     Scissor::Full => full,
                     Scissor::Rect(rect) => rect,
                     Scissor::Empty => continue,

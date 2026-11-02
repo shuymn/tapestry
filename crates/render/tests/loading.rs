@@ -17,10 +17,11 @@ mod decl_support;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::Duration;
 
 use bms_model::{Chart, ChartBuilder, TimeUs};
-use common::{GAUGES, VISIBLE, attempt, context, input, offscreen, view};
+use common::{
+    GAUGES, VISIBLE, attempt, context, input, install, loading, offscreen, read_back, view,
+};
 use decl_support::{
     ANIMATION, ARTIST, BACKGROUND, FULL_TITLE, GENRE, Look, TITLE, WHEN_MARK, WHEN_SLOT, bundle,
 };
@@ -40,17 +41,6 @@ fn chart() -> Chart {
     ChartBuilder::new(120_000).build().unwrap()
 }
 
-/// `r`'s read back once its submitted frames finished.
-#[track_caller]
-fn read_back(r: &Renderer) -> Vec<u8> {
-    let done = r.gpu().device().poll(wgpu::PollType::Wait {
-        submission_index: None,
-        timeout: Some(Duration::from_secs(10)),
-    });
-    assert!(done.is_ok(), "frames: {done:?}");
-    r.read_back()
-}
-
 /// The RGB at the centre of canvas rect `rect` of a 1920-wide read back.
 fn at(pixels: &[u8], rect: [i32; 4]) -> [u8; 3] {
     let [x, y, w, h] = rect.map(|v| u32::try_from(v).unwrap());
@@ -68,26 +58,12 @@ fn frame_at(lifetime: u64, now: i64) -> LoadingFrame<'static> {
     LoadingFrame::interim(lifetime, TimeUs(now * MS), TimeUs(0), VISIBLE)
 }
 
-/// Draws loading frame `f` with `text` and reads it back.
-#[track_caller]
-fn loading(r: &mut Renderer, text: &MenuText, f: &LoadingFrame<'_>) -> Vec<u8> {
-    let timing = r.loading_frame(f, text).unwrap().unwrap();
-    assert!(timing.presented);
-    read_back(r)
-}
-
 /// Red, with the loading elements.
 fn loader() -> Look {
     Look {
         loading: true,
         ..Look::left([255, 0, 0, 255])
     }
-}
-
-/// Installs `b` chart-independently for `request` and commits it.
-fn install(r: &mut Renderer, b: &Arc<SkinBundle>, request: u64) {
-    let token = r.install(b, request).unwrap();
-    r.commit(token).unwrap();
 }
 
 /// Stages `b` with a fresh attempt for `request`.

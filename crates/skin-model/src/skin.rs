@@ -31,7 +31,7 @@ use crate::widget::cover_paint::{
 use crate::widget::digits::{Align, Digits, MAX_DIGIT_OFFSETS, Number, NumberDef, NumberError};
 use crate::widget::gauge::{Gauge, GaugeDef, GaugeDraw, GaugeError, Shown};
 use crate::widget::glyphs;
-use crate::widget::glyphs::GlyphLine;
+use crate::widget::glyphs::{BitmapLines, GlyphLine};
 use crate::widget::image_choice::{
     ChoicePart, ImageChoice, ImageChoiceDef, ImageChoiceError, MAX_IMAGE_CHOICE_REFS,
 };
@@ -1777,25 +1777,72 @@ impl Skin {
         Ok(())
     }
 
+    /// Lays out `chart`'s lines in bitmap fonts for the slots `which`
+    /// names, as [`attach_bitmap_text`](Self::attach_bitmap_text) does for
+    /// a play, to install later
+    /// ([`install_loading_bitmap_lines`](Self::install_loading_bitmap_lines));
+    /// every other slot has none. Preparation, not a build: it allocates.
+    #[must_use]
+    pub fn loading_bitmap_lines(&self, which: TextSlots, chart: &ChartText<'_>) -> BitmapLines {
+        let mut lines = vec![None; self.text_slots()];
+        for (slot, value, font) in self.named_slots(which) {
+            let Some(font) = font else {
+                continue;
+            };
+            if let Some(s) = lines.get_mut(usize::from(slot)) {
+                *s = glyphs::layout(&self.sheet, font, &text::clean(&value.resolve(chart)));
+            }
+        }
+        BitmapLines::new(lines.into_boxed_slice())
+    }
+
+    /// Installs `lines` into `loading`'s bitmap-font slots that `which`
+    /// names, each taking its line or, with none, cleared; other slots
+    /// keep theirs, and no timer changes. The lines move in, so nothing is
+    /// laid out or allocated; the lines they replace are dropped.
+    ///
+    /// # Errors
+    ///
+    /// Lines whose length is not [`text_slots`](Self::text_slots);
+    /// nothing changes.
+    pub fn install_loading_bitmap_lines(
+        &self,
+        loading: &mut Loading,
+        which: TextSlots,
+        mut lines: BitmapLines,
+    ) -> Result<(), TextTableError> {
+        let expected = self.text_slots();
+        if lines.len() != expected {
+            return Err(TextTableError::Len {
+                expected,
+                got: lines.len(),
+            });
+        }
+        for (slot, _, font) in self.named_slots(which) {
+            if font.is_none() {
+                continue;
+            }
+            if let Some(s) = loading.bitmap_mut().get_mut(usize::from(slot)) {
+                *s = lines.take(slot);
+            }
+        }
+        Ok(())
+    }
+
     /// Lays out `chart`'s lines in bitmap fonts for `loading`'s slots that
-    /// `which` names, as [`attach_bitmap_text`](Self::attach_bitmap_text)
-    /// does for a play, and installs them; other slots keep theirs, and no
-    /// timer changes. For between frames, not in a build: it allocates.
+    /// `which` names and installs them at once
+    /// ([`loading_bitmap_lines`](Self::loading_bitmap_lines), then
+    /// [`install_loading_bitmap_lines`](Self::install_loading_bitmap_lines)).
+    /// For between frames, not in a build: it allocates.
     pub fn install_loading_bitmap_text(
         &self,
         loading: &mut Loading,
         which: TextSlots,
         chart: &ChartText<'_>,
     ) {
-        for (slot, value, font) in self.named_slots(which) {
-            let Some(font) = font else {
-                continue;
-            };
-            let line = glyphs::layout(&self.sheet, font, &text::clean(&value.resolve(chart)));
-            if let Some(s) = loading.bitmap_mut().get_mut(usize::from(slot)) {
-                *s = line;
-            }
-        }
+        let lines = self.loading_bitmap_lines(which, chart);
+        // Laid out by this skin: its length is the skin's slots.
+        let _ = self.install_loading_bitmap_lines(loading, which, lines);
     }
 
     /// Clears `loading`'s slots that `which` names, rasterized and bitmap

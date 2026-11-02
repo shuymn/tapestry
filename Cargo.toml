@@ -23,6 +23,7 @@ audio = { path = "crates/audio" }
 render = { path = "crates/render" }
 library = { path = "crates/library" }
 skin-model = { path = "crates/skin-model" }
+skin-beatoraja = { path = "crates/skin-beatoraja" }
 
 # bms-parser (md-5 also library)
 chardetng = "1.0.0"

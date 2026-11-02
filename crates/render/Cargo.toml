@@ -34,6 +34,8 @@ windows = { workspace = true, features = [
 # Charts loaded from BMS text in the simple skin's tests.
 criterion.workspace = true
 bms-parser.workspace = true
+# Self-made imported skins through the real importer.
+skin-beatoraja.workspace = true
 # The pinned font's hash and the expected image of the menu text test.
 png.workspace = true
 sha2.workspace = true
