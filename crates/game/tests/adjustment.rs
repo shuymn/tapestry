@@ -1282,6 +1282,29 @@ fn the_session_clock_runs_in_real_time_and_the_speed_scales_only_the_tempo() {
 }
 
 #[test]
+fn a_duration_whose_lowest_terms_fit_is_exact() {
+    // B = 150 + 1/(2·10¹⁶): H fits, and T is exactly 500 ms.
+    let b = r(3_000_000_000_000_000_001, 20_000_000_000_000_000);
+    let hs = solve(b, 300, &Covers::default()).unwrap();
+    assert_eq!(duration_ms(b, hs, &Covers::default()).unwrap(), bpm(500));
+    assert_eq!(green(b, hs, &Covers::default()).unwrap(), bpm(300));
+}
+
+#[test]
+fn no_field_left_is_zero_before_any_product() {
+    let b = r(3_000_000_000_000_000_001, 20_000_000_000_000_000);
+    let hs = solve(b, 300, &Covers::default()).unwrap();
+    let lift = Covers {
+        lift: Cover {
+            amount: 1000,
+            on: true,
+        },
+        ..Covers::default()
+    };
+    assert_eq!(duration_ms(b, hs, &lift).unwrap(), bpm(0));
+}
+
+#[test]
 fn a_failed_reattachment_keeps_the_switch_and_the_multiplier() {
     let covers = Covers {
         sudden: Cover {

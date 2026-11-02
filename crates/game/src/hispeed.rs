@@ -492,19 +492,40 @@ pub fn step_hispeed(h: Ratio, hundredths: i64) -> Result<Ratio, Unrepresentable>
 ///
 /// # Errors
 ///
-/// [`Unrepresentable`] when `bpm` or `h` is 0, or the exact terms do not
+/// [`Unrepresentable`] when `bpm` or `h` is 0, or the lowest terms do not
 /// fit.
 pub fn duration_ms(bpm: Ratio, h: Ratio, covers: &Covers) -> Result<Ratio, Unrepresentable> {
+    if bpm.num == 0 || h.num == 0 {
+        return Err(Unrepresentable);
+    }
     let (lift, sudden) = covers.field();
+    if lift == 0 || sudden == 0 {
+        return Ok(Ratio::integer(0));
+    }
     // 240000 / 10⁶ = 6/25.
-    let num = (6 * lift * sudden)
-        .checked_mul(u128::from(bpm.den))
-        .and_then(|n| n.checked_mul(u128::from(h.den)))
-        .ok_or(Unrepresentable)?;
-    let den = (u128::from(bpm.num) * u128::from(h.num))
-        .checked_mul(25)
-        .ok_or(Unrepresentable)?;
-    Ratio::reduced(num, den)
+    cancelled(
+        [6 * lift * sudden, u128::from(bpm.den), u128::from(h.den)],
+        [25, u128::from(bpm.num), u128::from(h.num)],
+    )
+}
+
+/// The product of `nums` over the product of `dens`, each pair of factors
+/// cancelled first, so a result whose lowest terms fit never overflows on
+/// the way.
+fn cancelled(mut nums: [u128; 3], mut dens: [u128; 3]) -> Result<Ratio, Unrepresentable> {
+    for n in &mut nums {
+        for d in &mut dens {
+            let g = gcd(*n, *d);
+            *n /= g;
+            *d /= g;
+        }
+    }
+    let product = |f: [u128; 3]| {
+        f.into_iter()
+            .try_fold(1_u128, u128::checked_mul)
+            .ok_or(Unrepresentable)
+    };
+    Ratio::reduced(product(nums)?, product(dens)?)
 }
 
 /// The green number `g = 144000·v / (B·H)`, three fifths of
