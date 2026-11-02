@@ -19,6 +19,12 @@ use crate::render::{PlayView, RenderSide, RenderSink, ViewWriter, render_link};
 pub trait EventSink {
     /// One event.
     fn receive(&mut self, ev: &JudgeEvent);
+    /// A rearmed READY candidate's chart time 0 lies at `origin` on the
+    /// rig's clock (design.md "Play Lifecycle", the start gate); the
+    /// cancelled candidate's events are discarded. Nothing by default.
+    fn rearm(&mut self, origin: TimeUs) {
+        let _ = origin;
+    }
 }
 
 /// The logic thread's end of a source queue: [`input::SourceReader`] in
@@ -28,6 +34,8 @@ pub trait SourceRead {
     fn published(&self) -> Published;
     /// The next queued event in receive order.
     fn pop(&mut self) -> Option<PhysicalInputEvent>;
+    /// Whether no event is queued.
+    fn is_empty(&self) -> bool;
 }
 
 impl SourceRead for SourceReader {
@@ -37,6 +45,10 @@ impl SourceRead for SourceReader {
 
     fn pop(&mut self) -> Option<PhysicalInputEvent> {
         Self::pop(self)
+    }
+
+    fn is_empty(&self) -> bool {
+        Self::is_empty(self)
     }
 }
 
@@ -110,6 +122,9 @@ pub enum AbortCause {
     ScreenFailed,
     /// The input thread failed: the record is incomplete (input failed).
     InputFailed,
+    /// A rearmed practice round's audio restore could not be planned
+    /// (design.md "Play Lifecycle", the start gate).
+    RestoreFailed,
 }
 
 /// What one logic step did.
@@ -162,10 +177,9 @@ impl Record {
     }
 }
 
-/// One source as the logic step sees it.
-#[derive(Debug)]
-struct Source<R> {
-    reader: R,
+/// One source as the logic step sees it, beside its reader.
+#[derive(Clone, Copy, Debug, Default)]
+struct Source {
     /// The receive time of the last event popped.
     last_popped: Option<TimeUs>,
     /// Whether the last pop found the queue empty.
@@ -181,7 +195,10 @@ pub struct Logic<'a, R = SourceReader> {
     evaluator: Evaluator<'a>,
     device: &'a DeviceProfile,
     start: InputStart,
-    sources: Vec<Source<R>>,
+    /// The source readers, by source id; lent out between a cancelled
+    /// READY candidate and its rearm ([`lend_readers`](Self::lend_readers)).
+    readers: Vec<R>,
+    sources: Vec<Source>,
     staged: Vec<Staged>,
     /// The input budget; the record's length is what has been spent.
     inputs: usize,
@@ -277,14 +294,7 @@ impl<'a, R: SourceRead> Logic<'a, R> {
                 Staged::with_capacity(id, per_source)
             })
             .collect();
-        let sources = readers
-            .into_iter()
-            .map(|reader| Source {
-                reader,
-                last_popped: None,
-                drained: false,
-            })
-            .collect();
+        let sources = vec![Source::default(); n];
         let initial = PlayView {
             finalized: None,
             tally: *evaluator.tally(),
@@ -299,6 +309,7 @@ impl<'a, R: SourceRead> Logic<'a, R> {
             evaluator,
             device,
             start: start.clone(),
+            readers,
             sources,
             staged,
             inputs: budget,
@@ -340,9 +351,9 @@ impl<'a, R: SourceRead> Logic<'a, R> {
         }
         // (1) Every watermark first.
         let mut open = false;
-        for (s, p) in self.sources.iter().zip(&mut self.published) {
+        for (r, p) in self.readers.iter().zip(&mut self.published) {
             if p.state != SourceState::Retired {
-                *p = s.reader.published();
+                *p = r.published();
             }
             open |= p.state == SourceState::Open;
         }
@@ -355,9 +366,10 @@ impl<'a, R: SourceRead> Logic<'a, R> {
             return self.idle();
         };
         // (2) Then each source's guaranteed prefix, within the budget.
-        for ((s, p), staged) in self
+        for (((s, r), p), staged) in self
             .sources
             .iter_mut()
+            .zip(&mut self.readers)
             .zip(&self.published)
             .zip(&mut self.staged)
         {
@@ -369,7 +381,7 @@ impl<'a, R: SourceRead> Logic<'a, R> {
             // An event beyond `up_to` ends the pops: the rest of the queue
             // is beyond it too.
             while s.last_popped.is_none_or(|t| t <= up_to) {
-                let Some(ev) = s.reader.pop() else {
+                let Some(ev) = r.pop() else {
                     s.drained = true;
                     break;
                 };
@@ -468,11 +480,11 @@ impl<'a, R: SourceRead> Logic<'a, R> {
 
     /// Pops every queued event into the record, while the budget lasts.
     fn drain_queues(&mut self) {
-        for (s, p) in self.sources.iter_mut().zip(&self.published) {
+        for (r, p) in self.readers.iter_mut().zip(&self.published) {
             if p.state == SourceState::Retired {
                 continue;
             }
-            while let Some(ev) = s.reader.pop() {
+            while let Some(ev) = r.pop() {
                 if self.record.len() < self.inputs {
                     self.record.push(ev);
                 } else {
@@ -572,6 +584,82 @@ impl<'a, R: SourceRead> Logic<'a, R> {
             start: self.start,
             finalized: self.finalized,
         }
+    }
+
+    /// The held-input snapshot the play started from.
+    #[must_use]
+    pub const fn start(&self) -> &InputStart {
+        &self.start
+    }
+
+    /// Every event popped so far, in pop order: a cancelled READY
+    /// candidate's input up to its cancellation ([`crate::HistoryRecorder`]).
+    #[must_use]
+    pub fn popped(&self) -> &[PhysicalInputEvent] {
+        &self.record
+    }
+
+    /// Reserves room for a held-input snapshot of `held` entries, so a
+    /// [`rearm`](Self::rearm) with one that size allocates nothing.
+    pub fn reserve_start(&mut self, held: usize) {
+        self.start
+            .held
+            .reserve(held.saturating_sub(self.start.held.len()));
+    }
+
+    /// Lends the readers out, in source order, between a cancelled READY
+    /// candidate and its rearm: the input side checks and reopens their
+    /// queues ([`input::SourceSet::reopen_candidate`]). No step advances
+    /// until they are back ([`restore_readers`](Self::restore_readers)).
+    /// Moves the vector; nothing is allocated.
+    pub fn lend_readers(&mut self) -> Vec<R> {
+        std::mem::take(&mut self.readers)
+    }
+
+    /// Takes back the readers [`lend_readers`](Self::lend_readers) lent.
+    pub fn restore_readers(&mut self, readers: Vec<R>) {
+        self.readers = readers;
+    }
+
+    /// The readers, to drain a cancelled candidate's events into its
+    /// history.
+    pub fn readers_mut(&mut self) -> &mut [R] {
+        &mut self.readers
+    }
+
+    /// Starts the next READY candidate of the attempt from `start`, its
+    /// chart time 0 at `origin` on the rig's clock (design.md "Play
+    /// Lifecycle", the start gate): the cancelled candidate's evaluator is
+    /// discarded whole ([`Evaluator::reset`]), never rewound or merged;
+    /// its staging, record, publications, effects and sinks start over,
+    /// and the view is published afresh. The readers must be back. Nothing
+    /// is allocated while `start` fits the reserved snapshot
+    /// ([`reserve_start`](Self::reserve_start)).
+    pub fn rearm(&mut self, start: &InputStart, origin: TimeUs) {
+        self.evaluator.reset(start);
+        self.start.opened_at = start.opened_at;
+        self.start.held.clear();
+        self.start.held.extend_from_slice(&start.held);
+        for s in &mut self.sources {
+            *s = Source::default();
+        }
+        for s in &mut self.staged {
+            s.clear();
+        }
+        self.published.fill(Published::open(TimeUs(i64::MIN)));
+        self.merged.clear();
+        self.out.clear();
+        self.record.clear();
+        self.emitted = 0;
+        self.playing = false;
+        self.finalized = None;
+        self.overflowed = false;
+        self.aborted = None;
+        self.render.rearm(origin);
+        for sink in &mut self.sinks {
+            sink.rearm(origin);
+        }
+        self.publish_view();
     }
 
     /// The play as recorded so far.

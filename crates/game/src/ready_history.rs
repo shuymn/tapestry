@@ -14,12 +14,13 @@ use std::ops::Range;
 
 use bms_model::TimeUs;
 use eval::{ControlId, InputStart, PhysicalInputEvent, SourceId};
-use input::{Arrival as InputArrival, SourceReader};
+use input::Arrival as InputArrival;
 use replay::{
     Arrival, CancelReason, CancelledOpening, MAX_CANCELLED_EVENTS, MAX_CANCELLED_OPENINGS,
     MAX_HELD, MAX_OPENING_ARRIVALS, ReadyHistory,
 };
 
+use crate::logic::SourceRead;
 use crate::session::arrival;
 
 type Held = (SourceId, ControlId, i32);
@@ -53,6 +54,8 @@ pub struct HistoryRecorder {
     events: Vec<PhysicalInputEvent>,
     arrivals: Vec<Arrival>,
     exhausted: bool,
+    /// Whether the last kept opening is begun and not sealed.
+    open: bool,
 }
 
 impl HistoryRecorder {
@@ -71,6 +74,7 @@ impl HistoryRecorder {
             events: Vec::with_capacity(MAX_CANCELLED_EVENTS),
             arrivals: Vec::with_capacity(MAX_CANCELLED_OPENINGS * MAX_OPENING_ARRIVALS),
             exhausted: false,
+            open: false,
         }
     }
 
@@ -112,15 +116,32 @@ impl HistoryRecorder {
     /// # Errors
     ///
     /// [`HistoryFull`]; the history is then exhausted.
-    pub fn keep(
+    pub fn keep<R: SourceRead>(
         &mut self,
         start: &InputStart,
         origin: TimeUs,
         closed: TimeUs,
-        readers: &mut [SourceReader],
+        readers: &mut [R],
         arrivals: &[InputArrival],
         reason: CancelReason,
     ) -> Result<(), HistoryFull> {
+        self.begin(start, origin)?;
+        let drained = self.drain(readers);
+        let sealed = self.seal(closed, arrivals, reason);
+        drained.and(sealed)
+    }
+
+    /// Begins keeping the cancelled opening that `start` opened, whose
+    /// time 0 lay at `origin` on the input thread's clock: its events
+    /// follow ([`take`](Self::take), [`drain`](Self::drain)) until it is
+    /// sealed ([`seal`](Self::seal)), while the attempt waits for START
+    /// and SELECT to be released.
+    ///
+    /// # Errors
+    ///
+    /// [`HistoryFull::Held`] or [`HistoryFull::Openings`]: it is not kept,
+    /// and the history is exhausted.
+    pub fn begin(&mut self, start: &InputStart, origin: TimeUs) -> Result<(), HistoryFull> {
         if start.held.len() > self.held {
             self.exhausted = true;
             return Err(HistoryFull::Held);
@@ -131,7 +152,57 @@ impl HistoryRecorder {
         };
         held.clear();
         held.extend_from_slice(&start.held);
-        let events_from = self.events.len();
+        let at = range(self.events.len(), self.events.len());
+        self.kept.push(CancelledOpening {
+            start: InputStart {
+                opened_at: start.opened_at,
+                held,
+            },
+            origin,
+            closed: start.opened_at,
+            events: at,
+            arrivals: range(self.arrivals.len(), self.arrivals.len()),
+            reason: CancelReason::Held,
+        });
+        self.open = true;
+        Ok(())
+    }
+
+    /// Adds `events`, already taken from the readers in their order, to
+    /// the opening begun.
+    ///
+    /// # Errors
+    ///
+    /// [`HistoryFull::Events`] for those that do not fit; the history is
+    /// exhausted.
+    pub fn take(&mut self, events: &[PhysicalInputEvent]) -> Result<(), HistoryFull> {
+        if !self.open {
+            return Ok(());
+        }
+        let fit = events
+            .len()
+            .min(MAX_CANCELLED_EVENTS.saturating_sub(self.events.len()));
+        self.events.extend(events.iter().take(fit));
+        self.extend_last();
+        if fit < events.len() {
+            self.exhausted = true;
+            return Err(HistoryFull::Events);
+        }
+        Ok(())
+    }
+
+    /// Drains `readers` into the opening begun, in source order, each
+    /// source's in receive order. Events that do not fit stay in
+    /// `readers`, so the input side refuses to reopen until they are
+    /// drained: a capture whose history ran out is sealed, not continued.
+    ///
+    /// # Errors
+    ///
+    /// [`HistoryFull::Events`]; the history is exhausted.
+    pub fn drain<R: SourceRead>(&mut self, readers: &mut [R]) -> Result<(), HistoryFull> {
+        if !self.open {
+            return Ok(());
+        }
         let mut full = false;
         for reader in readers {
             while self.events.len() < MAX_CANCELLED_EVENTS
@@ -144,26 +215,59 @@ impl HistoryRecorder {
                 break;
             }
         }
-        let arrivals_from = self.arrivals.len();
-        let fit = arrivals.len().min(MAX_OPENING_ARRIVALS);
-        full |= fit < arrivals.len();
-        self.arrivals.extend(arrivals.iter().take(fit).map(arrival));
-        self.kept.push(CancelledOpening {
-            start: InputStart {
-                opened_at: start.opened_at,
-                held,
-            },
-            origin,
-            closed,
-            events: range(events_from, self.events.len()),
-            arrivals: range(arrivals_from, self.arrivals.len()),
-            reason,
-        });
+        self.extend_last();
         if full {
             self.exhausted = true;
             return Err(HistoryFull::Events);
         }
         Ok(())
+    }
+
+    /// Seals the opening begun: closed at `closed` on its own timeline for
+    /// `reason`, with its `arrivals`.
+    ///
+    /// # Errors
+    ///
+    /// [`HistoryFull::Events`] when its arrivals do not fit; those that do
+    /// are kept, and the history is exhausted.
+    pub fn seal(
+        &mut self,
+        closed: TimeUs,
+        arrivals: &[InputArrival],
+        reason: CancelReason,
+    ) -> Result<(), HistoryFull> {
+        if !self.open {
+            return Ok(());
+        }
+        self.open = false;
+        let arrivals_from = self.arrivals.len();
+        let fit = arrivals.len().min(MAX_OPENING_ARRIVALS);
+        self.arrivals.extend(arrivals.iter().take(fit).map(arrival));
+        let to = self.arrivals.len();
+        if let Some(o) = self.kept.last_mut() {
+            o.closed = closed;
+            o.arrivals = range(arrivals_from, to);
+            o.reason = reason;
+        }
+        if fit < arrivals.len() {
+            self.exhausted = true;
+            return Err(HistoryFull::Events);
+        }
+        Ok(())
+    }
+
+    /// Whether an opening is begun and not sealed.
+    #[must_use]
+    pub const fn is_open(&self) -> bool {
+        self.open
+    }
+
+    /// The opening begun reaches the end of the events arena.
+    fn extend_last(&mut self) {
+        let to = self.events.len();
+        if let Some(o) = self.kept.last_mut() {
+            o.events = range(usize::try_from(o.events.start).unwrap_or(to), to);
+        }
     }
 
     /// Whether an opening could not be kept whole: the capture is sealed
@@ -220,6 +324,7 @@ impl HistoryRecorder {
         self.events.clear();
         self.arrivals.clear();
         self.exhausted = false;
+        self.open = false;
     }
 }
 

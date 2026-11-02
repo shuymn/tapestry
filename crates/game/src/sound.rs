@@ -69,6 +69,12 @@ impl EventSink for AudioSink {
             self.dropped.fetch_add(1, Ordering::Relaxed);
         }
     }
+
+    /// The next READY candidate's key sounds go onto the output's timeline
+    /// from its own origin.
+    fn rearm(&mut self, origin: TimeUs) {
+        self.shift = origin;
+    }
 }
 
 /// The audio thread's end of the command queue.

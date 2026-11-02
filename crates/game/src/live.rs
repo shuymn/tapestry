@@ -59,8 +59,9 @@ use ::audio::OutputError;
 use bms_model::TimeUs;
 use eval::{InputStart, JudgeEvent};
 use input::{Arrival, DeviceKind};
-use replay::Incomplete;
+use replay::{CancelReason, Incomplete, ReadyHistory};
 
+use crate::HistoryRecorder;
 use crate::app::IDLE_WAIT;
 use crate::attempt::{Preparation, PreparationRefusal};
 use crate::audio_loop::AudioWaitError;
@@ -321,6 +322,103 @@ pub trait Rig {
     fn before_play(&mut self, settings: &mut Settings) {
         let _ = settings;
     }
+    /// Whether this rig's plays run the start gate (design.md "Play
+    /// Lifecycle", the start gate): each READY is a candidate that a hold
+    /// of START or SELECT before its transport commits cancels, and the
+    /// methods below take part. `false` by default: the first READY opened
+    /// is the play, as the player's rig runs it until S10-04b.
+    fn gated(&self) -> bool {
+        false
+    }
+    /// Opens recording with READY candidate `generation` at the next
+    /// input boundary where START and SELECT are verifiably released, the
+    /// input side arming the start gate for it; `Ok(None)` when one is
+    /// held there, or may be: the opening is deferred and nothing opens.
+    /// Gated rigs only; by default, [`open`](Self::open).
+    ///
+    /// # Errors
+    ///
+    /// Why the input thread did not answer, which ends the run.
+    fn open_candidate(
+        &mut self,
+        lead_in: TimeUs,
+        generation: u32,
+    ) -> Result<Option<Opening<Self::Reader>>, InputWaitError> {
+        let _ = generation;
+        self.open(lead_in).map(Some)
+    }
+    /// The opening was deferred by a hold: an attempt with a loading
+    /// lifetime resumes it with its clock (Preparing → Loading), one
+    /// without waits in Preparing. Nothing by default.
+    fn defer(&mut self) {}
+    /// Whether START or SELECT is held as the input thread's latch last
+    /// read: when to ask the input side again. Never what opens a
+    /// candidate, which the input side decides at its boundary.
+    fn holding(&self) -> bool {
+        false
+    }
+    /// The start gate's state: whether the armed candidate committed or
+    /// was cancelled. Gated rigs only.
+    fn candidate(&self) -> input::GateState {
+        input::GateState {
+            generation: 0,
+            phase: input::GatePhase::Idle,
+        }
+    }
+    /// Candidate `generation` was cancelled: its key sounds stop, and its
+    /// scheduled chart start and audio restore are dropped; returns once
+    /// the audio side acknowledged it, so no authorization of it is left
+    /// when the next candidate opens. Gated rigs only.
+    fn cancel_candidate(&mut self, generation: u32) {
+        let _ = generation;
+        self.cancel_audio();
+    }
+    /// The cancelled candidate's queues, `readers`, drained of its last
+    /// events into `history`, which seals it with its closing time on its
+    /// own timeline and its arrivals; then the attempt's next candidate
+    /// `generation` opens on the same source table with chart time 0
+    /// `lead_in` after its opening and its held-input snapshot copied into
+    /// `start`, without allocating ([`input::SourceSet::reopen_candidate`]).
+    /// Gated rigs only; by default nothing opens.
+    ///
+    /// # Errors
+    ///
+    /// Why the input thread did not answer, which ends the run.
+    fn rearm_candidate(
+        &mut self,
+        readers: &mut Vec<Self::Reader>,
+        lead_in: TimeUs,
+        generation: u32,
+        history: &mut crate::HistoryRecorder,
+        start: &mut InputStart,
+    ) -> Result<Rearm, InputWaitError> {
+        let _ = (readers, lead_in, generation, history, start);
+        Ok(Rearm::Held)
+    }
+    /// Starts audio for the rearmed candidate `generation`, chart time 0
+    /// at `origin`, with the queue and screen of the first candidate: its
+    /// transport waits for the commit as the first's did. Gated rigs only.
+    fn restart_candidate(&mut self, origin: TimeUs, generation: u32) {
+        let _ = (origin, generation);
+    }
+    /// The held-input snapshot's reserved size on the input side: what a
+    /// rearmed candidate's snapshot may hold. Gated rigs only.
+    fn snapshot_capacity(&self) -> usize {
+        0
+    }
+}
+
+/// What a request to rearm READY gave ([`Rig::rearm_candidate`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Rearm {
+    /// The next candidate opened, its chart time 0 at `origin` on the
+    /// rig's clock.
+    Opened {
+        /// Where its chart time 0 lies.
+        origin: TimeUs,
+    },
+    /// START or SELECT is held at the input boundary: nothing changed.
+    Held,
 }
 
 /// Why the run of plays stopped short.
@@ -684,16 +782,31 @@ fn play_and_next<R: Rig>(
     // Repeat").
     let opens_at = loaded.opens_at();
     let restore_at = loaded.restore_at();
+    let lead_in = TimeUs(opens_at.0.saturating_neg());
+    // A gated rig opens READY candidates, the first numbered 1; otherwise
+    // the first READY opened is the play.
+    let gated = rig.gated();
+    let mut generation = 1_u32;
     // A quit during the wait is latched and taken by the first step. A
-    // failed opening opened nothing: its number goes back.
-    let opening = match rig.open(TimeUs(opens_at.0.saturating_neg())) {
-        Ok(opening) => opening,
+    // failed opening opened nothing: its number goes back, and so does an
+    // attempt left while its opening was deferred.
+    let opened = if gated {
+        open_gated(rig, lead_in, generation)
+    } else {
+        rig.open(lead_in).map(Some).map_err(LiveError::Input)
+    };
+    let opening = match opened {
+        Ok(Some(opening)) => opening,
+        Ok(None) => {
+            loaded.withdraw(start);
+            return Ok(None);
+        }
         Err(e) => {
             loaded.withdraw(start);
-            return Err(LiveError::Input(e));
+            return Err(e);
         }
     };
-    let origin = opening.origin;
+    let mut origin = opening.origin;
     // The refusal is the error reported; a failed close adds nothing to it.
     let plan = match loaded.plan(&opening.kinds, &opening.axes) {
         Ok(plan) => plan,
@@ -718,14 +831,28 @@ fn play_and_next<R: Rig>(
             return Err(refused(rig, LiveError::Logic(e)));
         }
     };
+    // A gated play's candidates: the history of cancelled openings and the
+    // rearmed snapshot, reserved with the play's setup and reused by every
+    // rearm.
+    let mut gate = gated.then(|| {
+        let held = rig.snapshot_capacity();
+        logic.reserve_start(held);
+        Candidates::new(held)
+    });
+    // A failure before the first step: a gated play's restore plan.
+    let mut failed = None;
     // The restore is planned on the opening's origin, in the play's setup,
     // and lands with the start: reset → restore → lead-in → section
-    // evaluation. A refusal closes recording as the logic step's does.
+    // evaluation. A refusal closes recording as the logic step's does; a
+    // gated play's ends without a played attempt.
     if let Some(at) = restore_at
         && let Err(e) = rig.restore_audio(origin, at)
     {
-        let _ = rig.close();
-        return Err(refused(rig, LiveError::Restore(e)));
+        if !gated {
+            let _ = rig.close();
+            return Err(refused(rig, LiveError::Restore(e)));
+        }
+        failed = Some(AbortCause::RestoreFailed);
     }
     // Admitted: only now does the play start, so a refused opening reports
     // no start.
@@ -754,10 +881,6 @@ fn play_and_next<R: Rig>(
     let end = loop {
         rig.wait();
         let now = TimeUs(rig.now().0 - origin.0);
-        // The step's phase as it enters it, before anything below ends the
-        // play: playing from the chart's start on, until a terminal
-        // transition. The step that processes one still enters playing.
-        logic.set_playing(now >= starts_at && !logic.is_complete() && logic.aborted().is_none());
         // Anything seen in a step is handled before the step advances.
         // Every pending command is taken, so a suspend is never left behind
         // a quit or a retry.
@@ -766,22 +889,79 @@ fn play_and_next<R: Rig>(
             suspended |= c == Command::Suspend;
             command = command.or(Some(c));
         }
-        if rig.quitting() {
-            logic.abort(AbortCause::Quit);
+        let ending = if rig.quitting() {
+            Some(AbortCause::Quit)
         } else if let Some(c) = command {
-            logic.abort(c.cause());
+            Some(c.cause())
         } else if let Some(e) = rig.input_failure() {
             // Before focus loss: the input thread publishes the focus gate
             // and the connections, which are stale once it is gone.
             input_error = Some(e);
-            logic.abort(AbortCause::InputFailed);
+            Some(AbortCause::InputFailed)
         } else if rig.focus_lost() {
-            logic.abort(AbortCause::FocusLoss);
+            Some(AbortCause::FocusLoss)
         } else if let Some(e) = rig.audio_failure() {
             output_error = Some(e);
-            logic.abort(AbortCause::OutputFailed);
+            Some(AbortCause::OutputFailed)
         } else if rig.screen_failed() {
-            logic.abort(AbortCause::ScreenFailed);
+            Some(AbortCause::ScreenFailed)
+        } else {
+            failed.take()
+        };
+        // Before its transport commits, a gated attempt's candidate is
+        // cancelled by a hold and rearmed by a release, and whatever ends
+        // the attempt ends it without a played attempt.
+        if let Some(g) = gate.as_mut().filter(|g| !g.committed) {
+            if let Some(cause) = ending {
+                if !g.waiting {
+                    logic.abort(cause);
+                }
+                rig.cancel_candidate(generation);
+                last = now;
+                break PlayEnd::Aborted(cause);
+            }
+            let step = if g.waiting {
+                g.wait_release(rig, &mut logic, lead_in, &mut generation)
+            } else {
+                g.watch(rig, &mut logic, origin, generation)
+            };
+            match step {
+                Step::Go => {}
+                Step::Wait => continue,
+                Step::Rearmed(o) => {
+                    origin = o;
+                    // The cancelled candidate's events are discarded whole.
+                    live.clear();
+                    // A round's restore is planned again on the new origin;
+                    // a plan that fails ends the attempt at the next step.
+                    if let Some(at) = restore_at
+                        && rig.restore_audio(origin, at).is_err()
+                    {
+                        failed = Some(AbortCause::RestoreFailed);
+                    }
+                    rig.restart_candidate(origin, generation);
+                    continue;
+                }
+                Step::End(cause) => {
+                    if let AbortCause::InputFailed = cause {
+                        input_error = rig.input_failure().or(Some(InputWaitError::Gone));
+                    }
+                    rig.cancel_candidate(generation);
+                    last = now;
+                    break PlayEnd::Aborted(cause);
+                }
+            }
+        }
+        // The step's phase as it enters it, before anything below ends the
+        // play: playing from the chart's start on, until a terminal
+        // transition. The step that processes one still enters playing. A
+        // gated play plays only once its candidate committed.
+        let committed = gate.as_ref().is_none_or(|g| g.committed);
+        logic.set_playing(
+            committed && now >= starts_at && !logic.is_complete() && logic.aborted().is_none(),
+        );
+        if let Some(cause) = ending {
+            logic.abort(cause);
         }
         last = now;
         let advance = logic.advance_to(now);
@@ -829,9 +1009,16 @@ fn play_and_next<R: Rig>(
         suspended |= c == Command::Suspend;
         carried = carried.or(Some(c));
     }
+    // A gated attempt still waiting after a cancellation keeps what reached
+    // the queues since in its cancelled opening.
+    let waiting = gate.as_ref().is_some_and(|g| g.waiting);
     let closing = match closed {
         Ok(closing) => {
-            logic.drain_after_close();
+            if let Some(g) = gate.as_mut().filter(|_| waiting) {
+                let _ = g.history.drain(logic.readers_mut());
+            } else {
+                logic.drain_after_close();
+            }
             closing
         }
         Err(e) => {
@@ -839,8 +1026,39 @@ fn play_and_next<R: Rig>(
             Closing::default()
         }
     };
+    // A gated attempt's history: before its commit, the last opening ends
+    // the capture, cancelled before playback (design.md "Play Lifecycle",
+    // ending without a played attempt), at origin 0; after it, the
+    // cancelled openings are relative to the winning one.
+    let capture = gate.as_mut().map(|g| {
+        if !g.committed {
+            let closed_at = TimeUs(rig.now().0.saturating_sub(origin.0));
+            let reason = if waiting {
+                CancelReason::Held
+            } else {
+                let _ = g.history.begin(logic.start(), origin);
+                let _ = g.history.take(logic.popped());
+                cancel_reason(end, rig.quitting())
+            };
+            let _ = g.history.seal(closed_at, &closing.arrivals, reason);
+        }
+        // A capture's last kept opening is its origin 0, even when the
+        // history had no room for the last one.
+        let last = if g.committed {
+            origin
+        } else {
+            g.history.last_origin().unwrap_or(origin)
+        };
+        Capture {
+            played: g.committed,
+            history: g.history.history(last),
+            exhausted: g.history.exhausted(),
+        }
+    });
     let incomplete = Incomplete {
-        overflow: logic.overflowed() || closing.overflowed,
+        overflow: logic.overflowed()
+            || closing.overflowed
+            || capture.as_ref().is_some_and(|c| c.exhausted),
         source_limit: closing.source_limited,
         suspend: suspended,
         input_failed: input_error.is_some(),
@@ -875,15 +1093,18 @@ fn play_and_next<R: Rig>(
         arrivals: closing.arrivals,
         axis_out_of_range: closing.axis_out_of_range,
         incomplete,
+        played: capture.as_ref().is_none_or(|c| c.played),
+        history: capture.map(|c| c.history),
     });
     // A completed play's tail took the carried command.
     let next = carried.filter(|_| end != PlayEnd::Completed);
     // The quit key before the chart started (in READY, or as
     // recording closed on a play aborted there) leaves the chart without a
     // result; from its start on, the aborted play's result shows, and a
-    // quit that arrived as recording closed is taken with the play.
-    let counted_down = last < loaded.starts_at()
-        && (end == PlayEnd::Aborted(AbortCause::Quit) || next == Some(Command::Quit));
+    // quit that arrived as recording closed is taken with the play. A
+    // gated attempt quit before its commit leaves it the same way.
+    let quit = end == PlayEnd::Aborted(AbortCause::Quit) || next == Some(Command::Quit);
+    let counted_down = quit && (!report.played() || last < loaded.starts_at());
     let mut next = next.filter(|&c| c != Command::Quit);
     let mut next_round = stage.is_some_and(|s| s.repeats) && tail == TailEnd::RanOut;
     // Commands still pending once the play is over, pressed as it ended or
@@ -905,6 +1126,205 @@ fn play_and_next<R: Rig>(
         next_round,
         counted_down,
     }))
+}
+
+/// Opens a gated attempt's first READY candidate (design.md "Play
+/// Lifecycle", the start gate): the input side opens it only where START
+/// and SELECT are verifiably released. A hold there defers it
+/// ([`Rig::defer`]): the attempt serves the quit key, a close and the
+/// threads' failures until the latch reads released, then quiesces the
+/// loading state again and asks again. `None` when the player left before
+/// it opened: nothing opened, so nothing is saved.
+///
+/// # Errors
+///
+/// The threads' failures, and a screen that does not quiesce the loading
+/// state, which end the run as before any opening.
+#[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+fn open_gated<R: Rig>(
+    rig: &mut R,
+    lead_in: TimeUs,
+    generation: u32,
+) -> Result<Option<Opening<R::Reader>>, LiveError<R::ScreenError>> {
+    loop {
+        if let Some(opening) = rig
+            .open_candidate(lead_in, generation)
+            .map_err(LiveError::Input)?
+        {
+            return Ok(Some(opening));
+        }
+        rig.defer();
+        loop {
+            rig.wait();
+            threads_over(rig)?;
+            // A retry or suspend before recording opens belongs to no
+            // play.
+            if rig.quitting() || rig.take() == Some(Command::Quit) {
+                while rig.take().is_some() {}
+                return Ok(None);
+            }
+            if !rig.holding() {
+                break;
+            }
+        }
+        rig.end_loading().map_err(LiveError::Screen)?;
+        preflight(rig)?;
+    }
+}
+
+/// A gated attempt's READY candidates (design.md "Play Lifecycle", the
+/// start gate): whether the current one committed or waits after its
+/// cancellation, the history of cancelled openings, and the rearmed
+/// snapshot's storage, all reserved with the play's setup.
+struct Candidates {
+    committed: bool,
+    waiting: bool,
+    history: HistoryRecorder,
+    next: InputStart,
+}
+
+/// What one step of a gated attempt before its commit does.
+enum Step {
+    /// The candidate is live: the step advances it.
+    Go,
+    /// The attempt waits for START and SELECT to be released: nothing
+    /// advances.
+    Wait,
+    /// The next candidate opened, its chart time 0 here on the rig's
+    /// clock.
+    Rearmed(TimeUs),
+    /// The attempt ends without a played attempt.
+    End(AbortCause),
+}
+
+impl Candidates {
+    fn new(held: usize) -> Self {
+        Self {
+            committed: false,
+            waiting: false,
+            history: HistoryRecorder::new(held),
+            next: InputStart {
+                opened_at: TimeUs(0),
+                held: Vec::with_capacity(held),
+            },
+        }
+    }
+
+    /// A live candidate's step: its commit, or its cancellation by a hold,
+    /// as the start gate tells. A cancelled candidate is acknowledged by
+    /// the audio side and its opening and packets are kept: what its
+    /// evaluator popped, then what is queued. Its evaluator advances no
+    /// more.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn watch<R: Rig>(
+        &mut self,
+        rig: &mut R,
+        logic: &mut Logic<'_, R::Reader>,
+        origin: TimeUs,
+        generation: u32,
+    ) -> Step {
+        let state = rig.candidate();
+        if state.generation != generation {
+            return Step::Go;
+        }
+        match state.phase {
+            input::GatePhase::Committed => {
+                self.committed = true;
+                Step::Go
+            }
+            input::GatePhase::Cancelled => {
+                rig.cancel_candidate(generation);
+                logic.set_playing(false);
+                self.waiting = true;
+                let kept = self
+                    .history
+                    .begin(logic.start(), origin)
+                    .and_then(|()| self.history.take(logic.popped()))
+                    .and_then(|()| self.history.drain(logic.readers_mut()));
+                if kept.is_err() {
+                    Step::End(AbortCause::Overflow)
+                } else {
+                    Step::Wait
+                }
+            }
+            input::GatePhase::Idle | input::GatePhase::Armed => Step::Go,
+        }
+    }
+
+    /// A step waiting after a cancellation: the capture goes on into the
+    /// cancelled opening, and once the latch reads both roles released
+    /// the input side is asked to seal it and open a fresh, full READY,
+    /// with a new origin and snapshot, at once. The evaluator is reset in
+    /// place for it, never rewound.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn wait_release<R: Rig>(
+        &mut self,
+        rig: &mut R,
+        logic: &mut Logic<'_, R::Reader>,
+        lead_in: TimeUs,
+        generation: &mut u32,
+    ) -> Step {
+        if self.history.drain(logic.readers_mut()).is_err() {
+            return Step::End(AbortCause::Overflow);
+        }
+        if rig.holding() {
+            return Step::Wait;
+        }
+        let next = generation.wrapping_add(1);
+        let mut readers = logic.lend_readers();
+        let rearmed = rig.rearm_candidate(
+            &mut readers,
+            lead_in,
+            next,
+            &mut self.history,
+            &mut self.next,
+        );
+        logic.restore_readers(readers);
+        match rearmed {
+            Err(_) => Step::End(AbortCause::InputFailed),
+            Ok(Rearm::Held) if self.history.exhausted() => Step::End(AbortCause::Overflow),
+            Ok(Rearm::Held) => Step::Wait,
+            Ok(Rearm::Opened { origin }) => {
+                *generation = next;
+                self.waiting = false;
+                logic.rearm(&self.next, origin);
+                Step::Rearmed(origin)
+            }
+        }
+    }
+}
+
+/// A gated attempt's capture as it ended.
+struct Capture {
+    /// Whether a candidate committed: the attempt was played.
+    played: bool,
+    history: ReadyHistory,
+    exhausted: bool,
+}
+
+/// Why the last opening of an attempt that ended before its commit was
+/// cancelled: its ending cause, `closing` when the window closed.
+#[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+const fn cancel_reason(end: PlayEnd, closing: bool) -> CancelReason {
+    if closing {
+        return CancelReason::Close;
+    }
+    match end {
+        PlayEnd::Aborted(AbortCause::Quit) => CancelReason::Quit,
+        PlayEnd::Aborted(AbortCause::Retry) => CancelReason::Retry,
+        PlayEnd::Aborted(AbortCause::FocusLoss) => CancelReason::FocusLost,
+        PlayEnd::Aborted(AbortCause::Overflow) => CancelReason::Exhausted,
+        PlayEnd::Completed
+        | PlayEnd::Aborted(
+            AbortCause::LastSourceRemoved
+            | AbortCause::Suspend
+            | AbortCause::OutputFailed
+            | AbortCause::GaugeFailed
+            | AbortCause::ScreenFailed
+            | AbortCause::InputFailed
+            | AbortCause::RestoreFailed,
+        ) => CancelReason::Failed,
+    }
 }
 
 /// The stage after a completed play: a round's end stage, of which a full

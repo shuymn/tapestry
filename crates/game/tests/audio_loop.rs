@@ -876,3 +876,98 @@ mod restore {
         }
     }
 }
+
+/// A READY candidate's transport (design.md "Play Lifecycle", the start
+/// gate) through `AudioWorker::step`: committed by generation before the
+/// pass reaching chart time 0, where the BGM starts; a candidate the
+/// input side cancelled first, or an authorization of another generation,
+/// starts nothing, its drop acknowledged; a rearmed candidate's own
+/// generation commits on the same queue.
+#[test]
+fn a_gated_transport_commits_only_its_own_armed_candidate() {
+    use game::TransportGate;
+    use input::{GatePhase, StartGate};
+
+    let chart = chart();
+    let transport = |gate: &StartGate, generation| TransportGate {
+        gate: gate.clone(),
+        generation,
+        commit_at: TimeUs(0),
+    };
+    let sounding = |out: &RecordingOutput<SimDevice>| out.samples().iter().any(|&s| s != 0.0);
+
+    // Committed: the BGM at chart time 0 plays.
+    let (mut control, mut worker, mut out) = rig(&chart);
+    let gate = StartGate::new();
+    gate.arm(1);
+    let (_sink, queue) = audio_link_at(4, TimeUs(50 * MS));
+    control
+        .play_gated(
+            TimeUs(50 * MS),
+            queue,
+            audio::Gain::HEADROOM,
+            None,
+            transport(&gate, 1),
+        )
+        .unwrap();
+    for _ in 0..20 {
+        worker.step(&mut out).unwrap();
+    }
+    assert_eq!(gate.state().phase, GatePhase::Committed);
+    assert!(sounding(&out));
+    assert!(!control.counters().dropped(1));
+
+    // Cancelled by a hold before the commit: nothing sounds, the drop is
+    // acknowledged; the rearmed candidate 2 commits and plays.
+    let (mut control, mut worker, mut out) = rig(&chart);
+    let gate = StartGate::new();
+    gate.arm(1);
+    let (_sink, queue) = audio_link_at(4, TimeUs(50 * MS));
+    control
+        .play_gated(
+            TimeUs(50 * MS),
+            queue,
+            audio::Gain::HEADROOM,
+            None,
+            transport(&gate, 1),
+        )
+        .unwrap();
+    worker.step(&mut out).unwrap();
+    assert_eq!(gate.cancel(), Some(1));
+    for _ in 0..20 {
+        worker.step(&mut out).unwrap();
+    }
+    assert!(
+        !sounding(&out),
+        "the cancelled candidate's chart start never ran"
+    );
+    assert!(control.counters().dropped(1));
+    gate.arm(2);
+    control.rearm(TimeUs(400 * MS), transport(&gate, 2));
+    for _ in 0..30 {
+        worker.step(&mut out).unwrap();
+    }
+    assert_eq!(gate.state().phase, GatePhase::Committed);
+    assert!(sounding(&out));
+
+    // A stale authorization: the gate armed for 3, the play's for 2.
+    let (mut control, mut worker, mut out) = rig(&chart);
+    let gate = StartGate::new();
+    gate.arm(3);
+    let (_sink, queue) = audio_link_at(4, TimeUs(50 * MS));
+    control
+        .play_gated(
+            TimeUs(50 * MS),
+            queue,
+            audio::Gain::HEADROOM,
+            None,
+            transport(&gate, 2),
+        )
+        .unwrap();
+    for _ in 0..20 {
+        worker.step(&mut out).unwrap();
+    }
+    assert!(!sounding(&out), "a stale authorization starts nothing");
+    assert_eq!(gate.state().phase, GatePhase::Armed);
+    assert!(control.counters().dropped(2));
+}
