@@ -216,6 +216,42 @@ fn judged_note_disappears() {
     assert_eq!(white_rows(&later, LANE_7), Vec::<u32>::new());
 }
 
+/// A READY rearm (design.md "Play Lifecycle", the start gate) through
+/// `Renderer::rearm`: the simple skin forgets what the cancelled
+/// candidate's effects built up, so a note it judged is drawn again, while
+/// its chart stays loaded.
+#[test]
+fn a_rearm_draws_a_judged_note_again() {
+    let chart = ChartBuilder::new(120_000)
+        .tap(lane(5), TimeUs(2_000 * MS))
+        .tap(lane(7), TimeUs(2_000 * MS))
+        .build()
+        .unwrap();
+    let mut r = warp(&chart);
+    let v = view(1, 2);
+    let now = TimeUs(1_800 * MS);
+    let judged = JudgeEvent {
+        seq: 0,
+        time: TimeUs(1_790 * MS),
+        origin: Some(TimeUs(1_789 * MS)),
+        kind: JudgeEventKind::Judged {
+            lane: lane(7),
+            note: 0,
+            judgment: Judgment::Perfect,
+            deviation: Some(TimeUs(-210 * MS)),
+            release: None,
+            combo: 1,
+        },
+    };
+    r.frame(&input(&v, now, TimeUs(0), &[judged])).unwrap();
+    assert_eq!(white_rows(&r.read_back(), LANE_7), Vec::<u32>::new());
+    r.rearm();
+    r.frame(&input(&v, now, TimeUs(0), &[])).unwrap();
+    let rearmed = r.read_back();
+    assert_row(&rearmed, LANE_5, 560.89);
+    assert_row(&rearmed, LANE_7, 560.89);
+}
+
 #[test]
 fn zero_size_target_is_one_pixel() {
     let mut r = Renderer::new(

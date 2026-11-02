@@ -159,12 +159,15 @@ fn json() -> String {
             "liftCover": [{{"id": "liftc", "src": "m", "x": 0, "y": 0, "w": 16, "h": 16,
                             "disapearLine": 200}}],
             "note": {{"id": "notes", "note": {n}, "lnstart": {n}, "lnend": {n},
-                      "lnbody": {n}, "lnactive": {n}, "hcnstart": {n}, "hcnend": {n},
+                      "lnbody": {n}, "lnactive": {active}, "hcnstart": {n}, "hcnend": {n},
                       "hcnbody": {n}, "hcnactive": {n}, "hcndamage": {n},
                       "hcnreactive": {n}, "mine": {n}, "dst": [{lanes}]}},
             "text": [{texts}],
             "destination": [{destinations}]}}"#,
         n = eight("n"),
+        // A held long note's body draws another image, so the reducer's
+        // hold shows in a frame.
+        active = eight("w"),
         lanes = lanes(),
     )
 }

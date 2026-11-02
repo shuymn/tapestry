@@ -612,35 +612,53 @@ fn imported_frames(chart: &Chart, overlay: &[&str], glyphs: usize) {
     assert_eq!(overlay_drawn(&staging), glyphs, "the overlay was cut");
 
     // A READY rearm (design.md "Play Lifecycle", the start gate): after
-    // judgments built up the attempt's runtime, it starts over in place,
-    // its prepared bitmap text still attached, so the frame after it is
-    // the fresh attempt's first, and nothing allocates.
+    // lane 1's long note was held (the skin draws a held body with
+    // another image, from the reducer's hold), the attempt starts over in
+    // place, its prepared bitmap text still attached: the frame inside
+    // that note after the rearm is a fresh attempt's, its body not held,
+    // and nothing allocates.
+    let (index, long) = chart.lanes[1]
+        .iter()
+        .enumerate()
+        .find(|(_, n)| matches!(n.kind, bms_model::NoteKind::Long { .. }))
+        .unwrap();
+    let t = long.time;
+    let inside = FrameInput {
+        overlay,
+        ..input(&v, TimeUs(t.0 + 100 * MS), TimeUs(8 * MS), &[])
+    };
     let mut fresh = DeclSkin::new(b.clone());
     fresh.prepare(r.gpu(), &a).unwrap();
-    frame(&mut staging, &mut fresh, 0).unwrap();
+    staging.build(&mut fresh, &inside).unwrap();
     let first_frame = staging.instances().to_vec();
-    let t = chart.lanes[1][0].time;
-    let judged = [JudgeEvent {
+    let held = [JudgeEvent {
         seq: 0,
         time: t,
         origin: Some(t),
-        kind: JudgeEventKind::Judged {
+        kind: JudgeEventKind::LnHeld {
             lane: lane(1),
-            note: 0,
+            note: index,
             judgment: Judgment::Great,
-            deviation: Some(TimeUs(0)),
-            release: None,
-            combo: 1,
+            deviation: TimeUs(0),
         },
     }];
-    let judging = FrameInput {
+    let holding = FrameInput {
         overlay,
-        ..input(&v, t, TimeUs(8 * MS), &judged)
+        ..input(&v, t, TimeUs(8 * MS), &held)
     };
-    staging.build(&mut skin, &judging).unwrap();
+    staging.build(&mut skin, &holding).unwrap();
+    // Held, its body draws the active image.
+    staging.build(&mut skin, &inside).unwrap();
+    assert_ne!(
+        staging.instances(),
+        &first_frame[..],
+        "the hold changed nothing"
+    );
     let (rearmed, rearm_allocs) = counted(|| {
         skin.rearm();
-        frame(&mut staging, &mut skin, 0)
+        staging
+            .build(&mut skin, &inside)
+            .map(|()| (staging.instances().len(), resolve(&staging)))
     });
     let (quads, _) = rearmed.unwrap();
     assert!(quads >= glyphs + 9, "the bitmap text was dropped: {quads}");
