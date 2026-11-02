@@ -187,6 +187,9 @@ pub struct SourceSet {
     next_connection: u64,
     gate: FocusGate,
     batch_at: TimeUs,
+    /// Between [`begin_batch`](Self::begin_batch) and
+    /// [`end_batch`](Self::end_batch).
+    in_batch: bool,
     recording: Option<Recording>,
     /// Where the configured controller's menu controls go while recording
     /// is closed ([`set_menu`](Self::set_menu)).
@@ -233,6 +236,7 @@ impl SourceSet {
             next_connection: 0,
             gate: FocusGate::new(),
             batch_at: TimeUs(i64::MIN),
+            in_batch: false,
             recording: None,
             menu: None,
             axis_mode: None,
@@ -285,9 +289,10 @@ impl SourceSet {
     /// recorded: `false` once the focus gate has tripped.
     pub fn begin_batch(&mut self, received: TimeUs) -> bool {
         self.batch_at = received;
+        self.in_batch = true;
         let open = self.gate.check();
         if let Some(tap) = &mut self.adjust {
-            tap.begin_batch(received, open);
+            tap.send_pending(received, open);
         }
         open
     }
@@ -302,6 +307,7 @@ impl SourceSet {
     /// what was already finalized. The adjustment tap sends what it owes,
     /// or a tick while a tapped control is held.
     pub fn end_batch(&mut self, fresh: TimeUs) {
+        self.in_batch = false;
         let open = self.gate.check();
         if let Some(tap) = &mut self.adjust {
             tap.end_batch(self.batch_at, open);
@@ -450,6 +456,8 @@ impl SourceSet {
     /// Marks again the devices that reach the adjustment tap and counts
     /// its holders again; `owners_changed` when one that reached it left,
     /// or its controls now map differently, which the marking cannot see.
+    /// A new baseline this makes within a batch is sent at once, before
+    /// the batch's later packets.
     fn recount_adjustment(&mut self, owners_changed: bool) {
         let reach = if self.recording.is_some() {
             Reach::Sources
@@ -462,6 +470,11 @@ impl SourceSet {
             reach,
             owners_changed,
         );
+        if self.in_batch
+            && let Some(tap) = &mut self.adjust
+        {
+            tap.send_pending(self.batch_at, !self.gate.is_tripped());
+        }
     }
 
     /// The adjustment tap, to set it active at each boundary.

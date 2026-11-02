@@ -346,10 +346,10 @@ impl AdjustmentTap {
         self.store_latch();
     }
 
-    /// The start of a batch received at `at`; `open` while the focus gate
-    /// admits input. Sends what is pending once there is room, so the
-    /// batch's packets follow it.
-    pub(crate) fn begin_batch(&mut self, at: TimeUs, open: bool) {
+    /// Sends what is pending, stamped at `at`, once the queue has room;
+    /// `open` while the focus gate admits input. Packets observed
+    /// afterwards follow it.
+    pub(crate) fn send_pending(&mut self, at: TimeUs, open: bool) {
         if self.active && open {
             self.flush(at);
         }

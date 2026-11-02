@@ -394,6 +394,7 @@ fn while_recording_is_closed_only_the_devices_that_would_be_sources_reach_the_ta
             (20, TapEvent::Resync(0)),
             (30, TapEvent::Resync(0)),
             (40, TapEvent::Resync(1 << START)),
+            (40, TapEvent::Tick),
         ]
     );
 }
@@ -422,6 +423,26 @@ fn a_change_of_the_devices_reaching_the_tap_is_a_new_baseline_with_the_same_held
             (30, TapEvent::Tick),
             (40, TapEvent::Resync(1 << START)),
             (40, TapEvent::Tick),
+        ]
+    );
+}
+
+#[test]
+fn a_baseline_for_a_device_change_precedes_the_rest_of_its_batch() {
+    let (mut set, mut rx, _) = rig(false);
+    batch(&mut set, 10, &[]);
+    set.begin_batch(TimeUs(20));
+    set.connect(DeviceId(4), DeviceKind::Keyboard);
+    set.packet(&packet(1, Q, 1));
+    set.packet(&packet(1, Q, 0));
+    set.end_batch(TimeUs(21));
+    assert_eq!(
+        drain(&mut rx),
+        [
+            (10, TapEvent::Resync(0)),
+            (20, TapEvent::Resync(0)),
+            (20, TapEvent::Press(START)),
+            (20, TapEvent::Release(START)),
         ]
     );
 }
