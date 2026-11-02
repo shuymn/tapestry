@@ -604,7 +604,9 @@ impl AudioControl {
     /// at `origin`, waiting for `gate`, a round's audio restored by
     /// `restore` ([`AudioCtl::Rearm`]). Send it once the cancellation is
     /// acknowledged ([`AudioCounters::dropped`]). The restore it replaces
-    /// comes back ([`take_restore`](Self::take_restore)).
+    /// comes back ([`take_restore`](Self::take_restore)); while one
+    /// replaced earlier is neither taken back nor queued, the rearm waits
+    /// on the audio thread, so none is freed there.
     pub fn rearm(&mut self, origin: TimeUs, gate: TransportGate, restore: Option<Box<Restore>>) {
         self.send(AudioCtl::Rearm {
             origin,
@@ -856,6 +858,20 @@ impl AudioWorker {
             // queue takes the answer.
             if self.unreturned_load.is_some()
                 && matches!(self.ctl.peek(), Ok(AudioCtl::Load { .. }))
+            {
+                break;
+            }
+            // Nor is a replaced restore not yet handed back: a rearm
+            // carrying another waits in the queue until the return queue
+            // takes it, so no restore is ever freed on this thread.
+            if self.unreturned_restore.is_some()
+                && matches!(
+                    self.ctl.peek(),
+                    Ok(AudioCtl::Rearm {
+                        restore: Some(_),
+                        ..
+                    })
+                )
             {
                 break;
             }

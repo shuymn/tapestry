@@ -137,13 +137,15 @@ impl PlayerGate {
         std::mem::take(&mut self.loading)
     }
 
-    /// The candidate armed last was handed to audio, with a round's
-    /// `restore`: a copy is kept to plan the first rearm's restore in.
-    pub fn started(&mut self, restore: Option<&game::Restore>) {
+    /// The candidate armed last is handed to audio, with a round's
+    /// `restore`: the restores earlier rearms replaced are taken back from
+    /// the audio thread first, so it never holds one it cannot return, and
+    /// a copy of `restore` is kept for this chart's first rearm to plan in.
+    /// The play's setup, before recording's in-play work.
+    pub fn started(&mut self, control: &mut AudioControl, restore: Option<&game::Restore>) {
         self.started = true;
-        if self.spare.is_none() {
-            self.spare = restore.map(|r| Box::new(r.clone()));
-        }
+        while control.take_restore().is_some() {}
+        self.spare = restore.map(|r| Box::new(r.clone()));
     }
 
     /// Whether the attempt's first candidate was handed to audio.
@@ -313,5 +315,108 @@ pub fn wait_dropped(control: &AudioControl, gate: &PlayerGate, generation: u32) 
         && begun.elapsed() < DROP_TIMEOUT
     {
         std::thread::sleep(Duration::from_micros(200));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use audio::{AudioEngine, Gain, RecordingOutput, SimConfig, SimDevice, Sound, SoundBank};
+    use bms_model::{BgmEvent, SoundId, TimeUs};
+    use eval::ControlId;
+    use game::{AudioWorker, RESTORE_AHEAD, Restorer, audio_control, audio_link_at};
+    use input::{AdjustmentBindings, QpcClock, TapControl, Waker};
+
+    use super::PlayerGate;
+    use crate::controls::Controls;
+    use crate::input_side::{Hook, InputLink, Mode, link};
+
+    const MS: i64 = 1_000;
+
+    /// A gate installed on an input link with START on Q, and the link's
+    /// two ends.
+    fn installed() -> (PlayerGate, Hook, InputLink) {
+        let controls = Arc::new(Controls::new(QpcClock::start()));
+        let (hook, input) = link(controls, Mode::Clock, Waker::new().unwrap());
+        let gate = PlayerGate::install(
+            &input,
+            AdjustmentBindings {
+                controls: vec![(TapControl::Key(ControlId(0x10)), 0)],
+                latched: 1,
+                wrap: None,
+            },
+        )
+        .unwrap();
+        (gate, hook, input)
+    }
+
+    /// Three practice attempts with one rearm each through the gate, a
+    /// stepped audio worker on the other end: each attempt's start takes
+    /// back the restore the previous rearm replaced, so every rearm is
+    /// taken at once (its candidate's drop acknowledged after it) and the
+    /// audio thread never keeps a restore it cannot return.
+    #[test]
+    fn each_attempt_takes_back_what_the_last_rearm_replaced() {
+        let bank = Arc::new(SoundBank::from_sounds(
+            48_000,
+            vec![Sound::mono(vec![1_000; 4 * 48_000])],
+        ));
+        let schedule = vec![BgmEvent {
+            time: TimeUs(5_000_000),
+            sound: SoundId(0),
+        }];
+        let engine =
+            AudioEngine::with_schedule(bank, schedule.clone(), 48_000, 480, 16, 0).unwrap();
+        let (mut control, mut worker) = audio_control(engine);
+        let mut out =
+            RecordingOutput::new(SimDevice::new(SimConfig::steady(48_000, 480, TimeUs(0))), 0);
+        let mut steps = |worker: &mut AudioWorker, n: usize| {
+            for _ in 0..n {
+                worker.step(&mut out).unwrap();
+            }
+        };
+        steps(&mut worker, 3);
+        let restorer = Restorer::new(control.seek_source(), schedule);
+        let (mut gate, _hook, _input) = installed();
+        let at = TimeUs(6_000_000);
+        // A round whose lead-in starts 20 ms from the output's position.
+        let origin = |worker: &AudioWorker| {
+            let now = i64::try_from(worker.engine().written()).unwrap() * 1_000 / 48;
+            TimeUs(now + 20 * MS - (at.0 - RESTORE_AHEAD.0))
+        };
+        let mut generation = 0;
+        for attempt in 0..3 {
+            let first = origin(&worker);
+            let plan = restorer
+                .plan(control.counters().frame_line(first), at)
+                .unwrap();
+            generation += 1;
+            gate.gate.arm(generation);
+            gate.armed = generation;
+            gate.started(&mut control, Some(&plan));
+            let (_sink, queue) = audio_link_at(4, first);
+            control
+                .play_gated(first, queue, Gain::HEADROOM, Some(plan), gate.transport(at))
+                .unwrap();
+            steps(&mut worker, 2);
+            assert!(!gate.settle(generation));
+            control.cancel();
+            steps(&mut worker, 2);
+            assert!(control.counters().dropped(generation));
+            let second = origin(&worker);
+            generation += 1;
+            gate.gate.arm(generation);
+            gate.replan(&restorer, &mut control, second, at).unwrap();
+            gate.restart(&mut control, second, generation, at, true);
+            steps(&mut worker, 2);
+            assert!(!gate.settle(generation));
+            control.cancel();
+            steps(&mut worker, 2);
+            assert!(
+                control.counters().dropped(generation),
+                "attempt {attempt}: the rearm waits on the audio thread"
+            );
+        }
     }
 }

@@ -736,7 +736,7 @@ impl Rig for PlayerRig<'_> {
         let commit_at = self.restore_at.unwrap_or(TimeUs(0));
         let _ = match &mut self.gate {
             Some(gate) => {
-                gate.started(restore.as_deref());
+                gate.started(&mut self.audio.control, restore.as_deref());
                 let transport = gate.transport(commit_at);
                 self.audio
                     .control
