@@ -29,7 +29,10 @@ fn bench_build(c: &mut Criterion) {
     }
     let chart = builder.build().expect("valid chart");
     let mut skin = SimpleSkin::new();
-    skin.load(&chart, None);
+    // The attempt prepared, its exact playhead included, outside the timed
+    // loop, as a play prepares it before READY.
+    skin.prepare_attempt(&chart, None)
+        .expect("the attempt prepares");
     let mut batch = SpriteBatch::with_capacity(MAX_SPRITES);
     let v = view(42, 1_234);
     let now = TimeUs(10_000 * MS);

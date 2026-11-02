@@ -2,8 +2,10 @@
 //! by the renderer (design.md "Rendering and Skins").
 //!
 //! Notes and bar lines sit at their stored display positions, and the
-//! chart's [`ScrollMap`] gives the playhead at the expected display time
-//! (design.md "Algorithms"). The hi-speed scale is fixed from the chart's
+//! attempt's [`ExactPlayhead`], prepared in `prepare`, gives the playhead at
+//! the expected display time, sampled once a frame, so every note reaches
+//! the judgment line at exactly its judgment µs (design.md "Rendering and
+//! Skins", exact playhead). The hi-speed scale is fixed from the chart's
 //! initial rate, so a note takes exactly `visible_time` from the lane top to
 //! the judgment line at the start BPM. During play notes move through scroll
 //! positions at that fixed scale, so BPM changes speed them up or slow them
@@ -14,11 +16,11 @@
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
-use bms_model::{Chart, LANE_COUNT, Lane, Note, NoteKind, Position, ScrollMap, TimeUs};
+use bms_model::{Chart, LANE_COUNT, Lane, Note, NoteKind, Position, TimeUs};
 use eval::{JudgeEvent, JudgeEventKind, Section};
 use game::ResultGraphs;
 use rules::{GaugeValue, Judgment, LnMode};
-use skin_model::BuildError;
+use skin_model::{BuildError, ExactPlayhead, PrepareError};
 
 use crate::atlas::{GLYPH_H, GLYPH_W, glyph_uv, solid_uv};
 use crate::{
@@ -28,7 +30,7 @@ use crate::{
 /// The layout, in layout pixels of the 1920×1080 base resolution, and the
 /// placement of notes in it.
 pub mod layout {
-    use bms_model::{Lane, Position, ScrollMap, TimeUs};
+    use bms_model::{Lane, Position, TimeUs};
 
     /// Base width the layout is authored at.
     pub const WIDTH: f32 = 1920.0;
@@ -73,18 +75,19 @@ pub mod layout {
     }
 
     impl Scale {
-        /// The scale at display time `at` with hi-speed `visible_time`. A
-        /// visible time below 1 µs counts as 1 µs.
+        /// The scale with the playhead at `at_line` and hi-speed
+        /// `visible_time`. A visible time below 1 µs counts as 1 µs.
         ///
         /// The lane from [`LANE_TOP`] to [`JUDGE_Y`] holds the scroll of
-        /// `visible_time` at the chart's initial rate. The pixels per
-        /// position never change during a play, whatever the BPM at `at`.
+        /// `visible_time` at the chart's initial rate, `initial_rate` units
+        /// per µs. The pixels per position never change during a play,
+        /// whatever the BPM at the playhead.
         #[must_use]
-        pub fn new(scroll: &ScrollMap, at: TimeUs, visible_time: TimeUs) -> Self {
+        pub fn new(at_line: Position, initial_rate: i128, visible_time: TimeUs) -> Self {
             let visible = visible_time.0.max(1) as f64;
-            let span = visible * scroll.initial_rate() as f64;
+            let span = visible * initial_rate as f64;
             Self {
-                at_line: scroll.position_at(at),
+                at_line,
                 px_per_pos: f64::from(JUDGE_Y - LANE_TOP) / span,
             }
         }
@@ -110,10 +113,16 @@ pub mod layout {
     }
 
     /// The vertical center of something at display position `pos` in a
-    /// frame displayed at `at` with hi-speed `visible_time`.
+    /// frame whose playhead stands at `at_line`, with the chart's
+    /// `initial_rate` and hi-speed `visible_time`.
     #[must_use]
-    pub fn note_y(scroll: &ScrollMap, pos: Position, at: TimeUs, visible_time: TimeUs) -> f32 {
-        Scale::new(scroll, at, visible_time).y(pos)
+    pub fn note_y(
+        pos: Position,
+        at_line: Position,
+        initial_rate: i128,
+        visible_time: TimeUs,
+    ) -> f32 {
+        Scale::new(at_line, initial_rate, visible_time).y(pos)
     }
 }
 
@@ -197,7 +206,10 @@ impl Bits {
 pub struct SimpleSkin {
     lanes: [Vec<Note>; LANE_COUNT],
     bar_lines: Vec<Position>,
-    scroll: ScrollMap,
+    /// The prepared attempt's playhead; `None` with no attempt prepared
+    /// (none yet, a chart loaded since, or a refused preparation), which
+    /// draws no note and no bar line. A rearm keeps it.
+    playhead: Option<ExactPlayhead>,
     /// Long notes whose head was held ([`JudgeEventKind::LnHeld`]): their
     /// press gave the feedback, so their judgment adds only its text.
     held: [Bits; LANE_COUNT],
@@ -229,17 +241,13 @@ impl Default for SimpleSkin {
 }
 
 impl SimpleSkin {
-    /// A skin with no chart loaded: it draws the empty lanes.
+    /// A skin with no attempt prepared: it draws the empty lanes.
     #[must_use]
-    #[expect(
-        clippy::expect_used,
-        reason = "construction: 120 BPM without changes is a valid scroll"
-    )]
     pub fn new() -> Self {
         Self {
             lanes: Default::default(),
             bar_lines: Vec::new(),
-            scroll: ScrollMap::new(120_000_000, &[]).expect("120 BPM is a valid scroll"),
+            playhead: None,
             held: Default::default(),
             done: Default::default(),
             section: None,
@@ -251,20 +259,34 @@ impl SimpleSkin {
         }
     }
 
-    /// Takes `chart`'s notes, bar lines and scroll, and resets the play
-    /// state. With a practice round's `section`, every note that is not one
-    /// of its targets is marked done, so only the targets are drawn
-    /// (design.md "Mid-Chart Start and Section Repeat"); the notes keep their
-    /// indices, which effects name. This is all of `prepare`; the skin needs
-    /// nothing from the GPU.
+    /// Prepares an attempt on `chart`: its playhead first
+    /// ([`ExactPlayhead::prepare`], over the practice round's `section` when
+    /// there is one), then the chart's notes and bar lines and a fresh play
+    /// state. With a section, every note that is not one of its targets is
+    /// marked done, so only the targets are drawn (design.md "Mid-Chart
+    /// Start and Section Repeat"); the notes keep their indices, which
+    /// effects name. The previous attempt goes first, so a refusal leaves
+    /// none and the skin draws the empty lanes until the next attempt. This
+    /// is all of `prepare`; the skin needs nothing from the GPU.
+    ///
+    /// # Errors
+    ///
+    /// The playhead's refusal: a chart whose presentation is invalid, or
+    /// a row past the playhead's domain.
     #[expect(
         clippy::indexing_slicing,
-        reason = "loading before play: `from_fn` passes lane indices below LANE_COUNT"
+        reason = "preparation before play: `from_fn` passes lane indices below LANE_COUNT"
     )]
-    pub fn load(&mut self, chart: &Chart, section: Option<&Section>) {
+    pub fn prepare_attempt(
+        &mut self,
+        chart: &Chart,
+        section: Option<&Section>,
+    ) -> Result<(), PrepareError> {
+        *self = Self::new();
+        let playhead = ExactPlayhead::prepare(chart, section.map(|s| (s.start, s.end)))?;
+        self.playhead = Some(playhead);
         self.lanes = chart.lanes.clone();
         self.bar_lines = chart.bar_lines.clone();
-        self.scroll = chart.scroll.clone();
         self.held = std::array::from_fn(|l| Bits::sized(self.lanes[l].len()));
         self.done = std::array::from_fn(|l| Bits::sized(self.lanes[l].len()));
         self.section = section.map(|s| Section {
@@ -274,10 +296,19 @@ impl SimpleSkin {
             initial_gauges: Vec::new(),
         });
         self.mask();
-        self.active = [None; LANE_COUNT];
-        self.pressed = [None; LANE_COUNT];
-        self.hit = [None; LANE_COUNT];
-        self.judgment = None;
+        Ok(())
+    }
+
+    /// The frame's scale: the playhead sampled once at the display time,
+    /// with the chart's initial rate and the hi-speed; `None` with no
+    /// attempt prepared.
+    fn scale(&self, f: &FrameInput<'_>) -> Option<Scale> {
+        let playhead = self.playhead.as_ref()?;
+        Some(Scale::new(
+            playhead.position_at(f.display_time()),
+            playhead.initial_rate(),
+            f.visible_time,
+        ))
     }
 
     /// Marks done every note that is not one of the practice section's
@@ -588,15 +619,22 @@ impl SimpleSkin {
 }
 
 impl PlaySkin for SimpleSkin {
-    /// The chart's notes and bar lines, the section's targets only, and
-    /// fresh feedback: nothing of the preset.
+    /// The attempt's playhead, the chart's notes and bar lines, the
+    /// section's targets only, and fresh feedback: nothing of the preset
+    /// ([`prepare_attempt`](Self::prepare_attempt)). A refusal leaves no
+    /// attempt.
     fn prepare(&mut self, _gpu: &Gpu, a: &AttemptInput<'_>) -> Result<(), SkinError> {
-        self.load(a.chart, a.section());
-        Ok(())
+        self.prepare_attempt(a.chart, a.section())
+            .map_err(|e| SkinError {
+                reason: e.to_string(),
+            })
     }
 
-    fn load_chart(&mut self, chart: &Chart, section: Option<&Section>) -> Result<(), SkinError> {
-        self.load(chart, section);
+    /// A chart's load prepares nothing: the previous attempt, its playhead
+    /// included, is dropped, and the next attempt's preparation makes its
+    /// own.
+    fn load_chart(&mut self, _chart: &Chart, _section: Option<&Section>) -> Result<(), SkinError> {
+        *self = Self::new();
         Ok(())
     }
 
@@ -616,7 +654,8 @@ impl PlaySkin for SimpleSkin {
     }
 
     /// What the effects built up starts over: no note held, done, pressed
-    /// or hit, and no judgment shown; the chart stays.
+    /// or hit, and no judgment shown, the section's mask applied again;
+    /// the chart and the prepared playhead stay.
     fn rearm(&mut self) {
         for bits in self.held.iter_mut().chain(&mut self.done) {
             bits.0.fill(0);
@@ -633,16 +672,21 @@ impl PlaySkin for SimpleSkin {
         for ev in f.effects {
             self.apply(ev);
         }
-        let at = f.display_time();
-        let scale = Scale::new(&self.scroll, at, f.visible_time);
         let half = NOTE_H / 2.0;
-        let (from, to) = scale.positions(LANE_BOTTOM - JUDGE_Y + half, JUDGE_Y - LANE_TOP + half);
+        let range = self.scale(f).map(|s| {
+            let (from, to) = s.positions(LANE_BOTTOM - JUDGE_Y + half, JUDGE_Y - LANE_TOP + half);
+            (s, from, to)
+        });
         Self::lanes_and_lines(out);
-        self.bar_lines(out, &scale, from, to);
+        if let Some((scale, from, to)) = range {
+            self.bar_lines(out, &scale, from, to);
+        }
         let w = LANES_RIGHT - LANE_LEFT;
         let y = JUDGE_Y - JUDGE_LINE_H / 2.0;
         rect(out, Blend::Alpha, LANE_LEFT, y, w, JUDGE_LINE_H, JUDGE_LINE);
-        self.notes(out, &scale, from, to);
+        if let Some((scale, from, to)) = range {
+            self.notes(out, &scale, from, to);
+        }
         // Feedback ages on the frame's own clock: the display offset moves
         // notes only.
         self.hud(f, out, f.now);
@@ -650,8 +694,9 @@ impl PlaySkin for SimpleSkin {
         Ok(())
     }
 
-    /// Itself, the chart's notes, bar lines and scroll copied for the
-    /// attempt, and its held and done bits, by their allocations.
+    /// Itself, the chart's notes and bar lines copied for the attempt, its
+    /// held and done bits, by their allocations, and the playhead's
+    /// representatives; the playhead's timeline is the chart's.
     fn attempt_bytes(&self) -> u64 {
         let lanes: usize = self
             .lanes
@@ -667,7 +712,7 @@ impl PlaySkin for SimpleSkin {
         let bytes = size_of::<Self>()
             + lanes
             + self.bar_lines.capacity() * size_of::<Position>()
-            + size_of_val(self.scroll.segments())
+            + self.playhead.as_ref().map_or(0, ExactPlayhead::heap_bytes)
             + bits;
         u64::try_from(bytes).unwrap_or(u64::MAX)
     }
@@ -1106,7 +1151,7 @@ mod tests {
 
     fn skin(chart: &Chart) -> SimpleSkin {
         let mut s = SimpleSkin::new();
-        s.load(chart, None);
+        s.prepare_attempt(chart, None).unwrap();
         s
     }
 
@@ -1617,12 +1662,11 @@ mod tests {
         chart
     }
 
-    #[test]
-    fn loaded_notes_and_bar_lines_sit_at_their_exact_beats() {
-        // Quarter-beat measures at 9,990,400 BPM: measure k starts at beat
-        // k/4, k × 1.5014416... µs, so its notes sound on floored µs (1, 3,
-        // 4, ...). Taps on key 1 at measures 1-6, a long note on key 2 from
-        // measure 2 to 5, a last tap on key 3 at measure 9.
+    /// Quarter-beat measures at 9,990,400 BPM: measure k starts at beat
+    /// k/4, k × 1.5014416... µs, so its notes sound on floored µs (1, 3, 4,
+    /// 6, 7, 9, ..., 13). Taps on key 1 at measures 1-6, a long note on key
+    /// 2 from measure 2 to 5, a last tap on key 3 at measure 9.
+    fn high_bpm() -> Chart {
         let mut text = String::from("#BPM 9990400\n#LNTYPE 1\n#WAV01 a.wav\n");
         for m in 0..=9 {
             text.push_str(&format!("#{m:03}02:0.0625\n"));
@@ -1631,7 +1675,12 @@ mod tests {
             text.push_str(&format!("#{m:03}11:01\n"));
         }
         text.push_str("#00252:01\n#00552:01\n#00913:01\n");
-        let chart = loaded(&text);
+        loaded(&text)
+    }
+
+    #[test]
+    fn loaded_notes_and_bar_lines_sit_at_their_exact_beats() {
+        let chart = high_bpm();
         let mut s = skin(&chart);
         let v = view();
         // The playhead at 1 µs, 10 µs visible: 800 px over 10 µs of the
@@ -1641,12 +1690,17 @@ mod tests {
             ..frame(&v, 1, &[])
         };
         let batch = build(&mut s, &f);
-        // By hand: beat k/4 is k × 15e6 / 9_990_400 µs of scroll, drawn
-        // 80 px per µs above the line once past the playhead's 1 µs:
-        // measure 1 at 880 - 80 × 0.5014416... = 839.8847 px, where its
-        // floored time (1 µs) would put it on the line.
-        let y = |k: i32| 880.0 - 80.0 * (f64::from(k) * 15e6 / 9_990_400.0 - 1.0);
-        assert!((y(1) - 839.884_7).abs() < 1e-3);
+        // By hand: measure 1's tap is judged at its floored µs, 1, so the
+        // playhead there is measure 1's beat, 1/4, and the tap is centred
+        // on the line, y = 880 exactly (the sampled scroll map put it 40 px
+        // higher, at 839.885, a µs of scroll short of its beat). Beat k/4
+        // is then (k - 1) × 15e6 / 9_990_400 µs of scroll ahead, drawn
+        // 80 px per µs above the line.
+        let y = |k: i32| 880.0 - 80.0 * f64::from(k - 1) * 15e6 / 9_990_400.0;
+        assert_eq!(
+            in_lane(&batch, lane(1), NOTE_WHITE).first(),
+            Some(&[256.0, 872.0, 64.0, 16.0])
+        );
         let centers = |rects: Vec<[f32; 4]>| -> Vec<f64> {
             rects.iter().map(|r| f64::from(r[1] + r[3] / 2.0)).collect()
         };
@@ -1672,6 +1726,237 @@ mod tests {
             .collect();
         // Bar lines 1-7 lie wholly inside the lanes (y from 80 to 960).
         close(centers(bars), (1..=7).map(y).collect());
+    }
+
+    #[test]
+    fn each_fractional_endpoint_is_anchored_on_the_prepared_head() {
+        // At every endpoint's judgment µs, whatever the display offset, the
+        // frame's one sample of the playhead is the endpoint's stored
+        // position, so it is centred on the line before any pixel is
+        // rounded; in a practice round (from 4 µs to 12 µs: the taps at
+        // measures 3-6) every target's the same. The sampled scroll map
+        // missed each by about half a µs of scroll, 40 px at 10 µs
+        // visible.
+        let chart = high_bpm();
+        let v = view();
+        let round = Section {
+            start: TimeUs(4),
+            end: TimeUs(12),
+            lead_in: TimeUs(0),
+            initial_gauges: Vec::new(),
+        };
+        for section in [None, Some(&round)] {
+            let mut s = SimpleSkin::new();
+            s.prepare_attempt(&chart, section).unwrap();
+            let mut checked = 0;
+            for note in chart.lanes.iter().flatten() {
+                if section.is_some_and(|r| !r.is_target(note)) {
+                    continue;
+                }
+                let mut ends = vec![(note.time, note.pos)];
+                if let NoteKind::Long { end, end_pos, .. } = note.kind {
+                    ends.push((end, end_pos));
+                }
+                for (t, pos) in ends {
+                    assert_ne!(chart.scroll.position_at(t), pos, "{t:?} is whole");
+                    for offset in [0, 3, -2] {
+                        let f = FrameInput {
+                            display_offset: TimeUs(offset),
+                            visible_time: TimeUs(10),
+                            ..frame(&v, t.0 - offset, &[])
+                        };
+                        let scale = s.scale(&f).unwrap();
+                        assert_eq!(scale.at_line, pos, "{t:?} offset {offset}");
+                        assert_eq!(scale.y(pos), JUDGE_Y);
+                        checked += 1;
+                    }
+                }
+            }
+            assert_eq!(checked, if section.is_some() { 4 * 3 } else { 9 * 3 });
+        }
+    }
+
+    /// `slots` object pairs with `01` at `index`.
+    fn one_of(slots: usize, index: usize) -> String {
+        (0..slots)
+            .map(|i| if i == index { "01" } else { "00" })
+            .collect()
+    }
+
+    #[test]
+    fn notes_and_bar_lines_share_the_playheads_stop_plateau() {
+        // 150 BPM, a beat every 400 ms: a STOP of a beat at beat 3 with no
+        // note there, a tap on key 1 and a bar line at beat 4. Through the
+        // STOP, 1.2 s to 1.6 s, the playhead holds beat 3, so both hold a
+        // beat ahead, 800 px / 1.5 = 533.33 px above the line, and move on
+        // after it.
+        let chart = loaded("#BPM 150\n#STOP01 48\n#WAV01 a.wav\n#00009:00000001\n#00111:01\n");
+        let mut s = skin(&chart);
+        let v = view();
+        let mut at = |now: i64| {
+            let batch = build(&mut s, &frame(&v, now, &[]));
+            let bars: Vec<[f32; 4]> = batch
+                .blended(Blend::Alpha)
+                .filter(|s| s.color == BAR_LINE && s.rect[3] == BAR_LINE_H)
+                .map(|s| s.rect)
+                .collect();
+            (in_lane(&batch, lane(1), NOTE_WHITE), bars)
+        };
+        let held = at(1_200 * MS);
+        let y = 880.0 - 800.0 / 1.5;
+        assert_eq!(held.0.len(), 1);
+        assert!((held.0[0][1] + NOTE_H / 2.0 - y).abs() < 1e-3, "{held:?}");
+        assert!(
+            held.1
+                .iter()
+                .any(|b| (b[1] + BAR_LINE_H / 2.0 - y).abs() < 1e-3)
+        );
+        for now in [1_300 * MS, 1_599_999, 1_600 * MS] {
+            assert_eq!(at(now), held, "{now}");
+        }
+        for now in [1_199_999, 1_600_001] {
+            assert_ne!(at(now).0, held.0, "{now}");
+        }
+        // A STOP sharing its µs with a tap at another position (2003rds
+        // and 2001sts of a measure both floor to 799 600 µs) follows the
+        // playhead's representative rule: the tap meets the line at its µs,
+        // and the curve rises through the STOP to the STOP's position.
+        let alias = loaded(&format!(
+            "#BPM 150\n#STOP01 48\n#WAV01 a.wav\n#00011:{}\n#00009:{}\n#00111:01\n",
+            one_of(2001, 1000),
+            one_of(2003, 1001)
+        ));
+        let mut s = skin(&alias);
+        let tap = alias.lanes[1][0];
+        assert_eq!(tap.time, TimeUs(799_600));
+        let playhead = ExactPlayhead::prepare(&alias, None).unwrap();
+        for now in (799_000..1_300_000)
+            .step_by(997)
+            .chain([799_600, 1_199_600])
+        {
+            let f = frame(&v, now, &[]);
+            let scale = s.scale(&f).unwrap();
+            assert_eq!(scale.at_line, playhead.position_at(TimeUs(now)), "{now}");
+        }
+        let on_line = build(&mut s, &frame(&v, 799_600, &[]));
+        assert_eq!(
+            in_lane(&on_line, lane(1), NOTE_WHITE).first(),
+            Some(&[256.0, 872.0, 64.0, 16.0])
+        );
+        let rising = |now| s.scale(&frame(&v, now, &[])).unwrap().at_line;
+        assert!(rising(1_000_000) > rising(799_600));
+    }
+
+    #[test]
+    fn a_rearm_keeps_the_playhead_and_starts_the_feedback_over() {
+        // A whole play and a practice round: a judged tap (key 1's at
+        // 1.1 s, a target of both) is hidden; each rearm keeps the very
+        // representatives and the attempt's memory, draws it again and
+        // keeps the section's mask.
+        let (chart, round) = sectioned();
+        let v = view();
+        for section in [None, Some(&round)] {
+            let mut s = SimpleSkin::new();
+            s.prepare_attempt(&chart, section).unwrap();
+            let reps = s.playhead.as_ref().unwrap().representatives().as_ptr();
+            let bytes = s.attempt_bytes();
+            let fresh = notes_drawn(&mut s);
+            let judged = event(
+                0,
+                900 * MS,
+                Some(900 * MS),
+                JudgeEventKind::Judged {
+                    lane: lane(1),
+                    note: 1,
+                    judgment: Judgment::Perfect,
+                    deviation: Some(TimeUs(-200 * MS)),
+                    release: None,
+                    combo: 1,
+                },
+            );
+            build(&mut s, &frame(&v, 900 * MS, &[judged]));
+            assert_eq!(notes_drawn(&mut s).0, fresh.0 - 1, "{section:?}");
+            for k in 0..3 {
+                s.rearm();
+                let playhead = s.playhead.as_ref().unwrap();
+                assert_eq!(playhead.representatives().as_ptr(), reps, "rearm {k}");
+                assert_eq!(s.attempt_bytes(), bytes, "rearm {k}");
+                assert_eq!((s.judgment, s.hit, s.pressed), (None, [None; 8], [None; 8]));
+                assert_eq!(notes_drawn(&mut s), fresh, "rearm {k}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_refused_or_dropped_attempt_leaves_nothing_drawn() {
+        // A chart with a row past the playhead's domain, and one with two
+        // notes at one µs at two positions, are refused before anything of
+        // them is kept, and the previous attempt is gone too: the frame
+        // draws the lanes and the line, no note and no bar line. A chart's
+        // load drops a prepared attempt the same way.
+        let chart = ChartBuilder::new(BPM)
+            .tap(lane(1), TimeUs(1_000 * MS))
+            .build()
+            .unwrap();
+        let past = ChartBuilder::new(BPM)
+            .tap(lane(1), TimeUs(1_000))
+            .tap(lane(2), TimeUs(bms_model::DOMAIN + 1))
+            .build()
+            .unwrap();
+        let conflict = loaded(&format!(
+            "#BPM 150\n#WAV01 a.wav\n#00011:{}\n#00012:{}\n",
+            one_of(2001, 1000),
+            one_of(2003, 1001)
+        ));
+        let v = view();
+        let bare = u64::try_from(size_of::<SimpleSkin>()).unwrap();
+        let drawn = |s: &mut SimpleSkin| {
+            let batch = build(s, &frame(&v, 900 * MS, &[]));
+            assert!(batch.blended(Blend::Alpha).any(|s| s.color == JUDGE_LINE));
+            batch
+                .blended(Blend::Alpha)
+                .filter(|s| [NOTE_WHITE, NOTE_BLUE, BAR_LINE].contains(&s.color))
+                .count()
+        };
+        let mut s = skin(&chart);
+        assert!(drawn(&mut s) > 0);
+        assert!(matches!(
+            s.prepare_attempt(&past, None),
+            Err(PrepareError::TimeOutOfDomain { .. })
+        ));
+        assert!(s.playhead.is_none());
+        assert_eq!(s.attempt_bytes(), bare);
+        assert_eq!(drawn(&mut s), 0);
+        s.prepare_attempt(&chart, None).unwrap();
+        assert!(matches!(
+            s.prepare_attempt(&conflict, None),
+            Err(PrepareError::Presentation(_))
+        ));
+        assert_eq!((s.attempt_bytes(), drawn(&mut s)), (bare, 0));
+        s.prepare_attempt(&chart, None).unwrap();
+        assert!(drawn(&mut s) > 0);
+        s.load_chart(&chart, None).unwrap();
+        assert!(s.playhead.is_none());
+        assert_eq!((s.attempt_bytes(), drawn(&mut s)), (bare, 0));
+    }
+
+    #[test]
+    fn the_attempts_memory_counts_the_representatives() {
+        // Itself, the notes and bar lines copied, two bits per note and
+        // 4 bytes per stored µs of the timeline, which is the chart's.
+        let chart = high_bpm();
+        let mut s = SimpleSkin::new();
+        s.prepare_attempt(&chart, None).unwrap();
+        let notes: usize = chart.lanes.iter().map(Vec::len).sum();
+        let words: usize = chart.lanes.iter().map(|l| l.len().div_ceil(64)).sum();
+        let mut times: Vec<TimeUs> = chart.timeline.points().iter().map(|p| p.at).collect();
+        times.dedup();
+        let want = size_of::<SimpleSkin>()
+            + notes * size_of::<Note>()
+            + chart.bar_lines.len() * size_of::<Position>()
+            + 2 * words * size_of::<u64>()
+            + times.len() * 4;
+        assert_eq!(s.attempt_bytes(), u64::try_from(want).unwrap());
     }
 
     #[test]
@@ -1788,7 +2073,7 @@ mod tests {
     fn only_section_targets_are_drawn() {
         let (chart, section) = sectioned();
         let mut s = SimpleSkin::new();
-        s.load(&chart, Some(&section));
+        s.prepare_attempt(&chart, Some(&section)).unwrap();
         let (taps, crossing, inside) = notes_drawn(&mut s);
         assert_eq!(taps, 2);
         assert_eq!(crossing, 0);
@@ -1803,8 +2088,8 @@ mod tests {
     fn a_full_play_after_a_section_draws_every_note() {
         let (chart, section) = sectioned();
         let mut s = SimpleSkin::new();
-        s.load(&chart, Some(&section));
-        s.load(&chart, None);
+        s.prepare_attempt(&chart, Some(&section)).unwrap();
+        s.prepare_attempt(&chart, None).unwrap();
         let (taps, crossing, inside) = notes_drawn(&mut s);
         assert_eq!(taps, 4);
         assert!(crossing > 0 && inside > 0);
@@ -1813,12 +2098,13 @@ mod tests {
     #[test]
     fn visible_time_below_a_microsecond_counts_as_one() {
         let chart = ChartBuilder::new(BPM).build().unwrap();
-        let one = layout::Scale::new(&chart.scroll, TimeUs(0), TimeUs(1));
+        let rate = chart.scroll.initial_rate();
+        let one = layout::Scale::new(Position(0), rate, TimeUs(1));
         // 1 µs of 150 BPM (2.5 millionths of a beat) on 800 px.
         let beat = (1_u128 << 80) as f64;
         assert!((one.px_per_pos * beat * 2.5e-6 - 800.0).abs() < 1e-6);
         for v in [0, -5, i64::MIN] {
-            assert_eq!(layout::Scale::new(&chart.scroll, TimeUs(0), TimeUs(v)), one);
+            assert_eq!(layout::Scale::new(Position(0), rate, TimeUs(v)), one);
         }
     }
 

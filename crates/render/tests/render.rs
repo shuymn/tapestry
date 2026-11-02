@@ -1,6 +1,9 @@
-//! The simple skin drawn on WARP and read back: notes sit where the scroll
-//! map, the hi-speed visible time and the display latency offset put them,
-//! and its feedback fades with its colour composited once. Sprites are drawn
+//! The simple skin drawn on WARP and read back: notes sit where the
+//! attempt's exact playhead, the hi-speed visible time and the display
+//! latency offset put them, so a note meets the judgment line at its
+//! judgment µs even at a fractional-µs time; a refused preparation leaves
+//! nothing of its attempt drawn; and its feedback fades with its colour
+//! composited once. Sprites are drawn
 //! in push order whatever their blends, premultiplied, turned about their
 //! pivots.
 //!
@@ -60,7 +63,7 @@ fn bpm_change_chart() -> Chart {
 }
 
 #[test]
-fn note_is_drawn_where_scroll_map_says() {
+fn note_is_drawn_where_the_playhead_says() {
     // The display offset is 20 ms, so a frame started at `now` shows
     // `now + 20 ms`:
     // - shown at 1.45 s (beat 2.9): 1.1 beats ahead, y = 880 - 1.1 ×
@@ -245,7 +248,9 @@ fn a_rearm_draws_a_judged_note_again() {
     };
     r.frame(&input(&v, now, TimeUs(0), &[judged])).unwrap();
     assert_eq!(white_rows(&r.read_back(), LANE_7), Vec::<u32>::new());
+    let memory = r.memory();
     r.rearm();
+    assert_eq!(r.memory(), memory, "the rearm kept the attempt's memory");
     r.frame(&input(&v, now, TimeUs(0), &[])).unwrap();
     let rearmed = r.read_back();
     assert_row(&rearmed, LANE_5, 560.89);
@@ -271,6 +276,7 @@ fn a_rearmed_practice_round_draws_only_its_targets() {
     };
     let mut r = common::offscreen(common::WIDTH, common::HEIGHT);
     r.load(&chart, Some(&section)).unwrap();
+    common::prepare_section(&mut r, &chart, &section);
     let v = view(1, 2);
     let now = TimeUs(1_800 * MS);
     let judged = JudgeEvent {
@@ -288,9 +294,200 @@ fn a_rearmed_practice_round_draws_only_its_targets() {
     };
     r.frame(&input(&v, now, TimeUs(0), &[judged])).unwrap();
     assert_eq!(white_rows(&r.read_back(), LANE_7), Vec::<u32>::new());
+    let memory = r.memory();
     r.rearm();
+    assert_eq!(r.memory(), memory, "the rearm kept the attempt's memory");
     r.frame(&input(&v, now, TimeUs(0), &[])).unwrap();
     assert_row(&r.read_back(), LANE_7, 560.89);
+}
+
+/// A 1920×1080 target: the layout at scale 1, layout row y on target row
+/// y, and each lane's middle column at layout x.
+const FULL: (u32, u32) = (1_920, 1_080);
+const FULL_KEY_1: u32 = 288;
+const FULL_KEY_3: u32 = 416;
+const FULL_KEY_4: u32 = 480;
+const FULL_KEY_5: u32 = 544;
+const FULL_KEY_7: u32 = 672;
+
+/// Loads BMS `text` as a session does: the loader, then the transform and
+/// the validation of its output.
+fn loaded(text: &str) -> Chart {
+    use game::ChartTransform;
+    let dir = tempfile::tempdir().unwrap();
+    let opts = bms_parser::LoadOptions::default();
+    let chart = bms_parser::load_bms(text.as_bytes(), dir.path(), &opts)
+        .unwrap()
+        .chart;
+    let chart = game::Passthrough.apply(chart, 0);
+    chart.validate().unwrap();
+    chart
+}
+
+/// Quarter-beat measures at 9,990,400 BPM: measure m starts at m ×
+/// 1.5014416... µs, judged at the floored µs, so measures 1, 3, 5, 7 and 9
+/// at 1, 4, 7, 10 and 13 µs, each about half a µs early. A tap on key 7
+/// at measure 1, on key 5 at measure 3 and on key 3 at measure 7, and a
+/// long note on key 1 from measure 5 to measure 9.
+fn fractional() -> Chart {
+    let mut text = String::from("#BPM 9990400\n#LNTYPE 1\n#WAV01 a.wav\n");
+    for m in 0..=9 {
+        text.push_str(&format!("#{m:03}02:0.0625\n"));
+    }
+    text.push_str("#00119:01\n#00315:01\n#00713:01\n#00551:01\n#00951:01\n");
+    loaded(&text)
+}
+
+/// The middle rows of the runs of rows in column `x` of a [`FULL`] read
+/// back whose RGB `keep` accepts, top to bottom.
+fn runs(pixels: &[u8], x: u32, keep: impl Fn([u8; 3]) -> bool) -> Vec<f64> {
+    let mut out = Vec::new();
+    let mut start = None;
+    for y in 0..=FULL.1 {
+        let on = y < FULL.1 && keep(common::rgb_at(pixels, FULL.0, (x, y)));
+        match (on, start) {
+            (true, None) => start = Some(y),
+            (false, Some(s)) => {
+                out.push(f64::from(s + y) / 2.0);
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+fn white(c: [u8; 3]) -> bool {
+    c.iter().all(|&v| v > 200)
+}
+
+/// A bar line's grey, 0.5 opaque.
+fn grey(c: [u8; 3]) -> bool {
+    c.iter().all(|v| (100..=160).contains(v))
+}
+
+/// `got` holds `want`'s rows, each within a row.
+#[track_caller]
+fn assert_rows(got: &[f64], want: &[f64]) {
+    assert_eq!(got.len(), want.len(), "rows {got:?}, expected {want:?}");
+    for (g, w) in got.iter().zip(want) {
+        assert!((g - w).abs() <= 1.0, "rows {got:?}, expected {want:?}");
+    }
+}
+
+/// The default renderer meets every endpoint at its judgment µs: a frame
+/// displayed at an endpoint's µs draws it centred on the line (row 880),
+/// whatever the display offset, long-note ends and a practice round's
+/// targets included, and the other notes and the bar lines at their
+/// stored distances from it. With 10 µs visible a µs of scroll at the
+/// start BPM is 80 px and a measure (a quarter beat) 120.115 px. The
+/// sampled scroll map drew each endpoint at its µs about half a µs of
+/// scroll short of its beat, 40 px above the line (rows 839.9, 839.7,
+/// 839.4, 839.2 and 839.0 for measures 1, 3, 5, 7 and 9), and everything
+/// else the same 40 px off.
+#[test]
+fn endpoints_meet_the_line_at_fractional_us() {
+    let chart = fractional();
+    let measure = 80.0 * 15e6 / 9_990_400.0;
+    // Measure m's row when measure k is on the line.
+    let y = |m: i32, k: i32| 880.0 - f64::from(m - k) * measure;
+    let mut r = common::offscreen(FULL.0, FULL.1);
+    r.load(&chart, None).unwrap();
+    common::prepare(&mut r, &chart);
+    let v = view(0, 0);
+    let draw = |r: &mut Renderer, now: i64, offset: i64| {
+        let f = render::FrameInput {
+            visible_time: TimeUs(10),
+            target: [FULL.0, FULL.1],
+            ..input(&v, TimeUs(now), TimeUs(offset), &[])
+        };
+        let timing = r.frame(&f).unwrap();
+        assert!(timing.presented);
+        r.read_back()
+    };
+    let notes = |p: &[u8], x| runs(p, x, white);
+
+    // Shown at 1 µs: measure 1's tap on the line, the long note's head
+    // (its end above the lanes) and the other taps above it, and the bar
+    // lines of measures 2-7 (measure 1's is under the judgment line, 0's
+    // and 8's outside the lanes).
+    let at_1 = draw(&mut r, 1, 0);
+    assert_rows(&notes(&at_1, FULL_KEY_7), &[880.0]);
+    assert_rows(&notes(&at_1, FULL_KEY_5), &[y(3, 1)]);
+    assert_rows(&notes(&at_1, FULL_KEY_3), &[y(7, 1)]);
+    assert_rows(&notes(&at_1, FULL_KEY_1), &[y(5, 1)]);
+    let bars: Vec<f64> = (2..=7).rev().map(|m| y(m, 1)).collect();
+    assert_rows(&runs(&at_1, FULL_KEY_4, grey), &bars);
+
+    // Started at 1 µs with a 3 µs display offset, shown at 4 µs: measure
+    // 3's tap on the line, the long note whole above it, and measure 1's
+    // tap below the lanes.
+    let offset = draw(&mut r, 1, 3);
+    assert_rows(&notes(&offset, FULL_KEY_5), &[880.0]);
+    assert_rows(&notes(&offset, FULL_KEY_1), &[y(9, 3), y(5, 3)]);
+    assert_rows(&notes(&offset, FULL_KEY_3), &[y(7, 3)]);
+    assert_rows(&notes(&offset, FULL_KEY_7), &[]);
+
+    // The long note at its head's µs, its end 4 measures above, and at its
+    // end's µs, both ends on the line.
+    assert_rows(&notes(&draw(&mut r, 7, 0), FULL_KEY_1), &[y(9, 5), 880.0]);
+    assert_rows(&notes(&draw(&mut r, 13, 0), FULL_KEY_1), &[880.0]);
+
+    // A practice round from 9 µs to 12 µs: its one target, measure 7's
+    // tap, on the line at its µs, the notes outside it not drawn.
+    let section = eval::Section {
+        start: TimeUs(9),
+        end: TimeUs(12),
+        lead_in: TimeUs(0),
+        initial_gauges: Vec::new(),
+    };
+    common::prepare_section(&mut r, &chart, &section);
+    let round = draw(&mut r, 10, 0);
+    assert_rows(&notes(&round, FULL_KEY_3), &[880.0]);
+    for x in [FULL_KEY_1, FULL_KEY_5, FULL_KEY_7] {
+        assert_rows(&notes(&round, x), &[]);
+    }
+}
+
+/// An attempt the simple skin refuses (a row past the playhead's domain)
+/// is a refusal of the attempt, not of the screen: the previous attempt
+/// is gone, frames go on being drawn and presented with no note, the
+/// attempt's memory is the skin's own, and the next attempt draws again.
+#[test]
+fn a_refused_preparation_keeps_the_renderer_and_draws_no_attempt() {
+    let chart = ChartBuilder::new(120_000)
+        .tap(lane(7), TimeUs(2_000 * MS))
+        .build()
+        .unwrap();
+    let past = ChartBuilder::new(120_000)
+        .tap(lane(7), TimeUs(2_000 * MS))
+        .tap(lane(5), TimeUs(bms_model::DOMAIN + 1))
+        .build()
+        .unwrap();
+    let mut r = warp(&chart);
+    assert_row(&draw(&mut r, 1_800 * MS, 0), LANE_7, 560.89);
+    r.load(&past, None).unwrap();
+    let ctx = common::context(&common::GAUGES, false);
+    let refused = r
+        .prepare_attempt(&common::attempt(&r, &past, &ctx))
+        .unwrap_err();
+    assert!(refused.is_refusal(), "{refused}");
+    let render::RenderError::Skin(why) = &refused else {
+        panic!("{refused:?}");
+    };
+    assert!(why.reason.contains("outside the playhead's range"), "{why}");
+    assert_eq!(
+        r.memory().attempt,
+        size_of::<render::SimpleSkin>() as u64,
+        "the refused attempt kept memory"
+    );
+    assert_eq!(
+        white_rows(&draw(&mut r, 1_800 * MS, 0), LANE_7),
+        Vec::<u32>::new()
+    );
+    r.load(&chart, None).unwrap();
+    common::prepare(&mut r, &chart);
+    assert_row(&draw(&mut r, 1_800 * MS, 0), LANE_7, 560.89);
 }
 
 #[test]
@@ -361,7 +558,9 @@ fn offscreen_pacing_indicator() {
         let l = u8::try_from(i % 8).unwrap();
         b = b.tap(lane(l), TimeUs(i64::from(i) * 5 * MS));
     }
-    r.load(&b.build().unwrap(), None).unwrap();
+    let chart = b.build().unwrap();
+    r.load(&chart, None).unwrap();
+    common::prepare(&mut r, &chart);
     let v = view(42, 1_234);
     let (mut slowest, mut skipped) = (std::time::Duration::ZERO, 0);
     let began = std::time::Instant::now();
