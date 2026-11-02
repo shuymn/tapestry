@@ -139,13 +139,18 @@ pub enum AudioCtl {
     },
     /// A READY candidate of the current play was cancelled and another
     /// opened: chart time 0 now at `origin`, its transport waiting for
-    /// `gate` as the first's did, the play's queue and gain kept. Nothing
-    /// is allocated or freed.
+    /// `gate` as the first's did, the play's queue and gain kept. A
+    /// round's `restore`, planned again in a box the game thread owns,
+    /// takes the place of the play's: the one it replaces goes back for
+    /// the next rearm ([`AudioControl::take_restore`]). Nothing is
+    /// allocated or freed.
     Rearm {
         /// Where the new candidate's chart time 0 lies.
         origin: TimeUs,
         /// Its gate.
         gate: TransportGate,
+        /// A round's restore for it.
+        restore: Option<Box<Restore>>,
     },
     /// The play was aborted: every sound stops.
     Cancel,
@@ -351,6 +356,8 @@ struct Shared {
 pub struct AudioControl {
     ctl: rtrb::Producer<AudioCtl>,
     retired: rtrb::Consumer<RetiredPlay>,
+    /// The restores rearms replaced, for planning the next rearm in.
+    rearmed: rtrb::Consumer<Box<Restore>>,
     /// What the engine plays, as of its latest load: for planning a round's
     /// restore.
     source: SeekSource,
@@ -394,6 +401,10 @@ pub struct AudioWorker {
     exited: bool,
     /// A retired play the full return queue did not take.
     unreturned: Option<RetiredPlay>,
+    /// The restores rearms replaced, back to the game thread for the next.
+    rearmed: rtrb::Producer<Box<Restore>>,
+    /// A replaced restore the full queue did not take.
+    unreturned_restore: Option<Box<Restore>>,
     /// Where key sound latencies go, if anywhere; a full queue drops them.
     probe: Option<rtrb::Producer<AudioProbe>>,
     /// The number of the latest queue change applied.
@@ -410,6 +421,7 @@ pub fn audio_control(mut engine: AudioEngine) -> (AudioControl, AudioWorker) {
     engine.stop();
     let (ctl_tx, ctl_rx) = rtrb::RingBuffer::new(CONTROL_CAPACITY);
     let (ret_tx, ret_rx) = rtrb::RingBuffer::new(RETIRED_CAPACITY);
+    let (rearm_tx, rearm_rx) = rtrb::RingBuffer::new(RETIRED_CAPACITY);
     let (loads_tx, loads_rx) = rtrb::RingBuffer::new(LOADS_CAPACITY);
     let rate = engine.bank().rate();
     let line = engine.frame_line();
@@ -422,6 +434,7 @@ pub fn audio_control(mut engine: AudioEngine) -> (AudioControl, AudioWorker) {
     let control = AudioControl {
         ctl: ctl_tx,
         retired: ret_rx,
+        rearmed: rearm_rx,
         source,
         in_flight: false,
         loads: loads_rx,
@@ -448,6 +461,8 @@ pub fn audio_control(mut engine: AudioEngine) -> (AudioControl, AudioWorker) {
         sealed: false,
         exited: false,
         unreturned: None,
+        rearmed: rearm_tx,
+        unreturned_restore: None,
         probe: None,
         queue_change: 0,
         steady_from: None,
@@ -586,10 +601,22 @@ impl AudioControl {
     }
 
     /// The play's cancelled candidate is followed by another, chart time 0
-    /// at `origin`, waiting for `gate` ([`AudioCtl::Rearm`]). Send it once
-    /// the cancellation is acknowledged ([`AudioCounters::dropped`]).
-    pub fn rearm(&mut self, origin: TimeUs, gate: TransportGate) {
-        self.send(AudioCtl::Rearm { origin, gate });
+    /// at `origin`, waiting for `gate`, a round's audio restored by
+    /// `restore` ([`AudioCtl::Rearm`]). Send it once the cancellation is
+    /// acknowledged ([`AudioCounters::dropped`]). The restore it replaces
+    /// comes back ([`take_restore`](Self::take_restore)).
+    pub fn rearm(&mut self, origin: TimeUs, gate: TransportGate, restore: Option<Box<Restore>>) {
+        self.send(AudioCtl::Rearm {
+            origin,
+            gate,
+            restore,
+        });
+    }
+
+    /// A round's restore a rearm replaced, once the audio thread handed it
+    /// back: the box the next rearm's restore is planned in.
+    pub fn take_restore(&mut self) -> Option<Box<Restore>> {
+        self.rearmed.pop().ok()
     }
 
     /// What the engine plays, as of its latest load: for a round's
@@ -808,6 +835,11 @@ impl AudioWorker {
             // Checked by `set_volume`.
             let _ = self.engine.set_volume(f32::from_bits(volume as u32));
         }
+        if let Some(old) = self.unreturned_restore.take()
+            && let Err(rtrb::PushError::Full(old)) = self.rearmed.push(old)
+        {
+            self.unreturned_restore = Some(old);
+        }
         if let Some(old) = self.unreturned.take()
             && let Err(rtrb::PushError::Full(old)) = self.retired.push(old)
         {
@@ -894,12 +926,33 @@ impl AudioWorker {
                     self.publish_steady();
                 }
                 AudioCtl::Cancel => self.drop_play(),
-                AudioCtl::Rearm { origin, gate } => {
+                AudioCtl::Rearm {
+                    origin,
+                    gate,
+                    restore,
+                } => {
                     self.engine.restart(origin);
+                    let restored = restore
+                        .as_deref()
+                        .map_or(0, |r| r.apply(&mut self.engine).code());
                     self.engine.hold_transport(gate.commit_at);
+                    self.shared.restored.store(
+                        self.generation << 8 | u64::from(restored),
+                        Ordering::Release,
+                    );
                     self.origin = origin;
                     self.transport = Some(gate);
                     self.steady_from = Some(origin);
+                    if restore.is_some() {
+                        let old = std::mem::replace(&mut self.restore, restore);
+                        // One rearm's restore is in flight at a time; were
+                        // the queue full, it would wait here, still owned.
+                        if let Some(old) = old
+                            && let Err(rtrb::PushError::Full(old)) = self.rearmed.push(old)
+                        {
+                            self.unreturned_restore = Some(old);
+                        }
+                    }
                 }
                 AudioCtl::Seal => self.sealed = true,
                 AudioCtl::RingOut { fade_at, end_at } => {
