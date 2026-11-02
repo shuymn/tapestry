@@ -189,6 +189,20 @@ pub(crate) struct Pass {
     bridge: Option<Bridge>,
     /// The tables of `skin_config`, by address.
     views: RefCell<Vec<usize>>,
+    #[cfg(feature = "dev-tools")]
+    timings: Cell<Timings>,
+}
+
+/// How long a configured pass's stages took, for the benchmarks: the
+/// VM's creation and the entry's run, the conversion, the VM's teardown,
+/// and the common import.
+#[cfg(feature = "dev-tools")]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Timings {
+    pub execution: std::time::Duration,
+    pub conversion: std::time::Duration,
+    pub teardown: std::time::Duration,
+    pub import: std::time::Duration,
 }
 
 impl Pass {
@@ -217,6 +231,8 @@ impl Pass {
             last_error: RefCell::new(None),
             bridge,
             views: RefCell::new(Vec::new()),
+            #[cfg(feature = "dev-tools")]
+            timings: Cell::new(Timings::default()),
         }
     }
 
@@ -360,7 +376,15 @@ fn pass(
     let r = run_pass(&pass, entry);
     let counts = pass.ledger.counts();
     let store = pass.store.replace(Store::default());
+    #[cfg(feature = "dev-tools")]
+    LAST_TIMINGS.with(|t| t.set(pass.timings.get()));
     (r, store, counts)
+}
+
+#[cfg(feature = "dev-tools")]
+thread_local! {
+    /// The stages of this thread's last pass.
+    static LAST_TIMINGS: Cell<Timings> = Cell::new(Timings::default());
 }
 
 /// [`pass`]'s work: the VM lives only inside.
@@ -371,12 +395,16 @@ fn run_pass(pass: &Rc<Pass>, entry: &str) -> Result<Converted, ImportError> {
             why: LuaWhy::Cancelled,
         });
     }
+    #[cfg(feature = "dev-tools")]
+    let start = std::time::Instant::now();
     let r = sandbox::vm(pass).map(|lua| {
         let run = loader::compile(&lua, pass, entry).and_then(|(f, id)| {
             let values = loader::run(&lua, pass, f, MultiValue::new())?;
             pass.ledger.memory(lua.used_memory());
             Ok((values, id))
         });
+        #[cfg(feature = "dev-tools")]
+        let executed = std::time::Instant::now();
         let converted = run.map(|(values, id)| {
             let value = values.into_iter().next().unwrap_or(Value::Nil);
             let modules = pass.modules.borrow().clone();
@@ -386,7 +414,16 @@ fn run_pass(pass: &Rc<Pass>, entry: &str) -> Result<Converted, ImportError> {
                 entry: id,
             })
         });
+        #[cfg(feature = "dev-tools")]
+        let done = std::time::Instant::now();
         drop(lua);
+        #[cfg(feature = "dev-tools")]
+        pass.timings.set(Timings {
+            execution: executed - start,
+            conversion: done - executed,
+            teardown: done.elapsed(),
+            import: std::time::Duration::ZERO,
+        });
         converted
     });
     if let Some(fault) = pass.ledger.take_fault() {
@@ -482,6 +519,22 @@ impl LuaHeader {
             dependencies,
             usage: counts,
         })
+    }
+
+    /// Runs the configured pass with `config` and imports its table, as
+    /// [`Self::import`] does, and returns how long each stage took.
+    ///
+    /// # Errors
+    ///
+    /// What [`Self::import`] refuses.
+    #[cfg(feature = "dev-tools")]
+    pub fn timed(&self, config: &Config, cancel: &Cancel) -> Result<Timings, ImportError> {
+        let (mut def, _, _) = self.configured(config, cancel)?;
+        let mut t = LAST_TIMINGS.with(Cell::get);
+        let start = std::time::Instant::now();
+        std::hint::black_box(import(&mut def, &self.header, config)?);
+        t.import = start.elapsed();
+        Ok(t)
     }
 
     /// The configured pass: the converted definition, the candidate's

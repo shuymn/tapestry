@@ -36,3 +36,8 @@ required-features = ["dev-tools"]
 [[bench]]
 name = "import"
 harness = false
+
+[[bench]]
+name = "lua"
+harness = false
+required-features = ["dev-tools"]
