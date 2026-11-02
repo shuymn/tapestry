@@ -37,7 +37,7 @@ use crate::end_screen::{LoadTimes, preset_error_text, shelf_error_text, view_log
 use crate::loading_text::{ChosenChart, LoadingText, Stage};
 use crate::log_file;
 use crate::play::{PlayerRig, since};
-use crate::render_side::{LoadingSink, RenderLink, RenderMsg, ScreenError};
+use crate::render_side::{LoadingSink, RenderLink, RenderMsg, ScreenError, SkinState};
 use crate::result_input::{Owner, Pad, ResultInput};
 use crate::select::{Acted, MenuInput, MenuKey, MenuQueue, SelectScreen};
 #[cfg(feature = "dev-tools")]
@@ -297,6 +297,26 @@ impl Selection {
         self.screen
             .set_save_error(error.map(|e| format!("player.toml を保存できません: {e}")));
         self.dirty = true;
+    }
+
+    /// `chosen`, if the play skin is ready for it ([`SkinState::ready`]);
+    /// else nothing is admitted, and the chart shows under the cursor with
+    /// the reason as the notice. The page stays usable.
+    fn admit(
+        &mut self,
+        chosen: Option<Pick>,
+        skin: &mut SkinState,
+        render: &RenderLink,
+    ) -> Option<Pick> {
+        let pick = chosen?;
+        let Err(notice) = skin.ready() else {
+            return Some(pick);
+        };
+        let (Pick::Play(path) | Pick::Practice(path)) = &pick;
+        println!("select: not admitted {}: {notice}", file_name(path));
+        self.refused(path, notice, false);
+        self.show(render, None);
+        None
     }
 
     /// Sends the page if it changed, with `status` in its title (the
@@ -1062,6 +1082,8 @@ impl PlayerRig<'_> {
         {
             chosen = sel.drain_owned(&mut self.result_input);
         }
+        // Before anything of the choice: no chart without its skin.
+        let chosen = sel.admit(chosen, &mut self.skin, &self.render);
         if let Some(pick) = &chosen {
             let (Pick::Play(path) | Pick::Practice(path)) = pick;
             let what = if matches!(pick, Pick::Practice(_)) {
@@ -1752,6 +1774,12 @@ impl AppRig for PlayerRig<'_> {
     /// The one routine of every entry into the practice page: on opening
     /// and after every return (a refused Start, a refused opening or
     /// restore, the rounds left by the quit key or a result's back).
+    fn start_ready(&mut self) -> Result<(), String> {
+        self.skin.ready().inspect_err(|notice| {
+            println!("practice: not started: {notice}");
+        })
+    }
+
     fn entered_practice(&mut self, screen: &PracticeScreen) {
         recover(
             &mut self.result_input,
@@ -1866,6 +1894,80 @@ mod tests {
         // Only catches a hold that never ends, however late a loaded
         // machine runs it.
         assert!(began.elapsed() < Duration::from_secs(600));
+    }
+
+    /// A chart chosen is admitted only once the selected skin is
+    /// installed, before anything of the choice happens (`look`'s gate):
+    /// - while its installation waits on the render thread, the choice is
+    ///   dropped with a notice, the select page goes on taking keys and
+    ///   each look returns at once;
+    /// - installed, the next choice is admitted;
+    /// - refused, the choice is dropped with the screen's located reason
+    ///   as the notice, every later choice too, and the page stays usable.
+    ///
+    /// The practice page asks the same state at a Start
+    /// ([`game::AppRig::start_ready`]).
+    #[test]
+    fn a_chart_is_admitted_only_once_its_skin_is_installed() {
+        use std::sync::atomic::Ordering;
+
+        use crate::menu_screen::LineStyle;
+        use crate::render_side::SkinState;
+        use crate::render_side::tests::{Installers, bundle, wait_until};
+
+        let notice = |sel: &Selection| {
+            let page = sel.screen.page("");
+            page.lines
+                .into_iter()
+                .find(|l| l.style == LineStyle::Notice)
+                .map(|l| l.text)
+                .unwrap_or_default()
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut sel = selection(dir.path());
+        let screens = Installers::default();
+        let render = screens.spawn_bare();
+        let mut skin = SkinState::Ready;
+        let choose = |sel: &mut Selection, skin: &mut SkinState, keys: &[MenuKey]| {
+            for key in keys {
+                sel.menu.push(MenuInput::Key(*key));
+            }
+            let chosen = sel.drain(&mut Pad::default());
+            let began = Instant::now();
+            let admitted = sel.admit(chosen, skin, &render);
+            assert!(began.elapsed() < Duration::from_secs(1), "a look waited");
+            admitted
+        };
+
+        // Held on the render thread: dropped, and the page moves on.
+        screens.hold_install.store(true, Ordering::Release);
+        skin.select(&render, Some(bundle()));
+        assert!(choose(&mut sel, &mut skin, &[MenuKey::Enter]).is_none());
+        assert_eq!(notice(&sel), "スキンを準備しています");
+        assert!(choose(&mut sel, &mut skin, &[MenuKey::Down, MenuKey::Enter]).is_none());
+        screens.hold_install.store(false, Ordering::Release);
+        assert!(wait_until(|| screens.log().len() == 2));
+        let admitted = choose(&mut sel, &mut skin, &[MenuKey::Enter]).expect("installed");
+        assert_eq!(played(admitted).file_name().unwrap(), "b.bms");
+
+        // Refused: never admitted, with the reason.
+        screens.refuse_install.store(true, Ordering::Release);
+        skin.select(&render, Some(bundle()));
+        assert!(wait_until(|| screens.log().len() == 4));
+        assert!(choose(&mut sel, &mut skin, &[MenuKey::Enter]).is_none());
+        let refused = notice(&sel);
+        assert!(
+            refused.contains("the skin cannot be installed"),
+            "{refused}"
+        );
+        assert!(choose(&mut sel, &mut skin, &[MenuKey::Up, MenuKey::Enter]).is_none());
+        assert_eq!(skin.ready(), Err(refused));
+        render.exit();
+        assert_eq!(
+            screens.log(),
+            ["1 install 1", "1 commit 1", "1 refuse 2", "1 discard"]
+        );
     }
 
     /// The chart a pick plays.
