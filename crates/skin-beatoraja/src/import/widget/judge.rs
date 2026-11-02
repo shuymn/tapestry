@@ -5,7 +5,7 @@
 //! with PERFECT's standing in for an empty full-gauge slot 6, each on its
 //! own (`SkinJudge.java:98-113`); the model's judge widget resolves its
 //! slots the same way. The combo is a relative number: its keys are moved
-//! left by half its width times its digits before inheritance, its user
+//! left by half their raw width times its digits, exactly, its user
 //! offsets change only its size, and it sits on the bottom edge of the
 //! grade's destination before its stretch, as the source attaches it to
 //! the grade's region and stretches only a copy at drawing
@@ -112,32 +112,6 @@ impl Cx<'_> {
             Some(f) => self.def.bool(f, "shift")?,
             None => false,
         };
-        // The source reads `numbers[i]` for every image while the skin
-        // has numbers (`JsonPlaySkinObjectLoader.java:244-245`).
-        let has_values = !super::super::object::records(&self.tables, "value").is_empty();
-        if numbers.len() < images.len() && has_values {
-            return refuse(self, at, field("numbers"));
-        }
-        // The source compares every image's id, and every number's for
-        // each image, with the skin's records, and fails on a missing one
-        // (`JsonPlaySkinObjectLoader.java:230-232, 243-244`).
-        let has_images = !super::super::object::records(&self.tables, "image").is_empty();
-        let lists = [
-            (&images[..], has_images, "images"),
-            (
-                numbers.get(..images.len()).unwrap_or(&numbers),
-                has_values,
-                "numbers",
-            ),
-        ];
-        for (list, compared, name) in lists {
-            for &r in list {
-                if compared && super::super::object::id_of(self.def, r)?.is_none() {
-                    return refuse(self, self.arena_span(r), field(name));
-                }
-            }
-        }
-
         // The outer destination: lifetime, timer and conditions.
         let Some(c) = self.common_with(
             role,
@@ -159,9 +133,14 @@ impl Cx<'_> {
         if images.len() > JudgeSlot::COUNT {
             self.ignored(at, NoteKind::Ignored { field: "images" });
         }
+        // A drawn slot's grade, and the combo of a slot that draws one
+        // beside it, must name its record; the other entries are not read.
         for (k, &g) in images.iter().enumerate().take(JudgeSlot::COUNT) {
             let (id, gdst) = self.read_nested(g)?;
-            let Some(img) = id.map(|id| self.image_rec(&id)).transpose()?.flatten() else {
+            let Some(id) = id else {
+                return refuse(self, self.arena_span(g), field("images"));
+            };
+            let Some(img) = self.image_rec(&id)? else {
                 continue;
             };
             if let Some(slot) = grades.get_mut(k) {
@@ -175,14 +154,22 @@ impl Cx<'_> {
 
         let mut combos: [Option<ComboPart>; JudgeSlot::COUNT] = Default::default();
         for (k, &n) in numbers.iter().enumerate().take(images.len()) {
-            let (id, ndst) = self.read_nested(n)?;
-            let Some(value) = id.map(|id| self.value_rec(&id)).transpose()?.flatten() else {
-                continue;
-            };
             if !COMBO_SLOTS.contains(&k) {
-                self.ignored(ndst.span, NoteKind::Ignored { field: "numbers" });
+                // Never drawn, so not read: only a value it names is noted.
+                if let Ok(Some(id)) = super::super::object::id_of(self.def, n)
+                    && self.value_rec(&id)?.is_some()
+                {
+                    self.ignored(self.arena_span(n), NoteKind::Ignored { field: "numbers" });
+                }
                 continue;
             }
+            let (id, ndst) = self.read_nested(n)?;
+            let Some(id) = id else {
+                return refuse(self, self.arena_span(n), field("numbers"));
+            };
+            let Some(value) = self.value_rec(&id)? else {
+                continue;
+            };
             if let Some(combo) = self.combo(&ndst, value)? {
                 combos[k] = Some(combo);
             }
@@ -375,7 +362,18 @@ impl Cx<'_> {
             || self.digit_rows_keep_aspect(value, extra, cells, cell);
         let mut keys = Vec::with_capacity(c.track.keys.len());
         for k in &c.track.keys {
+            // The raw `x` moved left by half the raw `w` times the digits
+            // (`JsonPlaySkinObjectLoader.java:268-270`), exactly: only the
+            // final edges round.
+            let [_, _, raw_w, _] = k.rect;
             let rect = Rect::scaled(k.rect, self.r)
+                .and_then(|r| {
+                    let shift = Q::int(raw_w).mul(Q::int(digit))?.half()?.mul(self.r)?;
+                    Some(Rect {
+                        x: r.x.sub(shift)?,
+                        ..r
+                    })
+                })
                 .and_then(|r| r.offset_relative(c.offset))
                 .ok_or_else(|| range(self))?;
             let (stretched, _) =

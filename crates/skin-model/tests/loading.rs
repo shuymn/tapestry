@@ -429,6 +429,7 @@ fn programs_reading_unavailable_fields_draw_nothing() {
     for src in reads {
         let choice = ImageChoiceDef {
             value: int(src),
+            past_table: skin_model::PastTable::Hide,
             choices: vec![Some(ImageChoicePart {
                 span: ImageSpan {
                     image: OTHER,

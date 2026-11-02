@@ -17,8 +17,8 @@ use rules::Judgment;
 use skin_model::{
     CycleDef, Ease, End, ImageChoiceDef, ImageChoiceError, ImageChoicePart, ImageSpan, KeyDef,
     LoadError, MAX_COORD, MAX_ELEMENTS, MAX_IMAGE_CHOICE_REFS, MAX_KEY_US, MAX_SKIN_KEYS,
-    MAX_SKIN_OPS, MAX_TRACK_KEYS, Native, Place, Region, Source, TimerRef, Track, WidgetDefs,
-    timer,
+    MAX_SKIN_OPS, MAX_TRACK_KEYS, Native, PastTable, Place, Region, Source, TimerRef, Track,
+    WidgetDefs, timer,
 };
 use widget_support::{
     ELEVEN, TEN, TWENTY_FOUR, boolean, drawn, element, harness, int, judgment, load,
@@ -54,6 +54,7 @@ fn cycled(p: ImageChoicePart, period_ms: i64, timer: u16) -> ImageChoicePart {
 fn table(value: &str, choices: Vec<Option<ImageChoicePart>>) -> ImageChoiceDef {
     ImageChoiceDef {
         value: int(value),
+        past_table: PastTable::Hide,
         choices,
     }
 }
@@ -89,31 +90,51 @@ fn shown_at(h: &mut play_support::Harness, ms: i64, combo: u32) -> Vec<(u32, u16
 }
 
 #[test]
-fn selection_hides_below_zero_and_falls_back_to_entry_zero() {
-    let t = table(
-        "combo - 1",
-        vec![Some(part(TEN, 2, 1)), None, Some(part(ELEVEN, 4, 1))],
-    );
-    let mut h = harness(load(vec![chooser(0)], widgets(vec![t])).unwrap());
+fn selection_hides_below_zero_and_past_the_table_as_told() {
     let rect = [100.0, 100.0, 40.0, 40.0];
-    // −1 hides; 0 and the last select themselves; a hole is blank; the
-    // length selects entry 0, as does anything past it.
-    for (combo, want) in [
-        (0, vec![]),
-        (1, vec![(TEN, 2, rect)]),
-        (2, vec![]),
-        (3, vec![(ELEVEN, 4, rect)]),
-        (4, vec![(TEN, 2, rect)]),
-        (1_000, vec![(TEN, 2, rect)]),
-    ] {
-        assert_eq!(shown_at(&mut h, 0, combo), want, "combo {combo}");
+    for past_table in [PastTable::Hide, PastTable::First] {
+        let t = ImageChoiceDef {
+            past_table,
+            ..table(
+                "combo - 1",
+                vec![Some(part(TEN, 2, 1)), None, Some(part(ELEVEN, 4, 1))],
+            )
+        };
+        let mut h = harness(load(vec![chooser(0)], widgets(vec![t])).unwrap());
+        // −1 hides; 0 and the last select themselves; a hole is blank;
+        // the length, and anything past it, hides or selects entry 0.
+        let past = match past_table {
+            PastTable::Hide => vec![],
+            PastTable::First => vec![(TEN, 2, rect)],
+        };
+        for (combo, want) in [
+            (0, vec![]),
+            (1, vec![(TEN, 2, rect)]),
+            (2, vec![]),
+            (3, vec![(ELEVEN, 4, rect)]),
+            (4, past.clone()),
+            (1_000, past.clone()),
+        ] {
+            assert_eq!(
+                shown_at(&mut h, 0, combo),
+                want,
+                "{past_table:?}, combo {combo}"
+            );
+        }
     }
 }
 
 #[test]
 fn integer_extremes_are_ordinary_selections() {
-    for (src, want) in [("2147483647", vec![(TEN, 0)]), ("-2147483647 - 1", vec![])] {
-        let t = table(src, vec![Some(part(TEN, 0, 1)), Some(part(ELEVEN, 0, 1))]);
+    for (src, past_table, want) in [
+        ("2147483647", PastTable::First, vec![(TEN, 0)]),
+        ("2147483647", PastTable::Hide, vec![]),
+        ("-2147483647 - 1", PastTable::First, vec![]),
+    ] {
+        let t = ImageChoiceDef {
+            past_table,
+            ..table(src, vec![Some(part(TEN, 0, 1)), Some(part(ELEVEN, 0, 1))])
+        };
         let mut h = harness(load(vec![chooser(0)], widgets(vec![t])).unwrap());
         let got: Vec<_> = shown_at(&mut h, 0, 0)
             .into_iter()
@@ -125,7 +146,10 @@ fn integer_extremes_are_ordinary_selections() {
 
 #[test]
 fn a_hole_at_entry_zero_hides_every_fallback() {
-    let t = table("combo - 1", vec![None, Some(part(TEN, 0, 1))]);
+    let t = ImageChoiceDef {
+        past_table: PastTable::First,
+        ..table("combo - 1", vec![None, Some(part(TEN, 0, 1))])
+    };
     let mut h = harness(load(vec![chooser(0)], widgets(vec![t])).unwrap());
     assert_eq!(shown_at(&mut h, 0, 2).len(), 1);
     for combo in [1, 3, 9] {
@@ -346,6 +370,7 @@ fn tables_refuse_what_they_cannot_draw() {
     assert!(matches!(
         err(load_err(vec![ImageChoiceDef {
             value: boolean("true"),
+            past_table: PastTable::Hide,
             choices: vec![Some(part(TEN, 0, 1))],
         }])),
         ImageChoiceError::NotInt

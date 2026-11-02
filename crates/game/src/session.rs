@@ -1109,13 +1109,12 @@ impl Loaded {
     /// it with, made afresh for each play.
     #[must_use]
     pub fn attempt(&self) -> Attempt {
-        let ends = match (&self.practice, self.config.autoplay) {
-            (Some((practice, _)), _) => NoteEnd::Practice {
+        let ends = match &self.practice {
+            Some((practice, _)) => NoteEnd::Practice {
                 end: practice.end,
                 speed: self.config.speed,
             },
-            (None, Some(_)) => NoteEnd::Autoplay,
-            (None, None) => NoteEnd::Play,
+            None => NoteEnd::Play,
         };
         Attempt::new(
             self.attempt,
