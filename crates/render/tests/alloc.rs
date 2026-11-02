@@ -20,7 +20,14 @@
 //! installed, builds its first and later loading frames, a refused one,
 //! and the next lifetime's first
 //! frame, its state started afresh in place, without allocating; the
-//! load's lines are drawn in a text pass outside this count.
+//! load's lines are drawn in a text pass outside this count. An imported
+//! skin (JSON, a bitmap font and page images through the importer) does
+//! the same with its bitmap text installed: its loading frames with
+//! covers moving its trimmed paint every frame, each frame's runs
+//! resolved to scissors, inline clips included, as the renderer draws
+//! them, across a resize, a refusal and the next lifetime; and an
+//! attempt's play frames with bitmap labels, batches short of sprites and
+//! of runs keeping the overlay whole.
 //!
 //! The counting allocator counts only on the thread that opted in, so the
 //! harness's own threads do not disturb it. This file holds a single test
@@ -31,6 +38,7 @@
 
 mod common;
 mod decl_support;
+mod json_support;
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -428,6 +436,219 @@ fn frames_do_not_allocate_from_the_first() {
 
     declarative_frames(&chart, &taps, &overlay, glyphs);
     loading_frames();
+    imported_frames(&chart, &overlay, glyphs);
+}
+
+/// Every run's scissor as the renderer resolves it while drawing
+/// ([`Staging::run_scissor`]): the runs that draw somewhere, and those
+/// with an inline clip rect.
+fn resolve(staging: &Staging) -> (usize, usize) {
+    staging
+        .batch()
+        .runs()
+        .iter()
+        .fold((0, 0), |(drawn, inline), run| {
+            let drawn = drawn + usize::from(staging.run_scissor(run) != Scissor::Empty);
+            (drawn, inline + usize::from(run.clip_rect.is_some()))
+        })
+}
+
+/// The imported skin ([`json_support`]: JSON, a bitmap font and page
+/// images through the importer, its atlas and bundle), committed on a
+/// renderer. Its loading presentation, the chosen chart's bitmap text
+/// prepared and installed between frames, builds its first and later
+/// frames with LIFT's paint and its follower moving with covers changing
+/// every frame, crossing the trim line and leaving it, and one at full
+/// coverage, each frame's runs resolved to scissors, the inline ones
+/// included; then an applied resize and the frames after it, a refused
+/// frame and the poisoned one after it, and the next lifetime's first
+/// frame. An attempt prepared with bitmap labels builds its first and
+/// later play frames with the overlay, and a batch short of sprites and
+/// one short of runs with sprites to spare keep the overlay whole. None
+/// allocates; preparation and GPU work stay outside the counts.
+fn imported_frames(chart: &Chart, overlay: &[&str], glyphs: usize) {
+    let mut r = offscreen(1_920, 1_080);
+    let (_dir, b) = json_support::bundle(&r);
+    let token = r.install(&b, 1).unwrap();
+    r.commit(token).unwrap();
+    r.enter_loading(1);
+    let labels = skin_model::ChartText {
+        title: "AB",
+        subtitle: "C",
+        artist: "D",
+        subartist: "",
+        genre: "E",
+    };
+    r.prepare_loading_text(1, 1, skin_model::TextSlots::ALL, &labels)
+        .unwrap();
+    assert_eq!(r.install_staged_loading_text(), Ok(true));
+    let mut skin = DeclSkin::of(&r.installation().unwrap());
+    let mut staging = Staging::with_runs(
+        skin.capacity(),
+        skin.run_capacity(),
+        &skin.canvas([1920, 1080]),
+    );
+    staging.set_clips(b.clips().clone());
+    // Lift cycling 0 to 990 ‰ by 30 ‰ a frame: the paint below, across
+    // and above its line.
+    let lifted = |lifetime: u64, k: i64, lift: u16| {
+        let mut f =
+            LoadingFrame::interim(lifetime, TimeUs(k * FRAME_US), TimeUs(0), common::VISIBLE);
+        f.lanes.lift = lift;
+        f.covers.lift = lift;
+        f.covers.lift_enabled = true;
+        f.text = 1;
+        f
+    };
+    let at = |lifetime: u64, k: i64| {
+        lifted(
+            lifetime,
+            k,
+            u16::try_from((k * 30).rem_euclid(1_000)).unwrap(),
+        )
+    };
+    let loading = |staging: &mut Staging, skin: &mut DeclSkin, f: &LoadingFrame<'_>| {
+        staging
+            .build_loading(skin, f)
+            .map(|()| (staging.instances().len(), resolve(staging)))
+    };
+    skin.enter_loading(1);
+    let (first, first_allocs) = counted(|| loading(&mut staging, &mut skin, &at(1, 0)));
+    let (quads, (drawn, _)) = first.unwrap();
+    assert!(quads > 4 && drawn > 0, "{quads} {drawn}");
+    assert_eq!(first_allocs, 0, "an imported loading frame allocated");
+    let (later, later_allocs) = counted(|| {
+        (1..FRAMES)
+            .map(|k| loading(&mut staging, &mut skin, &at(1, k)).map(|(_, (_, i))| i))
+            .sum::<Result<usize, BuildError>>()
+    });
+    assert!(later.unwrap() > 0, "no run carried an inline clip");
+    assert_eq!(later_allocs, 0, "a later imported loading frame allocated");
+    // Full coverage: the lift at 1 000 ‰ (on), no field left above it.
+    let (full, full_allocs) =
+        counted(|| loading(&mut staging, &mut skin, &lifted(1, FRAMES, 1_000)));
+    assert!(full.unwrap().0 > 0);
+    assert_eq!(full_allocs, 0, "a fully covered imported frame allocated");
+
+    let (resized, resize_allocs) = counted(|| {
+        staging.project(&skin.canvas([2560, 1080]));
+        (FRAMES..FRAMES + 60)
+            .map(|k| loading(&mut staging, &mut skin, &at(1, k)).map(|(_, (_, i))| i))
+            .sum::<Result<usize, BuildError>>()
+    });
+    assert!(resized.unwrap() > 0);
+    assert_eq!(resize_allocs, 0, "an imported resize allocated");
+    assert_eq!(staging.projection().target(), [2560, 1080]);
+
+    let mut bad = at(1, FRAMES + 60);
+    bad.covers.lift = bad.lanes.lift + 1;
+    let (refused, error_allocs) = counted(|| {
+        let first = staging.build_loading(&mut skin, &bad);
+        (first, staging.build_loading(&mut skin, &at(1, FRAMES + 61)))
+    });
+    assert_eq!(
+        refused,
+        (
+            Err(BuildError::InvalidReadouts),
+            Err(BuildError::InvalidReadouts)
+        )
+    );
+    assert_eq!(
+        error_allocs, 0,
+        "a refused imported loading frame allocated"
+    );
+    assert!(staging.instances().is_empty());
+    let (second, second_allocs) = counted(|| {
+        skin.enter_loading(2);
+        loading(&mut staging, &mut skin, &at(2, FRAMES + 62))
+    });
+    assert!(second.unwrap().0 > 0);
+    assert_eq!(second_allocs, 0, "an imported second lifetime allocated");
+
+    // An attempt with bitmap labels, prepared outside the count.
+    let ctx = context(&GAUGES, false);
+    let a = render::AttemptInput {
+        chart,
+        context: &ctx,
+        text: &labels,
+        target: [1_920, 1_080],
+    };
+    let mut skin = DeclSkin::new(b.clone());
+    skin.prepare(r.gpu(), &a).unwrap();
+    let mut staging = Staging::with_runs(
+        skin.capacity(),
+        skin.run_capacity(),
+        &skin.canvas([1920, 1080]),
+    );
+    staging.set_clips(b.clips().clone());
+    let v = view(0, 0);
+    let frame = |staging: &mut Staging, skin: &mut DeclSkin, k: i64| {
+        let f = FrameInput {
+            overlay,
+            ..input(&v, TimeUs(k * FRAME_US), TimeUs(8 * MS), &[])
+        };
+        staging
+            .build(skin, &f)
+            .map(|()| (staging.instances().len(), resolve(staging)))
+    };
+    let (first, first_allocs) = counted(|| frame(&mut staging, &mut skin, 0));
+    let (quads, _) = first.unwrap();
+    // Four lines of bitmap glyphs, "AB" and "AB C" among them.
+    assert!(quads >= glyphs + 9, "{quads}");
+    assert_eq!(
+        first_allocs, 0,
+        "an imported attempt's first frame allocated"
+    );
+    let (later, later_allocs) = counted(|| {
+        (1..FRAMES)
+            .map(|k| frame(&mut staging, &mut skin, k).map(|(n, _)| n))
+            .sum::<Result<usize, BuildError>>()
+    });
+    assert!(later.unwrap() > 0);
+    assert_eq!(
+        later_allocs, 0,
+        "an imported attempt's later frame allocated"
+    );
+    assert_eq!(overlay_drawn(&staging), glyphs, "the overlay was cut");
+
+    // A batch of 4 sprites in 2 runs: the skin's quads refused and
+    // counted, the overlay whole from its reserve.
+    let mut small = Staging::with_runs(4, 2, &skin.canvas([1920, 1080]));
+    small.set_clips(b.clips().clone());
+    let f = FrameInput {
+        overlay,
+        ..input(&v, TimeUs(0), TimeUs(8 * MS), &[])
+    };
+    let (dropped, full_allocs) = counted(|| {
+        small
+            .build(&mut skin, &f)
+            .map(|()| (small.batch().dropped(), resolve(&small)))
+    });
+    assert!(dropped.unwrap().0 > 0, "the full batch counted no refusal");
+    assert_eq!(overlay_drawn(&small), glyphs, "the overlay was cut");
+    assert_eq!(full_allocs, 0, "an imported full batch allocated");
+
+    // Room for every sprite but one run: the additive mark needs a second
+    // run, so it is refused and counted, as is any later quad that cannot
+    // extend the one run (an alpha unclipped quad still can), while
+    // sprites are left over; the overlay follows whole from the reserve.
+    let mut narrow = Staging::with_runs(skin.capacity(), 1, &skin.canvas([1920, 1080]));
+    narrow.set_clips(b.clips().clone());
+    let (refused, run_allocs) = counted(|| {
+        narrow
+            .build(&mut skin, &f)
+            .map(|()| (narrow.batch().dropped(), resolve(&narrow)))
+    });
+    let (dropped, (drawn, _)) = refused.unwrap();
+    assert!(dropped > 0, "the run-limited batch counted no refusal");
+    let skin_quads = narrow.instances().len() - glyphs;
+    assert!(
+        skin_quads < usize::try_from(skin.capacity()).unwrap(),
+        "no sprite left over: {skin_quads}"
+    );
+    assert_eq!(drawn, narrow.batch().runs().len(), "every run drawn");
+    assert_eq!(overlay_drawn(&narrow), glyphs, "the overlay was cut");
+    assert_eq!(run_allocs, 0, "a run-limited imported batch allocated");
 }
 
 /// A declarative installation committed on a renderer, its loading

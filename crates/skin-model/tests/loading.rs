@@ -704,6 +704,61 @@ fn loading_bitmap_text_is_replaced_and_cleared() {
     assert_eq!(when(&l), (Some(100 * MS), 400));
 }
 
+/// Bitmap lines laid out ahead (`loading_bitmap_lines`) draw nothing until
+/// installed, then only in the slots named, the others kept; their
+/// storage is counted while they wait; lines of another length install
+/// nothing.
+#[test]
+fn staged_bitmap_lines_install_into_the_named_slots() {
+    let (_dir, sheet) = image_support::ab_fonts();
+    let mut l = Loader::new(bitmap_text_skin(sheet));
+    let glyphs = |l: &Loader| {
+        let q = l.batch.quads();
+        [0.0, 100.0].map(|y| {
+            q.iter()
+                .filter(|q| q.rect[1] >= y && q.rect[1] < y + 20.0)
+                .count()
+        })
+    };
+    let chart = |title| skin_model::ChartText {
+        title,
+        subtitle: "B",
+        ..skin_model::ChartText::default()
+    };
+    l.build(100);
+    let ab = l.skin.loading_bitmap_lines(TextSlots::ALL, &chart("AB"));
+    assert_eq!(ab.len(), 2);
+    assert!(ab.heap_bytes() > 2 * size_of::<usize>(), "{ab:?}");
+    l.build(200);
+    assert_eq!(glyphs(&l), [0, 0], "laid out, not installed");
+    l.skin
+        .install_loading_bitmap_lines(&mut l.loading, TextSlots::ALL, ab)
+        .unwrap();
+    l.build(300);
+    let first = glyphs(&l);
+    assert_eq!(first[0], 2);
+    assert!(first[1] > first[0], "{first:?}");
+    // Only the full title's slot named: the title keeps its line.
+    let full = TextSlots::field(TextField::FullTitle);
+    let abab = l.skin.loading_bitmap_lines(full, &chart("ABAB"));
+    l.skin
+        .install_loading_bitmap_lines(&mut l.loading, full, abab)
+        .unwrap();
+    l.build(400);
+    assert_eq!(glyphs(&l), [2, first[1] + 2]);
+    // Lines of another skin's length change nothing.
+    let short = Loader::new(structural())
+        .skin
+        .loading_bitmap_lines(TextSlots::ALL, &chart("A"));
+    assert!(
+        l.skin
+            .install_loading_bitmap_lines(&mut l.loading, TextSlots::ALL, short)
+            .is_err()
+    );
+    l.build(500);
+    assert_eq!(glyphs(&l), [2, first[1] + 2]);
+}
+
 /// A state started afresh in place builds as a fresh one: its text slots
 /// empty, its `when` started again at its next frame, and a refusal gone.
 #[test]

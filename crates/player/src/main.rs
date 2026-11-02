@@ -51,14 +51,17 @@ mod shelf;
 mod tuning;
 mod window;
 
-// The render crate's WARP helpers and declarative skin fixtures, for the
-// tests that drive a real menu screen.
+// The render crate's WARP helpers and declarative and imported skin
+// fixtures, for the tests that drive a real menu screen.
 #[cfg(test)]
 #[path = "../../render/tests/common/mod.rs"]
 mod render_common;
 #[cfg(test)]
 #[path = "../../render/tests/decl_support/mod.rs"]
 mod render_decl;
+#[cfg(test)]
+#[path = "../../render/tests/json_support/mod.rs"]
+mod render_json;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;

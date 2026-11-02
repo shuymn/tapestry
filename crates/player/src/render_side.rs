@@ -6974,6 +6974,9 @@ pub(crate) mod tests {
         /// The chosen chart's text staged after the frame, in bytes.
         staged: u64,
         red: Option<Red>,
+        /// The imported fixture's title, artist, genre and full title
+        /// squares ([`crate::render_json::text_at`]).
+        glyphs: Option<[[u8; 3]; 4]>,
     }
 
     type Shots = Arc<std::sync::Mutex<Vec<Shot>>>;
@@ -7006,8 +7009,9 @@ pub(crate) mod tests {
             let r = self.menu.renderer_mut();
             let staged = r.memory().staged_text;
             let target = r.target();
-            let red = (drawn && r.target() == [1_920, 1_080]).then(|| {
-                let p = r.read_back();
+            let pixels = (drawn && r.target() == [1_920, 1_080]).then(|| r.read_back());
+            let glyphs = pixels.as_deref().map(crate::render_json::text_at);
+            let red = pixels.map(|p| {
                 let red_at = |at: (u32, u32)| crate::render_common::rgb_at(&p, 1_920, at) == RED;
                 let centre = |[x, y, w, h]: [i32; 4]| {
                     red_at((
@@ -7050,6 +7054,7 @@ pub(crate) mod tests {
                     .and_then(|i| i.loading().timer(PROGRESS_SLOT)),
                 staged,
                 red,
+                glyphs,
             }
         }
     }
@@ -8015,4 +8020,7 @@ pub(crate) mod tests {
         expect(4, 3, BLACK, RED);
         expect(5, 1, BLACK, BLACK);
     }
+
+    // The bridge over an imported skin with bitmap text.
+    mod bitmap;
 }

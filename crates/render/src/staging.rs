@@ -11,7 +11,7 @@ use skin_model::{BuildError, Canvas, ClipId};
 
 use crate::overlay::{self, OVERLAY_RUNS, OVERLAY_SPRITES};
 use crate::projection::{ClipTable, Projection};
-use crate::{FrameInput, Instance, LoadingFrame, PlaySkin, SpriteBatch};
+use crate::{FrameInput, Instance, LoadingFrame, PlaySkin, Run, SpriteBatch};
 
 /// A frame's batch and staging, sized for `capacity` sprites of the skin
 /// and the overlay's reserve after them, and the play skin's projection
@@ -158,6 +158,31 @@ impl Staging {
         }
     }
 
+    /// Where `run` draws: under its fixed clip's scissor
+    /// ([`scissor`](Self::scissor)) and, when it carries an inline clip
+    /// rect, under that rect too, projected as a fixed clip is (each edge
+    /// placed as the viewport places it, rounded half up and clamped to
+    /// the target, D1) and intersected with it. Rounding each edge on its
+    /// own is monotonic, so intersecting the projected rectangles is the
+    /// projection of their canvas intersection. An empty intersection
+    /// draws nothing. Allocates nothing: the renderer resolves every run
+    /// this way as it draws.
+    #[must_use]
+    pub fn run_scissor(&self, run: &Run) -> Scissor {
+        let fixed = self.scissor(run.key.clip);
+        let Some(rect) = run.clip_rect else {
+            return fixed;
+        };
+        let Some(inline) = self.projection.scissor(rect.rect()) else {
+            return Scissor::Empty;
+        };
+        match fixed {
+            Scissor::Full => Scissor::Rect(inline),
+            Scissor::Rect(fixed) => intersect(fixed, inline).map_or(Scissor::Empty, Scissor::Rect),
+            Scissor::Empty => Scissor::Empty,
+        }
+    }
+
     /// The skin builds `f` into the emptied batch, the overlay's lines
     /// follow from the reserve, and the batch is staged in drawing order:
     /// a play frame's app work, which calls nothing in wgpu and allocates
@@ -224,13 +249,24 @@ impl Staging {
     }
 }
 
+/// The pixels both target rectangles `[x, y, width, height]` cover;
+/// `None` when they share none.
+fn intersect(a: [u32; 4], b: [u32; 4]) -> Option<[u32; 4]> {
+    let [ax, ay, aw, ah] = a;
+    let [bx, by, bw, bh] = b;
+    let (x0, y0) = (ax.max(bx), ay.max(by));
+    let x1 = ax.saturating_add(aw).min(bx.saturating_add(bw));
+    let y1 = ay.saturating_add(ah).min(by.saturating_add(bh));
+    (x0 < x1 && y0 < y1).then(|| [x0, y0, x1 - x0, y1 - y0])
+}
+
 #[cfg(test)]
 mod tests {
-    use skin_model::{Canvas, ClipId, Fit};
+    use skin_model::{Canvas, ClipId, ClipRect, Fit, RunKey};
 
     use super::{Scissor, Staging};
     use crate::projection::ClipTable;
-    use crate::{Blend, Sprite};
+    use crate::{Blend, Run, Sprite};
 
     /// A clip's scissor follows the projection: the same canvas clip on
     /// 1920×1080 and, letterboxed at half scale, on 960×540; an unclipped
@@ -255,6 +291,69 @@ mod tests {
             Scissor::Rect([50, 100, 150, 200])
         );
         assert_eq!(s.projection().target(), [960, 540]);
+    }
+
+    /// A run's inline clip rect is projected as a fixed clip is, rounded
+    /// half up edge by edge (D1) and clamped to the target, then
+    /// intersected with its fixed clip's scissor: alone it is its own
+    /// scissor; with a fixed clip only the overlap draws; an overlap of no
+    /// pixel, a rect rounding to none and a fixed clip of none draw
+    /// nothing; a run without either draws on the whole target.
+    #[test]
+    fn inline_clips_intersect_the_fixed_clip() {
+        let run = |clip: Option<u16>, rect: Option<[f32; 4]>| Run {
+            key: RunKey {
+                blend: Blend::Alpha,
+                clip: clip.map(ClipId),
+            },
+            clip_rect: rect.map(|r| ClipRect::new(r).unwrap()),
+            start: 0,
+            end: 1,
+        };
+        let mut s = Staging::new(8, &Canvas::new([1920, 1080], Fit::Fixed));
+        s.set_clips(
+            ClipTable::new(vec![[100.0, 200.0, 300.0, 400.0], [10.0, 10.0, 0.4, 5.0]]).unwrap(),
+        );
+        assert_eq!(s.run_scissor(&run(None, None)), Scissor::Full);
+        assert_eq!(
+            s.run_scissor(&run(None, Some([50.0, 60.0, 70.0, 80.0]))),
+            Scissor::Rect([50, 60, 70, 80])
+        );
+        assert_eq!(
+            s.run_scissor(&run(Some(0), Some([250.0, 150.0, 1_000.0, 100.0]))),
+            Scissor::Rect([250, 200, 150, 50])
+        );
+        // Wholly right of the fixed clip, or touching its right edge: no
+        // pixel shared.
+        assert_eq!(
+            s.run_scissor(&run(Some(0), Some([1_000.0, 900.0, 10.0, 10.0]))),
+            Scissor::Empty
+        );
+        assert_eq!(
+            s.run_scissor(&run(Some(0), Some([400.0, 200.0, 10.0, 10.0]))),
+            Scissor::Empty
+        );
+        assert_eq!(
+            s.run_scissor(&run(Some(1), Some([0.0, 0.0, 1_920.0, 1_080.0]))),
+            Scissor::Empty
+        );
+        // Past the target: clamped to it.
+        assert_eq!(
+            s.run_scissor(&run(None, Some([-10.0, 1_000.0, 3_000.0, 500.0]))),
+            Scissor::Rect([0, 1_000, 1_920, 80])
+        );
+        // At half scale: x 101..501 is 50.5..250.5, rounded to 51..251, and
+        // y 201..402 to 101..201, then cut by clip 0's x 50..200 and
+        // y 100..300 to 51..200.
+        s.project(&Canvas::new([960, 540], Fit::Fixed));
+        assert_eq!(
+            s.run_scissor(&run(Some(0), Some([101.0, 201.0, 400.0, 201.0]))),
+            Scissor::Rect([51, 101, 149, 100])
+        );
+        assert_eq!(
+            s.run_scissor(&run(None, Some([10.0, 10.0, 0.5, 10.0]))),
+            Scissor::Empty
+        );
     }
 
     #[test]

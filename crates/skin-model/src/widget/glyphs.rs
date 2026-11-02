@@ -58,6 +58,49 @@ pub(crate) struct GlyphLine {
     pub(crate) quads: Box<[GlyphQuad]>,
 }
 
+/// Bitmap lines laid out before they install, one entry per text slot of
+/// the skin that laid them out
+/// ([`Skin::loading_bitmap_lines`](crate::Skin::loading_bitmap_lines));
+/// a slot without a line is `None`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct BitmapLines(Box<[Option<GlyphLine>]>);
+
+impl BitmapLines {
+    pub(crate) fn new(lines: Box<[Option<GlyphLine>]>) -> Self {
+        Self(lines)
+    }
+
+    /// The number of slots.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Whether it has no slots.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// The bytes its slots and their glyphs take on the heap.
+    #[must_use]
+    pub fn heap_bytes(&self) -> usize {
+        lines_bytes(&self.0)
+    }
+
+    /// Takes `slot`'s line, leaving none.
+    pub(crate) fn take(&mut self, slot: u16) -> Option<GlyphLine> {
+        self.0.get_mut(usize::from(slot)).and_then(Option::take)
+    }
+}
+
+/// The heap bytes of `lines`, one per text slot: the slots and every
+/// line's glyphs. Allocates nothing.
+pub(crate) fn lines_bytes(lines: &[Option<GlyphLine>]) -> usize {
+    let glyphs: usize = lines.iter().flatten().map(|l| size_of_val(&*l.quads)).sum();
+    size_of_val(lines) + glyphs
+}
+
 /// A glyph found for a character: from which file, with which y adjust,
 /// and whether it keeps its kerning.
 #[derive(Clone, Copy)]

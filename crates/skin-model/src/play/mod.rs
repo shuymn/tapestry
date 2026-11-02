@@ -20,7 +20,7 @@ use crate::layout::Layout;
 use crate::widget::Starts;
 use crate::widget::bar::BarScratch;
 use crate::widget::gauge::GaugeLook;
-use crate::widget::glyphs::GlyphLine;
+use crate::widget::glyphs::{self, GlyphLine};
 use crate::widget::lanes::{LaneView, Side};
 use crate::widget::text::TextTable;
 
@@ -299,12 +299,6 @@ impl Play {
             let lanes: usize = n.lanes.iter().map(|l| size_of_val(&**l)).sum();
             size_of::<Notes>() + lanes + size_of_val(&*n.bars)
         });
-        let bitmap: usize = self
-            .bitmap
-            .iter()
-            .flatten()
-            .map(|l| size_of_val(&*l.quads))
-            .sum();
         let bytes = size_of::<Self>()
             + self.reducer.heap_bytes()
             + size_of_val(&*self.starts)
@@ -313,8 +307,7 @@ impl Play {
             + notes
             + size_of_val(&*self.gauges)
             + self.text.heap_bytes()
-            + size_of_val(&*self.bitmap)
-            + bitmap
+            + glyphs::lines_bytes(&self.bitmap)
             + self.bars.as_ref().map_or(0, BarScratch::heap_bytes);
         u64::try_from(bytes).unwrap_or(u64::MAX)
     }

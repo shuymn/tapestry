@@ -17,7 +17,7 @@ use crate::expr::{Program, State, TIMER_OFF};
 use crate::layout::Layout;
 use crate::widget::Starts;
 use crate::widget::gauge::GaugeLook;
-use crate::widget::glyphs::GlyphLine;
+use crate::widget::glyphs::{self, GlyphLine};
 use crate::widget::lanes::{LaneView, Side};
 use crate::widget::text::TextTable;
 
@@ -244,18 +244,11 @@ impl Loading {
     /// memory witness; it allocates nothing.
     #[must_use]
     pub fn resident_bytes(&self) -> u64 {
-        let bitmap: usize = self
-            .bitmap
-            .iter()
-            .flatten()
-            .map(|l| size_of_val(&*l.quads))
-            .sum();
         let bytes = size_of::<Self>()
             + size_of_val(&*self.starts)
             + size_of_val(&*self.ms)
             + self.text.heap_bytes()
-            + size_of_val(&*self.bitmap)
-            + bitmap;
+            + glyphs::lines_bytes(&self.bitmap);
         u64::try_from(bytes).unwrap_or(u64::MAX)
     }
 

@@ -515,4 +515,4 @@ The pattern follows the kopje project's job runner and bmz-player's send queue.
 This touches no server and no stage-2 file.
 
 - **WASM build in CI:** a Linux CI job building `eval`, `bms-parser` and `replay` for `wasm32-unknown-unknown`. design.md already requires it ("Server Architecture"). setup.md defers the target to "the stage that uses it", and design.md's "kept passing in CI at all times" is the stronger statement.
-- **The chart codec crate:** begun in stage 3 with the compact form (docs/stage3.md S10, item 7), in a permissive L2 crate, so the evaluation subset extends it here.
+- **The chart codec crate:** begun in stage 3 with the compact form (docs/stage3.md S10, item 9), in a permissive L2 crate, so the evaluation subset extends it here.
