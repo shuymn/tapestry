@@ -2309,6 +2309,21 @@ fn import_memory_is_measured() {
             let ctx = common::play::context();
             let play = i.skin.prepare(&f17c, &ctx).unwrap();
             assert_eq!(play.playhead().representatives().len(), 1_000_000);
+            drop(play);
+            // The chart and the play as a practice page holds them: the
+            // 1x chart retained, the 50 % chart loaded beside it, and a
+            // play prepared over each, all in one window, every shared
+            // allocation counted once.
+            let text = f17c_text();
+            let (live, p) = peak(|| {
+                let normal = loaded_at(&text, bms_model::Speed::NORMAL);
+                let mapped = loaded_at(&text, bms_model::Speed::SLOWEST);
+                let a = i.skin.prepare(&normal, &ctx).unwrap();
+                let b = i.skin.prepare(&mapped, &ctx).unwrap();
+                (normal, mapped, a, b)
+            });
+            println!("F17c 1x and 50 % charts with a play over each: peak {p} B");
+            drop(live);
         }),
     ));
     let f17d = loaded_at(&f17d_text(), bms_model::Speed::NORMAL);

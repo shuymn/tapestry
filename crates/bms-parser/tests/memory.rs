@@ -162,14 +162,50 @@ fn a_chart_past_the_row_limit_is_refused_before_its_rows_are_allocated() {
     assert_eq!(seen, [false, false]);
 }
 
+/// The base-36 id of `n`, two digits.
+fn id(n: usize) -> String {
+    const DIGITS: &[u8; 36] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    String::from_utf8(vec![DIGITS[n / 36], DIGITS[n % 36]]).unwrap()
+}
+
+/// F17e: the time's denominator at its limit (`time.rs`'s heavy load):
+/// a distinct odd BPM at each of measures 0 to 807, so measure 808 enters
+/// at 16,371 bits, then 2,500 taps a measure through measure 999, each at
+/// its own position, many in one µs.
+fn denominator_limit() -> String {
+    let mut text = String::from("#BPM 77777777\n#WAV01 a.wav\n");
+    for m in 0..=807 {
+        let id = id(m + 1);
+        text.push_str(&format!(
+            "#BPM{id} {}\n#{m:03}08:{id}\n",
+            99_999_999 - 2 * m
+        ));
+    }
+    text.push_str("#80711:01\n");
+    let line = "01".repeat(2_500);
+    for m in 808..=999 {
+        text.push_str(&format!("#{m:03}11:{line}\n"));
+    }
+    text
+}
+
+/// The chart ceiling: the largest combined peak below plus 25 %, a
+/// regression bound for the loader's own storage, apart from the skin
+/// import's.
+const CHART_CEILING: usize = 426_140_582;
+
 #[test]
 #[ignore = "a measurement: run in release with --ignored --nocapture"]
 fn measure_load_peaks() {
-    for (name, stops, taps) in [
-        ("F17b 50,000 STOPs and taps", 50_000, true),
-        ("F17b 499,999 STOPs, near the row cap", 499_999, false),
+    let mut combined_max = 0;
+    for (name, text) in [
+        ("F17b 50,000 STOPs and taps", stop_heavy(50_000, true)),
+        (
+            "F17b 499,999 STOPs, near the row cap",
+            stop_heavy(499_999, false),
+        ),
+        ("F17e at the time's denominator limit", denominator_limit()),
     ] {
-        let text = stop_heavy(stops, taps);
         for speed in [Speed::NORMAL, Speed::SLOWEST] {
             let (loaded, peak, retained) = measured(&text, speed);
             let t = &loaded.chart.timeline;
@@ -186,7 +222,34 @@ fn measure_load_peaks() {
                 if speed == Speed::NORMAL { 0 } else { rows * 8 },
             );
         }
+        // The normal chart retained while the practice chart loads beside
+        // it, as a practice page keeps its 1x chart: one window, every
+        // allocation counted once.
+        let dir = tempfile::tempdir().unwrap();
+        let at = |speed| LoadOptions {
+            speed,
+            ..LoadOptions::default()
+        };
+        let base = LIVE.load(Ordering::Relaxed);
+        PEAK.store(base, Ordering::Relaxed);
+        let normal = load_bms(text.as_bytes(), dir.path(), &at(Speed::NORMAL)).unwrap();
+        let mapped = load_bms(text.as_bytes(), dir.path(), &at(Speed::SLOWEST)).unwrap();
+        let peak = PEAK.load(Ordering::Relaxed) - base;
+        let retained = LIVE.load(Ordering::Relaxed) - base;
+        println!(
+            "{name}, 1x retained and 50 % loaded beside it: peak {peak} B, retained {retained} B"
+        );
+        combined_max = combined_max.max(peak);
+        drop((normal, mapped));
     }
+    println!(
+        "combined max {combined_max} B, ceiling {} B",
+        combined_max + combined_max / 4
+    );
+    assert!(
+        combined_max <= CHART_CEILING,
+        "{combined_max} > {CHART_CEILING}"
+    );
     println!(
         "sizes: TimelinePoint {} B, TimelineId {} B, Note {} B, Chart {} B",
         size_of::<TimelinePoint>(),
