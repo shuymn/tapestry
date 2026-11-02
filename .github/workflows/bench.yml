@@ -36,13 +36,14 @@ jobs:
       # Only the tools in install_args are needed; keep `mise exec` from
       # installing the rest on demand.
       MISE_EXEC_AUTO_INSTALL: "false"
-      # The head builds here and the merge base into a directory of its own:
-      # cargo gives a workspace crate's artifacts the same name in both
-      # checkouts and judges them by modification time, so in one shared
-      # directory the head run can reuse the merge base's binaries.
+      # The head builds in its own `target` and the merge base into a
+      # directory of its own: cargo gives a workspace crate's artifacts the
+      # same name in both checkouts and judges them by modification time, so
+      # in one shared directory the head run can reuse the merge base's
+      # binaries. No CARGO_TARGET_DIR is set for the job, since rust-cache
+      # hashes every CARGO variable into its key, which must match CI's.
       # Criterion's results share one directory, so the head run compares
       # against the baseline the merge base saved.
-      CARGO_TARGET_DIR: ${{ github.workspace }}/target
       CRITERION_HOME: ${{ github.workspace }}/target/criterion
     steps:
       # The head commit itself, not the merge commit a pull request would
@@ -59,6 +60,16 @@ jobs:
           install_args: rust
           cache: true
           cache_save: ${{ github.ref == 'refs/heads/main' }}
+      # The dependencies in the bench profile, from CI `linux`'s cache on `main`
+      # ("Benchmarks run once" builds the same ones); restored only. Each
+      # build starts from them: the merge base's directory gets a copy, which
+      # holds no workspace crate (rust-cache removes those before saving).
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: linux
+          cmd-format: mise exec -- {0}
+          cache-bin: false
+          save-if: false
       # Both builds use the toolchain of the head: `mise exec` runs in the
       # head's checkout and cargo is pointed at the merge base's manifest.
       # `--bench` names keep the libtest unit-test harnesses, which do not
@@ -69,6 +80,7 @@ jobs:
           base=$(git merge-base origin/main HEAD)
           echo "merge base $base, head $(git rev-parse HEAD)"
           git worktree add --detach "$RUNNER_TEMP/base" "$base"
+          if [ -d target ]; then cp -a target "$RUNNER_TEMP/base-target"; fi
           if [ ! -f "$RUNNER_TEMP/base/crates/eval/benches/evaluate.rs" ]; then
             echo "::notice::The merge base has no benchmarks; there is nothing to compare."
             exit 0
@@ -123,7 +135,6 @@ jobs:
         shell: bash
     env:
       MISE_EXEC_AUTO_INSTALL: "false"
-      CARGO_TARGET_DIR: ${{ github.workspace }}/target
       CRITERION_HOME: ${{ github.workspace }}/target/criterion
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -138,12 +149,23 @@ jobs:
           install_args: rust
           cache: true
           cache_save: ${{ github.ref == 'refs/heads/main' }}
+      # The dependencies in the bench profile, from CI `windows-release`'s cache on `main`
+      # ("Benchmarks run once" builds the same ones); restored only. Each
+      # build starts from them: the merge base's directory gets a copy, which
+      # holds no workspace crate (rust-cache removes those before saving).
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: windows-release
+          cmd-format: mise exec -- {0}
+          cache-bin: false
+          save-if: false
       - name: Benchmark the merge base
         id: base
         run: |
           base=$(git merge-base origin/main HEAD)
           echo "merge base $base, head $(git rev-parse HEAD)"
           git worktree add --detach "$RUNNER_TEMP/base" "$base"
+          if [ -d target ]; then cp -a target "$RUNNER_TEMP/base-target"; fi
           if [ ! -f "$RUNNER_TEMP/base/crates/render/benches/skin.rs" ]; then
             echo "::notice::The merge base has no render benchmark; there is nothing to compare."
             exit 0
