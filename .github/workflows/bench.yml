@@ -26,7 +26,7 @@ concurrency:
 
 jobs:
   compare:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     # A failed step is reported, but does not fail the run.
     continue-on-error: true
