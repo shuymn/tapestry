@@ -167,7 +167,6 @@ pub fn import(
     let mut cx = Cx::new(def, header, config, tables, choices, r, size[1])?;
     let destinations = object::records(&cx.tables, "destination").to_vec();
     cx.span_hint = cx.lane_span_hint(&destinations);
-    cx.custom.judge_region = cx.judge_region(&destinations);
     for (index, rec) in destinations.into_iter().enumerate() {
         cx.destination(index, rec)?;
     }
@@ -479,29 +478,6 @@ impl<'d> Cx<'d> {
         for kind in notes {
             self.note(None, Severity::Ignored, kind);
         }
-    }
-
-    /// Whether some destination draws a judge, read ahead of the walk: the
-    /// source makes the judge region for it whatever its conditions
-    /// (`JsonPlaySkinObjectLoader.java:226, 283-287`). A judge other than
-    /// index 0 refuses the import, as does a judge id an image, text,
-    /// slider, graph or LIFT shares, and a record this cannot read fails
-    /// the walk at or before it, so none needs an answer.
-    fn judge_region(&mut self, destinations: &[u32]) -> bool {
-        for &rec in destinations {
-            let Ok(id) = object::id_of(self.def, rec) else {
-                return false;
-            };
-            let Some(id) = id.filter(|id| !id.parse::<i32>().is_ok_and(|n| n < 0)) else {
-                continue;
-            };
-            match self.objects.lookup(self.def, &self.tables, &id) {
-                Ok(Some((Object::Judge, _))) => return true,
-                Ok(_) => {}
-                Err(_) => return false,
-            }
-        }
-        false
     }
 
     /// The custom timers (`Skin.java:741-743`, `CustomTimer.java:20-58`):
@@ -849,9 +825,9 @@ impl<'d> Cx<'d> {
                     if !seen.insert(*n) {
                         continue;
                     }
-                    ops::numeric(*n, &self.items, self.custom.judge_region)
+                    ops::numeric(*n, &self.items)
                 }
-                Op::Name(s) => match ops::named(s, self.custom.judge_region) {
+                Op::Name(s) => match ops::named(s) {
                     Some(c) => c,
                     None => {
                         let why = NoteKind::UnsupportedProperty {
@@ -871,7 +847,7 @@ impl<'d> Cx<'d> {
             Prop::Null => {}
             Prop::Id(n) => {
                 if ops::is_builtin(i32::try_from(n.unsigned_abs()).unwrap_or(0)) {
-                    let c = ops::numeric(*n, &BTreeMap::new(), self.custom.judge_region);
+                    let c = ops::numeric(*n, &BTreeMap::new());
                     if !self.condition(role, at, c, &mut conds, &mut deviates)? {
                         return Ok(None);
                     }
@@ -880,7 +856,7 @@ impl<'d> Cx<'d> {
                 }
             }
             Prop::Name(s) => {
-                let Some(c) = ops::named(s, self.custom.judge_region) else {
+                let Some(c) = ops::named(s) else {
                     let why = NoteKind::UnsupportedProperty {
                         kind: PropertyKind::Boolean,
                         id: None,
