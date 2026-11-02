@@ -597,8 +597,7 @@ impl FntFile {
                     else {
                         continue;
                     };
-                    if first == 0 || chars.get(first).is_none() || second > MAX_CODE.unsigned_abs()
-                    {
+                    if chars.get(first).is_none() || second > MAX_CODE.unsigned_abs() {
                         continue;
                     }
                     if kernings.len() >= limits.kernings {
