@@ -164,6 +164,9 @@ pub struct Shelf {
     /// When the running pass started (dev-tools).
     #[cfg(feature = "dev-tools")]
     pass_started: Option<Instant>,
+    /// The end's wait in place of [`STOP_TIMEOUT`] (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    stop_timeout: Option<Duration>,
 }
 
 impl Shelf {
@@ -236,6 +239,8 @@ impl Shelf {
             passes: 0,
             #[cfg(feature = "dev-tools")]
             pass_started: None,
+            #[cfg(feature = "dev-tools")]
+            stop_timeout: None,
         };
         shelf.start_pass();
         shelf
@@ -627,11 +632,28 @@ impl Shelf {
     pub const fn has_scan(&self) -> bool {
         self.scan.is_some()
     }
+
+    /// The end waits `bound` in place of [`STOP_TIMEOUT`] (dev-tools,
+    /// `--dev-stop-timeout`).
+    #[cfg(feature = "dev-tools")]
+    pub fn set_stop_timeout(&mut self, bound: Duration) {
+        self.stop_timeout = Some(bound);
+    }
+
+    /// How long the end waits for the pass and the background measurement
+    /// to stop.
+    fn stop_timeout(&self) -> Duration {
+        #[cfg(feature = "dev-tools")]
+        if let Some(bound) = self.stop_timeout {
+            return bound;
+        }
+        STOP_TIMEOUT
+    }
 }
 
 impl Drop for Shelf {
     /// Stops the running pass and the background measurement, waiting at
-    /// most [`STOP_TIMEOUT`] for both together: a pass stuck on its file
+    /// most [`STOP_TIMEOUT`] (or `--dev-stop-timeout`) for both together: a pass stuck on its file
     /// system is left to end on its own, keeping the library's lock until
     /// it does or the process exits, and so is a stuck measurement, whose
     /// result nobody takes. The measurements the background completed are
@@ -639,7 +661,8 @@ impl Drop for Shelf {
     fn drop(&mut self) {
         let background = self.background.take();
         // Both stop at once, and share one deadline.
-        let deadline = Instant::now() + STOP_TIMEOUT;
+        let bound = self.stop_timeout();
+        let deadline = Instant::now() + bound;
         if let Some(worker) = &background {
             worker.stop();
         }
@@ -654,7 +677,7 @@ impl Drop for Shelf {
         if !quiet {
             let line = format!(
                 "library: the scan did not stop within {} s; it ends with the process",
-                STOP_TIMEOUT.as_secs()
+                bound.as_secs()
             );
             eprintln!("{line}");
             log::warn!("{line}");
@@ -663,7 +686,7 @@ impl Drop for Shelf {
             if !ended {
                 let line = format!(
                     "loudness: the background measurement did not stop within {} s; it ends with the process",
-                    STOP_TIMEOUT.as_secs()
+                    bound.as_secs()
                 );
                 eprintln!("{line}");
                 log::warn!("{line}");

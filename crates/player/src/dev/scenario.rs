@@ -1198,6 +1198,7 @@ pub fn run(args: ScenarioArgs, clock: QpcClock) -> anyhow::Result<()> {
                 rescan_ms,
                 frames: None,
                 render_timeout: args.render_timeout,
+                stop_timeout: None,
                 scenario: Some(session),
             },
         },

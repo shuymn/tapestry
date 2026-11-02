@@ -272,6 +272,8 @@ fn dev_scripted_input_is_unknown_without_feature() {
         assert_unknown(&["play", "a.bms", opt, "1"], opt);
     }
     assert_unknown(&["keys", "--dev-scripted-keys", "1"], "--dev-scripted-keys");
+    assert_unknown(&["--dev-stop-timeout", "1"], "--dev-stop-timeout");
+    assert_unknown(&["--auto", "--dev-stop-timeout", "1"], "--dev-stop-timeout");
 }
 
 /// A production build exits 2 on `--dev-scenario`, as on any unknown
