@@ -104,14 +104,18 @@ fn repeated_rearms_allocate_nothing_and_hold_memory_flat() {
     counting::self_check();
     let before = counting::calls();
     let mut effects = 0;
-    for _ in 0..60 {
-        // The candidate judges a press early in its READY.
+    for round in 0..60 {
+        // The candidate judges a press early in its READY; every other
+        // candidate's effects are left queued for the screen when it is
+        // cancelled.
         for k in 0..3 {
             at += 5 * MS;
             batch(&mut set, at, key1, i32::from(k % 2 == 0));
             logic.advance_to(TimeUs(at - origin));
         }
-        side.drain_effects(|_| effects += 1);
+        if round % 2 == 0 {
+            side.drain_effects(|_| effects += 1);
+        }
         // START held: the input side cancels the candidate.
         at += MS;
         batch(&mut set, at, Q, 1);
