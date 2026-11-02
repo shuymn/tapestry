@@ -511,8 +511,7 @@ impl LuaHeader {
     /// What [`read_lua_header`] refuses, and what [`crate::import`]
     /// refuses of the converted definition.
     pub fn import(&self, config: &Config, cancel: &Cancel) -> Result<LuaImported, ImportError> {
-        let (def, counts, dependencies) = self.configured(config, cancel)?;
-        let mut def = def;
+        let (mut def, counts, dependencies) = self.configured(config, cancel)?;
         let imported = import(&mut def, &self.header, config)?;
         Ok(LuaImported {
             imported,
