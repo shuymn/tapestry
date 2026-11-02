@@ -17,7 +17,8 @@ pub const MAX_LUA_MEMORY: usize = 64 << 20;
 /// The most Lua VM instructions across both passes, counted on every VM
 /// thread in steps of [`INSTRUCTION_STEP`]: the step that reaches it
 /// stops the run. A VM's last partial step, under one step, is not
-/// counted.
+/// counted: the two passes' VMs leave at most 1,998 instructions
+/// uncounted in all, the loaders sharing their VM's counter.
 pub const MAX_INSTRUCTIONS: u64 = 10_000_000;
 /// How many instructions run between two charges of
 /// [`MAX_INSTRUCTIONS`].

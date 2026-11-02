@@ -184,6 +184,21 @@ impl Q {
         } else {
             (frac | (1 << 52), exp - 1075)
         };
+        // The powers of two the mantissa holds cancel first, so a value
+        // such as 2^-80 needs no denominator past i128.
+        let (m, e) = if m == 0 {
+            (0, 0)
+        } else {
+            let common = m.trailing_zeros().min(e.unsigned_abs());
+            (
+                m >> common,
+                if e < 0 {
+                    e + i32::try_from(common).ok()?
+                } else {
+                    e
+                },
+            )
+        };
         let m = if negative { -m } else { m };
         if e >= 0 {
             let shift = u32::try_from(e).ok()?;
@@ -335,6 +350,19 @@ mod tests {
 
     fn q(n: i128, d: i128) -> Q {
         Q::new(n, d).unwrap()
+    }
+
+    #[test]
+    fn a_float_is_its_exact_binary_value() {
+        assert_eq!(Q::float(0.5), Q::new(1, 2));
+        assert_eq!(Q::float(-0.75), Q::new(-3, 4));
+        assert_eq!(Q::float(3.0), Some(Q::int(3)));
+        assert_eq!(Q::float(0.0), Some(Q::ZERO));
+        // 2^-80 reduces to 1 / 2^80; 2^-130 has no i128 denominator.
+        assert_eq!(Q::float(2.0_f64.powi(-80)), Q::new(1, 1 << 80));
+        assert_eq!(Q::float(2.0_f64.powi(-130)), None);
+        assert_eq!(Q::float(f64::NAN), None);
+        assert_eq!(Q::float(0.1), Q::new(3_602_879_701_896_397, 1 << 55));
     }
 
     #[test]

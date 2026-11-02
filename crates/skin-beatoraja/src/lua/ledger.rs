@@ -230,3 +230,44 @@ pub(crate) fn running(lua: &Lua) -> Option<Loc> {
         .flatten()
         .next()
 }
+
+#[cfg(test)]
+mod tests {
+    use mlua::Lua;
+
+    use super::{Cancel, Counts, Ledger, LuaWhy};
+    use crate::error::ImportError;
+    use crate::lua::LuaLimit;
+
+    #[test]
+    fn a_fault_refuses_every_later_charge_and_keeps_the_first() {
+        let lua = Lua::new();
+        let counts = Counts {
+            instructions: 5_000,
+            host_calls: 7,
+            native_work: 11,
+            ..Counts::default()
+        };
+        let ledger = Ledger::new(counts, Cancel::new());
+        ledger.check(&lua).unwrap();
+        let _ = ledger.fail_lua(&lua, LuaWhy::Finalizer);
+        let _ = ledger.fail_lua(&lua, LuaWhy::Limit(LuaLimit::Memory));
+        // Each later charge is refused at once and counts nothing.
+        assert!(ledger.check(&lua).is_err());
+        assert!(ledger.host_call(&lua).is_err());
+        assert!(ledger.step(&lua).is_err());
+        assert_eq!(ledger.counts(), counts);
+        // A cancellation after the fault does not replace it.
+        let cancel = Cancel::new();
+        let ledger2 = Ledger::new(counts, cancel.clone());
+        let _ = ledger2.fail_lua(&lua, LuaWhy::Finalizer);
+        cancel.cancel();
+        assert!(ledger2.check(&lua).is_err());
+        for l in [&ledger, &ledger2] {
+            match l.take_fault() {
+                Some(ImportError::Lua { why, .. }) => assert_eq!(why, LuaWhy::Finalizer),
+                other => panic!("{other:?}"),
+            }
+        }
+    }
+}

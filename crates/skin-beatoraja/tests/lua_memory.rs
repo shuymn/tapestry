@@ -6,7 +6,8 @@
 //! through [`read_lua_header`] and [`LuaHeader::import`]: its peak covers
 //! the source snapshots, each VM, the conversion, the common import and
 //! the teardown, and every byte is freed again once the results are
-//! dropped. The fixtures run in one test, one after another.
+//! dropped. The process's peak resident memory is recorded too. The
+//! fixtures run in one test, one after another.
 
 mod common;
 
@@ -223,4 +224,34 @@ fn lua_import_memory_is_bounded_and_freed() {
     let worst = peaks.iter().map(|(_, p)| *p).max().unwrap_or(0);
     println!("worst peak {worst} bytes; converted table at most {MAX_CONVERTED_BYTES} bytes");
     assert!(worst <= BOUND, "{peaks:?}");
+    // The process's own peak, which also holds the test harness: recorded
+    // beside the counted peaks, never compared with them.
+    let process = process_peak().expect("the process's peak memory");
+    println!("process peak {process} bytes");
+    assert!(process > 0);
+}
+
+/// The process's peak resident memory in bytes: `VmHWM` on Linux, the
+/// peak working set on Windows.
+fn process_peak() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let status = std::fs::read_to_string("/proc/self/status").ok()?;
+        let line = status.lines().find(|l| l.starts_with("VmHWM:"))?;
+        let kib: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+        Some(kib * 1024)
+    }
+    #[cfg(windows)]
+    {
+        let query = format!("(Get-Process -Id {}).PeakWorkingSet64", std::process::id());
+        let out = std::process::Command::new("powershell.exe")
+            .args(["-NoProfile", "-Command", &query])
+            .output()
+            .ok()?;
+        String::from_utf8(out.stdout).ok()?.trim().parse().ok()
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
+    {
+        None
+    }
 }
