@@ -124,12 +124,14 @@ fn the_simple_span_is_the_originals_f64() {
     assert_eq!(f64::from(reference::JUDGE_Y), 880.0);
 }
 
-/// The initial rates of charts' scroll maps, from the slowest `#BPM` to
-/// the fastest.
+/// The initial rates scroll maps give: from the slowest initial tempo a
+/// map accepts (1 millionth of a BPM) to the fastest (`i64::MAX`
+/// millionths), both included, with tempos up to 10^6 BPM between.
 fn initial_rates() -> impl Strategy<Value = i128> {
-    (1_i64..=1_000_000_000_000).prop_filter_map("a valid map", |bpm| {
-        ScrollMap::new(bpm, &[]).ok().map(|m| m.initial_rate())
-    })
+    prop_oneof![Just(1_i64), Just(i64::MAX), 1_i64..=1_000_000_000_000]
+        .prop_filter_map("a valid map", |bpm| {
+            ScrollMap::new(bpm, &[]).ok().map(|m| m.initial_rate())
+        })
 }
 
 fn visible_times() -> impl Strategy<Value = i64> {
