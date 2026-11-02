@@ -54,6 +54,10 @@ pub enum ReopenError {
     /// A source still has events of the sealed opening.
     #[error("source {} still has events of the sealed opening", .0.0)]
     Undrained(SourceId),
+    /// START or SELECT is held, or may be: the next READY candidate waits
+    /// for both to be released ([`SourceSet::reopen_candidate`]).
+    #[error("START or SELECT is held")]
+    Held,
 }
 
 /// Why [`SourceSet::new`] refused a configuration.
@@ -1060,6 +1064,73 @@ impl SourceSet {
         Ok(&rec.start)
     }
 
+    /// The open attempt's held-input snapshot storage: the most entries
+    /// any of its openings' snapshots holds. 0 without one.
+    #[must_use]
+    pub fn snapshot_capacity(&self) -> usize {
+        self.recording
+            .as_ref()
+            .map_or(0, |r| r.start.held.capacity())
+    }
+
+    /// Whether START or SELECT is held, or may be, as the adjustment tap
+    /// counts the devices that reach it now: what defers a READY
+    /// candidate's opening. `false` without a tap.
+    #[must_use]
+    pub fn holding(&self) -> bool {
+        self.adjust.as_ref().is_some_and(AdjustmentTap::holding)
+    }
+
+    /// Opens the attempt ([`open_attempt`](Self::open_attempt)) with its
+    /// first READY candidate `generation` at this boundary, only if START
+    /// and SELECT are verifiably released here (design.md "Play
+    /// Lifecycle", the start gate), and arms the tap's start gate for it.
+    /// `None` when one is held or may be: the opening is deferred and
+    /// nothing opens.
+    pub fn open_candidate(
+        &mut self,
+        now: TimeUs,
+        origin: TimeUs,
+        generation: u32,
+    ) -> Option<&InputStart> {
+        if self.holding() {
+            return None;
+        }
+        let _ = self.open_attempt(now, origin);
+        if let Some(tap) = &self.adjust {
+            tap.gate().arm(generation);
+        }
+        self.recording.as_ref().map(|r| &r.start)
+    }
+
+    /// Seals the open candidate and opens candidate `generation` on the
+    /// attempt's source table ([`reopen`](Self::reopen)), only if START
+    /// and SELECT are verifiably released at this boundary, and arms the
+    /// tap's start gate for it. Without allocating.
+    ///
+    /// # Errors
+    ///
+    /// [`ReopenError::Held`] when one is held or may be, and what
+    /// [`reopen`](Self::reopen) refuses; nothing changes.
+    pub fn reopen_candidate(
+        &mut self,
+        now: TimeUs,
+        origin: TimeUs,
+        generation: u32,
+    ) -> Result<&InputStart, ReopenError> {
+        if self.holding() {
+            return Err(ReopenError::Held);
+        }
+        let _ = self.reopen(now, origin)?;
+        if let Some(tap) = &self.adjust {
+            tap.gate().arm(generation);
+        }
+        self.recording
+            .as_ref()
+            .map(|r| &r.start)
+            .ok_or(ReopenError::NotRecording)
+    }
+
     /// The readers of the open recording, indexed by [`SourceId`]; empty
     /// after the first call until they are returned.
     pub fn take_readers(&mut self) -> Vec<SourceReader> {
@@ -1084,6 +1155,9 @@ impl SourceSet {
     /// Closes the recording. Devices keep their physical state.
     pub fn close_recording(&mut self) {
         self.recording = None;
+        if let Some(tap) = &self.adjust {
+            tap.gate().disarm();
+        }
         for d in &mut self.devices {
             d.source = None;
         }

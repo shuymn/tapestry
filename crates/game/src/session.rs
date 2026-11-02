@@ -333,6 +333,16 @@ pub struct PlayReport {
     pub preset: RulePreset,
 }
 
+impl PlayReport {
+    /// Whether the attempt was played: `false` for a capture cancelled
+    /// before playback (design.md "Play Lifecycle", ending without a
+    /// played attempt).
+    #[must_use]
+    pub fn played(&self) -> bool {
+        self.record.as_ref().is_none_or(PlayRecord::played)
+    }
+}
+
 /// A loaded chart, its preset and settings, before audio is attached: the
 /// sound bank is built from [`Loaded::chart`].
 ///
@@ -496,6 +506,14 @@ pub struct PlayOutcome {
     /// Why the record may be incomplete. Suspend is set by
     /// [`Loaded::finish_play`] from `end`.
     pub incomplete: Incomplete,
+    /// Whether a READY candidate's transport committed (design.md "Play
+    /// Lifecycle", the start gate): `false` saves the capture cancelled
+    /// before playback, with no played attempt. Always `true` without the
+    /// gate.
+    pub played: bool,
+    /// The attempt's cancelled READY openings, with the gate; `None`
+    /// without it, where none is ever cancelled.
+    pub history: Option<ReadyHistory>,
 }
 
 impl Loaded {
@@ -1003,6 +1021,7 @@ impl Loaded {
             loaded: self,
             audio,
             sources,
+            gate: None,
         }
     }
 
@@ -1107,8 +1126,26 @@ impl Loaded {
         kinds: &[DeviceKind],
         axes: &[Vec<input::hid::AxisCap>],
     ) -> Result<PlayPlan, LogicError> {
+        self.plan_gated(kinds, axes, None)
+    }
+
+    /// [`plan`](Self::plan) for a play whose READY candidates run the
+    /// start gate when `gate` gives the input side's held-snapshot
+    /// storage: the reservation then also counts the gate's own storage
+    /// ([`Reservation::with_gate`]), so a recording window that fits only
+    /// without it is refused.
+    ///
+    /// # Errors
+    ///
+    /// As [`plan`](Self::plan).
+    pub fn plan_gated(
+        &self,
+        kinds: &[DeviceKind],
+        axes: &[Vec<input::hid::AxisCap>],
+        gate: Option<usize>,
+    ) -> Result<PlayPlan, LogicError> {
         if self.config.autoplay.is_some() {
-            return self.autoplay_plan(kinds, axes);
+            return self.autoplay_plan(kinds, axes, gate);
         }
         let device = self.settings.device.profile(kinds, axes);
         // Per source: its recorded lane buttons and keys, and its recorded
@@ -1159,6 +1196,7 @@ impl Loaded {
         let inputs = window_inputs(&device, window, &rates).saturating_add(system);
         if let Ok(probe) = &probe
             && let r = Reservation::from_probe(probe, &device, self.config.effects)
+            && let r = gate.map_or(r, |held| r.with_gate(held))
             && !r.fits(inputs)
         {
             return Err(LogicError::RecordingTooLarge {
@@ -1189,11 +1227,13 @@ impl Loaded {
         }
     }
 
-    /// [`plan`](Self::plan) for an autoplay session.
+    /// [`plan_gated`](Self::plan_gated) for an autoplay session: the gate's
+    /// storage, when `gate` gives it, is charged beside autoplay's own.
     fn autoplay_plan(
         &self,
         kinds: &[DeviceKind],
         axes: &[Vec<input::hid::AxisCap>],
+        gate: Option<usize>,
     ) -> Result<PlayPlan, LogicError> {
         let device = self.autoplay_device().profile(kinds, axes);
         let generated = generated();
@@ -1216,6 +1256,7 @@ impl Loaded {
         .map_err(LogicError::Eval)?;
         let r = Reservation::from_probe(&probe, &device, self.config.effects)
             .with_autoplay(inputs, schedule);
+        let r = gate.map_or(r, |held| r.with_gate(held));
         if !r.fits(inputs) {
             return Err(LogicError::RecordingTooLarge {
                 needed: inputs,
@@ -1252,7 +1293,7 @@ impl Loaded {
     /// the budget, and
     /// [`AutoplayError::Time`] for a note too late to press.
     pub fn autoplay(&self) -> Result<Autoplay, AutoplayError> {
-        self.autoplay_plan(&[DeviceKind::Keyboard], &[Vec::new()])?;
+        self.autoplay_plan(&[DeviceKind::Keyboard], &[Vec::new()], None)?;
         let generated = generated();
         let events = input::autoplay(&self.chart, &generated)?;
         Ok(Autoplay {
@@ -1296,6 +1337,8 @@ impl Loaded {
             arrivals,
             axis_out_of_range,
             mut incomplete,
+            played,
+            history,
         } = outcome;
         incomplete.suspend |= end == PlayEnd::Aborted(AbortCause::Suspend);
         let PlayStart {
@@ -1303,6 +1346,7 @@ impl Loaded {
             reload_error,
         } = start;
         let status = match end {
+            _ if !played => EndStatus::CancelledBeforePlayback,
             PlayEnd::Completed => EndStatus::PlayedToEnd,
             PlayEnd::Aborted(_) => EndStatus::EndedMidway,
         };
@@ -1334,7 +1378,21 @@ impl Loaded {
                 }
             }
         };
-        let play_record = record.finalized.map(|finalized| PlayRecord {
+        // A capture cancelled before playback (design.md "Play Lifecycle",
+        // ending without a played attempt) keeps its openings in its
+        // history and nothing else: no winning opening, no finalized
+        // watermark, no score.
+        let (finalized, start, events, arrivals) = if played {
+            (record.finalized, record.start, record.events, arrivals)
+        } else {
+            (
+                Some(TimeUs(0)),
+                InputStart::default(),
+                Vec::new(),
+                Vec::new(),
+            )
+        };
+        let play_record = finalized.map(|finalized| PlayRecord {
             versions: Versions {
                 evaluator: preset.implementation.version(),
                 app: config.app_version.clone(),
@@ -1361,17 +1419,17 @@ impl Loaded {
             },
             play_type,
             speed: config.speed,
-            start: record.start,
-            events: record.events,
+            start,
+            events,
             arrivals: arrivals.iter().map(arrival).collect(),
             status: Status {
                 end: status,
                 finalized,
                 incomplete,
             },
-            // The start gate is not active: the attempt's first READY is
-            // its winning opening, so none was cancelled.
-            history: ReadyHistory::default(),
+            // Without the start gate the attempt's first READY is its
+            // winning opening, so none was cancelled.
+            history: history.unwrap_or_default(),
         });
         let parts = &mut self.parts;
         let saved = parts
@@ -1379,7 +1437,9 @@ impl Loaded {
             .as_mut()
             .zip(play_record.as_ref())
             .map(|(sink, r)| sink.save(r));
-        let result = play_record.as_ref().map(|r| {
+        // A capture with no played attempt has no result: no score, no play
+        // count, no best.
+        let result = play_record.as_ref().filter(|r| r.played()).map(|r| {
             parts.results.on_play_end(&ResultContext {
                 record: r,
                 chart: &self.chart,
@@ -1448,6 +1508,9 @@ pub struct Session<O> {
     audio: RunnerAudio<O>,
     sources: SourceSet,
     clock: VirtualClock,
+    /// The start gate and the adjustment controls, once
+    /// [`with_start_gate`](Self::with_start_gate) set them up.
+    gate: Option<SessionGate>,
 }
 
 impl<O: AudioOutput + Wakes> Session<O> {
@@ -1523,18 +1586,95 @@ impl<O: AudioOutput + Wakes> Session<O> {
     /// round whose schedule is not the engine's (a practice set on the
     /// [`Loaded`] before [`Loaded::start`] rather than through
     /// [`set_practice`](Self::set_practice)): refused before recording
-    /// opens.
+    /// opens. [`SessionPlayError::Left`] when, with the start gate, the
+    /// script quit while a hold deferred the opening.
     pub fn play(&mut self, script: PlayScript) -> Result<PlayReport, SessionPlayError> {
+        match self.play_until(script, None)? {
+            Some(report) => Ok(report),
+            None => Err(SessionPlayError::Left),
+        }
+    }
+
+    /// Runs the start gate (design.md "Play Lifecycle", the start gate) in
+    /// every play from now on, through the adjustment controls of `plan`:
+    /// their tap goes into the session's source set, and a reducer with
+    /// `options` takes what it observes, F1 and F2 included, publishing
+    /// [`presentation`](Self::presentation). Each READY is then a candidate
+    /// a hold of START or SELECT cancels before its transport commits, and
+    /// the script's times are on the first opening attempted's timeline.
+    ///
+    /// # Errors
+    ///
+    /// What the tap refuses of `plan`'s bindings.
+    pub fn with_start_gate(
+        &mut self,
+        plan: &crate::AdjustmentPlan,
+        options: crate::PlayOptions,
+    ) -> Result<(), input::TapError> {
+        let (adjust, tap, reader) = crate::start_gate::SessionAdjust::new(
+            plan,
+            options,
+            self.loaded.opens_at(),
+            self.loaded.settings.device.display_offset_us,
+        )?;
+        let gate = tap.start_gate();
+        self.sources.set_adjustment(tap);
+        self.gate = Some(SessionGate {
+            gate,
+            adjust,
+            reader,
+        });
+        Ok(())
+    }
+
+    /// The adjustments' latest snapshot, with the start gate.
+    pub fn presentation(&mut self) -> Option<&crate::adjustment::PresentationSnapshot> {
+        self.gate.as_mut().map(|g| g.reader.read())
+    }
+
+    /// The session's source set: its devices and the adjustment tap.
+    pub const fn sources(&self) -> &SourceSet {
+        &self.sources
+    }
+
+    /// [`play`](Self::play), with the window closing at `close_at` on the
+    /// script's timeline, if given: `None` when it closed before
+    /// recording opened.
+    ///
+    /// # Errors
+    ///
+    /// As [`play`](Self::play).
+    pub fn play_until(
+        &mut self,
+        script: PlayScript,
+        close_at: Option<TimeUs>,
+    ) -> Result<Option<PlayReport>, SessionPlayError> {
         let Self {
             loaded,
             audio,
             sources,
             clock,
+            gate,
         } = self;
         // The round's schedule, which the engine must be playing.
         let restorer = loaded
             .section()
             .map(|_| crate::Restorer::new(audio.engine().seek_source(), loaded.audio_schedule()));
+        let commit_at = loaded.restore_at().unwrap_or(TimeUs(0));
+        let gate = gate.as_mut().map(|g| {
+            let options = g.adjust.options();
+            g.adjust.begin_attempt(
+                options,
+                loaded.opens_at(),
+                loaded.settings.device.display_offset_us,
+            );
+            crate::start_gate::ScriptedGate::new(
+                g.gate.clone(),
+                commit_at,
+                loaded.opens_at(),
+                &mut g.adjust,
+            )
+        });
         let mut rig = SessionRig {
             step: loaded.config.step,
             clock,
@@ -1543,6 +1683,7 @@ impl<O: AudioOutput + Wakes> Session<O> {
             script,
             next_command: 0,
             origin: None,
+            script_origin: None,
             participants: Vec::new(),
             sounds: None,
             screen: None,
@@ -1550,10 +1691,12 @@ impl<O: AudioOutput + Wakes> Session<O> {
             sealed: false,
             restorer,
             restore: None,
+            gate,
+            close_at,
+            closing: false,
         };
         match crate::live::play(loaded, &mut rig) {
-            Ok(Some(report)) => Ok(report),
-            Ok(None) => unreachable!("a session never quits before recording opens"),
+            Ok(report) => Ok(report),
             Err(LiveError::Logic(e)) => Err(SessionPlayError::Logic(e)),
             Err(LiveError::Restore(e)) => Err(SessionPlayError::Restore(e)),
             Err(LiveError::Screen(e)) => match e {},
@@ -1571,6 +1714,15 @@ impl<O: AudioOutput + Wakes> Session<O> {
     }
 }
 
+/// A session's start gate: the tap's gate, the adjustment controls and
+/// their snapshots.
+#[derive(Debug)]
+struct SessionGate {
+    gate: input::StartGate,
+    adjust: crate::start_gate::SessionAdjust,
+    reader: crate::adjustment::PresentationReader,
+}
+
 /// Why [`Session::play`] did not play.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum SessionPlayError {
@@ -1584,6 +1736,10 @@ pub enum SessionPlayError {
     /// not start.
     #[error("the round cannot be prepared")]
     Refused(#[source] crate::PreparationRefusal),
+    /// The player left before recording opened (a quit while a held START
+    /// or SELECT deferred the opening): nothing was played or saved.
+    #[error("the player left before recording opened")]
+    Left,
 }
 
 /// The session's rig: one step of the virtual clock per wait, the script
@@ -1597,7 +1753,13 @@ struct SessionRig<'s, O> {
     audio: &'s mut RunnerAudio<O>,
     script: PlayScript,
     next_command: usize,
+    /// The current READY candidate's chart time 0 on the session clock.
     origin: Option<TimeUs>,
+    /// Where the script's timeline has its 0 on the session clock: the
+    /// first opening's chart time 0 (with the gate, the first one
+    /// attempted), so a rearm moves no script time. It is also the input
+    /// side's batch clock.
+    script_origin: Option<TimeUs>,
     /// Each participant with its connection at the opening.
     participants: Vec<(input::DeviceId, Option<u64>)>,
     sounds: Option<AudioQueue>,
@@ -1608,24 +1770,93 @@ struct SessionRig<'s, O> {
     restorer: Option<crate::Restorer>,
     /// A round's restore, planned at its opening, applied with its start.
     restore: Option<Box<crate::Restore>>,
+    /// The start gate, in a gated session.
+    gate: Option<crate::start_gate::ScriptedGate<'s>>,
+    /// When the window closes, on the script's timeline.
+    close_at: Option<TimeUs>,
+    closing: bool,
 }
 
 impl<O: AudioOutput + Wakes> SessionRig<'_, O> {
+    /// Starts the play's audio with chart time 0 at `origin`, as the audio
+    /// thread starts a play or a rearmed candidate: the engine restarted,
+    /// a round's restore applied (the lead-in's start, else its fallback,
+    /// else silence: design.md "Mid-Chart Start and Section Repeat"), and,
+    /// in a gated session, the transport held for the candidate's commit.
+    fn restart_audio(&mut self, origin: TimeUs) {
+        let engine = self.audio.engine_mut();
+        engine.restart(origin);
+        if let Some(restore) = self.restore.take() {
+            restore.apply(engine);
+        }
+        if let Some(g) = &self.gate {
+            g.hold(engine);
+        }
+        self.sealed = false;
+    }
+
     /// Every buffer event due before `now` (with `through`, at `now` too),
-    /// until the output fails.
+    /// until the output fails. In a gated session the engine holds the
+    /// armed candidate's transport: the pass whose block reaches its commit
+    /// point, by that pass's own wake, commits it first, and one that finds
+    /// it cancelled or stale stops its audio there.
     fn step_audio(&mut self, now: TimeUs, through: bool) {
-        if let Some(sounds) = &mut self.sounds
-            && self.failure.is_none()
-            && let Err(e) = self.audio.step(now, through, sounds)
-        {
-            self.failure = Some(e);
+        let Some(sounds) = &mut self.sounds else {
+            return;
+        };
+        if self.failure.is_some() {
+            return;
+        }
+        loop {
+            let at = self.audio.next_wake();
+            if at > now || (at == now && !through) {
+                return;
+            }
+            let woke = match &mut self.gate {
+                Some(g) => self.audio.wake_admitting(sounds, &mut || g.admit()),
+                None => self.audio.wake(sounds).map(|()| None),
+            };
+            match woke {
+                Ok(Some(false)) => self.audio.cancel(sounds),
+                Ok(_) => {}
+                Err(e) => {
+                    self.failure = Some(e);
+                    return;
+                }
+            }
         }
     }
 }
 
 impl<O> SessionRig<'_, O> {
+    /// What an opening at `origin` with `start` gives the play: the
+    /// participants, kinds and axes as the source set froze them, and the
+    /// readers.
+    fn opening(&mut self, origin: TimeUs, start: InputStart) -> Opening<input::SourceReader> {
+        let sources = &*self.sources;
+        // One removed and connected again since counts as removed.
+        self.participants = sources
+            .participants()
+            .map(|(d, _)| (d, sources.connection(d)))
+            .collect();
+        let kinds = sources.participants().map(|(_, k)| k).collect();
+        let axes = sources
+            .participants()
+            .map(|(d, _)| sources.axes(d).to_vec())
+            .collect();
+        self.origin = Some(origin);
+        Opening {
+            origin,
+            start,
+            readers: self.sources.take_readers(),
+            kinds,
+            axes,
+        }
+    }
+
+    /// The script's time now.
     fn play_time(&self) -> Option<TimeUs> {
-        self.origin.map(|o| TimeUs(self.clock.now().0 - o.0))
+        self.script_origin.map(|o| TimeUs(self.clock.now().0 - o.0))
     }
 }
 
@@ -1642,6 +1873,10 @@ impl<O: AudioOutput + Wakes> Rig for SessionRig<'_, O> {
         let global = self.clock.now();
         if let Some(now) = self.play_time() {
             self.script.input.poll(now, self.sources);
+            self.closing |= self.close_at.is_some_and(|at| now >= at);
+        }
+        if let Some(g) = &mut self.gate {
+            g.drain();
         }
         if !self.sealed {
             self.step_audio(global, false);
@@ -1667,7 +1902,7 @@ impl<O: AudioOutput + Wakes> Rig for SessionRig<'_, O> {
     }
 
     fn quitting(&self) -> bool {
-        false
+        self.closing
     }
 
     fn prepare_screen(&mut self) -> Result<(), Self::ScreenError> {
@@ -1678,42 +1913,133 @@ impl<O: AudioOutput + Wakes> Rig for SessionRig<'_, O> {
         // READY starts now; chart time 0 is `lead_in` later.
         let origin = TimeUs(self.clock.now().0 + lead_in.0);
         let open_at = TimeUs(-lead_in.0);
+        self.script_origin = Some(origin);
         self.script.input.poll(TimeUs(open_at.0 - 1), self.sources);
         self.sources.gate_mut().reset();
         let start = self.sources.open_recording(open_at);
-        let sources = &*self.sources;
-        // One removed and connected again since counts as removed.
-        self.participants = sources
-            .participants()
-            .map(|(d, _)| (d, sources.connection(d)))
-            .collect();
-        let kinds = sources.participants().map(|(_, k)| k).collect();
-        let axes = sources
-            .participants()
-            .map(|(d, _)| sources.axes(d).to_vec())
-            .collect();
+        Ok(self.opening(origin, start))
+    }
+
+    fn gated(&self) -> bool {
+        self.gate.is_some()
+    }
+
+    fn open_candidate(
+        &mut self,
+        lead_in: TimeUs,
+        generation: u32,
+    ) -> Result<Option<Opening<Self::Reader>>, InputWaitError> {
+        // The script's timeline is the first attempt's: a deferred opening
+        // keeps it.
+        let global = self.clock.now();
+        let script_origin = *self
+            .script_origin
+            .get_or_insert(TimeUs(global.0 + lead_in.0));
+        let now = TimeUs(global.0 - script_origin.0);
+        self.script.input.poll(TimeUs(now.0 - 1), self.sources);
+        self.sources.gate_mut().reset();
+        let chart0 = TimeUs(now.0 + lead_in.0);
+        let Some(start) = self
+            .sources
+            .open_candidate(now, chart0, generation)
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        let origin = TimeUs(script_origin.0 + chart0.0);
+        if let Some(g) = &mut self.gate {
+            g.opened(generation, now, chart0);
+        }
+        Ok(Some(self.opening(origin, start)))
+    }
+
+    fn holding(&self) -> bool {
+        self.sources.holding()
+    }
+
+    fn candidate(&self) -> input::GateState {
+        self.gate.as_ref().map_or(
+            input::GateState {
+                generation: 0,
+                phase: input::GatePhase::Idle,
+            },
+            crate::start_gate::ScriptedGate::state,
+        )
+    }
+
+    fn settle_candidate(&mut self, generation: u32) -> bool {
+        self.gate.as_ref().is_some_and(|g| g.settle(generation))
+    }
+
+    fn cancel_candidate(&mut self, generation: u32) {
+        self.cancel_audio();
+        self.restore = None;
+        let now = self.play_time().unwrap_or(TimeUs(0));
+        if let Some(g) = &mut self.gate {
+            g.cancelled(generation, now);
+        }
+    }
+
+    fn rearm_candidate(
+        &mut self,
+        readers: &mut Vec<Self::Reader>,
+        lead_in: TimeUs,
+        generation: u32,
+        history: &mut crate::HistoryRecorder,
+        start: &mut InputStart,
+    ) -> Result<crate::live::Rearm, InputWaitError> {
+        let (Some(script_origin), Some(origin)) = (self.script_origin, self.origin) else {
+            return Err(InputWaitError::Gone);
+        };
+        // At one boundary of the input side: both roles released, the
+        // cancelled opening sealed with its last events, the next opened.
+        if self.sources.holding() {
+            return Ok(crate::live::Rearm::Held);
+        }
+        let now = TimeUs(self.clock.now().0 - script_origin.0);
+        let chart0 = TimeUs(now.0 + lead_in.0);
+        let drained = history.drain(readers);
+        let closed = TimeUs(now.0 - (origin.0 - script_origin.0));
+        let sealed = history.seal(closed, self.sources.arrivals(), replay::CancelReason::Held);
+        // A history that ran out seals the capture: no candidate follows.
+        if drained.is_err() || sealed.is_err() {
+            return Ok(crate::live::Rearm::Held);
+        }
+        self.sources.return_readers(std::mem::take(readers));
+        let reopened = self
+            .sources
+            .reopen_candidate(now, chart0, generation)
+            .map(|s| {
+                start.opened_at = s.opened_at;
+                start.held.clear();
+                start.held.extend_from_slice(&s.held);
+            });
+        *readers = self.sources.take_readers();
+        match reopened {
+            Ok(()) => {}
+            Err(input::ReopenError::Held) => return Ok(crate::live::Rearm::Held),
+            Err(_) => return Err(InputWaitError::Gone),
+        }
+        let origin = TimeUs(script_origin.0 + chart0.0);
         self.origin = Some(origin);
-        Ok(Opening {
-            origin,
-            start,
-            readers: self.sources.take_readers(),
-            kinds,
-            axes,
-        })
+        if let Some(g) = &mut self.gate {
+            g.opened(generation, now, chart0);
+        }
+        Ok(crate::live::Rearm::Opened { origin })
+    }
+
+    fn restart_candidate(&mut self, origin: TimeUs, _generation: u32) {
+        self.restart_audio(origin);
+    }
+
+    fn snapshot_capacity(&self) -> usize {
+        self.sources.snapshot_capacity()
     }
 
     fn start(&mut self, origin: TimeUs, sounds: AudioQueue, screen: RenderSide) {
-        let engine = self.audio.engine_mut();
-        engine.restart(origin);
-        // As the audio thread restores a round: the lead-in's start, else
-        // its fallback, else silence (design.md "Mid-Chart Start and
-        // Section Repeat").
-        if let Some(restore) = self.restore.take() {
-            restore.apply(engine);
-        }
+        self.restart_audio(origin);
         self.sounds = Some(sounds);
         self.screen = Some(screen);
-        self.sealed = false;
     }
 
     fn focus_lost(&self) -> bool {
@@ -1931,6 +2257,21 @@ impl Reservation {
                 .fixed
                 .saturating_add(crate::HistoryRecorder::bytes(held)),
             per_input: self.per_input,
+        }
+    }
+
+    /// This reservation with a gated play's own storage (design.md "Play
+    /// Lifecycle", the start gate): the history of cancelled openings
+    /// ([`with_history`](Self::with_history)) and the two held-input
+    /// snapshots of `held` entries a rearm copies into, the logic step's
+    /// and the next candidate's.
+    #[must_use]
+    pub const fn with_gate(self, held: usize) -> Self {
+        let snapshots = held.saturating_mul(2 * size_of::<(eval::SourceId, ControlId, i32)>());
+        let r = self.with_history(held);
+        Self {
+            fixed: r.fixed.saturating_add(snapshots),
+            per_input: r.per_input,
         }
     }
 

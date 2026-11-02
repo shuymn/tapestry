@@ -216,22 +216,36 @@ impl ConversionState {
             axes,
             held: [0; LANE_COUNT],
         };
+        state.take_start(start);
+        Ok(state)
+    }
+
+    /// Back to the state [`init`](Self::init) makes from `start`, for the
+    /// same profile, in place: nothing is allocated.
+    pub fn reset(&mut self, start: &InputStart) {
+        for s in &mut self.sources {
+            s.pressed.fill(false);
+        }
+        for a in &mut self.axes {
+            a.clear();
+        }
+        self.held = [0; LANE_COUNT];
+        self.take_start(start);
+    }
+
+    /// Takes `start`'s held controls, as from released.
+    fn take_start(&mut self, start: &InputStart) {
         for &(source, control, value) in &start.held {
-            if let Some(i) = state.axis_of(source, control) {
+            if let Some(i) = self.axis_of(source, control) {
                 // Only an absolute axis reads it.
-                #[expect(
-                    clippy::indexing_slicing,
-                    reason = "construction: `axis_of` returns an index into `axes`"
-                )]
-                {
-                    state.axes[i].last = Some(value);
+                if let Some(a) = self.axes.get_mut(i) {
+                    a.last = Some(value);
                 }
                 continue;
             }
             // Held controls start pressed; no edge is reported for them.
-            state.set(source.index(), control, value != 0);
+            self.set(source.index(), control, value != 0);
         }
-        Ok(state)
     }
 
     /// Whether `lane` is held.

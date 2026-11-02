@@ -57,8 +57,9 @@ mod win;
 use bms_model::TimeUs;
 
 pub use adjust::{
-    ADJUST_QUEUE, AdjustmentBindings, AdjustmentReceiver, AdjustmentTap, Hold, HoldLatch,
-    MAX_TAPPED, TapControl, TapError, TapEvent, TapObservation, adjustment_queue,
+    ADJUST_QUEUE, AdjustmentBindings, AdjustmentReceiver, AdjustmentTap, GatePhase, GateState,
+    Hold, HoldLatch, MAX_TAPPED, StartGate, TapControl, TapError, TapEvent, TapObservation,
+    adjustment_queue,
 };
 pub use autoplay::{AUTOPLAY_DEVICE, AutoplayInput, TimeOverflow, autoplay, autoplay_count};
 pub use cadence::{Phase, WakeReport};

@@ -183,6 +183,7 @@ pub const IN_PLAY: &[Site] = &[
     Site::File("crates/game/src/ready_history.rs"),
     Site::File("crates/game/src/render.rs"),
     Site::File("crates/game/src/sound.rs"),
+    Site::File("crates/game/src/start_gate.rs"),
     Site::Fns(
         "crates/game/src/live.rs",
         &[
@@ -195,6 +196,10 @@ pub const IN_PLAY: &[Site] = &[
             "TailEnd::cut",
             "Rig::stepped",
             "Rig::input_failure",
+            "open_gated",
+            "Candidates::watch",
+            "Candidates::wait_release",
+            "cancel_reason",
         ],
     ),
     Site::Fns(

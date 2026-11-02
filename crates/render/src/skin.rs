@@ -279,3 +279,75 @@ pub trait PlaySkin: Send {
         Ok(())
     }
 }
+
+/// The stored cover settings a frame reports, from the adjustments' one
+/// snapshot (design.md "Play readouts", "Play Adjustments", publication):
+/// the configured amounts and switches, and `adjusting` (condition 270,
+/// `lanecover1_changing`) true while START or SELECT is held, so an
+/// imported skin's 270 reads what the source tests. Until S10-04b the
+/// player's frames keep their interim readouts (`decl::READOUTS`), which
+/// never call this: 270 keeps its documented D4 difference there.
+#[must_use]
+pub const fn cover_settings(s: &game::adjustment::PresentationSnapshot) -> CoverSettings {
+    let covers = s.options.covers();
+    CoverSettings {
+        cover: covers.sudden.amount,
+        lift: covers.lift.amount,
+        hidden: covers.hidden.amount,
+        cover_enabled: covers.sudden.on,
+        lift_enabled: covers.lift.on,
+        hidden_enabled: covers.hidden.on,
+        adjusting: s.adjusting,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use game::adjustment::{
+        Adjustment, ControlId, ControlRoles, Event, NoTempo, Observation, Role,
+    };
+    use game::{Cover, Covers, HiSpeedSettings, PlayOptions};
+
+    use super::cover_settings;
+    use bms_model::TimeUs;
+
+    /// Condition 270 reads START or SELECT held from the snapshot, with
+    /// the configured covers beside it.
+    #[test]
+    fn adjusting_follows_start_or_select_held_in_the_snapshot() {
+        let covers = Covers {
+            sudden: Cover {
+                amount: 250,
+                on: true,
+            },
+            lift: Cover {
+                amount: 100,
+                on: false,
+            },
+            hidden: Cover::default(),
+        };
+        let options = PlayOptions::new(HiSpeedSettings::default(), covers).unwrap();
+        let mut roles = ControlRoles::default();
+        roles.set(ControlId(0), Role::Start);
+        roles.set(ControlId(1), Role::Select);
+        let mut a = Adjustment::new(options, roles, TimeUs(-1_000_000), 0);
+        let at = |t, seq, event| Observation {
+            time: TimeUs(t),
+            seq,
+            event,
+        };
+        let c = cover_settings(&a.snapshot());
+        assert!(!c.adjusting);
+        assert_eq!(
+            (c.cover, c.cover_enabled, c.lift, c.lift_enabled),
+            (250, true, 100, false)
+        );
+        a.observe(at(10, 0, Event::Press(ControlId(1))), &NoTempo);
+        assert!(cover_settings(&a.snapshot()).adjusting, "SELECT held");
+        a.observe(at(20, 1, Event::Release(ControlId(1))), &NoTempo);
+        a.observe(at(30, 2, Event::Press(ControlId(0))), &NoTempo);
+        assert!(cover_settings(&a.snapshot()).adjusting, "START held");
+        a.observe(at(40, 3, Event::Release(ControlId(0))), &NoTempo);
+        assert!(!cover_settings(&a.snapshot()).adjusting);
+    }
+}

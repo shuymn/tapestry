@@ -43,6 +43,7 @@ mod save;
 mod session;
 mod settings;
 mod sound;
+mod start_gate;
 mod tuning;
 
 pub use adjust_keys::{
@@ -52,7 +53,7 @@ pub use app::{App, AppRig, IDLE_WAIT, LoadRefusal, Loading, Pick, Refused};
 pub use attempt::{Attempt, AttemptKind, NoteEnd, Preparation, PreparationRefusal};
 pub use audio_loop::{
     AudioControl, AudioCounters, AudioCtl, AudioLoadError, AudioProbe, AudioWaitError, AudioWorker,
-    Probed, SWITCH_TIMEOUT, audio_control,
+    Probed, SWITCH_TIMEOUT, TransportGate, audio_control,
 };
 pub use autoplay::{Autoplay, AutoplayError, schedule_iter};
 pub use bests::{BestScore, BestView, SavedPlay};
@@ -67,7 +68,7 @@ pub use keys::{
     Bound, CANCEL_KEY, KEEP_KEY, KeyConfigEnd, KeyConfigFlow, KeyConfigs, KeyScreen, LEARN_TIME,
     LearntRange, Press, ROLES, Refusal, SETTLE_TIME, capture_keys, capture_keys_within,
 };
-pub use live::{Closing, InputWaitError, Leave, LiveError, Opening, Rig};
+pub use live::{Closing, InputWaitError, Leave, LiveError, Opening, Rearm, Rig};
 pub use logic::{
     AbortCause, Advance, EventSink, Logic, LogicConfig, LogicError, Record, SourceRead,
 };

@@ -120,6 +120,9 @@ fn step(rule: &GaugeRule, before: GaugeValue, delta: i128) -> GaugeValue {
 #[derive(Clone, Debug)]
 pub(crate) struct Gauges {
     states: Vec<GaugeState>,
+    /// Each gauge's state at the start, which [`reset`](Self::reset)
+    /// restores.
+    starts: Vec<GaugeState>,
     /// Each gauge's `#TOTAL` correction for this chart.
     corrections: Vec<CorrectionFactors>,
     increment: i128,
@@ -136,19 +139,21 @@ impl Gauges {
         notes: usize,
         initial: Option<&[GaugeValue]>,
     ) -> Self {
+        let starts: Vec<GaugeState> = rules
+            .iter()
+            .enumerate()
+            .map(|(i, r)| {
+                let start = initial.and_then(|v| v.get(i)).copied().unwrap_or(r.start);
+                GaugeState {
+                    value: start,
+                    reference: start,
+                    failed_at: None,
+                }
+            })
+            .collect();
         Self {
-            states: rules
-                .iter()
-                .enumerate()
-                .map(|(i, r)| {
-                    let start = initial.and_then(|v| v.get(i)).copied().unwrap_or(r.start);
-                    GaugeState {
-                        value: start,
-                        reference: start,
-                        failed_at: None,
-                    }
-                })
-                .collect(),
+            states: starts.clone(),
+            starts,
             corrections: rules
                 .iter()
                 .map(|r| r.correction.factors(total_milli, notes))
@@ -169,6 +174,11 @@ impl Gauges {
 
     pub(crate) fn states(&self) -> &[GaugeState] {
         &self.states
+    }
+
+    /// Every gauge back at its start, in place.
+    pub(crate) fn reset(&mut self) {
+        self.states.copy_from_slice(&self.starts);
     }
 
     /// Applies `cause` at `time` to every gauge: each change is computed

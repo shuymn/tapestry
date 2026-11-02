@@ -3,7 +3,9 @@
 //! signed axis movement, observed beside the physical-state tracking and
 //! sent through a bounded queue, while recording is open too. The physical
 //! hold latch ([`HoldLatch`]) says whether a latched control (START or
-//! SELECT) is held, from any thread.
+//! SELECT) is held, from any thread, and takes part in the start gate
+//! ([`StartGate`]): the input thread cancels an armed READY candidate as it
+//! accepts a hold, so an observation ordered before the commit blocks it.
 //!
 //! Each tapped control has a number below [`MAX_TAPPED`]; one number may
 //! stand for the same control on several devices, which then count as one
@@ -138,6 +140,130 @@ impl HoldLatch {
     }
 }
 
+/// Where a READY candidate's start gate stands ([`StartGate::state`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GatePhase {
+    /// No candidate is armed.
+    Idle,
+    /// The candidate waits for its commit.
+    Armed,
+    /// The candidate committed: its transport started.
+    Committed,
+    /// A hold cancelled the candidate before its commit.
+    Cancelled,
+}
+
+/// A start gate's generation and phase.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GateState {
+    /// The READY candidate's generation.
+    pub generation: u32,
+    /// Where it stands.
+    pub phase: GatePhase,
+}
+
+/// The start gate's word (design.md "Play Lifecycle", the start gate),
+/// shared by the input thread, the game thread and whatever starts the
+/// transport: a candidate is armed by generation, and exactly one of its
+/// commit and its cancellation wins, each a compare-and-swap from armed.
+/// The input thread cancels as it accepts a hold
+/// ([`AdjustmentTap::start_gate`]); the transport commits only its own
+/// generation, so a stale authorization starts nothing. Nothing allocates
+/// after [`new`](Self::new).
+#[derive(Clone, Debug)]
+pub struct StartGate(Arc<AtomicU64>);
+
+impl Default for StartGate {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl StartGate {
+    /// An idle gate.
+    #[must_use]
+    pub fn new() -> Self {
+        Self(Arc::new(AtomicU64::new(0)))
+    }
+
+    const fn word(generation: u32, phase: GatePhase) -> u64 {
+        let code = match phase {
+            GatePhase::Idle => 0,
+            GatePhase::Armed => 1,
+            GatePhase::Committed => 2,
+            GatePhase::Cancelled => 3,
+        };
+        ((generation as u64) << 2) | code
+    }
+
+    fn decode(v: u64) -> GateState {
+        GateState {
+            generation: u32::try_from(v >> 2).unwrap_or(u32::MAX),
+            phase: match v & 3 {
+                0 => GatePhase::Idle,
+                1 => GatePhase::Armed,
+                2 => GatePhase::Committed,
+                _ => GatePhase::Cancelled,
+            },
+        }
+    }
+
+    /// The gate now.
+    #[must_use]
+    pub fn state(&self) -> GateState {
+        Self::decode(self.0.load(Ordering::Acquire))
+    }
+
+    /// Arms candidate `generation`, whatever stood before: the opening
+    /// that verified both roles released.
+    pub fn arm(&self, generation: u32) {
+        self.0
+            .store(Self::word(generation, GatePhase::Armed), Ordering::Release);
+    }
+
+    /// Commits candidate `generation`: `true` when it was armed and
+    /// nothing cancelled it first. Another generation, a cancelled or an
+    /// idle gate commits nothing.
+    pub fn commit(&self, generation: u32) -> bool {
+        self.0
+            .compare_exchange(
+                Self::word(generation, GatePhase::Armed),
+                Self::word(generation, GatePhase::Committed),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    /// Cancels the armed candidate, whichever it is: its generation when
+    /// one was armed and not committed first.
+    pub fn cancel(&self) -> Option<u32> {
+        let v = self.0.load(Ordering::Acquire);
+        let state = Self::decode(v);
+        if state.phase != GatePhase::Armed {
+            return None;
+        }
+        self.0
+            .compare_exchange(
+                v,
+                Self::word(state.generation, GatePhase::Cancelled),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+            .then_some(state.generation)
+    }
+
+    /// No candidate: the attempt is over. The last generation stays, so
+    /// the next attempt numbers its candidates after it and no
+    /// authorization or acknowledgement of an earlier one matches them.
+    pub fn disarm(&self) {
+        let generation = self.state().generation;
+        self.0
+            .store(Self::word(generation, GatePhase::Idle), Ordering::Release);
+    }
+}
+
 /// What the tap must send before anything else.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Pending {
@@ -167,6 +293,8 @@ pub struct AdjustmentTap {
     unclosed: Option<TimeUs>,
     queue: rtrb::Producer<TapObservation>,
     latch: Arc<AtomicU64>,
+    /// The READY candidate's gate, cancelled as a hold is accepted.
+    gate: StartGate,
     dropped: Arc<AtomicU64>,
 }
 
@@ -215,6 +343,7 @@ pub fn adjustment_queue(
             unclosed: None,
             queue: producer,
             latch: Arc::new(AtomicU64::new(0)),
+            gate: StartGate::new(),
             dropped: Arc::clone(&dropped),
         },
         AdjustmentReceiver {
@@ -229,6 +358,25 @@ impl AdjustmentTap {
     #[must_use]
     pub fn latch(&self) -> HoldLatch {
         HoldLatch(Arc::clone(&self.latch))
+    }
+
+    /// A handle on the start gate this tap cancels: the latch's hold, or
+    /// its state turning unverified, cancels the armed candidate as the
+    /// input thread accepts it.
+    #[must_use]
+    pub fn start_gate(&self) -> StartGate {
+        self.gate.clone()
+    }
+
+    /// The start gate, for the source set to arm at an opening.
+    pub(crate) const fn gate(&self) -> &StartGate {
+        &self.gate
+    }
+
+    /// Whether START or SELECT is held, or may be: what defers an opening.
+    #[must_use]
+    pub fn holding(&self) -> bool {
+        self.unverified || self.held_set() & self.latched != 0
     }
 
     /// Whether observations are sent: set at each boundary. The held
@@ -444,6 +592,11 @@ impl AdjustmentTap {
 
     fn store_latch(&self) {
         let held = self.held_set() & self.latched != 0;
+        // Cancelled before the latch shows the hold: whoever reads the
+        // hold finds the candidate cancelled already.
+        if held || self.unverified {
+            let _ = self.gate.cancel();
+        }
         let v = (self.presses << 2) | (u64::from(self.unverified) << 1) | u64::from(held);
         self.latch.store(v, Ordering::Release);
     }

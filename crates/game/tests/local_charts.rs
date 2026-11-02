@@ -267,6 +267,7 @@ fn sweep_one(path: &Path) -> Result<(usize, usize), &'static str> {
             game::SessionPlayError::Logic(e) => logic_category(&e),
             game::SessionPlayError::Restore(_) => "restore refusal",
             game::SessionPlayError::Refused(_) => "preparation refusal",
+            game::SessionPlayError::Left => "left before opening",
         })?;
 
     assert_eq!(report.end, PlayEnd::Completed);
