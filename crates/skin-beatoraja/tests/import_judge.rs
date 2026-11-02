@@ -324,6 +324,35 @@ fn judge_entries_need_an_id() {
     judge(&grades(1), &[combo("ten", 10), no_id]).ok();
 }
 
+/// An entry the judge never draws is not parsed: malformed fields in a
+/// number of a slot without a combo, or in an image past the slots, do
+/// not refuse; a number naming a value is still noted as ignored.
+#[test]
+fn undrawn_judge_entries_are_not_parsed() {
+    let malformed = [
+        r#"{"id": "ten", "blend": []}"#,
+        r#"{"id": "ten", "timer": "late", "dst": [{"x": 0}]}"#,
+        r#"{"id": "ten", "dst": 7}"#,
+        r#"{"id": "ten", "op": [{}], "offset": "far"}"#,
+    ];
+    for entry in malformed {
+        let mut numbers = vec![NONE.to_owned(); 3];
+        numbers.push(entry.to_owned());
+        let l = judge(&grades(4), &numbers);
+        assert!(
+            has(l.report(), NoteKind::Ignored { field: "numbers" }),
+            "{entry}"
+        );
+        let mut images = grades(7);
+        images.push(entry.replace("ten", "g0"));
+        let l = judge(&images, &[]);
+        assert!(
+            has(l.report(), NoteKind::Ignored { field: "images" }),
+            "{entry}"
+        );
+    }
+}
+
 #[test]
 fn quads_count_the_widest_state() {
     let l = judge(&grades(2), &[combo("ten", 10), combo("five", 10)]);

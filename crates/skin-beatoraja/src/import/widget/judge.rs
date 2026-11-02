@@ -154,21 +154,22 @@ impl Cx<'_> {
 
         let mut combos: [Option<ComboPart>; JudgeSlot::COUNT] = Default::default();
         for (k, &n) in numbers.iter().enumerate().take(images.len()) {
-            let drawn = COMBO_SLOTS.contains(&k);
-            let (id, ndst) = self.read_nested(n)?;
-            let Some(id) = id else {
-                if drawn {
-                    return refuse(self, self.arena_span(n), field("numbers"));
+            if !COMBO_SLOTS.contains(&k) {
+                // Never drawn, so not read: only a value it names is noted.
+                if let Ok(Some(id)) = super::super::object::id_of(self.def, n)
+                    && self.value_rec(&id)?.is_some()
+                {
+                    self.ignored(self.arena_span(n), NoteKind::Ignored { field: "numbers" });
                 }
                 continue;
+            }
+            let (id, ndst) = self.read_nested(n)?;
+            let Some(id) = id else {
+                return refuse(self, self.arena_span(n), field("numbers"));
             };
             let Some(value) = self.value_rec(&id)? else {
                 continue;
             };
-            if !drawn {
-                self.ignored(ndst.span, NoteKind::Ignored { field: "numbers" });
-                continue;
-            }
             if let Some(combo) = self.combo(&ndst, value)? {
                 combos[k] = Some(combo);
             }
