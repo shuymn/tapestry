@@ -297,11 +297,11 @@ enum Hold {
         pressed: TimeUs,
         /// The next repeat, for a digital scratch.
         next: TimeUs,
-        /// A digital scratch's request in the open group, with its time and
-        /// dispatch context: an opposite press at that time in that context
-        /// takes it back. Once its context ends, the group it was in has
-        /// applied, and nothing is taken back.
-        pending: Option<(TimeUs, u64, Request)>,
+        /// A digital scratch's request in the open group, with its time; it
+        /// was made in `context`. An opposite press at that time in that
+        /// context takes it back. Once its context ends, the group it was
+        /// in has applied, and nothing is taken back.
+        pending: Option<(TimeUs, Request)>,
     },
 }
 
@@ -374,12 +374,6 @@ enum Mods {
     Both,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Tempo {
-    references: References,
-    speed: Speed,
-}
-
 /// The adjustments' state for an attempt and its READY candidates.
 #[derive(Clone, Debug)]
 pub struct Adjustment {
@@ -397,7 +391,8 @@ pub struct Adjustment {
     head: Head,
     generation: u32,
     display_offset_us: i64,
-    tempo: Option<Tempo>,
+    /// The practice speed, once [`Event::Prepare`] makes the tempo known.
+    speed: Option<Speed>,
     group: Group,
     last: Option<(TimeUs, u64)>,
     diagnostics: Diagnostics,
@@ -431,7 +426,7 @@ impl Adjustment {
             head: Head::Frozen { opens_at },
             generation: 0,
             display_offset_us: 0,
-            tempo: None,
+            speed: None,
             group: Group::default(),
             last: None,
             diagnostics: Diagnostics::default(),
@@ -468,7 +463,7 @@ impl Adjustment {
         self.head = Head::Frozen { opens_at };
         self.generation = 0;
         self.display_offset_us = clamp_offset(display_offset_us);
-        self.tempo = None;
+        self.speed = None;
         self.group = Group::default();
         self.last = None;
     }
@@ -562,7 +557,7 @@ impl Adjustment {
             }
             Event::Prepare { references, speed } => {
                 self.end_context(tempo);
-                self.tempo = Some(Tempo { references, speed });
+                self.speed = Some(speed);
                 if self.options.hispeed().mode == SpeedMode::Floating {
                     let reference = references.get(self.options.hispeed().reference);
                     let solved = playback(reference, speed).and_then(|b| self.solve_at(b));
@@ -661,6 +656,7 @@ impl Adjustment {
                 for h in &mut self.holds {
                     if let Hold::Held {
                         role: r,
+                        context: c,
                         suppressed,
                         pending,
                         ..
@@ -669,9 +665,9 @@ impl Adjustment {
                     {
                         // What it asked at this time, press or repeat, is
                         // taken back: neither direction acts at this time.
-                        if let Some((at, c, request)) = pending.take()
+                        if let Some((at, request)) = pending.take()
                             && at == time
-                            && c == context
+                            && *c == context
                         {
                             group.retract(time, request);
                         }
@@ -798,36 +794,35 @@ impl Adjustment {
             return;
         }
         let context = self.context;
-        let mut steps = [(ControlId(0), Role::ScratchPositive, 0_i64); MAX_CONTROLS];
-        let mut n = 0;
-        for (i, h) in self.holds.iter_mut().enumerate() {
-            if let Hold::Held {
+        // A step only adds to the group and to its own hold's request, so
+        // each hold steps as it is reached.
+        for i in 0..self.holds.len() {
+            let Ok(control) = u8::try_from(i).map(ControlId) else {
+                break;
+            };
+            let Some(Hold::Held {
                 role: role @ (Role::ScratchPositive | Role::ScratchNegative),
                 context: c,
                 suppressed: false,
                 pressed,
                 next,
                 ..
-            } = h
-            {
-                if *c != context || time < *next {
-                    continue;
-                }
-                // One step however many deadlines passed.
-                let missed = (time.0 - next.0) / REPEAT_US + 1;
-                next.0 = next.0.saturating_add(missed.saturating_mul(REPEAT_US));
-                let q = if time.0.saturating_sub(pressed.0) >= ACCELERATE_US {
-                    FAST_COVER_STEP
-                } else {
-                    1
-                };
-                if let (Some(slot), Ok(i)) = (steps.get_mut(n), u8::try_from(i)) {
-                    *slot = (ControlId(i), *role, q);
-                    n += 1;
-                }
+            }) = self.holds.get_mut(i)
+            else {
+                continue;
+            };
+            if *c != context || time < *next {
+                continue;
             }
-        }
-        for &(control, role, q) in steps.iter().take(n) {
+            let role = *role;
+            // One step however many deadlines passed.
+            let missed = (time.0 - next.0) / REPEAT_US + 1;
+            next.0 = next.0.saturating_add(missed.saturating_mul(REPEAT_US));
+            let q = if time.0.saturating_sub(pressed.0) >= ACCELERATE_US {
+                FAST_COVER_STEP
+            } else {
+                1
+            };
             let request = self.act(role, q, time);
             self.note(control, time, request);
         }
@@ -840,12 +835,11 @@ impl Adjustment {
             return;
         };
         if let Some(Hold::Held { pending, .. }) = self.holds.get_mut(usize::from(control.0)) {
-            let context = self.context;
+            // Only a hold in the current context acts, so an earlier
+            // request at this time was made in this context too.
             *pending = Some(match *pending {
-                Some((at, c, earlier)) if at == time && c == context => {
-                    (time, context, earlier.plus(request))
-                }
-                _ => (time, context, request),
+                Some((at, earlier)) if at == time => (time, earlier.plus(request)),
+                _ => (time, request),
             });
         }
     }
@@ -1020,7 +1014,7 @@ impl Adjustment {
         time: TimeUs,
         tempo: &T,
     ) -> Result<Option<Ratio>, Unrepresentable> {
-        let Some(prepared) = self.tempo else {
+        let Some(speed) = self.speed else {
             return Ok(None);
         };
         let base = match self.head {
@@ -1031,7 +1025,7 @@ impl Adjustment {
         let Some(bpm) = tempo.bpm_at(head) else {
             return Ok(None);
         };
-        playback(bpm, prepared.speed).map(Some)
+        playback(bpm, speed).map(Some)
     }
 
     fn solve_at(&self, bpm: Ratio) -> Result<Ratio, Unrepresentable> {

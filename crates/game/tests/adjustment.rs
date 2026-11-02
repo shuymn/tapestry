@@ -474,18 +474,19 @@ fn delayed_drain() -> Vec<Observation> {
     rig.log
 }
 
-fn replay_split(log: &[Observation], splits: &[usize]) -> PresentationSnapshot {
-    let map = Map(vec![(0, bpm(150)), (5_000_000, bpm(300))]);
-    let mut a = Adjustment::new(
-        options(SpeedMode::Floating, 100, 360, sudden(500)),
-        roles(),
-        TimeUs(-2_000_000),
-        0,
-    );
+/// `log` from a fresh reducer with `options` on `map`, drained at each of
+/// `splits`; the publication counter cleared.
+fn drained(
+    options: PlayOptions,
+    map: &Map,
+    log: &[Observation],
+    splits: &[usize],
+) -> PresentationSnapshot {
+    let mut a = Adjustment::new(options, roles(), TimeUs(-2_000_000), 0);
     let (mut w, mut r) = presentation_link(&a.snapshot());
     let mut from = 0;
     for &to in splits.iter().chain([&log.len()]) {
-        a.drain(log[from..to].iter().copied(), &map, &mut w);
+        a.drain(log[from..to].iter().copied(), map, &mut w);
         from = to;
     }
     let mut s = *r.read();
@@ -496,6 +497,9 @@ fn replay_split(log: &[Observation], splits: &[usize]) -> PresentationSnapshot {
 #[test]
 fn a_delayed_drain_gives_one_state_whatever_its_splits() {
     let log = delayed_drain();
+    let o = options(SpeedMode::Floating, 100, 360, sudden(500));
+    let map = Map(vec![(0, bpm(150)), (5_000_000, bpm(300))]);
+    let replay_split = |log: &[Observation], splits: &[usize]| drained(o, &map, log, splits);
     let whole = replay_split(&log, &[]);
     assert_eq!(whole.options.covers().sudden.amount, 500);
     assert_eq!(h(&whole), r(2, 3));
@@ -1404,22 +1408,6 @@ fn same_time_axis_steps_cancel_exactly_at_the_i64_bounds() {
     }
 }
 
-/// `log` from a fresh reducer with `options` at 150 BPM, drained at each of
-/// `splits`; the publication counter cleared.
-fn drained(options: PlayOptions, log: &[Observation], splits: &[usize]) -> PresentationSnapshot {
-    let map = constant(150);
-    let mut a = Adjustment::new(options, roles(), TimeUs(-2_000_000), 0);
-    let (mut w, mut r) = presentation_link(&a.snapshot());
-    let mut from = 0;
-    for &to in splits.iter().chain([&log.len()]) {
-        a.drain(log[from..to].iter().copied(), &map, &mut w);
-        from = to;
-    }
-    let mut s = *r.read();
-    s.sequence = 0;
-    s
-}
-
 #[test]
 fn an_opposite_press_takes_back_a_repeat_at_its_time_in_either_order() {
     let o = options(SpeedMode::Classic, 200, 300, sudden(500));
@@ -1442,7 +1430,7 @@ fn an_opposite_press_takes_back_a_repeat_at_its_time_in_either_order() {
         rig.now += 1;
         rig.ev(Event::Tick);
         let log = rig.log.clone();
-        let whole = drained(o, &log, &[]);
+        let whole = drained(o, &constant(150), &log, &[]);
         assert_eq!(
             whole.options.covers().sudden.amount,
             510,
@@ -1450,7 +1438,7 @@ fn an_opposite_press_takes_back_a_repeat_at_its_time_in_either_order() {
         );
         for i in 0..=log.len() {
             assert_eq!(
-                drained(o, &log, &[i]),
+                drained(o, &constant(150), &log, &[i]),
                 whole,
                 "tick first: {tick_first}, split {i}"
             );
@@ -1474,9 +1462,9 @@ fn a_step_applied_in_an_ended_context_is_never_taken_back() {
     rig.now += 1;
     rig.ev(Event::Tick);
     let log = rig.log.clone();
-    let whole = drained(o, &log, &[]);
+    let whole = drained(o, &constant(150), &log, &[]);
     assert_eq!(whole.options.covers().sudden.amount, 511);
     for i in 0..=log.len() {
-        assert_eq!(drained(o, &log, &[i]), whole, "split {i}");
+        assert_eq!(drained(o, &constant(150), &log, &[i]), whole, "split {i}");
     }
 }
