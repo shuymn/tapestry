@@ -116,6 +116,7 @@ pub const IN_PLAY: &[Site] = &[
     Site::File("crates/eval/src/gauge.rs"),
     Site::File("crates/eval/src/input.rs"),
     Site::File("crates/eval/src/merge.rs"),
+    Site::File("crates/eval/src/notes.rs"),
     Site::Fns(
         "crates/rules/src/preset.rs",
         &[

@@ -451,6 +451,9 @@ pub fn draw(imported: &Imported) -> Vec<usize> {
             },
         }];
         batch.clear();
+        // The play view's note facts after the judgment.
+        let mut notes = eval::NoteFacts::new(&chart);
+        notes.set_done(lane, 0);
         let frame = SkinFrame {
             now: TimeUs(ms * 1_000),
             display_offset: TimeUs(0),
@@ -458,6 +461,7 @@ pub fn draw(imported: &Imported) -> Vec<usize> {
             gauges: &states,
             gauge: 0,
             effects: &effects,
+            notes: &notes,
             complete: false,
             target: [1_920, 1_080],
             layout: &Layout::AUTHOR,
@@ -498,6 +502,7 @@ pub fn draw(imported: &Imported) -> Vec<usize> {
             readouts.covers.hidden = hidden.min(1_000);
             readouts.covers.hidden_enabled = false;
         }
+        let notes = eval::NoteFacts::default();
         let frame = SkinFrame {
             now: TimeUs(ms * 1_000),
             display_offset: TimeUs(0),
@@ -505,6 +510,7 @@ pub fn draw(imported: &Imported) -> Vec<usize> {
             gauges: &states,
             gauge: 0,
             effects: &[],
+            notes: &notes,
             complete: false,
             target: [1_920, 1_080],
             layout: &Layout::AUTHOR,
@@ -589,6 +595,7 @@ fn lane_order_probes(
             hidden: 0,
         };
         batch.clear();
+        let notes = eval::NoteFacts::default();
         let frame = SkinFrame {
             now: TimeUs(800_000 + i64::try_from(k).unwrap_or(0) * 400_000),
             display_offset: TimeUs(0),
@@ -596,6 +603,7 @@ fn lane_order_probes(
             gauges: &states,
             gauge: 0,
             effects: &[],
+            notes: &notes,
             complete: false,
             target: [1_920, 1_080],
             layout: &Layout::AUTHOR,
@@ -666,6 +674,7 @@ fn gauge_probes(
                 failed_at: None,
             }];
             batch.clear();
+            let notes = eval::NoteFacts::default();
             let frame = SkinFrame {
                 now: TimeUs(i64::try_from(k).unwrap_or(0) * 16_000),
                 display_offset: TimeUs(0),
@@ -673,6 +682,7 @@ fn gauge_probes(
                 gauges: &states,
                 gauge: 0,
                 effects: &[],
+                notes: &notes,
                 complete: false,
                 target: [1_920, 1_080],
                 layout: &Layout::AUTHOR,
@@ -784,6 +794,7 @@ pub fn judged_rects(imported: &Imported, full: bool) -> Vec<[f32; 4]> {
     );
     for (ms, effects) in [(900, [gauge]), (1_000, [judged])] {
         batch.clear();
+        let notes = eval::NoteFacts::default();
         let frame = SkinFrame {
             now: TimeUs(ms * 1_000),
             display_offset: TimeUs(0),
@@ -791,6 +802,7 @@ pub fn judged_rects(imported: &Imported, full: bool) -> Vec<[f32; 4]> {
             gauges: &states,
             gauge: 0,
             effects: &effects,
+            notes: &notes,
             complete: false,
             target: [1_920, 1_080],
             layout: &Layout::AUTHOR,
@@ -895,6 +907,7 @@ fn grade_anchor_probes(
                 hidden: 0,
             };
             batch.clear();
+            let notes = eval::NoteFacts::default();
             let frame = SkinFrame {
                 now: TimeUs(now),
                 display_offset: TimeUs(0),
@@ -902,6 +915,7 @@ fn grade_anchor_probes(
                 gauges: &full,
                 gauge: 0,
                 effects: if step == 0 { &effects } else { &[] },
+                notes: &notes,
                 complete: false,
                 target,
                 layout: &Layout::AUTHOR,
@@ -1061,6 +1075,7 @@ fn digit_probes(
             },
         }];
         batch.clear();
+        let notes = eval::NoteFacts::default();
         let frame = SkinFrame {
             now,
             display_offset: TimeUs(0),
@@ -1068,6 +1083,7 @@ fn digit_probes(
             gauges: states,
             gauge: 0,
             effects: &effects,
+            notes: &notes,
             complete: false,
             target,
             layout: &Layout::AUTHOR,
@@ -1132,6 +1148,17 @@ fn long_note_probes(
                 lift: 0,
                 hidden: 0,
             };
+            // The play view's note facts: held from its head on.
+            let mut notes = eval::NoteFacts::new(&chart);
+            if ms >= 1_000 {
+                notes.set_done(lane, 0);
+                let hold = eval::NoteHold {
+                    note: 0,
+                    start: TimeUs(1_000_000),
+                    end: TimeUs(4_000_000),
+                };
+                notes.set_hold(lane, Some(hold));
+            }
             let frame = SkinFrame {
                 now: TimeUs(ms * 1_000),
                 display_offset: TimeUs(0),
@@ -1139,6 +1166,7 @@ fn long_note_probes(
                 gauges,
                 gauge: 0,
                 effects,
+                notes: &notes,
                 complete: false,
                 target: [1_920, 1_080],
                 layout: &Layout::AUTHOR,
@@ -1195,6 +1223,7 @@ fn bar_probes(
             lift,
             hidden: 0,
         };
+        let notes = eval::NoteFacts::default();
         let frame = SkinFrame {
             now: TimeUs(ms * 1_000),
             display_offset: TimeUs(offset * 1_000),
@@ -1202,6 +1231,7 @@ fn bar_probes(
             gauges,
             gauge: 0,
             effects: &[],
+            notes: &notes,
             complete: false,
             target: [1_920, 1_080],
             layout: &Layout::AUTHOR,
@@ -1294,6 +1324,7 @@ fn choice_probes(
             empty_poor: 0,
         };
         batch.clear();
+        let notes = eval::NoteFacts::default();
         let frame = SkinFrame {
             now: TimeUs(now),
             display_offset: TimeUs(0),
@@ -1301,6 +1332,7 @@ fn choice_probes(
             gauges: &states,
             gauge: 0,
             effects: &[],
+            notes: &notes,
             complete: false,
             target: [1_920, 1_080],
             layout: &Layout::AUTHOR,
@@ -1380,6 +1412,7 @@ fn rate_and_kind_probes(
         .flat_map(|(ks, s)| ks.map(move |k| (k, s)))
         {
             batch.clear();
+            let notes = eval::NoteFacts::default();
             let frame = SkinFrame {
                 now: TimeUs(2_000_000),
                 display_offset: TimeUs(0),
@@ -1387,6 +1420,7 @@ fn rate_and_kind_probes(
                 gauges: snapshot,
                 gauge: k,
                 effects: &[],
+                notes: &notes,
                 complete: false,
                 target: [1_920, 1_080],
                 layout: &Layout::AUTHOR,
@@ -1613,6 +1647,7 @@ fn readout_probes(
                 hidden: effective(on, hidden),
             };
             batch.clear();
+            let notes = eval::NoteFacts::default();
             let frame = SkinFrame {
                 now: TimeUs(now_ms * 1_000),
                 display_offset: TimeUs(0),
@@ -1620,6 +1655,7 @@ fn readout_probes(
                 gauges: &states,
                 gauge: 0,
                 effects: &[],
+                notes: &notes,
                 complete: false,
                 target: [1_920, 1_080],
                 layout: &Layout::AUTHOR,

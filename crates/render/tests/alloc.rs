@@ -662,10 +662,10 @@ fn imported_frames(chart: &Chart, overlay: &[&str], glyphs: usize) {
 
     // A READY rearm (design.md "Play Lifecycle", the start gate): after
     // lane 1's long note was held (the skin draws a held body with
-    // another image, from the reducer's hold), the attempt starts over in
-    // place, its prepared bitmap text still attached: the frame inside
-    // that note after the rearm is a fresh attempt's, its body not held,
-    // and nothing allocates.
+    // another image, from the note facts' hold), the attempt starts over
+    // in place, its prepared bitmap text still attached: the frame inside
+    // that note after the rearm, from the rearmed candidate's fresh view,
+    // is a fresh attempt's, its body not held, and nothing allocates.
     let (index, long) = chart.lanes[1]
         .iter()
         .enumerate()
@@ -691,13 +691,18 @@ fn imported_frames(chart: &Chart, overlay: &[&str], glyphs: usize) {
             deviation: TimeUs(0),
         },
     }];
+    let held_view = common::with_notes(view(0, 0), chart, &held);
     let holding = FrameInput {
         overlay,
-        ..input(&v, t, TimeUs(8 * MS), &held)
+        ..input(&held_view, t, TimeUs(8 * MS), &held)
     };
     staging.build(&mut skin, &holding).unwrap();
     // Held, its body draws the active image.
-    staging.build(&mut skin, &inside).unwrap();
+    let inside_held = FrameInput {
+        overlay,
+        ..input(&held_view, TimeUs(t.0 + 100 * MS), TimeUs(8 * MS), &[])
+    };
+    staging.build(&mut skin, &inside_held).unwrap();
     assert_ne!(
         staging.instances(),
         &first_frame[..],

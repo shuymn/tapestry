@@ -600,6 +600,17 @@ const LOAD_TIMEOUT: Duration = Duration::from_secs(30);
 /// left.
 const CANCEL_POLL: Duration = Duration::from_millis(10);
 
+/// The play frames whose acquisition is skipped (a rearm whose view the
+/// logic step has not published yet) that are retried at once, the frame
+/// granted kept; each later retry first waits [`ACQUIRE_WAIT`] for a
+/// message, so a logic step held between the two publications costs no
+/// spinning, and a message still ends the wait at once.
+const ACQUIRE_RETRIES: u32 = 4;
+
+/// How long a play frame waits for a message before its acquisition is
+/// tried again, past [`ACQUIRE_RETRIES`] skips in a row.
+const ACQUIRE_WAIT: Duration = Duration::from_millis(1);
+
 /// How long the end of the render thread is waited for: past it, the thread
 /// is left to the process's exit.
 const EXIT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -1680,14 +1691,18 @@ enum Mode {
         pending: Option<Box<MenuPage>>,
     },
     Play {
+        /// The play's first READY candidate's chart time 0 on the clock: a
+        /// rearmed candidate's view carries its own.
         origin: TimeUs,
         side: RenderSide,
         gauge: usize,
         first: bool,
-        /// The READY candidate's rearms drawn from (design.md "Play
-        /// Lifecycle", the start gate): when the side counts another, the
-        /// play is drawn from the rearmed candidate's origin.
+        /// The READY candidate drawn last, as its view's generation
+        /// (design.md "Play Lifecycle", the start gate): a view of
+        /// another starts the screen's runtime over before it is drawn.
         rearms: u64,
+        /// The acquisitions skipped in a row ([`ACQUIRE_RETRIES`]).
+        skipped: u32,
     },
     /// The end screen: [`Run::end_page`].
     End,
@@ -1788,6 +1803,13 @@ impl Run {
                 })
             } else if idle {
                 rx.recv().map_err(|_| TryRecvError::Disconnected)
+            } else if matches!(mode, Mode::Play { skipped, .. } if skipped >= ACQUIRE_RETRIES) {
+                // A play frame's acquisition keeps being skipped: wait a
+                // little, or for a message, before trying it again.
+                rx.recv_timeout(ACQUIRE_WAIT).map_err(|e| match e {
+                    mpsc::RecvTimeoutError::Timeout => TryRecvError::Empty,
+                    mpsc::RecvTimeoutError::Disconnected => TryRecvError::Disconnected,
+                })
             } else {
                 rx.try_recv()
             };
@@ -1987,6 +2009,7 @@ impl Run {
                         gauge,
                         first: true,
                         rearms: 0,
+                        skipped: 0,
                     };
                 }
                 // Without a screen (it failed), the failure stays reported
@@ -2118,6 +2141,7 @@ impl Run {
                     gauge,
                     first,
                     rearms,
+                    skipped,
                 } => {
                     // The app region's first interval (design.md "Scope of
                     // No Allocation"): this frame's own work up to the
@@ -2127,22 +2151,30 @@ impl Run {
                     #[cfg(feature = "dev-tools")]
                     let region = crate::alloc_count::AppRegion::enter();
                     effects.clear();
+                    // One coherent acquisition (design.md "Rendering and
+                    // Skins", the note snapshot): the newest view, its
+                    // candidate's generation and origin, and that
+                    // candidate's effects within the view's events, at most
+                    // what the buffer holds; the rest wait for the next
+                    // frame, and a cancelled candidate's are discarded. A
+                    // rearm the view does not show yet, or one during the
+                    // drain, builds no frame: the next try takes the newer
+                    // candidate, its frame granted kept, at once for the
+                    // first few and then after a short wait for a message
+                    // ([`ACQUIRE_RETRIES`]).
+                    let room = effects.capacity();
+                    let Some(view) = side.acquire(room, |e| effects.push(*e)) else {
+                        *skipped = skipped.saturating_add(1);
+                        continue;
+                    };
+                    *skipped = 0;
                     // A rearmed READY candidate is drawn from its own origin,
-                    // the skin's runtime starting over first. The drain then
-                    // hands over only that candidate's effects: a cancelled
-                    // one's are discarded, and those of a candidate rearmed
-                    // since the look stay queued for the next frame, which
-                    // starts over for it first. At most what the buffer
-                    // holds: the logic step can push during the drain, and
-                    // the rest waits for the next frame.
-                    let (rearmed, rearmed_origin) = side.rearm_state();
-                    if rearmed != *rearms {
-                        *rearms = rearmed;
-                        *origin = rearmed_origin;
+                    // the skin's runtime starting over first.
+                    if view.generation != *rearms {
+                        *rearms = view.generation;
                         screen.rearm();
                     }
-                    let room = effects.capacity();
-                    side.drain_effects_of(*rearms, room, |e| effects.push(*e));
+                    let origin = view.origin.unwrap_or(*origin);
                     let now = TimeUs(self.clock.now().0 - origin.0);
                     // Hi-speed and the display offset change anytime and move
                     // the notes only: they reach the screen here and nowhere
@@ -2161,7 +2193,7 @@ impl Run {
                         now,
                         display_offset: TimeUs(t.display_offset_us),
                         visible_time: t.visible_time(),
-                        view: side.view(),
+                        view,
                         effects: &effects,
                         gauge: *gauge,
                         overlay: &overlay[..shown],
@@ -8500,4 +8532,6 @@ pub(crate) mod tests {
 
     // The bridge over an imported skin with bitmap text.
     mod bitmap;
+    // Dropped effects and rearms through the acquisition into both skins.
+    mod note_snapshot;
 }

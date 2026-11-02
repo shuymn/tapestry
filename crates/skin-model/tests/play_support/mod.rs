@@ -6,8 +6,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-use bms_model::{Chart, Lane, TimeUs};
-use eval::{GaugeState, JudgeEvent, JudgeEventKind, Tally};
+use bms_model::{Chart, Lane, NoteKind, TimeUs};
+use eval::{GaugeState, JudgeEvent, JudgeEventKind, NoteFacts, NoteHold, Tally};
 use image::{ImageFormat, Rgba, RgbaImage};
 use rules::{GaugeValue, Judgment, PerJudgment};
 use skin_model::{
@@ -47,6 +47,68 @@ pub fn judged(
         deviation: deviation_ms.map(|d| TimeUs(d * MS)),
         release: release_ms.map(|r| TimeUs(r * MS)),
         combo,
+    }
+}
+
+/// What the evaluator's note facts become after `ev`, for tests that
+/// drive frames with effects: a judged tap or a hit mine is done, a long
+/// note's head press before its end (held, or a BAD head) takes it and
+/// starts the lane's hold, and its hold's end or its completion ends it. Drops are modelled
+/// by changing the facts without effects.
+pub fn follow(notes: &mut NoteFacts, chart: &Chart, ev: &JudgeEvent) {
+    let end_of = |lane: Lane, note: usize| match chart.lanes[lane.index()].get(note)?.kind {
+        NoteKind::Long { end, .. } => Some(end),
+        NoteKind::Tap | NoteKind::Mine { .. } => None,
+    };
+    match ev.kind {
+        JudgeEventKind::Judged {
+            lane,
+            note,
+            deviation,
+            release,
+            ..
+        } => {
+            notes.set_done(lane, note);
+            let Some(end) = end_of(lane, note) else {
+                return;
+            };
+            if deviation.is_some() && release.is_none() && ev.time < end {
+                notes.set_hold(
+                    lane,
+                    Some(NoteHold {
+                        note,
+                        start: ev.time,
+                        end,
+                    }),
+                );
+            } else if notes.hold(lane).is_some_and(|h| h.note == note) {
+                // Its completion ends its hold.
+                notes.set_hold(lane, None);
+            }
+        }
+        JudgeEventKind::LnHeld { lane, note, .. } => {
+            notes.set_done(lane, note);
+            if let Some(end) = end_of(lane, note) {
+                notes.set_hold(
+                    lane,
+                    Some(NoteHold {
+                        note,
+                        start: ev.time,
+                        end,
+                    }),
+                );
+            }
+        }
+        JudgeEventKind::LnHoldEnded { lane, note } => {
+            if notes.hold(lane).is_some_and(|h| h.note == note) {
+                notes.set_hold(lane, None);
+            }
+        }
+        JudgeEventKind::MineHit { lane, note } => notes.set_done(lane, note),
+        JudgeEventKind::EmptyPoor { .. }
+        | JudgeEventKind::PlaySound { .. }
+        | JudgeEventKind::Gauge { .. }
+        | JudgeEventKind::SongEnd => {}
     }
 }
 
@@ -307,6 +369,11 @@ pub struct Harness {
     pub view: LaneView,
     /// The frames' readouts; `None` gives [`readouts_for`] the view.
     pub readouts: Option<FrameReadouts>,
+    /// The chart, which [`follow`] reads.
+    pub chart: Chart,
+    /// The note facts each frame gives, following its effects
+    /// ([`follow`]) unless a test changes them.
+    pub notes: NoteFacts,
 }
 
 impl Harness {
@@ -328,6 +395,8 @@ impl Harness {
             layout: Layout::AUTHOR,
             view: VIEW,
             readouts: None,
+            chart: chart.clone(),
+            notes: NoteFacts::new(chart),
         }
     }
 
@@ -345,6 +414,9 @@ impl Harness {
     /// Builds the frame at `now_us` with `effects`.
     pub fn try_frame_us(&mut self, now_us: i64, effects: &[JudgeEvent]) -> Result<(), BuildError> {
         self.batch.clear();
+        for ev in effects {
+            follow(&mut self.notes, &self.chart, ev);
+        }
         let frame = SkinFrame {
             now: TimeUs(now_us),
             display_offset: self.offset,
@@ -352,6 +424,7 @@ impl Harness {
             gauges: &self.gauges,
             gauge: self.gauge,
             effects,
+            notes: &self.notes,
             complete: self.complete,
             target: self.target,
             layout: &self.layout,

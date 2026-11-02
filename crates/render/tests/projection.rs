@@ -571,6 +571,7 @@ fn one_renderer_resized_minimized_and_restored() {
             combo: 1,
         },
     };
+    let v = common::with_notes(v, &chart, &[judged]);
     assert!(
         r.frame(&input(&v, now, TimeUs(0), &[judged]))
             .unwrap()

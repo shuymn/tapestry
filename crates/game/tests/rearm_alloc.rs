@@ -104,6 +104,7 @@ fn repeated_rearms_allocate_nothing_and_hold_memory_flat() {
     counting::self_check();
     let before = counting::calls();
     let mut effects = 0;
+    let mut judged = 0;
     for round in 0..60 {
         // The candidate judges a press early in its READY; every other
         // candidate's effects are left queued for the screen when it is
@@ -113,8 +114,12 @@ fn repeated_rearms_allocate_nothing_and_hold_memory_flat() {
             batch(&mut set, at, key1, i32::from(k % 2 == 0));
             logic.advance_to(TimeUs(at - origin));
         }
+        // Every other round a frame acquires the candidate's view, its
+        // note facts copied into the render side's buffer: the judged tap.
         if round % 2 == 0 {
-            side.drain_effects(|_| effects += 1);
+            let v = side.acquire(1_024, |_| effects += 1).unwrap();
+            assert_eq!(v.generation, round);
+            judged += usize::from(v.notes.is_done(lane(1), 0));
         }
         // START held: the input side cancels the candidate.
         at += MS;
@@ -145,8 +150,13 @@ fn repeated_rearms_allocate_nothing_and_hold_memory_flat() {
         logic.restore_readers(set.take_readers());
         logic.rearm(&next, TimeUs(origin));
         while sounds.commands().pop().is_ok() {}
-        // The cancelled candidate's effects never reach the screen.
-        side.drain_effects(|_| panic!("a cancelled candidate's effect"));
+        // The cancelled candidate's effects never reach the screen, and
+        // the rearmed one's view has its facts reset.
+        let v = side
+            .acquire(1_024, |_| panic!("a cancelled candidate's effect"))
+            .unwrap();
+        assert_eq!(v.generation, round + 1);
+        assert!(!v.notes.is_done(lane(1), 0));
         if history.len() == replay::MAX_CANCELLED_OPENINGS {
             history.clear();
         }
@@ -155,6 +165,7 @@ fn repeated_rearms_allocate_nothing_and_hold_memory_flat() {
     counting::track(false);
     assert_eq!(calls, 0);
     assert!(effects > 0, "each candidate judged");
+    assert_eq!(judged, 30, "a view without its judged tap");
     assert_eq!(side.rearms(), 60);
     assert_eq!((history.reserved(), set.snapshot_capacity()), reserved);
 }

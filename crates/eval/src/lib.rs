@@ -49,6 +49,7 @@ mod evaluator;
 mod gauge;
 mod input;
 mod merge;
+mod notes;
 
 // Lint fixtures under the crate-root lints and `clippy.toml`: `cargo xtask
 // check-lints`.
@@ -71,3 +72,4 @@ pub use input::{
     Section, SourceId, SourceProfile, evaluation_time, window_inputs,
 };
 pub use merge::{Published, SourceState, StageError, Staged, merge, watermark};
+pub use notes::{NoteFacts, NoteHold};
