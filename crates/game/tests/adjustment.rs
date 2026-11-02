@@ -1380,3 +1380,26 @@ fn axis_steps_stay_wide_until_the_result_is_clamped() {
     rig.at(2 * MS).ev(axis(1 << 31)).ev(axis(-((1 << 31) - 1)));
     assert_eq!(g(&rig.snap()), 301);
 }
+
+#[test]
+fn same_time_axis_steps_cancel_exactly_at_the_i64_bounds() {
+    let q = AxisQuantum::per_step(1).unwrap();
+    let axis = |delta| Event::Axis {
+        control: AXIS,
+        delta,
+        quantum: q,
+    };
+    for (deltas, expected) in [
+        (&[i64::MIN, i64::MAX][..], 299),
+        (&[i64::MAX, 1, -i64::MAX][..], 301),
+    ] {
+        let mut rig = Rig::prepared(PlayOptions::default(), constant(150));
+        rig.at(0).press(SELECT);
+        rig.at(MS).ev(axis(0));
+        rig.at(2 * MS);
+        for &d in deltas {
+            rig.ev(axis(d));
+        }
+        assert_eq!(g(&rig.snap()), expected, "{deltas:?}");
+    }
+}

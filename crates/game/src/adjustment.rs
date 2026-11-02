@@ -311,23 +311,24 @@ struct AxisState {
 struct Group {
     open: bool,
     time: TimeUs,
-    /// Mode steps: + faster.
-    coarse: i64,
+    /// Mode steps: + faster. Every sum is wide enough that requests within
+    /// `i64` cancel exactly; only the resulting setting is clamped.
+    coarse: i128,
     /// Hundredths: + faster.
-    fine: i64,
+    fine: i128,
     /// Green units: + longer.
-    green: i64,
+    green: i128,
     /// `Cover(δ)`, ‰.
-    cover: i64,
+    cover: i128,
 }
 
 /// One request, signed toward faster, a longer green number or `Cover(δ)`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Request {
-    Coarse(i64),
-    Fine(i64),
-    Green(i64),
-    Cover(i64),
+    Coarse(i128),
+    Fine(i128),
+    Green(i128),
+    Cover(i128),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -651,7 +652,9 @@ impl Adjustment {
                     self.act(role, 1, time);
                 }
             }
-            _ => self.act(role, AUX_COVER_STEP, time),
+            _ => {
+                self.act(role, AUX_COVER_STEP, time);
+            }
         }
     }
 
@@ -813,21 +816,18 @@ impl Adjustment {
             .saturating_add(i128::from(delta) * i128::from(quantum.steps));
         let n = state.remainder / counts;
         state.remainder -= n * counts;
-        let n = i64::try_from(n).unwrap_or(if n < 0 { i64::MIN } else { i64::MAX });
-        if n > 0 {
+        if n != 0 {
             self.act_steps(Role::ScratchPositive, n, 1, time);
-        } else if n < 0 {
-            self.act_steps(Role::ScratchNegative, n.saturating_neg(), 1, time);
         }
     }
 
-    fn act(&mut self, role: Role, cover_step: i64, time: TimeUs) {
-        self.act_steps(role, 1, cover_step, time);
+    fn act(&mut self, role: Role, cover_step: i64, time: TimeUs) -> Option<Request> {
+        self.act_steps(role, 1, cover_step, time)
     }
 
     /// `n` steps of `role` under the current modifiers, into the group at
-    /// `time`.
-    fn act_steps(&mut self, role: Role, n: i64, cover_step: i64, time: TimeUs) {
+    /// `time`: the request added, if any.
+    fn act_steps(&mut self, role: Role, n: i128, cover_step: i64, time: TimeUs) -> Option<Request> {
         let mods = self.mods();
         let floating = self.options.hispeed().mode == SpeedMode::Floating;
         let target = self.target().is_some();
@@ -841,7 +841,7 @@ impl Adjustment {
             Role::White | Role::Slower | Role::AuxNegative | Role::ScratchNegative => -1,
         };
         let request = match (mods, role) {
-            (Mods::Both, _) | (_, Role::Start | Role::Select) => return,
+            (Mods::Both, _) | (_, Role::Start | Role::Select) => return None,
             (_, Role::Slower | Role::Faster) | (Mods::Start, Role::White | Role::Black) => {
                 Request::Coarse(n.saturating_mul(sign))
             }
@@ -854,12 +854,15 @@ impl Adjustment {
                 | Role::ScratchNegative,
             ) => {
                 if target {
-                    Request::Cover(n.saturating_mul(cover_step).saturating_mul(sign))
+                    Request::Cover(
+                        n.saturating_mul(i128::from(cover_step))
+                            .saturating_mul(sign),
+                    )
                 } else {
                     Request::Fine(n.saturating_mul(sign))
                 }
             }
-            _ => return,
+            _ => return None,
         };
         let g = &mut self.group;
         if !g.open {
@@ -876,6 +879,7 @@ impl Adjustment {
             Request::Cover(by) => (&mut g.cover, by),
         };
         *field = field.saturating_add(by);
+        Some(request)
     }
 
     /// Applies the open group as one transaction: speed, then the target
@@ -902,11 +906,12 @@ impl Adjustment {
                 } else {
                     h.classic_step_x100
                 });
+                // Past `i64` any step reaches an end already.
                 let by = group
                     .coarse
-                    .checked_mul(step)
-                    .and_then(|c| c.checked_add(group.fine))
-                    .ok_or(Unrepresentable)?;
+                    .saturating_mul(i128::from(step))
+                    .saturating_add(group.fine);
+                let by = i64::try_from(by).unwrap_or(if by < 0 { i64::MIN } else { i64::MAX });
                 let next = step_hispeed(current, by)?;
                 if !floating {
                     h.classic_hispeed_x100 = next.hundredths().ok_or(Unrepresentable)?;
@@ -914,8 +919,8 @@ impl Adjustment {
                 hispeed = Some(next);
             }
             if group.green != 0 {
-                let g = i64::from(h.green_target).saturating_add(group.green);
-                let g = g.clamp(i64::from(GREEN_TARGETS.0), i64::from(GREEN_TARGETS.1));
+                let g = i128::from(h.green_target).saturating_add(group.green);
+                let g = g.clamp(i128::from(GREEN_TARGETS.0), i128::from(GREEN_TARGETS.1));
                 h.green_target = u32::try_from(g).map_err(|_| Unrepresentable)?;
                 solve_needed = true;
             }
@@ -928,9 +933,9 @@ impl Adjustment {
                 } else {
                     group.cover.saturating_neg()
                 };
-                let amount = i64::from(cover.amount)
+                let amount = i128::from(cover.amount)
                     .saturating_add(by)
-                    .clamp(0, i64::from(MAX_COVER));
+                    .clamp(0, i128::from(MAX_COVER));
                 cover.amount = u16::try_from(amount).map_err(|_| Unrepresentable)?;
                 solve_needed |= floating && kind != CoverKind::Hidden;
             }
