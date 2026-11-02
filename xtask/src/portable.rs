@@ -37,6 +37,12 @@ pub fn run(manifest: &Path, args: &[OsString]) -> ExitCode {
         eprintln!("xtask portable: missing cargo command (e.g. `cargo xtask portable test`)");
         return ExitCode::from(2);
     }
+    if args.len() == 1 && args[0] == "nextest" {
+        eprintln!(
+            "xtask portable: missing nextest command (e.g. `cargo xtask portable nextest run`)"
+        );
+        return ExitCode::from(2);
+    }
     let excludes = match windows_only_packages(manifest) {
         Ok(excludes) => excludes,
         Err(e) => {
@@ -64,10 +70,11 @@ pub fn run(manifest: &Path, args: &[OsString]) -> ExitCode {
 /// its own command), then the package selection, then the rest of `args`.
 fn cargo_args(args: &[OsString], excludes: &[String]) -> Vec<OsString> {
     let commands = match args.first() {
-        Some(first) if first == "nextest" => 2.min(args.len()),
+        Some(first) if first == "nextest" => 2,
         Some(_) => 1,
         None => 0,
-    };
+    }
+    .min(args.len());
     let (command, rest) = args.split_at(commands);
     let mut out = command.to_vec();
     out.push("--workspace".into());
