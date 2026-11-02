@@ -759,6 +759,7 @@ impl Hook {
     /// within the buffers `rearm` carries. Allocates nothing.
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn rearm(&mut self, sources: &mut SourceSet, now: TimeUs, rearm: &mut Rearm) {
+        rearm.leftover.clear();
         let Some(old) = self.origin else {
             rearm.outcome = RearmOutcome::Refused;
             return;
@@ -768,7 +769,6 @@ impl Hook {
             return;
         }
         // Everything the sealed opening still holds, in source order.
-        rearm.leftover.clear();
         let mut fits = true;
         for reader in &mut rearm.readers {
             while let Some(ev) = reader.pop() {
@@ -2386,5 +2386,96 @@ mod gate_tests {
         let rearm = link.rearmed.pop().unwrap();
         assert_eq!(rearm.outcome, RearmOutcome::Refused);
         assert_eq!(gate.state().generation, 1, "nothing was armed");
+    }
+
+    /// The same refusal through the player's gate, with one event of room
+    /// left in the history and two arriving between its drain and the
+    /// input side's boundary: the capture is sealed, and the history the
+    /// record saves keeps the one that fits.
+    #[test]
+    fn a_refused_rearm_keeps_in_the_capture_what_fits_the_history() {
+        let mut sources = SourceSet::new(SourceConfig {
+            max_devices: 4,
+            max_sources: 4,
+            max_held: 4,
+            queue_capacity: 16,
+            max_arrivals: 4,
+        })
+        .unwrap();
+        sources.begin_batch(TimeUs(0));
+        sources.connect(DeviceId(1), DeviceKind::Keyboard);
+        sources.connect(DeviceId(2), DeviceKind::Keyboard);
+        sources.end_batch(TimeUs(1));
+        let controls = Arc::new(Controls::new(QpcClock::start()));
+        controls.set_latch(sources.gate().handle());
+        let (mut hook, mut link) = link(controls, Mode::Clock, Waker::new().unwrap());
+        let mut gate = crate::start_gate::PlayerGate::install(
+            &link,
+            AdjustmentBindings {
+                controls: vec![(TapControl::Key(Q), 0)],
+                latched: 1,
+                wrap: None,
+            },
+        )
+        .unwrap();
+        let opening = open(&mut hook, &link, &mut sources, 10).unwrap();
+        gate.opened(1, &opening);
+        batch(&mut hook, &mut sources, 20, &[packet(1, Q, 1)]);
+        assert_eq!(gate.state().phase, GatePhase::Cancelled);
+        batch(&mut hook, &mut sources, 40, &[packet(1, Q, 0)]);
+        // The history: the cancelled opening begun, one event of room left.
+        let mut history = game::HistoryRecorder::new(4);
+        history.begin(&opening.start, opening.origin).unwrap();
+        let filler = eval::PhysicalInputEvent {
+            received: TimeUs(0),
+            source: SourceId(0),
+            kind: InputKind::Disconnected,
+        };
+        history
+            .take(&vec![filler; replay::MAX_CANCELLED_EVENTS - 1])
+            .unwrap();
+        assert_eq!(history.room(), 1);
+        let mut readers = opening.readers;
+        let mut start = InputStart {
+            opened_at: TimeUs(0),
+            held: Vec::with_capacity(opening.start.held.capacity()),
+        };
+        let answer = std::thread::scope(|s| {
+            // The input thread: Z pressed and released after the game
+            // thread's drain, at the boundary that takes the rearm.
+            s.spawn(|| {
+                while hook.rearms.is_empty() {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                batch(
+                    &mut hook,
+                    &mut sources,
+                    50,
+                    &[packet(2, Z, 1), packet(2, Z, 0)],
+                );
+            });
+            gate.rearm(
+                &mut link,
+                &mut readers,
+                LEAD_IN,
+                2,
+                &mut history,
+                &mut start,
+            )
+        });
+        assert_eq!(answer, Ok(game::Rearm::Held));
+        assert!(history.exhausted(), "the capture was not sealed");
+        let saved = history.history(opening.origin);
+        assert_eq!(
+            saved.events.last().map(|e| (e.source, e.kind)),
+            Some((
+                SourceId(1),
+                InputKind::Control {
+                    control: Z,
+                    value: 1
+                }
+            )),
+            "the event that fits was dropped"
+        );
     }
 }

@@ -243,7 +243,8 @@ impl PlayerGate {
     /// takes what came since at its boundary, and the sealed opening is
     /// kept with its closing time and arrivals before the next candidate's
     /// snapshot is copied into `start`. A history that ran out, or buffers
-    /// the input side found too small, seals the capture: nothing opens.
+    /// the input side found too small, seals the capture with every event
+    /// that fits: nothing opens.
     ///
     /// # Errors
     ///
@@ -291,8 +292,17 @@ impl PlayerGate {
                 self.armed = generation;
                 LiveRearm::Opened { origin }
             }
-            RearmOutcome::Held | RearmOutcome::Pending => LiveRearm::Held,
+            // What the input side popped is kept as far as the history
+            // has room: the cancelled opening goes on, or, refused, its
+            // capture is sealed with every event that fits.
+            RearmOutcome::Held | RearmOutcome::Pending => {
+                if history.take(&rearm.leftover).is_err() {
+                    history.exhaust();
+                }
+                LiveRearm::Held
+            }
             RearmOutcome::Refused => {
+                let _ = history.take(&rearm.leftover);
                 history.exhaust();
                 LiveRearm::Held
             }
