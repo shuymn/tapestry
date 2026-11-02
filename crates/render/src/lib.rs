@@ -62,8 +62,8 @@ pub use gpu::{AdapterChoice, Gpu};
 pub use overlay::{OVERLAY_RUNS, OVERLAY_SPRITES};
 pub use projection::{ClipError, ClipTable, MAX_CLIPS, Projection};
 pub use renderer::{
-    CommitError, FrameTiming, MAX_SPRITES, MemoryWitness, PreparedToken, RenderError, Renderer,
-    Target, letterbox,
+    CommitError, FrameTiming, LoadingTextError, LoadingTextKey, MAX_SPRITES, MemoryWitness,
+    PreparedToken, RenderError, Renderer, Target, letterbox,
 };
 pub use simple::{
     RESULT_CELL_COLUMN, RESULT_GAUGE_ROW, SimpleSkin, layout, result_graphs, result_screen,

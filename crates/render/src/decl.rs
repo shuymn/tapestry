@@ -19,13 +19,14 @@
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use bms_model::{Chart, TimeUs};
 use eval::Section;
 use skin_model::{
     Atlas, BuildError, Canvas, ChartText, CoverSettings, FrameReadouts, LaneView, Layout, Loading,
-    Page, Play, Side, Skin, SkinFrame, TextTable, UvTable,
+    Page, Play, Side, Skin, SkinFrame, TextSlots, TextTable, TextTableError, UvTable,
 };
 
 use crate::projection::ClipTable;
@@ -244,9 +245,14 @@ impl SkinBundle {
 #[derive(Clone)]
 pub struct LoadingPresentation(Arc<Mutex<Presented>>);
 
+/// The number the next [`LoadingPresentation`] takes: each has its own.
+static PRESENTATIONS: AtomicU64 = AtomicU64::new(0);
+
 /// What a [`LoadingPresentation`] holds.
 #[derive(Debug)]
 struct Presented {
+    /// Its number, never another presentation's.
+    id: u64,
     loading: Loading,
     /// The lifetime the state belongs to; `None` until its first frame.
     lifetime: Option<u64>,
@@ -271,6 +277,7 @@ impl LoadingPresentation {
     #[must_use]
     pub fn new(bundle: &SkinBundle) -> Self {
         Self(Arc::new(Mutex::new(Presented {
+            id: PRESENTATIONS.fetch_add(1, Ordering::Relaxed),
             loading: bundle.skin.prepare_loading(bundle.scratch),
             lifetime: None,
             built: false,
@@ -285,6 +292,28 @@ impl LoadingPresentation {
     #[must_use]
     pub fn same(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
+    }
+
+    /// The presentation's number: what its loading text is checked
+    /// against ([`crate::LoadingTextKey`]).
+    #[must_use]
+    pub fn id(&self) -> u64 {
+        self.lock().id
+    }
+
+    /// Installs `table`'s lines into the slots `which` names, from the next
+    /// frame on, as [`Skin::install_loading_text`](skin_model::Skin::install_loading_text):
+    /// the caller checked that they were laid out for this presentation
+    /// and its resources.
+    pub(crate) fn install_text(
+        &self,
+        bundle: &SkinBundle,
+        which: TextSlots,
+        table: &TextTable,
+    ) -> Result<(), TextTableError> {
+        bundle
+            .skin
+            .install_loading_text(&mut self.lock().loading, which, table)
     }
 
     /// The loading lifetime the state belongs to, `None` before its first

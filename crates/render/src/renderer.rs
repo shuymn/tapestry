@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use bms_model::Chart;
 use eval::Section;
-use skin_model::{AtlasLimits, BuildError};
+use skin_model::{AtlasLimits, BuildError, TextSlots, TextTable, TextTableError};
 use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
 use windows::Win32::Graphics::Dxgi::{DXGI_FRAME_STATISTICS, IDXGISwapChain3};
 use windows::Win32::System::Threading::WaitForSingleObject;
@@ -122,6 +122,29 @@ pub enum Target {
         /// Height in pixels.
         height: u32,
     },
+}
+
+/// What a loading text table is checked against as it installs
+/// ([`Renderer::install_loading_text`]): the installation it was prepared
+/// for, by its loading presentation, and the renderer and resources (the
+/// atlas) its lines were laid out on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LoadingTextKey {
+    installation: u64,
+    device: u64,
+    resources: u64,
+}
+
+/// Why loading text was not installed: nothing changes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum LoadingTextError {
+    /// It was prepared for another installation, or the installation's
+    /// renderer or resources were replaced since.
+    #[error("the loading text belongs to another installation or its replaced resources")]
+    Stale,
+    /// The table does not fit the skin's text slots.
+    #[error(transparent)]
+    Table(#[from] TextTableError),
 }
 
 /// Why the renderer could not start or load a chart.
@@ -1336,6 +1359,46 @@ impl Renderer {
             return Err(e);
         }
         Ok(())
+    }
+
+    /// What loading text laid out for the installation in use now is
+    /// checked against; `None` without a declarative installation.
+    #[must_use]
+    pub fn loading_text_key(&self) -> Option<LoadingTextKey> {
+        let installed = self.installed.as_ref()?;
+        Some(LoadingTextKey {
+            installation: installed.loading().id(),
+            device: self.id,
+            resources: self.resources,
+        })
+    }
+
+    /// Installs `table`'s lines into the installed presentation's slots
+    /// `which` names, from its next loading frame on, if `key` is still
+    /// the installation's ([`loading_text_key`](Self::loading_text_key)):
+    /// text prepared for another installation, or on resources since
+    /// replaced, never draws.
+    ///
+    /// # Errors
+    ///
+    /// [`LoadingTextError::Stale`] for another key, and
+    /// [`LoadingTextError::Table`] for a table that does not fit the
+    /// skin's slots: nothing changes.
+    pub fn install_loading_text(
+        &mut self,
+        key: LoadingTextKey,
+        which: TextSlots,
+        table: &TextTable,
+    ) -> Result<(), LoadingTextError> {
+        if self.loading_text_key() != Some(key) {
+            return Err(LoadingTextError::Stale);
+        }
+        let Some(installed) = self.installed.as_ref() else {
+            return Err(LoadingTextError::Stale);
+        };
+        Ok(installed
+            .loading()
+            .install_text(installed.bundle(), which, table)?)
     }
 
     /// The loading refusal kept for lifetime `lifetime`, if any.

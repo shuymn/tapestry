@@ -24,10 +24,10 @@ use common::{GAUGES, VISIBLE, attempt, context, input, offscreen, view};
 use decl_support::{ANIMATION, BACKGROUND, Look, WHEN_MARK, WHEN_SLOT, bundle};
 use render::text::MenuText;
 use render::{
-    AttemptInput, CommitError, FrameInput, Gpu, Installation, LoadingFrame, PlaySkin,
-    PreparedToken, RenderError, Renderer, SkinBundle, SkinError, Sprite, SpriteBatch,
+    AttemptInput, CommitError, FrameInput, Gpu, Installation, LoadingFrame, LoadingTextError,
+    PlaySkin, PreparedToken, RenderError, Renderer, SkinBundle, SkinError, Sprite, SpriteBatch,
 };
-use skin_model::BuildError;
+use skin_model::{BuildError, TextSlots, TextTable, TextTableError};
 
 const BLACK: [u8; 3] = [0; 3];
 const RED: [u8; 3] = [255, 0, 0];
@@ -423,6 +423,76 @@ fn a_failed_replacement_keeps_the_old_loading_frames() {
     let after = r.installation().unwrap();
     assert!(Arc::ptr_eq(after.bundle(), &a));
     assert!(after.loading().same(before.loading()));
+}
+
+/// Loading text installs only under the key of the installation in use
+/// and the renderer and resources its lines were laid out on: the same
+/// bundle's attempt keeps the key, a staging not yet committed changes
+/// nothing, and another bundle's commit, a restoration on the same
+/// renderer (its resources replaced) and one on another renderer each
+/// make the key before stale, which then installs nothing. A table that
+/// does not fit the slots is refused as such.
+#[test]
+fn loading_text_installs_only_for_its_installation() {
+    let chart = chart();
+    let dir = tempfile::tempdir().unwrap();
+    let mut r = offscreen(1_920, 1_080);
+    let lines = |b: &SkinBundle| TextTable::new(vec![None; b.skin().text_slots()]);
+    let (a, _) = bundle(
+        &r,
+        dir.path(),
+        &Look {
+            text: true,
+            ..loader()
+        },
+    );
+    let green = Look {
+        text: true,
+        ..Look::left([0, 255, 0, 255])
+    };
+    let (b, _) = bundle(&r, dir.path(), &green);
+    assert_eq!(r.loading_text_key(), None);
+    install(&mut r, &a, 1);
+    let key = r.loading_text_key().unwrap();
+    r.install_loading_text(key, TextSlots::ALL, &lines(&a))
+        .unwrap();
+    assert_eq!(
+        r.install_loading_text(key, TextSlots::ALL, &TextTable::new(Vec::new())),
+        Err(LoadingTextError::Table(TextTableError::Len {
+            expected: a.skin().text_slots(),
+            got: 0
+        }))
+    );
+    let play = stage(&mut r, &a, &chart, 2).unwrap();
+    r.commit(play).unwrap();
+    assert_eq!(r.loading_text_key(), Some(key));
+    let selection = r.install(&b, 3).unwrap();
+    assert_eq!(r.loading_text_key(), Some(key));
+    r.commit(selection).unwrap();
+    assert_eq!(
+        r.install_loading_text(key, TextSlots::ALL, &lines(&b)),
+        Err(LoadingTextError::Stale)
+    );
+    let fresh = r.loading_text_key().unwrap();
+    r.install_loading_text(fresh, TextSlots::ALL, &lines(&b))
+        .unwrap();
+    let installation = r.installation().unwrap();
+    r.restore(&installation).unwrap();
+    assert_eq!(
+        r.install_loading_text(fresh, TextSlots::ALL, &lines(&b)),
+        Err(LoadingTextError::Stale)
+    );
+    let restored = r.loading_text_key().unwrap();
+    let mut other = offscreen(1_920, 1_080);
+    other.restore(&installation).unwrap();
+    assert_eq!(
+        other.install_loading_text(restored, TextSlots::ALL, &lines(&b)),
+        Err(LoadingTextError::Stale)
+    );
+    let elsewhere = other.loading_text_key().unwrap();
+    other
+        .install_loading_text(elsewhere, TextSlots::ALL, &lines(&b))
+        .unwrap();
 }
 
 /// Loading frames follow the applied target: at 960×540 the background
