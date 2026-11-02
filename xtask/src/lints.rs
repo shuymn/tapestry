@@ -149,15 +149,7 @@ pub const IN_PLAY: &[Site] = &[
             "Note::end_pos",
         ],
     ),
-    Site::Fns(
-        "crates/bms-model/src/scroll.rs",
-        &[
-            "Position::minus",
-            "ScrollSegment::value",
-            "ScrollMap::initial_rate",
-            "ScrollMap::position_at",
-        ],
-    ),
+    Site::Fns("crates/bms-model/src/scroll.rs", &["Position::minus"]),
     Site::Fns(
         "crates/bms-model/src/timeline.rs",
         &[

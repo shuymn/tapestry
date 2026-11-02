@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bms_model::{Chart, Lane, TimeUs};
-use eval::{GaugeState, JudgeEvent, Tally};
+use eval::{GaugeState, JudgeEvent, Section, Tally};
 use game::PlayView;
 use render::text::MenuText;
 use render::{AdapterChoice, AttemptInput, FrameInput, LoadingFrame, Renderer, SkinBundle, Target};
@@ -40,10 +40,12 @@ pub fn offscreen(width: u32, height: u32) -> Renderer {
 }
 
 /// A renderer on WARP ([`offscreen`], [`WIDTH`]×[`HEIGHT`]) with `chart`
-/// loaded.
+/// loaded and a whole-chart attempt prepared ([`prepare`]), as a play
+/// prepares one before its frames.
 pub fn warp(chart: &Chart) -> Renderer {
     let mut r = offscreen(WIDTH, HEIGHT);
     r.load(chart, None).expect("load the chart");
+    prepare(&mut r, chart);
     r
 }
 
@@ -98,6 +100,17 @@ pub fn prepare(r: &mut Renderer, chart: &Chart) {
     let ctx = context(&GAUGES, false);
     r.prepare_attempt(&attempt(r, chart, &ctx))
         .expect("prepare the attempt");
+}
+
+/// Prepares the play skin in use for a practice round of `chart` over
+/// `section`, which gives [`GAUGES`] their initial values.
+pub fn prepare_section(r: &mut Renderer, chart: &Chart, section: &Section) {
+    let ctx = PlayContext {
+        attempt: Attempt::Section(section),
+        ..context(&GAUGES, false)
+    };
+    r.prepare_attempt(&attempt(r, chart, &ctx))
+        .expect("prepare the round");
 }
 
 pub fn view(combo: u32, ex_score: u32) -> PlayView {

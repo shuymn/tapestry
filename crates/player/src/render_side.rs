@@ -3820,6 +3820,62 @@ pub(crate) mod tests {
         link.exit();
     }
 
+    /// The default skin's refusal of an attempt (a chart row past its
+    /// exact playhead's domain) through a real menu screen and renderer on
+    /// WARP: the attempt is refused with the skin's reason, no failure is
+    /// reported, the screen is not built again, and the next attempt is
+    /// ready on it.
+    #[test]
+    fn the_default_skins_refusal_keeps_the_screen() {
+        let builds = Arc::new(AtomicU32::new(0));
+        let made = Arc::clone(&builds);
+        let make: MakeScreen = Box::new(move || {
+            made.fetch_add(1, Ordering::SeqCst);
+            let renderer = render::Renderer::new(
+                render::Target::Offscreen {
+                    width: 1_920,
+                    height: 1_080,
+                },
+                render::AdapterChoice::Warp,
+            )?;
+            Ok(Box::new(crate::menu_screen::MenuScreen::new(renderer, None)) as Box<dyn Screen>)
+        });
+        let link = spawn_empty(make);
+        let key = Lane::new(1).unwrap();
+        let past = Arc::new(
+            ChartBuilder::new(120_000)
+                .tap(key, TimeUs(bms_model::DOMAIN + 1))
+                .build()
+                .unwrap(),
+        );
+        link.load(Arc::clone(&past), None).unwrap();
+        let refused = link.prepare_attempt(attempt(&past, None), || false);
+        let Ok(Preparation::Refused(why)) = refused else {
+            panic!("{refused:?}");
+        };
+        assert!(
+            why.reason.contains("outside the playhead's range"),
+            "{why:?}"
+        );
+        assert!(!link.failed(), "a refusal reported a failure");
+        let chart = Arc::new(
+            ChartBuilder::new(120_000)
+                .tap(key, TimeUs(2_000_000))
+                .build()
+                .unwrap(),
+        );
+        link.load(Arc::clone(&chart), None).unwrap();
+        let ready = link.prepare_attempt(attempt(&chart, None), || false);
+        assert_eq!(ready.unwrap(), Preparation::Ready);
+        assert!(!link.failed());
+        assert_eq!(
+            builds.load(Ordering::SeqCst),
+            1,
+            "the screen was built again"
+        );
+        link.exit();
+    }
+
     /// A screen whose chart preparation blocks while `hold` is set.
     struct Held(Arc<AtomicBool>);
 
