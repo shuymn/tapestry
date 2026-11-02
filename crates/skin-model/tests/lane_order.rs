@@ -9,13 +9,16 @@
 mod lanes_support;
 mod play_support;
 
-use bms_model::{Chart, ChartBuilder, TimeUs};
+use bms_model::{Chart, ChartBuilder, Position, TimeUs};
+use eval::Section;
 use lanes_support::{
     BAR, BODY_OFF, BODY_ON, HEAD, LINE, MINE, NOTE, TAIL, lanes_element, lanes_skin, simple,
     skin_with, source,
 };
 use play_support::{Harness, MS, REGIONS, full, lane};
-use skin_model::{LANE_QUADS, LaneStyle, LanesDef, LanesError, LoadError, NoteOrder};
+use skin_model::{
+    Attempt, LANE_QUADS, LaneStyle, LanesDef, LanesError, LoadError, NoteOrder, PlayContext,
+};
 
 /// 150 BPM, in thousandths.
 const BPM: i64 = 150_000;
@@ -56,40 +59,31 @@ fn lanes_drawn(h: &Harness) -> Vec<usize> {
         .collect()
 }
 
-/// The drawn quads as `(lane, y)`, in draw order.
-fn drawn(h: &Harness) -> Vec<(usize, f32)> {
-    lanes_drawn(h)
-        .into_iter()
-        .zip(h.batch.quads())
-        .map(|(l, q)| (l, q.rect[1]))
-        .collect()
-}
-
-/// Whether `seq` follows `order`: lane by lane in index order with each
-/// lane's notes from the line up, or every note from the line up (a
-/// later note is higher, so `y` falls), ties by the lane's rank.
-fn ordered(seq: &[(usize, f32)], order: NoteOrder) -> bool {
-    match order {
-        NoteOrder::LaneMajor => seq
-            .windows(2)
-            .all(|w| w[0].0 < w[1].0 || (w[0].0 == w[1].0 && w[0].1 > w[1].1)),
-        NoteOrder::Timeline { lanes } => {
-            let rank = |l: usize| lanes.iter().position(|&x| usize::from(x) == l).unwrap();
-            seq.windows(2)
-                .all(|w| w[0].1 > w[1].1 || (w[0].1 == w[1].1 && rank(w[0].0) < rank(w[1].0)))
+/// The lanes of the notes a frame paints under `order`, enumerated from
+/// `chart` outside the build: every note of `notes` (the frame's
+/// candidates, all in view) inside `section`, sorted lane by lane by
+/// `(lane, index)`, or under a timeline order by the exact integer key
+/// `(position, time, rank, index in the lane)`.
+fn expected(chart: &Chart, order: NoteOrder, section: Option<(TimeUs, TimeUs)>) -> Vec<usize> {
+    let mut cands: Vec<(Position, TimeUs, usize, usize, usize)> = Vec::new();
+    for (l, notes) in chart.lanes.iter().enumerate() {
+        for (i, n) in notes.iter().enumerate() {
+            if section.is_none_or(|(s, e)| s <= n.time && n.time < e) {
+                let rank = match order {
+                    NoteOrder::LaneMajor => l,
+                    NoteOrder::Timeline { lanes } => {
+                        lanes.iter().position(|&x| usize::from(x) == l).unwrap()
+                    }
+                };
+                cands.push((n.pos, n.time, rank, i, l));
+            }
         }
     }
-}
-
-/// Taps over every lane: at each of 30 times 50 ms apart from 1 000 ms,
-/// three lanes, a different three each time.
-fn chords() -> Chart {
-    let mut b = ChartBuilder::new(BPM);
-    for k in 0..90_u16 {
-        let t = 1_000 * MS + i64::from(k / 3) * 50 * MS;
-        b = b.tap(lane(u8::try_from((3 * k + k / 24) % 8).unwrap()), TimeUs(t));
+    match order {
+        NoteOrder::LaneMajor => cands.sort_by_key(|&(.., rank, i, _)| (rank, i)),
+        NoteOrder::Timeline { .. } => cands.sort_by_key(|&(p, t, rank, i, _)| (p, t, rank, i)),
     }
-    b.build().unwrap()
+    cands.into_iter().map(|c| c.4).collect()
 }
 
 const ORDERS: [NoteOrder; 3] = [
@@ -100,38 +94,83 @@ const ORDERS: [NoteOrder; 3] = [
     },
 ];
 
+/// Taps from 1 100 to 1 450 ms, all in view at 1 000 ms, with the keys'
+/// collisions: lane 1's and lane 2's at one µs, lane 1's one position
+/// later; lane 4's a µs after the chord of lanes 0, 3 and 7 at 1 300 ms,
+/// at its position; lane 5 empty; lane 0's first and lane 6's last
+/// outside the section of [`SECTION`].
+fn collisions() -> Chart {
+    let at = |ms: i64| TimeUs(ms * MS);
+    let mut chart = ChartBuilder::new(BPM)
+        .tap(lane(0), at(1_100))
+        .tap(lane(0), at(1_300))
+        .tap(lane(0), at(1_350))
+        .tap(lane(1), at(1_250))
+        .tap(lane(2), at(1_250))
+        .tap(lane(2), at(1_350))
+        .tap(lane(3), at(1_300))
+        .tap(lane(4), TimeUs(1_300 * MS + 1))
+        .tap(lane(6), at(1_150))
+        .tap(lane(6), at(1_350))
+        .tap(lane(6), at(1_450))
+        .tap(lane(7), at(1_300))
+        .tap(lane(7), at(1_350))
+        .build()
+        .unwrap();
+    let pos = |chart: &Chart, l: usize, i: usize| chart.lanes[l][i].pos;
+    chart.lanes[1][0].pos = Position(pos(&chart, 2, 0).0 + 1);
+    chart.lanes[4][0].pos = pos(&chart, 3, 0);
+    chart
+}
+
+/// The section the oracle's sectioned frames play: from 1 200 to
+/// 1 400 ms.
+const SECTION: (i64, i64) = (1_200, 1_400);
+
 #[test]
-fn notes_are_painted_in_the_lanes_note_order() {
-    // Both styles in every order: the frame's notes, each drawn once, in
-    // the order's sequence; the timeline orders paint a later note of an
-    // earlier lane after an earlier note of a later one, which lane by
-    // lane does not.
+fn notes_are_painted_in_the_order_s_exact_sequence() {
+    // Both styles in every order, the whole chart and a section: every
+    // quad's image, so its lane, in the oracle's sequence, no note left
+    // out or added.
+    let section = Section {
+        start: TimeUs(SECTION.0 * MS),
+        end: TimeUs(SECTION.1 * MS),
+        lead_in: TimeUs(500 * MS),
+        initial_gauges: vec![rules::GaugeValue::FULL; 2],
+    };
+    let sectioned = PlayContext {
+        attempt: Attempt::Section(&section),
+        ..full(0)
+    };
+    let chart = collisions();
     for style in [simple(), source()] {
         let name = match style.style {
             LaneStyle::Simple => "simple",
             LaneStyle::Source(_) => "source",
         };
-        let mut seen = Vec::new();
         for order in ORDERS {
-            let mut h = Harness::new(
-                lanes_skin(coincident(style.clone(), order)),
-                &chords(),
-                &full(0),
-            );
-            h.frame(900, &[]);
-            let seq = drawn(&h);
-            assert!(seq.len() > 20, "{name} {order:?}: {}", seq.len());
-            assert!(ordered(&seq, order), "{name} {order:?}: {seq:?}");
-            for other in ORDERS.into_iter().filter(|&o| o != order) {
-                assert!(!ordered(&seq, other), "{name} {order:?} as {other:?}");
+            for (ctx, bounds) in [
+                (full(0), None),
+                (sectioned, Some((section.start, section.end))),
+            ] {
+                let mut h =
+                    Harness::new(lanes_skin(coincident(style.clone(), order)), &chart, &ctx);
+                h.frame(1_000, &[]);
+                let want = expected(&chart, order, bounds);
+                assert_eq!(
+                    lanes_drawn(&h),
+                    want,
+                    "{name} {order:?} section {}",
+                    bounds.is_some()
+                );
             }
-            let mut set = seq.clone();
-            set.sort_by(|a, b| a.partial_cmp(b).unwrap());
-            seen.push(set);
         }
-        // The same notes in every order.
-        assert!(seen.windows(2).all(|w| w[0] == w[1]), "{name}");
     }
+    // The collisions decide: under the source's order lane 2 before lane
+    // 1 (an earlier position at one µs), lane 4 after the chord (a later
+    // µs at one position).
+    let want = expected(&chart, NoteOrder::SOURCE, None);
+    assert_eq!(want, [0, 6, 2, 1, 3, 7, 0, 4, 2, 6, 7, 0, 6]);
 }
 
 #[test]
@@ -231,7 +270,12 @@ fn the_quad_budget_keeps_the_order_s_prefix() {
             }
         };
         assert_eq!(lanes, want, "{order:?}");
-        assert!(ordered(&drawn(&h), order), "{order:?}");
+        // The oracle's sequence cut at the budget.
+        assert_eq!(
+            lanes,
+            expected(&chart, order, None)[..LANE_QUADS as usize],
+            "{order:?}"
+        );
     }
 }
 

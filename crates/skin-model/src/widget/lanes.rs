@@ -939,7 +939,7 @@ impl Lanes {
         let Some(notes) = play.notes() else {
             return true;
         };
-        if play.done(l.index, i) {
+        if play.done(l.lane.index(), i) {
             return true;
         }
         let (x, w, line) = (l.x, l.w, f32_of(scale.line_y));
@@ -1185,7 +1185,6 @@ impl<'n> LaneCursor<'n> {
 /// One lane's notes, geometry and parts for a frame's pass.
 struct LaneOf<'n> {
     lane: Lane,
-    index: usize,
     list: &'n [Note],
     lo: usize,
     hi: usize,
@@ -1223,7 +1222,6 @@ impl<'n> LaneOf<'n> {
         };
         Some(Self {
             lane,
-            index: l,
             list,
             lo,
             hi,
@@ -1252,6 +1250,8 @@ mod tests {
             size_of::<LaneCursor<'static>>()
         );
         assert!(n <= 8 * 256, "{n}");
+        let heads = size_of::<[Option<(Position, TimeUs, u8, usize)>; LANE_COUNT]>();
+        println!("heads: {heads} B");
         println!("loaded lanes: {} B", size_of::<Lanes>());
     }
 }
