@@ -386,6 +386,9 @@ jobs:
         with:
           persist-credentials: false
       - uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa # v23
+      # The wrapper self-test enters the `fuzz` shell too.
+      - name: Prepare the dev shells
+        run: scripts/nix-prepare.sh default fuzz
       - name: Test (portable crates, dev shell)
         run: scripts/wsl.sh cargo xtask portable test --locked
       - name: Wrapper self-test
@@ -403,6 +406,8 @@ jobs:
         with:
           persist-credentials: false
       - uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa # v23
+      - name: Prepare the dev shell
+        run: scripts/nix-prepare.sh fuzz
       - name: Build fuzz targets
         run: TAPESTRY_NIX_SHELL=fuzz scripts/wsl.sh scripts/fuzz.sh build
       # A panic, a hang and each memory limit fail a run, seen from outside
