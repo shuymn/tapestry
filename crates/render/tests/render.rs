@@ -252,6 +252,47 @@ fn a_rearm_draws_a_judged_note_again() {
     assert_row(&rearmed, LANE_7, 560.89);
 }
 
+/// A practice round's READY rearmed through `Renderer::rearm`: the note
+/// the cancelled candidate judged is drawn again, and the notes before and
+/// after the section stay hidden, as its load left them.
+#[test]
+fn a_rearmed_practice_round_draws_only_its_targets() {
+    let chart = ChartBuilder::new(120_000)
+        .tap(lane(7), TimeUs(1_900 * MS))
+        .tap(lane(7), TimeUs(2_000 * MS))
+        .tap(lane(7), TimeUs(2_100 * MS))
+        .build()
+        .unwrap();
+    let section = eval::Section {
+        start: TimeUs(1_950 * MS),
+        end: TimeUs(2_050 * MS),
+        lead_in: TimeUs(0),
+        initial_gauges: Vec::new(),
+    };
+    let mut r = common::offscreen(common::WIDTH, common::HEIGHT);
+    r.load(&chart, Some(&section)).unwrap();
+    let v = view(1, 2);
+    let now = TimeUs(1_800 * MS);
+    let judged = JudgeEvent {
+        seq: 0,
+        time: TimeUs(1_790 * MS),
+        origin: Some(TimeUs(1_789 * MS)),
+        kind: JudgeEventKind::Judged {
+            lane: lane(7),
+            note: 1,
+            judgment: Judgment::Perfect,
+            deviation: Some(TimeUs(-210 * MS)),
+            release: None,
+            combo: 1,
+        },
+    };
+    r.frame(&input(&v, now, TimeUs(0), &[judged])).unwrap();
+    assert_eq!(white_rows(&r.read_back(), LANE_7), Vec::<u32>::new());
+    r.rearm();
+    r.frame(&input(&v, now, TimeUs(0), &[])).unwrap();
+    assert_row(&r.read_back(), LANE_7, 560.89);
+}
+
 #[test]
 fn zero_size_target_is_one_pixel() {
     let mut r = Renderer::new(

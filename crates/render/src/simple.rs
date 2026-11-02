@@ -204,6 +204,9 @@ pub struct SimpleSkin {
     /// Notes hidden: judged taps and mines hit. A long note is never
     /// hidden; it is drawn until its end passes the judgment line.
     done: [Bits; LANE_COUNT],
+    /// A practice round's section, its span alone: the notes that are not
+    /// its targets are done from the start, a rearm included.
+    section: Option<Section>,
     /// The long-note judgment mode the notes are drawn by: LN, the only
     /// mode judged (design.md "LN Judgment Modes").
     ln_mode: LnMode,
@@ -239,6 +242,7 @@ impl SimpleSkin {
             scroll: ScrollMap::new(120_000_000, &[]).expect("120 BPM is a valid scroll"),
             held: Default::default(),
             done: Default::default(),
+            section: None,
             ln_mode: LnMode::Ln,
             active: [None; LANE_COUNT],
             pressed: [None; LANE_COUNT],
@@ -263,19 +267,32 @@ impl SimpleSkin {
         self.scroll = chart.scroll.clone();
         self.held = std::array::from_fn(|l| Bits::sized(self.lanes[l].len()));
         self.done = std::array::from_fn(|l| Bits::sized(self.lanes[l].len()));
-        if let Some(section) = section {
-            for (notes, done) in self.lanes.iter().zip(&mut self.done) {
-                for (i, note) in notes.iter().enumerate() {
-                    if !section.is_target(note) {
-                        done.set(i);
-                    }
-                }
-            }
-        }
+        self.section = section.map(|s| Section {
+            start: s.start,
+            end: s.end,
+            lead_in: s.lead_in,
+            initial_gauges: Vec::new(),
+        });
+        self.mask();
         self.active = [None; LANE_COUNT];
         self.pressed = [None; LANE_COUNT];
         self.hit = [None; LANE_COUNT];
         self.judgment = None;
+    }
+
+    /// Marks done every note that is not one of the practice section's
+    /// targets, if there is a section. Allocates nothing.
+    fn mask(&mut self) {
+        let Some(section) = &self.section else {
+            return;
+        };
+        for (notes, done) in self.lanes.iter().zip(&mut self.done) {
+            for (i, note) in notes.iter().enumerate() {
+                if !section.is_target(note) {
+                    done.set(i);
+                }
+            }
+        }
     }
 
     #[expect(
@@ -604,6 +621,7 @@ impl PlaySkin for SimpleSkin {
         for bits in self.held.iter_mut().chain(&mut self.done) {
             bits.0.fill(0);
         }
+        self.mask();
         self.active = [None; LANE_COUNT];
         self.pressed = [None; LANE_COUNT];
         self.hit = [None; LANE_COUNT];
