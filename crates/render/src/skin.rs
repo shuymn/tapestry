@@ -251,7 +251,7 @@ pub trait PlaySkin: Send {
 
     /// The loading lifetime `lifetime` is about to draw its frame,
     /// between frames: a skin whose loading state belongs to another
-    /// lifetime and was built starts it afresh, which may allocate. The
+    /// lifetime and was built starts it afresh, allocating nothing. The
     /// default keeps nothing per lifetime.
     fn enter_loading(&mut self, lifetime: u64) {
         let _ = lifetime;

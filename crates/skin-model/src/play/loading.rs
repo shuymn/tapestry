@@ -226,6 +226,20 @@ impl Loading {
         }
     }
 
+    /// Starts the state afresh in place, as
+    /// [`Skin::prepare_loading`](crate::Skin::prepare_loading) makes it:
+    /// no refusal, every timer off, every field 0 and every text slot
+    /// empty, its lanes still laid out for the same scratch side. Its
+    /// buffers are kept, so it allocates nothing.
+    pub fn reset(&mut self) {
+        self.poisoned = None;
+        self.starts.iter_mut().for_each(|s| *s = None);
+        self.ms.iter_mut().for_each(|m| *m = TIMER_OFF);
+        self.fields = [0; field::COUNT];
+        self.text.clear();
+        self.bitmap.iter_mut().for_each(|b| *b = None);
+    }
+
     /// The bytes this state holds, itself and every buffer it owns. For a
     /// memory witness; it allocates nothing.
     #[must_use]

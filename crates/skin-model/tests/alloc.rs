@@ -1985,8 +1985,10 @@ fn loading_frame<'a>(
 }
 
 /// The builds of a loading state of `loaded`, tracked: 600 frames, then a
-/// refused build and one after it. `see` is given each frame's number and
-/// quads while tracking, and must not allocate. The refused builds' errors.
+/// refused build and one after it, then the state started afresh in place
+/// (`Loading::reset`, a new loading lifetime) and built again. `see` is
+/// given each frame's number and quads while tracking, up to the refused
+/// pair's, and must not allocate. The refused builds' errors.
 fn track_loading(
     loaded: &Loaded,
     loading: &mut skin_model::Loading,
@@ -2017,6 +2019,10 @@ fn track_loading(
     let frame = loading_frame(views, descs, since, 1);
     let after = skin.build_loading(loading, &frame, &loaded.uvs, &mut batch);
     see(600, batch.quads());
+    loading.reset();
+    batch.clear();
+    skin.build_loading(loading, &frame, &loaded.uvs, &mut batch)
+        .expect("a state started afresh builds");
     TRACK.with(|t| t.set(false));
     assert_eq!(ALLOCS.load(Ordering::Relaxed), 0, "loading: allocations");
     [first, after]

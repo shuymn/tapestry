@@ -317,15 +317,15 @@ impl LoadingPresentation {
     }
 
     /// Lifetime `lifetime` draws next, between frames: a state built for
-    /// another lifetime starts afresh from `bundle`'s skin (which
-    /// allocates); one never built is taken as it is.
-    pub(crate) fn enter(&self, bundle: &SkinBundle, lifetime: u64) {
+    /// another lifetime starts afresh in place ([`Loading::reset`]),
+    /// allocating nothing; one never built is taken as it is.
+    pub(crate) fn enter(&self, lifetime: u64) {
         let mut p = self.lock();
         if p.lifetime == Some(lifetime) {
             return;
         }
         if p.built {
-            p.loading = bundle.skin.prepare_loading(bundle.scratch);
+            p.loading.reset();
             p.built = false;
         }
         p.lifetime = Some(lifetime);
@@ -528,7 +528,7 @@ impl PlaySkin for DeclSkin {
 
     /// A presentation built for another lifetime starts afresh.
     fn enter_loading(&mut self, lifetime: u64) {
-        self.loading.enter(&self.bundle, lifetime);
+        self.loading.enter(lifetime);
     }
 
     /// The installation's loading presentation, never the attempt's

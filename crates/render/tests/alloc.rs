@@ -16,8 +16,9 @@
 //! gauges changing: its first and later frames, a refused one, the frames
 //! around a resize, and a full batch with the overlay kept whole. A
 //! committed installation's loading presentation builds its first and
-//! later loading frames, and a refused one, without allocating; the load's
-//! lines are drawn in a text pass outside this count.
+//! later loading frames, a refused one, and the next lifetime's first
+//! frame, its state started afresh in place, without allocating; the
+//! load's lines are drawn in a text pass outside this count.
 //!
 //! The counting allocator counts only on the thread that opted in, so the
 //! harness's own threads do not disturb it. This file holds a single test
@@ -431,8 +432,9 @@ fn frames_do_not_allocate_from_the_first() {
 /// presentation built through the installed skin over a staging sized for
 /// it: the first loading frame (its lifetime entered before the count),
 /// the later ones advancing on the loading clock, and a refused one
-/// (covers its lanes disagree with) and the same lifetime's next, all
-/// allocating nothing.
+/// (covers its lanes disagree with) and the same lifetime's next, and the
+/// next lifetime entered and its first frame built, all allocating
+/// nothing.
 fn loading_frames() {
     let mut r = offscreen(1_920, 1_080);
     let dir = tempfile::tempdir().unwrap();
@@ -483,6 +485,25 @@ fn loading_frames() {
     );
     assert_eq!(error_allocs, 0, "a refused loading frame allocated");
     assert!(staging.instances().is_empty());
+    // The next lifetime: its state started afresh in place, then its first
+    // frame built, as the renderer's loading frame does both.
+    let next = LoadingFrame::interim(
+        2,
+        TimeUs((FRAMES + 2) * FRAME_US),
+        TimeUs(0),
+        common::VISIBLE,
+    );
+    let (second, second_allocs) = counted(|| {
+        skin.enter_loading(2);
+        staging
+            .build_loading(&mut skin, &next)
+            .map(|()| staging.instances().len())
+    });
+    assert!(second.unwrap() > 0);
+    assert_eq!(
+        second_allocs, 0,
+        "a second lifetime's first frame allocated"
+    );
 }
 
 /// A declarative skin prepared for an attempt of `chart`, as the

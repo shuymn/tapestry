@@ -1296,7 +1296,7 @@ impl Renderer {
 
     /// Loading lifetime `lifetime` draws next, between frames: a skin's
     /// loading state of another lifetime starts afresh
-    /// ([`PlaySkin::enter_loading`]), which may allocate, and a refusal of
+    /// ([`PlaySkin::enter_loading`]), in place, and a refusal of
     /// another lifetime is forgotten.
     pub fn enter_loading(&mut self, lifetime: u64) {
         if self.loading_refused.is_some_and(|(l, _)| l != lifetime) {
