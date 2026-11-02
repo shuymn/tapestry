@@ -390,7 +390,10 @@ impl Definition {
                 }
             }
             Scalar::Int(v) => i32::try_from(v).map_err(|_| range(self)),
-            Scalar::Float(v) => truncated(v).ok_or_else(|| range(self)),
+            Scalar::Float(v) => Q::float(v.trunc())
+                .and_then(Q::integer)
+                .and_then(|n| i32::try_from(n).ok())
+                .ok_or_else(|| range(self)),
             Scalar::Callable => Err(self.callable_error(id, field)),
             Scalar::Null | Scalar::Bool(_) | Scalar::Object | Scalar::Array => {
                 Err(self.type_error(id, field, "an integer"))
