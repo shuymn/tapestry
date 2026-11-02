@@ -186,6 +186,33 @@ fn audio_loop_neither_allocates_nor_frees_across_retries() {
         steps(&mut worker, 2);
         assert!(control.counters().dropped(generation), "attempt {attempt}");
     }
+    // The set-aside restore now waits to go back: a second cancel, then
+    // another play and its cancel, still free nothing.
+    control.cancel();
+    steps(&mut worker, 2);
+    let written = i64::try_from(worker.engine().written()).unwrap();
+    let origin = TimeUs(written * 1_000 / 48 + 10 * MS - 800 * MS);
+    let plan = restorer
+        .plan(control.counters().frame_line(origin), TimeUs(1_000 * MS))
+        .unwrap();
+    generation += 1;
+    gate.arm(generation);
+    let (_sink, queue) = audio_link_at(64, origin);
+    control
+        .play_gated(
+            origin,
+            queue,
+            audio::Gain::HEADROOM,
+            Some(plan),
+            transport(generation),
+        )
+        .unwrap();
+    steps(&mut worker, 2);
+    assert_eq!(gate.cancel(), Some(generation));
+    control.cancel();
+    control.cancel();
+    steps(&mut worker, 2);
+    assert!(control.counters().dropped(generation), "the last play");
     control.exit();
     counting::track(true);
     let running = worker.step(&mut out).unwrap();
