@@ -674,7 +674,7 @@ fn writes_only_between_plays(stdout: &str) {
 
 /// Hi-speed (F2) and the display offset (F6), changed during the first
 /// play through the settings keys' path, move notes only: a note 300 ms
-/// ahead of the display time sits 800 * 300 * (1/575 - 1/600) = 17.391
+/// ahead of the display time sits 800 * 300 * (1/569 - 1/600) = 21.793
 /// layout pixels higher, and both plays judge exactly as a run without the
 /// change. The second play starts with the new display offset; neither
 /// play's input offset moves.
@@ -707,13 +707,18 @@ fn hi_speed_change_moves_notes_not_judgment() {
     assert_eq!(display(&with[0]), TimeUs(0));
     assert_eq!(display(&with[1]), TimeUs(1_000));
 
-    // The same note at the same display time with 600 and 569 ms.
-    let scroll = &changed.chart.scroll;
+    // The same note (lane 1's at 2.5 s) at the same display time (2.2 s)
+    // with 600 and 569 ms: its stored position, and the playhead the
+    // attempt prepares, sampled there.
+    let chart = &changed.chart;
+    let playhead = skin_model::ExactPlayhead::prepare(chart, None).unwrap();
+    let note = chart.lanes[1][1];
+    assert_eq!(note.time, TimeUs(2_500_000));
     let y = |visible| {
         render::layout::note_y(
-            scroll,
-            scroll.position_at(TimeUs(2_300_000)),
-            TimeUs(2_000_000),
+            note.pos,
+            playhead.position_at(TimeUs(2_200_000)),
+            playhead.initial_rate(),
             TimeUs(visible),
         )
     };
