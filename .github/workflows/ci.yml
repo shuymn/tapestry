@@ -103,6 +103,11 @@ jobs:
           mise exec -- rustc -Vv
       - name: Show runner image
         run: echo "runner image $ImageOS $ImageVersion"
+      # Dependencies built with optimizations: their code dominates the heavy
+      # tests' run time, and rust-cache keeps them. Before rust-cache, which
+      # hashes .cargo/config.toml into its key.
+      - name: Optimize dependencies in debug builds
+        run: printf '\n[profile.dev.package."*"]\nopt-level = 2\n' >> .cargo/config.toml
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           cmd-format: mise exec -- {0}
@@ -223,6 +228,11 @@ jobs:
           mise exec -- rustc -Vv
       - name: Show runner image
         run: echo "runner image $ImageOS $ImageVersion"
+      # Dependencies built with optimizations: their code dominates the heavy
+      # tests' run time, and rust-cache keeps them. Before rust-cache, which
+      # hashes .cargo/config.toml into its key.
+      - name: Optimize dependencies in debug builds
+        run: printf '\n[profile.dev.package."*"]\nopt-level = 2\n' >> .cargo/config.toml
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           cmd-format: mise exec -- {0}
@@ -286,6 +296,11 @@ jobs:
           actual=$(mise exec -- rustc --version | cut -d' ' -f2)
           test "$expected" = "$actual"
           mise exec -- rustc -Vv
+      # Dependencies built with optimizations: their code dominates the heavy
+      # tests' run time, and rust-cache keeps them. Before rust-cache, which
+      # hashes .cargo/config.toml into its key.
+      - name: Optimize dependencies in debug builds
+        run: printf '\n[profile.dev.package."*"]\nopt-level = 2\n' >> .cargo/config.toml
       # The fuzz crate is a workspace of its own, with its own lockfile.
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
