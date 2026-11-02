@@ -1252,5 +1252,6 @@ mod tests {
             size_of::<LaneCursor<'static>>()
         );
         assert!(n <= 8 * 256, "{n}");
+        println!("loaded lanes: {} B", size_of::<Lanes>());
     }
 }
