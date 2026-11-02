@@ -522,7 +522,7 @@ pub struct DeviceSettings {
     /// How controllers' axes play their lanes.
     pub scratch: ScratchConfig,
     /// Periods the audio output keeps queued ahead of playback, 2 or 3
-    /// ([`QUEUED_PERIODS`]). A play with underruns after its countdown sets
+    /// ([`QUEUED_PERIODS`]). A play with underruns after its READY state sets
     /// it to 3; only the player sets it back.
     pub queued_periods: u32,
     /// The song library, `[library]`.

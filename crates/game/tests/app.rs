@@ -7,7 +7,7 @@
 //! Allocations are counted from each play's handoff to its close on the
 //! property's thread alone (see `counting`), on a per-thread count no
 //! other test can move: a play reserves everything at its
-//! countdown's start, so none happen there.
+//! READY state's start, so none happen there.
 
 mod common;
 mod counting;
@@ -501,7 +501,7 @@ impl Headless {
         );
         if self.opened {
             self.violations
-                .push("the countdown waited before the play was set up".to_owned());
+                .push("READY waited before the play was set up".to_owned());
         }
         if self.sealed {
             self.waits_since_seal += 1;
@@ -729,7 +729,7 @@ impl Rig for Headless {
     fn start(&mut self, _origin: TimeUs, sounds: AudioQueue, _screen: RenderSide) {
         self.opened = false;
         self.starts += 1;
-        // The countdown replaces the loading state.
+        // READY replaces the loading state.
         self.started_loading.push(self.loading.take().is_some());
         self.sounds = Some(sounds);
         self.sealed = false;
@@ -1117,7 +1117,7 @@ fn select_play_retry_back_select_again() {
     let (rig, events, ran) = run(Refusal::Missing, acts, |_| {});
     ran.unwrap();
     assert!(rig.violations.is_empty(), "{:?}", rig.violations);
-    // Each chosen chart shows its loading state up to its first countdown;
+    // Each chosen chart shows its loading state up to its first READY state;
     // the retry loads nothing and shows none.
     assert_eq!(
         rig.loading_pages.iter().map(|p| p.0).collect::<Vec<_>>(),
@@ -1368,7 +1368,7 @@ fn quit_in_the_tail_skips_to_the_result() {
     assert!(events.all().contains(&SessionEvent::Result { attempt: 1 }));
 }
 
-/// Before the play is complete the quit key aborts it: in its countdown it
+/// Before the play is complete the quit key aborts it: in its READY state it
 /// returns to selection with no result; while the chart plays it shows
 /// the play's result, which back leaves for selection.
 #[test]
@@ -1916,7 +1916,7 @@ const fn loaded_chart(entry: Entry) -> usize {
 ///
 /// | event during the load | a chart chosen to play | a practice Start |
 /// |---|---|---|
-/// | none (ready) | its countdown replaces the page | the same |
+/// | none (ready) | its READY state replaces the page | the same |
 /// | quit key | the load is cancelled; selection | cancelled; the practice page |
 /// | close | cancelled; the run ends | the same |
 /// | focus loss | nothing: the play opens and completes | the same |
@@ -2525,10 +2525,10 @@ fn practice_screen_repeats_and_quits() {
     assert_eq!(back.measures(), entered.measures());
 }
 
-/// The quit key in a round's countdown, before its section starts, aborts
+/// The quit key in a round's READY state, before its section starts, aborts
 /// the round and returns to the practice page with no result.
 #[test]
-fn practice_quit_in_the_countdown_returns_to_the_page() {
+fn practice_quit_in_ready_returns_to_the_page() {
     use PracticeInput::{Back, Confirm};
     let mut acts = vec![(0, Act::Practice(0))];
     acts.extend(to_start(0));
@@ -3360,7 +3360,7 @@ proptest! {
     /// two built charts, one refused chart and the practice chart: the run
     /// ends cleanly; every play that finalized anything has
     /// a saved record that re-evaluates equal to live; attempts count from
-    /// 1 per chart; every play is reserved at its countdown's start, before
+    /// 1 per chart; every play is reserved at its READY state's start, before
     /// any wait and with nothing allocated after its handoff; and every
     /// entry into selection is signaled.
     #[test]

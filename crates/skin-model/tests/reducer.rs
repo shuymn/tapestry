@@ -662,7 +662,7 @@ fn gauge_max_from_an_initial_full_gauge() {
     };
     let mut h = Harness::empty(&taps_chart(), &ctx);
     h.gauges[0] = state(GaugeValue::FULL);
-    // Off during the countdown; on from the play's start
+    // Off during READY; on from the play's start
     // (`play/BMSPlayer.java:639`).
     h.frame(-1_500, &[]);
     assert_eq!(h.start_ms(timer::GAUGE_MAX), None);

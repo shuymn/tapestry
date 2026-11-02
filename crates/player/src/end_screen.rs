@@ -34,7 +34,7 @@ pub struct LoadTimes {
 pub struct QueueLine {
     /// Periods the play queued, when the output said.
     pub played: Option<u32>,
-    /// Its underruns from chart time 0 on, after the countdown.
+    /// Its underruns from chart time 0 on, after READY.
     pub steady_underruns: u64,
     /// Periods the next play queues.
     pub next: u32,
@@ -47,12 +47,12 @@ pub fn next_queue(choice: u32, most: Option<u32>) -> u32 {
     most.map_or(choice, |m| choice.min(m))
 }
 
-/// The audio queue line: what the play queued, its underruns after the
-/// countdown, and the next play's queue when it differs.
+/// The audio queue line: what the play queued, its underruns after
+/// READY, and the next play's queue when it differs.
 pub fn queue_line(q: QueueLine) -> String {
     let played = q.played.map_or_else(|| "N/A".to_owned(), |p| p.to_string());
     let mut line = format!(
-        "AUDIO QUEUE {played} PERIODS, {} UNDERRUNS AFTER THE COUNTDOWN",
+        "AUDIO QUEUE {played} PERIODS, {} UNDERRUNS AFTER READY",
         q.steady_underruns
     );
     if q.played != Some(q.next) {
@@ -644,19 +644,19 @@ mod tests {
         };
         assert_eq!(
             line(Some(2), 0, 2),
-            "AUDIO QUEUE 2 PERIODS, 0 UNDERRUNS AFTER THE COUNTDOWN"
+            "AUDIO QUEUE 2 PERIODS, 0 UNDERRUNS AFTER READY"
         );
         assert_eq!(
             line(Some(2), 4, 3),
-            "AUDIO QUEUE 2 PERIODS, 4 UNDERRUNS AFTER THE COUNTDOWN: 3 FROM THE NEXT PLAY"
+            "AUDIO QUEUE 2 PERIODS, 4 UNDERRUNS AFTER READY: 3 FROM THE NEXT PLAY"
         );
         assert_eq!(
             line(Some(3), 7, 3),
-            "AUDIO QUEUE 3 PERIODS, 7 UNDERRUNS AFTER THE COUNTDOWN"
+            "AUDIO QUEUE 3 PERIODS, 7 UNDERRUNS AFTER READY"
         );
         assert_eq!(
             line(None, 1, 3),
-            "AUDIO QUEUE N/A PERIODS, 1 UNDERRUNS AFTER THE COUNTDOWN: 3 FROM THE NEXT PLAY"
+            "AUDIO QUEUE N/A PERIODS, 1 UNDERRUNS AFTER READY: 3 FROM THE NEXT PLAY"
         );
     }
 
@@ -673,10 +673,7 @@ mod tests {
             steady_underruns: 9,
             next: super::next_queue(3, Some(2)),
         });
-        assert_eq!(
-            line,
-            "AUDIO QUEUE 2 PERIODS, 9 UNDERRUNS AFTER THE COUNTDOWN"
-        );
+        assert_eq!(line, "AUDIO QUEUE 2 PERIODS, 9 UNDERRUNS AFTER READY");
     }
 
     #[test]

@@ -380,7 +380,7 @@ impl Play {
         let play = (now >= self.play_at).then_some(self.play_at);
         let shown = frame.gauges.get(frame.gauge);
         let failed = shown.and_then(|g| g.failed_at);
-        // The reducer's start, masked during the countdown and while the
+        // The reducer's start, masked during READY and while the
         // snapshot is below the maximum: a dropped below-maximum effect
         // cannot leave it on (`play/BMSPlayer.java:639`).
         let gauge_max = match (

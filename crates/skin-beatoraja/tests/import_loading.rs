@@ -36,7 +36,7 @@ fn of_width(rects: &[[i32; 4]], w: i32) -> Option<[i32; 4]> {
 
 /// Untimed destinations and image cycles draw while loading, from the
 /// loading state's origin, while those on an explicit `ready` (40) stay
-/// absent; a play runs them again from `ready`'s start, the countdown's
+/// absent; a play runs them again from `ready`'s start, READY's
 /// restart.
 #[test]
 fn untimed_elements_run_from_the_loading_origin() {

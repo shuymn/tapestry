@@ -5,7 +5,7 @@
 //! Each round runs reset → restore → lead-in → section evaluation through
 //! the play lifecycle every driver shares ([`crate::live`]), and is one
 //! attempt and one saved record. Its recording opens [`RESTORE_AHEAD`]
-//! before the lead-in's start, where the countdown begins, so the play's
+//! before the lead-in's start, where READY begins, so the play's
 //! origin is fixed before its audio is restored at the lead-in's start
 //! ([`crate::restore`]): the schedule is the BGM with the key sounds of
 //! every note that is not a target, played as autoplay ([`schedule`]).
@@ -45,7 +45,7 @@ pub struct Practice {
     /// The time just past the section, in the chart's 1× time.
     pub end: TimeUs,
     /// How long the lead-in before the section lasts, in real time: the
-    /// round's countdown.
+    /// round's READY state.
     pub lead_in: TimeUs,
     /// Each gauge's value at the section's start, in the preset's order.
     pub initial_gauges: Vec<GaugeValue>,

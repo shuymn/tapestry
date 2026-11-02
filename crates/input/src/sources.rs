@@ -756,7 +756,7 @@ impl SourceSet {
     /// the batch time minus `origin`: the logic thread sees the play's timeline
     /// while the input thread keeps reading one clock across plays (design.md
     /// "Play Lifecycle": each play's chart time 0 lies `lead_in` after its
-    /// countdown starts). The snapshot's `opened_at` is `now − origin`.
+    /// READY state starts). The snapshot's `opened_at` is `now − origin`.
     pub fn open_play(&mut self, now: TimeUs, origin: TimeUs) -> InputStart {
         self.close_recording();
         let taking = self.devices.iter().filter(|d| d.takes_part).count();

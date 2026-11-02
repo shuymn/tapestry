@@ -1,14 +1,14 @@
 //! The session: one chart played any number of times, through the extension
 //! points (design.md "Play Lifecycle", "Extension Boundaries").
 //!
-//! Each play runs prepare → countdown → play → evaluation complete → audio
+//! Each play runs prepare → READY → play → evaluation complete → audio
 //! tail → save → result. Retry, quit, focus loss, removal of the last
 //! device and suspend abort it from any state: it ends at the watermark the
 //! evaluator had already finalized, and what was recorded after it stays in
 //! the record unevaluated.
 //!
 //! Each play has its own timeline: its chart time 0 lies `lead_in` after
-//! its countdown starts, and recording opens at the countdown. The session
+//! its READY state starts, and recording opens at READY. The session
 //! clock, which the audio output follows, only moves forward across plays.
 
 use std::fmt;
@@ -149,7 +149,7 @@ impl Settings {
 /// Fixed choices of a session.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SessionConfig {
-    /// How long the countdown runs before chart time 0 (design.md "Play
+    /// How long READY runs before chart time 0 (design.md "Play
     /// Lifecycle").
     pub lead_in: TimeUs,
     /// How far the clock moves per step.
@@ -269,8 +269,8 @@ pub enum MenuCommand {
 }
 
 /// What one play receives: device input and system controls, both on the
-/// play's timeline (chart time; the countdown starts at `-lead_in`).
-/// Script items before the countdown bootstrap the devices: connections and
+/// play's timeline (chart time; READY starts at `-lead_in`).
+/// Script items before READY bootstrap the devices: connections and
 /// controls held before recording opens.
 #[derive(Debug)]
 pub struct PlayScript {
@@ -455,7 +455,7 @@ pub struct PlayPlan {
     /// "Recording Capacity").
     pub logic: LogicConfig,
     /// The recording window the capacity is sized for: from the opening
-    /// (the countdown, or a round's lead-in) to the final deadline of the
+    /// (READY, or a round's lead-in) to the final deadline of the
     /// chart or of the round's section, before the input-offset allowance.
     pub window: TimeUs,
 }
@@ -891,7 +891,7 @@ impl Loaded {
         }
     }
 
-    /// Where a play's recording opens, in its chart time: the countdown
+    /// Where a play's recording opens, in its chart time: READY
     /// before chart time 0 for a full play, [`RESTORE_AHEAD`] before the
     /// lead-in's start for a round, so the play's origin is fixed before its
     /// audio is restored there ([`restore_at`](Self::restore_at)).
@@ -1147,7 +1147,7 @@ impl Loaded {
             0,
         );
         let end = probe.as_ref().map_or(TimeUs(0), Evaluator::final_deadline);
-        // A full play's window counts from its countdown to its final
+        // A full play's window counts from its READY state to its final
         // deadline, or to chart time 0 if that comes first.
         let end = if section.is_some() {
             end
@@ -1504,7 +1504,7 @@ impl<O: AudioOutput + Wakes> Session<O> {
         Ok(())
     }
 
-    /// Plays the chart once with `script`, from the countdown to the
+    /// Plays the chart once with `script`, from READY to the
     /// result, or until a system control, focus loss, removal of the last
     /// device or an audio failure ends it, through the lifecycle every
     /// driver shares ([`crate::live`]). Every play after the first is a
@@ -1671,7 +1671,7 @@ impl<O: AudioOutput + Wakes> Rig for SessionRig<'_, O> {
     }
 
     fn open(&mut self, lead_in: TimeUs) -> Result<Opening<Self::Reader>, InputWaitError> {
-        // The countdown starts now; chart time 0 is `lead_in` later.
+        // READY starts now; chart time 0 is `lead_in` later.
         let origin = TimeUs(self.clock.now().0 + lead_in.0);
         let open_at = TimeUs(-lead_in.0);
         self.script.input.poll(TimeUs(open_at.0 - 1), self.sources);

@@ -9,7 +9,7 @@
 //! sounds during setup. Between plays the game thread may change the periods
 //! the output keeps queued; the audio thread applies the change at its next
 //! step and answers with what the output keeps. It also counts each play's
-//! underruns from its chart time 0 on, the steady state after the countdown. A
+//! underruns from its chart time 0 on, the steady state after READY. A
 //! sealed play (evaluation complete, no more key sounds) is reported done only
 //! once the audio thread has taken every command sent before the seal and every
 //! voice and BGM event has ended: the end of the audio tail (design.md "Play
