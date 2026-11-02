@@ -34,6 +34,7 @@ use game::{
 #[cfg(feature = "dev-tools")]
 use crate::controls::Controls;
 use crate::end_screen::{LoadTimes, preset_error_text, shelf_error_text, view_log};
+use crate::loading_state::{LoadInput, shown_gauge};
 use crate::loading_text::{ChosenChart, LoadingText, Stage};
 use crate::log_file;
 use crate::play::{PlayerRig, since};
@@ -957,7 +958,7 @@ fn show_stage(render: &RenderLink, page: Option<&LoadingText>, stage: Stage) {
     println!("load: {}", stage.label());
     render
         .loading()
-        .show_typed(page.lines(stage), page.update(stage));
+        .report(LoadInput::Stage(stage), Some(page.lines(stage)));
 }
 
 /// How often the sounds' progress is shown at most: more often would only
@@ -995,7 +996,14 @@ impl Progress {
         *shown = Some(now);
         let stage = Stage::Sounds { done, files };
         self.render
-            .show_typed(page.lines(stage), page.update(stage));
+            .report(LoadInput::Stage(stage), Some(page.lines(stage)));
+    }
+
+    /// The bank is complete, an empty one included: the lines stay.
+    fn completed(&self) {
+        if self.page.is_some() {
+            self.render.report(LoadInput::BankComplete, None);
+        }
     }
 }
 
@@ -1060,6 +1068,12 @@ fn hold(
 }
 
 impl PlayerRig<'_> {
+    /// Whether a loading lifetime runs: from the choice or a practice's
+    /// Start until loading ends.
+    pub(crate) fn loading_active(&self) -> bool {
+        self.selection.as_ref().is_some_and(|s| s.loading.is_some())
+    }
+
     /// Looks at the library and the window's input on the select screen,
     /// and sends the page if it changed; the chart chosen, if one was.
     fn look(&mut self) -> Option<Pick> {
@@ -1439,7 +1453,8 @@ impl AppRig for PlayerRig<'_> {
 
     /// The play screen's loading state, its lines from the chart's library
     /// entry (its title and artist) and the chosen preset, at the chart's
-    /// stage.
+    /// stage: a loading lifetime begins, with the shown gauge's descriptor
+    /// from the validated preset selection has chosen.
     fn entered_loading(&mut self, chart: &std::path::Path) {
         let Some(sel) = &mut self.selection else {
             return;
@@ -1467,6 +1482,11 @@ impl AppRig for PlayerRig<'_> {
             }),
         };
         println!("load: the play screen loads {}", file_name(chart));
+        let gauge = sel
+            .screen
+            .bests_preset()
+            .and_then(|p| shown_gauge(p, self.gauge));
+        self.render.begin_loading(&page, gauge);
         show_stage(&self.render, Some(&page), Stage::Chart);
         sel.loading = Some(page);
     }
@@ -1587,7 +1607,10 @@ impl AppRig for PlayerRig<'_> {
             &|| controls.quitting() || controls.leaving(),
         );
         let bank = match decoded_bank {
-            Ok(bank) => Arc::new(bank),
+            Ok(bank) => {
+                progress.completed();
+                Arc::new(bank)
+            }
             Err(audio::BankError::Cancelled) => {
                 println!("load: cancelled while loading the sounds");
                 println!("load: cancelled");

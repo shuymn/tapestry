@@ -33,11 +33,13 @@ use eval::Section;
 use game::Preparation;
 use render::text::{Fonts, MenuText, TextBlock, TextStyle};
 use render::{
-    AttemptInput, Blend, CommitError, FrameTiming, Installation, LoadingFrame, PreparedToken,
-    RenderError, Renderer, SkinBundle, Sprite, solid_uv,
+    AttemptInput, Blend, CommitError, FrameTiming, Installation, LoadingFrame, LoadingTextError,
+    LoadingTextKey, PreparedToken, RenderError, Renderer, SkinBundle, Sprite, solid_uv,
 };
-use skin_model::BuildError;
+use skin_model::{BuildError, ChartText, TextField, TextSlots};
 
+use crate::loading_state::LoadingUpdate;
+use crate::loading_text::ChosenChart;
 use crate::render_side::{Screen, refusal};
 
 /// The size of a line's text, in layout pixels (1920×1080).
@@ -235,6 +237,39 @@ pub struct MenuScreen {
     /// The target changed size since the text was last prepared: the
     /// page shown is prepared again before its next frame.
     stale: bool,
+    /// The chosen chart's text last asked of the renderer for a loading
+    /// lifetime; `None` before any.
+    asked: Option<AskedText>,
+}
+
+/// The chosen chart's text last prepared for the loading presentation:
+/// what it was prepared for, and the fields it was prepared from.
+#[derive(Debug)]
+struct AskedText {
+    key: LoadingTextKey,
+    target: [u32; 2],
+    lifetime: u64,
+    revision: u64,
+    chart: Arc<ChosenChart>,
+}
+
+/// The slots of the fields that differ between `old` and `new`, with the
+/// composites they are part of: what a field change clears until its
+/// replacement is installed.
+#[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+fn fields_changed(old: &ChosenChart, new: &ChosenChart) -> TextSlots {
+    [
+        (TextField::Title, &old.title, &new.title),
+        (TextField::Subtitle, &old.subtitle, &new.subtitle),
+        (TextField::Artist, &old.artist, &new.artist),
+        (TextField::Subartist, &old.subartist, &new.subartist),
+        (TextField::Genre, &old.genre, &new.genre),
+    ]
+    .into_iter()
+    .filter(|(_, a, b)| a != b)
+    .fold(TextSlots::NONE, |slots, (f, _, _)| {
+        slots.with(TextSlots::field(f))
+    })
 }
 
 impl MenuScreen {
@@ -251,7 +286,73 @@ impl MenuScreen {
             sent: None,
             splash: None,
             stale: false,
+            asked: None,
         }
+    }
+
+    /// Brings the loading presentation's chosen-chart text to `update`,
+    /// between frames: the presentation enters the update's lifetime, the
+    /// text staged by an earlier call is installed (dropped if its
+    /// installation, lifetime or revision has passed), and text for a
+    /// lifetime, revision, installation or size not asked yet is prepared
+    /// and staged for the next frame, replacing any staged. Within one
+    /// lifetime and installation only the fields that changed are laid
+    /// out again, their slots cleared until then; otherwise every slot.
+    /// Preparing allocates: it runs only when the update asks for new
+    /// text, never in a frame's build.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn chosen_text(&mut self, update: &LoadingUpdate, lifetime: u64) {
+        self.renderer.enter_loading(lifetime);
+        // Text whose installation, lifetime or revision has passed is
+        // dropped as meant; only a table that does not fit is reported.
+        if let Err(e @ LoadingTextError::Table(_)) = self.renderer.install_staged_loading_text() {
+            eprintln!("render: the chosen chart's text was not installed: {e}");
+        }
+        let Some(key) = self.renderer.loading_text_key() else {
+            self.asked = None;
+            return;
+        };
+        let target = self.renderer.target();
+        let which = match &self.asked {
+            Some(a)
+                if a.key == key
+                    && a.target == target
+                    && a.lifetime == lifetime
+                    && a.revision == update.revision =>
+            {
+                return;
+            }
+            Some(a) if a.key == key && a.target == target && a.lifetime == lifetime => {
+                let which = fields_changed(&a.chart, &update.chart);
+                self.renderer.clear_loading_text(which);
+                which
+            }
+            _ => TextSlots::ALL,
+        };
+        let c = &update.chart;
+        fn field(f: &Option<String>) -> &str {
+            f.as_deref().unwrap_or_default()
+        }
+        let chart = ChartText {
+            title: field(&c.title),
+            subtitle: field(&c.subtitle),
+            artist: field(&c.artist),
+            subartist: field(&c.subartist),
+            genre: field(&c.genre),
+        };
+        if let Err(e) = self
+            .renderer
+            .prepare_loading_text(lifetime, update.revision, which, &chart)
+        {
+            eprintln!("render: the chosen chart's text was not prepared: {e}");
+        }
+        self.asked = Some(AskedText {
+            key,
+            target,
+            lifetime,
+            revision: update.revision,
+            chart: Arc::clone(&update.chart),
+        });
     }
 
     /// Tells `sink` of its first frame presented and the caret's area of
@@ -467,18 +568,21 @@ impl Screen for MenuScreen {
         })
     }
 
-    /// The skin's loading frame `frame`, then the lines over it; the
-    /// typed update is for a loading frame's text, which none draws yet.
-    /// The lines are laid out before the frame is built, outside its
-    /// work.
+    /// The skin's loading frame `frame`, then the lines over it. The
+    /// chosen chart's text is brought to the lifetime's state `update`
+    /// ([`chosen_text`](Self::chosen_text)) and the lines are laid out
+    /// before the frame is built, outside its work.
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn loading(
         &mut self,
         page: &MenuPage,
-        _update: Option<&crate::loading_text::LoadingUpdate>,
+        update: Option<&LoadingUpdate>,
         changed: bool,
         frame: &LoadingFrame<'_>,
     ) -> Result<Result<FrameTiming, BuildError>, RenderError> {
+        if let Some(update) = update {
+            self.chosen_text(update, frame.lifetime);
+        }
         if changed || self.stale || self.text.is_none() {
             self.prepare(page, LOADING_LEFT, LOADING_TOP)?;
         }
@@ -608,6 +712,43 @@ impl MenuScreen {
 mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
+
+    /// Only the fields that differ name their slots, each with the
+    /// composites it is part of; equal fields name none, and a field
+    /// becoming unavailable names its own.
+    #[test]
+    fn only_changed_fields_name_their_slots() {
+        use skin_model::{TextField, TextSlots};
+
+        use super::fields_changed;
+        use crate::loading_text::ChosenChart;
+
+        let chart = ChosenChart {
+            title: Some("T".to_owned()),
+            subtitle: Some("s".to_owned()),
+            artist: Some("a".to_owned()),
+            subartist: None,
+            genre: Some("g".to_owned()),
+        };
+        assert_eq!(fields_changed(&chart, &chart.clone()), TextSlots::NONE);
+        let artist = ChosenChart {
+            artist: Some("b".to_owned()),
+            ..chart.clone()
+        };
+        assert_eq!(
+            fields_changed(&chart, &artist),
+            TextSlots::field(TextField::Artist)
+        );
+        let gone = ChosenChart {
+            subtitle: None,
+            genre: None,
+            ..chart.clone()
+        };
+        assert_eq!(
+            fields_changed(&chart, &gone),
+            TextSlots::field(TextField::Subtitle).with(TextSlots::field(TextField::Genre))
+        );
+    }
 
     use render::text::Fonts;
     use render::{AdapterChoice, Renderer, Target};
