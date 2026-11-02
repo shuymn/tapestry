@@ -1,14 +1,18 @@
 //! The `judge` widget: the latest judgment's grade image and, beside it,
-//! the combo as a glyph strip placed relative to the grade's sampled rect.
+//! the combo as a glyph strip placed relative to the grade's attachment
+//! rect.
 //!
 //! The reducer's latest judgment picks the slot; a PERFECT while
 //! `gauge_max` is on resolves the grade image and the combo each to their
 //! full-gauge slot, each falling back to PERFECT's on its own. Each part
 //! runs its own track on its own timer, with its own pivot, blend and
 //! visibility. The combo is the snapshot's `combo` and shows only above
-//! 0. With `shift`, the grade moves left by half the combo's drawn width.
-//! A grade may follow the covers ([`Follow`]): it moves before the combo
-//! attaches to it, so both move once.
+//! 0. A grade's attachment rect is its paint rect unless it has an
+//! attachment track ([`GradePart::attachment`]), sampled on the grade's
+//! clock. With `shift`, the grade's paint moves left by half the combo's
+//! baseline width; the attachment and the combo do not. A grade may follow
+//! the covers ([`Follow`]): its paint and attachment rects move before the
+//! combo attaches, so both parts move once.
 //! The element's own track gives color and alpha, multiplied into every
 //! part's.
 
@@ -95,14 +99,20 @@ pub struct GradePart {
     /// The covers it moves with ([`Follow`]); its combo, attached to its
     /// moved rect, moves with it.
     pub follow: Follow,
+    /// The rect its combo attaches to, when it is not the painted one
+    /// (`None`): corner-origin and unrotated, only its keys' geometry
+    /// read. It has the grade's key times, ease and end, and runs on the
+    /// grade's timer with the grade's [`Follow`]; native sizing and the
+    /// shift never change it.
+    pub attachment: Option<Track>,
 }
 
 /// A slot's combo strip.
 #[derive(Clone, Debug)]
 pub struct ComboPart {
     pub digits: DigitsDef,
-    /// Its `(x, y)` is relative to the grade's sampled rect before the
-    /// shift: x to its left edge, y to the `attach` edge.
+    /// Its `(x, y)` is relative to the grade's sampled attachment rect:
+    /// x to its left edge, y to the `attach` edge.
     pub track: Track,
     pub timer: TimerRef,
     pub attach: Attach,
@@ -129,6 +139,8 @@ pub struct JudgeDef {
 pub enum JudgePart {
     Grade(JudgeSlot),
     Combo(JudgeSlot),
+    /// A grade's attachment track.
+    Attachment(JudgeSlot),
 }
 
 /// Why a judge was refused.
@@ -146,6 +158,8 @@ pub enum JudgeError {
     VisibleNotBool { part: JudgePart },
     #[error("the {part:?} keys leave ±{MAX_COORD}")]
     Coordinates { part: JudgePart },
+    #[error("the {slot:?} grade's attachment keys are not timed as its own")]
+    AttachmentTiming { slot: JudgeSlot },
     #[error("the {slot:?} combo")]
     Combo {
         slot: JudgeSlot,
@@ -170,17 +184,37 @@ fn resolve<T>(parts: &[Option<T>; JudgeSlot::COUNT], slot: JudgeSlot) -> Option<
 }
 
 impl JudgeDef {
-    /// Every part's track with its part.
+    /// Every part's track with its part, grades' attachment tracks
+    /// included.
     pub(crate) fn tracks(&self) -> impl Iterator<Item = (JudgePart, &Track)> + '_ {
         let grades = JudgeSlot::ALL
             .into_iter()
             .zip(&self.grades)
             .filter_map(|(s, g)| g.as_ref().map(|g| (JudgePart::Grade(s), &g.track)));
+        let attachments = JudgeSlot::ALL
+            .into_iter()
+            .zip(&self.grades)
+            .filter_map(|(s, g)| {
+                Some((JudgePart::Attachment(s), g.as_ref()?.attachment.as_ref()?))
+            });
         let combos = JudgeSlot::ALL
             .into_iter()
             .zip(&self.combos)
             .filter_map(|(s, c)| c.as_ref().map(|c| (JudgePart::Combo(s), &c.track)));
-        grades.chain(combos)
+        grades.chain(attachments).chain(combos)
+    }
+
+    /// The first slot whose grade's attachment track is not timed as the
+    /// grade's own track.
+    pub(crate) fn mistimed_attachment(&self) -> Option<JudgeSlot> {
+        JudgeSlot::ALL
+            .into_iter()
+            .zip(&self.grades)
+            .find_map(|(s, g)| {
+                let g = g.as_ref()?;
+                let a = g.attachment.as_ref()?;
+                (!a.same_timing(&g.track)).then_some(s)
+            })
     }
 
     /// Every part's timer with its part.
@@ -228,9 +262,10 @@ impl JudgeDef {
     }
 
     /// The logical box: over the effective states, the grade's keys, the
-    /// combo's strip boxes moved by the range of the grade's corner on the
-    /// attach edge, and with `shift` the grade's box widened on both sides
-    /// by half the widest strip.
+    /// combo's strip boxes moved by the range of the corner of the grade's
+    /// attachment keys on the attach edge, and with `shift` the grade's
+    /// box widened on both sides by half the widest strip. An attachment
+    /// rect is never drawn, so its own box is not included.
     pub(crate) fn bounds(&self) -> Option<Bounds> {
         let mut out = None;
         for (grade, combo) in self.states() {
@@ -238,9 +273,10 @@ impl JudgeDef {
                 continue;
             };
             if let Some(c) = combo {
-                // The range of the grade's corner on the attach edge.
+                // The range of the attachment's corner on the attach edge.
+                let attachment = grade.attachment.as_ref().unwrap_or(&grade.track);
                 let mut corner: Option<Bounds> = None;
-                for [x, y, _, h] in grade.track.rects() {
+                for [x, y, _, h] in attachment.rects() {
                     let (x, y, h) = (i64::from(x), i64::from(y), i64::from(h));
                     let cy = match c.attach {
                         Attach::Top => y,
@@ -275,6 +311,8 @@ pub(crate) struct GradeImage {
     pub(crate) visible: Option<Program>,
     pub(crate) native: Option<Native>,
     pub(crate) follow: Follow,
+    /// [`GradePart::attachment`], timed as `track`.
+    pub(crate) attachment: Option<Track>,
 }
 
 /// A combo as a build reads it.
@@ -341,8 +379,21 @@ impl Judge {
         let Some(g) = resolve(&self.grades, slot) else {
             return;
         };
-        let Some(gs) = sample(d, &g.track, g.slot, g.visible.as_ref()) else {
+        let Some((gt, gs)) = super::sample(
+            d.at.starts,
+            d.at.now,
+            d.state,
+            g.slot,
+            g.visible.as_ref(),
+            &g.track,
+        ) else {
             return;
+        };
+        // The attachment on the grade's clock: timed as the paint, so
+        // drawn whenever it is.
+        let anchor = match &g.attachment {
+            Some(a) => a.sample(gt).map(|s| s.rect),
+            None => Some(gs.rect),
         };
         // The grade moves before the combo attaches to it, so both move
         // once.
@@ -355,13 +406,15 @@ impl Judge {
             .unwrap_or(0);
         let mut shift = 0.0_f32;
         if combo > 0
+            && let Some(anchor) = anchor
             && let Some(c) = resolve(&self.combos, slot)
             && let Some(cs) = sample(d, &c.track, c.slot, c.visible.as_ref())
         {
+            let [ax, ay, _, ah] = g.follow.translate(anchor, d.lanes);
             let [cx, cy, cw, ch] = cs.rect;
             let top = match c.attach {
-                Attach::Top => gy,
-                Attach::Bottom => gy + gh,
+                Attach::Top => ay,
+                Attach::Bottom => ay + ah,
             };
             let brush = Brush {
                 key: RunKey {
@@ -376,7 +429,7 @@ impl Judge {
                 native: c.native,
                 scale: d.scale,
             };
-            let rect = [gx + cx, top + cy, cw, ch];
+            let rect = [ax + cx, top + cy, cw, ch];
             let Some(width) = c.digits.draw(combo, rect, &brush, &d.at, out) else {
                 return;
             };

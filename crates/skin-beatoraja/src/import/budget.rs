@@ -127,6 +127,19 @@ impl Budget {
         Ok(n <= MAX_TRACK_KEYS)
     }
 
+    /// A grade attachment track's `n` keys, emitted beside the keys its
+    /// destination was charged as written, before its rects, keys or
+    /// track are built: ordinary keys, also counted on their own.
+    pub(crate) fn grade_anchor_keys(&mut self, n: usize) -> Result<(), ImportLimit> {
+        charge(&mut self.usage.keys, n, MAX_SKIN_KEYS, ImportLimit::Keys)?;
+        // At most the keys charged, so within `u32`.
+        self.usage.grade_anchor_keys = self
+            .usage
+            .grade_anchor_keys
+            .saturating_add(u32::try_from(n).unwrap_or(u32::MAX));
+        Ok(())
+    }
+
     /// One `when` timer, before its condition is compiled.
     pub(crate) fn when(&mut self) -> Result<(), ImportLimit> {
         charge(
@@ -307,6 +320,16 @@ mod tests {
         assert_eq!(b.keys(MAX_TRACK_KEYS), Ok(true));
         assert_eq!(b.keys(MAX_TRACK_KEYS + 1), Ok(false));
         assert_eq!(b.usage.keys as usize, 2 * MAX_TRACK_KEYS + 1);
+    }
+
+    #[test]
+    fn grade_anchor_keys_share_the_key_cap() {
+        let mut b = Budget::default();
+        b.keys(MAX_SKIN_KEYS - 3).unwrap();
+        b.grade_anchor_keys(3).unwrap();
+        assert_eq!(b.grade_anchor_keys(1), Err(ImportLimit::Keys));
+        assert_eq!(b.usage.keys as usize, MAX_SKIN_KEYS);
+        assert_eq!(b.usage.grade_anchor_keys, 3);
     }
 
     #[test]

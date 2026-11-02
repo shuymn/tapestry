@@ -427,7 +427,239 @@ pub fn draw(imported: &Imported) -> Vec<usize> {
     long_note_probes(skin, &ctx, (&tally, &states), &uvs, &mut batch);
     loading_probes(skin, (&text, &table), &gauges[0], &uvs, &mut batch);
     digit_probes(skin, &ctx, &states, &uvs, &mut batch);
+    grade_anchor_probes(skin, &ctx, &uvs, &mut batch);
     counts
+}
+
+/// The rects a frame of `imported` draws at a PERFECT with combo 12, the
+/// gauge full first when `full`, at the judgment's time, with no cover.
+#[must_use]
+pub fn judged_rects(imported: &Imported, full: bool) -> Vec<[f32; 4]> {
+    use bms_model::{Lane, TimeUs};
+    use eval::{GaugeState, JudgeEvent, JudgeEventKind, Tally};
+    use rules::{GaugeValue, Judgment, PerJudgment};
+    use skin_model::{
+        AtlasLimits, Attempt, GaugeDesc, GaugeLook, Layout, PlayContext, QuadBatch, Side,
+        SkinFrame, Variant,
+    };
+
+    let skin = &imported.skin;
+    let limits = AtlasLimits {
+        max_side: 4_096,
+        max_layers: 8,
+        reserved_layers: 1,
+    };
+    let uvs = skin
+        .atlas(Variant::Lo, limits)
+        .expect("an imported sheet builds its atlas")
+        .into_parts()
+        .1;
+    let chart = bms_model::ChartBuilder::new(150_000)
+        .build()
+        .expect("an empty chart");
+    let value = if full {
+        GaugeValue::FULL
+    } else {
+        GaugeValue(20 * GaugeValue::PERCENT)
+    };
+    let gauges = [GaugeDesc {
+        start: value,
+        max: GaugeValue::FULL,
+        look: GaugeLook::Normal,
+        border: GaugeValue(80 * GaugeValue::PERCENT),
+    }];
+    let ctx = PlayContext {
+        gauges: &gauges,
+        attempt: Attempt::Full { lead_in: TimeUs(0) },
+        empty_poor_breaks_combo: false,
+        empty_poor_counted: false,
+        scratch: Side::Left,
+        ln_default: rules::LnMode::Ln,
+        last_note_end: TimeUs(0),
+        bpm_range: None,
+    };
+    let mut play = skin
+        .prepare(&chart, &ctx)
+        .expect("an imported skin prepares");
+    let states = [GaugeState {
+        value,
+        reference: value,
+        failed_at: None,
+    }];
+    let tally = Tally {
+        counts: PerJudgment {
+            perfect: 12,
+            great: 0,
+            good: 0,
+            bad: 0,
+            poor: 0,
+        },
+        ex_score: 24,
+        bp: 0,
+        combo: 12,
+        max_combo: 12,
+        empty_poor: 0,
+    };
+    let mut batch = QuadBatch::with_capacity(skin.quad_capacity(), skin.run_capacity());
+    let event = |ms: i64, kind| JudgeEvent {
+        seq: 0,
+        time: TimeUs(ms * 1_000),
+        origin: None,
+        kind,
+    };
+    let gauge = event(
+        900,
+        JudgeEventKind::Gauge {
+            gauge: 0,
+            value,
+            reference: value,
+        },
+    );
+    let judged = event(
+        1_000,
+        JudgeEventKind::Judged {
+            lane: Lane::new(1).expect("lane 1"),
+            note: 0,
+            judgment: Judgment::Perfect,
+            deviation: Some(TimeUs(0)),
+            release: None,
+            combo: 12,
+        },
+    );
+    for (ms, effects) in [(900, [gauge]), (1_000, [judged])] {
+        batch.clear();
+        let frame = SkinFrame {
+            now: TimeUs(ms * 1_000),
+            display_offset: TimeUs(0),
+            tally: &tally,
+            gauges: &states,
+            gauge: 0,
+            effects: &effects,
+            complete: false,
+            target: [1_920, 1_080],
+            layout: &Layout::AUTHOR,
+            lanes: LANES_OFF,
+            readouts: readouts_for(LANES_OFF),
+            playing: true,
+        };
+        skin.build(&mut play, &frame, &uvs, &mut batch)
+            .expect("the frame builds");
+    }
+    batch.quads().iter().map(|q| q.rect).collect()
+}
+
+/// Every judgment, with the gauge full from the fourth, each judged at one
+/// time and drawn at later ones on every target: grades, their
+/// attachments and the combos on their own clocks, followers moving, each
+/// frame finite and inside the skin's capacities.
+fn grade_anchor_probes(
+    skin: &skin_model::Skin,
+    ctx: &skin_model::PlayContext<'_>,
+    uvs: &skin_model::UvTable,
+    batch: &mut skin_model::QuadBatch,
+) {
+    use bms_model::{Lane, TimeUs};
+    use eval::{GaugeState, JudgeEvent, JudgeEventKind, Tally};
+    use rules::{GaugeValue, Judgment, PerJudgment};
+    use skin_model::{LaneView, Layout, SkinFrame};
+
+    let chart = bms_model::ChartBuilder::new(150_000)
+        .build()
+        .expect("an empty chart");
+    let mut play = skin
+        .prepare(&chart, ctx)
+        .expect("an imported skin prepares");
+    let lane = Lane::new(1).expect("lane 1");
+    let full = [GaugeState {
+        value: GaugeValue::FULL,
+        reference: GaugeValue::FULL,
+        failed_at: None,
+    }];
+    let tally = Tally {
+        counts: PerJudgment {
+            perfect: 12,
+            great: 0,
+            good: 0,
+            bad: 0,
+            poor: 0,
+        },
+        ex_score: 24,
+        bp: 0,
+        combo: 12,
+        max_combo: 12,
+        empty_poor: 0,
+    };
+    let judgments = [
+        Judgment::Perfect,
+        Judgment::Great,
+        Judgment::Good,
+        Judgment::Perfect,
+        Judgment::Bad,
+        Judgment::Poor,
+    ];
+    let mut now = 0_i64;
+    for (k, judgment) in judgments.into_iter().enumerate() {
+        let gauge = (k == 3).then_some(JudgeEvent {
+            seq: 0,
+            time: TimeUs(now),
+            origin: None,
+            kind: JudgeEventKind::Gauge {
+                gauge: 0,
+                value: GaugeValue::FULL,
+                reference: GaugeValue::FULL,
+            },
+        });
+        let judged = JudgeEvent {
+            seq: 0,
+            time: TimeUs(now),
+            origin: None,
+            kind: JudgeEventKind::Judged {
+                lane,
+                note: 0,
+                judgment,
+                deviation: Some(TimeUs(0)),
+                release: None,
+                combo: 12,
+            },
+        };
+        let effects: Vec<JudgeEvent> = gauge.into_iter().chain([judged]).collect();
+        for (step, (target, cover)) in [
+            ([1_920, 1_080], 0),
+            ([640, 360], 300),
+            ([3_840, 2_160], 1_000),
+            ([1, 1], 0),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let view = LaneView {
+                visible_time: TimeUs(600_000),
+                cover,
+                lift: cover / 2,
+                hidden: 0,
+            };
+            batch.clear();
+            let frame = SkinFrame {
+                now: TimeUs(now),
+                display_offset: TimeUs(0),
+                tally: &tally,
+                gauges: &full,
+                gauge: 0,
+                effects: if step == 0 { &effects } else { &[] },
+                complete: false,
+                target,
+                layout: &Layout::AUTHOR,
+                lanes: view,
+                readouts: readouts_for(view),
+                playing: true,
+            };
+            skin.build(&mut play, &frame, uvs, batch)
+                .expect("the frame builds");
+            check_batch(skin, batch);
+            // Uneven steps, so the grade's and the combo's clocks part.
+            now += 37_000;
+        }
+    }
 }
 
 /// The skin's loading state with the chart's lines (`table`, the lines
@@ -1270,6 +1502,10 @@ fn check_usage(i: &Imported) {
     assert!(within(u.kernings, MAX_SHEET_KERNINGS), "too many kernings");
     assert!(within(u.elements, MAX_ELEMENTS), "too many elements");
     assert!(within(u.keys, MAX_SKIN_KEYS), "too many keys");
+    assert!(
+        u.grade_anchor_keys <= u.keys,
+        "grade attachment keys outside the keys"
+    );
     assert!(within(u.ops, MAX_SKIN_OPS), "too many ops");
     assert!(within(u.frames, MAX_SKIN_FRAMES), "too many frames");
     assert!(within(u.file_attempts, MAX_FILES), "too many file attempts");

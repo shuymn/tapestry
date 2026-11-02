@@ -389,41 +389,233 @@ fn judge_two() -> Loaded {
 /// A number that resolves to no value.
 const NONE: &str = r#"{"id": "none", "dst": []}"#;
 
+/// Grade `k` fitted with `stretch`.
+fn fit(k: usize, stretch: i32) -> String {
+    grade(k, &format!(r#", "stretch": {stretch}"#))
+}
+
+/// The keys charged for attachments, after asserting nothing was noted.
+#[track_caller]
+fn anchor_keys(l: &Loaded) -> u32 {
+    assert!(l.report().notes.is_empty(), "{:?}", l.report());
+    l.report().usage.grade_anchor_keys
+}
+
 #[test]
-fn a_stretch_may_not_move_a_combos_anchor() {
-    // Fit inner: the square image in an 80×20 box draws 20×20 centred,
-    // moving its left edge from the source's anchor.
-    let fit = |k: usize| grade(k, r#", "stretch": 1"#);
-    // PERFECT's grade paired with the full-gauge slot's combo.
-    let mut images = vec![fit(0)];
+fn a_stretched_grade_keeps_its_combo_on_its_destination() {
+    // Fit inner: the square image in the 80×20 box at 100 draws 20×20 at
+    // 130; the combo stays on the box's bottom-left, as the source
+    // attaches it before the stretch (`play/SkinJudge.java:115-125`):
+    // "12" at 100 and 110, 580 − 20.
+    let cells = [[100, 560, 10, 20], [110, 560, 10, 20]];
+    let l = judge(&[fit(0, 1)], &[combo("ten", 10)]);
+    assert_eq!(anchor_keys(&l), 1);
+    assert_eq!(l.report().usage.keys, 4);
+    assert_eq!(
+        shown(&l, of(Judgment::Perfect, 12), 12, false),
+        [cells[0], cells[1], [130, 560, 20, 20]]
+    );
+    // With the shift, half the baseline width 20 moves the paint alone.
+    let shifted = judge_rec(&[fit(0, 1)], &[combo("ten", 10)], r#", "shift": true"#);
+    let l = skin(VALUES, &shifted, &[DST]);
+    assert_eq!(
+        shown(&l, of(Judgment::Perfect, 12), 12, false),
+        [cells[0], cells[1], [120, 560, 20, 20]]
+    );
+    // Fit width moves the bottom edge: the 80×80 paint from 530, the
+    // combo still on 580.
+    let l = judge(&[fit(0, 4)], &[combo("ten", 10)]);
+    assert_eq!(anchor_keys(&l), 1);
+    assert_eq!(
+        shown(&l, of(Judgment::Perfect, 12), 12, false),
+        [cells[0], cells[1], [100, 530, 80, 80]]
+    );
+    // Outer and fit height move the left edge.
+    for stretch in [2, 6] {
+        let l = judge(&[fit(0, stretch)], &[combo("ten", 10)]);
+        assert_eq!(anchor_keys(&l), 1);
+        assert_eq!(
+            shown(&l, of(Judgment::Perfect, 12), 12, false)[..2],
+            cells,
+            "{stretch}"
+        );
+    }
+}
+
+#[test]
+fn a_stretched_grade_attaches_through_either_fallback() {
+    let cells = [[100, 560, 10, 20], [110, 560, 10, 20]];
+    // PERFECT's grade standing in, with the full-gauge slot's combo.
+    let mut images = vec![fit(0, 1)];
     images.extend((1..6).map(|k| grade(k, "")));
     images.push(NONE.replace("none", "g9"));
     let mut numbers = vec![NONE.to_owned(); 6];
     numbers.push(combo("ten", 10));
+    let l = judge(&images, &numbers);
+    assert_eq!(anchor_keys(&l), 1);
     assert_eq!(
-        critical(judge(&images, &numbers)),
-        (CriticalPart::Judge, NoteKind::Stretch(1))
+        shown(&l, of(Judgment::Perfect, 12), 12, true),
+        [cells[0], cells[1], [130, 560, 20, 20]]
     );
-    // The full-gauge slot's grade paired with PERFECT's combo.
+    // The full-gauge slot's grade with PERFECT's combo standing in; the
+    // 86 px box centres the paint at 133.
     let mut images = grades(6);
-    images.push(fit(6));
+    images.push(fit(6, 1));
     let mut numbers = vec![combo("ten", 10)];
     numbers.extend((1..7).map(|_| NONE.to_owned()));
+    let l = judge(&images, &numbers);
+    assert_eq!(anchor_keys(&l), 1);
     assert_eq!(
-        critical(judge(&images, &numbers)),
-        (CriticalPart::Judge, NoteKind::Stretch(1))
+        shown(&l, of(Judgment::Perfect, 12), 12, true),
+        [cells[0], cells[1], [133, 560, 20, 20]]
     );
-    // The same stretch where no combo pairs with it.
+}
+
+#[test]
+fn only_a_paired_moved_grade_keeps_an_attachment() {
+    // BAD has no combo: its fitted grade keeps no attachment keys.
     let mut images = grades(3);
-    images.push(fit(3));
+    images.push(fit(3, 1));
     let numbers: Vec<String> = (0..4).map(|_| combo("ten", 10)).collect();
-    judge(&images, &numbers).ok();
-    // A stretch that keeps the left and bottom edges.
+    let l = judge(&images, &numbers);
+    assert_eq!(l.report().usage.grade_anchor_keys, 0);
+    // Nor with a combo that is never drawn (zero digits).
+    let l = judge(&[fit(0, 1)], &[combo("zero", 10)]);
+    assert_eq!(l.report().usage.grade_anchor_keys, 0);
+    // Nor a stretch that keeps the left and bottom edges.
     let square = r#"{"id": "g0", "stretch": 1, "dst": [{"x": 100, "y": 500, "w": 20, "h": 20}]}"#;
     let l = judge(&[square.to_owned()], &[combo("ten", 10)]);
+    assert_eq!(anchor_keys(&l), 0);
     assert_eq!(
         shown(&l, of(Judgment::Perfect, 12), 12, false),
         [[100, 560, 10, 20], [110, 560, 10, 20], [100, 560, 20, 20]]
+    );
+    // Nor a native size, fitted at placement inside the destination.
+    let g = r#"{"id": "g0", "stretch": 9, "dst": [{"x": 100, "y": 500, "w": 80, "h": 20}]}"#;
+    let l = judge(&[g.to_owned()], &[combo("ten", 10)]);
+    assert_eq!(anchor_keys(&l), 0);
+}
+
+#[test]
+fn trimmed_and_branch_changing_grade_stretches_still_refuse() {
+    for stretch in [3, 5, 7, 10] {
+        assert_eq!(
+            critical(judge(&[fit(0, stretch)], &[combo("ten", 10)])),
+            (CriticalPart::Judge, NoteKind::Stretch(stretch)),
+            "{stretch}"
+        );
+    }
+    // Fit inner by height, then by width.
+    let turning = r#"{"id": "g0", "stretch": 1, "timer": 46, "dst": [
+        {"time": 0, "x": 100, "y": 500, "w": 80, "h": 20},
+        {"time": 100, "x": 100, "y": 500, "w": 20, "h": 80}]}"#;
+    assert_eq!(
+        critical(judge(&[turning.to_owned()], &[combo("ten", 10)])),
+        (CriticalPart::Judge, NoteKind::Stretch(1))
+    );
+}
+
+#[test]
+fn the_attachment_runs_on_the_grade_s_clock() {
+    // The grade grows over 100 ms from its judgment at 1 000 ms; the
+    // combo, on READY (timer 40), slides right 0.1 px a millisecond from READY. At
+    // 1 050 ms the destination is [150, 580, 80, 30] (y down), so the
+    // combo sits on 610 at 150 plus its own offset, while the paint is
+    // the 30 px square centred at 175. Both loop from 0 at 100 ms.
+    let g = r#"{"id": "g0", "stretch": 1, "timer": 46, "dst": [
+        {"time": 0, "x": 100, "y": 500, "w": 80, "h": 20},
+        {"time": 100, "x": 200, "y": 440, "w": 80, "h": 40}]}"#;
+    let n = r#"{"id": "ten", "timer": 40, "dst": [
+        {"time": 0, "x": 10, "y": 0, "w": 10, "h": 20},
+        {"time": 10000, "x": 1010, "y": 0, "w": 10, "h": 20}]}"#;
+    let l = judge(&[g.to_owned()], &[n.to_owned()]);
+    assert_eq!(anchor_keys(&l), 2);
+    let mut d = Drawn::new(l.ok().skin.clone(), 100);
+    d.tally = tally(0, 12);
+    d.frame(1_000, &[event(1_000, of(Judgment::Perfect, 12))]);
+    let ready = d.play.timer(skin_model::timer::READY).unwrap().0 / MS;
+    for (ms, [ax, bottom], paint) in [
+        (1_000, [100, 580], [130, 560, 20, 20]),
+        (1_050, [150, 610], [175, 580, 30, 30]),
+        (1_100, [100, 580], [130, 560, 20, 20]),
+        (1_125, [125, 595], [153, 570, 25, 25]),
+    ] {
+        // The combo's own x at its own elapsed time: −5 + 0.1 a ms, and
+        // half a cell for the blank one.
+        let cx = -5.0 + 0.1 * (ms - ready) as f32 + 5.0;
+        let got = d.rects(ms);
+        let x = (ax as f32 + cx).round() as i32;
+        assert_eq!(
+            got,
+            [
+                [x, bottom - 20, 10, 20],
+                [x + 10, bottom - 20, 10, 20],
+                paint
+            ],
+            "{ms}"
+        );
+    }
+}
+
+#[test]
+fn an_attachment_keeps_the_static_offsets() {
+    // Offset 40 raises the destination 10: paint and attachment alike.
+    let header =
+        r#""offset": [{"name": "a", "id": 40, "x": false, "y": true, "w": false, "h": false}]"#;
+    let rec = judge_rec(
+        &[grade(0, r#", "stretch": 1, "offset": 40"#)],
+        &[combo("ten", 10)],
+        "",
+    );
+    let body = format!(
+        r#"{header}, {}, {VALUES}, "judge": [{rec}], "destination": [{DST}]"#,
+        images()
+    );
+    let l = common::import_config([1_920, 1_080], &body, &[], |c| {
+        c.offsets.insert(
+            40,
+            skin_beatoraja::OffsetValue {
+                y: 10,
+                ..skin_beatoraja::OffsetValue::default()
+            },
+        );
+    });
+    assert_eq!(l.report().usage.grade_anchor_keys, 1);
+    assert_eq!(
+        shown(&l, of(Judgment::Perfect, 12), 12, false),
+        [[100, 550, 10, 20], [110, 550, 10, 20], [130, 550, 20, 20]]
+    );
+}
+
+#[test]
+fn attachment_edges_round_on_their_own() {
+    // At 1280×720 the scale is 3/2: the box [101, 500, 81, 21] is
+    // [151.5, 298.5, 121.5, 31.5] y down. Its edges round half up to
+    // [152, 299, 121, 31]; the 31.5 px square fitted inside it from
+    // 196.5 rounds to [197, 299, 31, 31]. The combo [−7.5, −30, 15, 30]
+    // relative rounds to [−7, −30, 15, 30]: "12" from 152 − 7 + 7.5.
+    let g = r#"{"id": "g0", "stretch": 1, "dst": [{"x": 101, "y": 500, "w": 81, "h": 21}]}"#;
+    let body = format!(
+        r#"{}, {VALUES}, "judge": [{}], "destination": [{DST}]"#,
+        images(),
+        judge_rec(&[g.to_owned()], &[combo("ten", 10)], "")
+    );
+    let l = import_sized([1_280, 720], &body, &[]);
+    assert_eq!(anchor_keys(&l), 1);
+    let q = {
+        let mut d = Drawn::new(l.ok().skin.clone(), 100);
+        d.tally = tally(0, 12);
+        d.frame(1_000, &[event(1_000, of(Judgment::Perfect, 12))]);
+        d.frame(1_001, &[])
+    };
+    let rects: Vec<[f32; 4]> = q.iter().map(|q| q.rect).collect();
+    assert_eq!(
+        rects,
+        [
+            [152.5, 300.0, 15.0, 30.0],
+            [167.5, 300.0, 15.0, 30.0],
+            [197.0, 299.0, 31.0, 31.0]
+        ]
     );
 }
 

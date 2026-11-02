@@ -6,7 +6,12 @@
 //! own (`SkinJudge.java:98-113`); the model's judge widget resolves its
 //! slots the same way. The combo is a relative number: its keys are moved
 //! left by half its width times its digits before inheritance, its user
-//! offsets change only its size, and it sits on the grade's bottom edge.
+//! offsets change only its size, and it sits on the bottom edge of the
+//! grade's destination before its stretch, as the source attaches it to
+//! the grade's region and stretches only a copy at drawing
+//! (`SkinJudge.java:115-125`, `skin/SkinObject.java:649-667`): a grade
+//! whose stretch moves that edge or its left one keeps the unstretched
+//! keys as its attachment track, when a combo pairs with it.
 
 use bms_model::TimeUs;
 use skin_model::{
@@ -25,20 +30,33 @@ use crate::error::ImportError;
 #[cfg(test)]
 thread_local! {
     /// Each judge's retained keys this thread imported: the outer track's,
-    /// slot 0's combo's and slot 0's grade's.
-    pub(crate) static RETAINED: std::cell::RefCell<Vec<[usize; 3]>> =
+    /// slot 0's combo's, slot 0's grade's and slot 0's grade attachment's.
+    pub(crate) static RETAINED: std::cell::RefCell<Vec<[usize; 4]>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
 #[cfg(test)]
-fn retained(def: &JudgeDef, outer: &Track) -> [usize; 3] {
+fn retained(def: &JudgeDef, outer: &Track) -> [usize; 4] {
     let combo = def.combos[0].as_ref().map_or(0, |c| c.track.key_count());
     let grade = def.grades[0].as_ref().map_or(0, |g| g.track.key_count());
-    [outer.key_count(), combo, grade]
+    let attachment = def.grades[0]
+        .as_ref()
+        .and_then(|g| g.attachment.as_ref())
+        .map_or(0, Track::key_count);
+    [outer.key_count(), combo, grade, attachment]
 }
 
 /// The slots whose combo the source draws (`SkinJudge.java:104-111`).
 const COMBO_SLOTS: [usize; 4] = [0, 1, 2, 6];
+
+/// A grade admitted before the combos.
+struct PendingGrade {
+    part: GradePart,
+    /// Its accepted destination, kept while its stretch moves the left or
+    /// bottom edge, to build its attachment track should a combo pair
+    /// with it; its visibility already moved into `part`.
+    attachment_source: Option<Common>,
+}
 
 impl Cx<'_> {
     /// A model track of neutral keys at 0 and at the last of `c`'s keys.
@@ -137,9 +155,7 @@ impl Cx<'_> {
             return refuse(self, at, NoteKind::Timer(TimerWhy::Untimed));
         }
 
-        let mut grades: [Option<GradePart>; JudgeSlot::COUNT] = Default::default();
-        let mut moved = [false; JudgeSlot::COUNT];
-        let mut stretch_mode = [0; JudgeSlot::COUNT];
+        let mut grades: [Option<PendingGrade>; JudgeSlot::COUNT] = Default::default();
         if images.len() > JudgeSlot::COUNT {
             self.ignored(at, NoteKind::Ignored { field: "images" });
         }
@@ -148,10 +164,8 @@ impl Cx<'_> {
             let Some(img) = id.map(|id| self.image_rec(&id)).transpose()?.flatten() else {
                 continue;
             };
-            stretch_mode[k] = gdst.stretch;
-            if let Some((grade, anchor_moved)) = self.grade(&gdst, img)? {
-                grades[k] = Some(grade);
-                moved[k] = anchor_moved;
+            if let Some(slot) = grades.get_mut(k) {
+                *slot = self.grade(&gdst, img)?;
             }
         }
         if grades.iter().all(Option::is_none) {
@@ -174,9 +188,10 @@ impl Cx<'_> {
             }
         }
 
-        // The source places the combo at the grade's region, the model at
-        // the grade's sampled rect: they agree only while the grade's
-        // stretch keeps its left and bottom edges.
+        // The source places the combo at the grade's region before its
+        // stretch: each grade an effective state pairs with a combo, the
+        // full-gauge slot's each falling back to PERFECT's, gets its
+        // unstretched keys as its attachment when its stretch moved them.
         let full = if grades[6].is_some() { 6 } else { 0 };
         let combo_at_full = combos[6].is_some() || combos[0].is_some();
         let pairs = [
@@ -186,10 +201,14 @@ impl Cx<'_> {
             (full, combo_at_full),
         ];
         for (g, combo) in pairs {
-            if combo && grades[g].is_some() && moved[g] {
-                return refuse(self, at, NoteKind::Stretch(stretch_mode[g]));
+            if let Some(p) = grades.get_mut(g).and_then(Option::as_mut)
+                && combo
+                && let Some(c) = p.attachment_source.take()
+            {
+                p.part.attachment = Some(self.grade_attachment(&c)?);
             }
         }
+        let grades = grades.map(|g| g.map(|g| g.part));
 
         let def = JudgeDef {
             grades,
@@ -220,9 +239,9 @@ impl Cx<'_> {
         Ok(None)
     }
 
-    /// A grade image and whether its stretch moves its left or bottom
-    /// edge; `None` when it is never drawn.
-    fn grade(&mut self, gdst: &Dst, img: u32) -> Result<Option<(GradePart, bool)>, ImportError> {
+    /// A grade image, with its destination kept when its stretch moves its
+    /// left or bottom edge; `None` when it is never drawn.
+    fn grade(&mut self, gdst: &Dst, img: u32) -> Result<Option<PendingGrade>, ImportError> {
         let at = gdst.span;
         let role = Role::Critical(CriticalPart::Judge);
         if Stretch::of(gdst.stretch) == Stretch::Trimmed {
@@ -233,14 +252,15 @@ impl Cx<'_> {
             follow: true,
             ..Opts::default()
         };
-        let Some(c) = self.common_with(role, gdst, o)? else {
+        let Some(mut c) = self.common_with(role, gdst, o)? else {
             return Ok(None);
         };
         let Some((image, cell)) = self.add_src_image(&c, img, &s, s.div)? else {
             return Ok(None);
         };
         // Stretch 8 and 9 apply at placement, inside the destination the
-        // combo attaches to (`play/SkinJudge.java:124`).
+        // combo attaches to (`play/SkinJudge.java:124`), so the model's
+        // runtime fit keeps the attachment.
         let native = c.stretch.native(cell);
         let mut rects = Vec::with_capacity(c.track.keys.len());
         let mut shared = track::ANY_BRANCH;
@@ -263,19 +283,37 @@ impl Cx<'_> {
         }
         self.retained(&c)?;
         let track = self.model_track(&c, &rects)?;
-        Ok(Some((
-            GradePart {
-                image,
-                track,
-                timer: c.timer,
-                pivot: c.pivot,
-                blend: c.blend,
-                visible: c.visible,
-                native,
-                follow: c.follow,
-            },
-            moved,
-        )))
+        let part = GradePart {
+            image,
+            track,
+            timer: c.timer,
+            pivot: c.pivot,
+            blend: c.blend,
+            visible: c.visible.take(),
+            native,
+            follow: c.follow,
+            attachment: None,
+        };
+        Ok(Some(PendingGrade {
+            part,
+            attachment_source: moved.then_some(c),
+        }))
+    }
+
+    /// A grade's attachment track: its destination's keys before the
+    /// stretch, each edge rounded on its own, timed as its paint. Its keys
+    /// are charged before anything is built.
+    fn grade_attachment(&mut self, c: &Common) -> Result<Track, ImportError> {
+        let n = c.track.keys.len();
+        self.budget
+            .grade_anchor_keys(n)
+            .map_err(|l| self.limit(c.span, l))?;
+        let mut rects = Vec::with_capacity(n);
+        for k in &c.track.keys {
+            let r = self.key_rect(c, k)?;
+            rects.push(r.model().ok_or_else(|| self.range(c.span, "dst"))?);
+        }
+        self.model_track(c, &rects)
     }
 
     /// A combo strip; `None` when it shows nothing.
