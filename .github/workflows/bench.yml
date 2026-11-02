@@ -70,6 +70,10 @@ jobs:
           cmd-format: mise exec -- {0}
           cache-bin: false
           save-if: false
+          # CI's paths, in its order: the cache's version covers them.
+          workspaces: |
+            . -> target
+            fuzz -> target
       # Both builds use the toolchain of the head: `mise exec` runs in the
       # head's checkout and cargo is pointed at the merge base's manifest.
       # `--bench` names keep the libtest unit-test harnesses, which do not
