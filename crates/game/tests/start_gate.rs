@@ -145,7 +145,21 @@ fn session_with_sources(
     events: &Events,
     sources: input::SourceConfig,
 ) -> Session<Out> {
-    let chart = chart();
+    let device = audio::SimDevice::new(audio::SimConfig::steady(RATE, PERIOD, TimeUs(0)));
+    let out = audio::RecordingOutput::new(device, 0);
+    session_of(root, events, &chart(), sources, out, true)
+}
+
+/// A session of `chart` on `out`, with the start gate when `gated`.
+fn session_of<O: audio::AudioOutput + game::Wakes>(
+    root: &DataRoot,
+    events: &Events,
+    chart: &Chart,
+    sources: input::SourceConfig,
+    out: O,
+    gated: bool,
+) -> Session<O> {
+    let chart = chart.clone();
     let parts = Parts {
         ingest: Box::new(Built(chart.clone())),
         events: Box::new(events.clone()),
@@ -168,9 +182,11 @@ fn session_with_sources(
         64,
     )
     .unwrap();
-    let device = audio::SimDevice::new(audio::SimConfig::steady(RATE, PERIOD, TimeUs(0)));
-    let audio = RunnerAudio::new(engine, audio::RecordingOutput::new(device, 0));
+    let audio = RunnerAudio::new(engine, out);
     let mut s = loaded.start(audio, SourceSet::new(sources).unwrap());
+    if !gated {
+        return s;
+    }
     let d = DeviceSettings::default();
     let keys = KeyConfigs {
         keyboard: d.keyboard,
@@ -247,7 +263,7 @@ fn saved_decodes(report: &PlayReport) {
 }
 
 /// The BGM starts the engine scheduled: the transport's runs.
-fn bgm_starts(s: &mut Session<Out>) -> usize {
+fn bgm_starts<O: audio::AudioOutput + game::Wakes>(s: &mut Session<O>) -> usize {
     let mut n = 0;
     s.drain_scheduled(|e| n += usize::from(matches!(e.kind, audio::ScheduledKind::Bgm { .. })));
     n
@@ -695,57 +711,293 @@ fn a_history_run_out_while_waiting_ends_the_attempt() {
     assert_eq!(bgm_starts(&mut s), 0, "no further candidate ran");
 }
 
-/// A gated play admits its own storage with its recording: a window that
-/// fits the reservation only without the gate's history and snapshots is
-/// refused for a gated play, while the same play without the gate is
-/// admitted (`Loaded::plan_gated`, which `game::live::play_and_next`
-/// calls with the input side's snapshot storage).
-#[test]
-fn the_gates_storage_counts_in_the_recording_admission() {
-    let (_dir, root) = temp_root();
-    let kinds = [DeviceKind::Keyboard; 4];
-    let axes = vec![Vec::new(); 4];
-    let held = 4 * (16 + input::hid::MAX_AXES);
-    let at = |last_s: i64| {
-        let chart = ChartBuilder::new(150_000)
-            .tap(lane(1), TimeUs(1_000 * MS))
-            .tap(lane(1), TimeUs(last_s * 1_000 * MS))
-            .build()
-            .unwrap();
-        let parts = Parts {
-            ingest: Box::new(Built(chart)),
-            ..Parts::standard(&root, &tapestry_settings(&root).player)
-        };
-        let loaded = Loaded::load(
-            root.clone(),
-            tapestry_settings(&root),
-            &chart_file(&root),
-            config(),
-            parts,
-        )
-        .unwrap();
-        (
-            loaded.plan_gated(&kinds, &axes, None).is_ok(),
-            loaded.plan_gated(&kinds, &axes, Some(held)).is_ok(),
-        )
+/// The four keyboards of the admission fixtures, and the held-snapshot
+/// storage the input side reserves for them (`common::sources()`: 16 held
+/// controls and the axes per source).
+const KINDS: [DeviceKind; 4] = [DeviceKind::Keyboard; 4];
+const HELD: usize = 4 * (16 + input::hid::MAX_AXES);
+
+/// Two taps, at 1 s and at `last_s` s.
+fn two_notes(last_s: i64) -> Chart {
+    ChartBuilder::new(150_000)
+        .tap(lane(1), TimeUs(1_000 * MS))
+        .tap(lane(1), TimeUs(last_s * 1_000 * MS))
+        .build()
+        .unwrap()
+}
+
+/// Whether `chart` under `config` is admitted for four keyboards without
+/// the gate, and with its storage (`Loaded::plan_gated`).
+fn admits(root: &DataRoot, chart: Chart, config: SessionConfig) -> (bool, bool) {
+    let parts = Parts {
+        ingest: Box::new(Built(chart)),
+        ..Parts::standard(root, &tapestry_settings(root).player)
     };
-    // The longest chart a plain play admits, by bisection.
-    let (mut lo, mut hi) = (2, 4_000);
-    assert_eq!(at(lo), (true, true));
-    assert!(!at(hi).0);
+    let loaded = Loaded::load(
+        root.clone(),
+        tapestry_settings(root),
+        &chart_file(root),
+        config,
+        parts,
+    )
+    .unwrap();
+    let axes = vec![Vec::new(); KINDS.len()];
+    (
+        loaded.plan_gated(&KINDS, &axes, None).is_ok(),
+        loaded.plan_gated(&KINDS, &axes, Some(HELD)).is_ok(),
+    )
+}
+
+/// The largest `x` in `lo..hi` for which `ungated(x)` holds, `ungated`
+/// holding at `lo` and not at `hi`, by bisection.
+fn last_admitted(mut lo: i64, mut hi: i64, ungated: impl Fn(i64) -> bool) -> i64 {
+    assert!(ungated(lo) && !ungated(hi));
     while hi - lo > 1 {
-        let mid = (lo + hi) / 2;
-        if at(mid).0 {
+        let mid = lo + (hi - lo) / 2;
+        if ungated(mid) {
             lo = mid;
         } else {
             hi = mid;
         }
     }
-    // Just below it the gate's storage tips the window over; well below
-    // it both fit.
-    assert!(
-        (lo - 40..=lo).any(|t| at(t) == (true, false)),
-        "no window fits only without the gate below {lo} s"
-    );
+    lo
+}
+
+/// A chart length whose recording window four keyboards fit only without
+/// the gate's storage.
+fn fits_only_ungated(root: &DataRoot) -> i64 {
+    let at = |s| admits(root, two_notes(s), config());
+    let lo = last_admitted(2, 4_000, |s| at(s).0);
+    let t = (lo - 40..=lo)
+        .find(|&t| at(t) == (true, false))
+        .unwrap_or_else(|| panic!("no window fits only without the gate below {lo} s"));
     assert_eq!(at(lo - 60), (true, true));
+    t
+}
+
+/// A gated play admits its own storage with its recording: a window that
+/// fits the reservation only without the gate's history and snapshots is
+/// refused for a gated play, while the same play without the gate is
+/// admitted (`Loaded::plan_gated`).
+#[test]
+fn the_gates_storage_counts_in_the_recording_admission() {
+    let (_dir, root) = temp_root();
+    fits_only_ungated(&root);
+}
+
+/// Through the lifecycle: a gated play whose window fits only without the
+/// gate's storage is refused right after recording opens, before it is
+/// admitted or handed to audio (`game::live::play_and_next` planning with
+/// the input side's snapshot storage).
+#[test]
+fn a_gated_play_over_the_reservation_is_refused_before_it_starts() {
+    let (_dir, root) = temp_root();
+    let last = fits_only_ungated(&root);
+    let events = Events::default();
+    let device = audio::SimDevice::new(audio::SimConfig::steady(RATE, PERIOD, TimeUs(0)));
+    let out = audio::RecordingOutput::new(device, 0);
+    let mut s = session_of(
+        &root,
+        &events,
+        &two_notes(last),
+        common::sources(),
+        out,
+        true,
+    );
+    let items = (0..4).map(connect).collect();
+    // A quit early in READY keeps a play that was wrongly admitted short.
+    let ran = s.play(script(items, &[(-500, Command::Quit)]));
+    assert!(
+        matches!(
+            ran,
+            Err(game::SessionPlayError::Logic(
+                game::LogicError::RecordingTooLarge { .. }
+            ))
+        ),
+        "{ran:?}"
+    );
+    assert!(
+        !events
+            .0
+            .borrow()
+            .iter()
+            .any(|e| matches!(e, SessionEvent::Start { .. })),
+        "nothing was admitted"
+    );
+}
+
+/// An autoplay session's gated plan charges the gate's storage beside its
+/// own buffers: at the largest render effect queue an ungated autoplay
+/// plan admits, the gated one is refused, and with a smaller queue both
+/// fit; ungated admission is unchanged.
+#[test]
+fn a_gated_autoplay_plan_counts_the_gates_storage() {
+    let (_dir, root) = temp_root();
+    let auto = |effects: i64| SessionConfig {
+        autoplay: Some(game::AutoKeySounds::Scheduled),
+        effects: usize::try_from(effects).unwrap(),
+        ..config()
+    };
+    let at = |effects| admits(&root, chart(), auto(effects));
+    let most = i64::try_from(game::RECORDING_MEMORY / eval::EVENT_BYTES).unwrap();
+    let lo = last_admitted(0, most, |e| at(e).0);
+    assert_eq!(at(lo), (true, false));
+    assert_eq!(at(lo - 200_000), (true, true));
+}
+
+/// An output that renders a block and then reports a failure: the order
+/// an output may take, the samples written before the release fails.
+/// It fails on the first block that sounds, the BGM at chart time 0 that
+/// the transport's commit lets start.
+struct FailsAfterSounding {
+    inner: audio::SimDevice,
+    failed: bool,
+}
+
+impl audio::AudioOutput for FailsAfterSounding {
+    fn rate(&self) -> u32 {
+        self.inner.rate()
+    }
+
+    fn period(&self) -> u32 {
+        self.inner.period()
+    }
+
+    fn wait(&mut self) -> audio::Wake {
+        self.inner.wait()
+    }
+
+    fn write(&mut self, f: impl FnOnce(&mut [f32])) -> Result<(), audio::OutputError> {
+        let mut sounded = false;
+        self.inner.write(|buf| {
+            f(buf);
+            sounded = buf.iter().any(|&s| s != 0.0);
+        })?;
+        if sounded && !self.failed {
+            self.failed = true;
+            return Err(audio::OutputError::DeviceLost);
+        }
+        Ok(())
+    }
+}
+
+impl game::Wakes for FailsAfterSounding {
+    fn next_wake(&self) -> TimeUs {
+        self.inner.next_wake()
+    }
+}
+
+/// The audio pass after the step's look at the gate commits the transport,
+/// renders its block and then fails: the attempt was played, so it is
+/// saved ended midway, never as cancelled before playback. Every way out
+/// of `game::live::play_and_next` settles the gate before recording
+/// closes.
+#[test]
+fn a_failure_after_the_committing_block_leaves_a_played_attempt() {
+    let (_dir, root) = temp_root();
+    let device = audio::SimDevice::new(audio::SimConfig::steady(RATE, PERIOD, TimeUs(0)));
+    let out = FailsAfterSounding {
+        inner: device,
+        failed: false,
+    };
+    let mut s = session_of(
+        &root,
+        &Events::default(),
+        &chart(),
+        common::sources(),
+        out,
+        true,
+    );
+    let report = s.play(script(vec![connect(0)], &[])).unwrap();
+    assert_eq!(report.end, PlayEnd::Aborted(AbortCause::OutputFailed));
+    assert!(report.played());
+    assert_eq!(record(&report).status.end, EndStatus::EndedMidway);
+}
+
+/// A quit queued with a retry at the release that ends a deferred opening
+/// belongs to Preparing: the attempt leaves without opening recording,
+/// whatever came first.
+#[test]
+fn a_quit_at_the_release_of_a_deferred_opening_leaves_before_it_opens() {
+    let (_dir, root) = temp_root();
+    let mut s = session(&root, &Events::default());
+    let items = vec![connect(0), raw(-2_000, 0, Q, 1), raw(-600, 0, Q, 0)];
+    let ran = s.play(script(
+        items,
+        &[(-600, Command::Retry), (-600, Command::Quit)],
+    ));
+    assert!(matches!(ran, Err(game::SessionPlayError::Left)), "{ran:?}");
+    assert_eq!(bgm_starts(&mut s), 0);
+}
+
+/// A quit while a hold defers the opening is answered through the public
+/// method: nothing opened, nothing saved.
+#[test]
+fn a_quit_while_the_opening_is_deferred_plays_nothing() {
+    let (_dir, root) = temp_root();
+    let mut s = session(&root, &Events::default());
+    let items = vec![connect(0), raw(-2_000, 0, Q, 1)];
+    let ran = s.play(script(items, &[(-500, Command::Quit)]));
+    assert!(matches!(ran, Err(game::SessionPlayError::Left)), "{ran:?}");
+}
+
+/// Each attempt numbers its candidates after the last one's, through the
+/// lifecycle: an attempt cancelled before playback, then one that plays,
+/// whose candidate is the gate's second.
+#[test]
+fn a_second_attempt_numbers_its_candidate_after_the_first() {
+    let (_dir, root) = temp_root();
+    let mut s = session(&root, &Events::default());
+    let one = s
+        .play(script(vec![connect(0)], &[(-500, Command::Retry)]))
+        .unwrap();
+    assert_cancelled(&one, CancelReason::Retry);
+    assert_eq!(s.presentation().unwrap().generation, 1);
+    let two = s.play(script(notes_from(0), &[])).unwrap();
+    assert!(two.played());
+    assert_eq!(s.presentation().unwrap().generation, 2);
+}
+
+/// The scheduled BGM before chart time 0 waits for the transport's commit
+/// in a gated play (design.md "Play Lifecycle", the start gate), where an
+/// ungated play starts it at its time.
+#[test]
+fn pre_zero_bgm_waits_for_the_commit_in_a_gated_play() {
+    let chart = ChartBuilder::new(150_000)
+        .sound("bgm.wav")
+        .tap(lane(1), TimeUs(1_000 * MS))
+        .bgm(TimeUs(-300 * MS), SoundId(0))
+        .build()
+        .unwrap();
+    let mut frames = Vec::new();
+    for gated in [false, true] {
+        let (_dir, root) = temp_root();
+        let device = audio::SimDevice::new(audio::SimConfig::steady(RATE, PERIOD, TimeUs(0)));
+        let out = audio::RecordingOutput::new(device, 0);
+        let mut s = session_of(
+            &root,
+            &Events::default(),
+            &chart,
+            common::sources(),
+            out,
+            gated,
+        );
+        let mut items = vec![connect(0)];
+        items.extend(tap(1, 1_000));
+        s.play(script(items, &[])).unwrap();
+        let mut frame = None;
+        s.drain_scheduled(|e| {
+            if matches!(e.kind, audio::ScheduledKind::Bgm { .. }) {
+                frame = Some(e.frame);
+            }
+        });
+        frames.push(frame.unwrap());
+    }
+    // 300 ms is 14 400 frames at 48 kHz: the gated start is that much
+    // later, within a pass.
+    let late = frames[1] - frames[0];
+    assert!(
+        (14_400 - u64::from(PERIOD)..=14_400 + u64::from(PERIOD)).contains(&late),
+        "{frames:?}"
+    );
 }

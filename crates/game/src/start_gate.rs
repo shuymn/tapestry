@@ -122,7 +122,7 @@ pub(crate) struct ScriptedGate<'a> {
     /// The armed candidate's generation, until the audio side commits
     /// or drops it.
     pending: Option<u32>,
-    adjust: Option<&'a mut SessionAdjust>,
+    adjust: &'a mut SessionAdjust,
 }
 
 impl<'a> ScriptedGate<'a> {
@@ -130,7 +130,7 @@ impl<'a> ScriptedGate<'a> {
         gate: StartGate,
         commit_at: TimeUs,
         opens_at: TimeUs,
-        adjust: Option<&'a mut SessionAdjust>,
+        adjust: &'a mut SessionAdjust,
     ) -> Self {
         Self {
             gate,
@@ -150,16 +150,14 @@ impl<'a> ScriptedGate<'a> {
     /// 0 at `chart0` on the script's timeline.
     pub(crate) fn opened(&mut self, generation: u32, at: TimeUs, chart0: TimeUs) {
         self.pending = Some(generation);
-        if let Some(a) = &mut self.adjust {
-            a.phase(
+        self.adjust.phase(
+            at,
+            Head::Clock {
                 at,
-                Head::Clock {
-                    at,
-                    chart: TimeUs(at.0.saturating_sub(chart0.0)),
-                },
-                generation,
-            );
-        }
+                chart: TimeUs(at.0.saturating_sub(chart0.0)),
+            },
+            generation,
+        );
     }
 
     /// Candidate `generation` was cancelled at script time `at`: nothing
@@ -170,9 +168,7 @@ impl<'a> ScriptedGate<'a> {
             self.pending = None;
         }
         let opens_at = self.opens_at;
-        if let Some(a) = &mut self.adjust {
-            a.phase(at, Head::Frozen { opens_at }, generation);
-        }
+        self.adjust.phase(at, Head::Frozen { opens_at }, generation);
     }
 
     /// Cancels candidate `generation` unless its transport committed
@@ -206,8 +202,6 @@ impl<'a> ScriptedGate<'a> {
 
     /// The reducer's side, after the input side's batch.
     pub(crate) fn drain(&mut self) {
-        if let Some(a) = &mut self.adjust {
-            a.drain();
-        }
+        self.adjust.drain();
     }
 }

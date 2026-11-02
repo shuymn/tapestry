@@ -923,23 +923,18 @@ fn play_and_next<R: Rig>(
             failed.take()
         };
         // Before its transport commits, a gated attempt's candidate is
-        // cancelled by a hold and rearmed by a release, and whatever ends
-        // the attempt ends it without a played attempt. An ending is
-        // settled on the start gate in one atomic outcome: a transport that
-        // committed meanwhile makes the attempt played, and it ends as any
-        // play does.
-        if let Some(g) = gate.as_mut().filter(|g| !g.committed)
+        // cancelled by a hold and rearmed by a release; whatever ends the
+        // attempt ends the loop here, and the gate settles whether it was
+        // played once the loop is left (below).
+        if let Some(g) = gate.as_ref().filter(|g| !g.committed)
             && let Some(cause) = ending
         {
-            if g.waiting || !rig.settle_candidate(generation) {
-                if !g.waiting {
-                    logic.abort(cause);
-                }
-                rig.cancel_candidate(generation);
-                last = now;
-                break PlayEnd::Aborted(cause);
+            if !g.waiting {
+                logic.abort(cause);
+                rig.cancel_audio();
             }
-            g.committed = true;
+            last = now;
+            break PlayEnd::Aborted(cause);
         }
         if let Some(g) = gate.as_mut().filter(|g| !g.committed) {
             let step = if g.waiting {
@@ -968,7 +963,6 @@ fn play_and_next<R: Rig>(
                     if let AbortCause::InputFailed = cause {
                         input_error = rig.input_failure().or(Some(InputWaitError::Gone));
                     }
-                    rig.cancel_candidate(generation);
                     last = now;
                     break PlayEnd::Aborted(cause);
                 }
@@ -1013,6 +1007,19 @@ fn play_and_next<R: Rig>(
             break PlayEnd::Aborted(AbortCause::GaugeFailed);
         }
     };
+    // Every way out of a gated attempt not yet seen committed, whatever
+    // ended it (a command, a failure before or after the step's audio, the
+    // evaluator, a completion), settles the start gate here, before
+    // recording closes and disarms it, in one atomic outcome: a transport
+    // that committed meanwhile makes the attempt played; otherwise the
+    // candidate is cancelled and its audio acknowledged dropped.
+    if let Some(g) = gate.as_mut().filter(|g| !g.committed) {
+        if !g.waiting && rig.settle_candidate(generation) {
+            g.committed = true;
+        } else {
+            rig.cancel_candidate(generation);
+        }
+    }
     // Stopped, completed or failed: no frame from here on is playing, the
     // tail's and the ring-out's included.
     logic.stop_playing();
@@ -1181,10 +1188,14 @@ fn open_gated<R: Rig>(
             // The threads and the screen prepared for the attempt, as
             // before any opening: a screen lost while held ends the run.
             preflight(rig)?;
-            // A retry or suspend before recording opens belongs to no
-            // play.
-            if rig.quitting() || rig.take() == Some(Command::Quit) {
-                while rig.take().is_some() {}
+            // Every command pending is taken before the opening is asked
+            // again: a retry or suspend before recording opens belongs to
+            // no play, and a quit among them leaves, whatever came first.
+            let mut quit = rig.quitting();
+            while let Some(c) = rig.take() {
+                quit |= c == Command::Quit;
+            }
+            if quit {
                 return Ok(None);
             }
             if !rig.holding() {

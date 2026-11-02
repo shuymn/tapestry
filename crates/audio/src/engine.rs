@@ -645,10 +645,7 @@ impl AudioEngine {
                     let admitted = admit();
                     report.transport = Some(admitted);
                     if !admitted {
-                        self.mixer.stop_all();
-                        self.next_bgm = self.bgm.len();
-                        self.seek_to = None;
-                        self.clear_ring_out();
+                        self.stop();
                     }
                 } else {
                     held = true;

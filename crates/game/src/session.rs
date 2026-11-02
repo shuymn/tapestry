@@ -1145,7 +1145,7 @@ impl Loaded {
         gate: Option<usize>,
     ) -> Result<PlayPlan, LogicError> {
         if self.config.autoplay.is_some() {
-            return self.autoplay_plan(kinds, axes);
+            return self.autoplay_plan(kinds, axes, gate);
         }
         let device = self.settings.device.profile(kinds, axes);
         // Per source: its recorded lane buttons and keys, and its recorded
@@ -1227,11 +1227,13 @@ impl Loaded {
         }
     }
 
-    /// [`plan`](Self::plan) for an autoplay session.
+    /// [`plan_gated`](Self::plan_gated) for an autoplay session: the gate's
+    /// storage, when `gate` gives it, is charged beside autoplay's own.
     fn autoplay_plan(
         &self,
         kinds: &[DeviceKind],
         axes: &[Vec<input::hid::AxisCap>],
+        gate: Option<usize>,
     ) -> Result<PlayPlan, LogicError> {
         let device = self.autoplay_device().profile(kinds, axes);
         let generated = generated();
@@ -1254,6 +1256,7 @@ impl Loaded {
         .map_err(LogicError::Eval)?;
         let r = Reservation::from_probe(&probe, &device, self.config.effects)
             .with_autoplay(inputs, schedule);
+        let r = gate.map_or(r, |held| r.with_gate(held));
         if !r.fits(inputs) {
             return Err(LogicError::RecordingTooLarge {
                 needed: inputs,
@@ -1290,7 +1293,7 @@ impl Loaded {
     /// the budget, and
     /// [`AutoplayError::Time`] for a note too late to press.
     pub fn autoplay(&self) -> Result<Autoplay, AutoplayError> {
-        self.autoplay_plan(&[DeviceKind::Keyboard], &[Vec::new()])?;
+        self.autoplay_plan(&[DeviceKind::Keyboard], &[Vec::new()], None)?;
         let generated = generated();
         let events = input::autoplay(&self.chart, &generated)?;
         Ok(Autoplay {
@@ -1583,11 +1586,12 @@ impl<O: AudioOutput + Wakes> Session<O> {
     /// round whose schedule is not the engine's (a practice set on the
     /// [`Loaded`] before [`Loaded::start`] rather than through
     /// [`set_practice`](Self::set_practice)): refused before recording
-    /// opens.
+    /// opens. [`SessionPlayError::Left`] when, with the start gate, the
+    /// script quit while a hold deferred the opening.
     pub fn play(&mut self, script: PlayScript) -> Result<PlayReport, SessionPlayError> {
         match self.play_until(script, None)? {
             Some(report) => Ok(report),
-            None => unreachable!("a session never quits before recording opens"),
+            None => Err(SessionPlayError::Left),
         }
     }
 
@@ -1668,7 +1672,7 @@ impl<O: AudioOutput + Wakes> Session<O> {
                 g.gate.clone(),
                 commit_at,
                 loaded.opens_at(),
-                Some(&mut g.adjust),
+                &mut g.adjust,
             )
         });
         let mut rig = SessionRig {
@@ -1732,6 +1736,10 @@ pub enum SessionPlayError {
     /// not start.
     #[error("the round cannot be prepared")]
     Refused(#[source] crate::PreparationRefusal),
+    /// The player left before recording opened (a quit while a held START
+    /// or SELECT deferred the opening): nothing was played or saved.
+    #[error("the player left before recording opened")]
+    Left,
 }
 
 /// The session's rig: one step of the virtual clock per wait, the script
@@ -1770,6 +1778,23 @@ struct SessionRig<'s, O> {
 }
 
 impl<O: AudioOutput + Wakes> SessionRig<'_, O> {
+    /// Starts the play's audio with chart time 0 at `origin`, as the audio
+    /// thread starts a play or a rearmed candidate: the engine restarted,
+    /// a round's restore applied (the lead-in's start, else its fallback,
+    /// else silence: design.md "Mid-Chart Start and Section Repeat"), and,
+    /// in a gated session, the transport held for the candidate's commit.
+    fn restart_audio(&mut self, origin: TimeUs) {
+        let engine = self.audio.engine_mut();
+        engine.restart(origin);
+        if let Some(restore) = self.restore.take() {
+            restore.apply(engine);
+        }
+        if let Some(g) = &self.gate {
+            g.hold(engine);
+        }
+        self.sealed = false;
+    }
+
     /// Every buffer event due before `now` (with `through`, at `now` too),
     /// until the output fails. In a gated session the engine holds the
     /// armed candidate's transport: the pass whose block reaches its commit
@@ -2004,15 +2029,7 @@ impl<O: AudioOutput + Wakes> Rig for SessionRig<'_, O> {
     }
 
     fn restart_candidate(&mut self, origin: TimeUs, _generation: u32) {
-        let engine = self.audio.engine_mut();
-        engine.restart(origin);
-        if let Some(restore) = self.restore.take() {
-            restore.apply(engine);
-        }
-        if let Some(g) = &self.gate {
-            g.hold(engine);
-        }
-        self.sealed = false;
+        self.restart_audio(origin);
     }
 
     fn snapshot_capacity(&self) -> usize {
@@ -2020,20 +2037,9 @@ impl<O: AudioOutput + Wakes> Rig for SessionRig<'_, O> {
     }
 
     fn start(&mut self, origin: TimeUs, sounds: AudioQueue, screen: RenderSide) {
-        let engine = self.audio.engine_mut();
-        engine.restart(origin);
-        // As the audio thread restores a round: the lead-in's start, else
-        // its fallback, else silence (design.md "Mid-Chart Start and
-        // Section Repeat").
-        if let Some(restore) = self.restore.take() {
-            restore.apply(engine);
-        }
-        if let Some(g) = &self.gate {
-            g.hold(engine);
-        }
+        self.restart_audio(origin);
         self.sounds = Some(sounds);
         self.screen = Some(screen);
-        self.sealed = false;
     }
 
     fn focus_lost(&self) -> bool {
