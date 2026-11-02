@@ -275,7 +275,7 @@ fn memory_is_capped_before_it_is_allocated() {
         "local s = string.rep(\"x\", 80 << 20)",
         "local s = string.rep(\"x\", 1 << 20)\nlocal t = {}\nfor i = 1, 100 do t[i] = s .. i end",
         "pcall(string.rep, \"x\", 80 << 20)",
-        "pcall(function() local t = {} for i = 1, 100 do t[i] = string.rep(\"x\", 1 << 20) .. i end end)",
+        "pcall(function() local s = \"x\" for i = 1, 40 do s = s .. s end end)",
     ] {
         let d = configured(body);
         assert_eq!(why(import(&d)), LuaWhy::Limit(LuaLimit::Memory), "{body}");
@@ -326,6 +326,19 @@ fn native_library_work_is_charged_before_the_call() {
         "pcall(string.gsub, string.rep(\"a\", 3000), \"(a-)(a-)(a-)b\", \"\")",
         "table.move({}, 1, 1 << 40, 1)",
         "local s = string.rep(\"a\", 3000)\nlocal f = s.match\npcall(f, s, \".-.-.-x\")",
+        // Every argument form Lua accepts is charged as it is read.
+        "table.move({}, 1.0, 2^40, 1.0)",
+        "table.move({}, \"1\", \"1099511627776\", 1)",
+        "pcall(string.rep, \"xx\", \"1e8\")",
+        "table.concat(setmetatable({}, { __len = function() return 1 << 40 end }))",
+        "table.unpack({}, 1.0, 2^40)",
+        "for w in string.gmatch(string.rep(\"ab \", 100000), \"%a+\") do end",
+        // Repeated small results add up: each call's output is charged.
+        "for i = 1, 2000000 do local s = string.upper(\"abcdefghijklmnopqrstuvwxyz0123456789abcdefghij\") end",
+        "local s = string.rep(\"a\", 1000)\nlocal r = string.rep(\"b\", 1000)\n\
+         for i = 1, 200 do local t = string.gsub(s, \"a\", r) end",
+        "local s = string.rep(\"a\", 100000)\n\
+         for i = 1, 600 do for w in s:gmatch(\"^a+\") do end end",
     ] {
         let d = configured(body);
         assert_eq!(
@@ -409,7 +422,7 @@ fn a_metatable_is_fixed_when_it_is_attached() {
 fn an_error_handler_that_does_not_complete_is_fatal() {
     for (handler, want) in [
         (
-            "function() return string.rep(\"x\", 80 << 20) end",
+            "function() local s = \"x\" for i = 1, 40 do s = s .. s end return s end",
             [LuaLimit::Memory, LuaLimit::Handler],
         ),
         (

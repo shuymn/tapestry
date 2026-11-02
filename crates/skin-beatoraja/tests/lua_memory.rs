@@ -147,7 +147,7 @@ fn lua_import_memory_is_bounded_and_freed() {
 
     // The VM at its cap: refused, everything freed.
     let vm_cap = folder(&configured(
-        "local t = {}\nfor i = 1, 100 do t[i] = string.rep(\"x\", 1 << 20) .. i end",
+        "local t = {}\nlocal s = string.rep(\"x\", 1 << 20)\nfor i = 1, 100 do t[i] = s .. i end",
     ));
     let p = record(
         "memory_cap",

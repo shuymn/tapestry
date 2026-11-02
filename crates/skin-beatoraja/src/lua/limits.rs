@@ -25,9 +25,18 @@ pub const INSTRUCTION_STEP: u32 = 1_000;
 /// The most calls into the functions the host exposes, each charged
 /// before it does any work.
 pub const MAX_HOST_CALLS: u32 = 100_000;
-/// The most work the library's native loops may do, which the
-/// instruction count does not see: a pattern match's worst case,
-/// `(length + 1)` to the power of its repetitions (one more unanchored)
-/// times the pattern's length, and one unit an element `table.move`
-/// copies or `table.sort` compares. Charged before the call.
+/// The most work the string and table libraries' native loops may do,
+/// which the instruction count does not see, in units of a byte or an
+/// element. Each call is charged its worst case before it runs, from its
+/// arguments as Lua coerces them (whole floats and numeric strings
+/// included): a pattern match `(length + 1)` to the power of its
+/// repetitions (one more unanchored) times the pattern's length, each
+/// element `table.move`, `table.concat`, `table.unpack`, `table.insert`
+/// and `table.remove` may touch, `n log n` for `table.sort`, a
+/// `string.rep`'s result, and the input of the byte-wise functions. What a
+/// call returns is charged again after it, a byte a byte and a unit a
+/// value, so that repeated small results add up; `gmatch`'s iterator is
+/// charged at each step. The VM's own string concatenation and comparison
+/// are not library calls: each is one instruction over strings the memory
+/// limit bounds.
 pub const MAX_NATIVE_WORK: u64 = 100_000_000;

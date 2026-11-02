@@ -248,68 +248,216 @@ fn snapshot(lua: &Lua, pass: &Pass, mt: &Table) -> mlua::Result<Table> {
     Ok(copy)
 }
 
-/// The library functions whose native loops the instruction hook does not
-/// see, wrapped to charge their worst case first.
-fn natives(lua: &Lua, pass: &Rc<Pass>, env: &Table) -> mlua::Result<()> {
-    let string: Table = env.raw_get("string")?;
-    for name in ["find", "match", "gmatch", "gsub"] {
-        let native: Function = string.raw_get(name)?;
-        let plain_find = name == "find";
-        let f = host(lua, pass, move |lua, pass, args| {
-            let len = |i: usize| match args.get(i) {
-                Some(Value::String(s)) => s.as_bytes().len(),
-                // A number is converted to at most a few dozen bytes.
-                _ => 64,
-            };
-            let plain = plain_find
-                && args
-                    .get(3)
-                    .is_some_and(|v| !matches!(v, Value::Nil | Value::Boolean(false)));
-            let work = match args.get(1) {
-                _ if plain => to_u64(len(0)).saturating_mul(to_u64(len(1)).saturating_add(1)),
-                Some(Value::String(p)) => pattern_work(len(0), &p.as_bytes()),
-                _ => pattern_work(len(0), &[]),
-            };
-            pass.ledger.native(lua, work)?;
-            native.call::<MultiValue>(args)
-        })?;
-        string.raw_set(name, f)?;
-    }
-    let table: Table = env.raw_get("table")?;
-    let native_move: Function = table.raw_get("move")?;
-    table.raw_set(
-        "move",
-        host(lua, pass, move |lua, pass, args| {
-            let int = |i: usize| match args.get(i) {
-                Some(Value::Integer(n)) => Some(*n),
-                _ => None,
-            };
-            if let (Some(f), Some(e)) = (int(1), int(2))
-                && e >= f
-            {
-                let count = u64::try_from(i128::from(e) - i128::from(f) + 1).unwrap_or(u64::MAX);
-                pass.ledger.native(lua, count)?;
-            }
-            native_move.call::<MultiValue>(args)
-        })?,
-    )?;
-    let native_sort: Function = table.raw_get("sort")?;
-    table.raw_set(
-        "sort",
-        host(lua, pass, move |lua, pass, args| {
-            if let Some(Value::Table(t)) = args.front() {
-                let n = to_u64(t.raw_len());
-                let log = u64::from(u64::BITS - n.leading_zeros());
-                pass.ledger.native(lua, n.saturating_mul(log.max(1)))?;
-            }
-            native_sort.call::<MultiValue>(args)
-        })?,
-    )?;
-    Ok(())
+/// How a library function's worst case is charged before it runs, from
+/// its arguments as Lua coerces them.
+#[derive(Clone, Copy)]
+enum Cost {
+    /// A pattern match over argument 0 with pattern argument 1; `find`
+    /// may be plain (argument 3).
+    Pattern { plain: bool },
+    /// Linear in argument 0's length.
+    Length,
+    /// `string.rep(s, n, sep)`: the result's length.
+    Rep,
+    /// `string.format(fmt, ...)`: its arguments' lengths.
+    Format,
+    /// Linear in the number of arguments.
+    Arguments,
+    /// `table.move(a1, f, e, t)`: the elements copied.
+    Move,
+    /// `table.concat(t, sep, i, j)` and `table.unpack(t, i, j)`: the
+    /// elements read, each with a separator; `range` is where `i` is.
+    Range { range: usize },
+    /// `table.insert` and `table.remove`: the elements shifted.
+    Shift,
+    /// `table.sort`: `n log n` comparisons.
+    Sort,
 }
+
+/// The string and table functions wrapped, with their cost. Every other
+/// one (`len`, `sub`, `math`) costs a constant or what its result's
+/// charge counts.
+const NATIVES: [(&str, &str, Cost); 18] = [
+    ("string", "find", Cost::Pattern { plain: true }),
+    ("string", "match", Cost::Pattern { plain: false }),
+    ("string", "gmatch", Cost::Pattern { plain: false }),
+    ("string", "gsub", Cost::Pattern { plain: false }),
+    ("string", "byte", Cost::Length),
+    ("string", "char", Cost::Arguments),
+    ("string", "format", Cost::Format),
+    ("string", "lower", Cost::Length),
+    ("string", "upper", Cost::Length),
+    ("string", "reverse", Cost::Length),
+    ("string", "rep", Cost::Rep),
+    ("table", "concat", Cost::Range { range: 2 }),
+    ("table", "unpack", Cost::Range { range: 1 }),
+    ("table", "pack", Cost::Arguments),
+    ("table", "move", Cost::Move),
+    ("table", "insert", Cost::Shift),
+    ("table", "remove", Cost::Shift),
+    ("table", "sort", Cost::Sort),
+];
 
 fn to_u64(n: usize) -> u64 {
     u64::try_from(n).unwrap_or(u64::MAX)
+}
+
+/// The elements from `f` to `e`, none when `e` is below `f`.
+fn span(f: i64, e: i64) -> u64 {
+    u64::try_from(i128::from(e) - i128::from(f) + 1).unwrap_or(0)
+}
+
+/// Argument `i` as Lua coerces it to an integer.
+fn integer(lua: &Lua, args: &MultiValue, i: usize) -> mlua::Result<Option<i64>> {
+    match args.get(i) {
+        Some(v) => lua.coerce_integer(v.clone()),
+        None => Ok(None),
+    }
+}
+
+/// The length of argument `i` as Lua coerces it to a string.
+fn length(lua: &Lua, args: &MultiValue, i: usize) -> mlua::Result<u64> {
+    Ok(match args.get(i) {
+        Some(v) => lua
+            .coerce_string(v.clone())?
+            .map_or(0, |s| to_u64(s.as_bytes().len())),
+        None => 0,
+    })
+}
+
+/// The length of table argument 0, as the library reads it (`__len`
+/// honoured).
+fn table_len(args: &MultiValue) -> mlua::Result<i64> {
+    match args.front() {
+        Some(Value::Table(t)) => t.len(),
+        _ => Ok(0),
+    }
+}
+
+impl Cost {
+    /// The work the call may do, before it runs.
+    fn before(self, lua: &Lua, args: &MultiValue) -> mlua::Result<u64> {
+        Ok(match self {
+            Self::Pattern { plain } => {
+                let subject = length(lua, args, 0)?;
+                let plain = plain
+                    && args
+                        .get(3)
+                        .is_some_and(|v| !matches!(v, Value::Nil | Value::Boolean(false)));
+                let pattern = match args.get(1) {
+                    Some(v) => lua.coerce_string(v.clone())?,
+                    None => None,
+                };
+                let pattern = pattern
+                    .as_ref()
+                    .map(|p| p.as_bytes().to_vec())
+                    .unwrap_or_default();
+                if plain {
+                    subject.saturating_mul(to_u64(pattern.len()).saturating_add(1))
+                } else {
+                    pattern_work(usize::try_from(subject).unwrap_or(usize::MAX), &pattern)
+                }
+            }
+            Self::Length => length(lua, args, 0)?,
+            Self::Rep => {
+                let n = u64::try_from(integer(lua, args, 1)?.unwrap_or(0)).unwrap_or(0);
+                let each = length(lua, args, 0)?.saturating_add(length(lua, args, 2)?);
+                n.saturating_mul(each)
+            }
+            Self::Format => {
+                let mut sum = 0_u64;
+                for i in 0..args.len() {
+                    sum = sum.saturating_add(length(lua, args, i)?).saturating_add(1);
+                }
+                sum
+            }
+            Self::Arguments => to_u64(args.len()),
+            Self::Move => match (integer(lua, args, 1)?, integer(lua, args, 2)?) {
+                (Some(f), Some(e)) => span(f, e),
+                _ => 0,
+            },
+            Self::Range { range } => {
+                let f = integer(lua, args, range)?.unwrap_or(1);
+                let e = match integer(lua, args, range + 1)? {
+                    Some(e) => e,
+                    None => table_len(args)?,
+                };
+                let sep = if range == 2 { length(lua, args, 1)? } else { 0 };
+                span(f, e).saturating_mul(sep.saturating_add(1))
+            }
+            Self::Shift => u64::try_from(table_len(args)?)
+                .unwrap_or(0)
+                .saturating_add(1),
+            Self::Sort => {
+                let n = u64::try_from(table_len(args)?).unwrap_or(0);
+                let log = u64::from(u64::BITS - n.leading_zeros());
+                n.saturating_mul(log.max(1))
+            }
+        })
+    }
+}
+
+/// What a library function produced: one unit a value and a byte a
+/// string's byte, charged after it returns, so repeated small results add
+/// up.
+fn produced(values: &MultiValue) -> u64 {
+    values.iter().fold(0_u64, |sum, v| {
+        let bytes = match v {
+            Value::String(s) => to_u64(s.as_bytes().len()),
+            _ => 0,
+        };
+        sum.saturating_add(bytes).saturating_add(1)
+    })
+}
+
+/// `native` wrapped: the fault and cancellation checked before and after,
+/// its worst case charged before it runs and its result after. Not a host
+/// call: the library is Lua's own.
+fn native(
+    lua: &Lua,
+    pass: &Rc<Pass>,
+    f: Function,
+    cost: Cost,
+    iterator: bool,
+) -> mlua::Result<Function> {
+    let pass = Rc::clone(pass);
+    lua.create_function(move |lua, args: MultiValue| {
+        pass.ledger.check(lua)?;
+        let work = cost.before(lua, &args)?;
+        pass.ledger.native(lua, work)?;
+        let values = f.call::<MultiValue>(args);
+        pass.ledger.check(lua)?;
+        let mut values = values.map_err(|e| match e {
+            mlua::Error::MemoryError(_) => {
+                pass.ledger.fail_lua(lua, LuaWhy::Limit(LuaLimit::Memory))
+            }
+            e => e,
+        })?;
+        pass.ledger.native(lua, produced(&values))?;
+        // `gmatch`'s iterator matches on each call: each is charged as
+        // a call that produces its captures.
+        if iterator && let Some(Value::Function(next)) = values.pop_front() {
+            values.push_front(Value::Function(native(
+                lua,
+                &pass,
+                next,
+                Cost::Arguments,
+                false,
+            )?));
+        }
+        Ok(values)
+    })
+}
+
+/// The library functions whose native loops the instruction hook does not
+/// see, wrapped to charge their worst case first and their result after.
+fn natives(lua: &Lua, pass: &Rc<Pass>, env: &Table) -> mlua::Result<()> {
+    for (lib, name, cost) in NATIVES {
+        let table: Table = env.raw_get(lib)?;
+        let f: Function = table.raw_get(name)?;
+        table.raw_set(name, native(lua, pass, f, cost, name == "gmatch")?)?;
+    }
+    Ok(())
 }
 
 /// A pattern match's worst case over a subject of `len` bytes: every
