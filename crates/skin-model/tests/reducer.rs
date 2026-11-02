@@ -563,6 +563,29 @@ fn last_note_starts_at_the_notes_end() {
     assert_eq!(h.start(timer::LAST_NOTE), Some(3_000 * MS));
 }
 
+/// `last_note` keeps µs precision: off a µs before an end inside a
+/// millisecond, on at it, and anchored to exactly that end after a
+/// delayed frame.
+#[test]
+fn last_note_keeps_microseconds() {
+    let chart = taps_chart();
+    let end = 3_000 * MS + 500;
+    let ctx = PlayContext {
+        last_note_end: TimeUs(end),
+        bpm_range: None,
+        ..full(0)
+    };
+    let mut h = Harness::empty(&chart, &ctx);
+    h.frame_us(end - 1, &[]);
+    assert_eq!(h.start(timer::LAST_NOTE), None);
+    h.frame_us(end, &[]);
+    assert_eq!(h.start(timer::LAST_NOTE), Some(end));
+    let mut h = Harness::empty(&chart, &ctx);
+    h.frame_us(end - 1, &[]);
+    h.frame_us(3_017 * MS + 250, &[]);
+    assert_eq!(h.start(timer::LAST_NOTE), Some(end));
+}
+
 /// The bomb threshold covers grades from PERFECT through `bomb_up_to`,
 /// an empty POOR on its lane last (`play/JudgeManager.java:673`).
 #[test]
