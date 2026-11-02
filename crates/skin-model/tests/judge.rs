@@ -873,11 +873,15 @@ fn an_attached_judge_scales_with_its_region() {
             .map(|q| [q[0] - r[2][0], q[1] - r[2][1], q[2], q[3]])
             .collect()
     };
-    let doubled: Vec<[f32; 4]> = from_grade(&one)
-        .into_iter()
-        .map(|q| q.map(|v| 2.0 * v))
-        .collect();
-    assert_eq!(from_grade(&two), doubled);
+    // The cells at 100 and 110 from the shifted paint at 120 (from the
+    // paint, they would be 10 and 20 right of it), then the same doubled.
+    let at_100 = [
+        [-20.0, 0.0, 10.0, 20.0],
+        [-10.0, 0.0, 10.0, 20.0],
+        [0.0, 0.0, 20.0, 20.0],
+    ];
+    assert_eq!(from_grade(&one), at_100);
+    assert_eq!(from_grade(&two), at_100.map(|q| q.map(|v| 2.0 * v)));
 }
 
 /// A rect track over `rects`, the i-th key at `times[i]`, under `ease`

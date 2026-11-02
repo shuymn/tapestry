@@ -1826,6 +1826,7 @@ fn build_does_not_allocate() {
     fallback_lanes_do_not_allocate(&chart, &full);
     bar_groups_do_not_allocate(&full);
     cover_trims_do_not_allocate(&chart, &full);
+    grade_attachments_do_not_allocate(&full);
     // The next attempt, prepared untracked after the stretches, builds.
     let mut play = skin.prepare(&chart, &full).unwrap();
     skin.attach_text(&mut play, text_table()).unwrap();
@@ -2831,6 +2832,226 @@ fn bar_groups_do_not_allocate(ctx: &PlayContext<'_>) {
         quads > 0 && turned > 0 && drops > 0,
         "bar groups drew {quads} bars, {turned} turned, {drops} drops"
     );
+}
+
+/// The attached grades of [`grade_attachments_do_not_allocate`]: `A`
+/// (shifting) has no full-gauge grade, so PERFECT's attached grade stands
+/// in beside the full-gauge combo; `B` has no full-gauge combo, so its
+/// attached full-gauge grade takes PERFECT's. Each attachment moves on
+/// `judge` with its paint; each combo moves on `ready`.
+fn attached_judges() -> (Vec<JudgeDef>, [Track; 2], Track) {
+    let rects = |x: i32, y: i32, w: i32, h: i32, dy: i32| {
+        let key = |at: i64, y: i32| {
+            let mut props = [None; 9];
+            props[..4].copy_from_slice(&[Some(x), Some(y), Some(w), Some(h)]);
+            KeyDef {
+                at: TimeUs(at),
+                props,
+            }
+        };
+        Track::new(&[key(0, y), key(500 * MS, y + dy)], Ease::Out, End::Hold).unwrap()
+    };
+    let combo_track = {
+        let key = |at: i64, x: i32| {
+            let mut props = [None; 9];
+            props[..4].copy_from_slice(&[Some(x), Some(-20), Some(10), Some(20)]);
+            KeyDef {
+                at: TimeUs(at),
+                props,
+            }
+        };
+        Track::new(&[key(0, 0), key(10_000 * MS, 100)], Ease::Linear, End::Hold).unwrap()
+    };
+    let digits = DigitsDef {
+        image: u32::from(COMBO_10),
+        set: GlyphSet::Ten,
+        cells: 1,
+        align: Align::Left,
+        pad: Pad::Blank,
+        space: 0,
+        offsets: Vec::new(),
+    };
+    let grade = |k: u16, paint: Track, attachment: Option<Track>| GradePart {
+        image: u32::from(GRADES + k),
+        track: paint,
+        timer: TimerRef::Builtin(timer::JUDGE),
+        pivot: Anchor::TopLeft,
+        blend: Blend::Alpha,
+        visible: None,
+        native: None,
+        follow: Follow::None,
+        attachment,
+    };
+    let combo = |attach: Attach| ComboPart {
+        digits: digits.clone(),
+        track: combo_track.clone(),
+        timer: TimerRef::Builtin(timer::READY),
+        attach,
+        pivot: Anchor::TopLeft,
+        blend: Blend::Alpha,
+        visible: None,
+        native: None,
+    };
+    let raw_a = rects(100, 300, 80, 20, 40);
+    let raw_b = rects(400, 300, 80, 20, 20);
+    let mut a = JudgeDef {
+        grades: Default::default(),
+        combos: Default::default(),
+        shift: true,
+    };
+    a.grades[0] = Some(grade(0, rects(130, 300, 20, 20, 40), Some(raw_a.clone())));
+    a.combos[0] = Some(combo(Attach::Top));
+    a.combos[6] = Some(combo(Attach::Bottom));
+    let mut b = JudgeDef {
+        grades: Default::default(),
+        combos: Default::default(),
+        shift: false,
+    };
+    b.grades[0] = Some(grade(0, rects(400, 300, 80, 20, 20), None));
+    b.grades[6] = Some(grade(6, rects(430, 300, 20, 20, 20), Some(raw_b.clone())));
+    b.combos[0] = Some(combo(Attach::Bottom));
+    (vec![a, b], [raw_a, raw_b], combo_track)
+}
+
+/// Attached grades build without allocating: both full-gauge fallbacks,
+/// each attachment on the grade's clock and each combo on its own, over
+/// every target. At the author's 1920×1080, each combo cell is drawn on
+/// its attachment's bottom edge at the combo's own sample, and the
+/// shifting judge's paint half a cell left.
+fn grade_attachments_do_not_allocate(ctx: &PlayContext<'_>) {
+    let (judges, [raw_a, raw_b], combo_track) = attached_judges();
+    let place = Place {
+        region: Region::Judge,
+        ..Place::SCREEN
+    };
+    let still = lanes_support::still([None; 9]);
+    let ready = TimerRef::Builtin(timer::READY);
+    // The fixture's lanes, never drawn.
+    let elements = vec![
+        ElementDef {
+            visible: Some(bool_program("combo < 0")),
+            ..lanes_support::lanes_element()
+        },
+        widget(Source::Judge(0), still.clone(), ready, place),
+        widget(Source::Judge(1), still, ready, place),
+    ];
+    // The sheet's cycles name `when` timers; none of them is drawn here.
+    let whens = (0..32).map(|_| bool_program("combo >= 1")).collect();
+    let loaded = load(
+        whens,
+        elements,
+        skin_model::WidgetDefs {
+            judges,
+            ..skin_model::WidgetDefs::default()
+        },
+    );
+    let skin = &loaded.skin;
+    let chart = ChartBuilder::new(150_000)
+        .tap(lane(1), TimeUs(1_000 * MS))
+        .build()
+        .unwrap();
+    let mut play = skin.prepare(&chart, ctx).unwrap();
+    let mut batch = QuadBatch::with_capacity(skin.quad_capacity(), skin.run_capacity());
+    let gauges = [state(GaugeValue::FULL), state(GaugeValue::FULL)];
+    let before = tally(0);
+    let after = Tally {
+        counts: rules::PerJudgment {
+            perfect: 1,
+            ..before.counts
+        },
+        ex_score: 2,
+        ..tally(1)
+    };
+    let effects = [
+        ev(
+            1_000 * MS,
+            JudgeEventKind::Gauge {
+                gauge: 0,
+                value: GaugeValue::FULL,
+                reference: GaugeValue::FULL,
+            },
+        ),
+        ev(
+            1_000 * MS,
+            JudgeEventKind::Judged {
+                lane: lane(1),
+                note: 0,
+                judgment: Judgment::Perfect,
+                deviation: Some(TimeUs(0)),
+                release: None,
+                combo: 1,
+            },
+        ),
+    ];
+    let layout = SkinLayout::AUTHOR;
+    let lanes = LaneView {
+        visible_time: TimeUs(600 * MS),
+        cover: 0,
+        lift: 0,
+        hidden: 0,
+    };
+    let shown = |q: &skin_model::Quad| loaded.shows.get(&uv_key(q.uv, q.layer)).map(|s| s.0);
+    let mut witnessed = 0_usize;
+    TRACK.with(|t| t.set(true));
+    for (i, now) in (0..3_000 * MS).step_by(16 * MS as usize).enumerate() {
+        let judged = now >= 1_008 * MS;
+        let target = TARGETS[i % TARGETS.len()];
+        let frame = SkinFrame {
+            now: TimeUs(now),
+            display_offset: TimeUs(0),
+            tally: if judged { &after } else { &before },
+            gauges: &gauges,
+            gauge: 0,
+            effects: if now == 1_008 * MS { &effects } else { &[] },
+            complete: false,
+            target,
+            layout: &layout,
+            lanes,
+            readouts: readouts_for(lanes),
+            playing: true,
+        };
+        batch.clear();
+        skin.build(&mut play, &frame, &loaded.uvs, &mut batch)
+            .expect("the frame builds");
+        let q = batch.quads();
+        if now < 1_008 * MS || target != TARGETS[0] {
+            continue;
+        }
+        // Judge A: its combo cell then PERFECT's grade; judge B: its
+        // combo cell then the full-gauge grade.
+        let (Some(ready_at), Some(judge_at)) = (play.timer(timer::READY), play.timer(timer::JUDGE))
+        else {
+            continue;
+        };
+        let c = combo_track.sample(now - ready_at.0).unwrap().rect;
+        let gt = now - judge_at.0;
+        let cell = |raw: &Track| {
+            let a = raw.sample(gt).unwrap().rect;
+            [a[0] + c[0], a[1] + a[3] + c[1], c[2], c[3]]
+        };
+        if q.len() == 4
+            && [shown(&q[0]), shown(&q[1]), shown(&q[2]), shown(&q[3])]
+                == [
+                    Some(COMBO_10),
+                    Some(GRADES),
+                    Some(COMBO_10),
+                    Some(GRADES + 6),
+                ]
+            && q[0].rect == cell(&raw_a)
+            && q[2].rect == cell(&raw_b)
+            && q[1].rect[0] == 125.0
+        {
+            witnessed += 1;
+        }
+    }
+    TRACK.with(|t| t.set(false));
+    assert_eq!(
+        ALLOCS.swap(0, Ordering::Relaxed),
+        0,
+        "grade attachments: allocations"
+    );
+    // 1 008 to 2 992 ms at every fifth frame.
+    assert_eq!(witnessed, 25, "attached frames witnessed");
 }
 
 /// The readouts a stretch's frame `frame_no` gives with `view`: nothing

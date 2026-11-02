@@ -1509,9 +1509,9 @@ fn f4_reaches_its_input_caps(root: &Path) {
 /// keys, a one-key one-digit combo and a one-key outer destination.
 const ANCHORED: usize = 8_192;
 
-/// F14a: [`ANCHORED`] judges at the key and widget quad caps, a quarter of
-/// the keys attachment keys. With `extra`, the first combo has a second
-/// key, leaving the last attachment no room.
+/// F14a: [`ANCHORED`] judges at the key and widget quad caps, three
+/// eighths of the keys (24,576) attachment keys. With `extra`, the first
+/// combo has a second key, leaving the last attachment no room.
 fn f14a(root: &Path, extra: bool) {
     png(root, "a.png", 64, 64);
     let judges = join((0..ANCHORED).map(|i| {
@@ -1861,8 +1861,8 @@ fn import_memory_is_measured() {
         measure(d.path(), |_, _| {})
     );
     drop(d);
-    // F14a: the key cap reached with a quarter of it attachment keys, and
-    // the last attachment refused with a key more.
+    // F14a: the key cap reached with three eighths of it (24,576)
+    // attachment keys, and the last attachment refused with a key more.
     assert_eq!(ANCHORED * (3 + 3 + 1 + 1), MAX_SKIN_KEYS);
     assert_eq!(ANCHORED * 2, MAX_WIDGET_QUADS as usize);
     let d = tempfile::tempdir().unwrap();
