@@ -13,10 +13,9 @@ mod common;
 mod json_support;
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use bms_model::{Chart, ChartBuilder, TimeUs};
-use common::{GAUGES, VISIBLE, context, input, offscreen, view};
+use common::{GAUGES, VISIBLE, context, input, install, loading, offscreen, read_back, view};
 use json_support::{
     ANIMATION, BACKGROUND, FOLLOWER, LANE_LENGTH, LIFT_PAINT, MAGENTA, RED, TRIM_LINE, bundle,
     centre, colour, rgb, text_at,
@@ -30,17 +29,6 @@ const MS: i64 = 1_000;
 
 fn chart() -> Chart {
     ChartBuilder::new(120_000).build().unwrap()
-}
-
-/// `r`'s read back once its submitted frames finished.
-#[track_caller]
-fn read_back(r: &Renderer) -> Vec<u8> {
-    let done = r.gpu().device().poll(wgpu::PollType::Wait {
-        submission_index: None,
-        timeout: Some(Duration::from_secs(10)),
-    });
-    assert!(done.is_ok(), "frames: {done:?}");
-    r.read_back()
 }
 
 /// The chart labels `title`, `artist` and `genre`, no subtitle.
@@ -111,20 +99,6 @@ fn loading_at(lifetime: u64, now: i64, lift: u16, text: u64) -> LoadingFrame<'st
     f.covers.lift_enabled = true;
     f.text = text;
     f
-}
-
-/// Draws loading frame `f` with `text` and reads it back.
-#[track_caller]
-fn loading(r: &mut Renderer, text: &MenuText, f: &LoadingFrame<'_>) -> Vec<u8> {
-    let timing = r.loading_frame(f, text).unwrap().unwrap();
-    assert!(timing.presented);
-    read_back(r)
-}
-
-/// `b` installed chart-independently for `request` and committed.
-fn install(r: &mut Renderer, b: &Arc<SkinBundle>, request: u64) {
-    let token = r.install(b, request).unwrap();
-    r.commit(token).unwrap();
 }
 
 /// The chosen chart's bitmap text, with no rasterized-text producer: laid

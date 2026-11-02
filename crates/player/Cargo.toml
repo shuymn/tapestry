@@ -53,6 +53,8 @@ bms-parser.workspace = true
 png.workspace = true
 rusqlite.workspace = true
 skin-beatoraja.workspace = true
+# The render tests' shared helpers wait on the device.
+wgpu.workspace = true
 tempfile.workspace = true
 toml.workspace = true
 
@@ -64,4 +66,4 @@ workspace = true
 # render's declarative and imported skin support (it writes PNG files and
 # imports through skin-beatoraja).
 [package.metadata.cargo-machete]
-ignored = ["png", "rusqlite", "skin-beatoraja"]
+ignored = ["png", "rusqlite", "skin-beatoraja", "wgpu"]
