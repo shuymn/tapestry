@@ -107,8 +107,10 @@ pub fn background_gate(stop: &dyn Fn() -> bool) -> bool {
         return true;
     }
     let _held = Held;
-    GATE_HELD.store(true, Ordering::SeqCst);
+    // Printed before the hold is published: a script waiting on it reads
+    // the line before anything it does next.
     println!("dev: the background measurement holds at its gate");
+    GATE_HELD.store(true, Ordering::SeqCst);
     while GATE_ARMED.load(Ordering::SeqCst) {
         if stop() {
             println!("dev: the background measurement stopped at its gate");
