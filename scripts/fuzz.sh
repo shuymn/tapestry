@@ -6,7 +6,7 @@
 #   scripts/fuzz.sh build [--sanitizer S]
 #   scripts/fuzz.sh seeds <dir>
 #   scripts/fuzz.sh run <target> <seconds> [--seed N] [--corpus DIR] [--sanitizer S]
-#   scripts/fuzz.sh run-all <seconds> [--seed N] [--corpus DIR] [--sanitizer S]
+#   scripts/fuzz.sh run-all <seconds> [--jobs N] [--seed N] [--corpus DIR] [--sanitizer S]
 #   scripts/fuzz.sh repro <target> <file> [--sanitizer S]
 #   scripts/fuzz.sh canary <panic|hang|malloc|rss> [--corpus DIR] [--sanitizer S]
 #
@@ -39,10 +39,13 @@ cd "$root"
 seed=
 corpus=${TAPESTRY_FUZZ_CORPUS:-}
 sanitizer=address
+# How many targets run-all runs at once; each libFuzzer run uses one core.
+jobs=1
 parse_options() {
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --seed) seed=${2:?--seed needs a value}; shift 2 ;;
+      --jobs) jobs=${2:?--jobs needs a value}; shift 2 ;;
       --corpus) corpus=${2:?--corpus needs a value}; shift 2 ;;
       --sanitizer) sanitizer=${2:?--sanitizer needs a value}; shift 2 ;;
       *) echo "unknown option: $1" >&2; usage ;;
@@ -215,15 +218,65 @@ case "$command" in
     shift
     check_seconds "$seconds"
     parse_options "$@"
+    if ! [[ "$jobs" =~ ^[1-9][0-9]{0,2}$ ]]; then
+      echo "--jobs must be a whole number from 1 to 999: got '$jobs'" >&2
+      exit 2
+    fi
     need_corpus
     fetch
     write_seeds "$corpus/seeds"
-    # Every target runs; the exit status is the first failing one's.
+    # Every target runs, at most $jobs at once; the exit status is the first
+    # failing one's in target order.
+    declare -A status_of=()
+    if [ "$jobs" -eq 1 ]; then
+      for target in "${targets[@]}"; do
+        status=0
+        run_target "$target" "$seconds" || status=$?
+        status_of[$target]=$status
+      done
+    else
+      # Each run's output goes to its own log, printed whole when the run
+      # ends (`wait -n -p` needs bash 5.1). Each run is a process group of
+      # its own (job control), so if this script ends early, the runs still
+      # going are stopped whole, with cargo and the fuzzer under them.
+      logs=$(mktemp -d)
+      declare -A target_of=()
+      cleanup() {
+        local pid
+        for pid in "${!target_of[@]}"; do kill -TERM -- "-$pid" 2>/dev/null || true; done
+        rm -rf "$logs"
+      }
+      set -m
+      trap cleanup EXIT
+      trap 'exit 130' INT
+      trap 'exit 143' TERM
+      running=0
+      next=0
+      while [ "$next" -lt "${#targets[@]}" ] || [ "$running" -gt 0 ]; do
+        if [ "$next" -lt "${#targets[@]}" ] && [ "$running" -lt "$jobs" ]; then
+          target=${targets[$next]}
+          run_target "$target" "$seconds" > "$logs/$target" 2>&1 &
+          target_of[$!]=$target
+          next=$((next + 1))
+          running=$((running + 1))
+          continue
+        fi
+        status=0
+        wait -n -p pid || status=$?
+        target=${target_of[$pid]}
+        cat "$logs/$target"
+        status_of[$target]=$status
+        unset "target_of[$pid]"
+        running=$((running - 1))
+      done
+      set +m
+      trap - EXIT INT TERM
+      rm -rf "$logs"
+    fi
     failed=()
     first_status=0
     for target in "${targets[@]}"; do
-      status=0
-      run_target "$target" "$seconds" || status=$?
+      status=${status_of[$target]}
       if [ "$status" -ne 0 ]; then
         failed+=("$target")
         [ "$first_status" -ne 0 ] || first_status=$status
