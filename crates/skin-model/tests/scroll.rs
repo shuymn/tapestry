@@ -1,21 +1,21 @@
 //! The scroll arithmetic against the simple skin's original: `reference`
 //! holds the original's constants and `Scale` verbatim (crates/render/src/
 //! simple.rs, `layout`), a property test checks that the copy, given the
-//! simple skin's span and line and the position the original samples from
-//! its scroll map, produces the same bits, and a drift guard fails once
-//! the original changes without the reference. The skins' playhead is the
-//! exact one (`ExactPlayhead`), which need not equal the sampled map; only
-//! the arithmetic from a position to pixels is tied. Render is
-//! Windows-only, so the original is read as text, not linked. The guard
-//! goes when the original is deleted.
+//! simple skin's span and line and the same playhead position and initial
+//! rate as the original, produces the same bits, and a drift guard fails
+//! once the original changes without the reference. Both skins take that
+//! position from the exact playhead (`ExactPlayhead`); only the arithmetic
+//! from a position to pixels is tied here. Render is Windows-only, so the
+//! original is read as text, not linked. The guard goes when the original
+//! is deleted.
 
-use bms_model::{DOMAIN, Position, ScrollChange, ScrollMap, TimeUs};
+use bms_model::{Position, ScrollMap, TimeUs};
 use proptest::prelude::*;
 use skin_model::Scale;
 
 #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
 mod reference {
-    use bms_model::{Position, ScrollMap, TimeUs};
+    use bms_model::{Position, TimeUs};
 
     // BEGIN render copy
     /// Top of the lanes, where a note appears `visible_time` before it
@@ -37,18 +37,19 @@ mod reference {
     }
 
     impl Scale {
-        /// The scale at display time `at` with hi-speed `visible_time`. A
-        /// visible time below 1 µs counts as 1 µs.
+        /// The scale with the playhead at `at_line` and hi-speed
+        /// `visible_time`. A visible time below 1 µs counts as 1 µs.
         ///
         /// The lane from [`LANE_TOP`] to [`JUDGE_Y`] holds the scroll of
-        /// `visible_time` at the chart's initial rate. The pixels per
-        /// position never change during a play, whatever the BPM at `at`.
+        /// `visible_time` at the chart's initial rate, `initial_rate` units
+        /// per µs. The pixels per position never change during a play,
+        /// whatever the BPM at the playhead.
         #[must_use]
-        pub fn new(scroll: &ScrollMap, at: TimeUs, visible_time: TimeUs) -> Self {
+        pub fn new(at_line: Position, initial_rate: i128, visible_time: TimeUs) -> Self {
             let visible = visible_time.0.max(1) as f64;
-            let span = visible * scroll.initial_rate() as f64;
+            let span = visible * initial_rate as f64;
             Self {
-                at_line: scroll.position_at(at),
+                at_line,
                 px_per_pos: f64::from(JUDGE_Y - LANE_TOP) / span,
             }
         }
@@ -123,40 +124,12 @@ fn the_simple_span_is_the_originals_f64() {
     assert_eq!(f64::from(reference::JUDGE_Y), 880.0);
 }
 
-/// Scroll maps of up to 6 BPM changes and STOPs anywhere in the domain.
-fn scroll_maps() -> impl Strategy<Value = ScrollMap> {
-    let change = (any::<bool>(), 0..DOMAIN, 1_i64..=1_000_000_000_000).prop_map(|(stop, at, v)| {
-        if stop {
-            ScrollChange::Stop {
-                at: TimeUs(at),
-                len: TimeUs(v % 10_000_000_000 + 1),
-            }
-        } else {
-            ScrollChange::Bpm {
-                at: TimeUs(at),
-                bpm_micro: v,
-            }
-        }
-    });
-    (
-        1_i64..=1_000_000_000_000,
-        prop::collection::vec(change, 0..6),
-    )
-        .prop_filter_map("a valid map", |(bpm, changes)| {
-            ScrollMap::new(bpm, &changes).ok()
-        })
-}
-
-fn times() -> impl Strategy<Value = i64> {
-    prop_oneof![
-        Just(i64::MIN),
-        Just(i64::MAX),
-        Just(-DOMAIN),
-        Just(DOMAIN),
-        Just(0),
-        any::<i64>(),
-        -DOMAIN..=DOMAIN,
-    ]
+/// The initial rates of charts' scroll maps, from the slowest `#BPM` to
+/// the fastest.
+fn initial_rates() -> impl Strategy<Value = i128> {
+    (1_i64..=1_000_000_000_000).prop_filter_map("a valid map", |bpm| {
+        ScrollMap::new(bpm, &[]).ok().map(|m| m.initial_rate())
+    })
 }
 
 fn visible_times() -> impl Strategy<Value = i64> {
@@ -182,21 +155,16 @@ fn positions() -> impl Strategy<Value = i128> {
 proptest! {
     #[test]
     fn the_copy_draws_the_originals_bits(
-        map in scroll_maps(),
-        at in times(),
+        at_line in positions(),
+        rate in initial_rates(),
         visible in visible_times(),
         ps in prop::collection::vec(positions(), 1..8),
         below in 0.0_f32..2_000.0,
         above in 0.0_f32..2_000.0,
     ) {
-        let original = reference::Scale::new(&map, TimeUs(at), TimeUs(visible));
-        let copy = Scale::new(
-            map.position_at(TimeUs(at)),
-            map.initial_rate(),
-            TimeUs(visible),
-            span(),
-            880.0,
-        );
+        let at_line = Position(at_line);
+        let original = reference::Scale::new(at_line, rate, TimeUs(visible));
+        let copy = Scale::new(at_line, rate, TimeUs(visible), span(), 880.0);
         prop_assert_eq!(copy.at_line, original.at_line);
         prop_assert_eq!(copy.px_per_pos.to_bits(), original.px_per_pos.to_bits());
         // Near the line as well as anywhere.

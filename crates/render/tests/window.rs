@@ -96,6 +96,7 @@ fn window_target_presents_and_reads_back_nothing() {
     .expect("WARP renderer on a window");
     assert_eq!(r.gpu().adapter().name, WARP);
     r.load(&chart, None).unwrap();
+    common::prepare(&mut r, &chart);
     assert!(r.has_frame_waitable());
     let v = view(0, 0);
     let mut presented = 0;
