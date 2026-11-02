@@ -852,11 +852,16 @@ impl MenuStats {
 ///
 /// # Errors
 ///
-/// Why the log cannot be read.
+/// Why the log cannot be read, or that it holds no played attempt (a
+/// capture cancelled before playback).
 pub fn script(log: &Path) -> anyhow::Result<ScriptedInput> {
     let limits = DecodeLimits::default();
     let bytes = read_bounded(log, limits.max_compressed)?;
     let rec = replay::decode(&bytes, &limits).with_context(|| log.display().to_string())?;
+    if !rec.played() {
+        return Err(replay::verify::VerifyError::NoPlayedAttempt)
+            .with_context(|| log.display().to_string());
+    }
     let kinds: Vec<DeviceKind> = rec
         .devices
         .sources
