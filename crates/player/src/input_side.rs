@@ -531,13 +531,8 @@ impl Hook {
             (Mode::Autoplay(_), None) => sources.end_batch(now),
             // A script runs on its own timeline, which a rearm does not move.
             #[cfg(feature = "dev-tools")]
-            (Mode::Script(script), Some(origin)) => {
-                let origin = self.script_origin.unwrap_or(origin);
-                input::InputAdapter::poll(&mut script.current, TimeUs(now.0 - origin.0), sources);
-            }
-            #[cfg(feature = "dev-tools")]
-            (Mode::Script(script), None) => {
-                if let Some(origin) = self.script_origin {
+            (Mode::Script(script), origin) => {
+                if let Some(origin) = self.script_origin.or(origin) {
                     input::InputAdapter::poll(
                         &mut script.current,
                         TimeUs(now.0 - origin.0),
