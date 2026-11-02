@@ -600,6 +600,17 @@ const LOAD_TIMEOUT: Duration = Duration::from_secs(30);
 /// left.
 const CANCEL_POLL: Duration = Duration::from_millis(10);
 
+/// The play frames whose acquisition is skipped (a rearm whose view the
+/// logic step has not published yet) that are retried at once, the frame
+/// granted kept; each later retry first waits [`ACQUIRE_WAIT`] for a
+/// message, so a logic step held between the two publications costs no
+/// spinning, and a message still ends the wait at once.
+const ACQUIRE_RETRIES: u32 = 4;
+
+/// How long a play frame waits for a message before its acquisition is
+/// tried again, past [`ACQUIRE_RETRIES`] skips in a row.
+const ACQUIRE_WAIT: Duration = Duration::from_millis(1);
+
 /// How long the end of the render thread is waited for: past it, the thread
 /// is left to the process's exit.
 const EXIT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -1690,6 +1701,8 @@ enum Mode {
         /// (design.md "Play Lifecycle", the start gate): a view of
         /// another starts the screen's runtime over before it is drawn.
         rearms: u64,
+        /// The acquisitions skipped in a row ([`ACQUIRE_RETRIES`]).
+        skipped: u32,
     },
     /// The end screen: [`Run::end_page`].
     End,
@@ -1790,6 +1803,13 @@ impl Run {
                 })
             } else if idle {
                 rx.recv().map_err(|_| TryRecvError::Disconnected)
+            } else if matches!(mode, Mode::Play { skipped, .. } if skipped >= ACQUIRE_RETRIES) {
+                // A play frame's acquisition keeps being skipped: wait a
+                // little, or for a message, before trying it again.
+                rx.recv_timeout(ACQUIRE_WAIT).map_err(|e| match e {
+                    mpsc::RecvTimeoutError::Timeout => TryRecvError::Empty,
+                    mpsc::RecvTimeoutError::Disconnected => TryRecvError::Disconnected,
+                })
             } else {
                 rx.try_recv()
             };
@@ -1989,6 +2009,7 @@ impl Run {
                         gauge,
                         first: true,
                         rearms: 0,
+                        skipped: 0,
                     };
                 }
                 // Without a screen (it failed), the failure stays reported
@@ -2120,6 +2141,7 @@ impl Run {
                     gauge,
                     first,
                     rearms,
+                    skipped,
                 } => {
                     // The app region's first interval (design.md "Scope of
                     // No Allocation"): this frame's own work up to the
@@ -2137,12 +2159,15 @@ impl Run {
                     // frame, and a cancelled candidate's are discarded. A
                     // rearm the view does not show yet, or one during the
                     // drain, builds no frame: the next try takes the newer
-                    // candidate, its frame granted kept.
+                    // candidate, its frame granted kept, at once for the
+                    // first few and then after a short wait for a message
+                    // ([`ACQUIRE_RETRIES`]).
                     let room = effects.capacity();
                     let Some(view) = side.acquire(room, |e| effects.push(*e)) else {
-                        std::thread::yield_now();
+                        *skipped = skipped.saturating_add(1);
                         continue;
                     };
+                    *skipped = 0;
                     // A rearmed READY candidate is drawn from its own origin,
                     // the skin's runtime starting over first.
                     if view.generation != *rearms {

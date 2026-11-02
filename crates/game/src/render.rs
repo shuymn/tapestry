@@ -234,8 +234,9 @@ impl RenderSide {
 /// The link between logic and rendering: an effect queue holding
 /// `effect_capacity` events, and a play view starting from `initial`, its
 /// three buffers copies of it. Writing a view with as many gauges as
-/// `initial` and note facts of its chart allocates nothing.
-pub(crate) fn render_link(
+/// `initial` and note facts of its chart allocates nothing. [`Logic`](crate::Logic)
+/// makes its own; a driver that publishes views itself makes one here.
+pub fn render_link(
     effect_capacity: usize,
     initial: &PlayView,
 ) -> (RenderSink, ViewWriter, RenderSide) {

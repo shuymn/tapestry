@@ -353,3 +353,108 @@ fn both_skins_show_the_snapshot_when_effects_are_dropped() {
         assert_eq!(s, want);
     }
 }
+
+/// A paced screen whose wait takes 2 ms, as a refresh would, noting how
+/// often the render loop looks at it and which generations it builds.
+struct Paced {
+    looks: Arc<std::sync::atomic::AtomicU64>,
+    built: Arc<Mutex<Vec<u64>>>,
+}
+
+impl Screen for Paced {
+    fn load(&mut self, _: &Chart, _: Option<&eval::Section>) -> Result<(), RenderError> {
+        Ok(())
+    }
+    fn wait(&self) -> bool {
+        std::thread::sleep(Duration::from_millis(2));
+        true
+    }
+    fn paced(&self) -> bool {
+        self.looks.fetch_add(1, Ordering::Relaxed);
+        true
+    }
+    fn build(&mut self, f: &FrameInput<'_>) -> Result<(), skin_model::BuildError> {
+        self.built.lock().unwrap().push(f.view.generation);
+        Ok(())
+    }
+    fn draw(&mut self) -> Result<FrameTiming, RenderError> {
+        Ok(timing(true))
+    }
+    fn text(&mut self, _lines: &[&str]) -> Result<bool, RenderError> {
+        Ok(true)
+    }
+    #[cfg(feature = "dev-tools")]
+    fn read_back(&self) -> Option<(u32, u32, Vec<u8>)> {
+        None
+    }
+}
+
+/// A logic step held between a rearm and its view's publication, on a
+/// paced screen whose frame stays granted: the render loop builds no
+/// frame, and after a few immediate retries waits between tries instead
+/// of spinning; it builds the new candidate once its view is published,
+/// and an exit sent while the step is held again ends it at once.
+#[test]
+fn a_held_rearm_neither_spins_nor_blocks_the_render_loop() {
+    use game::EventSink as _;
+
+    let initial = crate::render_common::view(0, 0);
+    let (mut sink, mut writer, side) = game::render_link(16, &initial);
+    let looks = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let built = Arc::new(Mutex::new(Vec::new()));
+    let (l, b) = (Arc::clone(&looks), Arc::clone(&built));
+    let make: MakeScreen = Box::new(move || {
+        Ok(Box::new(Paced {
+            looks: Arc::clone(&l),
+            built: Arc::clone(&b),
+        }) as Box<dyn Screen>)
+    });
+    let clock = QpcClock::start();
+    let chart = Arc::new(chart());
+    let link = spawn(
+        make,
+        Some(Arc::clone(&chart)),
+        None,
+        clock,
+        view(),
+        measure(clock),
+        Box::new(NoFrames),
+    )
+    .unwrap();
+    let ready = link.prepare_attempt(super::attempt(&chart, None), || false);
+    assert_eq!(ready.unwrap(), Preparation::Ready);
+    link.send(RenderMsg::Play {
+        side,
+        gauge: 0,
+        measure: play_measure(clock.now()),
+    });
+    assert!(wait_until(|| built.lock().unwrap().len() >= 3));
+    // Rearmed, its view not published: no frame, and few looks.
+    sink.rearm(TimeUs(clock.now().0 + 10_000_000));
+    std::thread::sleep(Duration::from_millis(50));
+    let (frames, before) = (built.lock().unwrap().len(), looks.load(Ordering::Relaxed));
+    std::thread::sleep(Duration::from_millis(300));
+    let held = looks.load(Ordering::Relaxed) - before;
+    assert_eq!(
+        built.lock().unwrap().len(),
+        frames,
+        "a frame of a held rearm"
+    );
+    assert!(held < 1_000, "{held} looks in 300 ms: the loop spins");
+    // Published: the new candidate is drawn.
+    let v = writer.input_buffer_mut();
+    v.generation = 1;
+    v.origin = Some(TimeUs(clock.now().0 + 10_000_000));
+    writer.publish();
+    assert!(wait_until(|| built.lock().unwrap().contains(&1)));
+    // Held again, an exit still ends the loop at once.
+    sink.rearm(TimeUs(clock.now().0 + 20_000_000));
+    std::thread::sleep(Duration::from_millis(50));
+    let asked = Instant::now();
+    assert!(matches!(link.exit(), super::super::RenderEnd::Joined));
+    assert!(
+        asked.elapsed() < Duration::from_secs(1),
+        "{:?}",
+        asked.elapsed()
+    );
+}
