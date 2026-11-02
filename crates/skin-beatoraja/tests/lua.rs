@@ -922,11 +922,32 @@ fn every_function_in_the_definition_is_refused_at_its_definition() {
         }) => assert_eq!((at.file.as_str(), at.line), ("s.luaskin", 0)),
         other => panic!("{other:?}"),
     }
-    // A function in the header table refuses the header pass.
-    let d = folder(&[("s.luaskin", "return { type = 0, draw = function() end }")]);
+}
+
+#[test]
+fn the_header_pass_refuses_a_function_only_where_it_reads() {
+    // In a field the header reads: refused by the header pass.
+    let d = folder(&[(
+        "s.luaskin",
+        "return { type = 0,\n property = { { name = \"o\", item = { { name = \"a\", op = 900 } },\n\
+           def = function() end } } }",
+    )]);
     assert_eq!(
         located(header(&d)),
-        (LuaWhy::Callable { field: "draw" }, "s.luaskin".into(), 1)
+        (LuaWhy::Callable { field: "other" }, "s.luaskin".into(), 3)
+    );
+    // Elsewhere: the header pass reads past it, and the configured pass
+    // refuses it at its definition.
+    let d = folder(&[(
+        "s.luaskin",
+        "local skin = { type = 0, w = 1920, h = 1080,\n\
+           helper = function() end }\n\
+         return skin",
+    )]);
+    let h = header(&d).unwrap();
+    assert_eq!(
+        located(h.import(&Config::defaults(h.header()), &Cancel::new())),
+        (LuaWhy::Callable { field: "other" }, "s.luaskin".into(), 2)
     );
 }
 
