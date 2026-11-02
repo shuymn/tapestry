@@ -1319,3 +1319,18 @@ fn a_playback_tempo_that_does_not_fit_fails_the_transaction() {
     assert_eq!(s.options, before.options);
     assert_eq!(s.hispeed, before.hispeed);
 }
+
+#[test]
+fn axis_steps_stay_wide_until_the_result_is_clamped() {
+    let q = AxisQuantum::per_step(1).unwrap();
+    let axis = |delta| Event::Axis {
+        control: AXIS,
+        delta,
+        quantum: q,
+    };
+    let mut rig = Rig::prepared(PlayOptions::default(), constant(150));
+    rig.at(0).press(SELECT);
+    rig.at(MS).ev(axis(0));
+    rig.at(2 * MS).ev(axis(1 << 31)).ev(axis(-((1 << 31) - 1)));
+    assert_eq!(g(&rig.snap()), 301);
+}

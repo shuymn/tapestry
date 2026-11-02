@@ -46,9 +46,9 @@ pub const REPEAT_US: i64 = 50_000;
 /// [`FAST_COVER_STEP`], µs.
 pub const ACCELERATE_US: i64 = 500_000;
 /// A digital scratch's cover step once accelerated, ‰.
-pub const FAST_COVER_STEP: i32 = 10;
+pub const FAST_COVER_STEP: i64 = 10;
 /// An auxiliary key's cover step, ‰.
-pub const AUX_COVER_STEP: i32 = 10;
+pub const AUX_COVER_STEP: i64 = 10;
 
 /// A physical control, numbered below [`MAX_CONTROLS`] by the bindings.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -748,7 +748,7 @@ impl Adjustment {
             return;
         }
         let context = self.context;
-        let mut steps = [(Role::ScratchPositive, 0_i32); MAX_CONTROLS];
+        let mut steps = [(Role::ScratchPositive, 0_i64); MAX_CONTROLS];
         let mut n = 0;
         for h in &mut self.holds {
             if let Hold::Held {
@@ -804,7 +804,7 @@ impl Adjustment {
             .saturating_add(i128::from(delta) * i128::from(quantum.steps));
         let n = state.remainder / counts;
         state.remainder -= n * counts;
-        let n = i32::try_from(n).unwrap_or(if n < 0 { i32::MIN } else { i32::MAX });
+        let n = i64::try_from(n).unwrap_or(if n < 0 { i64::MIN } else { i64::MAX });
         if n > 0 {
             self.act_steps(Role::ScratchPositive, n, 1, time);
         } else if n < 0 {
@@ -812,17 +812,16 @@ impl Adjustment {
         }
     }
 
-    fn act(&mut self, role: Role, cover_step: i32, time: TimeUs) {
+    fn act(&mut self, role: Role, cover_step: i64, time: TimeUs) {
         self.act_steps(role, 1, cover_step, time);
     }
 
     /// `n` steps of `role` under the current modifiers, into the group at
     /// `time`.
-    fn act_steps(&mut self, role: Role, n: i32, cover_step: i32, time: TimeUs) {
+    fn act_steps(&mut self, role: Role, n: i64, cover_step: i64, time: TimeUs) {
         let mods = self.mods();
         let floating = self.options.hispeed().mode == SpeedMode::Floating;
         let target = self.target().is_some();
-        let n = i64::from(n);
         let sign = match role {
             Role::Black
             | Role::Faster
@@ -835,9 +834,9 @@ impl Adjustment {
         let request = match (mods, role) {
             (Mods::Both, _) | (_, Role::Start | Role::Select) => return,
             (_, Role::Slower | Role::Faster) | (Mods::Start, Role::White | Role::Black) => {
-                Request::Coarse(sign * n)
+                Request::Coarse(n.saturating_mul(sign))
             }
-            (Mods::Select, _) if floating => Request::Green(sign * n),
+            (Mods::Select, _) if floating => Request::Green(n.saturating_mul(sign)),
             (
                 Mods::Start,
                 Role::AuxNegative
@@ -846,9 +845,9 @@ impl Adjustment {
                 | Role::ScratchNegative,
             ) => {
                 if target {
-                    Request::Cover(sign * n * i64::from(cover_step))
+                    Request::Cover(n.saturating_mul(cover_step).saturating_mul(sign))
                 } else {
-                    Request::Fine(sign * n)
+                    Request::Fine(n.saturating_mul(sign))
                 }
             }
             _ => return,
