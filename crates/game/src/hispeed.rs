@@ -476,15 +476,23 @@ fn clamped_hispeed(num: u128, den: u128) -> Result<Ratio, Unrepresentable> {
 ///
 /// [`Unrepresentable`] when the result's lowest terms do not fit.
 pub fn step_hispeed(h: Ratio, hundredths: i64) -> Result<Ratio, Unrepresentable> {
-    let num = i128::from(hundredths)
-        .checked_mul(i128::from(h.den))
-        .and_then(|d| d.checked_add(i128::from(h.num) * 100))
-        .ok_or(Unrepresentable)?;
-    // A negative result is below the bound.
-    let Ok(num) = u128::try_from(num) else {
-        return Ok(Ratio::MIN_HISPEED);
+    // In hundredths over `den`: `h` is `100·num`, the step `by`, and the
+    // ends `2000·den` and `den`. Each fits a `u128` (`by` < 2¹²⁷), and the
+    // step is compared with its room to the end before it is added.
+    let (num, den) = (u128::from(h.num), u128::from(h.den));
+    let by = u128::from(hundredths.unsigned_abs()) * den;
+    let num = if hundredths >= 0 {
+        if by >= (2000 * den).saturating_sub(100 * num) {
+            return Ok(Ratio::MAX_HISPEED);
+        }
+        100 * num + by
+    } else {
+        if by >= (100 * num).saturating_sub(den) {
+            return Ok(Ratio::MIN_HISPEED);
+        }
+        100 * num - by
     };
-    clamped_hispeed(num, u128::from(h.den) * 100)
+    clamped_hispeed(num, 100 * den)
 }
 
 /// The nominal travel duration `T = 240000·v / (B·H)` ms: 0 when no field

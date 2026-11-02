@@ -1305,6 +1305,13 @@ fn no_field_left_is_zero_before_any_product() {
 }
 
 #[test]
+fn a_saturated_step_from_a_large_multiplier_reaches_the_end() {
+    let hs = Ratio::new(u64::MAX, u64::MAX - 1).unwrap();
+    assert_eq!(step_hispeed(hs, i64::MAX).unwrap(), bpm(20));
+    assert_eq!(step_hispeed(hs, i64::MIN).unwrap(), r(1, 100));
+}
+
+#[test]
 fn a_failed_reattachment_keeps_the_switch_and_the_multiplier() {
     let covers = Covers {
         sudden: Cover {
