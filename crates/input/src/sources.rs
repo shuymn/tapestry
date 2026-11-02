@@ -281,7 +281,11 @@ impl SourceSet {
     /// recorded: `false` once the focus gate has tripped.
     pub fn begin_batch(&mut self, received: TimeUs) -> bool {
         self.batch_at = received;
-        self.gate.check()
+        let open = self.gate.check();
+        if let Some(tap) = &mut self.adjust {
+            tap.begin_batch(received, open);
+        }
+        open
     }
 
     /// Ends the batch: each open source publishes `fresh − 1 µs` (on the

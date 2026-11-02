@@ -258,7 +258,9 @@ fn an_overflow_sends_a_loss_then_the_held_controls_and_nothing_between() {
         drain(&mut rx),
         [
             (30_000, TapEvent::Lost),
-            (30_000, TapEvent::Resync((1 << SELECT) | (1 << SCRATCH))),
+            (30_000, TapEvent::Resync(1 << SELECT)),
+            (30_000, TapEvent::Press(SCRATCH)),
+            (30_000, TapEvent::Tick),
         ]
     );
     batch(&mut set, 30_010, &[packet(1, SHIFT, 0)]);
@@ -291,6 +293,7 @@ fn input_while_focus_is_away_is_answered_by_a_resynchronization() {
         [
             (40, TapEvent::Lost),
             (40, TapEvent::Resync((1 << START) | (1 << SELECT))),
+            (40, TapEvent::Tick),
         ]
     );
 }
@@ -308,6 +311,55 @@ fn an_inactive_tap_counts_holders_and_sends_them_on_activation() {
         drain(&mut rx),
         [(20, TapEvent::Resync(1 << START)), (20, TapEvent::Tick)],
         "one tick per batch time"
+    );
+}
+
+#[test]
+fn a_baseline_sent_on_activation_precedes_the_batch_it_starts() {
+    let (mut set, mut rx, _) = rig(false);
+    batch(&mut set, 10, &[packet(1, Q, 1), packet(1, Q, 0)]);
+    assert_eq!(
+        drain(&mut rx),
+        [
+            (10, TapEvent::Resync(0)),
+            (10, TapEvent::Press(START)),
+            (10, TapEvent::Release(START)),
+        ]
+    );
+}
+
+#[test]
+fn the_last_requests_are_closed_by_one_later_tick_once_nothing_is_held() {
+    let (mut set, mut rx, _) = rig(false);
+    batch(&mut set, 10, &[]);
+    batch(&mut set, 20, &[packet(1, Q, 1), packet(1, Q, 0)]);
+    batch(&mut set, 30, &[]);
+    batch(&mut set, 40, &[]);
+    assert_eq!(
+        drain(&mut rx),
+        [
+            (10, TapEvent::Resync(0)),
+            (20, TapEvent::Press(START)),
+            (20, TapEvent::Release(START)),
+            (30, TapEvent::Tick),
+        ]
+    );
+    batch(&mut set, 50, &[packet(3, TURN, 7)]);
+    batch(&mut set, 60, &[packet(3, TURN, 9)]);
+    batch(&mut set, 70, &[]);
+    batch(&mut set, 80, &[]);
+    assert_eq!(
+        drain(&mut rx),
+        [
+            (
+                60,
+                TapEvent::Axis {
+                    control: AXIS,
+                    delta: 2
+                }
+            ),
+            (70, TapEvent::Tick),
+        ]
     );
 }
 

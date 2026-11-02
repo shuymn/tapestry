@@ -86,7 +86,8 @@ pub enum TapEvent {
         /// The signed movement.
         delta: i64,
     },
-    /// A batch ended while a tapped control was held.
+    /// A batch ended while a tapped control was held, or once after the
+    /// last request so its group closes.
     Tick,
     /// Observations were lost, or focus was.
     Lost,
@@ -160,6 +161,10 @@ pub struct AdjustmentTap {
     pending: Pending,
     seq: u64,
     last_tick: TimeUs,
+    /// When the last request (a press, release, repeat or axis movement)
+    /// was sent, while no later observation has closed the reducer's group
+    /// at that time: `end_batch` owes a tick until one does.
+    unclosed: Option<TimeUs>,
     queue: rtrb::Producer<TapObservation>,
     latch: Arc<AtomicU64>,
     dropped: Arc<AtomicU64>,
@@ -207,6 +212,7 @@ pub fn adjustment_queue(
             pending: Pending::None,
             seq: 0,
             last_tick: TimeUs(i64::MIN),
+            unclosed: None,
             queue: producer,
             latch: Arc::new(AtomicU64::new(0)),
             dropped: Arc::clone(&dropped),
@@ -227,7 +233,8 @@ impl AdjustmentTap {
 
     /// Whether observations are sent: set at each boundary. The held
     /// controls are counted either way; turning it on sends them as the
-    /// baseline ([`TapEvent::Resync`]) first.
+    /// baseline ([`TapEvent::Resync`]) at the start of the next batch,
+    /// before its packets.
     pub fn set_active(&mut self, active: bool) {
         if active && !self.active {
             self.pending = Pending::Resync;
@@ -322,9 +329,19 @@ impl AdjustmentTap {
         self.store_latch();
     }
 
+    /// The start of a batch received at `at`; `open` while the focus gate
+    /// admits input. Sends what is pending once there is room, so the
+    /// batch's packets follow it.
+    pub(crate) fn begin_batch(&mut self, at: TimeUs, open: bool) {
+        if self.active && open {
+            self.flush(at);
+        }
+    }
+
     /// The end of a batch received at `at`; `open` while the focus gate
     /// admits input. Sends what is pending once there is room, else a tick
-    /// while a tapped control is held.
+    /// while a tapped control is held, and one more at a later time once
+    /// nothing is, so the reducer's last group closes.
     pub(crate) fn end_batch(&mut self, at: TimeUs, open: bool) {
         if !self.active {
             return;
@@ -333,20 +350,28 @@ impl AdjustmentTap {
             self.pending = Pending::LostResync;
             return;
         }
-        let held = self.held_set();
+        if self.pending != Pending::None {
+            self.flush(at);
+            return;
+        }
+        let owed = self.unclosed.is_some_and(|t| at > t);
+        if at > self.last_tick && (owed || self.held_set() != 0) {
+            self.last_tick = at;
+            self.observe(at, TapEvent::Tick, true);
+        }
+    }
+
+    /// Sends the pending loss or baseline once the queue has room for it.
+    fn flush(&mut self, at: TimeUs) {
         match self.pending {
             Pending::LostResync if self.queue.slots() >= 2 => {
                 self.send(at, TapEvent::Lost);
-                self.send(at, TapEvent::Resync(held));
+                self.send(at, TapEvent::Resync(self.held_set()));
                 self.pending = Pending::None;
             }
             Pending::Resync if self.queue.slots() >= 1 => {
-                self.send(at, TapEvent::Resync(held));
+                self.send(at, TapEvent::Resync(self.held_set()));
                 self.pending = Pending::None;
-            }
-            Pending::None if held != 0 && at > self.last_tick => {
-                self.last_tick = at;
-                self.observe(at, TapEvent::Tick, true);
             }
             _ => {}
         }
@@ -383,6 +408,17 @@ impl AdjustmentTap {
         let sent = self.queue.push(TapObservation { at, seq, event }).is_ok();
         if sent {
             self.seq = seq.wrapping_add(1);
+            if matches!(
+                event,
+                TapEvent::Press(_)
+                    | TapEvent::Release(_)
+                    | TapEvent::Repeat(_)
+                    | TapEvent::Axis { .. }
+            ) {
+                self.unclosed = Some(at);
+            } else if self.unclosed.is_some_and(|t| at > t) {
+                self.unclosed = None;
+            }
         } else {
             self.dropped.fetch_add(1, Ordering::Relaxed);
         }
