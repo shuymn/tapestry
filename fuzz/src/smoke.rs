@@ -293,6 +293,27 @@ fn bms_seed_charts_load_and_refuse() {
     assert!(ok > 0, "no chart loaded");
 }
 
+#[test]
+fn bms_load_keeps_a_chart_whose_endpoints_conflict() {
+    // At 150 BPM, 1000/2001 and 1001/2003 of a measure floor to one µs at
+    // two positions: the target loads it and its oracle agrees.
+    let line = |slots: usize, index: usize| -> String {
+        (0..slots)
+            .map(|i| if i == index { "01" } else { "00" })
+            .collect()
+    };
+    let text = format!(
+        "#BPM 150\n#WAV01 a.wav\n#00011:{}\n#00012:{}\n",
+        line(2001, 1000),
+        line(2003, 1001)
+    );
+    let loaded = bms_load(text.as_bytes()).unwrap();
+    assert!(matches!(
+        loaded.chart.validate_presentation(),
+        Err(bms_model::PresentationError::EndpointConflict { .. })
+    ));
+}
+
 fn option_names(h: &Header) -> Vec<&str> {
     h.options
         .iter()
