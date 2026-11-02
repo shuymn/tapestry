@@ -640,7 +640,8 @@ const F5_GROUPS: &str = r#"
 /// of 2 digits (3 quads) moved by two digit offset rows, one of 1 digit
 /// (2 quads) by one: 10,255 offsets kept. One grade ([`FITTED`]) fits its
 /// image inside its destination and keeps its 11 keys before the stretch
-/// for its combo besides.
+/// for its combo besides. Its first key lane reaches one pixel into the
+/// second ([`F5_LANES`]).
 fn f5(root: &Path) {
     png(root, "a.png", 256, 256);
     let cell = |id: &str, i: usize, w: usize, h: usize| {
@@ -684,7 +685,7 @@ fn f5(root: &Path) {
         list(4),
         list(3),
         list(4),
-        common::lanes::lane_rects(200, 600)
+        F5_LANES
     );
     let judges = join((0..JUDGES).map(|i| {
         let keys = if i < ELEVEN_KEYS { 11 } else { 10 };
@@ -745,15 +746,24 @@ fn f5(root: &Path) {
     );
 }
 
-/// F5's chart: no note on screen, bars at 1 000 and 1 050 ms.
+/// F5's lanes: the source's keys 50 wide from 100, the first 51 wide
+/// over the second, and the scratch at 20, 79 wide; the span 20 to 450.
+const F5_LANES: &str = r#"{"x": 100, "y": 200, "w": 51, "h": 600},
+    {"x": 150, "y": 200, "w": 50, "h": 600}, {"x": 200, "y": 200, "w": 50, "h": 600},
+    {"x": 250, "y": 200, "w": 50, "h": 600}, {"x": 300, "y": 200, "w": 50, "h": 600},
+    {"x": 350, "y": 200, "w": 50, "h": 600}, {"x": 400, "y": 200, "w": 50, "h": 600},
+    {"x": 20, "y": 200, "w": 79, "h": 600}"#;
+
+/// F5's chart: a chord on every lane at 1 100 and 1 200 ms, bars at
+/// 1 000 and 1 050 ms.
 fn f5_chart() -> bms_model::Chart {
-    let mut chart = bms_model::ChartBuilder::new(150_000)
-        .tap(
-            bms_model::Lane::new(1).unwrap(),
-            bms_model::TimeUs(100_000_000),
-        )
-        .build()
-        .unwrap();
+    let mut b = bms_model::ChartBuilder::new(150_000);
+    for t in [1_100_000, 1_200_000] {
+        for l in 0..8 {
+            b = b.tap(bms_model::Lane::new(l).unwrap(), bms_model::TimeUs(t));
+        }
+    }
+    let mut chart = b.build().unwrap();
     chart.bar_lines = [1_000_000, 1_050_000]
         .map(|t| chart.scroll.position_at(bms_model::TimeUs(t)))
         .to_vec();
@@ -904,7 +914,7 @@ fn check_f5(_: &Header, i: Imported) {
     // the third group is off.
     let bars = |q: &[skin_model::Quad]| -> Vec<([i32; 4], [f32; 4], [u32; 4])> {
         q.iter()
-            .filter(|q| matches!(common::play::round(q.rect), [_, _, 428 | 50, _]))
+            .filter(|q| matches!(common::play::round(q.rect), [_, _, 428 | 50, 2 | 4 | 6]))
             .map(|q| (common::play::round(q.rect), q.color, q.uv.map(f32::to_bits)))
             .collect()
     };
@@ -922,9 +932,21 @@ fn check_f5(_: &Header, i: Imported) {
         ]
     );
     assert_ne!(shown[0].2, shown[1].2);
+    // The two chords' taps, 20 tall, in the source's order: the earlier
+    // chord first, each keys 1 to 7 then the scratch.
+    let taps: Vec<[i32; 4]> = q
+        .iter()
+        .map(|q| common::play::round(q.rect))
+        .filter(|r| r[3] == 20 && matches!(r[2], 50 | 51 | 79))
+        .collect();
+    let xs: Vec<i32> = taps.iter().map(|r| r[0]).collect();
+    let chord = [100, 150, 200, 250, 300, 350, 400, 20];
+    assert_eq!(xs, [chord, chord].concat(), "{taps:?}");
+    assert!(taps[0][1] > taps[8][1], "{taps:?}");
+    assert_eq!(taps[0][2], 51);
     assert_eq!(
         q.len(),
-        JUDGES + 2 * JUDGES - 1 + 4 + gauge + 4,
+        JUDGES + 2 * JUDGES - 1 + 4 + gauge + 4 + 16,
         "{by_size:?}"
     );
     // Each follower moves once: LIFT at 100 ‰ of the 600 px lane lifts
@@ -1759,6 +1781,150 @@ fn f15_refuses_past_the_budget() {
     }
 }
 
+/// F16's lanes: the keys 60 wide every 40 from 100, each 20 into the
+/// next, the scratch at 20, 79 wide.
+const F16_LANES: &str = r#"{"x": 100, "y": 200, "w": 60, "h": 600},
+    {"x": 140, "y": 200, "w": 60, "h": 600}, {"x": 180, "y": 200, "w": 60, "h": 600},
+    {"x": 220, "y": 200, "w": 60, "h": 600}, {"x": 260, "y": 200, "w": 60, "h": 600},
+    {"x": 300, "y": 200, "w": 60, "h": 600}, {"x": 340, "y": 200, "w": 60, "h": 600},
+    {"x": 20, "y": 200, "w": 79, "h": 600}"#;
+
+/// F16: overlapping lanes of 48 distinct parts and three bar groups.
+fn f16(root: &Path) {
+    png(root, "a.png", 256, 256);
+    let cell = |id: &str, i: usize, h: usize| {
+        format!(
+            r#"{{"id": "{id}", "src": "a", "x": {}, "y": {}, "w": 8, "h": {h}}}"#,
+            8 * (i % 32),
+            20 * (i / 32)
+        )
+    };
+    let mut images: Vec<String> = (0..48)
+        .map(|i| cell(&format!("p{}_{}", i / 6, i % 6), i, 20))
+        .collect();
+    images.extend(
+        ["b0", "b1", "b2"]
+            .iter()
+            .zip(48..)
+            .map(|(id, i)| cell(id, i, 2)),
+    );
+    let list = |k: usize| join((0..8).map(|u| format!("\"p{u}_{k}\"")));
+    let groups = join((0..3).map(|g| {
+        format!(
+            r#"{{"id": "b{g}", "dst": [{{"x": 20, "y": {}, "w": 430, "h": {}}}]}}"#,
+            200 - g,
+            2 + 2 * g
+        )
+    }));
+    write(
+        root,
+        "s.json",
+        common::hd(&format!(
+            r#""source": [{{"id": "a", "path": "a.png"}}], "image": [{}],
+               "note": {{"id": "notes", "note": [{}], "lnstart": [{}], "lnend": [{}],
+                 "lnbody": [{}], "lnactive": [{}], "mine": [{}], "hcnstart": [{}],
+                 "hcnend": [{}], "hcnbody": [{}], "hcnactive": [{}], "hcndamage": [{}],
+                 "hcnreactive": [{}], "dst": [{F16_LANES}], "group": [{groups}]}},
+               "destination": [{{"id": "notes", "dst": [{{"w": 0, "h": 0}}]}}]"#,
+            images.join(", "),
+            list(0),
+            list(1),
+            list(2),
+            list(3),
+            list(4),
+            list(5),
+            list(1),
+            list(2),
+            list(3),
+            list(4),
+            list(3),
+            list(4),
+        ))
+        .as_bytes(),
+    );
+}
+
+/// F16a's chart: 1 100 chords within 400 ms from 1 s, 8 800 taps in
+/// view, past the quad budget; bars at 1 000 and 1 050 ms.
+fn f16a_chart() -> bms_model::Chart {
+    let mut b = bms_model::ChartBuilder::new(150_000);
+    for k in 0..1_100 {
+        for l in 0..8 {
+            let t = bms_model::TimeUs(1_000_000 + k * 360);
+            b = b.tap(bms_model::Lane::new(l).unwrap(), t);
+        }
+    }
+    let mut chart = b.build().unwrap();
+    chart.bar_lines = [1_000_000, 1_050_000]
+        .map(|t| chart.scroll.position_at(bms_model::TimeUs(t)))
+        .to_vec();
+    chart
+}
+
+fn check_f16a(_: &Header, i: Imported) {
+    assert!(
+        i.report
+            .notes
+            .iter()
+            .all(|n| !matches!(n.kind, skin_beatoraja::NoteKind::UnsupportedField { .. }))
+    );
+    assert_eq!(i.report.usage.images, 51);
+    // The two bars' three groups take six of the 8 192 quads, the taps
+    // the rest: 1 023 chords whole, keys 1 to 7 then the scratch, then
+    // keys 1 and 2 of the next; one drop.
+    let mut d = Drawn::over(i.skin, &f16a_chart());
+    let q = d.frame(900, &[]);
+    let rects: Vec<[i32; 4]> = q.iter().map(|q| common::play::round(q.rect)).collect();
+    let bars = rects.iter().filter(|r| r[2] == 430).count();
+    let taps: Vec<i32> = rects.iter().filter(|r| r[3] == 20).map(|r| r[0]).collect();
+    assert_eq!(bars, 6);
+    assert_eq!(bars + taps.len(), skin_model::LANE_QUADS as usize);
+    let chord = [100, 140, 180, 220, 260, 300, 340, 20];
+    let want: Vec<i32> = chord.iter().copied().cycle().take(taps.len()).collect();
+    assert_eq!(taps, want);
+    assert_eq!(d.batch.dropped(), 1);
+}
+
+/// F16b's chart: `LANE_VISITS` long notes, 2 048 a lane, then with
+/// `tap` a tap on the scratch.
+fn f16b_chart(tap: bool) -> bms_model::Chart {
+    let mut b = bms_model::ChartBuilder::new(150_000);
+    let per_lane = i64::from(skin_model::LANE_VISITS) / 8;
+    for l in 0..8 {
+        for k in 0..per_lane {
+            let t = 1_000_000 + k * 20;
+            b = b.long(
+                bms_model::Lane::new(l).unwrap(),
+                bms_model::TimeUs(t),
+                bms_model::TimeUs(t + 10),
+            );
+        }
+    }
+    if tap {
+        b = b.tap(
+            bms_model::Lane::new(0).unwrap(),
+            bms_model::TimeUs(9_000_000),
+        );
+    }
+    b.build().unwrap()
+}
+
+/// F16b: with no scroll left every long note is visited and none drawn;
+/// the visits end exactly at the last with no drop, and a tap past them
+/// is not drawn and drops once.
+fn check_f16b(_: &Header, i: Imported) {
+    for (tap, dropped) in [(false, 0), (true, 1)] {
+        let mut d = Drawn::over(i.skin.clone(), &f16b_chart(tap));
+        d.view.cover = 1_000;
+        let q = d.frame(900, &[]);
+        assert!(
+            q.iter().all(|q| common::play::round(q.rect)[3] != 20),
+            "{tap}"
+        );
+        assert_eq!(d.batch.dropped(), dropped, "{tap}");
+    }
+}
+
 #[test]
 fn import_memory_is_measured() {
     // Positive control: a 4 MiB buffer grown to 8 MiB is 12 MiB live at
@@ -2024,6 +2190,18 @@ fn import_memory_is_measured() {
     peaks.push(("F15c shared gauge", measure(d.path(), check_f15c)));
     drop(d);
     f15_refuses_past_the_budget();
+    // F16: overlapping lanes at the lanes' budgets.
+    let d = tempfile::tempdir().unwrap();
+    f16(d.path());
+    peaks.push((
+        "F16a overlapping lanes",
+        measure_prepared(d.path(), &f16a_chart(), check_f16a),
+    ));
+    peaks.push((
+        "F16b lane visits",
+        measure_prepared(d.path(), &f16b_chart(true), check_f16b),
+    ));
+    drop(d);
     for (name, p) in &peaks {
         println!("{name}: peak {p} B");
     }

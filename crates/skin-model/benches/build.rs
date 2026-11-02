@@ -4,7 +4,9 @@
 //! lanes, laid out as the simple skin's, on the render benchmark's dense
 //! chart and frame (crates/render/benches/skin.rs), so the two compare.
 //! The chart is built here; the skin and the frame helpers are the lanes
-//! tests'.
+//! tests'. `skin_model_build_dense_frame_timeline` is the same frame
+//! with the eight lanes' notes merged under the source's timeline order
+//! (`NoteOrder::SOURCE`), reported apart.
 //!
 //! `skin_model_build_widgets` is `Skin::build` of a skin of widgets only:
 //! four 11-cell numbers, a 50-segment flicker gauge, a judgment display
@@ -54,18 +56,27 @@ fn bench_build(c: &mut Criterion) {
         }
     }
     let chart = builder.build().expect("valid chart");
-    let mut h = Harness::new(lanes_skin(simple()), &chart, &full(0));
-    h.offset = TimeUs(8 * MS);
-    let now = 10_000 * MS;
-    h.frame_us(now, &[]);
-    assert!(h.batch.quads().len() > 500, "a dense frame");
-    assert_eq!(h.batch.dropped(), 0, "the batch has room");
-    c.bench_function("skin_model_build_dense_frame", |b| {
-        b.iter(|| {
-            h.frame_us(black_box(now), &[]);
-            black_box(h.batch.quads().len())
+    // The comparable workload, lane by lane, and the same chart over the
+    // eight lanes merged under the source's timeline order.
+    let mut timeline = simple();
+    timeline.note_order = skin_model::NoteOrder::SOURCE;
+    for (name, def) in [
+        ("skin_model_build_dense_frame", simple()),
+        ("skin_model_build_dense_frame_timeline", timeline),
+    ] {
+        let mut h = Harness::new(lanes_skin(def), &chart, &full(0));
+        h.offset = TimeUs(8 * MS);
+        let now = 10_000 * MS;
+        h.frame_us(now, &[]);
+        assert!(h.batch.quads().len() > 500, "a dense frame");
+        assert_eq!(h.batch.dropped(), 0, "the batch has room");
+        c.bench_function(name, |b| {
+            b.iter(|| {
+                h.frame_us(black_box(now), &[]);
+                black_box(h.batch.quads().len())
+            });
         });
-    });
+    }
 }
 
 /// 4 · 11 cells, 50 segments and the flicker's tip, a grade with a 4-cell
