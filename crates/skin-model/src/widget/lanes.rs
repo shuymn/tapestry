@@ -1116,18 +1116,32 @@ impl Lanes {
         };
         let mut cursors: [Option<LaneCursor<'n>>; LANE_COUNT] =
             std::array::from_fn(|l| u8::try_from(l).ok().and_then(Lane::new).and_then(cursor));
+        // Each cursor's next head as its ordering key, refreshed when the
+        // cursor moves.
+        type Key = (Position, TimeUs, u8, usize);
+        let key = |c: &Option<LaneCursor<'n>>, rank: u8| -> Option<Key> {
+            let c = c.as_ref()?;
+            let n = c.peek(to)?;
+            Some((n.pos, n.time, rank, c.next))
+        };
+        let mut heads: [Option<Key>; LANE_COUNT] =
+            std::array::from_fn(|k| key(cursors.get(k)?, *ranks.get(k)?));
         loop {
-            let mut best: Option<(usize, (Position, TimeUs, u8, usize))> = None;
-            for (k, (c, &rank)) in cursors.iter().zip(&ranks).enumerate() {
-                let Some(n) = c.as_ref().and_then(|c| c.peek(to)) else {
-                    continue;
-                };
-                let key = (n.pos, n.time, rank, c.as_ref().map_or(0, |c| c.next));
-                if best.is_none_or(|(_, b)| key < b) {
-                    best = Some((k, key));
+            let mut best: Option<(usize, Key)> = None;
+            for (k, head) in heads.iter().enumerate() {
+                if let &Some(h) = head
+                    && best.is_none_or(|(_, b)| h < b)
+                {
+                    best = Some((k, h));
                 }
             }
-            let Some(Some(c)) = best.and_then(|(k, _)| cursors.get_mut(k)) else {
+            let Some((k, (.., rank, _))) = best else {
+                return;
+            };
+            let (Some(slot), Some(head)) = (cursors.get_mut(k), heads.get_mut(k)) else {
+                return;
+            };
+            let Some(c) = slot.as_mut() else {
                 return;
             };
             let Some((i, n)) = c.take(to) else {
@@ -1136,6 +1150,7 @@ impl Lanes {
             if !pen.visit() || !emit(pen, &c.lane, i, n) {
                 return;
             }
+            *head = key(slot, rank);
         }
     }
 }
