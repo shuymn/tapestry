@@ -430,35 +430,19 @@ mod tests {
     /// start of a STOP has the bar line's time.
     #[test]
     fn measures_are_the_bar_lines_stored_times() {
-        let chart = load(
-            "#BPM 7
-#00111:01
-#00211:01
-#00311:01
-",
-        );
+        let chart = load("#BPM 7\n#00111:01\n#00211:01\n#00311:01\n");
         let m = measures(&chart);
         assert_eq!(m[0], TimeUs(0));
         assert_eq!(m[1], TimeUs(34_285_714));
         assert_eq!(chart.lanes[1][0].time, m[1]);
         // No note on measure 1's bar line: still its stored time, though
         // the position reaches the bar line only a microsecond later.
-        let chart = load(
-            "#BPM 7
-#00211:01
-",
-        );
+        let chart = load("#BPM 7\n#00211:01\n");
         let m = measures(&chart);
         assert_eq!(m[1], TimeUs(34_285_714));
         assert!(chart.scroll.position_at(m[1]) < chart.bar_lines[1]);
         // A STOP at measure 2's bar line, with a note on it.
-        let chart = load(
-            "#BPM 120
-#STOP01 192
-#00211:01
-#00209:01
-",
-        );
+        let chart = load("#BPM 120\n#STOP01 192\n#00211:01\n#00209:01\n");
         let m = measures(&chart);
         let on_bar = chart.lanes[1]
             .iter()
@@ -475,12 +459,7 @@ mod tests {
     /// measure 0.24 µs, so measures 1 and 2 start at the same µs.
     #[test]
     fn bar_lines_at_one_time_stay_separate_measures() {
-        let chart = load(
-            "#BPM 1000000
-#00102:0.001
-#00311:01
-",
-        );
+        let chart = load("#BPM 1000000\n#00102:0.001\n#00311:01\n");
         assert_eq!(chart.bar_lines.len(), 4);
         assert!(chart.bar_lines[1] < chart.bar_lines[2]);
         let m = measures(&chart);
@@ -493,13 +472,7 @@ mod tests {
     #[test]
     fn a_bar_line_keeps_its_own_row_across_a_stop() {
         // 120 BPM, a STOP of one beat (500 ms) at measure 2's start.
-        let mut chart = load(
-            "#BPM 120
-#STOP01 48
-#00209:01
-#00311:01
-",
-        );
+        let mut chart = load("#BPM 120\n#STOP01 48\n#00209:01\n#00311:01\n");
         let timeline = &chart.timeline;
         let bar = timeline.bar_ids()[2];
         let start = *timeline.point(bar).unwrap();
