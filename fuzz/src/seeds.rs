@@ -841,6 +841,10 @@ pub fn skin_jsons() -> Vec<Seed> {
         ),
         ("digit_offset_rows_limit", digit_offset_rows_limit()),
         (
+            "lanes_scratch_overlap",
+            play_skin(&lanes_body_over(SCRATCH_INTO_KEY)),
+        ),
+        (
             "gauge_over_budget",
             play_skin(&large_gauge_body(
                 r#""parts": 16384, "type": 3, "cycle": 100"#,
@@ -1026,6 +1030,10 @@ pub fn skin_imports() -> Vec<Seed> {
             ),
         ),
         ("lanes", play_skin(&lanes_body())),
+        (
+            "lanes_overlap",
+            play_skin(&lanes_body_over(OVERLAPPING_LANES)),
+        ),
         ("bar_groups", play_skin(&bar_groups_body())),
         ("paints", play_skin(&paints_body())),
         ("followers", play_skin(&followers_body())),
@@ -1331,6 +1339,26 @@ const PART_FIELDS: [&str; 12] = [
 
 /// The eight lanes' destinations: keys 50 wide from 100, the scratch
 /// (source lane 7) 80 wide at 20, all from y 200, 600 tall.
+/// [`lanes_body`] with `rects` for the lanes.
+fn lanes_body_over(rects: &str) -> String {
+    lanes_body().replace(&lane_dsts(), rects)
+}
+
+/// Overlapping and coincident keys: key 0 over key 1, keys 2 and 3 on
+/// one column, keys 4 and 5 swapped in x; the scratch beside them.
+const OVERLAPPING_LANES: &str = r#"{"x": 100, "y": 200, "w": 70, "h": 600},
+    {"x": 150, "y": 200, "w": 50, "h": 600}, {"x": 200, "y": 200, "w": 50, "h": 600},
+    {"x": 200, "y": 200, "w": 50, "h": 600}, {"x": 350, "y": 200, "w": 50, "h": 600},
+    {"x": 300, "y": 200, "w": 50, "h": 600}, {"x": 400, "y": 200, "w": 50, "h": 600},
+    {"x": 20, "y": 200, "w": 80, "h": 600}"#;
+
+/// The scratch reaching one pixel into the first key.
+const SCRATCH_INTO_KEY: &str = r#"{"x": 100, "y": 200, "w": 50, "h": 600},
+    {"x": 150, "y": 200, "w": 50, "h": 600}, {"x": 200, "y": 200, "w": 50, "h": 600},
+    {"x": 250, "y": 200, "w": 50, "h": 600}, {"x": 300, "y": 200, "w": 50, "h": 600},
+    {"x": 350, "y": 200, "w": 50, "h": 600}, {"x": 400, "y": 200, "w": 50, "h": 600},
+    {"x": 20, "y": 200, "w": 81, "h": 600}"#;
+
 fn lane_dsts() -> String {
     let mut lanes: Vec<String> = (0..7)
         .map(|i| format!(r#"{{"x": {}, "y": 200, "w": 50, "h": 600}}"#, 100 + 50 * i))

@@ -12,8 +12,8 @@ use image::{ImageFormat, Rgba, RgbaImage};
 use skin_model::{
     Anchor, BarGroupDef, Bind, Blend, CoverImage, CoverMotion, CoverPaintDef, CoverTrim, Ease,
     ElementDef, End, FileDef, Filter, Fit, Follow, ImageDef, KeyDef, LaneParts, LaneStyle,
-    LanesDef, LoadError, Place, Quad, Region, RegionDef, Sheet, Side, Skin, SkinDef, Source,
-    SourceLanes, TimerRef, Track, WidgetDefs, timer,
+    LanesDef, LoadError, NoteOrder, Place, Quad, Region, RegionDef, Sheet, Side, Skin, SkinDef,
+    Source, SourceLanes, TimerRef, Track, WidgetDefs, timer,
 };
 
 use crate::play_support::{Harness, REGIONS};
@@ -167,6 +167,7 @@ pub fn simple() -> LanesDef {
     }
     LanesDef {
         style: LaneStyle::Simple,
+        note_order: NoteOrder::LaneMajor,
         lanes,
         scratch: Side::Left,
         top: 80,
@@ -207,6 +208,7 @@ pub fn source() -> LanesDef {
         note_h: 20,
         mine_h: 20,
         bar_groups: vec![bar_group(869, 2)],
+        note_order: NoteOrder::SOURCE,
         ..simple()
     }
 }

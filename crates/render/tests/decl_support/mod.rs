@@ -284,6 +284,7 @@ pub fn skin(dir: &Path, look: &Look) -> Skin {
     if look.structure {
         lanes = Some(LanesDef {
             style: LaneStyle::Simple,
+            note_order: skin_model::NoteOrder::LaneMajor,
             lanes: std::array::from_fn(|k| {
                 let k = i32::try_from(k).unwrap();
                 [160 + 64 * k, 64]

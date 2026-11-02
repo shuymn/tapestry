@@ -353,6 +353,8 @@ fn skin_json_seeds_resolve_or_fail_as_built() {
             "gauge_too_many_parts",
             "gauge_fractional_parts",
             "gauge_node_count",
+            "lanes_overlap",
+            "lanes_scratch_overlap",
         ],
     );
     let imports: Vec<&str> = seeds::skin_imports().iter().map(|(n, _)| *n).collect();
@@ -554,6 +556,16 @@ fn gauge_refusal(name: &str) -> Option<fn(&ImportError) -> bool> {
                 }
             )
         }),
+        // The scratch stays wholly beside the keys, which may overlap.
+        "lanes_scratch_overlap" => Some(|e| {
+            matches!(
+                e,
+                ImportError::Model {
+                    at: Some(_),
+                    source: skin_model::LoadError::Lanes(skin_model::LanesError::ScratchNotAtSide),
+                }
+            )
+        }),
         _ => None,
     }
 }
@@ -697,7 +709,7 @@ fn skin_import_seeds_import_and_draw_as_built() {
                 assert!(!i.report.files[0].ambiguous, "{name}");
                 assert_eq!(drawn, [1, 1, 1, 1], "{name}");
             }
-            "lanes" => {
+            "lanes" | "lanes_overlap" => {
                 use skin_beatoraja::{DeviationId, LaneApprox};
                 // The lanes, SUDDEN+'s paint, LIFT and HIDDEN+; the notes,
                 // bar, SUDDEN+, LIFT and HIDDEN+ images over one file.
