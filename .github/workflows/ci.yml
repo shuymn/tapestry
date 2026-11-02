@@ -409,9 +409,10 @@ jobs:
       # the wrapper.
       - name: Fuzz self-test
         run: scripts/fuzz-selftest.sh
-      # A fixed libFuzzer seed keeps the run reproducible.
+      # A fixed libFuzzer seed keeps the run reproducible. One target per
+      # core at once: each libFuzzer run is single-threaded.
       - name: Fuzz (60 s per target, generated seeds)
-        run: TAPESTRY_NIX_SHELL=fuzz scripts/wsl.sh scripts/fuzz.sh run-all 60 --seed 1
+        run: TAPESTRY_NIX_SHELL=fuzz scripts/wsl.sh scripts/fuzz.sh run-all 60 --seed 1 --jobs "$(nproc)"
 
   # Passes as `windows` does, over `nix-test` and `nix-fuzz`.
   nix:
