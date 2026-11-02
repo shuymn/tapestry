@@ -7,6 +7,11 @@ license = "GPL-3.0-or-later"
 repository.workspace = true
 publish.workspace = true
 
+[features]
+# The Lua conversion report (src/bin/lua_report.rs), for the developer's
+# PC only (docs/stage3.md §3).
+dev-tools = []
+
 [dependencies]
 bms-model.workspace = true
 image.workspace = true
@@ -23,6 +28,10 @@ tempfile.workspace = true
 
 [lints]
 workspace = true
+
+[[bin]]
+name = "lua_report"
+required-features = ["dev-tools"]
 
 [[bench]]
 name = "import"

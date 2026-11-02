@@ -239,7 +239,7 @@ jobs:
           cache-bin: false
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Clippy (dev-tools)
-        run: mise exec -- cargo clippy -p player -p game --all-targets --locked --features player/dev-tools,game/dev-tools -- -D warnings
+        run: mise exec -- cargo clippy -p player -p game -p skin-beatoraja --all-targets --locked --features player/dev-tools,game/dev-tools,skin-beatoraja/dev-tools -- -D warnings
       - name: Development build includes dev-tools (positive control)
         run: |
           mise exec -- cargo build --locked -p player --features dev-tools

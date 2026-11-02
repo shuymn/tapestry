@@ -33,6 +33,8 @@ mod ledger;
 pub mod limits;
 mod loader;
 mod sandbox;
+#[cfg(feature = "dev-tools")]
+pub mod survey;
 #[cfg(test)]
 mod tests;
 
