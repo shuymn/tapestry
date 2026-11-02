@@ -43,6 +43,8 @@ pub(crate) struct Keys {
     pub(crate) acc: i32,
     /// Some key sets all four clip fields.
     pub(crate) clip: bool,
+    /// The first key whose colour was clamped.
+    pub(crate) clamped: Option<u32>,
 }
 
 /// Reads the keys `ids` of a destination with the source's inheritance
@@ -85,7 +87,7 @@ pub(crate) fn read(
     ];
     let mut keys = Vec::with_capacity(ids.len());
     let mut prev: Option<[i32; 15]> = None;
-    let (mut acc, mut clip) = (0, false);
+    let (mut acc, mut clip, mut clamped) = (0, false, None);
     for &id in ids {
         let fields = def.fields(id, FIELDS);
         let mut v = [i32::MIN; 15];
@@ -115,15 +117,24 @@ pub(crate) fn read(
             acc = a_cc;
         }
         clip |= [cx, cy, cw, ch].iter().all(|&c| c != i32::MIN);
+        let color = [a, r, g, b];
+        if clamped.is_none() && color.iter().any(|c| !(0..=255).contains(c)) {
+            clamped = Some(id);
+        }
         keys.push(SrcKey {
             at: i64::from(t),
             rect: [x, y, w, h],
-            color: [a, r, g, b].map(|c| c.clamp(0, 255)),
+            color: color.map(|c| c.clamp(0, 255)),
             angle,
         });
         prev = Some(v);
     }
-    Ok(Keys { keys, acc, clip })
+    Ok(Keys {
+        keys,
+        acc,
+        clip,
+        clamped,
+    })
 }
 
 /// An accepted track: keys strictly increasing from 0 or later.

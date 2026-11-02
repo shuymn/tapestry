@@ -776,6 +776,11 @@ impl<'d> Cx<'d> {
                 self.ignored(at, NoteKind::Ignored { field: "clip" });
                 keys.clip = false;
             }
+        } else if let Some(k) = keys.clamped {
+            // Clamped rather than refused, so the skin looks as its author
+            // saw it, and reported at the key.
+            let span = self.arena_span(k);
+            self.note(Some(span), Severity::Fallback, NoteKind::ColourClamped);
         }
         let mut angle = false;
         if text || o.unrotated {
