@@ -387,6 +387,28 @@ fn unequal_and_fractional_heights_map_to_their_lanes() {
 }
 
 #[test]
+fn a_height_fitting_exactly_imports_whatever_its_float_rounding() {
+    // At 1600×900 (r = 1.2) lanes at y 202, 403 high: the bottom is 837.6
+    // and the top 342 exactly, so key 4 at 413 (495.6) fills the room to
+    // the top exactly and fits. Rounded on their own, the bottom
+    // (837.5999755859375) and the height (495.6000061035156) would leave
+    // 341.9999694… < 342: the importer's height is the model's tallest
+    // fitting one instead, one `f32` step down, and the skin loads.
+    let skin = |size: &str| {
+        let note = note_with(&lane_rects(202, 403), &format!(r#""size": [{size}]"#));
+        import_sized([1_600, 900], &body("", &note, &[NOTES]), &[])
+    };
+    let l = skin("20, 20, 20, 413, 20, 20, 20, 20");
+    let q = drawn(&l, &tap(4, 1_000)).frame(1_000, &[]);
+    assert_eq!(q.len(), 1);
+    let h = q[0].rect[3];
+    assert_eq!(h, 495.6_f32.next_down());
+    assert!(f64::from(q[0].rect[1]) >= 342.0 - 1e-3, "{:?}", q[0].rect);
+    // Exactly too tall by 10^-8 of a skin pixel: refused.
+    refused(skin("20, 20, 20, 413.00000001, 20, 20, 20, 20"), "offset");
+}
+
+#[test]
 fn lane_rows_must_share_their_y() {
     let off = rects_with(3, r#"{"x": 250, "y": 201, "w": 50, "h": 600}"#);
     refused(

@@ -110,6 +110,30 @@ pub struct SourceLanes {
     pub note_h: [f32; LANE_COUNT],
 }
 
+impl SourceLanes {
+    /// The tallest note height that fits lanes whose top is `top`: the
+    /// largest `f32` at most `bottom − offset_y − top`, that room computed
+    /// in `f64` from the stored `f32` values. A note of at most this
+    /// height lies within `[top, bottom]` at its judgment time with no
+    /// lift. The one definition of a fitting height: the load check
+    /// applies it to every lane, and the importer to the heights it
+    /// converts.
+    #[must_use]
+    pub fn max_note_h(&self, top: i32) -> f32 {
+        let room = f64::from(self.bottom) - f64::from(self.offset_y) - f64::from(top);
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "rounded to the nearest f32, then stepped down below the room"
+        )]
+        let r = room as f32;
+        if f64::from(r) > room {
+            r.next_down()
+        } else {
+            r
+        }
+    }
+}
+
 /// The order the notes of different lanes are painted in, a later note
 /// over an earlier one where lanes overlap.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -343,10 +367,9 @@ impl LanesDef {
             }
             // Each lane's note at its judgment time, with no lift, lies
             // within `[top, bottom]` (`bottom` is the source's).
+            let max_h = s.max_note_h(self.top);
             for (lane, &n) in s.note_h.iter().enumerate() {
-                let n = f64::from(n);
-                #[expect(clippy::cast_precision_loss, reason = "within ±2^21, exact in f64")]
-                if !(n > 0.0 && y - o - n >= top as f64) {
+                if !(n > 0.0 && n <= max_h) {
                     return Err(LanesError::SourceHeight { lane });
                 }
             }

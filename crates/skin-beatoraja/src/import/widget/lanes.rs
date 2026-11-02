@@ -419,20 +419,30 @@ impl Cx<'_> {
         }
         // Each height in native lane order (source slot 7 is the scratch,
         // native lane 0).
-        // A positive rational here is at least 2^-127, so its `f32` is
-        // positive too (the least positive `f32` is 2^-149).
-        let mut note_h = [0.0_f32; LANES];
-        for (u, h) in heights.iter().enumerate() {
-            if let Some(slot) = note_h.get_mut(model(u)) {
-                *slot = h.to_f32();
-            }
-        }
-        let source = SourceLanes {
+        let mut source = SourceLanes {
             bottom: base.to_f32(),
             height: h_up.to_f32(),
             offset_y: oy.to_f32(),
-            note_h,
+            note_h: [0.0; LANES],
         };
+        // Each height to the model's `f32`, the exact fit decision kept:
+        // the nearest `f32`, unless that is taller than the model's own
+        // fit allows (`SourceLanes::max_note_h`, from the rounded bottom),
+        // then that tallest fitting height. The exact fit put the height
+        // at most the exact room, so the step down is at most the
+        // bottom's own rounding (half an `f32` step of the bottom) and one
+        // `f32` step of the height. A height that no positive `f32` fits
+        // after the bottom's rounding is out of range.
+        let max_h = source.max_note_h(top);
+        for (u, h) in heights.iter().enumerate() {
+            let v = h.to_f32().min(max_h);
+            if v <= 0.0 {
+                return Err(self.range(at, "size"));
+            }
+            if let Some(slot) = source.note_h.get_mut(model(u)) {
+                *slot = v;
+            }
+        }
 
         let mut lanes = [[0_i32; 2]; LANES];
         let mut parts = LaneParts {
