@@ -204,6 +204,16 @@ fn scripted_play(chart: &Path, log: &Path, appdata: &Path) -> Command {
     command
 }
 
+/// The output frames a development run reports sounds starting at.
+fn onsets(stdout: &str) -> Vec<i64> {
+    stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("dev: audio onsets "))
+        .and_then(|l| l.split_once(": "))
+        .map(|(_, frames)| frames.split(' ').map(|f| f.parse().unwrap()).collect())
+        .unwrap_or_default()
+}
+
 fn int(t: &toml::Table, table: &str, key: &str) -> Option<i64> {
     t.get(table)?.get(key)?.as_integer()
 }
@@ -476,19 +486,24 @@ fn an_invalid_key_config_exits_nonzero() {
 /// time 0 cancels the first READY through the input thread's latch, its
 /// release at 200 ms rearms a fresh READY through the input thread's
 /// boundary and the audio thread's transport, and the notes, pressed
-/// 1.2 s later than the log has them, are played by that READY. The saved
-/// record keeps the cancelled opening, Q's press in it, and the winning
-/// READY's input alone.
+/// 1.2 s later than the log has them, are played by that READY: every note
+/// judged PERFECT, and the audio restarted for it, its key sounds and BGM
+/// sounding as an ungated play's do. The saved record keeps the cancelled
+/// opening, Q's press in it, and the winning READY's input alone.
 #[test]
 fn the_start_gate_cancels_and_rearms_ready_on_the_real_threads() {
     const Q: u32 = 0x10;
     let Fixture {
-        dir: _dir,
+        dir,
         chart_path,
         log,
         appdata,
         ..
     } = fixture();
+    let ungated = scripted_play(&chart_path, &log, &dir.path().join("ungated"))
+        .output()
+        .expect("run tapestry");
+    let ungated = onsets(&String::from_utf8_lossy(&ungated.stdout));
     let mut rec = replay::decode(&fs::read(&log).unwrap(), &DecodeLimits::default()).unwrap();
     let q = |ms: i64, value: i32| eval::PhysicalInputEvent {
         received: TimeUs(ms * 1_000),
@@ -516,9 +531,20 @@ fn the_start_gate_cancels_and_rearms_ready_on_the_real_threads() {
     println!("{stdout}{stderr}");
     assert_eq!(out.status.code(), Some(0));
     assert!(
-        stdout.contains("re-evaluation matches live: true"),
+        stdout.contains(&format!(
+            "play 1: Completed; perfect {NOTES} great 0 good 0 bad 0 poor 0; re-evaluation matches live: true"
+        )),
         "{stdout}"
     );
+    // The same sounds as the ungated play, each where it falls from the
+    // first, within a period.
+    let gated = onsets(&stdout);
+    let from_first = |o: &[i64]| o.iter().map(|f| f - o[0]).collect::<Vec<_>>();
+    assert_eq!(gated.len(), ungated.len(), "{gated:?} {ungated:?}");
+    assert!(!gated.is_empty());
+    for (g, u) in from_first(&gated).iter().zip(from_first(&ungated)) {
+        assert!((g - u).abs() <= 480, "{gated:?} {ungated:?}");
+    }
 
     let saved = records(&appdata);
     assert_eq!(saved.len(), 1, "{saved:?}");
