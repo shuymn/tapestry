@@ -21,7 +21,9 @@ use rules::{GaugeValue, Judgment, LnMode};
 use skin_model::BuildError;
 
 use crate::atlas::{GLYPH_H, GLYPH_W, glyph_uv, solid_uv};
-use crate::{AttemptInput, Blend, FrameInput, Gpu, PlaySkin, SkinError, Sprite, SpriteBatch};
+use crate::{
+    AttemptInput, Blend, FrameInput, Gpu, LoadingFrame, PlaySkin, SkinError, Sprite, SpriteBatch,
+};
 
 /// The layout, in layout pixels of the 1920×1080 base resolution, and the
 /// placement of notes in it.
@@ -581,12 +583,19 @@ impl PlaySkin for SimpleSkin {
         Ok(())
     }
 
-    fn build_loading(&mut self, out: &mut SpriteBatch) {
+    /// The lanes, the judgment line and the gauge's frame, whatever the
+    /// frame: never refuses.
+    fn build_loading(
+        &mut self,
+        _f: &LoadingFrame<'_>,
+        out: &mut SpriteBatch,
+    ) -> Result<(), BuildError> {
         Self::lanes_and_lines(out);
         let w = LANES_RIGHT - LANE_LEFT;
         let y = JUDGE_Y - JUDGE_LINE_H / 2.0;
         rect(out, Blend::Alpha, LANE_LEFT, y, w, JUDGE_LINE_H, JUDGE_LINE);
         rect(out, Blend::Alpha, LANE_LEFT, GAUGE_Y, w, GAUGE_H, GAUGE_BG);
+        Ok(())
     }
 
     /// Never refuses a frame.
@@ -1907,7 +1916,8 @@ mod tests {
             .unwrap();
         let mut s = skin(&chart);
         let mut batch = SpriteBatch::with_capacity(4096);
-        s.build_loading(&mut batch);
+        let f = LoadingFrame::interim(1, TimeUs(0), TimeUs(0), TimeUs(500_000));
+        assert_eq!(s.build_loading(&f, &mut batch), Ok(()));
         assert!(batch.blended(Blend::Alpha).any(|s| s.color == JUDGE_LINE));
         assert!(batch.blended(Blend::Alpha).any(|s| s.color == LANE_BG));
         assert!(in_lane(&batch, lane(3), NOTE_WHITE).is_empty());

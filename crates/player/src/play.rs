@@ -58,6 +58,9 @@ pub struct PlayerRig<'a> {
     pub audio: AudioLink,
     /// The render thread.
     pub render: RenderLink,
+    /// The play skin's installation: charts are admitted once it is
+    /// ready.
+    pub skin: crate::render_side::SkinState,
     /// The window's controls.
     pub controls: &'a Controls,
     /// Whether the window was shown: recording opens once it is. `None`

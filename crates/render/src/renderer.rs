@@ -11,12 +11,12 @@ use std::time::{Duration, Instant};
 
 use bms_model::Chart;
 use eval::Section;
-use skin_model::{AtlasLimits, BuildError};
+use skin_model::{AtlasLimits, BuildError, TextSlots, TextTable, TextTableError};
 use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
 use windows::Win32::Graphics::Dxgi::{DXGI_FRAME_STATISTICS, IDXGISwapChain3};
 use windows::Win32::System::Threading::WaitForSingleObject;
 
-use crate::decl::{DeclSkin, SkinBundle};
+use crate::decl::{DeclSkin, Installation, SkinBundle};
 use crate::gpu::{self, AdapterChoice, Gpu};
 use crate::measure::{FrameStatistics, Presentation};
 use crate::pace::Pacer;
@@ -27,8 +27,8 @@ use crate::skin_atlas::{self, AtlasPages, AtlasTexture, UploadError};
 use crate::staging::{Scissor, Staging};
 use crate::text::MenuText;
 use crate::{
-    AttemptInput, Blend, FrameInput, Instance, OVERLAY_SPRITES, PlaySkin, SimpleSkin, SkinError,
-    SpriteBatch,
+    AttemptInput, Blend, FrameInput, Instance, LoadingFrame, OVERLAY_SPRITES, PlaySkin, SimpleSkin,
+    SkinError, SpriteBatch,
 };
 
 /// The next [`Renderer`]'s id.
@@ -124,6 +124,29 @@ pub enum Target {
     },
 }
 
+/// What a loading text table is checked against as it installs
+/// ([`Renderer::install_loading_text`]): the installation it was prepared
+/// for, by its loading presentation, and the renderer and resources (the
+/// atlas) its lines were laid out on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LoadingTextKey {
+    installation: u64,
+    device: u64,
+    resources: u64,
+}
+
+/// Why loading text was not installed: nothing changes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum LoadingTextError {
+    /// It was prepared for another installation, or the installation's
+    /// renderer or resources were replaced since.
+    #[error("the loading text belongs to another installation or its replaced resources")]
+    Stale,
+    /// The table does not fit the skin's text slots.
+    #[error(transparent)]
+    Table(#[from] TextTableError),
+}
+
 /// Why the renderer could not start or load a chart.
 #[derive(Debug, thiserror::Error)]
 pub enum RenderError {
@@ -181,6 +204,15 @@ pub enum RenderError {
     /// A menu's text could not be prepared ([`crate::text::MenuText::prepare`]).
     #[error(transparent)]
     TextPrepare(#[from] crate::text::TextError),
+    /// An installation was asked for a request older than one already
+    /// staged or committed: the newer stays, and the older is dropped.
+    #[error("the installation of request {request} is superseded by request {newer}")]
+    Superseded {
+        /// The request refused.
+        request: u64,
+        /// The newer request staged or committed.
+        newer: u64,
+    },
 }
 
 impl RenderError {
@@ -194,7 +226,7 @@ impl RenderError {
     #[must_use]
     pub const fn is_refusal(&self) -> bool {
         match self {
-            Self::Skin(_) | Self::Capacity { .. } => true,
+            Self::Skin(_) | Self::Capacity { .. } | Self::Superseded { .. } => true,
             Self::Atlas(UploadError::Device(e)) => matches!(
                 e,
                 wgpu::Error::OutOfMemory { .. } | wgpu::Error::Validation { .. }
@@ -235,6 +267,14 @@ pub enum CommitError {
     /// replaced.
     #[error("the installation was staged on another device")]
     Device,
+    /// The token's request is not newer than the one committed last.
+    #[error("request {asked} is not newer than request {committed}, committed")]
+    Superseded {
+        /// The request committed last.
+        committed: u64,
+        /// The request committed.
+        asked: u64,
+    },
 }
 
 /// The GPU and CPU resources a declarative skin's installation replaces
@@ -248,7 +288,9 @@ struct Resources {
 }
 
 /// An installation staged and not yet committed: the fresh skin with its
-/// prepared attempt, and its own resources, or `None` when it reuses the
+/// prepared attempt, or none for a chart-independent installation
+/// ([`Renderer::install`]), sharing the installation's loading
+/// presentation, and its own resources, or `None` when it reuses the
 /// installed bundle's.
 struct Pending {
     token: PreparedToken,
@@ -284,6 +326,12 @@ pub struct MemoryWitness {
     /// The staged attempt's, beside it until the commit, even when the
     /// staging reuses the installed resources.
     pub staged_attempt: u64,
+    /// The installed installation's loading presentation: its state and
+    /// its text. The render thread's copy kept for recovery is this very
+    /// state, shared, so it is counted here once.
+    pub loading: u64,
+    /// The staged installation's, when it is another installation's.
+    pub staged_loading: u64,
 }
 
 impl MemoryWitness {
@@ -299,6 +347,8 @@ impl MemoryWitness {
             .saturating_add(self.staged_batch)
             .saturating_add(self.attempt)
             .saturating_add(self.staged_attempt)
+            .saturating_add(self.loading)
+            .saturating_add(self.staged_loading)
     }
 }
 
@@ -425,9 +475,17 @@ pub struct Renderer {
     /// play skin's projection and clip scissors.
     staging: Staging,
     skin: Box<dyn PlaySkin>,
-    /// The declarative skin's bundle installed, `None` for the simple
-    /// skin or one set with [`set_skin`](Self::set_skin).
-    installed: Option<Arc<SkinBundle>>,
+    /// The declarative installation in use, its bundle with its loading
+    /// presentation; `None` for the simple skin or one set with
+    /// [`set_skin`](Self::set_skin).
+    installed: Option<Installation>,
+    /// The request committed last ([`commit`](Self::commit)): no staging
+    /// or commit of a request up to it is taken.
+    committed: u64,
+    /// The newest request a staging was asked for, kept through its
+    /// discard or refusal, and so never below `committed`: no staging of
+    /// a request up to it is taken.
+    requested: u64,
     /// Bumped each time the atlas and the staging are replaced: a test of
     /// whether an installation reused them.
     resources: u64,
@@ -440,6 +498,9 @@ pub struct Renderer {
     /// built again, and nothing submitted, until the next
     /// [`load`](Self::load) prepares a fresh one.
     refused: Option<BuildError>,
+    /// The skin's refusal of a loading frame, with its loading lifetime:
+    /// no loading frame of that lifetime is built again on this skin.
+    loading_refused: Option<(u64, BuildError)>,
     /// An offscreen target's frame left pending on the GPU: at most one,
     /// as a swap chain's frame latency bounds a window's.
     pacer: Pacer<wgpu::SubmissionIndex>,
@@ -536,10 +597,13 @@ impl Renderer {
             staging,
             skin,
             installed: None,
+            committed: 0,
+            requested: 0,
             resources: 0,
             pending: None,
             started: None,
             refused: None,
+            loading_refused: None,
             pacer: Pacer::default(),
             clear: wgpu::Color::BLACK,
             #[cfg(test)]
@@ -654,6 +718,7 @@ impl Renderer {
         self.skin = skin;
         self.installed = None;
         self.refused = None;
+        self.loading_refused = None;
         self.project();
         Ok(())
     }
@@ -780,8 +845,16 @@ impl Renderer {
 
     /// The declarative bundle installed, if any.
     #[must_use]
-    pub const fn installed(&self) -> Option<&Arc<SkinBundle>> {
-        self.installed.as_ref()
+    pub fn installed(&self) -> Option<&Arc<SkinBundle>> {
+        self.installed.as_ref().map(Installation::bundle)
+    }
+
+    /// The declarative installation in use, its bundle with its loading
+    /// presentation, shared: what the render thread keeps to restore on a
+    /// renderer built again ([`restore`](Self::restore)).
+    #[must_use]
+    pub fn installation(&self) -> Option<Installation> {
+        self.installed.clone()
     }
 
     /// How many times the atlas and the staging were replaced.
@@ -832,22 +905,67 @@ impl Renderer {
         a: &AttemptInput<'_>,
         request: u64,
     ) -> Result<PreparedToken, RenderError> {
+        self.stage_with(bundle, Some(a), request)
+    }
+
+    /// Stages `bundle`'s chart-independent installation for `request`: as
+    /// [`stage`](Self::stage), the atlas with the built-in layer, the
+    /// clips, the staging, the instance buffer and the loading
+    /// presentation, with no attempt and no `Play`. Its frames draw
+    /// nothing of a play until an attempt is staged and committed; its
+    /// loading frames draw its presentation. Staging the bundle installed
+    /// keeps its resources and its presentation.
+    ///
+    /// # Errors
+    ///
+    /// As [`stage`](Self::stage).
+    pub fn install(
+        &mut self,
+        bundle: &Arc<SkinBundle>,
+        request: u64,
+    ) -> Result<PreparedToken, RenderError> {
+        self.stage_with(bundle, None, request)
+    }
+
+    /// [`stage`](Self::stage) with attempt `a`, or
+    /// [`install`](Self::install) without one. A request not newer than
+    /// every one asked for or committed (staged, discarded or refused
+    /// included) is refused, the staging kept; any other refusal drops
+    /// the staging. The bundle installed keeps its loading presentation;
+    /// another gets a fresh one.
+    fn stage_with(
+        &mut self,
+        bundle: &Arc<SkinBundle>,
+        a: Option<&AttemptInput<'_>>,
+        request: u64,
+    ) -> Result<PreparedToken, RenderError> {
+        // Never below `committed`: a commit takes only a staging's
+        // request, and every staging was asked for first.
+        let newer = self.requested;
+        if request <= newer {
+            return Err(RenderError::Superseded { request, newer });
+        }
+        self.requested = request;
         self.pending = None;
-        let reuse = self
+        let installed = self
             .installed
             .as_ref()
-            .is_some_and(|b| Arc::ptr_eq(b, bundle));
-        let resources = if reuse {
-            None
-        } else {
-            Some(self.resources_for(bundle)?)
+            .filter(|i| Arc::ptr_eq(i.bundle(), bundle));
+        let (installation, resources) = match installed {
+            Some(i) => (i.clone(), None),
+            None => (
+                Installation::new(Arc::clone(bundle)),
+                Some(self.resources_for(bundle)?),
+            ),
         };
-        let mut skin = DeclSkin::new(Arc::clone(bundle));
-        let a = AttemptInput {
-            target: self.target(),
-            ..*a
-        };
-        skin.prepare(&self.gpu, &a).map_err(RenderError::Skin)?;
+        let mut skin = DeclSkin::of(&installation);
+        if let Some(a) = a {
+            let a = AttemptInput {
+                target: self.target(),
+                ..*a
+            };
+            skin.prepare(&self.gpu, &a).map_err(RenderError::Skin)?;
+        }
         let token = PreparedToken {
             request,
             device: self.id,
@@ -867,8 +985,11 @@ impl Renderer {
     /// validation) is answered as a refusal, never an uncaptured error.
     fn resources_for(&self, bundle: &Arc<SkinBundle>) -> Result<Resources, RenderError> {
         let device = self.gpu.device();
-        let skin = DeclSkin::new(Arc::clone(bundle));
-        let (capacity, runs) = sizes(&skin);
+        let skin = bundle.skin();
+        let (capacity, runs) = (
+            skin.quad_capacity().max(MAX_SPRITES as u32),
+            skin.run_capacity().max(MAX_SPRITES as u32),
+        );
         let instances =
             usize::try_from(capacity.saturating_add(OVERLAY_SPRITES)).unwrap_or(usize::MAX);
         let max = device.limits().max_buffer_size;
@@ -936,6 +1057,12 @@ impl Renderer {
         if token.device != self.id {
             return Err(CommitError::Device);
         }
+        if token.request <= self.committed {
+            return Err(CommitError::Superseded {
+                committed: self.committed,
+                asked: token.request,
+            });
+        }
         let Some(staged) = self.pending.as_ref().map(|p| p.token) else {
             return Err(CommitError::NothingStaged);
         };
@@ -949,26 +1076,30 @@ impl Renderer {
             return Err(CommitError::NothingStaged);
         };
         if let Some(r) = pending.resources {
-            self.install(r);
+            self.replace_resources(r);
         }
+        self.committed = token.request;
         self.activate_decl_skin(pending.skin);
         Ok(())
     }
 
-    /// Puts `skin` in use, its bundle the one installed, and builds frames
-    /// afresh: no refusal kept, no frame started, the projection made
-    /// again for its canvas.
+    /// Puts `skin` in use, its installation the one installed, and builds
+    /// frames afresh: no refusal kept, no frame started, the projection
+    /// made again for its canvas. A loading refusal stays only with the
+    /// installation's own presentation, so the same installation keeps it
+    /// for its lifetime and another starts afresh.
     fn activate_decl_skin(&mut self, skin: DeclSkin) {
-        self.installed = Some(Arc::clone(skin.bundle()));
+        self.installed = Some(skin.installation());
         self.skin = Box::new(skin);
         self.refused = None;
+        self.loading_refused = None;
         self.started = None;
         self.project();
     }
 
     /// Replaces the atlas, its bind group, the staging and the instance
     /// buffer with `r`, together.
-    fn install(&mut self, r: Resources) {
+    fn replace_resources(&mut self, r: Resources) {
         self.atlas = r.atlas;
         self.atlas_bind = r.atlas_bind;
         self.staging = r.staging;
@@ -982,19 +1113,21 @@ impl Renderer {
         self.pending = None;
     }
 
-    /// Installs `bundle` with no attempt prepared, at once: a renderer
-    /// built again after a device failure restores the committed bundle
-    /// from memory this way, and the next attempt is prepared afresh
-    /// through [`stage`](Self::stage), which reuses its resources.
+    /// Installs `installation` with no attempt prepared, at once: a
+    /// renderer built again after a device failure restores the committed
+    /// installation from memory this way, its loading presentation the
+    /// very state, `when` starts included, and the next attempt is
+    /// prepared afresh through [`stage`](Self::stage), which reuses its
+    /// resources.
     ///
     /// # Errors
     ///
     /// As [`stage`](Self::stage); the installation in use stays.
-    pub fn restore(&mut self, bundle: &Arc<SkinBundle>) -> Result<(), RenderError> {
+    pub fn restore(&mut self, installation: &Installation) -> Result<(), RenderError> {
         self.pending = None;
-        let r = self.resources_for(bundle)?;
-        self.install(r);
-        self.activate_decl_skin(DeclSkin::new(Arc::clone(bundle)));
+        let r = self.resources_for(installation.bundle())?;
+        self.replace_resources(r);
+        self.activate_decl_skin(DeclSkin::of(installation));
         Ok(())
     }
 
@@ -1005,12 +1138,14 @@ impl Renderer {
         let staged = self.pending.as_ref();
         let installed = self.installed.as_ref();
         let other = staged
-            .map(|p| p.skin.bundle())
-            .filter(|b| !installed.is_some_and(|i| Arc::ptr_eq(i, b)));
+            .map(|p| p.skin.installation())
+            .filter(|s| !installed.is_some_and(|i| Arc::ptr_eq(i.bundle(), s.bundle())));
         let res = staged.and_then(|p| p.resources.as_ref());
         MemoryWitness {
-            committed_cpu: installed.map_or(0, |b| b.resident_bytes()),
-            staged_cpu: other.map_or(0, |b| b.resident_bytes()),
+            committed_cpu: installed.map_or(0, |i| i.bundle().resident_bytes()),
+            staged_cpu: other.as_ref().map_or(0, |s| s.bundle().resident_bytes()),
+            loading: installed.map_or(0, |i| i.loading().bytes()),
+            staged_loading: other.as_ref().map_or(0, |s| s.loading().bytes()),
             atlas: self.atlas.bytes(),
             staged_atlas: res.map_or(0, |r| r.atlas.bytes()),
             upload: res.map_or(0, |r| r.atlas.upload_bytes()),
@@ -1158,23 +1293,121 @@ impl Renderer {
     }
 
     /// Draws the play screen while a chart loads before READY, as
-    /// [`frame`](Self::frame) draws: the skin's loading frame
-    /// ([`PlaySkin::build_loading`]), then in a pass of its own the text
-    /// last prepared on `text`, the load's lines. Before recording opens
-    /// only: no play frame draws text this way.
+    /// [`frame`](Self::frame) draws: the skin's loading frame `f`
+    /// ([`enter_loading`](Self::enter_loading), then
+    /// [`build_loading`](Self::build_loading)), then in a pass of its own
+    /// the text last prepared on `text`, the load's lines. Before
+    /// recording opens only: no play frame draws text this way.
     ///
     /// # Errors
     ///
-    /// As [`menu_frame`](Self::menu_frame).
-    pub fn loading_frame(&mut self, text: &MenuText) -> Result<FrameTiming, RenderError> {
+    /// The outer error as [`menu_frame`](Self::menu_frame): the device or
+    /// the surface failed. The inner one is the skin's refusal of the
+    /// loading frame: nothing of it, its lines included, is drawn or
+    /// submitted, the renderer stays usable, and no loading frame of that
+    /// lifetime is built again.
+    pub fn loading_frame(
+        &mut self,
+        f: &LoadingFrame<'_>,
+        text: &MenuText,
+    ) -> Result<Result<FrameTiming, BuildError>, RenderError> {
         if text.owner() != self.id {
             return Err(RenderError::OtherRenderersText);
         }
         let start = Instant::now();
-        let skin = &mut self.skin;
-        self.staging.fill(|b| skin.build_loading(b));
+        self.enter_loading(f.lifetime);
+        if let Err(e) = self.build_loading(f) {
+            return Ok(Err(e));
+        }
         let projection = self.staging.projection();
-        self.draw(start, Some(text), projection)
+        self.draw(start, Some(text), projection).map(Ok)
+    }
+
+    /// Loading lifetime `lifetime` draws next, between frames: a skin's
+    /// loading state of another lifetime starts afresh
+    /// ([`PlaySkin::enter_loading`]), in place, and a refusal of
+    /// another lifetime is forgotten.
+    pub fn enter_loading(&mut self, lifetime: u64) {
+        if self.loading_refused.is_some_and(|(l, _)| l != lifetime) {
+            self.loading_refused = None;
+        }
+        self.skin.enter_loading(lifetime);
+    }
+
+    /// The app's share of a loading frame: the skin builds `f`
+    /// ([`Staging::build_loading`]) at the applied target, with no call
+    /// into wgpu; nothing allocates, the refusal included.
+    ///
+    /// # Errors
+    ///
+    /// The skin's refusal of this frame, or of an earlier one of its
+    /// lifetime: the staging is left empty and the skin is not called
+    /// again for that lifetime.
+    pub fn build_loading(&mut self, f: &LoadingFrame<'_>) -> Result<(), BuildError> {
+        // Whatever is staged now, a play frame built before it is not
+        // submitted.
+        self.started = None;
+        if let Some(e) = self.loading_refused(f.lifetime) {
+            self.staging.fill(|_| {});
+            return Err(e);
+        }
+        let f = LoadingFrame {
+            target: self.target(),
+            ..*f
+        };
+        if let Err(e) = self.staging.build_loading(self.skin.as_mut(), &f) {
+            self.loading_refused = Some((f.lifetime, e));
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// What loading text laid out for the installation in use now is
+    /// checked against; `None` without a declarative installation.
+    #[must_use]
+    pub fn loading_text_key(&self) -> Option<LoadingTextKey> {
+        let installed = self.installed.as_ref()?;
+        Some(LoadingTextKey {
+            installation: installed.loading().id(),
+            device: self.id,
+            resources: self.resources,
+        })
+    }
+
+    /// Installs `table`'s lines into the installed presentation's slots
+    /// `which` names, from its next loading frame on, if `key` is still
+    /// the installation's ([`loading_text_key`](Self::loading_text_key)):
+    /// text prepared for another installation, or on resources since
+    /// replaced, never draws.
+    ///
+    /// # Errors
+    ///
+    /// [`LoadingTextError::Stale`] for another key, and
+    /// [`LoadingTextError::Table`] for a table that does not fit the
+    /// skin's slots: nothing changes.
+    pub fn install_loading_text(
+        &mut self,
+        key: LoadingTextKey,
+        which: TextSlots,
+        table: &TextTable,
+    ) -> Result<(), LoadingTextError> {
+        if self.loading_text_key() != Some(key) {
+            return Err(LoadingTextError::Stale);
+        }
+        let Some(installed) = self.installed.as_ref() else {
+            return Err(LoadingTextError::Stale);
+        };
+        Ok(installed
+            .loading()
+            .install_text(installed.bundle(), which, table)?)
+    }
+
+    /// The loading refusal kept for lifetime `lifetime`, if any.
+    #[must_use]
+    pub fn loading_refused(&self, lifetime: u64) -> Option<BuildError> {
+        self.loading_refused
+            .filter(|(l, _)| *l == lifetime)
+            .map(|(_, e)| e)
     }
 
     /// Draws a menu screen, as [`frame`](Self::frame) draws: the sprites

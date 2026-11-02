@@ -232,6 +232,11 @@ impl TextTable {
         self.0.get(usize::from(slot)).and_then(Option::as_ref)
     }
 
+    /// Empties every slot in place, allocating nothing.
+    pub(crate) fn clear(&mut self) {
+        self.0.iter_mut().for_each(|s| *s = None);
+    }
+
     /// Sets `slot`'s line; a slot past the table is ignored.
     pub(crate) fn set(&mut self, slot: u16, line: Option<TextImage>) {
         if let Some(s) = self.0.get_mut(usize::from(slot)) {

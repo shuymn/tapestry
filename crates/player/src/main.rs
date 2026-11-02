@@ -734,6 +734,7 @@ fn rig<'a>(
         input,
         audio,
         render,
+        skin: render_side::SkinState::Ready,
         controls,
         clock,
         recorded: input_side::Recorded {

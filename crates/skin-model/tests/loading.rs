@@ -704,6 +704,40 @@ fn loading_bitmap_text_is_replaced_and_cleared() {
     assert_eq!(when(&l), (Some(100 * MS), 400));
 }
 
+/// A state started afresh in place builds as a fresh one: its text slots
+/// empty, its `when` started again at its next frame, and a refusal gone.
+#[test]
+fn a_reset_loading_state_builds_as_a_fresh_one() {
+    let (_dir, sheet) = image_support::ab_fonts();
+    let mut l = Loader::new(bitmap_text_skin(sheet));
+    let lines = |l: &Loader| l.batch.quads().len();
+    let when = |l: &Loader| (l.start(timer::BUILTIN), l.reading(timer::BUILTIN));
+    l.build(100);
+    let bare = lines(&l);
+    let chart = skin_model::ChartText {
+        title: "AB",
+        ..skin_model::ChartText::default()
+    };
+    l.skin
+        .install_loading_bitmap_text(&mut l.loading, TextSlots::ALL, &chart);
+    l.build(200);
+    assert!(lines(&l) > bare);
+    l.loading.reset();
+    l.build(300);
+    assert_eq!(lines(&l), bare);
+    assert_eq!(when(&l), (Some(300 * MS), 0));
+
+    let mut l = Loader::new(structural());
+    l.build(100);
+    l.covers.cover = 300;
+    assert_eq!(l.try_build_us(200 * MS), Err(BuildError::InvalidReadouts));
+    l.covers = readouts_for(VIEW).covers;
+    l.loading.reset();
+    assert_eq!(l.loading.refused(), None);
+    assert_eq!(l.try_build_us(300 * MS), Ok(()));
+    assert_eq!(l.count(BACKGROUND), 1);
+}
+
 /// A refused loading build leaves the state refused: later builds return
 /// the same error, while a fresh state builds.
 #[test]

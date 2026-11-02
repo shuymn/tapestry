@@ -33,9 +33,10 @@ use eval::Section;
 use game::Preparation;
 use render::text::{Fonts, MenuText, TextBlock, TextStyle};
 use render::{
-    AttemptInput, Blend, CommitError, FrameTiming, PreparedToken, RenderError, Renderer,
-    SkinBundle, Sprite, solid_uv,
+    AttemptInput, Blend, CommitError, FrameTiming, Installation, LoadingFrame, PreparedToken,
+    RenderError, Renderer, SkinBundle, Sprite, solid_uv,
 };
+use skin_model::BuildError;
 
 use crate::render_side::{Screen, refusal};
 
@@ -387,8 +388,27 @@ impl Screen for MenuScreen {
         self.renderer.discard();
     }
 
-    fn restore(&mut self, bundle: &Arc<SkinBundle>) -> Result<(), RenderError> {
-        self.renderer.restore(bundle)
+    /// Stages `skin`'s chart-independent installation, answering at
+    /// once; a refusal on a healthy device ([`RenderError::is_refusal`])
+    /// keeps the installation in use.
+    fn install(
+        &mut self,
+        skin: &Arc<SkinBundle>,
+        request: u64,
+    ) -> Result<Preparation, RenderError> {
+        match self.renderer.install(skin, request) {
+            Ok(_) => Ok(Preparation::Ready),
+            Err(e) if e.is_refusal() => Ok(refusal(game::Chain(&e).to_string())),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn installation(&self) -> Option<Installation> {
+        self.renderer.installation()
+    }
+
+    fn restore(&mut self, installation: &Installation) -> Result<(), RenderError> {
+        self.renderer.restore(installation)
     }
 
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
@@ -447,22 +467,28 @@ impl Screen for MenuScreen {
         })
     }
 
-    /// The lines only: the typed update is for a skin's loading frame,
-    /// which the simple skin does not draw.
+    /// The skin's loading frame `frame`, then the lines over it; the
+    /// typed update is for a loading frame's text, which none draws yet.
+    /// The lines are laid out before the frame is built, outside its
+    /// work.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn loading(
         &mut self,
         page: &MenuPage,
         _update: Option<&crate::loading_text::LoadingUpdate>,
         changed: bool,
-    ) -> Result<FrameTiming, RenderError> {
+        frame: &LoadingFrame<'_>,
+    ) -> Result<Result<FrameTiming, BuildError>, RenderError> {
         if changed || self.stale || self.text.is_none() {
             self.prepare(page, LOADING_LEFT, LOADING_TOP)?;
         }
         let Some(text) = &self.text else {
             return Err(RenderError::OtherRenderersText);
         };
-        let timing = self.renderer.loading_frame(text)?;
-        self.shown(timing.presented);
+        let timing = self.renderer.loading_frame(frame, text)?;
+        if let Ok(t) = &timing {
+            self.shown(t.presented);
+        }
         Ok(timing)
     }
 

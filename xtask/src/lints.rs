@@ -330,11 +330,13 @@ pub const IN_PLAY: &[Site] = &[
     Site::Fns("crates/render/src/gpu.rs", &["Gpu::device", "Gpu::queue"]),
     Site::File("crates/player/src/measure.rs"),
     Site::File("crates/player/src/render_side.rs"),
-    // The play frame's calls through the screen the render thread keeps;
-    // its menu preparation runs on menus only.
+    // The play and loading frames' calls through the screen the render
+    // thread keeps; its menu preparation runs on menus only, and the
+    // loading lines' before the loading frame is built.
     Site::Fns(
         "crates/player/src/menu_screen.rs",
         &[
+            "MenuScreen::loading",
             "MenuScreen::wait",
             "MenuScreen::paced",
             "MenuScreen::build",

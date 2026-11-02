@@ -45,9 +45,20 @@
 //! commit of that request ([`RenderLink::commit_attempt`]), after the
 //! game's last checks; a cancelled, refused, timed out or superseded
 //! request is discarded, so an answer that comes late never installs.
-//! The declarative bundle committed is kept apart from the screen: a
-//! screen built again after a failure restores exactly it from memory
-//! ([`Screen::restore`]).
+//! The declarative installation committed is kept apart from the screen,
+//! its loading presentation with it: a screen built again after a failure
+//! restores exactly it from memory ([`Screen::restore`]), `when` starts
+//! included, never reading its files again.
+//!
+//! A declarative skin is selected by an acknowledged transaction
+//! ([`RenderLink::select`]): its chart-independent installation is staged
+//! and committed on the render thread under the same request numbers as
+//! the attempts' preparations, so the newer of the two always wins, and a
+//! selection the game thread withdrew (cancelled, timed out, abandoned)
+//! installs nothing however late it completes. A loading frame the skin
+//! refuses draws nothing, keeps the screen and is not built again in its
+//! loading lifetime; the end of loading reports the refusal, so recording
+//! does not open ([`RenderLink::end_loading`]).
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
@@ -63,7 +74,8 @@ use game::{Chain, Preparation, PreparationRefusal, RenderSide, ResultGraphs};
 use input::QpcClock;
 use render::measure::{FrameStatistics, Presentation};
 use render::{
-    AttemptInput, CommitError, FrameInput, FrameTiming, PreparedToken, RenderError, SkinBundle,
+    AttemptInput, CommitError, FrameInput, FrameTiming, Installation, LoadingFrame, PreparedToken,
+    RenderError, SkinBundle,
 };
 use skin_model::{BuildError, PlayContext};
 
@@ -136,15 +148,41 @@ pub trait Screen: Send {
     /// Drops what a preparation staged and was not committed. The default
     /// has nothing to drop.
     fn discard(&mut self) {}
-    /// Installs the committed `bundle` on a screen built again after a
-    /// failure, from memory, with no attempt prepared. The default
+    /// Stages `skin`'s chart-independent installation for request
+    /// `request` (its atlas, clips, buffers and loading presentation, no
+    /// attempt): it draws nothing until its [`commit`](Self::commit), and
+    /// the installation in use goes on drawing meanwhile. A skin the
+    /// screen cannot install refuses it, the installation in use kept.
+    /// The default refuses: it draws no declarative skin.
+    ///
+    /// # Errors
+    ///
+    /// Why the screen or its device cannot draw at all: the screen must be
+    /// built again.
+    fn install(
+        &mut self,
+        skin: &Arc<SkinBundle>,
+        request: u64,
+    ) -> Result<Preparation, RenderError> {
+        let _ = (skin, request);
+        Ok(refusal("this screen draws no declarative skin"))
+    }
+    /// The declarative installation in use, its loading presentation
+    /// with it, kept for a screen built again; `None` for the simple
+    /// skin. The default has none.
+    fn installation(&self) -> Option<Installation> {
+        None
+    }
+    /// Installs the committed `installation` on a screen built again
+    /// after a failure, from memory, with no attempt prepared: the very
+    /// loading presentation, `when` starts included. The default
     /// installs nothing.
     ///
     /// # Errors
     ///
     /// Why it could not be installed: the screen must be built again.
-    fn restore(&mut self, bundle: &Arc<SkinBundle>) -> Result<(), RenderError> {
-        let _ = bundle;
+    fn restore(&mut self, installation: &Installation) -> Result<(), RenderError> {
+        let _ = installation;
         Ok(())
     }
     /// Waits until a frame may start; `false` on a timeout. Returns at
@@ -214,22 +252,27 @@ pub trait Screen: Send {
         })
     }
     /// Draws the play screen while a chart loads before READY:
-    /// the skin's loading frame with `page`, the load's lines, over it,
-    /// laid out again when `changed` (design.md "Play Lifecycle"). `update`
-    /// is the same moment typed, when the lines came with it, of the same
-    /// loading lifetime. The default draws the lines as a menu page.
+    /// the skin's loading frame `frame`, then `page`, the load's lines,
+    /// over it in a pass of their own, laid out again when `changed`
+    /// (design.md "Play Lifecycle"). `update` is the same moment typed,
+    /// when the lines came with it, of the same loading lifetime. The
+    /// default draws the lines as a menu page.
     ///
     /// # Errors
     ///
-    /// As [`menu`](Self::menu).
+    /// The outer error as [`menu`](Self::menu). The inner one is the
+    /// skin's refusal of the loading frame: nothing of it, its lines
+    /// included, is drawn, the screen stays, and no loading frame of that
+    /// lifetime is drawn again.
     fn loading(
         &mut self,
         page: &MenuPage,
         update: Option<&LoadingUpdate>,
         changed: bool,
-    ) -> Result<FrameTiming, RenderError> {
-        let _ = update;
-        self.menu(page, changed)
+        frame: &LoadingFrame<'_>,
+    ) -> Result<Result<FrameTiming, BuildError>, RenderError> {
+        let _ = (update, frame);
+        self.menu(page, changed).map(Ok)
     }
     /// Draws the launch screen `elapsed` after the render thread started,
     /// as [`text`](Self::text), until the game sends what to draw; `None`
@@ -377,6 +420,21 @@ pub enum ScreenError {
     /// recording opened.
     #[error("the screen failed before the play opened")]
     Lost,
+    /// The play skin refused a loading frame of the play's loading
+    /// state: recording must not open.
+    #[error("the play skin refused its loading frame")]
+    LoadingRefused(#[source] BuildError),
+}
+
+/// How the render thread answered the end of a loading lifetime.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LoadingEnd {
+    /// No loading frame of it is drawn any more, and the screen is there.
+    Ready,
+    /// The screen failed after the attempt was prepared.
+    Lost,
+    /// The skin refused a loading frame of it.
+    Refused(BuildError),
 }
 
 /// The end screen: its lines and the view's graphs, if it has them.
@@ -436,10 +494,19 @@ pub enum RenderMsg {
     /// Drop the preparation of this request, answered or not, unless
     /// committed: it was cancelled, refused or timed out.
     Discard(u64),
-    /// Prepare every later attempt with this declarative skin, or with the
-    /// skin in use (tests: production draws the simple skin).
-    #[cfg(test)]
-    Select(Option<Arc<SkinBundle>>),
+    /// Install this declarative skin's chart-independent installation
+    /// and prepare every later attempt with it, or with the skin in use
+    /// for `None`, and answer how it ended: ready once committed, a
+    /// refusal keeping the installation in use, or the screen's failure.
+    /// Never committed once the request is withdrawn.
+    Select {
+        /// The request's number, of the same sequence as the attempts'.
+        request: u64,
+        /// The skin, or `None` for the skin in use.
+        skin: Option<Arc<SkinBundle>>,
+        /// Where the answer goes.
+        reply: mpsc::SyncSender<Result<Preparation, RenderError>>,
+    },
     /// Draw the select screen's page instead of a play.
     Menu(Box<MenuPage>),
     /// Draw the play screen's loading state of this loading lifetime with
@@ -447,10 +514,16 @@ pub enum RenderMsg {
     /// and a preparation until something else is drawn; nothing when the
     /// lifetime has ended ([`RenderLink::clear_loading`]).
     Loading(u64),
-    /// Loading has ended: stop drawing the loading state, and answer once
-    /// no loading frame can be drawn any more, with whether the screen is
-    /// still there ([`RenderLink::end_loading`]).
-    EndLoading(mpsc::SyncSender<bool>),
+    /// Loading lifetime `lifetime` has ended: stop drawing the loading
+    /// state, and answer once no loading frame can be drawn any more, with
+    /// whether the screen is still there and the skin drew every loading
+    /// frame of it ([`RenderLink::end_loading`]).
+    EndLoading {
+        /// The lifetime ended.
+        lifetime: u64,
+        /// Where the answer goes.
+        reply: mpsc::SyncSender<LoadingEnd>,
+    },
     /// A play starts: chart time 0 at the measurement's `origin` on the
     /// clock.
     Play {
@@ -870,12 +943,30 @@ impl RenderLink {
         self.send(RenderMsg::Discard(self.requests.load(Ordering::Relaxed)));
     }
 
-    /// Prepares every later attempt with the declarative `skin`, or with
-    /// the skin in use for `None` (tests: production draws the simple
-    /// skin).
-    #[cfg(test)]
-    pub fn select(&self, skin: Option<Arc<SkinBundle>>) {
-        self.send(RenderMsg::Select(skin));
+    /// Starts installing the declarative `skin` for every later attempt,
+    /// or the skin in use for `None`, as a request of the same sequence as
+    /// the attempts' preparations; the game thread goes on and polls the
+    /// answer ([`PendingSelect::poll`]). Production selection draws the
+    /// simple skin and selects nothing; tests choose a fixture.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "production selects no declarative skin yet")
+    )]
+    pub fn select(&self, skin: Option<Arc<SkinBundle>>) -> PendingSelect {
+        let request = self.requests.fetch_add(1, Ordering::Relaxed) + 1;
+        let (reply, rx) = mpsc::sync_channel(1);
+        self.send(RenderMsg::Select {
+            request,
+            skin,
+            reply,
+        });
+        PendingSelect {
+            request,
+            rx,
+            deadline: Instant::now() + self.answer_timeout,
+            shared: Arc::clone(&self.shared),
+            settled: false,
+        }
     }
 
     /// Prepares `chart` for every play from now on, and waits until it is.
@@ -935,16 +1026,20 @@ impl RenderLink {
     /// # Errors
     ///
     /// [`ScreenError::NoAnswer`] after [`LOAD_TIMEOUT`],
-    /// [`ScreenError::Ended`] when the render thread is gone, and
+    /// [`ScreenError::Ended`] when the render thread is gone,
     /// [`ScreenError::Lost`] when its screen failed after the attempt was
-    /// prepared (a loading frame failed): recording must not open.
+    /// prepared (a loading frame failed), and
+    /// [`ScreenError::LoadingRefused`] when the skin refused a loading
+    /// frame of the lifetime ended: recording must not open.
     pub fn end_loading(&self) -> Result<(), ScreenError> {
+        let lifetime = self.shared.loading_slot().lifetime;
         self.clear_loading();
         let (reply, rx) = mpsc::sync_channel(1);
-        self.send(RenderMsg::EndLoading(reply));
+        self.send(RenderMsg::EndLoading { lifetime, reply });
         match rx.recv_timeout(self.answer_timeout) {
-            Ok(true) => Ok(()),
-            Ok(false) => Err(ScreenError::Lost),
+            Ok(LoadingEnd::Ready) => Ok(()),
+            Ok(LoadingEnd::Lost) => Err(ScreenError::Lost),
+            Ok(LoadingEnd::Refused(e)) => Err(ScreenError::LoadingRefused(e)),
             Err(mpsc::RecvTimeoutError::Timeout) => Err(ScreenError::NoAnswer),
             Err(mpsc::RecvTimeoutError::Disconnected) => Err(ScreenError::Ended),
         }
@@ -1025,6 +1120,163 @@ impl PendingLoad {
     }
 }
 
+/// A skin's selection the render thread was asked for
+/// ([`RenderLink::select`]), polled by the game thread in short slices so
+/// it goes on with the menus meanwhile. Past the answer's bound, or
+/// dropped unanswered (cancelled, abandoned), it is withdrawn before that
+/// returns: a completion after that installs nothing.
+#[derive(Debug)]
+pub struct PendingSelect {
+    request: u64,
+    rx: Receiver<Result<Preparation, RenderError>>,
+    deadline: Instant,
+    shared: Arc<Shared>,
+    /// Answered or withdrawn.
+    settled: bool,
+}
+
+impl PendingSelect {
+    /// Waits at most `slice` for the answer: `None` while it is still on
+    /// its way. Ready means the skin is installed; a refusal keeps the
+    /// installation in use. Past the answer's bound the selection is
+    /// withdrawn, and answered ready only when it was installed before.
+    ///
+    /// # Errors
+    ///
+    /// Why the screen or its device cannot draw at all,
+    /// [`ScreenError::NoAnswer`] past the bound and [`ScreenError::Ended`]
+    /// when the render thread is gone.
+    pub fn poll(&mut self, slice: Duration) -> Option<Result<Preparation, ScreenError>> {
+        if self.settled {
+            return None;
+        }
+        match self.rx.recv_timeout(slice) {
+            Ok(answer) => {
+                self.settled = true;
+                Some(answer.map_err(ScreenError::from))
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                self.settled = true;
+                Some(Err(ScreenError::Ended))
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) if Instant::now() >= self.deadline => {
+                Some(if self.withdraw() {
+                    Ok(Preparation::Ready)
+                } else {
+                    Err(ScreenError::NoAnswer)
+                })
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => None,
+        }
+    }
+
+    /// Waits for the answer, polling as the game thread does (tests).
+    ///
+    /// # Errors
+    ///
+    /// As [`poll`](Self::poll).
+    #[cfg(test)]
+    pub fn wait(mut self) -> Result<Preparation, ScreenError> {
+        loop {
+            if let Some(answer) = self.poll(CANCEL_POLL) {
+                return answer;
+            }
+        }
+    }
+
+    /// Marks the request withdrawn unless it was committed: whether it
+    /// was. Under the commits' lock, so the render thread either
+    /// committed before or sees the withdrawal at the commit.
+    fn withdraw(&mut self) -> bool {
+        if std::mem::replace(&mut self.settled, true) {
+            return false;
+        }
+        let mut commits = self.shared.commits();
+        if commits.committed >= self.request {
+            return true;
+        }
+        commits.withdrawn = commits.withdrawn.max(self.request);
+        false
+    }
+}
+
+impl Drop for PendingSelect {
+    fn drop(&mut self) {
+        self.withdraw();
+    }
+}
+
+/// How long the game thread waits for a selection's answer at each look:
+/// the menus, quit and cancellation are served between looks.
+const SELECT_SLICE: Duration = Duration::from_millis(1);
+
+/// The play skin's installation as the game thread sees it: a chart is
+/// admitted (chosen to play, or a practice Start) only once the skin it
+/// shows is installed, so the loading state always draws the skin's own
+/// loading frame. Production draws the simple skin, always ready.
+#[derive(Debug, Default)]
+pub enum SkinState {
+    /// Installed: charts are admitted.
+    #[default]
+    Ready,
+    /// A selection on its way: no chart is admitted until it is
+    /// installed.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "production selects no declarative skin yet")
+    )]
+    Selecting(PendingSelect),
+    /// The selection was refused or failed, with its located reason: no
+    /// chart is admitted, and no other skin stands in.
+    Refused(String),
+}
+
+impl SkinState {
+    /// Starts selecting `skin` on `render`; a selection still on its way
+    /// is withdrawn first.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "production selects no declarative skin yet")
+    )]
+    pub fn select(&mut self, render: &RenderLink, skin: Option<Arc<SkinBundle>>) {
+        *self = Self::Ready;
+        *self = Self::Selecting(render.select(skin));
+    }
+
+    /// Whether a chart may be admitted now, looking at a selection on its
+    /// way for at most [`SELECT_SLICE`].
+    ///
+    /// # Errors
+    ///
+    /// The notice to show instead: the selection is on its way, or why
+    /// it was refused.
+    pub fn ready(&mut self) -> Result<(), String> {
+        if let Self::Selecting(pending) = self {
+            let Some(answer) = pending.poll(SELECT_SLICE) else {
+                return Err("スキンを準備しています".to_owned());
+            };
+            *self = match answer {
+                Ok(Preparation::Ready) => Self::Ready,
+                Ok(Preparation::Refused(why)) => {
+                    eprintln!("render: the play skin was refused: {why}");
+                    Self::Refused(format!("スキンを使えません: {why}"))
+                }
+                Ok(Preparation::Cancelled) => {
+                    Self::Refused("スキンの準備は取り消されました".to_owned())
+                }
+                Err(e) => {
+                    eprintln!("render: the play skin cannot be installed: {}", Chain(&e));
+                    Self::Refused(format!("スキンを準備できません: {}", Chain(&e)))
+                }
+            };
+        }
+        match self {
+            Self::Refused(notice) => Err(notice.clone()),
+            Self::Ready | Self::Selecting(_) => Ok(()),
+        }
+    }
+}
+
 /// Starts the render thread; `make` builds the screen on it, and the chart,
 /// when there is one yet, is prepared before this returns, so every upload
 /// is done before the first READY state (design.md "Display Latency and
@@ -1091,6 +1343,9 @@ pub fn spawn(
                 applied: None,
                 selected: None,
                 committed: None,
+                loading_since: None,
+                loading_refused: None,
+                requested: 0,
                 attempt: None,
                 prepared: None,
                 #[cfg(feature = "dev-tools")]
@@ -1137,17 +1392,17 @@ fn after_preparing(mode: Mode) -> Mode {
     }
 }
 
-/// A screen made afresh, with the `committed` bundle restored and `chart`
-/// loaded.
+/// A screen made afresh, with the `committed` installation restored and
+/// `chart` loaded.
 fn build(
     make: &mut MakeScreen,
-    committed: Option<&Arc<SkinBundle>>,
+    committed: Option<&Installation>,
     chart: Option<&Chart>,
     section: Option<&Section>,
 ) -> Result<Box<dyn Screen>, RenderError> {
     let mut s = make()?;
-    if let Some(bundle) = committed {
-        s.restore(bundle)?;
+    if let Some(installation) = committed {
+        s.restore(installation)?;
     }
     if let Some(chart) = chart {
         s.load(chart, section)?;
@@ -1190,11 +1445,11 @@ struct Preparing {
     reply: mpsc::SyncSender<Result<Preparation, RenderError>>,
 }
 
-/// An attempt's preparation answered ready: its token and the declarative
-/// skin it staged, if any.
+/// An attempt's preparation answered ready: its token and whether it
+/// staged a declarative skin.
 struct Prepared {
     token: PreparedToken,
-    skin: Option<Arc<SkinBundle>>,
+    declarative: bool,
 }
 
 struct Run {
@@ -1226,9 +1481,20 @@ struct Run {
     /// The declarative skin later attempts are prepared with; `None`
     /// prepares the skin in use (tests choose one).
     selected: Option<Arc<SkinBundle>>,
-    /// The declarative bundle committed last, kept apart from the screen:
-    /// a screen built again restores exactly it.
-    committed: Option<Arc<SkinBundle>>,
+    /// The declarative installation committed last, its loading
+    /// presentation with it, kept apart from the screen: a screen built
+    /// again restores exactly it.
+    committed: Option<Installation>,
+    /// The loading lifetime last drawn and when its first loading frame
+    /// was, on the clock: its loading state's origin, kept apart from the
+    /// screen, so a screen built again never stamps another.
+    loading_since: Option<(u64, TimeUs)>,
+    /// The loading lifetime whose loading frame the skin refused, and
+    /// why: none of it is drawn again, and its end reports the refusal.
+    loading_refused: Option<(u64, BuildError)>,
+    /// The newest request asked, an attempt's preparation or a
+    /// selection: an older one arriving late changes nothing.
+    requested: u64,
     /// The attempt's preparation not yet answered.
     attempt: Option<Preparing>,
     /// The attempt's preparation answered ready and not yet committed.
@@ -1335,8 +1601,11 @@ impl Run {
                 }
                 Ok(RenderMsg::Loading(lifetime)) => {
                     // Lines the slot no longer holds (taken, or their
-                    // lifetime ended) change nothing.
-                    if let Some((page, update)) = self.shared.take_loading(lifetime) {
+                    // lifetime ended) change nothing, and neither do the
+                    // lines of a lifetime whose loading frame was refused.
+                    if let Some((page, update)) = self.shared.take_loading(lifetime)
+                        && self.loading_refused.is_none_or(|(l, _)| l != lifetime)
+                    {
                         mode = Mode::Menu {
                             page,
                             update,
@@ -1345,7 +1614,7 @@ impl Run {
                         };
                     }
                 }
-                Ok(RenderMsg::EndLoading(reply)) => {
+                Ok(RenderMsg::EndLoading { lifetime, reply }) => {
                     // Between frames: none of the loading state follows.
                     if matches!(
                         mode,
@@ -1356,9 +1625,15 @@ impl Run {
                     ) {
                         mode = Mode::Idle;
                     }
-                    // Whether the screen prepared for the attempt is still
+                    // Whether the skin refused a loading frame of it, else
+                    // whether the screen prepared for the attempt is still
                     // there.
-                    let _ = reply.send(self.screen.is_some());
+                    let end = match (self.loading_refused, &self.screen) {
+                        (Some((l, e)), _) if l == lifetime => LoadingEnd::Refused(e),
+                        (_, None) => LoadingEnd::Lost,
+                        (_, Some(_)) => LoadingEnd::Ready,
+                    };
+                    let _ = reply.send(end);
                     continue;
                 }
                 Ok(RenderMsg::Prepare(reply)) => {
@@ -1389,9 +1664,14 @@ impl Run {
                     self.discard(request);
                     continue;
                 }
-                #[cfg(test)]
-                Ok(RenderMsg::Select(skin)) => {
-                    self.selected = skin;
+                Ok(RenderMsg::Select {
+                    request,
+                    skin,
+                    reply,
+                }) => {
+                    let answer = self.select(request, skin);
+                    let _ = reply.send(answer);
+                    mode = after_preparing(mode);
                     continue;
                 }
                 Ok(RenderMsg::Play {
@@ -1489,13 +1769,10 @@ impl Run {
                 mode = Mode::Idle;
                 continue;
             }
-            let loading_frame = matches!(
-                mode,
-                Mode::Menu {
-                    loading: Some(_),
-                    ..
-                }
-            );
+            let loading_frame = match mode {
+                Mode::Menu { loading, .. } => loading,
+                _ => None,
+            };
             // The launch screen's time is over: the page waiting replaces it.
             let elapsed = self.started.elapsed();
             if elapsed >= SPLASH
@@ -1613,8 +1890,33 @@ impl Run {
                     // out again.
                     #[cfg(feature = "dev-tools")]
                     let [_, _, _, before] = crate::alloc_count::counts();
-                    let drawn = if loading_frame {
-                        screen.loading(page, update.as_deref(), *changed)
+                    let drawn = if let Some(lifetime) = loading_frame {
+                        // The lifetime's origin: its first loading frame,
+                        // stamped once.
+                        let now = self.clock.now();
+                        let since = match self.loading_since {
+                            Some((l, at)) if l == lifetime => at,
+                            _ => {
+                                self.loading_since = Some((lifetime, now));
+                                now
+                            }
+                        };
+                        let visible = self.view.tuning.get().visible_time();
+                        let frame = LoadingFrame::interim(lifetime, now, since, visible);
+                        match screen.loading(page, update.as_deref(), *changed, &frame) {
+                            Ok(Ok(t)) => Ok(t),
+                            Ok(Err(e)) => {
+                                // Refused: nothing of it was drawn, the
+                                // screen stays, and nothing of the
+                                // lifetime is drawn again; the frame
+                                // granted waits for what comes next.
+                                self.loading_refused = Some((lifetime, e));
+                                eprintln!("render: the loading frame was refused: {}", Chain(&e));
+                                mode = Mode::Idle;
+                                continue;
+                            }
+                            Err(e) => Err(e),
+                        }
                     } else {
                         screen.menu(page, *changed)
                     }
@@ -1622,13 +1924,13 @@ impl Run {
                     #[cfg(feature = "dev-tools")]
                     if let Ok((t, _)) = &drawn {
                         let [_, _, _, after] = crate::alloc_count::counts();
-                        let stats = if loading_frame {
+                        let stats = if loading_frame.is_some() {
                             &mut self.loading_stats
                         } else {
                             &mut self.menu_stats
                         };
                         stats.frame(t.cpu, after - before, *changed);
-                        if loading_frame && t.presented {
+                        if loading_frame.is_some() && t.presented {
                             self.shared.loading_drawn.fetch_add(1, Ordering::Relaxed);
                         }
                         // What a refusal put on the screen, once drawn.
@@ -1735,6 +2037,11 @@ impl Run {
     /// `p` is asked of the screen at once and between frames until it
     /// answers ([`poll_attempt`](Self::poll_attempt)).
     fn begin_attempt(&mut self, p: Preparing) {
+        // An older request than one asked already changes nothing.
+        if !self.newest(p.request) {
+            let _ = p.reply.send(Ok(refusal("a newer request superseded it")));
+            return;
+        }
         self.attempt = None;
         self.drop_prepared();
         if let Err(e) = self.recover() {
@@ -1793,7 +2100,7 @@ impl Run {
                     request: p.request,
                     device: screen.device(),
                 },
-                skin: p.skin.clone(),
+                declarative: p.skin.is_some(),
             });
         }
         if answer.is_err() {
@@ -1843,11 +2150,95 @@ impl Run {
             screen.discard();
             return Err(e);
         }
-        if p.skin.is_some() {
-            self.committed = p.skin;
+        if p.declarative {
+            self.committed = screen.installation();
         }
         commits.committed = request;
         Ok(())
+    }
+
+    /// Whether `request` is newer than every request asked of the render
+    /// thread so far, an attempt's or a selection's, and then the newest.
+    fn newest(&mut self, request: u64) -> bool {
+        if request <= self.requested {
+            return false;
+        }
+        self.requested = request;
+        true
+    }
+
+    /// Selects `skin` for request `request`: a request not newer than one
+    /// asked already is refused, changing nothing; else an attempt
+    /// preparing or prepared, older, is discarded; `skin`'s
+    /// chart-independent installation is staged and committed, unless the
+    /// game thread withdrew the request, and every later attempt prepares
+    /// with it. `None` prepares later attempts with the skin in use. A
+    /// refusal or a withdrawal keeps the installation in use and the
+    /// selection before; an error drops the screen and reports its
+    /// failure, so the screen's recovery builds it again.
+    fn select(
+        &mut self,
+        request: u64,
+        skin: Option<Arc<SkinBundle>>,
+    ) -> Result<Preparation, RenderError> {
+        if !self.newest(request) {
+            return Ok(refusal("a newer request superseded it"));
+        }
+        if let Some(p) = self.attempt.take() {
+            let _ = p
+                .reply
+                .send(Ok(refusal("a newer skin selection superseded it")));
+            if let Some(screen) = &mut self.screen {
+                screen.discard();
+            }
+        }
+        self.drop_prepared();
+        let Some(bundle) = skin else {
+            self.selected = None;
+            return Ok(Preparation::Ready);
+        };
+        if let Err(e) = self.recover() {
+            self.shared.failed.store(true, Ordering::Release);
+            return Err(e);
+        }
+        let Some(screen) = &mut self.screen else {
+            return Err(RenderError::SurfaceLost);
+        };
+        match screen.install(&bundle, request) {
+            Ok(Preparation::Ready) => {
+                // Held through the commit: a withdrawal waits for it, or
+                // it sees the withdrawal and installs nothing.
+                let shared = Arc::clone(&self.shared);
+                let mut commits = shared.commits();
+                if commits.withdrawn >= request {
+                    screen.discard();
+                    return Ok(Preparation::Cancelled);
+                }
+                let token = PreparedToken {
+                    request,
+                    device: screen.device(),
+                };
+                if let Err(e) = screen.commit(token) {
+                    screen.discard();
+                    return Ok(refusal(e.to_string()));
+                }
+                commits.committed = commits.committed.max(request);
+                drop(commits);
+                self.committed = screen.installation();
+                self.selected = Some(bundle);
+                Ok(Preparation::Ready)
+            }
+            Ok(refused) => {
+                screen.discard();
+                Ok(refused)
+            }
+            Err(e) => {
+                self.screen = None;
+                self.granted = false;
+                self.shared.failed.store(true, Ordering::Release);
+                Err(e)
+            }
+        }
     }
 
     /// Drops the preparation of `request`, in progress or answered, unless
@@ -1902,7 +2293,7 @@ impl Run {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
     use std::time::{Duration, Instant};
@@ -2341,8 +2732,9 @@ mod tests {
             page: &crate::menu_screen::MenuPage,
             _update: Option<&crate::loading_text::LoadingUpdate>,
             _changed: bool,
-        ) -> Result<FrameTiming, RenderError> {
-            Ok(self.note(true, page))
+            _frame: &render::LoadingFrame<'_>,
+        ) -> Result<Result<FrameTiming, skin_model::BuildError>, RenderError> {
+            Ok(Ok(self.note(true, page)))
         }
         #[cfg(feature = "dev-tools")]
         fn read_back(&self) -> Option<(u32, u32, Vec<u8>)> {
@@ -2790,7 +3182,7 @@ mod tests {
 
     /// A render thread on the screens `make` builds, with no chart, no
     /// section and no frame sink.
-    fn spawn_empty(make: MakeScreen) -> super::RenderLink {
+    pub(crate) fn spawn_empty(make: MakeScreen) -> super::RenderLink {
         let clock = QpcClock::start();
         spawn(
             make,
@@ -3050,13 +3442,14 @@ mod tests {
             page: &crate::menu_screen::MenuPage,
             update: Option<&LoadingUpdate>,
             _changed: bool,
-        ) -> Result<FrameTiming, RenderError> {
+            _frame: &render::LoadingFrame<'_>,
+        ) -> Result<Result<FrameTiming, skin_model::BuildError>, RenderError> {
             let line = page
                 .lines
                 .first()
                 .map_or_else(String::new, |l| l.text.clone());
             self.seen.lock().unwrap().push((line, update.cloned()));
-            Ok(timing(true))
+            Ok(Ok(timing(true)))
         }
         #[cfg(feature = "dev-tools")]
         fn read_back(&self) -> Option<(u32, u32, Vec<u8>)> {
@@ -3259,7 +3652,7 @@ mod tests {
     /// that never answers: the parallel tests can starve the render thread
     /// for seconds. `f` is asked once more past the bound, so a wait that
     /// was itself starved does not fail on time alone.
-    fn wait_until(f: impl Fn() -> bool) -> bool {
+    pub(crate) fn wait_until(f: impl Fn() -> bool) -> bool {
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             if f() {
@@ -5005,10 +5398,59 @@ mod tests {
         assert_eq!(builds.load(Ordering::SeqCst), 2);
     }
 
+    /// While the window is minimized during loading, loading frames go on
+    /// unpaced and unpresented, a preparation and the end of loading are
+    /// answered; restored, the newest size is applied and the next
+    /// lifetime's loading frames are presented again.
+    #[test]
+    fn loading_follows_a_minimized_window_and_its_handshakes_complete() {
+        let resized = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let frames = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let waited_minimized = Arc::new(AtomicU32::new(0));
+        let (r, f, w) = (
+            Arc::clone(&resized),
+            Arc::clone(&frames),
+            Arc::clone(&waited_minimized),
+        );
+        let make: MakeScreen = Box::new(move || {
+            Ok(Box::new(Resizing {
+                id: 1,
+                size: (1_920, 1_080),
+                resized: Arc::clone(&r),
+                frames: Arc::clone(&f),
+                waited_minimized: Arc::clone(&w),
+                fail: Arc::new(AtomicBool::new(false)),
+            }) as Box<dyn Screen>)
+        });
+        let link = spawn_empty(make);
+        let last = || resized.lock().unwrap().last().copied();
+        let drawn = || frames.lock().unwrap().len();
+        let extent = Arc::new(super::Extent::default());
+        link.follow(&extent);
+        link.loading().show(one_line("A"));
+        assert!(wait_until(|| drawn() > 0));
+        extent.publish(0, 0);
+        assert!(wait_until(|| last() == Some((1, 0, 0))));
+        let from = drawn();
+        assert!(wait_until(|| drawn() >= from + 3));
+        assert_eq!(frames.lock().unwrap().last(), Some(&true));
+        assert!(link.prepare().is_ok());
+        link.end_loading().unwrap();
+        assert_eq!(waited_minimized.load(Ordering::SeqCst), 0);
+        extent.publish(1_280, 720);
+        assert!(wait_until(|| last() == Some((1, 1_280, 720))));
+        link.loading().show(one_line("B"));
+        let from = drawn();
+        assert!(wait_until(|| drawn() > from));
+        assert_eq!(frames.lock().unwrap().last(), Some(&false));
+        link.end_loading().unwrap();
+        link.exit();
+    }
+
     /// A real declarative bundle with nothing to draw: no image, no
     /// element, its lanes laid out for the right scratch side, which no
     /// attempt of the simple skin's has.
-    fn bundle() -> Arc<render::SkinBundle> {
+    pub(crate) fn bundle() -> Arc<render::SkinBundle> {
         use skin_model::{Anchor, AtlasLimits, Fit, Region, RegionDef, Sheet, SkinDef, Variant};
         let sheet = Sheet::new(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")),
@@ -5053,15 +5495,22 @@ mod tests {
     /// A screen that stages a declarative skin's installation as the
     /// renderer does, noting each step with its device: a preparation
     /// answered (`prepare` with its request, the context's scratch side
-    /// and the attempt's title), a commit, a discard and a restore. While
-    /// `hold` is set, its preparations do not answer. Its menu frames fail
-    /// while `fail` is set; it counts its loading frames, each of which
-    /// stalls while `stall` is set.
-    struct Installer {
+    /// and the attempt's title), an installation (`install`, or `refuse`
+    /// while `refuse_install` is set, its request), a commit, a discard
+    /// and a restore. While `hold` is set, its preparations do not answer;
+    /// while `hold_install` is set, an installation waits. Its menu and
+    /// loading frames fail while `fail` is set; it counts its loading
+    /// frames and notes their origins, each of which stalls while `stall`
+    /// is set and is refused while `refuse_loading` is set.
+    pub(crate) struct Installer {
         device: u64,
         /// The flags, counters and records of every installer its render
         /// thread builds.
         shared: Installers,
+        /// The installation staged by [`Screen::install`], not committed.
+        staged: Option<render::Installation>,
+        /// The installation committed or restored.
+        installed: Option<render::Installation>,
     }
 
     impl Installer {
@@ -5106,18 +5555,46 @@ mod tests {
                 return Err(render::CommitError::Device);
             }
             self.note(&format!("commit {}", token.request));
+            if let Some(staged) = self.staged.take() {
+                self.installed = Some(staged);
+            }
             Ok(())
         }
         fn discard(&mut self) {
             self.note("discard");
+            self.staged = None;
         }
-        fn restore(&mut self, bundle: &Arc<render::SkinBundle>) -> Result<(), RenderError> {
+        fn install(
+            &mut self,
+            skin: &Arc<render::SkinBundle>,
+            request: u64,
+        ) -> Result<Preparation, RenderError> {
+            while self.shared.hold_install.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            if self.shared.fail.load(Ordering::Acquire) {
+                self.note(&format!("fail {request}"));
+                return Err(RenderError::SurfaceLost);
+            }
+            if self.shared.refuse_install.load(Ordering::Acquire) {
+                self.note(&format!("refuse {request}"));
+                return Ok(super::refusal("the skin cannot be installed"));
+            }
+            self.note(&format!("install {request}"));
+            self.staged = Some(render::Installation::new(Arc::clone(skin)));
+            Ok(Preparation::Ready)
+        }
+        fn installation(&self) -> Option<render::Installation> {
+            self.installed.clone()
+        }
+        fn restore(&mut self, installation: &render::Installation) -> Result<(), RenderError> {
             self.note("restore");
+            self.installed = Some(installation.clone());
             self.shared
                 .restored
                 .lock()
                 .unwrap()
-                .push(Arc::clone(bundle));
+                .push(installation.clone());
             Ok(())
         }
         fn wait(&self) -> bool {
@@ -5150,12 +5627,24 @@ mod tests {
             _page: &crate::menu_screen::MenuPage,
             _update: Option<&LoadingUpdate>,
             _changed: bool,
-        ) -> Result<FrameTiming, RenderError> {
+            frame: &render::LoadingFrame<'_>,
+        ) -> Result<Result<FrameTiming, skin_model::BuildError>, RenderError> {
+            if self.shared.fail.load(Ordering::Acquire) {
+                return Err(RenderError::SurfaceLost);
+            }
             self.shared.loading.fetch_add(1, Ordering::AcqRel);
+            self.shared.origins.lock().unwrap().push((
+                self.device,
+                frame.lifetime,
+                frame.load.since,
+            ));
             while self.shared.stall.load(Ordering::Acquire) {
                 std::thread::sleep(Duration::from_millis(1));
             }
-            Ok(timing(true))
+            if self.shared.refuse_loading.load(Ordering::Acquire) {
+                return Ok(Err(skin_model::BuildError::InvalidReadouts));
+            }
+            Ok(Ok(timing(true)))
         }
         #[cfg(feature = "dev-tools")]
         fn read_back(&self) -> Option<(u32, u32, Vec<u8>)> {
@@ -5166,35 +5655,53 @@ mod tests {
     /// The shared state of the [`Installer`]s a render thread builds,
     /// their devices numbered from 1.
     #[derive(Clone, Default)]
-    struct Installers {
+    pub(crate) struct Installers {
         builds: Arc<AtomicU32>,
         hold: Arc<AtomicBool>,
         fail: Arc<AtomicBool>,
         loading: Arc<AtomicU32>,
         stall: Arc<AtomicBool>,
+        /// Installations wait while set.
+        pub(crate) hold_install: Arc<AtomicBool>,
+        /// Installations are refused while set.
+        pub(crate) refuse_install: Arc<AtomicBool>,
+        /// Loading frames are refused while set.
+        refuse_loading: Arc<AtomicBool>,
         log: Log,
-        restored: Arc<std::sync::Mutex<Vec<Arc<render::SkinBundle>>>>,
+        restored: Arc<std::sync::Mutex<Vec<render::Installation>>>,
+        /// Each loading frame's device, lifetime and origin.
+        origins: Arc<std::sync::Mutex<Vec<(u64, u64, TimeUs)>>>,
     }
 
     impl Installers {
         /// A render thread on these installers with `chart` loaded and
         /// `skin` chosen for its attempts.
         fn spawn(&self, chart: &Arc<Chart>, skin: &Arc<render::SkinBundle>) -> super::RenderLink {
+            let link = self.spawn_bare();
+            link.load(Arc::clone(chart), None).unwrap();
+            assert_eq!(
+                link.select(Some(Arc::clone(skin))).wait().unwrap(),
+                Preparation::Ready
+            );
+            link
+        }
+
+        /// A render thread on these installers, nothing loaded or chosen.
+        pub(crate) fn spawn_bare(&self) -> super::RenderLink {
             let shared = self.clone();
             let make: MakeScreen = Box::new(move || {
                 let device = u64::from(shared.builds.fetch_add(1, Ordering::SeqCst) + 1);
                 Ok(Box::new(Installer {
                     device,
                     shared: shared.clone(),
+                    staged: None,
+                    installed: None,
                 }) as Box<dyn Screen>)
             });
-            let link = spawn_empty(make);
-            link.load(Arc::clone(chart), None).unwrap();
-            link.select(Some(Arc::clone(skin)));
-            link
+            spawn_empty(make)
         }
 
-        fn log(&self) -> Vec<String> {
+        pub(crate) fn log(&self) -> Vec<String> {
             self.log.lock().unwrap().clone()
         }
     }
@@ -5213,22 +5720,23 @@ mod tests {
         let link = screens.spawn(&chart, &skin);
         let ready = |link: &super::RenderLink| link.prepare_attempt(titled(&chart), || false);
 
+        // Request 1 was the selection's.
         assert_eq!(ready(&link).unwrap(), Preparation::Ready);
         link.commit_attempt().unwrap();
-        // Request 2, superseded by 3 before its commit.
+        // Request 3, superseded by 4 before its commit.
         assert_eq!(ready(&link).unwrap(), Preparation::Ready);
         assert_eq!(ready(&link).unwrap(), Preparation::Ready);
         let (reply, rx) = std::sync::mpsc::sync_channel(1);
-        link.send(RenderMsg::Commit { request: 2, reply });
+        link.send(RenderMsg::Commit { request: 3, reply });
         assert_eq!(
             rx.recv().unwrap(),
             Err(render::CommitError::Request {
-                staged: 3,
-                asked: 2
+                staged: 4,
+                asked: 3
             })
         );
         link.commit_attempt().unwrap();
-        // Request 4, discarded.
+        // Request 5, discarded.
         assert_eq!(ready(&link).unwrap(), Preparation::Ready);
         link.discard_attempt();
         assert!(matches!(link.commit_attempt(), Err(ScreenError::Lost)));
@@ -5236,13 +5744,15 @@ mod tests {
         assert_eq!(
             screens.log(),
             [
-                "1 prepare 1 Right T",
+                "1 install 1",
                 "1 commit 1",
                 "1 prepare 2 Right T",
-                "1 discard",
+                "1 commit 2",
                 "1 prepare 3 Right T",
-                "1 commit 3",
+                "1 discard",
                 "1 prepare 4 Right T",
+                "1 commit 4",
+                "1 prepare 5 Right T",
                 "1 discard",
             ]
         );
@@ -5300,8 +5810,10 @@ mod tests {
         assert_eq!(
             screens.log(),
             [
-                "1 prepare 1 Right T",
+                "1 install 1",
                 "1 commit 1",
+                "1 prepare 2 Right T",
+                "1 commit 2",
                 "1 discard",
                 "1 discard"
             ]
@@ -5342,10 +5854,12 @@ mod tests {
         assert_eq!(
             screens.log(),
             [
-                "1 prepare 1 Right T",
-                "1 discard",
+                "1 install 1",
+                "1 commit 1",
                 "1 prepare 2 Right T",
-                "1 commit 2"
+                "1 discard",
+                "1 prepare 3 Right T",
+                "1 commit 3"
             ]
         );
     }
@@ -5373,7 +5887,7 @@ mod tests {
         assert_eq!(screens.builds.load(Ordering::SeqCst), 2);
         let restored = screens.restored.lock().unwrap().clone();
         assert_eq!(restored.len(), 1);
-        assert!(Arc::ptr_eq(&restored[0], &skin));
+        assert!(Arc::ptr_eq(restored[0].bundle(), &skin));
         assert!(matches!(link.commit_attempt(), Err(ScreenError::Lost)));
 
         assert_eq!(ready(&link).unwrap(), Preparation::Ready);
@@ -5382,15 +5896,325 @@ mod tests {
         assert_eq!(
             screens.log(),
             [
-                "1 prepare 1 Right T",
+                "1 install 1",
                 "1 commit 1",
                 "1 prepare 2 Right T",
+                "1 commit 2",
+                "1 prepare 3 Right T",
                 "2 restore",
                 "2 discard",
-                "2 prepare 3 Right T",
-                "2 commit 3",
+                "2 prepare 4 Right T",
+                "2 commit 4",
             ]
         );
+    }
+
+    /// A selection the game thread stopped waiting for installs nothing,
+    /// however late the render thread gets to it: cancelled (dropped
+    /// unanswered) or past its bound while the render thread stalls in a
+    /// loading frame, it is staged and discarded, never committed, and the
+    /// installation before it stays, restored on a screen built again;
+    /// the next selection installs. Without the withdrawal checked at the
+    /// commit, the late selections would commit.
+    #[test]
+    fn a_selection_given_up_on_installs_nothing() {
+        let chart = Arc::new(ChartBuilder::new(120_000).build().unwrap());
+        let (old, late) = (bundle(), bundle());
+        let screens = Installers::default();
+        let mut link = screens.spawn(&chart, &old);
+        let frames = || screens.loading.load(Ordering::Acquire);
+        link.loading().show(one_line("loading"));
+        assert!(wait_until(|| frames() > 0));
+        let stalled = |link: &super::RenderLink, give_up: &dyn Fn(super::PendingSelect)| {
+            screens.stall.store(true, Ordering::Release);
+            let from = frames();
+            assert!(wait_until(|| frames() > from));
+            give_up(link.select(Some(Arc::clone(&late))));
+            screens.stall.store(false, Ordering::Release);
+            let from = frames();
+            assert!(wait_until(|| frames() >= from + 3));
+        };
+
+        // Cancelled: dropped unanswered.
+        stalled(&link, &drop);
+        // Past its bound.
+        link.set_timeouts(Duration::from_millis(100), Duration::from_secs(5));
+        stalled(&link, &|pending| {
+            let answer = pending.wait();
+            assert!(matches!(answer, Err(ScreenError::NoAnswer)), "{answer:?}");
+        });
+        link.set_timeouts(Duration::from_secs(10), Duration::from_secs(5));
+
+        // The old installation is the one committed: a screen built again
+        // restores it.
+        screens.fail.store(true, Ordering::Release);
+        assert!(wait_until(|| link.failed()));
+        screens.fail.store(false, Ordering::Release);
+        link.prepare().unwrap();
+        let restored = screens.restored.lock().unwrap().clone();
+        let [restored] = &restored[..] else {
+            panic!("{restored:?}");
+        };
+        assert!(Arc::ptr_eq(restored.bundle(), &old));
+        assert_eq!(
+            link.select(Some(Arc::clone(&late))).wait().unwrap(),
+            Preparation::Ready
+        );
+        link.exit();
+        assert_eq!(
+            screens.log(),
+            [
+                "1 install 1",
+                "1 commit 1",
+                "1 install 2",
+                "1 discard",
+                "1 install 3",
+                "1 discard",
+                "2 restore",
+                "2 install 4",
+                "2 commit 4",
+            ]
+        );
+    }
+
+    /// A selection and an attempt's preparation share one sequence of
+    /// requests, and the newer wins: an attempt prepared and not yet
+    /// committed is discarded by a newer selection, which installs, and
+    /// the attempt's commit is refused; an attempt prepared after the
+    /// selection commits on it.
+    #[test]
+    fn a_newer_selection_discards_an_older_attempt() {
+        let chart = Arc::new(ChartBuilder::new(120_000).build().unwrap());
+        let (first, second) = (bundle(), bundle());
+        let screens = Installers::default();
+        let link = screens.spawn(&chart, &first);
+        let ready = |link: &super::RenderLink| link.prepare_attempt(titled(&chart), || false);
+        assert_eq!(ready(&link).unwrap(), Preparation::Ready);
+        assert_eq!(
+            link.select(Some(Arc::clone(&second))).wait().unwrap(),
+            Preparation::Ready
+        );
+        assert!(matches!(link.commit_attempt(), Err(ScreenError::Lost)));
+        assert_eq!(ready(&link).unwrap(), Preparation::Ready);
+        link.commit_attempt().unwrap();
+        link.exit();
+        assert_eq!(
+            screens.log(),
+            [
+                "1 install 1",
+                "1 commit 1",
+                "1 prepare 2 Right T",
+                "1 discard",
+                "1 install 3",
+                "1 commit 3",
+                "1 prepare 4 Right T",
+                "1 commit 4",
+            ]
+        );
+    }
+
+    /// A selection the screen fails on drops the screen and reports its
+    /// failure, so the game's recovery builds it again with the
+    /// installation before it; the failure is never only a notice. Without
+    /// the failure published, `failed` stays false and nothing rebuilds.
+    #[test]
+    fn a_failed_selection_reports_the_screen_failure() {
+        let chart = Arc::new(ChartBuilder::new(120_000).build().unwrap());
+        let (old, failing) = (bundle(), bundle());
+        let screens = Installers::default();
+        let link = screens.spawn(&chart, &old);
+        screens.fail.store(true, Ordering::Release);
+        let answer = link.select(Some(Arc::clone(&failing))).wait();
+        assert!(
+            matches!(answer, Err(ScreenError::Render(RenderError::SurfaceLost))),
+            "{answer:?}"
+        );
+        assert!(link.failed());
+        screens.fail.store(false, Ordering::Release);
+        link.prepare().unwrap();
+        assert!(!link.failed());
+        let restored = screens.restored.lock().unwrap().clone();
+        let [restored] = &restored[..] else {
+            panic!("{restored:?}");
+        };
+        assert!(Arc::ptr_eq(restored.bundle(), &old));
+        link.exit();
+        assert_eq!(screens.builds.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            screens.log(),
+            ["1 install 1", "1 commit 1", "1 fail 2", "2 restore"]
+        );
+    }
+
+    /// A request older than one the render thread was asked already
+    /// changes nothing when it arrives late: a selection behind an
+    /// attempt's preparation neither discards the preparation, which still
+    /// commits, nor installs; an attempt behind a selection is refused.
+    #[test]
+    fn a_late_older_request_changes_nothing() {
+        let chart = Arc::new(ChartBuilder::new(120_000).build().unwrap());
+        let (first, late) = (bundle(), bundle());
+        let screens = Installers::default();
+        let link = screens.spawn(&chart, &first);
+        let ready = link.prepare_attempt(titled(&chart), || false);
+        assert_eq!(ready.unwrap(), Preparation::Ready);
+        let (reply, rx) = std::sync::mpsc::sync_channel(1);
+        link.send(RenderMsg::Select {
+            request: 1,
+            skin: Some(Arc::clone(&late)),
+            reply,
+        });
+        let answer = rx.recv().unwrap().unwrap();
+        assert!(matches!(answer, Preparation::Refused(_)), "{answer:?}");
+        link.commit_attempt().unwrap();
+        let (reply, rx) = std::sync::mpsc::sync_channel(1);
+        link.send(RenderMsg::PrepareAttempt {
+            request: 2,
+            attempt: Box::new(titled(&chart)),
+            reply,
+        });
+        let answer = rx.recv().unwrap().unwrap();
+        assert!(matches!(answer, Preparation::Refused(_)), "{answer:?}");
+        link.exit();
+        assert_eq!(
+            screens.log(),
+            [
+                "1 install 1",
+                "1 commit 1",
+                "1 prepare 2 Right T",
+                "1 commit 2"
+            ]
+        );
+    }
+
+    /// A refused selection answers with the screen's reason and keeps the
+    /// installation before it, whole: the next attempt prepares on it and
+    /// a screen built again restores it, never another skin.
+    #[test]
+    fn a_refused_selection_keeps_the_installation_before_it() {
+        let chart = Arc::new(ChartBuilder::new(120_000).build().unwrap());
+        let (old, refused) = (bundle(), bundle());
+        let screens = Installers::default();
+        let link = screens.spawn(&chart, &old);
+        screens.refuse_install.store(true, Ordering::Release);
+        let answer = link.select(Some(Arc::clone(&refused))).wait().unwrap();
+        let Preparation::Refused(why) = answer else {
+            panic!("{answer:?}");
+        };
+        assert_eq!(why.reason, "the skin cannot be installed");
+        assert!(!link.failed());
+        screens.fail.store(true, Ordering::Release);
+        link.send(RenderMsg::Menu(Box::default()));
+        assert!(wait_until(|| link.failed()));
+        screens.fail.store(false, Ordering::Release);
+        link.prepare().unwrap();
+        let restored = screens.restored.lock().unwrap().clone();
+        let [restored] = &restored[..] else {
+            panic!("{restored:?}");
+        };
+        assert!(Arc::ptr_eq(restored.bundle(), &old));
+        link.exit();
+        assert_eq!(
+            screens.log(),
+            [
+                "1 install 1",
+                "1 commit 1",
+                "1 refuse 2",
+                "1 discard",
+                "2 restore"
+            ]
+        );
+    }
+
+    /// A loading frame the skin refuses keeps the screen and draws no
+    /// further loading frame of its lifetime, its later lines included;
+    /// the end of that lifetime reports the refusal, so recording does not
+    /// open, and never success because the screen is still there. The
+    /// next lifetime draws again and ends ready. Without the refusal kept
+    /// for the lifetime, the end would answer ready.
+    #[test]
+    fn a_refused_loading_frame_refuses_the_end_of_loading() {
+        let chart = Arc::new(ChartBuilder::new(120_000).build().unwrap());
+        let screens = Installers::default();
+        let link = screens.spawn(&chart, &bundle());
+        let frames = || screens.loading.load(Ordering::Acquire);
+        screens.refuse_loading.store(true, Ordering::Release);
+        link.loading().show(one_line("A"));
+        assert!(wait_until(|| frames() == 1));
+        link.loading().show(one_line("B"));
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(frames(), 1, "a refused lifetime drew again");
+        let ended = link.end_loading();
+        assert!(
+            matches!(
+                ended,
+                Err(ScreenError::LoadingRefused(
+                    skin_model::BuildError::InvalidReadouts
+                ))
+            ),
+            "{ended:?}"
+        );
+        assert!(!link.failed());
+
+        screens.refuse_loading.store(false, Ordering::Release);
+        link.loading().show(one_line("C"));
+        assert!(wait_until(|| frames() >= 3));
+        link.end_loading().unwrap();
+        link.exit();
+        assert_eq!(screens.builds.load(Ordering::SeqCst), 1);
+    }
+
+    /// A loading lifetime's origin is its first loading frame's time,
+    /// stamped once and kept apart from the screen: a screen built again
+    /// during the lifetime draws its loading frames from the same origin,
+    /// with the committed installation restored; the next lifetime stamps
+    /// its own, later.
+    #[test]
+    fn a_loading_origin_outlives_a_screen_built_again() {
+        let chart = Arc::new(ChartBuilder::new(120_000).build().unwrap());
+        let skin = bundle();
+        let screens = Installers::default();
+        let link = screens.spawn(&chart, &skin);
+        let frames = || screens.loading.load(Ordering::Acquire);
+        let sink = link.loading();
+        sink.show(one_line("A"));
+        assert!(wait_until(|| frames() >= 3));
+        screens.fail.store(true, Ordering::Release);
+        sink.show(one_line("A"));
+        assert!(wait_until(|| link.failed()));
+        screens.fail.store(false, Ordering::Release);
+        link.prepare().unwrap();
+        let from = frames();
+        sink.show(one_line("A"));
+        assert!(wait_until(|| frames() >= from + 3));
+        link.end_loading().unwrap();
+        link.loading().show(one_line("B"));
+        let from = frames();
+        assert!(wait_until(|| frames() >= from + 3));
+        link.end_loading().unwrap();
+        link.exit();
+
+        let restored = screens.restored.lock().unwrap().clone();
+        assert!(Arc::ptr_eq(restored[0].bundle(), &skin));
+        let origins = screens.origins.lock().unwrap().clone();
+        let lifetimes: Vec<u64> = origins.iter().map(|o| o.1).collect();
+        let first = lifetimes[0];
+        let of = |device: u64, lifetime: u64| -> Vec<TimeUs> {
+            origins
+                .iter()
+                .filter(|o| o.0 == device && o.1 == lifetime)
+                .map(|o| o.2)
+                .collect()
+        };
+        let (before, after) = (of(1, first), of(2, first));
+        assert!(before.len() >= 3 && after.len() >= 3, "{origins:?}");
+        assert!(
+            before.iter().chain(&after).all(|t| *t == before[0]),
+            "{origins:?}"
+        );
+        let next = of(2, first + 1);
+        assert!(next.len() >= 3, "{origins:?}");
+        assert!(next.iter().all(|t| *t == next[0] && *t > before[0]));
     }
 
     /// Each frame's effect sequence numbers and play phase.
@@ -5519,11 +6343,19 @@ mod tests {
         /// Per restore: whether the bundle installed is the one restored,
         /// the resource generation, and a frame drawn at once.
         restores: Vec<(bool, u64, Probing)>,
+        /// Per ready installation (a selection): the atlas bytes staged
+        /// beside the installed atlas.
+        installs: Vec<u64>,
         /// Per ready preparation: the atlas bytes staged beside the
         /// installed atlas.
         staged_atlas: Vec<u64>,
         /// Per commit: the resource generation and a frame drawn at once.
         commits: Vec<(u64, Probing)>,
+        /// Per loading frame drawn: the device, the lifetime, its origin
+        /// and the installed presentation's `when` timer start.
+        loadings: Vec<(u64, u64, TimeUs, Option<TimeUs>)>,
+        /// The installed presentation at each loading frame.
+        presentations: Vec<render::LoadingPresentation>,
     }
 
     /// A probe frame's sprites and the RGB of its samples ([`SAMPLES`]),
@@ -5625,10 +6457,27 @@ mod tests {
         fn discard(&mut self) {
             self.menu.discard();
         }
-        fn restore(&mut self, bundle: &Arc<render::SkinBundle>) -> Result<(), RenderError> {
-            self.menu.restore(bundle)?;
+        fn install(
+            &mut self,
+            skin: &Arc<render::SkinBundle>,
+            request: u64,
+        ) -> Result<Preparation, RenderError> {
+            let answer = self.menu.install(skin, request);
+            if matches!(answer, Ok(Preparation::Ready)) {
+                let staged = self.menu.renderer_mut().memory().staged_atlas;
+                self.probed().installs.push(staged);
+            }
+            answer
+        }
+        fn installation(&self) -> Option<render::Installation> {
+            self.menu.installation()
+        }
+        fn restore(&mut self, installation: &render::Installation) -> Result<(), RenderError> {
+            self.menu.restore(installation)?;
             let r = self.menu.renderer_mut();
-            let same = r.installed().is_some_and(|i| Arc::ptr_eq(i, bundle));
+            let same = r
+                .installed()
+                .is_some_and(|i| Arc::ptr_eq(i, installation.bundle()));
             let generation = r.resource_generation();
             let drew = self.frame();
             self.probed().restores.push((same, generation, drew));
@@ -5664,8 +6513,22 @@ mod tests {
             page: &crate::menu_screen::MenuPage,
             update: Option<&LoadingUpdate>,
             changed: bool,
-        ) -> Result<FrameTiming, RenderError> {
-            self.menu.loading(page, update, changed)
+            frame: &render::LoadingFrame<'_>,
+        ) -> Result<Result<FrameTiming, skin_model::BuildError>, RenderError> {
+            if self.fail.load(Ordering::Acquire) {
+                return Err(RenderError::SurfaceLost);
+            }
+            let drawn = self.menu.loading(page, update, changed, frame)?;
+            let device = self.menu.device();
+            if let Some(i) = self.menu.installation() {
+                let when = i.loading().timer(crate::render_decl::WHEN_SLOT);
+                let mut probed = self.probed();
+                probed
+                    .loadings
+                    .push((device, frame.lifetime, frame.load.since, when));
+                probed.presentations.push(i.loading().clone());
+            }
+            Ok(drawn)
         }
         fn resize(&mut self, width: u32, height: u32) {
             self.menu.resize(width, height);
@@ -5677,6 +6540,130 @@ mod tests {
         fn read_back(&self) -> Option<(u32, u32, Vec<u8>)> {
             self.menu.read_back()
         }
+    }
+
+    /// Through a real menu screen, with the runtime fonts its loading
+    /// lines need, and the render thread's own recovery, the loading
+    /// presentation belongs to the committed installation and
+    /// its lifetime: within one lifetime the `when` timer started on the
+    /// first loading frame keeps its start across an attempt staged and
+    /// committed on the same bundle and across a renderer built again
+    /// (its files deleted, restored from memory), and the loading frames
+    /// keep the lifetime's origin; the next lifetime on the same bundle,
+    /// its condition still true, starts it afresh, from its own origin.
+    #[test]
+    fn a_loading_presentation_keeps_its_lifetime_across_a_rebuilt_renderer() {
+        use crate::render_decl::{Look, bundle};
+
+        let chart = Arc::new(ChartBuilder::new(120_000).build().unwrap());
+        let dir = tempfile::tempdir().unwrap();
+        let look = Look {
+            loading: true,
+            ..Look::left([255, 0, 0, 255])
+        };
+        let (skin, _) = bundle(
+            &crate::render_common::offscreen(1_920, 1_080),
+            dir.path(),
+            &look,
+        );
+        let fail = Arc::new(AtomicBool::new(false));
+        let probed = Arc::new(std::sync::Mutex::new(Probed::default()));
+        let builds = Arc::new(AtomicU32::new(0));
+        let (f, p, b) = (Arc::clone(&fail), Arc::clone(&probed), Arc::clone(&builds));
+        let make: MakeScreen = Box::new(move || {
+            b.fetch_add(1, Ordering::SeqCst);
+            let renderer = render::Renderer::new(
+                render::Target::Offscreen {
+                    width: 1_920,
+                    height: 1_080,
+                },
+                render::AdapterChoice::Warp,
+            )?;
+            Ok(Box::new(Probe {
+                menu: crate::menu_screen::MenuScreen::new(
+                    renderer,
+                    Some(render::text::Fonts::runtime()?),
+                ),
+                fail: Arc::clone(&f),
+                judge: Arc::new(AtomicBool::new(false)),
+                gauges: Arc::new(std::sync::atomic::AtomicUsize::new(2)),
+                probed: Arc::clone(&p),
+            }) as Box<dyn Screen>)
+        });
+        let link = spawn_empty(make);
+        link.load(Arc::clone(&chart), None).unwrap();
+        assert_eq!(
+            link.select(Some(Arc::clone(&skin))).wait().unwrap(),
+            Preparation::Ready
+        );
+        let drawn = || probed.lock().unwrap().loadings.len();
+        let sink = link.loading();
+        sink.show(one_line("A"));
+        assert!(wait_until(|| drawn() >= 3));
+
+        // The same bundle staged and committed for an attempt.
+        let attempt = preset_attempt(&chart, &rules::tapestry(), None, "T");
+        assert_eq!(
+            link.prepare_attempt(attempt, || false).unwrap(),
+            Preparation::Ready
+        );
+        link.commit_attempt().unwrap();
+        let from = drawn();
+        assert!(wait_until(|| drawn() >= from + 3));
+        let staged = drawn();
+
+        // The renderer fails and is built again, the files gone.
+        dir.close().unwrap();
+        fail.store(true, Ordering::Release);
+        assert!(wait_until(|| link.failed()));
+        fail.store(false, Ordering::Release);
+        link.prepare().unwrap();
+        sink.show(one_line("A"));
+        assert!(wait_until(|| drawn() >= staged + 3));
+        let rebuilt = drawn();
+
+        // A new lifetime on the same bundle.
+        link.end_loading().unwrap();
+        link.loading().show(one_line("B"));
+        assert!(wait_until(|| drawn() >= rebuilt + 3));
+        link.end_loading().unwrap();
+        link.exit();
+        assert_eq!(builds.load(Ordering::SeqCst), 2);
+
+        let probed = probed.lock().unwrap();
+        let all = &probed.loadings;
+        let (a, b) = (all[0].1, all[rebuilt].1);
+        assert_ne!(a, b);
+        let (_, _, since, when) = all[0];
+        let started = when.expect("the when timer starts on the first frame");
+        // Lifetime A: one origin and one `when` start throughout, on both
+        // renderers, the presentation shared with the restored one.
+        let lifetime_a = &all[..rebuilt];
+        assert!(lifetime_a.iter().all(|l| l.1 == a), "{all:?}");
+        assert!(lifetime_a.iter().any(|l| l.0 != all[0].0), "{all:?}");
+        assert!(
+            lifetime_a
+                .iter()
+                .all(|&(_, _, s, w)| s == since && w == Some(started)),
+            "{all:?}"
+        );
+        assert!(
+            probed.presentations[..rebuilt]
+                .iter()
+                .all(|p| p.same(&probed.presentations[0]))
+        );
+        // Lifetime B: its own later origin and a fresh start.
+        let lifetime_b = &all[rebuilt..];
+        let (_, _, since_b, when_b) = lifetime_b[0];
+        assert!(since_b > since, "{all:?}");
+        let started_b = when_b.expect("the when timer starts afresh");
+        assert!(started_b > started, "{all:?}");
+        assert!(
+            lifetime_b
+                .iter()
+                .all(|&(_, l, s, w)| l == b && s == since_b && w == Some(started_b)),
+            "{all:?}"
+        );
     }
 
     /// The attempt of `chart` the game would make under `preset`: the
@@ -5702,10 +6689,13 @@ mod tests {
         AttemptContext::new(attempt, crate::attempt_context::SIMPLE_SCRATCH)
     }
 
-    /// Through the render thread's own screen drop and recovery, a real
-    /// menu screen built again restores the committed bundle from memory,
-    /// its image files deleted: installed at once and drawing nothing
-    /// without an attempt, its resources reused by every later attempt.
+    /// The selection installs the bundle, uploading it once, and its
+    /// commit draws nothing without an attempt; every attempt reuses its
+    /// resources. Through the render thread's own screen drop and
+    /// recovery, a real menu screen built again restores the committed
+    /// bundle from memory, its image files deleted: installed at once and
+    /// drawing nothing without an attempt, its resources reused by every
+    /// later attempt.
     /// Each attempt on it starts fresh from its own preset and labels:
     /// - a healthy attempt shows its judgment (the judgment marker) and
     ///   its title's text line;
@@ -5768,7 +6758,10 @@ mod tests {
         });
         let link = spawn_empty(make);
         link.load(Arc::clone(&chart), None).unwrap();
-        link.select(Some(Arc::clone(&skin)));
+        assert_eq!(
+            link.select(Some(Arc::clone(&skin))).wait().unwrap(),
+            Preparation::Ready
+        );
         let play = |preset: &rules::RulePreset,
                     section: Option<&eval::Section>,
                     title: &str,
@@ -5783,7 +6776,7 @@ mod tests {
         };
         let tapestry = rules::tapestry();
 
-        // The first attempt uploads the bundle and draws it.
+        // The first attempt draws the bundle the selection uploaded.
         play(&tapestry, None, "T", false);
         dir.close().unwrap();
 
@@ -5843,15 +6836,26 @@ mod tests {
             matches!(drew, Ok((0, [BLACK, BLACK, BLACK, BLACK]))),
             "{drew:?}"
         );
-        // Uploaded once per screen: the restore's resources are reused.
-        assert!(probed.staged_atlas[0] > 0);
-        assert_eq!(probed.staged_atlas[1..], [0; 5]);
+        // Uploaded once per screen, by the selection and the restore: the
+        // attempts reuse their resources.
+        let [installed] = probed.installs[..] else {
+            panic!("{:?}", probed.installs);
+        };
+        assert!(installed > 0);
+        assert_eq!(probed.staged_atlas, [0; 6]);
         let generations: Vec<u64> = probed.commits.iter().map(|c| c.0).collect();
-        assert_eq!(generations[1..], [*restored; 5]);
-        // Each commit's frame: the sprites (the image, the text line, the
-        // gauge-look marker, the judgment marker) and the samples (left,
-        // right, gauge look, judgment).
-        let drew: Vec<&Probing> = probed.commits.iter().map(|c| &c.1).collect();
+        assert_eq!(generations[0], generations[1]);
+        assert_eq!(generations[2..], [*restored; 5]);
+        // The selection's commit draws nothing without an attempt.
+        assert!(
+            matches!(&probed.commits[0].1, Ok((0, [BLACK, BLACK, BLACK, BLACK]))),
+            "{:?}",
+            probed.commits[0].1
+        );
+        // Each attempt's commit's frame: the sprites (the image, the text
+        // line, the gauge-look marker, the judgment marker) and the
+        // samples (left, right, gauge look, judgment).
+        let drew: Vec<&Probing> = probed.commits[1..].iter().map(|c| &c.1).collect();
         let expect = |i: usize, sprites: usize, gauge: [u8; 3], judgment: [u8; 3]| {
             let want = (sprites, [RED, BLACK, gauge, judgment]);
             assert!(

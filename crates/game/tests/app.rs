@@ -363,6 +363,11 @@ struct Headless {
     refuse_attempts: usize,
     /// Every attempt the screen was asked to prepare.
     attempts: Vec<game::Attempt>,
+    /// Practice Starts the play screen is not ready for, from the next.
+    unready_starts: usize,
+    /// Every practice Start's readiness asked, with the chart loads before
+    /// it.
+    start_asks: Vec<usize>,
 }
 
 /// What selection was shown of the shelf.
@@ -473,6 +478,8 @@ impl Headless {
             practiced: Vec::new(),
             refuse_attempts: 0,
             attempts: Vec::new(),
+            unready_starts: 0,
+            start_asks: Vec::new(),
         }
     }
 
@@ -1030,6 +1037,15 @@ impl AppRig for Headless {
 
     fn take_preset_step(&mut self) -> Option<PresetStep> {
         self.steps.pop_front()
+    }
+
+    fn start_ready(&mut self) -> Result<(), String> {
+        self.start_asks.push(self.loads.len());
+        if self.unready_starts > 0 {
+            self.unready_starts -= 1;
+            return Err("the play skin is not installed: skin.json:3: an unknown image".to_owned());
+        }
+        Ok(())
     }
 }
 
@@ -2867,6 +2883,40 @@ fn a_refused_round_preparation_shows_on_the_practice_page() {
     assert_eq!(rig.opens, 0);
     assert_eq!(events.count(|e| matches!(e, SessionEvent::Start { .. })), 0);
     assert_eq!(rig.seen.last(), Some(&Seen::Select));
+}
+
+/// A practice Start the play screen is not ready for keeps the practice
+/// page with the reason as its notice: no loading state, no load, no
+/// attempt. The page's other controls go on (the speed changed after it is
+/// the one loaded), and the next Start, once ready, loads and plays.
+#[test]
+fn a_start_before_the_screen_is_ready_stays_on_the_practice_page() {
+    use PracticeInput::{Confirm, Down, Left, Up};
+    let mut acts = vec![(0, Act::Practice(P))];
+    acts.extend(to_start(0));
+    acts.push((10, Act::Page(Confirm)));
+    // From Start back to the speed row, one step down, then Start again.
+    acts.extend(page(Up, 4));
+    acts.extend(page(Left, 1));
+    acts.extend(page(Down, 4));
+    acts.extend([(10, Act::Page(Confirm)), (4_000, Act::Close)]);
+    let (rig, _events, ran) = run(Refusal::Missing, acts, |rig| rig.unready_starts = 1);
+    ran.unwrap();
+    assert!(rig.violations.is_empty(), "{:?}", rig.violations);
+    // Both Starts asked, before any load.
+    assert_eq!(rig.start_asks, [0, 0]);
+    let n = notices(&rig);
+    assert!(
+        n.get(1)
+            .and_then(Option::as_deref)
+            .is_some_and(|n| n.contains("skin.json:3: an unknown image")),
+        "{n:?}"
+    );
+    // Nothing of the refused Start began; the second loaded once, at the
+    // speed changed after the refusal.
+    assert_eq!(rig.loading_pages.len(), 1, "{:?}", rig.loading_pages);
+    assert_eq!(rig.speeds, [Speed::from_twentieths(19).unwrap()]);
+    assert_eq!(rig.attempts.len(), 1, "{:?}", rig.seen);
 }
 
 /// What fails right after an attempt was prepared, before recording opens.
