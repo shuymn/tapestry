@@ -112,7 +112,7 @@ impl Resolver<'_, '_> {
                 Ok(())
             }
             Kind::Object => self.offset_row(id, out),
-            Kind::Quoted | Kind::Bare => match self.arena().scalar(id) {
+            Kind::Quoted | Kind::Bare | Kind::Lua => match self.arena().scalar(id) {
                 Scalar::Null => Ok(()),
                 _ => Err(self.def.type_error(id, FIELD, "an array")),
             },

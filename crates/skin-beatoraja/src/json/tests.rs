@@ -36,7 +36,7 @@ fn render(a: &Arena, id: u32) -> String {
             }
         }
         Kind::Quoted => format!("\"{}\"", a.raw(id)),
-        Kind::Bare => a.raw(id).to_owned(),
+        Kind::Bare | Kind::Lua => a.raw(id).to_owned(),
     };
     key + &body
 }
@@ -216,6 +216,7 @@ fn tokens_are_typed_as_the_pinned_reader_types_them() {
             Scalar::Bool(b) => format!("bool {b}"),
             Scalar::Null => "null".into(),
             Scalar::Object | Scalar::Array => "container".into(),
+            Scalar::Int(_) | Scalar::Float(_) | Scalar::Callable => "lua".into(),
         })
         .collect();
     assert_eq!(

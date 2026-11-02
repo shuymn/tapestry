@@ -1,0 +1,968 @@
+//! Lua skins through the public entries: every test runs
+//! [`read_lua_header`] (the header pass) and, where it imports,
+//! [`LuaHeader::import`] (the configured pass, the conversion and the
+//! common import). Every fixture is a small self-made skin.
+
+mod common;
+
+use skin_beatoraja::limits::{MAX_FILE_BYTES, MAX_INCLUDE_DEPTH, MAX_INCLUDE_PARSES, MAX_NODES};
+use skin_beatoraja::lua::HOST_APIS;
+use skin_beatoraja::lua::limits::{MAX_HOST_CALLS, MAX_INSTRUCTIONS};
+use skin_beatoraja::{
+    Cancel, Config, CriticalPart, ImportError, InputLimit, LuaHeader, LuaImported, LuaLimit,
+    LuaWhy, NoteKind, OffsetValue, Severity, read_lua_header,
+};
+use skin_model::RootError;
+use tempfile::TempDir;
+
+/// A skin folder with `files` and a 64×64 `a.png`.
+fn folder(files: &[(&str, &str)]) -> TempDir {
+    let d = common::skin(files);
+    common::png(d.path(), "a.png", 64, 64);
+    d
+}
+
+/// The header pass of `s.luaskin`.
+fn header(d: &TempDir) -> Result<LuaHeader, ImportError> {
+    read_lua_header(d.path(), "s.luaskin", &Cancel::new())
+}
+
+/// Both passes of `s.luaskin` with `config` made from the header.
+fn import_with(
+    d: &TempDir,
+    config: impl FnOnce(&LuaHeader) -> Config,
+) -> Result<LuaImported, ImportError> {
+    let h = header(d)?;
+    h.import(&config(&h), &Cancel::new())
+}
+
+/// Both passes of `s.luaskin` with the default configuration.
+fn import(d: &TempDir) -> Result<LuaImported, ImportError> {
+    import_with(d, |h| Config::defaults(h.header()))
+}
+
+/// A play skin: the header's `fields`, then `body` run in the configured
+/// pass only, with `skin` the header table holding `a.png` as source `a`
+/// and its whole as image `i`.
+fn skin(fields: &str, body: &str) -> String {
+    format!(
+        "local skin = {{ type = 0, name = \"t\", w = 1920, h = 1080, {fields} }}\n\
+         if not skin_config then return skin end\n\
+         skin.source = {{ {{ id = \"a\", path = \"a.png\" }} }}\n\
+         skin.image = {{ {{ id = \"i\", src = \"a\", x = 0, y = 0, w = 64, h = 64 }} }}\n\
+         {body}\n\
+         return skin\n"
+    )
+}
+
+/// [`skin`] drawing image `i` once with `fields` in its destination.
+fn drawn(fields: &str) -> String {
+    skin(
+        "",
+        &format!(
+            "skin.destination = {{ {{ id = \"i\", {fields} dst = {{ {{ x = 0, y = 0, w = 64, h = 64 }} }} }} }}"
+        ),
+    )
+}
+
+/// A folder whose `s.luaskin` runs `body` in the configured pass of a
+/// skin drawing image `i`.
+fn configured(body: &str) -> TempDir {
+    folder(&[("s.luaskin", &skin("", &format!("{body}\n{}", DRAW_I)))])
+}
+
+const DRAW_I: &str =
+    "skin.destination = { { id = \"i\", dst = { { x = 0, y = 0, w = 64, h = 64 } } } }";
+
+/// The Lua refusal of `r`.
+#[track_caller]
+fn why<T: std::fmt::Debug>(r: Result<T, ImportError>) -> LuaWhy {
+    match r {
+        Err(ImportError::Lua { why, .. }) => why,
+        other => panic!("{other:?}"),
+    }
+}
+
+/// The Lua refusal of `r` and its location's file and line.
+#[track_caller]
+fn located<T: std::fmt::Debug>(r: Result<T, ImportError>) -> (LuaWhy, String, u32) {
+    match r {
+        Err(ImportError::Lua { why, at: Some(at) }) => (why, at.file, at.line),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// The input bound `r` stopped at.
+#[track_caller]
+fn input<T: std::fmt::Debug>(r: Result<T, ImportError>) -> InputLimit {
+    match r {
+        Err(ImportError::Input { limit, .. }) => limit,
+        other => panic!("{other:?}"),
+    }
+}
+
+/// The read refusal of `r`.
+#[track_caller]
+fn read<T: std::fmt::Debug>(r: Result<T, ImportError>) -> RootError {
+    match r {
+        Err(ImportError::Read { source, .. }) => source,
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn a_data_only_skin_imports_through_the_common_mapper() {
+    let d = folder(&[("s.luaskin", &drawn(""))]);
+    let r = import(&d).unwrap();
+    assert_eq!(r.dependencies, ["s.luaskin"]);
+    assert_eq!(r.imported.report.sources, ["s.luaskin"]);
+    assert_eq!(r.imported.report.usage.elements, 1);
+    assert!(
+        r.imported.report.notes.is_empty(),
+        "{:?}",
+        r.imported.report.notes
+    );
+}
+
+#[test]
+fn the_environment_is_an_allowlist() {
+    let absent = [
+        "io",
+        "os",
+        "debug",
+        "package",
+        "load",
+        "loadfile",
+        "loadstring",
+        "collectgarbage",
+        "print",
+        "warn",
+        "coroutine",
+        "utf8",
+        "module",
+        "string.dump",
+        "string.pack",
+        "string.unpack",
+        "string.packsize",
+        "math.random",
+        "math.randomseed",
+    ];
+    let present = [
+        "assert",
+        "error",
+        "getmetatable",
+        "ipairs",
+        "next",
+        "pairs",
+        "pcall",
+        "rawequal",
+        "rawget",
+        "rawlen",
+        "rawset",
+        "select",
+        "setmetatable",
+        "tonumber",
+        "tostring",
+        "type",
+        "xpcall",
+        "require",
+        "dofile",
+        "_G",
+        "_VERSION",
+        "string.find",
+        "string.format",
+        "table.concat",
+        "table.sort",
+        "math.floor",
+        "math.mininteger",
+    ];
+    let lookup = |name: &str| match name.split_once('.') {
+        Some((lib, f)) => format!("(_G[\"{lib}\"] or {{}})[\"{f}\"]"),
+        None => format!("_G[\"{name}\"]"),
+    };
+    let mut src = String::new();
+    for name in absent {
+        src += &format!(
+            "if {} ~= nil then error(\"{name} is present\") end\n",
+            lookup(name)
+        );
+    }
+    for name in present {
+        src += &format!(
+            "if {} == nil then error(\"{name} is absent\") end\n",
+            lookup(name)
+        );
+    }
+    src += "if _G ~= _ENV then error(\"_G\") end\nreturn { type = 0 }\n";
+    let d = folder(&[("s.luaskin", &src)]);
+    header(&d).unwrap();
+}
+
+#[test]
+fn a_coroutine_is_unavailable() {
+    let d = folder(&[(
+        "s.luaskin",
+        "local co = coroutine.create(function() while true do end end)\n\
+         coroutine.resume(co)\nreturn { type = 0 }",
+    )]);
+    assert_eq!(located(header(&d)), (LuaWhy::Error, "s.luaskin".into(), 1));
+}
+
+#[test]
+fn an_infinite_loop_reaches_the_instruction_limit() {
+    let d = folder(&[("s.luaskin", "while true do end")]);
+    assert_eq!(why(header(&d)), LuaWhy::Limit(LuaLimit::Instructions));
+}
+
+#[test]
+fn exhaustion_inside_a_protected_call_stays_fatal() {
+    for body in [
+        "pcall(function() while true do end end)",
+        "for i = 1, 100 do pcall(function() while true do end end) end",
+        "xpcall(function() while true do end end, function(e) return e end)",
+        "local ok = pcall(pcall, function() while true do end end)\nif not ok then return { type = 0 } end",
+    ] {
+        let d = folder(&[("s.luaskin", &format!("{body}\nreturn {{ type = 0 }}"))]);
+        assert_eq!(
+            why(header(&d)),
+            LuaWhy::Limit(LuaLimit::Instructions),
+            "{body}"
+        );
+    }
+}
+
+#[test]
+fn the_instruction_limit_counts_both_passes() {
+    // One instruction per iteration of a numeric `for`: under the cap the
+    // skin imports, over it the configured pass is refused.
+    let under = configured("for i = 1, 9900000 do end");
+    let r = import(&under).unwrap();
+    assert!(
+        r.usage.instructions <= MAX_INSTRUCTIONS,
+        "{}",
+        r.usage.instructions
+    );
+    assert!(
+        r.usage.instructions >= 9_900_000,
+        "{}",
+        r.usage.instructions
+    );
+    let over = configured("for i = 1, 10000000 do end");
+    assert_eq!(why(import(&over)), LuaWhy::Limit(LuaLimit::Instructions));
+    // Half in each pass is over the cap too.
+    let halves = folder(&[(
+        "s.luaskin",
+        &format!(
+            "for i = 1, 5000000 do end\n{}",
+            skin("", &format!("for i = 1, 5000000 do end\n{DRAW_I}"))
+        ),
+    )]);
+    assert_eq!(why(import(&halves)), LuaWhy::Limit(LuaLimit::Instructions));
+}
+
+#[test]
+fn memory_is_capped_before_it_is_allocated() {
+    // 24 MiB, built in a buffer and then copied, fit in the 64 MiB.
+    let fits = configured("local s = string.rep(\"x\", 24 << 20)");
+    import(&fits).unwrap();
+    for body in [
+        "local s = string.rep(\"x\", 80 << 20)",
+        "local s = string.rep(\"x\", 1 << 20)\nlocal t = {}\nfor i = 1, 100 do t[i] = s .. i end",
+        "pcall(string.rep, \"x\", 80 << 20)",
+        "pcall(function() local t = {} for i = 1, 100 do t[i] = string.rep(\"x\", 1 << 20) .. i end end)",
+    ] {
+        let d = configured(body);
+        assert_eq!(why(import(&d)), LuaWhy::Limit(LuaLimit::Memory), "{body}");
+    }
+}
+
+#[test]
+fn recursion_ends_in_a_located_error() {
+    let d = folder(&[(
+        "s.luaskin",
+        "local function f(n) return 1 + f(n + 1) end\nf(0)\nreturn { type = 0 }",
+    )]);
+    assert_eq!(located(header(&d)), (LuaWhy::Error, "s.luaskin".into(), 1));
+    // A metamethod that recurses through C.
+    let d = folder(&[(
+        "s.luaskin",
+        "local t = setmetatable({}, { __index = function(t, k) return t[k] end })\n\
+         local x = t.a\nreturn { type = 0 }",
+    )]);
+    assert_eq!(why(header(&d)), LuaWhy::Error);
+}
+
+#[test]
+fn host_calls_are_capped_across_protected_calls() {
+    // `setmetatable` is a host function: one call each.
+    let n = MAX_HOST_CALLS;
+    let at = configured(&format!("for i = 1, {n} do setmetatable({{}}, nil) end"));
+    let r = import(&at).unwrap();
+    assert_eq!(r.usage.host_calls, n);
+    let over = configured(&format!(
+        "for i = 1, {} do setmetatable({{}}, nil) end",
+        n + 1
+    ));
+    assert_eq!(why(import(&over)), LuaWhy::Limit(LuaLimit::HostCalls));
+    let caught = configured(&format!(
+        "pcall(function() for i = 1, {} do setmetatable({{}}, nil) end end)",
+        n + 1
+    ));
+    assert_eq!(why(import(&caught)), LuaWhy::Limit(LuaLimit::HostCalls));
+}
+
+#[test]
+fn native_library_work_is_charged_before_the_call() {
+    let fine = configured("assert(string.find(\"a.png\", \"%.png$\"))");
+    import(&fine).unwrap();
+    for body in [
+        "string.find(string.rep(\"a\", 3000), \"a*a*a*b\")",
+        "pcall(string.gsub, string.rep(\"a\", 3000), \"(a-)(a-)(a-)b\", \"\")",
+        "table.move({}, 1, 1 << 40, 1)",
+        "local s = string.rep(\"a\", 3000)\nlocal f = s.match\npcall(f, s, \".-.-.-x\")",
+    ] {
+        let d = configured(body);
+        assert_eq!(
+            why(import(&d)),
+            LuaWhy::Limit(LuaLimit::NativeWork),
+            "{body}"
+        );
+    }
+}
+
+#[test]
+fn finalizers_and_weak_tables_are_refused() {
+    for body in [
+        "setmetatable({}, { __gc = function() end })",
+        "setmetatable({}, { __mode = \"k\" })",
+        "pcall(setmetatable, {}, { __gc = true })",
+    ] {
+        let d = folder(&[("s.luaskin", &format!("{body}\nreturn {{ type = 0 }}"))]);
+        assert_eq!(
+            located(header(&d)),
+            (LuaWhy::Finalizer, "s.luaskin".into(), 1)
+        );
+    }
+    // An ordinary metatable is fine.
+    let d = folder(&[(
+        "s.luaskin",
+        "local t = setmetatable({}, { __index = function() return 0 end })\n\
+         assert(t.x == 0)\nreturn { type = 0 }",
+    )]);
+    header(&d).unwrap();
+}
+
+#[test]
+fn cancellation_refuses_both_passes() {
+    let d = folder(&[("s.luaskin", &drawn(""))]);
+    let cancel = Cancel::new();
+    cancel.cancel();
+    assert_eq!(
+        why(read_lua_header(d.path(), "s.luaskin", &cancel)),
+        LuaWhy::Cancelled
+    );
+    let h = header(&d).unwrap();
+    assert_eq!(
+        why(h.import(&Config::defaults(h.header()), &cancel)),
+        LuaWhy::Cancelled
+    );
+}
+
+#[test]
+fn cancellation_stops_a_running_pass() {
+    // An endless loop of host calls stops only for the cancellation,
+    // which another thread requests once the pass runs.
+    let d = folder(&[(
+        "s.luaskin",
+        "local n = 0\nwhile true do n = n + 1 if n % 100 == 0 then setmetatable({}, nil) end end",
+    )]);
+    let cancel = Cancel::new();
+    let remote = cancel.clone();
+    let path = d.path().to_owned();
+    let worker = std::thread::spawn(move || read_lua_header(&path, "s.luaskin", &cancel));
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    remote.cancel();
+    let r = worker.join().unwrap();
+    // The instruction cap could be reached first on a very fast machine;
+    // either is a refusal, and a cancellation is what this one sees.
+    let w = why(r);
+    assert!(
+        w == LuaWhy::Cancelled || w == LuaWhy::Limit(LuaLimit::Instructions),
+        "{w:?}"
+    );
+}
+
+#[test]
+fn results_and_errors_cross_threads() {
+    fn send<T: Send + 'static>() {}
+    send::<LuaHeader>();
+    send::<LuaImported>();
+    send::<ImportError>();
+    let d = folder(&[("s.luaskin", &drawn(""))]);
+    let path = d.path().to_owned();
+    let h = std::thread::spawn(move || read_lua_header(&path, "s.luaskin", &Cancel::new()))
+        .join()
+        .unwrap()
+        .unwrap();
+    let r = std::thread::spawn(move || h.import(&Config::defaults(h.header()), &Cancel::new()))
+        .join()
+        .unwrap();
+    assert_eq!(r.unwrap().imported.report.usage.elements, 1);
+}
+
+#[test]
+fn loaders_refuse_names_outside_the_skin_folder() {
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(outside.path().join("x.lua"), "return {}").unwrap();
+    let abs = outside
+        .path()
+        .join("x.lua")
+        .display()
+        .to_string()
+        .replace('\\', "/");
+    for (call, want) in [
+        ("dofile(\"../x.lua\")", RootError::Underflow),
+        ("dofile(\"/x.lua\")", RootError::Rejected),
+        ("dofile(\"\\\\x.lua\")", RootError::Rejected),
+        ("dofile(\"C:/x.lua\")", RootError::Rejected),
+        ("dofile(\"//server/share/x.lua\")", RootError::Rejected),
+        (
+            "dofile(\"\\\\\\\\server\\\\share\\\\x.lua\")",
+            RootError::Rejected,
+        ),
+        ("dofile(\"m.lua:stream\")", RootError::Rejected),
+        ("dofile(\"parts/*.lua\")", RootError::Rejected),
+        ("pcall(dofile, \"../x.lua\")", RootError::Underflow),
+        ("pcall(dofile, \"missing.lua\")", RootError::Missing),
+        ("require(\"..x\")", RootError::Rejected),
+        ("require(\"a/b\")", RootError::Rejected),
+        ("pcall(require, \"c:x\")", RootError::Rejected),
+        ("pcall(require, \"missing\")", RootError::Missing),
+    ] {
+        let d = folder(&[
+            ("s.luaskin", &format!("{call}\nreturn {{ type = 0 }}")),
+            ("m.lua", "return {}"),
+        ]);
+        let got = read(header(&d));
+        assert_eq!(format!("{got:?}"), format!("{want:?}"), "{call}");
+    }
+    let d = folder(&[(
+        "s.luaskin",
+        &format!("dofile(\"{abs}\")\nreturn {{ type = 0 }}"),
+    )]);
+    assert!(matches!(read(header(&d)), RootError::Rejected));
+    // A loader's argument must be a name.
+    let d = folder(&[("s.luaskin", "pcall(dofile, 1)\nreturn { type = 0 }")]);
+    assert_eq!(why(header(&d)), LuaWhy::LoaderName);
+}
+
+#[test]
+fn a_link_out_of_the_skin_folder_is_refused() {
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(outside.path().join("x.lua"), "return {}").unwrap();
+    let d = folder(&[("s.luaskin", "require(\"link\")\nreturn { type = 0 }")]);
+    let target = outside.path().join("x.lua");
+    let link = d.path().join("link.lua");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_file(&target, &link).unwrap();
+    assert!(matches!(read(header(&d)), RootError::Escapes));
+}
+
+#[test]
+fn require_caches_a_module_and_dofile_runs_each_time() {
+    let d = folder(&[
+        (
+            "s.luaskin",
+            &skin(
+                "",
+                &format!(
+                    "local a = require(\"parts.m\")\nlocal b = require(\"parts.m\")\n\
+                     assert(a == b and a.runs == 1, \"cached\")\n\
+                     dofile(\"parts/d.lua\")\nlocal n = dofile(\"parts/d.lua\")\n\
+                     assert(n == 2, \"dofile\")\n{DRAW_I}"
+                ),
+            ),
+        ),
+        (
+            "parts/m.lua",
+            "runs = (runs or 0) + 1\nreturn { runs = runs }",
+        ),
+        ("parts/d.lua", "ran = (ran or 0) + 1\nreturn ran"),
+    ]);
+    let r = import(&d).unwrap();
+    assert_eq!(r.dependencies, ["s.luaskin", "parts/m.lua", "parts/d.lua"]);
+    assert_eq!((r.usage.requires, r.usage.dofiles), (2, 2));
+}
+
+#[test]
+fn a_require_cycle_is_refused() {
+    let d = folder(&[
+        ("s.luaskin", "require(\"a\")\nreturn { type = 0 }"),
+        ("a.lua", "require(\"b\")\nreturn {}"),
+        ("b.lua", "pcall(require, \"a\")\nreturn {}"),
+    ]);
+    assert_eq!(
+        located(header(&d)),
+        (LuaWhy::RequireCycle, "b.lua".into(), 1)
+    );
+}
+
+#[test]
+fn a_part_that_fails_is_refused_inside_a_protected_call() {
+    let d = folder(&[
+        ("s.luaskin", "pcall(dofile, \"p.lua\")\nreturn { type = 0 }"),
+        ("p.lua", "local x = 1\nerror(\"broken\")"),
+    ]);
+    assert_eq!(located(header(&d)), (LuaWhy::Error, "p.lua".into(), 2));
+    let d = folder(&[
+        ("s.luaskin", "pcall(require, \"p\")\nreturn { type = 0 }"),
+        ("p.lua", "local x = \n"),
+    ]);
+    assert_eq!(located(header(&d)), (LuaWhy::Syntax, "p.lua".into(), 2));
+}
+
+#[test]
+fn the_loader_depth_is_capped() {
+    let chain = |n: u32| {
+        let mut files: Vec<(String, String)> = (0..n)
+            .map(|i| {
+                let next = if i + 1 < n {
+                    format!("require(\"m{}\")\n", i + 1)
+                } else {
+                    String::new()
+                };
+                (format!("m{i}.lua"), format!("{next}return {{}}"))
+            })
+            .collect();
+        files.push((
+            "s.luaskin".into(),
+            "require(\"m0\")\nreturn { type = 0 }".into(),
+        ));
+        files
+    };
+    let at = chain(MAX_INCLUDE_DEPTH);
+    let refs: Vec<(&str, &str)> = at.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+    header(&folder(&refs)).unwrap();
+    let over = chain(MAX_INCLUDE_DEPTH + 1);
+    let refs: Vec<(&str, &str)> = over.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+    assert_eq!(input(header(&folder(&refs))), InputLimit::IncludeDepth);
+}
+
+#[test]
+fn every_load_invocation_counts() {
+    let n = MAX_INCLUDE_PARSES;
+    let loads = |n: u32| {
+        folder(&[
+            (
+                "s.luaskin",
+                &skin(
+                    "",
+                    &format!("for i = 1, {n} do dofile(\"p.lua\") end\n{DRAW_I}"),
+                ),
+            ),
+            ("p.lua", "return 1"),
+        ])
+    };
+    let r = import(&loads(n)).unwrap();
+    assert_eq!(r.usage.loads, n);
+    assert_eq!(input(import(&loads(n + 1))), InputLimit::IncludeParses);
+    // A cached `require` counts too.
+    let d = folder(&[
+        (
+            "s.luaskin",
+            &skin(
+                "",
+                &format!("for i = 1, {} do require(\"m\") end\n{DRAW_I}", n + 1),
+            ),
+        ),
+        ("m.lua", "return {}"),
+    ]);
+    assert_eq!(input(import(&d)), InputLimit::IncludeParses);
+}
+
+#[test]
+fn source_bytes_are_capped_per_file_and_in_all() {
+    let big = format!(
+        "--{}\nreturn 1",
+        "x".repeat(usize::try_from(MAX_FILE_BYTES).unwrap())
+    );
+    let d = folder(&[
+        ("s.luaskin", "dofile(\"big.lua\")\nreturn { type = 0 }"),
+        ("big.lua", &big),
+    ]);
+    assert_eq!(input(header(&d)), InputLimit::FileBytes);
+    // A 1 MiB part read again and again: each read counts.
+    let part = format!("--{}\nreturn 1", "x".repeat((1 << 20) - 12));
+    let reads = |n: u32| {
+        folder(&[
+            (
+                "s.luaskin",
+                &skin(
+                    "",
+                    &format!("for i = 1, {n} do dofile(\"p.lua\") end\n{DRAW_I}"),
+                ),
+            ),
+            ("p.lua", &part),
+        ])
+    };
+    let r = import(&reads(31)).unwrap();
+    assert!(r.usage.input_bytes < 32 << 20, "{}", r.usage.input_bytes);
+    assert_eq!(input(import(&reads(32))), InputLimit::InputBytes);
+}
+
+#[test]
+fn the_passes_diverge_on_skin_config_and_share_nothing() {
+    let d = folder(&[
+        (
+            "s.luaskin",
+            &skin(
+                "property = { { name = \"opt\", item = { { name = \"a\", op = 900 }, { name = \"b\", op = 901 } }, def = \"b\" } }",
+                &format!(
+                    "assert(leaked == nil, \"a global leaked\")\n\
+                     assert(require(\"m\").runs == 1, \"a module leaked\")\n\
+                     assert(skin_config.option.opt == 901, \"option\")\n{DRAW_I}"
+                ),
+            )
+            .replace(
+                "if not skin_config then return skin end",
+                "if not skin_config then leaked = true require(\"m\") return skin end",
+            ),
+        ),
+        ("m.lua", "runs = (runs or 0) + 1\nreturn { runs = runs }"),
+    ]);
+    let h = header(&d).unwrap();
+    assert_eq!(h.header().options.len(), 1);
+    // The header pass ran without `skin_config`; the configured pass saw
+    // the default item, then the configured one.
+    h.import(&Config::defaults(h.header()), &Cancel::new())
+        .unwrap();
+    let other = Config {
+        options: vec![Some(900)],
+        ..Config::default()
+    };
+    let (w, _, line) = located(h.import(&other, &Cancel::new()));
+    assert_eq!((w, line), (LuaWhy::Error, 7));
+}
+
+#[test]
+fn skin_config_is_read_only_and_follows_the_header() {
+    let d = folder(&[
+        (
+            "s.luaskin",
+            &skin(
+                "filepath = { { name = \"bg\", path = \"bg/*.png\", def = \"b\" } },\n\
+                 offset = { { name = \"o\", id = 40, x = true } },",
+                &format!(
+                    "assert(skin_config.file_path.bg == \"bg/b.png\", \"file_path\")\n\
+                     assert(skin_config.get_path(\"bg/*.png\") == \"bg/b.png\", \"get_path\")\n\
+                     assert(skin_config.get_path(\"bg/*.png/x\") == \"bg/b.png/x\", \"get_path foot\")\n\
+                     assert(skin_config.get_path(\"fx/*.png\") == nil, \"unchosen\")\n\
+                     assert(skin_config.offset.o.x == 5 and skin_config.offset.o.y == 0, \"offset\")\n\
+                     local n = 0 for _ in pairs(skin_config.offset.o) do n = n + 1 end\n\
+                     assert(n == 6, \"pairs\")\n\
+                     assert(getmetatable(skin_config) == false, \"hidden\")\n{DRAW_I}"
+                ),
+            ),
+        ),
+        ("bg/a.png", ""),
+        ("bg/b.png", ""),
+    ]);
+    let r = import_with(&d, |h| {
+        let mut c = Config::defaults(h.header());
+        c.offsets.insert(
+            40,
+            OffsetValue {
+                x: 5,
+                ..OffsetValue::default()
+            },
+        );
+        c
+    });
+    r.unwrap();
+    // A write is refused, inside a protected call too.
+    for write in [
+        "skin_config.option.x = 1",
+        "pcall(function() skin_config.offset.o.x = 1 end)",
+        "skin_config.offset = {}",
+        "pcall(rawset, skin_config, \"x\", 1)",
+        "pcall(setmetatable, skin_config, nil)\nassert(false)",
+    ] {
+        let d = folder(&[(
+            "s.luaskin",
+            &skin(
+                "offset = { { name = \"o\", id = 40 } },",
+                &format!("{write}\n{DRAW_I}"),
+            ),
+        )]);
+        let w = why(import(&d));
+        let want = if write.contains("assert") {
+            LuaWhy::Error
+        } else {
+            LuaWhy::ConfigWrite
+        };
+        assert_eq!(w, want, "{write}");
+    }
+}
+
+#[test]
+fn host_modules_load_but_reading_play_state_is_refused() {
+    let d = folder(&[(
+        "s.luaskin",
+        "local ms = require(\"main_state\")\nlocal tu = require(\"timer_util\")\n\
+         assert(ms.timer_off_value == math.mininteger and type(tu.now_timer) == \"function\")\n\
+         return { type = 0 }",
+    )]);
+    header(&d).unwrap();
+    let d = folder(&[(
+        "s.luaskin",
+        "local ms = require(\"main_state\")\npcall(ms.number, 71)\nreturn { type = 0 }",
+    )]);
+    let w = why(header(&d));
+    let LuaWhy::LiveState { api } = w else {
+        panic!("{w:?}")
+    };
+    assert_eq!(HOST_APIS[usize::from(api)], ("main_state", "number"));
+}
+
+#[test]
+fn a_decorative_callable_is_frozen_and_noted_at_its_definition() {
+    let d = folder(&[(
+        "s.luaskin",
+        &skin(
+            "",
+            "skin.destination = {\n\
+               { id = \"i\", dst = { { x = 0, y = 0, w = 64, h = 64 } } },\n\
+               { id = \"i\", draw = function() return true end,\n\
+                 dst = { { x = 0, y = 0, w = 64, h = 64 } } },\n\
+               { id = \"i\", timer = function() return 0 end, dst = { { w = 64, h = 64 } } },\n\
+             }",
+        ),
+    )]);
+    let r = import(&d).unwrap();
+    let report = &r.imported.report;
+    let notes: Vec<_> = report
+        .notes
+        .iter()
+        .map(|n| (n.severity, n.kind, n.at.map(|a| (a.source, a.line))))
+        .collect();
+    assert_eq!(
+        notes,
+        [
+            (
+                Severity::Dropped,
+                NoteKind::Callable { field: "draw" },
+                Some((0, 7))
+            ),
+            (
+                Severity::Dropped,
+                NoteKind::Callable { field: "timer" },
+                Some((0, 9))
+            ),
+        ]
+    );
+    assert_eq!(report.usage.elements, 3);
+}
+
+#[test]
+fn a_callable_a_critical_part_or_a_number_needs_is_refused() {
+    // A gauge's condition.
+    let images: String = (0..4)
+        .map(|k| {
+            format!(
+                "{{ id = \"n{k}\", src = \"a\", x = {}, y = 0, w = 8, h = 8 }},",
+                8 * k
+            )
+        })
+        .collect();
+    let d = folder(&[(
+        "s.luaskin",
+        &skin(
+            "",
+            &format!(
+                "skin.image = {{ {images} }}\n\
+                 skin.gauge = {{ id = \"g\", nodes = {{ \"n0\", \"n1\", \"n2\", \"n3\" }}, parts = 10 }}\n\
+                 skin.destination = {{ {{ id = \"g\",\n\
+                   draw = function() return true end,\n\
+                   dst = {{ {{ x = 100, y = 500, w = 100, h = 10 }} }} }} }}"
+            ),
+        ),
+    )]);
+    match import(&d) {
+        Err(ImportError::Critical { at, part, why }) => {
+            assert_eq!(
+                (part, why, at.file.as_str(), at.line),
+                (
+                    CriticalPart::Gauge,
+                    NoteKind::Callable { field: "draw" },
+                    "s.luaskin",
+                    8
+                )
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    // A number's value could be the score.
+    let d = folder(&[(
+        "s.luaskin",
+        &skin(
+            "",
+            "skin.value = { { id = \"v\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, digit = 3,\n\
+               value = function() return 1 end } }\n\
+             skin.destination = { { id = \"v\", dst = { { w = 6, h = 6 } } } }",
+        ),
+    )]);
+    assert_eq!(
+        located(import(&d)),
+        (LuaWhy::Callable { field: "value" }, "s.luaskin".into(), 6)
+    );
+    // A field that takes no function.
+    let d = folder(&[("s.luaskin", &drawn("blend = function() end,"))]);
+    assert_eq!(why(import(&d)), LuaWhy::Callable { field: "blend" });
+    // A module's function is located in that module.
+    let d = folder(&[
+        ("s.luaskin", &drawn("loop = require(\"f\"),")),
+        ("f.lua", "local x = 1\nreturn function() end"),
+    ]);
+    assert_eq!(
+        located(import(&d)),
+        (LuaWhy::Callable { field: "loop" }, "f.lua".into(), 2)
+    );
+}
+
+#[test]
+fn numbers_keep_their_subtype_and_exact_value() {
+    // A whole float is an integer; a fraction is not one for exact
+    // geometry; an integer outside i32 is out of range, not wrapped; a
+    // NaN has no integer.
+    let ok = folder(&[("s.luaskin", &drawn("blend = 2.0, filter = 1,"))]);
+    import(&ok).unwrap();
+    // A digit offset is read exactly.
+    let offsets = |x: &str| {
+        skin(
+            "",
+            &format!(
+                "skin.value = {{ {{ id = \"v\", src = \"a\", w = 60, h = 6, divx = 10, digit = 1,\n\
+                   ref = 110, offset = {{ {{ x = {x} }} }} }} }}\n{DRAW_I}"
+            ),
+        )
+    };
+    import(&folder(&[("s.luaskin", &offsets("2.0"))])).unwrap();
+    let r = import(&folder(&[("s.luaskin", &offsets("1.5"))]));
+    assert!(
+        matches!(r, Err(ImportError::Type { field: "x", .. })),
+        "{r:?}"
+    );
+    for value in ["4294967297", "-2147483649", "0/0", "1/0", "math.mininteger"] {
+        let d = folder(&[("s.luaskin", &drawn(&format!("loop = {value},")))]);
+        let r = import(&d);
+        assert!(
+            matches!(r, Err(ImportError::Range { field: "loop", .. })),
+            "{value}: {r:?}"
+        );
+    }
+    // An integer names a source by its digits; a float names none.
+    let by_int = skin(
+        "",
+        "skin.source = { { id = 7, path = \"a.png\" } }\n\
+         skin.image = { { id = \"i\", src = 7, x = 0, y = 0, w = 64, h = 64 } }\n{DRAW_I}"
+            .replace("{DRAW_I}", DRAW_I)
+            .as_str(),
+    );
+    let r = import(&folder(&[("s.luaskin", &by_int)])).unwrap();
+    assert_eq!(r.imported.report.usage.elements, 1);
+    assert!(
+        r.imported.report.notes.is_empty(),
+        "{:?}",
+        r.imported.report.notes
+    );
+    let by_float = by_int.replace("src = 7,", "src = 7.0,");
+    let r = import(&folder(&[("s.luaskin", &by_float)]));
+    assert!(
+        matches!(r, Err(ImportError::Type { field: "src", .. })),
+        "{r:?}"
+    );
+}
+
+#[test]
+fn tables_are_read_raw_and_their_shape_is_checked() {
+    // Metamethods are never invoked.
+    let guarded = configured(
+        "setmetatable(skin, { __index = function() error(\"index\") end,\n\
+           __pairs = function() error(\"pairs\") end, __len = function() error(\"len\") end })",
+    );
+    import(&guarded).unwrap();
+    for (body, want) in [
+        ("skin.extra = { 1, 2, x = 3 }", LuaWhy::Mixed),
+        ("skin.extra = { 1, nil, 3 }", LuaWhy::Sparse),
+        ("skin.extra = { [0] = 1 }", LuaWhy::Sparse),
+        ("skin.extra = { [1.5] = 1 }", LuaWhy::Key),
+        ("skin.extra = { [true] = 1 }", LuaWhy::Key),
+        ("skin.extra = skin", LuaWhy::Cycle),
+        ("skin.extra = \"\\xff\"", LuaWhy::NotUtf8),
+    ] {
+        assert_eq!(why(import(&configured(body))), want, "{body}");
+    }
+    let d = folder(&[("s.luaskin", "return 1")]);
+    assert_eq!(why(header(&d)), LuaWhy::Returned);
+    // A table reached twice is converted twice; an empty one takes its
+    // place's kind: an empty `dst` is no keys, an empty `mouseRect` an
+    // object (the element is dropped).
+    let shared = folder(&[(
+        "s.luaskin",
+        &skin(
+            "",
+            "local d = { { x = 0, y = 0, w = 64, h = 64 } }\n\
+             skin.destination = { { id = \"i\", dst = d }, { id = \"i\", dst = d }, { id = \"i\", dst = {} } }",
+        ),
+    )]);
+    let r = import(&shared).unwrap();
+    assert_eq!(r.imported.report.usage.elements, 3);
+    let mouse = folder(&[(
+        "s.luaskin",
+        &skin(
+            "",
+            "skin.destination = { { id = \"i\", mouseRect = {}, dst = { { w = 64, h = 64 } } } }",
+        ),
+    )]);
+    let r = import(&mouse).unwrap();
+    assert_eq!(
+        r.imported.report.notes[0].kind,
+        NoteKind::UnsupportedField { field: "mouseRect" }
+    );
+}
+
+#[test]
+fn the_converted_table_takes_the_definition_bounds() {
+    // A few lines that build 8^7 values: refused at the node bound before
+    // they are all kept.
+    let d = configured(
+        "local t = { 1, 2, 3, 4, 5, 6, 7, 8 }\n\
+         for i = 1, 6 do t = { t, t, t, t, t, t, t, t } end\nskin.extra = t",
+    );
+    assert_eq!(input(import(&d)), InputLimit::Nodes);
+    assert!(8_usize.pow(7) + 8_usize.pow(6) > MAX_NODES);
+    let deep = configured("local t = {}\nfor i = 1, 70 do t = { t } end\nskin.extra = t");
+    assert_eq!(input(import(&deep)), InputLimit::Depth);
+    let long = configured("skin.extra = string.rep(\"x\", (64 << 10) + 1)");
+    assert_eq!(input(import(&long)), InputLimit::StringBytes);
+    let many = configured(
+        "local s = string.rep(\"x\", 64 << 10)\nlocal t = {}\n\
+         for i = 1, 520 do t[i] = s end\nskin.extra = t",
+    );
+    assert_eq!(input(import(&many)), InputLimit::DecodedBytes);
+}
+
+#[test]
+fn errors_are_located_in_their_module() {
+    let d = folder(&[
+        ("s.luaskin", "require(\"m\")\nreturn { type = 0 }"),
+        ("m.lua", "\n\nlocal t = nil\nreturn t.x"),
+    ]);
+    assert_eq!(located(header(&d)), (LuaWhy::Error, "m.lua".into(), 4));
+    let d = folder(&[("s.luaskin", "return {\n type = 0,\n w = = 1 }")]);
+    assert_eq!(located(header(&d)), (LuaWhy::Syntax, "s.luaskin".into(), 3));
+    let d = folder(&[("s.luaskin", "\x1bLua")]);
+    assert_eq!(why(header(&d)), LuaWhy::Syntax);
+}

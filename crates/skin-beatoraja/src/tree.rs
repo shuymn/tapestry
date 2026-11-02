@@ -14,7 +14,9 @@ use crate::error::{ImportError, InputLimit, Loc, Syntax};
 pub(crate) const NONE: u32 = u32::MAX;
 
 /// What a node is. `Bare` is an unquoted token: a number, `true`,
-/// `false`, `null` or a string, told apart only when it is read.
+/// `false`, `null` or a string, told apart only when it is read. `Lua` is
+/// a scalar a Lua skin's returned table held, typed as Lua typed it: its
+/// value is [`LuaText::values`] entry `end` ([`crate::lua`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub(crate) enum Kind {
@@ -22,6 +24,7 @@ pub(crate) enum Kind {
     Array,
     Quoted,
     Bare,
+    Lua,
 }
 
 /// The node is an object member: `key_start..key_end` is its name.
@@ -55,10 +58,69 @@ pub(crate) struct Text {
     pub(crate) bytes: Box<[u8]>,
 }
 
-/// The parsed files of one resolution and their nodes.
+/// The parsed files of one resolution and their nodes. A Lua skin's
+/// converted table is file 0, with `lua` set: its nodes come first, so a
+/// node's id is its ordinal, held in its `start`.
 pub(crate) struct Arena {
     pub(crate) nodes: Vec<Node>,
     pub(crate) files: Vec<Text>,
+    pub(crate) lua: Option<Box<LuaText>>,
+}
+
+/// The typed values and provenance of a Lua skin's converted table
+/// (file 0 of its arena): its keys and strings are spans of that file's
+/// bytes, which hold no other text.
+#[derive(Debug, Default)]
+pub(crate) struct LuaText {
+    /// The scalars, by a `Lua` node's `end`.
+    pub(crate) values: Vec<LuaScalar>,
+    /// The Lua files the passes loaded, the entry first: the sources of
+    /// the report and of a callable's location.
+    pub(crate) modules: Vec<String>,
+    /// The functions the table held, each instance once.
+    pub(crate) callables: Vec<Callable>,
+}
+
+/// A Lua scalar, its subtype and exact value kept: an integer as the
+/// `i64` Lua holds, a float as its exact binary value.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum LuaScalar {
+    Int(i64),
+    Float(f64),
+    Bool(bool),
+    /// A string, by its span of the file's bytes.
+    Str {
+        start: u32,
+        end: u32,
+    },
+    /// A function, by its index in [`LuaText::callables`].
+    Callable(u32),
+}
+
+/// A function a Lua skin's table held: where it was defined, and what it
+/// is. It is never run; the importer refuses or freezes the field it
+/// reaches ([`crate::lua`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Callable {
+    /// The module that defined it, an index of [`LuaText::modules`];
+    /// `None` for a host or library function.
+    pub(crate) module: Option<u16>,
+    /// The line its definition starts on, 0 for a host function.
+    pub(crate) line: u32,
+    /// What it is.
+    pub(crate) kind: CallableKind,
+}
+
+/// What a function a Lua skin's table held is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CallableKind {
+    /// A function the skin's Lua defined.
+    Lua,
+    /// A host module's API function, by its index in
+    /// [`crate::lua::HOST_APIS`].
+    Host(u16),
+    /// A library function (`string`, `table`, `math` or a base function).
+    Library,
 }
 
 /// A value as a field reads it, following the pinned reader's typing:
@@ -80,12 +142,22 @@ pub(crate) enum Scalar<'a> {
         raw: &'a str,
         escaped: bool,
     },
+    /// A Lua integer, exactly.
+    Int(i64),
+    /// A Lua float, its exact binary value.
+    Float(f64),
+    /// A Lua function.
+    Callable,
 }
 
 impl Scalar<'_> {
-    /// Whether the pinned reader made this a number node.
+    /// Whether the pinned reader made this a number node, or Lua held a
+    /// number.
     pub(crate) fn is_number(self) -> bool {
-        matches!(self, Self::Long(_) | Self::Double(_))
+        matches!(
+            self,
+            Self::Long(_) | Self::Double(_) | Self::Int(_) | Self::Float(_)
+        )
     }
 }
 
@@ -203,6 +275,62 @@ impl Arena {
         Self {
             nodes: Vec::new(),
             files: Vec::new(),
+            lua: None,
+        }
+    }
+
+    /// The Lua values of `file`, when it is a converted Lua table.
+    fn lua_of(&self, file: u16) -> Option<&LuaText> {
+        self.lua.as_deref().filter(|_| file == 0)
+    }
+
+    /// The Lua scalar of node `n`, when it is one.
+    fn lua_scalar(&self, n: &Node) -> Option<LuaScalar> {
+        if n.kind != Kind::Lua {
+            return None;
+        }
+        self.lua_of(n.file)?.values.get(n.end as usize).copied()
+    }
+
+    /// The location of node `offset` of a converted Lua table, as an index
+    /// of [`Self::sources`], a line and a column: a callable's definition,
+    /// its module and line; any other value, the entry with line 0 and its
+    /// ordinal in the table as the column (a Lua table has no source
+    /// position).
+    pub(crate) fn lua_loc(&self, file: u16, offset: u32) -> Option<(u16, u32, u32)> {
+        let lua = self.lua_of(file)?;
+        let n = self.nodes.get(offset as usize)?;
+        if let Some(LuaScalar::Callable(i)) = self.lua_scalar(n)
+            && let Some(c) = lua.callables.get(i as usize)
+            && let Some(module) = c.module
+        {
+            return Some((module, c.line, 0));
+        }
+        Some((0, 0, offset.saturating_add(1)))
+    }
+
+    /// The names of the sources locations index: the files, or for a Lua
+    /// skin its modules and then the JSON files its table includes.
+    pub(crate) fn sources(&self) -> Vec<String> {
+        match &self.lua {
+            Some(lua) => lua
+                .modules
+                .iter()
+                .cloned()
+                .chain(self.files.iter().skip(1).map(|f| f.name.clone()))
+                .collect(),
+            None => self.files.iter().map(|f| f.name.clone()).collect(),
+        }
+    }
+
+    /// The index in [`Self::sources`] of file `file`, a JSON file.
+    pub(crate) fn source_of(&self, file: u16) -> u16 {
+        match &self.lua {
+            Some(lua) if file > 0 => {
+                let shift = u16::try_from(lua.modules.len()).unwrap_or(u16::MAX);
+                file.saturating_add(shift).saturating_sub(1)
+            }
+            _ => file,
         }
     }
 
@@ -214,14 +342,22 @@ impl Arena {
         &self.files[usize::from(node.file)].bytes
     }
 
-    /// The node's text as written: a string's content, a token.
+    /// The node's text as written: a string's content, a token; a Lua
+    /// string's bytes and a Lua boolean's word. A Lua number or function
+    /// has no text: it is read by its value ([`Self::scalar`]).
     pub(crate) fn raw(&self, id: u32) -> &str {
         let n = self.node(id);
-        text(self.bytes(n), n.start, n.end)
+        match self.lua_scalar(n) {
+            Some(LuaScalar::Str { start, end }) => text(self.bytes(n), start, end),
+            Some(LuaScalar::Bool(true)) => "true",
+            Some(LuaScalar::Bool(false)) => "false",
+            Some(_) => "",
+            None => text(self.bytes(n), n.start, n.end),
+        }
     }
 
     /// The member name's characters, decoded.
-    fn key(&self, id: u32) -> Option<Unescape<'_>> {
+    pub(crate) fn key(&self, id: u32) -> Option<Unescape<'_>> {
         let n = self.node(id);
         (n.flags & KEYED != 0).then(|| {
             Unescape::new(
@@ -274,6 +410,17 @@ impl Arena {
                 raw: self.raw(id),
                 escaped,
             },
+            Kind::Lua => match self.lua_scalar(&n) {
+                Some(LuaScalar::Int(v)) => Scalar::Int(v),
+                Some(LuaScalar::Float(v)) => Scalar::Float(v),
+                Some(LuaScalar::Bool(b)) => Scalar::Bool(b),
+                Some(LuaScalar::Str { .. }) => Scalar::Str {
+                    raw: self.raw(id),
+                    escaped: false,
+                },
+                Some(LuaScalar::Callable(_)) => Scalar::Callable,
+                None => Scalar::Null,
+            },
             Kind::Bare => {
                 let raw = self.raw(id);
                 // `true`, `false` and `null` are compared after unescaping
@@ -319,6 +466,17 @@ impl Arena {
     pub(crate) fn loc_at(&self, file: u16, offset: u32) -> Loc {
         #[cfg(test)]
         RESCANS.with(|n| n.set(n.get() + 1));
+        if let Some((module, line, col)) = self.lua_loc(file, offset) {
+            let modules = self.lua.as_deref().map_or(&[][..], |l| &l.modules[..]);
+            return Loc {
+                file: modules
+                    .get(usize::from(module))
+                    .cloned()
+                    .unwrap_or_default(),
+                line,
+                col,
+            };
+        }
         let t = &self.files[usize::from(file)];
         let before = t.bytes.get(..offset as usize).unwrap_or(&t.bytes);
         let line_start = before

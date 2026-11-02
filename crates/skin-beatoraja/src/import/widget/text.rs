@@ -90,6 +90,7 @@ impl Cx<'_> {
         // The effective string (`JsonSkinObjectLoader.java:633-636`,
         // `SkinText.java:102`).
         let resolved = match self.prop(value, "value")? {
+            Prop::Callable(node) => return self.callable(role, node, "value"),
             Prop::Id(n) => property::str_by_id(n),
             Prop::Name(s) => property::str_by_name(&s).unwrap_or(StrProp::Unsupported(None)),
             Prop::Null => StrProp::Null,

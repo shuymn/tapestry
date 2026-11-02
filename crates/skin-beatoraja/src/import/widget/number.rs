@@ -88,6 +88,11 @@ impl Cx<'_> {
             ],
         );
         let value = self.prop(value, "value")?;
+        // What a function shows is unknown: it could be a play-critical
+        // number.
+        if let Prop::Callable(node) = value {
+            return Err(self.def.callable_error(node, "value"));
+        }
         let r = self.int_or(r, "ref", 0)?;
         let shown = match self.int_prop(&value, r) {
             IntProp::Null => {

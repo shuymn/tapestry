@@ -388,6 +388,7 @@ pub(crate) fn value_prop(value: &super::Prop) -> IntProp {
     match value {
         super::Prop::Id(n) => int_by_id(*n),
         super::Prop::Name(s) => int_by_name(s).unwrap_or(IntProp::Unsupported(None)),
+        super::Prop::Callable(_) => IntProp::Unsupported(None),
         super::Prop::Null => IntProp::Null,
     }
 }

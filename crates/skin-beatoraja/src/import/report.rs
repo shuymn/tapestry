@@ -285,6 +285,12 @@ pub enum NoteKind {
         lane: u8,
         paint: NoteFallback,
     },
+    /// A Lua skin's function in `field`, which is not run: a play-critical
+    /// element refuses the import with it; a decorative element is frozen
+    /// as never drawn, its condition false or its timer off.
+    Callable {
+        field: &'static str,
+    },
 }
 
 impl fmt::Display for NoteKind {
@@ -312,6 +318,9 @@ impl fmt::Display for NoteKind {
             Self::BitmapFont(e) => write!(f, "a bitmap font refused ({e})"),
             Self::Ignored { field } => write!(f, "`{field}` ignored"),
             Self::NotePart { field, why } => write!(f, "note part `{field}`: {why}"),
+            Self::Callable { field } => {
+                write!(f, "an unsupported function in `{field}`, frozen")
+            }
             Self::NotePartFallback { field, lane, paint } => {
                 write!(
                     f,
@@ -457,6 +466,13 @@ pub(crate) fn locate(arena: &Arena, notes: &[(Option<Span>, Severity, NoteKind)]
     let mut locs: Vec<Option<NoteLoc>> = vec![None; notes.len()];
     let mut cursor: Option<(u16, usize, u32, u32)> = None;
     for (span, i) in order {
+        // A converted Lua table's values are located by their provenance.
+        if let Some((source, line, col)) = arena.lua_loc(span.file, span.offset) {
+            if let Some(slot) = usize::try_from(i).ok().and_then(|i| locs.get_mut(i)) {
+                *slot = Some(NoteLoc { source, line, col });
+            }
+            continue;
+        }
         let Some(text) = arena.files.get(usize::from(span.file)) else {
             continue;
         };
@@ -486,7 +502,7 @@ pub(crate) fn locate(arena: &Arena, notes: &[(Option<Span>, Severity, NoteKind)]
         cursor = Some((span.file, pos, line, col));
         if let Some(slot) = usize::try_from(i).ok().and_then(|i| locs.get_mut(i)) {
             *slot = Some(NoteLoc {
-                source: span.file,
+                source: arena.source_of(span.file),
                 line,
                 col,
             });

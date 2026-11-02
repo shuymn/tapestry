@@ -5,6 +5,7 @@ use std::fmt;
 use skin_model::{CompileError, ImageError, LoadError, RootError};
 
 use crate::import::{CriticalPart, ImportLimit, NoteKind};
+use crate::lua::LuaWhy;
 
 use crate::limits::{
     MAX_DEPTH, MAX_EXPANDED, MAX_FILE_BYTES, MAX_FILE_CHOICES, MAX_INCLUDE_DEPTH,
@@ -209,6 +210,13 @@ pub enum ImportError {
         at: Option<Loc>,
         source: LoadError,
     },
+    /// A Lua skin's sandbox, loaders or conversion refused it
+    /// ([`crate::lua`]); `at` is where its Lua ran, or the converted value
+    /// (line 0, the value's ordinal as the column), when known.
+    Lua {
+        at: Option<Loc>,
+        why: LuaWhy,
+    },
 }
 
 /// `"<loc>: "`, or nothing.
@@ -257,6 +265,7 @@ impl fmt::Display for ImportError {
             Self::Expr { at, .. } => write!(f, "{at}: an imported expression"),
             Self::Asset { at, .. } => write!(f, "{at}: a play-critical image"),
             Self::Model { at, .. } => write!(f, "{}the skin model refused the skin", At(at)),
+            Self::Lua { at, why } => write!(f, "{}{why}", At(at)),
         }
     }
 }

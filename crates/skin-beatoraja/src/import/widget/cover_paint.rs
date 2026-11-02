@@ -288,6 +288,9 @@ impl Cx<'_> {
         if let Some(f) = changeable {
             self.def.bool(f, "changeable")?;
         }
+        if let Prop::Callable(node) = value {
+            return self.callable(Role::Decorative, node, "value");
+        }
         let field = |field| NoteKind::UnsupportedField { field };
         let why = if value != Prop::Null {
             Some(field("value"))
