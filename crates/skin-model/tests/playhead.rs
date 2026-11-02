@@ -6,9 +6,11 @@
 
 mod play_support;
 
-use bms_model::{BEAT, Chart, NoteKind, Position, PresentationError, TimeUs};
-use play_support::{Harness, full};
-use skin_model::ExactPlayhead;
+use bms_model::{
+    BEAT, Chart, ChartBuilder, DOMAIN, NoteKind, Position, PresentationError, TimeUs, TimelineId,
+};
+use play_support::{Harness, full, lane, load};
+use skin_model::{ExactPlayhead, PrepareError};
 
 fn loaded(text: &str) -> Chart {
     let dir = tempfile::tempdir().unwrap();
@@ -150,7 +152,9 @@ fn a_section_sets_precedence_and_never_admits_a_refused_chart() {
         assert!(
             matches!(
                 ExactPlayhead::prepare(&conflict, section),
-                Err(PresentationError::EndpointConflict { .. })
+                Err(PrepareError::Presentation(
+                    PresentationError::EndpointConflict { .. }
+                ))
             ),
             "{section:?}"
         );
@@ -205,6 +209,33 @@ fn interpolation_is_exact_and_extrapolation_takes_the_map_rates() {
     // Clamped to the domain, saturating rather than wrapping.
     assert!(p.position_at(TimeUs(i64::MAX)) >= p.position_at(TimeUs(2_000_000)));
     assert!(p.position_at(TimeUs(i64::MIN)) <= p.position_at(TimeUs(-1_000)));
+}
+
+#[test]
+fn rows_past_the_domain_are_refused_before_preparing() {
+    // A chart built in code may hold a time past the scroll map's domain,
+    // where a query is clamped: the playhead could not meet it there, so
+    // preparation refuses it, through the skin too. At the domain's end
+    // the note is met.
+    let past = ChartBuilder::new(150_000)
+        .tap(lane(1), TimeUs(1_000))
+        .tap(lane(2), TimeUs(DOMAIN + 1))
+        .build()
+        .unwrap();
+    let refused = PrepareError::TimeOutOfDomain {
+        row: TimelineId(2),
+        at: TimeUs(DOMAIN + 1),
+    };
+    assert_eq!(ExactPlayhead::prepare(&past, None), Err(refused));
+    let skin = load(Vec::new(), Vec::new()).unwrap();
+    assert_eq!(skin.prepare(&past, &full(0)).err(), Some(refused));
+    let edge = ChartBuilder::new(150_000)
+        .tap(lane(2), TimeUs(DOMAIN))
+        .build()
+        .unwrap();
+    let p = ExactPlayhead::prepare(&edge, None).unwrap();
+    let n = edge.lanes[2][0];
+    assert_eq!(p.position_at(n.time), n.pos);
 }
 
 #[test]

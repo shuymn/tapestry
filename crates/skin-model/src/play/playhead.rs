@@ -26,10 +26,11 @@
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
 use bms_model::{
-    Chart, ChartTimeline, DOMAIN, LANE_COUNT, Note, NoteKind, Position, PresentationError, TimeUs,
-    TimelineId, TimelinePoint,
+    Chart, ChartTimeline, DOMAIN, LANE_COUNT, Note, NoteKind, Position, TimeUs, TimelineId,
+    TimelinePoint,
 };
 
+use super::PrepareError;
 use super::reducer::is_target;
 
 /// The prepared playhead of one attempt: the chart's shared timeline, one
@@ -60,21 +61,34 @@ impl ExactPlayhead {
     /// end, or the whole chart): the endpoints whose notes the attempt
     /// targets choose their µs's position. The chart's presentation is
     /// checked whole first, whatever the section, so a section never
-    /// admits a chart the whole would refuse. Two passes over the rows:
-    /// one counts the stored µs, the other fills that many
+    /// admits a chart the whole would refuse, and every row must lie in
+    /// the scroll map's domain, where queries are clamped. Two passes over
+    /// the rows: one counts the stored µs, the other fills that many
     /// representatives, walking the eight lanes' endpoints beside the rows
     /// with a cursor each.
     ///
     /// # Errors
     ///
-    /// The chart's [`PresentationError`] (`Chart::validate_presentation`).
-    pub fn prepare(
-        chart: &Chart,
-        section: Option<(TimeUs, TimeUs)>,
-    ) -> Result<Self, PresentationError> {
-        chart.validate_presentation()?;
+    /// [`PrepareError::Presentation`] with the chart's reason
+    /// (`Chart::validate_presentation`), and
+    /// [`PrepareError::TimeOutOfDomain`] for the first row past the
+    /// domain (`±DOMAIN` µs), which a chart built in code may hold and a
+    /// loaded one never does; both before anything is allocated.
+    pub fn prepare(chart: &Chart, section: Option<(TimeUs, TimeUs)>) -> Result<Self, PrepareError> {
+        chart
+            .validate_presentation()
+            .map_err(PrepareError::Presentation)?;
         let timeline = chart.timeline.clone();
         let points = timeline.points();
+        // Rows start at 0 and never decrease, so the first past the domain
+        // is the first past its end.
+        let inside = points.partition_point(|p| p.at.0 <= DOMAIN);
+        if let Some(p) = points.get(inside) {
+            return Err(PrepareError::TimeOutOfDomain {
+                row: row_id(inside),
+                at: p.at,
+            });
+        }
         let buckets = points.chunk_by(|a, b| a.at == b.at);
         let mut reps = Vec::with_capacity(buckets.clone().count());
         let mut cursors = [Cursor::default(); LANE_COUNT];
@@ -83,15 +97,15 @@ impl ExactPlayhead {
             let last = first + bucket.len() - 1;
             let mut chosen: Option<usize> = None;
             for (notes, cursor) in chart.lanes.iter().zip(&mut cursors) {
-                // Endpoints before this bucket belong to earlier ones.
+                // A lane's endpoints never decrease in identity (the links
+                // are checked), and earlier buckets consumed every one up
+                // to their last row, so each endpoint met here is in this
+                // bucket.
                 while let Some((id, note)) = endpoint(notes, *cursor) {
                     if id > last {
                         break;
                     }
-                    if id >= first
-                        && is_target(section, note.time, note.end())
-                        && chosen.is_none_or(|c| id < c)
-                    {
+                    if is_target(section, note.time, note.end()) && chosen.is_none_or(|c| id < c) {
                         chosen = Some(id);
                     }
                     *cursor = advance(note, *cursor);
@@ -186,9 +200,9 @@ const EMPTY: TimelinePoint = TimelinePoint {
 
 /// The position at `t` between `a` and `b`, `a.at <= t < b.at`.
 fn interpolate(a: TimelinePoint, b: TimelinePoint, t: i64) -> Position {
-    // Times are within ±2^32 and increase strictly between
-    // representatives; positions never decrease, and differ by less than
-    // 2^127.
+    // Times are within [0, 2^32] (preparation refuses rows past the
+    // domain) and increase strictly between representatives; positions
+    // never decrease, and differ by less than 2^127.
     let d = u128::from(b.at.0.abs_diff(a.at.0));
     let e = u128::from(t.abs_diff(a.at.0));
     let delta = b.pos.0.abs_diff(a.pos.0);
@@ -196,7 +210,7 @@ fn interpolate(a: TimelinePoint, b: TimelinePoint, t: i64) -> Position {
         return a.pos;
     };
     let r = delta % d;
-    // q·e ≤ Δ, and r·e < d² ≤ 2^66.
+    // q·e ≤ Δ, and r·e < d² ≤ 2^64.
     let inc = q.saturating_mul(e).saturating_add(r.saturating_mul(e) / d);
     Position(
         a.pos

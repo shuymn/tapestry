@@ -10,7 +10,9 @@ pub(crate) mod reducer;
 pub(crate) mod schema;
 pub(crate) mod timers;
 
-use bms_model::{Chart, LANE_COUNT, Lane, LnMode, Note, Position, PresentationError, TimeUs};
+use bms_model::{
+    Chart, LANE_COUNT, Lane, LnMode, Note, Position, PresentationError, TimeUs, TimelineId,
+};
 use eval::{GaugeState, JudgeEvent, Section, Tally};
 use rules::GaugeValue;
 
@@ -212,6 +214,16 @@ pub enum PrepareError {
     /// ([`Chart::validate_presentation`]). An admitted chart never is.
     #[error("the chart cannot be presented: {0}")]
     Presentation(PresentationError),
+    /// A timeline row lies past the scroll map's domain (`±DOMAIN` µs),
+    /// where the playhead cannot follow it: a chart built in code with
+    /// such a time; the loader refuses one.
+    #[error("timeline row {} at {} µs is outside the playhead's range", .row.0, .at.0)]
+    TimeOutOfDomain {
+        /// The first row past the domain.
+        row: TimelineId,
+        /// Its time.
+        at: TimeUs,
+    },
 }
 
 /// Why [`Skin::build`](crate::Skin::build) refused a frame. The frame's
@@ -358,7 +370,7 @@ impl Play {
             return Err(PrepareError::InvalidBpmRange);
         }
         let bounds = section.map(|s| (s.start, s.end));
-        let playhead = ExactPlayhead::prepare(chart, bounds).map_err(PrepareError::Presentation)?;
+        let playhead = ExactPlayhead::prepare(chart, bounds)?;
         let readout_end = section.map_or_else(|| last_object(chart), |s| s.end);
         let initial = ctx.gauges.iter().enumerate().map(|(i, g)| {
             let value = section
