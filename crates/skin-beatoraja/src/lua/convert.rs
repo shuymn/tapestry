@@ -98,6 +98,73 @@ fn empty_is_array(key: Option<&[u8]>, parent: Option<&[u8]>, depth: u32) -> bool
     }
 }
 
+/// The fields a callable's location names; any other is `other`. The
+/// format's own field names, never a skin's.
+pub(crate) const FIELDS: [&str; 24] = [
+    "draw",
+    "value",
+    "timer",
+    "op",
+    "act",
+    "event",
+    "ref",
+    "text",
+    "id",
+    "src",
+    "x",
+    "y",
+    "w",
+    "h",
+    "a",
+    "r",
+    "g",
+    "b",
+    "angle",
+    "loop",
+    "blend",
+    "isRefNum",
+    "mouseRect",
+    "customTimers",
+];
+
+/// The functions a converted table holds, in conversion order: each
+/// node, the field holding it ([`FIELDS`]), and what it is.
+pub(crate) fn callables(
+    arena: &Arena,
+) -> impl Iterator<Item = (u32, &'static str, CallableKind)> + '_ {
+    let lua = arena.lua.as_deref();
+    (0_u32..).zip(&arena.nodes).filter_map(move |(id, n)| {
+        let lua = lua?;
+        if n.kind != Kind::Lua {
+            return None;
+        }
+        let LuaScalar::Callable(i) = *lua.values.get(n.end as usize)? else {
+            return None;
+        };
+        let kind = lua.callables.get(i as usize)?.kind;
+        let key: String = arena.key(id).map(Iterator::collect).unwrap_or_default();
+        let field = FIELDS
+            .iter()
+            .find(|f| **f == key)
+            .copied()
+            .unwrap_or("other");
+        Some((id, field, kind))
+    })
+}
+
+/// Refuses a converted table that holds a function, at the first one's
+/// definition: until per-frame functions are analysed (S7-03), no
+/// function is accepted, frozen or given a fallback, wherever it is.
+pub(crate) fn refuse_callables(arena: &Arena) -> Result<(), ImportError> {
+    match callables(arena).next() {
+        Some((id, field, _)) => Err(ImportError::Lua {
+            at: Some(arena.loc(id)),
+            why: LuaWhy::Callable { field },
+        }),
+        None => Ok(()),
+    }
+}
+
 /// Converts `value`, what the entry of `entry` returned, with `modules`
 /// the files the pass loaded (the entry first).
 pub(super) fn convert(
@@ -131,6 +198,8 @@ pub(super) fn convert(
         decoded: 0,
     };
     let top = c.table(&t, None, None, 1)?;
+    #[cfg(test)]
+    super::tests::converted_witness();
     let Conv {
         nodes,
         bytes,

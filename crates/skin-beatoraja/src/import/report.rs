@@ -285,12 +285,6 @@ pub enum NoteKind {
         lane: u8,
         paint: NoteFallback,
     },
-    /// A Lua skin's function in `field`, which is not run: a play-critical
-    /// element refuses the import with it; a decorative element is frozen
-    /// as never drawn, its condition false or its timer off.
-    Callable {
-        field: &'static str,
-    },
 }
 
 impl fmt::Display for NoteKind {
@@ -318,9 +312,6 @@ impl fmt::Display for NoteKind {
             Self::BitmapFont(e) => write!(f, "a bitmap font refused ({e})"),
             Self::Ignored { field } => write!(f, "`{field}` ignored"),
             Self::NotePart { field, why } => write!(f, "note part `{field}`: {why}"),
-            Self::Callable { field } => {
-                write!(f, "an unsupported function in `{field}`, frozen")
-            }
             Self::NotePartFallback { field, lane, paint } => {
                 write!(
                     f,

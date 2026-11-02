@@ -198,9 +198,6 @@ enum Prop {
     Null,
     Id(i32),
     Name(String),
-    /// A Lua skin's function, by its node: never run, it is refused or
-    /// frozen where it is consumed ([`crate::lua`]).
-    Callable(u32),
 }
 
 /// A destination option (`JsonSkinSerializer.java:115-131`).
@@ -208,8 +205,6 @@ enum Prop {
 enum Op {
     Id(i32),
     Name(String),
-    /// A Lua skin's function, by its node.
-    Callable(u32),
 }
 
 /// How [`Cx::common_with`] reads a destination.
@@ -425,14 +420,6 @@ impl<'d> Cx<'d> {
         self.note(Some(at), Severity::Ignored, kind);
     }
 
-    /// A Lua skin's function at node `node` reaching `field` of an element
-    /// of `role`: a critical element refuses the import at the function's
-    /// definition; a decorative one is frozen as never drawn, noted there.
-    fn callable(&mut self, role: Role, node: u32, field: &'static str) -> Result<(), ImportError> {
-        let at = self.arena_span(node);
-        self.drop_el(role, at, NoteKind::Callable { field })
-    }
-
     fn drop_el(&mut self, role: Role, at: Span, why: NoteKind) -> Result<(), ImportError> {
         let r = policy::unsupported(&self.def.arena, role, at, why, &mut self.notes);
         self.budget.usage.notes = u32::try_from(self.notes.list.len()).unwrap_or(u32::MAX);
@@ -529,10 +516,6 @@ impl<'d> Cx<'d> {
             };
             let target = match self.prop(t, "timer")? {
                 Prop::Id(n) if n >= 0 => Some(n),
-                Prop::Callable(node) => {
-                    self.custom.scripted.insert(id, node);
-                    None
-                }
                 _ => None,
             };
             if id <= timer::BUILTIN_MAX {
@@ -555,7 +538,7 @@ impl<'d> Cx<'d> {
                 Prop::Id(self.def.int(f, name)?)
             }
             Scalar::Str { .. } => self.def.string(f, name)?.map_or(Prop::Null, Prop::Name),
-            Scalar::Callable => Prop::Callable(f),
+            Scalar::Callable => return Err(self.def.callable_error(f, name)),
             Scalar::Null | Scalar::Bool(_) | Scalar::Object | Scalar::Array => Prop::Null,
         })
     }
@@ -667,7 +650,6 @@ impl<'d> Cx<'d> {
                 match self.prop(Some(item), "op")? {
                     Prop::Id(n) => ops.push(Op::Id(n)),
                     Prop::Name(s) => ops.push(Op::Name(s)),
-                    Prop::Callable(node) => ops.push(Op::Callable(node)),
                     Prop::Null => {}
                 }
             }
@@ -692,6 +674,7 @@ impl<'d> Cx<'d> {
     /// One destination, in source order.
     fn destination(&mut self, index: usize, rec: u32) -> Result<(), ImportError> {
         let at = self.arena_span(rec);
+        self.def.cancelled(|| Some(self.loc(at)))?;
         self.budget.element().map_err(|l| self.limit(at, l))?;
         #[cfg(test)]
         trace(Event::Charge);
@@ -872,10 +855,6 @@ impl<'d> Cx<'d> {
                     }
                     ops::numeric(*n, &self.items, self.custom.judge_region)
                 }
-                Op::Callable(node) => {
-                    self.callable(role, *node, "op")?;
-                    return Ok(None);
-                }
                 Op::Name(s) => match ops::named(s, self.custom.judge_region) {
                     Some(c) => c,
                     None => {
@@ -894,10 +873,6 @@ impl<'d> Cx<'d> {
         }
         match &dst.draw {
             Prop::Null => {}
-            Prop::Callable(node) => {
-                self.callable(role, *node, "draw")?;
-                return Ok(None);
-            }
             Prop::Id(n) => {
                 if ops::is_builtin(i32::try_from(n.unsigned_abs()).unwrap_or(0)) {
                     let c = ops::numeric(*n, &BTreeMap::new(), self.custom.judge_region);
@@ -929,15 +904,6 @@ impl<'d> Cx<'d> {
             Prop::Id(n) if n < 0 => (TimerRef::Builtin(slot::SCREEN), true),
             Prop::Name(_) => {
                 self.drop_el(role, at, NoteKind::Timer(TimerWhy::Script))?;
-                return Ok(None);
-            }
-            Prop::Callable(node) => {
-                self.callable(role, node, "timer")?;
-                return Ok(None);
-            }
-            Prop::Id(n) if self.custom.scripted.contains_key(&n) => {
-                let node = self.custom.scripted.get(&n).copied().unwrap_or_default();
-                self.callable(role, node, "customTimers")?;
                 return Ok(None);
             }
             Prop::Id(n) => match self.custom.resolve(n) {
@@ -1230,12 +1196,6 @@ impl<'d> Cx<'d> {
             Prop::Null => (TimerRef::Builtin(slot::SCREEN), false),
             Prop::Id(n) if n < 0 => (TimerRef::Builtin(slot::SCREEN), false),
             Prop::Name(_) => return Ok(Err(NoteKind::Timer(TimerWhy::Script))),
-            Prop::Callable(_) => return Ok(Err(NoteKind::Callable { field: "timer" })),
-            Prop::Id(n) if self.custom.scripted.contains_key(&n) => {
-                return Ok(Err(NoteKind::Callable {
-                    field: "customTimers",
-                }));
-            }
             Prop::Id(n) => match self.custom.resolve(n) {
                 Timer::Unset => {
                     self.ignored(at, NoteKind::Timer(TimerWhy::Unset(n)));

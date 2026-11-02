@@ -16,12 +16,14 @@
 //! pass's state.
 //!
 //! A function the returned table holds is a typed callable, never run:
-//! until per-frame functions are converted, a callable that reaches a
-//! play-critical element, a number's value (which may show the score) or
-//! a field that takes no script refuses the import at the function's
-//! definition; one that reaches a decorative element's condition, timer
-//! or value freezes it as never drawn (a false condition, an off timer),
-//! with a note.
+//! until per-frame functions are analysed (S7-03), any function anywhere
+//! in a returned table refuses the candidate at its definition, after the
+//! developer report has counted them ([`convert::callables`]).
+//!
+//! What the common reader reads of the JSON files a table includes is
+//! charged to the candidate as the passes are: its bytes count toward the
+//! same allowance in both passes, its files join the dependencies, and it
+//! sees the cancellation request.
 //!
 //! Every failure is owned and crosses threads: the results and errors
 //! hold no Lua handle.
@@ -442,25 +444,31 @@ fn run_pass(pass: &Rc<Pass>, entry: &str) -> Result<Converted, ImportError> {
     }
 }
 
-/// Runs the header pass of the Lua skin `entry`, a name relative to the
-/// skin folder `root`, and reads its header as a JSON definition's.
-///
-/// # Errors
-///
-/// The folder cannot be read; the sandbox, a loader or the conversion
-/// refuses ([`ImportError::Lua`], [`ImportError::Read`],
-/// [`ImportError::Input`]); or the header refuses as a definition's does.
-pub fn read_lua_header(
-    root: &Path,
-    entry: &str,
-    cancel: &Cancel,
-) -> Result<LuaHeader, ImportError> {
-    let root = Root::new(root).map_err(|source| ImportError::Read {
-        at: None,
-        name: root.display().to_string(),
-        source,
-    })?;
-    let (r, store, counts) = pass(
+/// A stage's result at the candidate boundary with what the candidate
+/// used and consulted so far, kept whether or not it succeeded.
+pub(crate) struct Outcome<T> {
+    pub(crate) result: Result<T, ImportError>,
+    pub(crate) counts: Counts,
+    pub(crate) dependencies: Vec<String>,
+}
+
+/// The header pass, with its metadata.
+pub(crate) fn header_pass(root: &Path, entry: &str, cancel: &Cancel) -> Outcome<LuaHeader> {
+    let root = match Root::new(root) {
+        Ok(root) => root,
+        Err(source) => {
+            return Outcome {
+                result: Err(ImportError::Read {
+                    at: None,
+                    name: root.display().to_string(),
+                    source,
+                }),
+                counts: Counts::default(),
+                dependencies: Vec::new(),
+            };
+        }
+    };
+    let (r, mut store, mut counts) = pass(
         &root,
         entry,
         Store::default(),
@@ -468,20 +476,64 @@ pub fn read_lua_header(
         cancel,
         None,
     );
-    let converted = r?;
-    let mut def = definition(&root, converted, counts);
-    let header = resolve(&mut def, &std::collections::BTreeSet::new())?.header()?;
-    Ok(LuaHeader {
-        root,
-        entry: entry.to_owned(),
-        header,
-        store,
+    let result = r.and_then(|converted| {
+        convert::refuse_callables(&converted.arena)?;
+        let mut def = definition(&root, converted, counts, cancel);
+        let header =
+            resolve(&mut def, &std::collections::BTreeSet::new()).and_then(|mut r| r.header());
+        common_reads(&def, &mut counts, &mut store);
+        header
+    });
+    let dependencies = store.dependencies.clone();
+    Outcome {
+        result: result.map(|header| LuaHeader {
+            root,
+            entry: entry.to_owned(),
+            header,
+            store,
+            counts,
+        }),
         counts,
-    })
+        dependencies,
+    }
 }
 
-fn definition(root: &Root, c: Converted, counts: Counts) -> Definition {
-    Definition::from_lua(root.clone(), c.entry, c.arena, c.top, counts.input_bytes)
+/// Runs the header pass of the Lua skin `entry`, a name relative to the
+/// skin folder `root`, and reads its header as a JSON definition's.
+///
+/// # Errors
+///
+/// The folder cannot be read; the sandbox, a loader or the conversion
+/// refuses ([`ImportError::Lua`], [`ImportError::Read`],
+/// [`ImportError::Input`]), a function is in the returned table
+/// ([`LuaWhy::Callable`]); or the header refuses as a definition's does.
+pub fn read_lua_header(
+    root: &Path,
+    entry: &str,
+    cancel: &Cancel,
+) -> Result<LuaHeader, ImportError> {
+    header_pass(root, entry, cancel).result
+}
+
+fn definition(root: &Root, c: Converted, counts: Counts, cancel: &Cancel) -> Definition {
+    Definition::from_lua(
+        root.clone(),
+        c.entry,
+        c.arena,
+        c.top,
+        counts.input_bytes,
+        cancel.clone(),
+    )
+}
+
+/// Carries what the common reader read of `def`'s includes into the
+/// candidate: their bytes, which the next pass starts from, and their
+/// names among the dependencies.
+fn common_reads(def: &Definition, counts: &mut Counts, store: &mut Store) {
+    counts.input_bytes = counts.input_bytes.max(def.input_bytes());
+    for name in def.included() {
+        store.depend(name);
+    }
 }
 
 impl LuaHeader {
@@ -511,12 +563,11 @@ impl LuaHeader {
     /// What [`read_lua_header`] refuses, and what [`crate::import`]
     /// refuses of the converted definition.
     pub fn import(&self, config: &Config, cancel: &Cancel) -> Result<LuaImported, ImportError> {
-        let (mut def, counts, dependencies) = self.configured(config, cancel)?;
-        let imported = import(&mut def, &self.header, config)?;
-        Ok(LuaImported {
+        let o = self.complete(config, cancel);
+        o.result.map(|imported| LuaImported {
             imported,
-            dependencies,
-            usage: counts,
+            dependencies: o.dependencies,
+            usage: o.counts,
         })
     }
 
@@ -528,7 +579,8 @@ impl LuaHeader {
     /// What [`Self::import`] refuses.
     #[cfg(feature = "dev-tools")]
     pub fn timed(&self, config: &Config, cancel: &Cancel) -> Result<Timings, ImportError> {
-        let (mut def, _, _) = self.configured(config, cancel)?;
+        let mut def = self.configured(config, cancel).0?;
+        convert::refuse_callables(&def.arena)?;
         let mut t = LAST_TIMINGS.with(Cell::get);
         let start = std::time::Instant::now();
         std::hint::black_box(import(&mut def, &self.header, config)?);
@@ -536,13 +588,31 @@ impl LuaHeader {
         Ok(t)
     }
 
+    /// The configured pass and the common import, with the candidate's
+    /// metadata kept on every outcome.
+    pub(crate) fn complete(&self, config: &Config, cancel: &Cancel) -> Outcome<Imported> {
+        let (def, mut counts, mut store) = self.configured(config, cancel);
+        let result = def.and_then(|mut def| {
+            let r = convert::refuse_callables(&def.arena)
+                .and_then(|()| import(&mut def, &self.header, config));
+            common_reads(&def, &mut counts, &mut store);
+            r
+        });
+        Outcome {
+            result,
+            counts,
+            dependencies: store.dependencies,
+        }
+    }
+
     /// The configured pass: the converted definition, the candidate's
-    /// usage and its dependencies.
-    fn configured(
+    /// usage and its sources; on failure, the error with the usage and
+    /// sources so far.
+    pub(crate) fn configured(
         &self,
         config: &Config,
         cancel: &Cancel,
-    ) -> Result<(Definition, Counts, Vec<String>), ImportError> {
+    ) -> (Result<Definition, ImportError>, Counts, Store) {
         let bridge = Bridge::new(&self.header, config);
         let (r, store, counts) = pass(
             &self.root,
@@ -552,17 +622,7 @@ impl LuaHeader {
             cancel,
             Some(bridge),
         );
-        let converted = r?;
-        if cancel.is_cancelled() {
-            return Err(ImportError::Lua {
-                at: None,
-                why: LuaWhy::Cancelled,
-            });
-        }
-        Ok((
-            definition(&self.root, converted, counts),
-            counts,
-            store.dependencies,
-        ))
+        let def = r.map(|converted| definition(&self.root, converted, counts, cancel));
+        (def, counts, store)
     }
 }

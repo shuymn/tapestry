@@ -7,38 +7,13 @@
 
 use std::collections::BTreeMap;
 
-use super::{Cancel, HOST_APIS, LuaHeader, LuaUsage, LuaWhy};
-use crate::error::{ImportError, Loc};
-use crate::import::{Config, NoteKind, import};
-use crate::tree::{CallableKind, Kind, LuaScalar};
+use std::path::Path;
 
-/// The fields whose names the report prints; any other is `other`.
-const FIELDS: [&str; 24] = [
-    "draw",
-    "value",
-    "timer",
-    "op",
-    "act",
-    "event",
-    "ref",
-    "text",
-    "id",
-    "src",
-    "x",
-    "y",
-    "w",
-    "h",
-    "a",
-    "r",
-    "g",
-    "b",
-    "angle",
-    "loop",
-    "blend",
-    "isRefNum",
-    "mouseRect",
-    "customTimers",
-];
+use super::convert::callables;
+use super::{Cancel, HOST_APIS, LuaUsage, LuaWhy, header_pass};
+use crate::error::{ImportError, Loc};
+use crate::import::{Config, NoteKind};
+use crate::tree::CallableKind;
 
 /// One import's outcome under allowlisted labels.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -46,8 +21,10 @@ pub struct Survey {
     /// `imported`, or the refusal's label.
     pub outcome: String,
     /// The refusal's location: a module index (the order the passes
-    /// consulted the files, the entry 0) and a line.
-    pub at: Option<(usize, u32)>,
+    /// consulted the files, the entry 0), a line and a column. A converted
+    /// value has line 0 and its ordinal in the returned table as the
+    /// column.
+    pub at: Option<(usize, u32, u32)>,
     /// The files the passes consulted.
     pub modules: usize,
     /// The functions the configured definition holds, by the field that
@@ -100,7 +77,6 @@ fn label(e: &ImportError) -> String {
 /// The label of a note's kind: its variant, and a callable's field.
 fn note(kind: &NoteKind) -> String {
     match kind {
-        NoteKind::Callable { field } => format!("Callable {field}"),
         NoteKind::UnsupportedField { field } => format!("UnsupportedField {field}"),
         NoteKind::Ignored { field } => format!("Ignored {field}"),
         other => variant(other),
@@ -108,10 +84,10 @@ fn note(kind: &NoteKind) -> String {
 }
 
 /// Where `at` is: its file's index among `modules`.
-fn locate(at: Option<&Loc>, modules: &[String]) -> Option<(usize, u32)> {
+fn locate(at: Option<&Loc>, modules: &[String]) -> Option<(usize, u32, u32)> {
     let at = at?;
     let i = modules.iter().position(|m| *m == at.file)?;
-    Some((i, at.line))
+    Some((i, at.line, at.col))
 }
 
 fn at_of(e: &ImportError) -> Option<&Loc> {
@@ -135,79 +111,62 @@ fn at_of(e: &ImportError) -> Option<&Loc> {
     }
 }
 
-/// A refused header pass's survey.
+/// Runs the Lua skin `entry` of skin folder `root` with its default
+/// configuration, counts the functions its configured definition holds
+/// and imports it, keeping what the candidate used and consulted however
+/// far it got, and reports only allowlisted labels and numbers.
 #[must_use]
-pub fn refused_header(e: &ImportError) -> Survey {
-    Survey {
-        outcome: format!("header {}", label(e)),
-        at: at_of(e).map(|a| (usize::MAX, a.line)),
-        ..Survey::default()
-    }
-}
-
-impl LuaHeader {
-    /// Runs the configured pass with `config`, counts the functions its
-    /// definition holds, and imports it, reporting only allowlisted
-    /// labels and numbers.
-    #[must_use]
-    pub fn survey(&self, config: &Config, cancel: &Cancel) -> Survey {
-        let mut s = Survey {
-            modules: self.store.dependencies.len(),
-            usage: self.counts,
-            ..Survey::default()
-        };
-        let (mut def, counts, dependencies) = match self.configured(config, cancel) {
-            Ok(r) => r,
-            Err(e) => {
-                s.outcome = label(&e);
-                s.at = locate(at_of(&e), &self.store.dependencies);
-                return s;
-            }
-        };
-        s.usage = counts;
-        s.modules = dependencies.len();
-        let arena = &def.arena;
-        if let Some(lua) = arena.lua.as_deref() {
-            for (id, n) in (0_u32..).zip(&arena.nodes) {
-                let Some(LuaScalar::Callable(i)) = (n.kind == Kind::Lua)
-                    .then(|| lua.values.get(n.end as usize))
-                    .flatten()
-                    .copied()
-                else {
-                    continue;
-                };
-                let key: String = arena.key(id).map(Iterator::collect).unwrap_or_default();
-                let field = FIELDS
-                    .iter()
-                    .find(|f| **f == key)
-                    .copied()
-                    .unwrap_or("other");
-                let kind = match lua.callables.get(i as usize).map(|c| c.kind) {
-                    Some(CallableKind::Lua) => "lua".to_owned(),
-                    Some(CallableKind::Host(api)) => {
+pub fn survey(root: &Path, entry: &str, cancel: &Cancel) -> Survey {
+    let header = header_pass(root, entry, cancel);
+    let h = match header.result {
+        Ok(h) => h,
+        Err(e) => {
+            return Survey {
+                outcome: format!("header {}", label(&e)),
+                at: locate(at_of(&e), &header.dependencies),
+                modules: header.dependencies.len(),
+                usage: header.counts,
+                ..Survey::default()
+            };
+        }
+    };
+    let config = Config::defaults(h.header());
+    let mut s = Survey::default();
+    let (def, counts, store) = h.configured(&config, cancel);
+    s.usage = counts;
+    s.modules = store.dependencies.len();
+    if let Ok(def) = def {
+        {
+            for (_, field, kind) in callables(&def.arena) {
+                let kind = match kind {
+                    CallableKind::Lua => "lua".to_owned(),
+                    CallableKind::Host(api) => {
                         let (m, n) = HOST_APIS
                             .get(usize::from(api))
                             .copied()
                             .unwrap_or(("?", "?"));
                         format!("{m}.{n}")
                     }
-                    Some(CallableKind::Library) | None => "library".to_owned(),
+                    CallableKind::Library => "library".to_owned(),
                 };
                 *s.callables.entry((field, kind)).or_default() += 1;
             }
         }
-        match import(&mut def, &self.header, config) {
-            Ok(imported) => {
-                s.outcome = "imported".into();
-                for n in &imported.report.notes {
-                    *s.notes.entry(note(&n.kind)).or_default() += 1;
-                }
-            }
-            Err(e) => {
-                s.outcome = label(&e);
-                s.at = locate(at_of(&e), &dependencies);
+    }
+    let o = h.complete(&config, cancel);
+    s.usage = o.counts;
+    s.modules = o.dependencies.len();
+    match o.result {
+        Ok(imported) => {
+            s.outcome = "imported".into();
+            for n in &imported.report.notes {
+                *s.notes.entry(note(&n.kind)).or_default() += 1;
             }
         }
-        s
+        Err(e) => {
+            s.outcome = label(&e);
+            s.at = locate(at_of(&e), &o.dependencies);
+        }
     }
+    s
 }

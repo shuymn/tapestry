@@ -906,8 +906,8 @@ return skin
 }
 
 /// `skin_lua` seeds: skins that import (data only, local modules and
-/// selected parts, configuration, pass isolation, a frozen decorative
-/// function), then one refusal per boundary: a critical function, the
+/// selected parts, configuration, pass isolation), then one refusal per
+/// boundary: a function on a decorative and on a critical element, the
 /// instruction and memory caps (also inside a protected call), a path
 /// out of the folder, a coroutine, a write to `skin_config`, malformed
 /// Lua and a value that is no table.
@@ -936,7 +936,7 @@ return m"#;
         "if not skin_config then return skin end",
         "if not skin_config then leaked = true require(\"m\") return skin end",
     );
-    let frozen = lua_skin(
+    let decorative = lua_skin(
         r#"skin.destination[2] = { id = "i", draw = function() return true end, dst = { { w = 10, h = 10 } } }"#,
     );
     let refused = lua_skin(
@@ -951,7 +951,7 @@ skin.destination[2] = { id = "v", dst = { { w = 10, h = 10 } } }"#,
             "isolation",
             lua_input(&[&isolation, "runs = (runs or 0) + 1\nreturn { runs = runs }"]),
         ),
-        ("callable_frozen", lua_input(&[&frozen])),
+        ("callable_decorative", lua_input(&[&decorative])),
         ("callable_refused", lua_input(&[&refused])),
         ("loop", lua_input(&["while true do end"])),
         (

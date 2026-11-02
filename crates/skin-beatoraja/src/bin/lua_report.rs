@@ -8,8 +8,8 @@
 
 use std::path::PathBuf;
 
-use skin_beatoraja::lua::survey::refused_header;
-use skin_beatoraja::{Cancel, Config, read_lua_header};
+use skin_beatoraja::Cancel;
+use skin_beatoraja::lua::survey::survey;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -20,17 +20,10 @@ fn main() {
     for (index, pair) in args.chunks(2).enumerate() {
         let [root, entry] = pair else { continue };
         let cancel = Cancel::new();
-        let survey = match read_lua_header(&PathBuf::from(root), entry, &cancel) {
-            Ok(h) => h.survey(&Config::defaults(h.header()), &cancel),
-            Err(e) => refused_header(&e),
-        };
+        let survey = survey(&PathBuf::from(root), entry, &cancel);
         println!("skin {index}: {}", survey.outcome);
-        if let Some((module, line)) = survey.at {
-            if module == usize::MAX {
-                println!("  at: header pass, line {line}");
-            } else {
-                println!("  at: module {module}, line {line}");
-            }
+        if let Some((module, line, col)) = survey.at {
+            println!("  at: module {module}, line {line}, column {col}");
         }
         println!("  modules: {}", survey.modules);
         let u = survey.usage;

@@ -20,6 +20,7 @@ thread_local! {
     static HOST_CALLS: Cell<Option<u32>> = const { Cell::new(None) };
     static AT_HOST_CALL: RefCell<Option<Action>> = RefCell::new(None);
     static AT_CONVERSION: RefCell<Option<Action>> = RefCell::new(None);
+    static AT_CONVERTED: RefCell<Option<Action>> = RefCell::new(None);
     /// The VMs alive on this thread.
     static LIVE: Cell<usize> = const { Cell::new(0) };
 }
@@ -45,6 +46,13 @@ pub(crate) fn host_call_witness() {
 /// Called when a conversion starts.
 pub(crate) fn conversion_witness() {
     if let Some(f) = AT_CONVERSION.with(|a| a.borrow_mut().take()) {
+        f();
+    }
+}
+
+/// Called when a conversion has read the whole table.
+pub(crate) fn converted_witness() {
+    if let Some(f) = AT_CONVERTED.with(|a| a.borrow_mut().take()) {
         f();
     }
 }
@@ -181,4 +189,17 @@ fn the_instruction_hook_covers_a_thread_the_host_creates() {
         }
         other => panic!("{other:?}"),
     }
+}
+
+#[test]
+fn cancellation_is_seen_by_the_common_reader() {
+    // The table is converted whole, then the request comes: the JSON file
+    // it includes is not read.
+    let d = folder("return { type = 0, property = { include = \"p.json\" } }");
+    std::fs::write(d.path().join("p.json"), "[]").unwrap();
+    let cancel = Cancel::new();
+    let remote = cancel.clone();
+    AT_CONVERTED.with(|a| *a.borrow_mut() = Some(Box::new(move || remote.cancel())));
+    assert_eq!(why(header(d.path(), &cancel)), LuaWhy::Cancelled);
+    assert_eq!(live(), 0);
 }

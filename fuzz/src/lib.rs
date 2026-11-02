@@ -1758,7 +1758,11 @@ fn check_lua(usage: &LuaUsage, dependencies: &[String]) {
         "Lua memory over the cap"
     );
     for d in dependencies {
-        assert!(LUA_FILES.contains(&d.as_str()), "a file outside the input");
+        let resource = ["strip.png", "grid.png"].contains(&d.as_str());
+        assert!(
+            LUA_FILES.contains(&d.as_str()) || resource,
+            "a file outside the folder"
+        );
     }
 }
 
@@ -1770,7 +1774,7 @@ fn check_lua(usage: &LuaUsage, dependencies: &[String]) {
 /// configured pass then runs with the header's defaults, twice, which must
 /// give the same outcome (the passes share no Lua state), and once with
 /// each option's last item. Every candidate's use of the sandbox must be
-/// within its caps and consult only the input's files; an imported skin's
+/// within its caps and consult only the folder's files; an imported skin's
 /// counters must be within the model's caps, and it is drawn ([`draw`]).
 ///
 /// # Errors

@@ -1044,7 +1044,7 @@ fn skin_lua_seeds_import_or_fail_as_built() {
             "config",
             "modules",
             "isolation",
-            "callable_frozen",
+            "callable_decorative",
             "callable_refused",
             "loop",
             "protected_loop",
@@ -1064,19 +1064,11 @@ fn skin_lua_seeds_import_or_fail_as_built() {
         assert!(data.len() <= 64 * 1_024, "{name}: {} bytes", data.len());
         let result = skin_lua(&data);
         match name {
-            "data_only" | "config" | "modules" | "isolation" | "callable_frozen" => {
+            "data_only" | "config" | "modules" | "isolation" => {
                 let (h, imported) = result.unwrap_or_else(|e| panic!("{name}: {e}"));
                 assert_eq!(h.options.len(), 1, "{name}");
                 let i = imported.unwrap_or_else(|e| panic!("{name}: {e:?}"));
                 assert!(i.imported.report.usage.elements >= 1, "{name}");
-                let callables = i
-                    .imported
-                    .report
-                    .notes
-                    .iter()
-                    .filter(|n| matches!(n.kind, NoteKind::Callable { field: "draw" }))
-                    .count();
-                assert_eq!(callables, usize::from(name == "callable_frozen"), "{name}");
                 if name == "modules" {
                     assert_eq!(
                         i.dependencies,
@@ -1085,13 +1077,13 @@ fn skin_lua_seeds_import_or_fail_as_built() {
                     );
                 }
             }
-            "callable_refused" | "config_write" => {
+            "callable_refused" | "callable_decorative" | "config_write" => {
                 let (_, imported) = result.unwrap_or_else(|e| panic!("{name}: {e}"));
                 let e = imported.expect_err(name);
-                let want = if name == "config_write" {
-                    LuaWhy::ConfigWrite
-                } else {
-                    LuaWhy::Callable { field: "value" }
+                let want = match name {
+                    "config_write" => LuaWhy::ConfigWrite,
+                    "callable_decorative" => LuaWhy::Callable { field: "draw" },
+                    _ => LuaWhy::Callable { field: "value" },
                 };
                 assert_eq!(lua(&e), Some(want), "{name}");
             }

@@ -111,10 +111,15 @@ impl Store {
             });
         }
         *used += len;
-        if !self.dependencies.iter().any(|d| d == id.name()) {
-            self.dependencies.push(id.name().to_owned());
-        }
+        self.depend(id.name());
         Ok((id, bytes))
+    }
+
+    /// Records `name` among the files consulted, once.
+    pub(crate) fn depend(&mut self, name: &str) {
+        if !self.dependencies.iter().any(|d| d == name) {
+            self.dependencies.push(name.to_owned());
+        }
     }
 }
 

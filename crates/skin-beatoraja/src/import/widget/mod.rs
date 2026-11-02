@@ -494,9 +494,6 @@ impl Cx<'_> {
         let selector = image_choice::set_selector(&value, r);
         let (charged, lowered) = self.lowered(&dst)?;
         let role = lowered.role();
-        if let Prop::Callable(node) = value {
-            return self.callable(role, node, "value");
-        }
         let (src, deviates) = match selector {
             SetSelector::Unsupported { why, .. } => {
                 return self.drop_el(role, at, why);

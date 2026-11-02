@@ -9,8 +9,8 @@ use skin_beatoraja::limits::{MAX_FILE_BYTES, MAX_INCLUDE_DEPTH, MAX_INCLUDE_PARS
 use skin_beatoraja::lua::HOST_APIS;
 use skin_beatoraja::lua::limits::{MAX_HOST_CALLS, MAX_INSTRUCTIONS};
 use skin_beatoraja::{
-    Cancel, Config, CriticalPart, ImportError, InputLimit, LuaHeader, LuaImported, LuaLimit,
-    LuaWhy, NoteKind, OffsetValue, Severity, read_lua_header,
+    Cancel, Config, ImportError, InputLimit, LuaHeader, LuaImported, LuaLimit, LuaWhy, NoteKind,
+    OffsetValue, read_lua_header,
 };
 use skin_model::RootError;
 use tempfile::TempDir;
@@ -733,46 +733,20 @@ fn host_modules_load_but_reading_play_state_is_refused() {
 }
 
 #[test]
-fn a_decorative_callable_is_frozen_and_noted_at_its_definition() {
-    let d = folder(&[(
-        "s.luaskin",
-        &skin(
-            "",
-            "skin.destination = {\n\
-               { id = \"i\", dst = { { x = 0, y = 0, w = 64, h = 64 } } },\n\
-               { id = \"i\", draw = function() return true end,\n\
-                 dst = { { x = 0, y = 0, w = 64, h = 64 } } },\n\
-               { id = \"i\", timer = function() return 0 end, dst = { { w = 64, h = 64 } } },\n\
-             }",
-        ),
-    )]);
-    let r = import(&d).unwrap();
-    let report = &r.imported.report;
-    let notes: Vec<_> = report
-        .notes
-        .iter()
-        .map(|n| (n.severity, n.kind, n.at.map(|a| (a.source, a.line))))
-        .collect();
-    assert_eq!(
-        notes,
-        [
-            (
-                Severity::Dropped,
-                NoteKind::Callable { field: "draw" },
-                Some((0, 7))
-            ),
-            (
-                Severity::Dropped,
-                NoteKind::Callable { field: "timer" },
-                Some((0, 9))
-            ),
-        ]
-    );
-    assert_eq!(report.usage.elements, 3);
-}
-
-#[test]
-fn a_callable_a_critical_part_or_a_number_needs_is_refused() {
+fn every_function_in_the_definition_is_refused_at_its_definition() {
+    // A decorative image's condition and timer are refused, not frozen.
+    for (fields, field, line) in [
+        ("draw = function() return true end,", "draw", 5),
+        ("timer = function() return 0 end,", "timer", 5),
+        ("op = { function() end },", "other", 5),
+    ] {
+        let d = folder(&[("s.luaskin", &drawn(fields))]);
+        assert_eq!(
+            located(import(&d)),
+            (LuaWhy::Callable { field }, "s.luaskin".into(), line),
+            "{fields}"
+        );
+    }
     // A gauge's condition.
     let images: String = (0..4)
         .map(|k| {
@@ -795,21 +769,12 @@ fn a_callable_a_critical_part_or_a_number_needs_is_refused() {
             ),
         ),
     )]);
-    match import(&d) {
-        Err(ImportError::Critical { at, part, why }) => {
-            assert_eq!(
-                (part, why, at.file.as_str(), at.line),
-                (
-                    CriticalPart::Gauge,
-                    NoteKind::Callable { field: "draw" },
-                    "s.luaskin",
-                    8
-                )
-            );
-        }
-        other => panic!("{other:?}"),
-    }
-    // A number's value could be the score.
+    assert_eq!(
+        located(import(&d)),
+        (LuaWhy::Callable { field: "draw" }, "s.luaskin".into(), 8)
+    );
+    // A number's value, a field that takes no function, and a field
+    // nothing reads.
     let d = folder(&[(
         "s.luaskin",
         &skin(
@@ -823,9 +788,10 @@ fn a_callable_a_critical_part_or_a_number_needs_is_refused() {
         located(import(&d)),
         (LuaWhy::Callable { field: "value" }, "s.luaskin".into(), 6)
     );
-    // A field that takes no function.
     let d = folder(&[("s.luaskin", &drawn("blend = function() end,"))]);
     assert_eq!(why(import(&d)), LuaWhy::Callable { field: "blend" });
+    let d = configured("skin.unread = { function() end }");
+    assert_eq!(why(import(&d)), LuaWhy::Callable { field: "other" });
     // A module's function is located in that module.
     let d = folder(&[
         ("s.luaskin", &drawn("loop = require(\"f\"),")),
@@ -834,6 +800,62 @@ fn a_callable_a_critical_part_or_a_number_needs_is_refused() {
     assert_eq!(
         located(import(&d)),
         (LuaWhy::Callable { field: "loop" }, "f.lua".into(), 2)
+    );
+    // A host function has no Lua definition: it is located at its value,
+    // line 0 and its ordinal in the table.
+    let d = configured("skin.timer_fn = require(\"timer_util\").now_timer");
+    match import(&d) {
+        Err(ImportError::Lua {
+            why: LuaWhy::Callable { field: "other" },
+            at: Some(at),
+        }) => assert_eq!((at.file.as_str(), at.line), ("s.luaskin", 0)),
+        other => panic!("{other:?}"),
+    }
+    // A function in the header table refuses the header pass.
+    let d = folder(&[("s.luaskin", "return { type = 0, draw = function() end }")]);
+    assert_eq!(
+        located(header(&d)),
+        (LuaWhy::Callable { field: "draw" }, "s.luaskin".into(), 1)
+    );
+}
+
+#[test]
+fn json_included_by_a_lua_skin_is_charged_to_the_candidate() {
+    // The header's options come from a JSON file, read in both passes.
+    let pad = |n: usize| format!("[{}{{\"name\": \"o\"}}]", " ".repeat(n));
+    let header_json = pad(15 << 20);
+    let entry = skin(
+        "property = { include = \"props.json\" },",
+        &format!("skin.image = {{ include = \"images.json\" }}\n{DRAW_I}"),
+    );
+    let images = |n: usize| {
+        format!(
+            "[{}{{\"id\": \"i\", \"src\": \"a\", \"w\": 64, \"h\": 64}}]",
+            " ".repeat(n)
+        )
+    };
+    let small = folder(&[
+        ("s.luaskin", &entry),
+        ("props.json", &pad(0)),
+        ("images.json", &images(0)),
+    ]);
+    let r = import(&small).unwrap();
+    assert_eq!(r.dependencies, ["s.luaskin", "props.json", "images.json"]);
+    assert_eq!(
+        r.imported.report.sources,
+        ["s.luaskin", "props.json", "images.json"]
+    );
+    // 15 MiB in each pass and 3 MiB more pass the 32 MiB in all.
+    let big = folder(&[
+        ("s.luaskin", &entry),
+        ("props.json", &header_json),
+        ("images.json", &images(3 << 20)),
+    ]);
+    let h = header(&big).unwrap();
+    assert!(h.usage().input_bytes >= 15 << 20, "{:?}", h.usage());
+    assert_eq!(
+        input(h.import(&Config::defaults(h.header()), &Cancel::new())),
+        InputLimit::InputBytes
     );
 }
 

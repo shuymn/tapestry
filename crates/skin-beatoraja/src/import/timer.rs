@@ -86,9 +86,6 @@ pub(crate) fn rank_source(k: usize) -> Option<String> {
 #[derive(Debug, Default)]
 pub(crate) struct Custom {
     pub(crate) aliases: BTreeMap<i32, Option<i32>>,
-    /// The custom timers a Lua skin's function drives, by its node: the
-    /// last of an id wins, as for `aliases`.
-    pub(crate) scripted: BTreeMap<i32, u32>,
     pub(crate) judge_region: bool,
 }
 
@@ -153,7 +150,6 @@ mod tests {
                 (10_005, Some(0)),
                 (10_006, Some(46)),
             ]),
-            scripted: BTreeMap::new(),
             judge_region: false,
         };
         assert_eq!(c.resolve(10_000), Timer::Builtin(timer::PLAY));

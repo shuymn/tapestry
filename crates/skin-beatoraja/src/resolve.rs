@@ -51,7 +51,7 @@ use crate::json;
 use crate::limits::{
     Limits, MAX_FILE_BYTES, MAX_INCLUDE_DEPTH, MAX_INCLUDE_PARSES, MAX_INPUT_BYTES,
 };
-use crate::lua::LuaWhy;
+use crate::lua::{Cancel, LuaWhy};
 use crate::tree::{Arena, ESCAPED, Kind, NONE, Scalar, Text, Unescape};
 
 /// The type number of a 7-key play skin (`SkinType.java:12` at `0.8.9`).
@@ -70,6 +70,9 @@ pub struct Definition {
     top: u32,
     limits: Limits,
     pub(crate) run: Run,
+    /// A Lua candidate's cancellation request, seen before each include
+    /// is read and after it is parsed ([`crate::lua`]).
+    cancel: Option<Cancel>,
 }
 
 /// The counters of one resolution.
@@ -180,6 +183,7 @@ impl Definition {
             top,
             limits,
             run: Run::default(),
+            cancel: None,
         })
     }
 
@@ -193,6 +197,7 @@ impl Definition {
         arena: Arena,
         top: u32,
         input_bytes: u64,
+        cancel: Cancel,
     ) -> Self {
         Self {
             root,
@@ -203,7 +208,29 @@ impl Definition {
             top,
             limits: Limits::STANDARD,
             run: Run::default(),
+            cancel: Some(cancel),
         }
+    }
+
+    /// The bytes the last resolution read in all, its entry's included.
+    pub(crate) fn input_bytes(&self) -> u64 {
+        self.run.input_bytes
+    }
+
+    /// The files the last resolution included, by name, in order.
+    pub(crate) fn included(&self) -> impl Iterator<Item = &str> {
+        self.arena.files.iter().skip(1).map(|f| f.name.as_str())
+    }
+
+    /// A cancellation of the Lua candidate this definition belongs to.
+    pub(crate) fn cancelled(&self, at: impl FnOnce() -> Option<Loc>) -> Result<(), ImportError> {
+        if self.cancel.as_ref().is_some_and(Cancel::is_cancelled) {
+            return Err(ImportError::Lua {
+                at: at(),
+                why: LuaWhy::Cancelled,
+            });
+        }
+        Ok(())
     }
 
     pub(crate) fn root(&self) -> &Root {
@@ -903,6 +930,7 @@ impl Resolver<'_, '_> {
         let Some(name) = self.def.string(member, "include")? else {
             return Err(self.def.type_error(member, "include", "a file name"));
         };
+        self.def.cancelled(|| Some(self.def.loc(member)))?;
         // Both counts are reserved before anything is read.
         if self.chain.len() > MAX_INCLUDE_DEPTH as usize {
             return Err(ImportError::Input {
@@ -958,6 +986,7 @@ impl Resolver<'_, '_> {
             bytes: bytes.into_boxed_slice(),
         });
         let root = json::parse(&mut self.def.arena, index, depth)?;
+        self.def.cancelled(|| Some(self.def.loc(member)))?;
         self.chain.push(id);
         let result = then(self, root, depth + 1);
         self.chain.pop();
