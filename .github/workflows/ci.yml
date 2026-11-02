@@ -103,6 +103,11 @@ jobs:
           mise exec -- rustc -Vv
       - name: Show runner image
         run: echo "runner image $ImageOS $ImageVersion"
+      # Dependencies built with optimizations: the CPU-bound tests ran 15-20 %
+      # faster here (not on Linux), and rust-cache keeps them. Before
+      # rust-cache, which hashes .cargo/config.toml into its key.
+      - name: Optimize dependencies in debug builds
+        run: printf '\n[profile.dev.package."*"]\nopt-level = 2\n' >> .cargo/config.toml
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           cmd-format: mise exec -- {0}
@@ -223,6 +228,11 @@ jobs:
           mise exec -- rustc -Vv
       - name: Show runner image
         run: echo "runner image $ImageOS $ImageVersion"
+      # Dependencies built with optimizations: the CPU-bound tests ran 15-20 %
+      # faster here (not on Linux), and rust-cache keeps them. Before
+      # rust-cache, which hashes .cargo/config.toml into its key.
+      - name: Optimize dependencies in debug builds
+        run: printf '\n[profile.dev.package."*"]\nopt-level = 2\n' >> .cargo/config.toml
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           cmd-format: mise exec -- {0}
