@@ -137,6 +137,8 @@ pub static PLAY: Schema = Schema {
         int("duration.ms", READOUT_MAX, E),
         int("duration.green", GREEN_MAX, E),
         flag("duration.valid", E),
+        count("count.fast", E),
+        count("count.slow", E),
     ],
     timers: &[
         timer("ready", E),
@@ -279,8 +281,14 @@ pub mod field {
     pub const DURATION_GREEN: u16 = 35;
     /// Whether the frame gives the travel duration.
     pub const DURATION_VALID: u16 = 36;
+    /// The scored judgments other than PERFECT pressed before their note
+    /// ([`Tally::fast`](eval::Tally::fast)).
+    pub const COUNT_FAST: u16 = 37;
+    /// The scored judgments other than PERFECT pressed after their note
+    /// ([`Tally::slow`](eval::Tally::slow)).
+    pub const COUNT_SLOW: u16 = 38;
     /// The number of fields.
-    pub const COUNT: usize = 37;
+    pub const COUNT: usize = 39;
 }
 
 /// The built-in timer slots of [`PLAY`]; `when` timers follow from
@@ -501,6 +509,8 @@ mod tests {
             ("duration.ms", field::DURATION_MS),
             ("duration.green", field::DURATION_GREEN),
             ("duration.valid", field::DURATION_VALID),
+            ("count.fast", field::COUNT_FAST),
+            ("count.slow", field::COUNT_SLOW),
         ];
         for (name, slot) in fields {
             assert_eq!(PLAY.field(name).map(|(s, _)| s), Some(slot), "{name}");

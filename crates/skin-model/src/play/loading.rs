@@ -84,6 +84,8 @@ const FIELDS: [LoadingField; field::COUNT] = {
         Unavailable, // duration.ms
         Unavailable, // duration.green
         Unavailable, // duration.valid
+        Unavailable, // count.fast
+        Unavailable, // count.slow
     ]
 };
 

@@ -373,6 +373,8 @@ impl Play {
             r.duration_ms,
             r.green,
             r.duration_valid,
+            count(t.fast),
+            count(t.slow),
         ];
     }
 

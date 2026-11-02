@@ -261,6 +261,16 @@ pub(crate) enum Value {
     /// A judgment count: `count.perfect`..`count.poor`, then
     /// `count.empty_poor`.
     Count(u8),
+    /// `totalearly` and `totallate` (423, 424): `count.fast` and
+    /// `count.slow`, the scored judgments other than PERFECT pressed before
+    /// and after their note, a long note once by its head's press (D4).
+    /// The source counts every judgment other than PERFECT by its own
+    /// early or late flag, misses and presses on a judged note included,
+    /// and a long note by whichever of its head and its release lies
+    /// farther from its time (`IntegerPropertyFactory.java`, `totalearly`,
+    /// `totallate`; `play/JudgeManager.java`, `updateMicro`).
+    Fast,
+    Slow,
     /// The rate over the targets judged so far, whole percent and
     /// hundredths (D4): the source's `getNowRate*`
     /// (`IntegerPropertyFactory.java:176-180`).
@@ -321,6 +331,8 @@ impl Value {
             Self::Count(3) => "count.bad",
             Self::Count(4) => "count.poor",
             Self::Count(_) => "count.empty_poor",
+            Self::Fast => "count.fast",
+            Self::Slow => "count.slow",
             Self::CurrentRatePercent => "rate.current_bp / 100",
             Self::CurrentRateFraction => "rate.current_bp % 100",
             Self::WholeRatePercent => "rate.whole_bp / 100",
@@ -406,6 +418,8 @@ fn shown(id: i32) -> Option<Value> {
         116 | 156 => Value::WholeRateFraction,
         110..=114 => Value::Count(u8::try_from(id - 110).ok()?),
         420 => Value::Count(5),
+        423 => Value::Fast,
+        424 => Value::Slow,
         90 => Value::BpmMax,
         91 => Value::BpmMin,
         160 => Value::BpmNow,
@@ -677,6 +691,16 @@ mod tests {
             if let Some(g) = guard {
                 assert!(skin_model::compile(g, &scope, skin_model::Ty::Bool).is_ok());
             }
+        }
+        // FAST and SLOW, with a D4 note for their counting.
+        for (id, name, value, expr) in [
+            (423, "totalearly", Value::Fast, "count.fast"),
+            (424, "totallate", Value::Slow, "count.slow"),
+        ] {
+            assert_eq!(int_by_id(id), IntProp::Shown(value), "{id}");
+            assert_eq!(int_by_name(name), Some(IntProp::Shown(value)), "{name}");
+            assert_eq!((value.expr(), value.availability()), (expr, None));
+            assert!(value.deviates() && !value.critical());
         }
         // Neither is a value property; others keep needing their own data.
         assert_eq!(int_by_id(15), IntProp::Null);

@@ -359,3 +359,66 @@ fn a_strip_past_the_model_is_a_range_error() {
     .err();
     assert!(matches!(e, ImportError::Range { .. }), "{e:?}");
 }
+
+/// FAST and SLOW (423 `totalearly`, 424 `totallate`), by id and by name,
+/// one row each from y = 100 below an EX score of one cell at y = 0 that
+/// tells the glyphs apart.
+const FAST_SLOW: [&str; 4] = [
+    r#""ref": 423"#,
+    r#""value": "totalearly""#,
+    r#""value": 424"#,
+    r#""value": "totallate""#,
+];
+
+#[test]
+fn fast_and_slow_show_the_tallys_counts_with_a_d4_note() {
+    let mut values = vec![
+        r#"{"id": "ex", "src": "n", "w": 120, "h": 20, "divx": 10, "digit": 1, "ref": 71}"#
+            .to_owned(),
+    ];
+    let mut dsts = vec![r#"{"id": "ex", "dst": [{"x": 0, "y": 0, "w": 12, "h": 20}]}"#.to_owned()];
+    for (i, prop) in FAST_SLOW.iter().enumerate() {
+        values.push(format!(
+            r#"{{"id": "n{i}", "src": "n", "w": 120, "h": 20, "divx": 10, "digit": 3, {prop}}}"#
+        ));
+        let y = 100 * (i + 1);
+        dsts.push(format!(
+            r#"{{"id": "n{i}", "dst": [{{"x": 0, "y": {y}, "w": 12, "h": 20}}]}}"#
+        ));
+    }
+    let loaded = import_body(&format!(
+        r#""value": [{}], "destination": [{}]"#,
+        values.join(","),
+        dsts.join(",")
+    ));
+    // Each states its counting's difference from the source: one D4 note
+    // at each number, and nothing else.
+    let notes = &loaded.report().notes;
+    assert_eq!(notes.len(), FAST_SLOW.len(), "{notes:?}");
+    assert!(
+        notes
+            .iter()
+            .all(|n| n.kind == NoteKind::Deviation(skin_beatoraja::DeviationId::D4))
+    );
+    let mut d = loaded.drawn_over(4);
+    let rows = |d: &mut common::play::Drawn, ms: i64| {
+        let glyph = d.ex_glyphs(ms);
+        let q = d.frame(ms, &[]);
+        let mut cells: Vec<_> = q.iter().map(|q| (q.rect[1], q.rect[0], q.uv)).collect();
+        cells.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.total_cmp(&b.1)));
+        let mut ys: Vec<f32> = cells.iter().map(|c| c.0).collect();
+        ys.dedup();
+        let mut rows = vec![String::new(); FAST_SLOW.len()];
+        for (y, uv) in cells.iter().map(|c| (c.0, c.2)) {
+            let row = ys.iter().position(|&r| r == y).unwrap();
+            if row > 0 {
+                rows[row - 1].push(glyph[&uv.map(f32::to_bits)]);
+            }
+        }
+        rows
+    };
+    assert_eq!(rows(&mut d, 0), ["0", "0", "0", "0"]);
+    d.tally.fast = 12;
+    d.tally.slow = 7;
+    assert_eq!(rows(&mut d, 16), ["12", "12", "7", "7"]);
+}
