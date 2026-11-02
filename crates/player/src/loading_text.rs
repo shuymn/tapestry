@@ -1,5 +1,5 @@
 //! The load's lines on the play screen (design.md "Play Lifecycle"): from a
-//! chart chosen to play, or a practice Start, to its countdown, the play
+//! chart chosen to play, or a practice Start, to its READY state, the play
 //! screen is drawn in its loading state, and these lines over it name the
 //! chart and the play preset and say what the load is doing
 //! ([`MenuPage`], laid out by the render thread's text path). Everything
@@ -23,7 +23,7 @@ pub enum Stage {
     Loudness,
     /// Waiting for the screen to have the chart.
     Screen,
-    /// Waiting for the library's scan to pause before the countdown.
+    /// Waiting for the library's scan to pause before READY.
     Scan,
 }
 

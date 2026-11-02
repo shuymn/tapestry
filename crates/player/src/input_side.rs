@@ -65,7 +65,7 @@ pub enum Request {
     /// Open recording at the next boundary; chart time 0 lies `lead_in`
     /// after it.
     Open {
-        /// The countdown's length.
+        /// READY's length.
         lead_in: TimeUs,
         /// The thread to wake after each publication.
         logic: Thread,

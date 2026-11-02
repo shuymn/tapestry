@@ -1,7 +1,7 @@
 //! The library on the game thread (design.md "Loading and Song
 //! Selection"): `library.db` under the data root, kept current by scan
 //! passes in the background while the select screen shows, and paused from
-//! the choice of a chart until the countdown of each play is over.
+//! the choice of a chart until READY of each play is over.
 //!
 //! - **One process per data root.** The [`Library`] holds its lock on
 //!   `library.db.lock` for the whole run; a second player process on the
@@ -12,7 +12,7 @@
 //!   one has been over for [`RESCAN_AFTER`] while nothing pauses the scan:
 //!   a chart added while the game runs is listed without a restart. Only
 //!   files whose size or modification time changed are read again.
-//! - **Pausing.** Choosing a chart requests a pause, and each countdown
+//! - **Pausing.** Choosing a chart requests a pause, and each READY state
 //!   waits until the scan acknowledges it ([`Shelf::wait_paused`]); every
 //!   entry into selection and every result screen releases it.
 //! - **Priority.** The scan thread runs in background mode (lowered CPU and
@@ -53,7 +53,7 @@ pub const RESCAN_AFTER: Duration = Duration::from_secs(10);
 /// How long the end of a run waits for a running pass to stop.
 pub const STOP_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// How often a countdown's wait for the scan's pause looks whether it
+/// How often a READY state's wait for the scan's pause looks whether it
 /// was cancelled.
 pub const PAUSE_SLICE: Duration = Duration::from_millis(100);
 /// How long the wait for the pause runs before the select screen says so:
@@ -126,7 +126,7 @@ pub fn open(root: &DataRoot) -> Result<(Library, Opened), OpenError> {
     Ok((library, opened))
 }
 
-/// What a countdown's wait for the pause found: the scan's state.
+/// What a READY state's wait for the pause found: the scan's state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Paused {
     /// The scan acknowledged the pause.
@@ -134,7 +134,7 @@ pub enum Paused {
     /// No scan runs.
     Idle,
     /// The wait was cancelled: the window is closing, or the player left
-    /// the chart. No countdown follows.
+    /// the chart. No READY state follows.
     Cancelled,
 }
 
@@ -433,9 +433,9 @@ impl Shelf {
         }
     }
 
-    /// Before a countdown: requests the pause if none is, and waits for the
+    /// Before a READY state: requests the pause if none is, and waits for the
     /// scan and the background measurement to acknowledge it, however long
-    /// that takes (design.md "Loading and Song Selection": the countdown
+    /// that takes (design.md "Loading and Song Selection": READY
     /// starts only after it); without a scan it waits for the background
     /// measurement alone. Every `slice` it asks `cancelled` whether to give
     /// up; once the wait has run `notice_after`, it calls `notice` once.
@@ -588,7 +588,7 @@ impl Shelf {
         }
     }
 
-    /// Before a countdown, once [`wait_paused`](Self::wait_paused) found
+    /// Before a READY state, once [`wait_paused`](Self::wait_paused) found
     /// the scan quiet: stores the measurements taken, the background's
     /// among them.
     pub fn store_loudness(&mut self) {
@@ -758,7 +758,7 @@ mod tests {
             .collect()
     }
 
-    /// The wait a countdown makes, never cancelled.
+    /// The wait a READY state makes, never cancelled.
     fn wait(shelf: &mut Shelf) -> Paused {
         shelf.wait_paused(PAUSE_SLICE, || false, Duration::MAX, || {})
     }
@@ -821,11 +821,11 @@ mod tests {
         assert!(holds(&shelf, "added.bms"));
     }
 
-    /// The pause a countdown waits for is acknowledged by a running pass
+    /// The pause a READY state waits for is acknowledged by a running pass
     /// before the wait returns, and requested by the wait itself when no
     /// choice did.
     #[test]
-    fn the_pause_is_acknowledged_before_each_countdown() {
+    fn the_pause_is_acknowledged_before_each_ready_state() {
         let dir = tempfile::tempdir().unwrap();
         let root = DataRoot::new(dir.path().join("data"));
         let charts = dir.path().join("charts");
@@ -929,11 +929,11 @@ mod tests {
         gate.1.notify_all();
     }
 
-    /// The countdown's wait lasts until the scan acknowledges, however many
+    /// READY's wait lasts until the scan acknowledges, however many
     /// slices that takes: it never gives up on its own. Past its notice
     /// time it says so once.
     #[test]
-    fn the_countdown_waits_for_the_acknowledgment() {
+    fn ready_waits_for_the_acknowledgment() {
         let dir = tempfile::tempdir().unwrap();
         let (mut shelf, gate) = gated(dir.path());
         let opener = std::sync::Arc::clone(&gate);
@@ -956,7 +956,7 @@ mod tests {
         shelf.release();
     }
 
-    /// Closing the window, or the quit key, cancels the wait: no countdown
+    /// Closing the window, or the quit key, cancels the wait: no READY state
     /// follows, and the pause stays requested.
     #[test]
     fn closing_cancels_the_wait_for_the_pause() {
@@ -1152,7 +1152,7 @@ mod tests {
 
     /// A load cancelled during its measurement leaves the chart to the
     /// background, which measures it while selection shows; the result is
-    /// kept and stored at the next countdown, and the chart's next load
+    /// kept and stored at the next READY state, and the chart's next load
     /// measures nothing.
     #[test]
     fn a_cancelled_measurement_is_taken_in_the_background_and_stored() {
@@ -1218,12 +1218,12 @@ mod tests {
         assert_eq!(wait(&mut shelf), Paused::Idle);
     }
 
-    /// Another chart's choice pauses the background measurement, and the
-    /// countdown starts only once it has stopped at a block (200 ms long
+    /// Another chart's choice pauses the background measurement, and
+    /// READY starts only once it has stopped at a block (200 ms long
     /// here): nothing is measured during the play, until the result
     /// releases it.
     #[test]
-    fn the_countdown_waits_for_the_background_to_pause() {
+    fn ready_waits_for_the_background_to_pause() {
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         let dir = tempfile::tempdir().unwrap();
         let (_, _, key, _) = song(dir.path());
@@ -1508,14 +1508,14 @@ mod tests {
     /// The wait for the pause does not wait for the loudness, which the
     /// load measured: without a scan it returns at once.
     #[test]
-    fn the_countdown_does_not_wait_for_the_loudness() {
+    fn ready_does_not_wait_for_the_loudness() {
         let dir = tempfile::tempdir().unwrap();
         let mut shelf = unscanned(dir.path());
         load(&mut shelf, dir.path());
         assert_eq!(wait(&mut shelf), Paused::Idle);
     }
 
-    /// A measurement not yet stored (the run ended before a countdown) is
+    /// A measurement not yet stored (the run ended before a READY state) is
     /// stored when the run ends with its scan stopped: the next run (a
     /// second opening of the library) finds it.
     #[test]

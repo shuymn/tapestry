@@ -50,7 +50,7 @@ pub const MAX_STACK: usize = 32;
 /// The most operations across one skin's expressions; see [`SkinOps`].
 pub const MAX_SKIN_OPS: usize = 1 << 16;
 /// The largest elapsed time a timer reads, in ms (4 h): a chart's time
-/// range plus its countdown fits, and `elapsed(t) * 100` stays in `i32`.
+/// range plus its READY state fits, and `elapsed(t) * 100` stays in `i32`.
 pub const MAX_ELAPSED_MS: i32 = 14_400_000;
 /// A timer's value while it is off; any negative value reads as off.
 pub const TIMER_OFF: i32 = -1;

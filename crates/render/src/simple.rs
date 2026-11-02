@@ -138,7 +138,7 @@ const LN_BODY_INACTIVE: f32 = 0.3;
 const GAUGE_BG: Rgba = [0.12, 0.12, 0.12, 1.0];
 const GAUGE_FILL: Rgba = [0.2, 0.85, 0.3, 1.0];
 pub(crate) const TEXT: Rgba = [0.9, 0.9, 0.9, 1.0];
-const COUNTDOWN: Rgba = [1.0, 0.9, 0.4, 1.0];
+const READY_TEXT: Rgba = [1.0, 0.9, 0.4, 1.0];
 const BEAM: Rgba = [0.25, 0.3, 0.55, 0.8];
 const BOMB: Rgba = [1.0, 0.6, 0.15, 1.0];
 
@@ -537,7 +537,7 @@ impl SimpleSkin {
             }
         }
         if f.now.0 < 0 {
-            countdown(out, f.now);
+            ready_text(out);
         }
         let mut buf = [0; 10];
         text(out, SCORE_X, SCORE_Y, SCORE_SCALE, TEXT, b"EX");
@@ -955,23 +955,12 @@ fn timing(t: &game::Timing, out: &mut SpriteBatch) {
     }
 }
 
-/// The countdown before chart time 0 (the lead-in, design.md "Play Lifecycle"):
-/// "READY" where the judgment shows, and under it the time left in seconds,
-/// tenths rounded up, so it reads 0.1 until the chart starts.
-fn countdown(out: &mut SpriteBatch, now: TimeUs) {
-    let width = text_width(5, JUDGMENT_SCALE);
-    let x = JUDGMENT_X - width / 2.0;
-    text(out, x, JUDGMENT_Y, JUDGMENT_SCALE, COUNTDOWN, b"READY");
-    let tenths = now.0.unsigned_abs().div_ceil(100_000);
-    let mut buf = [0; 10];
-    let whole = decimal(u32::try_from(tenths / 10).unwrap_or(u32::MAX), &mut buf);
-    let n = whole.len();
-    let width = text_width(n + 2, JUDGMENT_SCALE);
-    let x = JUDGMENT_X - width / 2.0;
-    text(out, x, COMBO_Y, JUDGMENT_SCALE, COUNTDOWN, whole);
-    let fraction = [b'.', b'0' + (tenths % 10) as u8];
-    let x = x + text_width(n, JUDGMENT_SCALE);
-    text(out, x, COMBO_Y, JUDGMENT_SCALE, COUNTDOWN, &fraction);
+/// "READY" where the judgment shows, during the lead-in before chart time 0
+/// (design.md "Play Lifecycle").
+fn ready_text(out: &mut SpriteBatch) {
+    let label = b"READY";
+    let x = JUDGMENT_X - text_width(label.len(), JUDGMENT_SCALE) / 2.0;
+    text(out, x, JUDGMENT_Y, JUDGMENT_SCALE, READY_TEXT, label);
 }
 
 /// `n` in decimal, written at the end of `buf`.
@@ -1904,23 +1893,20 @@ mod tests {
     }
 
     #[test]
-    fn countdown_shows_the_time_left_before_chart_zero() {
+    fn ready_shows_only_its_text_before_chart_zero() {
         let chart = ChartBuilder::new(BPM).build().unwrap();
         let mut s = skin(&chart);
         let v = view();
-        // 350 ms left: 0.4 s, tenths rounded up; 1 µs left still 0.1.
-        for (now, left) in [(-350 * MS, b"0.4"), (-1, b"0.1"), (-1_000 * MS, b"1.0")] {
+        for now in [-1_000 * MS, -350 * MS, -1] {
             let batch = build(&mut s, &frame(&v, now, &[]));
-            let mut expected = uvs(b"READY");
-            expected.extend(uvs(left));
-            assert_eq!(glyphs(&batch, COUNTDOWN), expected, "at {now}");
+            assert_eq!(glyphs(&batch, READY_TEXT), uvs(b"READY"), "at {now}");
         }
         let batch = build(&mut s, &frame(&v, 0, &[]));
-        assert!(glyphs(&batch, COUNTDOWN).is_empty());
+        assert!(glyphs(&batch, READY_TEXT).is_empty());
     }
 
     /// The loading frame draws the lanes, the judgment line and the gauge's
-    /// frame, but no note of the prepared chart, no countdown and nothing
+    /// frame, but no note of the prepared chart, no READY text and nothing
     /// that allocates.
     #[test]
     fn the_loading_frame_draws_the_lanes_without_notes() {
@@ -1936,7 +1922,7 @@ mod tests {
         assert!(batch.blended(Blend::Alpha).any(|s| s.color == LANE_BG));
         assert!(in_lane(&batch, lane(3), NOTE_WHITE).is_empty());
         assert!(in_lane(&batch, lane(3), NOTE_BLUE).is_empty());
-        assert!(glyphs(&batch, COUNTDOWN).is_empty());
+        assert!(glyphs(&batch, READY_TEXT).is_empty());
         // The same frame on a play's clock draws the note.
         let v = view();
         let played = build(&mut s, &frame(&v, 0, &[]));

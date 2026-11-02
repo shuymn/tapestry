@@ -1,4 +1,4 @@
-//! Whole sessions, headless: load → countdown → play → tail → save →
+//! Whole sessions, headless: load → READY → play → tail → save →
 //! result, with retries and aborts.
 
 mod common;
@@ -953,7 +953,7 @@ fn tail_session(root: &DataRoot, events: &Events) -> Session<Out> {
 }
 
 /// The two notes pressed, and lane 7 (no notes) tapped every 20 ms from
-/// the countdown to 5 s: a source that reports continuously.
+/// READY to 5 s: a source that reports continuously.
 fn busy_items() -> Vec<ScriptItem> {
     let mut items = vec![connect(0)];
     items.extend(presses(&[(1, 1_000), (1, 1_100)]));
@@ -1009,7 +1009,7 @@ fn session_waits_for_audio_tail_after_completion() {
 }
 
 #[test]
-fn retry_in_the_countdown() {
+fn retry_in_ready() {
     let (_dir, root) = temp_root();
     let chart = taps(&NOTES);
     let events = Events::default();
@@ -1018,7 +1018,7 @@ fn retry_in_the_countdown() {
     let one = s
         .play(script(vec![connect(0)], &[(-999 * MS, Command::Retry)]))
         .unwrap();
-    // Later in the countdown it ends midway with nothing judged.
+    // Later in READY it ends midway with nothing judged.
     let two = s
         .play(script(Vec::new(), &[(-500 * MS, Command::Retry)]))
         .unwrap();

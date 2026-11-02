@@ -788,7 +788,7 @@ impl Renderer {
     }
 
     /// Prepares the play skin in use for the attempt `a`, in place, before
-    /// its countdown: the simple skin's way, whose preparation replaces no
+    /// its READY state: the simple skin's way, whose preparation replaces no
     /// resource. Its frames are built again after a refused one. The
     /// target in `a` is replaced by [`target`](Self::target).
     ///
@@ -855,7 +855,7 @@ impl Renderer {
     }
 
     /// Stages the installation of `bundle` with a fresh attempt `a` for
-    /// `request`, before the countdown, leaving what is installed drawing
+    /// `request`, before READY, leaving what is installed drawing
     /// until [`commit`](Self::commit): a previous staging is discarded;
     /// unless `bundle` is the one installed, its atlas is uploaded with the
     /// built-in atlas in layer 0, and a staging and an instance buffer are
@@ -1263,7 +1263,7 @@ impl Renderer {
         self.draw(start, None, Projection::fixed(self.target()))
     }
 
-    /// Draws the play screen while a chart loads before the countdown, as
+    /// Draws the play screen while a chart loads before READY, as
     /// [`frame`](Self::frame) draws: the skin's loading frame `f`
     /// ([`enter_loading`](Self::enter_loading), then
     /// [`build_loading`](Self::build_loading)), then in a pass of its own

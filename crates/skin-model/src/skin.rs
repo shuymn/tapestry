@@ -1725,7 +1725,7 @@ impl Skin {
     }
 
     /// A fresh loading state ([`Loading`]) for the play screen before a
-    /// chart's countdown, its lanes laid out for `scratch`: no chart, every
+    /// chart's READY state, its lanes laid out for `scratch`: no chart, every
     /// timer off and every text slot empty until a build or an install.
     #[must_use]
     pub fn prepare_loading(&self, scratch: Side) -> Loading {
@@ -1815,7 +1815,7 @@ impl Skin {
     ///
     /// # Errors
     ///
-    /// A negative lead-in, a countdown start outside the time range, or a
+    /// A negative lead-in, a READY state start outside the time range, or a
     /// section whose initial gauges do not match the context's gauges.
     pub fn prepare(&self, chart: &Chart, ctx: &PlayContext<'_>) -> Result<Play, PrepareError> {
         Play::new(

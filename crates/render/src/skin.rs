@@ -178,7 +178,7 @@ pub struct SkinError {
 }
 
 /// A play screen layout. The renderer calls `load_chart` when a chart is
-/// chosen, `prepare` before each attempt's countdown and `build` once per
+/// chosen, `prepare` before each attempt's READY state and `build` once per
 /// frame. `build` must not allocate: everything it needs is sized in
 /// `prepare`.
 pub trait PlaySkin: Send {
@@ -258,7 +258,7 @@ pub trait PlaySkin: Send {
     }
 
     /// Fills `out`, which arrives empty, with the play screen's frame `f`
-    /// while a chart loads before the countdown (design.md "Play
+    /// while a chart loads before READY (design.md "Play
     /// Lifecycle"): the lanes and the rest of the screen without notes,
     /// and nothing of any chart: the skin may still hold the previous
     /// chart's preparation, whose values the loading frame must not show.

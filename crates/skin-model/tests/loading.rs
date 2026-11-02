@@ -1,5 +1,5 @@
 //! The loading runtime: the play screen's state from a chart's choice to
-//! its countdown, built without a chart (stage3.md R3, "The loading
+//! its READY state, built without a chart (stage3.md R3, "The loading
 //! runtime").
 //!
 //! Unless stated: the loading lifetime's origin at 0, its progress 0, a

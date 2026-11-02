@@ -6,7 +6,7 @@
 //! elements into the batch, image quads at their native size where they
 //! keep one; the score rates and the gauge kind under both empty-POOR
 //! policies as the shown gauge switches, a refused inconsistent snapshot,
-//! and the readouts per round: known and unknown metrics, the countdown,
+//! and the readouts per round: known and unknown metrics, READY,
 //! a STOP, control changes, an invalid frame and the poisoned play.
 //!
 //! A counting global allocator counts allocations made on threads that opt
@@ -2855,7 +2855,7 @@ fn stretch_readouts(frame_no: usize, view: LaneView) -> FrameReadouts {
 }
 
 /// Readouts allocate nothing per round, each prepared untracked: the
-/// first build and later ones through the countdown, a STOP, tempo and
+/// first build and later ones through READY, a STOP, tempo and
 /// control changes and past the end, then an invalid frame and a build
 /// on the poisoned play; and an invalid first build.
 fn readouts_do_not_allocate(loaded: &Loaded, descs: &[GaugeDesc]) {

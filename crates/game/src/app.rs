@@ -8,7 +8,7 @@
 //!
 //! - A chart chosen to play, and each practice Start, switches to the play
 //!   screen in its loading state at once ([`AppRig::entered_loading`]),
-//!   before anything is read; it lasts until the countdown or the way back.
+//!   before anything is read; it lasts until READY or the way back.
 //! - A refused load returns to selection with the reason, and the chart
 //!   stays selected: a chart or preset file that cannot be used, a bank
 //!   that does not load, a play whose attempt the screen refuses to
@@ -62,7 +62,7 @@ pub trait AppRig: Rig {
     fn load_chart(&mut self, loaded: &Loaded) -> Result<Loading, Self::BankError>;
     /// A chart's load for play began: the play screen shows in its loading
     /// state from here, before anything of `chart` is read, until the
-    /// play's countdown or a return to where the chart was chosen
+    /// play's READY state or a return to where the chart was chosen
     /// (selection with a refusal or after a cancel, the practice page), or
     /// the run's end. Called at every chosen chart to play and at every
     /// practice Start, never at a retry, which loads nothing.

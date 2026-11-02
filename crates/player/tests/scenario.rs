@@ -306,7 +306,7 @@ fn exit_scenario_plays_select_result_retry_repeatedly() {
         // The log's presses fall on 1× times: at 75 % they miss.
         "play 1: Completed; ",
         "play started",
-        // The quit in the next round's countdown returns to the page.
+        // The quit in the next round's READY state returns to the page.
         "play 2: Aborted(Quit); nothing recorded",
         "dev: scenario: step 18 (quit)",
     ];
@@ -796,7 +796,7 @@ fn a_practice_at_a_speed_measures_the_charts_1x_gain() {
     // The +6 dB cap: four times the headroom.
     assert!(db > 5.5, "{stdout}");
     // The Start left the practice page for the play screen's loading state, which said
-    // the measurement and was drawn, up to the round's countdown.
+    // the measurement and was drawn, up to the round's READY state.
     let all: Vec<&str> = stdout.lines().collect();
     let at = |from: usize, line: &str| {
         (from..all.len())

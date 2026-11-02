@@ -163,7 +163,7 @@ pub struct SkinFrame<'a> {
     /// section attempt then rings out without notes.
     pub complete: bool,
     /// Whether this frame's update entered the play in its playing state:
-    /// false during the countdown and after a stop, the finish or the fade
+    /// false during READY and after a stop, the finish or the fade
     /// out. A gauge failure during the frame's own update leaves it true.
     pub playing: bool,
     /// The render target's size in pixels; the skin computes its canvas
@@ -179,7 +179,7 @@ pub struct SkinFrame<'a> {
     pub readouts: FrameReadouts,
 }
 
-/// The chart's load as the play screen shows it before the countdown
+/// The chart's load as the play screen shows it before READY
 /// ([`LoadingFrame::load`](crate::LoadingFrame::load)).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LoadState {
@@ -197,7 +197,7 @@ pub enum PrepareError {
     NegativeLeadIn,
     #[error("the attempt gives {got} initial gauges for {expected} gauges")]
     InitialGauges { expected: usize, got: usize },
-    #[error("the attempt's countdown starts outside the time range")]
+    #[error("the attempt's READY state starts outside the time range")]
     Overflow,
     #[error("the attempt's section ends before it starts")]
     InvalidSectionRange,

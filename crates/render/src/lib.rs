@@ -11,7 +11,7 @@
 //! of latency, the render thread waiting on the waitable object itself) or
 //! into an offscreen target that tests read back. Every pipeline is created
 //! and every upload finished in [`Renderer::new`], [`Renderer::load`] and
-//! [`Renderer::install_atlas`], before the countdown; a new target size is
+//! [`Renderer::install_atlas`], before READY; a new target size is
 //! applied between frames ([`Renderer::resize`]).
 //!
 //! The app's per-frame work, the skin's build into the preallocated

@@ -6,7 +6,7 @@
 //! is prepared) still ends the run. In the game's runs, with song selection
 //! or a chart given on the command line, the quit key is instead a command
 //! taken once, like retry and suspend, by the play or result it arrives in
-//! ([`Controls::quit_leaves`]): in a play's countdown it leaves the chart,
+//! ([`Controls::quit_leaves`]): in a play's READY state it leaves the chart,
 //! while the chart plays it ends the play on its result, and once the play
 //! is complete it skips its tail to the result. Elsewhere (the key config)
 //! it latches as a close does.
