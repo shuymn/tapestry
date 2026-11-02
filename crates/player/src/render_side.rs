@@ -4406,6 +4406,113 @@ pub(crate) mod tests {
         }
     }
 
+    /// A screen noting each frame's chart time with the rearms it was told
+    /// of so far.
+    struct RearmedFrames {
+        frames: Arc<std::sync::Mutex<Vec<(u32, TimeUs)>>>,
+        rearms: u32,
+    }
+
+    impl Screen for RearmedFrames {
+        fn load(
+            &mut self,
+            _chart: &Chart,
+            _section: Option<&eval::Section>,
+        ) -> Result<(), RenderError> {
+            Ok(())
+        }
+        fn wait(&self) -> bool {
+            true
+        }
+        fn paced(&self) -> bool {
+            false
+        }
+        fn build(&mut self, f: &FrameInput<'_>) -> Result<(), skin_model::BuildError> {
+            self.frames.lock().unwrap().push((self.rearms, f.now));
+            Ok(())
+        }
+        fn draw(&mut self) -> Result<FrameTiming, RenderError> {
+            Ok(timing(true))
+        }
+        fn text(&mut self, _lines: &[&str]) -> Result<bool, RenderError> {
+            Ok(true)
+        }
+        fn rearm(&mut self) {
+            self.rearms += 1;
+        }
+        #[cfg(feature = "dev-tools")]
+        fn read_back(&self) -> Option<(u32, u32, Vec<u8>)> {
+            None
+        }
+    }
+
+    /// A READY rearm reaches the screen through the render thread: the
+    /// logic step's rearm tells the screen once, before its first frame
+    /// drawn from the rearmed candidate's origin.
+    #[test]
+    fn a_rearm_reaches_the_screen_before_its_first_frame() {
+        let chart = ChartBuilder::new(120_000)
+            .tap(Lane::new(1).unwrap(), TimeUs(60_000_000))
+            .build()
+            .unwrap();
+        let (rule, device) = (rules::tapestry(), DeviceProfile::default());
+        let (mut logic, side) = Logic::<SourceReader>::new(
+            &chart,
+            &rule,
+            &device,
+            &InputStart::default(),
+            Vec::new(),
+            LogicConfig {
+                inputs: 0,
+                effects: 16,
+            },
+            Vec::new(),
+        )
+        .unwrap();
+        let frames = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let noted = Arc::clone(&frames);
+        let make: MakeScreen = Box::new(move || {
+            Ok(Box::new(RearmedFrames {
+                frames: Arc::clone(&noted),
+                rearms: 0,
+            }) as Box<dyn Screen>)
+        });
+        let clock = QpcClock::start();
+        let shared_chart = Arc::new(chart.clone());
+        let link = spawn(
+            make,
+            Some(Arc::clone(&shared_chart)),
+            None,
+            clock,
+            view(),
+            measure(clock),
+            Box::new(NoFrames),
+        )
+        .unwrap();
+        let ready = link.prepare_attempt(attempt(&shared_chart, None), || false);
+        assert_eq!(ready.unwrap(), Preparation::Ready);
+        link.send(RenderMsg::Play {
+            side,
+            gauge: 0,
+            measure: play_measure(clock.now()),
+        });
+        assert!(wait_until(|| frames.lock().unwrap().len() >= 2));
+        // The next candidate's chart time 0 lies 10 s ahead.
+        logic.rearm(&InputStart::default(), TimeUs(clock.now().0 + 10_000_000));
+        assert!(wait_until(|| frames
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(_, now)| now.0 < -9_000_000)));
+        let _ = link.finish(clock.now());
+        link.exit();
+        let frames = frames.lock().unwrap();
+        for &(rearms, now) in frames.iter() {
+            let expected = u32::from(now.0 < -9_000_000);
+            assert_eq!(rearms, expected, "a frame at {now:?}");
+        }
+    }
+
     /// A refused frame stops the attempt without dropping the screen: it
     /// is reported as the screen's failure, so the game ends the play, and
     /// no frame of that preparation is built or drawn again, however many
