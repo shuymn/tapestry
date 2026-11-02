@@ -233,14 +233,10 @@ fn natives(lua: &Lua, pass: &Rc<Pass>, env: &Table) -> mlua::Result<()> {
                 && args
                     .get(3)
                     .is_some_and(|v| !matches!(v, Value::Nil | Value::Boolean(false)));
-            let pattern = match args.get(1) {
-                Some(Value::String(p)) => p.as_bytes().to_vec(),
-                _ => Vec::new(),
-            };
-            let work = if plain {
-                to_u64(len(0)).saturating_mul(to_u64(len(1)).saturating_add(1))
-            } else {
-                pattern_work(len(0), &pattern)
+            let work = match args.get(1) {
+                _ if plain => to_u64(len(0)).saturating_mul(to_u64(len(1)).saturating_add(1)),
+                Some(Value::String(p)) => pattern_work(len(0), &p.as_bytes()),
+                _ => pattern_work(len(0), &[]),
             };
             pass.ledger.native(lua, work)?;
             native.call::<MultiValue>(args)
