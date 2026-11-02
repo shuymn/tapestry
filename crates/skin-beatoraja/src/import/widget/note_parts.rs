@@ -1,15 +1,16 @@
-//! The note record's part arrays and note heights, checked whole before
-//! any part is resolved, admitted or generated.
+//! The note record's part arrays and note heights, checked before any
+//! part is resolved, admitted or generated.
 //!
-//! The source reads every array it selects in full and transposes the
-//! long-note arrays by `lnend`'s length (`JsonPlaySkinObjectLoader.java:
-//! 46-77` at `0.8.9`), then indexes them per lane (`play/SkinNote.java:
-//! 26-30`): a missing, `null` or short selected array, or a `null` entry,
-//! throws there. Here each refuses with its field and index, before
-//! anything is loaded. An entry that names no image is not refused: the
-//! source draws generated paint for it ([`super::lanes`]). Only the
-//! eight lanes' entries are kept, as node ids; the rest of each array is
-//! scanned in place.
+//! The lanes draw six parts per lane from the arrays the source selects
+//! (`JsonPlaySkinObjectLoader.java:46-77` at `0.8.9`): `note`,
+//! `lnstart`, `lnend`, the two selected bodies and `mine`. Each must be
+//! an array with an id for each of the eight lanes; a missing, `null`,
+//! short or malformed one, or a lane's `null` or non-id entry, refuses
+//! with its field and index before anything is loaded. Entries past the
+//! lanes and the arrays the lanes never draw are not checked, where the
+//! source throws on some of them. An entry that names no image is not
+//! refused: the source draws generated paint for it ([`super::lanes`]).
+//! Only the eight lanes' entries are kept, as node ids.
 
 use super::super::Cx;
 use super::super::geom::Q;
@@ -49,7 +50,6 @@ const LNEND: usize = 2;
 const LNBODY: usize = 3;
 const LNBODY_ACTIVE: usize = 4;
 const LNACTIVE: usize = 5;
-const HCN_BODY_ACTIVE: usize = 10;
 const MINE: usize = 15;
 const HIDDEN: usize = 16;
 const PROCESSED: usize = 17;
@@ -96,10 +96,18 @@ impl Cx<'_> {
         }
     }
 
-    /// Part array `i` of record `rec` scanned in place: an array whose
-    /// entries are ids. `hidden` and `processed` keep their own reading:
-    /// a type error for anything but an array of strings or `null`s.
-    fn scan_part(&self, at: Span, i: usize, node: Option<u32>) -> Result<Scan, ImportError> {
+    /// Part array `i` of record `rec` scanned in place. One the lanes
+    /// draw (`drawn`) must be an array whose lanes' entries are ids; any
+    /// other is only counted, an array's entries or else none. `hidden`
+    /// and `processed` keep their own reading: a type error for anything
+    /// but an array of strings or `null`s.
+    fn scan_part(
+        &self,
+        at: Span,
+        i: usize,
+        node: Option<u32>,
+        drawn: bool,
+    ) -> Result<Scan, ImportError> {
         let field = FIELDS.get(i).copied().unwrap_or("note");
         let lenient = i == HIDDEN || i == PROCESSED;
         let Some(f) = node else {
@@ -109,6 +117,9 @@ impl Cx<'_> {
         if arena.node(f).kind != Kind::Array {
             if lenient {
                 return Err(self.def.type_error(f, field, "an array"));
+            }
+            if !drawn {
+                return Ok(Scan::default());
             }
             let why = if matches!(arena.scalar(f), Scalar::Null) {
                 PartWhy::Null
@@ -121,13 +132,15 @@ impl Cx<'_> {
             node: Some(f),
             ..Scan::default()
         };
+        let lanes = u32::try_from(LANES).unwrap_or(u32::MAX);
         for (index, c) in (0_u32..).zip(arena.children(f)) {
             let why = match arena.scalar(c) {
                 Scalar::Object | Scalar::Array if lenient => {
                     return Err(self.def.type_error(c, field, "a string"));
                 }
+                _ if !drawn || index >= lanes => None,
                 Scalar::Object | Scalar::Array => Some(PartWhy::BadEntry { index }),
-                Scalar::Null if !lenient => Some(PartWhy::NullEntry { index }),
+                Scalar::Null => Some(PartWhy::NullEntry { index }),
                 _ => None,
             };
             if let Some(why) = why {
@@ -144,58 +157,50 @@ impl Cx<'_> {
         Ok(scan)
     }
 
-    /// Record `rec`'s part arrays checked, in order: every supplied
-    /// array's form and entries, in field order; then each array the
-    /// source selects present and long enough: exactly eight notes,
-    /// `lnend` of at least eight (`N`), the start, the selected bodies
-    /// and the selected HCN arrays of at least `N`, at least eight mines.
-    /// An unselected alias may be absent, but one supplied must be well
-    /// formed. A missing array is located at the record.
+    /// Record `rec`'s part arrays checked, in field order: each array the
+    /// lanes draw well formed through the lanes, `hidden` and `processed`
+    /// as their reading says; then each drawn array present with eight
+    /// entries, exactly eight for `note`. The bodies are `lnbodyActive`
+    /// and `lnbody` when `lnbodyActive` is a non-empty array, else
+    /// `lnbody` and `lnactive`. A missing array is located at the record.
     pub(super) fn note_parts(&self, rec: u32) -> Result<NotePartsPlan, ImportError> {
         let at = self.arena_span(rec);
         let nodes = self.def.fields(rec, FIELDS);
-        let mut scans = [Scan::default(); FIELDS.len()];
-        for (i, (scan, node)) in scans.iter_mut().zip(nodes).enumerate() {
-            *scan = self.scan_part(at, i, node)?;
-        }
-        let scan = |i: usize| scans.get(i).copied().unwrap_or_default();
+        let node = |i: usize| nodes.get(i).copied().flatten();
         let field = |i: usize| FIELDS.get(i).copied().unwrap_or("note");
 
-        // The selected arrays (`JsonPlaySkinObjectLoader.java:46-77`).
-        let ln_active = scan(LNBODY_ACTIVE).len > 0;
+        // The selected bodies (`JsonPlaySkinObjectLoader.java:46-77`).
+        let ln_active = self
+            .scan_part(at, LNBODY_ACTIVE, node(LNBODY_ACTIVE), false)?
+            .len
+            > 0;
         let (on, off) = if ln_active {
             (LNBODY_ACTIVE, LNBODY)
         } else {
             (LNBODY, LNACTIVE)
         };
-        // hcnstart, hcnend, then the active, inactive, damage and
-        // reactive bodies of the branch.
-        let hcn: [usize; 6] = if scan(HCN_BODY_ACTIVE).len > 0 {
-            [6, 7, 10, 8, 14, 12]
-        } else {
-            [6, 7, 8, 9, 11, 13]
-        };
-        let need = |cx: &Self, i: usize, need: u32, exact: bool| {
+        let parts = [NOTE, LNSTART, LNEND, on, off, MINE];
+        let mut scans = [Scan::default(); FIELDS.len()];
+        for (i, scan) in scans.iter_mut().enumerate() {
+            *scan = self.scan_part(at, i, node(i), parts.contains(&i))?;
+        }
+        let scan = |i: usize| scans.get(i).copied().unwrap_or_default();
+        let need = |cx: &Self, i: usize| {
             let s = scan(i);
             let Some(node) = s.node else {
                 return Err(cx.part_error(at, None, field(i), PartWhy::Missing));
             };
-            if s.len < need || (exact && s.len != need) {
+            let need = u32::try_from(LANES).unwrap_or(u32::MAX);
+            if s.len < need || (i == NOTE && s.len != need) {
                 let why = PartWhy::Length { len: s.len, need };
                 return Err(cx.part_error(at, Some(node), field(i), why));
             }
             Ok(())
         };
-        let eight = u32::try_from(LANES).unwrap_or(u32::MAX);
-        need(self, NOTE, eight, true)?;
-        need(self, LNEND, eight, false)?;
-        let n = scan(LNEND).len;
-        for i in [LNSTART, on, off].into_iter().chain(hcn) {
-            need(self, i, n, false)?;
+        for i in parts {
+            need(self, i)?;
         }
-        need(self, MINE, eight, false)?;
 
-        let parts = [NOTE, LNSTART, LNEND, on, off, MINE];
         let mut plan = NotePartsPlan {
             nodes: [[0; 6]; LANES],
             fields: parts.map(field),

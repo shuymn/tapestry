@@ -282,22 +282,26 @@ fn judge_entries_need_an_id() {
     let mut images = grades(1);
     images.push(NONE.to_owned());
     judge(&images, &[combo("ten", 10), NONE.to_owned()]).ok();
-    // A missing one refuses, for an image past the slots too.
+    // A missing one refuses in a slot that is drawn.
     let mut images = grades(1);
     images.push(no_id.clone());
     assert_eq!(
         critical(judge(&images, &[combo("ten", 10), NONE.to_owned()])),
         refused("images")
     );
-    let mut images = grades(7);
-    images.push(no_id.clone());
-    let numbers = vec![NONE.to_owned(); 8];
-    assert_eq!(critical(judge(&images, &numbers)), refused("images"));
     assert_eq!(
         critical(judge(&grades(2), &[combo("ten", 10), no_id.clone()])),
         refused("numbers")
     );
-    // A number past the images is never read.
+    // Entries never drawn are not read: an image past the slots, a
+    // number of a slot without a combo, a number past the images.
+    let mut images = grades(7);
+    images.push(no_id.clone());
+    let l = judge(&images, &vec![NONE.to_owned(); 8]);
+    assert!(has(l.report(), NoteKind::Ignored { field: "images" }));
+    let mut numbers = vec![NONE.to_owned(); 3];
+    numbers.push(no_id.clone());
+    judge(&grades(4), &numbers).ok();
     judge(&grades(1), &[combo("ten", 10), no_id]).ok();
 }
 
@@ -341,14 +345,10 @@ fn judges_refuse_what_the_model_cannot_share() {
         critical(skin(r#""value": []"#, &both, &[DST, &k])).1,
         NoteKind::UnsupportedField { field: "index" }
     );
-    // Fewer numbers than images, while the skin has values.
+    // Fewer numbers than images leave the rest without combos.
     let short = judge_rec(&grades(2), &[combo("ten", 10)], "");
-    assert_eq!(
-        critical(skin(VALUES, &short, &[DST])).1,
-        NoteKind::UnsupportedField { field: "numbers" }
-    );
-    let l = skin(r#""value": []"#, &short, &[DST]);
-    assert_eq!(l.report().usage.widget_quads, 1);
+    let l = skin(VALUES, &short, &[DST]);
+    assert_eq!(l.report().usage.widget_quads, 4);
     // Drawn twice.
     assert_eq!(
         critical(judge_two()).1,

@@ -112,32 +112,6 @@ impl Cx<'_> {
             Some(f) => self.def.bool(f, "shift")?,
             None => false,
         };
-        // The source reads `numbers[i]` for every image while the skin
-        // has numbers (`JsonPlaySkinObjectLoader.java:244-245`).
-        let has_values = !super::super::object::records(&self.tables, "value").is_empty();
-        if numbers.len() < images.len() && has_values {
-            return refuse(self, at, field("numbers"));
-        }
-        // The source compares every image's id, and every number's for
-        // each image, with the skin's records, and fails on a missing one
-        // (`JsonPlaySkinObjectLoader.java:230-232, 243-244`).
-        let has_images = !super::super::object::records(&self.tables, "image").is_empty();
-        let lists = [
-            (&images[..], has_images, "images"),
-            (
-                numbers.get(..images.len()).unwrap_or(&numbers),
-                has_values,
-                "numbers",
-            ),
-        ];
-        for (list, compared, name) in lists {
-            for &r in list {
-                if compared && super::super::object::id_of(self.def, r)?.is_none() {
-                    return refuse(self, self.arena_span(r), field(name));
-                }
-            }
-        }
-
         // The outer destination: lifetime, timer and conditions.
         let Some(c) = self.common_with(
             role,
@@ -159,9 +133,14 @@ impl Cx<'_> {
         if images.len() > JudgeSlot::COUNT {
             self.ignored(at, NoteKind::Ignored { field: "images" });
         }
+        // A drawn slot's grade, and the combo of a slot that draws one
+        // beside it, must name its record; the other entries are not read.
         for (k, &g) in images.iter().enumerate().take(JudgeSlot::COUNT) {
             let (id, gdst) = self.read_nested(g)?;
-            let Some(img) = id.map(|id| self.image_rec(&id)).transpose()?.flatten() else {
+            let Some(id) = id else {
+                return refuse(self, self.arena_span(g), field("images"));
+            };
+            let Some(img) = self.image_rec(&id)? else {
                 continue;
             };
             if let Some(slot) = grades.get_mut(k) {
@@ -175,11 +154,18 @@ impl Cx<'_> {
 
         let mut combos: [Option<ComboPart>; JudgeSlot::COUNT] = Default::default();
         for (k, &n) in numbers.iter().enumerate().take(images.len()) {
+            let drawn = COMBO_SLOTS.contains(&k);
             let (id, ndst) = self.read_nested(n)?;
-            let Some(value) = id.map(|id| self.value_rec(&id)).transpose()?.flatten() else {
+            let Some(id) = id else {
+                if drawn {
+                    return refuse(self, self.arena_span(n), field("numbers"));
+                }
                 continue;
             };
-            if !COMBO_SLOTS.contains(&k) {
+            let Some(value) = self.value_rec(&id)? else {
+                continue;
+            };
+            if !drawn {
                 self.ignored(ndst.span, NoteKind::Ignored { field: "numbers" });
                 continue;
             }
