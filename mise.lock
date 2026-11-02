@@ -66,24 +66,27 @@ url = "https://github.com/EmbarkStudios/cargo-deny/releases/download/0.20.2/carg
 url_api = "https://api.github.com/repos/EmbarkStudios/cargo-deny/releases/assets/471599057"
 
 [[tools."github:babarot/gh-infra"]]
-version = "0.17.5"
+version = "0.18.0"
 backend = "github:babarot/gh-infra"
 specifiers = ["0"]
 
 [tools."github:babarot/gh-infra"."platforms.linux-x64"]
-checksum = "sha256:8de12718b62985b9571a3070ffd775c8581b90c64b7602a15a5300e248468fe1"
-url = "https://github.com/babarot/gh-infra/releases/download/v0.17.5/gh-infra_linux_amd64.tar.gz"
-url_api = "https://api.github.com/repos/babarot/gh-infra/releases/assets/675567906"
+checksum = "sha256:b3a1c51899cda58eed6313a9f83e059b9980a1417e455190049e83d7da35818e"
+checksum_source = "mise-versions"
+url = "https://github.com/babarot/gh-infra/releases/download/v0.18.0/gh-infra_linux_amd64.tar.gz"
+url_api = "https://api.github.com/repos/babarot/gh-infra/releases/assets/697883292"
 
 [tools."github:babarot/gh-infra"."platforms.macos-arm64"]
-checksum = "sha256:4fc2c0a923011afac9eb8d3c1a09f1f58c8760ce9193682377c5d9e28ac350ad"
-url = "https://github.com/babarot/gh-infra/releases/download/v0.17.5/gh-infra_darwin_arm64.tar.gz"
-url_api = "https://api.github.com/repos/babarot/gh-infra/releases/assets/675567867"
+checksum = "sha256:210f9f57a2b61bc25c025fe5e8cb7cce6b3fc194f8a9c15dd20cc3757aae0e9c"
+checksum_source = "mise-versions"
+url = "https://github.com/babarot/gh-infra/releases/download/v0.18.0/gh-infra_darwin_arm64.tar.gz"
+url_api = "https://api.github.com/repos/babarot/gh-infra/releases/assets/697883261"
 
 [tools."github:babarot/gh-infra"."platforms.windows-x64"]
-checksum = "sha256:2f25cd71b5b71ee248a689e27653af137dca0a9d5c51567fb1ab537aabb6f044"
-url = "https://github.com/babarot/gh-infra/releases/download/v0.17.5/gh-infra_windows_amd64.zip"
-url_api = "https://api.github.com/repos/babarot/gh-infra/releases/assets/675567887"
+checksum = "sha256:11019730004d7cf90ca959a6dd48354b525a133c49cf16d7a9132282f3817901"
+checksum_source = "mise-versions"
+url = "https://github.com/babarot/gh-infra/releases/download/v0.18.0/gh-infra_windows_amd64.zip"
+url_api = "https://api.github.com/repos/babarot/gh-infra/releases/assets/697883300"
 
 [[tools."github:bnjbvr/cargo-machete"]]
 version = "0.9.2"
