@@ -281,8 +281,14 @@ fn a_commit_checks_the_request_and_the_device_apart() {
     r.commit(token).unwrap();
     let (_, p) = frame(&mut r);
     halves(&p, RED, BLACK);
-    // Committed once, it is gone.
-    assert_eq!(r.commit(token), Err(CommitError::NothingStaged));
+    // Committed once, it is superseded.
+    assert_eq!(
+        r.commit(token),
+        Err(CommitError::Superseded {
+            committed: 7,
+            asked: 7
+        })
+    );
     // A discarded staging cannot be committed either.
     let token = stage(&mut r, &a, &chart, 8).unwrap();
     r.discard();
