@@ -13,7 +13,8 @@ use play_support::{Harness, MS, pct};
 use rules::{GaugeKind, GaugeValue};
 use skin_model::{
     Attempt, GaugeDef, GaugeDesc, GaugeError, GaugeLook, GaugePart, LoadError, MAX_KEY_US,
-    MAX_SEGMENTS, Motion, Place, PlayContext, Side, Skin, Source, WidgetDefs,
+    MAX_SEGMENTS, MAX_WIDGET_QUADS, Motion, Place, PlayContext, QuadBatch, Side, Skin, Source,
+    WidgetDefs,
 };
 use widget_support::{GAUGE, chart, desc, drawn, element, gauge, load};
 
@@ -292,12 +293,182 @@ fn flicker_overlays_the_tip_with_a_triangle_alpha() {
 
 #[test]
 fn the_most_segments_draw_with_the_flicker_tip() {
-    let mut h = harness(gauge(MAX_SEGMENTS, Motion::Flicker { period: TimeUs(MS) }));
+    // One segment fewer than the most leaves the tip its quad: the whole
+    // widget budget, the tip pushed at alpha 0 at the period's start, right
+    // after the last lit segment.
+    let p = MAX_SEGMENTS - 1;
+    let flicker = gauge(p, Motion::Flicker { period: TimeUs(MS) });
+    let mut h = harness(flicker);
+    assert_eq!(h.skin.quad_capacity(), MAX_WIDGET_QUADS);
     h.gauges[0].value = pct(50);
     h.frame(0, &[]);
-    assert_eq!(h.batch.quads().len(), 1_001);
+    assert_eq!(h.batch.quads().len(), 16_384);
     assert!(h.batch.is_full());
     assert_eq!(h.batch.dropped(), 0);
+    let s = segs(&h);
+    // 50 % of 16 383 lights 8 191.
+    assert_eq!((s[8_190].part, s[8_191].part), (0, 2));
+    assert_eq!(s[8_191].rect, s[8_190].rect);
+    assert_eq!(s[8_191].alpha, 0.0);
+    assert_eq!(s[8_192].part, 1);
+    // At 0 every segment is back and the tip is not drawn; the capacity
+    // keeps its quad.
+    h.gauges[0].value = GaugeValue(0);
+    h.frame(16, &[]);
+    assert_eq!(segs(&h).len(), usize::from(p));
+    assert!(segs(&h).iter().all(|s| s.part == 1));
+    assert_eq!(h.skin.quad_capacity(), MAX_WIDGET_QUADS);
+}
+
+#[test]
+fn the_most_segments_fit_without_a_flicker() {
+    // The parameter allows 16 384 segments under every motion; the widget
+    // budget refuses the flicker's tip one past it.
+    assert_eq!(u32::from(MAX_SEGMENTS), MAX_WIDGET_QUADS);
+    let mut h = harness(gauge(MAX_SEGMENTS, Motion::Still));
+    h.gauges[0].value = GaugeValue::FULL;
+    h.frame(0, &[]);
+    assert_eq!(h.batch.quads().len(), 16_384);
+    assert_eq!(h.batch.dropped(), 0);
+    let fall = Motion::Fall {
+        range: MAX_SEGMENTS,
+        step: TimeUs(1),
+    };
+    assert!(skin_of(gauge(MAX_SEGMENTS, fall)).is_ok());
+    assert!(matches!(
+        skin_of(gauge(MAX_SEGMENTS, Motion::Flicker { period: TimeUs(MS) })),
+        Err(LoadError::TooManyWidgetQuads { n: 16_385 })
+    ));
+}
+
+/// A descriptor of the raw maximum `max` and border `border`.
+fn raw(max: i64, border: i64) -> GaugeDesc {
+    GaugeDesc {
+        start: GaugeValue(0),
+        max: GaugeValue(max),
+        look: GaugeLook::Normal,
+        border: GaugeValue(border),
+    }
+}
+
+#[test]
+fn many_segments_read_the_raw_value() {
+    // 16 384 segments of a maximum of 10 000 000: 5 000 000 and 5 000 611
+    // share 500 ‰ but light 8 192 and 8 193; 5 000 610 still 8 192.
+    let mut h = harness_with(gauge(MAX_SEGMENTS, Motion::Still), &[raw(10_000_000, 0)]);
+    for (value, n) in [
+        (5_000_000, 8_192),
+        (5_000_610, 8_192),
+        (5_000_611, 8_193),
+        (1, 1),
+        (10_000_000, 16_384),
+        (i64::MAX, 16_384),
+        (0, 0),
+        (i64::MIN, 0),
+    ] {
+        h.gauges[0].value = GaugeValue(value);
+        h.frame(0, &[]);
+        assert_eq!(lit(&h), n, "{value}");
+    }
+    // The extremes of the raw maximum: one below it lights all but one.
+    let mut h = harness_with(gauge(MAX_SEGMENTS, Motion::Still), &[raw(i64::MAX, 0)]);
+    h.gauges[0].value = GaugeValue(i64::MAX - 1);
+    h.frame(0, &[]);
+    assert_eq!(lit(&h), 16_383);
+}
+
+#[test]
+fn many_segments_meet_the_border_exactly() {
+    // A maximum of 16 384 and a border of 8 192: segment 8 192 is exactly
+    // on it, so at or above; 8 191 below. A maximum of 3 (not dividing
+    // 16 384) and a border of 1: `i·3 < 16 384` below up to 5 461.
+    let below = |max: i64, border: i64| {
+        let mut h = harness_with(gauge(MAX_SEGMENTS, Motion::Still), &[raw(max, border)]);
+        h.gauges[0].value = GaugeValue(max);
+        h.frame(0, &[]);
+        segs(&h).iter().filter(|s| s.below).count()
+    };
+    assert_eq!(below(16_384, 8_192), 8_191);
+    assert_eq!(below(3, 1), 5_461);
+}
+
+#[test]
+fn a_full_range_motion_wraps_over_every_segment() {
+    // Fall over every segment, a step of 1 µs, all lit: the fronts below
+    // the tip are `16 383 − a`, `a = k mod 16 385`.
+    let fall = Motion::Fall {
+        range: MAX_SEGMENTS,
+        step: TimeUs(1),
+    };
+    let mut h = harness(gauge(MAX_SEGMENTS, fall));
+    h.gauges[0].value = GaugeValue::FULL;
+    let mut fronts = |t: i64| {
+        h.frame_us(t, &[]);
+        segs(&h).iter().filter(|s| s.part == 0).count()
+    };
+    let start = 1_000;
+    assert_eq!(fronts(start), 15_383);
+    assert_eq!(fronts(start), 15_383, "a repeated time");
+    for (k, want) in [(16_383, 0), (16_384, 0), (16_385, 16_383), (16_386, 16_382)] {
+        assert_eq!(fronts(k), want, "{k}");
+    }
+}
+
+#[test]
+fn narrow_and_degenerate_gauges_keep_their_cells() {
+    // 500 px in 16 384 cells: each 500 / 16 384 wide, the last from
+    // 500 · 16 383 / 16 384; a zero width gives finite empty cells.
+    let mut h = harness(gauge(MAX_SEGMENTS, Motion::Still));
+    h.gauges[0].value = GaugeValue::FULL;
+    h.frame(0, &[]);
+    let s = segs(&h);
+    let w = 500.0 / 16_384.0;
+    assert_eq!(s[0].rect, [0.0, 100.0, w as f32, 20.0]);
+    let last = s[16_383].rect;
+    assert!((f64::from(last[0]) - 500.0 * 16_383.0 / 16_384.0).abs() < 1e-3);
+    assert!((f64::from(last[2]) - w).abs() < 1e-6);
+    for r in [[0, 100, 0, 20], [500, 100, -500, 20]] {
+        let skin = load(
+            vec![element(Source::Gauge(0), r, Place::SCREEN)],
+            WidgetDefs {
+                gauges: vec![gauge(MAX_SEGMENTS, Motion::Still)],
+                ..WidgetDefs::default()
+            },
+        )
+        .unwrap();
+        let ctx = PlayContext {
+            gauges: &[desc(GaugeLook::Normal, 80)],
+            attempt: Attempt::Full { lead_in: TimeUs(0) },
+            empty_poor_breaks_combo: false,
+            empty_poor_counted: false,
+            scratch: Side::Left,
+            ln_default: rules::LnMode::Ln,
+            last_note_end: TimeUs(0),
+            bpm_range: None,
+        };
+        let mut h = Harness::new(skin, &chart(), &ctx);
+        h.gauges.truncate(1);
+        h.gauges[0].value = GaugeValue::FULL;
+        h.frame(0, &[]);
+        let q = h.batch.quads();
+        assert_eq!(q.len(), 16_384, "{r:?}");
+        assert!(q.iter().all(|q| q.rect.iter().all(|v| v.is_finite())));
+    }
+}
+
+#[test]
+fn a_short_batch_keeps_the_first_segments_in_order() {
+    // A batch of 100 quads keeps segments 1 to 100 as a full one draws
+    // them, and drops the rest.
+    let mut h = harness(gauge(MAX_SEGMENTS, Motion::Still));
+    h.gauges[0].value = GaugeValue::FULL;
+    h.frame(0, &[]);
+    let full: Vec<[f32; 4]> = h.batch.quads().iter().map(|q| q.rect).collect();
+    h.batch = QuadBatch::with_capacity(100, 8);
+    h.frame(16, &[]);
+    let short: Vec<[f32; 4]> = h.batch.quads().iter().map(|q| q.rect).collect();
+    assert_eq!(short, full[..100]);
+    assert!(h.batch.dropped() > 0);
 }
 
 fn refused(g: GaugeDef) -> Option<GaugeError> {
