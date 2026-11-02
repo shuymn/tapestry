@@ -183,5 +183,16 @@ fn a_reset_evaluator_is_a_fresh_one_and_allocates_nothing() {
         assert_eq!(ev.tally(), fresh.tally());
         assert_eq!(ev.gauges(), fresh.gauges());
         assert!(ev.is_complete());
+        // Reset after completion: the next run ends again, its song end
+        // emitted once more.
+        TRACK.with(|t| t.set(true));
+        out.clear();
+        ev.reset(&start);
+        assert!(!ev.is_complete());
+        run(&mut ev, &second, end * MS, &mut out);
+        TRACK.with(|t| t.set(false));
+        assert_eq!(ALLOCS.swap(0, Ordering::Relaxed), 0);
+        assert_eq!(out, expected);
+        assert!(ev.is_complete());
     }
 }
