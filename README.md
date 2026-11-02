@@ -2,6 +2,9 @@
 
 A BMS player for Windows, written in Rust.
 
+> [!WARNING]
+> tapestry is currently under development. Formats and behavior may change without notice.
+
 ## Features
 
 - **Judgment recomputable from the input log.** Every press and release is recorded with its timestamp, and judgment, score, and gauges are a pure function of `(chart, input log, rule preset)`. The same play can be re-evaluated under another rule after the fact, such as beatoraja-style or LR2-style, and every gauge of a preset is evaluated side by side regardless of the one displayed.
