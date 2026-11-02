@@ -689,6 +689,25 @@ pub fn skin_jsons() -> Vec<Seed> {
                 true,
             )),
         ),
+        (
+            "digit_offset_fraction",
+            play_skin(&digit_offset_body(r#"[{"x": 1}, {"y": 1.5}]"#, "")),
+        ),
+        (
+            "digit_offset_unselected",
+            play_skin(&digit_offset_body(
+                r#"[{"x": 1}, [{"if": [901], "value": {"x": 2}}], {"x": 3}]"#,
+                "",
+            )),
+        ),
+        (
+            "digit_offset_stretch",
+            play_skin(&digit_offset_body(
+                r#"[{"w": 6, "h": 9}]"#,
+                r#""stretch": 1, "#,
+            )),
+        ),
+        ("digit_offset_rows_limit", digit_offset_rows_limit()),
     ]
     .into_iter()
     .chain(skin_imports())
@@ -755,8 +774,8 @@ fn play_skin(body: &str) -> Vec<u8> {
 }
 
 /// `skin_json` seeds that import: images, numbers, text, bitmap text,
-/// tracks, ops,
-/// offsets, a default file choice and the play objects.
+/// tracks, ops, offsets, a default file choice, the play objects and
+/// digit offsets.
 #[must_use]
 pub fn skin_imports() -> Vec<Seed> {
     vec![
@@ -967,6 +986,7 @@ pub fn skin_imports() -> Vec<Seed> {
             ),
         ),
         ("selectors", play_skin(&selectors_body())),
+        ("digit_offsets", digit_offsets()),
         (
             "note_fallbacks",
             play_skin(&note_parts_body(
@@ -999,6 +1019,54 @@ pub fn skin_imports() -> Vec<Seed> {
             )),
         ),
     ]
+}
+
+/// Digit offsets: the EX score's four cells moved by rows a choice and an
+/// included file insert, the perfect count's cell grown in its aspect
+/// under stretch 1, and a combo's second cell moved.
+fn digit_offsets() -> Vec<u8> {
+    let entry = r#"{"type": 0, "w": 1920, "h": 1080,
+        "source": [{"id": "strip", "path": "strip.png"}, {"id": "grid", "path": "grid.png"}],
+        "image": [{"id": "g", "src": "grid", "w": 4, "h": 4}],
+        "value": [
+            {"id": "ex", "src": "strip", "w": 100, "h": 10, "divx": 10, "digit": 4, "ref": 71,
+             "offset": [{"x": 1}, {"if": [-901], "value": {"y": 2}},
+                        {"if": [-901], "values": {"include": "i1.json"}}]},
+            {"id": "pg", "src": "strip", "w": 100, "h": 10, "divx": 10, "digit": 1, "ref": 110,
+             "offset": {"w": 10, "h": 10}},
+            {"id": "c", "src": "strip", "w": 100, "h": 10, "divx": 10, "digit": 3,
+             "offset": [{}, {"x": 2}, {}]}],
+        "judge": [{"id": "j", "index": 0, "shift": true,
+            "images": [{"id": "g", "timer": 46, "dst": [{"x": 600, "y": 500, "w": 80, "h": 20}]}],
+            "numbers": [{"id": "c", "timer": 46, "dst": [{"x": 10, "y": 0, "w": 10, "h": 20}]}]}],
+        "destination": [
+            {"id": "ex", "timer": 41, "dst": [{"x": 10, "y": 500, "w": 10, "h": 10}]},
+            {"id": "pg", "stretch": 1, "dst": [{"x": 10, "y": 600, "w": 10, "h": 10}]},
+            {"id": "j", "dst": [{"w": 0, "h": 0}]}]}"#;
+    skin_input(&[entry, r#"[{"x": -1, "w": 2, "h": 2}, {"y": 1}]"#])
+}
+
+/// The EX score on one 10×10 cell of `strip`, its digit offset table
+/// `offset`, `stretch` the destination's fields before its keys.
+fn digit_offset_body(offset: &str, stretch: &str) -> String {
+    format!(
+        r#""value": [{{"id": "ex", "src": "strip", "w": 100, "h": 10, "divx": 10, "digit": 1,
+            "ref": 71, "offset": {offset}}}],
+        "destination": [{{"id": "ex", {stretch}"dst": [{{"x": 10, "y": 500, "w": 10, "h": 10}}]}}]"#
+    )
+}
+
+/// Eight includes of one file of 8,193 rows: 65,544 resolved rows, past
+/// the cap, in under 64 KiB.
+fn digit_offset_rows_limit() -> Vec<u8> {
+    let rows = vec!["{}"; 8_193].join(",");
+    let includes = [r#"{"include": "i1.json"}"#; 8].join(", ");
+    let entry = format!(
+        r#"{{"type": 0, "w": 1920, "h": 1080,
+            "source": [{{"id": "strip", "path": "strip.png"}}], {}}}"#,
+        digit_offset_body(&format!("[{includes}]"), "")
+    );
+    skin_input(&[&entry, &format!("[{rows}]")])
 }
 
 /// The twelve part arrays of a note member.

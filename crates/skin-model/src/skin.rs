@@ -28,7 +28,7 @@ use crate::widget::cover_paint::{
     CoverImage, CoverMotion, CoverPaint, CoverPaintDef, CoverPaintError, CoverTrim, PaintImage,
     TrimOutcome,
 };
-use crate::widget::digits::{Align, Digits, Number, NumberDef, NumberError};
+use crate::widget::digits::{Align, Digits, MAX_DIGIT_OFFSETS, Number, NumberDef, NumberError};
 use crate::widget::gauge::{Gauge, GaugeDef, GaugeDraw, GaugeError, Shown};
 use crate::widget::glyphs;
 use crate::widget::glyphs::GlyphLine;
@@ -227,6 +227,8 @@ pub enum LoadError {
     },
     #[error("the image choice tables have {n} entries, more than {MAX_IMAGE_CHOICE_REFS}")]
     TooManyImageChoiceRefs { n: usize },
+    #[error("the glyph strips have {n} digit offsets, more than {MAX_DIGIT_OFFSETS}")]
+    TooManyDigitOffsets { n: usize },
     #[error("image choice table {table}")]
     ImageChoice {
         table: usize,
@@ -1019,6 +1021,19 @@ impl Skin {
         if refs > MAX_IMAGE_CHOICE_REFS {
             return Err(LoadError::TooManyImageChoiceRefs { n: refs });
         }
+        let digit_offsets = w
+            .numbers
+            .iter()
+            .map(|n| &n.digits)
+            .chain(
+                w.judges
+                    .iter()
+                    .flat_map(|j| j.combos.iter().flatten().map(|c| &c.digits)),
+            )
+            .fold(0_usize, |n, d| n.saturating_add(d.offsets.len()));
+        if digit_offsets > MAX_DIGIT_OFFSETS {
+            return Err(LoadError::TooManyDigitOffsets { n: digit_offsets });
+        }
         let keys = elements
             .iter()
             .map(|e| &e.track)
@@ -1271,7 +1286,7 @@ impl Skin {
         let numbers: Box<[Number]> = numbers
             .into_iter()
             .map(|n| Number {
-                digits: Digits::new(&n.digits, image(n.digits.image)),
+                digits: Digits::new(n.digits, image),
                 value: n.value,
             })
             .collect();
@@ -1293,7 +1308,7 @@ impl Skin {
                 }),
                 combos: j.combos.map(|c| {
                     c.map(|c| ComboStrip {
-                        digits: Digits::new(&c.digits, image(c.digits.image)),
+                        digits: Digits::new(c.digits, image),
                         slot: slot(c.timer),
                         track: c.track,
                         attach: c.attach,
@@ -1429,6 +1444,18 @@ impl Skin {
     #[must_use]
     pub fn bar_group_scratch_bytes() -> usize {
         BarScratch::group_bytes()
+    }
+
+    /// The digit offsets the loaded strips hold: every number's and every
+    /// judge combo's, a shared definition once and each stored copy apart.
+    #[must_use]
+    pub fn digit_offset_count(&self) -> usize {
+        let numbers = self.numbers.iter().map(|n| n.digits.offsets.len());
+        let combos = self
+            .judges
+            .iter()
+            .flat_map(|j| j.combos.iter().flatten().map(|c| c.digits.offsets.len()));
+        numbers.chain(combos).sum()
     }
 
     /// The entries of the image choice tables, holes and repeats included.

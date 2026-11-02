@@ -20,7 +20,9 @@ pub(crate) mod text;
 
 use bms_model::TimeUs;
 
+use self::digits::DigitOffset;
 use crate::atlas::uv::{Cycle, FrameUv, UvTable};
+use crate::canvas::f32_of;
 use crate::expr::{Program, State};
 use crate::place::{Affine, LaneMap, Native};
 use crate::play::timers::elapsed_us;
@@ -109,7 +111,13 @@ impl Brush {
             return self.quad_about([x, y, w, h], pivot, f, filter);
         };
         let placed = self.affine.rect([self.map.x(x), y, self.map.w(w), h]);
-        let rect @ [qx, qy, qw, qh] = native.fit(placed, self.scale);
+        self.quad_at(native.fit(placed, self.scale), f, filter)
+    }
+
+    /// The quad showing `f` over the placed canvas rect `rect`, turned
+    /// about its own pivot in it.
+    fn quad_at(&self, rect @ [qx, qy, qw, qh]: [f32; 4], f: FrameUv, filter: Filter) -> Quad {
+        let [fx, fy] = self.pivot;
         Quad {
             rect,
             uv: f.uv,
@@ -119,6 +127,33 @@ impl Brush {
             layer: f.layer,
             filter,
         }
+    }
+
+    /// [`quad`](Self::quad) with a strip cell's paint delta `d` added to
+    /// the placed rect, `d / scale` canvas pixels in `f64`, before its
+    /// native size and its pivot, as the source adds a digit's offset
+    /// before it draws the glyph (`skin/SkinNumber.java:196-205`,
+    /// `skin/SkinObject.java:649-667`). A zero delta is `quad`.
+    pub(crate) fn quad_offset(
+        &self,
+        rect: [f32; 4],
+        d: DigitOffset,
+        f: FrameUv,
+        filter: Filter,
+    ) -> Quad {
+        if d == DigitOffset::default() || self.scale <= 0.0 || self.scale.is_nan() {
+            return self.quad(rect, f, filter);
+        }
+        let [x, y, w, h] = rect;
+        let [px, py, pw, ph] = self.affine.rect([self.map.x(x), y, self.map.w(w), h]);
+        let s = f64::from(self.scale);
+        let add = |v: f32, dv: i32| f32_of(f64::from(v) + f64::from(dv) / s);
+        let moved = [add(px, d.dx), add(py, d.dy), add(pw, d.dw), add(ph, d.dh)];
+        let rect = match self.native {
+            Some(native) => native.fit(moved, self.scale),
+            None => moved,
+        };
+        self.quad_at(rect, f, filter)
     }
 
     /// The quad showing `f` over the reference rect `[x, y, w, h]` turned
@@ -152,6 +187,19 @@ impl Brush {
         filter: Filter,
     ) -> bool {
         out.push(self.key, self.quad(rect, f, filter))
+    }
+
+    /// Pushes [`quad_offset`](Self::quad_offset); `false` when the batch
+    /// refused it.
+    pub(crate) fn push_offset(
+        &self,
+        out: &mut QuadBatch,
+        rect: [f32; 4],
+        d: DigitOffset,
+        f: FrameUv,
+        filter: Filter,
+    ) -> bool {
+        out.push(self.key, self.quad_offset(rect, d, f, filter))
     }
 
     /// [`push`](Self::push) clipped to `clip` as well when one.

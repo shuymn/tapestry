@@ -6,14 +6,15 @@
 
 mod lanes_support;
 mod play_support;
+mod widget_support;
 
 use bms_model::ChartBuilder;
 use lanes_support::{WHITE, image, in_region, lanes_element, simple, skin_with};
 use play_support::{Harness, REGIONS, full};
 use skin_model::{
-    Adjust, Anchor, Controls, ElementDef, Fill, Fit, Follow, LANE_WIDTH_PCT, Layout, LayoutError,
-    MAX_INSET, MAX_OFFSET, MIN_VISIBLE, Place, Region, RegionDef, RegionPlacement, SCALE_PCT, Side,
-    Skin, SkinDef,
+    Adjust, Align, Anchor, Controls, DigitOffset, DigitsDef, ElementDef, Fill, Fit, Follow,
+    GlyphSet, LANE_WIDTH_PCT, Layout, LayoutError, MAX_INSET, MAX_OFFSET, MIN_VISIBLE, Pad, Place,
+    Region, RegionDef, RegionPlacement, SCALE_PCT, Side, Skin, SkinDef, Source, WidgetDefs,
 };
 
 /// `REGIONS` with `changes` applied.
@@ -596,4 +597,46 @@ fn followers_are_placed_as_if_they_followed_nothing() {
     assert_eq!(moved[1], rest[1]);
     let [x, y, w, h] = rest[0];
     assert_eq!(moved[0], [x, y + 600.0, w, h]);
+}
+
+#[test]
+fn digit_offsets_leave_the_logical_box() {
+    // A number in `top` whose cells move far right and grow: its region's
+    // box and clamp are the unmoved strip's, here pushed left 4000 at
+    // 150 % and kept on the canvas by the strip's own 4 · 22 width.
+    let placed = |offsets: Vec<DigitOffset>| {
+        let d = DigitsDef {
+            offsets,
+            ..widget_support::digits(
+                widget_support::TEN,
+                GlyphSet::Ten,
+                4,
+                Align::Right,
+                Pad::Zero,
+            )
+        };
+        let skin = widget_support::load(
+            vec![widget_support::element(
+                Source::Number(0),
+                [100, 50, 20, 30],
+                in_region(Region::Top),
+            )],
+            WidgetDefs {
+                numbers: vec![widget_support::number(d, "1234")],
+                ..WidgetDefs::default()
+            },
+        )
+        .unwrap();
+        let layout = with(&[(Region::Top, adjust(-4_000, 0, 150))]);
+        let canvas = skin.canvas([1_920, 1_080]);
+        skin.placement(&canvas, &layout, Side::Left)
+            .region(Region::Top)
+    };
+    let far = DigitOffset {
+        dx: 4_000,
+        dy: -300,
+        dw: 900,
+        dh: 700,
+    };
+    assert_eq!(placed(vec![far; 4]), placed(Vec::new()));
 }

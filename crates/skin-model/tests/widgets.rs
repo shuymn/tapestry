@@ -89,7 +89,7 @@ fn worst() -> skin_model::Skin {
         ..digits(TEN, GlyphSet::Ten, 4, Align::Right, Pad::Zero)
     };
     for s in [JudgeSlot::Perfect, JudgeSlot::Great, JudgeSlot::Good] {
-        j.combos[s.index()] = Some(combo(strip, [210, 10, 20, 60]));
+        j.combos[s.index()] = Some(combo(strip.clone(), [210, 10, 20, 60]));
     }
     load(
         vec![

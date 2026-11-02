@@ -6,12 +6,14 @@
 
 mod lanes_support;
 mod play_support;
+mod widget_support;
 
 use bms_model::Lane;
 use lanes_support::{WHITE, bound, image, in_region, lanes_element, sheet, simple, skin_with};
 use play_support::{REGIONS, bool_program};
 use skin_model::{
-    Adjust, Bind, ElementDef, Fill, Fit, Layout, Place, Region, Skin, SkinDef, Variant,
+    Adjust, Align, Bind, DigitOffset, DigitsDef, ElementDef, Fill, Fit, GlyphSet, Layout, Pad,
+    Place, Region, Skin, SkinDef, Source, Variant, WidgetDefs,
 };
 
 fn scaled(r: Region, scale: u16) -> Layout {
@@ -204,4 +206,42 @@ fn an_element_that_can_never_draw_does_not_count() {
         let s = adapted(vec![plain.clone(), decoration(maybe)]);
         assert_eq!(s.variant([1_920, 1_080], &l), Variant::Hi, "{maybe}");
     }
+}
+
+#[test]
+fn digit_offsets_magnify_nothing() {
+    // A number whose cells grow by target pixels at 100 % on 1080p is
+    // drawn at the canvas scale, 1: `Lo`.
+    let grown = DigitsDef {
+        offsets: vec![
+            DigitOffset {
+                dx: -40,
+                dy: -40,
+                dw: 400,
+                dh: 400,
+            };
+            3
+        ],
+        ..widget_support::digits(
+            widget_support::TEN,
+            GlyphSet::Ten,
+            3,
+            Align::Right,
+            Pad::Zero,
+        )
+    };
+    let s = widget_support::load(
+        vec![widget_support::element(
+            Source::Number(0),
+            [0, 0, 10, 10],
+            Place::SCREEN,
+        )],
+        WidgetDefs {
+            numbers: vec![widget_support::number(grown, "123")],
+            ..WidgetDefs::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(s.variant([1_920, 1_080], &Layout::AUTHOR), Variant::Lo);
+    assert_eq!(s.variant([3_840, 2_160], &Layout::AUTHOR), Variant::Hi);
 }
