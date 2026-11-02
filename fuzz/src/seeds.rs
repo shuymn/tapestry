@@ -840,6 +840,14 @@ pub fn skin_jsons() -> Vec<Seed> {
             )),
         ),
         ("digit_offset_rows_limit", digit_offset_rows_limit()),
+        (
+            "grade_anchor_trimmed",
+            play_skin(&grade_anchors_body(GRADE_TRIMMED)),
+        ),
+        (
+            "grade_anchor_turning",
+            play_skin(&grade_anchors_body(GRADE_TURNING)),
+        ),
     ]
     .into_iter()
     .chain(skin_imports())
@@ -1120,6 +1128,10 @@ pub fn skin_imports() -> Vec<Seed> {
         ("selectors", play_skin(&selectors_body())),
         ("digit_offsets", digit_offsets()),
         (
+            "grade_anchors",
+            play_skin(&grade_anchors_body(GRADE_ANCHORED)),
+        ),
+        (
             "note_fallbacks",
             play_skin(&note_parts_body(
                 &[
@@ -1151,6 +1163,45 @@ pub fn skin_imports() -> Vec<Seed> {
             )),
         ),
     ]
+}
+
+/// PERFECT's grade for [`grade_anchors_body`]: the square image fitted
+/// inside its destination (stretch 1) as it grows on `judge` over 100 ms,
+/// following LIFT.
+const GRADE_ANCHORED: &str = r#"{"id": "g", "timer": 46, "stretch": 1, "offsets": [3], "dst": [
+    {"time": 0, "x": 600, "y": 500, "w": 80, "h": 20},
+    {"time": 100, "x": 620, "w": 80, "h": 40}]}"#;
+/// PERFECT's grade trimmed (stretch 3), which stays refused.
+const GRADE_TRIMMED: &str =
+    r#"{"id": "g", "timer": 46, "stretch": 3, "dst": [{"x": 600, "y": 500, "w": 80, "h": 20}]}"#;
+/// PERFECT's grade fitted by its height, then by its width: a branch
+/// change, which stays refused.
+const GRADE_TURNING: &str = r#"{"id": "g", "timer": 46, "stretch": 1, "dst": [
+    {"time": 0, "x": 600, "y": 500, "w": 80, "h": 20},
+    {"time": 100, "w": 20, "h": 80}]}"#;
+
+/// A shifting judge of `perfect` as PERFECT's grade, BAD's fitted grade
+/// without a combo, and the full-gauge slot's fitted by width (stretch
+/// 4), its bottom edge moved; PERFECT's two-digit combo, untimed, stands
+/// in for the full-gauge slot's.
+fn grade_anchors_body(perfect: &str) -> String {
+    let none = r#"{"id": "none", "dst": []}"#;
+    let fitted = |stretch: u8| {
+        format!(
+            r#"{{"id": "g", "timer": 46, "stretch": {stretch}, "dst": [{{"x": 600, "y": 500, "w": 80, "h": 20}}]}}"#
+        )
+    };
+    format!(
+        r#""image": [{{"id": "g", "src": "grid", "w": 4, "h": 4}}],
+        "value": [{{"id": "c", "src": "strip", "w": 100, "h": 10, "divx": 10, "digit": 2}}],
+        "judge": [{{"id": "j", "index": 0, "shift": true,
+            "images": [{perfect}, {none}, {none}, {bad}, {none}, {none}, {full}],
+            "numbers": [{{"id": "c", "dst": [{{"x": 10, "y": 0, "w": 10, "h": 20}}]}},
+                {none}, {none}, {none}, {none}, {none}, {none}]}}],
+        "destination": [{{"id": "j", "dst": [{{"w": 0, "h": 0}}]}}]"#,
+        bad = fitted(1),
+        full = fitted(4),
+    )
 }
 
 /// Digit offsets: the EX score's four cells moved by rows a choice and an
