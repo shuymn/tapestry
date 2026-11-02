@@ -102,7 +102,8 @@ impl Resolver<'_, '_> {
             return self.include(member, depth, |r, root, d| r.offset_table(root, d, out));
         }
         match self.arena().node(id).kind {
-            Kind::Array => {
+            // An empty Lua table reads as no rows.
+            Kind::Array | Kind::Empty => {
                 let mut next = self.arena().node(id).first_child;
                 while next != NONE {
                     let item = next;
@@ -166,7 +167,7 @@ impl Resolver<'_, '_> {
                 limit: InputLimit::DigitOffsets,
             });
         }
-        if self.arena().node(rec).kind != Kind::Object {
+        if !self.arena().is_object(rec) {
             return Err(self.def.type_error(rec, FIELD, "an object"));
         }
         let fields = self.def.fields(rec, ["x", "y", "w", "h"]);

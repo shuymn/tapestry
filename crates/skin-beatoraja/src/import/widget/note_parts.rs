@@ -16,7 +16,7 @@ use super::super::geom::Q;
 use super::super::policy::CriticalPart;
 use super::super::report::{NoteKind, PartWhy, Span};
 use crate::error::ImportError;
-use crate::tree::{Kind, Scalar};
+use crate::tree::Scalar;
 
 /// The lanes the source draws.
 pub(super) const LANES: usize = 8;
@@ -106,7 +106,7 @@ impl Cx<'_> {
             return Ok(Scan::default());
         };
         let arena = &self.def.arena;
-        if arena.node(f).kind != Kind::Array {
+        if !arena.is_array(f) {
             if lenient {
                 return Err(self.def.type_error(f, field, "an array"));
             }
@@ -222,7 +222,7 @@ impl Cx<'_> {
             return Ok(out);
         };
         let arena = &self.def.arena;
-        if arena.node(f).kind != Kind::Array {
+        if !arena.is_array(f) {
             return Err(self.def.type_error(f, "size", "an array"));
         }
         for (i, c) in arena.children(f).enumerate() {

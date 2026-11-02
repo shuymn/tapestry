@@ -947,6 +947,28 @@ fn tables_are_read_raw_and_their_shape_is_checked() {
     )]);
     let r = import(&shared).unwrap();
     assert_eq!(r.imported.report.usage.elements, 3);
+    // An empty condition is an empty list of conditions whatever the
+    // wrapper's case: it holds, as JSON's `[]` does, so every record is
+    // drawn.
+    let conditions = folder(&[(
+        "s.luaskin",
+        &skin(
+            "",
+            "local d = { { x = 0, y = 0, w = 64, h = 64 } }\n\
+             skin.destination = {\n\
+               { [\"if\"] = {}, value = { id = \"i\", dst = d } },\n\
+               { IF = {}, value = { id = \"i\", dst = d } },\n\
+               { If = {}, values = { { id = \"i\", dst = d } } },\n\
+             }",
+        ),
+    )]);
+    let r = import(&conditions).unwrap();
+    assert_eq!(r.imported.report.usage.elements, 3);
+    assert!(
+        r.imported.report.notes.is_empty(),
+        "{:?}",
+        r.imported.report.notes
+    );
     let mouse = folder(&[(
         "s.luaskin",
         &skin(

@@ -416,7 +416,7 @@ impl Definition {
     /// (case-sensitive), in `fields`' order; none when the record is no
     /// object (the source's record of defaults).
     pub(crate) fn fields<const N: usize>(&self, id: u32, fields: [&str; N]) -> [Option<u32>; N] {
-        if self.arena.node(id).kind != Kind::Object {
+        if !self.arena.is_object(id) {
             return [None; N];
         }
         fields.map(|f| self.arena.last_member(id, f))
@@ -447,7 +447,7 @@ pub fn resolve<'d>(
         ..Run::default()
     };
     let top = def.top;
-    if def.arena.node(top).kind != Kind::Object {
+    if !def.arena.is_object(top) {
         return Err(def.type_error(top, "(root)", "an object"));
     }
     // The top level is read literally, ordinary fields only
@@ -587,7 +587,7 @@ impl Resolved<'_> {
                 continue;
             };
             if LITERAL.contains(name) {
-                if r.def.arena.node(id).kind == Kind::Array {
+                if r.def.arena.is_array(id) {
                     let items: Vec<u32> = r.def.arena.children(id).collect();
                     for item in items {
                         r.emit(item, out)?;
@@ -715,7 +715,7 @@ impl Resolver<'_, '_> {
         let mut i = 0;
         while let Some(&d) = nested.get(&id).and_then(|l| l.get(i)) {
             i += 1;
-            if self.arena().node(d).kind != Kind::Object {
+            if !self.arena().is_object(d) {
                 return Err(self.def.type_error(d, "group", "an object"));
             }
             let Some(dst) = self.def.fields(d, ["dst"])[0] else {
@@ -724,10 +724,7 @@ impl Resolver<'_, '_> {
             self.strict_array(dst, depth + 2, "dst", nested)?;
             let bad = nested
                 .get(&dst)
-                .and_then(|keys| {
-                    keys.iter()
-                        .find(|&&k| self.arena().node(k).kind != Kind::Object)
-                })
+                .and_then(|keys| keys.iter().find(|&&k| !self.arena().is_object(k)))
                 .copied();
             if let Some(k) = bad {
                 return Err(self.def.type_error(k, "dst", "an object"));
@@ -777,7 +774,7 @@ impl Resolver<'_, '_> {
         }
         let kind = self.arena().node(id).kind;
         match kind {
-            Kind::Array => {
+            Kind::Array | Kind::Empty => {
                 let mut next = self.arena().node(id).first_child;
                 while next != NONE {
                     let item = next;
@@ -871,7 +868,7 @@ impl Resolver<'_, '_> {
         if self.is_number(cond) {
             return self.test_number(cond);
         }
-        if self.arena().node(cond).kind != Kind::Array {
+        if !self.arena().is_array(cond) {
             return Ok(false);
         }
         let mut next = self.arena().node(cond).first_child;
@@ -880,7 +877,7 @@ impl Resolver<'_, '_> {
             next = self.arena().node(item).next_sibling;
             let held = if self.is_number(item) {
                 self.test_number(item)?
-            } else if self.arena().node(item).kind == Kind::Array {
+            } else if self.arena().is_array(item) {
                 let mut held = false;
                 let mut alt = self.arena().node(item).first_child;
                 while alt != NONE {

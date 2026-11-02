@@ -121,7 +121,7 @@ impl Cx<'_> {
         let Some(f) = field else {
             return Ok(Vec::new());
         };
-        if self.def.arena.node(f).kind != crate::tree::Kind::Array {
+        if !self.def.arena.is_array(f) {
             return Err(self.def.type_error(f, name, "an array"));
         }
         let items: Vec<u32> = self.def.arena.children(f).collect();

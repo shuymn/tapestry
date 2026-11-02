@@ -37,6 +37,7 @@ fn render(a: &Arena, id: u32) -> String {
         }
         Kind::Quoted => format!("\"{}\"", a.raw(id)),
         Kind::Bare | Kind::Lua => a.raw(id).to_owned(),
+        Kind::Empty => "{}".to_owned(),
     };
     key + &body
 }

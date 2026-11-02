@@ -25,7 +25,6 @@ use super::super::{Common, Cx, Dst, Prop};
 use super::super::{Event, trace};
 use super::{SrcImage, Unplaced};
 use crate::error::ImportError;
-use crate::tree::Kind;
 
 /// An image set's selector as the source resolves it: its `value` through
 /// the value-property factory, else its `ref` as an image-index property.
@@ -252,7 +251,7 @@ impl Cx<'_> {
             self.ignored(at, NoteKind::Track(TrackWhy::NeverDrawn));
             return Ok(());
         };
-        if self.def.arena.node(list).kind != Kind::Array {
+        if !self.def.arena.is_array(list) {
             return Err(self.def.type_error(list, "images", "an array"));
         }
         let n = self.def.arena.children(list).count();

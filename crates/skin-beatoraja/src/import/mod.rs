@@ -51,7 +51,7 @@ use self::track::{Accepted, SrcKey, Stretch};
 use crate::error::{ImportError, Loc};
 use crate::header::Header;
 use crate::resolve::{Definition, Resolved, Tables, resolve};
-use crate::tree::{Kind, Scalar};
+use crate::tree::Scalar;
 
 /// What the user configured for one skin: the item selected in each
 /// option, the file chosen for each file choice, and the offsets.
@@ -565,7 +565,7 @@ impl<'d> Cx<'d> {
         let Some(f) = field else {
             return Ok(Vec::new());
         };
-        if self.def.arena.node(f).kind != Kind::Array {
+        if !self.def.arena.is_array(f) {
             return Err(self.def.type_error(f, name, "an array"));
         }
         let items: Vec<u32> = self.def.arena.children(f).collect();
@@ -642,7 +642,7 @@ impl<'d> Cx<'d> {
         ids.push(self.int_or(offset, "offset", 0)?);
         let mut ops = Vec::new();
         if let Some(op) = op {
-            if self.def.arena.node(op).kind != Kind::Array {
+            if !self.def.arena.is_array(op) {
                 return Err(self.def.type_error(op, "op", "an array"));
             }
             let items: Vec<u32> = self.def.arena.children(op).collect();
@@ -666,7 +666,7 @@ impl<'d> Cx<'d> {
             ops,
             draw: self.prop(draw, "draw")?,
             keys,
-            mouse: mouse.is_some_and(|m| self.def.arena.node(m).kind == Kind::Object),
+            mouse: mouse.is_some_and(|m| self.def.arena.is_object(m)),
         };
         Ok((id, dst))
     }

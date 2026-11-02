@@ -25,6 +25,9 @@ pub(crate) enum Kind {
     Quoted,
     Bare,
     Lua,
+    /// An empty Lua table: no members and no items, which an array reader
+    /// and an object reader each read as their own empty value.
+    Empty,
 }
 
 /// The node is an object member: `key_start..key_end` is its name.
@@ -367,6 +370,18 @@ impl Arena {
         })
     }
 
+    /// Whether node `id` is read as an array: a JSON array, or an empty
+    /// Lua table.
+    pub(crate) fn is_array(&self, id: u32) -> bool {
+        matches!(self.node(id).kind, Kind::Array | Kind::Empty)
+    }
+
+    /// Whether node `id` is read as an object: a JSON object, or an empty
+    /// Lua table.
+    pub(crate) fn is_object(&self, id: u32) -> bool {
+        matches!(self.node(id).kind, Kind::Object | Kind::Empty)
+    }
+
     /// The children of a container, in order.
     pub(crate) fn children(&self, id: u32) -> Children<'_> {
         Children {
@@ -388,7 +403,7 @@ impl Arena {
     /// (JsonValue.java:95-99). Java compares Unicode-aware; matching ASCII
     /// case only is an intentional subset.
     pub(crate) fn first_member_ci(&self, id: u32, name: &str) -> Option<u32> {
-        if self.node(id).kind != Kind::Object {
+        if !self.is_object(id) {
             return None;
         }
         self.children(id).find(|&c| {
@@ -404,7 +419,7 @@ impl Arena {
         let n = *self.node(id);
         let escaped = n.flags & ESCAPED != 0;
         match n.kind {
-            Kind::Object => Scalar::Object,
+            Kind::Object | Kind::Empty => Scalar::Object,
             Kind::Array => Scalar::Array,
             Kind::Quoted => Scalar::Str {
                 raw: self.raw(id),

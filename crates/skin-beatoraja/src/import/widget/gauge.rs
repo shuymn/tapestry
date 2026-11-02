@@ -119,7 +119,7 @@ impl Cx<'_> {
         };
         // The array's shape and count first, from at most one child past
         // the largest table, so an unsupported count gathers nothing.
-        if self.def.arena.node(nodes).kind != crate::tree::Kind::Array {
+        if !self.def.arena.is_array(nodes) {
             return Err(self.def.type_error(nodes, "nodes", "an array"));
         }
         let count = self.def.arena.children(nodes).take(NODES + 1).count();

@@ -8,9 +8,8 @@
 //! their bytes (a Lua table has no order of its own); mixed, sparse and
 //! other keys are refused, as is a table met again inside itself. A table
 //! reached twice is converted, and charged, at each place. An empty
-//! table takes the kind its place expects: an array for the fields that
-//! hold arrays ([`TOP_ARRAYS`], [`NESTED_ARRAYS`], a condition's items),
-//! an object otherwise. A number keeps its subtype and value: an integer
+//! table is neither: [`Kind::Empty`], which the definition's readers read
+//! as the empty array or the empty object their field expects. A number keeps its subtype and value: an integer
 //! as its `i64`, a float as its `f64`, never through text. A string must
 //! be UTF-8. A function becomes a typed callable, each instance once; any
 //! other value is refused.
@@ -29,7 +28,6 @@ use skin_model::FileId;
 use super::{LuaWhy, Pass};
 use crate::error::{ImportError, InputLimit, Loc};
 use crate::limits::{MAX_DECODED_BYTES, MAX_DEPTH, MAX_NODES, MAX_STRING_BYTES};
-use crate::resolve::ARRAYS;
 use crate::tree::{
     Arena, Callable, CallableKind, KEYED, Kind, LuaScalar, LuaText, NONE, Node, Text,
 };
@@ -43,60 +41,6 @@ pub(crate) const CHECK_EVERY: usize = 4_096;
 pub const MAX_CONVERTED_BYTES: u64 = MAX_NODES as u64
     * (size_of::<Node>() + size_of::<LuaScalar>() + size_of::<Callable>()) as u64
     + MAX_DECODED_BYTES;
-
-/// The top-level fields besides [`ARRAYS`] that hold arrays: the
-/// header's.
-const HEADER_ARRAYS: [&str; 3] = ["property", "filepath", "offset"];
-
-/// The nested fields that hold arrays: destinations' and wrappers' lists,
-/// the play objects' lists, the note parts and the literal arrays.
-const NESTED_ARRAYS: [&str; 34] = [
-    "dst",
-    "op",
-    "offsets",
-    "offset",
-    "item",
-    "values",
-    "if",
-    "group",
-    "bpm",
-    "stop",
-    "time",
-    "images",
-    "numbers",
-    "nodes",
-    "expansionrate",
-    "size",
-    "fallback",
-    "note",
-    "lnstart",
-    "lnend",
-    "lnbody",
-    "lnbodyActive",
-    "lnactive",
-    "hcnstart",
-    "hcnend",
-    "hcnbody",
-    "hcnactive",
-    "hcnbodyActive",
-    "hcndamage",
-    "hcnbodyMiss",
-    "hcnreactive",
-    "hcnbodyReactive",
-    "mine",
-    "hidden",
-];
-
-/// Whether an empty table under `key` at `depth` (the root at 1), or an
-/// item of an array under `parent`, holds an array.
-fn empty_is_array(key: Option<&[u8]>, parent: Option<&[u8]>, depth: u32) -> bool {
-    let is = |list: &[&str], k: &[u8]| list.iter().any(|f| f.as_bytes() == k);
-    match key {
-        Some(k) if depth == 2 => is(&ARRAYS, k) || is(&HEADER_ARRAYS, k),
-        Some(k) => is(&NESTED_ARRAYS, k) || k == b"processed",
-        None => depth > 1 && parent == Some(b"if"),
-    }
-}
 
 /// The fields a callable's location names; any other is `other`. The
 /// format's own field names, never a skin's.
@@ -197,7 +141,7 @@ pub(super) fn convert(
         path: Vec::new(),
         decoded: 0,
     };
-    let top = c.table(&t, None, None, 1)?;
+    let top = c.table(&t, None, 1)?;
     #[cfg(test)]
     super::tests::converted_witness();
     let Conv {
@@ -330,19 +274,11 @@ impl Conv<'_> {
         Ok(id)
     }
 
-    /// Value `v` under `key` (its name, and its span once copied), an
-    /// item of an array under `parent` when it has no key, at `depth`.
-    fn value(
-        &mut self,
-        v: &Value,
-        key: Option<(&[u8], (u32, u32))>,
-        parent: Option<&[u8]>,
-        depth: u32,
-    ) -> Result<u32, ImportError> {
-        let span = key.map(|(_, s)| s);
-        let name = key.map(|(k, _)| k);
+    /// Value `v`, its key's span when it has one, at
+    /// `depth`.
+    fn value(&mut self, v: &Value, span: Option<Span>, depth: u32) -> Result<u32, ImportError> {
         match v {
-            Value::Table(t) => self.table(t, name.map(|n| (n, span)), parent, depth),
+            Value::Table(t) => self.table(t, span, depth),
             Value::Boolean(b) => self.scalar(LuaScalar::Bool(*b), span),
             Value::Integer(n) => self.scalar(LuaScalar::Int(*n), span),
             Value::Number(n) => self.scalar(LuaScalar::Float(*n), span),
@@ -402,15 +338,8 @@ impl Conv<'_> {
         }
     }
 
-    /// Table `t` under `key` (its name and span), an item under `parent`
-    /// when it has none, at `depth`.
-    fn table(
-        &mut self,
-        t: &Table,
-        key: Option<(&[u8], Option<Span>)>,
-        parent: Option<&[u8]>,
-        depth: u32,
-    ) -> Result<u32, ImportError> {
+    /// Table `t`, its key's span when it has one, at `depth`.
+    fn table(&mut self, t: &Table, span: Option<Span>, depth: u32) -> Result<u32, ImportError> {
         if depth > MAX_DEPTH {
             return Err(self.input(InputLimit::Depth));
         }
@@ -448,24 +377,20 @@ impl Conv<'_> {
         if self.decoded.saturating_add(key_bytes) > MAX_DECODED_BYTES {
             return Err(self.input(InputLimit::DecodedBytes));
         }
-        let array = if n == 0 {
-            empty_is_array(key.map(|(k, _)| k), parent, depth)
+        let kind = if n == 0 {
+            Kind::Empty
         } else if strings == n {
-            false
+            Kind::Object
         } else if ints == n {
             let count = i64::try_from(n).unwrap_or(i64::MAX);
             if min != 1 || max != count {
                 return Err(self.lua(LuaWhy::Sparse));
             }
-            true
+            Kind::Array
         } else {
             return Err(self.lua(LuaWhy::Mixed));
         };
-        let id = self.node(
-            if array { Kind::Array } else { Kind::Object },
-            key.and_then(|(_, s)| s),
-            0,
-        )?;
+        let id = self.node(kind, span, 0)?;
         self.path.push(addr);
         let mut prev = NONE;
         let mut link = |c: &mut Self, child: u32| {
@@ -476,14 +401,13 @@ impl Conv<'_> {
             }
             prev = child;
         };
-        let name = key.map(|(k, _)| k.to_vec());
-        if array {
+        if kind == Kind::Array {
             for i in 1..=n {
                 let v: Value = t.raw_get(i).map_err(|e| self.mlua(&e))?;
-                let child = self.value(&v, None, name.as_deref(), depth + 1)?;
+                let child = self.value(&v, None, depth + 1)?;
                 link(self, child);
             }
-        } else {
+        } else if kind == Kind::Object {
             // The keys' bytes, charged above with the entries, copied out
             // so that no handle per key stays on Lua's stack.
             let mut keys: Vec<Vec<u8>> = Vec::with_capacity(n);
@@ -497,29 +421,11 @@ impl Conv<'_> {
                 let v: Value = t
                     .raw_get(mlua::BString::from(k.clone()))
                     .map_err(|e| self.mlua(&e))?;
-                let child = self.value(&v, Some((&k, span)), None, depth + 1)?;
+                let child = self.value(&v, Some(span), depth + 1)?;
                 link(self, child);
             }
         }
         self.path.pop();
         Ok(id)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::empty_is_array;
-
-    #[test]
-    fn empty_tables_follow_their_place() {
-        assert!(!empty_is_array(None, None, 1));
-        assert!(empty_is_array(Some(b"destination"), None, 2));
-        assert!(empty_is_array(Some(b"property"), None, 2));
-        assert!(!empty_is_array(Some(b"note"), None, 2));
-        assert!(empty_is_array(Some(b"note"), None, 3));
-        assert!(empty_is_array(Some(b"dst"), None, 3));
-        assert!(!empty_is_array(Some(b"mouseRect"), None, 3));
-        assert!(empty_is_array(None, Some(b"if"), 4));
-        assert!(!empty_is_array(None, Some(b"image"), 3));
     }
 }
