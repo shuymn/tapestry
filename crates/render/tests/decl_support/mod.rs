@@ -1,8 +1,10 @@
 //! Declarative skin bundles for the render tests, built here: a solid
 //! image written as PNG into a temporary folder, a fixed 1920×1080 skin
 //! drawing it, optionally under clip 0, with a text element whose
-//! prepared line a supplied producer gives, and with markers of the shown
-//! gauge's look and of the judgment timer.
+//! prepared line a supplied producer gives, with markers of the shown
+//! gauge's look and of the judgment timer, and with a loading
+//! presentation: an untimed background, an animation on the `loading`
+//! timer and a mark on a `when` timer whose condition holds while loading.
 
 #![allow(dead_code)]
 
@@ -78,7 +80,22 @@ pub struct Look {
     /// while the shown gauge's look is `hard` (a survival gauge's), and
     /// over [`JUDGE_MARKER`] once a judgment started its timer.
     pub markers: bool,
+    /// Three loading elements drawing the image unclipped: over
+    /// [`BACKGROUND`] on the untimed `screen` timer, over a 100×100 square
+    /// moving right from [`ANIMATION`] at 1 canvas pixel per ms of the
+    /// `loading` timer, and over [`WHEN_MARK`] on `when` timer 0, whose
+    /// condition (`load.percent >= 0`) holds in every loading frame.
+    pub loading: bool,
 }
+
+/// Where the untimed loading background draws, in canvas pixels.
+pub const BACKGROUND: [i32; 4] = [0, 900, 100, 100];
+/// Where the loading animation starts, at `loading` 0.
+pub const ANIMATION: [i32; 4] = [200, 900, 100, 100];
+/// Where the `when` timer's mark draws.
+pub const WHEN_MARK: [i32; 4] = [1_700, 900, 100, 100];
+/// The `when` timer's slot: the first after the built-in timers.
+pub const WHEN_SLOT: u16 = skin_model::timer::BUILTIN;
 
 /// Where the gauge-look marker draws, in canvas pixels.
 pub const GAUGE_MARKER: [i32; 4] = [1_200, 100, 100, 100];
@@ -96,6 +113,7 @@ impl Look {
             copies: 0,
             text: false,
             markers: false,
+            loading: false,
         }
     }
 }
@@ -187,13 +205,45 @@ pub fn skin(dir: &Path, look: &Look) -> Skin {
             ..image(JUDGE_MARKER, false)
         });
     }
+    let mut whens = Vec::new();
+    if look.loading {
+        let scope = Scope::new(&PLAY);
+        whens.push(compile("load.percent >= 0", &scope, Ty::Bool).unwrap());
+        elements.push(ElementDef {
+            timer: TimerRef::Builtin(skin_model::timer::SCREEN),
+            ..image(BACKGROUND, false)
+        });
+        let [x, y, w, h] = ANIMATION;
+        let key = |at: i64, x: i32| {
+            let mut props = [None; 9];
+            props[..4].copy_from_slice(&[Some(x), Some(y), Some(w), Some(h)]);
+            KeyDef {
+                at: TimeUs(at),
+                props,
+            }
+        };
+        elements.push(ElementDef {
+            track: Track::new(
+                &[key(0, x), key(1_000_000, x + 1_000)],
+                Ease::Linear,
+                End::Hold,
+            )
+            .unwrap(),
+            timer: TimerRef::Builtin(skin_model::timer::LOADING),
+            ..image(ANIMATION, false)
+        });
+        elements.push(ElementDef {
+            timer: TimerRef::When(0),
+            ..image(WHEN_MARK, false)
+        });
+    }
     Skin::new(SkinDef {
         fit: Fit::Fixed,
         regions: [RegionDef {
             anchor: Anchor::TopLeft,
             optional: false,
         }; Region::COUNT],
-        whens: Vec::new(),
+        whens,
         sheet,
         lanes: None,
         elements,

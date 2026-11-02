@@ -19,18 +19,18 @@
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use bms_model::Chart;
+use bms_model::{Chart, TimeUs};
 use eval::Section;
 use skin_model::{
-    Atlas, BuildError, Canvas, ChartText, CoverSettings, FrameReadouts, LaneView, Layout, Page,
-    Play, Side, Skin, SkinFrame, TextTable, UvTable,
+    Atlas, BuildError, Canvas, ChartText, CoverSettings, FrameReadouts, LaneView, Layout, Loading,
+    Page, Play, Side, Skin, SkinFrame, TextTable, UvTable,
 };
 
 use crate::projection::ClipTable;
 use crate::skin_atlas::{AtlasPages, PageLevels, RESERVED_LAYERS};
-use crate::{AttemptInput, FrameInput, Gpu, PlaySkin, SkinError, SpriteBatch};
+use crate::{AttemptInput, FrameInput, Gpu, LoadingFrame, PlaySkin, SkinError, SpriteBatch};
 
 /// Prepares the rasterized text of one attempt: the installation seam a
 /// text producer plugs into (bitmap text needs none: the skin lays its
@@ -234,6 +234,156 @@ impl SkinBundle {
     }
 }
 
+/// The loading state of one installation (design.md "Rendering and
+/// Skins", declarative skin installation): the skin's loading runtime
+/// ([`Loading`]: its fields, timer starts, `when` starts, refusal and
+/// installed text) and the loading lifetime it belongs to. It is shared,
+/// not copied: the installation's skin, a staging of the same bundle and
+/// the render thread's copy kept for recovery hold the one state, so a
+/// renderer built again draws on from the same `when` starts.
+#[derive(Clone)]
+pub struct LoadingPresentation(Arc<Mutex<Presented>>);
+
+/// What a [`LoadingPresentation`] holds.
+#[derive(Debug)]
+struct Presented {
+    loading: Loading,
+    /// The lifetime the state belongs to; `None` until its first frame.
+    lifetime: Option<u64>,
+    /// Whether a frame was built on the state since it was made.
+    built: bool,
+}
+
+impl fmt::Debug for LoadingPresentation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let p = self.lock();
+        f.debug_struct("LoadingPresentation")
+            .field("lifetime", &p.lifetime)
+            .field("built", &p.built)
+            .field("refused", &p.loading.refused())
+            .finish_non_exhaustive()
+    }
+}
+
+impl LoadingPresentation {
+    /// A fresh state of `bundle`'s skin, its lanes laid out for the
+    /// bundle's scratch side, belonging to no lifetime yet. Allocates.
+    #[must_use]
+    pub fn new(bundle: &SkinBundle) -> Self {
+        Self(Arc::new(Mutex::new(Presented {
+            loading: bundle.skin.prepare_loading(bundle.scratch),
+            lifetime: None,
+            built: false,
+        })))
+    }
+
+    fn lock(&self) -> MutexGuard<'_, Presented> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Whether `other` is this very state.
+    #[must_use]
+    pub fn same(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
+    /// The loading lifetime the state belongs to, `None` before its first
+    /// frame.
+    #[must_use]
+    pub fn lifetime(&self) -> Option<u64> {
+        self.lock().lifetime
+    }
+
+    /// Timer `slot`'s start as of the last frame (built-in, then `when`),
+    /// `None` while off.
+    #[must_use]
+    pub fn timer(&self, slot: u16) -> Option<TimeUs> {
+        self.lock().loading.timer(slot)
+    }
+
+    /// The refusal every later frame of the state answers, if a frame was
+    /// refused.
+    #[must_use]
+    pub fn refused(&self) -> Option<BuildError> {
+        self.lock().loading.refused()
+    }
+
+    /// The bytes the state and its text hold, for the memory witness.
+    #[must_use]
+    pub fn bytes(&self) -> u64 {
+        let p = self.lock();
+        let own = u64::try_from(size_of::<Presented>()).unwrap_or(u64::MAX);
+        p.loading.resident_bytes().saturating_add(own)
+    }
+
+    /// Lifetime `lifetime` draws next, between frames: a state built for
+    /// another lifetime starts afresh from `bundle`'s skin (which
+    /// allocates); one never built is taken as it is.
+    pub(crate) fn enter(&self, bundle: &SkinBundle, lifetime: u64) {
+        let mut p = self.lock();
+        if p.lifetime == Some(lifetime) {
+            return;
+        }
+        if p.built {
+            p.loading = bundle.skin.prepare_loading(bundle.scratch);
+            p.built = false;
+        }
+        p.lifetime = Some(lifetime);
+    }
+
+    /// Builds loading frame `f` of `bundle` into `out`, allocating
+    /// nothing. A state never built takes `f`'s lifetime; one built for
+    /// another lifetime, not entered since, draws nothing.
+    pub(crate) fn build(
+        &self,
+        bundle: &SkinBundle,
+        f: &LoadingFrame<'_>,
+        out: &mut SpriteBatch,
+    ) -> Result<(), BuildError> {
+        let mut p = self.lock();
+        if p.lifetime != Some(f.lifetime) {
+            if p.built {
+                return Ok(());
+            }
+            p.lifetime = Some(f.lifetime);
+        }
+        p.built = true;
+        bundle
+            .skin
+            .build_loading(&mut p.loading, &f.model(), &bundle.uvs, out.quads_mut())
+    }
+}
+
+/// An installation's CPU side: the bundle and its loading presentation,
+/// staged, committed, discarded and restored together. Cloning shares
+/// both.
+#[derive(Clone, Debug)]
+pub struct Installation {
+    bundle: Arc<SkinBundle>,
+    loading: LoadingPresentation,
+}
+
+impl Installation {
+    /// `bundle` with a fresh loading presentation.
+    #[must_use]
+    pub fn new(bundle: Arc<SkinBundle>) -> Self {
+        let loading = LoadingPresentation::new(&bundle);
+        Self { bundle, loading }
+    }
+
+    /// Its bundle.
+    #[must_use]
+    pub const fn bundle(&self) -> &Arc<SkinBundle> {
+        &self.bundle
+    }
+
+    /// Its loading presentation.
+    #[must_use]
+    pub const fn loading(&self) -> &LoadingPresentation {
+        &self.loading
+    }
+}
+
 /// A frame's readouts until the cover settings and the tempo provider
 /// reach the frame (docs/stage3.md S10-04 and S10-06): no tempo, hi-speed
 /// or duration, and every cover off at 0, not being adjusted.
@@ -281,28 +431,50 @@ pub fn skin_frame<'a>(f: &FrameInput<'a>) -> SkinFrame<'a> {
     }
 }
 
-/// A declarative skin on the play screen: its [`SkinBundle`] and the
-/// current attempt's `Play`, made fresh by each [`PlaySkin::prepare`] and
-/// dropped by a chart's load, so a frame never builds a previous attempt
-/// or another chart.
+/// A declarative skin on the play screen: its [`SkinBundle`], its
+/// installation's loading presentation, and the current attempt's
+/// `Play`, made fresh by each [`PlaySkin::prepare`] and dropped by a
+/// chart's load, so a frame never builds a previous attempt or another
+/// chart, and a loading frame never builds a `Play`.
 #[derive(Debug)]
 pub struct DeclSkin {
     bundle: Arc<SkinBundle>,
+    loading: LoadingPresentation,
     play: Option<Play>,
 }
 
 impl DeclSkin {
-    /// `bundle`'s skin with no attempt prepared: it draws nothing until
-    /// one is.
+    /// `bundle`'s skin with a fresh loading presentation and no attempt
+    /// prepared: it draws nothing of a play until one is.
     #[must_use]
-    pub const fn new(bundle: Arc<SkinBundle>) -> Self {
-        Self { bundle, play: None }
+    pub fn new(bundle: Arc<SkinBundle>) -> Self {
+        Self::of(&Installation::new(bundle))
+    }
+
+    /// The skin of `installation`, sharing its loading presentation, with
+    /// no attempt prepared.
+    #[must_use]
+    pub fn of(installation: &Installation) -> Self {
+        Self {
+            bundle: Arc::clone(&installation.bundle),
+            loading: installation.loading.clone(),
+            play: None,
+        }
     }
 
     /// Its bundle.
     #[must_use]
     pub const fn bundle(&self) -> &Arc<SkinBundle> {
         &self.bundle
+    }
+
+    /// Its installation: the bundle and the loading presentation, shared.
+    #[must_use]
+    pub fn installation(&self) -> Installation {
+        Installation {
+            bundle: Arc::clone(&self.bundle),
+            loading: self.loading.clone(),
+        }
     }
 
     /// Whether an attempt is prepared.
@@ -352,6 +524,21 @@ impl PlaySkin for DeclSkin {
         bundle
             .skin
             .build(play, &skin_frame(f), &bundle.uvs, out.quads_mut())
+    }
+
+    /// A presentation built for another lifetime starts afresh.
+    fn enter_loading(&mut self, lifetime: u64) {
+        self.loading.enter(&self.bundle, lifetime);
+    }
+
+    /// The installation's loading presentation, never the attempt's
+    /// `Play`.
+    fn build_loading(
+        &mut self,
+        f: &LoadingFrame<'_>,
+        out: &mut SpriteBatch,
+    ) -> Result<(), BuildError> {
+        self.loading.build(&self.bundle, f, out)
     }
 
     fn capacity(&self) -> u32 {

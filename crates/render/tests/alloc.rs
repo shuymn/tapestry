@@ -14,7 +14,10 @@
 //! nothing either. A declarative skin prepared for an attempt, its clips
 //! and its prepared text included, does the same with the snapshot's
 //! gauges changing: its first and later frames, a refused one, the frames
-//! around a resize, and a full batch with the overlay kept whole.
+//! around a resize, and a full batch with the overlay kept whole. A
+//! committed installation's loading presentation builds its first and
+//! later loading frames, and a refused one, without allocating; the load's
+//! lines are drawn in a text pass outside this count.
 //!
 //! The counting allocator counts only on the thread that opted in, so the
 //! harness's own threads do not disturb it. This file holds a single test
@@ -35,8 +38,8 @@ use common::{GAUGES, MS, attempt, context, input, lane, offscreen, view};
 use decl_support::{Look, bundle};
 use eval::{JudgeEvent, JudgeEventKind};
 use render::{
-    Blend, ClipTable, DeclSkin, FrameInput, Gpu, MAX_SPRITES, PlaySkin, Scissor, SimpleSkin,
-    SkinError, Sprite, SpriteBatch, Staging,
+    Blend, ClipTable, DeclSkin, FrameInput, Gpu, LoadingFrame, MAX_SPRITES, PlaySkin, Scissor,
+    SimpleSkin, SkinError, Sprite, SpriteBatch, Staging,
 };
 use rules::Judgment;
 use skin_model::{BuildError, ClipId};
@@ -421,6 +424,65 @@ fn frames_do_not_allocate_from_the_first() {
     assert_eq!(result_allocs, 0, "the result page allocated");
 
     declarative_frames(&chart, &taps, &overlay, glyphs);
+    loading_frames();
+}
+
+/// A declarative installation committed on a renderer, its loading
+/// presentation built through the installed skin over a staging sized for
+/// it: the first loading frame (its lifetime entered before the count),
+/// the later ones advancing on the loading clock, and a refused one
+/// (covers its lanes disagree with) and the same lifetime's next, all
+/// allocating nothing.
+fn loading_frames() {
+    let mut r = offscreen(1_920, 1_080);
+    let dir = tempfile::tempdir().unwrap();
+    let look = Look {
+        copies: 63,
+        loading: true,
+        ..Look::left([255, 0, 0, 255])
+    };
+    let (b, _) = bundle(&r, dir.path(), &look);
+    let token = r.install(&b, 1).unwrap();
+    r.commit(token).unwrap();
+    let mut skin = DeclSkin::of(&r.installation().unwrap());
+    let mut staging = Staging::with_runs(
+        skin.capacity(),
+        skin.run_capacity(),
+        &skin.canvas([1920, 1080]),
+    );
+    staging.set_clips(b.clips().clone());
+    let at = |k: i64| LoadingFrame::interim(1, TimeUs(k * FRAME_US), TimeUs(0), common::VISIBLE);
+    skin.enter_loading(1);
+    let (first, first_allocs) = counted(|| {
+        staging
+            .build_loading(&mut skin, &at(0))
+            .map(|()| staging.instances().len())
+    });
+    assert!(first.unwrap() > 0);
+    assert_eq!(first_allocs, 0, "the first loading frame allocated");
+    let (later, later_allocs) = counted(|| {
+        (1..FRAMES)
+            .map(|k| staging.build_loading(&mut skin, &at(k)).map(|()| 1))
+            .sum::<Result<usize, BuildError>>()
+    });
+    assert!(later.unwrap() > 0);
+    assert_eq!(later_allocs, 0, "a later loading frame allocated");
+    let mut bad = at(FRAMES);
+    bad.covers.cover_enabled = true;
+    bad.covers.cover = 100;
+    let (refused, error_allocs) = counted(|| {
+        let first = staging.build_loading(&mut skin, &bad);
+        (first, staging.build_loading(&mut skin, &at(FRAMES + 1)))
+    });
+    assert_eq!(
+        refused,
+        (
+            Err(BuildError::InvalidReadouts),
+            Err(BuildError::InvalidReadouts)
+        )
+    );
+    assert_eq!(error_allocs, 0, "a refused loading frame allocated");
+    assert!(staging.instances().is_empty());
 }
 
 /// A declarative skin prepared for an attempt of `chart`, as the

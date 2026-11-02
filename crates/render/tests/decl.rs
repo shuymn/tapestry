@@ -368,7 +368,9 @@ fn a_restored_bundle_needs_no_file() {
     dir.close().unwrap();
 
     let mut again = offscreen(1_920, 1_080);
-    again.restore(&a).unwrap();
+    again
+        .restore(&render::Installation::new(Arc::clone(&a)))
+        .unwrap();
     assert!(Arc::ptr_eq(again.installed().unwrap(), &a));
     let generation = again.resource_generation();
     let (sprites, p) = frame(&mut again);

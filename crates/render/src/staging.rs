@@ -11,7 +11,7 @@ use skin_model::{BuildError, Canvas, ClipId};
 
 use crate::overlay::{self, OVERLAY_RUNS, OVERLAY_SPRITES};
 use crate::projection::{ClipTable, Projection};
-use crate::{FrameInput, Instance, PlaySkin, SpriteBatch};
+use crate::{FrameInput, Instance, LoadingFrame, PlaySkin, SpriteBatch};
 
 /// A frame's batch and staging, sized for `capacity` sprites of the skin
 /// and the overlay's reserve after them, and the play skin's projection
@@ -176,6 +176,29 @@ impl Staging {
             return Err(e);
         }
         overlay::draw(f.overlay, &mut self.batch);
+        self.batch.stage(&mut self.instances, self.font_scale);
+        Ok(())
+    }
+
+    /// The skin builds the loading frame `f` into the emptied batch, which
+    /// is then staged: a loading frame's app work, which calls nothing in
+    /// wgpu and allocates nothing.
+    ///
+    /// # Errors
+    ///
+    /// The skin's refusal of the frame: the batch and the staging are
+    /// left empty, as for a play frame's ([`build`](Self::build)).
+    pub fn build_loading(
+        &mut self,
+        skin: &mut dyn PlaySkin,
+        f: &LoadingFrame<'_>,
+    ) -> Result<(), BuildError> {
+        self.batch.clear();
+        self.instances.clear();
+        if let Err(e) = skin.build_loading(f, &mut self.batch) {
+            self.batch.clear();
+            return Err(e);
+        }
         self.batch.stage(&mut self.instances, self.font_scale);
         Ok(())
     }

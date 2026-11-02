@@ -55,7 +55,9 @@ mod staging;
 pub mod text;
 
 pub use atlas::{ATLAS_SIZE, GLYPH_H, GLYPH_W, glyph_rows, solid_uv};
-pub use decl::{AttemptText, BundleError, DeclSkin, SkinBundle, skin_frame};
+pub use decl::{
+    AttemptText, BundleError, DeclSkin, Installation, LoadingPresentation, SkinBundle, skin_frame,
+};
 pub use gpu::{AdapterChoice, Gpu};
 pub use overlay::{OVERLAY_RUNS, OVERLAY_SPRITES};
 pub use projection::{ClipError, ClipTable, MAX_CLIPS, Projection};
@@ -67,7 +69,7 @@ pub use simple::{
     RESULT_CELL_COLUMN, RESULT_GAUGE_ROW, SimpleSkin, layout, result_graphs, result_screen,
     text_screen,
 };
-pub use skin::{AttemptInput, FrameInput, PlaySkin, SkinError};
+pub use skin::{AttemptInput, FrameInput, LoadingFrame, PlaySkin, SkinError};
 pub use skin_atlas::{AtlasPages, PageLevels, RESERVED_LAYERS, UploadError, atlas_limits};
 pub use sprite::{Blend, FLAG_NEAREST, Instance, Run, Sprite, SpriteBatch};
 pub use staging::{Scissor, Staging};
