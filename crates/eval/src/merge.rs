@@ -139,6 +139,11 @@ impl Staged {
     pub fn is_empty(&self) -> bool {
         self.events.is_empty()
     }
+
+    /// Drops every staged event, keeping the capacity.
+    pub fn clear(&mut self) {
+        self.events.clear();
+    }
 }
 
 /// Moves every staged event with evaluation time ≤ `up_to` into `out`,

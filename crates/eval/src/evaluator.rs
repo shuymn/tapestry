@@ -33,7 +33,7 @@ pub const RING_SLOT_BYTES: usize = size_of::<(TimeUs, PhysicalInputEvent)>();
 /// judgeable notes, their flags and its deadlines): an allowance, counted
 /// once for every object of the chart.
 pub const TABLE_BYTES_PER_OBJECT: usize = 64;
-/// The allowance per gauge for its state, its `#TOTAL` correction and the
+/// The allowance per gauge for its state, its start, its `#TOTAL` correction and the
 /// preset's validation, beside its history and its result.
 pub const GAUGE_BYTES: usize = 256;
 /// The allowance for a batch evaluation's small fixed parts: the
@@ -615,6 +615,29 @@ impl<'a> Evaluator<'a> {
     #[must_use]
     pub const fn tally(&self) -> &Tally {
         &self.tally
+    }
+
+    /// Back to the state [`new`](Self::new) makes for the same chart,
+    /// preset, profile and section from `start`, in place: every judgment,
+    /// hold, cursor, queued input, gauge, total and the watermark are
+    /// discarded whole, and nothing is allocated (design.md "Play
+    /// Lifecycle", the start gate: a cancelled READY candidate's
+    /// evaluator is never rewound or merged into the next).
+    pub fn reset(&mut self, start: &InputStart) {
+        for lane in &mut self.lanes {
+            lane.judged.fill(false);
+            lane.holding = None;
+            lane.visual = None;
+            lane.cursor = 0;
+            lane.next = 0;
+        }
+        self.conversion.reset(start);
+        self.inputs.clear();
+        self.finalized = None;
+        self.ended = false;
+        self.gauges.reset();
+        self.seq = 0;
+        self.tally = Tally::new();
     }
 
     /// Every gauge's state, in the preset's order.
