@@ -5,7 +5,7 @@
 //! with PERFECT's standing in for an empty full-gauge slot 6, each on its
 //! own (`SkinJudge.java:98-113`); the model's judge widget resolves its
 //! slots the same way. The combo is a relative number: its keys are moved
-//! left by half its width times its digits before inheritance, its user
+//! left by half their raw width times its digits, exactly, its user
 //! offsets change only its size, and it sits on the bottom edge of the
 //! grade's destination before its stretch, as the source attaches it to
 //! the grade's region and stretches only a copy at drawing
@@ -361,7 +361,18 @@ impl Cx<'_> {
             || self.digit_rows_keep_aspect(value, extra, cells, cell);
         let mut keys = Vec::with_capacity(c.track.keys.len());
         for k in &c.track.keys {
+            // The raw `x` moved left by half the raw `w` times the digits
+            // (`JsonPlaySkinObjectLoader.java:268-270`), exactly: only the
+            // final edges round.
+            let [_, _, raw_w, _] = k.rect;
             let rect = Rect::scaled(k.rect, self.r)
+                .and_then(|r| {
+                    let shift = Q::int(raw_w).mul(Q::int(digit))?.half()?.mul(self.r)?;
+                    Some(Rect {
+                        x: r.x.sub(shift)?,
+                        ..r
+                    })
+                })
                 .and_then(|r| r.offset_relative(c.offset))
                 .ok_or_else(|| range(self))?;
             let (stretched, _) =

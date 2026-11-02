@@ -230,8 +230,8 @@ struct Opts<'a> {
     neutral: bool,
     /// The offsets are not consumed: noted, never refused.
     no_offsets: bool,
-    /// A judge's combo: its digits, which shift each raw key left
-    /// ([`track::read`]).
+    /// A judge's combo: its digits; each key gives `x` and `w` together
+    /// or neither ([`track::read`]).
     digits: Option<i32>,
     /// The keys as written were charged before this read.
     charged: bool,

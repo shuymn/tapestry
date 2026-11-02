@@ -34,22 +34,6 @@ impl SrcKey {
     }
 }
 
-/// A combo key's raw `x` moved left by half its raw `w` times `digits`
-/// (`i32::MIN` marks an omitted field): both omitted stay omitted and
-/// inherit; `None`, a range error, when only one is omitted, when the
-/// arithmetic leaves `i32`, or when the result is the omission mark. The
-/// source's wrapping `int` arithmetic on such keys is not reproduced
-/// (stage3.md, the judge mapping).
-fn shift(x: i32, w: i32, digits: i32) -> Option<i32> {
-    match (x, w) {
-        (i32::MIN, i32::MIN) => Some(i32::MIN),
-        (i32::MIN, _) | (_, i32::MIN) => None,
-        _ => x
-            .checked_sub(w.checked_mul(digits)? / 2)
-            .filter(|&x| x != i32::MIN),
-    }
-}
-
 /// A destination's keys, in source order, with what they set apart from
 /// the track.
 #[derive(Debug)]
@@ -67,9 +51,11 @@ pub(crate) struct Keys {
 /// key's. Colour is clamped per key, as libGDX's `Color` constructor
 /// does (`Color.java:88` at 1.9.9).
 ///
-/// With `digits`, each key's raw `x` first moves left by half `w` times
-/// the digits, before any inheritance, as a judge's combo does
-/// (`JsonPlaySkinObjectLoader.java:268-270`); see [`shift`].
+/// With `digits`, as for a judge's combo, whose raw `x` moves left by
+/// half its raw `w` times its digits (`JsonPlaySkinObjectLoader.java:
+/// 268-270`), a key gives `x` and `w` together or omits both, so the
+/// moved `x` it inherits is the moved one; one omitted alone is a range
+/// error. The move itself is exact, at placement.
 pub(crate) fn read(
     def: &mut Definition,
     ids: &[u32],
@@ -107,11 +93,13 @@ pub(crate) fn read(
                 *slot = def.int(f, name)?;
             }
         }
-        if let (Some(d), [_, x, _, w, ..]) = (digits, &mut v) {
-            *x = shift(*x, *w, d).ok_or_else(|| ImportError::Range {
+        if let (Some(_), [_, x, _, w, ..]) = (digits, &v)
+            && (*x == i32::MIN) != (*w == i32::MIN)
+        {
+            return Err(ImportError::Range {
                 at: def.loc(id),
                 field: "x",
-            })?;
+            });
         }
         for (i, slot) in v.iter_mut().enumerate() {
             if *slot == i32::MIN {

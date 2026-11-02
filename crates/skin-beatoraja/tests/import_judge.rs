@@ -220,23 +220,42 @@ fn combo_keys(keys: &str) -> String {
 }
 
 #[test]
-fn a_combo_shift_outside_i32_refuses() {
-    let range_x = |keys: &str| {
+fn a_combo_key_gives_x_and_w_together() {
+    let range = |keys: &str, field: &str| {
         let l = judge(&grades(1), &[combo_keys(keys)]);
         assert!(
-            matches!(l.err(), ImportError::Range { field: "x", .. }),
+            matches!(l.err(), ImportError::Range { field: f, .. } if f == field),
             "{keys}"
         );
     };
-    // `w · 3` overflows.
-    range_x(r#"{"x": 0, "y": 0, "w": 2147483647, "h": 20}"#);
-    // `x − 15` overflows.
-    range_x(r#"{"x": -2147483647, "y": 0, "w": 10, "h": 20}"#);
-    // `x − 3` is the omission mark, `i32::MIN`.
-    range_x(r#"{"x": -2147483645, "y": 0, "w": 2, "h": 20}"#);
     // Only one of the two is given.
-    range_x(r#"{"x": 10, "y": 0, "h": 20}"#);
-    range_x(r#"{"y": 0, "w": 10, "h": 20}"#);
+    range(r#"{"x": 10, "y": 0, "h": 20}"#, "x");
+    range(r#"{"y": 0, "w": 10, "h": 20}"#, "x");
+    // A shift past `i32` is exact, and only its edges leave the model.
+    range(r#"{"x": 0, "y": 0, "w": 2147483647, "h": 20}"#, "dst");
+    range(r#"{"x": -2147483647, "y": 0, "w": 10, "h": 20}"#, "dst");
+}
+
+/// The shift is exact on a 1280 px skin: the raw x 10 less half of three
+/// 11 px widths is −6.5, −9.75 reference pixels, and only the drawn
+/// edges round, putting "12" at 149. Halving the raw widths first would
+/// leave −6, −9, and 150.
+#[test]
+fn a_combo_centres_exactly() {
+    let judge = judge_rec(
+        &grades(1),
+        &[combo_keys(r#"{"x": 10, "y": 0, "w": 11, "h": 20}"#)],
+        "",
+    );
+    let body = format!(
+        r#"{}, {VALUES}, "judge": [{judge}], "destination": [{DST}]"#,
+        images()
+    );
+    let l = import_sized([1_280, 720], &body, &[]);
+    assert_eq!(
+        shown(&l, of(Judgment::Perfect, 12), 12, false),
+        [[149, 300, 17, 30], [166, 300, 17, 30], [150, 300, 120, 30]]
+    );
 }
 
 #[test]
