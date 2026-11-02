@@ -10,9 +10,9 @@
 //! wrap, or lose the sign; they cover the library and its unit tests, not
 //! the integration tests.
 //!
-//! # Loader version 8
+//! # Loader version 9
 //!
-//! These rules are fixed for [`LOADER_VERSION`] 8; changing any of them
+//! These rules are fixed for [`LOADER_VERSION`] 9; changing any of them
 //! changes the version.
 //!
 //! - **Text encoding:** a UTF-8 or UTF-16 BOM decides the encoding. Without
@@ -57,6 +57,19 @@
 //!   the duration limit applies to them, and the resolved hash covers that
 //!   1× chart, so the identity is the same at every speed. A real time
 //!   beyond ±2^32 µs is a [`LoadError::TooLongAtSpeed`].
+//! - **Timeline:** one row per position kept (bar lines, notes, mines,
+//!   BGM, BPM changes and STOPs, in position order), at the time and
+//!   display position its objects have, plus one per positive STOP's end,
+//!   at the STOP's position, after the position's row. A row's tempo is the
+//!   exact BPM from it on, a change at its position applied; the `#BPM`
+//!   header's (130 without one) is the initial tempo. Each note's head and
+//!   end name their positions' rows, and each bar line its position's row.
+//!   The rows are counted before they are built: more than
+//!   [`Limits::max_timeline_points`] is a [`LoadError::TimelineLimit`]. At
+//!   another speed the rows' times are the mapped ones, positions, tempos
+//!   and rows unchanged. Two note endpoints at one µs at different
+//!   positions are not refused: that is play's admission
+//!   ([`Chart::validate_presentation`](bms_model::Chart::validate_presentation)).
 //! - **Identity:** which objects are the same, which survives a conflict,
 //!   long-note pairing and a note inside a long note are decided on exact
 //!   source positions, never on floored µs: objects at distinct positions
@@ -122,7 +135,8 @@
 //!   `#STOPxx`, `#ELSEIF`, and `#SWITCH`/`#CASE`/`#SKIP`/`#DEF`/`#ENDSW`.
 //!   The branching ones are refused even inside a branch not taken.
 //! - **Resolved hash:** covers what the chart resolved to at 1×, display
-//!   positions, the scroll map and the judgment-header declarations in
+//!   positions, the scroll map, the timeline (rows, the notes' and bar
+//!   lines' rows and the tempo metadata) and the judgment-header declarations in
 //!   canonical form included (so whitespace, a header's case and line
 //!   positions do not change it, and `120` and `120.0` differ), not the
 //!   `#RANDOM` results that chose it, so two draws resolving to the same
@@ -155,14 +169,15 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use bms_model::{
-    Chart, ChartIdentity, ModelError, NoteKind, ScrollMap, SoundId, SoundRef, Speed, TimeUs,
+    Chart, ChartIdentity, ChartTimeline, MAX_TIMELINE_POINTS, ModelError, NoteKind, ScrollMap,
+    SoundId, SoundRef, Speed, TimeUs,
 };
 
 pub use error::{LoadError, Warning, WarningKind};
 pub use header::{Header, read_header};
 
 /// Version of the loader rules recorded in [`ChartIdentity::loader_version`].
-pub const LOADER_VERSION: u32 = 8;
+pub const LOADER_VERSION: u32 = 9;
 
 /// Bounds on the work a chart may cause (design.md "Loading Limits"). The
 /// defaults sit far above real charts.
@@ -181,6 +196,11 @@ pub struct Limits {
     /// Most bits in the denominator of the exact running time (design.md "Chart
     /// Time").
     pub max_time_bits: u64,
+    /// Most timeline rows: one per position kept and one per positive
+    /// STOP's end (design.md "Chart Model", "Timeline"). At most
+    /// [`MAX_TIMELINE_POINTS`], which the other defaults cannot pass:
+    /// `2 × max_objects + max_measure + 1` rows.
+    pub max_timeline_points: usize,
 }
 
 impl Default for Limits {
@@ -192,6 +212,7 @@ impl Default for Limits {
             max_measure: 999,
             max_duration: TimeUs(60 * 60 * 1_000_000),
             max_time_bits: 16_384,
+            max_timeline_points: MAX_TIMELINE_POINTS,
         }
     }
 }
@@ -309,7 +330,15 @@ pub fn load_bms(bytes: &[u8], chart_dir: &Path, opts: &LoadOptions) -> Result<Lo
         })
     };
     let real_scroll = timeline.real.take();
+    let real_rows = timeline.real_rows.take();
     let scroll = compile(timeline.initial_rate, timeline.segments)?;
+    let rows = ChartTimeline::new(
+        timeline.rows,
+        timeline.bar_ids,
+        timeline.initial_tempo,
+        Speed::NORMAL,
+    )
+    .map_err(|e| LoadError::Model(ModelError::Timeline(e)))?;
     // The 1× chart first: its hash is the identity at every speed.
     let mut chart = Chart {
         lanes: resolved.lanes,
@@ -317,6 +346,7 @@ pub fn load_bms(bytes: &[u8], chart_dir: &Path, opts: &LoadOptions) -> Result<Lo
         sounds,
         bar_lines: timeline.bar_lines,
         scroll,
+        timeline: rows,
         meta: source.meta,
         identity: ChartIdentity {
             sha256,
@@ -328,11 +358,15 @@ pub fn load_bms(bytes: &[u8], chart_dir: &Path, opts: &LoadOptions) -> Result<Lo
         },
     };
     chart.validate().map_err(LoadError::Model)?;
+    chart
+        .validate_presentation_links()
+        .map_err(|e| LoadError::Links(Box::new(e)))?;
     chart.identity.resolved_hash = hash::resolved_hash(&chart);
     chart.identity.played_hash = chart.identity.resolved_hash;
-    // Then, at another speed, the same objects at their real times, on the
-    // real timeline's scroll map.
-    if let (Some(real), Some(scroll)) = (resolved.real, real_scroll) {
+    // Then, at another speed, the same objects and rows at their real
+    // times, on the real timeline's scroll map. The rows are rewritten in
+    // place, so one table is held.
+    if let (Some(real), Some(scroll), Some(real_rows)) = (resolved.real, real_scroll, real_rows) {
         for (lane, times) in chart.lanes.iter_mut().zip(real.lanes) {
             for (note, (head, tail)) in lane.iter_mut().zip(times) {
                 note.time = head;
@@ -345,7 +379,15 @@ pub fn load_bms(bytes: &[u8], chart_dir: &Path, opts: &LoadOptions) -> Result<Lo
             event.time = time;
         }
         chart.scroll = compile(scroll.initial_rate, scroll.segments)?;
+        chart
+            .timeline
+            .remap(&real_rows, opts.speed)
+            .map_err(|e| LoadError::Model(ModelError::Timeline(e)))?;
+        drop(real_rows);
         chart.validate().map_err(LoadError::Model)?;
+        chart
+            .validate_presentation_links()
+            .map_err(|e| LoadError::Links(Box::new(e)))?;
         chart.identity.played_hash = hash::played_hash(&chart, opts.speed);
     }
     Ok(Loaded {

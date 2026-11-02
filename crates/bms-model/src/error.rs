@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-use crate::{Lane, SoundId, TimeUs};
+use crate::{Lane, Position, SoundId, TimeUs, TimelineError, TimelineId};
 
 /// Why a chart or a scroll map was rejected.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -90,6 +90,8 @@ pub enum ModelError {
         /// The missing sound.
         sound: SoundId,
     },
+    /// The chart's timeline was refused.
+    Timeline(TimelineError),
 }
 
 impl fmt::Display for ModelError {
@@ -148,8 +150,153 @@ impl fmt::Display for ModelError {
             Self::UnknownSound { sound } => {
                 write!(f, "sound {} is not in the sound table", sound.0)
             }
+            Self::Timeline(e) => write!(f, "the timeline is invalid: {e}"),
         }
     }
 }
 
 impl std::error::Error for ModelError {}
+
+/// Which endpoint of a note.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum EndpointPart {
+    /// The head: a tap, a mine, or a long note's start.
+    Head,
+    /// A long note's end.
+    End,
+}
+
+/// A note endpoint, in chart coordinates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct EndpointLocation {
+    /// The note's lane.
+    pub lane: Lane,
+    /// The note's index in its lane.
+    pub index: usize,
+    /// Which endpoint.
+    pub part: EndpointPart,
+    /// The timeline row it names.
+    pub timeline_id: TimelineId,
+}
+
+impl fmt::Display for EndpointLocation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let part = match self.part {
+            EndpointPart::Head => "head",
+            EndpointPart::End => "end",
+        };
+        write!(
+            f,
+            "lane {} note {} {part} (timeline row {})",
+            self.lane.index(),
+            self.index,
+            self.timeline_id.0
+        )
+    }
+}
+
+/// Why a chart's presentation was refused (design.md "Chart Model",
+/// "Timeline"): a broken link between its notes, bar lines and timeline
+/// ([`Chart::validate_presentation_links`]), or two note endpoints at one
+/// playback µs at different positions ([`Chart::validate_presentation`]).
+///
+/// [`Chart::validate_presentation_links`]: crate::Chart::validate_presentation_links
+/// [`Chart::validate_presentation`]: crate::Chart::validate_presentation
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PresentationError {
+    /// An endpoint names a row the timeline does not hold, or one whose
+    /// time or position is not the endpoint's.
+    Link {
+        /// The endpoint.
+        endpoint: EndpointLocation,
+    },
+    /// A tap's or a mine's head and end name different rows.
+    SplitAnchors {
+        /// Lane of the note.
+        lane: Lane,
+        /// Index of the note in its lane.
+        index: usize,
+    },
+    /// A long note's end row comes before its head row.
+    ReversedAnchors {
+        /// Lane of the note.
+        lane: Lane,
+        /// Index of the note in its lane.
+        index: usize,
+    },
+    /// A note's head row comes before the end row of the note before it in
+    /// its lane.
+    LaneOrder {
+        /// Lane of the note.
+        lane: Lane,
+        /// Index of the later note in its lane.
+        index: usize,
+    },
+    /// The timeline names another number of bar lines than the chart has.
+    BarCount {
+        /// Bar lines in the chart.
+        bars: usize,
+        /// Bar rows in the timeline.
+        rows: usize,
+    },
+    /// A bar line's row is not at its position.
+    BarLink {
+        /// Index of the bar line.
+        index: usize,
+    },
+    /// Two note endpoints sit at one playback µs at different positions:
+    /// no single playhead meets both.
+    EndpointConflict {
+        /// Their common playback µs.
+        at: TimeUs,
+        /// The first endpoint of that µs in identity order.
+        first: EndpointLocation,
+        /// The first one at another position.
+        second: EndpointLocation,
+        /// `first`'s display position.
+        first_pos: Position,
+        /// `second`'s display position.
+        second_pos: Position,
+    },
+}
+
+impl fmt::Display for PresentationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            Self::Link { endpoint } => write!(f, "{endpoint} is not at its timeline row"),
+            Self::SplitAnchors { lane, index } => write!(
+                f,
+                "lane {} note {index} names two timeline rows",
+                lane.index()
+            ),
+            Self::ReversedAnchors { lane, index } => write!(
+                f,
+                "lane {} long note {index} ends on a timeline row before its head's",
+                lane.index()
+            ),
+            Self::LaneOrder { lane, index } => write!(
+                f,
+                "lane {} note {index} starts on a timeline row before the previous note ends",
+                lane.index()
+            ),
+            Self::BarCount { bars, rows } => {
+                write!(f, "{bars} bar lines but {rows} bar rows in the timeline")
+            }
+            Self::BarLink { index } => write!(f, "bar line {index} is not at its timeline row"),
+            Self::EndpointConflict {
+                at,
+                first,
+                second,
+                first_pos,
+                second_pos,
+            } => write!(
+                f,
+                "{first} and {second} both sound at {} µs but sit at different positions \
+                 ({} and {} in 2^-80 beat)",
+                at.0, first_pos.0, second_pos.0
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PresentationError {}

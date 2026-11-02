@@ -17,7 +17,9 @@ use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 use ::audio::{AudioOutput, OutputError};
-use bms_model::{BgmEvent, Chart, ModelError, Speed, TimeSource, TimeUs, VirtualClock};
+use bms_model::{
+    BgmEvent, Chart, ModelError, PresentationError, Speed, TimeSource, TimeUs, VirtualClock,
+};
 use eval::{ControlId, Evaluator, GaugeState, InputStart, JudgeEvent, Section, Tally};
 use input::hid::is_axis;
 use input::{Arrival as InputArrival, DeviceKind, InputAdapter, ScriptedInput, SourceSet};
@@ -219,10 +221,40 @@ pub enum SessionError {
     /// ([`Chart::validate`]).
     #[error("the transformed chart is invalid")]
     Transform(#[source] ModelError),
+    /// The chart transform's output has broken links between its notes,
+    /// bar lines and timeline ([`Chart::validate_presentation_links`]).
+    #[error("the transformed chart's timeline links are invalid")]
+    TransformLinks(#[source] Box<PresentationError>),
+    /// The chart cannot be presented at the speed it is loaded at
+    /// ([`Chart::validate_presentation`]): two note endpoints sound at one
+    /// µs at different positions (design.md "Chart Model", "Timeline"). Play
+    /// is refused before anything is prepared for it; reading the chart for
+    /// analysis is not ([`Loaded::chart_at`], [`ChartSource::read`]).
+    #[error("the chart cannot be played at {}% speed", .speed.twentieths() * 5)]
+    Presentation {
+        /// The speed it was loaded at.
+        speed: Speed,
+        /// Where its endpoints conflict.
+        #[source]
+        reason: Box<PresentationError>,
+    },
     /// The chart file is no longer the one loaded: its SHA-256 changed, so
     /// it is not read again at another speed. Opening it anew loads it.
     #[error("the chart file changed since it was loaded; open it again")]
     ChartChanged(PathBuf),
+}
+
+/// Play's admission of a chart read at `speed` (design.md "Chart Model",
+/// "Timeline"): one playhead can present it. Checked before a loaded chart
+/// is stored, first or at a new speed, so a refusal leaves everything as
+/// it was.
+fn admit(chart: &Chart, speed: Speed) -> Result<(), SessionError> {
+    chart
+        .validate_presentation()
+        .map_err(|reason| SessionError::Presentation {
+            speed,
+            reason: Box::new(reason),
+        })
 }
 
 fn io_error(path: &Path) -> impl FnOnce(io::Error) -> SessionError + '_ {
@@ -565,7 +597,9 @@ impl Loaded {
             return Err(Box::new((SessionError::InvalidStep(config.step), shelf)));
         }
         shelf.check();
-        match Self::read_chart(chart_path, config.seed, config.speed, &parts) {
+        let read = Self::read_chart(chart_path, config.seed, config.speed, &parts)
+            .and_then(|read| admit(&read.chart, config.speed).map(|()| read));
+        match read {
             Ok(ReadChart {
                 chart,
                 record: chart_record,
@@ -599,7 +633,10 @@ impl Loaded {
     }
 
     /// Reads, ingests and transforms the chart at `chart_path`: the chart,
-    /// its record and what the loader skipped or assumed.
+    /// its record and what the loader skipped or assumed. The chart is
+    /// checked structurally, its links included, never for presentation at
+    /// its speed: that is play's admission ([`admit`]), and an analysis
+    /// read keeps a chart play would refuse at that speed.
     fn read_chart(
         chart_path: &Path,
         seed: u64,
@@ -628,6 +665,9 @@ impl Loaded {
         // order: a transform must keep both orders (design.md "Chart
         // Model").
         chart.validate().map_err(SessionError::Transform)?;
+        chart
+            .validate_presentation_links()
+            .map_err(|e| SessionError::TransformLinks(Box::new(e)))?;
         let chart_record = ChartRecord {
             identity,
             random_seed: seed,
@@ -661,9 +701,12 @@ impl Loaded {
     /// # Errors
     ///
     /// [`SessionError::ChartChanged`] when the file's SHA-256 is not the
-    /// one loaded, and what reading it refuses; nothing changes then.
+    /// one loaded, what reading it refuses, and
+    /// [`SessionError::Presentation`] for a chart that cannot be presented
+    /// at `speed`; nothing changes then.
     pub fn set_speed(&mut self, speed: Speed) -> Result<(), SessionError> {
         let (config, read) = self.read_at(speed)?;
+        admit(&read.chart, speed)?;
         self.config = config;
         self.chart = read.chart;
         self.chart_record = read.record;
@@ -684,11 +727,14 @@ impl Loaded {
     /// The chart read again from its file at `speed`, with the same seed
     /// and transform, the session unchanged: what the loudness analysis of
     /// a practice at another speed measures at 1× (design.md
-    /// "Algorithms", per-chart volume normalization).
+    /// "Algorithms", per-chart volume normalization). It is checked
+    /// structurally only: a chart that cannot be presented at `speed` is
+    /// still read.
     ///
     /// # Errors
     ///
-    /// As [`set_speed`](Self::set_speed).
+    /// As [`set_speed`](Self::set_speed), except
+    /// [`SessionError::Presentation`].
     pub fn chart_at(&self, speed: Speed) -> Result<Chart, SessionError> {
         self.read_at(speed).map(|(_, read)| read.chart)
     }

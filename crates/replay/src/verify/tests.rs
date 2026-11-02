@@ -662,14 +662,23 @@ fn the_load_uses_the_recorded_speed() {
 
 #[test]
 fn refuses_a_chart_that_resolves_alike_but_plays_otherwise_at_the_speed() {
-    // The two BPMs differ by 10^-18: at 1× the note and the scroll map
-    // floor alike, so the resolved hash is one, and at 50 % the note floors
-    // to 2,000,001 µs and to 2,000,000 µs.
-    let text = |bpm| format!("#BPM {bpm}\n#WAV01 a.wav\n#00111:01\n");
-    let (played_text, edited) = (
-        text("239.999880000059999970"),
-        text("239.999880000059999971"),
-    );
+    // Measure 1 is 10^-18 measure long and starts just before
+    // 1,000,005.5 µs. The played file's note sits at 751/1500 of it, at
+    // exactly 1,000,005.5 µs; the edited file's at 1878/3751, a beat count
+    // below 2^-80 beat less and a few 10^-14 µs earlier. At 1× both floor
+    // to one µs and one display position on the same rows, so the resolved
+    // hash is one; at 50 % the note floors to 2,000,011 µs and to
+    // 2,000,010 µs.
+    let text = |slots: usize, index: usize| {
+        let line: String = (0..slots)
+            .map(|i| if i == index { "01" } else { "00" })
+            .collect();
+        format!(
+            "#BPM 149.999999999789120000\n#WAV01 a.wav\n#00002:0.625003437499121328\n\
+             #00102:0.000000000000000001\n#00111:{line}\n"
+        )
+    };
+    let (played_text, edited) = (text(1500, 751), text(3751, 1878));
     let dir = tempfile::tempdir().unwrap();
     let load = |text: &str, speed| {
         let opts = LoadOptions {
@@ -691,14 +700,14 @@ fn refuses_a_chart_that_resolves_alike_but_plays_otherwise_at_the_speed() {
         load(&played_text, Speed::SLOWEST),
         load(&edited, Speed::SLOWEST),
     );
-    assert_eq!(half.lanes[1][0].time, TimeUs(2_000_001));
-    assert_eq!(edited_half.lanes[1][0].time, TimeUs(2_000_000));
+    assert_eq!(half.lanes[1][0].time, TimeUs(2_000_011));
+    assert_eq!(edited_half.lanes[1][0].time, TimeUs(2_000_010));
     // A play at 50 % pressing 20.000 ms after its note: PERFECT under
     // tapestry, and GREAT 20.001 ms after the edited file's.
     let (_, mut record) = played();
     record.speed = Speed::SLOWEST;
     record.chart.identity = half.identity.clone();
-    record.events = vec![press(2_020_001, 1), press(2_070_001, 0)];
+    record.events = vec![press(2_020_011, 1), press(2_070_011, 0)];
     record.status.finalized = TimeUs(2_400_000);
     let first = |chart: &bms_model::Chart| {
         let r = evaluate_record(&record, chart, None).unwrap();

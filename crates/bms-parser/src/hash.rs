@@ -12,7 +12,10 @@ pub fn file_hashes(bytes: &[u8]) -> ([u8; 32], [u8; 16]) {
 /// SHA-256 over a canonical encoding of the resolved 1× chart (the loader
 /// hashes it before mapping times to a speed): loader version,
 /// the scroll map (initial rate and segments), notes with their display
-/// positions, BGM, bar-line positions, sound names as written, the title,
+/// positions and timeline rows, BGM, bar-line positions, the bar lines'
+/// rows, the timeline's rows (time, position and exact tempo), its tempo
+/// metadata (initial, slowest, fastest and the speed's k), sound names as
+/// written, the title,
 /// the judgment-header declarations in their canonical form (header, class
 /// and exact value; never the text) and the LN mode. Resolved sound paths
 /// are left out, so moving the chart folder
@@ -70,6 +73,8 @@ fn encode_chart(h: &mut Encoder, chart: &Chart) {
                     h.i64(i64::from(damage));
                 }
             }
+            h.u64(u64::from(note.anchors.head.0));
+            h.u64(u64::from(note.anchors.end.0));
         }
     }
     h.len(chart.bgm.len());
@@ -81,6 +86,22 @@ fn encode_chart(h: &mut Encoder, chart: &Chart) {
     for bar in &chart.bar_lines {
         h.i128(bar.0);
     }
+    let timeline = &chart.timeline;
+    h.len(timeline.bar_ids().len());
+    for id in timeline.bar_ids() {
+        h.u64(u64::from(id.0));
+    }
+    h.len(timeline.points().len());
+    for row in timeline.points() {
+        h.i64(row.at.0);
+        h.i128(row.pos.0);
+        h.u128(row.tempo.units());
+    }
+    let meta = timeline.meta();
+    h.u128(meta.initial.units());
+    h.u128(meta.min.units());
+    h.u128(meta.max.units());
+    h.u64(u64::from(meta.speed.twentieths()));
     h.len(chart.sounds.len());
     for sound in &chart.sounds {
         h.bytes(sound.name.as_bytes());
@@ -131,6 +152,10 @@ impl Encoder {
     }
 
     fn i128(&mut self, v: i128) {
+        self.0.update(v.to_le_bytes());
+    }
+
+    fn u128(&mut self, v: u128) {
         self.0.update(v.to_le_bytes());
     }
 

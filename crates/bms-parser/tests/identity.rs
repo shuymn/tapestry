@@ -3,7 +3,7 @@
 //! µs or quantize to one display position, and objects at one position
 //! conflict as they always have.
 
-use bms_model::{BEAT, Note, NoteKind, Position, SoundId, TimeUs};
+use bms_model::{BEAT, Note, NoteAnchors, NoteKind, Position, SoundId, TimeUs, TimelineId};
 use bms_parser::{LoadOptions, Loaded, WarningKind, load_bms};
 
 fn load(text: &str) -> Loaded {
@@ -43,15 +43,23 @@ fn taps_at_distinct_positions_in_one_microsecond_both_stay() {
         line(8, 1, "02")
     );
     let loaded = load(&text);
-    let tap = |pos, sound| Note {
+    // Row 0 is the bar line at 0, rows 1 and 2 the taps' positions.
+    let tap = |pos, sound, row| Note {
         time: TimeUs(0),
         pos,
         sound: Some(SoundId(sound)),
         kind: NoteKind::Tap,
+        anchors: NoteAnchors {
+            head: TimelineId(row),
+            end: TimelineId(row),
+        },
     };
     assert_eq!(
         loaded.chart.lanes[1],
-        [tap(units(4, 8_000_000), 1), tap(units(4, 4_000_000), 0)]
+        [
+            tap(units(4, 8_000_000), 1, 1),
+            tap(units(4, 4_000_000), 0, 2)
+        ]
     );
     assert_eq!(kinds(&loaded), []);
 }
@@ -76,6 +84,31 @@ fn positions_that_quantize_together_stay_distinct() {
                 (TimeUs(0), Position(1180), Some(SoundId(0))),
             ]
         );
+        // Each keeps its own timeline row: row 0 is the bar line, rows 1
+        // and 2 the two positions, alike in time and position yet never
+        // merged.
+        let heads: Vec<_> = lane.iter().map(|n| n.anchors).collect();
+        let on = |row| NoteAnchors {
+            head: TimelineId(row),
+            end: TimelineId(row),
+        };
+        assert_eq!(heads, [on(1), on(2)]);
+        let rows: Vec<_> = loaded
+            .chart
+            .timeline
+            .points()
+            .iter()
+            .map(|p| (p.at, p.pos))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                (TimeUs(0), Position(0)),
+                (TimeUs(0), Position(1180)),
+                (TimeUs(0), Position(1180)),
+            ]
+        );
+        assert_eq!(loaded.chart.validate_presentation(), Ok(()));
         assert_eq!(kinds(&loaded), []);
     }
 }

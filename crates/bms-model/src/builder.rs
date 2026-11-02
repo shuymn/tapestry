@@ -1,14 +1,18 @@
 //! Building charts in code, for tests across the workspace.
 
 use crate::{
-    BgmEvent, Chart, ChartIdentity, ChartMeta, LANE_COUNT, Lane, ModelError, Note, NoteKind,
-    Position, ScrollChange, ScrollMap, SoundId, SoundRef, TimeUs,
+    BgmEvent, Chart, ChartIdentity, ChartMeta, ChartTimeline, LANE_COUNT, Lane, ModelError, Note,
+    NoteAnchors, NoteKind, Position, ScrollChange, ScrollMap, SoundId, SoundRef, Speed, Tempo,
+    TimeUs, TimelineId, TimelinePoint,
 };
 
-/// Builds a [`Chart`] from notes, sounds and scroll changes given in any
-/// order. Notes and BGM are sorted by time, each note head and long-note end
-/// is placed where the scroll map puts its time, and the result is
-/// validated.
+/// Builds a [`Chart`] from notes, sounds, bar lines and scroll changes given
+/// in any order. Notes and BGM are sorted by time, each note head, long-note
+/// end and bar line is placed where the scroll map puts its time, and the
+/// result is validated. Its timeline has one row per distinct time of the
+/// origin, a note endpoint, a bar line, a BPM change, a STOP's start or a
+/// STOP's end, each with the tempo in effect from it; every endpoint and bar
+/// line names the row of its time.
 #[derive(Clone, Debug)]
 pub struct ChartBuilder {
     bpm_milli: i64,
@@ -17,6 +21,7 @@ pub struct ChartBuilder {
     lanes: [Vec<Note>; LANE_COUNT],
     bgm: Vec<BgmEvent>,
     sounds: Vec<SoundRef>,
+    bars: Vec<TimeUs>,
 }
 
 impl ChartBuilder {
@@ -31,6 +36,7 @@ impl ChartBuilder {
             bgm: Vec::new(),
             sounds: Vec::new(),
             scroll: Vec::new(),
+            bars: Vec::new(),
         }
     }
 
@@ -40,7 +46,15 @@ impl ChartBuilder {
             pos: Position(0),
             sound: None,
             kind,
+            anchors: NoteAnchors::default(),
         });
+        self
+    }
+
+    /// Adds a bar line at `at`.
+    #[must_use]
+    pub fn bar(mut self, at: TimeUs) -> Self {
+        self.bars.push(at);
         self
     }
 
@@ -108,37 +122,109 @@ impl ChartBuilder {
     ///
     /// # Errors
     ///
-    /// Returns the error of [`ScrollMap::new`] or [`Chart::validate`].
+    /// Returns the error of [`ScrollMap::new`], [`Chart::validate`] or the
+    /// timeline ([`ModelError::Timeline`], for a time before 0); a BPM
+    /// outside the tempo range is [`ModelError::InvalidBpm`].
     pub fn build(mut self) -> Result<Chart, ModelError> {
         for notes in &mut self.lanes {
             notes.sort_by_key(|n| n.time);
         }
         self.bgm.sort_by_key(|e| e.time);
+        self.bars.sort_unstable();
         let to_micro = |milli: i64| milli.checked_mul(1_000).ok_or(ModelError::Overflow);
+        // Each BPM change's time and BPM in thousandths, in the order given;
+        // stable sorting keeps the later of two at one time last.
+        let mut changes = Vec::new();
         for change in &mut self.scroll {
-            if let ScrollChange::Bpm { bpm_micro, .. } = change {
+            if let ScrollChange::Bpm { at, bpm_micro } = change {
+                changes.push((*at, *bpm_micro));
                 *bpm_micro = to_micro(*bpm_micro)?;
             }
         }
         let scroll = ScrollMap::new(to_micro(self.bpm_milli)?, &self.scroll)?;
-        for note in self.lanes.iter_mut().flatten() {
-            note.pos = scroll.position_at(note.time);
-            if let NoteKind::Long { end, end_pos, .. } = &mut note.kind {
-                *end_pos = scroll.position_at(*end);
+        let initial = tempo(TimeUs(0), self.bpm_milli)?;
+        let mut tempos = Vec::with_capacity(changes.len());
+        for (at, milli) in changes {
+            tempos.push((at, tempo(at, milli)?));
+        }
+        tempos.sort_by_key(|&(at, _)| at);
+
+        let mut times = vec![TimeUs(0)];
+        times.extend(self.bars.iter().copied());
+        for note in self.lanes.iter().flatten() {
+            times.push(note.time);
+            times.push(note.end());
+        }
+        for change in &self.scroll {
+            match *change {
+                ScrollChange::Bpm { at, .. } => times.push(at),
+                ScrollChange::Stop { at, len } => {
+                    times.push(at);
+                    times.push(at.checked_add(len).ok_or(ModelError::Overflow)?);
+                }
             }
         }
+        times.sort_unstable();
+        times.dedup();
+        let row = |at: TimeUs| -> Result<TimelineId, ModelError> {
+            let i = times.binary_search(&at).unwrap_or(0);
+            u32::try_from(i)
+                .map(TimelineId)
+                .map_err(|_| ModelError::Overflow)
+        };
+        let mut points = Vec::with_capacity(times.len());
+        for &at in &times {
+            let changed = tempos.partition_point(|&(t, _)| t <= at);
+            points.push(TimelinePoint {
+                at,
+                pos: scroll.position_at(at),
+                tempo: changed.checked_sub(1).map_or(initial, |i| tempos[i].1),
+            });
+        }
+        // Every endpoint and bar line sits at its row's position.
+        let pos = |id: TimelineId| points[id.index()].pos;
+        for note in self.lanes.iter_mut().flatten() {
+            let anchors = NoteAnchors {
+                head: row(note.time)?,
+                end: row(note.end())?,
+            };
+            note.pos = pos(anchors.head);
+            if let NoteKind::Long { end_pos, .. } = &mut note.kind {
+                *end_pos = pos(anchors.end);
+            }
+            note.anchors = anchors;
+        }
+        let bar_ids: Vec<TimelineId> = self
+            .bars
+            .iter()
+            .map(|&at| row(at))
+            .collect::<Result<_, _>>()?;
+        let bar_lines = bar_ids.iter().map(|&id| pos(id)).collect();
+        let timeline = ChartTimeline::new(points, bar_ids, initial, Speed::NORMAL)
+            .map_err(ModelError::Timeline)?;
         let chart = Chart {
             lanes: self.lanes,
             bgm: self.bgm,
             sounds: self.sounds,
-            bar_lines: Vec::new(),
+            bar_lines,
             scroll,
+            timeline,
             meta: ChartMeta::default(),
             identity: ChartIdentity::default(),
         };
+        // The links hold whenever this passes: each endpoint names the row
+        // of its own time, and rows follow time.
         chart.validate()?;
         Ok(chart)
     }
+}
+
+/// The tempo of `milli` thousandths of a BPM, the change at `at`.
+fn tempo(at: TimeUs, milli: i64) -> Result<Tempo, ModelError> {
+    Tempo::from_milli(milli).ok_or(ModelError::InvalidBpm {
+        at,
+        bpm_micro: milli.saturating_mul(1_000),
+    })
 }
 
 #[cfg(test)]

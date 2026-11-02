@@ -2,22 +2,22 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use bms_model::{BgmEvent, LANE_COUNT, Note, NoteKind, Position, SoundId, TimeUs};
+use bms_model::{
+    BgmEvent, LANE_COUNT, Note, NoteAnchors, NoteKind, Position, SoundId, TimeUs, TimelineId,
+};
 
 use crate::parse::ObjectKind;
 use crate::timing::Timed;
 use crate::{Warning, WarningKind};
 
-/// A note before conflicts are settled.
+/// A note before conflicts are settled. Its anchors are the rows of its
+/// exact head and end positions ([`Timed::id`]), on which identity is
+/// decided.
 #[derive(Clone, Copy, Debug)]
 struct Candidate {
     note: Note,
     /// The real times of its head and its end ([`Timed::real`]).
     real: (TimeUs, TimeUs),
-    /// The exact position of the note's head ([`Timed::rank`]).
-    rank: usize,
-    /// The exact position of its end: a long note's end, else `rank`.
-    end_rank: usize,
     /// File order of the object, the tie-breaker (later wins).
     seq: usize,
     line: usize,
@@ -72,14 +72,14 @@ struct Endpoint {
     time: TimeUs,
     real: TimeUs,
     pos: Position,
-    rank: usize,
+    row: TimelineId,
     id: u16,
     seq: usize,
     line: usize,
 }
 
 /// Builds lanes from objects sorted by position. Identity, conflicts and
-/// pairing are decided on exact positions ([`Timed::rank`]), so objects at
+/// pairing are decided on exact positions ([`Timed::id`]), so objects at
 /// distinct positions that floor to one µs stay distinct. With `mapped`,
 /// the real times are kept beside them.
 pub fn resolve(
@@ -121,7 +121,7 @@ pub fn resolve(
                 let start = last_plain[l]
                     .take()
                     .map(|i| &mut candidates[l][i])
-                    .filter(|c| c.rank < obj.rank);
+                    .filter(|c| c.note.anchors.head < obj.id);
                 match start {
                     Some(start) => {
                         start.note.kind = NoteKind::Long {
@@ -129,7 +129,7 @@ pub fn resolve(
                             end_pos: obj.pos,
                             end_sound: None,
                         };
-                        start.end_rank = obj.rank;
+                        start.note.anchors.end = obj.id;
                         start.real.1 = obj.real;
                     }
                     None => warn(warnings, WarningKind::UnpairedLongNoteEnd),
@@ -145,10 +145,9 @@ pub fn resolve(
                         pos: obj.pos,
                         sound,
                         kind: NoteKind::Tap,
+                        anchors: at_row(obj.id),
                     },
                     real: (obj.real, obj.real),
-                    rank: obj.rank,
-                    end_rank: obj.rank,
                     seq: obj.seq,
                     line: obj.line,
                 });
@@ -157,7 +156,7 @@ pub fn resolve(
                 time: obj.time,
                 real: obj.real,
                 pos: obj.pos,
-                rank: obj.rank,
+                row: obj.id,
                 id,
                 seq: obj.seq,
                 line: obj.line,
@@ -171,10 +170,9 @@ pub fn resolve(
                         kind: NoteKind::Mine {
                             damage: i32::from(id),
                         },
+                        anchors: at_row(obj.id),
                     },
                     real: (obj.real, obj.real),
-                    rank: obj.rank,
-                    end_rank: obj.rank,
                     seq: obj.seq,
                     line: obj.line,
                 });
@@ -207,10 +205,10 @@ fn pair_long_notes(
     sounds: &mut Sounds<'_>,
     warnings: &mut Vec<Warning>,
 ) {
-    lane.sort_unstable_by_key(|e| (e.rank, e.seq));
+    lane.sort_unstable_by_key(|e| (e.row, e.seq));
     let mut merged: Vec<Endpoint> = Vec::with_capacity(lane.len());
     for e in lane {
-        if let Some(last) = merged.last_mut().filter(|last| last.rank == e.rank) {
+        if let Some(last) = merged.last_mut().filter(|last| last.row == e.row) {
             warnings.push(Warning {
                 line: Some(last.line),
                 kind: WarningKind::SamePositionNoteDropped,
@@ -238,10 +236,12 @@ fn pair_long_notes(
                     end_pos: end.pos,
                     end_sound,
                 },
+                anchors: NoteAnchors {
+                    head: start.row,
+                    end: end.row,
+                },
             },
             real: (start.real, end.real),
-            rank: start.rank,
-            end_rank: end.rank,
             seq: start.seq,
             line: start.line,
         });
@@ -254,6 +254,14 @@ fn pair_long_notes(
     }
 }
 
+/// A tap's or a mine's anchors: both on its row.
+const fn at_row(row: TimelineId) -> NoteAnchors {
+    NoteAnchors {
+        head: row,
+        end: row,
+    }
+}
+
 /// Settles one lane: at one position the highest priority wins, then the
 /// later object in the file; a note at or inside an earlier long note's span
 /// is dropped. With `mapped`, the kept notes' real times come beside them;
@@ -263,11 +271,11 @@ fn settle(
     mapped: bool,
     warnings: &mut Vec<Warning>,
 ) -> (Vec<Note>, Vec<(TimeUs, TimeUs)>) {
-    lane.sort_unstable_by_key(|c| (c.rank, priority(c.note.kind), c.seq));
+    lane.sort_unstable_by_key(|c| (c.note.anchors.head, priority(c.note.kind), c.seq));
     let mut kept: Vec<Note> = Vec::with_capacity(lane.len());
     let mut real = Vec::with_capacity(if mapped { lane.len() } else { 0 });
-    // The end position of the last note kept.
-    let mut last_end_rank: Option<usize> = None;
+    // The end row of the last note kept.
+    let mut last_end: Option<TimelineId> = None;
     for (i, c) in lane.iter().enumerate() {
         let drop = |warnings: &mut Vec<Warning>, kind| {
             warnings.push(Warning {
@@ -275,16 +283,19 @@ fn settle(
                 kind,
             });
         };
-        if lane.get(i + 1).is_some_and(|next| next.rank == c.rank) {
+        if lane
+            .get(i + 1)
+            .is_some_and(|next| next.note.anchors.head == c.note.anchors.head)
+        {
             drop(warnings, WarningKind::SamePositionNoteDropped);
-        } else if last_end_rank.is_some_and(|end| c.rank <= end) {
+        } else if last_end.is_some_and(|end| c.note.anchors.head <= end) {
             drop(warnings, WarningKind::NoteInsideLongNoteDropped);
         } else {
             kept.push(c.note);
             if mapped {
                 real.push(c.real);
             }
-            last_end_rank = Some(c.end_rank);
+            last_end = Some(c.note.anchors.end);
         }
     }
     (kept, real)
@@ -309,7 +320,7 @@ mod tests {
             kind,
             line: usize::try_from(time).unwrap(),
             seq: 0,
-            rank: usize::try_from(time).unwrap(),
+            id: bms_model::TimelineId(u32::try_from(time).unwrap()),
         }
     }
 

@@ -5,8 +5,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use bms_model::{
-    BEAT, HeaderValue, JudgmentHeader, JudgmentHeaderName, Note, NoteKind, Position, SoundId,
-    TimeUs,
+    BEAT, HeaderValue, JudgmentHeader, JudgmentHeaderName, Note, NoteAnchors, NoteKind, Position,
+    SoundId, TimeUs, TimelineId,
 };
 use bms_parser::{LOADER_VERSION, Limits, LoadError, LoadOptions, Loaded, WarningKind, load_bms};
 use tempfile::TempDir;
@@ -142,6 +142,8 @@ fn rational_time_does_not_drift() {
 #[test]
 fn lnobj_and_lntype1_build_the_same_spans() {
     // 120 BPM: 2 beats a second, every endpoint on a whole beat.
+    // The two files hold other positions, so their rows differ; the
+    // links are checked, then left out of the comparison.
     let long = |start: i64, end: i64| Note {
         time: TimeUs(start),
         pos: beats(i128::from(start / 500_000)),
@@ -151,6 +153,7 @@ fn lnobj_and_lntype1_build_the_same_spans() {
             end_pos: beats(i128::from(end / 500_000)),
             end_sound: None,
         },
+        anchors: NoteAnchors::default(),
     };
     // 120 BPM: 2 s per measure, measure 1 starts at 2 s.
     let mut expected: [Vec<Note>; 8] = Default::default();
@@ -161,7 +164,12 @@ fn lnobj_and_lntype1_build_the_same_spans() {
     let dir = folder(&["click.wav"]);
     for name in ["long_notes_lnobj.bms", "long_notes_lntype1.bms"] {
         let loaded = load_in(&chart(name), dir.path()).unwrap();
-        assert_eq!(loaded.chart.lanes, expected, "{name}");
+        assert_eq!(loaded.chart.validate_presentation(), Ok(()), "{name}");
+        let mut lanes = loaded.chart.lanes.clone();
+        for note in lanes.iter_mut().flatten() {
+            note.anchors = NoteAnchors::default();
+        }
+        assert_eq!(lanes, expected, "{name}");
         assert_eq!(
             loaded.chart.lanes.iter().map(Vec::len).sum::<usize>(),
             4,
@@ -529,6 +537,12 @@ fn duplicated_lntype1_line_keeps_one_long_note() {
                 end: TimeUs(3_000_000),
                 end_pos: beats(6),
                 end_sound: None
+            },
+            // Row 0 is measure 0's bar line, row 1 measure 1's with the
+            // start, row 2 the end.
+            anchors: NoteAnchors {
+                head: TimelineId(1),
+                end: TimelineId(2)
             }
         }]
     );
@@ -546,15 +560,20 @@ fn notes_rounded_to_one_time_stay_in_position_order() {
     let text = "#BPM 120\n#WAV01 click.wav\n#WAV02 click.wav\n#00002:0.000001\n\
                 #00011:00010000\n#00011:02\n";
     let loaded = load_text(text).unwrap();
-    let tap = |pos, sound| Note {
+    // Row 0 holds the bar line and the note at 0, row 1 the other.
+    let tap = |pos, sound, row| Note {
         time: TimeUs(0),
         pos,
         sound: Some(SoundId(sound)),
         kind: NoteKind::Tap,
+        anchors: NoteAnchors {
+            head: TimelineId(row),
+            end: TimelineId(row),
+        },
     };
     assert_eq!(
         loaded.chart.lanes[1],
-        vec![tap(beats(0), 1), tap(Position(BEAT / 1_000_000), 0)]
+        vec![tap(beats(0), 1, 0), tap(Position(BEAT / 1_000_000), 0, 1)]
     );
     assert_eq!(loaded.warnings, vec![]);
 }
@@ -615,12 +634,15 @@ fn long_note_edge_cases() {
 #[test]
 fn resolved_hash_matches_golden() {
     // Computed at authoring time by an independent script encoding the
-    // documented fields of this chart: version 8, the 120 BPM rate
+    // documented fields of this chart: version 9, the 120 BPM rate
     // (floor(2^80 / 500_000) units per µs) before time 0 and as the one
-    // segment from 0, one tap at 2 s and 4 beats on key 1 with sound 0, bar
-    // lines at 0 and 4 beats, the sound name `a.wav`, an empty title and no
-    // other values (no judgment-header declarations, no LN mode).
-    const GOLDEN: &str = "017b3a8cb8565179f5b6ceb246899dadfe0fe4279417d19d869707cd1c198139";
+    // segment from 0, one tap at 2 s and 4 beats on key 1 with sound 0 on
+    // row 1, bar lines at 0 and 4 beats on rows 0 and 1, the rows (0 µs at
+    // 0 and 2 s at 4 beats, each at 120 BPM), the tempo metadata (120 BPM
+    // initial, slowest and fastest; k 20), the sound name `a.wav`, an
+    // empty title and no other values (no judgment-header declarations, no
+    // LN mode).
+    const GOLDEN: &str = "acf7f4524cf7c507a2aa962e542356c12e2cdf3b62796629a2845e994aac496d";
     let loaded = load_text("#BPM 120\n#WAV01 a.wav\n#00111:01\n").unwrap();
     let hex: String = loaded
         .chart

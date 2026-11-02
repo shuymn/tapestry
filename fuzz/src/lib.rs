@@ -43,8 +43,48 @@ fn chart_dir() -> &'static Path {
 /// # Errors
 ///
 /// What [`bms_parser::load_bms`] refuses.
+///
+/// # Panics
+///
+/// If a loaded chart breaks its base or link invariants, or its
+/// presentation validity disagrees with [`endpoint_conflict`].
 pub fn bms_load(data: &[u8]) -> Result<Loaded, LoadError> {
-    bms_parser::load_bms(data, chart_dir(), &LoadOptions::default())
+    let loaded = bms_parser::load_bms(data, chart_dir(), &LoadOptions::default())?;
+    let chart = &loaded.chart;
+    assert_eq!(chart.validate(), Ok(()), "a loaded chart is valid");
+    assert_eq!(
+        chart.validate_presentation_links(),
+        Ok(()),
+        "a loaded chart's links hold"
+    );
+    let t = &chart.timeline;
+    assert!(t.points().len() <= bms_model::MAX_TIMELINE_POINTS);
+    let meta = t.meta();
+    assert!(meta.min <= meta.initial && meta.initial <= meta.max);
+    assert_eq!(meta.speed, bms_model::Speed::NORMAL);
+    // The loader never refuses a conflict; validity is the chart's own.
+    match chart.validate_presentation() {
+        Ok(()) => assert!(!endpoint_conflict(chart), "a conflict passed"),
+        Err(bms_model::PresentationError::EndpointConflict { .. }) => {
+            assert!(endpoint_conflict(chart), "a conflict without one");
+        }
+        Err(e) => panic!("links passed but presentation failed: {e}"),
+    }
+    Ok(loaded)
+}
+
+/// The presentation oracle: whether two note endpoints of `chart` sit at
+/// one µs at different positions, by sorting every endpoint.
+fn endpoint_conflict(chart: &bms_model::Chart) -> bool {
+    let mut ends: Vec<(i64, i128)> = chart
+        .lanes
+        .iter()
+        .flatten()
+        .flat_map(|n| [(n.time.0, n.pos.0), (n.end().0, n.end_pos().0)])
+        .collect();
+    ends.sort_unstable();
+    ends.windows(2)
+        .any(|w| w[0].0 == w[1].0 && w[0].1 != w[1].1)
 }
 
 /// Target `replay_file`: an input log file's bytes, header and compressed
@@ -1072,17 +1112,16 @@ fn bar_probes(
     use bms_model::{ChartBuilder, Lane, TimeUs};
     use skin_model::{LaneView, Layout, SkinFrame};
 
-    let mut chart = ChartBuilder::new(150_000)
+    let mut builder = ChartBuilder::new(150_000)
         .stop(TimeUs(1_000_000), TimeUs(500_000))
-        .tap(Lane::new(1).expect("lane 1"), TimeUs(3_000_000))
-        .build()
-        .expect("a chart of a tap");
-    let at = |ms: i64| chart.scroll.position_at(TimeUs(ms * 1_000));
-    let mut bars: Vec<_> = (0..40).map(|i| at(i * 125)).collect();
-    bars.extend(std::iter::repeat_n(at(3_000), 8));
-    bars.sort_unstable();
-    chart.bar_lines = bars;
-    chart.validate().expect("the bar chart is valid");
+        .tap(Lane::new(1).expect("lane 1"), TimeUs(3_000_000));
+    for i in 0..40 {
+        builder = builder.bar(TimeUs(i * 125_000));
+    }
+    for _ in 0..8 {
+        builder = builder.bar(TimeUs(3_000_000));
+    }
+    let chart = builder.build().expect("the bar chart is valid");
     let mut play = skin
         .prepare(&chart, ctx)
         .expect("an imported skin prepares");

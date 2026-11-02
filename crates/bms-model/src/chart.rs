@@ -3,7 +3,7 @@
 
 use std::path::PathBuf;
 
-use crate::{ModelError, Position, ScrollMap, TimeUs};
+use crate::{ChartTimeline, ModelError, NoteAnchors, Position, ScrollMap, TimeUs};
 
 /// Number of lanes: the scratch and seven keys.
 pub const LANE_COUNT: usize = 8;
@@ -57,6 +57,8 @@ pub struct Note {
     pub sound: Option<SoundId>,
     /// What kind of note this is.
     pub kind: NoteKind,
+    /// The timeline rows of its head and end ([`Chart::timeline`]).
+    pub anchors: NoteAnchors,
 }
 
 impl Note {
@@ -241,10 +243,15 @@ pub struct Chart {
     pub bgm: Vec<BgmEvent>,
     /// The sound table, indexed by [`SoundId`].
     pub sounds: Vec<SoundRef>,
-    /// Display positions of the bar lines, sorted.
+    /// Display positions of the bar lines, sorted; their rows are
+    /// [`ChartTimeline::bar_ids`].
     pub bar_lines: Vec<Position>,
     /// The playhead's display position over time.
     pub scroll: ScrollMap,
+    /// The timeline the notes and bar lines name, with the tempo
+    /// metadata. [`Chart::validate`] does not read it;
+    /// [`Chart::validate_presentation_links`] checks the links.
+    pub timeline: ChartTimeline,
     /// Header values.
     pub meta: ChartMeta,
     /// What identifies the chart.
@@ -252,7 +259,8 @@ pub struct Chart {
 }
 
 impl Chart {
-    /// Checks the invariants consumers rely on.
+    /// Checks the invariants consumers rely on. The timeline and its links
+    /// are not checked here ([`Chart::validate_presentation_links`]).
     ///
     /// # Errors
     ///
