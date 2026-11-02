@@ -677,24 +677,28 @@ fn the_quit_key_leaves_the_measurement_to_the_background() {
     assert_eq!(lines(&next, "play started").len(), 1, "{next}");
 }
 
-/// Choosing the chart again while its background measurement runs waits
-/// for that measurement, saying it measures the loudness, and does not
-/// measure the chart a second time.
+/// Choosing the chart again while its background measurement runs (held
+/// at its gate) waits for that measurement, saying it measures the
+/// loudness, and does not measure the chart a second time.
 #[test]
 fn choosing_the_chart_again_waits_for_its_background_measurement() {
     let fx = fixture();
     write_chart(&fx.library, "a", "a.bms", "譜面A", 4_000);
     let (_, stdout) = run(
         &fx,
-        "slow-measuring=3000,pick=a.bms,quit-measuring,enter,background=running,\
-         pick=a.bms,enter,back,close",
+        "slow-measuring=3000,hold-background,pick=a.bms,quit-measuring,enter,\
+         background=running,pick=a.bms,enter,back,close",
         &[],
     );
     let at = |from: usize, line: &str| {
         find_from(&stdout, from, line).unwrap_or_else(|| panic!("no {line}:\n{stdout}"))
     };
     let cancelled = at(0, "load: cancelled");
-    let again = at(cancelled, "select: chose a.bms");
+    let held = at(
+        cancelled,
+        "dev: the background measurement holds at its gate",
+    );
+    let again = at(held, "select: chose a.bms");
     let waiting = at(
         again,
         "loudness: waiting for a.bms's measurement in the background",
@@ -723,7 +727,8 @@ fn choosing_the_chart_again_waits_for_its_background_measurement() {
 
 /// Closing the window while the background measures stops it: the run
 /// ends without waiting for it, nothing of it is stored, and the next run
-/// measures the chart in its load. The end's stop bound only catches a
+/// measures the chart in its load. The measurement is under way, held at
+/// its gate, when the close stops it. The end's stop bound only catches a
 /// measurement that never stops: a loaded machine starves its
 /// background-mode thread past the production 2 s.
 #[test]
@@ -732,7 +737,8 @@ fn closing_while_measuring_in_the_background_stores_nothing() {
     write_chart(&fx.library, "a", "a.bms", "譜面A", 4_000);
     let out = select(
         &fx,
-        "slow-measuring=5000,pick=a.bms,quit-measuring,enter,background=running,close",
+        "slow-measuring=5000,hold-background,pick=a.bms,quit-measuring,enter,\
+         background=running,close",
         &["--dev-stop-timeout", "600"],
     )
     .output()
@@ -745,6 +751,15 @@ fn closing_while_measuring_in_the_background_stores_nothing() {
         1,
         "{stdout}"
     );
+    let at = |from: usize, line: &str| {
+        find_from(&stdout, from, line).unwrap_or_else(|| panic!("no {line}:\n{stdout}"))
+    };
+    let measuring = at(0, "loudness: measuring a.bms in the background");
+    let held = at(
+        measuring,
+        "dev: the background measurement holds at its gate",
+    );
+    at(held, "dev: the background measurement stopped at its gate");
     assert!(
         lines(&stdout, "loudness: a.bms measured in ").is_empty(),
         "{stdout}"

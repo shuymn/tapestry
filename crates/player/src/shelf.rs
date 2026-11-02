@@ -569,6 +569,8 @@ impl Shelf {
         let line = format!("loudness: waiting for {name}'s measurement in the background");
         println!("{line}");
         log::info!("{line}");
+        #[cfg(feature = "dev-tools")]
+        crate::dev::release_background();
         while !worker.wait_done(chart, BACKGROUND_SLICE) {
             if cancelled() {
                 return game::Loading::Cancelled;
@@ -601,9 +603,8 @@ impl Shelf {
         self.loudness.store(&mut self.library);
     }
 
-    /// Whether the background measurement measures a job, its line
-    /// printed, and whether it has none at all, held or waiting
-    /// (dev-tools).
+    /// Whether the background measurement holds a job, and whether it has
+    /// none at all, held or waiting (dev-tools).
     #[cfg(feature = "dev-tools")]
     pub fn background(&self) -> (bool, bool) {
         self.background.as_ref().map_or((false, true), Worker::busy)

@@ -67,6 +67,58 @@ pub fn hold_measuring(stop: &mut dyn FnMut() -> bool) -> bool {
     }
 }
 
+/// Background measurements hold at their gate (`hold-background`).
+static GATE_ARMED: AtomicBool = AtomicBool::new(false);
+
+/// A background measurement holds at its gate.
+static GATE_HELD: AtomicBool = AtomicBool::new(false);
+
+/// Every background measurement from now on holds at its gate until
+/// [`release_background`] (`hold-background`).
+pub fn hold_background() {
+    GATE_ARMED.store(true, Ordering::SeqCst);
+}
+
+/// Releases the gate: the measurement held there goes on, and none holds
+/// there again.
+pub fn release_background() {
+    GATE_ARMED.store(false, Ordering::SeqCst);
+}
+
+/// Whether a background measurement holds at its gate.
+pub fn background_held() -> bool {
+    GATE_HELD.load(Ordering::SeqCst)
+}
+
+/// Clears [`GATE_HELD`] however the hold ends.
+struct Held;
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        GATE_HELD.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Holds a background measurement under way at its gate while
+/// `hold-background` holds it, asking `stop` every 10 ms as a
+/// measurement asks before each block: `false` once it says to stop.
+pub fn background_gate(stop: &dyn Fn() -> bool) -> bool {
+    if !GATE_ARMED.load(Ordering::SeqCst) {
+        return true;
+    }
+    let _held = Held;
+    GATE_HELD.store(true, Ordering::SeqCst);
+    println!("dev: the background measurement holds at its gate");
+    while GATE_ARMED.load(Ordering::SeqCst) {
+        if stop() {
+            println!("dev: the background measurement stopped at its gate");
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    true
+}
+
 /// Prints, to the console only, which window took the foreground when the
 /// game's window lost focus: its process's executable name and its window
 /// class, with the time on the game's clock (µs since start). A focus loss
@@ -487,8 +539,12 @@ pub enum SelectStep {
     /// milliseconds before its first block, stopped as a measurement is: a
     /// slow measurement, a load's or the background's.
     SlowMeasuring(u64),
-    /// Wait until the background measurement measures a job, its line
-    /// printed (`true`), or has none held or waiting (`false`), at most
+    /// Every background measurement from here on holds at its gate, past
+    /// its first stop check and its line, until a load waits for it or the
+    /// run ends.
+    HoldBackground,
+    /// Wait until a background measurement holds at its gate (`true`), or
+    /// the background has no job held or waiting (`false`), at most
     /// [`STEP_WATCHDOG`]: its thread runs in background mode, which a
     /// loaded machine starves for tens of seconds, so only the watchdog
     /// bounds the wait.
@@ -522,7 +578,8 @@ pub struct SlowLoad {
 /// `idle=<ms>`, `enter`, `prev-preset`, `next-preset`, `drawn`,
 /// `back`, `retry`, `next`, `prev`, `close-measuring`, `quit-measuring`,
 /// `quit-decoding`, `slow-load=<ms>`, `quit-loading`, `close-loading`,
-/// `slow-measuring=<ms>`, `background=<running|idle>` and `close`.
+/// `slow-measuring=<ms>`, `hold-background`, `background=<running|idle>`
+/// and `close`.
 /// Selection steps run on the select screen (`prev-preset` and
 /// `next-preset` press F11 and F12; `close-measuring` and
 /// `quit-measuring` close the window or press the quit key once the next
@@ -531,8 +588,10 @@ pub struct SlowLoad {
 /// `quit-loading` and `close-loading` press the quit key or close the
 /// window halfway through it; `slow-measuring` holds every loudness
 /// measurement from then on that long before its first block, a load's and
-/// the background's; `background` waits until the background measurement
-/// measures a job, or has none at all),
+/// the background's; `hold-background` holds every background
+/// measurement from then on at its gate until a load waits for it or the
+/// run ends, and `background` waits until one holds there, or until the
+/// background has no job at all),
 /// `drawn` (wait until the result's page is drawn), `back`, `retry`, `next`
 /// and `prev` on a result; a step out of place, or a chart not
 /// listed within [`STEP_TIMEOUT`] of no scan pass running (or
@@ -592,7 +651,7 @@ impl SelectScript {
                 Some(("wait", f)) => Ok(SelectStep::Wait(f.to_owned())),
                 Some(("search", t)) => Ok(SelectStep::Search(t.to_owned())),
                 Some(("sleep", ms)) => ms.parse().map(SelectStep::Sleep).map_err(|_| {
-                    format!("{s} is not pick=, wait=, search=, sleep=, idle=, slow-load=, slow-measuring=, background=running, background=idle, enter, prev-preset, next-preset, drawn, back, retry, next, prev, close-measuring, quit-measuring, quit-decoding, quit-loading, close-loading or close")
+                    format!("{s} is not pick=, wait=, search=, sleep=, idle=, slow-load=, slow-measuring=, hold-background, background=running, background=idle, enter, prev-preset, next-preset, drawn, back, retry, next, prev, close-measuring, quit-measuring, quit-decoding, quit-loading, close-loading or close")
                 }),
                 Some(("idle", ms)) => ms
                     .parse()
@@ -621,9 +680,10 @@ impl SelectScript {
                 None if s == "quit-decoding" => Ok(SelectStep::QuitDecoding),
                 None if s == "quit-loading" => Ok(SelectStep::QuitLoading),
                 None if s == "close-loading" => Ok(SelectStep::CloseLoading),
+                None if s == "hold-background" => Ok(SelectStep::HoldBackground),
                 None if s == "close" => Ok(SelectStep::Close),
                 _ => Err(format!(
-                    "{s} is not pick=, wait=, search=, sleep=, idle=, slow-load=, slow-measuring=, background=running, background=idle, enter, prev-preset, next-preset, drawn, back, retry, next, prev, close-measuring, quit-measuring, quit-decoding, quit-loading, close-loading or close"
+                    "{s} is not pick=, wait=, search=, sleep=, idle=, slow-load=, slow-measuring=, hold-background, background=running, background=idle, enter, prev-preset, next-preset, drawn, back, retry, next, prev, close-measuring, quit-measuring, quit-decoding, quit-loading, close-loading or close"
                 )),
             })
             .map(|step| step.map(|s| (s, None)))

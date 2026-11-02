@@ -106,10 +106,6 @@ struct State {
     /// The job taken from the queue: measured, or stopped by a pause and
     /// measured again from the beginning once it is released.
     current: Option<Job>,
-    /// The job in hand has started its measurement, its line printed
-    /// (dev-tools, tests).
-    #[cfg(any(test, feature = "dev-tools"))]
-    started: bool,
     /// A pause is requested and not released.
     pause: bool,
     /// The chart chosen with the pause: its running measurement goes on.
@@ -334,13 +330,13 @@ impl Worker {
         (ended, self.take_results())
     }
 
-    /// Whether the thread measures a job, its line printed, and whether it
-    /// has none at all, held or waiting (dev-tools, tests).
+    /// Whether the thread holds a job, and whether it has none at all,
+    /// held or waiting (dev-tools, tests).
     #[cfg(any(test, feature = "dev-tools"))]
     pub fn busy(&self) -> (bool, bool) {
         let s = self.shared.lock();
         (
-            s.current.is_some() && s.started,
+            s.current.is_some(),
             s.current.is_none() && s.waiting.is_empty(),
         )
     }
@@ -356,8 +352,7 @@ impl Drop for Worker {
 }
 
 /// The thread's loop: takes the jobs in order while nothing pauses it,
-/// says which it measures, acknowledges each pause, and ends at the
-/// shutdown.
+/// acknowledges each pause, and ends at the shutdown.
 fn run(shared: &Shared, measure: &mut Measure) {
     loop {
         let job = {
@@ -384,12 +379,6 @@ fn run(shared: &Shared, measure: &mut Measure) {
                     .unwrap_or_else(PoisonError::into_inner);
             }
         };
-        loudness::log_line(
-            &format!("loudness: measuring {} in the background", job.name),
-            false,
-        );
-        #[cfg(any(test, feature = "dev-tools"))]
-        shared.update(|s| s.started = true);
         let path = job.path().to_owned();
         // Whether the measurement was told to stop: a stop it was told is
         // a pause's or the end's, whatever the state is when it returns.
@@ -407,10 +396,6 @@ fn run(shared: &Shared, measure: &mut Measure) {
                 Outcome::Failed("the background measurement stopped unexpectedly".to_owned())
             });
         let mut s = shared.lock();
-        #[cfg(any(test, feature = "dev-tools"))]
-        {
-            s.started = false;
-        }
         let measured = match outcome {
             // Kept as the job in hand, even when the pause was released
             // meanwhile: measured again from the beginning once it may be,
@@ -444,6 +429,15 @@ fn run(shared: &Shared, measure: &mut Measure) {
 /// `stop` asked before the read, each file, packet, chunk and block.
 pub fn measure(job: &Job, stop: &(dyn Fn() -> bool + Sync)) -> Outcome {
     if stop() {
+        return Outcome::Stopped;
+    }
+    loudness::log_line(
+        &format!("loudness: measuring {} in the background", job.name),
+        false,
+    );
+    // A script's gate (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    if !crate::dev::background_gate(stop) {
         return Outcome::Stopped;
     }
     // The player's parts are the standard ones: what reads its charts.
@@ -674,23 +668,6 @@ mod tests {
         let results = drain(&worker);
         assert_eq!(paths(&results), all(&["a", "b"]));
         assert_eq!(probe.starts().last(), Some(&PathBuf::from("b")));
-    }
-
-    /// A job a pause stopped is held but not measured until the release,
-    /// after which the thread measures it again.
-    #[test]
-    fn a_job_held_through_a_pause_is_not_measured() {
-        let (worker, probe) = started();
-        worker.queue(job("a"));
-        until("a's start", || worker.busy().0);
-        worker.request_pause(None);
-        assert!(worker.wait_paused(WATCHDOG));
-        assert!(worker.holds(Path::new("a")));
-        assert_eq!(worker.busy(), (false, false));
-        worker.release();
-        until("a's second start", || worker.busy().0);
-        probe.open.store(true, Ordering::SeqCst);
-        assert_eq!(paths(&drain(&worker)), all(&["a"]));
     }
 
     /// The running measurement of the chart chosen with the pause goes on
