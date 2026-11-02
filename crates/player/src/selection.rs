@@ -501,11 +501,20 @@ impl Selection {
                     script.slow_load.get_or_insert_default().close = true;
                 }
                 Some(SelectStep::SlowMeasuring(ms)) => crate::dev::slow_measuring(ms),
+                Some(SelectStep::HoldBackground) => crate::dev::hold_background(),
                 Some(SelectStep::Background(running)) => {
-                    let (holds, idle) = self.shelf.background();
-                    if (running && !holds) || (!running && !idle) {
+                    let done = if running {
+                        crate::dev::background_held()
+                    } else {
+                        self.shelf.background().1
+                    };
+                    if !done {
                         if script.watchdog_expired() {
-                            let what = if running { "held no job" } else { "kept a job" };
+                            let what = if running {
+                                "held nothing at its gate"
+                            } else {
+                                "kept a job"
+                            };
                             script.fail(format!("the background measurement {what}"));
                             controls.close();
                         }
@@ -3067,7 +3076,7 @@ mod tests {
             index: 1,
             kind: StepKind::Select,
         };
-        for (running, what) in [(true, "held no job"), (false, "kept a job")] {
+        for (running, what) in [(true, "held nothing at its gate"), (false, "kept a job")] {
             sel.script = Some(SelectScript::compiled(vec![(
                 SelectStep::Background(running),
                 o,

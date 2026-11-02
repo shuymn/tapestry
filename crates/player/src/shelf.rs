@@ -569,6 +569,8 @@ impl Shelf {
         let line = format!("loudness: waiting for {name}'s measurement in the background");
         println!("{line}");
         log::info!("{line}");
+        #[cfg(feature = "dev-tools")]
+        crate::dev::release_background();
         while !worker.wait_done(chart, BACKGROUND_SLICE) {
             if cancelled() {
                 return game::Loading::Cancelled;
