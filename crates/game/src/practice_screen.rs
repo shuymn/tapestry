@@ -6,7 +6,7 @@
 //! and kept while the screen stays open, so its measures are always 1×
 //! times, whatever speed the chart is played at.
 
-use bms_model::{Chart, Position, Speed, TimeUs};
+use bms_model::{Chart, Speed, TimeUs};
 use rules::{GaugeRule, GaugeValue, RulePreset};
 
 use crate::Loaded;
@@ -104,50 +104,21 @@ pub struct PracticeScreen {
     notice: Option<String>,
 }
 
-/// The 1× start of each measure of `chart`: for each bar line, the first
-/// microsecond whose position reaches it, or the earliest note at or past
-/// it when that comes sooner (a note on the bar line rounds to a time
-/// before that microsecond, or sits at the start of a STOP). A chart
-/// without bar lines is one measure from 0.
+/// The 1× start of each measure of `chart`: each bar line's stored time,
+/// read through its timeline row (`bar_ids`, in order), the time a note on
+/// the bar line also has. Bar lines sharing a time stay separate measures.
+/// A chart without bar lines is one measure from 0.
 #[must_use]
 pub fn measures(chart: &Chart) -> Vec<TimeUs> {
-    if chart.bar_lines.is_empty() {
+    let timeline = &chart.timeline;
+    let bars = timeline.bar_ids();
+    if bars.is_empty() {
         return vec![TimeUs(0)];
     }
-    chart
-        .bar_lines
-        .iter()
-        .map(|&p| {
-            let note = chart
-                .lanes
-                .iter()
-                .filter_map(|lane| {
-                    let i = lane.partition_point(|n| n.pos < p);
-                    lane.get(i).map(|n| n.time)
-                })
-                .min();
-            let reached = reached(chart, p);
-            note.map_or(reached, |n| n.min(reached))
-        })
-        .collect()
-}
-
-/// The first microsecond whose position is at or past `p`, from 0.
-fn reached(chart: &Chart, p: Position) -> TimeUs {
-    let (mut lo, mut hi) = (0_i64, bms_model::DOMAIN);
-    if chart.scroll.position_at(TimeUs(hi)) < p {
-        return TimeUs(hi);
-    }
-    // The position never falls with time.
-    while lo < hi {
-        let mid = lo + (hi - lo) / 2;
-        if chart.scroll.position_at(TimeUs(mid)) >= p {
-            hi = mid;
-        } else {
-            lo = mid + 1;
-        }
-    }
-    TimeUs(lo)
+    // `ChartTimeline::new` refuses a bar row it does not hold, so every
+    // bar row indexes a row.
+    let points = timeline.points();
+    bars.iter().map(|id| points[id.index()].at).collect()
 }
 
 impl PracticeScreen {
@@ -453,22 +424,41 @@ mod tests {
         .chart
     }
 
-    /// At 7 BPM a measure lasts 34,285,714.28… µs: the note on measure 1's
-    /// bar line rounds down to 34,285,714 µs, a microsecond before the
-    /// position reaches the bar line, and still starts measure 1; a note on
-    /// the bar line at the start of a STOP too.
+    /// At 7 BPM a measure lasts 34,285,714.28… µs: measure 1's bar line is
+    /// stored at 34,285,714 µs, a microsecond before the position reaches
+    /// it, with a note on it and without one; a note on the bar line at the
+    /// start of a STOP has the bar line's time.
     #[test]
-    fn measures_include_notes_on_their_bar_line() {
-        let chart = load("#BPM 7\n#00111:01\n#00211:01\n#00311:01\n");
+    fn measures_are_the_bar_lines_stored_times() {
+        let chart = load(
+            "#BPM 7
+#00111:01
+#00211:01
+#00311:01
+",
+        );
         let m = measures(&chart);
         assert_eq!(m[0], TimeUs(0));
         assert_eq!(m[1], TimeUs(34_285_714));
-        let note = chart.lanes[1][0].time;
-        assert_eq!(note, m[1]);
-        // The position reaches the bar line a microsecond later.
-        assert!(chart.scroll.position_at(note) < chart.bar_lines[1]);
-        // A STOP at measure 1's bar line, with a note on it.
-        let chart = load("#BPM 120\n#STOP01 192\n#00211:01\n#00209:01\n");
+        assert_eq!(chart.lanes[1][0].time, m[1]);
+        // No note on measure 1's bar line: still its stored time, though
+        // the position reaches the bar line only a microsecond later.
+        let chart = load(
+            "#BPM 7
+#00211:01
+",
+        );
+        let m = measures(&chart);
+        assert_eq!(m[1], TimeUs(34_285_714));
+        assert!(chart.scroll.position_at(m[1]) < chart.bar_lines[1]);
+        // A STOP at measure 2's bar line, with a note on it.
+        let chart = load(
+            "#BPM 120
+#STOP01 192
+#00211:01
+#00209:01
+",
+        );
         let m = measures(&chart);
         let on_bar = chart.lanes[1]
             .iter()
@@ -478,6 +468,60 @@ mod tests {
         // No bar lines: one measure.
         let built = bms_model::ChartBuilder::new(150_000).build().unwrap();
         assert_eq!(measures(&built), [TimeUs(0)]);
+    }
+
+    /// Bar lines that share a stored µs stay separate measures, one per
+    /// bar line: at 1 000 000 BPM measure 0 lasts 240 µs and a 0.001
+    /// measure 0.24 µs, so measures 1 and 2 start at the same µs.
+    #[test]
+    fn bar_lines_at_one_time_stay_separate_measures() {
+        let chart = load(
+            "#BPM 1000000
+#00102:0.001
+#00311:01
+",
+        );
+        assert_eq!(chart.bar_lines.len(), 4);
+        assert!(chart.bar_lines[1] < chart.bar_lines[2]);
+        let m = measures(&chart);
+        assert_eq!(m, [TimeUs(0), TimeUs(240), TimeUs(240), TimeUs(480)]);
+    }
+
+    /// A bar line names its own row: one on the row after a STOP, at the
+    /// same position as the STOP's start, starts its measure after the
+    /// STOP, not where the position first reaches it.
+    #[test]
+    fn a_bar_line_keeps_its_own_row_across_a_stop() {
+        // 120 BPM, a STOP of one beat (500 ms) at measure 2's start.
+        let mut chart = load(
+            "#BPM 120
+#STOP01 48
+#00209:01
+#00311:01
+",
+        );
+        let timeline = &chart.timeline;
+        let bar = timeline.bar_ids()[2];
+        let start = *timeline.point(bar).unwrap();
+        let after = bms_model::TimelineId(bar.0 + 1);
+        let end = *timeline.point(after).unwrap();
+        assert_eq!(
+            (start.at, end.at, end.pos),
+            (TimeUs(4_000_000), TimeUs(4_500_000), start.pos)
+        );
+        let mut bars = timeline.bar_ids().to_vec();
+        bars[2] = after;
+        let meta = *timeline.meta();
+        chart.timeline = bms_model::ChartTimeline::new(
+            timeline.points().to_vec(),
+            bars,
+            meta.initial,
+            meta.speed,
+        )
+        .unwrap();
+        assert_eq!(chart.validate_presentation_links(), Ok(()));
+        let m = measures(&chart);
+        assert_eq!(m[2], TimeUs(4_500_000));
     }
 
     /// Every value stays within its bounds whatever is pressed: the
