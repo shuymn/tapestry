@@ -1445,11 +1445,11 @@ struct Preparing {
     reply: mpsc::SyncSender<Result<Preparation, RenderError>>,
 }
 
-/// An attempt's preparation answered ready: its token and the declarative
-/// skin it staged, if any.
+/// An attempt's preparation answered ready: its token and whether it
+/// staged a declarative skin.
 struct Prepared {
     token: PreparedToken,
-    skin: Option<Arc<SkinBundle>>,
+    declarative: bool,
 }
 
 struct Run {
@@ -2100,7 +2100,7 @@ impl Run {
                     request: p.request,
                     device: screen.device(),
                 },
-                skin: p.skin.clone(),
+                declarative: p.skin.is_some(),
             });
         }
         if answer.is_err() {
@@ -2150,7 +2150,7 @@ impl Run {
             screen.discard();
             return Err(e);
         }
-        if p.skin.is_some() {
+        if p.declarative {
             self.committed = screen.installation();
         }
         commits.committed = request;
@@ -2204,7 +2204,7 @@ impl Run {
         let Some(screen) = &mut self.screen else {
             return Err(RenderError::SurfaceLost);
         };
-        let installed = match screen.install(&bundle, request) {
+        match screen.install(&bundle, request) {
             Ok(Preparation::Ready) => {
                 // Held through the commit: a withdrawal waits for it, or
                 // it sees the withdrawal and installs nothing.
@@ -2223,19 +2223,14 @@ impl Run {
                     return Ok(refusal(e.to_string()));
                 }
                 commits.committed = commits.committed.max(request);
+                drop(commits);
+                self.committed = screen.installation();
+                self.selected = Some(bundle);
                 Ok(Preparation::Ready)
             }
             Ok(refused) => {
                 screen.discard();
-                return Ok(refused);
-            }
-            Err(e) => Err(e),
-        };
-        match installed {
-            Ok(ready) => {
-                self.committed = screen.installation();
-                self.selected = Some(bundle);
-                Ok(ready)
+                Ok(refused)
             }
             Err(e) => {
                 self.screen = None;
@@ -5944,12 +5939,8 @@ pub(crate) mod tests {
         stalled(&link, &drop);
         // Past its bound.
         link.set_timeouts(Duration::from_millis(100), Duration::from_secs(5));
-        stalled(&link, &|mut pending| {
-            let answer = loop {
-                if let Some(answer) = pending.poll(Duration::from_millis(10)) {
-                    break answer;
-                }
-            };
+        stalled(&link, &|pending| {
+            let answer = pending.wait();
             assert!(matches!(answer, Err(ScreenError::NoAnswer)), "{answer:?}");
         });
         link.set_timeouts(Duration::from_secs(10), Duration::from_secs(5));

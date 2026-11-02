@@ -483,7 +483,8 @@ pub struct Renderer {
     /// or commit of a request up to it is taken.
     committed: u64,
     /// The newest request a staging was asked for, kept through its
-    /// discard or refusal: no staging of a request up to it is taken.
+    /// discard or refusal, and so never below `committed`: no staging of
+    /// a request up to it is taken.
     requested: u64,
     /// Bumped each time the atlas and the staging are replaced: a test of
     /// whether an installation reused them.
@@ -938,7 +939,9 @@ impl Renderer {
         a: Option<&AttemptInput<'_>>,
         request: u64,
     ) -> Result<PreparedToken, RenderError> {
-        let newer = self.requested.max(self.committed);
+        // Never below `committed`: a commit takes only a staging's
+        // request, and every staging was asked for first.
+        let newer = self.requested;
         if request <= newer {
             return Err(RenderError::Superseded { request, newer });
         }
@@ -1344,9 +1347,7 @@ impl Renderer {
         // Whatever is staged now, a play frame built before it is not
         // submitted.
         self.started = None;
-        if let Some((lifetime, e)) = self.loading_refused
-            && lifetime == f.lifetime
-        {
+        if let Some(e) = self.loading_refused(f.lifetime) {
             self.staging.fill(|_| {});
             return Err(e);
         }
