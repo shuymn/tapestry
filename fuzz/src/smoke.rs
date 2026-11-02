@@ -1051,7 +1051,7 @@ fn skin_lua_seeds_import_or_fail_as_built() {
             "memory",
             "escape",
             "coroutine",
-            "config_write",
+            "config_local",
             "syntax",
             "not_table",
         ],
@@ -1064,7 +1064,7 @@ fn skin_lua_seeds_import_or_fail_as_built() {
         assert!(data.len() <= 64 * 1_024, "{name}: {} bytes", data.len());
         let result = skin_lua(&data);
         match name {
-            "data_only" | "config" | "modules" | "isolation" => {
+            "data_only" | "config" | "config_local" | "modules" | "isolation" => {
                 let (h, imported) = result.unwrap_or_else(|e| panic!("{name}: {e}"));
                 assert_eq!(h.options.len(), 1, "{name}");
                 let i = imported.unwrap_or_else(|e| panic!("{name}: {e:?}"));
@@ -1077,11 +1077,10 @@ fn skin_lua_seeds_import_or_fail_as_built() {
                     );
                 }
             }
-            "callable_refused" | "callable_decorative" | "config_write" => {
+            "callable_refused" | "callable_decorative" => {
                 let (_, imported) = result.unwrap_or_else(|e| panic!("{name}: {e}"));
                 let e = imported.expect_err(name);
                 let want = match name {
-                    "config_write" => LuaWhy::ConfigWrite,
                     "callable_decorative" => LuaWhy::Callable { field: "draw" },
                     _ => LuaWhy::Callable { field: "value" },
                 };

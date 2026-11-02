@@ -906,10 +906,11 @@ return skin
 }
 
 /// `skin_lua` seeds: skins that import (data only, local modules and
-/// selected parts, configuration, pass isolation), then one refusal per
+/// selected parts, configuration and a pass-local write to it, pass
+/// isolation), then one refusal per
 /// boundary: a function on a decorative and on a critical element, the
 /// instruction and memory caps (also inside a protected call), a path
-/// out of the folder, a coroutine, a write to `skin_config`, malformed
+/// out of the folder, a coroutine, malformed
 /// Lua and a value that is no table.
 #[must_use]
 pub fn skin_luas() -> Vec<Seed> {
@@ -971,9 +972,9 @@ skin.destination[2] = { id = "v", dst = { { w = 10, h = 10 } } }"#,
             lua_input(&["coroutine.wrap(function() end)()\nreturn { type = 0 }"]),
         ),
         (
-            "config_write",
+            "config_local",
             lua_input(&[&lua_skin(
-                "pcall(function() skin_config.option.mode = 0 end)",
+                "skin_config.option.mode = 0\nassert(skin_config.option.mode == 0)",
             )]),
         ),
         ("syntax", lua_input(&["return {"])),

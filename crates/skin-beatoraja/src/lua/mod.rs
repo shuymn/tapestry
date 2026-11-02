@@ -6,7 +6,7 @@
 //! runs the entry with no `skin_config`, and the table it returns is
 //! converted ([`convert`]) and read through the definition's header path.
 //! [`LuaHeader::import`] runs the configured pass for a [`Config`]: another
-//! fresh VM runs the entry with the read-only `skin_config`
+//! fresh VM runs the entry with a pass-local `skin_config`
 //! ([`config`]), and the table it returns is converted into the resolved
 //! representation and imported through [`crate::import`], the one import
 //! path. The passes share only the immutable snapshots of the sources
@@ -108,8 +108,6 @@ pub enum LuaWhy {
     RequireCycle,
     /// A metatable with `__gc` or `__mode`.
     Finalizer,
-    /// A write to `skin_config`, which is read-only.
-    ConfigWrite,
     /// A host API function called during import, by its index in
     /// [`HOST_APIS`]: there is no play state to read.
     LiveState { api: u16 },
@@ -143,7 +141,6 @@ impl fmt::Display for LuaWhy {
             Self::LoaderName => f.write_str("a loader's argument is not a file name"),
             Self::RequireCycle => f.write_str("a module requires itself"),
             Self::Finalizer => f.write_str("a metatable with __gc or __mode"),
-            Self::ConfigWrite => f.write_str("a write to the read-only skin_config"),
             Self::LiveState { api } => {
                 let (m, n) = HOST_APIS
                     .get(usize::from(*api))
@@ -189,8 +186,6 @@ pub(crate) struct Pass {
     handled: Cell<u64>,
     last_error: RefCell<Option<Loc>>,
     bridge: Option<Bridge>,
-    /// The tables of `skin_config`, by address.
-    views: RefCell<Vec<usize>>,
     #[cfg(feature = "dev-tools")]
     timings: Cell<Timings>,
 }
@@ -232,7 +227,6 @@ impl Pass {
             handled: Cell::new(0),
             last_error: RefCell::new(None),
             bridge,
-            views: RefCell::new(Vec::new()),
             #[cfg(feature = "dev-tools")]
             timings: Cell::new(Timings::default()),
         }

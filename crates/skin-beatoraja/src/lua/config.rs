@@ -1,8 +1,11 @@
 //! The configured pass's `skin_config`: the user's settings as the
-//! header declares them, read-only.
+//! header declares them, the names the pinned source exports
+//! (`SkinLuaAccessor.java:926-987` at `0.8.9`).
 //!
 //! - `option[name]`: the number of the item selected in the option
 //!   `name`, as [`Config::options`] selects it; absent when none is.
+//! - `enabled_options`: the selected items' numbers, in the header's
+//!   order of options.
 //! - `file_path[name]`: the file choice `name`'s path with its chosen
 //!   candidate substituted, relative to the entry's folder, as the
 //!   importer resolves a source path ([`Choices`]); absent with no
@@ -13,51 +16,27 @@
 //!   substituted, as `file_path`; `nil` when the choice has no candidate
 //!   or a wildcard is left.
 //!
-//! Each table lists its entries through `pairs`; a write to one, by
-//! assignment or `rawset`, is a fault ([`LuaWhy::ConfigWrite`]), which a
-//! protected call cannot hide, and its metatable is hidden and fixed. Of
-//! entries sharing a name, the last declared wins. An entry without a
-//! name is absent.
+//! The tables are plain and the skin may change them, as the source
+//! lets it: each pass builds them afresh from the validated header and
+//! settings and discards them with its VM, so a write reaches nothing
+//! else, not the host's settings, not the offsets the host applies and
+//! not the other pass. It grants nothing the skin lacks: its Lua already
+//! decides the definition it returns. Of entries sharing a name, the
+//! last declared wins. An entry without a name is absent.
 
 use std::rc::Rc;
 
-use mlua::chunk::ChunkMode;
 use mlua::{Lua, Table, Value};
 
-use super::{LuaWhy, Pass, host};
+use super::{Pass, host};
 use crate::header::Header;
 use crate::import::asset::{Choices, Path};
 use crate::import::{Config, OffsetValue};
 
-/// The read-only views, built in the sandbox.
-const VIEWS: &str = r#"
-local option, file_path, offset, get_path, setmetatable, next, refuse = ...
-local views = {}
-local function view(t)
-  local v = {}
-  views[#views + 1] = v
-  return setmetatable(v, {
-    __index = t,
-    __newindex = refuse,
-    __pairs = function() return next, t, nil end,
-    __len = function() return #t end,
-    __metatable = false,
-  })
-end
-local names = {}
-for k in next, offset do names[#names + 1] = k end
-for _, k in next, names do offset[k] = view(offset[k]) end
-return view({
-  option = view(option),
-  file_path = view(file_path),
-  offset = view(offset),
-  get_path = get_path,
-}), views
-"#;
-
 /// The settings a configured pass exposes.
 pub(crate) struct Bridge {
     options: Vec<(String, i32)>,
+    enabled: Vec<i32>,
     files: Vec<(String, String)>,
     offsets: Vec<(String, OffsetValue)>,
     choices: Choices,
@@ -65,10 +44,14 @@ pub(crate) struct Bridge {
 
 impl Bridge {
     pub(crate) fn new(header: &Header, config: &Config) -> Self {
-        let options = header
-            .options
-            .iter()
-            .zip(config.options.iter().chain(std::iter::repeat(&None)))
+        let selected = || {
+            header
+                .options
+                .iter()
+                .zip(config.options.iter().chain(std::iter::repeat(&None)))
+        };
+        let enabled = selected().filter_map(|(_, &sel)| sel).collect();
+        let options = selected()
             .filter_map(|(o, &sel)| Some((o.name.clone()?, sel?)))
             .collect();
         let choices = Choices::new(header, config, &mut Vec::new());
@@ -93,6 +76,7 @@ impl Bridge {
             .collect();
         Self {
             options,
+            enabled,
             files,
             offsets,
             choices,
@@ -108,7 +92,8 @@ impl Bridge {
     }
 }
 
-/// Sets the global `skin_config` of a configured pass's VM.
+/// Sets the global `skin_config` of a configured pass's VM: plain tables
+/// the pass may change, built afresh for it.
 pub(super) fn install(
     lua: &Lua,
     pass: &Rc<Pass>,
@@ -116,8 +101,12 @@ pub(super) fn install(
     bridge: &Bridge,
 ) -> mlua::Result<()> {
     let option = lua.create_table()?;
+    let enabled = lua.create_table()?;
     for (name, op) in &bridge.options {
         option.raw_set(name.as_str(), *op)?;
+    }
+    for (i, op) in (1_i64..).zip(&bridge.enabled) {
+        enabled.raw_set(i, *op)?;
     }
     let file_path = lua.create_table()?;
     for (name, path) in &bridge.files {
@@ -148,25 +137,11 @@ pub(super) fn install(
             None => Ok(Value::Nil),
         }
     })?;
-    let refuse = host(lua, pass, |lua, pass, _| -> mlua::Result<()> {
-        Err(pass.ledger.fail_lua(lua, LuaWhy::ConfigWrite))
-    })?;
-    let base = lua.globals();
-    let (config, views): (Table, Table) = lua
-        .load(VIEWS)
-        .set_name("=skin_config")
-        .set_mode(ChunkMode::Text)
-        .call((
-            option,
-            file_path,
-            offset,
-            get_path,
-            base.raw_get::<Value>("setmetatable")?,
-            base.raw_get::<Value>("next")?,
-            refuse,
-        ))?;
-    for v in views.sequence_values::<Table>() {
-        pass.views.borrow_mut().push(v?.to_pointer().addr());
-    }
+    let config = lua.create_table()?;
+    config.raw_set("option", option)?;
+    config.raw_set("enabled_options", enabled)?;
+    config.raw_set("file_path", file_path)?;
+    config.raw_set("offset", offset)?;
+    config.raw_set("get_path", get_path)?;
     env.raw_set("skin_config", config)
 }

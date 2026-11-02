@@ -7,9 +7,8 @@
 //! only:
 //!
 //! - the base functions `assert`, `error`, `getmetatable`, `ipairs`,
-//!   `next`, `pairs`, `rawequal`, `rawget`, `rawlen`, `select`,
+//!   `next`, `pairs`, `rawequal`, `rawget`, `rawlen`, `rawset`, `select`,
 //!   `tonumber`, `tostring`, `type` and `_VERSION`, and `_G`;
-//! - `rawset`, refusing a write to `skin_config` ([`super::config`]);
 //! - `string` without `dump`, `pack`, `packsize` and `unpack`, its
 //!   pattern functions charged their worst case first
 //!   ([`MAX_NATIVE_WORK`](super::limits::MAX_NATIVE_WORK)); `table`, its
@@ -41,7 +40,7 @@ pub(super) const XPCALL: &str = "tapestry.xpcall";
 pub(super) const HANDLER: &str = "tapestry.handler";
 
 /// The base functions the environment keeps as they are.
-const BASE: [&str; 14] = [
+const BASE: [&str; 15] = [
     "assert",
     "error",
     "getmetatable",
@@ -51,6 +50,7 @@ const BASE: [&str; 14] = [
     "rawequal",
     "rawget",
     "rawlen",
+    "rawset",
     "select",
     "tonumber",
     "tostring",
@@ -154,19 +154,6 @@ pub(super) fn vm(pass: &Rc<Pass>) -> mlua::Result<Lua> {
                 return Err(pass.ledger.fail_lua(lua, LuaWhy::Finalizer));
             }
             native_set.call::<MultiValue>(args)
-        })?,
-    )?;
-
-    let native_rawset: Function = base.raw_get("rawset")?;
-    env.raw_set(
-        "rawset",
-        host(&lua, pass, move |lua, pass, args| {
-            if let Some(Value::Table(t)) = args.front()
-                && pass.views.borrow().contains(&t.to_pointer().addr())
-            {
-                return Err(pass.ledger.fail_lua(lua, LuaWhy::ConfigWrite));
-            }
-            native_rawset.call::<MultiValue>(args)
         })?,
     )?;
 

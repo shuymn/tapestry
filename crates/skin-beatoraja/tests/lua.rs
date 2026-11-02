@@ -653,63 +653,51 @@ fn the_passes_diverge_on_skin_config_and_share_nothing() {
 }
 
 #[test]
-fn skin_config_is_read_only_and_follows_the_header() {
+fn skin_config_follows_the_header_and_its_writes_stay_in_the_pass() {
     let d = folder(&[
         (
             "s.luaskin",
             &skin(
-                "filepath = { { name = \"bg\", path = \"bg/*.png\", def = \"b\" } },\n\
+                "property = { { name = \"opt\", item = { { name = \"a\", op = 900 }, { name = \"b\", op = 901 } }, def = \"b\" } },\n\
+                 filepath = { { name = \"bg\", path = \"bg/*.png\", def = \"b\" } },\n\
                  offset = { { name = \"o\", id = 40, x = true } },",
                 &format!(
                     "assert(skin_config.file_path.bg == \"bg/b.png\", \"file_path\")\n\
                      assert(skin_config.get_path(\"bg/*.png\") == \"bg/b.png\", \"get_path\")\n\
                      assert(skin_config.get_path(\"bg/*.png/x\") == \"bg/b.png/x\", \"get_path foot\")\n\
                      assert(skin_config.get_path(\"fx/*.png\") == nil, \"unchosen\")\n\
-                     assert(skin_config.offset.o.x == 5 and skin_config.offset.o.y == 0, \"offset\")\n\
+                     assert(skin_config.option.opt == 901, \"option\")\n\
+                     assert(#skin_config.enabled_options == 1 and skin_config.enabled_options[1] == 901, \"enabled\")\n\
+                     assert(skin_config.offset.o.x == 5 and skin_config.offset.o.y == 0, \"offset at start\")\n\
                      local n = 0 for _ in pairs(skin_config.offset.o) do n = n + 1 end\n\
                      assert(n == 6, \"pairs\")\n\
-                     assert(getmetatable(skin_config) == false, \"hidden\")\n{DRAW_I}"
+                     -- The skin's own writes are seen by its later reads.\n\
+                     skin_config.offset.o.x = 123\n\
+                     skin_config.option.opt = 900\n\
+                     rawset(skin_config, \"extra\", true)\n\
+                     assert(skin_config.offset.o.x == 123 and skin_config.option.opt == 900, \"written\")\n\
+                     assert(skin_config.extra == true, \"rawset\")\n{DRAW_I}"
                 ),
             ),
         ),
         ("bg/a.png", ""),
         ("bg/b.png", ""),
     ]);
-    let r = import_with(&d, |h| {
-        let mut c = Config::defaults(h.header());
-        c.offsets.insert(
-            40,
-            OffsetValue {
-                x: 5,
-                ..OffsetValue::default()
-            },
-        );
-        c
-    });
-    r.unwrap();
-    // A write is refused, inside a protected call too.
-    for write in [
-        "skin_config.option.x = 1",
-        "pcall(function() skin_config.offset.o.x = 1 end)",
-        "skin_config.offset = {}",
-        "pcall(rawset, skin_config, \"x\", 1)",
-        "pcall(setmetatable, skin_config, nil)\nassert(false)",
-    ] {
-        let d = folder(&[(
-            "s.luaskin",
-            &skin(
-                "offset = { { name = \"o\", id = 40 } },",
-                &format!("{write}\n{DRAW_I}"),
-            ),
-        )]);
-        let w = why(import(&d));
-        let want = if write.contains("assert") {
-            LuaWhy::Error
-        } else {
-            LuaWhy::ConfigWrite
-        };
-        assert_eq!(w, want, "{write}");
-    }
+    let h = header(&d).unwrap();
+    let mut config = Config::defaults(h.header());
+    config.offsets.insert(
+        40,
+        OffsetValue {
+            x: 5,
+            ..OffsetValue::default()
+        },
+    );
+    let kept = config.clone();
+    // Each configured pass starts from the host's values again: the
+    // second would fail its first assertions after the first's writes.
+    h.import(&config, &Cancel::new()).unwrap();
+    h.import(&config, &Cancel::new()).unwrap();
+    assert_eq!(config, kept);
 }
 
 #[test]
