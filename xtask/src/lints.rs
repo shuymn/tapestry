@@ -180,6 +180,7 @@ pub const IN_PLAY: &[Site] = &[
     ),
     Site::File("crates/game/src/hispeed.rs"),
     Site::File("crates/game/src/logic.rs"),
+    Site::File("crates/game/src/ready_history.rs"),
     Site::File("crates/game/src/render.rs"),
     Site::File("crates/game/src/sound.rs"),
     Site::Fns(
@@ -198,7 +199,12 @@ pub const IN_PLAY: &[Site] = &[
     ),
     Site::Fns(
         "crates/game/src/session.rs",
-        &["Loaded::ends_play", "Command::cause"],
+        &[
+            "Loaded::ends_play",
+            "Command::cause",
+            "arrival",
+            "replay_kind",
+        ],
     ),
     Site::Fns(
         "crates/game/src/policy.rs",

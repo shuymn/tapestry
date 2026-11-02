@@ -32,6 +32,7 @@ mod practice_screen;
 mod prepare;
 pub mod presets;
 mod queue;
+mod ready_history;
 mod render;
 mod restore;
 mod result_graphs;
@@ -90,6 +91,7 @@ pub use presets::{
     Entry, POLL_INTERVAL, PollDeadline, PresetChange, PresetStep, Shelf, ShelfError, UnknownPreset,
 };
 pub use queue::{DEFAULT_QUEUED_PERIODS, QUEUED_PERIODS, QueueChoice, RAISED_QUEUED_PERIODS};
+pub use ready_history::{HistoryFull, HistoryRecorder};
 pub use render::{PlayView, RenderSide, RenderSink};
 pub use restore::{Restore, RestoreError, RestoreRefusal, Restored, Restorer};
 pub use result_graphs::{
