@@ -8300,6 +8300,7 @@ pub(crate) mod tests {
             section,
             game::NoteEnd::Play.of(chart),
             &labels,
+            chart,
         );
         AttemptContext::new(attempt, crate::attempt_context::SIMPLE_SCRATCH)
     }

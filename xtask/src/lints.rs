@@ -194,6 +194,11 @@ pub const IN_PLAY: &[Site] = &[
     Site::File("crates/game/src/render.rs"),
     Site::File("crates/game/src/sound.rs"),
     Site::File("crates/game/src/start_gate.rs"),
+    // The reducer's tempo lookup in play.
+    Site::Fns(
+        "crates/game/src/tempo.rs",
+        &["AttemptTempo::bpm_at", "ratio"],
+    ),
     Site::Fns(
         "crates/game/src/live.rs",
         &[

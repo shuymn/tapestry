@@ -2,12 +2,13 @@
 //! "Play Lifecycle"): the game's [`Attempt`] translated into owned skin
 //! data, sent to the render thread in its message, from which a borrowed
 //! [`PlayContext`] is made only for the call that prepares the screen,
-//! with the chart's labels as [`ChartText`].
+//! with the chart's labels as [`ChartText`], and the attempt's tempo
+//! provider ([`AttemptTempo`]) beside it.
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
 use bms_model::TimeUs;
-use game::{Attempt, AttemptKind, ChartLabels};
+use game::{Attempt, AttemptKind, AttemptTempo, ChartLabels};
 use skin_model::{ChartText, GaugeDesc, PlayContext, Side};
 
 /// The scratch side the simple skin draws, its author's layout: it has no
@@ -28,6 +29,9 @@ pub struct AttemptContext {
     last_note_end: TimeUs,
     /// The chart's labels, which its prepared text shows.
     labels: ChartLabels,
+    /// The tempo provider and references of the chart as loaded at the
+    /// attempt's speed, over its section.
+    tempo: AttemptTempo,
 }
 
 impl AttemptContext {
@@ -42,7 +46,19 @@ impl AttemptContext {
             ln_default: attempt.ln_default,
             last_note_end: attempt.last_note_end,
             labels: attempt.labels,
+            tempo: attempt.tempo,
         }
+    }
+
+    /// The attempt's tempo provider and references. Nothing reads them in
+    /// play until the readouts and controls are switched on (S10-04b), so
+    /// the frame readouts and the BPM range stay unavailable.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "S10-04b's frame readouts and controls read it")
+    )]
+    pub const fn tempo(&self) -> &AttemptTempo {
+        &self.tempo
     }
 
     /// The chart's five labels, borrowed for one preparation.
@@ -87,8 +103,9 @@ mod tests {
 
     /// The context carries the preset's gauges in its order, its flags and
     /// LN default, the section and the note end as the game made them,
-    /// the scratch side given, and no BPM range; and the chart's five
-    /// labels.
+    /// the scratch side given, and no BPM range; the chart's five labels;
+    /// and the attempt's tempo provider, sharing the chart's timeline, over
+    /// the same section.
     #[test]
     fn the_context_is_the_attempts_own_data() {
         let mut preset = rules::tapestry();
@@ -100,6 +117,7 @@ mod tests {
             lead_in: TimeUs(1_500_000),
             initial_gauges: Vec::new(),
         };
+        let chart = bms_model::ChartBuilder::new(150_000).build().unwrap();
         let attempt = Attempt::new(
             2,
             &preset,
@@ -113,8 +131,19 @@ mod tests {
                 subartist: "sa".to_owned(),
                 genre: "g".to_owned(),
             },
+            &chart,
         );
+        let tempo = attempt.tempo.clone();
         let owned = AttemptContext::new(attempt, Side::Right);
+        assert_eq!(owned.tempo(), &tempo);
+        assert_eq!(
+            owned.tempo().timeline().points().as_ptr(),
+            chart.timeline.points().as_ptr()
+        );
+        assert_eq!(
+            owned.tempo().section(),
+            Some((TimeUs(0), TimeUs(2_000_000)))
+        );
         let ctx = owned.context();
         let expected: Vec<GaugeDesc> = preset.gauges.iter().map(GaugeDesc::from_rule).collect();
         assert_eq!(ctx.gauges, expected.as_slice());

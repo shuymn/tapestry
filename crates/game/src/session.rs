@@ -1124,6 +1124,7 @@ impl Loaded {
             self.section(),
             ends.of(&self.chart),
             &self.labels,
+            &self.chart,
         )
     }
 
