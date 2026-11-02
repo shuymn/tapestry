@@ -6860,37 +6860,56 @@ pub(crate) mod tests {
         link.commit_attempt().unwrap();
         let from = drawn();
         assert!(wait_until(|| drawn() >= from + 3));
-        let staged = drawn();
 
-        // The renderer fails and is built again, the files gone.
+        // The renderer fails and is built again, the files gone: frames
+        // drawn on the rebuilt device.
+        let (first_device, a) = {
+            let probed = probed.lock().unwrap();
+            (probed.loadings[0].0, probed.loadings[0].1)
+        };
         dir.close().unwrap();
         fail.store(true, Ordering::Release);
         assert!(wait_until(|| link.failed()));
         fail.store(false, Ordering::Release);
         link.prepare().unwrap();
         sink.show(one_line("A"));
-        assert!(wait_until(|| drawn() >= staged + 3));
-        let rebuilt = drawn();
+        // A loading frame as the probe notes it.
+        type Seen = (u64, u64, TimeUs, Option<TimeUs>);
+        let counted = |what: &dyn Fn(&Seen) -> bool| {
+            probed
+                .lock()
+                .unwrap()
+                .loadings
+                .iter()
+                .filter(|l| what(l))
+                .count()
+        };
+        assert!(wait_until(
+            || counted(&|l| l.0 != first_device && l.1 == a) >= 3
+        ));
 
-        // A new lifetime on the same bundle.
+        // A new lifetime on the same bundle, after the end of A's is
+        // answered.
         link.end_loading().unwrap();
         link.loading().show(one_line("B"));
-        assert!(wait_until(|| drawn() >= rebuilt + 3));
+        assert!(wait_until(|| counted(&|l| l.1 != a) >= 3));
         link.end_loading().unwrap();
         link.exit();
         assert_eq!(builds.load(Ordering::SeqCst), 2);
 
         let probed = probed.lock().unwrap();
         let all = &probed.loadings;
-        let (a, b) = (all[0].1, all[rebuilt].1);
-        assert_ne!(a, b);
+        // Every frame of A comes before every frame of B.
+        let rebuilt = all.iter().position(|l| l.1 != a).unwrap();
+        assert!(all[rebuilt..].iter().all(|l| l.1 != a), "{all:?}");
+        let b = all[rebuilt].1;
         let (_, _, since, when) = all[0];
         let started = when.expect("the when timer starts on the first frame");
         // Lifetime A: one origin and one `when` start throughout, on both
         // renderers, the presentation shared with the restored one.
         let lifetime_a = &all[..rebuilt];
         assert!(lifetime_a.iter().all(|l| l.1 == a), "{all:?}");
-        assert!(lifetime_a.iter().any(|l| l.0 != all[0].0), "{all:?}");
+        assert!(lifetime_a.iter().any(|l| l.0 != first_device), "{all:?}");
         assert!(
             lifetime_a
                 .iter()
@@ -7711,7 +7730,6 @@ pub(crate) mod tests {
         let mut slot = LoadingSlot::default();
         let four = state.apply(LoadInput::Stage(Stage::Sounds { done: 4, files: 9 }));
         let bank = state.apply(LoadInput::BankComplete);
-        let bank_again = bank.clone();
         let screen = state.apply(LoadInput::Stage(Stage::Screen));
         assert!(slot.offer(0, Some(one_line("4")), Some(Box::new(four.clone()))));
         assert!(slot.offer(0, None, Some(Box::new(bank))));
@@ -7726,13 +7744,14 @@ pub(crate) mod tests {
         // Older than the one taken.
         assert!(!slot.offer(0, Some(one_line("old")), Some(Box::new(four.clone()))));
         assert!(slot.take(0).is_none());
-        // Older than the one waiting: neither the state nor the page
-        // waiting changes.
+        // Newer than the one taken but older than the one waiting: neither
+        // the state nor the page waiting changes.
+        let between = state.apply(LoadInput::Stage(Stage::Loudness));
         let newer = state.apply(LoadInput::Stage(Stage::Scan));
         assert!(slot.offer(0, Some(one_line("newer")), Some(Box::new(newer))));
-        assert!(!slot.offer(0, Some(one_line("old")), Some(Box::new(bank_again))));
+        assert!(!slot.offer(0, Some(one_line("old")), Some(Box::new(between))));
         let (page, update) = slot.take(0).unwrap();
-        assert_eq!(update.unwrap().seq, 4);
+        assert_eq!(update.unwrap().seq, 5);
         assert_eq!(page.unwrap().lines[0].text, "newer");
         // A page alone of the lifetime.
         assert!(slot.offer(0, Some(one_line("page")), None));
