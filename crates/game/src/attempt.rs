@@ -10,6 +10,7 @@ use rules::{GaugeRule, LnMode, RulePreset};
 
 use crate::practice::mapped_wide;
 use crate::prepare::ChartLabels;
+use crate::tempo::AttemptTempo;
 
 /// How a play's preparation on the screen ended ([`crate::Rig::prepare_attempt`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -84,6 +85,9 @@ pub struct Attempt {
     pub last_note_end: TimeUs,
     /// The chart's labels, from the ingestion that read the chart.
     pub labels: ChartLabels,
+    /// The tempo provider and reference tempos, from the chart as loaded
+    /// at the attempt's speed over its section.
+    pub tempo: AttemptTempo,
 }
 
 /// What an attempt's notes end at (design.md "Play Lifecycle"; the skin
@@ -134,7 +138,8 @@ const PRACTICE_PAD: TimeUs = TimeUs(1_000_000);
 impl Attempt {
     /// The attempt numbered `number` of `chart` under `preset`: the whole
     /// chart with a `lead_in` READY state, or the round of `section`, its
-    /// notes ending at `last_note_end` ([`NoteEnd::of`]).
+    /// notes ending at `last_note_end` ([`NoteEnd::of`]), with `chart`'s
+    /// tempo provider over the same section ([`AttemptTempo::prepare`]).
     #[must_use]
     pub fn new(
         number: u32,
@@ -143,6 +148,7 @@ impl Attempt {
         section: Option<&Section>,
         last_note_end: TimeUs,
         labels: &ChartLabels,
+        chart: &Chart,
     ) -> Self {
         let kind = match section {
             Some(s) => AttemptKind::Section(s.clone()),
@@ -158,6 +164,7 @@ impl Attempt {
             kind,
             last_note_end,
             labels: labels.clone(),
+            tempo: AttemptTempo::prepare(chart, section),
         }
     }
 }
