@@ -44,6 +44,7 @@ mod session;
 mod settings;
 mod sound;
 mod start_gate;
+mod tempo;
 mod tuning;
 
 pub use adjust_keys::{
@@ -93,7 +94,7 @@ pub use presets::{
 };
 pub use queue::{DEFAULT_QUEUED_PERIODS, QUEUED_PERIODS, QueueChoice, RAISED_QUEUED_PERIODS};
 pub use ready_history::{HistoryFull, HistoryRecorder};
-pub use render::{PlayView, RenderSide, RenderSink};
+pub use render::{PlayView, RenderSide, RenderSink, ViewWriter, render_link};
 pub use restore::{Restore, RestoreError, RestoreRefusal, Restored, Restorer};
 pub use result_graphs::{
     Axis, GRAPH_COLUMNS, GaugeColumn, GaugeTrace, ResultGraphs, TIMING_BIN_US, TIMING_BINS, Timing,
@@ -117,7 +118,7 @@ pub use session::{
     AutoKeySounds, ChartSource, Command, GateStorage, Loaded, MenuCommand, Parts, PlayEnd,
     PlayOutcome, PlayPlan, PlayReport, PlayScript, PlayStart, RECORDING_MEMORY, Reservation,
     SMALL_PARTS_BYTES, SYSTEM_CONTROL_INPUTS, Session, SessionConfig, SessionError,
-    SessionPlayError, Settings, wake_policy,
+    SessionPlayError, Settings, VIEW_NOTE_COPIES, wake_policy,
 };
 pub use settings::{
     ControllerDevice, DataRoot, DeviceSettings, DeviceSettingsError, KeyConfig, KeyError, LaneKey,
@@ -126,6 +127,7 @@ pub use settings::{
     save_settings,
 };
 pub use sound::{AudioQueue, AudioSink, RunnerAudio, Wakes, audio_link, audio_link_at};
+pub use tempo::{AttemptTempo, MAIN_HISTOGRAM_LIMIT, ReferenceError};
 pub use tuning::{
     Adjust, DEFAULT_VISIBLE_TIME_MS, MAX_VOLUME_PERCENT, OFFSET_LIMIT_US, OFFSET_STEP_US, Tuning,
     VISIBLE_TIME_MS, VISIBLE_TIME_STEPS_MS, VOLUME_STEP_PERCENT,

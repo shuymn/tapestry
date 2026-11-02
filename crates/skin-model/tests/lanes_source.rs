@@ -15,7 +15,7 @@ use lanes_support::{
 };
 use play_support::{Harness, MS, REGIONS, ev, full, hold_ended, judged, lane, ln_held, mine};
 use rules::Judgment;
-use skin_model::{LANE_QUADS, LANE_VISITS, LanesDef, LanesError, LoadError};
+use skin_model::{LANE_QUADS, LANE_VISITS, LanesDef, LanesError, LoadError, SourceLanes};
 
 /// 150 BPM, in thousandths.
 const BPM: i64 = 150_000;
@@ -56,7 +56,7 @@ fn a_note_sits_on_the_line_by_its_lower_edge() {
     assert_eq!(in_lane(&h, NOTE, lane(3)), [[384.0, 760.0, 64.0, 20.0]]);
     // Odd and fractional heights keep the lower edge, unrounded.
     for (n, y) in [(13.0, 867.0), (17.0, 863.0), (19.5, 860.5)] {
-        let mut h = harness_of(source_with(|s| s.note_h = n), &chart);
+        let mut h = harness_of(source_with(|s| s.note_h = [n; 8]), &chart);
         h.frame(1_000, &[]);
         assert_eq!(in_lane(&h, NOTE, lane(3)), [[384.0, y, 64.0, n]], "{n}");
     }
@@ -64,6 +64,52 @@ fn a_note_sits_on_the_line_by_its_lower_edge() {
     let mut h = harness_of(source_with(|s| s.offset_y = 5.0), &chart);
     h.frame(1_000, &[]);
     assert_eq!(in_lane(&h, NOTE, lane(3)), [[384.0, 855.0, 64.0, 20.0]]);
+}
+
+#[test]
+fn each_lane_draws_its_notes_at_its_own_height() {
+    // Lane 3's notes 33.5 high, lane 4's 7.25 and the scratch's 41, the
+    // rest 20: a tap, a mine and a long note's caps take their lane's
+    // height on one lower edge, the line and the region unchanged.
+    let heights = |s: &mut SourceLanes| {
+        s.note_h = [41.0, 20.0, 20.0, 33.5, 7.25, 20.0, 20.0, 20.0];
+    };
+    let chart = ChartBuilder::new(BPM)
+        .tap(lane(3), TimeUs(1_000 * MS))
+        .mine(lane(4), TimeUs(1_000 * MS), 10)
+        .tap(lane(0), TimeUs(1_000 * MS))
+        .tap(lane(1), TimeUs(1_000 * MS))
+        .long(lane(3), TimeUs(1_100 * MS), TimeUs(1_200 * MS))
+        .build()
+        .unwrap();
+    let mut h = harness_of(source_with(heights), &chart);
+    h.frame(1_000, &[]);
+    let edges = |rects: Vec<[f32; 4]>| {
+        rects
+            .iter()
+            .map(|r| (r[1] + r[3], r[3]))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(edges(in_lane(&h, NOTE, lane(3))), [(880.0, 33.5)]);
+    assert_eq!(edges(in_lane(&h, MINE, lane(4))), [(880.0, 7.25)]);
+    assert_eq!(edges(in_lane(&h, NOTE, lane(0))), [(880.0, 41.0)]);
+    assert_eq!(edges(in_lane(&h, NOTE, lane(1))), [(880.0, 20.0)]);
+    // The long note's head 100 px up, its end 200 px: each cap 33.5
+    // high on its edge, the body between them.
+    assert_eq!(edges(in_lane(&h, HEAD, lane(3))), [(780.0, 33.5)]);
+    let body = in_lane(&h, BODY_OFF, lane(3));
+    assert_eq!(body, [[384.0, 680.0, 64.0, 100.0 - 33.5]]);
+    let mut equal = harness(&chart);
+    equal.frame(1_000, &[]);
+    assert_eq!(rects(&h, LINE), rects(&equal, LINE));
+    // Judged on its own (CN), the end cap shows too, 33.5 high on the
+    // end's edge 200 px up.
+    let mut cn = chart.clone();
+    cn.meta.ln_mode = Some(LnMode::Cn);
+    let mut h = harness_of(source_with(heights), &cn);
+    h.frame(1_000, &[]);
+    assert_eq!(edges(in_lane(&h, TAIL, lane(3))), [(680.0, 33.5)]);
+    assert_eq!(edges(in_lane(&h, HEAD, lane(3))), [(780.0, 33.5)]);
 }
 
 #[test]
@@ -395,6 +441,43 @@ fn with_no_scroll_left_both_budgets_bound_the_frame() {
 }
 
 #[test]
+fn the_tallest_fitting_height_steps_below_a_rounded_up_room() {
+    // A bottom of 0.2 (as `f32`, 0.20000000298…) and a top of −1000 leave
+    // 1000.2000000029802… of room; its nearest `f32`, 1000.2000122…, is
+    // above it, so the tallest fitting height is the `f32` below.
+    let lanes = SourceLanes {
+        bottom: 0.2,
+        height: 600.0,
+        offset_y: 0.0,
+        note_h: [20.0; 8],
+    };
+    let room = f64::from(0.2_f32) + 1_000.0;
+    let nearest = 1_000.2_f32;
+    assert!(f64::from(nearest) > room);
+    let max = lanes.max_note_h(-1_000);
+    assert_eq!(max, nearest.next_down());
+    assert!(f64::from(max) <= room);
+    // The load check applies it: the rounded-up height refuses, the one
+    // below loads.
+    let err = |note_h: f32| {
+        let mut def = source_with(|s| {
+            *s = SourceLanes {
+                note_h: [note_h; 8],
+                ..lanes
+            };
+        });
+        def.top = -1_000;
+        match skin_with(REGIONS, Some(def), vec![lanes_element()]) {
+            Err(LoadError::Lanes(e)) => Some(e),
+            Err(e) => panic!("{e:?}"),
+            Ok(_) => None,
+        }
+    };
+    assert_eq!(err(nearest), Some(LanesError::SourceHeight { lane: 0 }));
+    assert_eq!(err(max), None);
+}
+
+#[test]
 fn the_source_geometry_is_checked_at_load() {
     let err = |def: LanesDef| match skin_with(REGIONS, Some(def), vec![lanes_element()]) {
         Err(LoadError::Lanes(e)) => Some(e),
@@ -404,14 +487,30 @@ fn the_source_geometry_is_checked_at_load() {
     for (what, def) in [
         ("negative offset", source_with(|s| s.offset_y = -1.0)),
         ("no height", source_with(|s| s.height = 0.0)),
-        ("no note height", source_with(|s| s.note_h = 0.0)),
         ("not finite", source_with(|s| s.bottom = f32::NAN)),
-        // 880 − 611 is above the top (270).
-        ("above the top", source_with(|s| s.note_h = 611.0)),
-        ("offset above the top", source_with(|s| s.offset_y = 600.0)),
     ] {
         assert_eq!(err(def), Some(LanesError::Source), "{what}");
     }
-    assert_eq!(err(source_with(|s| s.note_h = 610.0)), None);
+    // Each lane's height on its own, located by its lane.
+    for (what, def, lane) in [
+        ("no note height", source_with(|s| s.note_h[5] = 0.0), 5),
+        ("negative", source_with(|s| s.note_h[0] = -1.0), 0),
+        // 880 − 611 is above the top (270).
+        ("above the top", source_with(|s| s.note_h[3] = 611.0), 3),
+        (
+            "offset above the top",
+            source_with(|s| s.offset_y = 600.0),
+            0,
+        ),
+    ] {
+        assert_eq!(err(def), Some(LanesError::SourceHeight { lane }), "{what}");
+    }
+    assert_eq!(err(source_with(|s| s.note_h = [610.0; 8])), None);
+    assert_eq!(err(source_with(|s| s.note_h[7] = 0.125)), None);
     assert_eq!(err(source_with(|s| s.offset_y = 590.0)), None);
+    // The simple style's nominal heights are no part of the source
+    // style's: zero there loads.
+    let mut def = source();
+    (def.note_h, def.mine_h) = (0, 0);
+    assert_eq!(err(def), None);
 }

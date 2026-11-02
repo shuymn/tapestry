@@ -163,8 +163,8 @@ fn ops_of(ops: &str) -> u32 {
 fn f1(root: &Path) {
     // Two condition lists around 4 ops: x elements of the cheaper and the
     // rest of the dearer reach 65,536 exactly. Every supported condition
-    // with a judge region's 241 aside (no element is left for a judge)
-    // costs more than 4, so the cheaper is none.
+    // but 241, the latest judgment's PERFECT, costs more than 4, and the
+    // lists leave 241 out, so the cheaper is none.
     let lists = [
         "",
         "232",
@@ -672,7 +672,7 @@ fn f5(root: &Path) {
         r#"{{"id": "notes", "note": [{}], "lnstart": [{}], "lnend": [{}], "lnbody": [{}],
             "lnactive": [{}], "mine": [{}], "hcnstart": [{}], "hcnend": [{}], "hcnbody": [{}],
             "hcnactive": [{}], "hcndamage": [{}], "hcnreactive": [{}], "dst": [{}],
-            "group": [{F5_GROUPS}]}}"#,
+            "size": [{F5_SIZES}], "group": [{F5_GROUPS}]}}"#,
         list(0),
         list(1),
         list(2),
@@ -745,6 +745,10 @@ fn f5(root: &Path) {
         .as_bytes(),
     );
 }
+
+/// F5's note heights by source slot (keys 1 to 7, then the scratch):
+/// unequal, some fractional, the reference (slot 0) 19.5.
+const F5_SIZES: &str = "19.5, 20, 20.25, 21, 22, 23, 24, 7.75";
 
 /// F5's lanes: the source's keys 50 wide from 100, the first 51 wide
 /// over the second, and the scratch at 20, 79 wide; the span 20 to 450.
@@ -930,12 +934,13 @@ fn check_f5(_: &Header, i: Imported) {
         ]
     );
     assert_ne!(shown[0].2, shown[1].2);
-    // The two chords' taps, 20 tall, in the source's order: the earlier
-    // chord first, each keys 1 to 7 then the scratch.
+    // The two chords' taps, each at its lane's height (the bars are at
+    // most 6 tall), in the source's order: the earlier chord first, each
+    // keys 1 to 7 then the scratch.
     let taps: Vec<[i32; 4]> = q
         .iter()
         .map(|q| common::play::round(q.rect))
-        .filter(|r| r[3] == 20 && matches!(r[2], 50 | 51 | 79))
+        .filter(|r| r[3] >= 7 && matches!(r[2], 50 | 51 | 79))
         .collect();
     let xs: Vec<i32> = taps.iter().map(|r| r[0]).collect();
     let chord = [100, 150, 200, 250, 300, 350, 400, 20];
@@ -989,6 +994,29 @@ fn check_f5(_: &Header, i: Imported) {
         [([21, 878, 428, 2], grey), ([100, 876, 50, 6], [1.0; 4])]
     );
     assert_ne!(shown[0].2, shown[1].2);
+    // At 1 100 ms the first chord is on the line raised by LIFT (820):
+    // each lane's note at its own height on one lower edge, painted by
+    // its head's timeline row then the source's lane order, keys 1 to 7
+    // then the scratch.
+    let q = d.frame(1_100, &[]);
+    let chord: Vec<(f32, f32, f32)> = q
+        .iter()
+        .filter(|q| [51.0, 50.0, 79.0].contains(&q.rect[2]) && q.rect[1] + q.rect[3] == 820.0)
+        .map(|q| (q.rect[0], q.rect[1] + q.rect[3], q.rect[3]))
+        .collect();
+    assert_eq!(
+        chord,
+        [
+            (100.0, 820.0, 19.5),
+            (150.0, 820.0, 20.0),
+            (200.0, 820.0, 20.25),
+            (250.0, 820.0, 21.0),
+            (300.0, 820.0, 22.0),
+            (350.0, 820.0, 23.0),
+            (400.0, 820.0, 24.0),
+            (20.0, 820.0, 7.75),
+        ]
+    );
 }
 
 /// F10's LIFT destinations: every element but the lanes.
@@ -1920,6 +1948,69 @@ fn check_f16b(_: &Header, i: Imported) {
     }
 }
 
+/// Loads BMS `text` as a session does, at `speed`.
+fn loaded_at(text: &str, speed: bms_model::Speed) -> bms_model::Chart {
+    let dir = tempfile::tempdir().unwrap();
+    let opts = bms_parser::LoadOptions {
+        speed,
+        ..bms_parser::LoadOptions::default()
+    };
+    bms_parser::load_bms(text.as_bytes(), dir.path(), &opts)
+        .unwrap()
+        .chart
+}
+
+/// F17c's chart: 499 999 STOPs, 600 to a measure at 1 000 BPM, then one
+/// tap: 1 000 000 timeline rows, each at its own µs, so the playhead
+/// keeps a representative per row with no endpoint but the last.
+fn f17c_text() -> String {
+    let mut text = String::from("#BPM 1000\n#WAV01 a.wav\n#STOP01 1\n");
+    let (stops, per) = (499_999_usize, 600);
+    let measures = stops.div_ceil(per);
+    for m in 1..=measures {
+        let n = per.min(stops - (m - 1) * per);
+        let _ = writeln!(text, "#{m:03}09:{}", "01".repeat(n));
+    }
+    let _ = writeln!(text, "#{:03}11:01", measures + 1);
+    text
+}
+
+/// F17d's chart: 800 measures of 24 µs at 1 000 BPM, each with 600 BGM
+/// objects (25 rows to a µs) and a chord of taps on every lane at its
+/// start, whose position the bar line's and the BGM's µs take; the
+/// representatives are the stored µs, a few per measure.
+fn f17d_text() -> String {
+    let mut text = String::from("#BPM 1000\n#WAV01 a.wav\n");
+    let chord = ["16", "11", "12", "13", "14", "15", "18", "19"];
+    for m in 0..800 {
+        let _ = writeln!(text, "#{m:03}02:0.0001\n#{m:03}01:{}", "01".repeat(600));
+        for c in chord {
+            let _ = writeln!(text, "#{m:03}{c}:01");
+        }
+    }
+    text
+}
+
+/// What a play prepared over `chart` holds of its own and how many
+/// representatives its playhead keeps, two prepared at once.
+fn prepared_witness(skin: &Skin, chart: &bms_model::Chart, name: &str) {
+    let ctx = common::play::context();
+    let (a, b) = (
+        skin.prepare(chart, &ctx).unwrap(),
+        skin.prepare(chart, &ctx).unwrap(),
+    );
+    let reps = a.playhead().representatives().len();
+    println!(
+        "{name}: {} rows, {reps} representatives ({} B), play {} B, two at once {} B, \
+         the timeline shared ({} B once)",
+        chart.timeline.points().len(),
+        a.playhead().heap_bytes(),
+        a.resident_bytes(),
+        a.resident_bytes() + b.resident_bytes(),
+        size_of_val(chart.timeline.points()) + size_of_val(chart.timeline.bar_ids()),
+    );
+}
+
 #[test]
 fn import_memory_is_measured() {
     // Positive control: a 4 MiB buffer grown to 8 MiB is 12 MiB live at
@@ -1977,6 +2068,16 @@ fn import_memory_is_measured() {
         size_of::<Option<skin_model::Track>>(),
         size_of::<skin_model::GradePart>(),
         size_of::<skin_model::ComboPart>(),
+    );
+    println!(
+        "sizes: chart Note {}, TimelinePoint {}, TimelineId {}, ChartTimeline {}, \
+         ExactPlayhead {}, SourceLanes {}",
+        size_of::<bms_model::Note>(),
+        size_of::<bms_model::TimelinePoint>(),
+        size_of::<bms_model::TimelineId>(),
+        size_of::<bms_model::ChartTimeline>(),
+        size_of::<skin_model::ExactPlayhead>(),
+        size_of::<skin_model::SourceLanes>(),
     );
     // A group's work in a play: its frame record and its heap slot of 2 B,
     // 32 768 B of heap at the cap.
@@ -2195,6 +2296,51 @@ fn import_memory_is_measured() {
     peaks.push((
         "F16b lane visits",
         measure_prepared(d.path(), &f16b_chart(true), check_f16b),
+    ));
+    // F17: the exact playhead prepared over parser-loaded charts at the
+    // timeline's extremes, on F16's lanes; the chart is loaded outside
+    // the window, the play's representatives counted in it.
+    let f17c = loaded_at(&f17c_text(), bms_model::Speed::NORMAL);
+    assert_eq!(f17c.timeline.points().len(), 1_000_000);
+    peaks.push((
+        "F17c playhead at the row cap",
+        measure_prepared(d.path(), &f17c, |_, i| {
+            prepared_witness(&i.skin, &f17c, "F17c");
+            let ctx = common::play::context();
+            let play = i.skin.prepare(&f17c, &ctx).unwrap();
+            assert_eq!(play.playhead().representatives().len(), 1_000_000);
+            drop(play);
+            // The chart and the play as a practice page holds them: the
+            // 1x chart retained, the 50 % chart loaded beside it, and a
+            // play prepared over each, all in one window, every shared
+            // allocation counted once.
+            let text = f17c_text();
+            let (live, p) = peak(|| {
+                let normal = loaded_at(&text, bms_model::Speed::NORMAL);
+                let mapped = loaded_at(&text, bms_model::Speed::SLOWEST);
+                let a = i.skin.prepare(&normal, &ctx).unwrap();
+                let b = i.skin.prepare(&mapped, &ctx).unwrap();
+                (normal, mapped, a, b)
+            });
+            println!("F17c 1x and 50 % charts with a play over each: peak {p} B");
+            drop(live);
+        }),
+    ));
+    let f17d = loaded_at(&f17d_text(), bms_model::Speed::NORMAL);
+    peaks.push((
+        "F17d dense one-µs buckets",
+        measure_prepared(d.path(), &f17d, |_, i| {
+            prepared_witness(&i.skin, &f17d, "F17d");
+            let ctx = common::play::context();
+            let play = i.skin.prepare(&f17d, &ctx).unwrap();
+            let rows = f17d.timeline.points();
+            let reps = play.playhead().representatives().len();
+            assert!(reps * 10 < rows.len(), "{reps} of {}", rows.len());
+            // Each chord's µs takes the chord's position.
+            for n in &f17d.lanes[1] {
+                assert_eq!(play.playhead().position_at(n.time), n.pos);
+            }
+        }),
     ));
     drop(d);
     for (name, p) in &peaks {

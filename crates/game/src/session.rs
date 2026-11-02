@@ -1109,13 +1109,12 @@ impl Loaded {
     /// it with, made afresh for each play.
     #[must_use]
     pub fn attempt(&self) -> Attempt {
-        let ends = match (&self.practice, self.config.autoplay) {
-            (Some((practice, _)), _) => NoteEnd::Practice {
+        let ends = match &self.practice {
+            Some((practice, _)) => NoteEnd::Practice {
                 end: practice.end,
                 speed: self.config.speed,
             },
-            (None, Some(_)) => NoteEnd::Autoplay,
-            (None, None) => NoteEnd::Play,
+            None => NoteEnd::Play,
         };
         Attempt::new(
             self.attempt,
@@ -1124,6 +1123,7 @@ impl Loaded {
             self.section(),
             ends.of(&self.chart),
             &self.labels,
+            &self.chart,
         )
     }
 
@@ -2208,6 +2208,11 @@ pub const RECORDING_MEMORY: usize = 512 << 20;
 /// bookkeeping, the play view's buffers and the gauges).
 pub const SMALL_PARTS_BYTES: usize = 64 << 10;
 
+/// The copies of the note facts a play holds beside the evaluator's own,
+/// at its peak: the initial play view, each of the view's three buffers
+/// made from it, and the view the play's end takes.
+pub const VIEW_NOTE_COPIES: usize = 5;
+
 /// What a play reserves right after recording opens, before it is handed
 /// to audio and the screen, as a function of its input
 /// capacity: `fixed + per_input × inputs` bytes (design.md "Recording
@@ -2221,8 +2226,10 @@ pub const SMALL_PARTS_BYTES: usize = 64 << 10;
 /// command queue and a copy of the events, each also of
 /// [`Evaluator::max_events`]. The fixed part holds the chart's share of
 /// those events (its notes, mines and song end), the render effect queue,
-/// and the allowances for tables ([`Evaluator::table_bytes`]) and small
-/// parts. Its components are `eval`'s, which also composes the batch
+/// the play view's copies of the note facts ([`VIEW_NOTE_COPIES`] of
+/// [`Evaluator::note_bytes`]), and the allowances for tables
+/// ([`Evaluator::table_bytes`], the evaluator's own note facts included)
+/// and small parts. Its components are `eval`'s, which also composes the batch
 /// evaluation's peak from them ([`Evaluator::batch_bytes`]); a play holds
 /// no gauge histories.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2264,7 +2271,11 @@ impl Reservation {
         };
         let empty = total(0);
         Self {
-            fixed: empty + effects * eval::EVENT_BYTES + probe.table_bytes() + SMALL_PARTS_BYTES,
+            fixed: empty
+                + effects * eval::EVENT_BYTES
+                + VIEW_NOTE_COPIES * probe.note_bytes()
+                + probe.table_bytes()
+                + SMALL_PARTS_BYTES,
             per_input: total(1) - empty,
         }
     }

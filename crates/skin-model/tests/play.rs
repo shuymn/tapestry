@@ -972,6 +972,7 @@ fn an_inconsistent_snapshot_poisons_the_play() {
             gauges: &h.gauges,
             gauge: 0,
             effects,
+            notes: &h.notes,
             complete: false,
             playing: true,
             target: h.target,

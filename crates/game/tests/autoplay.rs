@@ -405,6 +405,20 @@ fn unsaved_session_keeps_no_records_and_judges_every_note_perfect() {
     }
 }
 
+/// An autoplay attempt's notes end where a played one's do, at the last
+/// note: background sounds after it do not move the end.
+#[test]
+fn autoplay_notes_end_at_the_last_note() {
+    let (_dir, root) = temp_root();
+    let mut chart = chart();
+    chart.bgm.push(bms_model::BgmEvent {
+        time: TimeUs(9_000 * MS),
+        sound: SoundId(2),
+    });
+    let loaded = load(&root, &chart, &DeviceSettings::default(), false);
+    assert_eq!(loaded.attempt().last_note_end, TimeUs(2_000 * MS));
+}
+
 /// G2: whatever `device.toml` binds (no keyboard lanes, or lanes on other
 /// keys, with a controller config playing the scratch on an axis),
 /// autoplay plays all eight lanes with its own keys, and the settings

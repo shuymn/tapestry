@@ -220,23 +220,42 @@ fn combo_keys(keys: &str) -> String {
 }
 
 #[test]
-fn a_combo_shift_outside_i32_refuses() {
-    let range_x = |keys: &str| {
+fn a_combo_key_gives_x_and_w_together() {
+    let range = |keys: &str, field: &str| {
         let l = judge(&grades(1), &[combo_keys(keys)]);
         assert!(
-            matches!(l.err(), ImportError::Range { field: "x", .. }),
+            matches!(l.err(), ImportError::Range { field: f, .. } if f == field),
             "{keys}"
         );
     };
-    // `w · 3` overflows.
-    range_x(r#"{"x": 0, "y": 0, "w": 2147483647, "h": 20}"#);
-    // `x − 15` overflows.
-    range_x(r#"{"x": -2147483647, "y": 0, "w": 10, "h": 20}"#);
-    // `x − 3` is the omission mark, `i32::MIN`.
-    range_x(r#"{"x": -2147483645, "y": 0, "w": 2, "h": 20}"#);
     // Only one of the two is given.
-    range_x(r#"{"x": 10, "y": 0, "h": 20}"#);
-    range_x(r#"{"y": 0, "w": 10, "h": 20}"#);
+    range(r#"{"x": 10, "y": 0, "h": 20}"#, "x");
+    range(r#"{"y": 0, "w": 10, "h": 20}"#, "x");
+    // A shift past `i32` is exact, and only its edges leave the model.
+    range(r#"{"x": 0, "y": 0, "w": 2147483647, "h": 20}"#, "dst");
+    range(r#"{"x": -2147483647, "y": 0, "w": 10, "h": 20}"#, "dst");
+}
+
+/// The shift is exact on a 1280 px skin: the raw x 10 less half of three
+/// 11 px widths is −6.5, −9.75 reference pixels, and only the drawn
+/// edges round, putting "12" at 149. Halving the raw widths first would
+/// leave −6, −9, and 150.
+#[test]
+fn a_combo_centres_exactly() {
+    let judge = judge_rec(
+        &grades(1),
+        &[combo_keys(r#"{"x": 10, "y": 0, "w": 11, "h": 20}"#)],
+        "",
+    );
+    let body = format!(
+        r#"{}, {VALUES}, "judge": [{judge}], "destination": [{DST}]"#,
+        images()
+    );
+    let l = import_sized([1_280, 720], &body, &[]);
+    assert_eq!(
+        shown(&l, of(Judgment::Perfect, 12), 12, false),
+        [[149, 300, 17, 30], [166, 300, 17, 30], [150, 300, 120, 30]]
+    );
 }
 
 #[test]
@@ -282,23 +301,56 @@ fn judge_entries_need_an_id() {
     let mut images = grades(1);
     images.push(NONE.to_owned());
     judge(&images, &[combo("ten", 10), NONE.to_owned()]).ok();
-    // A missing one refuses, for an image past the slots too.
+    // A missing one refuses in a slot that is drawn.
     let mut images = grades(1);
     images.push(no_id.clone());
     assert_eq!(
         critical(judge(&images, &[combo("ten", 10), NONE.to_owned()])),
         refused("images")
     );
-    let mut images = grades(7);
-    images.push(no_id.clone());
-    let numbers = vec![NONE.to_owned(); 8];
-    assert_eq!(critical(judge(&images, &numbers)), refused("images"));
     assert_eq!(
         critical(judge(&grades(2), &[combo("ten", 10), no_id.clone()])),
         refused("numbers")
     );
-    // A number past the images is never read.
+    // Entries never drawn are not read: an image past the slots, a
+    // number of a slot without a combo, a number past the images.
+    let mut images = grades(7);
+    images.push(no_id.clone());
+    let l = judge(&images, &vec![NONE.to_owned(); 8]);
+    assert!(has(l.report(), NoteKind::Ignored { field: "images" }));
+    let mut numbers = vec![NONE.to_owned(); 3];
+    numbers.push(no_id.clone());
+    judge(&grades(4), &numbers).ok();
     judge(&grades(1), &[combo("ten", 10), no_id]).ok();
+}
+
+/// An entry the judge never draws is not parsed: malformed fields in a
+/// number of a slot without a combo, or in an image past the slots, do
+/// not refuse; a number naming a value is still noted as ignored.
+#[test]
+fn undrawn_judge_entries_are_not_parsed() {
+    let malformed = [
+        r#"{"id": "ten", "blend": []}"#,
+        r#"{"id": "ten", "timer": "late", "dst": [{"x": 0}]}"#,
+        r#"{"id": "ten", "dst": 7}"#,
+        r#"{"id": "ten", "op": [{}], "offset": "far"}"#,
+    ];
+    for entry in malformed {
+        let mut numbers = vec![NONE.to_owned(); 3];
+        numbers.push(entry.to_owned());
+        let l = judge(&grades(4), &numbers);
+        assert!(
+            has(l.report(), NoteKind::Ignored { field: "numbers" }),
+            "{entry}"
+        );
+        let mut images = grades(7);
+        images.push(entry.replace("ten", "g0"));
+        let l = judge(&images, &[]);
+        assert!(
+            has(l.report(), NoteKind::Ignored { field: "images" }),
+            "{entry}"
+        );
+    }
 }
 
 #[test]
@@ -341,14 +393,10 @@ fn judges_refuse_what_the_model_cannot_share() {
         critical(skin(r#""value": []"#, &both, &[DST, &k])).1,
         NoteKind::UnsupportedField { field: "index" }
     );
-    // Fewer numbers than images, while the skin has values.
+    // Fewer numbers than images leave the rest without combos.
     let short = judge_rec(&grades(2), &[combo("ten", 10)], "");
-    assert_eq!(
-        critical(skin(VALUES, &short, &[DST])).1,
-        NoteKind::UnsupportedField { field: "numbers" }
-    );
-    let l = skin(r#""value": []"#, &short, &[DST]);
-    assert_eq!(l.report().usage.widget_quads, 1);
+    let l = skin(VALUES, &short, &[DST]);
+    assert_eq!(l.report().usage.widget_quads, 4);
     // Drawn twice.
     assert_eq!(
         critical(judge_two()).1,

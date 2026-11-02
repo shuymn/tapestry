@@ -30,10 +30,10 @@ pub enum Severity {
     /// Something the source does not draw either, or a field with no
     /// effect, was left out.
     Ignored,
-    /// The element is kept with the paint the source itself draws in
-    /// place of a part it could not find, such as a note part's generated
-    /// colour: a recovery the source also makes, neither a deviation nor
-    /// a dropped part.
+    /// The element is kept with what the source itself draws in place of
+    /// what it could not use, such as a note part's generated colour or a
+    /// clamped colour channel: a recovery the source also makes, neither
+    /// a deviation nor a dropped part.
     Fallback,
 }
 
@@ -278,6 +278,9 @@ pub enum NoteKind {
         field: &'static str,
         why: PartWhy,
     },
+    /// A key's colour channel outside 0 to 255, clamped as the source
+    /// clamps it.
+    ColourClamped,
     /// A note part whose id names no image, drawn with the source's
     /// generated `paint` on model lane `lane`.
     NotePartFallback {
@@ -312,6 +315,7 @@ impl fmt::Display for NoteKind {
             Self::BitmapFont(e) => write!(f, "a bitmap font refused ({e})"),
             Self::Ignored { field } => write!(f, "`{field}` ignored"),
             Self::NotePart { field, why } => write!(f, "note part `{field}`: {why}"),
+            Self::ColourClamped => f.write_str("a colour channel outside 0 to 255, clamped"),
             Self::NotePartFallback { field, lane, paint } => {
                 write!(
                     f,

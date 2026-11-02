@@ -5,7 +5,7 @@
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
 use bms_model::{Chart, LANE_COUNT, TimeUs};
-use eval::GaugeState;
+use eval::{GaugeState, NoteFacts};
 use rules::GaugeValue;
 
 use crate::atlas::uv::{Cycle, UvTable};
@@ -312,6 +312,9 @@ enum Phase<'a> {
     /// gauge.
     Play {
         play: &'a Play,
+        /// The frame's note facts, which the lanes draw each note's state
+        /// from.
+        notes: &'a NoteFacts,
         gauges: &'a [GaugeState],
         shown: usize,
     },
@@ -1266,6 +1269,7 @@ impl Skin {
             .into_iter()
             .map(|d| ImageChoice {
                 value: d.value,
+                past_table: d.past_table,
                 parts: d
                     .choices
                     .into_iter()
@@ -1957,6 +1961,7 @@ impl Skin {
             hidden_enabled: frame.readouts.covers.hidden_enabled,
             phase: Phase::Play {
                 play: shown,
+                notes: frame.notes,
                 gauges: frame.gauges,
                 shown: frame.gauge,
             },
@@ -2051,7 +2056,7 @@ impl Skin {
         // lanes draw.
         let lanes = self.lanes.as_ref().map(|l| l.frame_geometry(scene.lanes));
         let play = match scene.phase {
-            Phase::Play { play, .. } => Some(play),
+            Phase::Play { play, notes, .. } => Some((play, notes)),
             Phase::Loading { .. } => None,
         };
         for e in &self.elements {
@@ -2195,6 +2200,7 @@ impl Skin {
                                 play,
                                 gauges,
                                 shown,
+                                ..
                             } => Shown::of(gauges, play.gauge_desc(shown), shown),
                             // The empty frame: no value while loading.
                             Phase::Loading { gauge } => gauge.map(|g| Shown {
@@ -2210,7 +2216,7 @@ impl Skin {
                 }
                 Kind::Judge(i) => {
                     // Judgment feedback never draws while loading.
-                    if let (Some(j), Some(play)) = (self.judges.get(i), play) {
+                    if let (Some(j), Some((play, _))) = (self.judges.get(i), play) {
                         let d = JudgeDraw {
                             at,
                             grade: play.judge(),

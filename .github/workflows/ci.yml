@@ -169,6 +169,10 @@ jobs:
       # dependencies it reuses.
       - name: Render staging allocation test (release)
         run: mise exec -- cargo test --release --locked -p render --test alloc
+      # The loader's chart ceiling (design.md "Memory Budget"): one ignored
+      # measurement, run alone in the release profile it is sized for.
+      - name: Chart memory ceiling (release)
+        run: mise exec -- cargo test --release --locked -p bms-parser --test memory -- --ignored --exact measure_load_peaks
       - name: Production excludes dev-tools
         run: |
           mise exec -- cargo xtask check-binary --absent "tapestry dev-tools enabled" target/release/tapestry.exe
@@ -322,7 +326,7 @@ jobs:
       # The allocation contracts also hold with optimizations (design.md
       # "Scope of No Allocation").
       - name: Allocation tests (release)
-        run: mise exec -- cargo test --release --locked -p eval -p input -p game -p audio -p skin-model --test alloc --test audio_alloc --test audio_burst --test ring_out_alloc --test autoplay_iter_alloc --test loudness_alloc
+        run: mise exec -- cargo test --release --locked -p eval -p input -p game -p audio -p skin-model --test alloc --test audio_alloc --test audio_burst --test ring_out_alloc --test autoplay_iter_alloc --test loudness_alloc --test tempo_alloc --test adjustment_alloc --test rearm_alloc
       # The fuzz crate is its own workspace (fuzz/Cargo.toml), which the
       # workspace commands above do not reach.
       - name: Format (fuzz crate)

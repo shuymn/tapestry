@@ -3036,8 +3036,8 @@ fn the_first_round_prepares_with_the_preset_edited_on_the_practice_page() {
         .map(|g| if g.id == displayed.id { set } else { g.start })
         .collect();
     assert_eq!(section.initial_gauges, expected);
-    // A round's notes end 1 s after its section, at 1×.
-    assert_eq!(first.last_note_end, TimeUs(section.end.0 + 1_000_000));
+    // A round's notes end at its section's end, at 1×.
+    assert_eq!(first.last_note_end, section.end);
     let Some((P, rounds)) = rig.loads.first() else {
         panic!("{:?}", rig.seen);
     };

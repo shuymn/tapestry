@@ -112,6 +112,33 @@ fn a_bitmap_font_draws_its_glyphs() {
     close(r[1], [414.0, 251.0, 10.0, 20.0]);
 }
 
+/// A font of supplementary glyphs alone loads: its synthesised space
+/// takes the first drawn glyph's advance, and its text draws.
+#[test]
+fn a_supplementary_only_font_draws_with_a_synthesised_space() {
+    let dir = skin(&[(
+        "s.json",
+        &json(
+            [1_920, 1_080],
+            r#"{"id": "b", "path": "b.fnt"}"#,
+            &[("b", 24, "")],
+        ),
+    )]);
+    let smile: Ch = (0x1_F600, 0, 10, 20, 2, 3, 12);
+    let grin: Ch = (0x1_F601, 20, 8, 20, 0, 3, 9);
+    fnt(dir.path(), "b.fnt", &[smile, grin]);
+    let i = import(dir.path()).unwrap();
+    assert!(i.report.notes.is_empty(), "{:?}", i.report.notes);
+    // The two and the space.
+    assert_eq!((i.report.usage.fonts, i.report.usage.glyphs), (1, 3));
+    // The space advances 12, the first drawn glyph's advance; with no
+    // cap glyph the tallest, 20, is the cap height, so the ascent is 0.
+    let r = rects(i, "\u{1F600} \u{1F601}");
+    assert_eq!(r.len(), 2, "{r:?}");
+    close(r[0], [402.0, 253.0, 10.0, 20.0]);
+    close(r[1], [424.0, 253.0, 8.0, 20.0]);
+}
+
 #[test]
 fn the_size_rounds_to_a_whole_pixel() {
     // r = 3/2: 16 · 3/2 = 24 is whole; 15 · 3/2 = 22.5 rounds up to 23.

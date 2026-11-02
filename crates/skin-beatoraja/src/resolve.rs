@@ -130,14 +130,45 @@ fn read_file(
     })
 }
 
-/// `n` truncated toward zero, if that is inside `i32`.
-#[expect(
-    clippy::cast_possible_truncation,
-    reason = "the value is finite, whole and inside i32, checked just before"
-)]
-fn truncated(n: f64) -> Option<i32> {
-    let t = n.trunc();
-    (t.is_finite() && t >= f64::from(i32::MIN) && t <= f64::from(i32::MAX)).then_some(t as i32)
+/// Number token `raw`'s exact decimal value truncated toward zero, if
+/// that is inside `i32`: its digits are read up to where the exponent
+/// puts the point and the rest are only checked, so nothing rounds.
+fn truncated(raw: &str) -> Option<i32> {
+    let (negative, rest) = match raw.as_bytes().first() {
+        Some(b'-') => (true, raw.get(1..)?),
+        Some(b'+') => (false, raw.get(1..)?),
+        _ => (false, raw),
+    };
+    let (mantissa, exp) = match rest.find(['e', 'E']) {
+        Some(i) => (rest.get(..i)?, rest.get(i + 1..)?),
+        None => (rest, "0"),
+    };
+    if !integer_shaped(exp) {
+        return None;
+    }
+    // An exponent past `i64` puts the point past every digit.
+    let exp = exp.parse::<i64>().unwrap_or(if exp.starts_with('-') {
+        i64::MIN
+    } else {
+        i64::MAX
+    });
+    let (int, frac) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    let point = i64::try_from(int.len()).ok()?.saturating_add(exp);
+    let (mut v, mut read) = (0_i64, 0_i64);
+    for b in int.bytes().chain(frac.bytes()) {
+        let d = char::from(b).to_digit(10)?;
+        if read < point {
+            v = v.checked_mul(10)?.checked_add(i64::from(d))?;
+            read += 1;
+        }
+    }
+    // Zeros up to the point: a nonzero value leaves `i64` within 19.
+    if v != 0 {
+        for _ in read..point {
+            v = v.checked_mul(10)?;
+        }
+    }
+    i32::try_from(if negative { -v } else { v }).ok()
 }
 
 /// Whether `s` is an optional sign and decimal digits: an integer, if out
@@ -328,9 +359,10 @@ impl Definition {
     }
 
     /// An `int` field (Json.java:1011 and 1034, JsonValue.java:238-251):
-    /// a number token truncated toward zero, or a string that parses as a
-    /// decimal integer. Outside `i32` is refused (an intentional policy:
-    /// the source wraps or saturates).
+    /// a number token's exact decimal value truncated toward zero
+    /// ([`truncated`]), or a string that parses as a decimal integer.
+    /// Outside `i32` is refused (an intentional policy: the source wraps
+    /// or saturates).
     pub(crate) fn int(&mut self, id: u32, field: &'static str) -> Result<i32, ImportError> {
         let range = |d: &Self| ImportError::Range {
             at: d.loc(id),
@@ -342,11 +374,7 @@ impl Definition {
                 .ok()
                 .and_then(|v| i32::try_from(v).ok())
                 .ok_or_else(|| range(self)),
-            Scalar::Double(raw) => raw
-                .parse::<f64>()
-                .ok()
-                .and_then(truncated)
-                .ok_or_else(|| range(self)),
+            Scalar::Double(raw) => truncated(raw).ok_or_else(|| range(self)),
             Scalar::Str { raw, escaped } => {
                 let decoded;
                 let s = if escaped {
@@ -373,7 +401,7 @@ impl Definition {
     /// An `int` field read exactly: as [`Self::int`], except that a
     /// number token with a point or an exponent must be a whole number
     /// ([`Q::decimal`]) rather than truncated (an intentional policy for
-    /// paint geometry: the source truncates through `f64`).
+    /// paint geometry).
     pub(crate) fn exact_int(&mut self, id: u32, field: &'static str) -> Result<i32, ImportError> {
         let raw = match self.arena.scalar(id) {
             Scalar::Double(raw) => raw,

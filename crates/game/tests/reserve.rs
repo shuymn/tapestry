@@ -19,7 +19,8 @@ use bms_model::{ChartBuilder, TimeUs};
 use common::{MS, device, lane};
 use eval::{InputStart, JudgeEvent};
 use game::{
-    Logic, LogicConfig, Reservation, SMALL_PARTS_BYTES, TABLE_BYTES_PER_OBJECT, audio_link_at,
+    Logic, LogicConfig, Reservation, SMALL_PARTS_BYTES, TABLE_BYTES_PER_OBJECT, VIEW_NOTE_COPIES,
+    audio_link_at,
 };
 use input::source_queue;
 
@@ -101,8 +102,10 @@ fn reservation_matches_what_a_play_allocates() {
         .unwrap();
         let audio = audio_link_at(logic.max_events(), TimeUs(0));
         let live: Vec<JudgeEvent> = Vec::with_capacity(logic.max_events());
+        // The view the play's end takes.
+        let view = logic.view();
         TRACK.with(|t| t.set(false));
-        drop((logic, side, audio, live));
+        drop((logic, side, audio, live, view));
         BYTES.load(Ordering::Relaxed)
     };
     let (small, large) = (1_000, 101_000);
@@ -121,9 +124,51 @@ fn reservation_matches_what_a_play_allocates() {
         "{} unaccounted",
         r.bytes(small) - at_small
     );
+    // Every copy of the note facts, the evaluator's and the view's, is
+    // counted at its exact size: a chart one note longer on a lane whose
+    // bits fill their words takes one more word in each, and the
+    // reservation's fixed part still covers it.
+    let lane_of = |notes: i64| {
+        let mut b = ChartBuilder::new(150_000);
+        for i in 0..notes {
+            b = b.tap(lane(1), TimeUs(1_000 * MS + i * 50 * MS));
+        }
+        b.build().unwrap()
+    };
+    let at_notes = |notes: i64| {
+        let chart = lane_of(notes);
+        let dev = device(&[0]);
+        let readers = vec![source_queue(4).1];
+        let config = LogicConfig { inputs: 0, effects };
+        BYTES.store(0, Ordering::Relaxed);
+        TRACK.with(|t| t.set(true));
+        let (logic, side) = Logic::new(
+            &chart,
+            &rule,
+            &dev,
+            &InputStart::default(),
+            readers,
+            config,
+            Vec::new(),
+        )
+        .unwrap();
+        let view = logic.view();
+        TRACK.with(|t| t.set(false));
+        drop((logic, side, view));
+        let r = Reservation::of(&chart, &rule, &dev, effects).unwrap();
+        (BYTES.load(Ordering::Relaxed), r.fixed)
+    };
+    let ((full, full_r), (over, over_r)) = (at_notes(128), at_notes(129));
+    let copies = 1 + VIEW_NOTE_COPIES;
+    assert!(over - full >= copies * 8, "{} bytes", over - full);
+    assert!(
+        full <= full_r && over <= over_r,
+        "{full} {full_r} {over} {over_r}"
+    );
     // The evaluator's tables grow by the same bytes per note across a
     // power of two (127, 128, 129 notes on one lane), within the per-object
-    // allowance: reserved at their size, never grown by doubling.
+    // allowance: reserved at their size, never grown by doubling. Its note
+    // facts' bits, whole words per lane, are taken out.
     let tables = |notes: i64| {
         let mut b = ChartBuilder::new(150_000);
         for i in 0..notes {
@@ -136,8 +181,9 @@ fn reservation_matches_what_a_play_allocates() {
         let ev =
             eval::Evaluator::new(&chart, &rule, &one, &InputStart::default(), None, 0).unwrap();
         TRACK.with(|t| t.set(false));
+        let bits = ev.note_bytes();
         drop(ev);
-        BYTES.load(Ordering::Relaxed)
+        BYTES.load(Ordering::Relaxed) - bits
     };
     let (a, b, c) = (tables(127), tables(128), tables(129));
     assert_eq!(c - b, b - a, "{a} {b} {c}");

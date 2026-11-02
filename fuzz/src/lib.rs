@@ -47,10 +47,68 @@ fn chart_dir() -> &'static Path {
 /// # Panics
 ///
 /// If a loaded chart breaks its base or link invariants, or its
-/// presentation validity disagrees with [`endpoint_conflict`].
+/// presentation validity disagrees with [`endpoint_conflict`]; and, loaded
+/// again at the practice speed [`practice_speed`] picks for `data`, if the
+/// mapped chart does, or keeps other rows, positions, tempos or identity
+/// than the 1× chart.
 pub fn bms_load(data: &[u8]) -> Result<Loaded, LoadError> {
     let loaded = bms_parser::load_bms(data, chart_dir(), &LoadOptions::default())?;
-    let chart = &loaded.chart;
+    check_loaded(&loaded.chart, bms_model::Speed::NORMAL);
+    let speed = practice_speed(data);
+    let opts = LoadOptions {
+        speed,
+        ..LoadOptions::default()
+    };
+    // A chart too long for the speed is refused there, and only there.
+    match bms_parser::load_bms(data, chart_dir(), &opts) {
+        Ok(mapped) => {
+            check_loaded(&mapped.chart, speed);
+            let (one, at) = (&loaded.chart.timeline, &mapped.chart.timeline);
+            assert_eq!(one.points().len(), at.points().len());
+            for (a, b) in one.points().iter().zip(at.points()) {
+                assert_eq!((a.pos, a.tempo), (b.pos, b.tempo), "a mapped row moved");
+                if speed.twentieths() <= 20 {
+                    assert!(b.at >= a.at, "a slower row is earlier");
+                } else {
+                    assert!(b.at <= a.at, "a faster row is later");
+                }
+            }
+            assert_eq!(one.bar_ids(), at.bar_ids());
+            let (one_notes, at_notes) = (&loaded.chart.lanes, &mapped.chart.lanes);
+            assert!(
+                one_notes
+                    .iter()
+                    .flatten()
+                    .map(|n| n.anchors)
+                    .eq(at_notes.iter().flatten().map(|n| n.anchors)),
+                "a mapped note moved rows"
+            );
+            assert_eq!(
+                loaded.chart.identity.resolved_hash,
+                mapped.chart.identity.resolved_hash
+            );
+        }
+        Err(LoadError::TooLongAtSpeed { .. }) => {}
+        Err(e) => panic!("loads at 1x but not at {}/20: {e}", speed.twentieths()),
+    }
+    Ok(loaded)
+}
+
+/// The practice speed `bms_load` also loads `data` at: a step of the
+/// ladder (50 % to 150 %) from the bytes' sum, so every step is reached
+/// and the same input always takes the same one.
+#[must_use]
+pub fn practice_speed(data: &[u8]) -> bms_model::Speed {
+    let sum = data
+        .iter()
+        .fold(0_u32, |s, &b| s.wrapping_add(u32::from(b)));
+    bms_model::Speed::from_twentieths(10 + sum % 21).unwrap_or(bms_model::Speed::NORMAL)
+}
+
+/// The invariants of a chart loaded at `speed`: base and link validity,
+/// the row cap, the tempo metadata, and presentation validity agreeing
+/// with [`endpoint_conflict`] (the loader never refuses a conflict).
+fn check_loaded(chart: &bms_model::Chart, speed: bms_model::Speed) {
     assert_eq!(chart.validate(), Ok(()), "a loaded chart is valid");
     assert_eq!(
         chart.validate_presentation_links(),
@@ -61,8 +119,7 @@ pub fn bms_load(data: &[u8]) -> Result<Loaded, LoadError> {
     assert!(t.points().len() <= bms_model::MAX_TIMELINE_POINTS);
     let meta = t.meta();
     assert!(meta.min <= meta.initial && meta.initial <= meta.max);
-    assert_eq!(meta.speed, bms_model::Speed::NORMAL);
-    // The loader never refuses a conflict; validity is the chart's own.
+    assert_eq!(meta.speed, speed);
     match chart.validate_presentation() {
         Ok(()) => assert!(!endpoint_conflict(chart), "a conflict passed"),
         Err(bms_model::PresentationError::EndpointConflict { .. }) => {
@@ -70,7 +127,6 @@ pub fn bms_load(data: &[u8]) -> Result<Loaded, LoadError> {
         }
         Err(e) => panic!("links passed but presentation failed: {e}"),
     }
-    Ok(loaded)
 }
 
 /// The presentation oracle: whether two note endpoints of `chart` sit at
@@ -395,6 +451,9 @@ pub fn draw(imported: &Imported) -> Vec<usize> {
             },
         }];
         batch.clear();
+        // The play view's note facts after the judgment.
+        let mut notes = eval::NoteFacts::new(&chart);
+        notes.set_done(lane, 0);
         let frame = SkinFrame {
             now: TimeUs(ms * 1_000),
             display_offset: TimeUs(0),
@@ -402,6 +461,7 @@ pub fn draw(imported: &Imported) -> Vec<usize> {
             gauges: &states,
             gauge: 0,
             effects: &effects,
+            notes: &notes,
             complete: false,
             target: [1_920, 1_080],
             layout: &Layout::AUTHOR,
@@ -442,6 +502,7 @@ pub fn draw(imported: &Imported) -> Vec<usize> {
             readouts.covers.hidden = hidden.min(1_000);
             readouts.covers.hidden_enabled = false;
         }
+        let notes = eval::NoteFacts::default();
         let frame = SkinFrame {
             now: TimeUs(ms * 1_000),
             display_offset: TimeUs(0),
@@ -449,6 +510,7 @@ pub fn draw(imported: &Imported) -> Vec<usize> {
             gauges: &states,
             gauge: 0,
             effects: &[],
+            notes: &notes,
             complete: false,
             target: [1_920, 1_080],
             layout: &Layout::AUTHOR,
@@ -533,6 +595,7 @@ fn lane_order_probes(
             hidden: 0,
         };
         batch.clear();
+        let notes = eval::NoteFacts::default();
         let frame = SkinFrame {
             now: TimeUs(800_000 + i64::try_from(k).unwrap_or(0) * 400_000),
             display_offset: TimeUs(0),
@@ -540,6 +603,7 @@ fn lane_order_probes(
             gauges: &states,
             gauge: 0,
             effects: &[],
+            notes: &notes,
             complete: false,
             target: [1_920, 1_080],
             layout: &Layout::AUTHOR,
@@ -610,6 +674,7 @@ fn gauge_probes(
                 failed_at: None,
             }];
             batch.clear();
+            let notes = eval::NoteFacts::default();
             let frame = SkinFrame {
                 now: TimeUs(i64::try_from(k).unwrap_or(0) * 16_000),
                 display_offset: TimeUs(0),
@@ -617,6 +682,7 @@ fn gauge_probes(
                 gauges: &states,
                 gauge: 0,
                 effects: &[],
+                notes: &notes,
                 complete: false,
                 target: [1_920, 1_080],
                 layout: &Layout::AUTHOR,
@@ -728,6 +794,7 @@ pub fn judged_rects(imported: &Imported, full: bool) -> Vec<[f32; 4]> {
     );
     for (ms, effects) in [(900, [gauge]), (1_000, [judged])] {
         batch.clear();
+        let notes = eval::NoteFacts::default();
         let frame = SkinFrame {
             now: TimeUs(ms * 1_000),
             display_offset: TimeUs(0),
@@ -735,6 +802,7 @@ pub fn judged_rects(imported: &Imported, full: bool) -> Vec<[f32; 4]> {
             gauges: &states,
             gauge: 0,
             effects: &effects,
+            notes: &notes,
             complete: false,
             target: [1_920, 1_080],
             layout: &Layout::AUTHOR,
@@ -839,6 +907,7 @@ fn grade_anchor_probes(
                 hidden: 0,
             };
             batch.clear();
+            let notes = eval::NoteFacts::default();
             let frame = SkinFrame {
                 now: TimeUs(now),
                 display_offset: TimeUs(0),
@@ -846,6 +915,7 @@ fn grade_anchor_probes(
                 gauges: &full,
                 gauge: 0,
                 effects: if step == 0 { &effects } else { &[] },
+                notes: &notes,
                 complete: false,
                 target,
                 layout: &Layout::AUTHOR,
@@ -1005,6 +1075,7 @@ fn digit_probes(
             },
         }];
         batch.clear();
+        let notes = eval::NoteFacts::default();
         let frame = SkinFrame {
             now,
             display_offset: TimeUs(0),
@@ -1012,6 +1083,7 @@ fn digit_probes(
             gauges: states,
             gauge: 0,
             effects: &effects,
+            notes: &notes,
             complete: false,
             target,
             layout: &Layout::AUTHOR,
@@ -1076,6 +1148,17 @@ fn long_note_probes(
                 lift: 0,
                 hidden: 0,
             };
+            // The play view's note facts: held from its head on.
+            let mut notes = eval::NoteFacts::new(&chart);
+            if ms >= 1_000 {
+                notes.set_done(lane, 0);
+                let hold = eval::NoteHold {
+                    note: 0,
+                    start: TimeUs(1_000_000),
+                    end: TimeUs(4_000_000),
+                };
+                notes.set_hold(lane, Some(hold));
+            }
             let frame = SkinFrame {
                 now: TimeUs(ms * 1_000),
                 display_offset: TimeUs(0),
@@ -1083,6 +1166,7 @@ fn long_note_probes(
                 gauges,
                 gauge: 0,
                 effects,
+                notes: &notes,
                 complete: false,
                 target: [1_920, 1_080],
                 layout: &Layout::AUTHOR,
@@ -1139,6 +1223,7 @@ fn bar_probes(
             lift,
             hidden: 0,
         };
+        let notes = eval::NoteFacts::default();
         let frame = SkinFrame {
             now: TimeUs(ms * 1_000),
             display_offset: TimeUs(offset * 1_000),
@@ -1146,6 +1231,7 @@ fn bar_probes(
             gauges,
             gauge: 0,
             effects: &[],
+            notes: &notes,
             complete: false,
             target: [1_920, 1_080],
             layout: &Layout::AUTHOR,
@@ -1238,6 +1324,7 @@ fn choice_probes(
             empty_poor: 0,
         };
         batch.clear();
+        let notes = eval::NoteFacts::default();
         let frame = SkinFrame {
             now: TimeUs(now),
             display_offset: TimeUs(0),
@@ -1245,6 +1332,7 @@ fn choice_probes(
             gauges: &states,
             gauge: 0,
             effects: &[],
+            notes: &notes,
             complete: false,
             target: [1_920, 1_080],
             layout: &Layout::AUTHOR,
@@ -1324,6 +1412,7 @@ fn rate_and_kind_probes(
         .flat_map(|(ks, s)| ks.map(move |k| (k, s)))
         {
             batch.clear();
+            let notes = eval::NoteFacts::default();
             let frame = SkinFrame {
                 now: TimeUs(2_000_000),
                 display_offset: TimeUs(0),
@@ -1331,6 +1420,7 @@ fn rate_and_kind_probes(
                 gauges: snapshot,
                 gauge: k,
                 effects: &[],
+                notes: &notes,
                 complete: false,
                 target: [1_920, 1_080],
                 layout: &Layout::AUTHOR,
@@ -1557,6 +1647,7 @@ fn readout_probes(
                 hidden: effective(on, hidden),
             };
             batch.clear();
+            let notes = eval::NoteFacts::default();
             let frame = SkinFrame {
                 now: TimeUs(now_ms * 1_000),
                 display_offset: TimeUs(0),
@@ -1564,6 +1655,7 @@ fn readout_probes(
                 gauges: &states,
                 gauge: 0,
                 effects: &[],
+                notes: &notes,
                 complete: false,
                 target: [1_920, 1_080],
                 layout: &Layout::AUTHOR,
@@ -2023,7 +2115,7 @@ fn check_fnt(f: &FntFile) {
     }
     for k in f.kernings() {
         assert!(
-            f.glyph(u32::from(k.first)).is_some(),
+            f.glyph(k.first).is_some(),
             "a kerning pair without its first glyph"
         );
     }

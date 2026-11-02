@@ -14,7 +14,8 @@
 //! cover paint showing its table ([`Lowered::Paint`]).
 
 use skin_model::{
-    CoverImage, CycleDef, ImageChoiceDef, ImageChoicePart, ImageSpan, Program, Source, Track, Ty,
+    CoverImage, CycleDef, ImageChoiceDef, ImageChoicePart, ImageSpan, PastTable, Program, Source,
+    Track, Ty,
 };
 
 use super::super::policy::{CriticalPart, Role};
@@ -364,9 +365,11 @@ impl Cx<'_> {
         let t = self.model_track(&c, &rects)?;
         c.display_deviation |= deviates;
         let index = u32::try_from(self.widgets.image_choices.len()).unwrap_or(u32::MAX);
-        self.widgets
-            .image_choices
-            .push(ImageChoiceDef { value, choices });
+        self.widgets.image_choices.push(ImageChoiceDef {
+            value,
+            choices,
+            past_table: PastTable::First,
+        });
         match lowered {
             Lowered::Image => self.push(c, Source::ImageChoice(index), t),
             Lowered::Paint => self.push_paint(c, CoverImage::Choice(index), None, t, None),

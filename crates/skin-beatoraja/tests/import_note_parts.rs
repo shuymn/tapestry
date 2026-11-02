@@ -1,5 +1,6 @@
 //! Note parts: ids that name no image draw the source's generated paint;
-//! malformed arrays, an unsized unresolved tap and broken images refuse;
+//! malformed drawn arrays, an unsized unresolved tap and broken images
+//! refuse, and undrawn data is not checked;
 //! the body aliases, the tail suppression and the exact note heights.
 
 mod common;
@@ -291,9 +292,9 @@ fn part_refusals_are_located_in_the_note_record() {
 }
 
 #[test]
-fn malformed_selected_arrays_refuse() {
+fn malformed_drawn_arrays_refuse() {
     let mines = format!("{}, ", list("mine", "mi"));
-    let cases: [(&str, String, &str, PartWhy); 9] = [
+    let cases: [(&str, String, &str, PartWhy); 7] = [
         ("mine", mines.clone(), "", PartWhy::Missing),
         ("mine", list("mine", "mi"), r#""mine": null"#, PartWhy::Null),
         (
@@ -308,13 +309,6 @@ fn malformed_selected_arrays_refuse() {
             r#""mine": ["mi", "mi", "mi", "mi", "mi", "mi", "mi"]"#,
             PartWhy::Length { len: 7, need: 8 },
         ),
-        // A trailing entry past the lanes is checked too.
-        (
-            "mine",
-            list("mine", "mi"),
-            r#""mine": ["mi", "mi", "mi", "mi", "mi", "mi", "mi", "mi", null]"#,
-            PartWhy::NullEntry { index: 8 },
-        ),
         (
             "note",
             list("note", "nt"),
@@ -327,81 +321,83 @@ fn malformed_selected_arrays_refuse() {
             r#""note": ["nt", "nt", {}, "nt", "nt", "nt", "nt", "nt"]"#,
             PartWhy::BadEntry { index: 2 },
         ),
-        // Every long-note array covers `lnend`'s length.
         (
             "lnstart",
-            list("lnend", "le"),
-            r#""lnend": ["le", "le", "le", "le", "le", "le", "le", "le", "le"]"#,
-            PartWhy::Length { len: 8, need: 9 },
-        ),
-        (
-            "hcnbody",
-            list("hcnbody", "lb"),
-            r#""hcnbody": ["lb"]"#,
-            PartWhy::Length { len: 1, need: 8 },
+            list("lnstart", "ls"),
+            r#""lnstart": ["ls", "ls", "ls", "ls", "ls", "ls", "ls", null]"#,
+            PartWhy::NullEntry { index: 7 },
         ),
     ];
     for (field, from, to, why) in cases {
         part_refused(lanes_edit(&[(&from, to)], ""), field, why);
     }
-    // A `lnend` of nine and every selected array of nine loads.
-    let nine = |id: &str| format!("[{}]", vec![format!("\"{id}\""); 9].join(", "));
-    let mut edits = Vec::new();
+}
+
+/// Only what the lanes draw is checked: the eight lanes' entries of the
+/// six drawn arrays. Entries past the lanes, a `lnend` longer than the
+/// other long-note arrays, and the HCN arrays, which only add a note,
+/// may be anything.
+#[test]
+fn undrawn_part_data_is_not_checked() {
+    let nine = |id: &str, last: &str| {
+        let mut v = vec![format!("\"{id}\""); 8];
+        v.push(last.to_owned());
+        format!("[{}]", v.join(", "))
+    };
+    // `note` must have exactly eight; the others any past the lanes.
     for (field, id) in [
         ("lnstart", "ls"),
         ("lnend", "le"),
         ("lnbody", "lb"),
         ("lnactive", "la"),
-        ("hcnstart", "ls"),
-        ("hcnend", "le"),
-        ("hcnbody", "lb"),
-        ("hcnactive", "la"),
-        ("hcndamage", "lb"),
-        ("hcnreactive", "la"),
+        ("mine", "mi"),
     ] {
-        edits.push((list(field, id), format!(r#""{field}": {}"#, nine(id))));
+        for last in ["null", "{}", "[]"] {
+            let to = format!(r#""{field}": {}"#, nine(id, last));
+            lanes_edit(&[(&list(field, id), &to)], "").ok();
+        }
     }
-    let edits: Vec<(&str, &str)> = edits.iter().map(|(a, b)| (&a[..], &b[..])).collect();
-    lanes_edit(&edits, "").ok();
+    let le = format!(r#""lnend": {}"#, nine("le", r#""le""#));
+    lanes_edit(&[(&list("lnend", "le"), &le)], "").ok();
+    for to in [
+        r#""hcnbody": ["lb"]"#,
+        r#""hcnbody": null"#,
+        r#""hcnbody": 7"#,
+    ] {
+        lanes_edit(&[(&list("hcnbody", "lb"), to)], "").ok();
+    }
+    let hcn = format!(r#""hcnstart": {}, "#, eight("ls"));
+    lanes_edit(&[(&hcn, r#""hcnstart": [null], "#)], "").ok();
 }
 
 #[test]
 fn body_aliases_keep_their_selection() {
     let active = format!(r#""lnbodyActive": {}"#, eight("deco"));
-    // With `lnbodyActive`, `lnactive` is an unselected alias: absent is
-    // fine, supplied it must be well formed.
+    // With `lnbodyActive`, `lnactive` is not drawn: absent or anything
+    // supplied, the lanes load.
     let drop_active = format!(", {}", list("lnactive", "la"));
     let l = lanes_edit(&[(&drop_active, "")], &active);
     assert_eq!(l.report().usage.images, 6);
-    part_refused(
-        lanes_edit(&[(&list("lnactive", "la"), r#""lnactive": null"#)], &active),
-        "lnactive",
-        PartWhy::Null,
-    );
+    for to in [r#""lnactive": null"#, r#""lnactive": ["la", null]"#] {
+        lanes_edit(&[(&list("lnactive", "la"), to)], &active).ok();
+    }
+    // Without it, `lnactive` is drawn and required; an empty or `null`
+    // `lnbodyActive` selects the same.
+    for extra in ["", r#""lnbodyActive": []"#, r#""lnbodyActive": null"#] {
+        part_refused(
+            lanes_edit(&[(&drop_active, "")], extra),
+            "lnactive",
+            PartWhy::Missing,
+        );
+    }
+    // The selected `lnbodyActive` is drawn and checked.
     part_refused(
         lanes_edit(
-            &[(&list("lnactive", "la"), r#""lnactive": ["la", null]"#)],
-            &active,
+            &[],
+            r#""lnbodyActive": ["d", "d", "d", "d", "d", "d", "d"]"#,
         ),
-        "lnactive",
-        PartWhy::NullEntry { index: 1 },
-    );
-    // Without it, `lnactive` is selected and required; an empty
-    // `lnbodyActive` selects the same.
-    part_refused(
-        lanes_edit(&[(&drop_active, "")], ""),
-        "lnactive",
-        PartWhy::Missing,
-    );
-    part_refused(
-        lanes_edit(&[(&drop_active, "")], r#""lnbodyActive": []"#),
-        "lnactive",
-        PartWhy::Missing,
-    );
-    part_refused(
-        lanes_edit(&[], r#""lnbodyActive": null"#),
         "lnbodyActive",
-        PartWhy::Null,
+        PartWhy::Length { len: 7, need: 8 },
     );
     // The fallback field names follow the selection.
     let l = lanes_edit(
@@ -410,17 +406,9 @@ fn body_aliases_keep_their_selection() {
     );
     assert!(fallbacks(&l).iter().all(|e| e.0 == "lnbodyActive"));
     assert_eq!(fallbacks(&l).len(), 8);
-    // The HCN branch: with `hcnbodyActive`, its reactive and miss
-    // bodies are selected; `hcnactive` is not.
-    let hcn = format!(
-        r#""hcnbodyActive": {}, "hcnbodyReactive": {}"#,
-        eight("lb"),
-        eight("la")
-    );
-    part_refused(lanes_edit(&[], &hcn), "hcnbodyMiss", PartWhy::Missing);
-    let full = format!(r#"{hcn}, "hcnbodyMiss": {}"#, eight("lb"));
-    let drop_hcn = format!(r#""hcnactive": {}, "#, eight("la"));
-    lanes_edit(&[(&drop_hcn, "")], &full).ok();
+    // HCN arrays are not drawn: a partial set loads.
+    let hcn = format!(r#""hcnbodyActive": {}"#, eight("lb"));
+    lanes_edit(&[], &hcn).ok();
 }
 
 #[test]
@@ -429,13 +417,19 @@ fn sizes_are_exact() {
     // Equal values however spelled.
     let l = sizes("20, 20.0, 2e1, 200E-1, +20, 20.000, 0.2e2, 20");
     assert_eq!(l.result.as_ref().map(|_| ()).ok(), Some(()));
-    // Two values one `f32` would merge stay unequal.
+    // Unequal values load, each lane its own; the fit is checked on the
+    // exact value before any conversion: 610.0000001 passes the lanes' top
+    // by 10^-7 and refuses, though its `f32` is 610, which fits.
     let l = sizes(
         "20.000001, 20.000001, 20.000001, 20.000001, 20.000001, 20.000001, 20.000001, 20.0000011",
     );
+    assert_eq!(l.result.as_ref().map(|_| ()).ok(), Some(()));
+    assert_eq!(610.000_000_1_f32, 610.0);
+    sizes("20, 20, 20, 610, 20, 20, 20, 20").ok();
+    let l = sizes("20, 20, 20, 610.0000001, 20, 20, 20, 20");
     match l.err() {
         ImportError::Critical {
-            why: NoteKind::UnsupportedField { field: "size" },
+            why: NoteKind::UnsupportedField { field: "offset" },
             ..
         } => {}
         e => panic!("{e:?}"),

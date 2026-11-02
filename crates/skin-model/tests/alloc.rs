@@ -24,7 +24,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bms_model::{Chart, ChartBuilder, Lane, NoteKind, SoundId, TimeUs};
-use eval::{GaugeState, JudgeEvent, JudgeEventKind, Section, Tally};
+use eval::{GaugeState, JudgeEvent, JudgeEventKind, NoteFacts, Section, Tally};
 use image_support::{dir, file, save, solid, whole};
 use play_support::{bool_program, readouts_for, state, tally};
 use rules::{GaugeValue, Judgment};
@@ -831,6 +831,7 @@ fn image_choice_tables(
     };
     let combo = ImageChoiceDef {
         value: int("elapsed(ready) / 40 % 7 - 2"),
+        past_table: skin_model::PastTable::Hide,
         choices: vec![
             Some(ImageChoicePart {
                 cycle: cycle(300, timer::READY),
@@ -850,6 +851,7 @@ fn image_choice_tables(
     };
     let looks = ImageChoiceDef {
         value: int(GAUGE_LOOK),
+        past_table: skin_model::PastTable::Hide,
         choices: (0..6)
             .map(|k| {
                 Some(ImageChoicePart {
@@ -865,6 +867,7 @@ fn image_choice_tables(
     };
     let tempo = ImageChoiceDef {
         value: int("if bpm.current_valid then bpm.current_x100 / 100 % 3 else -1"),
+        past_table: skin_model::PastTable::Hide,
         choices: vec![Some(part(GRADES, 0, 1)), Some(part(GRADES + 1, 0, 1)), None],
     };
     vec![combo, looks, tempo]
@@ -1467,6 +1470,8 @@ fn stretch(
     loaded: &Loaded,
     views: &Views,
     play: &mut Play,
+    chart: &Chart,
+    notes: &mut NoteFacts,
     events: &[JudgeEvent],
     tally: &mut Tally,
     gauges: &mut [GaugeState],
@@ -1499,8 +1504,9 @@ fn stretch(
         }
         let drain = &events[next..next + take];
         next += take;
-        // The snapshot follows the drain.
+        // The snapshot follows the drain, its note facts too.
         for e in drain {
+            play_support::follow(notes, chart, e);
             match e.kind {
                 JudgeEventKind::Judged {
                     combo, judgment, ..
@@ -1549,6 +1555,7 @@ fn stretch(
             gauges,
             gauge: shown,
             effects: drain,
+            notes,
             complete: now > last,
             target: TARGETS[target_no],
             layout: &views.layouts[layout_no],
@@ -1713,6 +1720,7 @@ fn build_does_not_allocate() {
         let to = events.last().unwrap().time.0 + 1_000 * MS;
         let mut w = Witness::new();
         let counted = ctx.empty_poor_counted;
+        let mut notes = NoteFacts::new(&chart);
 
         TRACK.with(|t| t.set(true));
         // The count works: an allocation that escapes is counted in any
@@ -1723,6 +1731,8 @@ fn build_does_not_allocate() {
             &loaded,
             &views,
             &mut play,
+            &chart,
+            &mut notes,
             events,
             &mut tally,
             &mut gauges,
@@ -1835,6 +1845,7 @@ fn build_does_not_allocate() {
     let t = tally(0);
     let gauges = [descs[0].start, descs[1].start].map(state);
     batch.clear();
+    let notes = NoteFacts::default();
     let frame = SkinFrame {
         now: TimeUs(5_000 * MS),
         display_offset: TimeUs(0),
@@ -1842,6 +1853,7 @@ fn build_does_not_allocate() {
         gauges: &gauges,
         gauge: 0,
         effects: &[],
+        notes: &notes,
         complete: false,
         target: TARGETS[0],
         layout: &views.layouts[0],
@@ -1907,6 +1919,7 @@ fn build_does_not_allocate() {
     TRACK.with(|t| t.set(true));
     for ms in (0..2_000).step_by(16) {
         batch.clear();
+        let notes = NoteFacts::default();
         let frame = SkinFrame {
             now: TimeUs(ms * MS),
             display_offset: TimeUs(0),
@@ -1914,6 +1927,7 @@ fn build_does_not_allocate() {
             gauges: &gauges,
             gauge: 0,
             effects: &[],
+            notes: &notes,
             complete: false,
             target: TARGETS[0],
             layout: &views.layouts[0],
@@ -2204,6 +2218,7 @@ fn source_lanes_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
             lift,
             hidden: hidden_view,
         };
+        let notes = NoteFacts::default();
         let frame = SkinFrame {
             now: TimeUs(now),
             display_offset: TimeUs(0),
@@ -2211,6 +2226,7 @@ fn source_lanes_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
             gauges: &gauges,
             gauge: 0,
             effects: &[],
+            notes: &notes,
             complete: false,
             target: TARGETS[i % TARGETS.len()],
             layout: &layout,
@@ -2294,6 +2310,7 @@ fn fallback_lanes_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
         let mut c = chart.clone();
         c.meta.ln_mode = Some(mode);
         let mut play = skin.prepare(&c, ctx).unwrap();
+        let mut notes = NoteFacts::new(&c);
         let mut next = 0;
         let (mut taps, mut longs, mut mines, mut max_longs) = (0_usize, 0_usize, 0_usize, 0);
         TRACK.with(|t| t.set(true));
@@ -2309,6 +2326,9 @@ fn fallback_lanes_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
             let n = rest.partition_point(|e| e.time.0 <= now);
             let drain = rest.get(..n).unwrap_or_default();
             next += n;
+            for e in drain {
+                play_support::follow(&mut notes, &c, e);
+            }
             let frame = SkinFrame {
                 now: TimeUs(now),
                 display_offset: TimeUs(0),
@@ -2316,6 +2336,7 @@ fn fallback_lanes_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
                 gauges: &gauges,
                 gauge: 0,
                 effects: drain,
+                notes: &notes,
                 complete: false,
                 target: TARGETS[i % TARGETS.len()],
                 layout: &layout,
@@ -2352,6 +2373,7 @@ fn fallback_lanes_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
                 gauges: &gauges,
                 gauge: 0,
                 effects: &[],
+                notes: &notes,
                 complete: false,
                 target: TARGETS[0],
                 layout: &layout,
@@ -2467,6 +2489,7 @@ fn timeline_lanes_do_not_allocate(full: &PlayContext<'_>) {
             let events = effects(&chart, section, false);
             let from = section.map_or(0, |s| s.start.0 - s.lead_in.0);
             let mut play = skin.prepare(&chart, ctx).unwrap();
+            let mut notes = NoteFacts::new(&chart);
             let mut next = 0;
             TRACK.with(|t| t.set(true));
             for (i, now) in (from..from + 9_000 * MS)
@@ -2484,6 +2507,9 @@ fn timeline_lanes_do_not_allocate(full: &PlayContext<'_>) {
                 let n = rest.partition_point(|e| e.time.0 <= now).min(DRAIN);
                 let drain = rest.get(..n).unwrap_or_default();
                 next += n;
+                for e in drain {
+                    play_support::follow(&mut notes, &chart, e);
+                }
                 let frame = SkinFrame {
                     now: TimeUs(now),
                     display_offset: TimeUs(0),
@@ -2491,6 +2517,7 @@ fn timeline_lanes_do_not_allocate(full: &PlayContext<'_>) {
                     gauges: &gauges,
                     gauge: 0,
                     effects: drain,
+                    notes: &notes,
                     complete: false,
                     target: TARGETS[i % TARGETS.len()],
                     layout: &layout,
@@ -2517,6 +2544,7 @@ fn timeline_lanes_do_not_allocate(full: &PlayContext<'_>) {
             let reps = play.playhead().representatives().as_ptr();
             for r in 0..3_i64 {
                 play.rearm();
+                notes.reset();
                 for k in 0..5_i64 {
                     let lanes = LaneView {
                         visible_time: TimeUs(600 * MS),
@@ -2531,6 +2559,7 @@ fn timeline_lanes_do_not_allocate(full: &PlayContext<'_>) {
                         gauges: &gauges,
                         gauge: 0,
                         effects: &[],
+                        notes: &notes,
                         complete: false,
                         target: TARGETS[0],
                         layout: &layout,
@@ -2563,6 +2592,7 @@ fn timeline_lanes_do_not_allocate(full: &PlayContext<'_>) {
                     gauges: &gauges,
                     gauge: 0,
                     effects: &[],
+                    notes: &notes,
                     complete: false,
                     target: TARGETS[0],
                     layout: &layout,
@@ -2677,6 +2707,7 @@ fn trim_skin() -> Skin {
             skin_model::Ty::Int,
         )
         .unwrap(),
+        past_table: skin_model::PastTable::Hide,
         choices: [LIFT, HIDDEN]
             .map(|image| {
                 Some(skin_model::ImageChoicePart {
@@ -2774,6 +2805,7 @@ fn cover_trims_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
         let mut readouts = readouts_for(lanes);
         readouts.covers.hidden_enabled = on;
         let t = tally(u32::try_from(i / 17).unwrap_or(0));
+        let notes = NoteFacts::default();
         let frame = SkinFrame {
             now: TimeUs(now),
             display_offset: TimeUs(0),
@@ -2781,6 +2813,7 @@ fn cover_trims_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
             gauges: &gauges,
             gauge: 0,
             effects: &[],
+            notes: &notes,
             complete: false,
             target: TARGETS[i / 5 % TARGETS.len()],
             layout: &layout,
@@ -2826,6 +2859,7 @@ fn cover_trims_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
     let t = tally(0);
     for _ in 0..3 {
         batch.clear();
+        let notes = NoteFacts::default();
         let frame = SkinFrame {
             now: TimeUs(1_000 * MS),
             display_offset: TimeUs(0),
@@ -2833,6 +2867,7 @@ fn cover_trims_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
             gauges: &gauges,
             gauge: 0,
             effects: &[],
+            notes: &notes,
             complete: false,
             target: TARGETS[0],
             layout: &layout,
@@ -2953,6 +2988,7 @@ fn bar_groups_do_not_allocate(ctx: &PlayContext<'_>) {
     let gauges = [state(GaugeValue::FULL), state(GaugeValue::FULL)];
     let layout = SkinLayout::AUTHOR;
     // A frame at `now` µs, shown `offset` µs ahead, on the stack.
+    let notes = NoteFacts::default();
     let frame_at = |now: i64, offset: i64, target, lanes, readouts| SkinFrame {
         now: TimeUs(now),
         display_offset: TimeUs(offset),
@@ -2960,6 +2996,7 @@ fn bar_groups_do_not_allocate(ctx: &PlayContext<'_>) {
         gauges: &gauges,
         gauge: 0,
         effects: &[],
+        notes: &notes,
         complete: false,
         target,
         layout: &layout,
@@ -3206,6 +3243,7 @@ fn grade_attachments_do_not_allocate(ctx: &PlayContext<'_>) {
     for (i, now) in (0..3_000 * MS).step_by(16 * MS as usize).enumerate() {
         let judged = now >= 1_008 * MS;
         let target = TARGETS[i % TARGETS.len()];
+        let notes = NoteFacts::default();
         let frame = SkinFrame {
             now: TimeUs(now),
             display_offset: TimeUs(0),
@@ -3213,6 +3251,7 @@ fn grade_attachments_do_not_allocate(ctx: &PlayContext<'_>) {
             gauges: &gauges,
             gauge: 0,
             effects: if now == 1_008 * MS { &effects } else { &[] },
+            notes: &notes,
             complete: false,
             target,
             layout: &layout,
@@ -3353,6 +3392,7 @@ fn large_gauges_do_not_allocate(ctx: &PlayContext<'_>, views: &Views, descs: &[G
                 g.value = values[v % values.len()];
             }
             let view = views.lanes[(no / 7) % views.lanes.len()];
+            let notes = NoteFacts::default();
             let frame = SkinFrame {
                 now: TimeUs(now),
                 display_offset: TimeUs(0),
@@ -3360,6 +3400,7 @@ fn large_gauges_do_not_allocate(ctx: &PlayContext<'_>, views: &Views, descs: &[G
                 gauges: &gauges,
                 gauge: (no / 16) % 2,
                 effects: &[],
+                notes: &notes,
                 complete: false,
                 target: TARGETS[no % TARGETS.len()],
                 layout: &views.layouts[(no / 11) % views.layouts.len()],
@@ -3483,6 +3524,7 @@ fn readouts_do_not_allocate(loaded: &Loaded, descs: &[GaugeDesc]) {
         lift: 0,
         hidden: 0,
     };
+    let notes = NoteFacts::default();
     let frame = |now: i64, readouts: FrameReadouts| SkinFrame {
         now: TimeUs(now),
         display_offset: TimeUs(0),
@@ -3490,6 +3532,7 @@ fn readouts_do_not_allocate(loaded: &Loaded, descs: &[GaugeDesc]) {
         gauges: &gauges,
         gauge: 0,
         effects: &[],
+        notes: &notes,
         complete: false,
         target: TARGETS[0],
         layout: &SkinLayout::AUTHOR,

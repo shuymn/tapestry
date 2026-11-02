@@ -525,7 +525,7 @@ fn note_part_refusal(name: &str) -> Option<Option<NoteKind>> {
     use skin_beatoraja::PartWhy;
     let part = |field, why| Some(Some(NoteKind::NotePart { field, why }));
     match name {
-        "note_parts_null" => part("mine", PartWhy::NullEntry { index: 8 }),
+        "note_parts_null" => part("mine", PartWhy::NullEntry { index: 7 }),
         "note_parts_unsized" => part("note", PartWhy::MissingSize { lane: 2 }),
         "note_parts_broken" => Some(None),
         _ => None,

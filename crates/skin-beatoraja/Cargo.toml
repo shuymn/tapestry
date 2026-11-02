@@ -19,6 +19,8 @@ mlua.workspace = true
 skin-model.workspace = true
 
 [dev-dependencies]
+# The memory fixtures load charts as a session does.
+bms-parser.workspace = true
 criterion.workspace = true
 eval.workspace = true
 png.workspace = true

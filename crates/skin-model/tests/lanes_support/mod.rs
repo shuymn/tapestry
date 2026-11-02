@@ -200,7 +200,7 @@ pub fn source() -> LanesDef {
             bottom: 880.0,
             height: 600.0,
             offset_y: 0.0,
-            note_h: 20.0,
+            note_h: [20.0; 8],
         }),
         top: 270,
         line: 870,

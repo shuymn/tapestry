@@ -168,6 +168,33 @@ fn offset_four_images_off_the_lanes_follow_sudden_plus() {
     import_body(&body("", &note(""), &[none[0], none[1], &early, NOTES])).ok();
 }
 
+/// An offset-4 image's keys are read twice, by the lane probe and by the
+/// element; a clamped colour is reported once, at its key, whether it
+/// paints SUDDEN+ over the lanes or follows it beside them.
+#[test]
+fn a_clamped_colour_over_the_lanes_is_reported_once() {
+    for keys in [
+        r#"{"x": 100, "y": 0, "w": 10, "h": 10, "a": 300}"#,
+        r#"{"x": 0, "y": 0, "w": 10, "h": 10, "r": -1}"#,
+    ] {
+        let l = with("", &[&deco("", keys)]);
+        let clamped: Vec<_> = l
+            .report()
+            .notes
+            .iter()
+            .filter(|n| n.kind == NoteKind::ColourClamped)
+            .collect();
+        assert_eq!(clamped.len(), 1, "{keys}: {:?}", l.report().notes);
+        assert_eq!(clamped[0].severity, Severity::Fallback, "{keys}");
+        assert!(clamped[0].at.is_some(), "{keys}");
+        let fine = with(
+            "",
+            &[&deco("", &keys.replace("300", "255").replace("-1", "0"))],
+        );
+        assert!(!has(fine.report(), NoteKind::ColourClamped), "{keys}");
+    }
+}
+
 #[test]
 fn an_unknown_span_keeps_offset_four_critical() {
     let missing = (CriticalPart::Cover, NoteKind::MissingAsset);

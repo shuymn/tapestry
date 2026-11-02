@@ -29,6 +29,8 @@ use crate::atlas::uv::{FrameUv, UvTable};
 use crate::canvas::f32_of;
 use crate::expr::State;
 use crate::place::{Affine, Placement};
+use eval::NoteFacts;
+
 use crate::play::reducer::is_target;
 use crate::play::{Notes, Play};
 use crate::quad::{Filter, Quad, QuadBatch, RunKey};
@@ -83,14 +85,16 @@ pub enum LaneStyle {
 /// down).
 ///
 /// A note's lower edge sits `offset_y` above the raised judgment line
-/// `bottom − lift` at its judgment time, and every note, cap and mine is
-/// `note_h` high. A tap or mine is drawn while its time has not passed,
-/// judged or not (`:546-560`, `:589-593`); nothing is drawn below the
-/// line. A long note is drawn while its end's time has not passed and its
-/// end is ahead of its head, or of the line once the head has passed it
-/// (`:552`, `:577`); its body runs from its end cap's lower edge to its
-/// head cap's upper edge, and its end cap is drawn only when its release
-/// is judged on its own (`:701-727`).
+/// `bottom − lift` at its judgment time, and every note, cap and mine of
+/// a lane is that lane's `note_h` high: lanes may differ, and the lanes'
+/// common geometry (the region, its bottom and the source's line) does
+/// not depend on any of them. A tap or mine is drawn while its time has
+/// not passed, judged or not (`:546-560`, `:589-593`); nothing is drawn
+/// below the line. A long note is drawn while its end's time has not
+/// passed and its end is ahead of its head, or of the line once the head
+/// has passed it (`:552`, `:577`); its body runs from its end cap's lower
+/// edge to its head cap's upper edge, and its end cap is drawn only when
+/// its release is judged on its own (`:701-727`).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SourceLanes {
     /// Where a note's lower edge sits at its judgment time with no lift
@@ -102,8 +106,34 @@ pub struct SourceLanes {
     /// How far above the line a note's lower edge sits (the source's `y`
     /// offset), at least 0.
     pub offset_y: f32,
-    /// Every note's height, the source's note size plus its `h` offset.
-    pub note_h: f32,
+    /// Each lane's note height by [`Lane::index`], the source's note size
+    /// plus its `h` offset, unrounded: every note, cap and mine of that
+    /// lane is this high.
+    pub note_h: [f32; LANE_COUNT],
+}
+
+impl SourceLanes {
+    /// The tallest note height that fits lanes whose top is `top`: the
+    /// largest `f32` at most `bottom − offset_y − top`, that room computed
+    /// in `f64` from the stored `f32` values. A note of at most this
+    /// height lies within `[top, bottom]` at its judgment time with no
+    /// lift. The one definition of a fitting height: the load check
+    /// applies it to every lane, and the importer to the heights it
+    /// converts.
+    #[must_use]
+    pub fn max_note_h(&self, top: i32) -> f32 {
+        let room = f64::from(self.bottom) - f64::from(self.offset_y) - f64::from(top);
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "rounded to the nearest f32, then stepped down below the room"
+        )]
+        let r = room as f32;
+        if f64::from(r) > room {
+            r.next_down()
+        } else {
+            r
+        }
+    }
 }
 
 /// The order the notes of different lanes are painted in, a later note
@@ -185,7 +215,12 @@ pub struct LanesDef {
     /// The lanes' bottom: where a late note leaves them in the simple
     /// style. The source style cuts at [`SourceLanes::bottom`].
     pub bottom: i32,
+    /// The simple style's note and cap height, at least 1; the source
+    /// style's heights are its own ([`SourceLanes::note_h`]) and this is
+    /// unused there.
     pub note_h: u16,
+    /// The simple style's mine height, at least 1; unused by the source
+    /// style.
     pub mine_h: u16,
     pub line_h: u16,
     pub parts: LaneParts,
@@ -232,11 +267,13 @@ pub enum LanesError {
     ScratchNotAtSide,
     #[error("the note order does not list every lane once")]
     NoteOrder,
-    #[error(
-        "the source geometry needs a positive height and note height, an offset of at least 0, \
-         and a note at its judgment time within the lanes"
-    )]
+    #[error("the source geometry needs a positive height and an offset of at least 0")]
     Source,
+    #[error(
+        "lane {lane}'s source note height is not positive, or its note at its judgment time \
+         leaves the lanes"
+    )]
+    SourceHeight { lane: usize },
     #[error("a {part:?} image does not exist")]
     UnknownPart { part: LanePart },
     #[error("the lanes have {n} bar groups, more than {max}", max = super::bar::MAX_BAR_GROUPS)]
@@ -306,8 +343,10 @@ impl LanesDef {
             }
         }
         let [top, line, bottom] = [self.top, self.line, self.bottom].map(i64::from);
+        let simple = matches!(self.style, LaneStyle::Simple);
         if !(within(top) && within(bottom) && top < line && line <= bottom)
-            || [self.note_h, self.mine_h, self.line_h].contains(&0)
+            || self.line_h == 0
+            || (simple && (self.note_h == 0 || self.mine_h == 0))
         {
             return Err(LanesError::Heights);
         }
@@ -322,18 +361,19 @@ impl LanesDef {
             return Err(LanesError::ScratchNotAtSide);
         }
         if let LaneStyle::Source(s) = self.style {
-            let [y, h, o, n] = [s.bottom, s.height, s.offset_y, s.note_h].map(f64::from);
-            // The note at its judgment time, with no lift, lies within
-            // `[top, bottom]` (`bottom` is the source's).
+            let [y, h, o] = [s.bottom, s.height, s.offset_y].map(f64::from);
             #[expect(clippy::cast_precision_loss, reason = "within ±2^21, exact in f64")]
-            let ok = y.abs() <= max as f64
-                && h > 0.0
-                && h <= 2.0 * max as f64
-                && n > 0.0
-                && o >= 0.0
-                && y - o - n >= top as f64;
+            let ok = y.abs() <= max as f64 && h > 0.0 && h <= 2.0 * max as f64 && o >= 0.0;
             if !ok {
                 return Err(LanesError::Source);
+            }
+            // Each lane's note at its judgment time, with no lift, lies
+            // within `[top, bottom]` (`bottom` is the source's).
+            let max_h = s.max_note_h(self.top);
+            for (lane, &n) in s.note_h.iter().enumerate() {
+                if !(n > 0.0 && n <= max_h) {
+                    return Err(LanesError::SourceHeight { lane });
+                }
             }
         }
         if self.note_order.ranks().is_none() {
@@ -514,9 +554,10 @@ impl Lanes {
 
 /// What the lanes draw from this frame.
 pub(crate) struct Draw<'a> {
-    /// The attempt whose notes and bar lines the lanes draw; `None` draws
-    /// the judgment line alone (the loading state's chart-free lanes).
-    pub(crate) play: Option<&'a Play>,
+    /// The attempt whose notes and bar lines the lanes draw, with the
+    /// frame's note facts; `None` draws the judgment line alone (the
+    /// loading state's chart-free lanes).
+    pub(crate) play: Option<(&'a Play, &'a NoteFacts)>,
     /// The timers' starts, which the parts' cycles and the bar groups read.
     pub(crate) starts: Starts<'a>,
     /// The frame's fields and timers, which the bar groups' visibilities
@@ -730,7 +771,7 @@ impl Lanes {
     /// nothing.
     pub(crate) fn draw(&self, d: &Draw<'_>, scratch: Option<&mut BarScratch>, out: &mut QuadBatch) {
         let g = d.frame;
-        let Some(play) = d.play else {
+        let Some((play, facts)) = d.play else {
             self.line(&mut Pen::new(d, out), f32_of(g.line_y));
             return;
         };
@@ -755,7 +796,7 @@ impl Lanes {
             self.bars(&mut pen, notes, &scale, scratch);
         }
         match self.style {
-            LaneStyle::Simple => self.simple(&mut pen, play, &scale, g.span, ringing_out),
+            LaneStyle::Simple => self.simple(&mut pen, play, facts, &scale, g.span, ringing_out),
             LaneStyle::Source(s) => self.source(&mut pen, play, &scale, s, g.span, ringing_out),
         }
     }
@@ -896,6 +937,7 @@ impl Lanes {
         &self,
         pen: &mut Pen<'_, '_>,
         play: &Play,
+        facts: &NoteFacts,
         scale: &Scale,
         span: f64,
         ringing_out: bool,
@@ -924,16 +966,22 @@ impl Lanes {
             notes,
             |list| list.partition_point(|n| n.end_pos() < from),
             Some(to),
-            |pen, l, i, n| self.simple_note(pen, play, scale, l, i, n),
+            |pen, l, i, n| self.simple_note(pen, play, facts, scale, l, i, n),
         );
     }
 
     /// Note `i` of lane `l` as the simple skin draws it; `false` once the
-    /// frame's lanes stop.
+    /// frame's lanes stop. A judged tap and a hit mine are gone, by the
+    /// frame's note facts.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the frame's facts and scale beside the note"
+    )]
     fn simple_note(
         &self,
         pen: &mut Pen<'_, '_>,
         play: &Play,
+        facts: &NoteFacts,
         scale: &Scale,
         l: &LaneOf<'_>,
         i: usize,
@@ -943,7 +991,7 @@ impl Lanes {
         let Some(notes) = play.notes() else {
             return true;
         };
-        if play.done(l.lane.index(), i) {
+        if !matches!(n.kind, NoteKind::Long { .. }) && facts.is_done(l.lane, i) {
             return true;
         }
         let (x, w, line) = (l.x, l.w, f32_of(scale.line_y));
@@ -989,8 +1037,10 @@ impl Lanes {
         ringing_out: bool,
     ) {
         let range = (span > 0.0).then(|| {
-            // A note's lower edge sits `offset_y` above its position's y.
-            let pad = s.note_h;
+            // A note's lower edge sits `offset_y` above its position's y;
+            // the tallest lane's note pads every lane's window, which can
+            // only visit more candidates, each drawn at its own height.
+            let pad = s.note_h.iter().copied().fold(0.0_f32, f32::max);
             let (from, to) = scale.positions(
                 f32_of(f64::from(s.bottom) - scale.line_y) + s.offset_y + pad,
                 f32_of(scale.line_y - f64::from(self.top)) + pad,
@@ -1016,7 +1066,7 @@ impl Lanes {
                 None => list.partition_point(|n| n.time < display),
             },
             range.map(|[_, to]| to),
-            |pen, l, i, n| self.source_note(pen, play, scale, s, range, l, i, n),
+            |pen, l, i, n| self.source_note(pen, play, scale, s.offset_y, range, l, i, n),
         );
     }
 
@@ -1024,14 +1074,14 @@ impl Lanes {
     /// the frame's lanes stop.
     #[expect(
         clippy::too_many_arguments,
-        reason = "the frame's scale and source geometry beside the note"
+        reason = "the frame's scale and the source's offset beside the note"
     )]
     fn source_note(
         &self,
         pen: &mut Pen<'_, '_>,
         play: &Play,
         scale: &Scale,
-        s: SourceLanes,
+        offset_y: f32,
         range: Option<[Position; 2]>,
         l: &LaneOf<'_>,
         i: usize,
@@ -1044,7 +1094,7 @@ impl Lanes {
         if !is_target(notes.section, n.time, n.end()) {
             return true;
         }
-        let (x, w, oy, nh) = (l.x, l.w, s.offset_y, s.note_h);
+        let (x, w, oy, nh) = (l.x, l.w, offset_y, l.note_h);
         match n.kind {
             // Judged or not, until its time passes.
             NoteKind::Tap | NoteKind::Mine { .. } => {
@@ -1196,6 +1246,9 @@ struct LaneOf<'n> {
     hi: usize,
     x: f32,
     w: f32,
+    /// The lane's note height in the source style; the simple style's
+    /// nominal note height otherwise.
+    note_h: f32,
     note: Shown,
     head: Shown,
     tail: Shown,
@@ -1233,6 +1286,10 @@ impl<'n> LaneOf<'n> {
             hi,
             x: f32_of(x),
             w: f32_of(w),
+            note_h: match lanes.style {
+                LaneStyle::Source(s) => s.note_h.get(l).copied().unwrap_or(0.0),
+                LaneStyle::Simple => lanes.note_h,
+            },
             note: d.shown(note),
             head: d.shown(head),
             tail: d.shown(tail),

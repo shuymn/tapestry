@@ -20,6 +20,7 @@ use crate::gauge::{Cause, GaugeState, Gauges};
 use crate::input::{
     ControlId, DeviceProfile, InputStart, PhysicalInputEvent, Section, SourceId, evaluation_time,
 };
+use crate::notes::{NoteFacts, NoteHold};
 
 /// The bytes of one event of the evaluator's output.
 pub const EVENT_BYTES: usize = size_of::<JudgeEvent>();
@@ -374,6 +375,8 @@ pub struct Evaluator<'a> {
     gauges: Gauges,
     seq: u64,
     tally: Tally,
+    /// Each note's state and each lane's visual hold, for drawing.
+    notes: NoteFacts,
 }
 
 /// Why [`Evaluator::push_input`] refused an input. The evaluator is left
@@ -596,6 +599,7 @@ impl<'a> Evaluator<'a> {
             ),
             seq: 0,
             tally: Tally::new(),
+            notes: NoteFacts::new(chart),
         })
     }
 
@@ -638,6 +642,15 @@ impl<'a> Evaluator<'a> {
         self.gauges.reset();
         self.seq = 0;
         self.tally = Tally::new();
+        self.notes.reset();
+    }
+
+    /// Each note's state and each lane's visual long-note hold as of the
+    /// last advance: what drawing takes from the play beside the totals
+    /// and gauges. A [`reset`](Self::reset) clears it in place.
+    #[must_use]
+    pub const fn notes(&self) -> &NoteFacts {
+        &self.notes
     }
 
     /// Every gauge's state, in the preset's order.
@@ -701,11 +714,21 @@ impl<'a> Evaluator<'a> {
 
     /// The allowance for the evaluator's own tables:
     /// [`TABLE_BYTES_PER_OBJECT`] per object of every lane of the chart, a
-    /// section's evaluation included.
+    /// section's evaluation included, and its note facts' exact bits
+    /// ([`NoteFacts::heap_bytes_for`]).
     #[must_use]
     pub fn table_bytes(&self) -> usize {
         let objects: usize = self.chart.lanes.iter().map(Vec::len).sum();
-        objects.saturating_mul(TABLE_BYTES_PER_OBJECT)
+        objects
+            .saturating_mul(TABLE_BYTES_PER_OBJECT)
+            .saturating_add(self.note_bytes())
+    }
+
+    /// The heap bytes of the note facts ([`notes`](Self::notes)): what
+    /// each copy of them holds.
+    #[must_use]
+    pub fn note_bytes(&self) -> usize {
+        NoteFacts::heap_bytes_for(self.chart)
     }
 
     /// The most bytes [`evaluate`](crate::evaluate) holds at its peak for a
@@ -897,6 +920,7 @@ impl<'a> Evaluator<'a> {
                 let note = state.targets[d.index];
                 if visual {
                     state.visual = None;
+                    self.notes.set_hold(lane_of(lane), None);
                 }
                 if held.is_some() {
                     state.holding = None;
@@ -927,6 +951,7 @@ impl<'a> Evaluator<'a> {
                         NoteKind::Mine { damage } => damage,
                         NoteKind::Tap | NoteKind::Long { .. } => 0,
                     };
+                    self.notes.set_done(lane_of(lane), d.index);
                     let kind = JudgeEventKind::MineHit {
                         lane: lane_of(lane),
                         note: d.index,
@@ -1148,28 +1173,36 @@ impl<'a> Evaluator<'a> {
                 NoteKind::Long { end, .. } => match self.rule.ln_mode.late_head {
                     // A head pressed at or after its end decides the long
                     // note at the press; the following release is ignored.
-                    LateHeadRule::CompletesAtPress => t < end,
+                    LateHeadRule::CompletesAtPress => (t < end).then_some(end),
                 },
-                NoteKind::Tap | NoteKind::Mine { .. } => false,
+                NoteKind::Tap | NoteKind::Mine { .. } => None,
             };
-            if !before_end {
+            let Some(end) = before_end else {
                 self.judge(lane, k, judgment, Some(deviation), t, Some(origin), out);
                 return;
-            }
+            };
             #[expect(
                 clippy::indexing_slicing,
                 reason = "`lane` comes from `Lane::index`, below LANE_COUNT"
             )]
             let state = &mut self.lanes[lane];
             // A press edge needs the lane released, and every release ends
-            // both holds, so neither is set here.
+            // both holds, so neither is set here. A BAD head's visual hold
+            // is kept though the note is scored at once.
             state.visual = Some(k);
+            let hold = NoteHold {
+                note: index,
+                start: t,
+                end,
+            };
+            self.notes.set_hold(lane_of(lane), Some(hold));
             if judgment == Judgment::Bad {
                 // No release can better a BAD head: decided at the press.
                 self.judge(lane, k, judgment, Some(deviation), t, Some(origin), out);
                 return;
             }
             state.mark_judged(k);
+            self.notes.set_done(lane_of(lane), index);
             state.holding = Some(Held {
                 target: k,
                 judgment,
@@ -1233,6 +1266,7 @@ impl<'a> Evaluator<'a> {
         )]
         let visual = visual.map(|k| state.targets[k]);
         if let Some(note) = visual {
+            self.notes.set_hold(lane_of(lane), None);
             let kind = JudgeEventKind::LnHoldEnded {
                 lane: lane_of(lane),
                 note,
@@ -1284,7 +1318,11 @@ impl<'a> Evaluator<'a> {
             clippy::indexing_slicing,
             reason = "`lane` comes from `Lane::index`, below LANE_COUNT"
         )]
-        self.lanes[lane].mark_judged(target);
+        let state = &mut self.lanes[lane];
+        state.mark_judged(target);
+        if let Some(&note) = state.targets.get(target) {
+            self.notes.set_done(lane_of(lane), note);
+        }
         self.score(lane, target, judgment, deviation, None, time, origin, out);
     }
 

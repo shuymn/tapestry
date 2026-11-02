@@ -215,6 +215,10 @@ pub struct Logic<'a, R = SourceReader> {
     render: RenderSink,
     sinks: Vec<Box<dyn EventSink + Send + 'a>>,
     view: ViewWriter,
+    /// The READY candidate's rearms so far ([`PlayView::generation`]).
+    generation: u64,
+    /// The latest rearm's origin ([`PlayView::origin`]).
+    origin: Option<TimeUs>,
     /// The play phase the next publication carries ([`PlayView::playing`]).
     playing: bool,
     finalized: Option<TimeUs>,
@@ -295,10 +299,15 @@ impl<'a, R: SourceRead> Logic<'a, R> {
             })
             .collect();
         let sources = vec![Source::default(); n];
+        // Each of the view's three buffers takes a copy of this one, the
+        // note facts sized for the chart (`Reservation`).
         let initial = PlayView {
+            generation: 0,
+            origin: None,
             finalized: None,
             tally: *evaluator.tally(),
             gauges: evaluator.gauges().to_vec(),
+            notes: evaluator.notes().clone(),
             complete: false,
             playing: false,
             events: 0,
@@ -324,6 +333,8 @@ impl<'a, R: SourceRead> Logic<'a, R> {
             render,
             sinks,
             view,
+            generation: 0,
+            origin: None,
             playing: false,
             finalized: None,
             overflowed: false,
@@ -565,9 +576,12 @@ impl<'a, R: SourceRead> Logic<'a, R> {
     #[must_use]
     pub fn view(&self) -> PlayView {
         PlayView {
+            generation: self.generation,
+            origin: self.origin,
             finalized: self.finalized,
             tally: *self.evaluator.tally(),
             gauges: self.evaluator.gauges().to_vec(),
+            notes: self.evaluator.notes().clone(),
             complete: self.evaluator.is_complete(),
             playing: self.playing,
             events: self.emitted,
@@ -632,9 +646,10 @@ impl<'a, R: SourceRead> Logic<'a, R> {
     /// Lifecycle", the start gate): the cancelled candidate's evaluator is
     /// discarded whole ([`Evaluator::reset`]), never rewound or merged;
     /// its staging, record, publications, effects and sinks start over,
-    /// and the view is published afresh. The readers must be back. Nothing
-    /// is allocated while `start` fits the reserved snapshot
-    /// ([`reserve_start`](Self::reserve_start)).
+    /// and the view is published afresh, after the render sink's rearm,
+    /// as the next generation with `origin` and the cleared note facts.
+    /// The readers must be back. Nothing is allocated while `start` fits
+    /// the reserved snapshot ([`reserve_start`](Self::reserve_start)).
     pub fn rearm(&mut self, start: &InputStart, origin: TimeUs) {
         self.evaluator.reset(start);
         self.start.opened_at = start.opened_at;
@@ -655,6 +670,8 @@ impl<'a, R: SourceRead> Logic<'a, R> {
         self.finalized = None;
         self.overflowed = false;
         self.aborted = None;
+        self.generation += 1;
+        self.origin = Some(origin);
         self.render.rearm(origin);
         for sink in &mut self.sinks {
             sink.rearm(origin);
@@ -686,11 +703,20 @@ impl<'a, R: SourceRead> Logic<'a, R> {
 
     fn publish_view(&mut self) {
         let v = self.view.input_buffer_mut();
+        v.generation = self.generation;
+        v.origin = self.origin;
         v.finalized = self.finalized;
         v.tally = *self.evaluator.tally();
         // Within the capacity every buffer got from the initial view.
         v.gauges.clear();
         v.gauges.extend_from_slice(self.evaluator.gauges());
+        // Copied only when this buffer holds older facts: the revision
+        // advances with every change, a reset's included, and never goes
+        // back. Of the same chart, so within the buffer's storage.
+        let notes = self.evaluator.notes();
+        if v.notes.revision() != notes.revision() {
+            v.notes.copy_from(notes);
+        }
         v.complete = self.evaluator.is_complete();
         v.playing = self.playing;
         v.events = self.emitted;

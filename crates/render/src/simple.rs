@@ -17,7 +17,7 @@
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
 use bms_model::{Chart, LANE_COUNT, Lane, Note, NoteKind, Position, TimeUs};
-use eval::{JudgeEvent, JudgeEventKind, Section};
+use eval::{JudgeEvent, JudgeEventKind, NoteFacts, Section};
 use game::ResultGraphs;
 use rules::{GaugeValue, Judgment, LnMode};
 use skin_model::{BuildError, ExactPlayhead, PrepareError};
@@ -210,22 +210,18 @@ pub struct SimpleSkin {
     /// (none yet, a chart loaded since, or a refused preparation), which
     /// draws no note and no bar line. A rearm keeps it.
     playhead: Option<ExactPlayhead>,
-    /// Long notes whose head was held ([`JudgeEventKind::LnHeld`]): their
-    /// press gave the feedback, so their judgment adds only its text.
-    held: [Bits; LANE_COUNT],
-    /// Notes hidden: judged taps and mines hit. A long note is never
-    /// hidden; it is drawn until its end passes the judgment line.
-    done: [Bits; LANE_COUNT],
-    /// A practice round's section, its span alone: the notes that are not
-    /// its targets are done from the start, a rearm included.
+    /// Notes never drawn: with a practice round's section, every note
+    /// that is not one of its targets. The rest are drawn by the play
+    /// view's note facts ([`PlayView::notes`](game::PlayView::notes)): a
+    /// judged tap and a hit mine are gone, and a long note, never hidden,
+    /// is drawn until its end passes the judgment line, its body active
+    /// while its lane's visual hold is on it.
+    masked: [Bits; LANE_COUNT],
+    /// A practice round's section, its span alone.
     section: Option<Section>,
     /// The long-note judgment mode the notes are drawn by: LN, the only
     /// mode judged (design.md "LN Judgment Modes").
     ln_mode: LnMode,
-    /// Per lane, the long note being held: a press took its head before its
-    /// end (held, or decided BAD at the press) and its visual hold has not
-    /// ended ([`JudgeEventKind::LnHoldEnded`]).
-    active: [Option<usize>; LANE_COUNT],
     /// Latest press per lane, for the key beam.
     pressed: [Option<TimeUs>; LANE_COUNT],
     /// Latest hit per lane, for the bomb.
@@ -248,11 +244,9 @@ impl SimpleSkin {
             lanes: Default::default(),
             bar_lines: Vec::new(),
             playhead: None,
-            held: Default::default(),
-            done: Default::default(),
+            masked: Default::default(),
             section: None,
             ln_mode: LnMode::Ln,
-            active: [None; LANE_COUNT],
             pressed: [None; LANE_COUNT],
             hit: [None; LANE_COUNT],
             judgment: None,
@@ -263,9 +257,9 @@ impl SimpleSkin {
     /// ([`ExactPlayhead::prepare`], over the practice round's `section` when
     /// there is one), then the chart's notes and bar lines and a fresh play
     /// state. With a section, every note that is not one of its targets is
-    /// marked done, so only the targets are drawn (design.md "Mid-Chart
-    /// Start and Section Repeat"); the notes keep their indices, which
-    /// effects name. The previous attempt goes first, so a refusal leaves
+    /// masked, so only the targets are drawn (design.md "Mid-Chart Start
+    /// and Section Repeat"); the notes keep their indices, which effects
+    /// and the note facts name. The previous attempt goes first, so a refusal leaves
     /// none and the skin draws the empty lanes until the next attempt. This
     /// is all of `prepare`; the skin needs nothing from the GPU.
     ///
@@ -287,8 +281,7 @@ impl SimpleSkin {
         self.playhead = Some(playhead);
         self.lanes = chart.lanes.clone();
         self.bar_lines = chart.bar_lines.clone();
-        self.held = std::array::from_fn(|l| Bits::sized(self.lanes[l].len()));
-        self.done = std::array::from_fn(|l| Bits::sized(self.lanes[l].len()));
+        self.masked = std::array::from_fn(|l| Bits::sized(self.lanes[l].len()));
         self.section = section.map(|s| Section {
             start: s.start,
             end: s.end,
@@ -311,16 +304,16 @@ impl SimpleSkin {
         ))
     }
 
-    /// Marks done every note that is not one of the practice section's
-    /// targets, if there is a section. Allocates nothing.
+    /// Masks every note that is not one of the practice section's
+    /// targets, if there is a section.
     fn mask(&mut self) {
         let Some(section) = &self.section else {
             return;
         };
-        for (notes, done) in self.lanes.iter().zip(&mut self.done) {
+        for (notes, masked) in self.lanes.iter().zip(&mut self.masked) {
             for (i, note) in notes.iter().enumerate() {
                 if !section.is_target(note) {
-                    done.set(i);
+                    masked.set(i);
                 }
             }
         }
@@ -341,48 +334,29 @@ impl SimpleSkin {
                 ..
             } => {
                 let l = lane.index();
-                let end = match self.lanes[l].get(note).map(|n| n.kind) {
-                    Some(NoteKind::Long { end, .. }) => Some(end),
-                    Some(NoteKind::Tap | NoteKind::Mine { .. }) | None => None,
+                let long = match self.lanes[l].get(note).map(|n| (n.time, n.kind)) {
+                    Some((head, NoteKind::Long { end, .. })) => Some((head, end)),
+                    Some((_, NoteKind::Tap | NoteKind::Mine { .. })) | None => None,
                 };
                 self.judgment = Some((judgment, ev.time));
-                let Some(end) = end else {
-                    self.done[l].set(note);
+                // A long note's completion, finished by a release or at its
+                // end after a head press before it: its press already gave
+                // the feedback, even when that press's `LnHeld` was
+                // dropped, so its judgment adds only its text.
+                let completion = long.is_some_and(|(head, end)| {
+                    release.is_some()
+                        || (ev.time == end
+                            && deviation.is_some_and(|d| {
+                                i128::from(head.0) + i128::from(d.0) < i128::from(end.0)
+                            }))
+                });
+                if !completion {
                     self.feedback(l, judgment, deviation.is_some(), ev.time);
-                    return;
-                };
-                // A long note stays drawn when judged, until its end passes
-                // the line. Held earlier, its press already gave its
-                // feedback; decided at a press before its end (a BAD head),
-                // it is held while the lane stays held.
-                if self.held[l].get(note) {
-                    return;
                 }
-                if deviation.is_some() && release.is_none() && ev.time < end {
-                    self.active[l] = Some(note);
-                }
-                self.feedback(l, judgment, deviation.is_some(), ev.time);
             }
-            JudgeEventKind::LnHeld {
-                lane,
-                note,
-                judgment,
-                ..
-            } => {
-                let l = lane.index();
-                self.held[l].set(note);
-                self.active[l] = Some(note);
+            JudgeEventKind::LnHeld { lane, judgment, .. } => {
                 self.judgment = Some((judgment, ev.time));
-                self.feedback(l, judgment, true, ev.time);
-            }
-            JudgeEventKind::LnHoldEnded { lane, note } => {
-                let l = lane.index();
-                if self.active[l] == Some(note) {
-                    self.active[l] = None;
-                }
-            }
-            JudgeEventKind::MineHit { lane, note } => {
-                self.done[lane.index()].set(note);
+                self.feedback(lane.index(), judgment, true, ev.time);
             }
             JudgeEventKind::EmptyPoor { lane } => {
                 self.pressed[lane.index()] = Some(ev.time);
@@ -391,7 +365,10 @@ impl SimpleSkin {
             JudgeEventKind::PlaySound { lane, .. } => {
                 self.pressed[lane.index()] = Some(ev.time);
             }
-            JudgeEventKind::Gauge { .. } | JudgeEventKind::SongEnd => {}
+            JudgeEventKind::LnHoldEnded { .. }
+            | JudgeEventKind::MineHit { .. }
+            | JudgeEventKind::Gauge { .. }
+            | JudgeEventKind::SongEnd => {}
         }
     }
 
@@ -465,7 +442,18 @@ impl SimpleSkin {
         }
     }
 
-    fn notes(&self, out: &mut SpriteBatch, scale: &Scale, from: Position, to: Position) {
+    /// Every lane's notes between `from` and `to`, each by the frame's
+    /// note `facts`; a visual hold reads off once its long note's end is
+    /// at or before `now`, even while the facts, which follow the
+    /// finalized watermark, still have it.
+    fn notes(
+        &self,
+        out: &mut SpriteBatch,
+        scale: &Scale,
+        (from, to): (Position, Position),
+        facts: &NoteFacts,
+        now: TimeUs,
+    ) {
         for lane in Lane::all() {
             let l = lane.index();
             #[expect(
@@ -475,6 +463,7 @@ impl SimpleSkin {
             let notes = &self.lanes[l];
             let (x, w) = layout::lane_x(lane);
             let color = note_color(lane);
+            let held = facts.hold(lane).filter(|h| h.end > now).map(|h| h.note);
             // Positions never decrease along a lane (`Chart::validate`), so
             // the notes meeting [from, to] are one run.
             let start = notes.partition_point(|n| n.end_pos() < from);
@@ -486,7 +475,9 @@ impl SimpleSkin {
                     clippy::indexing_slicing,
                     reason = "`l` is a `Lane::index`, below LANE_COUNT"
                 )]
-                if self.done[l].get(i) {
+                if self.masked[l].get(i)
+                    || (!matches!(note.kind, NoteKind::Long { .. }) && facts.is_done(lane, i))
+                {
                     continue;
                 }
                 let head = scale.y(note.pos);
@@ -502,11 +493,7 @@ impl SimpleSkin {
                         }
                         let tail = scale.y(end_pos);
                         let head = head.min(JUDGE_Y);
-                        #[expect(
-                            clippy::indexing_slicing,
-                            reason = "`l` is a `Lane::index`, below LANE_COUNT"
-                        )]
-                        let body = if body_active(self.ln_mode, self.active[l] == Some(i)) {
+                        let body = if body_active(self.ln_mode, held == Some(i)) {
                             shade(color, LN_BODY_ACTIVE)
                         } else {
                             shade(color, LN_BODY_INACTIVE)
@@ -653,15 +640,10 @@ impl PlaySkin for SimpleSkin {
         Ok(())
     }
 
-    /// What the effects built up starts over: no note held, done, pressed
-    /// or hit, and no judgment shown, the section's mask applied again;
-    /// the chart and the prepared playhead stay.
+    /// What the effects built up starts over: no lane pressed or hit and
+    /// no judgment shown; the chart, the section's mask and the prepared
+    /// playhead stay, and the notes follow the next frame's facts.
     fn rearm(&mut self) {
-        for bits in self.held.iter_mut().chain(&mut self.done) {
-            bits.0.fill(0);
-        }
-        self.mask();
-        self.active = [None; LANE_COUNT];
         self.pressed = [None; LANE_COUNT];
         self.hit = [None; LANE_COUNT];
         self.judgment = None;
@@ -685,7 +667,7 @@ impl PlaySkin for SimpleSkin {
         let y = JUDGE_Y - JUDGE_LINE_H / 2.0;
         rect(out, Blend::Alpha, LANE_LEFT, y, w, JUDGE_LINE_H, JUDGE_LINE);
         if let Some((scale, from, to)) = range {
-            self.notes(out, &scale, from, to);
+            self.notes(out, &scale, (from, to), &f.view.notes, f.now);
         }
         // Feedback ages on the frame's own clock: the display offset moves
         // notes only.
@@ -695,7 +677,7 @@ impl PlaySkin for SimpleSkin {
     }
 
     /// Itself, the chart's notes and bar lines copied for the attempt, its
-    /// held and done bits, by their allocations, and the playhead's
+    /// mask bits, by their allocations, and the playhead's
     /// representatives; the playhead's timeline is the chart's.
     fn attempt_bytes(&self) -> u64 {
         let lanes: usize = self
@@ -704,9 +686,8 @@ impl PlaySkin for SimpleSkin {
             .map(|l| l.capacity() * size_of::<Note>())
             .sum();
         let bits: usize = self
-            .held
+            .masked
             .iter()
-            .chain(&self.done)
             .map(|b| b.0.capacity() * size_of::<u64>())
             .sum();
         let bytes = size_of::<Self>()
@@ -1088,7 +1069,7 @@ const fn judgment_text(j: Judgment) -> (&'static [u8], Rgba) {
 #[cfg(test)]
 mod tests {
     use bms_model::ChartBuilder;
-    use eval::{GaugeState, Tally};
+    use eval::{GaugeState, NoteHold, Tally};
     use game::PlayView;
 
     use super::*;
@@ -1104,6 +1085,8 @@ mod tests {
 
     fn view() -> PlayView {
         PlayView {
+            generation: 0,
+            origin: None,
             finalized: None,
             tally: Tally {
                 counts: rules::PerJudgment {
@@ -1120,10 +1103,82 @@ mod tests {
                 empty_poor: 0,
             },
             gauges: Vec::new(),
+            notes: NoteFacts::default(),
             complete: false,
             playing: true,
             events: 0,
         }
+    }
+
+    /// What the evaluator's note facts become after `ev`, for tests that
+    /// drive frames with effects: a judged tap or a hit mine is done, a long
+    /// note's head press before its end (held, or a BAD head) takes it and
+    /// starts the lane's hold, and its hold's end or its completion ends it. Drops are modelled
+    /// by changing the facts without effects.
+    fn follow(notes: &mut NoteFacts, chart: &Chart, ev: &JudgeEvent) {
+        let end_of = |lane: Lane, note: usize| match chart.lanes[lane.index()].get(note)?.kind {
+            NoteKind::Long { end, .. } => Some(end),
+            NoteKind::Tap | NoteKind::Mine { .. } => None,
+        };
+        match ev.kind {
+            JudgeEventKind::Judged {
+                lane,
+                note,
+                deviation,
+                release,
+                ..
+            } => {
+                notes.set_done(lane, note);
+                let Some(end) = end_of(lane, note) else {
+                    return;
+                };
+                if deviation.is_some() && release.is_none() && ev.time < end {
+                    notes.set_hold(
+                        lane,
+                        Some(NoteHold {
+                            note,
+                            start: ev.time,
+                            end,
+                        }),
+                    );
+                } else if notes.hold(lane).is_some_and(|h| h.note == note) {
+                    // Its completion ends its hold.
+                    notes.set_hold(lane, None);
+                }
+            }
+            JudgeEventKind::LnHeld { lane, note, .. } => {
+                notes.set_done(lane, note);
+                if let Some(end) = end_of(lane, note) {
+                    notes.set_hold(
+                        lane,
+                        Some(NoteHold {
+                            note,
+                            start: ev.time,
+                            end,
+                        }),
+                    );
+                }
+            }
+            JudgeEventKind::LnHoldEnded { lane, note } => {
+                if notes.hold(lane).is_some_and(|h| h.note == note) {
+                    notes.set_hold(lane, None);
+                }
+            }
+            JudgeEventKind::MineHit { lane, note } => notes.set_done(lane, note),
+            JudgeEventKind::EmptyPoor { .. }
+            | JudgeEventKind::PlaySound { .. }
+            | JudgeEventKind::Gauge { .. }
+            | JudgeEventKind::SongEnd => {}
+        }
+    }
+
+    /// A play view whose note facts follow `effects` on `chart`.
+    fn view_of(chart: &Chart, effects: &[JudgeEvent]) -> PlayView {
+        let mut notes = NoteFacts::new(chart);
+        for ev in effects {
+            follow(&mut notes, chart, ev);
+        }
+        PlayView { notes, ..view() }
     }
 
     fn frame<'a>(view: &'a PlayView, now: i64, effects: &'a [JudgeEvent]) -> FrameInput<'a> {
@@ -1318,6 +1373,7 @@ mod tests {
         ];
         for (name, effects, active) in cases {
             let mut s = skin(&chart);
+            let v = view_of(&chart, &effects);
             let batch = build(&mut s, &frame(&v, 1_150 * MS, &effects));
             let expected = if active {
                 [body.clone(), none.clone(), caps.clone()]
@@ -1358,14 +1414,98 @@ mod tests {
                 combo: 1,
             },
         );
-        let batch = build(&mut s, &frame(&v, 1_000 * MS, &[judged]));
+        let judged_view = view_of(&tap, &[judged]);
+        let batch = build(&mut s, &frame(&judged_view, 1_000 * MS, &[judged]));
         assert!(in_lane(&batch, lane(3), NOTE_WHITE).is_empty());
+    }
+
+    /// Each note's state comes from the frame's note facts, never from its
+    /// effects (#83): with every effect dropped, a judged tap and a hit
+    /// mine are gone and a held long note's body is active; effects that
+    /// disagree with the facts, late or of another note, change nothing
+    /// drawn but their feedback.
+    #[test]
+    fn note_state_comes_from_the_facts_not_the_effects() {
+        // A tap on key 1 and a mine on key 3 at 1.1 s, key 2's long note
+        // from 1 s to 1.3 s; drawn at 1.05 s, all on screen.
+        let chart = ChartBuilder::new(BPM)
+            .tap(lane(1), TimeUs(1_100 * MS))
+            .mine(lane(3), TimeUs(1_100 * MS), 10)
+            .long(lane(2), TimeUs(1_000 * MS), TimeUs(1_300 * MS))
+            .build()
+            .unwrap();
+        let mine = |batch: &SpriteBatch| in_lane(batch, lane(3), MINE).len();
+        let tap = |batch: &SpriteBatch| in_lane(batch, lane(1), note_color(lane(1))).len();
+        let active = |batch: &SpriteBatch| long_parts(batch, lane(2))[0].len();
+        let fresh = view_of(&chart, &[]);
+        let mut s = skin(&chart);
+        let batch = build(&mut s, &frame(&fresh, 1_050 * MS, &[]));
+        assert_eq!((tap(&batch), mine(&batch), active(&batch)), (1, 1, 0));
+        // Every effect dropped: the facts alone.
+        let mut v = view_of(&chart, &[]);
+        v.notes.set_done(lane(1), 0);
+        v.notes.set_done(lane(3), 0);
+        v.notes.set_done(lane(2), 0);
+        v.notes.set_hold(
+            lane(2),
+            Some(NoteHold {
+                note: 0,
+                start: TimeUs(1_000 * MS),
+                end: TimeUs(1_300 * MS),
+            }),
+        );
+        let mut s = skin(&chart);
+        let batch = build(&mut s, &frame(&v, 1_050 * MS, &[]));
+        assert_eq!((tap(&batch), mine(&batch), active(&batch)), (0, 0, 1));
+        // Effects the facts do not show yet, or no longer: a judged tap, a
+        // mine hit and a held head arriving before the facts that decide
+        // them leave the notes as the facts have them, and a late end of
+        // the hold leaves the body active; each starts only its feedback.
+        let early = [
+            ln_held(1_000 * MS, 0),
+            event(
+                3,
+                1_040 * MS,
+                Some(1_040 * MS),
+                JudgeEventKind::Judged {
+                    lane: lane(1),
+                    note: 0,
+                    judgment: Judgment::Great,
+                    deviation: Some(TimeUs(-60 * MS)),
+                    release: None,
+                    combo: 1,
+                },
+            ),
+            event(
+                4,
+                1_040 * MS,
+                None,
+                JudgeEventKind::MineHit {
+                    lane: lane(3),
+                    note: 0,
+                },
+            ),
+        ];
+        let mut s = skin(&chart);
+        let batch = build(&mut s, &frame(&fresh, 1_050 * MS, &early));
+        assert_eq!((tap(&batch), mine(&batch), active(&batch)), (1, 1, 0));
+        assert!(batch.blended(Blend::Add).any(|s| s.color[..3] == BOMB[..3]));
+        let late = [ln_hold_ended(1_000 * MS, 0)];
+        let batch = build(&mut s, &frame(&v, 1_060 * MS, &late));
+        assert_eq!((tap(&batch), mine(&batch), active(&batch)), (0, 0, 1));
+        // A negative display offset moves the notes only: the hold still
+        // reads off at the long note's end on the frame's own clock.
+        let f = |now: i64| FrameInput {
+            display_offset: TimeUs(-100 * MS),
+            ..frame(&v, now, &[])
+        };
+        assert_eq!(active(&build(&mut s, &f(1_299 * MS))), 1);
+        assert_eq!(active(&build(&mut s, &f(1_300 * MS))), 0);
     }
 
     #[test]
     fn a_held_long_notes_judgment_adds_its_text_but_no_second_bomb() {
         let chart = long_note();
-        let v = view();
         let mut s = skin(&chart);
         let bombs = |batch: &SpriteBatch| {
             batch
@@ -1373,6 +1513,7 @@ mod tests {
                 .filter(|s| s.color[..3] == BOMB[..3])
                 .count()
         };
+        let v = view_of(&chart, &[ln_held(1_000 * MS, 0)]);
         let held = build(&mut s, &frame(&v, 1_000 * MS, &[ln_held(1_000 * MS, 0)]));
         assert_eq!(bombs(&held), 1);
         assert_eq!(
@@ -1391,6 +1532,7 @@ mod tests {
             Some(1_250 * MS),
         );
         let released = ln_hold_ended(1_250 * MS, 0);
+        let v = view_of(&chart, &[ln_held(1_000 * MS, 0), released, judged]);
         let batch = build(&mut s, &frame(&v, 1_250 * MS, &[released, judged]));
         assert_eq!(bombs(&batch), 0);
         assert_eq!(
@@ -1401,11 +1543,29 @@ mod tests {
         assert!(active.is_empty());
         assert_eq!(inactive.len(), 1);
         assert_eq!(caps.len(), 2);
+        // Its `LnHeld` and `LnHoldEnded` dropped: the completion, known by
+        // its release, still starts no bomb, and the hold from the facts
+        // drew the body active until then.
+        let mut s = skin(&chart);
+        let held = view_of(&chart, &[ln_held(1_000 * MS, 0)]);
+        let batch = build(&mut s, &frame(&held, 1_100 * MS, &[]));
+        assert_eq!(long_parts(&batch, lane(2))[0].len(), 1);
+        assert_eq!(bombs(&batch), 0);
+        let batch = build(&mut s, &frame(&v, 1_250 * MS, &[judged]));
+        assert_eq!(bombs(&batch), 0);
+        assert_eq!(
+            glyphs(&batch, judgment_text(Judgment::Good).1),
+            uvs(b"GOOD")
+        );
+        // Held through its end, judged there: no bomb either.
+        let at_end = ln_judged(1_300 * MS, 0, Judgment::Great, Some(0), None, None);
+        let batch = build(&mut s, &frame(&v, 1_300 * MS, &[at_end]));
+        assert_eq!(bombs(&batch), 0);
     }
 
     /// The long note's sprites drawn at `now` with `offset`, after `effects`.
     fn drawn(chart: &Chart, now: i64, offset: i64, effects: &[JudgeEvent]) -> usize {
-        let v = view();
+        let v = view_of(chart, effects);
         let mut s = skin(chart);
         let f = FrameInput {
             display_offset: TimeUs(offset),
@@ -1419,8 +1579,9 @@ mod tests {
 
     /// The events the evaluator emits up to logic time `to` for key 2
     /// pressed at `press` and released at `release` (µs), with the tapestry
-    /// preset and one keyboard source.
-    fn evaluated(chart: &Chart, press: i64, release: i64, to: i64) -> Vec<JudgeEvent> {
+    /// preset and one keyboard source, and the play view of its note facts
+    /// then.
+    fn evaluated(chart: &Chart, press: i64, release: i64, to: i64) -> (Vec<JudgeEvent>, PlayView) {
         let device = eval::DeviceProfile {
             sources: vec![eval::SourceProfile {
                 input_offset: TimeUs(0),
@@ -1453,7 +1614,8 @@ mod tests {
         ev.push_input(key(release, 0)).unwrap();
         let mut out = Vec::new();
         ev.advance_to(TimeUs(to), &mut out).unwrap();
-        out
+        let notes = ev.notes().clone();
+        (out, PlayView { notes, ..view() })
     }
 
     #[test]
@@ -1466,14 +1628,13 @@ mod tests {
         // active at logic 1.29 s, and inactive from the logic end on, with
         // the tail drawn (at 1.31 s, 90 ms ahead: y 760).
         let chart = long_note();
-        let v = view();
         let end = 1_300 * MS;
         let offset = -100 * MS;
         let tail = [320.0, 752.0, 64.0, 16.0];
         for press in [1_000 * MS, 850 * MS] {
             for release in [end, 1_500 * MS] {
                 for (now, active) in [(end - 10 * MS, true), (end, false), (end + 10 * MS, false)] {
-                    let effects = evaluated(&chart, press, release, now);
+                    let (effects, v) = evaluated(&chart, press, release, now);
                     let mut s = skin(&chart);
                     let f = FrameInput {
                         display_offset: TimeUs(offset),
@@ -1498,8 +1659,7 @@ mod tests {
     /// evaluator emits up to then for key 2 pressed at `press` and released
     /// at `release`.
     fn played(chart: &Chart, l: u8, press: i64, release: i64, now: i64) -> [Vec<[f32; 4]>; 3] {
-        let v = view();
-        let effects = evaluated(chart, press, release, now);
+        let (effects, v) = evaluated(chart, press, release, now);
         let mut s = skin(chart);
         long_parts(&build(&mut s, &frame(&v, now, &effects)), lane(l))
     }
@@ -1851,10 +2011,9 @@ mod tests {
     fn a_rearm_keeps_the_playhead_and_starts_the_feedback_over() {
         // A whole play and a practice round: a judged tap (key 1's at
         // 1.1 s, a target of both) is hidden; each rearm keeps the very
-        // representatives and the attempt's memory, draws it again and
-        // keeps the section's mask.
+        // representatives, the attempt's memory and the section's mask,
+        // and the rearmed candidate's fresh facts draw the tap again.
         let (chart, round) = sectioned();
-        let v = view();
         for section in [None, Some(&round)] {
             let mut s = SimpleSkin::new();
             s.prepare_attempt(&chart, section).unwrap();
@@ -1874,8 +2033,13 @@ mod tests {
                     combo: 1,
                 },
             );
-            build(&mut s, &frame(&v, 900 * MS, &[judged]));
-            assert_eq!(notes_drawn(&mut s).0, fresh.0 - 1, "{section:?}");
+            let judged_view = view_of(&chart, &[judged]);
+            build(&mut s, &frame(&judged_view, 900 * MS, &[judged]));
+            assert_eq!(
+                notes_drawn_in(&mut s, &judged_view).0,
+                fresh.0 - 1,
+                "{section:?}"
+            );
             for k in 0..3 {
                 s.rearm();
                 let playhead = s.playhead.as_ref().unwrap();
@@ -1942,7 +2106,7 @@ mod tests {
 
     #[test]
     fn the_attempts_memory_counts_the_representatives() {
-        // Itself, the notes and bar lines copied, two bits per note and
+        // Itself, the notes and bar lines copied, a mask bit per note and
         // 4 bytes per stored µs of the timeline, which is the chart's.
         let chart = high_bpm();
         let mut s = SimpleSkin::new();
@@ -1954,7 +2118,7 @@ mod tests {
         let want = size_of::<SimpleSkin>()
             + notes * size_of::<Note>()
             + chart.bar_lines.len() * size_of::<Position>()
-            + 2 * words * size_of::<u64>()
+            + words * size_of::<u64>()
             + times.len() * 4;
         assert_eq!(s.attempt_bytes(), u64::try_from(want).unwrap());
     }
@@ -2059,8 +2223,12 @@ mod tests {
     /// The taps on key 1 and the long notes' sprites on keys 2 and 3 drawn
     /// at 0.9 s, when every note is on screen.
     fn notes_drawn(s: &mut SimpleSkin) -> (usize, usize, usize) {
-        let v = view();
-        let batch = build(s, &frame(&v, 900 * MS, &[]));
+        notes_drawn_in(s, &view())
+    }
+
+    /// [`notes_drawn`] with the note facts of `v`.
+    fn notes_drawn_in(s: &mut SimpleSkin, v: &PlayView) -> (usize, usize, usize) {
+        let batch = build(s, &frame(v, 900 * MS, &[]));
         let sprites = |l| long_parts(&batch, lane(l)).iter().map(Vec::len).sum();
         (
             in_lane(&batch, lane(1), note_color(lane(1))).len(),
@@ -2080,8 +2248,8 @@ mod tests {
         assert!(inside > 0);
         // The drawn taps are those at 1.1 and 1.2 s, which keep their
         // indices: an effect on note 1 still finds it.
-        assert!(!s.done[1].get(1) && !s.done[1].get(2));
-        assert!(s.done[1].get(0) && s.done[1].get(3));
+        assert!(!s.masked[1].get(1) && !s.masked[1].get(2));
+        assert!(s.masked[1].get(0) && s.masked[1].get(3));
     }
 
     #[test]

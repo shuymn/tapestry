@@ -5,8 +5,8 @@
 
 use std::collections::HashMap;
 
-use bms_model::{Chart, ChartBuilder, Lane, LnMode, TimeUs};
-use eval::{GaugeState, JudgeEvent, JudgeEventKind, Tally};
+use bms_model::{Chart, ChartBuilder, Lane, LnMode, NoteKind, TimeUs};
+use eval::{GaugeState, JudgeEvent, JudgeEventKind, NoteFacts, NoteHold, Tally};
 use rules::{GaugeValue, Judgment, PerJudgment};
 use skin_model::{
     Atlas, AtlasLimits, Attempt, BpmRange, ChartText, CoverSettings, FrameReadouts, FrameUv,
@@ -101,10 +101,77 @@ pub struct Drawn {
     /// The readouts each frame gives; `None` gives [`readouts_for`] the
     /// view.
     pub readouts: Option<FrameReadouts>,
+    /// The chart played, which [`follow`] reads.
+    pub chart: Chart,
+    /// The note facts each frame gives, following its effects
+    /// ([`follow`]).
+    pub notes: NoteFacts,
+}
+
+/// What the evaluator's note facts become after `ev`, for tests that
+/// drive frames with effects: a judged tap or a hit mine is done, a long
+/// note's head press before its end (held, or a BAD head) takes it and
+/// starts the lane's hold, and its hold's end or its completion ends it. Drops are modelled
+/// by changing the facts without effects.
+pub fn follow(notes: &mut NoteFacts, chart: &Chart, ev: &JudgeEvent) {
+    let end_of = |lane: Lane, note: usize| match chart.lanes[lane.index()].get(note)?.kind {
+        NoteKind::Long { end, .. } => Some(end),
+        NoteKind::Tap | NoteKind::Mine { .. } => None,
+    };
+    match ev.kind {
+        JudgeEventKind::Judged {
+            lane,
+            note,
+            deviation,
+            release,
+            ..
+        } => {
+            notes.set_done(lane, note);
+            let Some(end) = end_of(lane, note) else {
+                return;
+            };
+            if deviation.is_some() && release.is_none() && ev.time < end {
+                notes.set_hold(
+                    lane,
+                    Some(NoteHold {
+                        note,
+                        start: ev.time,
+                        end,
+                    }),
+                );
+            } else if notes.hold(lane).is_some_and(|h| h.note == note) {
+                // Its completion ends its hold.
+                notes.set_hold(lane, None);
+            }
+        }
+        JudgeEventKind::LnHeld { lane, note, .. } => {
+            notes.set_done(lane, note);
+            if let Some(end) = end_of(lane, note) {
+                notes.set_hold(
+                    lane,
+                    Some(NoteHold {
+                        note,
+                        start: ev.time,
+                        end,
+                    }),
+                );
+            }
+        }
+        JudgeEventKind::LnHoldEnded { lane, note } => {
+            if notes.hold(lane).is_some_and(|h| h.note == note) {
+                notes.set_hold(lane, None);
+            }
+        }
+        JudgeEventKind::MineHit { lane, note } => notes.set_done(lane, note),
+        JudgeEventKind::EmptyPoor { .. }
+        | JudgeEventKind::PlaySound { .. }
+        | JudgeEventKind::Gauge { .. }
+        | JudgeEventKind::SongEnd => {}
+    }
 }
 
 /// The attempt every drawn import plays: the whole chart, no lead-in.
-fn context() -> PlayContext<'static> {
+pub fn context() -> PlayContext<'static> {
     context_with(None)
 }
 
@@ -152,7 +219,9 @@ impl Drawn {
     /// it.
     #[allow(dead_code, reason = "not every test binary retries")]
     pub fn retry(&mut self, notes: u32) {
-        self.play = self.skin.prepare(&chart(notes), &context()).unwrap();
+        self.chart = chart(notes);
+        self.notes = NoteFacts::new(&self.chart);
+        self.play = self.skin.prepare(&self.chart, &context()).unwrap();
     }
 
     /// `skin` played over `chart`.
@@ -185,6 +254,8 @@ impl Drawn {
             },
             target: [1_920, 1_080],
             readouts: None,
+            chart: chart.clone(),
+            notes: NoteFacts::new(chart),
         }
     }
 
@@ -232,6 +303,9 @@ impl Drawn {
     /// Builds the frame at `ms` with `effects` into the batch.
     fn build_frame(&mut self, ms: i64, effects: &[JudgeEvent]) {
         self.batch.clear();
+        for ev in effects {
+            follow(&mut self.notes, &self.chart, ev);
+        }
         let frame = SkinFrame {
             now: TimeUs(ms * MS),
             display_offset: TimeUs(0),
@@ -239,6 +313,7 @@ impl Drawn {
             gauges: &self.gauges,
             gauge: 0,
             effects,
+            notes: &self.notes,
             complete: false,
             target: self.target,
             layout: &Layout::AUTHOR,

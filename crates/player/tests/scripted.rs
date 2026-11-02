@@ -575,6 +575,36 @@ fn the_start_gate_cancels_and_rearms_ready_on_the_real_threads() {
     assert_eq!(lanes, 2 * NOTES);
 }
 
+/// `--dev-start-gate` is planned against `device.toml`'s key config: quit
+/// on Q (0x10), the default START, is refused before any play opens, so
+/// the run ends with the collision and a nonzero exit, and nothing is
+/// recorded.
+#[test]
+fn a_start_gate_on_the_quit_key_opens_no_play() {
+    let Fixture {
+        dir: _dir,
+        chart_path,
+        log,
+        appdata,
+        ..
+    } = fixture();
+    let mut device = DeviceSettings::default();
+    device.keyboard.quit = Some(0x10);
+    game::save_settings(&appdata.join("tapestry").join("device.toml"), &device).unwrap();
+    let out = scripted_play(&chart_path, &log, &appdata)
+        .arg("--dev-start-gate")
+        .output()
+        .expect("run tapestry");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stdout}{stderr}");
+    let line =
+        "dev: the start gate cannot be installed: control 0x10 is bound to both quit and START";
+    assert!(stderr.lines().any(|l| l == line), "{line:?} in {stderr}");
+    assert!(!stdout.contains("play 1:"), "{stdout}");
+    assert!(!appdata.join("tapestry").join("records").exists());
+}
+
 /// A capture cancelled before playback is no script: the run ends with
 /// the reason and a nonzero exit, and nothing is recorded.
 #[test]

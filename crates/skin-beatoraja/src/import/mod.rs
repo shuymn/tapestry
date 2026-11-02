@@ -167,7 +167,6 @@ pub fn import(
     let mut cx = Cx::new(def, header, config, tables, choices, r, size[1])?;
     let destinations = object::records(&cx.tables, "destination").to_vec();
     cx.span_hint = cx.lane_span_hint(&destinations);
-    cx.custom.judge_region = cx.judge_region(&destinations);
     for (index, rec) in destinations.into_iter().enumerate() {
         cx.destination(index, rec)?;
     }
@@ -207,6 +206,15 @@ enum Op {
     Name(String),
 }
 
+/// Whether a reading of a destination's keys ([`Cx::read_keys`]) draws
+/// their colour: a probe, or a track whose colour is not consumed, does
+/// not, and the reading that draws it reports a clamp.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Colour {
+    Drawn,
+    Unused,
+}
+
 /// How [`Cx::common_with`] reads a destination.
 #[derive(Clone, Copy, Default)]
 struct Opts<'a> {
@@ -231,8 +239,8 @@ struct Opts<'a> {
     neutral: bool,
     /// The offsets are not consumed: noted, never refused.
     no_offsets: bool,
-    /// A judge's combo: its digits, which shift each raw key left
-    /// ([`track::read`]).
+    /// A judge's combo: its digits; each key gives `x` and `w` together
+    /// or neither ([`track::read`]).
     digits: Option<i32>,
     /// The keys as written were charged before this read.
     charged: bool,
@@ -479,29 +487,6 @@ impl<'d> Cx<'d> {
         for kind in notes {
             self.note(None, Severity::Ignored, kind);
         }
-    }
-
-    /// Whether some destination draws a judge, read ahead of the walk: the
-    /// source makes the judge region for it whatever its conditions
-    /// (`JsonPlaySkinObjectLoader.java:226, 283-287`). A judge other than
-    /// index 0 refuses the import, as does a judge id an image, text,
-    /// slider, graph or LIFT shares, and a record this cannot read fails
-    /// the walk at or before it, so none needs an answer.
-    fn judge_region(&mut self, destinations: &[u32]) -> bool {
-        for &rec in destinations {
-            let Ok(id) = object::id_of(self.def, rec) else {
-                return false;
-            };
-            let Some(id) = id.filter(|id| !id.parse::<i32>().is_ok_and(|n| n < 0)) else {
-                continue;
-            };
-            match self.objects.lookup(self.def, &self.tables, &id) {
-                Ok(Some((Object::Judge, _))) => return true,
-                Ok(_) => {}
-                Err(_) => return false,
-            }
-        }
-        false
     }
 
     /// The custom timers (`Skin.java:741-743`, `CustomTimer.java:20-58`):
@@ -758,6 +743,26 @@ impl<'d> Cx<'d> {
     /// (`SkinTextFont.java:158-176`): its keys' angles are cleared before
     /// the track is accepted, and an angle or a blend is only noted
     /// (`Opts::text`).
+    /// Destination `dst`'s keys ([`track::read`]), the one reading every
+    /// caller uses. Colour is clamped rather than refused, so the skin
+    /// looks as its author saw it; when `colour` is drawn, a clamped
+    /// channel is reported once, as a `Fallback` note at its first key.
+    fn read_keys(
+        &mut self,
+        dst: &Dst,
+        digits: Option<i32>,
+        colour: Colour,
+    ) -> Result<track::Keys, ImportError> {
+        let keys = track::read(self.def, &dst.keys, digits)?;
+        if colour == Colour::Drawn
+            && let Some(k) = keys.clamped
+        {
+            let span = self.arena_span(k);
+            self.note(Some(span), Severity::Fallback, NoteKind::ColourClamped);
+        }
+        Ok(keys)
+    }
+
     fn common_with(
         &mut self,
         role: Role,
@@ -780,7 +785,12 @@ impl<'d> Cx<'d> {
         } else {
             self.budget.keys(written).map_err(|l| self.limit(at, l))?
         };
-        let mut keys = track::read(self.def, &dst.keys, o.digits)?;
+        let drawn = if o.neutral {
+            Colour::Unused
+        } else {
+            Colour::Drawn
+        };
+        let mut keys = self.read_keys(dst, o.digits, drawn)?;
         if o.neutral {
             // The emitted keys, at 0 and at the last time, charged before
             // the constructor's key joins.
@@ -853,9 +863,9 @@ impl<'d> Cx<'d> {
                     if !seen.insert(*n) {
                         continue;
                     }
-                    ops::numeric(*n, &self.items, self.custom.judge_region)
+                    ops::numeric(*n, &self.items)
                 }
-                Op::Name(s) => match ops::named(s, self.custom.judge_region) {
+                Op::Name(s) => match ops::named(s) {
                     Some(c) => c,
                     None => {
                         let why = NoteKind::UnsupportedProperty {
@@ -875,7 +885,7 @@ impl<'d> Cx<'d> {
             Prop::Null => {}
             Prop::Id(n) => {
                 if ops::is_builtin(i32::try_from(n.unsigned_abs()).unwrap_or(0)) {
-                    let c = ops::numeric(*n, &BTreeMap::new(), self.custom.judge_region);
+                    let c = ops::numeric(*n, &BTreeMap::new());
                     if !self.condition(role, at, c, &mut conds, &mut deviates)? {
                         return Ok(None);
                     }
@@ -884,7 +894,7 @@ impl<'d> Cx<'d> {
                 }
             }
             Prop::Name(s) => {
-                let Some(c) = ops::named(s, self.custom.judge_region) else {
+                let Some(c) = ops::named(s) else {
                     let why = NoteKind::UnsupportedProperty {
                         kind: PropertyKind::Boolean,
                         id: None,

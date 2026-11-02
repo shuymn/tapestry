@@ -504,11 +504,10 @@ fn full_combo() {
     assert_eq!(h.start_ms(timer::FULL_COMBO), None);
 }
 
-/// `last_note` is sampled, not effect-sourced: it starts at the first
-/// playing frame whose whole ms is past the notes' end and within the
-/// finish margin (`play/BMSPlayer.java:683-697`), at that frame's time.
+/// `last_note` is not effect-sourced: the first playing frame at or past
+/// the notes' end starts it at that end, however late the frame comes.
 #[test]
-fn last_note_is_sampled_past_the_notes_end() {
+fn last_note_starts_at_the_notes_end() {
     use Judgment::Perfect;
     let chart = taps_chart();
     let ctx = PlayContext {
@@ -516,15 +515,12 @@ fn last_note_is_sampled_past_the_notes_end() {
         bpm_range: None,
         ..full(0)
     };
-    // The frame at the end does not start it; 1 ms after does.
+    // A frame before the end does not start it; the frame at it does.
     let mut h = Harness::empty(&chart, &ctx);
+    h.frame_us(3_000 * MS - 1, &[]);
+    assert_eq!(h.start(timer::LAST_NOTE), None);
     h.frame(3_000, &[ev(3_000, judged(1, 2, Perfect, Some(0), None, 3))]);
-    assert_eq!(h.start(timer::LAST_NOTE), None);
-    // Within the same whole ms of the end: still off.
-    h.frame_us(3_000 * MS + 999, &[]);
-    assert_eq!(h.start(timer::LAST_NOTE), None);
-    h.frame(3_001, &[]);
-    assert_eq!(h.start(timer::LAST_NOTE), Some(3_001 * MS));
+    assert_eq!(h.start(timer::LAST_NOTE), Some(3_000 * MS));
     // A late miss after the end and `SongEnd` do not move it.
     h.frame(
         3_400,
@@ -533,29 +529,16 @@ fn last_note_is_sampled_past_the_notes_end() {
             ev(3_400, JudgeEventKind::SongEnd),
         ],
     );
-    assert_eq!(h.start(timer::LAST_NOTE), Some(3_001 * MS));
+    assert_eq!(h.start(timer::LAST_NOTE), Some(3_000 * MS));
 
-    // A frame 100 ms late records its own time.
-    let mut h = Harness::empty(&chart, &ctx);
-    h.frame(2_990, &[]);
-    h.frame_us(3_100 * MS + 500, &[]);
-    assert_eq!(h.start(timer::LAST_NOTE), Some(3_100 * MS + 500));
-
-    // The last moment before the finish starts it; one past does not.
-    let mut h = Harness::empty(&chart, &ctx);
-    h.frame_us(8_000 * MS + 999, &[]);
-    assert_eq!(h.start(timer::LAST_NOTE), Some(8_000 * MS + 999));
-    let mut h = Harness::empty(&chart, &ctx);
-    h.frame(8_001, &[]);
-    assert_eq!(h.start(timer::LAST_NOTE), None);
-    h.frame(9_000, &[]);
-    assert_eq!(h.start(timer::LAST_NOTE), None);
-
-    // A jump from before the end to past the finish starts nothing.
-    let mut h = Harness::empty(&chart, &ctx);
-    h.frame(2_900, &[]);
-    h.frame(8_001, &[]);
-    assert_eq!(h.start(timer::LAST_NOTE), None);
+    // A frame 100.5 ms late, or one long past the end, still starts it at
+    // the end, and a jump from before the end alike.
+    for late in [3_100 * MS + 500, 8_001 * MS, 60_000 * MS] {
+        let mut h = Harness::empty(&chart, &ctx);
+        h.frame(2_900, &[]);
+        h.frame_us(late, &[]);
+        assert_eq!(h.start(timer::LAST_NOTE), Some(3_000 * MS), "{late}");
+    }
 
     // A failed gauge that keeps playing still starts it.
     let mut h = Harness::empty(&chart, &ctx);
@@ -566,7 +549,7 @@ fn last_note_is_sampled_past_the_notes_end() {
     };
     h.frame(2_500, &[]);
     h.frame(3_001, &[]);
-    assert_eq!(h.start(timer::LAST_NOTE), Some(3_001 * MS));
+    assert_eq!(h.start(timer::LAST_NOTE), Some(3_000 * MS));
 
     // Frames that are not playing (a stopped play) never start it.
     let mut h = Harness::empty(&chart, &ctx);
@@ -577,7 +560,30 @@ fn last_note_is_sampled_past_the_notes_end() {
     assert_eq!(h.start(timer::LAST_NOTE), None);
     h.playing = true;
     h.frame(8_000, &[]);
-    assert_eq!(h.start(timer::LAST_NOTE), Some(8_000 * MS));
+    assert_eq!(h.start(timer::LAST_NOTE), Some(3_000 * MS));
+}
+
+/// `last_note` keeps µs precision: off a µs before an end inside a
+/// millisecond, on at it, and anchored to exactly that end after a
+/// delayed frame.
+#[test]
+fn last_note_keeps_microseconds() {
+    let chart = taps_chart();
+    let end = 3_000 * MS + 500;
+    let ctx = PlayContext {
+        last_note_end: TimeUs(end),
+        bpm_range: None,
+        ..full(0)
+    };
+    let mut h = Harness::empty(&chart, &ctx);
+    h.frame_us(end - 1, &[]);
+    assert_eq!(h.start(timer::LAST_NOTE), None);
+    h.frame_us(end, &[]);
+    assert_eq!(h.start(timer::LAST_NOTE), Some(end));
+    let mut h = Harness::empty(&chart, &ctx);
+    h.frame_us(end - 1, &[]);
+    h.frame_us(3_017 * MS + 250, &[]);
+    assert_eq!(h.start(timer::LAST_NOTE), Some(end));
 }
 
 /// The bomb threshold covers grades from PERFECT through `bomb_up_to`,

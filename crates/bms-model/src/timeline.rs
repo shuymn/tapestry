@@ -491,6 +491,7 @@ mod tests {
         assert_eq!(new(two(), vec![2]), Err(TimelineError::BarRow { index: 0 }));
         // Rows that share their time and position stay distinct.
         assert_eq!(new(vec![row(0, 0, 120), row(0, 0, 120)], vec![]), Ok(()));
+        // F17a: the table at the row cap, and one row past it refused.
         let full = vec![row(0, 0, 120); MAX_TIMELINE_POINTS];
         assert_eq!(new(full.clone(), vec![]), Ok(()));
         let mut over = full;
