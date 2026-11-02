@@ -44,6 +44,7 @@ mod session;
 mod settings;
 mod sound;
 mod start_gate;
+mod tempo;
 mod tuning;
 
 pub use adjust_keys::{
@@ -126,6 +127,7 @@ pub use settings::{
     save_settings,
 };
 pub use sound::{AudioQueue, AudioSink, RunnerAudio, Wakes, audio_link, audio_link_at};
+pub use tempo::{AttemptTempo, MAIN_HISTOGRAM_LIMIT, ReferenceError};
 pub use tuning::{
     Adjust, DEFAULT_VISIBLE_TIME_MS, MAX_VOLUME_PERCENT, OFFSET_LIMIT_US, OFFSET_STEP_US, Tuning,
     VISIBLE_TIME_MS, VISIBLE_TIME_STEPS_MS, VOLUME_STEP_PERCENT,

@@ -575,6 +575,36 @@ fn the_start_gate_cancels_and_rearms_ready_on_the_real_threads() {
     assert_eq!(lanes, 2 * NOTES);
 }
 
+/// `--dev-start-gate` is planned against `device.toml`'s key config: quit
+/// on Q (0x10), the default START, is refused before any play opens, so
+/// the run ends with the collision and a nonzero exit, and nothing is
+/// recorded.
+#[test]
+fn a_start_gate_on_the_quit_key_opens_no_play() {
+    let Fixture {
+        dir: _dir,
+        chart_path,
+        log,
+        appdata,
+        ..
+    } = fixture();
+    let mut device = DeviceSettings::default();
+    device.keyboard.quit = Some(0x10);
+    game::save_settings(&appdata.join("tapestry").join("device.toml"), &device).unwrap();
+    let out = scripted_play(&chart_path, &log, &appdata)
+        .arg("--dev-start-gate")
+        .output()
+        .expect("run tapestry");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stdout}{stderr}");
+    let line =
+        "dev: the start gate cannot be installed: control 0x10 is bound to both quit and START";
+    assert!(stderr.lines().any(|l| l == line), "{line:?} in {stderr}");
+    assert!(!stdout.contains("play 1:"), "{stdout}");
+    assert!(!appdata.join("tapestry").join("records").exists());
+}
+
 /// A capture cancelled before playback is no script: the run ends with
 /// the reason and a nonzero exit, and nothing is recorded.
 #[test]
@@ -674,7 +704,7 @@ fn writes_only_between_plays(stdout: &str) {
 
 /// Hi-speed (F2) and the display offset (F6), changed during the first
 /// play through the settings keys' path, move notes only: a note 300 ms
-/// ahead of the display time sits 800 * 300 * (1/575 - 1/600) = 17.391
+/// ahead of the display time sits 800 * 300 * (1/569 - 1/600) = 21.793
 /// layout pixels higher, and both plays judge exactly as a run without the
 /// change. The second play starts with the new display offset; neither
 /// play's input offset moves.
@@ -707,13 +737,18 @@ fn hi_speed_change_moves_notes_not_judgment() {
     assert_eq!(display(&with[0]), TimeUs(0));
     assert_eq!(display(&with[1]), TimeUs(1_000));
 
-    // The same note at the same display time with 600 and 569 ms.
-    let scroll = &changed.chart.scroll;
+    // The same note (lane 1's at 2.5 s) at the same display time (2.2 s)
+    // with 600 and 569 ms: its stored position, and the playhead the
+    // attempt prepares, sampled there.
+    let chart = &changed.chart;
+    let playhead = skin_model::ExactPlayhead::prepare(chart, None).unwrap();
+    let note = chart.lanes[1][1];
+    assert_eq!(note.time, TimeUs(2_500_000));
     let y = |visible| {
         render::layout::note_y(
-            scroll,
-            scroll.position_at(TimeUs(2_300_000)),
-            TimeUs(2_000_000),
+            note.pos,
+            playhead.position_at(TimeUs(2_200_000)),
+            playhead.initial_rate(),
             TimeUs(visible),
         )
     };

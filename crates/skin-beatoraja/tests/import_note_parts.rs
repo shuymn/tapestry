@@ -417,13 +417,19 @@ fn sizes_are_exact() {
     // Equal values however spelled.
     let l = sizes("20, 20.0, 2e1, 200E-1, +20, 20.000, 0.2e2, 20");
     assert_eq!(l.result.as_ref().map(|_| ()).ok(), Some(()));
-    // Two values one `f32` would merge stay unequal.
+    // Unequal values load, each lane its own; the fit is checked on the
+    // exact value before any conversion: 610.0000001 passes the lanes' top
+    // by 10^-7 and refuses, though its `f32` is 610, which fits.
     let l = sizes(
         "20.000001, 20.000001, 20.000001, 20.000001, 20.000001, 20.000001, 20.000001, 20.0000011",
     );
+    assert_eq!(l.result.as_ref().map(|_| ()).ok(), Some(()));
+    assert_eq!(610.000_000_1_f32, 610.0);
+    sizes("20, 20, 20, 610, 20, 20, 20, 20").ok();
+    let l = sizes("20, 20, 20, 610.0000001, 20, 20, 20, 20");
     match l.err() {
         ImportError::Critical {
-            why: NoteKind::UnsupportedField { field: "size" },
+            why: NoteKind::UnsupportedField { field: "offset" },
             ..
         } => {}
         e => panic!("{e:?}"),

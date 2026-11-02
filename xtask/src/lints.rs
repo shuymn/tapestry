@@ -149,15 +149,7 @@ pub const IN_PLAY: &[Site] = &[
             "Note::end_pos",
         ],
     ),
-    Site::Fns(
-        "crates/bms-model/src/scroll.rs",
-        &[
-            "Position::minus",
-            "ScrollSegment::value",
-            "ScrollMap::initial_rate",
-            "ScrollMap::position_at",
-        ],
-    ),
+    Site::Fns("crates/bms-model/src/scroll.rs", &["Position::minus"]),
     Site::Fns(
         "crates/bms-model/src/timeline.rs",
         &[
@@ -202,6 +194,11 @@ pub const IN_PLAY: &[Site] = &[
     Site::File("crates/game/src/render.rs"),
     Site::File("crates/game/src/sound.rs"),
     Site::File("crates/game/src/start_gate.rs"),
+    // The reducer's tempo lookup in play.
+    Site::Fns(
+        "crates/game/src/tempo.rs",
+        &["AttemptTempo::bpm_at", "ratio"],
+    ),
     Site::Fns(
         "crates/game/src/live.rs",
         &[

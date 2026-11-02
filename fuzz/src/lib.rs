@@ -47,10 +47,68 @@ fn chart_dir() -> &'static Path {
 /// # Panics
 ///
 /// If a loaded chart breaks its base or link invariants, or its
-/// presentation validity disagrees with [`endpoint_conflict`].
+/// presentation validity disagrees with [`endpoint_conflict`]; and, loaded
+/// again at the practice speed [`practice_speed`] picks for `data`, if the
+/// mapped chart does, or keeps other rows, positions, tempos or identity
+/// than the 1× chart.
 pub fn bms_load(data: &[u8]) -> Result<Loaded, LoadError> {
     let loaded = bms_parser::load_bms(data, chart_dir(), &LoadOptions::default())?;
-    let chart = &loaded.chart;
+    check_loaded(&loaded.chart, bms_model::Speed::NORMAL);
+    let speed = practice_speed(data);
+    let opts = LoadOptions {
+        speed,
+        ..LoadOptions::default()
+    };
+    // A chart too long for the speed is refused there, and only there.
+    match bms_parser::load_bms(data, chart_dir(), &opts) {
+        Ok(mapped) => {
+            check_loaded(&mapped.chart, speed);
+            let (one, at) = (&loaded.chart.timeline, &mapped.chart.timeline);
+            assert_eq!(one.points().len(), at.points().len());
+            for (a, b) in one.points().iter().zip(at.points()) {
+                assert_eq!((a.pos, a.tempo), (b.pos, b.tempo), "a mapped row moved");
+                if speed.twentieths() <= 20 {
+                    assert!(b.at >= a.at, "a slower row is earlier");
+                } else {
+                    assert!(b.at <= a.at, "a faster row is later");
+                }
+            }
+            assert_eq!(one.bar_ids(), at.bar_ids());
+            let (one_notes, at_notes) = (&loaded.chart.lanes, &mapped.chart.lanes);
+            assert!(
+                one_notes
+                    .iter()
+                    .flatten()
+                    .map(|n| n.anchors)
+                    .eq(at_notes.iter().flatten().map(|n| n.anchors)),
+                "a mapped note moved rows"
+            );
+            assert_eq!(
+                loaded.chart.identity.resolved_hash,
+                mapped.chart.identity.resolved_hash
+            );
+        }
+        Err(LoadError::TooLongAtSpeed { .. }) => {}
+        Err(e) => panic!("loads at 1x but not at {}/20: {e}", speed.twentieths()),
+    }
+    Ok(loaded)
+}
+
+/// The practice speed `bms_load` also loads `data` at: a step of the
+/// ladder (50 % to 150 %) from the bytes' sum, so every step is reached
+/// and the same input always takes the same one.
+#[must_use]
+pub fn practice_speed(data: &[u8]) -> bms_model::Speed {
+    let sum = data
+        .iter()
+        .fold(0_u32, |s, &b| s.wrapping_add(u32::from(b)));
+    bms_model::Speed::from_twentieths(10 + sum % 21).unwrap_or(bms_model::Speed::NORMAL)
+}
+
+/// The invariants of a chart loaded at `speed`: base and link validity,
+/// the row cap, the tempo metadata, and presentation validity agreeing
+/// with [`endpoint_conflict`] (the loader never refuses a conflict).
+fn check_loaded(chart: &bms_model::Chart, speed: bms_model::Speed) {
     assert_eq!(chart.validate(), Ok(()), "a loaded chart is valid");
     assert_eq!(
         chart.validate_presentation_links(),
@@ -61,8 +119,7 @@ pub fn bms_load(data: &[u8]) -> Result<Loaded, LoadError> {
     assert!(t.points().len() <= bms_model::MAX_TIMELINE_POINTS);
     let meta = t.meta();
     assert!(meta.min <= meta.initial && meta.initial <= meta.max);
-    assert_eq!(meta.speed, bms_model::Speed::NORMAL);
-    // The loader never refuses a conflict; validity is the chart's own.
+    assert_eq!(meta.speed, speed);
     match chart.validate_presentation() {
         Ok(()) => assert!(!endpoint_conflict(chart), "a conflict passed"),
         Err(bms_model::PresentationError::EndpointConflict { .. }) => {
@@ -70,7 +127,6 @@ pub fn bms_load(data: &[u8]) -> Result<Loaded, LoadError> {
         }
         Err(e) => panic!("links passed but presentation failed: {e}"),
     }
-    Ok(loaded)
 }
 
 /// The presentation oracle: whether two note endpoints of `chart` sit at

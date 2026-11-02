@@ -11,7 +11,9 @@
 //! frame after it and the later ones. A batch that fills up counts what it
 //! refuses without allocating, the overlay still drawn whole, and the
 //! result screen's page, drawn every frame while it shows, allocates
-//! nothing either. A declarative skin prepared for an attempt, its clips
+//! nothing either. The simple skin's READY rearms, of a whole play and of
+//! a practice round, and the frames after each allocate nothing, its
+//! prepared playhead kept. A declarative skin prepared for an attempt, its clips
 //! and its prepared text included, does the same with the snapshot's
 //! gauges changing: its first and later frames, a refused one, the frames
 //! around a resize, and a full batch with the overlay kept whole. A
@@ -291,8 +293,9 @@ impl PlaySkin for Refusing {
 #[test]
 fn frames_do_not_allocate_from_the_first() {
     let (chart, taps) = chart();
+    // The attempt prepared, its playhead included, before counting.
     let mut skin = SimpleSkin::new();
-    skin.load(&chart, None);
+    skin.prepare_attempt(&chart, None).unwrap();
     let capacity = u32::try_from(MAX_SPRITES).unwrap();
     let mut staging = Staging::new(capacity, &skin.canvas([1920, 1080]));
     // A clip over the lanes' rows: its scissor is projected with the
@@ -390,10 +393,56 @@ fn frames_do_not_allocate_from_the_first() {
         "every long note held and finished"
     );
 
-    // A batch and staging too small for a frame of the chart loaded again,
-    // its notes not yet judged: the batch counts what it refuses, the
-    // overlay follows whole from its reserve, and nothing allocates.
-    skin.load(&chart, None);
+    // READY rearmed again and again, for the whole chart and for a
+    // practice round, each prepared before counting: the rearm starts the
+    // effects' state over in place, the playhead kept, and the first and
+    // later frames after it, fed the judgments again, allocate nothing.
+    let round = eval::Section {
+        start: TimeUs(1_000 * MS),
+        end: TimeUs(7_000 * MS),
+        lead_in: TimeUs(0),
+        initial_gauges: Vec::new(),
+    };
+    for section in [None, Some(&round)] {
+        skin.prepare_attempt(&chart, section).unwrap();
+        for k in 0..3 {
+            let mut again = Feed {
+                chart: &chart,
+                taps: &taps,
+                next: 0,
+                seq: 0,
+                held: 0,
+                ended: 0,
+            };
+            let (drawn, rearm_allocs) = counted(|| {
+                skin.rearm();
+                (0..FRAMES)
+                    .map(|j| {
+                        let now = TimeUs(j * FRAME_US);
+                        again.fill(now, &mut effects);
+                        let f = FrameInput {
+                            overlay: &overlay,
+                            ..input(&v, now, TimeUs(8 * MS), &effects)
+                        };
+                        staging
+                            .build(&mut skin, &f)
+                            .map(|()| staging.instances().len())
+                    })
+                    .sum::<Result<usize, BuildError>>()
+            });
+            assert!(drawn.unwrap() > glyphs);
+            assert_eq!(
+                rearm_allocs, 0,
+                "rearm {k} of {section:?} or a frame after it allocated"
+            );
+            assert_eq!(again.next, taps.len(), "every tap judged again");
+        }
+    }
+
+    // A batch and staging too small for a frame of the chart prepared
+    // again, its notes not yet judged: the batch counts what it refuses,
+    // the overlay follows whole from its reserve, and nothing allocates.
+    skin.prepare_attempt(&chart, None).unwrap();
     let mut small = Staging::new(32, &skin.canvas([1920, 1080]));
     let f = FrameInput {
         overlay: &overlay,

@@ -1,8 +1,8 @@
 //! Where the scroll stands for one frame: the simple skin's
-//! `layout::Scale` arithmetic (crates/render/src/simple.rs), given the
-//! playhead's position rather than sampling a scroll map, and
+//! `layout::Scale` arithmetic (crates/render/src/simple.rs), both given
+//! the playhead's position and the initial rate, here also
 //! parameterized by the uncovered lane length and the judgment line's y.
-//! Given the original's position, with no cover and no lift, its every
+//! Given the original's inputs, with no cover and no lift, its every
 //! output bit equals the original's; tests/scroll.rs ties the two
 //! together until the original is deleted.
 
