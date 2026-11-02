@@ -211,7 +211,8 @@ impl Budget {
         )
     }
 
-    /// `quads` more widget quads a frame.
+    /// `quads` more widget quads a frame; a gauge charges its segments and
+    /// flicker tip before its nodes are looked up or admitted.
     pub(crate) fn widget_quads(&mut self, quads: u32) -> Result<(), ImportLimit> {
         let n = usize::try_from(quads).unwrap_or(usize::MAX);
         let cap = usize::try_from(MAX_WIDGET_QUADS).unwrap_or(usize::MAX);

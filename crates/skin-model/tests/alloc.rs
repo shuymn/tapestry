@@ -1827,6 +1827,7 @@ fn build_does_not_allocate() {
     bar_groups_do_not_allocate(&full);
     cover_trims_do_not_allocate(&chart, &full);
     grade_attachments_do_not_allocate(&full);
+    large_gauges_do_not_allocate(&full, &views, &descs);
     // The next attempt, prepared untracked after the stretches, builds.
     let mut play = skin.prepare(&chart, &full).unwrap();
     skin.attach_text(&mut play, text_table()).unwrap();
@@ -3052,6 +3053,138 @@ fn grade_attachments_do_not_allocate(ctx: &PlayContext<'_>) {
     );
     // 1 008 to 2 992 ms at every fifth frame.
     assert_eq!(witnessed, 25, "attached frames witnessed");
+}
+
+/// Gauges at the widget budget build without allocating, in a play and
+/// while loading: 16 383 flickering segments and 16 384 falling over all
+/// of them each step of 1 µs, both following the covers, at zero, tiny,
+/// half and full values as the shown gauge switches, on every target and
+/// view, into a full batch and a short one. The skins are prepared before
+/// counting.
+fn large_gauges_do_not_allocate(ctx: &PlayContext<'_>, views: &Views, descs: &[GaugeDesc]) {
+    let look = |first: u16| {
+        let at = |k: u16| [u32::from(first + 2 * k), u32::from(first + 2 * k + 1)];
+        GaugeParts {
+            front: at(0),
+            back: at(1),
+            tip: at(2),
+        }
+    };
+    let mut looks = [look(LOOKS); GaugeLook::COUNT];
+    looks[GaugeLook::Hard.index()] = look(LOOKS + 6);
+    let max = skin_model::MAX_SEGMENTS;
+    let defs = [
+        GaugeDef {
+            segments: max - 1,
+            looks,
+            motion: Motion::Flicker {
+                period: TimeUs(330 * MS),
+            },
+        },
+        GaugeDef {
+            segments: max,
+            looks,
+            motion: Motion::Fall {
+                range: max,
+                step: TimeUs(1),
+            },
+        },
+    ];
+    let chart = ChartBuilder::new(150_000).build().unwrap();
+    let values = [
+        GaugeValue(0),
+        GaugeValue(1),
+        GaugeValue(50 * GaugeValue::PERCENT),
+        GaugeValue::FULL,
+    ];
+    let t = tally(0);
+    let mut most = [0_usize; 2];
+    let mut drops = 0_u32;
+    let mut loading_quads = [0_usize; 2];
+    for (k, def) in defs.into_iter().enumerate() {
+        let place = Place {
+            follow: Follow::LiftAndCover,
+            ..Place::SCREEN
+        };
+        let elements = vec![
+            ElementDef {
+                visible: Some(bool_program("combo < 0")),
+                ..lanes_support::lanes_element()
+            },
+            widget(
+                Source::Gauge(0),
+                lanes_support::rect([100, 900, 600, 20]),
+                TimerRef::Builtin(timer::SCREEN),
+                place,
+            ),
+        ];
+        let whens = (0..32).map(|_| bool_program("combo >= 1")).collect();
+        let loaded = load(
+            whens,
+            elements,
+            skin_model::WidgetDefs {
+                gauges: vec![def],
+                ..skin_model::WidgetDefs::default()
+            },
+        );
+        let skin = &loaded.skin;
+        assert_eq!(
+            skin.quad_capacity(),
+            skin_model::MAX_WIDGET_QUADS + skin_model::LANE_QUADS + skin_model::LANE_RESERVED
+        );
+        let mut play = skin.prepare(&chart, ctx).unwrap();
+        let mut batch = QuadBatch::with_capacity(skin.quad_capacity(), skin.run_capacity());
+        let mut small = QuadBatch::with_capacity(100, 8);
+        let mut loading = skin.prepare_loading(Side::Left);
+        let mut gauges = [state(values[0]), state(values[0])];
+        TRACK.with(|t| t.set(true));
+        for no in 0..240_usize {
+            let now = i64::try_from(no).unwrap() * 16 * MS + i64::try_from(no % 3).unwrap();
+            for (g, v) in gauges.iter_mut().zip([no / 4, no / 4 + 1]) {
+                g.value = values[v % values.len()];
+            }
+            let view = views.lanes[(no / 7) % views.lanes.len()];
+            let frame = SkinFrame {
+                now: TimeUs(now),
+                display_offset: TimeUs(0),
+                tally: &t,
+                gauges: &gauges,
+                gauge: (no / 16) % 2,
+                effects: &[],
+                complete: false,
+                target: TARGETS[no % TARGETS.len()],
+                layout: &views.layouts[(no / 11) % views.layouts.len()],
+                lanes: view,
+                readouts: readouts_for(view),
+                playing: true,
+            };
+            let out = if no % 10 == 9 { &mut small } else { &mut batch };
+            out.clear();
+            skin.build(&mut play, &frame, &loaded.uvs, out)
+                .expect("the frame builds");
+            drops += out.dropped();
+            most[k] = most[k].max(out.quads().len());
+        }
+        for no in 0..60 {
+            batch.clear();
+            let frame = loading_frame(views, descs, TimeUs(-5_000 * MS), no);
+            skin.build_loading(&mut loading, &frame, &loaded.uvs, &mut batch)
+                .expect("the loading frame builds");
+            loading_quads[k] = loading_quads[k].max(batch.quads().len());
+        }
+        TRACK.with(|t| t.set(false));
+    }
+    assert_eq!(
+        ALLOCS.swap(0, Ordering::Relaxed),
+        0,
+        "large gauges: allocations"
+    );
+    // The flicker's tip beside its segments, and every segment of the
+    // other; the short batch dropped the rest; loading drew every unlit
+    // segment.
+    assert_eq!(most, [16_384, 16_384]);
+    assert!(drops > 0);
+    assert_eq!(loading_quads, [16_383, 16_384]);
 }
 
 /// The readouts a stretch's frame `frame_no` gives with `view`: nothing

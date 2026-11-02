@@ -841,6 +841,28 @@ pub fn skin_jsons() -> Vec<Seed> {
         ),
         ("digit_offset_rows_limit", digit_offset_rows_limit()),
         (
+            "gauge_over_budget",
+            play_skin(&large_gauge_body(
+                r#""parts": 16384, "type": 3, "cycle": 100"#,
+                1,
+            )),
+        ),
+        (
+            "gauge_too_many_parts",
+            play_skin(&large_gauge_body(r#""parts": 16385, "range": 0"#, 1)),
+        ),
+        (
+            "gauge_fractional_parts",
+            play_skin(&large_gauge_body(r#""parts": 50.5"#, 1)),
+        ),
+        (
+            "gauge_node_count",
+            play_skin(&large_gauge_body(r#""parts": 50"#, 1).replace(
+                r#""nodes": ["n0", "n1", "n2", "n3"]"#,
+                r#""nodes": ["n0", "n1", "n2", "n3", "n0"]"#,
+            )),
+        ),
+        (
             "grade_anchor_trimmed",
             play_skin(&grade_anchors_body(GRADE_TRIMMED)),
         ),
@@ -1132,6 +1154,24 @@ pub fn skin_imports() -> Vec<Seed> {
             play_skin(&grade_anchors_body(GRADE_ANCHORED)),
         ),
         (
+            "gauge_max_still",
+            play_skin(&large_gauge_body(r#""parts": 16384, "range": 0"#, 1)),
+        ),
+        (
+            "gauge_max_flicker",
+            play_skin(&large_gauge_body(
+                r#""parts": 16383, "type": 3, "cycle": 100"#,
+                1,
+            )),
+        ),
+        (
+            "gauge_shared",
+            play_skin(&large_gauge_body(
+                r#""parts": 8191, "type": 3, "cycle": 100"#,
+                2,
+            )),
+        ),
+        (
             "note_fallbacks",
             play_skin(&note_parts_body(
                 &[
@@ -1163,6 +1203,27 @@ pub fn skin_imports() -> Vec<Seed> {
             )),
         ),
     ]
+}
+
+/// A gauge of four nodes over `grid` with `fields`, drawn by `dsts`
+/// destinations 20 px apart.
+fn large_gauge_body(fields: &str, dsts: usize) -> String {
+    let dsts: Vec<String> = (0..dsts)
+        .map(|k| {
+            format!(
+                r#"{{"id": "gg", "dst": [{{"x": 600, "y": {}, "w": 500, "h": 10}}]}}"#,
+                100 + 20 * k
+            )
+        })
+        .collect();
+    format!(
+        r#""image": [
+            {{"id": "n0", "src": "grid", "w": 4, "h": 4}}, {{"id": "n1", "src": "grid", "x": 4, "w": 4, "h": 4}},
+            {{"id": "n2", "src": "grid", "y": 4, "w": 4, "h": 4}}, {{"id": "n3", "src": "grid", "x": 4, "y": 4, "w": 4, "h": 4}}],
+        "gauge": {{"id": "gg", "nodes": ["n0", "n1", "n2", "n3"], {fields}}},
+        "destination": [{}]"#,
+        dsts.join(", ")
+    )
 }
 
 /// PERFECT's grade for [`grade_anchors_body`]: the square image fitted

@@ -428,7 +428,86 @@ pub fn draw(imported: &Imported) -> Vec<usize> {
     loading_probes(skin, (&text, &table), &gauges[0], &uvs, &mut batch);
     digit_probes(skin, &ctx, &states, &uvs, &mut batch);
     grade_anchor_probes(skin, &ctx, &uvs, &mut batch);
+    gauge_probes(skin, &chart, &uvs, &mut batch);
     counts
+}
+
+/// The shown gauge at raw values around its thresholds: a maximum that
+/// divides no segment count, values from below 0 to past it and the
+/// `i64` extremes, borders at, inside and past it, each frame inside the
+/// skin's capacities.
+fn gauge_probes(
+    skin: &skin_model::Skin,
+    chart: &bms_model::Chart,
+    uvs: &skin_model::UvTable,
+    batch: &mut skin_model::QuadBatch,
+) {
+    use bms_model::TimeUs;
+    use eval::{GaugeState, Tally};
+    use rules::{GaugeValue, PerJudgment};
+    use skin_model::{Attempt, GaugeDesc, GaugeLook, Layout, PlayContext, Side, SkinFrame};
+
+    let tally = Tally {
+        counts: PerJudgment {
+            perfect: 0,
+            great: 0,
+            good: 0,
+            bad: 0,
+            poor: 0,
+        },
+        ex_score: 0,
+        bp: 0,
+        combo: 0,
+        max_combo: 0,
+        empty_poor: 0,
+    };
+    for (max, border) in [(7, 0), (7, 7), (7, 3), (i64::MAX, i64::MAX / 2)] {
+        let descs = [GaugeDesc {
+            start: GaugeValue(0),
+            max: GaugeValue(max),
+            look: GaugeLook::Hard,
+            border: GaugeValue(border),
+        }];
+        let ctx = PlayContext {
+            gauges: &descs,
+            attempt: Attempt::Full { lead_in: TimeUs(0) },
+            empty_poor_breaks_combo: false,
+            empty_poor_counted: false,
+            scratch: Side::Left,
+            ln_default: rules::LnMode::Ln,
+            last_note_end: TimeUs(0),
+            bpm_range: None,
+        };
+        let mut play = skin
+            .prepare(chart, &ctx)
+            .expect("an imported skin prepares");
+        let values = [i64::MIN, -1, 0, 1, 3, 4, 6, 7, 8, max - 1, max, i64::MAX];
+        for (k, value) in values.into_iter().enumerate() {
+            let states = [GaugeState {
+                value: GaugeValue(value),
+                reference: GaugeValue(value),
+                failed_at: None,
+            }];
+            batch.clear();
+            let frame = SkinFrame {
+                now: TimeUs(i64::try_from(k).unwrap_or(0) * 16_000),
+                display_offset: TimeUs(0),
+                tally: &tally,
+                gauges: &states,
+                gauge: 0,
+                effects: &[],
+                complete: false,
+                target: [1_920, 1_080],
+                layout: &Layout::AUTHOR,
+                lanes: LANES_OFF,
+                readouts: readouts_for(LANES_OFF),
+                playing: true,
+            };
+            skin.build(&mut play, &frame, uvs, batch)
+                .expect("the frame builds");
+            check_batch(skin, batch);
+        }
+    }
 }
 
 /// The rects a frame of `imported` draws at a PERFECT with combo 12, the
