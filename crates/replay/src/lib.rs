@@ -695,14 +695,7 @@ fn decode_body(body: &[u8], limits: &DecodeLimits) -> Result<PlayRecord, DecodeE
     let (start, events, arrivals) = if status.end.played() {
         let start = read_start(&mut start_r, n_sources)?;
         start_r.finish()?;
-        let n = events_r.uint()?;
-        if n > limits.max_events {
-            return Err(DecodeError::TooManyEvents(n));
-        }
-        // Source, delta and kind.
-        let n = events_r.check_count(n, 3)?;
-        let mut events = Vec::with_capacity(n);
-        read_events(&mut events_r, n, n_sources, start.opened_at, &mut events)?;
+        let events = read_events(&mut events_r, n_sources, start.opened_at, limits.max_events)?;
         events_r.finish()?;
         let arrivals = read_arrivals(&mut arrivals_r)?;
         arrivals_r.finish()?;
@@ -994,20 +987,27 @@ fn read_snapshot(
     Ok(InputStart { opened_at, held })
 }
 
-/// Reads `n` events onto `events`, each source's first counting from
-/// `opened_at`; the caller checked `n` and reserved room for them.
+/// The winning opening's events, each source's first counting from
+/// `opened_at`: their count is checked against `max_events` and the bytes
+/// left before room is reserved for them.
 fn read_events(
     r: &mut Reader<'_>,
-    n: usize,
     n_sources: usize,
     opened_at: TimeUs,
-    events: &mut Vec<PhysicalInputEvent>,
-) -> Result<(), DecodeError> {
+    max_events: u64,
+) -> Result<Vec<PhysicalInputEvent>, DecodeError> {
+    let n = r.uint()?;
+    if n > max_events {
+        return Err(DecodeError::TooManyEvents(n));
+    }
+    // Source, delta and kind.
+    let n = r.check_count(n, 3)?;
+    let mut events = Vec::with_capacity(n);
     let mut prev = vec![opened_at.0; n_sources];
     for _ in 0..n {
         events.push(read_event(r, n_sources, &mut prev)?.1);
     }
-    Ok(())
+    Ok(events)
 }
 
 /// Reads one event, its time counted from its source's previous time in

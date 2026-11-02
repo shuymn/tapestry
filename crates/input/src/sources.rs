@@ -382,8 +382,7 @@ impl SourceSet {
                 tap.axis(n, moved, wrap, self.batch_at, foreground);
             }
         } else {
-            let was = tapped.is_some() && device.held.iter().any(|&(c, _)| c == packet.control);
-            if track(&mut device.held, max_held, packet.control, packet.value) {
+            if let Some(was) = track(&mut device.held, max_held, packet.control, packet.value) {
                 if let (Some(n), Some(tap)) = (tapped, &mut self.adjust) {
                     tap.button(n, was, packet.value != 0, self.batch_at, foreground);
                 }
@@ -1257,10 +1256,16 @@ fn resolved_relative(set: Option<&AxisMode>, product: Option<HidProduct>, cap: &
         .map_or(cap.relative, |m| m.relative)
 }
 
-/// Updates one control in a device's held list. Returns `false` when a
-/// newly held control does not fit.
-fn track(held: &mut Vec<(ControlId, i32)>, max: usize, control: ControlId, value: i32) -> bool {
-    match held.iter().position(|&(c, _)| c == control) {
+/// Updates one control in a device's held list. Returns whether it was
+/// held before, or `None` when a newly held control does not fit.
+fn track(
+    held: &mut Vec<(ControlId, i32)>,
+    max: usize,
+    control: ControlId,
+    value: i32,
+) -> Option<bool> {
+    let found = held.iter().position(|&(c, _)| c == control);
+    match found {
         Some(i) if value == 0 => {
             held.swap_remove(i);
         }
@@ -1268,7 +1273,7 @@ fn track(held: &mut Vec<(ControlId, i32)>, max: usize, control: ControlId, value
         Some(i) => held[i].1 = value,
         None if value == 0 => {}
         None if held.len() < max => held.push((control, value)),
-        None => return false,
+        None => return None,
     }
-    true
+    Some(found.is_some())
 }
