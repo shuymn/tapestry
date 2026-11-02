@@ -1345,6 +1345,7 @@ mod tests {
                 finalized: bms_model::TimeUs(0),
                 incomplete: reasons,
             },
+            history: Default::default(),
         }
     }
 

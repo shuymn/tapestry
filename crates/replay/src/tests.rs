@@ -164,6 +164,7 @@ fn sample(n_events: usize) -> PlayRecord {
                 ..Incomplete::default()
             },
         },
+        history: Default::default(),
     }
 }
 
@@ -198,15 +199,21 @@ fn an_event_takes_at_most_max_event_bytes() {
     let len = |kind| {
         let mut w = Writer::default();
         write_events(&mut w, TimeUs(0), &[worst(kind)]);
-        // Less the event count.
-        w.0.len() - 1
+        w.0.len()
     };
     assert_eq!(len(control), crate::MAX_EVENT_BYTES);
     assert_eq!(len(InputKind::Disconnected), 12);
-    // The standard limits leave room for 3 Mi worst-case events.
+    // A full history: 64 openings of 1040 held controls and 16 arrivals,
+    // and 65,536 events.
+    assert_eq!(
+        crate::HISTORY_MAX_BYTES,
+        64 * (64 + 1040 * 13 + 16 * 11) + 65_536 * 22 + 30
+    );
+    // The standard limits leave room for about 2.9 Mi worst-case events
+    // beside a full history.
     assert_eq!(
         crate::max_record_events(&DecodeLimits::STANDARD),
-        ((64 << 20) - (1 << 20)) / 22
+        ((64 << 20) - (1 << 20) - crate::HISTORY_MAX_BYTES) / 22
     );
 }
 
@@ -265,7 +272,6 @@ fn event_times_are_deltas_per_source() {
     assert_eq!(
         w.0,
         [
-            4, //
             0, 0, 0, 7, 2, //
             1, 0xc7, 0x01, 0, 9, 2, //
             0, 10, 0, 7, 0, //
@@ -598,7 +604,7 @@ fn section_length_beyond_remaining_bytes_is_an_error() {
     assert_eq!(
         decode(&wrap(&over, 3), &limits()),
         Err(DecodeError::SectionLength {
-            section: Section::Status,
+            section: Section::History,
             len: u32::try_from(remaining + 1).unwrap(),
             remaining,
         })
@@ -676,6 +682,7 @@ fn golden_base() -> PlayRecord {
                 input_failed: false,
             },
         },
+        history: Default::default(),
     }
 }
 
@@ -711,7 +718,7 @@ fn golden() -> PlayRecord {
 
 /// SHA-256 of `body_bytes(&golden())`, computed by a separate encoder
 /// written from the layout in the crate documentation.
-const GOLDEN_BODY_SHA256: &str = "55bd78549dc36bbed5e7494f4eeac79972ae7ae8f2036d46393627d4b66049cf";
+const GOLDEN_BODY_SHA256: &str = "084307354a6c395baa664d6b428549053c61d3cb81f1f040339dc4859465c7ef";
 
 #[test]
 fn golden_body() {
@@ -1017,7 +1024,7 @@ fn split_sections(body: &[u8]) -> Vec<Vec<u8>> {
         out.push(rest[4..4 + len].to_vec());
         rest = &rest[4 + len..];
     }
-    assert_eq!(out.len(), 9);
+    assert_eq!(out.len(), 10);
     out
 }
 
@@ -1073,3 +1080,5 @@ fn forged_counts_are_refused_before_allocating() {
         );
     }
 }
+
+mod history;

@@ -33,7 +33,17 @@ fn replay_body_seeds_reach_sections_counts_and_successful_decodes() {
             "no_events",
             "extremes",
             "practice_round",
+            "ready_history",
+            "cancelled_capture",
             "section_past_end",
+            "too_many_openings",
+            "history_events_beyond_limit",
+            "history_range",
+            "history_event_count",
+            "history_origin",
+            "history_unknown_source",
+            "cancelled_with_winner",
+            "cancelled_without_opening",
             "count_beyond_data",
             "too_many_events",
             "zero_sources",
@@ -44,18 +54,49 @@ fn replay_body_seeds_reach_sections_counts_and_successful_decodes() {
     for (name, body) in seeds {
         let result = replay_body(&body).map(|_| ());
         match name {
-            "two_sources" | "no_events" | "extremes" | "practice_round" => {
+            "two_sources" | "no_events" | "extremes" | "practice_round" | "ready_history"
+            | "cancelled_capture" => {
                 assert_eq!(result, Ok(()), "{name}");
             }
             "section_past_end" => assert!(
                 matches!(
                     result,
                     Err(DecodeError::SectionLength {
-                        section: Section::Status,
+                        section: Section::History,
                         ..
                     })
                 ),
                 "{name}: {result:?}"
+            ),
+            "too_many_openings" => {
+                assert_eq!(result, Err(DecodeError::TooManyOpenings(65)), "{name}");
+            }
+            "history_events_beyond_limit" => assert_eq!(
+                result,
+                Err(DecodeError::TooManyHistoryEvents(65_537)),
+                "{name}"
+            ),
+            "history_range" => {
+                assert_eq!(result, Err(DecodeError::InvalidHistory("range")), "{name}");
+            }
+            "history_event_count" => assert_eq!(
+                result,
+                Err(DecodeError::InvalidHistory("event count")),
+                "{name}"
+            ),
+            "history_origin" => {
+                assert_eq!(result, Err(DecodeError::InvalidHistory("origin")), "{name}");
+            }
+            "history_unknown_source" => {
+                assert_eq!(result, Err(DecodeError::UnknownSource(9)), "{name}");
+            }
+            "cancelled_with_winner" => {
+                assert_eq!(result, Err(DecodeError::TrailingBytes), "{name}");
+            }
+            "cancelled_without_opening" => assert_eq!(
+                result,
+                Err(DecodeError::InvalidHistory("no opening")),
+                "{name}"
             ),
             "count_beyond_data" => {
                 assert_eq!(result, Err(DecodeError::CountBeyondData(2)), "{name}");
@@ -81,8 +122,11 @@ fn replay_file_seeds_decode_or_fail_at_the_envelope() {
             "no_events",
             "extremes",
             "practice_round",
+            "ready_history",
+            "cancelled_capture",
             "bad_magic",
             "unsupported_version",
+            "older_version",
             "unsupported_encoding",
             "declared_too_large",
             "decompress",
@@ -93,11 +137,13 @@ fn replay_file_seeds_decode_or_fail_at_the_envelope() {
     for (name, file) in seeds {
         let result = replay_file(&file).map(|_| ());
         let expected = match name {
-            "two_sources" | "no_events" | "extremes" | "practice_round" => Ok(()),
+            "two_sources" | "no_events" | "extremes" | "practice_round" | "ready_history"
+            | "cancelled_capture" => Ok(()),
             "bad_magic" => Err(DecodeError::BadMagic),
             "unsupported_version" => Err(DecodeError::UnsupportedVersion(
                 replay::FORMAT_VERSION.wrapping_add(1),
             )),
+            "older_version" => Err(DecodeError::UnsupportedVersion(replay::FORMAT_VERSION - 1)),
             "unsupported_encoding" => Err(DecodeError::UnsupportedEncoding(2)),
             "declared_too_large" => Err(DecodeError::DeclaredLengthTooLarge {
                 declared: DecodeLimits::STANDARD.max_uncompressed + 1,

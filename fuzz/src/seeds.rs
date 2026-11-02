@@ -10,9 +10,10 @@ use eval::{
 };
 use input::raw;
 use replay::{
-    Arrival, BuildProvenance, ChartRecord, DecodeLimits, DeviceKind, DeviceRecord, EndStatus,
-    FORMAT_VERSION, Incomplete, InitialGauge, MAGIC, PlayRecord, PlayType, Practice, PresetRecord,
-    ReceiveMethod, SourceRecord, Status, TransformRecord, Versions, WakePolicy,
+    Arrival, BuildProvenance, CancelReason, CancelledOpening, ChartRecord, DecodeLimits,
+    DeviceKind, DeviceRecord, EndStatus, FORMAT_VERSION, Incomplete, InitialGauge, MAGIC,
+    PlayRecord, PlayType, Practice, PresetRecord, ReadyHistory, ReceiveMethod, SourceRecord,
+    Status, TransformRecord, Versions, WakePolicy,
 };
 
 /// A named seed.
@@ -161,6 +162,7 @@ fn two_sources() -> PlayRecord {
                 input_failed: false,
             },
         },
+        history: Default::default(),
     }
 }
 
@@ -218,12 +220,68 @@ fn practice_round() -> PlayRecord {
     rec
 }
 
-fn valid_records() -> [(&'static str, PlayRecord); 4] {
+/// An opening opened at 0 on its own timeline, at `origin` on the last
+/// one's, closing at 1 s.
+fn opening(origin: i64, events: std::ops::Range<u32>, reason: CancelReason) -> CancelledOpening {
+    CancelledOpening {
+        start: InputStart {
+            opened_at: TimeUs(0),
+            held: vec![(SourceId(1), ControlId(1), 1)],
+        },
+        origin: TimeUs(origin),
+        closed: TimeUs(1_000_000),
+        events,
+        arrivals: 0..0,
+        reason,
+    }
+}
+
+/// [`two_sources`] after two READY openings cancelled by a hold, with
+/// their events and an arrival.
+fn ready_history() -> PlayRecord {
+    let mut rec = two_sources();
+    let mut first = opening(-5_000_000, 0..2, CancelReason::Held);
+    first.arrivals = 0..1;
+    let mut second = opening(-3_000_000, 2..3, CancelReason::Held);
+    second.arrivals = 1..1;
+    rec.history = ReadyHistory {
+        openings: vec![first, second],
+        events: vec![
+            control(0, 100, 0x1e, 1),
+            control(1, 200, 0x1_0030, 7),
+            control(0, 300, 0x1e, 0),
+        ],
+        arrivals: vec![Arrival {
+            at: TimeUs(500),
+            kind: DeviceKind::Keyboard,
+        }],
+    };
+    rec
+}
+
+/// [`ready_history`] as a capture cancelled before playback: its last
+/// opening quit at origin 0, and no winning opening.
+fn cancelled_capture() -> PlayRecord {
+    let mut rec = ready_history();
+    rec.history.openings[0].origin = TimeUs(-2_000_000);
+    rec.history.openings[1].origin = TimeUs(0);
+    rec.history.openings[1].reason = CancelReason::Quit;
+    rec.start = InputStart::default();
+    rec.events.clear();
+    rec.arrivals.clear();
+    rec.status.end = EndStatus::CancelledBeforePlayback;
+    rec.status.finalized = TimeUs(0);
+    rec
+}
+
+fn valid_records() -> [(&'static str, PlayRecord); 6] {
     [
         ("two_sources", two_sources()),
         ("no_events", no_events()),
         ("extremes", extremes()),
         ("practice_round", practice_round()),
+        ("ready_history", ready_history()),
+        ("cancelled_capture", cancelled_capture()),
     ]
 }
 
@@ -254,7 +312,35 @@ fn join_sections(sections: &[Vec<u8>]) -> Vec<u8> {
 
 /// Section indexes in the body (`replay::Section` order).
 const DEVICES: usize = 4;
+const START: usize = 5;
 const EVENTS: usize = 6;
+const HISTORY: usize = 9;
+
+/// A history section of one opening (opened at 0, nothing held, origin
+/// −1, closed at 0, a hold) with the ranges and counts given.
+fn history_payload(events: [u64; 2], arrivals: [u64; 2], counts: [u64; 2]) -> Vec<u8> {
+    let mut out = vec![1, 0, 0, 1, 0];
+    for v in events.into_iter().chain(arrivals) {
+        varint(&mut out, v);
+    }
+    out.push(0);
+    for v in counts {
+        varint(&mut out, v);
+    }
+    out
+}
+
+fn varint(out: &mut Vec<u8>, mut v: u64) {
+    loop {
+        let byte = (v & 0x7f) as u8;
+        v >>= 7;
+        if v == 0 {
+            out.push(byte);
+            return;
+        }
+        out.push(byte | 0x80);
+    }
+}
 
 /// `replay_body` seeds: valid bodies, then one malformed body per error
 /// the smoke tests expect.
@@ -274,10 +360,52 @@ pub fn replay_bodies() -> Vec<Seed> {
 
     // The last section's length is one past the end of the body.
     let mut past_end = body.clone();
-    let status_at = body.len() - sections[8].len() - 4;
-    let len = u32::try_from(sections[8].len() + 1).expect("a short section");
-    past_end[status_at..status_at + 4].copy_from_slice(&len.to_le_bytes());
+    let last_at = body.len() - sections[HISTORY].len() - 4;
+    let len = u32::try_from(sections[HISTORY].len() + 1).expect("a short section");
+    past_end[last_at..last_at + 4].copy_from_slice(&len.to_le_bytes());
     seeds.push(("section_past_end", past_end));
+
+    // The history's limits and structure, each checked before anything is
+    // allocated for it: 65 openings; an opening's events reaching past
+    // 65,536; an event range not starting at 0; an event count other than
+    // the ranges'; an origin not after the previous one; an event of a
+    // source the record does not have.
+    seeds.push(("too_many_openings", with_section(HISTORY, vec![65])));
+    seeds.push((
+        "history_events_beyond_limit",
+        with_section(HISTORY, history_payload([0, 65_537], [0, 0], [0, 0])),
+    ));
+    seeds.push((
+        "history_range",
+        with_section(HISTORY, history_payload([1, 1], [0, 0], [0, 0])),
+    ));
+    seeds.push((
+        "history_event_count",
+        with_section(HISTORY, history_payload([0, 1], [0, 0], [2, 0])),
+    ));
+    let mut repeated = vec![2];
+    for _ in 0..2 {
+        repeated.extend_from_slice(&[0, 0, 1, 0, 0, 0, 0, 0, 0]);
+    }
+    repeated.extend_from_slice(&[0, 0]);
+    seeds.push(("history_origin", with_section(HISTORY, repeated)));
+    let mut unknown = history_payload([0, 1], [0, 0], [1, 0]);
+    unknown.truncate(unknown.len() - 1);
+    unknown.extend_from_slice(&[9, 0, 0, 1, 2, 0]);
+    seeds.push(("history_unknown_source", with_section(HISTORY, unknown)));
+
+    // A capture cancelled before playback with a winning opening's start
+    // snapshot, and one with no opening.
+    let cancelled = replay::body_bytes(&cancelled_capture());
+    let mut cancelled_sections = split_sections(&cancelled);
+    cancelled_sections[START] = vec![0, 0];
+    seeds.push(("cancelled_with_winner", join_sections(&cancelled_sections)));
+    cancelled_sections[START] = Vec::new();
+    cancelled_sections[HISTORY] = vec![0, 0, 0];
+    seeds.push((
+        "cancelled_without_opening",
+        join_sections(&cancelled_sections),
+    ));
 
     // Two events, within the event limit, with five payload bytes left:
     // two events take at least six.
@@ -335,6 +463,10 @@ pub fn replay_files() -> Vec<Seed> {
     seeds.push((
         "unsupported_version",
         with_header(header(FORMAT_VERSION.wrapping_add(1), 1, declared)),
+    ));
+    seeds.push((
+        "older_version",
+        with_header(header(FORMAT_VERSION - 1, 1, declared)),
     ));
     seeds.push((
         "unsupported_encoding",

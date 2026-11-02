@@ -78,6 +78,7 @@ fn what_if_on_a_chart_near_the_object_limit() {
             finalized,
             incomplete: Incomplete::default(),
         },
+        history: Default::default(),
     };
     let ctx = ResultContext {
         record: &record,

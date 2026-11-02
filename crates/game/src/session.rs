@@ -23,7 +23,8 @@ use input::hid::is_axis;
 use input::{Arrival as InputArrival, DeviceKind, InputAdapter, ScriptedInput, SourceSet};
 use replay::{
     Arrival, BuildProvenance, ChartRecord, DeviceRecord, EndStatus, Incomplete, PlayRecord,
-    PlayType, PresetRecord, ReceiveMethod, SourceRecord, Status, Versions, WakePolicy,
+    PlayType, PresetRecord, ReadyHistory, ReceiveMethod, SourceRecord, Status, Versions,
+    WakePolicy,
 };
 use rules::{GaugeKind, GaugeValue, RulePreset};
 
@@ -1368,6 +1369,9 @@ impl Loaded {
                 finalized,
                 incomplete,
             },
+            // The start gate is not active: the attempt's first READY is
+            // its winning opening, so none was cancelled.
+            history: ReadyHistory::default(),
         });
         let parts = &mut self.parts;
         let saved = parts

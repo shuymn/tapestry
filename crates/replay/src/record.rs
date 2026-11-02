@@ -1,5 +1,7 @@
 //! The play record: everything needed to re-evaluate a play.
 
+use std::ops::Range;
+
 use bms_model::{ChartIdentity, Speed, TimeUs};
 use eval::{DeviceProfile, InputStart, PhysicalInputEvent, SourceProfile};
 use rules::{GaugeValue, RulePreset};
@@ -256,6 +258,20 @@ pub enum EndStatus {
     PlayedToEnd,
     /// The play was aborted; it is evaluated up to the finalized watermark.
     EndedMidway,
+    /// The attempt ended before its transport committed (design.md "Play
+    /// Lifecycle", ending without a played attempt): a capture with no
+    /// played attempt, no winning opening, no finalized watermark and no
+    /// score, whose openings are all in [`PlayRecord::history`].
+    CancelledBeforePlayback,
+}
+
+impl EndStatus {
+    /// Whether there is a played attempt: a winning opening whose input is
+    /// evaluated up to the finalized watermark.
+    #[must_use]
+    pub const fn played(self) -> bool {
+        !matches!(self, Self::CancelledBeforePlayback)
+    }
 }
 
 /// Why the recorded input may be missing events. Several reasons can hold.
@@ -285,10 +301,74 @@ impl Incomplete {
 pub struct Status {
     /// How the play ended.
     pub end: EndStatus,
-    /// The watermark the evaluator had finalized at the end.
+    /// The watermark the evaluator had finalized at the end. A capture
+    /// cancelled before playback has none: it is not written, and reads
+    /// back as `TimeUs(0)`.
     pub finalized: TimeUs,
     /// Why the input may be incomplete.
     pub incomplete: Incomplete,
+}
+
+/// Why a READY opening was cancelled (design.md "Play Lifecycle", the
+/// start gate).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CancelReason {
+    /// START or SELECT was held before its transport committed; the
+    /// attempt then waited for their release.
+    Held,
+    /// The quit key.
+    Quit,
+    /// The retry key.
+    Retry,
+    /// The window was closed.
+    Close,
+    /// Focus was lost.
+    FocusLost,
+    /// A failure: an input thread that ended, an audio or screen failure,
+    /// or a failed restore plan.
+    Failed,
+    /// The history or the input capacity ran out: the capture is sealed
+    /// and incomplete.
+    Exhausted,
+}
+
+/// One READY opening the start gate cancelled: audit history, never input
+/// of the score (design.md "Input Log Format", cancelled openings).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CancelledOpening {
+    /// The controls held when it opened, and its opening time on its own
+    /// timeline.
+    pub start: InputStart,
+    /// Where its time 0 lies on the timeline of the attempt's last
+    /// opening (the winning one, or for a capture cancelled before
+    /// playback the last cancelled one, whose offset is 0). Receive times
+    /// are never rewritten: its events keep its own timeline, and this
+    /// relates the two.
+    pub origin: TimeUs,
+    /// When it closed, on its own timeline.
+    pub closed: TimeUs,
+    /// Its events' range in [`ReadyHistory::events`].
+    pub events: Range<u32>,
+    /// Its arrivals' range in [`ReadyHistory::arrivals`].
+    pub arrivals: Range<u32>,
+    /// Why it was cancelled.
+    pub reason: CancelReason,
+}
+
+/// The READY openings of the attempt the start gate cancelled, in order,
+/// with their raw events and arrivals in two shared arenas that the
+/// openings' ranges tile in order. Every opening names its sources in the
+/// record's one source table ([`DeviceRecord::sources`]). Empty for an
+/// attempt whose first READY played.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ReadyHistory {
+    /// The cancelled openings, at most [`MAX_CANCELLED_OPENINGS`](crate::MAX_CANCELLED_OPENINGS).
+    pub openings: Vec<CancelledOpening>,
+    /// Their events, at most [`MAX_CANCELLED_EVENTS`](crate::MAX_CANCELLED_EVENTS).
+    pub events: Vec<PhysicalInputEvent>,
+    /// Their arrivals, at most
+    /// [`MAX_OPENING_ARRIVALS`](crate::MAX_OPENING_ARRIVALS) each.
+    pub arrivals: Vec<Arrival>,
 }
 
 /// A recorded play: the inputs that reproduce its evaluation.
@@ -309,12 +389,27 @@ pub struct PlayRecord {
     /// The practice speed the chart was loaded at: its times, and so the
     /// input's, are real times at it.
     pub speed: Speed,
-    /// The controls held when recording opened.
+    /// The controls held when the winning opening's recording opened. A
+    /// capture cancelled before playback has no winning opening: this is
+    /// `InputStart::default()` and is not written.
     pub start: InputStart,
-    /// The physical input events in stream order.
+    /// The winning opening's physical input events in stream order, the
+    /// only input evaluated; empty for a capture cancelled before playback.
     pub events: Vec<PhysicalInputEvent>,
-    /// Devices that arrived during play.
+    /// Devices that arrived during the winning opening; empty for a
+    /// capture cancelled before playback.
     pub arrivals: Vec<Arrival>,
     /// How the play ended.
     pub status: Status,
+    /// The READY openings cancelled before the winning one, or every
+    /// opening of a capture cancelled before playback.
+    pub history: ReadyHistory,
+}
+
+impl PlayRecord {
+    /// Whether the record has a played attempt ([`EndStatus::played`]).
+    #[must_use]
+    pub const fn played(&self) -> bool {
+        self.status.end.played()
+    }
 }

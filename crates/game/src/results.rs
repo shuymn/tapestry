@@ -39,6 +39,10 @@ pub const MIN_OFFSET_SAMPLES: usize = 32;
 /// Why a record could not be re-evaluated.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ReEvaluationError {
+    /// The record is a capture cancelled before playback: there is no
+    /// played attempt to evaluate, and no score.
+    #[error("the record has no played attempt: it was cancelled before playback")]
+    NoPlayedAttempt,
     /// The record was made by an evaluator version this build does not
     /// run, so its rules are not this build's.
     #[error("the record was made by evaluator version {0}, which this build does not run")]
@@ -86,21 +90,25 @@ impl ReEvaluate {
     ///
     /// # Errors
     ///
+    /// [`NoPlayedAttempt`](ReEvaluationError::NoPlayedAttempt) and
     /// [`UnsupportedEvaluator`](ReEvaluationError::UnsupportedEvaluator),
     /// checked first, or what the evaluator refuses.
     pub fn under(
         ctx: &ResultContext<'_>,
         preset: &RulePreset,
     ) -> Result<ReEvaluation, ReEvaluationError> {
-        check_evaluator(ctx.record)?;
+        check_reevaluable(ctx.record)?;
         replay::verify::evaluate_under(ctx.record, ctx.chart, preset)
             .map_err(ReEvaluationError::Eval)
     }
 }
 
-/// Refuses a record of an evaluator version this build does not run.
-fn check_evaluator(rec: &PlayRecord) -> Result<(), ReEvaluationError> {
-    if rec.versions.evaluator == Implementation::STANDARD_VERSION {
+/// Refuses a capture cancelled before playback, then a record of an
+/// evaluator version this build does not run.
+fn check_reevaluable(rec: &PlayRecord) -> Result<(), ReEvaluationError> {
+    if !rec.played() {
+        Err(ReEvaluationError::NoPlayedAttempt)
+    } else if rec.versions.evaluator == Implementation::STANDARD_VERSION {
         Ok(())
     } else {
         Err(ReEvaluationError::UnsupportedEvaluator(
@@ -113,13 +121,14 @@ impl ResultExtension for ReEvaluate {
     fn on_play_end(&mut self, ctx: &ResultContext<'_>) -> ResultSummary {
         let rec = ctx.record;
         // The preset the play ran under is the record's, so another one is
-        // a mismatch, not a what-if. The evaluator version still comes
-        // first: `under` checks it, and a record of another version is
-        // refused whatever preset it names.
+        // a mismatch, not a what-if. The played attempt and the evaluator
+        // version still come first: `under` checks them, and a record
+        // without one or of another version is refused whatever preset it
+        // names.
         let evaluation = if replay::preset_hash(ctx.preset) == rec.preset.sha256 {
             Self::under(ctx, ctx.preset).map(|r| r.evaluation)
         } else {
-            check_evaluator(rec).and(Err(ReEvaluationError::PresetMismatch))
+            check_reevaluable(rec).and(Err(ReEvaluationError::PresetMismatch))
         };
         ResultSummary {
             matches_live: evaluation.as_ref().is_ok_and(|e| e.events == ctx.live),

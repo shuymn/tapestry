@@ -95,6 +95,7 @@ fn write_log(chart: &bms_model::Chart, path: &Path) -> Vec<eval::PhysicalInputEv
             finalized: TimeUs(4_000_000),
             incomplete: replay::Incomplete::default(),
         },
+        history: Default::default(),
     };
     fs::write(path, replay::encode(&rec)).unwrap();
     events

@@ -831,3 +831,40 @@ fn a_failure_writing_completion_rolls_back_its_batch() {
     assert_eq!(fx.pass(&lib).bests.counted, 1);
     assert!(!lib.bests_pending().unwrap());
 }
+
+#[test]
+fn a_capture_cancelled_before_playback_counts_nothing() {
+    // Its one opening, quit before its transport committed, holds the
+    // input of a full play; there is no played attempt.
+    let mut record = played(0);
+    let events = std::mem::take(&mut record.events);
+    let n = u32::try_from(events.len()).unwrap();
+    record.history = replay::ReadyHistory {
+        openings: vec![replay::CancelledOpening {
+            start: std::mem::take(&mut record.start),
+            origin: bms_model::TimeUs(0),
+            closed: bms_model::TimeUs(4_100 * MS),
+            events: 0..n,
+            arrivals: 0..0,
+            reason: replay::CancelReason::Quit,
+        }],
+        events,
+        arrivals: Vec::new(),
+    };
+    record.status.end = EndStatus::CancelledBeforePlayback;
+    record.status.finalized = bms_model::TimeUs(0);
+    assert_eq!(
+        library::ineligible(&record, None, true),
+        Some(Ineligible::NoPlayedAttempt)
+    );
+    assert_eq!(Ineligible::NoPlayedAttempt.to_string(), "no played attempt");
+    // The rebuild refuses it: no row, so no play counted.
+    let fx = Fixture::new();
+    fx.chart("a.bms", CHART);
+    fx.save(&record, "1-1.tprl");
+    let lib = fx.open();
+    let report = fx.pass(&lib);
+    assert_eq!(report.bests.refused.no_played_attempt, 1);
+    assert_eq!(report.bests.refused.total(), 1);
+    assert_eq!(score_of(&lib, &record), None);
+}

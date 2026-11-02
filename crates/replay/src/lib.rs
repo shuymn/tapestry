@@ -48,6 +48,31 @@
 //! limits ([`eval::MAX_BINDINGS_PER_SOURCE`], [`eval::MAX_AXES_PER_SOURCE`],
 //! [`eval::MAX_BINDINGS`], [`eval::MAX_AXES`]), checked as each count is
 //! read, before anything is allocated for it.
+//!
+//! The status section is the end status (0 played to the end, 1 ended
+//! midway, 2 cancelled before playback), then for a played attempt the
+//! finalized watermark, then the incomplete reasons as bits. A capture
+//! cancelled before playback has no winning opening: its start, events
+//! and arrivals sections are empty (no bytes at all), and its status holds
+//! no watermark.
+//!
+//! The history section ([`ReadyHistory`]) is the count of cancelled
+//! openings, then each opening's start snapshot (as the start section
+//! writes it), origin, closing time, event range and arrival range (start
+//! and end each) and cancel reason (0 held, 1 quit, 2 retry, 3 close, 4
+//! focus lost, 5 failed, 6 exhausted); then the events of every opening,
+//! counted once, each opening's events as the events section writes them
+//! from its own opening time; then the arrivals, counted once. The ranges
+//! tile the arenas in order. Origins rise strictly, and each opening opens
+//! no later than it closes and closes no later than the next one opens, on
+//! the last opening's timeline. A played record's openings were all
+//! cancelled by a hold, and the last closes no later than the winning
+//! opening opens, whose origin (0) lies after every cancelled one; a
+//! capture cancelled before playback has at least one opening, the last
+//! at origin 0, and every one but the last was cancelled by a hold. The
+//! counts are checked against [`MAX_CANCELLED_OPENINGS`],
+//! [`MAX_CANCELLED_EVENTS`] and [`MAX_OPENING_ARRIVALS`], and each range
+//! as it is read, before anything is allocated for them.
 
 #![forbid(unsafe_code)]
 
@@ -55,6 +80,8 @@ mod error;
 mod record;
 pub mod verify;
 mod wire;
+
+use std::ops::Range;
 
 use bms_model::{ChartIdentity, Lane, Speed, TimeUs};
 use eval::{
@@ -66,15 +93,16 @@ use sha2::{Digest, Sha256};
 
 pub use error::{DecodeError, Section};
 pub use record::{
-    Arrival, BuildProvenance, ChartRecord, DeviceKind, DeviceRecord, EndStatus, Incomplete,
-    InitialGauge, PASSTHROUGH, PlayRecord, PlayType, Practice, PresetRecord, ReceiveMethod,
-    SourceRecord, Status, TransformId, TransformRecord, Versions, WakePolicy,
+    Arrival, BuildProvenance, CancelReason, CancelledOpening, ChartRecord, DeviceKind,
+    DeviceRecord, EndStatus, Incomplete, InitialGauge, PASSTHROUGH, PlayRecord, PlayType, Practice,
+    PresetRecord, ReadyHistory, ReceiveMethod, SourceRecord, Status, TransformId, TransformRecord,
+    Versions, WakePolicy,
 };
 
 use wire::{Reader, Writer};
 
 /// The format version this crate writes, and the only one it reads.
-pub const FORMAT_VERSION: u16 = 7;
+pub const FORMAT_VERSION: u16 = 8;
 
 /// The first bytes of every input log.
 pub const MAGIC: [u8; 4] = *b"TPRL";
@@ -121,19 +149,39 @@ impl DecodeLimits {
 /// disconnect takes 12.
 pub const MAX_EVENT_BYTES: usize = 22;
 
-/// Body bytes kept for everything but the events in
+/// Body bytes kept for everything but the events and the history in
 /// [`max_record_events`]: versions, chart, preset, devices (at most 64
 /// sources, each within the evaluator's binding limits, about 120 KiB),
 /// the snapshot (bounded by the bindings), arrivals and status.
 pub const RECORD_OVERHEAD_BYTES: usize = 1 << 20;
 
+/// The most READY openings a record's history holds (design.md "Recording
+/// Capacity").
+pub const MAX_CANCELLED_OPENINGS: usize = 64;
+/// The most events of all its cancelled openings together.
+pub const MAX_CANCELLED_EVENTS: usize = 65_536;
+/// The most arrivals one cancelled opening keeps.
+pub const MAX_OPENING_ARRIVALS: usize = 16;
+/// The most controls one start snapshot names: what a profile may bind.
+pub const MAX_HELD: usize = eval::MAX_BINDINGS + eval::MAX_AXES;
+
+/// The most body bytes a full history takes: per opening its fixed fields
+/// (at most 64 bytes), a full snapshot (13 bytes a control) and its
+/// arrivals (11 bytes each), the events at [`MAX_EVENT_BYTES`], and three
+/// counts.
+pub const HISTORY_MAX_BYTES: usize = MAX_CANCELLED_OPENINGS
+    * (64 + MAX_HELD * 13 + MAX_OPENING_ARRIVALS * 11)
+    + MAX_CANCELLED_EVENTS * MAX_EVENT_BYTES
+    + 3 * 10;
+
 /// The most input events a record may hold and still decode under
 /// `limits`: within its event count, and with every event at
 /// [`MAX_EVENT_BYTES`], within its uncompressed body after
-/// [`RECORD_OVERHEAD_BYTES`].
+/// [`RECORD_OVERHEAD_BYTES`] and a full history ([`HISTORY_MAX_BYTES`]).
 #[must_use]
 pub fn max_record_events(limits: &DecodeLimits) -> usize {
-    let bytes = (limits.max_uncompressed as usize).saturating_sub(RECORD_OVERHEAD_BYTES);
+    let bytes = (limits.max_uncompressed as usize)
+        .saturating_sub(RECORD_OVERHEAD_BYTES + HISTORY_MAX_BYTES);
     usize::try_from(limits.max_events)
         .unwrap_or(usize::MAX)
         .min(bytes / MAX_EVENT_BYTES)
@@ -160,7 +208,7 @@ pub fn preset_hash(p: &RulePreset) -> [u8; 32] {
 /// # Panics
 ///
 /// If the body or one of its sections exceeds `u32::MAX` bytes, which the
-/// recording capacities rule out.
+/// recording capacities rule out, or as [`body_bytes`].
 #[must_use]
 pub fn encode(rec: &PlayRecord) -> Vec<u8> {
     let body = body_bytes(rec);
@@ -175,11 +223,14 @@ pub fn encode(rec: &PlayRecord) -> Vec<u8> {
     out
 }
 
-/// The canonical uncompressed body of `rec`.
+/// The canonical uncompressed body of `rec`. A capture cancelled before
+/// playback writes no winning opening: its `start`, `events`, `arrivals`
+/// and finalized watermark are not written.
 ///
 /// # Panics
 ///
-/// If a section exceeds `u32::MAX` bytes.
+/// If a section exceeds `u32::MAX` bytes, or a cancelled opening's event
+/// range does not lie in the history's arena.
 #[must_use]
 pub fn body_bytes(rec: &PlayRecord) -> Vec<u8> {
     let PlayRecord {
@@ -194,7 +245,9 @@ pub fn body_bytes(rec: &PlayRecord) -> Vec<u8> {
         events,
         arrivals,
         status,
+        history,
     } = rec;
+    let played = status.end.played();
     let mut body = Writer::default();
     let mut section = |write: &dyn Fn(&mut Writer)| {
         let mut w = Writer::default();
@@ -221,10 +274,24 @@ pub fn body_bytes(rec: &PlayRecord) -> Vec<u8> {
         w.uint(u64::from(speed.twentieths()));
     });
     section(&|w| write_devices(w, devices));
-    section(&|w| write_start(w, start));
-    section(&|w| write_events(w, start.opened_at, events));
-    section(&|w| write_arrivals(w, arrivals));
+    section(&|w| {
+        if played {
+            write_start(w, start);
+        }
+    });
+    section(&|w| {
+        if played {
+            w.len(events.len());
+            write_events(w, start.opened_at, events);
+        }
+    });
+    section(&|w| {
+        if played {
+            write_arrivals(w, arrivals);
+        }
+    });
     section(&|w| write_status(w, status));
+    section(&|w| write_history(w, history));
     body.0
 }
 
@@ -405,11 +472,12 @@ fn write_start(w: &mut Writer, s: &InputStart) {
     }
 }
 
+/// `events` without their count, each source's first counting from
+/// `opened_at`.
 fn write_events(w: &mut Writer, opened_at: TimeUs, events: &[PhysicalInputEvent]) {
     // The previous time per source; a source's first event counts from
     // `opened_at`. Wrapping arithmetic keeps every `i64` pair exact.
     let mut prev: Vec<i64> = Vec::new();
-    w.len(events.len());
     for &PhysicalInputEvent {
         received,
         source,
@@ -442,6 +510,53 @@ fn write_arrivals(w: &mut Writer, arrivals: &[Arrival]) {
     }
 }
 
+const fn reason_tag(r: CancelReason) -> u64 {
+    match r {
+        CancelReason::Held => 0,
+        CancelReason::Quit => 1,
+        CancelReason::Retry => 2,
+        CancelReason::Close => 3,
+        CancelReason::FocusLost => 4,
+        CancelReason::Failed => 5,
+        CancelReason::Exhausted => 6,
+    }
+}
+
+fn write_history(w: &mut Writer, h: &ReadyHistory) {
+    let ReadyHistory {
+        openings,
+        events,
+        arrivals,
+    } = h;
+    w.len(openings.len());
+    for CancelledOpening {
+        start,
+        origin,
+        closed,
+        events,
+        arrivals,
+        reason,
+    } in openings
+    {
+        write_start(w, start);
+        w.int(origin.0);
+        w.int(closed.0);
+        for r in [events, arrivals] {
+            w.uint(u64::from(r.start));
+            w.uint(u64::from(r.end));
+        }
+        w.uint(reason_tag(*reason));
+    }
+    w.len(events.len());
+    for o in openings {
+        let run = events
+            .get(o.events.start as usize..o.events.end as usize)
+            .expect("a cancelled opening's events lie in the history's arena");
+        write_events(w, o.start.opened_at, run);
+    }
+    write_arrivals(w, arrivals);
+}
+
 const OVERFLOW: u64 = 1;
 const SOURCE_LIMIT: u64 = 1 << 1;
 const SUSPEND: u64 = 1 << 2;
@@ -462,8 +577,11 @@ fn write_status(w: &mut Writer, s: &Status) {
     w.uint(match end {
         EndStatus::PlayedToEnd => 0,
         EndStatus::EndedMidway => 1,
+        EndStatus::CancelledBeforePlayback => 2,
     });
-    w.int(finalized.0);
+    if end.played() {
+        w.int(finalized.0);
+    }
     let bit = |set: bool, bit: u64| if set { bit } else { 0 };
     w.uint(
         bit(*overflow, OVERFLOW)
@@ -568,12 +686,35 @@ fn decode_body(body: &[u8], limits: &DecodeLimits) -> Result<PlayRecord, DecodeE
     })?;
     let devices = read_section(&mut r, Section::Devices, |r| read_devices(r, limits))?;
     let n_sources = devices.sources.len();
-    let start = read_section(&mut r, Section::Start, |r| read_start(r, n_sources))?;
-    let events = read_section(&mut r, Section::Events, |r| {
-        read_events(r, limits, n_sources, start.opened_at)
-    })?;
-    let arrivals = read_section(&mut r, Section::Arrivals, read_arrivals)?;
+    // The winning opening's sections are read once the status says there
+    // is one; a capture cancelled before playback leaves them empty.
+    let mut start_r = section(&mut r, Section::Start)?;
+    let mut events_r = section(&mut r, Section::Events)?;
+    let mut arrivals_r = section(&mut r, Section::Arrivals)?;
     let status = read_section(&mut r, Section::Status, read_status)?;
+    let (start, events, arrivals) = if status.end.played() {
+        let start = read_start(&mut start_r, n_sources)?;
+        start_r.finish()?;
+        let n = events_r.uint()?;
+        if n > limits.max_events {
+            return Err(DecodeError::TooManyEvents(n));
+        }
+        // Source, delta and kind.
+        let n = events_r.check_count(n, 3)?;
+        let mut events = Vec::with_capacity(n);
+        read_events(&mut events_r, n, n_sources, start.opened_at, &mut events)?;
+        events_r.finish()?;
+        let arrivals = read_arrivals(&mut arrivals_r)?;
+        arrivals_r.finish()?;
+        (start, events, arrivals)
+    } else {
+        for sub in [&start_r, &events_r, &arrivals_r] {
+            sub.finish()?;
+        }
+        (InputStart::default(), Vec::new(), Vec::new())
+    };
+    let history = read_section(&mut r, Section::History, |r| read_history(r, n_sources))?;
+    check_history(&history, status.end, start.opened_at)?;
     r.finish()?;
     Ok(PlayRecord {
         versions,
@@ -587,6 +728,7 @@ fn decode_body(body: &[u8], limits: &DecodeLimits) -> Result<PlayRecord, DecodeE
         events,
         arrivals,
         status,
+        history,
     })
 }
 
@@ -809,7 +951,7 @@ fn read_source(r: &mut Reader<'_>, n_sources: usize) -> Result<SourceId, DecodeE
 fn read_start(r: &mut Reader<'_>, n_sources: usize) -> Result<InputStart, DecodeError> {
     let opened_at = TimeUs(r.int()?);
     let n = r.count(3)?;
-    if n > eval::MAX_BINDINGS + eval::MAX_AXES {
+    if n > MAX_HELD {
         return Err(DecodeError::TooManyHeld);
     }
     let mut held = Vec::with_capacity(n);
@@ -831,18 +973,15 @@ fn read_start(r: &mut Reader<'_>, n_sources: usize) -> Result<InputStart, Decode
     Ok(InputStart { opened_at, held })
 }
 
+/// Reads `n` events onto `events`, each source's first counting from
+/// `opened_at`; the caller checked `n` and reserved room for them.
 fn read_events(
     r: &mut Reader<'_>,
-    limits: &DecodeLimits,
+    n: usize,
     n_sources: usize,
     opened_at: TimeUs,
-) -> Result<Vec<PhysicalInputEvent>, DecodeError> {
-    let n = r.uint()?;
-    if n > limits.max_events {
-        return Err(DecodeError::TooManyEvents(n));
-    }
-    // Source, delta and kind.
-    let mut events = Vec::with_capacity(r.check_count(n, 3)?);
+    events: &mut Vec<PhysicalInputEvent>,
+) -> Result<(), DecodeError> {
     let mut prev = vec![opened_at.0; n_sources];
     for _ in 0..n {
         let source = read_source(r, n_sources)?;
@@ -862,7 +1001,7 @@ fn read_events(
             kind,
         });
     }
-    Ok(events)
+    Ok(())
 }
 
 fn read_arrivals(r: &mut Reader<'_>) -> Result<Vec<Arrival>, DecodeError> {
@@ -882,9 +1021,14 @@ fn read_status(r: &mut Reader<'_>) -> Result<Status, DecodeError> {
     let end = match r.uint()? {
         0 => EndStatus::PlayedToEnd,
         1 => EndStatus::EndedMidway,
+        2 => EndStatus::CancelledBeforePlayback,
         _ => return Err(DecodeError::InvalidValue("end status")),
     };
-    let finalized = TimeUs(r.int()?);
+    let finalized = if end.played() {
+        TimeUs(r.int()?)
+    } else {
+        TimeUs(0)
+    };
     let bits = r.uint()?;
     if bits & !(OVERFLOW | SOURCE_LIMIT | SUSPEND | INPUT_FAILED) != 0 {
         return Err(DecodeError::InvalidValue("incomplete reasons"));
@@ -899,6 +1043,153 @@ fn read_status(r: &mut Reader<'_>) -> Result<Status, DecodeError> {
             input_failed: bits & INPUT_FAILED != 0,
         },
     })
+}
+
+/// The fewest bytes a cancelled opening takes: its opening time, held
+/// count, origin, closing time, four range bounds and reason.
+const MIN_OPENING_BYTES: usize = 9;
+
+fn read_reason(r: &mut Reader<'_>) -> Result<CancelReason, DecodeError> {
+    Ok(match r.uint()? {
+        0 => CancelReason::Held,
+        1 => CancelReason::Quit,
+        2 => CancelReason::Retry,
+        3 => CancelReason::Close,
+        4 => CancelReason::FocusLost,
+        5 => CancelReason::Failed,
+        6 => CancelReason::Exhausted,
+        _ => return Err(DecodeError::InvalidValue("cancel reason")),
+    })
+}
+
+/// A range of an arena, which starts where the previous one ended, ends
+/// at most at `max` and holds at most `per`.
+fn read_range(
+    r: &mut Reader<'_>,
+    from: u32,
+    per: usize,
+    max: usize,
+) -> Result<Range<u32>, DecodeError> {
+    let (start, end) = (r.u32()?, r.u32()?);
+    if start != from || end < start {
+        return Err(DecodeError::InvalidHistory("range"));
+    }
+    if end as usize > max || (end - start) as usize > per {
+        return Err(DecodeError::TooManyHistoryEvents(u64::from(end)));
+    }
+    Ok(start..end)
+}
+
+/// The history section: every count and range is checked before anything
+/// is allocated for it, and the openings' origins and chronology as they
+/// are read.
+fn read_history(r: &mut Reader<'_>, n_sources: usize) -> Result<ReadyHistory, DecodeError> {
+    let n = r.uint()?;
+    if n > MAX_CANCELLED_OPENINGS as u64 {
+        return Err(DecodeError::TooManyOpenings(n));
+    }
+    let mut openings: Vec<CancelledOpening> =
+        Vec::with_capacity(r.check_count(n, MIN_OPENING_BYTES)?);
+    let (mut events_end, mut arrivals_end) = (0, 0);
+    for _ in 0..n {
+        let start = read_start(r, n_sources)?;
+        let origin = TimeUs(r.int()?);
+        let closed = TimeUs(r.int()?);
+        let events = read_range(r, events_end, MAX_CANCELLED_EVENTS, MAX_CANCELLED_EVENTS)?;
+        let arrivals = read_range(
+            r,
+            arrivals_end,
+            MAX_OPENING_ARRIVALS,
+            MAX_CANCELLED_OPENINGS * MAX_OPENING_ARRIVALS,
+        )?;
+        let reason = read_reason(r)?;
+        if closed < start.opened_at {
+            return Err(DecodeError::InvalidHistory("closing time"));
+        }
+        if let Some(prev) = openings.last() {
+            if origin <= prev.origin {
+                return Err(DecodeError::InvalidHistory("origin"));
+            }
+            if !closes_before(prev.origin, prev.closed, origin, start.opened_at) {
+                return Err(DecodeError::InvalidHistory("chronology"));
+            }
+        }
+        (events_end, arrivals_end) = (events.end, arrivals.end);
+        openings.push(CancelledOpening {
+            start,
+            origin,
+            closed,
+            events,
+            arrivals,
+            reason,
+        });
+    }
+    if r.uint()? != u64::from(events_end) {
+        return Err(DecodeError::InvalidHistory("event count"));
+    }
+    // Source, delta and kind.
+    let mut events = Vec::with_capacity(r.check_count(u64::from(events_end), 3)?);
+    for o in &openings {
+        let run = (o.events.end - o.events.start) as usize;
+        read_events(r, run, n_sources, o.start.opened_at, &mut events)?;
+    }
+    if r.uint()? != u64::from(arrivals_end) {
+        return Err(DecodeError::InvalidHistory("arrival count"));
+    }
+    // Time and kind.
+    let mut arrivals = Vec::with_capacity(r.check_count(u64::from(arrivals_end), 2)?);
+    for _ in 0..arrivals_end {
+        let at = TimeUs(r.int()?);
+        arrivals.push(Arrival {
+            at,
+            kind: read_kind(r)?,
+        });
+    }
+    Ok(ReadyHistory {
+        openings,
+        events,
+        arrivals,
+    })
+}
+
+/// Whether an opening at `origin` closing at `closed` closed no later than
+/// one at `next_origin` opening at `opened` opened, on the last opening's
+/// timeline; computed wide, so no sum overflows.
+fn closes_before(origin: TimeUs, closed: TimeUs, next_origin: TimeUs, opened: TimeUs) -> bool {
+    i128::from(origin.0) + i128::from(closed.0) <= i128::from(next_origin.0) + i128::from(opened.0)
+}
+
+/// The history's agreement with the end status: a played record's
+/// openings were cancelled by a hold and lie before the winning opening
+/// (origin 0) opened at `opened_at`; a capture cancelled before playback
+/// has at least one, the last at origin 0, every earlier one cancelled by
+/// a hold.
+fn check_history(h: &ReadyHistory, end: EndStatus, opened_at: TimeUs) -> Result<(), DecodeError> {
+    let held = |o: &CancelledOpening| o.reason == CancelReason::Held;
+    if end.played() {
+        if !h.openings.iter().all(held) {
+            return Err(DecodeError::InvalidHistory("cancel reason"));
+        }
+        if let Some(last) = h.openings.last() {
+            if last.origin >= TimeUs(0) {
+                return Err(DecodeError::InvalidHistory("origin"));
+            }
+            if !closes_before(last.origin, last.closed, TimeUs(0), opened_at) {
+                return Err(DecodeError::InvalidHistory("chronology"));
+            }
+        }
+        return Ok(());
+    }
+    let Some((last, earlier)) = h.openings.split_last() else {
+        return Err(DecodeError::InvalidHistory("no opening"));
+    };
+    if last.origin != TimeUs(0) {
+        return Err(DecodeError::InvalidHistory("origin"));
+    }
+    if !earlier.iter().all(held) {
+        return Err(DecodeError::InvalidHistory("cancel reason"));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

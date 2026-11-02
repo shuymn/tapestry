@@ -590,6 +590,7 @@ fn sample() -> replay::PlayRecord {
             finalized: TimeUs(0),
             incomplete: replay::Incomplete::default(),
         },
+        history: Default::default(),
     }
 }
 

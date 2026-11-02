@@ -77,6 +77,7 @@ fn record(
             finalized,
             incomplete: Incomplete::default(),
         },
+        history: Default::default(),
     }
 }
 

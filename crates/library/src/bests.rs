@@ -31,6 +31,9 @@ pub struct Verified {
 /// Why a play sets no best, in the order the clauses are checked.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Ineligible {
+    /// A capture cancelled before playback: no played attempt, so neither
+    /// a best nor a play count.
+    NoPlayedAttempt,
     /// Verification refused the record.
     Unverified,
     /// The record was not saved.
@@ -51,6 +54,7 @@ pub enum Ineligible {
 impl fmt::Display for Ineligible {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
+            Self::NoPlayedAttempt => "no played attempt",
             Self::Unverified => "not verified",
             Self::NotSaved => "not saved",
             Self::Incomplete => "record incomplete",
@@ -62,15 +66,19 @@ impl fmt::Display for Ineligible {
     }
 }
 
-/// The first reason `record` sets no best, `None` when it may: verified,
-/// saved, complete, played to the end (which its evaluation confirms), a
-/// full play at 1×. A `#RANDOM` chart's draws share its file's best.
+/// The first reason `record` sets no best, `None` when it may: a played
+/// attempt, verified, saved, complete, played to the end (which its
+/// evaluation confirms), a full play at 1×. A `#RANDOM` chart's draws
+/// share its file's best.
 #[must_use]
 pub fn ineligible(
     record: &PlayRecord,
     verified: Option<&Verified>,
     saved: bool,
 ) -> Option<Ineligible> {
+    if !record.played() {
+        return Some(Ineligible::NoPlayedAttempt);
+    }
     let Some(verified) = verified else {
         return Some(Ineligible::Unverified);
     };

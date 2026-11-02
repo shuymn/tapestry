@@ -21,6 +21,8 @@ pub enum Section {
     Arrivals,
     /// End status, finalized watermark and incompleteness.
     Status,
+    /// The cancelled READY openings.
+    History,
 }
 
 /// Why [`decode`](crate::decode) refused a record.
@@ -116,6 +118,20 @@ pub enum DecodeError {
     /// The stored preset hash does not match the stored preset bytes.
     #[error("the preset hash does not match its bytes")]
     PresetHashMismatch,
+    /// More cancelled openings than
+    /// [`MAX_CANCELLED_OPENINGS`](crate::MAX_CANCELLED_OPENINGS).
+    #[error("{0} cancelled openings exceed the limit")]
+    TooManyOpenings(u64),
+    /// A range of the history's events or arrivals reaches beyond their
+    /// limits ([`MAX_CANCELLED_EVENTS`](crate::MAX_CANCELLED_EVENTS) in
+    /// all, [`MAX_OPENING_ARRIVALS`](crate::MAX_OPENING_ARRIVALS) per
+    /// opening).
+    #[error("a history range ending at {0} exceeds the limit")]
+    TooManyHistoryEvents(u64),
+    /// The history's ranges, origins, chronology or reasons are invalid, or
+    /// disagree with the end status.
+    #[error("invalid history: {0}")]
+    InvalidHistory(&'static str),
 }
 
 #[cfg(test)]
@@ -200,6 +216,18 @@ mod tests {
             (
                 DecodeError::PresetHashMismatch,
                 "the preset hash does not match its bytes",
+            ),
+            (
+                DecodeError::TooManyOpenings(65),
+                "65 cancelled openings exceed the limit",
+            ),
+            (
+                DecodeError::TooManyHistoryEvents(9),
+                "a history range ending at 9 exceeds the limit",
+            ),
+            (
+                DecodeError::InvalidHistory("range"),
+                "invalid history: range",
             ),
         ];
         for (e, message) in cases {

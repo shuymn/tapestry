@@ -126,6 +126,7 @@ fn what_if_peak_stays_within_its_budget() {
             finalized,
             incomplete: Incomplete::default(),
         },
+        history: Default::default(),
     };
     // The counter sees allocations: a positive control.
     let peak_of = |f: &mut dyn FnMut()| {

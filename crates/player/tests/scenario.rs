@@ -134,6 +134,7 @@ fn write_log(path: &Path, events: &[PhysicalInputEvent], sources: usize) {
             finalized: TimeUs(4_000_000),
             incomplete: replay::Incomplete::default(),
         },
+        history: Default::default(),
     };
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(path, replay::encode(&rec)).unwrap();
