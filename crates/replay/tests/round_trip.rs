@@ -309,6 +309,7 @@ fn record() -> impl Strategy<Value = PlayRecord> {
                             input_failed,
                         },
                     },
+                    history: Default::default(),
                 }
             },
         )

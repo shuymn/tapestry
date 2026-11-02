@@ -236,6 +236,7 @@ pub fn record_of(text: &str, seed: u64, events: Vec<PhysicalInputEvent>) -> Play
             finalized,
             incomplete: Incomplete::default(),
         },
+        history: Default::default(),
     }
 }
 

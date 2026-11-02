@@ -60,6 +60,10 @@ impl RecordSink for BestsRecords {
 impl BestsRecords {
     fn count(&self, saved: &RecordRef, play: &SavedPlay<'_>) -> BestView {
         let record = play.record;
+        // No played attempt: no row, as the rebuild leaves none.
+        if !record.played() {
+            return BestView::NotCounted(Ineligible::NoPlayedAttempt.to_string());
+        }
         // Refused by verification: no row, as the rebuild leaves none.
         let (Ok(preset), Ok(evaluation)) = (
             replay::verify::check_record(record),

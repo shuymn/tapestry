@@ -10,7 +10,8 @@
 //! checked first: a file that cannot be read or is too large, a stem that
 //! cannot name a user preset, an invalid preset, or a chart that loads
 //! under none of the records' seeds ends the run before any line.
-//! Each record is then decoded, refused if its input is incomplete, and
+//! Each record is then decoded, refused if it has no played attempt (a
+//! capture cancelled before playback) or its input is incomplete, and
 //! verified against the chart with `replay::verify` (design.md
 //! "Determinism"). It is evaluated under each `--preset` in order, or under
 //! its own preset copy when none is given (design.md "Extension
@@ -243,10 +244,10 @@ fn verified(
 ///
 /// # Errors
 ///
-/// Why the record is refused: it cannot be read or decoded, or its input is
-/// incomplete. Incompleteness is checked before verification, so an
-/// incomplete record is refused as incomplete whatever verification would
-/// say, without loading the chart.
+/// Why the record is refused: it cannot be read or decoded, it has no
+/// played attempt, or its input is incomplete. Both are checked before
+/// verification, in that order, so such a record is refused for them
+/// whatever verification would say, without loading the chart.
 fn decoded(path: &Path) -> Result<PlayRecord, String> {
     let limits = DecodeLimits::STANDARD;
     // The limits the game saves records under. The file is untrusted, so
@@ -260,6 +261,9 @@ fn decoded(path: &Path) -> Result<PlayRecord, String> {
         ));
     }
     let record = replay::decode(&bytes, &limits).map_err(|e| chain(&e))?;
+    if !record.played() {
+        return Err(chain(&replay::verify::VerifyError::NoPlayedAttempt));
+    }
     if let Some(why) = incomplete(record.status.incomplete) {
         return Err(format!("the record's input is incomplete ({why})"));
     }

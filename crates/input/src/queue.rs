@@ -93,9 +93,37 @@ impl SourceWriter {
         self.publish(final_watermark);
         self.shared.closed.store(true, Ordering::Release);
     }
+
+    /// Starts the queue over for another opening on a new timeline: the
+    /// watermark goes back to before the first publication and the source
+    /// is open again; an overflow stays. Taking `reader` proves the caller
+    /// holds both ends, so no reader sees the watermark move back. Returns
+    /// `false`, changing nothing, when `reader` is another queue's or still
+    /// has events.
+    pub(crate) fn rearm(&mut self, reader: &SourceReader) -> bool {
+        if !self.pairs(reader) || !reader.is_empty() {
+            return false;
+        }
+        self.shared.closed.store(false, Ordering::Release);
+        self.shared
+            .received_up_to
+            .store(i64::MIN, Ordering::Release);
+        true
+    }
+
+    /// Whether `reader` is this queue's other end.
+    pub(crate) fn pairs(&self, reader: &SourceReader) -> bool {
+        Arc::ptr_eq(&self.shared, &reader.shared)
+    }
 }
 
 impl SourceReader {
+    /// Whether no event is queued.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.queue.is_empty()
+    }
+
     /// What the source last published. Read it before popping: every event
     /// received at or before it is then poppable.
     #[must_use]
@@ -162,5 +190,21 @@ mod tests {
         assert_eq!(r.pop(), Some(ev(12)));
         assert_eq!(r.pop(), None);
         assert!(!r.overflowed());
+    }
+
+    #[test]
+    fn rearm_needs_its_own_drained_reader() {
+        let (mut w, mut r) = source_queue(1);
+        let (_, other) = source_queue(1);
+        w.push(ev(10)).unwrap();
+        w.push(ev(11)).unwrap_err();
+        w.close(TimeUs(10));
+        assert!(!w.rearm(&r), "an event is left");
+        assert!(r.pop().is_some());
+        assert!(!w.rearm(&other));
+        assert_eq!(r.published(), Published::closed(TimeUs(10)));
+        assert!(w.rearm(&r));
+        assert_eq!(r.published(), Published::open(TimeUs(i64::MIN)));
+        assert!(r.overflowed());
     }
 }

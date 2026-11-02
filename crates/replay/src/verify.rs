@@ -5,10 +5,12 @@
 //! A record reaches this module decoded, so the decoding checks (format
 //! version, structure, preset hash) have already passed. The rest are
 //! checked here in a fixed order, and the first failure is the refusal:
-//! the evaluator version, the recorded preset copy, the loader version, the
+//! a played attempt (a capture cancelled before playback has none, and
+//! nothing to evaluate), the evaluator version, the recorded preset copy,
+//! the loader version, the
 //! load with the recorded seed and speed, the resolved-chart hash, the
 //! played-chart hash, and the chart transform. [`load_recorded_chart`]
-//! runs every check and [`evaluate_record`] the first two again, so each
+//! runs every check and [`evaluate_record`] the first three again, so each
 //! entry point refuses in that order on its own. The chart file's SHA-256
 //! is not compared: an edited file that resolves to the same chart, at
 //! the record's speed too, verifies. [`check_record`] runs the checks made
@@ -29,6 +31,11 @@ use crate::{EndStatus, PASSTHROUGH, PlayRecord, preset_hash};
 /// Why a record was refused, in the order the checks run.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum VerifyError {
+    /// The record is a capture cancelled before playback: it has no played
+    /// attempt, so no score (design.md "Play Lifecycle", ending without a
+    /// played attempt).
+    #[error("the record has no played attempt: it was cancelled before playback")]
+    NoPlayedAttempt,
     /// The record was made by an evaluator version this build does not run.
     #[error("the record was made by evaluator version {0}, which this build does not run")]
     UnsupportedEvaluator(u32),
@@ -131,8 +138,12 @@ fn practice_section(record: &PlayRecord, preset: &RulePreset) -> Option<(Section
     Some((section, started_at_default))
 }
 
-/// Checks the record's evaluator version, then decodes its preset copy.
+/// Checks that the record has a played attempt and its evaluator version,
+/// then decodes its preset copy.
 fn recorded_preset(record: &PlayRecord) -> Result<RulePreset, VerifyError> {
+    if !record.played() {
+        return Err(VerifyError::NoPlayedAttempt);
+    }
     let evaluator = record.versions.evaluator;
     if evaluator != Implementation::STANDARD_VERSION {
         return Err(VerifyError::UnsupportedEvaluator(evaluator));
@@ -142,11 +153,12 @@ fn recorded_preset(record: &PlayRecord) -> Result<RulePreset, VerifyError> {
 }
 
 /// The checks a record passes before its chart is read, in their order:
-/// the evaluator version, the recorded preset copy and the loader version.
-/// Returns the decoded preset copy.
+/// a played attempt, the evaluator version, the recorded preset copy and
+/// the loader version. Returns the decoded preset copy.
 ///
 /// # Errors
 ///
+/// [`NoPlayedAttempt`](VerifyError::NoPlayedAttempt),
 /// [`UnsupportedEvaluator`](VerifyError::UnsupportedEvaluator),
 /// [`PresetCopy`](VerifyError::PresetCopy) or
 /// [`UnsupportedLoader`](VerifyError::UnsupportedLoader).
@@ -204,8 +216,9 @@ pub fn admit(
 /// # Errors
 ///
 /// The first check that fails, in this order:
+/// [`NoPlayedAttempt`](VerifyError::NoPlayedAttempt),
 /// [`UnsupportedEvaluator`](VerifyError::UnsupportedEvaluator),
-/// [`PresetCopy`](VerifyError::PresetCopy) (both before the bytes are
+/// [`PresetCopy`](VerifyError::PresetCopy) (all before the bytes are
 /// read), [`UnsupportedLoader`](VerifyError::UnsupportedLoader),
 /// [`Load`](VerifyError::Load) with the recorded `#RANDOM` seed and speed,
 /// [`ResolvedChartMismatch`](VerifyError::ResolvedChartMismatch),
@@ -250,6 +263,7 @@ pub fn load_recorded_chart(
 ///
 /// # Errors
 ///
+/// [`NoPlayedAttempt`](VerifyError::NoPlayedAttempt),
 /// [`UnsupportedEvaluator`](VerifyError::UnsupportedEvaluator), then
 /// [`PresetCopy`](VerifyError::PresetCopy): the copy is decoded with an
 /// override too. Then what the evaluator refuses
@@ -281,7 +295,8 @@ pub fn evaluate_record(
 /// ([`ReEvaluation::started_at_default`]); the final deadline is then the
 /// section's.
 ///
-/// The evaluator version is not checked here; the caller checks it first.
+/// Neither the played attempt nor the evaluator version is checked here;
+/// the caller checks them first ([`check_record`]).
 ///
 /// # Errors
 ///

@@ -95,9 +95,32 @@ fn write_log(chart: &bms_model::Chart, path: &Path) -> Vec<eval::PhysicalInputEv
             finalized: TimeUs(4_000_000),
             incomplete: replay::Incomplete::default(),
         },
+        history: Default::default(),
     };
     fs::write(path, replay::encode(&rec)).unwrap();
     events
+}
+
+/// `path` rewritten as a capture cancelled before playback: no winning
+/// opening, its one READY quit at origin 0.
+fn cancel_log(path: &Path) {
+    let mut rec = replay::decode(&fs::read(path).unwrap(), &DecodeLimits::default()).unwrap();
+    rec.start = InputStart::default();
+    rec.events.clear();
+    rec.status = Status {
+        end: EndStatus::CancelledBeforePlayback,
+        finalized: TimeUs(0),
+        incomplete: replay::Incomplete::default(),
+    };
+    rec.history.openings = vec![replay::CancelledOpening {
+        start: InputStart::default(),
+        origin: TimeUs(0),
+        closed: TimeUs(0),
+        events: 0..0,
+        arrivals: 0..0,
+        reason: replay::CancelReason::Quit,
+    }];
+    fs::write(path, replay::encode(&rec)).unwrap();
 }
 
 /// A temporary folder with the chart, its sound, and an input log that hits
@@ -447,6 +470,29 @@ fn an_invalid_key_config_exits_nonzero() {
         assert!(!appdata.join("tapestry").join("records").exists());
     }
 }
+
+/// A capture cancelled before playback is no script: the run ends with
+/// the reason and a nonzero exit, and nothing is recorded.
+#[test]
+fn a_cancelled_capture_is_no_script() {
+    let Fixture {
+        dir: _dir,
+        chart_path,
+        log,
+        appdata,
+        ..
+    } = fixture();
+    cancel_log(&log);
+    let out = scripted_play(&chart_path, &log, &appdata)
+        .output()
+        .expect("run tapestry");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    let refusal = replay::verify::VerifyError::NoPlayedAttempt.to_string();
+    assert!(stderr.contains(&refusal), "{stderr}");
+    assert!(!appdata.join("tapestry").join("records").exists());
+}
+
 /// A scripted run that retries once by itself (`--dev-auto-retry`), with
 /// `extra` arguments: the retried play replays the log from its start on
 /// devices in their first state, so both plays hit every note, both

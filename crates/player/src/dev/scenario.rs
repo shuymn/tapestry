@@ -1833,6 +1833,7 @@ mod tests {
                 finalized: TimeUs(0),
                 incomplete: replay::Incomplete::default(),
             },
+            history: Default::default(),
         };
         fs::write(dir.join("log.tprl"), replay::encode(&rec)).unwrap();
     }

@@ -2293,6 +2293,41 @@ fn under_checks_the_evaluator_version_first() {
             Err(game::ReEvaluationError::UnsupportedEvaluator(4))
         );
     }
+    // A capture cancelled before playback is refused before that: it has
+    // no played attempt, and the result extension gives it no score.
+    record.status.end = replay::EndStatus::CancelledBeforePlayback;
+    let opened = std::mem::take(&mut record.start);
+    let events = std::mem::take(&mut record.events);
+    let n = u32::try_from(events.len()).unwrap();
+    record.history = replay::ReadyHistory {
+        openings: vec![replay::CancelledOpening {
+            start: opened,
+            origin: TimeUs(0),
+            closed: record.status.finalized,
+            events: 0..n,
+            arrivals: 0..0,
+            reason: replay::CancelReason::Quit,
+        }],
+        events,
+        arrivals: Vec::new(),
+    };
+    record.status.finalized = TimeUs(0);
+    let ctx = game::ResultContext {
+        record: &record,
+        chart: &chart,
+        preset: &tapestry,
+        live: &one.live,
+    };
+    for preset in [tapestry.clone(), bad_edge(220)] {
+        assert_eq!(
+            ReEvaluate::under(&ctx, &preset).map(|_| ()),
+            Err(game::ReEvaluationError::NoPlayedAttempt)
+        );
+    }
+    assert_eq!(
+        game::ResultExtension::on_play_end(&mut ReEvaluate, &ctx).evaluation,
+        Err(game::ReEvaluationError::NoPlayedAttempt)
+    );
 }
 
 /// The chosen preset fails to load and is then restored to the same rules:

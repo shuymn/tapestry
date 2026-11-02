@@ -107,6 +107,7 @@ fn played_from(text: &str, seed: u64, offset: i64) -> (TempDir, PlayRecord) {
             finalized: TimeUs(4_180 * MS),
             incomplete: Incomplete::default(),
         },
+        history: Default::default(),
     };
     (dir, record)
 }
@@ -902,4 +903,57 @@ fn admission_compares_the_estimate_with_the_budget() {
     let mut more = record.clone();
     more.events.push(press(5_000 * MS, 1));
     assert!(batch_bytes(&more, &chart, &preset).unwrap() > needed);
+}
+
+/// [`played`] as a capture cancelled before playback: its one opening, quit
+/// before its transport committed, holds the input, and there is no
+/// winning opening.
+fn cancelled() -> (TempDir, PlayRecord) {
+    let (dir, mut record) = played();
+    let events = std::mem::take(&mut record.events);
+    let n = u32::try_from(events.len()).unwrap();
+    record.history = crate::ReadyHistory {
+        openings: vec![crate::CancelledOpening {
+            start: std::mem::take(&mut record.start),
+            origin: TimeUs(0),
+            closed: TimeUs(4_100 * MS),
+            events: 0..n,
+            arrivals: 0..0,
+            reason: crate::CancelReason::Quit,
+        }],
+        events,
+        arrivals: Vec::new(),
+    };
+    record.status.end = EndStatus::CancelledBeforePlayback;
+    record.status.finalized = TimeUs(0);
+    (dir, record)
+}
+
+#[test]
+fn a_capture_cancelled_before_playback_has_no_played_attempt() {
+    let (dir, record) = cancelled();
+    assert_eq!(
+        decode(&encode(&record), &DecodeLimits::STANDARD),
+        Ok(record.clone())
+    );
+    // Refused first, before the evaluator version, and with no chart read.
+    let mut other = record.clone();
+    other.versions.evaluator += 1;
+    for r in [&record, &other] {
+        assert_eq!(check_record(r), Err(VerifyError::NoPlayedAttempt));
+        assert_eq!(
+            load_recorded_chart(r, UNLOADABLE, dir.path()).map(|_| ()),
+            Err(VerifyError::NoPlayedAttempt)
+        );
+    }
+    let (_, played) = played();
+    let chart = load_recorded_chart(&played, CHART.as_bytes(), dir.path()).unwrap();
+    assert_eq!(
+        evaluate_record(&record, &chart, Some(&rules::tapestry())).map(|_| ()),
+        Err(VerifyError::NoPlayedAttempt)
+    );
+    assert_eq!(
+        VerifyError::NoPlayedAttempt.to_string(),
+        "the record has no played attempt: it was cancelled before playback"
+    );
 }

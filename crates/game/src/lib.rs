@@ -14,6 +14,7 @@
 
 #![forbid(unsafe_code)]
 
+mod adjust_keys;
 pub mod adjustment;
 pub mod app;
 mod attempt;
@@ -31,6 +32,7 @@ mod practice_screen;
 mod prepare;
 pub mod presets;
 mod queue;
+mod ready_history;
 mod render;
 mod restore;
 mod result_graphs;
@@ -43,6 +45,9 @@ mod settings;
 mod sound;
 mod tuning;
 
+pub use adjust_keys::{
+    AdjustBinding, AdjustKeyError, AdjustmentConfig, AdjustmentKeys, AdjustmentPlan,
+};
 pub use app::{App, AppRig, IDLE_WAIT, LoadRefusal, Loading, Pick, Refused};
 pub use attempt::{Attempt, AttemptKind, NoteEnd, Preparation, PreparationRefusal};
 pub use audio_loop::{
@@ -86,6 +91,7 @@ pub use presets::{
     Entry, POLL_INTERVAL, PollDeadline, PresetChange, PresetStep, Shelf, ShelfError, UnknownPreset,
 };
 pub use queue::{DEFAULT_QUEUED_PERIODS, QUEUED_PERIODS, QueueChoice, RAISED_QUEUED_PERIODS};
+pub use ready_history::{HistoryFull, HistoryRecorder};
 pub use render::{PlayView, RenderSide, RenderSink};
 pub use restore::{Restore, RestoreError, RestoreRefusal, Restored, Restorer};
 pub use result_graphs::{

@@ -5,12 +5,18 @@
 //! source's queue, then publishes `fresh − 1 µs` from a clock read taken
 //! after the push ([`SourceSet::end_batch`]); the logic thread reads the
 //! publication with `Acquire` before popping, so every event at or below it
-//! is already poppable. The participants are frozen when recording opens,
-//! and the controls held at that boundary go into [`eval::InputStart`].
+//! is already poppable. The participants are frozen when an attempt opens
+//! its one source table ([`SourceSet::open_attempt`]), and the controls
+//! held at each opening's boundary go into [`eval::InputStart`]; a later
+//! opening of the attempt reuses the table's queues and storage
+//! ([`SourceSet::reopen`]).
 //! The [`FocusGate`] keeps input received after focus loss out of the log.
 //! While recording is closed, the configured controller's bound controls
 //! can drive the menus instead ([`MenuTap`], [`SourceSet::set_menu`]),
-//! through a bounded queue; nothing of it is recorded.
+//! through a bounded queue; nothing of it is recorded. The play
+//! adjustments' controls go through their own bounded tap
+//! ([`AdjustmentTap`]), recording open or not, which also keeps the
+//! physical hold latch ([`HoldLatch`]).
 //!
 //! [`ScriptedInput`] feeds a scenario or a recorded log through the same
 //! path. [`autoplay`] makes the inputs that hit every note of a chart, and
@@ -25,13 +31,14 @@
 //! ([`raw`]), turning controller reports into packets ([`hid`]) and
 //! converting QPC ticks ([`qpc_to_us`]) are portable.
 //!
-//! After construction (and after [`SourceSet::open_recording`]), pushing
-//! and publishing allocate nothing.
+//! After construction (and after [`SourceSet::open_attempt`]), pushing,
+//! publishing, tapping and reopening allocate nothing.
 
 // Only the Windows OS calls use `unsafe`, in the `win` module.
 #![cfg_attr(not(windows), forbid(unsafe_code))]
 #![cfg_attr(windows, deny(unsafe_code))]
 
+mod adjust;
 mod autoplay;
 pub mod cadence;
 mod capture;
@@ -49,6 +56,10 @@ mod win;
 
 use bms_model::TimeUs;
 
+pub use adjust::{
+    ADJUST_QUEUE, AdjustmentBindings, AdjustmentReceiver, AdjustmentTap, Hold, HoldLatch,
+    MAX_TAPPED, TapControl, TapError, TapEvent, TapObservation, adjustment_queue,
+};
 pub use autoplay::{AUTOPLAY_DEVICE, AutoplayInput, TimeOverflow, autoplay, autoplay_count};
 pub use cadence::{Phase, WakeReport};
 pub use capture::{Capture, Watched};
@@ -58,7 +69,9 @@ pub use menu::{
 };
 pub use queue::{Overflow, SourceReader, SourceWriter, source_queue};
 pub use scripted::{Action, ScriptItem, ScriptedInput, declared_axes};
-pub use sources::{Arrival, ConfigError, DeviceKind, SOURCE_LIMIT, SourceConfig, SourceSet};
+pub use sources::{
+    Arrival, ConfigError, DeviceKind, ReopenError, SOURCE_LIMIT, SourceConfig, SourceSet,
+};
 pub use time::{Percentile, QpcFrequency, WAKE_HISTOGRAM_LIMIT, WakeHistogram, qpc_to_us};
 #[cfg(windows)]
 pub use win::{

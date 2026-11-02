@@ -159,6 +159,7 @@ pub const IN_PLAY: &[Site] = &[
         ],
     ),
     // The input thread.
+    Site::File("crates/input/src/adjust.rs"),
     Site::File("crates/input/src/autoplay.rs"),
     Site::File("crates/input/src/cadence.rs"),
     Site::File("crates/input/src/capture.rs"),
@@ -173,8 +174,13 @@ pub const IN_PLAY: &[Site] = &[
     Site::File("crates/player/src/input_side.rs"),
     // The logic step and its sinks.
     Site::File("crates/game/src/adjustment.rs"),
+    Site::Fns(
+        "crates/game/src/adjust_keys.rs",
+        &["AdjustmentPlan::observation"],
+    ),
     Site::File("crates/game/src/hispeed.rs"),
     Site::File("crates/game/src/logic.rs"),
+    Site::File("crates/game/src/ready_history.rs"),
     Site::File("crates/game/src/render.rs"),
     Site::File("crates/game/src/sound.rs"),
     Site::Fns(
@@ -193,7 +199,12 @@ pub const IN_PLAY: &[Site] = &[
     ),
     Site::Fns(
         "crates/game/src/session.rs",
-        &["Loaded::ends_play", "Command::cause"],
+        &[
+            "Loaded::ends_play",
+            "Command::cause",
+            "arrival",
+            "replay_kind",
+        ],
     ),
     Site::Fns(
         "crates/game/src/policy.rs",

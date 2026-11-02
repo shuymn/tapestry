@@ -76,11 +76,14 @@ pub enum Refusal {
     Eval,
     /// Checking or evaluating it panicked.
     Panicked,
+    /// It is a capture cancelled before playback: no played attempt, so
+    /// nothing to count.
+    NoPlayedAttempt,
 }
 
 impl Refusal {
     /// Every refusal with its name, its index the number it is stored as.
-    const TABLE: [(Self, &'static str); 15] = [
+    const TABLE: [(Self, &'static str); 16] = [
         (Self::Missing, "missing"),
         (Self::Unreadable, "unreadable"),
         (Self::Decode, "decode"),
@@ -96,6 +99,7 @@ impl Refusal {
         (Self::TooLarge, "too large"),
         (Self::Eval, "eval"),
         (Self::Panicked, "panicked"),
+        (Self::NoPlayedAttempt, "no played attempt"),
     ];
 
     /// The number it is stored as.
@@ -128,6 +132,7 @@ impl Refusal {
 
     fn of(e: &VerifyError) -> Self {
         match e {
+            VerifyError::NoPlayedAttempt => Self::NoPlayedAttempt,
             VerifyError::UnsupportedEvaluator(_) => Self::Evaluator,
             VerifyError::PresetCopy(_) => Self::PresetCopy,
             VerifyError::UnsupportedLoader(_) => Self::Loader,
@@ -174,6 +179,8 @@ pub struct Refusals {
     pub eval: u64,
     /// [`Refusal::Panicked`].
     pub panicked: u64,
+    /// [`Refusal::NoPlayedAttempt`].
+    pub no_played_attempt: u64,
 }
 
 impl Refusals {
@@ -195,6 +202,7 @@ impl Refusals {
             Refusal::TooLarge => &mut self.too_large,
             Refusal::Eval => &mut self.eval,
             Refusal::Panicked => &mut self.panicked,
+            Refusal::NoPlayedAttempt => &mut self.no_played_attempt,
         }
     }
 

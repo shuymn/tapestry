@@ -23,7 +23,8 @@ use input::hid::is_axis;
 use input::{Arrival as InputArrival, DeviceKind, InputAdapter, ScriptedInput, SourceSet};
 use replay::{
     Arrival, BuildProvenance, ChartRecord, DeviceRecord, EndStatus, Incomplete, PlayRecord,
-    PlayType, PresetRecord, ReceiveMethod, SourceRecord, Status, Versions, WakePolicy,
+    PlayType, PresetRecord, ReadyHistory, ReceiveMethod, SourceRecord, Status, Versions,
+    WakePolicy,
 };
 use rules::{GaugeKind, GaugeValue, RulePreset};
 
@@ -1368,6 +1369,9 @@ impl Loaded {
                 finalized,
                 incomplete,
             },
+            // The start gate is not active: the attempt's first READY is
+            // its winning opening, so none was cancelled.
+            history: ReadyHistory::default(),
         });
         let parts = &mut self.parts;
         let saved = parts
@@ -1786,6 +1790,7 @@ impl<O: AudioOutput + Wakes> Rig for SessionRig<'_, O> {
     fn show_end(&mut self, _report: &PlayReport, _screen: &crate::result_screen::ResultScreen) {}
 }
 
+#[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 const fn replay_kind(kind: DeviceKind) -> replay::DeviceKind {
     match kind {
         DeviceKind::Keyboard => replay::DeviceKind::Keyboard,
@@ -1811,7 +1816,8 @@ pub fn wake_policy(receive: ReceiveMethod) -> WakePolicy {
     }
 }
 
-fn arrival(a: &InputArrival) -> Arrival {
+#[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+pub(crate) fn arrival(a: &InputArrival) -> Arrival {
     Arrival {
         at: a.at,
         kind: replay_kind(a.kind),
@@ -1909,6 +1915,21 @@ impl Reservation {
             .saturating_add(schedule.saturating_mul(size_of::<BgmEvent>()));
         Self {
             fixed: self.fixed.saturating_add(own),
+            per_input: self.per_input,
+        }
+    }
+
+    /// This reservation with an attempt's history of cancelled READY
+    /// openings added to its fixed part: the arenas a
+    /// [`HistoryRecorder`](crate::HistoryRecorder) reserves for `held`
+    /// entries per held snapshot, allocated once before the first READY
+    /// opens and reused by every opening, never charged per opening.
+    #[must_use]
+    pub const fn with_history(self, held: usize) -> Self {
+        Self {
+            fixed: self
+                .fixed
+                .saturating_add(crate::HistoryRecorder::bytes(held)),
             per_input: self.per_input,
         }
     }

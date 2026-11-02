@@ -112,6 +112,7 @@ fn played_with(chart: &str, seed: u64) -> PlayRecord {
             finalized: TimeUs(4_180 * MS),
             incomplete: Incomplete::default(),
         },
+        history: Default::default(),
     }
 }
 
@@ -795,5 +796,52 @@ fn a_record_over_the_memory_budget_is_refused() {
     assert!(
         lines[1].starts_with("file.tprl | preset tapestry | as played"),
         "{out}"
+    );
+}
+
+/// [`played`] of `chart` as a capture cancelled before playback: its one
+/// opening, quit before its transport committed, holds the input.
+fn cancelled(chart: &str) -> PlayRecord {
+    let mut record = played(chart);
+    let events = std::mem::take(&mut record.events);
+    let n = u32::try_from(events.len()).unwrap();
+    record.history = replay::ReadyHistory {
+        openings: vec![replay::CancelledOpening {
+            start: std::mem::take(&mut record.start),
+            origin: TimeUs(0),
+            closed: TimeUs(4_100 * MS),
+            events: 0..n,
+            arrivals: 0..0,
+            reason: replay::CancelReason::Quit,
+        }],
+        events,
+        arrivals: Vec::new(),
+    };
+    record.status.end = EndStatus::CancelledBeforePlayback;
+    record.status.finalized = TimeUs(0);
+    record
+}
+
+#[test]
+fn a_capture_cancelled_before_playback_has_no_played_attempt() {
+    let dir = folder();
+    // On a record of another chart, incomplete too: the missing played
+    // attempt is the refusal, and the chart is not loaded for it.
+    let mut record = cancelled(OTHER_CHART);
+    record.status.incomplete.overflow = true;
+    save(dir.path(), "cancelled.tprl", &record);
+    save(dir.path(), "play.tprl", &played(CHART));
+    let o = run(
+        dir.path(),
+        &["--chart", "chart.bms", "cancelled.tprl", "play.tprl"],
+    );
+    assert_eq!(o.status.code(), Some(1), "{o:?}");
+    assert_eq!(
+        stdout(&o),
+        format!(
+            "cancelled.tprl | recorded preset | refused: the record has no played attempt: it \
+             was cancelled before playback\n\
+             play.tprl | recorded preset | as played | {TAPESTRY_TOTALS}\n"
+        )
     );
 }
