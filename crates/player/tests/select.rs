@@ -219,7 +219,7 @@ fn result_switches_presets_on_the_real_threads() {
 /// Two charts on the same threads: the second plays its own sound, never
 /// the first's, though both name it `#WAV01`, and its own input, four
 /// times longer than the first's, every note of it on time; each chart's
-/// load time is printed; and every countdown, a retry's too, starts only after the
+/// load time is printed; and every READY state, a retry's too, starts only after the
 /// scan's pause was acknowledged (or no scan ran).
 #[test]
 fn a_second_chart_plays_only_its_own_sounds() {
@@ -251,15 +251,15 @@ fn a_second_chart_plays_only_its_own_sounds() {
     // Each at its own measured gain: b's quiet sound, at the +6 dB cap,
     // stays far below a's.
     assert!(b.iter().all(|&p| p < 0.1), "{peaks:?}");
-    // Each countdown follows a pause line since the one before.
+    // Each READY state follows a pause line since the one before.
     let mut paused = false;
     for line in stdout.lines() {
-        if line.starts_with("library: the scan paused before the countdown")
-            || line.starts_with("library: no scan before the countdown")
+        if line.starts_with("library: the scan paused before READY")
+            || line.starts_with("library: no scan before READY")
         {
             paused = true;
         } else if line == "play started" {
-            assert!(paused, "a countdown without a pause:\n{stdout}");
+            assert!(paused, "a READY state without a pause:\n{stdout}");
             paused = false;
         }
     }
@@ -278,9 +278,9 @@ fn measured_gain(line: &str) -> f64 {
 }
 
 /// A chart whose loudness the library misses is measured during its load,
-/// before its first countdown: its first play and its retry sound at the
+/// before its first READY state: its first play and its retry sound at the
 /// measured gain, not the 0.5 headroom. Its next load finds the
-/// measurement stored at that countdown and measures nothing. Judgment is
+/// measurement stored at that READY state and measures nothing. Judgment is
 /// the same at either gain.
 #[test]
 fn the_first_play_has_the_measured_gain() {
@@ -294,7 +294,7 @@ fn the_first_play_has_the_measured_gain() {
         &[],
     );
     assert_eq!(lines(&stdout, "play started").len(), 4, "{stdout}");
-    // Each measured once, during its first load, before its countdown.
+    // Each measured once, during its first load, before its READY state.
     for name in ["a.bms", "b.bms"] {
         let line = format!("loudness: measuring {name}");
         assert_eq!(lines(&stdout, &line).len(), 1, "{stdout}");
@@ -352,7 +352,7 @@ fn the_first_play_has_the_measured_gain() {
 
 /// Closing the window while a chart's loudness is measured cancels the
 /// measurement and the load: nothing more is prepared (the chart is never
-/// ready, no countdown starts), nothing is stored, and the run ends at
+/// ready, no READY state starts), nothing is stored, and the run ends at
 /// once with 0. The next run measures the chart again.
 #[test]
 fn closing_during_the_measurement_leaves_the_load() {
@@ -464,7 +464,7 @@ fn has_red_run((w, _, rgba): &(usize, usize, Vec<u8>), len: usize) -> bool {
 /// Choosing a chart switches at once to the play screen in its loading
 /// state, the lanes and judgment line drawn without notes, the chart's
 /// lines saying each stage over it, drawn on (its frame dumped) while a
-/// slow load holds, until the countdown.
+/// slow load holds, until READY.
 #[test]
 fn the_play_screen_loads_from_the_choice_through_a_slow_load() {
     let fx = fixture();
@@ -512,7 +512,7 @@ fn the_play_screen_loads_from_the_choice_through_a_slow_load() {
 }
 
 /// The quit key during a load cancels it and returns to selection: the
-/// chart is not readied and no countdown starts; Enter then plays it.
+/// chart is not readied and no READY state starts; Enter then plays it.
 #[test]
 fn the_quit_key_during_a_load_returns_to_selection() {
     let fx = fixture();
@@ -597,7 +597,7 @@ fn the_quit_key_stops_the_sound_decode() {
 fn a_quit_after_the_last_file_is_decoded_cancels_the_load() {
     let fx = fixture();
     write_chart(&fx.library, "a", "a.bms", "譜面A", 4_000);
-    // The first run measures the chart and stores it at its countdown.
+    // The first run measures the chart and stores it at its READY state.
     let (_, first) = run(&fx, "pick=a.bms,enter,back,close", &[]);
     assert_eq!(lines(&first, "loudness: a.bms measured in ").len(), 1);
     let (_, stdout) = run(
@@ -633,7 +633,7 @@ fn count(stdout: &str, line: &str) -> usize {
 /// block and returns to selection at once, before the measurement could
 /// have ended; the chart is then measured in the background and its
 /// result kept, so the next choice measures nothing and plays it, and
-/// stored at that countdown, so the next run measures nothing either.
+/// stored at that READY state, so the next run measures nothing either.
 #[test]
 fn the_quit_key_leaves_the_measurement_to_the_background() {
     let fx = fixture();
@@ -754,7 +754,7 @@ fn closing_while_measuring_in_the_background_stores_nothing() {
 }
 
 /// Closing the window during a load cancels it and ends the run at once
-/// with 0, before any countdown.
+/// with 0, before any READY state.
 #[test]
 fn closing_during_a_load_ends_the_run() {
     let fx = fixture();

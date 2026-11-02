@@ -2,7 +2,7 @@
 //! (design.md "Personal Bests"): a chart near the loader's 500,000-object
 //! limit with a record of few inputs, and a record as dense as admission
 //! allows. A pause is acknowledged once the step in hand finishes, so these
-//! bound a countdown's wait for the rebuild. Indicators, not gates; run in
+//! bound a READY state's wait for the rebuild. Indicators, not gates; run in
 //! release:
 //!
 //! `cargo test --release -p library --test rebuild_time -- --ignored --nocapture`

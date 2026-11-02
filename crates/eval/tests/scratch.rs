@@ -347,7 +347,7 @@ fn axis_capacity_holds_a_song_of_1khz_reports() {
     assert_eq!(capacity, 225_680);
 
     // The axis turns forward one position every millisecond from the start
-    // of the countdown to the final deadline: 181_181 reports.
+    // of READY to the final deadline: 181_181 reports.
     let mut ev =
         Evaluator::new(&chart, &rule, &dev, &InputStart::default(), None, capacity).unwrap();
     let mut pushed = 0;
@@ -377,7 +377,7 @@ fn axis_capacity_holds_a_song_of_1khz_reports() {
     let mut out = Vec::with_capacity(ev.max_events(capacity));
     ev.advance_to(TimeUs(t), &mut out).unwrap();
     // Every input was evaluated: the spinning axis pressed once, 2 ms into
-    // the countdown, and held to the end, so the scratch tap at 500 ms was
+    // READY, and held to the end, so the scratch tap at 500 ms was
     // missed; the 180 key taps were missed before the key presses.
     let j = judged(&out);
     assert_eq!(

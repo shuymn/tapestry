@@ -13,7 +13,7 @@
 //!   waiting job is dropped, never the running one; a dropped chart is
 //!   measured at its next choice, as one never queued.
 //! - **Pausing** follows the scan's: a choice requests a pause, each
-//!   countdown waits for its acknowledgment, and selection and each result
+//!   READY state waits for its acknowledgment, and selection and each result
 //!   release it, so the thread never measures during a play. A measurement
 //!   stopped by a pause starts again from the beginning once released; the
 //!   running measurement of the chart just chosen goes on through the
@@ -635,7 +635,7 @@ mod tests {
     }
 
     /// A pause stops the running measurement at its next block and is
-    /// acknowledged (before a countdown): nothing is measured, and no
+    /// acknowledged (before a READY state): nothing is measured, and no
     /// waiting job starts, until the release (selection), after which the
     /// stopped job is measured again from the beginning.
     #[test]
@@ -652,7 +652,7 @@ mod tests {
         assert_eq!(probe.blocks.load(Ordering::SeqCst), blocks);
         assert_eq!(probe.starts(), all(&["a"]));
         assert!(worker.take_results().is_empty());
-        // A second request, as a retry's countdown makes, is acknowledged
+        // A second request, as a retry's READY state makes, is acknowledged
         // too.
         worker.release();
         worker.request_pause(None);
@@ -827,7 +827,7 @@ mod tests {
     }
 
     /// A thread that ended (its start hook panicked) takes no job, holds
-    /// none, and counts as paused, so no countdown waits for it.
+    /// none, and counts as paused, so no READY state waits for it.
     #[test]
     fn an_ended_thread_takes_nothing() {
         let probe = Arc::new(Probe::default());

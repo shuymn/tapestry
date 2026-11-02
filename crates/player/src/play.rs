@@ -72,7 +72,7 @@ pub struct PlayerRig<'a> {
     /// Whether the session plays generated input (design.md "Autoplay"):
     /// no recommended input offset, and "not saved" when nothing was.
     pub autoplay: bool,
-    /// The countdown's length: from the opening to chart time 0, as the
+    /// READY's length: from the opening to chart time 0, as the
     /// current play's opening was given it.
     pub lead_in: TimeUs,
     /// What restores a practice round's audio: the engine's seek source and
@@ -118,8 +118,8 @@ pub struct PlayerRig<'a> {
     pub retry_from: Option<TimeUs>,
     /// Load times shown on the end screen.
     pub times: LoadTimes,
-    /// When the current play's countdown started, on the clock.
-    pub countdown_at: Option<TimeUs>,
+    /// When the current play's READY state started, on the clock.
+    pub ready_state_at: Option<TimeUs>,
     /// Where the current play's chart time 0 lies on the clock.
     pub origin: Option<TimeUs>,
     /// Where each logic step's measurement goes (the render thread).
@@ -190,7 +190,7 @@ impl PlayerRig<'_> {
             .write(self.controls.tuning().get(), self.queue.periods());
     }
 
-    /// Counts the ended play's underruns after its countdown, raises the
+    /// Counts the ended play's underruns after its READY state, raises the
     /// next play's queue on any, and keeps the end screen's line.
     fn judge_queue(&mut self) {
         let steady = self
@@ -207,7 +207,7 @@ impl PlayerRig<'_> {
             next,
         };
         println!(
-            "audio: queued {} periods, {steady} underruns after the countdown{}",
+            "audio: queued {} periods, {steady} underruns after READY{}",
             self.queued_now
                 .map_or_else(|| "an unknown number of".to_owned(), |q| q.to_string()),
             if self.queued_now == Some(next) {
@@ -450,11 +450,11 @@ impl Rig for PlayerRig<'_> {
 
     fn prepare_audio(&mut self) -> Result<(), AudioWaitError> {
         // With selection, the scan has acknowledged its pause before
-        // recording opens and the countdown starts.
+        // recording opens and READY starts.
         self.pause_scan();
         self.audio.control.ready()?;
         // Between plays, before recording opens: the change never lands
-        // inside a play or its countdown.
+        // inside a play or its READY state.
         self.queued_now = self
             .audio
             .control
@@ -517,7 +517,7 @@ impl Rig for PlayerRig<'_> {
             window.wait_to_open();
         }
         self.in_play = true;
-        // A round's opening is not the full play's countdown: the countdown
+        // A round's opening is not the full play's READY state: READY
         // and a scenario's `until` run from it.
         self.lead_in = lead_in;
         self.input.open(Request::Open {
@@ -532,8 +532,8 @@ impl Rig for PlayerRig<'_> {
         // page faults count from here too.
         let started = self.clock.now();
         let page_faults = process_page_faults();
-        let countdown_at = TimeUs(origin.0 - self.lead_in.0);
-        self.countdown_at = Some(countdown_at);
+        let ready_state_at = TimeUs(origin.0 - self.lead_in.0);
+        self.ready_state_at = Some(ready_state_at);
         self.origin = Some(origin);
         println!("play started");
         // A chart's first play: a retry runs from its own receipt.
@@ -541,7 +541,7 @@ impl Rig for PlayerRig<'_> {
             && self.retry_from.is_none()
         {
             let ms = since(sel.chosen_at, started).as_millis();
-            println!("load: the countdown started {ms} ms after the choice");
+            println!("load: READY started {ms} ms after the choice");
         }
         // Before the play is sent: the audio thread may mix its first wake
         // before this thread runs again.
@@ -563,7 +563,7 @@ impl Rig for PlayerRig<'_> {
         let measure = PlayMeasure {
             generation: self.generation,
             origin,
-            countdown_at,
+            ready_state_at,
             started,
             page_faults,
             load_from: self.retry_from.unwrap_or(self.load_start),
@@ -688,9 +688,9 @@ impl Rig for PlayerRig<'_> {
     }
 
     fn ended(&mut self, report: &PlayReport) {
-        if let Some(c) = self.figures.as_ref().and_then(|f| f.countdown) {
+        if let Some(c) = self.figures.as_ref().and_then(|f| f.ready_state) {
             println!(
-                "countdown: setup {} us, first frame {} after it started",
+                "ready: setup {} us, first frame {} after it started",
                 c.setup_us,
                 c.first_frame_us
                     .map_or_else(|| "N/A".to_owned(), |us| format!("{us} us"))
@@ -862,7 +862,7 @@ mod tests {
     }
 
     /// The `until` command is sent once, at its time on the play's clock:
-    /// nothing before the countdown is known or before the time, then the
+    /// nothing before READY is known or before the time, then the
     /// command, then nothing again.
     #[test]
     fn until_fires_once_at_its_time() {

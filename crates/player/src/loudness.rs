@@ -18,7 +18,7 @@
 //!   leaves the chart to the background measurement ([`crate::background`]),
 //!   whose result is kept here as a load's own ([`Loudness::adopt`]).
 //! - **Results.** A measurement is kept in memory by its whole key and
-//!   stored in the library only before a countdown, once the scan's pause
+//!   stored in the library only before a READY state, once the scan's pause
 //!   is acknowledged (or no scan runs), or at a graceful exit whose scan
 //!   stopped, so the store never races a scan's commit; one the database
 //!   refuses stays in memory for the run. Without a library (`tapestry
@@ -328,7 +328,7 @@ impl Loudness {
         }
     }
 
-    /// Before a countdown, with the scan quiet (its pause acknowledged, or
+    /// Before a READY state, with the scan quiet (its pause acknowledged, or
     /// none running): every measurement in memory is stored; one the
     /// database refuses is logged and kept for this run.
     pub fn store(&mut self, library: &mut Library) {
@@ -486,7 +486,7 @@ mod tests {
     }
 
     /// A miss is measured during the load: the first play's gain is the
-    /// measured one, kept in memory and stored before the countdown; a
+    /// measured one, kept in memory and stored before READY; a
     /// second load (in memory, then from the library in another run)
     /// measures nothing.
     #[test]
@@ -508,7 +508,7 @@ mod tests {
         assert_eq!(loudness.gain(), super::gain(&row));
         assert_ne!(loudness.gain(), Gain::HEADROOM);
         assert_eq!(lib.loudness(&key).unwrap(), None);
-        // Before the countdown: stored.
+        // Before READY: stored.
         loudness.store(&mut lib);
         assert_eq!(lib.loudness(&key).unwrap(), Some(row));
         assert!(loudness.in_memory(&key).is_none());

@@ -32,7 +32,7 @@
 //! # "quit": the quit key before the play completes, which ends it midway
 //! # on its result; "skip": the quit key once it is complete, its tail
 //! # still sounding, which skips to its result. Both land on the result,
-//! # which a `result` step leaves; at_ms is never in the countdown, where
+//! # which a `result` step leaves; at_ms is never in READY, where
 //! # the quit key would leave the chart without one
 //!
 //! [[step]]
@@ -42,7 +42,7 @@
 //! practice = { path = "library/a/a.bms", from = 1, to = 2, speed = 75, lead_in_ms = 2000, gauge = 20, repeat = true, input = "logs/a.tprl", rounds = 1 }
 //! # or { search = "text", … }; measures from 1, both included; speed in
 //! # percent; the displayed gauge's initial value in percent; rounds
-//! # played, then the quit key at the next round's start, in its countdown,
+//! # played, then the quit key at the next round's start, in its READY state,
 //! # which returns to the page, and back
 //!
 //! [[step]]

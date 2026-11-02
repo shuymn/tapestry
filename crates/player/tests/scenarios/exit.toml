@@ -63,7 +63,7 @@ play = { input = "auto", until = "end" }
 result = "back"
 
 # 17: one practice round of A at 75 % with the log, then quit at the next
-# round's start, in its countdown, and back to selection.
+# round's start, in its READY state, and back to selection.
 [[step]]
 practice = { path = "library/a/a.bms", from = 1, to = 2, speed = 75, lead_in_ms = 2000, gauge = 20, repeat = true, input = "logs/a.tprl", rounds = 1 }
 

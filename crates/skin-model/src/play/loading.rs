@@ -1,5 +1,5 @@
 //! The loading runtime: the play screen's state from a chart's choice to
-//! its countdown, isolated from any attempt (stage3.md R3, "The loading
+//! its READY state, isolated from any attempt (stage3.md R3, "The loading
 //! runtime"). It holds its own fields, timer starts and readings and text
 //! lines, and no chart, notes, reducer or effects; a frame fills it from a
 //! [`LoadingFrame`] and draws it with a play's own evaluation and drawing.

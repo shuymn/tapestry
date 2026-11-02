@@ -11,7 +11,7 @@
 //! With selection the
 //! chart is not known at the start: each chosen chart is loaded on request
 //! ([`RenderMsg::Load`]) and stays until the next. From a chart's choice
-//! to its countdown the play screen is drawn in its loading state, through
+//! to its READY state the play screen is drawn in its loading state, through
 //! the chart's load and the play's preparation, whose answers come between
 //! its frames: the skin's loading frame ([`Screen::loading`]) with the
 //! load's lines over it. The lines go through a slot as the end screen's
@@ -213,7 +213,7 @@ pub trait Screen: Send {
             present_count: None,
         })
     }
-    /// Draws the play screen while a chart loads before the countdown:
+    /// Draws the play screen while a chart loads before READY:
     /// the skin's loading frame with `page`, the load's lines, over it,
     /// laid out again when `changed` (design.md "Play Lifecycle"). `update`
     /// is the same moment typed, when the lines came with it, of the same
@@ -1027,8 +1027,8 @@ impl PendingLoad {
 
 /// Starts the render thread; `make` builds the screen on it, and the chart,
 /// when there is one yet, is prepared before this returns, so every upload
-/// is done before the first countdown (design.md "Display Latency and
-/// Stutter"); a chart loaded later is prepared before its countdown too.
+/// is done before the first READY state (design.md "Display Latency and
+/// Stutter"); a chart loaded later is prepared before its READY state too.
 ///
 /// # Errors
 ///
@@ -1942,7 +1942,7 @@ mod tests {
         Box::new(PlayMeasure {
             generation: 1,
             origin,
-            countdown_at: origin,
+            ready_state_at: origin,
             started: origin,
             page_faults: None,
             load_from: TimeUs(0),

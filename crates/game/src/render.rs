@@ -25,7 +25,7 @@ pub struct PlayView {
     pub complete: bool,
     /// Whether the play is in its playing phase, as the lifecycle
     /// published it with the step that wrote this view
-    /// ([`crate::live`]): false in the countdown and from a stop, the
+    /// ([`crate::live`]): false in READY and from a stop, the
     /// completion or a failure on; the step that processed one of those
     /// still published true. Never derived from `complete`.
     pub playing: bool,

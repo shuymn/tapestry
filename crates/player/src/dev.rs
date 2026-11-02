@@ -6,7 +6,7 @@
 //! the clocked input thread, the audio engine plays into a recording of a
 //! simulated device paced by the clock, and the renderer draws offscreen
 //! on WARP. `play --auto <chart> --dev-headless` runs autoplay the same
-//! way. `--dev-frames <dir>` also writes a countdown frame, a play frame
+//! way. `--dev-frames <dir>` also writes a READY frame, a play frame
 //! and the end screen there as PNG files. `--dev-overlay` shows the
 //! measurement overlay from the start. `--dev-start <ms>` plays a mid-chart
 //! start from that time of the chart to its end.
@@ -303,7 +303,7 @@ pub struct SelectOptions {
     /// The wait between scan passes (`--dev-rescan-ms`).
     pub rescan_ms: Option<u64>,
     /// Where to write frames (`--dev-frames`): the select screen's first
-    /// frame, and the first play's countdown, play and end frames.
+    /// frame, and the first play's READY state, play and end frames.
     pub frames: Option<PathBuf>,
     /// The render thread's bounds, as [`Options::render_timeout`]
     /// (`--dev-render-timeout`).
@@ -1145,13 +1145,13 @@ fn onsets(samples: &[f32]) -> Vec<usize> {
 }
 
 /// Writes frames as PNG files: `select.png` at the first select screen
-/// frame, `loading.png` at the first loading state frame, `countdown.png` at
+/// frame, `loading.png` at the first loading state frame, `ready.png` at
 /// the first frame of the lead-in, `play.png` at the first frame at or
 /// after `play_at`, and `end.png` at the first end screen frame.
 pub struct FrameDump {
     dir: PathBuf,
     play_at: TimeUs,
-    countdown: bool,
+    ready_state: bool,
     play: bool,
     end: bool,
     select: bool,
@@ -1164,7 +1164,7 @@ impl FrameDump {
         Self {
             dir,
             play_at,
-            countdown: false,
+            ready_state: false,
             play: false,
             end: false,
             select: false,
@@ -1196,9 +1196,9 @@ impl FrameSink for FrameDump {
             return;
         }
         match drawn.play {
-            Some(t) if t.0 < 0 && !self.countdown => {
-                self.countdown = true;
-                self.save(screen, "countdown.png");
+            Some(t) if t.0 < 0 && !self.ready_state => {
+                self.ready_state = true;
+                self.save(screen, "ready.png");
             }
             Some(t) if t >= self.play_at && !self.play => {
                 self.play = true;

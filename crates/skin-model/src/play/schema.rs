@@ -286,9 +286,9 @@ pub mod field {
 /// The built-in timer slots of [`PLAY`]; `when` timers follow from
 /// [`BUILTIN`](timer::BUILTIN).
 pub mod timer {
-    /// The attempt's countdown start.
+    /// The attempt's READY state start.
     pub const READY: u16 = 0;
-    /// The attempt's start, after the countdown.
+    /// The attempt's start, after READY.
     pub const PLAY: u16 = 1;
     /// The shown gauge's fail time.
     pub const FAILED: u16 = 2;

@@ -1154,7 +1154,7 @@ fn slow_full_play_over_budget_is_refused() {
     ] {
         assert!(message.contains(&part), "{message}");
     }
-    // Played, it is refused at the opening: the countdown is never handed
+    // Played, it is refused at the opening: READY is never handed
     // to audio and the screen.
     let log = Log::default();
     let clock = Rc::new(Cell::new(CLOCK_START));

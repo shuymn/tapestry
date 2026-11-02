@@ -1,6 +1,6 @@
 //! How many periods the audio output keeps queued ahead of playback (design.md
 //! "Path from Press to Sound"). Two by default; a play with underruns after its
-//! countdown makes the next play queue three, a choice kept in `device.toml`
+//! READY state makes the next play queue three, a choice kept in `device.toml`
 //! that only the player lowers again, by editing the file.
 //!
 //! Some drivers deliver blocks whose size beats against the engine period,
@@ -36,7 +36,7 @@ impl QueueChoice {
 
     /// A play ended, however it ended (completed, retried, quit or its
     /// device lost), after `steady_underruns` underruns from its chart time
-    /// 0 on: the countdown before it, its first second, is the stream
+    /// 0 on: READY before it, its first second, is the stream
     /// settling and does not count. Any raises the choice to
     /// [`RAISED_QUEUED_PERIODS`]; nothing lowers it. Returns whether it
     /// rose.

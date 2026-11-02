@@ -32,7 +32,7 @@ The stage exits when song selection, play, results and retry can be played repea
 
 #84 and #85 land before the first stage-2 PR.
 
-- **#84** moves the reservation before the countdown and gives retry and practice one shared play-start flow. PR14 and PR23 build on that flow.
+- **#84** moves the reservation before READY and gives retry and practice one shared play-start flow. PR14 and PR23 build on that flow.
 - **#85** makes input-thread failure a typed error. Today `InputLink` calls `expect` (crates/player/src/input_side.rs:81-118). PR9 and PR10 add requests and a wake event on top of the error path #85 creates.
 
 ## 1. Scope
@@ -71,7 +71,7 @@ Each decision names the alternatives it beat. "Tuned by playing" marks a startin
 - `Loaded::load` takes one path (crates/game/src/session.rs:391-465).
 - The player builds the bank and the renderer once per process (crates/player/src/main.rs:460-472, 769).
 
-**Decision.** `game::app` owns the flow Select → Load → Plays (countdown, play, tail, result, retry) → Select. It is portable and runs headless on a virtual rig.
+**Decision.** `game::app` owns the flow Select → Load → Plays (READY, play, tail, result, retry) → Select. It is portable and runs headless on a virtual rig.
 
 - **The rig.** `AppRig: Rig` adds:
   - `choose()`, which returns a `Pick`: `Play(path)`, or `Practice(path)` for the practice screen;
@@ -165,7 +165,7 @@ egui comes with the first form-like screen.
 - **Pausing.**
   - Choosing a chart requests a pause before loading.
   - The thread finishes the file in hand, commits, and acknowledges.
-  - The countdown starts only after the acknowledgment.
+  - READY starts only after the acknowledgment.
   - Every entry into selection releases the pause (after a refusal, Back, or quit from play), and so does entering a result screen.
 - **Priority.** A start hook from `player` sets background mode, so Windows code stays in `player`.
 
@@ -418,7 +418,7 @@ A fractional first stage: 1,000 frames at 44.1 kHz are 1,088.435 frames at 48 kH
 - A ring-out follows instead of the full-play audio tail, which waits for every voice and BGM event (crates/game/src/live.rs:359). For `RING_OUT` (1.5 s, tuned by playing) the BGM keeps playing on schedule, no notes are drawn and nothing is judged or recorded; key sounds of notes after the section play as autoplay, like those before it. Over its last `FADE` (0.5 s, tuned by playing) the output fades to silence.
 - **The envelope is on output frames.** At completion the game sends `AudioCtl::RingOut { fade_at, end_at }` in play time. The engine converts both to frame positions on the play's mix clock, as it does for sound starts, and applies the gain per frame: 1 before `fade_at`, falling linearly to 0 at `end_at`. At `end_at` it stops every voice and starts nothing more, and it reports the ring-out done like a sealed tail. The fade therefore does not depend on when the request is taken or how the output is divided into periods, and the stop always comes at the envelope's zero. Nothing is allocated in the audio callback.
 - **The envelope is reset** to gain 1 by every `Play`, whether the previous ring-out finished or was cut, independently of master volume and loudness gain.
-- The ring-out ends when both the engine has reported done and play time has reached `end_at`: the engine mixes ahead into queued output, so its report alone can come early. The record is then saved, and the next round's countdown begins at the following step.
+- The ring-out ends when both the engine has reported done and play time has reached `end_at`: the engine mixes ahead into queued output, so its report alone can come early. The record is then saved, and the next round's READY state begins at the following step.
 - Quit, retry or focus loss during the ring-out cuts it at once with `AudioCtl::Cancel`, like the full-play tail; the frozen record is still saved. Quit returns to the practice screen.
 
 **Example.** 100 % speed, lead-in 2 s, offset 0, aligned 1 ms steps, 48 kHz output. Section `[10 s, 20 s)` of a 180 s chart; the last target is a tap at 19.5 s; the late BAD edge is 180 ms.
@@ -426,7 +426,7 @@ A fractional first stage: 1,000 frames at 44.1 kHz are 1,088.435 frames at 48 kH
 - The step at 19.680 s publishes `fresh − 1 µs` = 19.679999 s, which does not cover the deadline.
 - The step at 19.681 s publishes 19.680999 s: completion and the close happen there, and `RingOut { fade_at: 20.681 s, end_at: 21.181 s }` is sent.
 - The rendered fade covers output frames from 20.681 s to 21.181 s on the play's mix clock: 24,000 frames, whatever the audio period.
-- The engine may report done before 21.181 s, since it mixes ahead (with 10 ms periods and two queued, the wake at 21.160 s can render past 21.181 s). The ring-out ends at the first step at or after 21.181 s with the report in, so with aligned steps the record is saved in the step at 21.181 s and round 2's recording opens and its countdown begins at 21.182 s (round 1's timeline), at its own chart time 7.800 s; its lead-in's audio starts at 8.000 s.
+- The engine may report done before 21.181 s, since it mixes ahead (with 10 ms periods and two queued, the wake at 21.160 s can render past 21.181 s). The ring-out ends at the first step at or after 21.181 s with the report in, so with aligned steps the record is saved in the step at 21.181 s and round 2's recording opens and its READY state begins at 21.182 s (round 1's timeline), at its own chart time 7.800 s; its lead-in's audio starts at 8.000 s.
 - A BGM event at 20.5 s starts during the ring-out; one at 30 s never starts.
 - A 60 s BGM voice that started at 5 s is playing 3 s in at round 2's lead-in start, restored by `seek`, at full gain.
 
@@ -463,7 +463,7 @@ A fractional first stage: 1,000 frames at 44.1 kHz are 1,088.435 frames at 48 kH
 - The window is 12.100 s, so capacity counts 13 seconds.
 - A tap-only formula would give 10.380 s and 11 seconds.
 
-**Refusal.** A slow full play over 512 MiB is refused before its countdown through D1, with the inputs needed, the inputs that fit, and "practice a section".
+**Refusal.** A slow full play over 512 MiB is refused before its READY state through D1, with the inputs needed, the inputs that fit, and "practice a section".
 
 **What waits.** Output streaming stays after stage 3.
 
@@ -916,7 +916,7 @@ Each one holds the behavior D5 and D6 state.
 - `any_command_sequence_ends_cleanly`, over two built charts and one refused chart:
   - records re-evaluate equal to live;
   - attempts count per chart;
-  - every play is reserved before its countdown;
+  - every play is reserved before its READY state;
   - every entry into selection is signaled.
 
 ### PR15. Song selection on the real threads (`player`, `render`)
@@ -931,7 +931,7 @@ Each one holds the behavior D5 and D6 state.
 - a second chart plays only its own sounds;
 - `refused_chart_shows_its_reason`;
 - `refused_load_releases_the_scan_pause`: after a refusal, a newly added chart is discovered without any completed play;
-- the pause is acknowledged before each countdown;
+- the pause is acknowledged before each READY state;
 - the load time is printed;
 - unknown arguments exit 2;
 - a second player process started on the same data root is refused before it opens `library.db`, with a message naming the folder (`second_process_is_refused_before_the_library_opens`). `library` already refuses a second `Library` of the file in any process (`LibraryError::AlreadyOpen`, from its lock on `library.db.lock`); the player still decides what a second process does, and today's `tapestry.lock` only decides which process writes the log.
@@ -1091,7 +1091,7 @@ Each one holds the behavior D5 and D6 state.
   - completion and the close shall happen in the step at 19.681 s, not at 19.680 s;
   - `RingOut { fade_at: 20.681 s, end_at: 21.181 s }` shall be sent in that step, and the record shall be saved only after the engine reports the ring-out done;
   - the BGM event at 20.5 s and the autoplay key sound of a note at 20.4 s shall start, and the BGM event at 30 s shall never start;
-  - round 2's countdown shall begin at 21.182 s, with the long voice 3 s in, also when the engine reports done early with two or three queued periods (`early_done_report_waits_for_end_at`).
+  - round 2's READY state shall begin at 21.182 s, with the long voice 3 s in, also when the engine reports done early with two or three queued periods (`early_done_report_waits_for_end_at`).
 - When retry is pressed during the ring-out, the ring-out shall be cut in that step and the frozen record shall still be saved (`retry_cuts_the_ring_out_and_saves`).
 - When a slow save is simulated, the ring-out's fade, stop and quit handling shall happen at the same times as with an instant save (`saving_never_delays_the_ring_out`).
 - When the engine renders a ring-out, the gain shall be 1 before `fade_at`, fall linearly per frame to 0 at `end_at` (24,000 frames at 48 kHz in D15's example), and every voice shall stop at `end_at` (`ring_out_envelope_is_on_output_frames`, `audio`).
@@ -1235,11 +1235,11 @@ Choosing a refused chart and seeing a chart added are covered by `unrunnable_ste
 1. **Library.** Set `[library] roots` and start `tapestry`. The library fills, Japanese titles read correctly, and search works by kana and by a romanized word present in some chart's metadata.
 2. **Default preset.** On a fresh data root, plays use beatoraja-style and `presets\` stays empty. A `player.toml` naming `tapestry` plays tapestry, and one naming `custom.toml` is refused with an error naming it.
 3. **The loop.**
-   - Choose a chart: the screen goes straight to the play screen, which shows the load's stage over the lanes, and the countdown starts once it is ready. A chart played before starts within 1-2 s; a chart's first play also measures its loudness first.
+   - Choose a chart: the screen goes straight to the play screen, which shows the load's stage over the lanes, and READY starts once it is ready. A chart played before starts within 1-2 s; a chart's first play also measures its loudness first.
    - Quit during the load: selection returns at once, and a measurement in progress finishes in the background, so the next choice of that chart starts without measuring.
    - Choose the play preset on the select screen (F11 and F12, or the controller's preset key).
    - Play to the end and read the result: the gauge history and the early/late distribution. Step through the three presets, retry several times, go back and change charts. Do this with both keyboard and controller, and scroll the list with the scratch in both directions.
-   - Quit during a play: the result shows the play as aborted. Quit during the countdown: selection returns. After the last note, quit skips the remaining sound to the result.
+   - Quit during a play: the result shows the play as aborted. Quit during READY: selection returns. After the last note, quit skips the remaining sound to the result.
    - Long notes stay drawn to their end, lit while held.
    - A refused chart shows why, and new charts still appear; while the scan adds charts, the chart under the cursor stays where it is.
    - Search with the IME: its candidates appear at the search box.

@@ -103,10 +103,10 @@ pub struct PlayMeasure {
     pub generation: u64,
     /// Where chart time 0 lies on the clock.
     pub origin: TimeUs,
-    /// When the countdown started (recording opened), on the clock.
-    pub countdown_at: TimeUs,
+    /// When READY started (recording opened), on the clock.
+    pub ready_state_at: TimeUs,
     /// When the play was set up and about to be handed to audio and the
-    /// screen, on the clock: its setup ran from `countdown_at` to here.
+    /// screen, on the clock: its setup ran from `ready_state_at` to here.
     pub started: TimeUs,
     /// The process's page fault count at `started`; `None` when it could
     /// not be read.
@@ -148,9 +148,9 @@ impl AudioBase {
     }
 }
 
-/// The countdown's figures, µs from its start (recording opened).
+/// READY's figures, µs from its start (recording opened).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Countdown {
+pub struct ReadyState {
     /// Until the play was set up, as it was handed to audio and the screen.
     pub setup_us: i64,
     /// Until the clock read once the play's first frame was presented;
@@ -214,8 +214,8 @@ pub struct Figures {
     #[cfg(feature = "dev-tools")]
     pub present_times: Option<Vec<i64>>,
     /// The play span on the clock, from chart time 0 to the play's end.
-    /// The countdown is left out: a display capture misses a swap chain's
-    /// first present, which is the countdown's first frame.
+    /// READY is left out: a display capture misses a swap chain's
+    /// first present, which is READY's first frame.
     pub span: (TimeUs, TimeUs),
     /// Presents the game issued in the span.
     pub presents: u64,
@@ -230,8 +230,8 @@ pub struct Figures {
     /// Logic step samples the full queue refused: input to judgment and
     /// finalization delay are missing that many.
     pub steps_dropped: u64,
-    /// The countdown's setup and first frame.
-    pub countdown: Option<Countdown>,
+    /// READY's setup and first frame.
+    pub ready_state: Option<ReadyState>,
     /// Page faults of the whole process from the play's handover to audio
     /// and the screen until it was over (diagnostic: every thread, wgpu and
     /// the driver included).
@@ -474,7 +474,7 @@ pub struct Measure {
     /// The last present count, to notice a new swap chain.
     last_present: Option<u32>,
     /// When the play's first frame was presented, on the clock: the load
-    /// time and the countdown's first frame run to it.
+    /// time and READY's first frame run to it.
     first_frame: Option<TimeUs>,
     presents: u64,
     recent: [i64; RECENT],
@@ -678,9 +678,9 @@ impl Measure {
                 .zip(self.app_base)
                 .map(|(now, base)| now.saturating_sub(base)),
             steps_dropped: 0,
-            countdown: self.play.as_ref().map(|p| Countdown {
-                setup_us: p.started.0 - p.countdown_at.0,
-                first_frame_us: self.first_frame.map(|t| t.0 - p.countdown_at.0),
+            ready_state: self.play.as_ref().map(|p| ReadyState {
+                setup_us: p.started.0 - p.ready_state_at.0,
+                first_frame_us: self.first_frame.map(|t| t.0 - p.ready_state_at.0),
             }),
             page_faults: None,
             refresh_period_ns: self
@@ -993,8 +993,8 @@ pub fn to_toml(fig: &Figures, load: (Option<u64>, Option<u64>)) -> String {
     if let Some(ms) = load.1 {
         let _ = writeln!(out, "retry = {ms}");
     }
-    out.push_str("\n[countdown]\n");
-    if let Some(c) = fig.countdown {
+    out.push_str("\n[ready]\n");
+    if let Some(c) = fig.ready_state {
         let _ = writeln!(out, "setup_us = {}", c.setup_us);
         if let Some(us) = c.first_frame_us {
             let _ = writeln!(out, "first_frame_us = {us}");
@@ -1046,14 +1046,14 @@ mod tests {
         }
     }
 
-    /// The countdown's setup and first frame and the process's page faults
+    /// READY's setup and first frame and the process's page faults
     /// are written in their own tables; a figure without evidence has no
     /// key.
     #[test]
-    fn to_toml_writes_the_countdown_and_fault_figures() {
-        use super::{Countdown, to_toml};
+    fn to_toml_writes_the_ready_and_fault_figures() {
+        use super::{ReadyState, to_toml};
         let fig = Figures {
-            countdown: Some(Countdown {
+            ready_state: Some(ReadyState {
                 setup_us: 2_345,
                 first_frame_us: Some(18_000),
             }),
@@ -1062,22 +1062,22 @@ mod tests {
         };
         let t: toml::Table = to_toml(&fig, (None, None)).parse().unwrap();
         let int = |table: &str, key: &str| t[table].get(key).and_then(toml::Value::as_integer);
-        assert_eq!(int("countdown", "setup_us"), Some(2_345));
-        assert_eq!(int("countdown", "first_frame_us"), Some(18_000));
+        assert_eq!(int("ready", "setup_us"), Some(2_345));
+        assert_eq!(int("ready", "first_frame_us"), Some(18_000));
         assert_eq!(int("faults", "process"), Some(812));
 
         let fig = Figures {
-            countdown: Some(Countdown {
+            ready_state: Some(ReadyState {
                 setup_us: 2_345,
                 first_frame_us: None,
             }),
             ..Figures::default()
         };
         let t: toml::Table = to_toml(&fig, (None, None)).parse().unwrap();
-        assert_eq!(t["countdown"].as_table().unwrap().len(), 1);
+        assert_eq!(t["ready"].as_table().unwrap().len(), 1);
         assert!(t["faults"].as_table().unwrap().is_empty());
         let t: toml::Table = to_toml(&Figures::default(), (None, None)).parse().unwrap();
-        assert!(t["countdown"].as_table().unwrap().is_empty());
+        assert!(t["ready"].as_table().unwrap().is_empty());
     }
 
     /// The overlay's numbers come from the rings without allocating: the
@@ -1277,7 +1277,7 @@ mod frame_tests {
         PlayMeasure {
             generation,
             origin,
-            countdown_at: TimeUs(origin.0 - 1_000_000),
+            ready_state_at: TimeUs(origin.0 - 1_000_000),
             started: TimeUs(origin.0 - 990_000),
             page_faults: None,
             load_from: TimeUs(0),

@@ -6,13 +6,13 @@
 //!   ([`game::AudioControl::load`]), the render thread's chart
 //!   ([`RenderLink::load`]) and, with autoplay, the input thread's generated
 //!   input; a chart refused on the way returns to selection with why.
-//! - **The scan** pauses from the choice to each countdown, which waits for
+//! - **The scan** pauses from the choice to each READY state, which waits for
 //!   its acknowledgment ([`PlayerRig`]'s audio preparation); every entry
 //!   into selection and every result releases it. A chart whose loudness
 //!   the library misses is measured during its load, so its first play has
 //!   its gain; the measurement is stored once that pause is acknowledged.
 //! - **The play screen's loading state** shows from a chart chosen to
-//!   play, or a practice Start, to the countdown: the play screen without
+//!   play, or a practice Start, to READY: the play screen without
 //!   notes, with the chart, the preset and the load's stage over it, the
 //!   sounds decoded so far among them.
 //! - Loading runs on the game thread, the screen's preparation of the
@@ -134,7 +134,7 @@ pub struct Selection {
     /// When the chart being loaded was chosen.
     pub chosen_at: TimeUs,
     /// The load's lines on the play screen, from a chart's choice or a
-    /// practice Start to its countdown or the way back.
+    /// practice Start to its READY state or the way back.
     pub loading: Option<LoadingText>,
     /// Whether the chart chosen last was chosen to practice.
     pub practicing: bool,
@@ -1092,7 +1092,7 @@ impl PlayerRig<'_> {
         chosen
     }
 
-    /// Before each countdown, with song selection: the scan's pause is
+    /// Before each READY state, with song selection: the scan's pause is
     /// requested if it is not, and acknowledged before recording opens. A
     /// close or the quit key cancels the wait; the play then does not start
     /// (`game::live` takes the quit, or the close, before it opens).
@@ -1112,12 +1112,12 @@ impl PlayerRig<'_> {
         let paused = shelf.wait_paused(
             crate::shelf::PAUSE_SLICE,
             // Closing the window or the quit key ends the wait, and the
-            // play: the countdown never starts unacknowledged.
+            // play: READY never starts unacknowledged.
             || controls.quitting() || controls.leaving(),
             crate::shelf::PAUSE_NOTICE,
             || {
                 println!("library: waiting for the scan to pause");
-                // On the play screen before a chart's first countdown; a
+                // On the play screen before a chart's first READY state; a
                 // retry's shows on the select page, as the scan's state.
                 if loading.is_some() {
                     show_stage(render, loading.as_ref(), Stage::Scan);
@@ -1130,13 +1130,13 @@ impl PlayerRig<'_> {
         match paused {
             crate::shelf::Paused::Acknowledged => {
                 let line = format!(
-                    "library: the scan paused before the countdown in {} ms",
+                    "library: the scan paused before READY in {} ms",
                     began.elapsed().as_millis()
                 );
                 println!("{line}");
                 log::info!("{line}");
             }
-            crate::shelf::Paused::Idle => println!("library: no scan before the countdown"),
+            crate::shelf::Paused::Idle => println!("library: no scan before READY"),
             crate::shelf::Paused::Cancelled => {
                 println!("library: the wait for the scan was cancelled");
                 return;

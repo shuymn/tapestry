@@ -90,7 +90,7 @@ use crate::render_side::{MakeScreen, NoFrames, RenderEnd, Screen, View};
 use crate::select::MenuQueue;
 use crate::tuning::{Delivered, LiveTuning, SettingsFiles};
 
-/// The countdown before chart time 0 (design.md "Play Lifecycle").
+/// READY before chart time 0 (design.md "Play Lifecycle").
 const LEAD_IN: TimeUs = TimeUs(1_000_000);
 /// Effects the render queue holds.
 const EFFECTS: usize = 1 << 14;
@@ -663,7 +663,7 @@ fn measure(
 }
 
 /// Presents a play of `chart` can issue, with room to spare, at
-/// `refresh_mhz` (1 kHz when unknown): the countdown, the chart to its last
+/// `refresh_mhz` (1 kHz when unknown): READY, the chart to its last
 /// long note end or BGM event, a tail of 15 s, a quarter more.
 #[cfg(feature = "dev-tools")]
 fn presents_of(chart: &bms_model::Chart, lead_in: TimeUs, refresh_mhz: Option<u32>) -> usize {
@@ -692,7 +692,7 @@ fn view(controls: &Controls) -> View {
 /// The controls, with the settings keys starting from the loaded values,
 /// waking the calling thread: the game thread. The quit key is taken once
 /// by the play or result it arrives in, with or without selection: in a
-/// play's countdown it leaves the chart, while the chart plays it ends the
+/// play's READY state it leaves the chart, while the chart plays it ends the
 /// play on its result, after completion it skips the tail to the result
 /// (design.md "Play Lifecycle", "Audio tail"); only closing the window
 /// latches quitting.
@@ -759,7 +759,7 @@ fn rig<'a>(
         window: None,
         retry_from: None,
         times: LoadTimes::default(),
-        countdown_at: None,
+        ready_state_at: None,
         origin: None,
         steps,
         steps_dropped: 0,
