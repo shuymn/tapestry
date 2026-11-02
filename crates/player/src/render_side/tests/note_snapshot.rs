@@ -354,11 +354,15 @@ fn both_skins_show_the_snapshot_when_effects_are_dropped() {
     }
 }
 
-/// A paced screen whose wait takes 2 ms, as a refresh would, noting how
-/// often the render loop looks at it and which generations it builds.
+/// A paced screen that keeps a swap chain's promise: its wait takes 2 ms,
+/// as a refresh would, and grants one frame, which only a presented draw
+/// gives back; while that frame is out, a wait grants nothing. It notes
+/// how often the render loop looks at it and which generations it builds.
 struct Paced {
     looks: Arc<std::sync::atomic::AtomicU64>,
     built: Arc<Mutex<Vec<u64>>>,
+    /// A frame granted and not yet presented.
+    granted: AtomicBool,
 }
 
 impl Screen for Paced {
@@ -367,7 +371,7 @@ impl Screen for Paced {
     }
     fn wait(&self) -> bool {
         std::thread::sleep(Duration::from_millis(2));
-        true
+        !self.granted.swap(true, Ordering::AcqRel)
     }
     fn paced(&self) -> bool {
         self.looks.fetch_add(1, Ordering::Relaxed);
@@ -378,6 +382,7 @@ impl Screen for Paced {
         Ok(())
     }
     fn draw(&mut self) -> Result<FrameTiming, RenderError> {
+        self.granted.store(false, Ordering::Release);
         Ok(timing(true))
     }
     fn text(&mut self, _lines: &[&str]) -> Result<bool, RenderError> {
@@ -392,8 +397,10 @@ impl Screen for Paced {
 /// A logic step held between a rearm and its view's publication, on a
 /// paced screen whose frame stays granted: the render loop builds no
 /// frame, and after a few immediate retries waits between tries instead
-/// of spinning; it builds the new candidate once its view is published,
-/// and an exit sent while the step is held again ends it at once.
+/// of spinning; it builds the new candidate on the frame it kept once its
+/// view is published (a skip that gave the grant up would wait for a
+/// frame the screen never grants again), and an exit sent while the step
+/// is held again ends it at once.
 #[test]
 fn a_held_rearm_neither_spins_nor_blocks_the_render_loop() {
     use game::EventSink as _;
@@ -407,6 +414,7 @@ fn a_held_rearm_neither_spins_nor_blocks_the_render_loop() {
         Ok(Box::new(Paced {
             looks: Arc::clone(&l),
             built: Arc::clone(&b),
+            granted: AtomicBool::new(false),
         }) as Box<dyn Screen>)
     });
     let clock = QpcClock::start();
@@ -446,7 +454,14 @@ fn a_held_rearm_neither_spins_nor_blocks_the_render_loop() {
     v.generation = 1;
     v.origin = Some(TimeUs(clock.now().0 + 10_000_000));
     writer.publish();
-    assert!(wait_until(|| built.lock().unwrap().contains(&1)));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !built.lock().unwrap().contains(&1) {
+        assert!(
+            Instant::now() < deadline,
+            "the new candidate was never drawn"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
     // Held again, an exit still ends the loop at once.
     sink.rearm(TimeUs(clock.now().0 + 20_000_000));
     std::thread::sleep(Duration::from_millis(50));
