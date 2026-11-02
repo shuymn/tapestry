@@ -2174,7 +2174,8 @@ impl Run {
     /// game thread withdrew the request, and every later attempt prepares
     /// with it. `None` prepares later attempts with the skin in use. A
     /// refusal or a withdrawal keeps the installation in use and the
-    /// selection before; an error drops the screen, to be built again.
+    /// selection before; an error drops the screen and reports its
+    /// failure, so the screen's recovery builds it again.
     fn select(
         &mut self,
         request: u64,
@@ -2196,7 +2197,10 @@ impl Run {
             self.selected = None;
             return Ok(Preparation::Ready);
         };
-        self.recover()?;
+        if let Err(e) = self.recover() {
+            self.shared.failed.store(true, Ordering::Release);
+            return Err(e);
+        }
         let Some(screen) = &mut self.screen else {
             return Err(RenderError::SurfaceLost);
         };
@@ -2236,6 +2240,7 @@ impl Run {
             Err(e) => {
                 self.screen = None;
                 self.granted = false;
+                self.shared.failed.store(true, Ordering::Release);
                 Err(e)
             }
         }
@@ -5566,6 +5571,10 @@ pub(crate) mod tests {
             while self.shared.hold_install.load(Ordering::Acquire) {
                 std::thread::sleep(Duration::from_millis(1));
             }
+            if self.shared.fail.load(Ordering::Acquire) {
+                self.note(&format!("fail {request}"));
+                return Err(RenderError::SurfaceLost);
+            }
             if self.shared.refuse_install.load(Ordering::Acquire) {
                 self.note(&format!("refuse {request}"));
                 return Ok(super::refusal("the skin cannot be installed"));
@@ -6004,6 +6013,39 @@ pub(crate) mod tests {
                 "1 prepare 4 Right T",
                 "1 commit 4",
             ]
+        );
+    }
+
+    /// A selection the screen fails on drops the screen and reports its
+    /// failure, so the game's recovery builds it again with the
+    /// installation before it; the failure is never only a notice. Without
+    /// the failure published, `failed` stays false and nothing rebuilds.
+    #[test]
+    fn a_failed_selection_reports_the_screen_failure() {
+        let chart = Arc::new(ChartBuilder::new(120_000).build().unwrap());
+        let (old, failing) = (bundle(), bundle());
+        let screens = Installers::default();
+        let link = screens.spawn(&chart, &old);
+        screens.fail.store(true, Ordering::Release);
+        let answer = link.select(Some(Arc::clone(&failing))).wait();
+        assert!(
+            matches!(answer, Err(ScreenError::Render(RenderError::SurfaceLost))),
+            "{answer:?}"
+        );
+        assert!(link.failed());
+        screens.fail.store(false, Ordering::Release);
+        link.prepare().unwrap();
+        assert!(!link.failed());
+        let restored = screens.restored.lock().unwrap().clone();
+        let [restored] = &restored[..] else {
+            panic!("{restored:?}");
+        };
+        assert!(Arc::ptr_eq(restored.bundle(), &old));
+        link.exit();
+        assert_eq!(screens.builds.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            screens.log(),
+            ["1 install 1", "1 commit 1", "1 fail 2", "2 restore"]
         );
     }
 
