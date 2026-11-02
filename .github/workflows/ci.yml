@@ -113,7 +113,7 @@ jobs:
       - name: Clippy
         run: mise exec -- cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Test
-        run: mise exec -- cargo test --workspace --locked
+        run: mise exec -- cargo nextest run --workspace --locked --no-fail-fast
       # Also run on Windows: build-dependencies resolve for the host, so the
       # R3 production-feature check sees cfg(windows) build-dependencies only here.
       - name: Architecture rules
@@ -237,7 +237,7 @@ jobs:
           target/debug/tapestry.exe --dev-tools-probe
       # The game on its threads, driven by a scripted input log, on WARP.
       - name: Test (dev-tools)
-        run: mise exec -- cargo test -p player -p game --features player/dev-tools,game/dev-tools --locked
+        run: mise exec -- cargo nextest run -p player -p game --features player/dev-tools,game/dev-tools --locked --no-fail-fast
 
   # Passes when the three Windows jobs passed, or when `changes` found no
   # change the build jobs read and they were skipped; anything else
@@ -304,7 +304,7 @@ jobs:
       - name: Lint fixtures
         run: mise exec -- cargo xtask check-lints
       - name: Test (portable crates)
-        run: mise exec -- cargo xtask portable test --locked
+        run: mise exec -- cargo xtask portable nextest run --locked --no-fail-fast
       # Runs each benchmark once so it keeps building and running
       # (docs/setup.md "Benchmarks"); bench.yml measures.
       - name: Benchmarks run once

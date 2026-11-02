@@ -40,3 +40,19 @@ fn check_lints_reports_a_missing_cargo_once() {
 fn portable_reports_a_missing_cargo_once() {
     assert_fails_without_cargo(&["portable", "test"], "xtask portable: ");
 }
+
+/// `portable nextest` without nextest's own command exits 2 naming it,
+/// before running anything.
+#[test]
+fn portable_nextest_needs_its_command() {
+    let out = Command::new(env!("CARGO_BIN_EXE_xtask"))
+        .args(["portable", "nextest"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.contains("xtask portable: missing nextest command"),
+        "{stderr}"
+    );
+}
