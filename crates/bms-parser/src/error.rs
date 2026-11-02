@@ -1,6 +1,6 @@
 //! Load errors and warnings.
 
-use bms_model::ModelError;
+use bms_model::{ModelError, PresentationError};
 
 /// Why a chart was refused. Errors that come from a line name it (1-based).
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -96,9 +96,21 @@ pub enum LoadError {
         /// The I/O error kind.
         kind: std::io::ErrorKind,
     },
+    /// The chart has more timeline rows (positions kept and STOP ends) than
+    /// [`Limits::max_timeline_points`](crate::Limits).
+    #[error("measure {measure}: too many timeline rows")]
+    TimelineLimit {
+        /// The measure holding the first row past the limit.
+        measure: u16,
+    },
     /// The resolved chart broke a model invariant. This is a loader bug.
     #[error("resolved chart is invalid")]
     Model(#[source] ModelError),
+    /// The resolved chart's timeline links are broken. This is a loader
+    /// bug; two note endpoints at one µs at different positions are not
+    /// (design.md "Chart Model", "Timeline").
+    #[error("resolved chart's timeline links are invalid")]
+    Links(#[source] Box<PresentationError>),
 }
 
 /// Something the loader skipped or assumed; the chart still loads.

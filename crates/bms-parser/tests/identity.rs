@@ -3,7 +3,7 @@
 //! µs or quantize to one display position, and objects at one position
 //! conflict as they always have.
 
-use bms_model::{BEAT, Note, NoteKind, Position, SoundId, TimeUs};
+use bms_model::{BEAT, Note, NoteAnchors, NoteKind, Position, SoundId, TimeUs, TimelineId};
 use bms_parser::{LoadOptions, Loaded, WarningKind, load_bms};
 
 fn load(text: &str) -> Loaded {
@@ -43,15 +43,23 @@ fn taps_at_distinct_positions_in_one_microsecond_both_stay() {
         line(8, 1, "02")
     );
     let loaded = load(&text);
-    let tap = |pos, sound| Note {
+    // Row 0 is the bar line at 0, rows 1 and 2 the taps' positions.
+    let tap = |pos, sound, row| Note {
         time: TimeUs(0),
         pos,
         sound: Some(SoundId(sound)),
         kind: NoteKind::Tap,
+        anchors: NoteAnchors {
+            head: TimelineId(row),
+            end: TimelineId(row),
+        },
     };
     assert_eq!(
         loaded.chart.lanes[1],
-        [tap(units(4, 8_000_000), 1), tap(units(4, 4_000_000), 0)]
+        [
+            tap(units(4, 8_000_000), 1, 1),
+            tap(units(4, 4_000_000), 0, 2)
+        ]
     );
     assert_eq!(kinds(&loaded), []);
 }

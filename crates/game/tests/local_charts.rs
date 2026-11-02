@@ -141,13 +141,14 @@ fn category(e: &SessionError) -> &'static str {
             | LoadError::DurationExceeded { .. }
             | LoadError::TimeOverflow { .. }
             | LoadError::PositionOverflow { .. }
-            | LoadError::TooLongAtSpeed { .. } => "loading limit",
+            | LoadError::TooLongAtSpeed { .. }
+            | LoadError::TimelineLimit { .. } => "loading limit",
             LoadError::InvalidValue { what, reason, .. } => invalid_value(what, reason),
             LoadError::SoundPathRejected { .. } | LoadError::SoundPathEscapes { .. } => {
                 "sound path outside the folder"
             }
             LoadError::ChartDir { .. } => "chart folder unreadable",
-            LoadError::Model(_) => "loader bug",
+            LoadError::Model(_) | LoadError::Links(_) => "loader bug",
         },
         SessionError::UnsupportedChart(_) => "unsupported format",
         SessionError::InvalidStep(_) => "invalid step",

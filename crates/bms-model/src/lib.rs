@@ -12,8 +12,10 @@ mod builder;
 mod chart;
 mod clock;
 mod error;
+mod presentation;
 mod scroll;
 mod speed;
+mod timeline;
 
 pub use builder::ChartBuilder;
 pub use chart::{
@@ -21,9 +23,13 @@ pub use chart::{
     LANE_COUNT, Lane, LnMode, Note, NoteKind, SoundId, SoundRef,
 };
 pub use clock::{TimeSource, VirtualClock};
-pub use error::ModelError;
+pub use error::{EndpointLocation, EndpointPart, ModelError, PresentationError};
 pub use scroll::{BEAT, DOMAIN, FRAC_BITS, Position, ScrollChange, ScrollMap, ScrollSegment};
 pub use speed::Speed;
+pub use timeline::{
+    ChartTimeline, MAX_TIMELINE_POINTS, NoteAnchors, Tempo, TempoEvent, TempoEvents, TempoMeta,
+    TimelineError, TimelineId, TimelinePoint,
+};
 
 /// A point in chart time, in integer microseconds.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]

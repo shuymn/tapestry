@@ -3,10 +3,13 @@
 
 use std::cmp::Ordering;
 
-use bms_model::{DOMAIN, FRAC_BITS, Position, ScrollSegment, Speed, TimeUs};
+use bms_model::{
+    DOMAIN, FRAC_BITS, MAX_TIMELINE_POINTS, ModelError, Position, ScrollSegment, Speed, Tempo,
+    TimeUs, TimelineId, TimelinePoint,
+};
 use num_bigint::BigInt;
 use num_integer::Integer;
-use num_traits::{One, Signed, Zero};
+use num_traits::{One, Signed, ToPrimitive, Zero};
 
 use crate::decimal::Rational;
 use crate::parse::{ObjectKind, Source};
@@ -78,21 +81,31 @@ pub struct Timed {
     /// Position of the object in the file, the tie-breaker among objects
     /// that share a position.
     pub seq: usize,
-    /// The ordinal of the object's exact position among the chart's
-    /// positions: equal for objects at one position, ordered as positions
-    /// and times are. Identity is decided on it, never on the floored time
-    /// or the quantized position, which may merge distinct positions.
-    pub rank: usize,
+    /// The timeline row of the object's exact position ([`Timeline::rows`]):
+    /// equal for objects at one position, ordered as positions and times
+    /// are. Identity is decided on it, never on the floored time or the
+    /// quantized position, which may merge distinct positions.
+    pub id: TimelineId,
 }
 
-/// The chart's objects in time order with the scroll map's parts.
+/// The chart's objects in time order with the scroll map's parts and the
+/// timeline's rows.
 #[derive(Debug)]
 pub struct Timeline {
     /// Notes, long-note objects, mines and BGM in measure-position order,
     /// file order within one position. The position travels in
-    /// [`Timed::rank`] and file order in [`Timed::seq`]. Timing objects are
+    /// [`Timed::id`] and file order in [`Timed::seq`]. Timing objects are
     /// consumed.
     pub objects: Vec<Timed>,
+    /// One row per kept position, then one per positive STOP's end, in
+    /// exact time order, with 1× times.
+    pub rows: Vec<TimelinePoint>,
+    /// At a speed other than 1×, each row's real time, beside `rows`.
+    pub real_rows: Option<Vec<TimeUs>>,
+    /// Each bar line's row, beside `bar_lines`.
+    pub bar_ids: Vec<TimelineId>,
+    /// The tempo of the `#BPM` header, or the default.
+    pub initial_tempo: Tempo,
     /// The scroll rate before time 0, from the `#BPM` header.
     pub initial_rate: i128,
     /// The scroll map's segments, coalesced by start in exact event order.
@@ -278,7 +291,10 @@ pub fn compute(
         })
         .map_or_else(|| Spot::start(0), |(spot, _)| *spot);
     events.truncate(events.partition_point(|e| e.0.order(&end) != Ordering::Greater));
+    let charge = TimelineCharge::count(&events, source, limits)?;
 
+    let mut tempo = to_tempo(&initial_bpm)?;
+    let initial_tempo = tempo;
     let mut us_per_beat = int(US_PER_MINUTE) / &initial_bpm;
     let initial_rate = slope(&us_per_beat).ok_or(LoadError::PositionOverflow { measure: 0 })?;
     let mut scroll_rate = initial_rate;
@@ -307,6 +323,10 @@ pub fn compute(
     };
     let mut timeline = Timeline {
         objects: Vec::with_capacity(source.objects.len()),
+        rows: Vec::with_capacity(charge.rows),
+        real_rows: real.as_ref().map(|_| Vec::with_capacity(charge.rows)),
+        bar_ids: Vec::with_capacity(charge.bars),
+        initial_tempo,
         initial_rate,
         segments: vec![first(initial_rate)],
         real: None,
@@ -319,9 +339,7 @@ pub fn compute(
     let mut beat = Spot::start(0);
     let mut time = Time::zero();
     let mut rest = events.as_slice();
-    let mut rank = 0;
     while let Some((spot, _)) = rest.first() {
-        rank += 1;
         let len = rest
             .iter()
             .take_while(|e| e.0.order(spot) == Ordering::Equal)
@@ -406,6 +424,7 @@ pub fn compute(
             }
         }
         if let Some(v) = new_bpm {
+            tempo = to_tempo(&v)?;
             us_per_beat = int(US_PER_MINUTE) / v;
             measure_us = None;
             scroll_rate = slope(&us_per_beat).ok_or_else(out_of_range)?;
@@ -424,9 +443,17 @@ pub fn compute(
             }
         }
 
+        // The position's row, with the tempo after any change here.
+        let id = timeline.push_row(
+            TimelinePoint { at, pos, tempo },
+            real_here.as_ref().map(|r| r.0),
+        );
         for (_, event) in group {
             match *event {
-                Event::Bar => timeline.bar_lines.push(pos),
+                Event::Bar => {
+                    timeline.bar_lines.push(pos);
+                    timeline.bar_ids.push(id);
+                }
                 Event::Object(i) => {
                     let o = &source.objects[i];
                     if !matches!(
@@ -440,7 +467,7 @@ pub fn compute(
                             kind: o.kind,
                             line: o.line,
                             seq: i,
-                            rank,
+                            id,
                         });
                     }
                 }
@@ -483,6 +510,7 @@ pub fn compute(
             };
             let resume = segment(&change, &us_per_beat, scroll_rate).ok_or_else(out_of_range)?;
             push(&mut timeline.segments, resume);
+            let mut real_end = None;
             if let (Some(r), Some(t)) = (&mut real, &real_here) {
                 let stop = segment(&Change::real(t, &beats, pos, &pos_rest), &r.us_per_beat, 0)
                     .ok_or_else(out_of_range)?;
@@ -495,11 +523,109 @@ pub fn compute(
                 )
                 .ok_or_else(out_of_range)?;
                 push(&mut r.scroll.segments, resume);
+                real_end = Some(end.0);
             }
+            // The STOP's end: the same position and tempo, later.
+            timeline.push_row(
+                TimelinePoint {
+                    at: end,
+                    pos,
+                    tempo,
+                },
+                real_end,
+            );
         }
     }
     timeline.real = real.map(|r| r.scroll);
     Ok(timeline)
+}
+
+impl Timeline {
+    /// Appends a row, with its real time at another speed, and returns its
+    /// id. [`TimelineCharge::count`] reserved every row, so this neither
+    /// grows a vector nor passes the row limit.
+    fn push_row(&mut self, row: TimelinePoint, real: Option<TimeUs>) -> TimelineId {
+        // Below `MAX_TIMELINE_POINTS`, so this fits.
+        let id = TimelineId(u32::try_from(self.rows.len()).unwrap_or(u32::MAX));
+        self.rows.push(row);
+        if let (Some(rows), Some(real)) = (&mut self.real_rows, real) {
+            rows.push(real);
+        }
+        id
+    }
+}
+
+/// The timeline's construction charge: its rows (48 B each) and bar rows
+/// (4 B each), and at a speed other than 1× each row's real time (8 B),
+/// counted exactly over the ordered positions before any of them is
+/// allocated (design.md "Chart Model", "Timeline").
+#[derive(Clone, Copy, Debug)]
+struct TimelineCharge {
+    rows: usize,
+    bars: usize,
+}
+
+impl TimelineCharge {
+    /// One row per position kept, and one more where a positive STOP
+    /// starts; refused past [`Limits::max_timeline_points`] or the model's
+    /// cap, naming the measure of the first row past it.
+    fn count(
+        events: &[(Spot, Event)],
+        source: &Source,
+        limits: &Limits,
+    ) -> Result<Self, LoadError> {
+        let max = limits.max_timeline_points.min(MAX_TIMELINE_POINTS);
+        let mut charge = Self { rows: 0, bars: 0 };
+        let mut rest = events;
+        while let Some((spot, _)) = rest.first() {
+            let len = rest
+                .iter()
+                .take_while(|e| e.0.order(spot) == Ordering::Equal)
+                .count();
+            let (group, tail) = rest.split_at(len);
+            rest = tail;
+            let stops = group.iter().any(|(_, e)| match *e {
+                Event::Object(i) => match source.objects[i].kind {
+                    ObjectKind::StopRef(id) => {
+                        source.stop_defs.get(&id).is_some_and(Signed::is_positive)
+                    }
+                    _ => false,
+                },
+                Event::Bar => false,
+            });
+            charge.rows += 1 + usize::from(stops);
+            charge.bars += group
+                .iter()
+                .filter(|(_, e)| matches!(e, Event::Bar))
+                .count();
+            if charge.rows > max {
+                return Err(LoadError::TimelineLimit {
+                    measure: spot.measure,
+                });
+            }
+        }
+        Ok(charge)
+    }
+}
+
+/// The exact tempo of `bpm`, a decimal of the timing grammar, which has at
+/// most 18 fractional digits and fits [`Tempo`]'s range: its reduced
+/// denominator divides `10^18` and its numerator is below `10^30`, so the
+/// units are one exact `u128` product, with no big integer arithmetic.
+fn to_tempo(bpm: &Rational) -> Result<Tempo, LoadError> {
+    bpm.numer()
+        .to_u128()
+        .zip(bpm.denom().to_u128())
+        .filter(|&(_, d)| d != 0 && Tempo::UNITS_PER_BPM.is_multiple_of(d))
+        .and_then(|(n, d)| n.checked_mul(Tempo::UNITS_PER_BPM / d))
+        .and_then(Tempo::from_units)
+        .ok_or_else(|| {
+            let micro = (bpm * BigInt::from(1_000_000)).to_integer();
+            LoadError::Model(ModelError::InvalidBpm {
+                at: TimeUs(0),
+                bpm_micro: micro.to_i64().unwrap_or(i64::MAX),
+            })
+        })
 }
 
 /// Floors the time to microseconds (mathematical floor) after checking the
