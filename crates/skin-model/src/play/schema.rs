@@ -292,7 +292,7 @@ pub mod timer {
     pub const PLAY: u16 = 1;
     /// The shown gauge's fail time.
     pub const FAILED: u16 = 2;
-    /// The first playing frame past the notes' end
+    /// The notes' end, from the first playing frame at or past it
     /// ([`PlayContext::last_note_end`](crate::PlayContext::last_note_end)).
     pub const LAST_NOTE: u16 = 3;
     /// The judgment that made the combo equal the target count.

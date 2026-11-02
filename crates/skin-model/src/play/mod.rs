@@ -76,11 +76,10 @@ pub struct PlayContext<'a> {
     /// The preset's long-note mode for a chart that declares none
     /// (`rule.ln_mode.default`).
     pub ln_default: rules::LnMode,
-    /// The end of the attempt's notes on the play clock, from which
-    /// `last_note` is sampled: the last note's time in a normal play, the
-    /// last timeline's (background sounds included) in autoplay, and in
-    /// practice the section's end plus 1 s, scaled by the play speed
-    /// (`play/BMSPlayer.java:199, 587`).
+    /// The end of the attempt's notes on the play clock, where
+    /// `last_note` starts: the last note's time for the whole chart,
+    /// played or autoplayed, and the section's end in a practice round,
+    /// both at the play speed.
     pub last_note_end: TimeUs,
     /// The original 1× chart's BPM range, its initial BPM included, over
     /// its whole timeline (not narrowed to a practice section, not scaled
