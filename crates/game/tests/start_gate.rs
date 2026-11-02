@@ -392,7 +392,9 @@ fn every_rearm_takes_a_fresh_origin_and_keeps_every_opening() {
 /// FAST and SLOW are the winning READY's alone: a press 160 ms before
 /// a note at 100 ms in a cancelled candidate (BAD, FAST) is gone with it;
 /// the winner's press 30 ms late on that note counts SLOW, live and in
-/// the record's re-evaluation alike.
+/// the record's re-evaluation alike. The cancelled opening's recorded
+/// input, evaluated from its own snapshot to its close, witnesses that
+/// the candidate scored that press before the rearm.
 #[test]
 fn fast_and_slow_count_the_winning_ready_only() {
     let (_dir, root) = temp_root();
@@ -424,7 +426,39 @@ fn fast_and_slow_count_the_winning_ready_only() {
     let report = s.play(script(items, &[])).unwrap();
 
     assert_eq!(report.end, PlayEnd::Completed);
-    assert_eq!(record(&report).history.openings.len(), 1);
+    let r = record(&report);
+    let [o] = &r.history.openings[..] else {
+        panic!("{:?}", r.history.openings);
+    };
+    let range = o.events.start as usize..o.events.end as usize;
+    let cancelled = eval::evaluate(
+        &chart,
+        &eval::EvalInput {
+            events: r.history.events[range].to_vec(),
+            device: r.devices.profile(),
+            start: o.start.clone(),
+            finalized: Some(o.closed),
+            section: None,
+        },
+        &rules::tapestry(),
+    )
+    .unwrap();
+    let judged: Vec<_> = cancelled
+        .events
+        .iter()
+        .filter_map(|e| match e.kind {
+            eval::JudgeEventKind::Judged {
+                judgment,
+                deviation,
+                ..
+            } => Some((judgment, deviation)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(judged, [(Judgment::Bad, Some(TimeUs(-160 * MS)))]);
+    assert_eq!((cancelled.tally.fast, cancelled.tally.slow), (1, 0));
+    // The rearm starts the winner from nothing.
+    assert_eq!(count_judged(&report.live, Judgment::Bad), 0);
     assert_eq!(count_judged(&report.live, Judgment::Great), 1);
     assert_eq!(count_judged(&report.live, Judgment::Perfect), 3);
     assert_eq!((report.tally.fast, report.tally.slow), (0, 1));
