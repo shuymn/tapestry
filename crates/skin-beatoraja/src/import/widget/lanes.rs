@@ -365,14 +365,15 @@ impl Cx<'_> {
             .and_then(|q| q.add(Q::int(o.h)))
             .ok_or_else(|| self.range(at, "size"))?;
         }
-        // One height for every lane, kept unrounded; its rounding is the
-        // model's nominal note height.
-        let [nh, ..] = heights;
-        let note_h = nh.round().ok_or_else(|| self.range(at, "size"))?;
-        if heights.iter().any(|&h| h != nh) || note_h < 1 {
+        // Each lane's height, kept unrounded and checked exactly before
+        // any conversion: positive, lanes free to differ. Source slot 0
+        // (native lane 1) is the reference the common geometry is built
+        // on, as the source takes the field from lane 0
+        // (`play/LaneRenderer.java:323-326`).
+        if heights.iter().any(|&h| h <= Q::ZERO) {
             return refuse(self, "size");
         }
-        let note_h = u16::try_from(note_h).map_err(|_| self.range(at, "size"))?;
+        let [nh, ..] = heights;
 
         // Vertical (y down): the line and the top half a note above the
         // lanes' bottom and top (`play/LaneRenderer.java:324-326`).
@@ -401,20 +402,36 @@ impl Cx<'_> {
         // region's lower edge at its judgment time
         // (`play/LaneRenderer.java:521-524`). An offset that puts that note
         // below the lanes' bottom, which also takes the source's clipped
-        // long-note branch (`:577-581`), or above their top, refuses.
+        // long-note branch (`:577-581`), or any lane's note above their
+        // top, refuses.
         let oy = Q::int(o.y);
-        let fits = base
-            .sub(oy)
-            .and_then(|v| v.sub(nh))
-            .ok_or_else(|| range(self))?;
-        if o.y < 0 || fits < Q::int(top) {
+        if o.y < 0 {
             return refuse(self, "offset");
+        }
+        for h in heights {
+            let fits = base
+                .sub(oy)
+                .and_then(|v| v.sub(h))
+                .ok_or_else(|| range(self))?;
+            if fits < Q::int(top) {
+                return refuse(self, "offset");
+            }
+        }
+        // Each height in native lane order (source slot 7 is the scratch,
+        // native lane 0).
+        // A positive rational here is at least 2^-127, so its `f32` is
+        // positive too (the least positive `f32` is 2^-149).
+        let mut note_h = [0.0_f32; LANES];
+        for (u, h) in heights.iter().enumerate() {
+            if let Some(slot) = note_h.get_mut(model(u)) {
+                *slot = h.to_f32();
+            }
         }
         let source = SourceLanes {
             bottom: base.to_f32(),
             height: h_up.to_f32(),
             offset_y: oy.to_f32(),
-            note_h: nh.to_f32(),
+            note_h,
         };
 
         let mut lanes = [[0_i32; 2]; LANES];
@@ -470,8 +487,10 @@ impl Cx<'_> {
                 top,
                 line,
                 bottom,
-                note_h,
-                mine_h: note_h,
+                // The simple style's nominal heights, unused by the
+                // source style, which has its own per lane.
+                note_h: 0,
+                mine_h: 0,
                 line_h: 1,
                 parts,
                 bar_groups,

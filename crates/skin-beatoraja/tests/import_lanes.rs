@@ -303,8 +303,7 @@ fn note_heights_come_from_size_or_the_cell() {
     let tall = tall.replace(r#""id": "nt""#, r#""id": "tall""#);
     let l = import_body(&body(&tall, &objects, &[NOTES]));
     assert_eq!(rects_over(&l, &tap(1, 1_000), 1_000), [[100, 860, 50, 20]]);
-    // Every lane's size is one height, kept unrounded: unequal sizes
-    // refuse, even below a pixel.
+    // Each lane's size is its own height, kept unrounded.
     let sizes = |s: &str| lanes(&format!(r#""size": [{s}]"#), &[]);
     let l = sizes("20.5, 20.5, 20.5, 20.5, 20.5, 20.5, 20.5, 20.5");
     let q = drawn(&l, &tap(1, 1_000)).frame(1_000, &[]);
@@ -312,11 +311,22 @@ fn note_heights_come_from_size_or_the_cell() {
         q.iter().map(|q| q.rect).collect::<Vec<_>>(),
         [[100.0, 859.5, 50.0, 20.5]]
     );
-    refused(sizes("20, 20, 20, 20, 20, 20, 20, 20.4"), "size");
-    refused(sizes("20, 20, 20, 20, 20, 20, 20, 21"), "size");
-    refused(sizes("0.4, 0.4, 0.4, 0.4, 0.4, 0.4, 0.4, 0.4"), "size");
-    // −2^127 as `f32`, the rationals' negative boundary, and beyond.
-    for v in ["-1.7014118346046923e38", "-1.7014119e38", "-3.4e38"] {
+    // Positive sizes only; a zero or negative one refuses.
+    refused(sizes("0, 20, 20, 20, 20, 20, 20, 20"), "size");
+    refused(sizes("20, 20, 20, -1, 20, 20, 20, 20"), "size");
+    // A size the rationals cannot hold, however small, is out of range.
+    let tiny = sizes("20, 20, 20, 20, 20, 1e-60, 20, 20");
+    assert!(
+        matches!(tiny.err(), ImportError::Range { field: "size", .. }),
+        "tiny"
+    );
+    // −2^127 as `f32`, the rationals' negative boundary, is a negative
+    // size; beyond it, out of range.
+    refused(
+        sizes("-1.7014118346046923e38, 20, 20, 20, 20, 20, 20, 20"),
+        "size",
+    );
+    for v in ["-1.7014119e38", "-3.4e38"] {
         let l = sizes(&format!("{v}, 20, 20, 20, 20, 20, 20, 20"));
         assert!(
             matches!(l.err(), ImportError::Range { field: "size", .. }),
@@ -333,6 +343,47 @@ fn note_heights_come_from_size_or_the_cell() {
         )
         .ok();
     }
+}
+
+/// The height of every quad a frame at `ms` draws of `chart` over `l`.
+fn heights_over(l: &Loaded, chart: &Chart, ms: i64) -> Vec<f32> {
+    drawn(l, chart)
+        .frame(ms, &[])
+        .iter()
+        .map(|q| q.rect[3])
+        .collect()
+}
+
+#[test]
+fn unequal_and_fractional_heights_map_to_their_lanes() {
+    let sizes = |s: &str| lanes(&format!(r#""size": [{s}]"#), &[]);
+    // Source slots 0 to 6 are keys 1 to 7, slot 7 the scratch: each draws
+    // its own size, the reference (slot 0) keeping the common line.
+    let l = sizes("11, 12, 13, 14, 15, 16, 17, 18.25");
+    for (key, h) in [(1, 11.0), (4, 14.0), (7, 17.0), (0, 18.25)] {
+        assert_eq!(heights_over(&l, &tap(key, 1_000), 1_000), [h], "lane {key}");
+    }
+    // A note's lower edge stays on the region's at its time, whatever its
+    // height.
+    let q = drawn(&l, &tap(7, 1_000)).frame(1_000, &[]);
+    assert_eq!(q[0].rect[1] + q[0].rect[3], 880.0);
+    // Heights below a pixel, once refused by rounding, draw unrounded.
+    // Drawn in `f32` from the region's 880, within a float step.
+    let near = |got: Vec<f32>, want: f32| {
+        assert!(
+            got.len() == 1 && (got[0] - want).abs() < 1e-3,
+            "{got:?} vs {want}"
+        );
+    };
+    let l = sizes("0.4, 0.4, 0.4, 0.4, 0.4, 0.4, 0.4, 0.4");
+    near(heights_over(&l, &tap(2, 1_000), 1_000), 0.4);
+    let l = sizes("20, 20, 20, 20, 20, 20, 20, 20.4");
+    near(heights_over(&l, &tap(0, 1_000), 1_000), 20.4);
+    // A lane's note past the lanes' top at its time refuses: the field
+    // is built on the reference (top = line − 600 − 20/2 here), so key 4
+    // at 611 ends above it and 610 fits.
+    refused(sizes("20, 20, 20, 611, 20, 20, 20, 20"), "offset");
+    sizes("20, 20, 20, 610, 20, 20, 20, 20").ok();
 }
 
 #[test]
