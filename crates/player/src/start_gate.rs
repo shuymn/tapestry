@@ -542,4 +542,64 @@ mod tests {
             begun.elapsed()
         );
     }
+
+    /// A cancelled READY candidate rearmed through the gate restarts the
+    /// audio on the stepped worker: the next candidate's transport commits
+    /// by its own generation, and the BGM at chart time 0 starts exactly
+    /// at the rearmed origin's frame, nothing sounding before it.
+    #[test]
+    fn a_rearmed_candidate_starts_its_bgm_at_its_own_origin() {
+        let bank = Arc::new(SoundBank::from_sounds(
+            48_000,
+            vec![Sound::mono(vec![1_000; 4_800])],
+        ));
+        let schedule = vec![BgmEvent {
+            time: TimeUs(0),
+            sound: SoundId(0),
+        }];
+        let engine = AudioEngine::with_schedule(bank, schedule, 48_000, 480, 16, 0).unwrap();
+        let (mut control, mut worker) = audio_control(engine);
+        let mut out = RecordingOutput::new(
+            SimDevice::new(SimConfig::steady(48_000, 480, TimeUs(0))),
+            48_000,
+        );
+        for _ in 0..3 {
+            worker.step(&mut out).unwrap();
+        }
+        let (mut gate, _hook, _input) = installed();
+        // Candidate 1 opens with chart time 0 at 500 ms and is cancelled.
+        gate.gate.arm(1);
+        gate.armed = 1;
+        let (_sink, queue) = audio_link_at(4, TimeUs(500 * MS));
+        control
+            .play_gated(
+                TimeUs(500 * MS),
+                queue,
+                Gain::HEADROOM,
+                None,
+                gate.transport(TimeUs(0)),
+            )
+            .unwrap();
+        worker.step(&mut out).unwrap();
+        assert!(!gate.settle(1));
+        control.cancel();
+        worker.step(&mut out).unwrap();
+        assert!(control.counters().dropped(1));
+        // Candidate 2, rearmed with chart time 0 at 200 ms.
+        gate.gate.arm(2);
+        gate.restart(&mut control, TimeUs(200 * MS), 2, TimeUs(0), false);
+        for _ in 0..60 {
+            worker.step(&mut out).unwrap();
+        }
+        assert_eq!(
+            gate.state(),
+            input::GateState {
+                generation: 2,
+                phase: input::GatePhase::Committed
+            }
+        );
+        // Frame n plays at (n + 480) / 48 kHz: 200 ms is frame 9 120.
+        let left: Vec<f32> = out.samples().iter().step_by(2).copied().collect();
+        assert_eq!(left.iter().position(|&x| x != 0.0), Some(9_120));
+    }
 }

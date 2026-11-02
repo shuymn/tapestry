@@ -488,7 +488,7 @@ fn an_invalid_key_config_exits_nonzero() {
 /// boundary and the audio thread's transport, and the notes, pressed
 /// 1.2 s later than the log has them, are played by that READY: every note
 /// judged PERFECT, and the audio restarted for it, its key sounds and BGM
-/// sounding as an ungated play's do. The saved record keeps the cancelled
+/// all sounding, as an ungated play's do. The saved record keeps the cancelled
 /// opening, Q's press in it, and the winning READY's input alone.
 #[test]
 fn the_start_gate_cancels_and_rearms_ready_on_the_real_threads() {
@@ -530,21 +530,20 @@ fn the_start_gate_cancels_and_rearms_ready_on_the_real_threads() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     println!("{stdout}{stderr}");
     assert_eq!(out.status.code(), Some(0));
+    // The same sounds as the ungated play: the key sounds, and the BGM,
+    // which starts only once the rearmed candidate's transport commits.
+    // Where they fall is the real threads' timing, which the stepped
+    // worker fixes exactly (start_gate.rs,
+    // `a_rearmed_candidate_starts_its_bgm_at_its_own_origin`).
+    let gated = onsets(&stdout);
+    assert!(!ungated.is_empty());
+    assert_eq!(gated.len(), ungated.len(), "{gated:?} {ungated:?}");
     assert!(
         stdout.contains(&format!(
             "play 1: Completed; perfect {NOTES} great 0 good 0 bad 0 poor 0; re-evaluation matches live: true"
         )),
         "{stdout}"
     );
-    // The same sounds as the ungated play, each where it falls from the
-    // first, within a period.
-    let gated = onsets(&stdout);
-    let from_first = |o: &[i64]| o.iter().map(|f| f - o[0]).collect::<Vec<_>>();
-    assert_eq!(gated.len(), ungated.len(), "{gated:?} {ungated:?}");
-    assert!(!gated.is_empty());
-    for (g, u) in from_first(&gated).iter().zip(from_first(&ungated)) {
-        assert!((g - u).abs() <= 480, "{gated:?} {ungated:?}");
-    }
 
     let saved = records(&appdata);
     assert_eq!(saved.len(), 1, "{saved:?}");
