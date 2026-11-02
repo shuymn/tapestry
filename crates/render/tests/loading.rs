@@ -427,9 +427,9 @@ fn a_failed_replacement_keeps_the_old_loading_frames() {
 
 /// Text installed for a loading lifetime stays with it: the next
 /// lifetime entered starts without it, though the lifetime it was
-/// installed for never drew a frame. The fixture's text element draws its
-/// line, the bundle's red image, as a 100 × 100 square at
-/// `(1000, 500)`.
+/// installed for never drew a frame. The fixture's text element, on the
+/// `screen` timer so loading frames draw it, draws its line, the
+/// bundle's red image, as a 100 × 100 square at `(1000, 500)`.
 #[test]
 fn installed_text_never_passes_to_the_next_lifetime() {
     const TEXT: [i32; 4] = [1_000, 500, 100, 100];
@@ -441,6 +441,7 @@ fn installed_text_never_passes_to_the_next_lifetime() {
         dir.path(),
         &Look {
             text: true,
+            text_on_screen: true,
             ..loader()
         },
     );

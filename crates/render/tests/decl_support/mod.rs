@@ -76,6 +76,9 @@ pub struct Look {
     pub copies: usize,
     /// A text element on the right half with its prepared line.
     pub text: bool,
+    /// The text element on the untimed `screen` timer instead of
+    /// `ready`, so loading frames draw it too.
+    pub text_on_screen: bool,
     /// Two markers drawing the image unclipped: over [`GAUGE_MARKER`]
     /// while the shown gauge's look is `hard` (a survival gauge's), and
     /// over [`JUDGE_MARKER`] once a judgment started its timer.
@@ -112,6 +115,7 @@ impl Look {
             clip: Some([0.0, 0.0, 960.0, 1_080.0]),
             copies: 0,
             text: false,
+            text_on_screen: false,
             markers: false,
             loading: false,
         }
@@ -191,6 +195,9 @@ pub fn skin(dir: &Path, look: &Look) -> Skin {
         });
         let mut text = image([1_000, 500, 100, 100], false);
         text.source = Source::Text(0);
+        if look.text_on_screen {
+            text.timer = TimerRef::Builtin(skin_model::timer::SCREEN);
+        }
         elements.push(text);
     }
     if look.markers {
