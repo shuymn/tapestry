@@ -360,7 +360,11 @@ pub struct FileChoice {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Usage {
     pub elements: u32,
+    /// Track keys: each destination's as written, and the keys emitted
+    /// beyond them, grade attachment keys among them.
     pub keys: u32,
+    /// The grade attachment tracks' keys, counted in `keys` too.
+    pub grade_anchor_keys: u32,
     pub ops: u32,
     pub whens: u32,
     pub images: u32,

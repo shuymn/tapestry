@@ -210,6 +210,13 @@ impl Track {
         self.at.len()
     }
 
+    /// Whether `other` has the same key times, ease and end, so both are
+    /// drawn at the same local times and move between the same keys.
+    /// Allocates nothing.
+    pub(crate) fn same_timing(&self, other: &Self) -> bool {
+        self.at == other.at && self.ease == other.ease && self.end == other.end
+    }
+
     /// Each key's rect `[x, y, w, h]`.
     pub(crate) fn rects(&self) -> impl Iterator<Item = [i32; 4]> + '_ {
         self.v.iter().map(|&[x, y, w, h, ..]| [x, y, w, h])

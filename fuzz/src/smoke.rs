@@ -343,6 +343,9 @@ fn skin_json_seeds_resolve_or_fail_as_built() {
             "digit_offset_unselected",
             "digit_offset_stretch",
             "digit_offset_rows_limit",
+            "grade_anchors",
+            "grade_anchor_trimmed",
+            "grade_anchor_turning",
         ],
     );
     let imports: Vec<&str> = seeds::skin_imports().iter().map(|(n, _)| *n).collect();
@@ -398,6 +401,20 @@ fn skin_json_seeds_resolve_or_fail_as_built() {
             match imported {
                 Err(e) => assert!(want(&e), "{name}: {e:?}"),
                 Ok(i) => panic!("{name}: {:?}", i.report),
+            }
+            continue;
+        }
+        if let Some(want) = grade_anchor_refusal(name) {
+            // A trimmed or branch-changing grade stretch stays a located
+            // critical refusal.
+            let (_, imported) = skin_json(&data).unwrap_or_else(|e| panic!("{name}: {e}"));
+            match imported {
+                Err(ImportError::Critical {
+                    part: skin_beatoraja::CriticalPart::Judge,
+                    why,
+                    ..
+                }) => assert_eq!(why, NoteKind::Stretch(want), "{name}"),
+                other => panic!("{name}: {:?}", other.map(|i| i.report)),
             }
             continue;
         }
@@ -472,6 +489,15 @@ fn note_part_refusal(name: &str) -> Option<Option<NoteKind>> {
         "note_parts_null" => part("mine", PartWhy::NullEntry { index: 8 }),
         "note_parts_unsized" => part("note", PartWhy::MissingSize { lane: 2 }),
         "note_parts_broken" => Some(None),
+        _ => None,
+    }
+}
+
+/// The stretch mode a refused grade anchor seed names.
+fn grade_anchor_refusal(name: &str) -> Option<i32> {
+    match name {
+        "grade_anchor_trimmed" => Some(3),
+        "grade_anchor_turning" => Some(1),
         _ => None,
     }
 }
@@ -837,6 +863,41 @@ fn skin_import_seeds_import_and_draw_as_built() {
                 assert_eq!(kinds(&i), [], "{name}");
                 // "150", "1", and the grade with its combo of 1.
                 assert_eq!(drawn, [3 + 1 + 2; 4], "{name}");
+            }
+            "grade_anchors" => {
+                // PERFECT's two keys and the full-gauge slot's one kept
+                // again as attachments; BAD has no combo.
+                assert_eq!(u.grade_anchor_keys, 3, "{name}");
+                assert_eq!(u.keys, 1 + 2 + 1 + 1 + 1 + 3, "{name}");
+                let motion = NoteKind::Deviation(skin_beatoraja::DeviationId::D9(
+                    skin_beatoraja::LaneApprox::CoverMotion,
+                ));
+                assert_eq!(kinds(&i), [motion], "{name}");
+                // The grade and the "1" of its combo.
+                assert_eq!(drawn, [2; 4], "{name}");
+                // "12" on the destination's bottom-left at (600, 580):
+                // cells from 10 − 10; the 20×20 paint at 630 shifted half
+                // the 20 px baseline width. With the gauge full the
+                // full-gauge grade's 80×80 paint from 530 keeps the combo
+                // on 580 as well.
+                assert_eq!(
+                    crate::judged_rects(&i, false),
+                    [
+                        [600.0, 560.0, 10.0, 20.0],
+                        [610.0, 560.0, 10.0, 20.0],
+                        [620.0, 560.0, 20.0, 20.0]
+                    ],
+                    "{name}"
+                );
+                assert_eq!(
+                    crate::judged_rects(&i, true),
+                    [
+                        [600.0, 560.0, 10.0, 20.0],
+                        [610.0, 560.0, 10.0, 20.0],
+                        [590.0, 530.0, 80.0, 80.0]
+                    ],
+                    "{name}"
+                );
             }
             _ => panic!("no expectation for seed {name}"),
         }
