@@ -140,6 +140,7 @@ pub use widget::digits::{
 pub use widget::gauge::{
     GaugeDef, GaugeError, GaugeLook, GaugePart, GaugeParts, MAX_SEGMENTS, Motion,
 };
+pub use widget::glyphs::BitmapLines;
 pub use widget::image_choice::{
     ImageChoiceDef, ImageChoiceError, ImageChoicePart, ImageSpan, MAX_IMAGE_CHOICE_REFS,
 };
