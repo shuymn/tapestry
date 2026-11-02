@@ -236,20 +236,17 @@ case "$command" in
       done
     else
       # Each run's output goes to its own log, printed whole when the run
-      # ends (`wait -n -p` needs bash 5.1). If this script ends early, the
-      # runs still going are stopped, with cargo and the fuzzer under them.
+      # ends (`wait -n -p` needs bash 5.1). Each run is a process group of
+      # its own (job control), so if this script ends early, the runs still
+      # going are stopped whole, with cargo and the fuzzer under them.
       logs=$(mktemp -d)
       declare -A target_of=()
-      stop_tree() {
-        local child
-        for child in $(pgrep -P "$1"); do stop_tree "$child"; done
-        kill -TERM "$1" 2>/dev/null || true
-      }
       cleanup() {
         local pid
-        for pid in "${!target_of[@]}"; do stop_tree "$pid"; done
+        for pid in "${!target_of[@]}"; do kill -TERM -- "-$pid" 2>/dev/null || true; done
         rm -rf "$logs"
       }
+      set -m
       trap cleanup EXIT
       trap 'exit 130' INT
       trap 'exit 143' TERM
@@ -272,6 +269,7 @@ case "$command" in
         unset "target_of[$pid]"
         running=$((running - 1))
       done
+      set +m
       trap - EXIT INT TERM
       rm -rf "$logs"
     fi
