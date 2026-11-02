@@ -6545,8 +6545,9 @@ pub(crate) mod tests {
         }
     }
 
-    /// Through a real menu screen and the render thread's own recovery,
-    /// the loading presentation belongs to the committed installation and
+    /// Through a real menu screen, with the runtime fonts its loading
+    /// lines need, and the render thread's own recovery, the loading
+    /// presentation belongs to the committed installation and
     /// its lifetime: within one lifetime the `when` timer started on the
     /// first loading frame keeps its start across an attempt staged and
     /// committed on the same bundle and across a renderer built again
@@ -6582,7 +6583,10 @@ pub(crate) mod tests {
                 render::AdapterChoice::Warp,
             )?;
             Ok(Box::new(Probe {
-                menu: crate::menu_screen::MenuScreen::new(renderer, None),
+                menu: crate::menu_screen::MenuScreen::new(
+                    renderer,
+                    Some(render::text::Fonts::runtime()?),
+                ),
                 fail: Arc::clone(&f),
                 judge: Arc::new(AtomicBool::new(false)),
                 gauges: Arc::new(std::sync::atomic::AtomicUsize::new(2)),
