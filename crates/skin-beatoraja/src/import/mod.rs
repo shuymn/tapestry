@@ -206,6 +206,15 @@ enum Op {
     Name(String),
 }
 
+/// Whether a reading of a destination's keys ([`Cx::read_keys`]) draws
+/// their colour: a probe, or a track whose colour is not consumed, does
+/// not, and the reading that draws it reports a clamp.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Colour {
+    Drawn,
+    Unused,
+}
+
 /// How [`Cx::common_with`] reads a destination.
 #[derive(Clone, Copy, Default)]
 struct Opts<'a> {
@@ -730,6 +739,26 @@ impl<'d> Cx<'d> {
     /// (`SkinTextFont.java:158-176`): its keys' angles are cleared before
     /// the track is accepted, and an angle or a blend is only noted
     /// (`Opts::text`).
+    /// Destination `dst`'s keys ([`track::read`]), the one reading every
+    /// caller uses. Colour is clamped rather than refused, so the skin
+    /// looks as its author saw it; when `colour` is drawn, a clamped
+    /// channel is reported once, as a `Fallback` note at its first key.
+    fn read_keys(
+        &mut self,
+        dst: &Dst,
+        digits: Option<i32>,
+        colour: Colour,
+    ) -> Result<track::Keys, ImportError> {
+        let keys = track::read(self.def, &dst.keys, digits)?;
+        if colour == Colour::Drawn
+            && let Some(k) = keys.clamped
+        {
+            let span = self.arena_span(k);
+            self.note(Some(span), Severity::Fallback, NoteKind::ColourClamped);
+        }
+        Ok(keys)
+    }
+
     fn common_with(
         &mut self,
         role: Role,
@@ -752,7 +781,12 @@ impl<'d> Cx<'d> {
         } else {
             self.budget.keys(written).map_err(|l| self.limit(at, l))?
         };
-        let mut keys = track::read(self.def, &dst.keys, o.digits)?;
+        let drawn = if o.neutral {
+            Colour::Unused
+        } else {
+            Colour::Drawn
+        };
+        let mut keys = self.read_keys(dst, o.digits, drawn)?;
         if o.neutral {
             // The emitted keys, at 0 and at the last time, charged before
             // the constructor's key joins.
@@ -776,11 +810,6 @@ impl<'d> Cx<'d> {
                 self.ignored(at, NoteKind::Ignored { field: "clip" });
                 keys.clip = false;
             }
-        } else if let Some(k) = keys.clamped {
-            // Clamped rather than refused, so the skin looks as its author
-            // saw it, and reported at the key.
-            let span = self.arena_span(k);
-            self.note(Some(span), Severity::Fallback, NoteKind::ColourClamped);
         }
         let mut angle = false;
         if text || o.unrotated {
