@@ -803,7 +803,7 @@ pub fn skin_jsons() -> Vec<Seed> {
         (
             "note_parts_null",
             play_skin(&note_parts_body(
-                &[("mine", r#"["p", "p", "p", "p", "p", "p", "p", "p", null]"#)],
+                &[("mine", r#"["p", "p", "p", "p", "p", "p", "p", null]"#)],
                 true,
             )),
         ),
