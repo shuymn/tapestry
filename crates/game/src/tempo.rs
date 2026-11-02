@@ -40,7 +40,7 @@ pub enum ReferenceError {
     Unavailable(HiSpeedReference),
     /// MAIN's histogram needs more bytes than were available for it, or
     /// could not be allocated; nothing was kept.
-    #[error("the main tempo needs {needed} bytes, more than the {limit} available")]
+    #[error("the main tempo's {needed}-byte histogram was not allocated (limit {limit} bytes)")]
     Histogram {
         /// The bytes it needs: its bins times their size.
         needed: usize,
@@ -396,6 +396,67 @@ mod tests {
         );
         let fits = AttemptTempo::prepare_within(&chart, None, needed);
         assert_eq!(fits.references().unwrap().main, bpm(150));
+    }
+
+    /// Endpoints count at their own row's tempo, not at the tempo in
+    /// effect at their µs: two 150 BPM heads share a µs with a later row
+    /// that changes to 300 (a change less than a µs after them), and one
+    /// head follows at 300. By row, 150 has two and 300 one; by µs, 300
+    /// would have all three.
+    #[test]
+    fn an_endpoint_counts_at_its_own_row_not_its_us() {
+        let mut chart = ChartBuilder::new(150_000)
+            .tap(lane(1), at(1_000))
+            .tap(lane(2), at(1_000))
+            .tap(lane(1), at(2_000))
+            .build()
+            .unwrap();
+        let t = &chart.timeline;
+        let (first, last) = (t.points()[1], t.points()[2]);
+        let change = bms_model::TimelinePoint {
+            pos: bms_model::Position(first.pos.0 + 1),
+            tempo: Tempo::from_milli(300_000).unwrap(),
+            ..first
+        };
+        let late = bms_model::TimelinePoint {
+            tempo: change.tempo,
+            ..last
+        };
+        let points = vec![t.points()[0], first, change, late];
+        chart.timeline =
+            ChartTimeline::new(points, Vec::new(), t.meta().initial, t.meta().speed).unwrap();
+        let row = |i| bms_model::NoteAnchors {
+            head: bms_model::TimelineId(i),
+            end: bms_model::TimelineId(i),
+        };
+        chart.lanes[1][0].anchors = row(1);
+        chart.lanes[2][0].anchors = row(1);
+        chart.lanes[1][1].anchors = row(3);
+        assert_eq!(chart.validate_presentation_links(), Ok(()));
+        assert_eq!(chart.timeline.tempo_at(at(1_000)), change.tempo);
+        assert_eq!(main(&chart, None), bpm(150));
+    }
+
+    /// A declared CN's end counts at its own row's tempo: its head at 150,
+    /// a change to 300 under it, its end at 300. With a tap at 150 and two
+    /// at 300, 300 has three and 150 two; counted at its head's tempo the
+    /// end would make it 150, three to two.
+    #[test]
+    fn a_long_note_end_counts_at_its_own_tempo() {
+        let mut chart = ChartBuilder::new(150_000)
+            .tap(lane(1), at(200))
+            .long(lane(2), at(500), at(1_500))
+            .bpm(at(1_000), 300_000)
+            .tap(lane(1), at(2_000))
+            .tap(lane(1), at(2_500))
+            .build()
+            .unwrap();
+        for mode in [LnMode::Cn, LnMode::Hcn] {
+            chart.meta.ln_mode = Some(mode);
+            assert_eq!(main(&chart, None), bpm(300), "{mode:?}");
+        }
+        chart.meta.ln_mode = None;
+        assert_eq!(main(&chart, None), bpm(150));
     }
 
     /// `chart` with the tempo of row `row` and every later row, or the
