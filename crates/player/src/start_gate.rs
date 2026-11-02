@@ -165,6 +165,24 @@ impl PlayerGate {
         self.snapshot
     }
 
+    /// The bytes the rearm's exchange with the input side retains, by
+    /// the capacities reserved at the opening: its box, the events arena
+    /// for what the input side takes after the last drain, the arrivals
+    /// and the next opening's snapshot. The readers are the logic step's,
+    /// lent.
+    #[must_use]
+    pub fn exchange(&self) -> usize {
+        fn bytes<T>(v: &Vec<T>) -> usize {
+            v.capacity().saturating_mul(size_of::<T>())
+        }
+        self.rearm.as_deref().map_or(0, |r| {
+            size_of::<input_side::Rearm>()
+                .saturating_add(bytes(&r.leftover))
+                .saturating_add(bytes(&r.arrivals))
+                .saturating_add(bytes(&r.start.held))
+        })
+    }
+
     /// Whether START or SELECT is held, or may be, as the latch reads: when
     /// to ask the input side again.
     #[must_use]

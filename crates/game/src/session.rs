@@ -1130,10 +1130,9 @@ impl Loaded {
     }
 
     /// [`plan`](Self::plan) for a play whose READY candidates run the
-    /// start gate when `gate` gives the input side's held-snapshot
-    /// storage: the reservation then also counts the gate's own storage
-    /// ([`Reservation::with_gate`]), so a recording window that fits only
-    /// without it is refused.
+    /// start gate when `gate` gives its storage: the reservation then also
+    /// counts it ([`Reservation::with_gate`]), so a recording window that
+    /// fits only without it is refused.
     ///
     /// # Errors
     ///
@@ -1142,7 +1141,7 @@ impl Loaded {
         &self,
         kinds: &[DeviceKind],
         axes: &[Vec<input::hid::AxisCap>],
-        gate: Option<usize>,
+        gate: Option<GateStorage>,
     ) -> Result<PlayPlan, LogicError> {
         if self.config.autoplay.is_some() {
             return self.autoplay_plan(kinds, axes, gate);
@@ -1196,7 +1195,7 @@ impl Loaded {
         let inputs = window_inputs(&device, window, &rates).saturating_add(system);
         if let Ok(probe) = &probe
             && let r = Reservation::from_probe(probe, &device, self.config.effects)
-            && let r = gate.map_or(r, |held| r.with_gate(held))
+            && let r = gate.map_or(r, |g| r.with_gate(g))
             && !r.fits(inputs)
         {
             return Err(LogicError::RecordingTooLarge {
@@ -1233,7 +1232,7 @@ impl Loaded {
         &self,
         kinds: &[DeviceKind],
         axes: &[Vec<input::hid::AxisCap>],
-        gate: Option<usize>,
+        gate: Option<GateStorage>,
     ) -> Result<PlayPlan, LogicError> {
         let device = self.autoplay_device().profile(kinds, axes);
         let generated = generated();
@@ -1256,7 +1255,7 @@ impl Loaded {
         .map_err(LogicError::Eval)?;
         let r = Reservation::from_probe(&probe, &device, self.config.effects)
             .with_autoplay(inputs, schedule);
-        let r = gate.map_or(r, |held| r.with_gate(held));
+        let r = gate.map_or(r, |g| r.with_gate(g));
         if !r.fits(inputs) {
             return Err(LogicError::RecordingTooLarge {
                 needed: inputs,
@@ -2266,15 +2265,21 @@ impl Reservation {
 
     /// This reservation with a gated play's own storage (design.md "Play
     /// Lifecycle", the start gate): the history of cancelled openings
-    /// ([`with_history`](Self::with_history)) and the two held-input
-    /// snapshots of `held` entries a rearm copies into, the logic step's
-    /// and the next candidate's.
+    /// ([`with_history`](Self::with_history)), the two held-input
+    /// snapshots of `gate.held` entries a rearm copies into, the logic
+    /// step's and the next candidate's, and what the rig's exchange with
+    /// its input side retains (`gate.exchange`).
     #[must_use]
-    pub const fn with_gate(self, held: usize) -> Self {
-        let snapshots = held.saturating_mul(2 * size_of::<(eval::SourceId, ControlId, i32)>());
-        let r = self.with_history(held);
+    pub const fn with_gate(self, gate: GateStorage) -> Self {
+        let snapshots = gate
+            .held
+            .saturating_mul(2 * size_of::<(eval::SourceId, ControlId, i32)>());
+        let r = self.with_history(gate.held);
         Self {
-            fixed: r.fixed.saturating_add(snapshots),
+            fixed: r
+                .fixed
+                .saturating_add(snapshots)
+                .saturating_add(gate.exchange),
             per_input: r.per_input,
         }
     }
@@ -2298,6 +2303,18 @@ impl Reservation {
                 self.per_input
             }
     }
+}
+
+/// A gated play's storage beside its recording (design.md "Play
+/// Lifecycle", the start gate), admitted with it
+/// ([`Reservation::with_gate`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GateStorage {
+    /// The entries of the input side's held-input snapshot storage.
+    pub held: usize,
+    /// The bytes the rig's exchange with its input side retains for the
+    /// attempt's rearms: buffers it reserved, by their capacities.
+    pub exchange: usize,
 }
 
 /// The inputs each bound system control (retry, quit) of a source gets in the

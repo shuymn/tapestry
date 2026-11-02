@@ -61,7 +61,6 @@ use eval::{InputStart, JudgeEvent};
 use input::{Arrival, DeviceKind};
 use replay::{CancelReason, Incomplete, ReadyHistory};
 
-use crate::HistoryRecorder;
 use crate::app::IDLE_WAIT;
 use crate::attempt::{Preparation, PreparationRefusal};
 use crate::audio_loop::AudioWaitError;
@@ -75,6 +74,7 @@ use crate::session::{
     Command, Loaded, MenuCommand, PlayEnd, PlayOutcome, PlayReport, RECORDING_MEMORY, Settings,
 };
 use crate::sound::{AudioQueue, audio_link_at};
+use crate::{GateStorage, HistoryRecorder};
 
 /// What opening recording gave.
 #[derive(Debug)]
@@ -415,6 +415,12 @@ pub trait Rig {
     /// The held-input snapshot's reserved size on the input side: what a
     /// rearmed candidate's snapshot may hold. Gated rigs only.
     fn snapshot_capacity(&self) -> usize {
+        0
+    }
+    /// The bytes the rig's exchange with its input side retains for the
+    /// attempt's rearms, by their capacities, admitted with the recording
+    /// ([`GateStorage::exchange`](crate::GateStorage)). Gated rigs only.
+    fn gate_exchange(&self) -> usize {
         0
     }
 }
@@ -822,8 +828,11 @@ fn play_and_next<R: Rig>(
     let mut origin = opening.origin;
     // The refusal is the error reported; a failed close adds nothing to it.
     // A gated play's own storage is admitted with its recording.
-    let held = gated.then(|| rig.snapshot_capacity());
-    let plan = match loaded.plan_gated(&opening.kinds, &opening.axes, held) {
+    let storage = gated.then(|| GateStorage {
+        held: rig.snapshot_capacity(),
+        exchange: rig.gate_exchange(),
+    });
+    let plan = match loaded.plan_gated(&opening.kinds, &opening.axes, storage) {
         Ok(plan) => plan,
         Err(e) => {
             let _ = rig.close();
@@ -849,7 +858,7 @@ fn play_and_next<R: Rig>(
     // A gated play's candidates: the history of cancelled openings and the
     // rearmed snapshot, reserved with the play's setup and reused by every
     // rearm.
-    let mut gate = held.map(|held| {
+    let mut gate = storage.map(|GateStorage { held, .. }| {
         logic.reserve_start(held);
         Candidates::new(held)
     });

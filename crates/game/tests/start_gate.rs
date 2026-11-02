@@ -729,6 +729,23 @@ fn two_notes(last_s: i64) -> Chart {
 /// Whether `chart` under `config` is admitted for four keyboards without
 /// the gate, and with its storage (`Loaded::plan_gated`).
 fn admits(root: &DataRoot, chart: Chart, config: SessionConfig) -> (bool, bool) {
+    admits_with(root, chart, config, GATE)
+}
+
+/// The gate's storage of a rig whose exchange with its input side keeps
+/// nothing of its own.
+const GATE: game::GateStorage = game::GateStorage {
+    held: HELD,
+    exchange: 0,
+};
+
+/// [`admits`] with the gate's storage `gate`.
+fn admits_with(
+    root: &DataRoot,
+    chart: Chart,
+    config: SessionConfig,
+    gate: game::GateStorage,
+) -> (bool, bool) {
     let parts = Parts {
         ingest: Box::new(Built(chart)),
         ..Parts::standard(root, &tapestry_settings(root).player)
@@ -744,7 +761,7 @@ fn admits(root: &DataRoot, chart: Chart, config: SessionConfig) -> (bool, bool) 
     let axes = vec![Vec::new(); KINDS.len()];
     (
         loaded.plan_gated(&KINDS, &axes, None).is_ok(),
-        loaded.plan_gated(&KINDS, &axes, Some(HELD)).is_ok(),
+        loaded.plan_gated(&KINDS, &axes, Some(gate)).is_ok(),
     )
 }
 
@@ -783,6 +800,30 @@ fn fits_only_ungated(root: &DataRoot) -> i64 {
 fn the_gates_storage_counts_in_the_recording_admission() {
     let (_dir, root) = temp_root();
     fits_only_ungated(&root);
+}
+
+/// The rig's exchange with its input side counts too: a window that fits
+/// the gate's history and snapshots but not the exchange's buffers beside
+/// them (the player's: an events arena of `MAX_CANCELLED_EVENTS`) is
+/// refused for a gated play.
+#[test]
+fn the_rigs_exchange_counts_in_the_recording_admission() {
+    let (_dir, root) = temp_root();
+    let exchange = game::GateStorage {
+        held: HELD,
+        exchange: replay::MAX_CANCELLED_EVENTS * size_of::<eval::PhysicalInputEvent>(),
+    };
+    let at = |s| {
+        (
+            admits(&root, two_notes(s), config()).1,
+            admits_with(&root, two_notes(s), config(), exchange).1,
+        )
+    };
+    let lo = last_admitted(2, 4_000, |s| at(s).0);
+    assert!(
+        (lo - 40..=lo).any(|t| at(t) == (true, false)),
+        "no window fits only without the exchange below {lo} s"
+    );
 }
 
 /// Through the lifecycle: a gated play whose window fits only without the

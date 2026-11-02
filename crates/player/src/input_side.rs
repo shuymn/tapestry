@@ -2388,6 +2388,48 @@ mod gate_tests {
         assert_eq!(gate.state().generation, 1, "nothing was armed");
     }
 
+    /// The player's gate admits what its exchange with the input side
+    /// keeps, by the capacities reserved at the opening: an attempt whose
+    /// recording fills the reservation exactly with the history and the
+    /// snapshots is refused once the exchange is counted.
+    #[test]
+    fn the_player_gates_exchange_counts_in_the_admission() {
+        let (mut sources, mut hook, link, _) = rig();
+        let mut gate = crate::start_gate::PlayerGate::install(
+            &link,
+            AdjustmentBindings {
+                controls: vec![(TapControl::Key(Q), 0)],
+                latched: 1,
+                wrap: None,
+            },
+        )
+        .unwrap();
+        let opening = open(&mut hook, &link, &mut sources, 10).unwrap();
+        gate.opened(1, &opening);
+        assert!(
+            gate.exchange()
+                >= replay::MAX_CANCELLED_EVENTS * size_of::<eval::PhysicalInputEvent>()
+                    + replay::MAX_OPENING_ARRIVALS * size_of::<input::Arrival>(),
+            "{}",
+            gate.exchange()
+        );
+        let base = game::Reservation {
+            fixed: 4_096,
+            per_input: 1,
+        };
+        let without = base.with_gate(game::GateStorage {
+            held: gate.snapshot(),
+            exchange: 0,
+        });
+        let with = base.with_gate(game::GateStorage {
+            held: gate.snapshot(),
+            exchange: gate.exchange(),
+        });
+        let inputs = without.capacity();
+        assert!(without.fits(inputs));
+        assert!(!with.fits(inputs), "the exchange was not admitted");
+    }
+
     /// The same refusal through the player's gate, with one event of room
     /// left in the history and two arriving between its drain and the
     /// input side's boundary: the capture is sealed, and the history the

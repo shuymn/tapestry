@@ -697,6 +697,12 @@ impl Rig for PlayerRig<'_> {
         }
     }
 
+    fn gate_exchange(&self) -> usize {
+        self.gate
+            .as_ref()
+            .map_or(0, crate::start_gate::PlayerGate::exchange)
+    }
+
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn snapshot_capacity(&self) -> usize {
         self.gate
