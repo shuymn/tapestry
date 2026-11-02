@@ -1,8 +1,8 @@
 //! CPU benchmarks of importing a Lua skin, each stage apart
 //! (docs/stage3.md §3, Lua evidence), on a generated skin: a header of
 //! 16 options, a configured pass that builds 1,000 images and their
-//! destinations through a local module, with a decorative draw function
-//! on every tenth.
+//! destinations through a local module (data only: a function in the
+//! definition is refused until S7-03).
 //!
 //! - `skin_beatoraja_lua_header_pass`: [`read_lua_header`], the header
 //!   pass's VM, its conversion and the header.
@@ -48,14 +48,12 @@ fn typical(root: &Path) {
         root,
         "parts.lua",
         b"local m = {}\n\
-          local function shown() return true end\n\
           function m.build(n)\n\
             local images, dsts = {}, {}\n\
             for i = 1, n do\n\
               local id = \"i\" .. i\n\
               images[i] = { id = id, src = \"a\", x = i % 32, y = 0, w = 32, h = 32 }\n\
               local d = { id = id, dst = { { x = i % 1000, y = 10, w = 32, h = 32 } } }\n\
-              if i % 10 == 0 then d.draw = shown end\n\
               dsts[i] = d\n\
             end\n\
             return images, dsts\n\
