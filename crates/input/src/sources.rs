@@ -7,6 +7,7 @@
 use bms_model::TimeUs;
 use eval::{ControlId, InputKind, InputStart, PhysicalInputEvent, SourceId};
 
+use crate::adjust::AdjustmentTap;
 use crate::gate::{Admit, DeviceId, FocusGate, Packet};
 use crate::hid::{AxisCap, HidProduct, MAX_AXES, is_axis};
 use crate::menu::MenuTap;
@@ -33,6 +34,27 @@ pub struct Arrival {
 
 /// The most sources a play can have: one per [`SourceId`].
 pub const SOURCE_LIMIT: usize = 1 << 16;
+
+/// Why [`SourceSet::reopen`] refused to open the next opening.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum ReopenError {
+    /// No attempt is open.
+    #[error("no attempt is open")]
+    NotRecording,
+    /// The origin is not after the open opening's: origins are never
+    /// reused.
+    #[error("the next opening's origin is not after the last one's")]
+    Origin,
+    /// The readers were taken and not given back.
+    #[error("the readers have not been given back")]
+    ReadersOut,
+    /// The readers given back are not the attempt's, in its order.
+    #[error("the readers given back are not the attempt's")]
+    Readers,
+    /// A source still has events of the sealed opening.
+    #[error("source {} still has events of the sealed opening", .0.0)]
+    Undrained(SourceId),
+}
 
 /// Why [`SourceSet::new`] refused a configuration.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
@@ -121,9 +143,12 @@ struct Recording {
     /// Devices taking part that got no source: beyond `max_sources`, or
     /// not tracked at all.
     left_out: usize,
-    /// Where the play's time 0 lies on the batch clock: every time recorded
-    /// or published is the batch time minus this.
+    /// Where the opening's time 0 lies on the batch clock: every time
+    /// recorded or published is the batch time minus this.
     origin: TimeUs,
+    /// The opening's held-input snapshot, its storage reserved with the
+    /// attempt.
+    start: InputStart,
 }
 
 impl Recording {
@@ -165,6 +190,9 @@ pub struct SourceSet {
     /// The mode `device.toml` sets for the bound axes of the configured
     /// controller model ([`set_axis_mode`](Self::set_axis_mode)).
     axis_mode: Option<AxisMode>,
+    /// Where the adjustment controls go, recording open or not
+    /// ([`set_adjustment`](Self::set_adjustment)).
+    adjust: Option<AdjustmentTap>,
 }
 
 /// The mode `device.toml` sets for a controller model's bound axes.
@@ -204,6 +232,7 @@ impl SourceSet {
             recording: None,
             menu: None,
             axis_mode: None,
+            adjust: None,
         })
     }
 
@@ -217,7 +246,8 @@ impl SourceSet {
 
     /// Starts over with `config`, between plays: every device and its
     /// queues go, as in a new set, while the focus gate (and every latch
-    /// handle taken from it), the menu and the axis mode stay. For a
+    /// handle taken from it), the menu, the adjustment tap and the axis
+    /// mode stay. For a
     /// session whose input changes with its chart (a development scenario
     /// replaying a log for one chart and autoplay for the next).
     ///
@@ -229,6 +259,9 @@ impl SourceSet {
         std::mem::swap(&mut fresh.gate, &mut self.gate);
         fresh.menu = self.menu.take();
         fresh.axis_mode = self.axis_mode.take();
+        if let Some(tap) = self.adjust.take() {
+            fresh.set_adjustment(tap);
+        }
         *self = fresh;
         Ok(())
     }
@@ -258,9 +291,14 @@ impl SourceSet {
     /// above `fresh` and stay above the publication. The latch is checked
     /// here too, so a focus loss is seen even when no batch follows it;
     /// nothing is published once the gate has tripped, so the play ends at
-    /// what was already finalized.
+    /// what was already finalized. The adjustment tap sends what it owes,
+    /// or a tick while a tapped control is held.
     pub fn end_batch(&mut self, fresh: TimeUs) {
-        if !self.gate.check() {
+        let open = self.gate.check();
+        if let Some(tap) = &mut self.adjust {
+            tap.end_batch(self.batch_at, open);
+        }
+        if !open {
             return;
         }
         let Some(rec) = &self.recording else {
@@ -283,6 +321,12 @@ impl SourceSet {
     /// While recording is closed, a packet of the first connected
     /// controller of the menu's model is offered to the menu
     /// ([`set_menu`](Self::set_menu)), which acts on it only while active.
+    ///
+    /// A tapped control's packet goes to the adjustment tap
+    /// ([`set_adjustment`](Self::set_adjustment)), recording open or not:
+    /// a button's change of held state, or an axis's signed movement
+    /// since its last report, read before the position is replaced and
+    /// before any conversion to a lane.
     pub fn packet(&mut self, packet: &Packet) -> Admit {
         let admit = self.gate.admit(packet);
         self.offer_menu(packet);
@@ -291,6 +335,11 @@ impl SourceSet {
             return admit;
         };
         let source = device.source;
+        let tapped = self
+            .adjust
+            .as_ref()
+            .and_then(|t| t.number(device.kind, device.product, packet.control));
+        let foreground = admit == Admit::Record;
         let axis = device
             .axes
             .iter()
@@ -304,17 +353,36 @@ impl SourceSet {
                 clippy::indexing_slicing,
                 reason = "`i` is a position below `n_axes`, at most MAX_AXES"
             )]
-            if !resolved_relative(self.axis_mode.as_ref(), device.product, &device.axes[i]) {
-                device.positions[i] = Some(packet.value);
+            let (cap, slot) = (&device.axes[i], &mut device.positions[i]);
+            let value = i64::from(packet.value);
+            let (moved, wrap) = if resolved_relative(self.axis_mode.as_ref(), device.product, cap) {
+                (value, None)
+            } else {
+                let prev = slot.replace(packet.value);
+                let declared = if cap.relative { 0 } else { cap.wrap };
+                (prev.map_or(0, |p| value - i64::from(p)), Some(declared))
+            };
+            if let (Some(n), Some(tap)) = (tapped, &mut self.adjust) {
+                tap.axis(n, moved, wrap, self.batch_at, foreground);
             }
-        } else if !track(&mut device.held, max_held, packet.control, packet.value) {
-            // The state table is full; snapshots of this device may miss
-            // the control from now on.
-            device.state_lost = true;
-            if source.is_some()
-                && let Some(rec) = &mut self.recording
-            {
-                rec.overflowed = true;
+        } else {
+            let was = tapped.is_some() && device.held.iter().any(|&(c, _)| c == packet.control);
+            if track(&mut device.held, max_held, packet.control, packet.value) {
+                if let (Some(n), Some(tap)) = (tapped, &mut self.adjust) {
+                    tap.button(n, was, packet.value != 0, self.batch_at, foreground);
+                }
+            } else {
+                // The state table is full; snapshots of this device may
+                // miss the control from now on, and so may the latch.
+                device.state_lost = true;
+                if let Some(tap) = &mut self.adjust {
+                    tap.set_unverified(true);
+                }
+                if source.is_some()
+                    && let Some(rec) = &mut self.recording
+                {
+                    rec.overflowed = true;
+                }
             }
         }
         #[expect(
@@ -354,6 +422,27 @@ impl SourceSet {
     /// The menu, to set it active at each boundary and see what it sent.
     pub const fn menu_mut(&mut self) -> Option<&mut MenuTap> {
         self.menu.as_mut()
+    }
+
+    /// Sends the adjustment controls to `tap` from now on, recording open
+    /// or not, while it is active; replaces an earlier one. The controls
+    /// the connected devices hold now are counted as its holders.
+    pub fn set_adjustment(&mut self, mut tap: AdjustmentTap) {
+        tap.clear_holders();
+        for d in &self.devices {
+            for &(c, _) in &d.held {
+                if let Some(n) = tap.number(d.kind, d.product, c) {
+                    tap.hold(n);
+                }
+            }
+        }
+        tap.set_unverified(self.devices.iter().any(|d| d.state_lost));
+        self.adjust = Some(tap);
+    }
+
+    /// The adjustment tap, to set it active at each boundary.
+    pub const fn adjustment_mut(&mut self) -> Option<&mut AdjustmentTap> {
+        self.adjust.as_mut()
     }
 
     /// Offers `packet` to the menu: only while recording is closed, and
@@ -697,6 +786,17 @@ impl SourceSet {
         // `remove` keeps the order devices were found in, which gives
         // source ids at the next open.
         let mut removed = self.devices.remove(i);
+        if let Some(tap) = &mut self.adjust {
+            // What it held is released; the latch is verified again once
+            // no device that lost its state is left.
+            let foreground = !self.gate.is_tripped();
+            for &(c, _) in &removed.held {
+                if let Some(n) = tap.number(removed.kind, removed.product, c) {
+                    tap.button(n, true, false, self.batch_at, foreground);
+                }
+            }
+            tap.set_unverified(self.devices.iter().any(|d| d.state_lost));
+        }
         removed.held.clear();
         self.spare_held.push(removed.held);
         let Some(source) = removed.source else {
@@ -751,13 +851,26 @@ impl SourceSet {
     }
 
     /// [`open_recording`](Self::open_recording) for a play whose time 0 lies at
-    /// `origin` on the batch clock. Until recording closes, every receive time
-    /// recorded, every publication, every final watermark and every arrival is
-    /// the batch time minus `origin`: the logic thread sees the play's timeline
-    /// while the input thread keeps reading one clock across plays (design.md
-    /// "Play Lifecycle": each play's chart time 0 lies `lead_in` after its
-    /// READY state starts). The snapshot's `opened_at` is `now − origin`.
+    /// `origin` on the batch clock: [`open_attempt`](Self::open_attempt)
+    /// with the snapshot copied out, which allocates. Until recording
+    /// closes, every receive time recorded, every publication, every final
+    /// watermark and every arrival is the batch time minus `origin`: the
+    /// logic thread sees the play's timeline while the input thread keeps
+    /// reading one clock across plays (design.md "Play Lifecycle": each
+    /// play's chart time 0 lies `lead_in` after its READY state starts).
+    /// The snapshot's `opened_at` is `now − origin`.
     pub fn open_play(&mut self, now: TimeUs, origin: TimeUs) -> InputStart {
+        self.open_attempt(now, origin).clone()
+    }
+
+    /// Opens the attempt's one source table and its first opening, whose
+    /// time 0 lies at `origin` on the batch clock, as
+    /// [`open_play`](Self::open_play) does: the queues, the readers, the
+    /// arrivals list and the held-input snapshot's storage are allocated
+    /// here, once per attempt, and every later opening of the attempt
+    /// ([`reopen`](Self::reopen)) reuses them. Returns the opening's
+    /// snapshot.
+    pub fn open_attempt(&mut self, now: TimeUs, origin: TimeUs) -> &InputStart {
         self.close_recording();
         let taking = self.devices.iter().filter(|d| d.takes_part).count();
         let n = taking.min(self.config.max_sources);
@@ -766,7 +879,6 @@ impl SourceSet {
         let mut overflowed = false;
         let mut participants = Vec::with_capacity(n);
         let mut readers = Vec::with_capacity(n);
-        let mut held = Vec::new();
         // Controllers first, so keyboards' many handles never push a
         // controller out at the limit; each kind in the order found.
         for kind in [DeviceKind::Controller, DeviceKind::Keyboard] {
@@ -785,7 +897,7 @@ impl SourceSet {
                 overflowed |= device.state_lost;
                 // An axis is recorded only if the device declares it now: the
                 // recording window was sized for these, and an axis a late
-                // collection adds is not recorded in this play.
+                // collection adds is not recorded in this attempt.
                 let declared = device.axes.iter().take(device.n_axes);
                 let recorded: Vec<ControlId> = device
                     .recorded
@@ -797,22 +909,6 @@ impl SourceSet {
                             || declared.clone().any(|a| a.control == c)
                     })
                     .collect();
-                held.extend(
-                    device
-                        .held
-                        .iter()
-                        .filter(|(c, _)| recorded.contains(c))
-                        .map(|&(c, v)| (source, c, v)),
-                );
-                held.extend(
-                    device
-                        .axes
-                        .iter()
-                        .take(device.n_axes)
-                        .zip(device.positions)
-                        .filter(|(a, _)| recorded.contains(&a.control))
-                        .filter_map(|(a, p)| p.map(|v| (source, a.control, v))),
-                );
                 let (writer, reader) = source_queue(capacity);
                 participants.push(Participant {
                     device: device.id,
@@ -827,7 +923,10 @@ impl SourceSet {
                 readers.push(reader);
             }
         }
-        self.recording = Some(Recording {
+        // Each source holds at most `max_held` controls and MAX_AXES axis
+        // positions, so no opening's snapshot grows past this.
+        let held = n.saturating_mul(self.config.max_held.saturating_add(MAX_AXES));
+        let rec = self.recording.insert(Recording {
             participants,
             readers,
             arrivals: Vec::with_capacity(self.config.max_arrivals),
@@ -835,20 +934,99 @@ impl SourceSet {
             overflowed,
             left_out,
             origin,
+            start: InputStart {
+                opened_at: TimeUs(0),
+                held: Vec::with_capacity(held),
+            },
         });
-        InputStart {
-            opened_at: TimeUs(now.0.saturating_sub(origin.0)),
-            held,
+        snapshot(rec, &self.devices, now);
+        &rec.start
+    }
+
+    /// Seals the attempt's open opening and opens the next on the same
+    /// source table, its time 0 at `origin` on the batch clock, without
+    /// allocating: the readers must be back ([`return_readers`]) and
+    /// drained, so every event of the sealed opening was taken. Each
+    /// queue starts over on the new timeline; arrivals and the
+    /// out-of-range counts start empty, while an overflow and the sources
+    /// left out stay for the attempt. A source whose device was removed
+    /// keeps its id and reports absent: `Disconnected` at the opening
+    /// time, then closed. A device connected since stays an arrival until
+    /// the next attempt. Returns the opening's snapshot.
+    ///
+    /// # Errors
+    ///
+    /// [`ReopenError`], changing nothing.
+    ///
+    /// [`return_readers`]: Self::return_readers
+    pub fn reopen(&mut self, now: TimeUs, origin: TimeUs) -> Result<&InputStart, ReopenError> {
+        let tripped = self.gate.is_tripped();
+        let Some(rec) = &mut self.recording else {
+            return Err(ReopenError::NotRecording);
+        };
+        if origin <= rec.origin {
+            return Err(ReopenError::Origin);
         }
+        if rec.readers.len() != rec.participants.len() {
+            return Err(ReopenError::ReadersOut);
+        }
+        for (p, r) in rec.participants.iter().zip(&rec.readers) {
+            // Checked for every source before any is changed.
+            if !p.writer.pairs(r) {
+                return Err(ReopenError::Readers);
+            }
+        }
+        if let Some(i) = rec.readers.iter().position(|r| !r.is_empty()) {
+            return Err(ReopenError::Undrained(SourceId(
+                u16::try_from(i).unwrap_or(u16::MAX),
+            )));
+        }
+        rec.origin = origin;
+        rec.arrivals.clear();
+        rec.arrivals_dropped = 0;
+        let opened_at = rec.play_time(now);
+        for ((p, r), id) in rec.participants.iter_mut().zip(&rec.readers).zip(0_u16..) {
+            let rearmed = p.writer.rearm(r);
+            debug_assert!(rearmed, "each reader was checked above");
+            p.out_of_range = 0;
+            p.out_of_set_range = 0;
+            let source = SourceId(id);
+            p.closed |= !self.devices.iter().any(|d| d.source == Some(source));
+            if p.closed {
+                let gone = PhysicalInputEvent {
+                    received: opened_at,
+                    source,
+                    kind: InputKind::Disconnected,
+                };
+                if !tripped && p.writer.push(gone).is_err() {
+                    rec.overflowed = true;
+                }
+                p.writer.close(opened_at);
+            }
+        }
+        snapshot(rec, &self.devices, now);
+        Ok(&rec.start)
     }
 
     /// The readers of the open recording, indexed by [`SourceId`]; empty
-    /// after the first call.
+    /// after the first call until they are returned.
     pub fn take_readers(&mut self) -> Vec<SourceReader> {
         self.recording
             .as_mut()
             .map(|r| std::mem::take(&mut r.readers))
             .unwrap_or_default()
+    }
+
+    /// Gives back the readers [`take_readers`](Self::take_readers) took,
+    /// in the same order, for the next opening of the attempt
+    /// ([`reopen`](Self::reopen) checks them). Dropped when recording is
+    /// closed or the readers are already back.
+    pub fn return_readers(&mut self, readers: Vec<SourceReader>) {
+        if let Some(rec) = &mut self.recording
+            && rec.readers.is_empty()
+        {
+            rec.readers = readers;
+        }
     }
 
     /// Closes the recording. Devices keep their physical state.
@@ -891,6 +1069,14 @@ impl SourceSet {
             .map(|d| d.connection)
     }
 
+    /// The open opening's held-input snapshot, as
+    /// [`open_attempt`](Self::open_attempt) or [`reopen`](Self::reopen)
+    /// returned it.
+    #[must_use]
+    pub fn opening(&self) -> Option<&InputStart> {
+        self.recording.as_ref().map(|r| &r.start)
+    }
+
     /// Devices that arrived during the open recording.
     #[must_use]
     pub fn arrivals(&self) -> &[Arrival] {
@@ -928,8 +1114,39 @@ impl SourceSet {
     }
 }
 
-/// Updates one control in a device's held list. Returns `false` when a
-/// newly held control does not fit.
+/// Fills the opening's snapshot: `opened_at` is `now` on its timeline, and
+/// each source whose device is still connected gives the recorded
+/// controls it holds and its axes' positions, in source order. The
+/// attempt reserved room for all of them, so nothing is allocated.
+fn snapshot(rec: &mut Recording, devices: &[Device], now: TimeUs) {
+    rec.start.opened_at = rec.play_time(now);
+    let held = &mut rec.start.held;
+    held.clear();
+    for (p, id) in rec.participants.iter().zip(0_u16..) {
+        let source = SourceId(id);
+        let Some(device) = devices.iter().find(|d| d.source == Some(source)) else {
+            continue;
+        };
+        let recorded = &p.recorded;
+        held.extend(
+            device
+                .held
+                .iter()
+                .filter(|(c, _)| recorded.contains(c))
+                .map(|&(c, v)| (source, c, v)),
+        );
+        held.extend(
+            device
+                .axes
+                .iter()
+                .take(device.n_axes)
+                .zip(device.positions)
+                .filter(|(a, _)| recorded.contains(&a.control))
+                .filter_map(|(a, p)| p.map(|v| (source, a.control, v))),
+        );
+    }
+}
+
 /// Whether the axis `cap` of a device of `product` is converted as
 /// relative: the mode `set` gives it, else the declared one.
 fn resolved_relative(set: Option<&AxisMode>, product: Option<HidProduct>, cap: &AxisCap) -> bool {
@@ -937,6 +1154,8 @@ fn resolved_relative(set: Option<&AxisMode>, product: Option<HidProduct>, cap: &
         .map_or(cap.relative, |m| m.relative)
 }
 
+/// Updates one control in a device's held list. Returns `false` when a
+/// newly held control does not fit.
 fn track(held: &mut Vec<(ControlId, i32)>, max: usize, control: ControlId, value: i32) -> bool {
     match held.iter().position(|&(c, _)| c == control) {
         Some(i) if value == 0 => {
