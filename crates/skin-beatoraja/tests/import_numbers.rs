@@ -284,12 +284,12 @@ fn rates() -> common::Loaded {
     ))
 }
 
-/// The rows' digits as drawn at `ms`, read through the EX score's glyph
-/// for each digit; a blank cell is not drawn.
-fn rows(d: &mut common::play::Drawn, ms: i64) -> Vec<String> {
+/// The `n` rows' digits as drawn at `ms`, read through the EX score's
+/// glyph for each digit; a blank cell is not drawn.
+fn rows(d: &mut common::play::Drawn, ms: i64, n: usize) -> Vec<String> {
     let glyph = d.ex_glyphs(ms);
     let q = d.frame(ms, &[]);
-    let mut rows = vec![String::new(); RATES.len()];
+    let mut rows = vec![String::new(); n];
     let mut cells: Vec<_> = q.iter().map(|q| (q.rect[1], q.rect[0], q.uv)).collect();
     cells.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.total_cmp(&b.1)));
     let ys: Vec<f32> = {
@@ -331,15 +331,18 @@ fn rates_show_whole_percent_and_hundredths() {
     // Before any judgment, and again after a retry: 100.00 and 0.00 (the
     // source draws no digits until it has a score).
     let fresh = ["100", "00", "0", "00", "0", "00"];
-    assert_eq!(rows(&mut d, 0), fresh);
+    assert_eq!(rows(&mut d, 0, RATES.len()), fresh);
     // EX 3 over 2 judged of 4 targets: 75.00 and 37.50.
     d.tally.counts.perfect = 1;
     d.tally.counts.great = 1;
     d.tally.ex_score = 3;
-    assert_eq!(rows(&mut d, 16), ["75", "00", "37", "50", "37", "50"]);
+    assert_eq!(
+        rows(&mut d, 16, RATES.len()),
+        ["75", "00", "37", "50", "37", "50"]
+    );
     d.retry(4);
     d.tally = common::play::tally(0, 0);
-    assert_eq!(rows(&mut d, 0), fresh);
+    assert_eq!(rows(&mut d, 0, RATES.len()), fresh);
 }
 
 #[test]
@@ -401,24 +404,8 @@ fn fast_and_slow_show_the_tallys_counts_with_a_d4_note() {
             .all(|n| n.kind == NoteKind::Deviation(skin_beatoraja::DeviationId::D4))
     );
     let mut d = loaded.drawn_over(4);
-    let rows = |d: &mut common::play::Drawn, ms: i64| {
-        let glyph = d.ex_glyphs(ms);
-        let q = d.frame(ms, &[]);
-        let mut cells: Vec<_> = q.iter().map(|q| (q.rect[1], q.rect[0], q.uv)).collect();
-        cells.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.total_cmp(&b.1)));
-        let mut ys: Vec<f32> = cells.iter().map(|c| c.0).collect();
-        ys.dedup();
-        let mut rows = vec![String::new(); FAST_SLOW.len()];
-        for (y, uv) in cells.iter().map(|c| (c.0, c.2)) {
-            let row = ys.iter().position(|&r| r == y).unwrap();
-            if row > 0 {
-                rows[row - 1].push(glyph[&uv.map(f32::to_bits)]);
-            }
-        }
-        rows
-    };
-    assert_eq!(rows(&mut d, 0), ["0", "0", "0", "0"]);
+    assert_eq!(rows(&mut d, 0, FAST_SLOW.len()), ["0", "0", "0", "0"]);
     d.tally.fast = 12;
     d.tally.slow = 7;
-    assert_eq!(rows(&mut d, 16), ["12", "12", "7", "7"]);
+    assert_eq!(rows(&mut d, 16, FAST_SLOW.len()), ["12", "12", "7", "7"]);
 }

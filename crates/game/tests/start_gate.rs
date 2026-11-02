@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use bms_model::{Chart, ChartBuilder, SoundId, TimeUs};
-use common::{MS, PERIOD, RATE, count_judged, lane, tapestry_settings};
+use common::{MS, PERIOD, RATE, count_judged, judgments, lane, tapestry_settings};
 use eval::{ControlId, InputKind, PhysicalInputEvent, SourceId};
 use game::{
     AbortCause, AdjustmentConfig, ChartIngest, Command, DataRoot, DeviceSettings, HiSpeedSettings,
@@ -443,19 +443,10 @@ fn fast_and_slow_count_the_winning_ready_only() {
         &rules::tapestry(),
     )
     .unwrap();
-    let judged: Vec<_> = cancelled
-        .events
-        .iter()
-        .filter_map(|e| match e.kind {
-            eval::JudgeEventKind::Judged {
-                judgment,
-                deviation,
-                ..
-            } => Some((judgment, deviation)),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(judged, [(Judgment::Bad, Some(TimeUs(-160 * MS)))]);
+    assert_eq!(
+        judgments(&cancelled.events),
+        [(1, 0, Judgment::Bad, Some(-160 * MS))]
+    );
     assert_eq!((cancelled.tally.fast, cancelled.tally.slow), (1, 0));
     // The rearm starts the winner from nothing.
     assert_eq!(count_judged(&report.live, Judgment::Bad), 0);
