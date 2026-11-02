@@ -7,7 +7,7 @@
 //! are the notes, the judgment line and the bar line groups
 //! ([`super::bar`]). The covers' paint is apart ([`super::cover_paint`]).
 
-use skin_model::{Filter, LaneParts, LaneStyle, LanesDef, Side, Source, SourceLanes};
+use skin_model::{Filter, LaneParts, LaneStyle, LanesDef, NoteOrder, Side, Source, SourceLanes};
 
 use super::super::asset::{Crop, FALLBACK_SIZE};
 use super::super::geom::{HEIGHT, Offset, Q, Rect};
@@ -270,16 +270,9 @@ impl Cx<'_> {
         let Some(xs) = self.lane_xs(rec, o)? else {
             return refuse(self, "dst");
         };
-        // The source paints by timeline then by lane, the model lane by
-        // lane: the same only while no two lanes overlap.
-        let mut sorted = xs.clone();
-        sorted.sort_unstable();
-        if sorted
-            .windows(2)
-            .any(|w| matches!(w, [a, b] if a[1] > b[0]))
-        {
-            return refuse(self, "dst");
-        }
+        // Key lanes may overlap or coincide: the source paints by timeline
+        // then by lane (`play/LaneRenderer.java:470-518`), as the model's
+        // timeline order does, so overlapping notes layer as there.
         let span = span_of(&xs);
 
         // Note heights: `size[i]·r` exactly, else the note's cell height
@@ -469,6 +462,9 @@ impl Cx<'_> {
         let state = LaneState {
             def: LanesDef {
                 style: LaneStyle::Source(source),
+                // The source's lane array order, keys then scratch
+                // (`play/LaneProperty.java:46-50`), whatever the x order.
+                note_order: NoteOrder::SOURCE,
                 lanes,
                 scratch,
                 top,
