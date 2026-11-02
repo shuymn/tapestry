@@ -6,8 +6,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use bms_model::{Chart, Lane, TimeUs};
-use eval::{GaugeState, JudgeEvent, Section, Tally};
+use bms_model::{Chart, Lane, NoteKind, TimeUs};
+use eval::{GaugeState, JudgeEvent, JudgeEventKind, NoteFacts, NoteHold, Section, Tally};
 use game::PlayView;
 use render::text::MenuText;
 use render::{AdapterChoice, AttemptInput, FrameInput, LoadingFrame, Renderer, SkinBundle, Target};
@@ -115,6 +115,8 @@ pub fn prepare_section(r: &mut Renderer, chart: &Chart, section: &Section) {
 
 pub fn view(combo: u32, ex_score: u32) -> PlayView {
     PlayView {
+        generation: 0,
+        origin: None,
         finalized: None,
         tally: Tally {
             counts: PerJudgment {
@@ -135,10 +137,82 @@ pub fn view(combo: u32, ex_score: u32) -> PlayView {
             reference: GaugeValue(GaugeValue::PERCENT * 71),
             failed_at: None,
         }],
+        notes: NoteFacts::default(),
         complete: false,
         playing: true,
         events: 31,
     }
+}
+
+/// What the evaluator's note facts become after `ev`, for tests that
+/// drive frames with effects: a judged tap or a hit mine is done, a long
+/// note's head press before its end (held, or a BAD head) takes it and
+/// starts the lane's hold, and its hold's end or its completion ends it. Drops are modelled
+/// by changing the facts without effects.
+pub fn follow(notes: &mut NoteFacts, chart: &Chart, ev: &JudgeEvent) {
+    let end_of = |lane: Lane, note: usize| match chart.lanes[lane.index()].get(note)?.kind {
+        NoteKind::Long { end, .. } => Some(end),
+        NoteKind::Tap | NoteKind::Mine { .. } => None,
+    };
+    match ev.kind {
+        JudgeEventKind::Judged {
+            lane,
+            note,
+            deviation,
+            release,
+            ..
+        } => {
+            notes.set_done(lane, note);
+            let Some(end) = end_of(lane, note) else {
+                return;
+            };
+            if deviation.is_some() && release.is_none() && ev.time < end {
+                notes.set_hold(
+                    lane,
+                    Some(NoteHold {
+                        note,
+                        start: ev.time,
+                        end,
+                    }),
+                );
+            } else if notes.hold(lane).is_some_and(|h| h.note == note) {
+                // Its completion ends its hold.
+                notes.set_hold(lane, None);
+            }
+        }
+        JudgeEventKind::LnHeld { lane, note, .. } => {
+            notes.set_done(lane, note);
+            if let Some(end) = end_of(lane, note) {
+                notes.set_hold(
+                    lane,
+                    Some(NoteHold {
+                        note,
+                        start: ev.time,
+                        end,
+                    }),
+                );
+            }
+        }
+        JudgeEventKind::LnHoldEnded { lane, note } => {
+            if notes.hold(lane).is_some_and(|h| h.note == note) {
+                notes.set_hold(lane, None);
+            }
+        }
+        JudgeEventKind::MineHit { lane, note } => notes.set_done(lane, note),
+        JudgeEventKind::EmptyPoor { .. }
+        | JudgeEventKind::PlaySound { .. }
+        | JudgeEventKind::Gauge { .. }
+        | JudgeEventKind::SongEnd => {}
+    }
+}
+
+/// `v` with note facts of `chart` following `effects` ([`follow`]).
+pub fn with_notes(v: PlayView, chart: &Chart, effects: &[JudgeEvent]) -> PlayView {
+    let mut notes = NoteFacts::new(chart);
+    for ev in effects {
+        follow(&mut notes, chart, ev);
+    }
+    PlayView { notes, ..v }
 }
 
 pub fn input<'a>(

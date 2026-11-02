@@ -231,13 +231,11 @@ fn autoplay_buffers_are_charged_and_admitted_before_they_exist() {
     // most one schedule entry) is refused, and allocates nothing beyond
     // its plan's probe; one BGM event fewer fits. Without any one of the
     // charges it would fit.
-    let per_note = {
-        let (a, _) = expected(&chart(1_000, 0));
-        let (b, _) = expected(&chart(2_000, 0));
-        (b - a) / 1_000
-    };
+    // The bytes per note as a ratio: the note facts' whole words per lane
+    // make it fractional.
     let (base, _) = expected(&chart(1_000, 0));
-    let notes = (RECORDING_MEMORY - base) / per_note + 1_000 - 2;
+    let (double, _) = expected(&chart(2_000, 0));
+    let notes = (RECORDING_MEMORY - base) * 1_000 / (double - base) + 1_000 - 2;
     let (below, own) = expected(&chart(i64::try_from(notes).unwrap(), 0));
     assert!(below <= RECORDING_MEMORY, "{below}");
     let entry = size_of::<BgmEvent>();

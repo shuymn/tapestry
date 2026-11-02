@@ -13,7 +13,7 @@ pub(crate) mod timers;
 use bms_model::{
     Chart, LANE_COUNT, Lane, LnMode, Note, Position, PresentationError, TimeUs, TimelineId,
 };
-use eval::{GaugeState, JudgeEvent, Section, Tally};
+use eval::{GaugeState, JudgeEvent, NoteFacts, NoteHold, Section, Tally};
 use rules::GaugeValue;
 
 use self::playhead::ExactPlayhead;
@@ -161,8 +161,14 @@ pub struct SkinFrame<'a> {
     /// The shown gauge's index into `gauges`; it may change between
     /// frames.
     pub gauge: usize,
-    /// The effects drained since the last frame, in emission order.
+    /// The effects drained since the last frame, in emission order, of
+    /// the play view's candidate and within its events: they start
+    /// animations only.
     pub effects: &'a [JudgeEvent],
+    /// The play view's note facts: each note's state and each lane's
+    /// visual long-note hold, from which the lanes and the `hold` timers
+    /// read, whatever effects were dropped.
+    pub notes: &'a NoteFacts,
     /// Whether evaluation is complete (the play view's `complete`): a
     /// section attempt then rings out without notes.
     pub complete: bool,
@@ -246,11 +252,14 @@ pub enum BuildError {
 }
 
 /// One attempt's skin state: the reducer, every timer's start and reading,
-/// and the fields, as of the last build. [`Skin::prepare`](crate::Skin::prepare)
+/// each lane's visual hold and the fields, as of the last build. [`Skin::prepare`](crate::Skin::prepare)
 /// makes a fresh one per attempt, so a retry starts clean.
 #[derive(Clone, Debug)]
 pub struct Play {
     reducer: Reducer,
+    /// Per lane, the note facts' visual hold as of the last build, off
+    /// once its long note's end is at or before the frame's `now`.
+    holds: [Option<NoteHold>; LANE_COUNT],
     /// The context's [`PlayContext::empty_poor_counted`].
     empty_poor_counted: bool,
     /// The error of a refused build, which every later build returns.
@@ -409,6 +418,7 @@ impl Play {
         });
         Ok(Self {
             reducer,
+            holds: [None; LANE_COUNT],
             empty_poor_counted: ctx.empty_poor_counted,
             poisoned: None,
             starts: vec![None; slots].into_boxed_slice(),
@@ -439,12 +449,13 @@ impl Play {
 
     /// Starts the attempt's runtime state over for a rearmed READY
     /// candidate (design.md "Play Lifecycle", the start gate), in place:
-    /// the reducer, every timer and the beat, as a fresh attempt has them.
-    /// The chart's notes, the prepared playhead, the gauges, the attached
-    /// and bitmap text and a refused build stay, and nothing is
+    /// the reducer, the holds, every timer and the beat, as a fresh attempt
+    /// has them. The chart's notes, the prepared playhead, the gauges, the
+    /// attached and bitmap text and a refused build stay, and nothing is
     /// allocated.
     pub fn rearm(&mut self) {
         self.reducer.rearm();
+        self.holds = [None; LANE_COUNT];
         self.starts.fill(None);
         self.ms.fill(TIMER_OFF);
         self.beat = None;
@@ -548,15 +559,18 @@ impl Play {
         self.display
     }
 
-    /// Whether `note` on lane `l` is no longer drawn: a judged tap or a hit
-    /// mine, as of the last build.
-    pub(crate) fn done(&self, l: usize, note: usize) -> bool {
-        self.reducer.done(l, note)
+    /// `lane`'s visual hold, as of the last build.
+    fn hold(&self, lane: Lane) -> Option<NoteHold> {
+        self.holds.get(lane.index()).copied().flatten()
     }
 
-    /// `lane`'s visual hold, as of the last build.
-    fn hold(&self, lane: Lane) -> Option<reducer::Hold> {
-        self.reducer.hold.get(lane.index()).copied().flatten()
+    /// Takes each lane's visual hold from `notes`, off once its long
+    /// note's end is at or before `now`, even while the facts, which
+    /// follow the finalized watermark, still hold it.
+    pub(crate) fn take_holds(&mut self, notes: &NoteFacts, now: TimeUs) {
+        for (lane, slot) in Lane::all().zip(&mut self.holds) {
+            *slot = notes.hold(lane).filter(|h| h.end > now);
+        }
     }
 
     /// The long note whose visual hold `lane` shows, as of the last build.
@@ -577,8 +591,8 @@ impl Play {
 #[cfg(test)]
 mod tests {
     use bms_model::{ChartBuilder, Lane, TimeUs};
-    use eval::{GaugeState, JudgeEvent, JudgeEventKind, Tally};
-    use rules::{GaugeValue, Judgment, PerJudgment};
+    use eval::{GaugeState, JudgeEvent, JudgeEventKind, NoteFacts, NoteHold, Tally};
+    use rules::{GaugeValue, PerJudgment};
 
     use super::{Attempt, CoverSettings, FrameReadouts, GaugeDesc, PlayContext, SkinFrame};
     use crate::{
@@ -617,10 +631,14 @@ mod tests {
         }
     }
 
-    /// The done bits and hold notes the lanes widget reads, after each
-    /// frame of effects.
+    /// The holds the lanes widget and the `hold` timers read come from
+    /// each frame's note facts, never from its effects: a dropped
+    /// `LnHeld` or a BAD head's judgment lost still holds, a late
+    /// `LnHoldEnded` of the held note ends nothing, and a hold reads off
+    /// once its long note's end is at the frame's `now`, even while the
+    /// facts, which follow the finalized watermark, still have it.
     #[test]
-    fn done_bits_and_hold_notes_follow_the_effects() {
+    fn holds_follow_the_note_facts() {
         let chart = ChartBuilder::new(150_000)
             .long(lane(2), TimeUs(1_000 * MS), TimeUs(1_300 * MS))
             .long(lane(2), TimeUs(2_000 * MS), TimeUs(2_300 * MS))
@@ -689,121 +707,78 @@ mod tests {
         }];
         let layout = Layout::AUTHOR;
         let mut batch = QuadBatch::with_capacity(0, 0);
-        let mut frame = |play: &mut super::Play, now_ms: i64, effects: &[JudgeEvent]| {
-            let frame = SkinFrame {
-                now: TimeUs(now_ms * MS),
-                display_offset: TimeUs(0),
-                tally: &tally,
-                gauges: &snapshot,
-                gauge: 0,
-                effects,
-                complete: false,
-                playing: true,
-                target: [1_920, 1_080],
-                layout: &layout,
-                lanes: LaneView {
-                    visible_time: TimeUs(600 * MS),
-                    cover: 0,
-                    lift: 0,
-                    hidden: 0,
-                },
-                readouts: OFF,
+        let mut frame =
+            |play: &mut super::Play, now_ms: i64, effects: &[JudgeEvent], notes: &NoteFacts| {
+                let frame = SkinFrame {
+                    now: TimeUs(now_ms * MS),
+                    display_offset: TimeUs(0),
+                    tally: &tally,
+                    gauges: &snapshot,
+                    gauge: 0,
+                    effects,
+                    notes,
+                    complete: false,
+                    playing: true,
+                    target: [1_920, 1_080],
+                    layout: &layout,
+                    lanes: LaneView {
+                        visible_time: TimeUs(600 * MS),
+                        cover: 0,
+                        lift: 0,
+                        hidden: 0,
+                    },
+                    readouts: OFF,
+                };
+                skin.build(play, &frame, &uvs, &mut batch).unwrap();
             };
-            skin.build(play, &frame, &uvs, &mut batch).unwrap();
-        };
-        let held = |n: u8, note: usize, kind: Judgment| JudgeEventKind::LnHeld {
-            lane: lane(n),
-            note,
-            judgment: kind,
-            deviation: TimeUs(0),
-        };
         let ended = |n: u8, note: usize| JudgeEventKind::LnHoldEnded {
             lane: lane(n),
             note,
         };
-        let judged = |n: u8, note: usize, judgment, deviation: Option<i64>, release| {
-            JudgeEventKind::Judged {
-                lane: lane(n),
-                note,
-                judgment,
-                deviation: deviation.map(|d| TimeUs(d * MS)),
-                release,
-                combo: 1,
-            }
+        let hold = |note, start: i64, end: i64| NoteHold {
+            note,
+            start: TimeUs(start * MS),
+            end: TimeUs(end * MS),
         };
-        frame(&mut play, 1_000, &[ev(1_000, held(2, 0, Judgment::Great))]);
+        let hold_timer = |play: &super::Play, n: u8| {
+            play.timer(super::schema::lane_timer(
+                super::schema::LaneTimer::Hold,
+                lane(n),
+            ))
+        };
+        let mut notes = NoteFacts::new(&chart);
+        // Held with its `LnHeld` dropped: the facts hold it.
+        notes.set_done(lane(2), 0);
+        notes.set_hold(lane(2), Some(hold(0, 1_000, 1_300)));
+        frame(&mut play, 1_000, &[], &notes);
         assert_eq!(play.hold_note(lane(2)), Some(0));
         assert!(play.body_active(lane(2), 0));
-        frame(
-            &mut play,
-            1_250,
-            &[
-                ev(1_250, ended(2, 0)),
-                ev(
-                    1_250,
-                    judged(2, 0, Judgment::Good, Some(0), Some(TimeUs(-50 * MS))),
-                ),
-            ],
-        );
+        assert_eq!(hold_timer(&play, 2), Some(TimeUs(1_000 * MS)));
+        // A late `LnHoldEnded` of it changes nothing while the facts hold.
+        frame(&mut play, 1_100, &[ev(1_050, ended(2, 0))], &notes);
+        assert_eq!(play.hold_note(lane(2)), Some(0));
+        // Released: the facts end it.
+        notes.set_hold(lane(2), None);
+        frame(&mut play, 1_250, &[], &notes);
         assert_eq!(play.hold_note(lane(2)), None);
-        // A judged long note stays drawn: it is never done.
-        assert!(!play.done(2, 0));
-        // A BAD head holds without `LnHeld`, its body active; it stays
-        // drawn.
-        frame(
-            &mut play,
-            1_400,
-            &[ev(1_400, judged(5, 0, Judgment::Bad, Some(-100), None))],
-        );
+        assert!(!play.body_active(lane(2), 0));
+        assert_eq!(hold_timer(&play, 2), None);
+        // A BAD head's hold, its judgment lost.
+        notes.set_done(lane(5), 0);
+        notes.set_hold(lane(5), Some(hold(0, 1_400, 1_800)));
+        frame(&mut play, 1_400, &[], &notes);
         assert_eq!(play.hold_note(lane(5)), Some(0));
         assert!(play.body_active(lane(5), 0));
-        assert!(!play.done(5, 0));
-        // Another note's end leaves it; its own ends it.
-        frame(&mut play, 1_420, &[ev(1_420, ended(5, 1))]);
-        assert_eq!(play.hold_note(lane(5)), Some(0));
-        frame(&mut play, 1_450, &[ev(1_450, ended(5, 0))]);
-        assert_eq!(play.hold_note(lane(5)), None);
-        // A held note whose end event is lost stops at its end.
-        frame(
-            &mut play,
-            2_000,
-            &[ev(2_000, held(2, 1, Judgment::Perfect))],
-        );
+        // A hold whose end passed reads off though the facts lag.
+        notes.set_hold(lane(2), Some(hold(1, 2_000, 2_300)));
+        frame(&mut play, 2_299, &[], &notes);
         assert_eq!(play.hold_note(lane(2)), Some(1));
-        frame(&mut play, 2_300, &[]);
+        frame(&mut play, 2_300, &[], &notes);
         assert_eq!(play.hold_note(lane(2)), None);
-        // A judged tap and a hit mine are done; a tap's `LnHeld` is no
-        // hold, and stray indices are ignored.
-        assert!(!play.done(5, 1));
-        frame(
-            &mut play,
-            3_000,
-            &[
-                ev(3_000, held(5, 1, Judgment::Great)),
-                ev(3_000, judged(5, 1, Judgment::Poor, None, None)),
-                ev(3_000, judged(5, 99, Judgment::Great, Some(0), None)),
-                ev(
-                    3_000,
-                    JudgeEventKind::MineHit {
-                        lane: lane(6),
-                        note: 0,
-                    },
-                ),
-                ev(
-                    3_000,
-                    JudgeEventKind::MineHit {
-                        lane: lane(6),
-                        note: 70,
-                    },
-                ),
-            ],
-        );
+        assert_eq!(hold_timer(&play, 2), None);
+        // A rearm clears the holds until the next frame's facts.
+        play.rearm();
         assert_eq!(play.hold_note(lane(5)), None);
-        assert!(play.done(5, 1));
-        assert!(play.done(6, 0));
-        assert!(!play.done(5, 99));
-        assert!(!play.done(6, 70));
-        assert!(!play.done(1, 0));
 
         // A refused frame applies none of its effects: the hold its end
         // would close stays.
@@ -812,8 +787,11 @@ mod tests {
             ..ctx
         };
         let mut play = skin.prepare(&chart, &counted).unwrap();
-        frame(&mut play, 1_000, &[ev(1_000, held(2, 0, Judgment::Great))]);
+        let mut notes = NoteFacts::new(&chart);
+        notes.set_hold(lane(2), Some(hold(0, 1_000, 1_300)));
+        frame(&mut play, 1_000, &[], &notes);
         assert_eq!(play.hold_note(lane(2)), Some(0));
+        notes.set_hold(lane(2), None);
         let inconsistent = Tally {
             empty_poor: 1,
             ..tally
@@ -825,6 +803,7 @@ mod tests {
             gauges: &snapshot,
             gauge: 0,
             effects: &[ev(1_250, ended(2, 0))],
+            notes: &notes,
             complete: false,
             playing: true,
             target: [1_920, 1_080],

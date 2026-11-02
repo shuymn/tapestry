@@ -118,7 +118,7 @@ pub use session::{
     AutoKeySounds, ChartSource, Command, GateStorage, Loaded, MenuCommand, Parts, PlayEnd,
     PlayOutcome, PlayPlan, PlayReport, PlayScript, PlayStart, RECORDING_MEMORY, Reservation,
     SMALL_PARTS_BYTES, SYSTEM_CONTROL_INPUTS, Session, SessionConfig, SessionError,
-    SessionPlayError, Settings, wake_policy,
+    SessionPlayError, Settings, VIEW_NOTE_COPIES, wake_policy,
 };
 pub use settings::{
     ControllerDevice, DataRoot, DeviceSettings, DeviceSettingsError, KeyConfig, KeyError, LaneKey,

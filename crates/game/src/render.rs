@@ -4,23 +4,37 @@
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering, fence};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use bms_model::TimeUs;
-use eval::{GaugeState, JudgeEvent, Tally};
+use eval::{GaugeState, JudgeEvent, NoteFacts, Tally};
 
 use crate::logic::EventSink;
 
 /// The latest state of the play, for drawing. Only the newest one matters,
-/// so it goes through a triple buffer, not a queue.
+/// so it goes through a triple buffer, not a queue. Everything a frame
+/// keeps on screen comes from here: the numbers, the gauges and each
+/// note's state; effects only start animations.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlayView {
+    /// The READY candidate this view is of: how many times the play's
+    /// candidate was rearmed before it (design.md "Play Lifecycle", the
+    /// start gate). Its effects are those queued after that rearm.
+    pub generation: u64,
+    /// Where the rearm put this candidate's chart time 0 on the rig's
+    /// clock; `None` for the play's first candidate, whose origin the play
+    /// hands the screen with it.
+    pub origin: Option<TimeUs>,
     /// The watermark the evaluator last finalized, if it has advanced.
     pub finalized: Option<TimeUs>,
     /// The running totals.
     pub tally: Tally,
     /// Every gauge, in the preset's order.
     pub gauges: Vec<GaugeState>,
+    /// Each note's state and each lane's visual long-note hold, by the
+    /// chart's note identities ([`eval::Evaluator::notes`]), sized for the
+    /// chart in every buffer before the play starts.
+    pub notes: NoteFacts,
     /// Whether evaluation is complete.
     pub complete: bool,
     /// Whether the play is in its playing phase, as the lifecycle
@@ -29,7 +43,8 @@ pub struct PlayView {
     /// completion or a failure on; the step that processed one of those
     /// still published true. Never derived from `complete`.
     pub playing: bool,
-    /// The number of events emitted so far.
+    /// The number of events this candidate emitted so far: its effects
+    /// with a lower sequence number are the ones this view includes.
     pub events: u64,
 }
 
@@ -40,10 +55,11 @@ pub type ViewWriter = triple_buffer::Input<PlayView>;
 /// bombs, lane flashes).
 ///
 /// When the queue is full the effect is dropped and counted. Effects are
-/// display-only: the logic thread must never wait on rendering (design.md
-/// "Overall Architecture"), and the play view still carries the totals and
-/// gauges, so a dropped effect loses a flash, never a number on screen. The
-/// count shows in [`RenderSide::dropped`].
+/// feedback only: the logic thread must never wait on rendering (design.md
+/// "Overall Architecture"), and the play view carries the totals, the
+/// gauges and every note's state, so a dropped effect loses an animation
+/// (a flash, a bomb, a judgment's text), never a number or a note's state
+/// on screen. The count shows in [`RenderSide::dropped`].
 #[derive(Debug)]
 pub struct RenderSink {
     effects: rtrb::Producer<JudgeEvent>,
@@ -55,18 +71,14 @@ pub struct RenderSink {
 
 /// What a READY candidate's rearm tells the render side: how many rearms
 /// there were and how many effects were queued before the latest, in one
-/// word so the two are always read together, and the latest rearmed
-/// candidate's origin, read with the count as one snapshot through a
-/// sequence the one writer, the logic step, makes odd while it writes.
+/// word so the two are always read together. A rearm is published before
+/// its candidate's first view, so no view names a rearm the render side
+/// cannot see yet.
 #[derive(Debug, Default)]
 struct Rearmed {
-    /// Odd while a rearm is written, advanced by two for each.
-    seq: AtomicU64,
     /// The rearms so far above [`QUEUED_BITS`], the effects queued before
     /// the latest rearm below: those are a cancelled candidate's.
     word: AtomicU64,
-    /// The latest rearmed candidate's chart time 0 on the rig's clock.
-    origin: AtomicI64,
 }
 
 /// The bits of [`Rearmed::word`] counting queued effects: far beyond any
@@ -79,35 +91,6 @@ impl Rearmed {
         let w = self.word.load(Ordering::Acquire);
         (w >> QUEUED_BITS, w & ((1 << QUEUED_BITS) - 1))
     }
-
-    /// A rearm's writing begins: its candidate's `origin`, which no
-    /// snapshot takes until [`publish`](Self::publish).
-    fn begin(&self, origin: TimeUs) {
-        let s = self.seq.load(Ordering::Relaxed);
-        self.seq.store(s.wrapping_add(1), Ordering::Relaxed);
-        fence(Ordering::Release);
-        self.origin.store(origin.0, Ordering::Relaxed);
-    }
-
-    /// The rearm begun is published: `word` with its origin.
-    fn publish(&self, word: u64) {
-        self.word.store(word, Ordering::Release);
-        let s = self.seq.load(Ordering::Relaxed);
-        self.seq.store(s.wrapping_add(1), Ordering::Release);
-    }
-
-    /// The rearms so far and the latest one's origin, of one rearm;
-    /// `None` while one is written.
-    fn try_snapshot(&self) -> Option<(u64, TimeUs)> {
-        let before = self.seq.load(Ordering::Acquire);
-        if before & 1 == 1 {
-            return None;
-        }
-        let word = self.word.load(Ordering::Acquire);
-        let origin = self.origin.load(Ordering::Acquire);
-        let after = self.seq.load(Ordering::Relaxed);
-        (before == after).then_some((word >> QUEUED_BITS, TimeUs(origin)))
-    }
 }
 
 impl EventSink for RenderSink {
@@ -119,11 +102,14 @@ impl EventSink for RenderSink {
         }
     }
 
-    fn rearm(&mut self, origin: TimeUs) {
-        self.rearmed.begin(origin);
+    /// Publishes the rearm: the view of the rearmed candidate, which
+    /// carries its origin, follows.
+    fn rearm(&mut self, _origin: TimeUs) {
         let (count, _) = self.rearmed.read();
         let queued = self.pushed & ((1 << QUEUED_BITS) - 1);
-        self.rearmed.publish(((count + 1) << QUEUED_BITS) | queued);
+        self.rearmed
+            .word
+            .store(((count + 1) << QUEUED_BITS) | queued, Ordering::Release);
     }
 }
 
@@ -133,17 +119,21 @@ pub struct RenderSide {
     effects: rtrb::Consumer<JudgeEvent>,
     view: triple_buffer::Output<PlayView>,
     dropped: Arc<AtomicU64>,
-    /// Effects popped so far, discarded ones included.
+    /// Effects popped so far, discarded ones included: with the rearm's
+    /// count of effects queued before it, what tells a cancelled
+    /// candidate's effects apart. Sequence numbers cannot, since a dropped
+    /// effect leaves a hole in them.
     popped: u64,
     rearmed: Arc<Rearmed>,
 }
 
 impl RenderSide {
     /// Pops the next effect, discarding those a rearm left behind. With
-    /// `seen`, the rearms the caller's state is of, an effect of a later
-    /// candidate stays queued: a drain never hands a newer candidate's
-    /// effects to state that has not started over for it.
-    fn pop(&mut self, seen: Option<u64>) -> Option<JudgeEvent> {
+    /// `seen`, a candidate's rearm count, only that candidate's effects
+    /// are handed over, and with `below` only those with a lower sequence
+    /// number: a later candidate's, and later ones of its own, stay
+    /// queued.
+    fn pop(&mut self, seen: Option<u64>, below: u64) -> Option<JudgeEvent> {
         loop {
             if self.effects.is_empty() {
                 return None;
@@ -151,6 +141,9 @@ impl RenderSide {
             let (count, queued) = self.rearmed.read();
             if self.popped >= queued {
                 if seen.is_some_and(|s| s != count) {
+                    return None;
+                }
+                if self.effects.peek().ok()?.seq >= below {
                     return None;
                 }
                 let ev = self.effects.pop().ok()?;
@@ -164,37 +157,58 @@ impl RenderSide {
 
     /// Hands every queued effect to `f`, in emission order. The logic step
     /// can keep pushing meanwhile, so one drain can hand over more than the
-    /// queue holds; a frame bounded by its buffer uses
-    /// [`drain_effects_up_to`](Self::drain_effects_up_to). A cancelled
-    /// READY candidate's effects are never handed over.
+    /// queue holds; a frame takes its view and effects with
+    /// [`acquire`](Self::acquire). A cancelled READY candidate's effects
+    /// are never handed over.
     pub fn drain_effects(&mut self, mut f: impl FnMut(&JudgeEvent)) {
-        while let Some(ev) = self.pop(None) {
+        while let Some(ev) = self.pop(None, u64::MAX) {
             f(&ev);
         }
     }
 
     /// Hands up to `n` queued effects to `f`, in emission order, and stops
     /// popping there: the rest stay queued, in order, for the next drain.
-    pub fn drain_effects_up_to(&mut self, n: usize, f: impl FnMut(&JudgeEvent)) {
-        self.drain(n, None, f);
-    }
-
-    /// [`drain_effects_up_to`](Self::drain_effects_up_to) for state of the
-    /// candidate after `seen` rearms ([`rearms`](Self::rearms), read
-    /// before the state started over): a later candidate's effects stay
-    /// queued until the caller's state has started over for it, so a
-    /// rearm between the caller's look and its drain loses none of them.
-    pub fn drain_effects_of(&mut self, seen: u64, n: usize, f: impl FnMut(&JudgeEvent)) {
-        self.drain(n, Some(seen), f);
-    }
-
-    fn drain(&mut self, n: usize, seen: Option<u64>, mut f: impl FnMut(&JudgeEvent)) {
+    pub fn drain_effects_up_to(&mut self, n: usize, mut f: impl FnMut(&JudgeEvent)) {
         for _ in 0..n {
-            let Some(ev) = self.pop(seen) else {
+            let Some(ev) = self.pop(None, u64::MAX) else {
                 return;
             };
             f(&ev);
         }
+    }
+
+    /// One frame's acquisition (design.md "Rendering and Skins", the note
+    /// snapshot): the newest view, and up to `n` of its candidate's
+    /// effects handed to `f` in emission order, only those the view's
+    /// events include ([`PlayView::events`]). A cancelled candidate's
+    /// effects are discarded; later ones, the view's own past its events
+    /// or a later candidate's, stay queued for the next frame.
+    ///
+    /// `None` when the view and the rearms disagree: a rearm is published
+    /// whose candidate's view is not yet, or one came during the drain.
+    /// The frame is then not built, and the next acquisition takes the
+    /// newer candidate; what was handed to `f` before such a rearm is the
+    /// cancelled candidate's. The caller starts its state over when the
+    /// returned view's [`generation`](PlayView::generation) is not the
+    /// one it drew last.
+    pub fn acquire(&mut self, n: usize, mut f: impl FnMut(&JudgeEvent)) -> Option<&PlayView> {
+        let (generation, events) = {
+            let v = self.view.read();
+            (v.generation, v.events)
+        };
+        if self.rearmed.read().0 != generation {
+            return None;
+        }
+        for _ in 0..n {
+            let Some(ev) = self.pop(Some(generation), events) else {
+                break;
+            };
+            f(&ev);
+        }
+        if self.rearmed.read().0 != generation {
+            return None;
+        }
+        Some(self.view.output_buffer())
     }
 
     /// The newest play view.
@@ -208,34 +222,19 @@ impl RenderSide {
         self.dropped.load(Ordering::Relaxed)
     }
 
-    /// How many times the play's READY candidate was rearmed: when it
-    /// changes, the screen starts the candidate's clocks and READY timers
-    /// over, keeping its chart and text resources (design.md "Play
-    /// Lifecycle", the start gate).
+    /// How many times the play's READY candidate was rearmed (design.md
+    /// "Play Lifecycle", the start gate): a view of another
+    /// [`generation`](PlayView::generation) is not the newest candidate's.
     #[must_use]
     pub fn rearms(&self) -> u64 {
         self.rearmed.read().0
     }
-
-    /// [`rearms`](Self::rearms) with where the latest rearmed READY
-    /// candidate puts its chart time 0 on the rig's clock, both of the
-    /// same rearm: the screen draws from there once the count changed.
-    /// A rearm being written is waited out, which takes the logic step a
-    /// few stores.
-    #[must_use]
-    pub fn rearm_state(&self) -> (u64, TimeUs) {
-        loop {
-            if let Some(state) = self.rearmed.try_snapshot() {
-                return state;
-            }
-            std::hint::spin_loop();
-        }
-    }
 }
 
 /// The link between logic and rendering: an effect queue holding
-/// `effect_capacity` events, and a play view starting from `initial`.
-/// Writing a view with as many gauges as `initial` allocates nothing.
+/// `effect_capacity` events, and a play view starting from `initial`, its
+/// three buffers copies of it. Writing a view with as many gauges as
+/// `initial` and note facts of its chart allocates nothing.
 pub(crate) fn render_link(
     effect_capacity: usize,
     initial: &PlayView,
@@ -265,10 +264,10 @@ pub(crate) fn render_link(
 #[cfg(test)]
 mod tests {
     use bms_model::TimeUs;
-    use eval::{JudgeEvent, JudgeEventKind, Tally};
+    use eval::{JudgeEvent, JudgeEventKind, NoteFacts, Tally};
     use rules::PerJudgment;
 
-    use super::{PlayView, QUEUED_BITS, render_link};
+    use super::{PlayView, ViewWriter, render_link};
     use crate::logic::EventSink;
 
     fn effect(seq: u64) -> JudgeEvent {
@@ -287,6 +286,8 @@ mod tests {
     /// A play view before anything is judged.
     fn fresh() -> PlayView {
         PlayView {
+            generation: 0,
+            origin: None,
             finalized: None,
             tally: Tally {
                 counts: PerJudgment {
@@ -303,10 +304,21 @@ mod tests {
                 empty_poor: 0,
             },
             gauges: Vec::new(),
+            notes: NoteFacts::default(),
             complete: false,
             playing: false,
             events: 0,
         }
+    }
+
+    /// Publishes a view of candidate `generation` with `events` emitted,
+    /// as the logic step does after a step or a rearm.
+    fn publish(view: &mut ViewWriter, generation: u64, origin: Option<i64>, events: u64) {
+        let v = view.input_buffer_mut();
+        v.generation = generation;
+        v.origin = origin.map(TimeUs);
+        v.events = events;
+        view.publish();
     }
 
     /// A frame's drain stops at its buffer's capacity even while the logic
@@ -316,28 +328,7 @@ mod tests {
     #[test]
     fn a_frame_drain_stops_at_its_buffer_while_the_queue_refills() {
         const QUEUE: usize = 4;
-        let initial = PlayView {
-            finalized: None,
-            tally: Tally {
-                counts: PerJudgment {
-                    perfect: 0,
-                    great: 0,
-                    good: 0,
-                    bad: 0,
-                    poor: 0,
-                },
-                ex_score: 0,
-                bp: 0,
-                combo: 0,
-                max_combo: 0,
-                empty_poor: 0,
-            },
-            gauges: Vec::new(),
-            complete: false,
-            playing: false,
-            events: 0,
-        };
-        let (mut sink, _view, mut side) = render_link(QUEUE, &initial);
+        let (mut sink, _view, mut side) = render_link(QUEUE, &fresh());
         for seq in 0..4 {
             sink.receive(&effect(seq));
         }
@@ -368,73 +359,116 @@ mod tests {
         assert_eq!(side.dropped(), 0);
     }
 
-    /// A rearm landing between a frame's look at the rearms and its drain
-    /// (design.md "Play Lifecycle", the start gate): the drain discards the
-    /// cancelled candidate's effects and leaves the new candidate's queued,
-    /// so the next frame, which starts its state over first, gets every one
-    /// of them; the rearm's word is read whole, never a count with another
-    /// rearm's queued effects.
+    /// A frame takes only the effects its view includes: those the logic
+    /// step pushed for a later view stay queued until a frame acquires
+    /// that view, and a frame's buffer bounds what it takes.
     #[test]
-    fn a_rearm_between_the_look_and_the_drain_loses_no_effect() {
-        let initial = PlayView {
-            finalized: None,
-            tally: Tally {
-                counts: PerJudgment {
-                    perfect: 0,
-                    great: 0,
-                    good: 0,
-                    bad: 0,
-                    poor: 0,
-                },
-                ex_score: 0,
-                bp: 0,
-                combo: 0,
-                max_combo: 0,
-                empty_poor: 0,
-            },
-            gauges: Vec::new(),
-            complete: false,
-            playing: false,
-            events: 0,
-        };
-        let (mut sink, _view, mut side) = render_link(8, &initial);
-        sink.receive(&effect(0));
-        sink.receive(&effect(1));
-        // The frame looks: candidate 0, whose effects it takes.
-        let seen = side.rearms();
-        assert_eq!(seen, 0);
+    fn a_frame_takes_the_effects_its_view_includes() {
+        let (mut sink, mut view, mut side) = render_link(8, &fresh());
+        for seq in 0..3 {
+            sink.receive(&effect(seq));
+        }
+        publish(&mut view, 0, None, 2);
+        // The step after pushes its effect before publishing its view.
+        sink.receive(&effect(3));
         let mut frame = Vec::new();
-        side.drain_effects_of(seen, 1, |e| frame.push(*e));
-        assert_eq!(seqs(&frame), [0]);
-        // Next frame: it looks, then the logic step rearms and candidate 1
-        // judges, all before the frame drains.
-        let seen = side.rearms();
-        sink.rearm(TimeUs(5_000));
-        sink.receive(&effect(10));
-        sink.receive(&effect(11));
+        let v = side.acquire(8, |e| frame.push(*e)).unwrap();
+        assert_eq!((v.generation, v.events), (0, 2));
+        assert_eq!(seqs(&frame), [0, 1]);
+        publish(&mut view, 0, None, 4);
         frame.clear();
-        side.drain_effects_of(seen, 8, |e| frame.push(*e));
-        assert!(frame.is_empty(), "{:?}", seqs(&frame));
-        // The frame after sees the rearm, starts over, and gets them all.
-        let (seen, origin) = side.rearm_state();
-        assert_eq!((seen, origin), (1, TimeUs(5_000)));
-        side.drain_effects_of(seen, 8, |e| frame.push(*e));
-        assert_eq!(seqs(&frame), [10, 11]);
+        assert_eq!(side.acquire(1, |e| frame.push(*e)).unwrap().events, 4);
+        assert_eq!(seqs(&frame), [2]);
+        frame.clear();
+        side.acquire(8, |e| frame.push(*e)).unwrap();
+        assert_eq!(seqs(&frame), [3]);
     }
 
-    /// A second rearm overlapping a frame's look: while its origin is
-    /// stored and its count not yet published, no snapshot pairs the first
-    /// rearm's count with the second's origin; once published, both are
-    /// the second's.
+    /// A rearm before a frame's acquisition (design.md "Play Lifecycle",
+    /// the start gate): the cancelled candidate's effects still queued,
+    /// dropped ones leaving holes in their sequence, are discarded, never
+    /// handed over, and the new candidate's view, with its origin, comes
+    /// with its own effects.
     #[test]
-    fn a_rearm_state_is_never_of_two_rearms() {
-        let (mut sink, _view, side) = render_link(8, &fresh());
+    fn a_rearm_before_the_acquisition_discards_the_cancelled_candidates_effects() {
+        let (mut sink, mut view, mut side) = render_link(2, &fresh());
+        for seq in 0..4 {
+            sink.receive(&effect(seq));
+        }
+        assert_eq!(side.dropped(), 2);
+        publish(&mut view, 0, None, 4);
         sink.rearm(TimeUs(5_000));
-        assert_eq!(side.rearm_state(), (1, TimeUs(5_000)));
-        // The logic step's second rearm, halfway.
-        sink.rearmed.begin(TimeUs(9_000));
-        assert_eq!(side.rearmed.try_snapshot(), None, "a mixed snapshot");
-        sink.rearmed.publish(2 << QUEUED_BITS);
-        assert_eq!(side.rearm_state(), (2, TimeUs(9_000)));
+        publish(&mut view, 1, Some(5_000), 0);
+        let mut frame = Vec::new();
+        let v = side.acquire(8, |e| frame.push(*e)).unwrap();
+        assert_eq!((v.generation, v.origin), (1, Some(TimeUs(5_000))));
+        assert!(frame.is_empty(), "{:?}", seqs(&frame));
+        // The new candidate's effects, numbered from 0 again.
+        sink.receive(&effect(0));
+        sink.receive(&effect(1));
+        publish(&mut view, 1, Some(5_000), 2);
+        side.acquire(8, |e| frame.push(*e)).unwrap();
+        assert_eq!(seqs(&frame), [0, 1]);
+    }
+
+    /// A rearm published while its candidate's view is not yet, the frame
+    /// acquiring between the two (before or during its acquisition): no
+    /// frame is built of the older view with the newer rearm, and none of
+    /// the new candidate's effects are taken; once its view is published,
+    /// the next acquisition takes it and every one of them.
+    #[test]
+    fn a_rearm_whose_view_is_not_yet_published_skips_the_frame() {
+        let (mut sink, mut view, mut side) = render_link(8, &fresh());
+        sink.receive(&effect(0));
+        publish(&mut view, 0, None, 1);
+        sink.rearm(TimeUs(5_000));
+        sink.receive(&effect(0));
+        let mut frame = Vec::new();
+        assert!(side.acquire(8, |e| frame.push(*e)).is_none());
+        assert!(frame.is_empty(), "{:?}", seqs(&frame));
+        publish(&mut view, 1, Some(5_000), 1);
+        let v = side.acquire(8, |e| frame.push(*e)).unwrap();
+        assert_eq!((v.generation, v.origin), (1, Some(TimeUs(5_000))));
+        assert_eq!(seqs(&frame), [0]);
+    }
+
+    /// A rearm during a frame's drain: the frame is not built, and what it
+    /// took was the cancelled candidate's; the next frame takes the new
+    /// candidate whole, its effects included, and a later rearm's
+    /// candidate the same way.
+    #[test]
+    fn a_rearm_during_the_drain_skips_the_frame() {
+        let (mut sink, mut view, mut side) = render_link(8, &fresh());
+        for seq in 0..3 {
+            sink.receive(&effect(seq));
+        }
+        publish(&mut view, 0, None, 3);
+        let mut frame = Vec::new();
+        let mut rearmed = false;
+        let acquired = side
+            .acquire(8, |e| {
+                frame.push(*e);
+                if !rearmed {
+                    rearmed = true;
+                    sink.rearm(TimeUs(7_000));
+                    sink.receive(&effect(0));
+                    publish(&mut view, 1, Some(7_000), 1);
+                }
+            })
+            .map(|v| v.generation);
+        assert_eq!(acquired, None);
+        assert_eq!(seqs(&frame), [0]);
+        frame.clear();
+        let v = side.acquire(8, |e| frame.push(*e)).unwrap();
+        assert_eq!((v.generation, v.origin), (1, Some(TimeUs(7_000))));
+        assert_eq!(seqs(&frame), [0]);
+        // A rearm between acquisitions with nothing queued.
+        sink.rearm(TimeUs(9_000));
+        publish(&mut view, 2, Some(9_000), 0);
+        frame.clear();
+        let v = side.acquire(8, |e| frame.push(*e)).unwrap();
+        assert_eq!((v.generation, v.origin), (2, Some(TimeUs(9_000))));
+        assert!(frame.is_empty());
+        assert_eq!(side.rearms(), 2);
     }
 }

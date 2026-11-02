@@ -299,6 +299,7 @@ impl Play {
         for ev in frame.effects {
             self.reducer.apply(ev);
         }
+        self.take_holds(frame.notes, frame.now);
         // The frame's one sample of the playhead, which the beat and the
         // lanes share.
         let display = frame.now.0.saturating_add(frame.display_offset.0);
@@ -432,7 +433,7 @@ impl Play {
         set(timer::LOADING, None);
         for lane in Lane::all() {
             let l = lane.index();
-            let hold = self.reducer.hold_at(l, now).map(|h| h.start);
+            let hold = self.holds.get(l).copied().flatten().map(|h| h.start);
             let bomb = self.reducer.bomb.get(l).copied().flatten();
             let mine = self.reducer.mine.get(l).copied().flatten();
             // Press and release stay off until S9.

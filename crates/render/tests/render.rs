@@ -207,11 +207,12 @@ fn judged_note_disappears() {
             combo: 1,
         },
     };
+    let v = common::with_notes(v, &chart, &[judged]);
     r.frame(&input(&v, now, TimeUs(0), &[judged])).unwrap();
     let after = r.read_back();
     assert_row(&after, LANE_5, 560.89);
     assert_eq!(white_rows(&after, LANE_7), Vec::<u32>::new());
-    // The bit stays set on later frames with no new effect.
+    // The facts keep it judged on later frames with no new effect.
     r.frame(&input(&v, TimeUs(1_850 * MS), TimeUs(0), &[]))
         .unwrap();
     let later = r.read_back();
@@ -220,9 +221,9 @@ fn judged_note_disappears() {
 }
 
 /// A READY rearm (design.md "Play Lifecycle", the start gate) through
-/// `Renderer::rearm`: the simple skin forgets what the cancelled
-/// candidate's effects built up, so a note it judged is drawn again, while
-/// its chart stays loaded.
+/// `Renderer::rearm`: the rearmed candidate's view has nothing judged, so
+/// a note the cancelled candidate judged is drawn again, while its chart
+/// stays loaded.
 #[test]
 fn a_rearm_draws_a_judged_note_again() {
     let chart = ChartBuilder::new(120_000)
@@ -246,7 +247,9 @@ fn a_rearm_draws_a_judged_note_again() {
             combo: 1,
         },
     };
-    r.frame(&input(&v, now, TimeUs(0), &[judged])).unwrap();
+    let judged_view = common::with_notes(view(1, 2), &chart, &[judged]);
+    r.frame(&input(&judged_view, now, TimeUs(0), &[judged]))
+        .unwrap();
     assert_eq!(white_rows(&r.read_back(), LANE_7), Vec::<u32>::new());
     let memory = r.memory();
     r.rearm();
@@ -258,8 +261,9 @@ fn a_rearm_draws_a_judged_note_again() {
 }
 
 /// A practice round's READY rearmed through `Renderer::rearm`: the note
-/// the cancelled candidate judged is drawn again, and the notes before and
-/// after the section stay hidden, as its load left them.
+/// the cancelled candidate judged is drawn again from the rearmed
+/// candidate's view, and the notes before and after the section stay
+/// hidden, as its load left them.
 #[test]
 fn a_rearmed_practice_round_draws_only_its_targets() {
     let chart = ChartBuilder::new(120_000)
@@ -292,7 +296,9 @@ fn a_rearmed_practice_round_draws_only_its_targets() {
             combo: 1,
         },
     };
-    r.frame(&input(&v, now, TimeUs(0), &[judged])).unwrap();
+    let judged_view = common::with_notes(view(1, 2), &chart, &[judged]);
+    r.frame(&input(&judged_view, now, TimeUs(0), &[judged]))
+        .unwrap();
     assert_eq!(white_rows(&r.read_back(), LANE_7), Vec::<u32>::new());
     let memory = r.memory();
     r.rearm();

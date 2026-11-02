@@ -29,6 +29,8 @@ use crate::atlas::uv::{FrameUv, UvTable};
 use crate::canvas::f32_of;
 use crate::expr::State;
 use crate::place::{Affine, Placement};
+use eval::NoteFacts;
+
 use crate::play::reducer::is_target;
 use crate::play::{Notes, Play};
 use crate::quad::{Filter, Quad, QuadBatch, RunKey};
@@ -552,9 +554,10 @@ impl Lanes {
 
 /// What the lanes draw from this frame.
 pub(crate) struct Draw<'a> {
-    /// The attempt whose notes and bar lines the lanes draw; `None` draws
-    /// the judgment line alone (the loading state's chart-free lanes).
-    pub(crate) play: Option<&'a Play>,
+    /// The attempt whose notes and bar lines the lanes draw, with the
+    /// frame's note facts; `None` draws the judgment line alone (the
+    /// loading state's chart-free lanes).
+    pub(crate) play: Option<(&'a Play, &'a NoteFacts)>,
     /// The timers' starts, which the parts' cycles and the bar groups read.
     pub(crate) starts: Starts<'a>,
     /// The frame's fields and timers, which the bar groups' visibilities
@@ -768,7 +771,7 @@ impl Lanes {
     /// nothing.
     pub(crate) fn draw(&self, d: &Draw<'_>, scratch: Option<&mut BarScratch>, out: &mut QuadBatch) {
         let g = d.frame;
-        let Some(play) = d.play else {
+        let Some((play, facts)) = d.play else {
             self.line(&mut Pen::new(d, out), f32_of(g.line_y));
             return;
         };
@@ -793,7 +796,7 @@ impl Lanes {
             self.bars(&mut pen, notes, &scale, scratch);
         }
         match self.style {
-            LaneStyle::Simple => self.simple(&mut pen, play, &scale, g.span, ringing_out),
+            LaneStyle::Simple => self.simple(&mut pen, play, facts, &scale, g.span, ringing_out),
             LaneStyle::Source(s) => self.source(&mut pen, play, &scale, s, g.span, ringing_out),
         }
     }
@@ -934,6 +937,7 @@ impl Lanes {
         &self,
         pen: &mut Pen<'_, '_>,
         play: &Play,
+        facts: &NoteFacts,
         scale: &Scale,
         span: f64,
         ringing_out: bool,
@@ -962,16 +966,22 @@ impl Lanes {
             notes,
             |list| list.partition_point(|n| n.end_pos() < from),
             Some(to),
-            |pen, l, i, n| self.simple_note(pen, play, scale, l, i, n),
+            |pen, l, i, n| self.simple_note(pen, play, facts, scale, l, i, n),
         );
     }
 
     /// Note `i` of lane `l` as the simple skin draws it; `false` once the
-    /// frame's lanes stop.
+    /// frame's lanes stop. A judged tap and a hit mine are gone, by the
+    /// frame's note facts.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the frame's facts and scale beside the note"
+    )]
     fn simple_note(
         &self,
         pen: &mut Pen<'_, '_>,
         play: &Play,
+        facts: &NoteFacts,
         scale: &Scale,
         l: &LaneOf<'_>,
         i: usize,
@@ -981,7 +991,7 @@ impl Lanes {
         let Some(notes) = play.notes() else {
             return true;
         };
-        if play.done(l.lane.index(), i) {
+        if !matches!(n.kind, NoteKind::Long { .. }) && facts.is_done(l.lane, i) {
             return true;
         }
         let (x, w, line) = (l.x, l.w, f32_of(scale.line_y));
