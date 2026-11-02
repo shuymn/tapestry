@@ -524,12 +524,9 @@ impl Rig for PlayerRig<'_> {
             .and_then(|s| s.loading.take())
             .is_some();
         match &mut self.gate {
-            Some(gate) if loading || gate.loading_paused() => {
-                gate.pause_loading();
-                self.render.pause_loading()
-            }
-            _ if loading => self.render.end_loading(),
-            _ => Ok(()),
+            Some(gate) => gate.end_loading(&self.render, loading),
+            None if loading => self.render.end_loading(),
+            None => Ok(()),
         }
     }
 
@@ -606,21 +603,15 @@ impl Rig for PlayerRig<'_> {
         })?;
         if let (Some(opening), Some(gate)) = (&opened, &mut self.gate) {
             gate.opened(generation, opening);
-            if gate.take_loading() {
-                self.render.clear_loading();
-            }
+            gate.end_paused_loading(&self.render);
         }
         Ok(opened)
     }
 
     /// A paused loading lifetime is drawn again, with its clock.
     fn defer(&mut self) {
-        if self
-            .gate
-            .as_ref()
-            .is_some_and(crate::start_gate::PlayerGate::loading_paused)
-        {
-            self.render.resume_loading();
+        if let Some(gate) = &self.gate {
+            gate.defer(&self.render);
         }
     }
 

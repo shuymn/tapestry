@@ -39,6 +39,7 @@ use input::{
 use replay::{CancelReason, MAX_CANCELLED_EVENTS, MAX_OPENING_ARRIVALS};
 
 use crate::input_side::{self, InputLink, RearmOutcome};
+use crate::render_side::{RenderLink, ScreenError};
 
 /// How long a cancellation's acknowledgement is waited for: far beyond a
 /// period, which is when the audio thread takes the cancel.
@@ -127,19 +128,36 @@ impl PlayerGate {
         }));
     }
 
-    /// The selection's loading lifetime paused before an opening.
-    pub fn pause_loading(&mut self) {
-        self.loading = true;
+    /// Loading ends before an opening, the selection's loading lifetime
+    /// still running when `loading`: it is paused rather than ended
+    /// ([`RenderLink::pause_loading`]), so a hold at the opening returns
+    /// to it ([`defer`](Self::defer)); paused already, it is paused again.
+    ///
+    /// # Errors
+    ///
+    /// As [`RenderLink::pause_loading`].
+    pub fn end_loading(&mut self, render: &RenderLink, loading: bool) -> Result<(), ScreenError> {
+        self.loading |= loading;
+        if self.loading {
+            render.pause_loading()
+        } else {
+            Ok(())
+        }
     }
 
-    /// Whether a loading lifetime is paused before an opening.
-    pub fn loading_paused(&self) -> bool {
-        self.loading
+    /// The opening was deferred by a hold: a paused loading lifetime is
+    /// drawn again, with its clock.
+    pub fn defer(&self, render: &RenderLink) {
+        if self.loading {
+            render.resume_loading();
+        }
     }
 
-    /// A candidate opened: whether a paused loading lifetime is to end.
-    pub fn take_loading(&mut self) -> bool {
-        std::mem::take(&mut self.loading)
+    /// A candidate opened: a paused loading lifetime ends.
+    pub fn end_paused_loading(&mut self, render: &RenderLink) {
+        if std::mem::take(&mut self.loading) {
+            render.clear_loading();
+        }
     }
 
     /// The candidate armed last is handed to audio, with a round's

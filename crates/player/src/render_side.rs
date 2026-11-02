@@ -3226,6 +3226,56 @@ pub(crate) mod tests {
         }
     }
 
+    /// The player's gated opening through its gate: the end of loading
+    /// pauses the lifetime, a hold at the opening resumes the same lifetime
+    /// from its origin, the end of loading after the release pauses it
+    /// again, and the opening ends it, so nothing resumes it any more.
+    #[test]
+    fn a_gated_opening_held_returns_to_its_loading_state() {
+        let (link, clock, seen) = clocked();
+        let controls = Arc::new(crate::controls::Controls::new(clock));
+        let (_hook, input) = crate::input_side::link(
+            controls,
+            crate::input_side::Mode::Clock,
+            input::Waker::new().unwrap(),
+        );
+        let mut gate = crate::start_gate::PlayerGate::install(
+            &input,
+            input::AdjustmentBindings {
+                controls: vec![(input::TapControl::Key(eval::ControlId(0x10)), 0)],
+                latched: 1,
+                wrap: None,
+            },
+        )
+        .unwrap();
+        let count = || seen.lock().unwrap().len();
+        link.loading().show(one_line("L"));
+        assert!(wait_until(|| count() >= 2));
+        let (lifetime, since, _, _) = seen.lock().unwrap()[0].clone();
+        // Recording is to open: the loading state pauses.
+        gate.end_loading(&link, true).unwrap();
+        let paused = count();
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(count(), paused, "a loading frame before the opening");
+        // START held there: the opening is deferred, the loading state back.
+        let resumed = clock.now();
+        gate.defer(&link);
+        assert!(wait_until(|| count() > paused));
+        // Released: paused again, then the candidate opens.
+        gate.end_loading(&link, false).unwrap();
+        let again = count();
+        gate.end_paused_loading(&link);
+        gate.defer(&link);
+        std::thread::sleep(Duration::from_millis(100));
+        link.exit();
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), again, "a loading frame after the opening");
+        for (l, s, now, _) in &seen[paused..] {
+            assert_eq!((*l, *s), (lifetime, since), "the lifetime started over");
+            assert!(*now >= resumed, "the loading clock went back");
+        }
+    }
+
     /// Nothing is resumed without a loading lifetime paused, nor once the
     /// paused one has ended: the pause answers as an end would.
     #[test]
