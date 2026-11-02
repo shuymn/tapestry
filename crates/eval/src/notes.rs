@@ -31,10 +31,12 @@ pub struct NoteHold {
 /// Every change advances its [`revision`](Self::revision), which a
 /// [`reset`](Self::reset) advances too and never takes back, so a copy
 /// whose revision matches holds the same facts.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// The default is the facts of a chart without notes.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct NoteFacts {
-    /// Per lane, its first word in `words`, then the end of the last.
-    starts: [usize; LANE_COUNT + 1],
+    /// Per lane, its first word in `words`.
+    starts: [usize; LANE_COUNT],
     /// Per lane, its notes.
     lens: [usize; LANE_COUNT],
     /// The bits, lane after lane, each lane's in whole words.
@@ -43,24 +45,11 @@ pub struct NoteFacts {
     revision: u64,
 }
 
-impl Default for NoteFacts {
-    /// The facts of a chart without notes.
-    fn default() -> Self {
-        Self {
-            starts: [0; LANE_COUNT + 1],
-            lens: [0; LANE_COUNT],
-            words: Vec::new(),
-            holds: [None; LANE_COUNT],
-            revision: 0,
-        }
-    }
-}
-
 impl NoteFacts {
     /// No note decided and no hold, sized for `chart`'s lanes.
     #[must_use]
     pub fn new(chart: &Chart) -> Self {
-        let mut starts = [0; LANE_COUNT + 1];
+        let mut starts = [0; LANE_COUNT];
         let mut lens = [0; LANE_COUNT];
         let mut at = 0;
         for ((start, len), lane) in starts
@@ -71,14 +60,6 @@ impl NoteFacts {
             *start = at;
             *len = lane;
             at += lane.div_ceil(64);
-        }
-        if let Some(end) = starts.last_mut() {
-            *end = at;
-        }
-        // Lanes past the chart's (none in a valid chart) start at the end.
-        let lanes = chart.lanes.len().min(LANE_COUNT);
-        for start in starts.iter_mut().skip(lanes) {
-            *start = at;
         }
         Self {
             starts,
