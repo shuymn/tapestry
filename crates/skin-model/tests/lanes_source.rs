@@ -441,6 +441,43 @@ fn with_no_scroll_left_both_budgets_bound_the_frame() {
 }
 
 #[test]
+fn the_tallest_fitting_height_steps_below_a_rounded_up_room() {
+    // A bottom of 0.2 (as `f32`, 0.20000000298…) and a top of −1000 leave
+    // 1000.2000000029802… of room; its nearest `f32`, 1000.2000122…, is
+    // above it, so the tallest fitting height is the `f32` below.
+    let lanes = SourceLanes {
+        bottom: 0.2,
+        height: 600.0,
+        offset_y: 0.0,
+        note_h: [20.0; 8],
+    };
+    let room = f64::from(0.2_f32) + 1_000.0;
+    let nearest = 1_000.2_f32;
+    assert!(f64::from(nearest) > room);
+    let max = lanes.max_note_h(-1_000);
+    assert_eq!(max, nearest.next_down());
+    assert!(f64::from(max) <= room);
+    // The load check applies it: the rounded-up height refuses, the one
+    // below loads.
+    let err = |note_h: f32| {
+        let mut def = source_with(|s| {
+            *s = SourceLanes {
+                note_h: [note_h; 8],
+                ..lanes
+            };
+        });
+        def.top = -1_000;
+        match skin_with(REGIONS, Some(def), vec![lanes_element()]) {
+            Err(LoadError::Lanes(e)) => Some(e),
+            Err(e) => panic!("{e:?}"),
+            Ok(_) => None,
+        }
+    };
+    assert_eq!(err(nearest), Some(LanesError::SourceHeight { lane: 0 }));
+    assert_eq!(err(max), None);
+}
+
+#[test]
 fn the_source_geometry_is_checked_at_load() {
     let err = |def: LanesDef| match skin_with(REGIONS, Some(def), vec![lanes_element()]) {
         Err(LoadError::Lanes(e)) => Some(e),
