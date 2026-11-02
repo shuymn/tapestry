@@ -2393,7 +2393,9 @@ fn fallback_lanes_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
 /// attempt every lane's taps drew, a held long note drew its active body
 /// (its own image) and the short batch dropped.
 fn timeline_lanes_do_not_allocate(full: &PlayContext<'_>) {
-    use lanes_support::{BAR, BODY_OFF, BODY_ON, COVER, HEAD, LINE, MINE, NOTE, TAIL};
+    use lanes_support::{
+        BAR, BODY_OFF, BODY_ON, COVER, HEAD, HIDDEN, LIFT, LINE, MINE, NOTE, TAIL, WHITE,
+    };
     let section = Section {
         start: TimeUs(2_000 * MS),
         end: TimeUs(5_000 * MS),
@@ -2443,6 +2445,11 @@ fn timeline_lanes_do_not_allocate(full: &PlayContext<'_>) {
     for (style, mut def) in [("simple", simple), ("source", source)] {
         def.parts.note = taps;
         def.parts.body_on = [COVER; 8];
+        // The other long-note parts and the mines apart from every tap.
+        def.parts.head = [LIFT; 8];
+        def.parts.tail = [HIDDEN; 8];
+        def.parts.body_off = [WHITE; 8];
+        def.parts.mine = [WHITE; 8];
         // Lane 7's tap image is the line's otherwise.
         def.parts.line = None;
         let skin = lanes_support::lanes_skin(def);
