@@ -454,4 +454,13 @@ fn a_replacement_counts_both_presentations() {
     let after = r.memory();
     assert_eq!(after.loading, peak.staged_loading);
     assert_eq!(after.staged_loading, 0);
+    // A presentation counts its runtime, itself included, once: what it
+    // adds is the lifetime and its flag, far less than a second runtime.
+    let fresh = render::LoadingPresentation::new(&b).bytes();
+    let runtime = b.skin().prepare_loading(b.scratch()).resident_bytes();
+    let size = u64::try_from(size_of::<skin_model::Loading>()).unwrap();
+    assert!(
+        fresh > runtime && fresh - runtime < size,
+        "{fresh} {runtime}"
+    );
 }

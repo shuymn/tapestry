@@ -308,11 +308,14 @@ impl LoadingPresentation {
         self.lock().loading.refused()
     }
 
-    /// The bytes the state and its text hold, for the memory witness.
+    /// The bytes the state and its text hold, for the memory witness:
+    /// the runtime's own count, itself included, and what the presentation
+    /// adds around it.
     #[must_use]
     pub fn bytes(&self) -> u64 {
         let p = self.lock();
-        let own = u64::try_from(size_of::<Presented>()).unwrap_or(u64::MAX);
+        let around = size_of::<Presented>().saturating_sub(size_of::<Loading>());
+        let own = u64::try_from(around).unwrap_or(u64::MAX);
         p.loading.resident_bytes().saturating_add(own)
     }
 
