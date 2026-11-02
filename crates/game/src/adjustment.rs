@@ -697,21 +697,33 @@ impl Adjustment {
         }
     }
 
+    /// Toggles SUDDEN+ as one transaction: shown again, Floating solves to
+    /// the saved target at the current tempo, and Classic keeps `H`. A solve
+    /// that does not fit leaves the switch and `H` as they were.
     fn toggle_sudden<T: TempoMap>(&mut self, time: TimeUs, tempo: &T) {
+        let mut options = self.options;
         let shown = {
-            let (_, covers) = self.options.parts_mut();
+            let (_, covers) = options.parts_mut();
             covers.sudden.on = !covers.sudden.on;
             covers.sudden.on
         };
-        // Shown again, Floating solves to the saved target at the current
-        // tempo; Classic keeps `H`.
-        if shown
-            && self.options.hispeed().mode == SpeedMode::Floating
-            && let Ok(Some(b)) = self.bpm_at(time, tempo)
-        {
-            let solved = self.solve_at(b);
-            self.commit_hispeed(solved);
+        let mut hispeed = self.hispeed;
+        if shown && options.hispeed().mode == SpeedMode::Floating {
+            let solved = self.bpm_at(time, tempo).and_then(|b| {
+                b.map(|b| solve(b, options.hispeed().green_target, &options.covers()))
+                    .transpose()
+            });
+            match solved {
+                Ok(Some(h)) => hispeed = Some(h),
+                Ok(None) => {}
+                Err(Unrepresentable) => {
+                    self.diagnostics.unrepresentable += 1;
+                    return;
+                }
+            }
         }
+        self.options = options;
+        self.hispeed = hispeed;
         // The target changed.
         self.context = self.context.wrapping_add(1);
     }

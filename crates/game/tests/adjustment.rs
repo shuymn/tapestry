@@ -1282,6 +1282,30 @@ fn the_session_clock_runs_in_real_time_and_the_speed_scales_only_the_tempo() {
 }
 
 #[test]
+fn a_failed_reattachment_keeps_the_switch_and_the_multiplier() {
+    let covers = Covers {
+        sudden: Cover {
+            amount: 200,
+            on: false,
+        },
+        ..Covers::default()
+    };
+    let mut rig = Rig::new(
+        options(SpeedMode::Floating, 100, 300, covers),
+        Map(vec![(0, tight_bpm())]),
+    );
+    rig.ev(Event::Prepare {
+        references: References::all(bpm(150)),
+        speed: Speed::NORMAL,
+    });
+    double_start(&mut rig, 10 * MS);
+    let s = rig.snap();
+    assert_eq!(rig.a.diagnostics().unrepresentable, 1);
+    assert!(!s.options.covers().sudden.on);
+    assert_eq!(h(&s), r(16, 5));
+}
+
+#[test]
 fn a_playback_tempo_that_does_not_fit_fails_the_transaction() {
     let mut rig = Rig::new(PlayOptions::default(), Map(vec![(0, tight_bpm())]));
     rig.ev(Event::Prepare {
