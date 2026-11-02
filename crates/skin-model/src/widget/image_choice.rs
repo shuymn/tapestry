@@ -3,8 +3,9 @@
 //!
 //! The selector is evaluated once per frame against the filled play
 //! state: a negative value draws nothing, a value below the table's
-//! length draws that entry, and any other value draws entry 0. A hole
-//! draws nothing; nothing searches for another entry, wraps or clamps.
+//! length draws that entry, and any other value what the table's
+//! [`PastTable`] says. A hole draws nothing; nothing searches for another
+//! entry, wraps or clamps.
 //! Each entry animates its own frames on its own cycle and timer, so
 //! switching away and back never restarts a clock, and may replace the
 //! element's track, sampled on the element's timer, and its native size.
@@ -50,6 +51,17 @@ pub struct ImageChoicePart {
     pub native: Option<Native>,
 }
 
+/// What a value past an image choice table draws. The model has no
+/// default: each format that builds tables chooses its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PastTable {
+    /// Nothing, as a negative value.
+    Hide,
+    /// Entry 0: an imported skin's rule, which its source applies to any
+    /// positive value past the table, `i32::MAX` included.
+    First,
+}
+
 /// A table of images an element chooses from by `value`.
 #[derive(Clone, Debug)]
 pub struct ImageChoiceDef {
@@ -57,6 +69,8 @@ pub struct ImageChoiceDef {
     pub value: Program,
     /// 1 to [`MAX_IMAGE_CHOICE_REFS`] entries; `None` is a hole.
     pub choices: Vec<Option<ImageChoicePart>>,
+    /// What a value past `choices` draws.
+    pub past_table: PastTable,
 }
 
 /// Why an image choice table was refused; `choice` is an entry index.
@@ -107,13 +121,18 @@ pub(crate) struct ChoicePart {
 pub(crate) struct ImageChoice {
     pub(crate) value: Program,
     pub(crate) parts: Box<[Option<ChoicePart>]>,
+    pub(crate) past_table: PastTable,
 }
 
 impl ImageChoice {
     /// The entry `state` selects: none for a negative value or a hole,
-    /// entry 0 for a value past the table.
+    /// and for a value past the table what [`PastTable`] says.
     pub(crate) fn select(&self, state: &State<'_>) -> Option<&ChoicePart> {
         let v = usize::try_from(self.value.eval(state)).ok()?;
-        self.parts.get(v).or_else(|| self.parts.first())?.as_ref()
+        match (self.parts.get(v), self.past_table) {
+            (Some(part), _) => part.as_ref(),
+            (None, PastTable::Hide) => None,
+            (None, PastTable::First) => self.parts.first()?.as_ref(),
+        }
     }
 }

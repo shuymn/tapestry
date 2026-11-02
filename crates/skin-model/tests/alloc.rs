@@ -831,6 +831,7 @@ fn image_choice_tables(
     };
     let combo = ImageChoiceDef {
         value: int("elapsed(ready) / 40 % 7 - 2"),
+        past_table: skin_model::PastTable::Hide,
         choices: vec![
             Some(ImageChoicePart {
                 cycle: cycle(300, timer::READY),
@@ -850,6 +851,7 @@ fn image_choice_tables(
     };
     let looks = ImageChoiceDef {
         value: int(GAUGE_LOOK),
+        past_table: skin_model::PastTable::Hide,
         choices: (0..6)
             .map(|k| {
                 Some(ImageChoicePart {
@@ -865,6 +867,7 @@ fn image_choice_tables(
     };
     let tempo = ImageChoiceDef {
         value: int("if bpm.current_valid then bpm.current_x100 / 100 % 3 else -1"),
+        past_table: skin_model::PastTable::Hide,
         choices: vec![Some(part(GRADES, 0, 1)), Some(part(GRADES + 1, 0, 1)), None],
     };
     vec![combo, looks, tempo]
@@ -2677,6 +2680,7 @@ fn trim_skin() -> Skin {
             skin_model::Ty::Int,
         )
         .unwrap(),
+        past_table: skin_model::PastTable::Hide,
         choices: [LIFT, HIDDEN]
             .map(|image| {
                 Some(skin_model::ImageChoicePart {

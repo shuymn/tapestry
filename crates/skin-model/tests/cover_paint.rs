@@ -162,6 +162,7 @@ fn paint_never_changes_the_notes() {
     let choice = |value: &str| {
         vec![ImageChoiceDef {
             value: compile(value, &Scope::new(&PLAY), Ty::Int).unwrap(),
+            past_table: skin_model::PastTable::Hide,
             choices: vec![None],
         }]
     };
@@ -369,6 +370,7 @@ fn chosen_paint_keeps_each_entry_track_and_native_size() {
     own[..4].copy_from_slice(&[Some(300), Some(40), Some(100), Some(100)]);
     let table = ImageChoiceDef {
         value: compile("combo", &Scope::new(&PLAY), Ty::Int).unwrap(),
+        past_table: skin_model::PastTable::Hide,
         choices: vec![
             Some(ImageChoicePart {
                 span: ImageSpan {
@@ -490,6 +492,7 @@ fn paints_are_checked_at_load() {
     // A chosen paint's entries carry their native sizes.
     let table = ImageChoiceDef {
         value: compile("0", &Scope::new(&PLAY), Ty::Int).unwrap(),
+        past_table: skin_model::PastTable::Hide,
         choices: vec![None],
     };
     let chosen = WidgetDefs {

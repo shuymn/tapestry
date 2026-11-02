@@ -143,7 +143,7 @@ pub use widget::gauge::{
 };
 pub use widget::glyphs::BitmapLines;
 pub use widget::image_choice::{
-    ImageChoiceDef, ImageChoiceError, ImageChoicePart, ImageSpan, MAX_IMAGE_CHOICE_REFS,
+    ImageChoiceDef, ImageChoiceError, ImageChoicePart, ImageSpan, MAX_IMAGE_CHOICE_REFS, PastTable,
 };
 pub use widget::judge::{Attach, ComboPart, GradePart, JudgeDef, JudgeError, JudgePart, JudgeSlot};
 pub use widget::lanes::{
