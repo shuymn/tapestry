@@ -372,7 +372,9 @@ jobs:
   # The Nix dev shells used from WSL: the flake evaluates with the Rust version
   # from mise.lock, the wrapper's Linux path passes arguments and exit codes,
   # and short fuzz runs pass in the `fuzz` shell (docs/setup.md "Fuzzing").
-  nix:
+  # `nix-test` and `nix-fuzz` run in parallel; `nix` is the required check
+  # over the two.
+  nix-test:
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: ubuntu-24.04
@@ -388,6 +390,19 @@ jobs:
         run: scripts/wsl.sh cargo xtask portable test --locked
       - name: Wrapper self-test
         run: scripts/wsl-selftest.sh
+
+  nix-fuzz:
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa # v23
       - name: Build fuzz targets
         run: TAPESTRY_NIX_SHELL=fuzz scripts/wsl.sh scripts/fuzz.sh build
       # A panic, a hang and each memory limit fail a run, seen from outside
@@ -397,6 +412,27 @@ jobs:
       # A fixed libFuzzer seed keeps the run reproducible.
       - name: Fuzz (60 s per target, generated seeds)
         run: TAPESTRY_NIX_SHELL=fuzz scripts/wsl.sh scripts/fuzz.sh run-all 60 --seed 1
+
+  # Passes as `windows` does, over `nix-test` and `nix-fuzz`.
+  nix:
+    needs: [changes, nix-test, nix-fuzz]
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Check the Nix jobs
+        env:
+          CLASSIFIED: ${{ needs.changes.result }}
+          CODE: ${{ needs.changes.outputs.code }}
+          RESULTS: ${{ needs.nix-test.result }} ${{ needs.nix-fuzz.result }}
+        run: |
+          echo "changes $CLASSIFIED (code=$CODE); nix-test, nix-fuzz: $RESULTS"
+          allowed=success
+          if [ "$CLASSIFIED" = success ] && [ "$CODE" = false ]; then allowed=skipped; fi
+          for result in $RESULTS; do
+            test "$result" = "$allowed"
+          done
 
   # Runs on every change, documentation included.
   lint:
