@@ -29,3 +29,7 @@ workspace = true
 [[bench]]
 name = "build"
 harness = false
+
+[[bench]]
+name = "playhead"
+harness = false

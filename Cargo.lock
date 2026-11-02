@@ -2352,6 +2352,7 @@ name = "skin-beatoraja"
 version = "0.0.0"
 dependencies = [
  "bms-model",
+ "bms-parser",
  "criterion",
  "eval",
  "image",

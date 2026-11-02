@@ -104,7 +104,7 @@ pub struct Drawn {
 }
 
 /// The attempt every drawn import plays: the whole chart, no lead-in.
-fn context() -> PlayContext<'static> {
+pub fn context() -> PlayContext<'static> {
     context_with(None)
 }
 

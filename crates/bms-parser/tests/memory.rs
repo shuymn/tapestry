@@ -166,8 +166,8 @@ fn a_chart_past_the_row_limit_is_refused_before_its_rows_are_allocated() {
 #[ignore = "a measurement: run in release with --ignored --nocapture"]
 fn measure_load_peaks() {
     for (name, stops, taps) in [
-        ("50,000 STOPs and taps", 50_000, true),
-        ("499,999 STOPs, near the row cap", 499_999, false),
+        ("F17b 50,000 STOPs and taps", 50_000, true),
+        ("F17b 499,999 STOPs, near the row cap", 499_999, false),
     ] {
         let text = stop_heavy(stops, taps);
         for speed in [Speed::NORMAL, Speed::SLOWEST] {
