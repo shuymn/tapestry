@@ -28,6 +28,7 @@ pub fn all() -> Vec<(&'static str, Vec<Seed>)> {
         ("raw_input", raw_inputs()),
         ("preset_canonical", preset_canonicals()),
         ("skin_json", skin_jsons()),
+        ("skin_lua", skin_luas()),
         ("skin_fnt", skin_fnts()),
     ]
 }
@@ -878,6 +879,106 @@ pub fn skin_jsons() -> Vec<Seed> {
     .into_iter()
     .chain(skin_imports())
     .collect()
+}
+
+/// One `skin_lua` input: the files joined by NUL bytes, entry file first
+/// ([`crate::LUA_FILES`]).
+fn lua_input(files: &[&str]) -> Vec<u8> {
+    files.join("\0").into_bytes()
+}
+
+/// The header of the `skin_lua` seeds: an option, a file choice over the
+/// folder's PNGs and an offset. The configured pass adds `body`.
+fn lua_skin(body: &str) -> String {
+    format!(
+        r#"local skin = {{ type = 0, name = "seed", w = 1920, h = 1080,
+  property = {{ {{ name = "mode", item = {{ {{ name = "on", op = 901 }}, {{ name = "off", op = 902 }} }}, def = "on" }} }},
+  filepath = {{ {{ name = "bg", path = "*.png", def = "strip" }} }},
+  offset = {{ {{ name = "o", id = 40, x = true }} }} }}
+if not skin_config then return skin end
+skin.source = {{ {{ id = "s", path = skin_config.file_path.bg }} }}
+skin.image = {{ {{ id = "i", src = "s", x = 0, y = 0, w = 10, h = 10 }} }}
+skin.destination = {{ {{ id = "i", dst = {{ {{ x = 0, y = 0, w = 10, h = 10 }} }} }} }}
+{body}
+return skin
+"#
+    )
+}
+
+/// `skin_lua` seeds: skins that import (data only, local modules and
+/// selected parts, configuration, pass isolation, a frozen decorative
+/// function), then one refusal per boundary: a critical function, the
+/// instruction and memory caps (also inside a protected call), a path
+/// out of the folder, a coroutine, a write to `skin_config`, malformed
+/// Lua and a value that is no table.
+#[must_use]
+pub fn skin_luas() -> Vec<Seed> {
+    let config = lua_skin(
+        r#"if skin_config.option.mode == 901 then
+  skin.destination[2] = { id = "i", op = { 901 }, dst = { { x = 10, y = 0, w = 10, h = 10 } } }
+end
+assert(skin_config.get_path("*.png") == "strip.png")
+assert(skin_config.offset.o.x == 0)"#,
+    );
+    let modules = lua_skin(
+        r#"local m = require("m")
+skin.destination = m.destinations(dofile("parts/p.lua"))"#,
+    );
+    let module = r#"local m = {}
+function m.destinations(rects)
+  local out = {}
+  for i, r in ipairs(rects) do out[i] = { id = "i", dst = { r } } end
+  return out
+end
+return m"#;
+    let part = "return { { x = 0, y = 0, w = 10, h = 10 }, { x = 20, y = 0, w = 10, h = 10 } }";
+    let isolation = lua_skin(r#"assert(leaked == nil and require("m").runs == 1)"#).replace(
+        "if not skin_config then return skin end",
+        "if not skin_config then leaked = true require(\"m\") return skin end",
+    );
+    let frozen = lua_skin(
+        r#"skin.destination[2] = { id = "i", draw = function() return true end, dst = { { w = 10, h = 10 } } }"#,
+    );
+    let refused = lua_skin(
+        r#"skin.value = { { id = "v", src = "s", w = 100, h = 10, divx = 10, digit = 2, value = function() return 0 end } }
+skin.destination[2] = { id = "v", dst = { { w = 10, h = 10 } } }"#,
+    );
+    vec![
+        ("data_only", lua_input(&[&lua_skin("")])),
+        ("config", lua_input(&[&config])),
+        ("modules", lua_input(&[&modules, module, part])),
+        (
+            "isolation",
+            lua_input(&[&isolation, "runs = (runs or 0) + 1\nreturn { runs = runs }"]),
+        ),
+        ("callable_frozen", lua_input(&[&frozen])),
+        ("callable_refused", lua_input(&[&refused])),
+        ("loop", lua_input(&["while true do end"])),
+        (
+            "protected_loop",
+            lua_input(&["pcall(function() while true do end end)\nreturn { type = 0 }"]),
+        ),
+        (
+            "memory",
+            lua_input(&["local s = string.rep(\"x\", 80 << 20)\nreturn { type = 0 }"]),
+        ),
+        (
+            "escape",
+            lua_input(&["pcall(dofile, \"../outside.lua\")\nreturn { type = 0 }"]),
+        ),
+        (
+            "coroutine",
+            lua_input(&["coroutine.wrap(function() end)()\nreturn { type = 0 }"]),
+        ),
+        (
+            "config_write",
+            lua_input(&[&lua_skin(
+                "pcall(function() skin_config.option.mode = 0 end)",
+            )]),
+        ),
+        ("syntax", lua_input(&["return {"])),
+        ("not_table", lua_input(&["return 1"])),
+    ]
 }
 
 /// The bitmap font `font.fnt` of the `skin_json` folder: `A`, `B` and `l`

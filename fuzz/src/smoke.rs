@@ -10,7 +10,7 @@ use skin_beatoraja::{Header, ImportError, Imported, NoteKind, Rule, Syntax, Usag
 
 use crate::{
     RawSummary, bms_load, draw, preset_canonical, raw_input, replay_body, replay_file, seeds,
-    skin_fnt, skin_json,
+    skin_fnt, skin_json, skin_lua,
 };
 
 /// Every seed in `expected` is generated, and no other: a deleted seed
@@ -1029,6 +1029,106 @@ fn skin_json_accepts_ops_charged_for_a_dropped_element() {
     assert!(i.report.usage.ops > 0);
     assert_eq!(i.skin.ops().total(), 0);
     assert_eq!(kinds(&i), [NoteKind::MissingAsset]);
+}
+
+#[test]
+fn skin_lua_seeds_import_or_fail_as_built() {
+    use skin_beatoraja::{LuaLimit, LuaWhy};
+    use skin_model::RootError;
+
+    let seeds = seeds::skin_luas();
+    assert_names(
+        &seeds,
+        &[
+            "data_only",
+            "config",
+            "modules",
+            "isolation",
+            "callable_frozen",
+            "callable_refused",
+            "loop",
+            "protected_loop",
+            "memory",
+            "escape",
+            "coroutine",
+            "config_write",
+            "syntax",
+            "not_table",
+        ],
+    );
+    let lua = |e: &ImportError| match e {
+        ImportError::Lua { why, .. } => Some(*why),
+        _ => None,
+    };
+    for (name, data) in seeds {
+        assert!(data.len() <= 64 * 1_024, "{name}: {} bytes", data.len());
+        let result = skin_lua(&data);
+        match name {
+            "data_only" | "config" | "modules" | "isolation" | "callable_frozen" => {
+                let (h, imported) = result.unwrap_or_else(|e| panic!("{name}: {e}"));
+                assert_eq!(h.options.len(), 1, "{name}");
+                let i = imported.unwrap_or_else(|e| panic!("{name}: {e:?}"));
+                assert!(i.imported.report.usage.elements >= 1, "{name}");
+                let callables = i
+                    .imported
+                    .report
+                    .notes
+                    .iter()
+                    .filter(|n| matches!(n.kind, NoteKind::Callable { field: "draw" }))
+                    .count();
+                assert_eq!(callables, usize::from(name == "callable_frozen"), "{name}");
+                if name == "modules" {
+                    assert_eq!(
+                        i.dependencies,
+                        ["s.luaskin", "m.lua", "parts/p.lua"],
+                        "{name}"
+                    );
+                }
+            }
+            "callable_refused" | "config_write" => {
+                let (_, imported) = result.unwrap_or_else(|e| panic!("{name}: {e}"));
+                let e = imported.expect_err(name);
+                let want = if name == "config_write" {
+                    LuaWhy::ConfigWrite
+                } else {
+                    LuaWhy::Callable { field: "value" }
+                };
+                assert_eq!(lua(&e), Some(want), "{name}");
+            }
+            _ => {
+                let e = result.expect_err(name);
+                match name {
+                    "loop" | "protected_loop" => assert_eq!(
+                        lua(&e),
+                        Some(LuaWhy::Limit(LuaLimit::Instructions)),
+                        "{name}"
+                    ),
+                    "memory" => {
+                        assert_eq!(lua(&e), Some(LuaWhy::Limit(LuaLimit::Memory)), "{name}");
+                    }
+                    "escape" => assert!(
+                        matches!(
+                            e,
+                            ImportError::Read {
+                                source: RootError::Underflow,
+                                ..
+                            }
+                        ),
+                        "{name}: {e:?}"
+                    ),
+                    "coroutine" | "syntax" | "not_table" => {
+                        let want = match name {
+                            "coroutine" => LuaWhy::Error,
+                            "syntax" => LuaWhy::Syntax,
+                            _ => LuaWhy::Returned,
+                        };
+                        assert_eq!(lua(&e), Some(want), "{name}");
+                    }
+                    _ => unreachable!("{name}"),
+                }
+            }
+        }
+    }
 }
 
 #[test]

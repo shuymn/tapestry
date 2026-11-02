@@ -20,8 +20,8 @@ use input::raw;
 use replay::{DecodeError, DecodeLimits, FORMAT_VERSION, MAGIC, PlayRecord};
 use rules::{CanonicalError, RulePreset};
 use skin_beatoraja::{
-    Config, DeviationId, Header, ImportError, Imported, NoteFallback, NoteKind, SIZES, Severity,
-    import, read_header, resolve,
+    Cancel, Config, DeviationId, Header, ImportError, Imported, LuaImported, LuaUsage,
+    NoteFallback, NoteKind, SIZES, Severity, import, read_header, read_lua_header, resolve,
 };
 use skin_model::{FntError, FntFile, FntLimits};
 
@@ -1687,6 +1687,158 @@ pub fn skin_json(data: &[u8]) -> Result<(Header, Result<Imported, ImportError>),
         black_box(draw(i));
     }
     Ok((configured, imported))
+}
+
+/// The files a `skin_lua` input is split into, in order: the entry file,
+/// then files it may load.
+pub const LUA_FILES: [&str; 4] = ["s.luaskin", "m.lua", "parts/p.lua", "parts/q.lua"];
+
+/// A folder for the Lua skins, rewritten by each input, beside a copy of
+/// [`skin_dir`]'s resources and an `outside.lua` in its parent that no
+/// loader may reach. Its own folder, so the two skin targets never share
+/// files.
+fn lua_dir() -> &'static Path {
+    static DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
+    DIR.get_or_init(|| {
+        let parent = tempfile::Builder::new()
+            .prefix("tapestry-fuzz-lua-")
+            .tempdir()
+            .expect("create a Lua skin folder");
+        std::fs::write(parent.path().join("outside.lua"), "return {}").expect("write a file");
+        let dir = parent.path().join("skin");
+        std::fs::create_dir_all(dir.join("parts")).expect("create the skin folder");
+        write_png(&dir.join("strip.png"), 100, 10);
+        write_png(&dir.join("grid.png"), 8, 8);
+        parent
+    })
+    .path()
+}
+
+/// The configuration that selects each option's last item, so the
+/// configured pass sees another `skin_config` than with the defaults.
+fn last_items(h: &Header) -> Config {
+    Config {
+        options: h
+            .options
+            .iter()
+            .map(|o| o.items.last().map(|i| i.op))
+            .collect(),
+        ..Config::default()
+    }
+}
+
+/// A candidate's use of the sandbox is within its caps, and the files it
+/// consulted are the input's.
+fn check_lua(usage: &LuaUsage, dependencies: &[String]) {
+    use skin_beatoraja::limits::{MAX_INCLUDE_PARSES, MAX_INPUT_BYTES};
+    use skin_beatoraja::lua::limits::{
+        MAX_HOST_CALLS, MAX_INSTRUCTIONS, MAX_LUA_MEMORY, MAX_NATIVE_WORK,
+    };
+    assert!(
+        usage.instructions < MAX_INSTRUCTIONS,
+        "instructions over the cap"
+    );
+    assert!(
+        usage.host_calls <= MAX_HOST_CALLS,
+        "host calls over the cap"
+    );
+    assert!(
+        usage.native_work <= MAX_NATIVE_WORK,
+        "native work over the cap"
+    );
+    assert!(usage.loads <= MAX_INCLUDE_PARSES, "loads over the cap");
+    assert_eq!(
+        usage.loads,
+        usage.requires + usage.dofiles,
+        "loads miscounted"
+    );
+    assert!(usage.input_bytes <= MAX_INPUT_BYTES, "input over the cap");
+    assert!(
+        usage.peak_memory <= u64::try_from(MAX_LUA_MEMORY).unwrap_or(u64::MAX),
+        "Lua memory over the cap"
+    );
+    for d in dependencies {
+        assert!(LUA_FILES.contains(&d.as_str()), "a file outside the input");
+    }
+}
+
+/// Target `skin_lua`: Lua files separated by NUL bytes, at most
+/// [`LUA_FILES`]`.len()` of them, written to a temporary skin folder under
+/// those names (beside `strip.png` and `grid.png`; a file outside the
+/// folder is there to be refused). The header pass runs once
+/// ([`read_lua_header`]); its header must be within its caps. The
+/// configured pass then runs with the header's defaults, twice, which must
+/// give the same outcome (the passes share no Lua state), and once with
+/// each option's last item. Every candidate's use of the sandbox must be
+/// within its caps and consult only the input's files; an imported skin's
+/// counters must be within the model's caps, and it is drawn ([`draw`]).
+///
+/// # Errors
+///
+/// What [`read_lua_header`] refuses.
+///
+/// # Panics
+///
+/// If a bound above is broken, the two runs of one configuration differ,
+/// or [`draw`] panics.
+pub fn skin_lua(data: &[u8]) -> Result<(Header, Result<LuaImported, ImportError>), ImportError> {
+    static FOLDER: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _owned = FOLDER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dir = lua_dir().join("skin");
+    let mut parts = data.splitn(LUA_FILES.len(), |&b| b == 0);
+    for name in LUA_FILES {
+        let path = dir.join(name);
+        match parts.next() {
+            Some(part) => std::fs::write(&path, part).expect("write a skin file"),
+            None => {
+                if path.exists() {
+                    std::fs::remove_file(&path).expect("remove a skin file");
+                }
+            }
+        }
+    }
+    let cancel = Cancel::new();
+    let h = read_lua_header(&dir, LUA_FILES[0], &cancel)?;
+    check_header(h.header());
+    check_lua(&h.usage(), h.dependencies());
+    let defaults = Config::defaults(h.header());
+    let outcome = |config: &Config| {
+        let r = h.import(config, &cancel);
+        match &r {
+            Ok(i) => {
+                check_lua(&i.usage, &i.dependencies);
+                check_usage(&i.imported);
+            }
+            Err(e) => {
+                black_box(e.to_string());
+            }
+        }
+        r
+    };
+    let first = outcome(&defaults);
+    let again = outcome(&defaults);
+    match (&first, &again) {
+        (Ok(a), Ok(b)) => {
+            assert_eq!(
+                a.imported.report, b.imported.report,
+                "a run changed the next"
+            );
+            assert_eq!(a.usage, b.usage, "a run changed the next's usage");
+            assert_eq!(
+                a.dependencies, b.dependencies,
+                "a run changed the next's files"
+            );
+        }
+        (Err(a), Err(b)) => assert_eq!(a.to_string(), b.to_string(), "a run changed the next"),
+        _ => panic!("two runs of one configuration differ"),
+    }
+    let _ = outcome(&last_items(h.header()));
+    if let Ok(i) = &first {
+        black_box(draw(&i.imported));
+    }
+    Ok((h.header().clone(), first))
 }
 
 /// An import's charged counters are within the model's caps.
