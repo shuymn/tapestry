@@ -620,14 +620,22 @@ impl Adjustment {
                     Role::ScratchPositive
                 };
                 let mut clash = false;
+                // Opposite presses at this time and context whose step is
+                // still in the open group: this press's step cancels each.
+                let mut cancel = 0;
                 for h in &mut self.holds {
                     if let Hold::Held {
                         role: r,
                         suppressed,
+                        pressed,
+                        context: c,
                         ..
                     } = h
                         && *r == opposite
                     {
+                        if !*suppressed && *pressed == time && *c == context {
+                            cancel += 1;
+                        }
                         *suppressed = true;
                         clash = true;
                     }
@@ -638,6 +646,7 @@ impl Adjustment {
                     {
                         *suppressed = true;
                     }
+                    self.act_steps(role, cancel, 1, time);
                 } else {
                     self.act(role, 1, time);
                 }

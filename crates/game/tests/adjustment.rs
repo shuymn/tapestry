@@ -1321,6 +1321,22 @@ fn a_playback_tempo_that_does_not_fit_fails_the_transaction() {
 }
 
 #[test]
+fn opposite_scratch_presses_at_one_time_cancel_in_either_order() {
+    for order in [[SCRATCH_POS, SCRATCH_NEG], [SCRATCH_NEG, SCRATCH_POS]] {
+        let mut rig = Rig::prepared(
+            options(SpeedMode::Classic, 200, 300, sudden(500)),
+            constant(150),
+        );
+        rig.at(10 * MS).press(START);
+        rig.at(20 * MS).press(order[0]).press(order[1]);
+        for t in (70..=700).step_by(50) {
+            rig.at(t * MS).ev(Event::Tick);
+        }
+        assert_eq!(rig.snap().options.covers().sudden.amount, 500, "{order:?}");
+    }
+}
+
+#[test]
 fn axis_steps_stay_wide_until_the_result_is_clamped() {
     let q = AxisQuantum::per_step(1).unwrap();
     let axis = |delta| Event::Axis {
