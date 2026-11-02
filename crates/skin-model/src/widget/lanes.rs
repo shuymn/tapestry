@@ -106,6 +106,48 @@ pub struct SourceLanes {
     pub note_h: f32,
 }
 
+/// The order the notes of different lanes are painted in, a later note
+/// over an earlier one where lanes overlap.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum NoteOrder {
+    /// Lane by lane in [`Lane::index`] order, each lane's notes in chart
+    /// order.
+    #[default]
+    LaneMajor,
+    /// Every lane's notes merged by their heads: by position, then time,
+    /// then the lane's place in `lanes`, then the note's place in its
+    /// lane. `lanes` lists every [`Lane::index`] once, first painted
+    /// first. A long note's parts stay together at its head's place.
+    Timeline { lanes: [u8; LANE_COUNT] },
+}
+
+impl NoteOrder {
+    /// The source player's order: the seven keys, then the scratch
+    /// (`play/LaneProperty.java:46-50`, `play/LaneRenderer.java:470-518`).
+    pub const SOURCE: Self = Self::Timeline {
+        lanes: [1, 2, 3, 4, 5, 6, 7, 0],
+    };
+
+    /// Each lane's rank in the order, by [`Lane::index`]; `None` unless a
+    /// timeline order lists every lane once.
+    fn ranks(self) -> Option<[u8; LANE_COUNT]> {
+        let Self::Timeline { lanes } = self else {
+            return Some([0, 1, 2, 3, 4, 5, 6, 7]);
+        };
+        let mut ranks = [0_u8; LANE_COUNT];
+        let mut seen = 0_u16;
+        for (rank, &lane) in (0_u8..).zip(&lanes) {
+            let slot = ranks.get_mut(usize::from(lane))?;
+            if seen & (1 << lane) != 0 {
+                return None;
+            }
+            seen |= 1 << lane;
+            *slot = rank;
+        }
+        Some(ranks)
+    }
+}
+
 /// A part of the lanes, for errors.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LanePart {
@@ -125,7 +167,10 @@ pub enum LanePart {
 pub struct LanesDef {
     /// How notes are placed and kept.
     pub style: LaneStyle,
-    /// `(x, w)` per [`Lane::index`], at 100 % lane width.
+    /// The order notes of different lanes are painted in.
+    pub note_order: NoteOrder,
+    /// `(x, w)` per [`Lane::index`], at 100 % lane width; key lanes may
+    /// overlap or coincide, and the scratch lane lies wholly beside them.
     pub lanes: [[i32; 2]; LANE_COUNT],
     /// The side the author drew the scratch lane on.
     pub scratch: Side,
@@ -183,6 +228,8 @@ pub enum LanesError {
     Heights,
     #[error("a key lane is not on the scratch lane's side")]
     ScratchNotAtSide,
+    #[error("the note order does not list every lane once")]
+    NoteOrder,
     #[error(
         "the source geometry needs a positive height and note height, an offset of at least 0, \
          and a note at its judgment time within the lanes"
@@ -240,8 +287,10 @@ impl LanesDef {
 
     /// Checks the geometry: every width at least 1, every lane within
     /// ±[`MAX_COORD`], `top < line ≤ bottom` within it, heights of at
-    /// least 1, every key lane on the scratch lane's side, and for the
-    /// source style its geometry ([`LanesError::Source`]).
+    /// least 1, every key lane wholly on the scratch lane's side (key
+    /// lanes may overlap each other), for the source style its geometry
+    /// ([`LanesError::Source`]), and a timeline order listing every lane
+    /// once ([`LanesError::NoteOrder`]).
     pub(crate) fn check(&self) -> Result<(), LanesError> {
         let max = i64::from(MAX_COORD);
         let within = |v: i64| (-max..=max).contains(&v);
@@ -284,6 +333,9 @@ impl LanesDef {
             if !ok {
                 return Err(LanesError::Source);
             }
+        }
+        if self.note_order.ranks().is_none() {
+            return Err(LanesError::NoteOrder);
         }
         Ok(())
     }
@@ -328,6 +380,9 @@ pub(crate) struct Lanes {
     keys: [i64; 2],
     scratch: Side,
     style: LaneStyle,
+    /// Each lane's rank by [`Lane::index`] under a timeline order; `None`
+    /// paints lane by lane.
+    timeline: Option<[u8; LANE_COUNT]>,
     top: i32,
     line: i32,
     bottom: i32,
@@ -361,6 +416,10 @@ impl Lanes {
             keys,
             scratch: def.scratch,
             style: def.style,
+            timeline: match def.note_order {
+                NoteOrder::LaneMajor => None,
+                order @ NoteOrder::Timeline { .. } => order.ranks(),
+            },
             top: def.top,
             line: def.line,
             bottom: def.bottom,
@@ -848,77 +907,68 @@ impl Lanes {
             f32_of(scale.line_y - f64::from(self.top)) + pad,
         );
         self.line(pen, line);
-        if !ringing_out {
-            for lane in Lane::all() {
-                if !self.simple_lane(pen, play, scale, lane, [from, to]) {
-                    break;
-                }
-            }
+        let Some(notes) = play.notes() else {
+            return;
+        };
+        if ringing_out {
+            return;
         }
+        // Positions never decrease along a lane (`Chart::validate`), so a
+        // lane's notes meeting [from, to] are one run.
+        self.walk(
+            pen,
+            notes,
+            |list| list.partition_point(|n| n.end_pos() < from),
+            Some(to),
+            |pen, l, i, n| self.simple_note(pen, play, scale, l, i, n),
+        );
     }
 
-    /// One lane's notes meeting `[from, to]`, as the simple skin draws
-    /// them; `false` once the frame's lanes stop.
-    fn simple_lane(
+    /// Note `i` of lane `l` as the simple skin draws it; `false` once the
+    /// frame's lanes stop.
+    fn simple_note(
         &self,
         pen: &mut Pen<'_, '_>,
         play: &Play,
         scale: &Scale,
-        lane: Lane,
-        [from, to]: [Position; 2],
+        l: &LaneOf<'_>,
+        i: usize,
+        n: &Note,
     ) -> bool {
         let d = pen.d;
         let Some(notes) = play.notes() else {
             return true;
         };
-        let Some(l) = LaneOf::new(self, d, notes, lane) else {
+        if play.done(l.index, i) {
             return true;
-        };
+        }
         let (x, w, line) = (l.x, l.w, f32_of(scale.line_y));
-        // Positions never decrease along a lane (`Chart::validate`), so the
-        // notes meeting [from, to] are one run.
-        let start = l.list.partition_point(|n| n.end_pos() < from).max(l.lo);
-        for (i, n) in l.list.iter().enumerate().take(l.hi).skip(start) {
-            if n.pos > to {
-                break;
-            }
-            if !pen.visit() {
-                return false;
-            }
-            if play.done(l.index, i) {
-                continue;
-            }
-            let head = scale.y(n.pos);
-            let drawn = match n.kind {
-                // A mine leaves at its time, hit or not.
-                NoteKind::Mine { .. } if n.time < d.display => true,
-                NoteKind::Mine { .. } => pen.cap(l.mine, x, w, head, self.mine_h),
-                _ if !is_target(notes.section, n.time, n.end()) => true,
-                NoteKind::Tap => pen.cap(l.note, x, w, head, self.note_h),
-                NoteKind::Long { end_pos, .. } => {
-                    // Judged or not, a long note is drawn until its end
-                    // passes the line, and once its head's time has passed
-                    // the head stays on the line.
-                    if end_pos < scale.at_line {
-                        continue;
-                    }
-                    let tail = scale.y(end_pos);
-                    let head = head.min(line);
-                    let body = if play.body_active(lane, i) {
-                        l.on
-                    } else {
-                        l.off
-                    };
-                    pen.span(body, x, w, tail, head)
-                        && pen.cap(l.tail, x, w, tail, self.note_h)
-                        && pen.cap(l.head, x, w, head, self.note_h)
+        let head = scale.y(n.pos);
+        match n.kind {
+            // A mine leaves at its time, hit or not.
+            NoteKind::Mine { .. } if n.time < d.display => true,
+            NoteKind::Mine { .. } => pen.cap(l.mine, x, w, head, self.mine_h),
+            _ if !is_target(notes.section, n.time, n.end()) => true,
+            NoteKind::Tap => pen.cap(l.note, x, w, head, self.note_h),
+            NoteKind::Long { end_pos, .. } => {
+                // Judged or not, a long note is drawn until its end passes
+                // the line, and once its head's time has passed the head
+                // stays on the line.
+                if end_pos < scale.at_line {
+                    return true;
                 }
-            };
-            if !drawn {
-                return false;
+                let tail = scale.y(end_pos);
+                let head = head.min(line);
+                let body = if play.body_active(l.lane, i) {
+                    l.on
+                } else {
+                    l.off
+                };
+                pen.span(body, x, w, tail, head)
+                    && pen.cap(l.tail, x, w, tail, self.note_h)
+                    && pen.cap(l.head, x, w, head, self.note_h)
             }
         }
-        true
     }
 
     /// The source player's judgment line and notes ([`SourceLanes`]).
@@ -944,99 +994,182 @@ impl Lanes {
             [from, to]
         });
         self.line(pen, f32_of(scale.line_y));
-        if !ringing_out {
-            for lane in Lane::all() {
-                if !self.source_lane(pen, play, scale, lane, s, range) {
-                    break;
-                }
-            }
+        let Some(notes) = play.notes() else {
+            return;
+        };
+        if ringing_out {
+            return;
         }
+        let display = pen.d.display;
+        // Times and positions never decrease along a lane
+        // (`Chart::validate`): from those meeting `range`, or from the
+        // display time on without one.
+        self.walk(
+            pen,
+            notes,
+            |list| match range {
+                Some([from, _]) => list.partition_point(|n| n.end_pos() < from),
+                None => list.partition_point(|n| n.time < display),
+            },
+            range.map(|[_, to]| to),
+            |pen, l, i, n| self.source_note(pen, play, scale, s, range, l, i, n),
+        );
     }
 
-    /// One lane's notes as the source player draws them, from those
-    /// meeting `range`, or from the display time on without one; `false`
-    /// once the frame's lanes stop.
-    fn source_lane(
+    /// Note `i` of lane `l` as the source player draws it; `false` once
+    /// the frame's lanes stop.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the frame's scale and source geometry beside the note"
+    )]
+    fn source_note(
         &self,
         pen: &mut Pen<'_, '_>,
         play: &Play,
         scale: &Scale,
-        lane: Lane,
         s: SourceLanes,
         range: Option<[Position; 2]>,
+        l: &LaneOf<'_>,
+        i: usize,
+        n: &Note,
     ) -> bool {
         let d = pen.d;
         let Some(notes) = play.notes() else {
             return true;
         };
-        let Some(l) = LaneOf::new(self, d, notes, lane) else {
+        if !is_target(notes.section, n.time, n.end()) {
             return true;
-        };
+        }
         let (x, w, oy, nh) = (l.x, l.w, s.offset_y, s.note_h);
-        let line = f32_of(scale.line_y);
-        let tail_shown = play.separate_end_judgment();
-        // Times and positions never decrease along a lane
-        // (`Chart::validate`).
-        let start = match range {
-            Some([from, _]) => l.list.partition_point(|n| n.end_pos() < from),
-            None => l.list.partition_point(|n| n.time < d.display),
-        };
-        for (i, n) in l.list.iter().enumerate().take(l.hi).skip(start.max(l.lo)) {
-            if range.is_some_and(|[_, to]| n.pos > to) {
-                break;
-            }
-            if !pen.visit() {
-                return false;
-            }
-            if !is_target(notes.section, n.time, n.end()) {
-                continue;
-            }
-            let drawn = match n.kind {
-                // Judged or not, until its time passes.
-                NoteKind::Tap | NoteKind::Mine { .. } => {
-                    if n.time < d.display {
-                        continue;
-                    }
-                    let y = if range.is_some() {
-                        scale.y(n.pos)
-                    } else {
-                        line
-                    };
-                    let part = if n.kind == NoteKind::Tap {
-                        l.note
-                    } else {
-                        l.mine
-                    };
-                    pen.span(part, x, w, y - oy - nh, y - oy)
+        match n.kind {
+            // Judged or not, until its time passes.
+            NoteKind::Tap | NoteKind::Mine { .. } => {
+                if n.time < d.display {
+                    return true;
                 }
-                NoteKind::Long { end, end_pos, .. } => {
-                    // Until its end's time passes and while its end is ahead
-                    // of its head, which stays on the line once passed.
-                    let head_pos = n.pos.max(scale.at_line);
-                    if range.is_none() || d.display >= end || end_pos <= head_pos {
-                        continue;
-                    }
-                    let (head, tail) = (scale.y(head_pos) - oy, scale.y(end_pos) - oy);
-                    let body = if play.body_active(lane, i) {
-                        l.on
-                    } else {
-                        l.off
-                    };
-                    pen.span(body, x, w, tail, head - nh)
-                        && (!tail_shown || pen.span(l.tail, x, w, tail - nh, tail))
-                        && pen.span(l.head, x, w, head - nh, head)
+                let y = if range.is_some() {
+                    scale.y(n.pos)
+                } else {
+                    f32_of(scale.line_y)
+                };
+                let part = if n.kind == NoteKind::Tap {
+                    l.note
+                } else {
+                    l.mine
+                };
+                pen.span(part, x, w, y - oy - nh, y - oy)
+            }
+            NoteKind::Long { end, end_pos, .. } => {
+                // Until its end's time passes and while its end is ahead of
+                // its head, which stays on the line once passed.
+                let head_pos = n.pos.max(scale.at_line);
+                if range.is_none() || d.display >= end || end_pos <= head_pos {
+                    return true;
                 }
-            };
-            if !drawn {
-                return false;
+                let (head, tail) = (scale.y(head_pos) - oy, scale.y(end_pos) - oy);
+                let body = if play.body_active(l.lane, i) {
+                    l.on
+                } else {
+                    l.off
+                };
+                pen.span(body, x, w, tail, head - nh)
+                    && (!play.separate_end_judgment() || pen.span(l.tail, x, w, tail - nh, tail))
+                    && pen.span(l.head, x, w, head - nh, head)
             }
         }
-        true
+    }
+
+    /// Every lane's notes from `start` (given a lane's notes, its first
+    /// candidate) up to the lane's section end and, with `to`, while
+    /// their position is at most `to`: lane by lane, or under a timeline
+    /// order merged by their heads' position, time, lane rank and index in
+    /// the lane, the least first. Each candidate is charged a visit before
+    /// `emit` draws it or skips it; `false` from `emit` stops the frame's
+    /// lanes. At most eight cursors live on the stack; each choice scans
+    /// them once.
+    fn walk<'n>(
+        &self,
+        pen: &mut Pen<'_, '_>,
+        notes: &'n Notes,
+        start: impl Fn(&[Note]) -> usize,
+        to: Option<Position>,
+        mut emit: impl FnMut(&mut Pen<'_, '_>, &LaneOf<'n>, usize, &'n Note) -> bool,
+    ) {
+        let d = pen.d;
+        let cursor = |lane: Lane| {
+            let lane = LaneOf::new(self, d, notes, lane)?;
+            let next = start(lane.list).max(lane.lo);
+            Some(LaneCursor { lane, next })
+        };
+        let Some(ranks) = self.timeline else {
+            for lane in Lane::all() {
+                let Some(mut c) = cursor(lane) else {
+                    continue;
+                };
+                while let Some((i, n)) = c.take(to) {
+                    if !pen.visit() || !emit(pen, &c.lane, i, n) {
+                        return;
+                    }
+                }
+            }
+            return;
+        };
+        let mut cursors: [Option<LaneCursor<'n>>; LANE_COUNT] =
+            std::array::from_fn(|l| u8::try_from(l).ok().and_then(Lane::new).and_then(cursor));
+        loop {
+            let mut best: Option<(usize, (Position, TimeUs, u8, usize))> = None;
+            for (k, (c, &rank)) in cursors.iter().zip(&ranks).enumerate() {
+                let Some(n) = c.as_ref().and_then(|c| c.peek(to)) else {
+                    continue;
+                };
+                let key = (n.pos, n.time, rank, c.as_ref().map_or(0, |c| c.next));
+                if best.is_none_or(|(_, b)| key < b) {
+                    best = Some((k, key));
+                }
+            }
+            let Some(Some(c)) = best.and_then(|(k, _)| cursors.get_mut(k)) else {
+                return;
+            };
+            let Some((i, n)) = c.take(to) else {
+                return;
+            };
+            if !pen.visit() || !emit(pen, &c.lane, i, n) {
+                return;
+            }
+        }
+    }
+}
+
+/// A lane's next candidate in a frame's walk.
+struct LaneCursor<'n> {
+    lane: LaneOf<'n>,
+    /// The next note's index in its lane.
+    next: usize,
+}
+
+impl<'n> LaneCursor<'n> {
+    /// The next note, while it is before the lane's section end and its
+    /// position at most `to`.
+    fn peek(&self, to: Option<Position>) -> Option<&'n Note> {
+        if self.next >= self.lane.hi {
+            return None;
+        }
+        let n = self.lane.list.get(self.next)?;
+        (!to.is_some_and(|to| n.pos > to)).then_some(n)
+    }
+
+    /// The next note with its index, the cursor moved past it.
+    fn take(&mut self, to: Option<Position>) -> Option<(usize, &'n Note)> {
+        let n = self.peek(to)?;
+        let i = self.next;
+        self.next = i.checked_add(1)?;
+        Some((i, n))
     }
 }
 
 /// One lane's notes, geometry and parts for a frame's pass.
 struct LaneOf<'n> {
+    lane: Lane,
     index: usize,
     list: &'n [Note],
     lo: usize,
@@ -1074,6 +1207,7 @@ impl<'n> LaneOf<'n> {
             return None;
         };
         Some(Self {
+            lane,
             index: l,
             list,
             lo,
@@ -1087,5 +1221,21 @@ impl<'n> LaneOf<'n> {
             off: d.shown(off),
             mine: d.shown(mine),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A timeline walk's cursors live on the stack: eight of them, fixed.
+    #[test]
+    fn the_cursors_are_a_fixed_stack_array() {
+        let n = size_of::<[Option<LaneCursor<'static>>; LANE_COUNT]>();
+        println!(
+            "cursors: {n} B, {} B each",
+            size_of::<LaneCursor<'static>>()
+        );
+        assert!(n <= 8 * 256, "{n}");
     }
 }

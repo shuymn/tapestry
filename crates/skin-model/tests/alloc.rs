@@ -1823,6 +1823,11 @@ fn build_does_not_allocate() {
         "built-in timers never drawn"
     );
     source_lanes_do_not_allocate(&chart, &full);
+    let round_ctx = PlayContext {
+        attempt: Attempt::Section(&round),
+        ..full
+    };
+    timeline_lanes_do_not_allocate([(&full, None), (&round_ctx, Some(&round))]);
     fallback_lanes_do_not_allocate(&chart, &full);
     bar_groups_do_not_allocate(&full);
     cover_trims_do_not_allocate(&chart, &full);
@@ -2378,6 +2383,151 @@ fn fallback_lanes_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
     // CN draws its end caps besides LN's body and head.
     let [ln, cn] = max;
     assert!(cn > ln, "LN {ln}, CN {cn}");
+}
+
+/// Timeline orders build without allocating: the simple lanes with every
+/// key coincident under a reversed order, and the source lanes with keys
+/// overlapping by half a lane under the source's, each lane's tap its own
+/// image; over notes on all eight lanes with long notes held as their
+/// effects drain and a STOP, the whole chart and a practice section,
+/// every attempt prepared untracked; frames every 16 ms under covers that
+/// leave scroll and none, at every target, into a full batch and a short
+/// one; then an invalid frame poisoning the play. Every lane's taps drew,
+/// and the short batch dropped.
+fn timeline_lanes_do_not_allocate(contexts: [(&PlayContext<'_>, Option<&Section>); 2]) {
+    use lanes_support::{BAR, BODY_OFF, BODY_ON, HEAD, LINE, MINE, NOTE, TAIL};
+    let taps = [NOTE, HEAD, TAIL, BODY_ON, BODY_OFF, MINE, BAR, LINE];
+    let simple = {
+        let mut def = lanes_support::simple();
+        for l in def.lanes.iter_mut().skip(1) {
+            *l = [256, 64];
+        }
+        def.note_order = skin_model::NoteOrder::Timeline {
+            lanes: [7, 6, 5, 4, 3, 2, 1, 0],
+        };
+        def
+    };
+    let source = {
+        let mut def = lanes_support::source();
+        for (k, l) in (0_i32..).zip(def.lanes.iter_mut()).skip(1) {
+            *l = [256 + 32 * (k - 1), 64];
+        }
+        def
+    };
+    let mut b = ChartBuilder::new(150_000)
+        .sound("a.wav")
+        .stop(TimeUs(3_000 * MS), TimeUs(500 * MS));
+    for i in 0..1_600 {
+        let t = TimeUs(i * 40 * MS / 8);
+        b = if i % 7 == 3 {
+            b.long(lane(i), t, TimeUs(t.0 + 30 * MS))
+        } else {
+            b.tap(lane(i), t)
+        };
+    }
+    let chart = b.build().unwrap();
+    let t = tally(0);
+    let gauges = [state(GaugeValue::FULL), state(GaugeValue::FULL)];
+    let layout = SkinLayout::AUTHOR;
+    let mut seen = [false; 8];
+    let mut drops = 0_u32;
+    for mut def in [simple, source] {
+        def.parts.note = taps;
+        let skin = lanes_support::lanes_skin(def);
+        let uvs = play_support::uvs(&skin);
+        let keys = taps.map(|i| {
+            let f = uvs.get(i).unwrap();
+            ([f.uv[0].to_bits(), f.uv[2].to_bits()], f.layer)
+        });
+        let mut batch = QuadBatch::with_capacity(skin.quad_capacity(), skin.run_capacity());
+        let mut small = QuadBatch::with_capacity(64, 16);
+        for (ctx, section) in contexts {
+            let events = effects(&chart, section, false);
+            let from = section.map_or(0, |s| s.start.0 - s.lead_in.0);
+            let mut play = skin.prepare(&chart, ctx).unwrap();
+            let mut next = 0;
+            TRACK.with(|t| t.set(true));
+            for (i, now) in (from..from + 9_000 * MS)
+                .step_by(16 * MS as usize)
+                .enumerate()
+            {
+                let cover = [0, 300, 1_000][i / 40 % 3];
+                let lanes = LaneView {
+                    visible_time: TimeUs(600 * MS),
+                    cover,
+                    lift: 0,
+                    hidden: 0,
+                };
+                let rest = events.get(next..).unwrap_or_default();
+                let n = rest.partition_point(|e| e.time.0 <= now).min(DRAIN);
+                let drain = rest.get(..n).unwrap_or_default();
+                next += n;
+                let frame = SkinFrame {
+                    now: TimeUs(now),
+                    display_offset: TimeUs(0),
+                    tally: &t,
+                    gauges: &gauges,
+                    gauge: 0,
+                    effects: drain,
+                    complete: false,
+                    target: TARGETS[i % TARGETS.len()],
+                    layout: &layout,
+                    lanes,
+                    readouts: readouts_for(lanes),
+                    playing: true,
+                };
+                let out = if i % 25 == 24 { &mut small } else { &mut batch };
+                out.clear();
+                skin.build(&mut play, &frame, &uvs, out)
+                    .expect("the frame builds");
+                drops += out.dropped();
+                for q in out.quads() {
+                    let key = ([q.uv[0].to_bits(), q.uv[2].to_bits()], q.layer);
+                    if let Some(l) = keys.iter().position(|&k| k == key) {
+                        seen[l] = true;
+                    }
+                }
+            }
+            // An invalid frame poisons the play; every later build refuses.
+            let lanes = LaneView {
+                visible_time: TimeUs(600 * MS),
+                cover: 0,
+                lift: 100,
+                hidden: 0,
+            };
+            let mut bad = readouts_for(lanes);
+            bad.covers.lift = 500;
+            for _ in 0..2 {
+                batch.clear();
+                let frame = SkinFrame {
+                    now: TimeUs(from + 9_000 * MS),
+                    display_offset: TimeUs(0),
+                    tally: &t,
+                    gauges: &gauges,
+                    gauge: 0,
+                    effects: &[],
+                    complete: false,
+                    target: TARGETS[0],
+                    layout: &layout,
+                    lanes,
+                    readouts: bad,
+                    playing: true,
+                };
+                assert_eq!(
+                    skin.build(&mut play, &frame, &uvs, &mut batch),
+                    Err(BuildError::InvalidReadouts)
+                );
+            }
+            TRACK.with(|t| t.set(false));
+        }
+    }
+    assert_eq!(
+        ALLOCS.swap(0, Ordering::Relaxed),
+        0,
+        "timeline lanes: allocations"
+    );
+    assert_eq!(seen, [true; 8]);
+    assert!(drops > 0);
 }
 
 /// The trimmed cover paints of [`cover_trims_do_not_allocate`] over the

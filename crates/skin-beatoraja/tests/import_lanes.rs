@@ -156,17 +156,65 @@ fn lanes_map_source_seven_to_the_scratch() {
     assert_eq!(model(l), (LanesError::ScratchNotAtSide, 20));
 }
 
+/// The default lanes with source key 0 widened over key 1, keys 2 and 3
+/// coincident at 200, and keys 4 and 5 swapped in x.
+fn overlapping() -> Loaded {
+    let rects = [
+        r#"{"x": 100, "y": 200, "w": 70, "h": 600}"#,
+        r#"{"x": 150, "y": 200, "w": 50, "h": 600}"#,
+        r#"{"x": 200, "y": 200, "w": 50, "h": 600}"#,
+        r#"{"x": 200, "y": 200, "w": 50, "h": 600}"#,
+        r#"{"x": 350, "y": 200, "w": 50, "h": 600}"#,
+        r#"{"x": 300, "y": 200, "w": 50, "h": 600}"#,
+        r#"{"x": 400, "y": 200, "w": 50, "h": 600}"#,
+        r#"{"x": 20, "y": 200, "w": 80, "h": 600}"#,
+    ]
+    .join(", ");
+    import_body(&body("", &note_with(&rects, ""), &[NOTES]))
+}
+
 #[test]
-fn overlapping_lanes_refuse() {
-    // One pixel into the first key lane.
+fn key_lanes_may_overlap_or_coincide() {
+    // Each key keeps its authored rect: no report but the lanes' own,
+    // the parts charged as without the overlap.
+    let l = overlapping();
+    let disjoint = lanes("", &[]);
+    assert_eq!(l.report().notes, disjoint.report().notes);
+    assert_eq!(l.report().usage, disjoint.report().usage);
+    assert_eq!(l.ok().scratch, Some(Side::Left));
+    // A chord on every lane: painted keys 1 to 7, then the scratch,
+    // whatever their x order.
+    let chord: Vec<(u8, i64)> = (0..8).map(|k| (k, 1_000)).collect();
+    let xs: Vec<i32> = rects_over(&l, &taps(&chord), 900)
+        .iter()
+        .map(|r| r[0])
+        .collect();
+    assert_eq!(xs, [100, 150, 200, 200, 350, 300, 400, 20]);
+    let widths: Vec<i32> = rects_over(&l, &taps(&chord), 900)
+        .iter()
+        .map(|r| r[2])
+        .collect();
+    assert_eq!(widths, [70, 50, 50, 50, 50, 50, 50, 80]);
+    // An earlier note on a later lane is painted first: key 2's at
+    // 1 000 ms under key 1's at 1 100 ms where they overlap.
+    let xs: Vec<i32> = rects_over(&l, &taps(&[(1, 1_100), (2, 1_000)]), 900)
+        .iter()
+        .map(|r| r[0])
+        .collect();
+    assert_eq!(xs, [150, 100]);
+}
+
+#[test]
+fn a_scratch_reaching_a_key_refuses() {
+    // The scratch one pixel into the first key lane: the model's
+    // refusal, at the note.
     let wide = rects_with(7, r#"{"x": 20, "y": 200, "w": 81, "h": 600}"#);
-    refused(
-        import_body(&body("", &note_with(&wide, ""), &[NOTES])),
-        "dst",
-    );
+    let l = import_body(&body("", &note_with(&wide, ""), &[NOTES]));
+    assert_eq!(model(l).0, LanesError::ScratchNotAtSide);
     // Touching lanes import (the default lanes touch).
     lanes("", &[]).ok();
-    // A configured width that makes each lane reach into the next.
+    // A configured width that makes each lane reach into the next, the
+    // scratch into the first key among them.
     let header = r#""offset": [{"name": "w", "id": 40, "x": true, "w": true}]"#;
     let objects = format!("{header}, {}", note(""));
     let notes = r#"{"id": "notes", "offset": 40, "dst": [{"x": 0, "y": 0, "w": 0, "h": 0}]}"#;
@@ -184,7 +232,7 @@ fn overlapping_lanes_refuse() {
         w: 1,
         ..OffsetValue::default()
     });
-    refused(wide, "dst");
+    assert_eq!(model(wide).0, LanesError::ScratchNotAtSide);
     // The offsets apply as direct deltas: x moves, w widens to the right.
     let moved = with(OffsetValue {
         x: 10,
