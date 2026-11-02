@@ -737,10 +737,11 @@ impl Lanes {
         let Some(notes) = play.notes() else {
             return;
         };
-        let playhead = play.playhead();
+        // The frame's one sample of the playhead, taken when the play was
+        // filled for this build at the same display time.
         let scale = Scale::new(
-            playhead.position_at(d.display),
-            playhead.initial_rate(),
+            play.display_position(),
+            play.playhead().initial_rate(),
             d.view.visible_time,
             g.span,
             g.line_y,

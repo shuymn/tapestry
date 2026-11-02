@@ -263,6 +263,9 @@ pub struct Play {
     /// The attempt's exact playhead, which notes, bar lines and the beat
     /// sample; a rearm keeps it.
     playhead: ExactPlayhead,
+    /// The playhead at the last build's display time, sampled once per
+    /// frame and read by the beat timer and the lanes.
+    display: Position,
     /// The display beat last seen and the µs it was crossed at.
     beat: Option<(i128, i64)>,
     ready_at: TimeUs,
@@ -412,6 +415,7 @@ impl Play {
             ms: vec![TIMER_OFF; slots].into_boxed_slice(),
             fields: [0; field::COUNT],
             playhead,
+            display: Position(0),
             beat: None,
             ready_at,
             play_at,
@@ -535,6 +539,13 @@ impl Play {
     #[must_use]
     pub fn playhead(&self) -> &ExactPlayhead {
         &self.playhead
+    }
+
+    /// The playhead at the last build's display time (`now` plus the
+    /// display offset): the frame's one sample of it.
+    #[must_use]
+    pub const fn display_position(&self) -> Position {
+        self.display
     }
 
     /// Whether `note` on lane `l` is no longer drawn: a judged tap or a hit

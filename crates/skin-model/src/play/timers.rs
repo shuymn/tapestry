@@ -299,6 +299,10 @@ impl Play {
         for ev in frame.effects {
             self.reducer.apply(ev);
         }
+        // The frame's one sample of the playhead, which the beat and the
+        // lanes share.
+        let display = frame.now.0.saturating_add(frame.display_offset.0);
+        self.display = self.playhead.position_at(TimeUs(display));
         self.fill_fields(frame, judged, &readouts);
         self.fill_builtin(frame);
         read_timers(
@@ -444,7 +448,9 @@ impl Play {
     /// Off when that start leaves the time range.
     fn beat_start(&mut self, now: TimeUs, offset: TimeUs) -> Option<TimeUs> {
         let disp = now.0.saturating_add(offset.0).clamp(-DOMAIN, DOMAIN);
-        let b = self.playhead.position_at(TimeUs(disp)).0.div_euclid(BEAT);
+        // The frame's sample, at `disp` before its clamp, which the
+        // playhead clamps alike.
+        let b = self.display.0.div_euclid(BEAT);
         let crossed = match self.beat {
             Some((cached, at)) if cached == b => at,
             _ => {
