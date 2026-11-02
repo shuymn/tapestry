@@ -781,17 +781,16 @@ impl Shared {
 
     /// Applies `input` to lifetime `lifetime`'s state and publishes it,
     /// with `page`, through the slot; nothing for a lifetime not begun or
-    /// ended.
-    fn report(&self, lifetime: u64, input: LoadInput, page: Option<MenuPage>) -> Option<u64> {
+    /// ended. Whether the slot took it.
+    fn report(&self, lifetime: u64, input: LoadInput, page: Option<MenuPage>) -> bool {
         let update = {
             let mut producer = self.producer();
-            let state = producer.as_mut().filter(|s| s.lifetime() == lifetime)?;
+            let Some(state) = producer.as_mut().filter(|s| s.lifetime() == lifetime) else {
+                return false;
+            };
             Box::new(state.apply(input))
         };
-        let seq = update.seq;
-        self.loading_slot()
-            .offer(lifetime, page, Some(update))
-            .then_some(seq)
+        self.loading_slot().offer(lifetime, page, Some(update))
     }
 
     /// Whether loading lifetime `lifetime` is still the current one.
@@ -852,7 +851,7 @@ impl LoadingSink {
     /// begun and is still the current one: a newer state replaces one
     /// waiting, and the two replace a waiting pair together.
     pub fn report(&self, input: LoadInput, page: Option<MenuPage>) {
-        if self.shared.report(self.lifetime, input, page).is_some() {
+        if self.shared.report(self.lifetime, input, page) {
             self.signal();
         }
     }

@@ -283,8 +283,8 @@ struct ChosenTextState {
 enum TextPlan {
     /// Nothing: its text is installed, or it was refused.
     Keep,
-    /// Clear the slots `clear` names, then prepare those `which` names.
-    Prepare { clear: TextSlots, which: TextSlots },
+    /// Clear the slots named, then prepare them.
+    Prepare(TextSlots),
 }
 
 /// What request `asked` needs, the presentation holding `installed`'s
@@ -305,17 +305,8 @@ fn text_plan<K: PartialEq>(
         return TextPlan::Keep;
     }
     match installed {
-        Some(i) if i.same_place(asked) => {
-            let which = fields_changed(&i.chart, &asked.chart);
-            TextPlan::Prepare {
-                clear: which,
-                which,
-            }
-        }
-        _ => TextPlan::Prepare {
-            clear: TextSlots::ALL,
-            which: TextSlots::ALL,
-        },
+        Some(i) if i.same_place(asked) => TextPlan::Prepare(fields_changed(&i.chart, &asked.chart)),
+        _ => TextPlan::Prepare(TextSlots::ALL),
     }
 }
 
@@ -400,14 +391,14 @@ impl MenuScreen {
             revision: update.revision,
             chart: Arc::clone(&update.chart),
         };
-        let TextPlan::Prepare { clear, which } = text_plan(
+        let TextPlan::Prepare(which) = text_plan(
             self.chosen.installed.as_ref(),
             self.chosen.refused.as_ref(),
             &asked,
         ) else {
             return;
         };
-        self.renderer.clear_loading_text(clear);
+        self.renderer.clear_loading_text(which);
         let c = &update.chart;
         fn field(f: &Option<String>) -> &str {
             f.as_deref().unwrap_or_default()
@@ -820,10 +811,7 @@ mod tests {
         };
         let full = [1_920, 1_080];
         let installed = asked(1, full, 1, Some("x"));
-        let all = TextPlan::Prepare {
-            clear: TextSlots::ALL,
-            which: TextSlots::ALL,
-        };
+        let all = TextPlan::Prepare(TextSlots::ALL);
         assert_eq!(
             text_plan(Some(&installed), None, &installed.clone()),
             TextPlan::Keep
@@ -831,10 +819,7 @@ mod tests {
         let artist = TextSlots::field(TextField::Artist);
         assert_eq!(
             text_plan(Some(&installed), None, &asked(1, full, 2, None)),
-            TextPlan::Prepare {
-                clear: artist,
-                which: artist
-            }
+            TextPlan::Prepare(artist)
         );
         // Another size, another installation, nothing known.
         assert_eq!(
