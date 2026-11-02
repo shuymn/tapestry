@@ -346,6 +346,13 @@ fn skin_json_seeds_resolve_or_fail_as_built() {
             "grade_anchors",
             "grade_anchor_trimmed",
             "grade_anchor_turning",
+            "gauge_max_still",
+            "gauge_max_flicker",
+            "gauge_shared",
+            "gauge_over_budget",
+            "gauge_too_many_parts",
+            "gauge_fractional_parts",
+            "gauge_node_count",
         ],
     );
     let imports: Vec<&str> = seeds::skin_imports().iter().map(|(n, _)| *n).collect();
@@ -397,6 +404,15 @@ fn skin_json_seeds_resolve_or_fail_as_built() {
         if let Some(want) = digit_offset_refusal(name) {
             // The header resolves; the import refuses the table.
             assert!(data.len() <= 64 * 1_024, "{name}: {} bytes", data.len());
+            let (_, imported) = skin_json(&data).unwrap_or_else(|e| panic!("{name}: {e}"));
+            match imported {
+                Err(e) => assert!(want(&e), "{name}: {e:?}"),
+                Ok(i) => panic!("{name}: {:?}", i.report),
+            }
+            continue;
+        }
+        if let Some(want) = gauge_refusal(name) {
+            // The header resolves; the gauge refuses as built.
             let (_, imported) = skin_json(&data).unwrap_or_else(|e| panic!("{name}: {e}"));
             match imported {
                 Err(e) => assert!(want(&e), "{name}: {e:?}"),
@@ -489,6 +505,55 @@ fn note_part_refusal(name: &str) -> Option<Option<NoteKind>> {
         "note_parts_null" => part("mine", PartWhy::NullEntry { index: 8 }),
         "note_parts_unsized" => part("note", PartWhy::MissingSize { lane: 2 }),
         "note_parts_broken" => Some(None),
+        _ => None,
+    }
+}
+
+/// The refusal a gauge seed meets: a flicker's tip past the widget budget
+/// at its destination, parts past the most segments, a fractional count
+/// and an unsupported node count.
+fn gauge_refusal(name: &str) -> Option<fn(&ImportError) -> bool> {
+    use skin_beatoraja::{CriticalPart, ImportLimit};
+    match name {
+        "gauge_over_budget" => Some(|e| {
+            matches!(
+                e,
+                ImportError::Limit {
+                    limit: ImportLimit::WidgetQuads,
+                    at: Some(_),
+                }
+            )
+        }),
+        "gauge_too_many_parts" => Some(|e| {
+            matches!(
+                e,
+                ImportError::Critical {
+                    part: CriticalPart::Gauge,
+                    why: NoteKind::UnsupportedField { field: "parts" },
+                    ..
+                }
+            )
+        }),
+        "gauge_fractional_parts" => Some(|e| {
+            matches!(
+                e,
+                ImportError::Type {
+                    field: "parts",
+                    expected: "an integer",
+                    ..
+                }
+            )
+        }),
+        "gauge_node_count" => Some(|e| {
+            matches!(
+                e,
+                ImportError::Critical {
+                    part: CriticalPart::Gauge,
+                    why: NoteKind::UnsupportedField { field: "nodes" },
+                    ..
+                }
+            )
+        }),
         _ => None,
     }
 }
@@ -863,6 +928,20 @@ fn skin_import_seeds_import_and_draw_as_built() {
                 assert_eq!(kinds(&i), [], "{name}");
                 // "150", "1", and the grade with its combo of 1.
                 assert_eq!(drawn, [3 + 1 + 2; 4], "{name}");
+            }
+            "gauge_max_still" | "gauge_max_flicker" | "gauge_shared" => {
+                // The whole widget budget, one D10 note per destination,
+                // the nodes' four images whatever the parts; every quad
+                // drawn on each frame at 20 %, the flicker's tip among
+                // them.
+                let elements = if name == "gauge_shared" { 2 } else { 1 };
+                assert_eq!(u.widget_quads, 16_384, "{name}");
+                assert_eq!(u.elements, elements, "{name}");
+                assert_eq!((u.images, u.frames), (4, 4), "{name}");
+                let d10 = NoteKind::Deviation(skin_beatoraja::DeviationId::D10);
+                assert_eq!(kinds(&i), vec![d10; elements as usize], "{name}");
+                assert_eq!(i.skin.quad_capacity(), 16_384, "{name}");
+                assert_eq!(drawn, [16_384; 4], "{name}");
             }
             "grade_anchors" => {
                 // PERFECT's two keys and the full-gauge slot's one kept
