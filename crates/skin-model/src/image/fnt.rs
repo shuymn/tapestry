@@ -39,8 +39,6 @@ pub const MAX_FNT_VALUE: i32 = 16_384;
 
 /// The highest code point.
 const MAX_CODE: i32 = 0x10_FFFF;
-/// The highest code of the basic plane.
-const MAX_BMP: u32 = 0xFFFF;
 /// The glyphs whose height is the cap height, in order
 /// (`BitmapFont$BitmapFontData` `capChars`, gdx 1.9.9 `load`:643-658).
 const CAP_CHARS: &[u8] = b"MNBDCEFKAGHIJLOPQRSTUVWXYZ";
@@ -69,8 +67,8 @@ pub struct FntGlyph {
 /// A kerning pair: `amount` pixels between `first` and `second`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FntKerning {
-    pub first: u16,
-    pub second: u16,
+    pub first: u32,
+    pub second: u32,
     /// −128 to 127; a file with any other amount is refused.
     pub amount: i8,
 }
@@ -139,7 +137,7 @@ pub enum FntErrorKind {
     /// A declared `chars count` or `kernings count` not equal to the
     /// lines read.
     Count(&'static str),
-    /// No basic-plane glyph drawn with a size, the missing glyph aside.
+    /// No glyph drawn with a size, the missing glyph aside.
     NoGlyphs,
     /// More glyphs than the limit.
     TooManyGlyphs,
@@ -195,7 +193,7 @@ impl fmt::Display for FntErrorKind {
             Self::GlyphPage => f.write_str("a glyph on a page the font does not have"),
             Self::Unexpected => f.write_str("a line not allowed here"),
             Self::Count(k) => write!(f, "`{k} count` is not the number of lines"),
-            Self::NoGlyphs => f.write_str("no basic-plane glyph drawn with a size"),
+            Self::NoGlyphs => f.write_str("no glyph drawn with a size"),
             Self::TooManyGlyphs => f.write_str("too many glyphs"),
             Self::TooManyKernings => f.write_str("too many kerning pairs"),
             Self::GlyphOutside { code } => write!(f, "glyph {code} lies outside its page"),
@@ -590,13 +588,14 @@ impl FntFile {
                     let amount = amount
                         .parse::<i8>()
                         .map_err(|_| err(no, FntErrorKind::Value("amount")))?;
-                    // Kept only within the basic plane and after an existing
-                    // glyph (gdx 1.9.9 `load`:600-618).
-                    let (Ok(first), Ok(second)) = (u16::try_from(first), u16::try_from(second))
+                    // Kept only after an existing glyph and before a code
+                    // point, as any glyph's id is.
+                    let (Ok(first), Ok(second)) = (u32::try_from(first), u32::try_from(second))
                     else {
                         continue;
                     };
-                    if first == 0 || chars.get(u32::from(first)).is_none() {
+                    if first == 0 || chars.get(first).is_none() || second > MAX_CODE.unsigned_abs()
+                    {
                         continue;
                     }
                     if kernings.len() >= limits.kernings {
@@ -635,7 +634,7 @@ impl FntFile {
                         .glyphs
                         .iter()
                         .map(|(g, _)| g)
-                        .find(|g| g.code <= MAX_BMP && g.src[2] != 0 && g.src[3] != 0)
+                        .find(|g| g.src[2] != 0 && g.src[3] != 0)
                 })
                 .map(|g| g.adv)
                 .ok_or(err(0, FntErrorKind::NoGlyphs))?;
@@ -665,13 +664,12 @@ impl FntFile {
             g.src[2] = unsigned16(w);
             g.xoff = narrow16(-pad_left);
         }
-        // A font needs a basic-plane glyph drawn with a size; the missing
-        // glyph is not one, and a space with a height is once it has a
-        // width.
+        // A font needs a glyph drawn with a size; the missing glyph is not
+        // one, and a space with a height is once it has a width.
         if !chars
             .glyphs
             .iter()
-            .any(|(g, _)| g.code <= MAX_BMP && g.src[2] != 0 && g.src[3] != 0)
+            .any(|(g, _)| g.src[2] != 0 && g.src[3] != 0)
         {
             return Err(err(0, FntErrorKind::NoGlyphs));
         }
@@ -684,7 +682,7 @@ impl FntFile {
                 .glyphs
                 .iter()
                 .map(|(g, _)| g)
-                .filter(|g| g.code <= MAX_BMP && g.src[2] != 0 && g.src[3] != 0)
+                .filter(|g| g.src[2] != 0 && g.src[3] != 0)
                 .map(|g| i32::from(g.src[3]))
                 .fold(1, i32::max),
         } - (pad_top + pad_bottom);
@@ -730,7 +728,7 @@ impl FntFile {
         &self.glyphs
     }
 
-    /// The glyph drawn for a basic-plane character the font lacks.
+    /// The glyph drawn for a character the font lacks.
     #[must_use]
     pub fn missing(&self) -> Option<FntGlyph> {
         self.missing
@@ -760,11 +758,8 @@ impl FntFile {
     /// The kerning from `first` to `second`, 0 without a pair.
     #[must_use]
     pub fn kerning(&self, first: u32, second: u32) -> i8 {
-        let (Ok(a), Ok(b)) = (u16::try_from(first), u16::try_from(second)) else {
-            return 0;
-        };
         self.kernings
-            .binary_search_by_key(&(a, b), |k| (k.first, k.second))
+            .binary_search_by_key(&(first, second), |k| (k.first, k.second))
             .ok()
             .and_then(|i| self.kernings.get(i))
             .map_or(0, |k| k.amount)
@@ -1011,6 +1006,21 @@ mod tests {
     }
 
     #[test]
+    fn kerning_pairs_take_any_code_point() {
+        let smile = ch(0x1_F600, [4, 9], [0, 1, 6]);
+        let tail = "kernings count=4\nkerning first=128512 second=128513 amount=-3\n\
+                    kerning first=65 second=128512 amount=2\n\
+                    kerning first=128512 second=1114111 amount=4\n\
+                    kerning first=128512 second=1114112 amount=5\n";
+        let f = parse(&font(&[a(), smile], tail)).unwrap();
+        assert_eq!(f.kerning(0x1_F600, 0x1_F601), -3);
+        assert_eq!(f.kerning(65, 0x1_F600), 2);
+        assert_eq!(f.kerning(0x1_F600, 0x10_FFFF), 4);
+        // A second past the code points can follow no glyph: not kept.
+        assert_eq!(f.kernings().len(), 3);
+    }
+
+    #[test]
     fn a_missing_space_takes_the_advance_of_l_or_the_first_visible_glyph() {
         let bang = ch(33, [2, 9], [0, 0, 9]);
         let l = ch(108, [2, 9], [0, 0, 5]);
@@ -1038,12 +1048,12 @@ mod tests {
         let padded =
             |chars: &[String]| font(chars, "").replacen("padding=0,0,0,0", "padding=2,0,1,0", 1);
         assert_eq!(parse(&padded(&[n.clone(), m])).unwrap().ascent(), 4);
-        // No cap glyph: the tallest basic-plane glyph drawn with a size.
+        // No cap glyph: the tallest glyph drawn with a size, of any plane.
         let low = ch(97, [4, 5], [0, 0, 5]);
         let flat = ch(98, [0, 12], [0, 0, 5]);
         let wide = ch(0x1_0000, [4, 14], [0, 0, 5]);
         let f = parse(&padded(&[low, flat, wide])).unwrap();
-        assert_eq!(f.ascent(), 10 - (5 - 3));
+        assert_eq!(f.ascent(), 10 - (14 - 3));
         assert_eq!(parse(&padded(&[n])).unwrap().ascent(), 10 - (7 - 3));
     }
 
@@ -1168,15 +1178,16 @@ mod tests {
     }
 
     #[test]
-    fn a_font_needs_a_drawn_basic_plane_glyph() {
+    fn a_font_needs_a_drawn_glyph() {
         let space = ch(32, [0, 0], [0, 0, 4]);
         let missing = ch(0, [3, 3], [0, 0, 4]);
-        let emoji = ch(0x1_F600, [5, 5], [0, 0, 7]);
         let x = ch(120, [0, 0], [0, 0, 4]);
         let l = ch(108, [3, 0], [0, 0, 4]);
+        // A glyph of any plane is one.
+        let emoji = ch(0x1_F600, [5, 5], [0, 0, 7]);
+        assert!(parse(&font(&[space.clone(), emoji], "")).is_ok());
         for chars in [
             [space.clone(), missing.clone()],
-            [space.clone(), emoji],
             [space.clone(), x],
             // `l` gives the synthesised space its advance but is not drawn.
             [l, missing],

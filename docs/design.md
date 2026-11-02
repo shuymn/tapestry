@@ -1113,7 +1113,7 @@ Importing a JSON skin (`read_header`, then `import` with the `Header` and `Defin
 | Header read of one admitted file | 1 | 1 MiB read and 4 MiB decoding |
 | Frames, cells and renumbering when the sheet finishes | 65 536 each | 4 to 24 B |
 | Widgets, texts and fonts | ≤ 16 384 quads; 64 of 256 B; 16 of 1 024 B | |
-| Bitmap fonts: one file read, then glyphs, kerning pairs and page names kept | ≤ 4 MiB; 65 536; 65 536; 256 of ≤ 1 024 B | the file, 20 B, 6 B and a path |
+| Bitmap fonts: one file read, then glyphs, kerning pairs and page names kept | ≤ 4 MiB; 65 536; 65 536; 256 of ≤ 1 024 B | the file, 20 B, 12 B and a path |
 | Judges, gauges and the lanes | 16 384 at most (an element each); one lanes | 1 744 B (not remeasured since S6c-10 added the grades' attachment slots; see below), 168 B and 328 B |
 | Bar line groups, as defined and in a play | 16 384 | 112 B; a 168 B frame record and a 2 B heap slot (2 785 280 B at the cap, 32 768 B of it the heap) |
 | Cover paints | 16 384 at most (an element each), and their gate keys among the track keys | 88 B |

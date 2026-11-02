@@ -5,7 +5,7 @@
 //!
 //! The pen starts at 0 and moves by each glyph's advance, plus the
 //! kerning to the next character when the glyph is the primary file's own
-//! basic-plane glyph (a substituted glyph is a copy without kerning). The
+//! (a substituted glyph is a copy without kerning). The
 //! line's width is the pen after the last glyph's advance
 //! (`BitmapFont$BitmapFontData.getGlyphs`, gdx 1.9.9 jar lines 801-813).
 //! A glyph's ink is `[pen + xoffset, yoffset − adjust − ascent, width,
@@ -19,9 +19,9 @@
 //! A character the primary lacks is looked up in order
 //! (`SkinTextBitmap.java:611-765`): each fallback file; for the wave dash
 //! and the fullwidth tilde, the other one in the primary, then in each
-//! fallback; `□ ▢ ☐ ■ ?` in the primary, then in each fallback; for a
-//! basic-plane character, the primary's missing glyph. Otherwise it is
-//! skipped.
+//! fallback; `□ ▢ ☐ ■ ?` in the primary, then in each fallback; the
+//! primary's missing glyph. Otherwise it is skipped. Every character is
+//! treated alike, whatever its plane.
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
@@ -30,8 +30,6 @@ use crate::image::Sheet;
 use crate::image::fnt::{Fnt, FntGlyph};
 use crate::widget::text::MAX_TEXT_EM;
 
-/// The highest code of the basic plane.
-const MAX_BMP: u32 = 0xFFFF;
 const WAVE_DASH: u32 = 0x301C;
 const FULLWIDTH_TILDE: u32 = 0xFF5E;
 /// `□ ▢ ☐ ■ ?` (`SkinTextBitmap.java:350`).
@@ -113,7 +111,6 @@ struct Pick<'a> {
 
 /// The glyph for `code` by the missing-glyph chain.
 fn pick<'a>(primary: &'a Fnt, fallbacks: &[&'a Fnt], code: u32) -> Option<Pick<'a>> {
-    let bmp = code <= MAX_BMP;
     let own = |code: u32| primary.file.glyph(code).copied();
     let copy = |glyph, font: &'a Fnt| Pick {
         glyph,
@@ -134,24 +131,22 @@ fn pick<'a>(primary: &'a Fnt, fallbacks: &[&'a Fnt], code: u32) -> Option<Pick<'
     };
     if let Some(glyph) = own(code) {
         return Some(Pick {
-            kerns: bmp,
+            kerns: true,
             ..primary_copy(glyph)
         });
     }
     if let Some(p) = in_fallbacks(code) {
         return Some(p);
     }
-    if bmp {
-        let equivalent = match code {
-            WAVE_DASH => Some(FULLWIDTH_TILDE),
-            FULLWIDTH_TILDE => Some(WAVE_DASH),
-            _ => None,
-        };
-        if let Some(e) = equivalent
-            && let Some(p) = own(e).map(primary_copy).or_else(|| in_fallbacks(e))
-        {
-            return Some(p);
-        }
+    let equivalent = match code {
+        WAVE_DASH => Some(FULLWIDTH_TILDE),
+        FULLWIDTH_TILDE => Some(WAVE_DASH),
+        _ => None,
+    };
+    if let Some(e) = equivalent
+        && let Some(p) = own(e).map(primary_copy).or_else(|| in_fallbacks(e))
+    {
+        return Some(p);
     }
     if let Some(p) = MISSING_CANDIDATES
         .iter()
@@ -166,10 +161,7 @@ fn pick<'a>(primary: &'a Fnt, fallbacks: &[&'a Fnt], code: u32) -> Option<Pick<'
     }) {
         return Some(p);
     }
-    if bmp {
-        return primary.file.missing().map(primary_copy);
-    }
-    None
+    primary.file.missing().map(primary_copy)
 }
 
 /// `v` pixels in em of `size`, if within ±[`MAX_TEXT_EM`].
@@ -199,7 +191,7 @@ pub(crate) fn layout(sheet: &Sheet, font: u32, text: &str) -> Option<GlyphLine> 
             continue;
         };
         if let Some(prev) = last {
-            let kern = if prev.kerns && code <= MAX_BMP {
+            let kern = if prev.kerns {
                 i64::from(primary.file.kerning(prev.glyph.code, code))
             } else {
                 0
