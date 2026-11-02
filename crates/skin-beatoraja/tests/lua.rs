@@ -249,15 +249,21 @@ fn the_instruction_limit_counts_both_passes() {
     );
     let over = configured("for i = 1, 10000000 do end");
     assert_eq!(why(import(&over)), LuaWhy::Limit(LuaLimit::Instructions));
-    // Half in each pass is over the cap too.
+    // Most of the cap in each pass is over it in all: the configured pass
+    // starts from what the header pass used.
     let halves = folder(&[(
         "s.luaskin",
         &format!(
-            "for i = 1, 5000000 do end\n{}",
-            skin("", &format!("for i = 1, 5000000 do end\n{DRAW_I}"))
+            "if not skin_config then for i = 1, 6000000 do end end\n{}",
+            skin("", &format!("for i = 1, 6000000 do end\n{DRAW_I}"))
         ),
     )]);
-    assert_eq!(why(import(&halves)), LuaWhy::Limit(LuaLimit::Instructions));
+    let h = header(&halves).unwrap();
+    assert!(h.usage().instructions >= 6_000_000, "{:?}", h.usage());
+    assert_eq!(
+        why(h.import(&Config::defaults(h.header()), &Cancel::new())),
+        LuaWhy::Limit(LuaLimit::Instructions)
+    );
 }
 
 #[test]
