@@ -260,18 +260,29 @@ impl AdjustmentTap {
             .map(|&(_, n)| n)
     }
 
-    /// Forgets every holder, for a recount ([`hold`](Self::hold) each).
-    pub(crate) fn clear_holders(&mut self) {
+    /// Counts the holders again from `held`, each control a device whose
+    /// input reaches the tap holds, without sending them as presses or
+    /// releases; the latch is unverified while `unverified` holds. A held
+    /// set that changes while active is sent as a new baseline.
+    pub(crate) fn recount(
+        &mut self,
+        held: impl Iterator<Item = (DeviceKind, Option<HidProduct>, ControlId)>,
+        unverified: bool,
+    ) {
+        let before = self.held_set();
         self.holders = [0; MAX_TAPPED];
-        self.store_latch();
-    }
-
-    /// Counts a holder of `n` without sending anything: a recount.
-    pub(crate) fn hold(&mut self, n: u8) {
-        if let Some(h) = self.holders.get_mut(usize::from(n)) {
-            *h = h.saturating_add(1);
+        for (kind, product, control) in held {
+            if let Some(h) = self
+                .number(kind, product, control)
+                .and_then(|n| self.holders.get_mut(usize::from(n)))
+            {
+                *h = h.saturating_add(1);
+            }
         }
-        self.store_latch();
+        if self.active && self.pending == Pending::None && self.held_set() != before {
+            self.pending = Pending::Resync;
+        }
+        self.set_unverified(unverified);
     }
 
     /// A button or key `n` of one device went from `was` held to `now`

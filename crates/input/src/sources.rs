@@ -326,9 +326,9 @@ impl SourceSet {
     /// controller of the menu's model is offered to the menu
     /// ([`set_menu`](Self::set_menu)), which acts on it only while active.
     ///
-    /// A tapped control's packet goes to the adjustment tap
-    /// ([`set_adjustment`](Self::set_adjustment)), recording open or not:
-    /// a button's change of held state, or an axis's signed movement
+    /// A tapped control's packet of a device that reaches the adjustment
+    /// tap ([`set_adjustment`](Self::set_adjustment)) goes to it, recording
+    /// open or not: a button's change of held state, or an axis's signed movement
     /// since its last report, read before the position is replaced and
     /// before any conversion to a lane.
     pub fn packet(&mut self, packet: &Packet) -> Admit {
@@ -339,9 +339,11 @@ impl SourceSet {
             return admit;
         };
         let source = device.source;
+        let reaches = adjusts(self.recording.is_some(), device);
         let tapped = self
             .adjust
             .as_ref()
+            .filter(|_| reaches)
             .and_then(|t| t.number(device.kind, device.product, packet.control));
         let foreground = admit == Admit::Record;
         let axis = device
@@ -379,7 +381,7 @@ impl SourceSet {
                 // The state table is full; snapshots of this device may
                 // miss the control from now on, and so may the latch.
                 device.state_lost = true;
-                if let Some(tap) = &mut self.adjust {
+                if reaches && let Some(tap) = &mut self.adjust {
                     tap.set_unverified(true);
                 }
                 if source.is_some()
@@ -429,19 +431,24 @@ impl SourceSet {
     }
 
     /// Sends the adjustment controls to `tap` from now on, recording open
-    /// or not, while it is active; replaces an earlier one. The controls
-    /// the connected devices hold now are counted as its holders.
-    pub fn set_adjustment(&mut self, mut tap: AdjustmentTap) {
-        tap.clear_holders();
-        for d in &self.devices {
-            for &(c, _) in &d.held {
-                if let Some(n) = tap.number(d.kind, d.product, c) {
-                    tap.hold(n);
-                }
-            }
-        }
-        tap.set_unverified(self.devices.iter().any(|d| d.state_lost));
+    /// or not, while it is active; replaces an earlier one. Only the
+    /// devices whose input the play may record reach it: the sources of
+    /// the open recording, else the devices that take part
+    /// ([`set_takes_part`](Self::set_takes_part)). The controls they hold
+    /// now are counted as its holders.
+    pub fn set_adjustment(&mut self, tap: AdjustmentTap) {
         self.adjust = Some(tap);
+        self.recount_adjustment();
+    }
+
+    /// Counts the adjustment tap's holders again, after the devices that
+    /// reach it or the controls they map to changed.
+    fn recount_adjustment(&mut self) {
+        recount(
+            self.adjust.as_mut(),
+            &self.devices,
+            self.recording.is_some(),
+        );
     }
 
     /// The adjustment tap, to set it active at each boundary.
@@ -733,6 +740,7 @@ impl SourceSet {
         match self.devices.iter_mut().find(|d| d.id == device) {
             Some(d) => {
                 d.product = Some(product);
+                self.recount_adjustment();
                 true
             }
             None => false,
@@ -761,6 +769,7 @@ impl SourceSet {
         match self.devices.iter_mut().find(|d| d.id == device) {
             Some(d) => {
                 d.takes_part = takes_part;
+                self.recount_adjustment();
                 true
             }
             None => false,
@@ -790,17 +799,20 @@ impl SourceSet {
         // `remove` keeps the order devices were found in, which gives
         // source ids at the next open.
         let mut removed = self.devices.remove(i);
-        if let Some(tap) = &mut self.adjust {
-            // What it held is released; the latch is verified again once
-            // no device that lost its state is left.
+        if let Some(tap) = &mut self.adjust
+            && adjusts(self.recording.is_some(), &removed)
+        {
+            // What it held is released.
             let foreground = !self.gate.is_tripped();
             for &(c, _) in &removed.held {
                 if let Some(n) = tap.number(removed.kind, removed.product, c) {
                     tap.button(n, true, false, self.batch_at, foreground);
                 }
             }
-            tap.set_unverified(self.devices.iter().any(|d| d.state_lost));
         }
+        // The latch is verified again once no device that lost its state
+        // reaches the tap.
+        self.recount_adjustment();
         removed.held.clear();
         self.spare_held.push(removed.held);
         let Some(source) = removed.source else {
@@ -944,6 +956,7 @@ impl SourceSet {
             },
         });
         snapshot(rec, &self.devices, now);
+        recount(self.adjust.as_mut(), &self.devices, true);
         &rec.start
     }
 
@@ -1039,6 +1052,7 @@ impl SourceSet {
         for d in &mut self.devices {
             d.source = None;
         }
+        self.recount_adjustment();
     }
 
     /// Whether recording is open.
@@ -1149,6 +1163,29 @@ fn snapshot(rec: &mut Recording, devices: &[Device], now: TimeUs) {
                 .filter_map(|(a, p)| p.map(|v| (source, a.control, v))),
         );
     }
+}
+
+/// Whether `device`'s input reaches the adjustment tap: while recording is
+/// open, a source of it; otherwise a device that takes part in the next
+/// opening, as a play could record it.
+const fn adjusts(recording: bool, device: &Device) -> bool {
+    if recording {
+        device.source.is_some()
+    } else {
+        device.takes_part
+    }
+}
+
+/// Counts `tap`'s holders again over the `devices` whose input reaches it.
+fn recount(tap: Option<&mut AdjustmentTap>, devices: &[Device], recording: bool) {
+    let Some(tap) = tap else {
+        return;
+    };
+    let reaching = || devices.iter().filter(move |d| adjusts(recording, d));
+    tap.recount(
+        reaching().flat_map(|d| d.held.iter().map(|&(c, _)| (d.kind, d.product, c))),
+        reaching().any(|d| d.state_lost),
+    );
 }
 
 /// Whether the axis `cap` of a device of `product` is converted as

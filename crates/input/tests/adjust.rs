@@ -315,6 +315,79 @@ fn an_inactive_tap_counts_holders_and_sends_them_on_activation() {
 }
 
 #[test]
+fn only_devices_whose_input_the_play_may_record_reach_the_tap() {
+    let (mut set, mut rx, latch) = rig(false);
+    set.set_takes_part(DeviceId(3), false);
+    batch(&mut set, 10, &[packet(3, TURN, 250)]);
+    batch(&mut set, 20, &[packet(3, TURN, 5)]);
+    assert_eq!(
+        drain(&mut rx),
+        [(10, TapEvent::Resync(0))],
+        "a controller that takes no part"
+    );
+    set.open_recording(TimeUs(25));
+    let _readers = set.take_readers();
+    set.begin_batch(TimeUs(30));
+    set.connect(DeviceId(4), DeviceKind::Keyboard);
+    set.packet(&packet(4, Q, 1));
+    set.end_batch(TimeUs(31));
+    assert_eq!(
+        drain(&mut rx),
+        [],
+        "a keyboard connected during the attempt"
+    );
+    assert!(!latch.read().held);
+    // Once recording closes, the keyboard takes part in the next opening:
+    // what it holds becomes the baseline, with no press.
+    set.close_recording();
+    assert!(latch.read().held);
+    batch(&mut set, 40, &[]);
+    assert_eq!(
+        drain(&mut rx),
+        [(40, TapEvent::Resync(1 << START)), (40, TapEvent::Tick)]
+    );
+}
+
+#[test]
+fn a_device_left_out_of_the_sources_stops_reaching_the_tap_when_recording_opens() {
+    let mut set = SourceSet::new(SourceConfig {
+        max_devices: 2,
+        max_sources: 1,
+        max_held: 8,
+        queue_capacity: 64,
+        max_arrivals: 2,
+    })
+    .unwrap();
+    set.begin_batch(TimeUs(0));
+    set.connect(DeviceId(1), DeviceKind::Keyboard);
+    set.connect(DeviceId(2), DeviceKind::Keyboard);
+    set.end_batch(TimeUs(1));
+    let (mut tap, mut rx) = adjustment_queue(AdjustmentBindings {
+        controls: vec![(TapControl::Key(Q), START)],
+        latched: 1 << START,
+        wrap: None,
+    })
+    .unwrap();
+    let latch = tap.latch();
+    tap.set_active(true);
+    set.set_adjustment(tap);
+    batch(&mut set, 10, &[packet(2, Q, 1)]);
+    assert!(latch.read().held);
+    set.open_recording(TimeUs(15));
+    assert!(!latch.read().held, "keyboard 2 got no source");
+    batch(&mut set, 20, &[packet(2, Q, 0)]);
+    assert_eq!(
+        drain(&mut rx),
+        [
+            (10, TapEvent::Resync(0)),
+            (10, TapEvent::Press(START)),
+            (10, TapEvent::Tick),
+            (20, TapEvent::Resync(0)),
+        ]
+    );
+}
+
+#[test]
 fn a_baseline_sent_on_activation_precedes_the_batch_it_starts() {
     let (mut set, mut rx, _) = rig(false);
     batch(&mut set, 10, &[packet(1, Q, 1), packet(1, Q, 0)]);
