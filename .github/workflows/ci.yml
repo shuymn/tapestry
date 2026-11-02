@@ -67,6 +67,11 @@ jobs:
     timeout-minutes: 45
     permissions:
       contents: read
+    # Line tables keep backtraces' file and line and make the debug
+    # artifacts, and so the cache, much smaller than full debug info.
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
     defaults:
       run:
         shell: bash
@@ -79,6 +84,7 @@ jobs:
           version: 2026.10.25
           install: true
           cache: true
+          cache_save: ${{ github.ref == 'refs/heads/main' }}
       - name: Show toolchain
         run: |
           mise ls --current
@@ -88,6 +94,11 @@ jobs:
           mise exec -- rustc -Vv
       - name: Show runner image
         run: echo "runner image $ImageOS $ImageVersion"
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          cmd-format: mise exec -- {0}
+          cache-bin: false
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Format
         run: mise exec -- cargo fmt --all --check
       - name: Clippy
@@ -118,6 +129,7 @@ jobs:
           version: 2026.10.25
           install: true
           cache: true
+          cache_save: ${{ github.ref == 'refs/heads/main' }}
       - name: Show toolchain
         run: |
           mise ls --current
@@ -127,6 +139,11 @@ jobs:
           mise exec -- rustc -Vv
       - name: Show runner image
         run: echo "runner image $ImageOS $ImageVersion"
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          cmd-format: mise exec -- {0}
+          cache-bin: false
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       # Runs each benchmark once so it keeps building and running
       # (docs/setup.md "Benchmarks"); bench.yml measures.
       - name: Benchmarks run once
@@ -170,6 +187,11 @@ jobs:
     timeout-minutes: 45
     permissions:
       contents: read
+    # Line tables keep backtraces' file and line and make the debug
+    # artifacts, and so the cache, much smaller than full debug info.
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
     defaults:
       run:
         shell: bash
@@ -182,6 +204,7 @@ jobs:
           version: 2026.10.25
           install: true
           cache: true
+          cache_save: ${{ github.ref == 'refs/heads/main' }}
       - name: Show toolchain
         run: |
           mise ls --current
@@ -191,6 +214,11 @@ jobs:
           mise exec -- rustc -Vv
       - name: Show runner image
         run: echo "runner image $ImageOS $ImageVersion"
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          cmd-format: mise exec -- {0}
+          cache-bin: false
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Clippy (dev-tools)
         run: mise exec -- cargo clippy -p player -p game --all-targets --locked --features player/dev-tools,game/dev-tools -- -D warnings
       - name: Development build includes dev-tools (positive control)
@@ -241,6 +269,7 @@ jobs:
           version: 2026.10.25
           install: true
           cache: true
+          cache_save: ${{ github.ref == 'refs/heads/main' }}
       - name: Show toolchain
         run: |
           mise ls --current
@@ -248,6 +277,15 @@ jobs:
           actual=$(mise exec -- rustc --version | cut -d' ' -f2)
           test "$expected" = "$actual"
           mise exec -- rustc -Vv
+      # The fuzz crate is a workspace of its own, with its own lockfile.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          cmd-format: mise exec -- {0}
+          cache-bin: false
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          workspaces: |
+            . -> target
+            fuzz -> target
       - name: Format
         run: mise exec -- cargo fmt --all --check
       - name: Architecture rules
@@ -317,6 +355,7 @@ jobs:
           version: 2026.10.25
           install: true
           cache: true
+          cache_save: ${{ github.ref == 'refs/heads/main' }}
       - name: Show toolchain
         run: |
           mise ls --current
@@ -379,6 +418,7 @@ jobs:
           install: true
           install_args: rust actionlint shellcheck
           cache: true
+          cache_save: ${{ github.ref == 'refs/heads/main' }}
       - name: Banned words
         run: mise exec -- cargo xtask banned-words --all
       - name: actionlint

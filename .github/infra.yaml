@@ -88,4 +88,5 @@ spec:
         - actions/create-github-app-token@*
         - jdx/mise-action@*
         - DeterminateSystems/nix-installer-action@*
+        - Swatinem/rust-cache@*
     fork_pr_approval: all_external_contributors
