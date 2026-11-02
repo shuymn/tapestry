@@ -629,9 +629,9 @@ fn imported_frames(chart: &Chart, overlay: &[&str], glyphs: usize) {
     assert_eq!(full_allocs, 0, "an imported full batch allocated");
 
     // Room for every sprite but one run: the additive mark needs a second
-    // run, so it and everything after it is refused and counted while
-    // sprites are left over, and the overlay follows whole from the
-    // reserve.
+    // run, so it is refused and counted, as is any later quad that cannot
+    // extend the one run (an alpha unclipped quad still can), while
+    // sprites are left over; the overlay follows whole from the reserve.
     let mut narrow = Staging::with_runs(skin.capacity(), 1, &skin.canvas([1920, 1080]));
     narrow.set_clips(b.clips().clone());
     let (refused, run_allocs) = counted(|| {
