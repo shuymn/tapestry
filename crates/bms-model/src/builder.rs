@@ -181,23 +181,25 @@ impl ChartBuilder {
                 tempo: changed.checked_sub(1).map_or(initial, |i| tempos[i].1),
             });
         }
+        // Every endpoint and bar line sits at its row's position.
+        let pos = |id: TimelineId| points[id.index()].pos;
         for note in self.lanes.iter_mut().flatten() {
-            note.pos = scroll.position_at(note.time);
-            let end = note.end();
-            if let NoteKind::Long { end_pos, .. } = &mut note.kind {
-                *end_pos = scroll.position_at(end);
-            }
-            note.anchors = NoteAnchors {
+            let anchors = NoteAnchors {
                 head: row(note.time)?,
-                end: row(end)?,
+                end: row(note.end())?,
             };
+            note.pos = pos(anchors.head);
+            if let NoteKind::Long { end_pos, .. } = &mut note.kind {
+                *end_pos = pos(anchors.end);
+            }
+            note.anchors = anchors;
         }
-        let bar_lines = self.bars.iter().map(|&at| scroll.position_at(at)).collect();
-        let bar_ids = self
+        let bar_ids: Vec<TimelineId> = self
             .bars
             .iter()
             .map(|&at| row(at))
             .collect::<Result<_, _>>()?;
+        let bar_lines = bar_ids.iter().map(|&id| pos(id)).collect();
         let timeline = ChartTimeline::new(points, bar_ids, initial, Speed::NORMAL)
             .map_err(ModelError::Timeline)?;
         let chart = Chart {

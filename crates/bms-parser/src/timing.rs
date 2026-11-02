@@ -330,7 +330,7 @@ pub fn compute(
         initial_rate,
         segments: vec![first(initial_rate)],
         real: None,
-        bar_lines: Vec::with_capacity(usize::from(last_measure) + 1),
+        bar_lines: Vec::with_capacity(charge.bars),
         last_measure: end.measure,
     };
     // The current measure's length in µs at the current BPM, cleared when
