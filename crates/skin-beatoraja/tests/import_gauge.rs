@@ -287,6 +287,7 @@ fn gauge_scalars_are_read_exactly() {
     for (fields, field) in [
         (r#""parts": 3000000000"#, "parts"),
         (r#""parts": 10, "cycle": 3e9"#, "cycle"),
+        (r#""parts": 1e-100"#, "parts"),
     ] {
         match parted(fields).err() {
             ImportError::Range { field: f, .. } => assert_eq!(f, field, "{fields}"),
@@ -372,6 +373,10 @@ fn a_gauge_s_quads_are_admitted_before_its_nodes() {
     }
     // With room for its 10 quads, the unresolved node refuses it.
     refused(spent(1_488, g), "nodes");
+    // A destination with no keys is never drawn: it imports and charges
+    // nothing, the budget spent already.
+    let l = spent(1_489, r#"{"id": "g", "dst": []}"#);
+    assert_eq!(l.report().usage.widget_quads, 16_384);
     // The destination's own checks come first: a key outside `i32`.
     let bad = r#"{"id": "g", "dst": [{"x": 3000000000, "y": 500, "w": 100, "h": 10}]}"#;
     match spent(1_489, bad).err() {

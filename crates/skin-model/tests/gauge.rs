@@ -468,7 +468,8 @@ fn a_short_batch_keeps_the_first_segments_in_order() {
     h.frame(16, &[]);
     let short: Vec<[f32; 4]> = h.batch.quads().iter().map(|q| q.rect).collect();
     assert_eq!(short, full[..100]);
-    assert!(h.batch.dropped() > 0);
+    // The first refused push stops the gauge.
+    assert_eq!(h.batch.dropped(), 1);
 }
 
 fn refused(g: GaugeDef) -> Option<GaugeError> {
