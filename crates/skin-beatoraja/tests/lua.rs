@@ -799,23 +799,48 @@ fn skin_config_follows_the_header_and_its_writes_stay_in_the_pass() {
 }
 
 #[test]
-fn host_modules_load_but_reading_play_state_is_refused() {
+fn host_modules_hold_the_pinned_names_and_refuse_calls() {
+    // The header pass's modules are empty, as the source loads them.
     let d = folder(&[(
         "s.luaskin",
-        "local ms = require(\"main_state\")\nlocal tu = require(\"timer_util\")\n\
-         assert(ms.timer_off_value == math.mininteger and type(tu.now_timer) == \"function\")\n\
+        "if not skin_config then\n\
+           for _, m in ipairs({ \"main_state\", \"timer_util\", \"event_util\" }) do\n\
+             assert(next(require(m)) == nil, m)\n\
+           end\n\
+           return { type = 0 }\n\
+         end\n\
+         local ms = require(\"main_state\")\n\
+         assert(ms.timer_off_value == math.mininteger, \"off value\")\n\
+         assert(ms.event_observe_boolean == nil and ms.lua_version == nil, \"absent\")\n\
+         assert(require(\"event_util\").event_observe_boolean == nil, \"absent event\")\n\
          return { type = 0 }",
     )]);
-    header(&d).unwrap();
-    let d = folder(&[(
-        "s.luaskin",
-        "local ms = require(\"main_state\")\npcall(ms.number, 71)\nreturn { type = 0 }",
-    )]);
-    let w = why(header(&d));
-    let LuaWhy::LiveState { api } = w else {
-        panic!("{w:?}")
-    };
-    assert_eq!(HOST_APIS[usize::from(api)], ("main_state", "number"));
+    let h = header(&d).unwrap();
+    // Each pinned name is a function in its module, and calling it is
+    // refused as reading play state.
+    for (index, &(module, api)) in HOST_APIS.iter().enumerate() {
+        let d = folder(&[(
+            "s.luaskin",
+            &format!(
+                "if not skin_config then return {{ type = 0 }} end\n\
+                 local f = require(\"{module}\").{api}\n\
+                 assert(type(f) == \"function\", \"{api}\")\n\
+                 pcall(f, 1)\n\
+                 return {{ type = 0 }}"
+            ),
+        )]);
+        let h = header(&d).unwrap();
+        let w = why(h.import(&Config::defaults(h.header()), &Cancel::new()));
+        assert_eq!(
+            w,
+            LuaWhy::LiveState {
+                api: u16::try_from(index).unwrap()
+            },
+            "{module}.{api}"
+        );
+    }
+    h.import(&Config::defaults(h.header()), &Cancel::new())
+        .unwrap();
 }
 
 #[test]
