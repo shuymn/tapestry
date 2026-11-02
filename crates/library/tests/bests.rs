@@ -218,20 +218,33 @@ fn random_seeds() -> (u64, u64) {
     (one, two)
 }
 
+/// A play of each draw of `RANDOM_CHART`: the 3-note draw with every note
+/// 30 ms late (EX 3, BP 0, FULL COMBO), and the 4-note draw with three on
+/// time and its last note missed (EX 6, BP 1).
 fn random_plays() -> [PlayRecord; 2] {
     let (one, two) = random_seeds();
-    let press = |at| [key(1, at, 1), key(1, at + 50 * MS, 0)];
-    let mut events = Vec::new();
-    events.extend(press(2_000 * MS));
-    events.extend(press(4_000 * MS));
+    // Keys 1 and 3 at 2 s and key 1 at 4 s, each held 50 ms.
+    let hits = |late: i64| {
+        let at = |t: i64| t * MS + late;
+        vec![
+            key(1, at(2_000), 1),
+            key(3, at(2_000), 1),
+            key(1, at(2_050), 0),
+            key(3, at(2_050), 0),
+            key(1, at(4_000), 1),
+            key(1, at(4_050), 0),
+        ]
+    };
+    let short = hits(30 * MS);
+    let long = hits(0);
     [
-        record_of(RANDOM_CHART, one, events.clone()),
-        record_of(RANDOM_CHART, two, events),
+        record_of(RANDOM_CHART, one, short),
+        record_of(RANDOM_CHART, two, long),
     ]
 }
 
 #[test]
-fn random_charts_get_no_best_and_still_save() {
+fn random_chart_draws_share_the_file_best() {
     let fx = Fixture::new();
     fx.chart("r.bms", RANDOM_CHART);
     let lib = fx.open();
@@ -241,18 +254,44 @@ fn random_charts_get_no_best_and_still_save() {
         plays[0].chart.identity.resolved_hash,
         plays[1].chart.identity.resolved_hash
     );
+    let mut bests = Vec::new();
+    let mut saved = Vec::new();
     for (n, record) in plays.iter().enumerate() {
         let (rel, _) = fx.save(record, &format!("{n}-1.tprl"));
         let c = contribution(&fx.records, &rel, RANDOM_CHART, record);
-        assert_eq!(c.ineligible, Some(Ineligible::RandomChart));
-        lib.best_writer().unwrap().ingest(&c).unwrap();
+        assert_eq!(c.ineligible, None);
+        bests.push(c.best.clone().unwrap());
+        saved.push((rel, record));
     }
-    let none = Score {
+    assert_eq!(
+        (bests[0].ex, bests[0].bp, bests[0].full_combo),
+        (3, 0, true)
+    );
+    assert_eq!(
+        (bests[1].ex, bests[1].bp, bests[1].full_combo),
+        (6, 1, false)
+    );
+    // Each value comes from the draw that holds it: EX from the longer one,
+    // BP and FULL COMBO from the shorter one.
+    let merged = Score {
         plays: 2,
-        best: None,
+        best: Some(Best {
+            ex: 6,
+            bp: 0,
+            cleared: bests[0]
+                .cleared
+                .iter()
+                .zip(&bests[1].cleared)
+                .map(|(a, b)| a | b)
+                .collect(),
+            full_combo: true,
+        }),
     };
-    assert_eq!(score_of(&lib, &plays[0]), Some(none.clone()));
-    // After invalidation, the pass counts both again, with no best.
+    // Live plays in the reverse of the order the rebuild lists them.
+    for (rel, record) in saved.iter().rev() {
+        fx.live(&lib, rel, RANDOM_CHART, record);
+    }
+    assert_eq!(score_of(&lib, &plays[0]), Some(merged.clone()));
     drop(lib);
     sql(&fx.db(), "UPDATE meta SET bests = bests + 1");
     let lib = fx.open();
@@ -260,26 +299,7 @@ fn random_charts_get_no_best_and_still_save() {
     assert_eq!(score_of(&lib, &plays[0]), None);
     let report = fx.pass(&lib);
     assert_eq!(report.bests.counted, 2);
-    assert_eq!(score_of(&lib, &plays[0]), Some(none));
-}
-
-#[test]
-fn random_results_stripped_from_the_record_still_no_best() {
-    let fx = Fixture::new();
-    fx.chart("r.bms", RANDOM_CHART);
-    let [mut record, _] = random_plays();
-    record.chart.identity.random_results.clear();
-    fx.save(&record, "1-1.tprl");
-    let lib = fx.open();
-    let report = fx.pass(&lib);
-    assert_eq!(report.bests.counted, 1, "{report:?}");
-    assert_eq!(
-        score_of(&lib, &record),
-        Some(Score {
-            plays: 1,
-            best: None
-        })
-    );
+    assert_eq!(score_of(&lib, &plays[0]), Some(merged));
 }
 
 #[test]

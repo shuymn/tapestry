@@ -88,7 +88,6 @@ impl BestsRecords {
         };
         let verified = Verified {
             completed: evaluation.completed,
-            random: !play.chart.identity.random_results.is_empty(),
         };
         let c = Contribution::of(
             PlayId::of(rel, record, size, mtime),
@@ -198,7 +197,7 @@ pub const LAMP_COLUMNS: usize = 11;
 
 /// The select screen's cell for a chart: its lamp in [`LAMP_COLUMNS`] and
 /// its best EX in 5; blank when it was never played under the preset, `-`
-/// when it was but has no best (a `#RANDOM` chart, or no eligible play).
+/// when it was but no play set a best.
 pub fn chart_cell(score: Option<&Score>, preset: &RulePreset) -> String {
     let (lamp, ex) = match score {
         None => (String::new(), String::new()),
@@ -331,11 +330,11 @@ mod tests {
             best: Some(cleared(&[3], false)),
         };
         assert_eq!(chart_cell(Some(&scored), &p), "HARD           10");
-        let random = Score {
+        let no_best = Score {
             plays: 2,
             best: None,
         };
-        assert_eq!(chart_cell(Some(&random), &p), "-               -");
+        assert_eq!(chart_cell(Some(&no_best), &p), "-               -");
         assert_eq!(chart_cell(None, &p), " ".repeat(17));
         let mut long = p.clone();
         long.gauges[3].id = "much_harder_than_hard".to_owned();

@@ -142,7 +142,6 @@ pub fn contribution(records: &Path, rel: &str, text: &str, record: &PlayRecord) 
         record,
         &Verified {
             completed: re.evaluation.completed,
-            random: !chart.identity.random_results.is_empty(),
         },
         &re.evaluation,
         &preset,

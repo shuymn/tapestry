@@ -1112,17 +1112,17 @@ mod tests {
 
     /// Each chart line starts with the chart's lamp and best EX under the
     /// chosen preset: blank for a chart never played under it, `-` for one
-    /// played with no best (a `#RANDOM` chart).
+    /// whose plays set no best.
     #[test]
     fn chart_line_shows_lamp_and_ex_of_the_chosen_preset() {
         let mut s = SelectScreen::new(vec![PathBuf::from(r"C:\charts")]);
         let mut scored = entry(r"C:\charts\a\1.bms", "あ");
         scored.sha256 = [1; 32];
         scored.header.playlevel = Some("12".to_owned());
-        let mut random = entry(r"C:\charts\a\2.bms", "い");
-        random.sha256 = [2; 32];
+        let mut no_best = entry(r"C:\charts\a\2.bms", "い");
+        no_best.sha256 = [2; 32];
         let unplayed = entry(r"C:\charts\a\3.bms", "う");
-        s.set_entries(vec![scored, random, unplayed]);
+        s.set_entries(vec![scored, no_best, unplayed]);
         let preset = rules::tapestry();
         s.set_bests_preset(Some(preset.clone()));
         let hard = preset

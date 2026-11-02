@@ -15,20 +15,17 @@ use sha2::{Digest as _, Sha256};
 /// The version of the rules bests are derived by: eligibility, the values
 /// and how a play is identified. A change bumps it, and opening the
 /// database then clears every best and rebuilds them from the records.
-pub const BESTS_VERSION: i64 = 1;
+pub const BESTS_VERSION: i64 = 2;
 
 /// The LN mode bests are keyed by: the only one the evaluator judges, LN.
 pub const LN_MODE: i64 = 1;
 
 /// What verification established about a play, on either path: whether its
-/// evaluation completed, and whether its chart, as loaded, resolved any
-/// `#RANDOM`.
+/// evaluation completed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Verified {
     /// The as-played evaluation reached the final deadline.
     pub completed: bool,
-    /// The chart as loaded resolved a `#RANDOM` or `#SETRANDOM`.
-    pub random: bool,
 }
 
 /// Why a play sets no best, in the order the clauses are checked.
@@ -49,8 +46,6 @@ pub enum Ineligible {
     NotFullPlay,
     /// Played at another speed than 1×.
     NotNormalSpeed,
-    /// The chart resolved a `#RANDOM`.
-    RandomChart,
 }
 
 impl fmt::Display for Ineligible {
@@ -63,14 +58,13 @@ impl fmt::Display for Ineligible {
             Self::EndMismatch => "the end does not match the evaluation",
             Self::NotFullPlay => "not a full play",
             Self::NotNormalSpeed => "not at 1x",
-            Self::RandomChart => "#random chart",
         })
     }
 }
 
 /// The first reason `record` sets no best, `None` when it may: verified,
 /// saved, complete, played to the end (which its evaluation confirms), a
-/// full play at 1×, and of a chart without `#RANDOM`.
+/// full play at 1×. A `#RANDOM` chart's draws share its file's best.
 #[must_use]
 pub fn ineligible(
     record: &PlayRecord,
@@ -97,9 +91,6 @@ pub fn ineligible(
     }
     if record.speed != Speed::NORMAL {
         return Some(Ineligible::NotNormalSpeed);
-    }
-    if verified.random {
-        return Some(Ineligible::RandomChart);
     }
     None
 }
