@@ -174,6 +174,10 @@ pub const IN_PLAY: &[Site] = &[
     Site::File("crates/player/src/input_side.rs"),
     // The logic step and its sinks.
     Site::File("crates/game/src/adjustment.rs"),
+    Site::Fns(
+        "crates/game/src/adjust_keys.rs",
+        &["AdjustmentPlan::observation"],
+    ),
     Site::File("crates/game/src/hispeed.rs"),
     Site::File("crates/game/src/logic.rs"),
     Site::File("crates/game/src/render.rs"),
