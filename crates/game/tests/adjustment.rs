@@ -1403,3 +1403,57 @@ fn same_time_axis_steps_cancel_exactly_at_the_i64_bounds() {
         assert_eq!(g(&rig.snap()), expected, "{deltas:?}");
     }
 }
+
+/// `log` from a fresh reducer with `options` at 150 BPM, drained at each of
+/// `splits`; the publication counter cleared.
+fn drained(options: PlayOptions, log: &[Observation], splits: &[usize]) -> PresentationSnapshot {
+    let map = constant(150);
+    let mut a = Adjustment::new(options, roles(), TimeUs(-2_000_000), 0);
+    let (mut w, mut r) = presentation_link(&a.snapshot());
+    let mut from = 0;
+    for &to in splits.iter().chain([&log.len()]) {
+        a.drain(log[from..to].iter().copied(), &map, &mut w);
+        from = to;
+    }
+    let mut s = *r.read();
+    s.sequence = 0;
+    s
+}
+
+#[test]
+fn an_opposite_press_takes_back_a_repeat_at_its_time_in_either_order() {
+    let o = options(SpeedMode::Classic, 200, 300, sudden(500));
+    for tick_first in [true, false] {
+        let mut rig = Rig::prepared(o, constant(150));
+        rig.at(0).press(START).press(SCRATCH_POS);
+        for t in (50..=450).step_by(50) {
+            rig.at(t * MS).ev(Event::Tick);
+        }
+        // At 500 ms the held direction's repeat is accelerated (+10).
+        rig.at(500 * MS);
+        if tick_first {
+            rig.ev(Event::Tick).press(SCRATCH_NEG);
+        } else {
+            rig.press(SCRATCH_NEG).ev(Event::Tick);
+        }
+        for t in (550..=800).step_by(50) {
+            rig.at(t * MS).ev(Event::Tick);
+        }
+        rig.now += 1;
+        rig.ev(Event::Tick);
+        let log = rig.log.clone();
+        let whole = drained(o, &log, &[]);
+        assert_eq!(
+            whole.options.covers().sudden.amount,
+            510,
+            "tick first: {tick_first}"
+        );
+        for i in 0..=log.len() {
+            assert_eq!(
+                drained(o, &log, &[i]),
+                whole,
+                "tick first: {tick_first}, split {i}"
+            );
+        }
+    }
+}

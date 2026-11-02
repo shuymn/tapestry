@@ -297,6 +297,9 @@ enum Hold {
         pressed: TimeUs,
         /// The next repeat, for a digital scratch.
         next: TimeUs,
+        /// A digital scratch's request in the open group, and its time: an
+        /// opposite press at that time takes it back.
+        pending: Option<(TimeUs, Request)>,
     },
 }
 
@@ -329,6 +332,36 @@ enum Request {
     Fine(i128),
     Green(i128),
     Cover(i128),
+}
+
+impl Request {
+    /// The two requests together; one control's requests at one time are
+    /// of one kind, its context's.
+    const fn plus(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Coarse(a), Self::Coarse(b)) => Self::Coarse(a.saturating_add(b)),
+            (Self::Fine(a), Self::Fine(b)) => Self::Fine(a.saturating_add(b)),
+            (Self::Green(a), Self::Green(b)) => Self::Green(a.saturating_add(b)),
+            (Self::Cover(a), Self::Cover(b)) => Self::Cover(a.saturating_add(b)),
+            (_, other) => other,
+        }
+    }
+}
+
+impl Group {
+    /// Takes `request` back out of the group open at `time`.
+    const fn retract(&mut self, time: TimeUs, request: Request) {
+        if !self.open || self.time.0 != time.0 {
+            return;
+        }
+        let (field, by) = match request {
+            Request::Coarse(by) => (&mut self.coarse, by),
+            Request::Fine(by) => (&mut self.fine, by),
+            Request::Green(by) => (&mut self.green, by),
+            Request::Cover(by) => (&mut self.cover, by),
+        };
+        *field = field.saturating_sub(by);
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -601,6 +634,7 @@ impl Adjustment {
             suppressed: false,
             pressed: time,
             next: TimeUs(time.0.saturating_add(REPEAT_US)),
+            pending: None,
         };
         match role {
             Role::Start | Role::Select => {
@@ -621,21 +655,22 @@ impl Adjustment {
                     Role::ScratchPositive
                 };
                 let mut clash = false;
-                // Opposite presses at this time and context whose step is
-                // still in the open group: this press's step cancels each.
-                let mut cancel = 0;
+                let group = &mut self.group;
                 for h in &mut self.holds {
                     if let Hold::Held {
                         role: r,
                         suppressed,
-                        pressed,
-                        context: c,
+                        pending,
                         ..
                     } = h
                         && *r == opposite
                     {
-                        if !*suppressed && *pressed == time && *c == context {
-                            cancel += 1;
+                        // What it asked at this time, press or repeat, is
+                        // taken back: neither direction acts at this time.
+                        if let Some((at, request)) = pending.take()
+                            && at == time
+                        {
+                            group.retract(time, request);
                         }
                         *suppressed = true;
                         clash = true;
@@ -647,9 +682,9 @@ impl Adjustment {
                     {
                         *suppressed = true;
                     }
-                    self.act_steps(role, cancel, 1, time);
                 } else {
-                    self.act(role, 1, time);
+                    let request = self.act(role, 1, time);
+                    self.note(control, time, request);
                 }
             }
             _ => {
@@ -760,15 +795,16 @@ impl Adjustment {
             return;
         }
         let context = self.context;
-        let mut steps = [(Role::ScratchPositive, 0_i64); MAX_CONTROLS];
+        let mut steps = [(ControlId(0), Role::ScratchPositive, 0_i64); MAX_CONTROLS];
         let mut n = 0;
-        for h in &mut self.holds {
+        for (i, h) in self.holds.iter_mut().enumerate() {
             if let Hold::Held {
                 role: role @ (Role::ScratchPositive | Role::ScratchNegative),
                 context: c,
                 suppressed: false,
                 pressed,
                 next,
+                ..
             } = h
             {
                 if *c != context || time < *next {
@@ -782,14 +818,29 @@ impl Adjustment {
                 } else {
                     1
                 };
-                if let Some(slot) = steps.get_mut(n) {
-                    *slot = (*role, q);
+                if let (Some(slot), Ok(i)) = (steps.get_mut(n), u8::try_from(i)) {
+                    *slot = (ControlId(i), *role, q);
                     n += 1;
                 }
             }
         }
-        for &(role, q) in steps.iter().take(n) {
-            self.act(role, q, time);
+        for &(control, role, q) in steps.iter().take(n) {
+            let request = self.act(role, q, time);
+            self.note(control, time, request);
+        }
+    }
+
+    /// Keeps a digital scratch's `request` at `time` with its control, to
+    /// take back if an opposite press comes at the same time.
+    fn note(&mut self, control: ControlId, time: TimeUs, request: Option<Request>) {
+        let Some(request) = request else {
+            return;
+        };
+        if let Some(Hold::Held { pending, .. }) = self.holds.get_mut(usize::from(control.0)) {
+            *pending = Some(match *pending {
+                Some((at, earlier)) if at == time => (time, earlier.plus(request)),
+                _ => (time, request),
+            });
         }
     }
 
@@ -1015,6 +1066,7 @@ impl Adjustment {
                 suppressed: true,
                 pressed: TimeUs(0),
                 next: TimeUs(i64::MAX),
+                pending: None,
             };
         }
         self.lost = false;
