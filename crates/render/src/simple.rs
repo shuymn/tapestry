@@ -598,6 +598,18 @@ impl PlaySkin for SimpleSkin {
         Ok(())
     }
 
+    /// What the effects built up starts over: no note held, done, pressed
+    /// or hit, and no judgment shown; the chart stays.
+    fn rearm(&mut self) {
+        for bits in self.held.iter_mut().chain(&mut self.done) {
+            bits.0.fill(0);
+        }
+        self.active = [None; LANE_COUNT];
+        self.pressed = [None; LANE_COUNT];
+        self.hit = [None; LANE_COUNT];
+        self.judgment = None;
+    }
+
     /// Never refuses a frame.
     fn build(&mut self, f: &FrameInput<'_>, out: &mut SpriteBatch) -> Result<(), BuildError> {
         for ev in f.effects {

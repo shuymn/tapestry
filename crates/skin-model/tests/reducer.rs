@@ -323,6 +323,38 @@ fn every_split_of_the_script_reaches_the_same_states() {
     }
 }
 
+/// A READY rearm (design.md "Play Lifecycle", the start gate) starts the
+/// attempt's runtime over in place (`Play::rearm`): after the whole script
+/// built up the reducer and every timer, nothing is on, and the script
+/// played again reaches, frame by frame, what a fresh attempt does.
+#[test]
+fn a_rearm_starts_the_runtime_over_as_a_fresh_attempt() {
+    let chart = script_chart();
+    let events = script();
+    let mut h = Harness::new(mine_when_skin(), &chart, &full(1_000));
+    let mut fresh = Harness::new(mine_when_skin(), &chart, &full(1_000));
+    h.gauges[0] = state(GaugeValue::FULL);
+    fresh.gauges[0] = state(GaugeValue::FULL);
+    h.frame_us(2_500 * MS, &events);
+    h.play.rearm();
+    for slot in 0..=timer::BUILTIN {
+        assert_eq!(h.start(slot), None, "slot {slot} after the rearm");
+    }
+    for (k, e) in events.iter().enumerate() {
+        let drain = std::slice::from_ref(e);
+        h.frame_us(e.time.0, drain);
+        fresh.frame_us(e.time.0, drain);
+        for slot in 0..=timer::BUILTIN {
+            assert_eq!(h.start(slot), fresh.start(slot), "slot {slot} after {k}");
+        }
+        assert_eq!(
+            h.play.state().fields,
+            fresh.play.state().fields,
+            "after {k}"
+        );
+    }
+}
+
 fn ln_chart() -> Chart {
     ChartBuilder::new(BPM_150)
         .long(lane(2), TimeUs(1_000 * MS), TimeUs(1_300 * MS))

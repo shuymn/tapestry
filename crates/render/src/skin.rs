@@ -217,6 +217,12 @@ pub trait PlaySkin: Send {
     /// The model's [`BuildError`] for a frame it cannot build.
     fn build(&mut self, f: &FrameInput<'_>, out: &mut SpriteBatch) -> Result<(), BuildError>;
 
+    /// The prepared attempt's READY candidate was rearmed (design.md "Play
+    /// Lifecycle", the start gate): its runtime state (what the effects
+    /// built up, the timers) starts over in place, its chart and text
+    /// resources kept, allocating nothing. Nothing by default.
+    fn rearm(&mut self) {}
+
     /// The most sprites a frame of the skin pushes: the renderer's batch,
     /// staging and instance buffer hold this many, and never fewer than
     /// [`MAX_SPRITES`], which the built-in screens use, and the

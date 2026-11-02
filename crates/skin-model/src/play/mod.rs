@@ -411,6 +411,18 @@ impl Play {
         })
     }
 
+    /// Starts the attempt's runtime state over for a rearmed READY
+    /// candidate (design.md "Play Lifecycle", the start gate), in place:
+    /// the reducer, every timer and the beat, as a fresh attempt has them.
+    /// The chart's notes, the gauges, the attached and bitmap text and a
+    /// refused build stay, and nothing is allocated.
+    pub fn rearm(&mut self) {
+        self.reducer.rearm();
+        self.starts.fill(None);
+        self.ms.fill(TIMER_OFF);
+        self.beat = None;
+    }
+
     /// The bar groups the play holds work for.
     pub(crate) fn bar_capacity(&self) -> usize {
         self.bars.as_ref().map_or(0, |b| b.capacity())

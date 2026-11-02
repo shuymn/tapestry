@@ -591,6 +591,11 @@ impl Screen for MenuScreen {
     }
 
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn rearm(&mut self) {
+        self.renderer.rearm();
+    }
+
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn build(&mut self, f: &render::FrameInput<'_>) -> Result<(), skin_model::BuildError> {
         self.renderer.build(f)
     }

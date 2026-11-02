@@ -208,6 +208,10 @@ pub trait Screen: Send {
     /// again; the screen stays usable, and the next attempt's preparation
     /// builds again.
     fn build(&mut self, f: &FrameInput<'_>) -> Result<(), BuildError>;
+    /// The play's READY candidate was rearmed (design.md "Play Lifecycle",
+    /// the start gate): the skin's runtime state for the attempt starts
+    /// over, its chart and text resources kept. Nothing by default.
+    fn rearm(&mut self) {}
     /// Draws the play frame [`build`](Self::build) built;
     /// [`FrameTiming::presented`] is `false` when it was not presented (the
     /// swap chain image timed out or the window is occluded).
@@ -2036,15 +2040,17 @@ impl Run {
                     // At most what the buffer holds: the logic step can push
                     // during the drain, and the rest waits for the next
                     // frame.
-                    let room = effects.capacity();
-                    side.drain_effects_up_to(room, |e| effects.push(*e));
-                    // A rearmed READY candidate is drawn from its own origin;
-                    // the cancelled one's effects never reach the frame.
+                    // A rearmed READY candidate is drawn from its own origin,
+                    // the skin's runtime starting over first; the drain
+                    // after it never hands over the cancelled one's effects.
                     let rearmed = side.rearms();
                     if rearmed != *rearms {
                         *rearms = rearmed;
                         *origin = side.rearmed_origin();
+                        screen.rearm();
                     }
+                    let room = effects.capacity();
+                    side.drain_effects_up_to(room, |e| effects.push(*e));
                     let now = TimeUs(self.clock.now().0 - origin.0);
                     // Hi-speed and the display offset change anytime and move
                     // the notes only: they reach the screen here and nowhere

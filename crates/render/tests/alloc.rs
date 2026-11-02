@@ -611,6 +611,46 @@ fn imported_frames(chart: &Chart, overlay: &[&str], glyphs: usize) {
     );
     assert_eq!(overlay_drawn(&staging), glyphs, "the overlay was cut");
 
+    // A READY rearm (design.md "Play Lifecycle", the start gate): after
+    // judgments built up the attempt's runtime, it starts over in place,
+    // its prepared bitmap text still attached, so the frame after it is
+    // the fresh attempt's first, and nothing allocates.
+    let mut fresh = DeclSkin::new(b.clone());
+    fresh.prepare(r.gpu(), &a).unwrap();
+    frame(&mut staging, &mut fresh, 0).unwrap();
+    let first_frame = staging.instances().to_vec();
+    let t = chart.lanes[1][0].time;
+    let judged = [JudgeEvent {
+        seq: 0,
+        time: t,
+        origin: Some(t),
+        kind: JudgeEventKind::Judged {
+            lane: lane(1),
+            note: 0,
+            judgment: Judgment::Great,
+            deviation: Some(TimeUs(0)),
+            release: None,
+            combo: 1,
+        },
+    }];
+    let judging = FrameInput {
+        overlay,
+        ..input(&v, t, TimeUs(8 * MS), &judged)
+    };
+    staging.build(&mut skin, &judging).unwrap();
+    let (rearmed, rearm_allocs) = counted(|| {
+        skin.rearm();
+        frame(&mut staging, &mut skin, 0)
+    });
+    let (quads, _) = rearmed.unwrap();
+    assert!(quads >= glyphs + 9, "the bitmap text was dropped: {quads}");
+    assert_eq!(
+        staging.instances(),
+        &first_frame[..],
+        "the runtime did not start over"
+    );
+    assert_eq!(rearm_allocs, 0, "a rearm or the frame after it allocated");
+
     // A batch of 4 sprites in 2 runs: the skin's quads refused and
     // counted, the overlay whole from its reserve.
     let mut small = Staging::with_runs(4, 2, &skin.canvas([1920, 1080]));

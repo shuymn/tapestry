@@ -631,6 +631,14 @@ impl PlaySkin for DeclSkin {
         Ok(())
     }
 
+    /// The attempt's `Play` starts its runtime over in place
+    /// ([`Play::rearm`]), its notes and its attached and bitmap text kept.
+    fn rearm(&mut self) {
+        if let Some(play) = &mut self.play {
+            play.rearm();
+        }
+    }
+
     /// The model's build of the attempt's `Play` into the batch; nothing
     /// without one.
     fn build(&mut self, f: &FrameInput<'_>, out: &mut SpriteBatch) -> Result<(), BuildError> {
