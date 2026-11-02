@@ -723,7 +723,9 @@ fn choosing_the_chart_again_waits_for_its_background_measurement() {
 
 /// Closing the window while the background measures stops it: the run
 /// ends without waiting for it, nothing of it is stored, and the next run
-/// measures the chart in its load.
+/// measures the chart in its load. The end's stop bound only catches a
+/// measurement that never stops: a loaded machine starves its
+/// background-mode thread past the production 2 s.
 #[test]
 fn closing_while_measuring_in_the_background_stores_nothing() {
     let fx = fixture();
@@ -731,7 +733,7 @@ fn closing_while_measuring_in_the_background_stores_nothing() {
     let out = select(
         &fx,
         "slow-measuring=5000,pick=a.bms,quit-measuring,enter,background=running,close",
-        &[],
+        &["--dev-stop-timeout", "600"],
     )
     .output()
     .unwrap();
