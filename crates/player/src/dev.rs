@@ -214,7 +214,9 @@ impl Options {
     ///
     /// # Errors
     ///
-    /// The start gate asked for and refused ([`install_start_gate`]).
+    /// The start gate asked for and refused: what the bindings' plan
+    /// refuses ([`game::AdjustKeyError`]: START or SELECT on a key bound to
+    /// retry, quit or a lane), or what the tap refuses.
     pub fn tune(
         self,
         rig: &mut crate::play::PlayerRig<'_>,
@@ -1347,14 +1349,9 @@ fn crc32(data: &[u8]) -> u32 {
 /// Installs a start gate on the default adjustment bindings (START on Q,
 /// SELECT on W) in a development run's rig (`--dev-start-gate`; design.md
 /// "Play Lifecycle", the start gate), planned against `device`'s key
-/// configs, the ones the play's input uses.
-///
-/// # Errors
-///
-/// What the bindings' plan refuses ([`game::AdjustKeyError`]: START or
-/// SELECT on a key bound to retry, quit or a lane), or what the tap
-/// refuses.
-pub fn install_start_gate(
+/// configs, the ones the play's input uses; [`Options::tune`] is its one
+/// caller.
+fn install_start_gate(
     rig: &mut crate::play::PlayerRig<'_>,
     device: &game::DeviceSettings,
 ) -> anyhow::Result<()> {
