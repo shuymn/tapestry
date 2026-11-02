@@ -611,6 +611,64 @@ fn imported_frames(chart: &Chart, overlay: &[&str], glyphs: usize) {
     );
     assert_eq!(overlay_drawn(&staging), glyphs, "the overlay was cut");
 
+    // A READY rearm (design.md "Play Lifecycle", the start gate): after
+    // lane 1's long note was held (the skin draws a held body with
+    // another image, from the reducer's hold), the attempt starts over in
+    // place, its prepared bitmap text still attached: the frame inside
+    // that note after the rearm is a fresh attempt's, its body not held,
+    // and nothing allocates.
+    let (index, long) = chart.lanes[1]
+        .iter()
+        .enumerate()
+        .find(|(_, n)| matches!(n.kind, bms_model::NoteKind::Long { .. }))
+        .unwrap();
+    let t = long.time;
+    let inside = FrameInput {
+        overlay,
+        ..input(&v, TimeUs(t.0 + 100 * MS), TimeUs(8 * MS), &[])
+    };
+    let mut fresh = DeclSkin::new(b.clone());
+    fresh.prepare(r.gpu(), &a).unwrap();
+    staging.build(&mut fresh, &inside).unwrap();
+    let first_frame = staging.instances().to_vec();
+    let held = [JudgeEvent {
+        seq: 0,
+        time: t,
+        origin: Some(t),
+        kind: JudgeEventKind::LnHeld {
+            lane: lane(1),
+            note: index,
+            judgment: Judgment::Great,
+            deviation: TimeUs(0),
+        },
+    }];
+    let holding = FrameInput {
+        overlay,
+        ..input(&v, t, TimeUs(8 * MS), &held)
+    };
+    staging.build(&mut skin, &holding).unwrap();
+    // Held, its body draws the active image.
+    staging.build(&mut skin, &inside).unwrap();
+    assert_ne!(
+        staging.instances(),
+        &first_frame[..],
+        "the hold changed nothing"
+    );
+    let (rearmed, rearm_allocs) = counted(|| {
+        skin.rearm();
+        staging
+            .build(&mut skin, &inside)
+            .map(|()| (staging.instances().len(), resolve(&staging)))
+    });
+    let (quads, _) = rearmed.unwrap();
+    assert!(quads >= glyphs + 9, "the bitmap text was dropped: {quads}");
+    assert_eq!(
+        staging.instances(),
+        &first_frame[..],
+        "the runtime did not start over"
+    );
+    assert_eq!(rearm_allocs, 0, "a rearm or the frame after it allocated");
+
     // A batch of 4 sprites in 2 runs: the skin's quads refused and
     // counted, the overlay whole from its reserve.
     let mut small = Staging::with_runs(4, 2, &skin.canvas([1920, 1080]));

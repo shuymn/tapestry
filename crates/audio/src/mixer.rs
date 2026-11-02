@@ -153,6 +153,15 @@ impl Slots {
         }
     }
 
+    /// Every slot idle again, `voices` of each; allocates only when
+    /// `voices` is more than the slots hold.
+    pub(crate) fn reset(&mut self, voices: usize) {
+        for slots in [&mut self.voices, &mut self.releases] {
+            slots.clear();
+            slots.resize(voices, Voice::IDLE);
+        }
+    }
+
     pub(crate) fn all(&self) -> impl Iterator<Item = &Voice> {
         self.voices.iter().chain(&self.releases)
     }

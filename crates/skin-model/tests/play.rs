@@ -1529,8 +1529,9 @@ fn an_attempts_state_counts_its_buffers() {
     assert!(notes >= base + 100 * 16, "{base} {notes}");
 }
 
-/// Each gauge adds its descriptor and the reducer's record of its maximum
-/// and when it reached it, no more and no less.
+/// Each gauge adds its descriptor and the reducer's record of its maximum,
+/// when it reached it and when it did as the attempt started (what a
+/// READY rearm restores), no more and no less.
 #[test]
 fn an_attempts_state_counts_each_gauge() {
     let chart = ChartBuilder::new(BPM_150).build().unwrap();
@@ -1543,6 +1544,6 @@ fn an_attempts_state_counts_each_gauge() {
     };
     let one = bytes(&GAUGES[..1]);
     let three = bytes(&[GAUGES[0], GAUGES[1], GAUGES[0]]);
-    let each = size_of::<GaugeDesc>() + size_of::<Option<TimeUs>>() + size_of::<GaugeValue>();
+    let each = size_of::<GaugeDesc>() + 2 * size_of::<Option<TimeUs>>() + size_of::<GaugeValue>();
     assert_eq!(three - one, 2 * each as u64);
 }

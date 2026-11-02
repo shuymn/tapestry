@@ -141,4 +141,85 @@ fn audio_loop_neither_allocates_nor_frees_across_retries() {
         assert!(n < 200, "never done");
     }
     assert_eq!(counting::calls(), 0);
+    // Three gated practice attempts with one rearm each, the game thread
+    // taking back none of the restores the rearms replace: the first fills
+    // the return queue, the second's waits on the audio thread, and the
+    // third rearm is set aside rather than free either there. Its
+    // cancellation is still taken and acknowledged, and so is the exit,
+    // with every restore still owned.
+    let gate = input::StartGate::new();
+    let transport = |generation| game::TransportGate {
+        gate: gate.clone(),
+        generation,
+        commit_at: TimeUs(1_000 * MS),
+    };
+    let mut generation = 0;
+    for attempt in 0..3 {
+        let written = i64::try_from(worker.engine().written()).unwrap();
+        let origin = TimeUs(written * 1_000 / 48 + 10 * MS - 800 * MS);
+        let line = control.counters().frame_line(origin);
+        let plan = restorer.plan(line, TimeUs(1_000 * MS)).unwrap();
+        let spare = plan.clone();
+        generation += 1;
+        gate.arm(generation);
+        let (_sink, queue) = audio_link_at(64, origin);
+        control
+            .play_gated(
+                origin,
+                queue,
+                audio::Gain::HEADROOM,
+                Some(plan),
+                transport(generation),
+            )
+            .unwrap();
+        steps(&mut worker, 2);
+        assert_eq!(gate.cancel(), Some(generation));
+        control.cancel();
+        steps(&mut worker, 2);
+        assert!(control.counters().dropped(generation));
+        generation += 1;
+        gate.arm(generation);
+        control.rearm(origin, transport(generation), Some(spare));
+        steps(&mut worker, 2);
+        assert_eq!(gate.cancel(), Some(generation));
+        control.cancel();
+        steps(&mut worker, 2);
+        assert!(control.counters().dropped(generation), "attempt {attempt}");
+    }
+    // The set-aside restore now waits to go back: a second cancel, then
+    // another play and its cancel, still free nothing.
+    control.cancel();
+    steps(&mut worker, 2);
+    let written = i64::try_from(worker.engine().written()).unwrap();
+    let origin = TimeUs(written * 1_000 / 48 + 10 * MS - 800 * MS);
+    let plan = restorer
+        .plan(control.counters().frame_line(origin), TimeUs(1_000 * MS))
+        .unwrap();
+    generation += 1;
+    gate.arm(generation);
+    let (_sink, queue) = audio_link_at(64, origin);
+    control
+        .play_gated(
+            origin,
+            queue,
+            audio::Gain::HEADROOM,
+            Some(plan),
+            transport(generation),
+        )
+        .unwrap();
+    steps(&mut worker, 2);
+    assert_eq!(gate.cancel(), Some(generation));
+    control.cancel();
+    control.cancel();
+    steps(&mut worker, 2);
+    assert!(control.counters().dropped(generation), "the last play");
+    control.exit();
+    counting::track(true);
+    let running = worker.step(&mut out).unwrap();
+    counting::track(false);
+    assert!(!running, "the exit was not taken");
+    assert_eq!(counting::calls(), 0, "the audio thread allocated or freed");
+    // The restores the game thread never took are still owned, and go
+    // back once it takes them.
+    assert!(control.take_restore().is_some());
 }

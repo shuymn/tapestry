@@ -48,6 +48,7 @@ mod result_input;
 mod select;
 mod selection;
 mod shelf;
+mod start_gate;
 mod tuning;
 mod window;
 
@@ -184,6 +185,11 @@ fn play_command(p: args::Play, clock: QpcClock) -> ExitCode {
             rig.adjust_at = TimeUs(dev_options.adjust_at_ms.saturating_mul(1_000));
             rig.adjust_on_end = dev_options.adjust_on_end;
             rig.result_script = dev_options.result;
+            if dev_options.start_gate
+                && let Err(e) = dev::install_start_gate(rig)
+            {
+                eprintln!("dev: the start gate cannot be installed: {e}");
+            }
         }));
     }
     report(play(
@@ -797,6 +803,8 @@ fn rig<'a>(
         adjust_on_end: Vec::new(),
         selection: None,
         gain: audio::Gain::HEADROOM,
+        // Production plays run without the start gate until S10-04b.
+        gate: None,
     }
 }
 

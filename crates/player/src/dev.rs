@@ -196,6 +196,11 @@ pub struct Options {
     /// Play a mid-chart start from this time of the chart's 1× time to its
     /// end (`--dev-start <ms>`; design.md "Shortening Launch-Based Checks").
     pub start: Option<TimeUs>,
+    /// Run the plays through the start gate (`--dev-start-gate`; design.md
+    /// "Play Lifecycle", the start gate) on the default bindings: each
+    /// READY a candidate START or SELECT cancels before its transport
+    /// commits. Production plays run without it until S10-04b.
+    pub start_gate: bool,
 }
 
 impl Options {
@@ -244,6 +249,7 @@ impl Options {
             "dev-overlay" => self.overlay = true,
             "dev-headless" => self.headless = true,
             "dev-perfect" => self.perfect = true,
+            "dev-start-gate" => self.start_gate = true,
             "dev-adjust-at" => {
                 self.adjust_at_ms = p.value()?.to_string_lossy().parse().map_err(|_| {
                     UsageError::Usage("--dev-adjust-at takes milliseconds".to_owned())
@@ -1300,6 +1306,28 @@ fn crc32(data: &[u8]) -> u32 {
         }
     }
     !c
+}
+
+/// Installs a start gate on the default bindings (START on Q, SELECT on W)
+/// in a development run's rig (`--dev-start-gate`; design.md "Play
+/// Lifecycle", the start gate).
+///
+/// # Errors
+///
+/// What the bindings' plan or the tap refuses.
+pub fn install_start_gate(rig: &mut crate::play::PlayerRig<'_>) -> anyhow::Result<()> {
+    let d = game::DeviceSettings::default();
+    let keys = game::KeyConfigs {
+        keyboard: d.keyboard,
+        controller: d.controller,
+        controller_device: None,
+    };
+    let plan = game::AdjustmentConfig::default().plan(&keys, None, None)?;
+    rig.gate = Some(crate::start_gate::PlayerGate::install(
+        &rig.input,
+        plan.bindings,
+    )?);
+    Ok(())
 }
 
 #[cfg(test)]

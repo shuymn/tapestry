@@ -48,6 +48,10 @@ pub const INPUT_TIMEOUT: Duration = Duration::from_secs(2);
 /// again.
 const WAIT_SLICE: Duration = Duration::from_millis(50);
 
+/// How long the game thread sleeps between looks for a rearm's answer,
+/// which the input thread gives at its next boundary.
+const REARM_POLL: Duration = Duration::from_micros(200);
+
 /// The time the system has been awake, which stands still during a suspend
 /// (`QueryUnbiasedInterruptTime`), so a suspend during a handshake does
 /// not count against [`INPUT_TIMEOUT`].
@@ -71,9 +75,18 @@ pub enum Request {
         logic: Thread,
         /// What the play records.
         recorded: Recorded,
+        /// With the start gate (design.md "Play Lifecycle", the start
+        /// gate), the READY candidate's generation: recording opens only
+        /// where START and SELECT are verifiably released
+        /// ([`input::SourceSet::open_candidate`]), else the opening is
+        /// deferred ([`Reply::Deferred`]).
+        gate: Option<u32>,
     },
     /// Close recording at the next boundary.
     Close,
+    /// The adjustment controls' tap from now on, whose hold latch and
+    /// start gate the gated openings and rearms use. Not answered.
+    Tap(Box<input::AdjustmentTap>),
     /// Nothing waits on the input thread's publications until the next
     /// open: it stops its heartbeat. Not answered; ignored while
     /// recording is open.
@@ -123,6 +136,57 @@ pub enum Reply {
     Opened(Opening<SourceReader>, Vec<String>),
     /// Recording is closed.
     Closed(Closing, Vec<String>),
+    /// A gated opening found START or SELECT held, or possibly held:
+    /// nothing opened.
+    Deferred,
+}
+
+/// A rearm of the READY candidate (design.md "Play Lifecycle", the start
+/// gate), exchanged whole between the game thread and the input thread
+/// through a bounded queue, so the exchange allocates nothing: the
+/// readers go to the input thread and come back, and the buffers, reserved
+/// with the play's setup, carry what the input thread found.
+#[derive(Debug)]
+pub struct Rearm {
+    /// The attempt's readers, drained by the game thread into the
+    /// cancelled opening's history.
+    pub readers: Vec<SourceReader>,
+    /// READY's length.
+    pub lead_in: TimeUs,
+    /// The next candidate's generation.
+    pub generation: u32,
+    /// The next opening's held-input snapshot, copied within its capacity.
+    pub start: eval::InputStart,
+    /// The sealed opening's arrivals, within the capacity.
+    pub arrivals: Vec<input::Arrival>,
+    /// The sealed opening's events pushed after the game thread's last
+    /// drain, within the capacity.
+    pub leftover: Vec<eval::PhysicalInputEvent>,
+    /// How many of them the history still takes: more refuses the rearm.
+    pub room: usize,
+    /// What the input thread did.
+    pub outcome: RearmOutcome,
+}
+
+/// What a [`Rearm`] did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RearmOutcome {
+    /// Not yet taken.
+    Pending,
+    /// START or SELECT is held: nothing changed.
+    Held,
+    /// The cancelled opening was sealed at `closed` on its own timeline,
+    /// and the next opened with chart time 0 at `origin` on the clock.
+    Opened {
+        /// Where the next candidate's chart time 0 lies.
+        origin: TimeUs,
+        /// When the sealed opening closed, on its timeline.
+        closed: TimeUs,
+    },
+    /// The sealed opening's events or arrivals did not fit their buffers,
+    /// or the queues did not reopen: nothing opened, and the capture is
+    /// sealed.
+    Refused,
 }
 
 /// What the input thread publishes between requests.
@@ -152,6 +216,9 @@ pub struct InputLink {
     /// reply read, so a late reply to a request that timed out is never
     /// taken for the answer to another.
     failed: Option<InputWaitError>,
+    /// Rearms to the input thread, and back ([`rearm`](Self::rearm)).
+    rearms: rtrb::Producer<Box<Rearm>>,
+    rearmed: rtrb::Consumer<Box<Rearm>>,
 }
 
 impl InputLink {
@@ -162,13 +229,75 @@ impl InputLink {
     /// [`InputWaitError`] if the input thread is gone or did not answer
     /// within [`INPUT_TIMEOUT`], now or at an earlier handshake.
     pub fn open(&mut self, request: Request) -> Result<Opening<SourceReader>, InputWaitError> {
+        match self.open_candidate(request)? {
+            Some(o) => Ok(o),
+            None => unreachable!("an ungated open is never deferred"),
+        }
+    }
+
+    /// Opens recording for a play, or a gated play's READY candidate:
+    /// `None` when the input thread deferred it ([`Reply::Deferred`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`open`](Self::open).
+    pub fn open_candidate(
+        &mut self,
+        request: Request,
+    ) -> Result<Option<Opening<SourceReader>>, InputWaitError> {
         match self.ask(request)? {
             Reply::Opened(o, lines) => {
                 print_lines(&lines);
-                Ok(o)
+                Ok(Some(o))
             }
+            Reply::Deferred => Ok(None),
             Reply::Closed(..) => unreachable!("an open is answered by an opening"),
         }
+    }
+
+    /// Hands the input thread the adjustment controls' tap: sent without
+    /// waiting, as [`feed`](Self::feed). A failed link sends nothing.
+    pub fn tap(&self, tap: input::AdjustmentTap) {
+        if self.failed.is_none() && self.requests.send(Request::Tap(Box::new(tap))).is_ok() {
+            self.waker.wake();
+        }
+    }
+
+    /// Asks the input thread to seal the cancelled READY candidate's
+    /// opening and open the next at its next boundary ([`Rearm`]), and
+    /// waits for the answer as [`open`](Self::open) does. Allocates
+    /// nothing: `rearm` goes through a bounded queue and comes back.
+    ///
+    /// # Errors
+    ///
+    /// As [`open`](Self::open); `rearm` and its readers are then lost with
+    /// the link.
+    pub fn rearm(&mut self, mut rearm: Box<Rearm>) -> Result<Box<Rearm>, InputWaitError> {
+        if let Some(e) = self.failed {
+            return Err(e);
+        }
+        rearm.outcome = RearmOutcome::Pending;
+        let sent = self.rearms.push(rearm).map_err(|_| InputWaitError::Gone);
+        let answer = sent.and_then(|()| {
+            self.waker.wake();
+            let since = (self.awake)();
+            loop {
+                if let Ok(r) = self.rearmed.pop() {
+                    return Ok(r);
+                }
+                if self.state.gone.load(Ordering::Acquire) || self.rearmed.is_abandoned() {
+                    return Err(InputWaitError::Gone);
+                }
+                if (self.awake)().saturating_sub(since) >= self.timeout {
+                    return Err(InputWaitError::Timeout);
+                }
+                std::thread::sleep(REARM_POLL);
+            }
+        });
+        if let Err(e) = answer {
+            self.failed = Some(e);
+        }
+        answer
     }
 
     /// Closes recording.
@@ -182,7 +311,7 @@ impl InputLink {
                 print_lines(&lines);
                 Ok(c)
             }
-            Reply::Opened(..) => unreachable!("a close is answered by a closing"),
+            Reply::Opened(..) | Reply::Deferred => unreachable!("a close is answered by a closing"),
         }
     }
 
@@ -333,6 +462,12 @@ pub struct Hook {
     participants: Vec<(DeviceId, Option<u64>)>,
     /// The input thread's phase.
     phase: Phase,
+    /// A script's timeline: the first opening's chart time 0 on the
+    /// clock, which a rearm moves no script time from (dev-tools).
+    script_origin: Option<TimeUs>,
+    /// Rearms from the game thread, and back.
+    rearms: rtrb::Consumer<Box<Rearm>>,
+    rearmed: rtrb::Producer<Box<Rearm>>,
 }
 
 /// A linked hook and link; the link wakes the input thread through
@@ -341,6 +476,9 @@ pub fn link(controls: Arc<Controls>, mode: Mode, waker: Waker) -> (Hook, InputLi
     let (req_tx, req_rx) = mpsc::channel();
     let (rep_tx, rep_rx) = mpsc::channel();
     let state = Arc::new(InputState::default());
+    // One rearm is in flight at a time.
+    let (rearm_tx, rearm_rx) = rtrb::RingBuffer::new(1);
+    let (rearmed_tx, rearmed_rx) = rtrb::RingBuffer::new(1);
     (
         Hook {
             requests: req_rx,
@@ -352,6 +490,9 @@ pub fn link(controls: Arc<Controls>, mode: Mode, waker: Waker) -> (Hook, InputLi
             origin: None,
             participants: Vec::new(),
             phase: Phase::Tail,
+            script_origin: None,
+            rearms: rearm_rx,
+            rearmed: rearmed_tx,
         },
         InputLink {
             requests: req_tx,
@@ -361,6 +502,8 @@ pub fn link(controls: Arc<Controls>, mode: Mode, waker: Waker) -> (Hook, InputLi
             timeout: INPUT_TIMEOUT,
             awake: awake_time,
             failed: None,
+            rearms: rearm_tx,
+            rearmed: rearmed_rx,
         },
     )
 }
@@ -386,9 +529,16 @@ impl Hook {
                 input::InputAdapter::poll(feeder, TimeUs(now.0 - origin.0), sources);
             }
             (Mode::Autoplay(_), None) => sources.end_batch(now),
+            // A script runs on its own timeline, which a rearm does not move.
             #[cfg(feature = "dev-tools")]
-            (Mode::Script(script), Some(origin)) => {
-                input::InputAdapter::poll(&mut script.current, TimeUs(now.0 - origin.0), sources);
+            (Mode::Script(script), origin) => {
+                if let Some(origin) = self.script_origin.or(origin) {
+                    input::InputAdapter::poll(
+                        &mut script.current,
+                        TimeUs(now.0 - origin.0),
+                        sources,
+                    );
+                }
             }
             _ => {}
         }
@@ -398,10 +548,17 @@ impl Hook {
                     lead_in,
                     logic,
                     recorded,
-                } => {
-                    let (opening, lines) = self.open(sources, now, lead_in, logic, &recorded);
-                    self.phase = Phase::Open;
-                    Reply::Opened(opening, lines)
+                    gate,
+                } => match self.open(sources, now, lead_in, logic, &recorded, gate) {
+                    Some((opening, lines)) => {
+                        self.phase = Phase::Open;
+                        Reply::Opened(opening, lines)
+                    }
+                    None => Reply::Deferred,
+                },
+                Request::Tap(tap) => {
+                    sources.set_adjustment(*tap);
+                    continue;
                 }
                 Request::Close => {
                     let (closing, lines) = self.close(sources);
@@ -445,6 +602,12 @@ impl Hook {
             // the play.
             let _ = self.replies.send(reply);
         }
+        // A rearm, at this boundary: one in flight at a time, so the
+        // answer always has room.
+        if let Ok(mut rearm) = self.rearms.pop() {
+            self.rearm(sources, now, &mut rearm);
+            let _ = self.rearmed.push(rearm);
+        }
         self.publish(sources);
         if self.origin.is_some()
             && let Some(logic) = &self.logic
@@ -487,7 +650,8 @@ impl Hook {
         lead_in: TimeUs,
         logic: Thread,
         recorded: &Recorded,
-    ) -> (Opening<SourceReader>, Vec<String>) {
+        gate: Option<u32>,
+    ) -> Option<(Opening<SourceReader>, Vec<String>)> {
         let origin = TimeUs(now.0 + lead_in.0);
         let mut lines = Vec::new();
         let start = match &mut self.mode {
@@ -498,7 +662,10 @@ impl Hook {
                     );
                 }
                 reset_gate(sources, &self.controls);
-                let start = sources.open_play(now, origin);
+                let start = match gate {
+                    None => sources.open_play(now, origin),
+                    Some(generation) => candidate(sources.open_candidate(now, origin, generation))?,
+                };
                 // Devices the source limit left out: keyboards, when any
                 // is (controllers come first), possibly one with lanes.
                 let n = sources.left_out();
@@ -526,22 +693,37 @@ impl Hook {
             }
             #[cfg(feature = "dev-tools")]
             Mode::Script(script) => {
-                // The log again from its start, on devices as they were
-                // before it: they connect, with their recorded controls,
-                // before the opening.
-                script.current = script.log.clone();
-                // The same gate: the latch the controls hold trips it.
-                #[expect(
-                    clippy::expect_used,
-                    reason = "the run's source set was made with these sizes"
-                )]
-                sources
-                    .reset(script.sources.clone())
-                    .expect("the run's source set was made with these sizes");
-                let open_at = TimeUs(-lead_in.0);
+                // A gated opening deferred before keeps the script's
+                // timeline and devices; otherwise the log starts again
+                // from its start, on devices as they were before it: they
+                // connect, with their recorded controls, before the
+                // opening.
+                let script_origin = match self.script_origin.filter(|_| gate.is_some()) {
+                    Some(o) => o,
+                    None => {
+                        script.current = script.log.clone();
+                        // The same gate: the latch the controls hold trips it.
+                        #[expect(
+                            clippy::expect_used,
+                            reason = "the run's source set was made with these sizes"
+                        )]
+                        sources
+                            .reset(script.sources.clone())
+                            .expect("the run's source set was made with these sizes");
+                        origin
+                    }
+                };
+                let open_at = TimeUs(now.0 - script_origin.0);
                 input::InputAdapter::poll(&mut script.current, TimeUs(open_at.0 - 1), sources);
                 reset_gate(sources, &self.controls);
-                sources.open_recording(open_at)
+                self.script_origin = Some(script_origin);
+                match gate {
+                    None => sources.open_recording(open_at),
+                    Some(generation) => {
+                        let chart0 = TimeUs(open_at.0 + lead_in.0);
+                        candidate(sources.open_candidate(open_at, chart0, generation))?
+                    }
+                }
             }
         };
         self.origin = Some(origin);
@@ -560,7 +742,72 @@ impl Hook {
                 .map(|(d, _)| sources.axes(d).to_vec())
                 .collect(),
         };
-        (opening, lines)
+        Some((opening, lines))
+    }
+
+    /// Seals the cancelled READY candidate's opening and opens the next on
+    /// the attempt's source table at this boundary (design.md "Play
+    /// Lifecycle", the start gate), only where START and SELECT are
+    /// verifiably released: the readers come back drained of what was
+    /// pushed since the game thread's last drain, the sealed opening's
+    /// arrivals and closing time, and the next opening's snapshot, all
+    /// within the buffers `rearm` carries. Allocates nothing.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn rearm(&mut self, sources: &mut SourceSet, now: TimeUs, rearm: &mut Rearm) {
+        rearm.leftover.clear();
+        let Some(old) = self.origin else {
+            rearm.outcome = RearmOutcome::Refused;
+            return;
+        };
+        if sources.holding() {
+            rearm.outcome = RearmOutcome::Held;
+            return;
+        }
+        // Everything the sealed opening still holds, in source order.
+        let mut fits = true;
+        for reader in &mut rearm.readers {
+            while let Some(ev) = reader.pop() {
+                if rearm.leftover.len() < rearm.leftover.capacity().min(rearm.room) {
+                    rearm.leftover.push(ev);
+                } else {
+                    fits = false;
+                }
+            }
+        }
+        let arrivals = sources.arrivals();
+        rearm.arrivals.clear();
+        let room = rearm.arrivals.capacity();
+        rearm.arrivals.extend(arrivals.iter().take(room).copied());
+        fits &= arrivals.len() <= room;
+        if !fits {
+            rearm.outcome = RearmOutcome::Refused;
+            return;
+        }
+        // The input side's batch clock: the clock, or a script's timeline.
+        let batch = TimeUs(now.0 - self.script_origin.map_or(0, |o| o.0));
+        let chart0 = TimeUs(batch.0.saturating_add(rearm.lead_in.0));
+        sources.return_readers(std::mem::take(&mut rearm.readers));
+        let opened = sources.reopen_candidate(batch, chart0, rearm.generation);
+        rearm.outcome = match opened {
+            Ok(start) => {
+                rearm.start.opened_at = start.opened_at;
+                rearm.start.held.clear();
+                let room = rearm.start.held.capacity();
+                rearm
+                    .start
+                    .held
+                    .extend(start.held.iter().take(room).copied());
+                let origin = TimeUs(now.0.saturating_add(rearm.lead_in.0));
+                self.origin = Some(origin);
+                RearmOutcome::Opened {
+                    origin,
+                    closed: TimeUs(now.0.saturating_sub(old.0)),
+                }
+            }
+            Err(input::ReopenError::Held) => RearmOutcome::Held,
+            Err(_) => RearmOutcome::Refused,
+        };
+        rearm.readers = sources.take_readers();
     }
 
     fn close(&mut self, sources: &mut SourceSet) -> (Closing, Vec<String>) {
@@ -574,8 +821,22 @@ impl Hook {
         let lines = out_of_range_warnings(sources);
         sources.close_recording();
         self.origin = None;
+        self.script_origin = None;
         (closed, lines)
     }
+}
+
+/// A gated opening's snapshot, with the storage the input side reserved for
+/// the attempt's snapshots, so the game thread copies a rearm's into it
+/// without allocating; `None` when the opening was deferred.
+fn candidate(start: Option<&eval::InputStart>) -> Option<eval::InputStart> {
+    let start = start?;
+    let mut copy = eval::InputStart {
+        opened_at: start.opened_at,
+        held: Vec::with_capacity(start.held.capacity()),
+    };
+    copy.held.extend_from_slice(&start.held);
+    Some(copy)
 }
 
 /// The console lines for the open recording's axis values outside the
@@ -1038,12 +1299,13 @@ mod autoplay_tests {
                 lead_in: LEAD_IN,
                 logic: std::thread::current(),
                 recorded: recorded(),
+                gate: None,
             })
             .unwrap();
         hook.wake(sources, TimeUs(at));
         match link.replies.try_recv().unwrap() {
             Reply::Opened(o, _) => o,
-            Reply::Closed(..) => panic!("an open is answered by an opening"),
+            Reply::Closed(..) | Reply::Deferred => panic!("an open is answered by an opening"),
         }
     }
 
@@ -1342,6 +1604,7 @@ mod link_tests {
             lead_in: LEAD_IN,
             logic: std::thread::current(),
             recorded: recorded(),
+            gate: None,
         }
     }
 
@@ -1466,6 +1729,7 @@ mod link_tests {
                 lead_in: LEAD_IN,
                 logic: std::thread::current(),
                 recorded,
+                gate: None,
             })
             .unwrap();
         hook.wake(&mut sources, TimeUs(1_000));
@@ -1511,6 +1775,7 @@ mod wake_tests {
             lead_in: LEAD_IN,
             logic: std::thread::current(),
             recorded: recorded(),
+            gate: None,
         });
         assert!(opened.is_ok());
     }
@@ -1752,6 +2017,7 @@ mod menu_tests {
                 lead_in: TimeUs(1_000_000),
                 logic: std::thread::current(),
                 recorded,
+                gate: None,
             });
             assert!(matches!(reply, Some(Reply::Opened(..))));
         }
@@ -1889,5 +2155,374 @@ mod menu_tests {
         rig.wake();
         rig.batch(&press, false);
         assert_eq!(rig.events(), [MenuEvent::Confirm]);
+    }
+}
+
+/// The input thread's side of the start gate (design.md "Play Lifecycle",
+/// the start gate), through `Hook::wake` as the clocked input thread calls
+/// it: a gated opening deferred while START is held, the input side's
+/// cancellation, and a rearm at one boundary that seals the cancelled
+/// opening with what came since the game thread's drain and opens the next
+/// on the same source table, a device removed and reconnected meanwhile
+/// keeping its source id, allocating nothing.
+#[cfg(test)]
+mod gate_tests {
+    use std::sync::Arc;
+
+    use bms_model::TimeUs;
+    use eval::{ControlId, InputKind, InputStart, SourceId};
+    use input::{
+        AdjustmentBindings, DeviceId, DeviceKind, GatePhase, Packet, QpcClock, SourceConfig,
+        SourceSet, StartGate, TapControl, Waker, adjustment_queue,
+    };
+
+    use super::autoplay_tests::{LEAD_IN, recorded};
+    use super::{Hook, InputLink, Mode, Rearm, RearmOutcome, Reply, Request, link};
+    use crate::controls::Controls;
+
+    const MS: i64 = 1_000;
+    const Q: ControlId = ControlId(0x10);
+    const Z: ControlId = ControlId(0x2c);
+
+    fn packet(device: u64, control: ControlId, value: i32) -> Packet {
+        Packet {
+            device: DeviceId(device),
+            control,
+            value,
+            background: false,
+        }
+    }
+
+    /// Two keyboards, the hook of a device play with a START tap, and the
+    /// tap's gate.
+    fn rig() -> (SourceSet, Hook, InputLink, StartGate) {
+        let mut sources = SourceSet::new(SourceConfig {
+            max_devices: 4,
+            max_sources: 4,
+            max_held: 4,
+            queue_capacity: 16,
+            max_arrivals: 4,
+        })
+        .unwrap();
+        sources.begin_batch(TimeUs(0));
+        sources.connect(DeviceId(1), DeviceKind::Keyboard);
+        sources.connect(DeviceId(2), DeviceKind::Keyboard);
+        sources.end_batch(TimeUs(1));
+        let controls = Arc::new(Controls::new(QpcClock::start()));
+        controls.set_latch(sources.gate().handle());
+        let (hook, link) = link(controls, Mode::Clock, Waker::new().unwrap());
+        let (tap, _rx) = adjustment_queue(AdjustmentBindings {
+            controls: vec![(TapControl::Key(Q), 0)],
+            latched: 1,
+            wrap: None,
+        })
+        .unwrap();
+        let gate = tap.start_gate();
+        link.tap(tap);
+        (sources, hook, link, gate)
+    }
+
+    /// One batch at `at` ms of `packets`, then the hook's boundary.
+    fn batch(hook: &mut Hook, sources: &mut SourceSet, at: i64, packets: &[Packet]) {
+        sources.begin_batch(TimeUs(at * MS));
+        for p in packets {
+            sources.packet(p);
+        }
+        sources.end_batch(TimeUs(at * MS + 1));
+        hook.wake(sources, TimeUs(at * MS + 1));
+    }
+
+    fn open(
+        hook: &mut Hook,
+        link: &InputLink,
+        sources: &mut SourceSet,
+        at: i64,
+    ) -> Option<game::Opening<input::SourceReader>> {
+        link.requests
+            .send(Request::Open {
+                lead_in: LEAD_IN,
+                logic: std::thread::current(),
+                recorded: recorded(),
+                gate: Some(1),
+            })
+            .unwrap();
+        batch(hook, sources, at, &[]);
+        match link.replies.try_recv().unwrap() {
+            Reply::Opened(o, _) => Some(o),
+            Reply::Deferred => None,
+            Reply::Closed(..) => panic!("an open is answered by an opening"),
+        }
+    }
+
+    fn rearm_buffers(readers: Vec<input::SourceReader>, snapshot: usize) -> Box<Rearm> {
+        Box::new(Rearm {
+            readers,
+            lead_in: LEAD_IN,
+            generation: 2,
+            start: InputStart {
+                opened_at: TimeUs(0),
+                held: Vec::with_capacity(snapshot),
+            },
+            arrivals: Vec::with_capacity(16),
+            leftover: Vec::with_capacity(64),
+            room: 64,
+            outcome: RearmOutcome::Pending,
+        })
+    }
+
+    #[test]
+    fn a_rearm_seals_the_cancelled_opening_and_opens_the_next_at_one_boundary() {
+        let (mut sources, mut hook, mut link, gate) = rig();
+        // START held: the opening is deferred, nothing opens.
+        batch(&mut hook, &mut sources, 10, &[packet(1, Q, 1)]);
+        assert!(open(&mut hook, &link, &mut sources, 20).is_none());
+        assert!(!sources.is_recording());
+        // Released: candidate 1 opens and is armed.
+        batch(&mut hook, &mut sources, 30, &[packet(1, Q, 0)]);
+        let opening = open(&mut hook, &link, &mut sources, 40).unwrap();
+        assert_eq!(gate.state().phase, GatePhase::Armed);
+        let snapshot = opening.start.held.capacity();
+        let mut readers = opening.readers;
+        assert_eq!(readers.len(), 2);
+        // A lane press, then START: the input side cancels at once.
+        batch(&mut hook, &mut sources, 100, &[packet(2, Z, 1)]);
+        batch(&mut hook, &mut sources, 110, &[packet(1, Q, 1)]);
+        assert_eq!(gate.state().phase, GatePhase::Cancelled);
+        // The game thread drains what came so far; Z's release comes after.
+        for r in &mut readers {
+            while r.pop().is_some() {}
+        }
+        batch(&mut hook, &mut sources, 120, &[packet(2, Z, 0)]);
+        // Keyboard 2 removed and connected again while waiting.
+        sources.begin_batch(TimeUs(130 * MS));
+        sources.disconnect(DeviceId(2));
+        sources.connect(DeviceId(2), DeviceKind::Keyboard);
+        sources.end_batch(TimeUs(130 * MS + 1));
+        // Still held: the rearm changes nothing.
+        let rearm = rearm_buffers(readers, snapshot);
+        link.rearms.push(rearm).unwrap();
+        batch(&mut hook, &mut sources, 140, &[]);
+        let rearm = link.rearmed.pop().unwrap();
+        assert_eq!(rearm.outcome, RearmOutcome::Held);
+        // Released: one boundary seals and reopens, allocating nothing.
+        batch(&mut hook, &mut sources, 150, &[packet(1, Q, 0)]);
+        link.rearms.push(rearm).unwrap();
+        // The positive control: this thread's allocations are counted.
+        #[cfg(feature = "dev-tools")]
+        {
+            let control = crate::alloc_count::this_thread();
+            drop(std::hint::black_box(vec![1_u8; 8]));
+            assert!(
+                crate::alloc_count::this_thread() > control,
+                "the allocation was not counted"
+            );
+        }
+        #[cfg(feature = "dev-tools")]
+        let before = crate::alloc_count::this_thread();
+        batch(&mut hook, &mut sources, 160, &[]);
+        #[cfg(feature = "dev-tools")]
+        assert_eq!(
+            crate::alloc_count::this_thread(),
+            before,
+            "the rearm allocated"
+        );
+        let rearm = link.rearmed.pop().unwrap();
+        let origin = TimeUs(160 * MS + 1 + LEAD_IN.0);
+        assert_eq!(
+            rearm.outcome,
+            RearmOutcome::Opened {
+                origin,
+                closed: TimeUs(160 * MS + 1 - opening.origin.0),
+            }
+        );
+        assert_eq!(gate.state().phase, GatePhase::Armed);
+        assert_eq!(gate.state().generation, 2);
+        // What came since the drain: Z's release, and keyboard 2's removal.
+        let kinds: Vec<_> = rearm.leftover.iter().map(|e| (e.source, e.kind)).collect();
+        assert!(kinds.contains(&(
+            SourceId(1),
+            InputKind::Control {
+                control: Z,
+                value: 0
+            }
+        )));
+        assert!(kinds.contains(&(SourceId(1), InputKind::Disconnected)));
+        // Its reconnection is an arrival of the sealed opening.
+        assert_eq!(rearm.arrivals.len(), 1);
+        // The same source table: two readers, keyboard 2 still source 1 and
+        // absent in the next opening, which opened at −1 s.
+        assert_eq!(rearm.readers.len(), 2);
+        assert_eq!(rearm.start.opened_at, TimeUs(-LEAD_IN.0));
+        let mut readers = rearm.readers;
+        batch(&mut hook, &mut sources, 170, &[packet(1, Z, 1)]);
+        let next: Vec<_> = readers
+            .iter_mut()
+            .flat_map(|r| std::iter::from_fn(move || r.pop()))
+            .map(|e| (e.source, e.kind))
+            .collect();
+        assert!(next.contains(&(SourceId(1), InputKind::Disconnected)));
+        assert!(next.contains(&(
+            SourceId(0),
+            InputKind::Control {
+                control: Z,
+                value: 1
+            }
+        )));
+    }
+
+    /// A rearm whose sealed opening holds more than the history takes is
+    /// refused: nothing opens, and the capture is sealed.
+    #[test]
+    fn a_rearm_past_the_historys_room_opens_nothing() {
+        let (mut sources, mut hook, mut link, gate) = rig();
+        let opening = open(&mut hook, &link, &mut sources, 10).unwrap();
+        batch(&mut hook, &mut sources, 20, &[packet(1, Q, 1)]);
+        batch(
+            &mut hook,
+            &mut sources,
+            30,
+            &[packet(2, Z, 1), packet(2, Z, 0)],
+        );
+        batch(&mut hook, &mut sources, 40, &[packet(1, Q, 0)]);
+        let mut rearm = rearm_buffers(opening.readers, opening.start.held.capacity());
+        rearm.room = 1;
+        link.rearms.push(rearm).unwrap();
+        batch(&mut hook, &mut sources, 50, &[]);
+        let rearm = link.rearmed.pop().unwrap();
+        assert_eq!(rearm.outcome, RearmOutcome::Refused);
+        assert_eq!(gate.state().generation, 1, "nothing was armed");
+    }
+
+    /// The player's gate admits what its exchange with the input side
+    /// keeps, by the capacities reserved at the opening: an attempt whose
+    /// recording fills the reservation exactly with the history and the
+    /// snapshots is refused once the exchange is counted.
+    #[test]
+    fn the_player_gates_exchange_counts_in_the_admission() {
+        let (mut sources, mut hook, link, _) = rig();
+        let mut gate = crate::start_gate::PlayerGate::install(
+            &link,
+            AdjustmentBindings {
+                controls: vec![(TapControl::Key(Q), 0)],
+                latched: 1,
+                wrap: None,
+            },
+        )
+        .unwrap();
+        let opening = open(&mut hook, &link, &mut sources, 10).unwrap();
+        gate.opened(1, &opening);
+        assert!(
+            gate.exchange()
+                >= replay::MAX_CANCELLED_EVENTS * size_of::<eval::PhysicalInputEvent>()
+                    + replay::MAX_OPENING_ARRIVALS * size_of::<input::Arrival>(),
+            "{}",
+            gate.exchange()
+        );
+        let base = game::Reservation {
+            fixed: 4_096,
+            per_input: 1,
+        };
+        let without = base.with_gate(game::GateStorage {
+            held: gate.snapshot(),
+            exchange: 0,
+        });
+        let with = base.with_gate(game::GateStorage {
+            held: gate.snapshot(),
+            exchange: gate.exchange(),
+        });
+        let inputs = without.capacity();
+        assert!(without.fits(inputs));
+        assert!(!with.fits(inputs), "the exchange was not admitted");
+    }
+
+    /// The same refusal through the player's gate, with one event of room
+    /// left in the history and two arriving between its drain and the
+    /// input side's boundary: the capture is sealed, and the history the
+    /// record saves keeps the one that fits.
+    #[test]
+    fn a_refused_rearm_keeps_in_the_capture_what_fits_the_history() {
+        let mut sources = SourceSet::new(SourceConfig {
+            max_devices: 4,
+            max_sources: 4,
+            max_held: 4,
+            queue_capacity: 16,
+            max_arrivals: 4,
+        })
+        .unwrap();
+        sources.begin_batch(TimeUs(0));
+        sources.connect(DeviceId(1), DeviceKind::Keyboard);
+        sources.connect(DeviceId(2), DeviceKind::Keyboard);
+        sources.end_batch(TimeUs(1));
+        let controls = Arc::new(Controls::new(QpcClock::start()));
+        controls.set_latch(sources.gate().handle());
+        let (mut hook, mut link) = link(controls, Mode::Clock, Waker::new().unwrap());
+        let mut gate = crate::start_gate::PlayerGate::install(
+            &link,
+            AdjustmentBindings {
+                controls: vec![(TapControl::Key(Q), 0)],
+                latched: 1,
+                wrap: None,
+            },
+        )
+        .unwrap();
+        let opening = open(&mut hook, &link, &mut sources, 10).unwrap();
+        gate.opened(1, &opening);
+        batch(&mut hook, &mut sources, 20, &[packet(1, Q, 1)]);
+        assert_eq!(gate.state().phase, GatePhase::Cancelled);
+        batch(&mut hook, &mut sources, 40, &[packet(1, Q, 0)]);
+        // The history: the cancelled opening begun, one event of room left.
+        let mut history = game::HistoryRecorder::new(4);
+        history.begin(&opening.start, opening.origin).unwrap();
+        let filler = eval::PhysicalInputEvent {
+            received: TimeUs(0),
+            source: SourceId(0),
+            kind: InputKind::Disconnected,
+        };
+        history
+            .take(&vec![filler; replay::MAX_CANCELLED_EVENTS - 1])
+            .unwrap();
+        assert_eq!(history.room(), 1);
+        let mut readers = opening.readers;
+        let mut start = InputStart {
+            opened_at: TimeUs(0),
+            held: Vec::with_capacity(opening.start.held.capacity()),
+        };
+        let answer = std::thread::scope(|s| {
+            // The input thread: Z pressed and released after the game
+            // thread's drain, at the boundary that takes the rearm.
+            s.spawn(|| {
+                while hook.rearms.is_empty() {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                batch(
+                    &mut hook,
+                    &mut sources,
+                    50,
+                    &[packet(2, Z, 1), packet(2, Z, 0)],
+                );
+            });
+            gate.rearm(
+                &mut link,
+                &mut readers,
+                LEAD_IN,
+                2,
+                &mut history,
+                &mut start,
+            )
+        });
+        assert_eq!(answer, Ok(game::Rearm::Held));
+        assert!(history.exhausted(), "the capture was not sealed");
+        let saved = history.history(opening.origin);
+        assert_eq!(
+            saved.events.last().map(|e| (e.source, e.kind)),
+            Some((
+                SourceId(1),
+                InputKind::Control {
+                    control: Z,
+                    value: 1
+                }
+            )),
+            "the event that fits was dropped"
+        );
     }
 }

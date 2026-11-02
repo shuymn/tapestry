@@ -92,6 +92,38 @@ impl Restorer {
     }
 }
 
+impl Restorer {
+    /// Plans `restore` again at chart time `at` on `line`, as
+    /// [`plan`](Self::plan) does, reusing its storage: a rearmed READY
+    /// candidate's restore (design.md "Play Lifecycle", the start gate)
+    /// allocates nothing.
+    ///
+    /// # Errors
+    ///
+    /// As [`plan`](Self::plan); `restore` is then left as it was.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    pub fn replan(
+        &self,
+        restore: &mut Restore,
+        line: FrameLine,
+        at: TimeUs,
+    ) -> Result<(), RestoreError> {
+        // Both checked by the schedule's hash before either changes.
+        self.check()?;
+        let fallback = TimeUs(at.0.saturating_add(RESTORE_RETRY.0));
+        restore
+            .first
+            .replan(&self.source, &self.schedule, line, at)
+            .map_err(RestoreError::Plan)?;
+        restore
+            .fallback
+            .replan(&self.source, &self.schedule, line, fallback)
+            .map_err(RestoreError::Plan)?;
+        restore.at = at;
+        Ok(())
+    }
+}
+
 impl Restore {
     /// The chart time the first plan restores at.
     #[must_use]

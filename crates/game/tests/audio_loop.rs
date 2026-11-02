@@ -875,6 +875,67 @@ mod restore {
             opened = i64::try_from(worker.engine().written()).unwrap() * 1_000 / 48 + 10 * MS;
         }
     }
+
+    /// A gated round cancelled before its lead-in's start and rearmed
+    /// (design.md "Play Lifecycle", the start gate): the first candidate's
+    /// restore never runs, the rearm's restore, planned again in the box
+    /// the game thread keeps, lands at the new lead-in's start, and the
+    /// box it replaced comes back for the next rearm. Through
+    /// `AudioWorker::step` and `AudioCtl::Rearm`.
+    #[test]
+    fn a_rearmed_round_restores_at_its_own_lead_in_start() {
+        use game::TransportGate;
+        use input::{GatePhase, StartGate};
+
+        let (mut control, mut worker, mut out) = rig();
+        steps(&mut worker, &mut out, WARM);
+        let gate = StartGate::new();
+        let restorer = Restorer::new(control.seek_source(), schedule());
+        let transport = |generation| TransportGate {
+            gate: gate.clone(),
+            generation,
+            commit_at: RESTORE_AT,
+        };
+        // Candidate 1 opens at 30 ms and is cancelled at once.
+        let first = origin(30 * MS);
+        let plan = restorer
+            .plan(control.counters().frame_line(first), RESTORE_AT)
+            .unwrap();
+        let mut spare = plan.clone();
+        gate.arm(1);
+        let (_sink, queue) = audio_link_at(4, first);
+        control
+            .play_gated(first, queue, Gain::HEADROOM, Some(plan), transport(1))
+            .unwrap();
+        steps(&mut worker, &mut out, 1);
+        assert_eq!(gate.cancel(), Some(1));
+        control.cancel();
+        steps(&mut worker, &mut out, 1);
+        assert!(control.counters().dropped(1));
+        // Candidate 2 opens at 150 ms, its restore planned in the spare box.
+        let second = origin(150 * MS);
+        restorer
+            .replan(
+                &mut spare,
+                control.counters().frame_line(second),
+                RESTORE_AT,
+            )
+            .unwrap();
+        gate.arm(2);
+        control.rearm(second, transport(2), Some(spare));
+        steps(&mut worker, &mut out, 40);
+        assert_eq!(gate.state().phase, GatePhase::Committed);
+        assert_eq!(
+            control.counters().restored(control.generation()),
+            Some(Restored::First)
+        );
+        // Silent until the second lead-in's start at 350 ms, where the long
+        // voice enters 3 s in.
+        let at = frame(350 * MS);
+        assert!(out.samples()[..2 * at].iter().all(|&x| x == 0.0));
+        assert_eq!(level(&out, at, audio::HEADROOM), 3_001.0);
+        assert!(control.take_restore().is_some(), "the replaced box is back");
+    }
 }
 
 /// A READY candidate's transport (design.md "Play Lifecycle", the start
@@ -943,7 +1004,7 @@ fn a_gated_transport_commits_only_its_own_armed_candidate() {
     );
     assert!(control.counters().dropped(1));
     gate.arm(2);
-    control.rearm(TimeUs(400 * MS), transport(&gate, 2));
+    control.rearm(TimeUs(400 * MS), transport(&gate, 2), None);
     for _ in 0..30 {
         worker.step(&mut out).unwrap();
     }

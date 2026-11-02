@@ -729,6 +729,23 @@ fn two_notes(last_s: i64) -> Chart {
 /// Whether `chart` under `config` is admitted for four keyboards without
 /// the gate, and with its storage (`Loaded::plan_gated`).
 fn admits(root: &DataRoot, chart: Chart, config: SessionConfig) -> (bool, bool) {
+    admits_with(root, chart, config, GATE)
+}
+
+/// The gate's storage of a rig whose exchange with its input side keeps
+/// nothing of its own.
+const GATE: game::GateStorage = game::GateStorage {
+    held: HELD,
+    exchange: 0,
+};
+
+/// [`admits`] with the gate's storage `gate`.
+fn admits_with(
+    root: &DataRoot,
+    chart: Chart,
+    config: SessionConfig,
+    gate: game::GateStorage,
+) -> (bool, bool) {
     let parts = Parts {
         ingest: Box::new(Built(chart)),
         ..Parts::standard(root, &tapestry_settings(root).player)
@@ -744,7 +761,7 @@ fn admits(root: &DataRoot, chart: Chart, config: SessionConfig) -> (bool, bool) 
     let axes = vec![Vec::new(); KINDS.len()];
     (
         loaded.plan_gated(&KINDS, &axes, None).is_ok(),
-        loaded.plan_gated(&KINDS, &axes, Some(HELD)).is_ok(),
+        loaded.plan_gated(&KINDS, &axes, Some(gate)).is_ok(),
     )
 }
 
@@ -783,6 +800,30 @@ fn fits_only_ungated(root: &DataRoot) -> i64 {
 fn the_gates_storage_counts_in_the_recording_admission() {
     let (_dir, root) = temp_root();
     fits_only_ungated(&root);
+}
+
+/// The rig's exchange with its input side counts too: a window that fits
+/// the gate's history and snapshots but not the exchange's buffers beside
+/// them (the player's: an events arena of `MAX_CANCELLED_EVENTS`) is
+/// refused for a gated play.
+#[test]
+fn the_rigs_exchange_counts_in_the_recording_admission() {
+    let (_dir, root) = temp_root();
+    let exchange = game::GateStorage {
+        held: HELD,
+        exchange: replay::MAX_CANCELLED_EVENTS * size_of::<eval::PhysicalInputEvent>(),
+    };
+    let at = |s| {
+        (
+            admits(&root, two_notes(s), config()).1,
+            admits_with(&root, two_notes(s), config(), exchange).1,
+        )
+    };
+    let lo = last_admitted(2, 4_000, |s| at(s).0);
+    assert!(
+        (lo - 40..=lo).any(|t| at(t) == (true, false)),
+        "no window fits only without the exchange below {lo} s"
+    );
 }
 
 /// Through the lifecycle: a gated play whose window fits only without the
@@ -1000,4 +1041,70 @@ fn pre_zero_bgm_waits_for_the_commit_in_a_gated_play() {
         (14_400 - u64::from(PERIOD)..=14_400 + u64::from(PERIOD)).contains(&late),
         "{frames:?}"
     );
+}
+
+/// A practice round under the gate (design.md "Play Lifecycle", the start
+/// gate): its transport commits at the lead-in's start, where its audio is
+/// restored, not at chart time 0; a hold just before that cancels the round
+/// and a release rearms it, its restore planned again; a hold after it is
+/// an ordinary adjustment while the round stays in READY until its section
+/// starts. Through `game::live::play_and_next` on a session with practice.
+#[test]
+fn a_practice_round_commits_at_its_lead_in_start() {
+    let chart = ChartBuilder::new(150_000)
+        .sound("bgm.wav")
+        .tap(lane(1), TimeUs(10_000 * MS))
+        .tap(lane(1), TimeUs(12_000 * MS))
+        .bgm(TimeUs(0), SoundId(0))
+        .build()
+        .unwrap();
+    let round = |root: &DataRoot| {
+        let device = audio::SimDevice::new(audio::SimConfig::steady(RATE, PERIOD, TimeUs(0)));
+        let out = audio::RecordingOutput::new(device, 0);
+        let mut s = session_of(
+            root,
+            &Events::default(),
+            &chart,
+            common::sources(),
+            out,
+            true,
+        );
+        let practice = game::Practice {
+            start: TimeUs(10_000 * MS),
+            end: TimeUs(13_000 * MS),
+            lead_in: game::LEAD_IN,
+            initial_gauges: s.preset().gauges.iter().map(|g| g.start).collect(),
+            repeat: false,
+        };
+        s.set_practice(Some(practice)).unwrap();
+        s
+    };
+    // READY opens at 7.8 s of the round's chart time; the lead-in, where
+    // the transport commits, starts at 8.0 s.
+    let notes = |zero: i64| [tap(1, zero + 10_000), tap(1, zero + 12_000)].concat();
+
+    // Held after the commit, through the section's start: ordinary.
+    let (_dir, root) = temp_root();
+    let mut s = round(&root);
+    let mut items = vec![connect(0), raw(8_050, 0, Q, 1), raw(10_500, 0, Q, 0)];
+    items.extend(notes(0));
+    let report = s.play(script(items, &[])).unwrap();
+    let r = record(&report);
+    assert!(matches!(r.play_type, replay::PlayType::MidChartStart(_)));
+    assert_eq!(r.status.end, EndStatus::PlayedToEnd);
+    assert!(r.history.openings.is_empty(), "a hold after the commit");
+    assert_eq!(count_judged(&report.live, Judgment::Perfect), 2);
+
+    // Held before the commit: cancelled; released at 8.2 s, a fresh READY
+    // opens there, its lead-in starting 200 ms later, its chart 400 ms on.
+    let (_dir, root) = temp_root();
+    let mut s = round(&root);
+    let mut items = vec![connect(0), raw(7_950, 0, Q, 1), raw(8_200, 0, Q, 0)];
+    items.extend(notes(400));
+    let report = s.play(script(items, &[])).unwrap();
+    let r = record(&report);
+    assert_eq!(r.status.end, EndStatus::PlayedToEnd);
+    assert_eq!(r.history.openings.len(), 1);
+    assert_eq!(r.history.openings[0].origin, TimeUs(-400 * MS));
+    assert_eq!(count_judged(&report.live, Judgment::Perfect), 2);
 }

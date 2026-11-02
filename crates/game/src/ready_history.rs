@@ -262,6 +262,18 @@ impl HistoryRecorder {
         self.open
     }
 
+    /// How many more events the arena takes.
+    #[must_use]
+    pub const fn room(&self) -> usize {
+        MAX_CANCELLED_EVENTS.saturating_sub(self.events.len())
+    }
+
+    /// The capture ran out where the history could not see it (the input
+    /// side's buffers): it is sealed and incomplete.
+    pub const fn exhaust(&mut self) {
+        self.exhausted = true;
+    }
+
     /// The opening begun reaches the end of the events arena.
     fn extend_last(&mut self) {
         let to = self.events.len();

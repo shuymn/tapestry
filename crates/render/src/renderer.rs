@@ -1244,6 +1244,14 @@ impl Renderer {
         self.submit()
     }
 
+    /// The play's READY candidate was rearmed (design.md "Play Lifecycle",
+    /// the start gate): the skin's runtime state for the attempt starts
+    /// over ([`PlaySkin::rearm`]), its chart, text, atlas and clips kept.
+    /// Nothing allocates.
+    pub fn rearm(&mut self) {
+        self.skin.rearm();
+    }
+
     /// The app's share of a frame ([`Staging::build`]): the skin builds
     /// `f`, the overlay follows, and the batch is staged, with no call into
     /// wgpu. The frame's CPU time starts here; [`submit`](Self::submit)

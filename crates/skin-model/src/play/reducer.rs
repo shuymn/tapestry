@@ -76,6 +76,8 @@ pub(crate) struct Reducer {
     /// Per gauge: when it reached its maximum, if it is there by the
     /// effects delivered so far.
     pub(crate) gauge_max: Box<[Option<TimeUs>]>,
+    /// Per gauge: `gauge_max` as the attempt starts, for a rearm.
+    gauge_start: Box<[Option<TimeUs>]>,
     /// Per gauge: its maximum.
     pub(crate) gauge_top: Box<[GaugeValue]>,
     empty_poor_breaks_combo: bool,
@@ -103,7 +105,11 @@ impl Reducer {
     pub(crate) fn heap_bytes(&self) -> usize {
         let longs: usize = self.longs.iter().map(|l| size_of_val(&**l)).sum();
         let done: usize = self.done.iter().map(|d| size_of_val(&*d.0)).sum();
-        longs + done + size_of_val(&*self.gauge_max) + size_of_val(&*self.gauge_top)
+        longs
+            + done
+            + size_of_val(&*self.gauge_max)
+            + size_of_val(&*self.gauge_start)
+            + size_of_val(&*self.gauge_top)
     }
 
     /// A clean reducer for one attempt: `initial` gives each gauge's
@@ -152,11 +158,29 @@ impl Reducer {
             combo_up: None,
             targets,
             full_combo: None,
+            gauge_start: gauge_max.clone().into_boxed_slice(),
             gauge_max: gauge_max.into_boxed_slice(),
             gauge_top: gauge_top.into_boxed_slice(),
             empty_poor_breaks_combo,
             bomb_up_to,
         }
+    }
+
+    /// Back to the clean reducer [`new`](Self::new) made, in place, for a
+    /// rearmed READY candidate (design.md "Play Lifecycle", the start
+    /// gate): no note done, held, bombed or judged, and each gauge's
+    /// maximum as the attempt started. Allocates nothing.
+    pub(crate) fn rearm(&mut self) {
+        for bits in &mut self.done {
+            bits.0.fill(0);
+        }
+        self.hold = [None; LANE_COUNT];
+        self.bomb = [None; LANE_COUNT];
+        self.mine = [None; LANE_COUNT];
+        self.judge = None;
+        self.combo_up = None;
+        self.full_combo = None;
+        self.gauge_max.copy_from_slice(&self.gauge_start);
     }
 
     /// The attempt's target count.

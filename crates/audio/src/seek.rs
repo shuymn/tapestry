@@ -175,6 +175,36 @@ impl SeekPlan {
         line: FrameLine,
         t: TimeUs,
     ) -> Result<Self, SeekError> {
+        let mut plan = Self {
+            engine: source.engine,
+            chart: source.chart,
+            t,
+            line,
+            at: 0,
+            split: 0,
+            budget: 0,
+            seq: 0,
+            slots: Slots::new(source.voices),
+        };
+        plan.replan(source, schedule, line, t)?;
+        Ok(plan)
+    }
+
+    /// Plans this seek again, as [`new`](Self::new) would, for chart time
+    /// `t` on `line`, reusing its slots: nothing is allocated while the
+    /// engine keeps its voice count. A refused plan is left as it was.
+    ///
+    /// # Errors
+    ///
+    /// As [`new`](Self::new).
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    pub fn replan(
+        &mut self,
+        source: &SeekSource,
+        schedule: &[BgmEvent],
+        line: FrameLine,
+        t: TimeUs,
+    ) -> Result<(), SeekError> {
         if schedule_hash(schedule) != source.schedule {
             return Err(SeekError::Source);
         }
@@ -183,7 +213,8 @@ impl SeekPlan {
         let at = line.frame(t);
         let block_at = line.block_of(at);
         let period = i64::from(line.period.max(1));
-        let mut slots = Slots::new(voices);
+        let slots = &mut self.slots;
+        slots.reset(voices);
         let mut unheard = Counts::default();
         let mut seq = 0;
         // The block admitting starts, and how many it has admitted.
@@ -231,17 +262,15 @@ impl SeekPlan {
             slots.apply(voice, &mut unheard);
         }
         slots.retire(bank, fade, at);
-        Ok(Self {
-            engine: source.engine,
-            chart: source.chart,
-            t,
-            line,
-            at,
-            split,
-            budget: MAX_PENDING_STARTS - admitted_at,
-            seq,
-            slots,
-        })
+        self.engine = source.engine;
+        self.chart = source.chart;
+        self.t = t;
+        self.line = line;
+        self.at = at;
+        self.split = split;
+        self.budget = MAX_PENDING_STARTS - admitted_at;
+        self.seq = seq;
+        Ok(())
     }
 
     /// The chart time it starts at.

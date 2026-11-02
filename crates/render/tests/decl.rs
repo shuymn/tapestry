@@ -358,6 +358,45 @@ fn a_retry_reuses_the_resources_with_a_fresh_attempt() {
     halves(&read_back(&r), RED, BLACK);
 }
 
+/// Repeated READY rearms (design.md "Play Lifecycle", the start gate) keep
+/// the renderer's memory witness flat: the attempt's prepared resources and
+/// text stay attached, never prepared again, while its runtime starts
+/// over, and every frame after a rearm draws as the attempt's first.
+#[test]
+fn repeated_rearms_keep_the_memory_witness_flat() {
+    let chart = chart();
+    let dir = tempfile::tempdir().unwrap();
+    let mut r = offscreen(1_920, 1_080);
+    let look = Look {
+        text: true,
+        ..red()
+    };
+    let (a, text) = bundle(&r, dir.path(), &look);
+    let text = text.unwrap();
+    let ctx = context(&GAUGES, false);
+    let token = r.stage(&a, &attempt(&r, &chart, &ctx), 1).unwrap();
+    r.commit(token).unwrap();
+    let generation = r.resource_generation();
+    let v = view(0, 0);
+    let first = r.frame(&input(&v, TimeUs(0), TimeUs(0), &[])).unwrap();
+    let memory = r.memory();
+    for k in 0..50 {
+        let later = input(&v, TimeUs(k * 16_667), TimeUs(0), &[]);
+        r.frame(&later).unwrap();
+        r.rearm();
+        let again = r.frame(&input(&v, TimeUs(0), TimeUs(0), &[])).unwrap();
+        assert_eq!(again.sprites, first.sprites, "rearm {k}");
+        assert_eq!(r.memory(), memory, "rearm {k}");
+    }
+    assert_eq!(r.resource_generation(), generation);
+    assert_eq!(
+        text.calls.load(Ordering::SeqCst),
+        1,
+        "the text was prepared again"
+    );
+    halves(&read_back(&r), RED, BLACK);
+}
+
 /// A renderer made again after a device failure restores the committed
 /// bundle from memory, its image files gone: it draws nothing until an
 /// attempt is staged, which reuses the restored resources and draws as

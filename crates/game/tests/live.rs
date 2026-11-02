@@ -235,6 +235,8 @@ struct Fake {
     gated: bool,
     lifetime: bool,
     generation: u32,
+    /// The bytes a gated play's exchange with the input side keeps.
+    exchange: usize,
 }
 
 impl Fake {
@@ -303,6 +305,7 @@ impl Fake {
             gated: false,
             lifetime: false,
             generation: 0,
+            exchange: 0,
         }
     }
 
@@ -483,6 +486,10 @@ impl Rig for Fake {
 
     fn gated(&self) -> bool {
         self.gated
+    }
+
+    fn gate_exchange(&self) -> usize {
+        self.exchange
     }
 
     fn open_candidate(
@@ -3137,4 +3144,55 @@ fn a_quit_pending_at_an_immediate_preparation_commits_nothing() {
         rig.steps
     );
     assert!(rig.commands.is_empty());
+}
+
+/// A gated play admits the rig's exchange with its input side with its
+/// recording (`Rig::gate_exchange`): one byte under the most that fits, the
+/// play is admitted; at the most plus one, it is refused right after
+/// recording opens, before it starts.
+#[test]
+fn a_gated_play_admits_the_rigs_exchange_to_the_byte() {
+    let dir = tempfile::tempdir().unwrap();
+    let probe = loaded(dir.path());
+    let refused = |exchange| {
+        probe
+            .plan_gated(
+                &[input::DeviceKind::Keyboard],
+                &[Vec::new()],
+                Some(game::GateStorage { held: 0, exchange }),
+            )
+            .is_err()
+    };
+    // The least exchange refused for the double's one keyboard, by
+    // bisection.
+    let (mut lo, mut hi) = (0, game::RECORDING_MEMORY);
+    assert!(!refused(lo) && refused(hi));
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2;
+        if refused(mid) {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    for (exchange, admitted) in [(lo, true), (hi, false)] {
+        let mut loaded = loaded(dir.path());
+        let mut rig = Fake::new(Vec::new(), &[], 12_500_000);
+        rig.gated = true;
+        rig.exchange = exchange;
+        let ran = game::live::run_chart(&mut loaded, &mut rig);
+        if admitted {
+            assert!(ran.is_ok(), "{exchange}: {ran:?}");
+            assert_eq!(rig.reports.len(), 1, "{exchange}");
+        } else {
+            assert!(
+                matches!(
+                    ran,
+                    Err(LiveError::Logic(game::LogicError::RecordingTooLarge { .. }))
+                ),
+                "{exchange}: {ran:?}"
+            );
+            assert!(rig.reports.is_empty());
+        }
+    }
 }

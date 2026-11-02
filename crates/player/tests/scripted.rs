@@ -204,6 +204,16 @@ fn scripted_play(chart: &Path, log: &Path, appdata: &Path) -> Command {
     command
 }
 
+/// The output frames a development run reports sounds starting at.
+fn onsets(stdout: &str) -> Vec<i64> {
+    stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("dev: audio onsets "))
+        .and_then(|l| l.split_once(": "))
+        .map(|(_, frames)| frames.split(' ').map(|f| f.parse().unwrap()).collect())
+        .unwrap_or_default()
+}
+
 fn int(t: &toml::Table, table: &str, key: &str) -> Option<i64> {
     t.get(table)?.get(key)?.as_integer()
 }
@@ -469,6 +479,100 @@ fn an_invalid_key_config_exits_nonzero() {
         assert!(stderr.lines().any(|l| l == line), "{line:?} in {stderr}");
         assert!(!appdata.join("tapestry").join("records").exists());
     }
+}
+
+/// The start gate on the real threads (`--dev-start-gate`; design.md
+/// "Play Lifecycle", the start gate): START (Q) held 300 ms before chart
+/// time 0 cancels the first READY through the input thread's latch, its
+/// release at 200 ms rearms a fresh READY through the input thread's
+/// boundary and the audio thread's transport, and the notes, pressed
+/// 1.2 s later than the log has them, are played by that READY: every note
+/// judged PERFECT, and the audio restarted for it, its key sounds and BGM
+/// all sounding, as an ungated play's do. The saved record keeps the cancelled
+/// opening, Q's press in it, and the winning READY's input alone.
+#[test]
+fn the_start_gate_cancels_and_rearms_ready_on_the_real_threads() {
+    const Q: u32 = 0x10;
+    let Fixture {
+        dir,
+        chart_path,
+        log,
+        appdata,
+        ..
+    } = fixture();
+    let ungated = scripted_play(&chart_path, &log, &dir.path().join("ungated"))
+        .output()
+        .expect("run tapestry");
+    let ungated = onsets(&String::from_utf8_lossy(&ungated.stdout));
+    let mut rec = replay::decode(&fs::read(&log).unwrap(), &DecodeLimits::default()).unwrap();
+    let q = |ms: i64, value: i32| eval::PhysicalInputEvent {
+        received: TimeUs(ms * 1_000),
+        source: eval::SourceId(0),
+        kind: eval::InputKind::Control {
+            control: eval::ControlId(Q),
+            value,
+        },
+    };
+    let mut events = vec![q(-300, 1), q(200, 0)];
+    events.extend(rec.events.iter().map(|e| eval::PhysicalInputEvent {
+        received: TimeUs(e.received.0 + 1_200_000),
+        ..*e
+    }));
+    rec.events = events;
+    rec.status.finalized = TimeUs(rec.status.finalized.0 + 1_200_000);
+    fs::write(&log, replay::encode(&rec)).unwrap();
+
+    let out = scripted_play(&chart_path, &log, &appdata)
+        .arg("--dev-start-gate")
+        .output()
+        .expect("run tapestry");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    println!("{stdout}{stderr}");
+    assert_eq!(out.status.code(), Some(0));
+    // The same sounds as the ungated play: the key sounds, and the BGM,
+    // which starts only once the rearmed candidate's transport commits.
+    // Where they fall is the real threads' timing, which the stepped
+    // worker fixes exactly (start_gate.rs,
+    // `a_rearmed_candidate_starts_its_bgm_at_its_own_origin`).
+    let gated = onsets(&stdout);
+    assert!(!ungated.is_empty());
+    assert_eq!(gated.len(), ungated.len(), "{gated:?} {ungated:?}");
+    assert!(
+        stdout.contains(&format!(
+            "play 1: Completed; perfect {NOTES} great 0 good 0 bad 0 poor 0; re-evaluation matches live: true"
+        )),
+        "{stdout}"
+    );
+
+    let saved = records(&appdata);
+    assert_eq!(saved.len(), 1, "{saved:?}");
+    let rec = replay::decode(&fs::read(&saved[0]).unwrap(), &DecodeLimits::default()).unwrap();
+    assert_eq!(rec.status.end, EndStatus::PlayedToEnd);
+    let h = &rec.history;
+    assert_eq!(h.openings.len(), 1, "{h:?}");
+    let o = &h.openings[0];
+    assert_eq!(o.reason, replay::CancelReason::Held);
+    // The release was seen at an input boundary just after 200 ms: the
+    // next READY's chart time 0 lies about 1.2 s after the first's.
+    assert!(
+        (-1_250_000..=-1_199_000).contains(&o.origin.0),
+        "{:?}",
+        o.origin
+    );
+    let cancelled = &h.events[o.events.start as usize..o.events.end as usize];
+    assert!(cancelled.iter().any(|e| e.kind
+        == eval::InputKind::Control {
+            control: eval::ControlId(Q),
+            value: 1
+        }));
+    // The winning READY's input: every note's press and release.
+    let lanes = rec
+        .events
+        .iter()
+        .filter(|e| !matches!(e.kind, eval::InputKind::Control { control, .. } if control.0 == Q))
+        .count();
+    assert_eq!(lanes, 2 * NOTES);
 }
 
 /// A capture cancelled before playback is no script: the run ends with
