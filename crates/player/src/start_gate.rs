@@ -377,6 +377,10 @@ pub fn output_failure(control: &AudioControl, gate: Option<&PlayerGate>) -> Opti
 /// time is marked so on the gate ([`PlayerGate::unacknowledged`]), and
 /// counts as failed from then on.
 pub fn wait_dropped(control: &AudioControl, gate: &mut PlayerGate, generation: u32) {
+    // Latched: the output has failed already, and nothing more is waited.
+    if gate.unacknowledged {
+        return;
+    }
     let counters = control.counters();
     let begun = Instant::now();
     loop {
@@ -528,6 +532,14 @@ mod tests {
             output_failure(&control, Some(&gate)),
             Some(audio::OutputError::Stalled),
             "the next candidate may open without the acknowledgement"
+        );
+        // The attempt's final settlement waits no more once latched.
+        let begun = std::time::Instant::now();
+        wait_dropped(&control, &mut gate, 1);
+        assert!(
+            begun.elapsed() < std::time::Duration::from_millis(500),
+            "waited again: {:?}",
+            begun.elapsed()
         );
     }
 }
