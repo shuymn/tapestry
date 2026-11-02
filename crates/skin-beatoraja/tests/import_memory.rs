@@ -163,8 +163,8 @@ fn ops_of(ops: &str) -> u32 {
 fn f1(root: &Path) {
     // Two condition lists around 4 ops: x elements of the cheaper and the
     // rest of the dearer reach 65,536 exactly. Every supported condition
-    // with a judge region's 241 aside (no element is left for a judge)
-    // costs more than 4, so the cheaper is none.
+    // but 241, the latest judgment's PERFECT, costs more than 4, and the
+    // lists leave 241 out, so the cheaper is none.
     let lists = [
         "",
         "232",
