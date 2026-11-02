@@ -12,7 +12,10 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use audio::{AudioEngine, MAX_VOICES, RecordingOutput, SimConfig, SimDevice, Sound, SoundBank};
-use bms_model::{Chart, ChartBuilder, ModelError, SoundId, TimeUs};
+use bms_model::{
+    Chart, ChartBuilder, ChartTimeline, ModelError, NoteKind, PresentationError, SoundId, TimeUs,
+    TimelineId, TimelinePoint,
+};
 use common::{MS, PERIOD, RATE, count_judged, judgments, lane, rewrite, tapestry_settings};
 use eval::{ControlId, InputKind, SourceId};
 use game::{
@@ -1713,7 +1716,9 @@ fn a_reconnect_during_play_does_not_hide_a_removal_in_the_tail() {
     assert_eq!(s.now(), TimeUs(3_000 * MS));
 }
 
-/// Moves every note 500 ms later, its display position with it.
+/// Moves every note 500 ms later, its display positions with it, and
+/// links its endpoints to new timeline rows at their new times and
+/// positions.
 struct Later;
 
 impl game::ChartTransform for Later {
@@ -1721,6 +1726,67 @@ impl game::ChartTransform for Later {
         game::TransformId {
             id: "later",
             version: 3,
+        }
+    }
+
+    fn apply(&self, mut chart: Chart, _seed: u64) -> Chart {
+        let later = |t: TimeUs| TimeUs(t.0 + 500 * MS);
+        let timeline = &chart.timeline;
+        // The old rows stay, for the bar lines; each moved endpoint gets a
+        // row of its own after them. All are then numbered in time order,
+        // the order they were added in among equals.
+        let mut rows: Vec<TimelinePoint> = timeline.points().to_vec();
+        let mut row = |at: TimeUs| {
+            rows.push(TimelinePoint {
+                at,
+                pos: chart.scroll.position_at(at),
+                tempo: timeline.tempo_at(at),
+            });
+            rows.len() - 1
+        };
+        let mut added = Vec::new();
+        for note in chart.lanes.iter_mut().flatten() {
+            note.time = later(note.time);
+            note.pos = chart.scroll.position_at(note.time);
+            let head = row(note.time);
+            let mut end = head;
+            if let NoteKind::Long {
+                end: t, end_pos, ..
+            } = &mut note.kind
+            {
+                *t = later(*t);
+                *end_pos = chart.scroll.position_at(*t);
+                end = row(*t);
+            }
+            added.push((head, end));
+        }
+        let mut order: Vec<usize> = (0..rows.len()).collect();
+        order.sort_by_key(|&i| (rows[i].at, rows[i].pos));
+        let mut id = vec![TimelineId(0); rows.len()];
+        for (n, &i) in order.iter().enumerate() {
+            id[i] = TimelineId(u32::try_from(n).unwrap());
+        }
+        for (note, (head, end)) in chart.lanes.iter_mut().flatten().zip(added) {
+            note.anchors.head = id[head];
+            note.anchors.end = id[end];
+        }
+        let bar_ids = timeline.bar_ids().iter().map(|b| id[b.index()]).collect();
+        let meta = *timeline.meta();
+        let points = order.iter().map(|&i| rows[i]).collect();
+        chart.timeline = ChartTimeline::new(points, bar_ids, meta.initial, meta.speed).unwrap();
+        chart
+    }
+}
+
+/// Moves every note 500 ms later, display positions included, but leaves
+/// its anchors on the rows of its old time: the links go stale.
+struct LaterUnlinked;
+
+impl game::ChartTransform for LaterUnlinked {
+    fn id(&self) -> game::TransformId {
+        game::TransformId {
+            id: "later-unlinked",
+            version: 1,
         }
     }
 
@@ -1772,8 +1838,22 @@ fn a_transformed_chart_that_breaks_an_invariant_is_refused() {
             index: 1
         }))
     );
-    // The same chart moved whole, times and positions together, loads.
+    // The same chart moved whole, times, positions and rows together,
+    // loads; moved without its rows, its links are stale.
     assert_eq!(load(Box::new(Later)), None);
+    assert_eq!(
+        load(Box::new(LaterUnlinked)),
+        Some(SessionError::TransformLinks(Box::new(
+            PresentationError::Link {
+                endpoint: bms_model::EndpointLocation {
+                    lane: lane(1),
+                    index: 0,
+                    part: bms_model::EndpointPart::Head,
+                    timeline_id: TimelineId(1),
+                },
+            }
+        )))
+    );
 }
 
 #[test]

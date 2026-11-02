@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use audio::{AudioEngine, MAX_VOICES, RecordingOutput, SimConfig, SimDevice, Sound, SoundBank};
-use bms_model::TimeUs;
+use bms_model::{PresentationError, TimeUs};
 use bms_parser::LoadError;
 use common::{PERIOD, RATE, count_judged, judgeable};
 use eval::{EvalError, EvalInput};
@@ -154,7 +154,12 @@ fn category(e: &SessionError) -> &'static str {
         SessionError::InvalidStep(_) => "invalid step",
         SessionError::Io { .. } => "file error",
         SessionError::Preset(_) => "preset error",
-        SessionError::Transform(_) => "transform bug",
+        SessionError::Transform(_) | SessionError::TransformLinks(_) => "transform bug",
+        // Admission checks links first, so only a conflict reaches it.
+        SessionError::Presentation { reason, .. } => match **reason {
+            PresentationError::EndpointConflict { .. } => "endpoint conflict",
+            _ => "invariant failure",
+        },
         SessionError::ChartChanged(_) => "chart changed",
     }
 }
@@ -192,6 +197,9 @@ fn allowed(category: &str) -> bool {
             // a file over 16 MiB, a measure past 999, an exact time past its
             // size cap.
             | "loading limit"
+            // Two notes sounding at one µs at different positions: no
+            // playhead presents both (design.md "Chart Model", "Timeline").
+            | "endpoint conflict"
     )
 }
 

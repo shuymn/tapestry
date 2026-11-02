@@ -123,8 +123,13 @@ impl ChartIngest for BmsIngest {
 /// The chart transformation extension point: changes the resolved chart
 /// before evaluation (later RANDOM or MIRROR options). Any randomness comes
 /// from `seed`, which is recorded. A note moved in time moves its display
-/// positions with it; the session validates the output
-/// ([`Chart::validate`]) and refuses a chart that breaks an invariant.
+/// positions with it, and its anchors name timeline rows at its new time
+/// and positions: a transform that moves notes builds the timeline rows
+/// they need, since rows are never reconstructed from the result. The
+/// session validates the output ([`Chart::validate`] and
+/// [`Chart::validate_presentation_links`]) and refuses a chart that breaks
+/// an invariant; play then admits it only if it can be presented at its
+/// speed ([`Chart::validate_presentation`]).
 pub trait ChartTransform {
     /// Which transform this is.
     fn id(&self) -> TransformId;
