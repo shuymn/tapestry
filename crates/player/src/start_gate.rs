@@ -1,0 +1,298 @@
+//! The start gate's player side (design.md "Play Lifecycle", the start
+//! gate): the real threads' part of the handshake the portable lifecycle
+//! (`game::live`) drives through [`PlayerRig`](crate::play::PlayerRig).
+//!
+//! - **Input thread**: the adjustment tap goes to it once
+//!   ([`PlayerGate::install`]); a gated opening asks it to open only where
+//!   START and SELECT are verifiably released, and a rearm hands it the
+//!   readers and buffers reserved with the play's setup, through a bounded
+//!   queue, to seal the cancelled opening and open the next at one
+//!   boundary ([`input_side::Rearm`]).
+//! - **Audio thread**: the play starts with its transport held for the
+//!   candidate's generation ([`game::TransportGate`]); a cancellation is
+//!   acknowledged ([`game::AudioCounters::dropped`]) before the next
+//!   candidate's rearm, which carries a round's restore planned again in a
+//!   spare box ([`game::Restorer::replan`]).
+//!
+//! Production constructs no gate until S10-04b: its plays keep opening
+//! their first READY as the play. Development runs install one.
+
+#![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+#![cfg_attr(
+    not(feature = "dev-tools"),
+    expect(
+        dead_code,
+        reason = "production installs no start gate until S10-04b turns it on; development runs do"
+    )
+)]
+
+use std::time::{Duration, Instant};
+
+use bms_model::TimeUs;
+use eval::InputStart;
+use game::{AudioControl, HistoryRecorder, InputWaitError, Opening, Rearm as LiveRearm};
+use input::{
+    AdjustmentBindings, AdjustmentReceiver, GatePhase, GateState, HoldLatch, SourceReader,
+    StartGate, TapError, adjustment_queue,
+};
+use replay::{CancelReason, MAX_CANCELLED_EVENTS, MAX_OPENING_ARRIVALS};
+
+use crate::input_side::{self, InputLink, RearmOutcome};
+
+/// How long a cancellation's acknowledgement is waited for: far beyond a
+/// period, which is when the audio thread takes the cancel.
+const DROP_TIMEOUT: Duration = game::SWITCH_TIMEOUT;
+
+/// The start gate of the player's plays.
+pub struct PlayerGate {
+    gate: StartGate,
+    latch: HoldLatch,
+    /// The tap's queue's other end, kept so the queue stays open; the
+    /// controls' reducer reads it from S10-04b.
+    _adjust: AdjustmentReceiver,
+    /// The candidate armed last.
+    armed: u32,
+    /// Whether the attempt's first candidate was handed to audio.
+    started: bool,
+    /// The rearm's readers and buffers, reserved at the first opening and
+    /// reused by every rearm of the run.
+    rearm: Option<Box<input_side::Rearm>>,
+    /// The input side's held-snapshot storage.
+    snapshot: usize,
+    /// A round's restore box the next rearm plans in.
+    spare: Option<Box<game::Restore>>,
+}
+
+impl PlayerGate {
+    /// Sends the input thread a tap of `bindings` and keeps its start gate
+    /// and hold latch.
+    ///
+    /// # Errors
+    ///
+    /// What the tap refuses of `bindings`.
+    pub fn install(input: &InputLink, bindings: AdjustmentBindings) -> Result<Self, TapError> {
+        let (mut tap, receiver) = adjustment_queue(bindings)?;
+        tap.set_active(true);
+        let gate = tap.start_gate();
+        let latch = tap.latch();
+        input.tap(tap);
+        Ok(Self {
+            gate,
+            latch,
+            _adjust: receiver,
+            armed: 0,
+            started: false,
+            rearm: None,
+            snapshot: 0,
+            spare: None,
+        })
+    }
+
+    /// Candidate `generation` opened with `opening`: the rearm's buffers
+    /// are reserved once, for the input side's snapshot storage.
+    pub fn opened(&mut self, generation: u32, opening: &Opening<SourceReader>) {
+        self.armed = generation;
+        self.started = false;
+        let snapshot = opening.start.held.capacity();
+        if self
+            .rearm
+            .as_ref()
+            .is_some_and(|r| r.start.held.capacity() >= snapshot)
+        {
+            self.snapshot = snapshot;
+            return;
+        }
+        self.snapshot = snapshot;
+        self.rearm = Some(Box::new(input_side::Rearm {
+            readers: Vec::new(),
+            lead_in: TimeUs(0),
+            generation: 0,
+            start: InputStart {
+                opened_at: TimeUs(0),
+                held: Vec::with_capacity(snapshot),
+            },
+            arrivals: Vec::with_capacity(MAX_OPENING_ARRIVALS),
+            leftover: Vec::with_capacity(MAX_CANCELLED_EVENTS),
+            room: 0,
+            outcome: RearmOutcome::Pending,
+        }));
+    }
+
+    /// The candidate armed last was handed to audio, with a round's
+    /// `restore`: a copy is kept to plan the first rearm's restore in.
+    pub fn started(&mut self, restore: Option<&game::Restore>) {
+        self.started = true;
+        if self.spare.is_none() {
+            self.spare = restore.map(|r| Box::new(r.clone()));
+        }
+    }
+
+    /// Whether the attempt's first candidate was handed to audio.
+    #[must_use]
+    pub const fn is_started(&self) -> bool {
+        self.started
+    }
+
+    /// The input side's held-snapshot storage.
+    #[must_use]
+    pub const fn snapshot(&self) -> usize {
+        self.snapshot
+    }
+
+    /// Whether START or SELECT is held, or may be, as the latch reads: when
+    /// to ask the input side again.
+    #[must_use]
+    pub fn holding(&self) -> bool {
+        let hold = self.latch.read();
+        hold.held || hold.unverified
+    }
+
+    /// The start gate now.
+    #[must_use]
+    pub fn state(&self) -> GateState {
+        self.gate.state()
+    }
+
+    /// Cancels candidate `generation` unless it committed first: `true`
+    /// when it committed.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    pub fn settle(&self, generation: u32) -> bool {
+        let _ = self.gate.cancel();
+        self.gate.state()
+            == GateState {
+                generation,
+                phase: GatePhase::Committed,
+            }
+    }
+
+    /// The transport authorization of the candidate armed last, committing
+    /// at chart time `commit_at`.
+    #[must_use]
+    pub fn transport(&self, commit_at: TimeUs) -> game::TransportGate {
+        game::TransportGate {
+            gate: self.gate.clone(),
+            generation: self.armed,
+            commit_at,
+        }
+    }
+
+    /// Plans a rearmed round's restore at chart time `at` on the frame line
+    /// of `origin`, in the spare box (or the one the audio thread gave
+    /// back): nothing is allocated.
+    ///
+    /// # Errors
+    ///
+    /// What [`game::Restorer::replan`] refuses, or no box to plan in.
+    pub fn replan(
+        &mut self,
+        restorer: &game::Restorer,
+        control: &mut AudioControl,
+        origin: TimeUs,
+        at: TimeUs,
+    ) -> Result<(), game::RestoreError> {
+        if self.spare.is_none() {
+            self.spare = control.take_restore();
+        }
+        let spare = self
+            .spare
+            .as_deref_mut()
+            .ok_or(game::RestoreError::NotPrepared)?;
+        restorer.replan(spare, control.counters().frame_line(origin), at)
+    }
+
+    /// The rearmed candidate `generation`'s start, chart time 0 at
+    /// `origin`, its transport committing at `commit_at`, a round's restore
+    /// with it.
+    pub fn restart(
+        &mut self,
+        control: &mut AudioControl,
+        origin: TimeUs,
+        generation: u32,
+        commit_at: TimeUs,
+        round: bool,
+    ) {
+        self.armed = generation;
+        let restore = if round { self.spare.take() } else { None };
+        control.rearm(origin, self.transport(commit_at), restore);
+    }
+
+    /// Seals the cancelled candidate's opening and opens candidate
+    /// `generation` through the input thread ([`InputLink::rearm`]): the
+    /// game thread drains `readers` into `history` first, the input thread
+    /// takes what came since at its boundary, and the sealed opening is
+    /// kept with its closing time and arrivals before the next candidate's
+    /// snapshot is copied into `start`. A history that ran out, or buffers
+    /// the input side found too small, seals the capture: nothing opens.
+    ///
+    /// # Errors
+    ///
+    /// The input thread's failure.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    pub fn rearm(
+        &mut self,
+        input: &mut InputLink,
+        readers: &mut Vec<SourceReader>,
+        lead_in: TimeUs,
+        generation: u32,
+        history: &mut HistoryRecorder,
+        start: &mut InputStart,
+    ) -> Result<LiveRearm, InputWaitError> {
+        let Some(mut rearm) = self.rearm.take() else {
+            return Err(InputWaitError::Gone);
+        };
+        if history.drain(readers).is_err() {
+            self.rearm = Some(rearm);
+            return Ok(LiveRearm::Held);
+        }
+        rearm.readers = std::mem::take(readers);
+        rearm.lead_in = lead_in;
+        rearm.generation = generation;
+        rearm.room = history.room();
+        let mut rearm = input.rearm(rearm)?;
+        *readers = std::mem::take(&mut rearm.readers);
+        let outcome = rearm.outcome;
+        let answer = match outcome {
+            RearmOutcome::Opened { origin, closed } => {
+                let kept = history.take(&rearm.leftover).and(history.seal(
+                    closed,
+                    &rearm.arrivals,
+                    CancelReason::Held,
+                ));
+                if kept.is_err() {
+                    history.exhaust();
+                }
+                start.opened_at = rearm.start.opened_at;
+                start.held.clear();
+                let room = start.held.capacity();
+                start
+                    .held
+                    .extend(rearm.start.held.iter().take(room).copied());
+                self.armed = generation;
+                LiveRearm::Opened { origin }
+            }
+            RearmOutcome::Held | RearmOutcome::Pending => LiveRearm::Held,
+            RearmOutcome::Refused => {
+                history.exhaust();
+                LiveRearm::Held
+            }
+        };
+        self.rearm = Some(rearm);
+        Ok(answer)
+    }
+}
+
+/// Waits, at most [`DROP_TIMEOUT`], until the audio thread acknowledged
+/// dropping candidate `generation`'s transport, or `gate` shows it
+/// committed: no authorization of it is left when the next opens. A worker
+/// that does not answer shows as the output's failure.
+pub fn wait_dropped(control: &AudioControl, gate: &PlayerGate, generation: u32) {
+    let counters = control.counters();
+    let begun = Instant::now();
+    while !counters.dropped(generation)
+        && gate.state().phase != GatePhase::Committed
+        && control.failure().is_none()
+        && begun.elapsed() < DROP_TIMEOUT
+    {
+        std::thread::sleep(Duration::from_micros(200));
+    }
+}

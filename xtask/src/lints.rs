@@ -243,6 +243,13 @@ pub const IN_PLAY: &[Site] = &[
             "PlayerRig::ring_out",
             "PlayerRig::audio_done",
             "PlayerRig::input_failure",
+            "PlayerRig::holding",
+            "PlayerRig::candidate",
+            "PlayerRig::settle_candidate",
+            "PlayerRig::cancel_candidate",
+            "PlayerRig::rearm_candidate",
+            "PlayerRig::restart_candidate",
+            "PlayerRig::snapshot_capacity",
             "until_due",
             "until_fired",
         ],
@@ -261,6 +268,7 @@ pub const IN_PLAY: &[Site] = &[
         ],
     ),
     Site::File("crates/player/src/tuning.rs"),
+    Site::File("crates/player/src/start_gate.rs"),
     // The audio thread.
     Site::File("crates/game/src/audio_loop.rs"),
     Site::Fns(

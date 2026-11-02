@@ -471,6 +471,85 @@ fn an_invalid_key_config_exits_nonzero() {
     }
 }
 
+/// The start gate on the real threads (`--dev-start-gate`; design.md
+/// "Play Lifecycle", the start gate): START (Q) held 300 ms before chart
+/// time 0 cancels the first READY through the input thread's latch, its
+/// release at 200 ms rearms a fresh READY through the input thread's
+/// boundary and the audio thread's transport, and the notes, pressed
+/// 1.2 s later than the log has them, are played by that READY. The saved
+/// record keeps the cancelled opening, Q's press in it, and the winning
+/// READY's input alone.
+#[test]
+fn the_start_gate_cancels_and_rearms_ready_on_the_real_threads() {
+    const Q: u32 = 0x10;
+    let Fixture {
+        dir: _dir,
+        chart_path,
+        log,
+        appdata,
+        ..
+    } = fixture();
+    let mut rec = replay::decode(&fs::read(&log).unwrap(), &DecodeLimits::default()).unwrap();
+    let q = |ms: i64, value: i32| eval::PhysicalInputEvent {
+        received: TimeUs(ms * 1_000),
+        source: eval::SourceId(0),
+        kind: eval::InputKind::Control {
+            control: eval::ControlId(Q),
+            value,
+        },
+    };
+    let mut events = vec![q(-300, 1), q(200, 0)];
+    events.extend(rec.events.iter().map(|e| eval::PhysicalInputEvent {
+        received: TimeUs(e.received.0 + 1_200_000),
+        ..*e
+    }));
+    rec.events = events;
+    rec.status.finalized = TimeUs(rec.status.finalized.0 + 1_200_000);
+    fs::write(&log, replay::encode(&rec)).unwrap();
+
+    let out = scripted_play(&chart_path, &log, &appdata)
+        .arg("--dev-start-gate")
+        .output()
+        .expect("run tapestry");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    println!("{stdout}{stderr}");
+    assert_eq!(out.status.code(), Some(0));
+    assert!(
+        stdout.contains("re-evaluation matches live: true"),
+        "{stdout}"
+    );
+
+    let saved = records(&appdata);
+    assert_eq!(saved.len(), 1, "{saved:?}");
+    let rec = replay::decode(&fs::read(&saved[0]).unwrap(), &DecodeLimits::default()).unwrap();
+    assert_eq!(rec.status.end, EndStatus::PlayedToEnd);
+    let h = &rec.history;
+    assert_eq!(h.openings.len(), 1, "{h:?}");
+    let o = &h.openings[0];
+    assert_eq!(o.reason, replay::CancelReason::Held);
+    // The release was seen at an input boundary just after 200 ms: the
+    // next READY's chart time 0 lies about 1.2 s after the first's.
+    assert!(
+        (-1_250_000..=-1_199_000).contains(&o.origin.0),
+        "{:?}",
+        o.origin
+    );
+    let cancelled = &h.events[o.events.start as usize..o.events.end as usize];
+    assert!(cancelled.iter().any(|e| e.kind
+        == eval::InputKind::Control {
+            control: eval::ControlId(Q),
+            value: 1
+        }));
+    // The winning READY's input: every note's press and release.
+    let lanes = rec
+        .events
+        .iter()
+        .filter(|e| !matches!(e.kind, eval::InputKind::Control { control, .. } if control.0 == Q))
+        .count();
+    assert_eq!(lanes, 2 * NOTES);
+}
+
 /// A capture cancelled before playback is no script: the run ends with
 /// the reason and a nonzero exit, and nothing is recorded.
 #[test]

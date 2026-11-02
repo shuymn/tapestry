@@ -1632,6 +1632,10 @@ enum Mode {
         side: RenderSide,
         gauge: usize,
         first: bool,
+        /// The READY candidate's rearms drawn from (design.md "Play
+        /// Lifecycle", the start gate): when the side counts another, the
+        /// play is drawn from the rearmed candidate's origin.
+        rearms: u64,
     },
     /// The end screen: [`Run::end_page`].
     End,
@@ -1888,6 +1892,7 @@ impl Run {
                         side,
                         gauge,
                         first: true,
+                        rearms: 0,
                     };
                 }
                 // Without a screen (it failed), the failure stays reported
@@ -2018,6 +2023,7 @@ impl Run {
                     side,
                     gauge,
                     first,
+                    rearms,
                 } => {
                     // The app region's first interval (design.md "Scope of
                     // No Allocation"): this frame's own work up to the
@@ -2032,6 +2038,13 @@ impl Run {
                     // frame.
                     let room = effects.capacity();
                     side.drain_effects_up_to(room, |e| effects.push(*e));
+                    // A rearmed READY candidate is drawn from its own origin;
+                    // the cancelled one's effects never reach the frame.
+                    let rearmed = side.rearms();
+                    if rearmed != *rearms {
+                        *rearms = rearmed;
+                        *origin = side.rearmed_origin();
+                    }
                     let now = TimeUs(self.clock.now().0 - origin.0);
                     // Hi-speed and the display offset change anytime and move
                     // the notes only: they reach the screen here and nowhere

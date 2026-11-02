@@ -172,6 +172,11 @@ pub struct PlayerRig<'a> {
     /// (dev-tools).
     #[cfg(feature = "dev-tools")]
     pub adjust_on_end: Vec<game::Adjust>,
+    /// The start gate's player side (design.md "Play Lifecycle", the start
+    /// gate): `None` runs the plays as before, every first READY the play;
+    /// production constructs it so until S10-04b, and development runs
+    /// set it ([`crate::start_gate::PlayerGate::install`]).
+    pub gate: Option<crate::start_gate::PlayerGate>,
 }
 
 impl PlayerRig<'_> {
@@ -565,7 +570,114 @@ impl Rig for PlayerRig<'_> {
             lead_in,
             logic: thread::current(),
             recorded: self.recorded.clone(),
+            gate: None,
         })
+    }
+
+    fn gated(&self) -> bool {
+        self.gate.is_some()
+    }
+
+    fn open_candidate(
+        &mut self,
+        lead_in: TimeUs,
+        generation: u32,
+    ) -> Result<Option<Opening<SourceReader>>, InputWaitError> {
+        if let Some(window) = &self.window {
+            window.wait_to_open();
+        }
+        self.in_play = true;
+        self.lead_in = lead_in;
+        let opened = self.input.open_candidate(Request::Open {
+            lead_in,
+            logic: thread::current(),
+            recorded: self.recorded.clone(),
+            gate: Some(generation),
+        })?;
+        if let (Some(opening), Some(gate)) = (&opened, &mut self.gate) {
+            gate.opened(generation, opening);
+        }
+        Ok(opened)
+    }
+
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn holding(&self) -> bool {
+        self.gate
+            .as_ref()
+            .is_some_and(crate::start_gate::PlayerGate::holding)
+    }
+
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn candidate(&self) -> input::GateState {
+        self.gate.as_ref().map_or(
+            input::GateState {
+                generation: 0,
+                phase: input::GatePhase::Idle,
+            },
+            crate::start_gate::PlayerGate::state,
+        )
+    }
+
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn settle_candidate(&mut self, generation: u32) -> bool {
+        self.gate.as_ref().is_some_and(|g| g.settle(generation))
+    }
+
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn cancel_candidate(&mut self, generation: u32) {
+        self.audio.control.cancel();
+        if let Some(gate) = &self.gate {
+            crate::start_gate::wait_dropped(&self.audio.control, gate, generation);
+        }
+    }
+
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn rearm_candidate(
+        &mut self,
+        readers: &mut Vec<SourceReader>,
+        lead_in: TimeUs,
+        generation: u32,
+        history: &mut game::HistoryRecorder,
+        start: &mut eval::InputStart,
+    ) -> Result<game::Rearm, InputWaitError> {
+        let Some(gate) = &mut self.gate else {
+            return Ok(game::Rearm::Held);
+        };
+        let rearmed = gate.rearm(
+            &mut self.input,
+            readers,
+            lead_in,
+            generation,
+            history,
+            start,
+        )?;
+        if let game::Rearm::Opened { origin } = rearmed {
+            self.origin = Some(origin);
+            self.ready_state_at = Some(TimeUs(origin.0 - lead_in.0));
+        }
+        Ok(rearmed)
+    }
+
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn restart_candidate(&mut self, origin: TimeUs, generation: u32) {
+        let commit_at = self.restore_at.unwrap_or(TimeUs(0));
+        let round = self.restore_at.is_some();
+        if let Some(gate) = &mut self.gate {
+            gate.restart(
+                &mut self.audio.control,
+                origin,
+                generation,
+                commit_at,
+                round,
+            );
+        }
+    }
+
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn snapshot_capacity(&self) -> usize {
+        self.gate
+            .as_ref()
+            .map_or(0, crate::start_gate::PlayerGate::snapshot)
     }
 
     fn start(&mut self, origin: TimeUs, sounds: AudioQueue, screen: RenderSide) {
@@ -595,10 +707,19 @@ impl Rig for PlayerRig<'_> {
             .map_or(self.gain, |s| s.shelf.gain());
         // Audio was readied before recording opened, so this does not
         // wait; a worker gone since shows as the output's failure.
-        let _ = self
-            .audio
-            .control
-            .play_at(origin, sounds, gain, self.restore.take());
+        // A gated play's transport waits for its candidate's commit.
+        let restore = self.restore.take();
+        let commit_at = self.restore_at.unwrap_or(TimeUs(0));
+        let _ = match &mut self.gate {
+            Some(gate) => {
+                gate.started(restore.as_deref());
+                let transport = gate.transport(commit_at);
+                self.audio
+                    .control
+                    .play_gated(origin, sounds, gain, restore, transport)
+            }
+            None => self.audio.control.play_at(origin, sounds, gain, restore),
+        };
         self.generation = self.audio.control.generation();
         self.steps_dropped = 0;
         let measure = PlayMeasure {
@@ -635,6 +756,11 @@ impl Rig for PlayerRig<'_> {
 
     fn restore_audio(&mut self, origin: TimeUs, at: TimeUs) -> Result<(), RestoreError> {
         let restorer = self.restorer.as_ref().ok_or(RestoreError::NotPrepared)?;
+        // A rearmed round's restore is planned again in the gate's spare
+        // box, allocating nothing.
+        if let Some(gate) = self.gate.as_mut().filter(|g| g.is_started()) {
+            return gate.replan(restorer, &mut self.audio.control, origin, at);
+        }
         self.restore = Some(plan_restore(
             restorer,
             &self.audio.control.counters(),

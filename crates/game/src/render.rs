@@ -4,7 +4,7 @@
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
 use bms_model::TimeUs;
 use eval::{GaugeState, JudgeEvent, Tally};
@@ -63,6 +63,9 @@ struct Rearmed {
     skip_to: AtomicU64,
     /// Rearms so far.
     count: AtomicU64,
+    /// The latest rearmed candidate's chart time 0 on the rig's clock,
+    /// stored before the count.
+    origin: AtomicI64,
 }
 
 impl EventSink for RenderSink {
@@ -74,8 +77,9 @@ impl EventSink for RenderSink {
         }
     }
 
-    fn rearm(&mut self, _origin: TimeUs) {
+    fn rearm(&mut self, origin: TimeUs) {
         self.rearmed.skip_to.store(self.pushed, Ordering::Release);
+        self.rearmed.origin.store(origin.0, Ordering::Release);
         self.rearmed.count.fetch_add(1, Ordering::Release);
     }
 }
@@ -145,6 +149,16 @@ impl RenderSide {
     #[must_use]
     pub fn rearms(&self) -> u64 {
         self.rearmed.count.load(Ordering::Acquire)
+    }
+
+    /// Where the latest rearmed READY candidate puts its chart time 0 on
+    /// the rig's clock: the screen draws from there once [`rearms`]
+    /// changed.
+    ///
+    /// [`rearms`]: Self::rearms
+    #[must_use]
+    pub fn rearmed_origin(&self) -> TimeUs {
+        TimeUs(self.rearmed.origin.load(Ordering::Acquire))
     }
 }
 
