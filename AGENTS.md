@@ -34,7 +34,7 @@ The two `dev-tools` commands build and test the development features, which the 
 
 Linux-side tools (fuzzing, Linux builds) run inside `nix develop` via the WSL wrapper script (docs/setup.md "Linux-Side Tools (WSL)"). The fuzz crate `fuzz/` is outside the workspace: check it with `--manifest-path fuzz/Cargo.toml` (fmt, clippy, test); running the fuzzer is in docs/setup.md "Fuzzing".
 
-On Linux, the Windows-only crates can be checked (not tested or run) by cross-compiling with [cargo-xwin](https://github.com/rust-cross/cargo-xwin), which is not pinned by mise. It needs the `x86_64-pc-windows-msvc` target (`mise exec -- rustup target add x86_64-pc-windows-msvc`), and on first use it downloads the MSVC CRT and Windows SDK under Microsoft's license (set `XWIN_ACCEPT_LICENSE=1`, or pre-cache them with `cargo xwin cache xwin`):
+On Linux, the Windows-only crates can be checked (not tested or run) by cross-compiling with [cargo-xwin](https://github.com/rust-cross/cargo-xwin), which mise installs on Linux only. It needs the `x86_64-pc-windows-msvc` target (`mise exec -- rustup target add x86_64-pc-windows-msvc`), and on first use it downloads the MSVC CRT and Windows SDK under Microsoft's license (set `XWIN_ACCEPT_LICENSE=1`, or pre-cache them with `cargo xwin cache xwin`):
 
 ```sh
 mise exec -- cargo xwin clippy --workspace --all-targets --target x86_64-pc-windows-msvc -- -D warnings
