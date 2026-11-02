@@ -106,6 +106,10 @@ struct Device {
     /// Whether it is a source of the next opening
     /// ([`SourceSet::set_takes_part`]).
     takes_part: bool,
+    /// Whether its input reaches the adjustment tap: a source of the open
+    /// recording, else a device that would be one if recording opened now
+    /// ([`SourceSet::set_adjustment`]).
+    adjusts: bool,
     /// A held control did not fit, so `held` may miss one. Kept until the
     /// device is removed; every play it takes part in is incomplete.
     state_lost: bool,
@@ -339,7 +343,7 @@ impl SourceSet {
             return admit;
         };
         let source = device.source;
-        let reaches = adjusts(self.recording.is_some(), device);
+        let reaches = device.adjusts;
         let tapped = self
             .adjust
             .as_ref()
@@ -433,21 +437,30 @@ impl SourceSet {
     /// Sends the adjustment controls to `tap` from now on, recording open
     /// or not, while it is active; replaces an earlier one. Only the
     /// devices whose input the play may record reach it: the sources of
-    /// the open recording, else the devices that take part
-    /// ([`set_takes_part`](Self::set_takes_part)). The controls they hold
-    /// now are counted as its holders.
+    /// the open recording, else the devices that would be its sources if
+    /// it opened now (those that take part,
+    /// [`set_takes_part`](Self::set_takes_part), controllers first, up to
+    /// `max_sources`). The controls they hold now are counted as its
+    /// holders.
     pub fn set_adjustment(&mut self, tap: AdjustmentTap) {
         self.adjust = Some(tap);
-        self.recount_adjustment();
+        self.recount_adjustment(false);
     }
 
-    /// Counts the adjustment tap's holders again, after the devices that
-    /// reach it or the controls they map to changed.
-    fn recount_adjustment(&mut self) {
+    /// Marks again the devices that reach the adjustment tap and counts
+    /// its holders again; `owners_changed` when one that reached it left,
+    /// or its controls now map differently, which the marking cannot see.
+    fn recount_adjustment(&mut self, owners_changed: bool) {
+        let reach = if self.recording.is_some() {
+            Reach::Sources
+        } else {
+            Reach::Taking(self.config.max_sources)
+        };
         recount(
             self.adjust.as_mut(),
-            &self.devices,
-            self.recording.is_some(),
+            &mut self.devices,
+            reach,
+            owners_changed,
         );
     }
 
@@ -513,10 +526,12 @@ impl SourceSet {
                 axis_ranges: Vec::new(),
                 product: None,
                 takes_part: true,
+                adjusts: false,
                 state_lost: false,
                 connection: self.next_connection,
             });
             self.next_connection += 1;
+            self.recount_adjustment(false);
         } else {
             // No room for its state: kept out like an unread device.
             self.connect_unread(device, kind);
@@ -628,6 +643,11 @@ impl SourceSet {
             controls,
             relative,
         });
+        let remapped = self
+            .devices
+            .iter()
+            .any(|d| d.adjusts && d.product == Some(product));
+        self.recount_adjustment(remapped);
     }
 
     /// Whether the axis `cap` of `device` is taken as relative: the mode
@@ -739,8 +759,9 @@ impl SourceSet {
     pub fn set_product(&mut self, device: DeviceId, product: HidProduct) -> bool {
         match self.devices.iter_mut().find(|d| d.id == device) {
             Some(d) => {
+                let remapped = d.adjusts && d.product != Some(product);
                 d.product = Some(product);
-                self.recount_adjustment();
+                self.recount_adjustment(remapped);
                 true
             }
             None => false,
@@ -769,7 +790,7 @@ impl SourceSet {
         match self.devices.iter_mut().find(|d| d.id == device) {
             Some(d) => {
                 d.takes_part = takes_part;
-                self.recount_adjustment();
+                self.recount_adjustment(false);
                 true
             }
             None => false,
@@ -800,7 +821,7 @@ impl SourceSet {
         // source ids at the next open.
         let mut removed = self.devices.remove(i);
         if let Some(tap) = &mut self.adjust
-            && adjusts(self.recording.is_some(), &removed)
+            && removed.adjusts
         {
             // What it held is released.
             let foreground = !self.gate.is_tripped();
@@ -812,7 +833,7 @@ impl SourceSet {
         }
         // The latch is verified again once no device that lost its state
         // reaches the tap.
-        self.recount_adjustment();
+        self.recount_adjustment(removed.adjusts);
         removed.held.clear();
         self.spare_held.push(removed.held);
         let Some(source) = removed.source else {
@@ -887,23 +908,20 @@ impl SourceSet {
     /// ([`reopen`](Self::reopen)) reuses them. Returns the opening's
     /// snapshot.
     pub fn open_attempt(&mut self, now: TimeUs, origin: TimeUs) -> &InputStart {
+        // Closed, the devices that would be sources are marked, as the
+        // adjustment tap takes them (`recount`'s `Reach::Taking`).
         self.close_recording();
         let taking = self.devices.iter().filter(|d| d.takes_part).count();
-        let n = taking.min(self.config.max_sources);
+        let n = self.devices.iter().filter(|d| d.adjusts).count();
         let left_out = taking - n + self.untracked;
         let capacity = self.config.queue_capacity;
         let mut overflowed = false;
         let mut participants = Vec::with_capacity(n);
         let mut readers = Vec::with_capacity(n);
-        // Controllers first, so keyboards' many handles never push a
-        // controller out at the limit; each kind in the order found.
         for kind in [DeviceKind::Controller, DeviceKind::Keyboard] {
             let devices = self.devices.iter_mut();
-            for device in devices.filter(|d| d.takes_part && d.kind == kind) {
+            for device in devices.filter(|d| d.adjusts && d.kind == kind) {
                 let i = participants.len();
-                if i == n {
-                    break;
-                }
                 #[expect(
                     clippy::expect_used,
                     reason = "`SourceSet::new` bounds `max_sources` by SOURCE_LIMIT, which fits in u16"
@@ -956,7 +974,12 @@ impl SourceSet {
             },
         });
         snapshot(rec, &self.devices, now);
-        recount(self.adjust.as_mut(), &self.devices, true);
+        recount(
+            self.adjust.as_mut(),
+            &mut self.devices,
+            Reach::Sources,
+            false,
+        );
         &rec.start
     }
 
@@ -1052,7 +1075,7 @@ impl SourceSet {
         for d in &mut self.devices {
             d.source = None;
         }
-        self.recount_adjustment();
+        self.recount_adjustment(false);
     }
 
     /// Whether recording is open.
@@ -1165,26 +1188,52 @@ fn snapshot(rec: &mut Recording, devices: &[Device], now: TimeUs) {
     }
 }
 
-/// Whether `device`'s input reaches the adjustment tap: while recording is
-/// open, a source of it; otherwise a device that takes part in the next
-/// opening, as a play could record it.
-const fn adjusts(recording: bool, device: &Device) -> bool {
-    if recording {
-        device.source.is_some()
-    } else {
-        device.takes_part
-    }
+/// Which devices reach the adjustment tap.
+#[derive(Clone, Copy)]
+enum Reach {
+    /// The sources of the open recording.
+    Sources,
+    /// Those that would be sources if recording opened now: the devices
+    /// that take part, controllers first so keyboards' many handles never
+    /// push a controller out at the limit, each kind in the order found,
+    /// up to this many. [`SourceSet::open_attempt`] makes the marked ones
+    /// its sources.
+    Taking(usize),
 }
 
-/// Counts `tap`'s holders again over the `devices` whose input reaches it.
-fn recount(tap: Option<&mut AdjustmentTap>, devices: &[Device], recording: bool) {
+/// Marks the `devices` that reach `tap` by `reach` and counts its holders
+/// again over them. A change in which devices reach it, or
+/// `owners_changed`, ends the tap's ownership: it sends a new baseline.
+fn recount(
+    tap: Option<&mut AdjustmentTap>,
+    devices: &mut [Device],
+    reach: Reach,
+    owners_changed: bool,
+) {
+    let mut changed = owners_changed;
+    let mut taken = 0;
+    for kind in [DeviceKind::Controller, DeviceKind::Keyboard] {
+        for d in devices.iter_mut().filter(|d| d.kind == kind) {
+            let adjusts = match reach {
+                Reach::Sources => d.source.is_some(),
+                Reach::Taking(max) => {
+                    let within = d.takes_part && taken < max;
+                    taken += usize::from(d.takes_part);
+                    within
+                }
+            };
+            changed |= adjusts != d.adjusts;
+            d.adjusts = adjusts;
+        }
+    }
     let Some(tap) = tap else {
         return;
     };
-    let reaching = || devices.iter().filter(move |d| adjusts(recording, d));
+    let reaching = || devices.iter().filter(|d| d.adjusts);
     tap.recount(
         reaching().flat_map(|d| d.held.iter().map(|&(c, _)| (d.kind, d.product, c))),
         reaching().any(|d| d.state_lost),
+        changed,
     );
 }
 

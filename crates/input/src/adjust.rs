@@ -262,12 +262,15 @@ impl AdjustmentTap {
 
     /// Counts the holders again from `held`, each control a device whose
     /// input reaches the tap holds, without sending them as presses or
-    /// releases; the latch is unverified while `unverified` holds. A held
-    /// set that changes while active is sent as a new baseline.
+    /// releases; the latch is unverified while `unverified` holds. While
+    /// active, a held set that changes, or `owners_changed` (the devices
+    /// that reach the tap or their mappings changed), is sent as a new
+    /// baseline.
     pub(crate) fn recount(
         &mut self,
         held: impl Iterator<Item = (DeviceKind, Option<HidProduct>, ControlId)>,
         unverified: bool,
+        owners_changed: bool,
     ) {
         let before = self.held_set();
         self.holders = [0; MAX_TAPPED];
@@ -279,7 +282,10 @@ impl AdjustmentTap {
                 *h = h.saturating_add(1);
             }
         }
-        if self.active && self.pending == Pending::None && self.held_set() != before {
+        if self.active
+            && self.pending == Pending::None
+            && (owners_changed || self.held_set() != before)
+        {
             self.pending = Pending::Resync;
         }
         self.set_unverified(unverified);

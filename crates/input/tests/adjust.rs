@@ -349,9 +349,9 @@ fn only_devices_whose_input_the_play_may_record_reach_the_tap() {
 }
 
 #[test]
-fn a_device_left_out_of_the_sources_stops_reaching_the_tap_when_recording_opens() {
+fn while_recording_is_closed_only_the_devices_that_would_be_sources_reach_the_tap() {
     let mut set = SourceSet::new(SourceConfig {
-        max_devices: 2,
+        max_devices: 3,
         max_sources: 1,
         max_held: 8,
         queue_capacity: 64,
@@ -372,17 +372,56 @@ fn a_device_left_out_of_the_sources_stops_reaching_the_tap_when_recording_opens(
     tap.set_active(true);
     set.set_adjustment(tap);
     batch(&mut set, 10, &[packet(2, Q, 1)]);
+    assert!(!latch.read().held, "keyboard 2 would get no source");
+    // A controller that takes part is chosen first: keyboard 1 gives up
+    // the one source while it is connected.
+    set.begin_batch(TimeUs(20));
+    set.connect(DeviceId(3), DeviceKind::Controller);
+    set.end_batch(TimeUs(21));
+    set.begin_batch(TimeUs(30));
+    set.disconnect(DeviceId(3));
+    set.end_batch(TimeUs(31));
+    // Once keyboard 1 goes, keyboard 2 would get the source: what it holds
+    // becomes the baseline, with no press.
+    set.begin_batch(TimeUs(40));
+    set.disconnect(DeviceId(1));
+    set.end_batch(TimeUs(41));
     assert!(latch.read().held);
-    set.open_recording(TimeUs(15));
-    assert!(!latch.read().held, "keyboard 2 got no source");
-    batch(&mut set, 20, &[packet(2, Q, 0)]);
+    assert_eq!(
+        drain(&mut rx),
+        [
+            (10, TapEvent::Resync(0)),
+            (20, TapEvent::Resync(0)),
+            (30, TapEvent::Resync(0)),
+            (40, TapEvent::Resync(1 << START)),
+        ]
+    );
+}
+
+#[test]
+fn a_change_of_the_devices_reaching_the_tap_is_a_new_baseline_with_the_same_held_set() {
+    let (mut set, mut rx, _) = rig(false);
+    batch(&mut set, 10, &[packet(1, Q, 1)]);
+    batch(&mut set, 20, &[packet(3, TURN, 250)]);
+    // The controller's axis leaves and comes back while START stays held:
+    // its ownership ended, so the reducer gets a new baseline.
+    set.set_takes_part(DeviceId(3), false);
+    set.set_takes_part(DeviceId(3), true);
+    batch(&mut set, 30, &[]);
+    // So does a new mode for its axis.
+    set.set_axis_mode(PRODUCT, vec![TURN], true);
+    batch(&mut set, 40, &[]);
     assert_eq!(
         drain(&mut rx),
         [
             (10, TapEvent::Resync(0)),
             (10, TapEvent::Press(START)),
             (10, TapEvent::Tick),
-            (20, TapEvent::Resync(0)),
+            (20, TapEvent::Tick),
+            (30, TapEvent::Resync(1 << START)),
+            (30, TapEvent::Tick),
+            (40, TapEvent::Resync(1 << START)),
+            (40, TapEvent::Tick),
         ]
     );
 }
