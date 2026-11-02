@@ -69,7 +69,7 @@ pub use simple::{
     RESULT_CELL_COLUMN, RESULT_GAUGE_ROW, SimpleSkin, layout, result_graphs, result_screen,
     text_screen,
 };
-pub use skin::{AttemptInput, FrameInput, LoadingFrame, PlaySkin, SkinError};
+pub use skin::{AttemptInput, FrameInput, LoadingFrame, PlaySkin, SkinError, cover_settings};
 pub use skin_atlas::{AtlasPages, PageLevels, RESERVED_LAYERS, UploadError, atlas_limits};
 pub use sprite::{Blend, FLAG_NEAREST, Instance, Run, Sprite, SpriteBatch};
 pub use staging::{Scissor, Staging};
