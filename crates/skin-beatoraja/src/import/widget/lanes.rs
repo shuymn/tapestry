@@ -417,8 +417,6 @@ impl Cx<'_> {
                 return refuse(self, "offset");
             }
         }
-        // Each height in native lane order (source slot 7 is the scratch,
-        // native lane 0).
         let mut source = SourceLanes {
             bottom: base.to_f32(),
             height: h_up.to_f32(),
@@ -432,7 +430,8 @@ impl Cx<'_> {
         // at most the exact room, so the step down is at most the
         // bottom's own rounding (half an `f32` step of the bottom) and one
         // `f32` step of the height. A height that no positive `f32` fits
-        // after the bottom's rounding is out of range.
+        // after the bottom's rounding is out of range. Each goes to its
+        // native lane (source slot 7 is the scratch, native lane 0).
         let max_h = source.max_note_h(top);
         for (u, h) in heights.iter().enumerate() {
             let v = h.to_f32().min(max_h);

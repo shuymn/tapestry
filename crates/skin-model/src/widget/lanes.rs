@@ -86,13 +86,13 @@ pub enum LaneStyle {
 /// `bottom − lift` at its judgment time, and every note, cap and mine of
 /// a lane is that lane's `note_h` high: lanes may differ, and the lanes'
 /// common geometry (the region, its bottom and the source's line) does
-/// not depend on any of them. A tap or mine is drawn while its time has not passed,
-/// judged or not (`:546-560`, `:589-593`); nothing is drawn below the
-/// line. A long note is drawn while its end's time has not passed and its
-/// end is ahead of its head, or of the line once the head has passed it
-/// (`:552`, `:577`); its body runs from its end cap's lower edge to its
-/// head cap's upper edge, and its end cap is drawn only when its release
-/// is judged on its own (`:701-727`).
+/// not depend on any of them. A tap or mine is drawn while its time has
+/// not passed, judged or not (`:546-560`, `:589-593`); nothing is drawn
+/// below the line. A long note is drawn while its end's time has not
+/// passed and its end is ahead of its head, or of the line once the head
+/// has passed it (`:552`, `:577`); its body runs from its end cap's lower
+/// edge to its head cap's upper edge, and its end cap is drawn only when
+/// its release is judged on its own (`:701-727`).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SourceLanes {
     /// Where a note's lower edge sits at its judgment time with no lift
