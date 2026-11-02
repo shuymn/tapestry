@@ -40,6 +40,7 @@ jobs:
           install: true
           install_args: rust cargo-deny aqua:rustsec/rustsec/cargo-audit
           cache: true
+          cache_save: ${{ github.ref == 'refs/heads/main' }}
       # An unreadable registry index only warns and skips the yanked check.
       - name: cargo-deny
         run: |

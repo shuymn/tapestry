@@ -340,6 +340,8 @@ mod tests {
             "d",
             "--dev-render-timeout",
             "90",
+            "--dev-stop-timeout",
+            "30",
         ]);
         assert!(s.dev.headless);
         assert_eq!(s.dev.rescan_ms, Some(50));
@@ -348,6 +350,7 @@ mod tests {
             s.dev.render_timeout,
             Some(std::time::Duration::from_secs(90))
         );
+        assert_eq!(s.dev.stop_timeout, Some(std::time::Duration::from_secs(30)));
         assert_eq!(
             s.dev.script,
             Some(crate::dev::SelectScript::parse("pick=a.bms,enter,back,close").unwrap())

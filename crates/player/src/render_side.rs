@@ -3653,15 +3653,21 @@ pub(crate) mod tests {
         release.send(()).unwrap();
     }
 
+    /// Whether `f` holds within 60 s, a bound that only catches a thread
+    /// that never answers: the parallel tests can starve the render thread
+    /// for seconds. `f` is asked once more past the bound, so a wait that
+    /// was itself starved does not fail on time alone.
     pub(crate) fn wait_until(f: impl Fn() -> bool) -> bool {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while Instant::now() < deadline {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
             if f() {
                 return true;
             }
+            if Instant::now() >= deadline {
+                return false;
+            }
             std::thread::sleep(Duration::from_millis(5));
         }
-        false
     }
 
     fn view() -> View {

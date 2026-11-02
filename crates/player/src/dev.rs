@@ -308,6 +308,11 @@ pub struct SelectOptions {
     /// The render thread's bounds, as [`Options::render_timeout`]
     /// (`--dev-render-timeout`).
     pub render_timeout: Option<std::time::Duration>,
+    /// How long the end of the run waits for the scan and the background
+    /// measurement to stop, in place of [`crate::shelf::STOP_TIMEOUT`]
+    /// (`--dev-stop-timeout <seconds>`): a loaded machine can starve their
+    /// background-mode threads for seconds.
+    pub stop_timeout: Option<std::time::Duration>,
     /// The scenario the run plays (`--dev-scenario`), which no option of
     /// selection sets: its roots, captures and inputs.
     pub scenario: Option<scenario::Session>,
@@ -334,6 +339,12 @@ impl SelectOptions {
             }
             "dev-frames" => self.frames = Some(PathBuf::from(p.value()?)),
             "dev-render-timeout" => self.render_timeout = Some(render_timeout(p)?),
+            "dev-stop-timeout" => {
+                let secs = p.value()?.to_string_lossy().parse().map_err(|_| {
+                    UsageError::Usage("--dev-stop-timeout takes seconds".to_owned())
+                })?;
+                self.stop_timeout = Some(std::time::Duration::from_secs(secs));
+            }
             _ => return Err(UsageError::Unknown(format!("--{name}"))),
         }
         Ok(())
