@@ -19,14 +19,21 @@ use super::{Brush, Frame, ImageRef};
 use crate::canvas::f32_of;
 use crate::play::GaugeDesc;
 
-use crate::play::schema::GAUGE_PERMILLE;
 use crate::quad::QuadBatch;
+use crate::skin::MAX_WIDGET_QUADS;
 use crate::track::MAX_KEY_US;
 
-/// The most segments a gauge may have: one per ‰ of the gauge field. A
-/// policy cap; the widget reads the raw gauge value.
-#[expect(clippy::cast_possible_truncation, reason = "1 000")]
-pub const MAX_SEGMENTS: u16 = GAUGE_PERMILLE as u16;
+const _: () = assert!(MAX_WIDGET_QUADS <= u16::MAX as u32);
+
+/// The most segments a gauge may have: every widget quad a frame may push
+/// (16 384), independent of the gauge field's ‰. A referenced gauge also
+/// shares that budget ([`MAX_WIDGET_QUADS`]) with every other widget, a
+/// flicker's tip among them, so a flickering gauge fits one segment fewer.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "MAX_WIDGET_QUADS fits u16, asserted above"
+)]
+pub const MAX_SEGMENTS: u16 = MAX_WIDGET_QUADS as u16;
 
 /// How a gauge looks: a skin draws each with its own images.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -248,7 +255,8 @@ pub(crate) fn mix(k: u64) -> u64 {
     z ^ (z >> 31)
 }
 
-/// The lit segments of `p` for `value` against `max`.
+/// The lit segments of `p` for `value` against `max`. `|value| ≤ 2^63`
+/// and `p ≤ 2^14`, so `value·p` stays within `2^77`, inside `i128`.
 pub(crate) fn lit(value: GaugeValue, max: GaugeValue, p: u16) -> u16 {
     let (v, m, p) = (i128::from(value.0), i128::from(max.0), i128::from(p));
     if v <= 0 || m <= 0 {

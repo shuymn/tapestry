@@ -219,6 +219,47 @@ fn option_items_are_counted_before_anything_is_gathered() {
         assert_eq!(SEEN.load(Ordering::Relaxed), 1, "{want:?}");
     }
 
+    // A gauge naming 100 000 nodes: its unsupported count is refused from
+    // at most 37 entries, before the ids are read into a list of one
+    // entry each.
+    const NODES: usize = 100_000;
+    let nodes = vec![r#""n""#; NODES].join(",");
+    let d = skin(&[(
+        "s.json",
+        &play(&format!(
+            r#""w": 1920, "h": 1080, "source": [{{"id": "a", "path": "a.png"}}],
+               "image": [{{"id": "n", "src": "a", "w": 1, "h": 1}}],
+               "gauge": {{"id": "g", "nodes": [{nodes}], "parts": 10}},
+               "destination": [{{"id": "g", "dst": [{{"w": 10, "h": 1}}]}}]"#
+        )),
+    )]);
+    common::png(d.path(), "a.png", 1, 1);
+    let (mut def, h) = read_header(d.path(), "s.json").unwrap();
+    let config = Config::defaults(&h);
+    let watched = [
+        NODES * size_of::<u32>(),
+        NODES * size_of::<Option<String>>(),
+    ];
+    let mut seen = Vec::new();
+    for size in watched {
+        WATCHED.store(size, Ordering::Relaxed);
+        SEEN.store(0, Ordering::Relaxed);
+        let (result, _) = largest(|| import(&mut def, &h, &config).map(|_| ()));
+        WATCHED.store(usize::MAX, Ordering::Relaxed);
+        assert!(
+            matches!(
+                result,
+                Err(ImportError::Critical {
+                    why: skin_beatoraja::NoteKind::UnsupportedField { field: "nodes" },
+                    ..
+                })
+            ),
+            "{result:?}"
+        );
+        seen.push(SEEN.load(Ordering::Relaxed));
+    }
+    assert_eq!(seen, [0, 0], "list sizes {watched:?}");
+
     // Digit offsets: the last number's ten offsets (160 B) are copied
     // when the cap admits them, and not when their charge passes it. The
     // refused imports of nine and of ten make as many allocations of that

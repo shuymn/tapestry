@@ -1,6 +1,8 @@
 //! The gauge (`JsonSkinObjectLoader.java:509-556`, `play/SkinGauge.java`
 //! at `0.8.9`): its nodes mapped to the model's looks and parts, its
-//! motion, and its segments.
+//! motion, and its segments: up to `MAX_SEGMENTS` (16 384), as the source
+//! passes the authored count without a cap (`:551-554`), within the
+//! skin-wide widget quad budget.
 
 use bms_model::TimeUs;
 use skin_model::{Filter, GaugeDef, GaugeParts, MAX_KEY_US, MAX_SEGMENTS, Motion, Source};
@@ -112,22 +114,32 @@ impl Cx<'_> {
                 "endtime",
             ],
         );
-        if nodes.is_none() {
+        let Some(nodes) = nodes else {
             return refuse(self, "nodes");
+        };
+        // The array's shape and count first, from at most one child past
+        // the largest table, so an unsupported count gathers nothing.
+        if self.def.arena.node(nodes).kind != crate::tree::Kind::Array {
+            return Err(self.def.type_error(nodes, "nodes", "an array"));
         }
+        let count = self.def.arena.children(nodes).take(NODES + 1).count();
+        let Some(node_of) = node_of(count) else {
+            return refuse(self, "nodes");
+        };
         // A `null` node names no image, unlike an empty id
         // (`JsonSkinObjectLoader.java:523-525` fails on it).
-        let nodes = self.opt_strings(nodes, "nodes")?;
+        let nodes = self.opt_strings(Some(nodes), "nodes")?;
         let Some(nodes) = nodes.into_iter().collect::<Option<Vec<String>>>() else {
             return refuse(self, "nodes");
         };
-        let Some(node_of) = node_of(nodes.len()) else {
-            return refuse(self, "nodes");
-        };
-        let parts = self.int_or(parts, "parts", 50)?;
-        let kind = self.int_or(kind, "type", 0)?;
-        let range = self.int_or(range, "range", 3)?;
-        let cycle = self.int_or(cycle, "cycle", 33)?;
+        // Integers read exactly, as `JsonSkin.java:369-377` declares them:
+        // a fractional number refuses rather than truncates.
+        let mut exact =
+            |f: Option<u32>, name, or| f.map_or(Ok(or), |f| self.def.exact_int(f, name));
+        let parts = exact(parts, "parts", 50)?;
+        let kind = exact(kind, "type", 0)?;
+        let range = exact(range, "range", 3)?;
+        let cycle = exact(cycle, "cycle", 33)?;
         if start.is_some() || end.is_some() {
             self.ignored(at, NoteKind::Ignored { field: "starttime" });
         }
@@ -156,6 +168,13 @@ impl Cx<'_> {
         let Some(mut c) = self.common_with(role, &dst, o)? else {
             return Ok(());
         };
+        // Its quads, every segment and the flicker's tip, before any node
+        // is looked up or admitted; spent if it is later refused.
+        let segments = u16::try_from(parts).map_err(|_| self.range(at, "parts"))?;
+        let tip = u32::from(matches!(motion, Motion::Flicker { .. }));
+        self.budget
+            .widget_quads(u32::from(segments) + tip)
+            .map_err(|l| self.limit(at, l))?;
         if dst.stretch != -1 {
             self.ignored(at, NoteKind::Ignored { field: "stretch" });
         }
@@ -204,16 +223,11 @@ impl Cx<'_> {
                 tip: pair(4),
             }
         });
-        let segments = u16::try_from(parts).map_err(|_| self.range(at, "parts"))?;
         let def = GaugeDef {
             segments,
             looks,
             motion,
         };
-        let tip = u32::from(matches!(motion, Motion::Flicker { .. }));
-        self.budget
-            .widget_quads(u32::from(segments) + tip)
-            .map_err(|l| self.limit(at, l))?;
         let mut rects = Vec::with_capacity(c.track.keys.len());
         for k in &c.track.keys {
             let r = self.key_rect(&c, k)?;

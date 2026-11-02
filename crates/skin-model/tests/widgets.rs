@@ -10,8 +10,8 @@ use bms_model::TimeUs;
 use rules::Judgment;
 use skin_model::{
     Adjust, Align, Bind, ComboPart, DigitsDef, ElementDef, Fit, Follow, GlyphSet, GradePart,
-    JudgeSlot, Layout, LoadError, MAX_SEGMENTS, MAX_WIDGET_QUADS, Motion, Pad, Place, Region,
-    Source, TimerRef, Variant, WidgetDefs, timer,
+    JudgeSlot, Layout, LoadError, MAX_WIDGET_QUADS, Motion, Pad, Place, Region, Source, TimerRef,
+    Variant, WidgetDefs, timer,
 };
 use widget_support::{
     ELEVEN, GAUGE, GRADE, TEN, combo, digits, drawn, element, gauge, grade, harness, judge_all,
@@ -156,7 +156,7 @@ fn widget_quads_are_capped_per_skin() {
             WidgetDefs {
                 numbers: numbers(last),
                 gauges: vec![gauge(
-                    MAX_SEGMENTS,
+                    1_000,
                     Motion::Flicker {
                         period: TimeUs(1_000),
                     },
@@ -171,6 +171,70 @@ fn widget_quads_are_capped_per_skin() {
     assert!(matches!(
         with(6),
         Err(LoadError::TooManyWidgetQuads { n: 16_385 })
+    ));
+}
+
+#[test]
+fn large_gauges_share_the_widget_budget_per_element() {
+    // One definition of 8 191 flickering segments drawn by two elements,
+    // the second never visible, reserves 2 · 8 192: the whole budget. A
+    // number of one cell more refuses.
+    let flicker = gauge(
+        8_191,
+        Motion::Flicker {
+            period: TimeUs(1_000),
+        },
+    );
+    let with = |more: bool| {
+        let mut elements = vec![
+            element(Source::Gauge(0), [0, 0, 500, 10], Place::SCREEN),
+            ElementDef {
+                visible: Some(widget_support::boolean("combo < 0")),
+                ..element(Source::Gauge(0), [0, 20, 500, 10], Place::SCREEN)
+            },
+        ];
+        if more {
+            elements.push(element(Source::Number(0), [0, 40, 10, 10], Place::SCREEN));
+        }
+        load(
+            elements,
+            WidgetDefs {
+                numbers: vec![number(
+                    digits(TEN, GlyphSet::Ten, 1, Align::Right, Pad::Blank),
+                    "1",
+                )],
+                gauges: vec![flicker],
+                ..WidgetDefs::default()
+            },
+        )
+    };
+    let skin = with(false).unwrap();
+    assert_eq!(skin.quad_capacity(), MAX_WIDGET_QUADS);
+    assert!(matches!(
+        with(true),
+        Err(LoadError::TooManyWidgetQuads { n: 16_385 })
+    ));
+    // Both draw in element order, each its own segments, the tip right
+    // after the last lit one.
+    let mut h = harness(with(false).unwrap());
+    h.gauges[0].value = play_support::pct(50);
+    h.frame(500, &[]);
+    assert_eq!(h.batch.quads().len(), 8_192);
+    assert_eq!(h.batch.dropped(), 0);
+    // A third element of the same definition, though the parameter
+    // allows it, does not fit.
+    let three = load(
+        (0..3)
+            .map(|_| element(Source::Gauge(0), [0, 0, 500, 10], Place::SCREEN))
+            .collect(),
+        WidgetDefs {
+            gauges: vec![flicker],
+            ..WidgetDefs::default()
+        },
+    );
+    assert!(matches!(
+        three,
+        Err(LoadError::TooManyWidgetQuads { n: 24_576 })
     ));
 }
 

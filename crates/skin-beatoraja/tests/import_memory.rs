@@ -1631,6 +1631,134 @@ fn f14b(root: &Path) -> i64 {
     p
 }
 
+/// The F15 gauges: twelve nodes, each an 8×8 cell of `a`, of one gauge of
+/// `parts` parts and `fields`, drawn by `dsts`.
+fn f15(root: &Path, parts: usize, fields: &str, dsts: &[&str]) {
+    png(root, "a.png", 64, 64);
+    let images = join((0..12).map(|k| {
+        format!(
+            r#"{{"id": "n{k}", "src": "a", "x": {}, "y": {}, "w": 8, "h": 8}}"#,
+            8 * (k % 8),
+            8 * (k / 8)
+        )
+    }));
+    let nodes = join((0..12).map(|k| format!("\"n{k}\"")));
+    write(
+        root,
+        "s.json",
+        common::hd(&format!(
+            r#""source": [{{"id": "a", "path": "a.png"}}], "image": [{images}],
+               "gauge": {{"id": "g", "nodes": [{nodes}], "parts": {parts}{fields}}},
+               "destination": [{}]"#,
+            dsts.join(", ")
+        ))
+        .as_bytes(),
+    );
+}
+
+const F15_DST: &str = r#"{"id": "g", "dst": [{"x": 100, "y": 500, "w": 1000, "h": 10}]}"#;
+const FLICKER: &str = r#", "type": 3, "range": 1, "cycle": 330"#;
+
+/// F15a: one gauge of 16 383 flickering parts, the widget budget whole.
+fn f15a(root: &Path, parts: usize) {
+    f15(root, parts, FLICKER, &[F15_DST]);
+}
+
+/// The node costs of every F15 gauge: twelve images of one frame from
+/// one file.
+fn check_nodes(i: &Imported) {
+    let u = i.report.usage;
+    assert_eq!((u.images, u.frames, u.files), (12, 12, 1));
+}
+
+fn check_f15a(_: &Header, i: Imported) {
+    check_nodes(&i);
+    assert_eq!(i.report.usage.widget_quads, MAX_WIDGET_QUADS);
+    assert_eq!(i.skin.quad_capacity(), MAX_WIDGET_QUADS);
+    // At the start value, 20 %: 3 276 lit, the tip over the last of them
+    // right after it, then the rest.
+    let mut d = Drawn::new(i.skin, 100);
+    let q = d.frame(1_000, &[]);
+    assert_eq!(q.len(), 16_384);
+    assert_eq!(q[3_276].rect, q[3_275].rect);
+    assert!(q[3_277].rect[0] > q[3_276].rect[0]);
+    assert!(q.windows(2).filter(|w| w[0].rect == w[1].rect).count() == 1);
+}
+
+/// F15b: one still gauge of 16 384 parts (a range of 0).
+fn f15b(root: &Path) {
+    f15(root, 16_384, r#", "range": 0"#, &[F15_DST]);
+}
+
+fn check_f15b(_: &Header, i: Imported) {
+    check_nodes(&i);
+    assert_eq!(i.report.usage.widget_quads, MAX_WIDGET_QUADS);
+    // At half the full gauge 8 192 lit, the tip on the last; below the
+    // border of 80 % the first 13 107. By node: front below 8 191, the
+    // tip below 1, back below 4 915, back above 3 277.
+    let mut d = Drawn::new(i.skin, 100);
+    d.gauges[0].value = GaugeValue(GaugeValue::FULL.0 / 2);
+    let q = d.frame(1_000, &[]);
+    assert_eq!(q.len(), 16_384);
+    let mut by_uv = std::collections::HashMap::<[u32; 4], usize>::new();
+    for quad in &q {
+        *by_uv.entry(quad.uv.map(f32::to_bits)).or_default() += 1;
+    }
+    let mut counts: Vec<usize> = by_uv.into_values().collect();
+    counts.sort_unstable();
+    assert_eq!(counts, [1, 3_277, 4_915, 8_191]);
+}
+
+/// F15c: two destinations of one gauge of 8 191 flickering parts, one
+/// additive, the other on READY and lower; with `third`, a third.
+fn f15c(root: &Path, third: bool) {
+    let mut dsts = vec![
+        r#"{"id": "g", "blend": 2, "dst": [{"x": 100, "y": 500, "w": 1000, "h": 10}]}"#,
+        r#"{"id": "g", "timer": 40, "dst": [{"x": 100, "y": 400, "w": 1000, "h": 10}]}"#,
+    ];
+    if third {
+        dsts.push(F15_DST);
+    }
+    f15(root, 8_191, FLICKER, &dsts);
+}
+
+fn check_f15c(_: &Header, i: Imported) {
+    check_nodes(&i);
+    assert_eq!(i.report.usage.widget_quads, MAX_WIDGET_QUADS);
+    assert_eq!(i.report.usage.elements, 2);
+    // The first destination's 8 192 quads, then the second's, lower.
+    let mut d = Drawn::new(i.skin, 100);
+    let q = d.frame(1_000, &[]);
+    assert_eq!(q.len(), 16_384);
+    let ys: Vec<i32> = q.iter().map(|q| common::play::round(q.rect)[1]).collect();
+    assert!(ys[..8_192].iter().all(|&y| y == 570), "{:?}", &ys[..2]);
+    assert!(
+        ys[8_192..].iter().all(|&y| y == 670),
+        "{:?}",
+        &ys[8_192..8_194]
+    );
+}
+
+/// F15 past the budget: the flicker of 16 384 parts and F15c's third
+/// destination are refused at their destination.
+fn f15_refuses_past_the_budget() {
+    for variant in 0..2 {
+        let d = tempfile::tempdir().unwrap();
+        if variant == 0 {
+            f15a(d.path(), 16_384);
+        } else {
+            f15c(d.path(), true);
+        }
+        match refused(d.path()) {
+            ImportError::Limit {
+                limit: ImportLimit::WidgetQuads,
+                at: Some(_),
+            } => {}
+            other => panic!("{variant}: {other:?}"),
+        }
+    }
+}
+
 #[test]
 fn import_memory_is_measured() {
     // Positive control: a 4 MiB buffer grown to 8 MiB is 12 MiB live at
@@ -1876,6 +2004,26 @@ fn import_memory_is_measured() {
     let d = tempfile::tempdir().unwrap();
     peaks.push(("F14b empty judges", f14b(d.path())));
     drop(d);
+    // F15: gauges at the widget budget.
+    println!(
+        "sizes: GaugeDef {}, Motion {}, GaugeParts {}",
+        size_of::<skin_model::GaugeDef>(),
+        size_of::<skin_model::Motion>(),
+        size_of::<skin_model::GaugeParts>(),
+    );
+    let d = tempfile::tempdir().unwrap();
+    f15a(d.path(), 16_383);
+    peaks.push(("F15a flickering gauge", measure(d.path(), check_f15a)));
+    drop(d);
+    let d = tempfile::tempdir().unwrap();
+    f15b(d.path());
+    peaks.push(("F15b still gauge", measure(d.path(), check_f15b)));
+    drop(d);
+    let d = tempfile::tempdir().unwrap();
+    f15c(d.path(), false);
+    peaks.push(("F15c shared gauge", measure(d.path(), check_f15c)));
+    drop(d);
+    f15_refuses_past_the_budget();
     for (name, p) in &peaks {
         println!("{name}: peak {p} B");
     }

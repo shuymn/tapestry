@@ -213,19 +213,29 @@ fn motions_follow_the_source() {
     }
 }
 
+/// Four nodes and `fields` in place of the parts.
+fn parted(fields: &str) -> Loaded {
+    gauge_with(&format!(r#""nodes": {}, {fields}"#, nodes(4)), "", "")
+}
+
 #[test]
 fn parts_bound_the_segments() {
     assert!(has(
-        gauge_with(&format!(r#""nodes": {}, "parts": 0"#, nodes(4)), "", "").report(),
+        parted(r#""parts": 0"#).report(),
         NoteKind::Ignored { field: "parts" }
     ));
-    refused(
-        gauge_with(&format!(r#""nodes": {}, "parts": 1001"#, nodes(4)), "", ""),
-        "parts",
-    );
-    let l = gauge_with(&format!(r#""nodes": {}, "parts": 1000"#, nodes(4)), "", "");
-    assert_eq!(l.report().usage.widget_quads, 1_000);
-    // Flicker adds the tip.
+    // Up to the widget budget's 16 384, each part a quad, one D10 note
+    // and no unsupported `parts`.
+    for p in [1_000, 1_001, 4_096, 16_384] {
+        let l = parted(&format!(r#""parts": {p}"#));
+        assert_eq!(l.report().usage.widget_quads, p, "{p}");
+        let notes: Vec<NoteKind> = l.report().notes.iter().map(|n| n.kind).collect();
+        assert_eq!(notes, [NoteKind::Deviation(DeviationId::D10)], "{p}");
+        assert_eq!(l.quads(1_000).len(), p as usize, "{p}");
+    }
+    refused(parted(r#""parts": 16385"#), "parts");
+    // Flicker adds the tip: 16 383 parts fill the budget, 16 384 pass it,
+    // while a range of 0 makes the type-3 gauge still and it fits.
     assert_eq!(
         gauge(r#""type": 3, "cycle": 100"#)
             .report()
@@ -233,5 +243,144 @@ fn parts_bound_the_segments() {
             .widget_quads,
         11
     );
+    let l = parted(r#""parts": 16383, "type": 3, "range": 1, "cycle": 100"#);
+    assert_eq!(l.report().usage.widget_quads, 16_384);
+    match parted(r#""parts": 16384, "type": 3, "range": 1, "cycle": 100"#).err() {
+        ImportError::Limit {
+            limit: skin_beatoraja::ImportLimit::WidgetQuads,
+            at: Some(at),
+        } => assert_eq!(at.line, 3, "{at:?}"),
+        e => panic!("{e:?}"),
+    }
+    let l = parted(r#""parts": 16384, "type": 3, "range": 0, "cycle": 100"#);
+    assert_eq!(l.report().usage.widget_quads, 16_384);
     assert_eq!(gauge("").report().usage.widget_quads, 10);
+}
+
+#[test]
+fn gauge_scalars_are_read_exactly() {
+    // Whole numbers in any spelling and decimal strings; defaults only
+    // when absent.
+    for fields in [
+        r#""parts": 10.0"#,
+        r#""parts": 1e1"#,
+        r#""parts": "10""#,
+        r#""parts": 10, "type": 2.0, "range": 1.0, "cycle": 1e2"#,
+    ] {
+        assert_eq!(parted(fields).quads(1_000).len(), 10, "{fields}");
+    }
+    // A fraction, a null or a string that is no integer is a type error,
+    // past `i32` a range error, each at its field.
+    for (fields, field) in [
+        (r#""parts": 10.5"#, "parts"),
+        (r#""parts": null"#, "parts"),
+        (r#""parts": 10, "type": 0.5"#, "type"),
+        (r#""parts": 10, "range": 2.5"#, "range"),
+        (r#""parts": 10, "cycle": 33.3"#, "cycle"),
+        (r#""parts": "ten""#, "parts"),
+    ] {
+        match parted(fields).err() {
+            ImportError::Type { field: f, .. } => assert_eq!(f, field, "{fields}"),
+            e => panic!("{fields}: {e:?}"),
+        }
+    }
+    for (fields, field) in [
+        (r#""parts": 3000000000"#, "parts"),
+        (r#""parts": 10, "cycle": 3e9"#, "cycle"),
+        (r#""parts": 1e-100"#, "parts"),
+    ] {
+        match parted(fields).err() {
+            ImportError::Range { field: f, .. } => assert_eq!(f, field, "{fields}"),
+            e => panic!("{fields}: {e:?}"),
+        }
+    }
+    // A still gauge's cycle is unused, valid or not; a flicker's range
+    // only enables it, whatever its size.
+    assert_eq!(
+        parted(r#""parts": 10, "type": 1, "range": 0, "cycle": -5"#)
+            .quads(1_000)
+            .len(),
+        10
+    );
+    let l = parted(r#""parts": 10, "type": 3, "range": 2147483647, "cycle": 100"#);
+    assert_eq!(l.report().usage.widget_quads, 11);
+}
+
+#[test]
+fn node_arrays_are_counted_before_they_are_read() {
+    // Five entries that are no ids: an unsupported count, refused before
+    // any entry is read as a string.
+    refused(
+        gauge_with(r#""nodes": [{}, {}, {}, {}, {}], "parts": 10"#, "", ""),
+        "nodes",
+    );
+    // A long array likewise.
+    let long = vec!["{}"; 5_000].join(", ");
+    refused(
+        gauge_with(&format!(r#""nodes": [{long}], "parts": 10"#), "", ""),
+        "nodes",
+    );
+    // A supported count still reads its entries.
+    match gauge_with(r#""nodes": [{}, {}, {}, {}], "parts": 10"#, "", "").err() {
+        ImportError::Type { field: "nodes", .. } => {}
+        e => panic!("{e:?}"),
+    }
+}
+
+/// `n` numbers of 11 cells and one of 5, spending the widget budget
+/// before the gauge's destination `gauge` (none when empty), whose nodes
+/// name an image the skin lacks.
+fn spent(n: usize, gauge: &str) -> Loaded {
+    let values = r#", "value": [
+        {"id": "v11", "src": "n", "w": 120, "h": 20, "divx": 10, "digit": 11, "ref": 71},
+        {"id": "vl", "src": "n", "w": 120, "h": 20, "divx": 10, "digit": 5, "ref": 71}]"#;
+    let mut dsts: Vec<String> = (0..n)
+        .map(|_| r#"{"id": "v11", "dst": [{"x": 0, "y": 0, "w": 8, "h": 8}]}"#.to_owned())
+        .collect();
+    dsts.push(r#"{"id": "vl", "dst": [{"x": 0, "y": 0, "w": 8, "h": 8}]}"#.to_owned());
+    if !gauge.is_empty() {
+        dsts.push(gauge.to_owned());
+    }
+    let body = format!(
+        "{}{values}, \"gauge\": {{\"id\": \"g\", \"nodes\": [\"n0\", \"n1\", \"n2\", \"gone\"], \"parts\": 10}},\n\"destination\": [{}]",
+        images(""),
+        dsts.join(",\n")
+    );
+    import_sized([1_920, 1_080], &body, &[])
+}
+
+#[test]
+fn a_gauge_s_quads_are_admitted_before_its_nodes() {
+    // 1 489 numbers of 11 cells and one of 5 spend the budget exactly.
+    let l = spent(1_489, "");
+    assert_eq!(l.report().usage.widget_quads, 16_384);
+    // The gauge after them refuses at its own destination on the budget,
+    // before its unresolved node is looked up.
+    let g = r#"{"id": "g", "dst": [{"x": 100, "y": 500, "w": 100, "h": 10}]}"#;
+    let l = spent(1_489, g);
+    let text = std::fs::read_to_string(l.dir.path().join("s.json")).unwrap();
+    let line = text
+        .lines()
+        .position(|t| t.starts_with(r#"{"id": "g""#))
+        .unwrap()
+        + 1;
+    match l.err() {
+        ImportError::Limit {
+            limit: skin_beatoraja::ImportLimit::WidgetQuads,
+            at: Some(at),
+        } => assert_eq!(at.line as usize, line, "{at:?}"),
+        e => panic!("{e:?}"),
+    }
+    // With room for its 10 quads, the unresolved node refuses it.
+    refused(spent(1_488, g), "nodes");
+    // A destination with no keys is never drawn: it imports and charges
+    // nothing, the budget spent already.
+    let l = spent(1_489, r#"{"id": "g", "dst": []}"#);
+    assert_eq!(l.report().usage.widget_quads, 16_384);
+    // The destination's own checks come first: a key outside `i32`.
+    let bad = r#"{"id": "g", "dst": [{"x": 3000000000, "y": 500, "w": 100, "h": 10}]}"#;
+    match spent(1_489, bad).err() {
+        ImportError::Range { .. } => {}
+        e => panic!("{e:?}"),
+    }
 }

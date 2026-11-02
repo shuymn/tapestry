@@ -180,7 +180,9 @@ pub enum DeviationId {
     D8,
     /// A lane approximation (owner decisions 12 and 15).
     D9(LaneApprox),
-    /// The gauge motion's phase, random sequence and flicker curve.
+    /// The gauge drawn as the model's segments: exact integer lit counts
+    /// and border, the authored part count kept, and the motion's phase,
+    /// random sequence and flicker curve.
     D10,
     /// A bitmap font's size rounded to a whole reference pixel.
     D12,
