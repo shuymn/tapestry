@@ -1251,3 +1251,27 @@ fn play_options_refuse_each_value_outside_its_range_by_name() {
         assert!(o.set_hispeed(ok).is_ok());
     }
 }
+
+// ---- Exactness at the edges ----
+
+#[test]
+fn the_session_clock_runs_in_real_time_and_the_speed_scales_only_the_tempo() {
+    // At 150 %, 150 BPM changing to 300 at session time 1.2 s: an
+    // observation 1 s after the anchor is still at 150 (225 playing).
+    let map = Map(vec![(0, bpm(150)), (1_200_000, bpm(300))]);
+    let mut rig = Rig::new(options(SpeedMode::Floating, 100, 300, sudden(200)), map);
+    rig.ev(Event::Prepare {
+        references: References::all(bpm(150)),
+        speed: Speed::FASTEST,
+    });
+    rig.ev(Event::Phase {
+        head: Head::Clock {
+            at: TimeUs(0),
+            chart: TimeUs(0),
+        },
+        generation: 1,
+    });
+    rig.at(1_000 * MS).press(SELECT).tap(BLACK);
+    rig.at(1_001 * MS).tap(WHITE).release(SELECT);
+    assert_eq!(h(&rig.snap()), solve(bpm(225), 300, &sudden(200)).unwrap());
+}

@@ -168,8 +168,8 @@ pub enum Head {
         /// The chart time the attempt opens at.
         opens_at: TimeUs,
     },
-    /// The chart clock: chart time `chart` at receive time `at`, running at
-    /// the practice speed.
+    /// The session clock: session time `chart` at receive time `at`, both
+    /// real time, so it advances one µs per µs at any practice speed.
     Clock {
         /// A receive time.
         at: TimeUs,
@@ -235,9 +235,12 @@ pub struct Observation {
     pub event: Event,
 }
 
-/// The chart's tempo at a presentation head, in its own BPM.
+/// The chart's tempo at a presentation head. The head is a session time,
+/// real time with the practice speed already in it (design.md "Practice
+/// Speed Changes"); the tempo is the chart's own 1× BPM, which the reducer
+/// scales by the speed once.
 pub trait TempoMap {
-    /// The tempo at chart time `head`; `None` when unknown.
+    /// The tempo at the session time `head`; `None` when unknown.
     fn bpm_at(&self, head: TimeUs) -> Option<Ratio>;
 }
 
@@ -931,14 +934,7 @@ impl Adjustment {
         let prepared = self.tempo?;
         let base = match self.head {
             Head::Frozen { opens_at } => opens_at.0,
-            Head::Clock { at, chart } => {
-                let (k, d) = prepared.speed.ratio();
-                let real = i128::from(time.0.saturating_sub(at.0));
-                let chart_us = real * i128::from(k) / i128::from(d);
-                chart
-                    .0
-                    .saturating_add(i64::try_from(chart_us).unwrap_or(i64::MAX))
-            }
+            Head::Clock { at, chart } => chart.0.saturating_add(time.0.saturating_sub(at.0)),
         };
         let head = TimeUs(base.saturating_add(self.display_offset_us));
         playback(tempo.bpm_at(head)?, prepared.speed).ok()
