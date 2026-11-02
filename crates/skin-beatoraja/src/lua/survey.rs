@@ -58,14 +58,16 @@ pub struct Survey {
     pub usage: LuaUsage,
 }
 
+/// The name of `v`'s variant alone, without the values it holds.
+fn variant(v: &impl std::fmt::Debug) -> String {
+    let s = format!("{v:?}");
+    s.split(['(', ' ', '{']).next().unwrap_or("").to_owned()
+}
+
 /// The label of `e`: its kind and the importer's own constants.
 fn label(e: &ImportError) -> String {
     match e {
-        ImportError::Read { source, .. } => {
-            let s = format!("{source:?}");
-            let kind = s.split(['(', ' ', '{']).next().unwrap_or("");
-            format!("read {kind}")
-        }
+        ImportError::Read { source, .. } => format!("read {}", variant(source)),
         ImportError::Syntax { what, .. } => format!("json syntax {what:?}"),
         ImportError::Input { limit, .. } => format!("input {limit:?}"),
         ImportError::IncludeCycle { .. } => "include cycle".into(),
@@ -101,10 +103,7 @@ fn note(kind: &NoteKind) -> String {
         NoteKind::Callable { field } => format!("Callable {field}"),
         NoteKind::UnsupportedField { field } => format!("UnsupportedField {field}"),
         NoteKind::Ignored { field } => format!("Ignored {field}"),
-        other => {
-            let s = format!("{other:?}");
-            s.split(['(', ' ', '{']).next().unwrap_or("").to_owned()
-        }
+        other => variant(other),
     }
 }
 
