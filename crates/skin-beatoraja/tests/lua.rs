@@ -926,29 +926,47 @@ fn every_function_in_the_definition_is_refused_at_its_definition() {
 
 #[test]
 fn the_header_pass_refuses_a_function_only_where_it_reads() {
-    // In a field the header reads: refused by the header pass.
-    let d = folder(&[(
-        "s.luaskin",
-        "return { type = 0,\n property = { { name = \"o\", item = { { name = \"a\", op = 900 } },\n\
-           def = function() end } } }",
-    )]);
-    assert_eq!(
-        located(header(&d)),
-        (LuaWhy::Callable { field: "other" }, "s.luaskin".into(), 3)
-    );
-    // Elsewhere: the header pass reads past it, and the configured pass
-    // refuses it at its definition.
-    let d = folder(&[(
-        "s.luaskin",
-        "local skin = { type = 0, w = 1920, h = 1080,\n\
-           helper = function() end }\n\
-         return skin",
-    )]);
-    let h = header(&d).unwrap();
-    assert_eq!(
-        located(h.import(&Config::defaults(h.header()), &Cancel::new())),
-        (LuaWhy::Callable { field: "other" }, "s.luaskin".into(), 2)
-    );
+    // Where it does not: a key of an option item the header never reads,
+    // or a field outside the header. The header pass reads past it; the
+    // configured pass refuses it at its definition.
+    for fields in [
+        "property = { { name = \"o\", item = { { name = \"a\", op = 900,\n is_selected = function() end } } } }",
+        "w = 1920, h = 1080,\n helper = function() end",
+    ] {
+        let d = folder(&[("s.luaskin", &format!("return {{ type = 0, {fields} }}"))]);
+        let h = header(&d).unwrap_or_else(|e| panic!("{fields}: {e:?}"));
+        let (w, file, line) = located(h.import(&Config::defaults(h.header()), &Cancel::new()));
+        assert!(matches!(w, LuaWhy::Callable { .. }), "{fields}: {w:?}");
+        assert_eq!((file.as_str(), line), ("s.luaskin", 2), "{fields}");
+    }
+    // Where the header's reading meets it: a value, a record, a list or a
+    // condition, refused by the header pass at its definition.
+    for (fields, field, line) in [
+        (
+            "property = { { name = \"o\",\n def = function() end } }",
+            "def",
+            2,
+        ),
+        ("property = {\n function() end }", "other", 2),
+        ("filepath =\n function() end", "other", 2),
+        (
+            "offset = { { name = \"o\",\n id = function() end } }",
+            "id",
+            2,
+        ),
+        (
+            "property = { { [\"if\"] =\n function() end, value = {} } }",
+            "if",
+            2,
+        ),
+    ] {
+        let d = folder(&[("s.luaskin", &format!("return {{ type = 0, {fields} }}"))]);
+        assert_eq!(
+            located(header(&d)),
+            (LuaWhy::Callable { field }, "s.luaskin".into(), line),
+            "{fields}"
+        );
+    }
 }
 
 #[test]

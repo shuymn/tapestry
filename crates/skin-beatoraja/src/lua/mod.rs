@@ -19,7 +19,8 @@
 //! until per-frame functions are analysed (S7-03), any function anywhere
 //! in the configured pass's table refuses the candidate at its definition,
 //! after the developer report has counted them ([`convert::callables`]);
-//! the header pass refuses one only in a field it reads, so that the
+//! the header pass refuses one only where its reading of the header
+//! meets it, as a value, a record, a list or a condition, so that the
 //! configured pass runs and the report sees what else it meets.
 //!
 //! What the common reader reads of the JSON files a table includes is
@@ -485,7 +486,6 @@ pub(crate) fn header_pass(root: &Path, entry: &str, cancel: &Cancel) -> Outcome<
         None,
     );
     let result = r.and_then(|converted| {
-        convert::refuse_header_callables(&converted.arena, converted.top)?;
         let mut def = definition(&root, converted, counts, cancel);
         let header =
             resolve(&mut def, &std::collections::BTreeSet::new()).and_then(|mut r| r.header());
@@ -513,7 +513,7 @@ pub(crate) fn header_pass(root: &Path, entry: &str, cancel: &Cancel) -> Outcome<
 ///
 /// The folder cannot be read; the sandbox, a loader or the conversion
 /// refuses ([`ImportError::Lua`], [`ImportError::Read`],
-/// [`ImportError::Input`]), a function is in a field the header reads
+/// [`ImportError::Input`]), the header's reading meets a function
 /// ([`LuaWhy::Callable`]); or the header refuses as a definition's does.
 pub fn read_lua_header(
     root: &Path,

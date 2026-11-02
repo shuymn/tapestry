@@ -109,44 +109,6 @@ pub(crate) fn refuse_callables(arena: &Arena) -> Result<(), ImportError> {
     }
 }
 
-/// The top-level fields the header pass reads ([`crate::resolve`]): the
-/// type, the size, the name and author, and the options, file choices and
-/// offsets, with all they hold.
-const HEADER_FIELDS: [&str; 8] = [
-    "type", "w", "h", "name", "author", "property", "filepath", "offset",
-];
-
-/// Refuses the header pass's table when a field the header pass reads
-/// ([`HEADER_FIELDS`]) holds a function, at the first one's definition. A
-/// function elsewhere passes: the header pass never reads it, and the
-/// configured pass refuses it ([`refuse_callables`]), so the report sees
-/// what else the configured pass meets.
-pub(crate) fn refuse_header_callables(arena: &Arena, top: u32) -> Result<(), ImportError> {
-    let mut stack: Vec<u32> = arena
-        .children(top)
-        .filter(|&c| {
-            let key: String = arena.key(c).map(Iterator::collect).unwrap_or_default();
-            HEADER_FIELDS.contains(&key.as_str())
-        })
-        .collect();
-    let mut first: Option<u32> = None;
-    while let Some(id) = stack.pop() {
-        stack.extend(arena.children(id));
-        let is_callable = arena.node(id).kind == Kind::Lua
-            && matches!(arena.scalar(id), crate::tree::Scalar::Callable);
-        if is_callable && first.is_none_or(|f| id < f) {
-            first = Some(id);
-        }
-    }
-    match first.and_then(|id| callables(arena).find(|&(c, ..)| c == id)) {
-        Some((id, field, _)) => Err(ImportError::Lua {
-            at: Some(arena.loc(id)),
-            why: LuaWhy::Callable { field },
-        }),
-        None => Ok(()),
-    }
-}
-
 /// Converts `value`, what the entry of `entry` returned, with `modules`
 /// the files the pass loaded (the entry first).
 pub(super) fn convert(

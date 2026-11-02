@@ -822,6 +822,7 @@ impl Resolver<'_, '_> {
                 },
             },
             Kind::Quoted | Kind::Bare | Kind::Lua => match self.strict {
+                _ if self.callable(id) => Err(self.def.callable_error(id, "other")),
                 Some(field) if !matches!(self.arena().scalar(id), Scalar::Null) => {
                     Err(self.def.type_error(id, field, "an array"))
                 }
@@ -881,8 +882,15 @@ impl Resolver<'_, '_> {
                 }
                 Ok(None)
             }
+            _ if self.callable(id) => Err(self.def.callable_error(id, "other")),
             _ => Ok(Some(id)),
         }
+    }
+
+    /// Whether node `id` is a Lua skin's function: refused wherever the
+    /// resolution reads it, as a record, an array or a condition.
+    fn callable(&self, id: u32) -> bool {
+        matches!(self.arena().scalar(id), Scalar::Callable)
     }
 
     /// Whether the pinned reader made node `id` a number.
@@ -898,6 +906,9 @@ impl Resolver<'_, '_> {
         };
         if self.is_number(cond) {
             return self.test_number(cond);
+        }
+        if self.callable(cond) {
+            return Err(self.def.callable_error(cond, "if"));
         }
         if !self.arena().is_array(cond) {
             return Ok(false);
