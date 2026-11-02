@@ -338,6 +338,31 @@ impl PlayerRig<'_> {
 /// the line the audio thread last published for a play whose chart time 0
 /// lies at `origin`, the opening's: `at` is then `RESTORE_AHEAD` in the
 /// output's future (design.md "Mid-Chart Start and Section Repeat").
+/// The render thread's commit of the attempt prepared: while a loading
+/// lifetime runs (`loading`), it is ready first, so its progress reaches
+/// 100 before the commit and the end of loading.
+pub(crate) fn commit_ready(render: &RenderLink, loading: bool) -> Result<(), ScreenError> {
+    if loading {
+        render.loading().report(LoadInput::Ready, None);
+    }
+    render.commit_attempt()
+}
+
+/// While a loading lifetime runs (`loading`), replaces its gauge
+/// descriptor with gauge `gauge` of `preset`, the preset the play
+/// refreshed.
+pub(crate) fn refresh_loading_gauge(
+    render: &RenderLink,
+    loading: bool,
+    preset: &rules::RulePreset,
+    gauge: usize,
+) {
+    if loading {
+        let gauge = shown_gauge(preset, gauge);
+        render.loading().report(LoadInput::Gauge(gauge), None);
+    }
+}
+
 fn plan_restore(
     restorer: &game::Restorer,
     counters: &game::AudioCounters,
@@ -477,10 +502,7 @@ impl Rig for PlayerRig<'_> {
     /// A loading lifetime is ready first: everything before the commit
     /// passed, so its progress reaches 100.
     fn commit_attempt(&mut self) -> Result<(), ScreenError> {
-        if self.loading_active() {
-            self.render.loading().report(LoadInput::Ready, None);
-        }
-        self.render.commit_attempt()
+        commit_ready(&self.render, self.loading_active())
     }
 
     fn discard_attempt(&mut self) {
@@ -511,10 +533,12 @@ impl Rig for PlayerRig<'_> {
     /// The loading lifetime's gauge descriptor is replaced first from the
     /// preset the play refreshed.
     fn prepare_attempt(&mut self, loaded: &Loaded) -> Result<Preparation, ScreenError> {
-        if self.loading_active() {
-            let gauge = shown_gauge(loaded.preset(), self.gauge);
-            self.render.loading().report(LoadInput::Gauge(gauge), None);
-        }
+        refresh_loading_gauge(
+            &self.render,
+            self.loading_active(),
+            loaded.preset(),
+            self.gauge,
+        );
         let attempt = AttemptContext::new(loaded.attempt(), SIMPLE_SCRATCH);
         let rig = &*self;
         rig.render.prepare_attempt(attempt, || {

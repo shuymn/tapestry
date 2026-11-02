@@ -6931,15 +6931,17 @@ pub(crate) mod tests {
         progress: bool,
         /// The animation's square where it starts.
         animation_start: bool,
-        /// The animation's square where the loading timer puts it now,
-        /// while that is on screen clear of the other marks.
-        animation_now: Option<bool>,
+        /// The animation's square where the loading timer puts it now:
+        /// moving 1 canvas pixel per ms for 1 s, then held at its end.
+        animation_now: bool,
     }
 
     /// One loading frame as [`Recorder`] saw it.
     #[derive(Clone, Debug)]
     struct Shot {
         device: u64,
+        /// The target the frame was drawn at.
+        target: [u32; 2],
         lifetime: u64,
         now: TimeUs,
         load: skin_model::LoadState,
@@ -6958,16 +6960,20 @@ pub(crate) mod tests {
 
     type Shots = Arc<std::sync::Mutex<Vec<Shot>>>;
 
+    /// A size [`Recorder`] applies before a loading frame: before the
+    /// next one, or with a revision, before the first one whose state
+    /// has that text revision.
+    type Resize = Arc<std::sync::Mutex<Option<(Option<u64>, (u32, u32))>>>;
+
     /// A real menu screen on WARP that records each loading frame
     /// ([`Shot`]), counts the play frames it is asked to build, applies a
-    /// size set in `resize` before its next loading frame, and fails its
-    /// loading frames while `fail` is set, so the render thread builds
-    /// another.
+    /// size set in `resize` ([`Resize`]), and fails its loading frames
+    /// while `fail` is set, so the render thread builds another.
     struct Recorder {
         menu: crate::menu_screen::MenuScreen,
         shots: Shots,
         builds: Arc<AtomicU32>,
-        resize: Arc<std::sync::Mutex<Option<(u32, u32)>>>,
+        resize: Resize,
         fail: Arc<AtomicBool>,
     }
 
@@ -6981,6 +6987,7 @@ pub(crate) mod tests {
             let installation = self.menu.installation();
             let r = self.menu.renderer_mut();
             let staged = r.memory().staged_text;
+            let target = r.target();
             let red = (drawn && r.target() == [1_920, 1_080]).then(|| {
                 let p = r.read_back();
                 let red_at = |at: (u32, u32)| crate::render_common::rgb_at(&p, 1_920, at) == RED;
@@ -6990,7 +6997,7 @@ pub(crate) mod tests {
                         u32::try_from(y + h / 2).unwrap(),
                     ))
                 };
-                let moved = (frame.now.0 - frame.load.since.0) / 1_000;
+                let moved = ((frame.now.0 - frame.load.since.0) / 1_000).min(1_000);
                 let x = 250 + moved;
                 Red {
                     title: centre(TITLE),
@@ -7003,11 +7010,12 @@ pub(crate) mod tests {
                     percent: centre(PERCENT_MARK),
                     progress: centre(PROGRESS_MARK),
                     animation_start: centre(ANIMATION),
-                    animation_now: (x < 1_650).then(|| red_at((u32::try_from(x).unwrap(), 950))),
+                    animation_now: red_at((u32::try_from(x).unwrap(), 950)),
                 }
             });
             Shot {
                 device,
+                target,
                 lifetime: frame.lifetime,
                 now: frame.now,
                 load: frame.load,
@@ -7099,8 +7107,14 @@ pub(crate) mod tests {
             if self.fail.load(Ordering::Acquire) {
                 return Err(RenderError::SurfaceLost);
             }
-            if let Some((w, h)) = self.resize.lock().unwrap().take() {
-                self.menu.resize(w, h);
+            {
+                let mut resize = self.resize.lock().unwrap();
+                if let Some((at, (w, h))) = *resize
+                    && at.is_none_or(|r| update.is_some_and(|u| u.revision == r))
+                {
+                    *resize = None;
+                    self.menu.resize(w, h);
+                }
             }
             let drawn = self.menu.loading(page, update, changed, frame)?;
             let shot = self.shot(frame, drawn.is_ok());
@@ -7123,7 +7137,7 @@ pub(crate) mod tests {
     struct Recording {
         shots: Shots,
         builds: Arc<AtomicU32>,
-        resize: Arc<std::sync::Mutex<Option<(u32, u32)>>>,
+        resize: Resize,
         fail: Arc<AtomicBool>,
         made: Arc<AtomicU32>,
     }
@@ -7134,7 +7148,7 @@ pub(crate) mod tests {
         fn new() -> (super::RenderLink, Self) {
             let shots: Shots = Arc::new(std::sync::Mutex::new(Vec::new()));
             let builds = Arc::new(AtomicU32::new(0));
-            let resize = Arc::new(std::sync::Mutex::new(None));
+            let resize: Resize = Arc::new(std::sync::Mutex::new(None));
             let fail = Arc::new(AtomicBool::new(false));
             let made = Arc::new(AtomicU32::new(0));
             let (s, b, r, f, m) = (
@@ -7317,7 +7331,7 @@ pub(crate) mod tests {
             assert!(r.background && r.line && r.gauge, "{s:?}");
             assert!(r.percent && r.progress, "{s:?}");
             assert!(!r.artist && !r.genre, "{s:?}");
-            assert_ne!(r.animation_now, Some(false), "{s:?}");
+            assert!(r.animation_now, "{s:?}");
         }
         assert!(!last.red.unwrap().animation_start, "{last:?}");
         // B's title, once its text is installed, and never A's artist.
@@ -7338,7 +7352,9 @@ pub(crate) mod tests {
     }
 
     /// Within one lifetime, through a real menu screen: the preset's
-    /// refresh replaces the gauge's descriptor from the next frame on,
+    /// refresh ([`crate::play::refresh_loading_gauge`], as the attempt's
+    /// preparation calls it) replaces the gauge's descriptor from the
+    /// next frame on,
     /// kept by later pages, the loading clock and the `when` timer going
     /// on; a field's change clears its slots on the frame it arrives and
     /// draws the replacement from the next, the other fields kept; an
@@ -7364,7 +7380,7 @@ pub(crate) mod tests {
         let shown = rec.until(0, |s| s.red.is_some_and(|r| r.title && r.artist));
         let hard = crate::loading_state::shown_gauge(&rules::tapestry(), 1);
         assert!(hard.is_some());
-        sink.report(LoadInput::Gauge(hard), None);
+        crate::play::refresh_loading_gauge(&link, true, &rules::tapestry(), 1);
         let refreshed = rec.until(shown, |s| s.gauge == hard);
         sink.report(LoadInput::Stage(Stage::Loudness), Some(one_line("later")));
         let later = rec.more(refreshed, 3);
@@ -7434,7 +7450,10 @@ pub(crate) mod tests {
     /// different bundle committed within it keeps the clock but starts
     /// its own presentation's timer afresh, its text installed again; the
     /// next lifetime starts both afresh. A report of an ended lifetime
-    /// draws nothing; no play frame is built while loading.
+    /// draws nothing. The attempt's commit ([`crate::play::commit_ready`])
+    /// makes the lifetime ready, 100 drawn, before the end of loading is
+    /// answered, and no loading frame follows the answer; no play frame
+    /// is built while loading.
     #[test]
     fn a_lifetimes_clock_survives_what_happens_during_it() {
         let (link, rec) = Recording::new();
@@ -7465,11 +7484,13 @@ pub(crate) mod tests {
         );
         link.commit_attempt().unwrap();
         let committed = rec.more(progressed, 3);
-        // A resize and back.
-        *rec.resize.lock().unwrap() = Some((960, 540));
-        let small = rec.more(committed, 3);
-        *rec.resize.lock().unwrap() = Some((1_920, 1_080));
-        let resized = rec.until(small, |s| s.red.is_some_and(|r| r.title));
+        // A resize, drawn at the new size, and back.
+        *rec.resize.lock().unwrap() = Some((None, (960, 540)));
+        let small = rec.until(committed, |s| s.target == [960, 540]);
+        *rec.resize.lock().unwrap() = Some((None, (1_920, 1_080)));
+        let resized = rec.until(small, |s| {
+            s.target == [1_920, 1_080] && s.red.is_some_and(|r| r.title)
+        });
         // The renderer built again, its files gone.
         rec.fail.store(true, Ordering::Release);
         assert!(wait_until(|| link.failed()));
@@ -7495,17 +7516,23 @@ pub(crate) mod tests {
             s.bundle == Some(other_at) && s.red.is_some_and(|r| r.title)
         });
         // The lifetime cancelled: its late reports draw nothing.
+        let a = rec.shots()[0].lifetime;
         link.clear_loading();
         sink.report(LoadInput::Ready, Some(one_line("late")));
         sink.report(LoadInput::BankComplete, None);
-        std::thread::sleep(Duration::from_millis(50));
-        let cancelled = rec.count();
-        // The next lifetime.
+        // The next lifetime, ready through the attempt's commit.
         link.begin_loading(&chosen("B"), None);
         link.loading()
             .report(LoadInput::Stage(Stage::Chart), Some(one_line("B")));
-        let next = rec.until(cancelled, |s| s.red.is_some_and(|r| r.title));
-        link.loading().report(LoadInput::Ready, None);
+        let next = rec.until(switched, |s| {
+            s.lifetime != a && s.red.is_some_and(|r| r.title)
+        });
+        let attempt = preset_attempt(&chart, &rules::tapestry(), None, "T");
+        assert_eq!(
+            link.prepare_attempt(attempt, || false).unwrap(),
+            Preparation::Ready
+        );
+        crate::play::commit_ready(&link, true).unwrap();
         let ready = rec.until(next, |s| s.load.percent == 100);
         link.end_loading().unwrap();
         let ended = rec.count();
@@ -7544,9 +7571,14 @@ pub(crate) mod tests {
         );
         // Frames were drawn at the smaller size, on the same clock.
         assert!(shots[committed..resized].iter().any(|s| s.red.is_none()));
-        // The next lifetime: its own origin and timer, then READY's 100.
-        let lifetime_b: Vec<&Shot> = shots[cancelled..].iter().collect();
-        assert!(lifetime_b.iter().all(|s| s.lifetime != a));
+        // The next lifetime, after every frame of the cancelled one: its
+        // own origin and timer, then readiness's 100.
+        let first_b = shots.iter().position(|s| s.lifetime != a).unwrap();
+        assert!(
+            shots[first_b..].iter().all(|s| s.lifetime != a),
+            "{shots:?}"
+        );
+        let lifetime_b: Vec<&Shot> = shots[first_b..].iter().collect();
         let since_b = lifetime_b[0].load.since;
         assert!(since_b > since);
         assert!(lifetime_b.iter().all(|s| s.load.since == since_b));
@@ -7561,9 +7593,10 @@ pub(crate) mod tests {
 
     /// The slot takes a whole newer state over the one waiting, so a
     /// sound's progress coalescing after the bank's completion still
-    /// shows 90; a publication not newer than one accepted, waiting or
-    /// taken, is refused with its page; another lifetime's is refused;
-    /// the next lifetime accepts from its first number.
+    /// shows 90; a publication not newer than one accepted, taken or
+    /// still waiting, is refused with its page, the waiting state and
+    /// page unchanged; another lifetime's is refused; the next lifetime
+    /// accepts from its first number.
     #[test]
     fn the_loading_slot_takes_only_newer_states() {
         use super::LoadingSlot;
@@ -7573,6 +7606,7 @@ pub(crate) mod tests {
         let mut slot = LoadingSlot::default();
         let four = state.apply(LoadInput::Stage(Stage::Sounds { done: 4, files: 9 }));
         let bank = state.apply(LoadInput::BankComplete);
+        let bank_again = bank.clone();
         let screen = state.apply(LoadInput::Stage(Stage::Screen));
         assert!(slot.offer(0, Some(one_line("4")), Some(Box::new(four.clone()))));
         assert!(slot.offer(0, None, Some(Box::new(bank))));
@@ -7587,6 +7621,14 @@ pub(crate) mod tests {
         // Older than the one taken.
         assert!(!slot.offer(0, Some(one_line("old")), Some(Box::new(four.clone()))));
         assert!(slot.take(0).is_none());
+        // Older than the one waiting: neither the state nor the page
+        // waiting changes.
+        let newer = state.apply(LoadInput::Stage(Stage::Scan));
+        assert!(slot.offer(0, Some(one_line("newer")), Some(Box::new(newer))));
+        assert!(!slot.offer(0, Some(one_line("old")), Some(Box::new(bank_again))));
+        let (page, update) = slot.take(0).unwrap();
+        assert_eq!(update.unwrap().seq, 4);
+        assert_eq!(page.unwrap().lines[0].text, "newer");
         // A page alone of the lifetime.
         assert!(slot.offer(0, Some(one_line("page")), None));
         assert!(slot.take(0).unwrap().1.is_none());
