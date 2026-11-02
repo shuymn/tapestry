@@ -896,8 +896,8 @@ impl<'d> Cx<'d> {
 
         // Timer.
         let (timer, untimed) = match dst.timer {
-            Prop::Null => (TimerRef::Builtin(slot::READY), true),
-            Prop::Id(n) if n < 0 => (TimerRef::Builtin(slot::READY), true),
+            Prop::Null => (TimerRef::Builtin(slot::SCREEN), true),
+            Prop::Id(n) if n < 0 => (TimerRef::Builtin(slot::SCREEN), true),
             Prop::Name(_) => {
                 self.drop_el(role, at, NoteKind::Timer(TimerWhy::Script))?;
                 return Ok(None);
@@ -1189,8 +1189,8 @@ impl<'d> Cx<'d> {
             return Ok(Err(NoteKind::Timer(TimerWhy::Cycle)));
         }
         let (timer, on_timer) = match *t {
-            Prop::Null => (TimerRef::Builtin(slot::READY), false),
-            Prop::Id(n) if n < 0 => (TimerRef::Builtin(slot::READY), false),
+            Prop::Null => (TimerRef::Builtin(slot::SCREEN), false),
+            Prop::Id(n) if n < 0 => (TimerRef::Builtin(slot::SCREEN), false),
             Prop::Name(_) => return Ok(Err(NoteKind::Timer(TimerWhy::Script))),
             Prop::Id(n) => match self.custom.resolve(n) {
                 Timer::Unset => {

@@ -335,7 +335,7 @@ impl Digits {
         let cells = self.lay(v);
         let g = self.set.glyphs();
         let sets = self.image.frames / g;
-        let set = self.image.group(at.play, at.now, sets);
+        let set = self.image.group(at.starts, at.now, sets);
         let base = self
             .image
             .first

@@ -243,12 +243,14 @@ fn write_png(path: &Path, w: u32, h: u32) {
 
 /// What an imported skin draws: the quads of frames at a few times of a
 /// 100-note play with a perfect judgment at each, each frame within the
-/// skin's quad capacity.
+/// skin's quad capacity; its loading state is built too, within the same
+/// capacities.
 ///
 /// # Panics
 ///
-/// If the atlas, the play or the text table is refused, or a frame holds
-/// more quads than the skin's capacity.
+/// If the atlas, the play or the text table is refused, a play or loading
+/// frame holds more quads than the skin's capacity, or a refused loading
+/// state builds again.
 #[must_use]
 pub fn draw(imported: &Imported) -> Vec<usize> {
     use bms_model::{ChartBuilder, Lane, TimeUs};
@@ -313,7 +315,8 @@ pub fn draw(imported: &Imported) -> Vec<usize> {
             *slot = TextImage::new(uv, [0.0, 0.0, 1.0, 1.0], 1.0);
         }
     }
-    skin.attach_text(&mut play, TextTable::new(lines))
+    let table = TextTable::new(lines);
+    skin.attach_text(&mut play, table.clone())
         .expect("one line per slot");
     skin.attach_bitmap_text(&mut play, &text);
     let tally = Tally {
@@ -363,7 +366,6 @@ pub fn draw(imported: &Imported) -> Vec<usize> {
             target: [1_920, 1_080],
             layout: &Layout::AUTHOR,
             lanes: LANES_OFF,
-            loading: None,
             readouts: readouts_for(LANES_OFF),
             playing: true,
         };
@@ -411,7 +413,6 @@ pub fn draw(imported: &Imported) -> Vec<usize> {
             target: [1_920, 1_080],
             layout: &Layout::AUTHOR,
             lanes: frame_lanes,
-            loading: None,
             readouts,
             playing: true,
         };
@@ -424,8 +425,95 @@ pub fn draw(imported: &Imported) -> Vec<usize> {
     choice_probes(skin, &chart, &uvs, &mut batch);
     bar_probes(skin, &ctx, (&tally, &states), &uvs, &mut batch);
     long_note_probes(skin, &ctx, (&tally, &states), &uvs, &mut batch);
+    loading_probes(skin, (&text, &table), &gauges[0], &uvs, &mut batch);
     digit_probes(skin, &ctx, &states, &uvs, &mut batch);
     counts
+}
+
+/// The skin's loading state with the chart's lines (`table`, the lines
+/// the play attached) installed, built as
+/// its clock and progress advance, with its gauge descriptor given,
+/// changed and taken away, the covers moving and the lines cleared, each
+/// frame inside the skin's capacities; a refused build refuses the state
+/// for good.
+fn loading_probes(
+    skin: &skin_model::Skin,
+    (text, table): (&skin_model::ChartText<'_>, &skin_model::TextTable),
+    desc: &skin_model::GaugeDesc,
+    uvs: &skin_model::UvTable,
+    batch: &mut skin_model::QuadBatch,
+) {
+    use bms_model::TimeUs;
+    use skin_model::{
+        BuildError, GaugeLook, LaneView, Layout, LoadState, LoadingFrame, LoadingGauge, Side,
+        TextSlots,
+    };
+
+    let mut loading = skin.prepare_loading(Side::Left);
+    skin.install_loading_text(&mut loading, TextSlots::ALL, table)
+        .expect("one line per slot");
+    skin.install_loading_bitmap_text(&mut loading, TextSlots::ALL, text);
+    let normal = LoadingGauge::of(0, desc);
+    let hard = LoadingGauge {
+        look: GaugeLook::Hard,
+        ..normal
+    };
+    for (ms, percent, gauge, cover) in [
+        (0_i64, 0, Some(normal), 0_u16),
+        (50, 10, Some(normal), 300),
+        (500, 40, None, 1_000),
+        (900, 40, Some(hard), 1_500),
+        (5_000, 100, Some(normal), 0),
+    ] {
+        if ms == 900 {
+            skin.clear_loading_text(&mut loading, TextSlots::ALL);
+        }
+        batch.clear();
+        let lanes = LaneView {
+            visible_time: TimeUs(600_000),
+            cover,
+            lift: 0,
+            hidden: 0,
+        };
+        let frame = LoadingFrame {
+            now: TimeUs(ms * 1_000),
+            load: LoadState {
+                since: TimeUs(0),
+                percent,
+            },
+            target: [1_920, 1_080],
+            layout: &Layout::AUTHOR,
+            lanes,
+            covers: readouts_for(lanes).covers,
+            gauge,
+        };
+        skin.build_loading(&mut loading, &frame, uvs, batch)
+            .expect("the loading frame builds");
+        check_batch(skin, batch);
+    }
+    // Covers the frame's lanes do not show: refused, then for good.
+    let mut frame = LoadingFrame {
+        now: TimeUs(6_000_000),
+        load: LoadState {
+            since: TimeUs(0),
+            percent: 100,
+        },
+        target: [1_920, 1_080],
+        layout: &Layout::AUTHOR,
+        lanes: LANES_OFF,
+        covers: readouts_for(LANES_OFF).covers,
+        gauge: Some(normal),
+    };
+    frame.covers.cover = 500;
+    assert_eq!(
+        skin.build_loading(&mut loading, &frame, uvs, batch),
+        Err(BuildError::InvalidReadouts)
+    );
+    frame.covers = readouts_for(LANES_OFF).covers;
+    assert_eq!(
+        skin.build_loading(&mut loading, &frame, uvs, batch),
+        Err(BuildError::InvalidReadouts)
+    );
 }
 
 /// Numbers and combos over a few values, signs and combo lengths, at
@@ -496,7 +584,6 @@ fn digit_probes(
             target,
             layout: &Layout::AUTHOR,
             lanes: LANES_OFF,
-            loading: None,
             readouts: readouts_for(LANES_OFF),
             playing: true,
         };
@@ -568,7 +655,6 @@ fn long_note_probes(
                 target: [1_920, 1_080],
                 layout: &Layout::AUTHOR,
                 lanes,
-                loading: None,
                 readouts: readouts_for(lanes),
                 playing: true,
             };
@@ -633,7 +719,6 @@ fn bar_probes(
             target: [1_920, 1_080],
             layout: &Layout::AUTHOR,
             lanes,
-            loading: None,
             readouts: readouts_for(lanes),
             playing: true,
         };
@@ -733,7 +818,6 @@ fn choice_probes(
             target: [1_920, 1_080],
             layout: &Layout::AUTHOR,
             lanes: LANES_OFF,
-            loading: None,
             readouts: readouts_for(LANES_OFF),
             playing: true,
         };
@@ -820,7 +904,6 @@ fn rate_and_kind_probes(
                 target: [1_920, 1_080],
                 layout: &Layout::AUTHOR,
                 lanes: LANES_OFF,
-                loading: None,
                 readouts: readouts_for(LANES_OFF),
                 playing: true,
             };
@@ -1054,7 +1137,6 @@ fn readout_probes(
                 target: [1_920, 1_080],
                 layout: &Layout::AUTHOR,
                 lanes,
-                loading: None,
                 readouts: FrameReadouts {
                     bpm_current_x100: bpm,
                     hispeed_x100: hs,

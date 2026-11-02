@@ -239,6 +239,7 @@ const EXPECTED: [&[(u16, i64)]; 16] = [
 /// timers.
 const FINAL: &[(u16, i64)] = &[
     (timer::READY, -1_000 * MS),
+    (timer::SCREEN, -1_000 * MS),
     (timer::PLAY, 0),
     (timer::BEAT, 2_400 * MS + 1),
     (J, 2_000 * MS),
@@ -253,9 +254,9 @@ const FINAL: &[(u16, i64)] = &[
 ];
 
 /// Whether a slot is effect-sourced: every built-in but `ready`, `play`,
-/// `failed`, `last_note` and `beat`.
+/// `failed`, `last_note`, `beat` and `screen`.
 fn effect_sourced(slot: u16) -> bool {
-    !matches!(slot, 0..=3 | 6)
+    !matches!(slot, 0..=3 | 6) && slot != timer::SCREEN
 }
 
 #[track_caller]

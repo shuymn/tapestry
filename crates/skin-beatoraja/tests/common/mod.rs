@@ -301,6 +301,15 @@ impl Loaded {
         }
     }
 
+    /// The import's loading state, its atlas built.
+    #[track_caller]
+    pub fn loading(self) -> play::Loader {
+        match self.result {
+            Ok(i) => play::Loader::new(i.skin),
+            Err(e) => panic!("{e:?}"),
+        }
+    }
+
     /// The quads at `ms` of a 100-note play.
     #[track_caller]
     pub fn quads(self, ms: i64) -> Vec<skin_model::Quad> {

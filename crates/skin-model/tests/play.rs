@@ -112,6 +112,32 @@ fn a_mid_chart_countdown() {
     assert_eq!(h.field(field::NOTES), 1);
 }
 
+/// In a play the screen timer, which untimed elements run on, starts at
+/// `ready`'s start, so an untimed animation starts again at the
+/// countdown; `loading` stays off and `load.percent` reads 100.
+#[test]
+fn the_screen_timer_starts_with_the_countdown_in_a_play() {
+    let chart = taps(&[1_000, 31_000]);
+    let s = section(30_000, 60_000, 1_000);
+    let skin = load(
+        Vec::new(),
+        vec![element(TimerRef::Builtin(timer::SCREEN), 1)],
+    )
+    .unwrap();
+    let mut h = Harness::new(skin, &chart, &in_section(&s));
+    h.frame_us(28_999_999, &[]);
+    assert_eq!(h.elapsed(timer::SCREEN), TIMER_OFF);
+    assert!(h.batch.quads().is_empty());
+    for (now, ms) in [(29_000, 0), (29_250, 250), (31_000, 2_000)] {
+        h.frame(now, &[]);
+        assert_eq!(h.start(timer::SCREEN), h.start(timer::READY), "at {now}");
+        assert_eq!(h.elapsed(timer::SCREEN), ms, "at {now}");
+        assert_eq!(h.batch.quads().len(), 1, "at {now}");
+        assert_eq!(h.elapsed(timer::LOADING), TIMER_OFF, "at {now}");
+        assert_eq!(h.field(field::LOAD_PERCENT), 100, "at {now}");
+    }
+}
+
 /// The smallest µs whose display position reaches `k` beats, from the
 /// map's segments: before 0 at the initial rate, then per segment from its
 /// anchor at its slope.
@@ -930,7 +956,6 @@ fn an_inconsistent_snapshot_poisons_the_play() {
             target: h.target,
             layout: &layout,
             lanes: h.view,
-            loading: None,
             readouts: play_support::readouts_for(h.view),
         };
         // Not cleared: a refused build appends nothing.

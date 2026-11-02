@@ -347,7 +347,6 @@ impl Harness {
             target: self.target,
             layout: &self.layout,
             lanes: self.view,
-            loading: None,
             playing: self.playing,
             readouts: self.readouts.unwrap_or_else(|| readouts_for(self.view)),
         };

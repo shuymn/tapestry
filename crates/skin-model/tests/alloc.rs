@@ -38,8 +38,8 @@ use skin_model::{
     Skin, SkinDef, SkinFrame, Source, TimerRef, Track, UvTable, Variant, field, lane_timer, timer,
 };
 use skin_model::{
-    ChartText, FontRef, FrameUv, LoadState, Overflow, TextDef, TextField, TextImage, TextTable,
-    TextValue,
+    ChartText, FontRef, FrameUv, LoadState, LoadingFrame, LoadingGauge, Overflow, TextDef,
+    TextField, TextImage, TextSlots, TextTable, TextValue,
 };
 
 struct Counting;
@@ -309,9 +309,9 @@ const TARGETS: [[u32; 2]; 5] = [
     [4_321, 1_080],
 ];
 
-/// A uv rectangle as a map key.
-fn uv_key(uv: [f32; 4]) -> [u32; 4] {
-    uv.map(f32::to_bits)
+/// A frame as a map key: its uv rectangle and its layer.
+fn uv_key(uv: [f32; 4], layer: u16) -> ([u32; 4], u16) {
+    (uv.map(f32::to_bits), layer)
 }
 
 /// A lane part's key whatever its crop: the uv's horizontal extent and the
@@ -324,7 +324,7 @@ fn part_key(uv: [f32; 4], layer: u16) -> ([u32; 2], u16) {
 struct Loaded {
     skin: Skin,
     uvs: UvTable,
-    shows: HashMap<[u32; 4], (u16, u16)>,
+    shows: HashMap<([u32; 4], u16), (u16, u16)>,
     parts: HashMap<([u32; 2], u16), u16>,
 }
 
@@ -591,49 +591,7 @@ fn widgets(elements: &mut Vec<ElementDef>) -> skin_model::WidgetDefs {
             value: int(src),
         })
         .collect();
-    let look = |first: u16| {
-        let at = |k: u16| [u32::from(first + 2 * k), u32::from(first + 2 * k + 1)];
-        GaugeParts {
-            front: at(0),
-            back: at(1),
-            tip: at(2),
-        }
-    };
-    let looks = |hard: GaugeParts| {
-        let mut out = [look(LOOKS); GaugeLook::COUNT];
-        out[GaugeLook::Hard.index()] = hard;
-        out
-    };
-    let step = TimeUs(70 * MS);
-    let gauges = vec![
-        GaugeDef {
-            segments: 50,
-            looks: looks(look(LOOKS + 6)),
-            motion: Motion::Still,
-        },
-        GaugeDef {
-            segments: 40,
-            looks: looks(look(LOOKS + 6)),
-            motion: Motion::Random { range: 5, step },
-        },
-        GaugeDef {
-            segments: 30,
-            looks: looks(look(LOOKS + 6)),
-            motion: Motion::Rise { range: 3, step },
-        },
-        GaugeDef {
-            segments: 20,
-            looks: looks(look(LOOKS + 6)),
-            motion: Motion::Fall { range: 2, step },
-        },
-        GaugeDef {
-            segments: 50,
-            looks: [look(FLICKER); GaugeLook::COUNT],
-            motion: Motion::Flicker {
-                period: TimeUs(330 * MS),
-            },
-        },
-    ];
+    let gauges = gauges();
     let regions = [
         Region::Bottom,
         Region::Right,
@@ -792,22 +750,55 @@ fn widgets(elements: &mut Vec<ElementDef>) -> skin_model::WidgetDefs {
     }
 }
 
-/// The selector of the shown gauge's look, invalid hiding.
-const GAUGE_LOOK: &str = "if gauge.valid then (if gauge.kind == assist_easy then 0 \
-    else if gauge.kind == easy then 1 else if gauge.kind == normal then 2 \
-    else if gauge.kind == hard then 3 else if gauge.kind == ex_hard then 4 \
-    else if gauge.kind == hazard then 5 else -1) else -1";
+/// The gauges: one in each motion, the flicker's with its own images.
+fn gauges() -> Vec<GaugeDef> {
+    let look = |first: u16| {
+        let at = |k: u16| [u32::from(first + 2 * k), u32::from(first + 2 * k + 1)];
+        GaugeParts {
+            front: at(0),
+            back: at(1),
+            tip: at(2),
+        }
+    };
+    let looks = |hard: GaugeParts| {
+        let mut out = [look(LOOKS); GaugeLook::COUNT];
+        out[GaugeLook::Hard.index()] = hard;
+        out
+    };
+    let step = TimeUs(70 * MS);
+    vec![
+        GaugeDef {
+            segments: 50,
+            looks: looks(look(LOOKS + 6)),
+            motion: Motion::Still,
+        },
+        GaugeDef {
+            segments: 40,
+            looks: looks(look(LOOKS + 6)),
+            motion: Motion::Random { range: 5, step },
+        },
+        GaugeDef {
+            segments: 30,
+            looks: looks(look(LOOKS + 6)),
+            motion: Motion::Rise { range: 3, step },
+        },
+        GaugeDef {
+            segments: 20,
+            looks: looks(look(LOOKS + 6)),
+            motion: Motion::Fall { range: 2, step },
+        },
+        GaugeDef {
+            segments: 50,
+            looks: [look(FLICKER); GaugeLook::COUNT],
+            motion: Motion::Flicker {
+                period: TimeUs(330 * MS),
+            },
+        },
+    ]
+}
 
-/// The image choice tables, their elements appended to `elements`:
-/// - by `elapsed(ready) / 40 % 7 − 2`: hidden, each entry (a hole among them) and past
-///   the table, the entries on their own clocks (`ready`, `judge`), one
-///   with its own track and one with its own native size, following each
-///   way in turn;
-/// - by the gauge's look, one entry per look with its own track, shared
-///   by two elements;
-/// - by the current tempo, while it is known.
-fn image_choices(
-    elements: &mut Vec<ElementDef>,
+/// The image choice tables [`image_choices`] draws.
+fn image_choice_tables(
     int: impl Fn(&str) -> skin_model::Program,
 ) -> Vec<skin_model::ImageChoiceDef> {
     use skin_model::{ImageChoiceDef, ImageChoicePart, ImageSpan};
@@ -865,6 +856,28 @@ fn image_choices(
         value: int("if bpm.current_valid then bpm.current_x100 / 100 % 3 else -1"),
         choices: vec![Some(part(GRADES, 0, 1)), Some(part(GRADES + 1, 0, 1)), None],
     };
+    vec![combo, looks, tempo]
+}
+
+/// The selector of the shown gauge's look, invalid hiding.
+const GAUGE_LOOK: &str = "if gauge.valid then (if gauge.kind == assist_easy then 0 \
+    else if gauge.kind == easy then 1 else if gauge.kind == normal then 2 \
+    else if gauge.kind == hard then 3 else if gauge.kind == ex_hard then 4 \
+    else if gauge.kind == hazard then 5 else -1) else -1";
+
+/// The image choice tables, their elements appended to `elements`:
+/// - by `elapsed(ready) / 40 % 7 − 2`: hidden, each entry (a hole among them) and past
+///   the table, the entries on their own clocks (`ready`, `judge`), one
+///   with its own track and one with its own native size, following each
+///   way in turn;
+/// - by the gauge's look, one entry per look with its own track, shared
+///   by two elements;
+/// - by the current tempo, while it is known.
+fn image_choices(
+    elements: &mut Vec<ElementDef>,
+    int: impl Fn(&str) -> skin_model::Program,
+) -> Vec<skin_model::ImageChoiceDef> {
+    let tables = image_choice_tables(int);
     for (i, (table, place)) in [
         (0, Place::SCREEN),
         (
@@ -901,7 +914,7 @@ fn image_choices(
             },
         ));
     }
-    vec![combo, looks, tempo]
+    tables
 }
 
 /// The text elements' key height.
@@ -1046,7 +1059,15 @@ fn skin() -> Loaded {
         ..lanes_support::image(u32::from(BEAM), [152, 824, 112, 112], beam)
     });
     let mut widgets = widgets(&mut elements);
-    widgets.cover_paints = vec![
+    widgets.cover_paints = cover_paints();
+    load(whens, elements, widgets)
+}
+
+/// The cover paints: SUDDEN+, LIFT with a slider, a choice of table 0,
+/// HIDDEN+ trimmed at the line, LIFT trimmed at the lanes' bottom by its
+/// own gate track.
+fn cover_paints() -> Vec<CoverPaintDef> {
+    vec![
         lanes_support::moving(u32::from(SUDDEN), CoverMotion::None, CoverTrim::None),
         CoverPaintDef {
             slider_range: Some(300),
@@ -1062,7 +1083,16 @@ fn skin() -> Loaded {
             gate_track: Some(lanes_support::rect([160, 960, 544, 80])),
             ..lanes_support::moving(u32::from(LIFT), CoverMotion::Lift, CoverTrim::Fixed(960))
         },
-    ];
+    ]
+}
+
+/// A skin over [`images`] with the regions, the lanes, `whens`, `elements`
+/// and `widgets`, its atlas built, and every frame's image.
+fn load(
+    whens: Vec<skin_model::Program>,
+    elements: Vec<ElementDef>,
+    widgets: skin_model::WidgetDefs,
+) -> Loaded {
     let (_dir, sheet) = images();
     let skin = Skin::new(SkinDef {
         fit: Fit::Adapt,
@@ -1091,7 +1121,11 @@ fn skin() -> Loaded {
     for k in 0..IMAGES {
         for f in 0..frames_of(k) {
             let frame = uvs.get(next).unwrap();
-            assert!(shows.insert(uv_key(frame.uv), (k, f)).is_none());
+            assert!(
+                shows
+                    .insert(uv_key(frame.uv, frame.layer), (k, f))
+                    .is_none()
+            );
             if (PARTS..=BEAM).contains(&k) {
                 let old = parts.insert(part_key(frame.uv, frame.layer), k);
                 // A cycle's frames may share a column.
@@ -1107,6 +1141,96 @@ fn skin() -> Loaded {
         shows,
         parts,
     }
+}
+
+/// A skin for the loading runtime: its structural widgets untimed, on
+/// `screen`, under conditions loading can read. A background and an image
+/// on `loading`; the lanes while the cover is short of the whole lane; the
+/// gauges in every motion, two of them only with a descriptor; every
+/// cover paint, HIDDEN+'s while its amount is above 0; the gauge look's
+/// image choice; and images on `when` timers on the progress, the
+/// descriptor and the covers. The play fixture's other widgets are defined
+/// but not drawn.
+fn loading_skin() -> Loaded {
+    // 32, as the sheet's cycles name: on the progress, the descriptor
+    // and the covers in turn.
+    let conditions = [
+        "load.percent >= 50",
+        "gauge.valid && gauge.kind == hard",
+        "cover.enabled && lift.permille > 0",
+    ];
+    let whens = (0..32)
+        .map(|i| bool_program(conditions[i % conditions.len()]))
+        .collect();
+    let untimed =
+        |source, track, place| widget(source, track, TimerRef::Builtin(timer::SCREEN), place);
+    let still = || track(0, Ease::Linear, End::Hold);
+    let mut elements = vec![
+        ElementDef {
+            timer: TimerRef::Builtin(timer::SCREEN),
+            ..background(timer::SCREEN, Fill::Cover)
+        },
+        ElementDef {
+            timer: TimerRef::Builtin(timer::LOADING),
+            ..background(timer::LOADING, Fill::Stretch)
+        },
+        ElementDef {
+            visible: Some(bool_program("cover.permille < 1000")),
+            timer: TimerRef::Builtin(timer::SCREEN),
+            ..lanes_support::lanes_element()
+        },
+    ];
+    for i in 0_u16..5 {
+        elements.push(ElementDef {
+            visible: (i % 2 == 1).then(|| bool_program("gauge.valid")),
+            ..untimed(
+                Source::Gauge(u32::from(i)),
+                track(400 + 11 * i, Ease::Out, End::Hold),
+                Place {
+                    pivot: Anchor::ALL[usize::from(i)],
+                    follow: FOLLOWS[usize::from(i) % 4],
+                    ..Place::SCREEN
+                },
+            )
+        });
+    }
+    for (paint, r, follow) in [
+        (0, [160, -720, 544, 800], Follow::Cover),
+        (1, [160, 0, 544, 80], Follow::None),
+        (2, [160, -400, 544, 480], Follow::LiftAndCover),
+        (3, [160, 880, 544, 800], Follow::Cover),
+        (4, [160, 940, 544, 120], Follow::None),
+    ] {
+        elements.push(ElementDef {
+            visible: (paint == 3).then(|| bool_program("hidden.permille > 0")),
+            timer: TimerRef::Builtin(timer::SCREEN),
+            ..lanes_support::paint(paint, r, follow)
+        });
+    }
+    elements.push(untimed(Source::ImageChoice(1), still(), Place::SCREEN));
+    for w in 0_u16..3 {
+        elements.push(widget(
+            Source::Image(u32::from(timer::BUILTIN + w)),
+            still(),
+            TimerRef::When(w),
+            Place::SCREEN,
+        ));
+    }
+    let int = |src: &str| {
+        skin_model::compile(
+            src,
+            &skin_model::Scope::new(&skin_model::PLAY),
+            skin_model::Ty::Int,
+        )
+        .unwrap()
+    };
+    let widgets = skin_model::WidgetDefs {
+        gauges: gauges(),
+        image_choices: image_choice_tables(int),
+        cover_paints: cover_paints(),
+        ..skin_model::WidgetDefs::default()
+    };
+    load(whens, elements, widgets)
 }
 
 /// What a stretch saw.
@@ -1196,7 +1320,7 @@ impl Widgets {
                 let [.., iw, ih] = TEXT_INK;
                 self.text_squeezed |= q.uv == TITLE_UV && q.rect[2] * ih < q.rect[3] * iw * 0.99;
             }
-            let Some(&(image, frame)) = loaded.shows.get(&uv_key(q.uv)) else {
+            let Some(&(image, frame)) = loaded.shows.get(&uv_key(q.uv, q.layer)) else {
                 continue;
             };
             match image {
@@ -1419,11 +1543,6 @@ fn stretch(
             layout: &views.layouts[layout_no],
             lanes: view,
             readouts: stretch_readouts(frame_no, view),
-            // A stretch of loading frames every 50, its progress moving.
-            loading: (frame_no % 50 < 5).then(|| LoadState {
-                since: TimeUs(now - 1_000),
-                percent: i32::try_from(frame_no % 120).unwrap_or(0),
-            }),
             playing: true,
         };
         let use_small = frame_no % 100 == 99;
@@ -1458,7 +1577,7 @@ fn stretch(
                     }
                     _ => {}
                 }
-                let Some(&(image, frame)) = loaded.shows.get(&uv_key(q.uv)) else {
+                let Some(&(image, frame)) = loaded.shows.get(&uv_key(q.uv, q.layer)) else {
                     continue;
                 };
                 if let Some(d) = w.drawn.get_mut(usize::from(image)) {
@@ -1673,6 +1792,12 @@ fn build_does_not_allocate() {
             seen.drawn[slot] = true;
         }
     }
+    // `loading` runs only in the loading runtime, which draws an element
+    // on it in `loading_does_not_allocate`.
+    let slot = usize::from(timer::LOADING);
+    assert!(!seen.on[slot] && !seen.drawn[slot], "`loading` in a play");
+    seen.on[slot] = true;
+    seen.drawn[slot] = true;
     let missing = |flags: [bool; timer::BUILTIN as usize]| -> Vec<u16> {
         (0..)
             .zip(flags)
@@ -1708,7 +1833,6 @@ fn build_does_not_allocate() {
         layout: &views.layouts[0],
         lanes: views.lanes[0],
         readouts: readouts_for(views.lanes[0]),
-        loading: None,
         playing: true,
     };
     skin.build(&mut play, &frame, &loaded.uvs, &mut batch)
@@ -1738,6 +1862,7 @@ fn build_does_not_allocate() {
     assert_eq!(first, Err(BuildError::InconsistentTally));
     assert_eq!(after, Err(BuildError::InconsistentTally));
     readouts_do_not_allocate(&loaded, &descs);
+    loading_does_not_allocate(&loaded, &views, &descs);
     // Both text elements ask for a line; the title is the chart's.
     let chart_text = ChartText {
         title: "Title",
@@ -1780,7 +1905,6 @@ fn build_does_not_allocate() {
             layout: &views.layouts[0],
             lanes: views.lanes[0],
             readouts: readouts_for(views.lanes[0]),
-            loading: None,
             playing: true,
         };
         bitmap
@@ -1795,6 +1919,174 @@ fn build_does_not_allocate() {
         "bitmap text: allocations"
     );
     assert!(glyphs > 0, "no glyph drew");
+
+    // Its loading state's bitmap lines, installed untracked, draw alike.
+    let mut loading = bitmap.prepare_loading(Side::Left);
+    bitmap.install_loading_bitmap_text(
+        &mut loading,
+        TextSlots::ALL,
+        &ChartText {
+            title: "ABAB",
+            ..ChartText::default()
+        },
+    );
+    let mut glyphs = 0;
+    TRACK.with(|t| t.set(true));
+    for ms in (0..2_000).step_by(16) {
+        batch.clear();
+        let frame = LoadingFrame {
+            now: TimeUs(ms * MS),
+            load: LoadState {
+                since: TimeUs(0),
+                percent: 0,
+            },
+            target: TARGETS[0],
+            layout: &views.layouts[0],
+            lanes: views.lanes[0],
+            covers: readouts_for(views.lanes[0]).covers,
+            gauge: None,
+        };
+        bitmap
+            .build_loading(&mut loading, &frame, &uvs, &mut batch)
+            .expect("the loading frame builds");
+        glyphs += batch.quads().len();
+    }
+    TRACK.with(|t| t.set(false));
+    assert_eq!(
+        ALLOCS.load(Ordering::Relaxed),
+        0,
+        "loading bitmap text: allocations"
+    );
+    assert!(glyphs > 0, "no loading glyph drew");
+}
+
+/// The loading frame `no` of a lifetime begun at `since`: the clock, the
+/// progress, the target, the layout, the lanes and the covers moving, the
+/// descriptor of either gauge given on two frames of three.
+fn loading_frame<'a>(
+    views: &'a Views,
+    descs: &[GaugeDesc],
+    since: TimeUs,
+    no: usize,
+) -> LoadingFrame<'a> {
+    let view = views.lanes[(no / 7) % views.lanes.len()];
+    LoadingFrame {
+        now: TimeUs(since.0 + i64::try_from(no).unwrap() * 16 * MS),
+        load: LoadState {
+            since,
+            percent: i32::try_from(no % 120).unwrap(),
+        },
+        target: TARGETS[(no / 5) % TARGETS.len()],
+        layout: &views.layouts[(no / 11) % views.layouts.len()],
+        lanes: view,
+        covers: readouts_for(view).covers,
+        gauge: (no % 3 != 2).then(|| LoadingGauge::of(no % 2, &descs[no % 2])),
+    }
+}
+
+/// The builds of a loading state of `loaded`, tracked: 600 frames, then a
+/// refused build and one after it. `see` is given each frame's number and
+/// quads while tracking, and must not allocate. The refused builds' errors.
+fn track_loading(
+    loaded: &Loaded,
+    loading: &mut skin_model::Loading,
+    views: &Views,
+    descs: &[GaugeDesc],
+    mut see: impl FnMut(usize, &[skin_model::Quad]),
+) -> [Result<(), BuildError>; 2] {
+    let skin = &loaded.skin;
+    let mut batch = QuadBatch::with_capacity(skin.quad_capacity(), skin.run_capacity());
+    let since = TimeUs(-5_000 * MS);
+    let bad = LoadingFrame {
+        covers: CoverSettings {
+            cover: 1_001,
+            ..readouts_for(views.lanes[0]).covers
+        },
+        ..loading_frame(views, descs, since, 0)
+    };
+    TRACK.with(|t| t.set(true));
+    for no in 0..600 {
+        batch.clear();
+        let frame = loading_frame(views, descs, since, no);
+        skin.build_loading(loading, &frame, &loaded.uvs, &mut batch)
+            .expect("the loading frame builds");
+        see(no, batch.quads());
+    }
+    batch.clear();
+    let first = skin.build_loading(loading, &bad, &loaded.uvs, &mut batch);
+    let frame = loading_frame(views, descs, since, 1);
+    let after = skin.build_loading(loading, &frame, &loaded.uvs, &mut batch);
+    see(600, batch.quads());
+    TRACK.with(|t| t.set(false));
+    assert_eq!(ALLOCS.load(Ordering::Relaxed), 0, "loading: allocations");
+    [first, after]
+}
+
+/// The loading runtime's builds allocate nothing: its first build after
+/// preparation and the installation of its lines, later builds as the
+/// clock, the progress, the target, the layout, the covers and the gauge
+/// descriptor change, with it given and taken away, and a refused build
+/// and one after it, which draw nothing. Over the play fixture the
+/// elements on `loading` and `screen` draw, none on `ready`; over
+/// the structural fixture its background, the lanes' line, the gauges'
+/// empty frames, the cover paints, the gauge look's choice and the `when`
+/// images draw, in the first build and in later ones.
+fn loading_does_not_allocate(loaded: &Loaded, views: &Views, descs: &[GaugeDesc]) {
+    let mut loading = loaded.skin.prepare_loading(Side::Left);
+    loaded
+        .skin
+        .install_loading_text(&mut loading, TextSlots::ALL, &text_table())
+        .unwrap();
+    let mut drawn = 0;
+    // Whether an element on `loading`, `screen` and `ready` drew.
+    let mut timed = [false; 3];
+    let refused = track_loading(loaded, &mut loading, views, descs, |no, quads| {
+        if no < 600 {
+            drawn += quads.len();
+        } else {
+            assert!(quads.is_empty(), "a refused build drew");
+        }
+        for q in quads {
+            if let Some(&(image, _)) = loaded.shows.get(&uv_key(q.uv, q.layer)) {
+                timed[0] |= image == timer::LOADING;
+                timed[1] |= image == timer::SCREEN;
+                timed[2] |= image == timer::READY;
+            }
+        }
+    });
+    assert!(drawn > 0, "no loading quad drew");
+    assert_eq!(timed, [true, true, false], "loading, screen, ready");
+    assert_eq!(refused, [Err(BuildError::InvalidReadouts); 2]);
+
+    let structural = loading_skin();
+    let mut loading = structural.skin.prepare_loading(Side::Left);
+    // Per kind, whether it drew in the first build and in a later one:
+    // the background, the lanes' line, a gauge, a cover paint, the look
+    // choice and a `when` image.
+    let mut seen = [[false; 6]; 2];
+    let refused = track_loading(&structural, &mut loading, views, descs, |no, quads| {
+        if no == 600 {
+            assert!(quads.is_empty(), "a refused build drew");
+            return;
+        }
+        let at = &mut seen[usize::from(no > 0)];
+        for q in quads {
+            if structural.parts.get(&part_key(q.uv, q.layer)) == Some(&(PARTS + 7)) {
+                at[1] = true;
+            }
+            let Some(&(image, _)) = structural.shows.get(&uv_key(q.uv, q.layer)) else {
+                continue;
+            };
+            at[0] |= image == timer::SCREEN;
+            at[2] |= (LOOKS..CHOICES).contains(&image);
+            at[3] |= image == SUDDEN || image == LIFT;
+            at[4] |= image == CHOICES + 2;
+            at[5] |= (timer::BUILTIN..timer::BUILTIN + 3).contains(&image);
+        }
+    });
+    assert_eq!(seen[0][..5], [true; 5], "first build: {:?}", seen[0]);
+    assert_eq!(seen[1], [true; 6], "later builds");
+    assert_eq!(refused, [Err(BuildError::InvalidReadouts); 2]);
 }
 
 const LIMITS_SMALL: AtlasLimits = AtlasLimits {
@@ -1806,27 +2098,7 @@ const LIMITS_SMALL: AtlasLimits = AtlasLimits {
 /// Two bitmap texts of the title: `A` from the primary file, `B` from its
 /// fallback; the second squeezed into its box.
 fn bitmap_skin() -> (tempfile::TempDir, Skin) {
-    let root = dir();
-    let fnt = |name: &str, code: u32| {
-        let s = format!(
-            "info face=\"t\" size=10 padding=0,0,0,0\n\
-             common lineHeight=12 base=10 scaleW=16 scaleH=16 pages=1\n\
-             page id=0 file=\"{name}.png\"\n\
-             char id={code} x=0 y=0 width=6 height=9 xoffset=1 yoffset=1 xadvance=8 page=0\n"
-        );
-        std::fs::write(root.path().join(format!("{name}.fnt")), s).unwrap();
-        save(
-            root.path(),
-            &format!("{name}.png"),
-            &solid(16, 16, [255; 4]),
-        );
-    };
-    fnt("a", 65);
-    fnt("b", 66);
-    let mut b = skin_model::SheetBuilder::new(&skin_model::Root::new(root.path()).unwrap());
-    let a = b.admit_fnt("a.fnt", &mut |_| Ok(())).unwrap();
-    let f = b.admit_fnt("b.fnt", &mut |_| Ok(())).unwrap();
-    b.add_bitmap_font(a, &[f]).unwrap();
+    let (root, sheet) = image_support::ab_fonts();
     let text = |overflow| TextDef {
         value: TextValue::Field(TextField::Title),
         font: FontRef::Bitmap(0),
@@ -1836,7 +2108,7 @@ fn bitmap_skin() -> (tempfile::TempDir, Skin) {
     let element = |i: u16| ElementDef {
         source: Source::Text(u32::from(i)),
         track: track(i, Ease::Linear, End::Hold),
-        timer: TimerRef::Builtin(timer::READY),
+        timer: TimerRef::Builtin(timer::SCREEN),
         visible: None,
         blend: Blend::Alpha,
         clip: None,
@@ -1846,7 +2118,7 @@ fn bitmap_skin() -> (tempfile::TempDir, Skin) {
         fit: Fit::Adapt,
         regions: regions(),
         whens: Vec::new(),
-        sheet: b.finish(),
+        sheet,
         lanes: None,
         elements: vec![element(0), element(1)],
         widgets: skin_model::WidgetDefs {
@@ -1924,7 +2196,6 @@ fn source_lanes_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
             layout: &layout,
             lanes,
             readouts: readouts_for(lanes),
-            loading: None,
             playing: true,
         };
         skin.build(&mut play, &frame, &uvs, &mut batch)
@@ -2030,7 +2301,6 @@ fn fallback_lanes_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
                 layout: &layout,
                 lanes,
                 readouts: readouts_for(lanes),
-                loading: None,
                 playing: true,
             };
             let out = if i % 50 == 49 { &mut small } else { &mut batch };
@@ -2067,7 +2337,6 @@ fn fallback_lanes_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
                 layout: &layout,
                 lanes,
                 readouts: bad,
-                loading: None,
                 playing: true,
             };
             assert_eq!(
@@ -2286,7 +2555,6 @@ fn cover_trims_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
             layout: &layout,
             lanes,
             readouts,
-            loading: None,
             playing: true,
         };
         let out = if i % 50 == 49 { &mut small } else { &mut batch };
@@ -2339,7 +2607,6 @@ fn cover_trims_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
             layout: &layout,
             lanes,
             readouts: bad,
-            loading: None,
             playing: true,
         };
         assert_eq!(
@@ -2470,7 +2737,6 @@ fn bar_groups_do_not_allocate(ctx: &PlayContext<'_>) {
         layout: &layout,
         lanes,
         readouts,
-        loading: None,
         playing: true,
     };
     let bar_uv = |uvs: &UvTable| uvs.get(lanes_support::BAR).unwrap().uv;
@@ -2649,7 +2915,6 @@ fn readouts_do_not_allocate(loaded: &Loaded, descs: &[GaugeDesc]) {
         layout: &SkinLayout::AUTHOR,
         lanes,
         readouts,
-        loading: None,
         playing: true,
     };
     let invalid = FrameReadouts {

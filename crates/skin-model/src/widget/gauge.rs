@@ -18,6 +18,7 @@ use rules::{GaugeKind, GaugeRule, GaugeValue};
 use super::{Brush, Frame, ImageRef};
 use crate::canvas::f32_of;
 use crate::play::GaugeDesc;
+
 use crate::play::schema::GAUGE_PERMILLE;
 use crate::quad::QuadBatch;
 use crate::track::MAX_KEY_US;
@@ -296,12 +297,39 @@ pub(crate) struct Gauge {
     pub(crate) motion: Motion,
 }
 
+/// The shown gauge as a frame draws it: its look, maximum and border, and
+/// its value (0 for its empty frame).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Shown {
+    pub(crate) look: GaugeLook,
+    pub(crate) max: GaugeValue,
+    pub(crate) border: GaugeValue,
+    pub(crate) value: GaugeValue,
+}
+
+impl Shown {
+    /// A play's shown gauge: the snapshot's value under its descriptor;
+    /// `None` when either lacks the shown index.
+    pub(crate) fn of(
+        gauges: &[GaugeState],
+        descs: Option<&GaugeDesc>,
+        shown: usize,
+    ) -> Option<Self> {
+        let (g, d) = (gauges.get(shown)?, descs?);
+        Some(Self {
+            look: d.look,
+            max: d.max,
+            border: d.border,
+            value: g.value,
+        })
+    }
+}
+
 /// What a gauge draws from this frame.
 pub(crate) struct GaugeDraw<'a> {
     pub(crate) at: Frame<'a>,
-    /// The snapshot's gauges and the shown one's index.
-    pub(crate) gauges: &'a [GaugeState],
-    pub(crate) shown: usize,
+    /// The shown gauge; `None` draws nothing.
+    pub(crate) shown: Option<Shown>,
     /// µs since the element's timer started.
     pub(crate) t: i64,
 }
@@ -319,8 +347,8 @@ impl Gauge {
         }
     }
 
-    /// Draws the shown gauge over `rect` through `brush`; nothing when the
-    /// snapshot or the descriptors lack the shown index. A segment whose
+    /// Draws the shown gauge over `rect` through `brush`; nothing without
+    /// one. A segment whose
     /// frame is missing is skipped; a refused push stops the gauge.
     pub(crate) fn draw(
         &self,
@@ -329,14 +357,14 @@ impl Gauge {
         brush: &Brush,
         out: &mut QuadBatch,
     ) {
-        let (Some(g), Some(desc)) = (d.gauges.get(d.shown), d.at.play.gauge_desc(d.shown)) else {
+        let Some(desc) = d.shown else {
             return;
         };
         let Some(look) = self.looks.get(desc.look.index()) else {
             return;
         };
         let p = self.segments;
-        let n = lit(g.value, desc.max, p);
+        let n = lit(desc.value, desc.max, p);
         let a = self.motion.offset(d.t);
         let flicker = match self.motion {
             Motion::Flicker { period } => Some(period.0.max(1)),
@@ -347,7 +375,7 @@ impl Gauge {
         let pf = f64::from(p);
         // The look's six frames at `now`, resolved once for every segment.
         let resolve = |images: &[ImageRef; 2]| {
-            images.map(|i| (i.frame(d.at.play, d.at.now, d.at.uvs), i.filter))
+            images.map(|i| (i.frame(d.at.starts, d.at.now, d.at.uvs), i.filter))
         };
         let (front, back, tip) = (
             resolve(&look.front),

@@ -31,6 +31,33 @@ pub fn solid(w: u32, h: u32, c: [u8; 4]) -> RgbaImage {
     RgbaImage::from_pixel(w, h, Rgba(c))
 }
 
+/// A folder holding the bitmap fonts `a.fnt` (only `A`) and `b.fnt`
+/// (only `B`), each glyph 6×9 advancing 8 on a white 16×16 page, and a
+/// sheet whose bitmap font 0 is `a` falling back to `b`. The folder must
+/// live until the atlas is built.
+pub fn ab_fonts() -> (TempDir, Sheet) {
+    let root = dir();
+    for (name, code) in [("a", 65), ("b", 66)] {
+        let s = format!(
+            "info face=\"t\" size=10 padding=0,0,0,0\n\
+             common lineHeight=12 base=10 scaleW=16 scaleH=16 pages=1\n\
+             page id=0 file=\"{name}.png\"\n\
+             char id={code} x=0 y=0 width=6 height=9 xoffset=1 yoffset=1 xadvance=8 page=0\n"
+        );
+        fs::write(root.path().join(format!("{name}.fnt")), s).unwrap();
+        save(
+            root.path(),
+            &format!("{name}.png"),
+            &solid(16, 16, [255; 4]),
+        );
+    }
+    let mut b = skin_model::SheetBuilder::new(&skin_model::Root::new(root.path()).unwrap());
+    let a = b.admit_fnt("a.fnt", &mut |_| Ok(())).unwrap();
+    let f = b.admit_fnt("b.fnt", &mut |_| Ok(())).unwrap();
+    b.add_bitmap_font(a, &[f]).unwrap();
+    (root, b.finish())
+}
+
 pub fn file(path: &str) -> FileDef {
     FileDef {
         path: path.into(),
