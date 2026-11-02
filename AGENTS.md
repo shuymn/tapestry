@@ -24,7 +24,7 @@ mise exec -- cargo fmt --check
 mise exec -- cargo clippy --workspace --all-targets -- -D warnings
 mise exec -- cargo test --workspace
 mise exec -- cargo clippy -p player -p game -p skin-beatoraja --all-targets --features player/dev-tools,game/dev-tools,skin-beatoraja/dev-tools -- -D warnings
-mise exec -- cargo test -p player -p game --features player/dev-tools,game/dev-tools
+mise exec -- cargo test -p player -p game -p skin-beatoraja --features player/dev-tools,game/dev-tools,skin-beatoraja/dev-tools
 mise exec -- cargo xtask portable test
 mise exec -- cargo xtask check-arch
 mise exec -- cargo xtask check-lints
