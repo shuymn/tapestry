@@ -63,15 +63,13 @@ fn with_groups(mut def: LanesDef, groups: Vec<BarGroupDef>) -> LanesDef {
 
 /// A chart with bar lines at `ms` and a tap on key 3 at 5 s.
 fn chart_with_bars(ms: &[i64]) -> Chart {
-    let mut chart = ChartBuilder::new(BPM)
-        .tap(lane(3), TimeUs(5_000 * MS))
+    ms.iter()
+        .fold(
+            ChartBuilder::new(BPM).tap(lane(3), TimeUs(5_000 * MS)),
+            |b, &t| b.bar(TimeUs(t * MS)),
+        )
         .build()
-        .unwrap();
-    chart.bar_lines = ms
-        .iter()
-        .map(|&t| chart.scroll.position_at(TimeUs(t * MS)))
-        .collect();
-    chart
+        .unwrap()
 }
 
 fn harness(def: LanesDef, chart: &Chart) -> Harness {
@@ -144,12 +142,12 @@ fn a_stop_holds_a_bar_while_its_animation_runs() {
     // A bar at the STOP's start (1 s, held 1 s): its time passes while the
     // chart position holds, and it stays on the line, fading in on the
     // frame's clock.
-    let mut chart = ChartBuilder::new(BPM)
+    let chart = ChartBuilder::new(BPM)
         .stop(TimeUs(1_000 * MS), TimeUs(1_000 * MS))
         .tap(lane(3), TimeUs(5_000 * MS))
+        .bar(TimeUs(1_000 * MS))
         .build()
         .unwrap();
-    chart.bar_lines = vec![chart.scroll.position_at(TimeUs(1_000 * MS))];
     let def = with_groups(
         simple(),
         vec![fading(BAR, [160, 879, 544, 2], timer::READY)],
@@ -300,9 +298,7 @@ fn bars_stop_with_no_scroll_left() {
 
 /// `n` bar lines at 5 s, where the tap is.
 fn many_bars(n: usize) -> Chart {
-    let mut chart = chart_with_bars(&[]);
-    chart.bar_lines = vec![chart.scroll.position_at(TimeUs(5_000 * MS)); n];
-    chart
+    chart_with_bars(&vec![5_000; n])
 }
 
 #[test]

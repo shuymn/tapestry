@@ -1072,17 +1072,16 @@ fn bar_probes(
     use bms_model::{ChartBuilder, Lane, TimeUs};
     use skin_model::{LaneView, Layout, SkinFrame};
 
-    let mut chart = ChartBuilder::new(150_000)
+    let mut builder = ChartBuilder::new(150_000)
         .stop(TimeUs(1_000_000), TimeUs(500_000))
-        .tap(Lane::new(1).expect("lane 1"), TimeUs(3_000_000))
-        .build()
-        .expect("a chart of a tap");
-    let at = |ms: i64| chart.scroll.position_at(TimeUs(ms * 1_000));
-    let mut bars: Vec<_> = (0..40).map(|i| at(i * 125)).collect();
-    bars.extend(std::iter::repeat_n(at(3_000), 8));
-    bars.sort_unstable();
-    chart.bar_lines = bars;
-    chart.validate().expect("the bar chart is valid");
+        .tap(Lane::new(1).expect("lane 1"), TimeUs(3_000_000));
+    for i in 0..40 {
+        builder = builder.bar(TimeUs(i * 125_000));
+    }
+    for _ in 0..8 {
+        builder = builder.bar(TimeUs(3_000_000));
+    }
+    let chart = builder.build().expect("the bar chart is valid");
     let mut play = skin
         .prepare(&chart, ctx)
         .expect("an imported skin prepares");

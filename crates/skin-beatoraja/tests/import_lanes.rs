@@ -477,12 +477,13 @@ const ACROSS: &str = r#""x": 20, "y": 200, "w": 430, "h": 2"#;
 
 /// A tap at 5 s and bars at `ms`.
 fn barred(ms: &[i64]) -> Chart {
-    let mut chart = tap(1, 5_000);
-    chart.bar_lines = ms
-        .iter()
-        .map(|&t| chart.scroll.position_at(TimeUs(t * MS)))
-        .collect();
-    chart
+    ms.iter()
+        .fold(
+            ChartBuilder::new(150_000).tap(Lane::new(1).unwrap(), TimeUs(5_000 * MS)),
+            |b, &t| b.bar(TimeUs(t * MS)),
+        )
+        .build()
+        .unwrap()
 }
 
 /// Whether `r` drops something for `kind`.
@@ -526,12 +527,12 @@ fn a_group_draws_where_its_destination_stands() {
         Vec::<[i32; 4]>::new()
     );
     // During a STOP at the bar, it holds.
-    let mut chart = ChartBuilder::new(150_000)
+    let chart = ChartBuilder::new(150_000)
         .tap(Lane::new(1).unwrap(), TimeUs(5_000 * MS))
         .stop(TimeUs(1_000 * MS), TimeUs(500 * MS))
+        .bar(TimeUs(1_000 * MS))
         .build()
         .unwrap();
-    chart.bar_lines = vec![chart.scroll.position_at(TimeUs(1_000 * MS))];
     assert_eq!(rects_over(&l, &chart, 1_400), [[20, 878, 430, 2]]);
 }
 
@@ -671,8 +672,11 @@ fn groups_that_cannot_draw_drop_alone() {
             "{g}"
         );
         // The kept group and the notes still draw.
-        let mut chart = tap(1, 1_000);
-        chart.bar_lines = vec![chart.scroll.position_at(TimeUs(1_000 * MS))];
+        let chart = ChartBuilder::new(150_000)
+            .tap(Lane::new(1).unwrap(), TimeUs(1_000 * MS))
+            .bar(TimeUs(1_000 * MS))
+            .build()
+            .unwrap();
         assert_eq!(
             rects_over(&l, &chart, 1_000),
             [[20, 878, 430, 2], [100, 860, 50, 20]],

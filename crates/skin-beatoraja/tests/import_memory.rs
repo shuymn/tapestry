@@ -757,17 +757,15 @@ const F5_LANES: &str = r#"{"x": 100, "y": 200, "w": 51, "h": 600},
 /// F5's chart: a chord on every lane at 1 100 and 1 200 ms, bars at
 /// 1 000 and 1 050 ms.
 fn f5_chart() -> bms_model::Chart {
-    let mut b = bms_model::ChartBuilder::new(150_000);
+    let mut b = bms_model::ChartBuilder::new(150_000)
+        .bar(bms_model::TimeUs(1_000_000))
+        .bar(bms_model::TimeUs(1_050_000));
     for t in [1_100_000, 1_200_000] {
         for l in 0..8 {
             b = b.tap(bms_model::Lane::new(l).unwrap(), bms_model::TimeUs(t));
         }
     }
-    let mut chart = b.build().unwrap();
-    chart.bar_lines = [1_000_000, 1_050_000]
-        .map(|t| chart.scroll.position_at(bms_model::TimeUs(t)))
-        .to_vec();
-    chart
+    b.build().unwrap()
 }
 
 fn check_f5(_: &Header, i: Imported) {
@@ -1165,15 +1163,14 @@ fn f9(root: &Path) {
 
 /// F9's chart: a note and a bar on the line at 1 s.
 fn f9_chart() -> bms_model::Chart {
-    let mut chart = bms_model::ChartBuilder::new(150_000)
+    bms_model::ChartBuilder::new(150_000)
         .tap(
             bms_model::Lane::new(1).unwrap(),
             bms_model::TimeUs(1_000_000),
         )
+        .bar(bms_model::TimeUs(1_000_000))
         .build()
-        .unwrap();
-    chart.bar_lines = vec![chart.scroll.position_at(bms_model::TimeUs(1_000_000))];
-    chart
+        .unwrap()
 }
 
 fn check_f9(_: &Header, i: Imported) {
@@ -1847,18 +1844,16 @@ fn f16(root: &Path) {
 /// F16a's chart: 1 100 chords within 400 ms from 1 s, 8 800 taps in
 /// view, past the quad budget; bars at 1 000 and 1 050 ms.
 fn f16a_chart() -> bms_model::Chart {
-    let mut b = bms_model::ChartBuilder::new(150_000);
+    let mut b = bms_model::ChartBuilder::new(150_000)
+        .bar(bms_model::TimeUs(1_000_000))
+        .bar(bms_model::TimeUs(1_050_000));
     for k in 0..1_100 {
         for l in 0..8 {
             let t = bms_model::TimeUs(1_000_000 + k * 360);
             b = b.tap(bms_model::Lane::new(l).unwrap(), t);
         }
     }
-    let mut chart = b.build().unwrap();
-    chart.bar_lines = [1_000_000, 1_050_000]
-        .map(|t| chart.scroll.position_at(bms_model::TimeUs(t)))
-        .to_vec();
-    chart
+    b.build().unwrap()
 }
 
 fn check_f16a(_: &Header, i: Imported) {

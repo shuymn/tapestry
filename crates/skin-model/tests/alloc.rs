@@ -2905,19 +2905,16 @@ fn bar_groups_do_not_allocate(ctx: &PlayContext<'_>) {
     };
     // Bars every 100 ms over a STOP, then a run of equal bars that spends
     // every budget.
-    let mut chart = ChartBuilder::new(150_000)
+    let mut builder = ChartBuilder::new(150_000)
         .stop(TimeUs(2_000 * MS), TimeUs(1_000 * MS))
-        .tap(lane(3), TimeUs(9_000 * MS))
-        .build()
-        .unwrap();
-    let mut bars: Vec<_> = (0..80)
-        .map(|i| chart.scroll.position_at(TimeUs(i * 100 * MS)))
-        .collect();
-    bars.extend(std::iter::repeat_n(
-        chart.scroll.position_at(TimeUs(9_000 * MS)),
-        usize::try_from(skin_model::LANE_VISITS).unwrap(),
-    ));
-    chart.bar_lines = bars;
+        .tap(lane(3), TimeUs(9_000 * MS));
+    for i in 0..80 {
+        builder = builder.bar(TimeUs(i * 100 * MS));
+    }
+    for _ in 0..skin_model::LANE_VISITS {
+        builder = builder.bar(TimeUs(9_000 * MS));
+    }
+    let chart = builder.build().unwrap();
     let t = tally(0);
     let gauges = [state(GaugeValue::FULL), state(GaugeValue::FULL)];
     let layout = SkinLayout::AUTHOR;
