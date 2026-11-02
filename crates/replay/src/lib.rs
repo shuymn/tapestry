@@ -713,8 +713,9 @@ fn decode_body(body: &[u8], limits: &DecodeLimits) -> Result<PlayRecord, DecodeE
         }
         (InputStart::default(), Vec::new(), Vec::new())
     };
-    let history = read_section(&mut r, Section::History, |r| read_history(r, n_sources))?;
-    check_history(&history, status.end, start.opened_at)?;
+    let history = read_section(&mut r, Section::History, |r| {
+        read_history(r, n_sources, status.end, start.opened_at)
+    })?;
     r.finish()?;
     Ok(PlayRecord {
         versions,
@@ -949,18 +950,38 @@ fn read_source(r: &mut Reader<'_>, n_sources: usize) -> Result<SourceId, DecodeE
 /// all, as the evaluator lets a profile bind (buttons and axes), each named
 /// once; the count is checked before anything is allocated for it.
 fn read_start(r: &mut Reader<'_>, n_sources: usize) -> Result<InputStart, DecodeError> {
+    read_snapshot(r, n_sources, &mut Vec::new(), true)
+}
+
+/// [`read_start`] with `named` as the scratch its checks sort: the
+/// snapshot's controls are kept only when `keep` holds.
+fn read_snapshot(
+    r: &mut Reader<'_>,
+    n_sources: usize,
+    named: &mut Vec<(SourceId, ControlId)>,
+    keep: bool,
+) -> Result<InputStart, DecodeError> {
     let opened_at = TimeUs(r.int()?);
     let n = r.count(3)?;
     if n > MAX_HELD {
         return Err(DecodeError::TooManyHeld);
     }
-    let mut held = Vec::with_capacity(n);
+    let mut held = if keep {
+        Vec::with_capacity(n)
+    } else {
+        Vec::new()
+    };
+    named.clear();
+    named.reserve(n);
     for _ in 0..n {
         let source = read_source(r, n_sources)?;
         let control = ControlId(r.u32()?);
-        held.push((source, control, r.i32()?));
+        let value = r.i32()?;
+        named.push((source, control));
+        if keep {
+            held.push((source, control, value));
+        }
     }
-    let mut named: Vec<(SourceId, ControlId)> = held.iter().map(|&(s, c, _)| (s, c)).collect();
     named.sort_unstable();
     let per_source = eval::MAX_BINDINGS_PER_SOURCE + eval::MAX_AXES_PER_SOURCE;
     let repeated = named.windows(2).any(|w| w[0] == w[1]);
@@ -984,37 +1005,52 @@ fn read_events(
 ) -> Result<(), DecodeError> {
     let mut prev = vec![opened_at.0; n_sources];
     for _ in 0..n {
-        let source = read_source(r, n_sources)?;
-        let received = prev[source.index()].wrapping_add(r.int()?);
-        prev[source.index()] = received;
-        let kind = match r.uint()? {
-            0 => InputKind::Control {
-                control: ControlId(r.u32()?),
-                value: r.i32()?,
-            },
-            1 => InputKind::Disconnected,
-            _ => return Err(DecodeError::InvalidValue("input kind")),
-        };
-        events.push(PhysicalInputEvent {
-            received: TimeUs(received),
-            source,
-            kind,
-        });
+        events.push(read_event(r, n_sources, &mut prev)?);
     }
     Ok(())
+}
+
+/// Reads one event, its time counted from its source's last in `prev`,
+/// which it replaces.
+fn read_event(
+    r: &mut Reader<'_>,
+    n_sources: usize,
+    prev: &mut [i64],
+) -> Result<PhysicalInputEvent, DecodeError> {
+    let source = read_source(r, n_sources)?;
+    let last = &mut prev[source.index()];
+    *last = last.wrapping_add(r.int()?);
+    let received = TimeUs(*last);
+    let kind = match r.uint()? {
+        0 => InputKind::Control {
+            control: ControlId(r.u32()?),
+            value: r.i32()?,
+        },
+        1 => InputKind::Disconnected,
+        _ => return Err(DecodeError::InvalidValue("input kind")),
+    };
+    Ok(PhysicalInputEvent {
+        received,
+        source,
+        kind,
+    })
 }
 
 fn read_arrivals(r: &mut Reader<'_>) -> Result<Vec<Arrival>, DecodeError> {
     let n = r.count(2)?;
     let mut arrivals = Vec::with_capacity(n);
     for _ in 0..n {
-        let at = TimeUs(r.int()?);
-        arrivals.push(Arrival {
-            at,
-            kind: read_kind(r)?,
-        });
+        arrivals.push(read_arrival(r)?);
     }
     Ok(arrivals)
+}
+
+fn read_arrival(r: &mut Reader<'_>) -> Result<Arrival, DecodeError> {
+    let at = TimeUs(r.int()?);
+    Ok(Arrival {
+        at,
+        kind: read_kind(r)?,
+    })
 }
 
 fn read_status(r: &mut Reader<'_>) -> Result<Status, DecodeError> {
@@ -1080,19 +1116,61 @@ fn read_range(
     Ok(start..end)
 }
 
-/// The history section: every count and range is checked before anything
-/// is allocated for it, and the openings' origins and chronology as they
-/// are read.
-fn read_history(r: &mut Reader<'_>, n_sources: usize) -> Result<ReadyHistory, DecodeError> {
+/// What the history's checks keep of one opening, so nothing is
+/// allocated for them.
+#[derive(Clone, Copy, Default)]
+struct Span {
+    opened_at: TimeUs,
+    origin: TimeUs,
+    closed: TimeUs,
+    /// How many events it holds.
+    events: u32,
+    /// How many arrivals it holds.
+    arrivals: u32,
+    /// Whether a hold cancelled it.
+    held: bool,
+}
+
+/// The history section of a record whose end status is `end` and whose
+/// winning opening opened at `opened_at`. It is checked whole before
+/// anything is allocated for it: a first pass over a copy of `r`, with
+/// scratch bounded by the format's limits and `n_sources`, checks every
+/// count, range, source and time and the agreement with the end status;
+/// a second pass then builds it.
+fn read_history(
+    r: &mut Reader<'_>,
+    n_sources: usize,
+    end: EndStatus,
+    opened_at: TimeUs,
+) -> Result<ReadyHistory, DecodeError> {
+    walk_history(&mut r.clone(), n_sources, end, opened_at, None)?;
+    let mut history = ReadyHistory::default();
+    walk_history(r, n_sources, end, opened_at, Some(&mut history))?;
+    Ok(history)
+}
+
+/// One pass of [`read_history`], building the history into `out` if
+/// given.
+fn walk_history(
+    r: &mut Reader<'_>,
+    n_sources: usize,
+    end: EndStatus,
+    opened_at: TimeUs,
+    mut out: Option<&mut ReadyHistory>,
+) -> Result<(), DecodeError> {
     let n = r.uint()?;
     if n > MAX_CANCELLED_OPENINGS as u64 {
         return Err(DecodeError::TooManyOpenings(n));
     }
-    let mut openings: Vec<CancelledOpening> =
-        Vec::with_capacity(r.check_count(n, MIN_OPENING_BYTES)?);
+    let n = r.check_count(n, MIN_OPENING_BYTES)?;
+    if let Some(h) = out.as_deref_mut() {
+        h.openings.reserve_exact(n);
+    }
+    let mut spans = [Span::default(); MAX_CANCELLED_OPENINGS];
+    let mut named = Vec::new();
     let (mut events_end, mut arrivals_end) = (0, 0);
-    for _ in 0..n {
-        let start = read_start(r, n_sources)?;
+    for i in 0..n {
+        let start = read_snapshot(r, n_sources, &mut named, out.is_some())?;
         let origin = TimeUs(r.int()?);
         let closed = TimeUs(r.int()?);
         let events = read_range(r, events_end, MAX_CANCELLED_EVENTS, MAX_CANCELLED_EVENTS)?;
@@ -1106,7 +1184,7 @@ fn read_history(r: &mut Reader<'_>, n_sources: usize) -> Result<ReadyHistory, De
         if closed < start.opened_at {
             return Err(DecodeError::InvalidHistory("closing time"));
         }
-        if let Some(prev) = openings.last() {
+        if let Some(prev) = spans[..i].last() {
             if origin <= prev.origin {
                 return Err(DecodeError::InvalidHistory("origin"));
             }
@@ -1114,42 +1192,63 @@ fn read_history(r: &mut Reader<'_>, n_sources: usize) -> Result<ReadyHistory, De
                 return Err(DecodeError::InvalidHistory("chronology"));
             }
         }
-        (events_end, arrivals_end) = (events.end, arrivals.end);
-        openings.push(CancelledOpening {
-            start,
+        spans[i] = Span {
+            opened_at: start.opened_at,
             origin,
             closed,
-            events,
-            arrivals,
-            reason,
-        });
+            events: events.end - events.start,
+            arrivals: arrivals.end - arrivals.start,
+            held: reason == CancelReason::Held,
+        };
+        (events_end, arrivals_end) = (events.end, arrivals.end);
+        if let Some(h) = out.as_deref_mut() {
+            h.openings.push(CancelledOpening {
+                start,
+                origin,
+                closed,
+                events,
+                arrivals,
+                reason,
+            });
+        }
     }
+    let spans = &spans[..n];
+    check_history(spans, end, opened_at)?;
     if r.uint()? != u64::from(events_end) {
         return Err(DecodeError::InvalidHistory("event count"));
     }
     // Source, delta and kind.
-    let mut events = Vec::with_capacity(r.check_count(u64::from(events_end), 3)?);
-    for o in &openings {
-        let run = (o.events.end - o.events.start) as usize;
-        read_events(r, run, n_sources, o.start.opened_at, &mut events)?;
+    let total = r.check_count(u64::from(events_end), 3)?;
+    if let Some(h) = out.as_deref_mut() {
+        h.events.reserve_exact(total);
+    }
+    let mut prev = vec![0; n_sources];
+    for s in spans {
+        prev.fill(s.opened_at.0);
+        for _ in 0..s.events {
+            let event = read_event(r, n_sources, &mut prev)?;
+            if let Some(h) = out.as_deref_mut() {
+                h.events.push(event);
+            }
+        }
     }
     if r.uint()? != u64::from(arrivals_end) {
         return Err(DecodeError::InvalidHistory("arrival count"));
     }
     // Time and kind.
-    let mut arrivals = Vec::with_capacity(r.check_count(u64::from(arrivals_end), 2)?);
-    for _ in 0..arrivals_end {
-        let at = TimeUs(r.int()?);
-        arrivals.push(Arrival {
-            at,
-            kind: read_kind(r)?,
-        });
+    let total = r.check_count(u64::from(arrivals_end), 2)?;
+    if let Some(h) = out.as_deref_mut() {
+        h.arrivals.reserve_exact(total);
     }
-    Ok(ReadyHistory {
-        openings,
-        events,
-        arrivals,
-    })
+    for s in spans {
+        for _ in 0..s.arrivals {
+            let arrival = read_arrival(r)?;
+            if let Some(h) = out.as_deref_mut() {
+                h.arrivals.push(arrival);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Whether an opening at `origin` closing at `closed` closed no later than
@@ -1164,13 +1263,12 @@ fn closes_before(origin: TimeUs, closed: TimeUs, next_origin: TimeUs, opened: Ti
 /// (origin 0) opened at `opened_at`; a capture cancelled before playback
 /// has at least one, the last at origin 0, every earlier one cancelled by
 /// a hold.
-fn check_history(h: &ReadyHistory, end: EndStatus, opened_at: TimeUs) -> Result<(), DecodeError> {
-    let held = |o: &CancelledOpening| o.reason == CancelReason::Held;
+fn check_history(spans: &[Span], end: EndStatus, opened_at: TimeUs) -> Result<(), DecodeError> {
     if end.played() {
-        if !h.openings.iter().all(held) {
+        if !spans.iter().all(|s| s.held) {
             return Err(DecodeError::InvalidHistory("cancel reason"));
         }
-        if let Some(last) = h.openings.last() {
+        if let Some(last) = spans.last() {
             if last.origin >= TimeUs(0) {
                 return Err(DecodeError::InvalidHistory("origin"));
             }
@@ -1180,13 +1278,13 @@ fn check_history(h: &ReadyHistory, end: EndStatus, opened_at: TimeUs) -> Result<
         }
         return Ok(());
     }
-    let Some((last, earlier)) = h.openings.split_last() else {
+    let Some((last, earlier)) = spans.split_last() else {
         return Err(DecodeError::InvalidHistory("no opening"));
     };
     if last.origin != TimeUs(0) {
         return Err(DecodeError::InvalidHistory("origin"));
     }
-    if !earlier.iter().all(held) {
+    if !earlier.iter().all(|s| s.held) {
         return Err(DecodeError::InvalidHistory("cancel reason"));
     }
     Ok(())

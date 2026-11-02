@@ -51,6 +51,7 @@ pub const fn unzigzag(u: u64) -> i64 {
 }
 
 /// Reads values from a slice; every read checks the bytes left.
+#[derive(Clone)]
 pub struct Reader<'a> {
     buf: &'a [u8],
 }
