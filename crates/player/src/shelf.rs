@@ -601,8 +601,9 @@ impl Shelf {
         self.loudness.store(&mut self.library);
     }
 
-    /// Whether the background measurement holds a job, and whether it has
-    /// none at all, held or waiting (dev-tools).
+    /// Whether the background measurement measures a job, its line
+    /// printed, and whether it has none at all, held or waiting
+    /// (dev-tools).
     #[cfg(feature = "dev-tools")]
     pub fn background(&self) -> (bool, bool) {
         self.background.as_ref().map_or((false, true), Worker::busy)

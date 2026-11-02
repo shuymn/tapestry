@@ -487,10 +487,11 @@ pub enum SelectStep {
     /// milliseconds before its first block, stopped as a measurement is: a
     /// slow measurement, a load's or the background's.
     SlowMeasuring(u64),
-    /// Wait until the background measurement holds a job (`true`), or has
-    /// none held or waiting (`false`), at most [`STEP_WATCHDOG`]: its
-    /// thread runs in background mode, which a loaded machine starves for
-    /// tens of seconds, so only the watchdog bounds the wait.
+    /// Wait until the background measurement measures a job, its line
+    /// printed (`true`), or has none held or waiting (`false`), at most
+    /// [`STEP_WATCHDOG`]: its thread runs in background mode, which a
+    /// loaded machine starves for tens of seconds, so only the watchdog
+    /// bounds the wait.
     Background(bool),
     /// Close the window.
     Close,
@@ -531,7 +532,7 @@ pub struct SlowLoad {
 /// window halfway through it; `slow-measuring` holds every loudness
 /// measurement from then on that long before its first block, a load's and
 /// the background's; `background` waits until the background measurement
-/// holds a job, or has none at all),
+/// measures a job, or has none at all),
 /// `drawn` (wait until the result's page is drawn), `back`, `retry`, `next`
 /// and `prev` on a result; a step out of place, or a chart not
 /// listed within [`STEP_TIMEOUT`] of no scan pass running (or
