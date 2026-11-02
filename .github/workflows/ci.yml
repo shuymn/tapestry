@@ -14,9 +14,12 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  # Whether the change touches more than documentation (docs/ and Markdown
-  # files). The build jobs skip a documentation-only change; a skipped job
-  # passes as a required check, and `lint` still checks its banned words.
+  # Whether the change touches a file the build jobs read: anything but the
+  # documentation (docs/ and Markdown files) and repository files no build
+  # job reads (the license texts, .gitignore, the hook, repository settings,
+  # Renovate's settings and the other workflows, which run on their own).
+  # The build jobs skip a change of only those; a skipped job passes as a
+  # required check, and `lint` still checks its banned words and workflows.
   # Anything unclear (a manual run, an unknown range, a failure here) runs
   # them.
   changes:
@@ -45,11 +48,17 @@ jobs:
             push) base=$BEFORE ;;
             *) base= ;;
           esac
-          # Exit 0 means no change outside the documentation; 1 (a change)
-          # and 128 (an unreadable range) run the build jobs. Without rename
+          # Exit 0 means no change outside those files; 1 (a change) and
+          # 128 (an unreadable range) run the build jobs. Without rename
           # detection a file moved into docs/ also shows its old path.
           code=true
-          if [ -n "$base" ] && git diff --quiet --no-renames "$base" HEAD -- . ':(exclude)docs/' ':(exclude)*.md'; then
+          if [ -n "$base" ] && git diff --quiet --no-renames "$base" HEAD -- . \
+              ':(exclude)docs/' ':(exclude)*.md' \
+              ':(exclude,top)COPYRIGHT' ':(exclude,top,glob)LICENSE-*' \
+              ':(exclude,top).gitignore' ':(exclude,top)lefthook.yml' \
+              ':(exclude,top).github/infra.yaml' ':(exclude,top).github/renovate.json' \
+              ':(exclude,top).github/workflows/audit.yml' ':(exclude,top).github/workflows/bench.yml' \
+              ':(exclude,top).github/workflows/fuzz.yml' ':(exclude,top).github/workflows/mise-update.yml'; then
             code=false
           fi
           echo "code=$code"
@@ -230,8 +239,8 @@ jobs:
       - name: Test (dev-tools)
         run: mise exec -- cargo test -p player -p game --features player/dev-tools,game/dev-tools --locked
 
-  # Passes when the three Windows jobs passed, or when `changes` classified
-  # the change as documentation only and they were skipped; anything else
+  # Passes when the three Windows jobs passed, or when `changes` found no
+  # change the build jobs read and they were skipped; anything else
   # (a failed, cancelled or unexpectedly skipped job) fails it.
   windows:
     needs: [changes, windows-test, windows-release, windows-dev-tools]
@@ -434,7 +443,7 @@ jobs:
             test "$result" = "$allowed"
           done
 
-  # Runs on every change, documentation included.
+  # Runs on every change, including those the build jobs skip.
   lint:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
