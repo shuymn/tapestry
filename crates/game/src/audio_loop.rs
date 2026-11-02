@@ -908,22 +908,9 @@ impl AudioWorker {
                     restore,
                     gate,
                 } => {
-                    self.transport = gate;
                     // A `Gain` is always in range.
                     let _ = self.engine.set_gain(gain.get());
-                    self.engine.restart(origin);
-                    self.origin = origin;
-                    // A round's restore: the first plan, the fallback when
-                    // it is late, else silence; never the schedule from 0.
-                    let restored = restore
-                        .as_deref()
-                        .map_or(0, |r| r.apply(&mut self.engine).code());
-                    if let Some(t) = &self.transport {
-                        self.engine.hold_transport(t.commit_at);
-                    }
-                    self.shared
-                        .restored
-                        .store(generation << 8 | u64::from(restored), Ordering::Release);
+                    self.begin(origin, gate, restore.as_deref(), generation);
                     let old = (
                         std::mem::replace(&mut self.queue, queue),
                         std::mem::replace(&mut self.restore, restore),
@@ -947,17 +934,7 @@ impl AudioWorker {
                     gate,
                     restore,
                 } => {
-                    self.engine.restart(origin);
-                    let restored = restore
-                        .as_deref()
-                        .map_or(0, |r| r.apply(&mut self.engine).code());
-                    self.engine.hold_transport(gate.commit_at);
-                    self.shared.restored.store(
-                        self.generation << 8 | u64::from(restored),
-                        Ordering::Release,
-                    );
-                    self.origin = origin;
-                    self.transport = Some(gate);
+                    self.begin(origin, Some(gate), restore.as_deref(), self.generation);
                     self.steady_from = Some(origin);
                     if restore.is_some() {
                         let old = std::mem::replace(&mut self.restore, restore);
@@ -979,6 +956,30 @@ impl AudioWorker {
             }
         }
         !self.exited
+    }
+
+    /// A play's or a rearmed candidate's start, chart time 0 at `origin`:
+    /// a round's `restore` applied (the first plan, the fallback when it is
+    /// late, else silence; never the schedule from 0), the transport held
+    /// for `gate`'s commit if there is one, and the restore's outcome
+    /// published for play `generation`.
+    fn begin(
+        &mut self,
+        origin: TimeUs,
+        gate: Option<TransportGate>,
+        restore: Option<&Restore>,
+        generation: u64,
+    ) {
+        self.engine.restart(origin);
+        self.origin = origin;
+        let restored = restore.map_or(0, |r| r.apply(&mut self.engine).code());
+        if let Some(t) = &gate {
+            self.engine.hold_transport(t.commit_at);
+        }
+        self.transport = gate;
+        self.shared
+            .restored
+            .store(generation << 8 | u64::from(restored), Ordering::Release);
     }
 
     /// Stops every sound of the play and discards its queued key sounds;
