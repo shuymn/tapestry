@@ -20,7 +20,7 @@
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
-use bms_model::{LANE_COUNT, Lane, Note, NoteKind, Position, TimeUs};
+use bms_model::{LANE_COUNT, Lane, Note, NoteKind, Position, TimeUs, TimelineId};
 
 use super::bar::{BarGroup, BarGroupDef, BarScratch, Field, Template};
 use super::scroll::Scale;
@@ -114,9 +114,11 @@ pub enum NoteOrder {
     /// order.
     #[default]
     LaneMajor,
-    /// Every lane's notes merged by their heads: by position, then time,
-    /// then the lane's place in `lanes`, then the note's place in its
-    /// lane. `lanes` lists every [`Lane::index`] once, first painted
+    /// Every lane's notes merged by their heads: by the head's timeline
+    /// row ([`NoteAnchors::head`](bms_model::NoteAnchors::head)), then the
+    /// lane's place in `lanes`, then the note's place in its lane. Rows
+    /// are exact identities, so heads whose distinct source positions
+    /// floor to one µs and one position keep their positions' order. `lanes` lists every [`Lane::index`] once, first painted
     /// first. A long note's parts stay together at its head's place.
     Timeline { lanes: [u8; LANE_COUNT] },
 }
@@ -735,9 +737,11 @@ impl Lanes {
         let Some(notes) = play.notes() else {
             return;
         };
+        // The frame's one sample of the playhead, taken when the play was
+        // filled for this build at the same display time.
         let scale = Scale::new(
-            play.scroll(),
-            d.display,
+            play.display_position(),
+            play.playhead().initial_rate(),
             d.view.visible_time,
             g.span,
             g.line_y,
@@ -1082,8 +1086,10 @@ impl Lanes {
     /// Every lane's notes from `start` (given a lane's notes, its first
     /// candidate) up to the lane's section end and, with `to`, while
     /// their position is at most `to`: lane by lane, or under a timeline
-    /// order merged by their heads' position, time, lane rank and index in
-    /// the lane, the least first. Each candidate is charged a visit before
+    /// order merged by their heads' timeline rows, then lane rank and index
+    /// in the lane, the least first. Rows are exact identities: heads whose
+    /// distinct source positions floor to one µs and one position keep
+    /// their positions' order. Each candidate is charged a visit before
     /// `emit` draws it or skips it; `false` from `emit` stops the frame's
     /// lanes. At most eight cursors live on the stack; each choice scans
     /// them once.
@@ -1118,11 +1124,11 @@ impl Lanes {
             std::array::from_fn(|l| u8::try_from(l).ok().and_then(Lane::new).and_then(cursor));
         // Each cursor's next head as its ordering key, refreshed when the
         // cursor moves.
-        type Key = (Position, TimeUs, u8, usize);
+        type Key = (TimelineId, u8, usize);
         let key = |c: &Option<LaneCursor<'n>>, rank: u8| -> Option<Key> {
             let c = c.as_ref()?;
             let n = c.peek(to)?;
-            Some((n.pos, n.time, rank, c.next))
+            Some((n.anchors.head, rank, c.next))
         };
         let mut heads: [Option<Key>; LANE_COUNT] =
             std::array::from_fn(|k| key(cursors.get(k)?, *ranks.get(k)?));
@@ -1250,7 +1256,7 @@ mod tests {
             size_of::<LaneCursor<'static>>()
         );
         assert!(n <= 8 * 256, "{n}");
-        let heads = size_of::<[Option<(Position, TimeUs, u8, usize)>; LANE_COUNT]>();
+        let heads = size_of::<[Option<(TimelineId, u8, usize)>; LANE_COUNT]>();
         println!("heads: {heads} B");
         println!("loaded lanes: {} B", size_of::<Lanes>());
     }

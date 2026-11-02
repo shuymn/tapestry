@@ -114,6 +114,7 @@ pub use place::{
 pub use play::loading::{
     Loading, LoadingField, LoadingFrame, LoadingGauge, LoadingTimer, loading_field, loading_timer,
 };
+pub use play::playhead::ExactPlayhead;
 pub use play::schema::{
     COVER_PERMILLE, GAUGE_KIND_ENUM, GAUGE_PERMILLE, GREEN_MAX, Grade, LaneTimer, MAX_COUNT, PLAY,
     RATE_BASIS_POINTS, READOUT_MAX, field, lane_timer, timer,

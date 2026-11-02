@@ -2511,6 +2511,40 @@ fn timeline_lanes_do_not_allocate(full: &PlayContext<'_>) {
                     held += usize::from(key == held_key);
                 }
             }
+            // Repeated READY rearms, each followed by frames across the
+            // STOP: the runtime starts over in place, the prepared exact
+            // playhead is kept, and nothing allocates.
+            let reps = play.playhead().representatives().as_ptr();
+            for r in 0..3_i64 {
+                play.rearm();
+                for k in 0..5_i64 {
+                    let lanes = LaneView {
+                        visible_time: TimeUs(600 * MS),
+                        cover: 0,
+                        lift: 0,
+                        hidden: 0,
+                    };
+                    let frame = SkinFrame {
+                        now: TimeUs(from + (k + 1) * 700 * MS),
+                        display_offset: TimeUs(0),
+                        tally: &t,
+                        gauges: &gauges,
+                        gauge: 0,
+                        effects: &[],
+                        complete: false,
+                        target: TARGETS[0],
+                        layout: &layout,
+                        lanes,
+                        readouts: readouts_for(lanes),
+                        playing: true,
+                    };
+                    batch.clear();
+                    skin.build(&mut play, &frame, &uvs, &mut batch)
+                        .expect("a rearmed frame builds");
+                    assert!(!batch.quads().is_empty(), "rearm {r} frame {k}");
+                }
+            }
+            assert_eq!(play.playhead().representatives().as_ptr(), reps);
             // An invalid frame poisons the play; every later build refuses.
             let lanes = LaneView {
                 visible_time: TimeUs(600 * MS),

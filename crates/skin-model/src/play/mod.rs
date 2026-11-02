@@ -5,14 +5,18 @@
 #![deny(clippy::float_arithmetic, clippy::float_cmp)]
 
 pub(crate) mod loading;
+pub(crate) mod playhead;
 pub(crate) mod reducer;
 pub(crate) mod schema;
 pub(crate) mod timers;
 
-use bms_model::{Chart, LANE_COUNT, Lane, LnMode, Note, Position, ScrollMap, TimeUs};
+use bms_model::{
+    Chart, LANE_COUNT, Lane, LnMode, Note, Position, PresentationError, TimeUs, TimelineId,
+};
 use eval::{GaugeState, JudgeEvent, Section, Tally};
 use rules::GaugeValue;
 
+use self::playhead::ExactPlayhead;
 use self::reducer::Reducer;
 use self::schema::{field, timer};
 use crate::expr::{State, TIMER_OFF};
@@ -205,6 +209,21 @@ pub enum PrepareError {
         "the BPM range's minimum is above its maximum, or its maximum above the readout maximum"
     )]
     InvalidBpmRange,
+    /// The chart cannot be presented: its links are broken, or two of its
+    /// note endpoints sit at one µs at different positions
+    /// ([`Chart::validate_presentation`]). An admitted chart never is.
+    #[error("the chart cannot be presented: {0}")]
+    Presentation(PresentationError),
+    /// A timeline row lies past the scroll map's domain (`±DOMAIN` µs),
+    /// where the playhead cannot follow it: a chart built in code with
+    /// such a time; the loader refuses one.
+    #[error("timeline row {} at {} µs is outside the playhead's range", .row.0, .at.0)]
+    TimeOutOfDomain {
+        /// The first row past the domain.
+        row: TimelineId,
+        /// Its time.
+        at: TimeUs,
+    },
 }
 
 /// Why [`Skin::build`](crate::Skin::build) refused a frame. The frame's
@@ -241,7 +260,12 @@ pub struct Play {
     /// Per timer slot: elapsed ms, or [`TIMER_OFF`].
     ms: Box<[i32]>,
     fields: [i32; field::COUNT],
-    scroll: ScrollMap,
+    /// The attempt's exact playhead, which notes, bar lines and the beat
+    /// sample; a rearm keeps it.
+    playhead: ExactPlayhead,
+    /// The playhead at the last build's display time, sampled once per
+    /// frame and read by the beat timer and the lanes.
+    display: Position,
     /// The display beat last seen and the µs it was crossed at.
     beat: Option<(i128, i64)>,
     ready_at: TimeUs,
@@ -290,8 +314,8 @@ fn last_object(chart: &Chart) -> TimeUs {
 
 impl Play {
     /// The bytes this attempt's state holds, itself and every buffer it
-    /// owns: the reducer, the timers, the chart's scroll segments and
-    /// notes copied for it, the gauges, the attached and bitmap lines, and
+    /// owns: the reducer, the timers, the playhead's representatives and
+    /// the notes copied for it (the timeline is the chart's, shared), the gauges, the attached and bitmap lines, and
     /// the bar groups' scratch. For a memory witness; it allocates nothing.
     #[must_use]
     pub fn resident_bytes(&self) -> u64 {
@@ -303,7 +327,7 @@ impl Play {
             + self.reducer.heap_bytes()
             + size_of_val(&*self.starts)
             + size_of_val(&*self.ms)
-            + size_of_val(self.scroll.segments())
+            + self.playhead.heap_bytes()
             + notes
             + size_of_val(&*self.gauges)
             + self.text.heap_bytes()
@@ -348,6 +372,8 @@ impl Play {
         {
             return Err(PrepareError::InvalidBpmRange);
         }
+        let bounds = section.map(|s| (s.start, s.end));
+        let playhead = ExactPlayhead::prepare(chart, bounds)?;
         let readout_end = section.map_or_else(|| last_object(chart), |s| s.end);
         let initial = ctx.gauges.iter().enumerate().map(|(i, g)| {
             let value = section
@@ -364,7 +390,6 @@ impl Play {
             bomb_up_to,
         );
         let slots = usize::from(timer::BUILTIN).saturating_add(whens);
-        let bounds = section.map(|s| (s.start, s.end));
         let notes = lanes.then(|| {
             let range = std::array::from_fn(|l| {
                 chart.lanes.get(l).map_or((0, 0), |notes| match bounds {
@@ -389,7 +414,8 @@ impl Play {
             starts: vec![None; slots].into_boxed_slice(),
             ms: vec![TIMER_OFF; slots].into_boxed_slice(),
             fields: [0; field::COUNT],
-            scroll: chart.scroll.clone(),
+            playhead,
+            display: Position(0),
             beat: None,
             ready_at,
             play_at,
@@ -414,8 +440,9 @@ impl Play {
     /// Starts the attempt's runtime state over for a rearmed READY
     /// candidate (design.md "Play Lifecycle", the start gate), in place:
     /// the reducer, every timer and the beat, as a fresh attempt has them.
-    /// The chart's notes, the gauges, the attached and bitmap text and a
-    /// refused build stay, and nothing is allocated.
+    /// The chart's notes, the prepared playhead, the gauges, the attached
+    /// and bitmap text and a refused build stay, and nothing is
+    /// allocated.
     pub fn rearm(&mut self) {
         self.reducer.rearm();
         self.starts.fill(None);
@@ -508,9 +535,17 @@ impl Play {
         self.notes.as_deref()
     }
 
-    /// The chart's scroll map.
-    pub(crate) fn scroll(&self) -> &ScrollMap {
-        &self.scroll
+    /// The attempt's exact playhead.
+    #[must_use]
+    pub fn playhead(&self) -> &ExactPlayhead {
+        &self.playhead
+    }
+
+    /// The playhead at the last build's display time (`now` plus the
+    /// display offset): the frame's one sample of it.
+    #[must_use]
+    pub const fn display_position(&self) -> Position {
+        self.display
     }
 
     /// Whether `note` on lane `l` is no longer drawn: a judged tap or a hit

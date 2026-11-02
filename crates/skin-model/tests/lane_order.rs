@@ -9,7 +9,7 @@
 mod lanes_support;
 mod play_support;
 
-use bms_model::{Chart, ChartBuilder, Position, TimeUs};
+use bms_model::{Chart, ChartBuilder, Position, TimeUs, TimelineId};
 use eval::Section;
 use lanes_support::{
     BAR, BODY_OFF, BODY_ON, HEAD, LINE, MINE, NOTE, TAIL, lanes_element, lanes_skin, simple,
@@ -59,13 +59,14 @@ fn lanes_drawn(h: &Harness) -> Vec<usize> {
         .collect()
 }
 
-/// The lanes of the notes a frame paints under `order`, enumerated from
-/// `chart` outside the build: every note of `notes` (the frame's
-/// candidates, all in view) inside `section`, sorted lane by lane by
-/// `(lane, index)`, or under a timeline order by the exact integer key
-/// `(position, time, rank, index in the lane)`.
-fn expected(chart: &Chart, order: NoteOrder, section: Option<(TimeUs, TimeUs)>) -> Vec<usize> {
-    let mut cands: Vec<(Position, TimeUs, usize, usize, usize)> = Vec::new();
+/// A candidate note: its head's row, position and time, its lane's rank
+/// under the order, its index in the lane and its lane.
+type Cand = (TimelineId, Position, TimeUs, usize, usize, usize);
+
+/// The frame's candidates under `order`: every note of `chart` (all in
+/// view) inside `section`.
+fn candidates(chart: &Chart, order: NoteOrder, section: Option<(TimeUs, TimeUs)>) -> Vec<Cand> {
+    let mut cands = Vec::new();
     for (l, notes) in chart.lanes.iter().enumerate() {
         for (i, n) in notes.iter().enumerate() {
             if section.is_none_or(|(s, e)| s <= n.time && n.time < e) {
@@ -75,15 +76,32 @@ fn expected(chart: &Chart, order: NoteOrder, section: Option<(TimeUs, TimeUs)>) 
                         lanes.iter().position(|&x| usize::from(x) == l).unwrap()
                     }
                 };
-                cands.push((n.pos, n.time, rank, i, l));
+                cands.push((n.anchors.head, n.pos, n.time, rank, i, l));
             }
         }
     }
+    cands
+}
+
+/// The lanes of the notes a frame paints under `order`, enumerated from
+/// `chart` outside the build: the candidates sorted lane by lane by
+/// `(lane, index)`, or under a timeline order by the exact integer key
+/// `(head row, rank, index in the lane)`.
+fn expected(chart: &Chart, order: NoteOrder, section: Option<(TimeUs, TimeUs)>) -> Vec<usize> {
+    let mut cands = candidates(chart, order, section);
     match order {
         NoteOrder::LaneMajor => cands.sort_by_key(|&(.., rank, i, _)| (rank, i)),
-        NoteOrder::Timeline { .. } => cands.sort_by_key(|&(p, t, rank, i, _)| (p, t, rank, i)),
+        NoteOrder::Timeline { .. } => cands.sort_by_key(|&(id, .., rank, i, _)| (id, rank, i)),
     }
-    cands.into_iter().map(|c| c.4).collect()
+    cands.into_iter().map(|c| c.5).collect()
+}
+
+/// [`expected`] under the reconstructed key `(position, time, rank,
+/// index)` a chart without row identities would have to use.
+fn by_position(chart: &Chart, order: NoteOrder) -> Vec<usize> {
+    let mut cands = candidates(chart, order, None);
+    cands.sort_by_key(|&(_, p, t, rank, i, _)| (p, t, rank, i));
+    cands.into_iter().map(|c| c.5).collect()
 }
 
 const ORDERS: [NoteOrder; 3] = [
@@ -94,32 +112,56 @@ const ORDERS: [NoteOrder; 3] = [
     },
 ];
 
-/// Taps from 1 100 to 1 450 ms, all in view at 1 000 ms, with the keys'
-/// collisions: lane 1's and lane 2's at one µs, lane 1's one position
-/// later; lane 4's a µs after the chord of lanes 0, 3 and 7 at 1 300 ms,
-/// at its position; lane 5 empty; lane 0's first and lane 6's last
-/// outside the section of [`SECTION`].
+/// `slots` object pairs with `01` at `index`.
+fn line(slots: usize, index: usize) -> String {
+    (0..slots)
+        .map(|i| if i == index { "01" } else { "00" })
+        .collect()
+}
+
+/// Taps from 1 100 to 1 450 ms at 150 BPM, all in view at 1 000 ms,
+/// loaded as a session loads them. Measure 0 is 1 250 ms in 50 ms slots;
+/// measure 1 is 10^-18 of a measure long; measure 2 from 1 250 ms in 50 ms
+/// slots. At 1 250 ms the scratch's tap at 1/4097 of measure 1 and keys
+/// 3's and 7's at 1/4096 floor to one µs and one display position, the
+/// scratch's the earlier source position: its row comes first, so a
+/// timeline order paints it first whatever its rank, where the
+/// reconstructed key would follow the ranks. A chord of keys 1 and 4 at
+/// 1 300 ms and of keys 2, 6, 7 and the scratch at 1 350 ms; key 5 empty;
+/// the scratch's first and key 6's last outside the section of
+/// [`SECTION`].
 fn collisions() -> Chart {
-    let at = |ms: i64| TimeUs(ms * MS);
-    let mut chart = ChartBuilder::new(BPM)
-        .tap(lane(0), at(1_100))
-        .tap(lane(0), at(1_300))
-        .tap(lane(0), at(1_350))
-        .tap(lane(1), at(1_250))
-        .tap(lane(2), at(1_250))
-        .tap(lane(2), at(1_350))
-        .tap(lane(3), at(1_300))
-        .tap(lane(4), TimeUs(1_300 * MS + 1))
-        .tap(lane(6), at(1_150))
-        .tap(lane(6), at(1_350))
-        .tap(lane(6), at(1_450))
-        .tap(lane(7), at(1_300))
-        .tap(lane(7), at(1_350))
-        .build()
-        .unwrap();
-    let pos = |chart: &Chart, l: usize, i: usize| chart.lanes[l][i].pos;
-    chart.lanes[1][0].pos = Position(pos(&chart, 2, 0).0 + 1);
-    chart.lanes[4][0].pos = pos(&chart, 3, 0);
+    let m0 = |slot| line(25, slot);
+    let m2 = |slot| line(32, slot);
+    let text = [
+        "#BPM 150\n#WAV01 a.wav\n".to_owned(),
+        "#00002:0.78125\n#00102:0.000000000000000001\n".to_owned(),
+        format!(
+            "#00016:{}\n#00116:{}\n#00216:{}\n",
+            m0(22),
+            line(4097, 1),
+            m2(2)
+        ),
+        format!("#00211:{}\n", m2(1)),
+        format!("#00012:{}\n#00212:{}\n", m0(24), m2(2)),
+        format!("#00113:{}\n", line(4096, 1)),
+        format!("#00214:{}\n", m2(1)),
+        format!("#00018:{}\n#00218:{}\n#00218:{}\n", m0(23), m2(2), m2(4)),
+        format!("#00119:{}\n#00219:{}\n", line(4096, 1), m2(2)),
+    ]
+    .concat();
+    let dir = tempfile::tempdir().unwrap();
+    let chart = bms_parser::load_bms(text.as_bytes(), dir.path(), &Default::default())
+        .unwrap()
+        .chart;
+    chart.validate_presentation().unwrap();
+    // The aliases share their µs and position, not their rows.
+    let [s, k3, k7] = [(0, 1), (3, 0), (7, 0)].map(|(l, i)| chart.lanes[l][i]);
+    assert_eq!((s.time, s.pos), (k3.time, k3.pos));
+    assert_eq!((k3.time, k3.pos), (k7.time, k7.pos));
+    assert!(s.anchors.head < k3.anchors.head);
+    assert_eq!(k3.anchors.head, k7.anchors.head);
+    assert_eq!(s.time, TimeUs(1_250 * MS));
     chart
 }
 
@@ -166,11 +208,20 @@ fn notes_are_painted_in_the_order_s_exact_sequence() {
             }
         }
     }
-    // The collisions decide: under the source's order lane 2 before lane
-    // 1 (an earlier position at one µs), lane 4 after the chord (a later
-    // µs at one position).
+    // The aliases decide: under the source's order the scratch's earlier
+    // row before keys 3 and 7, though its rank is last; the reconstructed
+    // key would rank it after them.
     let want = expected(&chart, NoteOrder::SOURCE, None);
-    assert_eq!(want, [0, 6, 2, 1, 3, 7, 0, 4, 2, 6, 7, 0, 6]);
+    assert_eq!(want, [0, 6, 2, 0, 3, 7, 1, 4, 2, 6, 7, 0, 6]);
+    assert_eq!(
+        by_position(&chart, NoteOrder::SOURCE),
+        [0, 6, 2, 3, 7, 0, 1, 4, 2, 6, 7, 0, 6]
+    );
+    let reversed = ORDERS[2];
+    assert_ne!(
+        expected(&chart, reversed, None),
+        by_position(&chart, reversed)
+    );
 }
 
 #[test]

@@ -1,8 +1,11 @@
-//! The scroll copy against the simple skin's original: `reference` holds
-//! the original's constants and `Scale` verbatim (crates/render/src/
+//! The scroll arithmetic against the simple skin's original: `reference`
+//! holds the original's constants and `Scale` verbatim (crates/render/src/
 //! simple.rs, `layout`), a property test checks that the copy, given the
-//! simple skin's span and line, produces the same bits, and a drift guard
-//! fails once the original changes without the reference. Render is
+//! simple skin's span and line and the position the original samples from
+//! its scroll map, produces the same bits, and a drift guard fails once
+//! the original changes without the reference. The skins' playhead is the
+//! exact one (`ExactPlayhead`), which need not equal the sampled map; only
+//! the arithmetic from a position to pixels is tied. Render is
 //! Windows-only, so the original is read as text, not linked. The guard
 //! goes when the original is deleted.
 
@@ -187,7 +190,13 @@ proptest! {
         above in 0.0_f32..2_000.0,
     ) {
         let original = reference::Scale::new(&map, TimeUs(at), TimeUs(visible));
-        let copy = Scale::new(&map, TimeUs(at), TimeUs(visible), span(), 880.0);
+        let copy = Scale::new(
+            map.position_at(TimeUs(at)),
+            map.initial_rate(),
+            TimeUs(visible),
+            span(),
+            880.0,
+        );
         prop_assert_eq!(copy.at_line, original.at_line);
         prop_assert_eq!(copy.px_per_pos.to_bits(), original.px_per_pos.to_bits());
         // Near the line as well as anywhere.

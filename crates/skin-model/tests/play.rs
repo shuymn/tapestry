@@ -228,6 +228,27 @@ fn beat_inside_a_stop_keeps_the_latest_crossing() {
     assert_eq!(crossing(&aligned.scroll, 1), 500 * MS);
 }
 
+#[test]
+fn the_beat_follows_the_exact_playhead_at_a_fractional_boundary() {
+    // 9,375,000 BPM: a beat every 6.4 µs. A tap on beat 1 sounds at
+    // 6.4 µs, floored to 6: the exact playhead reaches beat 1 at 6 µs, as
+    // the tap reaches the line, where the sampled scroll map reaches it
+    // only at 7 µs.
+    let dir = tempfile::tempdir().unwrap();
+    let text = "#BPM 9375000\n#WAV01 a.wav\n#00011:00010000\n";
+    let chart = bms_parser::load_bms(text.as_bytes(), dir.path(), &Default::default())
+        .unwrap()
+        .chart;
+    assert_eq!(chart.lanes[1][0].time, TimeUs(6));
+    assert_eq!(crossing(&chart.scroll, 1), 7);
+    let mut h = Harness::empty(&chart, &full(0));
+    h.frame_us(5, &[]);
+    assert_eq!(h.start(timer::BEAT), Some(0));
+    h.frame_us(6, &[]);
+    assert_eq!(h.start(timer::BEAT), Some(6));
+    assert_eq!(h.play.display_position(), chart.lanes[1][0].pos);
+}
+
 /// A track on a timer that started at the earliest time, sampled at the
 /// latest: its age saturates and it shows its last key.
 #[test]

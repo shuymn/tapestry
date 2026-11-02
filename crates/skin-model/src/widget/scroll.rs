@@ -1,12 +1,14 @@
-//! Where the scroll stands for one frame: a copy of the simple skin's
-//! `layout::Scale` (crates/render/src/simple.rs), parameterized only by the
-//! uncovered lane length and the judgment line's y. With no cover and no
-//! lift its every output bit equals the original's; tests/scroll.rs ties
-//! the two together until the original is deleted.
+//! Where the scroll stands for one frame: the simple skin's
+//! `layout::Scale` arithmetic (crates/render/src/simple.rs), given the
+//! playhead's position rather than sampling a scroll map, and
+//! parameterized by the uncovered lane length and the judgment line's y.
+//! Given the original's position, with no cover and no lift, its every
+//! output bit equals the original's; tests/scroll.rs ties the two
+//! together until the original is deleted.
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
-use bms_model::{Position, ScrollMap, TimeUs};
+use bms_model::{Position, TimeUs};
 
 /// The playhead at the display time and the pixels per unit of position.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -20,25 +22,25 @@ pub struct Scale {
 }
 
 impl Scale {
-    /// The scale at display time `at` with hi-speed `visible_time`, over
-    /// `span_px` pixels of lane ending at the line `line_y`. A visible
-    /// time below 1 µs counts as 1 µs.
+    /// The scale with the playhead at `at_line` and hi-speed
+    /// `visible_time`, over `span_px` pixels of lane ending at the line
+    /// `line_y`. A visible time below 1 µs counts as 1 µs.
     ///
     /// The span holds the scroll of `visible_time` at the chart's initial
-    /// rate. The pixels per position never change during a play, whatever
-    /// the BPM at `at`.
+    /// rate, `initial_rate` units per µs. The pixels per position never
+    /// change during a play, whatever the BPM at the playhead.
     #[must_use]
     pub fn new(
-        scroll: &ScrollMap,
-        at: TimeUs,
+        at_line: Position,
+        initial_rate: i128,
         visible_time: TimeUs,
         span_px: f64,
         line_y: f64,
     ) -> Self {
         let visible = visible_time.0.max(1) as f64;
-        let span = visible * scroll.initial_rate() as f64;
+        let span = visible * initial_rate as f64;
         Self {
-            at_line: scroll.position_at(at),
+            at_line,
             px_per_pos: span_px / span,
             line_y,
         }
