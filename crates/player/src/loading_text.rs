@@ -28,6 +28,16 @@ pub enum Stage {
 }
 
 impl Stage {
+    /// The sounds done and the files to decode, while their count is
+    /// known: `None` for any other stage, and for the sounds' stage
+    /// before decoding, when it is reported with 0 files.
+    pub const fn known_sounds(self) -> Option<(usize, usize)> {
+        match self {
+            Self::Sounds { done, files } if files > 0 => Some((done, files)),
+            _ => None,
+        }
+    }
+
     /// The stage in the console's words.
     pub const fn label(self) -> &'static str {
         match self {
@@ -70,22 +80,6 @@ pub struct ChosenChart {
     pub genre: Option<String>,
 }
 
-/// One loading update, typed, beside its lines (design.md "Play
-/// Lifecycle"): what the load is doing and the chart chosen, bound to the
-/// loading lifetime it was shown in. Nothing reads these back out of the
-/// formatted lines.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LoadingUpdate {
-    /// What the load is doing.
-    pub stage: Stage,
-    /// The chart chosen.
-    pub chart: ChosenChart,
-    /// The play preset's name.
-    pub preset: String,
-    /// Whether it is a practice's Start.
-    pub practice: bool,
-}
-
 /// The chart being loaded, as its lines name it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LoadingText {
@@ -97,21 +91,12 @@ pub struct LoadingText {
     pub preset: String,
     /// Whether it is a practice's Start.
     pub practice: bool,
-    /// The chart's own fields, for the typed updates.
+    /// The chart's own fields, which a loading lifetime's state starts
+    /// from ([`crate::loading_state`]).
     pub chart: ChosenChart,
 }
 
 impl LoadingText {
-    /// The typed update at `stage`, beside [`lines`](Self::lines).
-    pub fn update(&self, stage: Stage) -> LoadingUpdate {
-        LoadingUpdate {
-            stage,
-            chart: self.chart.clone(),
-            preset: self.preset.clone(),
-            practice: self.practice,
-        }
-    }
-
     /// The lines at `stage`: the heading, the chart's lines and the stage.
     pub fn lines(&self, stage: Stage) -> MenuPage {
         let line = |text: String, style| MenuLine { text, style };

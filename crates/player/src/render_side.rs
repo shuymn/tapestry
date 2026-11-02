@@ -17,7 +17,12 @@
 //! load's lines over it. The lines go through a slot as the end screen's
 //! page does, where newer lines replace those not yet taken and at most
 //! one signal waits in the channel ([`LoadingSink`]), so a slow render
-//! thread never falls behind on the load's progress. A window target
+//! thread never falls behind on the load's progress. With them goes the
+//! loading lifetime's whole state, accumulated on the producers' side
+//! ([`crate::loading_state`]) and numbered: the slot and the render
+//! thread take only a newer one, and each loading frame is built from the
+//! newest on the loading clock, from the origin stamped when the lifetime
+//! began ([`RenderLink::begin_loading`]). A window target
 //! paces frames on the swap chain's waitable object; an offscreen one at about
 //! 60 Hz at most, each frame waiting for the GPU to finish the one before
 //! or skipped while it has not.
@@ -80,7 +85,10 @@ use render::{
 use skin_model::{BuildError, PlayContext};
 
 use crate::attempt_context::AttemptContext;
-use crate::loading_text::LoadingUpdate;
+use crate::loading_state::{LifetimeState, LoadInput, LoadingUpdate};
+use crate::loading_text::LoadingText;
+#[cfg(test)]
+use crate::loading_text::Stage;
 use crate::measure::{Drawn, Figures, Measure, PlayMeasure};
 use crate::menu_screen::{MenuPage, SPLASH};
 use crate::tuning::LiveTuning;
@@ -254,9 +262,10 @@ pub trait Screen: Send {
     /// Draws the play screen while a chart loads before READY:
     /// the skin's loading frame `frame`, then `page`, the load's lines,
     /// over it in a pass of their own, laid out again when `changed`
-    /// (design.md "Play Lifecycle"). `update` is the same moment typed,
-    /// when the lines came with it, of the same loading lifetime. The
-    /// default draws the lines as a menu page.
+    /// (design.md "Play Lifecycle"). `update` is the loading lifetime's
+    /// newest state, which `frame` was built from; `None` before the
+    /// lifetime published one. The default draws the lines as a menu
+    /// page.
     ///
     /// # Errors
     ///
@@ -617,6 +626,10 @@ struct Shared {
     loading_drawn: AtomicU64,
     /// The loading state's slot.
     loading: Mutex<LoadingSlot>,
+    /// The current loading lifetime's state, from its beginning
+    /// ([`RenderLink::begin_loading`]); `None` before. Locked before the
+    /// slot when both are.
+    producer: Mutex<Option<LifetimeState>>,
     /// The commits answered and given up on, which the game thread and the
     /// render thread settle under its lock.
     commits: Mutex<Commits>,
@@ -632,20 +645,82 @@ struct Commits {
     withdrawn: u64,
 }
 
-/// The loading state's lifetime, its newest page and the typed update
-/// shown with it until the render thread takes them or the lifetime ends,
-/// and whether a [`RenderMsg::Loading`] of this lifetime waits in the
-/// channel. Each clear starts a new lifetime: a sink, a signal or a frame
-/// of an older one does nothing.
+/// The loading state's lifetime, its newest page and its newest state
+/// until the render thread takes them or the lifetime ends, the highest
+/// sequence number accepted in the lifetime, and whether a
+/// [`RenderMsg::Loading`] of this lifetime waits in the channel. Each
+/// clear starts a new lifetime: a sink, a signal or a frame of an older
+/// one does nothing.
 #[derive(Debug, Default)]
 struct LoadingSlot {
     lifetime: u64,
-    pending: Option<TakenLoading>,
+    page: Option<Box<MenuPage>>,
+    update: Option<Box<LoadingUpdate>>,
+    /// The highest sequence number accepted in the lifetime, kept when
+    /// the render thread takes what waits.
+    accepted: u64,
     signaled: bool,
 }
 
-/// A loading page taken from the slot, with its typed update if it had one.
-type TakenLoading = (Box<MenuPage>, Option<Box<LoadingUpdate>>);
+/// What the render thread takes from the slot: the newest page and the
+/// newest state, each if one came since.
+type TakenLoading = (Option<Box<MenuPage>>, Option<Box<LoadingUpdate>>);
+
+impl LoadingSlot {
+    /// Puts `page` and `update` of lifetime `lifetime` in the slot, both
+    /// replacing what waits, unless the lifetime ended or `update` is not
+    /// newer than every state accepted in it: then nothing changes.
+    /// Whether it was put.
+    fn offer(
+        &mut self,
+        lifetime: u64,
+        page: Option<MenuPage>,
+        update: Option<Box<LoadingUpdate>>,
+    ) -> bool {
+        if lifetime != self.lifetime {
+            return false;
+        }
+        if let Some(u) = update {
+            if u.seq <= self.accepted {
+                return false;
+            }
+            self.accepted = u.seq;
+            drop(self.update.replace(u));
+        }
+        if let Some(page) = page {
+            drop(self.page.replace(Box::new(page)));
+        }
+        true
+    }
+
+    /// Takes what waits of lifetime `lifetime`, if it is still the
+    /// current one, with the signal that came for it.
+    fn take(&mut self, lifetime: u64) -> Option<TakenLoading> {
+        if self.lifetime != lifetime {
+            return None;
+        }
+        self.signaled = false;
+        let taken = (self.page.take(), self.update.take());
+        (taken.0.is_some() || taken.1.is_some()).then_some(taken)
+    }
+
+    /// Ends the current lifetime: what waits is dropped, and the next one
+    /// accepts from its first number.
+    fn end(&mut self) {
+        self.lifetime = self.lifetime.wrapping_add(1);
+        self.signaled = false;
+        self.accepted = 0;
+        drop(self.page.take());
+        drop(self.update.take());
+    }
+}
+
+/// Whether the render thread applies `incoming` over `applied`, the
+/// state its loading frames are built from: only a newer one, so an
+/// older state never comes back.
+fn newer(applied: Option<&LoadingUpdate>, incoming: &LoadingUpdate) -> bool {
+    applied.is_none_or(|a| incoming.seq > a.seq)
+}
 
 /// The end screen's newest page with its number, until the render thread
 /// takes it or the end screen is left, and the number of the last page
@@ -692,17 +767,30 @@ impl Shared {
         self.loading.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Takes the waiting lines of loading lifetime `lifetime` and their
-    /// typed update, if it is still the current one: the signal that came
+    /// Takes the waiting lines of loading lifetime `lifetime` and its
+    /// newest state, if it is still the current one: the signal that came
     /// for them is taken with them. A signal of an ended lifetime takes
     /// nothing.
     fn take_loading(&self, lifetime: u64) -> Option<TakenLoading> {
-        let mut slot = self.loading_slot();
-        if slot.lifetime != lifetime {
-            return None;
-        }
-        slot.signaled = false;
-        slot.pending.take()
+        self.loading_slot().take(lifetime)
+    }
+
+    fn producer(&self) -> std::sync::MutexGuard<'_, Option<LifetimeState>> {
+        self.producer.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Applies `input` to lifetime `lifetime`'s state and publishes it,
+    /// with `page`, through the slot; nothing for a lifetime not begun or
+    /// ended. Whether the slot took it.
+    fn report(&self, lifetime: u64, input: LoadInput, page: Option<MenuPage>) -> bool {
+        let update = {
+            let mut producer = self.producer();
+            let Some(state) = producer.as_mut().filter(|s| s.lifetime() == lifetime) else {
+                return false;
+            };
+            Box::new(state.apply(input))
+        };
+        self.loading_slot().offer(lifetime, page, Some(update))
     }
 
     /// Whether loading lifetime `lifetime` is still the current one.
@@ -710,13 +798,11 @@ impl Shared {
         self.loading_slot().lifetime == lifetime
     }
 
-    /// Ends the current loading lifetime: its waiting lines are dropped,
-    /// and its sinks, signals and frames do nothing from here.
+    /// Ends the current loading lifetime: its waiting lines and state are
+    /// dropped, and its sinks, signals and frames do nothing from here.
     fn end_lifetime(&self) {
-        let mut slot = self.loading_slot();
-        slot.lifetime = slot.lifetime.wrapping_add(1);
-        slot.signaled = false;
-        drop(slot.pending.take());
+        self.loading_slot().end();
+        drop(self.producer().take());
     }
 }
 
@@ -731,30 +817,64 @@ pub struct LoadingSink {
     tx: Sender<RenderMsg>,
     shared: Arc<Shared>,
     lifetime: u64,
+    /// The loading clock, for a test's lifetime begun by its first page.
+    #[cfg(test)]
+    clock: QpcClock,
 }
 
 impl LoadingSink {
     /// Shows `page` as the loading state, if the sink's lifetime is still
-    /// the current one, without a typed update.
+    /// the current one, as the stage of reading the chart; a lifetime not
+    /// begun yet begins now, for an untitled chart.
     #[cfg(test)]
     pub fn show(&self, page: MenuPage) {
-        self.put(page, None);
-    }
-
-    /// Shows `page` as the loading state with `update`, the same moment
-    /// typed, if the sink's lifetime is still the current one: the two
-    /// replace a waiting pair together.
-    pub fn show_typed(&self, page: MenuPage, update: LoadingUpdate) {
-        self.put(page, Some(Box::new(update)));
-    }
-
-    fn put(&self, page: MenuPage, update: Option<Box<LoadingUpdate>>) {
-        let mut slot = self.shared.loading_slot();
-        if slot.lifetime != self.lifetime {
-            return;
+        {
+            let mut producer = self.shared.producer();
+            if producer
+                .as_ref()
+                .is_none_or(|s| s.lifetime() != self.lifetime)
+                && self.shared.loading_current(self.lifetime)
+            {
+                *producer = Some(LifetimeState::new(
+                    self.lifetime,
+                    self.clock.now(),
+                    &LoadingText::default(),
+                    None,
+                ));
+            }
         }
-        drop(slot.pending.replace((Box::new(page), update)));
-        if !slot.signaled {
+        self.report(LoadInput::Stage(Stage::Chart), Some(page));
+    }
+
+    /// Applies `input` to the sink's lifetime's state and shows the whole
+    /// state, with `page` when the lines changed, if the lifetime has
+    /// begun and is still the current one: a newer state replaces one
+    /// waiting, and the two replace a waiting pair together.
+    pub fn report(&self, input: LoadInput, page: Option<MenuPage>) {
+        if self.shared.report(self.lifetime, input, page) {
+            self.signal();
+        }
+    }
+
+    /// Puts `page` and `update` in the slot as published, if the
+    /// lifetime is still the current one and `update` is newer than every
+    /// state the slot accepted in it; whether they were put.
+    #[cfg(test)]
+    fn offer(&self, page: Option<MenuPage>, update: LoadingUpdate) -> bool {
+        let put = self
+            .shared
+            .loading_slot()
+            .offer(self.lifetime, page, Some(Box::new(update)));
+        if put {
+            self.signal();
+        }
+        put
+    }
+
+    /// Signals the render thread, unless a signal waits.
+    fn signal(&self) {
+        let mut slot = self.shared.loading_slot();
+        if slot.lifetime == self.lifetime && !slot.signaled {
             slot.signaled = true;
             // A thread that already ended ignores it.
             let _ = self.tx.send(RenderMsg::Loading(self.lifetime));
@@ -790,6 +910,9 @@ pub struct RenderLink {
     end_pages: AtomicU64,
     /// The number of the last attempt's preparation requested.
     requests: AtomicU64,
+    /// The loading clock, the render thread's: a loading lifetime's
+    /// origin is stamped on it.
+    clock: QpcClock,
 }
 
 impl RenderLink {
@@ -999,14 +1122,35 @@ impl RenderLink {
         self.shared.loading_drawn.load(Ordering::Relaxed)
     }
 
-    /// Where the current loading lifetime's lines are shown from, on any
-    /// thread.
+    /// Where the current loading lifetime's lines and state are shown
+    /// from, on any thread.
     pub fn loading(&self) -> LoadingSink {
         LoadingSink {
             tx: self.tx.clone(),
             shared: Arc::clone(&self.shared),
             lifetime: self.shared.loading_slot().lifetime,
+            #[cfg(test)]
+            clock: self.clock,
         }
+    }
+
+    /// A loading lifetime begins (a chart chosen to play, a practice
+    /// Start): its origin is stamped now on the loading clock, once, and
+    /// its state starts for the chart and preset `text` names with the
+    /// shown gauge's descriptor `gauge`. A lifetime begun before and not
+    /// ended ends first, so each beginning has a lifetime of its own.
+    /// Its lines and state are then shown through [`loading`](Self::loading).
+    pub fn begin_loading(&self, text: &LoadingText, gauge: Option<skin_model::LoadingGauge>) {
+        let mut producer = self.shared.producer();
+        let current = self.shared.loading_slot().lifetime;
+        let lifetime = if producer.as_ref().is_some_and(|s| s.lifetime() == current) {
+            let mut slot = self.shared.loading_slot();
+            slot.end();
+            slot.lifetime
+        } else {
+            current
+        };
+        *producer = Some(LifetimeState::new(lifetime, self.clock.now(), text, gauge));
     }
 
     /// Loading ended (selection, the practice page): its lifetime ends, so
@@ -1305,6 +1449,7 @@ pub fn spawn(
         #[cfg(feature = "dev-tools")]
         loading_drawn: AtomicU64::new(0),
         loading: Mutex::new(LoadingSlot::default()),
+        producer: Mutex::new(None),
         commits: Mutex::new(Commits::default()),
     });
     let thread_shared = Arc::clone(&shared);
@@ -1343,7 +1488,6 @@ pub fn spawn(
                 applied: None,
                 selected: None,
                 committed: None,
-                loading_since: None,
                 loading_refused: None,
                 requested: 0,
                 attempt: None,
@@ -1367,12 +1511,78 @@ pub fn spawn(
             finish_timeout: FINISH_TIMEOUT,
             end_pages: AtomicU64::new(0),
             requests: AtomicU64::new(0),
+            clock,
         }),
         Ok(Err(e)) => {
             let _ = handle.join();
             Err(e.into())
         }
         Err(_) => Err(ScreenError::EndedWhileStarting),
+    }
+}
+
+/// The mode after the render thread took `page` and `update` of loading
+/// lifetime `lifetime` from the slot: the loading state of that lifetime
+/// with the newest page and the newest state, an older state never
+/// replacing a newer one; the lifetime's first take enters it.
+fn take_loading(
+    mode: Mode,
+    lifetime: u64,
+    page: Option<Box<MenuPage>>,
+    update: Option<Box<LoadingUpdate>>,
+) -> Mode {
+    match mode {
+        Mode::Menu {
+            page: shown,
+            update: applied,
+            changed,
+            loading: Some(l),
+        } if l == lifetime => {
+            let changed = changed || page.is_some();
+            let update = match update {
+                Some(u) if newer(applied.as_deref(), &u) => Some(u),
+                _ => applied,
+            };
+            Mode::Menu {
+                page: page.unwrap_or(shown),
+                update,
+                changed,
+                loading: Some(lifetime),
+            }
+        }
+        _ => Mode::Menu {
+            page: page.unwrap_or_default(),
+            update,
+            changed: true,
+            loading: Some(lifetime),
+        },
+    }
+}
+
+/// The loading frame of lifetime `lifetime` at `now` on the loading clock
+/// (design.md "Rendering and Skins", loading state): its origin, progress,
+/// gauge descriptor and text revision from the lifetime's newest state
+/// `update`, and the lanes' `visible_time` from the tuning snapshot; the
+/// author's layout and every cover 0 and off until the cover settings
+/// reach the frame (S10-04). Without a state yet it is the lifetime's
+/// first moment: from `now`, nothing loaded. Allocates nothing.
+fn loading_frame_of(
+    lifetime: u64,
+    now: TimeUs,
+    update: Option<&LoadingUpdate>,
+    visible_time: TimeUs,
+) -> LoadingFrame<'static> {
+    let Some(u) = update else {
+        return LoadingFrame::interim(lifetime, now, now, visible_time);
+    };
+    LoadingFrame {
+        load: skin_model::LoadState {
+            since: u.origin,
+            percent: i32::from(u.percent),
+        },
+        gauge: u.gauge,
+        text: u.revision,
+        ..LoadingFrame::interim(lifetime, now, u.origin, visible_time)
     }
 }
 
@@ -1426,8 +1636,8 @@ enum Mode {
     /// The end screen: [`Run::end_page`].
     End,
     /// The select screen, or with `loading` the play screen's loading
-    /// state of that loading lifetime, its lines and their typed `update`;
-    /// `changed` until the page is laid out.
+    /// state of that loading lifetime, its lines and the lifetime's newest
+    /// state `update`; `changed` until the page is laid out.
     Menu {
         page: Box<MenuPage>,
         update: Option<Box<LoadingUpdate>>,
@@ -1485,10 +1695,6 @@ struct Run {
     /// presentation with it, kept apart from the screen: a screen built
     /// again restores exactly it.
     committed: Option<Installation>,
-    /// The loading lifetime last drawn and when its first loading frame
-    /// was, on the clock: its loading state's origin, kept apart from the
-    /// screen, so a screen built again never stamps another.
-    loading_since: Option<(u64, TimeUs)>,
     /// The loading lifetime whose loading frame the skin refused, and
     /// why: none of it is drawn again, and its end reports the refusal.
     loading_refused: Option<(u64, BuildError)>,
@@ -1606,12 +1812,7 @@ impl Run {
                     if let Some((page, update)) = self.shared.take_loading(lifetime)
                         && self.loading_refused.is_none_or(|(l, _)| l != lifetime)
                     {
-                        mode = Mode::Menu {
-                            page,
-                            update,
-                            changed: true,
-                            loading: Some(lifetime),
-                        };
+                        mode = take_loading(mode, lifetime, page, update);
                     }
                 }
                 Ok(RenderMsg::EndLoading { lifetime, reply }) => {
@@ -1891,18 +2092,13 @@ impl Run {
                     #[cfg(feature = "dev-tools")]
                     let [_, _, _, before] = crate::alloc_count::counts();
                     let drawn = if let Some(lifetime) = loading_frame {
-                        // The lifetime's origin: its first loading frame,
-                        // stamped once.
-                        let now = self.clock.now();
-                        let since = match self.loading_since {
-                            Some((l, at)) if l == lifetime => at,
-                            _ => {
-                                self.loading_since = Some((lifetime, now));
-                                now
-                            }
-                        };
                         let visible = self.view.tuning.get().visible_time();
-                        let frame = LoadingFrame::interim(lifetime, now, since, visible);
+                        let frame = loading_frame_of(
+                            lifetime,
+                            self.clock.now(),
+                            update.as_deref(),
+                            visible,
+                        );
                         match screen.loading(page, update.as_deref(), *changed, &frame) {
                             Ok(Ok(t)) => Ok(t),
                             Ok(Err(e)) => {
@@ -2308,7 +2504,8 @@ pub(crate) mod tests {
 
     use super::{MakeScreen, NoFrames, RenderMsg, Screen, ScreenError, View, spawn};
     use crate::attempt_context::AttemptContext;
-    use crate::loading_text::{LoadingUpdate, Stage};
+    use crate::loading_state::{LoadInput, LoadingUpdate};
+    use crate::loading_text::{ChosenChart, LoadingText, Stage};
     use crate::measure::{Measure, PlayMeasure};
 
     fn timing(presented: bool) -> FrameTiming {
@@ -2730,7 +2927,7 @@ pub(crate) mod tests {
         fn loading(
             &mut self,
             page: &crate::menu_screen::MenuPage,
-            _update: Option<&crate::loading_text::LoadingUpdate>,
+            _update: Option<&LoadingUpdate>,
             _changed: bool,
             _frame: &render::LoadingFrame<'_>,
         ) -> Result<Result<FrameTiming, skin_model::BuildError>, RenderError> {
@@ -3406,9 +3603,13 @@ pub(crate) mod tests {
         link.exit();
     }
 
-    /// A screen that notes every loading frame's first line and typed
-    /// update.
-    type Typed = Arc<std::sync::Mutex<Vec<(String, Option<LoadingUpdate>)>>>;
+    /// What a loading frame was drawn with: the page's first line, the
+    /// state, and the frame's load.
+    type Seen = (String, Option<LoadingUpdate>, skin_model::LoadState);
+
+    /// A screen that notes every loading frame's first line, state and
+    /// load.
+    type Typed = Arc<std::sync::Mutex<Vec<Seen>>>;
 
     struct TypedLoading {
         seen: Typed,
@@ -3442,13 +3643,16 @@ pub(crate) mod tests {
             page: &crate::menu_screen::MenuPage,
             update: Option<&LoadingUpdate>,
             _changed: bool,
-            _frame: &render::LoadingFrame<'_>,
+            frame: &render::LoadingFrame<'_>,
         ) -> Result<Result<FrameTiming, skin_model::BuildError>, RenderError> {
             let line = page
                 .lines
                 .first()
                 .map_or_else(String::new, |l| l.text.clone());
-            self.seen.lock().unwrap().push((line, update.cloned()));
+            self.seen
+                .lock()
+                .unwrap()
+                .push((line, update.cloned(), frame.load));
             Ok(Ok(timing(true)))
         }
         #[cfg(feature = "dev-tools")]
@@ -3457,11 +3661,27 @@ pub(crate) mod tests {
         }
     }
 
-    /// The typed update shown with a loading page reaches the screen with
-    /// that page; a page shown without one carries none, not the one
-    /// before; and an update of an ended loading lifetime is never drawn.
+    /// The loading text of chart `title`.
+    fn chosen(title: &str) -> LoadingText {
+        LoadingText {
+            title: title.to_owned(),
+            preset: "preset".to_owned(),
+            chart: ChosenChart {
+                title: Some(title.to_owned()),
+                ..ChosenChart::default()
+            },
+            ..LoadingText::default()
+        }
+    }
+
+    /// A loading lifetime's whole state reaches the screen with its page,
+    /// numbered from 1 and from the origin stamped when it began; a state
+    /// reported without lines keeps the page shown; a publication not
+    /// newer than one accepted is refused; and a state of an ended
+    /// lifetime is never drawn, the next lifetime numbering afresh from
+    /// an origin of its own.
     #[test]
-    fn typed_loading_updates_travel_with_their_page_and_lifetime() {
+    fn a_loading_lifetimes_state_reaches_the_screen_whole_and_in_order() {
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let noted = Arc::clone(&seen);
         let make: MakeScreen = Box::new(move || {
@@ -3470,42 +3690,71 @@ pub(crate) mod tests {
             }) as Box<dyn Screen>)
         });
         let link = spawn_empty(make);
-        let update = |stage, title: &str| LoadingUpdate {
-            stage,
-            chart: crate::loading_text::ChosenChart {
-                title: Some(title.to_owned()),
-                genre: Some("Genre".to_owned()),
-                ..crate::loading_text::ChosenChart::default()
-            },
-            preset: "preset".to_owned(),
-            practice: false,
-        };
-        let drawn = |line: &str| {
-            let line = line.to_owned();
-            let seen = Arc::clone(&seen);
-            move || seen.lock().unwrap().iter().any(|(l, _)| *l == line)
-        };
+        let drawn =
+            |what: &dyn Fn(&Seen) -> bool| wait_until(|| seen.lock().unwrap().iter().any(what));
+        link.begin_loading(&chosen("One"), None);
         let sink = link.loading();
-        let chart_stage = update(Stage::Chart, "One");
-        sink.show_typed(one_line("A"), chart_stage.clone());
-        assert!(wait_until(drawn("A")));
-        sink.show(one_line("B"));
-        assert!(wait_until(drawn("B")));
+        sink.report(LoadInput::Stage(Stage::Chart), Some(one_line("A")));
+        assert!(drawn(&|(l, _, _)| l == "A"));
+        let four = Stage::Sounds { done: 4, files: 9 };
+        sink.report(LoadInput::Stage(four), None);
+        assert!(drawn(
+            &|(l, u, _)| l == "A" && u.as_ref().is_some_and(|u| u.percent == 40)
+        ));
+        // An older publication: the slot accepted number 2.
+        let old = seen
+            .lock()
+            .unwrap()
+            .first()
+            .and_then(|s| s.1.clone())
+            .unwrap();
+        assert!(!sink.offer(Some(one_line("old")), old));
         // The old lifetime's sink after loading ended, then the next one's.
         link.clear_loading();
-        sink.show_typed(one_line("stale"), update(Stage::Loudness, "Old"));
+        sink.report(LoadInput::Stage(Stage::Loudness), Some(one_line("stale")));
+        link.begin_loading(&chosen("Two"), None);
         let next = link.loading();
-        let sounds = update(Stage::Sounds { done: 1, files: 2 }, "Two");
-        next.show_typed(one_line("C"), sounds.clone());
-        assert!(wait_until(drawn("C")));
+        next.report(LoadInput::Stage(Stage::Chart), Some(one_line("C")));
+        assert!(drawn(&|(l, _, _)| l == "C"));
         std::thread::sleep(Duration::from_millis(50));
         link.exit();
         let seen = seen.lock().unwrap().clone();
-        let first = |line: &str| seen.iter().find(|(l, _)| l == line).map(|(_, u)| u.clone());
-        assert_eq!(first("A"), Some(Some(chart_stage)), "{seen:?}");
-        assert_eq!(first("B"), Some(None), "{seen:?}");
-        assert_eq!(first("C"), Some(Some(sounds)), "{seen:?}");
-        assert!(!seen.iter().any(|(l, _)| l == "stale"), "{seen:?}");
+        let first = |line: &str| seen.iter().find(|(l, _, _)| l == line).cloned().unwrap();
+        let (_, a, a_load) = first("A");
+        let a = a.unwrap();
+        assert_eq!(
+            (a.seq, a.stage, a.percent, a.revision),
+            (1, Stage::Chart, 0, 1)
+        );
+        assert_eq!(a.chart.title.as_deref(), Some("One"));
+        assert_eq!(a_load.since, a.origin, "{seen:?}");
+        assert_eq!(a_load.percent, 0);
+        let forty = seen
+            .iter()
+            .find(|(_, u, _)| u.as_ref().is_some_and(|u| u.percent == 40))
+            .unwrap();
+        assert_eq!(forty.1.as_ref().unwrap().seq, 2);
+        assert_eq!(forty.2.percent, 40);
+        assert_eq!(forty.2.since, a.origin);
+        assert!(
+            !seen.iter().any(|(l, _, _)| l == "stale" || l == "old"),
+            "{seen:?}"
+        );
+        let (_, c, c_load) = first("C");
+        let c = c.unwrap();
+        assert_eq!((c.seq, c.percent), (1, 0));
+        assert_eq!(c.chart.title.as_deref(), Some("Two"));
+        assert!(c.origin > a.origin, "{seen:?}");
+        assert_eq!(c_load.since, c.origin);
+        // Nothing older than the newest state drawn before it.
+        let mut newest = 0;
+        for (l, u, _) in &seen {
+            if l == "A" {
+                let seq = u.as_ref().unwrap().seq;
+                assert!(seq >= newest, "{seen:?}");
+                newest = seq;
+            }
+        }
     }
 
     /// A chart the screen cannot draw is refused, and the select screen
@@ -6610,37 +6859,56 @@ pub(crate) mod tests {
         link.commit_attempt().unwrap();
         let from = drawn();
         assert!(wait_until(|| drawn() >= from + 3));
-        let staged = drawn();
 
-        // The renderer fails and is built again, the files gone.
+        // The renderer fails and is built again, the files gone: frames
+        // drawn on the rebuilt device.
+        let (first_device, a) = {
+            let probed = probed.lock().unwrap();
+            (probed.loadings[0].0, probed.loadings[0].1)
+        };
         dir.close().unwrap();
         fail.store(true, Ordering::Release);
         assert!(wait_until(|| link.failed()));
         fail.store(false, Ordering::Release);
         link.prepare().unwrap();
         sink.show(one_line("A"));
-        assert!(wait_until(|| drawn() >= staged + 3));
-        let rebuilt = drawn();
+        // A loading frame as the probe notes it.
+        type Seen = (u64, u64, TimeUs, Option<TimeUs>);
+        let counted = |what: &dyn Fn(&Seen) -> bool| {
+            probed
+                .lock()
+                .unwrap()
+                .loadings
+                .iter()
+                .filter(|l| what(l))
+                .count()
+        };
+        assert!(wait_until(
+            || counted(&|l| l.0 != first_device && l.1 == a) >= 3
+        ));
 
-        // A new lifetime on the same bundle.
+        // A new lifetime on the same bundle, after the end of A's is
+        // answered.
         link.end_loading().unwrap();
         link.loading().show(one_line("B"));
-        assert!(wait_until(|| drawn() >= rebuilt + 3));
+        assert!(wait_until(|| counted(&|l| l.1 != a) >= 3));
         link.end_loading().unwrap();
         link.exit();
         assert_eq!(builds.load(Ordering::SeqCst), 2);
 
         let probed = probed.lock().unwrap();
         let all = &probed.loadings;
-        let (a, b) = (all[0].1, all[rebuilt].1);
-        assert_ne!(a, b);
+        // Every frame of A comes before every frame of B.
+        let rebuilt = all.iter().position(|l| l.1 != a).unwrap();
+        assert!(all[rebuilt..].iter().all(|l| l.1 != a), "{all:?}");
+        let b = all[rebuilt].1;
         let (_, _, since, when) = all[0];
         let started = when.expect("the when timer starts on the first frame");
         // Lifetime A: one origin and one `when` start throughout, on both
         // renderers, the presentation shared with the restored one.
         let lifetime_a = &all[..rebuilt];
         assert!(lifetime_a.iter().all(|l| l.1 == a), "{all:?}");
-        assert!(lifetime_a.iter().any(|l| l.0 != all[0].0), "{all:?}");
+        assert!(lifetime_a.iter().any(|l| l.0 != first_device), "{all:?}");
         assert!(
             lifetime_a
                 .iter()
@@ -6664,6 +6932,872 @@ pub(crate) mod tests {
                 .all(|&(_, l, s, w)| l == b && s == since_b && w == Some(started_b)),
             "{all:?}"
         );
+    }
+
+    /// What drew red in one loading frame at 1920×1080, at the centres of
+    /// the fixture's places ([`crate::render_decl`]).
+    #[derive(Clone, Copy, Debug)]
+    struct Red {
+        title: bool,
+        artist: bool,
+        genre: bool,
+        full_title: bool,
+        gauge: bool,
+        line: bool,
+        background: bool,
+        percent: bool,
+        progress: bool,
+        /// The animation's square where it starts.
+        animation_start: bool,
+        /// The animation's square where the loading timer puts it now:
+        /// moving 1 canvas pixel per ms for 1 s, then held at its end.
+        animation_now: bool,
+    }
+
+    /// One loading frame as [`Recorder`] saw it.
+    #[derive(Clone, Debug)]
+    struct Shot {
+        device: u64,
+        /// The target the frame was drawn at.
+        target: [u32; 2],
+        lifetime: u64,
+        now: TimeUs,
+        load: skin_model::LoadState,
+        gauge: Option<skin_model::LoadingGauge>,
+        text: u64,
+        /// The installed bundle, by address.
+        bundle: Option<usize>,
+        /// The installed presentation's `when` timer 0's start.
+        when: Option<TimeUs>,
+        /// Its progress timer's start ([`crate::render_decl::PROGRESS_SLOT`]).
+        progress: Option<TimeUs>,
+        /// The chosen chart's text staged after the frame, in bytes.
+        staged: u64,
+        red: Option<Red>,
+    }
+
+    type Shots = Arc<std::sync::Mutex<Vec<Shot>>>;
+
+    /// A size [`Recorder`] applies before a loading frame: before the
+    /// next one, or with a revision, before the first one whose state
+    /// has that text revision.
+    type Resize = Arc<std::sync::Mutex<Option<(Option<u64>, (u32, u32))>>>;
+
+    /// A real menu screen on WARP that records each loading frame
+    /// ([`Shot`]), counts the play frames it is asked to build, applies a
+    /// size set in `resize` ([`Resize`]), and fails its loading frames
+    /// while `fail` is set, so the render thread builds another.
+    struct Recorder {
+        menu: crate::menu_screen::MenuScreen,
+        shots: Shots,
+        builds: Arc<AtomicU32>,
+        resize: Resize,
+        fail: Arc<AtomicBool>,
+    }
+
+    impl Recorder {
+        fn shot(&mut self, frame: &render::LoadingFrame<'_>, drawn: bool) -> Shot {
+            use crate::render_decl::{
+                ANIMATION, ARTIST, BACKGROUND, FULL_TITLE, GAUGE, GENRE, LINE_AT, PERCENT_MARK,
+                PROGRESS_MARK, PROGRESS_SLOT, TITLE, WHEN_SLOT,
+            };
+            let device = self.menu.device();
+            let installation = self.menu.installation();
+            let r = self.menu.renderer_mut();
+            let staged = r.memory().staged_text;
+            let target = r.target();
+            let red = (drawn && r.target() == [1_920, 1_080]).then(|| {
+                let p = r.read_back();
+                let red_at = |at: (u32, u32)| crate::render_common::rgb_at(&p, 1_920, at) == RED;
+                let centre = |[x, y, w, h]: [i32; 4]| {
+                    red_at((
+                        u32::try_from(x + w / 2).unwrap(),
+                        u32::try_from(y + h / 2).unwrap(),
+                    ))
+                };
+                let moved = ((frame.now.0 - frame.load.since.0) / 1_000).min(1_000);
+                let x = 250 + moved;
+                Red {
+                    title: centre(TITLE),
+                    artist: centre(ARTIST),
+                    genre: centre(GENRE),
+                    full_title: centre(FULL_TITLE),
+                    gauge: centre(GAUGE),
+                    line: red_at(LINE_AT),
+                    background: centre(BACKGROUND),
+                    percent: centre(PERCENT_MARK),
+                    progress: centre(PROGRESS_MARK),
+                    animation_start: centre(ANIMATION),
+                    animation_now: red_at((u32::try_from(x).unwrap(), 950)),
+                }
+            });
+            Shot {
+                device,
+                target,
+                lifetime: frame.lifetime,
+                now: frame.now,
+                load: frame.load,
+                gauge: frame.gauge,
+                text: frame.text,
+                bundle: installation
+                    .as_ref()
+                    .map(|i| Arc::as_ptr(i.bundle()) as *const () as usize),
+                when: installation
+                    .as_ref()
+                    .and_then(|i| i.loading().timer(WHEN_SLOT)),
+                progress: installation
+                    .as_ref()
+                    .and_then(|i| i.loading().timer(PROGRESS_SLOT)),
+                staged,
+                red,
+            }
+        }
+    }
+
+    impl Screen for Recorder {
+        fn load(
+            &mut self,
+            chart: &Chart,
+            section: Option<&eval::Section>,
+        ) -> Result<(), RenderError> {
+            self.menu.load(chart, section)
+        }
+        fn prepare_attempt(
+            &mut self,
+            a: &render::AttemptInput<'_>,
+            skin: Option<&Arc<render::SkinBundle>>,
+            request: u64,
+        ) -> Option<Result<Preparation, RenderError>> {
+            self.menu.prepare_attempt(a, skin, request)
+        }
+        fn device(&self) -> u64 {
+            self.menu.device()
+        }
+        fn commit(&mut self, token: render::PreparedToken) -> Result<(), render::CommitError> {
+            self.menu.commit(token)
+        }
+        fn discard(&mut self) {
+            self.menu.discard();
+        }
+        fn install(
+            &mut self,
+            skin: &Arc<render::SkinBundle>,
+            request: u64,
+        ) -> Result<Preparation, RenderError> {
+            self.menu.install(skin, request)
+        }
+        fn installation(&self) -> Option<render::Installation> {
+            self.menu.installation()
+        }
+        fn restore(&mut self, installation: &render::Installation) -> Result<(), RenderError> {
+            self.menu.restore(installation)
+        }
+        fn wait(&self) -> bool {
+            self.menu.wait()
+        }
+        fn paced(&self) -> bool {
+            self.menu.paced()
+        }
+        fn build(&mut self, f: &FrameInput<'_>) -> Result<(), skin_model::BuildError> {
+            self.builds.fetch_add(1, Ordering::SeqCst);
+            self.menu.build(f)
+        }
+        fn draw(&mut self) -> Result<FrameTiming, RenderError> {
+            self.menu.draw()
+        }
+        fn text(&mut self, lines: &[&str]) -> Result<bool, RenderError> {
+            self.menu.text(lines)
+        }
+        fn menu(
+            &mut self,
+            page: &crate::menu_screen::MenuPage,
+            changed: bool,
+        ) -> Result<FrameTiming, RenderError> {
+            self.menu.menu(page, changed)
+        }
+        fn loading(
+            &mut self,
+            page: &crate::menu_screen::MenuPage,
+            update: Option<&LoadingUpdate>,
+            changed: bool,
+            frame: &render::LoadingFrame<'_>,
+        ) -> Result<Result<FrameTiming, skin_model::BuildError>, RenderError> {
+            if self.fail.load(Ordering::Acquire) {
+                return Err(RenderError::SurfaceLost);
+            }
+            {
+                let mut resize = self.resize.lock().unwrap();
+                if let Some((at, (w, h))) = *resize
+                    && at.is_none_or(|r| update.is_some_and(|u| u.revision == r))
+                {
+                    *resize = None;
+                    self.menu.resize(w, h);
+                }
+            }
+            let drawn = self.menu.loading(page, update, changed, frame)?;
+            let shot = self.shot(frame, drawn.is_ok());
+            self.shots.lock().unwrap().push(shot);
+            Ok(drawn)
+        }
+        fn resize(&mut self, width: u32, height: u32) {
+            self.menu.resize(width, height);
+        }
+        fn target(&self) -> [u32; 2] {
+            self.menu.target()
+        }
+        #[cfg(feature = "dev-tools")]
+        fn read_back(&self) -> Option<(u32, u32, Vec<u8>)> {
+            self.menu.read_back()
+        }
+    }
+
+    /// What the [`Recorder`]s of one render thread record.
+    struct Recording {
+        shots: Shots,
+        builds: Arc<AtomicU32>,
+        resize: Resize,
+        fail: Arc<AtomicBool>,
+        made: Arc<AtomicU32>,
+    }
+
+    impl Recording {
+        /// A render thread on [`Recorder`]s with the runtime fonts, and
+        /// what they record.
+        fn new() -> (super::RenderLink, Self) {
+            let shots: Shots = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let builds = Arc::new(AtomicU32::new(0));
+            let resize: Resize = Arc::new(std::sync::Mutex::new(None));
+            let fail = Arc::new(AtomicBool::new(false));
+            let made = Arc::new(AtomicU32::new(0));
+            let (s, b, r, f, m) = (
+                Arc::clone(&shots),
+                Arc::clone(&builds),
+                Arc::clone(&resize),
+                Arc::clone(&fail),
+                Arc::clone(&made),
+            );
+            let make: MakeScreen = Box::new(move || {
+                m.fetch_add(1, Ordering::SeqCst);
+                let renderer = render::Renderer::new(
+                    render::Target::Offscreen {
+                        width: 1_920,
+                        height: 1_080,
+                    },
+                    render::AdapterChoice::Warp,
+                )?;
+                Ok(Box::new(Recorder {
+                    menu: crate::menu_screen::MenuScreen::new(
+                        renderer,
+                        Some(render::text::Fonts::runtime()?),
+                    ),
+                    shots: Arc::clone(&s),
+                    builds: Arc::clone(&b),
+                    resize: Arc::clone(&r),
+                    fail: Arc::clone(&f),
+                }) as Box<dyn Screen>)
+            });
+            let recording = Self {
+                shots,
+                builds,
+                resize,
+                fail,
+                made,
+            };
+            (spawn_empty(make), recording)
+        }
+
+        fn count(&self) -> usize {
+            self.shots.lock().unwrap().len()
+        }
+
+        /// Waits for `n` more loading frames than `from`, then returns
+        /// the count.
+        fn more(&self, from: usize, n: usize) -> usize {
+            assert!(
+                wait_until(|| self.count() >= from + n),
+                "{} frames",
+                self.count()
+            );
+            self.count()
+        }
+
+        /// Waits until a loading frame after the `from`-th satisfies
+        /// `what`, then returns the count.
+        fn until(&self, from: usize, what: impl Fn(&Shot) -> bool) -> usize {
+            assert!(
+                wait_until(|| self.shots.lock().unwrap().iter().skip(from).any(&what)),
+                "{:?}",
+                self.shots
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .skip(from)
+                    .collect::<Vec<_>>()
+            );
+            self.count()
+        }
+
+        fn shots(&self) -> Vec<Shot> {
+            self.shots.lock().unwrap().clone()
+        }
+    }
+
+    /// The fixture with every loading part: the animation, the `when`
+    /// mark, the lanes and gauge, the chosen chart's text and the
+    /// progress marks.
+    fn bridge_look() -> crate::render_decl::Look {
+        crate::render_decl::Look {
+            loading: true,
+            structure: true,
+            chart_text: true,
+            progress: true,
+            ..crate::render_decl::Look::left([255, 0, 0, 255])
+        }
+    }
+
+    /// The loading text of chart `title` by `artist`, if it has one.
+    fn chosen_by(title: &str, artist: Option<&str>) -> LoadingText {
+        let mut text = chosen(title);
+        text.chart.artist = artist.map(str::to_owned);
+        text
+    }
+
+    /// Through the render thread, a real menu screen, its renderer and a
+    /// declarative skin: chart B chosen after chart A's lifetime ended,
+    /// its load stalled at 4 of 9 sounds, keeps drawing B's lifetime from
+    /// its own origin: the background, the animation moving on the
+    /// loading clock, `when` timer 0 started once, the lanes' judgment
+    /// line, the gauge from its descriptor with no value, B's title and
+    /// full title only, its progress 40 throughout, reading `load.percent`
+    /// 40 and starting the progress timer once, which then ages; no play
+    /// frame is built meanwhile.
+    #[test]
+    fn a_stalled_load_keeps_drawing_its_lifetime() {
+        let (link, rec) = Recording::new();
+        let dir = tempfile::tempdir().unwrap();
+        let (skin, _) = crate::render_decl::bundle(
+            &crate::render_common::offscreen(1_920, 1_080),
+            dir.path(),
+            &bridge_look(),
+        );
+        let chart = Arc::new(ChartBuilder::new(120_000).build().unwrap());
+        link.load(Arc::clone(&chart), None).unwrap();
+        assert_eq!(link.select(Some(skin)).wait().unwrap(), Preparation::Ready);
+
+        link.begin_loading(&chosen_by("A", Some("a")), None);
+        link.loading()
+            .report(LoadInput::Stage(Stage::Chart), Some(one_line("A")));
+        let a_end = rec.until(0, |s| s.red.is_some_and(|r| r.artist));
+        link.end_loading().unwrap();
+
+        let gauge = crate::loading_state::shown_gauge(&rules::tapestry(), 0);
+        link.begin_loading(&chosen("B"), gauge);
+        let sink = link.loading();
+        sink.report(LoadInput::Stage(Stage::Chart), Some(one_line("B")));
+        let four = Stage::Sounds { done: 4, files: 9 };
+        sink.report(LoadInput::Stage(four), Some(one_line("B 4/9")));
+        let forty = rec.until(a_end, |s| s.load.percent == 40);
+        // Stalled: no report for the rest, the progress timer ageing 200 ms.
+        let stalled = rec.more(forty, 10);
+        assert!(wait_until(|| rec.shots().last().is_some_and(|s| s
+            .progress
+            .is_some_and(|p| s.now.0 - p.0 > 200_000))));
+        let end = rec.more(stalled, 3);
+        link.end_loading().unwrap();
+        link.exit();
+
+        let shots = rec.shots();
+        let a = shots[0].lifetime;
+        let b = shots[end - 1].lifetime;
+        assert_ne!(a, b);
+        let lifetime_b: Vec<&Shot> = shots.iter().filter(|s| s.lifetime == b).collect();
+        let first = lifetime_b[0];
+        // B's origin is its own, later than A's, stamped before its first
+        // frame and kept by every frame.
+        assert!(first.load.since > shots[0].load.since, "{shots:?}");
+        assert!(first.load.since <= first.now);
+        assert!(lifetime_b.iter().all(|s| s.load.since == first.load.since));
+        let when = first
+            .when
+            .expect("the when timer starts on B's first frame");
+        assert!(lifetime_b.iter().all(|s| s.when == Some(when)), "{shots:?}");
+        assert!(lifetime_b.iter().all(|s| s.gauge == gauge), "{shots:?}");
+        // From the 40 % frame on, the progress stays and its timer starts
+        // once, then ages.
+        let from_forty: Vec<&Shot> = lifetime_b
+            .iter()
+            .copied()
+            .skip_while(|s| s.load.percent != 40)
+            .collect();
+        assert!(from_forty.len() >= 10, "{shots:?}");
+        assert!(from_forty.iter().all(|s| s.load.percent == 40), "{shots:?}");
+        let started = from_forty[0]
+            .progress
+            .expect("the progress timer starts at 40");
+        assert!(from_forty.iter().all(|s| s.progress == Some(started)));
+        assert!(
+            lifetime_b
+                .iter()
+                .take_while(|s| s.load.percent != 40)
+                .all(|s| s.progress.is_none() && s.load.percent == 0)
+        );
+        let last = from_forty.last().unwrap();
+        assert!(last.now.0 - started.0 > 200_000);
+        // What each frame drew.
+        for s in &from_forty {
+            let r = s.red.unwrap();
+            assert!(r.background && r.line && r.gauge, "{s:?}");
+            assert!(r.percent && r.progress, "{s:?}");
+            assert!(!r.artist && !r.genre, "{s:?}");
+            assert!(r.animation_now, "{s:?}");
+        }
+        assert!(!last.red.unwrap().animation_start, "{last:?}");
+        // B's title, once its text is installed, and never A's artist.
+        assert!(
+            lifetime_b.iter().all(|s| !s.red.unwrap().artist),
+            "{shots:?}"
+        );
+        let titled = lifetime_b
+            .iter()
+            .skip_while(|s| !s.red.unwrap().title)
+            .collect::<Vec<_>>();
+        assert!(titled.len() >= 10, "{shots:?}");
+        assert!(titled.iter().all(|s| {
+            let r = s.red.unwrap();
+            r.title && r.full_title
+        }));
+        assert_eq!(rec.builds.load(Ordering::SeqCst), 0);
+    }
+
+    /// Within one lifetime, through a real menu screen: the preset's
+    /// refresh ([`crate::play::refresh_loading_gauge`], as the attempt's
+    /// preparation calls it) replaces the gauge's descriptor from the
+    /// next frame on,
+    /// kept by later pages, the loading clock and the `when` timer going
+    /// on; a field's change clears its slots on the frame it arrives and
+    /// draws the replacement from the next, the other fields kept; an
+    /// unavailable field clears its slots; the staged text is counted in
+    /// the renderer's memory until installed.
+    #[test]
+    fn a_lifetimes_descriptor_and_chart_text_change_in_place() {
+        let (link, rec) = Recording::new();
+        let dir = tempfile::tempdir().unwrap();
+        let (skin, text) = crate::render_decl::bundle(
+            &crate::render_common::offscreen(1_920, 1_080),
+            dir.path(),
+            &bridge_look(),
+        );
+        let text = text.unwrap();
+        let chart = Arc::new(ChartBuilder::new(120_000).build().unwrap());
+        link.load(Arc::clone(&chart), None).unwrap();
+        assert_eq!(link.select(Some(skin)).wait().unwrap(), Preparation::Ready);
+
+        link.begin_loading(&chosen_by("T", Some("x")), None);
+        let sink = link.loading();
+        sink.report(LoadInput::Stage(Stage::Chart), Some(one_line("T")));
+        let shown = rec.until(0, |s| s.red.is_some_and(|r| r.title && r.artist));
+        let hard = crate::loading_state::shown_gauge(&rules::tapestry(), 1);
+        assert!(hard.is_some());
+        crate::play::refresh_loading_gauge(&link, true, &rules::tapestry(), 1);
+        let refreshed = rec.until(shown, |s| s.gauge == hard);
+        sink.report(LoadInput::Stage(Stage::Loudness), Some(one_line("later")));
+        let later = rec.more(refreshed, 3);
+        let y = ChosenChart {
+            title: Some("T".to_owned()),
+            artist: Some("y".to_owned()),
+            ..ChosenChart::default()
+        };
+        sink.report(LoadInput::Chart(y), None);
+        let changed = rec.until(later, |s| s.text == 2);
+        let replaced = rec.until(changed, |s| s.text == 2 && s.red.unwrap().artist);
+        let gone = ChosenChart {
+            title: Some("T".to_owned()),
+            ..ChosenChart::default()
+        };
+        sink.report(LoadInput::Chart(gone), None);
+        let cleared = rec.until(replaced, |s| s.text == 3);
+        let end = rec.more(cleared, 3);
+        link.end_loading().unwrap();
+        link.exit();
+
+        let shots = rec.shots();
+        let all = &shots[..end];
+        assert!(all.iter().all(|s| s.lifetime == all[0].lifetime));
+        let since = all[0].load.since;
+        assert!(all.iter().all(|s| s.load.since == since), "{all:?}");
+        let when = all[0].when.unwrap();
+        assert!(all.iter().all(|s| s.when == Some(when)), "{all:?}");
+        // The descriptor: none, then the refreshed one, in one step, kept.
+        let first_hard = all.iter().position(|s| s.gauge == hard).unwrap();
+        assert!(all[..first_hard].iter().all(|s| s.gauge.is_none()));
+        assert!(all[first_hard..].iter().all(|s| s.gauge == hard), "{all:?}");
+        assert!(all[..first_hard].iter().all(|s| !s.red.unwrap().gauge));
+        assert!(all[first_hard..].iter().all(|s| s.red.unwrap().gauge));
+        // Revision 2: the artist's slot cleared on its first frame, the
+        // title kept; from the next frame on its replacement.
+        let r2: Vec<&Shot> = all.iter().filter(|s| s.text == 2).collect();
+        assert!(
+            !r2[0].red.unwrap().artist && r2[0].red.unwrap().title,
+            "{r2:?}"
+        );
+        assert!(r2[0].staged > 0, "{r2:?}");
+        assert!(r2[1..].iter().all(|s| {
+            let r = s.red.unwrap();
+            r.artist && r.title && s.staged == 0
+        }));
+        // Revision 3: the artist unavailable, its slot empty; the title
+        // kept throughout.
+        let r3: Vec<&Shot> = all.iter().filter(|s| s.text == 3).collect();
+        assert!(r3.iter().all(|s| {
+            let r = s.red.unwrap();
+            !r.artist && r.title
+        }));
+        // Every field laid out once per revision: the first for all slots,
+        // then only for the changed fields' slots.
+        let charts = text.charts.lock().unwrap().clone();
+        assert_eq!(
+            charts.iter().map(|c| c[1].as_str()).collect::<Vec<_>>(),
+            ["x", "y", ""],
+            "{charts:?}"
+        );
+    }
+
+    /// A render thread on [`Recorder`]s with the fixture of every loading
+    /// part selected, and its text producer.
+    fn bridge_recording() -> (
+        super::RenderLink,
+        Recording,
+        Arc<crate::render_decl::Text>,
+        tempfile::TempDir,
+    ) {
+        let (link, rec) = Recording::new();
+        let dir = tempfile::tempdir().unwrap();
+        let (skin, text) = crate::render_decl::bundle(
+            &crate::render_common::offscreen(1_920, 1_080),
+            dir.path(),
+            &bridge_look(),
+        );
+        let chart = Arc::new(ChartBuilder::new(120_000).build().unwrap());
+        link.load(chart, None).unwrap();
+        assert_eq!(link.select(Some(skin)).wait().unwrap(), Preparation::Ready);
+        (link, rec, text.unwrap(), dir)
+    }
+
+    /// Text installed at one size and a field that became unavailable
+    /// arriving with another size: the slots are prepared again for the
+    /// new size, and the dropped artist is never drawn from the text the
+    /// slots kept, on the frame the change arrives or after.
+    #[test]
+    fn a_new_size_never_draws_a_dropped_field() {
+        let (link, rec, _text, _dir) = bridge_recording();
+        link.begin_loading(&chosen_by("T", Some("x")), None);
+        let sink = link.loading();
+        sink.report(LoadInput::Stage(Stage::Chart), Some(one_line("T")));
+        let shown = rec.until(0, |s| s.red.is_some_and(|r| r.title && r.artist));
+        // Installed at 960 × 540: a frame there with nothing staged.
+        *rec.resize.lock().unwrap() = Some((None, (960, 540)));
+        let small = rec.until(shown, |s| s.target == [960, 540] && s.staged == 0);
+        // The artist dropped, the size back on the same frame.
+        *rec.resize.lock().unwrap() = Some((Some(2), (1_920, 1_080)));
+        sink.report(
+            LoadInput::Chart(ChosenChart {
+                title: Some("T".to_owned()),
+                ..ChosenChart::default()
+            }),
+            None,
+        );
+        let end = rec.until(small, |s| s.text == 2 && s.red.is_some_and(|r| r.title));
+        link.end_loading().unwrap();
+        link.exit();
+
+        let shots = rec.shots();
+        let r2: Vec<&Shot> = shots[..end].iter().filter(|s| s.text == 2).collect();
+        assert!(r2.iter().all(|s| s.target == [1_920, 1_080]), "{r2:?}");
+        assert!(r2.iter().all(|s| !s.red.unwrap().artist), "{r2:?}");
+    }
+
+    /// A revision the producer refuses leaves its fields empty and is not
+    /// asked again; the next revision lays out every field again, the
+    /// refused ones included, so none stays empty for good.
+    #[test]
+    fn a_refused_revision_is_laid_out_again_by_the_next() {
+        let (link, rec, text, _dir) = bridge_recording();
+        link.begin_loading(&chosen_by("T", Some("x")), None);
+        let sink = link.loading();
+        sink.report(LoadInput::Stage(Stage::Chart), Some(one_line("T")));
+        let shown = rec.until(0, |s| s.red.is_some_and(|r| r.title && r.artist));
+        text.refuse.store(true, Ordering::SeqCst);
+        sink.report(
+            LoadInput::Chart(ChosenChart {
+                title: Some("T".to_owned()),
+                artist: Some("y".to_owned()),
+                ..ChosenChart::default()
+            }),
+            None,
+        );
+        // Two frames of the refused revision: its preparation ran on the
+        // first, and the second shows it was not asked again.
+        let refused = rec.until(shown, |s| s.text == 2);
+        let refused = rec.until(refused, |s| s.text == 2);
+        text.refuse.store(false, Ordering::SeqCst);
+        sink.report(
+            LoadInput::Chart(ChosenChart {
+                title: Some("T".to_owned()),
+                artist: Some("y".to_owned()),
+                genre: Some("g".to_owned()),
+                ..ChosenChart::default()
+            }),
+            None,
+        );
+        let end = rec.until(refused, |s| {
+            s.text == 3 && s.red.is_some_and(|r| r.title && r.artist && r.genre)
+        });
+        link.end_loading().unwrap();
+        link.exit();
+
+        let shots = rec.shots();
+        let r2: Vec<&Shot> = shots[..end].iter().filter(|s| s.text == 2).collect();
+        assert!(r2.len() >= 2, "{r2:?}");
+        assert!(r2.iter().all(|s| !s.red.unwrap().artist), "{r2:?}");
+        let charts = text.charts.lock().unwrap().clone();
+        assert_eq!(
+            charts.iter().map(|c| c[1].as_str()).collect::<Vec<_>>(),
+            ["x", "y", "y"],
+            "{charts:?}"
+        );
+    }
+
+    /// Within one lifetime the loading clock and the `when` timer go on
+    /// across a page and progress update, the same bundle prepared and
+    /// committed for the attempt, a resize and a renderer built again; a
+    /// different bundle committed within it keeps the clock but starts
+    /// its own presentation's timer afresh, its text installed again; the
+    /// next lifetime starts both afresh. A report of an ended lifetime
+    /// draws nothing. The attempt's commit ([`crate::play::commit_ready`])
+    /// makes the lifetime ready, 100 drawn, before the end of loading is
+    /// answered, and no loading frame follows the answer; no play frame
+    /// is built while loading.
+    #[test]
+    fn a_lifetimes_clock_survives_what_happens_during_it() {
+        let (link, rec) = Recording::new();
+        let dir = tempfile::tempdir().unwrap();
+        let other_dir = tempfile::tempdir().unwrap();
+        let r = crate::render_common::offscreen(1_920, 1_080);
+        let (skin, _) = crate::render_decl::bundle(&r, dir.path(), &bridge_look());
+        let (other, _) = crate::render_decl::bundle(&r, other_dir.path(), &bridge_look());
+        let chart = Arc::new(ChartBuilder::new(120_000).build().unwrap());
+        link.load(Arc::clone(&chart), None).unwrap();
+        assert_eq!(
+            link.select(Some(Arc::clone(&skin))).wait().unwrap(),
+            Preparation::Ready
+        );
+
+        link.begin_loading(&chosen("A"), None);
+        let sink = link.loading();
+        sink.report(LoadInput::Stage(Stage::Chart), Some(one_line("A")));
+        let shown = rec.until(0, |s| s.red.is_some_and(|r| r.title));
+        let four = Stage::Sounds { done: 4, files: 9 };
+        sink.report(LoadInput::Stage(four), Some(one_line("A 4/9")));
+        let progressed = rec.until(shown, |s| s.load.percent == 40);
+        // The same bundle prepared and committed for the attempt.
+        let attempt = preset_attempt(&chart, &rules::tapestry(), None, "T");
+        assert_eq!(
+            link.prepare_attempt(attempt, || false).unwrap(),
+            Preparation::Ready
+        );
+        link.commit_attempt().unwrap();
+        let committed = rec.more(progressed, 3);
+        // A resize, drawn at the new size, and back.
+        *rec.resize.lock().unwrap() = Some((None, (960, 540)));
+        let small = rec.until(committed, |s| s.target == [960, 540]);
+        *rec.resize.lock().unwrap() = Some((None, (1_920, 1_080)));
+        let resized = rec.until(small, |s| {
+            s.target == [1_920, 1_080] && s.red.is_some_and(|r| r.title)
+        });
+        // The renderer built again, its files gone.
+        rec.fail.store(true, Ordering::Release);
+        assert!(wait_until(|| link.failed()));
+        rec.fail.store(false, Ordering::Release);
+        link.prepare().unwrap();
+        sink.report(LoadInput::BankComplete, Some(one_line("A bank")));
+        let rebuilt = rec.until(resized, |s| {
+            s.load.percent == 90 && s.red.is_some_and(|r| r.title)
+        });
+        // A different bundle committed in the same lifetime.
+        assert_eq!(
+            link.select(Some(Arc::clone(&other))).wait().unwrap(),
+            Preparation::Ready
+        );
+        let attempt = preset_attempt(&chart, &rules::tapestry(), None, "T");
+        assert_eq!(
+            link.prepare_attempt(attempt, || false).unwrap(),
+            Preparation::Ready
+        );
+        link.commit_attempt().unwrap();
+        let other_at = Arc::as_ptr(&other) as *const () as usize;
+        let switched = rec.until(rebuilt, |s| {
+            s.bundle == Some(other_at) && s.red.is_some_and(|r| r.title)
+        });
+        // The lifetime cancelled: its late reports draw nothing.
+        let a = rec.shots()[0].lifetime;
+        link.clear_loading();
+        sink.report(LoadInput::Ready, Some(one_line("late")));
+        sink.report(LoadInput::BankComplete, None);
+        // The next lifetime, ready through the attempt's commit.
+        link.begin_loading(&chosen("B"), None);
+        link.loading()
+            .report(LoadInput::Stage(Stage::Chart), Some(one_line("B")));
+        let next = rec.until(switched, |s| {
+            s.lifetime != a && s.red.is_some_and(|r| r.title)
+        });
+        let attempt = preset_attempt(&chart, &rules::tapestry(), None, "T");
+        assert_eq!(
+            link.prepare_attempt(attempt, || false).unwrap(),
+            Preparation::Ready
+        );
+        crate::play::commit_ready(&link, true).unwrap();
+        let ready = rec.until(next, |s| s.load.percent == 100);
+        link.end_loading().unwrap();
+        let ended = rec.count();
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(rec.count(), ended, "a loading frame after the answer");
+        link.exit();
+
+        let shots = rec.shots();
+        let a = shots[0].lifetime;
+        let lifetime_a: Vec<&Shot> = shots.iter().filter(|s| s.lifetime == a).collect();
+        let since = lifetime_a[0].load.since;
+        assert!(
+            lifetime_a.iter().all(|s| s.load.since == since),
+            "{shots:?}"
+        );
+        assert!(lifetime_a.iter().all(|s| s.load.percent < 100), "{shots:?}");
+        // Two devices, two bundles, one origin.
+        assert!(lifetime_a.iter().any(|s| s.device != lifetime_a[0].device));
+        let skin_at = Arc::as_ptr(&skin) as *const () as usize;
+        let (on_skin, on_other): (Vec<&Shot>, Vec<&Shot>) = lifetime_a
+            .iter()
+            .copied()
+            .partition(|s| s.bundle == Some(skin_at));
+        assert!(on_other.iter().all(|s| s.bundle == Some(other_at)));
+        assert!(!on_other.is_empty());
+        let when = on_skin[0].when.unwrap();
+        assert!(on_skin.iter().all(|s| s.when == Some(when)), "{shots:?}");
+        let other_when = on_other[0].when.unwrap();
+        assert!(other_when > when, "{shots:?}");
+        assert!(on_other.iter().all(|s| s.when == Some(other_when)));
+        assert!(
+            shots[..switched]
+                .iter()
+                .skip_while(|s| s.bundle != Some(other_at))
+                .all(|s| s.bundle == Some(other_at))
+        );
+        // Frames were drawn at the smaller size, on the same clock.
+        assert!(shots[committed..resized].iter().any(|s| s.red.is_none()));
+        // The next lifetime, after every frame of the cancelled one: its
+        // own origin and timer, then readiness's 100.
+        let first_b = shots.iter().position(|s| s.lifetime != a).unwrap();
+        assert!(
+            shots[first_b..].iter().all(|s| s.lifetime != a),
+            "{shots:?}"
+        );
+        let lifetime_b: Vec<&Shot> = shots[first_b..].iter().collect();
+        let since_b = lifetime_b[0].load.since;
+        assert!(since_b > since);
+        assert!(lifetime_b.iter().all(|s| s.load.since == since_b));
+        let when_b = lifetime_b[0].when.unwrap();
+        assert!(when_b > other_when);
+        assert!(lifetime_b.iter().all(|s| s.when == Some(when_b)));
+        assert!(shots[..next].iter().all(|s| s.load.percent < 100));
+        assert_eq!(shots[ready - 1].load.percent, 100);
+        assert_eq!(rec.builds.load(Ordering::SeqCst), 0);
+        assert_eq!(rec.made.load(Ordering::SeqCst), 2);
+    }
+
+    /// The slot takes a whole newer state over the one waiting, so a
+    /// sound's progress coalescing after the bank's completion still
+    /// shows 90; a publication not newer than one accepted, taken or
+    /// still waiting, is refused with its page, the waiting state and
+    /// page unchanged; another lifetime's is refused; the next lifetime
+    /// accepts from its first number.
+    #[test]
+    fn the_loading_slot_takes_only_newer_states() {
+        use super::LoadingSlot;
+
+        let text = chosen("C");
+        let mut state = crate::loading_state::LifetimeState::new(0, TimeUs(5), &text, None);
+        let mut slot = LoadingSlot::default();
+        let four = state.apply(LoadInput::Stage(Stage::Sounds { done: 4, files: 9 }));
+        let bank = state.apply(LoadInput::BankComplete);
+        let screen = state.apply(LoadInput::Stage(Stage::Screen));
+        assert!(slot.offer(0, Some(one_line("4")), Some(Box::new(four.clone()))));
+        assert!(slot.offer(0, None, Some(Box::new(bank))));
+        assert!(slot.offer(0, Some(one_line("screen")), Some(Box::new(screen))));
+        let (page, update) = slot.take(0).unwrap();
+        let update = update.unwrap();
+        assert_eq!(
+            (update.seq, update.percent, update.stage),
+            (3, 90, Stage::Screen)
+        );
+        assert_eq!(page.unwrap().lines[0].text, "screen");
+        // Older than the one taken.
+        assert!(!slot.offer(0, Some(one_line("old")), Some(Box::new(four.clone()))));
+        assert!(slot.take(0).is_none());
+        // Newer than the one taken but older than the one waiting: neither
+        // the state nor the page waiting changes.
+        let between = state.apply(LoadInput::Stage(Stage::Loudness));
+        let newer = state.apply(LoadInput::Stage(Stage::Scan));
+        assert!(slot.offer(0, Some(one_line("newer")), Some(Box::new(newer))));
+        assert!(!slot.offer(0, Some(one_line("old")), Some(Box::new(between))));
+        let (page, update) = slot.take(0).unwrap();
+        assert_eq!(update.unwrap().seq, 5);
+        assert_eq!(page.unwrap().lines[0].text, "newer");
+        // A page alone of the lifetime.
+        assert!(slot.offer(0, Some(one_line("page")), None));
+        assert!(slot.take(0).unwrap().1.is_none());
+        // Another lifetime's, then the next lifetime's.
+        assert!(!slot.offer(1, None, Some(Box::new(four.clone()))));
+        slot.end();
+        assert!(slot.take(0).is_none());
+        assert!(slot.offer(1, None, Some(Box::new(four))));
+    }
+
+    /// The render thread applies only a newer state over the one its
+    /// loading frames are built from, keeping its page when the take
+    /// brought none; a take of another lifetime enters it.
+    #[test]
+    fn the_render_thread_applies_only_newer_states() {
+        use super::{Mode, take_loading};
+
+        let text = chosen("C");
+        let mut state = crate::loading_state::LifetimeState::new(0, TimeUs(5), &text, None);
+        let one = Box::new(state.apply(LoadInput::Stage(Stage::Chart)));
+        let two = Box::new(state.apply(LoadInput::BankComplete));
+        let mode = take_loading(Mode::Idle, 0, Some(Box::new(one_line("A"))), Some(two));
+        let mode = take_loading(mode, 0, None, Some(one.clone()));
+        let Mode::Menu {
+            page,
+            update,
+            loading,
+            ..
+        } = &mode
+        else {
+            panic!("not the loading state");
+        };
+        assert_eq!((update.as_ref().unwrap().seq, *loading), (2, Some(0)));
+        assert_eq!(page.lines[0].text, "A");
+        let mode = take_loading(mode, 1, None, Some(one));
+        let Mode::Menu {
+            page,
+            update,
+            loading,
+            ..
+        } = &mode
+        else {
+            panic!("not the loading state");
+        };
+        assert_eq!((update.as_ref().unwrap().seq, *loading), (1, Some(1)));
+        assert!(page.lines.is_empty());
     }
 
     /// The attempt of `chart` the game would make under `preset`: the

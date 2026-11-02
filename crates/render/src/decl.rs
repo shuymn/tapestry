@@ -174,6 +174,12 @@ impl SkinBundle {
         self
     }
 
+    /// The producer of its attempts' and its loading frames' prepared
+    /// text, if any.
+    pub(crate) fn text_producer(&self) -> Option<&Arc<dyn AttemptText>> {
+        self.text.as_ref()
+    }
+
     /// The compiled skin.
     #[must_use]
     pub fn skin(&self) -> &Arc<Skin> {
@@ -258,6 +264,9 @@ struct Presented {
     lifetime: Option<u64>,
     /// Whether a frame was built on the state since it was made.
     built: bool,
+    /// The revision of the chosen chart's text installed for the
+    /// lifetime; `None` until some is.
+    text: Option<u64>,
 }
 
 impl fmt::Debug for LoadingPresentation {
@@ -281,6 +290,7 @@ impl LoadingPresentation {
             loading: bundle.skin.prepare_loading(bundle.scratch),
             lifetime: None,
             built: false,
+            text: None,
         })))
     }
 
@@ -314,6 +324,58 @@ impl LoadingPresentation {
         bundle
             .skin
             .install_loading_text(&mut self.lock().loading, which, table)
+    }
+
+    /// Installs the chosen chart's text of `revision` for `lifetime` into
+    /// the slots `which` names, `table`'s lines, or clears them without
+    /// one, if the state belongs to `lifetime` and no newer revision is
+    /// installed for it; no timer changes.
+    ///
+    /// # Errors
+    ///
+    /// [`LoadingTextError::Lifetime`](crate::LoadingTextError::Lifetime)
+    /// and [`LoadingTextError::Older`](crate::LoadingTextError::Older) for
+    /// text of another lifetime or an older revision, and a table that
+    /// does not fit: nothing changes.
+    pub(crate) fn install_revision(
+        &self,
+        bundle: &SkinBundle,
+        lifetime: u64,
+        revision: u64,
+        which: TextSlots,
+        table: Option<&TextTable>,
+    ) -> Result<(), crate::LoadingTextError> {
+        let mut p = self.lock();
+        if p.lifetime != Some(lifetime) {
+            return Err(crate::LoadingTextError::Lifetime);
+        }
+        if let Some(installed) = p.text.filter(|r| *r > revision) {
+            return Err(crate::LoadingTextError::Older {
+                installed,
+                revision,
+            });
+        }
+        match table {
+            Some(t) => bundle.skin.install_loading_text(&mut p.loading, which, t)?,
+            None => bundle.skin.clear_loading_text(&mut p.loading, which),
+        }
+        p.text = Some(revision);
+        Ok(())
+    }
+
+    /// Clears the slots `which` names, so they draw nothing from the next
+    /// frame; no timer changes.
+    pub(crate) fn clear_text(&self, bundle: &SkinBundle, which: TextSlots) {
+        bundle
+            .skin
+            .clear_loading_text(&mut self.lock().loading, which);
+    }
+
+    /// The revision of the chosen chart's text installed for the
+    /// lifetime the state belongs to, `None` before any.
+    #[must_use]
+    pub fn text_revision(&self) -> Option<u64> {
+        self.lock().text
     }
 
     /// The loading lifetime the state belongs to, `None` before its first
@@ -361,6 +423,7 @@ impl LoadingPresentation {
         if p.lifetime.is_some() {
             p.loading.reset();
             p.built = false;
+            p.text = None;
         }
         p.lifetime = Some(lifetime);
     }
@@ -382,6 +445,7 @@ impl LoadingPresentation {
             }
             if p.lifetime.is_some() {
                 p.loading.reset();
+                p.text = None;
             }
             p.lifetime = Some(f.lifetime);
         }

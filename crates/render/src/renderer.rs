@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use bms_model::Chart;
 use eval::Section;
-use skin_model::{AtlasLimits, BuildError, TextSlots, TextTable, TextTableError};
+use skin_model::{AtlasLimits, BuildError, ChartText, TextSlots, TextTable, TextTableError};
 use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
 use windows::Win32::Graphics::Dxgi::{DXGI_FRAME_STATISTICS, IDXGISwapChain3};
 use windows::Win32::System::Threading::WaitForSingleObject;
@@ -135,6 +135,29 @@ pub struct LoadingTextKey {
     resources: u64,
 }
 
+/// The chosen chart's loading text prepared for one loading lifetime and
+/// text revision on the installation its key names, waiting for the next
+/// frame's start to install it.
+struct StagedText {
+    key: LoadingTextKey,
+    lifetime: u64,
+    revision: u64,
+    which: TextSlots,
+    /// The producer's lines; `None` clears the slots.
+    table: Option<TextTable>,
+}
+
+impl StagedText {
+    /// The bytes it holds, itself and its lines.
+    fn bytes(&self) -> u64 {
+        let lines = self
+            .table
+            .as_ref()
+            .map_or(0, |t| t.len() * size_of::<Option<skin_model::TextImage>>());
+        u64::try_from(size_of::<Self>() + lines).unwrap_or(u64::MAX)
+    }
+}
+
 /// Why loading text was not installed: nothing changes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum LoadingTextError {
@@ -142,6 +165,18 @@ pub enum LoadingTextError {
     /// renderer or resources were replaced since.
     #[error("the loading text belongs to another installation or its replaced resources")]
     Stale,
+    /// It was prepared for another loading lifetime than the one the
+    /// presentation is in.
+    #[error("the loading text belongs to another loading lifetime")]
+    Lifetime,
+    /// A newer revision of the chosen chart's text is installed.
+    #[error("the loading text's revision {revision} is older than the installed {installed}")]
+    Older {
+        /// The revision installed.
+        installed: u64,
+        /// The revision refused.
+        revision: u64,
+    },
     /// The table does not fit the skin's text slots.
     #[error(transparent)]
     Table(#[from] TextTableError),
@@ -332,6 +367,9 @@ pub struct MemoryWitness {
     pub loading: u64,
     /// The staged installation's, when it is another installation's.
     pub staged_loading: u64,
+    /// The chosen chart's loading text prepared and waiting to install
+    /// ([`Renderer::prepare_loading_text`]).
+    pub staged_text: u64,
 }
 
 impl MemoryWitness {
@@ -349,6 +387,7 @@ impl MemoryWitness {
             .saturating_add(self.staged_attempt)
             .saturating_add(self.loading)
             .saturating_add(self.staged_loading)
+            .saturating_add(self.staged_text)
     }
 }
 
@@ -501,6 +540,9 @@ pub struct Renderer {
     /// The skin's refusal of a loading frame, with its loading lifetime:
     /// no loading frame of that lifetime is built again on this skin.
     loading_refused: Option<(u64, BuildError)>,
+    /// The chosen chart's loading text prepared and not yet installed:
+    /// at most one ([`prepare_loading_text`](Self::prepare_loading_text)).
+    staged_text: Option<StagedText>,
     /// An offscreen target's frame left pending on the GPU: at most one,
     /// as a swap chain's frame latency bounds a window's.
     pacer: Pacer<wgpu::SubmissionIndex>,
@@ -604,6 +646,7 @@ impl Renderer {
             started: None,
             refused: None,
             loading_refused: None,
+            staged_text: None,
             pacer: Pacer::default(),
             clear: wgpu::Color::BLACK,
             #[cfg(test)]
@@ -1146,6 +1189,7 @@ impl Renderer {
             staged_cpu: other.as_ref().map_or(0, |s| s.bundle().resident_bytes()),
             loading: installed.map_or(0, |i| i.loading().bytes()),
             staged_loading: other.as_ref().map_or(0, |s| s.loading().bytes()),
+            staged_text: self.staged_text.as_ref().map_or(0, StagedText::bytes),
             atlas: self.atlas.bytes(),
             staged_atlas: res.map_or(0, |r| r.atlas.bytes()),
             upload: res.map_or(0, |r| r.atlas.upload_bytes()),
@@ -1400,6 +1444,91 @@ impl Renderer {
         Ok(installed
             .loading()
             .install_text(installed.bundle(), which, table)?)
+    }
+
+    /// Prepares the chosen chart's text `chart` of `revision` for loading
+    /// lifetime `lifetime`, the slots `which` names, with the producer of
+    /// the installation in use, and holds it staged until
+    /// [`install_staged_loading_text`](Self::install_staged_loading_text),
+    /// replacing text staged before: at most one table waits. Before
+    /// recording opens and outside a frame's build, such as in a loading
+    /// frame's call before it builds: it allocates. Nothing is staged without
+    /// a declarative installation; without a producer, the staged text
+    /// clears the slots.
+    ///
+    /// # Errors
+    ///
+    /// The producer's refusal: nothing is staged.
+    pub fn prepare_loading_text(
+        &mut self,
+        lifetime: u64,
+        revision: u64,
+        which: TextSlots,
+        chart: &ChartText<'_>,
+    ) -> Result<(), SkinError> {
+        self.staged_text = None;
+        let (Some(key), Some(installed)) = (self.loading_text_key(), self.installed.as_ref())
+        else {
+            return Ok(());
+        };
+        let bundle = installed.bundle();
+        let table = match bundle.text_producer() {
+            Some(text) => text.prepare(bundle.skin(), chart, self.target())?,
+            None => None,
+        };
+        self.staged_text = Some(StagedText {
+            key,
+            lifetime,
+            revision,
+            which,
+            table,
+        });
+        Ok(())
+    }
+
+    /// The loading lifetime and revision of the text staged, if any.
+    #[must_use]
+    pub fn staged_loading_text(&self) -> Option<(u64, u64)> {
+        self.staged_text.as_ref().map(|t| (t.lifetime, t.revision))
+    }
+
+    /// Installs the text staged, taking it, from the next loading frame
+    /// on, if it is still the installation's (its key), of the lifetime
+    /// its presentation is in, and no older than the revision installed:
+    /// text of another bundle, renderer, resources, lifetime or an older
+    /// revision is dropped. `Ok(false)` with nothing staged.
+    ///
+    /// # Errors
+    ///
+    /// Why the staged text was dropped.
+    pub fn install_staged_loading_text(&mut self) -> Result<bool, LoadingTextError> {
+        let Some(staged) = self.staged_text.take() else {
+            return Ok(false);
+        };
+        if self.loading_text_key() != Some(staged.key) {
+            return Err(LoadingTextError::Stale);
+        }
+        let Some(installed) = self.installed.as_ref() else {
+            return Err(LoadingTextError::Stale);
+        };
+        installed.loading().install_revision(
+            installed.bundle(),
+            staged.lifetime,
+            staged.revision,
+            staged.which,
+            staged.table.as_ref(),
+        )?;
+        Ok(true)
+    }
+
+    /// Clears the installed presentation's slots `which` names, so they
+    /// draw nothing from its next loading frame until text is installed
+    /// for them again; no timer changes. Nothing without a declarative
+    /// installation.
+    pub fn clear_loading_text(&mut self, which: TextSlots) {
+        if let Some(installed) = &self.installed {
+            installed.loading().clear_text(installed.bundle(), which);
+        }
     }
 
     /// The loading refusal kept for lifetime `lifetime`, if any.

@@ -21,13 +21,15 @@ use std::time::Duration;
 
 use bms_model::{Chart, ChartBuilder, TimeUs};
 use common::{GAUGES, VISIBLE, attempt, context, input, offscreen, view};
-use decl_support::{ANIMATION, BACKGROUND, Look, WHEN_MARK, WHEN_SLOT, bundle};
+use decl_support::{
+    ANIMATION, ARTIST, BACKGROUND, FULL_TITLE, GENRE, Look, TITLE, WHEN_MARK, WHEN_SLOT, bundle,
+};
 use render::text::MenuText;
 use render::{
     AttemptInput, CommitError, FrameInput, Gpu, Installation, LoadingFrame, LoadingTextError,
     PlaySkin, PreparedToken, RenderError, Renderer, SkinBundle, SkinError, Sprite, SpriteBatch,
 };
-use skin_model::{BuildError, TextImage, TextSlots, TextTable, TextTableError};
+use skin_model::{BuildError, TextField, TextImage, TextSlots, TextTable, TextTableError};
 
 const BLACK: [u8; 3] = [0; 3];
 const RED: [u8; 3] = [255, 0, 0];
@@ -604,4 +606,150 @@ fn a_replacement_counts_both_presentations() {
         fresh > runtime && fresh - runtime < size,
         "{fresh} {runtime}"
     );
+}
+
+/// The chosen chart's fields as a skin's text resolves them, an
+/// unavailable one empty.
+fn chosen<'a>(title: &'a str, artist: &'a str, genre: &'a str) -> skin_model::ChartText<'a> {
+    skin_model::ChartText {
+        title,
+        subtitle: "",
+        artist,
+        subartist: "",
+        genre,
+    }
+}
+
+/// Red, with the loading elements and the chosen chart's text slots.
+fn chart_texts(rgba: [u8; 4]) -> Look {
+    Look {
+        loading: true,
+        chart_text: true,
+        ..Look::left(rgba)
+    }
+}
+
+/// The RGB of the title, artist, genre and full title slots in `p`.
+fn texts(p: &[u8]) -> [[u8; 3]; 4] {
+    [TITLE, ARTIST, GENRE, FULL_TITLE].map(|r| at(p, r))
+}
+
+/// The chosen chart's text prepared between frames waits staged, counted
+/// in the memory witness, and installs at the next frame's start only on
+/// the installation, lifetime and revision it was prepared for: until
+/// then its slots draw nothing; only the fields available draw; text
+/// prepared on bundle A is dropped once bundle B was committed in the
+/// same lifetime with the same revision; text of another lifetime and an
+/// older revision are dropped too. A cleared field's slots and the
+/// composite using them draw nothing while the others stay.
+#[test]
+fn chosen_chart_text_installs_only_where_it_was_prepared() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut r = offscreen(1_920, 1_080);
+    let text = MenuText::new(&r);
+    let (a, producer) = bundle(&r, dir.path(), &chart_texts([255, 0, 0, 255]));
+    let (b, _) = bundle(&r, dir.path(), &chart_texts([0, 255, 0, 255]));
+    install(&mut r, &a, 1);
+    r.enter_loading(1);
+    assert_eq!(r.memory().staged_text, 0);
+    let all = TextSlots::field(TextField::Title)
+        .with(TextSlots::field(TextField::Artist))
+        .with(TextSlots::field(TextField::Genre));
+    r.prepare_loading_text(1, 1, all, &chosen("B", "", ""))
+        .unwrap();
+    assert_eq!(r.staged_loading_text(), Some((1, 1)));
+    assert!(r.memory().staged_text > 0);
+    // Staged, nothing of it draws yet.
+    assert_eq!(texts(&loading(&mut r, &text, &frame_at(1, 0))), [BLACK; 4]);
+    assert_eq!(r.install_staged_loading_text(), Ok(true));
+    assert_eq!(r.memory().staged_text, 0);
+    assert_eq!(
+        texts(&loading(&mut r, &text, &frame_at(1, 16))),
+        [RED, BLACK, BLACK, RED],
+        "the title and the full title, nothing unavailable"
+    );
+    assert_eq!(
+        producer.unwrap().charts.lock().unwrap().last().unwrap(),
+        &["B".to_owned(), String::new(), String::new()]
+    );
+
+    // The title cleared: its slot and the full title's draw nothing.
+    r.clear_loading_text(TextSlots::field(TextField::Title));
+    assert_eq!(texts(&loading(&mut r, &text, &frame_at(1, 32))), [BLACK; 4]);
+    r.prepare_loading_text(1, 2, all, &chosen("B", "b", ""))
+        .unwrap();
+    assert_eq!(r.install_staged_loading_text(), Ok(true));
+    assert_eq!(
+        texts(&loading(&mut r, &text, &frame_at(1, 48))),
+        [RED, RED, BLACK, RED]
+    );
+    r.clear_loading_text(TextSlots::field(TextField::Artist));
+    assert_eq!(
+        texts(&loading(&mut r, &text, &frame_at(1, 64))),
+        [RED, BLACK, BLACK, RED],
+        "the other slots stay"
+    );
+
+    // Prepared on A, then B committed within the lifetime: dropped.
+    r.prepare_loading_text(1, 3, all, &chosen("B", "b", "g"))
+        .unwrap();
+    install(&mut r, &b, 2);
+    r.enter_loading(1);
+    assert_eq!(
+        r.install_staged_loading_text(),
+        Err(LoadingTextError::Stale)
+    );
+    assert_eq!(r.staged_loading_text(), None);
+    assert_eq!(texts(&loading(&mut r, &text, &frame_at(1, 80))), [BLACK; 4]);
+    r.prepare_loading_text(1, 3, all, &chosen("B", "b", "g"))
+        .unwrap();
+    assert_eq!(r.install_staged_loading_text(), Ok(true));
+    assert_eq!(
+        texts(&loading(&mut r, &text, &frame_at(1, 96))),
+        [GREEN, GREEN, GREEN, GREEN]
+    );
+    // An older revision and another lifetime are dropped.
+    r.prepare_loading_text(1, 2, all, &chosen("", "", ""))
+        .unwrap();
+    assert_eq!(
+        r.install_staged_loading_text(),
+        Err(LoadingTextError::Older {
+            installed: 3,
+            revision: 2
+        })
+    );
+    r.prepare_loading_text(2, 4, all, &chosen("", "", ""))
+        .unwrap();
+    assert_eq!(
+        r.install_staged_loading_text(),
+        Err(LoadingTextError::Lifetime)
+    );
+    assert_eq!(
+        texts(&loading(&mut r, &text, &frame_at(1, 112))),
+        [GREEN, GREEN, GREEN, GREEN]
+    );
+}
+
+/// Text requested again and again keeps one table staged, the newest,
+/// and the memory witness counts it: the same as one request's.
+#[test]
+fn staged_chart_text_is_bounded() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut r = offscreen(1_920, 1_080);
+    let (a, _) = bundle(&r, dir.path(), &chart_texts([255, 0, 0, 255]));
+    install(&mut r, &a, 1);
+    r.enter_loading(1);
+    r.prepare_loading_text(1, 1, TextSlots::ALL, &chosen("A", "", ""))
+        .unwrap();
+    let one = r.memory();
+    assert!(one.staged_text > 0);
+    for revision in 2..20 {
+        r.prepare_loading_text(1, revision, TextSlots::ALL, &chosen("A", "a", ""))
+            .unwrap();
+        assert_eq!(r.memory(), one, "revision {revision}");
+    }
+    assert_eq!(r.staged_loading_text(), Some((1, 19)));
+    assert_eq!(r.install_staged_loading_text(), Ok(true));
+    assert_eq!(r.memory().staged_text, 0);
+    assert_eq!(r.install_staged_loading_text(), Ok(false));
 }

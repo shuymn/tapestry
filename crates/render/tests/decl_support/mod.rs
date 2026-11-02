@@ -4,7 +4,9 @@
 //! prepared line a supplied producer gives, with markers of the shown
 //! gauge's look and of the judgment timer, and with a loading
 //! presentation: an untimed background, an animation on the `loading`
-//! timer and a mark on a `when` timer whose condition holds while loading.
+//! timer and a mark on a `when` timer whose condition holds while loading;
+//! the lanes and a gauge; the chosen chart's title, artist, genre and full
+//! title; and marks following the load's progress.
 
 #![allow(dead_code)]
 
@@ -12,15 +14,17 @@ use std::fs::File;
 use std::io::BufWriter;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use bms_model::TimeUs;
 use render::{AttemptText, ClipTable, Renderer, SkinBundle, SkinError};
 use skin_model::{
     Align, Anchor, Blend, ChartText, ClipId, Ease, ElementDef, End, FileDef, Filter, Fit, FontRef,
-    FrameUv, ImageDef, KeyDef, Overflow, PLAY, Place, Region, RegionDef, Scope, Sheet, Side, Skin,
-    SkinDef, Source, TextDef, TextField, TextImage, TextTable, TextValue, TimerRef, Track, Ty,
-    Variant, WidgetDefs, compile,
+    FrameUv, GaugeDef, GaugeLook, GaugeParts, ImageDef, KeyDef, LaneParts, LaneStyle, LanesDef,
+    Layout, Motion, Overflow, PLAY, Place, Region, RegionDef, Scope, Sheet, Side, Skin, SkinDef,
+    Source, TextDef, TextField, TextImage, TextTable, TextValue, TimerRef, Track, Ty, Variant,
+    WidgetDefs, compile,
 };
 
 /// Writes a `side`-texel-square PNG of `rgba` at `path`.
@@ -89,6 +93,20 @@ pub struct Look {
     /// `loading` timer, and over [`WHEN_MARK`] on `when` timer 0, whose
     /// condition (`load.percent >= 0`) holds in every loading frame.
     pub loading: bool,
+    /// The lanes, their judgment line drawn over [`LINE_AT`], and a gauge
+    /// of 50 segments over [`GAUGE`], every part drawing the image,
+    /// both on the untimed `screen` timer.
+    pub structure: bool,
+    /// Four text elements on the untimed `screen` timer, each a 100×100
+    /// square where its line draws: the title over [`TITLE`], the artist
+    /// over [`ARTIST`], the genre over [`GENRE`] and the full title over
+    /// [`FULL_TITLE`].
+    pub chart_text: bool,
+    /// With `loading`, two progress marks: over [`PERCENT_MARK`] while
+    /// `load.percent` reads 40, and over [`PROGRESS_MARK`] on `when`
+    /// timer 1 ([`PROGRESS_SLOT`]), whose condition is
+    /// `load.percent >= 40`.
+    pub progress: bool,
 }
 
 /// Where the untimed loading background draws, in canvas pixels.
@@ -99,6 +117,25 @@ pub const ANIMATION: [i32; 4] = [200, 900, 100, 100];
 pub const WHEN_MARK: [i32; 4] = [1_700, 900, 100, 100];
 /// The `when` timer's slot: the first after the built-in timers.
 pub const WHEN_SLOT: u16 = skin_model::timer::BUILTIN;
+
+/// A canvas pixel on the lanes' judgment line.
+pub const LINE_AT: (u32, u32) = (300, 882);
+/// Where the gauge draws.
+pub const GAUGE: [i32; 4] = [100, 300, 500, 20];
+/// Where the title's line draws.
+pub const TITLE: [i32; 4] = [100, 600, 100, 100];
+/// Where the artist's line draws.
+pub const ARTIST: [i32; 4] = [300, 600, 100, 100];
+/// Where the genre's line draws.
+pub const GENRE: [i32; 4] = [500, 600, 100, 100];
+/// Where the full title's line draws.
+pub const FULL_TITLE: [i32; 4] = [700, 600, 100, 100];
+/// Where the mark shown while `load.percent` reads 40 draws.
+pub const PERCENT_MARK: [i32; 4] = [1_000, 600, 100, 100];
+/// Where the mark on the progress `when` timer draws.
+pub const PROGRESS_MARK: [i32; 4] = [1_200, 600, 100, 100];
+/// The progress `when` timer's slot.
+pub const PROGRESS_SLOT: u16 = skin_model::timer::BUILTIN + 1;
 
 /// Where the gauge-look marker draws, in canvas pixels.
 pub const GAUGE_MARKER: [i32; 4] = [1_200, 100, 100, 100];
@@ -118,18 +155,23 @@ impl Look {
             text_on_screen: false,
             markers: false,
             loading: false,
+            structure: false,
+            chart_text: false,
+            progress: false,
         }
     }
 }
 
-/// A text producer giving slot 0 the image of the fixture's frame 0 for a
-/// chart with a title, and no line for one without, counting its calls,
-/// or refusing while `refuse` is set.
+/// A text producer giving every text slot whose string resolves to
+/// something the image of the fixture's frame 0, and no line to the
+/// others, counting its calls and noting each chart's title, artist and
+/// genre, or refusing while `refuse` is set.
 #[derive(Debug)]
 pub struct Text {
     pub uv: FrameUv,
     pub calls: AtomicU32,
     pub refuse: AtomicBool,
+    pub charts: Mutex<Vec<[String; 3]>>,
 }
 
 impl AttemptText for Text {
@@ -137,9 +179,14 @@ impl AttemptText for Text {
         &self,
         skin: &Skin,
         chart: &ChartText<'_>,
-        _target: [u32; 2],
+        target: [u32; 2],
     ) -> Result<Option<TextTable>, SkinError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        self.charts.lock().unwrap().push([
+            chart.title.to_owned(),
+            chart.artist.to_owned(),
+            chart.genre.to_owned(),
+        ]);
         if self.refuse.load(Ordering::SeqCst) {
             return Err(SkinError {
                 reason: "the text cannot be prepared".to_owned(),
@@ -147,10 +194,10 @@ impl AttemptText for Text {
         }
         let line = TextImage::new(self.uv, [0.0, 0.0, 1.0, 1.0], 1.0);
         let mut slots = vec![None; skin.text_slots()];
-        if !chart.title.is_empty()
-            && let Some(slot) = slots.first_mut()
-        {
-            *slot = line;
+        for request in skin.text_requests(chart, target, &Layout::AUTHOR) {
+            if let Some(slot) = slots.get_mut(usize::from(request.slot)) {
+                *slot = line;
+            }
         }
         Ok(Some(TextTable::new(slots)))
     }
@@ -212,6 +259,74 @@ pub fn skin(dir: &Path, look: &Look) -> Skin {
             ..image(JUDGE_MARKER, false)
         });
     }
+    if look.chart_text {
+        for (field, rect) in [
+            (TextField::Title, TITLE),
+            (TextField::Artist, ARTIST),
+            (TextField::Genre, GENRE),
+            (TextField::FullTitle, FULL_TITLE),
+        ] {
+            let slot = u32::try_from(widgets.texts.len()).unwrap();
+            widgets.texts.push(TextDef {
+                value: TextValue::Field(field),
+                font: FontRef::Default,
+                align: Align::Left,
+                overflow: Overflow::Spill,
+            });
+            elements.push(ElementDef {
+                source: Source::Text(slot),
+                timer: TimerRef::Builtin(skin_model::timer::SCREEN),
+                ..image(rect, false)
+            });
+        }
+    }
+    let mut lanes = None;
+    if look.structure {
+        lanes = Some(LanesDef {
+            style: LaneStyle::Simple,
+            lanes: std::array::from_fn(|k| {
+                let k = i32::try_from(k).unwrap();
+                [160 + 64 * k, 64]
+            }),
+            scratch: Side::Left,
+            top: 80,
+            line: 880,
+            bottom: 960,
+            note_h: 16,
+            mine_h: 8,
+            line_h: 6,
+            parts: LaneParts {
+                note: [0; 8],
+                head: [0; 8],
+                tail: [0; 8],
+                body_on: [0; 8],
+                body_off: [0; 8],
+                mine: [0; 8],
+                line: Some(0),
+            },
+            bar_groups: Vec::new(),
+        });
+        let parts = GaugeParts {
+            front: [0; 2],
+            back: [0; 2],
+            tip: [0; 2],
+        };
+        widgets.gauges.push(GaugeDef {
+            segments: 50,
+            looks: [parts; GaugeLook::COUNT],
+            motion: Motion::Still,
+        });
+        elements.push(ElementDef {
+            source: Source::Lanes,
+            timer: TimerRef::Builtin(skin_model::timer::SCREEN),
+            ..image([0; 4], false)
+        });
+        elements.push(ElementDef {
+            source: Source::Gauge(0),
+            timer: TimerRef::Builtin(skin_model::timer::SCREEN),
+            ..image(GAUGE, false)
+        });
+    }
     let mut whens = Vec::new();
     if look.loading {
         let scope = Scope::new(&PLAY);
@@ -243,6 +358,18 @@ pub fn skin(dir: &Path, look: &Look) -> Skin {
             timer: TimerRef::When(0),
             ..image(WHEN_MARK, false)
         });
+        if look.progress {
+            whens.push(compile("load.percent >= 40", &scope, Ty::Bool).unwrap());
+            elements.push(ElementDef {
+                timer: TimerRef::Builtin(skin_model::timer::SCREEN),
+                visible: Some(compile("load.percent == 40", &scope, Ty::Bool).unwrap()),
+                ..image(PERCENT_MARK, false)
+            });
+            elements.push(ElementDef {
+                timer: TimerRef::When(1),
+                ..image(PROGRESS_MARK, false)
+            });
+        }
     }
     Skin::new(SkinDef {
         fit: Fit::Fixed,
@@ -252,7 +379,7 @@ pub fn skin(dir: &Path, look: &Look) -> Skin {
         }; Region::COUNT],
         whens,
         sheet,
-        lanes: None,
+        lanes,
         elements,
         widgets,
         bomb_up_to: None,
@@ -268,13 +395,14 @@ pub fn bundle(r: &Renderer, dir: &Path, look: &Look) -> (Arc<SkinBundle>, Option
     let uv = atlas.uvs().get(0).unwrap();
     let clips = ClipTable::new(look.clip.into_iter().collect()).unwrap();
     let bundle = SkinBundle::new(Arc::new(skin), atlas, clips, Side::Left).unwrap();
-    if !look.text {
+    if !look.text && !look.chart_text {
         return (Arc::new(bundle), None);
     }
     let text = Arc::new(Text {
         uv,
         calls: AtomicU32::new(0),
         refuse: AtomicBool::new(false),
+        charts: Mutex::new(Vec::new()),
     });
     let producer: Arc<dyn AttemptText> = text.clone();
     (Arc::new(bundle.with_text(producer)), Some(text))
