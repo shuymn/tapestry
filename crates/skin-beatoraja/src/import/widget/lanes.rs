@@ -16,7 +16,7 @@ use super::super::report::{
     DeviationId, LaneApprox, NoteFallback, NoteKind, PartWhy, Severity, Span,
 };
 use super::super::track::{self, Stretch};
-use super::super::{Common, Cx, Dst, Opts, RUNTIME_OFFSETS};
+use super::super::{Colour, Common, Cx, Dst, Opts, RUNTIME_OFFSETS};
 use super::SrcImage;
 use super::note_parts::LANES;
 use crate::error::ImportError;
@@ -560,7 +560,8 @@ impl Cx<'_> {
             return Ok(false);
         }
         let (o, rotates) = self.configured(&dst.offsets);
-        let keys = track::read(self.def, &dst.keys, None)?;
+        // A probe: the element's own reading draws the colour and reports.
+        let keys = self.read_keys(dst, None, Colour::Unused)?;
         if rotates || keys.keys.iter().any(|k| k.angle != 0) {
             return Ok(false);
         }

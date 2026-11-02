@@ -183,14 +183,7 @@ pub enum PracticeError {
 /// "Practice Speed Changes").
 #[must_use]
 pub(crate) fn mapped(t: TimeUs, speed: Speed) -> TimeUs {
-    mapped_wide(i128::from(t.0), speed)
-}
-
-/// [`mapped`] for a 1× time wider than a [`TimeUs`], such as one past its
-/// range by an added pad: only the real time saturates.
-#[must_use]
-pub(crate) fn mapped_wide(t: i128, speed: Speed) -> TimeUs {
-    let real = (t * 20).div_euclid(i128::from(speed.twentieths()));
+    let real = (i128::from(t.0) * 20).div_euclid(i128::from(speed.twentieths()));
     TimeUs(i64::try_from(real).unwrap_or(if real < 0 { i64::MIN } else { i64::MAX }))
 }
 

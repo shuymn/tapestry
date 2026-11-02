@@ -7,7 +7,7 @@ mod common;
 
 use common::play::round;
 use common::{has, import_body};
-use skin_beatoraja::{NoteKind, TrackWhy};
+use skin_beatoraja::{NoteKind, Severity, TrackWhy};
 
 /// A key: time in ms and the rect, y up.
 type Key = (i64, [i32; 4]);
@@ -112,13 +112,25 @@ const R: [i32; 4] = [10, 20, 30, 40];
 
 #[test]
 fn colour_is_clamped_per_key() {
-    let b = r#""image": [{"id": "i", "src": "a", "w": 64, "h": 64}],
+    let body = r#""image": [{"id": "i", "src": "a", "w": 64, "h": 64}],
                "destination": [{"id": "i", "dst": [{"w": 1, "h": 1, "a": 300, "r": -5, "g": 128}]}]"#;
-    let q = import_body(b).quads(0);
+    let loaded = import_body(body);
+    // One line, a fallback located at the clamped key.
+    let notes = &loaded.report().notes;
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert_eq!(notes[0].kind, NoteKind::ColourClamped);
+    assert_eq!(notes[0].severity, Severity::Fallback);
+    let at = notes[0].at.unwrap();
+    // The key's `{` on the destination's line.
+    assert_eq!((at.line, at.col), (3, 52), "{at:?}");
+    let q = loaded.quads(0);
     // RGBA: r −5 → 0, g 128, b 255, a 300 → 255.
     let [r, g, b, a] = q[0].color;
     assert_eq!([r, b, a], [0.0, 1.0, 1.0]);
     assert!((g - 128.0 / 255.0).abs() < 1e-6);
+    // In range, no line.
+    let fine = import_body(&body.replace("300", "255").replace("-5", "0"));
+    assert!(fine.report().notes.is_empty());
 }
 
 #[test]

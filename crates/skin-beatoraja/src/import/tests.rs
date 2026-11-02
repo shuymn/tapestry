@@ -252,11 +252,11 @@ fn hidden_plus_of_a_malformed_file_is_admitted_then_dropped() {
 }
 
 #[test]
-fn a_trailing_null_part_admits_nothing() {
+fn a_null_part_admits_nothing() {
     let eight = format!("[{}]", [r#""p""#; 8].join(", "));
     let json = lanes("", "").replace(
         &format!(r#""mine": {eight}"#),
-        &format!(r#""mine": [{}, null]"#, [r#""p""#; 8].join(", ")),
+        &format!(r#""mine": [{}, null]"#, [r#""p""#; 7].join(", ")),
     );
     let (r, _, admits) = run(&json);
     assert!(matches!(
@@ -265,7 +265,7 @@ fn a_trailing_null_part_admits_nothing() {
             part: super::CriticalPart::Lanes,
             why: NoteKind::NotePart {
                 field: "mine",
-                why: super::PartWhy::NullEntry { index: 8 },
+                why: super::PartWhy::NullEntry { index: 7 },
             },
             ..
         })

@@ -205,6 +205,17 @@ fn kerning_moves_the_pen() {
         [0, 100, 40, 10],
     );
     close(r[1], [12.0, 100.0, 4.0, 8.0]);
+    // A supplementary glyph kerns as any other, before and after.
+    let smile: Ch = (0x1_F600, [10, 4, 8], [0, 1, 6]);
+    let r = one(
+        &[A, b, smile],
+        &[[0x1_F600, 66, -2], [65, 0x1_F600, -1]],
+        "A\u{1F600}B",
+        (Align::Left, Overflow::Spill),
+        [0, 100, 40, 10],
+    );
+    close(r[1], [13.0, 100.0, 4.0, 8.0]);
+    close(r[2], [17.0, 100.0, 4.0, 8.0]);
 }
 
 #[test]
@@ -289,15 +300,16 @@ fn missing_glyphs_follow_the_chain() {
         );
         (d.0, d.1)
     };
-    // The primary, a fallback, the other tilde, and for `Z` the missing
-    // glyph (no `□` in either file); a supplementary character without a
-    // glyph is skipped.
+    // The primary, a fallback, the other tilde, and for `Z` and a
+    // supplementary character alike the missing glyph (no `□` in either
+    // file).
     let r = rects(load(s.clone(), vec![line(0, "AB\u{301C}Z\u{1F601}A")]).unwrap());
     assert_eq!(
         r.iter().map(width).collect::<Vec<_>>(),
-        [1.0, 5.0, 2.0, 4.0, 1.0]
+        [1.0, 5.0, 2.0, 4.0, 4.0, 1.0]
     );
-    close(r[4], [40.0, 100.0, 1.0, 8.0]);
+    close(r[4], [40.0, 100.0, 4.0, 8.0]);
+    close(r[5], [50.0, 100.0, 1.0, 8.0]);
     // `□` comes before the missing glyph; the supplementary glyph is the
     // file's own.
     let r = rects(load(s, vec![line(1, "Z\u{1F600}\u{1F601}")]).unwrap());

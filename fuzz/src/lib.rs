@@ -1959,7 +1959,7 @@ fn check_fnt(f: &FntFile) {
     }
     for k in f.kernings() {
         assert!(
-            f.glyph(u32::from(k.first)).is_some(),
+            f.glyph(k.first).is_some(),
             "a kerning pair without its first glyph"
         );
     }

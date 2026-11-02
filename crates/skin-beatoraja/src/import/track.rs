@@ -34,22 +34,6 @@ impl SrcKey {
     }
 }
 
-/// A combo key's raw `x` moved left by half its raw `w` times `digits`
-/// (`i32::MIN` marks an omitted field): both omitted stay omitted and
-/// inherit; `None`, a range error, when only one is omitted, when the
-/// arithmetic leaves `i32`, or when the result is the omission mark. The
-/// source's wrapping `int` arithmetic on such keys is not reproduced
-/// (stage3.md, the judge mapping).
-fn shift(x: i32, w: i32, digits: i32) -> Option<i32> {
-    match (x, w) {
-        (i32::MIN, i32::MIN) => Some(i32::MIN),
-        (i32::MIN, _) | (_, i32::MIN) => None,
-        _ => x
-            .checked_sub(w.checked_mul(digits)? / 2)
-            .filter(|&x| x != i32::MIN),
-    }
-}
-
 /// A destination's keys, in source order, with what they set apart from
 /// the track.
 #[derive(Debug)]
@@ -59,17 +43,22 @@ pub(crate) struct Keys {
     pub(crate) acc: i32,
     /// Some key sets all four clip fields.
     pub(crate) clip: bool,
+    /// The first key whose colour was clamped.
+    pub(crate) clamped: Option<u32>,
 }
 
 /// Reads the keys `ids` of a destination with the source's inheritance
 /// (`JSONSkinLoader.java:425-482` at `0.8.9`): the first key's omitted
 /// fields default to 0 (255 for colour), a later key's to the previous
 /// key's. Colour is clamped per key, as libGDX's `Color` constructor
-/// does (`Color.java:88` at 1.9.9).
+/// does (`Color.java:88` at 1.9.9), so an imported skin looks as its
+/// author saw it rather than being refused.
 ///
-/// With `digits`, each key's raw `x` first moves left by half `w` times
-/// the digits, before any inheritance, as a judge's combo does
-/// (`JsonPlaySkinObjectLoader.java:268-270`); see [`shift`].
+/// With `digits`, as for a judge's combo, whose raw `x` moves left by
+/// half its raw `w` times its digits (`JsonPlaySkinObjectLoader.java:
+/// 268-270`), a key gives `x` and `w` together or omits both, so the
+/// moved `x` it inherits is the moved one; one omitted alone is a range
+/// error. The move itself is exact, at placement.
 pub(crate) fn read(
     def: &mut Definition,
     ids: &[u32],
@@ -98,7 +87,7 @@ pub(crate) fn read(
     ];
     let mut keys = Vec::with_capacity(ids.len());
     let mut prev: Option<[i32; 15]> = None;
-    let (mut acc, mut clip) = (0, false);
+    let (mut acc, mut clip, mut clamped) = (0, false, None);
     for &id in ids {
         let fields = def.fields(id, FIELDS);
         let mut v = [i32::MIN; 15];
@@ -107,11 +96,13 @@ pub(crate) fn read(
                 *slot = def.int(f, name)?;
             }
         }
-        if let (Some(d), [_, x, _, w, ..]) = (digits, &mut v) {
-            *x = shift(*x, *w, d).ok_or_else(|| ImportError::Range {
+        if let (Some(_), [_, x, _, w, ..]) = (digits, &v)
+            && (*x == i32::MIN) != (*w == i32::MIN)
+        {
+            return Err(ImportError::Range {
                 at: def.loc(id),
                 field: "x",
-            })?;
+            });
         }
         for (i, slot) in v.iter_mut().enumerate() {
             if *slot == i32::MIN {
@@ -126,15 +117,24 @@ pub(crate) fn read(
             acc = a_cc;
         }
         clip |= [cx, cy, cw, ch].iter().all(|&c| c != i32::MIN);
+        let color = [a, r, g, b];
+        if clamped.is_none() && color.iter().any(|c| !(0..=255).contains(c)) {
+            clamped = Some(id);
+        }
         keys.push(SrcKey {
             at: i64::from(t),
             rect: [x, y, w, h],
-            color: [a, r, g, b].map(|c| c.clamp(0, 255)),
+            color: color.map(|c| c.clamp(0, 255)),
             angle,
         });
         prev = Some(v);
     }
-    Ok(Keys { keys, acc, clip })
+    Ok(Keys {
+        keys,
+        acc,
+        clip,
+        clamped,
+    })
 }
 
 /// An accepted track: keys strictly increasing from 0 or later.

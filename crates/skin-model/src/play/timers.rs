@@ -17,10 +17,6 @@ use crate::expr::{Program, State, TIMER_OFF};
 use crate::widget::gauge::GaugeLook;
 use crate::widget::lanes::LaneView;
 
-/// How long past the notes' end the play keeps playing before it
-/// finishes, in ms (`play/BMSPlayer.java:66`).
-const FINISH_MARGIN_MS: i64 = 5_000;
-
 /// A full gauge's value per ‰ of the gauge field.
 const GAUGE_UNIT: i64 = GaugeValue::FULL.0 / GAUGE_PERMILLE as i64;
 
@@ -246,7 +242,9 @@ impl Play {
             Some(d) => (round_duration(d)?, 1),
         };
         // Sequenced as the source: three fifths of the rounded duration
-        // (`skin/property/IntegerPropertyFactory.java:292-314`).
+        // (`skin/property/IntegerPropertyFactory.java:292-314`), so an
+        // imported skin shows the green number players compare to carry
+        // their settings over.
         let green = i32::try_from(i64::from(duration_ms) * 3 / 5).ok()?;
         let (bpm_min, bpm_max, bpm_range_valid) = self.bpm_range.map_or(Some((0, 0, 0)), |b| {
             Some((
@@ -385,9 +383,10 @@ impl Play {
         let play = (now >= self.play_at).then_some(self.play_at);
         let shown = frame.gauges.get(frame.gauge);
         let failed = shown.and_then(|g| g.failed_at);
-        // The reducer's start, masked during READY and while the
-        // snapshot is below the maximum: a dropped below-maximum effect
-        // cannot leave it on (`play/BMSPlayer.java:639`).
+        // The reducer's start, masked during READY, so skins animate the
+        // full gauge from the start of play, and while the snapshot is
+        // below the maximum: a dropped below-maximum effect cannot leave
+        // it on (`play/BMSPlayer.java:639`).
         let gauge_max = match (
             play,
             self.reducer.gauge_max.get(frame.gauge).copied().flatten(),
@@ -397,16 +396,12 @@ impl Play {
             (Some(_), Some(at), Some(g), Some(&top)) if g.value >= top => Some(at),
             _ => None,
         };
-        // Sampled on whole ms of the play clock, at the first playing
-        // frame past the notes' end and before the finish
-        // (`play/BMSPlayer.java:683-697`); once set, only this keeps it.
+        // Started at the notes' end itself by the first playing frame at
+        // or past it, however late that frame comes; once set, only this
+        // keeps it.
         let mut last_note = self.timer(timer::LAST_NOTE);
-        if last_note.is_none() && frame.playing {
-            let at = now.0.div_euclid(1_000);
-            let end = self.last_note_end.0.div_euclid(1_000);
-            if end < at && at <= end.saturating_add(FINISH_MARGIN_MS) {
-                last_note = Some(now);
-            }
+        if last_note.is_none() && frame.playing && now >= self.last_note_end {
+            last_note = Some(self.last_note_end);
         }
         let beat = ready.and_then(|_| self.beat_start(now, frame.display_offset));
         let judge = self.reducer.judge;

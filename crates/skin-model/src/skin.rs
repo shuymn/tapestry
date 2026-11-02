@@ -1269,6 +1269,7 @@ impl Skin {
             .into_iter()
             .map(|d| ImageChoice {
                 value: d.value,
+                past_table: d.past_table,
                 parts: d
                     .choices
                     .into_iter()
