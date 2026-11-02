@@ -724,7 +724,6 @@ impl Scanner<'_> {
             let re = verify::evaluate_record(record, &loaded, None).map_err(|e| Refusal::of(&e))?;
             let verified = Verified {
                 completed: re.evaluation.completed,
-                random: !loaded.identity.random_results.is_empty(),
             };
             Ok(Contribution::of(
                 id,

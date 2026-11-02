@@ -22,7 +22,7 @@ The stage exits when song selection, play, results and retry can be played repea
 - the library database is rebuilt when its schema version changes (D5);
 - no egui in stage 2, and library roots live in `device.toml` (D4);
 - difficulty tables, song preview and pitch-preserving speed are deferred (§1);
-- personal bests for charts with `#RANDOM` are left undecided, and such charts get no best in stage 2 (D8);
+- a chart with `#RANDOM` keeps one best per file, every draw contributing (D8);
 - a what-if of a completed play runs to its own final deadline (D9);
 - the gauge denominator in practice is the whole chart's note count (D13);
 - a practice round ends with a short ring-out once the section is judged: the BGM plays on without notes, fades out, and the next round starts (D15);
@@ -56,7 +56,6 @@ The stage exits when song selection, play, results and retry can be played repea
   - song preview playback;
   - pitch-preserving speed change (needs a time stretcher, so in stage 2 speed changes pitch);
   - `egui` (D4);
-  - how personal bests treat charts with `#RANDOM` (D8);
   - creating and editing presets in a game screen, which arrives with an in-game settings screen (D24).
 - **Not built yet:** CN/HCN, automatic offset adjustment, and its recorded stream (section evaluation uses fixed offsets).
 - **Unchanged by this stage:** #43 output streaming (D16), #45, #75, #81, #83, #86.
@@ -186,22 +185,20 @@ egui comes with the first form-like screen.
 
 **Key.** Bests are keyed by (file SHA-256, preset SHA-256, LN mode).
 
-**Charts with `#RANDOM` get no best yet.** Whether a best is kept per resolved branch or per file is left open: a file whose branches hold 10 and 100 notes would otherwise either show several bests or compare a perfect 10-note play with a 100-note branch's 200 EX.
-- A play whose load resolved any `#RANDOM` (or `#SETRANDOM`, recorded in the same field) is saved as usual, but `counts_for_best` is false for it and selection shows `-` for the chart. Whether the chart resolved one is read from the chart as loaded, never from the record's fields.
-- Records keep their seed and resolved-chart hash, and the bests are a cache rebuilt from records. Either rule can therefore be adopted later by a `BESTS_VERSION` bump and a rebuild, with no play lost.
+**Charts with `#RANDOM` keep one best per file.** Every draw counts under the file's key, and each value is the best any draw reached, so selection keeps one cell per chart. When branches hold different notes (a 10-note and a 100-note branch), the FULL COMBO and BP 0 of the short branch and the EX of the long one can share the best: each was reached on some draw, not necessarily on one branch (design.md "Personal Bests" gives the rejected per-branch rule).
+- Records keep their seed and resolved-chart hash, and the bests are a cache rebuilt from records, so another rule can be adopted later by a `BESTS_VERSION` bump and a rebuild, with no play lost.
 
-**Eligibility.** One predicate, `counts_for_best(record, verified, saved)`, serves live updates and rebuilds alike; `Verified { completed, random }` is what verification established (the rebuild's re-evaluation and loaded chart, or the result's as-played evaluation and the chart just loaded). It holds only when all of these are true:
+**Eligibility.** One predicate, `counts_for_best(record, verified, saved)`, serves live updates and rebuilds alike; `Verified { completed }` is what verification established (the rebuild's re-evaluation and loaded chart, or the result's as-played evaluation and the chart just loaded). It holds only when all of these are true:
 - `verify` accepts the record;
 - the record was saved;
 - the record is not incomplete;
 - the play ended `PlayedToEnd`, and its evaluation completed;
-- it was a full play at 1×;
-- the chart resolved no `#RANDOM`.
+- it was a full play at 1×.
 
 **Values.**
 - `scores` holds the best EX, the best BP, the set of the preset's gauges cleared, FULL COMBO, and the play count; each merges commutatively.
 - The lamp is the cleared gauge with the highest `lamp` rank (design.md "Rule Presets"), or FULL COMBO, drawn from the stored set when shown. Presets list their gauges in display order, not in order of difficulty, so each gauge states its rank (PR18a).
-- The play count counts every saved, verified record under the key, so plays of a `#RANDOM` chart count across its branches even though they set no best.
+- The play count counts every saved, verified record under the key, so plays of a `#RANDOM` chart count across its branches.
 
 **Idempotence.** One ingest function serves live updates and rebuilds. A play is (its record's path relative to `records\`, the SHA-256 of its canonical body); `counted(path, body_sha256)` makes ingesting the same play twice a no-op. A record recompressed at its path is the same play, identical plays in two files are two, and a byte copy under another name counts again. Records are written once, and a deleted record's name returns only if two random 64-bit ids collide, a negligible risk (`<n>-<id>.tprl`).
 
@@ -1016,7 +1013,7 @@ Each one holds the behavior D5 and D6 state.
 - `played_to_end_with_overflow_sets_no_best`;
 - `failed_save_sets_no_best`;
 - `only_eligible_plays_set_bests`;
-- `random_charts_get_no_best_and_still_save`: two plays resolving different branches set no best and count 2, before and after a rebuild;
+- `random_chart_draws_share_the_file_best`: two plays of branches with different note counts merge into one best, each value from the draw that reached it, in either order and after a rebuild;
 - `version_change_invalidates_bests_without_schema_change`;
 - `ingest_is_idempotent`;
 - `rebuild_from_records_skips_refused`;

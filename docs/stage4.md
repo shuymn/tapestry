@@ -133,7 +133,7 @@ Every connector gets the same services, so a connector stays a thin translator.
   - One primary instance answers ranking reads, and every enabled instance receives sends.
   - `population` reads go to the instance that declares the capability, whichever is primary, so an external IR can serve rankings while Weft serves statistics.
 - **Chart text:** for a connector that asks for `chart_text`, the host keeps the exact bytes of the recorded chart hash with the pending item. It reads them while the file still matches, so a changed or removed file does not lose them.
-- **Evaluation charts:** for a connector that asks for `evaluation_chart`, the host derives the played variant's evaluation chart and the chart's `#RANDOM` skeleton (design.md "Server Architecture") from the same bytes and keeps them with the pending item. When the chart's `#RANDOM` structure has at most 64 combinations, it derives all of them, through a loader entry that takes the draws explicitly instead of a seed. Tests cover 64 and 65 combinations and draws inside branches not taken. When the loader version changes, the host derives them again for the charts its records name, in the background.
+- **Evaluation charts:** for a connector that asks for `evaluation_chart`, the host derives the played variant's evaluation chart and the chart's `#RANDOM` skeleton (design.md "Server Architecture") from the same bytes and keeps them with the pending item. When the chart's `#RANDOM` structure has at most 64 combinations, it derives all of them, through a loader entry that takes the draws explicitly instead of a seed; above that it derives the played draw's only, so such a chart's plays usually stay unconfirmed (design.md "Server Architecture"). The count saturates at 65. Tests cover 64 and 65 combinations and draws inside branches not taken. When the loader version changes, the host derives them again for the charts its records name, in the background.
 - **Secrets:** stored in the Windows credential store under the instance id and remote account, never under a display name. The host hands an instance only its own.
 - **Browser sign-in:**
   - The host owns the transaction. It binds an exclusive loopback listener first, then builds the authorization URL with `state` and PKCE ([RFC 8252](https://datatracker.ietf.org/doc/html/rfc8252)).
@@ -299,6 +299,7 @@ The core is what must be correct for every record, and what a third party could 
   - an upload after quarantine;
   - an encoding version change, which opens new keys and quarantines nothing;
   - a record that arrives before its evaluation chart;
+  - a record of a chart above 64 combinations: it is delivered, evaluated with the one valid upload and stays off boards and statistics, and it is projected once its key is confirmed; a confirmed evaluation chart of another draw does not stand for its key;
   - a generation switch while a record's evaluation chart is still missing, and its evaluation once the chart arrives;
   - an operator's correction of a quarantined key after an evaluation with the other bytes, with an old job still running.
 

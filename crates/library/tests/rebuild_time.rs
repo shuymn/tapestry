@@ -65,7 +65,6 @@ fn time_steps(label: &str, text: &str, record: &PlayRecord) {
         &decoded,
         &Verified {
             completed: re.evaluation.completed,
-            random: false,
         },
         &re.evaluation,
         &preset,
