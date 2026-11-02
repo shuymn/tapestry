@@ -95,7 +95,7 @@ The fuzz targets are in `fuzz/`, a crate outside the workspace with its own `fuz
 
 | Target | Input |
 | --- | --- |
-| `bms_load` | A chart file's bytes, loaded with `bms_parser::load_bms` against an empty folder |
+| `bms_load` | A chart file's bytes, loaded with `bms_parser::load_bms` against an empty folder, then again at a practice speed the bytes' sum picks on the ladder (50 % to 150 %). Each loaded chart must keep its base and timeline-link validity, and its presentation validity must match an oracle sorting its note endpoints; the mapped chart must keep the 1× chart's rows, positions, tempos, note rows and identity, its row times moved the speed's way, or be too long for the speed |
 | `replay_file` | An input log file's bytes, decoded with `replay::decode` |
 | `replay_body` | An uncompressed body, decoded from a valid file built around it, so every input reaches the sections, counts and varints. A body that decodes must be the canonical body of its record |
 | `raw_input` | A block count byte, then a Raw Input buffer: the block walk and the keyboard and HID decoders of `input::raw` |
