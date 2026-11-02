@@ -1680,16 +1680,17 @@ impl Renderer {
             pass.set_vertex_buffer(0, self.instances.slice(..));
             // The runs in the batch's order, so each sprite is drawn over
             // every sprite pushed before it, whatever their blends. Each run
-            // sets its scissor when it differs from the one set: an
-            // unclipped run sets the whole target back, and a run whose clip
-            // keeps no pixel is not drawn.
+            // sets its scissor, its fixed clip's intersected with its inline
+            // clip rect's, when it differs from the one set: an unclipped
+            // run sets the whole target back, and a run whose clips keep no
+            // pixel is not drawn.
             let mut scissor = full;
             for run in self.staging.batch().runs() {
                 let end = run.end.min(staged);
                 if run.start >= end {
                     break;
                 }
-                let rect = match self.staging.scissor(run.key.clip) {
+                let rect = match self.staging.run_scissor(run) {
                     Scissor::Full => full,
                     Scissor::Rect(rect) => rect,
                     Scissor::Empty => continue,

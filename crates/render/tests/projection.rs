@@ -23,7 +23,7 @@ use render::{
     Renderer, SkinError, Sprite, SpriteBatch, UploadError, solid_uv,
 };
 use rules::Judgment;
-use skin_model::{BuildError, Canvas, ClipId, Filter, Fit};
+use skin_model::{BuildError, Canvas, ClipId, ClipRect, Filter, Fit, RunKey};
 
 type Placed = (Blend, Option<ClipId>, Sprite);
 
@@ -327,6 +327,87 @@ fn clips_change_between_runs() {
         }
     }
     assert_eq!(checked, 14);
+}
+
+/// A skin pushing white bands, each with a fixed clip and an inline clip
+/// rect or not, into the model's batch as an imported skin's widgets do.
+struct Inline;
+
+/// The bands of [`Inline`], 100 rows each from row 0: fixed clip, inline
+/// rect in canvas pixels.
+const INLINE_BANDS: [(Option<u16>, Option<[f32; 4]>); 5] = [
+    // Fixed (the left half) and inline (480..1440): 480..960 draws.
+    (Some(0), Some([480.0, 0.0, 960.0, 1_080.0])),
+    // Inline alone, then a neighbour of the same key with another rect.
+    (None, Some([0.0, 0.0, 480.0, 1_080.0])),
+    (None, Some([1_000.0, 0.0, 920.0, 1_080.0])),
+    // Fixed and inline sharing no pixel: nothing draws.
+    (Some(0), Some([1_000.0, 0.0, 500.0, 1_080.0])),
+    // Unclipped: the whole target again.
+    (None, None),
+];
+
+impl PlaySkin for Inline {
+    fn prepare(&mut self, _: &Gpu, _: &render::AttemptInput<'_>) -> Result<(), SkinError> {
+        Ok(())
+    }
+
+    fn build(&mut self, _: &FrameInput<'_>, out: &mut SpriteBatch) -> Result<(), BuildError> {
+        let quads = out.quads_mut();
+        for (row, (clip, rect)) in (0_u16..).zip(INLINE_BANDS) {
+            let key = RunKey {
+                blend: Blend::Alpha,
+                clip: clip.map(ClipId),
+            };
+            let band = solid([0.0, f32::from(row) * 100.0, 1_920.0, 100.0], [1.0; 4]);
+            match rect.and_then(ClipRect::new) {
+                Some(r) => quads.push_clipped(key, band, r),
+                None => quads.push(key, band),
+            };
+        }
+        Ok(())
+    }
+
+    fn canvas(&self, target: [u32; 2]) -> Canvas {
+        Canvas::new(target, Fit::Fixed)
+    }
+}
+
+/// A run's inline clip rect draws under the intersection with its fixed
+/// clip, projected with the canvas: on the fixed canvas at 1920×1080 and,
+/// by the same renderer, at 2560×1080, drawn from column 320. Per band
+/// at canvas x 240, 720 and 1200: black, white, black (only the overlap
+/// of the left half and 480..1440); white, black, black (inline 0..480);
+/// black, black, white (its neighbour's 1000..1920, not the scissor
+/// before it); black throughout (an empty intersection draws nothing);
+/// white throughout (the unclipped run after it). Inline rects ignored,
+/// the first band would draw at 240 and the fourth at 240 and 720; a
+/// scissor kept from 16:9 at 21:9 would cut the read columns.
+#[test]
+fn inline_clips_intersect_fixed_clips_across_a_resize() {
+    let mut r = offscreen(1_920, 1_080);
+    install(&mut r, vec![CLIPS[0]]);
+    r.set_skin(Box::new(Inline)).unwrap();
+    let expected: [[[u8; 3]; 3]; 5] = [
+        [BLACK, WHITE, BLACK],
+        [WHITE, BLACK, BLACK],
+        [BLACK, BLACK, WHITE],
+        [BLACK, BLACK, BLACK],
+        [WHITE, WHITE, WHITE],
+    ];
+    let mut checked = 0;
+    for (w, origin) in [(1_920, 0.0), (2_560, 320.0)] {
+        r.resize(w, 1_080);
+        let p = frame(&mut r);
+        for (row, want) in (0_u8..).zip(expected) {
+            for (x, colour) in [240.0, 720.0, 1_200.0].into_iter().zip(want) {
+                let y = f32::from(row) * 100.0 + 50.0;
+                near(px(&r, &p, origin + x, y), colour, 2);
+                checked += 1;
+            }
+        }
+    }
+    assert_eq!(checked, 30);
 }
 
 /// Page 1 smoothed into 64×64 pixels at (100, 300) and at (1100, 300),
