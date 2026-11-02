@@ -672,21 +672,20 @@ impl PlaySkin for SimpleSkin {
         for ev in f.effects {
             self.apply(ev);
         }
-        let scale = self.scale(f);
         let half = NOTE_H / 2.0;
-        let range = scale.map(|s| {
+        let range = self.scale(f).map(|s| {
             let (from, to) = s.positions(LANE_BOTTOM - JUDGE_Y + half, JUDGE_Y - LANE_TOP + half);
             (s, from, to)
         });
         Self::lanes_and_lines(out);
-        if let Some((scale, from, to)) = &range {
-            self.bar_lines(out, scale, *from, *to);
+        if let Some((scale, from, to)) = range {
+            self.bar_lines(out, &scale, from, to);
         }
         let w = LANES_RIGHT - LANE_LEFT;
         let y = JUDGE_Y - JUDGE_LINE_H / 2.0;
         rect(out, Blend::Alpha, LANE_LEFT, y, w, JUDGE_LINE_H, JUDGE_LINE);
-        if let Some((scale, from, to)) = &range {
-            self.notes(out, scale, *from, *to);
+        if let Some((scale, from, to)) = range {
+            self.notes(out, &scale, from, to);
         }
         // Feedback ages on the frame's own clock: the display offset moves
         // notes only.
