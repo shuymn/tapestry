@@ -170,27 +170,19 @@ fn play_command(p: args::Play, clock: QpcClock) -> ExitCode {
     let start = dev_options.start;
     #[cfg(not(feature = "dev-tools"))]
     let start = None;
+    // One rig configuration for both paths, so they cannot diverge.
     #[cfg(feature = "dev-tools")]
-    if dev_options.headless || matches!(input, PlayInput::Script(_)) {
-        let auto = u32::from(dev_options.auto_retry);
-        let frames = dev_options.frames.take();
-        return report(headless(&chart, input, start, frames, auto, clock, |rig| {
-            if dev_options.overlay {
-                rig.controls.toggle_overlay();
-            }
-            if let Some(bound) = dev_options.render_timeout {
-                rig.render.set_timeouts(bound, bound);
-            }
-            rig.adjust_in_play = dev_options.adjust_in_play;
-            rig.adjust_at = TimeUs(dev_options.adjust_at_ms.saturating_mul(1_000));
-            rig.adjust_on_end = dev_options.adjust_on_end;
-            rig.result_script = dev_options.result;
-            if dev_options.start_gate
-                && let Err(e) = dev::install_start_gate(rig)
-            {
-                eprintln!("dev: the start gate cannot be installed: {e}");
-            }
-        }));
+    let headless_run = dev_options.headless || matches!(input, PlayInput::Script(_));
+    #[cfg(feature = "dev-tools")]
+    let frames = dev_options.frames.take();
+    #[cfg(feature = "dev-tools")]
+    let tune =
+        move |rig: &mut PlayerRig<'_>, device: &DeviceSettings| dev_options.tune(rig, device);
+    #[cfg(not(feature = "dev-tools"))]
+    let tune = |_: &mut PlayerRig<'_>, _: &DeviceSettings| anyhow::Ok(());
+    #[cfg(feature = "dev-tools")]
+    if headless_run {
+        return report(headless(&chart, input, start, frames, clock, tune));
     }
     report(play(
         &chart,
@@ -199,25 +191,7 @@ fn play_command(p: args::Play, clock: QpcClock) -> ExitCode {
         clock,
         #[cfg(feature = "dev-tools")]
         false,
-        |_rig| {
-            #[cfg(feature = "dev-tools")]
-            {
-                if dev_options.auto_retry {
-                    _rig.auto_retries = 1;
-                    _rig.quit_after_end = Some(std::time::Duration::from_millis(300));
-                }
-                if dev_options.overlay {
-                    _rig.controls.toggle_overlay();
-                }
-                if let Some(bound) = dev_options.render_timeout {
-                    _rig.render.set_timeouts(bound, bound);
-                }
-                _rig.adjust_in_play = dev_options.adjust_in_play;
-                _rig.adjust_at = TimeUs(dev_options.adjust_at_ms.saturating_mul(1_000));
-                _rig.adjust_on_end = dev_options.adjust_on_end;
-                _rig.result_script = dev_options.result;
-            }
-        },
+        tune,
     ))
 }
 
@@ -257,10 +231,11 @@ fn measure_play(chart: &Path, perfect: bool, clock: QpcClock) -> anyhow::Result<
     } else {
         PlayInput::Devices
     };
-    let ran = play(chart, input, None, clock, true, move |rig| {
+    let ran = play(chart, input, None, clock, true, move |rig, _| {
         rig.measured_plays = Some(kept);
         rig.load_start = load_start;
         rig.quit_after_end = Some(std::time::Duration::from_millis(300));
+        Ok(())
     });
     let stopped = capture.stop();
     ran?;
@@ -919,7 +894,7 @@ fn play(
     start: Option<TimeUs>,
     clock: QpcClock,
     #[cfg(feature = "dev-tools")] keep_presents: bool,
-    tune: impl FnOnce(&mut PlayerRig<'_>),
+    tune: impl FnOnce(&mut PlayerRig<'_>, &DeviceSettings) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     #[cfg(feature = "dev-tools")]
     alloc_count::tag(alloc_count::Tag::Logic);
@@ -1060,8 +1035,9 @@ fn play(
     rig.gain = gain;
     rig.result_input = menus;
     rig.queue_most = opened.most_queued_periods;
-    tune(&mut rig);
-    let ran = game::live::run_chart(&mut loaded, &mut rig);
+    // A tuning refused ends the run before any play opens.
+    let ran = tune(&mut rig, &loaded.settings().device)
+        .and_then(|()| Ok(game::live::run_chart(&mut loaded, &mut rig)?));
     #[cfg(feature = "dev-tools")]
     let script_failed = result_script_failure(&rig);
     let rendered = rig.shut_down();
@@ -1502,9 +1478,8 @@ fn headless(
     input: PlayInput,
     start: Option<TimeUs>,
     frames: Option<PathBuf>,
-    auto_retries: u32,
     clock: QpcClock,
-    tune: impl FnOnce(&mut PlayerRig<'_>),
+    tune: impl FnOnce(&mut PlayerRig<'_>, &DeviceSettings) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     alloc_count::tag(alloc_count::Tag::Logic);
     let Prepared {
@@ -1593,10 +1568,10 @@ fn headless(
     rig.restorer = restorer(&loaded, &rig);
     rig.gain = gain;
     rig.quit_after_end = Some(std::time::Duration::from_millis(300));
-    rig.auto_retries = auto_retries;
     rig.queue_most = opened.most_queued_periods;
-    tune(&mut rig);
-    let ran = game::live::run_chart(&mut loaded, &mut rig);
+    // As in `play`: a tuning refused opens no play.
+    let ran = tune(&mut rig, &loaded.settings().device)
+        .and_then(|()| Ok(game::live::run_chart(&mut loaded, &mut rig)?));
     let script_failed = result_script_failure(&rig);
     // Offscreen: no window to keep.
     let _ = rig.shut_down();
@@ -1761,5 +1736,116 @@ mod tests {
         assert_eq!(input::keyboard_target(), Some(input.receiver()));
         drop(input);
         window.close();
+    }
+
+    /// A play's rig, as `play` and `headless` build it from `device`, on
+    /// threads that open nothing: an input link no thread serves, a
+    /// simulated audio output and a render thread on stub screens.
+    /// `options` tune it as both paths of `play_command` do; whether that
+    /// succeeded and whether the rig ended with a start gate.
+    #[cfg(feature = "dev-tools")]
+    fn tuned(
+        device: game::DeviceSettings,
+        options: crate::dev::Options,
+    ) -> (anyhow::Result<()>, bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = game::DataRoot::new(dir.path().join("data"));
+        let settings = game::Settings {
+            device,
+            player: game::PlayerSettings::default(),
+        };
+        let clock = QpcClock::start();
+        let controls = super::controls(&settings, clock);
+        let (_hook, input) = input_side::link(
+            Arc::clone(&controls),
+            Mode::Clock,
+            input::Waker::new().unwrap(),
+        );
+        let (audio, opened) = crate::audio_side::spawn(
+            move || {
+                Ok::<_, std::convert::Infallible>((crate::dev::recording_output(clock, 1), None))
+            },
+            |_| {},
+        )
+        .unwrap();
+        let chart = bms_parser::load_bms(
+            b"#BPM 120\n",
+            std::path::Path::new("."),
+            &Default::default(),
+        )
+        .unwrap()
+        .chart;
+        let bank = audio::load_bank(&chart, opened.rate, &audio::BankLimits::default()).unwrap();
+        let engine = audio::AudioEngine::new(
+            Arc::new(bank),
+            &[],
+            opened.rate,
+            opened.period,
+            audio::MAX_VOICES,
+            super::SCHEDULE_LOG,
+        )
+        .unwrap();
+        let audio = audio.start(engine, rtrb::RingBuffer::new(1).0);
+        let render = crate::render_side::tests::Installers::default().spawn_bare();
+        let threads = super::Threads {
+            input,
+            audio,
+            render,
+            steps: rtrb::RingBuffer::new(1).0,
+        };
+        let mut rig = super::rig(&root, &settings, false, threads, &controls, clock);
+        let ran = options.tune(&mut rig, &settings.device);
+        let gated = rig.gate.is_some();
+        let _ = rig.shut_down();
+        (ran, gated)
+    }
+
+    /// `--dev-start-gate` installs the gate through the one rig
+    /// configuration both paths of `play_command` take, the interactive
+    /// play's included.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn the_start_gate_option_installs_the_gate_on_a_plays_rig() {
+        let gate = || crate::dev::Options {
+            start_gate: true,
+            ..crate::dev::Options::default()
+        };
+        let (ran, gated) = tuned(game::DeviceSettings::default(), gate());
+        ran.unwrap();
+        assert!(gated);
+        let (ran, gated) = tuned(
+            game::DeviceSettings::default(),
+            crate::dev::Options::default(),
+        );
+        ran.unwrap();
+        assert!(!gated);
+    }
+
+    /// The gate is planned against the play's own key config: quit on Q
+    /// (0x10), the default START, is refused with the collision, and the
+    /// rig keeps no gate.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn the_start_gate_refuses_start_on_the_quit_key() {
+        let mut device = game::DeviceSettings::default();
+        device.keyboard.quit = Some(0x10);
+        let (ran, gated) = tuned(
+            device,
+            crate::dev::Options {
+                start_gate: true,
+                ..crate::dev::Options::default()
+            },
+        );
+        let e = ran.unwrap_err();
+        assert_eq!(
+            e.downcast_ref::<game::AdjustKeyError>(),
+            Some(&game::AdjustKeyError::Overlap {
+                control: 0x10,
+                first: game::AdjustBinding::Key(game::Role::Quit),
+                second: game::AdjustBinding::Adjustment(game::adjustment::Role::Start),
+            }),
+            "{e:#}"
+        );
+        assert!(!gated);
     }
 }

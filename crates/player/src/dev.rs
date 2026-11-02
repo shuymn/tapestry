@@ -197,13 +197,49 @@ pub struct Options {
     /// end (`--dev-start <ms>`; design.md "Shortening Launch-Based Checks").
     pub start: Option<TimeUs>,
     /// Run the plays through the start gate (`--dev-start-gate`; design.md
-    /// "Play Lifecycle", the start gate) on the default bindings: each
+    /// "Play Lifecycle", the start gate) on the default adjustment
+    /// bindings, planned against the key config of `device.toml`: each
     /// READY a candidate START or SELECT cancels before its transport
-    /// commits. Production plays run without it until S10-04b.
+    /// commits. START or SELECT on a key the key config binds to retry,
+    /// quit or a lane is refused, and the run ends with that error before
+    /// any play opens. Production plays run without it until S10-04b.
     pub start_gate: bool,
 }
 
 impl Options {
+    /// Applies the options to a play's rig, the same on every path that
+    /// plays a chart (`play`, interactive or headless): `device` is the
+    /// device settings the play uses, whose key config the start gate is
+    /// planned against.
+    ///
+    /// # Errors
+    ///
+    /// The start gate asked for and refused ([`install_start_gate`]).
+    pub fn tune(
+        self,
+        rig: &mut crate::play::PlayerRig<'_>,
+        device: &game::DeviceSettings,
+    ) -> anyhow::Result<()> {
+        if self.auto_retry {
+            rig.auto_retries = 1;
+            rig.quit_after_end = Some(Duration::from_millis(300));
+        }
+        if self.overlay {
+            rig.controls.toggle_overlay();
+        }
+        if let Some(bound) = self.render_timeout {
+            rig.render.set_timeouts(bound, bound);
+        }
+        rig.adjust_in_play = self.adjust_in_play;
+        rig.adjust_at = TimeUs(self.adjust_at_ms.saturating_mul(1_000));
+        rig.adjust_on_end = self.adjust_on_end;
+        rig.result_script = self.result;
+        if self.start_gate {
+            install_start_gate(rig, device).context("dev: the start gate cannot be installed")?;
+        }
+        Ok(())
+    }
+
     /// The session's input with the development options applied: an input
     /// log or the perfect measurement in place of the devices.
     ///
@@ -1308,19 +1344,24 @@ fn crc32(data: &[u8]) -> u32 {
     !c
 }
 
-/// Installs a start gate on the default bindings (START on Q, SELECT on W)
-/// in a development run's rig (`--dev-start-gate`; design.md "Play
-/// Lifecycle", the start gate).
+/// Installs a start gate on the default adjustment bindings (START on Q,
+/// SELECT on W) in a development run's rig (`--dev-start-gate`; design.md
+/// "Play Lifecycle", the start gate), planned against `device`'s key
+/// configs, the ones the play's input uses.
 ///
 /// # Errors
 ///
-/// What the bindings' plan or the tap refuses.
-pub fn install_start_gate(rig: &mut crate::play::PlayerRig<'_>) -> anyhow::Result<()> {
-    let d = game::DeviceSettings::default();
+/// What the bindings' plan refuses ([`game::AdjustKeyError`]: START or
+/// SELECT on a key bound to retry, quit or a lane), or what the tap
+/// refuses.
+pub fn install_start_gate(
+    rig: &mut crate::play::PlayerRig<'_>,
+    device: &game::DeviceSettings,
+) -> anyhow::Result<()> {
     let keys = game::KeyConfigs {
-        keyboard: d.keyboard,
-        controller: d.controller,
-        controller_device: None,
+        keyboard: device.keyboard.clone(),
+        controller: device.controller.clone(),
+        controller_device: device.controller_device.map(Into::into),
     };
     let plan = game::AdjustmentConfig::default().plan(&keys, None, None)?;
     rig.gate = Some(crate::start_gate::PlayerGate::install(
