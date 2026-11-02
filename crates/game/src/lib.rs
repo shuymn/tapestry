@@ -14,12 +14,14 @@
 
 #![forbid(unsafe_code)]
 
+pub mod adjustment;
 pub mod app;
 mod attempt;
 mod audio_loop;
 mod autoplay;
 mod bests;
 mod error;
+mod hispeed;
 mod keys;
 pub mod live;
 mod logic;
@@ -51,6 +53,11 @@ pub use autoplay::{Autoplay, AutoplayError, schedule_iter};
 pub use bests::{BestScore, BestView, SavedPlay};
 pub use error::{Chain, IoFailure};
 pub use eval::TABLE_BYTES_PER_OBJECT;
+pub use hispeed::{
+    Cover, CoverKind, Covers, GREEN_TARGETS, HiSpeedReference, HiSpeedSettings, MAX_COVER,
+    PlayOptions, PlayOptionsError, Ratio, References, SpeedMode, Unrepresentable, duration_ms,
+    green, solve, step_hispeed,
+};
 pub use keys::{
     Bound, CANCEL_KEY, KEEP_KEY, KeyConfigEnd, KeyConfigFlow, KeyConfigs, KeyScreen, LEARN_TIME,
     LearntRange, Press, ROLES, Refusal, SETTLE_TIME, capture_keys, capture_keys_within,
