@@ -16,7 +16,7 @@ concurrency:
 jobs:
   # Whether the change touches a file the build jobs read: anything but the
   # documentation (docs/ and Markdown files) and repository files no build
-  # job reads (the license texts, .gitignore, the hook, repository settings,
+  # job reads (the license texts, the hook, repository settings,
   # Renovate's settings and the other workflows, which run on their own).
   # The build jobs skip a change of only those; a skipped job passes as a
   # required check, and `lint` still checks its banned words and workflows.
@@ -55,7 +55,7 @@ jobs:
           if [ -n "$base" ] && git diff --quiet --no-renames "$base" HEAD -- . \
               ':(exclude)docs/' ':(exclude)*.md' \
               ':(exclude,top)COPYRIGHT' ':(exclude,top,glob)LICENSE-*' \
-              ':(exclude,top).gitignore' ':(exclude,top)lefthook.yml' \
+              ':(exclude,top)lefthook.yml' \
               ':(exclude,top).github/infra.yaml' ':(exclude,top).github/renovate.json' \
               ':(exclude,top).github/workflows/audit.yml' ':(exclude,top).github/workflows/bench.yml' \
               ':(exclude,top).github/workflows/fuzz.yml' ':(exclude,top).github/workflows/mise-update.yml'; then
