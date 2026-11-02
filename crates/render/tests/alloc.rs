@@ -15,8 +15,10 @@
 //! and its prepared text included, does the same with the snapshot's
 //! gauges changing: its first and later frames, a refused one, the frames
 //! around a resize, and a full batch with the overlay kept whole. A
-//! committed installation's loading presentation builds its first and
-//! later loading frames, a refused one, and the next lifetime's first
+//! committed installation's loading presentation, with its lanes, its
+//! gauge drawn from a descriptor, progress and the chosen chart's text
+//! installed, builds its first and later loading frames, a refused one,
+//! and the next lifetime's first
 //! frame, its state started afresh in place, without allocating; the
 //! load's lines are drawn in a text pass outside this count.
 //!
@@ -441,11 +443,27 @@ fn loading_frames() {
     let look = Look {
         copies: 63,
         loading: true,
+        structure: true,
+        chart_text: true,
+        progress: true,
         ..Look::left([255, 0, 0, 255])
     };
     let (b, _) = bundle(&r, dir.path(), &look);
     let token = r.install(&b, 1).unwrap();
     r.commit(token).unwrap();
+    // The chosen chart's text prepared and installed for lifetime 1
+    // between frames, outside the count.
+    r.enter_loading(1);
+    let chart = skin_model::ChartText {
+        title: "T",
+        subtitle: "S",
+        artist: "A",
+        subartist: "",
+        genre: "G",
+    };
+    r.prepare_loading_text(1, 1, skin_model::TextSlots::ALL, &chart)
+        .unwrap();
+    assert_eq!(r.install_staged_loading_text(), Ok(true));
     let mut skin = DeclSkin::of(&r.installation().unwrap());
     let mut staging = Staging::with_runs(
         skin.capacity(),
@@ -453,7 +471,17 @@ fn loading_frames() {
         &skin.canvas([1920, 1080]),
     );
     staging.set_clips(b.clips().clone());
-    let at = |k: i64| LoadingFrame::interim(1, TimeUs(k * FRAME_US), TimeUs(0), common::VISIBLE);
+    // Each frame with the shown gauge's descriptor, progress at 40 % and
+    // the text's revision.
+    let at = |k: i64| LoadingFrame {
+        load: skin_model::LoadState {
+            since: TimeUs(0),
+            percent: 40,
+        },
+        gauge: Some(skin_model::LoadingGauge::of(0, &GAUGES[0])),
+        text: 1,
+        ..LoadingFrame::interim(1, TimeUs(k * FRAME_US), TimeUs(0), common::VISIBLE)
+    };
     skin.enter_loading(1);
     let (first, first_allocs) = counted(|| {
         staging
