@@ -609,7 +609,10 @@ fn check_f8b(_: &Header, i: Imported) {
 /// F5's judges: 5,127 with a 2-digit combo and one with a 1-digit combo.
 const JUDGES: usize = 5_128;
 /// Judges whose grade has 11 keys; the rest have 10.
-const ELEVEN_KEYS: usize = 3_989;
+const ELEVEN_KEYS: usize = 3_978;
+/// The judge whose 11-key grade fits its square image inside its
+/// destination (stretch 1): it keeps 11 attachment keys for its combo.
+const FITTED: usize = 3;
 /// Judges whose grade has the 7-op predicate; the rest the 17-op one.
 const SEVEN_OPS: usize = 2_165;
 /// The grades' offsets in turn: none, LIFT, SUDDEN+, both repeated.
@@ -635,7 +638,9 @@ const F5_GROUPS: &str = r#"
 /// gauge of 1,000 flickering parts (1,001 quads); 5,128 judges, each one
 /// grade of 10 or 11 timed keys under a 7- or 17-op predicate and a combo
 /// of 2 digits (3 quads) moved by two digit offset rows, one of 1 digit
-/// (2 quads) by one: 10,255 offsets kept.
+/// (2 quads) by one: 10,255 offsets kept. One grade ([`FITTED`]) fits its
+/// image inside its destination and keeps its 11 keys before the stretch
+/// for its combo besides.
 fn f5(root: &Path) {
     png(root, "a.png", 256, 256);
     let cell = |id: &str, i: usize, w: usize, h: usize| {
@@ -692,9 +697,10 @@ fn f5(root: &Path) {
         }));
         let value = if i + 1 < JUDGES { "v" } else { "v1" };
         let follow = FOLLOWS[i % FOLLOWS.len()];
+        let stretch = if i == FITTED { r#""stretch": 1, "# } else { "" };
         format!(
             r#"{{"id": "j{i}", "index": 0,
-                "images": [{{"id": "g", "timer": 46, "op": [{op}], "loop": 0, {follow}"dst": [{track}]}}],
+                "images": [{{"id": "g", "timer": 46, "op": [{op}], "loop": 0, {follow}{stretch}"dst": [{track}]}}],
                 "numbers": [{{"id": "{value}", "offset": 3, "offsets": [4, 3, 4], "dst": [{{"x": 10, "y": 0, "w": 6, "h": 6}}]}}]}}"#
         )
     }));
@@ -759,6 +765,7 @@ fn check_f5(_: &Header, i: Imported) {
     assert_eq!(u.bar_groups, 3);
     assert_eq!(i.skin.bar_group_count(), 3);
     assert_eq!(u.keys, as_u32(MAX_SKIN_KEYS));
+    assert_eq!(u.grade_anchor_keys, 11);
     assert_eq!(u.ops, as_u32(MAX_SKIN_OPS));
     assert_eq!(u.widget_quads, MAX_WIDGET_QUADS);
     assert_eq!(u.elements, as_u32(JUDGES) + 6);
@@ -794,8 +801,8 @@ fn check_f5(_: &Header, i: Imported) {
     };
     d.frame(900, &[full]);
     let q = d.frame(1_000, &[judged(1_000, Judgment::Perfect, 12)]);
-    // Each emission by its drawn size: every judge's 80×20 grade, the
-    // 6×6 cells of "1" and "2" for each but the last, whose one-digit
+    // Each emission by its drawn size: every judge's 80×20 grade but the
+    // fitted one's 20×20, the 6×6 cells of "1" and "2" for each but the last, whose one-digit
     // combo draws "2" alone; the four covers' paint over the 430 px
     // lanes; the gauge's 1,000 one-pixel segments, and its tip while the
     // flicker shows it.
@@ -805,7 +812,8 @@ fn check_f5(_: &Header, i: Imported) {
         *by_size.entry([w, h]).or_default() += 1;
     }
     let count = |size: [i32; 2]| by_size.get(&size).copied().unwrap_or(0);
-    assert_eq!(count([80, 20]), JUDGES, "{by_size:?}");
+    assert_eq!(count([80, 20]), JUDGES - 1, "{by_size:?}");
+    assert_eq!(count([20, 20]), 1, "{by_size:?}");
     assert_eq!(count([6, 6]), 2 * (JUDGES - 1) + 1, "{by_size:?}");
     let xs = |size: [i32; 2]| {
         let mut xs = std::collections::BTreeMap::<i32, usize>::new();
@@ -817,13 +825,15 @@ fn check_f5(_: &Header, i: Imported) {
         }
         xs
     };
-    // Every grade at 100, unshifted. Each combo starts its 6 px cells
-    // half its baseline width left of 110: "12" from 104, moved 1 and 2;
-    // the last judge's "2" from 107, moved 3.
+    // Every grade at 100, unshifted, the fitted one's paint at 130. Each
+    // combo, the fitted grade's on its destination's corner at 100,
+    // starts its 6 px cells half its baseline width left of 110: "12"
+    // from 104, moved 1 and 2; the last judge's "2" from 107, moved 3.
     assert_eq!(
         xs([80, 20]).into_iter().collect::<Vec<_>>(),
-        [(100, JUDGES)]
+        [(100, JUDGES - 1)]
     );
+    assert_eq!(xs([20, 20]).into_iter().collect::<Vec<_>>(), [(130, 1)]);
     assert_eq!(
         xs([6, 6]).into_iter().collect::<Vec<_>>(),
         [(105, JUDGES - 1), (110, 1), (112, JUDGES - 1)]
@@ -932,8 +942,11 @@ fn check_f5(_: &Header, i: Imported) {
         rows
     };
     let each = JUDGES / FOLLOWS.len();
-    let grade = [(500, each), (560, each), (662, each), (722, each)];
+    let grade = [(500, each), (560, each), (662, each - 1), (722, each)];
     assert_eq!(rows([80, 20]).into_iter().collect::<Vec<_>>(), grade);
+    // The fitted grade, listing both offsets, moves as the others that do;
+    // its combo with it once, among theirs below.
+    assert_eq!(rows([20, 20]).into_iter().collect::<Vec<_>>(), [(662, 1)]);
     let combo = rows([6, 6]);
     let tops: Vec<i32> = combo.keys().copied().collect();
     assert_eq!(tops.len(), FOLLOWS.len(), "{combo:?}");
@@ -1492,6 +1505,132 @@ fn f4_reaches_its_input_caps(root: &Path) {
     }
 }
 
+/// F14a's judges: each one fitted three-key grade with three attachment
+/// keys, a one-key one-digit combo and a one-key outer destination.
+const ANCHORED: usize = 8_192;
+
+/// F14a: [`ANCHORED`] judges at the key and widget quad caps, a quarter of
+/// the keys attachment keys. With `extra`, the first combo has a second
+/// key, leaving the last attachment no room.
+fn f14a(root: &Path, extra: bool) {
+    png(root, "a.png", 64, 64);
+    let judges = join((0..ANCHORED).map(|i| {
+        let combo = if extra && i == 0 {
+            r#""timer": 46, "dst": [{"time": 0, "x": 10, "y": 0, "w": 6, "h": 6}, {"time": 100}]"#
+        } else {
+            r#""dst": [{"x": 10, "y": 0, "w": 6, "h": 6}]"#
+        };
+        format!(
+            "\n{{\"id\": \"j{i}\", \"index\": 0, \"images\": [{{\"id\": \"g\", \"timer\": 46, \
+             \"stretch\": 1, \"dst\": [{{\"time\": 0, \"x\": 100, \"y\": 500, \"w\": 80, \"h\": 20}}, \
+             {{\"time\": 50, \"x\": 110}}, {{\"time\": 100, \"x\": 120}}]}}], \
+             \"numbers\": [{{\"id\": \"v\", {combo}}}]}}"
+        )
+    }));
+    let dsts =
+        join((0..ANCHORED).map(|i| format!(r#"{{"id": "j{i}", "dst": [{{"w": 0, "h": 0}}]}}"#)));
+    write(
+        root,
+        "s.json",
+        common::hd(&format!(
+            r#""source": [{{"id": "a", "path": "a.png"}}],
+               "image": [{{"id": "g", "src": "a", "w": 8, "h": 8}}],
+               "value": [{{"id": "v", "src": "a", "y": 8, "w": 60, "h": 6, "divx": 10, "digit": 1}}],
+               "judge": [{judges}],
+               "destination": [{dsts}]"#
+        ))
+        .as_bytes(),
+    );
+}
+
+fn check_f14a(_: &Header, i: Imported) {
+    let u = i.report.usage;
+    assert_eq!(u.keys, as_u32(MAX_SKIN_KEYS));
+    assert_eq!(u.grade_anchor_keys, as_u32(3 * ANCHORED));
+    assert_eq!(u.widget_quads, MAX_WIDGET_QUADS);
+    assert_eq!(u.elements, as_u32(ANCHORED));
+    assert!(i.report.notes.is_empty(), "{:?}", i.report.notes);
+    // A PERFECT with combo 5 at the grades' first key: each paint the
+    // 20×20 square fitted at 130, each "5" in its 6 px cell at 10 − 3 of
+    // the destination at 100, on its bottom 580.
+    let mut d = Drawn::new(i.skin, 100);
+    d.tally = common::play::tally(0, 5);
+    let q = d.frame(1_000, &[judged(1_000, Judgment::Perfect, 5)]);
+    let mut by_rect = std::collections::BTreeMap::<[i32; 4], usize>::new();
+    for quad in &q {
+        *by_rect.entry(common::play::round(quad.rect)).or_default() += 1;
+    }
+    assert_eq!(
+        by_rect.into_iter().collect::<Vec<_>>(),
+        [([107, 574, 6, 6], ANCHORED), ([130, 560, 20, 20], ANCHORED)]
+    );
+    // Half way to the second key the destination is at 105, its paint at
+    // 135.
+    let q = d.frame(1_025, &[]);
+    let mut xs = std::collections::BTreeMap::<i32, usize>::new();
+    for quad in &q {
+        *xs.entry(common::play::round(quad.rect)[0]).or_default() += 1;
+    }
+    assert_eq!(
+        xs.into_iter().collect::<Vec<_>>(),
+        [(112, ANCHORED), (135, ANCHORED)]
+    );
+}
+
+/// F14a with a key more: the last judge's attachment is refused at its
+/// grade before it is built.
+fn f14a_refuses_past_the_key_cap(root: &Path) {
+    f14a(root, true);
+    let text = std::fs::read_to_string(root.join("s.json")).unwrap();
+    let last = text
+        .lines()
+        .position(|l| l.contains(&format!("\"id\": \"j{}\", \"index\"", ANCHORED - 1)))
+        .unwrap();
+    match refused(root) {
+        ImportError::Limit {
+            limit: ImportLimit::Keys,
+            at: Some(at),
+        } => {
+            assert_eq!(at.line as usize, last + 1, "{at:?}");
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+/// F14b: [`MAX_ELEMENTS`] empty judge definitions no element draws, as
+/// defined and as loaded: the inline attachment slots cost their size
+/// with no attachment.
+fn f14b(root: &Path) -> i64 {
+    use skin_model::{Anchor, Fit, JudgeDef, Region, RegionDef, Sheet, SkinDef, WidgetDefs};
+    let ((), p) = peak(|| {
+        let judges = (0..MAX_ELEMENTS)
+            .map(|_| JudgeDef {
+                grades: Default::default(),
+                combos: Default::default(),
+                shift: false,
+            })
+            .collect();
+        let def = SkinDef {
+            fit: Fit::Adapt,
+            regions: [RegionDef {
+                anchor: Anchor::TopLeft,
+                optional: false,
+            }; Region::COUNT],
+            whens: Vec::new(),
+            sheet: Sheet::new(root, Vec::new(), Vec::new()).unwrap(),
+            lanes: None,
+            elements: Vec::new(),
+            widgets: WidgetDefs {
+                judges,
+                ..WidgetDefs::default()
+            },
+            bomb_up_to: None,
+        };
+        black_box(Skin::new(def).unwrap());
+    });
+    p
+}
+
 #[test]
 fn import_memory_is_measured() {
     // Positive control: a 4 MiB buffer grown to 8 MiB is 12 MiB live at
@@ -1543,6 +1682,13 @@ fn import_memory_is_measured() {
         size_of::<skin_model::Run>(),
         size_of::<skin_model::Quad>(),
     );
+    println!(
+        "sizes: Track {}, Option<Track> {}, GradePart {}, ComboPart {}",
+        size_of::<skin_model::Track>(),
+        size_of::<Option<skin_model::Track>>(),
+        size_of::<skin_model::GradePart>(),
+        size_of::<skin_model::ComboPart>(),
+    );
     // A group's work in a play: its frame record and its heap slot of 2 B,
     // 32 768 B of heap at the cap.
     let scratch = Skin::bar_group_scratch_bytes();
@@ -1582,7 +1728,7 @@ fn import_memory_is_measured() {
         MAX_SKIN_OPS
     );
     assert_eq!(
-        11 + 2 * JUDGES + ELEVEN_KEYS * 11 + (JUDGES - ELEVEN_KEYS) * 10,
+        11 + 2 * JUDGES + ELEVEN_KEYS * 11 + (JUDGES - ELEVEN_KEYS) * 10 + 11,
         MAX_SKIN_KEYS
     );
     let d = tempfile::tempdir().unwrap();
@@ -1714,6 +1860,21 @@ fn import_memory_is_measured() {
         "F13d with unknown fields instead: {} B",
         measure(d.path(), |_, _| {})
     );
+    drop(d);
+    // F14a: the key cap reached with a quarter of it attachment keys, and
+    // the last attachment refused with a key more.
+    assert_eq!(ANCHORED * (3 + 3 + 1 + 1), MAX_SKIN_KEYS);
+    assert_eq!(ANCHORED * 2, MAX_WIDGET_QUADS as usize);
+    let d = tempfile::tempdir().unwrap();
+    f14a(d.path(), false);
+    peaks.push(("F14a grade attachments", measure(d.path(), check_f14a)));
+    drop(d);
+    let d = tempfile::tempdir().unwrap();
+    f14a_refuses_past_the_key_cap(d.path());
+    drop(d);
+    // F14b: empty judge definitions at the widget table cap.
+    let d = tempfile::tempdir().unwrap();
+    peaks.push(("F14b empty judges", f14b(d.path())));
     drop(d);
     for (name, p) in &peaks {
         println!("{name}: peak {p} B");
