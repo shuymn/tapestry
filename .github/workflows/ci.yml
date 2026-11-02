@@ -169,6 +169,10 @@ jobs:
       # dependencies it reuses.
       - name: Render staging allocation test (release)
         run: mise exec -- cargo test --release --locked -p render --test alloc
+      # The loader's chart ceiling (design.md "Memory Budget"): one ignored
+      # measurement, run alone in the release profile it is sized for.
+      - name: Chart memory ceiling (release)
+        run: mise exec -- cargo test --release --locked -p bms-parser --test memory -- --ignored --exact measure_load_peaks
       - name: Production excludes dev-tools
         run: |
           mise exec -- cargo xtask check-binary --absent "tapestry dev-tools enabled" target/release/tapestry.exe
