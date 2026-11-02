@@ -5,22 +5,43 @@
 //! --test memory -- --ignored --nocapture`).
 
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bms_model::{Speed, TimelineId, TimelinePoint};
-use bms_parser::{LoadOptions, Loaded, load_bms};
+use bms_parser::{Limits, LoadError, LoadOptions, Loaded, load_bms};
 
-/// Tracks live and peak bytes of every allocation.
+/// Tracks live and peak bytes of every allocation, and on this thread
+/// whether an allocation of a watched size was made.
 struct Peak;
 
 static LIVE: AtomicUsize = AtomicUsize::new(0);
 static PEAK: AtomicUsize = AtomicUsize::new(0);
+
+thread_local! {
+    /// Sizes to watch for on this thread, and whether each was allocated.
+    static WATCH: Cell<[(usize, bool); 2]> = const { Cell::new([(0, false); 2]) };
+}
+
+/// Notes an allocation of `size` bytes against this thread's watch list.
+fn watch(size: usize) {
+    let _ = WATCH.try_with(|w| {
+        let mut list = w.get();
+        for (watched, seen) in &mut list {
+            if *watched != 0 && *watched == size {
+                *seen = true;
+            }
+        }
+        w.set(list);
+    });
+}
 
 // SAFETY: delegates to `System`; only adds counters, which never allocate.
 unsafe impl GlobalAlloc for Peak {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let live = LIVE.fetch_add(layout.size(), Ordering::Relaxed) + layout.size();
         PEAK.fetch_max(live, Ordering::Relaxed);
+        watch(layout.size());
         // SAFETY: same contract as the caller's.
         unsafe { System.alloc(layout) }
     }
@@ -32,6 +53,7 @@ unsafe impl GlobalAlloc for Peak {
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        watch(new_size);
         // SAFETY: same contract as the caller's.
         let p = unsafe { System.realloc(ptr, layout, new_size) };
         if !p.is_null() {
@@ -100,6 +122,44 @@ fn the_timeline_is_held_at_its_counted_size() {
         assert_eq!(size_of_val(t.points()), 192_096);
         assert_eq!(size_of_val(t.bar_ids()), 24);
     }
+}
+
+#[test]
+fn a_chart_past_the_row_limit_is_refused_before_its_rows_are_allocated() {
+    // 20 000 STOPs: 40 002 rows, whose table is 1 920 096 bytes and whose
+    // mapped times at 50 % are 320 016; the bar rows are sized in the same
+    // step, after the count.
+    let text = stop_heavy(20_000, false);
+    let rows = 1 + 2 * 20_000 + 1;
+    let load = |limit: usize| {
+        WATCH.with(|w| {
+            w.set([
+                (rows * size_of::<TimelinePoint>(), false),
+                (rows * size_of::<bms_model::TimeUs>(), false),
+            ]);
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let opts = LoadOptions {
+            speed: Speed::SLOWEST,
+            limits: Limits {
+                max_timeline_points: limit,
+                ..Limits::default()
+            },
+            ..LoadOptions::default()
+        };
+        let result = load_bms(text.as_bytes(), dir.path(), &opts).map(|_| ());
+        let seen = WATCH.with(|w| w.get().map(|(_, seen)| seen));
+        (result, seen)
+    };
+    // The positive control: at the limit both tables are allocated, at
+    // their counted sizes.
+    assert_eq!(load(rows), (Ok(()), [true, true]));
+    let (refused, seen) = load(rows - 1);
+    assert!(
+        matches!(refused, Err(LoadError::TimelineLimit { .. })),
+        "{refused:?}"
+    );
+    assert_eq!(seen, [false, false]);
 }
 
 #[test]
