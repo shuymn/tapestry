@@ -268,7 +268,8 @@ pub(crate) enum Value {
     /// early or late flag, misses and presses on a judged note included,
     /// and a long note by whichever of its head and its release lies
     /// farther from its time (`IntegerPropertyFactory.java`, `totalearly`,
-    /// `totallate`; `play/JudgeManager.java`, `updateMicro`).
+    /// `totallate`; `play/JudgeManager.java:511-520`, in `update`, which
+    /// compares the two distances; `updateMicro`, which counts).
     Fast,
     Slow,
     /// The rate over the targets judged so far, whole percent and
