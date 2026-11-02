@@ -26,8 +26,8 @@
 //! covers moving its trimmed paint every frame, each frame's runs
 //! resolved to scissors, inline clips included, as the renderer draws
 //! them, across a resize, a refusal and the next lifetime; and an
-//! attempt's play frames with bitmap labels, a full batch keeping the
-//! overlay whole.
+//! attempt's play frames with bitmap labels, batches short of sprites and
+//! of runs keeping the overlay whole.
 //!
 //! The counting allocator counts only on the thread that opted in, so the
 //! harness's own threads do not disturb it. This file holds a single test
@@ -458,13 +458,14 @@ fn resolve(staging: &Staging) -> (usize, usize) {
 /// renderer. Its loading presentation, the chosen chart's bitmap text
 /// prepared and installed between frames, builds its first and later
 /// frames with LIFT's paint and its follower moving with covers changing
-/// every frame, crossing the trim line and leaving it, each frame's runs
-/// resolved to scissors, the inline ones included; then an applied resize
-/// and the frames after it, a refused frame and the poisoned one after it,
-/// and the next lifetime's first frame. An attempt prepared with bitmap
-/// labels builds its first and later play frames with the overlay, and a
-/// batch too small for them keeps the overlay whole. None allocates;
-/// preparation and GPU work stay outside the counts.
+/// every frame, crossing the trim line and leaving it, and one at full
+/// coverage, each frame's runs resolved to scissors, the inline ones
+/// included; then an applied resize and the frames after it, a refused
+/// frame and the poisoned one after it, and the next lifetime's first
+/// frame. An attempt prepared with bitmap labels builds its first and
+/// later play frames with the overlay, and a batch short of sprites and
+/// one short of runs with sprites to spare keep the overlay whole. None
+/// allocates; preparation and GPU work stay outside the counts.
 fn imported_frames(chart: &Chart, overlay: &[&str], glyphs: usize) {
     let mut r = offscreen(1_920, 1_080);
     let (_dir, b) = json_support::bundle(&r);
@@ -490,8 +491,7 @@ fn imported_frames(chart: &Chart, overlay: &[&str], glyphs: usize) {
     staging.set_clips(b.clips().clone());
     // Lift cycling 0 to 990 ‰ by 30 ‰ a frame: the paint below, across
     // and above its line.
-    let at = |lifetime: u64, k: i64| {
-        let lift = u16::try_from((k * 30).rem_euclid(1_000)).unwrap();
+    let lifted = |lifetime: u64, k: i64, lift: u16| {
         let mut f =
             LoadingFrame::interim(lifetime, TimeUs(k * FRAME_US), TimeUs(0), common::VISIBLE);
         f.lanes.lift = lift;
@@ -499,6 +499,13 @@ fn imported_frames(chart: &Chart, overlay: &[&str], glyphs: usize) {
         f.covers.lift_enabled = true;
         f.text = 1;
         f
+    };
+    let at = |lifetime: u64, k: i64| {
+        lifted(
+            lifetime,
+            k,
+            u16::try_from((k * 30).rem_euclid(1_000)).unwrap(),
+        )
     };
     let loading = |staging: &mut Staging, skin: &mut DeclSkin, f: &LoadingFrame<'_>| {
         staging
@@ -517,6 +524,11 @@ fn imported_frames(chart: &Chart, overlay: &[&str], glyphs: usize) {
     });
     assert!(later.unwrap() > 0, "no run carried an inline clip");
     assert_eq!(later_allocs, 0, "a later imported loading frame allocated");
+    // Full coverage: the lift at 1 000 ‰ (on), no field left above it.
+    let (full, full_allocs) =
+        counted(|| loading(&mut staging, &mut skin, &lifted(1, FRAMES, 1_000)));
+    assert!(full.unwrap().0 > 0);
+    assert_eq!(full_allocs, 0, "a fully covered imported frame allocated");
 
     let (resized, resize_allocs) = counted(|| {
         staging.project(&skin.canvas([2560, 1080]));
@@ -615,6 +627,28 @@ fn imported_frames(chart: &Chart, overlay: &[&str], glyphs: usize) {
     assert!(dropped.unwrap().0 > 0, "the full batch counted no refusal");
     assert_eq!(overlay_drawn(&small), glyphs, "the overlay was cut");
     assert_eq!(full_allocs, 0, "an imported full batch allocated");
+
+    // Room for every sprite but one run: the additive mark needs a second
+    // run, so it and everything after it is refused and counted while
+    // sprites are left over, and the overlay follows whole from the
+    // reserve.
+    let mut narrow = Staging::with_runs(skin.capacity(), 1, &skin.canvas([1920, 1080]));
+    narrow.set_clips(b.clips().clone());
+    let (refused, run_allocs) = counted(|| {
+        narrow
+            .build(&mut skin, &f)
+            .map(|()| (narrow.batch().dropped(), resolve(&narrow)))
+    });
+    let (dropped, (drawn, _)) = refused.unwrap();
+    assert!(dropped > 0, "the run-limited batch counted no refusal");
+    let skin_quads = narrow.instances().len() - glyphs;
+    assert!(
+        skin_quads < usize::try_from(skin.capacity()).unwrap(),
+        "no sprite left over: {skin_quads}"
+    );
+    assert_eq!(drawn, narrow.batch().runs().len(), "every run drawn");
+    assert_eq!(overlay_drawn(&narrow), glyphs, "the overlay was cut");
+    assert_eq!(run_allocs, 0, "a run-limited imported batch allocated");
 }
 
 /// A declarative installation committed on a renderer, its loading

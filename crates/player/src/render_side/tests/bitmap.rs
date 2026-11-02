@@ -105,10 +105,14 @@ fn changed_fields_and_a_cancelled_load_draw_only_current_bitmap_text() {
     let changed = rec.until(shown, |s| s.text == 2 && glyphs(s)[1] == e);
     sink.report(LoadInput::Chart(labelled("B", "E")), None);
     let retitled = rec.until(changed, |s| s.text == 3 && glyphs(s)[0] == b);
+    // Both bundles by address, as frames record them, taken before the
+    // selection so no frame drawn meanwhile can stand in for either.
+    let bundle = rec.shots()[retitled - 1].bundle;
+    let replacement = Some(Arc::as_ptr(&other) as *const () as usize);
+    assert_ne!(bundle, replacement);
     assert_eq!(link.select(Some(other)).wait().unwrap(), Preparation::Ready);
-    let bundle = rec.shots().last().unwrap().bundle;
     let moved = rec.until(retitled, |s| {
-        s.bundle != bundle && s.glyphs == Some([b, e, BLACK, b])
+        s.bundle == replacement && s.glyphs == Some([b, e, BLACK, b])
     });
     // Cancelled; chart C, with no artist, chosen at once.
     link.clear_loading();
@@ -137,7 +141,7 @@ fn changed_fields_and_a_cancelled_load_draw_only_current_bitmap_text() {
     assert_eq!(glyphs(r3[0]), [BLACK, e, BLACK, BLACK], "{r3:?}");
     assert!(r3.iter().all(|s| matches!(glyphs(s), [t, x, BLACK, f]
         if x == e && f == t && (t == BLACK || t == b))));
-    let first_other = shots.iter().position(|s| s.bundle != bundle).unwrap();
+    let first_other = shots.iter().position(|s| s.bundle == replacement).unwrap();
     assert!(
         shots[first_other..]
             .iter()

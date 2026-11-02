@@ -58,6 +58,10 @@ pub const LIFT_PAINT: [i32; 4] = [20, 880, 430, 200];
 pub const TRIM_LINE: i32 = 880;
 /// An image following the lift, at rest; it rises with the line. Red.
 pub const FOLLOWER: [i32; 4] = [600, 800, 100, 50];
+/// An untimed additive mark between the background and the animation,
+/// red: every frame's quads lie in at least three runs (alpha, additive,
+/// alpha).
+pub const ADDITIVE: [i32; 4] = [1_500, 900, 100, 100];
 /// The lanes' length: a lift of `l` ‰ raises the line `l · 600 / 1000`.
 pub const LANE_LENGTH: i32 = 600;
 
@@ -136,6 +140,7 @@ fn json() -> String {
     let destinations = [
         r#"{"id": "notes", "dst": [{"x": 0, "y": 0, "w": 0, "h": 0}]}"#.to_owned(),
         dst("w", "", BACKGROUND),
+        dst("w", r#", "blend": 2"#, ADDITIVE),
         animation,
         dst("liftc", "", LIFT_PAINT),
         dst("w", r#", "offset": 3"#, FOLLOWER),
