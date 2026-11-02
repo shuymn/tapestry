@@ -537,6 +537,19 @@ pub enum RenderMsg {
         /// Where the answer goes.
         reply: mpsc::SyncSender<LoadingEnd>,
     },
+    /// Loading lifetime `lifetime` pauses, still current: stop drawing its
+    /// loading state but keep it, its lines and newest state with it, and
+    /// answer as [`EndLoading`](Self::EndLoading) does
+    /// ([`RenderLink::pause_loading`]).
+    PauseLoading {
+        /// The lifetime paused.
+        lifetime: u64,
+        /// Where the answer goes.
+        reply: mpsc::SyncSender<LoadingEnd>,
+    },
+    /// Loading lifetime `lifetime`, paused and still current, is drawn
+    /// again as it was kept ([`RenderLink::resume_loading`]).
+    ResumeLoading(u64),
     /// A play starts: chart time 0 at the measurement's `origin` on the
     /// clock.
     Play {
@@ -1184,6 +1197,40 @@ impl RenderLink {
         self.clear_loading();
         let (reply, rx) = mpsc::sync_channel(1);
         self.send(RenderMsg::EndLoading { lifetime, reply });
+        self.loading_end(&rx)
+    }
+
+    /// The current loading lifetime pauses before a READY candidate opens
+    /// (design.md "Play Lifecycle", the start gate): as
+    /// [`end_loading`](Self::end_loading), but the lifetime stays current,
+    /// so its sinks still report into it and a deferred opening resumes it
+    /// ([`resume_loading`](Self::resume_loading)); an opening ends it
+    /// ([`clear_loading`](Self::clear_loading)). Without a loading state
+    /// drawn there is nothing to pause, and the answer is as the end's.
+    ///
+    /// # Errors
+    ///
+    /// As [`end_loading`](Self::end_loading).
+    pub fn pause_loading(&self) -> Result<(), ScreenError> {
+        let lifetime = self.shared.loading_slot().lifetime;
+        let (reply, rx) = mpsc::sync_channel(1);
+        self.send(RenderMsg::PauseLoading { lifetime, reply });
+        self.loading_end(&rx)
+    }
+
+    /// The paused loading lifetime, if still current, is drawn again as
+    /// it was paused: the same lifetime, so a skin's loading state goes on
+    /// rather than starting afresh, from the same origin on the loading
+    /// clock, with the lines and state reported meanwhile. Nothing when
+    /// no lifetime was paused or it has ended.
+    pub fn resume_loading(&self) {
+        let lifetime = self.shared.loading_slot().lifetime;
+        self.send(RenderMsg::ResumeLoading(lifetime));
+    }
+
+    /// The render thread's answer to the end or pause of a loading
+    /// lifetime, waited for at most [`LOAD_TIMEOUT`].
+    fn loading_end(&self, rx: &Receiver<LoadingEnd>) -> Result<(), ScreenError> {
         match rx.recv_timeout(self.answer_timeout) {
             Ok(LoadingEnd::Ready) => Ok(()),
             Ok(LoadingEnd::Lost) => Err(ScreenError::Lost),
@@ -1493,6 +1540,7 @@ pub fn spawn(
                 selected: None,
                 committed: None,
                 loading_refused: None,
+                paused: None,
                 requested: 0,
                 attempt: None,
                 prepared: None,
@@ -1706,6 +1754,10 @@ struct Run {
     /// The loading lifetime whose loading frame the skin refused, and
     /// why: none of it is drawn again, and its end reports the refusal.
     loading_refused: Option<(u64, BuildError)>,
+    /// The loading state of a paused lifetime, kept as it was drawn and
+    /// fed what its sinks report, until it is resumed, ended or paused
+    /// again.
+    paused: Option<Mode>,
     /// The newest request asked, an attempt's preparation or a
     /// selection: an older one arriving late changes nothing.
     requested: u64,
@@ -1820,7 +1872,52 @@ impl Run {
                     if let Some((page, update)) = self.shared.take_loading(lifetime)
                         && self.loading_refused.is_none_or(|(l, _)| l != lifetime)
                     {
-                        mode = take_loading(mode, lifetime, page, update);
+                        // A paused lifetime's are kept for its resumption.
+                        match self.paused.take() {
+                            Some(
+                                kept @ Mode::Menu {
+                                    loading: Some(l), ..
+                                },
+                            ) if l == lifetime => {
+                                self.paused = Some(take_loading(kept, lifetime, page, update));
+                            }
+                            other => {
+                                self.paused = other;
+                                mode = take_loading(mode, lifetime, page, update);
+                            }
+                        }
+                    }
+                }
+                Ok(RenderMsg::PauseLoading { lifetime, reply }) => {
+                    // Between frames, as an end: none of the loading
+                    // state is drawn from here, but it is kept.
+                    self.paused = None;
+                    if matches!(
+                        mode,
+                        Mode::Menu {
+                            loading: Some(l),
+                            ..
+                        } if l == lifetime
+                    ) {
+                        self.paused = Some(std::mem::replace(&mut mode, Mode::Idle));
+                    }
+                    let _ = reply.send(self.loading_end(lifetime));
+                    continue;
+                }
+                Ok(RenderMsg::ResumeLoading(lifetime)) => {
+                    // Only over nothing drawn, while the lifetime is
+                    // current and none of it was refused.
+                    if let Some(
+                        kept @ Mode::Menu {
+                            loading: Some(l), ..
+                        },
+                    ) = self.paused.take()
+                        && l == lifetime
+                        && matches!(mode, Mode::Idle)
+                        && self.shared.loading_current(lifetime)
+                        && self.loading_refused.is_none_or(|(r, _)| r != lifetime)
+                    {
+                        mode = kept;
                     }
                 }
                 Ok(RenderMsg::EndLoading { lifetime, reply }) => {
@@ -1834,15 +1931,8 @@ impl Run {
                     ) {
                         mode = Mode::Idle;
                     }
-                    // Whether the skin refused a loading frame of it, else
-                    // whether the screen prepared for the attempt is still
-                    // there.
-                    let end = match (self.loading_refused, &self.screen) {
-                        (Some((l, e)), _) if l == lifetime => LoadingEnd::Refused(e),
-                        (_, None) => LoadingEnd::Lost,
-                        (_, Some(_)) => LoadingEnd::Ready,
-                    };
-                    let _ = reply.send(end);
+                    self.paused = None;
+                    let _ = reply.send(self.loading_end(lifetime));
                     continue;
                 }
                 Ok(RenderMsg::Prepare(reply)) => {
@@ -2230,6 +2320,17 @@ impl Run {
                     mode = Mode::Idle;
                 }
             }
+        }
+    }
+
+    /// The answer to the end or pause of loading lifetime `lifetime`:
+    /// whether the skin refused a loading frame of it, else whether the
+    /// screen prepared for the attempt is still there.
+    fn loading_end(&self, lifetime: u64) -> LoadingEnd {
+        match (self.loading_refused, &self.screen) {
+            (Some((l, e)), _) if l == lifetime => LoadingEnd::Refused(e),
+            (_, None) => LoadingEnd::Lost,
+            (_, Some(_)) => LoadingEnd::Ready,
         }
     }
 
@@ -3009,6 +3110,147 @@ pub(crate) mod tests {
         link.exit();
         assert_eq!(answered, before, "a loading frame before the answer");
         assert_eq!(loading(), before, "a loading frame after the answer");
+    }
+
+    /// A loading frame as a skin sees it: its lifetime, its origin and
+    /// time on the loading clock, and its page's first line.
+    type Clocked = (u64, TimeUs, TimeUs, String);
+
+    /// A screen noting every loading frame it draws ([`Clocked`]).
+    struct ClockedLoading(Arc<std::sync::Mutex<Vec<Clocked>>>);
+
+    impl Screen for ClockedLoading {
+        fn load(
+            &mut self,
+            _chart: &Chart,
+            _section: Option<&eval::Section>,
+        ) -> Result<(), RenderError> {
+            Ok(())
+        }
+        fn wait(&self) -> bool {
+            true
+        }
+        fn paced(&self) -> bool {
+            false
+        }
+        fn build(&mut self, _f: &FrameInput<'_>) -> Result<(), skin_model::BuildError> {
+            Ok(())
+        }
+        fn draw(&mut self) -> Result<FrameTiming, RenderError> {
+            Ok(timing(true))
+        }
+        fn text(&mut self, _lines: &[&str]) -> Result<bool, RenderError> {
+            Ok(true)
+        }
+        fn menu(
+            &mut self,
+            _page: &crate::menu_screen::MenuPage,
+            _changed: bool,
+        ) -> Result<FrameTiming, RenderError> {
+            Ok(timing(true))
+        }
+        fn loading(
+            &mut self,
+            page: &crate::menu_screen::MenuPage,
+            _update: Option<&LoadingUpdate>,
+            _changed: bool,
+            frame: &render::LoadingFrame<'_>,
+        ) -> Result<Result<FrameTiming, skin_model::BuildError>, RenderError> {
+            let line = page
+                .lines
+                .first()
+                .map_or_else(String::new, |l| l.text.clone());
+            self.0
+                .lock()
+                .unwrap()
+                .push((frame.lifetime, frame.load.since, frame.now, line));
+            Ok(Ok(timing(true)))
+        }
+        #[cfg(feature = "dev-tools")]
+        fn read_back(&self) -> Option<(u32, u32, Vec<u8>)> {
+            None
+        }
+    }
+
+    /// A render thread drawing on a [`ClockedLoading`], and its frames.
+    fn clocked() -> (
+        super::RenderLink,
+        QpcClock,
+        Arc<std::sync::Mutex<Vec<Clocked>>>,
+    ) {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let noted = Arc::clone(&seen);
+        let make: MakeScreen =
+            Box::new(move || Ok(Box::new(ClockedLoading(Arc::clone(&noted))) as Box<dyn Screen>));
+        let clock = QpcClock::start();
+        let link = spawn(
+            make,
+            None,
+            None,
+            clock,
+            view(),
+            measure(clock),
+            Box::new(NoFrames),
+        )
+        .unwrap();
+        (link, clock, seen)
+    }
+
+    /// A gated opening deferred by a hold returns to the loading state it
+    /// paused (design.md "Play Lifecycle", the start gate): no loading
+    /// frame while paused, though lines arrive, then the same lifetime from
+    /// the same origin on the loading clock, its time gone on through the
+    /// pause, with the lines reported meanwhile.
+    #[test]
+    fn a_paused_loading_lifetime_resumes_where_it_was() {
+        let (link, clock, seen) = clocked();
+        let count = || seen.lock().unwrap().len();
+        link.loading().show(one_line("L"));
+        assert!(wait_until(|| count() >= 2));
+        let (lifetime, since, _, _) = seen.lock().unwrap()[0].clone();
+        link.pause_loading().unwrap();
+        let paused = count();
+        link.loading().show(one_line("M"));
+        std::thread::sleep(Duration::from_millis(150));
+        assert_eq!(count(), paused, "a loading frame while paused");
+        let resumed = clock.now();
+        link.resume_loading();
+        assert!(wait_until(|| count() > paused));
+        link.end_loading().unwrap();
+        link.exit();
+        let seen = seen.lock().unwrap();
+        for (l, s, now, line) in &seen[paused..] {
+            assert_eq!((*l, *s), (lifetime, since), "the lifetime started over");
+            assert!(*now >= resumed, "the loading clock went back");
+            assert_eq!(line, "M", "the lines reported while paused were lost");
+        }
+    }
+
+    /// Nothing is resumed without a loading lifetime paused, nor once the
+    /// paused one has ended: the pause answers as an end would.
+    #[test]
+    fn no_loading_frame_resumes_without_its_lifetime() {
+        let (link, _, seen) = clocked();
+        link.pause_loading().unwrap();
+        link.resume_loading();
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "a loading frame of nothing"
+        );
+        link.loading().show(one_line("L"));
+        assert!(wait_until(|| !seen.lock().unwrap().is_empty()));
+        link.pause_loading().unwrap();
+        let paused = seen.lock().unwrap().len();
+        link.clear_loading();
+        link.resume_loading();
+        std::thread::sleep(Duration::from_millis(100));
+        link.exit();
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            paused,
+            "an ended lifetime resumed"
+        );
     }
 
     /// The end of loading is refused, so recording does not open, when the

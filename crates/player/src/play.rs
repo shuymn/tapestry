@@ -514,12 +514,22 @@ impl Rig for PlayerRig<'_> {
         self.render.discard_attempt();
     }
 
+    /// A gated attempt pauses its loading lifetime instead, so a hold at
+    /// the opening returns to the same loading state ([`defer`](Rig::defer));
+    /// the opening ends it.
     fn end_loading(&mut self) -> Result<(), ScreenError> {
-        let loading = self.selection.as_mut().and_then(|s| s.loading.take());
-        if loading.is_some() {
-            self.render.end_loading()
-        } else {
-            Ok(())
+        let loading = self
+            .selection
+            .as_mut()
+            .and_then(|s| s.loading.take())
+            .is_some();
+        match &mut self.gate {
+            Some(gate) if loading || gate.loading_paused() => {
+                gate.pause_loading();
+                self.render.pause_loading()
+            }
+            _ if loading => self.render.end_loading(),
+            _ => Ok(()),
         }
     }
 
@@ -596,8 +606,22 @@ impl Rig for PlayerRig<'_> {
         })?;
         if let (Some(opening), Some(gate)) = (&opened, &mut self.gate) {
             gate.opened(generation, opening);
+            if gate.take_loading() {
+                self.render.clear_loading();
+            }
         }
         Ok(opened)
+    }
+
+    /// A paused loading lifetime is drawn again, with its clock.
+    fn defer(&mut self) {
+        if self
+            .gate
+            .as_ref()
+            .is_some_and(crate::start_gate::PlayerGate::loading_paused)
+        {
+            self.render.resume_loading();
+        }
     }
 
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]

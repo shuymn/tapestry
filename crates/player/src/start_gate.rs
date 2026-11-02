@@ -61,6 +61,9 @@ pub struct PlayerGate {
     snapshot: usize,
     /// A round's restore box the next rearm plans in.
     spare: Option<Box<game::Restore>>,
+    /// The selection's loading lifetime is paused, not ended, until a
+    /// candidate opens: a hold at the opening resumes it.
+    loading: bool,
 }
 
 impl PlayerGate {
@@ -85,6 +88,7 @@ impl PlayerGate {
             rearm: None,
             snapshot: 0,
             spare: None,
+            loading: false,
         })
     }
 
@@ -116,6 +120,21 @@ impl PlayerGate {
             room: 0,
             outcome: RearmOutcome::Pending,
         }));
+    }
+
+    /// The selection's loading lifetime paused before an opening.
+    pub fn pause_loading(&mut self) {
+        self.loading = true;
+    }
+
+    /// Whether a loading lifetime is paused before an opening.
+    pub fn loading_paused(&self) -> bool {
+        self.loading
+    }
+
+    /// A candidate opened: whether a paused loading lifetime is to end.
+    pub fn take_loading(&mut self) -> bool {
+        std::mem::take(&mut self.loading)
     }
 
     /// The candidate armed last was handed to audio, with a round's
