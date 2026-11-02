@@ -2135,10 +2135,10 @@ impl Run {
                     // starts over for it first. At most what the buffer
                     // holds: the logic step can push during the drain, and
                     // the rest waits for the next frame.
-                    let rearmed = side.rearms();
+                    let (rearmed, rearmed_origin) = side.rearm_state();
                     if rearmed != *rearms {
                         *rearms = rearmed;
-                        *origin = side.rearmed_origin();
+                        *origin = rearmed_origin;
                         screen.rearm();
                     }
                     let room = effects.capacity();

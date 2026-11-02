@@ -19,10 +19,10 @@
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 #![cfg_attr(
-    not(feature = "dev-tools"),
+    not(any(feature = "dev-tools", test)),
     expect(
         dead_code,
-        reason = "production installs no start gate until S10-04b turns it on; development runs do"
+        reason = "production installs no start gate until S10-04b turns it on; development runs and tests do"
     )
 )]
 

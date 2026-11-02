@@ -4,7 +4,7 @@
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering, fence};
 
 use bms_model::TimeUs;
 use eval::{GaugeState, JudgeEvent, Tally};
@@ -56,14 +56,16 @@ pub struct RenderSink {
 /// What a READY candidate's rearm tells the render side: how many rearms
 /// there were and how many effects were queued before the latest, in one
 /// word so the two are always read together, and the latest rearmed
-/// candidate's origin.
+/// candidate's origin, read with the count as one snapshot through a
+/// sequence the one writer, the logic step, makes odd while it writes.
 #[derive(Debug, Default)]
 struct Rearmed {
+    /// Odd while a rearm is written, advanced by two for each.
+    seq: AtomicU64,
     /// The rearms so far above [`QUEUED_BITS`], the effects queued before
     /// the latest rearm below: those are a cancelled candidate's.
     word: AtomicU64,
-    /// The latest rearmed candidate's chart time 0 on the rig's clock,
-    /// stored before the word.
+    /// The latest rearmed candidate's chart time 0 on the rig's clock.
     origin: AtomicI64,
 }
 
@@ -77,6 +79,35 @@ impl Rearmed {
         let w = self.word.load(Ordering::Acquire);
         (w >> QUEUED_BITS, w & ((1 << QUEUED_BITS) - 1))
     }
+
+    /// A rearm's writing begins: its candidate's `origin`, which no
+    /// snapshot takes until [`publish`](Self::publish).
+    fn begin(&self, origin: TimeUs) {
+        let s = self.seq.load(Ordering::Relaxed);
+        self.seq.store(s.wrapping_add(1), Ordering::Relaxed);
+        fence(Ordering::Release);
+        self.origin.store(origin.0, Ordering::Relaxed);
+    }
+
+    /// The rearm begun is published: `word` with its origin.
+    fn publish(&self, word: u64) {
+        self.word.store(word, Ordering::Release);
+        let s = self.seq.load(Ordering::Relaxed);
+        self.seq.store(s.wrapping_add(1), Ordering::Release);
+    }
+
+    /// The rearms so far and the latest one's origin, of one rearm;
+    /// `None` while one is written.
+    fn try_snapshot(&self) -> Option<(u64, TimeUs)> {
+        let before = self.seq.load(Ordering::Acquire);
+        if before & 1 == 1 {
+            return None;
+        }
+        let word = self.word.load(Ordering::Acquire);
+        let origin = self.origin.load(Ordering::Acquire);
+        let after = self.seq.load(Ordering::Relaxed);
+        (before == after).then_some((word >> QUEUED_BITS, TimeUs(origin)))
+    }
 }
 
 impl EventSink for RenderSink {
@@ -89,12 +120,10 @@ impl EventSink for RenderSink {
     }
 
     fn rearm(&mut self, origin: TimeUs) {
-        self.rearmed.origin.store(origin.0, Ordering::Release);
+        self.rearmed.begin(origin);
         let (count, _) = self.rearmed.read();
         let queued = self.pushed & ((1 << QUEUED_BITS) - 1);
-        self.rearmed
-            .word
-            .store(((count + 1) << QUEUED_BITS) | queued, Ordering::Release);
+        self.rearmed.publish(((count + 1) << QUEUED_BITS) | queued);
     }
 }
 
@@ -188,14 +217,19 @@ impl RenderSide {
         self.rearmed.read().0
     }
 
-    /// Where the latest rearmed READY candidate puts its chart time 0 on
-    /// the rig's clock: the screen draws from there once [`rearms`]
-    /// changed.
-    ///
-    /// [`rearms`]: Self::rearms
+    /// [`rearms`](Self::rearms) with where the latest rearmed READY
+    /// candidate puts its chart time 0 on the rig's clock, both of the
+    /// same rearm: the screen draws from there once the count changed.
+    /// A rearm being written is waited out, which takes the logic step a
+    /// few stores.
     #[must_use]
-    pub fn rearmed_origin(&self) -> TimeUs {
-        TimeUs(self.rearmed.origin.load(Ordering::Acquire))
+    pub fn rearm_state(&self) -> (u64, TimeUs) {
+        loop {
+            if let Some(state) = self.rearmed.try_snapshot() {
+                return state;
+            }
+            std::hint::spin_loop();
+        }
     }
 }
 
@@ -234,7 +268,7 @@ mod tests {
     use eval::{JudgeEvent, JudgeEventKind, Tally};
     use rules::PerJudgment;
 
-    use super::{PlayView, render_link};
+    use super::{PlayView, QUEUED_BITS, render_link};
     use crate::logic::EventSink;
 
     fn effect(seq: u64) -> JudgeEvent {
@@ -248,6 +282,31 @@ mod tests {
 
     fn seqs(effects: &[JudgeEvent]) -> Vec<u64> {
         effects.iter().map(|e| e.seq).collect()
+    }
+
+    /// A play view before anything is judged.
+    fn fresh() -> PlayView {
+        PlayView {
+            finalized: None,
+            tally: Tally {
+                counts: PerJudgment {
+                    perfect: 0,
+                    great: 0,
+                    good: 0,
+                    bad: 0,
+                    poor: 0,
+                },
+                ex_score: 0,
+                bp: 0,
+                combo: 0,
+                max_combo: 0,
+                empty_poor: 0,
+            },
+            gauges: Vec::new(),
+            complete: false,
+            playing: false,
+            events: 0,
+        }
     }
 
     /// A frame's drain stops at its buffer's capacity even while the logic
@@ -357,9 +416,25 @@ mod tests {
         side.drain_effects_of(seen, 8, |e| frame.push(*e));
         assert!(frame.is_empty(), "{:?}", seqs(&frame));
         // The frame after sees the rearm, starts over, and gets them all.
-        let seen = side.rearms();
-        assert_eq!((seen, side.rearmed_origin()), (1, TimeUs(5_000)));
+        let (seen, origin) = side.rearm_state();
+        assert_eq!((seen, origin), (1, TimeUs(5_000)));
         side.drain_effects_of(seen, 8, |e| frame.push(*e));
         assert_eq!(seqs(&frame), [10, 11]);
+    }
+
+    /// A second rearm overlapping a frame's look: while its origin is
+    /// stored and its count not yet published, no snapshot pairs the first
+    /// rearm's count with the second's origin; once published, both are
+    /// the second's.
+    #[test]
+    fn a_rearm_state_is_never_of_two_rearms() {
+        let (mut sink, _view, side) = render_link(8, &fresh());
+        sink.rearm(TimeUs(5_000));
+        assert_eq!(side.rearm_state(), (1, TimeUs(5_000)));
+        // The logic step's second rearm, halfway.
+        sink.rearmed.begin(TimeUs(9_000));
+        assert_eq!(side.rearmed.try_snapshot(), None, "a mixed snapshot");
+        sink.rearmed.publish(2 << QUEUED_BITS);
+        assert_eq!(side.rearm_state(), (2, TimeUs(9_000)));
     }
 }
