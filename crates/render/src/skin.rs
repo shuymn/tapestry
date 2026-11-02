@@ -6,7 +6,10 @@
 use bms_model::{Chart, TimeUs};
 use eval::{JudgeEvent, Section};
 use game::PlayView;
-use skin_model::{BuildError, Canvas, ChartText, Fit, PlayContext};
+use skin_model::{
+    BuildError, Canvas, ChartText, CoverSettings, Fit, LaneView, Layout, LoadState, LoadingGauge,
+    PlayContext,
+};
 
 use crate::{Gpu, MAX_SPRITES, SpriteBatch};
 
@@ -47,6 +50,90 @@ impl FrameInput<'_> {
     #[must_use]
     pub const fn display_time(&self) -> TimeUs {
         TimeUs(self.now.0.saturating_add(self.display_offset.0))
+    }
+}
+
+/// What one loading frame draws from (design.md "Rendering and Skins",
+/// loading state): the model's loading frame
+/// ([`skin_model::LoadingFrame`]) with the loading lifetime it belongs to
+/// and the revision of the loading text shown with it.
+#[derive(Clone, Copy, Debug)]
+pub struct LoadingFrame<'a> {
+    /// The loading lifetime the frame belongs to: a skin's loading state
+    /// starts afresh at the first frame of another
+    /// ([`PlaySkin::enter_loading`]).
+    pub lifetime: u64,
+    /// The frame's time on the loading clock: timers age on it.
+    pub now: TimeUs,
+    /// The load: its origin on the loading clock and its progress.
+    pub load: LoadState,
+    /// The target's size in pixels as the renderer last applied it, never
+    /// zero; [`Renderer::loading_frame`](crate::Renderer::loading_frame)
+    /// sets it so.
+    pub target: [u32; 2],
+    /// The player's layout.
+    pub layout: &'a Layout,
+    /// The hi-speed and the effective covers.
+    pub lanes: LaneView,
+    /// The stored cover settings `lanes` follows.
+    pub covers: CoverSettings,
+    /// The shown gauge's descriptor; `None` leaves what depends on it
+    /// undrawn.
+    pub gauge: Option<LoadingGauge>,
+    /// The revision of the loading text installed for this lifetime; 0
+    /// with none.
+    pub text: u64,
+}
+
+impl LoadingFrame<'static> {
+    /// A frame of lifetime `lifetime` at `now` on the loading clock, from
+    /// its origin `since`, with the interim values the render thread gives
+    /// until the player's bridge (docs/stage3.md S10-03c-3): the author's
+    /// layout, every cover 0 and off and not being adjusted, the lanes'
+    /// `visible_time` from the tuning snapshot, no gauge descriptor,
+    /// progress 0 and no text. The renderer applies its own target.
+    #[must_use]
+    pub const fn interim(lifetime: u64, now: TimeUs, since: TimeUs, visible_time: TimeUs) -> Self {
+        Self {
+            lifetime,
+            now,
+            load: LoadState { since, percent: 0 },
+            target: [1_920, 1_080],
+            layout: &Layout::AUTHOR,
+            lanes: LaneView {
+                visible_time,
+                cover: 0,
+                lift: 0,
+                hidden: 0,
+            },
+            covers: CoverSettings {
+                cover: 0,
+                lift: 0,
+                hidden: 0,
+                cover_enabled: false,
+                lift_enabled: false,
+                hidden_enabled: false,
+                adjusting: false,
+            },
+            gauge: None,
+            text: 0,
+        }
+    }
+}
+
+impl<'a> LoadingFrame<'a> {
+    /// The model's frame of it.
+    #[must_use]
+    pub const fn model(&self) -> skin_model::LoadingFrame<'a> {
+        skin_model::LoadingFrame {
+            now: self.now,
+            load: self.load,
+            target: self.target,
+            layout: self.layout,
+            lanes: self.lanes,
+            covers: self.covers,
+            gauge: self.gauge,
+        }
     }
 }
 
@@ -162,14 +249,33 @@ pub trait PlaySkin: Send {
         Canvas::new(target, Fit::Fixed)
     }
 
-    /// Fills `out`, which arrives empty, with the play screen's frame while
-    /// a chart loads before READY (design.md "Play Lifecycle"):
-    /// the lanes and the rest of the screen without notes, and nothing of
-    /// any chart: the skin may still hold the previous chart's
-    /// preparation, whose values the loading frame must not show. The
-    /// renderer draws the load's text, the chosen chart's, over it. The
-    /// default draws nothing.
-    fn build_loading(&mut self, out: &mut SpriteBatch) {
-        let _ = out;
+    /// The loading lifetime `lifetime` is about to draw its frame,
+    /// between frames: a skin whose loading state belongs to another
+    /// lifetime and was built starts it afresh, allocating nothing. The
+    /// default keeps nothing per lifetime.
+    fn enter_loading(&mut self, lifetime: u64) {
+        let _ = lifetime;
+    }
+
+    /// Fills `out`, which arrives empty, with the play screen's frame `f`
+    /// while a chart loads before READY (design.md "Play
+    /// Lifecycle"): the lanes and the rest of the screen without notes,
+    /// and nothing of any chart: the skin may still hold the previous
+    /// chart's preparation, whose values the loading frame must not show.
+    /// The renderer draws the load's text, the chosen chart's, over it.
+    /// Allocation-free, the error included. The default draws nothing.
+    ///
+    /// # Errors
+    ///
+    /// The model's [`BuildError`] for a loading frame it cannot build: the
+    /// renderer drops what was pushed, submits nothing, and builds that
+    /// loading state no more within its lifetime.
+    fn build_loading(
+        &mut self,
+        f: &LoadingFrame<'_>,
+        out: &mut SpriteBatch,
+    ) -> Result<(), BuildError> {
+        let _ = (f, out);
+        Ok(())
     }
 }

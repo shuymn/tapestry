@@ -101,6 +101,18 @@ pub trait AppRig: Rig {
     fn take_practice(&mut self) -> Option<PracticeInput> {
         None
     }
+    /// A Start was taken on the practice page, before anything of it
+    /// begins: whether the play screen can show the chart's loading state
+    /// now. A notice instead keeps the page, with it, and admits nothing;
+    /// the page's other controls go on as before. Asked at every Start,
+    /// never blocking. The default is always ready.
+    ///
+    /// # Errors
+    ///
+    /// The notice to show on the practice page.
+    fn start_ready(&mut self) -> Result<(), String> {
+        Ok(())
+    }
     /// The next step of the play preset taken on the select screen, in
     /// the order taken: those before a chosen chart, taken by the same
     /// [`choose`](Self::choose), apply to it.
@@ -517,6 +529,11 @@ fn practice_chart<R: AppRig>(
                 }
                 PracticeActed::Back => return Ok(Leave::Back),
             }
+        }
+        if start && let Err(n) = rig.start_ready() {
+            screen.set_notice(Some(n));
+            rig.entered_practice(&screen);
+            continue;
         }
         if start {
             // The play preset changes only at a Start and as a round
