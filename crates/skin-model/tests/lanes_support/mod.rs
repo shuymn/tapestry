@@ -63,7 +63,16 @@ fn root() -> &'static Path {
             RgbaImage::from_pixel(w, h, Rgba([255; 4]))
                 .save_with_format(tmp.path(), ImageFormat::Png)
                 .unwrap();
-            tmp.persist(dir.join(format!("{i}.png"))).unwrap();
+            // Under nextest each test is a process of its own, so another
+            // may write the same file at once. On Windows the rename over a
+            // file another process has open fails; the file there has the
+            // same bytes, so it is used.
+            let path = dir.join(format!("{i}.png"));
+            if let Err(e) = tmp.persist(&path)
+                && !path.is_file()
+            {
+                panic!("{path:?}: {e}");
+            }
         }
         dir
     })
