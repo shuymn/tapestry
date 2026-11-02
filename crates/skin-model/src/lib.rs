@@ -41,7 +41,7 @@
 //! glyph cells; a gauge's lit and unlit segments; the judgment's grade
 //! and combo; a text's line; a cover's paint moved by the covers and cut
 //! at its trim line; or the lanes' notes, bar lines and judgment line.
-//! From a chart's choice to its countdown the play screen draws a
+//! From a chart's choice to its READY state the play screen draws a
 //! [`Loading`] state instead, which [`Skin::prepare_loading`] makes
 //! without a chart and [`Skin::build_loading`] builds from each
 //! [`LoadingFrame`] through the same evaluation and drawing: `loading`

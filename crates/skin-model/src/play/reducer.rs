@@ -108,8 +108,8 @@ impl Reducer {
 
     /// A clean reducer for one attempt: `initial` gives each gauge's
     /// initial value and maximum, and a gauge whose initial value is at its
-    /// maximum reads on from `play_at`, the attempt's start after the
-    /// countdown.
+    /// maximum reads on from `play_at`, the attempt's start after
+    /// READY.
     pub(crate) fn new(
         chart: &Chart,
         section: Option<&Section>,

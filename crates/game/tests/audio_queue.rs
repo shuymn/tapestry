@@ -129,7 +129,7 @@ fn underruns_count_from_chart_time_zero_until_the_play_ends() {
         worker.step(&mut out).unwrap();
     }
     let counters = control.counters();
-    // Chart time 0 at 200 ms: the underrun at 70 ms is in the countdown.
+    // Chart time 0 at 200 ms: the underrun at 70 ms is in READY.
     let (_sink, queue) = audio_link_at(4, TimeUs(200 * MS));
     control.play(TimeUs(200 * MS), queue).unwrap();
     let first = control.generation();
@@ -169,8 +169,8 @@ fn a_failed_output_is_not_asked_and_a_lost_worker_is_an_error() {
     assert_eq!(control.set_queued_periods(3), Err(AudioWaitError::Timeout));
 }
 
-/// The state × event table of the queue choice: underruns after the
-/// countdown raise it from 2 to 3 whatever ended the play, once; none, or
+/// The state × event table of the queue choice: underruns after
+/// READY raise it from 2 to 3 whatever ended the play, once; none, or
 /// a choice already at 3, leaves it.
 #[test]
 fn the_queue_rises_once_on_steady_underruns_and_never_falls() {

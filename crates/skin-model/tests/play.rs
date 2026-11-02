@@ -1,4 +1,4 @@
-//! A play through `Skin`: retries, countdowns, practice rounds, the beat
+//! A play through `Skin`: retries, READY states, practice rounds, the beat
 //! timer, `when` timers shared by elements, the targets against the
 //! evaluator's, time extremes, and load errors.
 
@@ -93,7 +93,7 @@ fn a_retry_starts_clean() {
 }
 
 #[test]
-fn a_mid_chart_countdown() {
+fn a_mid_chart_ready_state() {
     let chart = taps(&[1_000, 31_000]);
     let s = section(30_000, 60_000, 1_000);
     let skin = load(Vec::new(), vec![element(TimerRef::Builtin(timer::PLAY), 1)]).unwrap();
@@ -113,10 +113,10 @@ fn a_mid_chart_countdown() {
 }
 
 /// In a play the screen timer, which untimed elements run on, starts at
-/// `ready`'s start, so an untimed animation starts again at the
-/// countdown; `loading` stays off and `load.percent` reads 100.
+/// `ready`'s start, so an untimed animation starts again at
+/// READY; `loading` stays off and `load.percent` reads 100.
 #[test]
-fn the_screen_timer_starts_with_the_countdown_in_a_play() {
+fn the_screen_timer_starts_with_ready_in_a_play() {
     let chart = taps(&[1_000, 31_000]);
     let s = section(30_000, 60_000, 1_000);
     let skin = load(
@@ -311,7 +311,7 @@ fn time_extremes_neither_panic_nor_wrap() {
         (-bms_model::DOMAIN + 1..=bms_model::DOMAIN + 1).contains(&b),
         "{b}"
     );
-    // A countdown that would start before the time range is refused.
+    // A READY state that would start before the time range is refused.
     let skin = load(Vec::new(), Vec::new()).unwrap();
     let early = Section {
         start: TimeUs(i64::MIN),
@@ -1096,7 +1096,7 @@ fn the_clocks_round_at_whole_seconds() {
     }
 }
 
-/// The countdown freezes both clocks at the attempt's start, the display
+/// READY freezes both clocks at the attempt's start, the display
 /// offset never moves them, and a section counts its own real-time length
 /// from its mapped start to its mapped end, reset per round.
 #[test]

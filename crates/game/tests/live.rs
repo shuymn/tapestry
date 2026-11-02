@@ -696,7 +696,7 @@ fn retry_with_a_key_held_down() {
     let mut loaded = loaded(dir.path());
     let items = vec![
         key(9_303_000, Z, 1),
-        // Released in play 2's countdown (play time -0.9 s).
+        // Released in play 2's READY state (play time -0.9 s).
         key(9_600_000, Z, 0),
         key(11_503_000, Z, 1),
         key(11_553_000, Z, 0),
@@ -2511,7 +2511,7 @@ fn went(event: Event, at: i64) -> Went {
     )
 }
 
-/// The state × event table of design.md "Play Lifecycle": in the countdown
+/// The state × event table of design.md "Play Lifecycle": in READY
 /// the quit key aborts the play and leaves the chart without a result;
 /// while playing it aborts the play and shows its result, which the next
 /// quit leaves; once the play is complete, in its audio tail, it skips to
@@ -2523,9 +2523,9 @@ fn every_state_and_event_of_a_play() {
     use game::Leave::{Back, Quit};
     let aborted = PlayEnd::Aborted;
     let done = PlayEnd::Completed;
-    // The countdown (play time -0.5 s) and playing (1.2 s): only the quit
+    // READY (play time -0.5 s) and playing (1.2 s): only the quit
     // key's result differs.
-    for (state, at, quit_shows) in [("countdown", 7_800_000, 0), ("playing", 9_500_000, 1)] {
+    for (state, at, quit_shows) in [("ready", 7_800_000, 0), ("playing", 9_500_000, 1)] {
         let cases = [
             (
                 Event::QuitKey,
@@ -2895,8 +2895,8 @@ fn a_slow_preparation_stays_cancellable_and_never_opens_recording() {
     }
 }
 
-/// Whether each step's view published playing: false through the
-/// countdown, true from the chart's start through the step that completes
+/// Whether each step's view published playing: false through
+/// READY, true from the chart's start through the step that completes
 /// the play, and false through the tail and once recording closed.
 #[test]
 fn the_play_phase_is_published_as_each_step_enters_it() {

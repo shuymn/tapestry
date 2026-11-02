@@ -1,5 +1,5 @@
 //! The play lifecycle every driver shares (design.md "Play Lifecycle"): prepare
-//! → open recording (the countdown starts) → play → evaluation complete → audio
+//! → open recording (READY starts) → play → evaluation complete → audio
 //! tail → save → result, with retry, quit, focus loss, removal of the last
 //! device, suspend, an audio, screen or input-thread failure, and a session
 //! policy failure ending the play from any state.
@@ -13,19 +13,19 @@
 //!   usable, the play preset is refreshed, then audio and the play's
 //!   attempt are prepared on the screen with that preset, the loading
 //!   state ends, and a quit or a failure is looked for again at each step
-//!   ([`ready_to_open`]); the countdown origin is chosen only once that
+//!   ([`ready_to_open`]); READY's origin is chosen only once that
 //!   work is done. A preparation the screen refuses goes back to where the
 //!   chart was chosen with the reason ([`LiveError::Preparation`]), and
 //!   one the player cancels, or a quit before the opening, opens nothing;
 //!   either gives the play's number back ([`Loaded::withdraw`]).
-//!   The play's setup follows the opening, at the countdown's start: the
+//!   The play's setup follows the opening, at READY's start: the
 //!   plan, the reservation of the whole recording window and the logic
 //!   step's construction, bounded by the chart and the reservation, then the
 //!   handoff to audio and the screen (design.md "Recording Capacity", "Play
 //!   Lifecycle"). The reserved memory is not touched in advance.
 //! - A quit is latched by the rig and checked before recording opens and in
 //!   every wait, so it is never lost to a transition.
-//! - The quit key in a play's countdown, before its chart starts (chart
+//! - The quit key in a play's READY state, before its chart starts (chart
 //!   time 0, a round's section start), leaves the chart without a result;
 //!   from there until the play is complete it aborts the play, whose
 //!   result shows, ended midway, as for any other abort.
@@ -44,7 +44,7 @@
 //!   round at the following step, with no result between.
 //! - Each step publishes whether the play is playing (design.md "Play
 //!   Lifecycle"), as the step entered it: from the chart's start until a
-//!   terminal transition, so the countdown is not, the step that processes
+//!   terminal transition, so READY is not, the step that processes
 //!   a gauge failure or the completion still is, and the stop, the tail and
 //!   the ring-out are not. It is the lifecycle's phase, not `!complete`.
 //! - A practice round opens recording [`RESTORE_AHEAD`](crate::RESTORE_AHEAD)
@@ -310,7 +310,7 @@ pub trait Rig {
     /// The play ended: its report, before any end screen.
     fn ended(&mut self, report: &PlayReport);
     /// Shows the end screen of a play that was not retried or quit in its
-    /// countdown, with its result screen's view; called again whenever the
+    /// READY state, with its result screen's view; called again whenever the
     /// view changes or the screen was built again.
     fn show_end(&mut self, report: &PlayReport, screen: &ResultScreen);
     /// Before each play opens recording: settings changed since the previous
@@ -400,7 +400,7 @@ fn preflight<R: Rig>(rig: &R) -> Result<(), LiveError<R::ScreenError>> {
 /// How the plays of a chart were left.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Leave {
-    /// The player left the chart: quit in a play's countdown, or back on
+    /// The player left the chart: quit in a play's READY state, or back on
     /// its result.
     Back,
     /// The window is closing: the run ends.
@@ -445,7 +445,7 @@ fn leave<R: Rig>(rig: &R) -> Result<Leave, LiveError<R::ScreenError>> {
 
 /// Plays one chart until the player leaves it: every play's report goes
 /// to [`Rig::ended`]; a play that was not retried, and not quit in its
-/// countdown, shows its result, which waits for a [`MenuCommand`]. The
+/// READY state, shows its result, which waits for a [`MenuCommand`]. The
 /// quit key before the chart starts ([`Loaded::starts_at`]) leaves the
 /// chart ([`Leave::Back`]); from then until the play is complete it aborts
 /// the play, whose result shows, ended midway; after it, it skips the tail
@@ -481,7 +481,7 @@ pub fn run_chart<R: Rig>(
             continue;
         }
         // A tail stage that ran to its end and repeats (a repeated round's
-        // ring-out) is followed by the next round, whose countdown begins at
+        // ring-out) is followed by the next round, whose READY state begins at
         // the following step; any other end shows the result.
         if next_round {
             rig.wait();
@@ -678,7 +678,7 @@ fn play_and_next<R: Rig>(
             return Err(refused(rig, e));
         }
     }
-    // A full play's recording opens its countdown before chart time 0, a
+    // A full play's recording opens its READY state before chart time 0, a
     // practice round's `RESTORE_AHEAD` before its lead-in, whose start its
     // audio is restored at (design.md "Mid-Chart Start and Section
     // Repeat").
@@ -878,7 +878,7 @@ fn play_and_next<R: Rig>(
     });
     // A completed play's tail took the carried command.
     let next = carried.filter(|_| end != PlayEnd::Completed);
-    // The quit key before the chart started (in the countdown, or as
+    // The quit key before the chart started (in READY, or as
     // recording closed on a play aborted there) leaves the chart without a
     // result; from its start on, the aborted play's result shows, and a
     // quit that arrived as recording closed is taken with the play.

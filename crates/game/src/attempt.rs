@@ -49,7 +49,7 @@ impl std::fmt::Display for PreparationRefusal {
 /// What an attempt plays.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AttemptKind {
-    /// The whole chart, its countdown `lead_in` long.
+    /// The whole chart, its READY state `lead_in` long.
     Full {
         /// From recording's opening to chart time 0.
         lead_in: TimeUs,
@@ -133,7 +133,7 @@ const PRACTICE_PAD: TimeUs = TimeUs(1_000_000);
 
 impl Attempt {
     /// The attempt numbered `number` of `chart` under `preset`: the whole
-    /// chart with a `lead_in` countdown, or the round of `section`, its
+    /// chart with a `lead_in` READY state, or the round of `section`, its
     /// notes ending at `last_note_end` ([`NoteEnd::of`]).
     #[must_use]
     pub fn new(

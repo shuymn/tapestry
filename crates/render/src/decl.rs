@@ -12,7 +12,7 @@
 //! exactly that bundle from memory, never from the files it came from.
 //!
 //! Preparation, the `Play`, its bitmap lines and its prepared text, runs
-//! before the countdown and allocates; a frame's [`PlaySkin::build`]
+//! before READY and allocates; a frame's [`PlaySkin::build`]
 //! translates the [`FrameInput`] into a `SkinFrame` and builds into the
 //! batch, allocating nothing.
 

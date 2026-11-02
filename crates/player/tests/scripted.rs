@@ -212,7 +212,7 @@ fn scripted_play_writes_a_record() {
         "{stdout}"
     );
     assert!(stdout.contains("re-evaluation matches live: true"));
-    for f in ["countdown.png", "play.png", "end.png"] {
+    for f in ["ready.png", "play.png", "end.png"] {
         assert!(frames.join(f).is_file(), "{f}");
     }
 
@@ -341,14 +341,14 @@ fn the_play_setup_reaches_the_figures() {
     let saved = records(&fx.appdata);
     assert_eq!(saved.len(), 1, "{saved:?}");
     let m = measured(&saved[0]);
-    let setup = int(&m, "countdown", "setup_us").unwrap();
-    let first = int(&m, "countdown", "first_frame_us").unwrap();
+    let setup = int(&m, "ready", "setup_us").unwrap();
+    let first = int(&m, "ready", "first_frame_us").unwrap();
     // The setup takes time and ends within the 1 s lead-in; the first
     // frame comes after it.
     assert!(0 < setup && setup < 1_000_000, "{setup}");
     assert!(first > setup, "{first} {setup}");
     assert!(stdout.contains(&format!(
-        "countdown: setup {setup} us, first frame {first} us after it started"
+        "ready: setup {setup} us, first frame {first} us after it started"
     )));
     // Seconds of play that fill buffers and draw frames: some page faults.
     assert!(int(&m, "faults", "process").unwrap() > 0);
@@ -1020,7 +1020,7 @@ fn direct_play_measures_at_each_load() {
                 .map(str::to_owned)
                 .collect()
         };
-        // Measured once, before the first countdown; the retry reuses it.
+        // Measured once, before the first READY state; the retry reuses it.
         assert_eq!(
             line("loudness: measuring autoplay.bms").len(),
             1,
