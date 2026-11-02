@@ -170,3 +170,43 @@ pub fn survey(root: &Path, entry: &str, cancel: &Cancel) -> Survey {
     }
     s
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{Cancel, survey};
+
+    fn folder(files: &[(&str, &str)]) -> tempfile::TempDir {
+        let d = tempfile::tempdir().unwrap();
+        for (name, text) in files {
+            std::fs::write(d.path().join(name), text).unwrap();
+        }
+        d
+    }
+
+    #[test]
+    fn a_failed_configured_pass_keeps_its_modules_and_counters() {
+        // The module only the configured pass loads fails at its line 2.
+        let d = folder(&[
+            (
+                "s.luaskin",
+                "if skin_config then require(\"late\") end\nreturn { type = 0 }",
+            ),
+            ("late.lua", "local x = 1\nerror(\"late\")"),
+        ]);
+        let s = survey(d.path(), "s.luaskin", &Cancel::new());
+        assert_eq!(s.outcome, "lua Error");
+        assert_eq!(s.modules, 2);
+        assert_eq!(s.at, Some((1, 2, 0)));
+        assert_eq!(s.usage.requires, 1);
+    }
+
+    #[test]
+    fn a_converted_value_is_located_by_its_ordinal() {
+        let d = folder(&[("s.luaskin", "return { type = 0, extra = { 1, x = 2 } }")]);
+        let s = survey(d.path(), "s.luaskin", &Cancel::new());
+        assert_eq!(s.outcome, "header lua Mixed");
+        let (module, line, col) = s.at.unwrap();
+        assert_eq!((module, line), (0, 0));
+        assert!(col > 1, "{col}");
+    }
+}
