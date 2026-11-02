@@ -14,7 +14,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use bms_model::{Chart, ChartBuilder, TimeUs};
 use common::{MS, control, device, lane, press, release};
-use eval::{Evaluator, InputStart, JudgeEvent, PhysicalInputEvent, Section, SourceId};
+use eval::{
+    AxisBinding, ControlId, Evaluator, InputKind, InputStart, JudgeEvent, PhysicalInputEvent,
+    ScratchSettings, Section, SourceId,
+};
 
 struct Counting;
 
@@ -54,16 +57,32 @@ unsafe impl GlobalAlloc for Counting {
 static GLOBAL: Counting = Counting;
 
 /// Taps on lanes 1 to 3 every 100 ms from 1 s, a long note on lane 4 at
-/// 1.5 s, and a mine on lane 5.
+/// 1.5 s, a mine on lane 5, and scratch taps at 1.55 and 2.05 s.
 fn chart() -> Chart {
     let mut b = ChartBuilder::new(150_000);
     for i in 0..20 {
         b = b.tap(lane(1 + (i % 3) as u8), TimeUs((1_000 + i * 100) * MS));
     }
-    b.long(lane(4), TimeUs(1_500 * MS), TimeUs(1_900 * MS))
+    b.tap(lane(0), TimeUs(1_550 * MS))
+        .tap(lane(0), TimeUs(2_050 * MS))
+        .long(lane(4), TimeUs(1_500 * MS), TimeUs(1_900 * MS))
         .mine(lane(5), TimeUs(1_200 * MS), 10)
         .build()
         .unwrap()
+}
+
+/// The scratch's absolute axis, bound to lane 0.
+const AXIS: ControlId = ControlId(0x1_0030);
+
+fn axis(received: i64, value: i32) -> PhysicalInputEvent {
+    PhysicalInputEvent {
+        received: TimeUs(received),
+        source: SourceId(0),
+        kind: InputKind::Control {
+            control: AXIS,
+            value,
+        },
+    }
 }
 
 fn run(ev: &mut Evaluator<'_>, inputs: &[PhysicalInputEvent], to: i64, out: &mut Vec<JudgeEvent>) {
@@ -83,7 +102,15 @@ fn run(ev: &mut Evaluator<'_>, inputs: &[PhysicalInputEvent], to: i64, out: &mut
 fn a_reset_evaluator_is_a_fresh_one_and_allocates_nothing() {
     let chart = chart();
     let preset = rules::beatoraja_style();
-    let dev = device(&[0]);
+    let mut dev = device(&[0]);
+    dev.sources[0].axes.push(AxisBinding {
+        control: AXIS,
+        lane: lane(0),
+        scratch: ScratchSettings {
+            mode: eval::AxisMode::Absolute { wrap: 256 },
+            ..ScratchSettings::DEFAULT
+        },
+    });
     let section = Section {
         start: TimeUs(1_300 * MS),
         end: TimeUs(2_500 * MS),
@@ -104,11 +131,17 @@ fn a_reset_evaluator_is_a_fresh_one_and_allocates_nothing() {
         press(1_500 * MS, 0, 4),
         press(900 * MS, 0, 6),
     ]);
+    // The scratch turned for the 1.55 s note: still pressing, its release
+    // pending, when the run is cancelled.
+    first.extend((0..4).map(|k| axis((1_540 + k) * MS, 10 + i32::try_from(k).unwrap())));
     first.sort_by_key(|e| e.received);
-    // The next run starts with lane 2 held and plays every note late.
+    // Input queued, not yet reached by the watermark, at the reset.
+    let queued = [press(1_700 * MS, 0, 1), axis(1_710 * MS, 40)];
+    // The next run starts with lane 2 held and the axis at 100, and plays
+    // every note late.
     let start = InputStart {
         opened_at: TimeUs(-500 * MS),
-        held: vec![(SourceId(0), control(2), 1)],
+        held: vec![(SourceId(0), control(2), 1), (SourceId(0), AXIS, 100)],
     };
     let mut second: Vec<PhysicalInputEvent> = (0..20)
         .flat_map(|i| {
@@ -119,6 +152,7 @@ fn a_reset_evaluator_is_a_fresh_one_and_allocates_nothing() {
         .collect();
     second.push(press(1_520 * MS, 0, 4));
     second.push(release(1_900 * MS, 0, 4));
+    second.extend((0..4).map(|k| axis((2_060 + k) * MS, 101 + i32::try_from(k).unwrap())));
     second.sort_by_key(|e| e.received);
     let end = 5_000;
 
@@ -131,6 +165,9 @@ fn a_reset_evaluator_is_a_fresh_one_and_allocates_nothing() {
             Evaluator::new(&chart, &preset, &dev, &InputStart::default(), section, 64).unwrap();
         let mut out = Vec::with_capacity(ev.max_events(first.len() + second.len()));
         run(&mut ev, &first, 1_600 * MS, &mut out);
+        for e in queued {
+            ev.push_input(e).unwrap();
+        }
         assert!(!out.is_empty(), "the cancelled run judged");
         TRACK.with(|t| t.set(true));
         // The count works: an allocation that escapes is counted.
