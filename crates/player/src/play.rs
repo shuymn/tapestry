@@ -650,7 +650,7 @@ impl Rig for PlayerRig<'_> {
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn cancel_candidate(&mut self, generation: u32) {
         self.audio.control.cancel();
-        if let Some(gate) = &self.gate {
+        if let Some(gate) = &mut self.gate {
             crate::start_gate::wait_dropped(&self.audio.control, gate, generation);
         }
     }
@@ -829,8 +829,10 @@ impl Rig for PlayerRig<'_> {
     }
 
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    /// A gated candidate's cancellation the audio thread never
+    /// acknowledged counts as its stall.
     fn audio_failure(&self) -> Option<OutputError> {
-        self.audio.control.failure()
+        crate::start_gate::output_failure(&self.audio.control, self.gate.as_ref())
     }
 
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
