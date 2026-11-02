@@ -707,7 +707,7 @@ impl Adjustment {
         // tempo; Classic keeps `H`.
         if shown
             && self.options.hispeed().mode == SpeedMode::Floating
-            && let Some(b) = self.bpm_at(time, tempo)
+            && let Ok(Some(b)) = self.bpm_at(time, tempo)
         {
             let solved = self.solve_at(b);
             self.commit_hispeed(solved);
@@ -914,7 +914,7 @@ impl Adjustment {
                 cover.amount = u16::try_from(amount).map_err(|_| Unrepresentable)?;
                 solve_needed |= floating && kind != CoverKind::Hidden;
             }
-            if solve_needed && let Some(b) = self.bpm_at(group.time, tempo) {
+            if solve_needed && let Some(b) = self.bpm_at(group.time, tempo)? {
                 hispeed = Some(solve(b, h.green_target, covers)?);
             }
             Ok(())
@@ -930,14 +930,26 @@ impl Adjustment {
 
     /// The playback tempo at the presentation head for `time`: the phase's
     /// base head plus the display offset, the practice speed applied once.
-    fn bpm_at<T: TempoMap>(&self, time: TimeUs, tempo: &T) -> Option<Ratio> {
-        let prepared = self.tempo?;
+    ///
+    /// `Ok(None)` when no tempo is known; an error when the playback tempo
+    /// does not fit, which fails the transaction that needed it.
+    fn bpm_at<T: TempoMap>(
+        &self,
+        time: TimeUs,
+        tempo: &T,
+    ) -> Result<Option<Ratio>, Unrepresentable> {
+        let Some(prepared) = self.tempo else {
+            return Ok(None);
+        };
         let base = match self.head {
             Head::Frozen { opens_at } => opens_at.0,
             Head::Clock { at, chart } => chart.0.saturating_add(time.0.saturating_sub(at.0)),
         };
         let head = TimeUs(base.saturating_add(self.display_offset_us));
-        playback(tempo.bpm_at(head)?, prepared.speed).ok()
+        let Some(bpm) = tempo.bpm_at(head) else {
+            return Ok(None);
+        };
+        playback(bpm, prepared.speed).map(Some)
     }
 
     fn solve_at(&self, bpm: Ratio) -> Result<Ratio, Unrepresentable> {

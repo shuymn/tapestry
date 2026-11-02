@@ -1254,6 +1254,11 @@ fn play_options_refuse_each_value_outside_its_range_by_name() {
 
 // ---- Exactness at the edges ----
 
+/// 150 + 10⁻¹⁷ BPM: exact, yet its terms leave no room in a product.
+fn tight_bpm() -> Ratio {
+    r(15_000_000_000_000_000_001, 100_000_000_000_000_000)
+}
+
 #[test]
 fn the_session_clock_runs_in_real_time_and_the_speed_scales_only_the_tempo() {
     // At 150 %, 150 BPM changing to 300 at session time 1.2 s: an
@@ -1274,4 +1279,19 @@ fn the_session_clock_runs_in_real_time_and_the_speed_scales_only_the_tempo() {
     rig.at(1_000 * MS).press(SELECT).tap(BLACK);
     rig.at(1_001 * MS).tap(WHITE).release(SELECT);
     assert_eq!(h(&rig.snap()), solve(bpm(225), 300, &sudden(200)).unwrap());
+}
+
+#[test]
+fn a_playback_tempo_that_does_not_fit_fails_the_transaction() {
+    let mut rig = Rig::new(PlayOptions::default(), Map(vec![(0, tight_bpm())]));
+    rig.ev(Event::Prepare {
+        references: References::all(bpm(150)),
+        speed: Speed::FASTEST,
+    });
+    let before = rig.snap();
+    rig.at(10 * MS).press(SELECT).tap(BLACK).release(SELECT);
+    let s = rig.snap();
+    assert_eq!(rig.a.diagnostics().unrepresentable, 1);
+    assert_eq!(s.options, before.options);
+    assert_eq!(s.hispeed, before.hispeed);
 }
