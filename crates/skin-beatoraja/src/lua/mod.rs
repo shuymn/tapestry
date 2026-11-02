@@ -70,8 +70,9 @@ pub enum LuaLimit {
     Instructions,
     /// [`limits::MAX_LUA_MEMORY`]: an allocation failed.
     Memory,
-    /// The C stack ran out while an error was handled.
-    Stack,
+    /// An error handler did not complete: it failed, recursed or ran out
+    /// of stack or memory.
+    Handler,
     /// [`limits::MAX_HOST_CALLS`].
     HostCalls,
     /// [`limits::MAX_NATIVE_WORK`].
@@ -83,7 +84,7 @@ impl fmt::Display for LuaLimit {
         f.write_str(match self {
             Self::Instructions => "the instruction limit",
             Self::Memory => "the memory limit",
-            Self::Stack => "the stack while an error was handled",
+            Self::Handler => "an error handler's failure",
             Self::HostCalls => "the host call limit",
             Self::NativeWork => "the library work limit",
         })
@@ -181,6 +182,8 @@ pub(crate) struct Pass {
     names: RefCell<Vec<(String, FileId)>>,
     cache: RefCell<Vec<(FileId, Option<RegistryKey>)>>,
     depth: Cell<u32>,
+    /// The metatable snapshots this pass attached and guards, by address.
+    snapshots: RefCell<Vec<usize>>,
     /// The host API functions, by address.
     hosts: RefCell<HashMap<usize, u16>>,
     handled: Cell<u64>,
@@ -223,6 +226,7 @@ impl Pass {
             names: RefCell::new(Vec::new()),
             cache: RefCell::new(Vec::new()),
             depth: Cell::new(0),
+            snapshots: RefCell::new(Vec::new()),
             hosts: RefCell::new(HashMap::new()),
             handled: Cell::new(0),
             last_error: RefCell::new(None),
@@ -264,6 +268,14 @@ impl Pass {
 
     fn last_error(&self) -> Option<Loc> {
         self.last_error.borrow().clone()
+    }
+
+    fn snapshot(&self, addr: usize) {
+        self.snapshots.borrow_mut().push(addr);
+    }
+
+    fn snapshot_of(&self, addr: usize) -> bool {
+        self.snapshots.borrow().contains(&addr)
     }
 
     fn host_api(&self, addr: usize, api: u16) {

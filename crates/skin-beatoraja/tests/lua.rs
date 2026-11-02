@@ -359,6 +359,91 @@ fn finalizers_and_weak_tables_are_refused() {
 }
 
 #[test]
+fn a_metatable_is_fixed_when_it_is_attached() {
+    // Garbage enough for the collector to run several cycles.
+    let churn = "for i = 1, 400 do local s = string.rep(\"x\", 1 << 16) .. i end";
+    for (attach, change) in [
+        (
+            "local mt = {}\nlocal t = setmetatable({}, mt)",
+            "mt.__mode = \"v\"",
+        ),
+        (
+            "local mt = {}\nlocal t = setmetatable({}, mt)",
+            "rawset(mt, \"__mode\", \"v\")",
+        ),
+        (
+            "local mt = {}\nlocal t = setmetatable({}, mt)",
+            "getmetatable(t).__mode = \"v\"",
+        ),
+    ] {
+        let d = folder(&[(
+            "s.luaskin",
+            &format!(
+                "{attach}\n{change}\nt[1] = {{}}\n{churn}\n\
+                 assert(t[1] ~= nil, \"collected\")\n\
+                 assert(getmetatable(t) == mt, \"the skin's own table\")\n\
+                 return {{ type = 0 }}"
+            ),
+        )]);
+        header(&d).unwrap_or_else(|e| panic!("{change}: {e:?}"));
+    }
+    // The skin replaces and removes its metatable; a protection of its
+    // own still holds.
+    let d = folder(&[(
+        "s.luaskin",
+        "local t = setmetatable({}, { __index = function() return 1 end })\n\
+         assert(t.x == 1)\n\
+         setmetatable(t, { __index = function() return 2 end })\n\
+         assert(t.x == 2)\n\
+         setmetatable(t, nil)\n\
+         assert(t.x == nil and getmetatable(t) == nil)\n\
+         local locked = setmetatable({}, { __metatable = \"locked\" })\n\
+         assert(not pcall(setmetatable, locked, {}), \"protection\")\n\
+         assert(getmetatable(locked) == \"locked\")\n\
+         return { type = 0 }",
+    )]);
+    header(&d).unwrap();
+}
+
+#[test]
+fn an_error_handler_that_does_not_complete_is_fatal() {
+    for (handler, want) in [
+        (
+            "function() return string.rep(\"x\", 80 << 20) end",
+            [LuaLimit::Memory, LuaLimit::Handler],
+        ),
+        (
+            "function(e) error(e) end",
+            [LuaLimit::Memory, LuaLimit::Handler],
+        ),
+        (
+            "function(e) local function f() return f() + 1 end return f() end",
+            [LuaLimit::Memory, LuaLimit::Handler],
+        ),
+    ] {
+        let d = folder(&[(
+            "s.luaskin",
+            &format!(
+                "local ok = xpcall(function() error(\"x\") end, {handler})\n\
+                 return {{ type = 0 }}"
+            ),
+        )]);
+        let w = why(header(&d));
+        assert!(
+            want.iter().any(|l| w == LuaWhy::Limit(*l)),
+            "{handler}: {w:?}"
+        );
+    }
+    // A handler that completes returns its value as Lua does.
+    let d = folder(&[(
+        "s.luaskin",
+        "local ok, v = xpcall(function() error(\"x\", 0) end, function(e) return e .. \"!\" end)\n\
+         assert(not ok and v == \"x!\")\nreturn { type = 0 }",
+    )]);
+    header(&d).unwrap();
+}
+
+#[test]
 fn cancellation_refuses_both_passes() {
     let d = folder(&[("s.luaskin", &drawn(""))]);
     let cancel = Cancel::new();

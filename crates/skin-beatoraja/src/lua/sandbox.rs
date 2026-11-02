@@ -14,9 +14,12 @@
 //!   ([`MAX_NATIVE_WORK`](super::limits::MAX_NATIVE_WORK)); `table`, its
 //!   `move` and `sort` charged likewise; `math` without `random` and
 //!   `randomseed`;
-//! - `setmetatable`, refusing a metatable with `__gc` (a finalizer) or
-//!   `__mode` (weak references), either of which lets the collector
-//!   change what the skin computes;
+//! - `setmetatable`, which attaches a snapshot of the metatable the
+//!   skin passes, refusing one with `__gc` (a finalizer) or `__mode`
+//!   (weak references), either of which lets the collector change what
+//!   the skin computes: a later change to the skin's table, by
+//!   assignment or `rawset`, never reaches the snapshot, and
+//!   `getmetatable` gives the skin its own table back;
 //! - `pcall` and `xpcall`, which return an ordinary error as Lua does but
 //!   raise a fault of the ledger again, and refuse an error no handler
 //!   saw (an allocation failure);
@@ -70,8 +73,10 @@ const REMOVED: [(&str, &str); 6] = [
 ];
 
 /// The protected-call wrappers, compiled in the sandbox before any skin
-/// code: each call's handler marks the error as seen, so an error no
-/// handler saw (Lua runs none for an allocation failure) is told apart.
+/// code: each call's handler marks the error as handled once it has
+/// completed, so an error no handler completed (Lua runs none for an
+/// allocation failure; a skin's handler can fail, recurse or exhaust its
+/// stack) is told apart and stays fatal.
 const PROTECTED: &str = r"
 local xpcall_native, settle = ...
 local function finish(seen, ok, ...)
@@ -84,7 +89,11 @@ local function pcall(f, ...)
 end
 local function xpcall(f, msgh, ...)
   local seen = {false}
-  return finish(seen, xpcall_native(f, function(e) seen[1] = true return msgh(e) end, ...))
+  return finish(seen, xpcall_native(f, function(e)
+    local r = msgh(e)
+    seen[1] = true
+    return r
+  end, ...))
 end
 return pcall, xpcall
 ";
@@ -147,11 +156,20 @@ pub(super) fn vm(pass: &Rc<Pass>) -> mlua::Result<Lua> {
         "setmetatable",
         host(&lua, pass, move |lua, pass, args| {
             pass.ledger.update(|c| c.metatables += 1);
-            if let Some(Value::Table(mt)) = args.get(1)
-                && (!mt.raw_get::<Value>("__gc")?.is_nil()
-                    || !mt.raw_get::<Value>("__mode")?.is_nil())
+            let mut args = args;
+            // A snapshot of ours guards the table's metatable only against
+            // the skin: lifted for the skin's own replacement.
+            if let Some(Value::Table(t)) = args.front()
+                && let Some(current) = t.metatable()
+                && pass.snapshot_of(current.to_pointer().addr())
             {
-                return Err(pass.ledger.fail_lua(lua, LuaWhy::Finalizer));
+                current.raw_set("__metatable", Value::Nil)?;
+            }
+            if let Some(Value::Table(mt)) = args.get(1) {
+                let snapshot = snapshot(lua, pass, mt)?;
+                if let Some(slot) = args.get_mut(1) {
+                    *slot = Value::Table(snapshot);
+                }
             }
             native_set.call::<MultiValue>(args)
         })?,
@@ -172,7 +190,7 @@ pub(super) fn vm(pass: &Rc<Pass>) -> mlua::Result<Lua> {
             let limit = if memory {
                 LuaLimit::Memory
             } else {
-                LuaLimit::Stack
+                LuaLimit::Handler
             };
             return Err(pass.ledger.fail_lua(lua, LuaWhy::Limit(limit)));
         }
@@ -201,6 +219,33 @@ pub(super) fn vm(pass: &Rc<Pass>) -> mlua::Result<Lua> {
     env.raw_set("_G", env.clone())?;
     lua.set_globals(env)?;
     Ok(lua)
+}
+
+/// A copy of the skin's metatable `mt`, its entries charged as native
+/// work before they are copied, refused with `__gc` or `__mode`. Unless
+/// the skin protected it with `__metatable`, the copy names `mt` there, so
+/// `getmetatable` gives the skin its own table, which it may change
+/// without reaching the copy.
+fn snapshot(lua: &Lua, pass: &Pass, mt: &Table) -> mlua::Result<Table> {
+    let mut entries = 0_u64;
+    for pair in mt.pairs::<Value, Value>() {
+        pair?;
+        entries += 1;
+    }
+    pass.ledger.native(lua, entries)?;
+    let copy = lua.create_table()?;
+    for pair in mt.pairs::<Value, Value>() {
+        let (k, v) = pair?;
+        copy.raw_set(k, v)?;
+    }
+    if !copy.raw_get::<Value>("__gc")?.is_nil() || !copy.raw_get::<Value>("__mode")?.is_nil() {
+        return Err(pass.ledger.fail_lua(lua, LuaWhy::Finalizer));
+    }
+    if copy.raw_get::<Value>("__metatable")?.is_nil() {
+        copy.raw_set("__metatable", mt.clone())?;
+        pass.snapshot(copy.to_pointer().addr());
+    }
+    Ok(copy)
 }
 
 /// The library functions whose native loops the instruction hook does not
