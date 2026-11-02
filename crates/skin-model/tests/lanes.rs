@@ -450,12 +450,15 @@ fn loaded_notes_and_bar_lines_sit_at_their_exact_beats() {
     // BPM, so 80 px per µs of scroll at 9,990,400 BPM.
     h.view.visible_time = TimeUs(10);
     h.frame_us(1, &[]);
-    // By hand: beat k/4 is k × 15e6 / 9_990_400 µs of scroll, drawn 80 px
-    // per µs above the line once past the playhead's 1 µs: measure 1 at
-    // 880 - 80 × 0.5014416... = 839.8847 px, where its floored time (1 µs)
-    // would put it on the line.
-    let y = |k: i32| 880.0 - 80.0 * (f64::from(k) * 15e6 / 9_990_400.0 - 1.0);
-    assert!((y(1) - 839.884_7).abs() < 1e-3);
+    // By hand: beat k/4 is k × 15e6 / 9_990_400 µs of scroll, 1.5014416
+    // µs a measure. The exact playhead meets measure 1's note at its
+    // judgment µs, its floored time 1 µs, so measure 1 is on the line,
+    // where sampling the scroll map at 1 µs put it 0.5014 µs of scroll
+    // (40 px) above; measure k is k - 1 measures, 80 px per µs of scroll,
+    // above it.
+    let y = |k: i32| 880.0 - 80.0 * f64::from(k - 1) * 15e6 / 9_990_400.0;
+    assert!((y(1) - 880.0).abs() < 1e-9);
+    assert!((y(2) - 759.884_7).abs() < 1e-3);
     let centers = |rects: Vec<[f32; 4]>| -> Vec<f64> {
         rects.iter().map(|r| f64::from(r[1] + r[3] / 2.0)).collect()
     };
@@ -543,13 +546,25 @@ fn drawn_notes_are_those_whose_span_meets_the_visible_range() {
 #[test]
 fn visible_time_below_a_microsecond_counts_as_one() {
     let chart = ChartBuilder::new(BPM).build().unwrap();
-    let one = Scale::new(&chart.scroll, TimeUs(0), TimeUs(1), 800.0, 880.0);
+    let one = Scale::new(
+        chart.scroll.position_at(TimeUs(0)),
+        chart.scroll.initial_rate(),
+        TimeUs(1),
+        800.0,
+        880.0,
+    );
     // 1 µs of 150 BPM (2.5 millionths of a beat) on 800 px.
     let beat = (1_u128 << 80) as f64;
     assert!((one.px_per_pos * beat * 2.5e-6 - 800.0).abs() < 1e-6);
     for v in [0, -5, i64::MIN] {
         assert_eq!(
-            Scale::new(&chart.scroll, TimeUs(0), TimeUs(v), 800.0, 880.0),
+            Scale::new(
+                chart.scroll.position_at(TimeUs(0)),
+                chart.scroll.initial_rate(),
+                TimeUs(v),
+                800.0,
+                880.0
+            ),
             one
         );
     }
@@ -598,12 +613,12 @@ fn the_culling_range_follows_the_tallest_part() {
     // though a padding of half the default note (8) would have culled it,
     // and the bar whole: its window is its own, not the notes'.
     let at = TimeUs(1_600 * MS);
-    let mut chart = ChartBuilder::new(BPM)
+    let chart = ChartBuilder::new(BPM)
         .tap(lane(3), at)
         .mine(lane(5), at, 10)
+        .bar(at)
         .build()
         .unwrap();
-    chart.bar_lines = vec![chart.scroll.position_at(at)];
     let tall = |set: fn(&mut LanesDef)| {
         let mut def = simple();
         set(&mut def);
