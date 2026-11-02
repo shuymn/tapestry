@@ -85,19 +85,20 @@ impl BitmapLines {
     /// The bytes its slots and their glyphs take on the heap.
     #[must_use]
     pub fn heap_bytes(&self) -> usize {
-        let glyphs: usize = self
-            .0
-            .iter()
-            .flatten()
-            .map(|l| size_of_val(&*l.quads))
-            .sum();
-        size_of_val(&*self.0) + glyphs
+        lines_bytes(&self.0)
     }
 
     /// Takes `slot`'s line, leaving none.
     pub(crate) fn take(&mut self, slot: u16) -> Option<GlyphLine> {
         self.0.get_mut(usize::from(slot)).and_then(Option::take)
     }
+}
+
+/// The heap bytes of `lines`, one per text slot: the slots and every
+/// line's glyphs. Allocates nothing.
+pub(crate) fn lines_bytes(lines: &[Option<GlyphLine>]) -> usize {
+    let glyphs: usize = lines.iter().flatten().map(|l| size_of_val(&*l.quads)).sum();
+    size_of_val(lines) + glyphs
 }
 
 /// A glyph found for a character: from which file, with which y adjust,
