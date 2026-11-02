@@ -237,20 +237,86 @@ pub struct MenuScreen {
     /// The target changed size since the text was last prepared: the
     /// page shown is prepared again before its next frame.
     stale: bool,
-    /// The chosen chart's text last asked of the renderer for a loading
-    /// lifetime; `None` before any.
-    asked: Option<AskedText>,
+    /// The chosen chart's text as the loading presentation holds it.
+    chosen: ChosenTextState,
 }
 
-/// The chosen chart's text last prepared for the loading presentation:
-/// what it was prepared for, and the fields it was prepared from.
-#[derive(Debug)]
-struct AskedText {
-    key: LoadingTextKey,
+/// One request for the chosen chart's text: the installation, size and
+/// lifetime it is for (the installation by its key `K`), and the revision
+/// of the fields it is prepared from.
+#[derive(Clone, Debug)]
+struct AskedText<K = LoadingTextKey> {
+    key: K,
     target: [u32; 2],
     lifetime: u64,
     revision: u64,
     chart: Arc<ChosenChart>,
+}
+
+impl<K: PartialEq> AskedText<K> {
+    /// Whether both are for the same installation, size and lifetime.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn same_place(&self, other: &Self) -> bool {
+        self.key == other.key && self.target == other.target && self.lifetime == other.lifetime
+    }
+
+    /// Whether both are the same request.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn same_request(&self, other: &Self) -> bool {
+        self.same_place(other) && self.revision == other.revision
+    }
+}
+
+/// Where the chosen chart's text stands on this screen: the request whose
+/// text every slot holds, the one staged for the next frame, and the last
+/// one refused, which is not asked again.
+#[derive(Debug, Default)]
+struct ChosenTextState {
+    /// What every slot holds; `None` when unknown, after a refusal.
+    installed: Option<AskedText>,
+    staged: Option<AskedText>,
+    refused: Option<AskedText>,
+}
+
+/// What the chosen chart's text needs before a loading frame.
+#[derive(Debug, PartialEq, Eq)]
+enum TextPlan {
+    /// Nothing: its text is installed, or it was refused.
+    Keep,
+    /// Clear the slots `clear` names, then prepare those `which` names.
+    Prepare { clear: TextSlots, which: TextSlots },
+}
+
+/// What request `asked` needs, the presentation holding `installed`'s
+/// text, after `refused` was refused. A request installed or refused
+/// needs nothing. In the place `installed` was prepared for, only the
+/// fields that changed are cleared and prepared again; anywhere else, or
+/// with what the slots hold unknown, every slot is cleared and prepared,
+/// so no field kept from another installation, size or revision draws.
+#[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+fn text_plan<K: PartialEq>(
+    installed: Option<&AskedText<K>>,
+    refused: Option<&AskedText<K>>,
+    asked: &AskedText<K>,
+) -> TextPlan {
+    if installed.is_some_and(|i| i.same_request(asked))
+        || refused.is_some_and(|r| r.same_request(asked))
+    {
+        return TextPlan::Keep;
+    }
+    match installed {
+        Some(i) if i.same_place(asked) => {
+            let which = fields_changed(&i.chart, &asked.chart);
+            TextPlan::Prepare {
+                clear: which,
+                which,
+            }
+        }
+        _ => TextPlan::Prepare {
+            clear: TextSlots::ALL,
+            which: TextSlots::ALL,
+        },
+    }
 }
 
 /// The slots of the fields that differ between `old` and `new`, with the
@@ -286,49 +352,62 @@ impl MenuScreen {
             sent: None,
             splash: None,
             stale: false,
-            asked: None,
+            chosen: ChosenTextState {
+                installed: None,
+                staged: None,
+                refused: None,
+            },
         }
     }
 
-    /// Brings the loading presentation's chosen-chart text to `update`,
-    /// between frames: the presentation enters the update's lifetime, the
-    /// text staged by an earlier call is installed (dropped if its
-    /// installation, lifetime or revision has passed), and text for a
-    /// lifetime, revision, installation or size not asked yet is prepared
-    /// and staged for the next frame, replacing any staged. Within one
-    /// lifetime and installation only the fields that changed are laid
-    /// out again, their slots cleared until then; otherwise every slot.
-    /// Preparing allocates: it runs only when the update asks for new
-    /// text, never in a frame's build.
+    /// Brings the loading presentation's chosen-chart text to `update`.
+    /// It runs inside [`loading`](Screen::loading), before the loading
+    /// frame is built, on the render thread before recording opens: the
+    /// presentation enters the update's lifetime, the text staged by the
+    /// previous loading frame is installed (dropped if its installation,
+    /// lifetime or revision has passed), and the text the update needs
+    /// ([`text_plan`]) is cleared and prepared through the installation's
+    /// producer, staged for the next loading frame. A request refused,
+    /// by the producer or by its table, is not asked again; what the slots
+    /// hold is then unknown, so the next request prepares every slot.
+    /// Preparing allocates: it runs only when the update needs new text,
+    /// never in a frame's build.
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn chosen_text(&mut self, update: &LoadingUpdate, lifetime: u64) {
         self.renderer.enter_loading(lifetime);
-        // Text whose installation, lifetime or revision has passed is
-        // dropped as meant; only a table that does not fit is reported.
-        if let Err(e @ LoadingTextError::Table(_)) = self.renderer.install_staged_loading_text() {
-            eprintln!("render: the chosen chart's text was not installed: {e}");
+        if let Some(staged) = self.chosen.staged.take() {
+            match self.renderer.install_staged_loading_text() {
+                Ok(true) => self.chosen.installed = Some(staged),
+                Ok(false) => {}
+                Err(e @ LoadingTextError::Table(_)) => {
+                    eprintln!("render: the chosen chart's text was not installed: {e}");
+                    self.chosen.installed = None;
+                    self.chosen.refused = Some(staged);
+                }
+                // Its installation, lifetime or revision has passed: what
+                // the update needs is planned below.
+                Err(_) => {}
+            }
         }
         let Some(key) = self.renderer.loading_text_key() else {
-            self.asked = None;
+            self.chosen = ChosenTextState::default();
             return;
         };
-        let target = self.renderer.target();
-        let which = match &self.asked {
-            Some(a)
-                if a.key == key
-                    && a.target == target
-                    && a.lifetime == lifetime
-                    && a.revision == update.revision =>
-            {
-                return;
-            }
-            Some(a) if a.key == key && a.target == target && a.lifetime == lifetime => {
-                let which = fields_changed(&a.chart, &update.chart);
-                self.renderer.clear_loading_text(which);
-                which
-            }
-            _ => TextSlots::ALL,
+        let asked = AskedText {
+            key,
+            target: self.renderer.target(),
+            lifetime,
+            revision: update.revision,
+            chart: Arc::clone(&update.chart),
         };
+        let TextPlan::Prepare { clear, which } = text_plan(
+            self.chosen.installed.as_ref(),
+            self.chosen.refused.as_ref(),
+            &asked,
+        ) else {
+            return;
+        };
+        self.renderer.clear_loading_text(clear);
         let c = &update.chart;
         fn field(f: &Option<String>) -> &str {
             f.as_deref().unwrap_or_default()
@@ -340,19 +419,17 @@ impl MenuScreen {
             subartist: field(&c.subartist),
             genre: field(&c.genre),
         };
-        if let Err(e) = self
+        match self
             .renderer
             .prepare_loading_text(lifetime, update.revision, which, &chart)
         {
-            eprintln!("render: the chosen chart's text was not prepared: {e}");
+            Ok(()) => self.chosen.staged = Some(asked),
+            Err(e) => {
+                eprintln!("render: the chosen chart's text was not prepared: {e}");
+                self.chosen.installed = None;
+                self.chosen.refused = Some(asked);
+            }
         }
-        self.asked = Some(AskedText {
-            key,
-            target,
-            lifetime,
-            revision: update.revision,
-            chart: Arc::clone(&update.chart),
-        });
     }
 
     /// Tells `sink` of its first frame presented and the caret's area of
@@ -712,6 +789,74 @@ impl MenuScreen {
 mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
+
+    /// A request installed or refused needs nothing; in the place its
+    /// text was installed for, only the changed fields are cleared and
+    /// prepared; for another installation, size or lifetime, or with
+    /// what the slots hold unknown, every slot is cleared, so a field
+    /// that became unavailable never draws from what they kept.
+    #[test]
+    fn a_request_clears_what_it_cannot_vouch_for() {
+        use std::sync::Arc;
+
+        use skin_model::{TextField, TextSlots};
+
+        use super::{AskedText, TextPlan, text_plan};
+        use crate::loading_text::ChosenChart;
+
+        let chart = |artist: Option<&str>| {
+            Arc::new(ChosenChart {
+                title: Some("T".to_owned()),
+                artist: artist.map(str::to_owned),
+                ..ChosenChart::default()
+            })
+        };
+        let asked = |key: u64, target: [u32; 2], revision: u64, artist: Option<&str>| AskedText {
+            key,
+            target,
+            lifetime: 1,
+            revision,
+            chart: chart(artist),
+        };
+        let full = [1_920, 1_080];
+        let installed = asked(1, full, 1, Some("x"));
+        let all = TextPlan::Prepare {
+            clear: TextSlots::ALL,
+            which: TextSlots::ALL,
+        };
+        assert_eq!(
+            text_plan(Some(&installed), None, &installed.clone()),
+            TextPlan::Keep
+        );
+        let artist = TextSlots::field(TextField::Artist);
+        assert_eq!(
+            text_plan(Some(&installed), None, &asked(1, full, 2, None)),
+            TextPlan::Prepare {
+                clear: artist,
+                which: artist
+            }
+        );
+        // Another size, another installation, nothing known.
+        assert_eq!(
+            text_plan(Some(&installed), None, &asked(1, [960, 540], 2, None)),
+            all
+        );
+        assert_eq!(
+            text_plan(Some(&installed), None, &asked(2, full, 1, Some("x"))),
+            all
+        );
+        assert_eq!(text_plan(None, None, &asked(1, full, 2, None)), all);
+        // A refused request is not asked again; the next one is.
+        let refused = asked(1, full, 2, Some("y"));
+        assert_eq!(
+            text_plan(None, Some(&refused), &refused.clone()),
+            TextPlan::Keep
+        );
+        assert_eq!(
+            text_plan(None, Some(&refused), &asked(1, full, 3, Some("y"))),
+            all
+        );
+    }
 
     /// Only the fields that differ name their slots, each with the
     /// composites it is part of; equal fields name none, and a field

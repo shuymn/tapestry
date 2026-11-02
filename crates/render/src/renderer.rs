@@ -1450,8 +1450,9 @@ impl Renderer {
     /// lifetime `lifetime`, the slots `which` names, with the producer of
     /// the installation in use, and holds it staged until
     /// [`install_staged_loading_text`](Self::install_staged_loading_text),
-    /// replacing text staged before: at most one table waits. Between
-    /// frames, never in a build: it allocates. Nothing is staged without
+    /// replacing text staged before: at most one table waits. Before
+    /// recording opens and outside a frame's build, such as in a loading
+    /// frame's call before it builds: it allocates. Nothing is staged without
     /// a declarative installation; without a producer, the staged text
     /// clears the slots.
     ///

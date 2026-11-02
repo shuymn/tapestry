@@ -7444,6 +7444,111 @@ pub(crate) mod tests {
         );
     }
 
+    /// A render thread on [`Recorder`]s with the fixture of every loading
+    /// part selected, and its text producer.
+    fn bridge_recording() -> (
+        super::RenderLink,
+        Recording,
+        Arc<crate::render_decl::Text>,
+        tempfile::TempDir,
+    ) {
+        let (link, rec) = Recording::new();
+        let dir = tempfile::tempdir().unwrap();
+        let (skin, text) = crate::render_decl::bundle(
+            &crate::render_common::offscreen(1_920, 1_080),
+            dir.path(),
+            &bridge_look(),
+        );
+        let chart = Arc::new(ChartBuilder::new(120_000).build().unwrap());
+        link.load(chart, None).unwrap();
+        assert_eq!(link.select(Some(skin)).wait().unwrap(), Preparation::Ready);
+        (link, rec, text.unwrap(), dir)
+    }
+
+    /// Text installed at one size and a field that became unavailable
+    /// arriving with another size: the slots are prepared again for the
+    /// new size, and the dropped artist is never drawn from the text the
+    /// slots kept, on the frame the change arrives or after.
+    #[test]
+    fn a_new_size_never_draws_a_dropped_field() {
+        let (link, rec, _text, _dir) = bridge_recording();
+        link.begin_loading(&chosen_by("T", Some("x")), None);
+        let sink = link.loading();
+        sink.report(LoadInput::Stage(Stage::Chart), Some(one_line("T")));
+        let shown = rec.until(0, |s| s.red.is_some_and(|r| r.title && r.artist));
+        // Installed at 960 × 540: a frame there with nothing staged.
+        *rec.resize.lock().unwrap() = Some((None, (960, 540)));
+        let small = rec.until(shown, |s| s.target == [960, 540] && s.staged == 0);
+        // The artist dropped, the size back on the same frame.
+        *rec.resize.lock().unwrap() = Some((Some(2), (1_920, 1_080)));
+        sink.report(
+            LoadInput::Chart(ChosenChart {
+                title: Some("T".to_owned()),
+                ..ChosenChart::default()
+            }),
+            None,
+        );
+        let end = rec.until(small, |s| s.text == 2 && s.red.is_some_and(|r| r.title));
+        link.end_loading().unwrap();
+        link.exit();
+
+        let shots = rec.shots();
+        let r2: Vec<&Shot> = shots[..end].iter().filter(|s| s.text == 2).collect();
+        assert!(r2.iter().all(|s| s.target == [1_920, 1_080]), "{r2:?}");
+        assert!(r2.iter().all(|s| !s.red.unwrap().artist), "{r2:?}");
+    }
+
+    /// A revision the producer refuses leaves its fields empty and is not
+    /// asked again; the next revision lays out every field again, the
+    /// refused ones included, so none stays empty for good.
+    #[test]
+    fn a_refused_revision_is_laid_out_again_by_the_next() {
+        let (link, rec, text, _dir) = bridge_recording();
+        link.begin_loading(&chosen_by("T", Some("x")), None);
+        let sink = link.loading();
+        sink.report(LoadInput::Stage(Stage::Chart), Some(one_line("T")));
+        let shown = rec.until(0, |s| s.red.is_some_and(|r| r.title && r.artist));
+        text.refuse.store(true, Ordering::SeqCst);
+        sink.report(
+            LoadInput::Chart(ChosenChart {
+                title: Some("T".to_owned()),
+                artist: Some("y".to_owned()),
+                ..ChosenChart::default()
+            }),
+            None,
+        );
+        // Two frames of the refused revision: its preparation ran on the
+        // first, and the second shows it was not asked again.
+        let refused = rec.until(shown, |s| s.text == 2);
+        let refused = rec.until(refused, |s| s.text == 2);
+        text.refuse.store(false, Ordering::SeqCst);
+        sink.report(
+            LoadInput::Chart(ChosenChart {
+                title: Some("T".to_owned()),
+                artist: Some("y".to_owned()),
+                genre: Some("g".to_owned()),
+                ..ChosenChart::default()
+            }),
+            None,
+        );
+        let end = rec.until(refused, |s| {
+            s.text == 3 && s.red.is_some_and(|r| r.title && r.artist && r.genre)
+        });
+        link.end_loading().unwrap();
+        link.exit();
+
+        let shots = rec.shots();
+        let r2: Vec<&Shot> = shots[..end].iter().filter(|s| s.text == 2).collect();
+        assert!(r2.len() >= 2, "{r2:?}");
+        assert!(r2.iter().all(|s| !s.red.unwrap().artist), "{r2:?}");
+        let charts = text.charts.lock().unwrap().clone();
+        assert_eq!(
+            charts.iter().map(|c| c[1].as_str()).collect::<Vec<_>>(),
+            ["x", "y", "y"],
+            "{charts:?}"
+        );
+    }
+
     /// Within one lifetime the loading clock and the `when` timer go on
     /// across a page and progress update, the same bundle prepared and
     /// committed for the attempt, a resize and a renderer built again; a
