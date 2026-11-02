@@ -384,6 +384,67 @@ fn invalid_ranges_origins_and_counts_are_refused_before_allocating() {
             DecodeError::CountBeyondData(huge),
         ),
         (
+            "an event before the last of its source",
+            forged(|w| {
+                w.uint(1);
+                opening_bytes(w, -1, 10, [0, 2], [0, 0]);
+                w.uint(2);
+                w.raw(&[0, 8, 0, 1, 2]);
+                w.raw(&[0, 1, 0, 1, 2]);
+                w.uint(0);
+            }),
+            invalid("event time"),
+        ),
+        (
+            "an event after its opening closed",
+            forged(|w| {
+                w.uint(1);
+                opening_bytes(w, -1, 10, [0, 1], [0, 0]);
+                w.uint(1);
+                w.raw(&[0, 22, 0, 1, 2]);
+                w.uint(0);
+            }),
+            invalid("event time"),
+        ),
+        (
+            "an event wrapping past the largest time",
+            forged(|w| {
+                w.uint(1);
+                opening_bytes(w, -1, 10, [0, 2], [0, 0]);
+                w.uint(2);
+                w.raw(&[0, 10, 0, 1, 2]);
+                w.raw(&[0]);
+                w.int(i64::MAX);
+                w.raw(&[0, 1, 2]);
+                w.uint(0);
+            }),
+            invalid("event time"),
+        ),
+        (
+            "an arrival before its opening opened",
+            forged(|w| {
+                w.uint(1);
+                opening_bytes(w, -1, 10, [0, 0], [0, 1]);
+                w.uint(0);
+                w.uint(1);
+                w.int(-1);
+                w.uint(0);
+            }),
+            invalid("arrival time"),
+        ),
+        (
+            "an arrival after its opening closed",
+            forged(|w| {
+                w.uint(1);
+                opening_bytes(w, -1, 10, [0, 0], [0, 1]);
+                w.uint(0);
+                w.uint(1);
+                w.int(11);
+                w.uint(0);
+            }),
+            invalid("arrival time"),
+        ),
+        (
             "an event of an unknown source",
             forged(|w| {
                 w.uint(1);
@@ -416,7 +477,7 @@ fn a_full_history_decodes() {
             opening(
                 0,
                 -64_000_000 + i64::from(i) * 1_000_000,
-                1_000,
+                i64::from(per),
                 i * per..(i + 1) * per,
                 i * 16..(i + 1) * 16,
                 CancelReason::Held,

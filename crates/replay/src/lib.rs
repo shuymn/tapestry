@@ -1005,20 +1005,21 @@ fn read_events(
 ) -> Result<(), DecodeError> {
     let mut prev = vec![opened_at.0; n_sources];
     for _ in 0..n {
-        events.push(read_event(r, n_sources, &mut prev)?);
+        events.push(read_event(r, n_sources, &mut prev)?.1);
     }
     Ok(())
 }
 
-/// Reads one event, its time counted from its source's last in `prev`,
-/// which it replaces.
+/// Reads one event, its time counted from its source's previous time in
+/// `prev`, which it replaces; returns that previous time with the event.
 fn read_event(
     r: &mut Reader<'_>,
     n_sources: usize,
     prev: &mut [i64],
-) -> Result<PhysicalInputEvent, DecodeError> {
+) -> Result<(TimeUs, PhysicalInputEvent), DecodeError> {
     let source = read_source(r, n_sources)?;
     let last = &mut prev[source.index()];
+    let before = TimeUs(*last);
     *last = last.wrapping_add(r.int()?);
     let received = TimeUs(*last);
     let kind = match r.uint()? {
@@ -1029,11 +1030,14 @@ fn read_event(
         1 => InputKind::Disconnected,
         _ => return Err(DecodeError::InvalidValue("input kind")),
     };
-    Ok(PhysicalInputEvent {
-        received,
-        source,
-        kind,
-    })
+    Ok((
+        before,
+        PhysicalInputEvent {
+            received,
+            source,
+            kind,
+        },
+    ))
 }
 
 fn read_arrivals(r: &mut Reader<'_>) -> Result<Vec<Arrival>, DecodeError> {
@@ -1135,7 +1139,9 @@ struct Span {
 /// winning opening opened at `opened_at`. It is checked whole before
 /// anything is allocated for it: a first pass over a copy of `r`, with
 /// scratch bounded by the format's limits and `n_sources`, checks every
-/// count, range, source and time and the agreement with the end status;
+/// count, range and source, that each opening's events and arrivals lie
+/// between its opening and its close with each source's events in time
+/// order, and the agreement with the end status;
 /// a second pass then builds it.
 fn read_history(
     r: &mut Reader<'_>,
@@ -1226,7 +1232,12 @@ fn walk_history(
     for s in spans {
         prev.fill(s.opened_at.0);
         for _ in 0..s.events {
-            let event = read_event(r, n_sources, &mut prev)?;
+            // `before` starts at the opening, so a source's first event
+            // is bounded by it too.
+            let (before, event) = read_event(r, n_sources, &mut prev)?;
+            if !(before..=s.closed).contains(&event.received) {
+                return Err(DecodeError::InvalidHistory("event time"));
+            }
             if let Some(h) = out.as_deref_mut() {
                 h.events.push(event);
             }
@@ -1243,6 +1254,9 @@ fn walk_history(
     for s in spans {
         for _ in 0..s.arrivals {
             let arrival = read_arrival(r)?;
+            if !(s.opened_at..=s.closed).contains(&arrival.at) {
+                return Err(DecodeError::InvalidHistory("arrival time"));
+            }
             if let Some(h) = out.as_deref_mut() {
                 h.arrivals.push(arrival);
             }
