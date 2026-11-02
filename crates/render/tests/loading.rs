@@ -27,7 +27,7 @@ use render::{
     AttemptInput, CommitError, FrameInput, Gpu, Installation, LoadingFrame, LoadingTextError,
     PlaySkin, PreparedToken, RenderError, Renderer, SkinBundle, SkinError, Sprite, SpriteBatch,
 };
-use skin_model::{BuildError, TextSlots, TextTable, TextTableError};
+use skin_model::{BuildError, TextImage, TextSlots, TextTable, TextTableError};
 
 const BLACK: [u8; 3] = [0; 3];
 const RED: [u8; 3] = [255, 0, 0];
@@ -423,6 +423,47 @@ fn a_failed_replacement_keeps_the_old_loading_frames() {
     let after = r.installation().unwrap();
     assert!(Arc::ptr_eq(after.bundle(), &a));
     assert!(after.loading().same(before.loading()));
+}
+
+/// Text installed for a loading lifetime stays with it: the next
+/// lifetime entered starts without it, though the lifetime it was
+/// installed for never drew a frame. The fixture's text element draws its
+/// line, the bundle's red image, as a 100 × 100 square at
+/// `(1000, 500)`.
+#[test]
+fn installed_text_never_passes_to_the_next_lifetime() {
+    const TEXT: [i32; 4] = [1_000, 500, 100, 100];
+    let dir = tempfile::tempdir().unwrap();
+    let mut r = offscreen(1_920, 1_080);
+    let text = MenuText::new(&r);
+    let (a, producer) = bundle(
+        &r,
+        dir.path(),
+        &Look {
+            text: true,
+            ..loader()
+        },
+    );
+    let uv = producer.unwrap().uv;
+    let lines = || {
+        let mut slots = vec![None; a.skin().text_slots()];
+        *slots.first_mut().unwrap() = TextImage::new(uv, [0.0, 0.0, 1.0, 1.0], 1.0);
+        TextTable::new(slots)
+    };
+    install(&mut r, &a, 1);
+    let key = r.loading_text_key().unwrap();
+    assert_eq!(at(&loading(&mut r, &text, &frame_at(1, 0)), TEXT), BLACK);
+    r.install_loading_text(key, TextSlots::ALL, &lines())
+        .unwrap();
+    assert_eq!(at(&loading(&mut r, &text, &frame_at(1, 100)), TEXT), RED);
+    // Lifetime 2 gets its own text but never draws; lifetime 3 follows.
+    r.enter_loading(2);
+    r.install_loading_text(key, TextSlots::ALL, &lines())
+        .unwrap();
+    r.enter_loading(3);
+    let p = loading(&mut r, &text, &frame_at(3, 200));
+    assert_eq!(at(&p, TEXT), BLACK);
+    assert_eq!(at(&p, BACKGROUND), RED);
 }
 
 /// Loading text installs only under the key of the installation in use

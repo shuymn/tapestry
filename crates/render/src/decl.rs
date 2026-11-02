@@ -348,15 +348,17 @@ impl LoadingPresentation {
         p.loading.resident_bytes().saturating_add(own)
     }
 
-    /// Lifetime `lifetime` draws next, between frames: a state built for
-    /// another lifetime starts afresh in place ([`Loading::reset`]),
-    /// allocating nothing; one never built is taken as it is.
+    /// Lifetime `lifetime` draws next, between frames: a state that
+    /// belonged to another lifetime, built or not, starts afresh in place
+    /// ([`Loading::reset`]), allocating nothing, so nothing installed in
+    /// it for that lifetime passes on; one that belonged to none is taken
+    /// as it is.
     pub(crate) fn enter(&self, lifetime: u64) {
         let mut p = self.lock();
         if p.lifetime == Some(lifetime) {
             return;
         }
-        if p.built {
+        if p.lifetime.is_some() {
             p.loading.reset();
             p.built = false;
         }
@@ -364,7 +366,8 @@ impl LoadingPresentation {
     }
 
     /// Builds loading frame `f` of `bundle` into `out`, allocating
-    /// nothing. A state never built takes `f`'s lifetime; one built for
+    /// nothing. A state never built takes `f`'s lifetime, afresh if it
+    /// belonged to another, as [`enter`](Self::enter) does; one built for
     /// another lifetime, not entered since, draws nothing.
     pub(crate) fn build(
         &self,
@@ -376,6 +379,9 @@ impl LoadingPresentation {
         if p.lifetime != Some(f.lifetime) {
             if p.built {
                 return Ok(());
+            }
+            if p.lifetime.is_some() {
+                p.loading.reset();
             }
             p.lifetime = Some(f.lifetime);
         }
