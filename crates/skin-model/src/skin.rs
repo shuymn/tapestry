@@ -435,6 +435,9 @@ fn check_places(def: &SkinDef) -> Result<(), LoadError> {
                 return Err(judge(JudgeError::Bound));
             }
             let def = def.widgets.judges.get(index(i));
+            if let Some(slot) = def.and_then(JudgeDef::mistimed_attachment) {
+                return Err(judge(JudgeError::AttachmentTiming { slot }));
+            }
             if let Some((part, _)) = def
                 .into_iter()
                 .flat_map(JudgeDef::tracks)
@@ -482,7 +485,7 @@ fn check_places(def: &SkinDef) -> Result<(), LoadError> {
 /// gauge, a text or a cover paint follows the covers, a moving cover's
 /// paint following SUDDEN+ alone, and every key of a follower or a moving
 /// paint, its gate's among them, and of a followed grade of a judge an
-/// element draws, keeps its y within ±[`MAX_COORD`] when moved `reach`
+/// element draws, its attachment's among them, keeps its y within ±[`MAX_COORD`] when moved `reach`
 /// either way; a slider paint's keys keep it moved down by its range as
 /// well, and a linked trim line stays within it raised by `reach`.
 fn check_follows(def: &SkinDef, reach: i64) -> Result<(), LoadError> {
@@ -521,20 +524,23 @@ fn check_follows(def: &SkinDef, reach: i64) -> Result<(), LoadError> {
             return Err(LoadError::Coordinates { element });
         }
         if let Source::Judge(i) = e.source
-            && let Some(slot) = def.widgets.judges.get(index(i)).and_then(|j| {
+            && let Some(part) = def.widgets.judges.get(index(i)).and_then(|j| {
                 JudgeSlot::ALL
                     .into_iter()
                     .zip(&j.grades)
                     .find_map(|(s, g)| {
-                        g.as_ref()
-                            .filter(|g| g.follow != Follow::None && moved_out(&g.track))
-                            .map(|_| s)
+                        let g = g.as_ref().filter(|g| g.follow != Follow::None)?;
+                        if moved_out(&g.track) {
+                            Some(JudgePart::Grade(s))
+                        } else if g.attachment.as_ref().is_some_and(moved_out) {
+                            Some(JudgePart::Attachment(s))
+                        } else {
+                            None
+                        }
                     })
             })
         {
-            let error = JudgeError::Coordinates {
-                part: JudgePart::Grade(slot),
-            };
+            let error = JudgeError::Coordinates { part };
             return Err(LoadError::Judge { element, error });
         }
     }
@@ -940,8 +946,8 @@ impl Skin {
     /// Loads a skin.
     ///
     /// Checks, in order: the counts (elements, `when` timers, each widget
-    /// table, text elements, keys across all tracks, judge parts'
-    /// included); every `when` condition and visibility is a bool, judge
+    /// table, text elements, keys across all tracks, judge parts' and
+    /// grades' attachment tracks included); every `when` condition and visibility is a bool, judge
     /// parts' included, and every number's value an int; every timer
     /// exists, judge parts' included; every element's widget, every
     /// element's, widget's and lane part's image exists, glyph images hold
@@ -949,7 +955,8 @@ impl Skin {
     /// table and cover paint is sound, referenced or not, and every
     /// image's cycle timer exists; the places (regions under a fixed canvas, fills
     /// outside `screen`, key coordinates within ±[`MAX_COORD`], widget
-    /// tracks that move, judges in `judge` and unbound, texts unbound,
+    /// tracks that move, judges in `judge` and unbound with each grade's
+    /// attachment timed as the grade, texts unbound,
     /// without a fill and with every key's height positive and width not
     /// negative, one lanes widget in its region, bindings beside it); the
     /// widgets' parameters (a literal's length and characters); the
@@ -1304,6 +1311,7 @@ impl Skin {
                         visible: g.visible,
                         native: g.native,
                         follow: g.follow,
+                        attachment: g.attachment,
                     })
                 }),
                 combos: j.combos.map(|c| {

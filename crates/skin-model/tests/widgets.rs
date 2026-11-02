@@ -386,4 +386,94 @@ fn judges_follow_only_through_their_grades() {
             }
         })
     ));
+    // So do its attachment's.
+    let followed = |y: i32| {
+        let mut j = judge_all([800, 500, 200, 80]);
+        j.grades[2] = Some(GradePart {
+            follow: Follow::Cover,
+            attachment: Some(lanes_support::rect([800, y, 200, 80])),
+            ..grade(GRADE + 2, [800, 500, 200, 80])
+        });
+        load_fit(
+            Fit::Adapt,
+            play_support::REGIONS,
+            Some(lanes_support::simple()),
+            vec![lanes_support::lanes_element(), judge_element(0)],
+            WidgetDefs {
+                judges: vec![j],
+                ..WidgetDefs::default()
+            },
+        )
+    };
+    assert!(followed(skin_model::MAX_COORD - 800).is_ok());
+    assert!(matches!(
+        followed(skin_model::MAX_COORD - 799),
+        Err(LoadError::Judge {
+            element: 1,
+            error: skin_model::JudgeError::Coordinates {
+                part: skin_model::JudgePart::Attachment(JudgeSlot::Good)
+            }
+        })
+    ));
+}
+
+#[test]
+fn a_followed_grade_carries_its_attachment_once() {
+    // As above: GREAT's grade follows the lift (−200) with lanes whose own
+    // timer is off. Its paint is fitted inside an attachment 40 px wider
+    // and 20 px taller; the combo, on another timer, attaches to the
+    // moved attachment, so every quad moves by −200 once, and the combo
+    // sits 20 px further down than the paint's bottom would put it.
+    let lanes = ElementDef {
+        timer: TimerRef::Builtin(timer::FULL_COMBO),
+        ..lanes_support::lanes_element()
+    };
+    let mut j = judge_all([800, 500, 200, 80]);
+    j.grades[JudgeSlot::Great.index()] = Some(GradePart {
+        follow: Follow::Lift,
+        attachment: Some(lanes_support::rect([780, 500, 240, 100])),
+        ..grade(GRADE + 1, [800, 500, 200, 80])
+    });
+    j.combos[JudgeSlot::Great.index()] = Some(ComboPart {
+        timer: TimerRef::Builtin(timer::READY),
+        attach: skin_model::Attach::Bottom,
+        ..combo(
+            digits(TEN, GlyphSet::Ten, 4, Align::Center, Pad::Blank),
+            [210, 10, 20, 60],
+        )
+    });
+    let skin = load_fit(
+        Fit::Adapt,
+        play_support::REGIONS,
+        Some(lanes_support::simple()),
+        vec![lanes, judge_element(0)],
+        WidgetDefs {
+            judges: vec![j],
+            ..WidgetDefs::default()
+        },
+    )
+    .unwrap();
+    let mut h = harness(skin);
+    h.tally = play_support::tally(12);
+    h.frame(500, &[judgment(500, Judgment::Great, 12)]);
+    let before = drawn(&h);
+    // Cells from 780 + 210, 600 + 10 below the attachment's top.
+    let cells: Vec<[f32; 2]> = before
+        .iter()
+        .filter(|(i, ..)| *i == TEN)
+        .map(|(.., q)| [q.rect[0], q.rect[1]])
+        .collect();
+    assert_eq!(cells.len(), 2);
+    assert_eq!(cells[0][1], 610.0);
+    h.view.lift = 250;
+    h.view.cover = 400;
+    h.frame(500, &[]);
+    let after = drawn(&h);
+    assert_eq!(before.len(), 3);
+    assert_eq!(before.len(), after.len());
+    for ((image, frame, a), (i2, f2, b)) in before.into_iter().zip(after) {
+        assert_eq!((image, frame), (i2, f2));
+        let [x, y, w, hh] = a.rect;
+        assert_eq!(b.rect, [x, y - 200.0, w, hh], "image {image}");
+    }
 }

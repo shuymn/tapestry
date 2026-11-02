@@ -273,6 +273,7 @@ impl Cx<'_> {
                 visible: c.visible,
                 native,
                 follow: c.follow,
+                attachment: None,
             },
             moved,
         )))

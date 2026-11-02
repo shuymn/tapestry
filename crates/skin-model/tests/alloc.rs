@@ -667,6 +667,17 @@ fn widgets(elements: &mut Vec<ElementDef>) -> skin_model::WidgetDefs {
                 visible: (k == 3).then(|| bool_program("bp < 100000")),
                 native: (k % 2 == 1).then_some(Native::Exact([2, 3])),
                 follow: FOLLOWS[usize::from(k) % 4],
+                // Slots 0, 3 and 6 attach their combos to a wider rect
+                // timed as the paint, slot 3's native.
+                attachment: (k % 3 == 0).then(|| {
+                    let raw = |at: i64, y: i32| {
+                        let mut key = grade_key(at, y);
+                        key.props[0] = Some(780);
+                        key.props[2] = Some(240);
+                        key
+                    };
+                    Track::new(&[raw(0, 510), raw(200 * MS, 490)], Ease::In, End::Hold).unwrap()
+                }),
             });
             j.combos[s.index()] = Some(ComboPart {
                 digits: combos[s.index() % 3].clone(),

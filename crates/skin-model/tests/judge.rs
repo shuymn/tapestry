@@ -759,3 +759,390 @@ fn a_judge_part_s_pivot_turns_it() {
     assert_eq!(q.pivot, [1_000.0, 580.0]);
     assert_eq!(q.angle, std::f32::consts::PI);
 }
+
+/// Three ten-glyph cells, centred, blank-padded, space 0.
+fn three() -> DigitsDef {
+    DigitsDef {
+        space: 0,
+        ..digits(TEN, GlyphSet::Ten, 3, Align::Center, Pad::Blank)
+    }
+}
+
+/// GREAT's grade painting `paint`, its combo of [`three`] attached to the
+/// bottom of `attachment` at the relative key `(−5, −20, 10, 20)`.
+fn attached(paint: [i32; 4], attachment: Option<[i32; 4]>) -> JudgeDef {
+    let mut j = empty_judge();
+    j.grades[1] = Some(GradePart {
+        attachment: attachment.map(rect),
+        ..grade(great(), paint)
+    });
+    j.combos[1] = Some(ComboPart {
+        attach: Attach::Bottom,
+        ..combo(three(), [-5, -20, 10, 20])
+    });
+    j
+}
+
+/// What `j` draws on a GREAT at 0 ms with combo 12.
+fn great_12(j: JudgeDef) -> Vec<(u32, u16, [f32; 4])> {
+    let mut h = harness(skin_of(j));
+    h.tally = tally(12);
+    h.frame(0, &[judgment(0, Judgment::Great, 12)]);
+    quads(&h)
+}
+
+#[test]
+fn a_combo_attaches_to_the_attachment_rect() {
+    // A square image fitted inside [100, 500, 80, 20] paints
+    // [130, 500, 20, 20]; the combo attaches to the unfitted rect's
+    // bottom-left: "12" centred in three 10 px cells from 95 draws at 100
+    // and 110, 520 − 20 = 500. The baseline width 20 shifts the paint
+    // alone, by 10.
+    let cells = [
+        (TEN, 1, [100.0, 500.0, 10.0, 20.0]),
+        (TEN, 2, [110.0, 500.0, 10.0, 20.0]),
+    ];
+    let paint = [130, 500, 20, 20];
+    let raw = Some([100, 500, 80, 20]);
+    let shown = great_12(attached(paint, raw));
+    assert_eq!(shown[..2], cells);
+    assert_eq!(shown[2], (great(), 0, [120.0, 500.0, 20.0, 20.0]));
+    let mut j = attached(paint, raw);
+    j.shift = false;
+    let shown = great_12(j);
+    assert_eq!(shown[..2], cells);
+    assert_eq!(shown[2], (great(), 0, [130.0, 500.0, 20.0, 20.0]));
+    // Without an attachment, the combo attaches to the paint: from 130.
+    let shown = great_12(attached(paint, None));
+    assert_eq!(shown[0].2, [130.0, 500.0, 10.0, 20.0]);
+    // The grade's native size and rotation change its paint alone: an
+    // 8×8 frame centred in the shifted paint, turned 90°.
+    let mut j = attached(paint, raw);
+    let mut props = [None; 9];
+    for (p, v) in props.iter_mut().zip(paint) {
+        *p = Some(v);
+    }
+    props[8] = Some(90);
+    if let Some(g) = j.grades[1].as_mut() {
+        g.track = lanes_support::still(props);
+        g.native = Some(skin_model::Native::Exact([8, 8]));
+    }
+    let mut h = harness(skin_of(j));
+    h.tally = tally(12);
+    h.frame(0, &[judgment(0, Judgment::Great, 12)]);
+    assert_eq!(quads(&h)[..2], cells);
+    let q = h.batch.quads();
+    assert_eq!([q[0].angle, q[1].angle], [0.0, 0.0]);
+    assert_eq!(q[2].rect, [126.0, 506.0, 8.0, 8.0]);
+    assert_eq!(q[2].angle, std::f32::consts::FRAC_PI_2);
+}
+
+#[test]
+fn an_attached_judge_scales_with_its_region() {
+    // At a judge scale of 200 % every offset between the parts doubles:
+    // the attachment and the shift are placed before the region's map.
+    let frame = |scale: u16| {
+        let mut layout = Layout::AUTHOR;
+        layout
+            .set(
+                Region::Judge,
+                Adjust {
+                    x: 0,
+                    y: 0,
+                    scale,
+                    visible: true,
+                },
+            )
+            .unwrap();
+        let j = attached([130, 500, 20, 20], Some([100, 500, 80, 20]));
+        let mut h = harness(placed(j));
+        h.layout = layout;
+        h.tally = tally(12);
+        h.frame(0, &[judgment(0, Judgment::Great, 12)]);
+        drawn(&h)
+            .into_iter()
+            .filter(|&(i, ..)| i != 0)
+            .map(|(.., q)| q.rect)
+            .collect::<Vec<_>>()
+    };
+    let (one, two) = (frame(100), frame(200));
+    assert_eq!(one.len(), 3);
+    // Each quad from the grade's corner.
+    let from_grade = |r: &[[f32; 4]]| -> Vec<[f32; 4]> {
+        r.iter()
+            .map(|q| [q[0] - r[2][0], q[1] - r[2][1], q[2], q[3]])
+            .collect()
+    };
+    let doubled: Vec<[f32; 4]> = from_grade(&one)
+        .into_iter()
+        .map(|q| q.map(|v| 2.0 * v))
+        .collect();
+    assert_eq!(from_grade(&two), doubled);
+}
+
+/// A rect track over `rects`, the i-th key at `times[i]`, under `ease`
+/// and `end`.
+fn keyed(times: &[i64], rects: &[[i32; 4]], ease: Ease, end: End) -> Track {
+    let keys: Vec<KeyDef> = times
+        .iter()
+        .zip(rects)
+        .map(|(&at, r)| {
+            let mut props = [None; 9];
+            for (p, v) in props.iter_mut().zip(*r) {
+                *p = Some(v);
+            }
+            KeyDef {
+                at: TimeUs(at),
+                props,
+            }
+        })
+        .collect();
+    Track::new(&keys, ease, end).unwrap()
+}
+
+#[test]
+fn the_attachment_runs_on_the_grade_s_clock_and_the_combo_on_its_own() {
+    // The grade on `judge` from the GREAT at 1 000 ms; its paint and its
+    // attachment move over 300 ms, the combo on `ready` over 2 000 ms.
+    // Each frame the attachment is sampled at the grade's elapsed time and
+    // the combo's relative key at its own, through every ease and end:
+    // across the hold, the hide after the last key and the loop from
+    // 100 ms.
+    let times = [0, 100 * MS, 300 * MS];
+    let combo_track = keyed(
+        &[0, 2_000 * MS],
+        &[[-5, -20, 10, 20], [15, -40, 10, 20]],
+        Ease::Linear,
+        End::Hold,
+    );
+    for ease in [Ease::Linear, Ease::In, Ease::Out, Ease::Step] {
+        for end in [
+            End::Hold,
+            End::Hide,
+            End::Loop {
+                from: TimeUs(100 * MS),
+            },
+        ] {
+            let paint = keyed(
+                &times,
+                &[[130, 500, 20, 20], [150, 470, 20, 40], [230, 400, 20, 40]],
+                ease,
+                end,
+            );
+            let raw = keyed(
+                &times,
+                &[[100, 500, 80, 20], [90, 460, 120, 60], [200, 380, 80, 60]],
+                ease,
+                end,
+            );
+            let mut j = attached([0; 4], None);
+            if let Some(g) = j.grades[1].as_mut() {
+                g.track = paint.clone();
+                g.attachment = Some(raw.clone());
+            }
+            if let Some(c) = j.combos[1].as_mut() {
+                c.track = combo_track.clone();
+                c.timer = TimerRef::Builtin(timer::READY);
+            }
+            let mut h = harness(skin_of(j));
+            h.tally = tally(12);
+            h.frame(1_000, &[judgment(1_000, Judgment::Great, 12)]);
+            let ready = h.start(timer::READY).unwrap();
+            for ms in [1_000, 1_050, 1_100, 1_250, 1_300, 1_301, 1_450, 1_700] {
+                h.frame(ms, &[]);
+                let now = ms * MS;
+                let gt = now - 1_000 * MS;
+                let got = quads(&h);
+                let Some(p) = paint.sample(gt) else {
+                    assert!(got.is_empty(), "{ease:?} {end:?} {ms}");
+                    continue;
+                };
+                let a = raw.sample(gt).unwrap().rect;
+                let c = combo_track.sample(now - ready).unwrap().rect;
+                // "12" in three cells of width c[2], centred: one blank
+                // cell, halved. The baseline width 2·c[2] shifts the
+                // paint by c[2].
+                let x0 = a[0] + c[0] + c[2] / 2.0;
+                let y = a[1] + a[3] + c[1];
+                let want = [
+                    [x0, y, c[2], c[3]],
+                    [x0 + c[2], y, c[2], c[3]],
+                    [p.rect[0] - c[2], p.rect[1], p.rect[2], p.rect[3]],
+                ];
+                assert_eq!(got.len(), 3, "{ease:?} {end:?} {ms}");
+                for ((.., r), w) in got.iter().zip(want) {
+                    for (g, w) in r.iter().zip(w) {
+                        assert!((g - w).abs() < 1e-3, "{ease:?} {end:?} {ms}: {r:?} {w:?}");
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn attachments_fall_back_with_their_grades() {
+    let shown = |j: JudgeDef| {
+        let mut h = harness(skin_of(j));
+        h.tally = tally(12);
+        h.gauges[0].value = GaugeValue::FULL;
+        h.frame(0, &[ev(0, gauge_effect(0, GaugeValue::FULL))]);
+        h.frame(10, &[judgment(10, Judgment::Perfect, 12)]);
+        quads(&h)
+    };
+    let with = |image: u32, raw: [i32; 4]| GradePart {
+        attachment: Some(rect(raw)),
+        ..grade(image, [130, 500, 20, 20])
+    };
+    let three_at = |attach| ComboPart {
+        attach,
+        ..combo(three(), [-5, -20, 10, 20])
+    };
+    // The full-gauge grade with PERFECT's combo: the chosen grade's
+    // attachment places it.
+    let mut j = empty_judge();
+    j.grades[0] = Some(with(GRADE, [0, 0, 10, 10]));
+    j.grades[6] = Some(with(GRADE + 6, [300, 600, 80, 20]));
+    j.combos[0] = Some(three_at(Attach::Bottom));
+    let q = shown(j);
+    assert_eq!(q[0].2, [300.0, 600.0, 10.0, 20.0]);
+    assert_eq!(q[2].0, GRADE + 6);
+    // PERFECT's grade standing in, with the full-gauge combo.
+    let mut j = empty_judge();
+    j.grades[0] = Some(with(GRADE, [300, 600, 80, 20]));
+    j.combos[0] = Some(three_at(Attach::Top));
+    j.combos[6] = Some(three_at(Attach::Bottom));
+    let q = shown(j);
+    assert_eq!(q[0].2, [300.0, 600.0, 10.0, 20.0]);
+    assert_eq!(q[2].0, GRADE);
+}
+
+#[test]
+fn an_attachment_moves_the_judge_box_through_its_combo() {
+    // The grade's paint [800, 1000] widened by 40 each side; the combo's
+    // strip [210, 290] from the attachment's corner at 400, not the
+    // paint's at 800; the attachment's own box [400, 600] is not drawn,
+    // so not included.
+    let mut j = judge();
+    j.grades[1] = Some(GradePart {
+        attachment: Some(rect([400, 500, 200, 80])),
+        ..grade(great(), GRADE_KEY)
+    });
+    assert_eq!(judge_bounds(&placed(j)), [610.0, 500.0, 430.0, 80.0]);
+    // From the bottom edge of a taller attachment: 500 + 100 + 70.
+    let mut j = judge();
+    j.grades[1] = Some(GradePart {
+        attachment: Some(rect([800, 500, 200, 100])),
+        ..grade(great(), GRADE_KEY)
+    });
+    if let Some(c) = j.combos[1].as_mut() {
+        c.attach = Attach::Bottom;
+    }
+    assert_eq!(judge_bounds(&placed(j)), [760.0, 500.0, 330.0, 170.0]);
+}
+
+fn loads(judges: Vec<JudgeDef>) -> bool {
+    load(
+        vec![judge_element(0)],
+        WidgetDefs {
+            judges,
+            ..WidgetDefs::default()
+        },
+    )
+    .is_ok()
+}
+
+#[test]
+fn attachments_are_checked_on_the_judges_drawn() {
+    let with = |raw: Track| {
+        let mut j = judge();
+        j.grades[2] = Some(GradePart {
+            attachment: Some(raw),
+            ..grade(GRADE + 2, GRADE_KEY)
+        });
+        j
+    };
+    // The grade's own timing with other geometry loads.
+    assert!(loads(vec![with(rect([0, 0, 10, 10]))]));
+    // Other key times, ease or end refuse.
+    let times = [0, 100 * MS];
+    let two = [GRADE_KEY, GRADE_KEY];
+    let timed_grade = keyed(&times, &two, Ease::Linear, End::Hold);
+    for raw in [
+        keyed(&[0, 101 * MS], &two, Ease::Linear, End::Hold),
+        keyed(&times, &two, Ease::In, End::Hold),
+        keyed(&times, &two, Ease::Linear, End::Hide),
+        rect(GRADE_KEY),
+    ] {
+        let mut j = with(raw);
+        if let Some(g) = j.grades[2].as_mut() {
+            g.track = timed_grade.clone();
+        }
+        assert_eq!(
+            judge_error(j.clone()),
+            JudgeError::AttachmentTiming {
+                slot: JudgeSlot::Good
+            }
+        );
+        // An unreferenced judge is not checked.
+        assert!(loads(vec![judge(), j]));
+    }
+    // Its coordinates stay within ±MAX_COORD.
+    for (v, ok) in [
+        (MAX_COORD, true),
+        (MAX_COORD + 1, false),
+        (-MAX_COORD - 1, false),
+    ] {
+        let j = with(rect([0, v, 10, 10]));
+        if ok {
+            assert!(loads(vec![j]));
+        } else {
+            assert_eq!(
+                judge_error(j),
+                JudgeError::Coordinates {
+                    part: JudgePart::Attachment(JudgeSlot::Good)
+                }
+            );
+        }
+    }
+}
+
+#[test]
+fn attachment_keys_count_toward_the_skin_s_keys_referenced_or_not() {
+    // One 1-key element and its judge's 1-key grade; 127 unreferenced
+    // judges whose grade and attachment have 256 keys each, and one whose
+    // grade has 255 and attachment `last`, unchecked though its timing
+    // differs when `last` is 256.
+    let judges = |last: usize| -> Vec<JudgeDef> {
+        let part = |grade_keys: usize, attachment_keys: usize| {
+            let mut j = empty_judge();
+            j.grades[0] = Some(GradePart {
+                track: keys(grade_keys),
+                attachment: Some(keys(attachment_keys)),
+                ..grade(GRADE, GRADE_KEY)
+            });
+            j
+        };
+        let mut first = empty_judge();
+        first.grades[0] = Some(grade(GRADE, GRADE_KEY));
+        let mut judges = vec![first];
+        judges.extend((0..127).map(|_| part(MAX_TRACK_KEYS, MAX_TRACK_KEYS)));
+        judges.push(part(MAX_TRACK_KEYS - 1, last));
+        judges
+    };
+    let with = |last| {
+        load(
+            vec![judge_element(0)],
+            WidgetDefs {
+                judges: judges(last),
+                ..WidgetDefs::default()
+            },
+        )
+    };
+    assert_eq!(1 + 1 + 127 * 512 + 255 + 255, MAX_SKIN_KEYS);
+    assert!(with(255).is_ok());
+    assert!(matches!(
+        with(256),
+        Err(LoadError::TooManyKeys { n }) if n == MAX_SKIN_KEYS + 1
+    ));
+}
