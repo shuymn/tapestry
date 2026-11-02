@@ -124,6 +124,7 @@ fn cause(c: AbortCause) -> &'static str {
         AbortCause::GaugeFailed => "GAUGE FAILED",
         AbortCause::ScreenFailed => "SCREEN FAILED",
         AbortCause::InputFailed => "INPUT FAILED",
+        AbortCause::RestoreFailed => "AUDIO RESTORE FAILED",
     }
 }
 

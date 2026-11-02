@@ -133,6 +133,19 @@ pub enum AudioCtl {
         /// A round's restore, planned on `origin`'s frame line; it goes
         /// back to the game thread with `queue` at the next play.
         restore: Option<Box<Restore>>,
+        /// The READY candidate whose transport this play's start waits
+        /// for ([`TransportGate`]); `None` starts it unconditionally.
+        gate: Option<TransportGate>,
+    },
+    /// A READY candidate of the current play was cancelled and another
+    /// opened: chart time 0 now at `origin`, its transport waiting for
+    /// `gate` as the first's did, the play's queue and gain kept. Nothing
+    /// is allocated or freed.
+    Rearm {
+        /// Where the new candidate's chart time 0 lies.
+        origin: TimeUs,
+        /// Its gate.
+        gate: TransportGate,
     },
     /// The play was aborted: every sound stops.
     Cancel,
@@ -151,6 +164,23 @@ pub enum AudioCtl {
     },
     /// The run ends.
     Exit,
+}
+
+/// A READY candidate's transport authorization (design.md "Play
+/// Lifecycle", the start gate): the engine holds the play's transport,
+/// and the pass whose block reaches chart time `commit_at` (0, or a
+/// round's lead-in start), by that pass's own wake and its actual block,
+/// commits `generation` on `gate` before anything of the schedule starts;
+/// when the commit finds it cancelled or stale, every sound of the play
+/// stops there, so its scheduled chart start and restore never run.
+#[derive(Clone, Debug)]
+pub struct TransportGate {
+    /// The start gate the input thread cancels.
+    pub gate: input::StartGate,
+    /// The candidate's generation.
+    pub generation: u32,
+    /// Where its transport commits, in chart time.
+    pub commit_at: TimeUs,
 }
 
 /// What the audio thread measured for a play (design.md "Latency Figures"),
@@ -217,6 +247,14 @@ impl AudioCounters {
     #[must_use]
     pub fn steals(&self) -> u64 {
         self.0.steals.load(Ordering::Acquire)
+    }
+
+    /// Whether the audio thread dropped READY candidate `generation`'s
+    /// transport, by a cancel or a commit that found it cancelled: its
+    /// cancellation is acknowledged, and no authorization of it is left.
+    #[must_use]
+    pub fn dropped(&self, generation: u32) -> bool {
+        self.0.dropped.load(Ordering::Acquire) == u64::from(generation) + 1
     }
 
     /// How play `generation`'s audio was restored, once the audio thread
@@ -291,6 +329,9 @@ struct Shared {
     /// How the latest play's restore went: its generation shifted left 8
     /// bits, with [`Restored`]'s code (0: no restore).
     restored: AtomicU64,
+    /// The latest READY candidate whose transport the audio thread
+    /// dropped, plus one: its cancellation acknowledged (0: none).
+    dropped: AtomicU64,
     /// The frame line's publication count: odd while the audio thread
     /// writes it.
     line_seq: AtomicU64,
@@ -343,6 +384,9 @@ pub struct AudioWorker {
     queue: AudioQueue,
     /// The current play's restore, kept until the next play retires it.
     restore: Option<Box<Restore>>,
+    /// The current READY candidate's transport, until it commits or is
+    /// dropped.
+    transport: Option<TransportGate>,
     /// The current play's origin.
     origin: TimeUs,
     generation: u64,
@@ -398,6 +442,7 @@ pub fn audio_control(mut engine: AudioEngine) -> (AudioControl, AudioWorker) {
         // Before the first play: a queue nothing sends to.
         queue: audio_link(1).1,
         restore: None,
+        transport: None,
         origin: TimeUs(0),
         generation: 0,
         sealed: false,
@@ -495,6 +540,36 @@ impl AudioControl {
         gain: Gain,
         restore: Option<Box<Restore>>,
     ) -> Result<(), AudioWaitError> {
+        self.start(origin, queue, gain, restore, None)
+    }
+
+    /// [`play_at`](Self::play_at) for a READY candidate whose transport
+    /// waits for `gate` (design.md "Play Lifecycle", the start gate): the
+    /// audio thread commits it in the pass reaching its commit point,
+    /// and drops the play's sounds there when it was cancelled.
+    ///
+    /// # Errors
+    ///
+    /// As [`ready`](Self::ready); nothing is sent.
+    pub fn play_gated(
+        &mut self,
+        origin: TimeUs,
+        queue: AudioQueue,
+        gain: Gain,
+        restore: Option<Box<Restore>>,
+        gate: TransportGate,
+    ) -> Result<(), AudioWaitError> {
+        self.start(origin, queue, gain, restore, Some(gate))
+    }
+
+    fn start(
+        &mut self,
+        origin: TimeUs,
+        queue: AudioQueue,
+        gain: Gain,
+        restore: Option<Box<Restore>>,
+        gate: Option<TransportGate>,
+    ) -> Result<(), AudioWaitError> {
         self.ready()?;
         self.in_flight = true;
         self.generation += 1;
@@ -505,8 +580,16 @@ impl AudioControl {
             generation,
             gain,
             restore,
+            gate,
         });
         Ok(())
+    }
+
+    /// The play's cancelled candidate is followed by another, chart time 0
+    /// at `origin`, waiting for `gate` ([`AudioCtl::Rearm`]). Send it once
+    /// the cancellation is acknowledged ([`AudioCounters::dropped`]).
+    pub fn rearm(&mut self, origin: TimeUs, gate: TransportGate) {
+        self.send(AudioCtl::Rearm { origin, gate });
     }
 
     /// What the engine plays, as of its latest load: for a round's
@@ -775,7 +858,9 @@ impl AudioWorker {
                     generation,
                     gain,
                     restore,
+                    gate,
                 } => {
+                    self.transport = gate;
                     // A `Gain` is always in range.
                     let _ = self.engine.set_gain(gain.get());
                     self.engine.restart(origin);
@@ -785,6 +870,9 @@ impl AudioWorker {
                     let restored = restore
                         .as_deref()
                         .map_or(0, |r| r.apply(&mut self.engine).code());
+                    if let Some(t) = &self.transport {
+                        self.engine.hold_transport(t.commit_at);
+                    }
                     self.shared
                         .restored
                         .store(generation << 8 | u64::from(restored), Ordering::Release);
@@ -805,10 +893,13 @@ impl AudioWorker {
                     self.steady = 0;
                     self.publish_steady();
                 }
-                AudioCtl::Cancel => {
-                    self.steady_from = None;
-                    self.engine.stop();
-                    while self.queue.commands().pop().is_ok() {}
+                AudioCtl::Cancel => self.drop_play(),
+                AudioCtl::Rearm { origin, gate } => {
+                    self.engine.restart(origin);
+                    self.engine.hold_transport(gate.commit_at);
+                    self.origin = origin;
+                    self.transport = Some(gate);
+                    self.steady_from = Some(origin);
                 }
                 AudioCtl::Seal => self.sealed = true,
                 AudioCtl::RingOut { fade_at, end_at } => {
@@ -819,6 +910,49 @@ impl AudioWorker {
             }
         }
         !self.exited
+    }
+
+    /// Stops every sound of the play and discards its queued key sounds;
+    /// a READY candidate's transport still waiting is dropped, and its
+    /// cancellation acknowledged.
+    fn drop_play(&mut self) {
+        self.steady_from = None;
+        self.engine.stop();
+        while self.queue.commands().pop().is_ok() {}
+        if let Some(t) = self.transport.take() {
+            self.shared
+                .dropped
+                .store(u64::from(t.generation) + 1, Ordering::Release);
+        }
+    }
+
+    /// One engine pass, the READY candidate's transport held: the pass
+    /// whose block reaches its commit point, by that pass's own wake and
+    /// actual block, commits it before anything of the schedule starts,
+    /// or drops the play when the commit finds the candidate cancelled or
+    /// stale.
+    fn engine_step(
+        &mut self,
+        out: &mut impl AudioOutput,
+    ) -> Result<::audio::StepReport, OutputError> {
+        let Self {
+            engine,
+            queue,
+            transport,
+            ..
+        } = self;
+        let mut admit = || {
+            transport
+                .as_ref()
+                .is_some_and(|t| t.gate.commit(t.generation))
+        };
+        let report = engine.step_admitting(out, queue.commands(), &mut admit)?;
+        match report.transport {
+            Some(true) => self.transport = None,
+            Some(false) => self.drop_play(),
+            None => {}
+        }
+        Ok(report)
     }
 
     /// Publishes where a play's chart times fall on the output now
@@ -865,7 +999,7 @@ impl AudioWorker {
             return Ok(false);
         }
         self.change_queue(out);
-        let stepped = self.engine.step(out, self.queue.commands());
+        let stepped = self.engine_step(out);
         // A failed write may have mixed, and stolen voices, first.
         self.shared
             .deferred_wakes

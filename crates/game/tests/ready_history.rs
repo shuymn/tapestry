@@ -215,7 +215,7 @@ fn a_full_arena_seals_the_history_and_leaves_the_rest_unread() {
             &start,
             TimeUs(0),
             TimeUs(0),
-            &mut [],
+            &mut [] as &mut [input::SourceReader],
             &[],
             CancelReason::Held
         ),

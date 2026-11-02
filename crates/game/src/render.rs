@@ -48,13 +48,35 @@ pub type ViewWriter = triple_buffer::Input<PlayView>;
 pub struct RenderSink {
     effects: rtrb::Producer<JudgeEvent>,
     dropped: Arc<AtomicU64>,
+    /// Effects queued so far.
+    pushed: u64,
+    rearmed: Arc<Rearmed>,
+}
+
+/// What a READY candidate's rearm tells the render side: the effects
+/// queued before it are the cancelled candidate's, and how many rearms
+/// there were, so the screen starts its candidate's clocks and timers
+/// over.
+#[derive(Debug, Default)]
+struct Rearmed {
+    /// Effects queued before the latest rearm: the side discards them.
+    skip_to: AtomicU64,
+    /// Rearms so far.
+    count: AtomicU64,
 }
 
 impl EventSink for RenderSink {
     fn receive(&mut self, ev: &JudgeEvent) {
         if self.effects.push(*ev).is_err() {
             self.dropped.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.pushed += 1;
         }
+    }
+
+    fn rearm(&mut self, _origin: TimeUs) {
+        self.rearmed.skip_to.store(self.pushed, Ordering::Release);
+        self.rearmed.count.fetch_add(1, Ordering::Release);
     }
 }
 
@@ -64,15 +86,32 @@ pub struct RenderSide {
     effects: rtrb::Consumer<JudgeEvent>,
     view: triple_buffer::Output<PlayView>,
     dropped: Arc<AtomicU64>,
+    /// Effects popped so far, discarded ones included.
+    popped: u64,
+    rearmed: Arc<Rearmed>,
 }
 
 impl RenderSide {
+    /// Pops the next effect of the current READY candidate, discarding
+    /// those a rearm left behind.
+    fn pop(&mut self) -> Option<JudgeEvent> {
+        let skip_to = self.rearmed.skip_to.load(Ordering::Acquire);
+        loop {
+            let ev = self.effects.pop().ok()?;
+            self.popped += 1;
+            if self.popped > skip_to {
+                return Some(ev);
+            }
+        }
+    }
+
     /// Hands every queued effect to `f`, in emission order. The logic step
     /// can keep pushing meanwhile, so one drain can hand over more than the
     /// queue holds; a frame bounded by its buffer uses
-    /// [`drain_effects_up_to`](Self::drain_effects_up_to).
+    /// [`drain_effects_up_to`](Self::drain_effects_up_to). A cancelled
+    /// READY candidate's effects are never handed over.
     pub fn drain_effects(&mut self, mut f: impl FnMut(&JudgeEvent)) {
-        while let Ok(ev) = self.effects.pop() {
+        while let Some(ev) = self.pop() {
             f(&ev);
         }
     }
@@ -81,7 +120,7 @@ impl RenderSide {
     /// popping there: the rest stay queued, in order, for the next drain.
     pub fn drain_effects_up_to(&mut self, n: usize, mut f: impl FnMut(&JudgeEvent)) {
         for _ in 0..n {
-            let Ok(ev) = self.effects.pop() else {
+            let Some(ev) = self.pop() else {
                 return;
             };
             f(&ev);
@@ -98,6 +137,15 @@ impl RenderSide {
     pub fn dropped(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)
     }
+
+    /// How many times the play's READY candidate was rearmed: when it
+    /// changes, the screen starts the candidate's clocks and READY timers
+    /// over, keeping its chart and text resources (design.md "Play
+    /// Lifecycle", the start gate).
+    #[must_use]
+    pub fn rearms(&self) -> u64 {
+        self.rearmed.count.load(Ordering::Acquire)
+    }
 }
 
 /// The link between logic and rendering: an effect queue holding
@@ -110,16 +158,21 @@ pub(crate) fn render_link(
     let (producer, consumer) = rtrb::RingBuffer::new(effect_capacity);
     let (writer, reader) = triple_buffer::triple_buffer(initial);
     let dropped = Arc::new(AtomicU64::new(0));
+    let rearmed = Arc::new(Rearmed::default());
     (
         RenderSink {
             effects: producer,
             dropped: Arc::clone(&dropped),
+            pushed: 0,
+            rearmed: Arc::clone(&rearmed),
         },
         writer,
         RenderSide {
             effects: consumer,
             view: reader,
             dropped,
+            popped: 0,
+            rearmed,
         },
     )
 }

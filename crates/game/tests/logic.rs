@@ -86,6 +86,10 @@ impl SourceRead for Racing {
         }
         ev
     }
+
+    fn is_empty(&self) -> bool {
+        self.reader.is_empty()
+    }
 }
 
 #[test]
@@ -509,6 +513,10 @@ impl SourceRead for Silent {
 
     fn pop(&mut self) -> Option<PhysicalInputEvent> {
         None
+    }
+
+    fn is_empty(&self) -> bool {
+        true
     }
 }
 

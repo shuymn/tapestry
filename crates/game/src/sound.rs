@@ -69,6 +69,12 @@ impl EventSink for AudioSink {
             self.dropped.fetch_add(1, Ordering::Relaxed);
         }
     }
+
+    /// The next READY candidate's key sounds go onto the output's timeline
+    /// from its own origin.
+    fn rearm(&mut self, origin: TimeUs) {
+        self.shift = origin;
+    }
 }
 
 /// The audio thread's end of the command queue.
@@ -199,6 +205,23 @@ impl<O: AudioOutput + Wakes> RunnerAudio<O> {
         self.engine
             .step(&mut self.output, queue.commands())
             .map(|_| ())
+    }
+
+    /// [`wake`](Self::wake), asking `admit` for a held transport in the
+    /// pass whose block reaches its commit point
+    /// ([`AudioEngine::step_admitting`]): what that pass did with it.
+    ///
+    /// # Errors
+    ///
+    /// The output's failure.
+    pub(crate) fn wake_admitting(
+        &mut self,
+        queue: &mut AudioQueue,
+        admit: &mut dyn FnMut() -> bool,
+    ) -> Result<Option<bool>, OutputError> {
+        self.engine
+            .step_admitting(&mut self.output, queue.commands(), admit)
+            .map(|r| r.transport)
     }
 
     /// Stops the play's audio (an abort): voices, pending starts and the

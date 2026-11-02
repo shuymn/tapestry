@@ -230,6 +230,11 @@ struct Fake {
     phases: Vec<Vec<(i64, bool)>>,
     /// The phase published once each play's recording closes.
     closed_phases: Vec<bool>,
+    /// Whether plays run the start gate; with `lifetime`, a deferred opening
+    /// resumes a loading lifetime.
+    gated: bool,
+    lifetime: bool,
+    generation: u32,
 }
 
 impl Fake {
@@ -295,6 +300,9 @@ impl Fake {
             side: None,
             phases: Vec::new(),
             closed_phases: Vec::new(),
+            gated: false,
+            lifetime: false,
+            generation: 0,
         }
     }
 
@@ -471,6 +479,43 @@ impl Rig for Fake {
             kinds: self.sources.participants().map(|(_, k)| k).collect(),
             axes: Vec::new(),
         })
+    }
+
+    fn gated(&self) -> bool {
+        self.gated
+    }
+
+    fn open_candidate(
+        &mut self,
+        lead_in: TimeUs,
+        generation: u32,
+    ) -> Result<Option<Opening<SourceReader>>, InputWaitError> {
+        if self.sources.holding() {
+            self.steps.push("deferred");
+            return Ok(None);
+        }
+        self.generation = generation;
+        self.open(lead_in).map(Some)
+    }
+
+    fn defer(&mut self) {
+        self.steps.push(if self.lifetime {
+            "resume loading"
+        } else {
+            "wait in preparing"
+        });
+    }
+
+    fn holding(&self) -> bool {
+        self.sources.holding()
+    }
+
+    /// The transport commits as soon as it is asked.
+    fn candidate(&self) -> input::GateState {
+        input::GateState {
+            generation: self.generation,
+            phase: input::GatePhase::Committed,
+        }
     }
 
     fn start(&mut self, origin: TimeUs, sounds: AudioQueue, screen: RenderSide) {
@@ -2807,6 +2852,90 @@ fn a_retry_prepares_with_the_refreshed_play_preset_not_the_viewed_one() {
     // Fresh per attempt: its own number, from the same chart.
     assert_eq!((one.number, two.number), (1, 2));
     assert_eq!(one.kind, two.kind);
+}
+
+/// A screen lost while a held START defers the opening ends the run as
+/// before any opening, without waiting for the release: recording never
+/// opens. Exercises `game::live::play_and_next` through `open_gated`.
+#[test]
+fn a_screen_lost_while_the_opening_is_deferred_opens_nothing() {
+    const Q: ControlId = ControlId(0x10);
+    let dir = tempfile::tempdir().unwrap();
+    let mut loaded = loaded(dir.path());
+    let items = vec![key(CLOCK_START, Q, 1), key(9_000_000, Q, 0)];
+    let mut rig = Fake::new(items, &[], 11_000_000);
+    let (mut tap, _rx) = input::adjustment_queue(input::AdjustmentBindings {
+        controls: vec![(input::TapControl::Key(Q), 0)],
+        latched: 1,
+        wrap: None,
+    })
+    .unwrap();
+    tap.set_active(true);
+    rig.sources.set_adjustment(tap);
+    rig.gated = true;
+    rig.screen_fails_at = 8_000_000;
+    let ran = game::live::run_chart(&mut loaded, &mut rig);
+    assert!(matches!(ran, Err(LiveError::ScreenLost)), "{ran:?}");
+    assert_eq!(rig.opens, 0);
+    assert!(
+        rig.clock.now().0 < 9_000_000,
+        "it did not wait for the release"
+    );
+}
+
+/// With the start gate (design.md "Play Lifecycle", the start gate), a
+/// START held at the opening defers it: an attempt with a loading lifetime
+/// resumes it (Preparing → Loading), one without waits in Preparing;
+/// either way the loading state is quiesced again and the opening asked
+/// again once the hold is released, and READY opens at that release.
+/// Exercises `game::live::play_and_next` through `open_gated`.
+#[test]
+fn a_hold_at_the_opening_defers_it_with_or_without_a_loading_lifetime() {
+    const Q: ControlId = ControlId(0x10);
+    for lifetime in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut loaded = loaded(dir.path());
+        let items = vec![key(CLOCK_START, Q, 1), key(8_000_000, Q, 0)];
+        let mut rig = Fake::new(items, &[], 11_000_000);
+        let (mut tap, _rx) = input::adjustment_queue(input::AdjustmentBindings {
+            controls: vec![(input::TapControl::Key(Q), 0)],
+            latched: 1,
+            wrap: None,
+        })
+        .unwrap();
+        tap.set_active(true);
+        rig.sources.set_adjustment(tap);
+        rig.gated = true;
+        rig.lifetime = lifetime;
+        game::live::run_chart(&mut loaded, &mut rig).unwrap();
+        let waited = if lifetime {
+            "resume loading"
+        } else {
+            "wait in preparing"
+        };
+        assert_eq!(
+            rig.steps,
+            [
+                "screen",
+                "before play",
+                "audio",
+                "attempt",
+                "commit",
+                "end loading",
+                "deferred",
+                waited,
+                "end loading",
+                "open",
+            ]
+        );
+        // READY opened at the release, a full lead-in before chart time 0.
+        assert_eq!(rig.origins.len(), 1);
+        assert!(
+            rig.origins[0].0 >= 8_000_000 + 1_000_000,
+            "{:?}",
+            rig.origins
+        );
+    }
 }
 
 /// The screen refuses the attempt: the run stops with the refusal before
