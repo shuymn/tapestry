@@ -102,6 +102,14 @@ fn each_lane_draws_its_notes_at_its_own_height() {
     let mut equal = harness(&chart);
     equal.frame(1_000, &[]);
     assert_eq!(rects(&h, LINE), rects(&equal, LINE));
+    // Judged on its own (CN), the end cap shows too, 33.5 high on the
+    // end's edge 200 px up.
+    let mut cn = chart.clone();
+    cn.meta.ln_mode = Some(LnMode::Cn);
+    let mut h = harness_of(source_with(heights), &cn);
+    h.frame(1_000, &[]);
+    assert_eq!(edges(in_lane(&h, TAIL, lane(3))), [(680.0, 33.5)]);
+    assert_eq!(edges(in_lane(&h, HEAD, lane(3))), [(780.0, 33.5)]);
 }
 
 #[test]
