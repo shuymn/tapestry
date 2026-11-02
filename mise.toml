@@ -13,6 +13,7 @@ lefthook = "2"
 cargo-deny = "0"
 "aqua:rustsec/rustsec/cargo-audit" = "0"
 "github:bnjbvr/cargo-machete" = "0"
+"github:nextest-rs/nextest" = { version = "0.9", version_prefix = "cargo-nextest-" }
 actionlint = "1"
 shellcheck = "0"
 "github:babarot/gh-infra" = "0"
