@@ -429,7 +429,88 @@ pub fn draw(imported: &Imported) -> Vec<usize> {
     digit_probes(skin, &ctx, &states, &uvs, &mut batch);
     grade_anchor_probes(skin, &ctx, &uvs, &mut batch);
     gauge_probes(skin, &chart, &uvs, &mut batch);
+    lane_order_probes(skin, &ctx, &uvs, &mut batch);
     counts
+}
+
+/// Chords on all eight lanes, every tenth a long note, at shared and
+/// distinct times: frames as they scroll past, with and without scroll
+/// left, each finite and inside the skin's capacities whatever the
+/// lanes' note order.
+fn lane_order_probes(
+    skin: &skin_model::Skin,
+    ctx: &skin_model::PlayContext<'_>,
+    uvs: &skin_model::UvTable,
+    batch: &mut skin_model::QuadBatch,
+) {
+    use bms_model::{ChartBuilder, Lane, TimeUs};
+    use eval::{GaugeState, Tally};
+    use rules::{GaugeValue, PerJudgment};
+    use skin_model::{LaneView, Layout, SkinFrame};
+
+    let mut b = ChartBuilder::new(150_000);
+    for k in 0..200_i64 {
+        for l in 0..8_u8 {
+            let Some(lane) = Lane::new(l) else {
+                continue;
+            };
+            let t = 1_000_000 + k * 10_000 + i64::from(l % 3) * 1_000;
+            b = if k % 10 == 0 {
+                b.long(lane, TimeUs(t), TimeUs(t + 5_000))
+            } else {
+                b.tap(lane, TimeUs(t))
+            };
+        }
+    }
+    let chart = b.build().expect("chords on every lane");
+    let mut play = skin
+        .prepare(&chart, ctx)
+        .expect("an imported skin prepares");
+    let tally = Tally {
+        counts: PerJudgment {
+            perfect: 0,
+            great: 0,
+            good: 0,
+            bad: 0,
+            poor: 0,
+        },
+        ex_score: 0,
+        bp: 0,
+        combo: 0,
+        max_combo: 0,
+        empty_poor: 0,
+    };
+    let states = [GaugeState {
+        value: GaugeValue(0),
+        reference: GaugeValue(0),
+        failed_at: None,
+    }];
+    for (k, cover) in [0_u16, 300, 1_000, 0, 500].into_iter().enumerate() {
+        let view = LaneView {
+            visible_time: TimeUs(600_000),
+            cover,
+            lift: 0,
+            hidden: 0,
+        };
+        batch.clear();
+        let frame = SkinFrame {
+            now: TimeUs(800_000 + i64::try_from(k).unwrap_or(0) * 400_000),
+            display_offset: TimeUs(0),
+            tally: &tally,
+            gauges: &states,
+            gauge: 0,
+            effects: &[],
+            complete: false,
+            target: [1_920, 1_080],
+            layout: &Layout::AUTHOR,
+            lanes: view,
+            readouts: readouts_for(view),
+            playing: true,
+        };
+        skin.build(&mut play, &frame, uvs, batch)
+            .expect("the frame builds");
+        check_batch(skin, batch);
+    }
 }
 
 /// The shown gauge at raw values around its thresholds: a maximum that
