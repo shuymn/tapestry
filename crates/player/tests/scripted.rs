@@ -677,20 +677,7 @@ fn run_retried(fx: &Fixture, extra: &[&str]) -> (String, Vec<PlayRecord>) {
 /// The judgments a record re-evaluates to; the run itself checked that
 /// they equal its live stream ("re-evaluation matches live").
 fn judged(chart: &bms_model::Chart, rec: &PlayRecord) -> Vec<eval::JudgeEvent> {
-    let evaluation = eval::evaluate(
-        chart,
-        &EvalInput {
-            events: rec.events.clone(),
-            device: rec.devices.profile(),
-            start: rec.start.clone(),
-            finalized: Some(rec.status.finalized),
-            section: None,
-        },
-        &rules::RulePreset::from_canonical_bytes(&rec.preset.canonical_bytes).unwrap(),
-    )
-    .unwrap();
-    evaluation
-        .events
+    all_events(chart, rec)
         .into_iter()
         .filter(|e| matches!(e.kind, JudgeEventKind::Judged { .. }))
         .collect()
@@ -1868,7 +1855,11 @@ fn the_winning_capture_reevaluates_equal_to_live() {
     }
     assert!(!has(&rec.events, 0x3C) && !has(&h.events, 0x3C));
     // Every outcome, re-evaluated from the record.
-    let judged = judged(&fx.chart, &rec);
+    let all = all_events(&fx.chart, &rec);
+    let judged: Vec<_> = all
+        .iter()
+        .filter(|e| matches!(e.kind, JudgeEventKind::Judged { .. }))
+        .collect();
     let count = |j: Judgment| {
         judged
             .iter()
@@ -1890,7 +1881,6 @@ fn the_winning_capture_reevaluates_equal_to_live() {
         matches!(e.kind, JudgeEventKind::Judged { lane, judgment: Judgment::Perfect, .. } if lane.index() == 0)
     });
     assert!(scratch, "{judged:?}");
-    let all = all_events(&fx.chart, &rec);
     assert!(
         all.iter()
             .any(|e| matches!(e.kind, JudgeEventKind::EmptyPoor { .. })),
