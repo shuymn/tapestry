@@ -22,6 +22,12 @@
 //! counters ([`Usage`]). A play-critical element it cannot reproduce
 //! refuses the import; anything else is dropped with a note.
 //!
+//! A Lua skin ([`lua`]) runs in a bounded sandbox, once for its header
+//! ([`read_lua_header`]) and once for a configuration
+//! ([`LuaHeader::import`]); the table it returns is converted into the
+//! same arena, its values typed as Lua typed them, and imported through
+//! [`import`].
+//!
 //! Every input bound ([`limits`]) is checked before the work it guards:
 //! file sizes from metadata before reading, the include depth and parse
 //! count before opening, nodes before they are inserted, decoded strings
@@ -42,6 +48,7 @@ mod header;
 mod import;
 mod json;
 pub mod limits;
+pub mod lua;
 mod resolve;
 mod tree;
 
@@ -52,4 +59,6 @@ pub use import::{
     NoteFallback, NoteKind, NoteLoc, Object, OffsetValue, PartWhy, PropertyKind, Report, Rule,
     Severity, TimerWhy, TrackWhy, Usage, import,
 };
+pub use lua::{Cancel, LuaHeader, LuaImported, LuaLimit, LuaUsage, LuaWhy, read_lua_header};
 pub use resolve::{Definition, Resolved, resolve};
+pub use tree::CallableKind;

@@ -1,15 +1,21 @@
 [package]
 name = "skin-beatoraja"
 version = "0.0.0"
-description = "Imports 7-key play skin definitions in the source format's lenient JSON: a bounded reader, include and branch resolution, the header, and the mapping of images, numbers, text and the play objects onto the skin model with a conversion report."
+description = "Imports 7-key play skin definitions in the source format's lenient JSON and its Lua skins, run in a bounded sandbox: a bounded reader, include and branch resolution, the header, and the mapping of images, numbers, text and the play objects onto the skin model with a conversion report."
 edition.workspace = true
 license = "GPL-3.0-or-later"
 repository.workspace = true
 publish.workspace = true
 
+[features]
+# The Lua conversion report (src/bin/lua_report.rs), for the developer's
+# PC only (docs/stage3.md §3).
+dev-tools = []
+
 [dependencies]
 bms-model.workspace = true
 image.workspace = true
+mlua.workspace = true
 skin-model.workspace = true
 
 [dev-dependencies]
@@ -25,6 +31,15 @@ tempfile.workspace = true
 [lints]
 workspace = true
 
+[[bin]]
+name = "lua_report"
+required-features = ["dev-tools"]
+
 [[bench]]
 name = "import"
 harness = false
+
+[[bench]]
+name = "lua"
+harness = false
+required-features = ["dev-tools"]

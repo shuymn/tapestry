@@ -13,7 +13,7 @@ use super::super::property::{self, StrProp};
 use super::super::report::{DeviationId, NoteKind, PropertyKind, Severity, Span};
 use super::super::{Cx, Dst, Opts, Prop};
 use crate::error::ImportError;
-use crate::tree::{Kind, Scalar};
+use crate::tree::Scalar;
 
 /// A text's font as the model draws it.
 enum TextFont {
@@ -381,7 +381,7 @@ impl Cx<'_> {
         let Some(f) = field else {
             return Ok(Vec::new());
         };
-        if self.def.arena.node(f).kind != Kind::Array {
+        if !self.def.arena.is_array(f) {
             return Err(self.def.type_error(f, "fallback", "an array"));
         }
         let n = self.def.arena.children(f).count();

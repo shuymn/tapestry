@@ -88,7 +88,7 @@ struct Parser<'a> {
 /// sits at the depth of the object that names it); the file's root is one
 /// deeper.
 pub(crate) fn parse(arena: &mut Arena, file: u16, base_depth: u32) -> Result<u32, ImportError> {
-    let Arena { nodes, files } = arena;
+    let Arena { nodes, files, .. } = arena;
     let b = &files[usize::from(file)].bytes;
     let result = match std::str::from_utf8(b) {
         Err(e) => Err(Fail::Syntax(e.valid_up_to(), Syntax::InvalidUtf8)),

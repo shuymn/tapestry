@@ -13,6 +13,14 @@ use skin_beatoraja::{
 };
 use tempfile::TempDir;
 
+/// Both passes of the Lua skin `s.luaskin` in `root`, with the default
+/// configuration.
+pub fn lua_import(root: &Path) -> Result<skin_beatoraja::LuaImported, ImportError> {
+    let cancel = skin_beatoraja::Cancel::new();
+    let h = skin_beatoraja::read_lua_header(root, "s.luaskin", &cancel)?;
+    h.import(&Config::defaults(h.header()), &cancel)
+}
+
 /// A skin folder holding `files`, each a name and its text.
 pub fn skin(files: &[(&str, &str)]) -> TempDir {
     let d = tempfile::tempdir().unwrap();
