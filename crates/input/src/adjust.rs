@@ -142,8 +142,9 @@ pub enum TapEvent {
         /// Its chart time 0.
         origin: TimeUs,
     },
-    /// A hold cancelled READY candidate `generation`, right after the
-    /// observation that caused it.
+    /// A hold cancelled READY candidate `generation`: sent after the batch
+    /// whose observation caused it, so the requests at that batch's time
+    /// are made under the candidate's clock.
     Cancelled {
         /// The candidate's generation.
         generation: u32,
@@ -529,6 +530,9 @@ pub struct AdjustmentTap {
     /// tap counts held from them.
     window: Option<(WindowKeyReceiver, [Option<u8>; 2])>,
     window_held: u8,
+    /// The candidate a hold of this batch cancelled: its marker follows the
+    /// batch.
+    cancelled: Option<u32>,
 }
 
 /// The logic thread's end of the tap.
@@ -589,6 +593,7 @@ pub fn adjustment_queue(
             owed_flag: Arc::clone(&owed),
             window: None,
             window_held: 0,
+            cancelled: None,
         },
         AdjustmentReceiver {
             queue: consumer,
@@ -743,11 +748,12 @@ impl AdjustmentTap {
         {
             *p = at;
         }
-        let cancelled = self.store_latch();
+        if let Some(generation) = self.store_latch() {
+            self.cancelled = Some(generation);
+        }
         if let Some(event) = event {
             self.observe(at, event, foreground);
         }
-        self.cancelled(cancelled, at);
     }
 
     /// Axis `n` moved `raw` counts: a relative report (`declared` is
@@ -819,6 +825,10 @@ impl AdjustmentTap {
     pub fn tick(&mut self, at: TimeUs) {
         if !self.active {
             return;
+        }
+        // A cancellation follows the batch whose hold caused it.
+        if let Some(generation) = self.cancelled.take() {
+            self.owed.push(Marker::Cancelled { generation });
         }
         self.flush(at);
         self.window_keys(at);
@@ -1009,17 +1019,6 @@ impl AdjustmentTap {
             self.unclosed = Some(at);
         } else if self.unclosed.is_some_and(|t| at > t) {
             self.unclosed = None;
-        }
-    }
-
-    /// A hold cancelled candidate `generation` (`cancelled`): the marker
-    /// follows what caused it.
-    fn cancelled(&mut self, cancelled: Option<u32>, at: TimeUs) {
-        if let Some(generation) = cancelled
-            && self.active
-        {
-            self.owed.push(Marker::Cancelled { generation });
-            self.flush(at);
         }
     }
 
