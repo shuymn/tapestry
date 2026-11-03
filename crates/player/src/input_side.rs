@@ -2651,7 +2651,7 @@ mod gate_tests {
     }
 
     #[test]
-    fn a_rearm_seals_the_cancelled_opening_and_opens_the_next_at_one_boundary() {
+    fn a_rearm_seals_the_cancelled_opening_and_opens_the_next_at_one_boundary_alloc() {
         let (mut sources, mut hook, mut link, gate) = rig();
         // START held: the opening is deferred, nothing opens.
         batch(&mut hook, &mut sources, 10, &[packet(1, Q, 1)]);
@@ -2911,7 +2911,7 @@ mod gate_tests {
     /// held through the handoff released with no press repeated, until the
     /// close after the tail.
     #[test]
-    fn a_handoff_keeps_the_sources_until_the_close() {
+    fn a_handoff_keeps_the_sources_until_the_close_alloc() {
         let (mut sources, mut hook, mut link, gate) = rig();
         let opening = open(&mut hook, &link, &mut sources, 10).unwrap();
         assert_eq!(gate.state().phase, GatePhase::Armed);
@@ -3160,7 +3160,7 @@ mod gate_tests {
     /// development builds' allocator, so the test runs with dev-tools.
     #[cfg(feature = "dev-tools")]
     #[test]
-    fn an_abort_close_allocates_nothing_on_either_thread() {
+    fn abort_close_alloc() {
         use crate::alloc_count::this_thread;
         let control = || {
             let before = this_thread();
