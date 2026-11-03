@@ -59,7 +59,7 @@ pub use self::convert::MAX_CONVERTED_BYTES;
 pub use self::host::HOST_APIS;
 pub use self::ledger::{Cancel, LuaUsage};
 use self::ledger::{Counts, Ledger};
-use self::loader::Store;
+pub(crate) use self::loader::Store;
 use self::sandbox::host;
 use crate::error::{ImportError, Loc};
 use crate::header::Header;
@@ -481,13 +481,16 @@ pub(crate) fn header_pass(root: &Path, entry: &str, cancel: &Cancel) -> Outcome<
         cancel,
         None,
     );
-    let result = r.and_then(|converted| {
-        let mut def = definition(&root, converted, counts, cancel);
-        let header =
-            resolve(&mut def, &std::collections::BTreeSet::new()).and_then(|mut r| r.header());
-        common_reads(&def, &mut counts, &mut store);
-        header
-    });
+    let result = match r {
+        Ok(converted) => {
+            let mut def = definition(&root, converted, counts, store, cancel);
+            let header =
+                resolve(&mut def, &std::collections::BTreeSet::new()).and_then(|mut r| r.header());
+            store = common_reads(&mut def, &mut counts);
+            header
+        }
+        Err(e) => Err(e),
+    };
     let dependencies = store.dependencies.clone();
     Outcome {
         result: result.map(|header| LuaHeader {
@@ -519,25 +522,33 @@ pub fn read_lua_header(
     header_pass(root, entry, cancel).result
 }
 
-fn definition(root: &Root, c: Converted, counts: Counts, cancel: &Cancel) -> Definition {
+fn definition(
+    root: &Root,
+    c: Converted,
+    counts: Counts,
+    store: Store,
+    cancel: &Cancel,
+) -> Definition {
     Definition::from_lua(
         root.clone(),
         c.entry,
         c.arena,
         c.top,
         counts.input_bytes,
+        counts.loads,
+        store,
         cancel.clone(),
     )
 }
 
-/// Carries what the common reader read of `def`'s includes into the
-/// candidate: their bytes, which the next pass starts from, and their
-/// names among the dependencies.
-fn common_reads(def: &Definition, counts: &mut Counts, store: &mut Store) {
+/// Carries what the common reader did with `def`'s includes into the
+/// candidate: the bytes and loads it charged, which the next pass starts
+/// from, and the snapshots it read and added, its files among the
+/// dependencies; the snapshots are taken back.
+fn common_reads(def: &mut Definition, counts: &mut Counts) -> Store {
     counts.input_bytes = counts.input_bytes.max(def.input_bytes());
-    for name in def.included() {
-        store.depend(name);
-    }
+    counts.loads = counts.loads.max(def.parses());
+    def.take_store()
 }
 
 impl LuaHeader {
@@ -611,7 +622,7 @@ impl LuaHeader {
         let result = def.and_then(|mut def| {
             let r = convert::refuse_callables(&def.arena)
                 .and_then(|()| import(&mut def, &self.header, config));
-            common_reads(&def, &mut counts, &mut store);
+            store = common_reads(&mut def, &mut counts);
             r
         });
         Outcome {
@@ -621,9 +632,9 @@ impl LuaHeader {
         }
     }
 
-    /// The configured pass: the converted definition, the candidate's
-    /// usage and its sources; on failure, the error with the usage and
-    /// sources so far.
+    /// The configured pass: the converted definition, holding the
+    /// candidate's snapshots, and its usage; on failure, the error with the
+    /// usage and the snapshots so far.
     pub(crate) fn configured(
         &self,
         config: &Config,
@@ -638,7 +649,13 @@ impl LuaHeader {
             cancel,
             Some(bridge),
         );
-        let def = r.map(|converted| definition(&self.root, converted, counts, cancel));
-        (def, counts, store)
+        match r {
+            Ok(converted) => (
+                Ok(definition(&self.root, converted, counts, store, cancel)),
+                counts,
+                Store::default(),
+            ),
+            Err(e) => (Err(e), counts, store),
+        }
     }
 }

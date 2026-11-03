@@ -1143,6 +1143,43 @@ fn json_included_by_a_lua_skin_is_charged_to_the_candidate() {
 }
 
 #[test]
+fn json_included_by_a_lua_skin_shares_the_load_allowance() {
+    // 600 includes in each pass: 1,200 in all, over the 1,024 the
+    // candidate's loads and includes share.
+    let includes = "{ include = \"p.json\" },".repeat(600);
+    let d = folder(&[
+        (
+            "s.luaskin",
+            &format!("return {{ type = 0, property = {{ {includes} }} }}"),
+        ),
+        ("p.json", "[]"),
+    ]);
+    let h = header(&d).unwrap();
+    assert_eq!(h.usage().loads, 600);
+    assert_eq!(
+        input(h.import(&Config::defaults(h.header()), &Cancel::new())),
+        InputLimit::IncludeParses
+    );
+}
+
+#[test]
+fn json_included_by_a_lua_skin_is_read_once_for_both_passes() {
+    // The configured pass reads the header pass's snapshot: a file changed
+    // between the passes is not read again.
+    let d = folder(&[
+        (
+            "s.luaskin",
+            "return { type = 0, property = { include = \"p.json\" } }",
+        ),
+        ("p.json", "[{\"name\": \"o\"}]"),
+    ]);
+    let h = header(&d).unwrap();
+    std::fs::write(d.path().join("p.json"), "this is no JSON").unwrap();
+    h.import(&Config::defaults(h.header()), &Cancel::new())
+        .unwrap();
+}
+
+#[test]
 fn numbers_keep_their_subtype_and_exact_value() {
     // A whole float is an integer; a fraction is not one for exact
     // geometry; an integer outside i32 is out of range, not wrapped; a

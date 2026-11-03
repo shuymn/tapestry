@@ -51,7 +51,7 @@ use crate::json;
 use crate::limits::{
     Limits, MAX_FILE_BYTES, MAX_INCLUDE_DEPTH, MAX_INCLUDE_PARSES, MAX_INPUT_BYTES,
 };
-use crate::lua::{Cancel, LuaWhy};
+use crate::lua::{Cancel, LuaWhy, Store};
 use crate::tree::{Arena, ESCAPED, Kind, NONE, Scalar, Text, Unescape};
 
 /// The type number of a 7-key play skin (`SkinType.java:12` at `0.8.9`).
@@ -67,6 +67,13 @@ pub struct Definition {
     entry: FileId,
     entry_nodes: usize,
     entry_bytes: u64,
+    /// The load invocations the candidate made before this definition's
+    /// resolution: a Lua skin's loaders share the allowance with its
+    /// includes ([`MAX_INCLUDE_PARSES`]).
+    entry_parses: u32,
+    /// A Lua candidate's source snapshots, which its includes read and
+    /// add to, so that both passes read one content of each file.
+    store: Option<Store>,
     top: u32,
     limits: Limits,
     pub(crate) run: Run,
@@ -211,6 +218,8 @@ impl Definition {
             arena,
             entry,
             entry_bytes,
+            entry_parses: 0,
+            store: None,
             top,
             limits,
             run: Run::default(),
@@ -219,15 +228,22 @@ impl Definition {
     }
 
     /// A Lua skin's definition: `arena` holds its converted table as file
-    /// 0, rooted at `top`, read from `entry` in `root`; `input_bytes` is
-    /// what its passes read, so the files its table includes count after
-    /// it ([`MAX_INPUT_BYTES`]).
+    /// 0, rooted at `top`, read from `entry` in `root`; `input_bytes` and
+    /// `loads` are what the candidate read and loaded so far, so that the
+    /// files its table includes count after them ([`MAX_INPUT_BYTES`],
+    /// [`MAX_INCLUDE_PARSES`]), read through its snapshots `store`.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a candidate's state, each part its own"
+    )]
     pub(crate) fn from_lua(
         root: Root,
         entry: FileId,
         arena: Arena,
         top: u32,
         input_bytes: u64,
+        loads: u32,
+        store: Store,
         cancel: Cancel,
     ) -> Self {
         Self {
@@ -236,6 +252,8 @@ impl Definition {
             arena,
             entry,
             entry_bytes: input_bytes,
+            entry_parses: loads,
+            store: Some(store),
             top,
             limits: Limits::STANDARD,
             run: Run::default(),
@@ -248,9 +266,14 @@ impl Definition {
         self.run.input_bytes
     }
 
-    /// The files the last resolution included, by name, in order.
-    pub(crate) fn included(&self) -> impl Iterator<Item = &str> {
-        self.arena.files.iter().skip(1).map(|f| f.name.as_str())
+    /// The load invocations made so far, includes among them.
+    pub(crate) fn parses(&self) -> u32 {
+        self.run.parses
+    }
+
+    /// The candidate's snapshots, taken back.
+    pub(crate) fn take_store(&mut self) -> Store {
+        self.store.take().unwrap_or_default()
     }
 
     /// A cancellation of the Lua candidate this definition belongs to.
@@ -475,6 +498,7 @@ pub fn resolve<'d>(
     def.arena.files.truncate(1);
     def.run = Run {
         input_bytes: def.entry_bytes,
+        parses: def.entry_parses,
         ..Run::default()
     };
     let top = def.top;
@@ -1011,9 +1035,19 @@ impl Resolver<'_, '_> {
         } else {
             format!("{dir}/{name}")
         };
-        let (bytes, id) = read_file(&self.def.root, &joined, self.def.run.input_bytes, || {
-            Some(self.def.loc(member))
-        })?;
+        let (bytes, id) = match self.def.store.as_mut() {
+            // A Lua candidate's include is its snapshot, its bytes charged
+            // as each read is.
+            Some(store) => {
+                let mut used = self.def.run.input_bytes;
+                let at = || Some(self.def.arena.loc(member));
+                let (id, bytes) = store.source(&self.def.root, &joined, &mut used, at)?;
+                (bytes.to_vec(), id)
+            }
+            None => read_file(&self.def.root, &joined, self.def.run.input_bytes, || {
+                Some(self.def.loc(member))
+            })?,
+        };
         if self.chain.contains(&id) {
             let mut chain: Vec<String> = self.chain.iter().map(|f| f.name().to_owned()).collect();
             chain.push(id.name().to_owned());
