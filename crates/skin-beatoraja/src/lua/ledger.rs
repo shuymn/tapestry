@@ -113,12 +113,6 @@ pub(crate) enum Stop {
     Pending(FactId),
 }
 
-impl From<ImportError> for Stop {
-    fn from(e: ImportError) -> Self {
-        Self::Fault(e)
-    }
-}
-
 /// One pass's accounting.
 pub(crate) struct Ledger {
     counts: Cell<Counts>,

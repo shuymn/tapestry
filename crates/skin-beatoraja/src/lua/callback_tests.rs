@@ -775,15 +775,17 @@ fn with_facts(entry: &str, facts: &super::facts::ImportFacts) -> (Captures, Lowe
     let cancel = Cancel::new();
     let h = read_lua_header(d.path(), "s.luaskin", &cancel).unwrap();
     let config = Config::defaults(h.header());
-    let (def, _, _, _) = h.configured(&config, facts, &cancel);
+    let (def, counts, store, reads) = h.configured(&config, facts, &cancel);
     let def = def.unwrap();
     let an = def.arena.lua.as_deref().and_then(|l| l.analysis.as_deref());
     let captured = an.unwrap().captured.clone();
     LOWERED.with(|l| l.borrow_mut().clear());
-    let r = h.import(&config, facts, &cancel).map(|o| match o {
-        super::LuaOutcome::Imported(i) => (i.callbacks, LOWERED.with(|l| l.borrow().clone())),
-        super::LuaOutcome::Pending(p) => panic!("{p:?}"),
-    });
+    let o = h.finish(Ok(def), counts, store, reads, &config);
+    let r = match o.result {
+        Ok(_) => Ok((o.callbacks, LOWERED.with(|l| l.borrow().clone()))),
+        Err(super::ledger::Stop::Fault(e)) => Err(e),
+        Err(super::ledger::Stop::Pending(p)) => panic!("{p:?}"),
+    };
     (captured, r)
 }
 

@@ -422,15 +422,6 @@ fn a_base_import_stops_pending_at_a_chart_fact() {
     assert_eq!(x(i), 1);
 }
 
-/// The snapshot's rank as the caller converts the preset's reading:
-/// `rules::JudgeRank` one to one, no rank kept as none.
-fn chart_rank(read: Option<rules::JudgeRank>) -> Option<ChartRank> {
-    read.map(|r| match r {
-        rules::JudgeRank::Rank(r) => ChartRank::Rank(r),
-        rules::JudgeRank::DefExRankMilli(m) => ChartRank::DefExRankMilli(m),
-    })
-}
-
 #[test]
 fn a_chart_with_no_rank_header_is_judged_and_classed_as_rank_2() {
     // Every shipped preset reads no rank from a chart without `#RANK` or
@@ -448,7 +439,7 @@ fn a_chart_with_no_rank_header_is_judged_and_classed_as_rank_2() {
         assert_eq!(absent, rank_2, "{name}");
     }
     let d = folder("x = ms.option(182) and 1 or 0");
-    let facts = play(Fact::Unavailable, Fact::Known(chart_rank(None)));
+    let facts = play(Fact::Unavailable, Fact::Known(None));
     let i = imported(import(&d, &facts));
     assert_eq!(i.facts, deps(&[class(Some(JudgeClass::Normal))]));
     assert_eq!(x(i), 1);
