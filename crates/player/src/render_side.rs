@@ -982,6 +982,12 @@ impl RenderLink {
         drop(self.shared.clear_end(upto));
     }
 
+    /// How many end pages were shown so far.
+    #[cfg(test)]
+    pub fn end_pages_shown(&self) -> u64 {
+        self.end_pages.load(Ordering::Relaxed)
+    }
+
     /// Waits at most `timeout` until the end page shown last has been
     /// presented, and the frame sink has seen it (dev-tools: a script's
     /// `drawn` step). Whether it was.

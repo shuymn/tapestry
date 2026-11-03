@@ -1894,4 +1894,31 @@ mod tests {
         ran.unwrap();
         assert_eq!((name, gated), ("headless", true));
     }
+
+    /// While the end screen shows, the game thread sends its page again
+    /// when the hi-speed line changes, as when a settings value does, and
+    /// not otherwise.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn the_end_screen_follows_the_hi_speed_line() {
+        let (shown, _) = on_rig(game::DeviceSettings::default(), |rig, _| {
+            rig.end_page = Some(crate::render_side::EndPage::default());
+            let pages = |rig: &crate::play::PlayerRig<'_>| rig.render.end_pages_shown();
+            let before = pages(rig);
+            // The first look: the line differs from the default one.
+            rig.sync();
+            let first = pages(rig);
+            rig.sync();
+            let unchanged = pages(rig);
+            // The adjustments changed the line since it was sent.
+            rig.shown_speed = crate::end_screen::SpeedLine {
+                hispeed_x100: Some(370),
+                ..rig.shown_speed
+            };
+            rig.sync();
+            let changed = pages(rig);
+            (first - before, unchanged - first, changed - unchanged)
+        });
+        assert_eq!(shown, (1, 0, 1));
+    }
 }
