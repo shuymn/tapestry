@@ -1044,8 +1044,10 @@ fn skin_lua_seeds_import_or_fail_as_built() {
             "config",
             "modules",
             "isolation",
-            "callable_decorative",
-            "callable_refused",
+            "callback_lowered",
+            "callback_replaced",
+            "callback_effect",
+            "host_write",
             "loop",
             "protected_loop",
             "memory",
@@ -1077,12 +1079,26 @@ fn skin_lua_seeds_import_or_fail_as_built() {
                     );
                 }
             }
-            "callable_refused" | "callable_decorative" => {
+            "callback_lowered" | "callback_replaced" => {
+                use skin_beatoraja::lua::Disposition;
+                let (_, imported) = result.unwrap_or_else(|e| panic!("{name}: {e}"));
+                let i = imported.unwrap_or_else(|e| panic!("{name}: {e:?}"));
+                let want: &[Disposition] = match name {
+                    "callback_lowered" => &[Disposition::Lowered, Disposition::Lowered],
+                    _ => &[Disposition::Replaced(
+                        skin_beatoraja::lua::Unsupported::Unmapped { api: 1, id: 425 },
+                    )],
+                };
+                assert_eq!(i.callbacks, want, "{name}");
+            }
+            "callback_effect" | "host_write" => {
                 let (_, imported) = result.unwrap_or_else(|e| panic!("{name}: {e}"));
                 let e = imported.expect_err(name);
                 let want = match name {
-                    "callable_decorative" => LuaWhy::Callable { field: "draw" },
-                    _ => LuaWhy::Callable { field: "value" },
+                    "callback_effect" => LuaWhy::Effect(
+                        skin_beatoraja::lua::Unsupported::Construct("call statement"),
+                    ),
+                    _ => LuaWhy::HostWrite,
                 };
                 assert_eq!(lua(&e), Some(want), "{name}");
             }

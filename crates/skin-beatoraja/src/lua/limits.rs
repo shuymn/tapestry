@@ -58,3 +58,20 @@ pub const MAX_NATIVE_WORK: u64 = 100_000_000;
 /// substring, a formatted or joined string, a capture), in
 /// bytes; a larger one is refused before the call.
 pub const MAX_PRIMITIVE_BYTES: i64 = 1 << 20;
+/// The most nodes the analysis's Lua trees hold across a candidate's
+/// files ([`super::syntax`]): expressions, statements, declarations,
+/// functions and list entries, each charged before it is added. The
+/// surveyed skins' configured passes parse about 120 000.
+pub const MAX_AST_NODES: u64 = 1 << 20;
+/// The deepest nesting of statements and subexpressions the analysis's
+/// parser recurses into, checked before each level: Lua's own parser
+/// stops at the same depth (`LUAI_MAXCCALLS`).
+pub const MAX_AST_DEPTH: u32 = 200;
+/// The most closure instances and captured values the analysis copies
+/// out of a configured pass before its VM is dropped, each charged before
+/// it is kept.
+pub const MAX_CAPTURES: u64 = 1 << 16;
+/// The most expression nodes the lowering of a candidate's callbacks
+/// expands helpers into, each helper call charged its expanded size
+/// before it is expanded.
+pub const MAX_EXPANDED_NODES: u64 = 1 << 20;

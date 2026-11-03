@@ -907,10 +907,10 @@ return skin
 
 /// `skin_lua` seeds: skins that import (data only, local modules and
 /// selected parts, configuration and a pass-local write to it, pass
-/// isolation), then one refusal per
-/// boundary: a function on a decorative and on a critical element, the
-/// instruction and memory caps (also inside a protected call), a path
-/// out of the folder, a coroutine, malformed
+/// isolation, callbacks converted and a decorative one replaced), then
+/// one refusal per boundary: a callback with an unknown effect, a write
+/// to a host module, the instruction and memory caps (also inside a
+/// protected call), a path out of the folder, a coroutine, malformed
 /// Lua and a value that is no table.
 #[must_use]
 pub fn skin_luas() -> Vec<Seed> {
@@ -937,13 +937,28 @@ return m"#;
         "if not skin_config then return skin end",
         "if not skin_config then leaked = true require(\"m\") return skin end",
     );
-    let decorative = lua_skin(
-        r#"skin.destination[2] = { id = "i", draw = function() return true end, dst = { { w = 10, h = 10 } } }"#,
+    let lowered = lua_skin(
+        r#"local ms = require("main_state")
+local function on() return skin_config.option["mode"] == 901 end
+skin.destination[2] = { id = "i", draw = function()
+  local kind = ms.gauge_type()
+  return on() and (kind == 4 or ms.timer(143) ~= ms.timer_off_value)
+end, dst = { { w = 10, h = 10 } } }
+skin.value = { { id = "v", src = "s", w = 100, h = 10, divx = 10, digit = 2, value = function()
+  return ms.number(106) - (ms.number(110) + ms.number(111)) * 2
+end } }
+skin.destination[3] = { id = "v", dst = { { w = 10, h = 10 } } }"#,
     );
-    let refused = lua_skin(
-        r#"skin.value = { { id = "v", src = "s", w = 100, h = 10, divx = 10, digit = 2, value = function() return 0 end } }
-skin.destination[2] = { id = "v", dst = { { w = 10, h = 10 } } }"#,
+    let replaced = lua_skin(
+        r#"local ms = require("main_state")
+skin.destination[2] = { id = "i", draw = function() return ms.number(425) > 0 end, dst = { { w = 10, h = 10 } } }"#,
     );
+    let effect = lua_skin(
+        r#"local ms = require("main_state")
+skin.destination[2] = { id = "i", draw = function() ms.set_timer(1, 0) return true end, dst = { { w = 10, h = 10 } } }"#,
+    );
+    let host_write =
+        lua_skin(r#"local ms = require("main_state") pcall(function() ms.number = nil end)"#);
     vec![
         ("data_only", lua_input(&[&lua_skin("")])),
         ("config", lua_input(&[&config])),
@@ -952,8 +967,10 @@ skin.destination[2] = { id = "v", dst = { { w = 10, h = 10 } } }"#,
             "isolation",
             lua_input(&[&isolation, "runs = (runs or 0) + 1\nreturn { runs = runs }"]),
         ),
-        ("callable_decorative", lua_input(&[&decorative])),
-        ("callable_refused", lua_input(&[&refused])),
+        ("callback_lowered", lua_input(&[&lowered])),
+        ("callback_replaced", lua_input(&[&replaced])),
+        ("callback_effect", lua_input(&[&effect])),
+        ("host_write", lua_input(&[&host_write])),
         ("loop", lua_input(&["while true do end"])),
         (
             "protected_loop",

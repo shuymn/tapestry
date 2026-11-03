@@ -29,7 +29,8 @@ fn main() {
         let u = survey.usage;
         println!(
             "  usage: instructions {} host calls {} native work {} loads {} (require {}, dofile {}) \
-             input bytes {} protected calls {} metatables {} peak memory {}",
+             input bytes {} protected calls {} metatables {} peak memory {} \
+             ast nodes {} captures {} expanded {}",
             u.instructions,
             u.host_calls,
             u.native_work,
@@ -39,10 +40,16 @@ fn main() {
             u.input_bytes,
             u.protected_calls,
             u.metatables,
-            u.peak_memory
+            u.peak_memory,
+            u.ast_nodes,
+            u.captures,
+            u.expanded
         );
         for ((field, kind), n) in &survey.callables {
             println!("  callable {field} {kind}: {n}");
+        }
+        for (outcome, n) in &survey.outcomes {
+            println!("  callback {outcome}: {n}");
         }
         for (kind, n) in &survey.notes {
             println!("  note {kind}: {n}");

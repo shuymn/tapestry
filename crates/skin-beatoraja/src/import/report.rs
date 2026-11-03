@@ -288,6 +288,13 @@ pub enum NoteKind {
         lane: u8,
         paint: NoteFallback,
     },
+    /// A decorative Lua callback in `field` that does not convert,
+    /// replaced by its typed constant: `false` for a `draw`, the omitted
+    /// number for a `value`.
+    Callback {
+        field: &'static str,
+        why: crate::lua::Unsupported,
+    },
 }
 
 impl fmt::Display for NoteKind {
@@ -316,6 +323,9 @@ impl fmt::Display for NoteKind {
             Self::Ignored { field } => write!(f, "`{field}` ignored"),
             Self::NotePart { field, why } => write!(f, "note part `{field}`: {why}"),
             Self::ColourClamped => f.write_str("a colour channel outside 0 to 255, clamped"),
+            Self::Callback { field, why } => {
+                write!(f, "a callback in `{field}` replaced by its constant: {why}")
+            }
             Self::NotePartFallback { field, lane, paint } => {
                 write!(
                     f,

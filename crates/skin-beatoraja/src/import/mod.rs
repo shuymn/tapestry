@@ -13,6 +13,7 @@
 
 pub(crate) mod asset;
 mod budget;
+pub(crate) mod callback;
 pub(crate) mod geom;
 mod object;
 mod ops;
@@ -197,6 +198,9 @@ enum Prop {
     Null,
     Id(i32),
     Name(String),
+    /// A Lua function, by its node, where the field takes one
+    /// ([`Cx::callback_prop`]).
+    Callable(u32),
 }
 
 /// A destination option (`JsonSkinSerializer.java:115-131`).
@@ -248,7 +252,7 @@ struct Opts<'a> {
     unclipped: bool,
     /// A condition the element is drawn under besides its own: a value's
     /// availability ([`property::Value::availability`]), joined first.
-    guard: Option<&'static str>,
+    guard: Option<&'a str>,
 }
 
 /// What the common part of an element decided.
@@ -635,7 +639,7 @@ impl<'d> Cx<'d> {
                 match self.prop(Some(item), "op")? {
                     Prop::Id(n) => ops.push(Op::Id(n)),
                     Prop::Name(s) => ops.push(Op::Name(s)),
-                    Prop::Null => {}
+                    Prop::Null | Prop::Callable(_) => {}
                 }
             }
         }
@@ -649,7 +653,7 @@ impl<'d> Cx<'d> {
             offsets: ids,
             stretch: self.int_or(stretch, "stretch", -1)?,
             ops,
-            draw: self.prop(draw, "draw")?,
+            draw: self.callback_prop(draw, "draw")?,
             keys,
             mouse: mouse.is_some_and(|m| self.def.arena.is_object(m)),
         };
@@ -906,6 +910,11 @@ impl<'d> Cx<'d> {
                     return Ok(None);
                 }
             }
+            Prop::Callable(id) => {
+                if !self.draw_callback(role, at, *id, &mut conds, &mut deviates)? {
+                    return Ok(None);
+                }
+            }
         }
 
         // Timer.
@@ -916,6 +925,7 @@ impl<'d> Cx<'d> {
                 self.drop_el(role, at, NoteKind::Timer(TimerWhy::Script))?;
                 return Ok(None);
             }
+            Prop::Callable(id) => return Err(self.def.callable_error(id, "timer")),
             Prop::Id(n) => match self.custom.resolve(n) {
                 Timer::Unset => {
                     self.ignored(at, NoteKind::Timer(TimerWhy::Unset(n)));
@@ -1206,6 +1216,7 @@ impl<'d> Cx<'d> {
             Prop::Null => (TimerRef::Builtin(slot::SCREEN), false),
             Prop::Id(n) if n < 0 => (TimerRef::Builtin(slot::SCREEN), false),
             Prop::Name(_) => return Ok(Err(NoteKind::Timer(TimerWhy::Script))),
+            Prop::Callable(id) => return Err(self.def.callable_error(id, "timer")),
             Prop::Id(n) => match self.custom.resolve(n) {
                 Timer::Unset => {
                     self.ignored(at, NoteKind::Timer(TimerWhy::Unset(n)));

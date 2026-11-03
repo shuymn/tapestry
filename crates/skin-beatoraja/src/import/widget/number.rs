@@ -3,9 +3,10 @@
 
 use skin_model::{Align, DigitsDef, GlyphSet, MAX_COORD, NumberDef, Pad, Source, Ty};
 
+use super::super::callback::NumberValue;
 use super::super::geom::{HEIGHT, Q, Rect};
-use super::super::policy::{CriticalPart, Role};
-use super::super::property::{self, IntProp, Value};
+use super::super::policy::Role;
+use super::super::property::{self, IntProp};
 use super::super::report::{NoteKind, PropertyKind};
 use super::super::track::{self, Stretch};
 use super::super::{Cx, Dst, Opts, Prop};
@@ -87,29 +88,32 @@ impl Cx<'_> {
                 "align",
             ],
         );
-        let value = self.prop(value, "value")?;
+        let value = self.callback_prop(value, "value")?;
         let r = self.int_or(r, "ref", 0)?;
-        let shown = match self.int_prop(&value, r) {
-            IntProp::Null => {
-                self.ignored(at, NoteKind::Ignored { field: "value" });
-                return Ok(());
+        // A callable keeps its precedence over `ref`.
+        let shown = if let Prop::Callable(id) = value {
+            match self.value_callback(at, id)? {
+                Some(v) => v,
+                None => return Ok(()),
             }
-            IntProp::Unsupported(id) => {
-                let why = NoteKind::UnsupportedProperty {
-                    kind: PropertyKind::Integer,
-                    id,
-                };
-                self.drop_el(Role::Decorative, at, why)?;
-                return Ok(());
+        } else {
+            match self.int_prop(&value, r) {
+                IntProp::Null => {
+                    self.ignored(at, NoteKind::Ignored { field: "value" });
+                    return Ok(());
+                }
+                IntProp::Unsupported(id) => {
+                    let why = NoteKind::UnsupportedProperty {
+                        kind: PropertyKind::Integer,
+                        id,
+                    };
+                    self.drop_el(Role::Decorative, at, why)?;
+                    return Ok(());
+                }
+                IntProp::Shown(v) => NumberValue::of(v),
             }
-            IntProp::Shown(v) => v,
         };
-        let role = match shown {
-            Value::ExScore => Role::Critical(CriticalPart::ExScore),
-            Value::MaxCombo => Role::Critical(CriticalPart::MaxCombo),
-            _ => Role::Decorative,
-        };
-        debug_assert_eq!(shown.critical(), role != Role::Decorative);
+        let role = shown.role;
         let digit = self.int_or(digit, "digit", 0)?;
         let padding = self.int_or(padding, "padding", 0)?;
         let zeropadding = self.int_or(zeropadding, "zeropadding", 0)?;
@@ -176,13 +180,13 @@ impl Cx<'_> {
         }
         let o = Opts {
             follow: true,
-            guard: shown.availability(),
+            guard: shown.guard.as_deref(),
             ..Opts::default()
         };
         let Some(mut c) = self.common_with(role, &dst, o)? else {
             return Ok(());
         };
-        let program = self.compile(shown.expr(), Ty::Int, at)?;
+        let program = self.compile(&shown.expr, Ty::Int, at)?;
         let Some((image, cell)) = self.add_src_image(&c, rec, &s, grid)? else {
             return Ok(());
         };
@@ -256,7 +260,7 @@ impl Cx<'_> {
             .map_err(|l| self.limit(at, l))?;
         let offsets = self.digit_offsets(at, rec, extra, cells)?;
         // One D4 note for the value and the conditions.
-        c.display_deviation |= shown.deviates();
+        c.display_deviation |= shown.deviates;
         let index = u32::try_from(self.widgets.numbers.len()).unwrap_or(u32::MAX);
         self.widgets.numbers.push(NumberDef {
             digits: DigitsDef {

@@ -15,13 +15,18 @@
 //! Changing the settings runs the configured pass again from the header
 //! pass's state.
 //!
-//! A function the returned table holds is a typed callable, never run:
-//! until per-frame functions are analysed (S7-03), any function anywhere
-//! in the configured pass's table refuses the candidate at its definition,
-//! after the developer report has counted them ([`convert::callables`]);
-//! the header pass refuses one only where its reading of the header
-//! meets it, as a value, a record, a list or a condition, so that the
-//! configured pass runs and the report sees what else it meets.
+//! A function the returned table holds is a typed callable, never run.
+//! The configured pass parses every chunk it loads with the importer's
+//! own parser ([`syntax`]) and runs it instrumented ([`instrument`]), so
+//! that each closure is tagged with its constructor and a capture reader;
+//! the conversion copies each callable's captures before the VM is
+//! dropped, and every callable is classified before the common import
+//! ([`callback::admit`]): one with an effect the analysis does not rule
+//! out refuses the candidate. The import converts the write-free ones
+//! where it consumes them (`import::callback`). The header pass refuses
+//! a function where its reading of the header meets it, as a value, a
+//! record, a list or a condition, so that the configured pass runs and
+//! the report sees what else it meets.
 //!
 //! What the common reader reads of the JSON files a table includes is
 //! charged to the candidate as the passes are: its bytes count toward the
@@ -31,9 +36,13 @@
 //! Every failure is owned and crosses threads: the results and errors
 //! hold no Lua handle.
 
+pub(crate) mod callback;
+#[cfg(test)]
+mod callback_tests;
 mod config;
 mod convert;
 mod host;
+mod instrument;
 mod ledger;
 mod library;
 pub mod limits;
@@ -41,8 +50,9 @@ mod loader;
 mod sandbox;
 #[cfg(feature = "dev-tools")]
 pub mod survey;
+pub(crate) mod syntax;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -55,6 +65,7 @@ use std::time::Duration;
 use mlua::{Lua, MultiValue, RegistryKey, Value};
 use skin_model::{FileId, Root};
 
+pub use self::callback::Disposition;
 use self::config::Bridge;
 pub use self::convert::MAX_CONVERTED_BYTES;
 pub use self::host::HOST_APIS;
@@ -84,6 +95,18 @@ pub enum LuaLimit {
     NativeWork,
     /// [`limits::MAX_LUA_TIME`].
     Time,
+    /// [`limits::MAX_AST_NODES`].
+    AstNodes,
+    /// [`limits::MAX_AST_DEPTH`].
+    AstDepth,
+    /// [`limits::MAX_CAPTURES`].
+    Captures,
+    /// [`limits::MAX_EXPANDED_NODES`].
+    Expansion,
+    /// The generated source's bound: an instrumented chunk's
+    /// ([`instrument::MAX_ADDED_BYTES`]) or a lowered expression's
+    /// ([`skin_model::MAX_SOURCE_BYTES`]).
+    Generated,
 }
 
 impl fmt::Display for LuaLimit {
@@ -95,6 +118,11 @@ impl fmt::Display for LuaLimit {
             Self::HostCalls => "the host call limit",
             Self::NativeWork => "the library work limit",
             Self::Time => "the Lua time limit",
+            Self::AstNodes => "the analysis node limit",
+            Self::AstDepth => "the analysis depth limit",
+            Self::Captures => "the capture limit",
+            Self::Expansion => "the helper expansion limit",
+            Self::Generated => "the generated source limit",
         })
     }
 }
@@ -138,9 +166,74 @@ pub enum LuaWhy {
     Value,
     /// A string that is not UTF-8.
     NotUtf8,
-    /// A function where field `field` takes none, or where its element
-    /// could show a play-critical value.
+    /// A function where field `field` takes none.
     Callable { field: &'static str },
+    /// A write to a host module's table, directly or through an alias.
+    HostWrite,
+    /// A chunk Lua compiles whose bindings the analysis's parser cannot
+    /// establish.
+    Unbound,
+    /// A callback with an effect the analysis does not rule out, located
+    /// at its construct.
+    Effect(Unsupported),
+    /// A play-critical callback in field `field` that does not convert.
+    Critical {
+        field: &'static str,
+        why: Unsupported,
+    },
+}
+
+/// Why a callback does not convert.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Unsupported {
+    /// A construct outside the converted form.
+    Construct(&'static str),
+    /// A global other than `skin_config`.
+    Global,
+    /// A host module or helper not bound once as a chunk local.
+    Binding(&'static str),
+    /// A host API outside the bridges, by its index in [`HOST_APIS`]: a
+    /// writer, or a reader with no conversion.
+    HostApi(u16),
+    /// A call of something that is not a host API or a helper.
+    Callee,
+    /// `and`, `or` or `not` of an integer, whose truthiness is Lua's.
+    Truthiness,
+    /// Operands of types the operator does not take.
+    Type,
+    /// A helper that calls itself.
+    Recursion,
+    /// A captured value or binding not proven.
+    Capture(&'static str),
+    /// A read of host API `api` with an id that has no mapping.
+    Unmapped { api: u16, id: i64 },
+    /// An integer intermediate that could leave the expressions' range.
+    Range,
+    /// A configuration read in a play-critical callback.
+    Config,
+}
+
+impl fmt::Display for Unsupported {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let api = |a: u16| {
+            let (m, n) = HOST_APIS.get(usize::from(a)).copied().unwrap_or(("", ""));
+            format!("{m}.{n}")
+        };
+        match self {
+            Self::Construct(c) => write!(f, "an unsupported construct ({c})"),
+            Self::Global => f.write_str("a global other than skin_config"),
+            Self::Binding(b) => write!(f, "{b} not bound once as a chunk local"),
+            Self::HostApi(a) => write!(f, "{} has no conversion", api(*a)),
+            Self::Callee => f.write_str("a call of an unknown function"),
+            Self::Truthiness => f.write_str("an integer used as a condition"),
+            Self::Type => f.write_str("operands of an unsupported type"),
+            Self::Recursion => f.write_str("a helper that calls itself"),
+            Self::Capture(c) => write!(f, "{c} not proven"),
+            Self::Unmapped { api: a, id } => write!(f, "{}({id}) has no mapping", api(*a)),
+            Self::Range => f.write_str("an integer that could leave the expression range"),
+            Self::Config => f.write_str("a configuration read in a play-critical callback"),
+        }
+    }
 }
 
 impl fmt::Display for LuaWhy {
@@ -171,6 +264,12 @@ impl fmt::Display for LuaWhy {
             Self::Callable { field } => {
                 write!(f, "an unsupported function in `{field}`")
             }
+            Self::HostWrite => f.write_str("a write to a host module"),
+            Self::Unbound => f.write_str("a Lua chunk the analysis cannot bind"),
+            Self::Effect(why) => write!(f, "a callback with an unknown effect: {why}"),
+            Self::Critical { field, why } => {
+                write!(f, "a play-critical callback in `{field}`: {why}")
+            }
         }
     }
 }
@@ -199,6 +298,10 @@ pub(crate) struct Pass {
     handled: Cell<u64>,
     last_error: RefCell<Option<Loc>>,
     bridge: Option<Bridge>,
+    /// The configured pass's instrumented chunks by identity, and its
+    /// parsed files in the same order.
+    parsed: RefCell<Vec<(FileId, Arc<[u8]>)>>,
+    files: RefCell<Vec<callback::ParsedFile>>,
     #[cfg(feature = "dev-tools")]
     timings: Cell<Timings>,
 }
@@ -241,6 +344,8 @@ impl Pass {
             handled: Cell::new(0),
             last_error: RefCell::new(None),
             bridge,
+            parsed: RefCell::new(Vec::new()),
+            files: RefCell::new(Vec::new()),
             #[cfg(feature = "dev-tools")]
             timings: Cell::new(Timings::default()),
         }
@@ -365,6 +470,9 @@ pub struct LuaImported {
     pub dependencies: Vec<String>,
     /// What the candidate used of the sandbox's caps.
     pub usage: LuaUsage,
+    /// What became of each function the configured definition holds, in
+    /// conversion order.
+    pub callbacks: Vec<Disposition>,
 }
 
 /// One pass's outcome: the converted table, and the files it loaded.
@@ -425,7 +533,7 @@ fn run_pass(pass: &Rc<Pass>, entry: &str) -> Result<Converted, ImportError> {
         let converted = run.map(|(values, id)| {
             let value = values.into_iter().next().unwrap_or(Value::Nil);
             let modules = pass.modules.borrow().clone();
-            convert::convert(pass, value, &id, modules).map(|(arena, top)| Converted {
+            convert::convert(&lua, pass, value, &id, modules).map(|(arena, top)| Converted {
                 arena,
                 top,
                 entry: id,
@@ -465,6 +573,8 @@ pub(crate) struct Outcome<T> {
     pub(crate) result: Result<T, ImportError>,
     pub(crate) counts: Counts,
     pub(crate) dependencies: Vec<String>,
+    /// What became of each callable of the configured definition.
+    pub(crate) callbacks: Vec<callback::Disposition>,
 }
 
 /// The header pass, with its metadata.
@@ -480,6 +590,7 @@ pub(crate) fn header_pass(root: &Path, entry: &str, cancel: &Cancel) -> Outcome<
                 }),
                 counts: Counts::default(),
                 dependencies: Vec::new(),
+                callbacks: Vec::new(),
             };
         }
     };
@@ -513,6 +624,7 @@ pub(crate) fn header_pass(root: &Path, entry: &str, cancel: &Cancel) -> Outcome<
         }),
         counts,
         dependencies,
+        callbacks: Vec::new(),
     }
 }
 
@@ -594,6 +706,7 @@ impl LuaHeader {
             imported,
             dependencies: o.dependencies,
             usage: o.counts,
+            callbacks: o.callbacks,
         })
     }
 
@@ -606,7 +719,7 @@ impl LuaHeader {
     #[cfg(feature = "dev-tools")]
     pub fn timed(&self, config: &Config, cancel: &Cancel) -> Result<Timings, ImportError> {
         let mut def = self.configured(config, cancel).0?;
-        convert::refuse_callables(&def.arena)?;
+        callback::admit(&def.arena)?;
         let mut t = LAST_TIMINGS.with(Cell::get);
         let start = std::time::Instant::now();
         std::hint::black_box(import(&mut def, &self.header, config)?);
@@ -630,16 +743,22 @@ impl LuaHeader {
         mut store: Store,
         config: &Config,
     ) -> Outcome<Imported> {
+        let mut callbacks = Vec::new();
         let result = def.and_then(|mut def| {
-            let r = convert::refuse_callables(&def.arena)
-                .and_then(|()| import(&mut def, &self.header, config));
+            let r =
+                callback::admit(&def.arena).and_then(|()| import(&mut def, &self.header, config));
             store = common_reads(&mut def, &mut counts);
+            if let Some(an) = def.arena.lua.as_deref().and_then(|l| l.analysis.as_deref()) {
+                counts.expanded = an.expanded.get();
+                callbacks = an.outcomes.borrow().clone();
+            }
             r
         });
         Outcome {
             result,
             counts,
             dependencies: store.dependencies,
+            callbacks,
         }
     }
 

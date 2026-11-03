@@ -92,7 +92,7 @@ impl Cx<'_> {
         let resolved = match self.prop(value, "value")? {
             Prop::Id(n) => property::str_by_id(n),
             Prop::Name(s) => property::str_by_name(&s).unwrap_or(StrProp::Unsupported(None)),
-            Prop::Null => StrProp::Null,
+            Prop::Null | Prop::Callable(_) => StrProp::Null,
         };
         let resolved = match resolved {
             StrProp::Null => property::str_by_id(self.int_or(r, "ref", 0)?),

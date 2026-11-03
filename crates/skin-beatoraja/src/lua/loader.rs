@@ -23,6 +23,12 @@
 //! bytes. A loader that fails, its source or the chunk it runs, is a
 //! fault: a required part that does not load never leaves a partial
 //! definition behind a protected call.
+//!
+//! In the configured pass each chunk is parsed by the analysis's parser
+//! first ([`super::syntax`], once a pass per file) and compiled
+//! instrumented ([`super::instrument`]); a chunk Lua compiles that the
+//! parser refuses is a fault ([`LuaWhy::Unbound`]), and one neither
+//! accepts is Lua's syntax error.
 
 use std::rc::Rc;
 use std::sync::Arc;
@@ -31,7 +37,9 @@ use mlua::chunk::ChunkMode;
 use mlua::{Function, Lua, MultiValue, Value};
 use skin_model::{FileId, MAX_PATH_BYTES, Root, RootError};
 
-use super::{LuaLimit, LuaWhy, Module, Pass, host, sandbox};
+use super::callback::ParsedFile;
+use super::syntax::{self, Fail};
+use super::{LuaLimit, LuaWhy, Module, Pass, host, instrument, sandbox};
 use crate::error::{ImportError, InputLimit, Loc};
 use crate::limits::{MAX_FILE_BYTES, MAX_INCLUDE_DEPTH, MAX_INCLUDE_PARSES, MAX_INPUT_BYTES};
 use crate::lua::ledger::running;
@@ -155,8 +163,13 @@ pub(super) fn compile(lua: &Lua, pass: &Pass, key: &str) -> mlua::Result<(Functi
     pass.ledger.check(lua)?;
     let name = id.name().to_owned();
     pass.module(&name);
+    let code = if pass.bridge.is_some() {
+        instrumented(lua, pass, &id, &bytes)?
+    } else {
+        None
+    };
     let f = lua
-        .load(&*bytes)
+        .load(code.as_deref().unwrap_or(&bytes))
         .set_name(format!("@{name}"))
         .set_mode(ChunkMode::Text)
         .into_function();
@@ -181,7 +194,84 @@ pub(super) fn compile(lua: &Lua, pass: &Pass, key: &str) -> mlua::Result<(Functi
             why,
         })
     })?;
-    Ok((f, id))
+    if code.is_none() {
+        return Ok((f, id));
+    }
+    // The instrumented chunk returns the skin's chunk, given the tagger.
+    let tagger: Function = lua.named_registry_value(sandbox::TAGGER)?;
+    let inner = f.call::<Function>(tagger).map_err(|e| {
+        let why = match e {
+            mlua::Error::MemoryError(_) => LuaWhy::Limit(LuaLimit::Memory),
+            _ => LuaWhy::Error,
+        };
+        pass.ledger.fail_lua(lua, why)
+    })?;
+    pass.ledger.check(lua)?;
+    Ok((inner, id))
+}
+
+/// The instrumented chunk of source `id`, parsed and charged on its first
+/// load in the pass; `None` when neither the parser nor Lua reads it, so
+/// that Lua's own compilation reports its syntax error.
+fn instrumented(
+    lua: &Lua,
+    pass: &Pass,
+    id: &FileId,
+    bytes: &[u8],
+) -> mlua::Result<Option<Arc<[u8]>>> {
+    if let Some(code) = pass
+        .parsed
+        .borrow()
+        .iter()
+        .find(|(i, _)| i == id)
+        .map(|(_, c)| Arc::clone(c))
+    {
+        return Ok(Some(code));
+    }
+    let name = id.name().to_owned();
+    let at = |line: u32| {
+        Some(Loc {
+            file: name.clone(),
+            line,
+            col: 0,
+        })
+    };
+    let fail = |line: u32, why: LuaWhy| pass.ledger.fail(ImportError::Lua { at: at(line), why });
+    let mut nodes = pass.ledger.counts().ast_nodes;
+    let r = syntax::parse(bytes, &mut nodes, &|| pass.ledger.cancelled());
+    pass.ledger.update(|c| c.ast_nodes = nodes);
+    let ast = match r {
+        Ok(ast) => ast,
+        Err(Fail::Nodes) => return Err(fail(0, LuaWhy::Limit(LuaLimit::AstNodes))),
+        Err(Fail::Depth(line)) => return Err(fail(line, LuaWhy::Limit(LuaLimit::AstDepth))),
+        Err(Fail::Cancelled) => return Err(fail(0, LuaWhy::Cancelled)),
+        Err(Fail::Syntax(line)) => {
+            let compiles = lua
+                .load(bytes)
+                .set_name(format!("@{name}"))
+                .set_mode(ChunkMode::Text)
+                .into_function()
+                .is_ok();
+            pass.ledger.check(lua)?;
+            return if compiles {
+                Err(fail(line, LuaWhy::Unbound))
+            } else {
+                Ok(None)
+            };
+        }
+    };
+    let Ok(file) = u16::try_from(pass.files.borrow().len()) else {
+        return Err(fail(0, LuaWhy::Limit(LuaLimit::AstNodes)));
+    };
+    let Some(code) = instrument::instrument(bytes, &ast, file) else {
+        return Err(fail(0, LuaWhy::Limit(LuaLimit::Generated)));
+    };
+    let code: Arc<[u8]> = Arc::from(code);
+    pass.files.borrow_mut().push(ParsedFile { name, ast });
+    pass.parsed
+        .borrow_mut()
+        .push((id.clone(), Arc::clone(&code)));
+    Ok(Some(code))
 }
 
 /// The line of a syntax error in chunk `name`: Lua prefixes its message

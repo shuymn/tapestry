@@ -19,12 +19,26 @@ pub const MS: i64 = 1_000;
 /// A notes' end past every frame the tests build: timer 143 stays off.
 pub const NO_END: TimeUs = TimeUs(3_600_000 * MS);
 
-const GAUGES: [GaugeDesc; 1] = [GaugeDesc {
-    start: GaugeValue(20 * GaugeValue::PERCENT),
-    max: GaugeValue::FULL,
-    look: GaugeLook::Normal,
-    border: GaugeValue(80 * GaugeValue::PERCENT),
-}];
+const GAUGES: [GaugeDesc; 1] = [desc(GaugeLook::Normal)];
+
+const fn desc(look: GaugeLook) -> GaugeDesc {
+    GaugeDesc {
+        start: GaugeValue(20 * GaugeValue::PERCENT),
+        max: GaugeValue::FULL,
+        look,
+        border: GaugeValue(80 * GaugeValue::PERCENT),
+    }
+}
+
+/// One gauge of each look, in [`GaugeLook::ALL`]'s order.
+const LOOKS: [GaugeDesc; GaugeLook::COUNT] = [
+    desc(GaugeLook::AssistEasy),
+    desc(GaugeLook::Easy),
+    desc(GaugeLook::Normal),
+    desc(GaugeLook::Hard),
+    desc(GaugeLook::ExHard),
+    desc(GaugeLook::Hazard),
+];
 
 const LIMITS: AtlasLimits = AtlasLimits {
     max_side: 4_096,
@@ -225,6 +239,23 @@ impl Drawn {
         self.chart = chart(notes);
         self.notes = NoteFacts::new(&self.chart);
         self.play = self.skin.prepare(&self.chart, &context()).unwrap();
+    }
+
+    /// `skin` played over a chart of `notes` notes with one gauge of
+    /// look `look`.
+    pub fn with_look(skin: Skin, notes: u32, look: GaugeLook) -> Self {
+        let mut d = Self::new(skin, notes);
+        let gauges = LOOKS
+            .iter()
+            .position(|g| g.look == look)
+            .map(|i| &LOOKS[i..=i])
+            .unwrap();
+        let ctx = PlayContext {
+            gauges,
+            ..context()
+        };
+        d.play = d.skin.prepare(&d.chart, &ctx).unwrap();
+        d
     }
 
     /// `skin` played over `chart`.

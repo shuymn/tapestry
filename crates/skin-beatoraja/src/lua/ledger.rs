@@ -73,6 +73,15 @@ pub struct LuaUsage {
     /// sampled at each instruction step and when the entry returns: a
     /// library function's own peak between two samples is not seen.
     pub peak_memory: u64,
+    /// The analysis's tree nodes
+    /// ([`MAX_AST_NODES`](super::limits::MAX_AST_NODES)).
+    pub ast_nodes: u64,
+    /// Closure instances and values captured
+    /// ([`MAX_CAPTURES`](super::limits::MAX_CAPTURES)).
+    pub captures: u64,
+    /// Expression nodes the lowering expanded
+    /// ([`MAX_EXPANDED_NODES`](super::limits::MAX_EXPANDED_NODES)).
+    pub expanded: u64,
 }
 
 /// The counts a pass starts from: the earlier passes' use.
