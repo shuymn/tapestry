@@ -77,11 +77,15 @@ pub fn project(
         }
     }
     let floating = settings.mode == SpeedMode::Floating;
+    let [covered, uncovered, ..] = variants;
     Projection {
         gain: h,
         bpm_current_x100: current.and_then(bpm_x100),
         hispeed_x100: h.and_then(|h| source_hispeed_x100(h, lift)),
-        duration: variant(covers.sudden.effective(), lift, current, h),
+        // The effective SUDDEN+ is the configured amount while it is on
+        // and 0 while it is off: the current tempo's covered or uncovered
+        // variant.
+        duration: if covers.sudden.on { covered } else { uncovered },
         variants,
         native_duration: native_duration(current, h, &covers),
         target_green: floating.then_some(settings.green_target),
@@ -112,25 +116,14 @@ pub fn variant(sudden: u16, lift: u16, bpm: Option<Ratio>, h: Option<Ratio>) -> 
     readable(t).then_some(t)
 }
 
-/// `n / d` rounded half up, exactly; `None` when `d` is 0.
-#[must_use]
-pub const fn round_half_up(n: u128, d: u128) -> Option<u128> {
-    if d == 0 {
-        return None;
-    }
-    // Quotient and remainder, so `n` near `u128::MAX` does not overflow.
-    let (q, r) = (n / d, n % d);
-    Some(if r >= d - r { q + 1 } else { q })
-}
-
 /// Whether the ms and the green number of the duration `t` both round
-/// within [`READOUT_MAX`].
+/// half up within [`READOUT_MAX`]. The ms do exactly when
+/// `n / d < MAX + 1/2`, that is `2n < (2·MAX + 1)·d`; the green number
+/// `3t/5` is at most `t`, so it rounds no higher and needs no check of
+/// its own. With `u64` terms both sides fit a `u128`.
 fn readable(t: Ratio) -> bool {
     let (n, d) = (u128::from(t.num()), u128::from(t.den()));
-    // n and d are u64s, so 3n and 5d fit.
-    let ms = round_half_up(n, d);
-    let green = round_half_up(3 * n, 5 * d);
-    ms.is_some_and(|v| v <= MAX) && green.is_some_and(|v| v <= MAX)
+    2 * n < (2 * MAX + 1) * d
 }
 
 /// The native duration `T` from [`hispeed::duration_ms`], if readable.

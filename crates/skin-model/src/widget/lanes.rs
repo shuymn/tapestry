@@ -792,20 +792,24 @@ impl Lanes {
         let Some(notes) = play.notes() else {
             return;
         };
+        let mut pen = Pen::new(d, out);
+        // With no scroll left (LIFT or the cover at 1 000 ‰) nothing is
+        // scaled or visited: both styles draw only the line, where the
+        // source would draw every future tap and mine (docs/stage3.md R6).
+        if g.span <= 0.0 {
+            self.line(&mut pen, f32_of(g.line_y));
+            return;
+        }
         // The frame's one sample of the playhead, taken when the play was
         // filled for this build at the same display time.
         let scale = Scale::from_gain(play.display_position(), gain, g.len, g.line_y);
-        let mut pen = Pen::new(d, out);
         let ringing_out = d.complete && notes.section.is_some();
-        // With no scroll left nothing is scaled and no bar is drawn.
-        if g.span > 0.0
-            && let Some(scratch) = scratch
-        {
+        if let Some(scratch) = scratch {
             self.bars(&mut pen, notes, &scale, scratch);
         }
         match self.style {
-            LaneStyle::Simple => self.simple(&mut pen, play, facts, &scale, g.span, ringing_out),
-            LaneStyle::Source(s) => self.source(&mut pen, play, &scale, s, g.span, ringing_out),
+            LaneStyle::Simple => self.simple(&mut pen, play, notes, facts, &scale, ringing_out),
+            LaneStyle::Source(s) => self.source(&mut pen, play, notes, &scale, s, ringing_out),
         }
     }
 
@@ -939,44 +943,28 @@ impl Lanes {
         }
     }
 
-    /// The simple skin's judgment line and notes; with no scroll left
-    /// (`span` 0) nothing is scaled and only the line is drawn, the covers
-    /// hiding the whole lane.
+    /// The simple skin's judgment line and notes, over some scroll.
     fn simple(
         &self,
         pen: &mut Pen<'_, '_>,
         play: &Play,
+        notes: &Notes,
         facts: &NoteFacts,
         scale: &Scale,
-        span: f64,
         ringing_out: bool,
     ) {
-        let line = f32_of(scale.line_y);
-        if span <= 0.0 {
-            self.line(pen, line);
-            return;
-        }
         let pad = self.note_h.max(self.mine_h) / 2.0;
-        let (from, to) = scale.positions(
+        let window = scale.positions(
             f32_of(f64::from(self.bottom) - scale.line_y) + pad,
             f32_of(scale.line_y - f64::from(self.top)) + pad,
         );
-        self.line(pen, line);
-        let Some(notes) = play.notes() else {
-            return;
-        };
+        self.line(pen, f32_of(scale.line_y));
         if ringing_out {
             return;
         }
-        // Positions never decrease along a lane (`Chart::validate`), so a
-        // lane's notes meeting [from, to] are one run.
-        self.walk(
-            pen,
-            notes,
-            |list| list.partition_point(|n| n.end_pos() < from),
-            Some(to),
-            |pen, l, i, n| self.simple_note(pen, play, facts, scale, l, i, n),
-        );
+        self.walk(pen, notes, window, |pen, l, i, n| {
+            self.simple_note(pen, play, facts, scale, l, i, n)
+        });
     }
 
     /// Note `i` of lane `l` as the simple skin draws it; `false` once the
@@ -1032,46 +1020,32 @@ impl Lanes {
         }
     }
 
-    /// The source player's judgment line and notes ([`SourceLanes`]).
-    /// With no scroll left (`span` 0) only the line is drawn: the source
-    /// then draws every future tap and mine on the line, which no note is
-    /// here (docs/stage3.md R6).
+    /// The source player's judgment line and notes ([`SourceLanes`]), over
+    /// some scroll.
     fn source(
         &self,
         pen: &mut Pen<'_, '_>,
         play: &Play,
+        notes: &Notes,
         scale: &Scale,
         s: SourceLanes,
-        span: f64,
         ringing_out: bool,
     ) {
         self.line(pen, f32_of(scale.line_y));
-        if span <= 0.0 {
-            return;
-        }
         // A note's lower edge sits `offset_y` above its position's y; the
         // tallest lane's note pads every lane's window, which can only
         // visit more candidates, each drawn at its own height.
         let pad = s.note_h.iter().copied().fold(0.0_f32, f32::max);
-        let (from, to) = scale.positions(
+        let window = scale.positions(
             f32_of(f64::from(s.bottom) - scale.line_y) + s.offset_y + pad,
             f32_of(scale.line_y - f64::from(self.top)) + pad,
         );
-        let Some(notes) = play.notes() else {
-            return;
-        };
         if ringing_out {
             return;
         }
-        // Positions never decrease along a lane (`Chart::validate`), so a
-        // lane's notes meeting [from, to] are one run.
-        self.walk(
-            pen,
-            notes,
-            |list| list.partition_point(|n| n.end_pos() < from),
-            Some(to),
-            |pen, l, i, n| self.source_note(pen, play, scale, s.offset_y, l, i, n),
-        );
+        self.walk(pen, notes, window, |pen, l, i, n| {
+            self.source_note(pen, play, scale, s.offset_y, l, i, n)
+        });
     }
 
     /// Note `i` of lane `l` as the source player draws it; `false` once
@@ -1132,9 +1106,10 @@ impl Lanes {
         }
     }
 
-    /// Every lane's notes from `start` (given a lane's notes, its first
-    /// candidate) up to the lane's section end and, with `to`, while
-    /// their position is at most `to`: lane by lane, or under a timeline
+    /// Every lane's notes meeting `[from, to]`, up to the lane's section
+    /// end: from the first whose end is at or past `from` (positions never
+    /// decrease along a lane, `Chart::validate`, so they are one run)
+    /// while their position is at most `to`: lane by lane, or under a timeline
     /// order merged by their heads' timeline rows, then lane rank and index
     /// in the lane, the least first. Rows are exact identities: heads whose
     /// distinct source positions floor to one µs and one position keep
@@ -1146,14 +1121,16 @@ impl Lanes {
         &self,
         pen: &mut Pen<'_, '_>,
         notes: &'n Notes,
-        start: impl Fn(&[Note]) -> usize,
-        to: Option<Position>,
+        (from, to): (Position, Position),
         mut emit: impl FnMut(&mut Pen<'_, '_>, &LaneOf<'n>, usize, &'n Note) -> bool,
     ) {
         let d = pen.d;
         let cursor = |lane: Lane| {
             let lane = LaneOf::new(self, d, notes, lane)?;
-            let next = start(lane.list).max(lane.lo);
+            let next = lane
+                .list
+                .partition_point(|n| n.end_pos() < from)
+                .max(lane.lo);
             Some(LaneCursor { lane, next })
         };
         let Some(ranks) = self.timeline else {
@@ -1220,16 +1197,16 @@ struct LaneCursor<'n> {
 impl<'n> LaneCursor<'n> {
     /// The next note, while it is before the lane's section end and its
     /// position at most `to`.
-    fn peek(&self, to: Option<Position>) -> Option<&'n Note> {
+    fn peek(&self, to: Position) -> Option<&'n Note> {
         if self.next >= self.lane.hi {
             return None;
         }
         let n = self.lane.list.get(self.next)?;
-        (!to.is_some_and(|to| n.pos > to)).then_some(n)
+        (n.pos <= to).then_some(n)
     }
 
     /// The next note with its index, the cursor moved past it.
-    fn take(&mut self, to: Option<Position>) -> Option<(usize, &'n Note)> {
+    fn take(&mut self, to: Position) -> Option<(usize, &'n Note)> {
         let n = self.peek(to)?;
         let i = self.next;
         self.next = i.checked_add(1)?;

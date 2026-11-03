@@ -7,7 +7,7 @@ mod counting;
 
 use bms_model::Speed;
 use game::adjustment::PresentationSnapshot;
-use game::readouts::{project, round_half_up, variant};
+use game::readouts::{project, variant};
 use game::{Cover, Covers, HiSpeedSettings, PlayOptions, Ratio, References, SpeedMode};
 
 #[global_allocator]
@@ -81,9 +81,8 @@ fn the_projections_allocate_nothing() {
         }
     }
     let v = variant(250, 300, Some(Ratio::integer(150)), Some(Ratio::integer(2)));
-    let half = round_half_up(u128::MAX, 2);
     let calls = counting::calls() - before;
     counting::track(false);
     assert_eq!(calls, 0, "the projections allocated or freed {calls} times");
-    assert!(available > 0 && v.is_some() && half.is_some());
+    assert!(available > 0 && v.is_some());
 }

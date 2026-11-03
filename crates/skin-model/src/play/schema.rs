@@ -29,9 +29,9 @@ pub const COVER_PERMILLE: i32 = 1_000;
 /// down.
 pub const GREEN_MAX: i32 = READOUT_MAX / 5 * 3 + READOUT_MAX % 5 * 3 / 5;
 /// The largest `native.hispeed.x100`: the multiplier's maximum, 20.
-pub const NATIVE_HISPEED_MAX: i32 = 2_000;
+const NATIVE_HISPEED_MAX: i32 = 2_000;
 /// The largest `native.target.green`: the target green number's maximum.
-pub const NATIVE_TARGET_MAX: i32 = 6_000;
+pub(crate) const NATIVE_TARGET_MAX: i32 = 6_000;
 
 const fn int(name: &'static str, hi: i32, export: Export) -> Field {
     Field {

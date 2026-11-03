@@ -5,7 +5,7 @@
 
 use bms_model::Speed;
 use game::adjustment::PresentationSnapshot;
-use game::readouts::{Projection, READOUT_MAX, project, round_half_up};
+use game::readouts::{Projection, READOUT_MAX, project};
 use game::{Cover, Covers, HiSpeedSettings, PlayOptions, Ratio, References, SpeedMode, solve};
 
 fn r(num: u64, den: u64) -> Ratio {
@@ -324,16 +324,4 @@ fn the_practice_speed_applies_once() {
     assert_eq!(p.native_duration, Some(bpm(500)));
     // MAIN 100 plays at 150: 240000 / (150 · 32/15) = 750.
     assert_eq!(p.variants[2], Some(bpm(750)));
-}
-
-#[test]
-fn round_half_up_is_exact_at_full_width() {
-    assert_eq!(round_half_up(5, 2), Some(3));
-    assert_eq!(round_half_up(4, 3), Some(1));
-    assert_eq!(round_half_up(7, 1), Some(7));
-    assert_eq!(round_half_up(1, 0), None);
-    assert_eq!(round_half_up(u128::MAX, u128::MAX), Some(1));
-    // u128::MAX / 2 leaves exactly a half.
-    assert_eq!(round_half_up(u128::MAX, 2), Some(u128::MAX / 2 + 1));
-    assert_eq!(round_half_up(u128::MAX - 1, u128::MAX), Some(1));
 }

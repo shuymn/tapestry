@@ -116,9 +116,8 @@ pub use play::loading::{
 };
 pub use play::playhead::ExactPlayhead;
 pub use play::schema::{
-    COVER_PERMILLE, GAUGE_KIND_ENUM, GAUGE_PERMILLE, GREEN_MAX, Grade, LaneTimer, MAX_COUNT,
-    NATIVE_HISPEED_MAX, NATIVE_TARGET_MAX, PLAY, RATE_BASIS_POINTS, READOUT_MAX, field, lane_timer,
-    timer,
+    COVER_PERMILLE, GAUGE_KIND_ENUM, GAUGE_PERMILLE, GREEN_MAX, Grade, LaneTimer, MAX_COUNT, PLAY,
+    RATE_BASIS_POINTS, READOUT_MAX, field, lane_timer, timer,
 };
 pub use play::timers::native_values;
 pub use play::{

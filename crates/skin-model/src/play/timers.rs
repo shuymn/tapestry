@@ -253,10 +253,9 @@ fn round(d: DurationRatio) -> Option<RoundedDuration> {
 }
 
 /// A rounded duration's fields: ms, green and validity, 0 while absent.
-fn duration_fields(d: Option<RoundedDuration>) -> Option<[i32; 3]> {
-    d.map_or(Some([0, 0, 0]), |d| {
-        Some([i32::try_from(d.ms).ok()?, i32::try_from(d.green).ok()?, 1])
-    })
+fn duration_fields(d: Option<RoundedDuration>) -> [i32; 3] {
+    // Both are rounded within `READOUT_MAX` ([`round`]), so they fit.
+    d.map_or([0, 0, 0], |d| [field_of(d.ms), field_of(d.green), 1])
 }
 
 /// The native block of a frame: the active `H` from `lanes`' gain in
@@ -367,7 +366,7 @@ impl Play {
                 None => None,
                 Some(d) => Some(round(*d)?),
             };
-            *fields = duration_fields(rounded)?;
+            *fields = duration_fields(rounded);
         }
         let native = native_values(&frame.lanes, r).ok()?;
         let (bpm_min, bpm_max, bpm_range_valid) = self.bpm_range.map_or(Some((0, 0, 0)), |b| {
@@ -461,9 +460,7 @@ impl Play {
             .map(|d| d.look);
         let targets = u64::from(self.reducer.targets());
         let n = &r.native;
-        let (native_ms, native_green, native_valid) = n
-            .duration
-            .map_or((0, 0, 0), |d| (field_of(d.ms), field_of(d.green), 1));
+        let [native_ms, native_green, native_valid] = duration_fields(n.duration);
         let native: [i32; field::COUNT - field::NATIVE_HISPEED_X100 as usize] = [
             n.hispeed_x100.map_or(0, field_of),
             i32::from(n.hispeed_x100.is_some()),

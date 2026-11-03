@@ -335,7 +335,8 @@ fn a_note_is_within_a_microsecond_of_scroll_of_the_line_at_its_judgment_time() {
     let [[_, y, _, n]] = in_lane(&h, NOTE, lane(1))[..] else {
         panic!("not drawn");
     };
-    // One µs of scroll at the initial rate is 600 px / 600 000 µs.
+    // At H 8/3 the 600 px lane holds 600 ms of 150 BPM: 1 µs of scroll
+    // is 0.001 px.
     let off = (f64::from(y + n) - 880.0).abs();
     assert!(off <= 0.001 + 1e-4, "{off}");
 }

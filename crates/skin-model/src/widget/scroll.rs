@@ -19,8 +19,9 @@ pub struct Gain {
 }
 
 impl Gain {
-    /// `H` 1.
-    pub const ONE: Self = Self { num: 1, den: 1 };
+    /// `H` 1, for the crate's tests.
+    #[cfg(test)]
+    pub(crate) const ONE: Self = Self { num: 1, den: 1 };
 
     /// `num / den`, if both are positive and `1/100 ≤ num/den ≤ 20`
     /// (compared exactly); `None` otherwise.
@@ -72,8 +73,8 @@ pub struct Scale {
 impl Scale {
     /// The scale with the playhead at `at_line` and the gain `gain` over
     /// an original lane of `lane_len_px` pixels, the judgment line at
-    /// `line_y`. The pixels per position never change during a play,
-    /// whatever the BPM at the playhead.
+    /// `line_y`. For a fixed gain the pixels per position are independent
+    /// of the BPM at the playhead.
     #[must_use]
     pub fn from_gain(at_line: Position, gain: Gain, lane_len_px: f64, line_y: f64) -> Self {
         Self {

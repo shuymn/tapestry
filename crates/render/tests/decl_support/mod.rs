@@ -57,20 +57,9 @@ fn png(path: &Path, side: u32, rgba: [u8; 4]) {
 /// An element drawing image 0 over canvas `rect` from `ready` on, under
 /// clip 0 when `clipped`.
 fn image(rect: [i32; 4], clipped: bool) -> ElementDef {
-    let [x, y, w, h] = rect;
-    let mut props = [None; 9];
-    props[..4].copy_from_slice(&[Some(x), Some(y), Some(w), Some(h)]);
     ElementDef {
         source: Source::Image(0),
-        track: Track::new(
-            &[KeyDef {
-                at: TimeUs(0),
-                props,
-            }],
-            Ease::Linear,
-            End::Hold,
-        )
-        .unwrap(),
+        track: still(rect),
         timer: TimerRef::Builtin(skin_model::timer::READY),
         visible: None,
         blend: Blend::Alpha,
