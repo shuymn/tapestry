@@ -100,6 +100,7 @@ mod tests {
             adjusting,
             generation: 0,
             sequence: 1,
+            epoch: 0,
         }
     }
 

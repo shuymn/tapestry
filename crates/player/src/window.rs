@@ -30,6 +30,7 @@ use std::time::{Duration, Instant};
 use anyhow::Context as _;
 use eval::ControlId;
 use game::{Adjust, Command};
+use input::WindowKeyEvent;
 use winit::application::ApplicationHandler;
 use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, Ime, StartCause, WindowEvent};
@@ -313,8 +314,34 @@ impl ApplicationHandler<Ask> for App {
                     crate::dev::print_foreground(self.controls.now());
                 }
             }
-            WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
-                key_pressed(&self.controls, event.physical_key, event.repeat, &self.keys);
+            WindowEvent::KeyboardInput {
+                event,
+                is_synthetic,
+                ..
+            } => {
+                let pressed = event.state == ElementState::Pressed;
+                // F1 and F2 reach the adjustments only through the tap, or
+                // in an autoplay session through the window's queue; a
+                // made-up event only updates what the window holds.
+                if let Some(key) = self.keys.speed_key(event.physical_key) {
+                    let e = match (pressed, event.repeat) {
+                        (true, false) => WindowKeyEvent::Press,
+                        (true, true) => WindowKeyEvent::Repeat,
+                        (false, _) => WindowKeyEvent::Release,
+                    };
+                    self.controls.window_key(key, e, is_synthetic);
+                }
+                if !pressed {
+                    return;
+                }
+                if !is_synthetic {
+                    key_pressed(
+                        &self.controls,
+                        event.physical_key,
+                        event.repeat,
+                        &mut self.keys,
+                    );
+                }
                 if let Some(menu) = &self.menu {
                     let key = menu_key(event.physical_key, event.repeat).map(MenuInput::Key);
                     // Printable text only: control characters come as keys.
@@ -683,6 +710,11 @@ struct Keys {
     quit: Option<PhysicalKey>,
     settings: [(PhysicalKey, Adjust); 6],
     overlay: PhysicalKey,
+    /// F1 and F2.
+    speed: [PhysicalKey; 2],
+    /// The scene epoch each settings key's press was taken in, while it is
+    /// held: its repeats act only while that epoch is current.
+    pressed_in: [Option<u64>; 6],
 }
 
 impl Keys {
@@ -693,15 +725,43 @@ impl Keys {
             quit: quit.map(window_key),
             settings: Adjust::ALL.map(|a| (window_key(a.key()), a)),
             overlay: window_key(game::OVERLAY_KEY),
+            speed: game::SPEED_KEYS.map(window_key),
+            pressed_in: [None; 6],
         }
+    }
+
+    /// F1 (0) or F2 (1), if `key` is one.
+    fn speed_key(&self, key: PhysicalKey) -> Option<u8> {
+        self.speed
+            .iter()
+            .position(|k| *k == key)
+            .and_then(|i| u8::try_from(i).ok())
     }
 }
 
 /// A key pressed in the window. A settings key steps again while held
-/// (key repeat), and wakes the game thread to show it; the overlay key,
-/// retry and quit act on the first press only.
-fn key_pressed(controls: &Controls, key: PhysicalKey, repeat: bool, keys: &Keys) {
-    if let Some(&(_, a)) = keys.settings.iter().find(|(k, _)| *k == key) {
+/// (key repeat), only while the scene its press was taken in is current
+/// (the held-input guard), and wakes the game thread to show it; the
+/// overlay key, retry and quit act on the first press only.
+fn key_pressed(controls: &Controls, key: PhysicalKey, repeat: bool, keys: &mut Keys) {
+    if let Some(i) = keys.settings.iter().position(|(k, _)| *k == key) {
+        let scene = controls.scene();
+        let Some((Some(pressed_in), &(_, a))) = keys
+            .pressed_in
+            .get_mut(i)
+            .zip(keys.settings.get(i))
+            .map(|(p, s)| {
+                if !repeat {
+                    *p = Some(scene);
+                }
+                (*p, s)
+            })
+        else {
+            return;
+        };
+        if pressed_in != scene {
+            return;
+        }
         controls.tuning().adjust(a);
         controls.wake_game();
     } else if repeat {
@@ -998,17 +1058,17 @@ mod tests {
         config.retry = Some(PAUSE);
         config.quit = Some(NUM_LOCK);
         assert_eq!(config.check(DeviceKind::Keyboard), Ok(()));
-        let keys = Keys::new(config.retry, config.quit);
+        let mut keys = Keys::new(config.retry, config.quit);
 
         let c = Controls::new(QpcClock::start());
         let pause = PhysicalKey::Code(KeyCode::Pause);
-        key_pressed(&c, pause, false, &keys);
+        key_pressed(&c, pause, false, &mut keys);
         assert_eq!(c.take(), Some(Command::Retry));
         assert!(!c.quitting());
         // A held Pause repeats nothing.
-        key_pressed(&c, pause, true, &keys);
+        key_pressed(&c, pause, true, &mut keys);
         assert_eq!(c.take(), None);
-        key_pressed(&c, PhysicalKey::Code(KeyCode::NumLock), false, &keys);
+        key_pressed(&c, PhysicalKey::Code(KeyCode::NumLock), false, &mut keys);
         assert_eq!(c.take(), None);
         assert!(c.quitting());
     }
@@ -1034,7 +1094,7 @@ mod tests {
                 known += 1;
             }
             let c = Controls::new(QpcClock::start());
-            key_pressed(&c, pressed, false, &Keys::new(Some(control), None));
+            key_pressed(&c, pressed, false, &mut Keys::new(Some(control), None));
             // A settings key's scan code steps the setting instead, and
             // the overlay key's toggles the overlay.
             if Adjust::from_key(control).is_none() && control != game::OVERLAY_KEY {
@@ -1060,10 +1120,44 @@ mod tests {
         let c = Controls::new(QpcClock::start());
         let before = c.tuning().get();
         for k in [KeyCode::F1, KeyCode::F2] {
-            key_pressed(&c, PhysicalKey::Code(k), true, &Keys::new(None, None));
+            key_pressed(&c, PhysicalKey::Code(k), true, &mut Keys::new(None, None));
         }
         assert_eq!(c.tuning().get(), before);
         assert_eq!(c.take(), None);
+    }
+
+    /// The held-input guard: a settings key repeats while the scene its
+    /// press was taken in is current; once the scene changes its repeats
+    /// step nothing until it is pressed afresh, and a repeat without a
+    /// press seen steps nothing.
+    #[test]
+    fn a_settings_key_held_across_a_scene_change_repeats_nothing() {
+        let c = Controls::new(QpcClock::start());
+        let mut keys = Keys::new(None, None);
+        let f6 = PhysicalKey::Code(KeyCode::F6);
+        let offset = |c: &Controls| c.tuning().get().display_offset_us;
+        key_pressed(&c, f6, true, &mut keys);
+        assert_eq!(offset(&c), 0, "no press seen");
+        key_pressed(&c, f6, false, &mut keys);
+        key_pressed(&c, f6, true, &mut keys);
+        assert_eq!(offset(&c), 2_000);
+        c.next_scene();
+        key_pressed(&c, f6, true, &mut keys);
+        assert_eq!(offset(&c), 2_000, "held across the scene change");
+        key_pressed(&c, f6, false, &mut keys);
+        assert_eq!(offset(&c), 3_000, "pressed afresh");
+    }
+
+    /// A volume key stores only the volume; an offset key only its offset.
+    #[test]
+    fn a_volume_step_stores_only_the_volume() {
+        let c = Controls::new(QpcClock::start());
+        let before = c.tuning().get();
+        assert!(c.tuning().adjust(Adjust::VolumeDown));
+        let after = c.tuning().get();
+        assert_eq!(after.display_offset_us, before.display_offset_us);
+        assert_eq!(after.input_offset_us, before.input_offset_us);
+        assert_ne!(after.volume_percent, before.volume_percent);
     }
 
     /// `device.toml`'s monitor picks a monitor by its exact device name,
@@ -1087,15 +1181,15 @@ mod tests {
     fn the_overlay_key_toggles_the_overlay() {
         use std::sync::atomic::Ordering;
         let c = Controls::new(QpcClock::start());
-        let keys = Keys::new(Some(0x0E), Some(0x01));
+        let mut keys = Keys::new(Some(0x0E), Some(0x01));
         let f9 = PhysicalKey::Code(KeyCode::F9);
         assert_eq!(window_key(game::OVERLAY_KEY), f9);
         assert!(!c.overlay().load(Ordering::Acquire));
-        key_pressed(&c, f9, false, &keys);
+        key_pressed(&c, f9, false, &mut keys);
         assert!(c.overlay().load(Ordering::Acquire));
-        key_pressed(&c, f9, true, &keys);
+        key_pressed(&c, f9, true, &mut keys);
         assert!(c.overlay().load(Ordering::Acquire));
-        key_pressed(&c, f9, false, &keys);
+        key_pressed(&c, f9, false, &mut keys);
         assert!(!c.overlay().load(Ordering::Acquire));
         assert_eq!(c.take(), None);
         assert!(!c.quitting());

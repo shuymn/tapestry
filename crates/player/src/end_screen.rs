@@ -559,12 +559,27 @@ pub fn view_graphs(screen: &ResultScreen) -> Option<Arc<ResultGraphs>> {
     }
 }
 
+/// The hi-speed as the end screen shows it: the active multiplier in
+/// hundredths, the mode, the green number at the attempt's reference tempo
+/// and, in Floating, the target green number.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SpeedLine {
+    /// The active `H` in hundredths, rounded half up; `None` while unknown.
+    pub hispeed_x100: Option<u64>,
+    /// Whether the mode is Floating.
+    pub floating: bool,
+    /// The green number, rounded half up; `None` while unknown.
+    pub green: Option<u64>,
+    /// The target green number G.
+    pub target: u32,
+}
+
 /// The end screen's page to draw: `base` (the summary's lines and the
 /// view's graphs, which a settings change keeps) with the settings lines of
-/// `t` under its lines.
-pub fn with_settings(base: &EndPage, t: Tuning) -> EndPage {
+/// `t` and `speed` under its lines.
+pub fn with_settings(base: &EndPage, t: Tuning, speed: SpeedLine) -> EndPage {
     let mut page = base.clone();
-    page.lines.extend(settings_lines(t));
+    page.lines.extend(settings_lines(t, speed));
     page
 }
 
@@ -572,20 +587,29 @@ pub fn with_settings(base: &EndPage, t: Tuning) -> EndPage {
 /// left: the input offset with its keys always among them. The input offset
 /// applies from the next play (design.md "Offset Changes and the
 /// Watermark") of devices; autoplay plays with 0 whatever it is.
-pub fn settings_lines(t: Tuning) -> Vec<String> {
+pub fn settings_lines(t: Tuning, speed: SpeedLine) -> Vec<String> {
+    let unknown = || "-".to_owned();
+    let hispeed = speed
+        .hispeed_x100
+        .map_or_else(unknown, |x| format!("{}.{:02}", x / 100, x % 100));
+    let green = speed.green.map_or_else(unknown, |g| g.to_string());
+    let (mode, target) = if speed.floating {
+        ("FLOATING", format!(" (TARGET {})", speed.target))
+    } else {
+        ("CLASSIC", String::new())
+    };
     vec![
         fit(
             &format!(
-                "F1/F2 VISIBLE TIME {} MS  F3/F4 VOLUME {}%  F5/F6 DISPLAY OFFSET {} MS",
-                t.visible_time_ms,
-                t.volume_percent,
-                ms(t.display_offset_us)
+                "F1/F2 HI-SPEED {hispeed} {mode} GREEN {green}{target}  F3/F4 VOLUME {}%",
+                t.volume_percent
             ),
             COLUMNS,
         ),
         fit(
             &format!(
-                "F7/F8 INPUT OFFSET {} MS FROM THE NEXT PLAY  F9 OVERLAY",
+                "F5/F6 DISPLAY {} MS  F7/F8 INPUT {} MS (NEXT PLAY)  F9 OVERLAY",
+                ms(t.display_offset_us),
                 ms(t.input_offset_us)
             ),
             COLUMNS,
@@ -618,18 +642,37 @@ mod tests {
 
     #[test]
     fn settings_lines_show_each_value_and_its_keys() {
-        let lines = super::settings_lines(game::Tuning {
-            visible_time_ms: 575,
+        let t = game::Tuning {
             volume_percent: 35,
             display_offset_us: -2_000,
             input_offset_us: 4_000,
-        });
+        };
+        let floating = super::SpeedLine {
+            hispeed_x100: Some(320),
+            floating: true,
+            green: Some(300),
+            target: 300,
+        };
         assert_eq!(
-            lines,
+            super::settings_lines(t, floating),
             [
-                "F1/F2 VISIBLE TIME 575 MS  F3/F4 VOLUME 35%  F5/F6 DISPLAY OFFSET -2.0 MS",
-                "F7/F8 INPUT OFFSET +4.0 MS FROM THE NEXT PLAY  F9 OVERLAY",
+                "F1/F2 HI-SPEED 3.20 FLOATING GREEN 300 (TARGET 300)  F3/F4 VOLUME 35%",
+                "F5/F6 DISPLAY -2.0 MS  F7/F8 INPUT +4.0 MS (NEXT PLAY)  F9 OVERLAY",
             ]
+        );
+        let classic = super::SpeedLine {
+            hispeed_x100: Some(256),
+            floating: false,
+            green: Some(150),
+            target: 300,
+        };
+        assert_eq!(
+            super::settings_lines(t, classic)[0],
+            "F1/F2 HI-SPEED 2.56 CLASSIC GREEN 150  F3/F4 VOLUME 35%"
+        );
+        assert_eq!(
+            super::settings_lines(t, super::SpeedLine::default())[0],
+            "F1/F2 HI-SPEED - CLASSIC GREEN -  F3/F4 VOLUME 35%"
         );
     }
 
@@ -1170,18 +1213,19 @@ mod tests {
             graphs: Some(Arc::clone(&graphs)),
         };
         let t = game::Tuning {
-            visible_time_ms: 575,
             volume_percent: 100,
             display_offset_us: 0,
             input_offset_us: 0,
         };
-        let page = super::with_settings(&base, t);
+        let speed = super::SpeedLine::default();
+        let page = super::with_settings(&base, t, speed);
         let changed = super::with_settings(
             &base,
             game::Tuning {
                 volume_percent: 35,
                 ..t
             },
+            speed,
         );
         assert_ne!(page.lines, changed.lines);
         assert_eq!(changed.lines.len(), 3);
@@ -1250,12 +1294,14 @@ mod tests {
             page[SUMMARY_LINES - 1],
             "BACKSPACE: RETRY  ESCAPE: BACK  LEFT/RIGHT: PRESET"
         );
-        page.extend(super::settings_lines(game::Tuning {
-            visible_time_ms: 575,
-            volume_percent: 100,
-            display_offset_us: -12_000,
-            input_offset_us: -7_500,
-        }));
+        page.extend(super::settings_lines(
+            game::Tuning {
+                volume_percent: 100,
+                display_offset_us: -12_000,
+                input_offset_us: -7_500,
+            },
+            super::SpeedLine::default(),
+        ));
         // The view's early/late lines under its counts, and its gauge
         // cells on the rows the renderer marks, the second cell at its
         // column.
@@ -1271,7 +1317,7 @@ mod tests {
 
         assert_eq!(
             page[26],
-            "F7/F8 INPUT OFFSET -7.5 MS FROM THE NEXT PLAY  F9 OVERLAY"
+            "F5/F6 DISPLAY -12.0 MS  F7/F8 INPUT -7.5 MS (NEXT PLAY)  F9 OVERLAY"
         );
         assert!(page.iter().all(|l| l.len() <= COLUMNS), "{page:?}");
     }

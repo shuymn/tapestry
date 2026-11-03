@@ -4836,7 +4836,10 @@ pub(crate) mod tests {
 
     /// A screen that keeps each play frame's visible time and display
     /// offset.
-    struct Inputs(Arc<std::sync::Mutex<Vec<(Option<skin_model::Gain>, TimeUs)>>>);
+    /// One frame's gain and display offset.
+    type FrameSeen = (Option<skin_model::Gain>, TimeUs);
+
+    struct Inputs(Arc<std::sync::Mutex<Vec<FrameSeen>>>);
 
     impl Screen for Inputs {
         fn load(
@@ -5171,10 +5174,7 @@ pub(crate) mod tests {
             }) as Box<dyn Screen>)
         });
         let clock = QpcClock::start();
-        let view = View {
-            effects: buffer,
-            ..view()
-        };
+        let view = View { effects: buffer };
         let link = spawn(
             make,
             Some(Arc::new(chart.clone())),
@@ -7160,10 +7160,7 @@ pub(crate) mod tests {
             Some(Arc::new(chart.clone())),
             None,
             clock,
-            View {
-                effects: buffer,
-                ..view()
-            },
+            View { effects: buffer },
             measure(clock),
             Box::new(NoFrames),
         )

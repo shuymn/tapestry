@@ -1,8 +1,8 @@
 //! The settings keys' values while the game runs (design.md "Input"): the
-//! window thread steps them on F3 to F8, the render thread reads the visible
-//! time and the display offset every frame, and the game thread forwards the volume to
-//! the audio thread, takes the input offset into the next play and writes the
-//! files when a play ends. Lock-free and allocation-free.
+//! window thread steps them on F3 to F8, the adjustments' driver reads the
+//! display offset at each drain, and the game thread forwards the volume to
+//! the audio thread, takes the input offset into the next play and writes
+//! the files when a play ends. Lock-free and allocation-free.
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
@@ -14,7 +14,6 @@ use game::{Adjust, Chain, DataRoot, Settings, Tuning, save_settings};
 /// The four values, shared.
 #[derive(Debug)]
 pub struct LiveTuning {
-    visible_time_ms: AtomicU32,
     volume_percent: AtomicU32,
     /// The volume as loaded, exact (`f32` bits), which plays until a
     /// volume key moves it to a whole percent.
@@ -37,7 +36,6 @@ impl LiveTuning {
     /// The values `t`, with no end screen shown.
     pub fn new(t: Tuning) -> Self {
         Self {
-            visible_time_ms: AtomicU32::new(t.visible_time_ms),
             volume_percent: AtomicU32::new(t.volume_percent),
             loaded_volume: AtomicU32::new(t.volume().to_bits()),
             volume_moved: AtomicBool::new(false),
@@ -70,7 +68,6 @@ impl LiveTuning {
     /// time, so a read between two changes sees each value as it is.
     pub fn get(&self) -> Tuning {
         Tuning {
-            visible_time_ms: self.visible_time_ms.load(Ordering::Acquire),
             volume_percent: self.volume_percent.load(Ordering::Acquire),
             display_offset_us: self.display_offset_us.load(Ordering::Acquire),
             input_offset_us: self.input_offset_us.load(Ordering::Acquire),
@@ -105,17 +102,22 @@ impl LiveTuning {
         if new == old {
             return false;
         }
-        self.visible_time_ms
-            .store(new.visible_time_ms, Ordering::Release);
-        if new.volume_percent != old.volume_percent {
-            self.volume_percent
-                .store(new.volume_percent, Ordering::Release);
-            self.volume_moved.store(true, Ordering::Release);
+        // Only the value the key owns is stored.
+        match a {
+            Adjust::VolumeDown | Adjust::VolumeUp => {
+                self.volume_percent
+                    .store(new.volume_percent, Ordering::Release);
+                self.volume_moved.store(true, Ordering::Release);
+            }
+            Adjust::DisplayOffsetDown | Adjust::DisplayOffsetUp => {
+                self.display_offset_us
+                    .store(new.display_offset_us, Ordering::Release);
+            }
+            Adjust::InputOffsetDown | Adjust::InputOffsetUp => {
+                self.input_offset_us
+                    .store(new.input_offset_us, Ordering::Release);
+            }
         }
-        self.display_offset_us
-            .store(new.display_offset_us, Ordering::Release);
-        self.input_offset_us
-            .store(new.input_offset_us, Ordering::Release);
         self.version.fetch_add(1, Ordering::AcqRel);
         true
     }
@@ -168,6 +170,9 @@ pub struct SettingsFiles {
     /// Why `player.toml` could not be written, until it is or holds what
     /// is wanted.
     player_error: Option<String>,
+    /// The play adjustments' settings as the reducer last left them,
+    /// written with the rest; as loaded until set.
+    options: Option<game::PlayOptions>,
 }
 
 impl SettingsFiles {
@@ -178,7 +183,14 @@ impl SettingsFiles {
             preset: loaded.player.preset.clone(),
             written: loaded,
             player_error: None,
+            options: None,
         }
+    }
+
+    /// The play adjustments' settings `player.toml` is to hold from now
+    /// on: the ones every accepted change left ([`game::AdjustDriver::options`]).
+    pub const fn set_options(&mut self, options: game::PlayOptions) {
+        self.options = Some(options);
     }
 
     /// The play preset `player.toml` is to hold.
@@ -224,6 +236,9 @@ impl SettingsFiles {
         t.apply_to(&mut next);
         next.device.queued_periods = queued_periods;
         next.player.preset.clone_from(&self.preset);
+        if let Some(options) = &self.options {
+            next.player.set_options(options);
+        }
         let mut wrote = Vec::new();
         if next.device != self.written.device {
             let path = self.root.device_settings();
@@ -267,7 +282,6 @@ mod tests {
 
     fn start() -> Tuning {
         Tuning {
-            visible_time_ms: 600,
             volume_percent: 100,
             display_offset_us: 0,
             input_offset_us: 2_000,

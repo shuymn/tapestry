@@ -302,6 +302,9 @@ impl PlayerRig<'_> {
     /// `player.toml`, each atomically and only if it changed. Called when a
     /// play ends and when the run ends, never during a play.
     fn persist(&mut self) {
+        if let Some(driver) = &self.adjust {
+            self.files.set_options(driver.options());
+        }
         self.files
             .write(self.controls.tuning().get(), self.queue.periods());
     }
@@ -350,12 +353,41 @@ impl PlayerRig<'_> {
         self.send_end(t);
     }
 
+    /// The hi-speed the end screen shows: the adjustments' newest state,
+    /// its green number at the attempt's reference tempo.
+    fn speed_line(&self) -> end_screen::SpeedLine {
+        let Some(driver) = &self.adjust else {
+            return end_screen::SpeedLine::default();
+        };
+        let s = driver.snapshot();
+        let h = s.options.hispeed();
+        let reference = driver.tempo().and_then(|t| {
+            let (k, d) = t.speed().ratio();
+            let speed = game::Ratio::new(u64::from(k), u64::from(d))?;
+            let bpm = t.references().ok()?.get(h.reference);
+            bpm.times(speed).ok()
+        });
+        end_screen::SpeedLine {
+            hispeed_x100: s
+                .hispeed
+                .and_then(|x| game::Ratio::new(100, 1).and_then(|c| x.times(c).ok()))
+                .map(game::Ratio::round_half_up),
+            floating: h.mode == game::SpeedMode::Floating,
+            green: reference
+                .zip(s.hispeed)
+                .and_then(|(b, x)| game::green(b, x, &s.options.covers()).ok())
+                .map(game::Ratio::round_half_up),
+            target: h.green_target,
+        }
+    }
+
     /// Hands the end screen's page, with the settings lines of `t` and the
     /// view's graphs, to the render thread, while the end screen shows.
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn send_end(&self, t: Tuning) {
         if let Some(base) = &self.end_page {
-            self.render.show_end(end_screen::with_settings(base, t));
+            self.render
+                .show_end(end_screen::with_settings(base, t, self.speed_line()));
         }
     }
 
@@ -462,14 +494,15 @@ pub(crate) fn install_adjustments(
     settings: &Settings,
 ) -> anyhow::Result<()> {
     let device = &settings.device;
-    let keys = game::KeyConfigs {
-        keyboard: device.keyboard.clone(),
-        controller: device.controller.clone(),
-        controller_device: device.controller_device.map(Into::into),
-    };
-    let config = game::AdjustmentConfig::default();
-    let plan = config.plan(&keys, None, device.scratch.wrap)?;
-    let options = game::PlayOptions::default();
+    let keys = game::KeyConfigs::from(device);
+    let config = game::AdjustmentConfig::of(device);
+    // A wrapping axis steps by its revolution; any other by the quantum
+    // `device.toml` sets.
+    let quantum = config
+        .counts_per_step
+        .and_then(game::adjustment::AxisQuantum::per_step);
+    let plan = config.plan(&keys, quantum, device.scratch.wrap)?;
+    let options = settings.player.options()?;
     let (driver, mut tap, reader) =
         game::AdjustDriver::new(&plan, options, rig.controls.tuning().display_offset_us())?;
     if rig.autoplay {
@@ -480,7 +513,7 @@ pub(crate) fn install_adjustments(
                 .find(|(c, _)| *c == input::TapControl::Key(eval::ControlId(code)))
                 .map(|&(_, n)| n)
         };
-        let [f1, f2] = [0x3B, 0x3C];
+        let [f1, f2] = game::SPEED_KEYS;
         let (keys, receiver) = input::window_keys();
         tap.set_window_keys(receiver, [number(f1), number(f2)]);
         rig.controls.set_window_keys(keys);
@@ -903,6 +936,8 @@ impl Rig for PlayerRig<'_> {
     }
 
     fn start(&mut self, origin: TimeUs, sounds: AudioQueue, screen: RenderSide) {
+        // A new scene: a settings key held into the play repeats nothing.
+        self.controls.next_scene();
         // The play's setup ends here, before anything is handed over; the
         // page faults count from here too.
         let started = self.clock.now();
@@ -1084,10 +1119,15 @@ impl Rig for PlayerRig<'_> {
         self.result_input.release();
         let t = self.controls.tuning().close_end_screen();
         t.apply_to(settings);
+        // The adjustments' settings as every accepted change left them.
+        if let Some(driver) = &self.adjust {
+            settings.player.set_options(&driver.options());
+        }
         self.input_offset_us = t.input_offset_us;
     }
 
     fn ended(&mut self, report: &PlayReport) {
+        self.controls.next_scene();
         if let Some(c) = self.figures.as_ref().and_then(|f| f.ready_state) {
             println!(
                 "ready: setup {} us, first frame {} after it started",

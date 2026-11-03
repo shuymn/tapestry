@@ -920,6 +920,7 @@ fn snapshot(covers: game::Covers, h: u64) -> PresentationSnapshot {
         adjusting: h.is_multiple_of(2),
         generation: 0,
         sequence: h,
+        epoch: 0,
     }
 }
 

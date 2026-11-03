@@ -238,7 +238,6 @@ pub const IN_PLAY: &[Site] = &[
             "Adjust::is_input_offset",
             "Tuning::adjust",
             "Tuning::volume",
-            "Tuning::visible_time",
         ],
     ),
     Site::Fns(

@@ -191,6 +191,19 @@ impl Fixture {
         (out, stdout, stderr)
     }
 
+    /// The saved records of a played attempt, oldest first, and how many
+    /// captures were cancelled before playback (a quit in READY saves
+    /// one).
+    fn played_records(&self) -> (Vec<PathBuf>, usize) {
+        let all = self.records();
+        let (played, cancelled): (Vec<PathBuf>, Vec<PathBuf>) = all.into_iter().partition(|p| {
+            replay::decode(&fs::read(p).unwrap(), &DecodeLimits::default())
+                .unwrap()
+                .played()
+        });
+        (played, cancelled.len())
+    }
+
     /// Every saved record, oldest first.
     fn records(&self) -> Vec<PathBuf> {
         let mut found = Vec::new();
@@ -344,8 +357,10 @@ fn exit_scenario_plays_select_result_retry_repeatedly() {
     // the whole log, and each aborted one the log replayed from its first
     // event up to where it was cut; the figures of each were measured
     // with no allocation in the render thread's app region.
-    let records = fx.records();
+    let (records, cancelled) = fx.played_records();
     assert_eq!(records.len(), 4, "{records:?}");
+    // The quit in the next round's READY state saves its capture.
+    assert_eq!(cancelled, 1);
     let decoded: Vec<PlayRecord> = records
         .iter()
         .map(|r| replay::decode(&fs::read(r).unwrap(), &DecodeLimits::default()).unwrap())
@@ -730,8 +745,10 @@ fn practice_after_autoplay_plays_its_log() {
         "quit = {}",
     ]));
     assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
-    let records = fx.records();
+    let (records, cancelled) = fx.played_records();
     assert_eq!(records.len(), 1, "{records:?}");
+    // The quit in the next round's READY state saves its capture.
+    assert_eq!(cancelled, 1, "{stdout}");
     let round = replay::decode(&fs::read(&records[0]).unwrap(), &DecodeLimits::default()).unwrap();
     assert!(
         matches!(round.play_type, PlayType::SectionRepeat(_)),

@@ -1194,7 +1194,6 @@ fn settings_keys_step_and_stop_at_their_bounds() {
     assert!(game::reserved_key(game::PREV_PRESET_KEY).is_some());
 
     let t = Tuning {
-        visible_time_ms: 600,
         volume_percent: 40,
         display_offset_us: 2_000,
         input_offset_us: -3_000,
@@ -1247,8 +1246,6 @@ fn settings_keys_step_and_stop_at_their_bounds() {
     for (a, after) in steps {
         assert_eq!(t.adjust(a), after, "{a:?}");
     }
-
-    assert_eq!(t.visible_time(), TimeUs(600_000));
     // Volume stops at 0 % and at unity.
     let vol = |p| Tuning {
         volume_percent: p,

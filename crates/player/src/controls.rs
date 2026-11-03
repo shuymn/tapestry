@@ -54,6 +54,9 @@ pub struct Controls {
     tuning: Arc<LiveTuning>,
     /// Whether the measurement overlay shows (design.md "Latency Figures").
     overlay: Arc<AtomicBool>,
+    /// The scene epoch: a play starting or ending, or focus changing, moves
+    /// it, so a key held across it repeats no action.
+    scene: std::sync::atomic::AtomicU64,
 }
 
 impl Controls {
@@ -90,6 +93,7 @@ impl Controls {
             game: OnceLock::new(),
             tuning,
             overlay: Arc::new(AtomicBool::new(false)),
+            scene: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -230,6 +234,7 @@ impl Controls {
     /// (design.md "Input"). Then the input thread is woken, so an idle one
     /// sees the change, and the game thread.
     pub fn focus(&self, focused: bool) {
+        self.next_scene();
         self.focused.store(focused, Ordering::Release);
         self.presentation.set(focused);
         if !focused && let Some(l) = self.latch.get() {
@@ -239,6 +244,18 @@ impl Controls {
             w.wake();
         }
         self.wake_game();
+    }
+
+    /// The scene changed (a play started or ended, focus changed): a held
+    /// settings key repeats no action until pressed afresh (the held-input
+    /// guard).
+    pub fn next_scene(&self) {
+        self.scene.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// The scene epoch now.
+    pub fn scene(&self) -> u64 {
+        self.scene.load(Ordering::Acquire)
     }
 
     /// The window's presentation focus, for the input thread's source set

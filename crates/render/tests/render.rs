@@ -124,6 +124,7 @@ fn presented(covers: game::Covers) -> (LaneView, FrameReadouts) {
         adjusting: false,
         generation: 0,
         sequence: 1,
+        epoch: 0,
     };
     let bpm = Some(game::Ratio::integer(150));
     let refs = game::References::all(game::Ratio::integer(150));
