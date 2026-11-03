@@ -1117,6 +1117,7 @@ fn load(
         elements,
         widgets,
         bomb_up_to: Some(skin_model::Grade::Bad),
+        close: None,
     })
     .unwrap();
     // A page of 256 holds only some of the frames.
@@ -2170,6 +2171,7 @@ fn bitmap_skin() -> (tempfile::TempDir, Skin) {
             ..skin_model::WidgetDefs::default()
         },
         bomb_up_to: Some(skin_model::Grade::Bad),
+        close: None,
     })
     .unwrap();
     (root, skin)
@@ -2301,6 +2303,7 @@ fn fallback_lanes_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
         lanes: Some(lanes),
         widgets: skin_model::WidgetDefs::default(),
         bomb_up_to: Some(skin_model::Grade::Bad),
+        close: None,
     })
     .unwrap();
     let uvs = play_support::uvs(&skin);

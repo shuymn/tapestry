@@ -97,6 +97,7 @@ fn skin_def(
             ..WidgetDefs::default()
         },
         bomb_up_to: Some(skin_model::Grade::Bad),
+        close: None,
     }
 }
 

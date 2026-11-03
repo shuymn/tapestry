@@ -1677,6 +1677,7 @@ fn f14b(root: &Path) -> i64 {
                 ..WidgetDefs::default()
             },
             bomb_up_to: None,
+            close: None,
         };
         black_box(Skin::new(def).unwrap());
     });

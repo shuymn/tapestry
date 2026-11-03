@@ -484,6 +484,7 @@ fn hidden_regions_and_offered_controls() {
         elements: vec![image(WHITE, [0; 4], Place::SCREEN)],
         widgets: skin_model::WidgetDefs::default(),
         bomb_up_to: Some(skin_model::Grade::Bad),
+        close: None,
     })
     .unwrap();
     for r in Region::ALL {

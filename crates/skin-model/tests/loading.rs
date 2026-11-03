@@ -93,6 +93,7 @@ fn skin(
         elements,
         widgets,
         bomb_up_to: Some(skin_model::Grade::Bad),
+        close: None,
     })
     .unwrap()
 }
@@ -649,6 +650,7 @@ fn bitmap_text_skin(sheet: skin_model::Sheet) -> Skin {
             ..WidgetDefs::default()
         },
         bomb_up_to: Some(skin_model::Grade::Bad),
+        close: None,
     })
     .unwrap()
 }

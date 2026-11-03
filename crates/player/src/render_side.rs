@@ -6347,6 +6347,7 @@ pub(crate) mod tests {
             elements: Vec::new(),
             widgets: skin_model::WidgetDefs::default(),
             bomb_up_to: None,
+            close: None,
         })
         .unwrap();
         let limits = AtlasLimits {

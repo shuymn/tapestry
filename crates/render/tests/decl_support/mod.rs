@@ -566,6 +566,7 @@ pub fn skin(dir: &Path, look: &Look) -> Skin {
         elements,
         widgets,
         bomb_up_to: None,
+        close: None,
     })
     .unwrap()
 }

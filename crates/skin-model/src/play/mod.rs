@@ -752,6 +752,7 @@ mod tests {
             elements: Vec::new(),
             widgets: crate::WidgetDefs::default(),
             bomb_up_to: Some(crate::Grade::Bad),
+            close: None,
         })
         .unwrap();
         let limits = AtlasLimits {

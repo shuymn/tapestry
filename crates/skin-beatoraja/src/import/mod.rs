@@ -1389,8 +1389,20 @@ impl<'d> Cx<'d> {
             .map(|i| Grade::ALL.get(i).copied().unwrap_or(Grade::EmptyPoor)))
     }
 
+    /// Closing's declared duration, from the top-level `close` in ms
+    /// (`JsonSkin.java:17`, default 0): a positive value in µs, `None`
+    /// for 0 or below. It is read whether or not the skin defines a
+    /// note, where the source sets it only while loading the note's
+    /// destination (`JsonPlaySkinObjectLoader.java:37-40`).
+    fn close(&mut self) -> Result<Option<TimeUs>, ImportError> {
+        let [f] = self.def.fields(self.def.top(), ["close"]);
+        let ms = self.int_or(f, "close", 0)?;
+        Ok((ms > 0).then(|| TimeUs(i64::from(ms) * 1_000)))
+    }
+
     fn finish(mut self, files: Vec<FileChoice>) -> Result<Imported, ImportError> {
         let bomb_up_to = self.bomb_up_to()?;
+        let close = self.close()?;
         let assets = std::mem::replace(&mut self.assets, Assets::new(self.def.root()));
         let sheet = assets.finish();
         // The lanes' groups move to the skin; the rest is copied.
@@ -1410,6 +1422,7 @@ impl<'d> Cx<'d> {
             elements: std::mem::take(&mut self.elements),
             widgets: std::mem::take(&mut self.widgets),
             bomb_up_to,
+            close,
         };
         let skin = Skin::new(def).map_err(|source| {
             let at = self.load_loc(&source);
