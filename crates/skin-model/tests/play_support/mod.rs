@@ -305,6 +305,7 @@ pub fn def(whens: Vec<Program>, sheet: Sheet, elements: Vec<ElementDef>) -> Skin
         elements,
         widgets: skin_model::WidgetDefs::default(),
         bomb_up_to: Some(skin_model::Grade::Bad),
+        close: None,
     }
 }
 

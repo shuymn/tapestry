@@ -305,6 +305,7 @@ pub fn skin_with_widgets(
         lanes,
         widgets,
         bomb_up_to: Some(skin_model::Grade::Bad),
+        close: None,
     })
 }
 

@@ -147,6 +147,10 @@ pub struct SkinDef {
     /// The last grade, in [`Grade::ALL`]'s order, whose press starts a
     /// lane's `bomb` timer; `None` starts none.
     pub bomb_up_to: Option<Grade>,
+    /// How long the skin declares Closing (design.md "Play Lifecycle",
+    /// Closing), positive; `None` declares nothing, and the player's
+    /// floor applies either way.
+    pub close: Option<TimeUs>,
 }
 
 /// Why [`Skin::new`] refused a skin; `element` and `when` are indices.
@@ -350,6 +354,7 @@ pub struct Skin {
     /// The quads one frame's widget elements can push, the lanes aside.
     widget_quads: u32,
     bomb_up_to: Option<Grade>,
+    close: Option<TimeUs>,
 }
 
 /// A table index from a definition's `u32`, past every table when it
@@ -1413,7 +1418,15 @@ impl Skin {
             text_slots,
             widget_quads,
             bomb_up_to: def.bomb_up_to,
+            close: def.close,
         })
+    }
+
+    /// How long the skin declares Closing, if it declares a positive
+    /// duration ([`SkinDef::close`]).
+    #[must_use]
+    pub fn close(&self) -> Option<TimeUs> {
+        self.close
     }
 
     /// The frames of the sheet's images: the length of the uv table
@@ -2325,6 +2338,7 @@ mod tests {
                 ..WidgetDefs::default()
             },
             bomb_up_to: None,
+            close: None,
         })
         .unwrap();
         let chart = ChartBuilder::new(150_000).build().unwrap();

@@ -122,6 +122,7 @@ pub fn load_fit(
         elements,
         widgets,
         bomb_up_to: Some(skin_model::Grade::Bad),
+        close: None,
     })
 }
 
