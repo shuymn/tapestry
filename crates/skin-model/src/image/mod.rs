@@ -8,6 +8,8 @@
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
+#[cfg(test)]
+mod band_tests;
 pub(crate) mod builder;
 pub(crate) mod decode;
 pub(crate) mod fnt;
@@ -26,7 +28,7 @@ use crate::atlas::Variant;
 use crate::quad::Filter;
 use crate::skin::TimerRef;
 use crate::track::MAX_KEY_US;
-use decode::DecodeError;
+use decode::{DecodeError, Halt, Mode};
 use path::PathError;
 
 /// The most files one skin may name.
@@ -47,10 +49,18 @@ pub const HEADER_BYTES: u64 = 1 << 20;
 pub const MAX_TOTAL_FILE_BYTES: u64 = 512 << 20;
 /// The largest width or height of a file.
 pub const MAX_SIDE: u32 = 16_384;
-/// The most texels of one file. With [`MAX_FILE_BYTES`] it bounds one
-/// file's decoding at 144 MiB: the larger of 2 × 32 MiB encoded, 32 MiB
-/// encoded + 8 B × 12 Mi native, and (8 + 4) B × 12 Mi native and RGBA8.
+/// The most texels of one file decoded whole. With [`MAX_FILE_BYTES`] it
+/// bounds one file's decoding at 144 MiB: the larger of 2 × 32 MiB
+/// encoded, 32 MiB encoded + 8 B × 12 Mi native, and (8 + 4) B × 12 Mi
+/// native and RGBA8.
 pub const MAX_IMAGE_TEXELS: u64 = 12 << 20;
+/// The most texels of one file decoded in bands of rows: a PNG past
+/// [`MAX_IMAGE_TEXELS`], neither interlaced nor animated. With
+/// [`MAX_FILE_BYTES`] its reading and decoding stay within the larger of
+/// 2 × 32 MiB and 32 MiB + 16 MiB, whatever its texels, beside the
+/// atlas's pages and tables
+/// ([`ATLAS_TABLE_BYTES`](crate::ATLAS_TABLE_BYTES)).
+pub const MAX_STREAMED_TEXELS: u64 = 64 << 20;
 /// The most texels across one variant's files.
 pub const MAX_TOTAL_TEXELS: u64 = 128 << 20;
 
@@ -115,6 +125,56 @@ impl fmt::Display for FileAt {
     }
 }
 
+/// The texel cap a file passed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TexelCap {
+    /// [`MAX_STREAMED_TEXELS`]: no path decodes it.
+    Banded,
+    /// [`MAX_IMAGE_TEXELS`], for a file that cannot be decoded in bands.
+    FullDecode(Unbanded),
+}
+
+impl TexelCap {
+    /// The cap's texels.
+    #[must_use]
+    pub fn texels(self) -> u64 {
+        match self {
+            Self::Banded => MAX_STREAMED_TEXELS,
+            Self::FullDecode(_) => MAX_IMAGE_TEXELS,
+        }
+    }
+}
+
+impl fmt::Display for TexelCap {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Banded => write!(f, "{MAX_STREAMED_TEXELS} texels"),
+            Self::FullDecode(why) => write!(f, "{MAX_IMAGE_TEXELS} texels {why}"),
+        }
+    }
+}
+
+/// Why a file past [`MAX_IMAGE_TEXELS`] cannot be decoded in bands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Unbanded {
+    /// An interlaced (Adam7) PNG.
+    Interlaced,
+    /// An animated PNG.
+    Animated,
+    /// A JPEG or BMP.
+    Format,
+}
+
+impl fmt::Display for Unbanded {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Interlaced => "as an interlaced PNG",
+            Self::Animated => "as an animated PNG",
+            Self::Format => "as a JPEG or BMP",
+        })
+    }
+}
+
 /// Why a sheet was refused or a file could not be read; `image` is an
 /// index into the image definitions.
 #[derive(Debug, thiserror::Error)]
@@ -155,8 +215,8 @@ pub enum ImageError {
     EmptyFile { at: FileAt },
     #[error("{at} is {w}×{h}, wider or taller than {MAX_SIDE}")]
     TooWide { at: FileAt, w: u32, h: u32 },
-    #[error("{at} has more than {MAX_IMAGE_TEXELS} texels")]
-    TooManyTexels { at: FileAt },
+    #[error("{at} has more than {cap}")]
+    TooManyTexels { at: FileAt, cap: TexelCap },
     #[error("the files up to {at} pass {MAX_TOTAL_TEXELS} texels")]
     TotalTooLarge { at: FileAt },
     #[error("file {file}'s @2x version is not exactly twice its size")]
@@ -174,11 +234,28 @@ pub enum ImageError {
     EmptyCell { image: usize },
     #[error("{at}'s dimensions changed since the skin was loaded")]
     DimensionsChanged { at: FileAt },
+    /// A file's format, or a PNG's colour type, bit depth or interlacing
+    /// (or, decoded in bands, its animation), changed since the skin was
+    /// loaded.
+    #[error("{at}'s header changed since the skin was loaded")]
+    HeaderChanged { at: FileAt },
+    /// The PNG decoder of a file decoded in bands, or of an oversized
+    /// file's header, met its allocation limit.
+    #[error("{at} needs more than the PNG decoder's allocation limit")]
+    DecoderLimit { at: FileAt },
     #[error("{at}")]
     Decode {
         at: FileAt,
         #[source]
         source: ::image::ImageError,
+    },
+    /// The PNG decoder reading a file in bands, an oversized file's
+    /// header, or a whole-decoded PNG's header checked before its decode.
+    #[error("{at}")]
+    Png {
+        at: FileAt,
+        #[source]
+        source: ::png::DecodingError,
     },
     #[error("{at}")]
     Io {
@@ -205,41 +282,96 @@ impl ImageError {
             DecodeError::HeaderTooLarge => Self::HeaderTooLarge { at },
             DecodeError::Unsupported => Self::Unsupported { at },
             DecodeError::Changed => Self::DimensionsChanged { at },
+            DecodeError::HeaderChanged => Self::HeaderChanged { at },
+            DecodeError::DecoderLimit => Self::DecoderLimit { at },
             DecodeError::Image(source) => Self::Decode { at, source },
+            DecodeError::Png(source) => Self::Png { at, source },
             DecodeError::Io(source) => Self::Io { at, source },
         }
     }
 }
 
+/// Why reading or decoding a file for a build stopped: its cancellation,
+/// or a failure of the file.
+#[derive(Debug)]
+pub(crate) enum Stop {
+    Cancelled,
+    Image(ImageError),
+}
+
+impl From<ImageError> for Stop {
+    fn from(e: ImageError) -> Self {
+        Self::Image(e)
+    }
+}
+
+impl Stop {
+    fn halt(at: FileAt, h: Halt) -> Self {
+        match h {
+            Halt::Cancelled => Self::Cancelled,
+            Halt::Failed(e) => Self::Image(ImageError::decode(at, e)),
+        }
+    }
+}
+
 /// The encoded bytes of the file at `canonical`, closed before they are
-/// returned. A file over `limit` refuses as [`ImageError::FileTooLarge`]
-/// at [`MAX_FILE_BYTES`], and as [`ImageError::TotalBytesTooLarge`] below
-/// it, where the limit is what remains of a total.
+/// returned, `cancel` asked before each piece read. A file over `limit`
+/// refuses as [`ImageError::FileTooLarge`] at [`MAX_FILE_BYTES`], and as
+/// [`ImageError::TotalBytesTooLarge`] below it, where the limit is what
+/// remains of a total.
 pub(crate) fn read_encoded(
     canonical: &Path,
     at: FileAt,
     limit: u64,
-) -> Result<Vec<u8>, ImageError> {
+    cancel: &dyn Fn() -> bool,
+) -> Result<Vec<u8>, Stop> {
     let (mut file, len) = path::open(canonical).map_err(|e| ImageError::path(at, e))?;
-    let (bytes, more) = decode::read_capped(&mut file, len, limit)
-        .map_err(|source| ImageError::Io { at, source })?;
+    let (bytes, more) = decode::read_capped(&mut file, len, limit, cancel).map_err(|source| {
+        if decode::is_cancelled(&source) {
+            Stop::Cancelled
+        } else {
+            Stop::Image(ImageError::Io { at, source })
+        }
+    })?;
     drop(file);
     if more {
-        return Err(if limit < MAX_FILE_BYTES {
+        return Err(Stop::Image(if limit < MAX_FILE_BYTES {
             ImageError::TotalBytesTooLarge { at }
         } else {
             ImageError::FileTooLarge { at }
-        });
+        }));
     }
     Ok(bytes)
 }
 
-/// One version of a file: its name and the dimensions its header gave at
-/// load.
+/// Decodes `bytes`, version `at` of a file admitted with `dims` and
+/// `mode`: a whole file into the image returned; a file decoded in bands
+/// into `bands`, `cancel` asked as it goes.
+pub(crate) fn decode_file(
+    bytes: Vec<u8>,
+    at: FileAt,
+    (dims, mode): ([u32; 2], Mode),
+    cancel: &dyn Fn() -> bool,
+    bands: &mut dyn decode::Bands,
+) -> Result<Option<::image::RgbaImage>, Stop> {
+    match mode {
+        Mode::Full(header) => decode::check_whole(&bytes, dims, header)
+            .and_then(|()| decode::decode(bytes, dims))
+            .map(Some)
+            .map_err(|e| Stop::Image(ImageError::decode(at, e))),
+        Mode::Banded(header) => decode::banded(bytes, dims, header, cancel, bands)
+            .map(|()| None)
+            .map_err(|h| Stop::halt(at, h)),
+    }
+}
+
+/// One version of a file: its name, the dimensions its header gave at
+/// load, and how it decodes, with the header fields that decided it.
 #[derive(Clone, Debug)]
 pub(crate) struct Version {
     pub name: String,
     pub dims: [u32; 2],
+    pub mode: Mode,
 }
 
 #[derive(Clone, Debug)]
@@ -442,18 +574,18 @@ fn read_file(
     hi_texels: Total,
 ) -> Result<(File, Total, Total), ImageError> {
     let lo_at = FileAt { file, hi: false };
-    let lo_dims = checked_header(lo_at, &paths.lo)?;
+    let (lo_dims, lo_mode) = checked_header(lo_at, &paths.lo)?;
     let lo_texels = lo_texels
         .with(texels(lo_dims))
         .ok_or(ImageError::TotalTooLarge { at: lo_at })?;
     let hi = match (def.hi, &paths.hi) {
         (Some(name), Some(hi_path)) => {
-            let dims = checked_header(FileAt { file, hi: true }, hi_path)?;
+            let (dims, mode) = checked_header(FileAt { file, hi: true }, hi_path)?;
             let [w, h] = lo_dims;
             if dims != [w * 2, h * 2] {
                 return Err(ImageError::HiSizeMismatch { file });
             }
-            Some(Version { name, dims })
+            Some(Version { name, dims, mode })
         }
         _ => None,
     };
@@ -469,6 +601,7 @@ fn read_file(
         lo: Version {
             name: def.path,
             dims: lo_dims,
+            mode: lo_mode,
         },
         hi,
     };
@@ -572,24 +705,32 @@ thread_local! {
     pub(crate) static HEADER_READS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
-/// The header of a resolved file, checked: non-empty, at most
-/// [`MAX_SIDE`] per side and [`MAX_IMAGE_TEXELS`] in all.
-fn checked_header(at: FileAt, path: &Path) -> Result<[u32; 2], ImageError> {
+/// The header of a resolved file, checked, and how it decodes: non-empty,
+/// at most [`MAX_SIDE`] per side and [`MAX_STREAMED_TEXELS`] in all, and
+/// past [`MAX_IMAGE_TEXELS`] only when it can be decoded in bands.
+fn checked_header(at: FileAt, path: &Path) -> Result<([u32; 2], Mode), ImageError> {
     #[cfg(test)]
     HEADER_READS.with(|n| n.set(n.get() + 1));
     let (mut file, len) = path::open(path).map_err(|e| ImageError::path(at, e))?;
-    let dims = decode::header(&mut file, len).map_err(|e| ImageError::decode(at, e))?;
-    let [w, h] = dims;
+    let probe = decode::header(&mut file, len).map_err(|e| ImageError::decode(at, e))?;
+    let [w, h] = probe.dims;
     if w == 0 || h == 0 {
         return Err(ImageError::EmptyFile { at });
     }
     if w > MAX_SIDE || h > MAX_SIDE {
         return Err(ImageError::TooWide { at, w, h });
     }
-    if u64::from(w) * u64::from(h) > MAX_IMAGE_TEXELS {
-        return Err(ImageError::TooManyTexels { at });
+    if u64::from(w) * u64::from(h) > MAX_STREAMED_TEXELS {
+        return Err(ImageError::TooManyTexels {
+            at,
+            cap: TexelCap::Banded,
+        });
     }
-    Ok(dims)
+    let mode = probe.mode.map_err(|why| ImageError::TooManyTexels {
+        at,
+        cap: TexelCap::FullDecode(why),
+    })?;
+    Ok((probe.dims, mode))
 }
 
 fn texels([w, h]: [u32; 2]) -> u64 {

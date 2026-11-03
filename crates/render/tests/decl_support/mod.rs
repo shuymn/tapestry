@@ -214,7 +214,10 @@ pub fn lane_chart() -> Chart {
 /// on `r`, told apart, whatever their crop, by the uv's horizontal extent
 /// and the layer.
 pub fn part_counts(r: &Renderer, bundle: &SkinBundle, instances: &[Instance]) -> [usize; 9] {
-    let atlas = bundle.skin().atlas(Variant::Lo, r.atlas_limits()).unwrap();
+    let atlas = bundle
+        .skin()
+        .atlas(Variant::Lo, r.atlas_limits(), &|| false)
+        .unwrap();
     Part::ALL.map(|p| {
         let f = atlas.uvs().get(p.image()).unwrap();
         let key = ([f.uv[0], f.uv[2]], u32::from(f.layer));
@@ -571,7 +574,9 @@ pub fn skin(dir: &Path, look: &Look) -> Skin {
 /// producer when it has a text element.
 pub fn bundle(r: &Renderer, dir: &Path, look: &Look) -> (Arc<SkinBundle>, Option<Arc<Text>>) {
     let skin = skin(dir, look);
-    let atlas = skin.atlas(Variant::Lo, r.atlas_limits()).unwrap();
+    let atlas = skin
+        .atlas(Variant::Lo, r.atlas_limits(), &|| false)
+        .unwrap();
     let uv = atlas.uvs().get(0).unwrap();
     let clips = ClipTable::new(look.clip.into_iter().collect()).unwrap();
     let bundle = SkinBundle::new(Arc::new(skin), atlas, clips, Side::Left).unwrap();

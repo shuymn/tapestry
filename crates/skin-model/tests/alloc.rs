@@ -1125,7 +1125,7 @@ fn load(
         max_layers: 16,
         reserved_layers: u32::from(RESERVED),
     };
-    let atlas = skin.atlas(Variant::Lo, limits).unwrap();
+    let atlas = skin.atlas(Variant::Lo, limits, &|| false).unwrap();
     assert!(atlas.pages().len() >= 2, "{} pages", atlas.pages().len());
     let (_, uvs) = atlas.into_parts();
     // Frames run image by image: image k's frames follow image k - 1's.
@@ -1906,7 +1906,7 @@ fn build_does_not_allocate() {
     // without allocating, squeezed or not, with a fallback glyph.
     let (_fonts, bitmap) = bitmap_skin();
     let uvs = bitmap
-        .atlas(Variant::Lo, LIMITS_SMALL)
+        .atlas(Variant::Lo, LIMITS_SMALL, &|| false)
         .unwrap()
         .into_parts()
         .1;

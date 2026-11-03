@@ -365,7 +365,11 @@ fn screen(
         max_layers: 8,
         reserved_layers: 1,
     };
-    let uvs = model.atlas(Variant::Lo, limits).unwrap().into_parts().1;
+    let uvs = model
+        .atlas(Variant::Lo, limits, &|| false)
+        .unwrap()
+        .into_parts()
+        .1;
     let seen = Arc::new(Mutex::new(Vec::new()));
     let noted = Arc::clone(&seen);
     let made = Mutex::new(Some((model, uvs, dir)));

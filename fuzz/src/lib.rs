@@ -365,7 +365,7 @@ pub fn draw(imported: &Imported, seed: &[u8]) -> Vec<usize> {
         reserved_layers: 1,
     };
     let uvs = skin
-        .atlas(Variant::Lo, limits)
+        .atlas(Variant::Lo, limits, &|| false)
         .expect("an imported sheet builds its atlas")
         .into_parts()
         .1;
@@ -724,7 +724,7 @@ pub fn judged_rects(imported: &Imported, full: bool) -> Vec<[f32; 4]> {
         reserved_layers: 1,
     };
     let uvs = skin
-        .atlas(Variant::Lo, limits)
+        .atlas(Variant::Lo, limits, &|| false)
         .expect("an imported sheet builds its atlas")
         .into_parts()
         .1;
@@ -2204,6 +2204,454 @@ fn check_usage(i: &Imported) {
         i.skin.digit_offset_count() <= usize::try_from(u.digit_offsets).unwrap_or(usize::MAX),
         "more digit offsets kept than charged"
     );
+}
+
+/// A folder for `skin_png`'s file, rewritten by each input.
+fn png_dir() -> &'static Path {
+    static DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
+    DIR.get_or_init(|| {
+        tempfile::Builder::new()
+            .prefix("tapestry-fuzz-png-")
+            .tempdir()
+            .expect("create an image folder")
+    })
+    .path()
+}
+
+/// The pixel formats `skin_png` generates, by the input's first byte.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PngKind {
+    Grey8,
+    Grey16,
+    GreyAlpha8,
+    Rgb8,
+    /// With a transparent colour.
+    Rgb16Trns,
+    Rgba8,
+    Rgba16,
+    /// With a palette of 256 entries and a transparency table.
+    Indexed8Trns,
+    /// With a transparent grey level.
+    Grey1Trns,
+}
+
+impl PngKind {
+    const ALL: [Self; 9] = [
+        Self::Grey8,
+        Self::Grey16,
+        Self::GreyAlpha8,
+        Self::Rgb8,
+        Self::Rgb16Trns,
+        Self::Rgba8,
+        Self::Rgba16,
+        Self::Indexed8Trns,
+        Self::Grey1Trns,
+    ];
+
+    fn format(self) -> (png::ColorType, png::BitDepth) {
+        use png::BitDepth::{Eight, One, Sixteen};
+        use png::ColorType::{Grayscale, GrayscaleAlpha, Indexed, Rgb, Rgba};
+        match self {
+            Self::Grey8 => (Grayscale, Eight),
+            Self::Grey16 => (Grayscale, Sixteen),
+            Self::GreyAlpha8 => (GrayscaleAlpha, Eight),
+            Self::Rgb8 => (Rgb, Eight),
+            Self::Rgb16Trns => (Rgb, Sixteen),
+            Self::Rgba8 => (Rgba, Eight),
+            Self::Rgba16 => (Rgba, Sixteen),
+            Self::Indexed8Trns => (Indexed, Eight),
+            Self::Grey1Trns => (Grayscale, One),
+        }
+    }
+}
+
+/// The input of `skin_png`, read from its bytes: what to generate.
+///
+/// Bytes: the format (one of [`PngKind::ALL`]); the width, two bytes; the
+/// height, its low bit choosing a file past the full-decode cap; the ask
+/// the second build is cancelled at (0 for none); flags (1: a text chunk
+/// after the image data, 2: that chunk's CRC wrong, 4: an extra empty
+/// image data chunk); then the bytes the samples, palette and
+/// transparency are drawn from.
+#[derive(Clone, Debug)]
+pub struct PngSpec {
+    kind: PngKind,
+    w: u32,
+    h: u32,
+    cancel_at: u8,
+    text: bool,
+    bad_text: bool,
+    extra_idat: bool,
+    seed: Vec<u8>,
+    /// The palette and transparency table, made once from the seed.
+    palette: Vec<u8>,
+    trns: Vec<u8>,
+}
+
+impl PngSpec {
+    /// The spec `data` describes.
+    #[must_use]
+    pub fn read(data: &[u8]) -> Self {
+        let at = |i: usize| data.get(i).copied().unwrap_or(0);
+        let kind = PngKind::ALL[usize::from(at(0)) % PngKind::ALL.len()];
+        let width = u32::from(u16::from_le_bytes([at(1), at(2)]));
+        let tall = at(3) & 1 == 1;
+        let (w, h) = if tall {
+            // Past 12 Mi texels: at least 769 wide, so the height stays
+            // within a side; a few rows more at most.
+            let w = 769 + width % (16_384 - 769 + 1);
+            let h = u32::try_from((skin_model::MAX_IMAGE_TEXELS + 1).div_ceil(u64::from(w)))
+                .expect("a height within a side");
+            (w, (h + u32::from(at(3) >> 1) % 8).min(16_384))
+        } else {
+            (1 + width % 200, 1 + u32::from(at(3) >> 1) % 100)
+        };
+        let flags = at(5);
+        let seed = data
+            .get(6..)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(&[7, 1, 99]);
+        let mut spec = Self {
+            kind,
+            w,
+            h,
+            cancel_at: at(4),
+            text: flags & 1 == 1,
+            bad_text: flags & 2 == 2,
+            extra_idat: flags & 4 == 4,
+            seed: seed.to_vec(),
+            palette: Vec::new(),
+            trns: Vec::new(),
+        };
+        spec.palette = spec.make_palette();
+        spec.trns = spec.make_trns();
+        spec
+    }
+
+    /// The byte `k` of block `(bx, by)`: samples are constant over blocks
+    /// of 64×64, so the file compresses.
+    fn byte(&self, bx: u32, by: u32, k: usize) -> u8 {
+        let i = usize::try_from(bx * 7 + by * 13).expect("a block index") * 8 + k;
+        self.seed[i % self.seed.len()]
+    }
+
+    /// The native samples of texel `(x, y)`: up to four channels, a
+    /// palette index, or a grey bit.
+    fn samples(&self, x: u32, y: u32) -> [u16; 4] {
+        let (bx, by) = (x / 64, y / 64);
+        let b = |k: usize| self.byte(bx, by, k);
+        let wide = |k: usize| u16::from_le_bytes([b(2 * k), b(2 * k + 1)]);
+        match self.kind {
+            PngKind::Grey16 | PngKind::Rgb16Trns | PngKind::Rgba16 => {
+                [wide(0), wide(1), wide(2), wide(3)]
+            }
+            PngKind::Grey1Trns => [u16::from(b(0) & 1), 0, 0, 0],
+            _ => [b(0), b(1), b(2), b(3)].map(u16::from),
+        }
+    }
+
+    fn make_palette(&self) -> Vec<u8> {
+        (0..768)
+            .map(|i| self.seed[(i * 5 + 3) % self.seed.len()])
+            .collect()
+    }
+
+    fn make_trns(&self) -> Vec<u8> {
+        match self.kind {
+            PngKind::Rgb16Trns => {
+                let [r, g, b, _] = self.samples(0, 0);
+                [r, g, b].iter().flat_map(|v| v.to_be_bytes()).collect()
+            }
+            PngKind::Indexed8Trns => {
+                let n = 1 + usize::from(self.seed[0]);
+                (0..n)
+                    .map(|i| self.seed[(i * 3 + 1) % self.seed.len()])
+                    .collect()
+            }
+            PngKind::Grey1Trns => vec![0, self.seed[0] & 1],
+            _ => Vec::new(),
+        }
+    }
+
+    /// The expected RGBA8 texel, straight, by the rules of a whole decode
+    /// (`png`'s expansion, then `image`'s conversion: 16-bit samples
+    /// rounded as `(v + 128) / 257`), computed here on its own.
+    fn expected(&self, x: u32, y: u32) -> [u8; 4] {
+        let s = self.samples(x, y);
+        let q = |v: u16| u8::try_from((u32::from(v) + 128) / 257).expect("a byte");
+        let n = |v: u16| u8::try_from(v).expect("an 8-bit sample");
+        match self.kind {
+            PngKind::Grey8 => [n(s[0]), n(s[0]), n(s[0]), 255],
+            PngKind::Grey16 => [q(s[0]), q(s[0]), q(s[0]), 255],
+            PngKind::GreyAlpha8 => [n(s[0]), n(s[0]), n(s[0]), n(s[1])],
+            PngKind::Rgb8 => [n(s[0]), n(s[1]), n(s[2]), 255],
+            PngKind::Rgb16Trns => {
+                let [r, g, b, _] = self.samples(0, 0);
+                let a = if [s[0], s[1], s[2]] == [r, g, b] {
+                    0
+                } else {
+                    255
+                };
+                [q(s[0]), q(s[1]), q(s[2]), a]
+            }
+            PngKind::Rgba8 => [n(s[0]), n(s[1]), n(s[2]), n(s[3])],
+            PngKind::Rgba16 => [q(s[0]), q(s[1]), q(s[2]), q(s[3])],
+            PngKind::Indexed8Trns => {
+                let i = usize::from(s[0]);
+                let p = &self.palette;
+                let a = self.trns.get(i).copied().unwrap_or(255);
+                [p[3 * i], p[3 * i + 1], p[3 * i + 2], a]
+            }
+            PngKind::Grey1Trns => {
+                let g = n(s[0] * 255);
+                let a = if s[0] == u16::from(self.seed[0] & 1) {
+                    0
+                } else {
+                    255
+                };
+                [g, g, g, a]
+            }
+        }
+    }
+
+    /// One row's bytes as `png` takes them.
+    fn row(&self, y: u32, out: &mut Vec<u8>) {
+        out.clear();
+        if self.kind == PngKind::Grey1Trns {
+            for x0 in (0..self.w).step_by(8) {
+                let mut byte = 0;
+                for x in x0..(x0 + 8).min(self.w) {
+                    byte |= u8::try_from(self.samples(x, y)[0]).expect("a bit") << (7 - (x - x0));
+                }
+                out.push(byte);
+            }
+            return;
+        }
+        let (color, depth) = self.kind.format();
+        let channels = color.samples();
+        for x in 0..self.w {
+            let s = self.samples(x, y);
+            for &v in &s[..channels] {
+                if depth == png::BitDepth::Sixteen {
+                    out.extend_from_slice(&v.to_be_bytes());
+                } else {
+                    out.push(u8::try_from(v).expect("an 8-bit sample"));
+                }
+            }
+        }
+    }
+
+    /// The PNG, its CRCs correct unless the spec asks for a bad one.
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        let (color, depth) = self.kind.format();
+        let mut enc = png::Encoder::new(&mut out, self.w, self.h);
+        enc.set_color(color);
+        enc.set_depth(depth);
+        enc.set_compression(png::Compression::Fast);
+        enc.set_filter(png::Filter::Sub);
+        if color == png::ColorType::Indexed {
+            enc.set_palette(self.palette.as_slice());
+        }
+        if !self.trns.is_empty() {
+            enc.set_trns(self.trns.as_slice());
+        }
+        let mut header = enc.write_header().expect("a PNG header");
+        {
+            let mut stream = header.stream_writer().expect("a PNG stream");
+            let mut row = Vec::new();
+            for y in 0..self.h {
+                self.row(y, &mut row);
+                std::io::Write::write_all(&mut stream, &row).expect("a row");
+            }
+            stream.finish().expect("the image data");
+        }
+        if self.extra_idat {
+            header
+                .write_chunk(png::chunk::IDAT, &[])
+                .expect("an extra image data chunk");
+        }
+        if self.text {
+            header
+                .write_chunk(png::chunk::tEXt, b"k\0v")
+                .expect("a text chunk");
+        }
+        header.finish().expect("the end");
+        if self.text && self.bad_text {
+            // The text chunk's CRC: the 4 bytes before `IEND`'s 12.
+            let at = out.len() - 16;
+            out[at] ^= 1;
+        }
+        out
+    }
+
+    /// Whether the file passes the full-decode cap.
+    #[must_use]
+    pub fn banded(&self) -> bool {
+        u64::from(self.w) * u64::from(self.h) > skin_model::MAX_IMAGE_TEXELS
+    }
+}
+
+/// What `skin_png` saw.
+#[derive(Debug)]
+pub struct PngOutcome {
+    /// The file passes the full-decode cap.
+    pub banded: bool,
+    /// The first build: its cells checked against [`PngSpec::expected`].
+    pub built: Result<(), skin_model::AtlasError>,
+    /// The second build's cancel said yes, and it was cancelled.
+    pub cancelled: bool,
+}
+
+/// Every page's every level of `atlas`, in order.
+fn levels(atlas: &skin_model::Atlas) -> impl Iterator<Item = &[u8]> {
+    atlas
+        .pages()
+        .iter()
+        .flat_map(|p| (0..skin_model::MIP_LEVELS).filter_map(move |k| p.level(k)))
+}
+
+/// The variant of `e`, and of the image error inside it.
+fn variant(
+    e: &skin_model::AtlasError,
+) -> (
+    std::mem::Discriminant<skin_model::AtlasError>,
+    Option<std::mem::Discriminant<skin_model::ImageError>>,
+) {
+    let inner = match e {
+        skin_model::AtlasError::Image(i) => Some(std::mem::discriminant(i)),
+        _ => None,
+    };
+    (std::mem::discriminant(e), inner)
+}
+
+/// Target `skin_png`: a [`PngSpec`] read from the input, generated as a
+/// PNG with correct CRCs (a file past the full-decode cap decoded in
+/// bands), admitted to a temporary skin folder, and built into an atlas
+/// of four cells of at most 32×32: its corners and one the spec places.
+/// Every texel of every cell must be the expected colour premultiplied,
+/// computed on its own from the generated samples. A file with a bad CRC
+/// after its image data fails in bands and builds whole (outside the
+/// fuzzer: `png` checks no CRC under `cfg(fuzzing)`). The atlas is
+/// built again with a cancel that says yes from the ask the spec names:
+/// it is cancelled exactly when the cancel said yes, and otherwise gives
+/// the same pages, or an error of the same variant.
+///
+/// # Panics
+///
+/// If the file is not admitted, a texel differs, a build fails other than
+/// expected, or the second build disagrees with the cancel or the first.
+#[must_use]
+pub fn skin_png(data: &[u8]) -> PngOutcome {
+    use skin_model::{AtlasError, AtlasLimits, FileDef, Filter, ImageDef, Root, SheetBuilder};
+    const LIMITS: AtlasLimits = AtlasLimits {
+        max_side: 256,
+        max_layers: 8,
+        reserved_layers: 1,
+    };
+    let spec = PngSpec::read(data);
+    let dir = png_dir();
+    std::fs::write(dir.join("a.png"), spec.encode()).expect("write the image");
+    let root = Root::new(dir).expect("the image folder");
+    let mut b = SheetBuilder::new(&root);
+    let file = b
+        .admit_file(FileDef {
+            path: "a.png".into(),
+            hi: None,
+        })
+        .expect("a generated file is admitted");
+    let (w, h) = (spec.w, spec.h);
+    assert_eq!(b.file_dims(file), Some([w, h]), "the admitted size");
+    let (cw, ch) = (w.min(32), h.min(32));
+    let (px, py) = (
+        u32::from(spec.seed[0]) * 97 % (w - cw + 1),
+        u32::from(*spec.seed.last().expect("a seed")) * 89 % (h - ch + 1),
+    );
+    let rects = [
+        [0, 0, cw, ch],
+        [w - cw, h - ch, cw, ch],
+        [px, py, cw, ch],
+        [w - cw, 0, cw, ch],
+    ];
+    for rect in rects {
+        b.add_image(ImageDef {
+            file,
+            rect: Some(rect),
+            grid: [1, 1],
+            cycle: None,
+            filter: Filter::Linear,
+        })
+        .expect("a cell inside its file");
+    }
+    let sheet = b.finish();
+    let first = sheet.atlas(skin_model::Variant::Lo, LIMITS, &|| false);
+    // `png` skips its CRC checks when built for fuzzing (`cfg(fuzzing)`),
+    // so a bad CRC fails only outside the fuzzer, as in the smoke tests.
+    let fails = spec.banded() && spec.text && spec.bad_text && !cfg!(fuzzing);
+    match &first {
+        Ok(atlas) => {
+            assert!(!fails, "a bad CRC after the image data built in bands");
+            let side = usize::try_from(atlas.side()).expect("a side");
+            for (rect, f) in rects.iter().zip(atlas.uvs().frames()) {
+                let page = atlas.pages()[usize::from(f.layer) - 1]
+                    .level(0)
+                    .expect("level 0");
+                let to = |v: f32| (v * side as f32) as usize;
+                let (u, v) = (to(f.uv[0]), to(f.uv[1]));
+                let [x0, y0, cw, ch] = *rect;
+                for dy in 0..ch {
+                    for dx in 0..cw {
+                        let [r, g, b, a] = spec.expected(x0 + dx, y0 + dy);
+                        let pre = |c: u8| {
+                            u8::try_from((u16::from(c) * u16::from(a) + 127) / 255).expect("a byte")
+                        };
+                        let at = ((v + dy as usize) * side + u + dx as usize) * 4;
+                        assert!(
+                            page[at..at + 4] == [pre(r), pre(g), pre(b), a],
+                            "texel ({}, {}) of {:?}",
+                            x0 + dx,
+                            y0 + dy,
+                            spec.kind
+                        );
+                    }
+                }
+            }
+        }
+        Err(e) => assert!(
+            fails && matches!(e, AtlasError::Image(skin_model::ImageError::Png { .. })),
+            "the build failed: {e}"
+        ),
+    }
+    let asked = std::cell::Cell::new(0_u32);
+    let said = std::cell::Cell::new(false);
+    let cancel = || {
+        asked.set(asked.get() + 1);
+        let yes = spec.cancel_at != 0 && asked.get() >= u32::from(spec.cancel_at);
+        said.set(said.get() || yes);
+        yes
+    };
+    let again = sheet.atlas(skin_model::Variant::Lo, LIMITS, &cancel);
+    let cancelled = matches!(again, Err(AtlasError::Cancelled));
+    assert!(
+        cancelled == said.get(),
+        "cancelled {cancelled}, cancel said {}",
+        said.get()
+    );
+    if !cancelled {
+        match (&first, &again) {
+            (Ok(a), Ok(b)) => {
+                assert!(levels(a).eq(levels(b)), "a second build differs");
+            }
+            (Err(e), Err(f)) => assert!(variant(e) == variant(f), "{e:?} then {f:?}"),
+            (first, again) => panic!("a second build differs: {first:?} then {again:?}"),
+        }
+    }
+    PngOutcome {
+        banded: spec.banded(),
+        built: first.map(|_| ()),
+        cancelled,
+    }
 }
 
 /// Target `skin_fnt`: a bitmap `.fnt` file's bytes, parsed with one

@@ -6233,7 +6233,7 @@ pub(crate) mod tests {
             max_layers: 4,
             reserved_layers: 1,
         };
-        let atlas = skin.atlas(Variant::Lo, limits).unwrap();
+        let atlas = skin.atlas(Variant::Lo, limits, &|| false).unwrap();
         let clips = render::ClipTable::new(Vec::new()).unwrap();
         Arc::new(
             render::SkinBundle::new(Arc::new(skin), atlas, clips, skin_model::Side::Right).unwrap(),

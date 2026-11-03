@@ -80,8 +80,8 @@ mod widget;
 
 pub use atlas::uv::{FrameUv, UvTable};
 pub use atlas::{
-    ALIGN, Atlas, AtlasError, AtlasLimits, GUTTER, MAX_ATLAS_TEXELS, MAX_PAGE_SIDE, MAX_PAGES,
-    MIN_PAGE_SIDE, MIP_LEVELS, Page, Variant,
+    ALIGN, ATLAS_TABLE_BYTES, Atlas, AtlasError, AtlasLimits, CELL_TABLE_BYTES, FILE_TABLE_BYTES,
+    GUTTER, MAX_ATLAS_TEXELS, MAX_PAGE_SIDE, MAX_PAGES, MIN_PAGE_SIDE, MIP_LEVELS, Page, Variant,
 };
 pub use canvas::{Canvas, Fit, MAX_CANVAS};
 pub use expr::{
@@ -102,7 +102,8 @@ pub use image::path::{Entry, FileId, Listing, Root, RootError};
 pub use image::{
     CycleDef, FileAt, FileDef, HEADER_BYTES, ImageDef, ImageError, MAX_FILE_BYTES, MAX_FILES,
     MAX_IMAGE_FRAMES, MAX_IMAGE_TEXELS, MAX_IMAGES, MAX_PATH_BYTES, MAX_SIDE, MAX_SKIN_FRAMES,
-    MAX_TOTAL_FILE_BYTES, MAX_TOTAL_TEXELS, Sheet, SolidImageDef,
+    MAX_STREAMED_TEXELS, MAX_TOTAL_FILE_BYTES, MAX_TOTAL_TEXELS, Sheet, SolidImageDef, TexelCap,
+    Unbanded,
 };
 pub use layout::{
     Adjust, Anchor, Controls, LANE_WIDTH_PCT, Layout, LayoutError, MAX_INSET, MAX_OFFSET, Region,

@@ -30,6 +30,7 @@ pub fn all() -> Vec<(&'static str, Vec<Seed>)> {
         ("skin_json", skin_jsons()),
         ("skin_lua", skin_luas()),
         ("skin_fnt", skin_fnts()),
+        ("skin_png", skin_pngs()),
     ]
 }
 
@@ -1711,4 +1712,42 @@ fn configured_fails_entry() -> String {
         r#"{{"type": 0, "property": [{{"name": "m", "item": [{{"op": 901}}]}}, {includes},
         {{"if": 901, "values": {{"include": "none.json"}}}}]}}"#
     )
+}
+
+/// A `skin_png` input: format `kind` (an index into its formats), width
+/// bytes, height byte (its low bit for a file past the full-decode cap),
+/// the ask to cancel at, flags, then sample bytes.
+fn png_spec(kind: u8, width: u16, height: u8, cancel_at: u8, flags: u8) -> Vec<u8> {
+    let [lo, hi] = width.to_le_bytes();
+    let mut v = vec![kind, lo, hi, height, cancel_at, flags];
+    v.extend_from_slice(&[
+        3, 200, 17, 255, 0, 128, 129, 64, 1, 254, 77, 9, 33, 190, 5, 250,
+    ]);
+    v
+}
+
+/// `skin_png` seeds: each format small and decoded whole; files past the
+/// full-decode cap, decoded in bands, in narrow formats so each stays
+/// quick; a bad CRC after the image data, whole and in bands; an extra
+/// empty image data chunk; and builds cancelled at an early and a late
+/// ask.
+#[must_use]
+pub fn skin_pngs() -> Vec<Seed> {
+    vec![
+        ("grey8", png_spec(0, 61, 106, 0, 0)),
+        ("grey16", png_spec(1, 61, 106, 0, 0)),
+        ("grey_alpha8", png_spec(2, 61, 106, 0, 0)),
+        ("rgb8", png_spec(3, 61, 106, 0, 0)),
+        ("rgb16_trns", png_spec(4, 61, 106, 0, 0)),
+        ("rgba8", png_spec(5, 61, 106, 0, 0)),
+        ("rgba16", png_spec(6, 61, 106, 0, 0)),
+        ("indexed8_trns", png_spec(7, 61, 106, 0, 0)),
+        ("grey1_trns", png_spec(8, 61, 106, 0, 0)),
+        ("banded_grey1", png_spec(8, 3_328, 1, 0, 0)),
+        ("banded_indexed8", png_spec(7, 0, 3, 0, 5)),
+        ("bad_text", png_spec(5, 61, 106, 0, 3)),
+        ("banded_bad_text", png_spec(8, 3_328, 1, 0, 3)),
+        ("cancelled_early", png_spec(8, 3_328, 1, 1, 0)),
+        ("cancelled_late", png_spec(8, 3_328, 1, 190, 0)),
+    ]
 }

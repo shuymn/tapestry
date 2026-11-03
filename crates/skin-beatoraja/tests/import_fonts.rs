@@ -412,7 +412,11 @@ fn a_page_with_corrupt_pixels_fails_its_font_not_the_atlas() {
         max_layers: 8,
         reserved_layers: 1,
     };
-    assert!(i.skin.atlas(skin_model::Variant::Lo, limits).is_ok());
+    assert!(
+        i.skin
+            .atlas(skin_model::Variant::Lo, limits, &|| false)
+            .is_ok()
+    );
     assert_eq!(rects(i, "").len(), 1);
 }
 
