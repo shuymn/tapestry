@@ -8,13 +8,14 @@
 //! covers, and an offset-4 one painting SUDDEN+. The chart's stage file,
 //! back image and banner (100–102) and every other id are dropped.
 
-use skin_model::{CoverImage, Source};
+use skin_model::Source;
 
 use super::super::asset::SYSTEM_SIZE;
 use super::super::policy::Role;
 use super::super::report::{NoteKind, Object};
 use super::super::track::Stretch;
 use super::super::{Common, Cx, Dst, TimerWhy};
+use super::Painted;
 use super::image_choice::Lowered;
 use crate::error::ImportError;
 
@@ -44,7 +45,19 @@ impl Cx<'_> {
         let (charged, lowered) = self.lowered(&dst)?;
         let role = lowered.role();
         if lowered == Lowered::Paint {
-            return self.system_paint(&dst, role, color);
+            // SUDDEN+'s paint, made as an image record's is; under stretch
+            // 5 a 1x1 frame's rect.
+            return self.cover_paint_with(dst, role, None, |cx, c, dst| {
+                cx.paint_rects(
+                    c,
+                    dst,
+                    |cx| {
+                        let r = cx.solid_cover_rect(c)?;
+                        Ok(cx.add_system(c, color)?.map(|i| (i, r)))
+                    },
+                    |cx| cx.system_rects(c, color),
+                )
+            });
         }
         if Stretch::of(dst.stretch) == Stretch::Trimmed {
             return self.drop_el(role, at, NoteKind::Stretch(dst.stretch));
@@ -52,49 +65,25 @@ impl Cx<'_> {
         let Some(c) = self.image_common(&dst, charged, role)? else {
             return Ok(());
         };
-        let Some(image) = self.add_system(&c, color)? else {
+        let Some((image, rects, native)) = self.system_rects(&c, color)? else {
             return Ok(());
-        };
-        let Some((rects, native)) = self.baked_rects(&c, SYSTEM_SIZE)? else {
-            return self.drop_el(c.role, c.span, NoteKind::Stretch(c.stretch_mode));
         };
         let t = self.model_track(&c, &rects)?;
         self.push_native(c, Source::Image(image), t, native)
     }
 
-    /// SUDDEN+'s paint of system colour `color`, as an image record's
-    /// paint is made ([`Self::cover_paint_image`]); stretch 5 keeps the
-    /// destination or fits it to its width as it would a 1×1 frame, its
-    /// cropped rows the same colour.
-    fn system_paint(&mut self, dst: &Dst, role: Role, color: [u8; 4]) -> Result<(), ImportError> {
-        let Some(c) = self.image_common(dst, true, role)? else {
-            return Ok(());
+    /// The system image of `color` for `c` and `c`'s keys baked against
+    /// its 1x1 cell, as [`Self::src_image_rects`] gives an image record's.
+    /// `None` once `c` is dropped.
+    fn system_rects(&mut self, c: &Common, color: [u8; 4]) -> Result<Option<Painted>, ImportError> {
+        let Some(image) = self.add_system(c, color)? else {
+            return Ok(None);
         };
-        let at = c.span;
-        let (image, rects, native) = if dst.stretch == 5 {
-            if !c.track.identical() {
-                return self.drop_el(c.role, at, NoteKind::Stretch(c.stretch_mode));
-            }
-            let r = self.solid_cover_rect(&c)?;
-            let Some(image) = self.add_system(&c, color)? else {
-                return Ok(());
-            };
-            let rect = r.model().ok_or_else(|| self.range(at, "dst"))?;
-            (image, vec![rect; c.track.keys.len()], None)
-        } else {
-            if c.stretch == Stretch::Trimmed {
-                return self.drop_el(c.role, at, NoteKind::Stretch(c.stretch_mode));
-            }
-            let Some(image) = self.add_system(&c, color)? else {
-                return Ok(());
-            };
-            let Some((rects, native)) = self.baked_rects(&c, SYSTEM_SIZE)? else {
-                return self.drop_el(c.role, at, NoteKind::Stretch(c.stretch_mode));
-            };
-            (image, rects, native)
+        let Some((rects, native)) = self.baked_rects(c, SYSTEM_SIZE)? else {
+            self.drop_el(c.role, c.span, NoteKind::Stretch(c.stretch_mode))?;
+            return Ok(None);
         };
-        let t = self.model_track(&c, &rects)?;
-        self.push_paint(c, CoverImage::Image(image), None, t, native)
+        Ok(Some((image, rects, native)))
     }
 
     /// The system image of `color` for `c`, sampled with `c`'s filter:
