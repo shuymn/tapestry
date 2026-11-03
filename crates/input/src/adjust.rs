@@ -970,6 +970,11 @@ impl AdjustmentTap {
                         self.send(at, TapEvent::Lost);
                     }
                     let verified = self.focused && !self.unverified;
+                    // The window's keys as the window holds them now: a
+                    // made-up release while focus was away shows only there.
+                    if let Some((keys, _)) = &self.window {
+                        self.window_held = keys.shared.held.load(Ordering::Acquire);
+                    }
                     let held = self.held_set();
                     self.send(at, TapEvent::Resync { held, verified });
                 }

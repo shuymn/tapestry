@@ -531,3 +531,34 @@ fn synthetic_window_keys_change_only_the_held_keys() {
         0
     );
 }
+
+#[test]
+fn a_recovery_takes_the_window_keys_as_the_window_holds_them() {
+    let (mut set, mut rx, focus) = rig();
+    let (mut keys, receiver) = window_keys();
+    set.adjustment_mut()
+        .unwrap()
+        .set_window_keys(receiver, [Some(SLOWER), Some(FASTER)]);
+    batch(&mut set, 10, &[]);
+    keys.key(1, WindowKeyEvent::Press, false);
+    set.tick_presentation(TimeUs(20));
+    assert!(drain(&mut rx).contains(&TapEvent::Press(FASTER)));
+    // Focus goes; the window makes up F2's release; F2 is released away.
+    focus.set(false);
+    keys.key(1, WindowKeyEvent::Release, true);
+    set.tick_presentation(TimeUs(30));
+    focus.set(true);
+    set.tick_presentation(TimeUs(40));
+    let back = drain(&mut rx);
+    assert!(
+        back.contains(&TapEvent::Resync {
+            held: 0,
+            verified: true
+        }),
+        "{back:?}"
+    );
+    // The first fresh press acts.
+    keys.key(1, WindowKeyEvent::Press, false);
+    set.tick_presentation(TimeUs(50));
+    assert!(drain(&mut rx).contains(&TapEvent::Press(FASTER)));
+}
