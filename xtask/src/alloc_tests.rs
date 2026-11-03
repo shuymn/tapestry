@@ -11,8 +11,9 @@
 //! crate's guard may have a step of its own on a Windows job (render's).
 //!
 //! The workflow is read line by line, enough for its own form: the list
-//! items with a `name:` and a `run:` (inline or a `|` / `>` block), with a
-//! trailing `\` joining lines. It is not a YAML parser.
+//! items with a `name:` and a `run:` (inline or a `|` block; a folded `>`
+//! block is refused), with a trailing `\` joining lines, comments dropped
+//! and the shell text split into commands. It is not a YAML parser.
 
 use std::path::Path;
 
@@ -84,7 +85,7 @@ pub fn is_guard(test: &str) -> bool {
 /// The diagnostics for `guards` against the workflow's text: one per guard
 /// that runs in no release step, naming the guard and the step.
 pub fn check(guards: &[Guard], workflow: &str) -> anyhow::Result<Vec<String>> {
-    let steps = steps(workflow);
+    let steps = steps(workflow)?;
     if !steps.iter().any(|s| s.name == ALLOC_STEP) {
         bail!("{WORKFLOW} has no step named `{ALLOC_STEP}`");
     }
@@ -130,7 +131,7 @@ pub fn check(guards: &[Guard], workflow: &str) -> anyhow::Result<Vec<String>> {
 }
 
 /// The steps of a workflow that have a `run:` command, in order.
-pub fn steps(workflow: &str) -> Vec<Step> {
+pub fn steps(workflow: &str) -> anyhow::Result<Vec<Step>> {
     struct Item {
         key_indent: usize,
         name: Option<String>,
@@ -196,6 +197,13 @@ pub fn steps(workflow: &str) -> Vec<Step> {
         let is_run = key == "run" && own.is_some();
         match (key, own) {
             ("name", Some(i)) => i.name = Some(unquote(value).to_owned()),
+            // Folding would join the command's lines; refused rather than
+            // read differently from the shell.
+            ("run", Some(i)) if value.starts_with('>') => bail!(
+                "{WORKFLOW}: step `{}` has a folded `run: >`, which this check does not \
+                 read; use `run: |`",
+                i.name.as_deref().unwrap_or("(unnamed)")
+            ),
             ("run", Some(i)) if is_block => i.run = Some(String::new()),
             ("run", Some(i)) => i.run = Some(format!("{}\n", unquote(value))),
             _ => {}
@@ -205,7 +213,7 @@ pub fn steps(workflow: &str) -> Vec<Step> {
         }
     }
     finish(item, &mut out);
-    out
+    Ok(out)
 }
 
 fn unquote(value: &str) -> &str {
@@ -218,51 +226,65 @@ fn unquote(value: &str) -> &str {
 }
 
 /// The `cargo test --release` commands of a step's shell text, with their
-/// `-p` and `--test` lists (up to `--` or the end of the command).
+/// `-p` and `--test` lists. Comments are dropped and the text is split
+/// into commands at line ends, `;`, `&` and `|` (so `&&` and `||` too),
+/// so one command's flags never join another's; a command that only
+/// builds (`--no-run`) or lists (`--list` after `--`) runs nothing.
 fn release_tests(run: &str) -> Vec<ReleaseTest> {
-    let joined = run.replace("\\\n", " ");
-    let mut out = Vec::new();
-    for line in joined.lines() {
-        let tokens: Vec<&str> = line.split_whitespace().collect();
-        let mut i = 0;
-        while let Some(&token) = tokens.get(i) {
-            i += 1;
-            if token != "cargo" || tokens.get(i) != Some(&"test") {
-                continue;
+    run.replace("\\\n", " ")
+        .lines()
+        .flat_map(|line| without_comment(line).split([';', '&', '|']))
+        .filter_map(|command| release_test(&command.split_whitespace().collect::<Vec<_>>()))
+        .collect()
+}
+
+/// `line` up to a `#` that starts a word.
+fn without_comment(line: &str) -> &str {
+    let mut previous = ' ';
+    for (at, c) in line.char_indices() {
+        if c == '#' && previous.is_whitespace() {
+            return &line[..at];
+        }
+        previous = c;
+    }
+    line
+}
+
+/// One command's `cargo test --release` lists, if it is one that runs.
+fn release_test(tokens: &[&str]) -> Option<ReleaseTest> {
+    let start = tokens.windows(2).position(|w| w == ["cargo", "test"])? + 2;
+    let mut command = ReleaseTest::default();
+    let mut release = false;
+    let mut args = tokens.iter().skip(start).copied();
+    while let Some(arg) = args.next() {
+        let mut value = |flag: &str, short: Option<&str>| {
+            if arg == flag || short == Some(arg) {
+                args.next().map(str::to_owned)
+            } else {
+                arg.strip_prefix(flag)
+                    .and_then(|v| v.strip_prefix('='))
+                    .map(str::to_owned)
             }
-            i += 1;
-            let mut command = ReleaseTest::default();
-            let mut release = false;
-            while let Some(&arg) = tokens.get(i) {
-                if matches!(arg, "--" | "&&" | "||" | ";" | "|") {
-                    break;
+        };
+        match arg {
+            "--" => {
+                if args.any(|a| a == "--list") {
+                    return None;
                 }
-                i += 1;
-                let mut value = |flag: &str, short: Option<&str>| {
-                    if arg == flag || short == Some(arg) {
-                        let v = tokens.get(i).map(|v| (*v).to_owned());
-                        i += 1;
-                        v
-                    } else {
-                        arg.strip_prefix(flag)
-                            .and_then(|v| v.strip_prefix('='))
-                            .map(str::to_owned)
-                    }
-                };
-                if arg == "--release" {
-                    release = true;
-                } else if let Some(p) = value("--package", Some("-p")) {
+                break;
+            }
+            "--release" => release = true,
+            "--no-run" => return None,
+            _ => {
+                if let Some(p) = value("--package", Some("-p")) {
                     command.packages.push(p);
                 } else if let Some(t) = value("--test", None) {
                     command.tests.push(t);
                 }
             }
-            if release {
-                out.push(command);
-            }
         }
     }
-    out
+    release.then_some(command)
 }
 
 #[cfg(test)]
@@ -331,7 +353,7 @@ jobs:
 
     #[test]
     fn steps_are_read_with_their_commands() {
-        let steps = steps(&workflow("--test alloc"));
+        let steps = steps(&workflow("--test alloc")).unwrap();
         let names: Vec<&str> = steps.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(
             names,
@@ -397,6 +419,81 @@ jobs:
                  the `--test` list of `{ALLOC_STEP}` in {WORKFLOW} without `-p audio`: add \
                  `-p audio` to `{ALLOC_STEP}`"
             )]
+        );
+    }
+
+    /// The fixture workflow with `tempo_alloc` left out of [`ALLOC_STEP`]
+    /// and a step `Extra` whose block command is `lines`.
+    fn with_extra(lines: &[&str]) -> String {
+        let mut text = workflow("--test alloc");
+        text.push_str("      - name: Extra\n        run: |\n");
+        for line in lines {
+            text.push_str("          ");
+            text.push_str(line);
+            text.push('\n');
+        }
+        text
+    }
+
+    fn missing_tempo_alloc() -> String {
+        format!(
+            "allocation guard `tempo_alloc` (crates/game/tests/tempo_alloc.rs) runs in no \
+             release step of {WORKFLOW}: add `--test tempo_alloc` and `-p game` to \
+             `{ALLOC_STEP}`"
+        )
+    }
+
+    #[test]
+    fn a_release_command_elsewhere_in_a_step_counts() {
+        let text = with_extra(&[
+            "cargo test --locked -p eval &&",
+            "  cargo test --release --locked -p game --test tempo_alloc || exit 1",
+        ]);
+        assert_eq!(check(&guards(), &text).unwrap(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn commands_that_run_no_release_test_do_not_count() {
+        for lines in [
+            // Commented out.
+            &["# cargo test --release --locked -p game --test tempo_alloc"][..],
+            // A dev command with a comment that names the flag.
+            &["cargo test --locked -p game --test tempo_alloc # --release"],
+            // A dev command whose flags must not join the next command's.
+            &["cargo test -p game --test tempo_alloc --locked; cargo test --release -p eval"],
+            &["cargo test -p game --test tempo_alloc|tee log; cargo test --release -p eval"],
+            // Built only, or listed.
+            &["cargo test --release --locked -p game --test tempo_alloc --no-run"],
+            &["cargo test --release --locked -p game --test tempo_alloc -- --list"],
+        ] {
+            let diags = check(&guards(), &with_extra(lines)).unwrap();
+            assert_eq!(diags, [missing_tempo_alloc()], "{lines:?}");
+        }
+    }
+
+    #[test]
+    fn a_package_and_a_test_from_different_steps_do_not_count() {
+        let text = with_extra(&["cargo test --release --locked -p eval --test tempo_alloc"]);
+        assert_eq!(
+            check(&guards(), &text).unwrap(),
+            [format!(
+                "allocation guard `tempo_alloc` (crates/game/tests/tempo_alloc.rs) is in the \
+                 `--test` list of `Extra` in {WORKFLOW} without `-p game`: add `-p game` to \
+                 `{ALLOC_STEP}`"
+            )]
+        );
+    }
+
+    #[test]
+    fn a_folded_run_is_refused() {
+        let text = workflow("--test alloc").replace("run: |", "run: >");
+        let e = check(&guards(), &text).unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            format!(
+                "{WORKFLOW}: step `{ALLOC_STEP}` has a folded `run: >`, which this check does \
+                 not read; use `run: |`"
+            )
         );
     }
 
