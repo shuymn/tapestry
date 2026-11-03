@@ -33,9 +33,9 @@ use skin_model::{
     ComboPart, CoverImage, CoverMotion, CoverPaintDef, CoverSettings, CoverTrim, CycleDef,
     DigitOffset, DigitsDef, DurationRatio, Ease, ElementDef, End, Fill, Filter, Fit, Follow,
     FrameReadouts, GaugeDef, GaugeDesc, GaugeLook, GaugeParts, GlyphSet, GradePart, ImageDef,
-    JudgeDef, JudgeSlot, KeyDef, LaneParts, LaneTimer, LaneView, Layout as SkinLayout, Motion,
-    Native, NumberDef, Pad, Place, Play, PlayContext, QuadBatch, Region, RegionDef, Sheet, Side,
-    Skin, SkinDef, SkinFrame, Source, TimerRef, Track, UvTable, Variant, field, lane_timer, timer,
+    JudgeDef, JudgeSlot, KeyDef, LaneParts, LaneView, Layout as SkinLayout, Motion, Native,
+    NumberDef, Pad, Place, Play, PlayContext, QuadBatch, Region, RegionDef, Sheet, Side, Skin,
+    SkinDef, SkinFrame, Source, TimerRef, Track, UvTable, Variant, field, timer,
 };
 use skin_model::{
     ChartText, FontRef, FrameUv, LoadState, LoadingFrame, LoadingGauge, Overflow, TextDef,
@@ -1548,6 +1548,16 @@ fn stretch(
         let target_no = (frame_no / 5) % TARGETS.len();
         let layout_no = (frame_no / 37) % views.layouts.len();
         let view = views.lanes[(frame_no / 23) % views.lanes.len()];
+        // Lane input changing under the frames: every key pressed and
+        // released in turn, so key-on and key-off both run.
+        let mut input = eval::InputFacts::NONE;
+        for lane in bms_model::Lane::all() {
+            let at = TimeUs(now - i64::try_from(lane.index()).unwrap() * 7_000);
+            input.press(lane, at);
+            if (frame_no + lane.index()).is_multiple_of(3) {
+                input.release(lane, at);
+            }
+        }
         let frame = SkinFrame {
             now: TimeUs(now),
             display_offset: offset,
@@ -1556,6 +1566,7 @@ fn stretch(
             gauge: shown,
             effects: drain,
             notes,
+            input: &input,
             complete: now > last,
             target: TARGETS[target_no],
             layout: &views.layouts[layout_no],
@@ -1803,16 +1814,8 @@ fn build_does_not_allocate() {
     // The beam follows the scratch: authored at 152 on the left, 600 with
     // the scratch on the right (tests/lanes.rs).
     assert_eq!(beams, [152.0, 600.0, 152.0]);
-    // Every fed built-in timer turned on, and an element on it was drawn,
-    // in some attempt; lane input is not fed yet.
-    for lane in 0..8 {
-        for kind in [LaneTimer::Press, LaneTimer::Release] {
-            let slot = usize::from(lane_timer(kind, Lane::new(lane).unwrap()));
-            assert!(!seen.on[slot] && !seen.drawn[slot], "slot {slot}");
-            seen.on[slot] = true;
-            seen.drawn[slot] = true;
-        }
-    }
+    // Every built-in timer turned on, and an element on it was drawn, in
+    // some attempt: the lanes' key-on and key-off from the fed input.
     // `loading` runs only in the loading runtime, which draws an element
     // on it in `loading_does_not_allocate`.
     let slot = usize::from(timer::LOADING);
@@ -1854,6 +1857,7 @@ fn build_does_not_allocate() {
         gauge: 0,
         effects: &[],
         notes: &notes,
+        input: &eval::InputFacts::NONE,
         complete: false,
         target: TARGETS[0],
         layout: &views.layouts[0],
@@ -1928,6 +1932,7 @@ fn build_does_not_allocate() {
             gauge: 0,
             effects: &[],
             notes: &notes,
+            input: &eval::InputFacts::NONE,
             complete: false,
             target: TARGETS[0],
             layout: &views.layouts[0],
@@ -2227,6 +2232,7 @@ fn source_lanes_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
             gauge: 0,
             effects: &[],
             notes: &notes,
+            input: &eval::InputFacts::NONE,
             complete: false,
             target: TARGETS[i % TARGETS.len()],
             layout: &layout,
@@ -2337,6 +2343,7 @@ fn fallback_lanes_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
                 gauge: 0,
                 effects: drain,
                 notes: &notes,
+                input: &eval::InputFacts::NONE,
                 complete: false,
                 target: TARGETS[i % TARGETS.len()],
                 layout: &layout,
@@ -2374,6 +2381,7 @@ fn fallback_lanes_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
                 gauge: 0,
                 effects: &[],
                 notes: &notes,
+                input: &eval::InputFacts::NONE,
                 complete: false,
                 target: TARGETS[0],
                 layout: &layout,
@@ -2518,6 +2526,7 @@ fn timeline_lanes_do_not_allocate(full: &PlayContext<'_>) {
                     gauge: 0,
                     effects: drain,
                     notes: &notes,
+                    input: &eval::InputFacts::NONE,
                     complete: false,
                     target: TARGETS[i % TARGETS.len()],
                     layout: &layout,
@@ -2560,6 +2569,7 @@ fn timeline_lanes_do_not_allocate(full: &PlayContext<'_>) {
                         gauge: 0,
                         effects: &[],
                         notes: &notes,
+                        input: &eval::InputFacts::NONE,
                         complete: false,
                         target: TARGETS[0],
                         layout: &layout,
@@ -2593,6 +2603,7 @@ fn timeline_lanes_do_not_allocate(full: &PlayContext<'_>) {
                     gauge: 0,
                     effects: &[],
                     notes: &notes,
+                    input: &eval::InputFacts::NONE,
                     complete: false,
                     target: TARGETS[0],
                     layout: &layout,
@@ -2814,6 +2825,7 @@ fn cover_trims_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
             gauge: 0,
             effects: &[],
             notes: &notes,
+            input: &eval::InputFacts::NONE,
             complete: false,
             target: TARGETS[i / 5 % TARGETS.len()],
             layout: &layout,
@@ -2868,6 +2880,7 @@ fn cover_trims_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
             gauge: 0,
             effects: &[],
             notes: &notes,
+            input: &eval::InputFacts::NONE,
             complete: false,
             target: TARGETS[0],
             layout: &layout,
@@ -2997,6 +3010,7 @@ fn bar_groups_do_not_allocate(ctx: &PlayContext<'_>) {
         gauge: 0,
         effects: &[],
         notes: &notes,
+        input: &eval::InputFacts::NONE,
         complete: false,
         target,
         layout: &layout,
@@ -3252,6 +3266,7 @@ fn grade_attachments_do_not_allocate(ctx: &PlayContext<'_>) {
             gauge: 0,
             effects: if now == 1_008 * MS { &effects } else { &[] },
             notes: &notes,
+            input: &eval::InputFacts::NONE,
             complete: false,
             target,
             layout: &layout,
@@ -3401,6 +3416,7 @@ fn large_gauges_do_not_allocate(ctx: &PlayContext<'_>, views: &Views, descs: &[G
                 gauge: (no / 16) % 2,
                 effects: &[],
                 notes: &notes,
+                input: &eval::InputFacts::NONE,
                 complete: false,
                 target: TARGETS[no % TARGETS.len()],
                 layout: &views.layouts[(no / 11) % views.layouts.len()],
@@ -3533,6 +3549,7 @@ fn readouts_do_not_allocate(loaded: &Loaded, descs: &[GaugeDesc]) {
         gauge: 0,
         effects: &[],
         notes: &notes,
+        input: &eval::InputFacts::NONE,
         complete: false,
         target: TARGETS[0],
         layout: &SkinLayout::AUTHOR,

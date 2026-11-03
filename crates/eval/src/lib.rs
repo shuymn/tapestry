@@ -72,4 +72,4 @@ pub use input::{
     Section, SourceId, SourceProfile, evaluation_time, window_inputs,
 };
 pub use merge::{Published, SourceState, StageError, Staged, merge, watermark};
-pub use notes::{NoteFacts, NoteHold};
+pub use notes::{InputFacts, LaneInput, NoteFacts, NoteHold};

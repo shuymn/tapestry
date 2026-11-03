@@ -20,7 +20,7 @@ use crate::gauge::{Cause, GaugeState, Gauges};
 use crate::input::{
     ControlId, DeviceProfile, InputStart, PhysicalInputEvent, Section, SourceId, evaluation_time,
 };
-use crate::notes::{NoteFacts, NoteHold};
+use crate::notes::{InputFacts, NoteFacts, NoteHold};
 
 /// The bytes of one event of the evaluator's output.
 pub const EVENT_BYTES: usize = size_of::<JudgeEvent>();
@@ -436,6 +436,8 @@ pub struct Evaluator<'a> {
     tally: Tally,
     /// Each note's state and each lane's visual hold, for drawing.
     notes: NoteFacts,
+    /// Each lane's input as conversion left it, for drawing.
+    input: InputFacts,
 }
 
 /// Why [`Evaluator::push_input`] refused an input. The evaluator is left
@@ -637,13 +639,16 @@ impl<'a> Evaluator<'a> {
                 .total_milli
                 .unwrap_or_else(|| rule.default_total.milli(notes)),
         };
+        let conversion = ConversionState::init(device, start)?;
+        let mut input = InputFacts::NONE;
+        input.open(|l| conversion.is_held(l));
         Ok(Self {
             chart,
             rule,
             device,
             tables,
             lanes,
-            conversion: ConversionState::init(device, start)?,
+            conversion,
             inputs: VecDeque::with_capacity(input_capacity),
             input_capacity,
             finalized: None,
@@ -659,6 +664,7 @@ impl<'a> Evaluator<'a> {
             seq: 0,
             tally: Tally::new(),
             notes: NoteFacts::new(chart),
+            input,
         })
     }
 
@@ -695,6 +701,8 @@ impl<'a> Evaluator<'a> {
             lane.next = 0;
         }
         self.conversion.reset(start);
+        let conversion = &self.conversion;
+        self.input.open(|l| conversion.is_held(l));
         self.inputs.clear();
         self.finalized = None;
         self.ended = false;
@@ -710,6 +718,16 @@ impl<'a> Evaluator<'a> {
     #[must_use]
     pub const fn notes(&self) -> &NoteFacts {
         &self.notes
+    }
+
+    /// Each lane's input as conversion left it as of the last advance:
+    /// every press and release edge conversion returned, judged or not
+    /// (section input outside its window and scratch release deadlines
+    /// included), and the lanes the opening holds as held without a press.
+    /// A [`reset`](Self::reset) starts it over from the new opening.
+    #[must_use]
+    pub const fn input(&self) -> &InputFacts {
+        &self.input
     }
 
     /// Every gauge's state, in the preset's order.
@@ -888,7 +906,10 @@ impl<'a> Evaluator<'a> {
                 .filter(|&t| t <= watermark);
             let deadline = self.next_deadline().filter(|(d, _)| d.time <= watermark);
             match (input, deadline) {
-                (None, None) => return Ok(()),
+                (None, None) => {
+                    self.input.convert_to(watermark);
+                    return Ok(());
+                }
                 (Some(t), Some((d, lane))) => {
                     let deadline_first = match self.rule.same_time_order {
                         SameTimeOrder::InputsFirst => d.time < t,
@@ -948,6 +969,7 @@ impl<'a> Evaluator<'a> {
             }
             DeadlineKind::ScratchRelease => {
                 if let Some(LaneEdge::Release(lane)) = self.conversion.release_due(d.index) {
+                    self.input.release(lane, d.time);
                     self.release(lane.index(), d.time, None, out);
                 }
                 return;
@@ -1028,6 +1050,14 @@ impl<'a> Evaluator<'a> {
             return;
         };
         let edges = self.conversion.apply(&ev, t);
+        // Every edge, judged or not, in its order: a reversal's release
+        // then its press, at one time.
+        for &edge in edges.as_slice() {
+            match edge {
+                LaneEdge::Press(lane) => self.input.press(lane, t),
+                LaneEdge::Release(lane) => self.input.release(lane, t),
+            }
+        }
         let acceptance = self.acceptance(t);
         if acceptance == Acceptance::ConversionOnly {
             return;

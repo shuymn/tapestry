@@ -1,6 +1,7 @@
 //! What a play has decided about each note so far, for drawing: the note
 //! facts the evaluator keeps beside its judgments (design.md "Rendering
-//! and Skins", the note snapshot).
+//! and Skins", the note snapshot), and each lane's input as conversion
+//! left it.
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
@@ -156,6 +157,91 @@ impl NoteFacts {
             return None;
         }
         self.starts.get(l)?.checked_add(note / 64)
+    }
+}
+
+/// One lane's input as conversion left it: whether a control holds it
+/// now, and the evaluation times of its latest press and release edges
+/// (receive time less the source's input offset). A lane held at the
+/// play's opening is held with no press: the opening has no edge.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LaneInput {
+    /// Whether some control holds the lane.
+    pub held: bool,
+    /// The latest press edge.
+    pub pressed: Option<TimeUs>,
+    /// The latest release edge.
+    pub released: Option<TimeUs>,
+}
+
+/// Every lane's input ([`LaneInput`]) and how far conversion took it:
+/// filled from each edge the conversion returns, judged or not, scratch
+/// release deadlines included. A reversal's release and press come at one
+/// time, so `held` tells which came last. It depends only on the input
+/// and the device profile.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct InputFacts {
+    lanes: [LaneInput; LANE_COUNT],
+    /// The evaluation time conversion has processed input through; `None`
+    /// before the first advance.
+    converted: Option<TimeUs>,
+}
+
+impl InputFacts {
+    /// No lane held and no edge: the facts of a play without input.
+    pub const NONE: Self = Self {
+        lanes: [LaneInput {
+            held: false,
+            pressed: None,
+            released: None,
+        }; LANE_COUNT],
+        converted: None,
+    };
+
+    /// `lane`'s input.
+    #[must_use]
+    pub fn lane(&self, lane: Lane) -> LaneInput {
+        self.lanes.get(lane.index()).copied().unwrap_or_default()
+    }
+
+    /// The evaluation time conversion has processed input through.
+    #[must_use]
+    pub const fn converted(&self) -> Option<TimeUs> {
+        self.converted
+    }
+
+    /// The opening's state, in place: each lane held as `held` says, with
+    /// no edge and nothing converted.
+    pub(crate) fn open(&mut self, held: impl Fn(Lane) -> bool) {
+        for (l, slot) in Lane::all().zip(&mut self.lanes) {
+            *slot = LaneInput {
+                held: held(l),
+                pressed: None,
+                released: None,
+            };
+        }
+        self.converted = None;
+    }
+
+    /// A press edge of `lane` at `at`.
+    pub fn press(&mut self, lane: Lane, at: TimeUs) {
+        if let Some(slot) = self.lanes.get_mut(lane.index()) {
+            slot.held = true;
+            slot.pressed = Some(at);
+        }
+    }
+
+    /// A release edge of `lane` at `at`.
+    pub fn release(&mut self, lane: Lane, at: TimeUs) {
+        if let Some(slot) = self.lanes.get_mut(lane.index()) {
+            slot.held = false;
+            slot.released = Some(at);
+        }
+    }
+
+    /// Conversion has processed input through `at`.
+    pub const fn convert_to(&mut self, at: TimeUs) {
+        self.converted = Some(at);
     }
 }
 

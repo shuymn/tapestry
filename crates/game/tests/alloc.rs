@@ -165,6 +165,17 @@ fn logic_does_not_allocate_during_play() {
 
     assert_eq!(outcome, RunOutcome::Complete);
     assert_eq!(runner.record().events.len(), 202 + 2 * 2_000);
+    // The published views carried the lane input through the tracked
+    // region: the scratch's last press and release, autoplay's, at their
+    // evaluation times.
+    assert_eq!(
+        runner.view().input.lane(lane(0)),
+        eval::LaneInput {
+            held: false,
+            pressed: Some(TimeUs(10_000 * MS)),
+            released: Some(TimeUs(10_050 * MS)),
+        }
+    );
     let stream = runner.stream();
     assert_eq!(count_judged(stream, Judgment::Perfect), 101);
     let empty = stream

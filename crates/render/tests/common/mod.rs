@@ -139,6 +139,7 @@ pub fn view(combo: u32, ex_score: u32) -> PlayView {
             failed_at: None,
         }],
         notes: NoteFacts::default(),
+        input: eval::InputFacts::NONE,
         complete: false,
         playing: true,
         events: 31,
