@@ -7,7 +7,7 @@ mod common;
 
 use skin_beatoraja::limits::{MAX_FILE_BYTES, MAX_INCLUDE_DEPTH, MAX_INCLUDE_PARSES, MAX_NODES};
 use skin_beatoraja::lua::HOST_APIS;
-use skin_beatoraja::lua::limits::{MAX_HOST_CALLS, MAX_INSTRUCTIONS};
+use skin_beatoraja::lua::limits::{MAX_HOST_CALLS, MAX_INSTRUCTIONS, MAX_PASS_TIME};
 use skin_beatoraja::{
     Cancel, Config, ImportError, InputLimit, LuaHeader, LuaImported, LuaLimit, LuaWhy, NoteKind,
     OffsetValue, read_lua_header,
@@ -697,6 +697,27 @@ fn import_within_a_minute(d: TempDir) -> Result<LuaImported, ImportError> {
     });
     rx.recv_timeout(std::time::Duration::from_secs(60))
         .expect("the import ran past a minute")
+}
+
+#[test]
+fn a_pass_is_refused_once_it_runs_past_its_time() {
+    // Each comparison or concatenation is one instruction over 16 MiB:
+    // the instruction cap would take hours to stop it, the deadline stops
+    // it within a step of its limit.
+    for body in [
+        "local s, t = rep(\"x\", 1 << 24), rep(\"x\", 1 << 24)\nlocal n = 0\n\
+         while true do if s == t then n = n + 1 end end",
+        "local s = rep(\"x\", 1 << 24)\nwhile true do local u = s .. \"y\" end",
+    ] {
+        let start = std::time::Instant::now();
+        let r = import_within_a_minute(configured(body));
+        let took = start.elapsed();
+        assert_eq!(why(r), LuaWhy::Limit(LuaLimit::Time), "{body}");
+        assert!(
+            took >= MAX_PASS_TIME && took < MAX_PASS_TIME + std::time::Duration::from_secs(10),
+            "{body}: {took:?}"
+        );
+    }
 }
 
 #[test]

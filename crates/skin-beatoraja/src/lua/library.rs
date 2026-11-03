@@ -67,10 +67,10 @@
 //! | host: `skin_config.get_path` | a string of at most 1 024 bytes, checked in Lua and again before it is copied | a substitution, O(path) | the result at most 1 024 bytes, else nil | no |
 //! | host: the pinned module APIs | any | O(1): the fault | fatal | no |
 //! | the strings' `__index` | a key | a raw lookup in the library's `string` table | none needed | no |
-//! | VM: `..` | strings, numbers | O(result) a concatenation | each result at most VM memory; not charged, so cumulative work is bounded only by instructions × VM memory | no |
-//! | VM: `<`, `<=`, `==` on long strings | strings | O(length) a comparison | as `..` | no |
-//! | VM: a numeral string in a bitwise operation or a `for` bound | strings | O(length) a numeral read (`luaV_tointegerns`, `luaV_tonumber_`) | as `..` | no |
-//! | VM: a table constructor or call with many values | values on the stack | O(n) copies | n at most the stack, as `..` | no |
+//! | VM: `..` | strings, numbers | O(result) a concatenation | each instruction at most O(VM memory), at most [`INSTRUCTION_STEP`](super::limits::INSTRUCTION_STEP) (100) instructions between checks, all of them within [`MAX_PASS_TIME`](super::limits::MAX_PASS_TIME) and [`MAX_INSTRUCTIONS`](super::limits::MAX_INSTRUCTIONS) | no |
+//! | VM: `<`, `<=`, `==` on long strings | strings | O(length) a comparison | each instruction at most O(VM memory), at most [`INSTRUCTION_STEP`](super::limits::INSTRUCTION_STEP) (100) instructions between checks, all of them within [`MAX_PASS_TIME`](super::limits::MAX_PASS_TIME) and [`MAX_INSTRUCTIONS`](super::limits::MAX_INSTRUCTIONS) | no |
+//! | VM: a numeral string in a bitwise operation or a `for` bound | strings | O(length) a numeral read (`luaV_tointegerns`, `luaV_tonumber_`) | each instruction at most O(VM memory), at most [`INSTRUCTION_STEP`](super::limits::INSTRUCTION_STEP) (100) instructions between checks, all of them within [`MAX_PASS_TIME`](super::limits::MAX_PASS_TIME) and [`MAX_INSTRUCTIONS`](super::limits::MAX_INSTRUCTIONS) | no |
+//! | VM: a table constructor or call with many values | values on the stack | O(n) copies | n at most the stack; each instruction at most O(VM memory), at most [`INSTRUCTION_STEP`](super::limits::INSTRUCTION_STEP) (100) instructions between checks, all of them within [`MAX_PASS_TIME`](super::limits::MAX_PASS_TIME) and [`MAX_INSTRUCTIONS`](super::limits::MAX_INSTRUCTIONS) | no |
 //! | VM: an error message (type errors, names) | the failing operation | O(message): constant names and `__name` | caught messages charged (`settle`), `__name` at most 64 bytes | no |
 //! | VM: compilation, garbage collection | sources, VM memory | O(source), O(VM memory) | the read caps and VM memory | no |
 //!

@@ -81,6 +81,8 @@ pub enum LuaLimit {
     HostCalls,
     /// [`limits::MAX_NATIVE_WORK`].
     NativeWork,
+    /// [`limits::MAX_PASS_TIME`].
+    Time,
 }
 
 impl fmt::Display for LuaLimit {
@@ -91,6 +93,7 @@ impl fmt::Display for LuaLimit {
             Self::Handler => "an error handler's failure",
             Self::HostCalls => "the host call limit",
             Self::NativeWork => "the library work limit",
+            Self::Time => "the pass's time limit",
         })
     }
 }

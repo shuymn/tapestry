@@ -10,11 +10,14 @@ use std::cell::{Cell, RefCell};
 use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 use mlua::Lua;
 
 use super::LuaWhy;
-use super::limits::{INSTRUCTION_STEP, MAX_HOST_CALLS, MAX_INSTRUCTIONS, MAX_NATIVE_WORK};
+use super::limits::{
+    INSTRUCTION_STEP, MAX_HOST_CALLS, MAX_INSTRUCTIONS, MAX_NATIVE_WORK, MAX_PASS_TIME,
+};
 use crate::error::{ImportError, Loc};
 use crate::lua::LuaLimit;
 
@@ -94,6 +97,8 @@ pub(crate) struct Ledger {
     fault: RefCell<Option<ImportError>>,
     faulted: Cell<bool>,
     cancel: Cancel,
+    /// When the pass started, for [`MAX_PASS_TIME`].
+    started: Instant,
 }
 
 impl Ledger {
@@ -103,6 +108,7 @@ impl Ledger {
             fault: RefCell::new(None),
             faulted: Cell::new(false),
             cancel,
+            started: Instant::now(),
         }
     }
 
@@ -153,6 +159,9 @@ impl Ledger {
         }
         if self.cancel.is_cancelled() {
             return Err(self.fail_lua(lua, LuaWhy::Cancelled));
+        }
+        if self.started.elapsed() > MAX_PASS_TIME {
+            return Err(self.fail_lua(lua, LuaWhy::Limit(LuaLimit::Time)));
         }
         Ok(())
     }
