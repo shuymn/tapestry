@@ -12,11 +12,13 @@ pub(super) mod note_parts;
 pub(super) mod number;
 pub(super) mod text;
 
-use skin_model::{CycleDef, ImageDef, MAX_SKIN_FRAMES, Native, Source, Track};
+use skin_model::{
+    CycleDef, ImageDef, MAX_SKIN_FRAMES, Native, Source, TimerRef, Track, timer as slot,
+};
 
 use super::asset::{self, Crop, Failed, ImageKey, Path};
 use super::budget::ImportLimit;
-use super::policy::Role;
+use super::policy::{self, Role};
 use super::property::{self, IndexProp};
 use super::report::{NoteKind, Object, Span};
 use super::track::{self, Stretch};
@@ -55,20 +57,6 @@ pub(super) struct SrcImage {
     cycle: i32,
 }
 
-/// Whether `c`, critical and untimed, would draw what depends on when
-/// the state started (owner decision 7, D3): its track static from 0 and
-/// perpetual, and every cycle it shows `cycle_ok` (absent or on a timer).
-fn untimed_refused(c: &Common, cycle_ok: bool) -> bool {
-    c.untimed
-        && matches!(c.role, Role::Critical(_))
-        && !super::policy::untimed_ok(
-            c.track.identical(),
-            c.track.keys.first().is_some_and(|k| k.at == 0),
-            c.track.end,
-            cycle_ok,
-        )
-}
-
 impl Cx<'_> {
     /// The frames of a `div` grid. A grid of more than the skin's frames
     /// is the aggregate frame limit, refused before anything reads it.
@@ -80,21 +68,38 @@ impl Cx<'_> {
             .ok_or_else(|| self.limit(at, ImportLimit::Frames))
     }
 
+    /// Whether `c`, critical and without a timer, is refused (owner
+    /// decision 7, D3, [`policy::untimed_ok`]). An admitted one whose
+    /// presentation phase depends on the start is noted once it is
+    /// retained (`Cx::untimed_phase`).
+    fn untimed_refused(&self, c: &Common) -> bool {
+        c.untimed && matches!(c.role, Role::Critical(_)) && !policy::untimed_ok(&c.track)
+    }
+
+    /// Records that `c` keeps an image cycling on `cycle`, for its D3
+    /// note once `c` is retained, when the cycle has no timer: only an
+    /// untimed cycle runs on `screen`.
+    pub(super) fn cycle_kept(&mut self, c: &Common, cycle: Option<&CycleDef>) {
+        if cycle.is_some_and(|y| y.timer == TimerRef::Builtin(slot::SCREEN)) {
+            self.cycled.insert(c.span);
+        }
+    }
+
     /// The cycle of `s` over `frames` for `c`, resolved before its sheet
     /// is admitted, or why `c` is dropped: its timer or cycle refused, or
-    /// `c` critical and untimed where it shows what the state's start
-    /// decides (D3).
+    /// `c` critical and untimed where it moves or changes a colour
+    /// channel other than alpha (D3).
     pub(super) fn src_cycle(
         &mut self,
         c: &Common,
         frames: u32,
         s: &SrcImage,
     ) -> Result<Result<Option<CycleDef>, NoteKind>, ImportError> {
-        let (cycle, on_timer) = match self.cycle(c.span, frames, &s.timer, s.cycle)? {
+        let cycle = match self.cycle(c.span, frames, &s.timer, s.cycle)? {
             Ok(v) => v,
             Err(why) => return Ok(Err(why)),
         };
-        if untimed_refused(c, cycle.is_none() || on_timer) {
+        if self.untimed_refused(c) {
             return Ok(Err(NoteKind::Timer(super::TimerWhy::Untimed)));
         }
         Ok(Ok(cycle))
@@ -202,12 +207,17 @@ impl Cx<'_> {
                 }
             };
             if let Some(found) = self.assets.image(key, crop) {
+                self.cycle_kept(c, cycle.as_ref());
                 return Ok(Some(found));
             }
             self.budget.image(frames).map_err(|l| self.limit(at, l))?;
             #[cfg(test)]
             super::trace(super::Event::Charge);
-            return self.add_image(c, key, crop, def, cell);
+            let found = self.add_image(c, key, crop, def, cell)?;
+            if found.is_some() {
+                self.cycle_kept(c, cycle.as_ref());
+            }
+            return Ok(found);
         }
         self.budget.image(frames).map_err(|l| self.limit(at, l))?;
         #[cfg(test)]
@@ -233,7 +243,11 @@ impl Cx<'_> {
                 return Ok(None);
             }
         };
-        self.add_image(c, key, crop, def, cell)
+        let found = self.add_image(c, key, crop, def, cell)?;
+        if found.is_some() {
+            self.cycle_kept(c, cycle.as_ref());
+        }
+        Ok(found)
     }
 
     /// Where `s`'s first `grid` columns and rows lie, its image charged:

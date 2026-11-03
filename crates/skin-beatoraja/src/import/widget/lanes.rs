@@ -11,7 +11,7 @@ use skin_model::{Filter, LaneParts, LaneStyle, LanesDef, NoteOrder, Side, Source
 
 use super::super::asset::{Crop, FALLBACK_SIZE};
 use super::super::geom::{HEIGHT, Offset, Q, Rect};
-use super::super::policy::{self, CriticalPart, Role};
+use super::super::policy::{CriticalPart, Role};
 use super::super::report::{
     DeviationId, LaneApprox, NoteFallback, NoteKind, PartWhy, Severity, Span,
 };
@@ -250,13 +250,6 @@ impl Cx<'_> {
         else {
             return Ok(());
         };
-        if c.untimed && !policy::untimed_ok(true, true, c.track.end, true) {
-            return Err(ImportError::Critical {
-                at: self.loc(at),
-                part,
-                why: NoteKind::Timer(super::super::TimerWhy::Untimed),
-            });
-        }
         if c.offset.r != 0 {
             self.ignored(at, NoteKind::Ignored { field: "angle" });
         }

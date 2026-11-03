@@ -311,6 +311,8 @@ pub(crate) struct Cx<'d> {
     span_hint: widget::lanes::SpanHint,
     /// The judge records already drawn.
     judges: Vec<u32>,
+    /// The destinations keeping an image whose cycle has no timer.
+    cycled: BTreeSet<Span>,
     /// Image selectors compiled once, by source; each copy kept is
     /// charged.
     selectors: HashMap<String, Program>,
@@ -388,6 +390,7 @@ impl<'d> Cx<'d> {
             lanes: None,
             span_hint: widget::lanes::SpanHint::NoLanes,
             judges: Vec::new(),
+            cycled: BTreeSet::new(),
             selectors: HashMap::new(),
         };
         cx.budget.usage.resolved_digit_offsets =
@@ -1187,29 +1190,30 @@ impl<'d> Cx<'d> {
     }
 
     /// An image's frame cycle (`SkinSourceImage.java:73-89`): `Ok(None)`
-    /// for no cycle; `Err(why)` for one the model cannot run.
+    /// for no cycle; `Err(why)` for one the model cannot run. A cycle
+    /// without a timer runs on `screen`, which no timer id maps to.
     fn cycle(
         &mut self,
         at: Span,
         frames: u32,
         t: &Prop,
         cycle: i32,
-    ) -> Result<Result<(Option<CycleDef>, bool), NoteKind>, ImportError> {
+    ) -> Result<Result<Option<CycleDef>, NoteKind>, ImportError> {
         if frames <= 1 || cycle == 0 {
-            return Ok(Ok((None, true)));
+            return Ok(Ok(None));
         }
         let period = i64::from(cycle) * 1000;
         if cycle < 0 || period > skin_model::MAX_KEY_US {
             return Ok(Err(NoteKind::Timer(TimerWhy::Cycle)));
         }
-        let (timer, on_timer) = match *t {
-            Prop::Null => (TimerRef::Builtin(slot::SCREEN), false),
-            Prop::Id(n) if n < 0 => (TimerRef::Builtin(slot::SCREEN), false),
+        let timer = match *t {
+            Prop::Null => TimerRef::Builtin(slot::SCREEN),
+            Prop::Id(n) if n < 0 => TimerRef::Builtin(slot::SCREEN),
             Prop::Name(_) => return Ok(Err(NoteKind::Timer(TimerWhy::Script))),
             Prop::Id(n) => match self.custom.resolve(n) {
                 Timer::Unset => {
                     self.ignored(at, NoteKind::Timer(TimerWhy::Unset(n)));
-                    return Ok(Ok((None, true)));
+                    return Ok(Ok(None));
                 }
                 Timer::Unsupported => {
                     let why = if n > timer::BUILTIN_MAX {
@@ -1219,16 +1223,13 @@ impl<'d> Cx<'d> {
                     };
                     return Ok(Err(NoteKind::Timer(why)));
                 }
-                t => (self.timer_ref(t, at)?, true),
+                t => self.timer_ref(t, at)?,
             },
         };
-        Ok(Ok((
-            Some(CycleDef {
-                period: TimeUs(period),
-                timer,
-            }),
-            on_timer,
-        )))
+        Ok(Ok(Some(CycleDef {
+            period: TimeUs(period),
+            timer,
+        })))
     }
 
     /// The model keys of `c`'s track with each key's rect from `rect`.
@@ -1299,10 +1300,12 @@ impl<'d> Cx<'d> {
         Ok(())
     }
 
-    /// Notes what a retained element or judge part carries: D4 once when
-    /// it deviates ([`Common::display_deviation`]), and D9
+    /// Notes what a retained element or judge part carries: D3 once when
+    /// what it shows depends on the state's start ([`Self::untimed_phase`]),
+    /// D4 once when it deviates ([`Common::display_deviation`]), and D9
     /// [`LaneApprox::CoverMotion`] once when it follows the covers.
     fn retained(&mut self, c: &Common) -> Result<(), ImportError> {
+        self.untimed_phase(c);
         if c.display_deviation {
             self.note(
                 Some(c.span),
@@ -1311,6 +1314,24 @@ impl<'d> Cx<'d> {
             );
         }
         self.cover_motion(c)
+    }
+
+    /// Notes D3 for retained `c`, critical and without a timer, when its
+    /// presentation phase depends on the start: its track
+    /// ([`policy::start_dependent`]) or an image it keeps cycling without
+    /// a timer (owner decision 7). Each destination is retained once.
+    fn untimed_phase(&mut self, c: &Common) {
+        let cycled = self.cycled.contains(&c.span);
+        if c.untimed
+            && matches!(c.role, Role::Critical(_))
+            && policy::start_dependent(&c.track, cycled)
+        {
+            self.note(
+                Some(c.span),
+                Severity::Deviation,
+                NoteKind::Deviation(DeviationId::D3),
+            );
+        }
     }
 
     /// Notes D9 [`LaneApprox::CoverMotion`] once for a retained element

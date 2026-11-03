@@ -21,8 +21,11 @@
 //!    ([`super::property::Value::critical`]).
 //! 6. A decorative element whose image or font fails: only it is dropped;
 //!    aggregate limits still refuse ([`unsupported`]).
-//! 7. Elements without a timer run on the `screen` timer; a critical one only with
-//!    output independent of the start time (D3, [`untimed_ok`]).
+//! 7. Elements without a timer run on the `screen` timer, which restarts
+//!    at READY; a critical one only with its placement and its colour
+//!    other than alpha the same at every key, so only its presentation
+//!    phase (alpha, its first key, its end, an image cycle without a
+//!    timer) depends on the start, noted (D3, [`untimed_ok`]).
 //! 8. Play-state display differences on decorative elements are accepted
 //!    (D4, [`super::ops`], [`super::property`]).
 //! 9. Text is always drawn with smooth sampling and normal blending (D5).
@@ -67,6 +70,7 @@ use std::fmt;
 use skin_model::End;
 
 use super::report::{NoteKind, Notes, Severity, Span};
+use super::track::Accepted;
 use crate::error::ImportError;
 use crate::tree::Arena;
 
@@ -131,9 +135,22 @@ pub(crate) fn unsupported(
     }
 }
 
-/// Whether an untimed critical element's output is independent of when
-/// the state started (owner decision 7, D3): every key identical, the
-/// first at 0, a perpetual end, and an image cycle absent or on a timer.
-pub(crate) fn untimed_ok(identical: bool, first_at_zero: bool, end: End, cycle_ok: bool) -> bool {
-    identical && first_at_zero && matches!(end, End::Hold | End::Loop { .. }) && cycle_ok
+/// Whether a critical element without a timer, running on `screen`
+/// (owner decision 7, D3), is admitted: its placement (rect and angle)
+/// and its colour other than alpha the same at every key. Its alpha, its
+/// first key's time, its end and an image cycle without a timer may make
+/// what it shows depend on when the state started. Provisional until a
+/// visual comparison of a real skin against the source's timing.
+pub(crate) fn untimed_ok(track: &Accepted) -> bool {
+    track.fixed_but_alpha()
+}
+
+/// Whether what an untimed element shows depends on when the state
+/// started: its keys differ, its first is after 0, it hides after its
+/// last, or `untimed_cycle`, an image cycle without a timer.
+pub(crate) fn start_dependent(track: &Accepted, untimed_cycle: bool) -> bool {
+    !track.identical()
+        || track.keys.first().is_some_and(|k| k.at != 0)
+        || matches!(track.end, End::Hide)
+        || untimed_cycle
 }
