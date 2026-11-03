@@ -321,7 +321,45 @@ pub(crate) enum Value {
     /// `duration_green`, `:292-314`), while it is known.
     Duration,
     DurationGreen,
+    /// One of the eight duration variants' ms or green number, 1312 to
+    /// 1327 as `id − 1312` (`:532-556`): the tempo `n / 4` (current,
+    /// MAIN, minimum, maximum), with the configured lane cover or none
+    /// (`n / 2 % 2`), the green number for an odd `n`; each rounded half
+    /// up from the exact ratio (D4), while its variant is known.
+    DurationVariant(u8),
 }
+
+/// The fields of [`Value::DurationVariant`] by `id − 1312`.
+const DURATION_VARIANTS: [&str; 16] = [
+    "duration.current.covered.ms",
+    "duration.current.covered.green",
+    "duration.current.uncovered.ms",
+    "duration.current.uncovered.green",
+    "duration.main.covered.ms",
+    "duration.main.covered.green",
+    "duration.main.uncovered.ms",
+    "duration.main.uncovered.green",
+    "duration.min.covered.ms",
+    "duration.min.covered.green",
+    "duration.min.uncovered.ms",
+    "duration.min.uncovered.green",
+    "duration.max.covered.ms",
+    "duration.max.covered.green",
+    "duration.max.uncovered.ms",
+    "duration.max.uncovered.green",
+];
+
+/// The validity of [`Value::DurationVariant`] by `(id − 1312) / 2`.
+const DURATION_VARIANTS_VALID: [&str; 8] = [
+    "duration.current.covered.valid",
+    "duration.current.uncovered.valid",
+    "duration.main.covered.valid",
+    "duration.main.uncovered.valid",
+    "duration.min.covered.valid",
+    "duration.min.uncovered.valid",
+    "duration.max.covered.valid",
+    "duration.max.uncovered.valid",
+];
 
 impl Value {
     /// The model expression.
@@ -372,6 +410,10 @@ impl Value {
             Self::HispeedFraction => "hispeed.x100 % 100",
             Self::Duration => "duration.ms",
             Self::DurationGreen => "duration.green",
+            Self::DurationVariant(n) => DURATION_VARIANTS
+                .get(usize::from(n))
+                .copied()
+                .unwrap_or("duration.max.uncovered.green"),
         }
     }
 
@@ -383,6 +425,7 @@ impl Value {
             Self::BpmNow => Some("bpm.current_valid"),
             Self::HispeedX100 | Self::HispeedWhole | Self::HispeedFraction => Some("hispeed.valid"),
             Self::Duration | Self::DurationGreen => Some("duration.valid"),
+            Self::DurationVariant(n) => DURATION_VARIANTS_VALID.get(usize::from(n / 2)).copied(),
             _ => None,
         }
     }
@@ -472,6 +515,7 @@ fn shown(id: i32) -> Option<Value> {
         311 => Value::HispeedFraction,
         312 => Value::Duration,
         313 => Value::DurationGreen,
+        1_312..=1_327 => Value::DurationVariant(u8::try_from(id - 1_312).ok()?),
         _ => return None,
     })
 }
@@ -770,9 +814,34 @@ mod tests {
         // Neither is a value property; others keep needing their own data.
         assert_eq!(int_by_id(15), IntProp::Null);
         assert_eq!(int_by_id(131), IntProp::Null);
-        for id in [92, 1_163, 1_164, 1_312, 1_327, 372, 373] {
+        for id in [92, 1_163, 1_164, 372, 373] {
             assert_eq!(int_by_id(id), IntProp::Unsupported(Some(id)), "{id}");
         }
+        // 1312 to 1327: each variant's ms and green, under its validity,
+        // by numeric id only.
+        for (n, (t, k)) in ["current", "main", "min", "max"]
+            .into_iter()
+            .flat_map(|t| ["covered", "uncovered"].map(|k| (t, k)))
+            .enumerate()
+        {
+            for (part, v) in ["ms", "green"].into_iter().enumerate() {
+                let id = 1_312 + 2 * i32::try_from(n).unwrap() + i32::try_from(part).unwrap();
+                let value = Value::DurationVariant(u8::try_from(id - 1_312).unwrap());
+                assert_eq!(int_by_id(id), IntProp::Shown(value), "{id}");
+                let (expr, valid) = (
+                    format!("duration.{t}.{k}.{v}"),
+                    format!("duration.{t}.{k}.valid"),
+                );
+                assert_eq!(value.expr(), expr, "{id}");
+                assert_eq!(value.availability(), Some(valid.as_str()), "{id}");
+                assert!(value.deviates() && !value.critical(), "{id}");
+                assert!(skin_model::compile(&expr, &scope, skin_model::Ty::Int).is_ok());
+                assert!(skin_model::compile(&valid, &scope, skin_model::Ty::Bool).is_ok());
+            }
+        }
+        assert_eq!(int_by_id(1_311), IntProp::Null);
+        assert_eq!(int_by_id(1_328), IntProp::Null);
+
         // The earlier values are never guarded.
         for v in [
             Value::ExScore,
