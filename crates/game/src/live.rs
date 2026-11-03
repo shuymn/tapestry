@@ -74,7 +74,7 @@ use ::audio::OutputError;
 use bms_model::TimeUs;
 use eval::{InputStart, JudgeEvent};
 use input::{Arrival, DeviceKind};
-use replay::{CancelReason, Incomplete, ReadyHistory};
+use replay::{CancelReason, Incomplete};
 
 use crate::app::IDLE_WAIT;
 use crate::attempt::{Preparation, PreparationRefusal};
@@ -1354,7 +1354,8 @@ fn play_and_next<R: Rig>(
             let _ = g.history.seal(closed_at, &closing.arrivals, reason);
         }
         // A capture's last kept opening is its origin 0, even when the
-        // history had no room for the last one.
+        // history had no room for the last one. Its history is copied out
+        // once the play is over, after Closing, which copies nothing.
         let last = if g.committed {
             origin
         } else {
@@ -1362,7 +1363,7 @@ fn play_and_next<R: Rig>(
         };
         Capture {
             played: g.committed,
-            history: g.history.history(last),
+            last,
             exhausted: g.history.exhausted(),
         }
     });
@@ -1415,6 +1416,10 @@ fn play_and_next<R: Rig>(
     // changed nothing scored.
     let view = logic.view();
     let record = logic.into_record();
+    let history = gate
+        .as_ref()
+        .zip(capture)
+        .map(|(g, c)| g.history.history(c.last));
 
     rig.play_over();
     let report = loaded.finish_play(PlayOutcome {
@@ -1431,8 +1436,8 @@ fn play_and_next<R: Rig>(
         arrivals: closing.arrivals,
         axis_out_of_range: closing.axis_out_of_range,
         incomplete,
-        played: capture.as_ref().is_none_or(|c| c.played),
-        history: capture.map(|c| c.history),
+        played: capture.is_none_or(|c| c.played),
+        history,
         closing: closing_report,
     });
     // A completed play's tail took the carried command.
@@ -1640,11 +1645,13 @@ impl Candidates {
     }
 }
 
-/// A gated attempt's capture as it ended.
+/// A gated attempt's capture as it ended, without copying its history.
+#[derive(Clone, Copy)]
 struct Capture {
     /// Whether a candidate committed: the attempt was played.
     played: bool,
-    history: ReadyHistory,
+    /// The last kept opening's origin: the history's time 0.
+    last: TimeUs,
     exhausted: bool,
 }
 

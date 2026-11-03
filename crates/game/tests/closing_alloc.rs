@@ -7,7 +7,9 @@
 //! abort close), the handshake's drain, the record's drain after the
 //! close, and every Closing wake's drain of commands, its failure polls
 //! and its exit, up to the final close. A quit admitted to Closing,
-//! repeated in it and ended by a retry, takes the same path. The rig's
+//! repeated in it and ended by a retry, takes the same path, and so do
+//! gated plays (the start gate), one of them after a READY candidate
+//! cancelled and rearmed, whose history Closing must not copy. The rig's
 //! own waits, standing in for the other threads, are not counted. This
 //! file holds a single test, so the harness's other threads are not
 //! tracked.
@@ -72,6 +74,14 @@ struct Counted {
     sounds: Option<AudioQueue>,
     screen: Option<RenderSide>,
     checked: bool,
+    /// Whether the play runs the start gate.
+    gated: bool,
+    /// The first candidate is cancelled from this clock time on.
+    cancel_at: Option<i64>,
+    /// The current candidate's generation.
+    generation: u32,
+    /// Where the current candidate's chart time 0 lies.
+    origin: TimeUs,
 }
 
 impl Counted {
@@ -95,6 +105,20 @@ impl Counted {
             sounds: None,
             screen: None,
             checked: false,
+            gated: false,
+            cancel_at: None,
+            generation: 0,
+            origin: TimeUs(0),
+        }
+    }
+
+    /// [`new`](Self::new) with the start gate, its first candidate
+    /// cancelled at `cancel_at` if given.
+    fn gated(commands: [(i64, Command); 4], cancel_at: Option<i64>) -> Self {
+        Self {
+            gated: true,
+            cancel_at,
+            ..Self::new(commands)
         }
     }
 
@@ -163,6 +187,79 @@ impl Rig for Counted {
             kinds: vec![DeviceKind::Keyboard],
             axes: vec![Vec::new()],
         })
+    }
+
+    fn gated(&self) -> bool {
+        self.gated
+    }
+
+    fn open_candidate(
+        &mut self,
+        lead_in: TimeUs,
+        generation: u32,
+    ) -> Result<Option<Opening<SourceReader>>, InputWaitError> {
+        let origin = TimeUs(self.now + lead_in.0);
+        let start = self
+            .sources
+            .open_candidate(TimeUs(self.now), origin, generation)
+            .cloned()
+            .expect("nothing is held");
+        self.generation = generation;
+        self.origin = origin;
+        Ok(Some(Opening {
+            origin,
+            start,
+            readers: self.sources.take_readers(),
+            kinds: vec![DeviceKind::Keyboard],
+            axes: vec![Vec::new()],
+        }))
+    }
+
+    /// The first candidate is cancelled at `cancel_at`; each commits at
+    /// its chart time 0.
+    fn candidate(&self) -> input::GateState {
+        let cancelled = self.generation == 1 && self.cancel_at.is_some_and(|at| self.now >= at);
+        input::GateState {
+            generation: self.generation,
+            phase: if cancelled {
+                input::GatePhase::Cancelled
+            } else if self.now >= self.origin.0 {
+                input::GatePhase::Committed
+            } else {
+                input::GatePhase::Armed
+            },
+        }
+    }
+
+    fn rearm_candidate(
+        &mut self,
+        readers: &mut Vec<SourceReader>,
+        lead_in: TimeUs,
+        generation: u32,
+        history: &mut game::HistoryRecorder,
+        start: &mut eval::InputStart,
+    ) -> Result<game::Rearm, InputWaitError> {
+        let now = TimeUs(self.now);
+        let _ = history.drain(readers);
+        let closed = TimeUs(now.0 - self.origin.0);
+        let _ = history.seal(closed, self.sources.arrivals(), replay::CancelReason::Held);
+        self.sources.return_readers(std::mem::take(readers));
+        let origin = TimeUs(now.0 + lead_in.0);
+        let s = self
+            .sources
+            .reopen_candidate(now, origin, generation)
+            .expect("nothing is held");
+        start.opened_at = s.opened_at;
+        start.held.clear();
+        start.held.extend_from_slice(&s.held);
+        *readers = self.sources.take_readers();
+        self.generation = generation;
+        self.origin = origin;
+        Ok(game::Rearm::Opened { origin })
+    }
+
+    fn snapshot_capacity(&self) -> usize {
+        self.sources.snapshot_capacity()
     }
 
     fn start(&mut self, _origin: TimeUs, sounds: AudioQueue, screen: RenderSide) {
@@ -272,7 +369,7 @@ fn closing_allocates_nothing() {
     // The quit key at 1.5 s of play time (READY opens at 0), again in
     // Closing, then a retry beside a suspend.
     let dir = tempfile::tempdir().unwrap();
-    let mut quit = loaded(dir.path(), sixteen);
+    let mut quit = loaded(dir.path(), sixteen.clone());
     let mut rig = Counted::new([
         (2_500 * MS, Command::Quit),
         (2_800 * MS, Command::Quit),
@@ -283,4 +380,44 @@ fn closing_allocates_nothing() {
     assert_eq!(report.end, PlayEnd::Aborted(game::AbortCause::Quit));
     assert_eq!(report.closing.map(|c| c.end), Some(ClosingEnd::Retry));
     assert_eq!(rig.calls, 0, "the quit's Closing allocated");
+
+    // Gated: committed at once, and after the first candidate was
+    // cancelled at 0.5 s and rearmed, its opening kept in the history;
+    // for the failure and for the quit (the rearmed chart time 0 lies at
+    // 1.5 s, so the quit at 3 s is during play).
+    for cancel_at in [None, Some(500 * MS)] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut failed = loaded(dir.path(), sixteen.clone());
+        let mut rig = Counted::gated([never; 4], cancel_at);
+        let report = game::live::play(&mut failed, &mut rig).unwrap().unwrap();
+        assert_eq!(report.end, PlayEnd::Aborted(game::AbortCause::GaugeFailed));
+        assert_eq!(report.closing.map(|c| c.end), Some(ClosingEnd::RanOut));
+        let openings = report.record.as_ref().unwrap().history.openings.len();
+        assert_eq!(openings, usize::from(cancel_at.is_some()), "{cancel_at:?}");
+        assert_eq!(
+            rig.calls, 0,
+            "a gated failure's Closing allocated ({cancel_at:?})"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut quit = loaded(dir.path(), sixteen.clone());
+        let mut rig = Counted::gated(
+            [
+                (3_000 * MS, Command::Quit),
+                (3_300 * MS, Command::Quit),
+                never,
+                never,
+            ],
+            cancel_at,
+        );
+        let report = game::live::play(&mut quit, &mut rig).unwrap().unwrap();
+        assert_eq!(report.end, PlayEnd::Aborted(game::AbortCause::Quit));
+        assert_eq!(report.closing.map(|c| c.end), Some(ClosingEnd::RanOut));
+        let openings = report.record.as_ref().unwrap().history.openings.len();
+        assert_eq!(openings, usize::from(cancel_at.is_some()), "{cancel_at:?}");
+        assert_eq!(
+            rig.calls, 0,
+            "a gated quit's Closing allocated ({cancel_at:?})"
+        );
+    }
 }
