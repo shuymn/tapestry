@@ -89,14 +89,12 @@ pub fn check(guards: &[Guard], workflow: &str) -> anyhow::Result<Vec<String>> {
     if !steps.iter().any(|s| s.name == ALLOC_STEP) {
         bail!("{WORKFLOW} has no step named `{ALLOC_STEP}`");
     }
-    let commands: Vec<(&str, ReleaseTest)> = steps
-        .iter()
-        .flat_map(|s| {
-            release_tests(&s.run)
-                .into_iter()
-                .map(|c| (s.name.as_str(), c))
-        })
-        .collect();
+    let mut commands: Vec<(&str, ReleaseTest)> = Vec::new();
+    for s in &steps {
+        for c in release_tests(&s.name, &s.run)? {
+            commands.push((s.name.as_str(), c));
+        }
+    }
     let mut diagnostics = Vec::new();
     for g in guards {
         let names = |c: &ReleaseTest| c.tests.contains(&g.test);
@@ -225,29 +223,72 @@ fn unquote(value: &str) -> &str {
     value
 }
 
-/// The `cargo test --release` commands of a step's shell text, with their
-/// `-p` and `--test` lists. Comments are dropped and the text is split
-/// into commands at line ends, `;`, `&` and `|` (so `&&` and `||` too),
-/// so one command's flags never join another's; a command that only
-/// builds (`--no-run`) or lists (`--list` after `--`) runs nothing.
-fn release_tests(run: &str) -> Vec<ReleaseTest> {
-    run.replace("\\\n", " ")
-        .lines()
-        .flat_map(|line| without_comment(line).split([';', '&', '|']))
-        .filter_map(|command| release_test(&command.split_whitespace().collect::<Vec<_>>()))
-        .collect()
+/// Shell syntax a release test command may not hold: redirections,
+/// background jobs, substitutions and quotes, which would need a shell to
+/// read.
+const NOT_PLAIN: &[&str] = &["&", "<", ">", "$(", "`", "\"", "'"];
+
+/// The `cargo test --release` commands of step `step`'s shell text, with
+/// their `-p` and `--test` lists. The text is split into commands at line
+/// ends, `;`, `&&`, `||` and `|`, so one command's flags never join
+/// another's, and comments are dropped. A command that only builds
+/// (`--no-run`) or lists (`--list` after `--`) runs nothing. A release
+/// command with any other shell syntax ([`NOT_PLAIN`]) is an error rather
+/// than read differently from the shell.
+fn release_tests(step: &str, run: &str) -> anyhow::Result<Vec<ReleaseTest>> {
+    let mut out = Vec::new();
+    for line in run.replace("\\\n", " ").lines() {
+        for command in commands(line) {
+            let tokens: Vec<&str> = command.split_whitespace().collect();
+            let is_release =
+                tokens.windows(2).any(|w| w == ["cargo", "test"]) && command.contains("--release");
+            if !is_release {
+                continue;
+            }
+            if NOT_PLAIN.iter().any(|m| command.contains(m)) {
+                bail!(
+                    "{WORKFLOW}: step `{step}` runs `{}` with shell syntax; this check reads \
+                     only plain cargo commands",
+                    command.trim()
+                );
+            }
+            out.extend(release_test(&tokens));
+        }
+    }
+    Ok(out)
 }
 
-/// `line` up to a `#` that starts a word.
-fn without_comment(line: &str) -> &str {
-    let mut previous = ' ';
-    for (at, c) in line.char_indices() {
-        if c == '#' && previous.is_whitespace() {
-            return &line[..at];
+/// One line's commands, split at `;`, `&&`, `||` and `|`, up to a comment:
+/// a `#` at the start of a word or right after one of those operators.
+fn commands(line: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    let mut word_start = true;
+    let mut chars = line.char_indices().peekable();
+    while let Some((at, c)) = chars.next() {
+        let operator = match c {
+            ';' => true,
+            '|' => {
+                chars.next_if(|&(_, n)| n == '|');
+                true
+            }
+            '&' => chars.next_if(|&(_, n)| n == '&').is_some(),
+            _ => false,
+        };
+        if operator {
+            out.push(&line[start..at]);
+            start = chars.peek().map_or(line.len(), |&(next, _)| next);
+            word_start = true;
+            continue;
         }
-        previous = c;
+        if c == '#' && word_start {
+            out.push(&line[start..at]);
+            return out;
+        }
+        word_start = c.is_whitespace();
     }
-    line
+    out.push(&line[start..]);
+    out
 }
 
 /// One command's `cargo test --release` lists, if it is one that runs.
@@ -370,13 +411,13 @@ jobs:
              --test alloc -- --test not_a_target\n"
         );
         assert_eq!(
-            release_tests(&steps[2].run),
+            release_tests("", &steps[2].run).unwrap(),
             [ReleaseTest {
                 packages: vec!["eval".into(), "game".into()],
                 tests: vec!["alloc".into()],
             }]
         );
-        assert!(release_tests(&steps[1].run).is_empty());
+        assert!(release_tests("", &steps[1].run).unwrap().is_empty());
     }
 
     #[test]
@@ -459,15 +500,44 @@ jobs:
             &["# cargo test --release --locked -p game --test tempo_alloc"][..],
             // A dev command with a comment that names the flag.
             &["cargo test --locked -p game --test tempo_alloc # --release"],
-            // A dev command whose flags must not join the next command's.
+            // A comment right after an operator.
+            &["echo done;# cargo test --release --locked -p game --test tempo_alloc"],
+            // A dev command whose flags must not join the next command's,
+            // one case per separator.
             &["cargo test -p game --test tempo_alloc --locked; cargo test --release -p eval"],
-            &["cargo test -p game --test tempo_alloc|tee log; cargo test --release -p eval"],
+            &["cargo test -p game --test tempo_alloc --locked|cargo test --release -p eval"],
+            &["cargo test -p game --test tempo_alloc --locked&&cargo test --release -p eval"],
+            &["cargo test -p game --test tempo_alloc --locked||cargo test --release -p eval"],
+            &[
+                "cargo test -p game --test tempo_alloc --locked",
+                "cargo test --release -p eval",
+            ],
             // Built only, or listed.
             &["cargo test --release --locked -p game --test tempo_alloc --no-run"],
             &["cargo test --release --locked -p game --test tempo_alloc -- --list"],
         ] {
             let diags = check(&guards(), &with_extra(lines)).unwrap();
             assert_eq!(diags, [missing_tempo_alloc()], "{lines:?}");
+        }
+    }
+
+    #[test]
+    fn a_release_command_with_other_shell_syntax_is_refused() {
+        for command in [
+            "cargo test --release -p game --test tempo_alloc 2>&1 --no-run",
+            "cargo test --release -p game --test tempo_alloc -- 2>&1 --list",
+            "cargo test --release -p game --test tempo_alloc > log",
+            "cargo test --release -p game --test \"tempo_alloc\"",
+            "cargo test --release -p game --test $(echo tempo_alloc)",
+        ] {
+            let e = check(&guards(), &with_extra(&[command])).unwrap_err();
+            assert_eq!(
+                e.to_string(),
+                format!(
+                    "{WORKFLOW}: step `Extra` runs `{command}` with shell syntax; this check \
+                     reads only plain cargo commands"
+                )
+            );
         }
     }
 
