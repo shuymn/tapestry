@@ -171,6 +171,22 @@ fn refused(e: &ImageError) -> bool {
     )
 }
 
+/// The per-file cap `e` names, if any, for
+/// [`NoteKind::OverCap`](super::report::NoteKind::OverCap).
+fn cap(e: &ImageError) -> Option<&'static str> {
+    Some(match e {
+        ImageError::TooWide { .. } => "per-file side",
+        ImageError::TooManyTexels { .. } => "per-file texel",
+        ImageError::FileTooLarge { .. } => "per-file byte",
+        ImageError::HeaderTooLarge { .. } => "header byte",
+        ImageError::Decode {
+            source: image::ImageError::Limits(_),
+            ..
+        } => "decoder allocation",
+        _ => return None,
+    })
+}
+
 /// A font as a text element uses it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Font {
@@ -342,6 +358,15 @@ impl Assets {
         let key = (path.to_owned(), None);
         match self.files.get_mut(&key) {
             Some(Err((_, e))) => e.take(),
+            _ => None,
+        }
+    }
+
+    /// The per-file cap a failed file passed, while its error is kept.
+    pub(crate) fn failed_cap(&self, path: &str) -> Option<&'static str> {
+        let key = (path.to_owned(), None);
+        match self.files.get(&key) {
+            Some(Err((_, Some(e)))) => cap(e),
             _ => None,
         }
     }

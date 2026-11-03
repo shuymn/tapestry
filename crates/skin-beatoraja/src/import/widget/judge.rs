@@ -20,8 +20,8 @@ use skin_model::{
 };
 
 use super::super::geom::{Q, Rect};
-use super::super::policy::{self, CriticalPart, Role};
-use super::super::report::{NoteKind, Span, TimerWhy};
+use super::super::policy::{CriticalPart, Role};
+use super::super::report::{NoteKind, Span};
 use super::super::track::{self, Stretch};
 use super::super::{Common, Cx, Dst, Opts};
 use super::number;
@@ -125,9 +125,6 @@ impl Cx<'_> {
         else {
             return Ok(());
         };
-        if c.untimed && !policy::untimed_ok(true, true, c.track.end, true) {
-            return refuse(self, at, NoteKind::Timer(TimerWhy::Untimed));
-        }
 
         let mut grades: [Option<PendingGrade>; JudgeSlot::COUNT] = Default::default();
         if images.len() > JudgeSlot::COUNT {

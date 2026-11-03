@@ -160,6 +160,18 @@ impl Accepted {
             _ => true,
         })
     }
+
+    /// Whether every key shows the same placement (rect and angle) and
+    /// the same colour apart from alpha.
+    pub(crate) fn fixed_but_alpha(&self) -> bool {
+        self.keys.windows(2).all(|w| match w {
+            [a, b] => {
+                let ([_, rgb_a @ ..], [_, rgb_b @ ..]) = (a.color, b.color);
+                a.rect == b.rect && a.angle == b.angle && rgb_a == rgb_b
+            }
+            _ => true,
+        })
+    }
 }
 
 /// Sorts `keys` stably by time and accepts them with loop point `l`:

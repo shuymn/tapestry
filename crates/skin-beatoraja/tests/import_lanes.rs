@@ -7,7 +7,7 @@ mod common;
 use bms_model::{Chart, ChartBuilder, Lane, LnMode, TimeUs};
 use common::lanes::{NOTES, body, cover, eight, lane_rects, lift_object, note, note_with};
 use common::play::{Drawn, MS, judged, long_note, round};
-use common::{Loaded, dst, has, import_body, import_config, import_sized};
+use common::{Loaded, d3_notes, dst, has, import_body, import_config, import_sized};
 use eval::{JudgeEvent, JudgeEventKind};
 use rules::Judgment;
 use skin_beatoraja::{
@@ -487,6 +487,42 @@ fn the_lanes_track_is_neutral() {
     assert_eq!(q[0].color, [1.0; 4]);
 }
 
+/// Long-note bodies, idle and active, of two rows cycled every 266 ms
+/// without a timer run on `screen` (D3): frame 1 at 750 ms, frame 0 at
+/// 800 ms, noted once for the lanes however many parts cycle.
+#[test]
+fn untimed_body_cycles_run_on_screen() {
+    let cycled =
+        r#"{"id": "lc", "src": "a", "x": 24, "y": 0, "w": 8, "h": 40, "divy": 2, "cycle": 266}"#;
+    let still = r#"{"id": "lc", "src": "a", "x": 24, "y": 0, "w": 8, "h": 40, "divy": 2}"#;
+    let skin = |image: &str| {
+        let note = note("")
+            .replace(&eight("lb"), &eight("lc"))
+            .replace(&eight("la"), &eight("lc"));
+        import_body(&body(image, &note, &[NOTES]))
+    };
+    let chart = ChartBuilder::new(150_000)
+        .long(
+            Lane::new(1).unwrap(),
+            TimeUs(1_000 * MS),
+            TimeUs(1_300 * MS),
+        )
+        .build()
+        .unwrap();
+    let uvs = |l: &Loaded, ms: i64| -> Vec<[f32; 4]> {
+        drawn(l, &chart)
+            .frame(ms, &[])
+            .iter()
+            .map(|q| q.uv)
+            .collect()
+    };
+    let (c, s) = (skin(cycled), skin(still));
+    assert_eq!(d3_notes(&c), 1);
+    assert_eq!(d3_notes(&s), 0);
+    assert_ne!(uvs(&c, 750), uvs(&s, 750));
+    assert_eq!(uvs(&c, 800), uvs(&s, 800));
+}
+
 #[test]
 fn the_lifetime_starts_at_zero() {
     let timed = r#"{"id": "notes", "timer": 41, "loop": -1, "dst": [
@@ -502,14 +538,14 @@ fn the_lifetime_starts_at_zero() {
     let l = lanes_dst(r#"{"id": "notes", "dst": []}"#);
     assert_eq!(l.report().usage.keys, 1);
     assert_eq!(rects_over(&l, &tap(1, 5_000), 5_000), [[100, 860, 50, 20]]);
-    // Untimed and hidden after its keys: D3 refuses.
+    // Untimed and hidden after its keys: on `screen`, noted (D3).
     let untimed = r#"{"id": "notes", "loop": -1, "dst": [
         {"time": 500, "x": 0, "y": 0, "w": 0, "h": 0},
         {"time": 1000, "x": 0, "y": 0, "w": 0, "h": 0}]}"#;
-    assert!(matches!(
-        critical(lanes_dst(untimed)),
-        (CriticalPart::Lanes, NoteKind::Timer(_))
-    ));
+    let l = lanes_dst(untimed);
+    assert_eq!(d3_notes(&l), 1);
+    assert_eq!(rects_over(&l, &chart, 900), [[100, 360, 50, 20]]);
+    assert_eq!(rects_over(&l, &chart, 1_001), Vec::<[i32; 4]>::new());
     // A negative first key refuses.
     let early = r#"{"id": "notes", "dst": [{"time": -1, "x": 0, "y": 0, "w": 0, "h": 0}]}"#;
     assert_eq!(

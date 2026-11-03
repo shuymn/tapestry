@@ -347,6 +347,7 @@ impl Cx<'_> {
                     Some(self.model_track(&c, &rects)?)
                 }
             };
+            self.cycle_kept(&c, e.cycle.as_ref());
             choices.push(Some(ImageChoicePart {
                 span: ImageSpan {
                     image: e.image,
