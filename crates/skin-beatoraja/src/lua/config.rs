@@ -6,15 +6,17 @@
 //!   `name`, as [`Config::options`] selects it; absent when none is.
 //! - `enabled_options`: the selected items' numbers, in the header's
 //!   order of options.
-//! - `file_path[name]`: the file choice `name`'s path with its chosen
-//!   candidate substituted, relative to the entry's folder, as the
-//!   importer resolves a source path ([`Choices`]); absent with no
-//!   candidate.
+//! - `file_path[name]`: the name of the candidate the file choice `name`
+//!   uses, the file's or folder's name within the choice's folder, as the
+//!   source's configuration holds it (`SkinConfigurationView.java:392`);
+//!   absent with no candidate.
 //! - `offset[name]`: the offset `name`'s `x`, `y`, `w`, `h`, `r` and `a`,
 //!   the configured value of an offset the header declares, else zeros.
-//! - `get_path(path)`: `path` with the file choice that prefixes it
-//!   substituted, as `file_path`; `nil` when the choice has no candidate
-//!   or a wildcard is left.
+//! - `get_path(path)`: `path`, relative to the entry's folder, with the
+//!   file choice that prefixes it substituted by the same candidate, as
+//!   the importer resolves a source path ([`Choices`]); `nil` when the
+//!   choice has no candidate or a wildcard is left. A skin may also join
+//!   a choice's folder and its `file_path` and pass that.
 //!
 //! The tables are plain and the skin may change them, as the source
 //! lets it: each pass builds them afresh from the validated header and
@@ -55,16 +57,18 @@ impl Bridge {
         let options = selected()
             .filter_map(|(o, &sel)| Some((o.name.clone()?, sel?)))
             .collect();
-        let choices = Choices::new(header, config, &mut Vec::new());
+        let mut picks = Vec::with_capacity(header.files.len());
+        let choices = Choices::new(header, config, &mut picks);
+        // Each choice's own pick, the one `get_path` substitutes: an entry
+        // name in the choice's folder, never a path.
         let files = header
             .files
             .iter()
-            .filter_map(|f| {
-                let name = f.name.clone()?;
-                match choices.substitute(f.path.as_deref()?) {
-                    Path::File(p) => Some((name, p)),
-                    _ => None,
-                }
+            .zip(&picks)
+            .filter_map(|(f, pick)| {
+                f.path.as_ref()?;
+                let chosen = f.candidates.get(usize::from(pick.candidate?))?;
+                Some((f.name.clone()?, chosen.clone()))
             })
             .collect();
         let offsets = header
