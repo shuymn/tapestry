@@ -80,8 +80,8 @@ mod widget;
 
 pub use atlas::uv::{FrameUv, UvTable};
 pub use atlas::{
-    ALIGN, Atlas, AtlasError, AtlasLimits, CELL_TABLE_BYTES, GUTTER, MAX_ATLAS_TEXELS,
-    MAX_PAGE_SIDE, MAX_PAGES, MIN_PAGE_SIDE, MIP_LEVELS, Page, Variant,
+    ALIGN, ATLAS_TABLE_BYTES, Atlas, AtlasError, AtlasLimits, CELL_TABLE_BYTES, FILE_TABLE_BYTES,
+    GUTTER, MAX_ATLAS_TEXELS, MAX_PAGE_SIDE, MAX_PAGES, MIN_PAGE_SIDE, MIP_LEVELS, Page, Variant,
 };
 pub use canvas::{Canvas, Fit, MAX_CANVAS};
 pub use expr::{

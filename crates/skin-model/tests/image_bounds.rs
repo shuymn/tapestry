@@ -25,9 +25,9 @@ use image_support::{
     save, solid, whole, write,
 };
 use skin_model::{
-    AtlasError, AtlasLimits, CELL_TABLE_BYTES, FileAt, ImageDef, ImageError, MAX_FILE_BYTES,
-    MAX_IMAGE_TEXELS, MAX_SKIN_FRAMES, MAX_STREAMED_TEXELS, MAX_TOTAL_FILE_BYTES, MAX_TOTAL_TEXELS,
-    Sheet, TexelCap, Unbanded, Variant,
+    ATLAS_TABLE_BYTES, AtlasError, AtlasLimits, CELL_TABLE_BYTES, FileAt, ImageDef, ImageError,
+    MAX_FILE_BYTES, MAX_IMAGE_TEXELS, MAX_SKIN_FRAMES, MAX_STREAMED_TEXELS, MAX_TOTAL_FILE_BYTES,
+    MAX_TOTAL_TEXELS, Sheet, TexelCap, Unbanded, Variant,
 };
 
 struct Peak;
@@ -591,11 +591,11 @@ fn page_bytes(pages: usize, side: u32) -> i64 {
 }
 
 /// The bound a file decoded in bands stays within beside the pages and
-/// the atlas's tables (a term of their own, at most 65 536 ×
-/// [`CELL_TABLE_BYTES`]): `W_band = max(2E, E + 16 MiB)` for `E` encoded
+/// the atlas's tables (a term of their own, at most
+/// [`ATLAS_TABLE_BYTES`]): `W_band = max(2E, E + 16 MiB)` for `E` encoded
 /// bytes, `2E` while a file that grew since its length was checked is
-/// read, plus the 1 MiB margin the whole-file bound keeps for an entry
-/// and canonical path of the file. The 16 MiB holds
+/// read, plus the 1 MiB margin the whole-file bound keeps, which holds
+/// the canonical path of the file being read. The 16 MiB holds
 /// `png`'s own count (its metadata and output row, within its 1 MiB
 /// limit), its window of filtered rows (128 KiB at first, growing by rows
 /// of at most 128 KiB + 1 at 16 384 texels of 16-bit RGBA, with the old
@@ -822,14 +822,15 @@ fn one_files_routing_is_freed_before_the_next_file_is_read() {
 }
 
 /// The atlas's tables are a term of their own beside a file's bound: at
-/// most 65 536 cells × [`CELL_TABLE_BYTES`] (16 B for a rectangle and
-/// 20 B for a place) = 2 359 296 B, live while every file is read. Here
+/// most [`ATLAS_TABLE_BYTES`] = 65 536 cells × [`CELL_TABLE_BYTES`] (16 B
+/// for a rectangle and 20 B for a place) + 4 096 files × 24 B =
+/// 2 457 600 B, live while every file is read. Here
 /// 65 536 cells of 1×1 (64 images of 1 024 frames) cut a 16 384 × 1 025
 /// RGBA16 file, 1 MiB when it is admitted, that grows to `E` = 32 MiB as
 /// it is read (the cancel's first ask, before the first piece, extends
 /// it): the read's last step holds the old 31 MiB beside the new 32 MiB.
 /// The peak stays within pages + tables + `max(2E, E + 16 MiB) + 1 MiB`
-/// = pages + 2 359 296 B + 65 MiB, and passes pages + 65 MiB, the bound
+/// = pages + 2 457 600 B + 65 MiB, and passes pages + 65 MiB, the bound
 /// without the tables.
 #[test]
 fn the_most_cells_and_a_file_grown_while_read_stay_within_the_bound() {
@@ -869,13 +870,86 @@ fn the_most_cells_and_a_file_grown_while_read_stay_within_the_bound() {
     assert!(grown.get());
     let pages = page_bytes(atlas.pages().len(), atlas.side());
     let encoded = i64::try_from(MAX_FILE_BYTES).unwrap();
-    let tables = i64::try_from(MAX_SKIN_FRAMES * CELL_TABLE_BYTES).unwrap();
-    assert_eq!(tables, 2_359_296);
+    let tables = i64::try_from(ATLAS_TABLE_BYTES).unwrap();
+    assert_eq!(tables, 2_457_600);
+    assert!(i64::try_from(MAX_SKIN_FRAMES * CELL_TABLE_BYTES).unwrap() < tables);
     let bound = pages + tables + banded_bound(encoded);
     assert!(peak <= bound, "peak {peak}, bound {bound}");
     let without_tables = pages + banded_bound(encoded);
     assert!(
         peak > without_tables,
         "peak {peak}, bound without the tables {without_tables}"
+    );
+}
+
+/// No file's canonical path is kept while another is read: 4 096 files
+/// with cells under a skin folder whose canonical path is past 1 024 B,
+/// the first a 16 384 × 1 025 RGBA16 file of 61 440 cells that grows from
+/// 1 MiB to `E` = 32 MiB as it is read, the others 1×1 files of one cell
+/// each (65 535 cells in all). The peak stays within pages +
+/// [`ATLAS_TABLE_BYTES`] + `max(2E, E + 16 MiB) + 1 MiB` = pages +
+/// 2 457 600 B + 65 MiB; the 4 095 other paths kept beside the read would
+/// add more than 4 MiB.
+#[test]
+fn no_files_path_is_kept_while_another_is_read() {
+    let d = dir();
+    // Five levels of 230 bytes: a folder past 1 024 bytes.
+    let mut root = d.path().to_path_buf();
+    for c in ['a', 'b', 'c', 'd', 'e'] {
+        root.push(std::iter::repeat_n(c, 230).collect::<String>());
+    }
+    std::fs::create_dir_all(&root).unwrap();
+    let canonical = std::fs::canonicalize(&root).unwrap();
+    assert!(canonical.as_os_str().len() > 1_024);
+    let grow_path = root.join("grow.png");
+    stream_png16(&grow_path, 16_384, 1_025, |_, _| {
+        [0x8080, 0x4000, 0xFFFF, 0xFFFF]
+    });
+    let f = File::options().write(true).open(&grow_path).unwrap();
+    f.set_len(1 << 20).unwrap();
+    drop(f);
+    let mut one = Vec::new();
+    solid(1, 1, [1, 2, 3, 255])
+        .write_to(&mut std::io::Cursor::new(&mut one), ImageFormat::Png)
+        .unwrap();
+    let mut names = vec!["grow.png".to_owned()];
+    for i in 1..4_096 {
+        let name = format!("s{i:04}.png");
+        write(&root, &name, &one);
+        names.push(name);
+    }
+    let files = names.iter().map(|n| file(n)).collect();
+    let mut images: Vec<ImageDef> = (0..60)
+        .map(|r| ImageDef {
+            rect: Some([0, r, 1_024, 1]),
+            grid: [1_024, 1],
+            ..whole(0)
+        })
+        .collect();
+    images.extend((1..4_096).map(whole));
+    let sheet = load(&root, files, images).unwrap();
+    assert_eq!(sheet.frame_count(), 65_535);
+    let grown = std::cell::Cell::new(false);
+    let grow = || {
+        if !grown.replace(true) {
+            let f = File::options().write(true).open(&grow_path).unwrap();
+            f.set_len(MAX_FILE_BYTES).unwrap();
+        }
+        false
+    };
+    let limits = AtlasLimits {
+        max_side: 8_192,
+        max_layers: 8,
+        reserved_layers: 0,
+    };
+    let (atlas, peak) = measure(|| sheet.atlas(Variant::Lo, limits, &grow).unwrap());
+    assert!(grown.get());
+    let pages = page_bytes(atlas.pages().len(), atlas.side());
+    let tables = i64::try_from(ATLAS_TABLE_BYTES).unwrap();
+    let bound = pages + tables + banded_bound(i64::try_from(MAX_FILE_BYTES).unwrap());
+    assert!(
+        peak <= bound,
+        "peak {peak}, bound {bound}, over the pages {}",
+        peak - pages
     );
 }

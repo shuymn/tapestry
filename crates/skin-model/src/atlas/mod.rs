@@ -27,10 +27,21 @@ use pack::PackError;
 use uv::{FrameUv, UvTable};
 
 /// The bytes a cell keeps in the atlas's tables while its files are read
-/// and decoded: its rectangle and its place. With at most
-/// [`MAX_SKIN_FRAMES`](crate::MAX_SKIN_FRAMES) cells they hold at most
-/// 65 536 × 36 B = 2.25 MiB, beside the pages and the file being decoded.
+/// and decoded: its rectangle and its place.
 pub const CELL_TABLE_BYTES: usize = size_of::<[u32; 4]>() + size_of::<pack::Place>();
+/// The bytes a file with cells keeps in the atlas's tables while files are
+/// read and decoded: its index and its cells' range.
+pub const FILE_TABLE_BYTES: usize = size_of::<FileCells>();
+/// The most the atlas's tables hold while files are read and decoded:
+/// [`MAX_SKIN_FRAMES`](crate::MAX_SKIN_FRAMES) cells and
+/// [`MAX_FILES`](crate::MAX_FILES) files, 65 536 × 36 B + 4 096 × 24 B =
+/// 2 457 600 B. No file's path is kept: each is resolved again as it is
+/// read, so only the one being read has its canonical path live.
+pub const ATLAS_TABLE_BYTES: usize =
+    crate::MAX_SKIN_FRAMES * CELL_TABLE_BYTES + crate::image::MAX_FILES * FILE_TABLE_BYTES;
+
+/// A file with cells: its index and its cells' range.
+type FileCells = (usize, usize, usize);
 
 /// Mip levels per page, level 0 included.
 pub const MIP_LEVELS: usize = 4;
@@ -192,9 +203,9 @@ impl Sheet {
     /// ([`SolidImageDef`](crate::SolidImageDef)) are written last, at one
     /// size in both variants, reading nothing.
     ///
-    /// Memory beside the pages: the cells' tables ([`CELL_TABLE_BYTES`]
-    /// a cell), an entry with its canonical path for each file with cells,
-    /// and the one file being read and decoded within its own bound
+    /// Memory beside the pages: the tables ([`ATLAS_TABLE_BYTES`] at
+    /// most), the canonical path of the file being read, and that one file
+    /// read and decoded within its own bound
     /// ([`MAX_IMAGE_TEXELS`](crate::MAX_IMAGE_TEXELS),
     /// [`MAX_STREAMED_TEXELS`](crate::MAX_STREAMED_TEXELS)).
     ///
@@ -315,7 +326,7 @@ impl Sheet {
         let cells = self.cells();
         // The files with cells, checked and summed before any is read.
         // File cells come first ([`CellSource`]'s order).
-        let mut used: Vec<(usize, usize, usize)> = Vec::new();
+        let mut used: Vec<FileCells> = Vec::new();
         let mut start = 0;
         while let Some(&CellSource::File(file)) = cells.get(start).map(|c| &c.source) {
             let end = start
@@ -327,26 +338,39 @@ impl Sheet {
             used.push((usize::try_from(file).unwrap_or(usize::MAX), start, end));
             start = end;
         }
+        // At most [`MAX_FILES`](crate::MAX_FILES) entries
+        // ([`ATLAS_TABLE_BYTES`]), whatever the growth left.
+        used.shrink_to_fit();
+        // Each file's path and length, checked and summed before any is
+        // read; the canonical paths are not kept.
+        let version = |file: usize| {
+            let (version, hi) = files.get(file)?.version(variant);
+            Some((version, FileAt { file, hi }))
+        };
         let mut total = 0_u64;
-        let mut resolved = Vec::with_capacity(used.len());
         for &(file, _, _) in &used {
-            let Some(f) = files.get(file) else {
+            let Some((version, at)) = version(file) else {
                 continue;
             };
-            let (version, hi) = f.version(variant);
-            let at = FileAt { file, hi };
-            let (canonical, len) =
+            let (_, len) =
                 path::resolve(self.root(), &version.name).map_err(|e| ImageError::path(at, e))?;
             total = total.saturating_add(len);
             if total > MAX_TOTAL_FILE_BYTES {
                 return Err(ImageError::TotalBytesTooLarge { at }.into());
             }
-            resolved.push((at, canonical, (version.dims, version.mode)));
         }
 
         let mut budget = MAX_TOTAL_FILE_BYTES;
-        for ((at, canonical, header), &(_, start, end)) in resolved.into_iter().zip(&used) {
+        for &(file, start, end) in &used {
+            let Some((version, at)) = version(file) else {
+                continue;
+            };
+            let header = (version.dims, version.mode);
+            // Resolved again as it is read: only this file's path is live.
+            let (canonical, _) =
+                path::resolve(self.root(), &version.name).map_err(|e| ImageError::path(at, e))?;
             let bytes = image::read_encoded(&canonical, at, MAX_FILE_BYTES.min(budget), cancel)?;
+            drop(canonical);
             budget = budget.saturating_sub(u64::try_from(bytes.len()).unwrap_or(budget));
             // This file's placements and window, at their exact size, made
             // after its bytes are read and freed with them: nothing of one
@@ -499,9 +523,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_cell_keeps_36_bytes_in_the_tables() {
+    fn the_tables_hold_36_bytes_a_cell_and_24_a_file() {
         assert_eq!(CELL_TABLE_BYTES, 36);
-        assert_eq!(crate::MAX_SKIN_FRAMES * CELL_TABLE_BYTES, 2_359_296);
+        assert_eq!(FILE_TABLE_BYTES, 24);
+        assert_eq!(ATLAS_TABLE_BYTES, 65_536 * 36 + 4_096 * 24);
+        assert_eq!(ATLAS_TABLE_BYTES, 2_457_600);
     }
 
     #[test]

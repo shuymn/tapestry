@@ -59,7 +59,7 @@ pub const MAX_IMAGE_TEXELS: u64 = 12 << 20;
 /// [`MAX_FILE_BYTES`] its reading and decoding stay within the larger of
 /// 2 × 32 MiB and 32 MiB + 16 MiB, whatever its texels, beside the
 /// atlas's pages and tables
-/// ([`CELL_TABLE_BYTES`](crate::CELL_TABLE_BYTES)).
+/// ([`ATLAS_TABLE_BYTES`](crate::ATLAS_TABLE_BYTES)).
 pub const MAX_STREAMED_TEXELS: u64 = 64 << 20;
 /// The most texels across one variant's files.
 pub const MAX_TOTAL_TEXELS: u64 = 128 << 20;
