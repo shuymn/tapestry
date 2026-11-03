@@ -471,8 +471,9 @@ fn tail_presses_sound_and_light_without_changing_the_play() {
 }
 
 /// Every way out of the tail ends the feedback before anything else: a
-/// press 100 ms after the exit is never converted and never sounds, the
-/// sources close once, and a cut stops the audio.
+/// press received with the exit, in the step that takes it, is never
+/// converted and never sounds, the sources close once, and a cut stops
+/// the audio.
 #[test]
 fn every_tail_exit_ends_the_feedback_first() {
     let gone = Action::Disconnect(KEYBOARD);
@@ -484,17 +485,38 @@ fn every_tail_exit_ends_the_feedback_first() {
         ("close", (Vec::new(), Vec::new(), at)),
         (
             "focus",
-            (vec![item(at, Action::FocusLoss)], Vec::new(), i64::MAX),
+            (
+                vec![item(at - 500, Action::FocusLoss)],
+                Vec::new(),
+                i64::MAX,
+            ),
         ),
-        ("device", (vec![item(at, gone)], Vec::new(), i64::MAX)),
+        ("device", (vec![item(at - 500, gone)], Vec::new(), i64::MAX)),
     ];
     for (name, (extra, commands, quit_at)) in exits {
         let mut items = hits();
         items.extend(tap(2_000, 1));
         items.extend(extra);
-        items.extend(tap(2_300, 1));
-        let (rig, report) = played(items, &commands, quit_at);
+        // Received half a millisecond before the step that takes the
+        // exit, which its wait feeds with it.
+        items.push(item(
+            at - 500,
+            Action::Packet(Packet {
+                device: KEYBOARD,
+                control: code(1),
+                value: 1,
+                background: false,
+            }),
+        ));
+        let (mut rig, report) = played(items, &commands, quit_at);
         assert_eq!(report.end, PlayEnd::Completed, "{name}");
+        // The view the screen keeps once the tail is over.
+        let kept = rig.side.as_mut().unwrap().view().input;
+        assert_eq!(
+            kept.lane(lane(1)),
+            input(false, Some(2_000), Some(2_020)),
+            "{name}"
+        );
         let cut = match name {
             "retry" => Some(AbortCause::Retry),
             "close" => Some(AbortCause::Quit),
@@ -504,10 +526,10 @@ fn every_tail_exit_ends_the_feedback_first() {
         };
         assert_eq!(report.tail_cut, cut, "{name}");
         assert_eq!(report.tail_skipped, name == "skip", "{name}");
-        // The hits and the tap at 2.0 s; never the one at 2.3 s.
+        // The hits and the tap at 2.0 s; never the one at 2.2 s.
         assert_eq!(rig.key_starts, 3, "{name}");
         let last = rig.tail().last().unwrap();
-        assert!(last.at < 2_300 * MS, "{name}: {last:?}");
+        assert!(last.at < 2_200 * MS, "{name}: {last:?}");
         assert_eq!(
             last.input.lane(lane(1)),
             input(false, Some(2_000), Some(2_020)),
