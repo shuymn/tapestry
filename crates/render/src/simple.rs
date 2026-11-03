@@ -17,7 +17,7 @@
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
 use bms_model::{Chart, LANE_COUNT, Lane, Note, NoteKind, Position, TimeUs};
-use eval::{JudgeEvent, JudgeEventKind, NoteFacts, Section};
+use eval::{InputFacts, JudgeEvent, JudgeEventKind, NoteFacts, Section};
 use game::ResultGraphs;
 use rules::{GaugeValue, Judgment, LnMode};
 use skin_model::{BuildError, ExactPlayhead, PrepareError};
@@ -157,7 +157,7 @@ const MINE_H: f32 = 8.0;
 const JUDGE_LINE_H: f32 = 6.0;
 /// Height of a bar line.
 const BAR_LINE_H: f32 = 2.0;
-/// How long a key beam fades after a press.
+/// How long a key beam fades after its lane's release.
 const BEAM_US: i64 = 100_000;
 /// How long a bomb fades after a hit.
 const BOMB_US: i64 = 200_000;
@@ -222,8 +222,6 @@ pub struct SimpleSkin {
     /// The long-note judgment mode the notes are drawn by: LN, the only
     /// mode judged (design.md "LN Judgment Modes").
     ln_mode: LnMode,
-    /// Latest press per lane, for the key beam.
-    pressed: [Option<TimeUs>; LANE_COUNT],
     /// Latest hit per lane, for the bomb.
     hit: [Option<TimeUs>; LANE_COUNT],
     /// Latest judgment shown, and when.
@@ -247,7 +245,6 @@ impl SimpleSkin {
             masked: Default::default(),
             section: None,
             ln_mode: LnMode::Ln,
-            pressed: [None; LANE_COUNT],
             hit: [None; LANE_COUNT],
             judgment: None,
         }
@@ -351,39 +348,32 @@ impl SimpleSkin {
                             }))
                 });
                 if !completion {
-                    self.feedback(l, judgment, deviation.is_some(), ev.time);
+                    self.feedback(l, judgment, ev.time);
                 }
             }
             JudgeEventKind::LnHeld { lane, judgment, .. } => {
                 self.judgment = Some((judgment, ev.time));
-                self.feedback(lane.index(), judgment, true, ev.time);
+                self.feedback(lane.index(), judgment, ev.time);
             }
-            JudgeEventKind::EmptyPoor { lane } => {
-                self.pressed[lane.index()] = Some(ev.time);
+            JudgeEventKind::EmptyPoor { .. } => {
                 self.judgment = Some((Judgment::Poor, ev.time));
             }
-            JudgeEventKind::PlaySound { lane, .. } => {
-                self.pressed[lane.index()] = Some(ev.time);
-            }
-            JudgeEventKind::LnHoldEnded { .. }
+            JudgeEventKind::PlaySound { .. }
+            | JudgeEventKind::LnHoldEnded { .. }
             | JudgeEventKind::MineHit { .. }
             | JudgeEventKind::Gauge { .. }
             | JudgeEventKind::SongEnd => {}
         }
     }
 
-    /// A judgment's key beam and bomb on lane `l`: the bomb unless it is a
-    /// POOR, the beam when a press made it.
+    /// A judgment's bomb on lane `l`, unless it is a POOR.
     #[expect(
         clippy::indexing_slicing,
         reason = "callers pass a `Lane::index`, below LANE_COUNT"
     )]
-    fn feedback(&mut self, l: usize, judgment: Judgment, pressed: bool, at: TimeUs) {
+    fn feedback(&mut self, l: usize, judgment: Judgment, at: TimeUs) {
         if judgment != Judgment::Poor {
             self.hit[l] = Some(at);
-        }
-        if pressed {
-            self.pressed[l] = Some(at);
         }
     }
 
@@ -516,11 +506,19 @@ impl SimpleSkin {
         }
     }
 
-    fn effects(&self, out: &mut SpriteBatch, at: TimeUs) {
+    /// Each lane's key beam from the view's `input`, whatever effects were
+    /// dropped: whole while the lane is held, notes or none, fading from
+    /// its release; and its bomb from the effects.
+    fn effects(&self, out: &mut SpriteBatch, input: &InputFacts, at: TimeUs) {
         for lane in Lane::all() {
             let (x, w) = layout::lane_x(lane);
-            #[expect(clippy::indexing_slicing, reason = "`Lane::index` is below LANE_COUNT")]
-            if let Some(f) = self.pressed[lane.index()].and_then(|t| fade(at, t, BEAM_US)) {
+            let key = input.lane(lane);
+            let beam = if key.held {
+                Some(1.0)
+            } else {
+                key.released.and_then(|t| fade(at, t, BEAM_US))
+            };
+            if let Some(f) = beam {
                 let c = [BEAM[0], BEAM[1], BEAM[2], BEAM[3] * f];
                 rect(out, Blend::Add, x, LANE_TOP, w, JUDGE_Y - LANE_TOP, c);
             }
@@ -640,11 +638,11 @@ impl PlaySkin for SimpleSkin {
         Ok(())
     }
 
-    /// What the effects built up starts over: no lane pressed or hit and
-    /// no judgment shown; the chart, the section's mask and the prepared
-    /// playhead stay, and the notes follow the next frame's facts.
+    /// What the effects built up starts over: no lane hit and no
+    /// judgment shown; the chart, the section's mask and the prepared
+    /// playhead stay, and the notes and the key beams follow the next
+    /// frame's view.
     fn rearm(&mut self) {
-        self.pressed = [None; LANE_COUNT];
         self.hit = [None; LANE_COUNT];
         self.judgment = None;
     }
@@ -672,7 +670,7 @@ impl PlaySkin for SimpleSkin {
         // Feedback ages on the frame's own clock: the display offset moves
         // notes only.
         self.hud(f, out, f.now);
-        self.effects(out, f.now);
+        self.effects(out, &f.view.input, f.now);
         Ok(())
     }
 
@@ -1106,6 +1104,7 @@ mod tests {
             },
             gauges: Vec::new(),
             notes: NoteFacts::default(),
+            input: eval::InputFacts::NONE,
             complete: false,
             playing: true,
             events: 0,
@@ -2047,7 +2046,7 @@ mod tests {
                 let playhead = s.playhead.as_ref().unwrap();
                 assert_eq!(playhead.representatives().as_ptr(), reps, "rearm {k}");
                 assert_eq!(s.attempt_bytes(), bytes, "rearm {k}");
-                assert_eq!((s.judgment, s.hit, s.pressed), (None, [None; 8], [None; 8]));
+                assert_eq!((s.judgment, s.hit), (None, [None; 8]));
                 assert_eq!(notes_drawn(&mut s), fresh, "rearm {k}");
             }
         }
@@ -2316,16 +2315,19 @@ mod tests {
 
     #[test]
     fn display_offset_moves_notes_but_not_feedback() {
-        // A press judged GREAT at 1 s, drawn at 1 s with a 150 ms display
-        // offset: the 100 ms beam and the 200 ms bomb are fresh, though the
-        // display time is past both lifetimes' halves.
+        // A press judged GREAT at 1 s and released there, drawn at 1 s
+        // with a 150 ms display offset: the 100 ms beam fading from the
+        // release and the 200 ms bomb are fresh, though the display time
+        // is past both lifetimes' halves.
         let chart = ChartBuilder::new(BPM)
             .tap(lane(3), TimeUs(1_200 * MS))
             .tap(lane(6), TimeUs(1_000 * MS))
             .build()
             .unwrap();
         let mut s = skin(&chart);
-        let v = view();
+        let mut v = view();
+        v.input.press(lane(6), TimeUs(1_000 * MS));
+        v.input.release(lane(6), TimeUs(1_000 * MS));
         let press = JudgeEvent {
             seq: 0,
             time: TimeUs(1_000 * MS),

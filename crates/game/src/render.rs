@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bms_model::TimeUs;
-use eval::{GaugeState, JudgeEvent, NoteFacts, Tally};
+use eval::{GaugeState, InputFacts, JudgeEvent, NoteFacts, Tally};
 
 use crate::logic::EventSink;
 
@@ -35,6 +35,11 @@ pub struct PlayView {
     /// chart's note identities ([`eval::Evaluator::notes`]), sized for the
     /// chart in every buffer before the play starts.
     pub notes: NoteFacts,
+    /// Each lane's input as conversion left it
+    /// ([`eval::Evaluator::input`]): held now, its latest press and
+    /// release, and how far conversion went. Copied whole with every
+    /// view, so no effect's loss can change it.
+    pub input: InputFacts,
     /// Whether evaluation is complete.
     pub complete: bool,
     /// Whether the play is in its playing phase, as the lifecycle
@@ -265,7 +270,7 @@ pub fn render_link(
 #[cfg(test)]
 mod tests {
     use bms_model::TimeUs;
-    use eval::{JudgeEvent, JudgeEventKind, NoteFacts, Tally};
+    use eval::{InputFacts, JudgeEvent, JudgeEventKind, NoteFacts, Tally};
     use rules::PerJudgment;
 
     use super::{PlayView, ViewWriter, render_link};
@@ -308,6 +313,7 @@ mod tests {
             },
             gauges: Vec::new(),
             notes: NoteFacts::default(),
+            input: InputFacts::NONE,
             complete: false,
             playing: false,
             events: 0,

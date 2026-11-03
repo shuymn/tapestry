@@ -13,7 +13,7 @@ pub(crate) mod timers;
 use bms_model::{
     Chart, LANE_COUNT, Lane, LnMode, Note, Position, PresentationError, TimeUs, TimelineId,
 };
-use eval::{GaugeState, JudgeEvent, NoteFacts, NoteHold, Section, Tally};
+use eval::{GaugeState, InputFacts, JudgeEvent, NoteFacts, NoteHold, Section, Tally};
 use rules::GaugeValue;
 
 use self::playhead::ExactPlayhead;
@@ -168,6 +168,10 @@ pub struct SkinFrame<'a> {
     /// visual long-note hold, from which the lanes and the `hold` timers
     /// read, whatever effects were dropped.
     pub notes: &'a NoteFacts,
+    /// The play view's lane input: each lane held or not, with its latest
+    /// press and release, from which the `press` and `release` timers
+    /// read.
+    pub input: &'a InputFacts,
     /// Whether evaluation is complete (the play view's `complete`): a
     /// section attempt then rings out without notes.
     pub complete: bool,
@@ -717,6 +721,7 @@ mod tests {
                     gauges: &snapshot,
                     gauge: 0,
                     effects,
+                    input: &eval::InputFacts::NONE,
                     notes,
                     complete: false,
                     playing: true,
@@ -805,6 +810,7 @@ mod tests {
             gauge: 0,
             effects: &[ev(1_250, ended(2, 0))],
             notes: &notes,
+            input: &eval::InputFacts::NONE,
             complete: false,
             playing: true,
             target: [1_920, 1_080],

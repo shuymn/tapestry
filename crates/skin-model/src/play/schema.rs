@@ -372,9 +372,12 @@ impl Grade {
 /// A per-lane timer kind, in slot order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LaneTimer {
-    /// The lane's latest press: off until the play view carries lane input.
+    /// Key-on: while the lane is held, from its latest press (from the
+    /// READY start for a lane held since the opening); off while it is
+    /// released.
     Press,
-    /// The lane's latest release: off, as `Press`.
+    /// Key-off: while the lane is released, from its latest release; off
+    /// while it is held and before its first release.
     Release,
     /// The lane's latest judgment within the skin's bomb threshold, from a
     /// press.

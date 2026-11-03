@@ -8534,4 +8534,7 @@ pub(crate) mod tests {
     mod bitmap;
     // Dropped effects and rearms through the acquisition into both skins.
     mod note_snapshot;
+    // Lane input through the acquisition into both skins' key beams and
+    // key timers.
+    mod lane_input;
 }

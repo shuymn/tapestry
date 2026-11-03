@@ -19,7 +19,7 @@
 
 mod common;
 
-use bms_model::{Chart, ChartBuilder, SoundId, TimeUs};
+use bms_model::{Chart, ChartBuilder, TimeUs};
 use common::{MS, input, lane, note_center, view, warp, white_rows};
 use eval::{JudgeEvent, JudgeEventKind};
 use render::text::MenuText;
@@ -710,8 +710,8 @@ fn rotated_sprite_turns_clockwise_about_its_pivot() {
 
 #[test]
 fn fading_beam_adds_its_colour_once() {
-    // A press on lane 7 at 1.0 s lights its beam, (0.25, 0.3, 0.55) at
-    // alpha 0.8, fading over 100 ms, added over the lane's background,
+    // Lane 7 released at 1.0 s: its beam, (0.25, 0.3, 0.55) at alpha
+    // 0.8, fades over 100 ms from the release, added over the lane's background,
     // (0.04, 0.04, 0.05) stored as (10, 10, 13). Sampled at layout (672,
     // 300), screen (448, 352):
     // - 25 ms on, alpha 0.6, premultiplied (0.15, 0.18, 0.33): 38.25 + 10,
@@ -725,16 +725,9 @@ fn fading_beam_adds_its_colour_once() {
         .build()
         .unwrap();
     let mut r = warp(&chart);
-    let v = view(0, 0);
-    let press = JudgeEvent {
-        seq: 0,
-        time: TimeUs(1_000 * MS),
-        origin: Some(TimeUs(1_000 * MS)),
-        kind: JudgeEventKind::PlaySound {
-            lane: lane(7),
-            sound: SoundId(0),
-        },
-    };
+    let mut v = view(0, 0);
+    v.input.press(lane(7), TimeUs(990 * MS));
+    v.input.release(lane(7), TimeUs(1_000 * MS));
     let mut at = |now_ms: i64, effects: &[JudgeEvent]| {
         r.frame(&input(&v, TimeUs(now_ms * MS), TimeUs(0), effects))
             .unwrap();
@@ -742,7 +735,7 @@ fn fading_beam_adds_its_colour_once() {
         let i = ((352 * common::WIDTH + LANE_7) * 4) as usize;
         [pixels[i], pixels[i + 1], pixels[i + 2]]
     };
-    assert_rgb(at(1_025, &[press]), [48, 56, 97]);
+    assert_rgb(at(1_025, &[]), [48, 56, 97]);
     assert_rgb(at(1_075, &[]), [23, 25, 41]);
     assert_rgb(at(1_100, &[]), [10, 10, 13]);
 }

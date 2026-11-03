@@ -376,6 +376,8 @@ pub struct Harness {
     /// The note facts each frame gives, following its effects
     /// ([`follow`]) unless a test changes them.
     pub notes: NoteFacts,
+    /// The lane input each frame gives.
+    pub input: eval::InputFacts,
 }
 
 impl Harness {
@@ -399,6 +401,7 @@ impl Harness {
             readouts: None,
             chart: chart.clone(),
             notes: NoteFacts::new(chart),
+            input: eval::InputFacts::NONE,
         }
     }
 
@@ -427,6 +430,7 @@ impl Harness {
             gauge: self.gauge,
             effects,
             notes: &self.notes,
+            input: &self.input,
             complete: self.complete,
             target: self.target,
             layout: &self.layout,

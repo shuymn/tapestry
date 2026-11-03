@@ -308,6 +308,7 @@ impl<'a, R: SourceRead> Logic<'a, R> {
             tally: *evaluator.tally(),
             gauges: evaluator.gauges().to_vec(),
             notes: evaluator.notes().clone(),
+            input: *evaluator.input(),
             complete: false,
             playing: false,
             events: 0,
@@ -582,6 +583,7 @@ impl<'a, R: SourceRead> Logic<'a, R> {
             tally: *self.evaluator.tally(),
             gauges: self.evaluator.gauges().to_vec(),
             notes: self.evaluator.notes().clone(),
+            input: *self.evaluator.input(),
             complete: self.evaluator.is_complete(),
             playing: self.playing,
             events: self.emitted,
@@ -717,6 +719,8 @@ impl<'a, R: SourceRead> Logic<'a, R> {
         if v.notes.revision() != notes.revision() {
             v.notes.copy_from(notes);
         }
+        // Whole, every time: the held lanes and the latest edges.
+        v.input = *self.evaluator.input();
         v.complete = self.evaluator.is_complete();
         v.playing = self.playing;
         v.events = self.emitted;

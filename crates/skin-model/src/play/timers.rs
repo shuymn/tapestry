@@ -433,7 +433,17 @@ impl Play {
             let hold = self.holds.get(l).copied().flatten().map(|h| h.start);
             let bomb = self.reducer.bomb.get(l).copied().flatten();
             let mine = self.reducer.mine.get(l).copied().flatten();
-            // Press and release stay off until S9.
+            // Key-on and key-off exclude each other, from the view's input
+            // in µs, whatever the play phase: a lane held since the opening
+            // has no press, so its key-on runs from the READY start.
+            let key = frame.input.lane(lane);
+            let (press, release) = if key.held {
+                (Some(key.pressed.unwrap_or(self.ready_at)), None)
+            } else {
+                (None, key.released)
+            };
+            set(lane_timer(LaneTimer::Press, lane), press);
+            set(lane_timer(LaneTimer::Release, lane), release);
             set(lane_timer(LaneTimer::Bomb, lane), bomb);
             set(lane_timer(LaneTimer::Hold, lane), hold);
             set(lane_timer(LaneTimer::Mine, lane), mine);
