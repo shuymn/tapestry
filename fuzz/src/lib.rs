@@ -2283,6 +2283,9 @@ pub struct PngSpec {
     bad_text: bool,
     extra_idat: bool,
     seed: Vec<u8>,
+    /// The palette and transparency table, made once from the seed.
+    palette: Vec<u8>,
+    trns: Vec<u8>,
 }
 
 impl PngSpec {
@@ -2308,7 +2311,7 @@ impl PngSpec {
             .get(6..)
             .filter(|s| !s.is_empty())
             .unwrap_or(&[7, 1, 99]);
-        Self {
+        let mut spec = Self {
             kind,
             w,
             h,
@@ -2317,7 +2320,12 @@ impl PngSpec {
             bad_text: flags & 2 == 2,
             extra_idat: flags & 4 == 4,
             seed: seed.to_vec(),
-        }
+            palette: Vec::new(),
+            trns: Vec::new(),
+        };
+        spec.palette = spec.make_palette();
+        spec.trns = spec.make_trns();
+        spec
     }
 
     /// The byte `k` of block `(bx, by)`: samples are constant over blocks
@@ -2342,13 +2350,13 @@ impl PngSpec {
         }
     }
 
-    fn palette(&self) -> Vec<u8> {
+    fn make_palette(&self) -> Vec<u8> {
         (0..768)
             .map(|i| self.seed[(i * 5 + 3) % self.seed.len()])
             .collect()
     }
 
-    fn trns(&self) -> Vec<u8> {
+    fn make_trns(&self) -> Vec<u8> {
         match self.kind {
             PngKind::Rgb16Trns => {
                 let [r, g, b, _] = self.samples(0, 0);
@@ -2390,8 +2398,8 @@ impl PngSpec {
             PngKind::Rgba16 => [q(s[0]), q(s[1]), q(s[2]), q(s[3])],
             PngKind::Indexed8Trns => {
                 let i = usize::from(s[0]);
-                let p = self.palette();
-                let a = self.trns().get(i).copied().unwrap_or(255);
+                let p = &self.palette;
+                let a = self.trns.get(i).copied().unwrap_or(255);
                 [p[3 * i], p[3 * i + 1], p[3 * i + 2], a]
             }
             PngKind::Grey1Trns => {
@@ -2420,11 +2428,7 @@ impl PngSpec {
             return;
         }
         let (color, depth) = self.kind.format();
-        let channels = if color == png::ColorType::Indexed {
-            1
-        } else {
-            color.samples()
-        };
+        let channels = color.samples();
         for x in 0..self.w {
             let s = self.samples(x, y);
             for &v in &s[..channels] {
@@ -2448,11 +2452,10 @@ impl PngSpec {
         enc.set_compression(png::Compression::Fast);
         enc.set_filter(png::Filter::Sub);
         if color == png::ColorType::Indexed {
-            enc.set_palette(self.palette());
+            enc.set_palette(self.palette.as_slice());
         }
-        let trns = self.trns();
-        if !trns.is_empty() {
-            enc.set_trns(trns);
+        if !self.trns.is_empty() {
+            enc.set_trns(self.trns.as_slice());
         }
         let mut header = enc.write_header().expect("a PNG header");
         {
@@ -2499,6 +2502,14 @@ pub struct PngOutcome {
     pub built: Result<(), skin_model::AtlasError>,
     /// The second build's cancel said yes, and it was cancelled.
     pub cancelled: bool,
+}
+
+/// Every page's every level of `atlas`, in order.
+fn levels(atlas: &skin_model::Atlas) -> impl Iterator<Item = &[u8]> {
+    atlas
+        .pages()
+        .iter()
+        .flat_map(|p| (0..skin_model::MIP_LEVELS).filter_map(move |k| p.level(k)))
 }
 
 /// The variant of `e`, and of the image error inside it.
@@ -2630,14 +2641,7 @@ pub fn skin_png(data: &[u8]) -> PngOutcome {
     if !cancelled {
         match (&first, &again) {
             (Ok(a), Ok(b)) => {
-                let levels = |x: &skin_model::Atlas| -> Vec<Vec<u8>> {
-                    x.pages()
-                        .iter()
-                        .flat_map(|p| (0..skin_model::MIP_LEVELS).filter_map(|k| p.level(k)))
-                        .map(<[u8]>::to_vec)
-                        .collect()
-                };
-                assert!(levels(a) == levels(b), "a second build differs");
+                assert!(levels(a).eq(levels(b)), "a second build differs");
             }
             (Err(e), Err(f)) => assert!(variant(e) == variant(f), "{e:?} then {f:?}"),
             (first, again) => panic!("a second build differs: {first:?} then {again:?}"),

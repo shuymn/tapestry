@@ -249,8 +249,8 @@ pub enum ImageError {
         #[source]
         source: ::image::ImageError,
     },
-    /// The PNG decoder of a file decoded in bands, or of an oversized
-    /// file's header.
+    /// The PNG decoder reading a file in bands, an oversized file's
+    /// header, or a whole-decoded PNG's header checked before its decode.
     #[error("{at}")]
     Png {
         at: FileAt,

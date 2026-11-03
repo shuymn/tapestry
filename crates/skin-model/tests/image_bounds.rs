@@ -21,8 +21,8 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use image::codecs::png::{CompressionType, FilterType, PngEncoder};
 use image::{ExtendedColorType, ImageEncoder, ImageFormat, RgbImage};
 use image_support::{
-    LIMITS, bmp_header, chunk, dir, file, load, load_files, png_header, png_header_with, png_start,
-    save, solid, whole, write,
+    LIMITS, bmp_header, chunk, content, dir, file, load, load_files, png_header, png_header_with,
+    png_start, save, solid, texel, whole, write,
 };
 use skin_model::{
     ATLAS_TABLE_BYTES, AtlasError, AtlasLimits, CELL_TABLE_BYTES, FileAt, ImageDef, ImageError,
@@ -656,19 +656,12 @@ fn a_sheet_past_the_full_decode_cap_decodes_in_bands_within_its_bound() {
     assert!(peak >= pages + encoded, "peak {peak}");
     // Every frame holds its colour, premultiplied, at its first texel.
     assert_eq!(sheet.frame_count(), 55);
-    let side = atlas.side();
-    for (i, f) in atlas.uvs().frames().iter().enumerate() {
-        let i = u32::try_from(i).unwrap();
+    for i in 0..55 {
         let [r, g, b, a] = colour(i % 5, i / 5);
         let pre = |c: u8| u8::try_from((u32::from(c) * u32::from(a) + 127) / 255).unwrap();
-        let page = &atlas.pages()[usize::from(f.layer) - 1];
-        let (x, y) = (
-            (f.uv[0] * side as f32) as usize,
-            (f.uv[1] * side as f32) as usize,
-        );
-        let at = (y * side as usize + x) * 4;
+        let ([x, y, ..], page) = content(&atlas, i, 1);
         assert_eq!(
-            page.level(0).unwrap()[at..at + 4],
+            texel(&atlas, page, 0, x, y),
             [pre(r), pre(g), pre(b), a],
             "frame {i}"
         );
@@ -711,17 +704,14 @@ fn many_tall_thin_cells_route_within_the_bound() {
         peak <= bound,
         "peak {peak}, bound {bound}, encoded {encoded}"
     );
-    let side = atlas.side() as usize;
-    for (x, f) in (0_u32..).zip(atlas.uvs().frames()) {
-        let page = atlas.pages()[usize::from(f.layer)].level(0).unwrap();
-        let (u, v0, v1) = (
-            (f.uv[0] * side as f32) as usize,
-            (f.uv[1] * side as f32) as usize,
-            (f.uv[3] * side as f32) as usize,
-        );
-        for v in [v0, v1 - 1] {
-            let at = (v * side + u) * 4;
-            assert_eq!(page[at..at + 4], colour(x, (x % 3) * 4_000), "cell {x}");
+    for x in 0..w {
+        let ([u, v, _, ch], page) = content(&atlas, x, 0);
+        for v in [v, v + ch - 1] {
+            assert_eq!(
+                texel(&atlas, page, 0, u, v),
+                colour(x, (x % 3) * 4_000),
+                "cell {x}"
+            );
         }
     }
 }
@@ -801,16 +791,9 @@ fn one_files_routing_is_freed_before_the_next_file_is_read() {
         assert!(peak <= bound, "peak {peak}, bound {bound}");
         // The deep cell's first texel, its 16-bit samples rounded as a
         // whole decode rounds them.
-        let f = atlas.uvs().frames()[32_769];
-        let side = atlas.side() as usize;
-        let (x, y) = (
-            (f.uv[0] * side as f32) as usize,
-            (f.uv[1] * side as f32) as usize,
-        );
-        let page = atlas.pages()[usize::from(f.layer)].level(0).unwrap();
-        let at = (y * side + x) * 4;
+        let ([x, y, ..], page) = content(&atlas, 32_769, 0);
         let want = colour.map(|v| u8::try_from((u32::from(v) + 128) / 257).unwrap());
-        assert_eq!(page[at..at + 4], want);
+        assert_eq!(texel(&atlas, page, 0, x, y), want);
         peak - pages
     };
     let deep_first = build(["deep.png", "many.png"], 1, 0);
@@ -819,6 +802,24 @@ fn one_files_routing_is_freed_before_the_next_file_is_read() {
         many_first <= deep_first + (256 << 10),
         "many first {many_first}, deep first {deep_first}"
     );
+}
+
+/// A 16 384 × 1 025 RGBA16 PNG at `path` of one colour, padded after
+/// `IEND` to 1 MiB: the length admission checks.
+fn growing_png(path: &std::path::Path) {
+    stream_png16(path, 16_384, 1_025, |_, _| [0x8080, 0x4000, 0xFFFF, 0xFFFF]);
+    let f = File::options().write(true).open(path).unwrap();
+    f.set_len(1 << 20).unwrap();
+}
+
+/// A cancel that asks nothing to stop: on its first ask, the first piece
+/// of the first read, it grows the file at `path` to [`MAX_FILE_BYTES`].
+fn grow_once(path: &std::path::Path, grown: &std::cell::Cell<bool>) -> bool {
+    if !grown.replace(true) {
+        let f = File::options().write(true).open(path).unwrap();
+        f.set_len(MAX_FILE_BYTES).unwrap();
+    }
+    false
 }
 
 /// The atlas's tables are a term of their own beside a file's bound: at
@@ -836,12 +837,7 @@ fn one_files_routing_is_freed_before_the_next_file_is_read() {
 fn the_most_cells_and_a_file_grown_while_read_stay_within_the_bound() {
     let d = dir();
     let path = d.path().join("grow.png");
-    stream_png16(&path, 16_384, 1_025, |_, _| {
-        [0x8080, 0x4000, 0xFFFF, 0xFFFF]
-    });
-    let f = File::options().write(true).open(&path).unwrap();
-    f.set_len(1 << 20).unwrap();
-    drop(f);
+    growing_png(&path);
     let images = (0..64)
         .map(|r| ImageDef {
             rect: Some([0, r, 1_024, 1]),
@@ -852,13 +848,7 @@ fn the_most_cells_and_a_file_grown_while_read_stay_within_the_bound() {
     let sheet = load(d.path(), vec![file("grow.png")], images).unwrap();
     assert_eq!(sheet.frame_count(), MAX_SKIN_FRAMES);
     let grown = std::cell::Cell::new(false);
-    let grow = || {
-        if !grown.replace(true) {
-            let f = File::options().write(true).open(&path).unwrap();
-            f.set_len(MAX_FILE_BYTES).unwrap();
-        }
-        false
-    };
+    let grow = || grow_once(&path, &grown);
     // Eight layers and none reserved: a page holds at most 32 767 cells,
     // so the cells take three pages of 4 096.
     let limits = AtlasLimits {
@@ -902,12 +892,7 @@ fn no_files_path_is_kept_while_another_is_read() {
     let canonical = std::fs::canonicalize(&root).unwrap();
     assert!(canonical.as_os_str().len() > 1_024);
     let grow_path = root.join("grow.png");
-    stream_png16(&grow_path, 16_384, 1_025, |_, _| {
-        [0x8080, 0x4000, 0xFFFF, 0xFFFF]
-    });
-    let f = File::options().write(true).open(&grow_path).unwrap();
-    f.set_len(1 << 20).unwrap();
-    drop(f);
+    growing_png(&grow_path);
     let mut one = Vec::new();
     solid(1, 1, [1, 2, 3, 255])
         .write_to(&mut std::io::Cursor::new(&mut one), ImageFormat::Png)
@@ -930,13 +915,7 @@ fn no_files_path_is_kept_while_another_is_read() {
     let sheet = load(&root, files, images).unwrap();
     assert_eq!(sheet.frame_count(), 65_535);
     let grown = std::cell::Cell::new(false);
-    let grow = || {
-        if !grown.replace(true) {
-            let f = File::options().write(true).open(&grow_path).unwrap();
-            f.set_len(MAX_FILE_BYTES).unwrap();
-        }
-        false
-    };
+    let grow = || grow_once(&grow_path, &grown);
     let limits = AtlasLimits {
         max_side: 8_192,
         max_layers: 8,

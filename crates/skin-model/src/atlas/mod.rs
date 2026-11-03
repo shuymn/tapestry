@@ -375,8 +375,10 @@ impl Sheet {
             // This file's placements and window, at their exact size, made
             // after its bytes are read and freed with them: nothing of one
             // file's routing is live while the next file is read.
+            let banded = matches!(header.1, decode::Mode::Banded(_));
             let mut places = Vec::with_capacity(end.saturating_sub(start));
-            let mut active = Vec::with_capacity(end.saturating_sub(start));
+            // Only bands are routed through a window.
+            let mut active = Vec::with_capacity(if banded { places.capacity() } else { 0 });
             places.extend((start..end).filter_map(|i| {
                 let place = packing.places.get(i)?;
                 Some(Placement {
@@ -385,7 +387,10 @@ impl Sheet {
                     alloc: place.alloc,
                 })
             }));
-            let mut router = Router::new(&mut places, &mut active, pages, packing.side);
+            if banded {
+                places.sort_unstable_by_key(Placement::top);
+            }
+            let mut router = Router::new(&places, &mut active, pages, packing.side);
             match image::decode_file(bytes, at, header, cancel, &mut router)? {
                 Some(image) => router.blit(&image),
                 None => router.complete(),
@@ -437,8 +442,8 @@ impl Placement {
     }
 }
 
-/// Routes a file's bands to its cells: the placements in order of their
-/// first row, and a window of the ones the current band crosses, entered
+/// Routes a file's bands to its cells: the placements, in order of their
+/// first row for bands, and a window of the ones the current band crosses, entered
 /// at their first row and left after their last, so the routing holds
 /// O(cells) and does O(cells + rows) work besides the texels it writes.
 struct Router<'a> {
@@ -452,14 +457,14 @@ struct Router<'a> {
 }
 
 impl<'a> Router<'a> {
+    /// A router over `places`, sorted by first row when bands are routed,
+    /// with `active` empty.
     fn new(
-        places: &'a mut [Placement],
+        places: &'a [Placement],
         active: &'a mut Vec<usize>,
         pages: &'a mut [Page],
         side: u32,
     ) -> Self {
-        places.sort_unstable_by_key(Placement::top);
-        active.clear();
         Self {
             places,
             next: 0,
@@ -541,8 +546,9 @@ mod tests {
                 alloc: [0, 0, 24, 80],
             })
             .collect();
+        places.sort_unstable_by_key(Placement::top);
         let mut active = Vec::new();
-        let mut router = Router::new(&mut places, &mut active, &mut [], 256);
+        let mut router = Router::new(&places, &mut active, &mut [], 256);
         let mut seen = Vec::new();
         for top in (0..64).step_by(16) {
             let wants = router.wants(top, top + 16);
