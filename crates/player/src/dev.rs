@@ -231,6 +231,10 @@ pub struct Options {
     pub adjust_on_end: Vec<game::Adjust>,
     /// The chart time, ms, at which `adjust_in_play` is pressed.
     pub adjust_at_ms: i64,
+    /// F1 and F2, by scan code, pressed and released on a scripted play's
+    /// keyboard at `adjust_at_ms` (`--dev-speed`): packets the adjustment
+    /// tap observes and recording does not, as the speed keys are.
+    pub speed_keys: Vec<u32>,
     /// Show the measurement overlay from the start, without its key.
     pub overlay: bool,
     /// The result screen's input, scripted (`--dev-result`): `next`,
@@ -250,32 +254,12 @@ pub struct Options {
     /// Play a mid-chart start from this time of the chart's 1× time to its
     /// end (`--dev-start <ms>`; design.md "Shortening Launch-Based Checks").
     pub start: Option<TimeUs>,
-    /// Run the plays through the start gate (`--dev-start-gate`; design.md
-    /// "Play Lifecycle", the start gate) on the default adjustment
-    /// bindings, planned against the key config of `device.toml`: each
-    /// READY a candidate START or SELECT cancels before its transport
-    /// commits. START or SELECT on a key the key config binds to retry,
-    /// quit or a lane is refused, and the run ends with that error before
-    /// any play opens. Production plays run without it until S10-04b.
-    pub start_gate: bool,
 }
 
 impl Options {
     /// Applies the options to a play's rig, the same on every path that
-    /// plays a chart (`play`, interactive or headless): `device` is the
-    /// device settings the play uses, whose key config the start gate is
-    /// planned against.
-    ///
-    /// # Errors
-    ///
-    /// The start gate asked for and refused: what the bindings' plan
-    /// refuses ([`game::AdjustKeyError`]: START or SELECT on a key bound to
-    /// retry, quit or a lane), or what the tap refuses.
-    pub fn tune(
-        self,
-        rig: &mut crate::play::PlayerRig<'_>,
-        device: &game::DeviceSettings,
-    ) -> anyhow::Result<()> {
+    /// plays a chart (`play`, interactive or headless).
+    pub fn tune(self, rig: &mut crate::play::PlayerRig<'_>) {
         if self.auto_retry {
             rig.auto_retries = 1;
             rig.quit_after_end = Some(Duration::from_millis(300));
@@ -290,10 +274,6 @@ impl Options {
         rig.adjust_at = TimeUs(self.adjust_at_ms.saturating_mul(1_000));
         rig.adjust_on_end = self.adjust_on_end;
         rig.result_script = self.result;
-        if self.start_gate {
-            install_start_gate(rig, device).context("dev: the start gate cannot be installed")?;
-        }
-        Ok(())
     }
 
     /// The session's input with the development options applied: an input
@@ -325,7 +305,10 @@ impl Options {
             _ if self.headless => Err(UsageError::Usage(
                 "--dev-headless needs --auto or --dev-perfect".to_owned(),
             )),
-            _ => Ok(log.map_or(input, crate::PlayInput::Script)),
+            _ => Ok(log.map_or(input, |log| {
+                let at = TimeUs(self.adjust_at_ms.saturating_mul(1_000));
+                crate::PlayInput::Script(log, self.speed_keys.iter().map(|&k| (k, at)).collect())
+            })),
         }
     }
 
@@ -341,7 +324,6 @@ impl Options {
             "dev-overlay" => self.overlay = true,
             "dev-headless" => self.headless = true,
             "dev-perfect" => self.perfect = true,
-            "dev-start-gate" => self.start_gate = true,
             "dev-adjust-at" => {
                 self.adjust_at_ms = p.value()?.to_string_lossy().parse().map_err(|_| {
                     UsageError::Usage("--dev-adjust-at takes milliseconds".to_owned())
@@ -350,6 +332,10 @@ impl Options {
             "dev-adjust" => {
                 self.adjust_in_play =
                     adjust_keys(&p.value()?.to_string_lossy()).map_err(UsageError::Usage)?;
+            }
+            "dev-speed" => {
+                self.speed_keys =
+                    speed_keys(&p.value()?.to_string_lossy()).map_err(UsageError::Usage)?;
             }
             "dev-adjust-end" => {
                 self.adjust_on_end =
@@ -955,13 +941,15 @@ impl MenuStats {
 }
 
 /// The scripted play's input: the log's events as a script, one device per
-/// source.
+/// source, and each speed key of `speed` pressed on the first keyboard at
+/// its time on the script's timeline and released 50 ms later, as packets
+/// no source records.
 ///
 /// # Errors
 ///
 /// Why the log cannot be read, or that it holds no played attempt (a
 /// capture cancelled before playback).
-pub fn script(log: &Path) -> anyhow::Result<ScriptedInput> {
+pub fn script(log: &Path, speed: &[(u32, TimeUs)]) -> anyhow::Result<ScriptedInput> {
     let limits = DecodeLimits::default();
     let bytes = read_bounded(log, limits.max_compressed)?;
     let rec = replay::decode(&bytes, &limits).with_context(|| log.display().to_string())?;
@@ -981,6 +969,29 @@ pub fn script(log: &Path) -> anyhow::Result<ScriptedInput> {
     // Each controller declares the axes its record binds, as the adapter
     // would: only declared axes are recorded.
     let script = ScriptedInput::from_log(&rec.start, &rec.events, &kinds);
+    let keyboard = kinds.iter().position(|&k| k == DeviceKind::Keyboard);
+    let script = match keyboard {
+        Some(i) => script.with_packets(speed.iter().flat_map(|&(code, at)| {
+            let packet = |value| input::Packet {
+                device: input::DeviceId(i as u64),
+                control: eval::ControlId(code),
+                value,
+                background: false,
+            };
+            [
+                input::ScriptItem {
+                    at,
+                    action: input::Action::Packet(packet(1)),
+                },
+                input::ScriptItem {
+                    at: TimeUs(at.0 + 50_000),
+                    action: input::Action::Packet(packet(0)),
+                },
+            ]
+        })),
+        None if speed.is_empty() => script,
+        None => anyhow::bail!("--dev-speed needs a keyboard in the input log"),
+    };
     Ok(rec
         .devices
         .sources
@@ -1024,6 +1035,21 @@ pub fn adjust_keys(list: &str) -> Result<Vec<game::Adjust>, String> {
                 .and_then(|n| n.parse::<u32>().ok())
                 .and_then(|n| game::Adjust::from_key(0x3A + n))
                 .ok_or_else(|| format!("{name} is not a settings key (F1 to F8)"))
+        })
+        .collect()
+}
+
+/// The speed keys of `list`, comma-separated: `F1` and `F2`.
+///
+/// # Errors
+///
+/// A name that is not F1 or F2.
+pub fn speed_keys(list: &str) -> Result<Vec<u32>, String> {
+    list.split(',')
+        .map(|name| match name {
+            "F1" => Ok(0x3B),
+            "F2" => Ok(0x3C),
+            _ => Err(format!("{name} is not a speed key (F1 or F2)")),
         })
         .collect()
 }
@@ -1407,28 +1433,6 @@ fn crc32(data: &[u8]) -> u32 {
         }
     }
     !c
-}
-
-/// Installs a start gate on the default adjustment bindings (START on Q,
-/// SELECT on W) in a development run's rig (`--dev-start-gate`; design.md
-/// "Play Lifecycle", the start gate), planned against `device`'s key
-/// configs, the ones the play's input uses; [`Options::tune`] is its one
-/// caller.
-fn install_start_gate(
-    rig: &mut crate::play::PlayerRig<'_>,
-    device: &game::DeviceSettings,
-) -> anyhow::Result<()> {
-    let keys = game::KeyConfigs {
-        keyboard: device.keyboard.clone(),
-        controller: device.controller.clone(),
-        controller_device: device.controller_device.map(Into::into),
-    };
-    let plan = game::AdjustmentConfig::default().plan(&keys, None, None)?;
-    rig.gate = Some(crate::start_gate::PlayerGate::install(
-        &rig.input,
-        plan.bindings,
-    )?);
-    Ok(())
 }
 
 #[cfg(test)]

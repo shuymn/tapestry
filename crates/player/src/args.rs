@@ -468,7 +468,7 @@ mod tests {
         assert!(matches!(play.input, PlayInput::Autoplay));
         assert!(play.dev.headless);
         let play = chart(&["play", "a.bms", "--dev-scripted-input", "l"]);
-        assert!(matches!(play.input, PlayInput::Script(ref l) if l == Path::new("l")));
+        assert!(matches!(play.input, PlayInput::Script(ref l, _) if l == Path::new("l")));
         let play = chart(&["play", "--dev-perfect", "a.bms", "--dev-headless"]);
         assert!(matches!(play.input, PlayInput::Perfect));
         assert!(play.dev.headless);

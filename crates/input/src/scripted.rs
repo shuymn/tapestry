@@ -79,6 +79,20 @@ impl ScriptedInput {
         self
     }
 
+    /// The script with `extra` items fed among its own, each after the
+    /// script's items at the same time: for packets no source records,
+    /// which only the adjustment tap observes.
+    #[must_use]
+    pub fn with_packets(mut self, extra: impl IntoIterator<Item = ScriptItem>) -> Self {
+        for item in extra {
+            let at = self.items.partition_point(|i| i.at <= item.at);
+            self.items.insert(at, item);
+            self.connect_lists.insert(at, None);
+            self.connect_axes.insert(at, Vec::new());
+        }
+        self
+    }
+
     /// Records `controls` from `device` each time the script connects it.
     #[must_use]
     pub fn with_recorded(mut self, device: DeviceId, controls: Vec<ControlId>) -> Self {

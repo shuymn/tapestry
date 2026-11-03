@@ -77,6 +77,12 @@ impl LiveTuning {
         }
     }
 
+    /// The display offset now, µs: what the adjustments' driver reads at
+    /// each drain.
+    pub fn display_offset_us(&self) -> i64 {
+        self.display_offset_us.load(Ordering::Acquire)
+    }
+
     /// How many changes there have been.
     pub fn version(&self) -> u64 {
         self.version.load(Ordering::Acquire)

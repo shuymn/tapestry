@@ -47,6 +47,58 @@ const PARK: Duration = Duration::from_millis(2);
 /// screen's failure, a timed quit).
 const IDLE_PARK: Duration = Duration::from_micros(game::IDLE_WAIT.0.unsigned_abs());
 
+/// How long a wait for the input thread's marker parks at most
+/// ([`game::InputPump::park`]).
+pub(crate) const MARKER_PARK: Duration = Duration::from_millis(1);
+
+/// The input thread as the adjustment driver needs it
+/// ([`game::InputPump`]): fences through its link, wakes, and the display
+/// offset the window steps.
+pub(crate) struct PlayerPump<'a> {
+    pub(crate) input: &'a InputLink,
+    pub(crate) tuning: &'a crate::tuning::LiveTuning,
+}
+
+impl game::InputPump for PlayerPump<'_> {
+    fn request_fence(&mut self, n: u64) {
+        self.input.request_fence(n);
+    }
+
+    fn wake(&mut self) {
+        self.input.wake_input();
+    }
+
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn display_offset_us(&self) -> i64 {
+        self.tuning.display_offset_us()
+    }
+
+    fn park(&mut self) -> Result<(), InputWaitError> {
+        if self.input.gone() {
+            return Err(InputWaitError::Gone);
+        }
+        if let Some(e) = self.input.failure() {
+            return Err(e);
+        }
+        thread::park_timeout(MARKER_PARK);
+        Ok(())
+    }
+}
+
+/// One drain of the adjustments' driver, if there is one: what the tap
+/// observed since reaches the reducer and its snapshot (design.md "Play
+/// Adjustments"). Allocates nothing.
+#[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+pub(crate) fn serve_adjustments(
+    adjust: Option<&mut game::AdjustDriver>,
+    input: &InputLink,
+    tuning: &crate::tuning::LiveTuning,
+) {
+    if let Some(driver) = adjust {
+        driver.pump(&mut PlayerPump { input, tuning });
+    }
+}
+
 /// Each saved play's record and figures, in order (dev-tools).
 #[cfg(feature = "dev-tools")]
 pub type MeasuredPlays = std::sync::Arc<std::sync::Mutex<Vec<(std::path::PathBuf, Figures)>>>;
@@ -177,9 +229,64 @@ pub struct PlayerRig<'a> {
     /// production constructs it so until S10-04b, and development runs
     /// set it ([`crate::start_gate::PlayerGate::install`]).
     pub gate: Option<crate::start_gate::PlayerGate>,
+    /// The adjustments' driver (design.md "Play Adjustments"): the game
+    /// thread's one writer of the presentation, installed with the gate.
+    pub adjust: Option<game::AdjustDriver>,
 }
 
 impl PlayerRig<'_> {
+    /// One drain of the adjustments' driver ([`serve_adjustments`]).
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    pub(crate) fn serve_adjustments(&mut self) {
+        serve_adjustments(self.adjust.as_mut(), &self.input, self.controls.tuning());
+    }
+
+    /// The adjustments as the play left them, on the console: the active
+    /// hi-speed, the mode, the target green number and the covers.
+    fn print_adjustments(&self) {
+        let Some(driver) = &self.adjust else {
+            return;
+        };
+        let s = driver.snapshot();
+        let h = s
+            .hispeed
+            .map(|h| {
+                // Hundredths, a half rounded up.
+                let (n, d) = (u128::from(h.num()), u128::from(h.den()));
+                (200 * n + d) / (2 * d)
+            })
+            .map_or_else(|| "-".to_owned(), |x| format!("{}.{:02}", x / 100, x % 100));
+        let o = s.options;
+        let c = o.covers();
+        let cover = |c: game::Cover| {
+            if c.on {
+                c.amount.to_string()
+            } else {
+                "off".to_owned()
+            }
+        };
+        println!(
+            "adjust: hi-speed {h} {} target {} sudden {} lift {} hidden {}",
+            match o.hispeed().mode {
+                game::SpeedMode::Floating => "floating",
+                game::SpeedMode::Classic => "classic",
+            },
+            o.hispeed().green_target,
+            cover(c.sudden),
+            cover(c.lift),
+            cover(c.hidden),
+        );
+    }
+
+    /// The driver and its pump, for a wait on the input thread.
+    pub(crate) fn adjustments(&mut self) -> Option<(&mut game::AdjustDriver, PlayerPump<'_>)> {
+        let pump = PlayerPump {
+            input: &self.input,
+            tuning: self.controls.tuning(),
+        };
+        self.adjust.as_mut().map(|d| (d, pump))
+    }
+
     /// Writes changed settings, then ends the render and audio threads;
     /// how the render thread ended: when [`RenderEnd::Stuck`], the window
     /// must stay open until the process exits.
@@ -339,10 +446,51 @@ impl PlayerRig<'_> {
     }
 }
 
-/// A round's restore at chart time `at`, its lead-in's start, planned on
-/// the line the audio thread last published for a play whose chart time 0
-/// lies at `origin`, the opening's: `at` is then `RESTORE_AHEAD` in the
-/// output's future (design.md "Mid-Chart Start and Section Repeat").
+/// Installs the adjustments in `rig` (design.md "Play Adjustments"): the
+/// bindings of `settings`'s key configs planned for the tap, the driver
+/// with the player's options and the display offset, its snapshots handed
+/// to the render thread, and the tap with its start gate to the input
+/// thread. In an autoplay session F1 and F2 come from the window
+/// ([`Controls::set_window_keys`]), as no keyboard reaches the tap.
+///
+/// # Errors
+///
+/// What the plan refuses of the bindings (more controls than the tap
+/// takes), or what the tap refuses.
+pub(crate) fn install_adjustments(
+    rig: &mut PlayerRig<'_>,
+    settings: &Settings,
+) -> anyhow::Result<()> {
+    let device = &settings.device;
+    let keys = game::KeyConfigs {
+        keyboard: device.keyboard.clone(),
+        controller: device.controller.clone(),
+        controller_device: device.controller_device.map(Into::into),
+    };
+    let config = game::AdjustmentConfig::default();
+    let plan = config.plan(&keys, None, device.scratch.wrap)?;
+    let options = game::PlayOptions::default();
+    let (driver, mut tap, reader) =
+        game::AdjustDriver::new(&plan, options, rig.controls.tuning().display_offset_us())?;
+    if rig.autoplay {
+        let number = |code: u32| {
+            plan.bindings
+                .controls
+                .iter()
+                .find(|(c, _)| *c == input::TapControl::Key(eval::ControlId(code)))
+                .map(|&(_, n)| n)
+        };
+        let [f1, f2] = [0x3B, 0x3C];
+        let (keys, receiver) = input::window_keys();
+        tap.set_window_keys(receiver, [number(f1), number(f2)]);
+        rig.controls.set_window_keys(keys);
+    }
+    rig.render.presentation(reader);
+    rig.gate = Some(crate::start_gate::PlayerGate::install(&rig.input, tap));
+    rig.adjust = Some(driver);
+    Ok(())
+}
+
 /// The render thread's commit of the attempt prepared: while a loading
 /// lifetime runs (`loading`), it is ready first, so its progress reaches
 /// 100 before the commit and the end of loading.
@@ -368,6 +516,10 @@ pub(crate) fn refresh_loading_gauge(
     }
 }
 
+/// A round's restore at chart time `at`, its lead-in's start, planned on
+/// the line the audio thread last published for a play whose chart time 0
+/// lies at `origin`, the opening's: `at` is then `RESTORE_AHEAD` in the
+/// output's future (design.md "Mid-Chart Start and Section Repeat").
 fn plan_restore(
     restorer: &game::Restorer,
     counters: &game::AudioCounters,
@@ -420,6 +572,7 @@ impl Rig for PlayerRig<'_> {
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn wait(&mut self) {
         thread::park_timeout(if self.in_play { PARK } else { IDLE_PARK });
+        self.serve_adjustments();
         // A scenario's `until`: the command, sent once, as its key would.
         #[cfg(feature = "dev-tools")]
         if let Some(sc) = &mut self.scenario
@@ -445,6 +598,7 @@ impl Rig for PlayerRig<'_> {
         if left > 0 {
             thread::park_timeout(Duration::from_micros(left.unsigned_abs()));
         }
+        self.serve_adjustments();
         self.sync();
     }
 
@@ -551,16 +705,25 @@ impl Rig for PlayerRig<'_> {
             loaded.preset(),
             self.gauge,
         );
-        let attempt = AttemptContext::new(loaded.attempt(), SIMPLE_SCRATCH);
+        // The attempt attached last is the one prepared: its epoch is
+        // the frames'.
+        let epoch = self.adjust.as_mut().and_then(game::AdjustDriver::prepared);
+        let attempt = AttemptContext::new(loaded.attempt(), SIMPLE_SCRATCH, epoch.unwrap_or(0));
+        // The adjustments are served while the screen prepares, so an
+        // adjustment then is published before the preparation ends.
+        let mut adjust = self.adjust.take();
         let rig = &*self;
-        rig.render.prepare_attempt(attempt, || {
+        let prepared = rig.render.prepare_attempt(attempt, || {
+            serve_adjustments(adjust.as_mut(), &rig.input, rig.controls.tuning());
             preparation_stops(
                 rig.quitting(),
                 rig.controls.leaving(),
                 rig.input_failure(),
                 rig.audio_failure(),
             )
-        })
+        });
+        self.adjust = adjust;
+        prepared
     }
 
     fn open(&mut self, lead_in: TimeUs) -> Result<Opening<SourceReader>, InputWaitError> {
@@ -585,6 +748,22 @@ impl Rig for PlayerRig<'_> {
         self.gate.is_some()
     }
 
+    fn begin_presentation(
+        &mut self,
+        loaded: &Loaded,
+    ) -> Result<Option<game::PreparationRefusal>, InputWaitError> {
+        match self.adjustments() {
+            Some((driver, mut pump)) => driver.begin_presentation(loaded, &mut pump),
+            None => Ok(None),
+        }
+    }
+
+    fn end_presentation(&mut self) {
+        if let Some(driver) = &mut self.adjust {
+            driver.invalidate();
+        }
+    }
+
     fn open_candidate(
         &mut self,
         lead_in: TimeUs,
@@ -592,6 +771,11 @@ impl Rig for PlayerRig<'_> {
     ) -> Result<Option<Opening<SourceReader>>, InputWaitError> {
         if let Some(window) = &self.window {
             window.wait_to_open();
+        }
+        // The previous opening's marker is taken first: the tap owes one
+        // at most.
+        if let Some((driver, mut pump)) = self.adjustments() {
+            driver.before_opening(&mut pump)?;
         }
         self.in_play = true;
         self.lead_in = lead_in;
@@ -604,6 +788,11 @@ impl Rig for PlayerRig<'_> {
         if let (Some(opening), Some(gate)) = (&opened, &mut self.gate) {
             gate.opened(generation, opening);
             gate.end_paused_loading(&self.render);
+        }
+        if opened.is_none()
+            && let Some(driver) = &mut self.adjust
+        {
+            driver.no_opening();
         }
         Ok(opened)
     }
@@ -655,6 +844,13 @@ impl Rig for PlayerRig<'_> {
         history: &mut game::HistoryRecorder,
         start: &mut eval::InputStart,
     ) -> Result<game::Rearm, InputWaitError> {
+        // The cancellation's and the previous opening's markers are taken
+        // first: the tap owes one of each at most.
+        let cancelled = self.gate.as_ref().map(|g| g.state().generation);
+        if let (Some(cancelled), Some((driver, mut pump))) = (cancelled, self.adjustments()) {
+            driver.after_cancel(cancelled, &mut pump)?;
+            driver.before_opening(&mut pump)?;
+        }
         let Some(gate) = &mut self.gate else {
             return Ok(game::Rearm::Held);
         };
@@ -669,6 +865,11 @@ impl Rig for PlayerRig<'_> {
         if let game::Rearm::Opened { origin } = rearmed {
             self.origin = Some(origin);
             self.ready_state_at = Some(TimeUs(origin.0 - lead_in.0));
+        }
+        if rearmed == game::Rearm::Held
+            && let Some(driver) = &mut self.adjust
+        {
+            driver.no_opening();
         }
         Ok(rearmed)
     }
@@ -907,6 +1108,7 @@ impl Rig for PlayerRig<'_> {
             }
         }
         self.print(report);
+        self.print_adjustments();
         #[cfg(feature = "dev-tools")]
         self.scenario_ended(report);
         self.print_restored();

@@ -481,14 +481,14 @@ fn an_invalid_key_config_exits_nonzero() {
     }
 }
 
-/// The start gate on the real threads (`--dev-start-gate`; design.md
+/// The start gate on the real threads, which every play runs (design.md
 /// "Play Lifecycle", the start gate): START (Q) held 300 ms before chart
 /// time 0 cancels the first READY through the input thread's latch, its
 /// release at 200 ms rearms a fresh READY through the input thread's
 /// boundary and the audio thread's transport, and the notes, pressed
 /// 1.2 s later than the log has them, are played by that READY: every note
 /// judged PERFECT, and the audio restarted for it, its key sounds and BGM
-/// all sounding, as an ungated play's do. The saved record keeps the cancelled
+/// all sounding, as a play without the hold does. The saved record keeps the cancelled
 /// opening, Q's press in it, and the winning READY's input alone.
 #[test]
 fn the_start_gate_cancels_and_rearms_ready_on_the_real_threads() {
@@ -500,10 +500,10 @@ fn the_start_gate_cancels_and_rearms_ready_on_the_real_threads() {
         appdata,
         ..
     } = fixture();
-    let ungated = scripted_play(&chart_path, &log, &dir.path().join("ungated"))
+    let unheld = scripted_play(&chart_path, &log, &dir.path().join("unheld"))
         .output()
         .expect("run tapestry");
-    let ungated = onsets(&String::from_utf8_lossy(&ungated.stdout));
+    let unheld = onsets(&String::from_utf8_lossy(&unheld.stdout));
     let mut rec = replay::decode(&fs::read(&log).unwrap(), &DecodeLimits::default()).unwrap();
     let q = |ms: i64, value: i32| eval::PhysicalInputEvent {
         received: TimeUs(ms * 1_000),
@@ -523,21 +523,20 @@ fn the_start_gate_cancels_and_rearms_ready_on_the_real_threads() {
     fs::write(&log, replay::encode(&rec)).unwrap();
 
     let out = scripted_play(&chart_path, &log, &appdata)
-        .arg("--dev-start-gate")
         .output()
         .expect("run tapestry");
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     println!("{stdout}{stderr}");
     assert_eq!(out.status.code(), Some(0));
-    // The same sounds as the ungated play: the key sounds, and the BGM,
+    // The same sounds as the play without the hold: the key sounds, and the BGM,
     // which starts only once the rearmed candidate's transport commits.
     // Where they fall is the real threads' timing, which the stepped
     // worker fixes exactly (start_gate.rs,
     // `a_rearmed_candidate_starts_its_bgm_at_its_own_origin`).
     let gated = onsets(&stdout);
-    assert!(!ungated.is_empty());
-    assert_eq!(gated.len(), ungated.len(), "{gated:?} {ungated:?}");
+    assert!(!unheld.is_empty());
+    assert_eq!(gated.len(), unheld.len(), "{gated:?} {unheld:?}");
     assert!(
         stdout.contains(&format!(
             "play 1: Completed; perfect {NOTES} great 0 good 0 bad 0 poor 0; re-evaluation matches live: true"
@@ -702,32 +701,55 @@ fn writes_only_between_plays(stdout: &str) {
     assert!(writes > 0, "{stdout}");
 }
 
-/// Hi-speed (F2) and the display offset (F6), changed during the first
-/// play through the settings keys' path, move notes only: a note 300 ms
-/// ahead of the display time sits 800 * 300 * (1/569 - 1/600) = 21.793
-/// layout pixels higher, and both plays judge exactly as a run without the
-/// change. The second play starts with the new display offset; neither
-/// play's input offset moves.
+/// One F2 press in each play (a scripted packet only the adjustment tap
+/// observes) and the display offset (F6) in the first move notes only: F2 is
+/// exactly one Floating step, 4.00 to 4.50 at 120 BPM and the target
+/// green number 300, so a note 300 ms ahead of the display time sits
+/// 120 · (4.5 − 4) = 60 layout pixels higher; both plays judge exactly as
+/// a run without the change, and F2 is in neither record. The display
+/// offset persists; neither play's input offset moves.
 #[test]
-fn hi_speed_change_moves_notes_not_judgment() {
+fn one_f2_press_steps_hi_speed_once_and_moves_notes_not_judgment() {
     let plain = fixture();
     let (plain_out, without) = run_retried(&plain, &[]);
     // The retried play's load time is reported.
     assert!(plain_out.contains("retry "), "{plain_out}");
+    assert_eq!(
+        plain_out
+            .matches("adjust: hi-speed 4.00 floating target 300")
+            .count(),
+        2,
+        "{plain_out}"
+    );
     let changed = fixture();
     let (stdout, with) = run_retried(
         &changed,
-        &["--dev-adjust", "F2,F6", "--dev-adjust-at", "2250"],
+        &[
+            "--dev-speed",
+            "F2",
+            "--dev-adjust",
+            "F6",
+            "--dev-adjust-at",
+            "2250",
+        ],
     );
     writes_only_between_plays(&stdout);
+    // Each play's press steps once; a retry solves from the target again
+    // before its own press.
+    assert_eq!(
+        stdout
+            .matches("adjust: hi-speed 4.50 floating target 300")
+            .count(),
+        2,
+        "{stdout}"
+    );
     let root = game::DataRoot::new(changed.appdata.join("tapestry"));
     let s = game::Settings::load(&root).unwrap();
-    assert_eq!(s.player.visible_time_ms, 569);
     assert_eq!(s.device.display_offset_us, 1_000);
 
     assert_eq!((without.len(), with.len()), (2, 2));
     for (a, b) in without.iter().zip(&with) {
-        assert_eq!(a.events, b.events);
+        assert_eq!(a.events, b.events, "F2 is not recorded");
         assert_eq!(a.devices.sources, b.devices.sources);
         let (ja, jb) = (judged(&plain.chart, a), judged(&changed.chart, b));
         assert_eq!(ja.len(), NOTES);
@@ -738,25 +760,23 @@ fn hi_speed_change_moves_notes_not_judgment() {
     assert_eq!(display(&with[1]), TimeUs(1_000));
 
     // The same note (lane 1's at 2.5 s) at the same display time (2.2 s)
-    // with 600 and 569 ms: its stored position, and the playhead the
-    // attempt prepares, sampled there.
+    // at 4.00 and 4.50: its stored position, and the playhead the attempt
+    // prepares, sampled there.
     let chart = &changed.chart;
     let playhead = skin_model::ExactPlayhead::prepare(chart, None).unwrap();
     let note = chart.lanes[1][1];
     assert_eq!(note.time, TimeUs(2_500_000));
-    let y = |visible| {
+    let y = |num, den| {
         render::layout::note_y(
             note.pos,
             playhead.position_at(TimeUs(2_200_000)),
-            playhead.initial_rate(),
-            TimeUs(visible),
+            skin_model::Gain::new(num, den).unwrap(),
         )
     };
-    // By hand: 880 - 800 * 300 / 600 = 480; 880 - 800 * 300 / 569 =
-    // 458.2074.
-    assert!((y(600_000) - 480.0).abs() < 1e-3);
-    let after = i64::from(s.player.visible_time_ms) * 1_000;
-    assert!((y(after) - 458.207_4).abs() < 1e-3);
+    // By hand: 0.6 beats ahead, 200 · H pixels a beat: 880 − 480 = 400
+    // and 880 − 540 = 340.
+    assert!((y(4, 1) - 400.0).abs() < 1e-3);
+    assert!((y(9, 2) - 340.0).abs() < 1e-3);
 }
 
 /// Settings keys pressed in the first play (hi-speed up twice, volume down,

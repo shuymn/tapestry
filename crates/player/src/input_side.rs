@@ -92,6 +92,9 @@ pub enum Request {
     },
     /// Close recording at the next boundary.
     Close,
+    /// Answer fence `n` in the adjustment tap's stream at the next
+    /// boundary ([`input::TapEvent::Fence`]). Not answered otherwise.
+    Fence(u64),
     /// The adjustment controls' tap from now on, whose hold latch and
     /// start gate the gated openings and rearms use. Not answered.
     Tap(Box<input::AdjustmentTap>),
@@ -315,6 +318,26 @@ impl InputLink {
         if self.failed.is_none() && self.requests.send(Request::Tap(Box::new(tap))).is_ok() {
             self.waker.wake();
         }
+    }
+
+    /// Asks the input thread to answer fence `n` in the adjustment tap's
+    /// stream at its next boundary: sent without waiting; the answer is
+    /// the tap's marker. A failed link sends nothing.
+    pub fn request_fence(&self, n: u64) {
+        if self.failed.is_none() && self.requests.send(Request::Fence(n)).is_ok() {
+            self.waker.wake();
+        }
+    }
+
+    /// Wakes the input thread: the adjustment tap waits for room.
+    pub fn wake_input(&self) {
+        self.waker.wake();
+    }
+
+    /// Whether the input thread is gone.
+    #[must_use]
+    pub fn gone(&self) -> bool {
+        self.state.gone.load(Ordering::Acquire)
     }
 
     /// Asks the input thread to seal the cancelled READY candidate's
@@ -670,7 +693,14 @@ impl Hook {
                     None => Reply::Deferred,
                 },
                 Request::Tap(tap) => {
+                    sources.set_presentation_focus(self.controls.presentation_focus().clone());
                     sources.set_adjustment(*tap);
+                    continue;
+                }
+                Request::Fence(n) => {
+                    if let Some(tap) = sources.adjustment_mut() {
+                        tap.fence(n, now);
+                    }
                     continue;
                 }
                 Request::Close => {
@@ -811,7 +841,17 @@ impl Hook {
                     sources.set_takes_part(d, false);
                 }
                 reset_gate(sources, &self.controls);
-                sources.open_recording(TimeUs(-lead_in.0))
+                // The feeder's batches are on the play's time: the tap
+                // stamps them on the clock from the opening's origin.
+                sources.set_presentation_offset(origin);
+                match gate {
+                    None => sources.open_recording(TimeUs(-lead_in.0)),
+                    Some(generation) => candidate(sources.open_candidate(
+                        TimeUs(-lead_in.0),
+                        TimeUs(0),
+                        generation,
+                    ))?,
+                }
             }
             #[cfg(feature = "dev-tools")]
             Mode::Script(script) => {
@@ -839,6 +879,9 @@ impl Hook {
                 input::InputAdapter::poll(&mut script.current, TimeUs(open_at.0 - 1), sources);
                 reset_gate(sources, &self.controls);
                 self.script_origin = Some(script_origin);
+                // The script's batches are on its timeline: the tap stamps
+                // them on the clock from its origin.
+                sources.set_presentation_offset(script_origin);
                 match gate {
                     None => sources.open_recording(open_at),
                     Some(generation) => {
@@ -947,6 +990,8 @@ impl Hook {
         let lines = out_of_range_warnings(sources);
         sources.close_recording();
         self.origin = None;
+        // Between plays every batch is on the clock.
+        sources.set_presentation_offset(TimeUs(0));
         self.script_origin = None;
         self.handoff = None;
         (closed, lines)
@@ -2341,7 +2386,7 @@ mod gate_tests {
         let (tap, _rx) = adjustment_queue(AdjustmentBindings {
             controls: vec![(TapControl::Key(Q), 0)],
             latched: 1,
-            wrap: None,
+            ..AdjustmentBindings::default()
         })
         .unwrap();
         let gate = tap.start_gate();
@@ -2527,15 +2572,14 @@ mod gate_tests {
     #[test]
     fn the_player_gates_exchange_counts_in_the_admission() {
         let (mut sources, mut hook, link, _) = rig();
-        let mut gate = crate::start_gate::PlayerGate::install(
-            &link,
-            AdjustmentBindings {
-                controls: vec![(TapControl::Key(Q), 0)],
-                latched: 1,
-                wrap: None,
-            },
-        )
+        let (mut tap, _rx) = adjustment_queue(AdjustmentBindings {
+            controls: vec![(TapControl::Key(Q), 0)],
+            latched: 1,
+            ..AdjustmentBindings::default()
+        })
         .unwrap();
+        tap.set_active(true);
+        let mut gate = crate::start_gate::PlayerGate::install(&link, tap);
         let opening = open(&mut hook, &link, &mut sources, 10).unwrap();
         gate.opened(1, &opening);
         assert!(
@@ -2583,15 +2627,14 @@ mod gate_tests {
         let controls = Arc::new(Controls::new(QpcClock::start()));
         controls.set_latch(sources.gate().handle());
         let (mut hook, mut link) = link(controls, Mode::Clock, Waker::new().unwrap());
-        let mut gate = crate::start_gate::PlayerGate::install(
-            &link,
-            AdjustmentBindings {
-                controls: vec![(TapControl::Key(Q), 0)],
-                latched: 1,
-                wrap: None,
-            },
-        )
+        let (mut tap, _rx) = adjustment_queue(AdjustmentBindings {
+            controls: vec![(TapControl::Key(Q), 0)],
+            latched: 1,
+            ..AdjustmentBindings::default()
+        })
         .unwrap();
+        tap.set_active(true);
+        let mut gate = crate::start_gate::PlayerGate::install(&link, tap);
         let opening = open(&mut hook, &link, &mut sources, 10).unwrap();
         gate.opened(1, &opening);
         batch(&mut hook, &mut sources, 20, &[packet(1, Q, 1)]);

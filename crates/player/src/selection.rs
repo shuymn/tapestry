@@ -71,6 +71,10 @@ struct LoadHost<'a> {
     render: &'a RenderLink,
     /// The load's lines, which say the chart is being measured.
     page: Option<&'a LoadingText>,
+    /// The adjustments' driver, served at every check of the measurement
+    /// and through the 1× decode.
+    adjust: Option<&'a mut game::AdjustDriver>,
+    input: &'a crate::input_side::InputLink,
     /// The measurement closes the window (a script's `close-measuring`,
     /// dev-tools).
     #[cfg(feature = "dev-tools")]
@@ -85,14 +89,29 @@ impl crate::loudness::Host for LoadHost<'_> {
     fn at_normal(&mut self) -> anyhow::Result<(bms_model::Chart, Arc<audio::SoundBank>)> {
         let chart = self.loaded.chart_at(bms_model::Speed::NORMAL)?;
         let controls = self.controls;
-        let bank = audio::load_bank_reporting(
-            &chart,
-            self.rate,
-            bms_model::Speed::NORMAL,
-            &audio::BankLimits::default(),
-            &|_, _| {},
-            &|| controls.quitting() || controls.leaving(),
-        )?;
+        let rate = self.rate;
+        let decode = || {
+            audio::load_bank_reporting(
+                &chart,
+                rate,
+                bms_model::Speed::NORMAL,
+                &audio::BankLimits::default(),
+                &|_, _| {},
+                &|| controls.quitting() || controls.leaving(),
+            )
+        };
+        // Decoded on its own thread while this one serves the adjustments.
+        let (adjust, input) = (&mut self.adjust, self.input);
+        let bank = std::thread::scope(|s| {
+            let worker = s.spawn(decode);
+            while !worker.is_finished() {
+                crate::play::serve_adjustments(adjust.as_deref_mut(), input, controls.tuning());
+                std::thread::park_timeout(crate::play::MARKER_PARK);
+            }
+            worker
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+        })?;
         Ok((chart, Arc::new(bank)))
     }
 
@@ -109,6 +128,12 @@ impl crate::loudness::Host for LoadHost<'_> {
     }
 
     fn cancelled(&mut self) -> bool {
+        // Every block of the measurement serves the adjustments.
+        crate::play::serve_adjustments(
+            self.adjust.as_deref_mut(),
+            self.input,
+            self.controls.tuning(),
+        );
         self.controls.quitting() || self.controls.leaving()
     }
 }
@@ -1465,6 +1490,14 @@ impl AppRig for PlayerRig<'_> {
     /// stage: a loading lifetime begins, with the shown gauge's descriptor
     /// from the validated preset selection has chosen.
     fn entered_loading(&mut self, chart: &std::path::Path) {
+        // The coming attempt's entry: its loading-time adjustments are its
+        // own, and solve nothing until its chart is read. A failed fence
+        // leaves the input thread's failure for the play to report.
+        if let Some((driver, mut pump)) = self.adjustments()
+            && let Err(e) = driver.enter_attempt(None, &mut pump)
+        {
+            log::warn!("the adjustments' fence failed: {e}");
+        }
         let Some(sel) = &mut self.selection else {
             return;
         };
@@ -1501,6 +1534,16 @@ impl AppRig for PlayerRig<'_> {
     }
 
     fn load_chart(&mut self, loaded: &Loaded) -> Result<Loading, ChartLoadError> {
+        // The chart, speed and section are final: the presentation solves
+        // for them once, so what the player adjusts while loading applies
+        // to this attempt. A refusal is reported by the play's preparation
+        // ([`game::Rig::begin_presentation`]), which attaches again.
+        if let Some((driver, mut pump)) = self.adjustments() {
+            match driver.attach_loaded(loaded, &mut pump) {
+                Ok(_) => {}
+                Err(e) => log::warn!("the adjustments' fence failed: {e}"),
+            }
+        }
         // A practice's Start chooses again: its load times run from it.
         let now = self.clock.now();
         let sel = self.selection.as_mut().ok_or(ChartLoadError::NoSelection)?;
@@ -1601,20 +1644,36 @@ impl AppRig for PlayerRig<'_> {
             .is_some_and(|s| std::mem::take(&mut s.quit_decoding));
         // The quit key or a close stops the decode at the next file or
         // packet, and no bank is made.
-        let decoded_bank = audio::load_bank_reporting(
-            chart,
-            rate,
-            speed,
-            &audio::BankLimits::default(),
-            &|done, files| {
-                progress.decoded(done, files);
-                #[cfg(feature = "dev-tools")]
-                if quit_decoding && done == 1 {
-                    controls.command(game::Command::Quit);
-                }
-            },
-            &|| controls.quitting() || controls.leaving(),
-        );
+        // The sounds decode on their own thread while this one serves the
+        // adjustments, so one made during a long decode is published before
+        // loading ends (design.md "Play Adjustments").
+        let decode = || {
+            audio::load_bank_reporting(
+                chart,
+                rate,
+                speed,
+                &audio::BankLimits::default(),
+                &|done, files| {
+                    progress.decoded(done, files);
+                    #[cfg(feature = "dev-tools")]
+                    if quit_decoding && done == 1 {
+                        controls.command(game::Command::Quit);
+                    }
+                },
+                &|| controls.quitting() || controls.leaving(),
+            )
+        };
+        let (adjust, input) = (&mut self.adjust, &self.input);
+        let decoded_bank = std::thread::scope(|s| {
+            let worker = s.spawn(decode);
+            while !worker.is_finished() {
+                crate::play::serve_adjustments(adjust.as_mut(), input, controls.tuning());
+                std::thread::park_timeout(crate::play::MARKER_PARK);
+            }
+            worker
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+        });
         let bank = match decoded_bank {
             Ok(bank) => {
                 progress.completed();
@@ -1666,6 +1725,8 @@ impl AppRig for PlayerRig<'_> {
             controls: self.controls,
             render: &self.render,
             page: page.as_ref(),
+            adjust: self.adjust.as_mut(),
+            input: &self.input,
             #[cfg(feature = "dev-tools")]
             close,
             #[cfg(feature = "dev-tools")]

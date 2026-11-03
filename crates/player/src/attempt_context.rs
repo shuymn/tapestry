@@ -9,7 +9,7 @@
 
 use bms_model::TimeUs;
 use game::{Attempt, AttemptKind, AttemptTempo, ChartLabels};
-use skin_model::{ChartText, GaugeDesc, PlayContext, Side};
+use skin_model::{BpmRange, ChartText, GaugeDesc, PlayContext, Side};
 
 /// The scratch side the simple skin draws, its author's layout: it has no
 /// imported side and no player layout.
@@ -32,11 +32,15 @@ pub struct AttemptContext {
     /// The tempo provider and references of the chart as loaded at the
     /// attempt's speed, over its section.
     tempo: AttemptTempo,
+    /// The presentation epoch the attempt was attached as: a snapshot of
+    /// another epoch gives its frames no gain.
+    epoch: u64,
 }
 
 impl AttemptContext {
-    /// `attempt` as a skin takes it, with the lanes laid out for `scratch`.
-    pub fn new(attempt: Attempt, scratch: Side) -> Self {
+    /// `attempt` as a skin takes it, with the lanes laid out for `scratch`,
+    /// attached as presentation epoch `epoch`.
+    pub fn new(attempt: Attempt, scratch: Side, epoch: u64) -> Self {
         Self {
             gauges: attempt.gauges.iter().map(GaugeDesc::from_rule).collect(),
             kind: attempt.kind,
@@ -47,18 +51,19 @@ impl AttemptContext {
             last_note_end: attempt.last_note_end,
             labels: attempt.labels,
             tempo: attempt.tempo,
+            epoch,
         }
     }
 
-    /// The attempt's tempo provider and references. Nothing reads them in
-    /// play until the readouts and controls are switched on (S10-04b), so
-    /// the frame readouts and the BPM range stay unavailable.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "S10-04b's frame readouts and controls read it")
-    )]
+    /// The attempt's tempo provider and references, which every play frame
+    /// reads at its display head.
     pub const fn tempo(&self) -> &AttemptTempo {
         &self.tempo
+    }
+
+    /// The presentation epoch the attempt was attached as.
+    pub const fn epoch(&self) -> u64 {
+        self.epoch
     }
 
     /// The chart's five labels, borrowed for one preparation.
@@ -86,11 +91,25 @@ impl AttemptContext {
             scratch: self.scratch,
             ln_default: self.ln_default,
             last_note_end: self.last_note_end,
-            // No authoritative BPM range is known yet: `None` hides its
-            // readouts rather than inferring them from the scroll.
-            bpm_range: None,
+            bpm_range: bpm_range(self.tempo.meta()),
         }
     }
+}
+
+/// The chart's original lowest and highest tempos in floored hundredths of
+/// a BPM, not scaled by the practice speed (design.md "Play readouts");
+/// `None` past [`skin_model::READOUT_MAX`].
+fn bpm_range(meta: &bms_model::TempoMeta) -> Option<BpmRange> {
+    let x100 = |t: bms_model::Tempo| {
+        let v = t.units() / (bms_model::Tempo::UNITS_PER_BPM / 100);
+        u32::try_from(v)
+            .ok()
+            .filter(|&v| i64::from(v) <= i64::from(skin_model::READOUT_MAX))
+    };
+    Some(BpmRange {
+        min_x100: x100(meta.min)?,
+        max_x100: x100(meta.max)?,
+    })
 }
 
 #[cfg(test)]
@@ -103,9 +122,9 @@ mod tests {
 
     /// The context carries the preset's gauges in its order, its flags and
     /// LN default, the section and the note end as the game made them,
-    /// the scratch side given, and no BPM range; the chart's five labels;
-    /// and the attempt's tempo provider, sharing the chart's timeline, over
-    /// the same section.
+    /// the scratch side given, and the chart's original BPM range; the
+    /// chart's five labels; and the attempt's tempo provider, sharing the
+    /// chart's timeline, over the same section.
     #[test]
     fn the_context_is_the_attempts_own_data() {
         let mut preset = rules::tapestry();
@@ -134,7 +153,8 @@ mod tests {
             &chart,
         );
         let tempo = attempt.tempo.clone();
-        let owned = AttemptContext::new(attempt, Side::Right);
+        let owned = AttemptContext::new(attempt, Side::Right, 7);
+        assert_eq!(owned.epoch(), 7);
         assert_eq!(owned.tempo(), &tempo);
         assert_eq!(
             owned.tempo().timeline().points().as_ptr(),
@@ -153,7 +173,13 @@ mod tests {
         assert_eq!(ctx.ln_default, preset.ln_mode.default);
         assert_eq!(ctx.scratch, Side::Right);
         assert_eq!(ctx.last_note_end, TimeUs(1_000_000));
-        assert_eq!(ctx.bpm_range, None);
+        assert_eq!(
+            ctx.bpm_range,
+            Some(skin_model::BpmRange {
+                min_x100: 15_000,
+                max_x100: 15_000
+            })
+        );
         let text = owned.text();
         assert_eq!(
             [

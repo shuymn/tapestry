@@ -1228,6 +1228,14 @@ pub(crate) fn playback(bpm: Ratio, speed: Speed) -> Result<Ratio, Unrepresentabl
 #[derive(Debug)]
 pub struct PresentationWriter(triple_buffer::Input<PresentationSnapshot>);
 
+impl PresentationWriter {
+    /// Publishes `snapshot`, as a drain does: what a frame stands in for
+    /// the reducer with. Allocates nothing.
+    pub fn write(&mut self, snapshot: PresentationSnapshot) {
+        self.0.write(snapshot);
+    }
+}
+
 /// The frame's end of the presentation triple buffer.
 #[derive(Debug)]
 pub struct PresentationReader(triple_buffer::Output<PresentationSnapshot>);
