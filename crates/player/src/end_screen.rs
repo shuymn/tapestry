@@ -347,14 +347,16 @@ fn gauge_cells(s: &ViewSummary, preset: Option<&RulePreset>, width: usize) -> Ve
 }
 
 /// The early/late lines: the totals, the tally's FAST and SLOW (PERFECT
-/// left out), with the presses exactly on time and the speed when it is
-/// not 100 %; then each judgment's early and late counts, PERFECT
-/// included.
+/// left out, empty POORs in), with the presses exactly on time and the
+/// speed when it is not 100 %; then the tally's early and late counts of
+/// each judgment, PERFECT included.
 fn timing_lines(tally: &eval::Tally, t: &Timing, speed: bms_model::Speed) -> [String; 2] {
-    let (e, l) = (&t.early, &t.late);
+    let (e, l) = (&tally.early, &tally.late);
     let mut totals = format!(
         "EARLY {}  LATE {}  (NOT PERFECT)  ON TIME {}",
-        tally.fast, tally.slow, t.exact
+        tally.fast(),
+        tally.slow(),
+        t.exact
     );
     if speed != bms_model::Speed::NORMAL {
         totals.push_str(&format!("  AT {}% SPEED", speed.twentieths() * 5));
@@ -721,8 +723,7 @@ mod tests {
             combo: 2,
             max_combo: 4,
             empty_poor: 6,
-            fast: 0,
-            slow: 0,
+            ..Default::default()
         };
         let gauges = preset
             .gauges
@@ -898,8 +899,9 @@ mod tests {
     }
 
     /// P1: the early/late lines show the tally's FAST and SLOW as the
-    /// totals, then the counts split by judgment, and the speed when it is
-    /// not 100 %; at the largest counts a chart can hold they fit the line.
+    /// totals, empty POORs in, then its early and late counts by judgment,
+    /// and the speed when it is not 100 %; at the largest counts a chart
+    /// can hold they fit the line.
     #[test]
     fn early_late_lines_show_the_counts_and_fit() {
         let per = |perfect, great, good, bad, poor| rules::PerJudgment {
@@ -909,24 +911,22 @@ mod tests {
             bad,
             poor,
         };
-        let tally = |fast, slow| eval::Tally {
-            fast,
-            slow,
+        let tally = |early, late, empty: (u32, u32)| eval::Tally {
+            early,
+            late,
+            empty_poor_early: empty.0,
+            empty_poor_late: empty.1,
             ..report(rules::tapestry()).tally
         };
         let t = game::Timing {
-            early: per(310, 80, 30, 8, 2),
-            late: per(298, 60, 25, 9, 1),
             exact: 4,
             ..game::Timing::NONE
         };
-        // The totals are the tally's, not sums of the split: unequal here,
-        // so the line shows which it read.
-        let played = tally(7, 5);
+        let played = tally(per(310, 80, 30, 8, 2), per(298, 60, 25, 9, 1), (3, 1));
         assert_eq!(
             super::timing_lines(&played, &t, bms_model::Speed::NORMAL),
             [
-                "EARLY 7  LATE 5  (NOT PERFECT)  ON TIME 4",
+                "EARLY 123  LATE 96  (NOT PERFECT)  ON TIME 4",
                 "E/L PF 310/298 GR 80/60 GD 30/25 BD 8/9 PR 2/1",
             ]
         );
@@ -934,24 +934,20 @@ mod tests {
         assert!(super::timing_lines(&played, &t, slow)[0].ends_with("  AT 75% SPEED"));
         // The loader's 500,000 objects: ten 5-digit counts, or one
         // 6-digit total with the rest small.
-        let wide = game::Timing {
-            early: per(49_999, 49_999, 49_999, 49_999, 49_999),
-            late: per(49_999, 49_999, 49_999, 49_999, 49_999),
+        let t = game::Timing {
             exact: 99_999,
             ..game::Timing::NONE
         };
-        let tall = game::Timing {
-            early: per(0, 499_999, 0, 0, 0),
-            exact: 99_999,
-            ..game::Timing::NONE
-        };
-        for (n, t) in [(tally(199_996, 199_996), wide), (tally(499_999, 0), tall)] {
+        let five = per(49_999, 49_999, 49_999, 49_999, 49_999);
+        let wide = tally(five, five, (0, 0));
+        let tall = tally(per(0, 499_999, 0, 0, 0), per(0, 0, 0, 0, 0), (0, 0));
+        for n in [wide, tall] {
             for line in super::timing_lines(&n, &t, bms_model::Speed::FASTEST) {
                 assert!(line.len() <= COLUMNS, "{line}");
             }
         }
         assert!(
-            super::timing_lines(&played, &wide, bms_model::Speed::NORMAL)[1]
+            super::timing_lines(&wide, &t, bms_model::Speed::NORMAL)[1]
                 .starts_with("PF 49999/49999")
         );
     }

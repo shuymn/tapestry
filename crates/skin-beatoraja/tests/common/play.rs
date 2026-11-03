@@ -66,8 +66,7 @@ pub fn tally(ex_score: u32, combo: u32) -> Tally {
         combo,
         max_combo: combo,
         empty_poor: 0,
-        fast: 0,
-        slow: 0,
+        ..Default::default()
     }
 }
 

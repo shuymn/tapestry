@@ -952,7 +952,11 @@ fn fast_and_slow_survive_the_record_and_its_reevaluation() {
     }
     let one = s.play(script(items, &[])).unwrap();
     assert_eq!(one.end, PlayEnd::Completed);
-    assert_eq!((one.tally.fast, one.tally.slow), (4, 4));
+    // FAST: the GREAT and BAD presses before their notes; SLOW: the GREAT
+    // and GOOD presses after theirs and the misses. The presses on time
+    // are early PERFECTs.
+    assert_eq!((one.tally.fast(), one.tally.slow()), (4, 6));
+    assert_eq!((one.tally.early.perfect, one.tally.late.poor), (2, 2));
     assert_eq!(one.tally.counts.poor, 2);
 
     let path = &one.saved.as_ref().unwrap().as_ref().unwrap().path;
@@ -985,12 +989,10 @@ fn fast_and_slow_survive_the_record_and_its_reevaluation() {
 
     // PERFECT at ±30 ms takes in the 25 ms presses.
     let wide = ReEvaluate::under(&ctx, &wide_perfect()).unwrap().evaluation;
-    assert_eq!((wide.tally.fast, wide.tally.slow), (2, 2));
+    assert_eq!((wide.tally.fast(), wide.tally.slow()), (2, 4));
 
-    let other = eval::Tally {
-        slow: one.tally.slow + 1,
-        ..one.tally
-    };
+    let mut other = one.tally;
+    other.late.good += 1;
     let summary = game::ResultExtension::on_play_end(
         &mut ReEvaluate,
         &game::ResultContext {

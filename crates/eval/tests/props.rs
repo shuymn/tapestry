@@ -85,27 +85,36 @@ fn check_stream(e: &Evaluation) -> Result<(), TestCaseError> {
     Ok(())
 }
 
-/// FAST and SLOW are the stream's judgments other than PERFECT that carry
-/// a deviation, by its sign: one per judgment, a long note's at its
-/// judgment, never a miss, an empty POOR or feedback.
-fn check_fast_slow(e: &Evaluation) -> Result<(), TestCaseError> {
-    let (mut fast, mut slow) = (0, 0);
-    for ev in &e.events {
-        if let eval::JudgeEventKind::Judged {
-            judgment,
-            deviation: Some(d),
-            ..
-        } = ev.kind
-            && judgment != rules::Judgment::Perfect
-        {
-            if d.0 < 0 {
-                fast += 1;
-            } else if d.0 > 0 {
-                slow += 1;
-            }
-        }
+/// Each judgment counts once on one side: for every kind, early plus
+/// late is the stream's judgments of that kind, and the empty POORs'
+/// early plus late is the stream's empty POORs and the tally's; FAST and
+/// SLOW are the sides GREAT to POOR plus the empty POORs'.
+fn check_early_late(e: &Evaluation) -> Result<(), TestCaseError> {
+    use rules::Judgment::{Bad, Good, Great, Perfect, Poor};
+    let t = &e.tally;
+    for j in [Perfect, Great, Good, Bad, Poor] {
+        let judged = e
+            .events
+            .iter()
+            .filter(|ev| matches!(ev.kind, eval::JudgeEventKind::Judged { judgment, .. } if judgment == j))
+            .count();
+        prop_assert_eq!(
+            u64::from(*t.early.get(j)) + u64::from(*t.late.get(j)),
+            u64::try_from(judged).unwrap(),
+            "{:?}",
+            j
+        );
     }
-    prop_assert_eq!((e.tally.fast, e.tally.slow), (fast, slow));
+    let empty = e
+        .events
+        .iter()
+        .filter(|ev| matches!(ev.kind, eval::JudgeEventKind::EmptyPoor { .. }))
+        .count();
+    prop_assert_eq!(t.empty_poor_early + t.empty_poor_late, t.empty_poor);
+    prop_assert_eq!(u64::from(t.empty_poor), u64::try_from(empty).unwrap());
+    let side = |p: &rules::PerJudgment<u32>, empty: u32| p.great + p.good + p.bad + p.poor + empty;
+    prop_assert_eq!(t.fast(), side(&t.early, t.empty_poor_early));
+    prop_assert_eq!(t.slow(), side(&t.late, t.empty_poor_late));
     Ok(())
 }
 
@@ -140,7 +149,7 @@ fn check_live(play: &Play, delivery: &Delivery) -> Result<Live, TestCaseError> {
     let batch = eval_ok(play, &at_t)?;
     check_stream(&batch)?;
     check_final_deadline(play, &batch)?;
-    check_fast_slow(&batch)?;
+    check_early_late(&batch)?;
     prop_assert_eq!(run.watermarks.last(), Some(&t));
     prop_assert_eq!(&run.events, &batch.events);
     prop_assert_eq!(run.tally, batch.tally);
@@ -374,7 +383,7 @@ proptest! {
         check_play(&play)?;
         let whole = eval_ok(&play, &play.input)?;
         check_long_notes(&play, &whole)?;
-        check_fast_slow(&whole)?;
+        check_early_late(&whole)?;
     }
 
     /// A long note pressed inside its scaled BAD window and held at least

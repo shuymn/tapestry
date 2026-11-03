@@ -447,12 +447,12 @@ fn fast_and_slow_count_the_winning_ready_only() {
         judgments(&cancelled.events),
         [(1, 0, Judgment::Bad, Some(-160 * MS))]
     );
-    assert_eq!((cancelled.tally.fast, cancelled.tally.slow), (1, 0));
+    assert_eq!((cancelled.tally.fast(), cancelled.tally.slow()), (1, 0));
     // The rearm starts the winner from nothing.
     assert_eq!(count_judged(&report.live, Judgment::Bad), 0);
     assert_eq!(count_judged(&report.live, Judgment::Great), 1);
     assert_eq!(count_judged(&report.live, Judgment::Perfect), 3);
-    assert_eq!((report.tally.fast, report.tally.slow), (0, 1));
+    assert_eq!((report.tally.fast(), report.tally.slow()), (0, 1));
     let result = report.result.as_ref().unwrap();
     assert!(result.matches_live);
     assert_eq!(result.evaluation.as_ref().unwrap().tally, report.tally);

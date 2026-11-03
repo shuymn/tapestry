@@ -129,27 +129,27 @@ fn loaded_charts_evaluate_as_before() {
     let expected: [(&str, &str); 6] = [
         (
             "mixed",
-            "72865449564cbc68fb59d0c8f37d0a0c7133b219153be9f162751bfebf9d5dbe",
+            "0ac86e4990f2e43d9aefe2881f6389bc365a1ee030bbae0baafebaf020498faf",
         ),
         (
             "cycling",
-            "1e56f857825d43b305e12d469b3ff538b37292579e64f7723c4ec850f74d9786",
+            "49429a3a6cf6ca1baf4c4c7d1e2d3471f9bca58ca7f8143acffddb0c115a759b",
         ),
         (
             "bpm_stop",
-            "0d577861d3e2501c5ec348efba3190c80f889d8e4e4a125b2a6cc652f926811d",
+            "f2f39c9ca77d208e4ca9d3c658453cfb1acc533d86dfc3233a6b886af64c505d",
         ),
         (
             "mines",
-            "f6add694bb80b616d41eea2449987696f0f87f1594329db72bd23fa923e40d8f",
+            "c2fd0d676d6a76cd5c89d7b7a0a11ecb81baa06de863c4c1a2418e41ec4d73c6",
         ),
         (
             "lntype1",
-            "ac3996b2afea5772ba58312fed0ace205e9ffd69b0d2bfec9bdd5ce65ea18e9e",
+            "e9549920fa034c5c1a141563e588f512a5055269ad2590a0fe37a64a7fde60c4",
         ),
         (
             "lnobj",
-            "ac3996b2afea5772ba58312fed0ace205e9ffd69b0d2bfec9bdd5ce65ea18e9e",
+            "e9549920fa034c5c1a141563e588f512a5055269ad2590a0fe37a64a7fde60c4",
         ),
     ];
     let got: Vec<(&str, &str)> = got.iter().map(|(n, d)| (*n, d.as_str())).collect();

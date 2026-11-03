@@ -161,8 +161,7 @@ pub fn tally(combo: u32) -> Tally {
         combo,
         max_combo: combo,
         empty_poor: 0,
-        fast: 0,
-        slow: 0,
+        ..Default::default()
     }
 }
 

@@ -353,9 +353,8 @@ fn coverage_sets_reached_and_no_input() {
     assert_eq!(s.graphs.no_input_from, Some(expected - 1));
 }
 
-/// G5, units: early, late and on time by judgment, the bins and both
-/// sides beyond them; a miss, an empty POOR and a held head's feedback
-/// count nothing.
+/// G5, units: the presses on time, the bins and both sides beyond them;
+/// a miss, an empty POOR and a held head's feedback count nothing.
 #[test]
 fn timing_counts_the_judged_presses() {
     use eval::{JudgeEvent, JudgeEventKind};
@@ -397,15 +396,6 @@ fn timing_counts_the_judged_presses() {
         },
     ];
     let t = Timing::of(&events);
-    let per = |perfect, great, good, bad, poor| PerJudgment {
-        perfect,
-        great,
-        good,
-        bad,
-        poor,
-    };
-    assert_eq!(t.early, per(1, 2, 0, 0, 0));
-    assert_eq!(t.late, per(1, 0, 1, 1, 1));
     assert_eq!(t.exact, 1);
     assert_eq!(t.earlier, 1);
     assert_eq!(t.later, 2);
@@ -420,8 +410,9 @@ fn timing_counts_the_judged_presses() {
 }
 
 /// G5 through a re-evaluation: a long note pressed 20 ms early and held
-/// through its end counts once, early, under its judgment at the end; a
-/// tap 5 ms late counts late; a missed tap and an empty POOR count nothing.
+/// through its end is one press in the distribution, and the tally counts
+/// it once, early, under its judgment at the end; a tap 5 ms late is a
+/// press and counts late; a missed tap is no press and counts late.
 #[test]
 fn timing_counts_a_long_note_once_by_its_head() {
     let chart = ChartBuilder::new(150_000)
@@ -446,15 +437,12 @@ fn timing_counts_a_long_note_once_by_its_head() {
     let (_, _, ln, ln_dev) = judged[0];
     assert_eq!(ln_dev, Some(-20 * MS));
     assert_eq!(t.samples(), 2);
-    assert_eq!(t.early.get(ln), &1);
-    assert_eq!(
-        t.early.perfect + t.early.great + t.early.good + t.early.bad + t.early.poor,
-        1
-    );
-    assert_eq!(
-        t.late.perfect + t.late.great + t.late.good + t.late.bad + t.late.poor,
-        1
-    );
+    let tally = &r.evaluation.tally;
+    let all = |p: &PerJudgment<u32>| p.perfect + p.great + p.good + p.bad + p.poor;
+    assert_eq!(tally.early.get(ln), &1);
+    assert_eq!(all(&tally.early), 1);
+    assert_eq!(all(&tally.late), 2);
+    assert_eq!(tally.late.poor, 1);
     assert_eq!(t.exact, 0);
     assert_eq!(t.bins[(64_000 - 20_000) / 2_000], 1);
     assert_eq!(t.bins[(64_000 + 5_000) / 2_000], 1);
@@ -522,10 +510,7 @@ fn own_timing_matches_the_recommendation_and_emphasis_follows_the_display() {
         panic!("{:?}", screen.status());
     };
     assert_eq!(own.graphs.timing.samples(), 40);
-    assert_eq!(
-        own.graphs.timing.early.perfect + own.graphs.timing.early.great,
-        20
-    );
+    assert_eq!(own.tally.early.perfect + own.tally.early.great, 20);
     assert_eq!(own.graphs.emphasized, Some(1));
     let mut emphasized = Vec::new();
     for _ in 0..screen.entries().len() {

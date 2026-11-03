@@ -363,24 +363,56 @@ fn a_strip_past_the_model_is_a_range_error() {
     assert!(matches!(e, ImportError::Range { .. }), "{e:?}");
 }
 
-/// FAST and SLOW (423 `totalearly`, 424 `totallate`), by id and by name,
-/// one row each from y = 100 below an EX score of one cell at y = 0 that
-/// tells the glyphs apart.
-const FAST_SLOW: [&str; 4] = [
-    r#""ref": 423"#,
-    r#""value": "totalearly""#,
-    r#""value": 424"#,
-    r#""value": "totallate""#,
+/// The early and late counts (410-419 by id, 420-422 by id and by name)
+/// and their totals (423 `totalearly`, 424 `totallate`), one row each
+/// from y = 100 below an EX score of one cell at y = 0 that tells the
+/// glyphs apart, with what each shows of [`early_late_tally`].
+const EARLY_LATE: [(&str, &str); 17] = [
+    (r#""ref": 410"#, "1"),
+    (r#""value": 411"#, "6"),
+    (r#""ref": 412"#, "2"),
+    (r#""ref": 413"#, "7"),
+    (r#""ref": 414"#, "3"),
+    (r#""ref": 415"#, "8"),
+    (r#""ref": 416"#, "4"),
+    (r#""ref": 417"#, "9"),
+    (r#""ref": 418"#, "5"),
+    (r#""ref": 419"#, "10"),
+    (r#""value": "miss""#, "23"),
+    (r#""value": "early_miss""#, "11"),
+    (r#""ref": 422"#, "12"),
+    (r#""ref": 423"#, "25"),
+    (r#""value": "totalearly""#, "25"),
+    (r#""value": 424"#, "46"),
+    (r#""value": "totallate""#, "46"),
 ];
 
+/// Early 1 to 5 and late 6 to 10 PERFECT to POOR, and 11 early and 12
+/// late empty POORs: FAST 2 + 3 + 4 + 5 + 11 = 25, SLOW 7 + 8 + 9 + 10 +
+/// 12 = 46.
+fn early_late_tally(t: &mut eval::Tally) {
+    let per = |perfect, great, good, bad, poor| rules::PerJudgment {
+        perfect,
+        great,
+        good,
+        bad,
+        poor,
+    };
+    t.early = per(1, 2, 3, 4, 5);
+    t.late = per(6, 7, 8, 9, 10);
+    t.empty_poor_early = 11;
+    t.empty_poor_late = 12;
+    t.empty_poor = 23;
+}
+
 #[test]
-fn fast_and_slow_show_the_tallys_counts_with_a_d4_note() {
+fn early_and_late_counts_show_the_tallys_counts() {
     let mut values = vec![
         r#"{"id": "ex", "src": "n", "w": 120, "h": 20, "divx": 10, "digit": 1, "ref": 71}"#
             .to_owned(),
     ];
     let mut dsts = vec![r#"{"id": "ex", "dst": [{"x": 0, "y": 0, "w": 12, "h": 20}]}"#.to_owned()];
-    for (i, prop) in FAST_SLOW.iter().enumerate() {
+    for (i, (prop, _)) in EARLY_LATE.iter().enumerate() {
         values.push(format!(
             r#"{{"id": "n{i}", "src": "n", "w": 120, "h": 20, "divx": 10, "digit": 3, {prop}}}"#
         ));
@@ -394,18 +426,12 @@ fn fast_and_slow_show_the_tallys_counts_with_a_d4_note() {
         values.join(","),
         dsts.join(",")
     ));
-    // Each states its counting's difference from the source: one D4 note
-    // at each number, and nothing else.
-    let notes = &loaded.report().notes;
-    assert_eq!(notes.len(), FAST_SLOW.len(), "{notes:?}");
-    assert!(
-        notes
-            .iter()
-            .all(|n| n.kind == NoteKind::Deviation(skin_beatoraja::DeviationId::D4))
-    );
+    // Counted as the source counts them: no note.
+    assert_eq!(loaded.report().notes, [], "{:?}", loaded.report().notes);
     let mut d = loaded.drawn_over(4);
-    assert_eq!(rows(&mut d, 0, FAST_SLOW.len()), ["0", "0", "0", "0"]);
-    d.tally.fast = 12;
-    d.tally.slow = 7;
-    assert_eq!(rows(&mut d, 16, FAST_SLOW.len()), ["12", "12", "7", "7"]);
+    let n = EARLY_LATE.len();
+    assert_eq!(rows(&mut d, 0, n), vec!["0"; n]);
+    early_late_tally(&mut d.tally);
+    let shown: Vec<_> = EARLY_LATE.iter().map(|(_, v)| v.to_string()).collect();
+    assert_eq!(rows(&mut d, 16, n), shown);
 }
