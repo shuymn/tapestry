@@ -1868,6 +1868,9 @@ impl AppRig for PlayerRig<'_> {
     }
 
     fn entered_selection(&mut self) {
+        // Another scene: held adjustment controls act no more until
+        // pressed afresh.
+        self.enter_scene();
         recover(
             &mut self.result_input,
             Owner::Select,
@@ -1896,6 +1899,7 @@ impl AppRig for PlayerRig<'_> {
     }
 
     fn entered_practice(&mut self, screen: &PracticeScreen) {
+        self.enter_scene();
         recover(
             &mut self.result_input,
             Owner::Practice,

@@ -816,7 +816,12 @@ fn a_scene_change_stops_held_controls_until_a_fresh_press() {
         .keys(20 * MS, &[(F2, true)]);
     assert_eq!(rig.snap().hispeed, Some(r(370, 100)));
     // The play ends and its result shows: the repeats step nothing more.
-    rig.driver.scene_changed();
+    let mut pump = Pump {
+        set: &mut rig.set,
+        now: TimeUs(rig.now),
+        offset: 0,
+    };
+    rig.driver.scene_changed(&mut pump).unwrap();
     rig.keys(40 * MS, &[(F2, true)])
         .keys(50 * MS, &[(F2, true)]);
     let s = rig.snap();
@@ -826,4 +831,27 @@ fn a_scene_change_stops_held_controls_until_a_fresh_press() {
     rig.keys(60 * MS, &[(F2, false)])
         .keys(70 * MS, &[(F2, true)]);
     assert_eq!(rig.snap().hispeed, Some(r(395, 100)));
+}
+
+#[test]
+fn a_press_queued_before_a_scene_change_stays_in_the_old_scene() {
+    // F2 pressed and repeating after the last drain, before the result
+    // shows: the scene change fences the tap first, so the press is taken
+    // in the play's context and its repeats on the result act no more.
+    let mut rig = Rig::new(options(SpeedMode::Classic, 320, 300, Covers::default()));
+    rig.enter(-1_000_000);
+    rig.attach(tempo(150, None), -1_000_000).unwrap();
+    rig.drain();
+    rig.keys(10 * MS, &[(F2, true)]);
+    let mut pump = Pump {
+        set: &mut rig.set,
+        now: TimeUs(rig.now),
+        offset: 0,
+    };
+    rig.driver.scene_changed(&mut pump).unwrap();
+    rig.keys(40 * MS, &[(F2, true)])
+        .keys(50 * MS, &[(F2, true)]);
+    let s = rig.snap();
+    assert_eq!(s.hispeed, Some(r(345, 100)), "the press alone");
+    assert_eq!(s.options.hispeed().classic_hispeed_x100, 345);
 }

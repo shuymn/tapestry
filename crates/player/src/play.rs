@@ -316,6 +316,20 @@ impl PlayerRig<'_> {
         self.adjust_failed.get_or_insert(e);
     }
 
+    /// Every scene change outside an attempt's entry (a play's result,
+    /// selection, the practice page) goes through here: the driver fences
+    /// the input thread and changes the adjustments' context
+    /// ([`game::AdjustDriver::scene_changed`]). An attempt's entry goes
+    /// through [`enter_attempt`](Self::enter_attempt), which fences and
+    /// changes the context too.
+    pub(crate) fn enter_scene(&mut self) {
+        if let Some((driver, mut pump)) = self.adjustments()
+            && let Err(e) = driver.scene_changed(&mut pump)
+        {
+            self.adjustments_failed(e);
+        }
+    }
+
     /// The coming attempt's entry for the adjustments, at a loading
     /// state's start ([`game::AdjustDriver::enter_attempt`]).
     pub(crate) fn enter_attempt(&mut self) {
@@ -1164,9 +1178,7 @@ impl Rig for PlayerRig<'_> {
         self.controls.next_scene();
         // The result is another scene: held adjustment controls act no more
         // until pressed afresh.
-        if let Some(driver) = &mut self.adjust {
-            driver.scene_changed();
-        }
+        self.enter_scene();
         if let Some(c) = self.figures.as_ref().and_then(|f| f.ready_state) {
             println!(
                 "ready: setup {} us, first frame {} after it started",

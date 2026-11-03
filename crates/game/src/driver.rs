@@ -320,12 +320,20 @@ impl AdjustDriver {
         Ok(epoch)
     }
 
-    /// The scene changed (a play ended and its result shows): an
-    /// ownership change at the latest observation's stamp, so a control
-    /// held across it (F1 or F2 repeating, a scratch held with START)
-    /// takes no further action until released and pressed afresh.
-    /// Publishes the result.
-    pub fn scene_changed(&mut self) {
+    /// The scene changed (a play's result, selection or the practice
+    /// page shows): the input thread is fenced first, so everything it
+    /// observed before the change is taken in the old scene's context;
+    /// then an ownership change at the fence's stamp, so a control held
+    /// across it (F1 or F2 repeating, a scratch held with START) takes no
+    /// further action until released and pressed afresh. Publishes the
+    /// result. An attempt's entry ([`enter_attempt`](Self::enter_attempt))
+    /// is the other scene change, and fences and ends the context too.
+    ///
+    /// # Errors
+    ///
+    /// Why the input thread did not answer the fence: the run ends with it.
+    pub fn scene_changed(&mut self, input: &mut impl InputPump) -> Result<(), InputWaitError> {
+        self.fence(input)?;
         let (time, seq) = self.reducer.last().unwrap_or((TimeUs(i64::MIN), 0));
         let ownership = Observation {
             time,
@@ -340,6 +348,7 @@ impl AdjustDriver {
                 .reducer
                 .feed([Augmented::Obs(ownership)], &NoTempo, &mut self.writer),
         }
+        Ok(())
     }
 
     /// Whether an attempt is attached and not yet prepared.

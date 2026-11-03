@@ -1949,4 +1949,20 @@ mod tests {
             )
         );
     }
+
+    /// Entering selection is a scene change: it fences the input thread
+    /// for the adjustments (here it never answers, so the fence fails and
+    /// ends the run, which shows it was asked).
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn entering_selection_fences_the_adjustments() {
+        use game::AppRig as _;
+        use game::Rig as _;
+        let (failed, _) = on_rig(game::DeviceSettings::default(), |rig, _| {
+            assert_eq!(rig.input_failure(), None);
+            rig.entered_selection();
+            rig.input_failure()
+        });
+        assert_eq!(failed, Some(game::InputWaitError::Timeout));
+    }
 }
