@@ -212,16 +212,16 @@ fn an_unavailable_fact_refuses_at_the_read() {
 }
 
 /// The ways a skin can call `call` under protection: `pcall` of the
-/// host function itself and of a closure, `xpcall` with a handler that
-/// returns the error, each on the body's second line, then a check that
-/// fails the skin if the call came back.
+/// host function itself and of a closure, and `xpcall` with a handler
+/// that returns the error, each on the body's second line. That no skin
+/// code runs after the call is shown with a witness only the crate's own
+/// tests have (`lua::tests`).
 fn protected(call: &str) -> [String; 3] {
-    let reached = "error(\"the protected call came back\")";
     [
-        format!("local a = 1\npcall(ms.option, {call})\n{reached}"),
-        format!("local a = 1\npcall(function() return ms.option({call}) end)\n{reached}"),
+        format!("local a = 1\npcall(ms.option, {call})"),
+        format!("local a = 1\npcall(function() return ms.option({call}) end)"),
         format!(
-            "local a = 1\nxpcall(function() return ms.option({call}) end, function(e) return e end)\n{reached}"
+            "local a = 1\nxpcall(function() return ms.option({call}) end, function(e) return e end)"
         ),
     ]
 }
