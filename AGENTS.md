@@ -38,5 +38,5 @@ On Linux, the Windows-only crates can be checked (not tested or run) by cross-co
 
 ```sh
 mise exec -- cargo xwin clippy --workspace --all-targets --target x86_64-pc-windows-msvc -- -D warnings
-mise exec -- cargo xwin clippy -p player -p game --all-targets --features player/dev-tools,game/dev-tools --target x86_64-pc-windows-msvc -- -D warnings
+mise exec -- cargo xwin clippy -p player -p game -p skin-beatoraja --all-targets --features player/dev-tools,game/dev-tools,skin-beatoraja/dev-tools --target x86_64-pc-windows-msvc -- -D warnings
 ```
