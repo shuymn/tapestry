@@ -35,7 +35,7 @@
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use bms_model::TimeUs;
 use eval::ControlId;
@@ -334,11 +334,46 @@ pub enum WindowKeyEvent {
 
 #[derive(Debug, Default)]
 struct WindowKeyShared {
-    /// The queue was full: the window enqueues nothing until the input
-    /// thread clears it.
-    overflow: AtomicBool,
-    /// The keys held as the window last saw them, a bit each.
-    held: AtomicU8,
+    /// One word, so the input thread acknowledges an overflow against the
+    /// very held keys it takes as the baseline: the keys held as the
+    /// window last saw them (bits 0 and 1), whether the queue was full so
+    /// the window enqueues nothing until the input thread acknowledges it
+    /// ([`OVERFLOW`]), and a version counting every change (from bit 8).
+    word: AtomicU64,
+}
+
+/// [`WindowKeyShared::word`]'s overflow bit.
+const OVERFLOW: u64 = 1 << 2;
+
+/// The held keys of a [`WindowKeyShared::word`].
+const fn held_keys(word: u64) -> u8 {
+    (word & 3) as u8
+}
+
+impl WindowKeyShared {
+    /// The held keys now.
+    fn held(&self) -> u8 {
+        held_keys(self.word.load(Ordering::Acquire))
+    }
+
+    /// Acknowledges an overflow: clears it in one step with reading the
+    /// held keys it returns as the baseline, so a change the window made
+    /// meanwhile (and could not queue) is never lost: the step fails and
+    /// is taken again with the newer keys. `between` runs between the read
+    /// and the step (a test forces an interleaving there).
+    fn acknowledge(&self, mut between: impl FnMut()) -> u8 {
+        loop {
+            let w = self.word.load(Ordering::Acquire);
+            between();
+            if self
+                .word
+                .compare_exchange(w, w & !OVERFLOW, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return held_keys(w);
+            }
+        }
+    }
 }
 
 /// The window's end of the window-key queue ([`window_keys`]): an ordered
@@ -383,22 +418,27 @@ impl WindowKeys {
     /// takes the held state as a baseline instead. `false` when it was not
     /// queued.
     pub fn key(&mut self, key: u8, event: WindowKeyEvent, synthetic: bool) -> bool {
-        let bit = 1_u8 << (key & 1);
-        match event {
-            WindowKeyEvent::Press | WindowKeyEvent::Repeat => {
-                self.shared.held.fetch_or(bit, Ordering::AcqRel);
-            }
-            WindowKeyEvent::Release => {
-                self.shared.held.fetch_and(!bit, Ordering::AcqRel);
-            }
-        }
-        if synthetic || self.shared.overflow.load(Ordering::Acquire) {
+        let bit = 1_u64 << (key & 1);
+        let changed = |w: u64| {
+            let held = match event {
+                WindowKeyEvent::Press | WindowKeyEvent::Repeat => (w & 3) | bit,
+                WindowKeyEvent::Release => (w & 3) & !bit,
+            };
+            Some(((w >> 8).wrapping_add(1) << 8) | (w & OVERFLOW) | held)
+        };
+        // Every change moves the version, even one the window cannot queue.
+        let before = self
+            .shared
+            .word
+            .try_update(Ordering::AcqRel, Ordering::Acquire, changed)
+            .unwrap_or(0);
+        if synthetic || before & OVERFLOW != 0 {
             return false;
         }
         if self.queue.push((key & 1, event)).is_ok() {
             return true;
         }
-        self.shared.overflow.store(true, Ordering::Release);
+        self.shared.word.fetch_or(OVERFLOW, Ordering::AcqRel);
         false
     }
 }
@@ -530,6 +570,9 @@ pub struct AdjustmentTap {
     /// tap counts held from them.
     window: Option<(WindowKeyReceiver, [Option<u8>; 2])>,
     window_held: u8,
+    /// The window's keys acknowledged with an overflow, the baseline of
+    /// the recovery it owes.
+    window_baseline: Option<u8>,
     /// The candidate a hold of this batch cancelled: its marker follows the
     /// batch.
     cancelled: Option<u32>,
@@ -593,6 +636,7 @@ pub fn adjustment_queue(
             owed_flag: Arc::clone(&owed),
             window: None,
             window_held: 0,
+            window_baseline: None,
             cancelled: None,
         },
         AdjustmentReceiver {
@@ -902,7 +946,7 @@ impl AdjustmentTap {
             return;
         };
         let numbers = *numbers;
-        let overflow = keys.shared.overflow.load(Ordering::Acquire);
+        let overflow = keys.shared.word.load(Ordering::Acquire) & OVERFLOW != 0;
         let mut events = [None; WINDOW_KEYS];
         let mut taken = 0;
         while let Some(slot) = events.get_mut(taken)
@@ -911,7 +955,6 @@ impl AdjustmentTap {
             *slot = Some(e);
             taken += 1;
         }
-        let held = keys.shared.held.load(Ordering::Acquire);
         for (key, event) in events.into_iter().flatten() {
             let Some(n) = numbers.get(usize::from(key)).copied().flatten() else {
                 continue;
@@ -931,15 +974,13 @@ impl AdjustmentTap {
             };
             self.observe(at, tap, true);
         }
-        if overflow {
+        if overflow && let Some((keys, _)) = &self.window {
             // What the window could not queue shows only in its held
-            // keys: they are the baseline, and none of them acts.
-            self.window_held = held;
+            // keys: they are the baseline, read in one step with the
+            // acknowledgement, and none of them acts.
+            self.window_baseline = Some(keys.shared.acknowledge(|| {}));
             self.owed.push(Marker::Recovery { lost: true });
             self.flush(at);
-            if let Some((keys, _)) = &self.window {
-                keys.shared.overflow.store(false, Ordering::Release);
-            }
         }
     }
 
@@ -970,10 +1011,18 @@ impl AdjustmentTap {
                         self.send(at, TapEvent::Lost);
                     }
                     let verified = self.focused && !self.unverified;
-                    // The window's keys as the window holds them now: a
-                    // made-up release while focus was away shows only there.
-                    if let Some((keys, _)) = &self.window {
-                        self.window_held = keys.shared.held.load(Ordering::Acquire);
+                    // The window's keys: an overflow's acknowledged baseline,
+                    // else as the window holds them now (a made-up release
+                    // while focus was away shows only there), its queued
+                    // events before it dropped, as the loss drops them.
+                    if let Some((keys, _)) = &mut self.window {
+                        self.window_held = match self.window_baseline.take() {
+                            Some(held) => held,
+                            None => {
+                                while keys.queue.pop().is_ok() {}
+                                keys.shared.held()
+                            }
+                        };
                     }
                     let held = self.held_set();
                     self.send(at, TapEvent::Resync { held, verified });
@@ -1129,5 +1178,32 @@ impl PresentationFocus {
     pub fn read(&self) -> (bool, u64) {
         let losses = self.0.losses.load(Ordering::Acquire);
         (self.0.focused.load(Ordering::Acquire), losses)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{WindowKeyEvent, window_keys};
+
+    /// An overflow's acknowledgement takes the held keys in one step with
+    /// clearing the overflow: F2 released after the input thread read the
+    /// keys, and dropped by the window since the overflow still stood, is
+    /// in the baseline all the same.
+    #[test]
+    fn an_acknowledgement_keeps_a_release_made_while_it_reads() {
+        let (mut keys, receiver) = window_keys();
+        assert!(keys.key(1, WindowKeyEvent::Press, false));
+        for _ in 1..super::WINDOW_KEYS {
+            assert!(keys.key(1, WindowKeyEvent::Repeat, false));
+        }
+        assert!(!keys.key(1, WindowKeyEvent::Repeat, false), "overflowed");
+        let mut released = false;
+        let held = receiver.shared.acknowledge(|| {
+            if !std::mem::replace(&mut released, true) {
+                // Dropped: the overflow still stands.
+                assert!(!keys.key(1, WindowKeyEvent::Release, false));
+            }
+        });
+        assert_eq!(held, 0, "the release is in the baseline");
     }
 }
