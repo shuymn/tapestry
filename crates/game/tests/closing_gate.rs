@@ -129,8 +129,19 @@ impl game::Wakes for Stalled {
 /// A gated session of `chart` with the survival gauge shown under
 /// `on_failure`, its audio stalled until `until_ms` of session time.
 fn session(root: &DataRoot, chart: &Chart, until_ms: i64) -> Session<Stalled> {
+    session_with_sources(root, chart, until_ms, common::sources(), 1)
+}
+
+/// [`session`] with the source set's limits.
+fn session_with_sources(
+    root: &DataRoot,
+    chart: &Chart,
+    until_ms: i64,
+    sources: input::SourceConfig,
+    displayed: usize,
+) -> Session<Stalled> {
     let mut settings = tapestry_settings(root);
-    settings.player.displayed_gauge = 1;
+    settings.player.displayed_gauge = displayed;
     settings.player.on_failure = FailureAction::Close;
     let parts = Parts {
         ingest: Box::new(Built(chart.clone())),
@@ -164,7 +175,7 @@ fn session(root: &DataRoot, chart: &Chart, until_ms: i64) -> Session<Stalled> {
     };
     let mut s = loaded.start(
         RunnerAudio::new(engine, out),
-        SourceSet::new(common::sources()).unwrap(),
+        SourceSet::new(sources).unwrap(),
     );
     let d = DeviceSettings::default();
     let keys = KeyConfigs {
@@ -352,6 +363,68 @@ fn a_quit_while_cached_uncommitted_follows_the_settled_gate() {
                 EndStatus::CancelledBeforePlayback
             },
             "{quit}"
+        );
+    }
+}
+
+/// An adjustment during Closing works as in the tail, with no scene
+/// change at Closing's entry: a fine hi-speed gesture (START with the
+/// scratch held, +0.01 at the press and every 50 ms after) begun at 2.1 s,
+/// before the failure, goes on repeating through Closing until its
+/// release at 3.4 s: the press and 25 repeats, 1.26. A scene change at the
+/// entry would end its context, and the held scratch would act no more.
+#[test]
+fn an_adjustment_in_closing_keeps_its_gesture() {
+    let scratch = ControlId(DeviceSettings::default().keyboard.scratch_positive.unwrap());
+    let (_dir, root) = temp_root();
+    let mut s = session(&root, &notes(16), 0);
+    let items = vec![
+        connect(),
+        raw(2_000, Q, 1),
+        raw(2_100, scratch, 1),
+        raw(3_400, scratch, 0),
+    ];
+    let report = s.play(script(items, &[])).unwrap();
+    let closing = report.closing.unwrap();
+    assert!(closing.started_at < TimeUs(2_700 * MS), "{closing:?}");
+    assert!(TimeUs(3_400 * MS) < closing.ended_at, "{closing:?}");
+    let snap = s.presentation().unwrap();
+    assert!(snap.adjusting, "START is still held");
+    assert_eq!(snap.hispeed, Some(game::Ratio::from_hundredths(126)));
+}
+
+/// The record's source-limit flag is the one recording had when Closing
+/// sealed it, whatever arrives during Closing: with one source allowed, a
+/// second keyboard connected before the opening marks it and the mark
+/// stays through Closing; one arriving during Closing marks nothing.
+#[test]
+fn the_source_limit_flag_is_frozen_in_closing() {
+    for (second_at, marked) in [(i64::MIN, true), (3_000 * MS, false)] {
+        let (_dir, root) = temp_root();
+        let sources = input::SourceConfig {
+            max_sources: 1,
+            ..common::sources()
+        };
+        let mut s = session_with_sources(&root, &notes(16), 0, sources, 1);
+        let items = vec![
+            connect(),
+            item(
+                second_at,
+                Action::Connect(DeviceId(1), DeviceKind::Keyboard),
+            ),
+            // And a third during Closing, in both.
+            item(
+                3_100 * MS,
+                Action::Connect(DeviceId(2), DeviceKind::Keyboard),
+            ),
+        ];
+        let report = s.play(script(items, &[])).unwrap();
+        let closing = report.closing.unwrap();
+        assert!(closing.started_at < TimeUs(3_000 * MS), "{second_at}");
+        assert_eq!(
+            status(&report).incomplete.source_limit,
+            marked,
+            "{second_at}"
         );
     }
 }

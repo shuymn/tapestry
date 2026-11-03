@@ -1798,12 +1798,25 @@ mod tests {
         device: game::DeviceSettings,
         f: impl FnOnce(&mut crate::play::PlayerRig<'_>, &game::DeviceSettings) -> R,
     ) -> (R, bool) {
+        on_rig_with(
+            game::Settings {
+                device,
+                player: game::PlayerSettings::default(),
+            },
+            crate::render_side::tests::Installers::default().spawn_bare(),
+            |rig, settings| f(rig, &settings.device),
+        )
+    }
+
+    /// [`on_rig`] with `settings` and the render thread `render`.
+    #[cfg(feature = "dev-tools")]
+    fn on_rig_with<R>(
+        settings: game::Settings,
+        render: crate::render_side::RenderLink,
+        f: impl FnOnce(&mut crate::play::PlayerRig<'_>, &game::Settings) -> R,
+    ) -> (R, bool) {
         let dir = tempfile::tempdir().unwrap();
         let root = game::DataRoot::new(dir.path().join("data"));
-        let settings = game::Settings {
-            device,
-            player: game::PlayerSettings::default(),
-        };
         let clock = QpcClock::start();
         let controls = super::controls(&settings, clock);
         let (_hook, input) = input_side::link(
@@ -1829,7 +1842,6 @@ mod tests {
         )
         .unwrap();
         let audio = audio.start(engine, rtrb::RingBuffer::new(1).0);
-        let render = crate::render_side::tests::Installers::default().spawn_bare();
         let threads = super::Threads {
             input,
             audio,
@@ -1837,10 +1849,172 @@ mod tests {
             steps: rtrb::RingBuffer::new(1).0,
         };
         let mut rig = super::rig(&root, &settings, false, threads, &controls, clock).unwrap();
-        let out = f(&mut rig, &settings.device);
+        let out = f(&mut rig, &settings);
         let gated = rig.gate.is_some() && rig.adjust.is_some();
         let _ = rig.shut_down();
         (out, gated)
+    }
+
+    /// A retry pressed in Closing with the quit key, in either order, is
+    /// taken as Closing's through the real controls: the quit first, then
+    /// one retry, whose receipt the rig keeps as the next play's retry
+    /// (`pending_retry`, then `retry_from` at the next preparation).
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn a_retry_in_closing_is_received_once() {
+        use game::{Command, Rig as _};
+        for order in [
+            [Command::Quit, Command::Retry],
+            [Command::Retry, Command::Quit],
+        ] {
+            let (taken, _) = on_rig(game::DeviceSettings::default(), |rig, _| {
+                for c in order {
+                    rig.controls.command(c);
+                }
+                let mut taken = Vec::new();
+                while let Some(c) = rig.take_closing() {
+                    taken.push(c);
+                }
+                let receipt = rig.controls.retry_at();
+                assert!(receipt.is_some());
+                assert_eq!(rig.pending_retry, receipt, "{order:?}");
+                rig.prepare_screen().unwrap();
+                assert_eq!(rig.retry_from, receipt, "{order:?}");
+                taken
+            });
+            assert_eq!(taken, [Command::Quit, Command::Retry], "{order:?}");
+        }
+    }
+
+    /// The gauge each play frame was drawn with.
+    #[cfg(feature = "dev-tools")]
+    type Gauges = Arc<std::sync::Mutex<Vec<usize>>>;
+
+    /// A screen that notes the gauge of every play frame it builds.
+    #[cfg(feature = "dev-tools")]
+    struct GaugeFrames {
+        seen: Gauges,
+    }
+
+    #[cfg(feature = "dev-tools")]
+    impl crate::render_side::Screen for GaugeFrames {
+        fn load(
+            &mut self,
+            _chart: &bms_model::Chart,
+            _section: Option<&eval::Section>,
+        ) -> Result<(), render::RenderError> {
+            Ok(())
+        }
+        fn wait(&self) -> bool {
+            true
+        }
+        fn paced(&self) -> bool {
+            false
+        }
+        fn build(&mut self, f: &render::FrameInput<'_>) -> Result<(), skin_model::BuildError> {
+            self.seen.lock().unwrap().push(f.gauge);
+            Ok(())
+        }
+        fn draw(&mut self) -> Result<render::FrameTiming, render::RenderError> {
+            Ok(render::FrameTiming {
+                cpu: std::time::Duration::from_micros(50),
+                sprites: 0,
+                dropped: 0,
+                presented: true,
+                present_count: None,
+            })
+        }
+        fn text(&mut self, _lines: &[&str]) -> Result<bool, render::RenderError> {
+            Ok(true)
+        }
+        fn read_back(&self) -> Option<(u32, u32, Vec<u8>)> {
+            None
+        }
+    }
+
+    /// The play's frames are drawn with the gauge the attempt resolved
+    /// (`game::Loaded::displayed`), sent with the play
+    /// (`RenderMsg::Play`), whatever the settings name: the HARD gauge as
+    /// set, and a gauge the preset does not have as its first.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn the_play_frames_show_the_attempts_resolved_gauge() {
+        use game::Rig as _;
+        for (set, shown) in [(3, 3), (99, 0)] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = game::DataRoot::new(dir.path().join("loaded"));
+            let player = game::PlayerSettings {
+                displayed_gauge: set,
+                ..Default::default()
+            };
+            let settings = game::Settings {
+                device: game::DeviceSettings::default(),
+                player,
+            };
+            let chart_path = dir.path().join("a.bms");
+            std::fs::write(&chart_path, "#BPM 120\n#00111:01\n").unwrap();
+            let config = game::SessionConfig {
+                lead_in: bms_model::TimeUs(1_000_000),
+                step: bms_model::TimeUs(1_000),
+                start: bms_model::TimeUs(0),
+                effects: 64,
+                seed: 1,
+                speed: bms_model::Speed::NORMAL,
+                app_version: "0.0.0-test".to_owned(),
+                provenance: replay::BuildProvenance::Development,
+                receive: replay::ReceiveMethod::Scripted,
+                autoplay: None,
+            };
+            let loaded = game::Loaded::load(
+                root,
+                settings.clone(),
+                &chart_path,
+                config,
+                game::Parts::unsaved(&settings.player),
+            )
+            .unwrap();
+            assert_eq!(loaded.displayed(), game::GaugeIndex(shown));
+            let seen = Gauges::default();
+            let noted = Arc::clone(&seen);
+            let render = crate::render_side::tests::spawn_empty(Box::new(move || {
+                Ok(Box::new(GaugeFrames {
+                    seen: Arc::clone(&noted),
+                }) as Box<dyn crate::render_side::Screen>)
+            }));
+            render.load(Arc::new(loaded.chart().clone()), None).unwrap();
+            on_rig_with(settings, render, |rig, settings| {
+                assert_eq!(
+                    rig.prepare_attempt(&loaded).unwrap(),
+                    game::Preparation::Ready
+                );
+                rig.commit_attempt().unwrap();
+                let device = settings.device.profile(&[input::DeviceKind::Keyboard], &[]);
+                let (_writer, reader) = input::source_queue(8);
+                let (_logic, side) = game::Logic::<input::SourceReader>::new(
+                    loaded.chart(),
+                    loaded.preset(),
+                    &device,
+                    &eval::InputStart::default(),
+                    vec![reader],
+                    game::LogicConfig {
+                        inputs: 8,
+                        effects: 8,
+                    },
+                    Vec::new(),
+                )
+                .unwrap();
+                let origin = bms_model::TimeSource::now(&rig.clock);
+                let (_sink, sounds) = game::audio_link_at(8, origin);
+                rig.start(origin, sounds, side);
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while seen.lock().unwrap().len() < 3 && std::time::Instant::now() < deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            });
+            let frames = seen.lock().unwrap().clone();
+            assert!(frames.len() >= 3, "{set}: {frames:?}");
+            assert!(frames.iter().all(|&g| g == shown), "{set}: {frames:?}");
+        }
     }
 
     /// Which launcher [`super::launch`] chose for `input` and `options`,
