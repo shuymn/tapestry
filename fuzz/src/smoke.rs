@@ -866,12 +866,12 @@ fn skin_import_seeds_import_and_draw_as_built() {
             }
             "readouts" => {
                 use skin_beatoraja::{DeviationId, PropertyKind};
-                // Each readout number D4, and the adjustment condition
-                // twice; 15 is no value property, so `ref` 71 shows; 131
+                // Each readout number D4, and none for the adjustment
+                // condition, which reads the snapshot; 15 is no value property, so `ref` 71 shows; 131
                 // resolves to nothing; 92 is unsupported.
                 let mut k = kinds(&i);
                 k.sort_by_key(|n| format!("{n:?}"));
-                let mut want = vec![NoteKind::Deviation(DeviationId::D4); 18];
+                let mut want = vec![NoteKind::Deviation(DeviationId::D4); 16];
                 want.push(NoteKind::Ignored { field: "value" });
                 want.push(NoteKind::UnsupportedProperty {
                     kind: PropertyKind::Integer,
