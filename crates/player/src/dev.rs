@@ -1023,7 +1023,7 @@ fn read_limited(reader: impl std::io::Read, limit: usize) -> anyhow::Result<Vec<
     Ok(bytes)
 }
 
-/// Settings keys by name, comma-separated: `F1` to `F8`.
+/// Settings keys by name, comma-separated: `F3` to `F8`.
 ///
 /// # Errors
 ///
@@ -1034,7 +1034,7 @@ pub fn adjust_keys(list: &str) -> Result<Vec<game::Adjust>, String> {
             name.strip_prefix('F')
                 .and_then(|n| n.parse::<u32>().ok())
                 .and_then(|n| game::Adjust::from_key(0x3A + n))
-                .ok_or_else(|| format!("{name} is not a settings key (F1 to F8)"))
+                .ok_or_else(|| format!("{name} is not a settings key (F3 to F8)"))
         })
         .collect()
 }

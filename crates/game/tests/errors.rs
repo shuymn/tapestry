@@ -105,14 +105,19 @@ fn settings_errors_chain_to_their_causes() {
             "lane 9 does not exist (lanes are 0 to 7)",
         ],
     );
-    let visible = PlayerSettingsError::VisibleTime(1);
-    let e = SettingsError::InvalidPlayer(visible.clone());
+    let option = PlayerSettingsError::PlayOption {
+        section: "covers",
+        setting: "sudden",
+        value: 1_001,
+        expected: "0 to 1000",
+    };
+    let e = SettingsError::InvalidPlayer(option.clone());
     assert_chain(
         &e,
-        &visible,
+        &option,
         &[
             "the settings cannot be used: player.toml",
-            "visible_time_ms 1 is outside 100 to 4000",
+            "[covers] sudden 1001 is outside 0 to 1000",
         ],
     );
     let unknown = UnknownPreset("custom.toml".to_owned());

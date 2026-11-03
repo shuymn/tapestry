@@ -399,10 +399,12 @@ fn perfect_measurement_judges_key_sounds_and_saves() {
         input_offset_us: 30_000,
         ..DeviceSettings::default()
     };
-    // Other physical keys (Q, W): the generated keys must still be the
-    // ones recorded.
+    // Other physical keys (Q, W, START and SELECT by default, so those
+    // move to E and R): the generated keys must still be the ones
+    // recorded.
     let lanes = &mut device.keyboard.lanes;
     (lanes[1].control, lanes[2].control) = (0x10, 0x11);
+    (device.keyboard.start, device.keyboard.select) = (Some(0x12), Some(0x13));
     game::save_settings(&fx.appdata.join("tapestry").join("device.toml"), &device).unwrap();
     let out = Command::new(env!("CARGO_BIN_EXE_tapestry"))
         .arg("play")
@@ -574,12 +576,11 @@ fn the_start_gate_cancels_and_rearms_ready_on_the_real_threads() {
     assert_eq!(lanes, 2 * NOTES);
 }
 
-/// `--dev-start-gate` is planned against `device.toml`'s key config: quit
-/// on Q (0x10), the default START, is refused before any play opens, so
-/// the run ends with the collision and a nonzero exit, and nothing is
-/// recorded.
+/// Quit on Q (0x10), the default START, is refused with the collision
+/// when `device.toml` loads, before any play opens, so the run ends with
+/// a nonzero exit, and nothing is recorded.
 #[test]
-fn a_start_gate_on_the_quit_key_opens_no_play() {
+fn a_colliding_device_toml_opens_no_play() {
     let Fixture {
         dir: _dir,
         chart_path,
@@ -591,15 +592,17 @@ fn a_start_gate_on_the_quit_key_opens_no_play() {
     device.keyboard.quit = Some(0x10);
     game::save_settings(&appdata.join("tapestry").join("device.toml"), &device).unwrap();
     let out = scripted_play(&chart_path, &log, &appdata)
-        .arg("--dev-start-gate")
         .output()
         .expect("run tapestry");
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(1), "{stdout}{stderr}");
-    let line =
-        "dev: the start gate cannot be installed: control 0x10 is bound to both quit and START";
-    assert!(stderr.lines().any(|l| l == line), "{line:?} in {stderr}");
+    let line = "the settings cannot be used: device.toml: keyboard key config: \
+                control 0x10 is bound to both quit and START";
+    assert!(
+        stderr.lines().any(|l| l.ends_with(line)),
+        "{line:?} in {stderr}"
+    );
     assert!(!stdout.contains("play 1:"), "{stdout}");
     assert!(!appdata.join("tapestry").join("records").exists());
 }
@@ -779,10 +782,10 @@ fn one_f2_press_steps_hi_speed_once_and_moves_notes_not_judgment() {
     assert!((y(9, 2) - 340.0).abs() < 1e-3);
 }
 
-/// Settings keys pressed in the first play (hi-speed up twice, volume down,
-/// display offset up three times, and input offset up, which a play
-/// refuses) and on its end screen (input offset up twice) are written to
-/// `player.toml` and `device.toml` when a play ends, never during one.
+/// Settings keys pressed in the first play (volume down, display offset up
+/// three times, and input offset up, which a play refuses) and on its end
+/// screen (input offset up twice) are written to `device.toml` when a play
+/// ends, never during one.
 /// Each play is recorded with the offsets it started with: the input
 /// offset changed on the end screen is the retried play's, never the
 /// first one's.
@@ -793,7 +796,7 @@ fn settings_keys_persist_and_the_input_offset_waits_for_the_next_play() {
         &fx,
         &[
             "--dev-adjust",
-            "F2,F2,F3,F6,F6,F6,F8",
+            "F3,F6,F6,F6,F8",
             "--dev-adjust-at",
             "2250",
             "--dev-adjust-end",
@@ -808,9 +811,8 @@ fn settings_keys_persist_and_the_input_offset_waits_for_the_next_play() {
 
     let root = game::DataRoot::new(fx.appdata.join("tapestry"));
     let s = game::Settings::load(&root).unwrap();
-    // Two hi-speed steps from 600 ms (569, then 540 ms); 100 - 5 %; 3 * 1 ms; F8 during play does nothing,
-    // 2 * 1 ms on the end screen.
-    assert_eq!(s.player.visible_time_ms, 540);
+    // 100 - 5 %; 3 * 1 ms; F8 during play does nothing, 2 * 1 ms on the
+    // end screen.
     assert_eq!(s.device.master_volume, 0.95);
     assert_eq!(s.device.display_offset_us, 3_000);
     assert_eq!(s.device.input_offset_us, 2_000);
@@ -1326,6 +1328,8 @@ fn auto_play_uses_its_own_keys_and_keeps_device_toml() {
     let device = DeviceSettings {
         keyboard: game::KeyConfig {
             lanes: Vec::new(),
+            // No scratch key: no scratch direction either.
+            scratch_positive: None,
             ..DeviceSettings::default().keyboard
         },
         ..DeviceSettings::default()

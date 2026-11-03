@@ -2082,6 +2082,7 @@ mod menu_tests {
             lanes,
             retry: None,
             quit: None,
+            ..KeyConfig::default()
         }
     }
 

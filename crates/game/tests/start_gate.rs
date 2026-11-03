@@ -269,7 +269,7 @@ fn bgm_starts<O: audio::AudioOutput + game::Wakes>(s: &mut Session<O>) -> usize 
     n
 }
 
-/// Lane presses and releases of a list of events, as `(ms, lane key, value)`.
+/// Presses and releases of a list of events, as `(ms, control, value)`.
 fn lane_events(events: &[PhysicalInputEvent]) -> Vec<(i64, u32, i32)> {
     events
         .iter()
@@ -325,7 +325,7 @@ fn a_hold_cancels_ready_keeps_its_input_and_a_release_rearms_a_fresh_one() {
     assert!(report.result.as_ref().unwrap().matches_live);
     // The cancelled READY: kept whole on its own timeline, 1.2 s before
     // the winner's, closed at the rearm, its input all there: the early
-    // press and the one while waiting.
+    // press, START (a recorded control) and the press while waiting.
     let h = &r.history;
     assert_eq!(h.openings.len(), 1);
     let o = &h.openings[0];
@@ -336,7 +336,14 @@ fn a_hold_cancels_ready_keeps_its_input_and_a_release_rearms_a_fresh_one() {
     let (l4, l5) = (code(4).0, code(5).0);
     assert_eq!(
         lane_events(&h.events[o.events.start as usize..o.events.end as usize]),
-        vec![(-500, l4, 1), (-460, l4, 0), (0, l5, 1), (40, l5, 0)]
+        vec![
+            (-500, l4, 1),
+            (-460, l4, 0),
+            (-300, Q.0, 1),
+            (0, l5, 1),
+            (40, l5, 0),
+            (200, Q.0, 0)
+        ]
     );
     // Its scheduled chart start never ran: one transport, the winner's.
     assert_eq!(bgm_starts(&mut s), 1);
@@ -381,7 +388,11 @@ fn every_rearm_takes_a_fresh_origin_and_keeps_every_opening() {
     assert_eq!(origins, vec![-2_250, -1_500, -750]);
     for o in &r.history.openings {
         assert_eq!(o.reason, CancelReason::Held);
-        assert_eq!(o.events.end - o.events.start, 2, "each kept its press");
+        assert_eq!(
+            o.events.end - o.events.start,
+            4,
+            "each kept its press and its START or SELECT"
+        );
     }
     assert_eq!(count_judged(&report.live, Judgment::Perfect), 3);
     assert!(report.result.as_ref().unwrap().matches_live);
@@ -574,10 +585,11 @@ fn a_quit_while_waiting_keeps_the_cancelled_opening_and_its_input() {
     let r = record(&report);
     assert_eq!(r.history.openings.len(), 1);
     assert_eq!(r.history.openings[0].closed, TimeUs(300 * MS));
+    // START is recorded too.
     let l4 = code(4).0;
     assert_eq!(
         lane_events(&r.history.events),
-        vec![(0, l4, 1), (40, l4, 0)]
+        vec![(-300, Q.0, 1), (0, l4, 1), (40, l4, 0)]
     );
     assert_eq!(bgm_starts(&mut s), 0);
 }

@@ -2682,6 +2682,7 @@ mod tests {
                 .to_vec(),
             retry: None,
             quit: None,
+            ..game::KeyConfig::default()
         };
         let bindings = crate::select::menu_bindings(
             &config,

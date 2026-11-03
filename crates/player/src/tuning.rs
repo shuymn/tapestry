@@ -1,6 +1,6 @@
 //! The settings keys' values while the game runs (design.md "Input"): the
-//! window thread steps them on F1 to F8, the render thread reads hi-speed and
-//! the display offset every frame, and the game thread forwards the volume to
+//! window thread steps them on F3 to F8, the render thread reads the visible
+//! time and the display offset every frame, and the game thread forwards the volume to
 //! the audio thread, takes the input offset into the next play and writes the
 //! files when a play ends. Lock-free and allocation-free.
 
@@ -318,7 +318,7 @@ mod tests {
         };
         let t = LiveTuning::new(quiet).with_loaded_volume(0.004);
         assert_eq!(t.volume(), 0.004);
-        assert!(t.adjust(Adjust::HiSpeedUp));
+        assert!(t.adjust(Adjust::DisplayOffsetUp));
         assert_eq!(t.volume(), 0.004);
         assert!(t.adjust(Adjust::VolumeUp));
         assert_eq!(t.volume(), 0.05);
@@ -334,12 +334,12 @@ mod tests {
         // Volume is at unity already.
         assert!(!t.adjust(Adjust::VolumeUp));
         assert_eq!(t.version(), 0);
-        assert!(t.adjust(Adjust::HiSpeedUp));
+        assert!(t.adjust(Adjust::VolumeDown));
         assert!(t.adjust(Adjust::DisplayOffsetDown));
         assert_eq!(
             t.get(),
             Tuning {
-                visible_time_ms: 569,
+                volume_percent: 95,
                 display_offset_us: -1_000,
                 ..start()
             }
@@ -363,16 +363,16 @@ mod tests {
         assert!(!root.device_settings().exists());
         // `player.toml` cannot be written: a directory is in the way.
         std::fs::create_dir_all(root.player_settings().join("x")).unwrap();
-        let faster = t.adjust(Adjust::HiSpeedUp);
-        assert!(files.write(faster, 2).is_empty());
+        assert!(files.choose_preset("lr2-style", t, 2).is_err());
+        assert!(files.write(t, 2).is_empty());
         std::fs::remove_dir_all(root.player_settings()).unwrap();
-        assert_eq!(files.write(faster, 2), ["player.toml"]);
-        assert!(files.write(faster, 2).is_empty());
+        assert_eq!(files.write(t, 2), ["player.toml"]);
+        assert!(files.write(t, 2).is_empty());
         let s = game::Settings::load(&root).unwrap();
-        assert_eq!(s.player.visible_time_ms, 569);
+        assert_eq!(s.player.preset, "lr2-style");
         assert!(!root.device_settings().exists());
         assert_eq!(
-            files.write(faster.adjust(Adjust::VolumeDown), 2),
+            files.write(t.adjust(Adjust::VolumeDown), 2),
             ["device.toml"]
         );
     }
@@ -388,17 +388,15 @@ mod tests {
             player: game::PlayerSettings::default(),
         };
         let mut files = SettingsFiles::new(root.clone(), loaded.clone());
-        let faster = Tuning::of(&loaded).adjust(Adjust::HiSpeedUp);
-        assert_eq!(files.choose_preset("lr2-style", faster, 2), Ok(()));
+        let t = Tuning::of(&loaded);
+        assert_eq!(files.choose_preset("lr2-style", t, 2), Ok(()));
         let s = game::Settings::load(&root).unwrap();
         assert_eq!(s.player.preset, "lr2-style");
-        assert_eq!(s.player.visible_time_ms, 569);
         assert_eq!(files.preset(), "lr2-style");
-        let slower = faster.adjust(Adjust::HiSpeedDown);
-        assert_eq!(files.write(slower, 2), ["player.toml"]);
+        let quieter = t.adjust(Adjust::VolumeDown);
+        assert_eq!(files.write(quieter, 2), ["device.toml"]);
         let s = game::Settings::load(&root).unwrap();
         assert_eq!(s.player.preset, "lr2-style");
-        assert_eq!(s.player.visible_time_ms, 600);
         assert_eq!(files.player_error(), None);
     }
 

@@ -1,4 +1,4 @@
-//! The adjustment bindings: the defaults beside the default key configs,
+//! The adjustment bindings: the defaults in the default key configs,
 //! every role collision refused, the scratch's directions and reversal,
 //! and the tap's observations reaching the reducer through a plan.
 
@@ -9,7 +9,7 @@ use game::adjustment::{
 };
 use game::{
     AdjustBinding, AdjustKeyError, AdjustmentConfig, AdjustmentKeys, Covers, DeviceSettings,
-    HiSpeedSettings, KeyConfigs, LaneKey, PlayOptions, Role as KeyRole,
+    HiSpeedSettings, KeyConfig, KeyConfigs, KeyError, LaneKey, PlayOptions, Role as KeyRole,
 };
 use input::hid::{HidProduct, axis_control};
 use input::{
@@ -24,12 +24,7 @@ const PRODUCT: HidProduct = HidProduct {
 };
 
 fn keys() -> KeyConfigs {
-    let d = DeviceSettings::default();
-    KeyConfigs {
-        keyboard: d.keyboard,
-        controller: d.controller,
-        controller_device: None,
-    }
+    KeyConfigs::from(&DeviceSettings::default())
 }
 
 /// A controller binding the scratch to its turntable axis and two
@@ -60,10 +55,22 @@ fn with_controller() -> KeyConfigs {
 
 #[test]
 fn the_defaults_bind_q_w_up_down_and_the_scratch_key() {
+    let k = keys();
+    let roles = |keys: &KeyConfig| AdjustmentKeys::of(keys).roles().collect::<Vec<_>>();
+    assert_eq!(
+        roles(&k.keyboard),
+        [
+            (0x10, Role::Start),
+            (0x11, Role::Select),
+            (0xE048, Role::AuxNegative),
+            (0xE050, Role::AuxPositive),
+            (0x2a, Role::ScratchPositive),
+        ]
+    );
+    assert_eq!(roles(&k.controller), []);
     let config = AdjustmentConfig::default();
-    assert_eq!(config.keyboard, AdjustmentKeys::KEYBOARD);
-    assert_eq!(config.controller, AdjustmentKeys::CONTROLLER);
-    let plan = config.plan(&keys(), None, None).unwrap();
+    assert_eq!(config, AdjustmentConfig::of(&DeviceSettings::default()));
+    let plan = config.plan(&k, None, None).unwrap();
     let number = |code: u32| {
         plan.bindings
             .controls
@@ -93,10 +100,16 @@ fn the_defaults_bind_q_w_up_down_and_the_scratch_key() {
 
 #[test]
 fn every_role_collision_is_refused() {
-    let check = |f: fn(&mut AdjustmentKeys)| {
-        let mut config = AdjustmentConfig::default();
-        f(&mut config.keyboard);
-        config.check(&keys()).err()
+    let check = |f: fn(&mut KeyConfig)| {
+        let mut k = keys().keyboard;
+        f(&mut k);
+        let e = AdjustmentKeys::of(&k).check(DeviceKind::Keyboard).err();
+        // The key config's own check refuses the same.
+        assert_eq!(
+            k.check(DeviceKind::Keyboard).err(),
+            e.map(KeyError::Adjustment)
+        );
+        e
     };
     let overlap = |control, first, second| {
         Some(AdjustKeyError::Overlap {
@@ -147,23 +160,23 @@ fn every_role_collision_is_refused() {
         })
     );
     // Reserved keys: F1 to F8, the overlay and the presets.
-    for code in [0x3b, 0x42, 0x43, 0x58] {
-        let mut config = AdjustmentConfig::default();
-        config.keyboard.start = Some(code);
+    for code in [0x3b, 0x3c, 0x42, 0x43, 0x58] {
+        let mut k = keys().keyboard;
+        k.start = Some(code);
         assert!(
             matches!(
-                config.check(&keys()),
+                AdjustmentKeys::of(&k).check(DeviceKind::Keyboard),
                 Err(AdjustKeyError::Reserved { control, .. }) if control == code
             ),
             "{code:#x}"
         );
     }
     // Two names of one key are one key.
-    let mut config = AdjustmentConfig::default();
-    config.keyboard.start = Some(0x45);
-    config.keyboard.select = Some(0xE045);
+    let mut k = keys().keyboard;
+    k.start = Some(0x45);
+    k.select = Some(0xE045);
     assert!(matches!(
-        config.check(&keys()),
+        AdjustmentKeys::of(&k).check(DeviceKind::Keyboard),
         Err(AdjustKeyError::Overlap {
             control: 0xE045,
             ..
@@ -173,27 +186,22 @@ fn every_role_collision_is_refused() {
 
 #[test]
 fn the_controller_binds_buttons_and_the_scratch_directions_among_its_own() {
-    let mut config = AdjustmentConfig::default();
-    config.controller.start = Some(9);
-    config.controller.scratch_positive = Some(1);
-    config.controller.scratch_negative = Some(2);
-    assert_eq!(config.check(&with_controller()), Ok(()));
-    config.controller.select = Some(axis_control(0x01, 0x31).0);
-    assert_eq!(
-        config.check(&with_controller()),
-        Err(AdjustKeyError::Axis(Role::Select))
-    );
-    config.controller.select = Some(3);
+    let mut k = with_controller().controller;
+    let check = |k: &KeyConfig| AdjustmentKeys::of(k).check(DeviceKind::Controller);
+    k.start = Some(9);
+    k.scratch_positive = Some(1);
+    k.scratch_negative = Some(2);
+    assert_eq!(check(&k), Ok(()));
+    k.select = Some(axis_control(0x01, 0x31).0);
+    assert_eq!(check(&k), Err(AdjustKeyError::Axis(Role::Select)));
+    k.select = Some(3);
     assert!(matches!(
-        config.check(&with_controller()),
+        check(&k),
         Err(AdjustKeyError::Overlap { control: 3, .. })
     ));
-    config.controller.select = None;
-    config.controller.scratch_negative = Some(axis_control(0x01, 0x30).0);
-    assert_eq!(
-        config.check(&with_controller()),
-        Err(AdjustKeyError::Axis(Role::ScratchNegative))
-    );
+    k.select = None;
+    k.scratch_negative = Some(axis_control(0x01, 0x30).0);
+    assert_eq!(check(&k), Err(AdjustKeyError::Axis(Role::ScratchNegative)));
 }
 
 #[test]

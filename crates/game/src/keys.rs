@@ -1,14 +1,19 @@
 //! The key config screen's flow (design.md "Input"): it prompts for each lane,
-//! the scratch first, then retry and quit, and binds the next control pressed,
-//! captured while play recording is closed, so nothing captured is recorded.
+//! the scratch first, then retry and quit, then the play adjustments' START,
+//! SELECT and auxiliary negative and positive keys, then the scratch's
+//! adjustment directions, and binds the next control pressed, captured while
+//! play recording is closed, so nothing captured is recorded.
 //!
 //! A lane takes a control of any device; retry and quit take keyboard keys
-//! only, because stage 1 reads them from the window's keyboard messages.
-//! A control already bound to another role, a key the game reserves
-//! ([`reserved_key`](crate::reserved_key)), or a controller's control at
-//! the retry or quit prompt is refused with a prompt to press another.
-//! The controller key config belongs to one controller, the first whose
-//! control is bound: a control of a controller of another product is
+//! only, because stage 1 reads them from the window's keyboard messages;
+//! START, SELECT and the auxiliary keys take a keyboard key or a
+//! controller's button. A control already bound to another role, a key the
+//! game reserves ([`reserved_key`](crate::reserved_key)), a controller's
+//! control at the retry or quit prompt, or a controller's axis at an
+//! adjustment prompt is refused with a prompt to press another: the same
+//! check [`DeviceSettings::validate`](crate::DeviceSettings::validate) makes
+//! at load. The controller key config belongs to one controller, the first
+//! whose control is bound: a control of a controller of another product is
 //! refused too, and `device.toml` saves the product with the bindings.
 //! Escape ([`CANCEL_KEY`]) cancels and nothing is written; F12
 //! ([`KEEP_KEY`]) keeps the role's current bindings, which is how Escape
@@ -20,6 +25,14 @@
 //! way that scrolls menus down ([`capture_keys`]); a button or a key
 //! covers one, and the scratch is prompted for again for the other
 //! direction, which F12 skips.
+//!
+//! The scratch's adjustment directions (design.md "Play Adjustments",
+//! bindings) come last, for each kind of device from its scratch
+//! controls: one button or key is the positive direction; of two, the one
+//! pressed at the prompt is positive and the other negative (F12 keeps
+//! the current choice); an axis is turned the way that raises SUDDEN+ and
+//! speeds up, which sets `[scratch] adjust_reversed` (F12 keeps the
+//! current setting).
 
 use std::time::{Duration, Instant};
 
@@ -27,15 +40,18 @@ use eval::ControlId;
 use input::hid::{HidProduct, is_axis, widened_wrap};
 use input::{Capture, DeviceKind, Watched};
 
-use crate::settings::{KeyConfig, KeyError, LaneKey, Role};
+use crate::adjust_keys::AdjustKeyError;
+use crate::adjustment::Role as Adjust;
+use crate::settings::{DeviceSettings, KeyConfig, KeyError, LaneKey, Role};
 
 /// Escape: cancels the key config.
 pub const CANCEL_KEY: u32 = 0x01;
 /// F12: keeps the current bindings of the role prompted for.
 pub const KEEP_KEY: u32 = 0x58;
 
-/// The roles in the order they are prompted for.
-pub const ROLES: [Role; 10] = [
+/// The roles in the order they are prompted for; the scratch's
+/// adjustment directions follow.
+pub const ROLES: [Role; 14] = [
     Role::Lane(0),
     Role::Lane(1),
     Role::Lane(2),
@@ -46,6 +62,10 @@ pub const ROLES: [Role; 10] = [
     Role::Lane(7),
     Role::Retry,
     Role::Quit,
+    Role::Start,
+    Role::Select,
+    Role::AuxNegative,
+    Role::AuxPositive,
 ];
 
 /// A control of a kind of device: what a press binds.
@@ -65,8 +85,18 @@ pub struct KeyConfigs {
     /// The controller's.
     pub controller: KeyConfig,
     /// The controller `controller` belongs to; known whenever it binds a
-    /// lane in a key config the flow finished.
+    /// control in a key config the flow finished.
     pub controller_device: Option<HidProduct>,
+}
+
+impl From<&DeviceSettings> for KeyConfigs {
+    fn from(d: &DeviceSettings) -> Self {
+        Self {
+            keyboard: d.keyboard.clone(),
+            controller: d.controller.clone(),
+            controller_device: d.controller_device.map(Into::into),
+        }
+    }
 }
 
 impl KeyConfigs {
@@ -88,15 +118,38 @@ impl KeyConfigs {
         self.keyboard.check(DeviceKind::Keyboard)?;
         self.controller.check(DeviceKind::Controller)
     }
+
+    /// The scratch's buttons or keys of `kind`, in binding order.
+    fn scratch_digital(&self, kind: DeviceKind) -> Vec<u32> {
+        self.of(kind)
+            .lanes
+            .iter()
+            .filter(|k| k.lane == 0)
+            .filter(|k| kind == DeviceKind::Keyboard || !is_axis(ControlId(k.control)))
+            .map(|k| k.control)
+            .collect()
+    }
+
+    /// The controller's scratch axis, if the scratch has one.
+    fn scratch_axis(&self) -> Option<u32> {
+        self.controller
+            .lanes
+            .iter()
+            .find(|k| k.lane == 0 && is_axis(ControlId(k.control)))
+            .map(|k| k.control)
+    }
 }
 
 /// Why a press was not bound.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Refusal {
     /// It would break the key config: bound to another role already,
-    /// reserved, or not a keyboard key at the retry or quit prompt.
+    /// reserved, not a keyboard key at the retry or quit prompt, an axis at
+    /// an adjustment prompt, or not one of the scratch's controls at the
+    /// prompt for its positive direction.
     Key(KeyError),
-    /// Keep was pressed for a lane the current key configs do not bind.
+    /// Keep was pressed for a lane, or the scratch's positive direction,
+    /// the current key configs do not bind.
     NothingToKeep(Role),
     /// A control of a controller other than the one already bound: the
     /// controller key config belongs to one controller.
@@ -105,13 +158,18 @@ pub enum Refusal {
     /// controller bindings that name no controller: `device.toml` could not
     /// say which controller plays them.
     UnknownController,
+    /// A press while the scratch axis is to be turned for its adjustment
+    /// direction: a turn answers, or F12.
+    NotATurn,
 }
 
 /// What a press did.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Press {
-    /// The role is bound to these controls (none, when an unbound retry or
-    /// quit was kept); the next role is prompted for.
+    /// The role is bound to these controls (none, when an unbound role was
+    /// kept); the next role is prompted for, or the scratch axis is to be
+    /// turned for its adjustment direction
+    /// ([`reversing`](KeyConfigFlow::reversing)).
     Bound(Role, Vec<Bound>),
     /// Refused: the same role is prompted for again.
     Refused(Refusal),
@@ -140,9 +198,16 @@ pub struct LearntRange {
 pub struct KeyConfigFlow {
     current: KeyConfigs,
     /// The roles prompted for, in order; the scratch twice when it is
-    /// bound to a button or a key.
+    /// bound to a button or a key, and its positive direction once for
+    /// each kind of device with two or more scratch buttons or keys.
     steps: Vec<Role>,
     bound: Vec<(Role, Vec<Bound>)>,
+    /// The scratch directions decided without a prompt: the only scratch
+    /// button or key of a kind, and the other of two.
+    directions: Vec<(Role, Bound)>,
+    /// The kinds of device whose positive scratch direction is prompted
+    /// for, in prompt order; set once [`ROLES`] are bound.
+    choosing: Option<Vec<DeviceKind>>,
     refused: Option<Refusal>,
     /// Once a controller's control is bound: its product.
     device: Option<HidProduct>,
@@ -156,6 +221,12 @@ pub struct KeyConfigFlow {
     /// The menu direction that turn showed: whether down is toward lower
     /// values.
     menu_reversed: Option<bool>,
+    /// While the scratch axis is to be turned the way that raises SUDDEN+
+    /// and speeds up.
+    reversing: bool,
+    /// The adjustment direction that turn showed: whether raising is
+    /// toward lower values.
+    adjust_reversed: Option<bool>,
 }
 
 impl KeyConfigFlow {
@@ -166,17 +237,23 @@ impl KeyConfigFlow {
             current,
             steps: ROLES.to_vec(),
             bound: Vec::new(),
+            directions: Vec::new(),
+            choosing: None,
             refused: None,
             device: None,
             learning: None,
             learnt: None,
             turning: false,
             menu_reversed: None,
+            reversing: false,
+            adjust_reversed: None,
         }
     }
 
     /// The roles prompted for, in order: [`ROLES`], with the scratch
-    /// twice once it is bound to a button or a key.
+    /// twice once it is bound to a button or a key, and then the scratch's
+    /// positive direction for each kind of device with two or more
+    /// scratch buttons or keys.
     #[must_use]
     pub fn steps(&self) -> &[Role] {
         &self.steps
@@ -186,6 +263,21 @@ impl KeyConfigFlow {
     #[must_use]
     pub fn other_direction(&self) -> bool {
         self.bound.len() == 1 && self.role() == Some(Role::Lane(0))
+    }
+
+    /// The kind of device whose positive scratch direction is prompted
+    /// for, while it is.
+    #[must_use]
+    pub fn choosing(&self) -> Option<DeviceKind> {
+        if self.role() != Some(Role::ScratchPositive) {
+            return None;
+        }
+        let asked = self
+            .bound
+            .iter()
+            .filter(|(r, _)| *r == Role::ScratchPositive)
+            .count();
+        self.choosing.as_ref()?.get(asked).copied()
     }
 
     /// While the scratch axis is turned to learn its range: what it has
@@ -223,6 +315,23 @@ impl KeyConfigFlow {
         self.menu_reversed
     }
 
+    /// Whether the scratch axis is to be turned the way that raises
+    /// SUDDEN+ and speeds up: every role is bound, and the flow ends with
+    /// [`reverse`](Self::reverse) or F12.
+    #[must_use]
+    pub const fn reversing(&self) -> bool {
+        self.reversing
+    }
+
+    /// The scratch axis's adjustment direction to save as `[scratch]
+    /// adjust_reversed`: whether raising SUDDEN+ is toward lower values, as
+    /// it was turned; `None` when it was not (F12 keeps the current
+    /// setting).
+    #[must_use]
+    pub const fn adjust_reversed(&self) -> Option<bool> {
+        self.adjust_reversed
+    }
+
     /// The role prompted for; `None` once every role is bound.
     #[must_use]
     pub fn role(&self) -> Option<Role> {
@@ -249,7 +358,7 @@ impl KeyConfigFlow {
     pub fn current(&self, role: Role) -> Vec<Bound> {
         let mut found = Vec::new();
         for kind in [DeviceKind::Keyboard, DeviceKind::Controller] {
-            if kind != DeviceKind::Keyboard && !matches!(role, Role::Lane(_)) {
+            if kind != DeviceKind::Keyboard && matches!(role, Role::Retry | Role::Quit) {
                 continue;
             }
             let bound = self.current.of(kind).roles().filter(|&(_, r)| r == role);
@@ -258,39 +367,52 @@ impl KeyConfigFlow {
         found
     }
 
-    /// The key configs of the roles bound so far, the controller's bound
-    /// to `device`.
-    fn configs(bound: &[(Role, Vec<Bound>)], device: Option<HidProduct>) -> KeyConfigs {
-        let empty = || KeyConfig {
-            lanes: Vec::new(),
-            retry: None,
-            quit: None,
-        };
+    /// The key configs of the roles bound so far and the scratch
+    /// directions decided, the controller's bound to `device`.
+    fn configs(
+        bound: &[(Role, Vec<Bound>)],
+        directions: &[(Role, Bound)],
+        device: Option<HidProduct>,
+    ) -> KeyConfigs {
         let mut c = KeyConfigs {
-            keyboard: empty(),
-            controller: empty(),
+            keyboard: KeyConfig::default(),
+            controller: KeyConfig::default(),
             controller_device: None,
         };
-        for (role, controls) in bound {
-            for b in controls {
-                let keys = match b.kind {
-                    DeviceKind::Keyboard => &mut c.keyboard,
-                    DeviceKind::Controller => &mut c.controller,
-                };
-                match *role {
-                    Role::Lane(lane) => keys.lanes.push(LaneKey {
-                        control: b.control,
-                        lane,
-                    }),
-                    Role::Retry => keys.retry = Some(b.control),
-                    Role::Quit => keys.quit = Some(b.control),
-                }
+        let each = bound
+            .iter()
+            .flat_map(|(role, controls)| controls.iter().map(|b| (*role, *b)))
+            .chain(directions.iter().copied());
+        for (role, b) in each {
+            let keys = match b.kind {
+                DeviceKind::Keyboard => &mut c.keyboard,
+                DeviceKind::Controller => &mut c.controller,
+            };
+            let control = Some(b.control);
+            match role {
+                Role::Lane(lane) => keys.lanes.push(LaneKey {
+                    control: b.control,
+                    lane,
+                }),
+                Role::Retry => keys.retry = control,
+                Role::Quit => keys.quit = control,
+                Role::Start => keys.start = control,
+                Role::Select => keys.select = control,
+                Role::AuxNegative => keys.aux_negative = control,
+                Role::AuxPositive => keys.aux_positive = control,
+                Role::ScratchPositive => keys.scratch_positive = control,
+                Role::ScratchNegative => keys.scratch_negative = control,
             }
         }
-        if !c.controller.lanes.is_empty() {
+        if c.controller.roles().next().is_some() {
             c.controller_device = device;
         }
         c
+    }
+
+    /// The key configs of everything bound so far.
+    fn result(&self) -> KeyConfigs {
+        Self::configs(&self.bound, &self.directions, self.device)
     }
 
     fn refuse(&mut self, r: Refusal) -> Press {
@@ -311,16 +433,28 @@ impl KeyConfigFlow {
     /// finished key config always names the controller it binds. Once a
     /// controller's control is bound, a control of a controller of another
     /// product is refused, and so is keeping the current controller
-    /// bindings when they belong to another controller.
+    /// bindings when they belong to another controller. While the scratch
+    /// axis is to be turned for its adjustment direction, F12 keeps the
+    /// current setting and ends the flow, and any other press is refused.
     pub fn press_from(&mut self, pressed: Bound, product: Option<HidProduct>) -> Press {
-        let Some(role) = self.role() else {
-            return Press::Done(Self::configs(&self.bound, self.device));
-        };
         let keyboard = pressed.kind == DeviceKind::Keyboard;
+        if self.reversing {
+            return match (keyboard, pressed.control) {
+                (true, CANCEL_KEY) => Press::Cancelled,
+                (true, KEEP_KEY) => self.reverse(None),
+                _ => self.refuse(Refusal::NotATurn),
+            };
+        }
+        let Some(role) = self.role() else {
+            return Press::Done(self.result());
+        };
         if keyboard && pressed.control == CANCEL_KEY {
             return Press::Cancelled;
         }
         let keep = keyboard && pressed.control == KEEP_KEY;
+        if role == Role::ScratchPositive {
+            return self.choose_positive(pressed, keep);
+        }
         let (chosen, from) = if keep && self.other_direction() {
             // Skipped: the scratch keeps the one control it has.
             (Vec::new(), None)
@@ -346,7 +480,7 @@ impl KeyConfigFlow {
             self.device
         };
         self.bound.push((role, chosen.clone()));
-        let candidate = Self::configs(&self.bound, device);
+        let candidate = Self::configs(&self.bound, &self.directions, device);
         if let Err(e) = candidate.check() {
             self.bound.pop();
             return self.refuse(Refusal::Key(e));
@@ -360,10 +494,84 @@ impl KeyConfigFlow {
         if role == Role::Lane(0) && self.bound.len() == 1 && one_direction {
             self.steps.insert(1, Role::Lane(0));
         }
-        if self.role().is_none() {
-            return Press::Done(candidate);
+        self.next(role, chosen)
+    }
+
+    /// Takes `pressed`, or F12 (`keep`), as the positive scratch direction
+    /// of the kind of device prompted for: one of its scratch buttons or
+    /// keys; of two, the other is negative.
+    fn choose_positive(&mut self, pressed: Bound, keep: bool) -> Press {
+        let Some(kind) = self.choosing() else {
+            return Press::Done(self.result());
+        };
+        let controls = self.result().scratch_digital(kind);
+        let chosen = if keep {
+            match self.current.of(kind).scratch_positive {
+                Some(c) if controls.contains(&c) => c,
+                _ => return self.refuse(Refusal::NothingToKeep(Role::ScratchPositive)),
+            }
+        } else if pressed.kind == kind && controls.contains(&pressed.control) {
+            pressed.control
+        } else {
+            return self.refuse(Refusal::Key(KeyError::Adjustment(
+                AdjustKeyError::NotScratch {
+                    control: pressed.control,
+                    role: Adjust::ScratchPositive,
+                },
+            )));
+        };
+        let positive = Bound {
+            kind,
+            control: chosen,
+        };
+        if let [a, b] = controls[..] {
+            let control = if a == chosen { b } else { a };
+            self.directions
+                .push((Role::ScratchNegative, Bound { kind, control }));
         }
-        Press::Bound(role, chosen)
+        self.bound.push((Role::ScratchPositive, vec![positive]));
+        self.refused = None;
+        self.next(Role::ScratchPositive, vec![positive])
+    }
+
+    /// After `role` is bound to `chosen`: the next prompt, or once
+    /// [`ROLES`] are bound, the scratch's directions; done when nothing is
+    /// left.
+    fn next(&mut self, role: Role, chosen: Vec<Bound>) -> Press {
+        if self.role().is_none() && self.choosing.is_none() {
+            let configs = self.result();
+            let mut choosing = Vec::new();
+            for kind in [DeviceKind::Keyboard, DeviceKind::Controller] {
+                match configs.scratch_digital(kind)[..] {
+                    [] => {}
+                    [control] => self
+                        .directions
+                        .push((Role::ScratchPositive, Bound { kind, control })),
+                    _ => {
+                        choosing.push(kind);
+                        self.steps.push(Role::ScratchPositive);
+                    }
+                }
+            }
+            self.choosing = Some(choosing);
+        }
+        if self.role().is_some() {
+            return Press::Bound(role, chosen);
+        }
+        if self.result().scratch_axis().is_some() {
+            self.reversing = true;
+            return Press::Bound(role, chosen);
+        }
+        Press::Done(self.result())
+    }
+
+    /// Ends the scratch axis's adjustment direction: `reversed` as it was
+    /// turned, `None` to keep the current setting. The new key configs.
+    pub fn reverse(&mut self, reversed: Option<bool>) -> Press {
+        self.reversing = false;
+        self.refused = None;
+        self.adjust_reversed = reversed;
+        Press::Done(self.result())
     }
 }
 
@@ -383,9 +591,11 @@ pub trait KeyScreen {
 pub enum KeyConfigEnd {
     /// Every role was bound; with the scratch axis's revolution to save,
     /// when it was learnt beyond its declared range
-    /// ([`KeyConfigFlow::widened`]), and its menu direction to save, when
-    /// it was turned for it ([`KeyConfigFlow::menu_reversed`]).
-    Done(KeyConfigs, Option<u32>, Option<bool>),
+    /// ([`KeyConfigFlow::widened`]), its menu direction to save, when it
+    /// was turned for it ([`KeyConfigFlow::menu_reversed`]), and its
+    /// adjustment direction to save, likewise
+    /// ([`KeyConfigFlow::adjust_reversed`]).
+    Done(KeyConfigs, Option<u32>, Option<bool>, Option<bool>),
     /// Escape was pressed.
     Cancelled,
     /// The window closed.
@@ -396,9 +606,9 @@ pub enum KeyConfigEnd {
 /// learn its range.
 pub const LEARN_TIME: Duration = Duration::from_secs(10);
 
-/// How long a turn of the scratch axis is not taken as its menu direction
-/// after that prompt shows, so the turning that ended the range learning
-/// does not answer it.
+/// How long a turn of the scratch axis is not taken as its menu or
+/// adjustment direction after that prompt shows, so the turning that ended
+/// the range learning does not answer it.
 pub const SETTLE_TIME: Duration = Duration::from_millis(500);
 
 /// Runs the key config screen: each next press `capture` takes (recording
@@ -414,7 +624,9 @@ pub const SETTLE_TIME: Duration = Duration::from_millis(500);
 /// capture turn ([`Capture::lower`]) begun after [`SETTLE_TIME`] decides
 /// it, counted in the revolution menus will count it in (the one learnt
 /// beyond the declared range, else `wrap`, the one `device.toml` sets,
-/// else the declared one), and F12 keeps the current setting.
+/// else the declared one), and F12 keeps the current setting. Once every
+/// role is bound, the scratch axis is turned the way that raises SUDDEN+
+/// and speeds up, taken the same way.
 pub fn capture_keys(
     capture: &Capture,
     screen: &mut impl KeyScreen,
@@ -425,7 +637,7 @@ pub fn capture_keys(
 }
 
 /// [`capture_keys`] with `limit` for the range learning and `settle`
-/// before the menu direction is taken.
+/// before the menu and adjustment directions are taken.
 pub fn capture_keys_within(
     capture: &Capture,
     screen: &mut impl KeyScreen,
@@ -453,10 +665,16 @@ pub fn capture_keys_within(
             DeviceKind::Keyboard => None,
             DeviceKind::Controller => capture.product(),
         };
+        let done = |flow: &KeyConfigFlow, keys| {
+            KeyConfigEnd::Done(
+                keys,
+                flow.widened(),
+                flow.menu_reversed,
+                flow.adjust_reversed,
+            )
+        };
         match flow.press_from(pressed, product) {
-            Press::Done(keys) => {
-                return KeyConfigEnd::Done(keys, flow.widened(), flow.menu_reversed);
-            }
+            Press::Done(keys) => return done(&flow, keys),
             Press::Cancelled => return KeyConfigEnd::Cancelled,
             Press::Bound(Role::Lane(0), ref chosen)
                 if flow.bound.len() == 1
@@ -470,10 +688,27 @@ pub fn capture_keys_within(
                     return end;
                 }
                 let wrap = flow.widened().or(wrap);
-                if let Some(end) = learn_direction(capture, screen, &mut flow, axis, wrap, settle) {
+                let turn = Turn::Menu;
+                if let Some(end) =
+                    learn_direction(capture, screen, &mut flow, axis, wrap, settle, turn)
+                {
                     return end;
                 }
                 capture.arm();
+            }
+            Press::Bound(..) if flow.reversing() => {
+                // The flow reverses only with a scratch axis.
+                if let Some(axis) = flow.result().scratch_axis() {
+                    let wrap = flow.widened().or(wrap);
+                    let (axis, turn) = (ControlId(axis), Turn::Adjust);
+                    if let Some(end) =
+                        learn_direction(capture, screen, &mut flow, axis, wrap, settle, turn)
+                    {
+                        return end;
+                    }
+                }
+                flow.reversing = false;
+                return done(&flow, flow.result());
             }
             Press::Bound(..) | Press::Refused(_) => capture.arm(),
         }
@@ -534,14 +769,22 @@ fn learn_range(
     None
 }
 
-/// Asks for the scratch axis `control` to be turned the way that scrolls
-/// menus down, and keeps the direction of its first capture turn begun
-/// after `settle`: the way it moved, net and the short way round its
-/// revolution as menus count it (`wrap`, else the declared one). At
-/// `settle` the capture is armed again, dropping a turn captured or
-/// counted before it. F12 keeps the current setting; any other control is
-/// not an answer. Returns how the screen ended if it was cancelled or
-/// closed meanwhile.
+/// Which way the scratch axis is turned for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Turn {
+    /// The way that scrolls menus down.
+    Menu,
+    /// The way that raises SUDDEN+ and speeds up.
+    Adjust,
+}
+
+/// Asks for the scratch axis `control` to be turned the way `turn` names,
+/// and keeps the direction of its first capture turn begun after
+/// `settle`: the way it moved, net and the short way round its revolution
+/// as menus count it (`wrap`, else the declared one). At `settle` the
+/// capture is armed again, dropping a turn captured or counted before it.
+/// F12 keeps the current setting; any other control is not an answer.
+/// Returns how the screen ended if it was cancelled or closed meanwhile.
 fn learn_direction(
     capture: &Capture,
     screen: &mut impl KeyScreen,
@@ -549,8 +792,10 @@ fn learn_direction(
     control: ControlId,
     wrap: Option<u32>,
     settle: Duration,
+    turn: Turn,
 ) -> Option<KeyConfigEnd> {
-    flow.turning = true;
+    flow.turning = turn == Turn::Menu;
+    let mut answer = None;
     if let Some(wrap) = wrap {
         capture.set_revolution(control, wrap);
     }
@@ -575,7 +820,7 @@ fn learn_direction(
             Some((c, DeviceKind::Controller))
                 if settled && !settling && c == control && capture.product() == flow.device =>
             {
-                flow.menu_reversed = Some(capture.lower());
+                answer = Some(capture.lower());
                 break None;
             }
             Some(_) => capture.arm(),
@@ -585,5 +830,13 @@ fn learn_direction(
     };
     capture.clear_revolution();
     flow.turning = false;
+    if end.is_none() {
+        match turn {
+            Turn::Menu => flow.menu_reversed = answer,
+            Turn::Adjust => {
+                flow.reverse(answer);
+            }
+        }
+    }
     end
 }

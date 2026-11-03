@@ -1,9 +1,10 @@
 //! The settings changed from the keyboard while playing (design.md "Input"):
-//! hi-speed as the visible time, the master volume and the display offset
-//! anytime, and the input offset on the end screen, from the next play
-//! (design.md "Offset Changes and the Watermark"). Each has a reserved key
-//! ([`Adjust`]) that no key config may bind, a step and a range; [`Tuning`]
-//! holds the four values and steps them.
+//! the master volume and the display offset anytime, and the input offset
+//! on the end screen, from the next play (design.md "Offset Changes and the
+//! Watermark"). Each has a reserved key ([`Adjust`]) that no key config may
+//! bind, a step and a range; [`Tuning`] holds the values and steps them.
+//! Hi-speed's keys, F1 and F2 ([`SPEED_KEYS`]), are reserved too, and step
+//! hi-speed through the play adjustments (design.md "Play Adjustments").
 
 use std::ops::RangeInclusive;
 
@@ -37,14 +38,13 @@ pub const MAX_VOLUME_PERCENT: u32 = 100;
 pub const OFFSET_LIMIT_US: i64 = 1_000_000;
 /// One offset step, µs.
 pub const OFFSET_STEP_US: i64 = 1_000;
+/// F1 and F2, by scan code: slower and faster hi-speed, through the play
+/// adjustments' plan rather than [`Tuning`].
+pub const SPEED_KEYS: [u32; 2] = [0x3B, 0x3C];
 
-/// A settings key: F1 to F8 on a keyboard, by scan code, in this order.
+/// A settings key: F3 to F8 on a keyboard, by scan code, in this order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Adjust {
-    /// F1: lower hi-speed, a longer visible time.
-    HiSpeedDown,
-    /// F2: higher hi-speed, a shorter visible time.
-    HiSpeedUp,
     /// F3.
     VolumeDown,
     /// F4.
@@ -61,9 +61,7 @@ pub enum Adjust {
 
 impl Adjust {
     /// Every settings key, by scan code.
-    pub const ALL: [Self; 8] = [
-        Self::HiSpeedDown,
-        Self::HiSpeedUp,
+    pub const ALL: [Self; 6] = [
         Self::VolumeDown,
         Self::VolumeUp,
         Self::DisplayOffsetDown,
@@ -72,10 +70,10 @@ impl Adjust {
         Self::InputOffsetUp,
     ];
 
-    /// The keyboard scan code: F1 is 0x3B, through F8 at 0x42.
+    /// The keyboard scan code: F3 is 0x3D, through F8 at 0x42.
     #[must_use]
     pub const fn key(self) -> u32 {
-        0x3B + self as u32
+        0x3D + self as u32
     }
 
     /// The settings key with scan code `code`.
@@ -88,7 +86,6 @@ impl Adjust {
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
-            Self::HiSpeedDown | Self::HiSpeedUp => "hi-speed",
             Self::VolumeDown | Self::VolumeUp => "volume",
             Self::DisplayOffsetDown | Self::DisplayOffsetUp => "display offset",
             Self::InputOffsetDown | Self::InputOffsetUp => "input offset",
@@ -104,10 +101,11 @@ impl Adjust {
     }
 }
 
-/// The four values the settings keys change.
+/// The values the settings keys change, and the visible time drawing
+/// reads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Tuning {
-    /// Hi-speed as the visible time, ms.
+    /// Hi-speed as the visible time, ms: [`DEFAULT_VISIBLE_TIME_MS`].
     pub visible_time_ms: u32,
     /// The master volume, percent of unity.
     pub volume_percent: u32,
@@ -122,7 +120,7 @@ impl Tuning {
     #[must_use]
     pub fn of(settings: &Settings) -> Self {
         Self {
-            visible_time_ms: settings.player.visible_time_ms,
+            visible_time_ms: DEFAULT_VISIBLE_TIME_MS,
             // `Settings::load` keeps the volume within 0.0 to 1.0.
             volume_percent: (settings.device.master_volume * 100.0).round() as u32,
             display_offset_us: settings.device.display_offset_us,
@@ -130,32 +128,13 @@ impl Tuning {
         }
     }
 
-    /// One step of `adjust`, held within its range. Hi-speed moves to the
-    /// next visible time of [`VISIBLE_TIME_STEPS_MS`], from a value on it or
-    /// between two of its steps.
+    /// One step of `adjust`, held within its range.
     #[must_use]
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub fn adjust(self, adjust: Adjust) -> Self {
-        let steps = &VISIBLE_TIME_STEPS_MS;
         let offset = |us: i64| us.clamp(-OFFSET_LIMIT_US, OFFSET_LIMIT_US);
         let mut t = self;
         match adjust {
-            #[expect(
-                clippy::indexing_slicing,
-                reason = "the step table is a non-empty constant, and `next` is a valid step or the last"
-            )]
-            Adjust::HiSpeedDown => {
-                let next = steps.partition_point(|&ms| ms <= t.visible_time_ms);
-                t.visible_time_ms = steps.get(next).copied().unwrap_or(steps[steps.len() - 1]);
-            }
-            #[expect(
-                clippy::indexing_slicing,
-                reason = "the step table is a non-empty constant, and `i` is below the partition point"
-            )]
-            Adjust::HiSpeedUp => {
-                let below = steps.partition_point(|&ms| ms < t.visible_time_ms);
-                t.visible_time_ms = below.checked_sub(1).map_or(steps[0], |i| steps[i]);
-            }
             Adjust::VolumeDown => {
                 t.volume_percent = t.volume_percent.saturating_sub(VOLUME_STEP_PERCENT);
             }
@@ -199,7 +178,6 @@ impl Tuning {
     /// percent `settings` rounds to keeps its exact value (0.754 stays
     /// 0.754 until a volume key moves it).
     pub fn apply_to(self, settings: &mut Settings) {
-        settings.player.visible_time_ms = self.visible_time_ms;
         if self.volume_percent != Self::of(settings).volume_percent {
             settings.device.master_volume = self.volume();
         }

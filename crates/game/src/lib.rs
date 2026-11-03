@@ -124,14 +124,14 @@ pub use session::{
     SessionPlayError, Settings, VIEW_NOTE_COPIES, wake_policy,
 };
 pub use settings::{
-    ControllerDevice, DataRoot, DeviceSettings, DeviceSettingsError, KeyConfig, KeyError, LaneKey,
-    LibrarySettings, NEXT_PRESET_KEY, OVERLAY_KEY, PREV_PRESET_KEY, PlayerSettings,
-    PlayerSettingsError, Role, ScratchConfig, SettingsError, load_settings, reserved_key,
-    save_settings,
+    ControllerDevice, CoverSettings, DEVICE_SETTINGS_VERSION, DataRoot, DeviceSettings,
+    DeviceSettingsError, KeyConfig, KeyError, LaneKey, LibrarySettings, NEXT_PRESET_KEY,
+    OVERLAY_KEY, PREV_PRESET_KEY, PlayerSettings, PlayerSettingsError, Role, ScratchConfig,
+    SettingsError, SettingsFile, load_settings, reserved_key, save_settings,
 };
 pub use sound::{AudioQueue, AudioSink, RunnerAudio, Wakes, audio_link, audio_link_at};
 pub use tempo::{AttemptTempo, MAIN_HISTOGRAM_LIMIT, ReferenceError};
 pub use tuning::{
-    Adjust, DEFAULT_VISIBLE_TIME_MS, MAX_VOLUME_PERCENT, OFFSET_LIMIT_US, OFFSET_STEP_US, Tuning,
-    VISIBLE_TIME_MS, VISIBLE_TIME_STEPS_MS, VOLUME_STEP_PERCENT,
+    Adjust, DEFAULT_VISIBLE_TIME_MS, MAX_VOLUME_PERCENT, OFFSET_LIMIT_US, OFFSET_STEP_US,
+    SPEED_KEYS, Tuning, VISIBLE_TIME_MS, VISIBLE_TIME_STEPS_MS, VOLUME_STEP_PERCENT,
 };

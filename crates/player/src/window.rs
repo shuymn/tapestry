@@ -681,7 +681,7 @@ fn window_key(control: u32) -> PhysicalKey {
 struct Keys {
     retry: Option<PhysicalKey>,
     quit: Option<PhysicalKey>,
-    settings: [(PhysicalKey, Adjust); 8],
+    settings: [(PhysicalKey, Adjust); 6],
     overlay: PhysicalKey,
 }
 
@@ -1045,8 +1045,6 @@ mod tests {
         assert_eq!(window_key(PAUSE), PhysicalKey::Code(KeyCode::Pause));
         assert_eq!(window_key(NUM_LOCK), PhysicalKey::Code(KeyCode::NumLock));
         let f = [
-            KeyCode::F1,
-            KeyCode::F2,
             KeyCode::F3,
             KeyCode::F4,
             KeyCode::F5,
@@ -1058,15 +1056,14 @@ mod tests {
             assert_eq!(window_key(a.key()), PhysicalKey::Code(k));
             assert_eq!(PhysicalKey::Code(k).to_scancode(), Some(a.key()));
         }
-        // F2 (hi-speed up) steps the visible time in the window.
+        // F1 and F2 (hi-speed) step nothing in the window.
         let c = Controls::new(QpcClock::start());
-        key_pressed(
-            &c,
-            PhysicalKey::Code(KeyCode::F2),
-            true,
-            &Keys::new(None, None),
-        );
-        assert_eq!(c.tuning().get().visible_time_ms, 569);
+        let before = c.tuning().get();
+        for k in [KeyCode::F1, KeyCode::F2] {
+            key_pressed(&c, PhysicalKey::Code(k), true, &Keys::new(None, None));
+        }
+        assert_eq!(c.tuning().get(), before);
+        assert_eq!(c.take(), None);
     }
 
     /// `device.toml`'s monitor picks a monitor by its exact device name,
