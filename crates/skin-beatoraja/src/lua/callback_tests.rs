@@ -349,8 +349,13 @@ fn a_function_made_in_a_loop_is_classified_once() {
     // walked once.
     let i = import(&many(60_000, false)).unwrap();
     assert_eq!(i.callbacks.len(), 60_000);
-    // One unit a callable, and the body once.
-    assert!(i.usage.analysis_work < 150_000, "{}", i.usage.analysis_work);
+    // A few units a callable (its module name hashed, its admission), and
+    // the body once: far below 60 000 bodies.
+    assert!(
+        i.usage.analysis_work < 1_000_000,
+        "{}",
+        i.usage.analysis_work
+    );
     // Each capturing its own value, they are classified apart, under the
     // cumulative work allowance.
     assert_eq!(
@@ -444,6 +449,91 @@ fn option_lookups_hash_the_name_and_charge_its_bytes() {
         "{}",
         i.usage.analysis_work
     );
+    assert!(start.elapsed() < std::time::Duration::from_secs(20));
+}
+
+#[test]
+fn the_role_scan_visits_each_helper_once() {
+    // A binary tree of 16 383 helper closures, 8 192 leaves each
+    // capturing its own index, under 64 numbers whose callback does not
+    // convert: each one's role scan visits every helper once, a hash a
+    // check.
+    let body = "local level = {}\n\
+        for i = 1, 8192 do local k = i level[i] = function() local own = k return 0 end end\n\
+        while #level > 1 do\n\
+          local up = {}\n\
+          for i = 1, #level, 2 do\n\
+            local left, right = level[i], level[i + 1]\n\
+            up[#up + 1] = function() local x = left() local y = right() return 0 end\n\
+          end\n\
+          level = up\n\
+        end\n\
+        local root = level[1]\n\
+        skin.value = { { id = \"v\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, digit = 3,\n\
+          value = function() local unused = root() return ms.number(425) end } }";
+    let dst: String = (0..64)
+        .map(|k| format!("{{ id = \"v\", dst = {{ {{ x = {k}, y = 0, w = 6, h = 6 }} }} }},"))
+        .collect();
+    let start = std::time::Instant::now();
+    let i = import(&skin(body, &dst)).unwrap();
+    assert!(
+        i.callbacks
+            .iter()
+            .any(|d| matches!(d, super::Disposition::Replaced(_)))
+    );
+    assert!(start.elapsed() < std::time::Duration::from_secs(20));
+}
+
+#[test]
+fn a_callable_s_module_is_found_by_hash() {
+    // 1 000 modules with long names sharing all but their last digits,
+    // then 2 000 closures from the last: each closure's provenance is one
+    // hash of its module's name, its bytes charged.
+    let prefix = "m".repeat(120);
+    let mut files: Vec<(String, String)> = (0..1_000)
+        .map(|k| (format!("{prefix}{k:04}.lua"), "return 1".to_owned()))
+        .collect();
+    files.push((
+        format!("{prefix}last.lua"),
+        "local t = {} for i = 1, 2000 do local k = i t[i] = function() local own = k return 0 end end return t"
+            .to_owned(),
+    ));
+    let loads: String = (0..1_000)
+        .map(|k| format!("require(\"{prefix}{k:04}\")\n"))
+        .collect();
+    let entry = format!(
+        "local s = {{ type = 0, name = \"t\", w = 1920, h = 1080 }}\n\
+         if not skin_config then return s end\n\
+         {loads}s.extra = require(\"{prefix}last\")\n\
+         return s"
+    );
+    let named: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(n, t)| (n.as_str(), t.as_str()))
+        .collect();
+    let i = run_with(&entry, &named, &Cancel::new()).unwrap();
+    let name = u64::try_from(prefix.len() + "last.lua".len()).unwrap();
+    assert!(
+        i.usage.analysis_work >= 2_000 * name,
+        "{}",
+        i.usage.analysis_work
+    );
+}
+
+#[test]
+fn a_table_met_again_is_not_scanned_again() {
+    // An emptied table of 262 144 slots, referenced 100 000 times: its
+    // empty capacity is walked once, not once a reference.
+    let entry = "local s = { type = 0, name = \"t\", w = 1920, h = 1080 }\n\
+        if not skin_config then return s end\n\
+        local t = {}\n\
+        for i = 1, 262144 do t[i] = true end\n\
+        for i = 1, 262144 do t[i] = nil end\n\
+        s.extra = {}\n\
+        for i = 1, 100000 do s.extra[i] = t end\n\
+        return s";
+    let start = std::time::Instant::now();
+    import(entry).unwrap();
     assert!(start.elapsed() < std::time::Duration::from_secs(20));
 }
 

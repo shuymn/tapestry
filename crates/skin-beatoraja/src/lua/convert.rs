@@ -32,6 +32,7 @@
 //! [`MAX_CONVERTED_BYTES`].
 
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use mlua::{Function, Lua, Table, Value};
 use skin_model::FileId;
@@ -171,9 +172,13 @@ pub(super) fn convert(
         pending: Vec::new(),
         env_of: HashMap::new(),
         option_set_of: HashMap::new(),
-        analysis: Analysis::default(),
+        shapes: HashMap::new(),
+        module_index: (0_u16..)
+            .zip(&modules)
+            .map(|(i, m)| (m.as_str(), i))
+            .collect(),
+        analysis: Analysis::with_cancel(pass.ledger.cancel()),
         entry: entry.name(),
-        modules: &modules,
         nodes: Vec::new(),
         bytes: Vec::new(),
         values: Vec::new(),
@@ -197,7 +202,6 @@ pub(super) fn convert(
     } = c;
     let analysis = configured.then(|| {
         analysis.files = std::mem::take(&mut *pass.files.borrow_mut());
-        analysis.cancel = Some(pass.ledger.cancel());
         Box::new(analysis)
     });
     let name = entry.name().to_owned();
@@ -223,6 +227,16 @@ pub(super) fn convert(
 /// A span of the converted bytes.
 type Span = (u32, u32);
 
+/// A table's keys as [`Conv::enumerate`] read them.
+#[derive(Clone, Debug)]
+enum Shape {
+    Empty,
+    /// The keys `1..=n`.
+    Array(usize),
+    /// String keys, sorted by their bytes.
+    Object(Rc<[Vec<u8>]>),
+}
+
 struct Conv<'a> {
     pass: &'a Pass,
     tags: Option<Tags>,
@@ -234,9 +248,13 @@ struct Conv<'a> {
     env_of: HashMap<usize, u32>,
     /// Option tables read, by address.
     option_set_of: HashMap<usize, u32>,
+    /// Tables enumerated, by address.
+    shapes: HashMap<usize, Shape>,
+    /// The loaded modules' indices, by name: a callable's provenance is
+    /// one hash of its source's name (at most 1 024 bytes).
+    module_index: HashMap<&'a str, u16>,
     analysis: Analysis,
     entry: &'a str,
-    modules: &'a [String],
     nodes: Vec<Node>,
     bytes: Vec<u8>,
     values: Vec<LuaScalar>,
@@ -386,12 +404,13 @@ impl Conv<'_> {
                 instance: NONE,
             });
         }
-        let module = info
-            .source
-            .as_deref()
-            .and_then(|s| s.strip_prefix('@'))
-            .and_then(|s| self.modules.iter().position(|m| m == s))
-            .and_then(|i| u16::try_from(i).ok());
+        let source = info.source.as_deref().and_then(|s| s.strip_prefix('@'));
+        // One hash of the source's name, its bytes charged first.
+        if let Some(s) = source {
+            let len = u64::try_from(s.len()).unwrap_or(u64::MAX);
+            self.analysis.charge(len).map_err(|w| self.fatal(w))?;
+        }
+        let module = source.and_then(|s| self.module_index.get(s).copied());
         let instance = self.tagged(f)?.unwrap_or(NONE);
         Ok(Callable {
             module,
@@ -649,21 +668,19 @@ impl Conv<'_> {
         self.lua(callback::fatal(why).unwrap_or(LuaWhy::Limit(LuaLimit::AnalysisWork)))
     }
 
-    /// Table `t`, its key's span when it has one, at `depth`.
-    fn table(&mut self, t: &Table, span: Option<Span>, depth: u32) -> Result<u32, ImportError> {
-        if depth > MAX_DEPTH {
-            return Err(self.input(InputLimit::Depth));
-        }
-        let addr = t.to_pointer().addr();
-        if self.path.contains(&addr) {
-            return Err(self.lua(LuaWhy::Cycle));
-        }
-        // The keys classified and counted before anything is kept.
-        let (mut n, mut strings, mut ints) = (0_usize, 0_usize, 0_usize);
+    /// Table `t`'s keys, read once by `next`: their kind and count, an
+    /// object's keys copied out (no handle per key stays on Lua's stack)
+    /// and sorted by their bytes. Each entry is counted against the node
+    /// cap and each key's bytes against the decoded-bytes cap as it is
+    /// met, and cancellation is seen every [`CHECK_EVERY`] entries and
+    /// once the scan is done; `next`'s own walk over empty slots is
+    /// bounded by the table's capacity in VM memory, met once per table.
+    fn enumerate(&mut self, t: &Table) -> Result<Shape, ImportError> {
+        let (mut n, mut ints) = (0_usize, 0_usize);
         let (mut min, mut max) = (i64::MAX, i64::MIN);
         let mut key_bytes = 0_u64;
+        let mut keys: Vec<Vec<u8>> = Vec::new();
         for pair in t.pairs::<Value, Value>() {
-            // The entries counted against the node cap as they are met.
             self.poll(n)?;
             if self.nodes.len().saturating_add(n) >= MAX_NODES {
                 return Err(self.input(InputLimit::Nodes));
@@ -672,12 +689,16 @@ impl Conv<'_> {
             n += 1;
             match k {
                 Value::String(s) => {
-                    strings += 1;
-                    let len = s.as_bytes().len();
-                    if len > MAX_STRING_BYTES {
+                    let s = s.as_bytes();
+                    if s.len() > MAX_STRING_BYTES {
                         return Err(self.input(InputLimit::StringBytes));
                     }
-                    key_bytes = key_bytes.saturating_add(u64::try_from(len).unwrap_or(u64::MAX));
+                    key_bytes =
+                        key_bytes.saturating_add(u64::try_from(s.len()).unwrap_or(u64::MAX));
+                    if self.decoded.saturating_add(key_bytes) > MAX_DECODED_BYTES {
+                        return Err(self.input(InputLimit::DecodedBytes));
+                    }
+                    keys.push(s.to_vec());
                 }
                 Value::Integer(i) => {
                     ints += 1;
@@ -687,25 +708,72 @@ impl Conv<'_> {
                 _ => return Err(self.lua(LuaWhy::Key)),
             }
         }
-        if self.nodes.len().saturating_add(n) >= MAX_NODES {
-            return Err(self.input(InputLimit::Nodes));
+        if self.pass.ledger.cancelled() {
+            return Err(self.lua(LuaWhy::Cancelled));
         }
-        if self.decoded.saturating_add(key_bytes) > MAX_DECODED_BYTES {
-            return Err(self.input(InputLimit::DecodedBytes));
-        }
-        let kind = if n == 0 {
-            Kind::Empty
-        } else if strings == n {
-            Kind::Object
+        if n == 0 {
+            Ok(Shape::Empty)
+        } else if keys.len() == n {
+            // Sorted by their bytes, the bytes compared counted and the
+            // cancellation request seen every 64 KiB of them: once seen,
+            // the rest of the sort compares nothing.
+            let ledger = &self.pass.ledger;
+            let (mut compared, mut stop) = (0_usize, false);
+            keys.sort_unstable_by(|a, b| {
+                if stop {
+                    return std::cmp::Ordering::Equal;
+                }
+                let before = compared;
+                compared = compared.saturating_add(a.len().min(b.len()) + 1);
+                if before >> 16 != compared >> 16 && ledger.cancelled() {
+                    stop = true;
+                    return std::cmp::Ordering::Equal;
+                }
+                a.cmp(b)
+            });
+            if stop {
+                return Err(self.lua(LuaWhy::Cancelled));
+            }
+            Ok(Shape::Object(Rc::from(keys)))
         } else if ints == n {
             let count = i64::try_from(n).unwrap_or(i64::MAX);
             if min != 1 || max != count {
                 return Err(self.lua(LuaWhy::Sparse));
             }
-            Kind::Array
+            Ok(Shape::Array(n))
         } else {
-            return Err(self.lua(LuaWhy::Mixed));
+            Err(self.lua(LuaWhy::Mixed))
+        }
+    }
+
+    /// Table `t`, its key's span when it has one, at `depth`.
+    fn table(&mut self, t: &Table, span: Option<Span>, depth: u32) -> Result<u32, ImportError> {
+        if depth > MAX_DEPTH {
+            return Err(self.input(InputLimit::Depth));
+        }
+        let addr = t.to_pointer().addr();
+        if self.path.contains(&addr) {
+            return Err(self.lua(LuaWhy::Cycle));
+        }
+        // The table's shape, enumerated once a conversion by its identity:
+        // a table met again through another reference is not scanned
+        // again, while each reference is charged its nodes and key bytes.
+        let shape = match self.shapes.get(&addr) {
+            Some(shape) => shape.clone(),
+            None => {
+                let shape = self.enumerate(t)?;
+                self.shapes.insert(addr, shape.clone());
+                shape
+            }
         };
+        let (kind, n) = match &shape {
+            Shape::Empty => (Kind::Empty, 0),
+            Shape::Array(n) => (Kind::Array, *n),
+            Shape::Object(keys) => (Kind::Object, keys.len()),
+        };
+        if self.nodes.len().saturating_add(n) >= MAX_NODES {
+            return Err(self.input(InputLimit::Nodes));
+        }
         let id = self.node(kind, span, 0)?;
         self.path.push(addr);
         let mut prev = NONE;
@@ -723,20 +791,13 @@ impl Conv<'_> {
                 let child = self.value(&v, None, depth + 1)?;
                 link(self, child);
             }
-        } else if kind == Kind::Object {
-            // The keys' bytes, charged above with the entries, copied out
-            // so that no handle per key stays on Lua's stack.
-            let mut keys: Vec<Vec<u8>> = Vec::with_capacity(n);
-            for (seen, pair) in t.pairs::<mlua::LuaString, Value>().enumerate() {
-                self.poll(seen)?;
-                let (k, _) = pair.map_err(|e| self.mlua(&e))?;
-                keys.push(k.as_bytes().to_vec());
-            }
-            keys.sort_unstable();
-            for k in keys {
-                let span = self.text(&k)?;
+        } else if let Shape::Object(keys) = &shape {
+            // Each key's bytes charged again for this reference as they
+            // are copied into the arena.
+            for k in keys.iter() {
+                let span = self.text(k)?;
                 let v: Value = t
-                    .raw_get(mlua::BString::from(k))
+                    .raw_get(mlua::BString::from(k.as_slice()))
                     .map_err(|e| self.mlua(&e))?;
                 let child = self.value(&v, Some(span), depth + 1)?;
                 link(self, child);

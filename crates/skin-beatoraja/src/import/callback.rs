@@ -152,26 +152,31 @@ struct Lower<'a> {
 }
 
 impl Lower<'_> {
-    fn bytes(src: String) -> R<String> {
+    /// A generated string kept: past [`MAX_SOURCE_BYTES`] fatal, its
+    /// bytes charged as analysis work (each level copies its operands').
+    fn bytes(&self, src: String) -> R<String> {
         if src.len() > MAX_SOURCE_BYTES {
             return Err(Stop::Fatal(LuaWhy::Limit(LuaLimit::Generated)));
         }
+        self.an
+            .charge(u64::try_from(src.len()).unwrap_or(u64::MAX))
+            .map_err(stop)?;
         Ok(src)
     }
 
-    fn int(src: String, lo: i64, hi: i64) -> R<V> {
+    fn int(&self, src: String, lo: i64, hi: i64) -> R<V> {
         if lo < i64::from(i32::MIN) || hi > i64::from(i32::MAX) {
             return Err(Stop::Unsupported(Unsupported::Range));
         }
         Ok(V::Int {
-            src: Self::bytes(src)?,
+            src: self.bytes(src)?,
             lo,
             hi,
         })
     }
 
-    fn boolean(src: String) -> R<V> {
-        Ok(V::Bool(Self::bytes(src)?))
+    fn boolean(&self, src: String) -> R<V> {
+        Ok(V::Bool(self.bytes(src)?))
     }
 
     fn guard(&mut self, g: &'static str) {
@@ -284,9 +289,9 @@ impl Lower<'_> {
     fn expr_inner(&mut self, ast: &Ast, inst: u32, locals: &[(u32, u32)], e: u32) -> R<V> {
         let unsupported = |w| Err(Stop::Unsupported(w));
         match ast.expr(e) {
-            Expr::Int(n) => Self::literal(n),
-            Expr::True => Self::boolean("true".into()),
-            Expr::False => Self::boolean("false".into()),
+            Expr::Int(n) => self.literal(n),
+            Expr::True => self.boolean("true".into()),
+            Expr::False => self.boolean("false".into()),
             Expr::Paren(x) => self.expr(ast, inst, locals, x),
             Expr::Local(d) => {
                 self.charge_scan(locals.len())?;
@@ -297,8 +302,8 @@ impl Lower<'_> {
                     return self.expr(ast, inst, before, init);
                 }
                 match self.an.upvalue(inst, d) {
-                    Some(Captured::Int(n)) => Self::literal(n),
-                    Some(Captured::Bool(b)) => Self::boolean(b.to_string()),
+                    Some(Captured::Int(n)) => self.literal(n),
+                    Some(Captured::Bool(b)) => self.boolean(b.to_string()),
                     _ => unsupported(Unsupported::Capture("an upvalue")),
                 }
             }
@@ -328,12 +333,12 @@ impl Lower<'_> {
                 }
             }
             Expr::Unary(op, x) => match (op, self.expr(ast, inst, locals, x)?) {
-                (Un::Neg, V::Int { src, lo, hi }) => Self::int(
+                (Un::Neg, V::Int { src, lo, hi }) => self.int(
                     format!("(-{src})"),
                     hi.checked_neg().unwrap_or(i64::MAX),
                     lo.checked_neg().unwrap_or(i64::MAX),
                 ),
-                (Un::Not, V::Bool(s)) => Self::boolean(format!("(!{s})")),
+                (Un::Not, V::Bool(s)) => self.boolean(format!("(!{s})")),
                 _ => unsupported(Unsupported::Type),
             },
             Expr::Binary(op, a, b) => {
@@ -347,13 +352,13 @@ impl Lower<'_> {
         }
     }
 
-    fn literal(n: i64) -> R<V> {
+    fn literal(&self, n: i64) -> R<V> {
         let src = if n < 0 {
             format!("(-{})", n.unsigned_abs())
         } else {
             n.to_string()
         };
-        Self::int(src, n, n)
+        self.int(src, n, n)
     }
 
     /// `skin_config.option["name"]`: its captured value.
@@ -407,7 +412,7 @@ impl Lower<'_> {
                 self.out.deviates |= v.deviates();
                 self.out.part = self.out.part.or(v.part());
                 let (lo, hi) = v.range();
-                Self::int(format!("({})", v.expr()), lo, hi)
+                self.int(format!("({})", v.expr()), lo, hi)
             }
             "option" => match ops::numeric(id.ok_or_else(unmapped)?, &BTreeMap::new()) {
                 Cond::Expr {
@@ -415,10 +420,10 @@ impl Lower<'_> {
                     display_deviation,
                 } => {
                     self.out.deviates |= display_deviation;
-                    Self::boolean(format!("({src})"))
+                    self.boolean(format!("({src})"))
                 }
-                Cond::Fold(b) => Self::boolean(b.to_string()),
-                Cond::Undefined(_) => Self::boolean("false".into()),
+                Cond::Fold(b) => self.boolean(b.to_string()),
+                Cond::Undefined(_) => self.boolean("false".into()),
                 Cond::Unsupported(_) => Err(unmapped()),
             },
             "timer" => {
@@ -482,22 +487,22 @@ impl Lower<'_> {
                 match op {
                     Bin::Add => {
                         let (lo, hi) = corners(|p, q| p + q);
-                        Self::int(src, lo, hi)
+                        self.int(src, lo, hi)
                     }
                     Bin::Sub => {
                         let (lo, hi) = corners(|p, q| p - q);
-                        Self::int(src, lo, hi)
+                        self.int(src, lo, hi)
                     }
                     Bin::Mul => {
                         let (lo, hi) = corners(|p, q| p * q);
-                        Self::int(src, lo, hi)
+                        self.int(src, lo, hi)
                     }
-                    Bin::Eq | Bin::Ne | Bin::Lt | Bin::Le | Bin::Gt | Bin::Ge => Self::boolean(src),
+                    Bin::Eq | Bin::Ne | Bin::Lt | Bin::Le | Bin::Gt | Bin::Ge => self.boolean(src),
                     _ => Err(Stop::Unsupported(Unsupported::Truthiness)),
                 }
             }
             (V::Bool(x), V::Bool(y)) if matches!(op, Bin::And | Bin::Or) => {
-                Self::boolean(format!("({x} {sym} {y})"))
+                self.boolean(format!("({x} {sym} {y})"))
             }
             (V::Gauge, V::Int { lo, hi, .. }) | (V::Int { lo, hi, .. }, V::Gauge)
                 if lo == hi && matches!(op, Bin::Eq | Bin::Ne) =>
@@ -505,7 +510,7 @@ impl Lower<'_> {
                 self.guard("gauge.valid");
                 self.out.deviates = true;
                 let look = usize::try_from(lo).ok().and_then(|k| LOOKS.get(k));
-                Self::boolean(match look {
+                self.boolean(match look {
                     Some(name) => format!("(gauge.kind {sym} {name})"),
                     None => (!eq).to_string(),
                 })
@@ -513,7 +518,7 @@ impl Lower<'_> {
             (V::Timer(t), V::TimerOff) | (V::TimerOff, V::Timer(t))
                 if matches!(op, Bin::Eq | Bin::Ne) =>
             {
-                Self::boolean(match (t, eq) {
+                self.boolean(match (t, eq) {
                     (Some(name), true) => format!("(!on({name}))"),
                     (Some(name), false) => format!("on({name})"),
                     (None, on) => on.to_string(),
@@ -522,7 +527,7 @@ impl Lower<'_> {
             (V::Config(v), V::Int { lo, hi, .. }) | (V::Int { lo, hi, .. }, V::Config(v))
                 if lo == hi && matches!(op, Bin::Eq | Bin::Ne) =>
             {
-                Self::boolean(((v == lo) == eq).to_string())
+                self.boolean(((v == lo) == eq).to_string())
             }
             _ => Err(Stop::Unsupported(Unsupported::Type)),
         }
@@ -532,7 +537,8 @@ impl Lower<'_> {
     /// helpers included: what a callback's role depends on. A worklist,
     /// each instance visited once, so no nesting deepens it.
     fn part(&self, i: u32) -> R<Option<CriticalPart>> {
-        let mut seen = vec![i];
+        // Each instance visited once: one hash a check.
+        let mut seen = std::collections::HashSet::from([i]);
         let mut pending = vec![i];
         let mut stack: Vec<u32> = Vec::new();
         while let Some(i) = pending.pop() {
@@ -562,8 +568,7 @@ impl Lower<'_> {
                     }
                     Expr::Call { callee, args } => match resolve_callee(self.an, ast, i, callee) {
                         Ok(Callee::Helper(j)) => {
-                            if !seen.contains(&j) {
-                                seen.push(j);
+                            if seen.insert(j) {
                                 pending.push(j);
                             }
                         }

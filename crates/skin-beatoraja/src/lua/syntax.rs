@@ -656,7 +656,11 @@ impl Lexer<'_> {
             return Err(self.fail());
         }
         let text = self.src.get(start..self.pos).unwrap_or_default();
-        number(text).ok_or(self.fail())
+        let fail = self.fail();
+        let mut lex = *self;
+        let r = number(text, &mut || lex.tick());
+        self.steps = lex.steps;
+        r?.ok_or(fail)
     }
 
     /// The next token, its strings decoded into `bytes`.
@@ -825,40 +829,53 @@ fn utf8(v: u32, out: &mut Vec<u8>) {
 /// only decimal digits that fit (an overflowing one is a float) or is
 /// hexadecimal without a point or an exponent (wrapping), else a float
 /// when it reads as one; `None` when it is malformed.
-fn number(text: &[u8]) -> Option<Tok> {
+fn number(text: &[u8], tick: &mut dyn FnMut() -> Result<(), Fail>) -> Result<Option<Tok>, Fail> {
+    // Each byte visited once per scan, each visit a tick.
+    let mut all = |t: &[u8], f: fn(&u8) -> bool| -> Result<bool, Fail> {
+        for c in t {
+            tick()?;
+            if !f(c) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    };
     let hex = text.len() > 1 && text[0] == b'0' && matches!(text[1], b'x' | b'X');
     if hex {
         let digits = &text[2..];
-        if !digits.is_empty() && digits.iter().all(u8::is_ascii_hexdigit) {
+        if !digits.is_empty() && all(digits, u8::is_ascii_hexdigit)? {
             let mut v: u64 = 0;
             for &d in digits {
+                tick()?;
                 let d = char::from(d).to_digit(16).unwrap_or(0);
                 v = v.wrapping_mul(16).wrapping_add(u64::from(d));
             }
-            return Some(Tok::Int(v.cast_signed()));
+            return Ok(Some(Tok::Int(v.cast_signed())));
         }
-        return float(digits, true).then_some(Tok::Float);
+        return Ok(float(digits, true, tick)?.then_some(Tok::Float));
     }
-    if !text.is_empty() && text.iter().all(u8::is_ascii_digit) {
+    if !text.is_empty() && all(text, u8::is_ascii_digit)? {
         let mut v: i64 = 0;
         for &d in text {
+            tick()?;
             match v
                 .checked_mul(10)
                 .and_then(|v| v.checked_add(i64::from(d - b'0')))
             {
                 Some(n) => v = n,
-                None => return Some(Tok::Float),
+                None => return Ok(Some(Tok::Float)),
             }
         }
-        return Some(Tok::Int(v));
+        return Ok(Some(Tok::Int(v)));
     }
-    float(text, false).then_some(Tok::Float)
+    Ok(float(text, false, tick)?.then_some(Tok::Float))
 }
 
 /// Whether `t` is a float numeral's mantissa and exponent: digits with
 /// at most one point, at least one digit, and an optional exponent with a
-/// sign and at least one decimal digit (`p` for hexadecimal).
-fn float(t: &[u8], hex: bool) -> bool {
+/// sign and at least one decimal digit (`p` for hexadecimal); each byte
+/// visited a tick.
+fn float(t: &[u8], hex: bool, tick: &mut dyn FnMut() -> Result<(), Fail>) -> Result<bool, Fail> {
     let digit = |c: u8| {
         if hex {
             c.is_ascii_hexdigit()
@@ -869,22 +886,24 @@ fn float(t: &[u8], hex: bool) -> bool {
     let mut i = 0;
     let mut digits = 0;
     while i < t.len() && digit(t[i]) {
+        tick()?;
         i += 1;
         digits += 1;
     }
     if i < t.len() && t[i] == b'.' {
         i += 1;
         while i < t.len() && digit(t[i]) {
+            tick()?;
             i += 1;
             digits += 1;
         }
     }
     if digits == 0 {
-        return false;
+        return Ok(false);
     }
     if i < t.len() && matches!(t[i], b'e' | b'E' | b'p' | b'P') {
         if hex != matches!(t[i], b'p' | b'P') {
-            return false;
+            return Ok(false);
         }
         i += 1;
         if i < t.len() && matches!(t[i], b'+' | b'-') {
@@ -892,13 +911,14 @@ fn float(t: &[u8], hex: bool) -> bool {
         }
         let from = i;
         while i < t.len() && t[i].is_ascii_digit() {
+            tick()?;
             i += 1;
         }
         if i == from {
-            return false;
+            return Ok(false);
         }
     }
-    i == t.len()
+    Ok(i == t.len())
 }
 
 /// A function being parsed: its index and its upvalues so far.
@@ -1819,16 +1839,17 @@ mod tests {
     #[test]
     fn numerals_take_lua_s_subtypes() {
         use super::Tok;
-        assert_eq!(number(b"10"), Some(Tok::Int(10)));
-        assert_eq!(number(b"0x10"), Some(Tok::Int(16)));
-        assert_eq!(number(b"0xffffffffffffffff"), Some(Tok::Int(-1)));
-        assert_eq!(number(b"9223372036854775807"), Some(Tok::Int(i64::MAX)));
-        assert_eq!(number(b"9223372036854775808"), Some(Tok::Float));
+        let n = |t: &[u8]| number(t, &mut || Ok(())).unwrap();
+        assert_eq!(n(b"10"), Some(Tok::Int(10)));
+        assert_eq!(n(b"0x10"), Some(Tok::Int(16)));
+        assert_eq!(n(b"0xffffffffffffffff"), Some(Tok::Int(-1)));
+        assert_eq!(n(b"9223372036854775807"), Some(Tok::Int(i64::MAX)));
+        assert_eq!(n(b"9223372036854775808"), Some(Tok::Float));
         for f in ["1.0", "1e5", ".5", "5.", "0x1p4", "0x.8", "1e+5", "3E-2"] {
-            assert_eq!(number(f.as_bytes()), Some(Tok::Float), "{f}");
+            assert_eq!(n(f.as_bytes()), Some(Tok::Float), "{f}");
         }
         for bad in ["1e", "0x", "1..2", "0x1e+", "1p4", "."] {
-            assert_eq!(number(bad.as_bytes()), None, "{bad}");
+            assert_eq!(n(bad.as_bytes()), None, "{bad}");
         }
     }
 

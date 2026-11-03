@@ -207,6 +207,15 @@ pub(crate) struct Analysis {
 }
 
 impl Analysis {
+    /// An empty analysis that sees `cancel`, set before any capture so
+    /// that every charge polls it.
+    pub(crate) fn with_cancel(cancel: super::Cancel) -> Self {
+        Self {
+            cancel: Some(cancel),
+            ..Self::default()
+        }
+    }
+
     /// `n` units of work charged before they are done, the cancellation
     /// request seen every [`CHECK_EVERY`]: [`TOO_MUCH`] past the cap,
     /// [`CANCELLED`] once it is requested.
@@ -311,7 +320,20 @@ impl Analysis {
                 *s = State::InProgress;
             }
         }
-        let key = self.proto_key(i);
+        let key = match self.proto_key(i) {
+            Ok(key) => key,
+            Err(why) => {
+                let r = Err(Found {
+                    why,
+                    file: self.instance(i).map_or(0, |x| x.file),
+                    line: 0,
+                });
+                if let Some(s) = self.classes.borrow_mut().get_mut(i as usize) {
+                    *s = State::Done(r);
+                }
+                return r;
+            }
+        };
         let cached = key
             .as_ref()
             .and_then(|k| self.protos.borrow().get(k).copied());
@@ -336,18 +358,21 @@ impl Analysis {
 
     /// The prototype key of instance `i`, its captured values charged as
     /// they are copied.
-    fn proto_key(&self, i: u32) -> Option<ProtoKey> {
-        let inst = self.instance(i)?;
-        let values = match inst.values {
-            Some((start, len)) => self
-                .captured
-                .get(start as usize..start as usize + len as usize)?
-                .to_vec(),
-            None => Vec::new(),
+    /// [`Self::classify_at`]'s key for instance `i`, its values charged
+    /// before they are copied; `Ok(None)` without one.
+    fn proto_key(&self, i: u32) -> Result<Option<ProtoKey>, Unsupported> {
+        let Some(inst) = self.instance(i) else {
+            return Ok(None);
         };
-        self.charge(u64::try_from(values.len()).unwrap_or(u64::MAX))
-            .ok()?;
-        Some((inst.file, inst.func, values))
+        let (start, len) = inst.values.unwrap_or((0, 0));
+        self.charge(u64::from(len))?;
+        let Some(values) = self
+            .captured
+            .get(start as usize..start as usize + len as usize)
+        else {
+            return Ok(None);
+        };
+        Ok(Some((inst.file, inst.func, values.to_vec())))
     }
 
     fn classify_body(&self, i: u32, depth: u32) -> Result<Ty, Found> {
