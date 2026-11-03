@@ -453,3 +453,26 @@ fn a_chart_with_no_rank_header_is_judged_and_classed_as_rank_2() {
     assert_eq!(i.facts, deps(&[class(Some(JudgeClass::Normal))]));
     assert_eq!(x(i), 1);
 }
+
+#[cfg(feature = "dev-tools")]
+#[test]
+fn the_timed_import_keeps_a_pending_result() {
+    use skin_beatoraja::lua::LuaTimed;
+    let d = folder("local on = ms.option(33)\nx = ms.option(182) and 1 or 0");
+    let h = header(&d);
+    let config = Config::defaults(h.header());
+    let base = ImportFacts::base(Scene::Play, Fact::Known(true));
+    match h.timed(&config, &base, &Cancel::new()) {
+        Ok(LuaTimed::Pending(p)) => {
+            assert_eq!(p.pending, FactId::JudgeClass);
+            assert_eq!(p.facts, deps(&[autoplay(true)]));
+            assert_eq!(p.dependencies, ["s.luaskin"]);
+        }
+        other => panic!("{other:?}"),
+    }
+    let known = play(Fact::Known(true), Fact::Known(Some(ChartRank::Rank(2))));
+    assert!(matches!(
+        h.timed(&config, &known, &Cancel::new()),
+        Ok(LuaTimed::Imported(_))
+    ));
+}

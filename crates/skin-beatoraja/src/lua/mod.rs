@@ -346,6 +346,15 @@ pub(crate) struct Pass {
     timings: Cell<Timings>,
 }
 
+/// What [`LuaHeader::timed`] gives: the stages' times of an import, or
+/// the pending result [`LuaHeader::import`] gives.
+#[cfg(feature = "dev-tools")]
+#[derive(Debug)]
+pub enum LuaTimed {
+    Imported(Timings),
+    Pending(LuaPending),
+}
+
 /// How long a configured pass's stages took, for the benchmarks: the
 /// VM's creation and the entry's run, the conversion, the VM's teardown,
 /// and the common import.
@@ -841,35 +850,40 @@ impl LuaHeader {
 
     /// Runs the configured pass with `config` and `facts` and imports its
     /// table, as [`Self::import`] does, and returns how long each stage
-    /// took.
+    /// took, or the pending result [`Self::import`] gives.
     ///
     /// # Errors
     ///
-    /// What [`Self::import`] refuses; a pending fact refuses with
-    /// [`LuaWhy::Error`].
+    /// What [`Self::import`] refuses.
     #[cfg(feature = "dev-tools")]
     pub fn timed(
         &self,
         config: &Config,
         facts: &ImportFacts,
         cancel: &Cancel,
-    ) -> Result<Timings, ImportError> {
-        let mut def = self
-            .configured(config, facts, cancel)
-            .0
-            .map_err(|s| match s {
-                Stop::Fault(e) => e,
-                Stop::Pending(_) => ImportError::Lua {
-                    at: None,
-                    why: LuaWhy::Error,
-                },
-            })?;
+    ) -> Result<LuaTimed, ImportError> {
+        let (def, counts, store, reads) = self.configured(config, facts, cancel);
+        let mut def = match def {
+            Ok(def) => def,
+            Err(Stop::Fault(e)) => return Err(e),
+            Err(Stop::Pending(pending)) => {
+                return Ok(LuaTimed::Pending(LuaPending {
+                    facts: FactDeps {
+                        scene: facts.scene,
+                        reads,
+                    },
+                    pending,
+                    dependencies: store.dependencies,
+                    usage: counts,
+                }));
+            }
+        };
         callback::admit(&def.arena)?;
         let mut t = LAST_TIMINGS.with(Cell::get);
         let start = std::time::Instant::now();
         std::hint::black_box(import(&mut def, &self.header, config)?);
         t.import = start.elapsed();
-        Ok(t)
+        Ok(LuaTimed::Imported(t))
     }
 
     /// The configured pass and the common import, with the candidate's
