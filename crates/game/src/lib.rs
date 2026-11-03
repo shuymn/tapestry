@@ -72,7 +72,10 @@ pub use keys::{
     Bound, CANCEL_KEY, KEEP_KEY, KeyConfigEnd, KeyConfigFlow, KeyConfigs, KeyScreen, LEARN_TIME,
     LearntRange, Press, ROLES, Refusal, SETTLE_TIME, capture_keys, capture_keys_within,
 };
-pub use live::{Closing, InputWaitError, Leave, LiveError, Opening, Rearm, Rig};
+pub use live::{
+    CLOSE_FLOOR, Closing, ClosingEnd, InputWaitError, Leave, LiveError, Opening, Rearm, Rig,
+    closing_deadline, closing_time,
+};
 pub use logic::{
     AbortCause, Advance, EventSink, Logic, LogicConfig, LogicError, Record, SourceRead,
 };
@@ -118,9 +121,9 @@ pub use rules_toml::{
 pub use runner::{HANDOFF_WAKES, RunOutcome, Runner};
 pub use save::{LocalRecords, RecordRef, RecordSink, SAVE_ATTEMPTS, SaveError, write_atomic};
 pub use session::{
-    AutoKeySounds, ChartSource, Command, GateStorage, Loaded, MenuCommand, Parts, PlayEnd,
-    PlayOutcome, PlayPlan, PlayReport, PlayScript, PlayStart, RECORDING_MEMORY, Reservation,
-    SMALL_PARTS_BYTES, SYSTEM_CONTROL_INPUTS, Session, SessionConfig, SessionError,
+    AutoKeySounds, ChartSource, ClosingReport, Command, GateStorage, Loaded, MenuCommand, Parts,
+    PlayEnd, PlayOutcome, PlayPlan, PlayReport, PlayScript, PlayStart, RECORDING_MEMORY,
+    Reservation, SMALL_PARTS_BYTES, SYSTEM_CONTROL_INPUTS, Session, SessionConfig, SessionError,
     SessionPlayError, Settings, VIEW_NOTE_COPIES, wake_policy,
 };
 pub use settings::{

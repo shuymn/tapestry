@@ -1356,7 +1356,7 @@ fn quit_shows_the_result_close_ends_the_run() {
     let acts = vec![
         (0, Act::Choose(0)),
         (1_500, Act::Quit),
-        (100, Act::Back),
+        (1_100, Act::Back),
         (100, Act::Choose(1)),
         (1_500, Act::Close),
         // Never reached: the run has ended.
@@ -1401,7 +1401,7 @@ fn quit_in_the_tail_skips_to_the_result() {
     let acts = vec![
         (0, Act::Choose(0)),
         (IN_THE_TAIL, Act::Quit),
-        (500, Act::Quit),
+        (1_500, Act::Quit),
         (500, Act::Choose(1)),
         (6_000, Act::Close),
     ];
@@ -1441,7 +1441,7 @@ fn quit_before_completion_leaves_or_shows_the_result() {
         let mut acts = vec![(0, Act::Choose(0)), (at, Act::Quit)];
         let mut seen = vec![Seen::Select, Seen::Load(0)];
         if result {
-            acts.push((100, Act::Back));
+            acts.push((1_100, Act::Back));
             seen.push(Seen::Shown(1));
         }
         acts.extend([(100, Act::Choose(1)), (4_000, Act::Close)]);
@@ -1504,7 +1504,7 @@ fn autoplay_quit_in_the_tail_skips_to_the_result() {
     let acts = vec![
         (0, Act::Choose(0)),
         (IN_THE_TAIL, Act::Quit),
-        (500, Act::Quit),
+        (1_500, Act::Quit),
         (100, Act::Close),
     ];
     let (rig, _, ran) = run(Refusal::Missing, acts, |r| {
@@ -2525,7 +2525,7 @@ fn practice_screen_repeats_and_quits() {
     acts.push((10, Act::Page(PracticeInput::Confirm)));
     // Round 1 runs about 11 s at 75 %: the quit falls inside round 2.
     acts.push((14_000, Act::Quit));
-    acts.push((500, Act::Back));
+    acts.push((1_500, Act::Back));
     acts.push((500, Act::Page(PracticeInput::Back)));
     acts.push((500, Act::Close));
     let (rig, events, ran) = run(Refusal::Missing, acts, |_| {});
@@ -2641,10 +2641,10 @@ fn start_always_loads_the_current_chart() {
     acts.extend([
         (10, Act::Page(Confirm)),
         (3_000, Act::Quit),
-        (100, Act::Back),
+        (1_100, Act::Back),
         (500, Act::Page(Confirm)),
         (3_000, Act::Quit),
-        (100, Act::Back),
+        (1_100, Act::Back),
         (500, Act::Page(Back)),
         (500, Act::Practice(1)),
     ]);
@@ -2652,7 +2652,7 @@ fn start_always_loads_the_current_chart() {
     acts.extend([
         (10, Act::Page(Confirm)),
         (3_000, Act::Quit),
-        (100, Act::Back),
+        (1_100, Act::Back),
         (500, Act::Page(Back)),
         (500, Act::Close),
     ]);
@@ -3058,7 +3058,7 @@ fn the_first_round_prepares_with_the_preset_edited_on_the_practice_page() {
     acts.extend([
         (500, Act::Page(PracticeInput::Confirm)),
         (3_000, Act::Quit),
-        (500, Act::Quit),
+        (1_500, Act::Quit),
         (500, Act::Page(PracticeInput::Confirm)),
         (3_000, Act::Quit),
         (500, Act::Close),
@@ -3199,7 +3199,7 @@ fn start_again() -> Vec<(i64, Act)> {
     vec![
         (500, Act::Page(PracticeInput::Confirm)),
         (3_000, Act::Quit),
-        (500, Act::Back),
+        (1_500, Act::Back),
         (500, Act::Page(PracticeInput::Back)),
         (500, Act::Close),
     ]
@@ -3272,7 +3272,7 @@ fn a_reset_stops_the_retry() {
 fn a_sync_only_edit_keeps_the_repeat() {
     let after = vec![
         (14_000, Act::Quit),
-        (500, Act::Back),
+        (1_500, Act::Back),
         (500, Act::Page(PracticeInput::Back)),
         (500, Act::Close),
     ];

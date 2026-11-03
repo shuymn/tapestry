@@ -150,6 +150,7 @@ pub fn view(combo: u32, ex_score: u32) -> PlayView {
         input: eval::InputFacts::NONE,
         complete: false,
         playing: true,
+        closing: None,
         events: 31,
     }
 }

@@ -27,8 +27,23 @@
 //!   every wait, so it is never lost to a transition.
 //! - The quit key in a play's READY state, before its chart starts (chart
 //!   time 0, a round's section start), leaves the chart without a result;
-//!   from there until the play is complete it aborts the play, whose
-//!   result shows, ended midway, as for any other abort.
+//!   from there until the play is complete it aborts the play into
+//!   Closing, whose end shows the result, ended midway (in autoplay it
+//!   aborts the play, whose result shows at once).
+//! - Closing (design.md "Play Lifecycle", Closing): the displayed survival
+//!   gauge's failure under `on_failure = "close"`, once the attempt is
+//!   committed, or the quit key during play, freezes evaluation at the
+//!   play's last finalized watermark, cuts the chart audio and seals
+//!   recording ([`Rig::abort_close`]); the play then waits on its clock
+//!   for [`closing_time`] from Closing's start ([`run_closing`]) before it
+//!   is saved and its result shows. Every command taken from the
+//!   admission to the end of Closing is Closing's ([`Rig::take_closing`]):
+//!   a quit does nothing, a retry ends it and retries with no result, a
+//!   suspend or a thread's or the screen's failure cuts it to the result,
+//!   and closing the window cuts it and ends the run. A displayed failure
+//!   before a gated attempt is seen committed is retained: scoring freezes
+//!   ([`Logic::hold`]) until the gate settles, and the failure acts only
+//!   on the commit, at its watermark.
 //! - An aborted play closes recording and only then drains what is left in the
 //!   source queues into its record, unevaluated, so input that arrived after
 //!   the abort is kept (design.md "Play Lifecycle").
@@ -71,7 +86,8 @@ use crate::render::RenderSide;
 use crate::restore::RestoreError;
 use crate::result_screen::ResultScreen;
 use crate::session::{
-    Command, Loaded, MenuCommand, PlayEnd, PlayOutcome, PlayReport, RECORDING_MEMORY, Settings,
+    ClosingReport, Command, Loaded, MenuCommand, PlayEnd, PlayOutcome, PlayReport,
+    RECORDING_MEMORY, Settings,
 };
 use crate::sound::{AudioQueue, audio_link_at};
 use crate::{GateStorage, HistoryRecorder};
@@ -159,6 +175,20 @@ pub trait Rig {
     /// A pending retry or suspend (or quit, for rigs without a latch),
     /// taken.
     fn take(&mut self) -> Option<Command>;
+    /// A pending command taken during Closing (design.md "Play
+    /// Lifecycle", Closing), where a quit does nothing: a rig whose
+    /// controls let a pending quit drop a pending retry keeps the retry
+    /// here. By default, [`take`](Self::take).
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn take_closing(&mut self) -> Option<Command> {
+        self.take()
+    }
+    /// The play skin's declared Closing duration, if it declares one
+    /// ([`closing_time`] applies the floor). `None` by default.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn declared_close(&self) -> Option<TimeUs> {
+        None
+    }
     /// A pending result-screen command, taken. By default the in-play
     /// controls stand in for it: retry retries, quit goes back, and a
     /// suspend is ignored.
@@ -334,10 +364,10 @@ pub trait Rig {
         self.close()
     }
     /// The end of either handoff ([`hand_off`](Self::hand_off) after the
-    /// tail, [`abort_close`](Self::abort_close) after the play's last
-    /// presentation): the sources close, nothing more is pushed into the
-    /// play's queues, and the input side's console lines for the play are
-    /// printed. By default, nothing.
+    /// tail, [`abort_close`](Self::abort_close) after Closing): the
+    /// sources close, nothing more is pushed into the play's queues, and
+    /// the input side's console lines for the play are printed. By
+    /// default, nothing.
     ///
     /// # Errors
     ///
@@ -611,6 +641,87 @@ impl TailAction {
     }
 }
 
+/// The shortest Closing (design.md "Play Lifecycle", Closing): the same
+/// 1 s as the loading state's minimum.
+pub const CLOSE_FLOOR: TimeUs = TimeUs(1_000_000);
+
+/// How long Closing lasts for a skin that declares `declared`: at least
+/// [`CLOSE_FLOOR`]; a missing, zero or negative declaration gives the
+/// floor, and nothing caps it.
+#[must_use]
+#[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+pub const fn closing_time(declared: Option<TimeUs>) -> TimeUs {
+    match declared {
+        Some(d) if d.0 > CLOSE_FLOOR.0 => d,
+        _ => CLOSE_FLOOR,
+    }
+}
+
+/// Where a Closing started at play time `start` with `declared` runs out:
+/// [`closing_time`] after it, saturating.
+#[must_use]
+#[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+pub const fn closing_deadline(start: TimeUs, declared: Option<TimeUs>) -> TimeUs {
+    TimeUs(start.0.saturating_add(closing_time(declared).0))
+}
+
+/// How a play's Closing ended (design.md "Play Lifecycle", Closing). The
+/// play's own cause never changes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClosingEnd {
+    /// Its time ran out: the play is saved and its result shows.
+    RanOut,
+    /// A retry ended it: the play is saved and retried, with no result.
+    Retry,
+    /// This cut it short: closing the window (`Quit`), a suspend, or the
+    /// input thread's, the audio output's or the screen's failure.
+    Cut(AbortCause),
+}
+
+/// A play's Closing on its play clock: where it started and runs out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ClosingStage {
+    /// Where it started, the `failed` timer's start.
+    start: TimeUs,
+    /// Where it runs out.
+    deadline: TimeUs,
+}
+
+impl ClosingStage {
+    /// The Closing that starts at play time `start`, for a skin that
+    /// declares `declared`.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    const fn begin(start: TimeUs, declared: Option<TimeUs>) -> Self {
+        Self {
+            start,
+            deadline: closing_deadline(start, declared),
+        }
+    }
+
+    /// Whether it has run out at play time `now`.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    const fn over(self, now: TimeUs) -> bool {
+        now.0 >= self.deadline.0
+    }
+}
+
+/// What Closing has latched: a retry or a suspend taken since its
+/// admission, the play's last steps' suspend included.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ClosingLatches {
+    retry: bool,
+    suspend: bool,
+}
+
+/// What admits a play to Closing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Admit {
+    /// The displayed survival gauge failed under `on_failure = "close"`.
+    Failure,
+    /// The quit key during play.
+    Quit,
+}
+
 /// How the plays of a chart are left: closing the window ends the run,
 /// anything else leaves the chart; a known input-thread failure ends the
 /// run with its cause.
@@ -628,8 +739,9 @@ fn leave<R: Rig>(rig: &R) -> Result<Leave, LiveError<R::ScreenError>> {
 /// READY state, shows its result, which waits for a [`MenuCommand`]. The
 /// quit key before the chart starts ([`Loaded::starts_at`]) leaves the
 /// chart ([`Leave::Back`]); from then until the play is complete it aborts
-/// the play, whose result shows, ended midway; after it, it skips the tail
-/// to the result. Closing the window ends the run ([`Leave::Quit`]).
+/// the play into Closing, whose end shows the result, ended midway (in
+/// autoplay, at once); after it, it skips the tail to the result. Closing
+/// the window ends the run ([`Leave::Quit`]).
 ///
 /// # Errors
 ///
@@ -656,6 +768,7 @@ pub fn run_chart<R: Rig>(
         }
         if report.end == PlayEnd::Aborted(AbortCause::Retry)
             || report.tail_cut == Some(AbortCause::Retry)
+            || report.closing.is_some_and(|c| c.end == ClosingEnd::Retry)
             || next == Some(Command::Retry)
         {
             continue;
@@ -972,6 +1085,14 @@ fn play_and_next<R: Rig>(
     let mut suspended = false;
     // The play time of the last step: where an abort came.
     let mut last;
+    // Whether the step's ending was a taken quit key, not the window's
+    // close: only it admits Closing.
+    let mut key_quit = false;
+    // A displayed survival failure retained before a gated attempt is seen
+    // committed: scoring freezes, and it acts on the commit.
+    let mut pending = false;
+    // The displayed survival failure stopped the committed play.
+    let mut failed_closed = false;
 
     let starts_at = loaded.starts_at();
     let end = loop {
@@ -988,6 +1109,7 @@ fn play_and_next<R: Rig>(
         let ending = if rig.quitting() {
             Some(AbortCause::Quit)
         } else if let Some(c) = command {
+            key_quit = c == Command::Quit;
             Some(c.cause())
         } else if let Some(e) = rig.input_failure() {
             // Before focus loss: the input thread publishes the focus gate
@@ -1026,8 +1148,14 @@ fn play_and_next<R: Rig>(
             };
             match step {
                 Step::Go => {}
-                Step::Wait => continue,
+                // A cancellation or a rearm discards a retained failure
+                // with the candidate's evaluation.
+                Step::Wait => {
+                    pending = false;
+                    continue;
+                }
                 Step::Rearmed(o) => {
+                    pending = false;
                     origin = o;
                     // The cancelled candidate's events are discarded whole.
                     live.clear();
@@ -1062,6 +1190,25 @@ fn play_and_next<R: Rig>(
             logic.abort(cause);
         }
         last = now;
+        // A retained failure freezes scoring: the step takes the input
+        // with its checks and advances nothing, and once the gate shows
+        // the transport committed, the failure acts at its watermark,
+        // after those checks and before any advance.
+        if pending {
+            let held = logic.hold();
+            rig.stepped(held.aborted.is_some());
+            if let Some(cause) = held.aborted {
+                rig.cancel_audio();
+                break PlayEnd::Aborted(cause);
+            }
+            if committed {
+                logic.abort(AbortCause::GaugeFailed);
+                rig.cancel_audio();
+                failed_closed = true;
+                break PlayEnd::Aborted(AbortCause::GaugeFailed);
+            }
+            continue;
+        }
         let advance = logic.advance_to(now);
         live.extend_from_slice(logic.events());
         let delivered = TimeUs(rig.now().0 - origin.0);
@@ -1083,10 +1230,16 @@ fn play_and_next<R: Rig>(
             rig.cancel_audio();
             break PlayEnd::Aborted(AbortCause::OutputFailed);
         }
-        if loaded.ends_play(logic.gauges()) {
-            logic.abort(AbortCause::GaugeFailed);
-            rig.cancel_audio();
-            break PlayEnd::Aborted(AbortCause::GaugeFailed);
+        // The displayed survival failure closes a committed attempt here,
+        // after the failing advance; before the commit it is retained.
+        if loaded.closes_on(logic.gauges()) {
+            if committed {
+                logic.abort(AbortCause::GaugeFailed);
+                rig.cancel_audio();
+                failed_closed = true;
+                break PlayEnd::Aborted(AbortCause::GaugeFailed);
+            }
+            pending = true;
         }
     };
     // Every way out of a gated attempt not yet seen committed, whatever
@@ -1102,31 +1255,71 @@ fn play_and_next<R: Rig>(
             rig.cancel_candidate(generation);
         }
     }
+    // Admission to Closing, once the gate settled: a played attempt whose
+    // displayed survival gauge failed, or the quit key during its play (at
+    // or after the chart's start, outside autoplay). Closing the window
+    // vetoes it for either cause.
+    let played = gate.as_ref().is_none_or(|g| g.committed);
+    let admit = if rig.quitting() || !played {
+        None
+    } else if failed_closed {
+        Some(Admit::Failure)
+    } else if end == PlayEnd::Aborted(AbortCause::Quit)
+        && key_quit
+        && loaded.config().autoplay.is_none()
+        && last >= starts_at
+    {
+        Some(Admit::Quit)
+    } else {
+        None
+    };
     // Stopped, completed or failed: no frame from here on is playing, the
-    // tail's and the ring-out's included.
-    logic.stop_playing();
+    // tail's, the ring-out's and Closing's included. Closing starts at its
+    // publication, on the play clock.
+    let closing_at = admit.map(|_| TimeUs(rig.now().0 - origin.0));
+    match closing_at {
+        Some(at) => logic.enter_closing(at),
+        None => logic.stop_playing(),
+    }
 
     // Recording closes at the end of evaluation (design.md "Play Lifecycle");
     // an aborted play then takes what reached its queues after the abort,
-    // and a completed one hands its sources to the tail's feedback.
+    // and a completed one hands its sources to the tail's feedback. A play
+    // in Closing seals it without allocating, its sources closed once
+    // Closing ends.
     // A failed close leaves the closing unknown, and the record keeps what
     // the play already took: what reached the queues after its last step is
     // lost, and the record is marked incomplete (input failed).
     let handed_off = end == PlayEnd::Completed;
     let closed = if handed_off {
         rig.hand_off()
+    } else if admit.is_some() {
+        rig.abort_close()
     } else {
         rig.close()
     };
     let handed_off = handed_off && closed.is_ok();
+    let sealed = admit.is_some() && closed.is_ok();
     // A command that arrived during the close handshake is kept for what
     // follows: it cuts the tail, or, after an abort, it is the run's next
     // step. A suspend there still happened while recording was open.
+    // In Closing it is Closing's: a quit does nothing, a retry ends it.
     let mut carried = None;
-    while let Some(c) = rig.take() {
-        suspended |= c == Command::Suspend;
-        carried = carried.or(Some(c));
+    let mut latches = ClosingLatches::default();
+    if admit.is_some() {
+        while let Some(c) = rig.take_closing() {
+            suspended |= c == Command::Suspend;
+            latches.retry |= c == Command::Retry;
+        }
+    } else {
+        while let Some(c) = rig.take() {
+            suspended |= c == Command::Suspend;
+            carried = carried.or(Some(c));
+        }
     }
+    // A suspend latched in the play's last steps or at the handshake cuts
+    // Closing at once.
+    latches.suspend = suspended;
     // A gated attempt still waiting after a cancellation keeps what reached
     // the queues since in its cancelled opening.
     let waiting = gate.as_ref().is_some_and(|g| g.waiting);
@@ -1193,9 +1386,29 @@ fn play_and_next<R: Rig>(
         ),
         None => TailEnd::NoTail,
     };
-    // The feedback stopped with the tail: the sources close now, so no
-    // input reaches the result or the next attempt.
-    if handed_off && let Err(e) = rig.end_feedback() {
+    // Closing, once its recording is sealed and its record's flags are
+    // known: nothing it takes changes them.
+    let closing_report = closing_at.map(|start| {
+        let stage = ClosingStage::begin(start, rig.declared_close());
+        let end = run_closing(
+            rig,
+            stage,
+            origin,
+            &mut latches,
+            &mut input_error,
+            &mut output_error,
+        );
+        ClosingReport {
+            started_at: stage.start,
+            ended_at: TimeUs(rig.now().0 - origin.0),
+            end,
+        }
+    });
+    // The feedback stopped with the tail, and Closing ended: the sources
+    // close now, so no input reaches the result or the next attempt.
+    if (handed_off || sealed)
+        && let Err(e) = rig.end_feedback()
+    {
         input_error = input_error.or(Some(e));
     }
     // As the completion froze them: the feedback recorded nothing and
@@ -1220,6 +1433,7 @@ fn play_and_next<R: Rig>(
         incomplete,
         played: capture.as_ref().is_none_or(|c| c.played),
         history: capture.map(|c| c.history),
+        closing: closing_report,
     });
     // A completed play's tail took the carried command.
     let next = carried.filter(|_| end != PlayEnd::Completed);
@@ -1228,8 +1442,9 @@ fn play_and_next<R: Rig>(
     // result; from its start on, the aborted play's result shows, and a
     // quit that arrived as recording closed is taken with the play. A
     // gated attempt quit before its commit leaves it the same way.
+    // A play admitted to Closing always shows its result.
     let quit = end == PlayEnd::Aborted(AbortCause::Quit) || next == Some(Command::Quit);
-    let counted_down = quit && (!report.played() || last < loaded.starts_at());
+    let counted_down = admit.is_none() && quit && (!report.played() || last < starts_at);
     let mut next = next.filter(|&c| c != Command::Quit);
     let mut next_round = stage.is_some_and(|s| s.repeats) && tail == TailEnd::RanOut;
     // Commands still pending once the play is over, pressed as it ended or
@@ -1613,4 +1828,65 @@ fn run_tail<R: Rig>(
         }
     }
     TailEnd::RanOut
+}
+
+/// Runs a play's Closing until it ends (design.md "Play Lifecycle",
+/// Closing): on entry and after every wait, every pending command is taken
+/// as Closing's ([`Rig::take_closing`]: a quit does nothing, a retry and a
+/// suspend are latched), the input thread's and the audio output's
+/// failures are latched into `input_error` and `output_error` whichever
+/// way it ends, and then, in this order: closing the window, a retry, an
+/// input failure, an audio failure, a screen failure, a suspend, and its
+/// time running out on the play clock end it. Focus loss and removal of
+/// the last device change nothing. Nothing is evaluated, recorded or
+/// allocated.
+#[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+fn run_closing<R: Rig>(
+    rig: &mut R,
+    stage: ClosingStage,
+    origin: TimeUs,
+    latches: &mut ClosingLatches,
+    input_error: &mut Option<InputWaitError>,
+    output_error: &mut Option<OutputError>,
+) -> ClosingEnd {
+    loop {
+        while let Some(c) = rig.take_closing() {
+            match c {
+                Command::Quit => {}
+                Command::Retry => latches.retry = true,
+                Command::Suspend => latches.suspend = true,
+            }
+        }
+        let input = rig.input_failure();
+        if let Some(e) = input {
+            *input_error = input_error.or(Some(e));
+        }
+        let audio = rig.audio_failure();
+        if let Some(e) = audio {
+            *output_error = output_error.or(Some(e));
+        }
+        let screen = rig.screen_failed();
+        let now = TimeUs(rig.now().0 - origin.0);
+        let end = if rig.quitting() {
+            Some(ClosingEnd::Cut(AbortCause::Quit))
+        } else if latches.retry {
+            Some(ClosingEnd::Retry)
+        } else if input.is_some() {
+            Some(ClosingEnd::Cut(AbortCause::InputFailed))
+        } else if audio.is_some() {
+            Some(ClosingEnd::Cut(AbortCause::OutputFailed))
+        } else if screen {
+            Some(ClosingEnd::Cut(AbortCause::ScreenFailed))
+        } else if latches.suspend {
+            Some(ClosingEnd::Cut(AbortCause::Suspend))
+        } else if stage.over(now) {
+            Some(ClosingEnd::RanOut)
+        } else {
+            None
+        };
+        if let Some(end) = end {
+            return end;
+        }
+        rig.wait();
+    }
 }

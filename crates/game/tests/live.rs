@@ -237,6 +237,22 @@ struct Fake {
     generation: u32,
     /// The bytes a gated play's exchange with the input side keeps.
     exchange: usize,
+    /// The play skin's declared Closing duration.
+    declared_close: Option<TimeUs>,
+    /// Each abort close asked, with the clock time, and the view's
+    /// Closing start and phase it found published.
+    abort_closes: Vec<(i64, Option<TimeUs>, bool)>,
+    /// Every abort close fails with this; an ordinary close still
+    /// succeeds.
+    abort_close_fails: Option<InputWaitError>,
+    /// Final closes asked (`end_feedback`).
+    end_feedbacks: usize,
+    /// Each command taken as Closing's, with its clock time.
+    closing_taken: Vec<(i64, Command)>,
+    /// The audio output fails from this clock time on.
+    output_fails_at: i64,
+    /// The last device is gone from this clock time on.
+    disconnected_at: i64,
 }
 
 impl Fake {
@@ -306,6 +322,13 @@ impl Fake {
             lifetime: false,
             generation: 0,
             exchange: 0,
+            declared_close: None,
+            abort_closes: Vec::new(),
+            abort_close_fails: None,
+            end_feedbacks: 0,
+            closing_taken: Vec::new(),
+            output_fails_at: i64::MAX,
+            disconnected_at: i64::MAX,
         }
     }
 
@@ -539,11 +562,42 @@ impl Rig for Fake {
     }
 
     fn connected(&self) -> bool {
-        true
+        self.clock.now().0 < self.disconnected_at
     }
 
     fn audio_failure(&self) -> Option<audio::OutputError> {
-        self.output_failed.then_some(audio::OutputError::DeviceLost)
+        (self.output_failed || self.clock.now().0 >= self.output_fails_at)
+            .then_some(audio::OutputError::DeviceLost)
+    }
+
+    fn declared_close(&self) -> Option<TimeUs> {
+        self.declared_close
+    }
+
+    fn take_closing(&mut self) -> Option<Command> {
+        let c = self.take()?;
+        self.closing_taken.push((self.clock.now().0, c));
+        Some(c)
+    }
+
+    fn abort_close(&mut self) -> Result<Closing, InputWaitError> {
+        let (closing, playing) = self
+            .side
+            .as_mut()
+            .map_or((None, false), |s| (s.view().closing, s.view().playing));
+        self.abort_closes
+            .push((self.clock.now().0, closing, playing));
+        if let Some(e) = self.abort_close_fails {
+            // As on a poisoned link: the failure sticks.
+            self.failed = Some(e);
+            return Err(e);
+        }
+        self.close()
+    }
+
+    fn end_feedback(&mut self) -> Result<(), InputWaitError> {
+        self.end_feedbacks += 1;
+        Ok(())
     }
 
     fn screen_failed(&self) -> bool {
@@ -2624,12 +2678,12 @@ fn every_state_and_event_of_a_play() {
 
 /// The chart starts at chart time 0 (clock 8.3 s): the quit key in the
 /// step before it leaves the chart with no result, and from the step at it
-/// on aborts the play and shows its result in that step, ended midway and
-/// never cleared, until the back at 15 s. Both plays are saved, ended
-/// midway.
+/// on aborts the play into Closing, whose end 1 s later shows its result,
+/// ended midway and never cleared, until the back at 15 s. Both plays are
+/// saved, ended midway.
 #[test]
 fn the_quit_key_shows_the_result_from_the_charts_start() {
-    for (at, shown) in [(8_299_000, None), (8_300_000, Some(8_300_000))] {
+    for (at, shown) in [(8_299_000, None), (8_300_000, Some(9_300_000))] {
         let dir = tempfile::tempdir().unwrap();
         let mut loaded = loaded(dir.path());
         let items = vec![key(9_303_000, Z, 1), key(9_353_000, Z, 0)];
@@ -3082,7 +3136,7 @@ impl game::SessionPolicy for Strict {
         game::GaugeIndex(1)
     }
     fn on_survival_failure(&self) -> game::FailureAction {
-        game::FailureAction::EndPlay
+        game::FailureAction::Close
     }
 }
 

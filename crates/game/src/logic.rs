@@ -228,6 +228,8 @@ pub struct Logic<'a, R = SourceReader> {
     origin: Option<TimeUs>,
     /// The play phase the next publication carries ([`PlayView::playing`]).
     playing: bool,
+    /// Where the play entered Closing ([`PlayView::closing`]).
+    closing: Option<TimeUs>,
     finalized: Option<TimeUs>,
     overflowed: bool,
     aborted: Option<AbortCause>,
@@ -321,6 +323,7 @@ impl<'a, R: SourceRead> Logic<'a, R> {
             input: *evaluator.input(),
             complete: false,
             playing: false,
+            closing: None,
             events: 0,
         };
         let (render, view, side) = render_link(config.effects, &initial);
@@ -347,6 +350,7 @@ impl<'a, R: SourceRead> Logic<'a, R> {
             generation: 0,
             origin: None,
             playing: false,
+            closing: None,
             finalized: None,
             overflowed: false,
             aborted: None,
@@ -372,6 +376,34 @@ impl<'a, R: SourceRead> Logic<'a, R> {
         if self.aborted.is_some() {
             return self.idle();
         }
+        match self.take_inputs() {
+            Some(w) => self.advance_through(now, w),
+            None => self.idle(),
+        }
+    }
+
+    /// A frozen step (design.md "Play Lifecycle": a displayed failure
+    /// retained before the transport commits): the input is taken as
+    /// [`advance_to`](Self::advance_to) takes it, steps (1) to (3), into
+    /// the staging and the record within the budget, with the same checks
+    /// (no source left open, an input over the budget or its source's
+    /// staging), which abort the play as there; nothing is merged,
+    /// evaluated, finalized or published, so the watermark and the view
+    /// stay where the failing advance left them. After an abort nothing is
+    /// taken.
+    pub fn hold(&mut self) -> Advance {
+        self.out.clear();
+        if self.aborted.is_none() {
+            let _ = self.take_inputs();
+        }
+        self.idle()
+    }
+
+    /// [`advance_to`](Self::advance_to)'s steps (1) to (3): the global
+    /// watermark once each source's guaranteed prefix is staged and
+    /// recorded; `None` when the play was aborted instead (no source left
+    /// open, or an input over the budget or its source's staging).
+    fn take_inputs(&mut self) -> Option<TimeUs> {
         // (1) Every watermark first.
         let open = self.read_publications();
         // (3), taken here since it depends only on the publications: the
@@ -380,7 +412,7 @@ impl<'a, R: SourceRead> Logic<'a, R> {
         // final watermark could finalize more.
         let Some(w) = watermark(&self.published, self.device).filter(|_| open) else {
             self.abort(AbortCause::LastSourceRemoved);
-            return self.idle();
+            return None;
         };
         // (2) Then each source's guaranteed prefix, within the budget.
         for (((s, r), p), staged) in self
@@ -422,8 +454,14 @@ impl<'a, R: SourceRead> Logic<'a, R> {
         }
         if self.overflowed {
             self.abort(AbortCause::Overflow);
-            return self.idle();
+            return None;
         }
+        Some(w)
+    }
+
+    /// [`advance_to`](Self::advance_to)'s steps (4) and (5), through the
+    /// global watermark `w`.
+    fn advance_through(&mut self, now: TimeUs, w: TimeUs) -> Advance {
         // (4) Merge through it; later events stay staged. Everything staged
         // was popped within the budget, so `merged` never grows.
         merge(&mut self.staged, self.device, w, &mut self.merged);
@@ -614,6 +652,18 @@ impl<'a, R: SourceRead> Logic<'a, R> {
         self.publish_view();
     }
 
+    /// The play entered Closing at play time `at` (design.md "Play
+    /// Lifecycle", Closing): publishes the view again with
+    /// [`PlayView::playing`] false and [`PlayView::closing`] at `at`, in
+    /// one view, so no later frame is drawn as playing and every one
+    /// draws Closing from `at`.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    pub fn enter_closing(&mut self, at: TimeUs) {
+        self.playing = false;
+        self.closing = Some(at);
+        self.publish_view();
+    }
+
     /// The events emitted by the last step.
     #[must_use]
     pub fn events(&self) -> &[JudgeEvent] {
@@ -678,6 +728,7 @@ impl<'a, R: SourceRead> Logic<'a, R> {
             input: *self.evaluator.input(),
             complete: self.evaluator.is_complete(),
             playing: self.playing,
+            closing: self.closing,
             events: self.emitted,
         }
     }
@@ -761,6 +812,7 @@ impl<'a, R: SourceRead> Logic<'a, R> {
         self.record.clear();
         self.emitted = 0;
         self.playing = false;
+        self.closing = None;
         self.finalized = None;
         self.overflowed = false;
         self.aborted = None;
@@ -816,6 +868,7 @@ impl<'a, R: SourceRead> Logic<'a, R> {
         v.input = *self.evaluator.input();
         v.complete = self.evaluator.is_complete();
         v.playing = self.playing;
+        v.closing = self.closing;
         v.events = self.emitted;
         self.view.publish();
     }

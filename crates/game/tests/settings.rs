@@ -5,10 +5,10 @@ use std::fs;
 use bms_model::{Lane, TimeUs};
 use eval::{AxisBinding, AxisMode, Binding, ControlId, ScratchSettings, SourceProfile};
 use game::{
-    Adjust, Chain, ControllerDevice, CoverSettings, DataRoot, DeviceSettings, HiSpeedReference,
-    HiSpeedSettings, KeyConfig, KeyError, LaneKey, LibrarySettings, LocalRecords, PlayerSettings,
-    PlayerSettingsError, RecordSink, Role, ScratchConfig, Settings, SettingsError, SpeedMode,
-    Tuning, load_settings, save_settings, write_atomic,
+    Adjust, Chain, ControllerDevice, CoverSettings, DataRoot, DeviceSettings, FailureAction,
+    HiSpeedReference, HiSpeedSettings, KeyConfig, KeyError, LaneKey, LibrarySettings, LocalRecords,
+    PlayerSettings, PlayerSettingsError, RecordSink, Role, ScratchConfig, Settings, SettingsError,
+    SpeedMode, Tuning, load_settings, save_settings, write_atomic,
 };
 use input::DeviceKind;
 use input::hid::AxisCap;
@@ -97,6 +97,7 @@ fn changed() -> Settings {
         player: PlayerSettings {
             preset: "wide".to_owned(),
             displayed_gauge: 1,
+            on_failure: FailureAction::PlayToEnd,
             hispeed: HiSpeedSettings {
                 mode: SpeedMode::Classic,
                 reference: HiSpeedReference::Maximum,

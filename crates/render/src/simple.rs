@@ -1270,6 +1270,7 @@ mod tests {
             input: eval::InputFacts::NONE,
             complete: false,
             playing: true,
+            closing: None,
             events: 0,
         }
     }
