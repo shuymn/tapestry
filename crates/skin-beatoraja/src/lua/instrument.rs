@@ -28,6 +28,10 @@ use super::syntax::{Ast, CHUNK_ENV, DeclKind, Form, TAG_PREFIX};
 /// candidate is refused.
 pub(crate) const MAX_ADDED_BYTES: usize = 1 << 24;
 
+/// The most bytes the wrapper adds to a chunk: its prefix (with the
+/// tagger's name) and its `end`.
+const WRAPPER_BYTES: usize = 128;
+
 /// How many constructors are rewritten, or edits copied, between two
 /// looks at the cancellation request.
 const CHECK_EVERY: usize = 4_096;
@@ -92,8 +96,17 @@ pub(crate) fn instrument(
     src: &[u8],
     ast: &Ast,
     file: u16,
+    budget: usize,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<Vec<u8>, Stop> {
+    // The bytes it may add: [`MAX_ADDED_BYTES`] a file, and what is left
+    // of the pass's rewritten-source allowance (`budget`) once the source
+    // itself and the wrapper are counted.
+    let cap = MAX_ADDED_BYTES.min(
+        budget
+            .checked_sub(src.len() + WRAPPER_BYTES)
+            .ok_or(Stop::Generated)?,
+    );
     let t = tagger(&ast.tag_names);
     let mut edits: Vec<Edit> = Vec::new();
     let mut added = 0_usize;
@@ -107,7 +120,7 @@ pub(crate) fn instrument(
             next_check = added.saturating_add(CHECK_BYTES);
         }
         let id = (u64::from(file) << 32) | u64::try_from(index).map_err(|_| Stop::Generated)?;
-        let room = MAX_ADDED_BYTES.saturating_sub(added);
+        let room = cap.saturating_sub(added);
         let reader = reader(src, ast, index, room).ok_or(Stop::Generated)?;
         let (start, open) = (f.start as usize, f.open as usize);
         let head = |text: String| -> Edit {
@@ -163,7 +176,7 @@ pub(crate) fn instrument(
             skip: 0,
             text: format!(",{reader}{close}"),
         });
-        if added > MAX_ADDED_BYTES {
+        if added > cap {
             return Err(Stop::Generated);
         }
     }
@@ -234,7 +247,8 @@ mod tests {
     fn run(src: &str) -> String {
         let mut n = 0;
         let ast = parse(src.as_bytes(), &mut n, &|| false).unwrap();
-        String::from_utf8(instrument(src.as_bytes(), &ast, 1, &|| false).unwrap()).unwrap()
+        String::from_utf8(instrument(src.as_bytes(), &ast, 1, usize::MAX >> 1, &|| false).unwrap())
+            .unwrap()
     }
 
     #[test]

@@ -310,6 +310,9 @@ pub(crate) struct Pass {
     /// that have constructors, in the order they were parsed.
     parsed: RefCell<HashMap<FileId, Chunk>>,
     files: RefCell<Vec<callback::ParsedFile>>,
+    /// The bytes of the rewritten chunks kept
+    /// ([`limits::MAX_REWRITTEN_BYTES`]).
+    rewritten: Cell<usize>,
     #[cfg(feature = "dev-tools")]
     timings: Cell<Timings>,
 }
@@ -355,6 +358,7 @@ impl Pass {
             bridge,
             parsed: RefCell::new(HashMap::new()),
             files: RefCell::new(Vec::new()),
+            rewritten: Cell::new(0),
             #[cfg(feature = "dev-tools")]
             timings: Cell::new(Timings::default()),
         }

@@ -537,6 +537,73 @@ fn a_table_met_again_is_not_scanned_again() {
     assert!(start.elapsed() < std::time::Duration::from_secs(20));
 }
 
+#[test]
+fn rewritten_chunks_share_one_allowance() {
+    // 80 modules, each a 16 KiB name read by the innermost of 60 nested
+    // functions: each of the 60 readers names it, about 960 KiB a module,
+    // 77 MiB kept in all, past the pass's 64 MiB.
+    let name = format!("n{}", "x".repeat(16 * 1024));
+    let mut module = format!("local {name} = 1\n");
+    for _ in 0..60 {
+        module.push_str("local function f() ");
+    }
+    module.push_str(&format!("return {name} "));
+    module.push_str(&"end ".repeat(60));
+    module.push_str("\nreturn 1");
+    let files: Vec<(String, String)> = (0..80)
+        .map(|k| (format!("m{k:03}.lua"), module.clone()))
+        .collect();
+    let loads: String = (0..80).map(|k| format!("require(\"m{k:03}\")\n")).collect();
+    let entry = format!(
+        "local s = {{ type = 0, name = \"t\", w = 1920, h = 1080 }}\n\
+         if not skin_config then return s end\n\
+         {loads}return s"
+    );
+    let named: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(n, t)| (n.as_str(), t.as_str()))
+        .collect();
+    assert_eq!(
+        why(run_with(&entry, &named, &Cancel::new())),
+        LuaWhy::Limit(LuaLimit::Generated)
+    );
+}
+
+#[test]
+fn a_lowering_sizes_only_what_it_reaches() {
+    // One number callback read by 16 000 destinations, with and without
+    // 60 000 closures nothing consumes: each lowering sizes its one
+    // instance, not a slot for every instance, so the unconsumed closures
+    // add their conversion and admission and nothing a lowering.
+    let skin_of = |extra: usize| {
+        let body = format!(
+            "s_extra = {{}}\n\
+             for i = 1, {extra} do s_extra[i] = function() return 0 end end\n\
+             skin.extra = s_extra\n\
+             skin.value = {{ {{ id = \"v\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, digit = 3,\n\
+               value = function() return ms.number(425) end }} }}"
+        );
+        let dst: String = (0..16_000)
+            .map(|k| {
+                format!(
+                    "{{ id = \"v\", dst = {{ {{ x = {}, y = 0, w = 6, h = 6 }} }} }},",
+                    k % 1_000
+                )
+            })
+            .collect();
+        skin(&body, &dst)
+    };
+    let time = |entry: &str| {
+        let start = std::time::Instant::now();
+        import(entry).unwrap();
+        start.elapsed()
+    };
+    let (none, many) = (skin_of(0), skin_of(60_000));
+    let base = time(&none);
+    let with = time(&many);
+    assert!(with < base * 3, "{base:?} without, {with:?} with");
+}
+
 /// The model fields read by the counts the oracle sets, by property id:
 /// written from the play schema's names, apart from the importer.
 const FIELDS: [(i64, &str); 9] = [

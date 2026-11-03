@@ -39,6 +39,7 @@ use mlua::{Function, Lua, MultiValue, Value};
 use skin_model::{FileId, MAX_PATH_BYTES, Root, RootError};
 
 use super::callback::ParsedFile;
+use super::limits::MAX_REWRITTEN_BYTES;
 use super::syntax::{self, Fail};
 use super::{LuaLimit, LuaWhy, Module, Pass, host, instrument, sandbox};
 use crate::error::{ImportError, InputLimit, Loc};
@@ -272,13 +273,21 @@ fn instrumented(
     let Ok(file) = u16::try_from(pass.files.borrow().len()) else {
         return Err(fail(0, LuaWhy::Limit(LuaLimit::AstNodes)));
     };
-    let code = match instrument::instrument(bytes, &ast, file, &|| pass.ledger.cancelled()) {
+    // The rewritten chunks the pass keeps share one allowance, checked
+    // before each is built.
+    let used = pass.rewritten.get();
+    let budget = usize::try_from(MAX_REWRITTEN_BYTES)
+        .unwrap_or(usize::MAX)
+        .saturating_sub(used);
+    let code = match instrument::instrument(bytes, &ast, file, budget, &|| pass.ledger.cancelled())
+    {
         Ok(code) => code,
         Err(instrument::Stop::Generated) => {
             return Err(fail(0, LuaWhy::Limit(LuaLimit::Generated)));
         }
         Err(instrument::Stop::Cancelled) => return Err(fail(0, LuaWhy::Cancelled)),
     };
+    pass.rewritten.set(used.saturating_add(code.len()));
     let code: Arc<[u8]> = Arc::from(code);
     pass.files.borrow_mut().push(ParsedFile { name, ast });
     pass.parsed

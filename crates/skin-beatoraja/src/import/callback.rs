@@ -144,8 +144,9 @@ struct Lower<'a> {
     cancelled: &'a dyn Fn() -> bool,
     critical: bool,
     out: Lowered,
-    /// Each instance's expanded size, once computed.
-    sizes: Vec<Option<u64>>,
+    /// Each instance's expanded size, once computed, for the instances
+    /// this lowering reaches.
+    sizes: std::collections::HashMap<u32, u64>,
     /// How deep the current walk is: every expression level, an inlined
     /// local's and a helper's included.
     depth: u32,
@@ -218,8 +219,8 @@ impl Lower<'_> {
     /// Instance `i`'s expanded size: its return expression's nodes, each
     /// local and helper read counted at its full size.
     fn size(&mut self, i: u32) -> R<u64> {
-        if let Some(Some(n)) = self.sizes.get(i as usize) {
-            return Ok(*n);
+        if let Some(&n) = self.sizes.get(&i) {
+            return Ok(n);
         }
         if (self.cancelled)() {
             return Err(Stop::Fatal(LuaWhy::Cancelled));
@@ -231,12 +232,8 @@ impl Lower<'_> {
             sized.push((d, n));
         }
         let n = self.size_expr(ast, inst, &sized, ret)?;
-        if self.sizes.len() <= i as usize {
-            self.sizes.resize(i as usize + 1, None);
-        }
-        if let Some(s) = self.sizes.get_mut(i as usize) {
-            *s = Some(n);
-        }
+        // Sparse: an entry for each instance this lowering sized.
+        self.sizes.insert(i, n);
         Ok(n)
     }
 
@@ -698,7 +695,7 @@ impl Cx<'_> {
                 deviates: false,
                 config: false,
             },
-            sizes: Vec::new(),
+            sizes: std::collections::HashMap::new(),
             depth: 0,
         };
         let part = |l: &Lower<'_>| match l.part(inst) {

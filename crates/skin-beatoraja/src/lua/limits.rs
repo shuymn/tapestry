@@ -82,6 +82,12 @@ pub const MAX_CAPTURES: u64 = 1 << 16;
 /// same captured values are classified once, so a function created in a
 /// loop costs its body once.
 pub const MAX_ANALYSIS_WORK: u64 = 1 << 24;
+/// The most bytes of rewritten chunks a configured pass keeps
+/// ([`super::instrument`]): each chunk's source and what the rewrite
+/// adds, checked before it is built. Twice the read allowance
+/// ([`MAX_INPUT_BYTES`](crate::limits::MAX_INPUT_BYTES)), so a pass can
+/// rewrite every byte it may read.
+pub const MAX_REWRITTEN_BYTES: u64 = 1 << 26;
 /// The most expression nodes the lowering of a candidate's callbacks
 /// expands helpers into, each helper call charged its expanded size
 /// before it is expanded.

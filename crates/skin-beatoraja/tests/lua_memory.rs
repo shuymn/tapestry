@@ -371,6 +371,40 @@ local function p0() return ms.number(110) > 0 end
         }),
     );
 
+    // 600 keys of 50 004 bytes, shared by 20 nested tables through their
+    // first key `a`: the keys the conversion keeps are charged as they
+    // are copied, so it stops near the decoded-bytes cap instead of
+    // copying the shared keys once a table.
+    let shared = folder(&configured(
+        "local p = \"x\"\nwhile #p < 50000 do p = p .. p end\np = string.sub(p, 1, 50000)\n\
+         local keys = {}\nfor i = 1, 600 do keys[i] = \"b\" .. p .. string.format(\"%03d\", i) end\n\
+         local t = {}\nlocal top = t\n\
+         for level = 1, 20 do\n\
+           for i = 1, 600 do t[keys[i]] = true end\n\
+           local next = {}\n\
+           t.a = next\n\
+           t = next\n\
+         end\n\
+         skin.extra = top",
+    ));
+    let p = record(
+        "shared_keys",
+        measure(|| {
+            let e = both(shared.path()).unwrap_err();
+            assert!(
+                matches!(
+                    e,
+                    ImportError::Input {
+                        limit: InputLimit::DecodedBytes,
+                        ..
+                    }
+                ),
+                "{e:?}"
+            );
+        }),
+    );
+    assert!(p < 160 << 20, "the shared keys were copied again: {p}");
+
     let worst = peaks.iter().map(|(_, p)| *p).max().unwrap_or(0);
     println!("worst peak {worst} bytes; converted table at most {MAX_CONVERTED_BYTES} bytes");
     assert!(worst <= BOUND, "{peaks:?}");

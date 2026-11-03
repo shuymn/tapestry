@@ -186,6 +186,7 @@ pub(super) fn convert(
         seen: HashMap::new(),
         path: Vec::new(),
         decoded: 0,
+        retained: 0,
     };
     let top = c.table(&t, None, 1)?;
     c.capture()?;
@@ -264,6 +265,8 @@ struct Conv<'a> {
     /// The tables on the path from the root, by address.
     path: Vec<usize>,
     decoded: u64,
+    /// Bytes kept beside the arena ([`Conv::retain`]).
+    retained: u64,
 }
 
 impl Conv<'_> {
@@ -644,10 +647,7 @@ impl Conv<'_> {
             let id = match self.analysis.option_names.get(&*k) {
                 Some(&id) => id,
                 None => {
-                    if self.decoded.saturating_add(len) > MAX_DECODED_BYTES {
-                        return Err(self.input(InputLimit::DecodedBytes));
-                    }
-                    self.decoded += len;
+                    self.retain(len)?;
                     let id = u32::try_from(self.analysis.option_names.len())
                         .map_err(|_| self.lua(LuaWhy::Limit(LuaLimit::Captures)))?;
                     self.analysis.option_names.insert(Box::from(&*k), id);
@@ -661,6 +661,18 @@ impl Conv<'_> {
         self.analysis.option_sets.push(set);
         self.option_set_of.insert(addr, i);
         Ok(i)
+    }
+
+    /// `len` bytes the conversion keeps beside the arena (an enumerated
+    /// table's keys, an interned option name), charged cumulatively before
+    /// they are copied against [`MAX_DECODED_BYTES`], apart from the
+    /// arena's own decoded bytes.
+    fn retain(&mut self, len: u64) -> Result<(), ImportError> {
+        if self.retained.saturating_add(len) > MAX_DECODED_BYTES {
+            return Err(self.input(InputLimit::DecodedBytes));
+        }
+        self.retained += len;
+        Ok(())
     }
 
     /// The refusal a walk's sentinel stands for.
@@ -678,7 +690,6 @@ impl Conv<'_> {
     fn enumerate(&mut self, t: &Table) -> Result<Shape, ImportError> {
         let (mut n, mut ints) = (0_usize, 0_usize);
         let (mut min, mut max) = (i64::MAX, i64::MIN);
-        let mut key_bytes = 0_u64;
         let mut keys: Vec<Vec<u8>> = Vec::new();
         for pair in t.pairs::<Value, Value>() {
             self.poll(n)?;
@@ -693,11 +704,9 @@ impl Conv<'_> {
                     if s.len() > MAX_STRING_BYTES {
                         return Err(self.input(InputLimit::StringBytes));
                     }
-                    key_bytes =
-                        key_bytes.saturating_add(u64::try_from(s.len()).unwrap_or(u64::MAX));
-                    if self.decoded.saturating_add(key_bytes) > MAX_DECODED_BYTES {
-                        return Err(self.input(InputLimit::DecodedBytes));
-                    }
+                    // A retained copy, charged cumulatively before it is
+                    // made: the arena's decoding of it is charged apart.
+                    self.retain(u64::try_from(s.len()).unwrap_or(u64::MAX))?;
                     keys.push(s.to_vec());
                 }
                 Value::Integer(i) => {
