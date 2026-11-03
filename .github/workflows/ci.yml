@@ -486,6 +486,9 @@ jobs:
           cache_save: ${{ github.ref == 'refs/heads/main' }}
       - name: Banned words
         run: mise exec -- cargo xtask banned-words --all
+      # Each allocation guard also runs in a release step above.
+      - name: Allocation tests in release steps
+        run: mise exec -- cargo xtask check-alloc-tests
       - name: actionlint
         run: mise exec -- actionlint
       - name: shellcheck
