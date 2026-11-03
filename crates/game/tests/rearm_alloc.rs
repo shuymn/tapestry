@@ -53,6 +53,7 @@ fn repeated_rearms_allocate_nothing_and_hold_memory_flat() {
         controls: vec![(TapControl::Key(Q), 0)],
         latched: 1,
         wrap: None,
+        ..input::AdjustmentBindings::default()
     })
     .unwrap();
     tap.set_active(true);

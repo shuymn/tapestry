@@ -198,14 +198,15 @@ fn the_controller_binds_buttons_and_the_scratch_directions_among_its_own() {
 
 #[test]
 fn the_scratch_axis_signs_its_movement_and_reversal_flips_it() {
-    let quantum = AxisQuantum::wrapping(256).unwrap();
+    let wrapping = AxisQuantum::wrapping(256).unwrap();
+    let configured = AxisQuantum::per_step(5).unwrap();
     for reversed in [false, true] {
         let config = AdjustmentConfig {
             reversed,
             ..AdjustmentConfig::default()
         };
         let plan = config
-            .plan(&with_controller(), Some(quantum), Some(512))
+            .plan(&with_controller(), Some(configured), Some(512))
             .unwrap();
         assert_eq!(plan.bindings.wrap, Some(512));
         let axis = plan.axis().unwrap();
@@ -216,10 +217,10 @@ fn the_scratch_axis_signs_its_movement_and_reversal_flips_it() {
             event: TapEvent::Axis {
                 control: axis,
                 delta: 7,
+                revolution: 256,
             },
         };
-        assert_eq!(
-            plan.observation(&o),
+        let stepped = |quantum| {
             Some(Observation {
                 time: TimeUs(5),
                 seq: 3,
@@ -229,21 +230,46 @@ fn the_scratch_axis_signs_its_movement_and_reversal_flips_it() {
                     quantum,
                 },
             })
-        );
+        };
+        // A wrapping axis steps by the revolution the packet was counted
+        // on, any other by the configured quantum.
+        assert_eq!(plan.observation(&o), stepped(wrapping));
+        let relative = TapObservation {
+            event: TapEvent::Axis {
+                control: axis,
+                delta: 7,
+                revolution: 0,
+            },
+            ..o
+        };
+        assert_eq!(plan.observation(&relative), stepped(configured));
         let other = TapObservation {
             event: TapEvent::Axis {
                 control: axis + 1,
                 delta: 7,
+                revolution: 256,
             },
             ..o
         };
         assert_eq!(plan.observation(&other), None);
     }
-    // Without a quantum the axis is not tapped.
+    // Without a configured quantum a wrapping axis still steps; any other
+    // does not.
     let plan = AdjustmentConfig::default()
         .plan(&with_controller(), None, None)
         .unwrap();
-    assert_eq!(plan.axis(), None);
+    let axis = plan.axis().unwrap();
+    let o = |revolution| TapObservation {
+        at: TimeUs(5),
+        seq: 3,
+        event: TapEvent::Axis {
+            control: axis,
+            delta: 7,
+            revolution,
+        },
+    };
+    assert!(plan.observation(&o(256)).is_some());
+    assert_eq!(plan.observation(&o(0)), None);
 }
 
 #[test]
@@ -290,10 +316,16 @@ fn the_tap_reaches_the_reducer_through_the_plan() {
         plan.observation(&TapObservation {
             at: TimeUs(0),
             seq: 0,
-            event: TapEvent::Resync(0b101),
+            event: TapEvent::Resync {
+                held: 0b101,
+                verified: false,
+            },
         })
         .map(|o| o.event),
-        Some(Event::Resync(HeldSet(0b101)))
+        Some(Event::Resync {
+            held: HeldSet(0b101),
+            verified: false,
+        })
     );
 }
 

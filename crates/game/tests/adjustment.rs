@@ -241,8 +241,7 @@ fn a_floating_faster_key_is_an_override_that_a_retry_replaces() {
     assert_eq!(native_green(bpm(150), &s), 259);
     assert_eq!(g(&s), 300);
     // A retry restores Floating from G.
-    let saved = rig.a.options();
-    rig.a.begin_attempt(saved, TimeUs(-2_000_000), 0);
+    rig.a.enter_attempt(Some(TimeUs(-2_000_000)), &rig.map);
     rig.ev(Event::Prepare {
         references: References::all(bpm(150)),
         speed: Speed::NORMAL,
@@ -260,8 +259,7 @@ fn classic_keeps_its_edited_multiplier_across_a_retry() {
     let s = rig.snap();
     assert_eq!(h(&s), r(345, 100));
     assert_eq!(s.options.hispeed().classic_hispeed_x100, 345);
-    let saved = rig.a.options();
-    rig.a.begin_attempt(saved, TimeUs(-2_000_000), 0);
+    rig.a.enter_attempt(Some(TimeUs(-2_000_000)), &rig.map);
     assert_eq!(h(&rig.snap()), r(345, 100));
 }
 
@@ -1017,9 +1015,10 @@ fn a_loss_acts_on_nothing_until_resynchronized_and_never_makes_up_a_release() {
     rig.at(20 * MS).tap(AUX_POS).tap(F2);
     assert_eq!(rig.snap().options.covers().sudden.amount, 500);
     // START verified held, the scratch too: neither acts until released.
-    rig.at(30 * MS).ev(Event::Resync(
-        HeldSet::default().with(START).with(SCRATCH_POS).with(F2),
-    ));
+    rig.at(30 * MS).ev(Event::Resync {
+        held: HeldSet::default().with(START).with(SCRATCH_POS).with(F2),
+        verified: true,
+    });
     rig.at(40 * MS).ev(Event::Repeat(F2));
     assert_eq!(h(&rig.snap()), r(200, 100));
     assert!(rig.a.modifiers_held());

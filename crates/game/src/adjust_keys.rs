@@ -14,7 +14,7 @@ use input::raw::key_identity;
 use input::{AdjustmentBindings, DeviceKind, MAX_TAPPED, TapControl, TapEvent, TapObservation};
 
 use crate::adjustment::{
-    AxisQuantum, ControlId, ControlRoles, Event, HeldSet, Observation, Role as Adjust,
+    AxisQuantum, ControlId, ControlRoles, Event, HeldSet, Observation, REPEAT_US, Role as Adjust,
 };
 use crate::keys::KeyConfigs;
 use crate::settings::{KeyConfig, Role as KeyRole, reserved_key};
@@ -240,7 +240,9 @@ impl AdjustmentConfig {
 
     /// Numbers every adjustment control of `keys` for the tap and the
     /// reducer: these roles, the lane keys as white and black keys, F1
-    /// and F2, and the controller's scratch axis when it has a `quantum`,
+    /// and F2, and the controller's scratch axis: a wrapping axis steps
+    /// by its revolution as each packet counted it, any other by `quantum`
+    /// (none without one),
     /// its movement counted the short way round `wrap` (the declared
     /// revolution when `None`). The controller's controls are tapped on
     /// its model only.
@@ -261,6 +263,8 @@ impl AdjustmentConfig {
                 controls: Vec::new(),
                 latched: 0,
                 wrap,
+                repeating: 0,
+                repeat_us: REPEAT_US,
             },
             axis: None,
             reversed: self.reversed,
@@ -287,7 +291,7 @@ impl AdjustmentConfig {
         for (control, role) in self.controller.roles().chain(lane_roles(&keys.controller)) {
             plan.add(tapped(control), Some(role))?;
         }
-        if let Some(quantum) = quantum {
+        {
             let axis = keys
                 .controller
                 .lanes
@@ -321,7 +325,7 @@ pub struct AdjustmentPlan {
     pub roles: ControlRoles,
     /// The tap's bindings ([`input::adjustment_queue`]).
     pub bindings: AdjustmentBindings,
-    axis: Option<(u8, AxisQuantum)>,
+    axis: Option<(u8, Option<AxisQuantum>)>,
     reversed: bool,
 }
 
@@ -339,6 +343,9 @@ impl AdjustmentPlan {
             if matches!(role, Adjust::Start | Adjust::Select) {
                 self.bindings.latched |= 1 << n;
             }
+            if matches!(role, Adjust::ScratchPositive | Adjust::ScratchNegative) {
+                self.bindings.repeating |= 1 << n;
+            }
         }
         Ok(n)
     }
@@ -351,7 +358,8 @@ impl AdjustmentPlan {
 
     /// The reducer's observation of the tap's `o`: its time and sequence,
     /// the scratch axis's movement signed by the reversal and given its
-    /// quantum. `None` for an axis the plan does not tap.
+    /// quantum. `None` for an axis the plan does not tap or cannot step, and
+    /// for the lifecycle's markers.
     #[must_use]
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub fn observation(&self, o: &TapObservation) -> Option<Observation> {
@@ -359,8 +367,15 @@ impl AdjustmentPlan {
             TapEvent::Press(n) => Event::Press(ControlId(n)),
             TapEvent::Release(n) => Event::Release(ControlId(n)),
             TapEvent::Repeat(n) => Event::Repeat(ControlId(n)),
-            TapEvent::Axis { control, delta } => {
+            TapEvent::Axis {
+                control,
+                delta,
+                revolution,
+            } => {
                 let (n, quantum) = self.axis.filter(|&(n, _)| n == control)?;
+                // A wrapping axis by the revolution it was counted on, so
+                // its controller need not be connected at the plan.
+                let quantum = AxisQuantum::wrapping(revolution).or(quantum)?;
                 Event::Axis {
                     control: ControlId(n),
                     delta: if self.reversed {
@@ -373,7 +388,14 @@ impl AdjustmentPlan {
             }
             TapEvent::Tick => Event::Tick,
             TapEvent::Lost => Event::Lost,
-            TapEvent::Resync(held) => Event::Resync(HeldSet(held)),
+            TapEvent::Resync { held, verified } => Event::Resync {
+                held: HeldSet(held),
+                verified,
+            },
+            // The lifecycle's markers are the driver's.
+            TapEvent::Opened { .. } | TapEvent::Cancelled { .. } | TapEvent::Fence(_) => {
+                return None;
+            }
         };
         Some(Observation {
             time: o.at,

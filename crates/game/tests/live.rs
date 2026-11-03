@@ -2876,6 +2876,7 @@ fn a_screen_lost_while_the_opening_is_deferred_opens_nothing() {
         controls: vec![(input::TapControl::Key(Q), 0)],
         latched: 1,
         wrap: None,
+        ..input::AdjustmentBindings::default()
     })
     .unwrap();
     tap.set_active(true);
@@ -2909,6 +2910,7 @@ fn a_hold_at_the_opening_defers_it_with_or_without_a_loading_lifetime() {
             controls: vec![(input::TapControl::Key(Q), 0)],
             latched: 1,
             wrap: None,
+            ..input::AdjustmentBindings::default()
         })
         .unwrap();
         tap.set_active(true);

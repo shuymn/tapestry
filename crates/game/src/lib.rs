@@ -21,6 +21,7 @@ mod attempt;
 mod audio_loop;
 mod autoplay;
 mod bests;
+mod driver;
 mod error;
 mod hispeed;
 mod keys;
@@ -59,6 +60,7 @@ pub use audio_loop::{
 };
 pub use autoplay::{Autoplay, AutoplayError, schedule_iter};
 pub use bests::{BestScore, BestView, SavedPlay};
+pub use driver::{AdjustDriver, InputPump, WAIT_PARKS};
 pub use error::{Chain, IoFailure};
 pub use eval::TABLE_BYTES_PER_OBJECT;
 pub use hispeed::{

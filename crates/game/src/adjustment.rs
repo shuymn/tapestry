@@ -219,9 +219,15 @@ pub enum Event {
     /// Observations were lost, or focus was: nothing acts until
     /// [`Event::Resync`].
     Lost,
-    /// The controls verified held after a loss; each stays without action
-    /// until released.
-    Resync(HeldSet),
+    /// The controls held after a loss; each stays without action until
+    /// released. While `verified` is false the held set may miss a control,
+    /// so the loss stands: nothing acts until a verified one.
+    Resync {
+        /// The controls held.
+        held: HeldSet,
+        /// Whether `held` is known to be complete.
+        verified: bool,
+    },
 }
 
 /// An observation: an event at a receive time, with its packet sequence.
@@ -272,6 +278,32 @@ pub struct PresentationSnapshot {
     pub generation: u32,
     /// The drain that published it, counting from 1.
     pub sequence: u64,
+    /// The presentation epoch: which attempt's chart `hispeed` was solved
+    /// for, 0 before any. A frame of another attempt reads no gain from it.
+    pub epoch: u64,
+}
+
+/// Why [`Adjustment::attach`] left a Floating `H` unknown.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum AttachError {
+    /// The chart's reference tempos are unavailable: an exact tempo does
+    /// not fit.
+    #[error("the chart's reference tempos are unavailable")]
+    NoReferences,
+    /// The solve's result does not fit.
+    #[error("the hi-speed for the chart's reference tempo does not fit")]
+    Unrepresentable,
+}
+
+/// One item of the augmented input stream (design.md "Play Adjustments",
+/// the display offset): an observation, or a display-offset change cut in
+/// where the drain that first read it took it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Augmented {
+    /// An observation.
+    Obs(Observation),
+    /// The display offset changed to this, µs.
+    Cut(i64),
 }
 
 /// Counts of what the reducer refused, outside counted processing.
@@ -397,6 +429,7 @@ pub struct Adjustment {
     last: Option<(TimeUs, u64)>,
     diagnostics: Diagnostics,
     published: u64,
+    epoch: u64,
 }
 
 impl Adjustment {
@@ -431,41 +464,124 @@ impl Adjustment {
             last: None,
             diagnostics: Diagnostics::default(),
             published: 0,
+            epoch: 0,
         };
-        a.begin_attempt(options, opens_at, display_offset_us);
+        a.hispeed = match options.hispeed().mode {
+            SpeedMode::Classic => Some(Ratio::from_hundredths(
+                options.hispeed().classic_hispeed_x100,
+            )),
+            SpeedMode::Floating => None,
+        };
+        a.display_offset_us = clamp_offset(display_offset_us);
         a
     }
 
-    /// A new attempt (a first play, a retry, the next chart or round),
-    /// reusing this state: the settings are `options`, and the holds, the
-    /// target selection, the double-press history, the axes' remainders
-    /// and the repeat deadlines start afresh. Allocates nothing.
-    pub fn begin_attempt(
-        &mut self,
-        options: PlayOptions,
-        opens_at: TimeUs,
-        display_offset_us: i64,
-    ) {
-        self.options = options;
-        let h = options.hispeed();
-        self.hispeed = match h.mode {
-            SpeedMode::Classic => Some(Ratio::from_hundredths(h.classic_hispeed_x100)),
-            SpeedMode::Floating => None,
-        };
+    /// The entry of a new attempt (a first play, a retry, the next chart
+    /// or round), before its chart is known to the reducer: the open
+    /// group closes under the head and tempo in force; the holds carry
+    /// over suppressed (a control held across it acts only after a release
+    /// and a fresh press, while a held START or SELECT still counts as
+    /// held), and the target selection, the double-press history, the
+    /// axes' remainders and the repeat deadlines start afresh; the chart
+    /// is forgotten: Floating's `H` is unknown and no tempo is known until
+    /// [`attach`](Self::attach), so an edit until then solves nothing and
+    /// is never rolled back for want of a tempo. The settings, Classic's
+    /// multiplier, the display offset and a loss stay. The head freezes at
+    /// `opens_at` where the coming attempt's opening is known. Allocates
+    /// nothing.
+    pub fn enter_attempt<T: TempoMap>(&mut self, opens_at: Option<TimeUs>, tempo: &T) {
+        self.close(tempo);
+        let context = self.context;
+        for hold in &mut self.holds {
+            if let Hold::Held {
+                context: c,
+                suppressed,
+                next,
+                pending,
+                ..
+            } = hold
+            {
+                *c = context.wrapping_sub(1);
+                *suppressed = true;
+                *next = TimeUs(i64::MAX);
+                *pending = None;
+            }
+        }
+        self.context = context.wrapping_add(1);
         self.selected = CoverKind::Lift;
-        self.holds = [Hold::Up; MAX_CONTROLS];
         self.axes = [AxisState::default(); MAX_CONTROLS];
-        self.starts = 0;
-        self.selects = 0;
         self.pending_start = None;
-        self.context = self.context.wrapping_add(1);
-        self.lost = false;
-        self.head = Head::Frozen { opens_at };
-        self.generation = 0;
-        self.display_offset_us = clamp_offset(display_offset_us);
+        if self.options.hispeed().mode == SpeedMode::Floating {
+            self.hispeed = None;
+        }
         self.speed = None;
-        self.group = Group::default();
-        self.last = None;
+        if let Some(opens_at) = opens_at {
+            self.head = Head::Frozen { opens_at };
+        }
+    }
+
+    /// The attempt's chart becomes known: the head frozen at `opens_at`,
+    /// the practice `speed`, and in Floating one solve from the reference
+    /// tempo of `references` with the target and the covers in force.
+    ///
+    /// # Errors
+    ///
+    /// [`AttachError::NoReferences`] when Floating has no references, and
+    /// [`AttachError::Unrepresentable`] when its solve does not fit: `H`
+    /// stays unknown, and the attempt cannot be played in Floating.
+    pub fn attach<T: TempoMap>(
+        &mut self,
+        opens_at: TimeUs,
+        references: Option<References>,
+        speed: Speed,
+        tempo: &T,
+    ) -> Result<(), AttachError> {
+        self.end_context(tempo);
+        self.head = Head::Frozen { opens_at };
+        self.prepare(references, speed, tempo)
+    }
+
+    /// The tempo becomes known at the practice `speed`: in Floating, one
+    /// solve from `references` ([`Event::Prepare`]).
+    fn prepare<T: TempoMap>(
+        &mut self,
+        references: Option<References>,
+        speed: Speed,
+        tempo: &T,
+    ) -> Result<(), AttachError> {
+        self.end_context(tempo);
+        self.speed = Some(speed);
+        if self.options.hispeed().mode != SpeedMode::Floating {
+            return Ok(());
+        }
+        let Some(references) = references else {
+            self.hispeed = None;
+            return Err(AttachError::NoReferences);
+        };
+        let reference = references.get(self.options.hispeed().reference);
+        match playback(reference, speed).and_then(|b| self.solve_at(b)) {
+            Ok(h) => {
+                self.hispeed = Some(h);
+                Ok(())
+            }
+            Err(Unrepresentable) => {
+                self.diagnostics.unrepresentable += 1;
+                self.hispeed = None;
+                Err(AttachError::Unrepresentable)
+            }
+        }
+    }
+
+    /// The latest observation taken: its receive time and sequence.
+    #[must_use]
+    pub const fn last(&self) -> Option<(TimeUs, u64)> {
+        self.last
+    }
+
+    /// Marks what is published from now on as of presentation epoch
+    /// `epoch` ([`PresentationSnapshot::epoch`]).
+    pub const fn set_epoch(&mut self, epoch: u64) {
+        self.epoch = epoch;
     }
 
     /// The settings with every accepted change: what is saved.
@@ -500,6 +616,7 @@ impl Adjustment {
             adjusting: !self.lost && (self.starts > 0 || self.selects > 0),
             generation: self.generation,
             sequence: self.published,
+            epoch: self.epoch,
         }
     }
 
@@ -516,6 +633,39 @@ impl Adjustment {
         }
         self.published = self.published.wrapping_add(1);
         writer.0.write(self.snapshot());
+    }
+
+    /// Takes a drain's items of the augmented stream in order, a cut as
+    /// [`Event::DisplayOffset`] at the latest observation's stamp, then
+    /// publishes one snapshot through `writer`.
+    pub fn feed<T: TempoMap>(
+        &mut self,
+        items: impl IntoIterator<Item = Augmented>,
+        tempo: &T,
+        writer: &mut PresentationWriter,
+    ) {
+        for item in items {
+            match item {
+                Augmented::Obs(o) => self.observe(o, tempo),
+                Augmented::Cut(us) => self.cut(us, tempo),
+            }
+        }
+        self.published = self.published.wrapping_add(1);
+        writer.0.write(self.snapshot());
+    }
+
+    /// The display offset changed to `us`, taken at the latest
+    /// observation's stamp, so it is never out of order.
+    pub fn cut<T: TempoMap>(&mut self, us: i64, tempo: &T) {
+        let (time, seq) = self.last.unwrap_or((TimeUs(i64::MIN), 0));
+        self.observe(
+            Observation {
+                time,
+                seq,
+                event: Event::DisplayOffset(us),
+            },
+            tempo,
+        );
     }
 
     /// Takes one observation.
@@ -556,22 +706,17 @@ impl Adjustment {
                 self.generation = generation;
             }
             Event::Prepare { references, speed } => {
-                self.end_context(tempo);
-                self.speed = Some(speed);
-                if self.options.hispeed().mode == SpeedMode::Floating {
-                    let reference = references.get(self.options.hispeed().reference);
-                    let solved = playback(reference, speed).and_then(|b| self.solve_at(b));
-                    self.commit_hispeed(solved);
-                }
+                let _ = self.prepare(Some(references), speed, tempo);
             }
             Event::Lost => {
                 self.end_context(tempo);
                 self.lost = true;
                 self.pending_start = None;
             }
-            Event::Resync(held) => {
+            Event::Resync { held, verified } => {
                 self.end_context(tempo);
                 self.resync(held);
+                self.lost = !verified;
             }
         }
     }
@@ -1031,13 +1176,6 @@ impl Adjustment {
     fn solve_at(&self, bpm: Ratio) -> Result<Ratio, Unrepresentable> {
         let covers = self.options.covers();
         solve(bpm, self.options.hispeed().green_target, &covers)
-    }
-
-    fn commit_hispeed(&mut self, solved: Result<Ratio, Unrepresentable>) {
-        match solved {
-            Ok(h) => self.hispeed = Some(h),
-            Err(Unrepresentable) => self.diagnostics.unrepresentable += 1,
-        }
     }
 
     fn resync(&mut self, held: HeldSet) {
