@@ -252,6 +252,11 @@ jobs:
       # The game on its threads, driven by a scripted input log, on WARP.
       - name: Test (dev-tools)
         run: mise exec -- cargo nextest run -p player -p game -p skin-beatoraja --features player/dev-tools,game/dev-tools,skin-beatoraja/dev-tools --locked --no-fail-fast
+      # The player's allocation guards are unit tests of its binary, whose
+      # counting allocator exists only with dev-tools; `_alloc` selects them
+      # (`cargo xtask check-alloc-tests`).
+      - name: Player allocation guards (release)
+        run: mise exec -- cargo test --release --locked -p player --features dev-tools --bin tapestry -- _alloc
 
   # Passes when the three Windows jobs passed, or when `changes` found no
   # change the build jobs read and they were skipped; anything else

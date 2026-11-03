@@ -1156,6 +1156,11 @@ impl Rig for PlayerRig<'_> {
         self.input.hand_off()
     }
 
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn abort_close(&mut self) -> Result<Closing, InputWaitError> {
+        self.input.abort_close()
+    }
+
     fn end_feedback(&mut self) -> Result<(), InputWaitError> {
         self.input.close().map(|_| ())
     }

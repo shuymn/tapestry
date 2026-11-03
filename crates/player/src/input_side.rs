@@ -19,6 +19,11 @@
 //! tail's feedback until the close that follows the tail. The hook's lines
 //! for the play are made at that close, outside the play.
 //!
+//! An aborted play's close can be the same exchange, sealed
+//! ([`InputLink::abort_close`]): the closing comes back in the same
+//! storage and nothing more reaches the play's queues, while the sources
+//! stay, and the hook's lines wait, until the close that follows.
+//!
 //! The hook reports the thread's phase (`input::cadence`): Open from an
 //! open through a handoff to the close, Tail from a close, and Idle only from [`Request::Idle`], which the
 //! game thread sends once a play's audio tail is over. At each boundary
@@ -215,10 +220,21 @@ pub enum RearmOutcome {
     Refused,
 }
 
-/// A completed play's closing, made at its handoff in storage the input
-/// thread reserved at the opening, and kept by the game thread until the
-/// close after the tail, so neither side allocates or frees for it during
-/// the play.
+/// What a handoff does with the play's sources once its closing is made.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HandoffKind {
+    /// A completed play's: input goes on reaching the play's queues for
+    /// the tail's feedback ([`input::SourceSet::hand_off`]).
+    Feedback,
+    /// An aborted play's: nothing more is pushed into the play's queues
+    /// ([`input::SourceSet::seal_recording`]).
+    Sealed,
+}
+
+/// A play's closing, made at its handoff ([`HandoffKind`]) in storage the
+/// input thread reserved at the opening, and kept by the game thread until
+/// the close that follows, so neither side allocates or frees for it
+/// during the play.
 #[derive(Debug, Default)]
 pub struct Handoff {
     /// The closing, moved out by the game thread.
@@ -286,10 +302,10 @@ pub struct InputLink {
     rearms: rtrb::Producer<Box<Rearm>>,
     rearmed: rtrb::Consumer<Box<Rearm>>,
     /// Handoffs asked of the input thread, and their answers
-    /// ([`hand_off`](Self::hand_off)).
-    handoffs: rtrb::Producer<()>,
+    /// ([`hand_off`](Self::hand_off), [`abort_close`](Self::abort_close)).
+    handoffs: rtrb::Producer<HandoffKind>,
     handed: rtrb::Consumer<Box<Handoff>>,
-    /// The last handoff's storage, freed at the close after its tail.
+    /// The last handoff's storage, freed at the close that follows.
     spent: Option<Box<Handoff>>,
 }
 
@@ -433,10 +449,31 @@ impl InputLink {
     ///
     /// As [`open`](Self::open).
     pub fn hand_off(&mut self) -> Result<Closing, InputWaitError> {
+        self.exchange(HandoffKind::Feedback)
+    }
+
+    /// Closes an aborted play's recording at the input thread's next
+    /// boundary without ending it: the recording is sealed there
+    /// ([`input::SourceSet::seal_recording`]), so nothing more reaches the
+    /// play's queues, while its sources stay until [`close`](Self::close),
+    /// which prints the hook's lines for the play. Waits and allocates as
+    /// [`hand_off`](Self::hand_off).
+    ///
+    /// # Errors
+    ///
+    /// As [`open`](Self::open).
+    pub fn abort_close(&mut self) -> Result<Closing, InputWaitError> {
+        self.exchange(HandoffKind::Sealed)
+    }
+
+    /// Asks the input thread for a handoff of `kind` and waits for its
+    /// closing ([`hand_off`](Self::hand_off)). A failed wait fails the
+    /// link, so a late answer is never taken for another request's.
+    fn exchange(&mut self, kind: HandoffKind) -> Result<Closing, InputWaitError> {
         if let Some(e) = self.failed {
             return Err(e);
         }
-        let sent = self.handoffs.push(()).map_err(|_| InputWaitError::Gone);
+        let sent = self.handoffs.push(kind).map_err(|_| InputWaitError::Gone);
         let answer = sent.and_then(|()| {
             self.waker.wake();
             let since = (self.awake)();
@@ -467,7 +504,9 @@ impl InputLink {
     }
 
     /// Closes recording, or the sources of a play handed off to its tail
-    /// ([`hand_off`](Self::hand_off)).
+    /// or sealed ([`hand_off`](Self::hand_off),
+    /// [`abort_close`](Self::abort_close)), and prints the hook's lines
+    /// for the play.
     ///
     /// # Errors
     ///
@@ -640,7 +679,7 @@ pub struct Hook {
     rearms: rtrb::Consumer<Box<Rearm>>,
     rearmed: rtrb::Producer<Box<Rearm>>,
     /// Handoffs from the game thread, and their answers.
-    handoffs: rtrb::Consumer<()>,
+    handoffs: rtrb::Consumer<HandoffKind>,
     handed: rtrb::Producer<Box<Handoff>>,
     /// The open recording's handoff storage, reserved at its opening.
     handoff: Option<Box<Handoff>>,
@@ -829,10 +868,13 @@ impl Hook {
         // A handoff, at this boundary: one in flight at a time, so the
         // answer always has room. Only an opening reserved its storage; a
         // handoff without one answers an empty closing.
-        if self.handoffs.pop().is_ok() {
+        if let Ok(kind) = self.handoffs.pop() {
             let mut handoff = self.handoff.take().unwrap_or_default();
             handoff.fill(sources);
-            sources.hand_off();
+            match kind {
+                HandoffKind::Feedback => sources.hand_off(),
+                HandoffKind::Sealed => sources.seal_recording(),
+            }
             let _ = self.handed.push(handoff);
         }
         // A loading script wakes the thread for its next item, Idle or not.
@@ -1903,9 +1945,12 @@ mod link_tests {
         assert_eq!(link.failure(), None);
         link.timeout = SHORT;
         waker.pause();
-        let begun = Instant::now();
+        // Measured on the awake clock the bound is kept on, which moves in
+        // timer ticks and can reach it just before the wall clock does.
+        let begun = link.awake_now();
         assert_eq!(link.close().err(), Some(InputWaitError::Timeout));
-        assert!(begun.elapsed() >= SHORT, "{:?}", begun.elapsed());
+        let waited = link.awake_now().saturating_sub(begun);
+        assert!(waited >= SHORT, "{waited:?}");
         waker.resume();
         // The late reply to the close arrives.
         waker.two_more_wakes();
@@ -1941,6 +1986,75 @@ mod link_tests {
             stuck.store(false, Ordering::Release);
         });
         assert!(link.open(open_request()).is_ok());
+        assert!(begun.elapsed() >= SHORT * 4, "{:?}", begun.elapsed());
+        assert_eq!(link.failure(), None);
+        resume.join().unwrap();
+        assert!(link.close().is_ok());
+        drop(waker.stop());
+    }
+
+    /// An aborted play's close the input thread does not answer times out
+    /// and fails the link: once the late answer has arrived, no later
+    /// request reads it, the final close included, and none is sent.
+    #[test]
+    fn an_unanswered_abort_close_times_out_and_its_late_answer_is_never_read() {
+        let sources = set();
+        let (_controls, hook, mut link) = hooked(&sources);
+        let waker = Waker::spawn(hook, sources);
+        link.timeout = Duration::from_secs(60);
+        assert!(link.open(open_request()).is_ok());
+        link.timeout = SHORT;
+        waker.pause();
+        assert_eq!(link.abort_close().err(), Some(InputWaitError::Timeout));
+        waker.resume();
+        // The late answer arrives.
+        waker.two_more_wakes();
+        assert_eq!(link.abort_close().err(), Some(InputWaitError::Timeout));
+        assert_eq!(link.hand_off().err(), Some(InputWaitError::Timeout));
+        assert_eq!(link.close().err(), Some(InputWaitError::Timeout));
+        assert_eq!(link.failure(), Some(InputWaitError::Timeout));
+        // Still there, never read; nothing was asked after it.
+        assert!(link.handed.pop().is_ok());
+        waker.two_more_wakes();
+        assert!(link.handed.pop().is_err());
+        assert!(link.replies.try_recv().is_err());
+        drop(waker.stop());
+    }
+
+    /// With the hook gone, an aborted play's close is `Gone`, and stays
+    /// so.
+    #[test]
+    fn an_abort_close_after_the_hook_is_gone_is_an_error() {
+        let sources = set();
+        let (_controls, hook, mut link) = hooked(&sources);
+        drop(hook);
+        for _ in 0..2 {
+            assert_eq!(link.abort_close().err(), Some(InputWaitError::Gone));
+        }
+        assert_eq!(link.failure(), Some(InputWaitError::Gone));
+    }
+
+    /// An aborted play's close whose wall time passes the bound during a
+    /// suspend, while the awake time stands still, is answered and leaves
+    /// the link healthy for the final close.
+    #[test]
+    fn an_abort_close_across_a_suspend_is_answered_and_not_poisoned() {
+        let sources = set();
+        let (_controls, hook, mut link) = hooked(&sources);
+        let waker = Waker::spawn(hook, sources);
+        link.timeout = Duration::from_secs(60);
+        assert!(link.open(open_request()).is_ok());
+        link.timeout = SHORT;
+        // Asleep from here: the awake time does not move.
+        link.awake = || Duration::ZERO;
+        waker.pause();
+        let begun = Instant::now();
+        let stuck = Arc::clone(&waker.stuck);
+        let resume = std::thread::spawn(move || {
+            std::thread::sleep(SHORT * 4);
+            stuck.store(false, Ordering::Release);
+        });
+        assert!(link.abort_close().is_ok());
         assert!(begun.elapsed() >= SHORT * 4, "{:?}", begun.elapsed());
         assert_eq!(link.failure(), None);
         resume.join().unwrap();
@@ -2537,7 +2651,7 @@ mod gate_tests {
     }
 
     #[test]
-    fn a_rearm_seals_the_cancelled_opening_and_opens_the_next_at_one_boundary() {
+    fn a_rearm_seals_the_cancelled_opening_and_opens_the_next_at_one_boundary_alloc() {
         let (mut sources, mut hook, mut link, gate) = rig();
         // START held: the opening is deferred, nothing opens.
         batch(&mut hook, &mut sources, 10, &[packet(1, Q, 1)]);
@@ -2797,7 +2911,7 @@ mod gate_tests {
     /// held through the handoff released with no press repeated, until the
     /// close after the tail.
     #[test]
-    fn a_handoff_keeps_the_sources_until_the_close() {
+    fn a_handoff_keeps_the_sources_until_the_close_alloc() {
         let (mut sources, mut hook, mut link, gate) = rig();
         let opening = open(&mut hook, &link, &mut sources, 10).unwrap();
         assert_eq!(gate.state().phase, GatePhase::Armed);
@@ -2880,5 +2994,207 @@ mod gate_tests {
         assert!(!sources.is_recording());
         batch(&mut hook, &mut sources, 120, &[packet(2, Z, 1)]);
         assert!(readers.iter().all(input::SourceReader::is_empty));
+    }
+
+    /// Asks `ask` of the link on a thread of its own, as the game thread
+    /// does, while the input thread's batches run from `at` ms one per
+    /// millisecond until it is answered.
+    fn served<R: Send>(
+        hook: &mut Hook,
+        sources: &mut SourceSet,
+        link: &mut InputLink,
+        at: i64,
+        ask: impl FnOnce(&mut InputLink) -> R + Send,
+    ) -> R {
+        std::thread::scope(|s| {
+            let asked = s.spawn(|| ask(link));
+            let mut at = at;
+            while !asked.is_finished() {
+                batch(hook, sources, at, &[]);
+                at += 1;
+            }
+            asked.join().unwrap()
+        })
+    }
+
+    /// An aborted play's close is answered at the input thread's next
+    /// boundary with the closing in the storage reserved at the opening:
+    /// its arrivals come back in the reserved buffer, capped at its
+    /// capacity, and the recording is sealed there, not closed.
+    #[test]
+    fn an_abort_close_is_answered_in_the_reserved_storage() {
+        let (mut sources, mut hook, mut link, _gate) = rig();
+        let opening = open(&mut hook, &link, &mut sources, 10).unwrap();
+        let reserved = hook.handoff.as_ref().unwrap();
+        let (buffer, room) = (
+            reserved.closing.arrivals.as_ptr(),
+            reserved.closing.arrivals.capacity(),
+        );
+        assert_eq!(room, 4);
+        // More devices arrive than the reservation holds.
+        sources.begin_batch(TimeUs(20 * MS));
+        for d in 3..9 {
+            sources.connect(DeviceId(d), DeviceKind::Keyboard);
+        }
+        sources.end_batch(TimeUs(20 * MS + 1));
+        hook.wake(&mut sources, TimeUs(20 * MS + 1));
+        let closing = served(
+            &mut hook,
+            &mut sources,
+            &mut link,
+            30,
+            InputLink::abort_close,
+        );
+        let closing = closing.unwrap();
+        assert_eq!(closing.arrivals.as_ptr(), buffer);
+        assert_eq!(
+            (closing.arrivals.len(), closing.arrivals.capacity()),
+            (room, room)
+        );
+        assert!(hook.handoff.is_none());
+        assert!(sources.is_recording() && sources.is_sealed());
+        // The game thread's reply channel is untouched: the exchange went
+        // through the bounded queues.
+        assert!(link.replies.try_recv().is_err());
+        drop(opening);
+    }
+
+    /// After the seal nothing more reaches the play's queues, a removal
+    /// included, and the start gate is disarmed; the sources and what the
+    /// record keeps stay as sealed until the final close, while every
+    /// device's held state goes on following its packets, so the next
+    /// opening's snapshot holds what is held then.
+    #[test]
+    fn a_sealed_recording_pushes_nothing_and_keeps_the_held_state() {
+        let (mut sources, mut hook, mut link, gate) = rig();
+        let opening = open(&mut hook, &link, &mut sources, 10).unwrap();
+        assert_eq!(gate.state().phase, GatePhase::Armed);
+        let mut readers = opening.readers;
+        // Z held on keyboard 2 through the seal.
+        batch(&mut hook, &mut sources, 20, &[packet(2, Z, 1)]);
+        for r in &mut readers {
+            while r.pop().is_some() {}
+        }
+        let closing = served(
+            &mut hook,
+            &mut sources,
+            &mut link,
+            30,
+            InputLink::abort_close,
+        );
+        let closing = closing.unwrap();
+        assert!(closing.arrivals.is_empty());
+        assert!(sources.is_sealed());
+        assert_ne!(gate.state().phase, GatePhase::Armed);
+        // Z released on keyboard 2, pressed on keyboard 1; a device
+        // arrives, and keyboard 1 is pressed again past its queue's room.
+        batch(&mut hook, &mut sources, 100, &[packet(2, Z, 0)]);
+        batch(&mut hook, &mut sources, 101, &[packet(1, Z, 1)]);
+        sources.begin_batch(TimeUs(102 * MS));
+        sources.connect(DeviceId(3), DeviceKind::Keyboard);
+        sources.end_batch(TimeUs(102 * MS + 1));
+        for i in 0..40 {
+            batch(&mut hook, &mut sources, 103 + i, &[packet(1, Z, 1)]);
+        }
+        assert!(readers.iter().all(input::SourceReader::is_empty));
+        assert_eq!(sources.participants().count(), 2);
+        assert_eq!(sources.devices().count(), 3);
+        // The final close: what the record keeps is as sealed.
+        link.requests.send(Request::Close).unwrap();
+        batch(&mut hook, &mut sources, 200, &[]);
+        match link.replies.try_recv() {
+            Ok(Reply::Closed(c, lines)) => {
+                assert_eq!(c.arrivals, closing.arrivals);
+                assert!(!c.overflowed);
+                assert!(lines.is_empty());
+            }
+            _ => panic!("a close is answered by a closing"),
+        }
+        assert!(!sources.is_recording());
+        // The next opening's snapshot: Z held on keyboard 1, released on
+        // keyboard 2.
+        let next = open(&mut hook, &link, &mut sources, 300).unwrap();
+        assert_eq!(next.start.held, [(SourceId(0), Z, 1)]);
+    }
+
+    /// The out-of-range warnings wait for the final close, which prints
+    /// them once with what was counted before the seal, and closes
+    /// recording.
+    #[test]
+    fn the_final_close_after_an_abort_close_prints_the_warnings_once() {
+        let (mut sources, mut hook, mut link, _gate) = rig();
+        let _opening = open(&mut hook, &link, &mut sources, 10).unwrap();
+        let cap =
+            input::hid::axis_cap(input::hid::axis_control(0x01, 0x30), true, 0, 255, 8).unwrap();
+        sources.axis_value(DeviceId(1), &cap, 300);
+        sources.axis_value(DeviceId(1), &cap, -1);
+        let closing = served(
+            &mut hook,
+            &mut sources,
+            &mut link,
+            20,
+            InputLink::abort_close,
+        );
+        assert_eq!(closing.unwrap().axis_out_of_range, [2, 0]);
+        assert!(link.replies.try_recv().is_err(), "the abort close printed");
+        // Counted no more once sealed.
+        sources.axis_value(DeviceId(1), &cap, 400);
+        let declared = "input: source 0 reported 2 axis values outside the range its controller declares; set its scratch range in device.toml";
+        let close = |hook: &mut Hook, sources: &mut SourceSet, at| {
+            link.requests.send(Request::Close).unwrap();
+            batch(hook, sources, at, &[]);
+            match link.replies.try_recv() {
+                Ok(Reply::Closed(_, lines)) => lines,
+                _ => panic!("a close is answered by a closing"),
+            }
+        };
+        assert_eq!(close(&mut hook, &mut sources, 30), [declared]);
+        assert!(!sources.is_recording());
+        assert!(close(&mut hook, &mut sources, 40).is_empty());
+    }
+
+    /// Nothing is allocated on either thread for an aborted play's close:
+    /// the game thread's request and wait, and the input thread's
+    /// boundaries that answer it and seal the recording, each thread with
+    /// a positive control proving its counter counts. The counter is the
+    /// development builds' allocator, so the test runs with dev-tools.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn abort_close_alloc() {
+        use crate::alloc_count::this_thread;
+        let control = || {
+            let before = this_thread();
+            drop(std::hint::black_box(vec![1_u8; 8]));
+            assert!(this_thread() > before, "the allocation was not counted");
+        };
+        let (mut sources, mut hook, mut link, _gate) = rig();
+        let opening = open(&mut hook, &link, &mut sources, 10).unwrap();
+        let mut readers = opening.readers;
+        batch(&mut hook, &mut sources, 20, &[packet(2, Z, 1)]);
+        for r in &mut readers {
+            while r.pop().is_some() {}
+        }
+        control();
+        let mut allocated = 0;
+        let (closing, asking) = std::thread::scope(|s| {
+            let asked = s.spawn(|| {
+                control();
+                let before = this_thread();
+                let closing = link.abort_close();
+                (closing, this_thread() - before)
+            });
+            let mut at = 30;
+            while !asked.is_finished() {
+                let before = this_thread();
+                batch(&mut hook, &mut sources, at, &[packet(2, Z, 0)]);
+                allocated += this_thread() - before;
+                at += 1;
+            }
+            asked.join().unwrap()
+        });
+        assert!(closing.is_ok());
+        assert!(sources.is_sealed());
+        assert_eq!(allocated, 0, "the input thread's abort close allocated");
+        assert_eq!(asking, 0, "the game thread's abort close allocated");
     }
 }

@@ -1085,7 +1085,7 @@ mod tests {
     /// counting allocator counts this thread's allocations.
     #[cfg(feature = "dev-tools")]
     #[test]
-    fn overlay_percentiles_without_allocation() {
+    fn overlay_percentiles_alloc() {
         use super::AudioInfo;
         use crate::alloc_count::this_thread;
         use render::measure::{RefreshCount, Samples};
@@ -1378,7 +1378,7 @@ mod frame_tests {
     /// of an older play does not, and nothing of it allocates once the play
     /// has started.
     #[test]
-    fn frames_pair_judgments_with_their_statistics() {
+    fn frames_pair_judgments_with_their_statistics_alloc() {
         let mut r = rig();
         let origin = TimeUs(5_000_000);
         r.m.start(play(3, origin));

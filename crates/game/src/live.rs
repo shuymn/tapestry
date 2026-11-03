@@ -319,9 +319,25 @@ pub trait Rig {
     fn hand_off(&mut self) -> Result<Closing, InputWaitError> {
         self.close()
     }
-    /// The tail of a play handed off ([`hand_off`](Self::hand_off)) ended:
-    /// the sources close, and nothing more is pushed into the play's
-    /// queues. By default, nothing.
+    /// An aborted play's close that allocates nothing: recording is sealed
+    /// at the next input boundary and its closing returned, as with
+    /// [`hand_off`](Self::hand_off), but nothing more is pushed into the
+    /// play's queues; the sources stay, and the input side's console lines
+    /// for the play wait, until [`end_feedback`](Self::end_feedback). By
+    /// default, for rigs without an input thread, it closes.
+    ///
+    /// # Errors
+    ///
+    /// As [`close`](Self::close).
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn abort_close(&mut self) -> Result<Closing, InputWaitError> {
+        self.close()
+    }
+    /// The end of either handoff ([`hand_off`](Self::hand_off) after the
+    /// tail, [`abort_close`](Self::abort_close) after the play's last
+    /// presentation): the sources close, nothing more is pushed into the
+    /// play's queues, and the input side's console lines for the play are
+    /// printed. By default, nothing.
     ///
     /// # Errors
     ///

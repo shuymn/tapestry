@@ -214,6 +214,48 @@ fn held_state_survives_retry() {
     assert!(start.held.is_empty());
 }
 
+/// A sealed recording takes nothing more into its queues, a removal
+/// included, and keeps what the record holds as it was at the seal, a
+/// handoff after it changing nothing; its sources stay until it closes,
+/// and every device's held state goes on following its packets.
+#[test]
+fn a_sealed_recording_pushes_nothing_and_keeps_its_sources() {
+    let mut set = SourceSet::new(SourceConfig {
+        queue_capacity: 4,
+        ..config()
+    })
+    .unwrap();
+    set.begin_batch(TimeUs(0));
+    plug(&mut set, DeviceId(0), DeviceKind::Keyboard);
+    plug(&mut set, DeviceId(1), DeviceKind::Keyboard);
+    set.end_batch(TimeUs(0));
+    set.open_recording(TimeUs(0));
+    let mut readers = set.take_readers();
+    batch(&mut set, 10, &[key(0, A, 1)], 11);
+    assert_eq!(drain(&mut readers[0]), [ev(10, 0, A, 1)]);
+    set.seal_recording();
+    set.hand_off();
+    assert!(set.is_recording() && set.is_sealed() && !set.is_handed_off());
+    // A released and B pressed on keyboard 0, past the queue's room; a
+    // device arrives, and keyboard 1 is removed.
+    let presses: Vec<Packet> = [A, B, B, B, B, B]
+        .iter()
+        .enumerate()
+        .map(|(i, &c)| key(0, c, i32::from(i > 0)))
+        .collect();
+    batch(&mut set, 20, &presses, 21);
+    set.begin_batch(TimeUs(30));
+    plug(&mut set, DeviceId(2), DeviceKind::Keyboard);
+    set.disconnect(DeviceId(1));
+    set.end_batch(TimeUs(31));
+    assert!(readers.iter().all(SourceReader::is_empty));
+    assert!(!set.overflowed() && set.arrivals().is_empty());
+    assert_eq!(set.participants().count(), 2);
+    set.close_recording();
+    let start = set.open_recording(TimeUs(40));
+    assert_eq!(start.held, [(SourceId(0), B, 1)]);
+}
+
 #[test]
 fn overflow_is_flagged_never_silent() {
     let mut set = SourceSet::new(SourceConfig {

@@ -1259,7 +1259,7 @@ mod tests {
     /// per process.)
     #[cfg(feature = "dev-tools")]
     #[test]
-    fn a_play_frame_tells_the_window_unallocated_and_carets_coalesce() {
+    fn a_play_frame_tells_the_window_unallocated_and_carets_coalesce_alloc() {
         use std::sync::atomic::Ordering;
         use std::time::Duration;
 
