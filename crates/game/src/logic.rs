@@ -373,13 +373,7 @@ impl<'a, R: SourceRead> Logic<'a, R> {
             return self.idle();
         }
         // (1) Every watermark first.
-        let mut open = false;
-        for (r, p) in self.readers.iter().zip(&mut self.published) {
-            if p.state != SourceState::Retired {
-                *p = r.published();
-            }
-            open |= p.state == SourceState::Open;
-        }
+        let open = self.read_publications();
         // (3), taken here since it depends only on the publications: the
         // global watermark. With no source left open the play is over: it
         // ends at what was already finalized, before a closed source's
@@ -458,14 +452,7 @@ impl<'a, R: SourceRead> Logic<'a, R> {
                 oldest = Some(oldest.map_or(o, |t| t.min(o)));
             }
         }
-        for ((s, p), staged) in self
-            .sources
-            .iter()
-            .zip(&mut self.published)
-            .zip(&self.staged)
-        {
-            p.retire_if_drained(s.drained, staged);
-        }
+        self.retire_drained();
         self.publish_view();
         Advance {
             watermark: Some(w),
@@ -495,13 +482,7 @@ impl<'a, R: SourceRead> Logic<'a, R> {
     pub fn feedback_to(&mut self) -> Option<TimeUs> {
         // A feedback step emits no event.
         self.out.clear();
-        let mut open = false;
-        for (r, p) in self.readers.iter().zip(&mut self.published) {
-            if p.state != SourceState::Retired {
-                *p = r.published();
-            }
-            open |= p.state == SourceState::Open;
-        }
+        let open = self.read_publications();
         let w = watermark(&self.published, self.device).filter(|_| open)?;
         let room = self.merged.capacity();
         let mut staged: usize = self.staged.iter().map(Staged::len).sum();
@@ -539,6 +520,26 @@ impl<'a, R: SourceRead> Logic<'a, R> {
                 }
             });
         self.merged.clear();
+        self.retire_drained();
+        self.publish_view();
+        Some(w)
+    }
+
+    /// Reads every source's publication, a retired one's sticking; returns
+    /// whether a source is still open.
+    fn read_publications(&mut self) -> bool {
+        let mut open = false;
+        for (r, p) in self.readers.iter().zip(&mut self.published) {
+            if p.state != SourceState::Retired {
+                *p = r.published();
+            }
+            open |= p.state == SourceState::Open;
+        }
+        open
+    }
+
+    /// Retires each closed source whose queue and staging are drained.
+    fn retire_drained(&mut self) {
         for ((s, p), staged) in self
             .sources
             .iter()
@@ -547,8 +548,6 @@ impl<'a, R: SourceRead> Logic<'a, R> {
         {
             p.retire_if_drained(s.drained, staged);
         }
-        self.publish_view();
-        Some(w)
     }
 
     /// Inputs the audio tail's feedback dropped, its staging full

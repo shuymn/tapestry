@@ -260,8 +260,9 @@ pub trait Rig {
     /// A full play completed: its audio is done once it has ended, the key
     /// sounds of the tail's feedback included ([`audio_done`](Self::audio_done)).
     fn seal_audio(&mut self);
-    /// A practice round completed: sealed, and its audio rings out (design.md "Mid-Chart Start and Section Repeat"): the BGM
-    /// plays on until `fade_at`, the output fades to silence by `end_at`,
+    /// A practice round completed: sealed, and its audio rings out
+    /// (design.md "Mid-Chart Start and Section Repeat"): the BGM plays on
+    /// until `fade_at`, the output fades to silence by `end_at`,
     /// both in the play's chart time, and every sound stops there.
     /// [`audio_done`](Self::audio_done) then turns true as for a sealed
     /// play, possibly before the play's time reaches `end_at`.
