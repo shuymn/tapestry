@@ -157,15 +157,33 @@ struct Recording {
     /// The opening's held-input snapshot, its storage reserved with the
     /// attempt.
     start: InputStart,
-    /// Handed off to a completed play's tail ([`SourceSet::hand_off`]):
-    /// what the record keeps is frozen, and the queues take input for the
-    /// tail's feedback only.
-    handed_off: bool,
+    /// What the queues take from here: the play's input, the tail's
+    /// feedback, or nothing.
+    stage: Stage,
     /// Events a full queue refused once handed off.
     feedback_dropped: u64,
 }
 
+/// What an open recording's queues take.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Stage {
+    /// The play's input, which the record keeps.
+    Play,
+    /// Handed off to a completed play's tail ([`SourceSet::hand_off`]):
+    /// what the record keeps is frozen, and the queues take input for the
+    /// tail's feedback only.
+    Feedback,
+    /// Sealed at an aborted play's close ([`SourceSet::seal_recording`]):
+    /// what the record keeps is frozen, and nothing more is pushed.
+    Sealed,
+}
+
 impl Recording {
+    /// Whether what the record keeps is frozen: handed off or sealed.
+    fn frozen(&self) -> bool {
+        self.stage != Stage::Play
+    }
+
     /// `at` on the batch clock as the play's time.
     const fn play_time(&self, at: TimeUs) -> TimeUs {
         TimeUs(at.0.saturating_sub(self.origin.0))
@@ -427,7 +445,7 @@ impl SourceSet {
                     tap.set_unverified(true);
                 }
                 if source.is_some()
-                    && let Some(rec) = self.recording.as_mut().filter(|r| !r.handed_off)
+                    && let Some(rec) = self.recording.as_mut().filter(|r| !r.frozen())
                 {
                     rec.overflowed = true;
                 }
@@ -719,7 +737,7 @@ impl SourceSet {
     /// reported; a participating source counts it, and its record says so
     /// ([`axis_out_of_range`](Self::axis_out_of_range)).
     pub fn axis_value(&mut self, device: DeviceId, cap: &AxisCap, value: i32) {
-        if let Some(rec) = self.recording.as_mut().filter(|r| !r.handed_off)
+        if let Some(rec) = self.recording.as_mut().filter(|r| !r.frozen())
             && let Some(p) = rec.participants.iter_mut().find(|p| p.device == device)
         {
             let set = p.axis_ranges.iter().find(|(c, _)| *c == cap.control);
@@ -810,7 +828,7 @@ impl SourceSet {
     /// Input that could not be read (a packet larger than the adapter's
     /// buffers, or a failed read): the open recording is incomplete.
     pub fn input_lost(&mut self) {
-        if let Some(rec) = self.recording.as_mut().filter(|r| !r.handed_off) {
+        if let Some(rec) = self.recording.as_mut().filter(|r| !r.frozen()) {
             rec.overflowed = true;
         }
     }
@@ -827,7 +845,7 @@ impl SourceSet {
 
     /// Puts an arrival during the open recording on its list.
     fn arrived(&mut self, kind: DeviceKind) {
-        if let Some(rec) = self.recording.as_mut().filter(|r| !r.handed_off) {
+        if let Some(rec) = self.recording.as_mut().filter(|r| !r.frozen()) {
             if rec.arrivals.len() < self.config.max_arrivals {
                 rec.arrivals.push(Arrival {
                     at: rec.play_time(self.batch_at),
@@ -961,7 +979,7 @@ impl SourceSet {
     }
 
     fn push(&mut self, source: SourceId, kind: InputKind) {
-        let Some(rec) = &mut self.recording else {
+        let Some(rec) = self.recording.as_mut().filter(|r| r.stage != Stage::Sealed) else {
             return;
         };
         let received = rec.play_time(self.batch_at);
@@ -975,7 +993,7 @@ impl SourceSet {
             reason = "a source id is its device's position in `participants`, set when recording opens"
         )]
         if rec.participants[source.index()].writer.push(ev).is_err() {
-            if rec.handed_off {
+            if rec.stage == Stage::Feedback {
                 rec.feedback_dropped = rec.feedback_dropped.saturating_add(1);
             } else {
                 rec.overflowed = true;
@@ -1081,7 +1099,7 @@ impl SourceSet {
                 opened_at: TimeUs(0),
                 held: Vec::with_capacity(held),
             },
-            handed_off: false,
+            stage: Stage::Play,
             feedback_dropped: 0,
         });
         snapshot(rec, &self.devices, now);
@@ -1112,7 +1130,7 @@ impl SourceSet {
     /// [`return_readers`]: Self::return_readers
     pub fn reopen(&mut self, now: TimeUs, origin: TimeUs) -> Result<&InputStart, ReopenError> {
         let tripped = self.gate.is_tripped();
-        let Some(rec) = self.recording.as_mut().filter(|r| !r.handed_off) else {
+        let Some(rec) = self.recording.as_mut().filter(|r| !r.frozen()) else {
             return Err(ReopenError::NotRecording);
         };
         if origin <= rec.origin {
@@ -1272,10 +1290,14 @@ impl SourceSet {
     /// From here a full queue drops the event and counts it
     /// ([`feedback_dropped`](Self::feedback_dropped)), which the record
     /// never sees. [`close_recording`](Self::close_recording) ends it.
-    /// Allocates nothing; does nothing while recording is closed.
+    /// Allocates nothing; does nothing while recording is closed, and a
+    /// sealed recording ([`seal_recording`](Self::seal_recording)) stays
+    /// sealed.
     pub fn hand_off(&mut self) {
         if let Some(rec) = &mut self.recording {
-            rec.handed_off = true;
+            if rec.stage == Stage::Play {
+                rec.stage = Stage::Feedback;
+            }
             if let Some(tap) = &self.adjust {
                 tap.gate().disarm();
             }
@@ -1286,7 +1308,35 @@ impl SourceSet {
     /// tail ([`hand_off`](Self::hand_off)).
     #[must_use]
     pub fn is_handed_off(&self) -> bool {
-        self.recording.as_ref().is_some_and(|r| r.handed_off)
+        self.recording
+            .as_ref()
+            .is_some_and(|r| r.stage == Stage::Feedback)
+    }
+
+    /// Seals the open recording at an aborted play's close, at a boundary
+    /// between two batches: what the record keeps is frozen here, as at
+    /// [`hand_off`](Self::hand_off), the start gate is disarmed, and
+    /// nothing more is pushed into the play's queues, while every source
+    /// keeps its device, its queue and its counts, and every device its
+    /// held state. [`close_recording`](Self::close_recording) ends it, so
+    /// nothing is freed here. Allocates nothing; does nothing while
+    /// recording is closed.
+    pub fn seal_recording(&mut self) {
+        if let Some(rec) = &mut self.recording {
+            rec.stage = Stage::Sealed;
+            if let Some(tap) = &self.adjust {
+                tap.gate().disarm();
+            }
+        }
+    }
+
+    /// Whether the open recording was sealed
+    /// ([`seal_recording`](Self::seal_recording)).
+    #[must_use]
+    pub fn is_sealed(&self) -> bool {
+        self.recording
+            .as_ref()
+            .is_some_and(|r| r.stage == Stage::Sealed)
     }
 
     /// Events a full queue dropped since the recording was handed off
