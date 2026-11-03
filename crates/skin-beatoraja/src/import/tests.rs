@@ -70,6 +70,33 @@ fn each_compile_follows_its_charges_and_each_admission_its_image_charge() {
 }
 
 #[test]
+fn a_system_image_is_charged_once_and_admits_nothing() {
+    use Event::Charge;
+    let json = skin(
+        A,
+        r#"{"id": "-111", "dst": [{"w": 1, "h": 1}]},
+           {"id": "-111", "filter": 1, "dst": [{"w": 1, "h": 1}]},
+           {"id": "-111", "dst": [{"w": 1, "h": 1}]},
+           {"id": "-111", "filter": 1, "dst": [{"w": 1, "h": 1}]},
+           {"id": "-100", "dst": [{"w": 1, "h": 1}]}"#,
+    );
+    let (r, trace, admits) = run(&json);
+    let imported = r.unwrap();
+    // Each filter's first: the element, then its image; a repeat shares
+    // the image; the dropped one charges its element alone.
+    assert_eq!(
+        trace,
+        [Charge, Charge, Charge, Charge, Charge, Charge, Charge]
+    );
+    assert_eq!(admits, 0);
+    let u = imported.report.usage;
+    assert_eq!(
+        (u.elements, u.images, u.frames, u.file_attempts),
+        (5, 2, 2, 0)
+    );
+}
+
+#[test]
 fn a_dropped_element_admits_nothing() {
     let json = skin(
         A,

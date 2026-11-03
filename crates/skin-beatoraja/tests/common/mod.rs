@@ -146,6 +146,22 @@ pub fn png(root: &Path, name: &str, w: u32, h: u32) {
     w8.write_image_data(&[255_u8].repeat(texels * 4)).unwrap();
 }
 
+/// A 24-bit BMP header declaring `w`×`h` with no pixels behind it: the
+/// importer reads headers only.
+pub fn bmp_header(w: i32, h: i32) -> Vec<u8> {
+    let mut out = b"BM".to_vec();
+    out.extend_from_slice(&54_u32.to_le_bytes()); // file size, not checked
+    out.extend_from_slice(&[0; 4]);
+    out.extend_from_slice(&54_u32.to_le_bytes()); // pixel offset
+    out.extend_from_slice(&40_u32.to_le_bytes()); // BITMAPINFOHEADER
+    out.extend_from_slice(&w.to_le_bytes());
+    out.extend_from_slice(&h.to_le_bytes());
+    out.extend_from_slice(&1_u16.to_le_bytes()); // planes
+    out.extend_from_slice(&24_u16.to_le_bytes()); // bits per pixel
+    out.extend_from_slice(&[0; 24]); // no compression, sizes, palette
+    out
+}
+
 /// A file with a font's magic number at `root/name`.
 pub fn font(root: &Path, name: &str) {
     write(root, name, &[0, 1, 0, 0, 0]);
