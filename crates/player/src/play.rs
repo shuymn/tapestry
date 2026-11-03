@@ -478,52 +478,6 @@ impl PlayerRig<'_> {
     }
 }
 
-/// Installs the adjustments in `rig` (design.md "Play Adjustments"): the
-/// bindings of `settings`'s key configs planned for the tap, the driver
-/// with the player's options and the display offset, its snapshots handed
-/// to the render thread, and the tap with its start gate to the input
-/// thread. In an autoplay session F1 and F2 come from the window
-/// ([`Controls::set_window_keys`]), as no keyboard reaches the tap.
-///
-/// # Errors
-///
-/// What the plan refuses of the bindings (more controls than the tap
-/// takes), or what the tap refuses.
-pub(crate) fn install_adjustments(
-    rig: &mut PlayerRig<'_>,
-    settings: &Settings,
-) -> anyhow::Result<()> {
-    let device = &settings.device;
-    let keys = game::KeyConfigs::from(device);
-    let config = game::AdjustmentConfig::of(device);
-    // A wrapping axis steps by its revolution; any other by the quantum
-    // `device.toml` sets.
-    let quantum = config
-        .counts_per_step
-        .and_then(game::adjustment::AxisQuantum::per_step);
-    let plan = config.plan(&keys, quantum, device.scratch.wrap)?;
-    let options = settings.player.options()?;
-    let (driver, mut tap, reader) =
-        game::AdjustDriver::new(&plan, options, rig.controls.tuning().display_offset_us())?;
-    if rig.autoplay {
-        let number = |code: u32| {
-            plan.bindings
-                .controls
-                .iter()
-                .find(|(c, _)| *c == input::TapControl::Key(eval::ControlId(code)))
-                .map(|&(_, n)| n)
-        };
-        let [f1, f2] = game::SPEED_KEYS;
-        let (keys, receiver) = input::window_keys();
-        tap.set_window_keys(receiver, [number(f1), number(f2)]);
-        rig.controls.set_window_keys(keys);
-    }
-    rig.render.presentation(reader);
-    rig.gate = Some(crate::start_gate::PlayerGate::install(&rig.input, tap));
-    rig.adjust = Some(driver);
-    Ok(())
-}
-
 /// The render thread's commit of the attempt prepared: while a loading
 /// lifetime runs (`loading`), it is ready first, so its progress reaches
 /// 100 before the commit and the end of loading.

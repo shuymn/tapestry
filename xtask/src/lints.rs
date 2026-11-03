@@ -185,6 +185,7 @@ pub const IN_PLAY: &[Site] = &[
     Site::File("crates/player/src/input_side.rs"),
     // The logic step and its sinks.
     Site::File("crates/game/src/adjustment.rs"),
+    Site::File("crates/game/src/driver.rs"),
     Site::Fns(
         "crates/game/src/adjust_keys.rs",
         &["AdjustmentPlan::observation"],
@@ -244,6 +245,9 @@ pub const IN_PLAY: &[Site] = &[
         "crates/player/src/play.rs",
         &[
             "PlayerRig::sync",
+            "PlayerRig::serve_adjustments",
+            "serve_adjustments",
+            "PlayerPump::display_offset_us",
             "PlayerRig::send_end",
             "PlayerRig::now",
             "PlayerRig::wait",

@@ -15,7 +15,7 @@
 //!   spare box ([`game::Restorer::replan`]).
 //!
 //! Every run installs the gate with the adjustments' driver
-//! ([`crate::play::install_adjustments`]).
+//! (`install_adjustments` in `main.rs`).
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
