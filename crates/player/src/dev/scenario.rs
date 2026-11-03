@@ -182,8 +182,9 @@ impl UntilCommand {
     ///
     /// A quit is checked by what the play did, not by when it was asked
     /// for: the play's own cause is the quit, unless the key came in a
-    /// Closing that had started, where it does nothing (told apart from a
-    /// quit that was taken); Closing follows only a played attempt outside
+    /// Closing that had started before it was sent, where it does nothing,
+    /// whether a failure or an earlier quit started it (told apart from a
+    /// quit that was taken, whose Closing starts as it is taken); Closing follows only a played attempt outside
     /// autoplay, and must once the play's evaluation finalized its chart's
     /// start.
     /// A retry is taken once: the play, its tail or its Closing ended by
@@ -202,7 +203,9 @@ impl UntilCommand {
                 "the quit came after the play completed, which skips to its result: \
                  use command = \"skip\"",
             ),
-            Self::Quit if !quit && report.closing.is_some_and(|c| c.started_at <= sent_at) => {
+            // Sent once a Closing had started, by a failure or an earlier
+            // quit alike: discarded, whatever the play's own cause.
+            Self::Quit if report.closing.is_some_and(|c| c.started_at < sent_at) => {
                 Some("the quit came during Closing, where it does nothing")
             }
             Self::Quit if !quit => Some("the play ended for another cause before the quit"),
@@ -1442,6 +1445,16 @@ mod tests {
         assert_eq!(
             q.missed(&ended(quit, Some(1_498_000), None), false, at),
             Some("the quit during play did not enter Closing")
+        );
+        // Sent into a Closing an earlier quit started: ignored too, though
+        // the play's cause is a quit.
+        assert_eq!(
+            q.missed(
+                &ended(quit, Some(800_000), closed(800_000, ran_out)),
+                false,
+                at
+            ),
+            Some("the quit came during Closing, where it does nothing")
         );
         // Sent into the Closing of a failure: ignored, told apart.
         assert_eq!(
