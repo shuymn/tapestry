@@ -43,7 +43,7 @@ fn header(d: &TempDir) -> LuaHeader {
 }
 
 /// A play snapshot.
-fn play(autoplay: Fact<bool>, chart_rank: Fact<ChartRank>) -> ImportFacts {
+fn play(autoplay: Fact<bool>, chart_rank: Fact<Option<ChartRank>>) -> ImportFacts {
     ImportFacts {
         scene: Scene::Play,
         autoplay,
@@ -158,24 +158,25 @@ fn the_judgment_class_follows_the_source_s_bands() {
          x = x * 10",
     );
     let cases = [
-        (Rank(0), Some(VeryHard)),
-        (Rank(1), Some(Hard)),
-        (Rank(2), Some(Normal)),
-        (Rank(3), Some(Easy)),
-        (Rank(4), Some(VeryEasy)),
-        (Rank(5), None),
-        (Rank(-1), None),
-        (Defex(9_999), None),
-        (Defex(10_000), Some(VeryHard)),
-        (Defex(34_999), Some(VeryHard)),
-        (Defex(35_000), Some(Hard)),
-        (Defex(59_999), Some(Hard)),
-        (Defex(60_000), Some(Normal)),
-        (Defex(84_999), Some(Normal)),
-        (Defex(85_000), Some(Easy)),
-        (Defex(109_999), Some(Easy)),
-        (Defex(110_000), Some(VeryEasy)),
-        (Defex(200_000), Some(VeryEasy)),
+        (None, Some(Normal)),
+        (Some(Rank(0)), Some(VeryHard)),
+        (Some(Rank(1)), Some(Hard)),
+        (Some(Rank(2)), Some(Normal)),
+        (Some(Rank(3)), Some(Easy)),
+        (Some(Rank(4)), Some(VeryEasy)),
+        (Some(Rank(5)), None),
+        (Some(Rank(-1)), None),
+        (Some(Defex(9_999)), None),
+        (Some(Defex(10_000)), Some(VeryHard)),
+        (Some(Defex(34_999)), Some(VeryHard)),
+        (Some(Defex(35_000)), Some(Hard)),
+        (Some(Defex(59_999)), Some(Hard)),
+        (Some(Defex(60_000)), Some(Normal)),
+        (Some(Defex(84_999)), Some(Normal)),
+        (Some(Defex(85_000)), Some(Easy)),
+        (Some(Defex(109_999)), Some(Easy)),
+        (Some(Defex(110_000)), Some(VeryEasy)),
+        (Some(Defex(200_000)), Some(VeryEasy)),
     ];
     for (rank, want) in cases {
         let facts = play(Fact::Unavailable, Fact::Known(rank));
@@ -197,7 +198,7 @@ fn course_mode_is_a_constant_and_records_nothing() {
 #[test]
 fn an_unavailable_fact_refuses_at_the_read() {
     let d = folder("local a = 1\nx = ms.option(33) and 1 or 0");
-    let facts = play(Fact::Unavailable, Fact::Known(ChartRank::Rank(2)));
+    let facts = play(Fact::Unavailable, Fact::Known(Some(ChartRank::Rank(2))));
     assert_eq!(
         located(import(&d, &facts)),
         (unavailable(33), "s.luaskin".to_owned(), BODY_LINE + 1)
@@ -229,7 +230,7 @@ fn protected(call: &str) -> [String; 3] {
 fn protected_calls_do_not_catch_a_fact_refusal_or_a_pending_read() {
     let line = BODY_LINE + 1;
     let at = |why| (why, "s.luaskin".to_owned(), line);
-    let known = play(Fact::Known(true), Fact::Known(ChartRank::Rank(2)));
+    let known = play(Fact::Known(true), Fact::Known(Some(ChartRank::Rank(2))));
     for body in protected("33") {
         let facts = play(Fact::Unavailable, Fact::Unavailable);
         assert_eq!(
@@ -260,7 +261,7 @@ fn protected_calls_do_not_catch_a_fact_refusal_or_a_pending_read() {
 
 #[test]
 fn an_argument_that_is_not_an_integer_refuses() {
-    let known = play(Fact::Known(true), Fact::Known(ChartRank::Rank(2)));
+    let known = play(Fact::Known(true), Fact::Known(Some(ChartRank::Rank(2))));
     for arg in ["33.0", "2^31", "\"33\"", ""] {
         let d = folder(&format!("local a = 1\nx = ms.option({arg}) and 1 or 0"));
         assert_eq!(
@@ -273,7 +274,7 @@ fn an_argument_that_is_not_an_integer_refuses() {
 
 #[test]
 fn an_integer_outside_i32_refuses() {
-    let known = play(Fact::Known(true), Fact::Known(ChartRank::Rank(2)));
+    let known = play(Fact::Known(true), Fact::Known(Some(ChartRank::Rank(2))));
     for arg in ["2147483648", "-2147483649"] {
         let d = folder(&format!("local a = 1\nx = ms.option({arg}) and 1 or 0"));
         assert_eq!(
@@ -297,14 +298,14 @@ fn an_integer_outside_i32_refuses() {
 #[test]
 fn an_id_the_source_does_not_know_is_false_and_unrecorded() {
     let d = folder("assert(ms.option(99999) == false and ms.option(-99999) == false)");
-    let known = play(Fact::Known(true), Fact::Known(ChartRank::Rank(2)));
+    let known = play(Fact::Known(true), Fact::Known(Some(ChartRank::Rank(2))));
     assert_eq!(imported(import(&d, &known)).facts, deps(&[]));
 }
 
 #[test]
 fn another_scene_refuses_before_any_lua_runs() {
     let d = folder("error(\"the configured pass ran\")");
-    let mut facts = play(Fact::Known(true), Fact::Known(ChartRank::Rank(2)));
+    let mut facts = play(Fact::Known(true), Fact::Known(Some(ChartRank::Rank(2))));
     facts.scene = Scene::Result;
     match import(&d, &facts) {
         Err(ImportError::Lua {
@@ -317,7 +318,7 @@ fn another_scene_refuses_before_any_lua_runs() {
 
 #[test]
 fn a_changed_or_unavailable_read_fact_no_longer_holds() {
-    let rank = |r| Fact::Known(ChartRank::Rank(r));
+    let rank = |r| Fact::Known(Some(ChartRank::Rank(r)));
     let d = folder("x = ms.option(33) and 1 or 0");
     let i = imported(import(&d, &play(Fact::Known(true), Fact::Unavailable)));
     assert!(i.facts.holds(&play(Fact::Known(true), Fact::Unavailable)));
@@ -338,9 +339,9 @@ fn a_change_to_an_unread_fact_still_holds() {
     let ranks = [
         Fact::Unavailable,
         Fact::Pending,
-        Fact::Known(ChartRank::Rank(0)),
-        Fact::Known(ChartRank::Rank(9)),
-        Fact::Known(ChartRank::DefExRankMilli(120_000)),
+        Fact::Known(Some(ChartRank::Rank(0))),
+        Fact::Known(Some(ChartRank::Rank(9))),
+        Fact::Known(Some(ChartRank::DefExRankMilli(120_000))),
     ];
     for rank in ranks {
         assert!(i.facts.holds(&play(Fact::Known(true), rank)), "{rank:?}");
@@ -349,16 +350,16 @@ fn a_change_to_an_unread_fact_still_holds() {
     let d = folder("x = ms.option(182) and 1 or 0");
     let i = imported(import(
         &d,
-        &play(Fact::Unavailable, Fact::Known(ChartRank::Rank(2))),
+        &play(Fact::Unavailable, Fact::Known(Some(ChartRank::Rank(2)))),
     ));
-    let defex = Fact::Known(ChartRank::DefExRankMilli(70_000));
+    let defex = Fact::Known(Some(ChartRank::DefExRankMilli(70_000)));
     assert!(i.facts.holds(&play(Fact::Unavailable, defex)));
     assert!(i.facts.holds(&play(Fact::Known(false), defex)));
 }
 
 #[test]
 fn another_scene_never_holds() {
-    let on = play(Fact::Known(true), Fact::Known(ChartRank::Rank(2)));
+    let on = play(Fact::Known(true), Fact::Known(Some(ChartRank::Rank(2))));
     let result = ImportFacts {
         scene: Scene::Result,
         ..on
@@ -377,7 +378,7 @@ fn another_scene_never_holds() {
 
 #[test]
 fn reads_are_recorded_once_in_first_read_order() {
-    let facts = play(Fact::Known(true), Fact::Known(ChartRank::Rank(2)));
+    let facts = play(Fact::Known(true), Fact::Known(Some(ChartRank::Rank(2))));
     let normal = class(Some(JudgeClass::Normal));
     for (ids, want) in [
         ("182, 32, -33, 33, 181, 182", [normal, autoplay(true)]),
@@ -412,11 +413,43 @@ fn a_base_import_stops_pending_at_a_chart_fact() {
     // The attempt's final snapshot imports.
     let i = imported(import(
         &d,
-        &play(Fact::Known(true), Fact::Known(ChartRank::Rank(2))),
+        &play(Fact::Known(true), Fact::Known(Some(ChartRank::Rank(2)))),
     ));
     assert_eq!(
         i.facts,
         deps(&[autoplay(true), class(Some(JudgeClass::Normal))])
     );
+    assert_eq!(x(i), 1);
+}
+
+/// The snapshot's rank as the caller converts the preset's reading:
+/// `rules::JudgeRank` one to one, no rank kept as none.
+fn chart_rank(read: Option<rules::JudgeRank>) -> Option<ChartRank> {
+    read.map(|r| match r {
+        rules::JudgeRank::Rank(r) => ChartRank::Rank(r),
+        rules::JudgeRank::DefExRankMilli(m) => ChartRank::DefExRankMilli(m),
+    })
+}
+
+#[test]
+fn a_chart_with_no_rank_header_is_judged_and_classed_as_rank_2() {
+    // Every shipped preset reads no rank from a chart without `#RANK` or
+    // `#DEFEXRANK` and judges it with its absent window, which is its
+    // `#RANK 2` window: the class of `#RANK 2` is the class it plays.
+    for name in rules::BUILT_IN_PRESETS {
+        let p = rules::built_in(name).unwrap();
+        let read = p.headers.read(&[]).rank;
+        assert_eq!(read, None, "{name}");
+        let absent = p.window_policy.prepare(&p.tables, read);
+        let rank_2 = p
+            .window_policy
+            .prepare(&p.tables, Some(rules::JudgeRank::Rank(2)));
+        assert!(absent.is_some(), "{name}");
+        assert_eq!(absent, rank_2, "{name}");
+    }
+    let d = folder("x = ms.option(182) and 1 or 0");
+    let facts = play(Fact::Unavailable, Fact::Known(chart_rank(None)));
+    let i = imported(import(&d, &facts));
+    assert_eq!(i.facts, deps(&[class(Some(JudgeClass::Normal))]));
     assert_eq!(x(i), 1);
 }

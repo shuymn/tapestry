@@ -793,7 +793,7 @@ fn known() -> super::facts::ImportFacts {
     ImportFacts {
         scene: Scene::Play,
         autoplay: Fact::Known(true),
-        chart_rank: Fact::Known(ChartRank::Rank(2)),
+        chart_rank: Fact::Known(Some(ChartRank::Rank(2))),
     }
 }
 

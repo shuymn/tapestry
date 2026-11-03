@@ -2144,8 +2144,8 @@ pub fn skin_lua(data: &[u8]) -> Result<(Header, Result<LuaOutcome, ImportError>)
 /// The play snapshot of a `skin_lua` input's first two bytes: autoplay
 /// unavailable, off, on or pending by `a` modulo 4, on a result scene
 /// for 255; the chart's rank unavailable, pending, a `#RANK` from -8 to
-/// 55 or a `#DEFEXRANK` from 0 to 315 % in steps of 5 % by `r`'s low two
-/// bits and the rest.
+/// 54 or none read for 55, or a `#DEFEXRANK` from 0 to 315 % in steps of
+/// 5 % by `r`'s low two bits and the rest.
 #[must_use]
 pub fn lua_facts(a: u8, r: u8) -> ImportFacts {
     let scene = if a == u8::MAX {
@@ -2163,8 +2163,9 @@ pub fn lua_facts(a: u8, r: u8) -> ImportFacts {
     let chart_rank = match r % 4 {
         0 => Fact::Unavailable,
         1 => Fact::Pending,
-        2 => Fact::Known(ChartRank::Rank(i32::from(v) - 8)),
-        _ => Fact::Known(ChartRank::DefExRankMilli(i64::from(v) * 5_000)),
+        2 if v == 63 => Fact::Known(None),
+        2 => Fact::Known(Some(ChartRank::Rank(i32::from(v) - 8))),
+        _ => Fact::Known(Some(ChartRank::DefExRankMilli(i64::from(v) * 5_000))),
     };
     ImportFacts {
         scene,

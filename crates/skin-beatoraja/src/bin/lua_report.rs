@@ -1,9 +1,11 @@
 //! The Lua conversion report (docs/stage3.md §3, the conversion report),
 //! for the developer's PC:
-//! `lua_report [--autoplay on|off] [--rank <n>|--rank defex <milli>] <root> <entry> [<root> <entry>]...`
+//! `lua_report [--autoplay on|off] [--rank <n>|defex <milli>|none]
+//! <root> <entry> [<root> <entry>]...`
 //! imports each Lua skin, `entry` relative to its skin folder `root`,
 //! with its default configuration against a play scene's import facts
-//! (autoplay and the chart's rank as given, each unavailable when not)
+//! (autoplay and the rank the preset read as given, `none` for a chart
+//! with no rank header; each unavailable when not given)
 //! and prints what did not convert as allowlisted counts and outcomes,
 //! the import facts it read and recorded, each skin by its index in the
 //! arguments and each file by its index among those it consulted. It
@@ -15,7 +17,8 @@ use skin_beatoraja::Cancel;
 use skin_beatoraja::lua::facts::{ChartRank, Fact, ImportFacts, Scene};
 use skin_beatoraja::lua::survey::survey;
 
-const USAGE: &str = "usage: lua_report [--autoplay on|off] [--rank <n>|--rank defex <milli>]                      <root> <entry> [<root> <entry>]...";
+const USAGE: &str = "usage: lua_report [--autoplay on|off] [--rank <n>|defex <milli>|none] \
+                     <root> <entry> [<root> <entry>]...";
 
 fn usage() -> ! {
     eprintln!("{USAGE}");
@@ -38,12 +41,16 @@ fn facts(mut args: &[String]) -> (ImportFacts, &[String]) {
             }
             [flag, defex, m, rest @ ..] if flag == "--rank" && defex == "defex" => {
                 let m = m.parse().unwrap_or_else(|_| usage());
-                facts.chart_rank = Fact::Known(ChartRank::DefExRankMilli(m));
+                facts.chart_rank = Fact::Known(Some(ChartRank::DefExRankMilli(m)));
+                args = rest;
+            }
+            [flag, none, rest @ ..] if flag == "--rank" && none == "none" => {
+                facts.chart_rank = Fact::Known(None);
                 args = rest;
             }
             [flag, r, rest @ ..] if flag == "--rank" => {
                 let r = r.parse().unwrap_or_else(|_| usage());
-                facts.chart_rank = Fact::Known(ChartRank::Rank(r));
+                facts.chart_rank = Fact::Known(Some(ChartRank::Rank(r)));
                 args = rest;
             }
             _ => return (facts, args),

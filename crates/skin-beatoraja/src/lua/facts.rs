@@ -14,7 +14,10 @@
 //! - 180 to 184, the chart's judgment class (`:448-452`): the source's
 //!   bands over [`ImportFacts::chart_rank`], the rank the play preset's
 //!   header policy reads (which the evaluator judges with), where the
-//!   source bands the chart's raw rank;
+//!   source bands the chart's raw rank. A chart the policy reads no rank
+//!   from is judged with the window policy's absent window, which is the
+//!   `#RANK 2` window in every shipped preset, so its class is
+//!   [`JudgeClass::Normal`], the class of `#RANK 2`;
 //! - 290, course mode (`:526-527`): a constant `false`, as there are no
 //!   courses.
 //!
@@ -52,7 +55,7 @@ pub enum Fact<T> {
     Unavailable,
 }
 
-/// The rank the play preset's header policy reads, as `rules::JudgeRank`
+/// A rank the play preset's header policy reads, as `rules::JudgeRank`
 /// has it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ChartRank {
@@ -72,6 +75,10 @@ pub enum JudgeClass {
     VeryEasy,
 }
 
+/// The rank whose window the play uses when the header policy reads none:
+/// every shipped preset's absent window is its `#RANK 2` window.
+const ABSENT_RANK: ChartRank = ChartRank::Rank(2);
+
 /// The option id of [`JudgeClass::VeryHard`]; the others follow it.
 const JUDGE_CLASS_FIRST: i32 = 180;
 const AUTOPLAY_OFF: i32 = 32;
@@ -87,15 +94,17 @@ impl JudgeClass {
         Self::VeryEasy,
     ];
 
-    /// The class of `rank` by the source's bands: `j == 0 || 10 <= j < 35`
-    /// very hard, `j == 1 || 35 <= j < 60` hard, `j == 2 || 60 <= j < 85`
-    /// normal, `j == 3 || 85 <= j < 110` easy, `j == 4 || j >= 110` very
-    /// easy. A `#RANK` is `j` itself; a `#DEFEXRANK` is its whole percent
-    /// from 10 up, since the source's integer below 10 is a `#RANK` code.
-    /// `None` for a `j` in no band.
+    /// The class of `rank`, the header policy's reading, by the source's
+    /// bands: `j == 0 || 10 <= j < 35` very hard, `j == 1 || 35 <= j < 60`
+    /// hard, `j == 2 || 60 <= j < 85` normal, `j == 3 || 85 <= j < 110`
+    /// easy, `j == 4 || j >= 110` very easy. A `#RANK` is `j` itself; a
+    /// `#DEFEXRANK` is its whole percent from 10 up, since the source's
+    /// integer below 10 is a `#RANK` code. No rank read is the class of
+    /// `#RANK 2`, whose window the play then uses. `None` for a `j` in no
+    /// band.
     #[must_use]
-    pub fn of(rank: ChartRank) -> Option<Self> {
-        let j = match rank {
+    pub fn of(rank: Option<ChartRank>) -> Option<Self> {
+        let j = match rank.unwrap_or(ABSENT_RANK) {
             ChartRank::Rank(r) => i64::from(r),
             ChartRank::DefExRankMilli(m) => Some(m.div_euclid(1_000)).filter(|&j| j >= 10)?,
         };
@@ -124,8 +133,9 @@ pub struct ImportFacts {
     /// [`Scene::Play`] only.
     pub autoplay: Fact<bool>,
     /// The rank the play preset's header policy reads from the drawn
-    /// chart; [`Fact::Unavailable`] when it reads none.
-    pub chart_rank: Fact<ChartRank>,
+    /// chart, `None` when it reads none (`rules::ReadHeaders::rank`);
+    /// [`Fact::Unavailable`] when there is no chart.
+    pub chart_rank: Fact<Option<ChartRank>>,
 }
 
 impl ImportFacts {
