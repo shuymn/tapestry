@@ -303,14 +303,10 @@ fn every_walk_over_a_tree_stops_at_the_depth_cap() {
     );
     assert_eq!(why(import(&entry)), fatal);
     // Classification through helpers, each calling the one before.
-    let mut helpers = String::from(
-        "local function h0() return ms.number(110) > 0 end
-",
-    );
+    let mut helpers = String::from("local function h0() return ms.number(110) > 0 end\n");
     for k in 1..150 {
         helpers.push_str(&format!(
-            "local function h{k}() return h{}() and true end
-",
+            "local function h{k}() return h{}() and true end\n",
             k - 1
         ));
     }
@@ -327,6 +323,55 @@ fn every_walk_over_a_tree_stops_at_the_depth_cap() {
         &image(&format!("function() {locals} return a149 > 0 end")),
     );
     assert_eq!(why(import(&entry)), fatal);
+}
+
+/// A skin whose configured pass makes `count` closures of one function
+/// whose body is 180 locals of 180-term sums, each capturing its own
+/// loop index when `distinct`.
+fn many(count: usize, distinct: bool) -> String {
+    let sum = vec!["1"; 180].join("+");
+    let body: String = (0..180).map(|i| format!("local v{i}={sum}\n")).collect();
+    let own = if distinct { "local own = k\n" } else { "" };
+    format!(
+        "local s = {{ type = 0, name = \"t\", w = 1920, h = 1080 }}\n\
+         if not skin_config then return s end\n\
+         s.extra = {{}}\n\
+         for i = 1, {count} do local k = i s.extra[i] = function()\n\
+         {own}{body}return true\n\
+         end end\n\
+         return s"
+    )
+}
+
+#[test]
+fn a_function_made_in_a_loop_is_classified_once() {
+    // 60 000 closures of one function, nothing captured: its body is
+    // walked once.
+    let i = import(&many(60_000, false)).unwrap();
+    assert_eq!(i.callbacks.len(), 60_000);
+    // One unit a callable, and the body once.
+    assert!(i.usage.analysis_work < 150_000, "{}", i.usage.analysis_work);
+    // Each capturing its own value, they are classified apart, under the
+    // cumulative work allowance.
+    assert_eq!(
+        why(import(&many(600, true))),
+        LuaWhy::Limit(LuaLimit::AnalysisWork)
+    );
+}
+
+#[test]
+fn classification_sees_cancellation() {
+    let d = folder(&many(600, true));
+    let cancel = Cancel::new();
+    let h = read_lua_header(d.path(), "s.luaskin", &cancel).unwrap();
+    // Cancelled once the configured pass has converted its table: only
+    // the analysis's own polling can see it before its work cap would.
+    let remote = cancel.clone();
+    super::tests::at_converted(move || remote.cancel());
+    assert_eq!(
+        why(h.import(&Config::defaults(h.header()), &cancel)),
+        LuaWhy::Cancelled
+    );
 }
 
 /// The model fields read by the counts the oracle sets, by property id:

@@ -404,9 +404,26 @@ struct Lexer<'a> {
     src: &'a [u8],
     pos: usize,
     line: u32,
+    /// The cancellation request, seen every [`TICK_EVERY`] bytes scanned.
+    cancel: &'a dyn Fn() -> bool,
+    steps: u32,
 }
 
+/// How many bytes the lexer scans between two looks at the cancellation
+/// request, whatever token they are in.
+const TICK_EVERY: u32 = 1 << 16;
+
 impl Lexer<'_> {
+    /// One byte scanned: the cancellation request seen every
+    /// [`TICK_EVERY`].
+    fn tick(&mut self) -> Result<(), Fail> {
+        self.steps = self.steps.wrapping_add(1);
+        if self.steps.is_multiple_of(TICK_EVERY) && (self.cancel)() {
+            return Err(Fail::Cancelled);
+        }
+        Ok(())
+    }
+
     fn cur(&self) -> Option<u8> {
         self.src.get(self.pos).copied()
     }
@@ -435,6 +452,7 @@ impl Lexer<'_> {
     fn long_open(&mut self) -> Result<Option<usize>, Fail> {
         let mut k = 1;
         while self.at(k) == Some(b'=') {
+            self.tick()?;
             k += 1;
         }
         if self.at(k) == Some(b'[') {
@@ -454,11 +472,13 @@ impl Lexer<'_> {
             self.newline();
         }
         loop {
+            self.tick()?;
             match self.cur() {
                 None => return Err(self.fail()),
                 Some(b']') => {
                     let mut k = 1;
                     while self.at(k) == Some(b'=') {
+                        self.tick()?;
                         k += 1;
                     }
                     if k - 1 == level && self.at(k) == Some(b']') {
@@ -489,6 +509,7 @@ impl Lexer<'_> {
     /// A quoted string's content, the cursor past its opening quote.
     fn short_string(&mut self, quote: u8, out: &mut Vec<u8>) -> Result<(), Fail> {
         loop {
+            self.tick()?;
             let Some(c) = self.cur() else {
                 return Err(self.fail());
             };
@@ -554,6 +575,7 @@ impl Lexer<'_> {
             b'z' => {
                 self.pos += 1;
                 while let Some(c) = self.cur() {
+                    self.tick()?;
                     if c == b'\n' || c == b'\r' {
                         self.newline();
                     } else if is_space(c) {
@@ -572,6 +594,7 @@ impl Lexer<'_> {
                 let mut v: u32 = 0;
                 let mut digits = 0;
                 while let Some(d) = self.cur().and_then(|d| char::from(d).to_digit(16)) {
+                    self.tick()?;
                     v = v
                         .checked_mul(16)
                         .and_then(|v| v.checked_add(d))
@@ -615,6 +638,7 @@ impl Lexer<'_> {
             b"Ee"
         };
         loop {
+            self.tick()?;
             match self.cur() {
                 Some(c) if expo.contains(&c) => {
                     self.pos += 1;
@@ -636,6 +660,7 @@ impl Lexer<'_> {
     /// The next token, its strings decoded into `bytes`.
     fn next(&mut self, ast: &mut Ast) -> Result<Token, Fail> {
         loop {
+            self.tick()?;
             let Some(c) = self.cur() else {
                 return Ok(self.token(Tok::Eof, self.pos));
             };
@@ -653,6 +678,7 @@ impl Lexer<'_> {
                         continue;
                     }
                     while let Some(c) = self.cur() {
+                        self.tick()?;
                         if c == b'\n' || c == b'\r' {
                             break;
                         }
@@ -674,6 +700,7 @@ impl Lexer<'_> {
         let tok = match c {
             c if is_alpha(c) => {
                 while self.cur().is_some_and(is_alnum) {
+                    self.tick()?;
                     self.pos += 1;
                 }
                 let word = self.src.get(start..self.pos).unwrap_or_default();
@@ -904,6 +931,8 @@ pub(crate) fn parse(src: &[u8], charged: &mut u64, cancel: &dyn Fn() -> bool) ->
         src,
         pos: 0,
         line: 1,
+        cancel,
+        steps: 0,
     };
     let mut ast = Ast::default();
     let tok = lex.next(&mut ast)?;
@@ -1808,6 +1837,39 @@ mod tests {
             parse(b"local a = 1 + 2 + 3", &mut n, &|| false).err(),
             Some(Fail::Nodes)
         );
+    }
+
+    #[test]
+    fn the_lexer_sees_cancellation_inside_a_long_token() {
+        // One token of a mebibyte each, with almost no nodes: only the
+        // lexer's byte count can see the request.
+        let mib = 1 << 20;
+        let zeros = "0".repeat(mib);
+        let eqs = "=".repeat(mib);
+        let spaces = " ".repeat(mib);
+        let letters = "a".repeat(mib);
+        for src in [
+            format!("local s = \"\\u{{{zeros}41}}\""),
+            format!("local s = \"{letters}\""),
+            format!("local s = [[{letters}]]"),
+            format!("--[[{letters}]]"),
+            format!("-- {letters}"),
+            format!("--[{eqs}"),
+            format!("local s = [{eqs}[x]{eqs}]"),
+            format!("{spaces}return"),
+            format!("local n = {zeros}"),
+            format!("local {letters} = 1"),
+        ] {
+            let mut n = 0;
+            let r = parse(src.as_bytes(), &mut n, &|| true);
+            assert_eq!(r.err(), Some(Fail::Cancelled), "{}", &src[..12]);
+            let mut n = 0;
+            assert!(
+                parse(src.as_bytes(), &mut n, &|| false).is_ok(),
+                "{}",
+                &src[..12]
+            );
+        }
     }
 
     #[test]

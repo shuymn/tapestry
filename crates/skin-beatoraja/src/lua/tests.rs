@@ -42,6 +42,11 @@ pub(crate) fn expansion_witness() {
     }
 }
 
+/// Runs `f` when a conversion has next read its whole table.
+pub(crate) fn at_converted(f: impl Fn() + 'static) {
+    AT_CONVERTED.with(|a| *a.borrow_mut() = Some(Box::new(f)));
+}
+
 /// Runs `f` when lowering next expands an instance.
 pub(crate) fn at_expansion(f: impl Fn() + 'static) {
     AT_EXPANSION.with(|a| *a.borrow_mut() = Some(Box::new(f)));

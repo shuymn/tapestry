@@ -82,6 +82,9 @@ pub struct LuaUsage {
     /// Expression nodes the lowering expanded
     /// ([`MAX_EXPANDED_NODES`](super::limits::MAX_EXPANDED_NODES)).
     pub expanded: u64,
+    /// Units of the callbacks' analysis work
+    /// ([`MAX_ANALYSIS_WORK`](super::limits::MAX_ANALYSIS_WORK)).
+    pub analysis_work: u64,
 }
 
 /// The counts a pass starts from: the earlier passes' use.
@@ -199,6 +202,11 @@ impl Ledger {
     /// Whether cancellation was requested, outside Lua.
     pub(crate) fn cancelled(&self) -> bool {
         self.cancel.is_cancelled()
+    }
+
+    /// The candidate's cancellation request, for the work after the VM.
+    pub(crate) fn cancel(&self) -> Cancel {
+        self.cancel.clone()
     }
 
     /// The instruction hook: one step of [`INSTRUCTION_STEP`] charged.

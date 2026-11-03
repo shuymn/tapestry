@@ -52,7 +52,7 @@ use super::timer::{Custom, Timer};
 use super::{Cx, Prop};
 use crate::error::ImportError;
 use crate::lua::callback::{
-    Analysis, Callee, Captured, Disposition, TOO_DEEP, Ty, numeral, resolve_callee, tree,
+    Analysis, Callee, Captured, Disposition, Ty, fatal as sentinel, numeral, resolve_callee, tree,
 };
 use crate::lua::limits::{MAX_AST_DEPTH, MAX_EXPANDED_NODES};
 use crate::lua::syntax::{Ast, Bin, Expr, Stmt, Un};
@@ -106,6 +106,11 @@ thread_local! {
 enum Stop {
     Unsupported(Unsupported),
     Fatal(LuaWhy),
+}
+
+/// A walk's stop for `why`: fatal for a cap or cancellation.
+fn stop(why: Unsupported) -> Stop {
+    sentinel(why).map_or(Stop::Unsupported(why), Stop::Fatal)
 }
 
 type R<T> = Result<T, Stop>;
@@ -187,6 +192,7 @@ impl Lower<'_> {
             )))?;
         let mut locals = Vec::new();
         for &s in ast.list(f.body) {
+            an.charge(1).map_err(stop)?;
             match ast.stmt(s) {
                 Stmt::Local { names, exprs } => {
                     if let (&[d], &[e]) = (ast.list(names), ast.list(exprs)) {
@@ -515,7 +521,7 @@ impl Lower<'_> {
     /// The critical part a read reachable from instance `i` shows, its
     /// helpers included: what a callback's role depends on. A worklist,
     /// each instance visited once, so no nesting deepens it.
-    fn part(&self, i: u32) -> Option<CriticalPart> {
+    fn part(&self, i: u32) -> R<Option<CriticalPart>> {
         let mut seen = vec![i];
         let mut pending = vec![i];
         let mut stack: Vec<u32> = Vec::new();
@@ -528,6 +534,7 @@ impl Lower<'_> {
             };
             stack.clear();
             for &s in ast.list(f.body) {
+                self.an.charge(1).map_err(stop)?;
                 match ast.stmt(s) {
                     Stmt::Local { exprs, .. } | Stmt::Return(exprs) => {
                         stack.extend_from_slice(ast.list(exprs));
@@ -536,6 +543,7 @@ impl Lower<'_> {
                 }
             }
             while let Some(e) = stack.pop() {
+                self.an.charge(1).map_err(stop)?;
                 match ast.expr(e) {
                     Expr::Paren(x) | Expr::Unary(_, x) => stack.push(x),
                     Expr::Binary(_, a, b) => {
@@ -562,7 +570,7 @@ impl Lower<'_> {
                                 && let Some(IntProp::Shown(v)) = id.map(property::int_by_id)
                                 && let Some(part) = v.part()
                             {
-                                return Some(part);
+                                return Ok(Some(part));
                             }
                         }
                         Err(_) => {}
@@ -571,7 +579,7 @@ impl Lower<'_> {
                 }
             }
         }
-        None
+        Ok(None)
     }
 
     /// Runs `f` one level deeper into a walk: past [`MAX_AST_DEPTH`] the
@@ -580,6 +588,7 @@ impl Lower<'_> {
         if self.depth >= MAX_AST_DEPTH {
             return Err(Stop::Fatal(LuaWhy::Limit(LuaLimit::AstDepth)));
         }
+        self.an.charge(1).map_err(stop)?;
         self.depth += 1;
         let r = f(self);
         self.depth -= 1;
@@ -670,12 +679,19 @@ impl Cx<'_> {
             sizes: Vec::new(),
             depth: 0,
         };
+        let part = |l: &Lower<'_>| match l.part(inst) {
+            Ok(p) => Ok(p),
+            Err(Stop::Fatal(why)) => Err(fatal(why)),
+            Err(Stop::Unsupported(_)) => Ok(None),
+        };
         let ty = match an.classify(inst) {
             Ok(ty) => ty,
-            Err(f) if f.why == TOO_DEEP => {
-                return Err(fatal(LuaWhy::Limit(LuaLimit::AstDepth)));
+            Err(f) => {
+                if let Some(why) = sentinel(f.why) {
+                    return Err(fatal(why));
+                }
+                return Ok(Lowering::Unsupported(f.why, part(&l)?));
             }
-            Err(f) => return Ok(Lowering::Unsupported(f.why, l.part(inst))),
         };
         let r = l.size(inst).and_then(|n| {
             let total = an.expanded.get().saturating_add(n);
@@ -690,10 +706,13 @@ impl Cx<'_> {
                 l.out.src = src;
                 Ok(Lowering::Lowered(l.out, ty))
             }
-            Ok(_) => Ok(Lowering::Unsupported(Unsupported::Type, l.part(inst))),
+            Ok(_) => Ok(Lowering::Unsupported(Unsupported::Type, part(&l)?)),
             Err(Stop::Unsupported(why)) => {
-                let part = l.out.part.or_else(|| l.part(inst));
-                Ok(Lowering::Unsupported(why, part))
+                let found = match l.out.part {
+                    Some(p) => Some(p),
+                    None => part(&l)?,
+                };
+                Ok(Lowering::Unsupported(why, found))
             }
             Err(Stop::Fatal(why)) => Err(fatal(why)),
         }

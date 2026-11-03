@@ -28,9 +28,11 @@ use super::syntax::{Ast, CHUNK_ENV, DeclKind, Form, TAG_PREFIX};
 /// candidate is refused.
 pub(crate) const MAX_ADDED_BYTES: usize = 1 << 24;
 
-/// How many constructors are rewritten between two looks at the
-/// cancellation request.
+/// How many constructors are rewritten, or edits copied, between two
+/// looks at the cancellation request.
 const CHECK_EVERY: usize = 4_096;
+/// How many bytes are added between two looks at it.
+const CHECK_BYTES: usize = 1 << 16;
 
 /// Why a chunk was not instrumented.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -95,9 +97,14 @@ pub(crate) fn instrument(
     let t = tagger(&ast.tag_names);
     let mut edits: Vec<Edit> = Vec::new();
     let mut added = 0_usize;
+    let mut next_check = CHECK_BYTES;
     for (index, f) in ast.funcs.iter().enumerate().skip(1) {
-        if index % CHECK_EVERY == 0 && cancelled() {
+        // Seen every so many constructors and every so many bytes added.
+        if (index % CHECK_EVERY == 0 || added >= next_check) && cancelled() {
             return Err(Stop::Cancelled);
+        }
+        if added >= next_check {
+            next_check = added.saturating_add(CHECK_BYTES);
         }
         let id = (u64::from(file) << 32) | u64::try_from(index).map_err(|_| Stop::Generated)?;
         let reader = reader(src, ast, index).ok_or(Stop::Generated)?;
@@ -164,7 +171,10 @@ pub(crate) fn instrument(
     let mut out = Vec::with_capacity(src.len() + added + prefix.len() + 4);
     out.extend_from_slice(prefix.as_bytes());
     let mut at = 0;
-    for e in &edits {
+    for (k, e) in edits.iter().enumerate() {
+        if k % CHECK_EVERY == 0 && cancelled() {
+            return Err(Stop::Cancelled);
+        }
         out.extend_from_slice(src.get(at..e.at).ok_or(Stop::Generated)?);
         out.extend_from_slice(e.text.as_bytes());
         at = e.at + e.skip;
@@ -244,20 +254,10 @@ mod tests {
         // words in comments do not, and finding it does not rescan the
         // source per candidate.
         let names: String = (0..20_000)
-            .map(|i| {
-                format!(
-                    "tapestry_tag{i} = 1
-"
-                )
-            })
+            .map(|i| format!("tapestry_tag{i} = 1\n"))
             .collect();
         let comments: String = (0..20_000)
-            .map(|i| {
-                format!(
-                    "-- tapestry_tag{i}
-"
-                )
-            })
+            .map(|i| format!("-- tapestry_tag{i}\n"))
             .collect();
         let start = std::time::Instant::now();
         let out = run(&format!("{names}{comments}f = function() end"));

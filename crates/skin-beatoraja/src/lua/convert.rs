@@ -196,6 +196,7 @@ pub(super) fn convert(
     } = c;
     let analysis = configured.then(|| {
         analysis.files = std::mem::take(&mut *pass.files.borrow_mut());
+        analysis.cancel = Some(pass.ledger.cancel());
         Box::new(analysis)
     });
     let name = entry.name().to_owned();
@@ -400,6 +401,15 @@ impl Conv<'_> {
         })
     }
 
+    /// The cancellation request, seen every [`CHECK_EVERY`] entries a
+    /// loop over a table visits.
+    fn poll(&self, seen: usize) -> Result<(), ImportError> {
+        if seen.is_multiple_of(CHECK_EVERY) && seen > 0 && self.pass.ledger.cancelled() {
+            return Err(self.lua(LuaWhy::Cancelled));
+        }
+        Ok(())
+    }
+
     /// One capture charged before it is kept.
     fn charge(&self) -> Result<(), ImportError> {
         let n = self.pass.ledger.counts().captures;
@@ -569,14 +579,16 @@ impl Conv<'_> {
         match option {
             Err(why) => cap.unproven = Some(why),
             Ok(option) => {
-                for pair in option.pairs::<Value, Value>() {
+                for (seen, pair) in option.pairs::<Value, Value>().enumerate() {
+                    self.poll(seen)?;
+                    // Every entry is charged, whatever it holds.
+                    self.charge()?;
                     let (k, v) = pair.map_err(|e| self.mlua(&e))?;
                     if let (Value::String(k), Value::Integer(v)) = (k, v) {
                         let k = k.as_bytes();
                         if k.len() > MAX_STRING_BYTES {
                             continue;
                         }
-                        self.charge()?;
                         cap.options.push((k.to_vec(), v));
                     }
                 }
@@ -604,6 +616,11 @@ impl Conv<'_> {
         let (mut min, mut max) = (i64::MAX, i64::MIN);
         let mut key_bytes = 0_u64;
         for pair in t.pairs::<Value, Value>() {
+            // The entries counted against the node cap as they are met.
+            self.poll(n)?;
+            if self.nodes.len().saturating_add(n) >= MAX_NODES {
+                return Err(self.input(InputLimit::Nodes));
+            }
             let (k, _) = pair.map_err(|e| self.mlua(&e))?;
             n += 1;
             match k {
@@ -663,7 +680,8 @@ impl Conv<'_> {
             // The keys' bytes, charged above with the entries, copied out
             // so that no handle per key stays on Lua's stack.
             let mut keys: Vec<Vec<u8>> = Vec::with_capacity(n);
-            for pair in t.pairs::<mlua::LuaString, Value>() {
+            for (seen, pair) in t.pairs::<mlua::LuaString, Value>().enumerate() {
+                self.poll(seen)?;
                 let (k, _) = pair.map_err(|e| self.mlua(&e))?;
                 keys.push(k.as_bytes().to_vec());
             }

@@ -35,7 +35,9 @@
 
 use std::cell::{Cell, RefCell};
 
-use super::limits::MAX_AST_DEPTH;
+use std::collections::HashMap;
+
+use super::limits::{MAX_ANALYSIS_WORK, MAX_AST_DEPTH};
 use super::syntax::{Ast, Bin, CHUNK_ENV, DeclKind, Expr, NONE, Stmt, Un};
 use super::{HOST_APIS, Unsupported};
 use crate::error::{ImportError, Loc};
@@ -52,7 +54,7 @@ pub(crate) struct ParsedFile {
 }
 
 /// A value a closure's reader returned.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum Captured {
     Nil,
     Bool(bool),
@@ -124,14 +126,31 @@ pub(crate) enum Ty {
 /// wherever it is met ([`super::LuaLimit::AstDepth`]).
 pub(crate) const TOO_DEEP: Unsupported = Unsupported::Construct("nesting past the depth cap");
 
-/// The refusal of `why` found at `at`: the depth cap is a limit, any
+/// What a walk past [`MAX_ANALYSIS_WORK`] gives: fatal wherever it is
+/// met ([`super::LuaLimit::AnalysisWork`]).
+pub(crate) const TOO_MUCH: Unsupported = Unsupported::Construct("analysis work past its cap");
+
+/// What a walk that saw the cancellation request gives: fatal.
+pub(crate) const CANCELLED: Unsupported = Unsupported::Construct("cancelled");
+
+/// How many units of analysis work run between two looks at the
+/// cancellation request.
+const CHECK_EVERY: u64 = 4_096;
+
+/// The fatal refusal a walk's sentinel stands for, if it is one.
+pub(crate) fn fatal(why: Unsupported) -> Option<super::LuaWhy> {
+    match why {
+        TOO_DEEP => Some(super::LuaWhy::Limit(super::LuaLimit::AstDepth)),
+        TOO_MUCH => Some(super::LuaWhy::Limit(super::LuaLimit::AnalysisWork)),
+        CANCELLED => Some(super::LuaWhy::Cancelled),
+        _ => None,
+    }
+}
+
+/// The refusal of `why`: a cap or the cancellation request is fatal, any
 /// other reason an unknown effect.
 pub(crate) fn effect(why: Unsupported) -> super::LuaWhy {
-    if why == TOO_DEEP {
-        super::LuaWhy::Limit(super::LuaLimit::AstDepth)
-    } else {
-        super::LuaWhy::Effect(why)
-    }
+    fatal(why).unwrap_or(super::LuaWhy::Effect(why))
 }
 
 /// A located unsupported construct: the file and line of its tree.
@@ -150,6 +169,10 @@ enum State {
     Done(Result<Ty, Found>),
 }
 
+/// A function prototype with its captured values: its file, its function
+/// and the values, in its upvalues' order.
+type ProtoKey = (u16, u32, Vec<Captured>);
+
 /// The owned analysis data of a configured pass.
 #[derive(Debug, Default)]
 pub(crate) struct Analysis {
@@ -158,13 +181,44 @@ pub(crate) struct Analysis {
     pub(crate) captured: Vec<Captured>,
     pub(crate) envs: Vec<EnvCapture>,
     classes: RefCell<Vec<State>>,
+    /// The classes of function prototypes by their file, function and
+    /// captured values: instances that share all three share a class,
+    /// which is walked once.
+    protos: RefCell<HashMap<ProtoKey, Result<Ty, Found>>>,
     /// By callable.
     pub(crate) outcomes: RefCell<Vec<Disposition>>,
     /// Expression nodes expanded so far by lowering.
     pub(crate) expanded: Cell<u64>,
+    /// Units of work the walks over the trees have done
+    /// ([`MAX_ANALYSIS_WORK`]): an expression or statement visited, a
+    /// captured value compared.
+    pub(crate) work: Cell<u64>,
+    /// The candidate's cancellation request.
+    pub(crate) cancel: Option<super::Cancel>,
 }
 
 impl Analysis {
+    /// `n` units of work charged before they are done, the cancellation
+    /// request seen every [`CHECK_EVERY`]: [`TOO_MUCH`] past the cap,
+    /// [`CANCELLED`] once it is requested.
+    pub(crate) fn charge(&self, n: u64) -> Result<(), Unsupported> {
+        let before = self.work.get();
+        let after = before.saturating_add(n);
+        if after > MAX_ANALYSIS_WORK {
+            return Err(TOO_MUCH);
+        }
+        self.work.set(after);
+        if before / CHECK_EVERY != after / CHECK_EVERY
+            && self
+                .cancel
+                .as_ref()
+                .is_some_and(super::Cancel::is_cancelled)
+        {
+            return Err(CANCELLED);
+        }
+        Ok(())
+    }
+
     pub(crate) fn instance(&self, i: u32) -> Option<&Instance> {
         self.instances.get(i as usize)
     }
@@ -239,11 +293,43 @@ impl Analysis {
                 *s = State::InProgress;
             }
         }
-        let r = self.classify_body(i, depth);
+        let key = self.proto_key(i);
+        let cached = key
+            .as_ref()
+            .and_then(|k| self.protos.borrow().get(k).copied());
+        let r = match cached {
+            Some(r) => r,
+            None => {
+                let r = self.classify_body(i, depth);
+                // A cap or cancellation is not a class.
+                if let Some(k) = key
+                    && !r.is_err_and(|f| fatal(f.why).is_some())
+                {
+                    self.protos.borrow_mut().insert(k, r);
+                }
+                r
+            }
+        };
         if let Some(s) = self.classes.borrow_mut().get_mut(i as usize) {
             *s = State::Done(r);
         }
         r
+    }
+
+    /// The prototype key of instance `i`, its captured values charged as
+    /// they are copied.
+    fn proto_key(&self, i: u32) -> Option<ProtoKey> {
+        let inst = self.instance(i)?;
+        let values = match inst.values {
+            Some((start, len)) => self
+                .captured
+                .get(start as usize..start as usize + len as usize)?
+                .to_vec(),
+            None => Vec::new(),
+        };
+        self.charge(u64::try_from(values.len()).unwrap_or(u64::MAX))
+            .ok()?;
+        Some((inst.file, inst.func, values))
     }
 
     fn classify_body(&self, i: u32, depth: u32) -> Result<Ty, Found> {
@@ -276,6 +362,7 @@ impl Analysis {
         };
         for &s in ast.list(f.body) {
             let line = ast.stmt_line(s);
+            self.charge(1).map_err(|why| at(why, line))?;
             match ast.stmt(s) {
                 Stmt::Empty => {}
                 Stmt::Local { names, exprs } => {
@@ -353,6 +440,7 @@ impl Classify<'_> {
     }
 
     fn expr(&self, e: u32) -> Result<Ty, Found> {
+        self.an.charge(1).map_err(|why| self.at(why, e))?;
         let d = self.depth.get();
         if d >= MAX_AST_DEPTH {
             return Err(self.at(TOO_DEEP, e));
@@ -633,6 +721,13 @@ pub(crate) fn admit(arena: &Arena) -> Result<(), ImportError> {
         .resize(lua.callables.len(), Disposition::NeverAnalysed);
     let mut first: Option<ImportError> = None;
     for (id, c) in callable_nodes(arena) {
+        // Each callable visited is a unit of work, cancellation seen.
+        if let Err(why) = an.charge(1) {
+            return Err(ImportError::Lua {
+                at: Some(arena.loc(id)),
+                why: effect(why),
+            });
+        }
         let Some(callable) = lua.callables.get(c as usize) else {
             continue;
         };

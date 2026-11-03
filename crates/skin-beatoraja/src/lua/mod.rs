@@ -103,6 +103,8 @@ pub enum LuaLimit {
     Captures,
     /// [`limits::MAX_EXPANDED_NODES`].
     Expansion,
+    /// [`limits::MAX_ANALYSIS_WORK`].
+    AnalysisWork,
     /// The generated source's bound: an instrumented chunk's
     /// ([`instrument::MAX_ADDED_BYTES`]) or a lowered expression's
     /// ([`skin_model::MAX_SOURCE_BYTES`]).
@@ -122,6 +124,7 @@ impl fmt::Display for LuaLimit {
             Self::AstDepth => "the analysis depth limit",
             Self::Captures => "the capture limit",
             Self::Expansion => "the helper expansion limit",
+            Self::AnalysisWork => "the analysis work limit",
             Self::Generated => "the generated source limit",
         })
     }
@@ -754,6 +757,7 @@ impl LuaHeader {
             store = common_reads(&mut def, &mut counts);
             if let Some(an) = def.arena.lua.as_deref().and_then(|l| l.analysis.as_deref()) {
                 counts.expanded = an.expanded.get();
+                counts.analysis_work = an.work.get();
                 callbacks = an.outcomes.borrow().clone();
             }
             r
