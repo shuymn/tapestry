@@ -1618,3 +1618,45 @@ fn dev_start_inside_a_lone_long_note_exits_one() {
     assert!(!stdout.contains("play started"), "{stdout}");
     assert!(!fx.appdata.join("tapestry").join("records").exists());
 }
+
+/// The loading script on the real threads (`--dev-loading`; design.md
+/// "Play Adjustments"): START (Q) held from the start of loading for
+/// 1.5 s, with recording closed, defers the opening; the loading script
+/// goes on feeding through the deferral, so its release opens it, and the
+/// play's script takes over on the same devices. Nothing of the loading
+/// script is recorded, and the play opened about 1.5 s after it was first
+/// asked for.
+#[test]
+fn a_loading_script_press_defers_the_opening_and_its_release_opens_it() {
+    const Q: u32 = 0x10;
+    let Fixture {
+        dir: _dir,
+        chart_path,
+        log,
+        events,
+        appdata,
+        ..
+    } = fixture();
+    let out = scripted_play(&chart_path, &log, &appdata)
+        .args(["--dev-loading", "10@0-1500"])
+        .output()
+        .expect("run tapestry");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stdout}{stderr}");
+    assert!(stdout.contains("play 1:"), "{stdout}");
+    let saved = records(&appdata);
+    assert_eq!(saved.len(), 1, "{saved:?}");
+    let rec = replay::decode(&fs::read(&saved[0]).unwrap(), &DecodeLimits::default()).unwrap();
+    // No cancelled candidate: the opening was deferred, not cancelled.
+    assert!(rec.history.openings.is_empty(), "{:?}", rec.history);
+    // The script keeps the timeline of the opening first asked for; the
+    // play opened about 1.5 s later, at the release, so the log's presses
+    // land that much earlier on its chart time.
+    let early = events[0].received.0 - rec.events[0].received.0;
+    assert!((1_400_000..1_700_000).contains(&early), "{early} {stderr}");
+    assert!(!rec.events.iter().any(|e| matches!(
+        e.kind,
+        eval::InputKind::Control { control, .. } if control.0 == Q
+    )));
+}

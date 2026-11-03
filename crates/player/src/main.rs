@@ -335,7 +335,7 @@ enum PlayInput {
     /// the speed keys pressed on its keyboard as unrecorded packets the
     /// adjustment tap observes; plays are saved (dev-tools).
     #[cfg(feature = "dev-tools")]
-    Script(PathBuf, Vec<(u32, TimeUs)>),
+    Script(dev::ScriptInput),
     /// Autoplay's generated input, keys and planning, with key sounds sent
     /// from judgments; plays are saved: the perfect measurement
     /// (dev-tools).
@@ -496,12 +496,14 @@ fn prepare(chart: &Path, input: &PlayInput, start: Option<TimeUs>) -> anyhow::Re
             generated(loaded, chart)
         }
         #[cfg(feature = "dev-tools")]
-        PlayInput::Script(log, speed) => {
-            let script = dev::script(log, speed)?;
+        PlayInput::Script(input) => {
+            let script = dev::script(&input.log, &input.speed)?;
+            let loading = dev::loading_script(&input.log, &input.loading)?;
             let script = input_side::Script {
                 log: script.clone(),
                 current: script,
                 sources: source_config(),
+                loading,
             };
             Ok(Prepared {
                 loaded,
@@ -819,6 +821,8 @@ fn rig<'a>(
         end_shown: None,
         #[cfg(feature = "dev-tools")]
         auto_retries: 0,
+        #[cfg(feature = "dev-tools")]
+        loading_script: false,
         #[cfg(feature = "dev-tools")]
         adjust_in_play: Vec::new(),
         #[cfg(feature = "dev-tools")]
@@ -1879,7 +1883,11 @@ mod tests {
             launched(PlayInput::Devices, crate::dev::Options::default(), &device);
         ran.unwrap();
         assert_eq!((name, gated), ("interactive", true));
-        let script = PlayInput::Script(std::path::PathBuf::from("log.tprl"), Vec::new());
+        let script = PlayInput::Script(crate::dev::ScriptInput {
+            log: std::path::PathBuf::from("log.tprl"),
+            speed: Vec::new(),
+            loading: Vec::new(),
+        });
         let (name, ran, gated) = launched(script, crate::dev::Options::default(), &device);
         ran.unwrap();
         assert_eq!((name, gated), ("headless", true));

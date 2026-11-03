@@ -211,6 +211,10 @@ pub struct PlayerRig<'a> {
     /// Retries still to send by itself at an end screen (dev-tools).
     #[cfg(feature = "dev-tools")]
     pub auto_retries: u32,
+    /// A loading script is to be fed before the first opening
+    /// (`--dev-loading`), until it is started.
+    #[cfg(feature = "dev-tools")]
+    pub loading_script: bool,
     /// Settings keys pressed by themselves when the first play reaches
     /// chart time `adjust_at` (dev-tools).
     #[cfg(feature = "dev-tools")]
@@ -747,6 +751,11 @@ impl Rig for PlayerRig<'_> {
         &mut self,
         loaded: &Loaded,
     ) -> Result<Option<game::PreparationRefusal>, InputWaitError> {
+        // The loading script runs from here to the first opening.
+        #[cfg(feature = "dev-tools")]
+        if std::mem::take(&mut self.loading_script) {
+            self.input.loading_script(self.clock.now());
+        }
         match self.adjustments() {
             Some((driver, mut pump)) => driver.begin_presentation(loaded, &mut pump),
             None => Ok(None),
@@ -754,6 +763,8 @@ impl Rig for PlayerRig<'_> {
     }
 
     fn end_presentation(&mut self) {
+        #[cfg(feature = "dev-tools")]
+        self.input.end_loading_script();
         if let Some(driver) = &mut self.adjust {
             driver.invalidate();
         }

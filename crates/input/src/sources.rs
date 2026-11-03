@@ -216,6 +216,8 @@ pub struct SourceSet {
     /// Added to the batch clock to give the presentation clock the tap
     /// stamps on ([`set_presentation_offset`](Self::set_presentation_offset)).
     presentation_offset: TimeUs,
+    /// A wake due besides the tap's ([`set_wake_at`](Self::set_wake_at)).
+    wake_at: Option<TimeUs>,
 }
 
 /// The mode `device.toml` sets for a controller model's bound axes.
@@ -259,6 +261,7 @@ impl SourceSet {
             adjust: None,
             focus: PresentationFocus::new(),
             presentation_offset: TimeUs(0),
+            wake_at: None,
         })
     }
 
@@ -543,11 +546,23 @@ impl SourceSet {
         }
     }
 
-    /// When the tap is next due a tick, on the presentation clock
-    /// ([`AdjustmentTap::next_due`]).
+    /// When the input thread is next due a wake, on the presentation clock:
+    /// the tap's next tick ([`AdjustmentTap::next_due`]), or the deadline
+    /// set with [`set_wake_at`](Self::set_wake_at), whichever is sooner.
     #[must_use]
     pub fn next_due(&self) -> Option<TimeUs> {
-        self.adjust.as_ref().and_then(AdjustmentTap::next_due)
+        let tap = self.adjust.as_ref().and_then(AdjustmentTap::next_due);
+        match (tap, self.wake_at) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
+    /// A wake the input thread is due at `at` on the presentation clock
+    /// besides the tap's, such as a timed script's next item; `None` for
+    /// none.
+    pub const fn set_wake_at(&mut self, at: Option<TimeUs>) {
+        self.wake_at = at;
     }
 
     /// Whether the presentation focus is in now and no loss was counted

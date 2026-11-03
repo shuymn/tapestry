@@ -235,6 +235,10 @@ pub struct Options {
     /// keyboard at `adjust_at_ms` (`--dev-speed`): packets the adjustment
     /// tap observes and recording does not, as the speed keys are.
     pub speed_keys: Vec<u32>,
+    /// Keys held on a scripted play's keyboard while it loads, before its
+    /// first opening (`--dev-loading`): each by scan code with its press and
+    /// release times after loading starts, fed only to the adjustment tap.
+    pub loading_keys: Vec<(u32, TimeUs, TimeUs)>,
     /// Show the measurement overlay from the start, without its key.
     pub overlay: bool,
     /// The result screen's input, scripted (`--dev-result`): `next`,
@@ -274,6 +278,7 @@ impl Options {
         rig.adjust_at = TimeUs(self.adjust_at_ms.saturating_mul(1_000));
         rig.adjust_on_end = self.adjust_on_end;
         rig.result_script = self.result;
+        rig.loading_script = !self.loading_keys.is_empty();
     }
 
     /// The session's input with the development options applied: an input
@@ -307,7 +312,11 @@ impl Options {
             )),
             _ => Ok(log.map_or(input, |log| {
                 let at = TimeUs(self.adjust_at_ms.saturating_mul(1_000));
-                crate::PlayInput::Script(log, self.speed_keys.iter().map(|&k| (k, at)).collect())
+                crate::PlayInput::Script(ScriptInput {
+                    log,
+                    speed: self.speed_keys.iter().map(|&k| (k, at)).collect(),
+                    loading: self.loading_keys.clone(),
+                })
             })),
         }
     }
@@ -332,6 +341,10 @@ impl Options {
             "dev-adjust" => {
                 self.adjust_in_play =
                     adjust_keys(&p.value()?.to_string_lossy()).map_err(UsageError::Usage)?;
+            }
+            "dev-loading" => {
+                self.loading_keys =
+                    loading_keys(&p.value()?.to_string_lossy()).map_err(UsageError::Usage)?;
             }
             "dev-speed" => {
                 self.speed_keys =
@@ -1037,6 +1050,98 @@ pub fn adjust_keys(list: &str) -> Result<Vec<game::Adjust>, String> {
                 .ok_or_else(|| format!("{name} is not a settings key (F3 to F8)"))
         })
         .collect()
+}
+
+/// A scripted play's input (`--dev-scripted-input`): the log, the speed
+/// keys pressed during its plays ([`Options::speed_keys`]) and the keys
+/// held while it loads ([`Options::loading_keys`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScriptInput {
+    /// The input log.
+    pub log: PathBuf,
+    /// Speed keys by scan code, each pressed at its time on the script.
+    pub speed: Vec<(u32, TimeUs)>,
+    /// Keys held while loading, with their press and release times.
+    pub loading: Vec<(u32, TimeUs, TimeUs)>,
+}
+
+/// The keys of `list` held while loading, comma-separated as
+/// `<scan code in hex>@<press ms>-<release ms>` (`10-1500`: Q from the
+/// start for 1.5 s).
+///
+/// # Errors
+///
+/// An item not of that form, or released before it is pressed.
+pub fn loading_keys(list: &str) -> Result<Vec<(u32, TimeUs, TimeUs)>, String> {
+    list.split(',')
+        .map(|item| {
+            let bad = || format!("{item} is not <scan code>@<press ms>-<release ms>");
+            let (code, times) = item.split_once('@').ok_or_else(bad)?;
+            let (down, up) = times.split_once('-').ok_or_else(bad)?;
+            let code = u32::from_str_radix(code, 16).map_err(|_| bad())?;
+            let ms = |s: &str| {
+                s.parse::<i64>()
+                    .map(|m| TimeUs(m * 1_000))
+                    .map_err(|_| bad())
+            };
+            let (down, up) = (ms(down)?, ms(up)?);
+            if up <= down {
+                return Err(bad());
+            }
+            Ok((code, down, up))
+        })
+        .collect()
+}
+
+/// The keys held while a scripted play loads ([`loading_keys`]), as a
+/// script on the log's first keyboard, which it connects: its times are
+/// after loading starts. `None` without keys.
+///
+/// # Errors
+///
+/// Why the log cannot be read, or that it has no keyboard.
+pub fn loading_script(
+    log: &Path,
+    keys: &[(u32, TimeUs, TimeUs)],
+) -> anyhow::Result<Option<ScriptedInput>> {
+    if keys.is_empty() {
+        return Ok(None);
+    }
+    let limits = DecodeLimits::default();
+    let bytes = read_bounded(log, limits.max_compressed)?;
+    let rec = replay::decode(&bytes, &limits).with_context(|| log.display().to_string())?;
+    let Some(i) = rec
+        .devices
+        .sources
+        .iter()
+        .position(|s| s.kind == replay::DeviceKind::Keyboard)
+    else {
+        anyhow::bail!("--dev-loading needs a keyboard in the input log");
+    };
+    let device = input::DeviceId(i as u64);
+    let packet = |code, value| {
+        input::Action::Packet(input::Packet {
+            device,
+            control: eval::ControlId(code),
+            value,
+            background: false,
+        })
+    };
+    let mut items = vec![input::ScriptItem {
+        at: TimeUs(0),
+        action: input::Action::Connect(device, DeviceKind::Keyboard),
+    }];
+    for &(code, down, up) in keys {
+        items.push(input::ScriptItem {
+            at: down,
+            action: packet(code, 1),
+        });
+        items.push(input::ScriptItem {
+            at: up,
+            action: packet(code, 0),
+        });
+    }
+    Ok(Some(ScriptedInput::new(items)))
 }
 
 /// The speed keys of `list`, comma-separated: `F1` and `F2`.

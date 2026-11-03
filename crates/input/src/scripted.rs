@@ -171,6 +171,12 @@ impl ScriptedInput {
         script
     }
 
+    /// The time of the next item to feed, if any.
+    #[must_use]
+    pub fn next_at(&self) -> Option<TimeUs> {
+        self.items.get(self.next).map(|i| i.at)
+    }
+
     /// Whether every item has been fed.
     #[must_use]
     pub fn is_done(&self) -> bool {

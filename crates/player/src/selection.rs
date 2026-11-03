@@ -1430,6 +1430,7 @@ impl PlayerRig<'_> {
                         log: log.clone(),
                         current: log.clone(),
                         sources: crate::source_config(),
+                        loading: None,
                     };
                     self.input
                         .switch(Mode::Script(Box::new(script)), crate::source_config());
