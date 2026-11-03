@@ -169,11 +169,15 @@ fn distance_field_fonts_and_bad_sizes_read_nothing() {
         assert_eq!(i.report.usage.texts, 1);
         assert_eq!(i.report.usage.file_attempts, 0);
     }
-    for size in [0, -5] {
+    // The source throws at 0 and mirrors a negative size.
+    for (size, kind) in [
+        (0, NoteKind::Ignored { field: "size" }),
+        (-5, NoteKind::UnsupportedField { field: "size" }),
+    ] {
         let fonts = r#"{"id": "b", "path": "b.fnt"}"#;
         let dir = skin(&[("s.json", &json([1_920, 1_080], fonts, &[("b", size, "A")]))]);
         let i = import(dir.path()).unwrap();
-        assert!(has(&i.report, NoteKind::Ignored { field: "size" }));
+        assert!(has(&i.report, kind), "{size}");
         assert_eq!((i.report.usage.texts, i.report.usage.file_attempts), (0, 0));
     }
 }

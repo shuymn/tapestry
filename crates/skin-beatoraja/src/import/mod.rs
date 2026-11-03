@@ -188,6 +188,8 @@ struct Dst {
     draw: Prop,
     keys: Vec<u32>,
     mouse: bool,
+    /// Whether it is failure presentation ([`Cx::failure`]).
+    failure: bool,
 }
 
 /// A property field as the source's script serializer reads it
@@ -526,6 +528,7 @@ impl<'d> Cx<'d> {
             }
             self.custom.aliases.insert(id, target);
         }
+        self.custom.classify();
         Ok(())
     }
 
@@ -641,6 +644,36 @@ impl<'d> Cx<'d> {
         let id = self.opt_string(id, "id")?;
         let mut ids = self.ints(offsets, "offsets")?;
         ids.push(self.int_or(offset, "offset", 0)?);
+        let ops = self.ops(op)?;
+        let blend = self.int_or(blend, "blend", 0)?;
+        let filter = self.int_or(filter, "filter", 0)?;
+        let timer = self.prop(timer, "timer")?;
+        let looped = self.int_or(looped, "loop", 0)?;
+        let center = self.int_or(center, "center", 0)?;
+        let stretch = self.int_or(stretch, "stretch", -1)?;
+        let draw = self.callback_prop(draw, "draw")?;
+        let failure = self.failure(&timer, &ops);
+        let dst = Dst {
+            span: self.arena_span(rec),
+            blend,
+            filter,
+            timer,
+            looped,
+            center,
+            offsets: ids,
+            stretch,
+            ops,
+            draw,
+            keys,
+            mouse: mouse.is_some_and(|m| self.def.arena.is_object(m)),
+            failure,
+        };
+        Ok((id, dst))
+    }
+
+    /// A destination's `op` items: numbers and names, `null` items
+    /// skipped.
+    fn ops(&mut self, op: Option<u32>) -> Result<Vec<Op>, ImportError> {
         let mut ops = Vec::new();
         if let Some(op) = op {
             if !self.def.arena.is_array(op) {
@@ -655,21 +688,60 @@ impl<'d> Cx<'d> {
                 }
             }
         }
-        let dst = Dst {
-            span: self.arena_span(rec),
-            blend: self.int_or(blend, "blend", 0)?,
-            filter: self.int_or(filter, "filter", 0)?,
-            timer: self.prop(timer, "timer")?,
-            looped: self.int_or(looped, "loop", 0)?,
-            center: self.int_or(center, "center", 0)?,
-            offsets: ids,
-            stretch: self.int_or(stretch, "stretch", -1)?,
-            ops,
-            draw: self.callback_prop(draw, "draw")?,
-            keys,
-            mouse: mouse.is_some_and(|m| self.def.arena.is_object(m)),
-        };
-        Ok((id, dst))
+        Ok(ops)
+    }
+
+    /// Whether destination record `rec` is failure presentation
+    /// ([`Self::failure`]), read from its `timer`, `op` and `draw` alone,
+    /// before anything else of it is read or charged.
+    fn record_failure(&mut self, rec: u32) -> Result<bool, ImportError> {
+        let [timer, op, draw] = self.def.fields(rec, ["timer", "op", "draw"]);
+        let timer = self.prop(timer, "timer")?;
+        if !self.failure_timed(&timer) {
+            return Ok(false);
+        }
+        let ops = self.ops(op)?;
+        // Read for its errors as any destination's `draw` is; it never
+        // folds ([`Self::can_draw`]).
+        self.callback_prop(draw, "draw")?;
+        Ok(self.failure(&timer, &ops))
+    }
+
+    /// Whether a destination of `timer` and `ops` is failure
+    /// presentation (owner decision 16): its timer resolves to `failed`
+    /// and it can still draw once the configured options are folded
+    /// ([`Self::can_draw`]). Reads nothing else, and notes, charges and
+    /// compiles nothing.
+    fn failure(&self, timer: &Prop, ops: &[Op]) -> bool {
+        self.failure_timed(timer) && self.can_draw(ops)
+    }
+
+    /// Whether `timer` resolves to `failed`: built-in 3, or a custom
+    /// timer whose numeric chain reaches it ([`Custom::fails`]). A null,
+    /// negative or script timer does not.
+    fn failure_timed(&self, timer: &Prop) -> bool {
+        matches!(*timer, Prop::Id(n) if n >= 0 && self.custom.fails(n))
+    }
+
+    /// Whether a destination of `ops` can still draw once the configured
+    /// options are folded, as [`Self::common_with`] folds them: no numeric
+    /// op folds false or names nothing ([`Self::op_cond`]). Built-in and
+    /// named conditions are not folded, so they can draw, and nor is a
+    /// `draw`, which is a built-in condition or nothing ([`draw_cond`]).
+    fn can_draw(&self, ops: &[Op]) -> bool {
+        !ops.iter().any(|op| match op {
+            Op::Id(n) => matches!(
+                self.op_cond(*n),
+                Some(Cond::Fold(false) | Cond::Undefined(_))
+            ),
+            Op::Name(_) => false,
+        })
+    }
+
+    /// Numeric op `n`'s condition: none for 0, else built-ins first, then
+    /// the declared items folded ([`ops::numeric`]).
+    fn op_cond(&self, n: i32) -> Option<Cond> {
+        (n != 0).then(|| ops::numeric(n, &self.items))
     }
 
     /// One destination, in source order.
@@ -691,6 +763,7 @@ impl<'d> Cx<'d> {
         {
             return self.system(dst, n);
         }
+        let role = Role::Decorative.or_failure(dst.failure);
         let Some((object, orec)) = self.objects.lookup(self.def, &self.tables, &id)? else {
             self.ignored(at, NoteKind::UndefinedObject);
             return Ok(());
@@ -739,7 +812,7 @@ impl<'d> Cx<'d> {
             Object::Gauge => self.gauge(dst, orec)?,
             Object::Slider => self.slider(dst, orec)?,
             _ => {
-                self.drop_el(Role::Decorative, at, NoteKind::Unsupported { object })?;
+                self.drop_el(role, at, NoteKind::Unsupported { object })?;
             }
         }
         Ok(())
@@ -869,12 +942,14 @@ impl<'d> Cx<'d> {
         let mut seen = BTreeSet::new();
         for op in &dst.ops {
             let cond = match op {
-                Op::Id(0) => continue,
                 Op::Id(n) => {
                     if !seen.insert(*n) {
                         continue;
                     }
-                    ops::numeric(*n, &self.items)
+                    let Some(c) = self.op_cond(*n) else {
+                        continue;
+                    };
+                    c
                 }
                 Op::Name(s) => match ops::named(s) {
                     Some(c) => c,
@@ -895,8 +970,7 @@ impl<'d> Cx<'d> {
         match &dst.draw {
             Prop::Null => {}
             Prop::Id(n) => {
-                if ops::is_builtin(i32::try_from(n.unsigned_abs()).unwrap_or(0)) {
-                    let c = ops::numeric(*n, &BTreeMap::new());
+                if let Some(c) = draw_cond(*n) {
                     if !self.condition(role, at, c, &mut conds, &mut deviates)? {
                         return Ok(None);
                     }
@@ -1331,15 +1405,15 @@ impl<'d> Cx<'d> {
         self.cover_motion(c)
     }
 
-    /// Notes D3 for retained `c`, critical and without a timer, when its
-    /// presentation phase depends on the start: its track
-    /// ([`policy::start_dependent`]) or an image it keeps cycling without
-    /// a timer (owner decision 7). Each destination is retained once.
+    /// Notes D3 for retained critical `c` when its presentation phase
+    /// depends on the start ([`policy::start_dependent`]): an image it
+    /// keeps cycling without a timer, whatever its own timer, or, without
+    /// a timer itself, its track (owner decision 7). Each destination is
+    /// retained once.
     fn untimed_phase(&mut self, c: &Common) {
         let cycled = self.cycled.contains(&c.span);
-        if c.untimed
-            && matches!(c.role, Role::Critical(_))
-            && policy::start_dependent(&c.track, cycled)
+        if matches!(c.role, Role::Critical(_))
+            && policy::start_dependent(&c.track, c.untimed, cycled)
         {
             self.note(
                 Some(c.span),
@@ -1467,6 +1541,15 @@ impl Common {
     fn angle_of(&self, k: &SrcKey) -> i64 {
         -(i64::from(k.angle) + self.offset.r)
     }
+}
+
+/// Numeric `draw` `n`'s condition: a boolean property joining the ops
+/// (`JsonSkinObjectLoader.java:734-737`), so a built-in only; anything
+/// else, an option item among them, has no effect (`None`) and never
+/// folds.
+fn draw_cond(n: i32) -> Option<Cond> {
+    ops::is_builtin(i32::try_from(n.unsigned_abs()).unwrap_or(0))
+        .then(|| ops::numeric(n, &BTreeMap::new()))
 }
 
 /// The pivot of `center` (`SkinObject.java:80-81, 228-233`): honoured

@@ -70,6 +70,46 @@ fn each_compile_follows_its_charges_and_each_admission_its_image_charge() {
 }
 
 #[test]
+fn failure_presentation_is_classified_without_work_of_its_own() {
+    use Event::{Admit, Charge, Compile};
+    // The same destinations on `failed` and on READY: classifying them
+    // charges, compiles and admits nothing, and a refusal stops where a
+    // decorative element is dropped.
+    let dsts = |timer: i32| {
+        skin(
+            A,
+            &format!(
+                r#"{{"id": "i", "timer": {timer}, "op": [232], "dst": [{{"w": 1, "h": 1}}]}},
+                   {{"id": "i", "timer": {timer}, "op": [7777], "dst": [{{"w": 1, "h": 1}}]}},
+                   {{"id": "-111", "timer": {timer}, "dst": [{{"w": 1, "h": 1}}]}}"#
+            ),
+        )
+    };
+    let (failed, failed_trace, failed_admits) = run(&dsts(3));
+    let (ready, ready_trace, ready_admits) = run(&dsts(40));
+    failed.unwrap();
+    ready.unwrap();
+    assert_eq!(
+        failed_trace,
+        [Charge, Compile, Charge, Admit, Charge, Charge, Charge]
+    );
+    assert_eq!((failed_trace, failed_admits), (ready_trace, ready_admits));
+    let refused = |timer: i32| {
+        let json = skin(
+            A,
+            &format!(r#"{{"id": "i", "timer": {timer}, "blend": 9, "dst": [{{"w": 1, "h": 1}}]}}"#),
+        );
+        run(&json)
+    };
+    let (r, trace, admits) = refused(3);
+    assert!(matches!(r, Err(ImportError::Critical { .. })));
+    assert_eq!((trace.as_slice(), admits), ([Charge].as_slice(), 0));
+    let (r, trace, _) = refused(40);
+    r.unwrap();
+    assert_eq!(trace, [Charge]);
+}
+
+#[test]
 fn a_system_image_is_charged_once_and_admits_nothing() {
     use Event::Charge;
     let json = skin(
