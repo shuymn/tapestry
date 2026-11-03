@@ -1377,13 +1377,18 @@ impl<'d> Cx<'d> {
         self.opt_string(path, "path")
     }
 
+    /// The top-level integer `name`, `default` when absent.
+    fn top_int(&mut self, name: &'static str, default: i32) -> Result<i32, ImportError> {
+        let [f] = self.def.fields(self.def.top(), [name]);
+        self.int_or(f, name, default)
+    }
+
     /// The grades that give a bomb, from the top-level `judgetimer`
     /// (`JsonSkin.java:20`, default 1): a judgment at or below it, PERFECT
     /// 0 to empty POOR 5 (`play/JudgeManager.java:673`). Its whole domain
     /// maps exactly: below 0 none, above 5 every grade.
     fn bomb_up_to(&mut self) -> Result<Option<Grade>, ImportError> {
-        let [f] = self.def.fields(self.def.top(), ["judgetimer"]);
-        let n = self.int_or(f, "judgetimer", 1)?;
+        let n = self.top_int("judgetimer", 1)?;
         Ok(usize::try_from(n)
             .ok()
             .map(|i| Grade::ALL.get(i).copied().unwrap_or(Grade::EmptyPoor)))
@@ -1395,8 +1400,7 @@ impl<'d> Cx<'d> {
     /// note, where the source sets it only while loading the note's
     /// destination (`JsonPlaySkinObjectLoader.java:37-40`).
     fn close(&mut self) -> Result<Option<TimeUs>, ImportError> {
-        let [f] = self.def.fields(self.def.top(), ["close"]);
-        let ms = self.int_or(f, "close", 0)?;
+        let ms = self.top_int("close", 0)?;
         Ok((ms > 0).then(|| TimeUs(i64::from(ms) * 1_000)))
     }
 
