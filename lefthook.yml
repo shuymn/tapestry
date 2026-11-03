@@ -15,6 +15,10 @@ pre-commit:
     actionlint:
       glob: ".github/workflows/*.{yml,yaml}"
       run: mise exec -- actionlint
+    # An allocation guard added, renamed or left out of CI's release step.
+    alloc-tests:
+      glob: "{.github/workflows/ci.yml,**/tests/**/*.rs,**/Cargo.toml}"
+      run: mise exec -- cargo xtask check-alloc-tests
     shellcheck:
       glob: "**/*.sh"
       run: mise exec -- shellcheck {staged_files}

@@ -2,6 +2,7 @@
 //!
 //! Exit codes: 0 success, 1 check failed, 2 usage or environment error.
 
+mod alloc_tests;
 mod arch;
 mod banned_words;
 mod binary;
@@ -29,6 +30,8 @@ commands:
   check-arch                              check the architecture rules (R1-R4)
   check-lints                             check that the lints enforcing the design
                                           rules are configured and fire on their fixtures
+  check-alloc-tests                       check that every allocation test runs in a
+                                          release step of CI
   banned-words (--staged|--all) [--list <path>]
                                           check paths and contents in the index for
                                           terms in banned-words.txt
@@ -51,6 +54,9 @@ fn main() -> ExitCode {
         ),
         Some("check-lints") if rest.is_empty() => {
             report("check-lints", lints::run(&workspace_manifest()))
+        }
+        Some("check-alloc-tests") if rest.is_empty() => {
+            report("check-alloc-tests", alloc_tests::run(&workspace_manifest()))
         }
         Some("banned-words") => banned_words::run(&rest),
         Some("portable") => portable::run(&workspace_manifest(), &rest),
