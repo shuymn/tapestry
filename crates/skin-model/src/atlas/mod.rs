@@ -26,6 +26,12 @@ use crate::image::{CellSource, FileAt, ImageError, MAX_FILE_BYTES, MAX_TOTAL_FIL
 use pack::PackError;
 use uv::{FrameUv, UvTable};
 
+/// The bytes a cell keeps in the atlas's tables while its files are read
+/// and decoded: its rectangle and its place. With at most
+/// [`MAX_SKIN_FRAMES`](crate::MAX_SKIN_FRAMES) cells they hold at most
+/// 65 536 × 36 B = 2.25 MiB, beside the pages and the file being decoded.
+pub const CELL_TABLE_BYTES: usize = size_of::<[u32; 4]>() + size_of::<pack::Place>();
+
 /// Mip levels per page, level 0 included.
 pub const MIP_LEVELS: usize = 4;
 /// Texels of edge copies around each cell.
@@ -186,6 +192,12 @@ impl Sheet {
     /// ([`SolidImageDef`](crate::SolidImageDef)) are written last, at one
     /// size in both variants, reading nothing.
     ///
+    /// Memory beside the pages: the cells' tables ([`CELL_TABLE_BYTES`]
+    /// a cell), an entry with its canonical path for each file with cells,
+    /// and the one file being read and decoded within its own bound
+    /// ([`MAX_IMAGE_TEXELS`](crate::MAX_IMAGE_TEXELS),
+    /// [`MAX_STREAMED_TEXELS`](crate::MAX_STREAMED_TEXELS)).
+    ///
     /// `cancel` is asked as each file's bytes are read, before each band
     /// and each read after a banded file's rows, and before each page's
     /// mip level.
@@ -233,6 +245,9 @@ impl Sheet {
                 PackError::TooManyPages => AtlasError::TooManyPages,
                 PackError::Misaligned => AtlasError::Misaligned,
             })?;
+        // Only the rectangles and the places stay beside the files
+        // ([`CELL_TABLE_BYTES`]).
+        drop(padded);
         let side = packing.side;
         let texels = pack::cost(limits.reserved_layers, packing.pages, side);
         if texels > MAX_ATLAS_TEXELS {
@@ -482,6 +497,12 @@ impl Bands for Router<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_cell_keeps_36_bytes_in_the_tables() {
+        assert_eq!(CELL_TABLE_BYTES, 36);
+        assert_eq!(crate::MAX_SKIN_FRAMES * CELL_TABLE_BYTES, 2_359_296);
+    }
 
     #[test]
     fn the_window_holds_the_cells_a_band_crosses() {

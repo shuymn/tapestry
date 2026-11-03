@@ -56,8 +56,10 @@ pub const MAX_SIDE: u32 = 16_384;
 pub const MAX_IMAGE_TEXELS: u64 = 12 << 20;
 /// The most texels of one file decoded in bands of rows: a PNG past
 /// [`MAX_IMAGE_TEXELS`], neither interlaced nor animated. With
-/// [`MAX_FILE_BYTES`] its decoding stays within the larger of 2 × 32 MiB
-/// and 32 MiB + 16 MiB, whatever its texels.
+/// [`MAX_FILE_BYTES`] its reading and decoding stay within the larger of
+/// 2 × 32 MiB and 32 MiB + 16 MiB, whatever its texels, beside the
+/// atlas's pages and tables
+/// ([`CELL_TABLE_BYTES`](crate::CELL_TABLE_BYTES)).
 pub const MAX_STREAMED_TEXELS: u64 = 64 << 20;
 /// The most texels across one variant's files.
 pub const MAX_TOTAL_TEXELS: u64 = 128 << 20;
