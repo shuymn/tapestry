@@ -1451,20 +1451,36 @@ impl<'d> Cx<'d> {
         self.opt_string(path, "path")
     }
 
+    /// The top-level integer `name`, `default` when absent.
+    fn top_int(&mut self, name: &'static str, default: i32) -> Result<i32, ImportError> {
+        let [f] = self.def.fields(self.def.top(), [name]);
+        self.int_or(f, name, default)
+    }
+
     /// The grades that give a bomb, from the top-level `judgetimer`
     /// (`JsonSkin.java:20`, default 1): a judgment at or below it, PERFECT
     /// 0 to empty POOR 5 (`play/JudgeManager.java:673`). Its whole domain
     /// maps exactly: below 0 none, above 5 every grade.
     fn bomb_up_to(&mut self) -> Result<Option<Grade>, ImportError> {
-        let [f] = self.def.fields(self.def.top(), ["judgetimer"]);
-        let n = self.int_or(f, "judgetimer", 1)?;
+        let n = self.top_int("judgetimer", 1)?;
         Ok(usize::try_from(n)
             .ok()
             .map(|i| Grade::ALL.get(i).copied().unwrap_or(Grade::EmptyPoor)))
     }
 
+    /// Closing's declared duration, from the top-level `close` in ms
+    /// (`JsonSkin.java:17`, default 0): a positive value in µs, `None`
+    /// for 0 or below. It is read whether or not the skin defines a
+    /// note, where the source sets it only while loading the note's
+    /// destination (`JsonPlaySkinObjectLoader.java:37-40`).
+    fn close(&mut self) -> Result<Option<TimeUs>, ImportError> {
+        let ms = self.top_int("close", 0)?;
+        Ok((ms > 0).then(|| TimeUs(i64::from(ms) * 1_000)))
+    }
+
     fn finish(mut self, files: Vec<FileChoice>) -> Result<Imported, ImportError> {
         let bomb_up_to = self.bomb_up_to()?;
+        let close = self.close()?;
         let assets = std::mem::replace(&mut self.assets, Assets::new(self.def.root()));
         let sheet = assets.finish();
         // The lanes' groups move to the skin; the rest is copied.
@@ -1484,6 +1500,7 @@ impl<'d> Cx<'d> {
             elements: std::mem::take(&mut self.elements),
             widgets: std::mem::take(&mut self.widgets),
             bomb_up_to,
+            close,
         };
         let skin = Skin::new(def).map_err(|source| {
             let at = self.load_loc(&source);

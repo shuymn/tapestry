@@ -499,13 +499,14 @@ pub enum RenderMsg {
         reply: mpsc::SyncSender<Result<(), RenderError>>,
     },
     /// Install what the preparation of this request staged, and answer
-    /// whether it was: not when the request was discarded or superseded,
-    /// or its screen was built again since.
+    /// whether it was, with its receipt (the declared Closing duration):
+    /// not when the request was discarded or superseded, or its screen
+    /// was built again since.
     Commit {
         /// The request.
         request: u64,
         /// Where the answer goes.
-        reply: mpsc::SyncSender<Result<(), CommitError>>,
+        reply: mpsc::SyncSender<Result<Option<TimeUs>, CommitError>>,
     },
     /// Drop the preparation of this request, answered or not, unless
     /// committed: it was cancelled, refused or timed out.
@@ -661,16 +662,33 @@ struct Shared {
     /// The commits answered and given up on, which the game thread and the
     /// render thread settle under its lock.
     commits: Mutex<Commits>,
+    /// Set when the game thread stopped waiting for a commit's answer,
+    /// before it takes the commits' lock (tests).
+    #[cfg(test)]
+    commit_timed_out: AtomicBool,
 }
 
 /// The last request committed and the last whose commit the game thread
 /// stopped waiting for: a commit is installed only while its request is
 /// not withdrawn, and a withdrawal finds a commit already installed, so
-/// the two never disagree.
+/// the two never disagree. With them, the receipt of the attempt
+/// committed last, taken in the same installation.
 #[derive(Debug, Default)]
 struct Commits {
     committed: u64,
     withdrawn: u64,
+    receipt: Receipt,
+}
+
+/// What an attempt's commit gives the game thread: the request and the
+/// declared Closing duration ([`skin_model::Skin::close`]) of the
+/// declarative installation the committed attempt draws with, the one it
+/// staged or the one already in use; `None` for a skin that declares
+/// none and for the simple skin.
+#[derive(Clone, Copy, Debug, Default)]
+struct Receipt {
+    request: u64,
+    close: Option<TimeUs>,
 }
 
 /// The loading state's lifetime, its newest page and its newest state
@@ -1072,20 +1090,27 @@ impl RenderLink {
     /// discarded or superseded, or the screen was built again since it
     /// was prepared; [`ScreenError::NoAnswer`] past the bound and
     /// [`ScreenError::Ended`] when the render thread is gone.
-    pub fn commit_attempt(&self) -> Result<(), ScreenError> {
+    ///
+    /// Installed, the play skin's declared Closing duration, from the
+    /// receipt taken with the installation, on the answer and past the
+    /// bound alike.
+    pub fn commit_attempt(&self) -> Result<Option<TimeUs>, ScreenError> {
         let request = self.requests.load(Ordering::Relaxed);
         let (reply, rx) = mpsc::sync_channel(1);
         self.send(RenderMsg::Commit { request, reply });
         match rx.recv_timeout(self.answer_timeout) {
-            Ok(Ok(())) => Ok(()),
+            Ok(Ok(close)) => Ok(close),
             Ok(Err(e)) => {
                 eprintln!("render: the attempt was not installed: {e}");
                 Err(ScreenError::Lost)
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
+                #[cfg(test)]
+                self.shared.commit_timed_out.store(true, Ordering::Release);
                 let mut commits = self.shared.commits();
                 if commits.committed >= request {
-                    return Ok(());
+                    let r = commits.receipt;
+                    return Ok(if r.request == request { r.close } else { None });
                 }
                 commits.withdrawn = commits.withdrawn.max(request);
                 Err(ScreenError::NoAnswer)
@@ -1542,6 +1567,8 @@ pub fn spawn(
         loading: Mutex::new(LoadingSlot::default()),
         producer: Mutex::new(None),
         commits: Mutex::new(Commits::default()),
+        #[cfg(test)]
+        commit_timed_out: AtomicBool::new(false),
     });
     let thread_shared = Arc::clone(&shared);
     let (ended_tx, ended) = mpsc::sync_channel::<()>(0);
@@ -2573,8 +2600,10 @@ impl Run {
     /// one answered ready last, not withdrawn by a game thread that stopped
     /// waiting, on the screen it was prepared on (its device's). Another request's commit changes nothing; one refused by
     /// the screen discards the staging. Committed, a declarative bundle is
-    /// kept for a screen built again.
-    fn commit(&mut self, request: u64) -> Result<(), CommitError> {
+    /// kept for a screen built again. The receipt taken under the
+    /// commits' lock is answered: the declared Closing duration of the
+    /// declarative installation the attempt draws with, staged or in use.
+    fn commit(&mut self, request: u64) -> Result<Option<TimeUs>, CommitError> {
         // Held through the installation: a withdrawal waits for it, or it
         // sees the withdrawal and installs nothing.
         let shared = Arc::clone(&self.shared);
@@ -2605,9 +2634,16 @@ impl Run {
         if p.declarative {
             self.committed = screen.installation();
         }
+        // The installation the attempt draws with: the one it staged, or
+        // the one in use it was readied on.
+        let close = self
+            .committed
+            .as_ref()
+            .and_then(|i| i.bundle().skin().close());
         self.current = Some(p.presentation);
         commits.committed = request;
-        Ok(())
+        commits.receipt = Receipt { request, close };
+        Ok(close)
     }
 
     /// Whether `request` is newer than every request asked of the render
@@ -6328,6 +6364,11 @@ pub(crate) mod tests {
     /// element, its lanes laid out for the right scratch side, which no
     /// attempt of the simple skin's has.
     pub(crate) fn bundle() -> Arc<render::SkinBundle> {
+        bundle_closing(None)
+    }
+
+    /// [`bundle`] declaring Closing's duration `close`.
+    pub(crate) fn bundle_closing(close: Option<TimeUs>) -> Arc<render::SkinBundle> {
         use skin_model::{Anchor, AtlasLimits, Fit, Region, RegionDef, Sheet, SkinDef, Variant};
         let sheet = Sheet::new(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")),
@@ -6347,6 +6388,7 @@ pub(crate) mod tests {
             elements: Vec::new(),
             widgets: skin_model::WidgetDefs::default(),
             bomb_up_to: None,
+            close,
         })
         .unwrap();
         let limits = AtlasLimits {
@@ -6417,7 +6459,8 @@ pub(crate) mod tests {
             if self.shared.hold.load(Ordering::Acquire) {
                 return None;
             }
-            assert!(skin.is_some());
+            // Without a skin chosen, the installation in use draws.
+            assert!(skin.is_some() || self.installed.is_some());
             self.note(&format!(
                 "prepare {request} {:?} {}",
                 a.context.scratch, a.text.title
@@ -6432,6 +6475,10 @@ pub(crate) mod tests {
                 return Err(render::CommitError::Device);
             }
             self.note(&format!("commit {}", token.request));
+            while self.shared.hold_commit.load(Ordering::Acquire) {
+                self.shared.commit_held.store(true, Ordering::Release);
+                std::thread::sleep(Duration::from_millis(1));
+            }
             if let Some(staged) = self.staged.take() {
                 self.installed = Some(staged);
             }
@@ -6548,6 +6595,10 @@ pub(crate) mod tests {
         pub(crate) refuse_install: Arc<AtomicBool>,
         /// Loading frames are refused while set.
         refuse_loading: Arc<AtomicBool>,
+        /// Commits wait, once noted, while set.
+        hold_commit: Arc<AtomicBool>,
+        /// Set once a commit waits on `hold_commit`.
+        commit_held: Arc<AtomicBool>,
         log: Log,
         restored: Arc<std::sync::Mutex<Vec<render::Installation>>>,
         /// Each loading frame's device, lifetime and origin.
@@ -6557,7 +6608,11 @@ pub(crate) mod tests {
     impl Installers {
         /// A render thread on these installers with `chart` loaded and
         /// `skin` chosen for its attempts.
-        fn spawn(&self, chart: &Arc<Chart>, skin: &Arc<render::SkinBundle>) -> super::RenderLink {
+        pub(crate) fn spawn(
+            &self,
+            chart: &Arc<Chart>,
+            skin: &Arc<render::SkinBundle>,
+        ) -> super::RenderLink {
             let link = self.spawn_bare();
             link.load(Arc::clone(chart), None).unwrap();
             assert_eq!(
@@ -6637,6 +6692,191 @@ pub(crate) mod tests {
                 "1 discard",
             ]
         );
+    }
+
+    /// A render thread on [`Installers`] with a chart loaded and a skin
+    /// declaring `close` chosen: the chart, the installers and the link.
+    fn receipt_link(close: Option<TimeUs>) -> (Arc<Chart>, Installers, super::RenderLink) {
+        let chart = Arc::new(ChartBuilder::new(120_000).build().unwrap());
+        let screens = Installers::default();
+        let link = screens.spawn(&chart, &bundle_closing(close));
+        (chart, screens, link)
+    }
+
+    /// Prepares an attempt of `chart` on `link`, answered ready.
+    #[track_caller]
+    fn ready_attempt(link: &super::RenderLink, chart: &Chart) {
+        let ready = link.prepare_attempt(titled(chart), || false);
+        assert_eq!(ready.unwrap(), Preparation::Ready);
+    }
+
+    /// Fails `link`'s screen and builds it again.
+    fn rebuild_screen(link: &super::RenderLink, screens: &Installers) {
+        screens.fail.store(true, Ordering::Release);
+        link.send(RenderMsg::Menu(Box::default()));
+        assert!(wait_until(|| link.failed()));
+        screens.fail.store(false, Ordering::Release);
+        link.prepare().unwrap();
+    }
+
+    /// Stalls `link`'s render thread in a loading frame.
+    fn stall_render(link: &super::RenderLink, screens: &Installers) {
+        let frames = || screens.loading.load(Ordering::Acquire);
+        link.loading().show(one_line("loading"));
+        assert!(wait_until(|| frames() > 0));
+        screens.stall.store(true, Ordering::Release);
+        assert!(wait_until(|| screens.stalled.load(Ordering::Acquire)));
+    }
+
+    /// Each installed attempt's commit gives the player its receipt, the
+    /// committed skin's declared Closing duration, through the player's
+    /// commit ([`crate::play::commit_ready`]): on the answer, past the
+    /// answer's bound when it was installed meanwhile, again on a retry
+    /// and kept while the screen is built again; a commit refused or
+    /// withdrawn gives `None`, whatever the receipt before it. The
+    /// longest duration a skin declares, `i32::MAX` ms, arrives whole.
+    #[test]
+    fn a_commit_receipt_carries_the_declared_close() {
+        let three = Some(TimeUs(3_000_000));
+        let longest = Some(TimeUs(2_147_483_647_000));
+        let (chart, screens, mut link) = receipt_link(three);
+        let mut declared = None;
+
+        // On the answer.
+        ready_attempt(&link, &chart);
+        crate::play::commit_ready(&link, false, &mut declared).unwrap();
+        assert_eq!(declared, three);
+        // A retry commits it again.
+        ready_attempt(&link, &chart);
+        crate::play::commit_ready(&link, false, &mut declared).unwrap();
+        assert_eq!(declared, three);
+
+        // Refused: the screen built again since the preparation.
+        ready_attempt(&link, &chart);
+        rebuild_screen(&link, &screens);
+        assert!(matches!(
+            crate::play::commit_ready(&link, false, &mut declared),
+            Err(ScreenError::Lost)
+        ));
+        assert_eq!(declared, None);
+        // A screen built again after the commit keeps the receipt.
+        ready_attempt(&link, &chart);
+        crate::play::commit_ready(&link, false, &mut declared).unwrap();
+        rebuild_screen(&link, &screens);
+        assert_eq!(declared, three);
+
+        // Withdrawn: the render thread reaches it past the bound.
+        ready_attempt(&link, &chart);
+        stall_render(&link, &screens);
+        link.set_timeouts(Duration::from_millis(100), Duration::from_secs(5));
+        assert!(matches!(
+            crate::play::commit_ready(&link, false, &mut declared),
+            Err(ScreenError::NoAnswer)
+        ));
+        assert_eq!(declared, None);
+        screens.stall.store(false, Ordering::Release);
+        let frames = || screens.loading.load(Ordering::Acquire);
+        let from = frames();
+        assert!(wait_until(|| frames() >= from + 3));
+        link.set_timeouts(Duration::from_secs(10), Duration::from_secs(5));
+
+        // Installed past the bound: the commit waits in the screen,
+        // holding the commits' lock, until the game thread stopped
+        // waiting for the answer, so the receipt is read past the bound.
+        assert_eq!(
+            link.select(Some(bundle_closing(longest))).wait().unwrap(),
+            Preparation::Ready
+        );
+        ready_attempt(&link, &chart);
+        link.set_timeouts(Duration::from_millis(100), Duration::from_secs(5));
+        link.shared.commit_timed_out.store(false, Ordering::Release);
+        screens.hold_commit.store(true, Ordering::Release);
+        let release = std::thread::spawn({
+            let screens = screens.clone();
+            let shared = Arc::clone(&link.shared);
+            move || {
+                assert!(wait_until(|| screens.commit_held.load(Ordering::Acquire)));
+                assert!(wait_until(|| shared
+                    .commit_timed_out
+                    .load(Ordering::Acquire)));
+                screens.hold_commit.store(false, Ordering::Release);
+            }
+        });
+        crate::play::commit_ready(&link, false, &mut declared).unwrap();
+        release.join().unwrap();
+        assert!(link.shared.commit_timed_out.load(Ordering::Acquire));
+        assert_eq!(declared, longest);
+        assert_eq!(
+            game::closing_time(declared),
+            TimeUs(2_147_483_647_000),
+            "i32::MAX ms is admitted whole"
+        );
+        link.exit();
+    }
+
+    /// A skin declaring no Closing duration, committed after one that
+    /// declares one, clears the receipt.
+    #[test]
+    fn a_skin_declaring_no_close_clears_the_receipt() {
+        let (chart, _screens, link) = receipt_link(Some(TimeUs(3_000_000)));
+        let mut declared = None;
+        ready_attempt(&link, &chart);
+        crate::play::commit_ready(&link, false, &mut declared).unwrap();
+        assert_eq!(declared, Some(TimeUs(3_000_000)));
+        assert_eq!(
+            link.select(Some(bundle())).wait().unwrap(),
+            Preparation::Ready
+        );
+        ready_attempt(&link, &chart);
+        crate::play::commit_ready(&link, false, &mut declared).unwrap();
+        assert_eq!(declared, None);
+        link.exit();
+    }
+
+    /// An attempt prepared with no skin chosen (`select(None)`) draws with
+    /// the installation in use, so its receipt is that skin's declared
+    /// duration, on the first commit after the choice and on a retry.
+    #[test]
+    fn the_skin_in_use_gives_its_declared_close() {
+        let three = Some(TimeUs(3_000_000));
+        let (chart, _screens, link) = receipt_link(three);
+        assert_eq!(link.select(None).wait().unwrap(), Preparation::Ready);
+        let mut declared = None;
+        for _ in 0..2 {
+            ready_attempt(&link, &chart);
+            crate::play::commit_ready(&link, false, &mut declared).unwrap();
+            assert_eq!(declared, three);
+        }
+        link.exit();
+    }
+
+    /// Past the bound, a receipt is read only for the request waited for:
+    /// with a later request committed and the receipt another request's,
+    /// the commit answers installed with no declared duration, never the
+    /// other request's.
+    #[test]
+    fn a_receipt_past_the_bound_is_only_its_own_requests() {
+        let (chart, screens, mut link) = receipt_link(Some(TimeUs(3_000_000)));
+        let mut declared = None;
+        ready_attempt(&link, &chart);
+        crate::play::commit_ready(&link, false, &mut declared).unwrap();
+        assert_eq!(declared, Some(TimeUs(3_000_000)));
+        ready_attempt(&link, &chart);
+
+        // The render thread stalls in a loading frame, so the commit is
+        // not taken within the bound, while the commits show a later
+        // request committed and the first attempt's receipt.
+        stall_render(&link, &screens);
+        let request = link.requests.load(Ordering::Relaxed);
+        link.shared.commits().committed = request + 1;
+        link.set_timeouts(Duration::from_millis(100), Duration::from_secs(5));
+        link.shared.commit_timed_out.store(false, Ordering::Release);
+        crate::play::commit_ready(&link, false, &mut declared).unwrap();
+        assert!(link.shared.commit_timed_out.load(Ordering::Acquire));
+        assert_ne!(link.shared.commits().receipt.request, request);
+        assert_eq!(declared, None);
+        screens.stall.store(false, Ordering::Release);
+        link.exit();
     }
 
     /// While a preparation is held unanswered, loading frames go on being
@@ -8414,7 +8654,7 @@ pub(crate) mod tests {
             link.prepare_attempt(attempt, || false).unwrap(),
             Preparation::Ready
         );
-        crate::play::commit_ready(&link, true).unwrap();
+        crate::play::commit_ready(&link, true, &mut None).unwrap();
         let ready = rec.until(next, |s| s.load.percent == 100);
         link.end_loading().unwrap();
         let ended = rec.count();
