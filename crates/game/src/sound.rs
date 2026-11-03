@@ -7,24 +7,32 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use ::audio::{AudioEngine, AudioOutput, OutputError, SoundCmd};
-use bms_model::TimeUs;
+use bms_model::{Lane, SoundId, TimeUs};
 use eval::{JudgeEvent, JudgeEventKind};
 
 use crate::logic::EventSink;
 
-/// Sends each key sound (`PlaySound`) to the audio command queue, with the
-/// receive time of the press behind it as the command's origin (design.md
-/// "Latency Figures"). Other events are not audio's concern.
+/// Sends each key sound (`PlaySound`, and each press of the audio tail's
+/// feedback, [`EventSink::key_sound`]) to the audio command queue, with
+/// the receive time of the press behind it as the command's origin
+/// (design.md "Latency Figures"). Other events are not audio's concern.
 ///
-/// The queue is sized from the play's event bound ([`Logic::max_events`]),
-/// so it cannot fill within a play; if it ever did, the sound would be
-/// dropped and counted rather than block the logic thread.
+/// The queue is bounded and never blocks the logic thread. It is sized
+/// from the play's event bound ([`Logic::max_events`]), which the judged
+/// play's sounds stay within; the audio tail's presses are not recorded,
+/// so nothing bounds them but the audio thread draining the queue every
+/// period. A sound that finds the queue full is dropped and counted
+/// ([`AudioQueue::dropped`]); each command it takes is counted too
+/// ([`AudioQueue::accepted`]), so the audio thread's report that the
+/// play's audio ended names the commands it had taken by then
+/// ([`crate::AudioControl::done`]).
 ///
 /// [`Logic::max_events`]: crate::Logic::max_events
 #[derive(Debug)]
 pub struct AudioSink {
     cmds: rtrb::Producer<SoundCmd>,
     dropped: Arc<AtomicU64>,
+    accepted: Arc<AtomicU64>,
     /// Where the play's time 0 lies on the output's timeline.
     shift: TimeUs,
     /// Whether key sounds are sent; not when they are scheduled ahead with
@@ -52,21 +60,26 @@ impl AudioSink {
 
 impl EventSink for AudioSink {
     fn receive(&mut self, ev: &JudgeEvent) {
-        let JudgeEventKind::PlaySound { sound, .. } = ev.kind else {
+        let JudgeEventKind::PlaySound { lane, sound } = ev.kind else {
             return;
         };
+        // A key sound always comes from a press; the event time stands in
+        // only if an origin is ever missing.
+        self.key_sound(lane, sound, ev.origin.unwrap_or(ev.time));
+    }
+
+    fn key_sound(&mut self, _lane: Lane, sound: SoundId, origin: TimeUs) {
         if !self.keys {
             return;
         }
-        // A key sound always comes from a press; the event time stands in
-        // only if an origin is ever missing.
-        let origin = ev.origin.unwrap_or(ev.time);
         let cmd = SoundCmd {
             sound,
             origin: TimeUs(origin.0.saturating_add(self.shift.0)),
         };
         if self.cmds.push(cmd).is_err() {
             self.dropped.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.accepted.fetch_add(1, Ordering::Release);
         }
     }
 
@@ -82,6 +95,7 @@ impl EventSink for AudioSink {
 pub struct AudioQueue {
     cmds: rtrb::Consumer<SoundCmd>,
     dropped: Arc<AtomicU64>,
+    accepted: Arc<AtomicU64>,
 }
 
 impl AudioQueue {
@@ -107,6 +121,19 @@ impl AudioQueue {
     pub fn dropped(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)
     }
+
+    /// Commands the queue has taken so far, read with `Acquire`.
+    #[must_use]
+    pub fn accepted(&self) -> u64 {
+        self.accepted.load(Ordering::Acquire)
+    }
+
+    /// The count behind [`accepted`](Self::accepted), shared with the side
+    /// that hands the queue on, which reads it after the queue has gone.
+    #[must_use]
+    pub fn accepted_count(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.accepted)
+    }
 }
 
 /// The link between logic and audio: a command queue holding `capacity`
@@ -122,16 +149,19 @@ pub fn audio_link(capacity: usize) -> (AudioSink, AudioQueue) {
 pub fn audio_link_at(capacity: usize, origin: TimeUs) -> (AudioSink, AudioQueue) {
     let (producer, consumer) = rtrb::RingBuffer::new(capacity);
     let dropped = Arc::new(AtomicU64::new(0));
+    let accepted = Arc::new(AtomicU64::new(0));
     (
         AudioSink {
             cmds: producer,
             dropped: Arc::clone(&dropped),
+            accepted: Arc::clone(&accepted),
             shift: origin,
             keys: true,
         },
         AudioQueue {
             cmds: consumer,
             dropped,
+            accepted,
         },
     )
 }
@@ -253,8 +283,6 @@ impl<O: AudioOutput + Wakes> Wakes for ::audio::RecordingOutput<O> {
 
 #[cfg(test)]
 mod tests {
-    use bms_model::{Lane, SoundId};
-
     use super::*;
 
     fn event(kind: JudgeEventKind, origin: Option<TimeUs>) -> JudgeEvent {

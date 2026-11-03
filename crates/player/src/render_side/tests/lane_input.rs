@@ -35,6 +35,9 @@ fn lane(n: u8) -> Lane {
 struct Seen {
     generation: u64,
     finalized: Option<TimeUs>,
+    /// How far the view's conversion went: its finalized watermark in
+    /// play, beyond it in the audio tail.
+    converted: Option<TimeUs>,
     /// Each lane's key beam alpha in `SimpleSkin`, `None` unlit.
     beams: [Option<f32>; 8],
     /// Each lane's model `press` and `release` starts.
@@ -58,8 +61,8 @@ struct Clocked {
 
 /// A screen that builds both skins from each frame the render thread
 /// acquires and notes what they show: at the chart time `now` gives the
-/// frame's view when set (the logic step publishes each step's view
-/// once, at its watermark), otherwise at the thread's own frame time,
+/// frame's view's conversion watermark when set (the logic step
+/// publishes each step's view once, converted through its watermark), otherwise at the thread's own frame time,
 /// with the display offset it is given.
 struct Skins {
     simple: SimpleSkin,
@@ -110,7 +113,7 @@ impl Screen for Skins {
     fn build(&mut self, f: &FrameInput<'_>) -> Result<(), skin_model::BuildError> {
         let f = match self.now {
             Some(now) => FrameInput {
-                now: now(f.view.finalized),
+                now: now(f.view.input.converted()),
                 display_offset: TimeUs(150 * MS),
                 ..*f
             },
@@ -150,6 +153,7 @@ impl Screen for Skins {
         let seen = Seen {
             generation: f.view.generation,
             finalized: f.view.finalized,
+            converted: f.view.input.converted(),
             beams: beams(&batch),
             keys,
             ready: play.timer(timer::READY),
@@ -813,4 +817,160 @@ fn key_timers_follow_the_lifecycles_own_clocks() {
         latencies[latencies.len() / 2],
         latencies[latencies.len() - 1]
     );
+}
+
+/// The audio tail (S9-03, #159) through the render thread and the audio
+/// thread's loop: once the play completed and its audio was sealed, the
+/// feedback goes on converting what the queue takes, so key 3 pressed in
+/// the tail (no notes) lights whole in `SimpleSkin` with the model's
+/// key-on from its press, and fades from its release with key-off, with an
+/// effect queue of one, frames drawn at each step's conversion watermark;
+/// key 1 pressed there sounds its note's sound, which the audio thread
+/// takes, and the audio is reported done only once that sound has ended
+/// with the BGM; the record and the view's scored part stay as the
+/// completion froze them.
+#[test]
+fn tail_presses_reach_both_skins_and_the_audio() {
+    use ::audio::{AudioEngine, Gain, MAX_VOICES, SimConfig, SimDevice, Sound, SoundBank};
+    const RATE: u32 = 48_000;
+    let mut chart = ChartBuilder::new(150_000)
+        .sound("bgm.wav")
+        .sound("key.wav")
+        .bgm(TimeUs(0), bms_model::SoundId(0))
+        .tap(lane(1), TimeUs(100 * MS))
+        .build()
+        .unwrap();
+    chart.lanes[1][0].sound = Some(bms_model::SoundId(1));
+    let bank = Arc::new(SoundBank::from_sounds(
+        RATE,
+        vec![
+            Sound::mono(vec![900; RATE as usize]),
+            Sound::mono(vec![500; 480]),
+        ],
+    ));
+    let engine = AudioEngine::new(bank, &chart.bgm, RATE, 480, MAX_VOICES, 0).unwrap();
+    let (mut audio, mut worker) = game::audio_control(engine);
+    let mut out = SimDevice::new(SimConfig::steady(RATE, 480, TimeUs(0)));
+    let mut audio_to = |at: i64| {
+        while out.next_wake().0 <= at {
+            worker.step(&mut out).unwrap();
+        }
+    };
+    let rule = rules::tapestry();
+    let mut device = device();
+    device.sources.truncate(1);
+    let (mut writer, reader) = input::source_queue(64);
+    let (mut logic, side) = Logic::<SourceReader>::new(
+        &chart,
+        &rule,
+        &device,
+        &InputStart::default(),
+        vec![reader],
+        LogicConfig {
+            inputs: 64,
+            effects: 1,
+        },
+        Vec::new(),
+    )
+    .unwrap();
+    let (sink, queue) = game::audio_link_at(logic.max_events(), TimeUs(0));
+    let accepted = queue.accepted_count();
+    logic.add_sink(Box::new(sink));
+    audio
+        .play_at(TimeUs(0), queue, Gain::HEADROOM, None)
+        .unwrap();
+    let mut feed = |events: &[PhysicalInputEvent], ms: i64| {
+        for ev in events {
+            writer.push(*ev).unwrap();
+        }
+        writer.publish(TimeUs(ms * MS));
+    };
+    // Key 1's note hit, the play complete at 400 ms.
+    feed(&[key(100, 1, 1), key(120, 1, 0)], 400);
+    assert!(logic.advance_to(TimeUs(400 * MS)).complete);
+    logic.stop_playing();
+    audio.seal();
+    let frozen = logic.view();
+    let record = logic.record();
+
+    let clock = QpcClock::start();
+    let (seen, make) = screen(Some(|c| c.unwrap_or(TimeUs(0))), clock);
+    let shared = Arc::new(chart.clone());
+    let link = spawn(
+        make,
+        Some(Arc::clone(&shared)),
+        None,
+        clock,
+        view(),
+        measure(clock),
+        Box::new(NoFrames),
+    )
+    .unwrap();
+    link.send(RenderMsg::Play {
+        side,
+        gauge: 0,
+        measure: play_measure(clock.now()),
+    });
+    let frame = |converted: i64| {
+        let at = Some(TimeUs(converted * MS));
+        assert!(wait_until(|| seen
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(s, _)| s.converted == at)));
+        let seen = seen.lock().unwrap();
+        seen.iter()
+            .map(|(s, _)| s)
+            .find(|s| s.converted == at)
+            .cloned()
+            .unwrap()
+    };
+    let beams = |b1: Option<f32>, b3: Option<f32>| {
+        let mut b = [None; 8];
+        b[1] = b1;
+        b[3] = b3;
+        b
+    };
+    assert_eq!(frame(400).keys[3], (None, None));
+    // The tail: keys 1 and 3 pressed at 450 ms.
+    feed(&[key(450, 1, 1), key(450, 3, 1)], 500);
+    assert_eq!(logic.feedback_to(), Some(TimeUs(500 * MS)));
+    let pressed = frame(500);
+    assert_eq!(pressed.keys[3], (at(450), None));
+    assert_eq!(pressed.keys[1], (at(450), None));
+    assert!(
+        close(pressed.beams, beams(lit(1.0), lit(1.0))),
+        "{pressed:?}"
+    );
+    audio_to(500 * MS);
+    assert_eq!(accepted.load(std::sync::atomic::Ordering::Acquire), 2);
+    assert!(!audio.done());
+    // Both released at 520 ms: 80 ms along their fade at 600 ms.
+    feed(&[key(520, 3, 0), key(520, 1, 0)], 600);
+    logic.feedback_to().unwrap();
+    let released = frame(600);
+    assert_eq!(released.keys[3], (None, at(520)));
+    assert!(
+        close(released.beams, beams(lit(0.2), lit(0.2))),
+        "{released:?}"
+    );
+    // The BGM's 1 s ends; then the audio is done, every sound taken.
+    audio_to(900 * MS);
+    assert!(!audio.done());
+    audio_to(1_200 * MS);
+    assert!(audio.done());
+    let v = logic.view();
+    assert_eq!(
+        (v.tally, v.gauges, v.notes, v.finalized, v.events),
+        (
+            frozen.tally,
+            frozen.gauges,
+            frozen.notes,
+            frozen.finalized,
+            frozen.events
+        )
+    );
+    assert_eq!(logic.record(), record);
+    let _ = link.finish(clock.now());
+    link.exit();
 }

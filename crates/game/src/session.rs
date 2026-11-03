@@ -1901,6 +1901,16 @@ impl<O> SessionRig<'_, O> {
         }
     }
 
+    /// The open recording's closing as it reads now.
+    fn closing(&self) -> Closing {
+        Closing {
+            arrivals: self.sources.arrivals().to_vec(),
+            overflowed: self.sources.overflowed(),
+            source_limited: self.sources.source_limited(),
+            axis_out_of_range: self.sources.axis_out_of_range().collect(),
+        }
+    }
+
     /// The script's time now.
     fn play_time(&self) -> Option<TimeUs> {
         self.script_origin.map(|o| TimeUs(self.clock.now().0 - o.0))
@@ -2151,14 +2161,20 @@ impl<O: AudioOutput + Wakes> Rig for SessionRig<'_, O> {
     }
 
     fn close(&mut self) -> Result<Closing, InputWaitError> {
-        let closing = Closing {
-            arrivals: self.sources.arrivals().to_vec(),
-            overflowed: self.sources.overflowed(),
-            source_limited: self.sources.source_limited(),
-            axis_out_of_range: self.sources.axis_out_of_range().collect(),
-        };
+        let closing = self.closing();
         self.sources.close_recording();
         Ok(closing)
+    }
+
+    fn hand_off(&mut self) -> Result<Closing, InputWaitError> {
+        let closing = self.closing();
+        self.sources.hand_off();
+        Ok(closing)
+    }
+
+    fn end_feedback(&mut self) -> Result<(), InputWaitError> {
+        self.sources.close_recording();
+        Ok(())
     }
 
     fn ended(&mut self, _report: &PlayReport) {}

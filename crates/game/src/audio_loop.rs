@@ -10,10 +10,13 @@
 //! the output keeps queued; the audio thread applies the change at its next
 //! step and answers with what the output keeps. It also counts each play's
 //! underruns from its chart time 0 on, the steady state after READY. A
-//! sealed play (evaluation complete, no more key sounds) is reported done only
-//! once the audio thread has taken every command sent before the seal and every
-//! voice and BGM event has ended: the end of the audio tail (design.md "Play
-//! Lifecycle").
+//! sealed play (evaluation complete; key sounds come only from the audio
+//! tail's feedback) is reported done once its queue is empty and every voice
+//! and BGM event has ended, the report naming the play and the commands the
+//! audio thread had taken from its queue by then; the game thread takes it
+//! as the end of the audio tail (design.md "Play Lifecycle") only when that
+//! is every command its queue accepted, so a report made before a later
+//! press's sound was accepted never ends the tail.
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
@@ -207,10 +210,11 @@ pub enum AudioCtl {
     },
     /// The play was aborted: every sound stops.
     Cancel,
-    /// Evaluation completed: no key sound follows.
+    /// Evaluation completed: the play's audio is reported done whenever it
+    /// has ended, and key sounds come only from the audio tail's feedback.
     Seal,
-    /// A practice round's evaluation completed: no key sound follows, and
-    /// the play rings out (design.md "Mid-Chart Start and Section Repeat"):
+    /// A practice round's evaluation completed: sealed, and the play rings
+    /// out (design.md "Mid-Chart Start and Section Repeat"):
     /// the BGM plays on until `fade_at`, the output fades to silence by
     /// `end_at`, both in the play's chart time, and every sound stops
     /// there. The play is then done as a sealed one is.
@@ -365,7 +369,9 @@ struct Shared {
     /// waiting. Only the newest counts, so volume keys never fill the
     /// control queue.
     volume: AtomicU64,
-    /// The generation whose sealed audio has ended.
+    /// The latest report that the sealed play's audio has ended: its
+    /// generation in the high 32 bits, the key-sound commands the audio
+    /// thread had taken from its queue in the low 32.
     done: AtomicU64,
     /// The engine's underruns so far.
     underruns: AtomicU64,
@@ -427,6 +433,9 @@ pub struct AudioControl {
     rate: u32,
     shared: Arc<Shared>,
     generation: u64,
+    /// The commands the current play's queue accepted
+    /// ([`AudioQueue::accepted_count`]); `None` before the first play.
+    accepted: Option<Arc<AtomicU64>>,
     /// The number of the latest queue change asked for.
     queue_change: u32,
 }
@@ -450,6 +459,9 @@ pub struct AudioWorker {
     /// The current play's origin.
     origin: TimeUs,
     generation: u64,
+    /// The commands taken from the current play's queue: started, refused
+    /// or discarded.
+    consumed: u64,
     sealed: bool,
     exited: bool,
     /// A retired play the full return queue did not take.
@@ -514,6 +526,7 @@ pub fn audio_control(mut engine: AudioEngine) -> (AudioControl, AudioWorker) {
         rate,
         shared: Arc::clone(&shared),
         generation: 0,
+        accepted: None,
         queue_change: 0,
     };
     let worker = AudioWorker {
@@ -529,6 +542,7 @@ pub fn audio_control(mut engine: AudioEngine) -> (AudioControl, AudioWorker) {
         transport: None,
         origin: TimeUs(0),
         generation: 0,
+        consumed: 0,
         sealed: false,
         exited: false,
         unreturned: None,
@@ -660,6 +674,7 @@ impl AudioControl {
         self.ready()?;
         self.in_flight = true;
         self.generation += 1;
+        self.accepted = Some(queue.accepted_count());
         let generation = self.generation;
         self.send(AudioCtl::Play {
             origin,
@@ -839,14 +854,15 @@ impl AudioControl {
         self.send(AudioCtl::Cancel);
     }
 
-    /// No key sound follows: [`done`](Self::done) turns true when the play's
-    /// audio has ended.
+    /// Evaluation completed: [`done`](Self::done) turns true when the
+    /// play's audio has ended, every key sound its queue accepted
+    /// included.
     pub fn seal(&mut self) {
         self.send(AudioCtl::Seal);
     }
 
-    /// No key sound follows, and the play rings out from `fade_at` to
-    /// `end_at` in its chart time ([`AudioCtl::RingOut`]): [`done`](Self::done)
+    /// Sealed, and the play rings out from `fade_at` to `end_at` in its
+    /// chart time ([`AudioCtl::RingOut`]): [`done`](Self::done)
     /// turns true once every sound has stopped, at the latest when the
     /// output reaches `end_at`. The audio thread mixes ahead, so that can
     /// be before the play's time reaches `end_at`.
@@ -854,10 +870,19 @@ impl AudioControl {
         self.send(AudioCtl::RingOut { fade_at, end_at });
     }
 
-    /// Whether the sealed play's audio has ended.
+    /// Whether the sealed play's audio has ended: the audio thread's
+    /// latest report names this play and every key-sound command its queue
+    /// has accepted. A report made before a later command was accepted is
+    /// stale and does not count; the game thread, which alone sends them,
+    /// reads the accepted count after its last send.
     #[must_use]
     pub fn done(&self) -> bool {
-        self.generation != 0 && self.shared.done.load(Ordering::Acquire) == self.generation
+        let Some(accepted) = self.accepted.as_ref().filter(|_| self.generation != 0) else {
+            return false;
+        };
+        let report = self.shared.done.load(Ordering::Acquire);
+        let accepted = accepted.load(Ordering::Acquire);
+        report == done_report(self.generation, accepted)
     }
 
     /// The output's failure, once it failed.
@@ -985,7 +1010,7 @@ impl AudioWorker {
             match msg {
                 AudioCtl::Load { bank, schedule, id } => {
                     self.steady_from = None;
-                    while self.queue.commands().pop().is_ok() {}
+                    self.discard_commands();
                     let (taken, (bank, schedule)) = match self.engine.replace(bank, schedule) {
                         Ok(old) => (true, old),
                         Err(refused) => (false, refused),
@@ -1035,6 +1060,7 @@ impl AudioWorker {
                         self.unreturned = Some(old);
                     }
                     self.generation = generation;
+                    self.consumed = 0;
                     self.sealed = false;
                     self.steady_from = Some(origin);
                     self.steady = 0;
@@ -1159,11 +1185,18 @@ impl AudioWorker {
     fn drop_play(&mut self) {
         self.steady_from = None;
         self.engine.stop();
-        while self.queue.commands().pop().is_ok() {}
+        self.discard_commands();
         if let Some(t) = self.transport.take() {
             self.shared
                 .dropped
                 .store(u64::from(t.generation) + 1, Ordering::Release);
+        }
+    }
+
+    /// Discards the play's queued key-sound commands, counted as taken.
+    fn discard_commands(&mut self) {
+        while self.queue.commands().pop().is_ok() {
+            self.consumed = self.consumed.saturating_add(1);
         }
     }
 
@@ -1188,6 +1221,7 @@ impl AudioWorker {
                 .is_some_and(|t| t.gate.commit(t.generation))
         };
         let report = engine.step_admitting(out, queue.commands(), &mut admit)?;
+        self.consumed = self.consumed.saturating_add(u64::from(report.commands));
         match report.transport {
             Some(true) => self.transport = None,
             Some(false) => self.drop_play(),
@@ -1292,7 +1326,10 @@ impl AudioWorker {
             && self.engine.bgm_left() == 0
         {
             self.steady_from = None;
-            self.shared.done.store(self.generation, Ordering::Release);
+            self.shared.done.store(
+                done_report(self.generation, self.consumed),
+                Ordering::Release,
+            );
         }
         Ok(true)
     }
@@ -1325,6 +1362,15 @@ impl AudioWorker {
     pub const fn engine(&self) -> &AudioEngine {
         &self.engine
     }
+}
+
+/// A report that play `generation`'s audio has ended with `consumed`
+/// key-sound commands taken: each in 32 bits, the generation high. The
+/// count starts over with each play, and 2^32 key sounds in one play are
+/// more than eight months of one every 5 ms, so its 32 bits never wrap
+/// onto a stale report.
+const fn done_report(generation: u64, consumed: u64) -> u64 {
+    (generation & 0xffff_ffff) << 32 | consumed & 0xffff_ffff
 }
 
 #[cfg(test)]

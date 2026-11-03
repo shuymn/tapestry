@@ -11,8 +11,16 @@
 //! publishes the gate's state and whether a participating device is still
 //! connected, for the abort checks of the play and its audio tail.
 //!
+//! A completed play's close is a handoff (design.md "Play Lifecycle", the
+//! audio tail): the game thread asks for it through a bounded queue and the
+//! input thread answers at its next boundary with the closing, copied into
+//! storage reserved at the opening, so the handoff allocates nothing; the
+//! sources stay, and input goes on reaching the play's queues for the
+//! tail's feedback until the close that follows the tail. The hook's lines
+//! for the play are made at that close, outside the play.
+//!
 //! The hook reports the thread's phase (`input::cadence`): Open from an
-//! open, Tail from a close, and Idle only from [`Request::Idle`], which the
+//! open through a handoff to the close, Tail from a close, and Idle only from [`Request::Idle`], which the
 //! game thread sends once a play's audio tail is over. At each boundary
 //! the hook also sets the controller's menu active only while Idle with the
 //! window focused, and wakes the game thread when the batch sent a menu
@@ -189,6 +197,46 @@ pub enum RearmOutcome {
     Refused,
 }
 
+/// A completed play's closing, made at its handoff in storage the input
+/// thread reserved at the opening, and kept by the game thread until the
+/// close after the tail, so neither side allocates or frees for it during
+/// the play.
+#[derive(Debug, Default)]
+pub struct Handoff {
+    /// The closing, moved out by the game thread.
+    pub closing: Closing,
+}
+
+impl Handoff {
+    /// Storage for a closing of up to `arrivals` arrivals and `sources`
+    /// sources.
+    fn reserved(arrivals: usize, sources: usize) -> Box<Self> {
+        Box::new(Self {
+            closing: Closing {
+                arrivals: Vec::with_capacity(arrivals),
+                overflowed: false,
+                source_limited: false,
+                axis_out_of_range: Vec::with_capacity(sources),
+            },
+        })
+    }
+
+    /// Fills the closing from `sources`, within the reserved storage.
+    fn fill(&mut self, sources: &SourceSet) {
+        let c = &mut self.closing;
+        c.arrivals.clear();
+        let room = c.arrivals.capacity();
+        c.arrivals
+            .extend(sources.arrivals().iter().take(room).copied());
+        c.overflowed = sources.overflowed();
+        c.source_limited = sources.source_limited();
+        c.axis_out_of_range.clear();
+        let room = c.axis_out_of_range.capacity();
+        c.axis_out_of_range
+            .extend(sources.axis_out_of_range().take(room));
+    }
+}
+
 /// What the input thread publishes between requests.
 #[derive(Debug, Default)]
 pub struct InputState {
@@ -219,6 +267,12 @@ pub struct InputLink {
     /// Rearms to the input thread, and back ([`rearm`](Self::rearm)).
     rearms: rtrb::Producer<Box<Rearm>>,
     rearmed: rtrb::Consumer<Box<Rearm>>,
+    /// Handoffs asked of the input thread, and their answers
+    /// ([`hand_off`](Self::hand_off)).
+    handoffs: rtrb::Producer<()>,
+    handed: rtrb::Consumer<Box<Handoff>>,
+    /// The last handoff's storage, freed at the close after its tail.
+    spent: Option<Box<Handoff>>,
 }
 
 impl InputLink {
@@ -300,12 +354,57 @@ impl InputLink {
         answer
     }
 
-    /// Closes recording.
+    /// Hands a completed play's recording off to its tail at the input
+    /// thread's next boundary ([`input::SourceSet::hand_off`]), and waits
+    /// for the closing as [`rearm`](Self::rearm) waits. Allocates nothing:
+    /// the request and the answer go through bounded queues, and the
+    /// answer's storage is kept until [`close`](Self::close).
+    ///
+    /// # Errors
+    ///
+    /// As [`open`](Self::open).
+    pub fn hand_off(&mut self) -> Result<Closing, InputWaitError> {
+        if let Some(e) = self.failed {
+            return Err(e);
+        }
+        let sent = self.handoffs.push(()).map_err(|_| InputWaitError::Gone);
+        let answer = sent.and_then(|()| {
+            self.waker.wake();
+            let since = (self.awake)();
+            loop {
+                if let Ok(h) = self.handed.pop() {
+                    return Ok(h);
+                }
+                if self.state.gone.load(Ordering::Acquire) || self.handed.is_abandoned() {
+                    return Err(InputWaitError::Gone);
+                }
+                if (self.awake)().saturating_sub(since) >= self.timeout {
+                    return Err(InputWaitError::Timeout);
+                }
+                std::thread::sleep(REARM_POLL);
+            }
+        });
+        match answer {
+            Ok(mut h) => {
+                let closing = std::mem::take(&mut h.closing);
+                self.spent = Some(h);
+                Ok(closing)
+            }
+            Err(e) => {
+                self.failed = Some(e);
+                Err(e)
+            }
+        }
+    }
+
+    /// Closes recording, or the sources of a play handed off to its tail
+    /// ([`hand_off`](Self::hand_off)).
     ///
     /// # Errors
     ///
     /// As [`open`](Self::open).
     pub fn close(&mut self) -> Result<Closing, InputWaitError> {
+        self.spent = None;
         match self.ask(Request::Close)? {
             Reply::Closed(c, lines) => {
                 print_lines(&lines);
@@ -468,6 +567,11 @@ pub struct Hook {
     /// Rearms from the game thread, and back.
     rearms: rtrb::Consumer<Box<Rearm>>,
     rearmed: rtrb::Producer<Box<Rearm>>,
+    /// Handoffs from the game thread, and their answers.
+    handoffs: rtrb::Consumer<()>,
+    handed: rtrb::Producer<Box<Handoff>>,
+    /// The open recording's handoff storage, reserved at its opening.
+    handoff: Option<Box<Handoff>>,
 }
 
 /// A linked hook and link; the link wakes the input thread through
@@ -479,6 +583,9 @@ pub fn link(controls: Arc<Controls>, mode: Mode, waker: Waker) -> (Hook, InputLi
     // One rearm is in flight at a time.
     let (rearm_tx, rearm_rx) = rtrb::RingBuffer::new(1);
     let (rearmed_tx, rearmed_rx) = rtrb::RingBuffer::new(1);
+    // One handoff is in flight at a time.
+    let (handoff_tx, handoff_rx) = rtrb::RingBuffer::new(1);
+    let (handed_tx, handed_rx) = rtrb::RingBuffer::new(1);
     (
         Hook {
             requests: req_rx,
@@ -493,6 +600,9 @@ pub fn link(controls: Arc<Controls>, mode: Mode, waker: Waker) -> (Hook, InputLi
             script_origin: None,
             rearms: rearm_rx,
             rearmed: rearmed_tx,
+            handoffs: handoff_rx,
+            handed: handed_tx,
+            handoff: None,
         },
         InputLink {
             requests: req_tx,
@@ -504,6 +614,9 @@ pub fn link(controls: Arc<Controls>, mode: Mode, waker: Waker) -> (Hook, InputLi
             failed: None,
             rearms: rearm_tx,
             rearmed: rearmed_rx,
+            handoffs: handoff_tx,
+            handed: handed_rx,
+            spent: None,
         },
     )
 }
@@ -607,6 +720,15 @@ impl Hook {
         if let Ok(mut rearm) = self.rearms.pop() {
             self.rearm(sources, now, &mut rearm);
             let _ = self.rearmed.push(rearm);
+        }
+        // A handoff, at this boundary: one in flight at a time, so the
+        // answer always has room. Only an opening reserved its storage; a
+        // handoff without one answers an empty closing.
+        if self.handoffs.pop().is_ok() {
+            let mut handoff = self.handoff.take().unwrap_or_default();
+            handoff.fill(sources);
+            sources.hand_off();
+            let _ = self.handed.push(handoff);
         }
         self.publish(sources);
         if self.origin.is_some()
@@ -728,6 +850,10 @@ impl Hook {
         };
         self.origin = Some(origin);
         self.logic = Some(logic);
+        self.handoff = Some(Handoff::reserved(
+            sources.max_arrivals(),
+            sources.participants().count(),
+        ));
         self.participants = sources
             .participants()
             .map(|(d, _)| (d, sources.connection(d)))
@@ -822,6 +948,7 @@ impl Hook {
         sources.close_recording();
         self.origin = None;
         self.script_origin = None;
+        self.handoff = None;
         (closed, lines)
     }
 }
@@ -2524,5 +2651,97 @@ mod gate_tests {
             )),
             "the event that fits was dropped"
         );
+    }
+
+    /// A completed play's handoff, served at the input thread's boundary
+    /// while the game thread waits: the closing comes back in the storage
+    /// reserved at the opening, and the boundaries allocate nothing; the
+    /// start gate is disarmed, and the queues go on taking input, a key
+    /// held through the handoff released with no press repeated, until the
+    /// close after the tail.
+    #[test]
+    fn a_handoff_keeps_the_sources_until_the_close() {
+        let (mut sources, mut hook, mut link, gate) = rig();
+        let opening = open(&mut hook, &link, &mut sources, 10).unwrap();
+        assert_eq!(gate.state().phase, GatePhase::Armed);
+        let mut readers = opening.readers;
+        batch(&mut hook, &mut sources, 20, &[packet(2, Z, 1)]);
+        for r in &mut readers {
+            while r.pop().is_some() {}
+        }
+        #[cfg(feature = "dev-tools")]
+        {
+            let control = crate::alloc_count::this_thread();
+            drop(std::hint::black_box(vec![1_u8; 8]));
+            assert!(
+                crate::alloc_count::this_thread() > control,
+                "the allocation was not counted"
+            );
+        }
+        // Each side's own allocations (counted with dev-tools only): the
+        // input thread's boundaries, the thread's spawn aside, and the game
+        // thread's whole handoff, each thread with its positive control.
+        let count = || {
+            #[cfg(feature = "dev-tools")]
+            return crate::alloc_count::this_thread();
+            #[cfg(not(feature = "dev-tools"))]
+            0
+        };
+        let control = || {
+            #[cfg(feature = "dev-tools")]
+            {
+                let before = count();
+                drop(std::hint::black_box(vec![1_u8; 8]));
+                assert!(count() > before, "the allocation was not counted");
+            }
+        };
+        let mut allocated = 0;
+        let (closing, asking) = std::thread::scope(|s| {
+            let asked = s.spawn(|| {
+                control();
+                let before = count();
+                let closing = link.hand_off();
+                (closing, count() - before)
+            });
+            let mut at = 30;
+            while !asked.is_finished() {
+                let before = count();
+                batch(&mut hook, &mut sources, at, &[]);
+                allocated += count() - before;
+                at += 1;
+            }
+            asked.join().unwrap()
+        });
+        let closing = closing.unwrap();
+        assert_eq!(allocated, 0, "the input thread's handoff allocated");
+        assert_eq!(asking, 0, "the game thread's handoff allocated");
+        assert_eq!(
+            closing,
+            game::Closing {
+                arrivals: Vec::new(),
+                overflowed: false,
+                source_limited: false,
+                axis_out_of_range: vec![0, 0],
+            }
+        );
+        assert!(sources.is_recording() && sources.is_handed_off());
+        assert_ne!(gate.state().phase, GatePhase::Armed);
+        batch(&mut hook, &mut sources, 100, &[packet(2, Z, 0)]);
+        let tail: Vec<_> = readers[1].pop().into_iter().map(|e| e.kind).collect();
+        assert_eq!(
+            tail,
+            [InputKind::Control {
+                control: Z,
+                value: 0
+            }]
+        );
+        assert!(readers.iter().all(input::SourceReader::is_empty));
+        // The close after the tail: nothing more reaches the queues.
+        link.requests.send(Request::Close).unwrap();
+        batch(&mut hook, &mut sources, 110, &[]);
+        assert!(matches!(link.replies.try_recv(), Ok(Reply::Closed(..))));
+        assert!(!sources.is_recording());
+        batch(&mut hook, &mut sources, 120, &[packet(2, Z, 1)]);
+        assert!(readers.iter().all(input::SourceReader::is_empty));
     }
 }
