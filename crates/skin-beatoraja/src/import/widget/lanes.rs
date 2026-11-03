@@ -614,28 +614,23 @@ impl Cx<'_> {
     }
 
     /// A cover's image and its destination stretched against the image's
-    /// frame, y up: unchanged for identity; fit to its width for stretch
-    /// 4 (`skin/StretchType.java:61-64, 125-129`); for stretch 5 the same
-    /// unless the fitted frame is taller than the destination, when the
-    /// destination stays and the frame keeps its middle rows, which only
-    /// a single frame can (`:65-68, 143-153`). `None` when the image was
-    /// dropped, also as its role says, before anything is added, when the
-    /// crop cannot be reproduced.
+    /// frame under stretch 5, y up: fit to its width
+    /// (`skin/StretchType.java:65-68, 125-129`) unless [`trimmed`] trims
+    /// it, when the destination stays and the frame keeps its middle
+    /// rows, which only a single frame can (`:140-153`). `None` when the
+    /// image was dropped, also as its role says, before anything is
+    /// added, when the crop cannot be reproduced.
     pub(super) fn add_cover_image(
         &mut self,
         c: &Common,
-        dst: &Dst,
         rec: u32,
         s: &SrcImage,
     ) -> Result<Option<(u32, Rect)>, ImportError> {
         let at = c.span;
         let r = self.cover_rect(c)?;
-        let (mode, grid) = (dst.stretch, s.div);
+        let (mode, grid) = (c.stretch_mode, s.div);
         let mut cropped = false;
         let found = self.add_src_image_cropped(c, rec, s, grid, |cx, [_, y, w, h]| {
-            if mode != 5 {
-                return Ok(Ok(None));
-            }
             let cell = [w / grid[0].max(1), h / grid[1].max(1)];
             let Some(kept) = trimmed(r, cell).ok_or_else(|| cx.range(at, "dst"))? else {
                 return Ok(Ok(None));
@@ -652,14 +647,13 @@ impl Cx<'_> {
         let Some((image, cell)) = found else {
             return Ok(None);
         };
-        if matches!(mode, 4 | 5) && !cropped {
-            let fitted = track::stretch(Stretch::FitWidth, r, cell);
-            return match fitted {
-                Some((r, _)) => Ok(Some((image, r))),
-                None => Err(self.range(at, "dst")),
-            };
+        if cropped {
+            return Ok(Some((image, r)));
         }
-        Ok(Some((image, r)))
+        match track::stretch(Stretch::FitWidth, r, cell) {
+            Some((r, _)) => Ok(Some((image, r))),
+            None => Err(self.range(at, "dst")),
+        }
     }
 
     /// The rect stretch 5 gives a cover of one colour, y up: its

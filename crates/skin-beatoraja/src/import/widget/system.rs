@@ -47,10 +47,9 @@ impl Cx<'_> {
         if lowered == Lowered::Paint {
             // SUDDEN+'s paint, made as an image record's is; under stretch
             // 5 a 1x1 frame's rect.
-            return self.cover_paint_with(dst, role, None, |cx, c, dst| {
+            return self.cover_paint_with(dst, role, None, |cx, c| {
                 cx.paint_rects(
                     c,
-                    dst,
                     |cx| {
                         let r = cx.solid_cover_rect(c)?;
                         Ok(cx.add_system(c, color)?.map(|i| (i, r)))
@@ -79,11 +78,7 @@ impl Cx<'_> {
         let Some(image) = self.add_system(c, color)? else {
             return Ok(None);
         };
-        let Some((rects, native)) = self.baked_rects(c, SYSTEM_SIZE)? else {
-            self.drop_el(c.role, c.span, NoteKind::Stretch(c.stretch_mode))?;
-            return Ok(None);
-        };
-        Ok(Some((image, rects, native)))
+        self.baked_image(c, image, SYSTEM_SIZE)
     }
 
     /// The system image of `color` for `c`, sampled with `c`'s filter:

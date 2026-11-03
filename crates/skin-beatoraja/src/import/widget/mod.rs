@@ -468,6 +468,18 @@ impl Cx<'_> {
         let Some((image, cell)) = self.add_src_image(c, rec, s, s.div)? else {
             return Ok(None);
         };
+        self.baked_image(c, image, cell)
+    }
+
+    /// Admitted `image` of `cell` with `c`'s keys baked against it
+    /// ([`Self::baked_rects`]); `None` once `c` is dropped, as a stretch
+    /// changing branch between keys drops it.
+    pub(super) fn baked_image(
+        &mut self,
+        c: &Common,
+        image: u32,
+        cell: [u32; 2],
+    ) -> Result<Option<Painted>, ImportError> {
         let Some((rects, native)) = self.baked_rects(c, cell)? else {
             self.drop_el(c.role, c.span, NoteKind::Stretch(c.stretch_mode))?;
             return Ok(None);

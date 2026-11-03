@@ -91,14 +91,12 @@ impl Cx<'_> {
     fn paint_image(
         &mut self,
         c: &Common,
-        dst: &Dst,
         rec: u32,
         s: &SrcImage,
     ) -> Result<Option<Painted>, ImportError> {
         self.paint_rects(
             c,
-            dst,
-            |cx| cx.add_cover_image(c, dst, rec, s),
+            |cx| cx.add_cover_image(c, rec, s),
             |cx| cx.src_image_rects(c, rec, s),
         )
     }
@@ -111,12 +109,11 @@ impl Cx<'_> {
     pub(super) fn paint_rects(
         &mut self,
         c: &Common,
-        dst: &Dst,
         fit5: impl FnOnce(&mut Self) -> Result<Option<(u32, Rect)>, ImportError>,
         baked: impl FnOnce(&mut Self) -> Result<Option<Painted>, ImportError>,
     ) -> Result<Option<Painted>, ImportError> {
         let at = c.span;
-        if dst.stretch == 5 {
+        if c.stretch_mode == 5 {
             if !c.track.identical() {
                 self.drop_el(c.role, at, NoteKind::Stretch(c.stretch_mode))?;
                 return Ok(None);
@@ -145,9 +142,7 @@ impl Cx<'_> {
         role: Role,
         range: Option<u32>,
     ) -> Result<(), ImportError> {
-        self.cover_paint_with(dst, role, range, |cx, c, dst| {
-            cx.paint_image(c, dst, rec, s)
-        })
+        self.cover_paint_with(dst, role, range, |cx, c| cx.paint_image(c, rec, s))
     }
 
     /// SUDDEN+'s paint of `dst` in `role`, its keys already charged as an
@@ -158,12 +153,12 @@ impl Cx<'_> {
         dst: Dst,
         role: Role,
         range: Option<u32>,
-        paint: impl FnOnce(&mut Self, &Common, &Dst) -> Result<Option<Painted>, ImportError>,
+        paint: impl FnOnce(&mut Self, &Common) -> Result<Option<Painted>, ImportError>,
     ) -> Result<(), ImportError> {
         let Some(c) = self.image_common(&dst, true, role)? else {
             return Ok(());
         };
-        let Some((image, rects, native)) = paint(self, &c, &dst)? else {
+        let Some((image, rects, native)) = paint(self, &c)? else {
             return Ok(());
         };
         let t = self.model_track(&c, &rects)?;
@@ -245,7 +240,7 @@ impl Cx<'_> {
             }
             raw
         };
-        let Some((image, rects, native)) = self.paint_image(&c, &dst, rec, &s)? else {
+        let Some((image, rects, native)) = self.paint_image(&c, rec, &s)? else {
             return Ok(());
         };
         let gate_track = if trim == CoverTrim::None || raw == rects {
