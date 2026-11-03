@@ -1176,10 +1176,9 @@ impl<'a> Evaluator<'a> {
         // else the lane's latest note before the press, else its first.
         // An empty POOR, early when pressed at or before the note it is
         // against.
-        let empty_poor = best
-            .is_none()
-            .then(|| against.and_then(|k| state.targets.get(k)))
-            .flatten()
+        let empty_poor = against
+            .filter(|_| best.is_none())
+            .and_then(|k| state.targets.get(k))
             .and_then(|&i| notes.get(i))
             .map(|n| t <= n.time);
         let target = best
