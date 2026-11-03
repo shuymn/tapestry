@@ -10,13 +10,13 @@ use std::cell::{Cell, RefCell};
 use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use mlua::Lua;
 
 use super::LuaWhy;
 use super::limits::{
-    INSTRUCTION_STEP, MAX_HOST_CALLS, MAX_INSTRUCTIONS, MAX_NATIVE_WORK, MAX_PASS_TIME,
+    INSTRUCTION_STEP, MAX_HOST_CALLS, MAX_INSTRUCTIONS, MAX_LUA_TIME, MAX_NATIVE_WORK,
 };
 use crate::error::{ImportError, Loc};
 use crate::lua::LuaLimit;
@@ -97,19 +97,28 @@ pub(crate) struct Ledger {
     fault: RefCell<Option<ImportError>>,
     faulted: Cell<bool>,
     cancel: Cancel,
-    /// When the pass started, for [`MAX_PASS_TIME`].
+    /// The time the candidate's earlier passes ran, and when this one
+    /// started, for [`MAX_LUA_TIME`].
+    spent: Duration,
     started: Instant,
 }
 
 impl Ledger {
-    pub(crate) fn new(counts: Counts, cancel: Cancel) -> Self {
+    pub(crate) fn new(counts: Counts, spent: Duration, cancel: Cancel) -> Self {
         Self {
             counts: Cell::new(counts),
             fault: RefCell::new(None),
             faulted: Cell::new(false),
             cancel,
+            spent,
             started: Instant::now(),
         }
+    }
+
+    /// The time the candidate's passes have run, this one's so far
+    /// included.
+    pub(crate) fn spent(&self) -> Duration {
+        self.spent.saturating_add(self.started.elapsed())
     }
 
     pub(crate) fn counts(&self) -> Counts {
@@ -160,7 +169,7 @@ impl Ledger {
         if self.cancel.is_cancelled() {
             return Err(self.fail_lua(lua, LuaWhy::Cancelled));
         }
-        if self.started.elapsed() > MAX_PASS_TIME {
+        if self.spent() > MAX_LUA_TIME {
             return Err(self.fail_lua(lua, LuaWhy::Limit(LuaLimit::Time)));
         }
         Ok(())
@@ -259,7 +268,7 @@ mod tests {
             native_work: 11,
             ..Counts::default()
         };
-        let ledger = Ledger::new(counts, Cancel::new());
+        let ledger = Ledger::new(counts, std::time::Duration::ZERO, Cancel::new());
         ledger.check(&lua).unwrap();
         let _ = ledger.fail_lua(&lua, LuaWhy::Finalizer);
         let _ = ledger.fail_lua(&lua, LuaWhy::Limit(LuaLimit::Memory));
@@ -270,7 +279,7 @@ mod tests {
         assert_eq!(ledger.counts(), counts);
         // A cancellation after the fault does not replace it.
         let cancel = Cancel::new();
-        let ledger2 = Ledger::new(counts, cancel.clone());
+        let ledger2 = Ledger::new(counts, std::time::Duration::ZERO, cancel.clone());
         let _ = ledger2.fail_lua(&lua, LuaWhy::Finalizer);
         cancel.cancel();
         assert!(ledger2.check(&lua).is_err());

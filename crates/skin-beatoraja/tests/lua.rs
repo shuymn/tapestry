@@ -7,7 +7,7 @@ mod common;
 
 use skin_beatoraja::limits::{MAX_FILE_BYTES, MAX_INCLUDE_DEPTH, MAX_INCLUDE_PARSES, MAX_NODES};
 use skin_beatoraja::lua::HOST_APIS;
-use skin_beatoraja::lua::limits::{MAX_HOST_CALLS, MAX_INSTRUCTIONS, MAX_PASS_TIME};
+use skin_beatoraja::lua::limits::{MAX_HOST_CALLS, MAX_INSTRUCTIONS, MAX_LUA_TIME};
 use skin_beatoraja::{
     Cancel, Config, ImportError, InputLimit, LuaHeader, LuaImported, LuaLimit, LuaWhy, NoteKind,
     OffsetValue, read_lua_header,
@@ -700,24 +700,59 @@ fn import_within_a_minute(d: TempDir) -> Result<LuaImported, ImportError> {
 }
 
 #[test]
-fn a_pass_is_refused_once_it_runs_past_its_time() {
+fn a_candidate_is_refused_once_its_lua_runs_past_its_time() {
+    use std::time::{Duration, Instant};
+    // How far past the cap the refusal may come: a check's interval and
+    // the test's own work.
+    const SLACK: Duration = Duration::from_millis(1_500);
     // Each comparison or concatenation is one instruction over 16 MiB:
-    // the instruction cap would take hours to stop it, the deadline stops
+    // the instruction cap would take hours to stop it, the time cap stops
     // it within a step of its limit.
     for body in [
         "local s, t = rep(\"x\", 1 << 24), rep(\"x\", 1 << 24)\nlocal n = 0\n\
          while true do if s == t then n = n + 1 end end",
         "local s = rep(\"x\", 1 << 24)\nwhile true do local u = s .. \"y\" end",
     ] {
-        let start = std::time::Instant::now();
+        let start = Instant::now();
         let r = import_within_a_minute(configured(body));
         let took = start.elapsed();
         assert_eq!(why(r), LuaWhy::Limit(LuaLimit::Time), "{body}");
         assert!(
-            took >= MAX_PASS_TIME && took < MAX_PASS_TIME + std::time::Duration::from_secs(10),
+            took >= MAX_LUA_TIME && took < MAX_LUA_TIME + SLACK,
             "{body}: {took:?}"
         );
     }
+    // The cap spans both passes: a header pass that spends seconds leaves
+    // the configured pass only the rest.
+    let d = folder(&[(
+        "s.luaskin",
+        "local s, t = rep(\"x\", 1 << 24), rep(\"x\", 1 << 24)\n\
+         if not skin_config then\n\
+           for i = 1, 6000 do if s == t then end end\n\
+           return { type = 0 }\n\
+         end\n\
+         while true do if s == t then end end",
+    )]);
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let start = Instant::now();
+        let h = header(&d).unwrap();
+        let read = start.elapsed();
+        let r = h.import(&Config::defaults(h.header()), &Cancel::new());
+        let _ = tx.send((read, start.elapsed(), r.map(|_| ())));
+    });
+    let (read, took, r) = rx
+        .recv_timeout(Duration::from_secs(60))
+        .expect("the import ran past a minute");
+    assert_eq!(why(r), LuaWhy::Limit(LuaLimit::Time));
+    assert!(
+        read > SLACK && read < MAX_LUA_TIME - SLACK,
+        "the header pass took {read:?}"
+    );
+    assert!(
+        took >= MAX_LUA_TIME && took < MAX_LUA_TIME + SLACK,
+        "{read:?} then {took:?} in all"
+    );
 }
 
 #[test]

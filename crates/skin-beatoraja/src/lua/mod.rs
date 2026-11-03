@@ -50,6 +50,7 @@ use std::fmt;
 use std::path::Path;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Duration;
 
 use mlua::{Lua, MultiValue, RegistryKey, Value};
 use skin_model::{FileId, Root};
@@ -81,7 +82,7 @@ pub enum LuaLimit {
     HostCalls,
     /// [`limits::MAX_NATIVE_WORK`].
     NativeWork,
-    /// [`limits::MAX_PASS_TIME`].
+    /// [`limits::MAX_LUA_TIME`].
     Time,
 }
 
@@ -93,7 +94,7 @@ impl fmt::Display for LuaLimit {
             Self::Handler => "an error handler's failure",
             Self::HostCalls => "the host call limit",
             Self::NativeWork => "the library work limit",
-            Self::Time => "the pass's time limit",
+            Self::Time => "the Lua time limit",
         })
     }
 }
@@ -220,6 +221,7 @@ impl Pass {
         entry: &str,
         store: Store,
         counts: Counts,
+        spent: Duration,
         cancel: &Cancel,
         bridge: Option<Bridge>,
     ) -> Self {
@@ -227,7 +229,7 @@ impl Pass {
             .rsplit_once(['/', '\\'])
             .map_or(String::new(), |(d, _)| d.to_owned());
         Self {
-            ledger: Ledger::new(counts, cancel.clone()),
+            ledger: Ledger::new(counts, spent, cancel.clone()),
             root: root.clone(),
             entry_dir,
             store: RefCell::new(store),
@@ -336,6 +338,7 @@ fn test_pass(root: Root) -> Pass {
         "s.luaskin",
         Store::default(),
         Counts::default(),
+        Duration::ZERO,
         &Cancel::new(),
         None,
     )
@@ -350,6 +353,8 @@ pub struct LuaHeader {
     header: Header,
     store: Store,
     counts: Counts,
+    /// The time the header pass ran Lua.
+    spent: Duration,
 }
 
 /// A Lua skin imported.
@@ -369,26 +374,27 @@ struct Converted {
     entry: FileId,
 }
 
-/// Runs one pass over `entry` in a fresh VM, starting from `counts`, with
-/// `bridge` as `skin_config` when configured; the VM is dropped before it
-/// returns.
+/// Runs one pass over `entry` in a fresh VM, starting from `counts` and
+/// the time `spent` by the candidate's earlier pass, with `bridge` as
+/// `skin_config` when configured; the VM is dropped before it returns.
 fn pass(
     root: &Root,
     entry: &str,
     store: Store,
-    counts: Counts,
+    (counts, spent): (Counts, Duration),
     cancel: &Cancel,
     bridge: Option<Bridge>,
-) -> (Result<Converted, ImportError>, Store, Counts) {
+) -> (Result<Converted, ImportError>, Store, Counts, Duration) {
     #[cfg(test)]
     tests::pass_witness();
-    let pass = Rc::new(Pass::new(root, entry, store, counts, cancel, bridge));
+    let pass = Rc::new(Pass::new(root, entry, store, counts, spent, cancel, bridge));
     let r = run_pass(&pass, entry);
     let counts = pass.ledger.counts();
+    let spent = pass.ledger.spent();
     let store = pass.store.replace(Store::default());
     #[cfg(feature = "dev-tools")]
     LAST_TIMINGS.with(|t| t.set(pass.timings.get()));
-    (r, store, counts)
+    (r, store, counts, spent)
 }
 
 #[cfg(feature = "dev-tools")]
@@ -476,11 +482,11 @@ pub(crate) fn header_pass(root: &Path, entry: &str, cancel: &Cancel) -> Outcome<
             };
         }
     };
-    let (r, mut store, mut counts) = pass(
+    let (r, mut store, mut counts, spent) = pass(
         &root,
         entry,
         Store::default(),
-        Counts::default(),
+        (Counts::default(), Duration::ZERO),
         cancel,
         None,
     );
@@ -502,6 +508,7 @@ pub(crate) fn header_pass(root: &Path, entry: &str, cancel: &Cancel) -> Outcome<
             header,
             store,
             counts,
+            spent,
         }),
         counts,
         dependencies,
@@ -644,11 +651,11 @@ impl LuaHeader {
         cancel: &Cancel,
     ) -> (Result<Definition, ImportError>, Counts, Store) {
         let bridge = Bridge::new(&self.header, config);
-        let (r, store, counts) = pass(
+        let (r, store, counts, _) = pass(
             &self.root,
             &self.entry,
             self.store.clone(),
-            self.counts,
+            (self.counts, self.spent),
             cancel,
             Some(bridge),
         );
