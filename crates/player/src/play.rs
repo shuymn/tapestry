@@ -149,6 +149,8 @@ pub struct PlayerRig<'a> {
     pub files: SettingsFiles,
     /// The settings keys' values last acted on.
     pub seen: Delivered,
+    /// The hi-speed line the end screen was last sent with.
+    pub shown_speed: end_screen::SpeedLine,
     /// The end screen's page while it shows: the summary's lines and the
     /// view's graphs; the settings lines are added each time it is sent.
     pub end_page: Option<EndPage>,
@@ -342,19 +344,25 @@ impl PlayerRig<'_> {
     /// audio thread, and a shown end screen is drawn again.
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub(crate) fn sync(&mut self) {
-        let Some(t) = self.seen.take_new(self.controls.tuning()) else {
-            return;
-        };
-        // Always within 0 to unity: loading and `Tuning` keep it there.
-        let _ = self
-            .audio
-            .control
-            .set_volume(self.controls.tuning().volume());
-        self.send_end(t);
+        let tuned = self.seen.take_new(self.controls.tuning());
+        if tuned.is_some() {
+            // Always within 0 to unity: loading and `Tuning` keep it there.
+            let _ = self
+                .audio
+                .control
+                .set_volume(self.controls.tuning().volume());
+        }
+        // The end screen's hi-speed line follows the adjustments too.
+        let speed = self.speed_line();
+        if tuned.is_some() || speed != self.shown_speed {
+            self.shown_speed = speed;
+            self.send_end(tuned.unwrap_or_else(|| self.controls.tuning().get()));
+        }
     }
 
     /// The hi-speed the end screen shows: the adjustments' newest state,
     /// its green number at the attempt's reference tempo.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn speed_line(&self) -> end_screen::SpeedLine {
         let Some(driver) = &self.adjust else {
             return end_screen::SpeedLine::default();

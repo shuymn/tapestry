@@ -245,6 +245,7 @@ pub const IN_PLAY: &[Site] = &[
         "crates/player/src/play.rs",
         &[
             "PlayerRig::sync",
+            "PlayerRig::speed_line",
             "PlayerRig::serve_adjustments",
             "serve_adjustments",
             "PlayerPump::display_offset_us",

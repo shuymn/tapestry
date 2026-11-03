@@ -781,6 +781,7 @@ fn rig<'a>(
         input_offset_us: device.input_offset_us,
         files: SettingsFiles::new(root.clone(), settings.clone()),
         seen: Delivered::default(),
+        shown_speed: end_screen::SpeedLine::default(),
         end_page: None,
         hints: Hints::new(device.keyboard.retry, device.keyboard.quit),
         result_input: result_input::ResultInput::new(Arc::new(MenuQueue::default()), None),
