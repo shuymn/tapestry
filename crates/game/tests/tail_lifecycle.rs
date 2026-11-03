@@ -16,7 +16,7 @@
 //! | Playing | judged (existing) | judged (existing) | merged by the watermark (existing) | — | — | fresh opening (`rearm_alloc`) |
 //! | Completion step | ≤ watermark judged; beyond it staged | as press | staged kept, record holds it (`tail_feedback`) | — | — | — |
 //! | Audio tail | sounds, lights, unjudged (`tail_presses_sound_and_light`) | lane off, deadline at its time (`tail_feedback`) | converted first, evaluation time (`tail_feedback`) | ends the tail (`tail_presses_sound_and_light`) | ignored until consumed (`a_stale_audio_report_does_not_end_the_tail`) | none: committed |
-//! | Exit: ran out, retry, skip, close, focus loss, device loss | not converted, silent (`every_tail_exit_ends_the_feedback_first`) | not converted | dropped with the sources | — | — | retry: next attempt's fresh opening |
+//! | Exit: ran out, retry, skip, close, suspend, focus loss, device loss, input, audio or screen failure | not converted, silent (`every_tail_exit_ends_the_feedback_first`) | not converted | dropped with the sources | — | — | retry: next attempt's fresh opening |
 //! | Exit: practice ring-out | before its end: faded; after: silent (`a_rounds_ring_out_keeps_its_limits`) | — | — | with the play time at its end | as above | — |
 
 mod common;
@@ -186,7 +186,11 @@ struct Tail {
     participants: Vec<(DeviceId, Option<u64>)>,
     control: AudioControl,
     worker: AudioWorker,
-    out: SimDevice,
+    out: Failing,
+    /// The input thread is gone from this play time on.
+    input_fails_at: i64,
+    /// The screen fails from this play time on.
+    screen_fails_at: i64,
     probes: rtrb::Consumer<AudioProbe>,
     /// Key sounds the engine scheduled.
     key_starts: usize,
@@ -225,7 +229,14 @@ impl Tail {
             participants: Vec::new(),
             control,
             worker,
-            out: SimDevice::new(SimConfig::steady(RATE, PERIOD, TimeUs(CLOCK_START))),
+            out: Failing {
+                inner: SimDevice::new(SimConfig::steady(RATE, PERIOD, TimeUs(CLOCK_START))),
+                last: TimeUs(i64::MIN),
+                fail_from: TimeUs(i64::MAX),
+                failed: false,
+            },
+            input_fails_at: i64::MAX,
+            screen_fails_at: i64::MAX,
             probes,
             key_starts: 0,
             side: None,
@@ -274,8 +285,10 @@ impl Rig for Tail {
         if let Some(now) = self.play_time() {
             self.script.poll(TimeUs(now), &mut self.sources);
         }
-        while self.out.next_wake() <= self.clock.now() {
-            self.worker.step(&mut self.out).unwrap();
+        // A failed output takes no more steps here; the failure is
+        // published to the control side.
+        while !self.out.failed && self.out.inner.next_wake() <= self.clock.now() {
+            self.out.failed = self.worker.step(&mut self.out).is_err();
         }
         while let Ok(p) = self.probes.pop() {
             assert!(matches!(p.kind, game::Probed::KeyScheduled { .. }));
@@ -355,7 +368,13 @@ impl Rig for Tail {
     }
 
     fn screen_failed(&self) -> bool {
-        false
+        self.play_time().is_some_and(|t| t >= self.screen_fails_at)
+    }
+
+    fn input_failure(&self) -> Option<InputWaitError> {
+        self.play_time()
+            .is_some_and(|t| t >= self.input_fails_at)
+            .then_some(InputWaitError::Gone)
     }
 
     fn cancel_audio(&mut self) {
@@ -403,11 +422,52 @@ impl Rig for Tail {
     fn show_end(&mut self, _report: &PlayReport, _screen: &ResultScreen) {}
 }
 
+/// A steady simulated device whose writes fail from the wake at
+/// `fail_from` on (the rig's clock).
+struct Failing {
+    inner: SimDevice,
+    last: TimeUs,
+    fail_from: TimeUs,
+    /// A write failed: the audio thread takes no more steps.
+    failed: bool,
+}
+
+impl audio::AudioOutput for Failing {
+    fn rate(&self) -> u32 {
+        self.inner.rate()
+    }
+    fn period(&self) -> u32 {
+        self.inner.period()
+    }
+    fn wait(&mut self) -> audio::Wake {
+        let w = self.inner.wait();
+        self.last = w.at;
+        w
+    }
+    fn write(&mut self, f: impl FnOnce(&mut [f32])) -> Result<(), audio::OutputError> {
+        if self.last >= self.fail_from {
+            return Err(audio::OutputError::DeviceLost);
+        }
+        self.inner.write(f)
+    }
+}
+
 /// One play of `items` with `commands`, the window closing at `quit_at`.
 fn played(items: Vec<ScriptItem>, commands: &[(i64, Command)], quit_at: i64) -> (Tail, PlayReport) {
+    played_with(items, commands, quit_at, |_| {})
+}
+
+/// [`played`] on a rig `setup` changes first.
+fn played_with(
+    items: Vec<ScriptItem>,
+    commands: &[(i64, Command)],
+    quit_at: i64,
+    setup: impl FnOnce(&mut Tail),
+) -> (Tail, PlayReport) {
     let dir = tempfile::tempdir().unwrap();
     let mut loaded = loaded(dir.path());
     let mut rig = Tail::new(items, commands, quit_at);
+    setup(&mut rig);
     let report = game::live::play(&mut loaded, &mut rig).unwrap().unwrap();
     (rig, report)
 }
@@ -479,7 +539,7 @@ fn every_tail_exit_ends_the_feedback_first() {
     let gone = Action::Disconnect(KEYBOARD);
     type Exit = (Vec<ScriptItem>, Vec<(i64, Command)>, i64);
     let at = 2_200 * MS;
-    let exits: [(&str, Exit); 5] = [
+    let exits: [(&str, Exit); 9] = [
         ("retry", (Vec::new(), vec![(at, Command::Retry)], i64::MAX)),
         ("skip", (Vec::new(), vec![(at, Command::Quit)], i64::MAX)),
         ("close", (Vec::new(), Vec::new(), at)),
@@ -492,7 +552,17 @@ fn every_tail_exit_ends_the_feedback_first() {
             ),
         ),
         ("device", (vec![item(at - 500, gone)], Vec::new(), i64::MAX)),
+        (
+            "suspend",
+            (Vec::new(), vec![(at, Command::Suspend)], i64::MAX),
+        ),
+        ("input", (Vec::new(), Vec::new(), i64::MAX)),
+        ("audio", (Vec::new(), Vec::new(), i64::MAX)),
+        ("screen", (Vec::new(), Vec::new(), i64::MAX)),
     ];
+    // The play's chart time 0 on the rig's clock: its 1 s READY from the
+    // clock's start.
+    let origin = CLOCK_START + 1_000 * MS;
     for (name, (extra, commands, quit_at)) in exits {
         let mut items = hits();
         items.extend(tap(2_000, 1));
@@ -508,7 +578,13 @@ fn every_tail_exit_ends_the_feedback_first() {
                 background: false,
             }),
         ));
-        let (mut rig, report) = played(items, &commands, quit_at);
+        let (mut rig, report) = played_with(items, &commands, quit_at, |rig| match name {
+            "input" => rig.input_fails_at = at,
+            // A wake falls there, every 10 ms from the clock's start.
+            "audio" => rig.out.fail_from = TimeUs(origin + at),
+            "screen" => rig.screen_fails_at = at,
+            _ => {}
+        });
         assert_eq!(report.end, PlayEnd::Completed, "{name}");
         // The view the screen keeps once the tail is over.
         let kept = rig.side.as_mut().unwrap().view().input;
@@ -522,6 +598,10 @@ fn every_tail_exit_ends_the_feedback_first() {
             "close" => Some(AbortCause::Quit),
             "focus" => Some(AbortCause::FocusLoss),
             "device" => Some(AbortCause::LastSourceRemoved),
+            "suspend" => Some(AbortCause::Suspend),
+            "input" => Some(AbortCause::InputFailed),
+            "audio" => Some(AbortCause::OutputFailed),
+            "screen" => Some(AbortCause::ScreenFailed),
             _ => None,
         };
         assert_eq!(report.tail_cut, cut, "{name}");

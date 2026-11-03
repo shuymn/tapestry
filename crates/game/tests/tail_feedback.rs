@@ -340,11 +340,13 @@ fn autoplays_pending_release_goes_through_the_tail() {
 }
 
 /// A practice section's tail sounds only the section's targets: a press
-/// after it on a lane whose only note before it lies outside the section
-/// is silent, one on a lane with a target sounds that target's sound.
+/// after it on key 1, whose notes lie outside the section, is silent;
+/// one on key 2, whose note in the section is given a sound here, sounds
+/// that note's sound.
 #[test]
 fn a_sections_tail_sounds_only_its_targets() {
-    let chart = chart();
+    let mut chart = chart();
+    chart.lanes[2][0].sound = Some(SoundId(0));
     let rule = rules::tapestry();
     let dev = device(&[0]);
     let section = eval::Section {
@@ -369,11 +371,16 @@ fn a_sections_tail_sounds_only_its_targets() {
     logic.add_sink(Box::new(sink));
     writer.publish(TimeUs(1_400 * MS));
     assert!(logic.advance_to(TimeUs(1_400 * MS)).complete);
-    // Key 1's notes lie outside the section; key 2's soundless one in it.
     writer.push(press(1_500 * MS, 0, lane(1))).unwrap();
     writer.push(press(1_500 * MS, 0, lane(2))).unwrap();
     writer.publish(TimeUs(1_600 * MS));
     logic.feedback_to().unwrap();
-    assert!(sounds.commands().pop().is_err());
-    assert!(logic.view().input.lane(lane(1)).held);
+    let heard = sounds.commands().pop().unwrap();
+    assert_eq!(
+        (heard.sound, heard.origin),
+        (SoundId(0), TimeUs(1_500 * MS))
+    );
+    assert!(sounds.commands().pop().is_err(), "key 1 sounded");
+    let input = logic.view().input;
+    assert!(input.lane(lane(1)).held && input.lane(lane(2)).held);
 }
