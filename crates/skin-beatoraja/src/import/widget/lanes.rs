@@ -250,13 +250,6 @@ impl Cx<'_> {
         else {
             return Ok(());
         };
-        if self.untimed_refused(&c) {
-            return Err(ImportError::Critical {
-                at: self.loc(at),
-                part,
-                why: NoteKind::Timer(super::super::TimerWhy::Untimed),
-            });
-        }
         if c.offset.r != 0 {
             self.ignored(at, NoteKind::Ignored { field: "angle" });
         }

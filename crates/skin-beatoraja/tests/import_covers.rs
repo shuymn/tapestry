@@ -13,7 +13,7 @@ mod common;
 use bms_model::{ChartBuilder, Lane, TimeUs};
 use common::lanes::{NOTES, body, cover, lift, lift_object, note, with};
 use common::play::{Drawn, MS};
-use common::{Loaded, has, import_body, import_config, import_sized};
+use common::{Loaded, d3_notes, has, import_body, import_config, import_sized};
 use skin_beatoraja::{
     Config, CriticalPart, DeviationId, ImportError, LaneApprox, NoteKind, OffsetValue,
     PropertyKind, Severity, TimerWhy,
@@ -1162,12 +1162,6 @@ fn selecting_paint_varies_only_its_presentation_phase_untimed() {
         d3_notes(&cover_set("", "", r#""cover", "cover""#, "", OVER)),
         0
     );
-}
-
-/// The D3 deviation notes in `l`'s report.
-fn d3_notes(l: &Loaded) -> usize {
-    let d3 = NoteKind::Deviation(DeviationId::D3);
-    l.report().notes.iter().filter(|n| n.kind == d3).count()
 }
 
 #[test]

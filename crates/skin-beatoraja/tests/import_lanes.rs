@@ -7,7 +7,7 @@ mod common;
 use bms_model::{Chart, ChartBuilder, Lane, LnMode, TimeUs};
 use common::lanes::{NOTES, body, cover, eight, lane_rects, lift_object, note, note_with};
 use common::play::{Drawn, MS, judged, long_note, round};
-use common::{Loaded, dst, has, import_body, import_config, import_sized};
+use common::{Loaded, d3_notes, dst, has, import_body, import_config, import_sized};
 use eval::{JudgeEvent, JudgeEventKind};
 use rules::Judgment;
 use skin_beatoraja::{
@@ -485,12 +485,6 @@ fn the_lanes_track_is_neutral() {
     assert_eq!(q.len(), 1);
     assert_eq!(round(q[0].rect), [100, 860, 50, 20]);
     assert_eq!(q[0].color, [1.0; 4]);
-}
-
-/// The D3 deviation notes in `l`'s report.
-fn d3_notes(l: &Loaded) -> usize {
-    let d3 = NoteKind::Deviation(DeviationId::D3);
-    l.report().notes.iter().filter(|n| n.kind == d3).count()
 }
 
 /// Long-note bodies, idle and active, of two rows cycled every 266 ms

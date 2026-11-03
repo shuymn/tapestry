@@ -6,7 +6,7 @@
 mod common;
 
 use common::play::round;
-use common::{Loaded, has, import_sized};
+use common::{Loaded, d3_notes, has, import_body, import_sized};
 use skin_beatoraja::{CriticalPart, DeviationId, ImportError, NoteKind, TimerWhy};
 use skin_model::Filter;
 
@@ -405,13 +405,9 @@ fn untimed_gauge_fades_run_on_screen() {
             nodes(4),
             dsts.join(", ")
         );
-        import_sized([1_920, 1_080], &body, &[])
+        import_body(&body)
     };
-    let d3 = |l: &Loaded| {
-        let d3 = NoteKind::Deviation(DeviationId::D3);
-        l.report().notes.iter().filter(|n| n.kind == d3).count()
-    };
-    assert_eq!(d3(&skin(&[base, pulse])), 2);
+    assert_eq!(d3_notes(&skin(&[base, pulse])), 2);
     // Absent before its first key, then its alpha at each `screen` time.
     let alphas = |dst: &str, ms: i64| -> Vec<f32> {
         skin(&[dst]).quads(ms).iter().map(|q| q.color[3]).collect()

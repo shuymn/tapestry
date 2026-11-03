@@ -4,9 +4,9 @@
 mod common;
 
 use common::play::{judged, tally};
-use common::{has, import_body};
+use common::{d3_notes, has, import_body};
 use rules::Judgment;
-use skin_beatoraja::{CriticalPart, DeviationId, ImportError, NoteKind, TimerWhy};
+use skin_beatoraja::{CriticalPart, ImportError, NoteKind, TimerWhy};
 
 fn timer(why: TimerWhy) -> NoteKind {
     NoteKind::Timer(why)
@@ -229,12 +229,6 @@ fn untimed(image: &str, dst: &str) -> common::Loaded {
                       "ref": 71 {image}}}],
            "destination": [{{"id": "v", {dst}}}]"#
     ))
-}
-
-/// The D3 deviation notes in `l`'s report.
-fn d3_notes(l: &common::Loaded) -> usize {
-    let d3 = NoteKind::Deviation(DeviationId::D3);
-    l.report().notes.iter().filter(|n| n.kind == d3).count()
 }
 
 #[test]

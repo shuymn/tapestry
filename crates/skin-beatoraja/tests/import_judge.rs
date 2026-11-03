@@ -8,10 +8,10 @@ mod common;
 
 use bms_model::{Lane, TimeUs};
 use common::play::{Drawn, MS, judged, tally};
-use common::{Loaded, has, import_sized};
+use common::{Loaded, d3_notes, has, import_sized};
 use eval::{JudgeEvent, JudgeEventKind};
 use rules::{GaugeValue, Judgment};
-use skin_beatoraja::{CriticalPart, DeviationId, ImportError, NoteKind};
+use skin_beatoraja::{CriticalPart, ImportError, NoteKind};
 
 /// Grade `k`'s destination: image `gk` with `extra` fields.
 fn grade(k: usize, extra: &str) -> String {
@@ -821,10 +821,6 @@ fn a_kind_condition_is_noted_at_its_part() {
 /// a timer of its own it is not noted.
 #[test]
 fn an_untimed_ending_judge_runs_on_screen() {
-    let d3 = |l: &Loaded| {
-        let d3 = NoteKind::Deviation(DeviationId::D3);
-        l.report().notes.iter().filter(|n| n.kind == d3).count()
-    };
     let outer = |fields: &str| {
         format!(
             r#"{{"id": "j"{fields}, "loop": -1, "dst": [{{"time": 0, "x": 0, "y": 0, "w": 0, "h": 0}},
@@ -833,7 +829,7 @@ fn an_untimed_ending_judge_runs_on_screen() {
     };
     let rec = judge_rec(&grades(7), &[], "");
     let l = skin(r#""value": []"#, &rec, &[&outer("")]);
-    assert_eq!(d3(&l), 1);
+    assert_eq!(d3_notes(&l), 1);
     let at = |ms: i64| {
         let mut d = Drawn::new(l.ok().skin.clone(), 100);
         d.frame(ms, &[event(ms, of(Judgment::Perfect, 1))]);
@@ -841,8 +837,8 @@ fn an_untimed_ending_judge_runs_on_screen() {
     };
     assert_eq!((at(1_000), at(2_500)), (1, 0));
     let timed = skin(r#""value": []"#, &rec, &[&outer(r#", "timer": 41"#)]);
-    assert_eq!(d3(&timed), 0);
+    assert_eq!(d3_notes(&timed), 0);
     // A judge drawing no grade is not retained: no D3.
     let empty = skin(r#""value": []"#, &judge_rec(&[], &[], ""), &[&outer("")]);
-    assert_eq!(d3(&empty), 0);
+    assert_eq!(d3_notes(&empty), 0);
 }
