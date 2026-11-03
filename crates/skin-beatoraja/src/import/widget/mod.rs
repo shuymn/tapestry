@@ -18,7 +18,7 @@ use super::asset::{self, Crop, Failed, ImageKey, Path};
 use super::budget::ImportLimit;
 use super::policy::{self, Role};
 use super::property::{self, IndexProp};
-use super::report::{DeviationId, NoteKind, Object, Severity, Span};
+use super::report::{NoteKind, Object, Span};
 use super::track::{self, Stretch};
 use super::{Common, Cx, Dst, Opts, Prop};
 use crate::error::ImportError;
@@ -67,44 +67,39 @@ impl Cx<'_> {
     }
 
     /// Whether `c`, critical and without a timer, is refused (owner
-    /// decision 7, D3, [`policy::untimed_ok`]); one admitted whose
-    /// presentation phase depends on the start, `untimed_cycle` when it
-    /// shows an image cycle without a timer, is noted once per
-    /// destination.
-    pub(super) fn untimed_refused(&mut self, c: &Common, untimed_cycle: bool) -> bool {
-        if !c.untimed || !matches!(c.role, Role::Critical(_)) {
-            return false;
+    /// decision 7, D3, [`policy::untimed_ok`]). One admitted is noted
+    /// once it is retained (`Cx::untimed_phase`).
+    pub(super) fn untimed_refused(&self, c: &Common) -> bool {
+        c.untimed && matches!(c.role, Role::Critical(_)) && !policy::untimed_ok(&c.track)
+    }
+
+    /// Records that `c` keeps an image whose cycle has no timer, when
+    /// `untimed_cycle`, for its D3 note once `c` is retained.
+    pub(super) fn cycle_kept(&mut self, c: &Common, untimed_cycle: bool) {
+        if untimed_cycle {
+            self.cycled.insert(c.span);
         }
-        if !policy::untimed_ok(&c.track) {
-            return true;
-        }
-        if policy::start_dependent(&c.track, untimed_cycle) && self.phased.insert(c.span) {
-            self.note(
-                Some(c.span),
-                Severity::Deviation,
-                NoteKind::Deviation(DeviationId::D3),
-            );
-        }
-        false
     }
 
     /// The cycle of `s` over `frames` for `c`, resolved before its sheet
-    /// is admitted, or why `c` is dropped: its timer or cycle refused, or
-    /// `c` critical and untimed where it moves or changes colour (D3).
+    /// is admitted, and whether it runs without a timer; or why `c` is
+    /// dropped: its timer or cycle refused, or `c` critical and untimed
+    /// where it moves or changes colour (D3).
     pub(super) fn src_cycle(
         &mut self,
         c: &Common,
         frames: u32,
         s: &SrcImage,
-    ) -> Result<Result<Option<CycleDef>, NoteKind>, ImportError> {
+    ) -> Result<Result<(Option<CycleDef>, bool), NoteKind>, ImportError> {
         let (cycle, on_timer) = match self.cycle(c.span, frames, &s.timer, s.cycle)? {
             Ok(v) => v,
             Err(why) => return Ok(Err(why)),
         };
-        if self.untimed_refused(c, cycle.is_some() && !on_timer) {
+        if self.untimed_refused(c) {
             return Ok(Err(NoteKind::Timer(super::TimerWhy::Untimed)));
         }
-        Ok(Ok(cycle))
+        let untimed = cycle.is_some() && !on_timer;
+        Ok(Ok((cycle, untimed)))
     }
 
     /// The `image` record of id `id`, the first of it: the play objects
@@ -191,8 +186,8 @@ impl Cx<'_> {
         let at = c.span;
         let role = c.role;
         let frames = self.grid_frames(at, grid)?;
-        let cycle = match self.src_cycle(c, frames, s)? {
-            Ok(cycle) => cycle,
+        let (cycle, untimed) = match self.src_cycle(c, frames, s)? {
+            Ok(found) => found,
             Err(why) => {
                 self.drop_el(role, at, why)?;
                 return Ok(None);
@@ -209,12 +204,15 @@ impl Cx<'_> {
                 }
             };
             if let Some(found) = self.assets.image(key, crop) {
+                self.cycle_kept(c, untimed);
                 return Ok(Some(found));
             }
             self.budget.image(frames).map_err(|l| self.limit(at, l))?;
             #[cfg(test)]
             super::trace(super::Event::Charge);
-            return self.add_image(c, key, crop, def, cell);
+            let found = self.add_image(c, key, crop, def, cell)?;
+            self.cycle_kept(c, untimed && found.is_some());
+            return Ok(found);
         }
         self.budget.image(frames).map_err(|l| self.limit(at, l))?;
         #[cfg(test)]
@@ -240,7 +238,9 @@ impl Cx<'_> {
                 return Ok(None);
             }
         };
-        self.add_image(c, key, crop, def, cell)
+        let found = self.add_image(c, key, crop, def, cell)?;
+        self.cycle_kept(c, untimed && found.is_some());
+        Ok(found)
     }
 
     /// Where `s`'s first `grid` columns and rows lie, its image charged:

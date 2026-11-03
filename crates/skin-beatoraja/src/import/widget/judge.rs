@@ -125,7 +125,7 @@ impl Cx<'_> {
         else {
             return Ok(());
         };
-        if self.untimed_refused(&c, false) {
+        if self.untimed_refused(&c) {
             return refuse(self, at, NoteKind::Timer(TimerWhy::Untimed));
         }
 

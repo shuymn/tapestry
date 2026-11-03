@@ -160,8 +160,8 @@ pub enum TimerWhy {
     Custom(i32),
     /// A custom timer declared in the built-in range: no effect.
     CustomBuiltin(i32),
-    /// A play-critical element with no timer whose output depends on when
-    /// the state started (D3).
+    /// A play-critical element with no timer whose placement or colour
+    /// other than alpha changes between keys (D3).
     Untimed,
     /// A frame cycle the model cannot run (negative or too long).
     Cycle,

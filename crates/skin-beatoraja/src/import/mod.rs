@@ -311,6 +311,8 @@ pub(crate) struct Cx<'d> {
     span_hint: widget::lanes::SpanHint,
     /// The judge records already drawn.
     judges: Vec<u32>,
+    /// The destinations keeping an image whose cycle has no timer.
+    cycled: BTreeSet<Span>,
     /// The untimed critical destinations noted for D3.
     phased: BTreeSet<Span>,
     /// Image selectors compiled once, by source; each copy kept is
@@ -390,6 +392,7 @@ impl<'d> Cx<'d> {
             lanes: None,
             span_hint: widget::lanes::SpanHint::NoLanes,
             judges: Vec::new(),
+            cycled: BTreeSet::new(),
             phased: BTreeSet::new(),
             selectors: HashMap::new(),
         };
@@ -1302,10 +1305,12 @@ impl<'d> Cx<'d> {
         Ok(())
     }
 
-    /// Notes what a retained element or judge part carries: D4 once when
-    /// it deviates ([`Common::display_deviation`]), and D9
+    /// Notes what a retained element or judge part carries: D3 once when
+    /// what it shows depends on the state's start ([`Self::untimed_phase`]),
+    /// D4 once when it deviates ([`Common::display_deviation`]), and D9
     /// [`LaneApprox::CoverMotion`] once when it follows the covers.
     fn retained(&mut self, c: &Common) -> Result<(), ImportError> {
+        self.untimed_phase(c);
         if c.display_deviation {
             self.note(
                 Some(c.span),
@@ -1314,6 +1319,25 @@ impl<'d> Cx<'d> {
             );
         }
         self.cover_motion(c)
+    }
+
+    /// Notes D3 once for retained `c`, critical and without a timer, when
+    /// its presentation phase depends on the start: its track
+    /// ([`policy::start_dependent`]) or an image it keeps cycling without
+    /// a timer (owner decision 7).
+    fn untimed_phase(&mut self, c: &Common) {
+        let cycled = self.cycled.contains(&c.span);
+        if c.untimed
+            && matches!(c.role, Role::Critical(_))
+            && policy::start_dependent(&c.track, cycled)
+            && self.phased.insert(c.span)
+        {
+            self.note(
+                Some(c.span),
+                Severity::Deviation,
+                NoteKind::Deviation(DeviationId::D3),
+            );
+        }
     }
 
     /// Notes D9 [`LaneApprox::CoverMotion`] once for a retained element

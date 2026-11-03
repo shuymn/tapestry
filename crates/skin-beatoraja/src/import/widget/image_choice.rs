@@ -208,14 +208,15 @@ impl Cx<'_> {
         };
         let (src, deviates) = selector;
         let value = self.selector(src, at)?;
-        let cycle = match self.src_cycle(&c, q, s)? {
-            Ok(cycle) => cycle,
+        let (cycle, untimed) = match self.src_cycle(&c, q, s)? {
+            Ok(found) => found,
             Err(why) => return self.drop_el(c.role, at, why),
         };
         let (image, cell) = match self.admit_choice(&c, rec, s)? {
             Ok(found) => found,
             Err(u) => return self.drop_el(c.role, at, u.why),
         };
+        self.cycle_kept(&c, untimed);
         // Runs of at most 1 024 frames, as the sheet admitted them.
         let frames = u16::try_from(q).map_err(|_| self.range(at, "len"))?;
         #[cfg(test)]
@@ -283,18 +284,21 @@ impl Cx<'_> {
             };
             let s = self.src_image(rec)?;
             let n = self.grid_frames(at, s.div)?;
-            let cycle = match self.src_cycle(&c, n, &s)? {
-                Ok(cycle) => cycle,
+            let (cycle, untimed) = match self.src_cycle(&c, n, &s)? {
+                Ok(found) => found,
                 Err(why) => return self.drop_el(c.role, at, why),
             };
             match self.admit_choice(&c, rec, &s)? {
-                Ok((image, cell)) => entries.push(Some(Entry {
-                    image,
-                    cell,
-                    first: 0,
-                    frames: u16::try_from(n).map_err(|_| self.range(at, "images"))?,
-                    cycle,
-                })),
+                Ok((image, cell)) => {
+                    self.cycle_kept(&c, untimed);
+                    entries.push(Some(Entry {
+                        image,
+                        cell,
+                        first: 0,
+                        frames: u16::try_from(n).map_err(|_| self.range(at, "images"))?,
+                        cycle,
+                    }));
+                }
                 Err(Unplaced { why, missing: true }) => {
                     self.ignored(self.arena_span(item), why);
                     entries.push(None);

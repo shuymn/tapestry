@@ -1186,6 +1186,10 @@ fn a_critical_set_keeps_missing_files_as_holes() {
         .count();
     assert_eq!(holes, 2);
     assert_eq!(rects(&l, 5_000, 500, 0).len(), 1);
+    // An untimed cycle only a hole would show is not retained: no D3.
+    let cycled_hole = r#"{"id": "gone", "src": "m", "w": 16, "h": 16, "divx": 2, "cycle": 100}"#;
+    let l = cover_set(sources, cycled_hole, r#""cover", "gone""#, "", OVER);
+    assert_eq!(d3_notes(&l), 0);
     // A file only this importer refuses is no hole: refused with its
     // error.
     let refused = r#"{"id": "gone", "src": "bad", "w": 16, "h": 16}"#;

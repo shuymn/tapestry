@@ -842,4 +842,7 @@ fn an_untimed_ending_judge_runs_on_screen() {
     assert_eq!((at(1_000), at(2_500)), (1, 0));
     let timed = skin(r#""value": []"#, &rec, &[&outer(r#", "timer": 41"#)]);
     assert_eq!(d3(&timed), 0);
+    // A judge drawing no grade is not retained: no D3.
+    let empty = skin(r#""value": []"#, &judge_rec(&[], &[], ""), &[&outer("")]);
+    assert_eq!(d3(&empty), 0);
 }
