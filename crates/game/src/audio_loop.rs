@@ -1365,7 +1365,10 @@ impl AudioWorker {
 }
 
 /// A report that play `generation`'s audio has ended with `consumed`
-/// key-sound commands taken: each in 32 bits, the generation high.
+/// key-sound commands taken: each in 32 bits, the generation high. The
+/// count starts over with each play, and 2^32 key sounds in one play are
+/// more than eight months of one every 5 ms, so its 32 bits never wrap
+/// onto a stale report.
 const fn done_report(generation: u64, consumed: u64) -> u64 {
     (generation & 0xffff_ffff) << 32 | consumed & 0xffff_ffff
 }

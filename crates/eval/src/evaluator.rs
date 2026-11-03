@@ -934,7 +934,7 @@ impl<'a> Evaluator<'a> {
     /// rule a press without a judgment follows in
     /// [`advance_to`](Self::advance_to), over this evaluation's targets
     /// only) and the input's receive time, and each pending scratch
-    /// release falls due at its deadline, before an input at the same
+    /// release falls due at its deadline, after an input at the same
     /// time. Nothing is judged, scored or emitted, and the finalized
     /// watermark stays where it is: after completion, conversion goes on
     /// past it. A press whose target has no sound calls nothing. Allocates
