@@ -9,13 +9,13 @@ mod common;
 use std::path::{Path, PathBuf};
 
 use bms_model::{Chart, ChartBuilder, TimeSource, TimeUs, VirtualClock};
-use common::{MS, lane, tapestry_settings};
+use common::{Built, MS, lane, tapestry_settings};
 use eval::{ControlId, InputKind, JudgeEventKind, SourceId};
 use game::{
-    AbortCause, AudioControl, AudioQueue, AudioWaitError, ChartIngest, Closing, Command, DataRoot,
-    DeviceSettings, EntryId, IngestError, Ingested, InputWaitError, LiveError, Loaded, Notice,
-    Opening, Parts, PlayEnd, PlayReport, Preparation, PreparationRefusal, RenderSide, ResultScreen,
-    Rig, SessionConfig, Settings, ViewStatus,
+    AbortCause, AudioControl, AudioQueue, AudioWaitError, Closing, Command, DataRoot,
+    DeviceSettings, EntryId, InputWaitError, LiveError, Loaded, Notice, Opening, Parts, PlayEnd,
+    PlayReport, Preparation, PreparationRefusal, RenderSide, ResultScreen, Rig, SessionConfig,
+    Settings, ViewStatus,
 };
 use input::{
     Action, DeviceId, DeviceKind, InputAdapter, Packet, ScriptItem, ScriptedInput, SourceReader,
@@ -32,32 +32,6 @@ const OFFSET: i64 = 3_000;
 const Z: ControlId = ControlId(0x2c);
 /// Lane 3's key (X).
 const X: ControlId = ControlId(0x2d);
-
-struct Built(Chart);
-
-impl ChartIngest for Built {
-    fn max_bytes(&self) -> usize {
-        1 << 20
-    }
-
-    fn accepts(&self, path: &Path) -> bool {
-        path.extension().is_some_and(|e| e == "chart")
-    }
-
-    fn ingest(
-        &self,
-        _bytes: &[u8],
-        _dir: &Path,
-        _seed: u64,
-        _speed: bms_model::Speed,
-    ) -> Result<Ingested, IngestError> {
-        Ok(Ingested {
-            labels: game::ChartLabels::default(),
-            chart: self.0.clone(),
-            warnings: Vec::new(),
-        })
-    }
-}
 
 /// Lane 1 at 1.0 s and 1.5 s.
 fn chart() -> Chart {

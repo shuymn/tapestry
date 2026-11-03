@@ -13,15 +13,15 @@
 mod common;
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use bms_model::{Chart, ChartBuilder, SoundId, TimeUs};
-use common::{MS, PERIOD, RATE, lane, tapestry_settings};
+use common::{Built, MS, PERIOD, RATE, lane, tapestry_settings};
 use eval::ControlId;
 use game::{
-    AbortCause, AdjustmentConfig, ChartIngest, ClosingEnd, Command, DataRoot, DeviceSettings,
-    FailureAction, HiSpeedSettings, IngestError, Ingested, KeyConfigs, Loaded, Parts, PlayEnd,
-    PlayOptions, PlayReport, PlayScript, RunnerAudio, Session, SessionConfig, SpeedMode,
+    AbortCause, AdjustmentConfig, ClosingEnd, Command, DataRoot, DeviceSettings, FailureAction,
+    HiSpeedSettings, KeyConfigs, Loaded, Parts, PlayEnd, PlayOptions, PlayReport, PlayScript,
+    RunnerAudio, Session, SessionConfig, SpeedMode,
 };
 use input::{Action, DeviceId, DeviceKind, Packet, ScriptItem, ScriptedInput, SourceSet};
 use replay::{BuildProvenance, EndStatus, ReceiveMethod};
@@ -59,32 +59,6 @@ fn notes(n: i64) -> Chart {
         )
         .build()
         .unwrap()
-}
-
-struct Built(Chart);
-
-impl ChartIngest for Built {
-    fn max_bytes(&self) -> usize {
-        1 << 20
-    }
-
-    fn accepts(&self, path: &Path) -> bool {
-        path.extension().is_some_and(|e| e == "chart")
-    }
-
-    fn ingest(
-        &self,
-        _bytes: &[u8],
-        _dir: &Path,
-        _seed: u64,
-        _speed: bms_model::Speed,
-    ) -> Result<Ingested, IngestError> {
-        Ok(Ingested {
-            labels: game::ChartLabels::default(),
-            chart: self.0.clone(),
-            warnings: Vec::new(),
-        })
-    }
 }
 
 fn chart_file(root: &DataRoot) -> PathBuf {
@@ -127,9 +101,10 @@ impl game::Wakes for Stalled {
 }
 
 /// A gated session of `chart` with the survival gauge shown under
-/// `on_failure`, its audio stalled until `until_ms` of session time.
+/// `on_failure = "close"`, its audio stalled until `until_ms` of session
+/// time.
 fn session(root: &DataRoot, chart: &Chart, until_ms: i64) -> Session<Stalled> {
-    session_with_sources(root, chart, until_ms, common::sources(), 1)
+    session_with_sources(root, chart, until_ms, common::sources())
 }
 
 /// [`session`] with the source set's limits.
@@ -138,10 +113,9 @@ fn session_with_sources(
     chart: &Chart,
     until_ms: i64,
     sources: input::SourceConfig,
-    displayed: usize,
 ) -> Session<Stalled> {
     let mut settings = tapestry_settings(root);
-    settings.player.displayed_gauge = displayed;
+    settings.player.displayed_gauge = 1;
     settings.player.on_failure = FailureAction::Close;
     let parts = Parts {
         ingest: Box::new(Built(chart.clone())),
@@ -405,7 +379,7 @@ fn the_source_limit_flag_is_frozen_in_closing() {
             max_sources: 1,
             ..common::sources()
         };
-        let mut s = session_with_sources(&root, &notes(16), 0, sources, 1);
+        let mut s = session_with_sources(&root, &notes(16), 0, sources);
         let items = vec![
             connect(),
             item(

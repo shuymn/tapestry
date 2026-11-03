@@ -227,3 +227,31 @@ pub fn onsets(left: &[f32]) -> Vec<usize> {
         .filter(|&f| left[f - 1] == 0.0 && left[f] != 0.0)
         .collect()
 }
+
+/// Reads any `.chart` file as the chart it was built with: test charts
+/// made in code, loaded through `Loaded::load`.
+pub struct Built(pub Chart);
+
+impl game::ChartIngest for Built {
+    fn max_bytes(&self) -> usize {
+        1 << 20
+    }
+
+    fn accepts(&self, path: &std::path::Path) -> bool {
+        path.extension().is_some_and(|e| e == "chart")
+    }
+
+    fn ingest(
+        &self,
+        _bytes: &[u8],
+        _dir: &std::path::Path,
+        _seed: u64,
+        _speed: bms_model::Speed,
+    ) -> Result<game::Ingested, game::IngestError> {
+        Ok(game::Ingested {
+            labels: game::ChartLabels::default(),
+            chart: self.0.clone(),
+            warnings: Vec::new(),
+        })
+    }
+}
