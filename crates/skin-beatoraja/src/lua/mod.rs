@@ -5,15 +5,16 @@
 //! [`read_lua_header`] runs the header pass: a fresh VM ([`sandbox`])
 //! runs the entry with no `skin_config`, and the table it returns is
 //! converted ([`convert`]) and read through the definition's header path.
-//! [`LuaHeader::import`] runs the configured pass for a [`Config`]: another
-//! fresh VM runs the entry with a pass-local `skin_config`
-//! ([`config`]), and the table it returns is converted into the resolved
-//! representation and imported through [`crate::import`], the one import
-//! path. The passes share only the immutable snapshots of the sources
-//! they read ([`loader`]) and the candidate's accounting ([`ledger`]);
-//! each VM is dropped when its pass ends, before the common import.
-//! Changing the settings runs the configured pass again from the header
-//! pass's state.
+//! [`LuaHeader::import`] runs the configured pass for a [`Config`] and a
+//! snapshot of import facts ([`facts`]): another fresh VM runs the entry
+//! with a pass-local `skin_config` ([`config`]) and `main_state.option`
+//! answering the snapshot's facts, and the table it returns is converted
+//! into the resolved representation and imported through
+//! [`crate::import`], the one import path. The passes share only the
+//! immutable snapshots of the sources they read ([`loader`]) and the
+//! candidate's accounting ([`ledger`]); each VM is dropped when its pass
+//! ends, before the common import. Changing the settings runs the
+//! configured pass again from the header pass's state.
 //!
 //! A function the returned table holds is a typed callable, never run.
 //! The configured pass parses every chunk it loads with the importer's

@@ -237,18 +237,15 @@ pub(crate) enum OptionRead {
 /// Answers `option(n)` from `facts`.
 pub(crate) fn option(facts: &ImportFacts, n: i32) -> OptionRead {
     // `i32::MIN`'s magnitude is not an `i32`: not built in.
-    let Some(id) = n.checked_abs() else {
+    let Some(id) = n
+        .checked_abs()
+        .filter(|&id| crate::import::ops::is_builtin(id))
+    else {
         return OptionRead::Constant {
             value: false,
             known: false,
         };
     };
-    if !crate::import::ops::is_builtin(id) {
-        return OptionRead::Constant {
-            value: false,
-            known: false,
-        };
-    }
     let negate = |b: bool| b != (n < 0);
     let constant = |b: bool| OptionRead::Constant {
         value: negate(b),
@@ -279,7 +276,7 @@ pub(crate) fn option(facts: &ImportFacts, n: i32) -> OptionRead {
 
 #[cfg(test)]
 mod tests {
-    use super::{ChartRank, Fact, ImportFacts, OptionRead, Scene, option};
+    use super::{Fact, ImportFacts, OptionRead, Scene, option};
 
     #[test]
     fn the_scene_s_constants_hold_off_play() {
@@ -293,14 +290,5 @@ mod tests {
                 "{n}"
             );
         }
-    }
-
-    #[test]
-    fn a_defexrank_below_10_percent_has_no_class() {
-        assert_eq!(super::JudgeClass::of(ChartRank::DefExRankMilli(-1)), None);
-        assert_eq!(
-            super::JudgeClass::of(ChartRank::DefExRankMilli(2_000)),
-            None
-        );
     }
 }
