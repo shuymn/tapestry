@@ -438,9 +438,11 @@ fn a_held_scratch_is_due_its_repeats_through_silent_idle() {
                 .map(|o| o.at.0),
         );
     }
-    // The press's group closes 1 µs later; then a tick at every repeat.
+    // The press's group closes 1 µs later; then a tick at every repeat,
+    // each closed 1 µs later too.
     let expected: Vec<i64> = std::iter::once(1_001)
-        .chain((1..=12).map(|k| 1_000 + k * 50_000))
+        .chain((1..=12).flat_map(|k| [1_000 + k * 50_000, 1_001 + k * 50_000]))
+        .filter(|&t| t < 601_001)
         .collect();
     assert_eq!(ticks, expected);
 }

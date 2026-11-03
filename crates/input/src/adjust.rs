@@ -844,8 +844,14 @@ impl AdjustmentTap {
         }
         let closing = self.unclosed.is_some_and(|t| at > t);
         if at > self.last_tick && (closing || self.held_set() != 0) {
+            // A tick at a repeat's deadline makes a request: like a press,
+            // it owes the tick that closes its group.
+            let repeats = self.next_repeat().is_some_and(|due| due <= at);
             self.last_tick = at;
             self.observe(at, TapEvent::Tick, true);
+            if repeats {
+                self.unclosed = Some(at);
+            }
         }
     }
 
@@ -860,19 +866,27 @@ impl AdjustmentTap {
             return None;
         }
         let closing = self.unclosed.map(|t| TimeUs(t.0.saturating_add(1)));
-        let mut due = closing;
-        if self.repeat_us > 0 {
-            let held = self.held_set() & self.repeating;
-            for (n, &pressed) in self.pressed_at.iter().enumerate() {
-                if held & (1_u128 << (n & 127)) == 0 {
-                    continue;
-                }
-                // The first repeat after the last tick.
-                let since = self.last_tick.0.saturating_sub(pressed.0).max(0);
-                let k = since / self.repeat_us + 1;
-                let at = TimeUs(pressed.0.saturating_add(k.saturating_mul(self.repeat_us)));
-                due = Some(due.map_or(at, |d: TimeUs| d.min(at)));
+        match (closing, self.next_repeat()) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
+    /// The first repeat of a held repeating control after the last tick.
+    fn next_repeat(&self) -> Option<TimeUs> {
+        if self.repeat_us <= 0 {
+            return None;
+        }
+        let held = self.held_set() & self.repeating;
+        let mut due: Option<TimeUs> = None;
+        for (n, &pressed) in self.pressed_at.iter().enumerate() {
+            if held & (1_u128 << (n & 127)) == 0 {
+                continue;
             }
+            let since = self.last_tick.0.saturating_sub(pressed.0).max(0);
+            let k = since / self.repeat_us + 1;
+            let at = TimeUs(pressed.0.saturating_add(k.saturating_mul(self.repeat_us)));
+            due = Some(due.map_or(at, |d| d.min(at)));
         }
         due
     }
