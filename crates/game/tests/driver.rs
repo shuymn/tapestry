@@ -855,3 +855,107 @@ fn a_press_queued_before_a_scene_change_stays_in_the_old_scene() {
     assert_eq!(s.hispeed, Some(r(345, 100)), "the press alone");
     assert_eq!(s.options.hispeed().classic_hispeed_x100, 345);
 }
+
+/// An input side that answers nothing for `stall` parks, then answers:
+/// the fences it was asked for come with the next park.
+struct Slow<'a> {
+    set: &'a mut SourceSet,
+    now: TimeUs,
+    asked: Vec<u64>,
+    parks: u32,
+    stall: u32,
+    /// Parks after which the pump's awake deadline has passed.
+    deadline: u32,
+}
+
+impl InputPump for Slow<'_> {
+    fn request_fence(&mut self, n: u64) {
+        self.asked.push(n);
+    }
+    fn wake(&mut self) {}
+    fn display_offset_us(&self) -> i64 {
+        0
+    }
+    fn park(&mut self) -> Result<(), InputWaitError> {
+        self.parks += 1;
+        if self.parks >= self.deadline {
+            return Err(InputWaitError::Timeout);
+        }
+        if self.parks >= self.stall {
+            let now = self.now;
+            for &n in &self.asked {
+                self.set.adjustment_mut().unwrap().fence(n, now);
+            }
+            self.asked.clear();
+        }
+        Ok(())
+    }
+}
+
+#[test]
+fn a_wait_ends_only_at_the_pumps_awake_deadline() {
+    // Early wakes do not end a wait: an answer after 5,000 parks, all
+    // within the awake deadline, is taken.
+    let mut rig = Rig::new(PlayOptions::default());
+    let now = TimeUs(rig.now);
+    let mut slow = Slow {
+        set: &mut rig.set,
+        now,
+        asked: Vec::new(),
+        parks: 0,
+        stall: 5_000,
+        deadline: u32::MAX,
+    };
+    assert_eq!(rig.driver.fence(&mut slow), Ok(()));
+    assert_eq!(slow.parks, 5_000);
+    assert_eq!(rig.driver.failure(), None);
+}
+
+#[test]
+fn a_failed_wait_is_terminal_even_when_the_input_recovers() {
+    // The cancellation's marker never comes before the awake deadline:
+    // the wait fails, and the failure is latched.
+    let mut rig = Rig::new(PlayOptions::default());
+    let now = TimeUs(rig.now);
+    let mut stalled = Slow {
+        set: &mut rig.set,
+        now,
+        asked: Vec::new(),
+        parks: 0,
+        stall: u32::MAX,
+        deadline: 10,
+    };
+    assert_eq!(
+        rig.driver.after_cancel(1, &mut stalled),
+        Err(InputWaitError::Timeout)
+    );
+    assert_eq!(rig.driver.failure(), Some(InputWaitError::Timeout));
+    // The input thread recovers: nothing more is asked of it, and every
+    // later wait (a retry's entry, a scene change, an opening) answers
+    // with the first failure.
+    let mut recovered = Slow {
+        set: &mut rig.set,
+        now,
+        asked: Vec::new(),
+        parks: 0,
+        stall: 0,
+        deadline: u32::MAX,
+    };
+    assert_eq!(
+        rig.driver.enter_attempt(None, &mut recovered),
+        Err(InputWaitError::Timeout)
+    );
+    assert_eq!(
+        rig.driver.scene_changed(&mut recovered),
+        Err(InputWaitError::Timeout)
+    );
+    assert_eq!(
+        rig.driver.before_opening(&mut recovered),
+        Err(InputWaitError::Timeout)
+    );
+    assert!(
+        recovered.asked.is_empty(),
+        "nothing asked: {:?}",
+        recovered.asked
+    );
+}

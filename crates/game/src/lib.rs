@@ -60,7 +60,7 @@ pub use audio_loop::{
 };
 pub use autoplay::{Autoplay, AutoplayError, schedule_iter};
 pub use bests::{BestScore, BestView, SavedPlay};
-pub use driver::{AdjustDriver, InputPump, WAIT_PARKS};
+pub use driver::{AdjustDriver, InputPump};
 pub use error::{Chain, IoFailure};
 pub use eval::TABLE_BYTES_PER_OBJECT;
 pub use hispeed::{

@@ -17,7 +17,11 @@
 //!   tap never owes more than one marker of each kind.
 //! - **Waits**: a fence or a credit is waited for in one loop that drains,
 //!   wakes the input thread when the tap is owed room, and parks for a
-//!   millisecond at most, up to [`WAIT_PARKS`] times.
+//!   millisecond at most ([`InputPump::park`]), until the pump's awake
+//!   deadline ends it. Every wait goes through that one loop, and its
+//!   first failure is latched: the driver asks nothing more of the input
+//!   thread and answers every later wait with that failure
+//!   ([`AdjustDriver::failure`]).
 //! - **Attempts**: [`enter_attempt`](AdjustDriver::enter_attempt) at an
 //!   attempt's entry fences, closes the open group and forgets the chart;
 //!   [`attach`](AdjustDriver::attach) gives it the attempt's tempo where
@@ -43,10 +47,6 @@ use crate::live::InputWaitError;
 use crate::session::Loaded;
 use crate::tempo::AttemptTempo;
 
-/// The most parks a wait for a marker takes, a millisecond each at most:
-/// the input thread's bound for an answer.
-pub const WAIT_PARKS: u32 = 2_000;
-
 /// The input thread, as the driver's waits need it.
 pub trait InputPump {
     /// Asks the input thread to answer fence `n` at its next boundary.
@@ -55,11 +55,14 @@ pub trait InputPump {
     fn wake(&mut self);
     /// The display offset now, µs: what the drain cuts in when it changed.
     fn display_offset_us(&self) -> i64;
-    /// Waits a millisecond at most for the input thread to make progress.
+    /// Waits a millisecond at most for the input thread to make progress:
+    /// the only end of a driver's wait other than its answer.
     ///
     /// # Errors
     ///
-    /// [`InputWaitError::Gone`] when the input thread is gone.
+    /// [`InputWaitError::Gone`] when the input thread is gone, and
+    /// [`InputWaitError::Timeout`] once this pump's waits have lasted the
+    /// input thread's bound in awake time.
     fn park(&mut self) -> Result<(), InputWaitError>;
 }
 
@@ -89,6 +92,8 @@ pub struct AdjustDriver {
     pending: Option<u64>,
     /// The epoch of the attempt prepared.
     active: Option<u64>,
+    /// The first wait on the input thread that failed: terminal.
+    failed: Option<InputWaitError>,
 }
 
 impl AdjustDriver {
@@ -124,6 +129,7 @@ impl AdjustDriver {
                 next_epoch: 1,
                 pending: None,
                 active: None,
+                failed: None,
             },
             tap,
             reader,
@@ -205,14 +211,27 @@ impl AdjustDriver {
         input: &mut impl InputPump,
         done: impl Fn(&Self) -> bool,
     ) -> Result<(), InputWaitError> {
-        for _ in 0..WAIT_PARKS {
+        if let Some(e) = self.failed {
+            return Err(e);
+        }
+        loop {
             self.pump(input);
             if done(self) {
                 return Ok(());
             }
-            input.park()?;
+            // The pump's awake deadline is the wait's only end.
+            if let Err(e) = input.park() {
+                self.failed = Some(e);
+                return Err(e);
+            }
         }
-        Err(InputWaitError::Timeout)
+    }
+
+    /// The first wait on the input thread that failed, if one did: the run
+    /// ends with it, and the driver asks nothing more of the input thread.
+    #[must_use]
+    pub const fn failure(&self) -> Option<InputWaitError> {
+        self.failed
     }
 
     /// Fences the input thread: returns once everything it observed before
@@ -222,6 +241,9 @@ impl AdjustDriver {
     ///
     /// Why the input thread did not answer: the run ends with it.
     pub fn fence(&mut self, input: &mut impl InputPump) -> Result<(), InputWaitError> {
+        if let Some(e) = self.failed {
+            return Err(e);
+        }
         let n = self.fence_asked.wrapping_add(1);
         self.fence_asked = n;
         input.request_fence(n);
