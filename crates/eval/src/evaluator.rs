@@ -158,34 +158,74 @@ pub struct Tally {
     pub max_combo: u32,
     /// Number of empty POORs.
     pub empty_poor: u32,
+    /// The scored judgments per kind that came early: pressed at or before
+    /// their note (a deviation of 0 or less). A long note counts once, at
+    /// its judgment, on the side of whichever of its head's press and its
+    /// release lies farther from its time, the release on a tie; a long
+    /// note held through its end, or decided at its head's press, by its
+    /// head. Empty POORs are not among them, even when the preset counts
+    /// them as POOR.
+    pub early: PerJudgment<u32>,
+    /// The scored judgments per kind that came late: pressed after their
+    /// note, or missed (a miss and a note a press passed are late), counted
+    /// as [`early`](Self::early). For each kind, `early + late` is the
+    /// number of that kind's judgments.
+    pub late: PerJudgment<u32>,
+    /// The empty POORs pressed at or before the note they are against.
+    pub empty_poor_early: u32,
+    /// The empty POORs pressed after the note they are against;
+    /// `empty_poor_early + empty_poor_late` is
+    /// [`empty_poor`](Self::empty_poor).
+    pub empty_poor_late: u32,
+}
+
+impl Default for Tally {
+    /// Nothing judged yet.
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Tally {
     const fn new() -> Self {
         Self {
-            counts: PerJudgment {
-                perfect: 0,
-                great: 0,
-                good: 0,
-                bad: 0,
-                poor: 0,
-            },
+            counts: ZERO_COUNTS,
             ex_score: 0,
             bp: 0,
             combo: 0,
             max_combo: 0,
             empty_poor: 0,
+            early: ZERO_COUNTS,
+            late: ZERO_COUNTS,
+            empty_poor_early: 0,
+            empty_poor_late: 0,
         }
     }
 
+    /// FAST: the early judgments other than PERFECT, GREAT to POOR, and
+    /// the early empty POORs.
+    #[must_use]
+    pub const fn fast(&self) -> u32 {
+        Self::without_perfect(&self.early, self.empty_poor_early)
+    }
+
+    /// SLOW: the late judgments other than PERFECT and the late empty
+    /// POORs, as [`fast`](Self::fast).
+    #[must_use]
+    pub const fn slow(&self) -> u32 {
+        Self::without_perfect(&self.late, self.empty_poor_late)
+    }
+
+    const fn without_perfect(side: &PerJudgment<u32>, empty: u32) -> u32 {
+        side.great
+            .saturating_add(side.good)
+            .saturating_add(side.bad)
+            .saturating_add(side.poor)
+            .saturating_add(empty)
+    }
+
     const fn count_mut(&mut self, j: Judgment) -> &mut u32 {
-        match j {
-            Judgment::Perfect => &mut self.counts.perfect,
-            Judgment::Great => &mut self.counts.great,
-            Judgment::Good => &mut self.counts.good,
-            Judgment::Bad => &mut self.counts.bad,
-            Judgment::Poor => &mut self.counts.poor,
-        }
+        per_mut(&mut self.counts, j)
     }
 
     fn apply(&mut self, breaks_combo: bool, counts_bp: bool) {
@@ -198,6 +238,25 @@ impl Tally {
         if counts_bp {
             self.bp = self.bp.saturating_add(1);
         }
+    }
+}
+
+const ZERO_COUNTS: PerJudgment<u32> = PerJudgment {
+    perfect: 0,
+    great: 0,
+    good: 0,
+    bad: 0,
+    poor: 0,
+};
+
+/// `p`'s value for `j`.
+const fn per_mut(p: &mut PerJudgment<u32>, j: Judgment) -> &mut u32 {
+    match j {
+        Judgment::Perfect => &mut p.perfect,
+        Judgment::Great => &mut p.great,
+        Judgment::Good => &mut p.good,
+        Judgment::Bad => &mut p.bad,
+        Judgment::Poor => &mut p.poor,
     }
 }
 
@@ -1115,7 +1174,13 @@ impl<'a> Evaluator<'a> {
         // The sound (design.md "The Only Output Is the Judgment Event
         // Stream"): the note taken, else the one the empty POOR is against,
         // else the lane's latest note before the press, else its first.
-        let empty_poor = best.is_none() && against.is_some();
+        // An empty POOR, early when pressed at or before the note it is
+        // against.
+        let empty_poor = against
+            .filter(|_| best.is_none())
+            .and_then(|k| state.targets.get(k))
+            .and_then(|&i| notes.get(i))
+            .map(|n| t <= n.time);
         let target = best
             .map(|(_, k)| k)
             .or(against)
@@ -1217,8 +1282,14 @@ impl<'a> Evaluator<'a> {
             self.emit(t, Some(origin), kind, out);
             return;
         }
-        if empty_poor {
+        if let Some(early) = empty_poor {
             self.tally.empty_poor = self.tally.empty_poor.saturating_add(1);
+            let side = if early {
+                &mut self.tally.empty_poor_early
+            } else {
+                &mut self.tally.empty_poor_late
+            };
+            *side = side.saturating_add(1);
             if rule.counted {
                 let c = self.tally.count_mut(Judgment::Poor);
                 *c = c.saturating_add(1);
@@ -1326,8 +1397,8 @@ impl<'a> Evaluator<'a> {
         self.score(lane, target, judgment, deviation, None, time, origin, out);
     }
 
-    /// Scores a taken target: counts, EX score, combo, BP, its
-    /// [`JudgeEventKind::Judged`] and the gauges.
+    /// Scores a taken target: counts and their early and late sides, EX
+    /// score, combo, BP, its [`JudgeEventKind::Judged`] and the gauges.
     #[allow(clippy::too_many_arguments)]
     fn score(
         &mut self,
@@ -1353,6 +1424,22 @@ impl<'a> Evaluator<'a> {
             *score.breaks_combo.get(judgment),
             *score.counts_bp.get(judgment),
         );
+        // Early or late (design.md "Evaluation Stages", accounting): a
+        // miss is late; a long note finished by a release takes the side of
+        // whichever of its head and its release lies farther from its time,
+        // the release on a tie; otherwise the press's side, 0 early.
+        let distance = match (deviation, release) {
+            (Some(head), Some(r)) if head.0.unsigned_abs() > r.0.unsigned_abs() => Some(head),
+            (_, Some(r)) => Some(r),
+            (head, None) => head,
+        };
+        let side = if distance.is_some_and(|d| d.0 <= 0) {
+            &mut self.tally.early
+        } else {
+            &mut self.tally.late
+        };
+        let n = per_mut(side, judgment);
+        *n = n.saturating_add(1);
         let kind = JudgeEventKind::Judged {
             lane: lane_of(lane),
             note,

@@ -698,6 +698,7 @@ mod tests {
             combo: 0,
             max_combo: 0,
             empty_poor: 0,
+            ..Default::default()
         };
         let snapshot = [GaugeState {
             value: GaugeValue(0),

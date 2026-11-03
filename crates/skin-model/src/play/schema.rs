@@ -137,6 +137,20 @@ pub static PLAY: Schema = Schema {
         int("duration.ms", READOUT_MAX, E),
         int("duration.green", GREEN_MAX, E),
         flag("duration.valid", E),
+        count("count.fast", E),
+        count("count.slow", E),
+        count("count.early.perfect", E),
+        count("count.late.perfect", E),
+        count("count.early.great", E),
+        count("count.late.great", E),
+        count("count.early.good", E),
+        count("count.late.good", E),
+        count("count.early.bad", E),
+        count("count.late.bad", E),
+        count("count.early.poor", E),
+        count("count.late.poor", E),
+        count("count.early.empty_poor", E),
+        count("count.late.empty_poor", E),
     ],
     timers: &[
         timer("ready", E),
@@ -279,8 +293,28 @@ pub mod field {
     pub const DURATION_GREEN: u16 = 35;
     /// Whether the frame gives the travel duration.
     pub const DURATION_VALID: u16 = 36;
+    /// FAST: the early judgments other than PERFECT and the early empty
+    /// POORs ([`Tally::fast`](eval::Tally::fast)).
+    pub const COUNT_FAST: u16 = 37;
+    /// SLOW, as FAST ([`Tally::slow`](eval::Tally::slow)).
+    pub const COUNT_SLOW: u16 = 38;
+    /// Each kind's early and late judgments, PERFECT to POOR, then the
+    /// empty POORs' ([`Tally::early`](eval::Tally::early),
+    /// [`Tally::late`](eval::Tally::late)), in pairs from 39 to 50.
+    pub const COUNT_EARLY_PERFECT: u16 = 39;
+    pub const COUNT_LATE_PERFECT: u16 = 40;
+    pub const COUNT_EARLY_GREAT: u16 = 41;
+    pub const COUNT_LATE_GREAT: u16 = 42;
+    pub const COUNT_EARLY_GOOD: u16 = 43;
+    pub const COUNT_LATE_GOOD: u16 = 44;
+    pub const COUNT_EARLY_BAD: u16 = 45;
+    pub const COUNT_LATE_BAD: u16 = 46;
+    pub const COUNT_EARLY_POOR: u16 = 47;
+    pub const COUNT_LATE_POOR: u16 = 48;
+    pub const COUNT_EARLY_EMPTY_POOR: u16 = 49;
+    pub const COUNT_LATE_EMPTY_POOR: u16 = 50;
     /// The number of fields.
-    pub const COUNT: usize = 37;
+    pub const COUNT: usize = 51;
 }
 
 /// The built-in timer slots of [`PLAY`]; `when` timers follow from
@@ -501,6 +535,20 @@ mod tests {
             ("duration.ms", field::DURATION_MS),
             ("duration.green", field::DURATION_GREEN),
             ("duration.valid", field::DURATION_VALID),
+            ("count.fast", field::COUNT_FAST),
+            ("count.slow", field::COUNT_SLOW),
+            ("count.early.perfect", field::COUNT_EARLY_PERFECT),
+            ("count.late.perfect", field::COUNT_LATE_PERFECT),
+            ("count.early.great", field::COUNT_EARLY_GREAT),
+            ("count.late.great", field::COUNT_LATE_GREAT),
+            ("count.early.good", field::COUNT_EARLY_GOOD),
+            ("count.late.good", field::COUNT_LATE_GOOD),
+            ("count.early.bad", field::COUNT_EARLY_BAD),
+            ("count.late.bad", field::COUNT_LATE_BAD),
+            ("count.early.poor", field::COUNT_EARLY_POOR),
+            ("count.late.poor", field::COUNT_LATE_POOR),
+            ("count.early.empty_poor", field::COUNT_EARLY_EMPTY_POOR),
+            ("count.late.empty_poor", field::COUNT_LATE_EMPTY_POOR),
         ];
         for (name, slot) in fields {
             assert_eq!(PLAY.field(name).map(|(s, _)| s), Some(slot), "{name}");

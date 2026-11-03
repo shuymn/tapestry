@@ -284,12 +284,12 @@ fn rates() -> common::Loaded {
     ))
 }
 
-/// The rows' digits as drawn at `ms`, read through the EX score's glyph
-/// for each digit; a blank cell is not drawn.
-fn rows(d: &mut common::play::Drawn, ms: i64) -> Vec<String> {
+/// The `n` rows' digits as drawn at `ms`, read through the EX score's
+/// glyph for each digit; a blank cell is not drawn.
+fn rows(d: &mut common::play::Drawn, ms: i64, n: usize) -> Vec<String> {
     let glyph = d.ex_glyphs(ms);
     let q = d.frame(ms, &[]);
-    let mut rows = vec![String::new(); RATES.len()];
+    let mut rows = vec![String::new(); n];
     let mut cells: Vec<_> = q.iter().map(|q| (q.rect[1], q.rect[0], q.uv)).collect();
     cells.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.total_cmp(&b.1)));
     let ys: Vec<f32> = {
@@ -331,15 +331,18 @@ fn rates_show_whole_percent_and_hundredths() {
     // Before any judgment, and again after a retry: 100.00 and 0.00 (the
     // source draws no digits until it has a score).
     let fresh = ["100", "00", "0", "00", "0", "00"];
-    assert_eq!(rows(&mut d, 0), fresh);
+    assert_eq!(rows(&mut d, 0, RATES.len()), fresh);
     // EX 3 over 2 judged of 4 targets: 75.00 and 37.50.
     d.tally.counts.perfect = 1;
     d.tally.counts.great = 1;
     d.tally.ex_score = 3;
-    assert_eq!(rows(&mut d, 16), ["75", "00", "37", "50", "37", "50"]);
+    assert_eq!(
+        rows(&mut d, 16, RATES.len()),
+        ["75", "00", "37", "50", "37", "50"]
+    );
     d.retry(4);
     d.tally = common::play::tally(0, 0);
-    assert_eq!(rows(&mut d, 0), fresh);
+    assert_eq!(rows(&mut d, 0, RATES.len()), fresh);
 }
 
 #[test]
@@ -358,4 +361,77 @@ fn a_strip_past_the_model_is_a_range_error() {
     )
     .err();
     assert!(matches!(e, ImportError::Range { .. }), "{e:?}");
+}
+
+/// The early and late counts (410-419 by id, 420-422 by id and by name)
+/// and their totals (423 `totalearly`, 424 `totallate`), one row each
+/// from y = 100 below an EX score of one cell at y = 0 that tells the
+/// glyphs apart, with what each shows of [`early_late_tally`].
+const EARLY_LATE: [(&str, &str); 17] = [
+    (r#""ref": 410"#, "1"),
+    (r#""value": 411"#, "6"),
+    (r#""ref": 412"#, "2"),
+    (r#""ref": 413"#, "7"),
+    (r#""ref": 414"#, "3"),
+    (r#""ref": 415"#, "8"),
+    (r#""ref": 416"#, "4"),
+    (r#""ref": 417"#, "9"),
+    (r#""ref": 418"#, "5"),
+    (r#""ref": 419"#, "10"),
+    (r#""value": "miss""#, "23"),
+    (r#""value": "early_miss""#, "11"),
+    (r#""ref": 422"#, "12"),
+    (r#""ref": 423"#, "25"),
+    (r#""value": "totalearly""#, "25"),
+    (r#""value": 424"#, "46"),
+    (r#""value": "totallate""#, "46"),
+];
+
+/// Early 1 to 5 and late 6 to 10 PERFECT to POOR, and 11 early and 12
+/// late empty POORs: FAST 2 + 3 + 4 + 5 + 11 = 25, SLOW 7 + 8 + 9 + 10 +
+/// 12 = 46.
+fn early_late_tally(t: &mut eval::Tally) {
+    let per = |perfect, great, good, bad, poor| rules::PerJudgment {
+        perfect,
+        great,
+        good,
+        bad,
+        poor,
+    };
+    t.early = per(1, 2, 3, 4, 5);
+    t.late = per(6, 7, 8, 9, 10);
+    t.empty_poor_early = 11;
+    t.empty_poor_late = 12;
+    t.empty_poor = 23;
+}
+
+#[test]
+fn early_and_late_counts_show_the_tallys_counts() {
+    let mut values = vec![
+        r#"{"id": "ex", "src": "n", "w": 120, "h": 20, "divx": 10, "digit": 1, "ref": 71}"#
+            .to_owned(),
+    ];
+    let mut dsts = vec![r#"{"id": "ex", "dst": [{"x": 0, "y": 0, "w": 12, "h": 20}]}"#.to_owned()];
+    for (i, (prop, _)) in EARLY_LATE.iter().enumerate() {
+        values.push(format!(
+            r#"{{"id": "n{i}", "src": "n", "w": 120, "h": 20, "divx": 10, "digit": 3, {prop}}}"#
+        ));
+        let y = 100 * (i + 1);
+        dsts.push(format!(
+            r#"{{"id": "n{i}", "dst": [{{"x": 0, "y": {y}, "w": 12, "h": 20}}]}}"#
+        ));
+    }
+    let loaded = import_body(&format!(
+        r#""value": [{}], "destination": [{}]"#,
+        values.join(","),
+        dsts.join(",")
+    ));
+    // Counted as the source counts them: no note.
+    assert_eq!(loaded.report().notes, [], "{:?}", loaded.report().notes);
+    let mut d = loaded.drawn_over(4);
+    let n = EARLY_LATE.len();
+    assert_eq!(rows(&mut d, 0, n), vec!["0"; n]);
+    early_late_tally(&mut d.tally);
+    let shown: Vec<_> = EARLY_LATE.iter().map(|(_, v)| v.to_string()).collect();
+    assert_eq!(rows(&mut d, 16, n), shown);
 }

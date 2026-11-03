@@ -123,19 +123,19 @@ fn ln_end_edges_and_the_implementation_version_read_back_and_validate() {
             judgment: rules::Judgment::Perfect
         }))
     );
-    // The standard evaluator's version 2, the earlier key sound rule, is
-    // refused.
-    let v2 = text.replacen(
+    // The standard evaluator's version 3, without the FAST and SLOW
+    // counts, is refused.
+    let v3 = text.replacen(
+        "[implementation]\nkind = \"standard\"\nversion = 4",
         "[implementation]\nkind = \"standard\"\nversion = 3",
-        "[implementation]\nkind = \"standard\"\nversion = 2",
         1,
     );
-    assert_ne!(v2, text, "the edit did not apply");
+    assert_ne!(v3, text, "the edit did not apply");
     assert_eq!(
-        load_preset_toml("mine", &v2),
+        load_preset_toml("mine", &v3),
         Err(PresetError::Invalid(RuleError::UnsupportedImplementation {
             name: "standard",
-            version: 2
+            version: 3
         }))
     );
 }
