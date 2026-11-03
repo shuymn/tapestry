@@ -200,6 +200,9 @@ pub struct PlayerRig<'a> {
     pub ready_state_at: Option<TimeUs>,
     /// Where the current play's chart time 0 lies on the clock.
     pub origin: Option<TimeUs>,
+    /// The play skin's declared Closing duration, from the current
+    /// attempt's commit receipt ([`commit_ready`]); `None` before it.
+    pub declared_close: Option<TimeUs>,
     /// Where each logic step's measurement goes (the render thread).
     pub steps: rtrb::Producer<StepSample>,
     /// Step samples of the current play the full queue refused.
@@ -568,12 +571,20 @@ pub(crate) fn closing_line(c: &game::ClosingReport) -> String {
 
 /// The render thread's commit of the attempt prepared: while a loading
 /// lifetime runs (`loading`), it is ready first, so its progress reaches
-/// 100 before the commit and the end of loading.
-pub(crate) fn commit_ready(render: &RenderLink, loading: bool) -> Result<(), ScreenError> {
+/// 100 before the commit and the end of loading. `declared` becomes the
+/// commit's receipt, the play skin's declared Closing duration, and
+/// `None` when nothing was installed.
+pub(crate) fn commit_ready(
+    render: &RenderLink,
+    loading: bool,
+    declared: &mut Option<TimeUs>,
+) -> Result<(), ScreenError> {
+    *declared = None;
     if loading {
         render.loading().report(LoadInput::Ready, None);
     }
-    render.commit_attempt()
+    *declared = render.commit_attempt()?;
+    Ok(())
 }
 
 /// While a loading lifetime runs (`loading`), replaces its gauge
@@ -702,6 +713,12 @@ impl Rig for PlayerRig<'_> {
         c
     }
 
+    /// The current attempt's commit receipt.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn declared_close(&self) -> Option<TimeUs> {
+        self.declared_close
+    }
+
     /// As [`take`](Self::take), with the quit key taken without dropping a
     /// retry pressed with it ([`Controls::take_closing`]).
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
@@ -763,7 +780,8 @@ impl Rig for PlayerRig<'_> {
     /// A loading lifetime is ready first: everything before the commit
     /// passed, so its progress reaches 100.
     fn commit_attempt(&mut self) -> Result<(), ScreenError> {
-        commit_ready(&self.render, self.loading_active())
+        let loading = self.loading_active();
+        commit_ready(&self.render, loading, &mut self.declared_close)
     }
 
     fn discard_attempt(&mut self) {

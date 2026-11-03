@@ -793,6 +793,7 @@ fn rig<'a>(
         times: LoadTimes::default(),
         ready_state_at: None,
         origin: None,
+        declared_close: None,
         steps,
         steps_dropped: 0,
         figures: None,
