@@ -19,7 +19,21 @@ use tempfile::TempDir;
 pub fn lua_import(root: &Path) -> Result<skin_beatoraja::LuaImported, ImportError> {
     let cancel = skin_beatoraja::Cancel::new();
     let h = skin_beatoraja::read_lua_header(root, "s.luaskin", &cancel)?;
-    h.import(&Config::defaults(h.header()), &cancel)
+    lua_play(&h, &Config::defaults(h.header()), &cancel)
+}
+
+/// The configured pass of `h` with `config` on a play scene whose import
+/// facts are all unavailable, which never ends pending.
+pub fn lua_play(
+    h: &skin_beatoraja::LuaHeader,
+    config: &Config,
+    cancel: &skin_beatoraja::Cancel,
+) -> Result<skin_beatoraja::LuaImported, ImportError> {
+    let facts = skin_beatoraja::ImportFacts::unavailable(skin_beatoraja::Scene::Play);
+    match h.import(config, &facts, cancel)? {
+        skin_beatoraja::LuaOutcome::Imported(i) => Ok(i),
+        skin_beatoraja::LuaOutcome::Pending(p) => panic!("pending with no pending fact: {p:?}"),
+    }
 }
 
 /// A skin folder holding `files`, each a name and its text.

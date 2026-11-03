@@ -17,8 +17,9 @@
 //! require them and keep their functions, which its per-frame functions
 //! call; a call during import reads live play state, or acts on files,
 //! the network or audio, none of which an import may, and is refused
-//! rather than answered with an invented value. There each module is
-//! read-only: the skin gets an empty proxy whose `__index` is the
+//! rather than answered with an invented value; only `main_state.option`
+//! answers the import facts of the pass's snapshot ([`super::facts`]).
+//! There each module is read-only: the skin gets an empty proxy whose `__index` is the
 //! module's table, out of the skin's reach, and whose `__newindex`
 //! refuses the write as a fault ([`LuaWhy::HostWrite`]), whatever local
 //! it is written through; its metatable is protected. So `main_state.f`
@@ -27,8 +28,9 @@
 //! sentinel, the smallest integer, kept so that a skin can test a timer
 //! for off.
 
-use mlua::{Lua, Table, Value};
+use mlua::{Lua, MultiValue, Table, Value};
 
+use super::facts::{self, OptionRead};
 use super::{LuaWhy, Pass, host};
 
 /// The host API functions, by module: what a report names, and what a
@@ -101,6 +103,62 @@ pub const HOST_APIS: [(&str, &str); 65] = [
     ("event_util", "event_min_interval"),
 ];
 
+/// `main_state.option`'s index in [`HOST_APIS`].
+const OPTION: u16 = 0;
+
+/// `main_state.option(n)` during the configured pass: an import fact from
+/// the pass's snapshot ([`facts::option`]), recorded on its first read;
+/// an id the source does not know or a scene's constant, unrecorded; and
+/// a refusal, fatal and located, for an argument that is not an integer
+/// within `i32` (the integer subtype: `33.0` and `"33"` refuse), a fact
+/// the snapshot has unavailable and a built-in that is not a fact. A fact
+/// the snapshot has pending stops the pass by the same fatal path.
+fn option(lua: &Lua, pass: &Pass, args: MultiValue) -> mlua::Result<bool> {
+    let n = match args.front() {
+        Some(Value::Integer(n)) => i32::try_from(*n).ok(),
+        _ => None,
+    };
+    let Some(n) = n else {
+        pass.count_fact(|| "option argument".to_owned());
+        return Err(pass.ledger.fail_lua(lua, LuaWhy::FactArgument));
+    };
+    let Some(snapshot) = &pass.facts else {
+        return Err(pass.ledger.fail_lua(lua, LuaWhy::LiveState { api: OPTION }));
+    };
+    let id = n.unsigned_abs();
+    match facts::option(snapshot, n) {
+        OptionRead::Constant { value, known } => {
+            pass.count_fact(|| {
+                if known {
+                    format!("option {id} constant")
+                } else {
+                    "option unknown".to_owned()
+                }
+            });
+            Ok(value)
+        }
+        OptionRead::Fact { value, read } => {
+            pass.count_fact(|| format!("option {id} read"));
+            pass.read_fact(read);
+            Ok(value)
+        }
+        OptionRead::Pending(fact) => {
+            pass.count_fact(|| format!("option {id} pending"));
+            Err(pass.ledger.pending(fact))
+        }
+        OptionRead::Unavailable => {
+            pass.count_fact(|| format!("option {id} unavailable"));
+            Err(pass
+                .ledger
+                .fail_lua(lua, LuaWhy::Unavailable { api: OPTION, id: n }))
+        }
+        OptionRead::LiveState => {
+            pass.count_fact(|| format!("option {id} live state"));
+            Err(pass.ledger.fail_lua(lua, LuaWhy::LiveState { api: OPTION }))
+        }
+    }
+}
+
 /// The host modules' names.
 pub(super) const MODULES: [&str; 3] = ["main_state", "timer_util", "event_util"];
 
@@ -132,9 +190,13 @@ pub(super) fn install(lua: &Lua, pass: &std::rc::Rc<Pass>) -> mlua::Result<()> {
             if m != module || !configured {
                 continue;
             }
-            let f = host(lua, pass, 0, move |lua, pass, _| -> mlua::Result<()> {
-                Err(pass.ledger.fail_lua(lua, LuaWhy::LiveState { api: index }))
-            })?;
+            let f = if index == OPTION {
+                host(lua, pass, 1, option)?
+            } else {
+                host(lua, pass, 0, move |lua, pass, _| -> mlua::Result<()> {
+                    Err(pass.ledger.fail_lua(lua, LuaWhy::LiveState { api: index }))
+                })?
+            };
             pass.host_api(f.to_pointer().addr(), index);
             t.raw_set(api, f)?;
         }

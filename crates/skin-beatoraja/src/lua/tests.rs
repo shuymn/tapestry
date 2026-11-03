@@ -12,6 +12,20 @@ use super::{Cancel, LuaHeader, LuaLimit, LuaWhy, read_lua_header};
 use crate::error::ImportError;
 use crate::import::Config;
 
+/// The configured pass of `h` with `config` on a play scene whose import
+/// facts are all unavailable, which never ends pending.
+pub(crate) fn play(
+    h: &LuaHeader,
+    config: &Config,
+    cancel: &Cancel,
+) -> Result<super::LuaImported, ImportError> {
+    let facts = super::facts::ImportFacts::unavailable(super::facts::Scene::Play);
+    match h.import(config, &facts, cancel)? {
+        super::LuaOutcome::Imported(i) => Ok(i),
+        super::LuaOutcome::Pending(p) => panic!("pending with no pending fact: {p:?}"),
+    }
+}
+
 /// What a test does at a point of the import.
 type Action = Box<dyn Fn()>;
 
@@ -202,13 +216,11 @@ fn every_pass_drops_its_vm_on_every_outcome() {
     let ok = folder("return { type = 0 }");
     let h = header(ok.path(), &Cancel::new()).unwrap();
     assert_eq!(live(), 0);
-    h.import(&Config::defaults(h.header()), &Cancel::new())
-        .unwrap();
+    super::tests::play(&h, &Config::defaults(h.header()), &Cancel::new()).unwrap();
     assert_eq!(live(), 0);
     let fails = folder("if skin_config then error(\"x\") end\nreturn { type = 0 }");
     let h = header(fails.path(), &Cancel::new()).unwrap();
-    h.import(&Config::defaults(h.header()), &Cancel::new())
-        .unwrap_err();
+    super::tests::play(&h, &Config::defaults(h.header()), &Cancel::new()).unwrap_err();
     assert_eq!(live(), 0);
     for entry in [
         "while true do end",
@@ -233,8 +245,8 @@ fn the_instruction_hook_covers_a_thread_the_host_creates() {
     let f = lua.load("while true do end").into_function().unwrap();
     let thread = lua.create_thread(f).unwrap();
     assert!(thread.resume::<()>(()).is_err());
-    match pass.ledger.take_fault() {
-        Some(ImportError::Lua { why, .. }) => {
+    match pass.ledger.take_stop() {
+        Some(super::ledger::Stop::Fault(ImportError::Lua { why, .. })) => {
             assert_eq!(why, LuaWhy::Limit(LuaLimit::Instructions));
         }
         other => panic!("{other:?}"),
@@ -272,7 +284,7 @@ fn the_time_cap_spans_both_passes() {
     let mut h = header(d.path(), &Cancel::new()).unwrap();
     h.spent = MAX_LUA_TIME - Duration::from_millis(300);
     let start = Instant::now();
-    let r = h.import(&Config::defaults(h.header()), &Cancel::new());
+    let r = super::tests::play(&h, &Config::defaults(h.header()), &Cancel::new());
     let took = start.elapsed();
     // Without the carried time it would run its own 5 s.
     assert_eq!(why(r), LuaWhy::Limit(LuaLimit::Time));

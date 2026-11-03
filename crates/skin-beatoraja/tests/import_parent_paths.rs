@@ -134,7 +134,7 @@ fn a_lua_entry_reads_a_script_and_an_image_above_it() {
         imported,
         dependencies,
         ..
-    } = h.import(&Config::defaults(h.header()), &cancel).unwrap();
+    } = common::lua_play(&h, &Config::defaults(h.header()), &cancel).unwrap();
     assert!(
         imported.report.notes.is_empty(),
         "{:?}",

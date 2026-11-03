@@ -907,11 +907,18 @@ pub fn skin_jsons() -> Vec<Seed> {
     .collect()
 }
 
-/// One `skin_lua` input: the files joined by NUL bytes, entry file first
-/// ([`crate::LUA_FILES`]).
+/// One `skin_lua` input: the play snapshot's two bytes
+/// ([`crate::lua_facts`]: autoplay off, `#RANK 2`), then the files joined
+/// by NUL bytes, entry file first ([`crate::LUA_FILES`]).
 fn lua_input(files: &[&str]) -> Vec<u8> {
-    files.join("\0").into_bytes()
+    let mut input = vec![LUA_AUTOPLAY_OFF, LUA_RANK_2];
+    input.extend_from_slice(files.join("\0").as_bytes());
+    input
 }
+
+/// [`crate::lua_facts`]'s bytes for autoplay off and for `#RANK 2`.
+pub const LUA_AUTOPLAY_OFF: u8 = 1;
+pub const LUA_RANK_2: u8 = (10 << 2) | 2;
 
 /// The header of the `skin_lua` seeds: an option, a file choice over the
 /// folder's PNGs and an offset. The configured pass adds `body`.
@@ -933,7 +940,8 @@ return skin
 
 /// `skin_lua` seeds: skins that import (data only, local modules and
 /// selected parts, configuration and a pass-local write to it, pass
-/// isolation, callbacks converted and a decorative one replaced), then
+/// isolation, callbacks converted and a decorative one replaced, import
+/// facts read), then
 /// one refusal per boundary: a callback with an unknown effect, a write
 /// to a host module, the instruction and memory caps (also inside a
 /// protected call), a path out of the folder, a coroutine, malformed
@@ -983,6 +991,10 @@ skin.destination[2] = { id = "i", draw = function() return ms.number(425) > 0 en
         r#"local ms = require("main_state")
 skin.destination[2] = { id = "i", draw = function() ms.set_timer(1, 0) return true end, dst = { { w = 10, h = 10 } } }"#,
     );
+    let facts = lua_skin(
+        r#"local ms = require("main_state")
+assert(not ms.option(33) and ms.option(32) and ms.option(182) and not ms.option(290))"#,
+    );
     let host_write =
         lua_skin(r#"local ms = require("main_state") pcall(function() ms.number = nil end)"#);
     vec![
@@ -994,6 +1006,7 @@ skin.destination[2] = { id = "i", draw = function() ms.set_timer(1, 0) return tr
             lua_input(&[&isolation, "runs = (runs or 0) + 1\nreturn { runs = runs }"]),
         ),
         ("callback_lowered", lua_input(&[&lowered])),
+        ("facts", lua_input(&[&facts])),
         ("callback_replaced", lua_input(&[&replaced])),
         ("callback_effect", lua_input(&[&effect])),
         ("host_write", lua_input(&[&host_write])),

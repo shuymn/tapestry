@@ -59,6 +59,12 @@ pub use import::{
     NoteFallback, NoteKind, NoteLoc, Object, OffsetValue, PartWhy, PropertyKind, Report, Rule,
     Severity, TimerWhy, TrackWhy, Usage, import,
 };
-pub use lua::{Cancel, LuaHeader, LuaImported, LuaLimit, LuaUsage, LuaWhy, read_lua_header};
+pub use lua::facts::{
+    ChartRank, Fact, FactDeps, FactId, FactRead, FactValue, ImportFacts, JudgeClass, Scene,
+};
+pub use lua::{
+    Cancel, LuaHeader, LuaImported, LuaLimit, LuaOutcome, LuaPending, LuaUsage, LuaWhy,
+    read_lua_header,
+};
 pub use resolve::{Definition, Resolved, resolve};
 pub use tree::CallableKind;

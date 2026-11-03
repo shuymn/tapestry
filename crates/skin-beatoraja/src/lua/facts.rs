@@ -1,0 +1,306 @@
+//! Import facts (design.md "beatoraja Lua Skins", import facts;
+//! docs/stage3.md §3, Lua): the owned snapshot of the scene a skin is
+//! imported for, which the configured pass answers `main_state.option`
+//! from, and the dependencies an import records on it.
+//!
+//! The snapshot is plain data the caller fills, immutable for the pass,
+//! so every read of one pass sees one scene. The facts are published by
+//! id, as the source's boolean properties at beatoraja's `0.8.9` tag
+//! answer them (`skin/property/BooleanPropertyFactory.java`):
+//!
+//! - 33 and 32, autoplay on and off (`:416-419`): the snapshot's
+//!   [`ImportFacts::autoplay`] on [`Scene::Play`], a constant `false` on
+//!   every other scene, as the source's are off the play state;
+//! - 180 to 184, the chart's judgment class (`:448-452`): the source's
+//!   bands over [`ImportFacts::chart_rank`], the rank the play preset's
+//!   header policy reads (which the evaluator judges with), where the
+//!   source bands the chart's raw rank;
+//! - 290, course mode (`:526-527`): a constant `false`, as there are no
+//!   courses.
+//!
+//! An import records each fact it read once, with the derived value it
+//! read (the class, never the rank), in first-read order ([`FactDeps`]);
+//! [`FactDeps::holds`] says whether a result still fits a snapshot.
+//!
+//! The boundary with the caller: this module gives the pure pieces. The
+//! import is a function of the sources, the configuration and the
+//! snapshot; its result names its scene and the facts it read; a base
+//! import that reaches a [`Fact::Pending`] fact ends with a pending
+//! result naming it ([`super::LuaPending`]); a [`Fact::Unavailable`] one
+//! refuses. Building the snapshots from a session, the base import and
+//! the attempt's specialization, the pending installation, generations,
+//! invalidation and refusing a stale completion belong to the caller
+//! (docs/stage3.md S10-07).
+
+/// The scene a skin is imported for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Scene {
+    Play,
+    Selection,
+    Decision,
+    Result,
+}
+
+/// A fact as the snapshot has it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Fact<T> {
+    Known(T),
+    /// Bound to the chart or the attempt, supplied by the attempt's
+    /// specialization: an import that reads it ends pending.
+    Pending,
+    /// The scene cannot give it: an import that reads it refuses.
+    Unavailable,
+}
+
+/// The rank the play preset's header policy reads, as `rules::JudgeRank`
+/// has it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChartRank {
+    /// `#RANK`, as written.
+    Rank(i32),
+    /// `#DEFEXRANK`, in thousandths of a percent.
+    DefExRankMilli(i64),
+}
+
+/// A chart's judgment class: options 180 to 184, in order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JudgeClass {
+    VeryHard,
+    Hard,
+    Normal,
+    Easy,
+    VeryEasy,
+}
+
+/// The option id of [`JudgeClass::VeryHard`]; the others follow it.
+const JUDGE_CLASS_FIRST: i32 = 180;
+const AUTOPLAY_OFF: i32 = 32;
+const AUTOPLAY_ON: i32 = 33;
+const COURSE_MODE: i32 = 290;
+
+impl JudgeClass {
+    const ALL: [Self; 5] = [
+        Self::VeryHard,
+        Self::Hard,
+        Self::Normal,
+        Self::Easy,
+        Self::VeryEasy,
+    ];
+
+    /// The class of `rank` by the source's bands: `j == 0 || 10 <= j < 35`
+    /// very hard, `j == 1 || 35 <= j < 60` hard, `j == 2 || 60 <= j < 85`
+    /// normal, `j == 3 || 85 <= j < 110` easy, `j == 4 || j >= 110` very
+    /// easy. A `#RANK` is `j` itself; a `#DEFEXRANK` is its whole percent
+    /// from 10 up, since the source's integer below 10 is a `#RANK` code.
+    /// `None` for a `j` in no band.
+    #[must_use]
+    pub fn of(rank: ChartRank) -> Option<Self> {
+        let j = match rank {
+            ChartRank::Rank(r) => i64::from(r),
+            ChartRank::DefExRankMilli(m) => Some(m.div_euclid(1_000)).filter(|&j| j >= 10)?,
+        };
+        Some(match j {
+            0 | 10..35 => Self::VeryHard,
+            1 | 35..60 => Self::Hard,
+            2 | 60..85 => Self::Normal,
+            3 | 85..110 => Self::Easy,
+            4 | 110.. => Self::VeryEasy,
+            _ => return None,
+        })
+    }
+
+    /// The class option `id` (180 to 184) tests.
+    fn of_option(id: i32) -> Option<Self> {
+        let i = usize::try_from(id.checked_sub(JUDGE_CLASS_FIRST)?).ok()?;
+        Self::ALL.get(i).copied()
+    }
+}
+
+/// The facts of one scene, for one configured pass.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ImportFacts {
+    pub scene: Scene,
+    /// Whether the session plays automatically; read on
+    /// [`Scene::Play`] only.
+    pub autoplay: Fact<bool>,
+    /// The rank the play preset's header policy reads from the drawn
+    /// chart; [`Fact::Unavailable`] when it reads none.
+    pub chart_rank: Fact<ChartRank>,
+}
+
+impl ImportFacts {
+    /// Every fact unavailable.
+    #[must_use]
+    pub fn unavailable(scene: Scene) -> Self {
+        Self {
+            scene,
+            autoplay: Fact::Unavailable,
+            chart_rank: Fact::Unavailable,
+        }
+    }
+
+    /// The base snapshot: the session's facts known, the chart's pending
+    /// (unavailable on [`Scene::Selection`], which has no chart).
+    #[must_use]
+    pub fn base(scene: Scene, autoplay: Fact<bool>) -> Self {
+        Self {
+            scene,
+            autoplay,
+            chart_rank: if scene == Scene::Selection {
+                Fact::Unavailable
+            } else {
+                Fact::Pending
+            },
+        }
+    }
+
+    /// The fact `fact` as this snapshot gives it, derived.
+    fn value(&self, fact: FactId) -> Fact<FactValue> {
+        match fact {
+            FactId::Autoplay => match self.autoplay {
+                Fact::Known(b) => Fact::Known(FactValue::Bool(b)),
+                Fact::Pending => Fact::Pending,
+                Fact::Unavailable => Fact::Unavailable,
+            },
+            FactId::JudgeClass => match self.chart_rank {
+                Fact::Known(r) => Fact::Known(FactValue::Class(JudgeClass::of(r))),
+                Fact::Pending => Fact::Pending,
+                Fact::Unavailable => Fact::Unavailable,
+            },
+        }
+    }
+}
+
+/// A published fact.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FactId {
+    /// Options 32 and 33.
+    Autoplay,
+    /// Options 180 to 184.
+    JudgeClass,
+}
+
+/// A fact's derived value, as an import read it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FactValue {
+    /// [`FactId::Autoplay`]: whether autoplay is on.
+    Bool(bool),
+    /// [`FactId::JudgeClass`]: the class, or none.
+    Class(Option<JudgeClass>),
+}
+
+/// One fact an import read, with the value it read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FactRead {
+    pub fact: FactId,
+    pub value: FactValue,
+}
+
+/// What an import depends on: its scene, and each fact it read once, in
+/// first-read order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FactDeps {
+    pub scene: Scene,
+    pub reads: Vec<FactRead>,
+}
+
+impl FactDeps {
+    /// Whether a result with these dependencies fits `now`: the same
+    /// scene, and each recorded fact known there at its recorded value.
+    #[must_use]
+    pub fn holds(&self, now: &ImportFacts) -> bool {
+        now.scene == self.scene
+            && self
+                .reads
+                .iter()
+                .all(|r| now.value(r.fact) == Fact::Known(r.value))
+    }
+}
+
+/// What `option(n)` is during the configured pass, for an `n` within
+/// `i32`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OptionRead {
+    /// An id the source's factory does not know, or the scene's
+    /// constant: the value, nothing recorded.
+    Constant { value: bool, known: bool },
+    /// A published fact: the answer, and the read to record.
+    Fact { value: bool, read: FactRead },
+    /// A published fact the snapshot has pending.
+    Pending(FactId),
+    /// A published fact the snapshot has unavailable.
+    Unavailable,
+    /// A built-in that is not a published fact.
+    LiveState,
+}
+
+/// Answers `option(n)` from `facts`.
+pub(crate) fn option(facts: &ImportFacts, n: i32) -> OptionRead {
+    // `i32::MIN`'s magnitude is not an `i32`: not built in.
+    let Some(id) = n.checked_abs() else {
+        return OptionRead::Constant {
+            value: false,
+            known: false,
+        };
+    };
+    if !crate::import::ops::is_builtin(id) {
+        return OptionRead::Constant {
+            value: false,
+            known: false,
+        };
+    }
+    let negate = |b: bool| b != (n < 0);
+    let constant = |b: bool| OptionRead::Constant {
+        value: negate(b),
+        known: true,
+    };
+    let fact = match id {
+        AUTOPLAY_OFF | AUTOPLAY_ON if facts.scene != Scene::Play => return constant(false),
+        COURSE_MODE => return constant(false),
+        AUTOPLAY_OFF | AUTOPLAY_ON => FactId::Autoplay,
+        _ if JudgeClass::of_option(id).is_some() => FactId::JudgeClass,
+        _ => return OptionRead::LiveState,
+    };
+    match facts.value(fact) {
+        Fact::Known(value) => {
+            let on = match value {
+                FactValue::Bool(on) => on == (id == AUTOPLAY_ON),
+                FactValue::Class(c) => c.is_some() && c == JudgeClass::of_option(id),
+            };
+            OptionRead::Fact {
+                value: negate(on),
+                read: FactRead { fact, value },
+            }
+        }
+        Fact::Pending => OptionRead::Pending(fact),
+        Fact::Unavailable => OptionRead::Unavailable,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ChartRank, Fact, ImportFacts, OptionRead, Scene, option};
+
+    #[test]
+    fn the_scene_s_constants_hold_off_play() {
+        // Autoplay is false off the play scene, whatever the snapshot.
+        let mut f = ImportFacts::unavailable(Scene::Result);
+        f.autoplay = Fact::Known(true);
+        for (n, value) in [(33, false), (-33, true), (32, false), (-290, true)] {
+            assert_eq!(
+                option(&f, n),
+                OptionRead::Constant { value, known: true },
+                "{n}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_defexrank_below_10_percent_has_no_class() {
+        assert_eq!(super::JudgeClass::of(ChartRank::DefExRankMilli(-1)), None);
+        assert_eq!(
+            super::JudgeClass::of(ChartRank::DefExRankMilli(2_000)),
+            None
+        );
+    }
+}

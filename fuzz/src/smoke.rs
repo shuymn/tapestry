@@ -1058,8 +1058,13 @@ for k = 1, 5000 do
   skin.destination[k] = { id = \"i\", draw = function() return ms.number(425) > 0 end, dst = { { w = 10, h = 10 } } }
 end
 return skin";
-    let (_, imported) = skin_lua(entry.as_bytes()).unwrap();
-    let i = imported.unwrap();
+    let input = [
+        &[seeds::LUA_AUTOPLAY_OFF, seeds::LUA_RANK_2],
+        entry.as_bytes(),
+    ]
+    .concat();
+    let (_, imported) = skin_lua(&input).unwrap();
+    let i = imported_lua(imported).unwrap();
     assert_eq!(i.callbacks.len(), 5_000);
     assert!(
         i.callbacks
@@ -1067,6 +1072,16 @@ return skin";
             .all(|d| matches!(d, Disposition::Replaced(_)))
     );
     assert!(i.imported.report.suppressed > 0);
+}
+
+/// A `skin_lua` result that is not pending.
+fn imported_lua(
+    r: Result<skin_beatoraja::LuaOutcome, ImportError>,
+) -> Result<skin_beatoraja::LuaImported, ImportError> {
+    match r? {
+        skin_beatoraja::LuaOutcome::Imported(i) => Ok(i),
+        skin_beatoraja::LuaOutcome::Pending(p) => panic!("pending: {p:?}"),
+    }
 }
 
 #[test]
@@ -1083,6 +1098,7 @@ fn skin_lua_seeds_import_or_fail_as_built() {
             "modules",
             "isolation",
             "callback_lowered",
+            "facts",
             "callback_replaced",
             "callback_effect",
             "host_write",
@@ -1104,10 +1120,10 @@ fn skin_lua_seeds_import_or_fail_as_built() {
         assert!(data.len() <= 64 * 1_024, "{name}: {} bytes", data.len());
         let result = skin_lua(&data);
         match name {
-            "data_only" | "config" | "config_local" | "modules" | "isolation" => {
+            "data_only" | "config" | "config_local" | "modules" | "isolation" | "facts" => {
                 let (h, imported) = result.unwrap_or_else(|e| panic!("{name}: {e}"));
                 assert_eq!(h.options.len(), 1, "{name}");
-                let i = imported.unwrap_or_else(|e| panic!("{name}: {e:?}"));
+                let i = imported_lua(imported).unwrap_or_else(|e| panic!("{name}: {e:?}"));
                 assert!(i.imported.report.usage.elements >= 1, "{name}");
                 if name == "modules" {
                     assert_eq!(
@@ -1120,7 +1136,7 @@ fn skin_lua_seeds_import_or_fail_as_built() {
             "callback_lowered" | "callback_replaced" => {
                 use skin_beatoraja::lua::Disposition;
                 let (_, imported) = result.unwrap_or_else(|e| panic!("{name}: {e}"));
-                let i = imported.unwrap_or_else(|e| panic!("{name}: {e:?}"));
+                let i = imported_lua(imported).unwrap_or_else(|e| panic!("{name}: {e:?}"));
                 let want: &[Disposition] = match name {
                     "callback_lowered" => &[Disposition::Lowered, Disposition::Lowered],
                     _ => &[Disposition::Replaced(
@@ -1131,7 +1147,7 @@ fn skin_lua_seeds_import_or_fail_as_built() {
             }
             "callback_effect" | "host_write" => {
                 let (_, imported) = result.unwrap_or_else(|e| panic!("{name}: {e}"));
-                let e = imported.expect_err(name);
+                let e = imported_lua(imported).expect_err(name);
                 let want = match name {
                     "callback_effect" => LuaWhy::Effect(
                         skin_beatoraja::lua::Unsupported::Construct("call statement"),

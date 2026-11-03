@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 use mlua::Lua;
 
 use super::LuaWhy;
+use super::facts::FactId;
 use super::limits::{
     INSTRUCTION_STEP, MAX_HOST_CALLS, MAX_INSTRUCTIONS, MAX_LUA_TIME, MAX_NATIVE_WORK,
 };
@@ -103,10 +104,25 @@ impl fmt::Display for Fatal {
 
 impl std::error::Error for Fatal {}
 
+/// Why a pass stopped before its end: a fault, or a read of a fact the
+/// snapshot has pending ([`super::facts::Fact::Pending`]), which ends the
+/// import with a pending result rather than a refusal.
+#[derive(Debug)]
+pub(crate) enum Stop {
+    Fault(ImportError),
+    Pending(FactId),
+}
+
+impl From<ImportError> for Stop {
+    fn from(e: ImportError) -> Self {
+        Self::Fault(e)
+    }
+}
+
 /// One pass's accounting.
 pub(crate) struct Ledger {
     counts: Cell<Counts>,
-    fault: RefCell<Option<ImportError>>,
+    fault: RefCell<Option<Stop>>,
     faulted: Cell<bool>,
     cancel: Cancel,
     /// The time the candidate's earlier passes ran, and when this one
@@ -160,16 +176,27 @@ impl Ledger {
         self.faulted.get()
     }
 
-    /// The recorded fault, taken.
-    pub(crate) fn take_fault(&self) -> Option<ImportError> {
+    /// The recorded stop, taken.
+    pub(crate) fn take_stop(&self) -> Option<Stop> {
         self.fault.borrow_mut().take()
     }
 
-    /// Records `e` unless a fault is already recorded, and returns the
+    /// Records `e` unless a stop is already recorded, and returns the
     /// error that raises it in Lua.
     pub(crate) fn fail(&self, e: ImportError) -> mlua::Error {
+        self.stop(Stop::Fault(e))
+    }
+
+    /// Stops the pass at a read of pending fact `fact` by the fatal path,
+    /// so that the skin cannot catch it, unless a stop is already
+    /// recorded.
+    pub(crate) fn pending(&self, fact: FactId) -> mlua::Error {
+        self.stop(Stop::Pending(fact))
+    }
+
+    fn stop(&self, stop: Stop) -> mlua::Error {
         if !self.faulted.replace(true) {
-            *self.fault.borrow_mut() = Some(e);
+            *self.fault.borrow_mut() = Some(stop);
         }
         mlua::Error::external(Fatal)
     }
@@ -313,8 +340,10 @@ mod tests {
         cancel.cancel();
         assert!(ledger2.check(&lua).is_err());
         for l in [&ledger, &ledger2] {
-            match l.take_fault() {
-                Some(ImportError::Lua { why, .. }) => assert_eq!(why, LuaWhy::Finalizer),
+            match l.take_stop() {
+                Some(super::Stop::Fault(ImportError::Lua { why, .. })) => {
+                    assert_eq!(why, LuaWhy::Finalizer)
+                }
                 other => panic!("{other:?}"),
             }
         }

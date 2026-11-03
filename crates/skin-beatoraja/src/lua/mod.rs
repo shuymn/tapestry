@@ -41,6 +41,7 @@ pub(crate) mod callback;
 mod callback_tests;
 mod config;
 mod convert;
+pub mod facts;
 mod host;
 mod instrument;
 mod ledger;
@@ -68,9 +69,12 @@ use skin_model::{FileId, Root};
 pub use self::callback::Disposition;
 use self::config::Bridge;
 pub use self::convert::MAX_CONVERTED_BYTES;
+pub use self::facts::{
+    ChartRank, Fact, FactDeps, FactId, FactRead, FactValue, ImportFacts, JudgeClass, Scene,
+};
 pub use self::host::HOST_APIS;
 pub use self::ledger::{Cancel, LuaUsage};
-use self::ledger::{Counts, Ledger};
+use self::ledger::{Counts, Ledger, Stop};
 pub(crate) use self::loader::Store;
 use self::sandbox::host;
 use crate::error::{ImportError, Loc};
@@ -155,6 +159,13 @@ pub enum LuaWhy {
     /// A host API function called during import, by its index in
     /// [`HOST_APIS`]: there is no play state to read.
     LiveState { api: u16 },
+    /// A read of an import fact the snapshot has as unavailable
+    /// ([`facts::Fact::Unavailable`]), by host API and id.
+    Unavailable { api: u16, id: i32 },
+    /// A host API's argument that is not a Lua integer within `i32`.
+    FactArgument,
+    /// The snapshot's scene is not the scene of the skin's kind.
+    Scene,
     /// The entry returned no table.
     Returned,
     /// A table key that is neither a string nor an integer, or a table the
@@ -258,6 +269,15 @@ impl fmt::Display for LuaWhy {
                     .unwrap_or(("", ""));
                 write!(f, "{m}.{n} reads play state during import")
             }
+            Self::Unavailable { api, id } => {
+                let (m, n) = HOST_APIS
+                    .get(usize::from(*api))
+                    .copied()
+                    .unwrap_or(("", ""));
+                write!(f, "{m}.{n}({id}) reads a fact this scene cannot give")
+            }
+            Self::FactArgument => f.write_str("a host API's argument is not an integer id"),
+            Self::Scene => f.write_str("the skin is imported for another scene"),
             Self::Returned => f.write_str("the skin returned no table"),
             Self::Key => f.write_str("a table key that is not a string or an integer"),
             Self::Mixed => f.write_str("a table with string and integer keys"),
@@ -307,6 +327,13 @@ pub(crate) struct Pass {
     handled: Cell<u64>,
     last_error: RefCell<Option<Loc>>,
     bridge: Option<Bridge>,
+    /// The configured pass's import facts, and the facts it read once
+    /// each, in first-read order.
+    facts: Option<ImportFacts>,
+    reads: RefCell<Vec<FactRead>>,
+    /// The fact reads by allowlisted label, for the report.
+    #[cfg(feature = "dev-tools")]
+    fact_counts: RefCell<std::collections::BTreeMap<String, u32>>,
     /// The configured pass's chunks by identity, and the parsed files
     /// that have constructors, in the order they were parsed.
     parsed: RefCell<HashMap<FileId, Chunk>>,
@@ -338,8 +365,9 @@ impl Pass {
         counts: Counts,
         spent: Duration,
         cancel: &Cancel,
-        bridge: Option<Bridge>,
+        bridge: Option<(Bridge, ImportFacts)>,
     ) -> Self {
+        let (bridge, facts) = bridge.unzip();
         let entry_dir = entry
             .rsplit_once(['/', '\\'])
             .map_or(String::new(), |(d, _)| d.to_owned());
@@ -357,6 +385,10 @@ impl Pass {
             handled: Cell::new(0),
             last_error: RefCell::new(None),
             bridge,
+            facts,
+            reads: RefCell::new(Vec::new()),
+            #[cfg(feature = "dev-tools")]
+            fact_counts: RefCell::new(std::collections::BTreeMap::new()),
             parsed: RefCell::new(HashMap::new()),
             files: RefCell::new(Vec::new()),
             rewritten: Cell::new(0),
@@ -397,6 +429,23 @@ impl Pass {
     fn last_error(&self) -> Option<Loc> {
         self.last_error.borrow().clone()
     }
+
+    /// Records the read `read` unless its fact was read before.
+    fn read_fact(&self, read: FactRead) {
+        let mut reads = self.reads.borrow_mut();
+        if !reads.iter().any(|r| r.fact == read.fact) {
+            reads.push(read);
+        }
+    }
+
+    /// Counts one fact read under `label`, for the report.
+    #[cfg(feature = "dev-tools")]
+    fn count_fact(&self, label: impl FnOnce() -> String) {
+        *self.fact_counts.borrow_mut().entry(label()).or_default() += 1;
+    }
+
+    #[cfg(not(feature = "dev-tools"))]
+    fn count_fact(&self, _: impl FnOnce() -> String) {}
 
     fn host_api(&self, addr: usize, api: u16) {
         self.hosts.borrow_mut().insert(addr, api);
@@ -481,6 +530,32 @@ pub struct LuaImported {
     /// What became of each function the configured definition holds, in
     /// conversion order.
     pub callbacks: Vec<Disposition>,
+    /// The scene it was imported for and the facts it read.
+    pub facts: FactDeps,
+}
+
+/// A configured pass that reached a fact its snapshot has pending: what
+/// it read before, the fact, and the files and usage so far, with no
+/// definition.
+#[derive(Debug)]
+pub struct LuaPending {
+    /// The scene and the facts read before the pending one.
+    pub facts: FactDeps,
+    pub pending: FactId,
+    /// Every source file the passes consulted, the entry first.
+    pub dependencies: Vec<String>,
+    pub usage: LuaUsage,
+}
+
+/// What [`LuaHeader::import`] gives for a snapshot.
+#[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "one outcome an import, moved to its caller once"
+)]
+pub enum LuaOutcome {
+    Imported(LuaImported),
+    Pending(LuaPending),
 }
 
 /// One pass's outcome: the converted table, and the files it loaded.
@@ -499,8 +574,14 @@ fn pass(
     store: Store,
     (counts, spent): (Counts, Duration),
     cancel: &Cancel,
-    bridge: Option<Bridge>,
-) -> (Result<Converted, ImportError>, Store, Counts, Duration) {
+    bridge: Option<(Bridge, ImportFacts)>,
+) -> (
+    Result<Converted, Stop>,
+    Store,
+    Counts,
+    Duration,
+    Vec<FactRead>,
+) {
     #[cfg(test)]
     tests::pass_witness();
     let pass = Rc::new(Pass::new(root, entry, store, counts, spent, cancel, bridge));
@@ -508,24 +589,31 @@ fn pass(
     let counts = pass.ledger.counts();
     let spent = pass.ledger.spent();
     let store = pass.store.replace(Store::default());
+    let reads = pass.reads.take();
     #[cfg(feature = "dev-tools")]
-    LAST_TIMINGS.with(|t| t.set(pass.timings.get()));
-    (r, store, counts, spent)
+    {
+        LAST_TIMINGS.with(|t| t.set(pass.timings.get()));
+        LAST_FACTS.with(|f| f.replace(pass.fact_counts.take()));
+    }
+    (r, store, counts, spent, reads)
 }
 
 #[cfg(feature = "dev-tools")]
 thread_local! {
     /// The stages of this thread's last pass.
     static LAST_TIMINGS: Cell<Timings> = Cell::new(Timings::default());
+    /// The fact reads of this thread's last pass, by label.
+    pub(crate) static LAST_FACTS: RefCell<std::collections::BTreeMap<String, u32>> =
+        const { RefCell::new(std::collections::BTreeMap::new()) };
 }
 
 /// [`pass`]'s work: the VM lives only inside.
-fn run_pass(pass: &Rc<Pass>, entry: &str) -> Result<Converted, ImportError> {
+fn run_pass(pass: &Rc<Pass>, entry: &str) -> Result<Converted, Stop> {
     if pass.ledger.cancelled() {
-        return Err(ImportError::Lua {
+        return Err(Stop::Fault(ImportError::Lua {
             at: None,
             why: LuaWhy::Cancelled,
-        });
+        }));
     }
     #[cfg(feature = "dev-tools")]
     let start = std::time::Instant::now();
@@ -559,30 +647,32 @@ fn run_pass(pass: &Rc<Pass>, entry: &str) -> Result<Converted, ImportError> {
         });
         converted
     });
-    if let Some(fault) = pass.ledger.take_fault() {
-        return Err(fault);
+    if let Some(stop) = pass.ledger.take_stop() {
+        return Err(stop);
     }
     match r.and_then(|r| r) {
-        Ok(converted) => converted,
-        Err(mlua::Error::MemoryError(_)) => Err(ImportError::Lua {
+        Ok(converted) => converted.map_err(Stop::Fault),
+        Err(mlua::Error::MemoryError(_)) => Err(Stop::Fault(ImportError::Lua {
             at: None,
             why: LuaWhy::Limit(LuaLimit::Memory),
-        }),
-        Err(_) => Err(ImportError::Lua {
+        })),
+        Err(_) => Err(Stop::Fault(ImportError::Lua {
             at: None,
             why: LuaWhy::Error,
-        }),
+        })),
     }
 }
 
 /// A stage's result at the candidate boundary with what the candidate
 /// used and consulted so far, kept whether or not it succeeded.
-pub(crate) struct Outcome<T> {
-    pub(crate) result: Result<T, ImportError>,
+pub(crate) struct Outcome<T, E = ImportError> {
+    pub(crate) result: Result<T, E>,
     pub(crate) counts: Counts,
     pub(crate) dependencies: Vec<String>,
     /// What became of each callable of the configured definition.
     pub(crate) callbacks: Vec<callback::Disposition>,
+    /// The facts the configured pass read, however far it got.
+    pub(crate) reads: Vec<FactRead>,
 }
 
 /// The header pass, with its metadata.
@@ -599,10 +689,11 @@ pub(crate) fn header_pass(root: &Path, entry: &str, cancel: &Cancel) -> Outcome<
                 counts: Counts::default(),
                 dependencies: Vec::new(),
                 callbacks: Vec::new(),
+                reads: Vec::new(),
             };
         }
     };
-    let (r, mut store, mut counts, spent) = pass(
+    let (r, mut store, mut counts, spent, _) = pass(
         &root,
         entry,
         Store::default(),
@@ -618,7 +709,12 @@ pub(crate) fn header_pass(root: &Path, entry: &str, cancel: &Cancel) -> Outcome<
             store = common_reads(&mut def, &mut counts);
             header
         }
-        Err(e) => Err(e),
+        Err(Stop::Fault(e)) => Err(e),
+        // The header pass has no facts, so it never reads a pending one.
+        Err(Stop::Pending(_)) => Err(ImportError::Lua {
+            at: None,
+            why: LuaWhy::Error,
+        }),
     };
     let dependencies = store.dependencies.clone();
     Outcome {
@@ -633,6 +729,7 @@ pub(crate) fn header_pass(root: &Path, entry: &str, cancel: &Cancel) -> Outcome<
         counts,
         dependencies,
         callbacks: Vec::new(),
+        reads: Vec::new(),
     }
 }
 
@@ -701,32 +798,71 @@ impl LuaHeader {
         &self.store.dependencies
     }
 
-    /// Runs the configured pass with `config` and imports the table it
-    /// returns. It starts from the header pass's state each time.
+    /// Runs the configured pass with `config` against the import facts
+    /// `facts` and imports the table it returns. It starts from the header
+    /// pass's state each time. A read of a fact `facts` has pending ends
+    /// it with [`LuaOutcome::Pending`].
     ///
     /// # Errors
     ///
-    /// What [`read_lua_header`] refuses, and what [`crate::import`]
-    /// refuses of the converted definition.
-    pub fn import(&self, config: &Config, cancel: &Cancel) -> Result<LuaImported, ImportError> {
-        let o = self.complete(config, cancel);
-        o.result.map(|imported| LuaImported {
-            imported,
-            dependencies: o.dependencies,
-            usage: o.counts,
-            callbacks: o.callbacks,
-        })
+    /// What [`read_lua_header`] refuses; a snapshot of another scene than
+    /// the skin's kind ([`LuaWhy::Scene`]), a fact it has unavailable
+    /// ([`LuaWhy::Unavailable`]) or a bad id ([`LuaWhy::FactArgument`]);
+    /// and what [`crate::import`] refuses of the converted definition.
+    pub fn import(
+        &self,
+        config: &Config,
+        facts: &ImportFacts,
+        cancel: &Cancel,
+    ) -> Result<LuaOutcome, ImportError> {
+        let o = self.complete(config, facts, cancel);
+        let deps = FactDeps {
+            scene: facts.scene,
+            reads: o.reads,
+        };
+        match o.result {
+            Ok(imported) => Ok(LuaOutcome::Imported(LuaImported {
+                imported,
+                dependencies: o.dependencies,
+                usage: o.counts,
+                callbacks: o.callbacks,
+                facts: deps,
+            })),
+            Err(Stop::Pending(pending)) => Ok(LuaOutcome::Pending(LuaPending {
+                facts: deps,
+                pending,
+                dependencies: o.dependencies,
+                usage: o.counts,
+            })),
+            Err(Stop::Fault(e)) => Err(e),
+        }
     }
 
-    /// Runs the configured pass with `config` and imports its table, as
-    /// [`Self::import`] does, and returns how long each stage took.
+    /// Runs the configured pass with `config` and `facts` and imports its
+    /// table, as [`Self::import`] does, and returns how long each stage
+    /// took.
     ///
     /// # Errors
     ///
-    /// What [`Self::import`] refuses.
+    /// What [`Self::import`] refuses; a pending fact refuses with
+    /// [`LuaWhy::Error`].
     #[cfg(feature = "dev-tools")]
-    pub fn timed(&self, config: &Config, cancel: &Cancel) -> Result<Timings, ImportError> {
-        let mut def = self.configured(config, cancel).0?;
+    pub fn timed(
+        &self,
+        config: &Config,
+        facts: &ImportFacts,
+        cancel: &Cancel,
+    ) -> Result<Timings, ImportError> {
+        let mut def = self
+            .configured(config, facts, cancel)
+            .0
+            .map_err(|s| match s {
+                Stop::Fault(e) => e,
+                Stop::Pending(_) => ImportError::Lua {
+                    at: None,
+                    why: LuaWhy::Error,
+                },
+            })?;
         callback::admit(&def.arena)?;
         let mut t = LAST_TIMINGS.with(Cell::get);
         let start = std::time::Instant::now();
@@ -737,20 +873,26 @@ impl LuaHeader {
 
     /// The configured pass and the common import, with the candidate's
     /// metadata kept on every outcome.
-    pub(crate) fn complete(&self, config: &Config, cancel: &Cancel) -> Outcome<Imported> {
-        let (def, counts, store) = self.configured(config, cancel);
-        self.finish(def, counts, store, config)
+    pub(crate) fn complete(
+        &self,
+        config: &Config,
+        facts: &ImportFacts,
+        cancel: &Cancel,
+    ) -> Outcome<Imported, Stop> {
+        let (def, counts, store, reads) = self.configured(config, facts, cancel);
+        self.finish(def, counts, store, reads, config)
     }
 
     /// The common import of a configured pass's outcome, with the
     /// candidate's metadata kept on every outcome.
     pub(crate) fn finish(
         &self,
-        def: Result<Definition, ImportError>,
+        def: Result<Definition, Stop>,
         mut counts: Counts,
         mut store: Store,
+        reads: Vec<FactRead>,
         config: &Config,
-    ) -> Outcome<Imported> {
+    ) -> Outcome<Imported, Stop> {
         let mut callbacks = Vec::new();
         let result = def.and_then(|mut def| {
             let r =
@@ -761,40 +903,58 @@ impl LuaHeader {
                 counts.analysis_work = an.work.get();
                 callbacks = an.outcomes.borrow().clone();
             }
-            r
+            r.map_err(Stop::Fault)
         });
         Outcome {
             result,
             counts,
             dependencies: store.dependencies,
             callbacks,
+            reads,
         }
     }
 
     /// The configured pass: the converted definition, holding the
-    /// candidate's snapshots, and its usage; on failure, the error with the
-    /// usage and the snapshots so far.
+    /// candidate's snapshots, its usage and the facts it read; on failure
+    /// or a pending fact, the stop with the usage, the snapshots and the
+    /// facts read so far. A snapshot of another scene than the skin's
+    /// kind refuses before any Lua runs: every skin imported is a play
+    /// skin.
     pub(crate) fn configured(
         &self,
         config: &Config,
+        facts: &ImportFacts,
         cancel: &Cancel,
-    ) -> (Result<Definition, ImportError>, Counts, Store) {
+    ) -> (Result<Definition, Stop>, Counts, Store, Vec<FactRead>) {
+        if facts.scene != Scene::Play {
+            let e = ImportError::Lua {
+                at: None,
+                why: LuaWhy::Scene,
+            };
+            return (
+                Err(Stop::Fault(e)),
+                self.counts,
+                self.store.clone(),
+                Vec::new(),
+            );
+        }
         let bridge = Bridge::new(&self.header, config);
-        let (r, store, counts, _) = pass(
+        let (r, store, counts, _, reads) = pass(
             &self.root,
             &self.entry,
             self.store.clone(),
             (self.counts, self.spent),
             cancel,
-            Some(bridge),
+            Some((bridge, *facts)),
         );
         match r {
             Ok(converted) => (
                 Ok(definition(&self.root, converted, counts, store, cancel)),
                 counts,
                 Store::default(),
+                reads,
             ),
-            Err(e) => (Err(e), counts, store),
+            Err(e) => (Err(e), counts, store, reads),
         }
     }
 }

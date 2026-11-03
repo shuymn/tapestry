@@ -20,8 +20,9 @@ use input::raw;
 use replay::{DecodeError, DecodeLimits, FORMAT_VERSION, MAGIC, PlayRecord};
 use rules::{CanonicalError, RulePreset};
 use skin_beatoraja::{
-    Cancel, Config, DeviationId, Header, ImportError, Imported, LuaImported, LuaUsage,
-    NoteFallback, NoteKind, SIZES, Severity, import, read_header, read_lua_header, resolve,
+    Cancel, ChartRank, Config, DeviationId, Fact, FactDeps, Header, ImportError, ImportFacts,
+    Imported, LuaImported, LuaOutcome, LuaUsage, NoteFallback, NoteKind, SIZES, Scene, Severity,
+    import, read_header, read_lua_header, resolve,
 };
 use skin_model::{FntError, FntFile, FntLimits};
 
@@ -2006,16 +2007,19 @@ fn check_lua(usage: &LuaUsage, dependencies: &[String]) {
     }
 }
 
-/// Target `skin_lua`: Lua files separated by NUL bytes, at most
-/// [`LUA_FILES`]`.len()` of them, written to a temporary skin folder under
-/// those names (beside `strip.png` and `grid.png`; a file outside the
-/// folder is there to be refused). The header pass runs once
-/// ([`read_lua_header`]); its header must be within its caps. The
-/// configured pass then runs with the header's defaults, twice, which must
-/// give the same outcome (the passes share no Lua state), and once with
-/// each option's last item. Every candidate's use of the sandbox must be
-/// within its caps and consult only the folder's files; an imported skin's
-/// counters must be within the model's caps, and it is drawn ([`draw`]).
+/// Target `skin_lua`: two bytes of import facts ([`lua_facts`]), then Lua
+/// files separated by NUL bytes, at most [`LUA_FILES`]`.len()` of them,
+/// written to a temporary skin folder under those names (beside
+/// `strip.png` and `grid.png`; a file outside the folder is there to be
+/// refused). The header pass runs once ([`read_lua_header`]); its header
+/// must be within its caps. The configured pass then runs against that
+/// snapshot with the header's defaults, twice, which must give the same
+/// outcome (the passes share no Lua state), and once with each option's
+/// last item. Every candidate's use of the sandbox must be within its caps
+/// and consult only the folder's files; an imported or pending result's
+/// facts must hold for its snapshot, each fact recorded once; an imported
+/// skin's counters must be within the model's caps, and it is drawn
+/// ([`draw`]).
 ///
 /// # Errors
 ///
@@ -2025,12 +2029,16 @@ fn check_lua(usage: &LuaUsage, dependencies: &[String]) {
 ///
 /// If a bound above is broken, the two runs of one configuration differ,
 /// or [`draw`] panics.
-pub fn skin_lua(data: &[u8]) -> Result<(Header, Result<LuaImported, ImportError>), ImportError> {
+pub fn skin_lua(data: &[u8]) -> Result<(Header, Result<LuaOutcome, ImportError>), ImportError> {
     static FOLDER: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _owned = FOLDER
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = lua_dir().join("skin");
+    let (facts, data) = match data {
+        [a, r, rest @ ..] => (lua_facts(*a, *r), rest),
+        _ => (ImportFacts::unavailable(Scene::Play), data),
+    };
     let mut parts = data.splitn(LUA_FILES.len(), |&b| b == 0);
     for name in LUA_FILES {
         let path = dir.join(name);
@@ -2049,12 +2057,21 @@ pub fn skin_lua(data: &[u8]) -> Result<(Header, Result<LuaImported, ImportError>
     check_lua(&h.usage(), h.dependencies());
     let defaults = Config::defaults(h.header());
     let outcome = |config: &Config| {
-        let r = h.import(config, &cancel);
+        let r = h.import(config, &facts, &cancel);
         match &r {
-            Ok(i) => {
+            Ok(LuaOutcome::Imported(i)) => {
                 check_lua(&i.usage, &i.dependencies);
                 check_usage(&i.imported);
                 check_callbacks(i);
+                check_facts(&i.facts, &facts);
+            }
+            Ok(LuaOutcome::Pending(p)) => {
+                check_lua(&p.usage, &p.dependencies);
+                check_facts(&p.facts, &facts);
+                assert!(
+                    p.facts.reads.iter().all(|r| r.fact != p.pending),
+                    "a pending fact among the reads"
+                );
             }
             Err(e) => {
                 black_box(e.to_string());
@@ -2065,7 +2082,7 @@ pub fn skin_lua(data: &[u8]) -> Result<(Header, Result<LuaImported, ImportError>
     // A refusal at the Lua time cap depends on the clock: it is not
     // compared, and the input is not run again (each import starts from
     // the header pass's time).
-    let timed = |r: &Result<LuaImported, ImportError>| {
+    let timed = |r: &Result<LuaOutcome, ImportError>| {
         matches!(
             r,
             Err(ImportError::Lua {
@@ -2083,7 +2100,7 @@ pub fn skin_lua(data: &[u8]) -> Result<(Header, Result<LuaImported, ImportError>
         return Ok((h.header().clone(), first));
     }
     match (&first, &again) {
-        (Ok(a), Ok(b)) => {
+        (Ok(LuaOutcome::Imported(a)), Ok(LuaOutcome::Imported(b))) => {
             assert_eq!(
                 a.imported.report, b.imported.report,
                 "a run changed the next"
@@ -2093,15 +2110,67 @@ pub fn skin_lua(data: &[u8]) -> Result<(Header, Result<LuaImported, ImportError>
                 a.dependencies, b.dependencies,
                 "a run changed the next's files"
             );
+            assert_eq!(a.facts, b.facts, "a run changed the next's facts");
+        }
+        (Ok(LuaOutcome::Pending(a)), Ok(LuaOutcome::Pending(b))) => {
+            assert_eq!(
+                (&a.facts, a.pending, a.usage, &a.dependencies),
+                (&b.facts, b.pending, b.usage, &b.dependencies),
+                "a run changed the next"
+            );
         }
         (Err(a), Err(b)) => assert_eq!(a.to_string(), b.to_string(), "a run changed the next"),
         _ => panic!("two runs of one configuration differ"),
     }
     let _ = outcome(&last_items(h.header()));
-    if let Ok(i) = &first {
+    if let Ok(LuaOutcome::Imported(i)) = &first {
         black_box(draw(&i.imported, data));
     }
     Ok((h.header().clone(), first))
+}
+
+/// The play snapshot of a `skin_lua` input's first two bytes: autoplay
+/// unavailable, off, on or pending by `a` modulo 4, on a result scene
+/// for 255; the chart's rank unavailable, pending, a `#RANK` from -8 to
+/// 55 or a `#DEFEXRANK` from 0 to 315 % in steps of 5 % by `r`'s low two
+/// bits and the rest.
+#[must_use]
+pub fn lua_facts(a: u8, r: u8) -> ImportFacts {
+    let scene = if a == u8::MAX {
+        Scene::Result
+    } else {
+        Scene::Play
+    };
+    let autoplay = match a % 4 {
+        0 => Fact::Unavailable,
+        1 => Fact::Known(false),
+        2 => Fact::Known(true),
+        _ => Fact::Pending,
+    };
+    let v = r >> 2;
+    let chart_rank = match r % 4 {
+        0 => Fact::Unavailable,
+        1 => Fact::Pending,
+        2 => Fact::Known(ChartRank::Rank(i32::from(v) - 8)),
+        _ => Fact::Known(ChartRank::DefExRankMilli(i64::from(v) * 5_000)),
+    };
+    ImportFacts {
+        scene,
+        autoplay,
+        chart_rank,
+    }
+}
+
+/// A result's recorded facts hold for the snapshot it read them from,
+/// each fact once.
+fn check_facts(deps: &FactDeps, facts: &ImportFacts) {
+    assert!(deps.holds(facts), "a result does not hold for its snapshot");
+    for (i, r) in deps.reads.iter().enumerate() {
+        assert!(
+            deps.reads.iter().skip(i + 1).all(|o| o.fact != r.fact),
+            "a fact recorded twice"
+        );
+    }
 }
 
 /// A candidate that imports was refused at none of its callbacks and
