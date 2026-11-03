@@ -1044,6 +1044,7 @@ fn an_inconsistent_snapshot_poisons_the_play() {
             input: &eval::InputFacts::NONE,
             complete: false,
             playing: true,
+            closing: None,
             target: h.target,
             layout: &layout,
             lanes: h.view,

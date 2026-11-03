@@ -1158,7 +1158,7 @@ impl SessionPolicy for Strict {
         GaugeIndex(1)
     }
     fn on_survival_failure(&self) -> FailureAction {
-        FailureAction::EndPlay
+        FailureAction::Close
     }
 }
 
@@ -1229,11 +1229,19 @@ fn default_policy_shows_the_chosen_gauge_or_the_first() {
         2
     ];
     assert_eq!(
-        DefaultPolicy { displayed: 1 }.displayed_gauge(&gauges),
+        DefaultPolicy {
+            displayed: 1,
+            on_failure: FailureAction::Close,
+        }
+        .displayed_gauge(&gauges),
         GaugeIndex(1)
     );
     assert_eq!(
-        DefaultPolicy { displayed: 2 }.displayed_gauge(&gauges),
+        DefaultPolicy {
+            displayed: 2,
+            on_failure: FailureAction::Close,
+        }
+        .displayed_gauge(&gauges),
         GaugeIndex(0)
     );
 }
@@ -1386,7 +1394,7 @@ fn passthrough_transform_is_recorded() {
             version: 1
         }
     );
-    assert_eq!(rec.session_policy, "default");
+    assert_eq!(rec.session_policy, "close-on-failure");
     assert_eq!(rec.chart.random_seed, 7);
     let sha: [u8; 32] = sha2::Sha256::digest(&bytes).into();
     assert_eq!(rec.chart.identity.sha256, sha);

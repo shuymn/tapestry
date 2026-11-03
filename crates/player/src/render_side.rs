@@ -7215,6 +7215,131 @@ pub(crate) mod tests {
         assert!(frames.iter().all(|&(_, p)| p == playing));
     }
 
+    /// Each play frame's chart time and Closing start, as the declarative
+    /// skin's frame adapter reads them.
+    type Closings = Arc<std::sync::Mutex<Vec<(TimeUs, Option<TimeUs>, bool)>>>;
+
+    /// A screen that builds every play frame through the frame adapter,
+    /// noting its time, its Closing start and its phase.
+    struct ClosingFrames {
+        seen: Closings,
+    }
+
+    impl Screen for ClosingFrames {
+        fn load(
+            &mut self,
+            _chart: &Chart,
+            _section: Option<&eval::Section>,
+        ) -> Result<(), RenderError> {
+            Ok(())
+        }
+        fn wait(&self) -> bool {
+            true
+        }
+        fn paced(&self) -> bool {
+            false
+        }
+        fn build(&mut self, f: &FrameInput<'_>) -> Result<(), skin_model::BuildError> {
+            let frame = render::skin_frame(f);
+            self.seen
+                .lock()
+                .unwrap()
+                .push((frame.now, frame.closing, frame.playing));
+            Ok(())
+        }
+        fn draw(&mut self) -> Result<FrameTiming, RenderError> {
+            Ok(timing(true))
+        }
+        fn text(&mut self, _lines: &[&str]) -> Result<bool, RenderError> {
+            Ok(true)
+        }
+        #[cfg(feature = "dev-tools")]
+        fn read_back(&self) -> Option<(u32, u32, Vec<u8>)> {
+            None
+        }
+    }
+
+    /// Once the play enters Closing, its frames go on in play mode on the
+    /// play clock until the play's end: a positive number of them carry
+    /// Closing's start, not playing, with their time advancing.
+    #[test]
+    fn closing_frames_draw_on_the_play_clock_until_the_end() {
+        use game::DeviceSettings;
+        use input::DeviceKind;
+
+        let chart = ChartBuilder::new(120_000)
+            .tap(Lane::new(1).unwrap(), TimeUs(1_000_000))
+            .build()
+            .unwrap();
+        let rule = rules::tapestry();
+        let device = DeviceSettings::default().profile(&[DeviceKind::Keyboard], &[]);
+        let (writer, reader) = input::source_queue(8);
+        writer.publish(TimeUs(0));
+        let (mut logic, side) = Logic::<SourceReader>::new(
+            &chart,
+            &rule,
+            &device,
+            &InputStart::default(),
+            vec![reader],
+            LogicConfig {
+                inputs: 8,
+                effects: 8,
+            },
+            Vec::new(),
+        )
+        .unwrap();
+        logic.advance_to(TimeUs(1));
+        let at = TimeUs(-5_000_000);
+        logic.enter_closing(at);
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let noted = Arc::clone(&seen);
+        let make: MakeScreen = Box::new(move || {
+            Ok(Box::new(ClosingFrames {
+                seen: Arc::clone(&noted),
+            }) as Box<dyn Screen>)
+        });
+        let clock = QpcClock::start();
+        let link = spawn(
+            make,
+            Some(Arc::new(chart.clone())),
+            None,
+            clock,
+            View { effects: 8 },
+            measure(clock),
+            Box::new(NoFrames),
+        )
+        .unwrap();
+        link.send(RenderMsg::Play {
+            side,
+            gauge: 0,
+            measure: play_measure(clock.now()),
+        });
+        let closing = || {
+            seen.lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, c, _)| *c == Some(at))
+                .count()
+        };
+        assert!(wait_until(|| closing() >= 3));
+        let _ = link.finish(clock.now());
+        link.exit();
+        let frames: Vec<_> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .copied()
+            .filter(|(_, c, _)| *c == Some(at))
+            .collect();
+        assert!(frames.len() >= 3, "{frames:?}");
+        assert!(frames.iter().all(|&(_, _, playing)| !playing), "{frames:?}");
+        assert!(frames.windows(2).all(|w| w[0].0 <= w[1].0), "{frames:?}");
+        assert!(
+            frames.first().unwrap().0 < frames.last().unwrap().0,
+            "{frames:?}"
+        );
+    }
+
     /// What the [`Probe`]s of one render thread saw.
     #[derive(Debug, Default)]
     struct Probed {

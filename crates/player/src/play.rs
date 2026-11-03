@@ -140,8 +140,14 @@ pub struct PlayerRig<'a> {
     pub clock: QpcClock,
     /// What each play records.
     pub recorded: Recorded,
-    /// The gauge to show.
+    /// The gauge the settings show (`displayed_gauge`), by its index in
+    /// a play preset, never changed by an attempt: each preset resolves it
+    /// afresh, the select screen's loading gauge included
+    /// ([`loading_gauge`]).
     pub gauge: usize,
+    /// The gauge the current attempt shows, as it resolved the settings'
+    /// ([`game::Loaded::displayed`]): its loading gauge and its frames.
+    pub attempt_gauge: usize,
     /// Whether the session plays generated input (design.md "Autoplay"):
     /// no recommended input offset, and "not saved" when nothing was.
     pub autoplay: bool,
@@ -529,6 +535,9 @@ impl PlayerRig<'_> {
                 report.attempt, report.end
             ),
         }
+        if let Some(c) = &report.closing {
+            println!("{}", closing_line(c));
+        }
         match &report.saved {
             Some(Ok(r)) => println!("saved: {}", r.path.display()),
             Some(Err(e)) => eprintln!("not saved: {}", Chain(e)),
@@ -542,6 +551,22 @@ impl PlayerRig<'_> {
             self.times.retry.map_or_else(|| "-".to_owned(), ms)
         );
     }
+}
+
+/// The report's line for a play's Closing (design.md "Play Lifecycle",
+/// Closing): its start on the play clock, how long it lasted and how it
+/// ended.
+pub(crate) fn closing_line(c: &game::ClosingReport) -> String {
+    let end = match c.end {
+        game::ClosingEnd::RanOut => "ran out".to_owned(),
+        game::ClosingEnd::Retry => "retried".to_owned(),
+        game::ClosingEnd::Cut(cause) => format!("cut by {cause:?}"),
+    };
+    format!(
+        "closing: from {} us, {} us, {end}",
+        c.started_at.0,
+        c.ended_at.0.saturating_sub(c.started_at.0)
+    )
 }
 
 /// The render thread's commit of the attempt prepared: while a loading
@@ -567,6 +592,22 @@ pub(crate) fn refresh_loading_gauge(
         let gauge = shown_gauge(preset, gauge);
         render.loading().report(LoadInput::Gauge(gauge), None);
     }
+}
+
+/// The loading gauge descriptor of the gauge the settings show,
+/// `gauge`, in `preset`, before an attempt resolves it: resolved as the
+/// attempt will be ([`game::resolve_displayed`], through the player's
+/// policy), so a gauge the preset does not have shows its first from the
+/// lifetime's first frame.
+pub(crate) fn loading_gauge(
+    preset: &rules::RulePreset,
+    gauge: usize,
+) -> Option<skin_model::LoadingGauge> {
+    let policy = game::DefaultPolicy {
+        displayed: gauge,
+        on_failure: game::FailureAction::default(),
+    };
+    shown_gauge(preset, game::resolve_displayed(&policy, preset).0)
 }
 
 /// A round's restore at chart time `at`, its lead-in's start, planned on
@@ -631,7 +672,8 @@ impl Rig for PlayerRig<'_> {
         if let Some(sc) = &mut self.scenario
             && let Some(command) = until_fired(&mut sc.until, self.origin, self.clock.now())
         {
-            sc.sent = Some(command);
+            let at = TimeUs(self.clock.now().0 - self.origin.map_or(0, |o| o.0));
+            sc.sent = Some((command, at));
             self.controls.command(command.command());
         }
         #[cfg(feature = "dev-tools")]
@@ -673,6 +715,17 @@ impl Rig for PlayerRig<'_> {
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn take(&mut self) -> Option<Command> {
         let c = self.controls.take();
+        if c == Some(Command::Retry) {
+            self.pending_retry = self.controls.retry_at();
+        }
+        c
+    }
+
+    /// As [`take`](Self::take), with the quit key taken without dropping a
+    /// retry pressed with it ([`Controls::take_closing`]).
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn take_closing(&mut self) -> Option<Command> {
+        let c = self.controls.take_closing();
         if c == Some(Command::Retry) {
             self.pending_retry = self.controls.retry_at();
         }
@@ -765,13 +818,14 @@ impl Rig for PlayerRig<'_> {
     /// at the threads for a failure's cause.
     ///
     /// The loading lifetime's gauge descriptor is replaced first from the
-    /// preset the play refreshed.
+    /// preset the play refreshed, with the gauge the attempt shows.
     fn prepare_attempt(&mut self, loaded: &Loaded) -> Result<Preparation, ScreenError> {
+        self.attempt_gauge = loaded.displayed().0;
         refresh_loading_gauge(
             &self.render,
             self.loading_active(),
             loaded.preset(),
-            self.gauge,
+            self.attempt_gauge,
         );
         // The attempt attached last is the one prepared: its epoch is
         // the frames'.
@@ -1048,7 +1102,7 @@ impl Rig for PlayerRig<'_> {
         self.scenario_started();
         self.render.send(RenderMsg::Play {
             side: screen,
-            gauge: self.gauge,
+            gauge: self.attempt_gauge,
             measure: Box::new(measure),
         });
     }
@@ -1284,6 +1338,50 @@ pub(crate) fn prepare_render(
     *end_page = None;
     render.clear_end();
     render.prepare()
+}
+
+#[cfg(test)]
+mod closing_tests {
+    use bms_model::TimeUs;
+    use game::{AbortCause, ClosingEnd, ClosingReport};
+
+    use super::{closing_line, loading_gauge};
+    use crate::loading_state::shown_gauge;
+
+    /// The select screen's loading gauge resolves the settings' gauge as
+    /// the attempt does: one the preset has as itself, one it lacks as its
+    /// first.
+    #[test]
+    fn the_loading_gauge_resolves_as_the_attempt_does() {
+        let preset = rules::beatoraja_style();
+        assert!(shown_gauge(&preset, 3).is_some());
+        assert_eq!(loading_gauge(&preset, 3), shown_gauge(&preset, 3));
+        assert_eq!(shown_gauge(&preset, 99), None);
+        assert!(shown_gauge(&preset, 0).is_some());
+        assert_eq!(loading_gauge(&preset, 99), shown_gauge(&preset, 0));
+    }
+
+    /// The Closing line gives its start, its length and its end.
+    #[test]
+    fn the_closing_line_gives_start_length_and_end() {
+        let c = |end| ClosingReport {
+            started_at: TimeUs(2_584_000),
+            ended_at: TimeUs(3_584_000),
+            end,
+        };
+        assert_eq!(
+            closing_line(&c(ClosingEnd::RanOut)),
+            "closing: from 2584000 us, 1000000 us, ran out"
+        );
+        assert_eq!(
+            closing_line(&c(ClosingEnd::Retry)),
+            "closing: from 2584000 us, 1000000 us, retried"
+        );
+        assert_eq!(
+            closing_line(&c(ClosingEnd::Cut(AbortCause::Suspend))),
+            "closing: from 2584000 us, 1000000 us, cut by Suspend"
+        );
+    }
 }
 
 #[cfg(test)]

@@ -561,3 +561,64 @@ fn evaluator_refusal_is_reported() {
         Some(LogicError::Eval(EvalError::NoJudgeableNotes))
     );
 }
+
+/// A frozen step (`Logic::hold`) takes the queued input into the record
+/// and stages it, with no evaluation, emission or new watermark; over
+/// several frozen steps, input beyond the budget aborts the play
+/// (overflow) as an advance does, at the watermark the last advance
+/// finalized.
+#[test]
+fn frozen_steps_take_input_and_overflow_as_advances_do() {
+    let chart = taps(&[(1, 1_000), (2, 1_100), (3, 1_200)]);
+    let rule = rules::tapestry();
+    let dev = device(&[0]);
+    let (mut w, r) = source_queue(16);
+    w.publish(TimeUs(500_000));
+    let mut logic = logic(&chart, &rule, &dev, vec![r], budget(2));
+    assert_eq!(
+        logic.advance_to(TimeUs(501_000)).watermark,
+        Some(TimeUs(500_000))
+    );
+    let view = logic.view();
+    w.push(press(1_000_000, 0, lane(1))).unwrap();
+    w.publish(TimeUs(1_050_000));
+    let a = logic.hold();
+    assert_eq!((a.watermark, a.emitted, a.aborted), (None, 0, None));
+    assert_eq!(logic.finalized(), Some(TimeUs(500_000)));
+    assert_eq!(logic.record().events, [press(1_000_000, 0, lane(1))]);
+    assert_eq!(logic.view(), view, "nothing scored or published");
+    w.push(press(1_100_000, 0, lane(2))).unwrap();
+    w.publish(TimeUs(1_150_000));
+    assert_eq!(logic.hold().aborted, None);
+    // The budget holds two control events and the source's disconnect
+    // allowance: the third press fills it, the fourth overflows.
+    w.push(press(1_200_000, 0, lane(3))).unwrap();
+    w.push(press(1_250_000, 0, lane(3))).unwrap();
+    w.publish(TimeUs(1_300_000));
+    let a = logic.hold();
+    assert_eq!(a.aborted, Some(AbortCause::Overflow));
+    assert!(logic.overflowed());
+    assert_eq!(logic.finalized(), Some(TimeUs(500_000)));
+    assert_eq!(logic.record().finalized, Some(TimeUs(500_000)));
+}
+
+/// A frozen step finds the last source closed as an advance does: the
+/// play is aborted (last source removed) at the watermark already
+/// finalized, its tail recorded.
+#[test]
+fn a_frozen_step_finds_the_last_source_removed() {
+    let chart = taps(&[(1, 1_000)]);
+    let rule = rules::tapestry();
+    let dev = device(&[0]);
+    let (mut w, r) = source_queue(4);
+    w.publish(TimeUs(200_000));
+    let mut logic = logic(&chart, &rule, &dev, vec![r], CONFIG);
+    logic.advance_to(TimeUs(201_000));
+    assert_eq!(logic.hold().aborted, None);
+    w.push(disconnected(300_000, 0)).unwrap();
+    w.close(TimeUs(300_000));
+    let a = logic.hold();
+    assert_eq!(a.aborted, Some(AbortCause::LastSourceRemoved));
+    assert_eq!(logic.finalized(), Some(TimeUs(200_000)));
+    assert_eq!(logic.record().events, [disconnected(300_000, 0)]);
+}
