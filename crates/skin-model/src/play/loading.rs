@@ -98,7 +98,10 @@ const FIELDS: [LoadingField; field::COUNT] = {
         Unavailable, // count.late.poor
         Unavailable, // count.early.empty_poor
         Unavailable, // count.late.empty_poor
-        // The duration variants, 51 to 74: no tempo or gain while loading.
+        // The duration variants, 51 to 74: each needs a tempo (current or
+        // a reference) and `H`, and a loading frame has neither (no gain,
+        // no tempo, no presentation snapshot), so all 24 are unavailable,
+        // their validities included, which would only ever read false.
         Unavailable, // duration.current.covered.ms
         Unavailable, // duration.current.covered.green
         Unavailable, // duration.current.covered.valid
@@ -123,8 +126,13 @@ const FIELDS: [LoadingField; field::COUNT] = {
         Unavailable, // duration.max.uncovered.ms
         Unavailable, // duration.max.uncovered.green
         Unavailable, // duration.max.uncovered.valid
-        // The native block, 75 to 85: a loading frame has no presentation
-        // readouts beside the stored covers.
+        // The native block, 75 to 85: the native HUD's values come from
+        // the presentation snapshot and the lanes' gain, which no loading
+        // frame carries: no `H`, duration or target, and no mode to show
+        // as `native.floating`. The whites take the effective lift with the
+        // configured covers; they are part of that HUD, not settings, so
+        // they are unavailable too, and a loading skin reads the stored
+        // covers through the `Setting` fields above instead.
         Unavailable, // native.hispeed.x100
         Unavailable, // native.hispeed.valid
         Unavailable, // native.duration.ms
