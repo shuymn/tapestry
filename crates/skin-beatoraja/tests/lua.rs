@@ -350,9 +350,6 @@ fn the_library_runs_its_loops_as_metered_lua() {
         "table.move({}, 1.0, 2^40, 1.0)",
         "table.move({}, \"1\", \"1099511627776\", 1)",
         "local t = {}\nfor i = 1, 1e6 do table.insert(t, 1, i) end",
-        // An exhausted iterator stays exhausted: each call is a few
-        // instructions, never a rescan.
-        "local it = string.gmatch(string.rep(\"a\", 1 << 16), \"z\")\nwhile true do it() end",
     ] {
         let d = configured(body);
         assert_eq!(
@@ -437,6 +434,13 @@ fn the_library_runs_its_loops_as_metered_lua() {
         let r = import(&configured(body)).unwrap_or_else(|e| panic!("{body}: {e:?}"));
         assert!(r.usage.native_work < 1 << 20, "{body}: {:?}", r.usage);
     }
+    // An exhausted iterator stays exhausted: each later call is a few
+    // instructions, never a rescan of its subject.
+    let d = configured(
+        "local it = string.gmatch(string.rep(\"a\", 1 << 16), \"z\")\n\
+         for i = 1, 100000 do assert(it() == nil) end",
+    );
+    import(&d).unwrap();
     // The natives stay private: the strings' methods are the library's.
     let d = configured(
         "assert(getmetatable(\"\").__index == string, \"methods\")\n\
