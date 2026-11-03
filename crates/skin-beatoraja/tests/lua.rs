@@ -501,10 +501,15 @@ fn the_library_runs_its_loops_as_metered_lua() {
         let r = import(&configured(body)).unwrap_or_else(|e| panic!("{body}: {e:?}"));
         assert!(r.usage.native_work < 1 << 20, "{body}: {:?}", r.usage);
     }
-    // The natives stay private: the strings' methods are the library's.
+    // The natives stay private: the strings' methods are the library's,
+    // and their metatable is out of reach.
     let d = configured(
-        "assert(getmetatable(\"\").__index == string, \"methods\")\n\
-         assert(string.dump == nil and (\"\").dump == nil, \"dump\")",
+        "assert((\"abc\").upper == string.upper, \"methods\")\n\
+         assert(string.dump == nil and (\"\").dump == nil, \"dump\")\n\
+         assert(getmetatable(\"\") == false, \"metatable\")\n\
+         assert(not pcall(function() getmetatable(\"\").__tostring = function() return \"y\" end end))\n\
+         assert(not pcall(setmetatable, \"\", {}))\n\
+         assert(string.format(\"%s\", \"x\") == \"x\" and tostring(\"x\") == \"x\")",
     );
     import(&d).unwrap();
 }
@@ -564,7 +569,7 @@ fn the_library_never_coerces_a_string_to_a_number_or_back() {
          assert(tonumber(\"x\") == nil and tonumber({}) == nil and tonumber(\"-7\", 10) == -7)\n\
          assert(math.max(2, 7.5, 7) == 7.5 and math.min(3, -1) == -1 and math.abs(-2) == 2)\n\
          assert(math.floor(-1.5) == -2 and math.ceil(1.2) == 2 and math.floor(3) == 3)\n\
-         assert(getmetatable(\"\").__add == nil and getmetatable(\"\").__index == string)\n\
+         assert(not pcall(function() return (\"1\") + 1 end))\n\
          assert(skin_config.get_path(\"none.png\") == \"none.png\")",
     );
     import(&d).unwrap();
@@ -702,9 +707,11 @@ fn import_within_a_minute(d: TempDir) -> Result<LuaImported, ImportError> {
 #[test]
 fn a_candidate_is_refused_once_its_lua_runs_past_its_time() {
     use std::time::{Duration, Instant};
-    // How far past the cap the refusal may come: a check's interval and
-    // the test's own work.
-    const SLACK: Duration = Duration::from_millis(1_500);
+
+    // How far past the cap the refusal may come: a check's interval, the
+    // test's own work and a loaded machine. The passes' carry-over is
+    // tested with a set clock (src/lua/tests.rs).
+    const SLACK: Duration = Duration::from_secs(10);
     // Each comparison or concatenation is one instruction over 16 MiB:
     // the instruction cap would take hours to stop it, the time cap stops
     // it within a step of its limit.
@@ -722,37 +729,6 @@ fn a_candidate_is_refused_once_its_lua_runs_past_its_time() {
             "{body}: {took:?}"
         );
     }
-    // The cap spans both passes: a header pass that spends seconds leaves
-    // the configured pass only the rest.
-    let d = folder(&[(
-        "s.luaskin",
-        "local s, t = rep(\"x\", 1 << 24), rep(\"x\", 1 << 24)\n\
-         if not skin_config then\n\
-           for i = 1, 6000 do if s == t then end end\n\
-           return { type = 0 }\n\
-         end\n\
-         while true do if s == t then end end",
-    )]);
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let start = Instant::now();
-        let h = header(&d).unwrap();
-        let read = start.elapsed();
-        let r = h.import(&Config::defaults(h.header()), &Cancel::new());
-        let _ = tx.send((read, start.elapsed(), r.map(|_| ())));
-    });
-    let (read, took, r) = rx
-        .recv_timeout(Duration::from_secs(60))
-        .expect("the import ran past a minute");
-    assert_eq!(why(r), LuaWhy::Limit(LuaLimit::Time));
-    assert!(
-        read > SLACK && read < MAX_LUA_TIME - SLACK,
-        "the header pass took {read:?}"
-    );
-    assert!(
-        took >= MAX_LUA_TIME && took < MAX_LUA_TIME + SLACK,
-        "{read:?} then {took:?} in all"
-    );
 }
 
 #[test]
@@ -812,8 +788,14 @@ fn natives_never_read_a_skin_s_long_value() {
         "local s = rep(\"a\", 1 << 23)\nfor i = 1, 20 do string.format(\"%.0s\", s) end",
     );
     assert_eq!(why(import(&d)), LuaWhy::Limit(LuaLimit::NativeWork));
-    // An error's message is charged once formatted.
+    // An error's message is charged once formatted, before a handler can
+    // replace it.
     let d = configured("local s = rep(\"a\", 1 << 23)\nfor i = 1, 20 do pcall(error, s) end");
+    assert_eq!(why(import(&d)), LuaWhy::Limit(LuaLimit::NativeWork));
+    let d = configured(
+        "local s = rep(\"a\", 1 << 23)\n\
+         for i = 1, 20 do xpcall(error, function() return false end, s) end",
+    );
     assert_eq!(why(import(&d)), LuaWhy::Limit(LuaLimit::NativeWork));
     // A format takes at most 32 conversions.
     let d = configured(

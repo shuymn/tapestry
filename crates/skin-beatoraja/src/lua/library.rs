@@ -41,14 +41,14 @@
 //!
 //! | Native | Arguments | Native work | Bound | Skin code |
 //! |---|---|---|---|---|
-//! | `assert` | any | O(1): its arguments stay in place | none needed | no |
+//! | `assert` | any | O(1) when it holds, its arguments staying in place; when it fails, as `error` (the message and its position copied, O(#message)) | a caught message's length charged by the handler; an uncaught one ends the pass | no |
 //! | `getmetatable` | any | O(1) raw `__metatable` read | none needed | no |
 //! | `type` | any | O(1) | none needed | no |
 //! | `next` (and `pairs`' iterator) | table, key | a key's hash (long strings: once, cached) and a scan of empty slots, O(table capacity) | the table's capacity, held in VM memory: the one native loop over skin data, bounded by memory and not charged | no |
 //! | `pairs` | any | O(1) | none needed | `__pairs`, hooked |
 //! | `tostring` (also `%s`, `concat`'s and `gsub`'s numbers) | any | a number's digits, or `__name` (at most 64 bytes) and an address; a string is returned uncopied | `__name` over 64 bytes refused when the metatable is attached | `__tostring`, hooked |
 //! | `select` | an integer or `"#"`, values | O(1): the values stay in place | integer checked in Lua | no |
-//! | `error` | a value, an integer level | with a level, the position and the message copied, O(#message) | each caught message's length charged (`settle`); an uncaught one ends the pass | no |
+//! | `error` | a value, an integer level | with a level, the position and the message copied, O(#message) | each caught message's length charged by the handler, before the skin's runs; an uncaught one ends the pass | no |
 //! | `ipairs` | any | none: the step is Lua (`t[i]`) | integer index checked in Lua | `__index`, hooked |
 //! | `tonumber` | a string of at most 200 numeral bytes | O(200) | longer refused; base 10 parsed in Lua, any other base refused | no |
 //! | `setmetatable`, `getmetatable` (private) | a table, the Lua-made snapshot | O(1) | the snapshot copied in Lua; `__gc`, `__mode` and `__close` refused | no |
@@ -57,30 +57,38 @@
 //! | `string.char` (private) | integers in 0..255 | O(n) | at most 4 096, charged | no |
 //! | `string.upper`, `string.lower` (private) | a string | O(#s) | at most 1 MiB, charged | no |
 //! | `string.format` (private) | the checked format, its arguments | O(format + output + the bytes `%s` reads) | 32 conversions, two-digit widths and precisions, output at most 1 MiB, all charged | `__tostring`, hooked |
-//! | `table.concat` (private) | the library's own table of strings | O(output) | at most 1 MiB, charged | no |
+//! | `table.concat` (private) | the library's own table of strings | O(entries + output) | output at most 1 MiB, entries and output charged | no |
 //! | `rawget`, `rawset`, `rawlen` (private) | a plain table | O(1) amortized; a resize O(capacity) | VM memory | no |
 //! | `math.floor`, `ceil`, `abs`, `tointeger`, `math.type` (private) | a number | O(1) | number checked in Lua | no |
 //! | `table.unpack` (private, the protected calls only) | the packed results | O(n) | at most 16, within a native call's free stack | no |
 //! | `xpcall` (the protected calls' base) | the library's packer | O(1): one result | the skin's handler run only while no fault is recorded | the protected function and handler, hooked |
-//! | host: `settle`, the handlers, `charge`, `refuse`, `bridge.metatable` | the library's own values | O(1); a refusal's location looks up at most 2 048 frames, once | fatal once | no |
+//! | host: `settle`, the handlers' `note`, `charge`, `refuse`, `bridge.metatable` | the library's own values | O(1); a refusal's location looks up at most 2 048 frames, once | fatal once | no |
 //! | host: `require`, `dofile` | a name of at most 1 024 bytes, checked before it is copied | a confined read and a compilation, O(file) | 16 MiB a file, 32 MiB read in all, 1 024 loads, depth 16; 16 results | the chunk, hooked |
 //! | host: `skin_config.get_path` | a string of at most 1 024 bytes, checked in Lua and again before it is copied | a substitution, O(path) | the result at most 1 024 bytes, else nil | no |
 //! | host: the pinned module APIs | any | O(1): the fault | fatal | no |
 //! | the strings' `__index` | a key | a raw lookup in the library's `string` table | none needed | no |
 //! | VM: `..` | strings, numbers | O(result) a concatenation | each instruction at most O(VM memory), at most [`INSTRUCTION_STEP`](super::limits::INSTRUCTION_STEP) (100) instructions between checks, all of them within [`MAX_LUA_TIME`](super::limits::MAX_LUA_TIME) across the candidate's passes and [`MAX_INSTRUCTIONS`](super::limits::MAX_INSTRUCTIONS) | no |
 //! | VM: `<`, `<=`, `==` on long strings | strings | O(length) a comparison | each instruction at most O(VM memory), at most [`INSTRUCTION_STEP`](super::limits::INSTRUCTION_STEP) (100) instructions between checks, all of them within [`MAX_LUA_TIME`](super::limits::MAX_LUA_TIME) across the candidate's passes and [`MAX_INSTRUCTIONS`](super::limits::MAX_INSTRUCTIONS) | no |
-//! | VM: a numeral string in a bitwise operation or a `for` bound | strings | O(length) a numeral read (`luaV_tointegerns`, `luaV_tonumber_`) | each instruction at most O(VM memory), at most [`INSTRUCTION_STEP`](super::limits::INSTRUCTION_STEP) (100) instructions between checks, all of them within [`MAX_LUA_TIME`](super::limits::MAX_LUA_TIME) across the candidate's passes and [`MAX_INSTRUCTIONS`](super::limits::MAX_INSTRUCTIONS) | no |
+//! | VM: a numeral string as a `for` bound | strings | O(length) a numeral read (`luaV_tonumber_`) | each instruction at most O(VM memory), at most [`INSTRUCTION_STEP`](super::limits::INSTRUCTION_STEP) (100) instructions between checks, all of them within [`MAX_LUA_TIME`](super::limits::MAX_LUA_TIME) across the candidate's passes and [`MAX_INSTRUCTIONS`](super::limits::MAX_INSTRUCTIONS) | no |
 //! | VM: a table constructor or call with many values | values on the stack | O(n) copies | n at most the stack; each instruction at most O(VM memory), at most [`INSTRUCTION_STEP`](super::limits::INSTRUCTION_STEP) (100) instructions between checks, all of them within [`MAX_LUA_TIME`](super::limits::MAX_LUA_TIME) across the candidate's passes and [`MAX_INSTRUCTIONS`](super::limits::MAX_INSTRUCTIONS) | no |
-//! | VM: an error message (type errors, names) | the failing operation | O(message): constant names and `__name` | caught messages charged (`settle`), `__name` at most 64 bytes | no |
+//! | VM: an error message (type errors, names) | the failing operation | O(message): constant names and `__name` | caught messages charged by the handler, `__name` at most 64 bytes | no |
 //! | VM: compilation, garbage collection | sources, VM memory | O(source), O(VM memory) | the read caps and VM memory | no |
+//!
+//! No host function returns a Rust error to Lua: each returns its status
+//! and its Lua face raises a fault as a fixed marker, so no error carries
+//! a traceback outside the VM's memory. Only the instruction hook raises
+//! its fault as an error, once: the protected calls raise the marker as
+//! they unwind.
 //!
 //! Skin code never runs with the hook off: Lua runs the message handler
 //! where an error is raised, inside the instruction hook for a fault, so
-//! the protected calls check the ledger before the skin's handler runs
-//! and raise the fault again instead; finalizers (`__gc`) and
+//! the protected calls' handlers check the ledger first and complete with
+//! the marker instead of running the skin's; finalizers (`__gc`) and
 //! to-be-closed variables (`__close`) are refused at the metatable, and
-//! the sandbox's own weak tables have neither. Lua runs no other skin
-//! code itself.
+//! the sandbox's own weak tables have neither. The strings' metatable is
+//! out of reach (`getmetatable` of a string gives `false`), so a skin adds
+//! no metamethod a native would call. Lua runs no other skin code
+//! itself.
 
 use std::rc::Rc;
 
@@ -150,31 +158,40 @@ pub(super) fn install(lua: &Lua, pass: &Rc<Pass>, env: &Table, base: &Table) -> 
     native.raw_set("mathtype", math.raw_get::<Function>("type")?)?;
 
     let p = Rc::clone(pass);
+    // Each returns its status, never a Rust error: `library.lua` raises
+    // the fault in Lua.
     let charge = lua.create_function(move |lua, n: i64| {
-        p.ledger.check(lua)?;
         let n = u64::try_from(n).unwrap_or(0);
-        p.ledger.native(lua, n)
+        Ok(p.ledger
+            .check(lua)
+            .and_then(|()| p.ledger.native(lua, n))
+            .is_ok())
     })?;
     let p = Rc::clone(pass);
-    let refuse = lua.create_function(move |lua, code: i64| -> mlua::Result<()> {
-        if code == FINALIZER {
-            return Err(p.ledger.fail_lua(lua, LuaWhy::Finalizer));
-        }
-        let op = usize::try_from(code - 1)
-            .ok()
-            .and_then(|i| REFUSED.get(i))
-            .copied()
-            .unwrap_or("library");
-        Err(p.ledger.fail_lua(lua, LuaWhy::Library { op }))
+    let refuse = lua.create_function(move |lua, code: i64| {
+        let why = if code == FINALIZER {
+            LuaWhy::Finalizer
+        } else {
+            let op = usize::try_from(code - 1)
+                .ok()
+                .and_then(|i| REFUSED.get(i))
+                .copied()
+                .unwrap_or("library");
+            LuaWhy::Library { op }
+        };
+        let _ = p.ledger.fail_lua(lua, why);
+        Ok(false)
     })?;
     let bridge = lua.create_table()?;
     let p = Rc::clone(pass);
     bridge.raw_set(
         "metatable",
         lua.create_function(move |lua, ()| {
-            p.ledger.check(lua)?;
-            p.ledger.update(|c| c.metatables += 1);
-            Ok(())
+            let ok = p.ledger.check(lua).is_ok();
+            if ok {
+                p.ledger.update(|c| c.metatables += 1);
+            }
+            Ok(ok)
         })?,
     )?;
     let (string_lib, table_lib, math_lib, lib): (Table, Table, Table, Table) = lua
@@ -190,6 +207,7 @@ pub(super) fn install(lua: &Lua, pass: &Rc<Pass>, env: &Table, base: &Table) -> 
             bridge,
             MAX_PRIMITIVE_BYTES,
             MAX_PATH_BYTES,
+            super::sandbox::FAULT,
         ))?;
     // Strings' methods are the library's, and strings have no other
     // metamethod: none of their native arithmetic coercions is reachable.
@@ -206,6 +224,10 @@ pub(super) fn install(lua: &Lua, pass: &Rc<Pass>, env: &Table, base: &Table) -> 
             mt.raw_set(k, Value::Nil)?;
         }
         mt.raw_set("__index", string_lib.clone())?;
+        // Unreachable from a skin: `getmetatable` of a string gives this
+        // marker, so no skin adds a metamethod Lua's natives would call
+        // (a `__tostring` that `%s` runs, say).
+        mt.raw_set("__metatable", false)?;
     }
     env.raw_set("string", string_lib)?;
     env.raw_set("table", table_lib)?;

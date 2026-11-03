@@ -141,7 +141,10 @@ run_target() {
   [ -n "$seed" ] && options+=(-seed="$seed")
   [ "$target" = bms_load ] && options+=(-dict=fuzz/dict/bms.dict)
   [ "$target" = skin_json ] && options+=(-dict=fuzz/dict/skin.dict)
-  [ "$target" = skin_lua ] && options+=(-dict=fuzz/dict/lua.dict)
+  # skin_lua imports one input up to three times, each import's Lua
+  # starting from the header pass's time: its 5 s cap (MAX_LUA_TIME)
+  # three times over, and slack.
+  [ "$target" = skin_lua ] && options+=(-dict=fuzz/dict/lua.dict -timeout=25)
   [ "$target" = skin_fnt ] && options+=(-dict=fuzz/dict/fnt.dict)
   echo "=== $target: $seconds s"
   status=0

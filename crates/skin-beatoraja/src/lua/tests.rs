@@ -210,3 +210,28 @@ fn cancellation_is_seen_by_the_common_reader() {
     assert_eq!(why(header(d.path(), &cancel)), LuaWhy::Cancelled);
     assert_eq!(live(), 0);
 }
+
+#[test]
+fn the_time_cap_spans_both_passes() {
+    use std::time::{Duration, Instant};
+
+    use super::limits::MAX_LUA_TIME;
+    // A header pass that ran almost all the time leaves the configured
+    // pass only the rest.
+    let d = folder(
+        "if skin_config then\n\
+           local s, t = \"x\", \"x\"\n\
+           for i = 1, 24 do s, t = s .. s, t .. t end\n\
+           while true do if s == t then end end\n\
+         end\n\
+         return { type = 0 }",
+    );
+    let mut h = header(d.path(), &Cancel::new()).unwrap();
+    h.spent = MAX_LUA_TIME - Duration::from_millis(300);
+    let start = Instant::now();
+    let r = h.import(&Config::defaults(h.header()), &Cancel::new());
+    let took = start.elapsed();
+    // Without the carried time it would run its own 5 s.
+    assert_eq!(why(r), LuaWhy::Limit(LuaLimit::Time));
+    assert!(took < Duration::from_secs(3), "{took:?}");
+}

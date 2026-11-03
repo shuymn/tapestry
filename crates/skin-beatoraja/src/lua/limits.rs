@@ -24,7 +24,7 @@ pub const MAX_INSTRUCTIONS: u64 = 10_000_000;
 /// [`MAX_INSTRUCTIONS`], and between two checks of cancellation and
 /// [`MAX_LUA_TIME`]. One VM instruction can cost up to the size of VM
 /// memory (a concatenation, a comparison of long strings, a numeral
-/// string read in a bitwise operation), so this bounds how long a check
+/// string read as a `for` bound), so this bounds how long a check
 /// can wait. At 100, with the time check, the `lua` bench's execution
 /// and conversion took under 2 % longer than at 1 000, and its run to the
 /// instruction cap 16 % longer.

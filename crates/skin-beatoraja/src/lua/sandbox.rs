@@ -46,6 +46,37 @@ pub(super) const XPCALL: &str = "tapestry.xpcall";
 pub(super) const PACKED: &str = "tapestry.packed";
 /// The registry name of the handler the host's protected runs use.
 pub(super) const HANDLER: &str = "tapestry.handler";
+/// The registry name of the function that makes a host function's Lua
+/// face: it raises the fault in Lua when the host reports one.
+const SHIM: &str = "tapestry.shim";
+
+/// The error value Lua carries once the ledger holds a fault: a fixed,
+/// small string, whatever the fault.
+pub(super) const FAULT: &str = "the import was refused";
+
+/// The host functions' Lua faces, compiled before any skin code. A host
+/// function returns its status first and never a Rust error, which mlua
+/// would wrap with a traceback outside the VM's memory limit: a fault
+/// is raised here, in Lua, as [`FAULT`].
+const SHIMS: &str = r##"
+local error, fault = ...
+local function check(ok, ...)
+  if not ok then
+    error(fault, 0)
+  end
+  return ...
+end
+return function(raw)
+  return function(...)
+    return check(raw(...))
+  end
+end
+"##;
+
+/// The most instruction steps the hook lets run after a fault without
+/// raising it again: the protected calls raise it in Lua as they unwind,
+/// so the hook's own error, which carries a traceback, is raised once.
+const STEPS_AFTER_FAULT: u32 = 1_000;
 
 /// The base functions the environment keeps as they are.
 const BASE: [&str; 7] = [
@@ -64,7 +95,7 @@ const BASE: [&str; 7] = [
 /// allocation failure; a skin's handler can fail, recurse or exhaust its
 /// stack) is told apart and stays fatal.
 const PROTECTED: &str = r##"
-local xpcall_native, settle, select, unpack, alive = ...
+local xpcall_native, settle, select, unpack, note, error, fault = ...
 -- The protected function's results come back as one table: the native
 -- xpcall pushes its status after the results without making room, so it
 -- is given one result at a time only.
@@ -76,22 +107,36 @@ local function packed(f, ...)
 end
 local function finish(seen, ok, r)
   if ok then
-    settle(seen[1], true, nil, r.n)
+    if not settle(seen[1], true, nil, r.n) then
+      error(fault, 0)
+    end
     return true, unpack(r, 1, r.n)
   end
-  settle(seen[1], false, r)
+  if not settle(seen[1], false, r) then
+    error(fault, 0)
+  end
   return false, r
 end
+-- Each handler charges the error it is given (`note`), and completes
+-- with the fault's marker once a fault is recorded: after a fault Lua
+-- runs the handler inside the instruction hook, with hooks off, so the
+-- skin's handler never runs then.
 local function pcall(f, ...)
   local seen = {false}
-  return finish(seen, xpcall_native(packed, function(e) seen[1] = true return e end, f, ...))
+  return finish(seen, xpcall_native(packed, function(e)
+    if not note(e) then
+      return fault
+    end
+    seen[1] = true
+    return e
+  end, f, ...))
 end
 local function xpcall(f, msgh, ...)
   local seen = {false}
   return finish(seen, xpcall_native(packed, function(e)
-    -- After a fault (raised from the instruction hook, where hooks are
-    -- off) the skin's handler is never run: this raises it again.
-    alive()
+    if not note(e) then
+      return fault
+    end
     local r = msgh(e)
     seen[1] = true
     return r
@@ -111,23 +156,51 @@ pub(super) const TOO_MANY: &str = "protected call results";
 /// Lua's message for an allocation failure (`lstate.c`, `MEMERRMSG`).
 const MEMORY_ERROR: &str = "not enough memory";
 
-/// Creates a host function: `f` runs after one host call is charged, and
-/// a failed allocation in it is the memory fault.
-pub(super) fn host<F, R>(lua: &Lua, pass: &Rc<Pass>, f: F) -> mlua::Result<Function>
+/// A host function as the sandbox calls it: `f` runs after one host call
+/// is charged, and the function returns `true` and `f`'s results, or
+/// `false` once a fault is recorded (any error of `f` becomes one: a
+/// failed allocation the memory fault, another a Lua error). It never
+/// returns a Rust error to Lua.
+pub(super) fn host_raw<F, R>(lua: &Lua, pass: &Rc<Pass>, f: F) -> mlua::Result<Function>
 where
     F: Fn(&Lua, &Pass, MultiValue) -> mlua::Result<R> + 'static,
     R: mlua::IntoLuaMulti,
 {
     let pass = Rc::clone(pass);
-    lua.create_function(move |lua, args: MultiValue| {
-        pass.ledger.host_call(lua)?;
-        match f(lua, &pass, args) {
-            Err(mlua::Error::MemoryError(_)) => {
-                Err(pass.ledger.fail_lua(lua, LuaWhy::Limit(LuaLimit::Memory)))
+    lua.create_function(move |lua, args: MultiValue| -> mlua::Result<MultiValue> {
+        let r = pass
+            .ledger
+            .host_call(lua)
+            .and_then(|()| f(lua, &pass, args))
+            .and_then(|v| v.into_lua_multi(lua));
+        match r {
+            Ok(mut v) => {
+                v.push_front(Value::Boolean(true));
+                Ok(v)
             }
-            r => r,
+            Err(e) => {
+                if !pass.ledger.faulted() {
+                    let why = match e {
+                        mlua::Error::MemoryError(_) => LuaWhy::Limit(LuaLimit::Memory),
+                        _ => LuaWhy::Error,
+                    };
+                    let _ = pass.ledger.fail_lua(lua, why);
+                }
+                Ok(MultiValue::from_iter([Value::Boolean(false)]))
+            }
         }
     })
+}
+
+/// A host function as a skin calls it: [`host_raw`]'s, its results
+/// returned and a fault raised in Lua.
+pub(super) fn host<F, R>(lua: &Lua, pass: &Rc<Pass>, f: F) -> mlua::Result<Function>
+where
+    F: Fn(&Lua, &Pass, MultiValue) -> mlua::Result<R> + 'static,
+    R: mlua::IntoLuaMulti,
+{
+    let shim: Function = lua.named_registry_value(SHIM)?;
+    shim.call(host_raw(lua, pass, f)?)
 }
 
 /// A fresh VM for one pass, its environment built and its caps set.
@@ -141,14 +214,29 @@ pub(super) fn vm(pass: &Rc<Pass>) -> mlua::Result<Lua> {
     #[cfg(test)]
     lua.set_app_data(super::tests::Live::new());
     let hook = Rc::clone(pass);
+    let after_fault = std::cell::Cell::new(0_u32);
     lua.set_global_hook(
         HookTriggers::new().every_nth_instruction(INSTRUCTION_STEP),
         move |lua, _| {
+            if hook.ledger.faulted() {
+                let n = after_fault.get().saturating_add(1);
+                after_fault.set(n);
+                if n <= STEPS_AFTER_FAULT {
+                    return Ok(VmState::Continue);
+                }
+            }
             hook.ledger.step(lua)?;
             Ok(VmState::Continue)
         },
     )?;
     let base = lua.globals();
+    let error: Function = base.raw_get("error")?;
+    let shim: Function = lua
+        .load(SHIMS)
+        .set_name("=sandbox")
+        .set_mode(ChunkMode::Text)
+        .call((error.clone(), FAULT))?;
+    lua.set_named_registry_value(SHIM, shim)?;
     let env = lua.create_table()?;
     for name in BASE {
         env.raw_set(name, base.raw_get::<Value>(name)?)?;
@@ -157,7 +245,7 @@ pub(super) fn vm(pass: &Rc<Pass>) -> mlua::Result<Lua> {
 
     let xpcall: Function = base.raw_get("xpcall")?;
     lua.set_named_registry_value(XPCALL, xpcall.clone())?;
-    let settle = host(&lua, pass, |lua, pass, args| {
+    let settle = host_raw(&lua, pass, |lua, pass, args| {
         pass.ledger.update(|c| c.protected_calls += 1);
         pass.ledger.check(lua)?;
         let seen = args.front().is_some_and(|v| v.as_boolean() == Some(true));
@@ -171,11 +259,6 @@ pub(super) fn vm(pass: &Rc<Pass>) -> mlua::Result<Lua> {
                 .is_none_or(|n| n > MAX_RESULTS)
         {
             return Err(pass.ledger.fail_lua(lua, LuaWhy::Library { op: TOO_MANY }));
-        }
-        // The error's message was formatted natively, its length charged.
-        if !ok && let Some(Value::String(s)) = args.get(2) {
-            let n = u64::try_from(s.as_bytes().len()).unwrap_or(u64::MAX);
-            pass.ledger.native(lua, n)?;
         }
         if !ok && !seen {
             let memory = match args.get(2) {
@@ -201,16 +284,34 @@ pub(super) fn vm(pass: &Rc<Pass>) -> mlua::Result<Lua> {
             base.raw_get::<Function>("select")?,
             base.raw_get::<Table>("table")?
                 .raw_get::<Function>("unpack")?,
-            host(&lua, pass, |lua, pass, _| pass.ledger.check(lua))?,
+            // The error's message was formatted natively: its length is
+            // charged, whatever the handler then makes of it.
+            host_raw(&lua, pass, |lua, pass, args| {
+                pass.ledger.check(lua)?;
+                if let Some(Value::String(s)) = args.front() {
+                    let n = u64::try_from(s.as_bytes().len()).unwrap_or(u64::MAX);
+                    pass.ledger.native(lua, n)?;
+                }
+                Ok(())
+            })?,
+            error,
+            FAULT,
         ))?;
     lua.set_named_registry_value(PACKED, packed)?;
     env.raw_set("pcall", pcall)?;
     env.raw_set("xpcall", xpcall_wrapped)?;
 
-    let handler = host(&lua, pass, |lua, pass, args| {
+    // The host's own runs' handler: it completes with the fault's marker
+    // once one is recorded, as the protected calls' do.
+    let mark = host_raw(&lua, pass, |lua, pass, _| {
         pass.handled(super::ledger::running(lua));
-        Ok(args)
+        Ok(())
     })?;
+    let handler: Function = lua
+        .load("local mark, fault = ... return function(e) if not mark() then return fault end return e end")
+        .set_name("=sandbox")
+        .set_mode(ChunkMode::Text)
+        .call((mark, FAULT))?;
     lua.set_named_registry_value(HANDLER, handler)?;
 
     super::host::install(&lua, pass)?;

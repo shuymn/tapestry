@@ -354,7 +354,7 @@ pub struct LuaHeader {
     store: Store,
     counts: Counts,
     /// The time the header pass ran Lua.
-    spent: Duration,
+    pub(crate) spent: Duration,
 }
 
 /// A Lua skin imported.
@@ -419,6 +419,7 @@ fn run_pass(pass: &Rc<Pass>, entry: &str) -> Result<Converted, ImportError> {
             pass.ledger.memory(lua.used_memory());
             Ok((values, id))
         });
+        pass.ledger.stop_clock();
         #[cfg(feature = "dev-tools")]
         let executed = std::time::Instant::now();
         let converted = run.map(|(values, id)| {

@@ -7,7 +7,7 @@
 -- a number belongs, or the reverse, is an error), and only for a result
 -- whose size is known and charged first (bytes). An unsupported form is
 -- refused (refuse), never approximated.
-local native, charge, refuse, bridge, cap, max_path = ...
+local native, raw_charge, raw_refuse, bridge, cap, max_path, fault = ...
 
 local byte, sub = native.byte, native.sub
 local native_char, native_upper, native_lower = native.char, native.upper, native.lower
@@ -19,6 +19,19 @@ local native_floor, native_ceil, native_abs = native.floor, native.ceil, native.
 local tointeger, mathtype = native.tointeger, native.mathtype
 local type, next = native.type, native.next
 local rawget, rawset, rawlen = native.rawget, native.rawset, native.rawlen
+
+-- The host's primitives return their status; a fault is raised here, in
+-- Lua, as the fixed marker `fault`.
+local function charge(n)
+  if not raw_charge(n) then
+    native_error(fault, 0)
+  end
+end
+
+local function refuse(code)
+  raw_refuse(code)
+  native_error(fault, 0)
+end
 local error, select = native_error, native_select
 
 -- The refusal codes library.rs names.
@@ -722,6 +735,8 @@ local function join(out, sep)
     total = total + #out[k]
   end
   bytes(total + #sep * (#out > 0 and #out - 1 or 0))
+  -- The native visits every entry, an empty one too.
+  charge(#out)
   return native_concat(out, sep)
 end
 
@@ -1032,7 +1047,9 @@ local function snapshot(mt)
   if type(name) == "string" and #name > MAX_NAME then
     refuse(NAME)
   end
-  bridge.metatable()
+  if not bridge.metatable() then
+    native_error(fault, 0)
+  end
   return copy
 end
 

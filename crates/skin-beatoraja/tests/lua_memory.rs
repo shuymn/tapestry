@@ -241,6 +241,38 @@ fn lua_import_memory_is_bounded_and_freed() {
         }),
     );
 
+    // A fault under nested handlers, at a call site named by a 4 MiB
+    // constant: the hook's one error carries a traceback naming it, and no
+    // handler fails again (each failure would add another, outside the
+    // VM's limit, while the handlers recurse).
+    let name = "n".repeat(4 << 20);
+    let long_names = folder(&format!(
+        "local t = {{}}\n\
+         t[\"{name}\"] = function() while true do end end\n\
+         local function deep(n)\n\
+           if n == 0 then local r = t[\"{name}\"]() return r end\n\
+           return xpcall(deep, function(e) return e end, n - 1)\n\
+         end\n\
+         deep(2)\nreturn {{ type = 0 }}"
+    ));
+    let p = record(
+        "long_names",
+        measure(|| {
+            let e = header(long_names.path()).unwrap_err();
+            assert!(
+                matches!(
+                    e,
+                    ImportError::Lua {
+                        why: LuaWhy::Limit(LuaLimit::Instructions),
+                        ..
+                    }
+                ),
+                "{e:?}"
+            );
+        }),
+    );
+    assert!(p < 48 << 20, "the handlers' errors grew memory: {p}");
+
     // The instruction cap, refused in the header pass.
     let looping = folder("while true do end");
     record(

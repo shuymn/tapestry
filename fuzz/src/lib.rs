@@ -1934,8 +1934,26 @@ pub fn skin_lua(data: &[u8]) -> Result<(Header, Result<LuaImported, ImportError>
         }
         r
     };
+    // A refusal at the Lua time cap depends on the clock: it is not
+    // compared, and the input is not run again (each import starts from
+    // the header pass's time).
+    let timed = |r: &Result<LuaImported, ImportError>| {
+        matches!(
+            r,
+            Err(ImportError::Lua {
+                why: skin_beatoraja::LuaWhy::Limit(skin_beatoraja::LuaLimit::Time),
+                ..
+            })
+        )
+    };
     let first = outcome(&defaults);
+    if timed(&first) {
+        return Ok((h.header().clone(), first));
+    }
     let again = outcome(&defaults);
+    if timed(&again) {
+        return Ok((h.header().clone(), first));
+    }
     match (&first, &again) {
         (Ok(a), Ok(b)) => {
             assert_eq!(

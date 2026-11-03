@@ -101,6 +101,8 @@ pub(crate) struct Ledger {
     /// started, for [`MAX_LUA_TIME`].
     spent: Duration,
     started: Instant,
+    /// The time this pass ran Lua, once its execution ended.
+    stopped: Cell<Option<Duration>>,
 }
 
 impl Ledger {
@@ -112,13 +114,23 @@ impl Ledger {
             cancel,
             spent,
             started: Instant::now(),
+            stopped: Cell::new(None),
+        }
+    }
+
+    /// Ends this pass's Lua time: the conversion and the teardown after
+    /// it are not Lua's.
+    pub(crate) fn stop_clock(&self) {
+        if self.stopped.get().is_none() {
+            self.stopped.set(Some(self.started.elapsed()));
         }
     }
 
     /// The time the candidate's passes have run, this one's so far
     /// included.
     pub(crate) fn spent(&self) -> Duration {
-        self.spent.saturating_add(self.started.elapsed())
+        let this = self.stopped.get().unwrap_or_else(|| self.started.elapsed());
+        self.spent.saturating_add(this)
     }
 
     pub(crate) fn counts(&self) -> Counts {
