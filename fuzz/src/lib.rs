@@ -1866,6 +1866,15 @@ fn check_usage(i: &Imported) {
                 NoteFallback::Mine => 4,
             };
             entries += 1;
+        } else if n.kind == NoteKind::ColourClamped {
+            // A clamped colour channel is the other fallback (design:
+            // docs/stage3.md "Tracks").
+            assert_eq!(
+                n.severity,
+                Severity::Fallback,
+                "a clamped colour's severity"
+            );
+            assert!(n.at.is_some(), "an unlocated clamped colour");
         } else {
             assert_ne!(n.severity, Severity::Fallback, "a fallback of another kind");
         }

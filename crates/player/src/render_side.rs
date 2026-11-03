@@ -6396,8 +6396,10 @@ pub(crate) mod tests {
                 frame.load.since,
             ));
             while self.shared.stall.load(Ordering::Acquire) {
+                self.shared.stalled.store(true, Ordering::Release);
                 std::thread::sleep(Duration::from_millis(1));
             }
+            self.shared.stalled.store(false, Ordering::Release);
             if self.shared.refuse_loading.load(Ordering::Acquire) {
                 return Ok(Err(skin_model::BuildError::InvalidReadouts));
             }
@@ -6418,6 +6420,8 @@ pub(crate) mod tests {
         fail: Arc<AtomicBool>,
         loading: Arc<AtomicU32>,
         stall: Arc<AtomicBool>,
+        /// Set while a loading frame is held by `stall`.
+        stalled: Arc<AtomicBool>,
         /// Installations wait while set.
         pub(crate) hold_install: Arc<AtomicBool>,
         /// Installations are refused while set.
@@ -6595,8 +6599,9 @@ pub(crate) mod tests {
 
         // The render thread stalls in a loading frame past the bound.
         screens.stall.store(true, Ordering::Release);
-        let from = frames();
-        assert!(wait_until(|| frames() > from));
+        // A frame counted before the stall was seen may be the one held,
+        // so wait for the hold itself rather than for another frame.
+        assert!(wait_until(|| screens.stalled.load(Ordering::Acquire)));
         link.set_timeouts(Duration::from_millis(100), Duration::from_secs(5));
         assert!(matches!(link.commit_attempt(), Err(ScreenError::NoAnswer)));
         screens.stall.store(false, Ordering::Release);
@@ -6684,8 +6689,7 @@ pub(crate) mod tests {
         assert!(wait_until(|| frames() > 0));
         let stalled = |link: &super::RenderLink, give_up: &dyn Fn(super::PendingSelect)| {
             screens.stall.store(true, Ordering::Release);
-            let from = frames();
-            assert!(wait_until(|| frames() > from));
+            assert!(wait_until(|| screens.stalled.load(Ordering::Acquire)));
             give_up(link.select(Some(Arc::clone(&late))));
             screens.stall.store(false, Ordering::Release);
             let from = frames();
