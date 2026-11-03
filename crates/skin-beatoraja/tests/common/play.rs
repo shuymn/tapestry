@@ -106,6 +106,9 @@ pub struct Drawn {
     pub play: skin_model::Play,
     pub tally: Tally,
     pub gauges: Vec<GaugeState>,
+    /// Where the play entered Closing, for every frame
+    /// ([`SkinFrame::closing`]).
+    pub closing: Option<TimeUs>,
     pub batch: QuadBatch,
     /// The hi-speed and covers each frame shows.
     pub view: LaneView,
@@ -281,6 +284,7 @@ impl Drawn {
                 reference: GAUGES[0].start,
                 failed_at: None,
             }],
+            closing: None,
             batch,
             // 600 ms of 150 BPM over the original lane.
             view: LaneView {
@@ -356,6 +360,7 @@ impl Drawn {
             layout: &Layout::AUTHOR,
             lanes: self.view,
             playing: true,
+            closing: self.closing,
             readouts: self.readouts.unwrap_or_else(|| readouts_for(self.view)),
         };
         self.skin

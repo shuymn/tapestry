@@ -33,7 +33,7 @@ use rules::{GaugeKind, GaugeValue, RulePreset};
 use crate::attempt::{Attempt, NoteEnd};
 use crate::autoplay::{Autoplay, AutoplayError};
 use crate::bests::{BestView, SavedPlay};
-use crate::live::{Closing, InputWaitError, LiveError, Opening, Rig};
+use crate::live::{Closing, ClosingEnd, InputWaitError, LiveError, Opening, Rig};
 use crate::logic::{AbortCause, LogicConfig, LogicError, Record};
 use crate::policy::{
     DefaultPolicy, FailureAction, GaugeIndex, NoSessionEvents, SessionEvent, SessionEventSink,
@@ -102,6 +102,7 @@ impl Parts {
             transform: Box::new(Passthrough),
             policy: Box::new(DefaultPolicy {
                 displayed: player.displayed_gauge,
+                on_failure: player.on_failure,
             }),
             events: Box::new(NoSessionEvents),
             results: Box::new(ReEvaluate),
@@ -322,6 +323,19 @@ pub enum PlayEnd {
     Aborted(AbortCause),
 }
 
+/// A play's Closing (design.md "Play Lifecycle", Closing), on the play
+/// clock.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClosingReport {
+    /// Where it started: the play time the lifecycle entered it, which
+    /// the `failed` timer starts from.
+    pub started_at: TimeUs,
+    /// The play time of the wake that ended it.
+    pub ended_at: TimeUs,
+    /// How it ended.
+    pub end: ClosingEnd,
+}
+
 /// What happened in one play.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlayReport {
@@ -335,6 +349,9 @@ pub struct PlayReport {
     /// Whether the player skipped the rest of a completed play's audio
     /// tail to its result; the play stays complete.
     pub tail_skipped: bool,
+    /// The play's Closing, if it entered one (design.md "Play Lifecycle",
+    /// Closing): the play stays aborted with its cause.
+    pub closing: Option<ClosingReport>,
     /// Why the preset file changed at this retry but was not used; the
     /// previous preset played instead.
     pub reload_error: Option<PresetFileError>,
@@ -416,6 +433,9 @@ pub struct Loaded {
     /// its order, whether or not the section passed its check: what the
     /// practice page shows ([`initial_gauge`](Self::initial_gauge)).
     fitted: Option<Vec<GaugeValue>>,
+    /// The gauge the policy shows in the coming attempt, resolved once
+    /// per attempt under its play preset ([`displayed`](Self::displayed)).
+    displayed: GaugeIndex,
     /// Each gauge a fit since the practice page's Start found gone, with
     /// the gauge the page shows in its place
     /// ([`replacement`](Self::replacement)).
@@ -546,6 +566,9 @@ pub struct PlayOutcome {
     /// The attempt's cancelled READY openings, with the gate; `None`
     /// without it, where none is ever cancelled.
     pub history: Option<ReadyHistory>,
+    /// The play's Closing, if it entered one (design.md "Play Lifecycle",
+    /// Closing).
+    pub closing: Option<ClosingReport>,
 }
 
 impl Loaded {
@@ -607,6 +630,8 @@ impl Loaded {
                 warnings,
             }) => {
                 events.on_event(&SessionEvent::Load);
+                let preset = shelf.chosen().clone();
+                let displayed = resolve_displayed(parts.policy.as_ref(), &preset);
                 Ok(Self {
                     root,
                     settings,
@@ -617,7 +642,8 @@ impl Loaded {
                     chart_record,
                     labels,
                     warnings,
-                    preset: shelf.chosen().clone(),
+                    preset,
+                    displayed,
                     first_error: shelf.chosen_error().cloned(),
                     shelf,
                     attempt: 0,
@@ -1116,15 +1142,18 @@ impl Loaded {
             },
             None => NoteEnd::Play,
         };
-        Attempt::new(
-            self.attempt,
-            &self.preset,
-            self.config.lead_in,
-            self.section(),
-            ends.of(&self.chart),
-            &self.labels,
-            &self.chart,
-        )
+        Attempt {
+            displayed: self.displayed,
+            ..Attempt::new(
+                self.attempt,
+                &self.preset,
+                self.config.lead_in,
+                self.section(),
+                ends.of(&self.chart),
+                &self.labels,
+                &self.chart,
+            )
+        }
     }
 
     /// The tempo provider of the coming attempt ([`AttemptTempo::prepare`]):
@@ -1154,7 +1183,19 @@ impl Loaded {
         if self.preset != *self.shelf.chosen() {
             self.preset.clone_from(self.shelf.chosen());
         }
+        self.displayed = resolve_displayed(self.parts.policy.as_ref(), &self.preset);
         error
+    }
+
+    /// The gauge the policy shows in the coming attempt, by its index in
+    /// the play preset: resolved once per attempt, when
+    /// [`begin_play`](Self::begin_play) refreshes the preset, through the
+    /// policy, which falls back to the first. The attempt
+    /// ([`Attempt::displayed`]), what closes the play
+    /// ([`closes_on`](Self::closes_on)) and the report all use it.
+    #[must_use]
+    pub const fn displayed(&self) -> GaugeIndex {
+        self.displayed
     }
 
     /// The device profile and the logic step's sizes for a play whose
@@ -1359,16 +1400,22 @@ impl Loaded {
         })
     }
 
-    /// Whether the session policy ends the play with `gauges` (every
-    /// gauge in the preset's order): a survival gauge failed and the policy
-    /// does not keep playing.
+    /// Whether the play closes with `gauges` (every gauge in the preset's
+    /// order; design.md "Play Lifecycle", Closing): the attempt's displayed
+    /// gauge ([`displayed`](Self::displayed)) is a survival gauge that
+    /// failed, and the policy closes on failure. A hidden gauge's failure,
+    /// or any under play-to-end, never closes it.
     #[must_use]
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
-    pub fn ends_play(&self, gauges: &[GaugeState]) -> bool {
-        let failed = gauges.iter().zip(&self.preset.gauges).any(|(g, rule)| {
-            matches!(rule.kind, GaugeKind::Survival { .. }) && g.failed_at.is_some()
-        });
-        failed && self.parts.policy.on_survival_failure() == FailureAction::EndPlay
+    pub fn closes_on(&self, gauges: &[GaugeState]) -> bool {
+        let i = self.displayed.0;
+        let failed = gauges
+            .get(i)
+            .zip(self.preset.gauges.get(i))
+            .is_some_and(|(g, rule)| {
+                matches!(rule.kind, GaugeKind::Survival { .. }) && g.failed_at.is_some()
+            });
+        failed && self.parts.policy.on_survival_failure() == FailureAction::Close
     }
 
     /// Ends a play: builds its record (unless nothing was finalized),
@@ -1391,6 +1438,7 @@ impl Loaded {
             mut incomplete,
             played,
             history,
+            closing,
         } = outcome;
         incomplete.suspend |= end == PlayEnd::Aborted(AbortCause::Suspend);
         let PlayStart {
@@ -1517,8 +1565,9 @@ impl Loaded {
             }
             _ => None,
         };
-        let retried =
-            end == PlayEnd::Aborted(AbortCause::Retry) || tail_cut == Some(AbortCause::Retry);
+        let retried = end == PlayEnd::Aborted(AbortCause::Retry)
+            || tail_cut == Some(AbortCause::Retry)
+            || closing.is_some_and(|c| c.end == ClosingEnd::Retry);
         if retried {
             self.events.on_event(&SessionEvent::Retry { attempt });
         }
@@ -1528,12 +1577,13 @@ impl Loaded {
             end,
             tail_cut,
             tail_skipped,
+            closing,
             reload_error,
             output_error,
             input_error,
             live,
             tally: view.tally,
-            displayed_gauge: parts.policy.displayed_gauge(&view.gauges),
+            displayed_gauge: self.displayed,
             record: play_record,
             saved,
             result,
@@ -1541,6 +1591,24 @@ impl Loaded {
             preset: preset.clone(),
         }
     }
+}
+
+/// The gauge `policy` shows for an attempt under `preset`, from the
+/// gauges' starting states: how [`Loaded::displayed`] resolves it, and how
+/// a screen shown before the attempt exists (the select screen's loading
+/// gauge) resolves it too.
+#[must_use]
+pub fn resolve_displayed(policy: &dyn SessionPolicy, preset: &RulePreset) -> GaugeIndex {
+    let states: Vec<GaugeState> = preset
+        .gauges
+        .iter()
+        .map(|g| GaugeState {
+            value: g.start,
+            reference: g.start,
+            failed_at: None,
+        })
+        .collect();
+    policy.displayed_gauge(&states)
 }
 
 /// The generated keyboard's profile: the built-in key config and an input
@@ -1730,6 +1798,7 @@ impl<O: AudioOutput + Wakes> Session<O> {
             audio,
             script,
             next_command: 0,
+            pending: PendingCommands::default(),
             origin: None,
             script_origin: None,
             participants: Vec::new(),
@@ -1791,6 +1860,45 @@ pub enum SessionPlayError {
     Left,
 }
 
+/// Commands published and not yet taken, held as the player's controls
+/// hold them, whatever order they were published in: a quit, a suspend
+/// and a retry each pending at most once. A take gives the quit first,
+/// dropping a retry pending with it (outside Closing) and leaving a
+/// suspend for the next take, then the suspend, then the retry.
+#[derive(Clone, Copy, Debug, Default)]
+struct PendingCommands {
+    quit: bool,
+    retry: bool,
+    suspend: bool,
+}
+
+impl PendingCommands {
+    fn publish(&mut self, c: Command) {
+        match c {
+            Command::Quit => self.quit = true,
+            Command::Retry => self.retry = true,
+            Command::Suspend => self.suspend = true,
+        }
+    }
+
+    /// The next command taken; in Closing (`closing`) a quit keeps the
+    /// retry pending with it.
+    fn take(&mut self, closing: bool) -> Option<Command> {
+        if std::mem::take(&mut self.quit) {
+            if !closing {
+                self.retry = false;
+            }
+            Some(Command::Quit)
+        } else if std::mem::take(&mut self.suspend) {
+            Some(Command::Suspend)
+        } else if std::mem::take(&mut self.retry) {
+            Some(Command::Retry)
+        } else {
+            None
+        }
+    }
+}
+
 /// The session's rig: one step of the virtual clock per wait, the script
 /// fed on the play's timeline, and the audio stepped through every buffer
 /// event before the step's logic (a buffer event at the step's own time
@@ -1802,6 +1910,9 @@ struct SessionRig<'s, O> {
     audio: &'s mut RunnerAudio<O>,
     script: PlayScript,
     next_command: usize,
+    /// The script's commands due and not yet taken, held as the player's
+    /// controls hold them.
+    pending: PendingCommands,
     /// The current READY candidate's chart time 0 on the session clock.
     origin: Option<TimeUs>,
     /// Where the script's timeline has its 0 on the session clock: the
@@ -1916,6 +2027,22 @@ impl<O> SessionRig<'_, O> {
         }
     }
 
+    /// Publishes every script command due now into
+    /// [`pending`](Self::pending), as the window publishes a key into the
+    /// player's controls.
+    fn publish_due(&mut self) {
+        let Some(now) = self.play_time() else {
+            return;
+        };
+        while let Some(&(at, c)) = self.script.commands.get(self.next_command) {
+            if at > now {
+                break;
+            }
+            self.next_command += 1;
+            self.pending.publish(c);
+        }
+    }
+
     /// The script's time now.
     fn play_time(&self) -> Option<TimeUs> {
         self.script_origin.map(|o| TimeUs(self.clock.now().0 - o.0))
@@ -1962,12 +2089,13 @@ impl<O: AudioOutput + Wakes> Rig for SessionRig<'_, O> {
     }
 
     fn take(&mut self) -> Option<Command> {
-        let now = self.play_time()?;
-        let &(at, c) = self.script.commands.get(self.next_command)?;
-        (at <= now).then(|| {
-            self.next_command += 1;
-            c
-        })
+        self.publish_due();
+        self.pending.take(false)
+    }
+
+    fn take_closing(&mut self) -> Option<Command> {
+        self.publish_due();
+        self.pending.take(true)
     }
 
     fn quitting(&self) -> bool {

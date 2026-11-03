@@ -1573,6 +1573,9 @@ fn stretch(
             lanes: view,
             readouts: stretch_readouts(frame_no, view),
             playing: true,
+            // A Closing that starts with the shown survival gauge's
+            // failure, drawn while that gauge shows.
+            closing: gauges[1].failed_at.filter(|_| shown == 1),
         };
         let use_small = frame_no % 100 == 99;
         let out = if use_small { &mut *small } else { &mut *batch };
@@ -1864,6 +1867,7 @@ fn build_does_not_allocate() {
         lanes: views.lanes[0],
         readouts: readouts_for(views.lanes[0]),
         playing: true,
+        closing: None,
     };
     skin.build(&mut play, &frame, &loaded.uvs, &mut batch)
         .expect("the frame builds");
@@ -1939,6 +1943,7 @@ fn build_does_not_allocate() {
             lanes: views.lanes[0],
             readouts: readouts_for(views.lanes[0]),
             playing: true,
+            closing: None,
         };
         bitmap
             .build(&mut play, &frame, &uvs, &mut batch)
@@ -2239,6 +2244,7 @@ fn source_lanes_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
             lanes,
             readouts: readouts_for(lanes),
             playing: true,
+            closing: None,
         };
         skin.build(&mut play, &frame, &uvs, &mut batch)
             .expect("the frame builds");
@@ -2350,6 +2356,7 @@ fn fallback_lanes_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
                 lanes,
                 readouts: readouts_for(lanes),
                 playing: true,
+                closing: None,
             };
             let out = if i % 50 == 49 { &mut small } else { &mut batch };
             out.clear();
@@ -2388,6 +2395,7 @@ fn fallback_lanes_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
                 lanes,
                 readouts: bad,
                 playing: true,
+                closing: None,
             };
             assert_eq!(
                 skin.build(&mut play, &frame, &uvs, &mut batch),
@@ -2533,6 +2541,7 @@ fn timeline_lanes_do_not_allocate(full: &PlayContext<'_>) {
                     lanes,
                     readouts: readouts_for(lanes),
                     playing: true,
+                    closing: None,
                 };
                 let out = if i % 25 == 24 { &mut small } else { &mut batch };
                 out.clear();
@@ -2576,6 +2585,7 @@ fn timeline_lanes_do_not_allocate(full: &PlayContext<'_>) {
                         lanes,
                         readouts: readouts_for(lanes),
                         playing: true,
+                        closing: None,
                     };
                     batch.clear();
                     skin.build(&mut play, &frame, &uvs, &mut batch)
@@ -2610,6 +2620,7 @@ fn timeline_lanes_do_not_allocate(full: &PlayContext<'_>) {
                     lanes,
                     readouts: bad,
                     playing: true,
+                    closing: None,
                 };
                 assert_eq!(
                     skin.build(&mut play, &frame, &uvs, &mut batch),
@@ -2832,6 +2843,7 @@ fn cover_trims_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
             lanes,
             readouts,
             playing: true,
+            closing: None,
         };
         let out = if i % 50 == 49 { &mut small } else { &mut batch };
         out.clear();
@@ -2887,6 +2899,7 @@ fn cover_trims_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
             lanes,
             readouts: bad,
             playing: true,
+            closing: None,
         };
         assert_eq!(
             skin.build(&mut play, &frame, &uvs, &mut batch),
@@ -3017,6 +3030,7 @@ fn bar_groups_do_not_allocate(ctx: &PlayContext<'_>) {
         lanes,
         readouts,
         playing: true,
+        closing: None,
     };
     let bar_uv = |uvs: &UvTable| uvs.get(lanes_support::BAR).unwrap().uv;
     let (mut quads, mut turned, mut drops) = (0_usize, 0_usize, 0_u32);
@@ -3273,6 +3287,7 @@ fn grade_attachments_do_not_allocate(ctx: &PlayContext<'_>) {
             lanes,
             readouts: readouts_for(lanes),
             playing: true,
+            closing: None,
         };
         batch.clear();
         skin.build(&mut play, &frame, &loaded.uvs, &mut batch)
@@ -3423,6 +3438,7 @@ fn large_gauges_do_not_allocate(ctx: &PlayContext<'_>, views: &Views, descs: &[G
                 lanes: view,
                 readouts: readouts_for(view),
                 playing: true,
+                closing: None,
             };
             let out = if no % 10 == 9 { &mut small } else { &mut batch };
             out.clear();
@@ -3573,6 +3589,7 @@ fn readouts_do_not_allocate(loaded: &Loaded, descs: &[GaugeDesc]) {
         lanes,
         readouts,
         playing: true,
+        closing: None,
     };
     let invalid = FrameReadouts {
         duration: Some(DurationRatio {

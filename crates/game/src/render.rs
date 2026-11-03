@@ -48,6 +48,12 @@ pub struct PlayView {
     /// completion or a failure on; the step that processed one of those
     /// still published true. Never derived from `complete`.
     pub playing: bool,
+    /// Where the play entered Closing, on its play clock (design.md "Play
+    /// Lifecycle", Closing): the time the `failed` timer starts from, for
+    /// a displayed survival failure and a quit alike; `None` outside
+    /// Closing, and never [`GaugeState::failed_at`], which stays the
+    /// evaluator's.
+    pub closing: Option<TimeUs>,
     /// The number of events this candidate emitted so far: its effects
     /// with a lower sequence number are the ones this view includes.
     pub events: u64,
@@ -315,6 +321,7 @@ mod tests {
             input: InputFacts::NONE,
             complete: false,
             playing: false,
+            closing: None,
             events: 0,
         }
     }

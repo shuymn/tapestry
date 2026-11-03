@@ -247,7 +247,7 @@ fn int(t: &toml::Table, table: &str, key: &str) -> Option<i64> {
 /// preset, A again with an input log played to the end, retried from the
 /// result, retried during the play, quit during the play to its result and
 /// left there, then B found by search, then one practice round of A at
-/// 75 % with the log, left at the next round's start; the steps run in
+/// 75 % with the log, left before the next round opens; the steps run in
 /// scene order, the log's plays are saved, re-evaluate equal and are
 /// counted into the bests, the round is saved as a section repeat at 75 %
 /// played to the end, and the capture is the log's first play's frame.
@@ -306,7 +306,7 @@ fn exit_scenario_plays_select_result_retry_repeatedly() {
         "dev: scenario: step 12 (play)",
         "play started",
         "play 3: Aborted(Quit); ",
-        // The quit while the chart plays shows the play's result.
+        // The quit while the chart plays closes it, then shows its result.
         "dev: scenario: step 13 (result)",
         "dev: scenario: step 14 (select)",
         "select: chose b.bms",
@@ -319,9 +319,7 @@ fn exit_scenario_plays_select_result_retry_repeatedly() {
         "play started",
         // The log's presses fall on 1× times: at 75 % they miss.
         "play 1: Completed; ",
-        "play started",
-        // The quit in the next round's READY state returns to the page.
-        "play 2: Aborted(Quit); nothing recorded",
+        // The rounds are left before the next opens, back to the page.
         "dev: scenario: step 18 (quit)",
     ];
     assert_eq!(
@@ -359,8 +357,8 @@ fn exit_scenario_plays_select_result_retry_repeatedly() {
     // with no allocation in the render thread's app region.
     let (records, cancelled) = fx.played_records();
     assert_eq!(records.len(), 4, "{records:?}");
-    // The quit in the next round's READY state saves its capture.
-    assert_eq!(cancelled, 1);
+    // The rounds are left before the next opens: no capture is cancelled.
+    assert_eq!(cancelled, 0);
     let decoded: Vec<PlayRecord> = records
         .iter()
         .map(|r| replay::decode(&fs::read(r).unwrap(), &DecodeLimits::default()).unwrap())
@@ -747,8 +745,12 @@ fn practice_after_autoplay_plays_its_log() {
     assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
     let (records, cancelled) = fx.played_records();
     assert_eq!(records.len(), 1, "{records:?}");
-    // The quit in the next round's READY state saves its capture.
-    assert_eq!(cancelled, 1, "{stdout}");
+    // The rounds are left at the boundary after the last: no round after
+    // it opens, so no capture is cancelled.
+    assert_eq!(cancelled, 0, "{stdout}");
+    // Autoplay's play and the round: no second round reports.
+    assert_eq!(lines(&stdout, "play 1: ").len(), 2, "{stdout}");
+    assert!(lines(&stdout, "play 2: ").is_empty(), "{stdout}");
     let round = replay::decode(&fs::read(&records[0]).unwrap(), &DecodeLimits::default()).unwrap();
     assert!(
         matches!(round.play_type, PlayType::SectionRepeat(_)),
@@ -998,4 +1000,63 @@ fn restart_keeps_the_chosen_preset() {
         decoded.preset.sha256,
         replay::preset_hash(&rules::lr2_style())
     );
+}
+
+/// A log that presses nothing, played with the HAZARD gauge shown: its
+/// first miss fails it. Under `on_failure = "close"` the play enters
+/// Closing, which lasts at least the 1 s floor before the result; under
+/// `"play-to-end"` it plays to its end.
+#[test]
+fn a_shown_survival_failure_closes_or_plays_to_the_end() {
+    for (on_failure, closes) in [("close", true), ("play-to-end", false)] {
+        let fx = Fixture::new();
+        write_chart(&fx.library(), "a", "譜面A");
+        write_log(&fx.base.join("logs").join("none.tprl"), &[], 1);
+        fs::create_dir_all(fx.data()).unwrap();
+        fs::write(
+            fx.data().join("player.toml"),
+            format!("displayed_gauge = 5\non_failure = \"{on_failure}\"\n"),
+        )
+        .unwrap();
+        let (out, stdout, stderr) = fx.run(&scenario(&[
+            "select = { path = \"library/a/a.bms\" }",
+            "play = { input = \"logs/none.tprl\", until = \"end\" }",
+            "result = \"back\"",
+            "quit = {}",
+        ]));
+        assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+        let closing = lines(&stdout, "closing: ");
+        if closes {
+            assert_eq!(
+                lines(&stdout, "play 1: Aborted(GaugeFailed)").len(),
+                1,
+                "{stdout}"
+            );
+            let [line] = closing[..] else {
+                panic!("{stdout}");
+            };
+            let lasted: i64 = line
+                .split(", ")
+                .nth(1)
+                .and_then(|d| d.strip_suffix(" us"))
+                .unwrap()
+                .parse()
+                .unwrap();
+            assert!(lasted >= 1_000_000, "{line}");
+            assert!(line.ends_with("ran out"), "{line}");
+        } else {
+            assert_eq!(lines(&stdout, "play 1: Completed").len(), 1, "{stdout}");
+            assert!(closing.is_empty(), "{stdout}");
+        }
+        let (records, _) = fx.played_records();
+        let record =
+            replay::decode(&fs::read(&records[0]).unwrap(), &DecodeLimits::default()).unwrap();
+        let (status, policy) = if closes {
+            (EndStatus::EndedMidway, "close-on-failure")
+        } else {
+            (EndStatus::PlayedToEnd, "play-to-end")
+        };
+        assert_eq!(record.status.end, status);
+        assert_eq!(record.session_policy, policy);
+    }
 }

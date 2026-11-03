@@ -146,8 +146,10 @@ impl Controls {
         }
     }
 
-    /// A system control or the system's suspend. Quit latches; a suspend is
-    /// never replaced by a later retry, so it always aborts the play.
+    /// A system control or the system's suspend. Quit latches; a retry and
+    /// a suspend are kept apart, so neither replaces the other: a suspend
+    /// still aborts the play, taken before a retry, and a retry pending
+    /// with it still ends a Closing.
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub fn command(&self, c: Command) {
         self.set_command(c);
@@ -163,7 +165,7 @@ impl Controls {
 
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn set_command(&self, c: Command) {
-        let new = match c {
+        let bit = match c {
             Command::Quit if self.leaves.load(Ordering::Acquire) => {
                 self.leave.store(true, Ordering::Release);
                 return;
@@ -178,30 +180,42 @@ impl Controls {
             }
             Command::Suspend => SUSPEND,
         };
-        let _ = self
-            .command
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |old| {
-                (old != SUSPEND).then_some(new)
-            });
+        self.command.fetch_or(bit, Ordering::AcqRel);
     }
 
     /// Takes the pending quit (while it leaves the chart), suspend or retry,
-    /// in that order: a quit drops a retry pressed with it and leaves a
-    /// suspend for the next take, so a chart the player left is left even
-    /// when the system suspends too.
+    /// in that order, one per call: a quit drops a retry pressed with it and
+    /// leaves a suspend for the next take, so a chart the player left is
+    /// left even when the system suspends too.
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub fn take(&self) -> Option<Command> {
         if self.leave.swap(false, Ordering::AcqRel) {
-            let _ = self
-                .command
-                .compare_exchange(RETRY, NONE, Ordering::AcqRel, Ordering::Acquire);
+            self.command.fetch_and(!RETRY, Ordering::AcqRel);
             return Some(Command::Quit);
         }
-        match self.command.swap(NONE, Ordering::AcqRel) {
-            RETRY => Some(Command::Retry),
-            SUSPEND => Some(Command::Suspend),
-            _ => None,
+        self.take_slot()
+    }
+
+    /// [`take`](Self::take) during Closing (design.md "Play Lifecycle",
+    /// Closing), where a quit does nothing: the pending quit is taken
+    /// without dropping a pending retry, which the next take returns.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    pub fn take_closing(&self) -> Option<Command> {
+        if self.leave.swap(false, Ordering::AcqRel) {
+            return Some(Command::Quit);
         }
+        self.take_slot()
+    }
+
+    /// The pending suspend, else the pending retry, taken.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn take_slot(&self) -> Option<Command> {
+        for (bit, c) in [(SUSPEND, Command::Suspend), (RETRY, Command::Retry)] {
+            if self.command.fetch_and(!bit, Ordering::AcqRel) & bit != 0 {
+                return Some(c);
+            }
+        }
+        None
     }
 
     /// Whether a quit key press waits to be taken (while it leaves the
@@ -306,17 +320,51 @@ mod tests {
 
     use super::Controls;
 
+    /// A retry and a suspend are kept apart whichever is published first:
+    /// the suspend is taken first, so it still decides a play's drain, and
+    /// the retry after it, so it still ends a Closing; each take empties
+    /// what it took.
     #[test]
-    fn suspend_is_never_replaced_and_take_empties() {
-        let c = Controls::new(QpcClock::start());
-        assert_eq!(c.take(), None);
-        c.command(Command::Retry);
-        assert_eq!(c.take(), Some(Command::Retry));
-        assert_eq!(c.take(), None);
-        c.command(Command::Suspend);
-        c.command(Command::Retry);
-        assert_eq!(c.take(), Some(Command::Suspend));
-        assert!(c.retry_at().is_some());
+    fn retry_and_suspend_are_kept_apart_in_either_order() {
+        for order in [
+            [Command::Suspend, Command::Retry],
+            [Command::Retry, Command::Suspend],
+        ] {
+            let c = Controls::new(QpcClock::start());
+            assert_eq!(c.take(), None);
+            for command in order {
+                c.command(command);
+            }
+            assert_eq!(c.take(), Some(Command::Suspend), "{order:?}");
+            assert_eq!(c.take(), Some(Command::Retry), "{order:?}");
+            assert_eq!(c.take(), None, "{order:?}");
+            assert!(c.retry_at().is_some());
+        }
+    }
+
+    /// During Closing the quit key is taken without dropping a retry
+    /// pressed with it, in either order, which the next take returns;
+    /// outside it, the quit drops the retry.
+    #[test]
+    fn a_quit_in_closing_keeps_the_retry_pressed_with_it() {
+        for order in [
+            [Command::Quit, Command::Retry],
+            [Command::Retry, Command::Quit],
+        ] {
+            let c = Controls::new(QpcClock::start());
+            c.quit_leaves();
+            for command in order {
+                c.command(command);
+            }
+            assert_eq!(c.take_closing(), Some(Command::Quit), "{order:?}");
+            assert_eq!(c.take_closing(), Some(Command::Retry), "{order:?}");
+            assert_eq!(c.take_closing(), None, "{order:?}");
+            for command in order {
+                c.command(command);
+            }
+            assert_eq!(c.take(), Some(Command::Quit), "{order:?}");
+            assert_eq!(c.take(), None, "{order:?}");
+        }
     }
 
     /// With song selection the quit key leaves the chart: taken once, ahead

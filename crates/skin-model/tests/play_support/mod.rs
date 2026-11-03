@@ -371,6 +371,8 @@ pub struct Harness {
     pub batch: QuadBatch,
     pub complete: bool,
     pub playing: bool,
+    /// Where the play entered Closing ([`SkinFrame::closing`]).
+    pub closing: Option<TimeUs>,
     pub target: [u32; 2],
     pub layout: Layout,
     pub view: LaneView,
@@ -400,6 +402,7 @@ impl Harness {
             batch,
             complete: false,
             playing: true,
+            closing: None,
             target: [1_920, 1_080],
             layout: Layout::AUTHOR,
             view: VIEW,
@@ -441,6 +444,7 @@ impl Harness {
             layout: &self.layout,
             lanes: self.view,
             playing: self.playing,
+            closing: self.closing,
             readouts: self.readouts.unwrap_or_else(|| readouts_for(self.view)),
         };
         self.skin

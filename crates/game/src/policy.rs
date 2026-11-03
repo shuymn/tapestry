@@ -8,18 +8,24 @@ use std::rc::Rc;
 
 use eval::GaugeState;
 use replay::EndStatus;
+use serde::{Deserialize, Serialize};
 
 /// Which of the preset's gauges is shown, by its index in the preset.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GaugeIndex(pub usize);
 
-/// What the session does when a survival gauge fails.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// What the session does when the displayed survival gauge fails
+/// (`on_failure` in `player.toml`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum FailureAction {
-    /// The play goes on to the end; the failure stays in the record.
-    KeepPlaying,
-    /// The play ends there, as ended midway.
-    EndPlay,
+    /// The play stops there: it enters Closing, ended midway, then shows
+    /// its result (design.md "Play Lifecycle", Closing).
+    #[default]
+    Close,
+    /// The play goes on to the end; the failure stays in the record and
+    /// starts no `failed` timer.
+    PlayToEnd,
 }
 
 /// The session policy extension point. It never changes evaluation.
@@ -28,24 +34,30 @@ pub trait SessionPolicy {
     fn id(&self) -> &str;
     /// The gauge shown, given every gauge's state in the preset's order.
     fn displayed_gauge(&self, gauges: &[GaugeState]) -> GaugeIndex;
-    /// What to do when a survival gauge fails.
+    /// What to do when the displayed survival gauge fails.
     fn on_survival_failure(&self) -> FailureAction;
 }
 
-/// The stage 1 policy: the gauge chosen in `player.toml` is shown, and the
-/// play goes on to the end after a failure.
+/// The stage 1 policy: the gauge chosen in `player.toml` is shown, and its
+/// survival failure does what `on_failure` chooses.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DefaultPolicy {
     /// The gauge to show; an index the preset does not have shows the
     /// first.
     pub displayed: usize,
+    /// What the displayed survival gauge's failure does.
+    pub on_failure: FailureAction,
 }
 
 impl SessionPolicy for DefaultPolicy {
     fn id(&self) -> &str {
-        "default"
+        match self.on_failure {
+            FailureAction::Close => "close-on-failure",
+            FailureAction::PlayToEnd => "play-to-end",
+        }
     }
 
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn displayed_gauge(&self, gauges: &[GaugeState]) -> GaugeIndex {
         GaugeIndex(if self.displayed < gauges.len() {
             self.displayed
@@ -56,7 +68,7 @@ impl SessionPolicy for DefaultPolicy {
 
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn on_survival_failure(&self) -> FailureAction {
-        FailureAction::KeepPlaying
+        self.on_failure
     }
 }
 

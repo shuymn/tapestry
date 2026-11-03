@@ -8,6 +8,7 @@ use bms_model::{Chart, Speed, TimeUs};
 use eval::Section;
 use rules::{GaugeRule, LnMode, RulePreset};
 
+use crate::policy::GaugeIndex;
 use crate::practice::mapped;
 use crate::prepare::ChartLabels;
 use crate::tempo::AttemptTempo;
@@ -71,6 +72,12 @@ pub struct Attempt {
     pub preset: (String, u32),
     /// The play preset's gauges, in its order.
     pub gauges: Vec<GaugeRule>,
+    /// The gauge shown, by its index in `gauges`, as the session policy
+    /// resolved it once for the attempt ([`crate::Loaded::displayed`]):
+    /// what the loading gauge, the play's frames, the report and what
+    /// closes the play all use. [`Attempt::new`] gives the first;
+    /// [`crate::Loaded::attempt`] sets the policy's.
+    pub displayed: GaugeIndex,
     /// Whether an empty POOR breaks the combo.
     pub empty_poor_breaks_combo: bool,
     /// Whether an empty POOR is counted as a POOR.
@@ -148,6 +155,7 @@ impl Attempt {
             number,
             preset: (preset.id.clone(), preset.version),
             gauges: preset.gauges.clone(),
+            displayed: GaugeIndex(0),
             empty_poor_breaks_combo: preset.empty_poor.breaks_combo,
             empty_poor_counted: preset.empty_poor.counted,
             ln_default: preset.ln_mode.default,

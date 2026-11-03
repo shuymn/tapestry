@@ -135,12 +135,14 @@ fn asset_refused(r: Run, marker: &str) {
 }
 
 /// A fresh play of `l` over an empty chart, the shown gauge failed at
-/// `failed` ms when one.
+/// `failed` ms when one, the play entering Closing there.
 fn drawn(l: &Loaded, failed: Option<i64>) -> common::play::Drawn {
     let mut d = common::play::Drawn::new(l.ok().skin.clone(), 0);
+    let at = failed.map(|f| TimeUs(f * 1_000));
     for g in &mut d.gauges {
-        g.failed_at = failed.map(|f| TimeUs(f * 1_000));
+        g.failed_at = at;
     }
+    d.closing = at;
     d
 }
 
