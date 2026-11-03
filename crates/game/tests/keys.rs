@@ -1192,3 +1192,96 @@ fn two_scratch_buttons_take_positive_then_negative() {
         (Some(0x2a), Some(0x36))
     );
 }
+
+/// More than two scratch keys of one kind: the positive one is chosen,
+/// then a distinct negative one, and the others stay lane-only; F12 at the
+/// positive prompt keeps both current directions.
+#[test]
+fn three_scratch_keys_take_a_positive_then_a_distinct_negative() {
+    let mut cur = current();
+    cur.keyboard.lanes.extend([
+        LaneKey {
+            control: 0x36,
+            lane: 0,
+        },
+        LaneKey {
+            control: 0x1d,
+            lane: 0,
+        },
+    ]);
+    cur.controller = KeyConfig::default();
+    cur.controller_device = None;
+    let to_directions = |flow: &mut KeyConfigFlow| {
+        while flow.role() != Some(Role::ScratchPositive) {
+            assert!(matches!(flow.press(kb(game::KEEP_KEY)), Press::Bound(..)));
+        }
+        assert_eq!(flow.choosing(), Some(KB));
+    };
+    let mut flow = KeyConfigFlow::new(cur.clone());
+    to_directions(&mut flow);
+    assert!(matches!(flow.press(kb(0x36)), Press::Bound(..)));
+    assert_eq!(flow.role(), Some(Role::ScratchNegative));
+    assert_eq!(
+        flow.press(kb(0x36)),
+        Press::Refused(Refusal::Key(KeyError::Adjustment(
+            AdjustKeyError::NotScratch {
+                control: 0x36,
+                role: Adjust::ScratchNegative,
+            },
+        )))
+    );
+    let Press::Done(keys) = flow.press(kb(0x1d)) else {
+        panic!("not done");
+    };
+    saves(&keys);
+    assert_eq!(
+        (
+            keys.keyboard.scratch_positive,
+            keys.keyboard.scratch_negative
+        ),
+        (Some(0x36), Some(0x1d))
+    );
+    // F12 keeps both current directions, with no negative prompt.
+    cur.keyboard.scratch_positive = Some(0x2a);
+    cur.keyboard.scratch_negative = Some(0x1d);
+    let mut flow = KeyConfigFlow::new(cur);
+    to_directions(&mut flow);
+    let Press::Done(keys) = flow.press(kb(game::KEEP_KEY)) else {
+        panic!("not done");
+    };
+    assert_eq!(
+        (
+            keys.keyboard.scratch_positive,
+            keys.keyboard.scratch_negative
+        ),
+        (Some(0x2a), Some(0x1d))
+    );
+}
+
+/// A controller's scratch direction is refused from a controller of
+/// unknown model or of another model than the one bound.
+#[test]
+fn a_scratch_direction_checks_the_controller() {
+    let mut flow = KeyConfigFlow::new(current());
+    for b in [pad(40), pad(41)] {
+        assert!(matches!(
+            flow.press_from(b, Some(MODEL_A)),
+            Press::Bound(..)
+        ));
+    }
+    while flow.role() != Some(Role::ScratchPositive) {
+        assert!(matches!(flow.press(kb(game::KEEP_KEY)), Press::Bound(..)));
+    }
+    assert_eq!(
+        flow.press_from(pad(41), None),
+        Press::Refused(Refusal::UnknownController)
+    );
+    assert_eq!(
+        flow.press_from(pad(41), Some(MODEL_B)),
+        Press::Refused(Refusal::OtherController)
+    );
+    assert!(matches!(
+        flow.press_from(pad(41), Some(MODEL_A)),
+        Press::Done(_)
+    ));
+}

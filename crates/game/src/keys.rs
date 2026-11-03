@@ -453,7 +453,10 @@ impl KeyConfigFlow {
         }
         let keep = keyboard && pressed.control == KEEP_KEY;
         if role == Role::ScratchPositive {
-            return self.choose_positive(pressed, keep);
+            return self.choose_positive(pressed, keep, product);
+        }
+        if role == Role::ScratchNegative {
+            return self.choose_negative(pressed, keep, product);
         }
         let (chosen, from) = if keep && self.other_direction() {
             // Skipped: the scratch keeps the one control it has.
@@ -497,10 +500,34 @@ impl KeyConfigFlow {
         self.next(role, chosen)
     }
 
+    /// Whether a controller's `pressed` control may be bound, from a
+    /// controller of `product`: its model must be known, and the one the
+    /// controller key config belongs to. A keyboard's always may.
+    fn controller_of(&self, pressed: Bound, product: Option<HidProduct>) -> Result<(), Refusal> {
+        if pressed.kind != DeviceKind::Controller {
+            return Ok(());
+        }
+        let Some(from) = product else {
+            return Err(Refusal::UnknownController);
+        };
+        if self.device.is_some_and(|d| d != from) {
+            return Err(Refusal::OtherController);
+        }
+        Ok(())
+    }
+
     /// Takes `pressed`, or F12 (`keep`), as the positive scratch direction
     /// of the kind of device prompted for: one of its scratch buttons or
-    /// keys; of two, the other is negative.
-    fn choose_positive(&mut self, pressed: Bound, keep: bool) -> Press {
+    /// keys, a controller's from the controller already bound. Of two, the
+    /// other is negative; of more, a distinct negative is prompted for
+    /// next, and the others stay lane-only. F12 keeps both current
+    /// directions where they are among the scratch's controls.
+    fn choose_positive(
+        &mut self,
+        pressed: Bound,
+        keep: bool,
+        product: Option<HidProduct>,
+    ) -> Press {
         let Some(kind) = self.choosing() else {
             return Press::Done(self.result());
         };
@@ -511,6 +538,9 @@ impl KeyConfigFlow {
                 _ => return self.refuse(Refusal::NothingToKeep(Role::ScratchPositive)),
             }
         } else if pressed.kind == kind && controls.contains(&pressed.control) {
+            if let Err(r) = self.controller_of(pressed, product) {
+                return self.refuse(r);
+            }
             pressed.control
         } else {
             return self.refuse(Refusal::Key(KeyError::Adjustment(
@@ -524,14 +554,80 @@ impl KeyConfigFlow {
             kind,
             control: chosen,
         };
-        if let [a, b] = controls[..] {
-            let control = if a == chosen { b } else { a };
-            self.directions
-                .push((Role::ScratchNegative, Bound { kind, control }));
+        let kept_negative = self
+            .current
+            .of(kind)
+            .scratch_negative
+            .filter(|&c| keep && c != chosen && controls.contains(&c));
+        match (kept_negative, &controls[..]) {
+            (Some(control), _) => self
+                .directions
+                .push((Role::ScratchNegative, Bound { kind, control })),
+            (None, [a, b]) => {
+                let control = if *a == chosen { *b } else { *a };
+                self.directions
+                    .push((Role::ScratchNegative, Bound { kind, control }));
+            }
+            // More than two, not kept: the negative is prompted for next.
+            (None, _) if !keep && controls.len() > 2 => {
+                let at = self.bound.len() + 1;
+                self.steps.insert(at, Role::ScratchNegative);
+            }
+            (None, _) => {}
         }
         self.bound.push((Role::ScratchPositive, vec![positive]));
         self.refused = None;
         self.next(Role::ScratchPositive, vec![positive])
+    }
+
+    /// Takes `pressed`, or F12 (`keep`), as the negative scratch direction
+    /// of the kind whose positive direction was just chosen from more than
+    /// two controls: another of its scratch buttons or keys.
+    fn choose_negative(
+        &mut self,
+        pressed: Bound,
+        keep: bool,
+        product: Option<HidProduct>,
+    ) -> Press {
+        let Some(&(_, ref positive)) = self
+            .bound
+            .iter()
+            .rev()
+            .find(|(r, _)| *r == Role::ScratchPositive)
+        else {
+            return Press::Done(self.result());
+        };
+        let Some(&positive) = positive.first() else {
+            return Press::Done(self.result());
+        };
+        let kind = positive.kind;
+        let controls = self.result().scratch_digital(kind);
+        let usable = |c: u32| c != positive.control && controls.contains(&c);
+        let chosen = if keep {
+            match self.current.of(kind).scratch_negative {
+                Some(c) if usable(c) => c,
+                _ => return self.refuse(Refusal::NothingToKeep(Role::ScratchNegative)),
+            }
+        } else if pressed.kind == kind && usable(pressed.control) {
+            if let Err(r) = self.controller_of(pressed, product) {
+                return self.refuse(r);
+            }
+            pressed.control
+        } else {
+            return self.refuse(Refusal::Key(KeyError::Adjustment(
+                AdjustKeyError::NotScratch {
+                    control: pressed.control,
+                    role: Adjust::ScratchNegative,
+                },
+            )));
+        };
+        let negative = Bound {
+            kind,
+            control: chosen,
+        };
+        self.bound.push((Role::ScratchNegative, vec![negative]));
+        self.refused = None;
+        self.next(Role::ScratchNegative, vec![negative])
     }
 
     /// After `role` is bound to `chosen`: the next prompt, or once
