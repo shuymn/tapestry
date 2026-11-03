@@ -246,6 +246,7 @@ pub const IN_PLAY: &[Site] = &[
         &[
             "PlayerRig::sync",
             "PlayerRig::speed_line",
+            "PlayerRig::adjustments_failure",
             "PlayerRig::serve_adjustments",
             "serve_adjustments",
             "PlayerPump::display_offset_us",

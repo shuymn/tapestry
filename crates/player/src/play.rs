@@ -340,6 +340,7 @@ impl PlayerRig<'_> {
 
     /// The adjustments' first failed wait on the input thread, latched by
     /// the driver.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn adjustments_failure(&self) -> Option<InputWaitError> {
         self.adjust.as_ref().and_then(game::AdjustDriver::failure)
     }
