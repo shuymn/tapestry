@@ -129,6 +129,8 @@ impl crate::loudness::Host for LoadHost<'_> {
 
     fn cancelled(&mut self) -> bool {
         // Every block of the measurement serves the adjustments.
+        #[cfg(feature = "dev-tools")]
+        crate::dev::press_due(self.controls, crate::dev::LoadPhase::Measuring);
         crate::play::serve_adjustments(
             self.adjust.as_deref_mut(),
             self.input,
@@ -526,6 +528,9 @@ impl Selection {
                     script.slow_load.get_or_insert_default().close = true;
                 }
                 Some(SelectStep::SlowMeasuring(ms)) => crate::dev::slow_measuring(ms),
+                Some(SelectStep::SlowDecoding(ms)) => crate::dev::slow_decoding(ms),
+                Some(SelectStep::SlowPreparing(ms)) => crate::dev::slow_preparing(ms),
+                Some(SelectStep::PressLoading(ms)) => crate::dev::press_loading(ms),
                 Some(SelectStep::HoldBackground) => crate::dev::hold_background(),
                 Some(SelectStep::Background(running)) => {
                     let done = if running {
@@ -1656,6 +1661,8 @@ impl AppRig for PlayerRig<'_> {
                 speed,
                 &audio::BankLimits::default(),
                 &|done, files| {
+                    #[cfg(feature = "dev-tools")]
+                    crate::dev::hold_decoding();
                     progress.decoded(done, files);
                     #[cfg(feature = "dev-tools")]
                     if quit_decoding && done == 1 {
@@ -1669,6 +1676,8 @@ impl AppRig for PlayerRig<'_> {
         let decoded_bank = std::thread::scope(|s| {
             let worker = s.spawn(decode);
             while !worker.is_finished() {
+                #[cfg(feature = "dev-tools")]
+                crate::dev::press_due(controls, crate::dev::LoadPhase::Decoding);
                 crate::play::serve_adjustments(adjust.as_mut(), input, controls.tuning());
                 std::thread::park_timeout(crate::play::MARKER_PARK);
             }
@@ -1676,6 +1685,8 @@ impl AppRig for PlayerRig<'_> {
                 .join()
                 .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
         });
+        #[cfg(feature = "dev-tools")]
+        crate::dev::print_adjustments("decoding", self.adjust.as_ref());
         let bank = match decoded_bank {
             Ok(bank) => {
                 progress.completed();
@@ -1753,6 +1764,8 @@ impl AppRig for PlayerRig<'_> {
             println!("load: cancelled");
             return Ok(Loading::Cancelled);
         }
+        #[cfg(feature = "dev-tools")]
+        crate::dev::print_adjustments("measuring", self.adjust.as_ref());
         let measured = self.clock.now();
         // A cached measurement asks nothing: the screen is not waited for
         // after a quit or a close.

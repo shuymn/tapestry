@@ -983,7 +983,7 @@ impl RenderLink {
     }
 
     /// How many end pages were shown so far.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "dev-tools"))]
     pub fn end_pages_shown(&self) -> u64 {
         self.end_pages.load(Ordering::Relaxed)
     }
@@ -2519,6 +2519,8 @@ impl Run {
             text: &text,
             target: screen.target(),
         };
+        #[cfg(feature = "dev-tools")]
+        crate::dev::hold_preparing();
         let Some(answer) = screen.prepare_attempt(&a, p.skin.as_ref(), p.request) else {
             return;
         };

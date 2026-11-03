@@ -15,7 +15,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -54,6 +54,7 @@ pub fn hold_measuring(stop: &mut dyn FnMut() -> bool) -> bool {
         return true;
     }
     println!("dev: the measurement holds {} ms", total.as_millis());
+    let _stall = Stall::begin();
     let began = std::time::Instant::now();
     loop {
         if stop() {
@@ -67,6 +68,129 @@ pub fn hold_measuring(stop: &mut dyn FnMut() -> bool) -> bool {
     }
 }
 
+/// How long the next load's decode holds at its first decoded file, ms
+/// (a script's `slow-decoding`).
+static SLOW_DECODING: AtomicU64 = AtomicU64::new(0);
+/// How long the render thread holds the next attempt's preparation, ms
+/// (a script's `slow-preparing`).
+static SLOW_PREPARING: AtomicU64 = AtomicU64::new(0);
+/// A load's phase holds now (`slow-decoding`, `slow-measuring`,
+/// `slow-preparing`): a `press-loading` press waits for it.
+static STALLED: AtomicBool = AtomicBool::new(false);
+
+/// Marks a hold for its length.
+struct Stall;
+
+impl Stall {
+    fn begin() -> Self {
+        STALLED.store(true, Ordering::SeqCst);
+        Self
+    }
+}
+
+impl Drop for Stall {
+    fn drop(&mut self) {
+        STALLED.store(false, Ordering::SeqCst);
+    }
+}
+/// The phase of the next load in which F2 is pressed on the window (a
+/// script's `press-loading`): one of [`LoadPhase`], `u8::MAX` for none.
+static PRESS_LOADING: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(u8::MAX);
+
+/// A phase of a load the game thread waits through, serving the
+/// adjustments.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LoadPhase {
+    /// The sounds decode.
+    Decoding,
+    /// The loudness is measured.
+    Measuring,
+    /// The render thread prepares the attempt.
+    Preparing,
+}
+
+impl LoadPhase {
+    /// The phase a script names.
+    pub fn named(name: &str) -> Option<Self> {
+        match name {
+            "decoding" => Some(Self::Decoding),
+            "measuring" => Some(Self::Measuring),
+            "preparing" => Some(Self::Preparing),
+            _ => None,
+        }
+    }
+}
+
+/// The next load's decode holds `ms` at its first decoded file
+/// (`slow-decoding`).
+pub fn slow_decoding(ms: u64) {
+    SLOW_DECODING.store(ms, Ordering::Relaxed);
+}
+
+/// Holds the decode as `slow-decoding` says, once: on the decode's own
+/// thread, while the game thread serves the adjustments.
+pub fn hold_decoding() {
+    let ms = SLOW_DECODING.swap(0, Ordering::Relaxed);
+    if ms > 0 {
+        println!("dev: the decode holds {ms} ms");
+        let _stall = Stall::begin();
+        std::thread::sleep(Duration::from_millis(ms));
+    }
+}
+
+/// The render thread holds the next attempt's preparation `ms`
+/// (`slow-preparing`).
+pub fn slow_preparing(ms: u64) {
+    SLOW_PREPARING.store(ms, Ordering::Relaxed);
+}
+
+/// Holds the attempt's preparation on the render thread as
+/// `slow-preparing` says, once, while the game thread waits for it.
+pub fn hold_preparing() {
+    let ms = SLOW_PREPARING.swap(0, Ordering::Relaxed);
+    if ms > 0 {
+        println!("dev: the preparation holds {ms} ms");
+        let _stall = Stall::begin();
+        std::thread::sleep(Duration::from_millis(ms));
+    }
+}
+
+/// F2 is pressed on the window at the first wait of `phase` in the next
+/// load (`press-loading`): an autoplay session's speed key, which reaches
+/// the adjustments through the window's queue.
+pub fn press_loading(phase: LoadPhase) {
+    PRESS_LOADING.store(phase as u8, Ordering::Relaxed);
+}
+
+/// Presses F2 on the window when a `press-loading` press is due in
+/// `phase`, the load's phase now, while that phase holds.
+pub fn press_due(controls: &crate::controls::Controls, phase: LoadPhase) {
+    if !STALLED.load(Ordering::SeqCst) {
+        return;
+    }
+    let due = PRESS_LOADING
+        .compare_exchange(phase as u8, u8::MAX, Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok();
+    if due {
+        controls.window_key(1, input::WindowKeyEvent::Press, false);
+        controls.window_key(1, input::WindowKeyEvent::Release, false);
+        println!("dev: F2 pressed while {phase:?}");
+    }
+}
+
+/// Prints the adjustments' published hi-speed after `phase` of a load.
+pub fn print_adjustments(phase: &str, driver: Option<&game::AdjustDriver>) {
+    let Some(h) = driver.and_then(|d| d.snapshot().hispeed) else {
+        return;
+    };
+    let (n, d) = (u128::from(h.num()), u128::from(h.den()));
+    let x = (200 * n + d) / (2 * d);
+    println!(
+        "dev: adjustments after {phase}: hi-speed {}.{:02}",
+        x / 100,
+        x % 100
+    );
+}
 /// Background measurements hold at their gate (`hold-background`).
 static GATE_ARMED: AtomicBool = AtomicBool::new(false);
 
@@ -541,6 +665,15 @@ pub enum SelectStep {
     /// milliseconds before its first block, stopped as a measurement is: a
     /// slow measurement, a load's or the background's.
     SlowMeasuring(u64),
+    /// The next load's decode holds this many milliseconds at its first
+    /// file (`slow-decoding`).
+    SlowDecoding(u64),
+    /// The next attempt's preparation holds this many milliseconds on the
+    /// render thread (`slow-preparing`).
+    SlowPreparing(u64),
+    /// F2 is pressed on the window in this phase of the next load
+    /// (`press-loading`).
+    PressLoading(LoadPhase),
     /// Every background measurement from here on holds at its gate, past
     /// its first stop check and its line, until a load waits for it or the
     /// run ends.
@@ -653,7 +786,7 @@ impl SelectScript {
                 Some(("wait", f)) => Ok(SelectStep::Wait(f.to_owned())),
                 Some(("search", t)) => Ok(SelectStep::Search(t.to_owned())),
                 Some(("sleep", ms)) => ms.parse().map(SelectStep::Sleep).map_err(|_| {
-                    format!("{s} is not pick=, wait=, search=, sleep=, idle=, slow-load=, slow-measuring=, hold-background, background=running, background=idle, enter, prev-preset, next-preset, drawn, back, retry, next, prev, close-measuring, quit-measuring, quit-decoding, quit-loading, close-loading or close")
+                    format!("{s} is not pick=, wait=, search=, sleep=, idle=, slow-load=, slow-measuring=, slow-decoding=, slow-preparing=, press-loading=, hold-background, background=running, background=idle, enter, prev-preset, next-preset, drawn, back, retry, next, prev, close-measuring, quit-measuring, quit-decoding, quit-loading, close-loading or close")
                 }),
                 Some(("idle", ms)) => ms
                     .parse()
@@ -667,6 +800,17 @@ impl SelectScript {
                     .parse()
                     .map(SelectStep::SlowMeasuring)
                     .map_err(|_| format!("{s} takes milliseconds")),
+                Some(("slow-decoding", ms)) => ms
+                    .parse()
+                    .map(SelectStep::SlowDecoding)
+                    .map_err(|_| format!("{s} takes milliseconds")),
+                Some(("slow-preparing", ms)) => ms
+                    .parse()
+                    .map(SelectStep::SlowPreparing)
+                    .map_err(|_| format!("{s} takes milliseconds")),
+                Some(("press-loading", phase)) => LoadPhase::named(phase)
+                    .map(SelectStep::PressLoading)
+                    .ok_or_else(|| format!("{s} takes decoding, measuring or preparing")),
                 Some(("background", "running")) => Ok(SelectStep::Background(true)),
                 Some(("background", "idle")) => Ok(SelectStep::Background(false)),
                 None if s == "enter" => Ok(SelectStep::Enter),
@@ -685,7 +829,7 @@ impl SelectScript {
                 None if s == "hold-background" => Ok(SelectStep::HoldBackground),
                 None if s == "close" => Ok(SelectStep::Close),
                 _ => Err(format!(
-                    "{s} is not pick=, wait=, search=, sleep=, idle=, slow-load=, slow-measuring=, hold-background, background=running, background=idle, enter, prev-preset, next-preset, drawn, back, retry, next, prev, close-measuring, quit-measuring, quit-decoding, quit-loading, close-loading or close"
+                    "{s} is not pick=, wait=, search=, sleep=, idle=, slow-load=, slow-measuring=, slow-decoding=, slow-preparing=, press-loading=, hold-background, background=running, background=idle, enter, prev-preset, next-preset, drawn, back, retry, next, prev, close-measuring, quit-measuring, quit-decoding, quit-loading, close-loading or close"
                 )),
             })
             .map(|step| step.map(|s| (s, None)))

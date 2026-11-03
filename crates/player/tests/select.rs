@@ -1123,3 +1123,56 @@ fn the_select_screen_is_drawn_after_a_results_quit_key() {
         );
     }
 }
+
+/// An adjustment while a load's phase stalls is published before the load
+/// ends (design.md "Play Adjustments": the game thread serves the
+/// adjustments through every wait of a load): F2, on the window in this
+/// autoplay session, pressed while `phase` holds, steps hi-speed from 4.00
+/// to 4.50 (120 BPM, target 300) before that phase is over, and READY
+/// starts after it.
+fn an_adjustment_during_a_stalled_phase_is_published(stall: &str, phase: &str, held: &str) {
+    let fx = fixture();
+    write_chart(&fx.library, "a", "a.bms", "譜面A", 4_000);
+    let (_, stdout) = run(
+        &fx,
+        &format!("{stall},press-loading={phase},pick=a.bms,enter,back,close"),
+        &[],
+    );
+    let at = |from: usize, line: &str| {
+        find_from(&stdout, from, line).unwrap_or_else(|| panic!("no {line}:\n{stdout}"))
+    };
+    let holds = at(0, held);
+    let pressed = at(holds, "dev: F2 pressed while ");
+    let published = at(
+        pressed,
+        &format!("dev: adjustments after {phase}: hi-speed 4.50"),
+    );
+    at(published, "play started");
+}
+
+#[test]
+fn a_select_during_a_stalled_decode_is_published_before_loading_ends() {
+    an_adjustment_during_a_stalled_phase_is_published(
+        "slow-decoding=1500",
+        "decoding",
+        "dev: the decode holds 1500 ms",
+    );
+}
+
+#[test]
+fn a_select_during_a_stalled_measurement_is_published_before_loading_ends() {
+    an_adjustment_during_a_stalled_phase_is_published(
+        "slow-measuring=1500",
+        "measuring",
+        "dev: the measurement holds 1500 ms",
+    );
+}
+
+#[test]
+fn an_adjustment_during_a_stalled_render_preparation_is_published_before_it_ends() {
+    an_adjustment_during_a_stalled_phase_is_published(
+        "slow-preparing=1500",
+        "preparing",
+        "dev: the preparation holds 1500 ms",
+    );
+}

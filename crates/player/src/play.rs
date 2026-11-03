@@ -733,6 +733,8 @@ impl Rig for PlayerRig<'_> {
         let mut adjust = self.adjust.take();
         let rig = &*self;
         let prepared = rig.render.prepare_attempt(attempt, || {
+            #[cfg(feature = "dev-tools")]
+            crate::dev::press_due(rig.controls, crate::dev::LoadPhase::Preparing);
             serve_adjustments(adjust.as_mut(), &rig.input, rig.controls.tuning());
             preparation_stops(
                 rig.quitting(),
@@ -742,6 +744,8 @@ impl Rig for PlayerRig<'_> {
             )
         });
         self.adjust = adjust;
+        #[cfg(feature = "dev-tools")]
+        crate::dev::print_adjustments("preparing", self.adjust.as_ref());
         prepared
     }
 
