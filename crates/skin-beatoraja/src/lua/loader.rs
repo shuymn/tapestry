@@ -63,9 +63,13 @@ impl Store {
         used: &mut u64,
         at: impl Fn() -> Option<Loc>,
     ) -> Result<(FileId, Arc<[u8]>), ImportError> {
-        let found = self.snapshots.iter().find(|s| s.key == key).cloned();
+        let found = self
+            .snapshots
+            .iter()
+            .find(|s| s.key == key)
+            .map(|s| (s.id.clone(), Arc::clone(&s.bytes)));
         let (id, bytes) = match found {
-            Some(s) => (s.id, s.bytes),
+            Some(found) => found,
             None => {
                 let max = MAX_FILE_BYTES.min(MAX_INPUT_BYTES.saturating_sub(*used));
                 let (bytes, id) = root.read(key, max).map_err(|source| match source {
@@ -97,13 +101,9 @@ impl Store {
                 (id, bytes)
             }
         };
+        // A snapshot was read within MAX_FILE_BYTES; only the cumulative
+        // allowance is checked again.
         let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-        if len > MAX_FILE_BYTES {
-            return Err(ImportError::Input {
-                at: at(),
-                limit: InputLimit::FileBytes,
-            });
-        }
         if used.saturating_add(len) > MAX_INPUT_BYTES {
             return Err(ImportError::Input {
                 at: at(),

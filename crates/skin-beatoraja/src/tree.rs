@@ -101,8 +101,7 @@ pub(crate) enum LuaScalar {
 }
 
 /// A function a Lua skin's table held: where it was defined, and what it
-/// is. It is never run; the importer refuses or freezes the field it
-/// reaches ([`crate::lua`]).
+/// is. It is never run; the importer refuses it ([`crate::lua`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Callable {
     /// The module that defined it, an index of [`LuaText::modules`];

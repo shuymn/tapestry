@@ -421,7 +421,7 @@ impl Conv<'_> {
             for k in keys {
                 let span = self.text(&k)?;
                 let v: Value = t
-                    .raw_get(mlua::BString::from(k.clone()))
+                    .raw_get(mlua::BString::from(k))
                     .map_err(|e| self.mlua(&e))?;
                 let child = self.value(&v, Some(span), depth + 1)?;
                 link(self, child);

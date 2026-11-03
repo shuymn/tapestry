@@ -41,17 +41,20 @@ pub const INSTRUCTION_STEP: u32 = 100;
 /// and refuses nothing a skin needs. One `skin_lua` fuzz input imports up
 /// to three times, so that target's timeout is 25 s.
 pub const MAX_LUA_TIME: std::time::Duration = std::time::Duration::from_secs(5);
-/// The most calls into the functions the host exposes, each charged
-/// before it does any work.
+/// The most calls into the functions the host exposes to skins and to
+/// the sandbox's protected calls, each charged before it does any work;
+/// the library's own `charge`, `refuse` and `metatable` callbacks are
+/// not counted, their work O(1).
 pub const MAX_HOST_CALLS: u32 = 100_000;
 /// The most bytes the sandbox library's native primitives may produce in
 /// all ([`super::library`]): each call's result size is known from its
 /// validated arguments and charged before the call. Every loop whose
-/// length a skin chooses runs as Lua instead, under
+/// length a skin chooses runs as Lua instead (but `next`'s scan of empty
+/// slots, which VM memory bounds), under
 /// [`MAX_INSTRUCTIONS`]. The VM's own string operations are single
 /// instructions over strings the memory limit bounds, under [`MAX_LUA_TIME`].
 pub const MAX_NATIVE_WORK: u64 = 100_000_000;
 /// The largest result one native primitive call may produce (a
-/// substring, a repetition, a formatted or joined string, a capture), in
+/// substring, a formatted or joined string, a capture), in
 /// bytes; a larger one is refused before the call.
 pub const MAX_PRIMITIVE_BYTES: i64 = 1 << 20;

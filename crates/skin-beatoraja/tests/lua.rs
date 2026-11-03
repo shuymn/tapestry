@@ -25,22 +25,14 @@ const REP: &str = "local function rep(s, n) local r, p = \"\", s \
 /// A skin folder with `files` and a 64×64 `a.png`; the entry
 /// `s.luaskin` has [`REP`].
 fn folder(files: &[(&str, &str)]) -> TempDir {
-    let with_rep: Vec<(String, String)> = files
-        .iter()
-        .map(|(name, text)| {
-            let text = if *name == "s.luaskin" {
-                format!("{REP}{text}")
-            } else {
-                (*text).to_owned()
-            };
-            ((*name).to_owned(), text)
-        })
-        .collect();
-    let refs: Vec<(&str, &str)> = with_rep
-        .iter()
-        .map(|(n, t)| (n.as_str(), t.as_str()))
-        .collect();
-    let d = common::skin(&refs);
+    let d = tempfile::tempdir().unwrap();
+    for &(name, text) in files {
+        if name == "s.luaskin" {
+            common::write(d.path(), name, format!("{REP}{text}").as_bytes());
+        } else {
+            common::write(d.path(), name, text.as_bytes());
+        }
+    }
     common::png(d.path(), "a.png", 64, 64);
     d
 }
@@ -50,18 +42,9 @@ fn header(d: &TempDir) -> Result<LuaHeader, ImportError> {
     read_lua_header(d.path(), "s.luaskin", &Cancel::new())
 }
 
-/// Both passes of `s.luaskin` with `config` made from the header.
-fn import_with(
-    d: &TempDir,
-    config: impl FnOnce(&LuaHeader) -> Config,
-) -> Result<LuaImported, ImportError> {
-    let h = header(d)?;
-    h.import(&config(&h), &Cancel::new())
-}
-
 /// Both passes of `s.luaskin` with the default configuration.
 fn import(d: &TempDir) -> Result<LuaImported, ImportError> {
-    import_with(d, |h| Config::defaults(h.header()))
+    common::lua_import(d.path())
 }
 
 /// A play skin: the header's `fields`, then `body` run in the configured

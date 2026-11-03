@@ -17,7 +17,8 @@
 //! Every loop whose length a skin chooses (a pattern match, a table
 //! shift, a sort, a format's scan, a metatable's copy, an `ipairs`
 //! step) runs as metered Lua and sees cancellation at each instruction
-//! step. A native function the library keeps is its private upvalue,
+//! step, except `next`'s scan of a table's empty slots, which VM memory
+//! bounds (the table below). A native function the library keeps is its private upvalue,
 //! called only with arguments of the exact Lua type it takes, checked
 //! first and never coerced, and only for a result whose size is known
 //! and charged in bytes to
@@ -27,8 +28,9 @@
 //! would consult, is refused, as are `%b`, `%f`, `%z` and back
 //! references, an unsized format conversion and any other `tonumber`
 //! base. An ordinary error stays a Lua value raised in Lua; the host's
-//! primitives fail only with the ledger's fault, and its bridge functions
-//! take their arguments checked here and never raise one.
+//! primitives fail only with the ledger's fault. `get_path` takes its
+//! argument checked here, the loaders check their names in Rust before
+//! copying them, and no host function raises an error.
 //!
 //! # The bound of every native
 //!
@@ -78,14 +80,18 @@
 //! and its Lua face raises a fault as a fixed marker, so no error carries
 //! a traceback outside the VM's memory. Each takes a fixed number of
 //! arguments, at most four (the protected calls' `settle`), extras
-//! dropped in Lua before the call: mlua converts and pins every argument
-//! before the host function runs, and its auxiliary stack starts with 17
-//! free slots (`LUA_MINSTACK` less its reserve of 3), so a host call's
-//! own arguments never make it grow; nested loads (at most 16 deep) pin a
-//! few more each. The instruction hook raises its fault as mlua's own
-//! error, with no traceback; after it, the protected calls raise the
-//! marker as they unwind, and the hook raises the fault again only past a
-//! grace of 1 000 steps.
+//! dropped in Lua before the call: mlua decodes and pins every argument
+//! before the host function runs, a failure there an error the host
+//! never sees, so the number it pins is bounded. A skin-facing host
+//! function decodes at most one reference. `loader::run` moves its
+//! packer, handler and chunk handles into the owned argument list it
+//! calls with, and mlua releases those references before Lua runs, so a
+//! load holds none of its own across the chunk and 16 nested loads pin no
+//! more than one does; any handle acquired after decoding is inside the
+//! status boundary, its failure a fault. The instruction hook raises its
+//! fault as mlua's own error, with no traceback; after it, the protected
+//! calls raise the marker as they unwind, and past a grace of 1 000 steps
+//! the hook raises the fault again at every step.
 //!
 //! Skin code never runs with the hook off: Lua runs the message handler
 //! where an error is raised, inside the instruction hook for a fault, so
@@ -114,9 +120,9 @@ const LIBRARY: &str = include_str!("library.lua");
 /// one string.
 pub(super) const STRING_BRIDGE: &str = "tapestry.string_bridge";
 
-/// What `library.lua` refuses, by its refusal code (1 first); code 8 is a
+/// What `library.lua` refuses, by its refusal code (1 first); code 0 is a
 /// finalizer, [`LuaWhy::Finalizer`].
-pub(crate) const REFUSED: [&str; 11] = [
+pub(crate) const REFUSED: [&str; 10] = [
     "pattern %b",
     "pattern %f",
     "pattern back reference",
@@ -124,14 +130,13 @@ pub(crate) const REFUSED: [&str; 11] = [
     "result over the primitive cap",
     "format conversion",
     "pattern %z",
-    "metatable with __gc, __mode or __close",
     "tonumber of a long numeral or another base",
     "metatable __name over 64 bytes",
     "bridge argument over the path limit",
 ];
 
 /// The code of a finalizer refusal.
-const FINALIZER: i64 = 8;
+const FINALIZER: i64 = 0;
 
 /// Installs the library in `env`, from the natives of `base`, the VM's
 /// own globals, which no skin reaches.

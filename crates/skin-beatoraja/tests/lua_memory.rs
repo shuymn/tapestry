@@ -19,8 +19,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use skin_beatoraja::lua::MAX_CONVERTED_BYTES;
 use skin_beatoraja::lua::limits::MAX_LUA_MEMORY;
 use skin_beatoraja::{
-    Cancel, Config, ImportError, InputLimit, LuaHeader, LuaImported, LuaLimit, LuaWhy,
-    read_lua_header,
+    Cancel, ImportError, InputLimit, LuaHeader, LuaImported, LuaLimit, LuaWhy, read_lua_header,
 };
 
 /// The recorded bound: the largest measured peak over the fixtures plus
@@ -100,8 +99,7 @@ fn header(root: &Path) -> Result<LuaHeader, ImportError> {
 }
 
 fn both(root: &Path) -> Result<LuaImported, ImportError> {
-    let h = header(root)?;
-    h.import(&Config::defaults(h.header()), &Cancel::new())
+    common::lua_import(root)
 }
 
 /// A folder holding `entry` as `s.luaskin` and a 64×64 `a.png`.

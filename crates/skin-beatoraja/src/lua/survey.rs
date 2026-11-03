@@ -74,7 +74,7 @@ fn label(e: &ImportError) -> String {
     }
 }
 
-/// The label of a note's kind: its variant, and a callable's field.
+/// The label of a note's kind.
 fn note(kind: &NoteKind) -> String {
     match kind {
         NoteKind::UnsupportedField { field } => format!("UnsupportedField {field}"),

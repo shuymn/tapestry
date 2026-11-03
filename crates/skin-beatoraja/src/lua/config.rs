@@ -133,12 +133,13 @@ pub(super) fn install(
     let native = host(lua, pass, 1, |lua, pass, args| {
         // Its length is checked before any copy, as the library's is.
         let path = match args.front() {
-            Some(Value::String(p)) if p.as_bytes().len() <= MAX_PATH_BYTES => {
-                p.to_str().ok().map(|p| p.to_owned())
-            }
+            Some(Value::String(p)) if p.as_bytes().len() <= MAX_PATH_BYTES => p
+                .to_str()
+                .ok()
+                .and_then(|p| pass.bridge.as_ref().and_then(|b| b.path(&p))),
             _ => None,
         };
-        match path.and_then(|p| pass.bridge.as_ref().and_then(|b| b.path(&p))) {
+        match path {
             Some(s) if s.len() <= MAX_PATH_BYTES => Ok(Value::String(lua.create_string(s)?)),
             _ => Ok(Value::Nil),
         }

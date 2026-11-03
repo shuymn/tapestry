@@ -37,7 +37,7 @@ local error, select = native_error, native_select
 -- The refusal codes library.rs names.
 local PATTERN_BALANCE, PATTERN_FRONTIER, PATTERN_BACKREF = 1, 2, 3
 local METATABLE, TOO_LARGE, FORMAT, PATTERN_ZERO = 4, 5, 6, 7
-local FINALIZER, TONUMBER, NAME, PATH = 8, 9, 10, 11
+local FINALIZER, TONUMBER, NAME, PATH = 0, 8, 9, 10
 
 -- The most values string.char takes in one call.
 local MAX_VALUES = 4096
@@ -111,7 +111,6 @@ local function plain(t, n, fname)
   if native_getmetatable(t) ~= nil then
     refuse(METATABLE)
   end
-  return t
 end
 
 -- Charges n bytes a native call allocates, refusing a result past the
@@ -980,8 +979,7 @@ function base.tonumber(v, b)
   end
   str(v, 1, "tonumber")
   local i, l = 1, #v
-  local function space(c) return c == 32 or (c >= 9 and c <= 13) end
-  while i <= l and space(byte(v, i)) do
+  while i <= l and is_space(byte(v, i)) do
     i = i + 1
   end
   local negative = false
@@ -1001,7 +999,7 @@ function base.tonumber(v, b)
     digits = digits + 1
     i = i + 1
   end
-  while i <= l and space(byte(v, i)) do
+  while i <= l and is_space(byte(v, i)) do
     i = i + 1
   end
   if digits == 0 or i <= l then

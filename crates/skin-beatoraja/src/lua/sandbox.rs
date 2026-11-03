@@ -28,7 +28,10 @@
 //!
 //! There is no `io`, `os`, `debug`, `package`, `load`, `loadfile`,
 //! `collectgarbage`, `print`, `warn`, `coroutine` or `utf8`. Every
-//! function the host adds charges one host call before its work.
+//! function the host adds to the environment, and every one the
+//! protected calls use, charges one host call before its work; the
+//! library's private `charge`, `refuse` and `metatable` callbacks, O(1),
+//! do not.
 
 use std::rc::Rc;
 
