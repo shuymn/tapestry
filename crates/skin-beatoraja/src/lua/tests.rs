@@ -23,6 +23,13 @@ thread_local! {
     static AT_CONVERTED: RefCell<Option<Action>> = RefCell::new(None);
     /// The VMs alive on this thread.
     static LIVE: Cell<usize> = const { Cell::new(0) };
+    /// The passes this thread has run.
+    pub(crate) static PASSES: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Called as each pass starts.
+pub(crate) fn pass_witness() {
+    PASSES.with(|n| n.set(n.get() + 1));
 }
 
 /// Called at every charged host call.

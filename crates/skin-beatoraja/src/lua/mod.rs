@@ -377,6 +377,8 @@ fn pass(
     cancel: &Cancel,
     bridge: Option<Bridge>,
 ) -> (Result<Converted, ImportError>, Store, Counts) {
+    #[cfg(test)]
+    tests::pass_witness();
     let pass = Rc::new(Pass::new(root, entry, store, counts, cancel, bridge));
     let r = run_pass(&pass, entry);
     let counts = pass.ledger.counts();
@@ -593,7 +595,19 @@ impl LuaHeader {
     /// The configured pass and the common import, with the candidate's
     /// metadata kept on every outcome.
     pub(crate) fn complete(&self, config: &Config, cancel: &Cancel) -> Outcome<Imported> {
-        let (def, mut counts, mut store) = self.configured(config, cancel);
+        let (def, counts, store) = self.configured(config, cancel);
+        self.finish(def, counts, store, config)
+    }
+
+    /// The common import of a configured pass's outcome, with the
+    /// candidate's metadata kept on every outcome.
+    pub(crate) fn finish(
+        &self,
+        def: Result<Definition, ImportError>,
+        mut counts: Counts,
+        mut store: Store,
+        config: &Config,
+    ) -> Outcome<Imported> {
         let result = def.and_then(|mut def| {
             let r = convert::refuse_callables(&def.arena)
                 .and_then(|()| import(&mut def, &self.header, config));

@@ -132,10 +132,10 @@ pub fn survey(root: &Path, entry: &str, cancel: &Cancel) -> Survey {
     };
     let config = Config::defaults(h.header());
     let mut s = Survey::default();
+    // One configured pass: its functions counted, then its definition
+    // imported.
     let (def, counts, store) = h.configured(&config, cancel);
-    s.usage = counts;
-    s.modules = store.dependencies.len();
-    if let Ok(def) = def {
+    if let Ok(def) = &def {
         {
             for (_, field, kind) in callables(&def.arena) {
                 let kind = match kind {
@@ -153,7 +153,7 @@ pub fn survey(root: &Path, entry: &str, cancel: &Cancel) -> Survey {
             }
         }
     }
-    let o = h.complete(&config, cancel);
+    let o = h.finish(def, counts, store, &config);
     s.usage = o.counts;
     s.modules = o.dependencies.len();
     match o.result {
@@ -208,5 +208,18 @@ mod tests {
         let (module, line, col) = s.at.unwrap();
         assert_eq!((module, line), (0, 0));
         assert!(col > 1, "{col}");
+    }
+
+    #[test]
+    fn the_survey_runs_each_pass_once() {
+        let d = folder(&[(
+            "s.luaskin",
+            "if skin_config then for i = 1, 4000000 do end end
+return { type = 0 }",
+        )]);
+        crate::lua::tests::PASSES.with(|n| n.set(0));
+        let s = survey(d.path(), "s.luaskin", &Cancel::new());
+        assert_eq!(crate::lua::tests::PASSES.with(std::cell::Cell::get), 2);
+        assert!(s.usage.instructions >= 4_000_000 && s.usage.instructions < 5_000_000);
     }
 }
