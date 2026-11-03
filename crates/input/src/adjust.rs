@@ -652,6 +652,10 @@ impl AdjustmentTap {
     /// back sends a verified baseline; until then observations are not
     /// sent.
     pub fn set_focus(&mut self, focused: bool, losses: u64) {
+        // Focus going away sends Lost and an unverified Resync at once, not
+        // a Resync held back until focus returns (design B3), so a marker
+        // behind the recovery never waits on focus; the return sends a
+        // verified one. Under review.
         let lost = losses != self.losses || (self.focused && !focused);
         let back = focused && !self.focused;
         self.losses = losses;
@@ -826,7 +830,10 @@ impl AdjustmentTap {
         if !self.active {
             return;
         }
-        // A cancellation follows the batch whose hold caused it.
+        // A cancellation follows the batch whose hold caused it, not the
+        // causing press itself (design B2 says after the press): SELECT is
+        // a hold too, so a request made with it in one batch is still made
+        // under the candidate's clock. Under review.
         if let Some(generation) = self.cancelled.take() {
             self.owed.push(Marker::Cancelled { generation });
         }
