@@ -7,6 +7,7 @@ mod common;
 
 use skin_beatoraja::limits::{MAX_FILE_BYTES, MAX_INCLUDE_DEPTH, MAX_INCLUDE_PARSES, MAX_NODES};
 use skin_beatoraja::lua::HOST_APIS;
+use skin_beatoraja::lua::Unsupported;
 use skin_beatoraja::lua::limits::{MAX_HOST_CALLS, MAX_INSTRUCTIONS, MAX_LUA_TIME};
 use skin_beatoraja::{
     Cancel, Config, ImportError, InputLimit, LuaHeader, LuaImported, LuaLimit, LuaWhy, NoteKind,
@@ -1413,21 +1414,40 @@ fn host_modules_hold_the_pinned_names_and_refuse_calls() {
 }
 
 #[test]
-fn every_function_in_the_definition_is_refused_at_its_definition() {
-    // A decorative image's condition and timer are refused, not frozen.
-    for (fields, field, line) in [
-        ("draw = function() return true end,", "draw", 5),
-        ("timer = function() return 0 end,", "timer", 5),
-        ("op = { function() end },", "other", 5),
+fn every_function_in_the_definition_is_classified_and_consumed_where_read() {
+    // A write-free condition converts; one with no result refuses the
+    // candidate, wherever it is, at its construct.
+    let d = folder(&[("s.luaskin", &drawn("draw = function() return true end,"))]);
+    import(&d).unwrap();
+    for (fields, line) in [
+        ("draw = function() end,", 5),
+        ("op = { function() end },", 5),
     ] {
         let d = folder(&[("s.luaskin", &drawn(fields))]);
         assert_eq!(
             located(import(&d)),
-            (LuaWhy::Callable { field }, "s.luaskin".into(), line),
+            (
+                LuaWhy::Effect(Unsupported::Construct("no return")),
+                "s.luaskin".into(),
+                line
+            ),
             "{fields}"
         );
     }
-    // A gauge's condition.
+    // A write-free function in a field that takes none is refused there,
+    // at its definition.
+    for (fields, field) in [
+        ("timer = function() return 0 end,", "timer"),
+        ("blend = function() return 1 end,", "blend"),
+    ] {
+        let d = folder(&[("s.luaskin", &drawn(fields))]);
+        assert_eq!(
+            located(import(&d)),
+            (LuaWhy::Callable { field }, "s.luaskin".into(), 5),
+            "{fields}"
+        );
+    }
+    // A gauge's condition and a number's value convert.
     let images: String = (0..4)
         .map(|k| {
             format!(
@@ -1449,12 +1469,7 @@ fn every_function_in_the_definition_is_refused_at_its_definition() {
             ),
         ),
     )]);
-    assert_eq!(
-        located(import(&d)),
-        (LuaWhy::Callable { field: "draw" }, "s.luaskin".into(), 8)
-    );
-    // A number's value, a field that takes no function, and a field
-    // nothing reads.
+    import(&d).unwrap();
     let d = folder(&[(
         "s.luaskin",
         &skin(
@@ -1464,14 +1479,13 @@ fn every_function_in_the_definition_is_refused_at_its_definition() {
              skin.destination = { { id = \"v\", dst = { { w = 6, h = 6 } } } }",
         ),
     )]);
-    assert_eq!(
-        located(import(&d)),
-        (LuaWhy::Callable { field: "value" }, "s.luaskin".into(), 6)
-    );
-    let d = folder(&[("s.luaskin", &drawn("blend = function() end,"))]);
-    assert_eq!(why(import(&d)), LuaWhy::Callable { field: "blend" });
+    import(&d).unwrap();
+    // A function nothing reads is classified too.
     let d = configured("skin.unread = { function() end }");
-    assert_eq!(why(import(&d)), LuaWhy::Callable { field: "other" });
+    assert_eq!(
+        why(import(&d)),
+        LuaWhy::Effect(Unsupported::Construct("no return"))
+    );
     // A module's function is located in that module.
     let d = folder(&[
         ("s.luaskin", &drawn("loop = require(\"f\"),")),
@@ -1479,14 +1493,18 @@ fn every_function_in_the_definition_is_refused_at_its_definition() {
     ]);
     assert_eq!(
         located(import(&d)),
-        (LuaWhy::Callable { field: "loop" }, "f.lua".into(), 2)
+        (
+            LuaWhy::Effect(Unsupported::Construct("no return")),
+            "f.lua".into(),
+            2
+        )
     );
-    // A host function has no Lua definition: it is located at its value,
-    // line 0 and its ordinal in the table.
+    // A host function has no tree: it is refused at its value, line 0
+    // and its ordinal in the table.
     let d = configured("skin.timer_fn = require(\"timer_util\").now_timer");
     match import(&d) {
         Err(ImportError::Lua {
-            why: LuaWhy::Callable { field: "other" },
+            why: LuaWhy::Effect(Unsupported::Capture("not a skin closure")),
             at: Some(at),
         }) => assert_eq!((at.file.as_str(), at.line), ("s.luaskin", 0)),
         other => panic!("{other:?}"),
@@ -1497,7 +1515,7 @@ fn every_function_in_the_definition_is_refused_at_its_definition() {
 fn the_header_pass_refuses_a_function_only_where_it_reads() {
     // Where it does not: a key of an option item the header never reads,
     // or a field outside the header. The header pass reads past it; the
-    // configured pass refuses it at its definition.
+    // configured pass refuses it at its construct (it returns nothing).
     for fields in [
         "property = { { name = \"o\", item = { { name = \"a\", op = 900,\n is_selected = function() end } } } }",
         "w = 1920, h = 1080,\n helper = function() end",
@@ -1505,7 +1523,7 @@ fn the_header_pass_refuses_a_function_only_where_it_reads() {
         let d = folder(&[("s.luaskin", &format!("return {{ type = 0, {fields} }}"))]);
         let h = header(&d).unwrap_or_else(|e| panic!("{fields}: {e:?}"));
         let (w, file, line) = located(h.import(&Config::defaults(h.header()), &Cancel::new()));
-        assert!(matches!(w, LuaWhy::Callable { .. }), "{fields}: {w:?}");
+        assert!(matches!(w, LuaWhy::Effect(_)), "{fields}: {w:?}");
         assert_eq!((file.as_str(), line), ("s.luaskin", 2), "{fields}");
     }
     // Where the header's reading meets it: a value, a record, a list or a
@@ -1807,4 +1825,23 @@ fn errors_are_located_in_their_module() {
     assert_eq!(located(header(&d)), (LuaWhy::Syntax, "s.luaskin".into(), 3));
     let d = folder(&[("s.luaskin", "\x1bLua")]);
     assert_eq!(why(header(&d)), LuaWhy::Syntax);
+}
+
+#[test]
+fn tagging_keeps_statement_boundaries() {
+    // A constructor that ends a statement still ends it once tagged: the
+    // `(` that starts the next statement calls nothing of it.
+    for body in [
+        "local function identity(f) changed = true return f end\n(function() return true end)()",
+        "local g = function() changed = true end\n(function() return true end)()",
+        "h = function() changed = true end\n(function() return true end)()",
+        "local t = {}\nfunction t.m() changed = true end\n(function() return true end)()",
+        "local u = 1, function() changed = true end\n(function() return true end)()",
+        "repeat local r = 1 until function() changed = true end\n(function() return true end)()",
+    ] {
+        let d = configured(&format!(
+            "local changed = false\n{body}\nassert(not changed, \"changed\")"
+        ));
+        import(&d).unwrap_or_else(|e| panic!("{body}: {e:?}"));
+    }
 }

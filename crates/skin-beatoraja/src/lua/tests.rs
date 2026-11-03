@@ -25,6 +25,46 @@ thread_local! {
     static LIVE: Cell<usize> = const { Cell::new(0) };
     /// The passes this thread has run.
     pub(crate) static PASSES: Cell<usize> = const { Cell::new(0) };
+    /// Whether a conversion is copying captures, and the host calls made
+    /// meanwhile: a skin handler run by the capture would make one.
+    static CAPTURING: Cell<bool> = const { Cell::new(false) };
+    pub(crate) static CAPTURE_CALLS: Cell<u32> = const { Cell::new(0) };
+}
+
+thread_local! {
+    static AT_EXPANSION: RefCell<Option<Action>> = RefCell::new(None);
+}
+
+thread_local! {
+    /// The size-memo slots this thread's lowerings held, summed.
+    pub(crate) static MEMO_SLOTS: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Called as a lowering ends with `slots` size-memo slots.
+pub(crate) fn memo_witness(slots: usize) {
+    MEMO_SLOTS.with(|n| n.set(n.get() + slots));
+}
+
+/// Called as lowering expands an instance.
+pub(crate) fn expansion_witness() {
+    if let Some(f) = AT_EXPANSION.with(|a| a.borrow_mut().take()) {
+        f();
+    }
+}
+
+/// Runs `f` when a conversion has next read its whole table.
+pub(crate) fn at_converted(f: impl Fn() + 'static) {
+    AT_CONVERTED.with(|a| *a.borrow_mut() = Some(Box::new(f)));
+}
+
+/// Runs `f` when lowering next expands an instance.
+pub(crate) fn at_expansion(f: impl Fn() + 'static) {
+    AT_EXPANSION.with(|a| *a.borrow_mut() = Some(Box::new(f)));
+}
+
+/// Called as a conversion starts and ends copying captures.
+pub(crate) fn capturing(on: bool) {
+    CAPTURING.with(|c| c.set(on));
 }
 
 /// Called as each pass starts.
@@ -34,6 +74,9 @@ pub(crate) fn pass_witness() {
 
 /// Called at every charged host call.
 pub(crate) fn host_call_witness() {
+    if CAPTURING.with(Cell::get) {
+        CAPTURE_CALLS.with(|n| n.set(n.get() + 1));
+    }
     let due = HOST_CALLS.with(|n| match n.get() {
         Some(0) => {
             n.set(None);
@@ -102,7 +145,7 @@ fn header(root: &Path, cancel: &Cancel) -> Result<LuaHeader, ImportError> {
 }
 
 #[track_caller]
-fn why<T: std::fmt::Debug>(r: Result<T, ImportError>) -> LuaWhy {
+pub(crate) fn why<T: std::fmt::Debug>(r: Result<T, ImportError>) -> LuaWhy {
     match r {
         Err(ImportError::Lua { why, .. }) => why,
         other => panic!("{other:?}"),

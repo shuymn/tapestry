@@ -1962,7 +1962,8 @@ fn last_items(h: &Header) -> Config {
 fn check_lua(usage: &LuaUsage, dependencies: &[String]) {
     use skin_beatoraja::limits::{MAX_INCLUDE_PARSES, MAX_INPUT_BYTES};
     use skin_beatoraja::lua::limits::{
-        MAX_HOST_CALLS, MAX_INSTRUCTIONS, MAX_LUA_MEMORY, MAX_NATIVE_WORK,
+        MAX_AST_NODES, MAX_CAPTURES, MAX_EXPANDED_NODES, MAX_HOST_CALLS, MAX_INSTRUCTIONS,
+        MAX_LUA_MEMORY, MAX_NATIVE_WORK,
     };
     assert!(
         usage.instructions < MAX_INSTRUCTIONS,
@@ -1983,6 +1984,15 @@ fn check_lua(usage: &LuaUsage, dependencies: &[String]) {
         "loads miscounted"
     );
     assert!(usage.input_bytes <= MAX_INPUT_BYTES, "input over the cap");
+    assert!(
+        usage.ast_nodes <= MAX_AST_NODES,
+        "analysis nodes over the cap"
+    );
+    assert!(usage.captures <= MAX_CAPTURES, "captures over the cap");
+    assert!(
+        usage.expanded <= MAX_EXPANDED_NODES,
+        "expansion over the cap"
+    );
     assert!(
         usage.peak_memory <= u64::try_from(MAX_LUA_MEMORY).unwrap_or(u64::MAX),
         "Lua memory over the cap"
@@ -2044,6 +2054,7 @@ pub fn skin_lua(data: &[u8]) -> Result<(Header, Result<LuaImported, ImportError>
             Ok(i) => {
                 check_lua(&i.usage, &i.dependencies);
                 check_usage(&i.imported);
+                check_callbacks(i);
             }
             Err(e) => {
                 black_box(e.to_string());
@@ -2091,6 +2102,36 @@ pub fn skin_lua(data: &[u8]) -> Result<(Header, Result<LuaImported, ImportError>
         black_box(draw(&i.imported, data));
     }
     Ok((h.header().clone(), first))
+}
+
+/// A candidate that imports was refused at none of its callbacks and
+/// analysed every one; each decorative one replaced is reported, among
+/// the retained notes or counted as suppressed past the report's cap.
+fn check_callbacks(i: &LuaImported) {
+    use skin_beatoraja::NoteKind;
+    use skin_beatoraja::lua::Disposition;
+    let mut replaced = 0;
+    for d in &i.callbacks {
+        match d {
+            Disposition::Lowered | Disposition::ClassifiedOnly => {}
+            Disposition::Replaced(_) => replaced += 1,
+            Disposition::Refused | Disposition::NeverAnalysed => {
+                panic!("an imported candidate with a callback {d:?}")
+            }
+        }
+    }
+    let noted = i
+        .imported
+        .report
+        .notes
+        .iter()
+        .filter(|n| matches!(n.kind, NoteKind::Callback { .. }))
+        .count();
+    let suppressed = usize::try_from(i.imported.report.suppressed).unwrap_or(usize::MAX);
+    assert!(
+        noted.saturating_add(suppressed) >= replaced,
+        "a replaced callback was not reported"
+    );
 }
 
 /// An import's charged counters are within the model's caps.

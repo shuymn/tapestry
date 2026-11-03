@@ -17,7 +17,12 @@
 //! require them and keep their functions, which its per-frame functions
 //! call; a call during import reads live play state, or acts on files,
 //! the network or audio, none of which an import may, and is refused
-//! rather than answered with an invented value. A name the source does
+//! rather than answered with an invented value. There each module is
+//! read-only: the skin gets an empty proxy whose `__index` is the
+//! module's table, out of the skin's reach, and whose `__newindex`
+//! refuses the write as a fault ([`LuaWhy::HostWrite`]), whatever local
+//! it is written through; its metatable is protected. So `main_state.f`
+//! is the host function by identity when a callback reads it. A name the source does
 //! not export is `nil`. `main_state.timer_off_value` is the source's off
 //! sentinel, the smallest integer, kept so that a skin can test a timer
 //! for off.
@@ -97,20 +102,32 @@ pub const HOST_APIS: [(&str, &str); 65] = [
 ];
 
 /// The host modules' names.
-const MODULES: [&str; 3] = ["main_state", "timer_util", "event_util"];
+pub(super) const MODULES: [&str; 3] = ["main_state", "timer_util", "event_util"];
 
 /// The registry name of host module `name`'s table in this VM.
 fn registry_name(name: &str) -> String {
     format!("tapestry.host.{name}")
 }
 
+/// The registry name of host module `name`'s proxy metatable.
+fn metatable_name(name: &str) -> String {
+    format!("tapestry.host_mt.{name}")
+}
+
 /// Builds the host modules of a fresh VM, kept in its registry for
 /// `require`.
 pub(super) fn install(lua: &Lua, pass: &std::rc::Rc<Pass>) -> mlua::Result<()> {
+    let configured = pass.bridge.is_some();
+    let write = if configured {
+        Some(host(lua, pass, 0, |lua, pass, _| -> mlua::Result<()> {
+            Err(pass.ledger.fail_lua(lua, LuaWhy::HostWrite))
+        })?)
+    } else {
+        None
+    };
     for module in MODULES {
         let t = lua.create_table()?;
         // The header pass's modules are empty.
-        let configured = pass.bridge.is_some();
         for (index, &(m, api)) in (0_u16..).zip(&HOST_APIS) {
             if m != module || !configured {
                 continue;
@@ -124,9 +141,43 @@ pub(super) fn install(lua: &Lua, pass: &std::rc::Rc<Pass>) -> mlua::Result<()> {
         if module == "main_state" && configured {
             t.raw_set("timer_off_value", i64::MIN)?;
         }
-        lua.set_named_registry_value(&registry_name(module), t)?;
+        let face = match &write {
+            Some(write) => {
+                let mt = lua.create_table()?;
+                mt.raw_set("__index", t)?;
+                mt.raw_set("__newindex", write.clone())?;
+                mt.raw_set("__metatable", false)?;
+                let proxy = lua.create_table()?;
+                proxy.set_metatable(Some(mt.clone()))?;
+                lua.set_named_registry_value(&metatable_name(module), mt)?;
+                proxy
+            }
+            None => t,
+        };
+        lua.set_named_registry_value(&registry_name(module), face)?;
     }
     Ok(())
+}
+
+/// The configured pass's host module proxies: each one's address, its
+/// [`MODULES`] index, and whether it is as the pass built it (no entry of
+/// its own, and the metatable it was given).
+pub(super) fn proxies(lua: &Lua) -> mlua::Result<Vec<(usize, u8, bool)>> {
+    let mut out = Vec::with_capacity(MODULES.len());
+    for (index, module) in (0_u8..).zip(MODULES) {
+        let Value::Table(proxy) = lua.named_registry_value::<Value>(&registry_name(module))? else {
+            continue;
+        };
+        let Value::Table(mt) = lua.named_registry_value::<Value>(&metatable_name(module))? else {
+            continue;
+        };
+        let empty = proxy.clone().pairs::<Value, Value>().next().is_none();
+        let same = proxy
+            .metatable()
+            .is_some_and(|m| m.to_pointer() == mt.to_pointer());
+        out.push((proxy.to_pointer().addr(), index, empty && same));
+    }
+    Ok(out)
 }
 
 /// Host module `name`; `None` when `name` names none.

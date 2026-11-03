@@ -152,5 +152,10 @@ pub(super) fn install(
     config.raw_set("file_path", file_path)?;
     config.raw_set("offset", offset)?;
     config.raw_set("get_path", get_path)?;
+    lua.set_named_registry_value(CONFIG, config.clone())?;
     env.raw_set("skin_config", config)
 }
+
+/// The registry name of the pass's own `skin_config` table, which a
+/// callback's capture proves its reads against.
+pub(super) const CONFIG: &str = "tapestry.skin_config";

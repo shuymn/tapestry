@@ -82,6 +82,9 @@ pub(crate) struct LuaText {
     pub(crate) modules: Vec<String>,
     /// The functions the table held, each instance once.
     pub(crate) callables: Vec<Callable>,
+    /// The configured pass's trees and captures; `None` for the header
+    /// pass's table.
+    pub(crate) analysis: Option<Box<crate::lua::callback::Analysis>>,
 }
 
 /// A Lua scalar, its subtype and exact value kept: an integer as the
@@ -101,7 +104,7 @@ pub(crate) enum LuaScalar {
 }
 
 /// A function a Lua skin's table held: where it was defined, and what it
-/// is. It is never run; the importer refuses it ([`crate::lua`]).
+/// is. It is never run ([`crate::lua`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Callable {
     /// The module that defined it, an index of [`LuaText::modules`];
@@ -111,6 +114,8 @@ pub(crate) struct Callable {
     pub(crate) line: u32,
     /// What it is.
     pub(crate) kind: CallableKind,
+    /// Its closure instance in [`LuaText::analysis`], `NONE` without one.
+    pub(crate) instance: u32,
 }
 
 /// What a function a Lua skin's table held is.

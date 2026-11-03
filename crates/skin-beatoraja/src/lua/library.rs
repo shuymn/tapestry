@@ -68,6 +68,9 @@
 //! | host: `require`, `dofile` | one argument (extras dropped in Lua), a name of at most 1 024 bytes, checked before it is copied | a confined read and a compilation, O(file) | 16 MiB a file, 32 MiB read in all, 1 024 loads, depth 16; 16 results | the chunk, hooked |
 //! | host: `skin_config.get_path` | one argument, a string of at most 1 024 bytes, checked in Lua and again before it is copied | a substitution, O(path) | the result at most 1 024 bytes, else nil | no |
 //! | host: the pinned module APIs | none (the skin's dropped in Lua) | O(1): the fault | fatal | no |
+//! | host: a host module's `__newindex` (configured pass) | none (the skin's dropped in Lua) | O(1): the fault | fatal | no |
+//! | the tagger (the instrumented chunks' constructors) | an identity, the closure, its reader | O(1): two weak-table writes | VM memory | no |
+//! | a capture reader, called after the pass | none | O(upvalues): returns its bindings, no metamethod | at most 200 values | no |
 //! | the strings' `__index` | a key | a raw lookup in the library's `string` table | none needed | no |
 //! | VM: `..` | strings, numbers | O(result) a concatenation | each instruction at most O(VM memory), at most [`INSTRUCTION_STEP`](super::limits::INSTRUCTION_STEP) (100) instructions between checks, all of them within [`MAX_LUA_TIME`](super::limits::MAX_LUA_TIME) across the candidate's passes and [`MAX_INSTRUCTIONS`](super::limits::MAX_INSTRUCTIONS) | no |
 //! | VM: `<`, `<=`, `==` on long strings | strings | O(length) a comparison | each instruction at most O(VM memory), at most [`INSTRUCTION_STEP`](super::limits::INSTRUCTION_STEP) (100) instructions between checks, all of them within [`MAX_LUA_TIME`](super::limits::MAX_LUA_TIME) across the candidate's passes and [`MAX_INSTRUCTIONS`](super::limits::MAX_INSTRUCTIONS) | no |

@@ -745,3 +745,57 @@ fn the_refusal_names_the_failure_presentation() {
     );
     assert_eq!(CriticalPart::Failure.to_string(), "failure presentation");
 }
+
+#[test]
+fn lua_callbacks_on_failure_presentation_refuse_where_unsupported() {
+    // A number's `value` and an image's `draw` that do not convert: on
+    // `failed` they refuse, on another timer they are replaced.
+    let lua = |timer: i32, callback: &str| {
+        format!(
+            "local skin = {{ type = 0, name = \"t\", w = 1920, h = 1080 }}\n\
+             if not skin_config then return skin end\n\
+             local ms = require(\"main_state\")\n\
+             skin.source = {{ {{ id = \"a\", path = \"a.png\" }} }}\n\
+             skin.image = {{ {{ id = \"i\", src = \"a\", x = 0, y = 0, w = 64, h = 64 }} }}\n\
+             skin.value = {{ {{ id = \"v\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, \
+             digit = 8, {value} }} }}\n\
+             skin.destination = {{ {{ id = \"{id}\", timer = {timer}, {draw} \
+             dst = {{ {{ x = 0, y = 0, w = 6, h = 6 }} }} }} }}\n\
+             return skin\n",
+            value = if callback == "value" {
+                "value = function() return ms.number(110) + ms.number(425) end"
+            } else {
+                "ref = 110"
+            },
+            id = if callback == "value" { "v" } else { "i" },
+            draw = if callback == "draw" {
+                "draw = function() return ms.number(425) > 0 end,"
+            } else {
+                ""
+            },
+        )
+    };
+    for callback in ["value", "draw"] {
+        let d = tempfile::tempdir().unwrap();
+        write(d.path(), "s.luaskin", lua(3, callback).as_bytes());
+        png(d.path(), "a.png", 64, 64);
+        match common::lua_import(d.path()) {
+            Err(ImportError::Lua {
+                why: skin_beatoraja::LuaWhy::Critical { field, .. },
+                ..
+            }) => assert_eq!(field, callback),
+            other => panic!("{callback}: {other:?}"),
+        }
+        write(d.path(), "s.luaskin", lua(41, callback).as_bytes());
+        let r = common::lua_import(d.path()).unwrap();
+        assert!(
+            r.imported
+                .report
+                .notes
+                .iter()
+                .any(|n| n.severity == Severity::Dropped),
+            "{callback}: {:?}",
+            r.imported.report.notes
+        );
+    }
+}

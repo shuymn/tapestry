@@ -58,3 +58,37 @@ pub const MAX_NATIVE_WORK: u64 = 100_000_000;
 /// substring, a formatted or joined string, a capture), in
 /// bytes; a larger one is refused before the call.
 pub const MAX_PRIMITIVE_BYTES: i64 = 1 << 20;
+/// The most nodes the analysis's Lua trees hold across a candidate's
+/// files ([`super::syntax`]): expressions, statements, declarations,
+/// functions and list entries, each charged before it is added. The
+/// surveyed skins' configured passes parse about 120 000.
+pub const MAX_AST_NODES: u64 = 1 << 20;
+/// The deepest nesting of statements and subexpressions the analysis's
+/// parser recurses into, checked before each level: Lua's own parser
+/// stops at the same depth (`LUAI_MAXCCALLS`). Every other recursive walk
+/// over a tree (classification, sizing and lowering, through inlined
+/// locals and helpers) stops at it too, fatal: a left-leaning chain the
+/// parser reads without recursing is as deep as it is long.
+pub const MAX_AST_DEPTH: u32 = 200;
+/// The most closure instances and captured values the analysis copies
+/// out of a configured pass before its VM is dropped, each charged before
+/// it is kept.
+pub const MAX_CAPTURES: u64 = 1 << 16;
+/// The most units of work the callbacks' analysis does across a
+/// candidate: each expression or statement a classification, sizing,
+/// lowering or role scan visits, each local scanned, each captured value
+/// a prototype's key copies, and each byte of an option name hashed,
+/// charged before the work. Instances of one function with the
+/// same captured values are classified once, so a function created in a
+/// loop costs its body once.
+pub const MAX_ANALYSIS_WORK: u64 = 1 << 24;
+/// The most bytes of rewritten chunks a configured pass keeps
+/// ([`super::instrument`]): each chunk's source and what the rewrite
+/// adds, checked before it is built. Twice the read allowance
+/// ([`MAX_INPUT_BYTES`](crate::limits::MAX_INPUT_BYTES)), so a pass can
+/// rewrite every byte it may read.
+pub const MAX_REWRITTEN_BYTES: u64 = 1 << 26;
+/// The most expression nodes the lowering of a candidate's callbacks
+/// expands helpers into, each helper call charged its expanded size
+/// before it is expanded.
+pub const MAX_EXPANDED_NODES: u64 = 1 << 20;

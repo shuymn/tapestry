@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use super::convert::callables;
-use super::{Cancel, HOST_APIS, LuaUsage, LuaWhy, header_pass};
+use super::{Cancel, Disposition, HOST_APIS, LuaUsage, LuaWhy, Unsupported, header_pass};
 use crate::error::{ImportError, Loc};
 use crate::import::{Config, NoteKind};
 use crate::tree::CallableKind;
@@ -30,6 +30,10 @@ pub struct Survey {
     /// The functions the configured definition holds, by the field that
     /// holds them and what they are.
     pub callables: BTreeMap<(&'static str, String), u32>,
+    /// What became of them: `lowered`, `replaced` with its reason,
+    /// `refused`, `classified only` (returned but never consumed) and
+    /// `never analysed` (the import stopped before them).
+    pub outcomes: BTreeMap<String, u32>,
     /// The import's notes, by kind.
     pub notes: BTreeMap<String, u32>,
     pub usage: LuaUsage,
@@ -62,15 +66,43 @@ fn label(e: &ImportError) -> String {
         ImportError::Asset { .. } => "critical asset".into(),
         ImportError::Model { .. } => "model".into(),
         ImportError::Lua { why, .. } => match why {
-            LuaWhy::LiveState { api } => {
-                let (m, n) = HOST_APIS
-                    .get(usize::from(*api))
-                    .copied()
-                    .unwrap_or(("?", "?"));
-                format!("lua live state {m}.{n}")
+            LuaWhy::LiveState { api: a } => format!("lua live state {}", api(*a)),
+            LuaWhy::Effect(why) => format!("lua effect {}", unsupported(why)),
+            LuaWhy::Critical { field, why } => {
+                format!("lua critical {field} {}", unsupported(why))
             }
             why => format!("lua {why:?}"),
         },
+    }
+}
+
+/// The label of a host API.
+fn api(a: u16) -> String {
+    let (m, n) = HOST_APIS.get(usize::from(a)).copied().unwrap_or(("?", "?"));
+    format!("{m}.{n}")
+}
+
+/// The label of why a callback does not convert: the importer's own
+/// constructs, host API names and numbers.
+fn unsupported(why: &Unsupported) -> String {
+    match why {
+        Unsupported::Construct(c) => format!("Construct {c}"),
+        Unsupported::Binding(b) => format!("Binding {b}"),
+        Unsupported::Capture(c) => format!("Capture {c}"),
+        Unsupported::HostApi(a) => format!("HostApi {}", api(*a)),
+        Unsupported::Unmapped { api: a, id } => format!("Unmapped {} {id}", api(*a)),
+        other => variant(other),
+    }
+}
+
+/// The label of what became of a callable.
+fn disposition(d: &Disposition) -> String {
+    match d {
+        Disposition::NeverAnalysed => "never analysed".into(),
+        Disposition::ClassifiedOnly => "classified only".into(),
+        Disposition::Lowered => "lowered".into(),
+        Disposition::Replaced(why) => format!("replaced {}", unsupported(why)),
+        Disposition::Refused => "refused".into(),
     }
 }
 
@@ -79,6 +111,7 @@ fn note(kind: &NoteKind) -> String {
     match kind {
         NoteKind::UnsupportedField { field } => format!("UnsupportedField {field}"),
         NoteKind::Ignored { field } => format!("Ignored {field}"),
+        NoteKind::Callback { field, why } => format!("Callback {field} {}", unsupported(why)),
         NoteKind::OverCap { cap } => format!("OverCap {cap}"),
         other => variant(other),
     }
@@ -155,6 +188,9 @@ pub fn survey(root: &Path, entry: &str, cancel: &Cancel) -> Survey {
         }
     }
     let o = h.finish(def, counts, store, &config);
+    for d in &o.callbacks {
+        *s.outcomes.entry(disposition(d)).or_default() += 1;
+    }
     s.usage = o.counts;
     s.modules = o.dependencies.len();
     match o.result {
@@ -239,6 +275,10 @@ return { type = 0 }",
             .map(|((_, kind), n)| (kind.as_str(), *n))
             .collect();
         assert_eq!(kinds, [("library", 3), ("lua", 1)]);
+        // A library function has no tree, and the empty function returns
+        // nothing: each refuses the candidate, the first at its value.
+        assert_eq!(s.outcome, "lua effect Capture not a skin closure");
+        assert_eq!(s.outcomes.get("refused"), Some(&4));
     }
 
     #[test]
