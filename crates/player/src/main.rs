@@ -165,14 +165,13 @@ fn play_command(p: args::Play, clock: QpcClock) -> ExitCode {
     #[cfg(feature = "dev-tools")]
     let ran = launch(&chart, p.input, p.dev, clock, headless, play);
     #[cfg(not(feature = "dev-tools"))]
-    let ran = play(&chart, p.input, None, clock, |_, _| anyhow::Ok(()));
+    let ran = play(&chart, p.input, None, clock, |_| {});
     report(ran)
 }
 
-/// What configures a play's rig from the development options, given the
-/// device settings the play uses (dev-tools).
+/// What configures a play's rig from the development options (dev-tools).
 #[cfg(feature = "dev-tools")]
-type Tune = Box<dyn FnOnce(&mut PlayerRig<'_>, &DeviceSettings) -> anyhow::Result<()>>;
+type Tune = Box<dyn FnOnce(&mut PlayerRig<'_>)>;
 
 /// Launches `play` of `chart` with its development options (dev-tools):
 /// an input log or `--dev-headless` through `headless` ([`headless`] in
@@ -193,10 +192,7 @@ fn launch<T>(
     let start = options.start;
     let scripted = options.headless || matches!(input, PlayInput::Script(..));
     let frames = options.frames.take();
-    let tune: Tune = Box::new(move |rig, _| {
-        options.tune(rig);
-        Ok(())
-    });
+    let tune: Tune = Box::new(move |rig| options.tune(rig));
     if scripted {
         headless(chart, input, start, frames, clock, tune)
     } else {
@@ -240,11 +236,10 @@ fn measure_play(chart: &Path, perfect: bool, clock: QpcClock) -> anyhow::Result<
     } else {
         PlayInput::Devices
     };
-    let ran = play(chart, input, None, clock, true, move |rig, _| {
+    let ran = play(chart, input, None, clock, true, move |rig| {
         rig.measured_plays = Some(kept);
         rig.load_start = load_start;
         rig.quit_after_end = Some(std::time::Duration::from_millis(300));
-        Ok(())
     });
     let stopped = capture.stop();
     ran?;
@@ -952,7 +947,7 @@ fn play(
     start: Option<TimeUs>,
     clock: QpcClock,
     #[cfg(feature = "dev-tools")] keep_presents: bool,
-    tune: impl FnOnce(&mut PlayerRig<'_>, &DeviceSettings) -> anyhow::Result<()>,
+    tune: impl FnOnce(&mut PlayerRig<'_>),
 ) -> anyhow::Result<()> {
     #[cfg(feature = "dev-tools")]
     alloc_count::tag(alloc_count::Tag::Logic);
@@ -1093,9 +1088,8 @@ fn play(
     rig.gain = gain;
     rig.result_input = menus;
     rig.queue_most = opened.most_queued_periods;
-    // A tuning refused ends the run before any play opens.
-    let ran = tune(&mut rig, &loaded.settings().device)
-        .and_then(|()| Ok(game::live::run_chart(&mut loaded, &mut rig)?));
+    tune(&mut rig);
+    let ran = game::live::run_chart(&mut loaded, &mut rig).map_err(anyhow::Error::from);
     #[cfg(feature = "dev-tools")]
     let script_failed = result_script_failure(&rig);
     let rendered = rig.shut_down();
@@ -1536,7 +1530,7 @@ fn headless(
     start: Option<TimeUs>,
     frames: Option<PathBuf>,
     clock: QpcClock,
-    tune: impl FnOnce(&mut PlayerRig<'_>, &DeviceSettings) -> anyhow::Result<()>,
+    tune: impl FnOnce(&mut PlayerRig<'_>),
 ) -> anyhow::Result<()> {
     alloc_count::tag(alloc_count::Tag::Logic);
     let Prepared {
@@ -1626,9 +1620,8 @@ fn headless(
     rig.gain = gain;
     rig.quit_after_end = Some(std::time::Duration::from_millis(300));
     rig.queue_most = opened.most_queued_periods;
-    // As in `play`: a tuning refused opens no play.
-    let ran = tune(&mut rig, &loaded.settings().device)
-        .and_then(|()| Ok(game::live::run_chart(&mut loaded, &mut rig)?));
+    tune(&mut rig);
+    let ran = game::live::run_chart(&mut loaded, &mut rig).map_err(anyhow::Error::from);
     let script_failed = result_script_failure(&rig);
     // Offscreen: no window to keep.
     let _ = rig.shut_down();
@@ -1851,17 +1844,17 @@ mod tests {
     }
 
     /// Which launcher [`super::launch`] chose for `input` and `options`,
-    /// the tuner it handed over applied to a rig of `device`: what the
-    /// tuner returned and whether the rig ended with a start gate.
+    /// the tuner it handed over applied to a rig of `device`: whether the
+    /// rig ended with a start gate.
     #[cfg(feature = "dev-tools")]
     fn launched(
         input: super::PlayInput,
         options: crate::dev::Options,
         device: &game::DeviceSettings,
-    ) -> (&'static str, anyhow::Result<()>, bool) {
+    ) -> (&'static str, bool) {
         let run = |name, tune: super::Tune| {
-            let (ran, gated) = on_rig(device.clone(), tune);
-            (name, ran, gated)
+            let ((), gated) = on_rig(device.clone(), |rig, _| tune(rig));
+            (name, gated)
         };
         super::launch(
             std::path::Path::new("chart.bms"),
@@ -1881,18 +1874,18 @@ mod tests {
     fn every_launcher_gates_its_plays() {
         use super::PlayInput;
         let device = game::DeviceSettings::default();
-        let (name, ran, gated) =
+        let launched_devices =
             launched(PlayInput::Devices, crate::dev::Options::default(), &device);
-        ran.unwrap();
-        assert_eq!((name, gated), ("interactive", true));
+        assert_eq!(launched_devices, ("interactive", true));
         let script = PlayInput::Script(crate::dev::ScriptInput {
             log: std::path::PathBuf::from("log.tprl"),
             speed: Vec::new(),
             loading: Vec::new(),
         });
-        let (name, ran, gated) = launched(script, crate::dev::Options::default(), &device);
-        ran.unwrap();
-        assert_eq!((name, gated), ("headless", true));
+        assert_eq!(
+            launched(script, crate::dev::Options::default(), &device),
+            ("headless", true)
+        );
     }
 
     /// While the end screen shows, the game thread sends its page again
