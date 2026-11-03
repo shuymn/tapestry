@@ -11,7 +11,7 @@ use common::play::{Drawn, MS, judged, tally};
 use common::{Loaded, has, import_sized};
 use eval::{JudgeEvent, JudgeEventKind};
 use rules::{GaugeValue, Judgment};
-use skin_beatoraja::{CriticalPart, ImportError, NoteKind};
+use skin_beatoraja::{CriticalPart, DeviationId, ImportError, NoteKind};
 
 /// Grade `k`'s destination: image `gk` with `extra` fields.
 fn grade(k: usize, extra: &str) -> String {
@@ -814,4 +814,32 @@ fn a_kind_condition_is_noted_at_its_part() {
         .collect();
     assert_eq!(d4.len(), 2, "{:?}", l.report().notes);
     assert_ne!(d4[0], d4[1]);
+}
+
+/// An untimed judge whose window ends runs on `screen` (D3): noted once,
+/// its grades shown until the window's last key and hidden after it; on
+/// a timer of its own it is not noted.
+#[test]
+fn an_untimed_ending_judge_runs_on_screen() {
+    let d3 = |l: &Loaded| {
+        let d3 = NoteKind::Deviation(DeviationId::D3);
+        l.report().notes.iter().filter(|n| n.kind == d3).count()
+    };
+    let outer = |fields: &str| {
+        format!(
+            r#"{{"id": "j"{fields}, "loop": -1, "dst": [{{"time": 0, "x": 0, "y": 0, "w": 0, "h": 0}},
+                                                       {{"time": 2000, "x": 0, "y": 0, "w": 0, "h": 0}}]}}"#
+        )
+    };
+    let rec = judge_rec(&grades(7), &[], "");
+    let l = skin(r#""value": []"#, &rec, &[&outer("")]);
+    assert_eq!(d3(&l), 1);
+    let at = |ms: i64| {
+        let mut d = Drawn::new(l.ok().skin.clone(), 100);
+        d.frame(ms, &[event(ms, of(Judgment::Perfect, 1))]);
+        d.rects(ms + 1).len()
+    };
+    assert_eq!((at(1_000), at(2_500)), (1, 0));
+    let timed = skin(r#""value": []"#, &rec, &[&outer(r#", "timer": 41"#)]);
+    assert_eq!(d3(&timed), 0);
 }
