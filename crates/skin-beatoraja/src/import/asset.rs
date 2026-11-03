@@ -125,13 +125,27 @@ pub(crate) fn is_movie(path: &str) -> bool {
     MOVIES.iter().chain([&AVI]).any(|ext| lower.ends_with(ext))
 }
 
-/// `name` joined to the definition's folder `dir`.
-pub(crate) fn join(dir: &str, name: &str) -> String {
-    if dir.is_empty() {
+/// Asset name `name`, written relative to the definition's folder `dir`,
+/// as the name the model admits, relative to the skin folder: `name`'s
+/// own form checked ([`Root::check_name`]), so a rooted, drive, UNC,
+/// verbatim or stream name or a NUL cannot become relative by joining;
+/// then joined to `dir` and normalised ([`Root::normalise`]), so `..` may
+/// step up inside the skin folder and every spelling of a file is one
+/// name, for the caches and the font pages' folder. A name it refuses,
+/// by its form or by a `..` above the skin folder, is returned as written
+/// (joined, for the `..`): the model refuses it as such, with its usual
+/// errors. The model then checks the canonical path, links followed,
+/// the file type and the size of every name.
+pub(crate) fn resolve(dir: &str, name: &str) -> String {
+    if Root::check_name(name).is_err() {
+        return name.to_owned();
+    }
+    let joined = if dir.is_empty() {
         name.to_owned()
     } else {
         format!("{dir}/{name}")
-    }
+    };
+    Root::normalise(&joined).unwrap_or(joined)
 }
 
 /// Why an asset request stopped the import: an aggregate limit, or a

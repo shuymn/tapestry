@@ -252,7 +252,7 @@ impl Cx<'_> {
                 TextFont::Fixed(FontRef::Bitmap(font), em)
             }
         } else {
-            let name = asset::join(&self.entry_dir, &path);
+            let name = asset::resolve(&self.entry_dir, &path);
             match self
                 .assets
                 .font(&mut self.budget, &name)
@@ -339,7 +339,7 @@ impl Cx<'_> {
             }
             None => {
                 let names = self.fallbacks(rec, at)?;
-                let primary = asset::join(&self.entry_dir, path);
+                let primary = asset::resolve(&self.entry_dir, path);
                 let def = &self.def;
                 let primary = self
                     .assets
@@ -397,10 +397,10 @@ impl Cx<'_> {
         }
     }
 
-    /// The fallback files of font record `rec`, joined to the
-    /// definition's folder: the `path` of each `fallback[]` entry that has
-    /// one (`JsonSkinObjectLoader.java:637-649`). The count is checked
-    /// before anything is kept.
+    /// The fallback files of font record `rec`, resolved from the
+    /// definition's folder ([`asset::resolve`]): the `path` of each
+    /// `fallback[]` entry that has one (`JsonSkinObjectLoader.java:
+    /// 637-649`). The count is checked before anything is kept.
     fn fallbacks(&mut self, rec: u32, at: Span) -> Result<Vec<String>, ImportError> {
         let [field] = self.def.fields(rec, ["fallback"]);
         let Some(f) = field else {
@@ -421,7 +421,7 @@ impl Cx<'_> {
             }
             let [path] = self.def.fields(item, ["path"]);
             if let Some(p) = self.opt_string(path, "path")? {
-                names.push(asset::join(&self.entry_dir, &p));
+                names.push(asset::resolve(&self.entry_dir, &p));
             }
         }
         Ok(names)
