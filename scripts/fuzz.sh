@@ -20,6 +20,10 @@ targets=(bms_load replay_file replay_body raw_input preset_canonical skin_json s
 # The per-input limits of every run: seconds, then MiB of RSS and of one
 # allocation.
 limits=(-timeout=10 -rss_limit_mb=2048 -malloc_limit_mb=2048)
+# skin_lua imports one input up to three times, each import's Lua
+# starting from the header pass's time: its 5 s cap (MAX_LUA_TIME) three
+# times over, and slack.
+lua_limits=(-timeout=25)
 # At most this many failing inputs, each at most this many bytes, are
 # printed in full.
 dump_files=4
@@ -141,10 +145,7 @@ run_target() {
   [ -n "$seed" ] && options+=(-seed="$seed")
   [ "$target" = bms_load ] && options+=(-dict=fuzz/dict/bms.dict)
   [ "$target" = skin_json ] && options+=(-dict=fuzz/dict/skin.dict)
-  # skin_lua imports one input up to three times, each import's Lua
-  # starting from the header pass's time: its 5 s cap (MAX_LUA_TIME)
-  # three times over, and slack.
-  [ "$target" = skin_lua ] && options+=(-dict=fuzz/dict/lua.dict -timeout=25)
+  [ "$target" = skin_lua ] && options+=(-dict=fuzz/dict/lua.dict "${lua_limits[@]}")
   [ "$target" = skin_fnt ] && options+=(-dict=fuzz/dict/fnt.dict)
   echo "=== $target: $seconds s"
   status=0
@@ -299,7 +300,9 @@ case "$command" in
     parse_options "$@"
     fetch
     # A file instead of a corpus directory: libFuzzer runs it once.
-    cargo_fuzz run "$target" "$file" -- "${limits[@]}"
+    repro_limits=("${limits[@]}")
+    [ "$target" = skin_lua ] && repro_limits+=("${lua_limits[@]}")
+    cargo_fuzz run "$target" "$file" -- "${repro_limits[@]}"
     ;;
   canary)
     [ "$#" -ge 1 ] || usage

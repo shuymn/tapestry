@@ -115,7 +115,7 @@ pub(super) fn install(lua: &Lua, pass: &std::rc::Rc<Pass>) -> mlua::Result<()> {
             if m != module || !configured {
                 continue;
             }
-            let f = host(lua, pass, move |lua, pass, _| -> mlua::Result<()> {
+            let f = host(lua, pass, 0, move |lua, pass, _| -> mlua::Result<()> {
                 Err(pass.ledger.fail_lua(lua, LuaWhy::LiveState { api: index }))
             })?;
             pass.host_api(f.to_pointer().addr(), index);

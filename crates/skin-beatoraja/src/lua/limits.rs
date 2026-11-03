@@ -37,9 +37,9 @@ pub const INSTRUCTION_STEP: u32 = 100;
 /// between them, while a header waits for its configuration. The
 /// surveyed skins execute in about 1.5 ms and a run to
 /// [`MAX_INSTRUCTIONS`] takes about 38 ms (the `lua` bench), so 5 s
-/// leaves three orders of magnitude for slow machines and debug builds,
-/// refuses nothing a skin needs, and ends a candidate within the fuzz
-/// targets' 10 s timeout.
+/// leaves three orders of magnitude for slow machines and debug builds
+/// and refuses nothing a skin needs. One `skin_lua` fuzz input imports up
+/// to three times, so that target's timeout is 25 s.
 pub const MAX_LUA_TIME: std::time::Duration = std::time::Duration::from_secs(5);
 /// The most calls into the functions the host exposes, each charged
 /// before it does any work.

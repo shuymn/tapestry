@@ -66,16 +66,25 @@ local function check(ok, ...)
   end
   return ...
 end
-return function(raw)
-  return function(...)
-    return check(raw(...))
+-- A face passes its host function a fixed number of arguments, extras
+-- dropped here: mlua converts every argument before the host function
+-- runs, and a failure there would be an error the host never sees.
+return function(raw, arity)
+  if arity == 0 then
+    return function()
+      return check(raw())
+    end
+  end
+  return function(a)
+    return check(raw(a))
   end
 end
 "##;
 
-/// The most instruction steps the hook lets run after a fault without
-/// raising it again: the protected calls raise it in Lua as they unwind,
-/// so the hook's own error, which carries a traceback, is raised once.
+/// The most instruction steps the hook lets run after a fault before it
+/// raises the fault again: the protected calls raise it in Lua as they
+/// unwind, and the hook's own error (mlua raises it unwrapped, with no
+/// traceback) is raised again only past this grace, every step.
 const STEPS_AFTER_FAULT: u32 = 1_000;
 
 /// The base functions the environment keeps as they are.
@@ -192,15 +201,17 @@ where
     })
 }
 
-/// A host function as a skin calls it: [`host_raw`]'s, its results
-/// returned and a fault raised in Lua.
-pub(super) fn host<F, R>(lua: &Lua, pass: &Rc<Pass>, f: F) -> mlua::Result<Function>
+/// A host function as a skin calls it: [`host_raw`]'s, given exactly
+/// `arity` (0 or 1) of the skin's arguments, its results returned and a
+/// fault raised in Lua.
+pub(super) fn host<F, R>(lua: &Lua, pass: &Rc<Pass>, arity: u8, f: F) -> mlua::Result<Function>
 where
     F: Fn(&Lua, &Pass, MultiValue) -> mlua::Result<R> + 'static,
     R: mlua::IntoLuaMulti,
 {
+    debug_assert!(arity <= 1, "a face passes at most one argument");
     let shim: Function = lua.named_registry_value(SHIM)?;
-    shim.call(host_raw(lua, pass, f)?)
+    shim.call((host_raw(lua, pass, f)?, arity))
 }
 
 /// A fresh VM for one pass, its environment built and its caps set.

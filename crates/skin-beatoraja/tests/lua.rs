@@ -732,6 +732,28 @@ fn a_candidate_is_refused_once_its_lua_runs_past_its_time() {
 }
 
 #[test]
+fn host_functions_take_a_fixed_number_of_arguments() {
+    // Extra arguments are dropped in Lua before a host function is
+    // called, so none is converted for it.
+    let d = folder(&[
+        (
+            "s.luaskin",
+            &skin(
+                "",
+                &format!(
+                    "local t = {{}}\nfor i = 1, 64 do t[i] = {{ i }} end\n\
+                     assert(dofile(\"p.lua\", nil, t, t, t, t, t, t, t) == 7)\n\
+                     assert(require(\"p\", t, t, t, t) == 7)\n\
+                     assert(skin_config.get_path(\"a.png\", t, t, t) == \"a.png\")\n{DRAW_I}"
+                ),
+            ),
+        ),
+        ("p.lua", "return 7"),
+    ]);
+    import(&d).unwrap();
+}
+
+#[test]
 fn no_skin_code_runs_once_a_fault_is_raised() {
     // The instruction cap is raised from the hook, where Lua turns hooks
     // off and runs the message handler: the skin's handler is skipped.

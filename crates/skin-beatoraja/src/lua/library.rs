@@ -63,9 +63,9 @@
 //! | `table.unpack` (private, the protected calls only) | the packed results | O(n) | at most 16, within a native call's free stack | no |
 //! | `xpcall` (the protected calls' base) | the library's packer | O(1): one result | the skin's handler run only while no fault is recorded | the protected function and handler, hooked |
 //! | host: `settle`, the handlers' `note`, `charge`, `refuse`, `bridge.metatable` | the library's own values | O(1); a refusal's location looks up at most 2 048 frames, once | fatal once | no |
-//! | host: `require`, `dofile` | a name of at most 1 024 bytes, checked before it is copied | a confined read and a compilation, O(file) | 16 MiB a file, 32 MiB read in all, 1 024 loads, depth 16; 16 results | the chunk, hooked |
-//! | host: `skin_config.get_path` | a string of at most 1 024 bytes, checked in Lua and again before it is copied | a substitution, O(path) | the result at most 1 024 bytes, else nil | no |
-//! | host: the pinned module APIs | any | O(1): the fault | fatal | no |
+//! | host: `require`, `dofile` | one argument (extras dropped in Lua), a name of at most 1 024 bytes, checked before it is copied | a confined read and a compilation, O(file) | 16 MiB a file, 32 MiB read in all, 1 024 loads, depth 16; 16 results | the chunk, hooked |
+//! | host: `skin_config.get_path` | one argument, a string of at most 1 024 bytes, checked in Lua and again before it is copied | a substitution, O(path) | the result at most 1 024 bytes, else nil | no |
+//! | host: the pinned module APIs | none (the skin's dropped in Lua) | O(1): the fault | fatal | no |
 //! | the strings' `__index` | a key | a raw lookup in the library's `string` table | none needed | no |
 //! | VM: `..` | strings, numbers | O(result) a concatenation | each instruction at most O(VM memory), at most [`INSTRUCTION_STEP`](super::limits::INSTRUCTION_STEP) (100) instructions between checks, all of them within [`MAX_LUA_TIME`](super::limits::MAX_LUA_TIME) across the candidate's passes and [`MAX_INSTRUCTIONS`](super::limits::MAX_INSTRUCTIONS) | no |
 //! | VM: `<`, `<=`, `==` on long strings | strings | O(length) a comparison | each instruction at most O(VM memory), at most [`INSTRUCTION_STEP`](super::limits::INSTRUCTION_STEP) (100) instructions between checks, all of them within [`MAX_LUA_TIME`](super::limits::MAX_LUA_TIME) across the candidate's passes and [`MAX_INSTRUCTIONS`](super::limits::MAX_INSTRUCTIONS) | no |
@@ -76,9 +76,16 @@
 //!
 //! No host function returns a Rust error to Lua: each returns its status
 //! and its Lua face raises a fault as a fixed marker, so no error carries
-//! a traceback outside the VM's memory. Only the instruction hook raises
-//! its fault as an error, once: the protected calls raise the marker as
-//! they unwind.
+//! a traceback outside the VM's memory. Each takes a fixed number of
+//! arguments, at most four (the protected calls' `settle`), extras
+//! dropped in Lua before the call: mlua converts and pins every argument
+//! before the host function runs, and its auxiliary stack starts with 17
+//! free slots (`LUA_MINSTACK` less its reserve of 3), so a host call's
+//! own arguments never make it grow; nested loads (at most 16 deep) pin a
+//! few more each. The instruction hook raises its fault as mlua's own
+//! error, with no traceback; after it, the protected calls raise the
+//! marker as they unwind, and the hook raises the fault again only past a
+//! grace of 1 000 steps.
 //!
 //! Skin code never runs with the hook off: Lua runs the message handler
 //! where an error is raised, inside the instruction hook for a fault, so
