@@ -877,7 +877,9 @@ impl AdjustmentTap {
         // A cancellation follows the batch whose hold caused it, not the
         // causing press itself (design B2 says after the press): SELECT is
         // a hold too, so a request made with it in one batch is still made
-        // under the candidate's clock. Under review.
+        // under the candidate's clock; the reducer closes the group at the
+        // cancel without ending a held gesture's context, so a scratch held
+        // with START goes on repeating.
         if let Some(generation) = self.cancelled.take() {
             self.owed.push(Marker::Cancelled { generation });
         }
