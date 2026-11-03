@@ -259,9 +259,6 @@ pub struct PlayerRig<'a> {
     /// The adjustments' driver (design.md "Play Adjustments"): the game
     /// thread's one writer of the presentation, installed with the gate.
     pub adjust: Option<game::AdjustDriver>,
-    /// The adjustments' first failed wait on the input thread: terminal,
-    /// nothing more is asked of the driver, and the run ends with it.
-    pub adjust_failed: Option<InputWaitError>,
 }
 
 impl PlayerRig<'_> {
@@ -309,40 +306,48 @@ impl PlayerRig<'_> {
         );
     }
 
-    /// The adjustments' wait on the input thread failed with `e`: the first
-    /// failure is kept, nothing more is asked of the driver, and the run
-    /// ends with it ([`Rig::input_failure`]).
-    pub(crate) fn adjustments_failed(&mut self, e: InputWaitError) {
-        self.adjust_failed.get_or_insert(e);
+    /// The window's scene-scoped state moves on: the settings keys' scene
+    /// epoch ([`Controls::next_scene`]), so a held F3 to F8 repeats no
+    /// action. Every scene change and attempt entry calls it, beside the
+    /// adjustments' context change.
+    fn next_window_scene(&self) {
+        self.controls.next_scene();
     }
 
     /// Every scene change outside an attempt's entry (a play's result,
-    /// selection, the practice page) goes through here: the driver fences
-    /// the input thread and changes the adjustments' context
-    /// ([`game::AdjustDriver::scene_changed`]). An attempt's entry goes
-    /// through [`enter_attempt`](Self::enter_attempt), which fences and
-    /// changes the context too.
+    /// selection, the practice page) goes through here: the window's scene
+    /// epoch moves on, and the driver fences the input thread and changes
+    /// the adjustments' context ([`game::AdjustDriver::scene_changed`]).
+    /// An attempt's entry goes through [`enter_attempt`](Self::enter_attempt),
+    /// which does both too. A failed fence is latched in the driver and
+    /// ends the run ([`Rig::input_failure`]).
     pub(crate) fn enter_scene(&mut self) {
-        if let Some((driver, mut pump)) = self.adjustments()
-            && let Err(e) = driver.scene_changed(&mut pump)
-        {
-            self.adjustments_failed(e);
+        self.next_window_scene();
+        if let Some((driver, mut pump)) = self.adjustments() {
+            let _ = driver.scene_changed(&mut pump);
         }
     }
 
-    /// The coming attempt's entry for the adjustments, at a loading
-    /// state's start ([`game::AdjustDriver::enter_attempt`]).
+    /// The coming attempt's entry, at a loading state's start: the
+    /// window's scene epoch moves on and the adjustments enter the attempt
+    /// ([`game::AdjustDriver::enter_attempt`]).
     pub(crate) fn enter_attempt(&mut self) {
-        if let Some((driver, mut pump)) = self.adjustments()
-            && let Err(e) = driver.enter_attempt(None, &mut pump)
-        {
-            self.adjustments_failed(e);
+        self.next_window_scene();
+        if let Some((driver, mut pump)) = self.adjustments() {
+            let _ = driver.enter_attempt(None, &mut pump);
         }
     }
 
-    /// The driver and its pump, for a wait on the input thread.
+    /// The adjustments' first failed wait on the input thread, latched by
+    /// the driver.
+    fn adjustments_failure(&self) -> Option<InputWaitError> {
+        self.adjust.as_ref().and_then(game::AdjustDriver::failure)
+    }
+
+    /// The driver and its pump, for a wait on the input thread; `None` once
+    /// a wait failed, so nothing more is asked of the input thread.
     pub(crate) fn adjustments(&mut self) -> Option<(&mut game::AdjustDriver, PlayerPump<'_>)> {
-        if self.adjust_failed.is_some() {
+        if self.adjustments_failure().is_some() {
             return None;
         }
         let pump = PlayerPump {
@@ -824,17 +829,18 @@ impl Rig for PlayerRig<'_> {
         if std::mem::take(&mut self.loading_script) {
             self.input.loading_script(self.clock.now());
         }
-        if let Some(e) = self.adjust_failed {
+        if let Some(e) = self.adjustments_failure() {
             return Err(e);
         }
-        let begun = match self.adjustments() {
+        // An attempt entered here (nothing attached at a loading state)
+        // is a scene change for the window too.
+        if self.adjust.as_ref().is_some_and(|d| !d.has_pending()) {
+            self.next_window_scene();
+        }
+        match self.adjustments() {
             Some((driver, mut pump)) => driver.begin_presentation(loaded, &mut pump),
             None => Ok(None),
-        };
-        if let Err(e) = begun {
-            self.adjustments_failed(e);
         }
-        begun
     }
 
     fn end_presentation(&mut self) {
@@ -985,7 +991,7 @@ impl Rig for PlayerRig<'_> {
 
     fn start(&mut self, origin: TimeUs, sounds: AudioQueue, screen: RenderSide) {
         // A new scene: a settings key held into the play repeats nothing.
-        self.controls.next_scene();
+        self.next_window_scene();
         // The play's setup ends here, before anything is handed over; the
         // page faults count from here too.
         let started = self.clock.now();
@@ -1156,7 +1162,7 @@ impl Rig for PlayerRig<'_> {
 
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn input_failure(&self) -> Option<InputWaitError> {
-        self.input.failure().or(self.adjust_failed)
+        self.input.failure().or(self.adjustments_failure())
     }
 
     fn before_play(&mut self, settings: &mut Settings) {
@@ -1175,7 +1181,6 @@ impl Rig for PlayerRig<'_> {
     }
 
     fn ended(&mut self, report: &PlayReport) {
-        self.controls.next_scene();
         // The result is another scene: held adjustment controls act no more
         // until pressed afresh.
         self.enter_scene();

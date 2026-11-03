@@ -1541,11 +1541,10 @@ impl AppRig for PlayerRig<'_> {
         // for them once, so what the player adjusts while loading applies
         // to this attempt. A refusal is reported by the play's preparation
         // ([`game::Rig::begin_presentation`]), which attaches again: a
-        // refused attach leaves nothing pending. Under review.
-        if let Some((driver, mut pump)) = self.adjustments()
-            && let Err(e) = driver.attach_loaded(loaded, &mut pump)
-        {
-            self.adjustments_failed(e);
+        // refused attach leaves nothing pending. Under review. A failed
+        // fence is latched in the driver and ends the run.
+        if let Some((driver, mut pump)) = self.adjustments() {
+            let _ = driver.attach_loaded(loaded, &mut pump);
         }
         // A practice's Start chooses again: its load times run from it.
         let now = self.clock.now();

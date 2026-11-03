@@ -835,7 +835,6 @@ fn rig<'a>(
         gain: audio::Gain::HEADROOM,
         gate: None,
         adjust: None,
-        adjust_failed: None,
     };
     install_adjustments(&mut rig, settings)
         .context("the adjustment controls cannot be installed")?;
@@ -1964,5 +1963,32 @@ mod tests {
             rig.input_failure()
         });
         assert_eq!(failed, Some(game::InputWaitError::Timeout));
+    }
+
+    /// Every scene change and attempt entry moves the window's scene epoch
+    /// on with the adjustments' context: selection, the practice page's
+    /// loading state, a play's opening. A settings key held across one
+    /// repeats no action (the window's guard). Here the input thread never
+    /// answers, so the first fence fails and is latched: the epoch moves on
+    /// all the same.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn every_scene_change_moves_the_window_scene_on() {
+        use game::AppRig as _;
+        let (moved, _) = on_rig(game::DeviceSettings::default(), |rig, _| {
+            let mut moved = Vec::new();
+            let mut last = rig.controls.scene();
+            let mut step = |rig: &mut crate::play::PlayerRig<'_>, what: &'static str| {
+                let now = rig.controls.scene();
+                moved.push((what, now > last));
+                last = now;
+            };
+            rig.entered_selection();
+            step(rig, "selection");
+            rig.entered_loading(std::path::Path::new("chart.bms"));
+            step(rig, "loading");
+            moved
+        });
+        assert_eq!(moved, [("selection", true), ("loading", true)]);
     }
 }
