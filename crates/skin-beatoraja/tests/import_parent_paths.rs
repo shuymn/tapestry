@@ -104,7 +104,7 @@ fn a_font_file_above_the_entry_loads() {
 }
 
 #[test]
-fn an_image_above_the_entry_loads_once_under_every_spelling() {
+fn an_image_above_the_entry_loads_once_under_each_lexical_spelling() {
     // JSON text: `\\` is one backslash.
     let sources = ["../img/a.png", r"..\\img\\a.png", "../play/../img/./a.png"];
     let (_outer, root) = layout(&json("", &sources));
@@ -147,59 +147,180 @@ fn a_lua_entry_reads_a_script_and_an_image_above_it() {
     );
 }
 
-/// Each image name is refused as a missing asset, and nothing admitted,
-/// though a file lies where a lenient reading of the name would lead.
-#[test]
-fn image_names_leaving_the_skin_folder_are_refused() {
-    for name in [
-        // Above the folder: `x.png` lies beside the skin and inside it.
-        "../../x.png",
-        r"..\\..\\x.png",
-        "../play/../../x.png",
-        // Rooted and UNC names: `play/img/a.png` and `play/srv/s/a.png`
-        // exist, where joining them to the entry's folder would lead.
-        "/img/a.png",
-        "\\\\img\\\\a.png",
-        "\\\\\\\\srv\\\\s\\\\a.png",
-        "//srv/s/a.png",
-        // Drive, verbatim and stream names.
-        "C:/x.png",
-        "C:x.png",
-        "\\\\\\\\?\\\\C:\\\\x.png",
-        "../img/a.png:s",
-        "../img/a.png\\u0000",
-        // A junction or link to a folder outside the skin.
-        "../link/a.png",
-    ] {
-        let (outer, root) = layout(&json("", &[name]));
-        png(outer.path(), "x.png", 16, 16);
-        png(&root, "x.png", 16, 16);
-        png(&root, "img/a.png", 16, 16);
-        png(&root, "play/img/a.png", 16, 16);
-        png(&root, "play/srv/s/a.png", 16, 16);
-        png(&outer.path().join("away"), "a.png", 16, 16);
-        common::link_dir(&root.join("link"), &outer.path().join("away"));
-        let i = import_play(&root).unwrap();
-        assert_eq!(
-            notes(&i),
-            [(Severity::Dropped, NoteKind::MissingAsset)],
-            "{name}"
-        );
-        assert_eq!(i.report.usage.files, 0, "{name}");
-    }
+/// `name` as JSON string text: `\` and NUL escaped.
+fn esc(name: &str) -> String {
+    name.replace('\\', r"\\").replace('\0', r"\u0000")
 }
 
-/// A bitmap font above the folder or behind a junction out of it is
-/// refused as a missing asset, though the file exists there.
+/// A skin folder whose `play/s.json` draws `name` as an image, with
+/// files where a lenient reading of an escaping name would lead:
+/// `x.png` beside the skin and inside it, `img/a.png`, `play/a.png`,
+/// `play/img/a.png` and `play/srv/s/a.png`, and the junction or link
+/// `link` to the folder `away` beside the skin, which holds `a.png`.
+fn image_layout(name: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+    let (outer, root) = layout(&json("", &[&esc(name)]));
+    png(outer.path(), "x.png", 16, 16);
+    for file in [
+        "x.png",
+        "img/a.png",
+        "play/a.png",
+        "play/img/a.png",
+        "play/srv/s/a.png",
+    ] {
+        png(&root, file, 16, 16);
+    }
+    png(&outer.path().join("away"), "a.png", 16, 16);
+    common::link_dir(&root.join("link"), &outer.path().join("away"));
+    (outer, root)
+}
+
+/// What importing image `name` from [`image_layout`] noted and admitted.
+fn image_outcome(name: &str) -> (Vec<(Severity, NoteKind)>, u32) {
+    let (_outer, root) = image_layout(name);
+    let i = import_play(&root).unwrap();
+    (notes(&i), i.report.usage.files)
+}
+
+/// The names of `cases` whose outcome is not `expected`, each with what
+/// it gave: every case is checked, so each form fails on its own.
+fn mismatches<T: PartialEq + std::fmt::Debug>(
+    cases: &[&str],
+    expected: &T,
+    outcome: impl Fn(&str) -> T,
+) -> Vec<String> {
+    cases
+        .iter()
+        .filter_map(|&name| {
+            let got = outcome(name);
+            (got != *expected).then(|| format!("{name:?}: {got:?}"))
+        })
+        .collect()
+}
+
+/// The outcome of a refused image: one dropped element, no file.
+fn refused_image() -> (Vec<(Severity, NoteKind)>, u32) {
+    (vec![(Severity::Dropped, NoteKind::MissingAsset)], 0)
+}
+
+/// Each image name leaving the skin folder is refused as a missing
+/// asset, and nothing admitted.
+#[test]
+fn image_names_leaving_the_skin_folder_are_refused() {
+    let names = [
+        // Above the folder.
+        "../../x.png",
+        r"..\..\x.png",
+        "../play/../../x.png",
+        // Rooted and UNC names, which joining to the entry's folder
+        // would lead to `play/img/a.png` and `play/srv/s/a.png`.
+        "/img/a.png",
+        r"\img\a.png",
+        r"\\srv\s\a.png",
+        "//srv/s/a.png",
+        // Drive, device, verbatim and stream names.
+        "C:/x.png",
+        "C:x.png",
+        r"\\.\C:\x.png",
+        "//./C:/x.png",
+        r"\\?\C:\x.png",
+        "//?/C:/x.png",
+        r"\\.\CON",
+        "../img/a.png:s",
+        "a.png::$DATA",
+        "../img/a.png\0",
+        // A junction or link to a folder outside the skin.
+        "../link/a.png",
+    ];
+    let bad = mismatches(&names, &refused_image(), image_outcome);
+    assert!(bad.is_empty(), "{bad:#?}");
+}
+
+/// Windows device names, with extensions and from a subfolder, and
+/// names ending in dots or spaces are refused as missing assets, and
+/// nothing admitted.
+#[cfg(windows)]
+#[test]
+fn windows_device_and_trailing_names_are_refused() {
+    let names = [
+        "CON.png",
+        "con",
+        "COM1.txt",
+        "NUL",
+        "CONIN$",
+        "sub/CON.png",
+        "../CON.png",
+        // `play/a.png` exists.
+        "a.png.",
+        "a.png ",
+        "a.png. .",
+    ];
+    let bad = mismatches(&names, &refused_image(), image_outcome);
+    assert!(bad.is_empty(), "{bad:#?}");
+}
+
+/// A case alias and an 8.3 alias of the in-root `play/longfilename.png`
+/// are admitted: they reach that file, inside the folder. Normalising
+/// is lexical, so each alias is a cache entry of its own.
+#[cfg(windows)]
+#[test]
+fn windows_aliases_of_a_file_inside_the_folder_are_admitted() {
+    use std::os::windows::process::CommandExt as _;
+
+    let (_outer, root) = layout(&json("", &[]));
+    png(&root, "play/longfilename.png", 16, 16);
+    let file = root.join("play").join("longfilename.png");
+    // The file's 8.3 name, when the volume makes one; cmd takes the
+    // quoted path as written.
+    let out = std::process::Command::new("cmd")
+        .raw_arg(format!(
+            "/C for %I in (\"{}\") do @echo %~snxI",
+            file.display()
+        ))
+        .output()
+        .unwrap();
+    let short = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    let mut names = vec![
+        "LongFileName.PNG".to_owned(),
+        "../PLAY/longfilename.png".to_owned(),
+    ];
+    if short.eq_ignore_ascii_case("longfilename.png") {
+        eprintln!("no 8.3 name on this volume: the 8.3 case is skipped");
+    } else {
+        names.push(short);
+    }
+    let cases: Vec<&str> = names.iter().map(String::as_str).collect();
+    let admitted = (Vec::new(), 1);
+    let bad = mismatches(&cases, &admitted, |name| {
+        write(&root, "play/s.json", json("", &[&esc(name)]).as_bytes());
+        let i = import_play(&root).unwrap();
+        (notes(&i), i.report.usage.files)
+    });
+    assert!(bad.is_empty(), "{bad:#?}");
+}
+
+/// A bitmap font leaving the skin folder, or a device name, is refused
+/// as a missing asset, though a font lies where a lenient reading would
+/// lead.
 #[test]
 fn bitmap_fonts_leaving_the_skin_folder_are_refused() {
-    for name in ["../../f.fnt", "../link/f.fnt", "/_font/f.fnt"] {
-        let fonts = format!(r#"{{"id": "t", "path": "{name}"}}"#);
+    let mut names = vec![
+        "../../f.fnt",
+        "../link/f.fnt",
+        "/_font/f.fnt",
+        r"\\.\C:\f.fnt",
+    ];
+    if cfg!(windows) {
+        names.extend(["nul.fnt", "CON.fnt", "f.fnt."]);
+    }
+    let refused = (vec![(Severity::Dropped, NoteKind::MissingAsset)], (0, 0));
+    let bad = mismatches(&names, &refused, |name| {
+        let fonts = format!(r#"{{"id": "t", "path": "{}"}}"#, esc(name));
         let (outer, root) = layout(&json(&fonts, &[]));
         for dir in [
             outer.path().to_owned(),
             root.clone(),
             outer.path().join("away"),
+            root.join("play"),
             root.join("play/_font"),
         ] {
             fnt(&dir, "f.fnt", "f.png");
@@ -207,15 +328,7 @@ fn bitmap_fonts_leaving_the_skin_folder_are_refused() {
         }
         common::link_dir(&root.join("link"), &outer.path().join("away"));
         let i = import_play(&root).unwrap();
-        assert_eq!(
-            notes(&i),
-            [(Severity::Dropped, NoteKind::MissingAsset)],
-            "{name}"
-        );
-        assert_eq!(
-            (i.report.usage.fonts, i.report.usage.files),
-            (0, 0),
-            "{name}"
-        );
-    }
+        (notes(&i), (i.report.usage.fonts, i.report.usage.files))
+    });
+    assert!(bad.is_empty(), "{bad:#?}");
 }

@@ -129,9 +129,12 @@ pub(crate) fn is_movie(path: &str) -> bool {
 /// as the name the model admits, relative to the skin folder: `name`'s
 /// own form checked ([`Root::check_name`]), so a rooted, drive, UNC,
 /// verbatim or stream name or a NUL cannot become relative by joining;
-/// then joined to `dir` and normalised ([`Root::normalise`]), so `..` may
-/// step up inside the skin folder and every spelling of a file is one
-/// name, for the caches and the font pages' folder. A name it refuses,
+/// then joined to `dir` and normalised lexically ([`Root::normalise`]),
+/// so `..` may step up inside the skin folder and spellings differing
+/// only in separators, `.` and `..` are one name, for the caches and the
+/// font pages' folder. Case, 8.3 and link aliases stay names of their
+/// own, each held to the folder by the model's canonical path check. A
+/// name it refuses,
 /// by its form or by a `..` above the skin folder, is returned as written
 /// (joined, for the `..`): the model refuses it as such, with its usual
 /// errors. The model then checks the canonical path, links followed,
