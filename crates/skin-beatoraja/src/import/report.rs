@@ -261,6 +261,11 @@ pub enum NoteKind {
     /// A file that is missing or failed to load, or a choice with no
     /// candidate.
     MissingAsset,
+    /// A file past one of the image decoder's per-file caps, which only
+    /// this importer refuses: `cap` names it.
+    OverCap {
+        cap: &'static str,
+    },
     /// A source rectangle with a negative corner or size (a mirrored
     /// cut), or one leaving its file, which the source cuts as given
     /// (`JsonSkinObjectLoader.java:600-619`).
@@ -311,6 +316,7 @@ impl fmt::Display for NoteKind {
             Self::Timer(why) => write!(f, "an unsupported timer ({why:?})"),
             Self::Deviation(d) => write!(f, "deviation {d:?}"),
             Self::MissingAsset => f.write_str("a missing or unreadable file"),
+            Self::OverCap { cap } => write!(f, "a file over the {cap} cap"),
             Self::SourceRect => f.write_str("a mirrored or out-of-file source rectangle"),
             Self::BitmapFont(e) => write!(f, "a bitmap font refused ({e})"),
             Self::Ignored { field } => write!(f, "`{field}` ignored"),

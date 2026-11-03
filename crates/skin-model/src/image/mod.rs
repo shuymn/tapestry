@@ -48,9 +48,9 @@ pub const MAX_TOTAL_FILE_BYTES: u64 = 512 << 20;
 /// The largest width or height of a file.
 pub const MAX_SIDE: u32 = 16_384;
 /// The most texels of one file. With [`MAX_FILE_BYTES`] it bounds one
-/// file's decoding at 96 MiB: the larger of 2 × 32 MiB encoded, 32 MiB
-/// encoded + 8 B × 8 Mi native, and (8 + 4) B × 8 Mi native and RGBA8.
-pub const MAX_IMAGE_TEXELS: u64 = 8 << 20;
+/// file's decoding at 144 MiB: the larger of 2 × 32 MiB encoded, 32 MiB
+/// encoded + 8 B × 12 Mi native, and (8 + 4) B × 12 Mi native and RGBA8.
+pub const MAX_IMAGE_TEXELS: u64 = 12 << 20;
 /// The most texels across one variant's files.
 pub const MAX_TOTAL_TEXELS: u64 = 128 << 20;
 

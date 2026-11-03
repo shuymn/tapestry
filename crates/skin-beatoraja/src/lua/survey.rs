@@ -79,6 +79,7 @@ fn note(kind: &NoteKind) -> String {
     match kind {
         NoteKind::UnsupportedField { field } => format!("UnsupportedField {field}"),
         NoteKind::Ignored { field } => format!("Ignored {field}"),
+        NoteKind::OverCap { cap } => format!("OverCap {cap}"),
         other => variant(other),
     }
 }
