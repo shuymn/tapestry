@@ -198,7 +198,7 @@ fn windows_stay_in_real_time_at_half_speed() {
             .find(|e| e.kind == JudgeEventKind::SongEnd)
             .unwrap()
             .time;
-        let counts = (report.tally.fast, report.tally.slow);
+        let counts = (report.tally.fast(), report.tally.slow());
         (judgments(&report.live), end.0 - last.0, last, counts)
     };
     let (normal, normal_tail, normal_last, normal_counts) = run(Speed::NORMAL);

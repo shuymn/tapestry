@@ -262,16 +262,22 @@ pub(crate) enum Value {
     /// `count.empty_poor`.
     Count(u8),
     /// `totalearly` and `totallate` (423, 424): `count.fast` and
-    /// `count.slow`, the scored judgments other than PERFECT pressed before
-    /// and after their note, a long note once by its head's press (D4).
-    /// The source counts every judgment other than PERFECT by its own
-    /// early or late flag, misses and presses on a judged note included,
-    /// and a long note by whichever of its head and its release lies
-    /// farther from its time (`IntegerPropertyFactory.java`, `totalearly`,
-    /// `totallate`; `play/JudgeManager.java:511-520`, in `update`, which
-    /// compares the two distances; `updateMicro`, which counts).
+    /// `count.slow`, the early and the late judgments GREAT to POOR and
+    /// empty POORs, as the source sums judges 1 to 5
+    /// (`IntegerPropertyFactory.java`, `totalearly`, `totallate`).
     Fast,
     Slow,
+    /// A judgment's early and late counts, `count.early.perfect`..
+    /// `count.early.poor`, then `count.early.empty_poor`, and the same
+    /// late: 410 to 419 in early and late pairs PERFECT to POOR, 421
+    /// (`early_miss`) and 422 (`late_miss`) for the empty POOR. Early is
+    /// pressed at or before the note, as the source's `note − press ≥ 0`;
+    /// a miss is late; a long note takes the side of whichever of its
+    /// head and its release lies farther from its time, the release on a
+    /// tie (`play/JudgeManager.java:511-520`, in `update`, which compares
+    /// the two distances; `updateMicro`, which counts).
+    Early(u8),
+    Late(u8),
     /// The rate over the targets judged so far, whole percent and
     /// hundredths (D4): the source's `getNowRate*`
     /// (`IntegerPropertyFactory.java:176-180`).
@@ -334,6 +340,18 @@ impl Value {
             Self::Count(_) => "count.empty_poor",
             Self::Fast => "count.fast",
             Self::Slow => "count.slow",
+            Self::Early(0) => "count.early.perfect",
+            Self::Early(1) => "count.early.great",
+            Self::Early(2) => "count.early.good",
+            Self::Early(3) => "count.early.bad",
+            Self::Early(4) => "count.early.poor",
+            Self::Early(_) => "count.early.empty_poor",
+            Self::Late(0) => "count.late.perfect",
+            Self::Late(1) => "count.late.great",
+            Self::Late(2) => "count.late.good",
+            Self::Late(3) => "count.late.bad",
+            Self::Late(4) => "count.late.poor",
+            Self::Late(_) => "count.late.empty_poor",
             Self::CurrentRatePercent => "rate.current_bp / 100",
             Self::CurrentRateFraction => "rate.current_bp % 100",
             Self::WholeRatePercent => "rate.whole_bp / 100",
@@ -373,7 +391,14 @@ impl Value {
     pub(crate) fn deviates(self) -> bool {
         !matches!(
             self,
-            Self::ExScore | Self::MaxCombo | Self::GaugePercent | Self::Count(_)
+            Self::ExScore
+                | Self::MaxCombo
+                | Self::GaugePercent
+                | Self::Count(_)
+                | Self::Fast
+                | Self::Slow
+                | Self::Early(_)
+                | Self::Late(_)
         )
     }
 
@@ -421,6 +446,16 @@ fn shown(id: i32) -> Option<Value> {
         420 => Value::Count(5),
         423 => Value::Fast,
         424 => Value::Slow,
+        410..=419 => {
+            let grade = u8::try_from((id - 410) / 2).ok()?;
+            if id % 2 == 0 {
+                Value::Early(grade)
+            } else {
+                Value::Late(grade)
+            }
+        }
+        421 => Value::Early(5),
+        422 => Value::Late(5),
         90 => Value::BpmMax,
         91 => Value::BpmMin,
         160 => Value::BpmNow,
@@ -693,15 +728,44 @@ mod tests {
                 assert!(skin_model::compile(g, &scope, skin_model::Ty::Bool).is_ok());
             }
         }
-        // FAST and SLOW, with a D4 note for their counting.
-        for (id, name, value, expr) in [
-            (423, "totalearly", Value::Fast, "count.fast"),
-            (424, "totallate", Value::Slow, "count.slow"),
-        ] {
+        // The early and late counts and their totals, counted as the
+        // source counts them: no D4 note.
+        let early_late = [
+            (410, None, Value::Early(0), "count.early.perfect"),
+            (411, None, Value::Late(0), "count.late.perfect"),
+            (412, None, Value::Early(1), "count.early.great"),
+            (413, None, Value::Late(1), "count.late.great"),
+            (414, None, Value::Early(2), "count.early.good"),
+            (415, None, Value::Late(2), "count.late.good"),
+            (416, None, Value::Early(3), "count.early.bad"),
+            (417, None, Value::Late(3), "count.late.bad"),
+            (418, None, Value::Early(4), "count.early.poor"),
+            (419, None, Value::Late(4), "count.late.poor"),
+            (420, Some("miss"), Value::Count(5), "count.empty_poor"),
+            (
+                421,
+                Some("early_miss"),
+                Value::Early(5),
+                "count.early.empty_poor",
+            ),
+            (
+                422,
+                Some("late_miss"),
+                Value::Late(5),
+                "count.late.empty_poor",
+            ),
+            (423, Some("totalearly"), Value::Fast, "count.fast"),
+            (424, Some("totallate"), Value::Slow, "count.slow"),
+        ];
+        let scope = skin_model::Scope::new(&skin_model::PLAY);
+        for (id, name, value, expr) in early_late {
             assert_eq!(int_by_id(id), IntProp::Shown(value), "{id}");
-            assert_eq!(int_by_name(name), Some(IntProp::Shown(value)), "{name}");
+            if let Some(name) = name {
+                assert_eq!(int_by_name(name), Some(IntProp::Shown(value)), "{name}");
+            }
             assert_eq!((value.expr(), value.availability()), (expr, None));
-            assert!(value.deviates() && !value.critical());
+            assert!(!value.deviates() && !value.critical(), "{id}");
+            assert!(skin_model::compile(expr, &scope, skin_model::Ty::Int).is_ok());
         }
         // Neither is a value property; others keep needing their own data.
         assert_eq!(int_by_id(15), IntProp::Null);
