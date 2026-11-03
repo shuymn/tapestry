@@ -16,16 +16,16 @@ mod common;
 
 use std::cell::RefCell;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::rc::Rc;
 
 use bms_model::{Chart, ChartBuilder, SoundId, TimeUs};
-use common::{MS, PERIOD, RATE, count_judged, judgments, lane, tapestry_settings};
+use common::{Built, MS, PERIOD, RATE, count_judged, judgments, lane, tapestry_settings};
 use eval::{ControlId, InputKind, PhysicalInputEvent, SourceId};
 use game::{
-    AbortCause, AdjustmentConfig, ChartIngest, Command, DataRoot, DeviceSettings, HiSpeedSettings,
-    IngestError, Ingested, KeyConfigs, Loaded, Parts, PlayEnd, PlayOptions, PlayReport, PlayScript,
-    Ratio, RunnerAudio, Session, SessionConfig, SessionEvent, SessionEventSink, SpeedMode,
+    AbortCause, AdjustmentConfig, Command, DataRoot, DeviceSettings, HiSpeedSettings, KeyConfigs,
+    Loaded, Parts, PlayEnd, PlayOptions, PlayReport, PlayScript, Ratio, RunnerAudio, Session,
+    SessionConfig, SessionEvent, SessionEventSink, SpeedMode,
 };
 use input::{Action, DeviceId, DeviceKind, Packet, ScriptItem, ScriptedInput, SourceSet};
 use replay::{BuildProvenance, CancelReason, DecodeLimits, EndStatus, PlayRecord, ReceiveMethod};
@@ -62,32 +62,6 @@ fn chart() -> Chart {
         .bgm(TimeUs(0), SoundId(0))
         .build()
         .unwrap()
-}
-
-struct Built(Chart);
-
-impl ChartIngest for Built {
-    fn max_bytes(&self) -> usize {
-        1 << 20
-    }
-
-    fn accepts(&self, path: &Path) -> bool {
-        path.extension().is_some_and(|e| e == "chart")
-    }
-
-    fn ingest(
-        &self,
-        _bytes: &[u8],
-        _dir: &Path,
-        _seed: u64,
-        _speed: bms_model::Speed,
-    ) -> Result<Ingested, IngestError> {
-        Ok(Ingested {
-            labels: game::ChartLabels::default(),
-            chart: self.0.clone(),
-            warnings: Vec::new(),
-        })
-    }
 }
 
 #[derive(Clone, Default)]

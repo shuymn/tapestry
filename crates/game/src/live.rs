@@ -1340,37 +1340,23 @@ fn play_and_next<R: Rig>(
     // A gated attempt's history: before its commit, the last opening ends
     // the capture, cancelled before playback (design.md "Play Lifecycle",
     // ending without a played attempt), at origin 0; after it, the
-    // cancelled openings are relative to the winning one.
-    let capture = gate.as_mut().map(|g| {
-        if !g.committed {
-            let closed_at = TimeUs(rig.now().0.saturating_sub(origin.0));
-            let reason = if waiting {
-                CancelReason::Held
-            } else {
-                let _ = g.history.begin(logic.start(), origin);
-                let _ = g.history.take(logic.popped());
-                cancel_reason(end, rig.quitting())
-            };
-            let _ = g.history.seal(closed_at, &closing.arrivals, reason);
-        }
-        // A capture's last kept opening is its origin 0, even when the
-        // history had no room for the last one. Its history is copied out
-        // once the play is over, after Closing, which copies nothing.
-        let last = if g.committed {
-            origin
+    // cancelled openings are relative to the winning one. It is copied out
+    // once the play is over, after Closing, which copies nothing.
+    if let Some(g) = gate.as_mut().filter(|g| !g.committed) {
+        let closed_at = TimeUs(rig.now().0.saturating_sub(origin.0));
+        let reason = if waiting {
+            CancelReason::Held
         } else {
-            g.history.last_origin().unwrap_or(origin)
+            let _ = g.history.begin(logic.start(), origin);
+            let _ = g.history.take(logic.popped());
+            cancel_reason(end, rig.quitting())
         };
-        Capture {
-            played: g.committed,
-            last,
-            exhausted: g.history.exhausted(),
-        }
-    });
+        let _ = g.history.seal(closed_at, &closing.arrivals, reason);
+    }
     let incomplete = Incomplete {
         overflow: logic.overflowed()
             || closing.overflowed
-            || capture.as_ref().is_some_and(|c| c.exhausted),
+            || gate.as_ref().is_some_and(|g| g.history.exhausted()),
         source_limit: closing.source_limited,
         suspend: suspended,
         input_failed: input_error.is_some(),
@@ -1416,10 +1402,16 @@ fn play_and_next<R: Rig>(
     // changed nothing scored.
     let view = logic.view();
     let record = logic.into_record();
-    let history = gate
-        .as_ref()
-        .zip(capture)
-        .map(|(g, c)| g.history.history(c.last));
+    // A capture's last kept opening is its origin 0, even when the
+    // history had no room for the last one.
+    let history = gate.as_ref().map(|g| {
+        let last = if g.committed {
+            origin
+        } else {
+            g.history.last_origin().unwrap_or(origin)
+        };
+        g.history.history(last)
+    });
 
     rig.play_over();
     let report = loaded.finish_play(PlayOutcome {
@@ -1436,7 +1428,7 @@ fn play_and_next<R: Rig>(
         arrivals: closing.arrivals,
         axis_out_of_range: closing.axis_out_of_range,
         incomplete,
-        played: capture.is_none_or(|c| c.played),
+        played,
         history,
         closing: closing_report,
     });
@@ -1643,16 +1635,6 @@ impl Candidates {
             }
         }
     }
-}
-
-/// A gated attempt's capture as it ended, without copying its history.
-#[derive(Clone, Copy)]
-struct Capture {
-    /// Whether a candidate committed: the attempt was played.
-    played: bool,
-    /// The last kept opening's origin: the history's time 0.
-    last: TimeUs,
-    exhausted: bool,
 }
 
 /// Why the last opening of an attempt that ended before its commit was

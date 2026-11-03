@@ -20,43 +20,16 @@ mod counting;
 use std::path::Path;
 
 use bms_model::{Chart, ChartBuilder, TimeUs};
-use common::{MS, lane, tapestry_settings};
+use common::{Built, MS, lane, tapestry_settings};
 use game::{
-    AudioQueue, ChartIngest, Closing, ClosingEnd, Command, DataRoot, FailureAction, IngestError,
-    Ingested, InputWaitError, Loaded, Opening, Parts, PlayEnd, PlayReport, RenderSide, Rig,
-    SessionConfig,
+    AudioQueue, Closing, ClosingEnd, Command, DataRoot, FailureAction, InputWaitError, Loaded,
+    Opening, Parts, PlayEnd, PlayReport, RenderSide, Rig, SessionConfig,
 };
 use input::{DeviceId, DeviceKind, SourceReader, SourceSet};
 use replay::{BuildProvenance, ReceiveMethod};
 
 #[global_allocator]
 static GLOBAL: counting::Counting = counting::Counting;
-
-struct Built(Chart);
-
-impl ChartIngest for Built {
-    fn max_bytes(&self) -> usize {
-        1 << 20
-    }
-
-    fn accepts(&self, path: &Path) -> bool {
-        path.extension().is_some_and(|e| e == "chart")
-    }
-
-    fn ingest(
-        &self,
-        _bytes: &[u8],
-        _dir: &Path,
-        _seed: u64,
-        _speed: bms_model::Speed,
-    ) -> Result<Ingested, IngestError> {
-        Ok(Ingested {
-            labels: game::ChartLabels::default(),
-            chart: self.0.clone(),
-            warnings: Vec::new(),
-        })
-    }
-}
 
 /// A rig on a 1 ms clock whose input side is a source set in the test's
 /// thread: each wait publishes an empty batch. Counting runs from the end
