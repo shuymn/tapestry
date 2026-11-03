@@ -15,7 +15,7 @@ use lanes_support::{
 };
 use play_support::{Harness, MS, REGIONS, bool_program, full, lane, readouts_for, uvs};
 use skin_model::{
-    BarGroupDef, BarGroupError, Bind, Blend, BuildError, Ease, End, Fill, Follow, KeyDef,
+    BarGroupDef, BarGroupError, Bind, Blend, BuildError, Ease, End, Fill, Follow, Gain, KeyDef,
     LANE_QUADS, LANE_VISITS, LanePart, LanesDef, LanesError, Layout, LoadError, MAX_BAR_GROUPS,
     MAX_COORD, MAX_SKIN_KEYS, Native, Place, Region, TimerRef, Track, Variant, timer,
 };
@@ -94,8 +94,8 @@ fn a_bar_at_the_line_sits_where_its_group_is_authored() {
 
 #[test]
 fn travel_and_the_lift_each_move_a_bar_once() {
-    // A lane 600 long (top 80, line 680) lifted 250 ‰: L = 150, the 450
-    // px left scrolled over 450 ms, so a bar 100 ms ahead travels −100.
+    // A lane 600 long (top 80, line 680) lifted 250 ‰: L = 150; the whole
+    // lane scrolls over 600 ms, so a bar 100 ms ahead travels −100.
     let mut def = simple();
     def.line = 680;
     let def = with_groups(
@@ -107,7 +107,6 @@ fn travel_and_the_lift_each_move_a_bar_once() {
     );
     let chart = chart_with_bars(&[1_100]);
     let mut h = harness(def, &chart);
-    h.view.visible_time = TimeUs(450 * MS);
     h.view.lift = 250;
     h.frame(1_000, &[]);
     assert_eq!(rects(&h, BAR), [[100.0, 250.0, 300.0, 2.0]]);
@@ -166,7 +165,7 @@ fn a_stop_holds_a_bar_while_its_animation_runs() {
 
 #[test]
 fn lead_in_and_display_offset_keep_decorative_time() {
-    // A 2 s lead-in: `ready` runs, `play` is off. Over 3 s visible, the
+    // A 2 s lead-in: `ready` runs, `play` is off. With 3 s over the lane, the
     // bar at 0 is 1 s ahead; a display offset moves it but not the fade.
     let chart = chart_with_bars(&[0]);
     let def = with_groups(
@@ -177,7 +176,7 @@ fn lead_in_and_display_offset_keep_decorative_time() {
         ],
     );
     let mut h = Harness::new(lanes_skin(def.clone()), &chart, &full(2_000));
-    h.view.visible_time = TimeUs(3_000 * MS);
+    h.view.gain = Gain::new(8, 15);
     h.frame(-1_000, &[]);
     let at = quads_of(&h, BAR);
     assert_eq!(at.len(), 1);
@@ -187,7 +186,7 @@ fn lead_in_and_display_offset_keep_decorative_time() {
     assert!((at[0].color[3] - alpha).abs() < 1e-3, "{alpha} {:?}", at[0]);
     // 150 ms of display offset: the bar is 150 ms nearer, 40 px lower.
     let mut later = Harness::new(lanes_skin(def), &chart, &full(2_000));
-    later.view.visible_time = TimeUs(3_000 * MS);
+    later.view.gain = Gain::new(8, 15);
     later.offset = TimeUs(150 * MS);
     later.frame(-1_000, &[]);
     let moved = quads_of(&later, BAR);

@@ -25,9 +25,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use bms_model::{Chart, TimeUs};
 use eval::Section;
 use skin_model::{
-    Atlas, BitmapLines, BuildError, Canvas, ChartText, CoverSettings, FrameReadouts, LaneView,
-    Layout, Loading, Page, Play, Side, Skin, SkinFrame, TextSlots, TextTable, TextTableError,
-    UvTable,
+    Atlas, BitmapLines, BuildError, Canvas, ChartText, Layout, Loading, Page, Play, Side, Skin,
+    SkinFrame, TextSlots, TextTable, TextTableError, UvTable,
 };
 
 use crate::projection::ClipTable;
@@ -501,29 +500,10 @@ impl Installation {
     }
 }
 
-/// A frame's readouts until the cover settings and the tempo provider
-/// reach the frame (docs/stage3.md S10-04 and S10-06): no tempo, hi-speed
-/// or duration, and every cover off at 0, not being adjusted.
-const READOUTS: FrameReadouts = FrameReadouts {
-    bpm_current_x100: None,
-    hispeed_x100: None,
-    duration: None,
-    covers: CoverSettings {
-        cover: 0,
-        lift: 0,
-        hidden: 0,
-        cover_enabled: false,
-        lift_enabled: false,
-        hidden_enabled: false,
-        adjusting: false,
-    },
-};
-
 /// The model's frame of `f`: the tally, the gauges, the completion and the
 /// play phase from the one play view `f` borrows, the effects slice as
 /// drained, the target as the renderer applied it, the author's layout,
-/// no cover and the visible time of the tuning snapshot, and the
-/// readouts above.
+/// and the lanes and readouts `f` carries.
 #[must_use]
 pub fn skin_frame<'a>(f: &FrameInput<'a>) -> SkinFrame<'a> {
     let view = f.view;
@@ -540,13 +520,8 @@ pub fn skin_frame<'a>(f: &FrameInput<'a>) -> SkinFrame<'a> {
         playing: view.playing,
         target: f.target,
         layout: &Layout::AUTHOR,
-        lanes: LaneView {
-            visible_time: f.visible_time,
-            cover: 0,
-            lift: 0,
-            hidden: 0,
-        },
-        readouts: READOUTS,
+        lanes: f.lanes,
+        readouts: f.readouts,
     }
 }
 

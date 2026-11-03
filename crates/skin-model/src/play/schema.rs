@@ -28,6 +28,10 @@ pub const COVER_PERMILLE: i32 = 1_000;
 /// The largest `duration.green`: three fifths of [`READOUT_MAX`], rounded
 /// down.
 pub const GREEN_MAX: i32 = READOUT_MAX / 5 * 3 + READOUT_MAX % 5 * 3 / 5;
+/// The largest `native.hispeed.x100`: the multiplier's maximum, 20.
+const NATIVE_HISPEED_MAX: i32 = 2_000;
+/// The largest `native.target.green`: the target green number's maximum.
+pub(crate) const NATIVE_TARGET_MAX: i32 = 6_000;
 
 const fn int(name: &'static str, hi: i32, export: Export) -> Field {
     Field {
@@ -151,6 +155,41 @@ pub static PLAY: Schema = Schema {
         count("count.late.poor", E),
         count("count.early.empty_poor", E),
         count("count.late.empty_poor", E),
+        int("duration.current.covered.ms", READOUT_MAX, E),
+        int("duration.current.covered.green", READOUT_MAX, E),
+        flag("duration.current.covered.valid", E),
+        int("duration.current.uncovered.ms", READOUT_MAX, E),
+        int("duration.current.uncovered.green", READOUT_MAX, E),
+        flag("duration.current.uncovered.valid", E),
+        int("duration.main.covered.ms", READOUT_MAX, E),
+        int("duration.main.covered.green", READOUT_MAX, E),
+        flag("duration.main.covered.valid", E),
+        int("duration.main.uncovered.ms", READOUT_MAX, E),
+        int("duration.main.uncovered.green", READOUT_MAX, E),
+        flag("duration.main.uncovered.valid", E),
+        int("duration.min.covered.ms", READOUT_MAX, E),
+        int("duration.min.covered.green", READOUT_MAX, E),
+        flag("duration.min.covered.valid", E),
+        int("duration.min.uncovered.ms", READOUT_MAX, E),
+        int("duration.min.uncovered.green", READOUT_MAX, E),
+        flag("duration.min.uncovered.valid", E),
+        int("duration.max.covered.ms", READOUT_MAX, E),
+        int("duration.max.covered.green", READOUT_MAX, E),
+        flag("duration.max.covered.valid", E),
+        int("duration.max.uncovered.ms", READOUT_MAX, E),
+        int("duration.max.uncovered.green", READOUT_MAX, E),
+        flag("duration.max.uncovered.valid", E),
+        int("native.hispeed.x100", NATIVE_HISPEED_MAX, T),
+        flag("native.hispeed.valid", T),
+        int("native.duration.ms", READOUT_MAX, T),
+        int("native.duration.green", READOUT_MAX, T),
+        flag("native.duration.valid", T),
+        int("native.target.green", NATIVE_TARGET_MAX, T),
+        flag("native.target.valid", T),
+        int("native.sudden.white", COVER_PERMILLE, T),
+        int("native.lift.white", COVER_PERMILLE, T),
+        int("native.hidden.white", COVER_PERMILLE, T),
+        flag("native.floating", T),
     ],
     timers: &[
         timer("ready", E),
@@ -280,12 +319,14 @@ pub mod field {
     pub const HIDDEN_ENABLED: u16 = 30;
     /// Whether the cover-adjustment mode is active.
     pub const COVER_ADJUSTING: u16 = 31;
-    /// The multiplicative hi-speed, in floored hundredths; 0 while
-    /// `hispeed.valid` is false.
+    /// The hi-speed projected into the source's coordinates,
+    /// `⌊100 · H / (1 − l)⌋` for the effective lift `l`, in floored
+    /// hundredths and not clamped to 20; 0 while `hispeed.valid` is false.
     pub const HISPEED_X100: u16 = 32;
-    /// Whether the scroll policy has a multiplicative hi-speed.
+    /// Whether `H` is known and a field is left above the lift.
     pub const HISPEED_VALID: u16 = 33;
-    /// The travel duration, rounded half up to whole ms; 0 while
+    /// The projected travel duration at the current tempo with the
+    /// effective lane cover, rounded half up to whole ms; 0 while
     /// `duration.valid` is false.
     pub const DURATION_MS: u16 = 34;
     /// `⌊3 · duration.ms / 5⌋`, the green number derived from the rounded
@@ -313,8 +354,51 @@ pub mod field {
     pub const COUNT_LATE_POOR: u16 = 48;
     pub const COUNT_EARLY_EMPTY_POOR: u16 = 49;
     pub const COUNT_LATE_EMPTY_POOR: u16 = 50;
+    /// The first of the eight duration variants' fields, 51 to 74
+    /// ([`FrameReadouts::duration_variants`](crate::FrameReadouts::duration_variants)):
+    /// variant `i` (the tempo `t` = current, main, min, max, then the
+    /// cover `k` = covered, uncovered, `i = 2t + k`) is
+    /// `duration.<t>.<k>.ms` at `51 + 3i`, rounded half up, `.green` at
+    /// `52 + 3i`, rounded half up from the exact ratio × 3/5, and `.valid`
+    /// at `53 + 3i`; see [`duration_variant`].
+    pub const DURATION_VARIANTS: u16 = 51;
+    /// The active multiplier from the lanes' gain, rounded half up to
+    /// hundredths; 0 while `native.hispeed.valid` is false.
+    pub const NATIVE_HISPEED_X100: u16 = 75;
+    /// Whether the lanes have a gain.
+    pub const NATIVE_HISPEED_VALID: u16 = 76;
+    /// The exact current travel duration, rounded half up to whole ms;
+    /// 0 while `native.duration.valid` is false.
+    pub const NATIVE_DURATION_MS: u16 = 77;
+    /// The green number rounded half up from exactly three fifths of the
+    /// duration.
+    pub const NATIVE_DURATION_GREEN: u16 = 78;
+    /// Whether the frame gives the native duration.
+    pub const NATIVE_DURATION_VALID: u16 = 79;
+    /// The target green number; 0 while `native.target.valid` is false.
+    pub const NATIVE_TARGET_GREEN: u16 = 80;
+    /// Whether there is a target: Floating only.
+    pub const NATIVE_TARGET_VALID: u16 = 81;
+    /// SUDDEN+'s white number: `⌊(1 000 − l) · cover / 1 000⌋` of the
+    /// configured lane cover and the effective lift `l`.
+    pub const NATIVE_SUDDEN_WHITE: u16 = 82;
+    /// LIFT's white number: the configured lift.
+    pub const NATIVE_LIFT_WHITE: u16 = 83;
+    /// HIDDEN+'s white number: `⌊(1 000 − l) · hidden / 1 000⌋` of the
+    /// configured hidden cover and the effective lift `l`.
+    pub const NATIVE_HIDDEN_WHITE: u16 = 84;
+    /// Whether the speed mode is Floating.
+    pub const NATIVE_FLOATING: u16 = 85;
     /// The number of fields.
-    pub const COUNT: usize = 51;
+    pub const COUNT: usize = 86;
+
+    /// The `duration.<t>.<k>.ms` slot of the variant at `tempo` (0 to 3:
+    /// current, main, min, max), `covered` or not; `.green` and `.valid`
+    /// follow it.
+    #[must_use]
+    pub const fn duration_variant(tempo: u16, covered: bool) -> u16 {
+        DURATION_VARIANTS + 3 * (2 * tempo + if covered { 0 } else { 1 })
+    }
 }
 
 /// The built-in timer slots of [`PLAY`]; `when` timers follow from
@@ -490,12 +574,81 @@ mod tests {
             ("cover.adjusting", E),
             ("hispeed.valid", E),
             ("duration.valid", E),
+            ("native.hispeed.valid", T),
+            ("native.duration.valid", T),
+            ("native.target.valid", T),
+            ("native.floating", T),
         ] {
             assert!(
                 matches!(ty(name), Some((FieldTy::Bool, e)) if e == export),
                 "{name}"
             );
         }
+        for (name, hi) in [
+            ("native.hispeed.x100", 2_000),
+            ("native.duration.ms", READOUT_MAX),
+            ("native.duration.green", READOUT_MAX),
+            ("native.target.green", 6_000),
+            ("native.sudden.white", 1_000),
+            ("native.lift.white", 1_000),
+            ("native.hidden.white", 1_000),
+        ] {
+            assert!(matches!(ty(name), Some((t, T)) if t == int(hi)), "{name}");
+        }
+        for t in ["current", "main", "min", "max"] {
+            for k in ["covered", "uncovered"] {
+                for v in ["ms", "green"] {
+                    let name = format!("duration.{t}.{k}.{v}");
+                    assert!(
+                        matches!(ty(&name), Some((t, E)) if t == int(READOUT_MAX)),
+                        "{name}"
+                    );
+                }
+                let name = format!("duration.{t}.{k}.valid");
+                assert!(matches!(ty(&name), Some((FieldTy::Bool, E))), "{name}");
+            }
+        }
+    }
+
+    /// Slots 51 to 74 are `51 + 3 · (2t + k) + {0, 1, 2}` for the tempo
+    /// `t` and the cover `k`, and the native block follows to 85.
+    #[test]
+    fn duration_variants_and_the_native_block_take_their_slots() {
+        let slot = |name: &str| PLAY.field(name).map(|(s, _)| s);
+        for (t, tempo) in ["current", "main", "min", "max"].into_iter().enumerate() {
+            for (k, cover) in ["covered", "uncovered"].into_iter().enumerate() {
+                let t16 = u16::try_from(t).unwrap();
+                let k16 = u16::try_from(k).unwrap();
+                let first = 51 + 3 * (2 * t16 + k16);
+                assert_eq!(field::duration_variant(t16, k == 0), first);
+                for (i, v) in ["ms", "green", "valid"].into_iter().enumerate() {
+                    let name = format!("duration.{tempo}.{cover}.{v}");
+                    assert_eq!(
+                        slot(&name),
+                        Some(first + u16::try_from(i).unwrap()),
+                        "{name}"
+                    );
+                }
+            }
+        }
+        let native = [
+            ("native.hispeed.x100", field::NATIVE_HISPEED_X100),
+            ("native.hispeed.valid", field::NATIVE_HISPEED_VALID),
+            ("native.duration.ms", field::NATIVE_DURATION_MS),
+            ("native.duration.green", field::NATIVE_DURATION_GREEN),
+            ("native.duration.valid", field::NATIVE_DURATION_VALID),
+            ("native.target.green", field::NATIVE_TARGET_GREEN),
+            ("native.target.valid", field::NATIVE_TARGET_VALID),
+            ("native.sudden.white", field::NATIVE_SUDDEN_WHITE),
+            ("native.lift.white", field::NATIVE_LIFT_WHITE),
+            ("native.hidden.white", field::NATIVE_HIDDEN_WHITE),
+            ("native.floating", field::NATIVE_FLOATING),
+        ];
+        for (i, (name, s)) in native.into_iter().enumerate() {
+            assert_eq!(usize::from(s), 75 + i, "{name}");
+            assert_eq!(slot(name), Some(s), "{name}");
+        }
+        assert_eq!(field::COUNT, 86);
     }
 
     #[test]

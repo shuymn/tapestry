@@ -9,7 +9,7 @@ use bms_model::{Chart, ChartBuilder, Lane, LnMode, NoteKind, TimeUs};
 use eval::{GaugeState, JudgeEvent, JudgeEventKind, NoteFacts, NoteHold, Tally};
 use rules::{GaugeValue, Judgment, PerJudgment};
 use skin_model::{
-    Atlas, AtlasLimits, Attempt, BpmRange, ChartText, CoverSettings, FrameReadouts, FrameUv,
+    Atlas, AtlasLimits, Attempt, BpmRange, ChartText, CoverSettings, FrameReadouts, FrameUv, Gain,
     GaugeDesc, GaugeLook, LaneView, Layout, LoadState, Loading, LoadingFrame, LoadingGauge,
     PlayContext, Quad, QuadBatch, Side, Skin, SkinFrame, TextImage, TextTable, UvTable, Variant,
 };
@@ -51,9 +51,6 @@ const LIMITS: AtlasLimits = AtlasLimits {
 /// at 1 000).
 pub fn readouts_for(view: LaneView) -> FrameReadouts {
     FrameReadouts {
-        bpm_current_x100: None,
-        hispeed_x100: None,
-        duration: None,
         covers: CoverSettings {
             cover: view.cover.min(1_000),
             lift: view.lift.min(1_000),
@@ -63,6 +60,7 @@ pub fn readouts_for(view: LaneView) -> FrameReadouts {
             hidden_enabled: true,
             adjusting: false,
         },
+        ..FrameReadouts::UNAVAILABLE
     }
 }
 
@@ -280,11 +278,10 @@ impl Drawn {
                 failed_at: None,
             }],
             batch,
+            // 600 ms of 150 BPM over the original lane.
             view: LaneView {
-                visible_time: TimeUs(600 * MS),
-                cover: 0,
-                lift: 0,
-                hidden: 0,
+                gain: Gain::new(8, 3),
+                ..LaneView::NONE
             },
             target: [1_920, 1_080],
             readouts: None,
@@ -452,12 +449,7 @@ impl Loader {
     /// The quads of the loading frame at `ms`.
     pub fn frame(&mut self, ms: i64) -> Vec<Quad> {
         self.batch.clear();
-        let view = LaneView {
-            visible_time: TimeUs(600 * MS),
-            cover: 0,
-            lift: 0,
-            hidden: 0,
-        };
+        let view = LaneView::NONE;
         let frame = LoadingFrame {
             now: TimeUs(ms * MS),
             load: LoadState {

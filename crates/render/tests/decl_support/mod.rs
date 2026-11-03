@@ -17,15 +17,32 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-use bms_model::TimeUs;
-use render::{AttemptText, ClipTable, Renderer, SkinBundle, SkinError};
+use bms_model::{Chart, ChartBuilder, Lane, LnMode, TimeUs};
+use render::{AttemptText, ClipTable, Instance, Renderer, SkinBundle, SkinError};
 use skin_model::{
-    Align, Anchor, Blend, ChartText, ClipId, Ease, ElementDef, End, FileDef, Filter, Fit, FontRef,
-    FrameUv, GaugeDef, GaugeLook, GaugeParts, ImageDef, KeyDef, LaneParts, LaneStyle, LanesDef,
-    Layout, Motion, Overflow, PLAY, Place, Region, RegionDef, Scope, Sheet, Side, Skin, SkinDef,
-    Source, TextDef, TextField, TextImage, TextTable, TextValue, TimerRef, Track, Ty, Variant,
-    WidgetDefs, compile,
+    Align, Anchor, BarGroupDef, Bind, Blend, ChartText, ClipId, CoverImage, CoverMotion,
+    CoverPaintDef, CoverSettings, CoverTrim, Ease, ElementDef, End, FileDef, Filter, Fit, Follow,
+    FontRef, FrameReadouts, FrameUv, Gain, GaugeDef, GaugeLook, GaugeParts, ImageDef, KeyDef,
+    LaneParts, LaneStyle, LaneView, LanesDef, Layout, Motion, Overflow, PLAY, Place, Region,
+    RegionDef, Scope, Sheet, Side, Skin, SkinDef, Source, SourceLanes, TextDef, TextField,
+    TextImage, TextTable, TextValue, TimerRef, Track, Ty, Variant, WidgetDefs, compile,
 };
+
+/// A track holding canvas `rect` from 0.
+fn still(rect: [i32; 4]) -> Track {
+    let [x, y, w, h] = rect;
+    let mut props = [None; 9];
+    props[..4].copy_from_slice(&[Some(x), Some(y), Some(w), Some(h)]);
+    Track::new(
+        &[KeyDef {
+            at: TimeUs(0),
+            props,
+        }],
+        Ease::Linear,
+        End::Hold,
+    )
+    .unwrap()
+}
 
 /// Writes a `side`-texel-square PNG of `rgba` at `path`.
 fn png(path: &Path, side: u32, rgba: [u8; 4]) {
@@ -40,20 +57,9 @@ fn png(path: &Path, side: u32, rgba: [u8; 4]) {
 /// An element drawing image 0 over canvas `rect` from `ready` on, under
 /// clip 0 when `clipped`.
 fn image(rect: [i32; 4], clipped: bool) -> ElementDef {
-    let [x, y, w, h] = rect;
-    let mut props = [None; 9];
-    props[..4].copy_from_slice(&[Some(x), Some(y), Some(w), Some(h)]);
     ElementDef {
         source: Source::Image(0),
-        track: Track::new(
-            &[KeyDef {
-                at: TimeUs(0),
-                props,
-            }],
-            Ease::Linear,
-            End::Hold,
-        )
-        .unwrap(),
+        track: still(rect),
         timer: TimerRef::Builtin(skin_model::timer::READY),
         visible: None,
         blend: Blend::Alpha,
@@ -107,6 +113,116 @@ pub struct Look {
     /// timer 1 ([`PROGRESS_SLOT`]), whose condition is
     /// `load.percent >= 40`.
     pub progress: bool,
+    /// With `structure`, the full lane fixture: the lanes placed as an
+    /// imported skin's (`LaneStyle::Source`, the region 800 high from 80
+    /// to 880), each note part, the bar group and each cover paint its own
+    /// image ([`Part`]), a bar group 2 high on the line, and SUDDEN+'s,
+    /// LIFT's and HIDDEN+'s paints within the left half, all on the
+    /// untimed `screen` timer; it draws [`lane_chart`] under
+    /// [`FULL_LANES`] and [`full_readouts`].
+    pub full_lanes: bool,
+}
+
+/// The images of the full lane fixture's categories, each its own texel
+/// of the image file, so each draws its own uv.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Part {
+    Note = 1,
+    Mine,
+    Head,
+    Tail,
+    Body,
+    Bar,
+    Sudden,
+    Lift,
+    Hidden,
+}
+
+impl Part {
+    pub const ALL: [Self; 9] = [
+        Self::Note,
+        Self::Mine,
+        Self::Head,
+        Self::Tail,
+        Self::Body,
+        Self::Bar,
+        Self::Sudden,
+        Self::Lift,
+        Self::Hidden,
+    ];
+
+    /// The note geometry, which no zero field may draw.
+    pub const NOTES: [Self; 6] = [
+        Self::Note,
+        Self::Mine,
+        Self::Head,
+        Self::Tail,
+        Self::Body,
+        Self::Bar,
+    ];
+
+    pub const fn image(self) -> u32 {
+        self as u32
+    }
+}
+
+/// The full lane fixture's view: `H` 10/3 (600 ms over the original lane
+/// at 120 BPM), SUDDEN+ 200 ‰, LIFT 100 ‰ and HIDDEN+ 500 ‰, so every
+/// paint shows and every note category of [`lane_chart`] is in the
+/// field at 900 ms.
+pub const FULL_LANES: LaneView = LaneView {
+    gain: Gain::new(10, 3),
+    cover: 200,
+    lift: 100,
+    hidden: 500,
+};
+
+/// The readouts consistent with `lanes`: each cover on at its amount.
+pub fn full_readouts(lanes: LaneView) -> FrameReadouts {
+    FrameReadouts {
+        covers: CoverSettings {
+            cover: lanes.cover,
+            lift: lanes.lift,
+            hidden: lanes.hidden,
+            cover_enabled: true,
+            lift_enabled: true,
+            hidden_enabled: true,
+            adjusting: false,
+        },
+        ..FrameReadouts::UNAVAILABLE
+    }
+}
+
+/// The full lane fixture's chart, 120 BPM: taps on lanes 1 and 3, a mine
+/// on lane 4, a CN long note on lane 2, all from 1 s, and bar lines.
+pub fn lane_chart() -> Chart {
+    let ms = |v: i64| TimeUs(v * 1_000);
+    let mut chart = ChartBuilder::new(120_000)
+        .tap(Lane::new(1).unwrap(), ms(1_000))
+        .tap(Lane::new(3).unwrap(), ms(1_100))
+        .mine(Lane::new(4).unwrap(), ms(1_050), 10)
+        .long(Lane::new(2).unwrap(), ms(1_000), ms(1_200))
+        .bar(ms(1_000))
+        .bar(ms(3_000))
+        .build()
+        .unwrap();
+    chart.meta.ln_mode = Some(LnMode::Cn);
+    chart
+}
+
+/// How many of `instances` draw each of [`Part::ALL`] of `bundle` staged
+/// on `r`, told apart, whatever their crop, by the uv's horizontal extent
+/// and the layer.
+pub fn part_counts(r: &Renderer, bundle: &SkinBundle, instances: &[Instance]) -> [usize; 9] {
+    let atlas = bundle.skin().atlas(Variant::Lo, r.atlas_limits()).unwrap();
+    Part::ALL.map(|p| {
+        let f = atlas.uvs().get(p.image()).unwrap();
+        let key = ([f.uv[0], f.uv[2]], u32::from(f.layer));
+        instances
+            .iter()
+            .filter(|i| ([i.uv[0], i.uv[2]], i.flags & 0xffff) == key)
+            .count()
+    })
 }
 
 /// Where the untimed loading background draws, in canvas pixels.
@@ -158,6 +274,7 @@ impl Look {
             structure: false,
             chart_text: false,
             progress: false,
+            full_lanes: false,
         }
     }
 }
@@ -210,19 +327,26 @@ pub fn skin(dir: &Path, look: &Look) -> Skin {
         look.rgba[0], look.rgba[1], look.rgba[2], look.side
     );
     png(&dir.join(&name), look.side, look.rgba);
+    let mut images = vec![ImageDef {
+        file: 0,
+        rect: None,
+        grid: [1, 1],
+        cycle: None,
+        filter: Filter::Nearest,
+    }];
+    if look.full_lanes {
+        images.extend(Part::ALL.map(|p| ImageDef {
+            rect: Some([p.image(), 0, 1, 1]),
+            ..images[0]
+        }));
+    }
     let sheet = Sheet::new(
         dir,
         vec![FileDef {
             path: name.as_str().into(),
             hi: None,
         }],
-        vec![ImageDef {
-            file: 0,
-            rect: None,
-            grid: [1, 1],
-            cycle: None,
-            filter: Filter::Nearest,
-        }],
+        images,
     )
     .unwrap();
     let clipped = look.clip.is_some();
@@ -282,8 +406,19 @@ pub fn skin(dir: &Path, look: &Look) -> Skin {
     }
     let mut lanes = None;
     if look.structure {
+        let part = |p: Part| if look.full_lanes { p.image() } else { 0 };
         lanes = Some(LanesDef {
-            style: LaneStyle::Simple,
+            // The full fixture places notes as an imported skin does.
+            style: if look.full_lanes {
+                LaneStyle::Source(SourceLanes {
+                    bottom: 880.0,
+                    height: 800.0,
+                    offset_y: 0.0,
+                    note_h: [16.0; 8],
+                })
+            } else {
+                LaneStyle::Simple
+            },
             note_order: skin_model::NoteOrder::LaneMajor,
             lanes: std::array::from_fn(|k| {
                 let k = i32::try_from(k).unwrap();
@@ -297,16 +432,60 @@ pub fn skin(dir: &Path, look: &Look) -> Skin {
             mine_h: 8,
             line_h: 6,
             parts: LaneParts {
-                note: [0; 8],
-                head: [0; 8],
-                tail: [0; 8],
-                body_on: [0; 8],
-                body_off: [0; 8],
-                mine: [0; 8],
+                note: [part(Part::Note); 8],
+                head: [part(Part::Head); 8],
+                tail: [part(Part::Tail); 8],
+                body_on: [part(Part::Body); 8],
+                body_off: [part(Part::Body); 8],
+                mine: [part(Part::Mine); 8],
                 line: Some(0),
             },
-            bar_groups: Vec::new(),
+            bar_groups: if look.full_lanes {
+                vec![BarGroupDef {
+                    image: Part::Bar.image(),
+                    track: still([160, 879, 512, 2]),
+                    timer: TimerRef::Builtin(skin_model::timer::SCREEN),
+                    visible: None,
+                    blend: Blend::Alpha,
+                    place: Place {
+                        bind: Bind::Lanes,
+                        follow: Follow::Lift,
+                        ..Place::SCREEN
+                    },
+                }]
+            } else {
+                Vec::new()
+            },
         });
+        if look.full_lanes {
+            let paint = |image: Part, motion, trim| CoverPaintDef {
+                image: CoverImage::Image(image.image()),
+                slider_range: None,
+                motion,
+                trim,
+                gate_track: None,
+            };
+            widgets.cover_paints = vec![
+                paint(Part::Sudden, CoverMotion::None, CoverTrim::None),
+                paint(Part::Lift, CoverMotion::Lift, CoverTrim::Fixed(880)),
+                paint(Part::Hidden, CoverMotion::Hidden, CoverTrim::Lift(880)),
+            ];
+            for (index, rect, follow) in [
+                (0, [160, -720, 512, 800], Follow::Cover),
+                (1, [160, 880, 512, 200], Follow::None),
+                (2, [160, 80, 512, 800], Follow::None),
+            ] {
+                elements.push(ElementDef {
+                    source: Source::CoverPaint(index),
+                    timer: TimerRef::Builtin(skin_model::timer::SCREEN),
+                    place: Place {
+                        follow,
+                        ..Place::SCREEN
+                    },
+                    ..image(rect, false)
+                });
+            }
+        }
         let parts = GaugeParts {
             front: [0; 2],
             back: [0; 2],

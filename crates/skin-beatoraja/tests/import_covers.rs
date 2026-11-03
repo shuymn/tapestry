@@ -116,12 +116,14 @@ fn lift_and_sudden_plus_share_the_lane() {
     assert_eq!(added_notes(&l), []);
     // LIFT 200 ‰ takes 120 px, raising the line to 750; SUDDEN+ 500 ‰
     // takes half of the 480 px left: its paint's lower edge at 520 (the
-    // source's 1080 − 800 + 240), LIFT's top at 760 (the source's `hl`),
-    // and a note half the visible time ahead halfway down the 240 px
-    // left. The paint is drawn whole, LIFT cut to the lanes.
+    // source's 1080 − 800 + 240), LIFT's top at 760 (the source's `hl`).
+    // The gain keeps the original lane's scale, 600 ms over its 600 px, so
+    // a note 300 ms ahead is 300 px above where it would sit on the line,
+    // under the paint (D4). The paint is drawn whole, LIFT cut to the
+    // lanes.
     assert_eq!(
         rects(&l, 1_300, 500, 200),
-        [[100, 620, 50, 20], [20, -80, 430, 600], [20, 760, 430, 120]]
+        [[100, 440, 50, 20], [20, -80, 430, 600], [20, 760, 430, 120]]
     );
 }
 
@@ -778,13 +780,9 @@ fn fit_width_covers_take_the_frames_aspect() {
     for mode in [4, 5] {
         let l = tall(WIDE, &[&stretched("cw", mode)]);
         assert_eq!(rects(&l, 5_000, 0, 0), [[20, -170, 430, 300]], "{mode}");
-        // At 1 000 ‰ it spans 430–730: the tap at its judgment time
-        // stays visible below it, on the line.
-        assert_eq!(
-            rects(&l, 1_000, 1_000, 0),
-            [[100, 860, 50, 20], [20, 430, 430, 300]],
-            "{mode}"
-        );
+        // At 1 000 ‰ it spans 430–730; no field is left, so the tap at
+        // its judgment time is not drawn on the line (stage3.md R6).
+        assert_eq!(rects(&l, 1_000, 1_000, 0), [[20, 430, 430, 300]], "{mode}");
     }
 }
 

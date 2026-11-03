@@ -1186,6 +1186,8 @@ mod tests {
             now: TimeUs(now),
             display_offset: TimeUs(0),
             visible_time: VISIBLE,
+            lanes: skin_model::LaneView::NONE,
+            readouts: skin_model::FrameReadouts::UNAVAILABLE,
             view,
             effects,
             gauge: 0,
@@ -2403,7 +2405,7 @@ mod tests {
             .unwrap();
         let mut s = skin(&chart);
         let mut batch = SpriteBatch::with_capacity(4096);
-        let f = LoadingFrame::interim(1, TimeUs(0), TimeUs(0), TimeUs(500_000));
+        let f = LoadingFrame::interim(1, TimeUs(0), TimeUs(0));
         assert_eq!(s.build_loading(&f, &mut batch), Ok(()));
         assert!(batch.blended(Blend::Alpha).any(|s| s.color == JUDGE_LINE));
         assert!(batch.blended(Blend::Alpha).any(|s| s.color == LANE_BG));
