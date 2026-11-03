@@ -1571,8 +1571,8 @@ fn readout_probes(
     use eval::{GaugeState, Tally};
     use rules::{GaugeValue, PerJudgment};
     use skin_model::{
-        Attempt, BpmRange, CoverSettings, DurationRatio, FrameReadouts, Gain, GaugeDesc, GaugeLook,
-        LaneView, Layout, NativeReadouts, PLAY, PlayContext, READOUT_MAX, Side, SkinFrame, field,
+        Attempt, BpmRange, CoverSettings, FrameReadouts, Gain, GaugeDesc, GaugeLook, LaneView,
+        Layout, NativeReadouts, PLAY, PlayContext, READOUT_MAX, Side, SkinFrame, field,
     };
 
     let descs = [GaugeDesc {
@@ -1604,12 +1604,6 @@ fn readout_probes(
     let top = READOUT_MAX.unsigned_abs();
     // A ratio as the producer gives it: unavailable where it rounds past
     // the maximum or has no denominator.
-    let producer = |(numerator, denominator): (u128, u128)| {
-        (denominator > 0 && numerator / denominator < u128::from(top)).then_some(DurationRatio {
-            numerator,
-            denominator,
-        })
-    };
     let ratios = [
         (6_675, 10),
         (u128::MAX, 1),
@@ -1655,7 +1649,7 @@ fn readout_probes(
                     ratios
                         .get((ratio + i) % ratios.len())
                         .copied()
-                        .and_then(producer)
+                        .and_then(produced)
                 };
                 let floating = k % 2 == 0;
                 let readouts = FrameReadouts {
@@ -1673,49 +1667,7 @@ fn readout_probes(
                 (now_ms, gains.get(k).copied().flatten(), readouts)
             },
         );
-    // The seed's frame: every byte read cyclically, so any input names a
-    // gain, covers, eight variants and a native block.
-    let mut bytes = seed.iter().copied().chain(std::iter::repeat(0)).take(256);
-    let mut next = |n: usize| {
-        (0..n).fold(0_u128, |v, _| {
-            v << 8 | u128::from(bytes.next().unwrap_or(0))
-        })
-    };
-    let small = |v: u128| u16::try_from(v % 1_001).unwrap_or(0);
-    let (num, den) = (next(8), next(8));
-    let gain = Gain::new(
-        u64::try_from(num).unwrap_or(0),
-        u64::try_from(den).unwrap_or(0),
-    );
-    let flags = next(1);
-    let seeded_covers = CoverSettings {
-        cover: small(next(2)),
-        lift: small(next(2)),
-        hidden: small(next(2)),
-        cover_enabled: flags & 1 != 0,
-        lift_enabled: flags & 2 != 0,
-        hidden_enabled: flags & 4 != 0,
-        adjusting: flags & 8 != 0,
-    };
-    let floating = flags & 16 != 0;
-    let target = u32::try_from(next(2) % 6_001).unwrap_or(0);
-    let bpm = u32::try_from(next(4)).ok().filter(|&b| b <= top);
-    let hispeed = u32::try_from(next(4)).ok().filter(|&h| h <= top);
-    let mut ratio = || producer((next(16), next(16)));
-    let duration_variants = std::array::from_fn(|_| ratio());
-    let native = ratio();
-    let seeded = FrameReadouts {
-        bpm_current_x100: bpm,
-        hispeed_x100: hispeed,
-        duration: ratio(),
-        covers: seeded_covers,
-        duration_variants,
-        native: NativeReadouts {
-            duration: native,
-            target_green: (floating && target > 0).then_some(target),
-            floating,
-        },
-    };
+    let (gain, seeded) = seeded_readouts(seed);
     let frames: Vec<_> = frames.chain([(1_000, gain, seeded)]).collect();
     for range in [
         None,
@@ -1805,6 +1757,77 @@ fn readout_probes(
             check_batch(skin, batch);
         }
     }
+}
+
+/// A duration ratio as the producer gives it: unavailable where it rounds
+/// past the readout maximum or has no denominator.
+fn produced((numerator, denominator): (u128, u128)) -> Option<skin_model::DurationRatio> {
+    let top = u128::from(skin_model::READOUT_MAX.unsigned_abs());
+    (denominator > 0 && numerator / denominator < top).then_some(skin_model::DurationRatio {
+        numerator,
+        denominator,
+    })
+}
+
+/// The bytes [`seeded_readouts`] reads: the gain's two terms, the switches,
+/// three covers, the target, the tempo and the hi-speed, then ten ratios
+/// (the eight variants, the native and the source duration) of two
+/// 16-byte terms each.
+#[cfg(test)]
+pub(crate) const SEEDED_BYTES: usize = 8 + 8 + 1 + 3 * 2 + 2 + 4 + 4 + 10 * 32;
+
+/// One readout frame's gain and readouts from `seed`, read cyclically, so
+/// any nonempty input names a gain, covers, eight variants, a native
+/// block and a source duration, each consistent as a producer gives it;
+/// an empty seed reads as zeros.
+pub(crate) fn seeded_readouts(
+    seed: &[u8],
+) -> (Option<skin_model::Gain>, skin_model::FrameReadouts) {
+    use skin_model::{CoverSettings, FrameReadouts, Gain, NativeReadouts, READOUT_MAX};
+
+    let top = READOUT_MAX.unsigned_abs();
+    let mut bytes = seed.iter().copied().cycle();
+    let mut next = |n: usize| {
+        (0..n).fold(0_u128, |v, _| {
+            v << 8 | u128::from(bytes.next().unwrap_or(0))
+        })
+    };
+    let small = |v: u128| u16::try_from(v % 1_001).unwrap_or(0);
+    let (num, den) = (next(8), next(8));
+    let gain = Gain::new(
+        u64::try_from(num).unwrap_or(0),
+        u64::try_from(den).unwrap_or(0),
+    );
+    let flags = next(1);
+    let seeded_covers = CoverSettings {
+        cover: small(next(2)),
+        lift: small(next(2)),
+        hidden: small(next(2)),
+        cover_enabled: flags & 1 != 0,
+        lift_enabled: flags & 2 != 0,
+        hidden_enabled: flags & 4 != 0,
+        adjusting: flags & 8 != 0,
+    };
+    let floating = flags & 16 != 0;
+    let target = u32::try_from(next(2) % 6_001).unwrap_or(0);
+    let bpm = u32::try_from(next(4)).ok().filter(|&b| b <= top);
+    let hispeed = u32::try_from(next(4)).ok().filter(|&h| h <= top);
+    let mut ratio = || produced((next(16), next(16)));
+    let duration_variants = std::array::from_fn(|_| ratio());
+    let native = ratio();
+    let seeded = FrameReadouts {
+        bpm_current_x100: bpm,
+        hispeed_x100: hispeed,
+        duration: ratio(),
+        covers: seeded_covers,
+        duration_variants,
+        native: NativeReadouts {
+            duration: native,
+            target_green: (floating && target > 0).then_some(target),
+            floating,
+        },
+    };
+    (gain, seeded)
 }
 
 /// The header's counts are inside their caps, its size is an accepted
