@@ -227,23 +227,27 @@ fn headers_are_checked_before_pixels() {
             h: 1
         }
     ));
-    // 4 096 × 2 048 is the texel cap; one more row passes it.
-    assert_eq!(4_096 * 2_048, MAX_IMAGE_TEXELS);
-    write(root, "big.png", &png_header(4_096, 2_049));
+    // 4 096 × 3 072 is the texel cap; one more row passes it.
+    assert_eq!(4_096 * 3_072, MAX_IMAGE_TEXELS);
+    write(root, "big.png", &png_header(4_096, 3_073));
     let err = load_small(root, &["big.png"]).unwrap_err();
     assert!(matches!(err, ImageError::TooManyTexels { at: AT0 }));
-    write(root, "cap.png", &png_header(4_096, 2_048));
+    write(root, "cap.png", &png_header(4_096, 3_072));
     load_small(root, &["cap.png"]).unwrap();
-    // Sixteen at the cap fill the total; the 17th passes it.
-    assert_eq!(16 * MAX_IMAGE_TEXELS, MAX_TOTAL_TEXELS);
-    let names = vec!["cap.png"; 17];
-    load_small(root, &names[..16]).unwrap();
+    // Ten at the cap and one of 8 Mi fill the total; one texel more
+    // passes it.
+    write(root, "rest.png", &png_header(4_096, 2_048));
+    write(root, "one.png", &png_header(1, 1));
+    assert_eq!(10 * MAX_IMAGE_TEXELS + 4_096 * 2_048, MAX_TOTAL_TEXELS);
+    let mut names = vec!["cap.png"; 10];
+    names.extend(["rest.png", "one.png"]);
+    load_small(root, &names[..11]).unwrap();
     let err = load_small(root, &names).unwrap_err();
     assert!(matches!(
         err,
         ImageError::TotalTooLarge {
             at: FileAt {
-                file: 16,
+                file: 11,
                 hi: false
             }
         }
@@ -442,10 +446,11 @@ fn files_grown_since_load_are_charged_again() {
 
 #[test]
 fn one_file_decodes_within_its_bound() {
-    // The widest format at the texel cap: 16-bit RGBA, 4 096 × 2 048.
+    // The widest format at the texel cap: 16-bit RGBA, 4 096 × 3 072.
     let d = dir();
-    let (w, h) = (4_096_u32, 2_048_u32);
+    let (w, h) = (4_096_u32, 3_072_u32);
     let texels = i64::from(w) * i64::from(h);
+    assert_eq!(u64::from(w) * u64::from(h), MAX_IMAGE_TEXELS);
     {
         let pixels = vec![0x80_u8; usize::try_from(texels * 8).unwrap()];
         let mut f = std::io::BufWriter::new(File::create(d.path().join("deep.png")).unwrap());
