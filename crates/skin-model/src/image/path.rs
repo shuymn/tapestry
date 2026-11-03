@@ -35,14 +35,14 @@ pub(crate) enum PathError {
 
 /// Whether `name` has the form of a relative path, checked before any
 /// normalisation: at most [`MAX_PATH_BYTES`], not empty, not rooted (`/`,
-/// `\`, which also covers UNC and verbatim `\\?\` names), and no drive
-/// or stream colon. Both spellings of the separator count on every
-/// platform.
+/// `\`, which also covers UNC and verbatim `\\?\` names), no drive or
+/// stream colon and no NUL. Both spellings of the separator count on
+/// every platform.
 fn is_relative_form(name: &str) -> bool {
     name.len() <= MAX_PATH_BYTES
         && !name.is_empty()
         && !name.starts_with(['/', '\\'])
-        && !name.contains(':')
+        && !name.contains([':', '\0'])
 }
 
 /// Whether `name` is a relative path that cannot leave the folder by
@@ -115,8 +115,8 @@ pub(crate) fn open(canonical: &Path) -> Result<(File, u64), PathError> {
 #[derive(Debug, thiserror::Error)]
 pub enum RootError {
     #[error(
-        "the name is not a relative path (empty, rooted, with a drive or stream colon, \
-         or longer than {MAX_PATH_BYTES} bytes)"
+        "the name is not a relative path (empty, rooted, with a drive or stream colon \
+         or a NUL, or longer than {MAX_PATH_BYTES} bytes)"
     )]
     Rejected,
     #[error("the name leads above the skin folder")]
@@ -218,7 +218,7 @@ impl Root {
     /// Checks the form of `name` as [`Root::read`] and [`Root::list`] do
     /// first, before it is normalised or touches the file system: at most
     /// [`MAX_PATH_BYTES`], not empty, not rooted, drive, UNC or verbatim,
-    /// and no `:`. For a name whose parts are checked before it is split.
+    /// and no `:` or NUL. For a name whose parts are checked before it is split.
     ///
     /// # Errors
     ///
@@ -231,14 +231,26 @@ impl Root {
         }
     }
 
-    /// The canonical path `name` leads to inside the folder, and the
-    /// normalised name. The form is checked before normalising, so a
-    /// rooted or drive name cannot become relative by it; then `..`
-    /// may not step above the folder; then the canonical path, links
-    /// followed, must stay inside the folder.
-    fn locate(&self, name: &str) -> Result<(PathBuf, String), RootError> {
+    /// `name` normalised as [`Root::read`] and [`Root::list`] take it,
+    /// before anything touches the file system: the form checked as by
+    /// [`Root::check_name`], so a rooted or drive name cannot become
+    /// relative by normalising; then `.` and empty components dropped and
+    /// each `..` taking off the component before it, joined with `/`.
+    ///
+    /// # Errors
+    ///
+    /// [`RootError::Rejected`] when the form is wrong, and
+    /// [`RootError::Underflow`] when a `..` leads above the folder.
+    pub fn normalise(name: &str) -> Result<String, RootError> {
         Self::check_name(name)?;
-        let normal = normalise(name).ok_or(RootError::Underflow)?;
+        normalise(name).ok_or(RootError::Underflow)
+    }
+
+    /// The canonical path `name` leads to inside the folder, and the
+    /// normalised name ([`Root::normalise`]); then the canonical path,
+    /// links followed, must stay inside the folder.
+    fn locate(&self, name: &str) -> Result<(PathBuf, String), RootError> {
+        let normal = Self::normalise(name)?;
         let canonical = match self.dir.join(&normal).canonicalize() {
             Ok(c) => c,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(RootError::Missing),
@@ -379,6 +391,7 @@ mod tests {
             "C:\\x.png",
             "c:x.png",
             "x.png:s",
+            "a\0.png",
             long.as_str(),
         ] {
             assert!(!is_confined_name(bad), "{bad}");
@@ -404,6 +417,7 @@ mod tests {
             "C:\\x",
             "c:x",
             "x:s",
+            "a\0b",
             long.as_str(),
         ] {
             assert!(!is_relative_form(bad), "{bad}");
