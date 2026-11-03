@@ -461,7 +461,9 @@ impl Value {
         let (name, op) = e.split_once(' ').map_or((e, None), |(n, r)| (n, Some(r)));
         let (lo, hi) = match skin_model::PLAY.field(name).map(|(_, f)| f.ty) {
             Some(skin_model::FieldTy::Int { lo, hi }) => (i64::from(lo), i64::from(hi)),
-            _ => (0, 0),
+            // Never met (a test reads every value); the widest range is
+            // the safe one.
+            _ => (i64::from(i32::MIN), i64::from(i32::MAX)),
         };
         let by = |r: &str| {
             r.get(2..)
@@ -859,7 +861,7 @@ mod tests {
                 );
                 assert_eq!(value.expr(), expr, "{id}");
                 assert_eq!(value.availability(), Some(valid.as_str()), "{id}");
-                assert!(value.deviates() && !value.critical(), "{id}");
+                assert!(value.deviates() && value.part().is_none(), "{id}");
                 assert!(skin_model::compile(&expr, &scope, skin_model::Ty::Int).is_ok());
                 assert!(skin_model::compile(&valid, &scope, skin_model::Ty::Bool).is_ok());
             }
@@ -942,5 +944,26 @@ mod tests {
         assert_eq!(ops(IndexProp::Null), 1);
         assert!(!IndexProp::Null.deviates());
         assert_eq!(IndexProp::Unsupported(42).selector(), None);
+    }
+}
+
+#[cfg(test)]
+mod range_tests {
+    use super::{IntProp, int_by_id};
+
+    #[test]
+    fn every_shown_value_reads_a_declared_field() {
+        for id in 0..2_000 {
+            if let IntProp::Shown(v) = int_by_id(id) {
+                let field = v.expr().split(' ').next().unwrap_or("");
+                assert!(
+                    skin_model::PLAY.field(field).is_some(),
+                    "{id}: {}",
+                    v.expr()
+                );
+                let (lo, hi) = v.range();
+                assert!(lo >= 0 && lo <= hi && hi <= i64::from(i32::MAX), "{id}");
+            }
+        }
     }
 }
