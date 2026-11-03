@@ -746,56 +746,116 @@ fn the_refusal_names_the_failure_presentation() {
     assert_eq!(CriticalPart::Failure.to_string(), "failure presentation");
 }
 
-#[test]
-fn lua_callbacks_on_failure_presentation_refuse_where_unsupported() {
-    // A number's `value` and an image's `draw` that do not convert: on
-    // `failed` they refuse, on another timer they are replaced.
-    let lua = |timer: i32, callback: &str| {
-        format!(
-            "local skin = {{ type = 0, name = \"t\", w = 1920, h = 1080 }}\n\
-             if not skin_config then return skin end\n\
-             local ms = require(\"main_state\")\n\
-             skin.source = {{ {{ id = \"a\", path = \"a.png\" }} }}\n\
-             skin.image = {{ {{ id = \"i\", src = \"a\", x = 0, y = 0, w = 64, h = 64 }} }}\n\
-             skin.value = {{ {{ id = \"v\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, \
-             digit = 8, {value} }} }}\n\
-             skin.destination = {{ {{ id = \"{id}\", timer = {timer}, {draw} \
-             dst = {{ {{ x = 0, y = 0, w = 6, h = 6 }} }} }} }}\n\
-             return skin\n",
-            value = if callback == "value" {
-                "value = function() return ms.number(110) + ms.number(425) end"
-            } else {
-                "ref = 110"
-            },
-            id = if callback == "value" { "v" } else { "i" },
-            draw = if callback == "draw" {
-                "draw = function() return ms.number(425) > 0 end,"
-            } else {
-                ""
-            },
-        )
+/// A Lua skin drawing, on `timer`, an image `i` with `draw` when one, or
+/// a number `v` of `value` when one.
+fn lua_callback_skin(timer: i32, draw: Option<&str>, value: Option<&str>) -> tempfile::TempDir {
+    let (id, draw, value) = match (draw, value) {
+        (Some(d), _) => (
+            "i",
+            format!("draw = function() return {d} end,"),
+            "ref = 110".to_owned(),
+        ),
+        (None, Some(v)) => (
+            "v",
+            String::new(),
+            format!("value = function() return {v} end"),
+        ),
+        (None, None) => ("i", String::new(), "ref = 110".to_owned()),
     };
-    for callback in ["value", "draw"] {
-        let d = tempfile::tempdir().unwrap();
-        write(d.path(), "s.luaskin", lua(3, callback).as_bytes());
-        png(d.path(), "a.png", 64, 64);
+    let lua = format!(
+        "local skin = {{ type = 0, name = \"t\", w = 1920, h = 1080 }}\n\
+         if not skin_config then return skin end\n\
+         local ms = require(\"main_state\")\n\
+         skin.source = {{ {{ id = \"a\", path = \"a.png\" }} }}\n\
+         skin.image = {{ {{ id = \"i\", src = \"a\", x = 0, y = 0, w = 64, h = 64 }} }}\n\
+         skin.value = {{ {{ id = \"v\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, \
+         digit = 2, {value} }} }}\n\
+         skin.destination = {{ {{ id = \"{id}\", timer = {timer}, {draw} \
+         dst = {{ {{ x = 0, y = 0, w = 6, h = 6 }} }} }} }}\n\
+         return skin\n"
+    );
+    let d = tempfile::tempdir().unwrap();
+    write(d.path(), "s.luaskin", lua.as_bytes());
+    png(d.path(), "a.png", 64, 64);
+    d
+}
+
+/// How many callables were lowered, replaced and refused.
+fn dispositions(r: &skin_beatoraja::LuaImported) -> [usize; 3] {
+    use skin_beatoraja::lua::Disposition;
+    let n = |f: fn(&Disposition) -> bool| r.callbacks.iter().filter(|d| f(d)).count();
+    [
+        n(|d| *d == Disposition::Lowered),
+        n(|d| matches!(d, Disposition::Replaced(_))),
+        n(|d| *d == Disposition::Refused),
+    ]
+}
+
+#[test]
+fn lua_callbacks_on_failure_presentation_lower_or_refuse() {
+    use skin_beatoraja::LuaWhy;
+    use skin_beatoraja::lua::Unsupported;
+    // Supported: lowered, kept and drawn once the gauge fails.
+    for (draw, value) in [
+        (Some("ms.option(273)"), None),
+        (None, Some("ms.number(110)")),
+    ] {
+        let d = lua_callback_skin(3, draw, value);
+        let r = common::lua_import(d.path()).unwrap();
+        assert_eq!(dispositions(&r), [1, 0, 0], "{draw:?} {value:?}");
+        let rep = &r.imported.report;
+        assert!(
+            !rep.notes.iter().any(|n| n.severity == Severity::Dropped),
+            "{:?}",
+            rep.notes
+        );
+        let l = Loaded {
+            result: Ok(r.imported),
+            dir: d,
+        };
+        assert!(rects(&l, None, 2_000).is_empty(), "{draw:?} {value:?}");
+        assert!(
+            !rects(&l, Some(1_000), 1_200).is_empty(),
+            "{draw:?} {value:?}"
+        );
+    }
+    // Unsupported: on `failed` refused at the callback, elsewhere
+    // replaced and dropped with its reason.
+    let unmapped = Unsupported::Unmapped { api: 1, id: 425 };
+    // Located at the callback: the destination's line, or the number's.
+    for (field, draw, value, line) in [
+        ("draw", Some("ms.number(425) > 0"), None, 7),
+        ("value", None, Some("ms.number(110) + ms.number(425)"), 6),
+    ] {
+        let d = lua_callback_skin(3, draw, value);
         match common::lua_import(d.path()) {
             Err(ImportError::Lua {
-                why: skin_beatoraja::LuaWhy::Critical { field, .. },
-                ..
-            }) => assert_eq!(field, callback),
-            other => panic!("{callback}: {other:?}"),
+                at: Some(at),
+                why: LuaWhy::Critical { field: f, why },
+            }) => {
+                assert_eq!((f, why), (field, unmapped));
+                assert_eq!((at.file.as_str(), at.line), ("s.luaskin", line));
+            }
+            other => panic!("{field}: {other:?}"),
         }
-        write(d.path(), "s.luaskin", lua(41, callback).as_bytes());
+        let d = lua_callback_skin(41, draw, value);
         let r = common::lua_import(d.path()).unwrap();
-        assert!(
-            r.imported
-                .report
-                .notes
-                .iter()
-                .any(|n| n.severity == Severity::Dropped),
-            "{callback}: {:?}",
-            r.imported.report.notes
+        assert_eq!(dispositions(&r), [0, 1, 0], "{field}");
+        let dropped: Vec<_> = r
+            .imported
+            .report
+            .notes
+            .iter()
+            .filter(|n| n.severity == Severity::Dropped)
+            .map(|n| n.kind)
+            .collect();
+        assert_eq!(
+            dropped,
+            [NoteKind::Callback {
+                field,
+                why: unmapped
+            }],
+            "{field}"
         );
     }
 }
