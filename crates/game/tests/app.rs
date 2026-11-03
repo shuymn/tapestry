@@ -1348,8 +1348,8 @@ fn queued_menu_commands_do_not_outlive_their_result() {
     assert_eq!(plays[1].end, PlayEnd::Completed);
 }
 
-/// A quit while the chart plays aborts the play and shows its result,
-/// saved ended midway; back on it returns to selection; the window closing
+/// A quit while the chart plays aborts the play into Closing, whose end
+/// shows its result, saved ended midway; back on it returns to selection; the window closing
 /// during the next chart's play ends the run, with no result.
 #[test]
 fn quit_shows_the_result_close_ends_the_run() {
@@ -1433,8 +1433,8 @@ fn quit_in_the_tail_skips_to_the_result() {
 }
 
 /// Before the play is complete the quit key aborts it: in its READY state it
-/// returns to selection with no result; while the chart plays it shows
-/// the play's result, which back leaves for selection.
+/// returns to selection with no result; while the chart plays it closes
+/// the play and then shows its result, which back leaves for selection.
 #[test]
 fn quit_before_completion_leaves_or_shows_the_result() {
     for (at, result) in [(300, false), (1_500, true)] {
@@ -2515,7 +2515,8 @@ fn notices(rig: &Headless) -> Vec<Option<String>> {
 /// P on the practice chart opens its screen at 1×; 75 % with repeat on
 /// and Start load it at that speed and play round 1 to the end of its
 /// ring-out, then round 2 with no result between; the quit key while
-/// round 2 plays shows its result, whose back returns to the practice
+/// round 2 plays closes it, and the closed round shows its result and
+/// never starts round 3; the result's back returns to the practice
 /// screen, and Back to selection. Round 1's record is a section repeat at
 /// 15/20, attempt 1.
 #[test]
@@ -2572,6 +2573,10 @@ fn practice_screen_repeats_and_quits() {
         .count();
     assert_eq!(judged, 8);
     assert_eq!(reports[1].end, PlayEnd::Aborted(game::AbortCause::Quit));
+    assert_eq!(
+        reports[1].closing.map(|c| c.end),
+        Some(game::ClosingEnd::RanOut)
+    );
     let status = reports[1].record.as_ref().unwrap().status;
     assert_eq!(status.end, replay::EndStatus::EndedMidway);
     // No result between the rounds; round 2's after the quit.
@@ -2589,8 +2594,9 @@ fn practice_screen_repeats_and_quits() {
     assert_eq!(back.measures(), entered.measures());
 }
 
-/// The quit key in a round's READY state, before its section starts, aborts
-/// the round and returns to the practice page with no result.
+/// The quit key in a round's READY state, before its section starts (its
+/// lead-in, already committed), aborts the round and returns to the
+/// practice page with no result and no Closing.
 #[test]
 fn practice_quit_in_ready_returns_to_the_page() {
     use PracticeInput::{Back, Confirm};
@@ -2622,6 +2628,7 @@ fn practice_quit_in_ready_returns_to_the_page() {
         panic!("{} rounds", reports.len());
     };
     assert_eq!(round.end, PlayEnd::Aborted(AbortCause::Quit));
+    assert_eq!(round.closing, None);
     assert_eq!(
         events.count(|e| matches!(e, SessionEvent::Result { .. })),
         0
@@ -2634,8 +2641,8 @@ fn practice_quit_in_ready_returns_to_the_page() {
 #[test]
 fn start_always_loads_the_current_chart() {
     use PracticeInput::{Back, Confirm};
-    // Each quit falls while a round plays: its result shows, and back
-    // returns to the page.
+    // Each quit falls while a round plays: it closes the round, its
+    // result shows, and back returns to the page.
     let mut acts = vec![(0, Act::Practice(0))];
     acts.extend(to_start(0));
     acts.extend([

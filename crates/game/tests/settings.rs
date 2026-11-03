@@ -144,7 +144,7 @@ fn device_and_player_settings_round_trip() {
     // A hand-written file in the same units reads the same.
     fs::write(
         root.player_settings(),
-        "preset = \"wide\"\ndisplayed_gauge = 1\n\
+        "preset = \"wide\"\ndisplayed_gauge = 1\non_failure = \"play-to-end\"\n\
          [hispeed]\nmode = \"classic\"\nreference = \"max\"\nclassic_hispeed_x100 = 235\n\
          classic_step_x100 = 10\nfloating_step_x100 = 25\ngreen_target = 280\n\
          [covers]\nsudden = 120\nsudden_on = true\nlift = 80\nlift_on = true\n\
@@ -1378,4 +1378,53 @@ fn two_names_of_one_key_cannot_have_two_roles() {
             assert_eq!(same, other == code, "{other:#x} and {code:#x}");
         }
     }
+}
+
+/// `on_failure` in `player.toml`: `close` and `play-to-end` read as
+/// themselves, a missing key gives `close`, an unknown value is a parse
+/// error located at its line, and the value is written before the tables
+/// and reads back.
+#[test]
+fn on_failure_reads_closes_by_default_and_round_trips() {
+    let (_dir, root) = temp_root();
+    fs::create_dir_all(root.path()).unwrap();
+    for (text, read) in [
+        ("on_failure = \"close\"\n", FailureAction::Close),
+        ("on_failure = \"play-to-end\"\n", FailureAction::PlayToEnd),
+        ("preset = \"wide\"\n", FailureAction::Close),
+    ] {
+        fs::write(root.player_settings(), text).unwrap();
+        assert_eq!(
+            Settings::load(&root).unwrap().player.on_failure,
+            read,
+            "{text}"
+        );
+    }
+    fs::write(
+        root.player_settings(),
+        "preset = \"wide\"\non_failure = \"keep\"\n",
+    )
+    .unwrap();
+    let e = Settings::load(&root).unwrap_err();
+    let SettingsError::Parse(parse) = &e else {
+        panic!("{e:?}");
+    };
+    let message = parse.to_string();
+    assert!(message.contains("line 2"), "{message}");
+    assert!(
+        message.contains("close") && message.contains("play-to-end"),
+        "{message}"
+    );
+    // Written first, ahead of the tables, and read back.
+    fs::remove_file(root.player_settings()).unwrap();
+    let mut s = Settings::load(&root).unwrap();
+    s.player.on_failure = FailureAction::PlayToEnd;
+    s.save(&root).unwrap();
+    let text = fs::read_to_string(root.player_settings()).unwrap();
+    let line = text
+        .lines()
+        .position(|l| l == "on_failure = \"play-to-end\"");
+    let table = text.lines().position(|l| l.starts_with('['));
+    assert!(line.is_some() && line < table, "{text}");
+    assert_eq!(Settings::load(&root).unwrap().player, s.player);
 }

@@ -804,15 +804,16 @@ fn quit_skips_the_ring_out_to_the_rounds_result() {
 
 /// A round starts at its section's start (10 s): the quit key in the step
 /// before it, in the lead-in, leaves the rounds with no result; from the
-/// step at it on it ends the round midway and shows its result, never
-/// cleared, which the quit key at 10.5 s leaves.
+/// step at it on it closes the round, ended midway, and its result shows
+/// once Closing ran out, never cleared, which the quit key at 11.5 s
+/// leaves.
 #[test]
 fn a_rounds_quit_shows_its_result_from_the_sections_start() {
     for (at, shown) in [(9_999 * MS, vec![]), (10_000 * MS, vec![1])] {
         let run = example_rounds(
             2,
             0,
-            &[(1, at, Command::Quit), (1, 10_500 * MS, Command::Quit)],
+            &[(1, at, Command::Quit), (1, 11_500 * MS, Command::Quit)],
         );
         let [round1] = &run.reports[..] else {
             panic!("{at}: {} rounds", run.reports.len());
@@ -966,10 +967,10 @@ fn section_round_records_its_conditions() {
         };
         loaded.set_practice(Some(practice)).unwrap();
         let mut rig = Rounds::new(loaded.audio_schedule(), 2, &log, &clock);
-        // Round 1 is ended by a quit at 18 s, and its result left at
-        // 18.5 s.
+        // Round 1 is closed by a quit at 18 s, and its result, shown once
+        // Closing ran out, left at 19.5 s.
         rig.commands.push((1, 18_000 * MS, Command::Quit));
-        rig.commands.push((1, 18_500 * MS, Command::Quit));
+        rig.commands.push((1, 19_500 * MS, Command::Quit));
         game::live::run_chart(&mut loaded, &mut rig).unwrap();
         assert_eq!(rig.shown, [1]);
         reports.append(&mut rig.reports);

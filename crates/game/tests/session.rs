@@ -1394,7 +1394,7 @@ fn passthrough_transform_is_recorded() {
             version: 1
         }
     );
-    assert_eq!(rec.session_policy, "default");
+    assert_eq!(rec.session_policy, "close-on-failure");
     assert_eq!(rec.chart.random_seed, 7);
     let sha: [u8; 32] = sha2::Sha256::digest(&bytes).into();
     assert_eq!(rec.chart.identity.sha256, sha);
