@@ -2,9 +2,13 @@
 //! fed by source queues, the render thread's acquisition, and both skins'
 //! builds from the very `FrameInput` the thread makes, `SimpleSkin`'s key
 //! beams and the model's `press` and `release` timers, with a 150 ms
-//! display offset that moves neither. Each test runs with an effect queue
-//! of one, which every step saturates, and with a roomy one: the beams and
-//! timers are the same, since they come from the view.
+//! display offset that moves neither. The fixed-clock tests run with an
+//! effect queue of one, whose first step runs before the render thread
+//! drains anything and so drops all but one of its effects (later steps
+//! drop whatever the frames have not drained yet), and with a roomy one:
+//! the beams and timers are the same, since they come from the view. A
+//! lifecycle test keeps the thread's own frame clock through real opening,
+//! rearm and cancelled-wait boundaries.
 
 use std::sync::Mutex;
 
@@ -39,17 +43,32 @@ struct Seen {
     ready: Option<TimeUs>,
 }
 
+/// What one frame's clock was.
+#[derive(Clone, Copy, Debug)]
+struct Clocked {
+    /// The frame's chart time.
+    now: TimeUs,
+    /// The QPC read as the frame was built.
+    at: TimeUs,
+    /// The model's `ready` reading in ms.
+    ready_ms: i32,
+    /// Each lane's model `press` and `release` readings in ms.
+    elapsed: [(i32, i32); 8],
+}
+
 /// A screen that builds both skins from each frame the render thread
-/// acquires, at the chart time `now` gives the frame's view (the logic
-/// step publishes each step's view once, at its watermark), and notes
-/// what they show.
+/// acquires and notes what they show: at the chart time `now` gives the
+/// frame's view when set (the logic step publishes each step's view
+/// once, at its watermark), otherwise at the thread's own frame time,
+/// with the display offset it is given.
 struct Skins {
     simple: SimpleSkin,
     model: Skin,
     uvs: UvTable,
     play: Option<Play>,
-    now: fn(Option<TimeUs>) -> TimeUs,
-    seen: Arc<Mutex<Vec<Seen>>>,
+    now: Option<fn(Option<TimeUs>) -> TimeUs>,
+    clock: QpcClock,
+    seen: Arc<Mutex<Vec<(Seen, Clocked)>>>,
 }
 
 /// Each lane's key beam alpha: the additive sprite of the lane's width
@@ -71,6 +90,17 @@ impl Screen for Skins {
         self.play = Some(self.model.prepare(chart, &ctx).unwrap());
         Ok(())
     }
+    /// The attempt's own context, its lead-in and READY start included.
+    fn prepare_attempt(
+        &mut self,
+        a: &render::AttemptInput<'_>,
+        _skin: Option<&Arc<render::SkinBundle>>,
+        _request: u64,
+    ) -> Option<Result<Preparation, RenderError>> {
+        self.simple.prepare_attempt(a.chart, a.section()).unwrap();
+        self.play = Some(self.model.prepare(a.chart, a.context).unwrap());
+        Some(Ok(Preparation::Ready))
+    }
     fn wait(&self) -> bool {
         true
     }
@@ -78,11 +108,15 @@ impl Screen for Skins {
         false
     }
     fn build(&mut self, f: &FrameInput<'_>) -> Result<(), skin_model::BuildError> {
-        let f = FrameInput {
-            now: (self.now)(f.view.finalized),
-            display_offset: TimeUs(150 * MS),
-            ..*f
+        let f = match self.now {
+            Some(now) => FrameInput {
+                now: now(f.view.finalized),
+                display_offset: TimeUs(150 * MS),
+                ..*f
+            },
+            None => *f,
         };
+        let at = self.clock.now();
         let mut batch = SpriteBatch::with_capacity(4_096);
         self.simple.build(&f, &mut batch)?;
         let play = self.play.as_mut().unwrap();
@@ -99,13 +133,28 @@ impl Screen for Skins {
                 play.timer(lane_timer(LaneTimer::Release, l)),
             )
         });
-        self.seen.lock().unwrap().push(Seen {
+        let reading = |slot: u16| play.state().timers[usize::from(slot)];
+        let elapsed = std::array::from_fn(|l| {
+            let l = lane(u8::try_from(l).unwrap());
+            (
+                reading(lane_timer(LaneTimer::Press, l)),
+                reading(lane_timer(LaneTimer::Release, l)),
+            )
+        });
+        let clocked = Clocked {
+            now: f.now,
+            at,
+            ready_ms: reading(timer::READY),
+            elapsed,
+        };
+        let seen = Seen {
             generation: f.view.generation,
             finalized: f.view.finalized,
             beams: beams(&batch),
             keys,
             ready: play.timer(timer::READY),
-        });
+        };
+        self.seen.lock().unwrap().push((seen, clocked));
         Ok(())
     }
     fn draw(&mut self) -> Result<FrameTiming, RenderError> {
@@ -248,29 +297,8 @@ fn played(
         assert_eq!(side.dropped(), emitted - 1);
     }
 
-    let dir = tempfile::tempdir().unwrap();
-    let model = crate::render_decl::skin(dir.path(), &crate::render_decl::Look::left([255; 4]));
-    let limits = AtlasLimits {
-        max_side: 4_096,
-        max_layers: 8,
-        reserved_layers: 1,
-    };
-    let uvs = model.atlas(Variant::Lo, limits).unwrap().into_parts().1;
-    let seen = Arc::new(Mutex::new(Vec::new()));
-    let noted = Arc::clone(&seen);
-    let made = Mutex::new(Some((model, uvs)));
-    let make: MakeScreen = Box::new(move || {
-        let (model, uvs) = made.lock().unwrap().take().unwrap();
-        Ok(Box::new(Skins {
-            simple: SimpleSkin::new(),
-            model,
-            uvs,
-            play: None,
-            now,
-            seen: Arc::clone(&noted),
-        }) as Box<dyn Screen>)
-    });
     let clock = QpcClock::start();
+    let (seen, make) = screen(Some(now), clock);
     let shared = Arc::new(chart.clone());
     let link = spawn(
         make,
@@ -292,12 +320,13 @@ fn played(
             .lock()
             .unwrap()
             .iter()
-            .filter(|s| (s.generation, s.finalized) == (generation, finalized))
+            .filter(|(s, _)| (s.generation, s.finalized) == (generation, finalized))
             .count()
             >= 2));
         let seen = seen.lock().unwrap();
         let frames: Vec<&Seen> = seen
             .iter()
+            .map(|(s, _)| s)
             .filter(|s| (s.generation, s.finalized) == (generation, finalized))
             .collect();
         // Every frame of one view shows the same, whatever was drained.
@@ -316,6 +345,39 @@ fn played(
     let _ = link.finish(clock.now());
     link.exit();
     out
+}
+
+/// Frames noted by the screen [`Skins`] makes, at `now` if given, with
+/// a model skin of its own.
+#[expect(clippy::type_complexity, reason = "a test's shared log")]
+fn screen(
+    now: Option<fn(Option<TimeUs>) -> TimeUs>,
+    clock: QpcClock,
+) -> (Arc<Mutex<Vec<(Seen, Clocked)>>>, MakeScreen) {
+    let dir = tempfile::tempdir().unwrap();
+    let model = crate::render_decl::skin(dir.path(), &crate::render_decl::Look::left([255; 4]));
+    let limits = AtlasLimits {
+        max_side: 4_096,
+        max_layers: 8,
+        reserved_layers: 1,
+    };
+    let uvs = model.atlas(Variant::Lo, limits).unwrap().into_parts().1;
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let noted = Arc::clone(&seen);
+    let made = Mutex::new(Some((model, uvs, dir)));
+    let make: MakeScreen = Box::new(move || {
+        let (model, uvs, _dir) = made.lock().unwrap().take().unwrap();
+        Ok(Box::new(Skins {
+            simple: SimpleSkin::new(),
+            model,
+            uvs,
+            play: None,
+            now,
+            clock,
+            seen: Arc::clone(&noted),
+        }) as Box<dyn Screen>)
+    });
+    (seen, make)
 }
 
 /// A beam at `share` of full light.
@@ -557,4 +619,190 @@ fn autoplays_stream_lights_the_beams() {
         assert_eq!(seen[1].keys[3], (at(1_000), None));
         assert_eq!(seen[2].keys[3], (None, at(1_500)));
     }
+}
+
+/// The real lifecycle's clocks, the render thread's own frame time kept:
+/// a candidate opened 1 s before its chart time 0 (the attempt's
+/// lead-in, so its opening is its READY start) with key 6 held, a press,
+/// a cancellation whose READY wait lasts 2 s with no step, a rearm from
+/// the wait's opening with key 5 held, a press and 2 s of steps, then a
+/// rearm straight from them with key 7 held. Each candidate's frames run
+/// on its own origin (checked against the QPC read as each frame is
+/// built), `ready` starts at its opening, a key held at an opening runs
+/// key-on from there, and every reading is the frame's time since its
+/// start. Prints the time from just before each step's advance (or
+/// rearm) to the first frame built with its view; no bound is asserted.
+#[test]
+fn key_timers_follow_the_lifecycles_own_clocks() {
+    const LEAD: i64 = 1_000 * MS;
+    let chart = ChartBuilder::new(150_000)
+        .tap(lane(1), TimeUs(60_000 * MS))
+        .build()
+        .unwrap();
+    let rule = rules::tapestry();
+    let mut device = device();
+    device.sources.truncate(1);
+    let clock = QpcClock::start();
+    let held = |n: u32, opened_at: TimeUs| InputStart {
+        opened_at,
+        held: vec![(SourceId(0), ControlId(n), 1)],
+    };
+    let opened = clock.now();
+    let mut origin = TimeUs(opened.0 + LEAD);
+    let (mut writer, reader) = input::source_queue(64);
+    let (mut logic, side) = Logic::<SourceReader>::new(
+        &chart,
+        &rule,
+        &device,
+        &held(6, opened),
+        vec![reader],
+        LogicConfig {
+            inputs: 64,
+            effects: 16,
+        },
+        Vec::new(),
+    )
+    .unwrap();
+    logic.reserve_start(4);
+    let (seen, make) = screen(None, clock);
+    let shared = Arc::new(chart.clone());
+    let link = spawn(
+        make,
+        Some(Arc::clone(&shared)),
+        None,
+        clock,
+        view(),
+        measure(clock),
+        Box::new(NoFrames),
+    )
+    .unwrap();
+    let ready = link.prepare_attempt(super::attempt(&shared, None), || false);
+    assert_eq!(ready.unwrap(), Preparation::Ready);
+    link.send(RenderMsg::Play {
+        side,
+        gauge: 0,
+        measure: play_measure(origin),
+    });
+    // The first frame of `generation` built with a view finalized at
+    // `finalized`.
+    let frame = |generation: u64, finalized: Option<TimeUs>| {
+        assert!(wait_until(|| seen.lock().unwrap().iter().any(|(s, _)| (
+            s.generation,
+            s.finalized
+        )
+            == (generation, finalized))));
+        let seen = seen.lock().unwrap();
+        seen.iter()
+            .find(|(s, _)| (s.generation, s.finalized) == (generation, finalized))
+            .cloned()
+            .unwrap()
+    };
+    // The frame was drawn on `origin`; READY started at the opening, key
+    // `held` held since it and each of `pressed` from its press, nothing
+    // released; every reading is the frame's time since its start.
+    let check = |(s, c): &(Seen, Clocked), origin: TimeUs, held: u8, pressed: &[(u8, TimeUs)]| {
+        let lag = c.at.0 - origin.0 - c.now.0;
+        assert!((0..1_000 * MS).contains(&lag), "{c:?} on {origin:?}");
+        let ms = |start: TimeUs| i32::try_from((c.now.0 - start.0).max(0) / MS).unwrap();
+        let ready_at = TimeUs(-LEAD);
+        assert_eq!(s.ready, Some(ready_at), "{s:?}");
+        assert_eq!(c.ready_ms, ms(ready_at), "{c:?}");
+        for l in 0..8_u8 {
+            let i = usize::from(l);
+            let start = if l == held {
+                Some(ready_at)
+            } else {
+                pressed.iter().find(|&&(p, _)| p == l).map(|&(_, t)| t)
+            };
+            assert_eq!(s.keys[i], (start, None), "key {l}: {s:?}");
+            let want = start.map_or(skin_model::TIMER_OFF, ms);
+            assert_eq!(
+                c.elapsed[i],
+                (want, skin_model::TIMER_OFF),
+                "key {l}: {c:?}"
+            );
+        }
+    };
+    // One step at the candidate's chart time now, pressing key `n` there
+    // if given: the time, and the QPC just before the advance.
+    let step = |logic: &mut Logic<'_, SourceReader>,
+                writer: &mut input::SourceWriter,
+                origin: TimeUs,
+                press: Option<u32>| {
+        let at = TimeUs(clock.now().0 - origin.0);
+        if let Some(n) = press {
+            writer
+                .push(PhysicalInputEvent {
+                    received: at,
+                    ..key(0, n, 1)
+                })
+                .unwrap();
+        }
+        writer.publish(at);
+        let before = clock.now();
+        logic.advance_to(at);
+        (at, before)
+    };
+    let mut latencies = Vec::new();
+    // Candidate 0: key 3 pressed in READY.
+    let (pressed, before) = step(&mut logic, &mut writer, origin, Some(3));
+    let first = frame(0, Some(pressed));
+    latencies.push(first.1.at.0 - before.0);
+    check(&first, origin, 6, &[(3, pressed)]);
+    // Cancelled: no step for 2 s, the readers lent; the frames go on
+    // drawing the cancelled candidate on its origin, its timers ageing.
+    drop(logic.lend_readers());
+    std::thread::sleep(Duration::from_secs(2));
+    let waited = seen.lock().unwrap().last().cloned().unwrap();
+    assert_eq!(waited.0.generation, 0);
+    assert!(waited.1.now.0 - pressed.0 >= 1_900 * MS, "{waited:?}");
+    check(&waited, origin, 6, &[(3, pressed)]);
+    // Released: the next candidate opens now, with key 5 held, on a
+    // reopened queue.
+    let (w, reader) = input::source_queue(64);
+    writer = w;
+    logic.restore_readers(vec![reader]);
+    let rearm = |logic: &mut Logic<'_, SourceReader>, n: u32, origin: &mut TimeUs| {
+        let opening = clock.now();
+        let previous = *origin;
+        *origin = TimeUs(opening.0 + LEAD);
+        assert!(origin.0 - previous.0 >= 2_000 * MS);
+        let before = clock.now();
+        logic.rearm(&held(n, opening), *origin);
+        before
+    };
+    let before = rearm(&mut logic, 5, &mut origin);
+    let rearmed = frame(1, None);
+    latencies.push(rearmed.1.at.0 - before.0);
+    check(&rearmed, origin, 5, &[]);
+    // Key 2 pressed, then 2 s of steps.
+    let (at, before) = step(&mut logic, &mut writer, origin, Some(2));
+    let pressed = frame(1, Some(at));
+    latencies.push(pressed.1.at.0 - before.0);
+    check(&pressed, origin, 5, &[(2, at)]);
+    let until = clock.now().0 + 2_000 * MS;
+    while clock.now().0 < until {
+        let (w, before) = step(&mut logic, &mut writer, origin, None);
+        let f = frame(1, Some(w));
+        latencies.push(f.1.at.0 - before.0);
+        check(&f, origin, 5, &[(2, at)]);
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // Rearmed straight from the steps, key 7 held at its opening.
+    let readers = logic.lend_readers();
+    logic.restore_readers(readers);
+    let before = rearm(&mut logic, 7, &mut origin);
+    let rearmed = frame(2, None);
+    latencies.push(rearmed.1.at.0 - before.0);
+    check(&rearmed, origin, 7, &[]);
+    let _ = link.finish(clock.now());
+    link.exit();
+    latencies.sort_unstable();
+    println!(
+        "lane input publication to frame, µs: {} views, min {}, median {}, max {}",
+        latencies.len(),
+        latencies[0],
+        latencies[latencies.len() / 2],
+        latencies[latencies.len() - 1]
+    );
 }
