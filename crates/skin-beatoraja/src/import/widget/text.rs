@@ -212,11 +212,17 @@ impl Cx<'_> {
             self.ignored(at, NoteKind::Ignored { field: "stretch" });
         }
         let tf = if path.to_ascii_lowercase().ends_with(".fnt") {
-            // A non-positive size cannot be drawn: the source's
-            // `setScale` throws at 0 (gdx 1.9.9 `setScale`, jar lines
-            // 868-869) and mirrors the text below it.
-            if size <= 0 {
+            // The source scales the font by the signed size
+            // (`JsonSkinObjectLoader.java:652`, `SkinTextBitmap.java:
+            // 118-123`): `setScale` throws at 0 (gdx 1.9.9 `setScale`, jar
+            // lines 868-869), so nothing is drawn there either, and a
+            // negative size mirrors the text, which is not reproduced.
+            if size == 0 {
                 self.ignored(at, NoteKind::Ignored { field: "size" });
+                return Ok(());
+            }
+            if size < 0 {
+                self.drop_el(role, at, NoteKind::UnsupportedField { field: "size" })?;
                 return Ok(());
             }
             let em = Q::int(size)

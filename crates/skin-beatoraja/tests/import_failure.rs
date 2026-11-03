@@ -210,11 +210,75 @@ fn an_untimed_cycle_on_failure_presentation_is_noted_once() {
     for id in ["ct", "c3", "one", "still"] {
         let l = images("", &[&fail(id, "")]).loaded;
         assert!(l.report().notes.is_empty(), "{id}: {:?}", l.report().notes);
+        // Retained, and drawn once the gauge fails.
+        assert_eq!(l.report().usage.elements, 1, "{id}");
+        assert_eq!(
+            rects(&l, Some(1_000), 1_250),
+            [[10, 1_010, 100, 50]],
+            "{id}"
+        );
     }
     let off = format!(r#""op": [901], {MOUSE}"#);
     let l = images("", &[&fail("cy", &off)]).loaded;
     assert_eq!(d3_notes(&l), 0);
     assert!(dropped(&l, unsupported_field("mouseRect")));
+}
+
+#[test]
+fn a_negative_bitmap_font_size_refuses_failure_presentation() {
+    // The source draws a negative size mirrored; 0 it cannot draw.
+    let fnt = concat!(
+        "info face=\"t\" size=24 padding=0,0,0,0\n",
+        "common lineHeight=24 base=20 scaleW=64 scaleH=32 pages=1\n",
+        "page id=0 file=\"p.fnt.png\"\n",
+        "char id=65 x=0 y=0 width=10 height=20 xoffset=0 yoffset=0 xadvance=12 page=0 chnl=15\n",
+    );
+    let skin = |size: i32, fields: &str| {
+        let body = format!(
+            r#"{HEADER}, "font": [{{"id": "f", "path": "p.fnt"}}],
+               "text": [{{"id": "t", "font": "f", "size": {size}, "constantText": "A"}}],
+               "destination": [{}]"#,
+            fail("t", fields)
+        );
+        let json = json_of(&body);
+        let dir = skin_with(&json, &[]);
+        write(dir.path(), "p.fnt", fnt.as_bytes());
+        png(dir.path(), "p.fnt.png", 64, 32);
+        Run {
+            loaded: Loaded {
+                result: common::import_dir(dir.path()),
+                dir,
+            },
+            json,
+        }
+    };
+    // The same font draws at a positive size.
+    let l = skin(24, "").loaded;
+    assert!(l.report().notes.is_empty(), "{:?}", l.report().notes);
+    assert_eq!(l.report().usage.texts, 1);
+    refused_as_failure(skin(-24, ""), &at("t"), unsupported_field("size"));
+    // Folded off, it is never drawn and imports; on another timer it is
+    // dropped; at 0 it is ignored, as the source fails.
+    let l = skin(-24, r#""op": [901]"#).loaded;
+    assert_eq!(
+        common::kinds(l.report()),
+        [NoteKind::Ignored { field: "op" }]
+    );
+    let r = skin(-24, "");
+    let decorative = r.json.replace(r#""timer": 3"#, r#""timer": 41"#);
+    let dir = skin_with(&decorative, &[]);
+    write(dir.path(), "p.fnt", fnt.as_bytes());
+    png(dir.path(), "p.fnt.png", 64, 32);
+    let l = Loaded {
+        result: common::import_dir(dir.path()),
+        dir,
+    };
+    assert!(dropped(&l, unsupported_field("size")));
+    let l = skin(0, "").loaded;
+    assert_eq!(
+        common::kinds(l.report()),
+        [NoteKind::Ignored { field: "size" }]
+    );
 }
 
 #[test]
