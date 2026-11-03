@@ -375,7 +375,7 @@ pub trait Rig {
     /// Lifecycle", the start gate): each READY is a candidate that a hold
     /// of START or SELECT before its transport commits cancels, and the
     /// methods below take part. `false` by default: the first READY opened
-    /// is the play, as the player's rig runs it until S10-04b.
+    /// is the play.
     fn gated(&self) -> bool {
         false
     }

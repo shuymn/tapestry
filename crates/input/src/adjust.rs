@@ -704,9 +704,8 @@ impl AdjustmentTap {
     /// sent.
     pub fn set_focus(&mut self, focused: bool, losses: u64) {
         // Focus going away sends Lost and an unverified Resync at once, not
-        // a Resync held back until focus returns (design B3), so a marker
-        // behind the recovery never waits on focus; the return sends a
-        // verified one. Under review.
+        // a Resync held back until focus returns, so a marker behind the
+        // recovery never waits on focus; the return sends a verified one.
         let lost = losses != self.losses || (self.focused && !focused);
         let back = focused && !self.focused;
         self.losses = losses;
@@ -891,7 +890,7 @@ impl AdjustmentTap {
             return;
         }
         // A cancellation follows the batch whose hold caused it, not the
-        // causing press itself (design B2 says after the press): SELECT is
+        // causing press itself: SELECT is
         // a hold too, so a request made with it in one batch is still made
         // under the candidate's clock; the reducer closes the group at the
         // cancel without ending a held gesture's context, so a scratch held

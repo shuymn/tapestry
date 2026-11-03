@@ -252,9 +252,8 @@ pub struct PlayerRig<'a> {
     #[cfg(feature = "dev-tools")]
     pub adjust_on_end: Vec<game::Adjust>,
     /// The start gate's player side (design.md "Play Lifecycle", the start
-    /// gate): `None` runs the plays as before, every first READY the play;
-    /// production constructs it so until S10-04b, and development runs
-    /// set it ([`crate::start_gate::PlayerGate::install`]).
+    /// gate), installed with the adjustments' driver by every launcher:
+    /// `None` runs the plays ungated, every first READY the play.
     pub gate: Option<crate::start_gate::PlayerGate>,
     /// The adjustments' driver (design.md "Play Adjustments"): the game
     /// thread's one writer of the presentation, installed with the gate.

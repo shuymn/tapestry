@@ -1196,8 +1196,8 @@ impl SourceSet {
         let (at, origin) = (self.presentation_time(now), self.presentation_time(origin));
         if let Some(tap) = &mut self.adjust {
             // The opening's marker is sent here, at the same boundary as
-            // the input-side hook would (design C4), its origin mapped
-            // through the presentation offset. Under review.
+            // the input-side hook would, its origin mapped through the
+            // presentation offset.
             tap.gate().arm(generation);
             tap.opened(generation, origin, at);
         }
@@ -1229,8 +1229,8 @@ impl SourceSet {
         let (at, origin) = (self.presentation_time(now), self.presentation_time(origin));
         if let Some(tap) = &mut self.adjust {
             // The opening's marker is sent here, at the same boundary as
-            // the input-side hook would (design C4), its origin mapped
-            // through the presentation offset. Under review.
+            // the input-side hook would, its origin mapped through the
+            // presentation offset.
             tap.gate().arm(generation);
             tap.opened(generation, origin, at);
         }

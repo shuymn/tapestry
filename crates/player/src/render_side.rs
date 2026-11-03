@@ -1699,9 +1699,11 @@ fn loading_frame_of(
 /// One play frame's presentation at chart time `now`: the newest snapshot
 /// from `reader` projected with the committed attempt's tempo and epoch
 /// (`current`) at the display head, `now` plus the snapshot's display
-/// offset; the lanes, the readouts and that offset. Without a reader or a
-/// committed attempt nothing is known: no gain, every readout unavailable
-/// and no offset. Allocates nothing.
+/// offset; the lanes, the readouts and that offset. Without a reader
+/// nothing is known: no gain, every readout unavailable and no offset.
+/// Without a committed attempt the snapshot still gives the covers, the
+/// settings and the display offset, but no gain or value that depends on
+/// it. Allocates nothing.
 #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 fn play_presentation(
     reader: Option<&mut game::adjustment::PresentationReader>,

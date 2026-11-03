@@ -466,7 +466,7 @@ impl AdjustDriver {
         match self.attach(loaded.attempt_tempo(), loaded.opens_at(), input) {
             Ok(_) => Ok(None),
             // Located at the chart's path: the reason is the chart's
-            // tempo. Under review.
+            // tempo.
             Err(Ok(why)) => Ok(Some(PreparationRefusal {
                 location: Some(loaded.path().display().to_string()),
                 reason: format!(

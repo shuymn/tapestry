@@ -9,8 +9,10 @@
 //!   tail ends) keep a heartbeat: a deadline at most [`HEARTBEAT`] after
 //!   the last publication. Input wakes never move it; only a publication
 //!   at or after it does, to the next point of its 1 ms grid.
-//! - **Idle** has no timer: the thread sleeps until input, a device change
-//!   or the wake event (a request, a focus change, stop).
+//! - **Idle** has no heartbeat: the thread sleeps until input, a device
+//!   change, the wake event (a request, a focus change, stop), or the
+//!   deadline its hook reports ([`Boundary::due`]: the adjustment tap's
+//!   next tick, or a timed script's next item).
 //!
 //! The thread only enters Idle when the hook says so, which it does on
 //! request; it starts in Tail.
