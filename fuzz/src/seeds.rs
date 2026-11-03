@@ -167,6 +167,30 @@ fn two_sources() -> PlayRecord {
     }
 }
 
+/// The adjustment controls recorded beside the lanes (design.md "Play
+/// Adjustments"): START, SELECT and the auxiliary keys on the keyboard and
+/// START on the controller, bound to no lane, pressed and released
+/// around the lane events.
+fn adjustment_controls() -> PlayRecord {
+    let mut rec = two_sources();
+    rec.events = vec![
+        control(0, 1_000_000, 0x10, 1),
+        control(0, 1_000_000, 0x1e, 1),
+        control(1, 1_010_000, 9, 1),
+        control(0, 1_020_000, 0x11, 1),
+        control(0, 1_030_000, 0xE048, 1),
+        control(0, 1_040_000, 0xE048, 0),
+        control(0, 1_050_000, 0xE050, 1),
+        control(0, 1_060_000, 0xE050, 0),
+        control(0, 1_070_000, 0x1e, 0),
+        control(0, 1_080_000, 0x11, 0),
+        control(1, 1_090_000, 9, 0),
+        control(0, 1_100_000, 0x10, 0),
+    ];
+    rec.status.finalized = TimeUs(1_450_000);
+    rec
+}
+
 /// One keyboard, no events, no held keys, played to the end.
 fn no_events() -> PlayRecord {
     let mut rec = two_sources();
@@ -275,7 +299,7 @@ fn cancelled_capture() -> PlayRecord {
     rec
 }
 
-fn valid_records() -> [(&'static str, PlayRecord); 6] {
+fn valid_records() -> [(&'static str, PlayRecord); 7] {
     [
         ("two_sources", two_sources()),
         ("no_events", no_events()),
@@ -283,6 +307,7 @@ fn valid_records() -> [(&'static str, PlayRecord); 6] {
         ("practice_round", practice_round()),
         ("ready_history", ready_history()),
         ("cancelled_capture", cancelled_capture()),
+        ("adjustment_controls", adjustment_controls()),
     ]
 }
 

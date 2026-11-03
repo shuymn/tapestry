@@ -35,6 +35,7 @@ fn replay_body_seeds_reach_sections_counts_and_successful_decodes() {
             "practice_round",
             "ready_history",
             "cancelled_capture",
+            "adjustment_controls",
             "section_past_end",
             "too_many_openings",
             "history_events_beyond_limit",
@@ -54,8 +55,13 @@ fn replay_body_seeds_reach_sections_counts_and_successful_decodes() {
     for (name, body) in seeds {
         let result = replay_body(&body).map(|_| ());
         match name {
-            "two_sources" | "no_events" | "extremes" | "practice_round" | "ready_history"
-            | "cancelled_capture" => {
+            "two_sources"
+            | "no_events"
+            | "extremes"
+            | "practice_round"
+            | "ready_history"
+            | "cancelled_capture"
+            | "adjustment_controls" => {
                 assert_eq!(result, Ok(()), "{name}");
             }
             "section_past_end" => assert!(
@@ -124,6 +130,7 @@ fn replay_file_seeds_decode_or_fail_at_the_envelope() {
             "practice_round",
             "ready_history",
             "cancelled_capture",
+            "adjustment_controls",
             "bad_magic",
             "unsupported_version",
             "older_version",
@@ -137,8 +144,13 @@ fn replay_file_seeds_decode_or_fail_at_the_envelope() {
     for (name, file) in seeds {
         let result = replay_file(&file).map(|_| ());
         let expected = match name {
-            "two_sources" | "no_events" | "extremes" | "practice_round" | "ready_history"
-            | "cancelled_capture" => Ok(()),
+            "two_sources"
+            | "no_events"
+            | "extremes"
+            | "practice_round"
+            | "ready_history"
+            | "cancelled_capture"
+            | "adjustment_controls" => Ok(()),
             "bad_magic" => Err(DecodeError::BadMagic),
             "unsupported_version" => Err(DecodeError::UnsupportedVersion(
                 replay::FORMAT_VERSION.wrapping_add(1),
