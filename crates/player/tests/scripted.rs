@@ -1660,3 +1660,88 @@ fn a_loading_script_press_defers_the_opening_and_its_release_opens_it() {
         eval::InputKind::Control { control, .. } if control.0 == Q
     )));
 }
+
+/// An autoplay session keeps F1 and F2 (design.md "Play Adjustments"): no
+/// keyboard reaches the tap, so the window queues them for it; one F2
+/// press during the play is exactly one Floating step, 4.00 to 4.50 at
+/// 120 BPM and the target green number 300, and nothing is saved.
+#[test]
+fn autoplay_f2_steps_hi_speed_once() {
+    let (_dir, chart, appdata) = auto_fixture();
+    let out = auto_run(
+        &chart,
+        &appdata,
+        &[
+            "--dev-speed".as_ref(),
+            "F2".as_ref(),
+            "--dev-adjust-at".as_ref(),
+            "1000".as_ref(),
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+    assert!(
+        stdout.contains("adjust: hi-speed 4.50 floating target 300"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("autoplay: not saved"), "{stdout}");
+}
+
+/// Every observation is stamped on the process clock (design.md "Play
+/// Adjustments", clock domains): a scripted play's loading script, on its
+/// own timeline from the start of loading, holds SELECT and taps a white
+/// key, lowering G to 299 before the chart's tempo is known; the attempt
+/// then solves once at 120 BPM, 144000 / (120 · 299) = 4.01, and the
+/// play's script, on the timeline of the first opening, holds START
+/// before the commit, so READY is cancelled and rearmed. Nothing the
+/// reducer takes is out of order.
+#[test]
+fn presentation_times_follow_the_process_clock_under_a_script() {
+    const Q: u32 = 0x10;
+    let Fixture {
+        dir: _dir,
+        chart_path,
+        log,
+        appdata,
+        ..
+    } = fixture();
+    let mut rec = replay::decode(&fs::read(&log).unwrap(), &DecodeLimits::default()).unwrap();
+    let q = |ms: i64, value: i32| eval::PhysicalInputEvent {
+        received: TimeUs(ms * 1_000),
+        source: eval::SourceId(0),
+        kind: eval::InputKind::Control {
+            control: eval::ControlId(Q),
+            value,
+        },
+    };
+    let mut events = vec![q(-300, 1), q(200, 0)];
+    events.extend(rec.events.iter().map(|e| eval::PhysicalInputEvent {
+        received: TimeUs(e.received.0 + 1_200_000),
+        ..*e
+    }));
+    rec.events = events;
+    rec.status.finalized = TimeUs(rec.status.finalized.0 + 1_200_000);
+    fs::write(&log, replay::encode(&rec)).unwrap();
+    let out = scripted_play(&chart_path, &log, &appdata)
+        .args(["--dev-loading", "11@0-300,2c@100-150"])
+        .output()
+        .expect("run tapestry");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stdout}{stderr}");
+    assert!(
+        stdout.contains("adjust: hi-speed 4.01 floating target 299"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("out-of-order 0"), "{stdout}");
+    let saved = records(&appdata);
+    assert_eq!(saved.len(), 1, "{saved:?}");
+    let rec = replay::decode(&fs::read(&saved[0]).unwrap(), &DecodeLimits::default()).unwrap();
+    assert_eq!(
+        rec.history.openings.len(),
+        1,
+        "the rearm: {:?}",
+        rec.history
+    );
+}

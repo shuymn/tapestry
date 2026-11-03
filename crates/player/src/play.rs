@@ -219,6 +219,10 @@ pub struct PlayerRig<'a> {
     /// chart time `adjust_at` (dev-tools).
     #[cfg(feature = "dev-tools")]
     pub adjust_in_play: Vec<game::Adjust>,
+    /// Speed keys pressed by themselves on the window when an autoplay
+    /// session's first play reaches chart time `adjust_at` (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    pub speed_in_play: Vec<u32>,
     #[cfg(feature = "dev-tools")]
     pub adjust_at: TimeUs,
     /// The select screen, with song selection.
@@ -272,7 +276,7 @@ impl PlayerRig<'_> {
             }
         };
         println!(
-            "adjust: hi-speed {h} {} target {} sudden {} lift {} hidden {}",
+            "adjust: hi-speed {h} {} target {} sudden {} lift {} hidden {} out-of-order {}",
             match o.hispeed().mode {
                 game::SpeedMode::Floating => "floating",
                 game::SpeedMode::Classic => "classic",
@@ -281,6 +285,7 @@ impl PlayerRig<'_> {
             cover(c.sudden),
             cover(c.lift),
             cover(c.hidden),
+            driver.diagnostics().out_of_order,
         );
     }
 
@@ -587,6 +592,21 @@ impl Rig for PlayerRig<'_> {
         {
             for a in self.adjust_in_play.drain(..) {
                 self.controls.tuning().adjust(a);
+            }
+        }
+        // An autoplay session's speed keys come from the window's queue.
+        #[cfg(feature = "dev-tools")]
+        if let Some(origin) = self.origin
+            && self.autoplay
+            && !self.speed_in_play.is_empty()
+            && until_due(origin, self.adjust_at, self.clock.now())
+        {
+            for code in self.speed_in_play.drain(..) {
+                let key = u8::from(code != game::SPEED_KEYS[0]);
+                self.controls
+                    .window_key(key, input::WindowKeyEvent::Press, false);
+                self.controls
+                    .window_key(key, input::WindowKeyEvent::Release, false);
             }
         }
         self.sync();

@@ -279,6 +279,7 @@ impl Options {
         rig.adjust_on_end = self.adjust_on_end;
         rig.result_script = self.result;
         rig.loading_script = !self.loading_keys.is_empty();
+        rig.speed_in_play = self.speed_keys;
     }
 
     /// The session's input with the development options applied: an input

@@ -826,6 +826,8 @@ fn rig<'a>(
         #[cfg(feature = "dev-tools")]
         adjust_in_play: Vec::new(),
         #[cfg(feature = "dev-tools")]
+        speed_in_play: Vec::new(),
+        #[cfg(feature = "dev-tools")]
         adjust_at: TimeUs(0),
         #[cfg(feature = "dev-tools")]
         adjust_on_end: Vec::new(),
