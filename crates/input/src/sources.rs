@@ -338,10 +338,9 @@ impl SourceSet {
     pub fn end_batch(&mut self, fresh: TimeUs) {
         self.in_batch = false;
         let open = self.gate.check();
+        let at = self.presentation_time(self.batch_at);
         if let Some(tap) = &mut self.adjust {
-            tap.tick(TimeUs(
-                self.batch_at.0.saturating_add(self.presentation_offset.0),
-            ));
+            tap.tick(at);
         }
         if !open {
             return;
@@ -376,6 +375,7 @@ impl SourceSet {
         let admit = self.gate.admit(packet);
         self.offer_menu(packet);
         let max_held = self.config.max_held;
+        let at = self.presentation_time(self.batch_at);
         let Some(device) = self.devices.iter_mut().find(|d| d.id == packet.device) else {
             return admit;
         };
@@ -389,7 +389,6 @@ impl SourceSet {
         // Background input is a loss for the tap; whether focus is in is
         // the presentation focus sampled for the batch.
         let foreground = !packet.background;
-        let at = TimeUs(self.batch_at.0.saturating_add(self.presentation_offset.0));
         let axis = device
             .axes
             .iter()
@@ -926,11 +925,11 @@ impl SourceSet {
         // `remove` keeps the order devices were found in, which gives
         // source ids at the next open.
         let mut removed = self.devices.remove(i);
+        let at = self.presentation_time(self.batch_at);
         if let Some(tap) = &mut self.adjust
             && removed.adjusts
         {
             // What it held is released.
-            let at = TimeUs(self.batch_at.0.saturating_add(self.presentation_offset.0));
             for &(c, _) in &removed.held {
                 if let Some(n) = tap.number(removed.kind, removed.product, c) {
                     tap.button(n, true, false, at, true);
