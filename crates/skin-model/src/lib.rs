@@ -116,12 +116,15 @@ pub use play::loading::{
 };
 pub use play::playhead::ExactPlayhead;
 pub use play::schema::{
-    COVER_PERMILLE, GAUGE_KIND_ENUM, GAUGE_PERMILLE, GREEN_MAX, Grade, LaneTimer, MAX_COUNT, PLAY,
-    RATE_BASIS_POINTS, READOUT_MAX, field, lane_timer, timer,
+    COVER_PERMILLE, GAUGE_KIND_ENUM, GAUGE_PERMILLE, GREEN_MAX, Grade, LaneTimer, MAX_COUNT,
+    NATIVE_HISPEED_MAX, NATIVE_TARGET_MAX, PLAY, RATE_BASIS_POINTS, READOUT_MAX, field, lane_timer,
+    timer,
 };
+pub use play::timers::native_values;
 pub use play::{
     Attempt, BpmRange, BuildError, CoverSettings, DurationRatio, FrameReadouts, GaugeDesc,
-    LoadState, Play, PlayContext, PrepareError, SkinFrame,
+    LoadState, NativeReadouts, NativeValues, Play, PlayContext, PrepareError, RoundedDuration,
+    SkinFrame,
 };
 pub use quad::{Blend, ClipId, ClipRect, Filter, Quad, QuadBatch, Run, RunKey};
 pub use schema::{EnumDef, EnumId, Export, Field, FieldTy, Schema, SchemaError, TimerDef, Ty};
@@ -150,7 +153,7 @@ pub use widget::lanes::{
     LANE_QUADS, LANE_RESERVED, LANE_VISITS, LanePart, LaneParts, LaneStyle, LaneView, LanesDef,
     LanesError, NoteOrder, Side, SourceLanes,
 };
-pub use widget::scroll::Scale;
+pub use widget::scroll::{Gain, Scale};
 pub use widget::text::{
     ChartText, FontRef, MAX_TEXT_BYTES, MAX_TEXT_ELEMENTS, MAX_TEXT_EM, MAX_TEXT_EM_PX, Overflow,
     TextDef, TextError, TextField, TextImage, TextRequest, TextSlots, TextTable, TextTableError,

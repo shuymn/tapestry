@@ -32,10 +32,10 @@ use skin_model::{
     Adjust, Align, Anchor, AtlasLimits, Attach, Attempt, Bind, Blend, BpmRange, BuildError, ClipId,
     ComboPart, CoverImage, CoverMotion, CoverPaintDef, CoverSettings, CoverTrim, CycleDef,
     DigitOffset, DigitsDef, DurationRatio, Ease, ElementDef, End, Fill, Filter, Fit, Follow,
-    FrameReadouts, GaugeDef, GaugeDesc, GaugeLook, GaugeParts, GlyphSet, GradePart, ImageDef,
+    FrameReadouts, Gain, GaugeDef, GaugeDesc, GaugeLook, GaugeParts, GlyphSet, GradePart, ImageDef,
     JudgeDef, JudgeSlot, KeyDef, LaneParts, LaneView, Layout as SkinLayout, Motion, Native,
-    NumberDef, Pad, Place, Play, PlayContext, QuadBatch, Region, RegionDef, Sheet, Side, Skin,
-    SkinDef, SkinFrame, Source, TimerRef, Track, UvTable, Variant, field, timer,
+    NativeReadouts, NumberDef, Pad, Place, Play, PlayContext, QuadBatch, Region, RegionDef, Sheet,
+    Side, Skin, SkinDef, SkinFrame, Source, TimerRef, Track, UvTable, Variant, field, timer,
 };
 use skin_model::{
     ChartText, FontRef, FrameUv, LoadState, LoadingFrame, LoadingGauge, Overflow, TextDef,
@@ -1441,7 +1441,7 @@ impl Views {
             .set(Region::Right, adjust(4_320, -4_320, 50))
             .unwrap();
         let view = |cover, lift, hidden| LaneView {
-            visible_time: TimeUs(600 * MS),
+            gain: Gain::new(8, 3),
             cover,
             lift,
             hidden,
@@ -2218,7 +2218,7 @@ fn source_lanes_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
         let (cover, lift, hidden_view) = views[i / 50 % views.len()];
         batch.clear();
         let lanes = LaneView {
-            visible_time: TimeUs(600 * MS),
+            gain: Gain::new(8, 3),
             cover,
             lift,
             hidden: hidden_view,
@@ -2323,7 +2323,7 @@ fn fallback_lanes_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
         for (i, now) in (0..12_000 * MS).step_by(16 * MS as usize).enumerate() {
             let cover = [0, 300, 1_000][i / 50 % 3];
             let lanes = LaneView {
-                visible_time: TimeUs(600 * MS),
+                gain: Gain::new(8, 3),
                 cover,
                 lift: 0,
                 hidden: 0,
@@ -2364,7 +2364,7 @@ fn fallback_lanes_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
         }
         // An invalid frame poisons the play; every later build refuses.
         let lanes = LaneView {
-            visible_time: TimeUs(600 * MS),
+            gain: Gain::new(8, 3),
             cover: 0,
             lift: 100,
             hidden: 0,
@@ -2506,7 +2506,7 @@ fn timeline_lanes_do_not_allocate(full: &PlayContext<'_>) {
             {
                 let cover = [0, 300, 1_000][i / 40 % 3];
                 let lanes = LaneView {
-                    visible_time: TimeUs(600 * MS),
+                    gain: Gain::new(8, 3),
                     cover,
                     lift: 0,
                     hidden: 0,
@@ -2556,7 +2556,7 @@ fn timeline_lanes_do_not_allocate(full: &PlayContext<'_>) {
                 notes.reset();
                 for k in 0..5_i64 {
                     let lanes = LaneView {
-                        visible_time: TimeUs(600 * MS),
+                        gain: Gain::new(8, 3),
                         cover: 0,
                         lift: 0,
                         hidden: 0,
@@ -2586,7 +2586,7 @@ fn timeline_lanes_do_not_allocate(full: &PlayContext<'_>) {
             assert_eq!(play.playhead().representatives().as_ptr(), reps);
             // An invalid frame poisons the play; every later build refuses.
             let lanes = LaneView {
-                visible_time: TimeUs(600 * MS),
+                gain: Gain::new(8, 3),
                 cover: 0,
                 lift: 100,
                 hidden: 0,
@@ -2808,7 +2808,7 @@ fn cover_trims_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
     for (i, now) in (0..6_000 * MS).step_by(16 * MS as usize).enumerate() {
         let on = i / 40 % 2 == 0;
         let lanes = LaneView {
-            visible_time: TimeUs(600 * MS),
+            gain: Gain::new(8, 3),
             cover: [0, 300, 900][i / 7 % 3],
             lift: [0, 100, 250, 1_000][i / 11 % 4],
             hidden: if on { [0, 400, 1_000][i / 13 % 3] } else { 0 },
@@ -2861,7 +2861,7 @@ fn cover_trims_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
     }
     // An invalid frame poisons the play; every later build refuses.
     let lanes = LaneView {
-        visible_time: TimeUs(600 * MS),
+        gain: Gain::new(8, 3),
         cover: 0,
         lift: 100,
         hidden: 0,
@@ -3033,7 +3033,7 @@ fn bar_groups_do_not_allocate(ctx: &PlayContext<'_>) {
         {
             batch.clear();
             let lanes = LaneView {
-                visible_time: TimeUs(600 * MS),
+                gain: Gain::new(8, 3),
                 cover: [0, 300, 0][i / 60 % 3],
                 lift: [0, 0, 250][i / 60 % 3],
                 hidden: 0,
@@ -3057,7 +3057,7 @@ fn bar_groups_do_not_allocate(ctx: &PlayContext<'_>) {
         }
         // An invalid frame poisons the play; every later build refuses.
         let lanes = LaneView {
-            visible_time: TimeUs(600 * MS),
+            gain: Gain::new(8, 3),
             cover: 0,
             lift: 0,
             hidden: 0,
@@ -3246,7 +3246,7 @@ fn grade_attachments_do_not_allocate(ctx: &PlayContext<'_>) {
     ];
     let layout = SkinLayout::AUTHOR;
     let lanes = LaneView {
-        visible_time: TimeUs(600 * MS),
+        gain: Gain::new(8, 3),
         cover: 0,
         lift: 0,
         hidden: 0,
@@ -3479,6 +3479,23 @@ fn stretch_readouts(frame_no: usize, view: LaneView) -> FrameReadouts {
                 denominator: u128::from(15_000 + k),
             }),
             covers,
+            // Every variant known, the last two of them exactly half way
+            // in ms and in green, and the native block in Floating.
+            duration_variants: std::array::from_fn(|i| {
+                let i = u128::try_from(i).unwrap_or(0);
+                Some(DurationRatio {
+                    numerator: 1_875 * (i + 1) + u128::from(k),
+                    denominator: 2 + i % 2,
+                })
+            }),
+            native: NativeReadouts {
+                duration: Some(DurationRatio {
+                    numerator: 1_005,
+                    denominator: 2,
+                }),
+                target_green: Some(300 + k % 7),
+                floating: true,
+            },
         },
         _ => FrameReadouts {
             duration: Some(DurationRatio {
@@ -3535,7 +3552,7 @@ fn readouts_do_not_allocate(loaded: &Loaded, descs: &[GaugeDesc]) {
     let gauges = [descs[0].start, descs[1].start].map(state);
     let mut batch = QuadBatch::with_capacity(skin.quad_capacity(), skin.run_capacity());
     let lanes = LaneView {
-        visible_time: TimeUs(600 * MS),
+        gain: Gain::new(8, 3),
         cover: 250,
         lift: 0,
         hidden: 0,

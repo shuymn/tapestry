@@ -17,9 +17,9 @@ use lanes_support::{
 use play_support::{GAUGES, Harness, MS, REGIONS, ev, full, hold_ended, judged, lane, ln_held};
 use rules::Judgment;
 use skin_model::{
-    Attempt, Bind, Canvas, CoverMotion, CoverTrim, Fill, Fit, Follow, LANE_QUADS, LANE_RESERVED,
-    LANE_VISITS, LanePart, LaneView, LanesDef, LanesError, Layout, LoadError, MAX_COORD, Place,
-    PlayContext, QuadBatch, Region, Scale, Side, Skin, SkinDef,
+    Attempt, Bind, Canvas, CoverMotion, CoverTrim, Fill, Fit, Follow, Gain, LANE_QUADS,
+    LANE_RESERVED, LANE_VISITS, LanePart, LaneView, LanesDef, LanesError, Layout, LoadError,
+    MAX_COORD, Place, PlayContext, QuadBatch, Region, Scale, Side, Skin, SkinDef,
 };
 
 /// 150 BPM, in thousandths.
@@ -432,13 +432,13 @@ fn bars(h: &Harness) -> Vec<[f32; 4]> {
 
 #[test]
 fn loaded_notes_and_bar_lines_sit_at_their_exact_beats() {
-    // Quarter-beat measures at 9,990,400 BPM: measure k starts at beat
-    // k/4, k × 1.5014416... µs, so its notes sound on floored µs (1, 3,
+    // 1/32-beat measures at 1,248,800 BPM: measure k starts at beat
+    // k/32, k × 1.5014416... µs, so its notes sound on floored µs (1, 3,
     // 4, ...). Taps on key 1 at measures 1-6, a long note on key 2 from
     // measure 2 to 5, a last tap on key 3 at measure 9.
-    let mut text = String::from("#BPM 9990400\n#LNTYPE 1\n#WAV01 a.wav\n");
+    let mut text = String::from("#BPM 1248800\n#LNTYPE 1\n#WAV01 a.wav\n");
     for m in 0..=9 {
-        text.push_str(&format!("#{m:03}02:0.0625\n"));
+        text.push_str(&format!("#{m:03}02:0.0078125\n"));
     }
     for m in 1..=6 {
         text.push_str(&format!("#{m:03}11:01\n"));
@@ -446,19 +446,16 @@ fn loaded_notes_and_bar_lines_sit_at_their_exact_beats() {
     text.push_str("#00252:01\n#00552:01\n#00913:01\n");
     let chart = loaded(&text);
     let mut h = harness(&chart);
-    // The playhead at 1 µs, 10 µs visible: 800 px over 10 µs of the start
-    // BPM, so 80 px per µs of scroll at 9,990,400 BPM.
-    h.view.visible_time = TimeUs(10);
+    // The playhead at 1 µs, H 20: the 800 px lane holds 4 / 20 beat, so
+    // a measure (1/32 beat) is 125 px.
+    h.view.gain = Gain::new(20, 1);
     h.frame_us(1, &[]);
-    // By hand: beat k/4 is k × 15e6 / 9_990_400 µs of scroll, 1.5014416
-    // µs a measure. The exact playhead meets measure 1's note at its
-    // judgment µs, its floored time 1 µs, so measure 1 is on the line,
-    // where sampling the scroll map at 1 µs put it 0.5014 µs of scroll
-    // (40 px) above; measure k is k - 1 measures, 80 px per µs of scroll,
-    // above it.
-    let y = |k: i32| 880.0 - 80.0 * f64::from(k - 1) * 15e6 / 9_990_400.0;
-    assert!((y(1) - 880.0).abs() < 1e-9);
-    assert!((y(2) - 759.884_7).abs() < 1e-3);
+    // By hand: the exact playhead meets measure 1's note at its judgment
+    // µs, its floored time 1 µs, so measure 1 is on the line, where
+    // sampling the scroll map at 1 µs would put it 0.5014 µs of scroll
+    // above; measure k is k - 1 measures, 125 px each, above it.
+    let y = |k: i32| 880.0 - 125.0 * f64::from(k - 1);
+    assert!((y(2) - 755.0).abs() < 1e-9);
     let centers = |rects: Vec<[f32; 4]>| -> Vec<f64> {
         rects.iter().map(|r| f64::from(r[1] + r[3] / 2.0)).collect()
     };
@@ -482,25 +479,23 @@ fn loaded_notes_and_bar_lines_sit_at_their_exact_beats() {
 
 #[test]
 fn bar_lines_of_equal_measures_are_drawn_evenly() {
-    // Quarter-beat measures at 9,990,400 BPM last 1.5014... µs each, so
+    // 1/32-beat measures at 1,248,800 BPM last 1.5014... µs each, so
     // their floored times step by 1 or 2 µs; their positions are exactly
-    // a quarter beat apart. Over a 10 µs visible time a quarter beat is
-    // 120.1... px.
-    let mut text = String::from("#BPM 9990400\n#WAV01 a.wav\n");
+    // a 32nd of a beat apart, 125 px at H 20 on the 800 px lane.
+    let mut text = String::from("#BPM 1248800\n#WAV01 a.wav\n");
     for m in 0..=64 {
-        text.push_str(&format!("#{m:03}02:0.0625\n"));
+        text.push_str(&format!("#{m:03}02:0.0078125\n"));
     }
     text.push_str("#06411:01\n");
     let chart = loaded(&text);
     let mut h = harness(&chart);
-    h.view.visible_time = TimeUs(10);
+    h.view.gain = Gain::new(20, 1);
     h.frame_us(40, &[]);
     let ys: Vec<f32> = bars(&h).iter().map(|r| r[1]).collect();
     assert!(ys.len() >= 6, "{ys:?}");
-    let quarter = 800.0 / (10.0 * 9_990_400.0 / 60_000_000.0) / 4.0;
     for w in ys.windows(2) {
         let gap = w[0] - w[1];
-        assert!((gap - quarter).abs() < 1e-2, "{ys:?}");
+        assert!((gap - 125.0).abs() < 1e-2, "{ys:?}");
     }
 }
 
@@ -543,31 +538,62 @@ fn drawn_notes_are_those_whose_span_meets_the_visible_range() {
     assert!(in_lane(&h, NOTE, lane(3)).is_empty());
 }
 
+/// The gain scales the original lane: at `H` a measure of four beats
+/// takes `1 / H` of it, whatever the tempo.
 #[test]
-fn visible_time_below_a_microsecond_counts_as_one() {
+fn the_gain_scales_the_original_lane() {
     let chart = ChartBuilder::new(BPM).build().unwrap();
-    let one = Scale::new(
-        chart.scroll.position_at(TimeUs(0)),
-        chart.scroll.initial_rate(),
-        TimeUs(1),
-        800.0,
-        880.0,
-    );
-    // 1 µs of 150 BPM (2.5 millionths of a beat) on 800 px.
+    let at = chart.scroll.position_at(TimeUs(0));
     let beat = (1_u128 << 80) as f64;
-    assert!((one.px_per_pos * beat * 2.5e-6 - 800.0).abs() < 1e-6);
-    for v in [0, -5, i64::MIN] {
-        assert_eq!(
-            Scale::new(
-                chart.scroll.position_at(TimeUs(0)),
-                chart.scroll.initial_rate(),
-                TimeUs(v),
-                800.0,
-                880.0
-            ),
-            one
+    for (num, den, px_per_beat) in [(1, 1, 200.0), (20, 1, 4_000.0), (1, 100, 2.0)] {
+        let s = Scale::from_gain(at, Gain::new(num, den).unwrap(), 800.0, 880.0);
+        assert!(
+            (s.px_per_pos * beat - px_per_beat).abs() < 1e-9,
+            "{num}/{den}"
         );
+        assert_eq!(s.at_line, at);
     }
+}
+
+/// The readouts are fields only: a frame with every source projection,
+/// variant and native value known draws the same quads, drops the same
+/// and holds the same bytes as one with none known.
+#[test]
+fn readout_fields_add_no_visits_or_quads() {
+    use skin_model::{DurationRatio, FrameReadouts, NativeReadouts};
+    let chart = ChartBuilder::new(BPM)
+        .tap(lane(3), TimeUs(1_000 * MS))
+        .long(lane(2), TimeUs(1_000 * MS), TimeUs(1_300 * MS))
+        .bar(TimeUs(1_200 * MS))
+        .build()
+        .unwrap();
+    let run = |readouts: FrameReadouts| {
+        let mut h = harness(&chart);
+        h.readouts = Some(readouts);
+        h.frame(900, &[]);
+        let drawn = [NOTE, HEAD, BODY_OFF, BAR, LINE].map(|p| rects(&h, p).len());
+        let quads = h.batch.quads().to_vec();
+        (drawn, quads, h.batch.dropped(), h.play.resident_bytes())
+    };
+    let d = Some(DurationRatio {
+        numerator: 1_005,
+        denominator: 2,
+    });
+    let known = FrameReadouts {
+        bpm_current_x100: Some(15_000),
+        hispeed_x100: Some(320),
+        duration: d,
+        duration_variants: [d; 8],
+        native: NativeReadouts {
+            duration: d,
+            target_green: Some(300),
+            floating: true,
+        },
+        ..FrameReadouts::UNAVAILABLE
+    };
+    let none = run(FrameReadouts::UNAVAILABLE);
+    assert!(none.0.iter().all(|&n| n > 0), "{:?}", none.0);
+    assert_eq!(run(known), none);
 }
 
 #[test]
@@ -674,20 +700,20 @@ fn centres(chart: &Chart, now: i64, cover: u16, lift: u16) -> Vec<f32> {
 }
 
 #[test]
-fn the_cover_and_the_lift_shorten_the_visible_span() {
-    // L = 800, a tenth 80. Cover 250 ‰: the span is 600 px from the
-    // cover's edge (280) to the line (880), and 600 ms of 150 BPM take all
-    // of it. Lift 100 ‰ as well: the line rises 80 to 800 and the cover
-    // takes 250 ‰ of the 720 left above it, 180, so the span is 540 px
-    // from 260. A note 300 ms ahead is halfway: 580 without the lift, 530
+fn the_covers_keep_the_original_lane_scale() {
+    // L = 800, a tenth 80, and the gain puts 600 ms of 150 BPM over the
+    // whole lane: 4/3 px per ms, whatever covers it. At 850 ms the taps
+    // are 150 and 450 ms ahead, 200 and 600 px above the line (880) under
+    // cover 250 ‰. Lift 100 ‰ raises the line 80 to 800 and both notes
     // with it.
     let chart = ChartBuilder::new(BPM)
         .tap(lane(3), TimeUs(1_000 * MS))
         .tap(lane(3), TimeUs(1_300 * MS))
         .build()
         .unwrap();
-    assert_eq!(centres(&chart, 700, 250, 0), [580.0, 280.0]);
-    assert_eq!(centres(&chart, 700, 250, 100), [530.0, 260.0]);
+    assert_eq!(centres(&chart, 850, 0, 0), [680.0, 280.0]);
+    assert_eq!(centres(&chart, 850, 250, 0), [680.0, 280.0]);
+    assert_eq!(centres(&chart, 850, 250, 100), [600.0, 200.0]);
     let mut h = harness(&chart);
     h.view.cover = 250;
     h.view.lift = 100;
@@ -698,10 +724,9 @@ fn the_cover_and_the_lift_shorten_the_visible_span() {
     for part in [COVER, LIFT, HIDDEN] {
         assert!(rects(&h, part).is_empty(), "part {part}");
     }
-    // Lift 500 ‰ raises the line 400 to 480; cover 500 ‰ of the 400 left
-    // is 200: the edge is 280 and a note 300 ms ahead sits halfway down
-    // the 200 px span.
-    assert_eq!(centres(&chart, 700, 500, 500), [380.0, 280.0]);
+    // Lift 500 ‰ raises the line 400 to 480: the nearer tap is 200 px
+    // above it, the farther past the lanes' top.
+    assert_eq!(centres(&chart, 850, 500, 500), [280.0]);
     let mut h = harness(&chart);
     h.frame(700, &[]);
     assert_eq!(rects(&h, LINE), [[160.0, 877.0, 544.0, 6.0]]);
@@ -727,9 +752,10 @@ fn covered(
 
 #[test]
 fn the_covers_may_hide_the_whole_lane() {
-    // Top 200, line and bottom 800: the lane is 600 long. A cover of
-    // 900 ‰ takes 540, the scroll's top at 740, a 60 px span; a note
-    // 300 ms ahead is halfway.
+    // Top 200, line and bottom 800: the lane is 600 long, 600 ms of 150
+    // BPM over it. A cover of 900 ‰ takes 540, leaving a 60 px span, and
+    // the scale stays the lane's: a note 300 ms ahead is 300 px above the
+    // line, under the cover.
     let chart = ChartBuilder::new(BPM)
         .tap(lane(3), TimeUs(1_000 * MS))
         .tap(lane(3), TimeUs(1_300 * MS))
@@ -743,7 +769,7 @@ fn the_covers_may_hide_the_whole_lane() {
         .iter()
         .map(|r| r[1] + r[3] / 2.0)
         .collect();
-    assert_eq!(centres[1..], [770.0]);
+    assert_eq!(centres[1..], [500.0]);
     // With no scroll left, by the lift, the cover or both, nothing is
     // divided by it: no note is drawn, only the line.
     for (cover, lift, line) in [(0, 1_000, 200.0), (1_000, 0, 800.0), (1_000, 1_000, 200.0)] {
@@ -1523,10 +1549,8 @@ fn stored_cover_settings_do_not_paint() {
     let quads = |covers: CoverSettings| {
         let mut h = Harness::new(lanes_skin(simple()), &chart, &full(0));
         h.readouts = Some(FrameReadouts {
-            bpm_current_x100: None,
-            hispeed_x100: None,
-            duration: None,
             covers,
+            ..FrameReadouts::UNAVAILABLE
         });
         h.frame(700, &[]);
         h.batch.quads().to_vec()

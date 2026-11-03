@@ -127,7 +127,12 @@ pub struct CoverSettings {
 }
 
 /// What one frame reports of the presentation besides the lanes'
-/// effective amounts ([`LaneView`]).
+/// effective amounts ([`LaneView`]): the source projections, in the
+/// source's coordinates for imported numbers, and the native block for
+/// the player's own HUD, all from one presentation snapshot (design.md
+/// "Play readouts"). The producer marks a value past
+/// [`READOUT_MAX`](crate::READOUT_MAX) unavailable; a build refuses one
+/// as malformed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FrameReadouts {
     /// The playback tempo at the display head (`now + display_offset`), in
@@ -135,15 +140,97 @@ pub struct FrameReadouts {
     /// the musical tempo through a STOP; `None` when unknown. 0 is a tempo
     /// below 0.01, not a STOP.
     pub bpm_current_x100: Option<u32>,
-    /// The scroll policy's explicit multiplicative hi-speed, in floored
-    /// hundredths; `None` when it has none (it is never solved back from
-    /// the duration).
+    /// The source hi-speed `⌊100 · H / (1 − l)⌋` for the effective lift
+    /// `l`, in floored hundredths and not clamped to 20; `None` while `H`
+    /// is unknown or no field is left above the lift.
     pub hispeed_x100: Option<u32>,
-    /// The scroll policy's nominal current travel duration, STOP waiting
-    /// excluded and unrounded; `None` when unknown.
+    /// The source travel duration `240000 · (1 − c) / (B · Hs)` ms at the
+    /// current tempo with the effective lane cover, STOP waiting excluded
+    /// and unrounded; `None` with the source hi-speed or the tempo
+    /// unknown.
     pub duration: Option<DurationRatio>,
     /// The stored cover settings.
     pub covers: CoverSettings,
+    /// The eight duration variants, unrounded, in slot order (slots 51 to
+    /// 74): the current, MAIN, minimum and maximum tempos, each first
+    /// with the configured lane cover, counted while it is off, then with
+    /// none; `None` where unavailable.
+    pub duration_variants: [Option<DurationRatio>; 8],
+    /// The native block's inputs (slots 75 to 85).
+    pub native: NativeReadouts,
+}
+
+impl FrameReadouts {
+    /// Every readout unavailable and every cover off at 0, not being
+    /// adjusted: a frame without a presentation snapshot.
+    pub const UNAVAILABLE: Self = Self {
+        bpm_current_x100: None,
+        hispeed_x100: None,
+        duration: None,
+        covers: CoverSettings {
+            cover: 0,
+            lift: 0,
+            hidden: 0,
+            cover_enabled: false,
+            lift_enabled: false,
+            hidden_enabled: false,
+            adjusting: false,
+        },
+        duration_variants: [None; 8],
+        native: NativeReadouts {
+            duration: None,
+            target_green: None,
+            floating: false,
+        },
+    };
+}
+
+/// The native block's inputs: the active `H` itself is the lanes' gain
+/// ([`LaneView::gain`]) and the whites follow from the stored covers and
+/// the lanes' effective lift ([`native_values`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NativeReadouts {
+    /// The exact current travel duration `T = 240000 · v / (B · H)` ms at
+    /// the lanes' gain and the effective covers, 0 where no field is
+    /// left; `None` with the gain or the tempo unknown.
+    pub duration: Option<DurationRatio>,
+    /// The target green number G, 1 to 6 000, given in Floating only.
+    pub target_green: Option<u32>,
+    /// Whether the speed mode is Floating.
+    pub floating: bool,
+}
+
+/// A duration rounded for the readouts: whole ms, and the green number
+/// from the exact ratio × 3/5, each rounded half up.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RoundedDuration {
+    /// Whole ms, at most [`READOUT_MAX`](crate::READOUT_MAX).
+    pub ms: u32,
+    /// The green number, at most [`READOUT_MAX`](crate::READOUT_MAX).
+    pub green: u32,
+}
+
+/// The native block (slots 75 to 85) as values, for the native HUD and
+/// the fields ([`native_values`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NativeValues {
+    /// The lanes' gain in hundredths, rounded half up; `None` without a
+    /// gain.
+    pub hispeed_x100: Option<u32>,
+    /// The native duration, rounded; `None` while unavailable.
+    pub duration: Option<RoundedDuration>,
+    /// The target green number, Floating only.
+    pub target_green: Option<u32>,
+    /// SUDDEN+'s white number, `⌊(1 000 − l) · cover / 1 000⌋` of the
+    /// configured lane cover and the effective lift `l`.
+    pub sudden_white: u16,
+    /// LIFT's white number: the configured lift.
+    pub lift_white: u16,
+    /// HIDDEN+'s white number, `⌊(1 000 − l) · hidden / 1 000⌋` of the
+    /// configured hidden cover and the effective lift `l`.
+    pub hidden_white: u16,
+    /// Whether the speed mode is Floating.
+    pub floating: bool,
 }
 
 /// What one frame gives the skin.
@@ -247,9 +334,11 @@ pub enum BuildError {
     InconsistentTally,
     /// A readout is out of range (a BPM or hi-speed above
     /// [`READOUT_MAX`](crate::READOUT_MAX), a cover setting above 1 000, a
-    /// zero duration denominator, a rounded duration above
-    /// [`READOUT_MAX`](crate::READOUT_MAX)), or an effective amount in
-    /// [`SkinFrame::lanes`] is not its stored cover setting.
+    /// zero duration denominator, a duration or variant whose rounded ms
+    /// or green number is above [`READOUT_MAX`](crate::READOUT_MAX), a
+    /// target green number outside 1 to 6 000 or given outside Floating),
+    /// or an effective amount in [`SkinFrame::lanes`] is not its stored
+    /// cover setting.
     #[error("the frame's readouts are out of range or disagree with the lanes")]
     InvalidReadouts,
 }
@@ -597,28 +686,24 @@ mod tests {
     use eval::{GaugeState, JudgeEvent, JudgeEventKind, NoteFacts, NoteHold, Tally};
     use rules::{GaugeValue, PerJudgment};
 
-    use super::{Attempt, CoverSettings, FrameReadouts, GaugeDesc, PlayContext, SkinFrame};
+    use super::{Attempt, FrameReadouts, GaugeDesc, PlayContext, SkinFrame};
     use crate::{
-        AtlasLimits, Fit, LaneView, Layout, QuadBatch, Region, Sheet, Side, Skin, SkinDef, Variant,
+        AtlasLimits, Fit, Gain, LaneView, Layout, QuadBatch, Region, Sheet, Side, Skin, SkinDef,
+        Variant,
     };
 
     const MS: i64 = 1_000;
 
     /// No tempo, hi-speed or duration, every cover off at 0: the readouts
     /// of a frame whose lanes draw no cover.
-    pub(crate) const OFF: FrameReadouts = FrameReadouts {
-        bpm_current_x100: None,
-        hispeed_x100: None,
-        duration: None,
-        covers: CoverSettings {
-            cover: 0,
-            lift: 0,
-            hidden: 0,
-            cover_enabled: false,
-            lift_enabled: false,
-            hidden_enabled: false,
-            adjusting: false,
-        },
+    const OFF: FrameReadouts = FrameReadouts::UNAVAILABLE;
+
+    /// The lanes at H 1, no cover.
+    const VIEW: LaneView = LaneView {
+        gain: Some(Gain::ONE),
+        cover: 0,
+        lift: 0,
+        hidden: 0,
     };
 
     fn lane(n: u8) -> Lane {
@@ -726,12 +811,7 @@ mod tests {
                     playing: true,
                     target: [1_920, 1_080],
                     layout: &layout,
-                    lanes: LaneView {
-                        visible_time: TimeUs(600 * MS),
-                        cover: 0,
-                        lift: 0,
-                        hidden: 0,
-                    },
+                    lanes: VIEW,
                     readouts: OFF,
                 };
                 skin.build(play, &frame, &uvs, &mut batch).unwrap();
@@ -814,12 +894,7 @@ mod tests {
             playing: true,
             target: [1_920, 1_080],
             layout: &layout,
-            lanes: LaneView {
-                visible_time: TimeUs(600 * MS),
-                cover: 0,
-                lift: 0,
-                hidden: 0,
-            },
+            lanes: VIEW,
             readouts: OFF,
         };
         assert_eq!(

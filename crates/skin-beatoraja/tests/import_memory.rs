@@ -354,6 +354,7 @@ fn check_f2(_: &Header, i: Imported) {
             hidden_enabled: false,
             adjusting: false,
         },
+        ..skin_model::FrameReadouts::UNAVAILABLE
     };
     // In ROTATION's order at 0 ms, one note at 1 s: rates 100.00 and 0.00,
     // BPMs 300, 75 and 150.75, 0 s played, 1 s left, the covers, hi-speed
@@ -911,9 +912,10 @@ fn check_f5(_: &Header, i: Imported) {
         .map(|(_, n)| n)
         .sum();
     assert!((1_000..=1_001).contains(&gauge), "{by_size:?}");
-    // Each bar, the one at the line then the coming one higher,
-    // draws the full-gauge group then the PERFECT one, before the notes;
-    // the third group is off.
+    // Each bar, the one at the line then the coming one 50 ms ahead, 50 px
+    // higher at the original lane's 600 ms over 600 px, draws the
+    // full-gauge group then the PERFECT one, before the notes; the third
+    // group is off.
     let bars = |q: &[skin_model::Quad]| -> Vec<([i32; 4], [f32; 4], [u32; 4])> {
         q.iter()
             .filter(|q| matches!(common::play::round(q.rect), [_, _, 428 | 50, 2 | 4 | 6]))
@@ -929,8 +931,8 @@ fn check_f5(_: &Header, i: Imported) {
         [
             ([21, 878, 428, 2], grey),
             ([21, 877, 428, 4], red),
-            ([21, 847, 428, 2], grey),
-            ([21, 846, 428, 4], red),
+            ([21, 828, 428, 2], grey),
+            ([21, 827, 428, 4], red),
         ]
     );
     assert_ne!(shown[0].2, shown[1].2);
@@ -1932,11 +1934,11 @@ fn f16b_chart(tap: bool) -> bms_model::Chart {
     b.build().unwrap()
 }
 
-/// F16b: with no scroll left every long note is visited and none drawn;
-/// the visits end exactly at the last with no drop, and a tap past them
-/// is not drawn and drops once.
+/// F16b: with no scroll left nothing ahead is visited or drawn
+/// (stage3.md R6), so neither the long notes up to the visit budget nor
+/// a tap past them drops anything.
 fn check_f16b(_: &Header, i: Imported) {
-    for (tap, dropped) in [(false, 0), (true, 1)] {
+    for (tap, dropped) in [(false, 0), (true, 0)] {
         let mut d = Drawn::over(i.skin.clone(), &f16b_chart(tap));
         d.view.cover = 1_000;
         let q = d.frame(900, &[]);

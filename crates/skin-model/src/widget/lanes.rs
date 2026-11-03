@@ -23,7 +23,7 @@
 use bms_model::{LANE_COUNT, Lane, Note, NoteKind, Position, TimeUs, TimelineId};
 
 use super::bar::{BarGroup, BarGroupDef, BarScratch, Field, Template};
-use super::scroll::Scale;
+use super::scroll::{Gain, Scale};
 use super::{Brush, ImageRef, Starts, sample, tint};
 use crate::atlas::uv::{FrameUv, UvTable};
 use crate::canvas::f32_of;
@@ -207,8 +207,8 @@ pub struct LanesDef {
     /// The side the author drew the scratch lane on.
     pub scratch: Side,
     /// The lanes' top: notes are cut to `[top, bottom]`. In the
-    /// simple style, where a note appears `visible_time` before it
-    /// reaches the line.
+    /// simple style, the top of the original lane the gain scales
+    /// ([`LaneView::gain`]).
     pub top: i32,
     /// The simple style's judgment line.
     pub line: i32,
@@ -230,12 +230,13 @@ pub struct LanesDef {
     pub bar_groups: Vec<BarGroupDef>,
 }
 
-/// What the lanes show this frame: the hi-speed and the covers.
+/// What the lanes show this frame: the gain and the covers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LaneView {
-    /// The time a note takes from the uncovered top to the line, at the
-    /// chart's initial rate.
-    pub visible_time: TimeUs,
+    /// The exact original-lane gain ([`Gain`]): one measure takes `1 / H`
+    /// of the lane's length, not shortened by either cover. `None` in
+    /// structural and loading frames, which draw only the judgment line.
+    pub gain: Option<Gain>,
     /// The lane cover, in ‰ (at most 1 000) of the length left above the
     /// lift: the lane's length less the lift's.
     pub cover: u16,
@@ -248,6 +249,16 @@ pub struct LaneView {
     /// the lift, as the lane cover. The caller passes 0 while the player
     /// has it off.
     pub hidden: u16,
+}
+
+impl LaneView {
+    /// No gain and no cover: a frame without a presentation snapshot.
+    pub const NONE: Self = Self {
+        gain: None,
+        cover: 0,
+        lift: 0,
+        hidden: 0,
+    };
 }
 
 /// Why the lanes were refused.
@@ -757,7 +768,10 @@ pub(crate) struct LaneFrameGeometry {
     pub(crate) hidden_px: f64,
     /// The raised judgment line.
     pub(crate) line_y: f64,
-    /// The scroll's length: from the uncovered top to the line.
+    /// The original lane's length, which the gain scales.
+    pub(crate) len: f64,
+    /// The scroll's length: from the uncovered top to the line; exactly 0
+    /// only when LIFT or the lane cover is at 1 000 ‰.
     pub(crate) span: f64,
     /// The lanes' top and bottom, where notes are cut.
     pub(crate) top: f64,
@@ -767,11 +781,11 @@ pub(crate) struct LaneFrameGeometry {
 impl Lanes {
     /// Draws the lanes into `out`: the bar groups, with `scratch` when
     /// they have any, the judgment line and every lane's notes; without a
-    /// play, the judgment line alone at the frame's line. Allocates
-    /// nothing.
+    /// play or a gain, the judgment line alone at the frame's line.
+    /// Allocates nothing.
     pub(crate) fn draw(&self, d: &Draw<'_>, scratch: Option<&mut BarScratch>, out: &mut QuadBatch) {
         let g = d.frame;
-        let Some((play, facts)) = d.play else {
+        let (Some((play, facts)), Some(gain)) = (d.play, d.view.gain) else {
             self.line(&mut Pen::new(d, out), f32_of(g.line_y));
             return;
         };
@@ -780,13 +794,7 @@ impl Lanes {
         };
         // The frame's one sample of the playhead, taken when the play was
         // filled for this build at the same display time.
-        let scale = Scale::new(
-            play.display_position(),
-            play.playhead().initial_rate(),
-            d.view.visible_time,
-            g.span,
-            g.line_y,
-        );
+        let scale = Scale::from_gain(play.display_position(), gain, g.len, g.line_y);
         let mut pen = Pen::new(d, out);
         let ringing_out = d.complete && notes.section.is_some();
         // With no scroll left nothing is scaled and no bar is drawn.
@@ -924,6 +932,7 @@ impl Lanes {
             cover_px: left - span,
             hidden_px: left * f64::from(hidden) / 1_000.0,
             line_y: line - lift_px,
+            len,
             span,
             top: f64::from(self.top),
             bottom,
@@ -1024,9 +1033,9 @@ impl Lanes {
     }
 
     /// The source player's judgment line and notes ([`SourceLanes`]).
-    /// With no scroll left (`span` 0) nothing is scaled: every tap and
-    /// mine whose time has not passed is drawn on the line, as the source
-    /// then draws every note there, and no long note is drawn.
+    /// With no scroll left (`span` 0) only the line is drawn: the source
+    /// then draws every future tap and mine on the line, which no note is
+    /// here (docs/stage3.md R6).
     fn source(
         &self,
         pen: &mut Pen<'_, '_>,
@@ -1036,37 +1045,32 @@ impl Lanes {
         span: f64,
         ringing_out: bool,
     ) {
-        let range = (span > 0.0).then(|| {
-            // A note's lower edge sits `offset_y` above its position's y;
-            // the tallest lane's note pads every lane's window, which can
-            // only visit more candidates, each drawn at its own height.
-            let pad = s.note_h.iter().copied().fold(0.0_f32, f32::max);
-            let (from, to) = scale.positions(
-                f32_of(f64::from(s.bottom) - scale.line_y) + s.offset_y + pad,
-                f32_of(scale.line_y - f64::from(self.top)) + pad,
-            );
-            [from, to]
-        });
         self.line(pen, f32_of(scale.line_y));
+        if span <= 0.0 {
+            return;
+        }
+        // A note's lower edge sits `offset_y` above its position's y; the
+        // tallest lane's note pads every lane's window, which can only
+        // visit more candidates, each drawn at its own height.
+        let pad = s.note_h.iter().copied().fold(0.0_f32, f32::max);
+        let (from, to) = scale.positions(
+            f32_of(f64::from(s.bottom) - scale.line_y) + s.offset_y + pad,
+            f32_of(scale.line_y - f64::from(self.top)) + pad,
+        );
         let Some(notes) = play.notes() else {
             return;
         };
         if ringing_out {
             return;
         }
-        let display = pen.d.display;
-        // Times and positions never decrease along a lane
-        // (`Chart::validate`): from those meeting `range`, or from the
-        // display time on without one.
+        // Positions never decrease along a lane (`Chart::validate`), so a
+        // lane's notes meeting [from, to] are one run.
         self.walk(
             pen,
             notes,
-            |list| match range {
-                Some([from, _]) => list.partition_point(|n| n.end_pos() < from),
-                None => list.partition_point(|n| n.time < display),
-            },
-            range.map(|[_, to]| to),
-            |pen, l, i, n| self.source_note(pen, play, scale, s.offset_y, range, l, i, n),
+            |list| list.partition_point(|n| n.end_pos() < from),
+            Some(to),
+            |pen, l, i, n| self.source_note(pen, play, scale, s.offset_y, l, i, n),
         );
     }
 
@@ -1082,7 +1086,6 @@ impl Lanes {
         play: &Play,
         scale: &Scale,
         offset_y: f32,
-        range: Option<[Position; 2]>,
         l: &LaneOf<'_>,
         i: usize,
         n: &Note,
@@ -1101,11 +1104,7 @@ impl Lanes {
                 if n.time < d.display {
                     return true;
                 }
-                let y = if range.is_some() {
-                    scale.y(n.pos)
-                } else {
-                    f32_of(scale.line_y)
-                };
+                let y = scale.y(n.pos);
                 let part = if n.kind == NoteKind::Tap {
                     l.note
                 } else {
@@ -1117,7 +1116,7 @@ impl Lanes {
                 // Until its end's time passes and while its end is ahead of
                 // its head, which stays on the line once passed.
                 let head_pos = n.pos.max(scale.at_line);
-                if range.is_none() || d.display >= end || end_pos <= head_pos {
+                if d.display >= end || end_pos <= head_pos {
                     return true;
                 }
                 let (head, tail) = (scale.y(head_pos) - oy, scale.y(end_pos) - oy);

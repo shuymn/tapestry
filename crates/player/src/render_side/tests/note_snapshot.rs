@@ -109,11 +109,19 @@ impl Screen for Skins {
         false
     }
     fn build(&mut self, f: &FrameInput<'_>) -> Result<(), skin_model::BuildError> {
+        // The player's frames give the declarative skin no gain until
+        // S10-04b-2: the model's lanes take `H` 10/3, 600 ms of 120 BPM over
+        // the original lane, as the simple skin's default visible time.
         let f = FrameInput {
             now: AT,
             display_offset: TimeUs(0),
+            lanes: skin_model::LaneView {
+                gain: skin_model::Gain::new(10, 3),
+                ..f.lanes
+            },
             ..*f
         };
+
         let mut batch = SpriteBatch::with_capacity(4_096);
         self.simple.build(&f, &mut batch)?;
         let fresh = game::PlayView {

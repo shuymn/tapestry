@@ -1,14 +1,62 @@
-//! Where the scroll stands for one frame: the simple skin's
-//! `layout::Scale` arithmetic (crates/render/src/simple.rs), both given
-//! the playhead's position and the initial rate, here also
-//! parameterized by the uncovered lane length and the judgment line's y.
-//! Given the original's inputs, with no cover and no lift, its every
-//! output bit equals the original's; tests/scroll.rs ties the two
-//! together until the original is deleted.
+//! Where the scroll stands for one frame: the playhead's position at the
+//! judgment line and the pixels per unit of position, from the exact
+//! original-lane gain (design.md "Play readouts"). The arithmetic from a
+//! position to pixels is the simple skin's `layout::Scale`
+//! (crates/render/src/simple.rs); tests/scroll.rs ties the two together
+//! until the original is deleted.
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
-use bms_model::{Position, TimeUs};
+use bms_model::{BEAT, Position};
+
+/// The lanes' exact original-lane gain: the active multiplier `H` as
+/// `num / den`, one measure of four beats taking `1 / H` of the original
+/// lane. Within 1/100 to 20, both terms positive.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Gain {
+    num: u64,
+    den: u64,
+}
+
+impl Gain {
+    /// `H` 1.
+    pub const ONE: Self = Self { num: 1, den: 1 };
+
+    /// `num / den`, if both are positive and `1/100 ≤ num/den ≤ 20`
+    /// (compared exactly); `None` otherwise.
+    #[must_use]
+    pub const fn new(num: u64, den: u64) -> Option<Self> {
+        // Widened, so neither product overflows.
+        let (n, d) = (num as u128, den as u128);
+        if n > 0 && d > 0 && 100 * n >= d && n <= 20 * d {
+            Some(Self { num, den })
+        } else {
+            None
+        }
+    }
+
+    /// The numerator.
+    #[must_use]
+    pub const fn num(self) -> u64 {
+        self.num
+    }
+
+    /// The denominator, never 0.
+    #[must_use]
+    pub const fn den(self) -> u64 {
+        self.den
+    }
+
+    /// Pixels per unit of position (2^-80 beat) over an original lane of
+    /// `lane_len_px` pixels: `num · lane_len_px / (den · 4 · BEAT)`. The
+    /// only conversion of a gain to pixels; finite and positive for a
+    /// lane length of at least 1.
+    #[must_use]
+    pub fn px_per_pos(self, lane_len_px: f64) -> f64 {
+        let measure = 4.0 * BEAT as f64;
+        self.num as f64 * lane_len_px / (self.den as f64 * measure)
+    }
+}
 
 /// The playhead at the display time and the pixels per unit of position.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -22,26 +70,15 @@ pub struct Scale {
 }
 
 impl Scale {
-    /// The scale with the playhead at `at_line` and hi-speed
-    /// `visible_time`, over `span_px` pixels of lane ending at the line
-    /// `line_y`. A visible time below 1 µs counts as 1 µs.
-    ///
-    /// The span holds the scroll of `visible_time` at the chart's initial
-    /// rate, `initial_rate` units per µs. The pixels per position never
-    /// change during a play, whatever the BPM at the playhead.
+    /// The scale with the playhead at `at_line` and the gain `gain` over
+    /// an original lane of `lane_len_px` pixels, the judgment line at
+    /// `line_y`. The pixels per position never change during a play,
+    /// whatever the BPM at the playhead.
     #[must_use]
-    pub fn new(
-        at_line: Position,
-        initial_rate: i128,
-        visible_time: TimeUs,
-        span_px: f64,
-        line_y: f64,
-    ) -> Self {
-        let visible = visible_time.0.max(1) as f64;
-        let span = visible * initial_rate as f64;
+    pub fn from_gain(at_line: Position, gain: Gain, lane_len_px: f64, line_y: f64) -> Self {
         Self {
             at_line,
-            px_per_pos: span_px / span,
+            px_per_pos: gain.px_per_pos(lane_len_px),
             line_y,
         }
     }

@@ -12,7 +12,9 @@ use game::PlayView;
 use render::text::MenuText;
 use render::{AdapterChoice, AttemptInput, FrameInput, LoadingFrame, Renderer, SkinBundle, Target};
 use rules::{GaugeValue, PerJudgment};
-use skin_model::{Attempt, ChartText, GaugeDesc, GaugeLook, PlayContext, Side};
+use skin_model::{
+    Attempt, ChartText, FrameReadouts, Gain, GaugeDesc, GaugeLook, LaneView, PlayContext, Side,
+};
 
 pub const MS: i64 = 1_000;
 /// A 5:4 target: the layout is scaled by 2/3 to 1280×720 with 152 rows of
@@ -20,6 +22,13 @@ pub const MS: i64 = 1_000;
 pub const WIDTH: u32 = 1280;
 pub const HEIGHT: u32 = 1024;
 pub const VISIBLE: TimeUs = TimeUs(600 * MS);
+/// The declarative skins' lanes: `H` 10/3, which puts 600 ms of 120 BPM
+/// over the original lane as [`VISIBLE`] does for the simple skin, and no
+/// cover.
+pub const LANES: LaneView = LaneView {
+    gain: Gain::new(10, 3),
+    ..LaneView::NONE
+};
 /// The name WARP reports.
 pub const WARP: &str = "Microsoft Basic Render Driver";
 
@@ -227,6 +236,8 @@ pub fn input<'a>(
         now,
         display_offset,
         visible_time: VISIBLE,
+        lanes: LANES,
+        readouts: FrameReadouts::UNAVAILABLE,
         view,
         effects,
         gauge: 0,

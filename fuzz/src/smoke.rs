@@ -673,7 +673,7 @@ fn skin_import_seeds_import_and_draw_as_built() {
         let i = imported.unwrap_or_else(|e| panic!("{name}: {e}"));
         let u = i.report.usage;
         // Quads at 0, 50, 500 and 5,000 ms, each with a perfect judgment.
-        let drawn = draw(&i);
+        let drawn = draw(&i, &[]);
         match name {
             "images" => {
                 assert_eq!(u, usage(2, 2, 14, 2), "{name}");

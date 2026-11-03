@@ -10,8 +10,8 @@ mod play_support;
 use bms_model::{Chart, ChartBuilder, Lane, LnMode, NoteKind, TimeUs};
 use eval::JudgeEvent;
 use lanes_support::{
-    BAR, BODY_OFF, BODY_ON, COVER, HEAD, HIDDEN, LIFT, LINE, MINE, NOTE, TAIL, in_lane,
-    lanes_element, lanes_skin, rects, skin_with, source, source_with,
+    BODY_OFF, BODY_ON, COVER, HEAD, HIDDEN, LIFT, LINE, MINE, NOTE, TAIL, in_lane, lanes_element,
+    lanes_skin, rects, skin_with, source, source_with,
 };
 use play_support::{Harness, MS, REGIONS, ev, full, hold_ended, judged, lane, ln_held, mine};
 use rules::Judgment;
@@ -343,8 +343,8 @@ fn a_note_is_within_a_microsecond_of_scroll_of_the_line_at_its_judgment_time() {
 #[test]
 fn the_lift_and_the_cover_take_their_shares_of_the_region() {
     // Lift 200 ‰ of 600: the line at 760. Cover 500 ‰ of the 480 left
-    // is 240, leaving 240 px of scroll for 600 ms: a long note of 300 ms
-    // is 120 px long.
+    // is 240, and the gain keeps the original lane's scale, 600 ms over
+    // its 600 px: a long note of 300 ms is 300 px long.
     let chart = ChartBuilder::new(BPM)
         .tap(lane(3), TimeUs(1_000 * MS))
         .long(lane(2), TimeUs(1_000 * MS), TimeUs(1_300 * MS))
@@ -356,10 +356,10 @@ fn the_lift_and_the_cover_take_their_shares_of_the_region() {
     h.frame(1_000, &[]);
     assert_eq!(in_lane(&h, NOTE, lane(3)), [[384.0, 740.0, 64.0, 20.0]]);
     assert_eq!(in_lane(&h, HEAD, lane(2)), [[320.0, 740.0, 64.0, 20.0]]);
-    // The end's lower edge (120 px up), the body up to the head's top.
+    // The end's lower edge (300 px up), the body up to the head's top.
     assert_eq!(
         in_lane(&h, BODY_OFF, lane(2)),
-        [[320.0, 640.0, 64.0, 100.0]]
+        [[320.0, 460.0, 64.0, 280.0]]
     );
     // The lanes paint no cover of their own.
     for part in [COVER, LIFT, HIDDEN] {
@@ -367,41 +367,10 @@ fn the_lift_and_the_cover_take_their_shares_of_the_region() {
     }
 }
 
+/// With no scroll left nothing ahead is visited, so neither budget is
+/// spent however many notes wait (docs/stage3.md R6).
 #[test]
-fn with_no_scroll_left_only_taps_and_mines_are_drawn_on_the_line() {
-    let mut chart = ChartBuilder::new(BPM)
-        .tap(lane(5), TimeUs(500 * MS))
-        .tap(lane(3), TimeUs(1_000 * MS))
-        .tap(lane(3), TimeUs(2_000 * MS))
-        .mine(lane(4), TimeUs(3_000 * MS), 10)
-        .long(lane(2), TimeUs(1_000 * MS), TimeUs(1_300 * MS))
-        .build()
-        .unwrap();
-    chart.meta.ln_mode = Some(LnMode::Cn);
-    // On the line: at the bottom, or lifted to the region's top, where
-    // the lanes' top (270) cuts the note's upper half.
-    for (lift, cover, [y, n]) in [
-        (1_000, 0, [270.0, 10.0]),
-        (0, 1_000, [860.0, 20.0]),
-        (1_000, 1_000, [270.0, 10.0]),
-    ] {
-        let mut h = harness(&chart);
-        h.view.lift = lift;
-        h.view.cover = cover;
-        h.frame(900, &[]);
-        let at = |x: f32| [x, y, 64.0, n];
-        let case = format!("lift {lift}, cover {cover}");
-        assert_eq!(in_lane(&h, NOTE, lane(3)), [at(384.0), at(384.0)], "{case}");
-        assert_eq!(in_lane(&h, MINE, lane(4)), [at(448.0)], "{case}");
-        assert!(in_lane(&h, NOTE, lane(5)).is_empty(), "{case}");
-        assert_eq!(ln_parts(&h).map(|p| p.len()), [0, 0, 0], "{case}");
-        assert!(rects(&h, BAR).is_empty(), "{case}");
-        assert_eq!(rects(&h, LINE).len(), 1, "{case}");
-    }
-}
-
-#[test]
-fn with_no_scroll_left_both_budgets_bound_the_frame() {
+fn with_no_scroll_left_nothing_is_visited() {
     let mut def = source();
     def.bar_groups.clear();
     let run = |chart: &Chart| {
@@ -410,8 +379,7 @@ fn with_no_scroll_left_both_budgets_bound_the_frame() {
         h.frame(900, &[]);
         h
     };
-    // `LANE_VISITS` long notes ahead, none drawn, then a tap never
-    // visited: one drop.
+    // `LANE_VISITS` long notes ahead, then a tap: none drawn, no drop.
     let per_lane = i64::from(LANE_VISITS) / 8;
     let mut b = ChartBuilder::new(BPM);
     for l in Lane::all() {
@@ -423,10 +391,10 @@ fn with_no_scroll_left_both_budgets_bound_the_frame() {
     let h = run(&b.tap(lane(7), TimeUs(9_000 * MS)).build().unwrap());
     assert!(rects(&h, NOTE).is_empty());
     assert!(rects(&h, HEAD).is_empty());
-    assert_eq!(h.batch.dropped(), 1);
-    // `LANE_QUADS` taps ahead and one more: the budget's taps, one drop.
+    assert_eq!(h.batch.dropped(), 0);
+    // `LANE_QUADS` taps ahead and one more: none drawn, no drop.
     let per_lane = i64::from(LANE_QUADS) / 8;
-    for (extra, dropped) in [(0, 0), (1, 1)] {
+    for extra in [0, 1] {
         let mut b = ChartBuilder::new(BPM);
         for l in Lane::all() {
             let n = per_lane + if l == lane(7) { extra } else { 0 };
@@ -435,8 +403,8 @@ fn with_no_scroll_left_both_budgets_bound_the_frame() {
             }
         }
         let h = run(&b.build().unwrap());
-        assert_eq!(rects(&h, NOTE).len(), LANE_QUADS as usize, "{extra}");
-        assert_eq!(h.batch.dropped(), dropped, "{extra}");
+        assert!(rects(&h, NOTE).is_empty(), "{extra}");
+        assert_eq!(h.batch.dropped(), 0, "{extra}");
     }
 }
 

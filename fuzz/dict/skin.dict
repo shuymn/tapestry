@@ -81,6 +81,29 @@
 "\"disapearLine\""
 "\"isDisapearLineLinkLift\""
 
+# Readout numbers: the duration and its green number, and the eight
+# duration variants by id, 1312 to 1327.
+"\"duration\""
+"\"duration_green\""
+"\"ref\": 312"
+"\"ref\": 313"
+"\"ref\": 1312"
+"\"ref\": 1313"
+"\"ref\": 1314"
+"\"ref\": 1315"
+"\"ref\": 1316"
+"\"ref\": 1317"
+"\"ref\": 1318"
+"\"ref\": 1319"
+"\"ref\": 1320"
+"\"ref\": 1321"
+"\"ref\": 1322"
+"\"ref\": 1323"
+"\"ref\": 1324"
+"\"ref\": 1325"
+"\"ref\": 1326"
+"\"ref\": 1327"
+
 # The resources of the skin folder.
 "strip.png"
 "grid.png"

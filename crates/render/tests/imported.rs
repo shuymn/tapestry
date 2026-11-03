@@ -15,7 +15,7 @@ mod json_support;
 use std::sync::Arc;
 
 use bms_model::{Chart, ChartBuilder, TimeUs};
-use common::{GAUGES, VISIBLE, context, input, install, loading, offscreen, read_back, view};
+use common::{GAUGES, context, input, install, loading, offscreen, read_back, view};
 use json_support::{
     ANIMATION, BACKGROUND, FOLLOWER, LANE_LENGTH, LIFT_PAINT, MAGENTA, RED, TRIM_LINE, bundle,
     centre, colour, rgb, text_at,
@@ -93,7 +93,7 @@ fn each_fresh_attempt_draws_its_own_bitmap_labels() {
 /// clock from origin 0, with the lift at `lift` ‰ (on) and text revision
 /// `text`.
 fn loading_at(lifetime: u64, now: i64, lift: u16, text: u64) -> LoadingFrame<'static> {
-    let mut f = LoadingFrame::interim(lifetime, TimeUs(now * MS), TimeUs(0), VISIBLE);
+    let mut f = LoadingFrame::interim(lifetime, TimeUs(now * MS), TimeUs(0));
     f.lanes.lift = lift;
     f.covers.lift = lift;
     f.covers.lift_enabled = true;

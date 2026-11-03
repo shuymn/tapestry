@@ -105,6 +105,7 @@ const KNOWN: FrameReadouts = FrameReadouts {
         hidden_enabled: false,
         adjusting: false,
     },
+    ..FrameReadouts::UNAVAILABLE
 };
 
 #[test]
@@ -218,9 +219,6 @@ fn image(op: &str) -> common::Loaded {
 #[test]
 fn cover_conditions_read_the_stored_switches() {
     let covers = |cover_enabled, lift_enabled, hidden_enabled, adjusting| FrameReadouts {
-        bpm_current_x100: None,
-        hispeed_x100: None,
-        duration: None,
         covers: CoverSettings {
             cover: 0,
             lift: 0,
@@ -230,6 +228,7 @@ fn cover_conditions_read_the_stored_switches() {
             hidden_enabled,
             adjusting,
         },
+        ..FrameReadouts::UNAVAILABLE
     };
     for (op, d4) in [
         ("270", true),

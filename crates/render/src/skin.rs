@@ -7,11 +7,14 @@ use bms_model::{Chart, TimeUs};
 use eval::{JudgeEvent, Section};
 use game::PlayView;
 use skin_model::{
-    BuildError, Canvas, ChartText, CoverSettings, Fit, LaneView, Layout, LoadState, LoadingGauge,
-    PlayContext,
+    BuildError, Canvas, ChartText, CoverSettings, Fit, FrameReadouts, LaneView, Layout, LoadState,
+    LoadingGauge, PlayContext,
 };
 
 use crate::{Gpu, MAX_SPRITES, SpriteBatch};
+
+// The producer's bound is the model's (design.md "Play readouts").
+const _: () = assert!(game::readouts::READOUT_MAX == skin_model::READOUT_MAX);
 
 /// What one frame draws from.
 #[derive(Clone, Copy, Debug)]
@@ -21,11 +24,17 @@ pub struct FrameInput<'a> {
     /// The display latency offset: how much later than `now` the frame is
     /// expected to reach the screen (design.md "Rendering and Skins").
     pub display_offset: TimeUs,
-    /// Hi-speed as the visible time (design.md "Algorithms"): how long a note's
-    /// center takes from the top of the lane to the judgment line while the
-    /// chart scrolls at its initial BPM. The note's edge shows slightly
-    /// earlier.
+    /// The simple skin's hi-speed as the visible time (design.md
+    /// "Algorithms"): how long a note's center takes from the top of the
+    /// lane to the judgment line while the chart scrolls at its initial
+    /// BPM. The note's edge shows slightly earlier.
     pub visible_time: TimeUs,
+    /// The declarative skin's lanes: the exact original-lane gain and the
+    /// effective covers (design.md "Play readouts").
+    pub lanes: LaneView,
+    /// The declarative skin's readouts, from the same presentation
+    /// snapshot as `lanes`.
+    pub readouts: FrameReadouts,
     /// The newest play state.
     pub view: &'a PlayView,
     /// The effects received since the previous frame, in emission order.
@@ -89,23 +98,18 @@ impl LoadingFrame<'static> {
     /// A frame of lifetime `lifetime` at `now` on the loading clock, from
     /// its origin `since`, with the interim values the render thread gives
     /// until the player's bridge (docs/stage3.md S10-03c-3): the author's
-    /// layout, every cover 0 and off and not being adjusted, the lanes'
-    /// `visible_time` from the tuning snapshot, no gauge descriptor,
-    /// progress 0 and no text. The renderer applies its own target.
+    /// layout, every cover 0 and off and not being adjusted, no gain (a
+    /// loading frame has none), no gauge descriptor, progress 0 and no
+    /// text. The renderer applies its own target.
     #[must_use]
-    pub const fn interim(lifetime: u64, now: TimeUs, since: TimeUs, visible_time: TimeUs) -> Self {
+    pub const fn interim(lifetime: u64, now: TimeUs, since: TimeUs) -> Self {
         Self {
             lifetime,
             now,
             load: LoadState { since, percent: 0 },
             target: [1_920, 1_080],
             layout: &Layout::AUTHOR,
-            lanes: LaneView {
-                visible_time,
-                cover: 0,
-                lift: 0,
-                hidden: 0,
-            },
+            lanes: LaneView::NONE,
             covers: CoverSettings {
                 cover: 0,
                 lift: 0,
@@ -290,9 +294,9 @@ pub trait PlaySkin: Send {
 /// snapshot (design.md "Play readouts", "Play Adjustments", publication):
 /// the configured amounts and switches, and `adjusting` (condition 270,
 /// `lanecover1_changing`) true while START or SELECT is held, so an
-/// imported skin's 270 reads what the source tests. Until S10-04b the
-/// player's frames keep their interim readouts (`decl::READOUTS`), which
-/// never call this: 270 keeps its documented D4 difference there.
+/// imported skin's 270 reads what the source tests. Until S10-04b-2 the
+/// player's frames keep unavailable readouts (`FrameReadouts::UNAVAILABLE`),
+/// which never call this: 270 keeps its documented D4 difference there.
 #[must_use]
 pub const fn cover_settings(s: &game::adjustment::PresentationSnapshot) -> CoverSettings {
     let covers = s.options.covers();
