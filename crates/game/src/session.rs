@@ -1798,6 +1798,7 @@ impl<O: AudioOutput + Wakes> Session<O> {
             audio,
             script,
             next_command: 0,
+            pending: PendingCommands::default(),
             origin: None,
             script_origin: None,
             participants: Vec::new(),
@@ -1859,6 +1860,45 @@ pub enum SessionPlayError {
     Left,
 }
 
+/// Commands published and not yet taken, held as the player's controls
+/// hold them, whatever order they were published in: a quit, a suspend
+/// and a retry each pending at most once. A take gives the quit first,
+/// dropping a retry pending with it (outside Closing) and leaving a
+/// suspend for the next take, then the suspend, then the retry.
+#[derive(Clone, Copy, Debug, Default)]
+struct PendingCommands {
+    quit: bool,
+    retry: bool,
+    suspend: bool,
+}
+
+impl PendingCommands {
+    fn publish(&mut self, c: Command) {
+        match c {
+            Command::Quit => self.quit = true,
+            Command::Retry => self.retry = true,
+            Command::Suspend => self.suspend = true,
+        }
+    }
+
+    /// The next command taken; in Closing (`closing`) a quit keeps the
+    /// retry pending with it.
+    fn take(&mut self, closing: bool) -> Option<Command> {
+        if std::mem::take(&mut self.quit) {
+            if !closing {
+                self.retry = false;
+            }
+            Some(Command::Quit)
+        } else if std::mem::take(&mut self.suspend) {
+            Some(Command::Suspend)
+        } else if std::mem::take(&mut self.retry) {
+            Some(Command::Retry)
+        } else {
+            None
+        }
+    }
+}
+
 /// The session's rig: one step of the virtual clock per wait, the script
 /// fed on the play's timeline, and the audio stepped through every buffer
 /// event before the step's logic (a buffer event at the step's own time
@@ -1870,6 +1910,9 @@ struct SessionRig<'s, O> {
     audio: &'s mut RunnerAudio<O>,
     script: PlayScript,
     next_command: usize,
+    /// The script's commands due and not yet taken, held as the player's
+    /// controls hold them.
+    pending: PendingCommands,
     /// The current READY candidate's chart time 0 on the session clock.
     origin: Option<TimeUs>,
     /// Where the script's timeline has its 0 on the session clock: the
@@ -1984,6 +2027,22 @@ impl<O> SessionRig<'_, O> {
         }
     }
 
+    /// Publishes every script command due now into
+    /// [`pending`](Self::pending), as the window publishes a key into the
+    /// player's controls.
+    fn publish_due(&mut self) {
+        let Some(now) = self.play_time() else {
+            return;
+        };
+        while let Some(&(at, c)) = self.script.commands.get(self.next_command) {
+            if at > now {
+                break;
+            }
+            self.next_command += 1;
+            self.pending.publish(c);
+        }
+    }
+
     /// The script's time now.
     fn play_time(&self) -> Option<TimeUs> {
         self.script_origin.map(|o| TimeUs(self.clock.now().0 - o.0))
@@ -2030,12 +2089,13 @@ impl<O: AudioOutput + Wakes> Rig for SessionRig<'_, O> {
     }
 
     fn take(&mut self) -> Option<Command> {
-        let now = self.play_time()?;
-        let &(at, c) = self.script.commands.get(self.next_command)?;
-        (at <= now).then(|| {
-            self.next_command += 1;
-            c
-        })
+        self.publish_due();
+        self.pending.take(false)
+    }
+
+    fn take_closing(&mut self) -> Option<Command> {
+        self.publish_due();
+        self.pending.take(true)
     }
 
     fn quitting(&self) -> bool {
