@@ -2678,17 +2678,31 @@ mod gate_tests {
                 "the allocation was not counted"
             );
         }
-        // The boundaries' own allocations, the thread's spawn aside
-        // (counted with dev-tools only).
+        // Each side's own allocations (counted with dev-tools only): the
+        // input thread's boundaries, the thread's spawn aside, and the game
+        // thread's whole handoff, each thread with its positive control.
         let count = || {
             #[cfg(feature = "dev-tools")]
             return crate::alloc_count::this_thread();
             #[cfg(not(feature = "dev-tools"))]
             0
         };
+        let control = || {
+            #[cfg(feature = "dev-tools")]
+            {
+                let before = count();
+                drop(std::hint::black_box(vec![1_u8; 8]));
+                assert!(count() > before, "the allocation was not counted");
+            }
+        };
         let mut allocated = 0;
-        let closing = std::thread::scope(|s| {
-            let asked = s.spawn(|| link.hand_off());
+        let (closing, asking) = std::thread::scope(|s| {
+            let asked = s.spawn(|| {
+                control();
+                let before = count();
+                let closing = link.hand_off();
+                (closing, count() - before)
+            });
             let mut at = 30;
             while !asked.is_finished() {
                 let before = count();
@@ -2697,9 +2711,10 @@ mod gate_tests {
                 at += 1;
             }
             asked.join().unwrap()
-        })
-        .unwrap();
-        assert_eq!(allocated, 0, "the handoff allocated");
+        });
+        let closing = closing.unwrap();
+        assert_eq!(allocated, 0, "the input thread's handoff allocated");
+        assert_eq!(asking, 0, "the game thread's handoff allocated");
         assert_eq!(
             closing,
             game::Closing {
