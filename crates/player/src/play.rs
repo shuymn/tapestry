@@ -51,12 +51,19 @@ const IDLE_PARK: Duration = Duration::from_micros(game::IDLE_WAIT.0.unsigned_abs
 /// ([`game::InputPump::park`]).
 pub(crate) const MARKER_PARK: Duration = Duration::from_millis(1);
 
+/// How long an operation waits for the input thread's markers in all
+/// before the input thread counts as failed (design.md "Play Lifecycle",
+/// the start gate's open and close bound).
+const MARKER_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// The input thread as the adjustment driver needs it
 /// ([`game::InputPump`]): fences through its link, wakes, and the display
 /// offset the window steps.
 pub(crate) struct PlayerPump<'a> {
     pub(crate) input: &'a InputLink,
     pub(crate) tuning: &'a crate::tuning::LiveTuning,
+    /// When this pump's waits began: they end at [`MARKER_TIMEOUT`].
+    pub(crate) since: Option<std::time::Instant>,
 }
 
 impl game::InputPump for PlayerPump<'_> {
@@ -80,6 +87,10 @@ impl game::InputPump for PlayerPump<'_> {
         if let Some(e) = self.input.failure() {
             return Err(e);
         }
+        let since = *self.since.get_or_insert_with(std::time::Instant::now);
+        if since.elapsed() >= MARKER_TIMEOUT {
+            return Err(InputWaitError::Timeout);
+        }
         thread::park_timeout(MARKER_PARK);
         Ok(())
     }
@@ -95,7 +106,11 @@ pub(crate) fn serve_adjustments(
     tuning: &crate::tuning::LiveTuning,
 ) {
     if let Some(driver) = adjust {
-        driver.pump(&mut PlayerPump { input, tuning });
+        driver.pump(&mut PlayerPump {
+            input,
+            tuning,
+            since: None,
+        });
     }
 }
 
@@ -242,6 +257,9 @@ pub struct PlayerRig<'a> {
     /// The adjustments' driver (design.md "Play Adjustments"): the game
     /// thread's one writer of the presentation, installed with the gate.
     pub adjust: Option<game::AdjustDriver>,
+    /// The adjustments' first failed wait on the input thread: terminal,
+    /// nothing more is asked of the driver, and the run ends with it.
+    pub adjust_failed: Option<InputWaitError>,
 }
 
 impl PlayerRig<'_> {
@@ -289,11 +307,33 @@ impl PlayerRig<'_> {
         );
     }
 
+    /// The adjustments' wait on the input thread failed with `e`: the first
+    /// failure is kept, nothing more is asked of the driver, and the run
+    /// ends with it ([`Rig::input_failure`]).
+    pub(crate) fn adjustments_failed(&mut self, e: InputWaitError) {
+        log::warn!("the adjustments' wait on the input thread failed: {e}");
+        self.adjust_failed.get_or_insert(e);
+    }
+
+    /// The coming attempt's entry for the adjustments, at a loading
+    /// state's start ([`game::AdjustDriver::enter_attempt`]).
+    pub(crate) fn enter_attempt(&mut self) {
+        if let Some((driver, mut pump)) = self.adjustments()
+            && let Err(e) = driver.enter_attempt(None, &mut pump)
+        {
+            self.adjustments_failed(e);
+        }
+    }
+
     /// The driver and its pump, for a wait on the input thread.
     pub(crate) fn adjustments(&mut self) -> Option<(&mut game::AdjustDriver, PlayerPump<'_>)> {
+        if self.adjust_failed.is_some() {
+            return None;
+        }
         let pump = PlayerPump {
             input: &self.input,
             tuning: self.controls.tuning(),
+            since: None,
         };
         self.adjust.as_mut().map(|d| (d, pump))
     }
@@ -769,10 +809,17 @@ impl Rig for PlayerRig<'_> {
         if std::mem::take(&mut self.loading_script) {
             self.input.loading_script(self.clock.now());
         }
-        match self.adjustments() {
+        if let Some(e) = self.adjust_failed {
+            return Err(e);
+        }
+        let begun = match self.adjustments() {
             Some((driver, mut pump)) => driver.begin_presentation(loaded, &mut pump),
             None => Ok(None),
+        };
+        if let Err(e) = begun {
+            self.adjustments_failed(e);
         }
+        begun
     }
 
     fn end_presentation(&mut self) {
@@ -1094,7 +1141,7 @@ impl Rig for PlayerRig<'_> {
 
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn input_failure(&self) -> Option<InputWaitError> {
-        self.input.failure()
+        self.input.failure().or(self.adjust_failed)
     }
 
     fn before_play(&mut self, settings: &mut Settings) {

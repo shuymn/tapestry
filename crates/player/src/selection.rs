@@ -1497,13 +1497,9 @@ impl AppRig for PlayerRig<'_> {
     /// from the validated preset selection has chosen.
     fn entered_loading(&mut self, chart: &std::path::Path) {
         // The coming attempt's entry: its loading-time adjustments are its
-        // own, and solve nothing until its chart is read. A failed fence
-        // leaves the input thread's failure for the play to report.
-        if let Some((driver, mut pump)) = self.adjustments()
-            && let Err(e) = driver.enter_attempt(None, &mut pump)
-        {
-            log::warn!("the adjustments' fence failed: {e}");
-        }
+        // own, and solve nothing until its chart is read. A failed fence is
+        // the input thread's failure, which ends the run.
+        self.enter_attempt();
         let Some(sel) = &mut self.selection else {
             return;
         };
@@ -1545,11 +1541,10 @@ impl AppRig for PlayerRig<'_> {
         // to this attempt. A refusal is reported by the play's preparation
         // ([`game::Rig::begin_presentation`]), which attaches again: a
         // refused attach leaves nothing pending. Under review.
-        if let Some((driver, mut pump)) = self.adjustments() {
-            match driver.attach_loaded(loaded, &mut pump) {
-                Ok(_) => {}
-                Err(e) => log::warn!("the adjustments' fence failed: {e}"),
-            }
+        if let Some((driver, mut pump)) = self.adjustments()
+            && let Err(e) = driver.attach_loaded(loaded, &mut pump)
+        {
+            self.adjustments_failed(e);
         }
         // A practice's Start chooses again: its load times run from it.
         let now = self.clock.now();

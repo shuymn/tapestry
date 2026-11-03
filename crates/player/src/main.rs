@@ -835,6 +835,7 @@ fn rig<'a>(
         gain: audio::Gain::HEADROOM,
         gate: None,
         adjust: None,
+        adjust_failed: None,
     };
     install_adjustments(&mut rig, settings)
         .context("the adjustment controls cannot be installed")?;
@@ -1920,5 +1921,32 @@ mod tests {
             (first - before, unchanged - first, changed - unchanged)
         });
         assert_eq!(shown, (1, 0, 1));
+    }
+
+    /// A fence the input thread does not answer within its bound fails the
+    /// adjustments for good: the failure is the run's input failure, and
+    /// nothing more is asked of the driver, whatever the input thread does
+    /// after.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn a_failed_fence_while_loading_ends_the_run() {
+        use game::Rig as _;
+        let (failed, _) = on_rig(game::DeviceSettings::default(), |rig, _| {
+            // The input thread does not run: the entry's fence times out.
+            rig.enter_attempt();
+            let first = rig.input_failure();
+            let asked = rig.adjustments().is_some();
+            // A second entry asks nothing and keeps the first failure.
+            rig.enter_attempt();
+            (first, asked, rig.input_failure())
+        });
+        assert_eq!(
+            failed,
+            (
+                Some(game::InputWaitError::Timeout),
+                false,
+                Some(game::InputWaitError::Timeout)
+            )
+        );
     }
 }
