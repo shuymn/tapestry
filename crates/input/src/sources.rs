@@ -1327,10 +1327,9 @@ impl SourceSet {
     pub fn seal_recording(&mut self) {
         if let Some(rec) = &mut self.recording {
             rec.stage = Stage::Sealed;
-            if let Some(tap) = &self.adjust {
-                tap.gate().disarm();
-            }
         }
+        // Keeps the seal, and disarms the start gate.
+        self.hand_off();
     }
 
     /// Whether the open recording was sealed
