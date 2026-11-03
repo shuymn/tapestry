@@ -1755,3 +1755,162 @@ fn presentation_times_follow_the_process_clock_under_a_script() {
         rec.history
     );
 }
+
+/// A chart for the outcome mix at 120 BPM (a measure is 2 s): key 1, 2, 3
+/// and 4 in measure 1; the scratch and key 5's long note (1/4 to 3/4) in
+/// measure 2; key 6 and key 7 in measure 3.
+const MIX_CHART: &str = "#PLAYER 1\n#TITLE mix\n#BPM 120\n#WAV01 click.wav\n#LNTYPE 1\n\
+                         #00111:01000000\n#00112:00010000\n#00113:00000100\n#00114:00000001\n\
+                         #00216:01\n#00255:00010001\n#00318:01\n#00319:00000100\n";
+
+/// The winning capture re-evaluates equal to the live play, on the real
+/// threads (design.md "Play Lifecycle", the start gate; B9): a READY
+/// cancelled by START first, then the play with every outcome the
+/// evaluator has: PERFECT, a GREAT pressed early (counted FAST), a POOR
+/// miss, a long note judged at its release (the long notes judge their
+/// release, so a separate CN mode adds nothing here), an empty POOR and a
+/// scratch hit, with START, SELECT and the auxiliary keys pressed during
+/// it, which are recorded, and F2, which is not. The cancelled opening
+/// keeps START's press.
+#[test]
+fn the_winning_capture_reevaluates_equal_to_live() {
+    const Q: u32 = 0x10;
+    const W: u32 = 0x11;
+    const UP: u32 = 0xE048;
+    const KEY6: u32 = 0x21;
+    const KEY7: u32 = 0x2f;
+    const KEY2: u32 = 0x1f;
+    let fx = fixture_of(MIX_CHART);
+    let mut rec = replay::decode(&fs::read(&fx.log).unwrap(), &DecodeLimits::default()).unwrap();
+    let key = |ms: i64, control: u32, value: i32| eval::PhysicalInputEvent {
+        received: TimeUs(ms * 1_000),
+        source: eval::SourceId(0),
+        kind: eval::InputKind::Control {
+            control: eval::ControlId(control),
+            value,
+        },
+    };
+    let key7 = fx.chart.lanes[7][0].time.0 / 1_000;
+    let mut events: Vec<_> = rec
+        .events
+        .iter()
+        .filter(
+            |e| !matches!(e.kind, eval::InputKind::Control { control, .. } if control.0 == KEY6),
+        )
+        .map(|e| match e.kind {
+            // Key 2 pressed 40 ms early: a GREAT, counted FAST.
+            eval::InputKind::Control { control, value: 1 } if control.0 == KEY2 => {
+                eval::PhysicalInputEvent {
+                    received: TimeUs(e.received.0 - 40_000),
+                    ..*e
+                }
+            }
+            _ => *e,
+        })
+        .collect();
+    // An empty POOR on key 7 400 ms before its note; START, SELECT and the
+    // auxiliary key during the play.
+    events.extend([
+        key(key7 - 400, KEY7, 1),
+        key(key7 - 380, KEY7, 0),
+        key(2_500, W, 1),
+        key(2_520, UP, 1),
+        key(2_540, UP, 0),
+        key(2_560, W, 0),
+        key(3_300, Q, 1),
+        key(3_320, Q, 0),
+    ]);
+    events.sort_by_key(|e| e.received);
+    // START held before chart time 0 cancels the first READY; the play's
+    // input comes 1.2 s later.
+    let mut shifted = vec![key(-300, Q, 1), key(200, Q, 0)];
+    shifted.extend(events.iter().map(|e| eval::PhysicalInputEvent {
+        received: TimeUs(e.received.0 + 1_200_000),
+        ..*e
+    }));
+    rec.events = shifted;
+    rec.status.finalized = TimeUs(8_000_000);
+    fs::write(&fx.log, replay::encode(&rec)).unwrap();
+
+    let out = scripted_play(&fx.chart_path, &fx.log, &fx.appdata)
+        .args(["--dev-speed", "F2", "--dev-adjust-at", "1500"])
+        .output()
+        .expect("run tapestry");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stdout}{stderr}");
+    assert!(
+        stdout.contains("re-evaluation matches live: true"),
+        "{stdout}"
+    );
+    let saved = records(&fx.appdata);
+    assert_eq!(saved.len(), 1, "{saved:?}");
+    let rec = replay::decode(&fs::read(&saved[0]).unwrap(), &DecodeLimits::default()).unwrap();
+    // The cancelled opening holds START's press.
+    let h = &rec.history;
+    assert_eq!(h.openings.len(), 1, "{h:?}");
+    let o = &h.openings[0];
+    let cancelled = &h.events[o.events.start as usize..o.events.end as usize];
+    let has = |events: &[eval::PhysicalInputEvent], c: u32| {
+        events.iter().any(|e| {
+            e.kind
+                == eval::InputKind::Control {
+                    control: eval::ControlId(c),
+                    value: 1,
+                }
+        })
+    };
+    assert!(has(cancelled, Q));
+    // The winning opening records START, SELECT and the auxiliary key, and
+    // not F2.
+    for c in [Q, W, UP] {
+        assert!(has(&rec.events, c), "{c:#x}");
+    }
+    assert!(!has(&rec.events, 0x3C) && !has(&h.events, 0x3C));
+    // Every outcome, re-evaluated from the record.
+    let judged = judged(&fx.chart, &rec);
+    let count = |j: Judgment| {
+        judged
+            .iter()
+            .filter(|e| matches!(e.kind, JudgeEventKind::Judged { judgment, .. } if judgment == j))
+            .count()
+    };
+    assert!(count(Judgment::Perfect) >= 1, "{judged:?}");
+    assert_eq!(count(Judgment::Great), 1, "{judged:?}");
+    assert_eq!(count(Judgment::Poor), 1, "{judged:?}");
+    let fast = judged.iter().any(|e| {
+        matches!(e.kind, JudgeEventKind::Judged { judgment: Judgment::Great, deviation: Some(d), .. } if d.0 < 0)
+    });
+    assert!(fast, "{judged:?}");
+    let released = judged.iter().any(|e| {
+        matches!(e.kind, JudgeEventKind::Judged { lane, release: Some(_), .. } if lane.index() == 5)
+    });
+    assert!(released, "{judged:?}");
+    let scratch = judged.iter().any(|e| {
+        matches!(e.kind, JudgeEventKind::Judged { lane, judgment: Judgment::Perfect, .. } if lane.index() == 0)
+    });
+    assert!(scratch, "{judged:?}");
+    let all = all_events(&fx.chart, &rec);
+    assert!(
+        all.iter()
+            .any(|e| matches!(e.kind, JudgeEventKind::EmptyPoor { .. })),
+        "{all:?}"
+    );
+}
+
+/// Every event a record re-evaluates to.
+fn all_events(chart: &bms_model::Chart, rec: &PlayRecord) -> Vec<eval::JudgeEvent> {
+    eval::evaluate(
+        chart,
+        &EvalInput {
+            events: rec.events.clone(),
+            device: rec.devices.profile(),
+            start: rec.start.clone(),
+            finalized: Some(rec.status.finalized),
+            section: None,
+        },
+        &rules::RulePreset::from_canonical_bytes(&rec.preset.canonical_bytes).unwrap(),
+    )
+    .unwrap()
+    .events
+}
