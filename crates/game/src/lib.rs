@@ -124,7 +124,7 @@ pub use session::{
     AutoKeySounds, ChartSource, ClosingReport, Command, GateStorage, Loaded, MenuCommand, Parts,
     PlayEnd, PlayOutcome, PlayPlan, PlayReport, PlayScript, PlayStart, RECORDING_MEMORY,
     Reservation, SMALL_PARTS_BYTES, SYSTEM_CONTROL_INPUTS, Session, SessionConfig, SessionError,
-    SessionPlayError, Settings, VIEW_NOTE_COPIES, wake_policy,
+    SessionPlayError, Settings, VIEW_NOTE_COPIES, resolve_displayed, wake_policy,
 };
 pub use settings::{
     ControllerDevice, CoverSettings, DEVICE_SETTINGS_VERSION, DataRoot, DeviceSettings,

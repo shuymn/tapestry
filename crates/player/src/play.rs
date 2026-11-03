@@ -602,6 +602,22 @@ pub(crate) fn refresh_loading_gauge(
     }
 }
 
+/// The loading gauge descriptor of the gauge the settings show,
+/// `gauge`, in `preset`, before an attempt resolves it: resolved as the
+/// attempt will be ([`game::resolve_displayed`], through the player's
+/// policy), so a gauge the preset does not have shows its first from the
+/// lifetime's first frame.
+pub(crate) fn loading_gauge(
+    preset: &rules::RulePreset,
+    gauge: usize,
+) -> Option<skin_model::LoadingGauge> {
+    let policy = game::DefaultPolicy {
+        displayed: gauge,
+        on_failure: game::FailureAction::default(),
+    };
+    shown_gauge(preset, game::resolve_displayed(&policy, preset).0)
+}
+
 /// A round's restore at chart time `at`, its lead-in's start, planned on
 /// the line the audio thread last published for a play whose chart time 0
 /// lies at `origin`, the opening's: `at` is then `RESTORE_AHEAD` in the
@@ -1344,7 +1360,21 @@ mod closing_tests {
     use bms_model::TimeUs;
     use game::{AbortCause, ClosingEnd, ClosingReport};
 
-    use super::closing_line;
+    use super::{closing_line, loading_gauge};
+    use crate::loading_state::shown_gauge;
+
+    /// The select screen's loading gauge resolves the settings' gauge as
+    /// the attempt does: one the preset has as itself, one it lacks as its
+    /// first.
+    #[test]
+    fn the_loading_gauge_resolves_as_the_attempt_does() {
+        let preset = rules::beatoraja_style();
+        assert!(shown_gauge(&preset, 3).is_some());
+        assert_eq!(loading_gauge(&preset, 3), shown_gauge(&preset, 3));
+        assert_eq!(shown_gauge(&preset, 99), None);
+        assert!(shown_gauge(&preset, 0).is_some());
+        assert_eq!(loading_gauge(&preset, 99), shown_gauge(&preset, 0));
+    }
 
     /// The Closing line gives its start, its length and its end.
     #[test]

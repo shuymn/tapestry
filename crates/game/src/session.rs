@@ -1594,8 +1594,11 @@ impl Loaded {
 }
 
 /// The gauge `policy` shows for an attempt under `preset`, from the
-/// gauges' starting states.
-fn resolve_displayed(policy: &dyn SessionPolicy, preset: &RulePreset) -> GaugeIndex {
+/// gauges' starting states: how [`Loaded::displayed`] resolves it, and how
+/// a screen shown before the attempt exists (the select screen's loading
+/// gauge) resolves it too.
+#[must_use]
+pub fn resolve_displayed(policy: &dyn SessionPolicy, preset: &RulePreset) -> GaugeIndex {
     let states: Vec<GaugeState> = preset
         .gauges
         .iter()

@@ -34,7 +34,7 @@ use game::{
 #[cfg(feature = "dev-tools")]
 use crate::controls::Controls;
 use crate::end_screen::{LoadTimes, preset_error_text, shelf_error_text, view_log};
-use crate::loading_state::{LoadInput, shown_gauge};
+use crate::loading_state::LoadInput;
 use crate::loading_text::{ChosenChart, LoadingText, Stage};
 use crate::log_file;
 use crate::play::{PlayerRig, since};
@@ -1538,7 +1538,7 @@ impl AppRig for PlayerRig<'_> {
         let gauge = sel
             .screen
             .bests_preset()
-            .and_then(|p| shown_gauge(p, self.gauge));
+            .and_then(|p| crate::play::loading_gauge(p, self.gauge));
         self.render.begin_loading(&page, gauge);
         show_stage(&self.render, Some(&page), Stage::Chart);
         sel.loading = Some(page);
