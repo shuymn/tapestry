@@ -20,10 +20,12 @@
 //! and has exactly the form of [`UNIT_COMMAND`], followed by libtest's
 //! substring filters and only `--exact` and `--skip`; it selects a test by
 //! its path (`module::tests::name`) as libtest does. Any other command
-//! naming the package, and any guard the files cannot place for certain (a
-//! `cfg` other than `test` or the feature, `#[ignore]`, a module's `#[path]`,
-//! `include!` anywhere under `src`), is an error rather than read as cargo
-//! or libtest might.
+//! naming the package is an error rather than read as cargo or libtest
+//! might. The tests are found by walking the binary's modules from its root
+//! as the compiler does, and a guard the walk cannot place for certain (an
+//! attribute that may gate it out of the release build anywhere above it,
+//! `#[ignore]`, `include!`, a `#[path]` it cannot follow exactly) is an
+//! error ([`unit_tests`]).
 //!
 //! The check catches omissions, not adversarial edits: a step a condition
 //! disables (`if: false`) still counts.
@@ -166,12 +168,21 @@ pub fn run(manifest: &Path) -> anyhow::Result<Vec<String>> {
                     bin.name
                 );
             }
-            let src = bin
+            let root_file = bin
                 .src_path
                 .as_std_path()
-                .parent()
-                .context("a binary's source has a directory")?;
-            Some(unit_tests(root, src)?)
+                .strip_prefix(root)
+                .context("the binary's source is in the workspace")?
+                .to_string_lossy()
+                .replace('\\', "/");
+            let read = |path: &str| -> anyhow::Result<Option<String>> {
+                match std::fs::read_to_string(root.join(path)) {
+                    Ok(text) => Ok(Some(text)),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                    Err(e) => Err(e).with_context(|| format!("cannot read {path}")),
+                }
+            };
+            Some(unit_tests(&root_file, &read)?)
         }
         None => None,
     };
@@ -181,87 +192,52 @@ pub fn run(manifest: &Path) -> anyhow::Result<Vec<String>> {
     check(&guards, unit.as_deref(), &workflow)
 }
 
-/// The unit tests of the crate whose root directory is `src`, read from
-/// every `.rs` file under it, its files' paths relative to `root`.
-fn unit_tests(root: &Path, src: &Path) -> anyhow::Result<Vec<UnitTest>> {
-    fn walk(dir: &Path, out: &mut Vec<std::path::PathBuf>) -> anyhow::Result<()> {
-        for entry in
-            std::fs::read_dir(dir).with_context(|| format!("cannot read {}", dir.display()))?
-        {
-            let path = entry?.path();
-            if path.is_dir() {
-                walk(&path, out)?;
-            } else if path.extension().is_some_and(|e| e == "rs") {
-                out.push(path);
-            }
-        }
-        Ok(())
-    }
-    let mut paths = Vec::new();
-    walk(src, &mut paths)?;
-    paths.sort();
-    let mut files = Vec::new();
-    for path in paths {
-        let relative = path.strip_prefix(src).unwrap_or(&path);
-        let module = module_path(&relative.to_string_lossy().replace('\\', "/"));
-        let file = path
-            .strip_prefix(root)
-            .unwrap_or(&path)
-            .to_string_lossy()
-            .replace('\\', "/");
-        let text = std::fs::read_to_string(&path)
-            .with_context(|| format!("cannot read {}", path.display()))?;
-        files.push((module, file, text));
-    }
-    let files: Vec<(&str, &str, &str)> = files
-        .iter()
-        .map(|(m, f, t)| (m.as_str(), f.as_str(), t.as_str()))
-        .collect();
-    // A `#[path]` is relative to the declaring file's directory.
-    let resolve = |declaring: &str, path: &str| -> anyhow::Result<(String, String)> {
-        let mut target = std::path::PathBuf::new();
-        let base = root.join(declaring);
-        for c in base.parent().unwrap_or(root).join(path).components() {
-            match c {
-                std::path::Component::ParentDir => {
-                    target.pop();
-                }
-                std::path::Component::CurDir => {}
-                c => target.push(c),
-            }
-        }
-        let text = std::fs::read_to_string(&target)
-            .with_context(|| format!("cannot read {}", target.display()))?;
-        let shown = target
-            .strip_prefix(root)
-            .unwrap_or(&target)
-            .to_string_lossy()
-            .replace('\\', "/");
-        Ok((shown, text))
+/// Reads a file by its path relative to the workspace root, `/`-separated:
+/// `None` when there is no such file.
+type Read<'a> = &'a dyn Fn(&str) -> anyhow::Result<Option<String>>;
+
+/// The unit tests of the crate whose root file is `root_file` (relative to
+/// the workspace root), found by walking its modules from the root as the
+/// compiler does: `mod x;` is `x.rs` or `x/mod.rs` in the declaring
+/// module's directory, and a file-level `#[path]` is relative to the
+/// declaring file's directory.
+///
+/// An attribute can gate a guard in four places: the test function, each
+/// enclosing inline module, each `mod x;` line (a `#[path]` one included),
+/// and each file's inner attributes, along the whole chain from the root.
+/// A `cfg` other than [`UNIT_CFGS`], or any `cfg_attr`, at any of them
+/// restricts everything beneath it, across files, and a restricted guard is
+/// an error, as are an ignored guard, `include!` in a walked file, a
+/// `#[path]` inside an inline module or not a string, a `mod x;` in a file
+/// reached by `#[path]`, and an unrestricted `mod x;` with no file.
+fn unit_tests(root_file: &str, read: Read) -> anyhow::Result<Vec<UnitTest>> {
+    let text = read(root_file)?.with_context(|| format!("cannot read {root_file}"))?;
+    let mut walk = Walk {
+        read,
+        out: Vec::new(),
     };
-    crate_tests(&files, &resolve)
+    walk.file(root_file, &text, "", &parent(root_file), false, None)?;
+    Ok(walk.out)
 }
 
-/// Reads the file a `#[path]` names, from the declaring file and the path:
-/// its path to show, and its text.
-type Resolve<'a> = &'a dyn Fn(&str, &str) -> anyhow::Result<(String, String)>;
+struct Walk<'a> {
+    read: Read<'a>,
+    out: Vec<UnitTest>,
+}
 
-/// The unit tests of a crate's files, each `(module path, file, text)`,
-/// with the files their `#[path]` modules name, which `resolve` reads from
-/// the declaring file and the path: a module declared under a `cfg` other
-/// than [`UNIT_CFGS`] (on its `mod` line, or inside its file) carries it to
-/// every test in it. `include!`, a `#[path]` inside an inline module, and a
-/// `mod x;` in a file reached by `#[path]` are errors.
-fn crate_tests(files: &[(&str, &str, &str)], resolve: Resolve) -> anyhow::Result<Vec<UnitTest>> {
-    // Each file with its module and whether a `#[path]` reached it.
-    let mut queue: Vec<(String, String, String, bool)> = files
-        .iter()
-        .map(|&(m, f, t)| (m.to_owned(), f.to_owned(), t.to_owned(), false))
-        .collect();
-    let mut parsed = Vec::new();
-    // Modules whose declaration carries another `cfg`, with it.
-    let mut declared: Vec<(String, String)> = Vec::new();
-    while let Some((module, file, text, followed)) = queue.pop() {
+impl Walk<'_> {
+    /// File `file` of module `module`, holding `text`, whose `mod x;` files
+    /// lie in `dir`; `followed` when a `#[path]` reached it, `restricted`
+    /// the gate above it.
+    fn file(
+        &mut self,
+        file: &str,
+        text: &str,
+        module: &str,
+        dir: &str,
+        followed: bool,
+        restricted: Option<String>,
+    ) -> anyhow::Result<()> {
         if has_macro(
             &text.parse().map_err(|e| anyhow::anyhow!("{file}: {e}"))?,
             "include",
@@ -271,67 +247,94 @@ fn crate_tests(files: &[(&str, &str, &str)], resolve: Resolve) -> anyhow::Result
                  could run unseen"
             );
         }
-        let syntax = syn::parse_file(&text).with_context(|| format!("parsing {file}"))?;
-        let mut paths = Vec::new();
-        declarations(
+        let syntax = syn::parse_file(text).with_context(|| format!("parsing {file}"))?;
+        let restricted = restricted.or_else(|| gate(&syntax.attrs));
+        self.items(
             &syntax.items,
-            &module,
-            &file,
+            file,
+            module,
+            dir,
             true,
-            &mut declared,
-            &mut paths,
-        )?;
-        for (child, path) in paths {
-            if followed {
-                bail!("{file}: module `{child}` is declared in a file reached by `#[path]`");
-            }
-            if let Some(path) = path {
-                let (target, text) = resolve(&file, &path)?;
-                queue.push((child, target, text, true));
-            }
-        }
-        parsed.push((module, file, syntax));
+            followed,
+            restricted.as_deref(),
+        )
     }
-    parsed.sort_by(|a, b| a.1.cmp(&b.1));
-    let mut out = Vec::new();
-    for (module, file, syntax) in &parsed {
-        let inherited = declared
-            .iter()
-            .find(|(m, _)| module == m || module.starts_with(&format!("{m}::")))
-            .map(|(_, cfg)| cfg.clone())
-            .or_else(|| other_cfg(&syntax.attrs));
-        collect(&syntax.items, module, file, inherited.as_deref(), &mut out)?;
-    }
-    Ok(out)
-}
 
-/// The `mod` declarations (`mod x;`) under `items`, in module `module`:
-/// each with its `#[path]`, if any, into `paths` (a `#[path]` inside an
-/// inline module, `top` false, is an error), and those that carry a `cfg`
-/// other than [`UNIT_CFGS`] with it into `cfgs`.
-fn declarations(
-    items: &[syn::Item],
-    module: &str,
-    file: &str,
-    top: bool,
-    cfgs: &mut Vec<(String, String)>,
-    paths: &mut Vec<(String, Option<String>)>,
-) -> anyhow::Result<()> {
-    for item in items {
-        if let syn::Item::Mod(m) = item {
-            let child = join(module, &m.ident.to_string());
-            let path = m.attrs.iter().find(|a| a.path().is_ident("path"));
-            match &m.content {
-                Some((_, inner)) => {
-                    if path.is_some() {
+    /// The items of module `module` in `file` (`top` when they are the
+    /// file's own, not an inline module's), its `mod x;` files in `dir`.
+    #[expect(clippy::too_many_arguments, reason = "the walk's state, passed down")]
+    fn items(
+        &mut self,
+        items: &[syn::Item],
+        file: &str,
+        module: &str,
+        dir: &str,
+        top: bool,
+        followed: bool,
+        restricted: Option<&str>,
+    ) -> anyhow::Result<()> {
+        for item in items {
+            match item {
+                syn::Item::Fn(f) if f.attrs.iter().any(|a| a.path().is_ident("test")) => {
+                    let name = f.sig.ident.to_string();
+                    let path = join(module, &name);
+                    let counts = has_ident(&f.block.to_token_stream(), COUNTER);
+                    if counts || is_guard(&name) {
+                        let gated = restricted.map(str::to_owned).or_else(|| gate(&f.attrs));
+                        if let Some(gated) = gated {
+                            bail!(
+                                "allocation guard `{path}` ({file}) is under `{gated}`, which \
+                                 the release command may not build: only `cfg(test)` and \
+                                 `cfg(feature = \"{UNIT_FEATURE}\")` are allowed, and no \
+                                 `cfg_attr`"
+                            );
+                        }
+                        if f.attrs.iter().any(|a| a.path().is_ident("ignore")) {
+                            bail!(
+                                "allocation guard `{path}` ({file}) has `#[ignore]`, so the \
+                                 release command does not run it"
+                            );
+                        }
+                    }
+                    self.out.push(UnitTest {
+                        path,
+                        file: file.to_owned(),
+                        counts,
+                    });
+                }
+                syn::Item::Mod(m) => {
+                    let name = m.ident.to_string();
+                    let child = join(module, &name);
+                    let child_dir = under(dir, &name);
+                    let gated = restricted.map(str::to_owned).or_else(|| gate(&m.attrs));
+                    let path = m.attrs.iter().find(|a| a.path().is_ident("path"));
+                    let not_followed = || {
+                        anyhow::anyhow!(
+                            "{file}: module `{child}` has a `#[path]`, which this check does \
+                             not follow"
+                        )
+                    };
+                    if let Some((_, inner)) = &m.content {
+                        if path.is_some() {
+                            return Err(not_followed());
+                        }
+                        self.items(
+                            inner,
+                            file,
+                            &child,
+                            &child_dir,
+                            false,
+                            followed,
+                            gated.as_deref(),
+                        )?;
+                        continue;
+                    }
+                    if followed {
                         bail!(
-                            "{file}: module `{child}` has a `#[path]`, which this check does not follow"
+                            "{file}: module `{child}` is declared in a file reached by `#[path]`"
                         );
                     }
-                    declarations(inner, &child, file, false, cfgs, paths)?;
-                }
-                None => {
-                    let path = match path.map(|a| &a.meta) {
+                    let target = match path.map(|a| &a.meta) {
                         Some(syn::Meta::NameValue(syn::MetaNameValue {
                             value:
                                 syn::Expr::Lit(syn::ExprLit {
@@ -339,78 +342,66 @@ fn declarations(
                                     ..
                                 }),
                             ..
-                        })) if top => Some(s.value()),
-                        Some(_) => bail!(
-                            "{file}: module `{child}` has a `#[path]`, which this check does not follow"
-                        ),
-                        None => None,
+                        })) if top => {
+                            let target = normalize(&under(&parent(file), &s.value()));
+                            let text = (self.read)(&target)?
+                                .with_context(|| format!("cannot read {target}"))?;
+                            Some((target, text, true))
+                        }
+                        Some(_) => return Err(not_followed()),
+                        None => {
+                            let own = under(dir, &format!("{name}.rs"));
+                            let nested = under(&child_dir, "mod.rs");
+                            match ((self.read)(&own)?, (self.read)(&nested)?) {
+                                (Some(text), None) => Some((own, text, false)),
+                                (None, Some(text)) => Some((nested, text, false)),
+                                (None, None) if gated.is_some() => None,
+                                _ => bail!(
+                                    "{file}: module `{child}` has no single file ({own} or \
+                                     {nested})"
+                                ),
+                            }
+                        }
                     };
-                    if let Some(cfg) = other_cfg(&m.attrs) {
-                        cfgs.push((child.clone(), cfg));
+                    if let Some((target, text, by_path)) = target {
+                        self.file(&target, &text, &child, &child_dir, by_path, gated)?;
                     }
-                    paths.push((child, path));
                 }
+                _ => {}
             }
         }
+        Ok(())
     }
-    Ok(())
 }
 
-/// The `#[test]` functions under `items`, in module `module`, inside a
-/// `cfg` other than [`UNIT_CFGS`] when `outer` is one.
-fn collect(
-    items: &[syn::Item],
-    module: &str,
-    file: &str,
-    outer: Option<&str>,
-    out: &mut Vec<UnitTest>,
-) -> anyhow::Result<()> {
-    for item in items {
-        match item {
-            syn::Item::Fn(f) if f.attrs.iter().any(|a| a.path().is_ident("test")) => {
-                let path = join(module, &f.sig.ident.to_string());
-                let counts = has_ident(&f.block.to_token_stream(), COUNTER);
-                if counts || is_guard(&f.sig.ident.to_string()) {
-                    let cfg = outer.map(str::to_owned).or_else(|| other_cfg(&f.attrs));
-                    if let Some(cfg) = cfg {
-                        bail!(
-                            "allocation guard `{path}` ({file}) is under `{cfg}`, which the \
-                             release command may not build: only `cfg(test)` and \
-                             `cfg(feature = \"{UNIT_FEATURE}\")` are allowed"
-                        );
-                    }
-                    if f.attrs
-                        .iter()
-                        .any(|a| a.path().is_ident("ignore") || a.path().is_ident("cfg_attr"))
-                    {
-                        bail!(
-                            "allocation guard `{path}` ({file}) has `#[ignore]` or `#[cfg_attr]`, \
-                             so the release command may not run it"
-                        );
-                    }
-                }
-                out.push(UnitTest {
-                    path,
-                    file: file.to_owned(),
-                    counts,
-                });
+/// `path`'s directory, `/`-separated.
+fn parent(path: &str) -> String {
+    path.rsplit_once('/')
+        .map_or_else(String::new, |(dir, _)| dir.to_owned())
+}
+
+/// `name` in directory `dir`.
+fn under(dir: &str, name: &str) -> String {
+    if dir.is_empty() {
+        name.to_owned()
+    } else {
+        format!("{dir}/{name}")
+    }
+}
+
+/// `path` with its `.` and `..` components resolved.
+fn normalize(path: &str) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "." | "" => {}
+            ".." => {
+                parts.pop();
             }
-            syn::Item::Mod(m) => {
-                if let Some((_, inner)) = &m.content {
-                    let cfg = outer.map(str::to_owned).or_else(|| other_cfg(&m.attrs));
-                    collect(
-                        inner,
-                        &join(module, &m.ident.to_string()),
-                        file,
-                        cfg.as_deref(),
-                        out,
-                    )?;
-                }
-            }
-            _ => {}
+            part => parts.push(part),
         }
     }
-    Ok(())
+    parts.join("/")
 }
 
 fn join(module: &str, name: &str) -> String {
@@ -421,13 +412,17 @@ fn join(module: &str, name: &str) -> String {
     }
 }
 
-/// The first `cfg` of `attrs` (outer or inner) other than [`UNIT_CFGS`],
-/// as written.
-fn other_cfg(attrs: &[syn::Attribute]) -> Option<String> {
+/// The first attribute of `attrs` (outer or inner) that may gate what it
+/// covers out of the release command: a `cfg` other than [`UNIT_CFGS`], or
+/// any `cfg_attr`, as written.
+fn gate(attrs: &[syn::Attribute]) -> Option<String> {
     attrs.iter().find_map(|a| {
         let syn::Meta::List(list) = &a.meta else {
             return None;
         };
+        if a.path().is_ident("cfg_attr") {
+            return Some(format!("cfg_attr({})", list.tokens));
+        }
         if !a.path().is_ident("cfg") {
             return None;
         }
@@ -461,19 +456,6 @@ fn has_macro(tokens: &proc_macro2::TokenStream, name: &str) -> bool {
         proc_macro2::TokenTree::Group(g) => has_macro(&g.stream(), name),
         _ => false,
     })
-}
-
-/// The module path of a crate's file from its path under `src`: the root
-/// (`main.rs`, `lib.rs`) is empty, and `x/mod.rs` is `x`.
-fn module_path(relative: &str) -> String {
-    let stem = relative.strip_suffix(".rs").unwrap_or(relative);
-    let parts: Vec<&str> = stem.split('/').collect();
-    let parts = match parts.as_slice() {
-        ["main" | "lib"] => &[][..],
-        [rest @ .., "mod"] => rest,
-        all => all,
-    };
-    parts.join("::")
 }
 
 /// Whether an integration test is an allocation guard by its name.
@@ -1079,38 +1061,39 @@ jobs:
         );
     }
 
-    #[test]
-    fn module_paths_follow_the_files() {
-        assert_eq!(module_path("main.rs"), "");
-        assert_eq!(module_path("input_side.rs"), "input_side");
-        assert_eq!(module_path("dev/scenario.rs"), "dev::scenario");
-        assert_eq!(module_path("render_side/mod.rs"), "render_side");
-    }
-
-    /// Reads a `#[path]` module's file from fixtures, by its path.
-    fn elsewhere(declaring: &str, path: &str) -> anyhow::Result<(String, String)> {
-        let text = match path {
-            "../shared/guard.rs" => "#[test]\nfn shared_alloc() {}\n",
-            "../shared/nested.rs" => "mod deeper;\n",
-            _ => bail!("{declaring}: no {path}"),
+    /// The crate of `files`, rooted at `src/main.rs`.
+    fn walk(files: &[(&str, &str)]) -> anyhow::Result<Vec<UnitTest>> {
+        let read = |path: &str| -> anyhow::Result<Option<String>> {
+            Ok(files
+                .iter()
+                .find(|(p, _)| *p == path)
+                .map(|(_, t)| (*t).to_owned()))
         };
-        Ok((path.trim_start_matches("../").to_owned(), text.to_owned()))
+        unit_tests("src/main.rs", &read)
     }
 
-    fn found(files: &[(&str, &str, &str)]) -> Vec<(String, bool)> {
-        crate_tests(files, &elsewhere)
+    fn found(files: &[(&str, &str)]) -> Vec<(String, String, bool)> {
+        walk(files)
             .unwrap()
             .into_iter()
-            .map(|t| (t.path, t.counts))
+            .map(|t| (t.path, t.file, t.counts))
             .collect()
     }
 
-    /// Unit tests are found in inline modules with their paths; a test is
-    /// told to count by the counter's identifier in its body, not by a
-    /// string, and a helper reading it is not a test.
+    /// A gating fixture: what it gates, the files past the root, and the
+    /// error expected.
+    type Row<'a> = (&'a str, Vec<(&'a str, String)>, String);
+
+    const GUARD_FN: &str = "#[test]\nfn a_alloc() {}\n";
+
+    /// Modules are walked from the root through their files, inline ones
+    /// included, with each test's path; a test counts by the counter's
+    /// identifier in its body, not a string, and a helper is not a test;
+    /// `cfg(test)` and the feature restrict nothing, anywhere.
     #[test]
-    fn unit_tests_are_found_with_their_paths_and_whether_they_count() {
-        let text = "\
+    fn unit_tests_are_found_through_the_module_tree() {
+        let m = "\
+#![cfg(feature = \"dev-tools\")]
 fn helper() { let _ = crate::alloc_count::this_thread(); }
 #[test]
 fn top() { let _ = \"alloc_count\"; }
@@ -1122,93 +1105,221 @@ mod tests {
         use crate::alloc_count::this_thread;
         assert_eq!(this_thread(), 0);
     }
-    mod inner {
-        #[test]
-        fn plain() {}
-    }
+    mod inner;
 }
 ";
-        let file = "crates/player/src/measure.rs";
-        assert_eq!(
-            found(&[("measure", file, text)]),
-            [
-                ("measure::top".to_owned(), false),
-                ("measure::tests::counted_alloc".to_owned(), true),
-                ("measure::tests::inner::plain".to_owned(), false),
-            ]
-        );
+        let found = found(&[
+            (
+                "src/main.rs",
+                "#[cfg(test)]\nmod m;\nmod d;\nmod unused {}\n",
+            ),
+            ("src/m.rs", m),
+            ("src/m/tests/inner.rs", GUARD_FN),
+            ("src/d/mod.rs", "#[cfg(feature = \"dev-tools\")]\nmod e;\n"),
+            ("src/d/e.rs", GUARD_FN),
+            ("src/orphan.rs", "#[cfg(unix)]\n#[test]\nfn b_alloc() {}\n"),
+        ]);
+        let expected = [
+            ("m::top", "src/m.rs", false),
+            ("m::tests::counted_alloc", "src/m.rs", true),
+            ("m::tests::inner::a_alloc", "src/m/tests/inner.rs", false),
+            ("d::e::a_alloc", "src/d/e.rs", false),
+        ]
+        .map(|(p, f, c)| (p.to_owned(), f.to_owned(), c));
+        assert_eq!(found, expected);
     }
 
-    /// A guard the files cannot place for certain is an error: under
-    /// another `cfg` on itself, its inline module, its file or its `mod`
-    /// line; ignored; in a module with `#[path]`; or with `include!`
-    /// anywhere in the crate. Tests that are not guards may carry any.
+    /// One fixture per place an attribute can gate a guard, with a `cfg`
+    /// and with a `cfg_attr`, crossing a file boundary where the place
+    /// allows it; then the other refusals. Each row is the crate's files
+    /// past the root and the error expected. Every mismatch is listed.
     #[test]
-    fn a_guard_the_files_cannot_place_is_an_error() {
-        let guard = "#[test]\nfn a_alloc() {}\n";
-        let error =
-            |files: &[(&str, &str, &str)]| crate_tests(files, &elsewhere).unwrap_err().to_string();
-        let under = |path: &str, cfg: &str| {
-            format!(
-                "allocation guard `{path}` (m.rs) is under `{cfg}`, which the release \
-                 command may not build: only `cfg(test)` and `cfg(feature = \"dev-tools\")` \
-                 are allowed"
-            )
-        };
-        let cfg = |cfg: &str| under("m::a_alloc", cfg);
-        let own = format!("#[cfg(not(windows))]\n{guard}");
-        assert_eq!(error(&[("m", "m.rs", &own)]), cfg("cfg(not (windows))"));
-        let inline = format!("#[cfg(debug_assertions)]\nmod t {{\n{guard}}}\n");
-        assert_eq!(
-            error(&[("m", "m.rs", &inline)]),
-            under("m::t::a_alloc", "cfg(debug_assertions)")
-        );
-        let inner = format!("#![cfg(unix)]\n{guard}");
-        assert_eq!(error(&[("m", "m.rs", &inner)]), cfg("cfg(unix)"));
-        let declared = [
-            ("", "main.rs", "#[cfg(feature = \"other\")]\nmod m;\n"),
-            ("m", "m.rs", guard),
+    fn every_place_that_can_gate_a_guard_is_checked() {
+        let child = "mod c;\n";
+        let off = "cfg_attr(not(debug_assertions), cfg(any()))";
+        let rows: Vec<Row> = vec![
+            (
+                "the test function's cfg",
+                vec![
+                    ("src/main.rs", "mod m;".into()),
+                    ("src/m.rs", format!("#[cfg(unix)]\n{GUARD_FN}")),
+                ],
+                "is under `cfg(unix)`".into(),
+            ),
+            (
+                "the test function's cfg_attr",
+                vec![
+                    ("src/main.rs", "mod m;".into()),
+                    ("src/m.rs", format!("#[{off}]\n{GUARD_FN}")),
+                ],
+                "is under `cfg_attr(".into(),
+            ),
+            (
+                "an inline module's cfg, in its file",
+                vec![
+                    ("src/main.rs", "mod m;".into()),
+                    (
+                        "src/m.rs",
+                        format!("#[cfg(unix)]\nmod t {{\n{GUARD_FN}}}\n"),
+                    ),
+                ],
+                "is under `cfg(unix)`".into(),
+            ),
+            (
+                "an inline module's cfg, across a file",
+                vec![
+                    ("src/main.rs", "mod m;".into()),
+                    (
+                        "src/m.rs",
+                        "#[cfg(debug_assertions)]\nmod tests { mod c; }\n".into(),
+                    ),
+                    ("src/m/tests/c.rs", GUARD_FN.into()),
+                ],
+                "is under `cfg(debug_assertions)`".into(),
+            ),
+            (
+                "an inline module's cfg_attr, across a file",
+                vec![
+                    ("src/main.rs", "mod m;".into()),
+                    ("src/m.rs", format!("#[{off}]\nmod tests {{ mod c; }}\n")),
+                    ("src/m/tests/c.rs", GUARD_FN.into()),
+                ],
+                "is under `cfg_attr(".into(),
+            ),
+            (
+                "a mod line's cfg",
+                vec![
+                    ("src/main.rs", "#[cfg(unix)]\nmod m;".into()),
+                    ("src/m.rs", GUARD_FN.into()),
+                ],
+                "is under `cfg(unix)`".into(),
+            ),
+            (
+                "a mod line's cfg_attr",
+                vec![
+                    ("src/main.rs", format!("#[{off}]\nmod m;")),
+                    ("src/m.rs", GUARD_FN.into()),
+                ],
+                "is under `cfg_attr(".into(),
+            ),
+            (
+                "a mod line's cfg inside an inline module",
+                vec![
+                    ("src/main.rs", "mod t {\n#[cfg(unix)]\nmod m;\n}\n".into()),
+                    ("src/t/m.rs", GUARD_FN.into()),
+                ],
+                "is under `cfg(unix)`".into(),
+            ),
+            (
+                "a #[path] mod line's cfg",
+                vec![
+                    (
+                        "src/main.rs",
+                        "#[cfg(unix)]\n#[path = \"../shared/g.rs\"]\nmod s;".into(),
+                    ),
+                    ("shared/g.rs", GUARD_FN.into()),
+                ],
+                "is under `cfg(unix)`".into(),
+            ),
+            (
+                "a #[path] mod line's cfg_attr",
+                vec![
+                    (
+                        "src/main.rs",
+                        format!("#[{off}]\n#[path = \"../shared/g.rs\"]\nmod s;"),
+                    ),
+                    ("shared/g.rs", GUARD_FN.into()),
+                ],
+                "is under `cfg_attr(".into(),
+            ),
+            (
+                "a file's inner cfg, across a file",
+                vec![
+                    ("src/main.rs", "mod m;".into()),
+                    ("src/m.rs", format!("#![cfg(unix)]\n{child}")),
+                    ("src/m/c.rs", GUARD_FN.into()),
+                ],
+                "is under `cfg(unix)`".into(),
+            ),
+            (
+                "a file's inner cfg_attr, across a file",
+                vec![
+                    ("src/main.rs", "mod m;".into()),
+                    ("src/m.rs", format!("#![{off}]\n{child}")),
+                    ("src/m/c.rs", GUARD_FN.into()),
+                ],
+                "is under `cfg_attr(".into(),
+            ),
+            (
+                "the root's inner cfg",
+                vec![
+                    ("src/main.rs", "#![cfg(unix)]\nmod m;".into()),
+                    ("src/m.rs", GUARD_FN.into()),
+                ],
+                "is under `cfg(unix)`".into(),
+            ),
+            (
+                "an ignored guard",
+                vec![
+                    ("src/main.rs", "mod m;".into()),
+                    ("src/m.rs", format!("#[ignore]\n{GUARD_FN}")),
+                ],
+                "has `#[ignore]`".into(),
+            ),
+            (
+                "a #[path] that is not a string",
+                vec![(
+                    "src/main.rs",
+                    "#[path = concat!(\"m\", \".rs\")]\nmod m;".into(),
+                )],
+                "has a `#[path]`, which this check does not follow".into(),
+            ),
+            (
+                "a #[path] inside an inline module",
+                vec![(
+                    "src/main.rs",
+                    "mod t {\n#[path = \"../shared/g.rs\"]\nmod s;\n}\n".into(),
+                )],
+                "has a `#[path]`, which this check does not follow".into(),
+            ),
+            (
+                "a module declared in a file reached by #[path]",
+                vec![
+                    ("src/main.rs", "#[path = \"../shared/n.rs\"]\nmod n;".into()),
+                    ("shared/n.rs", "mod deeper;\n".into()),
+                ],
+                "is declared in a file reached by `#[path]`".into(),
+            ),
+            (
+                "include!",
+                vec![
+                    ("src/main.rs", "mod m;".into()),
+                    ("src/m.rs", "include!(\"t.rs\");".into()),
+                ],
+                "uses `include!`".into(),
+            ),
+            (
+                "a module with no file",
+                vec![("src/main.rs", "mod m;".into())],
+                "has no single file".into(),
+            ),
         ];
-        assert_eq!(error(&declared), cfg("cfg(feature = \"other\")"));
-        let ignored = format!("#[ignore]\n{guard}");
-        assert_eq!(
-            error(&[("m", "m.rs", &ignored)]),
-            "allocation guard `m::a_alloc` (m.rs) has `#[ignore]` or `#[cfg_attr]`, so the \
-             release command may not run it"
+        let mut wrong = Vec::new();
+        for (row, files, expected) in &rows {
+            let files: Vec<(&str, &str)> = files.iter().map(|(p, t)| (*p, t.as_str())).collect();
+            match walk(&files) {
+                Err(e) if e.to_string().contains(expected.as_str()) => {}
+                other => wrong.push(format!("{row}: {:?}", other.map(|t| t.len()))),
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+        // A restricted module with no file is not an error: nothing of it
+        // is built.
+        assert!(
+            walk(&[("src/main.rs", "#[cfg(unix)]\nmod m;")])
+                .unwrap()
+                .is_empty()
         );
-        // A `#[path]` module's file is read, its declaration's cfg kept;
-        // one inside an inline module, or a module such a file declares,
-        // is not followed.
-        let shared = |attrs: &str| format!("{attrs}#[path = \"../shared/guard.rs\"]\nmod s;\n");
-        assert_eq!(
-            found(&[("", "main.rs", &shared(""))]),
-            [("s::shared_alloc".to_owned(), false)]
-        );
-        assert_eq!(
-            error(&[("", "main.rs", &shared("#[cfg(unix)]\n"))]),
-            "allocation guard `s::shared_alloc` (shared/guard.rs) is under `cfg(unix)`, which \
-             the release command may not build: only `cfg(test)` and \
-             `cfg(feature = \"dev-tools\")` are allowed"
-        );
-        assert_eq!(
-            error(&[("", "main.rs", &format!("mod t {{\n{}}}\n", shared("")))]),
-            "main.rs: module `t::s` has a `#[path]`, which this check does not follow"
-        );
-        assert_eq!(
-            error(&[("", "main.rs", "#[path = \"../shared/nested.rs\"]\nmod n;\n")]),
-            "shared/nested.rs: module `n::deeper` is declared in a file reached by `#[path]`"
-        );
-        assert_eq!(
-            error(&[("m", "m.rs", "include!(\"tests.rs\");\n")]),
-            "m.rs uses `include!`, whose code this check cannot place; its unit guards could \
-             run unseen"
-        );
-        // Allowed: the feature and `test`, and any cfg on a non-guard.
-        let allowed = format!(
-            "#[cfg(not(windows))]\n#[test]\nfn other() {{}}\n#[cfg(test)]\nmod t {{\n\
-             #[cfg(feature = \"dev-tools\")]\n{guard}}}\n"
-        );
-        assert_eq!(found(&[("m", "m.rs", &allowed)]).len(), 2);
     }
 
     fn unit(tests: &[(&str, bool)]) -> Vec<UnitTest> {
