@@ -525,16 +525,29 @@ impl Cx<'_> {
         }
         // The BPM, STOP and time guides, which the source draws only under
         // player settings (`play/LaneRenderer.java:401-438`), are not drawn.
+        // The source makes one guide per bar line group from each list's
+        // records naming an image (`skin/json/JsonPlaySkinObjectLoader.java:
+        // 115-170`): one of them that is failure presentation refuses.
+        let groups = group
+            .and_then(|f| self.tables.nested.get(&f))
+            .map_or(0, Vec::len);
         let [bpm, stop, time] = self.def.fields(rec, ["bpm", "stop", "time"]);
         for (field, f) in [("bpm", bpm), ("stop", stop), ("time", time)] {
+            let made: Vec<u32> = f
+                .and_then(|f| self.tables.nested.get(&f))
+                .map(|l| l.iter().take(groups).copied().collect())
+                .unwrap_or_default();
+            let why = NoteKind::UnsupportedField { field };
+            for g in made {
+                if self.guide_failure(g)? {
+                    let at = self.arena_span(g);
+                    self.drop_el(Role::Critical(CriticalPart::Failure), at, why)?;
+                }
+            }
             if f.and_then(|f| self.tables.nested.get(&f))
                 .is_some_and(|l| !l.is_empty())
             {
-                self.note(
-                    Some(at),
-                    Severity::Dropped,
-                    NoteKind::UnsupportedField { field },
-                );
+                self.note(Some(at), Severity::Dropped, why);
             }
         }
         for a in [LaneApprox::TopCrop, LaneApprox::LnBody] {
@@ -547,6 +560,20 @@ impl Cx<'_> {
             self.lane_approx(at, part, LaneApprox::Expansion)?;
         }
         Ok(())
+    }
+
+    /// Whether guide record `rec` is failure presentation: it names an
+    /// image record, which the source makes it from, and its timer and
+    /// conditions make it so ([`Cx::record_failure`]).
+    fn guide_failure(&mut self, rec: u32) -> Result<bool, ImportError> {
+        let [id] = self.def.fields(rec, ["id"]);
+        let Some(id) = self.opt_string(id, "id")? else {
+            return Ok(false);
+        };
+        if self.image_rec(&id)?.is_none() {
+            return Ok(false);
+        }
+        self.record_failure(rec)
     }
 
     /// Whether an image listing offset 4 cannot move over the lanes

@@ -408,7 +408,7 @@ impl Cx<'_> {
         let group = len > 1;
         let index = property::index_by_id(self.int_or(r, "ref", 0)?);
         let (charged, lowered) = self.lowered(&dst)?;
-        let role = lowered.role();
+        let role = lowered.role(dst.failure);
         if act.is_some() {
             self.ignored(at, NoteKind::Ignored { field: "act" });
         }
@@ -430,7 +430,7 @@ impl Cx<'_> {
             let selector = (src, index.deviates());
             return self.image_group(dst, rec, &s, len, selector, charged, lowered);
         }
-        let Some(c) = self.image_common(&dst, charged, Role::Decorative)? else {
+        let Some(c) = self.image_common(&dst, charged, role)? else {
             return Ok(());
         };
         let Some((image, t, native)) = self.src_image_track(&c, rec, &s)? else {
@@ -525,7 +525,7 @@ impl Cx<'_> {
         let value = self.prop(value, "value")?;
         let selector = image_choice::set_selector(&value, r);
         let (charged, lowered) = self.lowered(&dst)?;
-        let role = lowered.role();
+        let role = lowered.role(dst.failure);
         let (src, deviates) = match selector {
             SetSelector::Unsupported { why, .. } => {
                 return self.drop_el(role, at, why);

@@ -90,9 +90,11 @@ impl Cx<'_> {
         );
         let value = self.callback_prop(value, "value")?;
         let r = self.int_or(r, "ref", 0)?;
+        // Its role when what it shows has none of its own.
+        let base = Role::Decorative.or_failure(dst.failure);
         // A callable keeps its precedence over `ref`.
         let shown = if let Prop::Callable(id) = value {
-            match self.value_callback(at, id)? {
+            match self.value_callback(at, id, base)? {
                 Some(v) => v,
                 None => return Ok(()),
             }
@@ -107,13 +109,13 @@ impl Cx<'_> {
                         kind: PropertyKind::Integer,
                         id,
                     };
-                    self.drop_el(Role::Decorative, at, why)?;
+                    self.drop_el(base, at, why)?;
                     return Ok(());
                 }
                 IntProp::Shown(v) => NumberValue::of(v),
             }
         };
-        let role = shown.role;
+        let role = shown.role.or_failure(dst.failure);
         let digit = self.int_or(digit, "digit", 0)?;
         let padding = self.int_or(padding, "padding", 0)?;
         let zeropadding = self.int_or(zeropadding, "zeropadding", 0)?;

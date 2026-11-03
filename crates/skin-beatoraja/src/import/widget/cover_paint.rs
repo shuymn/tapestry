@@ -27,7 +27,7 @@
 //! `isDisapearLineLinkLift` (default false for LIFT, true for HIDDEN+,
 //! `skin/json/JsonSkin.java:380-407`). HIDDEN+'s paint shows only while
 //! HIDDEN+ is on. LIFT is play-critical; HIDDEN+, which the player may
-//! leave off, is dropped with a note.
+//! leave off, is dropped with a note unless it is failure presentation.
 
 use skin_model::{
     CoverImage, CoverMotion, CoverPaintDef, CoverTrim, Follow, MAX_COORD, Native, Source, Track,
@@ -171,7 +171,7 @@ impl Cx<'_> {
     }
 
     /// A `hiddenCover` destination: HIDDEN+'s paint, dropped with a note
-    /// where unsupported.
+    /// where unsupported unless it is failure presentation.
     pub(in super::super) fn hidden_cover(&mut self, dst: Dst, rec: u32) -> Result<(), ImportError> {
         self.moving_cover(dst, rec, CoverMotion::Hidden)
     }
@@ -191,7 +191,11 @@ impl Cx<'_> {
     fn moving_cover(&mut self, dst: Dst, rec: u32, motion: CoverMotion) -> Result<(), ImportError> {
         let at = dst.span;
         let (role, allow, linked): (Role, &[i32], bool) = match motion {
-            CoverMotion::Hidden => (Role::Decorative, &[OFFSET_LIFT, OFFSET_HIDDEN], true),
+            CoverMotion::Hidden => (
+                Role::Decorative.or_failure(dst.failure),
+                &[OFFSET_LIFT, OFFSET_HIDDEN],
+                true,
+            ),
             CoverMotion::Lift | CoverMotion::None => {
                 (Role::Critical(CriticalPart::Lift), &[OFFSET_LIFT], false)
             }
@@ -292,7 +296,8 @@ impl Cx<'_> {
     /// nothing, since the play has no pointer, and `event` is unused on
     /// that path. Its range is scaled from the skin's height to 1 080
     /// reference pixels and truncated once, exactly. Any other slider is
-    /// dropped with a note.
+    /// dropped with a note, or refuses the skin when it is failure
+    /// presentation.
     pub(in super::super) fn slider(&mut self, dst: Dst, rec: u32) -> Result<(), ImportError> {
         let at = dst.span;
         let [ty, angle, range, value, ref_num, changeable, event] = self.def.fields(
@@ -335,7 +340,7 @@ impl Cx<'_> {
             None
         };
         if let Some(why) = why {
-            return self.drop_el(Role::Decorative, at, why);
+            return self.drop_el(Role::Decorative.or_failure(dst.failure), at, why);
         }
         // `⌊1080 · range / height⌋`, at most `MAX_COORD`.
         let r = (HEIGHT * i128::from(range))
@@ -348,7 +353,7 @@ impl Cx<'_> {
         }
         let s = self.src_image(rec)?;
         let role = if self.offset4_outside(&dst)? {
-            Role::Decorative
+            Role::Decorative.or_failure(dst.failure)
         } else {
             Role::Critical(CriticalPart::Cover)
         };
