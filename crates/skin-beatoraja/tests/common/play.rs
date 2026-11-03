@@ -107,6 +107,8 @@ pub struct Drawn {
     /// The note facts each frame gives, following its effects
     /// ([`follow`]).
     pub notes: NoteFacts,
+    /// The lane input each frame gives.
+    pub input: eval::InputFacts,
 }
 
 /// What the evaluator's note facts become after `ev`, for tests that
@@ -257,6 +259,7 @@ impl Drawn {
             readouts: None,
             chart: chart.clone(),
             notes: NoteFacts::new(chart),
+            input: eval::InputFacts::NONE,
         }
     }
 
@@ -315,6 +318,7 @@ impl Drawn {
             gauge: 0,
             effects,
             notes: &self.notes,
+            input: &self.input,
             complete: false,
             target: self.target,
             layout: &Layout::AUTHOR,

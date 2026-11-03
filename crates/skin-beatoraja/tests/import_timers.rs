@@ -272,3 +272,48 @@ fn untimed_critical_numbers_must_not_depend_on_the_start() {
         );
     }
 }
+
+/// The key-on timers 100–107 and key-off timers 120–127 map through the
+/// import to the scratch's and keys 1–7's `press` and `release`, running
+/// from the frame's lane input, one excluding the other; 108, 109, 128 and
+/// 129, keys this 7-key mode does not have, are never set: never drawn,
+/// whatever the input, and never another lane's.
+#[test]
+fn key_on_and_key_off_timers_follow_the_lane_input() {
+    use bms_model::{Lane, TimeUs};
+    for n in 0..8_u8 {
+        let lane = Lane::new(n).unwrap();
+        let (on, off) = (100 + i32::from(n), 120 + i32::from(n));
+        let loaded = images(
+            &[
+                &format!(r#""timer": {on},"#),
+                &format!(r#""timer": {off},"#),
+            ],
+            "",
+        );
+        assert!(
+            loaded.report().notes.is_empty(),
+            "{n}: {:?}",
+            loaded.report()
+        );
+        let mut d = loaded.drawn();
+        // Never pressed: neither runs.
+        assert!(d.frame(10, &[]).is_empty(), "{n}");
+        // Held from 10 ms: key-on only, 40 ms along at 50 ms.
+        d.input.press(lane, TimeUs(10 * common::play::MS));
+        assert_eq!(d.rects(50), [[40, 1_070, 10, 10]], "{n}");
+        // Released at 60 ms: key-off only, 20 ms along at 80 ms.
+        d.input.release(lane, TimeUs(60 * common::play::MS));
+        assert_eq!(d.rects(80), [[20, 1_070, 10, 10]], "{n}");
+        // Another lane's input runs neither.
+        let mut d = images(&[&format!(r#""timer": {on},"#)], "").drawn();
+        let other = Lane::new((n + 1) % 8).unwrap();
+        d.input.press(other, TimeUs(0));
+        assert!(d.frame(50, &[]).is_empty(), "{n}");
+    }
+    for n in [108, 109, 128, 129] {
+        let loaded = images(&[&format!(r#""timer": {n},"#)], "");
+        assert!(has(loaded.report(), timer(TimerWhy::Unset(n))), "{n}");
+        assert_eq!(loaded.report().usage.images, 0, "{n}");
+    }
+}

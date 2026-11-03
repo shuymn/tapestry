@@ -39,6 +39,10 @@ pub(crate) fn builtin(id: i32) -> Timer {
         // Proven unset: nothing sets timer 0 (`TimerPropertyFactory.java:
         // 6-10`, `JsonSkinSerializer.java:109`).
         0 => return Timer::Unset,
+        // Keys 8 and 9's key-on and key-off (`SkinProperty.java`): this
+        // 7-key mode has no such lanes, so they are never set and never
+        // alias another lane.
+        108 | 109 | 128 | 129 => return Timer::Unset,
         40 => timer::READY,
         41 => timer::PLAY,
         3 => timer::FAILED,
@@ -126,6 +130,9 @@ mod tests {
                 let want = lane_timer(kind, Lane::new(lane).unwrap());
                 assert_eq!(builtin(first + i32::from(lane)), Timer::Builtin(want));
             }
+        }
+        for id in [108, 109, 128, 129] {
+            assert_eq!(builtin(id), Timer::Unset, "{id}");
         }
         assert_eq!(builtin(58), Timer::Unsupported);
         assert_eq!(builtin(2), Timer::Unsupported);

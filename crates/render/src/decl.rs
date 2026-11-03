@@ -535,6 +535,7 @@ pub fn skin_frame<'a>(f: &FrameInput<'a>) -> SkinFrame<'a> {
         gauge: f.gauge,
         effects: f.effects,
         notes: &view.notes,
+        input: &view.input,
         complete: view.complete,
         playing: view.playing,
         target: f.target,

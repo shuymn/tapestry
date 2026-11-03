@@ -138,6 +138,74 @@ fn the_screen_timer_starts_with_ready_in_a_play() {
     }
 }
 
+/// Key-on and key-off from the view's lane input, mutually exclusive, in
+/// µs on the frame's clock: a lane held since the opening runs key-on from
+/// the READY start with key-off off; a release runs key-off and stops
+/// key-on, a press the reverse; a reversal's release and press at one µs
+/// leave key-on from that µs; a lane never released has key-off off. The
+/// display offset moves neither, and neither stops in READY or once the
+/// play is no longer playing.
+#[test]
+fn key_on_and_key_off_follow_the_lane_input() {
+    use skin_model::{LaneTimer, lane_timer};
+    let chart = taps(&[1_000, 31_000]);
+    let mut h = Harness::empty(&chart, &full(2_000));
+    let on = |l: u8| lane_timer(LaneTimer::Press, lane(l));
+    let off = |l: u8| lane_timer(LaneTimer::Release, lane(l));
+    // Key 3 held at the opening, from the evaluator's own opening facts;
+    // the scratch untouched.
+    let device = eval::DeviceProfile {
+        sources: vec![eval::SourceProfile {
+            input_offset: TimeUs(0),
+            bindings: vec![eval::Binding {
+                control: eval::ControlId(3),
+                lane: lane(3),
+            }],
+            axes: Vec::new(),
+        }],
+    };
+    let rule = rules::tapestry();
+    let start = eval::InputStart {
+        opened_at: TimeUs(0),
+        held: vec![(eval::SourceId(0), eval::ControlId(3), 1)],
+    };
+    let ev = eval::Evaluator::new(&chart, &rule, &device, &start, None, 4).unwrap();
+    h.input = *ev.input();
+    h.offset = TimeUs(150 * MS);
+    h.playing = false;
+    h.frame(-1_500, &[]);
+    let ready_at = Some(-2_000 * MS);
+    assert_eq!(h.start(timer::READY), ready_at);
+    assert_eq!((h.start(on(3)), h.start(off(3))), (ready_at, None));
+    assert_eq!(h.elapsed(on(3)), 500);
+    assert_eq!((h.start(on(0)), h.start(off(0))), (None, None));
+    // Released at −1 s: key-off from there, key-on off.
+    h.input.release(lane(3), TimeUs(-1_000 * MS));
+    h.frame(-900, &[]);
+    assert_eq!((h.start(on(3)), h.start(off(3))), (None, Some(-1_000 * MS)));
+    assert_eq!(h.elapsed(off(3)), 100);
+    // Pressed again at 0.5 s, playing.
+    h.playing = true;
+    h.input.press(lane(3), TimeUs(500 * MS));
+    h.frame(700, &[]);
+    assert_eq!((h.start(on(3)), h.start(off(3))), (Some(500 * MS), None));
+    assert_eq!(h.elapsed(on(3)), 200);
+    // A reversal: released and pressed again at one µs.
+    h.input.release(lane(3), TimeUs(800 * MS + 1));
+    h.input.press(lane(3), TimeUs(800 * MS + 1));
+    h.frame(900, &[]);
+    assert_eq!(
+        (h.start(on(3)), h.start(off(3))),
+        (Some(800 * MS + 1), None)
+    );
+    // Stopped: still running.
+    h.playing = false;
+    h.input.release(lane(3), TimeUs(1_000 * MS));
+    h.frame(5_000, &[]);
+    assert_eq!((h.start(on(3)), h.start(off(3))), (None, Some(1_000 * MS)));
+    assert_eq!(h.elapsed(off(3)), 4_000);
+}
+
 /// The smallest µs whose display position reaches `k` beats, from the
 /// map's segments: before 0 at the initial rate, then per segment from its
 /// anchor at its slope.
@@ -973,6 +1041,7 @@ fn an_inconsistent_snapshot_poisons_the_play() {
             gauge: 0,
             effects,
             notes: &h.notes,
+            input: &eval::InputFacts::NONE,
             complete: false,
             playing: true,
             target: h.target,
