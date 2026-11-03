@@ -1512,11 +1512,15 @@ impl InputThread {
                 let (published, read) = raw.poll(now, may_read, &mut sources);
                 // Polling may take a while after a scheduling stall; the
                 // boundary is read after it.
-                let phase = on_wake(&mut sources, clock.now());
+                let now = clock.now();
+                let phase = on_wake(&mut sources, now);
+                // Every wake is a tick of the adjustment tap's clock.
+                sources.tick_presentation(now);
                 Boundary {
                     published,
                     read,
                     phase,
+                    due: sources.next_due(),
                 }
             }))
         })?;
@@ -1583,10 +1587,15 @@ impl ClockedThread {
         F: FnMut(&mut SourceSet, TimeUs) -> Phase + Send + 'static,
     {
         let (worker, _) = spawn_worker("clocked input", clock, Driven::Timer, waker, move || {
-            Ok((Timer::new()?, 0, move |now, _| Boundary {
-                published: now,
-                read: None,
-                phase: on_wake(&mut sources, now),
+            Ok((Timer::new()?, 0, move |now, _| {
+                let phase = on_wake(&mut sources, now);
+                sources.tick_presentation(now);
+                Boundary {
+                    published: now,
+                    read: None,
+                    phase,
+                    due: sources.next_due(),
+                }
             }))
         })?;
         Ok(Self { worker })

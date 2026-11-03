@@ -151,6 +151,9 @@ pub enum Cause {
     Heartbeat,
     /// The previous drain was cut, and its gap has ended.
     Drain,
+    /// The adjustment tap's deadline passed: a repeat or the tick closing
+    /// its last group is due.
+    Due,
 }
 
 /// What a processed wake did: the clock read its last publication was
@@ -163,6 +166,9 @@ pub struct Boundary {
     pub read: Option<u32>,
     /// The phase after the hook.
     pub phase: Phase,
+    /// When the adjustment tap is next due a tick, on the clock
+    /// ([`SourceSet::next_due`]); `None` for none.
+    pub due: Option<TimeUs>,
 }
 
 impl Boundary {
@@ -186,6 +192,8 @@ pub struct Cadence {
     left: bool,
     /// Input arrived before `quiet_until` and waits for it.
     held: bool,
+    /// The adjustment tap's next deadline, in every phase.
+    due: Option<TimeUs>,
 }
 
 impl Cadence {
@@ -199,6 +207,7 @@ impl Cadence {
             quiet_until: TimeUs(i64::MIN),
             left: false,
             held: false,
+            due: None,
         }
     }
 
@@ -217,7 +226,11 @@ impl Cadence {
     /// The next wait, at `now`.
     #[must_use]
     pub fn wait(&self, now: TimeUs) -> Wait {
-        let beat = self.heartbeat();
+        // The tap's deadline counts in every phase, Idle included.
+        let beat = match (self.heartbeat(), self.due) {
+            (Some(b), Some(d)) => Some(b.min(d)),
+            (b, d) => b.or(d),
+        };
         let sooner = |at: TimeUs| Some(beat.map_or(at, |b| b.min(at)));
         match self.driven {
             Driven::Timer => Wait {
@@ -252,6 +265,7 @@ impl Cadence {
             Woken::Timer if self.phase != Phase::Idle && now >= self.heartbeat => {
                 Some(Cause::Heartbeat)
             }
+            Woken::Timer if self.due.is_some_and(|d| now >= d) => Some(Cause::Due),
             Woken::Timer if self.left && now >= self.quiet_until => Some(Cause::Drain),
             Woken::Timer if self.held && now >= self.quiet_until => Some(Cause::Input),
             Woken::Timer | Woken::Queue => None,
@@ -272,6 +286,7 @@ impl Cadence {
     pub fn processed(&mut self, woke_at: TimeUs, boundary: Boundary) -> Option<u64> {
         let was_idle = self.phase == Phase::Idle;
         self.phase = boundary.phase;
+        self.due = boundary.due;
         let mut late = None;
         let published = boundary.published;
         // Against the deadline of the phase the wake ran in, also when its
@@ -346,13 +361,15 @@ pub struct WakeCauses {
     pub heartbeat: u64,
     /// The rest of a cut drain.
     pub drain: u64,
+    /// The adjustment tap's deadline.
+    pub due: u64,
 }
 
 impl WakeCauses {
     /// Every processed wake.
     #[must_use]
     pub const fn total(&self) -> u64 {
-        self.input + self.event + self.heartbeat + self.drain
+        self.input + self.event + self.heartbeat + self.drain + self.due
     }
 }
 
@@ -425,6 +442,7 @@ pub fn run<C: TimeSource, W: Waiter>(
             Cause::Event => report.causes.event += 1,
             Cause::Heartbeat => report.causes.heartbeat += 1,
             Cause::Drain => report.causes.drain += 1,
+            Cause::Due => report.causes.due += 1,
         }
         if let Some(last) = last_wake {
             report.intervals.record(now.0.abs_diff(last.0));
