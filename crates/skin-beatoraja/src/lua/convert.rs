@@ -315,7 +315,9 @@ impl Conv<'_> {
             };
         }
         let info = f.info();
-        if info.what == "C" {
+        // The sandbox's own Lua (its chunks are named `=`) is library.
+        let ours = info.source.as_deref().is_some_and(|s| s.starts_with('='));
+        if info.what == "C" || ours {
             return Callable {
                 module: None,
                 line: 0,

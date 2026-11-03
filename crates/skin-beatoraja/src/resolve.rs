@@ -1041,7 +1041,10 @@ impl Resolver<'_, '_> {
             Some(store) => {
                 let mut used = self.def.run.input_bytes;
                 let at = || Some(self.def.arena.loc(member));
-                let (id, bytes) = store.source(&self.def.root, &joined, &mut used, at)?;
+                let read = store.source(&self.def.root, &joined, &mut used, at);
+                // The charge stands even when the file is refused below.
+                self.def.run.input_bytes = used;
+                let (id, bytes) = read?;
                 (bytes.to_vec(), id)
             }
             None => read_file(&self.def.root, &joined, self.def.run.input_bytes, || {
@@ -1056,7 +1059,9 @@ impl Resolver<'_, '_> {
                 chain,
             });
         }
-        self.def.run.input_bytes += u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        if self.def.store.is_none() {
+            self.def.run.input_bytes += u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        }
         let index = u16::try_from(self.arena().files.len()).map_err(|_| ImportError::Input {
             at: Some(self.def.loc(member)),
             limit: InputLimit::IncludeParses,

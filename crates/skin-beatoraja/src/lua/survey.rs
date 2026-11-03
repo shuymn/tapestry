@@ -222,4 +222,34 @@ return { type = 0 }",
         assert_eq!(crate::lua::tests::PASSES.with(std::cell::Cell::get), 2);
         assert!(s.usage.instructions >= 4_000_000 && s.usage.instructions < 5_000_000);
     }
+
+    #[test]
+    fn the_library_s_functions_are_counted_as_library() {
+        let d = folder(&[(
+            "s.luaskin",
+            "if skin_config then\n\
+               return { type = 0, extra = { string.find, string.len, type, function() end } }\n\
+             end\nreturn { type = 0 }",
+        )]);
+        let s = survey(d.path(), "s.luaskin", &Cancel::new());
+        let kinds: Vec<(&str, u32)> = s
+            .callables
+            .iter()
+            .map(|((_, kind), n)| (kind.as_str(), *n))
+            .collect();
+        assert_eq!(kinds, [("library", 3), ("lua", 1)]);
+    }
+
+    #[test]
+    fn an_include_cycle_keeps_the_charge_of_its_last_read() {
+        let entry = "return { type = 0, property = { include = \"p.json\" } }";
+        let json = "[{\"include\": \"p.json\"}]";
+        let d = folder(&[("s.luaskin", entry), ("p.json", json)]);
+        let s = survey(d.path(), "s.luaskin", &Cancel::new());
+        assert_eq!(s.outcome, "header include cycle");
+        assert_eq!(
+            s.usage.input_bytes,
+            u64::try_from(entry.len() + 2 * json.len()).unwrap()
+        );
+    }
 }
