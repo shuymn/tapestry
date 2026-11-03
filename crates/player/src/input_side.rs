@@ -2652,4 +2652,81 @@ mod gate_tests {
             "the event that fits was dropped"
         );
     }
+
+    /// A completed play's handoff, served at the input thread's boundary
+    /// while the game thread waits: the closing comes back in the storage
+    /// reserved at the opening, and the boundaries allocate nothing; the
+    /// start gate is disarmed, and the queues go on taking input, a key
+    /// held through the handoff released with no press repeated, until the
+    /// close after the tail.
+    #[test]
+    fn a_handoff_keeps_the_sources_until_the_close() {
+        let (mut sources, mut hook, mut link, gate) = rig();
+        let opening = open(&mut hook, &link, &mut sources, 10).unwrap();
+        assert_eq!(gate.state().phase, GatePhase::Armed);
+        let mut readers = opening.readers;
+        batch(&mut hook, &mut sources, 20, &[packet(2, Z, 1)]);
+        for r in &mut readers {
+            while r.pop().is_some() {}
+        }
+        #[cfg(feature = "dev-tools")]
+        {
+            let control = crate::alloc_count::this_thread();
+            drop(std::hint::black_box(vec![1_u8; 8]));
+            assert!(
+                crate::alloc_count::this_thread() > control,
+                "the allocation was not counted"
+            );
+        }
+        // The boundaries' own allocations, the thread's spawn aside
+        // (counted with dev-tools only).
+        let count = || {
+            #[cfg(feature = "dev-tools")]
+            return crate::alloc_count::this_thread();
+            #[cfg(not(feature = "dev-tools"))]
+            0
+        };
+        let mut allocated = 0;
+        let closing = std::thread::scope(|s| {
+            let asked = s.spawn(|| link.hand_off());
+            let mut at = 30;
+            while !asked.is_finished() {
+                let before = count();
+                batch(&mut hook, &mut sources, at, &[]);
+                allocated += count() - before;
+                at += 1;
+            }
+            asked.join().unwrap()
+        })
+        .unwrap();
+        assert_eq!(allocated, 0, "the handoff allocated");
+        assert_eq!(
+            closing,
+            game::Closing {
+                arrivals: Vec::new(),
+                overflowed: false,
+                source_limited: false,
+                axis_out_of_range: vec![0, 0],
+            }
+        );
+        assert!(sources.is_recording() && sources.is_handed_off());
+        assert_ne!(gate.state().phase, GatePhase::Armed);
+        batch(&mut hook, &mut sources, 100, &[packet(2, Z, 0)]);
+        let tail: Vec<_> = readers[1].pop().into_iter().map(|e| e.kind).collect();
+        assert_eq!(
+            tail,
+            [InputKind::Control {
+                control: Z,
+                value: 0
+            }]
+        );
+        assert!(readers.iter().all(input::SourceReader::is_empty));
+        // The close after the tail: nothing more reaches the queues.
+        link.requests.send(Request::Close).unwrap();
+        batch(&mut hook, &mut sources, 110, &[]);
+        assert!(matches!(link.replies.try_recv(), Ok(Reply::Closed(..))));
+        assert!(!sources.is_recording());
+        batch(&mut hook, &mut sources, 120, &[packet(2, Z, 1)]);
+        assert!(readers.iter().all(input::SourceReader::is_empty));
+    }
 }
