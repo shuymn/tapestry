@@ -601,6 +601,45 @@ fn sudden_plus_paint_draws_as_authored() {
     assert_eq!(rects(&moved, 5_000, 500, 0), [[20, -20, 430, 600]]);
 }
 
+/// The outcome of SUDDEN+'s stretch-5 paint of record `cover` (a 16×16
+/// cell) over `[x, 800, w, h]` (source coordinates, y up): its rects at
+/// cover 0, or the critical refusal.
+fn stretch_five(x: i32, w: i32, h: i32) -> Result<Vec<[i32; 4]>, (CriticalPart, NoteKind)> {
+    let paint = format!(
+        r#"{{"id": "cover", "offset": 4, "stretch": 5,
+            "dst": [{{"x": {x}, "y": 800, "w": {w}, "h": {h}}}]}}"#
+    );
+    let l = with("", &[&paint]);
+    match l.result {
+        Ok(_) => Ok(rects(&l, 5_000, 0, 0)),
+        Err(ImportError::Critical { part, why, .. }) => Err((part, why)),
+        Err(e) => panic!("{e:?}"),
+    }
+}
+
+#[test]
+fn stretch_five_takes_the_sources_branch_for_any_sign() {
+    // The source trims when `h < w · ih / iw` (`skin/StretchType.java:
+    // 65-68, 140-150`), else fits a frame `w · ih / iw` high about the
+    // destination's centre. A model rect's y is 1080 − y − h.
+    // w −100: −100 high, fitted.
+    assert_eq!(
+        stretch_five(300, -100, 50),
+        Ok(vec![[300, 305, -100, -100]])
+    );
+    // w 0: 0 high, fitted.
+    assert_eq!(stretch_five(300, 0, 50), Ok(vec![[300, 255, 0, 0]]));
+    // A negative height is trimmed to a negative count of rows, which no
+    // crop reproduces, under a zero width (the source's zero scale) as
+    // under a positive one.
+    let no_rows = Err((
+        CriticalPart::Cover,
+        NoteKind::UnsupportedField { field: "dst" },
+    ));
+    assert_eq!(stretch_five(300, 0, -50), no_rows);
+    assert_eq!(stretch_five(200, 100, -50), no_rows);
+}
+
 #[test]
 fn the_lanes_blend_ignores_the_outer_blend() {
     // The notes and SUDDEN+'s paint draw in alpha-blended runs, LIFT's in

@@ -33,13 +33,23 @@ pub(crate) struct LaneState {
 }
 
 /// The texels of a frame of `[iw, ih]` that stretch 5 keeps for
-/// destination `r`, exactly: `r.h × iw / r.w`
-/// (`skin/StretchType.java:65-68, 143-148`).
-/// `Some(None)` when the fitted frame is no taller than the destination,
-/// so nothing is cropped; `None` on overflow.
+/// destination `r`, exactly. The source fits the frame to the
+/// destination's width and trims its rows when the destination is lower
+/// than the fitted frame, `r.h < r.w · ih / iw`, keeping `r.h · iw / r.w`
+/// of them (`skin/StretchType.java:65-68, 140-150`); the test is made as
+/// `r.h · iw < r.w · ih`, so a negative or zero width takes the source's
+/// branch. A zero width trims only a negative height, which the source
+/// cuts by a zero scale: its kept texels are `r.h`, negative, a crop of
+/// no rows. `Some(None)` when nothing is trimmed; `None` on overflow.
 fn trimmed(r: Rect, [iw, ih]: [u32; 2]) -> Option<Option<Q>> {
-    let kept = r.h.mul(Q::int(iw))?.div(r.w)?;
-    Some((kept < Q::int(ih)).then_some(kept))
+    let (iw, ih) = (Q::int(iw), Q::int(ih));
+    if r.h.mul(iw)? >= r.w.mul(ih)? {
+        return Some(None);
+    }
+    if r.w == Q::ZERO {
+        return Some(Some(r.h));
+    }
+    Some(Some(r.h.mul(iw)?.div(r.w)?))
 }
 
 /// The rows a frame at row `y`, `h` high, keeps when it keeps `kept`
@@ -652,21 +662,18 @@ impl Cx<'_> {
         Ok(Some((image, r)))
     }
 
-    /// The rect stretch 5 gives a cover of one colour, y up: the source
-    /// fits a frame to the destination's width and trims its rows when
-    /// the destination is lower than the fitted frame, `h < w · ih / iw`,
-    /// keeping the destination (`skin/StretchType.java:65-68, 140-150`),
-    /// compared here as `h · iw < w · ih`, so a negative or zero width
-    /// takes the source's branch; the trimmed rows are the same colour.
+    /// The rect stretch 5 gives a cover of one colour, y up: its
+    /// destination where the source trims a 1×1 frame ([`trimmed`]), the
+    /// trimmed rows being the same colour, else that frame fitted to its
+    /// width.
     pub(super) fn solid_cover_rect(&self, c: &Common) -> Result<Rect, ImportError> {
         let at = c.span;
         let r = self.cover_rect(c)?;
         let cell = super::super::asset::SYSTEM_SIZE;
-        let [iw, ih] = cell.map(Q::int);
-        let (Some(h), Some(w)) = (r.h.mul(iw), r.w.mul(ih)) else {
-            return Err(self.range(at, "dst"));
-        };
-        if h < w {
+        if trimmed(r, cell)
+            .ok_or_else(|| self.range(at, "dst"))?
+            .is_some()
+        {
             return Ok(r);
         }
         track::stretch(Stretch::FitWidth, r, cell)
@@ -730,6 +737,19 @@ mod tests {
         assert_eq!(
             trimmed(rect(int(430), int(299)), [43, 30]),
             Some(Q::new(299, 10))
+        );
+        // The source's branch for any sign: a width of −100 or 0 fits a
+        // 50-high destination; a zero width trims a negative height to
+        // its own (negative) height.
+        assert_eq!(trimmed(rect(int(-100), int(50)), [16, 16]), Some(None));
+        assert_eq!(trimmed(rect(int(0), int(50)), [16, 16]), Some(None));
+        assert_eq!(
+            trimmed(rect(int(0), int(-50)), [16, 16]),
+            Some(Some(int(-50)))
+        );
+        assert_eq!(
+            trimmed(rect(int(-100), int(-200)), [16, 16]),
+            Some(Some(int(32)))
         );
         // No row left: 0.4 texels about row 64.
         assert_eq!(crop_rows(0, 128, Q::new(2, 5).unwrap()), None);
