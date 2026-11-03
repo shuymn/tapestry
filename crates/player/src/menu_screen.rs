@@ -993,7 +993,7 @@ mod tests {
     /// at the same opacity prepares nothing.
     #[cfg(feature = "dev-tools")]
     #[test]
-    fn a_splash_fade_lays_nothing_out_again() {
+    fn a_splash_fade_lays_nothing_out_again_alloc() {
         let mut screen = MenuScreen::new(warp(), Some(Fonts::runtime().unwrap()));
         screen.fade_splash(255).unwrap();
         screen.fade_splash(254).unwrap();
