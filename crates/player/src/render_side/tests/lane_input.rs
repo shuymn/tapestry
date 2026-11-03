@@ -643,8 +643,10 @@ fn key_timers_follow_the_lifecycles_own_clocks() {
     let mut device = device();
     device.sources.truncate(1);
     let clock = QpcClock::start();
-    let held = |n: u32, opened_at: TimeUs| InputStart {
-        opened_at,
+    // An opening snapshot on its candidate's chart clock, as production's:
+    // the opening lies the lead-in before chart time 0.
+    let held = |n: u32| InputStart {
+        opened_at: TimeUs(-LEAD),
         held: vec![(SourceId(0), ControlId(n), 1)],
     };
     let opened = clock.now();
@@ -654,7 +656,7 @@ fn key_timers_follow_the_lifecycles_own_clocks() {
         &chart,
         &rule,
         &device,
-        &held(6, opened),
+        &held(6),
         vec![reader],
         LogicConfig {
             inputs: 64,
@@ -752,10 +754,16 @@ fn key_timers_follow_the_lifecycles_own_clocks() {
     // Cancelled: no step for 2 s, the readers lent; the frames go on
     // drawing the cancelled candidate on its origin, its timers ageing.
     drop(logic.lend_readers());
-    std::thread::sleep(Duration::from_secs(2));
-    let waited = seen.lock().unwrap().last().cloned().unwrap();
-    assert_eq!(waited.0.generation, 0);
-    assert!(waited.1.now.0 - pressed.0 >= 1_900 * MS, "{waited:?}");
+    let waited_until = TimeUs(pressed.0 + 2_000 * MS);
+    let past = |(s, c): &(Seen, Clocked)| s.generation == 0 && c.now >= waited_until;
+    assert!(wait_until(|| seen.lock().unwrap().iter().any(past)));
+    let waited = seen
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|f| past(f))
+        .cloned()
+        .unwrap();
     check(&waited, origin, 6, &[(3, pressed)]);
     // Released: the next candidate opens now, with key 5 held, on a
     // reopened queue.
@@ -768,7 +776,7 @@ fn key_timers_follow_the_lifecycles_own_clocks() {
         *origin = TimeUs(opening.0 + LEAD);
         assert!(origin.0 - previous.0 >= 2_000 * MS);
         let before = clock.now();
-        logic.rearm(&held(n, opening), *origin);
+        logic.rearm(&held(n), *origin);
         before
     };
     let before = rearm(&mut logic, 5, &mut origin);
