@@ -280,7 +280,7 @@ impl Cx<'_> {
             });
         }
         let name = match self.choices.substitute(&path) {
-            Path::File(p) => asset::join(&self.entry_dir, &p),
+            Path::File(p) => asset::resolve(&self.entry_dir, &p),
             Path::Missing => return missing(NoteKind::MissingAsset),
             Path::Glob => {
                 return refused(NoteKind::UnsupportedField {
