@@ -102,7 +102,7 @@ pub const HOST_APIS: [(&str, &str); 65] = [
 ];
 
 /// The host modules' names.
-const MODULES: [&str; 3] = ["main_state", "timer_util", "event_util"];
+pub(super) const MODULES: [&str; 3] = ["main_state", "timer_util", "event_util"];
 
 /// The registry name of host module `name`'s table in this VM.
 fn registry_name(name: &str) -> String {

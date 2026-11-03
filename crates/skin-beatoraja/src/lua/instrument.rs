@@ -41,7 +41,9 @@ const CHECK_BYTES: usize = 1 << 16;
 /// Why a chunk was not instrumented.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Stop {
-    /// It would grow past [`MAX_ADDED_BYTES`].
+    /// It would grow past [`MAX_ADDED_BYTES`], or past what is left of
+    /// the pass's rewritten-source allowance
+    /// ([`MAX_REWRITTEN_BYTES`](super::limits::MAX_REWRITTEN_BYTES)).
     Generated,
     Cancelled,
 }

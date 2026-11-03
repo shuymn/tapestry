@@ -106,7 +106,8 @@ pub enum LuaLimit {
     /// [`limits::MAX_ANALYSIS_WORK`].
     AnalysisWork,
     /// The generated source's bound: an instrumented chunk's
-    /// ([`instrument::MAX_ADDED_BYTES`]) or a lowered expression's
+    /// ([`instrument::MAX_ADDED_BYTES`]), the rewritten chunks a pass
+    /// keeps ([`limits::MAX_REWRITTEN_BYTES`]) or a lowered expression's
     /// ([`skin_model::MAX_SOURCE_BYTES`]).
     Generated,
 }

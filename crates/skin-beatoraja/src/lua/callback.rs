@@ -428,10 +428,6 @@ impl Analysis {
                     };
                     return cx.expr(e);
                 }
-                Stmt::LocalFunction { .. } | Stmt::Function { .. } => {
-                    return Err(at(Unsupported::Construct("function"), line));
-                }
-                Stmt::Call(_) => return Err(at(Unsupported::Construct("call statement"), line)),
                 Stmt::Other(what) => return Err(at(Unsupported::Construct(what), line)),
             }
         }
@@ -712,7 +708,7 @@ pub(crate) fn resolve_callee(
                 Some(Captured::Module(m)) => m,
                 _ => return Err(Unsupported::Callee),
             };
-            let module_name = ["main_state", "timer_util", "event_util"]
+            let module_name = super::host::MODULES
                 .get(usize::from(module))
                 .copied()
                 .unwrap_or("");
@@ -817,11 +813,10 @@ pub(crate) fn callable_nodes(arena: &Arena) -> impl Iterator<Item = (u32, u32)> 
     })
 }
 
-/// The tree of instance `i`: its file's tree, its function's index and
-/// its file.
-pub(crate) fn tree(an: &Analysis, i: u32) -> Option<(&Ast, u32, u16)> {
+/// The tree of instance `i`: its file's tree and its function's index.
+pub(crate) fn tree(an: &Analysis, i: u32) -> Option<(&Ast, u32)> {
     let inst = an.instance(i)?;
-    Some((an.ast(inst.file)?, inst.func, inst.file))
+    Some((an.ast(inst.file)?, inst.func))
 }
 
 /// Whether upvalue `up` of a function in `ast` is the binding its globals

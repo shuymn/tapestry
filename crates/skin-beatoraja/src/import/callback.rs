@@ -136,7 +136,7 @@ fn timer_name(slot: u16) -> Option<&'static str> {
 }
 
 /// An instance's body as [`Lower::body`] reads it.
-type Body<'a> = (&'a Ast, u32, Vec<(u32, u32)>, u32);
+type Body<'a> = (&'a Ast, Vec<(u32, u32)>, u32);
 
 struct Lower<'a> {
     an: &'a Analysis,
@@ -186,11 +186,11 @@ impl Lower<'_> {
         }
     }
 
-    /// The body of instance `i`: its tree, the instance, its locals (each
-    /// declaration and its initializer) and its return expression.
+    /// The body of instance `i`: its tree, its locals (each declaration
+    /// and its initializer) and its return expression.
     fn body(an: &Analysis, i: u32) -> R<Body<'_>> {
         let unsupported = Stop::Unsupported(Unsupported::Capture("an untagged closure"));
-        let (ast, func, _) = tree(an, i).ok_or(unsupported)?;
+        let (ast, func) = tree(an, i).ok_or(unsupported)?;
         let f = ast
             .func(func)
             .ok_or(Stop::Unsupported(Unsupported::Capture(
@@ -207,7 +207,7 @@ impl Lower<'_> {
                 }
                 Stmt::Return(list) => {
                     if let &[e] = ast.list(list) {
-                        return Ok((ast, i, locals, e));
+                        return Ok((ast, locals, e));
                     }
                 }
                 _ => {}
@@ -225,13 +225,13 @@ impl Lower<'_> {
         if (self.cancelled)() {
             return Err(Stop::Fatal(LuaWhy::Cancelled));
         }
-        let (ast, inst, locals, ret) = Self::body(self.an, i)?;
+        let (ast, locals, ret) = Self::body(self.an, i)?;
         let mut sized: Vec<(u32, u64)> = Vec::with_capacity(locals.len());
         for &(d, e) in &locals {
-            let n = self.size_expr(ast, inst, &sized, e)?;
+            let n = self.size_expr(ast, i, &sized, e)?;
             sized.push((d, n));
         }
-        let n = self.size_expr(ast, inst, &sized, ret)?;
+        let n = self.size_expr(ast, i, &sized, ret)?;
         // Sparse: an entry for each instance this lowering sized.
         self.sizes.insert(i, n);
         Ok(n)
@@ -268,6 +268,18 @@ impl Lower<'_> {
         })
     }
 
+    /// Instance `i` sized, its expanded size charged against
+    /// [`MAX_EXPANDED_NODES`], then lowered.
+    fn expand(&mut self, i: u32) -> R<V> {
+        let n = self.size(i)?;
+        let total = self.an.expanded.get().saturating_add(n);
+        if total > MAX_EXPANDED_NODES {
+            return Err(Stop::Fatal(LuaWhy::Limit(LuaLimit::Expansion)));
+        }
+        self.an.expanded.set(total);
+        self.instance(i)
+    }
+
     /// Instance `i` lowered.
     fn instance(&mut self, i: u32) -> R<V> {
         #[cfg(test)]
@@ -275,8 +287,8 @@ impl Lower<'_> {
         if (self.cancelled)() {
             return Err(Stop::Fatal(LuaWhy::Cancelled));
         }
-        let (ast, inst, locals, ret) = Self::body(self.an, i)?;
-        self.expr(ast, inst, &locals, ret)
+        let (ast, locals, ret) = Self::body(self.an, i)?;
+        self.expr(ast, i, &locals, ret)
     }
 
     fn expr(&mut self, ast: &Ast, inst: u32, locals: &[(u32, u32)], e: u32) -> R<V> {
@@ -292,9 +304,10 @@ impl Lower<'_> {
             Expr::Paren(x) => self.expr(ast, inst, locals, x),
             Expr::Local(d) => {
                 self.charge_scan(locals.len())?;
-                if let Some(&(_, init)) = locals.iter().rev().find(|(l, _)| *l == d) {
+                if let Some((k, &(_, init))) =
+                    locals.iter().enumerate().rev().find(|(_, (l, _))| *l == d)
+                {
                     // The locals before it, as its initializer saw them.
-                    let k = locals.iter().position(|&(l, _)| l == d).unwrap_or(0);
                     let before = locals.get(..k).unwrap_or_default();
                     return self.expr(ast, inst, before, init);
                 }
@@ -314,15 +327,7 @@ impl Lower<'_> {
             }
             Expr::Call { callee, args } => {
                 match resolve_callee(self.an, ast, inst, callee).map_err(Stop::Unsupported)? {
-                    Callee::Helper(j) => {
-                        let n = self.size(j)?;
-                        let total = self.an.expanded.get().saturating_add(n);
-                        if total > MAX_EXPANDED_NODES {
-                            return Err(Stop::Fatal(LuaWhy::Limit(LuaLimit::Expansion)));
-                        }
-                        self.an.expanded.set(total);
-                        self.instance(j)
-                    }
+                    Callee::Helper(j) => self.expand(j),
                     Callee::Host(api) => {
                         let arg = ast.list(args).first().and_then(|&a| numeral(ast, a));
                         self.read(api, arg)
@@ -539,7 +544,7 @@ impl Lower<'_> {
         let mut pending = vec![i];
         let mut stack: Vec<u32> = Vec::new();
         while let Some(i) = pending.pop() {
-            let Some((ast, func, _)) = tree(self.an, i) else {
+            let Some((ast, func)) = tree(self.an, i) else {
                 continue;
             };
             let Some(f) = ast.func(func) else {
@@ -712,14 +717,9 @@ impl Cx<'_> {
                 return Ok(Lowering::Unsupported(f.why, part(&l)?));
             }
         };
-        let r = l.size(inst).and_then(|n| {
-            let total = an.expanded.get().saturating_add(n);
-            if total > MAX_EXPANDED_NODES {
-                return Err(Stop::Fatal(LuaWhy::Limit(LuaLimit::Expansion)));
-            }
-            an.expanded.set(total);
-            l.instance(inst)
-        });
+        let r = l.expand(inst);
+        #[cfg(test)]
+        crate::lua::tests::memo_witness(l.sizes.len());
         match r {
             Ok(V::Int { src, .. }) | Ok(V::Bool(src)) => {
                 l.out.src = src;

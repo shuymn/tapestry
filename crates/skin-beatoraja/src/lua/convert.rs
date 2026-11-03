@@ -102,15 +102,8 @@ pub(crate) fn callables(
     arena: &Arena,
 ) -> impl Iterator<Item = (u32, &'static str, CallableKind)> + '_ {
     let lua = arena.lua.as_deref();
-    (0_u32..).zip(&arena.nodes).filter_map(move |(id, n)| {
-        let lua = lua?;
-        if n.kind != Kind::Lua {
-            return None;
-        }
-        let LuaScalar::Callable(i) = *lua.values.get(n.end as usize)? else {
-            return None;
-        };
-        let kind = lua.callables.get(i as usize)?.kind;
+    callback::callable_nodes(arena).filter_map(move |(id, i)| {
+        let kind = lua?.callables.get(i as usize)?.kind;
         let key: String = arena.key(id).map(Iterator::collect).unwrap_or_default();
         let field = FIELDS
             .iter()

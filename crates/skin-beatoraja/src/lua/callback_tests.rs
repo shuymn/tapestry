@@ -9,7 +9,7 @@ use std::collections::HashMap;
 
 use skin_model::{PLAY, Scope, State, Ty, compile};
 
-use super::tests::CAPTURE_CALLS;
+use super::tests::{CAPTURE_CALLS, why};
 use super::{Cancel, LuaLimit, LuaWhy, Unsupported, read_lua_header};
 use crate::error::ImportError;
 use crate::import::Config;
@@ -84,14 +84,6 @@ fn import(entry: &str) -> Result<super::LuaImported, ImportError> {
     let r = run(entry, &Cancel::new());
     assert_eq!(CAPTURE_CALLS.with(Cell::get), 0, "{entry}");
     r
-}
-
-#[track_caller]
-fn why<T: std::fmt::Debug>(r: Result<T, ImportError>) -> LuaWhy {
-    match r {
-        Err(ImportError::Lua { why, .. }) => why,
-        other => panic!("{other:?}"),
-    }
 }
 
 /// A test handler: any skin code a capture ran would call it, a host
@@ -571,37 +563,26 @@ fn rewritten_chunks_share_one_allowance() {
 
 #[test]
 fn a_lowering_sizes_only_what_it_reaches() {
-    // One number callback read by 16 000 destinations, with and without
-    // 60 000 closures nothing consumes: each lowering sizes its one
-    // instance, not a slot for every instance, so the unconsumed closures
-    // add their conversion and admission and nothing a lowering.
-    let skin_of = |extra: usize| {
-        let body = format!(
-            "s_extra = {{}}\n\
-             for i = 1, {extra} do s_extra[i] = function() return 0 end end\n\
-             skin.extra = s_extra\n\
-             skin.value = {{ {{ id = \"v\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, digit = 3,\n\
-               value = function() return ms.number(425) end }} }}"
-        );
-        let dst: String = (0..16_000)
-            .map(|k| {
-                format!(
-                    "{{ id = \"v\", dst = {{ {{ x = {}, y = 0, w = 6, h = 6 }} }} }},",
-                    k % 1_000
-                )
-            })
-            .collect();
-        skin(&body, &dst)
-    };
-    let time = |entry: &str| {
-        let start = std::time::Instant::now();
-        import(entry).unwrap();
-        start.elapsed()
-    };
-    let (none, many) = (skin_of(0), skin_of(60_000));
-    let base = time(&none);
-    let with = time(&many);
-    assert!(with < base * 3, "{base:?} without, {with:?} with");
+    // 60 000 closures nothing consumes, then one number callback read by
+    // 16 000 destinations: each lowering holds a memo slot for the one
+    // instance it sizes, not one for every instance.
+    let body = "s_extra = {}\n\
+        for i = 1, 60000 do s_extra[i] = function() return 0 end end\n\
+        skin.extra = s_extra\n\
+        skin.value = { { id = \"v\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, digit = 3,\n\
+          value = function() return ms.number(425) end } }";
+    let dst: String = (0..16_000)
+        .map(|k| {
+            format!(
+                "{{ id = \"v\", dst = {{ {{ x = {}, y = 0, w = 6, h = 6 }} }} }},",
+                k % 1_000
+            )
+        })
+        .collect();
+    super::tests::MEMO_SLOTS.with(|n| n.set(0));
+    import(&skin(body, &dst)).unwrap();
+    let slots = super::tests::MEMO_SLOTS.with(Cell::get);
+    assert!(slots <= 16_000, "{slots} memo slots");
 }
 
 /// The model fields read by the counts the oracle sets, by property id:

@@ -18,8 +18,10 @@
 //! across a candidate's files, and [`MAX_AST_DEPTH`] levels of statements
 //! and subexpressions, checked before recursing, as Lua's own parser
 //! counts them (`LUAI_MAXCCALLS`); cancellation is seen every
-//! [`CHECK_EVERY`] nodes. The parser allocates only its arena and a
-//! shared scratch stack.
+//! [`CHECK_EVERY`] nodes. Besides its arena, the parser keeps a shared
+//! scratch stack and, for the scopes open at the current position, a
+//! stack of declarations, a map from each name to its declarations and
+//! each open function's upvalue set.
 
 use std::collections::{HashMap, HashSet};
 
@@ -131,18 +133,13 @@ pub(crate) enum Expr {
 pub(crate) enum Stmt {
     /// `local` names (declarations) `=` expressions.
     Local { names: List, exprs: List },
-    /// `local function`, its declaration and function.
-    LocalFunction { decl: u32, func: u32 },
-    /// `function name`, its function.
-    Function { func: u32 },
     /// `return` expressions.
     Return(List),
-    /// A call statement.
-    Call(u32),
     /// `;`.
     Empty,
-    /// Any other statement: assignment, `do`, `while`, `repeat`, `if`,
-    /// `for`, `goto`, a label or `break`.
+    /// Any other statement, by its construct's name: a function
+    /// statement, a call statement, an assignment, `do`, `while`,
+    /// `repeat`, `if`, `for`, `goto`, a label or `break`.
     Other(&'static str),
 }
 
@@ -984,7 +981,7 @@ pub(crate) fn parse(src: &[u8], charged: &mut u64, cancel: &dyn Fn() -> bool) ->
     Ok(p.ast)
 }
 
-impl Parser<'_, '_> {
+impl<'a> Parser<'a, '_> {
     fn fail(&self) -> Fail {
         Fail::Syntax(self.tok.line)
     }
@@ -1054,7 +1051,7 @@ impl Parser<'_, '_> {
         Ok(t.tok)
     }
 
-    fn name_bytes(&self, (s, e): (u32, u32)) -> &[u8] {
+    fn name_bytes(&self, (s, e): (u32, u32)) -> &'a [u8] {
         self.lex.src.get(s as usize..e as usize).unwrap_or_default()
     }
 
@@ -1103,19 +1100,18 @@ impl Parser<'_, '_> {
         Ok(u32::try_from(self.ast.decls.len() - 1).unwrap_or(NONE))
     }
 
-    /// The local named `name` in scope, innermost first.
     /// The local named `name` in scope, innermost first: a hash of the
     /// name, O(its length).
     fn lookup(&self, name: &[u8]) -> Option<u32> {
         self.by_name.get(name).and_then(|ds| ds.last().copied())
     }
 
-    /// The name declaration `d` is in scope by.
-    fn decl_name(&self, d: u32) -> Vec<u8> {
+    /// The name declaration `d` is in scope by, borrowed from the source.
+    fn decl_name(&self, d: u32) -> &'a [u8] {
         match self.ast.decls.get(d as usize) {
-            Some(x) if x.kind == DeclKind::SelfParam => b"self".to_vec(),
-            Some(x) => self.name_bytes(x.name).to_vec(),
-            None => Vec::new(),
+            Some(x) if x.kind == DeclKind::SelfParam => b"self",
+            Some(x) => self.name_bytes(x.name),
+            None => b"",
         }
     }
 
@@ -1127,7 +1123,7 @@ impl Parser<'_, '_> {
             return Err(self.fail());
         }
         let name = self.decl_name(d);
-        self.by_name.entry(name).or_default().push(d);
+        self.by_name.entry(name.to_vec()).or_default().push(d);
         self.active.push(d);
         Ok(())
     }
@@ -1139,10 +1135,10 @@ impl Parser<'_, '_> {
                 break;
             };
             let name = self.decl_name(d);
-            if let Some(ds) = self.by_name.get_mut(name.as_slice()) {
+            if let Some(ds) = self.by_name.get_mut(name) {
                 ds.pop();
                 if ds.is_empty() {
-                    self.by_name.remove(name.as_slice());
+                    self.by_name.remove(name);
                 }
             }
         }
@@ -1172,16 +1168,14 @@ impl Parser<'_, '_> {
 
     /// A name read as a value: a local, or a global through `_ENV`.
     fn name_expr(&mut self, t: Token) -> Result<u32, Fail> {
-        let name = self.name_bytes((t.start, t.end)).to_vec();
-        if let Some(d) = self.lookup(&name) {
+        let name = self.name_bytes((t.start, t.end));
+        if let Some(d) = self.lookup(name) {
             self.use_binding(d);
             return self.expr(Expr::Local(d), t.line);
         }
         let env = self.lookup(b"_ENV").unwrap_or(CHUNK_ENV);
         self.use_binding(env);
-        let from = self.ast.bytes.len();
-        self.ast.bytes.extend_from_slice(&name);
-        let name = push_str(&mut self.ast, from);
+        let name = self.field_name(t);
         self.expr(Expr::Global { name, env }, t.line)
     }
 
@@ -1335,7 +1329,7 @@ impl Parser<'_, '_> {
                     if let Some(d) = self.ast.decls.get_mut(decl as usize) {
                         d.init = e;
                     }
-                    self.stmt(Stmt::LocalFunction { decl, func }, line)
+                    self.stmt(Stmt::Other("function"), line)
                 } else {
                     self.local_stat(line)
                 }
@@ -1438,15 +1432,15 @@ impl Parser<'_, '_> {
         } else {
             self.assign_name(first)?;
         }
-        let func = self.body(Form::Named { names, method }, start, method, line)?;
-        self.stmt(Stmt::Function { func }, line)
+        self.body(Form::Named { names, method }, start, method, line)?;
+        self.stmt(Stmt::Other("function"), line)
     }
 
     /// Assignment to a plain name: a write to its local, or a global
     /// through `_ENV`.
     fn assign_name(&mut self, t: Token) -> Result<(), Fail> {
-        let name = self.name_bytes((t.start, t.end)).to_vec();
-        if let Some(d) = self.lookup(&name) {
+        let name = self.name_bytes((t.start, t.end));
+        if let Some(d) = self.lookup(name) {
             self.use_binding(d);
             if let Some(x) = self.ast.decls.get_mut(d as usize) {
                 x.writes = x.writes.saturating_add(1);
@@ -1519,7 +1513,7 @@ impl Parser<'_, '_> {
         if !matches!(self.ast.expr(e), Expr::Call { .. } | Expr::Method { .. }) {
             return Err(self.fail());
         }
-        self.stmt(Stmt::Call(e), line)
+        self.stmt(Stmt::Other("call statement"), line)
     }
 
     /// An assignment's target: a local written, a global, or a field.

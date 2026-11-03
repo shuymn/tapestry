@@ -124,17 +124,7 @@ fn configured(body: &str) -> String {
 
 /// [`configured`] running `after` once its destinations are set.
 fn drawing(body: &str, after: &str) -> String {
-    configured(body).replace(
-        "
-return skin
-",
-        &format!(
-            "
-{after}
-return skin
-"
-        ),
-    )
+    configured(body).replace("\nreturn skin\n", &format!("\n{after}\nreturn skin\n"))
 }
 
 #[test]
@@ -328,22 +318,18 @@ return t",
     // 2 000 callbacks lowered through small helpers, then helpers that
     // expand past the expansion cap.
     let mut helpers = String::from(
-        "local ms = require(\"main_state\")
-local function p0() return ms.number(110) > 0 end
-",
+        "local ms = require(\"main_state\")\nlocal function p0() return ms.number(110) > 0 end\n",
     );
     for k in 1..=31 {
         helpers.push_str(&format!(
-            "local function p{k}() return p{0}() or p{0}() end
-",
+            "local function p{k}() return p{0}() or p{0}() end\n",
             k - 1
         ));
     }
     let callbacks: String = (0..2_000)
         .map(|k| {
             format!(
-                "table.insert(skin.destination, {{ id = \"i\", draw = function() return p{}() end, dst = {{ {{ w = 64, h = 64 }} }} }})
-",
+                "table.insert(skin.destination, {{ id = \"i\", draw = function() return p{}() end, dst = {{ {{ w = 64, h = 64 }} }} }})\n",
                 k % 5
             )
         })
