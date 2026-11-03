@@ -651,6 +651,22 @@ impl Cx<'_> {
         }
         Ok(Some((image, r)))
     }
+
+    /// The rect stretch 5 gives a cover of one colour, y up: its
+    /// destination when a 1×1 frame fitted to its width would be taller,
+    /// else that fitted frame ([`Self::add_cover_image`]); the rows the
+    /// source crops are the same colour.
+    pub(super) fn solid_cover_rect(&self, c: &Common) -> Result<Rect, ImportError> {
+        let at = c.span;
+        let r = self.cover_rect(c)?;
+        let cell = super::super::asset::SYSTEM_SIZE;
+        match trimmed(r, cell).ok_or_else(|| self.range(at, "dst"))? {
+            Some(_) => Ok(r),
+            None => track::stretch(Stretch::FitWidth, r, cell)
+                .map(|(r, _)| r)
+                .ok_or_else(|| self.range(at, "dst")),
+        }
+    }
 }
 
 #[cfg(test)]

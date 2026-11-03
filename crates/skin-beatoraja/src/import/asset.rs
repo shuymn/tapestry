@@ -219,6 +219,19 @@ pub(crate) type Crop = [u32; 2];
 /// it (`play/SkinNote.java:113-138`).
 pub(crate) const FALLBACK_SIZE: [u32; 2] = [32, 8];
 
+/// The size of the source's built-in black and white regions
+/// (`skin/SkinSourceReference.java:25-33`).
+pub(crate) const SYSTEM_SIZE: [u32; 2] = [1, 1];
+
+/// The aggregate limit a generated image's [`ImageError`] stands for.
+fn solid_limit(e: ImageError) -> ImportLimit {
+    match e {
+        ImageError::TooManyImages { .. } => ImportLimit::Images,
+        ImageError::TooManySkinFrames => ImportLimit::Frames,
+        _ => ImportLimit::FileTotals,
+    }
+}
+
 /// The sheet being built, with the importer's caches.
 pub(crate) struct Assets {
     builder: SheetBuilder,
@@ -237,6 +250,8 @@ pub(crate) struct Assets {
     /// The generated note part images, by [`NoteFallback`]: at most
     /// three, however many parts draw them.
     note_fallbacks: [Option<u32>; 3],
+    /// The built-in system images, by straight RGBA and a linear filter.
+    systems: HashMap<([u8; 4], bool), u32>,
 }
 
 #[cfg(test)]
@@ -257,6 +272,7 @@ impl Assets {
             fnt_files: HashMap::new(),
             bitmap_fonts: HashMap::new(),
             note_fallbacks: [None; 3],
+            systems: HashMap::new(),
         }
     }
 
@@ -288,14 +304,40 @@ impl Assets {
             color,
             filter: Filter::Nearest,
         };
-        let i = self.builder.add_solid_image(def).map_err(|e| match e {
-            ImageError::TooManyImages { .. } => ImportLimit::Images,
-            ImageError::TooManySkinFrames => ImportLimit::Frames,
-            _ => ImportLimit::FileTotals,
-        })?;
+        let i = self.builder.add_solid_image(def).map_err(solid_limit)?;
         if let Some(cached) = self.note_fallbacks.get_mut(slot) {
             *cached = Some(i);
         }
+        Ok(i)
+    }
+
+    /// The system image of straight RGBA `color` sampled with `filter`,
+    /// once [`Self::add_system`] added it.
+    pub(crate) fn system(&self, color: [u8; 4], filter: Filter) -> Option<u32> {
+        self.systems
+            .get(&(color, filter == Filter::Linear))
+            .copied()
+    }
+
+    /// Adds the [`SYSTEM_SIZE`] image of straight RGBA `color` sampled
+    /// with `filter`, its image and frame already charged. No file is
+    /// admitted or attempted.
+    ///
+    /// # Errors
+    ///
+    /// The image or frame limit, or a variant's texel total.
+    pub(crate) fn add_system(
+        &mut self,
+        color: [u8; 4],
+        filter: Filter,
+    ) -> Result<u32, ImportLimit> {
+        let def = SolidImageDef {
+            size: SYSTEM_SIZE,
+            color,
+            filter,
+        };
+        let i = self.builder.add_solid_image(def).map_err(solid_limit)?;
+        self.systems.insert((color, filter == Filter::Linear), i);
         Ok(i)
     }
 

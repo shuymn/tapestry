@@ -10,6 +10,7 @@ pub(super) mod judge;
 pub(super) mod lanes;
 pub(super) mod note_parts;
 pub(super) mod number;
+pub(super) mod system;
 pub(super) mod text;
 
 use skin_model::{
