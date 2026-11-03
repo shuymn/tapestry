@@ -33,7 +33,7 @@ use skin_model::{
     CoverImage, CoverMotion, CoverPaintDef, CoverTrim, Follow, MAX_COORD, Native, Source, Track,
 };
 
-use super::super::geom::{HEIGHT, Q};
+use super::super::geom::{HEIGHT, Q, Rect};
 use super::super::policy::{CriticalPart, Role};
 use super::super::report::{LaneApprox, NoteKind, Object};
 use super::super::track::Stretch;
@@ -91,17 +91,34 @@ impl Cx<'_> {
     fn paint_image(
         &mut self,
         c: &Common,
-        dst: &Dst,
         rec: u32,
         s: &SrcImage,
     ) -> Result<Option<Painted>, ImportError> {
+        self.paint_rects(
+            c,
+            |cx| cx.add_cover_image(c, rec, s),
+            |cx| cx.src_image_rects(c, rec, s),
+        )
+    }
+
+    /// A paint's image and baked keys for `c` ([`Self::paint_image`]):
+    /// under stretch 5, while its track is static, the image and rect
+    /// `fit5` gives, that rect for every key; the other trimming
+    /// stretches refused as `c`'s role says; any other stretch as
+    /// `baked` gives them. `None` once `c` is dropped.
+    pub(super) fn paint_rects(
+        &mut self,
+        c: &Common,
+        fit5: impl FnOnce(&mut Self) -> Result<Option<(u32, Rect)>, ImportError>,
+        baked: impl FnOnce(&mut Self) -> Result<Option<Painted>, ImportError>,
+    ) -> Result<Option<Painted>, ImportError> {
         let at = c.span;
-        if dst.stretch == 5 {
+        if c.stretch_mode == 5 {
             if !c.track.identical() {
                 self.drop_el(c.role, at, NoteKind::Stretch(c.stretch_mode))?;
                 return Ok(None);
             }
-            let Some((image, r)) = self.add_cover_image(c, dst, rec, s)? else {
+            let Some((image, r)) = fit5(self)? else {
                 return Ok(None);
             };
             let rect = r.model().ok_or_else(|| self.range(at, "dst"))?;
@@ -111,7 +128,7 @@ impl Cx<'_> {
             self.drop_el(c.role, at, NoteKind::Stretch(c.stretch_mode))?;
             return Ok(None);
         }
-        self.src_image_rects(c, rec, s)
+        baked(self)
     }
 
     /// SUDDEN+'s paint from image record `rec` (`s`) in `role`, its keys
@@ -125,10 +142,23 @@ impl Cx<'_> {
         role: Role,
         range: Option<u32>,
     ) -> Result<(), ImportError> {
+        self.cover_paint_with(dst, role, range, |cx, c| cx.paint_image(c, rec, s))
+    }
+
+    /// SUDDEN+'s paint of `dst` in `role`, its keys already charged as an
+    /// offset-4 candidate, moved by a slider of `range` reference pixels
+    /// when one, drawing the image and keys `paint` gives its common part.
+    pub(super) fn cover_paint_with(
+        &mut self,
+        dst: Dst,
+        role: Role,
+        range: Option<u32>,
+        paint: impl FnOnce(&mut Self, &Common) -> Result<Option<Painted>, ImportError>,
+    ) -> Result<(), ImportError> {
         let Some(c) = self.image_common(&dst, true, role)? else {
             return Ok(());
         };
-        let Some((image, rects, native)) = self.paint_image(&c, &dst, rec, s)? else {
+        let Some((image, rects, native)) = paint(self, &c)? else {
             return Ok(());
         };
         let t = self.model_track(&c, &rects)?;
@@ -210,7 +240,7 @@ impl Cx<'_> {
             }
             raw
         };
-        let Some((image, rects, native)) = self.paint_image(&c, &dst, rec, &s)? else {
+        let Some((image, rects, native)) = self.paint_image(&c, rec, &s)? else {
             return Ok(());
         };
         let gate_track = if trim == CoverTrim::None || raw == rects {

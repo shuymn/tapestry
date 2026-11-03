@@ -682,15 +682,10 @@ impl<'d> Cx<'d> {
         };
         // A negative number is a player-drawn image (`JSONSkinLoader.java:
         // 316-339`).
-        if id.parse::<i32>().is_ok_and(|n| n < 0) {
-            self.drop_el(
-                Role::Decorative,
-                at,
-                NoteKind::Unsupported {
-                    object: Object::System,
-                },
-            )?;
-            return Ok(());
+        if let Ok(n) = id.parse::<i32>()
+            && n < 0
+        {
+            return self.system(dst, n);
         }
         let Some((object, orec)) = self.objects.lookup(self.def, &self.tables, &id)? else {
             self.ignored(at, NoteKind::UndefinedObject);

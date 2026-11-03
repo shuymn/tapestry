@@ -111,7 +111,8 @@ pub enum Object {
     Bga,
     Judge,
     PmChara,
-    /// A destination with a negative numeric id: a player-drawn image.
+    /// A destination with a negative numeric id other than the built-in
+    /// black and white: a player-drawn image the importer cannot draw.
     System,
     /// An image whose source is a movie.
     Movie,
