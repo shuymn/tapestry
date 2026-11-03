@@ -5,7 +5,6 @@
 
 mod common;
 
-use bms_model::ChartBuilder;
 use common::lanes::{cover, with};
 use common::play::{Drawn, quad_texel, round};
 use common::{Loaded, import_body};
@@ -27,8 +26,7 @@ type Painted = ([i32; 4], [f32; 4], [u8; 4], Blend);
 fn painted(l: &Loaded, ms: i64) -> Vec<Painted> {
     let skin = l.ok().skin.clone();
     let atlas = skin.atlas(Variant::Lo, LIMITS).unwrap();
-    let chart = ChartBuilder::new(150_000).build().unwrap();
-    let mut d = Drawn::over(skin, &chart);
+    let mut d = Drawn::new(skin, 0);
     let quads = d.frame(ms, &[]);
     let runs = d.batch.runs().to_vec();
     let blend = |i: usize| {
@@ -125,10 +123,9 @@ fn an_offset_four_system_image_paints_sudden_plus() {
     let lid = cover("").replace(r#""id": "cover""#, r#""id": "-110""#);
     let l = with("", &[&lid]);
     assert_eq!(l.report().usage.file_attempts, 1, "a.png alone");
-    let chart = ChartBuilder::new(150_000).build().unwrap();
     let skin = l.ok().skin.clone();
     let atlas = skin.atlas(Variant::Lo, LIMITS).unwrap();
-    let mut d = Drawn::over(skin, &chart);
+    let mut d = Drawn::new(skin, 0);
     d.view.cover = 500;
     let quads = d.frame(1_000, &[]);
     let shown: Vec<_> = quads
@@ -143,7 +140,7 @@ fn an_offset_four_system_image_paints_sudden_plus() {
             .replace(r#""offset": 4"#, r#""offset": 4, "stretch": 5"#)
             .replace(r#""h": 600"#, &format!(r#""h": {h}"#));
         let l = with("", &[&lid]);
-        let mut d = Drawn::over(l.ok().skin.clone(), &chart);
+        let mut d = Drawn::new(l.ok().skin.clone(), 0);
         d.view.cover = 500;
         assert_eq!(d.shown(1_000), [shown], "{h}");
     }
@@ -172,9 +169,7 @@ fn trimmed_paint(x: i32, y: i32, w: i32, h: i32) -> Vec<[i32; 4]> {
             "dst": [{{"x": {x}, "y": {y}, "w": {w}, "h": {h}}}]}}"#
     );
     let l = with("", &[&lid]);
-    let chart = ChartBuilder::new(150_000).build().unwrap();
-    let mut d = Drawn::over(l.ok().skin.clone(), &chart);
-    d.frame(0, &[]).iter().map(|q| round(q.rect)).collect()
+    Drawn::new(l.ok().skin.clone(), 0).rects(0)
 }
 
 #[test]
@@ -210,8 +205,7 @@ fn an_untimed_critical_fade_is_kept_with_one_d3_note() {
                 {"time": 500, "x": 20, "y": 800, "w": 430, "h": 600, "a": 255}]}"#;
     let l = with("", &[fade]);
     assert_eq!(common::d3_notes(&l), 1);
-    let chart = ChartBuilder::new(150_000).build().unwrap();
-    let mut d = Drawn::over(l.ok().skin.clone(), &chart);
+    let mut d = Drawn::new(l.ok().skin.clone(), 0);
     let alpha =
         |d: &mut Drawn, ms| -> Vec<f32> { d.frame(ms, &[]).iter().map(|q| q.color[3]).collect() };
     assert_eq!(alpha(&mut d, 250), [127.5 / 255.0]);
@@ -288,22 +282,6 @@ fn system_images_charge_the_frame_limit() {
     }
 }
 
-/// A 24-bit BMP header declaring `w`×`h` with no pixels behind it: the
-/// importer reads headers only.
-fn bmp_header(w: i32, h: i32) -> Vec<u8> {
-    let mut out = b"BM".to_vec();
-    out.extend_from_slice(&54_u32.to_le_bytes());
-    out.extend_from_slice(&[0; 4]);
-    out.extend_from_slice(&54_u32.to_le_bytes());
-    out.extend_from_slice(&40_u32.to_le_bytes());
-    out.extend_from_slice(&w.to_le_bytes());
-    out.extend_from_slice(&h.to_le_bytes());
-    out.extend_from_slice(&1_u16.to_le_bytes());
-    out.extend_from_slice(&24_u16.to_le_bytes());
-    out.extend_from_slice(&[0; 24]);
-    out
-}
-
 /// Ten 4096×3072 files and a 4096×`last` one, each drawn, then `extra`
 /// destinations.
 fn texels_skin(last: i32, extra: &str) -> Result<skin_beatoraja::Imported, ImportError> {
@@ -318,7 +296,7 @@ fn texels_skin(last: i32, extra: &str) -> Result<skin_beatoraja::Imported, Impor
     let d = common::skin(&[("s.json", &json)]);
     for i in 0..11 {
         let h = if i == 10 { last } else { 3_072 };
-        common::write(d.path(), &format!("{i}.bmp"), &bmp_header(4_096, h));
+        common::write(d.path(), &format!("{i}.bmp"), &common::bmp_header(4_096, h));
     }
     common::import_dir(d.path())
 }
@@ -327,14 +305,21 @@ fn texels_skin(last: i32, extra: &str) -> Result<skin_beatoraja::Imported, Impor
 fn system_images_charge_the_texel_totals() {
     // 10 × 12 Mi + 4096 × 2047 texels leaves 4,096 of the 128 Mi a
     // variant holds: a system image fits.
-    let one = r#", {"id": "-110", "dst": [{"w": 1, "h": 1}]}"#;
+    let one = ",\n{\"id\": \"-110\", \"dst\": [{\"w\": 1, \"h\": 1}]}";
     let r = texels_skin(2_047, one).unwrap().report;
     assert_eq!((r.usage.images, r.usage.files), (12, 11), "{:?}", r.notes);
-    // At exactly 128 Mi it does not.
+    // The files alone fill exactly 128 Mi and are accepted.
+    let r = texels_skin(2_048, "").unwrap().report;
+    assert_eq!((r.usage.images, r.usage.files), (11, 11), "{:?}", r.notes);
+    // A system image after them does not fit: the limit is located at
+    // its destination, on the definition's second line.
     match texels_skin(2_048, one) {
-        Err(ImportError::Limit { limit, at }) => {
+        Err(ImportError::Limit {
+            limit,
+            at: Some(at),
+        }) => {
             assert_eq!(limit, ImportLimit::FileTotals);
-            assert!(at.is_some());
+            assert_eq!((at.file.as_str(), at.line, at.col), ("s.json", 2, 1));
         }
         other => panic!("{:?}", other.map(|i| i.report)),
     }

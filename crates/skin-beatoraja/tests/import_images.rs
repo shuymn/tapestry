@@ -325,21 +325,6 @@ fn an_entry_the_source_could_draw_drops_the_set() {
     }
 }
 
-/// A 24-bit BMP header declaring `w`×`h` with no pixels behind it.
-fn bmp_header(w: i32, h: i32) -> Vec<u8> {
-    let mut out = b"BM".to_vec();
-    out.extend_from_slice(&54_u32.to_le_bytes()); // file size, not checked
-    out.extend_from_slice(&[0; 4]);
-    out.extend_from_slice(&54_u32.to_le_bytes()); // pixel offset
-    out.extend_from_slice(&40_u32.to_le_bytes()); // BITMAPINFOHEADER
-    out.extend_from_slice(&w.to_le_bytes());
-    out.extend_from_slice(&h.to_le_bytes());
-    out.extend_from_slice(&1_u16.to_le_bytes()); // planes
-    out.extend_from_slice(&24_u16.to_le_bytes()); // bits per pixel
-    out.extend_from_slice(&[0; 24]); // no compression, sizes, palette
-    out
-}
-
 /// A decorative image cut from a file past the per-file texel cap (a
 /// 6400×7941 animation sheet) drops, its note naming that cap rather
 /// than a missing file.
@@ -352,7 +337,7 @@ fn a_file_past_the_texel_cap_drops_naming_the_cap() {
            "destination": [{{"id": "i", {KEY}}}]}}"#
     );
     let dir = common::skin_with(&json, &[]);
-    common::write(dir.path(), "close.bmp", &bmp_header(6_400, 7_941));
+    common::write(dir.path(), "close.bmp", &common::bmp_header(6_400, 7_941));
     let l = common::Loaded {
         result: common::import_dir(dir.path()),
         dir,
