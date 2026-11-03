@@ -574,6 +574,39 @@ pub struct SpeedLine {
     pub target: u32,
 }
 
+impl SpeedLine {
+    /// The line of the adjustments' `snapshot`, its green number at the
+    /// playback tempo `reference`: each value rounded half up from its
+    /// exact ratio, widened, as the native projection rounds
+    /// ([`game::readouts`]), so a valid exact gain never overflows.
+    #[must_use]
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    pub fn of(
+        snapshot: &game::adjustment::PresentationSnapshot,
+        reference: Option<game::Ratio>,
+    ) -> Self {
+        let h = snapshot.options.hispeed();
+        let covers = snapshot.options.covers();
+        let half_up = |n: u128, d: u128| u64::try_from((2 * n + d) / (2 * d)).ok();
+        let hispeed_x100 = snapshot
+            .hispeed
+            .and_then(|x| half_up(100 * u128::from(x.num()), u128::from(x.den())));
+        // The native duration's exact ratio, its green number 3/5 of it.
+        let green = game::readouts::variant(
+            covers.sudden.effective(),
+            covers.lift.effective(),
+            reference,
+            snapshot.hispeed,
+        )
+        .and_then(|t| half_up(3 * u128::from(t.num()), 5 * u128::from(t.den())));
+        Self {
+            hispeed_x100,
+            floating: h.mode == game::SpeedMode::Floating,
+            green,
+            target: h.green_target,
+        }
+    }
+}
 /// The end screen's page to draw: `base` (the summary's lines and the
 /// view's graphs, which a settings change keeps) with the settings lines of
 /// `t` and `speed` under its lines.
@@ -640,6 +673,34 @@ mod tests {
         assert_eq!(key_name(None), "UNBOUND");
     }
 
+    /// The hi-speed line rounds each exact value widened: a valid gain
+    /// with large terms (150.0000000000000001 BPM, target 300) shows 3.20
+    /// and green 300, not an overflow.
+    #[test]
+    fn the_speed_line_rounds_large_exact_terms() {
+        let bpm = game::Ratio::new(1_500_000_000_000_000_001, 10_000_000_000_000_000).unwrap();
+        let covers = game::Covers::default();
+        let h = game::solve(bpm, 300, &covers).unwrap();
+        let snapshot = game::adjustment::PresentationSnapshot {
+            options: game::PlayOptions::default(),
+            hispeed: Some(h),
+            target: None,
+            display_offset_us: 0,
+            adjusting: false,
+            generation: 0,
+            sequence: 1,
+            epoch: 1,
+        };
+        assert_eq!(
+            super::SpeedLine::of(&snapshot, Some(bpm)),
+            super::SpeedLine {
+                hispeed_x100: Some(320),
+                floating: true,
+                green: Some(300),
+                target: 300,
+            }
+        );
+    }
     #[test]
     fn settings_lines_show_each_value_and_its_keys() {
         let t = game::Tuning {

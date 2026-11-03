@@ -384,18 +384,7 @@ impl PlayerRig<'_> {
             let bpm = t.references().ok()?.get(h.reference);
             bpm.times(speed).ok()
         });
-        end_screen::SpeedLine {
-            hispeed_x100: s
-                .hispeed
-                .and_then(|x| game::Ratio::new(100, 1).and_then(|c| x.times(c).ok()))
-                .map(game::Ratio::round_half_up),
-            floating: h.mode == game::SpeedMode::Floating,
-            green: reference
-                .zip(s.hispeed)
-                .and_then(|(b, x)| game::green(b, x, &s.options.covers()).ok())
-                .map(game::Ratio::round_half_up),
-            target: h.green_target,
-        }
+        end_screen::SpeedLine::of(&s, reference)
     }
 
     /// Hands the end screen's page, with the settings lines of `t` and the
