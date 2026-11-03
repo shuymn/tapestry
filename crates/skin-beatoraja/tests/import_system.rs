@@ -9,8 +9,10 @@ use bms_model::ChartBuilder;
 use common::lanes::{cover, with};
 use common::play::{Drawn, quad_texel, round};
 use common::{Loaded, import_body};
-use skin_beatoraja::{CriticalPart, ImportError, NoteKind, Object, Severity, TimerWhy};
-use skin_model::{AtlasLimits, Blend, Variant};
+use skin_beatoraja::{
+    CriticalPart, ImportError, ImportLimit, NoteKind, Object, Severity, TimerWhy,
+};
+use skin_model::{AtlasLimits, Blend, MAX_SKIN_FRAMES, MAX_TOTAL_TEXELS, Variant};
 
 const LIMITS: AtlasLimits = AtlasLimits {
     max_side: 4_096,
@@ -197,6 +199,146 @@ fn stretch_five_takes_the_sources_branch_for_any_sign() {
     for ((x, y, w, h), want) in cases {
         assert_eq!(trimmed_paint(x, y, w, h), [want], "{x} {y} {w} {h}");
     }
+}
+
+#[test]
+fn an_untimed_critical_fade_is_kept_with_one_d3_note() {
+    // Only its alpha changes, so the critical paint may run on `screen`
+    // (D3): admitted, fading in over 500 ms, with one deviation note.
+    let fade = r#"{"id": "-111", "offset": 4,
+        "dst": [{"time": 0, "x": 20, "y": 800, "w": 430, "h": 600, "a": 0},
+                {"time": 500, "x": 20, "y": 800, "w": 430, "h": 600, "a": 255}]}"#;
+    let l = with("", &[fade]);
+    assert_eq!(common::d3_notes(&l), 1);
+    let chart = ChartBuilder::new(150_000).build().unwrap();
+    let mut d = Drawn::over(l.ok().skin.clone(), &chart);
+    let alpha =
+        |d: &mut Drawn, ms| -> Vec<f32> { d.frame(ms, &[]).iter().map(|q| q.color[3]).collect() };
+    assert_eq!(alpha(&mut d, 250), [127.5 / 255.0]);
+    assert_eq!(alpha(&mut d, 400), [204.0 / 255.0]);
+}
+
+#[test]
+fn each_filter_charges_one_image_per_colour() {
+    let l = import_body(
+        r#""destination": [
+            {"id": "-110", "dst": [{"w": 1, "h": 1}]},
+            {"id": "-110", "filter": 1, "dst": [{"w": 1, "h": 1}]},
+            {"id": "-110", "dst": [{"w": 1, "h": 1}]},
+            {"id": "-110", "filter": 1, "dst": [{"w": 1, "h": 1}]},
+            {"id": "-111", "filter": 1, "dst": [{"w": 1, "h": 1}]}]"#,
+    );
+    let u = l.report().usage;
+    assert_eq!(
+        (u.elements, u.images, u.frames, u.file_attempts),
+        (5, 3, 3, 0)
+    );
+    let filters: Vec<_> = l.quads(0).iter().map(|q| q.filter).collect();
+    use skin_model::Filter::{Linear, Nearest};
+    assert_eq!(filters, [Nearest, Linear, Nearest, Linear, Linear]);
+}
+
+/// A play skin of 31 images of 1,024 frames and one of `last`, each
+/// drawn with both filters, then `extra` destinations.
+fn frames_skin(last: &str, extra: &str) -> common::Loaded {
+    let mut images: Vec<String> = (0..31)
+        .map(|i| {
+            format!(r#"{{"id": "{i}", "src": "a", "w": 64, "h": 64, "divx": 32, "divy": 32}}"#)
+        })
+        .collect();
+    images.push(format!(r#"{{"id": "31", "src": "a", {last}}}"#));
+    let dsts = common::join((0..64).map(|k| {
+        format!(
+            r#"{{"id": "{}", "filter": {}, "dst": [{{"w": 1, "h": 1}}]}}"#,
+            k / 2,
+            k % 2
+        )
+    }));
+    import_body(&format!(
+        r#""image": [{}], "destination": [{dsts} {extra}]"#,
+        images.join(", ")
+    ))
+}
+
+#[test]
+fn system_images_charge_the_frame_limit() {
+    // 31 grids of 1,024 frames and one of 1,023 (31 × 33), each with two
+    // filters: two frames short of the limit, which black and white take.
+    let last = r#""w": 62, "h": 33, "divx": 31, "divy": 33"#;
+    let both = r#", {"id": "-110", "dst": [{"w": 1, "h": 1}]},
+                   {"id": "-111", "dst": [{"w": 1, "h": 1}]}"#;
+    let l = frames_skin(last, both);
+    let u = l.report().usage;
+    assert_eq!(
+        (u.images, u.frames),
+        (66, u32::try_from(MAX_SKIN_FRAMES).unwrap())
+    );
+    assert_eq!(l.ok().skin.sheet().frame_count(), MAX_SKIN_FRAMES);
+    // Either colour again charges nothing; black with the other filter
+    // is one frame past it.
+    let again = format!("{both}{both}");
+    assert_eq!(frames_skin(last, &again).report().usage.images, 66);
+    let linear = format!(r#"{both}, {{"id": "-110", "filter": 1, "dst": [{{"w": 1, "h": 1}}]}}"#);
+    match frames_skin(last, &linear).result {
+        Err(ImportError::Limit { limit, at }) => {
+            assert_eq!(limit, ImportLimit::Frames);
+            assert!(at.is_some());
+        }
+        other => panic!("{:?}", other.map(|i| i.report)),
+    }
+}
+
+/// A 24-bit BMP header declaring `w`×`h` with no pixels behind it: the
+/// importer reads headers only.
+fn bmp_header(w: i32, h: i32) -> Vec<u8> {
+    let mut out = b"BM".to_vec();
+    out.extend_from_slice(&54_u32.to_le_bytes());
+    out.extend_from_slice(&[0; 4]);
+    out.extend_from_slice(&54_u32.to_le_bytes());
+    out.extend_from_slice(&40_u32.to_le_bytes());
+    out.extend_from_slice(&w.to_le_bytes());
+    out.extend_from_slice(&h.to_le_bytes());
+    out.extend_from_slice(&1_u16.to_le_bytes());
+    out.extend_from_slice(&24_u16.to_le_bytes());
+    out.extend_from_slice(&[0; 24]);
+    out
+}
+
+/// Ten 4096×3072 files and a 4096×`last` one, each drawn, then `extra`
+/// destinations.
+fn texels_skin(last: i32, extra: &str) -> Result<skin_beatoraja::Imported, ImportError> {
+    let sources = common::join((0..11).map(|i| format!(r#"{{"id": "{i}", "path": "{i}.bmp"}}"#)));
+    let images =
+        common::join((0..11).map(|i| format!(r#"{{"id": "{i}", "src": "{i}", "w": 1, "h": 1}}"#)));
+    let dsts =
+        common::join((0..11).map(|i| format!(r#"{{"id": "{i}", "dst": [{{"w": 1, "h": 1}}]}}"#)));
+    let json = common::hd(&format!(
+        r#""source": [{sources}], "image": [{images}], "destination": [{dsts} {extra}]"#
+    ));
+    let d = common::skin(&[("s.json", &json)]);
+    for i in 0..11 {
+        let h = if i == 10 { last } else { 3_072 };
+        common::write(d.path(), &format!("{i}.bmp"), &bmp_header(4_096, h));
+    }
+    common::import_dir(d.path())
+}
+
+#[test]
+fn system_images_charge_the_texel_totals() {
+    // 10 × 12 Mi + 4096 × 2047 texels leaves 4,096 of the 128 Mi a
+    // variant holds: a system image fits.
+    let one = r#", {"id": "-110", "dst": [{"w": 1, "h": 1}]}"#;
+    let r = texels_skin(2_047, one).unwrap().report;
+    assert_eq!((r.usage.images, r.usage.files), (12, 11), "{:?}", r.notes);
+    // At exactly 128 Mi it does not.
+    match texels_skin(2_048, one) {
+        Err(ImportError::Limit { limit, at }) => {
+            assert_eq!(limit, ImportLimit::FileTotals);
+            assert!(at.is_some());
+        }
+        other => panic!("{:?}", other.map(|i| i.report)),
+    }
+    assert_eq!(MAX_TOTAL_TEXELS, 10 * (4_096 * 3_072) + 4_096 * 2_048);
 }
 
 #[test]
