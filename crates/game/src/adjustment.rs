@@ -628,11 +628,7 @@ impl Adjustment {
         tempo: &T,
         writer: &mut PresentationWriter,
     ) {
-        for o in observations {
-            self.observe(o, tempo);
-        }
-        self.published = self.published.wrapping_add(1);
-        writer.0.write(self.snapshot());
+        self.feed(observations.into_iter().map(Augmented::Obs), tempo, writer);
     }
 
     /// Takes a drain's items of the augmented stream in order, a cut as
