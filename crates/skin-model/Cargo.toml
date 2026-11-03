@@ -12,6 +12,7 @@ bms-model.workspace = true
 etagere.workspace = true
 eval.workspace = true
 image.workspace = true
+png.workspace = true
 rules.workspace = true
 thiserror.workspace = true
 
@@ -19,7 +20,6 @@ thiserror.workspace = true
 # The lanes tests load charts as a session does.
 bms-parser.workspace = true
 criterion.workspace = true
-png.workspace = true
 proptest.workspace = true
 tempfile.workspace = true
 

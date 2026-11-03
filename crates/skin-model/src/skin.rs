@@ -1429,13 +1429,19 @@ impl Skin {
         &self.sheet
     }
 
-    /// Builds the sheet's atlas for `variant` ([`Sheet::atlas`]).
+    /// Builds the sheet's atlas for `variant`, asking `cancel` as it goes
+    /// ([`Sheet::atlas`]).
     ///
     /// # Errors
     ///
     /// As [`Sheet::atlas`].
-    pub fn atlas(&self, variant: Variant, limits: AtlasLimits) -> Result<Atlas, AtlasError> {
-        self.sheet.atlas(variant, limits)
+    pub fn atlas(
+        &self,
+        variant: Variant,
+        limits: AtlasLimits,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<Atlas, AtlasError> {
+        self.sheet.atlas(variant, limits, cancel)
     }
 
     /// The operations every frame's expressions run.
@@ -2276,7 +2282,7 @@ mod tests {
             .save_with_format(dir.path().join("f.png"), image::ImageFormat::Png)
             .unwrap();
         let mut b = SheetBuilder::new(&Root::new(dir.path()).unwrap());
-        let f = b.admit_fnt("f.fnt", &mut |_| Ok(())).unwrap();
+        let f = b.admit_fnt("f.fnt", &mut |_| Ok(()), &|| false).unwrap();
         b.add_bitmap_font(f, &[]).unwrap();
         let mut props = [None; 9];
         props[..4].copy_from_slice(&[Some(0), Some(0), Some(100), Some(10)]);

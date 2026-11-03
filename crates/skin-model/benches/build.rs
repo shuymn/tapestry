@@ -165,7 +165,9 @@ fn bench_bitmap_text(c: &mut Criterion) {
         .save_with_format(dir.path().join("b.png"), image::ImageFormat::Png)
         .expect("write the page");
     let mut b = SheetBuilder::new(&Root::new(dir.path()).expect("a root"));
-    let f = b.admit_fnt("b.fnt", &mut |_| Ok(())).expect("the font");
+    let f = b
+        .admit_fnt("b.fnt", &mut |_| Ok(()), &|| false)
+        .expect("the font");
     b.add_bitmap_font(f, &[]).expect("a bitmap font");
     let text = TextDef {
         value: TextValue::Literal("AB".repeat(MAX_TEXT_BYTES / 2)),

@@ -17,11 +17,31 @@ mod mip;
 mod pack;
 pub(crate) mod uv;
 
+use ::image::RgbaImage;
+
+use crate::image::decode::{self, Bands, Site};
 use crate::image::path;
-use crate::image::{self, decode};
+use crate::image::{self, Stop};
 use crate::image::{CellSource, FileAt, ImageError, MAX_FILE_BYTES, MAX_TOTAL_FILE_BYTES, Sheet};
 use pack::PackError;
 use uv::{FrameUv, UvTable};
+
+/// The bytes a cell keeps in the atlas's tables while its files are read
+/// and decoded: its rectangle and its place.
+pub const CELL_TABLE_BYTES: usize = size_of::<[u32; 4]>() + size_of::<pack::Place>();
+/// The bytes a file with cells keeps in the atlas's tables while files are
+/// read and decoded: its index and its cells' range.
+pub const FILE_TABLE_BYTES: usize = size_of::<FileCells>();
+/// The most the atlas's tables hold while files are read and decoded:
+/// [`MAX_SKIN_FRAMES`](crate::MAX_SKIN_FRAMES) cells and
+/// [`MAX_FILES`](crate::MAX_FILES) files, 65 536 × 36 B + 4 096 × 24 B =
+/// 2 457 600 B. No file's path is kept: each is resolved again as it is
+/// read, so only the one being read has its canonical path live.
+pub const ATLAS_TABLE_BYTES: usize =
+    crate::MAX_SKIN_FRAMES * CELL_TABLE_BYTES + crate::image::MAX_FILES * FILE_TABLE_BYTES;
+
+/// A file with cells: its index and its cells' range.
+type FileCells = (usize, usize, usize);
 
 /// Mip levels per page, level 0 included.
 pub const MIP_LEVELS: usize = 4;
@@ -73,6 +93,18 @@ pub enum AtlasError {
     Misaligned,
     #[error(transparent)]
     Image(#[from] ImageError),
+    /// The build was cancelled: neither a file's failure nor a limit.
+    #[error("the atlas build was cancelled")]
+    Cancelled,
+}
+
+impl From<Stop> for AtlasError {
+    fn from(s: Stop) -> Self {
+        match s {
+            Stop::Cancelled => Self::Cancelled,
+            Stop::Image(e) => Self::Image(e),
+        }
+    }
 }
 
 /// One page: its mip levels, each RGBA8, premultiplied, row by row.
@@ -164,14 +196,33 @@ impl Sheet {
     /// every file to be read again (its path, at most [`MAX_FILE_BYTES`],
     /// and at most [`MAX_TOTAL_FILE_BYTES`] across them), and reads and
     /// decodes one file at a time, each into memory freed before the next:
-    /// a file whose dimensions changed since load is refused. Generated
-    /// cells ([`SolidImageDef`](crate::SolidImageDef)) are written last,
-    /// at one size in both variants, reading nothing.
+    /// whole, or in bands of rows when it was admitted to be
+    /// ([`MAX_STREAMED_TEXELS`](crate::MAX_STREAMED_TEXELS)), each band
+    /// written to every cell it crosses. A file whose dimensions or format,
+    /// or a PNG whose header fields, changed since load is refused. Generated cells
+    /// ([`SolidImageDef`](crate::SolidImageDef)) are written last, at one
+    /// size in both variants, reading nothing.
+    ///
+    /// Memory beside the pages: the tables ([`ATLAS_TABLE_BYTES`] at
+    /// most), the canonical path of the file being read, and that one file
+    /// read and decoded within its own bound
+    /// ([`MAX_IMAGE_TEXELS`](crate::MAX_IMAGE_TEXELS),
+    /// [`MAX_STREAMED_TEXELS`](crate::MAX_STREAMED_TEXELS)).
+    ///
+    /// `cancel` is asked as each file's bytes are read, before each band
+    /// and each read after a banded file's rows, and before each page's
+    /// mip level.
     ///
     /// # Errors
     ///
-    /// The first check that fails.
-    pub fn atlas(&self, variant: Variant, limits: AtlasLimits) -> Result<Atlas, AtlasError> {
+    /// The first check that fails; [`AtlasError::Cancelled`] once `cancel`
+    /// said so.
+    pub fn atlas(
+        &self,
+        variant: Variant,
+        limits: AtlasLimits,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<Atlas, AtlasError> {
         let max_pages = page_cap(&limits)?;
         let cap = pack::side_cap(limits.max_side.min(MAX_PAGE_SIDE));
         let files = self.files();
@@ -205,6 +256,9 @@ impl Sheet {
                 PackError::TooManyPages => AtlasError::TooManyPages,
                 PackError::Misaligned => AtlasError::Misaligned,
             })?;
+        // Only the rectangles and the places stay beside the files
+        // ([`CELL_TABLE_BYTES`]).
+        drop(padded);
         let side = packing.side;
         let texels = pack::cost(limits.reserved_layers, packing.pages, side);
         if texels > MAX_ATLAS_TEXELS {
@@ -222,9 +276,10 @@ impl Sheet {
             });
         }
 
-        self.fill(variant, &rects, &packing, &mut pages)?;
+        self.fill(variant, &rects, &packing, &mut pages, cancel)?;
         for page in &mut pages {
             for k in 1..MIP_LEVELS {
+                decode::checkpoint(cancel, Site::Mip).map_err(|_| AtlasError::Cancelled)?;
                 let (done, rest) = page.levels.split_at_mut(k);
                 if let (Some(src), Some(dst)) = (done.last(), rest.first_mut()) {
                     let src_side = side >> (k - 1);
@@ -265,12 +320,13 @@ impl Sheet {
         rects: &[[u32; 4]],
         packing: &pack::Packing,
         pages: &mut [Page],
+        cancel: &dyn Fn() -> bool,
     ) -> Result<(), AtlasError> {
         let files = self.files();
         let cells = self.cells();
         // The files with cells, checked and summed before any is read.
         // File cells come first ([`CellSource`]'s order).
-        let mut used: Vec<(usize, usize, usize)> = Vec::new();
+        let mut used: Vec<FileCells> = Vec::new();
         let mut start = 0;
         while let Some(&CellSource::File(file)) = cells.get(start).map(|c| &c.source) {
             let end = start
@@ -282,42 +338,62 @@ impl Sheet {
             used.push((usize::try_from(file).unwrap_or(usize::MAX), start, end));
             start = end;
         }
+        // At most [`MAX_FILES`](crate::MAX_FILES) entries
+        // ([`ATLAS_TABLE_BYTES`]), whatever the growth left.
+        used.shrink_to_fit();
+        // Each file's path and length, checked and summed before any is
+        // read; the canonical paths are not kept.
+        let version = |file: usize| {
+            let (version, hi) = files.get(file)?.version(variant);
+            Some((version, FileAt { file, hi }))
+        };
         let mut total = 0_u64;
-        let mut resolved = Vec::with_capacity(used.len());
         for &(file, _, _) in &used {
-            let Some(f) = files.get(file) else {
+            let Some((version, at)) = version(file) else {
                 continue;
             };
-            let (version, hi) = f.version(variant);
-            let at = FileAt { file, hi };
-            let (canonical, len) =
+            let (_, len) =
                 path::resolve(self.root(), &version.name).map_err(|e| ImageError::path(at, e))?;
             total = total.saturating_add(len);
             if total > MAX_TOTAL_FILE_BYTES {
                 return Err(ImageError::TotalBytesTooLarge { at }.into());
             }
-            resolved.push((at, canonical, version.dims));
         }
 
         let mut budget = MAX_TOTAL_FILE_BYTES;
-        for ((at, canonical, dims), &(_, start, end)) in resolved.into_iter().zip(&used) {
-            let bytes = image::read_encoded(&canonical, at, MAX_FILE_BYTES.min(budget))?;
+        for &(file, start, end) in &used {
+            let Some((version, at)) = version(file) else {
+                continue;
+            };
+            let header = (version.dims, version.mode);
+            // Resolved again as it is read: only this file's path is live.
+            let (canonical, _) =
+                path::resolve(self.root(), &version.name).map_err(|e| ImageError::path(at, e))?;
+            let bytes = image::read_encoded(&canonical, at, MAX_FILE_BYTES.min(budget), cancel)?;
+            drop(canonical);
             budget = budget.saturating_sub(u64::try_from(bytes.len()).unwrap_or(budget));
-            let image = decode::decode(bytes, dims).map_err(|e| ImageError::decode(at, e))?;
-            for i in start..end {
-                let (Some(place), Some(&rect)) = (packing.places.get(i), rects.get(i)) else {
-                    continue;
-                };
-                let Some(page) = usize::try_from(place.page)
-                    .ok()
-                    .and_then(|p| pages.get_mut(p))
-                else {
-                    continue;
-                };
-                let Some(level) = page.levels.first_mut() else {
-                    continue;
-                };
-                mip::blit(level, packing.side, &image, rect, place.alloc);
+            // This file's placements and window, at their exact size, made
+            // after its bytes are read and freed with them: nothing of one
+            // file's routing is live while the next file is read.
+            let banded = matches!(header.1, decode::Mode::Banded(_));
+            let mut places = Vec::with_capacity(end.saturating_sub(start));
+            // Only bands are routed through a window.
+            let mut active = Vec::with_capacity(if banded { places.capacity() } else { 0 });
+            places.extend((start..end).filter_map(|i| {
+                let place = packing.places.get(i)?;
+                Some(Placement {
+                    rect: *rects.get(i)?,
+                    page: usize::try_from(place.page).ok()?,
+                    alloc: place.alloc,
+                })
+            }));
+            if banded {
+                places.sort_unstable_by_key(Placement::top);
+            }
+            let mut router = Router::new(&places, &mut active, pages, packing.side);
+            match image::decode_file(bytes, at, header, cancel, &mut router)? {
+                Some(image) => router.blit(&image),
+                None => router.complete(),
             }
         }
 
@@ -331,13 +407,168 @@ impl Sheet {
             };
             let Some(level) = usize::try_from(place.page)
                 .ok()
-                .and_then(|p| pages.get_mut(p))
-                .and_then(|page| page.levels.first_mut())
+                .and_then(|p| level0(pages, p))
             else {
                 continue;
             };
             mip::blit_solid(level, packing.side, color, place.alloc);
         }
         Ok(())
+    }
+}
+
+/// Page `page`'s level 0.
+fn level0(pages: &mut [Page], page: usize) -> Option<&mut Vec<u8>> {
+    pages.get_mut(page)?.levels.first_mut()
+}
+
+/// Where one cell of a file goes: its rectangle in the file, its page and
+/// its allocation there.
+#[derive(Clone, Copy, Debug)]
+struct Placement {
+    rect: [u32; 4],
+    page: usize,
+    alloc: [u32; 4],
+}
+
+impl Placement {
+    fn top(&self) -> u32 {
+        self.rect[1]
+    }
+
+    /// The row past the cell's last.
+    fn bottom(&self) -> u32 {
+        self.rect[1].saturating_add(self.rect[3])
+    }
+}
+
+/// Routes a file's bands to its cells: the placements, in order of their
+/// first row for bands, and a window of the ones the current band crosses, entered
+/// at their first row and left after their last, so the routing holds
+/// O(cells) and does O(cells + rows) work besides the texels it writes.
+struct Router<'a> {
+    places: &'a [Placement],
+    /// The next placement to enter, by first row.
+    next: usize,
+    /// The window: indices into `places`.
+    active: &'a mut Vec<usize>,
+    pages: &'a mut [Page],
+    side: u32,
+}
+
+impl<'a> Router<'a> {
+    /// A router over `places`, sorted by first row when bands are routed,
+    /// with `active` empty.
+    fn new(
+        places: &'a [Placement],
+        active: &'a mut Vec<usize>,
+        pages: &'a mut [Page],
+        side: u32,
+    ) -> Self {
+        Self {
+            places,
+            next: 0,
+            active,
+            pages,
+            side,
+        }
+    }
+
+    /// Writes a whole file's every placement.
+    fn blit(self, image: &RgbaImage) {
+        for p in self.places {
+            if let Some(level) = level0(self.pages, p.page) {
+                mip::blit(level, self.side, image, p.rect, p.alloc);
+            }
+        }
+    }
+
+    /// Completes every placement's allocation once all its rows are
+    /// written: its first and last rows repeated through the gutter and
+    /// the alignment padding, as [`mip::blit`] fills them.
+    fn complete(self) {
+        for p in self.places {
+            if let Some(level) = level0(self.pages, p.page) {
+                mip::complete(level, self.side, p.rect[3], p.alloc);
+            }
+        }
+    }
+}
+
+impl Bands for Router<'_> {
+    fn wants(&mut self, top: u32, bottom: u32) -> bool {
+        let places = self.places;
+        self.active
+            .retain(|&i| places.get(i).is_some_and(|p| p.bottom() > top));
+        while let Some(p) = places.get(self.next)
+            && p.top() < bottom
+        {
+            if p.bottom() > top {
+                self.active.push(self.next);
+            }
+            self.next += 1;
+        }
+        !self.active.is_empty()
+    }
+
+    fn put(&mut self, top: u32, band: &RgbaImage) {
+        for &i in self.active.iter() {
+            let Some(p) = self.places.get(i) else {
+                continue;
+            };
+            if let Some(level) = level0(self.pages, p.page) {
+                mip::scatter(level, self.side, band, top, p.rect, p.alloc);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_tables_hold_36_bytes_a_cell_and_24_a_file() {
+        assert_eq!(CELL_TABLE_BYTES, 36);
+        assert_eq!(FILE_TABLE_BYTES, 24);
+        assert_eq!(ATLAS_TABLE_BYTES, 65_536 * 36 + 4_096 * 24);
+        assert_eq!(ATLAS_TABLE_BYTES, 2_457_600);
+    }
+
+    #[test]
+    fn the_window_holds_the_cells_a_band_crosses() {
+        // Cells of rows 0..40, 10..20 and 30..60, out of order.
+        let mut places: Vec<Placement> = [[0, 30, 1, 30], [0, 0, 1, 40], [0, 10, 1, 10]]
+            .into_iter()
+            .map(|rect| Placement {
+                rect,
+                page: 0,
+                alloc: [0, 0, 24, 80],
+            })
+            .collect();
+        places.sort_unstable_by_key(Placement::top);
+        let mut active = Vec::new();
+        let mut router = Router::new(&places, &mut active, &mut [], 256);
+        let mut seen = Vec::new();
+        for top in (0..64).step_by(16) {
+            let wants = router.wants(top, top + 16);
+            let mut tops: Vec<u32> = router
+                .active
+                .iter()
+                .map(|&i| router.places[i].top())
+                .collect();
+            tops.sort_unstable();
+            seen.push((wants, tops));
+        }
+        assert_eq!(
+            seen,
+            [
+                (true, vec![0, 10]),
+                (true, vec![0, 10, 30]),
+                (true, vec![0, 30]),
+                (true, vec![30]),
+            ]
+        );
+        assert!(!router.wants(64, 80));
     }
 }

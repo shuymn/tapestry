@@ -4,7 +4,7 @@
 [package]
 name = "fuzz"
 version = "0.0.0"
-description = "Fuzz targets: chart loading, input log decoding, Raw Input packet decoding, canonical preset decoding, skin definition reading and import, Lua skins, and bitmap font parsing."
+description = "Fuzz targets: chart loading, input log decoding, Raw Input packet decoding, canonical preset decoding, skin definition reading and import, Lua skins, bitmap font parsing, and skin images decoded in bands."
 edition = "2024"
 # GPL because it links `input` (design.md "Licenses"). Tooling, never shipped.
 license = "GPL-3.0-or-later"
@@ -85,6 +85,13 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "skin_png"
+path = "fuzz_targets/skin_png.rs"
+test = false
+doc = false
+bench = false
+
 # Proves that a panic, a hang and the memory limits fail a run
 # (scripts/fuzz-selftest.sh). Never fuzzed.
 [[bin]]
@@ -102,6 +109,8 @@ members = ["."]
 # `#[no_mangle]`, which that lint flags.
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
+# cargo-fuzz builds the targets with `--cfg fuzzing`; `skin_png` reads it.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }
 
 [lints.clippy]
 all = { level = "warn", priority = -1 }

@@ -415,6 +415,15 @@ impl<'d> Cx<'d> {
         }
     }
 
+    /// What stops the import when an asset request at `at` stopped: a
+    /// limit, or the candidate's cancellation.
+    fn stopped(&self, at: Span, stop: asset::Stop) -> ImportError {
+        match stop {
+            asset::Stop::Limit(l) => self.limit(at, l),
+            asset::Stop::Cancelled => Definition::cancellation(Some(self.loc(at))),
+        }
+    }
+
     fn range(&self, at: Span, field: &'static str) -> ImportError {
         ImportError::Range {
             at: self.loc(at),

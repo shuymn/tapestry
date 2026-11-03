@@ -16,7 +16,7 @@
 # directory and exits with the fuzzer's status.
 set -euo pipefail
 
-targets=(bms_load replay_file replay_body raw_input preset_canonical skin_json skin_lua skin_fnt)
+targets=(bms_load replay_file replay_body raw_input preset_canonical skin_json skin_lua skin_fnt skin_png)
 # The per-input limits of every run: seconds, then MiB of RSS and of one
 # allocation.
 limits=(-timeout=10 -rss_limit_mb=2048 -malloc_limit_mb=2048)
