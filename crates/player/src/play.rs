@@ -51,9 +51,9 @@ const IDLE_PARK: Duration = Duration::from_micros(game::IDLE_WAIT.0.unsigned_abs
 /// ([`game::InputPump::park`]).
 pub(crate) const MARKER_PARK: Duration = Duration::from_millis(1);
 
-/// How long an operation waits for the input thread's markers in all
-/// before the input thread counts as failed (design.md "Play Lifecycle",
-/// the start gate's open and close bound).
+/// How long an operation waits for the input thread's markers in all, in
+/// awake time, before the input thread counts as failed (design.md "Input
+/// thread failure": 2 s of awake time, a suspend not counted).
 const MARKER_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// The input thread as the adjustment driver needs it
@@ -62,8 +62,9 @@ const MARKER_TIMEOUT: Duration = Duration::from_secs(2);
 pub(crate) struct PlayerPump<'a> {
     pub(crate) input: &'a InputLink,
     pub(crate) tuning: &'a crate::tuning::LiveTuning,
-    /// When this pump's waits began: they end at [`MARKER_TIMEOUT`].
-    pub(crate) since: Option<std::time::Instant>,
+    /// When this pump's waits began, in awake time: they end
+    /// [`MARKER_TIMEOUT`] of awake time later, a suspend not counted.
+    pub(crate) since: Option<Duration>,
 }
 
 impl game::InputPump for PlayerPump<'_> {
@@ -87,8 +88,9 @@ impl game::InputPump for PlayerPump<'_> {
         if let Some(e) = self.input.failure() {
             return Err(e);
         }
-        let since = *self.since.get_or_insert_with(std::time::Instant::now);
-        if since.elapsed() >= MARKER_TIMEOUT {
+        let now = self.input.awake_now();
+        let since = *self.since.get_or_insert(now);
+        if now.saturating_sub(since) >= MARKER_TIMEOUT {
             return Err(InputWaitError::Timeout);
         }
         thread::park_timeout(MARKER_PARK);
@@ -1326,6 +1328,43 @@ mod tests {
     use game::Command;
 
     use super::{until_due, until_fired};
+
+    /// The awake time the marker wait reads, set by the test.
+    static AWAKE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    fn awake() -> std::time::Duration {
+        std::time::Duration::from_millis(AWAKE_MS.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    /// A wait for the input thread's markers is bounded by 2 s of awake
+    /// time: time passed in a suspend, which the awake clock does not
+    /// count, never times it out, and 2 s awake does.
+    #[test]
+    fn the_marker_wait_counts_awake_time_only() {
+        use game::InputPump as _;
+        use std::sync::atomic::Ordering;
+        let controls =
+            std::sync::Arc::new(crate::controls::Controls::new(input::QpcClock::start()));
+        let (_hook, mut link) = crate::input_side::link(
+            std::sync::Arc::clone(&controls),
+            crate::input_side::Mode::Clock,
+            input::Waker::new().unwrap(),
+        );
+        link.set_awake(awake);
+        let mut pump = super::PlayerPump {
+            input: &link,
+            tuning: controls.tuning(),
+            since: None,
+        };
+        AWAKE_MS.store(1_000, Ordering::SeqCst);
+        assert_eq!(pump.park(), Ok(()));
+        // A long suspend: wall time passes, awake time does not.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        AWAKE_MS.store(2_999, Ordering::SeqCst);
+        assert_eq!(pump.park(), Ok(()), "1.999 s awake");
+        AWAKE_MS.store(3_000, Ordering::SeqCst);
+        assert_eq!(pump.park(), Err(game::InputWaitError::Timeout));
+    }
 
     /// A scenario's `until` is due at its chart time exactly: chart time 0
     /// lies at 6 s on the clock, so chart time 2.25 s is clock time 8.25 s.

@@ -362,6 +362,19 @@ impl InputLink {
         }
     }
 
+    /// The awake time now: the clock the input thread's answers are bounded
+    /// on, which stands still through a suspend.
+    #[must_use]
+    pub fn awake_now(&self) -> Duration {
+        (self.awake)()
+    }
+
+    /// Measures the awake time with `awake` from now on (tests).
+    #[cfg(test)]
+    pub(crate) fn set_awake(&mut self, awake: fn() -> Duration) {
+        self.awake = awake;
+    }
+
     /// Wakes the input thread: the adjustment tap waits for room.
     pub fn wake_input(&self) {
         self.waker.wake();
