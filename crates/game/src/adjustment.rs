@@ -1080,7 +1080,7 @@ fn clamp_offset(us: i64) -> i64 {
 }
 
 /// The playback tempo: `bpm` at the practice `speed`.
-fn playback(bpm: Ratio, speed: Speed) -> Result<Ratio, Unrepresentable> {
+pub(crate) fn playback(bpm: Ratio, speed: Speed) -> Result<Ratio, Unrepresentable> {
     let (k, d) = speed.ratio();
     let speed = Ratio::new(u64::from(k), u64::from(d)).ok_or(Unrepresentable)?;
     bpm.times(speed)

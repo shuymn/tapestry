@@ -11,8 +11,9 @@ mod play_support;
 
 use bms_model::TimeUs;
 use lanes_support::{
-    COVER, HIDDEN, LIFT, NOTE, WHITE, cover_image, image, in_lane, lanes_element, moving, paint,
-    quads_of, rects, shown, simple, skin_with_widgets, source, tap_chart,
+    BAR, BODY_OFF, COVER, HEAD, HIDDEN, LIFT, LINE, MINE, NOTE, TAIL, WHITE, cover_image, image,
+    in_lane, lanes_element, moving, paint, quads_of, rects, shown, simple, skin_with_widgets,
+    source, tap_chart,
 };
 use play_support::{Harness, MS, REGIONS, bool_program, full, lane, readouts_for};
 use skin_model::{
@@ -330,6 +331,50 @@ fn every_cover_paint_draws_in_list_order() {
     );
     // LIFT's whole rect, moved up by L, is drawn under its clip.
     assert_eq!(rects(&h, LIFT), [[160.0, 820.0, 544.0, 200.0]]);
+}
+
+/// The source lanes at a field, then with none left (LIFT or SUDDEN+ at
+/// 1 000 ‰): every tap, mine, long-note part and bar is drawn, each cover
+/// paint too, and then none of the note geometry, where the source would
+/// draw every future tap and mine on the line; the paint and the line stay
+/// (docs/stage3.md R6).
+#[test]
+fn with_no_field_no_tap_or_mine_is_drawn() {
+    let mut chart = bms_model::ChartBuilder::new(150_000)
+        .tap(lane(3), TimeUs(1_000 * MS))
+        .tap(lane(3), TimeUs(1_300 * MS))
+        .mine(lane(4), TimeUs(1_200 * MS), 10)
+        .long(lane(2), TimeUs(1_000 * MS), TimeUs(1_300 * MS))
+        .bar(TimeUs(1_100 * MS))
+        .build()
+        .unwrap();
+    chart.meta.ln_mode = Some(bms_model::LnMode::Cn);
+    let elements = vec![
+        lanes_element(),
+        paint(0, [160, 0, 544, 100], Follow::None),
+        lift_paint(),
+        hidden_paint(),
+    ];
+    let skin = def(Some(source()), elements, paints(three_paints())).unwrap();
+    let frame = |[cover, lift, hidden]: [u16; 3]| {
+        let mut h = Harness::new(skin.clone(), &chart, &full(0));
+        (h.view.cover, h.view.lift, h.view.hidden) = (cover, lift, hidden);
+        h.view.gain = skin_model::Gain::new(2, 1);
+        h.frame(900, &[]);
+        h
+    };
+    let notes = [NOTE, MINE, HEAD, TAIL, BODY_OFF, BAR];
+    let paints = [COVER, LIFT, HIDDEN, LINE];
+    let count =
+        |h: &Harness, parts: &[u32]| parts.iter().map(|&p| rects(h, p).len()).collect::<Vec<_>>();
+    let open = frame([200, 100, 500]);
+    assert_eq!(count(&open, &notes), [2, 1, 1, 1, 1, 1]);
+    assert_eq!(count(&open, &paints), [1, 1, 1, 1]);
+    for view in [[0, 1_000, 500], [1_000, 100, 500], [1_000, 1_000, 500]] {
+        let h = frame(view);
+        assert_eq!(count(&h, &notes), [0; 6], "{view:?}");
+        assert_eq!(count(&h, &paints), [1, 1, 1, 1], "{view:?}");
+    }
 }
 
 #[test]

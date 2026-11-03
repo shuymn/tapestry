@@ -432,6 +432,9 @@ pub fn tap_chart() -> bms_model::Chart {
 pub fn shown(skin: Skin, [cover, lift, hidden]: [u16; 3]) -> Harness {
     let mut h = Harness::new(skin, &tap_chart(), &crate::play_support::full(0));
     (h.view.cover, h.view.lift, h.view.hidden) = (cover, lift, hidden);
+    // H 2 at 150 BPM, 800 ms over the original lane: both taps stay
+    // within the lanes under a lift.
+    h.view.gain = skin_model::Gain::new(2, 1);
     h.frame(700, &[]);
     h
 }

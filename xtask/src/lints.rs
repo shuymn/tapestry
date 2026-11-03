@@ -190,6 +190,7 @@ pub const IN_PLAY: &[Site] = &[
         &["AdjustmentPlan::observation"],
     ),
     Site::File("crates/game/src/hispeed.rs"),
+    Site::File("crates/game/src/readouts.rs"),
     Site::File("crates/game/src/logic.rs"),
     Site::File("crates/game/src/ready_history.rs"),
     Site::File("crates/game/src/render.rs"),

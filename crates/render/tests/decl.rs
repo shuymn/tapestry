@@ -20,11 +20,13 @@ use std::time::Duration;
 
 use bms_model::{Chart, ChartBuilder, TimeUs};
 use common::{GAUGES, attempt, context, input, offscreen, view};
-use decl_support::{Look, bundle};
+use decl_support::{FULL_LANES, Look, bundle, full_readouts, lane_chart, part_counts};
 use eval::GaugeState;
 use render::{
-    BundleError, CommitError, MAX_SPRITES, PreparedToken, RenderError, Renderer, SkinBundle,
+    BundleError, CommitError, DeclSkin, FrameInput, MAX_SPRITES, PlaySkin, PreparedToken,
+    RenderError, Renderer, SkinBundle, Staging,
 };
+
 use rules::GaugeValue;
 use skin_model::{BuildError, GaugeDesc, GaugeLook, Side};
 
@@ -361,37 +363,56 @@ fn a_retry_reuses_the_resources_with_a_fresh_attempt() {
 /// Repeated READY rearms (design.md "Play Lifecycle", the start gate) keep
 /// the renderer's memory witness flat: the attempt's prepared resources and
 /// text stay attached, never prepared again, while its runtime starts
-/// over, and every frame after a rearm draws as the attempt's first.
+/// over, and every frame after a rearm draws as the attempt's first. The
+/// skin is the full lane fixture, which first draws every note category,
+/// its bar group and each cover paint as quads.
 #[test]
 fn repeated_rearms_keep_the_memory_witness_flat() {
-    let chart = chart();
+    let chart = lane_chart();
     let dir = tempfile::tempdir().unwrap();
     let mut r = offscreen(1_920, 1_080);
     let look = Look {
         text: true,
+        structure: true,
+        full_lanes: true,
         ..red()
     };
     let (a, text) = bundle(&r, dir.path(), &look);
     let text = text.unwrap();
     let ctx = context(&GAUGES, false);
+    let v = view(0, 0);
+    let at = |ms: i64| FrameInput {
+        lanes: FULL_LANES,
+        readouts: full_readouts(FULL_LANES),
+        ..input(&v, TimeUs(ms * 1_000), TimeUs(0), &[])
+    };
+    // What the attempt's first frame draws, staged apart.
+    let mut skin = DeclSkin::new(a.clone());
+    skin.prepare(r.gpu(), &attempt(&r, &chart, &ctx)).unwrap();
+    let canvas = skin.canvas([1_920, 1_080]);
+    let mut staging = Staging::with_runs(skin.capacity(), skin.run_capacity(), &canvas);
+    staging.set_clips(a.clips().clone());
+    staging.build(&mut skin, &at(900)).unwrap();
+    let counts = part_counts(&r, &a, staging.instances());
+    assert!(counts.iter().all(|&n| n > 0), "{counts:?}");
+    let prepared = text.calls.load(Ordering::SeqCst);
     let token = r.stage(&a, &attempt(&r, &chart, &ctx), 1).unwrap();
     r.commit(token).unwrap();
     let generation = r.resource_generation();
-    let v = view(0, 0);
-    let first = r.frame(&input(&v, TimeUs(0), TimeUs(0), &[])).unwrap();
+    let first = r.frame(&at(900)).unwrap();
+    assert_eq!(first.sprites, staging.instances().len());
     let memory = r.memory();
     for k in 0..50 {
-        let later = input(&v, TimeUs(k * 16_667), TimeUs(0), &[]);
-        r.frame(&later).unwrap();
+        r.frame(&at(900 + k * 17)).unwrap();
         r.rearm();
-        let again = r.frame(&input(&v, TimeUs(0), TimeUs(0), &[])).unwrap();
+        let again = r.frame(&at(900)).unwrap();
         assert_eq!(again.sprites, first.sprites, "rearm {k}");
         assert_eq!(r.memory(), memory, "rearm {k}");
     }
     assert_eq!(r.resource_generation(), generation);
     assert_eq!(
         text.calls.load(Ordering::SeqCst),
-        1,
+        prepared + 1,
         "the text was prepared again"
     );
     halves(&read_back(&r), RED, BLACK);
@@ -528,8 +549,8 @@ fn a_reused_bundle_still_counts_both_attempts() {
 
 /// A frame's model input comes from the frame alone: the tally, the
 /// gauges, the completion and the play phase from its one view, the
-/// effects as drained, its target and visible time, the author's layout,
-/// no cover and no readout.
+/// effects as drained, its target, lanes and readouts, and the author's
+/// layout.
 #[test]
 fn a_skin_frame_reads_one_view() {
     let mut v = view(5, 9);
@@ -545,6 +566,21 @@ fn a_skin_frame_reads_one_view() {
     }];
     let f = render::FrameInput {
         gauge: 0,
+        lanes: skin_model::LaneView {
+            gain: skin_model::Gain::new(16, 5),
+            cover: 200,
+            lift: 300,
+            hidden: 0,
+        },
+        readouts: skin_model::FrameReadouts {
+            hispeed_x100: Some(457),
+            native: skin_model::NativeReadouts {
+                target_green: Some(300),
+                floating: true,
+                ..skin_model::FrameReadouts::UNAVAILABLE.native
+            },
+            ..skin_model::FrameReadouts::UNAVAILABLE
+        },
         ..input(&v, TimeUs(1_000), TimeUs(20), &effects)
     };
     let s = render::skin_frame(&f);
@@ -557,11 +593,8 @@ fn a_skin_frame_reads_one_view() {
         (TimeUs(1_000), TimeUs(20), f.target)
     );
     assert_eq!(*s.layout, skin_model::Layout::AUTHOR);
-    assert_eq!(s.lanes.visible_time, common::VISIBLE);
-    assert_eq!((s.lanes.cover, s.lanes.lift, s.lanes.hidden), (0, 0, 0));
-    assert_eq!(s.readouts.bpm_current_x100, None);
-    assert_eq!(s.readouts.hispeed_x100, None);
-    assert!(!s.readouts.covers.adjusting);
+    assert_eq!(s.lanes, f.lanes);
+    assert_eq!(s.readouts, f.readouts);
 }
 
 /// The simple skin's attempt state counts what it copies of the chart, so

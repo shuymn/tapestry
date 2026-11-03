@@ -19,9 +19,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use bms_model::{Chart, ChartBuilder, TimeUs};
-use common::{
-    GAUGES, VISIBLE, attempt, context, input, install, loading, offscreen, read_back, view,
-};
+use common::{GAUGES, attempt, context, input, install, loading, offscreen, read_back, view};
 use decl_support::{
     ANIMATION, ARTIST, BACKGROUND, FULL_TITLE, GENRE, Look, TITLE, WHEN_MARK, WHEN_SLOT, bundle,
 };
@@ -55,7 +53,7 @@ const fn right(rect: [i32; 4], dx: i32) -> [i32; 4] {
 /// A loading frame of lifetime `lifetime` at `now` ms on the loading
 /// clock, from origin 0.
 fn frame_at(lifetime: u64, now: i64) -> LoadingFrame<'static> {
-    LoadingFrame::interim(lifetime, TimeUs(now * MS), TimeUs(0), VISIBLE)
+    LoadingFrame::interim(lifetime, TimeUs(now * MS), TimeUs(0))
 }
 
 /// Red, with the loading elements.
