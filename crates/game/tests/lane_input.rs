@@ -1,8 +1,9 @@
 //! Lane input in the play view through the logic step (design.md "Rendering
 //! and Skins", lane input): every lane's held state and latest edges as
-//! the step's conversion left them, frozen where the play stops
-//! advancing (completion, an abort for focus loss or a lost last source),
-//! and started over by a rearm from its fresh opening.
+//! the step's conversion left them, frozen where an abort stops the play
+//! (focus loss or a lost last source; after completion the audio tail's
+//! feedback carries them on, `tail_feedback.rs`), and started over by a
+//! rearm from its fresh opening.
 
 mod common;
 
@@ -34,48 +35,6 @@ fn input(held: bool, pressed: Option<i64>, released: Option<i64>) -> LaneInput {
         pressed: pressed.map(|t| TimeUs(t * MS)),
         released: released.map(|t| TimeUs(t * MS)),
     }
-}
-
-/// Autoplay's generated stream, keys pressed 50 ms per tap: with key
-/// windows scaled to 25 %, the late BAD edge is 45 ms, so the play
-/// completes at 1 045 ms with key 1 still held by autoplay. Its release at
-/// 1 050 ms is never processed: the view freezes at the completion, and
-/// the step that stops playing republishes it unchanged (S9-03's feedback
-/// runner carries such a release through the audio tail).
-#[test]
-fn the_view_freezes_at_completion_with_autoplays_release_pending() {
-    let chart = ChartBuilder::new(150_000)
-        .tap(lane(1), TimeUs(1_000 * MS))
-        .build()
-        .unwrap();
-    let mut rule = rules::tapestry();
-    let keys = &mut rule.tables.keys;
-    keys.windows = keys.windows.scaled(25_000).unwrap();
-    let dev = device(&[0]);
-    let events = input::autoplay(&chart, &dev.sources[0]).unwrap();
-    assert_eq!(events.len(), 2);
-    let (mut writer, reader) = source_queue(8);
-    let (mut logic, _side) = Logic::<SourceReader>::new(
-        &chart,
-        &rule,
-        &dev,
-        &InputStart::default(),
-        vec![reader],
-        CONFIG,
-        Vec::new(),
-    )
-    .unwrap();
-    writer.push(events[0]).unwrap();
-    writer.publish(TimeUs(1_046 * MS));
-    let a = logic.advance_to(TimeUs(1_046 * MS));
-    assert!(a.complete);
-    logic.stop_playing();
-    writer.push(events[1]).unwrap();
-    writer.publish(TimeUs(2_000 * MS));
-    let view = logic.view();
-    assert_eq!(view.input.lane(lane(1)), input(true, Some(1_000), None));
-    assert_eq!(view.input.converted(), Some(TimeUs(1_046 * MS)));
-    assert!(!view.playing);
 }
 
 /// A focus loss aborts the play: the view keeps the lanes as the last

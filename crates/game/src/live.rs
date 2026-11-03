@@ -257,10 +257,10 @@ pub trait Rig {
     fn screen_failed(&self) -> bool;
     /// Stops the play's sounds.
     fn cancel_audio(&mut self);
-    /// No key sound follows.
+    /// A full play completed: its audio is done once it has ended, the key
+    /// sounds of the tail's feedback included ([`audio_done`](Self::audio_done)).
     fn seal_audio(&mut self);
-    /// A practice round completed: no key sound follows, and its audio
-    /// rings out (design.md "Mid-Chart Start and Section Repeat"): the BGM
+    /// A practice round completed: sealed, and its audio rings out (design.md "Mid-Chart Start and Section Repeat"): the BGM
     /// plays on until `fade_at`, the output fades to silence by `end_at`,
     /// both in the play's chart time, and every sound stops there.
     /// [`audio_done`](Self::audio_done) then turns true as for a sealed
@@ -293,7 +293,9 @@ pub trait Rig {
         let _ = (origin, at);
         Ok(())
     }
-    /// Whether the sealed play's audio has ended.
+    /// Whether the sealed play's audio has ended, with every key sound
+    /// sent to it so far: a report of its end made before the last key
+    /// sound was sent does not count.
     fn audio_done(&self) -> bool;
     /// Closes recording and waits until nothing more is pushed.
     ///
@@ -302,6 +304,30 @@ pub trait Rig {
     /// Why the input thread did not close it: the play is saved without
     /// the closing, and the run ends.
     fn close(&mut self) -> Result<Closing, InputWaitError>;
+    /// A completed play's close (design.md "Play Lifecycle", the audio
+    /// tail): recording closes as with [`close`](Self::close), at the
+    /// next input boundary, and its closing is returned, but the play's
+    /// sources stay, so input goes on reaching the play's queues, with no
+    /// gap, for the tail's feedback, until
+    /// [`end_feedback`](Self::end_feedback). Allocates nothing. By
+    /// default, for rigs without feedback, it closes.
+    ///
+    /// # Errors
+    ///
+    /// As [`close`](Self::close).
+    fn hand_off(&mut self) -> Result<Closing, InputWaitError> {
+        self.close()
+    }
+    /// The tail of a play handed off ([`hand_off`](Self::hand_off)) ended:
+    /// the sources close, and nothing more is pushed into the play's
+    /// queues. By default, nothing.
+    ///
+    /// # Errors
+    ///
+    /// Why the input thread did not close them: the run ends.
+    fn end_feedback(&mut self) -> Result<(), InputWaitError> {
+        Ok(())
+    }
     /// The input thread's failure, once known: it is gone, or a handshake
     /// with it failed. Sticks once set.
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
@@ -1034,11 +1060,18 @@ fn play_and_next<R: Rig>(
     logic.stop_playing();
 
     // Recording closes at the end of evaluation (design.md "Play Lifecycle");
-    // an aborted play then takes what reached its queues after the abort.
+    // an aborted play then takes what reached its queues after the abort,
+    // and a completed one hands its sources to the tail's feedback.
     // A failed close leaves the closing unknown, and the record keeps what
     // the play already took: what reached the queues after its last step is
     // lost, and the record is marked incomplete (input failed).
-    let closed = rig.close();
+    let handed_off = end == PlayEnd::Completed;
+    let closed = if handed_off {
+        rig.hand_off()
+    } else {
+        rig.close()
+    };
+    let handed_off = handed_off && closed.is_ok();
     // A command that arrived during the close handshake is kept for what
     // follows: it cuts the tail, or, after an abort, it is the run's next
     // step. A suspend there still happened while recording was open.
@@ -1101,12 +1134,10 @@ fn play_and_next<R: Rig>(
         suspend: suspended,
         input_failed: input_error.is_some(),
     };
-    let view = logic.view();
-    let record = logic.into_record();
-
     let tail = match stage {
         Some(stage) => run_tail(
             rig,
+            &mut logic,
             stage,
             origin,
             carried,
@@ -1115,6 +1146,15 @@ fn play_and_next<R: Rig>(
         ),
         None => TailEnd::NoTail,
     };
+    // The feedback stopped with the tail: the sources close now, so no
+    // input reaches the result or the next attempt.
+    if handed_off && let Err(e) = rig.end_feedback() {
+        input_error = input_error.or(Some(e));
+    }
+    // As the completion froze them: the feedback recorded nothing and
+    // changed nothing scored.
+    let view = logic.view();
+    let record = logic.into_record();
 
     rig.play_over();
     let report = loaded.finish_play(PlayOutcome {
@@ -1462,12 +1502,16 @@ impl TailEnd {
 /// audio failure already known, ends it at once. Then, at each wait,
 /// skipping to the result ends it, as do a retry or a suspend, closing the
 /// window, an input-thread failure, focus loss, removal of the last device,
-/// an audio failure or a screen failure, which cut it with their cause.
-/// Whatever ends it early stops its audio; the play stays complete either
-/// way.
+/// an audio failure or a screen failure, which cut it with their cause;
+/// otherwise the tail's feedback converts the input that reached the
+/// play's queues ([`Logic::feedback_to`]): its presses sound and its lanes
+/// light, and nothing is judged or recorded. Whatever ends the tail ends
+/// the feedback first, so no press is taken after it; whatever ends it
+/// early stops its audio. The play stays complete either way.
 #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 fn run_tail<R: Rig>(
     rig: &mut R,
+    logic: &mut Logic<'_, R::Reader>,
     stage: TailStage,
     origin: TimeUs,
     carried: Option<Command>,
@@ -1509,6 +1553,7 @@ fn run_tail<R: Rig>(
         } else if rig.screen_failed() {
             Some(TailEnd::Cut(AbortCause::ScreenFailed))
         } else {
+            let _ = logic.feedback_to();
             rig.stepped(false);
             rig.audio_failure().map(|e| {
                 *output_error = Some(e);

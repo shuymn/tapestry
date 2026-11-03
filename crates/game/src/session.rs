@@ -2161,6 +2161,22 @@ impl<O: AudioOutput + Wakes> Rig for SessionRig<'_, O> {
         Ok(closing)
     }
 
+    fn hand_off(&mut self) -> Result<Closing, InputWaitError> {
+        let closing = Closing {
+            arrivals: self.sources.arrivals().to_vec(),
+            overflowed: self.sources.overflowed(),
+            source_limited: self.sources.source_limited(),
+            axis_out_of_range: self.sources.axis_out_of_range().collect(),
+        };
+        self.sources.hand_off();
+        Ok(closing)
+    }
+
+    fn end_feedback(&mut self) -> Result<(), InputWaitError> {
+        self.sources.close_recording();
+        Ok(())
+    }
+
     fn ended(&mut self, _report: &PlayReport) {}
 
     fn show_end(&mut self, _report: &PlayReport, _screen: &crate::result_screen::ResultScreen) {}
