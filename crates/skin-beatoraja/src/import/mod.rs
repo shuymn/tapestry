@@ -11,7 +11,7 @@
 //! reproduce refuses the import, anything else is dropped with a note
 //! ([`policy`]).
 
-mod asset;
+pub(crate) mod asset;
 mod budget;
 pub(crate) mod geom;
 mod object;
@@ -51,7 +51,7 @@ use self::track::{Accepted, SrcKey, Stretch};
 use crate::error::{ImportError, Loc};
 use crate::header::Header;
 use crate::resolve::{Definition, Resolved, Tables, resolve};
-use crate::tree::{Kind, Scalar};
+use crate::tree::Scalar;
 
 /// What the user configured for one skin: the item selected in each
 /// option, the file chosen for each file choice, and the offsets.
@@ -519,8 +519,11 @@ impl<'d> Cx<'d> {
             return Ok(Prop::Null);
         };
         Ok(match self.def.arena.scalar(f) {
-            Scalar::Long(_) | Scalar::Double(_) => Prop::Id(self.def.int(f, name)?),
+            Scalar::Long(_) | Scalar::Double(_) | Scalar::Int(_) | Scalar::Float(_) => {
+                Prop::Id(self.def.int(f, name)?)
+            }
             Scalar::Str { .. } => self.def.string(f, name)?.map_or(Prop::Null, Prop::Name),
+            Scalar::Callable => return Err(self.def.callable_error(f, name)),
             Scalar::Null | Scalar::Bool(_) | Scalar::Object | Scalar::Array => Prop::Null,
         })
     }
@@ -547,7 +550,7 @@ impl<'d> Cx<'d> {
         let Some(f) = field else {
             return Ok(Vec::new());
         };
-        if self.def.arena.node(f).kind != Kind::Array {
+        if !self.def.arena.is_array(f) {
             return Err(self.def.type_error(f, name, "an array"));
         }
         let items: Vec<u32> = self.def.arena.children(f).collect();
@@ -624,7 +627,7 @@ impl<'d> Cx<'d> {
         ids.push(self.int_or(offset, "offset", 0)?);
         let mut ops = Vec::new();
         if let Some(op) = op {
-            if self.def.arena.node(op).kind != Kind::Array {
+            if !self.def.arena.is_array(op) {
                 return Err(self.def.type_error(op, "op", "an array"));
             }
             let items: Vec<u32> = self.def.arena.children(op).collect();
@@ -648,7 +651,7 @@ impl<'d> Cx<'d> {
             ops,
             draw: self.prop(draw, "draw")?,
             keys,
-            mouse: mouse.is_some_and(|m| self.def.arena.node(m).kind == Kind::Object),
+            mouse: mouse.is_some_and(|m| self.def.arena.is_object(m)),
         };
         Ok((id, dst))
     }
@@ -656,6 +659,7 @@ impl<'d> Cx<'d> {
     /// One destination, in source order.
     fn destination(&mut self, index: usize, rec: u32) -> Result<(), ImportError> {
         let at = self.arena_span(rec);
+        self.def.cancelled(|| Some(self.loc(at)))?;
         self.budget.element().map_err(|l| self.limit(at, l))?;
         #[cfg(test)]
         trace(Event::Charge);
@@ -1377,13 +1381,7 @@ impl<'d> Cx<'d> {
         })?;
         let notes = report::locate(&self.def.arena, &self.notes.list);
         let report = Report {
-            sources: self
-                .def
-                .arena
-                .files
-                .iter()
-                .map(|f| f.name.clone())
-                .collect(),
+            sources: self.def.arena.sources(),
             files,
             notes,
             suppressed: self.notes.suppressed,

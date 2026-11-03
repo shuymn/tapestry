@@ -17,7 +17,7 @@ use super::super::geom::Q;
 use super::super::policy::CriticalPart;
 use super::super::report::{NoteKind, PartWhy, Span};
 use crate::error::ImportError;
-use crate::tree::{Kind, Scalar};
+use crate::tree::Scalar;
 
 /// The lanes the source draws.
 pub(super) const LANES: usize = 8;
@@ -114,7 +114,7 @@ impl Cx<'_> {
             return Ok(Scan::default());
         };
         let arena = &self.def.arena;
-        if arena.node(f).kind != Kind::Array {
+        if !arena.is_array(f) {
             if lenient {
                 return Err(self.def.type_error(f, field, "an array"));
             }
@@ -227,15 +227,25 @@ impl Cx<'_> {
             return Ok(out);
         };
         let arena = &self.def.arena;
-        if arena.node(f).kind != Kind::Array {
+        if !arena.is_array(f) {
             return Err(self.def.type_error(f, "size", "an array"));
         }
         for (i, c) in arena.children(f).enumerate() {
-            let (Scalar::Long(raw) | Scalar::Double(raw)) = arena.scalar(c) else {
-                return Err(self.def.type_error(c, "size", "a number"));
-            };
+            // A Lua number is its exact value, never its text.
+            let num = arena.scalar(c);
+            match num {
+                Scalar::Long(_) | Scalar::Double(_) | Scalar::Int(_) | Scalar::Float(_) => {}
+                Scalar::Callable => return Err(self.def.callable_error(c, "size")),
+                _ => return Err(self.def.type_error(c, "size", "a number")),
+            }
             if let Some(slot) = out.get_mut(i) {
-                let q = Q::decimal(raw).ok_or_else(|| self.range(self.arena_span(c), "size"))?;
+                let q = match num {
+                    Scalar::Long(raw) | Scalar::Double(raw) => Q::decimal(raw),
+                    Scalar::Int(v) => Some(Q::int(v)),
+                    Scalar::Float(v) => Q::float(v),
+                    _ => None,
+                };
+                let q = q.ok_or_else(|| self.range(self.arena_span(c), "size"))?;
                 *slot = Some(q);
             }
         }

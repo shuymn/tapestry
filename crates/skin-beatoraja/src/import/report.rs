@@ -461,6 +461,13 @@ pub(crate) fn locate(arena: &Arena, notes: &[(Option<Span>, Severity, NoteKind)]
     let mut locs: Vec<Option<NoteLoc>> = vec![None; notes.len()];
     let mut cursor: Option<(u16, usize, u32, u32)> = None;
     for (span, i) in order {
+        // A converted Lua table's values are located by their provenance.
+        if let Some((source, line, col)) = arena.lua_loc(span.file, span.offset) {
+            if let Some(slot) = usize::try_from(i).ok().and_then(|i| locs.get_mut(i)) {
+                *slot = Some(NoteLoc { source, line, col });
+            }
+            continue;
+        }
         let Some(text) = arena.files.get(usize::from(span.file)) else {
             continue;
         };
@@ -490,7 +497,7 @@ pub(crate) fn locate(arena: &Arena, notes: &[(Option<Span>, Severity, NoteKind)]
         cursor = Some((span.file, pos, line, col));
         if let Some(slot) = usize::try_from(i).ok().and_then(|i| locs.get_mut(i)) {
             *slot = Some(NoteLoc {
-                source: span.file,
+                source: arena.source_of(span.file),
                 line,
                 col,
             });

@@ -51,6 +51,7 @@ use crate::json;
 use crate::limits::{
     Limits, MAX_FILE_BYTES, MAX_INCLUDE_DEPTH, MAX_INCLUDE_PARSES, MAX_INPUT_BYTES,
 };
+use crate::lua::{Cancel, LuaWhy, Store};
 use crate::tree::{Arena, ESCAPED, Kind, NONE, Scalar, Text, Unescape};
 
 /// The type number of a 7-key play skin (`SkinType.java:12` at `0.8.9`).
@@ -66,9 +67,19 @@ pub struct Definition {
     entry: FileId,
     entry_nodes: usize,
     entry_bytes: u64,
+    /// The load invocations the candidate made before this definition's
+    /// resolution: a Lua skin's loaders share the allowance with its
+    /// includes ([`MAX_INCLUDE_PARSES`]).
+    entry_parses: u32,
+    /// A Lua candidate's source snapshots, which its includes read and
+    /// add to, so that both passes read one content of each file.
+    store: Option<Store>,
     top: u32,
     limits: Limits,
     pub(crate) run: Run,
+    /// A Lua candidate's cancellation request, seen before each include
+    /// is read and after it is parsed ([`crate::lua`]).
+    cancel: Option<Cancel>,
 }
 
 /// The counters of one resolution.
@@ -207,10 +218,73 @@ impl Definition {
             arena,
             entry,
             entry_bytes,
+            entry_parses: 0,
+            store: None,
             top,
             limits,
             run: Run::default(),
+            cancel: None,
         })
+    }
+
+    /// A Lua skin's definition: `arena` holds its converted table as file
+    /// 0, rooted at `top`, read from `entry` in `root`; `input_bytes` and
+    /// `loads` are what the candidate read and loaded so far, so that the
+    /// files its table includes count after them ([`MAX_INPUT_BYTES`],
+    /// [`MAX_INCLUDE_PARSES`]), read through its snapshots `store`.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a candidate's state, each part its own"
+    )]
+    pub(crate) fn from_lua(
+        root: Root,
+        entry: FileId,
+        arena: Arena,
+        top: u32,
+        input_bytes: u64,
+        loads: u32,
+        store: Store,
+        cancel: Cancel,
+    ) -> Self {
+        Self {
+            root,
+            entry_nodes: arena.nodes.len(),
+            arena,
+            entry,
+            entry_bytes: input_bytes,
+            entry_parses: loads,
+            store: Some(store),
+            top,
+            limits: Limits::STANDARD,
+            run: Run::default(),
+            cancel: Some(cancel),
+        }
+    }
+
+    /// The bytes the last resolution read in all, its entry's included.
+    pub(crate) fn input_bytes(&self) -> u64 {
+        self.run.input_bytes
+    }
+
+    /// The load invocations made so far, includes among them.
+    pub(crate) fn parses(&self) -> u32 {
+        self.run.parses
+    }
+
+    /// The candidate's snapshots, taken back.
+    pub(crate) fn take_store(&mut self) -> Store {
+        self.store.take().unwrap_or_default()
+    }
+
+    /// A cancellation of the Lua candidate this definition belongs to.
+    pub(crate) fn cancelled(&self, at: impl FnOnce() -> Option<Loc>) -> Result<(), ImportError> {
+        if self.cancel.as_ref().is_some_and(Cancel::is_cancelled) {
+            return Err(ImportError::Lua {
+                at: at(),
+                why: LuaWhy::Cancelled,
+            });
+        }
+        Ok(())
     }
 
     pub(crate) fn root(&self) -> &Root {
@@ -262,22 +336,48 @@ impl Definition {
         Ok(s)
     }
 
+    /// A function a Lua skin's table held, reaching `field` that takes no
+    /// script: a refusal at the function's definition.
+    pub(crate) fn callable_error(&self, id: u32, field: &'static str) -> ImportError {
+        ImportError::Lua {
+            at: Some(self.loc(id)),
+            why: LuaWhy::Callable { field },
+        }
+    }
+
     /// A string field (`Json.readValue` to `String`, Json.java:1014 and
     /// JsonValue.java:172-186): a number as written, a boolean as `true`
-    /// or `false`, `null` as absent.
+    /// or `false`, `null` as absent. A Lua integer is its decimal digits,
+    /// which name its exact value; a Lua float has no exact text and is
+    /// refused.
     pub(crate) fn string(
         &mut self,
         id: u32,
         field: &'static str,
     ) -> Result<Option<String>, ImportError> {
         match self.arena.scalar(id) {
-            Scalar::Object | Scalar::Array => Err(self.type_error(id, field, "a string")),
+            Scalar::Object | Scalar::Array | Scalar::Float(_) => {
+                Err(self.type_error(id, field, "a string"))
+            }
             Scalar::Null => Ok(None),
             Scalar::Bool(_) | Scalar::Long(_) | Scalar::Double(_) => {
                 let escaped = self.arena.node(id).flags & ESCAPED != 0;
                 self.decode(id, escaped).map(Some)
             }
             Scalar::Str { escaped, .. } => self.decode(id, escaped).map(Some),
+            Scalar::Int(v) => {
+                let s = v.to_string();
+                let len = u64::try_from(s.len()).unwrap_or(u64::MAX);
+                if self.run.decoded.saturating_add(len) > self.limits.decoded_bytes {
+                    return Err(ImportError::Input {
+                        at: Some(self.loc(id)),
+                        limit: InputLimit::DecodedBytes,
+                    });
+                }
+                self.run.decoded += len;
+                Ok(Some(s))
+            }
+            Scalar::Callable => Err(self.callable_error(id, field)),
         }
     }
 
@@ -312,6 +412,12 @@ impl Definition {
                     Err(_) => Err(self.type_error(id, field, "an integer")),
                 }
             }
+            Scalar::Int(v) => i32::try_from(v).map_err(|_| range(self)),
+            Scalar::Float(v) => Q::float(v.trunc())
+                .and_then(Q::integer)
+                .and_then(|n| i32::try_from(n).ok())
+                .ok_or_else(|| range(self)),
+            Scalar::Callable => Err(self.callable_error(id, field)),
             Scalar::Null | Scalar::Bool(_) | Scalar::Object | Scalar::Array => {
                 Err(self.type_error(id, field, "an integer"))
             }
@@ -323,8 +429,13 @@ impl Definition {
     /// ([`Q::decimal`]) rather than truncated (an intentional policy for
     /// paint geometry).
     pub(crate) fn exact_int(&mut self, id: u32, field: &'static str) -> Result<i32, ImportError> {
-        let Scalar::Double(raw) = self.arena.scalar(id) else {
-            return self.int(id, field);
+        let raw = match self.arena.scalar(id) {
+            Scalar::Double(raw) => raw,
+            // A Lua float is its exact value: whole, or no integer.
+            Scalar::Float(v) if v.is_finite() && v.trunc() != v => {
+                return Err(self.type_error(id, field, "an integer"));
+            }
+            _ => return self.int(id, field),
         };
         let q = Q::decimal(raw).ok_or_else(|| ImportError::Range {
             at: self.loc(id),
@@ -344,7 +455,8 @@ impl Definition {
     pub(crate) fn bool(&self, id: u32, field: &'static str) -> Result<bool, ImportError> {
         match self.arena.scalar(id) {
             Scalar::Bool(b) => Ok(b),
-            Scalar::Long(_) | Scalar::Double(_) => Ok(false),
+            Scalar::Long(_) | Scalar::Double(_) | Scalar::Int(_) | Scalar::Float(_) => Ok(false),
+            Scalar::Callable => Err(self.callable_error(id, field)),
             Scalar::Str { raw, escaped } => Ok(Unescape::new(raw, escaped)
                 .map(|c| c.to_ascii_lowercase())
                 .eq("true".chars())),
@@ -358,7 +470,7 @@ impl Definition {
     /// (case-sensitive), in `fields`' order; none when the record is no
     /// object (the source's record of defaults).
     pub(crate) fn fields<const N: usize>(&self, id: u32, fields: [&str; N]) -> [Option<u32>; N] {
-        if self.arena.node(id).kind != Kind::Object {
+        if !self.arena.is_object(id) {
             return [None; N];
         }
         fields.map(|f| self.arena.last_member(id, f))
@@ -386,10 +498,11 @@ pub fn resolve<'d>(
     def.arena.files.truncate(1);
     def.run = Run {
         input_bytes: def.entry_bytes,
+        parses: def.entry_parses,
         ..Run::default()
     };
     let top = def.top;
-    if def.arena.node(top).kind != Kind::Object {
+    if !def.arena.is_object(top) {
         return Err(def.type_error(top, "(root)", "an object"));
     }
     // The top level is read literally, ordinary fields only
@@ -529,7 +642,7 @@ impl Resolved<'_> {
                 continue;
             };
             if LITERAL.contains(name) {
-                if r.def.arena.node(id).kind == Kind::Array {
+                if r.def.arena.is_array(id) {
                     let items: Vec<u32> = r.def.arena.children(id).collect();
                     for item in items {
                         r.emit(item, out)?;
@@ -657,7 +770,7 @@ impl Resolver<'_, '_> {
         let mut i = 0;
         while let Some(&d) = nested.get(&id).and_then(|l| l.get(i)) {
             i += 1;
-            if self.arena().node(d).kind != Kind::Object {
+            if !self.arena().is_object(d) {
                 return Err(self.def.type_error(d, "group", "an object"));
             }
             let Some(dst) = self.def.fields(d, ["dst"])[0] else {
@@ -666,10 +779,7 @@ impl Resolver<'_, '_> {
             self.strict_array(dst, depth + 2, "dst", nested)?;
             let bad = nested
                 .get(&dst)
-                .and_then(|keys| {
-                    keys.iter()
-                        .find(|&&k| self.arena().node(k).kind != Kind::Object)
-                })
+                .and_then(|keys| keys.iter().find(|&&k| !self.arena().is_object(k)))
                 .copied();
             if let Some(k) = bad {
                 return Err(self.def.type_error(k, "dst", "an object"));
@@ -719,7 +829,7 @@ impl Resolver<'_, '_> {
         }
         let kind = self.arena().node(id).kind;
         match kind {
-            Kind::Array => {
+            Kind::Array | Kind::Empty => {
                 let mut next = self.arena().node(id).first_child;
                 while next != NONE {
                     let item = next;
@@ -735,7 +845,8 @@ impl Resolver<'_, '_> {
                     None => Ok(()),
                 },
             },
-            Kind::Quoted | Kind::Bare => match self.strict {
+            Kind::Quoted | Kind::Bare | Kind::Lua => match self.strict {
+                _ if self.callable(id) => Err(self.def.callable_error(id, "other")),
                 Some(field) if !matches!(self.arena().scalar(id), Scalar::Null) => {
                     Err(self.def.type_error(id, field, "an array"))
                 }
@@ -785,6 +896,9 @@ impl Resolver<'_, '_> {
                 while next != NONE {
                     let branch = next;
                     next = self.arena().node(branch).next_sibling;
+                    if self.callable(branch) {
+                        return Err(self.def.callable_error(branch, "other"));
+                    }
                     let cond = self.arena().first_member_ci(branch, "if");
                     if self.test(cond)? {
                         return match self.arena().first_member_ci(branch, "value") {
@@ -795,8 +909,15 @@ impl Resolver<'_, '_> {
                 }
                 Ok(None)
             }
+            _ if self.callable(id) => Err(self.def.callable_error(id, "other")),
             _ => Ok(Some(id)),
         }
+    }
+
+    /// Whether node `id` is a Lua skin's function: refused wherever the
+    /// resolution reads it, as a record, an array or a condition.
+    fn callable(&self, id: u32) -> bool {
+        matches!(self.arena().scalar(id), Scalar::Callable)
     }
 
     /// Whether the pinned reader made node `id` a number.
@@ -813,7 +934,10 @@ impl Resolver<'_, '_> {
         if self.is_number(cond) {
             return self.test_number(cond);
         }
-        if self.arena().node(cond).kind != Kind::Array {
+        if self.callable(cond) {
+            return Err(self.def.callable_error(cond, "if"));
+        }
+        if !self.arena().is_array(cond) {
             return Ok(false);
         }
         let mut next = self.arena().node(cond).first_child;
@@ -822,12 +946,17 @@ impl Resolver<'_, '_> {
             next = self.arena().node(item).next_sibling;
             let held = if self.is_number(item) {
                 self.test_number(item)?
-            } else if self.arena().node(item).kind == Kind::Array {
+            } else if self.callable(item) {
+                return Err(self.def.callable_error(item, "if"));
+            } else if self.arena().is_array(item) {
                 let mut held = false;
                 let mut alt = self.arena().node(item).first_child;
                 while alt != NONE {
                     let one = alt;
                     alt = self.arena().node(one).next_sibling;
+                    if self.callable(one) {
+                        return Err(self.def.callable_error(one, "if"));
+                    }
                     if self.is_number(one) && self.test_number(one)? {
                         held = true;
                         break;
@@ -872,6 +1001,7 @@ impl Resolver<'_, '_> {
         let Some(name) = self.def.string(member, "include")? else {
             return Err(self.def.type_error(member, "include", "a file name"));
         };
+        self.def.cancelled(|| Some(self.def.loc(member)))?;
         // Both counts are reserved before anything is read.
         if self.chain.len() > MAX_INCLUDE_DEPTH as usize {
             return Err(ImportError::Input {
@@ -905,9 +1035,22 @@ impl Resolver<'_, '_> {
         } else {
             format!("{dir}/{name}")
         };
-        let (bytes, id) = read_file(&self.def.root, &joined, self.def.run.input_bytes, || {
-            Some(self.def.loc(member))
-        })?;
+        let (bytes, id) = match self.def.store.as_mut() {
+            // A Lua candidate's include is its snapshot, its bytes charged
+            // as each read is.
+            Some(store) => {
+                let mut used = self.def.run.input_bytes;
+                let at = || Some(self.def.arena.loc(member));
+                let read = store.source(&self.def.root, &joined, &mut used, at);
+                // The charge stands even when the file is refused below.
+                self.def.run.input_bytes = used;
+                let (id, bytes) = read?;
+                (bytes.to_vec(), id)
+            }
+            None => read_file(&self.def.root, &joined, self.def.run.input_bytes, || {
+                Some(self.def.loc(member))
+            })?,
+        };
         if self.chain.contains(&id) {
             let mut chain: Vec<String> = self.chain.iter().map(|f| f.name().to_owned()).collect();
             chain.push(id.name().to_owned());
@@ -916,7 +1059,9 @@ impl Resolver<'_, '_> {
                 chain,
             });
         }
-        self.def.run.input_bytes += u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        if self.def.store.is_none() {
+            self.def.run.input_bytes += u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        }
         let index = u16::try_from(self.arena().files.len()).map_err(|_| ImportError::Input {
             at: Some(self.def.loc(member)),
             limit: InputLimit::IncludeParses,
@@ -927,6 +1072,7 @@ impl Resolver<'_, '_> {
             bytes: bytes.into_boxed_slice(),
         });
         let root = json::parse(&mut self.def.arena, index, depth)?;
+        self.def.cancelled(|| Some(self.def.loc(member)))?;
         self.chain.push(id);
         let result = then(self, root, depth + 1);
         self.chain.pop();

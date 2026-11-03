@@ -243,7 +243,7 @@ jobs:
           cache-bin: false
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Clippy (dev-tools)
-        run: mise exec -- cargo clippy -p player -p game --all-targets --locked --features player/dev-tools,game/dev-tools -- -D warnings
+        run: mise exec -- cargo clippy -p player -p game -p skin-beatoraja --all-targets --locked --features player/dev-tools,game/dev-tools,skin-beatoraja/dev-tools -- -D warnings
       - name: Development build includes dev-tools (positive control)
         run: |
           mise exec -- cargo build --locked -p player --features dev-tools
@@ -251,7 +251,7 @@ jobs:
           target/debug/tapestry.exe --dev-tools-probe
       # The game on its threads, driven by a scripted input log, on WARP.
       - name: Test (dev-tools)
-        run: mise exec -- cargo nextest run -p player -p game --features player/dev-tools,game/dev-tools --locked --no-fail-fast
+        run: mise exec -- cargo nextest run -p player -p game -p skin-beatoraja --features player/dev-tools,game/dev-tools,skin-beatoraja/dev-tools --locked --no-fail-fast
 
   # Passes when the three Windows jobs passed, or when `changes` found no
   # change the build jobs read and they were skipped; anything else
@@ -323,6 +323,8 @@ jobs:
       # (docs/setup.md "Benchmarks"); bench.yml measures.
       - name: Benchmarks run once
         run: mise exec -- cargo bench --locked -p eval -p bms-parser -p library -p skin-model -p audio --bench evaluate --bench load --bench scan --bench build --bench loudness -- --test
+      - name: Lua skin benchmark runs once
+        run: mise exec -- cargo bench --locked -p skin-beatoraja --features dev-tools --bench lua -- --test
       # The allocation contracts also hold with optimizations (design.md
       # "Scope of No Allocation").
       - name: Allocation tests (release)
