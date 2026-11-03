@@ -136,12 +136,7 @@ pub fn slow_decoding(ms: u64) {
 /// Holds the decode as `slow-decoding` says, once: on the decode's own
 /// thread, while the game thread serves the adjustments.
 pub fn hold_decoding() {
-    let ms = SLOW_DECODING.swap(0, Ordering::Relaxed);
-    if ms > 0 {
-        println!("dev: the decode holds {ms} ms");
-        let _stall = Stall::begin();
-        std::thread::sleep(Duration::from_millis(ms));
-    }
+    hold(LoadPhase::Decoding);
 }
 
 /// The render thread holds the next chart's load `ms`
@@ -176,12 +171,7 @@ pub fn slow_preparing(ms: u64) {
 /// Holds the attempt's preparation on the render thread as
 /// `slow-preparing` says, once, while the game thread waits for it.
 pub fn hold_preparing() {
-    let ms = SLOW_PREPARING.swap(0, Ordering::Relaxed);
-    if ms > 0 {
-        println!("dev: the preparation holds {ms} ms");
-        let _stall = Stall::begin();
-        std::thread::sleep(Duration::from_millis(ms));
-    }
+    hold(LoadPhase::Preparing);
 }
 
 /// F2 is pressed on the window at the first wait of `phase` in the next
