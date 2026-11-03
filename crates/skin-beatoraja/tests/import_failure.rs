@@ -134,21 +134,24 @@ fn asset_refused(r: Run, marker: &str) {
     }
 }
 
-/// The quads `l` draws at `ms`, the shown gauge failed at `failed` ms
-/// when one, over an empty chart.
-fn quads(l: &Loaded, failed: Option<i64>, ms: i64) -> Vec<skin_model::Quad> {
+/// A fresh play of `l` over an empty chart, the shown gauge failed at
+/// `failed` ms when one.
+fn drawn(l: &Loaded, failed: Option<i64>) -> common::play::Drawn {
     let mut d = common::play::Drawn::new(l.ok().skin.clone(), 0);
     for g in &mut d.gauges {
         g.failed_at = failed.map(|f| TimeUs(f * 1_000));
     }
-    d.frame(ms, &[])
+    d
 }
 
+/// The quads [`drawn`] gives at `ms`.
+fn quads(l: &Loaded, failed: Option<i64>, ms: i64) -> Vec<skin_model::Quad> {
+    drawn(l, failed).frame(ms, &[])
+}
+
+/// The rounded rects [`drawn`] gives at `ms`.
 fn rects(l: &Loaded, failed: Option<i64>, ms: i64) -> Vec<[i32; 4]> {
-    quads(l, failed, ms)
-        .iter()
-        .map(|q| common::play::round(q.rect))
-        .collect()
+    drawn(l, failed).rects(ms)
 }
 
 fn unsupported_field(field: &'static str) -> NoteKind {

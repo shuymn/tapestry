@@ -44,7 +44,7 @@ impl Cx<'_> {
             return self.drop_el(Role::Decorative.or_failure(dst.failure), at, why);
         };
         let (charged, lowered) = self.lowered(&dst)?;
-        let role = lowered.role().or_failure(dst.failure);
+        let role = lowered.role(dst.failure);
         if lowered == Lowered::Paint {
             // SUDDEN+'s paint, made as an image record's is; under stretch
             // 5 a 1x1 frame's rect.

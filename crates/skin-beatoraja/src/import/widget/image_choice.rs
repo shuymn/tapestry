@@ -100,10 +100,11 @@ pub(in super::super) enum Lowered {
 }
 
 impl Lowered {
-    /// The role its element takes.
-    pub(in super::super) fn role(self) -> Role {
+    /// The role its element takes, failure presentation when `failure`
+    /// (owner decision 16): SUDDEN+'s paint keeps its own.
+    pub(in super::super) fn role(self, failure: bool) -> Role {
         match self {
-            Self::Image => Role::Decorative,
+            Self::Image => Role::Decorative.or_failure(failure),
             Self::Paint => Role::Critical(CriticalPart::Cover),
         }
     }
@@ -178,7 +179,7 @@ impl Cx<'_> {
     /// `⌊N / len⌋` of its `N` frames, the remainder never shown; never
     /// drawn when a run would be empty. The cycle is resolved for a run's
     /// frames, so a run of one frame ignores its timer. It is lowered as
-    /// `lowered` says, in `role`.
+    /// `lowered` says.
     #[expect(clippy::too_many_arguments, reason = "the group's parts as read")]
     pub(in super::super) fn image_group(
         &mut self,
@@ -188,9 +189,10 @@ impl Cx<'_> {
         len: i32,
         selector: (&'static str, bool),
         charged: bool,
-        (lowered, role): (Lowered, Role),
+        lowered: Lowered,
     ) -> Result<(), ImportError> {
         let at = dst.span;
+        let role = lowered.role(dst.failure);
         let n = self.grid_frames(at, s.div)?;
         let len = u32::try_from(len).unwrap_or(0);
         let q = n.checked_div(len).unwrap_or(0);
@@ -239,7 +241,7 @@ impl Cx<'_> {
     /// An image set selecting by `src`: one entry per item of its
     /// `images` array, in order, repeats kept; a null item, an id no
     /// `image` record defines and a source proven missing are holes. It
-    /// is lowered as `lowered` says, in `role`.
+    /// is lowered as `lowered` says.
     pub(in super::super) fn image_set_choices(
         &mut self,
         dst: Dst,
@@ -247,9 +249,10 @@ impl Cx<'_> {
         src: &str,
         deviates: bool,
         charged: bool,
-        (lowered, role): (Lowered, Role),
+        lowered: Lowered,
     ) -> Result<(), ImportError> {
         let at = dst.span;
+        let role = lowered.role(dst.failure);
         let Some(list) = images else {
             self.ignored(at, NoteKind::Track(TrackWhy::NeverDrawn));
             return Ok(());

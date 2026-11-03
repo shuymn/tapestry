@@ -648,7 +648,7 @@ impl<'d> Cx<'d> {
         let center = self.int_or(center, "center", 0)?;
         let stretch = self.int_or(stretch, "stretch", -1)?;
         let draw = self.prop(draw, "draw")?;
-        let failure = self.failure(&timer, &ops, &draw);
+        let failure = self.failure(&timer, &ops);
         let dst = Dst {
             span: self.arena_span(rec),
             blend,
@@ -697,17 +697,19 @@ impl<'d> Cx<'d> {
             return Ok(false);
         }
         let ops = self.ops(op)?;
-        let draw = self.prop(draw, "draw")?;
-        Ok(self.failure(&timer, &ops, &draw))
+        // Read for its errors as any destination's `draw` is; it never
+        // folds ([`Self::can_draw`]).
+        self.prop(draw, "draw")?;
+        Ok(self.failure(&timer, &ops))
     }
 
-    /// Whether a destination of `timer`, `ops` and `draw` is failure
+    /// Whether a destination of `timer` and `ops` is failure
     /// presentation (owner decision 16): its timer resolves to `failed`
     /// and it can still draw once the configured options are folded
     /// ([`Self::can_draw`]). Reads nothing else, and notes, charges and
     /// compiles nothing.
-    fn failure(&self, timer: &Prop, ops: &[Op], draw: &Prop) -> bool {
-        self.failure_timed(timer) && self.can_draw(ops, draw)
+    fn failure(&self, timer: &Prop, ops: &[Op]) -> bool {
+        self.failure_timed(timer) && self.can_draw(ops)
     }
 
     /// Whether `timer` resolves to `failed`: built-in 3, or a custom
@@ -717,23 +719,19 @@ impl<'d> Cx<'d> {
         matches!(*timer, Prop::Id(n) if n >= 0 && self.custom.fails(n))
     }
 
-    /// Whether `ops` and `draw` can still draw once the configured
+    /// Whether a destination of `ops` can still draw once the configured
     /// options are folded, as [`Self::common_with`] folds them: no numeric
-    /// op folds false or names nothing ([`Self::op_cond`]), and `draw`
-    /// does not fold false ([`draw_cond`], which never folds an
-    /// option item). Built-in and named conditions are not folded, so
-    /// they can draw.
-    fn can_draw(&self, ops: &[Op], draw: &Prop) -> bool {
-        let folds_off = |c: Option<Cond>| matches!(c, Some(Cond::Fold(false) | Cond::Undefined(_)));
-        let op_off = ops.iter().any(|op| match op {
-            Op::Id(n) => folds_off(self.op_cond(*n)),
+    /// op folds false or names nothing ([`Self::op_cond`]). Built-in and
+    /// named conditions are not folded, so they can draw, and nor is a
+    /// `draw`, which is a built-in condition or nothing ([`draw_cond`]).
+    fn can_draw(&self, ops: &[Op]) -> bool {
+        !ops.iter().any(|op| match op {
+            Op::Id(n) => matches!(
+                self.op_cond(*n),
+                Some(Cond::Fold(false) | Cond::Undefined(_))
+            ),
             Op::Name(_) => false,
-        });
-        let draw_off = match draw {
-            Prop::Id(n) => folds_off(draw_cond(*n)),
-            Prop::Null | Prop::Name(_) => false,
-        };
-        !op_off && !draw_off
+        })
     }
 
     /// Numeric op `n`'s condition: none for 0, else built-ins first, then

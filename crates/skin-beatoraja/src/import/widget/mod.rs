@@ -408,7 +408,7 @@ impl Cx<'_> {
         let group = len > 1;
         let index = property::index_by_id(self.int_or(r, "ref", 0)?);
         let (charged, lowered) = self.lowered(&dst)?;
-        let role = lowered.role().or_failure(dst.failure);
+        let role = lowered.role(dst.failure);
         if act.is_some() {
             self.ignored(at, NoteKind::Ignored { field: "act" });
         }
@@ -428,7 +428,7 @@ impl Cx<'_> {
                 return self.drop_el(role, at, why);
             };
             let selector = (src, index.deviates());
-            return self.image_group(dst, rec, &s, len, selector, charged, (lowered, role));
+            return self.image_group(dst, rec, &s, len, selector, charged, lowered);
         }
         let Some(c) = self.image_common(&dst, charged, role)? else {
             return Ok(());
@@ -525,7 +525,7 @@ impl Cx<'_> {
         let value = self.prop(value, "value")?;
         let selector = image_choice::set_selector(&value, r);
         let (charged, lowered) = self.lowered(&dst)?;
-        let role = lowered.role().or_failure(dst.failure);
+        let role = lowered.role(dst.failure);
         let (src, deviates) = match selector {
             SetSelector::Unsupported { why, .. } => {
                 return self.drop_el(role, at, why);
@@ -539,6 +539,6 @@ impl Cx<'_> {
         if Stretch::of(dst.stretch) == Stretch::Trimmed {
             return self.drop_el(role, at, NoteKind::Stretch(dst.stretch));
         }
-        self.image_set_choices(dst, images, &src, deviates, charged, (lowered, role))
+        self.image_set_choices(dst, images, &src, deviates, charged, lowered)
     }
 }
