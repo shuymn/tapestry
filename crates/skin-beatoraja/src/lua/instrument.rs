@@ -107,7 +107,8 @@ pub(crate) fn instrument(
             next_check = added.saturating_add(CHECK_BYTES);
         }
         let id = (u64::from(file) << 32) | u64::try_from(index).map_err(|_| Stop::Generated)?;
-        let reader = reader(src, ast, index).ok_or(Stop::Generated)?;
+        let room = MAX_ADDED_BYTES.saturating_sub(added);
+        let reader = reader(src, ast, index, room).ok_or(Stop::Generated)?;
         let (start, open) = (f.start as usize, f.open as usize);
         let head = |text: String| -> Edit {
             let breaks = lines(src.get(start..open).unwrap_or_default());
@@ -184,29 +185,42 @@ pub(crate) fn instrument(
     Ok(out)
 }
 
+/// The name an upvalue is read by in a reader.
+fn up_name<'a>(src: &'a [u8], ast: &Ast, up: u32) -> Option<&'a str> {
+    if up == CHUNK_ENV {
+        return Some("_ENV");
+    }
+    let d = ast.decl(up)?;
+    Some(if d.kind == DeclKind::SelfParam {
+        "self"
+    } else {
+        text(src, d.name)
+    })
+}
+
 /// The capture reader of function `index`: `nil`, or a function
-/// returning its upvalues in their order.
-fn reader(src: &[u8], ast: &Ast, index: usize) -> Option<String> {
+/// returning its upvalues in their order; `None` when it would be longer
+/// than `room`, measured before it is built.
+fn reader(src: &[u8], ast: &Ast, index: usize, room: usize) -> Option<String> {
     let f = ast.funcs.get(index)?;
     let ups = ast.list(f.upvalues);
     if f.unread || ups.is_empty() {
         return Some("nil".to_owned());
     }
-    let mut r = String::from("function() return ");
+    let mut len = "function() return  end".len();
+    for &up in ups {
+        len = len.saturating_add(up_name(src, ast, up)?.len() + 1);
+    }
+    if len > room {
+        return None;
+    }
+    let mut r = String::with_capacity(len);
+    r.push_str("function() return ");
     for (i, &up) in ups.iter().enumerate() {
         if i > 0 {
             r.push(',');
         }
-        if up == CHUNK_ENV {
-            r.push_str("_ENV");
-            continue;
-        }
-        let d = ast.decl(up)?;
-        if d.kind == DeclKind::SelfParam {
-            r.push_str("self");
-        } else {
-            r.push_str(text(src, d.name));
-        }
+        r.push_str(up_name(src, ast, up)?);
     }
     r.push_str(" end");
     Some(r)

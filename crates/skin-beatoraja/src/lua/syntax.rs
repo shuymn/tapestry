@@ -21,6 +21,8 @@
 //! [`CHECK_EVERY`] nodes. The parser allocates only its arena and a
 //! shared scratch stack.
 
+use std::collections::{HashMap, HashSet};
+
 use super::limits::{MAX_AST_DEPTH, MAX_AST_NODES};
 
 /// How many nodes are added between two looks at the cancellation
@@ -903,8 +905,16 @@ fn float(t: &[u8], hex: bool) -> bool {
 struct FuncState {
     id: u32,
     upvalues: Vec<u32>,
+    /// [`Self::upvalues`] as a set, for O(1) membership.
+    seen: HashSet<u32>,
     unread: bool,
+    /// The length of the scope stack where its locals start.
+    base: usize,
 }
+
+/// The most locals a function has in scope at once: Lua's own
+/// (`MAXVARS`), so a chunk past it is one Lua refuses too.
+const MAX_LOCALS: usize = 200;
 
 /// The parser of one file.
 struct Parser<'a, 'c> {
@@ -915,8 +925,9 @@ struct Parser<'a, 'c> {
     charged: &'c mut u64,
     cancel: &'c dyn Fn() -> bool,
     depth: u32,
-    /// The locals in scope, innermost last.
+    /// The locals in scope, innermost last, and by name.
     active: Vec<u32>,
+    by_name: HashMap<Vec<u8>, Vec<u32>>,
     funcs: Vec<FuncState>,
     /// The shared scratch stack lists are gathered on.
     scratch: Vec<u32>,
@@ -944,6 +955,7 @@ pub(crate) fn parse(src: &[u8], charged: &mut u64, cancel: &dyn Fn() -> bool) ->
         cancel,
         depth: 0,
         active: Vec::new(),
+        by_name: HashMap::new(),
         funcs: Vec::new(),
         scratch: Vec::new(),
         last_end: 0,
@@ -1072,16 +1084,48 @@ impl Parser<'_, '_> {
     }
 
     /// The local named `name` in scope, innermost first.
+    /// The local named `name` in scope, innermost first: a hash of the
+    /// name, O(its length).
     fn lookup(&self, name: &[u8]) -> Option<u32> {
-        self.active.iter().rev().copied().find(|&d| {
-            self.ast.decls.get(d as usize).is_some_and(|x| {
-                if x.kind == DeclKind::SelfParam {
-                    name == b"self"
-                } else {
-                    self.name_bytes(x.name) == name
+        self.by_name.get(name).and_then(|ds| ds.last().copied())
+    }
+
+    /// The name declaration `d` is in scope by.
+    fn decl_name(&self, d: u32) -> Vec<u8> {
+        match self.ast.decls.get(d as usize) {
+            Some(x) if x.kind == DeclKind::SelfParam => b"self".to_vec(),
+            Some(x) => self.name_bytes(x.name).to_vec(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Brings declaration `d` into scope; past [`MAX_LOCALS`] in its
+    /// function the chunk is refused, as Lua refuses it.
+    fn bind(&mut self, d: u32) -> Result<(), Fail> {
+        let base = self.funcs.last().map_or(0, |f| f.base);
+        if self.active.len() - base >= MAX_LOCALS {
+            return Err(self.fail());
+        }
+        let name = self.decl_name(d);
+        self.by_name.entry(name).or_default().push(d);
+        self.active.push(d);
+        Ok(())
+    }
+
+    /// Ends the scopes opened since the stack was `len` long.
+    fn unbind_to(&mut self, len: usize) {
+        while self.active.len() > len {
+            let Some(d) = self.active.pop() else {
+                break;
+            };
+            let name = self.decl_name(d);
+            if let Some(ds) = self.by_name.get_mut(name.as_slice()) {
+                ds.pop();
+                if ds.is_empty() {
+                    self.by_name.remove(name.as_slice());
                 }
-            })
-        })
+            }
+        }
     }
 
     /// Records that the current function reads `up` (a declaration or
@@ -1095,13 +1139,14 @@ impl Parser<'_, '_> {
         let Some(f) = self.funcs.last_mut() else {
             return;
         };
-        if owner == f.id || f.unread || f.upvalues.contains(&up) {
+        if owner == f.id || f.unread || f.seen.contains(&up) {
             return;
         }
         if f.upvalues.len() >= MAX_READER {
             f.unread = true;
             return;
         }
+        f.seen.insert(up);
         f.upvalues.push(up);
     }
 
@@ -1147,7 +1192,9 @@ impl Parser<'_, '_> {
         self.funcs.push(FuncState {
             id: 0,
             upvalues: Vec::new(),
+            seen: HashSet::new(),
             unread: false,
+            base: 0,
         });
         let body = self.block()?;
         if !self.check(Tok::Eof) {
@@ -1172,7 +1219,7 @@ impl Parser<'_, '_> {
     fn block(&mut self) -> Result<List, Fail> {
         let scope = self.active.len();
         let list = self.block_open()?;
-        self.active.truncate(scope);
+        self.unbind_to(scope);
         Ok(list)
     }
 
@@ -1252,7 +1299,7 @@ impl Parser<'_, '_> {
                 self.block_open()?;
                 self.expect(Tok::Until)?;
                 self.expression()?;
-                self.active.truncate(scope);
+                self.unbind_to(scope);
                 self.stmt(Stmt::Other("repeat"), line)
             }
             Tok::Function => self.function_stat(line),
@@ -1262,7 +1309,7 @@ impl Parser<'_, '_> {
                     self.advance()?;
                     let t = self.expect(Tok::Name)?;
                     let decl = self.declare((t.start, t.end), DeclKind::LocalFunction)?;
-                    self.active.push(decl);
+                    self.bind(decl)?;
                     let func = self.body(Form::Local { decl }, start, false, line)?;
                     let e = self.expr(Expr::Func(func), line)?;
                     if let Some(d) = self.ast.decls.get_mut(decl as usize) {
@@ -1314,9 +1361,9 @@ impl Parser<'_, '_> {
             }
             let d = self.declare((first.start, first.end), DeclKind::ForVar)?;
             self.expect(Tok::Do)?;
-            self.active.push(d);
+            self.bind(d)?;
             self.block()?;
-            self.active.truncate(scope);
+            self.unbind_to(scope);
             self.expect(Tok::End)?;
             return self.stmt(Stmt::Other("numeric for"), line);
         }
@@ -1332,10 +1379,10 @@ impl Parser<'_, '_> {
         self.expect(Tok::Do)?;
         for n in names {
             let d = self.declare(n, DeclKind::ForVar)?;
-            self.active.push(d);
+            self.bind(d)?;
         }
         self.block()?;
-        self.active.truncate(scope);
+        self.unbind_to(scope);
         self.expect(Tok::End)?;
         self.stmt(Stmt::Other("generic for"), line)
     }
@@ -1429,7 +1476,9 @@ impl Parser<'_, '_> {
                 x.init = init;
             }
         }
-        self.active.extend(ns);
+        for d in ns {
+            self.bind(d)?;
+        }
         self.stmt(Stmt::Local { names, exprs }, line)
     }
 
@@ -1483,10 +1532,13 @@ impl Parser<'_, '_> {
             upvalues: (0, 0),
             unread: false,
         });
+        let base = self.active.len();
         self.funcs.push(FuncState {
             id,
             upvalues: Vec::new(),
+            seen: HashSet::new(),
             unread: false,
+            base,
         });
         let scope = self.active.len();
         self.expect(Tok::LParen)?;
@@ -1495,7 +1547,7 @@ impl Parser<'_, '_> {
         if method {
             // `self`, implicit: its name is not in the source.
             let d = self.declare((0, 0), DeclKind::SelfParam)?;
-            self.active.push(d);
+            self.bind(d)?;
             self.scratch.push(d);
         }
         let mut vararg = false;
@@ -1507,7 +1559,7 @@ impl Parser<'_, '_> {
                 }
                 let t = self.expect(Tok::Name)?;
                 let d = self.declare((t.start, t.end), DeclKind::Param)?;
-                self.active.push(d);
+                self.bind(d)?;
                 self.scratch.push(d);
                 if !self.accept(Tok::Comma)? {
                     break;
@@ -1518,7 +1570,7 @@ impl Parser<'_, '_> {
         self.expect(Tok::RParen)?;
         let body = self.block()?;
         let end = self.expect(Tok::End)?;
-        self.active.truncate(scope);
+        self.unbind_to(scope);
         let state = self.funcs.pop();
         let (ups, unread) = state.map_or((Vec::new(), false), |s| (s.upvalues, s.unread));
         let mark = self.scratch.len();
@@ -1870,6 +1922,38 @@ mod tests {
                 &src[..12]
             );
         }
+    }
+
+    #[test]
+    fn names_resolve_in_constant_time_and_locals_are_capped() {
+        // 80 nested functions of 199 locals each, about 16 000 in scope,
+        // then 100 000 assignments of a name none declares: each read is
+        // a hash of the name, not a scan of the scope.
+        let locals: String = (0..199).map(|i| format!("local a{i} = 0 ")).collect();
+        let mut src = String::new();
+        for _ in 0..80 {
+            src.push_str(&locals);
+            src.push_str("local function f() ");
+        }
+        src.push_str(&"b = z ".repeat(100_000));
+        src.push_str(&"end ".repeat(80));
+        let start = std::time::Instant::now();
+        ok(&src);
+        assert!(start.elapsed() < std::time::Duration::from_secs(5));
+        // Lua's own cap on a function's locals.
+        let over: String = (0..201).map(|i| format!("local a{i} = 0 ")).collect();
+        let mut n = 0;
+        assert!(matches!(
+            parse(over.as_bytes(), &mut n, &|| false),
+            Err(Fail::Syntax(_))
+        ));
+        // A nested function counts its own.
+        let nested = format!(
+            "{} local function f() {} end",
+            "local x = 0 ".repeat(150),
+            "local y = 0 ".repeat(150)
+        );
+        ok(&nested);
     }
 
     #[test]

@@ -241,10 +241,14 @@ impl Lower<'_> {
 
     fn size_expr_inner(&mut self, ast: &Ast, inst: u32, locals: &[(u32, u64)], e: u32) -> R<u64> {
         Ok(match ast.expr(e) {
-            Expr::Local(d) => match locals.iter().rev().find(|(l, _)| *l == d) {
-                Some(&(_, n)) => n,
-                None => 1,
-            },
+            Expr::Local(d) => {
+                self.charge_scan(locals.len())?;
+                locals
+                    .iter()
+                    .rev()
+                    .find(|(l, _)| *l == d)
+                    .map_or(1, |&(_, n)| n)
+            }
             Expr::Paren(x) | Expr::Unary(_, x) => {
                 self.size_expr(ast, inst, locals, x)?.saturating_add(1)
             }
@@ -285,6 +289,7 @@ impl Lower<'_> {
             Expr::False => Self::boolean("false".into()),
             Expr::Paren(x) => self.expr(ast, inst, locals, x),
             Expr::Local(d) => {
+                self.charge_scan(locals.len())?;
                 if let Some(&(_, init)) = locals.iter().rev().find(|(l, _)| *l == d) {
                     // The locals before it, as its initializer saw them.
                     let k = locals.iter().position(|&(l, _)| l == d).unwrap_or(0);
@@ -367,11 +372,16 @@ impl Lower<'_> {
         };
         let k = ast.str(k);
         self.out.config = true;
-        self.an
+        let set = self
+            .an
             .envs
             .get(i as usize)
-            .and_then(|c| c.options.iter().find(|(n, _)| n == k))
-            .map(|&(_, v)| V::Config(v))
+            .ok_or(Stop::Unsupported(Unsupported::Capture("_ENV")))?
+            .options;
+        self.an
+            .option(set, k)
+            .map_err(stop)?
+            .map(V::Config)
             .ok_or(Stop::Unsupported(Unsupported::Capture("an option entry")))
     }
 
@@ -580,6 +590,13 @@ impl Lower<'_> {
             }
         }
         Ok(None)
+    }
+
+    /// A scan of `n` locals (at most Lua's 200) charged before it is made.
+    fn charge_scan(&self, n: usize) -> R<()> {
+        self.an
+            .charge(u64::try_from(n).unwrap_or(u64::MAX))
+            .map_err(stop)
     }
 
     /// Runs `f` one level deeper into a walk: past [`MAX_AST_DEPTH`] the

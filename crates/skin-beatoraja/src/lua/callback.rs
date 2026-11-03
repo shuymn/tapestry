@@ -77,8 +77,9 @@ pub(crate) enum Captured {
 pub(crate) struct EnvCapture {
     /// Why `skin_config.option` is not proven: `None` when it is.
     pub(crate) unproven: Option<&'static str>,
-    /// The integer entries of `skin_config.option`.
-    pub(crate) options: Vec<(Vec<u8>, i64)>,
+    /// Its `skin_config.option` table's integer entries, by its index in
+    /// [`Analysis::option_sets`].
+    pub(crate) options: u32,
 }
 
 /// A closure instance.
@@ -180,6 +181,14 @@ pub(crate) struct Analysis {
     pub(crate) instances: Vec<Instance>,
     pub(crate) captured: Vec<Captured>,
     pub(crate) envs: Vec<EnvCapture>,
+    /// Each captured function's upvalue positions, by its file, function
+    /// and binding: one hash a read.
+    pub(crate) slots: HashMap<(u16, u32, u32), u32>,
+    /// Option names interned once a pass, by their bytes; every option
+    /// table refers to them by id.
+    pub(crate) option_names: HashMap<Box<[u8]>, u32>,
+    /// Each distinct option table's integer entries, by name id.
+    pub(crate) option_sets: Vec<HashMap<u32, i64>>,
     classes: RefCell<Vec<State>>,
     /// The classes of function prototypes by their file, function and
     /// captured values: instances that share all three share a class,
@@ -219,6 +228,17 @@ impl Analysis {
         Ok(())
     }
 
+    /// Entry `k` of option table `set`: one hash of `k`, its bytes
+    /// charged first.
+    pub(crate) fn option(&self, set: u32, k: &[u8]) -> Result<Option<i64>, Unsupported> {
+        self.charge(u64::try_from(k.len()).unwrap_or(u64::MAX))?;
+        Ok(self
+            .option_names
+            .get(k)
+            .and_then(|id| self.option_sets.get(set as usize)?.get(id))
+            .copied())
+    }
+
     pub(crate) fn instance(&self, i: u32) -> Option<&Instance> {
         self.instances.get(i as usize)
     }
@@ -230,9 +250,7 @@ impl Analysis {
     /// Instance `i`'s value for its function's upvalue `up`.
     pub(crate) fn upvalue(&self, i: u32, up: u32) -> Option<Captured> {
         let inst = self.instance(i)?;
-        let ast = self.ast(inst.file)?;
-        let f = ast.func(inst.func)?;
-        let k = ast.list(f.upvalues).iter().position(|&u| u == up)?;
+        let k = *self.slots.get(&(inst.file, inst.func, up))? as usize;
         let (start, len) = inst.values?;
         if k >= len as usize {
             return None;
@@ -465,6 +483,9 @@ impl Classify<'_> {
             Expr::Method { .. } => construct("method call"),
             Expr::Paren(x) => self.expr(x),
             Expr::Local(d) => {
+                // The body's locals, at most Lua's 200, scanned and charged.
+                let n = u64::try_from(self.locals.len()).unwrap_or(u64::MAX);
+                self.an.charge(n).map_err(|why| self.at(why, e))?;
                 if let Some(&(_, ty)) = self.locals.iter().rev().find(|(l, _)| *l == d) {
                     return Ok(ty);
                 }
@@ -563,11 +584,9 @@ impl Classify<'_> {
         if let Some(why) = capture.unproven {
             return Err(self.at(Unsupported::Capture(why), e));
         }
-        capture
-            .options
-            .iter()
-            .find(|(name, _)| name == k)
-            .map(|&(_, v)| v)
+        self.an
+            .option(capture.options, k)
+            .map_err(|why| self.at(why, e))?
             .ok_or(self.at(Unsupported::Capture("an option entry"), e))
     }
 

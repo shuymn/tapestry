@@ -30,6 +30,7 @@
 //! parser refuses is a fault ([`LuaWhy::Unbound`]), and one neither
 //! accepts is Lua's syntax error.
 
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -44,10 +45,10 @@ use crate::error::{ImportError, InputLimit, Loc};
 use crate::limits::{MAX_FILE_BYTES, MAX_INCLUDE_DEPTH, MAX_INCLUDE_PARSES, MAX_INPUT_BYTES};
 use crate::lua::ledger::running;
 
-/// One source read: the name it was asked by, its identity and its bytes.
+/// One source read: its identity and its bytes, found by the name it was
+/// asked by ([`Store::source`]).
 #[derive(Clone, Debug)]
 struct Snapshot {
-    key: String,
     id: FileId,
     bytes: Arc<[u8]>,
 }
@@ -57,7 +58,13 @@ struct Snapshot {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Store {
     snapshots: Vec<Snapshot>,
+    /// [`Self::snapshots`] by the name each was asked by, and by identity:
+    /// one hash a load.
+    by_key: HashMap<String, usize>,
+    by_id: HashMap<FileId, usize>,
     pub(crate) dependencies: Vec<String>,
+    /// [`Self::dependencies`] as a set.
+    depended: HashSet<String>,
 }
 
 impl Store {
@@ -72,9 +79,9 @@ impl Store {
         at: impl Fn() -> Option<Loc>,
     ) -> Result<(FileId, Arc<[u8]>), ImportError> {
         let found = self
-            .snapshots
-            .iter()
-            .find(|s| s.key == key)
+            .by_key
+            .get(key)
+            .and_then(|&i| self.snapshots.get(i))
             .map(|s| (s.id.clone(), Arc::clone(&s.bytes)));
         let (id, bytes) = match found {
             Some(found) => found,
@@ -97,12 +104,14 @@ impl Store {
                 })?;
                 // Another spelling of a file already read shares its
                 // snapshot.
-                let bytes = match self.snapshots.iter().find(|s| s.id == id) {
+                let bytes = match self.by_id.get(&id).and_then(|&i| self.snapshots.get(i)) {
                     Some(s) => Arc::clone(&s.bytes),
                     None => Arc::from(bytes),
                 };
+                let i = self.snapshots.len();
+                self.by_key.insert(key.to_owned(), i);
+                self.by_id.entry(id.clone()).or_insert(i);
                 self.snapshots.push(Snapshot {
-                    key: key.to_owned(),
                     id: id.clone(),
                     bytes: Arc::clone(&bytes),
                 });
@@ -125,7 +134,7 @@ impl Store {
 
     /// Records `name` among the files consulted, once.
     pub(crate) fn depend(&mut self, name: &str) {
-        if !self.dependencies.iter().any(|d| d == name) {
+        if self.depended.insert(name.to_owned()) {
             self.dependencies.push(name.to_owned());
         }
     }
@@ -220,13 +229,7 @@ fn instrumented(
     id: &FileId,
     bytes: &[u8],
 ) -> mlua::Result<Option<Arc<[u8]>>> {
-    if let Some(code) = pass
-        .parsed
-        .borrow()
-        .iter()
-        .find(|(i, _)| i == id)
-        .map(|(_, c)| c.clone())
-    {
+    if let Some(code) = pass.parsed.borrow().get(id).cloned() {
         return Ok(code);
     }
     let name = id.name().to_owned();
@@ -263,7 +266,7 @@ fn instrumented(
     };
     // A chunk with no constructor makes no closure: it runs as written.
     if ast.funcs.len() <= 1 {
-        pass.parsed.borrow_mut().push((id.clone(), None));
+        pass.parsed.borrow_mut().insert(id.clone(), None);
         return Ok(None);
     }
     let Ok(file) = u16::try_from(pass.files.borrow().len()) else {
@@ -280,7 +283,7 @@ fn instrumented(
     pass.files.borrow_mut().push(ParsedFile { name, ast });
     pass.parsed
         .borrow_mut()
-        .push((id.clone(), Some(Arc::clone(&code))));
+        .insert(id.clone(), Some(Arc::clone(&code)));
     Ok(Some(code))
 }
 

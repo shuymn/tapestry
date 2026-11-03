@@ -76,8 +76,9 @@ pub const MAX_AST_DEPTH: u32 = 200;
 pub const MAX_CAPTURES: u64 = 1 << 16;
 /// The most units of work the callbacks' analysis does across a
 /// candidate: each expression or statement a classification, sizing,
-/// lowering or role scan visits, each captured value a prototype's key
-/// copies, charged before the work. Instances of one function with the
+/// lowering or role scan visits, each local scanned, each captured value
+/// a prototype's key copies, and each byte of an option name hashed,
+/// charged before the work. Instances of one function with the
 /// same captured values are classified once, so a function created in a
 /// loop costs its body once.
 pub const MAX_ANALYSIS_WORK: u64 = 1 << 24;

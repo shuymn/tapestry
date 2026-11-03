@@ -294,11 +294,12 @@ pub(crate) struct Pass {
     root: Root,
     entry_dir: String,
     store: RefCell<Store>,
-    /// The files this pass loaded, the entry first.
+    /// The files this pass loaded, the entry first, and as a set.
     modules: RefCell<Vec<String>>,
+    loaded: RefCell<std::collections::HashSet<String>>,
     /// `require`'s cache: names to identities, identities to values.
-    names: RefCell<Vec<(String, FileId)>>,
-    cache: RefCell<Vec<(FileId, Option<RegistryKey>)>>,
+    names: RefCell<HashMap<String, FileId>>,
+    cache: RefCell<HashMap<FileId, Option<RegistryKey>>>,
     depth: Cell<u32>,
     /// The host API functions, by address.
     hosts: RefCell<HashMap<usize, u16>>,
@@ -307,7 +308,7 @@ pub(crate) struct Pass {
     bridge: Option<Bridge>,
     /// The configured pass's chunks by identity, and the parsed files
     /// that have constructors, in the order they were parsed.
-    parsed: RefCell<Vec<(FileId, Chunk)>>,
+    parsed: RefCell<HashMap<FileId, Chunk>>,
     files: RefCell<Vec<callback::ParsedFile>>,
     #[cfg(feature = "dev-tools")]
     timings: Cell<Timings>,
@@ -344,14 +345,15 @@ impl Pass {
             entry_dir,
             store: RefCell::new(store),
             modules: RefCell::new(Vec::new()),
-            names: RefCell::new(Vec::new()),
-            cache: RefCell::new(Vec::new()),
+            loaded: RefCell::new(std::collections::HashSet::new()),
+            names: RefCell::new(HashMap::new()),
+            cache: RefCell::new(HashMap::new()),
             depth: Cell::new(0),
             hosts: RefCell::new(HashMap::new()),
             handled: Cell::new(0),
             last_error: RefCell::new(None),
             bridge,
-            parsed: RefCell::new(Vec::new()),
+            parsed: RefCell::new(HashMap::new()),
             files: RefCell::new(Vec::new()),
             #[cfg(feature = "dev-tools")]
             timings: Cell::new(Timings::default()),
@@ -373,9 +375,8 @@ impl Pass {
     }
 
     fn module(&self, name: &str) {
-        let mut m = self.modules.borrow_mut();
-        if !m.iter().any(|n| n == name) {
-            m.push(name.to_owned());
+        if self.loaded.borrow_mut().insert(name.to_owned()) {
+            self.modules.borrow_mut().push(name.to_owned());
         }
     }
 
@@ -403,12 +404,7 @@ impl Pass {
     /// The cached value of the module `key` named before, or a fault for
     /// one still loading.
     fn cached(&self, lua: &Lua, key: &str) -> mlua::Result<Option<Value>> {
-        let id = self
-            .names
-            .borrow()
-            .iter()
-            .find(|(k, _)| k == key)
-            .map(|(_, id)| id.clone());
+        let id = self.names.borrow().get(key).cloned();
         match id {
             Some(id) => match self.cached_id(lua, &id)? {
                 Module::Loading => Err(self.ledger.fail_lua(lua, LuaWhy::RequireCycle)),
@@ -421,22 +417,22 @@ impl Pass {
 
     fn cached_id(&self, lua: &Lua, id: &FileId) -> mlua::Result<Module> {
         let cache = self.cache.borrow();
-        Ok(match cache.iter().find(|(i, _)| i == id) {
+        Ok(match cache.get(id) {
             None => Module::Absent,
-            Some((_, None)) => Module::Loading,
-            Some((_, Some(k))) => Module::Done(lua.registry_value(k)?),
+            Some(None) => Module::Loading,
+            Some(Some(k)) => Module::Done(lua.registry_value(k)?),
         })
     }
 
     fn start_module(&self, id: FileId, key: &str) {
-        self.names.borrow_mut().push((key.to_owned(), id.clone()));
-        self.cache.borrow_mut().push((id, None));
+        self.names.borrow_mut().insert(key.to_owned(), id.clone());
+        self.cache.borrow_mut().insert(id, None);
     }
 
     fn finish_module(&self, lua: &Lua, id: &FileId, v: &Value) -> mlua::Result<()> {
         let k = lua.create_registry_value(v.clone())?;
-        if let Some(slot) = self.cache.borrow_mut().iter_mut().find(|(i, _)| i == id) {
-            slot.1 = Some(k);
+        if let Some(slot) = self.cache.borrow_mut().get_mut(id) {
+            *slot = Some(k);
         }
         Ok(())
     }

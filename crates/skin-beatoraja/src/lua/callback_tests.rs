@@ -374,6 +374,79 @@ fn classification_sees_cancellation() {
     );
 }
 
+/// A skin whose configured pass gives `skin_config.option` `keys`
+/// integer entries named by `bytes`-byte names sharing all but their
+/// last digits, then makes `count` closures that each read the last name
+/// through `_ENV`: through one `_ENV` of their own each when `envs`, else
+/// through the globals, each capturing its own index.
+fn options(keys: usize, bytes: usize, count: usize, envs: bool) -> String {
+    let env = if envs {
+        "local _ENV = { skin_config = skin_config }\n"
+    } else {
+        ""
+    };
+    format!(
+        "local s = {{ type = 0, name = \"t\", w = 1920, h = 1080 }}\n\
+         if not skin_config then return s end\n\
+         local p = \"x\"\n\
+         while #p < {bytes} do p = p .. p end\n\
+         p = string.sub(p, 1, {bytes} - 8)\n\
+         local last\n\
+         for i = 1, {keys} do last = p .. string.format(\"%08d\", i) skin_config.option[last] = i end\n\
+         s.extra = {{}}\n\
+         for i = 1, {count} do\n\
+         local own = i\n\
+         {env}\
+         s.extra[i] = function() local mine = own return skin_config.option[\"{{LAST}}\"] == 1 end\n\
+         end\n\
+         return s"
+    )
+}
+
+/// [`options`] with the read name spelled out.
+fn options_entry(keys: usize, bytes: usize, count: usize, envs: bool) -> String {
+    let last = format!("{}{keys:08}", "x".repeat(bytes - 8));
+    options(keys, bytes, count, envs).replace("{LAST}", &last)
+}
+
+#[test]
+fn option_tables_are_interned_once_a_pass() {
+    // 100 `_ENV` tables over one option table of 600 names of 6 000
+    // bytes: its names are read and interned once, not once an `_ENV`.
+    let d = folder(&options_entry(600, 6_000, 100, true));
+    let cancel = Cancel::new();
+    let h = read_lua_header(d.path(), "s.luaskin", &cancel).unwrap();
+    let (def, _, _) = h.configured(&Config::defaults(h.header()), &cancel);
+    let def = def.unwrap();
+    let an = def
+        .arena
+        .lua
+        .as_deref()
+        .and_then(|l| l.analysis.as_deref())
+        .unwrap();
+    assert_eq!(an.envs.len(), 100);
+    assert_eq!(an.option_sets.len(), 1);
+    assert_eq!(an.option_names.len(), 600);
+    // One hash of each name, its bytes charged.
+    let work = an.work.get();
+    assert!((600 * 6_000..2 * 600 * 6_000).contains(&work), "{work}");
+}
+
+#[test]
+fn option_lookups_hash_the_name_and_charge_its_bytes() {
+    // 2 000 closures with distinct captures, each classified apart, each
+    // looking up one of 600 names of 1 000 bytes sharing their first 992:
+    // one hash a lookup, its 1 000 bytes charged, never a scan.
+    let start = std::time::Instant::now();
+    let i = import(&options_entry(600, 1_000, 2_000, false)).unwrap();
+    assert!(
+        i.usage.analysis_work >= 2_000 * 1_000,
+        "{}",
+        i.usage.analysis_work
+    );
+    assert!(start.elapsed() < std::time::Duration::from_secs(20));
+}
+
 /// The model fields read by the counts the oracle sets, by property id:
 /// written from the play schema's names, apart from the importer.
 const FIELDS: [(i64, &str); 9] = [

@@ -170,6 +170,7 @@ pub(super) fn convert(
         instance_of: HashMap::new(),
         pending: Vec::new(),
         env_of: HashMap::new(),
+        option_set_of: HashMap::new(),
         analysis: Analysis::default(),
         entry: entry.name(),
         modules: &modules,
@@ -231,6 +232,8 @@ struct Conv<'a> {
     pending: Vec<(u32, Function)>,
     /// `_ENV` captures by the table's address.
     env_of: HashMap<usize, u32>,
+    /// Option tables read, by address.
+    option_set_of: HashMap<usize, u32>,
     analysis: Analysis,
     entry: &'a str,
     modules: &'a [String],
@@ -484,7 +487,7 @@ impl Conv<'_> {
             let Some(inst) = self.analysis.instances.get(i as usize).copied() else {
                 continue;
             };
-            let ups: Vec<bool> = {
+            let ups: Vec<(u32, bool)> = {
                 let files = self.pass.files.borrow();
                 let Some(ast) = files.get(usize::from(inst.file)).map(|f| &f.ast) else {
                     continue;
@@ -494,15 +497,22 @@ impl Conv<'_> {
                 };
                 ast.list(func.upvalues)
                     .iter()
-                    .map(|&u| callback::is_env(ast, u))
+                    .map(|&u| (u, callback::is_env(ast, u)))
                     .collect()
             };
+            // Each binding's position, hashed once a function.
+            for (k, &(up, _)) in (0_u32..).zip(&ups) {
+                self.analysis
+                    .slots
+                    .entry((inst.file, inst.func, up))
+                    .or_insert(k);
+            }
             let start = u32::try_from(self.analysis.captured.len())
                 .map_err(|_| self.lua(LuaWhy::Limit(LuaLimit::Captures)))?;
             let mut n = 0_u32;
             for (k, v) in values.into_iter().enumerate() {
                 self.charge()?;
-                let env = ups.get(k).copied().unwrap_or(false);
+                let env = ups.get(k).is_some_and(|&(_, env)| env);
                 let c = self.captured(v, env)?;
                 self.analysis.captured.push(c);
                 n += 1;
@@ -578,21 +588,7 @@ impl Conv<'_> {
         })();
         match option {
             Err(why) => cap.unproven = Some(why),
-            Ok(option) => {
-                for (seen, pair) in option.pairs::<Value, Value>().enumerate() {
-                    self.poll(seen)?;
-                    // Every entry is charged, whatever it holds.
-                    self.charge()?;
-                    let (k, v) = pair.map_err(|e| self.mlua(&e))?;
-                    if let (Value::String(k), Value::Integer(v)) = (k, v) {
-                        let k = k.as_bytes();
-                        if k.len() > MAX_STRING_BYTES {
-                            continue;
-                        }
-                        cap.options.push((k.to_vec(), v));
-                    }
-                }
-            }
+            Ok(option) => cap.options = self.option_set(&option)?,
         }
         self.charge()?;
         let i = u32::try_from(self.analysis.envs.len())
@@ -600,6 +596,57 @@ impl Conv<'_> {
         self.analysis.envs.push(cap);
         self.env_of.insert(addr, i);
         Ok(i)
+    }
+
+    /// The integer entries of option table `t`, read once a pass by its
+    /// address: each name hashed (its bytes charged as analysis work) and
+    /// interned once (its bytes charged as decoded bytes), the entries
+    /// kept by name id.
+    fn option_set(&mut self, t: &Table) -> Result<u32, ImportError> {
+        let addr = t.to_pointer().addr();
+        if let Some(&i) = self.option_set_of.get(&addr) {
+            return Ok(i);
+        }
+        let mut set = HashMap::new();
+        for (seen, pair) in t.pairs::<Value, Value>().enumerate() {
+            self.poll(seen)?;
+            // Every entry is charged, whatever it holds.
+            self.charge()?;
+            let (k, v) = pair.map_err(|e| self.mlua(&e))?;
+            let (Value::String(k), Value::Integer(v)) = (k, v) else {
+                continue;
+            };
+            let k = k.as_bytes();
+            if k.len() > MAX_STRING_BYTES {
+                continue;
+            }
+            let len = u64::try_from(k.len()).unwrap_or(u64::MAX);
+            self.analysis.charge(len).map_err(|w| self.fatal(w))?;
+            let id = match self.analysis.option_names.get(&*k) {
+                Some(&id) => id,
+                None => {
+                    if self.decoded.saturating_add(len) > MAX_DECODED_BYTES {
+                        return Err(self.input(InputLimit::DecodedBytes));
+                    }
+                    self.decoded += len;
+                    let id = u32::try_from(self.analysis.option_names.len())
+                        .map_err(|_| self.lua(LuaWhy::Limit(LuaLimit::Captures)))?;
+                    self.analysis.option_names.insert(Box::from(&*k), id);
+                    id
+                }
+            };
+            set.insert(id, v);
+        }
+        let i = u32::try_from(self.analysis.option_sets.len())
+            .map_err(|_| self.lua(LuaWhy::Limit(LuaLimit::Captures)))?;
+        self.analysis.option_sets.push(set);
+        self.option_set_of.insert(addr, i);
+        Ok(i)
+    }
+
+    /// The refusal a walk's sentinel stands for.
+    fn fatal(&self, why: super::Unsupported) -> ImportError {
+        self.lua(callback::fatal(why).unwrap_or(LuaWhy::Limit(LuaLimit::AnalysisWork)))
     }
 
     /// Table `t`, its key's span when it has one, at `depth`.
