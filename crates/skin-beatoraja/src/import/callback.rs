@@ -799,16 +799,18 @@ impl Cx<'_> {
         Ok(false)
     }
 
-    /// A number's `value` callback at node `id`, for the number at `at`:
-    /// its value, or `None` when it is replaced by the omitted number,
-    /// reported.
+    /// A number's `value` callback at node `id`, for the number at `at`
+    /// in `base` unless what it reads has a part of its own: its value,
+    /// or `None` when it is replaced by the omitted number, reported; a
+    /// critical one refuses instead.
     pub(super) fn value_callback(
         &mut self,
         at: Span,
         id: u32,
+        base: Role,
     ) -> Result<Option<NumberValue>, ImportError> {
         let c = self.callable_at(id).map_or(NONE, |(c, _)| c);
-        let (why, part) = match self.lower(id, false) {
+        let (why, part) = match self.lower(id, base != Role::Decorative) {
             Ok(Lowering::Lowered(l, _)) if l.config && l.part.is_some() => {
                 (Unsupported::Config, l.part)
             }
@@ -820,7 +822,7 @@ impl Cx<'_> {
                 return Ok(Some(NumberValue {
                     expr: l.src,
                     guard,
-                    role: l.part.map_or(Role::Decorative, Role::Critical),
+                    role: l.part.map_or(base, Role::Critical),
                     deviates: l.deviates,
                 }));
             }
@@ -831,7 +833,7 @@ impl Cx<'_> {
                 return Err(e);
             }
         };
-        if part.is_some() {
+        if part.is_some() || base != Role::Decorative {
             self.set_outcome(c, Disposition::Refused);
             return Err(self.critical(id, "value", why));
         }

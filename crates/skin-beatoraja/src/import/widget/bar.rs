@@ -9,7 +9,9 @@
 //! `len`, `ref` and actions are unused there and here. A record whose
 //! image is missing or fails is dropped with a note where the source
 //! would fail on it later (`LaneRenderer.java:443-444`); a record without
-//! keys, which the source fails on at once (`:97-98`), refuses.
+//! keys, which the source fails on at once (`:97-98`), refuses. A record
+//! that is failure presentation (owner decision 16) refuses wherever
+//! another would be dropped.
 
 use skin_model::{BarGroupDef, Place};
 
@@ -57,7 +59,6 @@ impl Cx<'_> {
 
     /// Group record `rec`: `None` when it is dropped.
     fn bar_group(&mut self, rec: u32) -> Result<Option<(BarGroupDef, Span)>, ImportError> {
-        let role = Role::Decorative;
         let at = self.arena_span(rec);
         let [dst] = self.def.fields(rec, ["dst"]);
         let keys = dst
@@ -71,6 +72,8 @@ impl Cx<'_> {
             });
         }
         let fits = self.budget.keys(keys).map_err(|l| self.limit(at, l))?;
+        // Its role, from its timer and conditions alone, before any exit.
+        let role = Role::Decorative.or_failure(self.record_failure(rec)?);
         if !fits {
             self.drop_el(role, at, NoteKind::Track(TrackWhy::Limits))?;
             return Ok(None);
