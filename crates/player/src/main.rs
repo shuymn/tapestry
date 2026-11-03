@@ -2018,6 +2018,58 @@ mod tests {
         }
     }
 
+    /// The rig answers the Closing duration the play skin declares from
+    /// the attempt's commit receipt: none before the first commit, the
+    /// committed skin's after it.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn the_rig_declares_the_committed_skins_close() {
+        use game::Rig as _;
+        let three = Some(bms_model::TimeUs(3_000_000));
+        let dir = tempfile::tempdir().unwrap();
+        let root = game::DataRoot::new(dir.path().join("loaded"));
+        let settings = game::Settings {
+            device: game::DeviceSettings::default(),
+            player: game::PlayerSettings::default(),
+        };
+        let chart_path = dir.path().join("a.bms");
+        std::fs::write(&chart_path, "#BPM 120\n#00111:01\n").unwrap();
+        let config = game::SessionConfig {
+            lead_in: bms_model::TimeUs(1_000_000),
+            step: bms_model::TimeUs(1_000),
+            start: bms_model::TimeUs(0),
+            effects: 64,
+            seed: 1,
+            speed: bms_model::Speed::NORMAL,
+            app_version: "0.0.0-test".to_owned(),
+            provenance: replay::BuildProvenance::Development,
+            receive: replay::ReceiveMethod::Scripted,
+            autoplay: None,
+        };
+        let loaded = game::Loaded::load(
+            root,
+            settings.clone(),
+            &chart_path,
+            config,
+            game::Parts::unsaved(&settings.player),
+        )
+        .unwrap();
+        let render = crate::render_side::tests::Installers::default().spawn(
+            &Arc::new(loaded.chart().clone()),
+            &crate::render_side::tests::bundle_closing(three),
+        );
+        let (declared, _) = on_rig_with(settings, render, |rig, _| {
+            let before = rig.declared_close();
+            assert_eq!(
+                rig.prepare_attempt(&loaded).unwrap(),
+                game::Preparation::Ready
+            );
+            rig.commit_attempt().unwrap();
+            (before, rig.declared_close())
+        });
+        assert_eq!(declared, (None, three));
+    }
+
     /// Which launcher [`super::launch`] chose for `input` and `options`,
     /// the tuner it handed over applied to a rig of `device`: whether the
     /// rig ended with a start gate.

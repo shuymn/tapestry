@@ -6358,7 +6358,7 @@ pub(crate) mod tests {
     }
 
     /// [`bundle`] declaring Closing's duration `close`.
-    fn bundle_closing(close: Option<TimeUs>) -> Arc<render::SkinBundle> {
+    pub(crate) fn bundle_closing(close: Option<TimeUs>) -> Arc<render::SkinBundle> {
         use skin_model::{Anchor, AtlasLimits, Fit, Region, RegionDef, Sheet, SkinDef, Variant};
         let sheet = Sheet::new(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")),
@@ -6597,7 +6597,11 @@ pub(crate) mod tests {
     impl Installers {
         /// A render thread on these installers with `chart` loaded and
         /// `skin` chosen for its attempts.
-        fn spawn(&self, chart: &Arc<Chart>, skin: &Arc<render::SkinBundle>) -> super::RenderLink {
+        pub(crate) fn spawn(
+            &self,
+            chart: &Arc<Chart>,
+            skin: &Arc<render::SkinBundle>,
+        ) -> super::RenderLink {
             let link = self.spawn_bare();
             link.load(Arc::clone(chart), None).unwrap();
             assert_eq!(
