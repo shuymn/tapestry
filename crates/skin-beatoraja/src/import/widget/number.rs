@@ -89,6 +89,7 @@ impl Cx<'_> {
         );
         let value = self.prop(value, "value")?;
         let r = self.int_or(r, "ref", 0)?;
+        let base = Role::Decorative.or_failure(dst.failure);
         let shown = match self.int_prop(&value, r) {
             IntProp::Null => {
                 self.ignored(at, NoteKind::Ignored { field: "value" });
@@ -99,7 +100,7 @@ impl Cx<'_> {
                     kind: PropertyKind::Integer,
                     id,
                 };
-                self.drop_el(Role::Decorative, at, why)?;
+                self.drop_el(base, at, why)?;
                 return Ok(());
             }
             IntProp::Shown(v) => v,
@@ -107,9 +108,15 @@ impl Cx<'_> {
         let role = match shown {
             Value::ExScore => Role::Critical(CriticalPart::ExScore),
             Value::MaxCombo => Role::Critical(CriticalPart::MaxCombo),
-            _ => Role::Decorative,
+            _ => base,
         };
-        debug_assert_eq!(shown.critical(), role != Role::Decorative);
+        debug_assert_eq!(
+            shown.critical(),
+            matches!(
+                role,
+                Role::Critical(CriticalPart::ExScore | CriticalPart::MaxCombo)
+            )
+        );
         let digit = self.int_or(digit, "digit", 0)?;
         let padding = self.int_or(padding, "padding", 0)?;
         let zeropadding = self.int_or(zeropadding, "zeropadding", 0)?;

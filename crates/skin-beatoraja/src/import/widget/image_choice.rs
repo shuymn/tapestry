@@ -177,7 +177,8 @@ impl Cx<'_> {
     /// An image group (`len` above 1) selecting by `src`: `len` runs of
     /// `⌊N / len⌋` of its `N` frames, the remainder never shown; never
     /// drawn when a run would be empty. The cycle is resolved for a run's
-    /// frames, so a run of one frame ignores its timer.
+    /// frames, so a run of one frame ignores its timer. It is lowered as
+    /// `lowered` says, in `role`.
     #[expect(clippy::too_many_arguments, reason = "the group's parts as read")]
     pub(in super::super) fn image_group(
         &mut self,
@@ -187,7 +188,7 @@ impl Cx<'_> {
         len: i32,
         selector: (&'static str, bool),
         charged: bool,
-        lowered: Lowered,
+        (lowered, role): (Lowered, Role),
     ) -> Result<(), ImportError> {
         let at = dst.span;
         let n = self.grid_frames(at, s.div)?;
@@ -203,7 +204,7 @@ impl Cx<'_> {
             .map_err(|l| self.limit(at, l))?;
         #[cfg(test)]
         trace(Event::Refs);
-        let Some(c) = self.image_common(&dst, charged, lowered.role())? else {
+        let Some(c) = self.image_common(&dst, charged, role)? else {
             return Ok(());
         };
         let (src, deviates) = selector;
@@ -237,7 +238,8 @@ impl Cx<'_> {
 
     /// An image set selecting by `src`: one entry per item of its
     /// `images` array, in order, repeats kept; a null item, an id no
-    /// `image` record defines and a source proven missing are holes.
+    /// `image` record defines and a source proven missing are holes. It
+    /// is lowered as `lowered` says, in `role`.
     pub(in super::super) fn image_set_choices(
         &mut self,
         dst: Dst,
@@ -245,7 +247,7 @@ impl Cx<'_> {
         src: &str,
         deviates: bool,
         charged: bool,
-        lowered: Lowered,
+        (lowered, role): (Lowered, Role),
     ) -> Result<(), ImportError> {
         let at = dst.span;
         let Some(list) = images else {
@@ -263,7 +265,7 @@ impl Cx<'_> {
         self.budget.choice_refs(n).map_err(|l| self.limit(at, l))?;
         #[cfg(test)]
         trace(Event::Refs);
-        let Some(c) = self.image_common(&dst, charged, lowered.role())? else {
+        let Some(c) = self.image_common(&dst, charged, role)? else {
             return Ok(());
         };
         let value = self.selector(src, at)?;

@@ -1179,23 +1179,25 @@ fn selecting_paint_varies_only_its_presentation_phase_untimed() {
         import_body(&body(group, &note(""), &[NOTES, &d]))
     };
     // A moving track refuses; an ending window and an untimed cycle are
-    // noted, for an image set and an image group alike.
+    // noted, for an image set and an image group alike. An untimed cycle
+    // runs on `screen` whatever the destination's own timer, so it is
+    // noted on a timed paint too.
     let l = cover_set("", cycling, r#""cover""#, "", moving);
     assert_eq!(critical(l), untimed);
     let timed = cover_set("", cycling, r#""cover""#, r#", "timer": 41"#, moving);
     assert_eq!(d3_notes(&timed), 0);
-    for (images, fields, keys) in [
-        (r#""cover""#, r#", "loop": -1"#, ending),
-        (r#""cy", "cover""#, "", OVER),
+    for (images, fields, keys, when_timed) in [
+        (r#""cover""#, r#", "loop": -1"#, ending, 0),
+        (r#""cy", "cover""#, "", OVER, 1),
     ] {
         let l = cover_set("", cycling, images, fields, keys);
         assert_eq!(d3_notes(&l), 1, "{images} {fields} {keys}");
         let timed = format!(r#", "timer": 41{fields}"#);
         let l = cover_set("", cycling, images, &timed, keys);
-        assert_eq!(d3_notes(&l), 0, "{images} {fields} {keys}");
+        assert_eq!(d3_notes(&l), when_timed, "{images} {fields} {keys}");
     }
     assert_eq!(d3_notes(&group_over("")), 1);
-    assert_eq!(d3_notes(&group_over(r#", "timer": 41"#)), 0);
+    assert_eq!(d3_notes(&group_over(r#", "timer": 41"#)), 1);
     // A static, perpetual one without a cycle imports untimed.
     assert_eq!(
         d3_notes(&cover_set("", "", r#""cover", "cover""#, "", OVER)),

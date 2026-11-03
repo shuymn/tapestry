@@ -25,7 +25,9 @@
 //!    at READY; a critical one only with its placement and its colour
 //!    other than alpha the same at every key, so only its presentation
 //!    phase (alpha, its first key, its end, an image cycle without a
-//!    timer) depends on the start, noted (D3, [`untimed_ok`]).
+//!    timer) depends on the start, noted (D3, [`untimed_ok`]); an image
+//!    cycle without a timer runs on `screen` under a timed destination
+//!    too, noted on a critical one ([`start_dependent`]).
 //! 8. Play-state display differences on decorative elements are accepted
 //!    (D4, [`super::ops`], [`super::property`]).
 //! 9. Text is always drawn with smooth sampling and normal blending (D5).
@@ -64,6 +66,13 @@
 //!     imports ([`super::widget::lanes`]). Its differences from the source
 //!     are noted as lane approximations (D9): n cut at its trim line
 //!     after its stretch, o never drawn outside the lanes.
+//! 16. The failure presentation is play-critical: on play, a destination
+//!     that can still draw once the configured options are folded and
+//!     whose timer resolves to `failed` (3, directly or through a custom
+//!     timer chain) is reproduced or refuses the skin, never dropped. Its
+//!     role is fixed before any of its fields is mapped; a part with a
+//!     role of its own (EX score, max combo, the covers, the play
+//!     objects) keeps it ([`Role::or_failure`], `Cx::failure`).
 
 use std::fmt;
 
@@ -89,6 +98,9 @@ pub enum CriticalPart {
     Cover,
     /// The LIFT cover.
     Lift,
+    /// What the play presents when a survival gauge fails: a destination
+    /// timed on `failed` (owner decision 16).
+    Failure,
 }
 
 impl fmt::Display for CriticalPart {
@@ -101,6 +113,7 @@ impl fmt::Display for CriticalPart {
             Self::Gauge => "gauge",
             Self::Cover => "SUDDEN+ cover",
             Self::Lift => "LIFT cover",
+            Self::Failure => "failure presentation",
         })
     }
 }
@@ -110,6 +123,18 @@ impl fmt::Display for CriticalPart {
 pub(crate) enum Role {
     Critical(CriticalPart),
     Decorative,
+}
+
+impl Role {
+    /// The role of an element that is failure presentation when `failure`
+    /// (owner decision 16): a decorative one becomes play-critical, and a
+    /// content part keeps its own.
+    pub(crate) fn or_failure(self, failure: bool) -> Self {
+        match self {
+            Self::Decorative if failure => Self::Critical(CriticalPart::Failure),
+            r => r,
+        }
+    }
 }
 
 /// Something `role`'s element at `at` needs that the importer cannot
@@ -145,12 +170,14 @@ pub(crate) fn untimed_ok(track: &Accepted) -> bool {
     track.fixed_but_alpha()
 }
 
-/// Whether what an untimed element shows depends on when the state
-/// started: its keys differ, its first is after 0, it hides after its
-/// last, or `untimed_cycle`, an image cycle without a timer.
-pub(crate) fn start_dependent(track: &Accepted, untimed_cycle: bool) -> bool {
-    !track.identical()
-        || track.keys.first().is_some_and(|k| k.at != 0)
-        || matches!(track.end, End::Hide)
-        || untimed_cycle
+/// Whether what a critical element shows depends on when the state
+/// started (D3): it keeps an image cycling without a timer, `untimed_cycle`,
+/// whatever its own timer; or it is `untimed` itself and its keys differ,
+/// its first is after 0 or it hides after its last.
+pub(crate) fn start_dependent(track: &Accepted, untimed: bool, untimed_cycle: bool) -> bool {
+    untimed_cycle
+        || (untimed
+            && (!track.identical()
+                || track.keys.first().is_some_and(|k| k.at != 0)
+                || matches!(track.end, End::Hide)))
 }

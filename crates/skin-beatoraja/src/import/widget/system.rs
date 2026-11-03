@@ -6,7 +6,8 @@
 //! images of that size and colour, drawn as any image is: stretched to
 //! the destination, its colour, alpha and blend applied, following the
 //! covers, and an offset-4 one painting SUDDEN+. The chart's stage file,
-//! back image and banner (100–102) and every other id are dropped.
+//! back image and banner (100–102) and every other id are dropped, or
+//! refuse the skin when they are failure presentation.
 
 use skin_model::Source;
 
@@ -40,10 +41,10 @@ impl Cx<'_> {
             let why = NoteKind::Unsupported {
                 object: Object::System,
             };
-            return self.drop_el(Role::Decorative, at, why);
+            return self.drop_el(Role::Decorative.or_failure(dst.failure), at, why);
         };
         let (charged, lowered) = self.lowered(&dst)?;
-        let role = lowered.role();
+        let role = lowered.role().or_failure(dst.failure);
         if lowered == Lowered::Paint {
             // SUDDEN+'s paint, made as an image record's is; under stretch
             // 5 a 1x1 frame's rect.
