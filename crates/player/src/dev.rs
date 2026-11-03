@@ -74,6 +74,9 @@ static SLOW_DECODING: AtomicU64 = AtomicU64::new(0);
 /// How long the render thread holds the next attempt's preparation, ms
 /// (a script's `slow-preparing`).
 static SLOW_PREPARING: AtomicU64 = AtomicU64::new(0);
+/// How long the render thread holds the next chart's load, ms (a
+/// script's `slow-chart-load`).
+static SLOW_CHART_LOAD: AtomicU64 = AtomicU64::new(0);
 /// A load's phase holds now (`slow-decoding`, `slow-measuring`,
 /// `slow-preparing`): a `press-loading` press waits for it.
 static STALLED: AtomicBool = AtomicBool::new(false);
@@ -107,6 +110,8 @@ pub enum LoadPhase {
     Measuring,
     /// The render thread prepares the attempt.
     Preparing,
+    /// The render thread loads the chart.
+    ChartLoad,
 }
 
 impl LoadPhase {
@@ -116,6 +121,7 @@ impl LoadPhase {
             "decoding" => Some(Self::Decoding),
             "measuring" => Some(Self::Measuring),
             "preparing" => Some(Self::Preparing),
+            "chart-load" => Some(Self::ChartLoad),
             _ => None,
         }
     }
@@ -133,6 +139,29 @@ pub fn hold_decoding() {
     let ms = SLOW_DECODING.swap(0, Ordering::Relaxed);
     if ms > 0 {
         println!("dev: the decode holds {ms} ms");
+        let _stall = Stall::begin();
+        std::thread::sleep(Duration::from_millis(ms));
+    }
+}
+
+/// The render thread holds the next chart's load `ms`
+/// (`slow-chart-load`).
+pub fn slow_chart_load(ms: u64) {
+    SLOW_CHART_LOAD.store(ms, Ordering::Relaxed);
+}
+
+/// Holds `phase` on the thread running it as its `slow-` step says, once.
+/// Only a phase the render thread runs holds here.
+pub fn hold(phase: LoadPhase) {
+    let (slow, what) = match phase {
+        LoadPhase::ChartLoad => (&SLOW_CHART_LOAD, "the chart's load"),
+        LoadPhase::Preparing => (&SLOW_PREPARING, "the preparation"),
+        LoadPhase::Decoding => (&SLOW_DECODING, "the decode"),
+        LoadPhase::Measuring => return,
+    };
+    let ms = slow.swap(0, Ordering::Relaxed);
+    if ms > 0 {
+        println!("dev: {what} holds {ms} ms");
         let _stall = Stall::begin();
         std::thread::sleep(Duration::from_millis(ms));
     }
@@ -671,6 +700,9 @@ pub enum SelectStep {
     /// The next attempt's preparation holds this many milliseconds on the
     /// render thread (`slow-preparing`).
     SlowPreparing(u64),
+    /// The next chart's load holds this many milliseconds on the render
+    /// thread (`slow-chart-load`).
+    SlowChartLoad(u64),
     /// F2 is pressed on the window in this phase of the next load
     /// (`press-loading`).
     PressLoading(LoadPhase),
@@ -786,7 +818,7 @@ impl SelectScript {
                 Some(("wait", f)) => Ok(SelectStep::Wait(f.to_owned())),
                 Some(("search", t)) => Ok(SelectStep::Search(t.to_owned())),
                 Some(("sleep", ms)) => ms.parse().map(SelectStep::Sleep).map_err(|_| {
-                    format!("{s} is not pick=, wait=, search=, sleep=, idle=, slow-load=, slow-measuring=, slow-decoding=, slow-preparing=, press-loading=, hold-background, background=running, background=idle, enter, prev-preset, next-preset, drawn, back, retry, next, prev, close-measuring, quit-measuring, quit-decoding, quit-loading, close-loading or close")
+                    format!("{s} is not pick=, wait=, search=, sleep=, idle=, slow-load=, slow-measuring=, slow-decoding=, slow-preparing=, slow-chart-load=, press-loading=, hold-background, background=running, background=idle, enter, prev-preset, next-preset, drawn, back, retry, next, prev, close-measuring, quit-measuring, quit-decoding, quit-loading, close-loading or close")
                 }),
                 Some(("idle", ms)) => ms
                     .parse()
@@ -808,9 +840,13 @@ impl SelectScript {
                     .parse()
                     .map(SelectStep::SlowPreparing)
                     .map_err(|_| format!("{s} takes milliseconds")),
+                Some(("slow-chart-load", ms)) => ms
+                    .parse()
+                    .map(SelectStep::SlowChartLoad)
+                    .map_err(|_| format!("{s} takes milliseconds")),
                 Some(("press-loading", phase)) => LoadPhase::named(phase)
                     .map(SelectStep::PressLoading)
-                    .ok_or_else(|| format!("{s} takes decoding, measuring or preparing")),
+                    .ok_or_else(|| format!("{s} takes decoding, measuring, preparing or chart-load")),
                 Some(("background", "running")) => Ok(SelectStep::Background(true)),
                 Some(("background", "idle")) => Ok(SelectStep::Background(false)),
                 None if s == "enter" => Ok(SelectStep::Enter),
@@ -829,7 +865,7 @@ impl SelectScript {
                 None if s == "hold-background" => Ok(SelectStep::HoldBackground),
                 None if s == "close" => Ok(SelectStep::Close),
                 _ => Err(format!(
-                    "{s} is not pick=, wait=, search=, sleep=, idle=, slow-load=, slow-measuring=, slow-decoding=, slow-preparing=, press-loading=, hold-background, background=running, background=idle, enter, prev-preset, next-preset, drawn, back, retry, next, prev, close-measuring, quit-measuring, quit-decoding, quit-loading, close-loading or close"
+                    "{s} is not pick=, wait=, search=, sleep=, idle=, slow-load=, slow-measuring=, slow-decoding=, slow-preparing=, slow-chart-load=, press-loading=, hold-background, background=running, background=idle, enter, prev-preset, next-preset, drawn, back, retry, next, prev, close-measuring, quit-measuring, quit-decoding, quit-loading, close-loading or close"
                 )),
             })
             .map(|step| step.map(|s| (s, None)))

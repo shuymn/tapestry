@@ -1176,3 +1176,12 @@ fn an_adjustment_during_a_stalled_render_preparation_is_published_before_it_ends
         "dev: the preparation holds 1500 ms",
     );
 }
+
+#[test]
+fn an_adjustment_during_a_stalled_chart_load_is_published_before_it_ends() {
+    an_adjustment_during_a_stalled_phase_is_published(
+        "slow-chart-load=1500",
+        "chart-load",
+        "dev: the chart's load holds 1500 ms",
+    );
+}

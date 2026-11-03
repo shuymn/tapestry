@@ -530,6 +530,7 @@ impl Selection {
                 Some(SelectStep::SlowMeasuring(ms)) => crate::dev::slow_measuring(ms),
                 Some(SelectStep::SlowDecoding(ms)) => crate::dev::slow_decoding(ms),
                 Some(SelectStep::SlowPreparing(ms)) => crate::dev::slow_preparing(ms),
+                Some(SelectStep::SlowChartLoad(ms)) => crate::dev::slow_chart_load(ms),
                 Some(SelectStep::PressLoading(ms)) => crate::dev::press_loading(ms),
                 Some(SelectStep::HoldBackground) => crate::dev::hold_background(),
                 Some(SelectStep::Background(running)) => {
@@ -1769,7 +1770,18 @@ impl AppRig for PlayerRig<'_> {
             return Ok(Loading::Cancelled);
         }
         show_stage(&self.render, page.as_ref(), Stage::Screen);
-        screen.wait(&self.render).map_err(ChartLoadError::Screen)?;
+        // The chart loads on the render thread: the adjustments are served
+        // through the wait.
+        let (adjust, input, controls) = (&mut self.adjust, &self.input, self.controls);
+        screen
+            .wait_serving(&self.render, || {
+                #[cfg(feature = "dev-tools")]
+                crate::dev::press_due(controls, crate::dev::LoadPhase::ChartLoad);
+                crate::play::serve_adjustments(adjust.as_mut(), input, controls.tuning());
+            })
+            .map_err(ChartLoadError::Screen)?;
+        #[cfg(feature = "dev-tools")]
+        crate::dev::print_adjustments("chart-load", self.adjust.as_ref());
         let ready = self.clock.now();
         #[cfg(feature = "dev-tools")]
         let feed = self.scenario_input(feed);

@@ -1136,15 +1136,15 @@ impl RenderLink {
     ///
     /// # Errors
     ///
-    /// As [`PendingLoad::wait`].
+    /// As [`PendingLoad::wait_serving`].
     #[cfg(test)]
     pub fn load(&self, chart: Arc<Chart>, section: Option<Section>) -> Result<(), ScreenError> {
-        self.begin_load(chart, section).wait(self)
+        self.begin_load(chart, section).wait_serving(self, || {})
     }
 
     /// Starts preparing `chart` for every play from now on; the game
     /// thread goes on with the rest of the load and waits for the answer
-    /// later ([`PendingLoad::wait`]). A pending load dropped unanswered
+    /// later ([`PendingLoad::wait_serving`]). A pending load dropped unanswered
     /// leaves the screen with the chart, which the next load replaces.
     pub fn begin_load(&self, chart: Arc<Chart>, section: Option<Section>) -> PendingLoad {
         let (reply, rx) = mpsc::sync_channel(1);
@@ -1326,15 +1326,32 @@ impl RenderLink {
 pub struct PendingLoad(Receiver<Result<(), RenderError>>);
 
 impl PendingLoad {
-    /// Waits for the answer, at most [`LOAD_TIMEOUT`] from here.
+    /// Waits for the answer, at most the answer's bound from here, calling
+    /// `serve` every [`CANCEL_POLL`] at most meanwhile: the game thread
+    /// serves the adjustments through the chart's load on the render
+    /// thread.
     ///
     /// # Errors
     ///
     /// Why the screen cannot be built or cannot draw the chart, and
-    /// [`ScreenError::NoAnswer`] after [`LOAD_TIMEOUT`]; a late answer goes
-    /// nowhere.
-    pub fn wait(self, link: &RenderLink) -> Result<(), ScreenError> {
-        link.answer(&self.0)
+    /// [`ScreenError::NoAnswer`] past the bound; a late answer goes nowhere.
+    pub fn wait_serving(
+        self,
+        link: &RenderLink,
+        mut serve: impl FnMut(),
+    ) -> Result<(), ScreenError> {
+        let deadline = Instant::now() + link.answer_timeout;
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match self.0.recv_timeout(left.min(CANCEL_POLL)) {
+                Ok(ready) => return Ok(ready?),
+                Err(mpsc::RecvTimeoutError::Disconnected) => return Err(ScreenError::Ended),
+                Err(mpsc::RecvTimeoutError::Timeout) if left.is_zero() => {
+                    return Err(ScreenError::NoAnswer);
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => serve(),
+            }
+        }
     }
 }
 
@@ -1913,6 +1930,8 @@ impl Run {
                     section,
                     reply,
                 }) => {
+                    #[cfg(feature = "dev-tools")]
+                    crate::dev::hold(crate::dev::LoadPhase::ChartLoad);
                     // What the screen draws of the chart (dev-tools): a
                     // section's targets only.
                     #[cfg(feature = "dev-tools")]
