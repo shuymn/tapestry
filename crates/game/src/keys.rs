@@ -589,7 +589,7 @@ impl KeyConfigFlow {
         keep: bool,
         product: Option<HidProduct>,
     ) -> Press {
-        let Some(&(_, ref positive)) = self
+        let Some((_, positive)) = self
             .bound
             .iter()
             .rev()

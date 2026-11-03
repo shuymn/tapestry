@@ -311,7 +311,6 @@ impl PlayerRig<'_> {
     /// failure is kept, nothing more is asked of the driver, and the run
     /// ends with it ([`Rig::input_failure`]).
     pub(crate) fn adjustments_failed(&mut self, e: InputWaitError) {
-        log::warn!("the adjustments' wait on the input thread failed: {e}");
         self.adjust_failed.get_or_insert(e);
     }
 
