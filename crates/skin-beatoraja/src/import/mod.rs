@@ -311,6 +311,8 @@ pub(crate) struct Cx<'d> {
     span_hint: widget::lanes::SpanHint,
     /// The judge records already drawn.
     judges: Vec<u32>,
+    /// The untimed critical destinations noted for D3.
+    phased: BTreeSet<Span>,
     /// Image selectors compiled once, by source; each copy kept is
     /// charged.
     selectors: HashMap<String, Program>,
@@ -388,6 +390,7 @@ impl<'d> Cx<'d> {
             lanes: None,
             span_hint: widget::lanes::SpanHint::NoLanes,
             judges: Vec::new(),
+            phased: BTreeSet::new(),
             selectors: HashMap::new(),
         };
         cx.budget.usage.resolved_digit_offsets =

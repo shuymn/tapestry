@@ -16,9 +16,9 @@ use skin_model::{CycleDef, ImageDef, MAX_SKIN_FRAMES, Native, Source, Track};
 
 use super::asset::{self, Crop, Failed, ImageKey, Path};
 use super::budget::ImportLimit;
-use super::policy::Role;
+use super::policy::{self, Role};
 use super::property::{self, IndexProp};
-use super::report::{NoteKind, Object, Span};
+use super::report::{DeviationId, NoteKind, Object, Severity, Span};
 use super::track::{self, Stretch};
 use super::{Common, Cx, Dst, Opts, Prop};
 use crate::error::ImportError;
@@ -55,20 +55,6 @@ pub(super) struct SrcImage {
     cycle: i32,
 }
 
-/// Whether `c`, critical and untimed, would draw what depends on when
-/// the state started (owner decision 7, D3): its track static from 0 and
-/// perpetual, and every cycle it shows `cycle_ok` (absent or on a timer).
-fn untimed_refused(c: &Common, cycle_ok: bool) -> bool {
-    c.untimed
-        && matches!(c.role, Role::Critical(_))
-        && !super::policy::untimed_ok(
-            c.track.identical(),
-            c.track.keys.first().is_some_and(|k| k.at == 0),
-            c.track.end,
-            cycle_ok,
-        )
-}
-
 impl Cx<'_> {
     /// The frames of a `div` grid. A grid of more than the skin's frames
     /// is the aggregate frame limit, refused before anything reads it.
@@ -80,10 +66,31 @@ impl Cx<'_> {
             .ok_or_else(|| self.limit(at, ImportLimit::Frames))
     }
 
+    /// Whether `c`, critical and without a timer, is refused (owner
+    /// decision 7, D3, [`policy::untimed_ok`]); one admitted whose
+    /// presentation phase depends on the start, `untimed_cycle` when it
+    /// shows an image cycle without a timer, is noted once per
+    /// destination.
+    pub(super) fn untimed_refused(&mut self, c: &Common, untimed_cycle: bool) -> bool {
+        if !c.untimed || !matches!(c.role, Role::Critical(_)) {
+            return false;
+        }
+        if !policy::untimed_ok(&c.track) {
+            return true;
+        }
+        if policy::start_dependent(&c.track, untimed_cycle) && self.phased.insert(c.span) {
+            self.note(
+                Some(c.span),
+                Severity::Deviation,
+                NoteKind::Deviation(DeviationId::D3),
+            );
+        }
+        false
+    }
+
     /// The cycle of `s` over `frames` for `c`, resolved before its sheet
     /// is admitted, or why `c` is dropped: its timer or cycle refused, or
-    /// `c` critical and untimed where it shows what the state's start
-    /// decides (D3).
+    /// `c` critical and untimed where it moves or changes colour (D3).
     pub(super) fn src_cycle(
         &mut self,
         c: &Common,
@@ -94,7 +101,7 @@ impl Cx<'_> {
             Ok(v) => v,
             Err(why) => return Ok(Err(why)),
         };
-        if untimed_refused(c, cycle.is_none() || on_timer) {
+        if self.untimed_refused(c, cycle.is_some() && !on_timer) {
             return Ok(Err(NoteKind::Timer(super::TimerWhy::Untimed)));
         }
         Ok(Ok(cycle))

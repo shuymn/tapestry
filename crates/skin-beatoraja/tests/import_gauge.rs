@@ -7,7 +7,7 @@ mod common;
 
 use common::play::round;
 use common::{Loaded, has, import_sized};
-use skin_beatoraja::{CriticalPart, DeviationId, ImportError, NoteKind};
+use skin_beatoraja::{CriticalPart, DeviationId, ImportError, NoteKind, TimerWhy};
 use skin_model::Filter;
 
 /// Node images n0..n35, each an 8×8 cell of `a`, and `extra` records.
@@ -382,5 +382,70 @@ fn a_gauge_s_quads_are_admitted_before_its_nodes() {
     match spent(1_489, bad).err() {
         ImportError::Range { .. } => {}
         e => panic!("{e:?}"),
+    }
+}
+
+/// A gauge without a timer that fades in and holds, and a second
+/// destination of it that pulses additively under a condition, run on
+/// `screen` (D3): only their alpha changes, each noted once.
+#[test]
+fn untimed_gauge_fades_run_on_screen() {
+    let base = r#"{"id": "g", "loop": 700, "dst": [
+        {"time": 500, "x": 100, "y": 500, "w": 100, "h": 10, "a": 0},
+        {"time": 700, "x": 100, "y": 500, "w": 100, "h": 10, "a": 255}]}"#;
+    let pulse = r#"{"id": "g", "loop": 700, "blend": 2, "draw": -241, "dst": [
+        {"time": 700, "x": 100, "y": 500, "w": 100, "h": 10, "a": 0},
+        {"time": 1200, "x": 100, "y": 500, "w": 100, "h": 10, "a": 80},
+        {"time": 1500, "x": 100, "y": 500, "w": 100, "h": 10, "a": 0}]}"#;
+    let skin = |dsts: &[&str]| {
+        let body = format!(
+            r#"{}, "gauge": {{"id": "g", "nodes": {}, "parts": 10}},
+               "destination": [{}]"#,
+            images(""),
+            nodes(4),
+            dsts.join(", ")
+        );
+        import_sized([1_920, 1_080], &body, &[])
+    };
+    let d3 = |l: &Loaded| {
+        let d3 = NoteKind::Deviation(DeviationId::D3);
+        l.report().notes.iter().filter(|n| n.kind == d3).count()
+    };
+    assert_eq!(d3(&skin(&[base, pulse])), 2);
+    // Absent before its first key, then its alpha at each `screen` time.
+    let alphas = |dst: &str, ms: i64| -> Vec<f32> {
+        skin(&[dst]).quads(ms).iter().map(|q| q.color[3]).collect()
+    };
+    assert_eq!(alphas(base, 499), Vec::<f32>::new());
+    assert_eq!(alphas(base, 600)[0], 127.5 / 255.0);
+    assert_eq!(alphas(base, 5_000), [1.0; 10]);
+    assert_eq!(alphas(pulse, 699), Vec::<f32>::new());
+    assert_eq!(alphas(pulse, 1_200), [80.0 / 255.0; 10]);
+    // 800 ms on, the pulse repeats.
+    assert_eq!(alphas(pulse, 2_000), [80.0 / 255.0; 10]);
+    let mut d = skin(&[pulse]).drawn();
+    d.frame(1_200, &[]);
+    assert!(
+        d.batch
+            .runs()
+            .iter()
+            .all(|r| r.key.blend == skin_model::Blend::Add)
+    );
+    // Moving or tinting it untimed refuses.
+    for last in [
+        r#""x": 100, "y": 500, "w": 120, "h": 10"#,
+        r#""x": 100, "y": 500, "w": 100, "h": 10, "g": 0"#,
+    ] {
+        let dst = format!(
+            r#"{{"id": "g", "dst": [{{"time": 0, "x": 100, "y": 500, "w": 100, "h": 10}},
+                                    {{"time": 100, {last}}}]}}"#
+        );
+        match skin(&[&dst]).err() {
+            ImportError::Critical { part, why, .. } => assert_eq!(
+                (part, why),
+                (CriticalPart::Gauge, NoteKind::Timer(TimerWhy::Untimed))
+            ),
+            e => panic!("{e:?}"),
+        }
     }
 }

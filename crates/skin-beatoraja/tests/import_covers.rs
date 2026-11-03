@@ -544,15 +544,24 @@ fn sudden_plus_paint_draws_as_authored() {
         let l = with("", &[&d]);
         assert_eq!(added_notes(&l), [], "{d}");
     }
-    // Play-critical, it may not depend on when the state started
-    // without a timer of its own (D3): a window ending is refused.
-    let ending = cover(r#""loop": -1"#).replace(
-        r#""dst": [{"x": 20, "y": 800, "w": 430, "h": 600}]"#,
-        r#""dst": [{"time": 0, "x": 20, "y": 800, "w": 430, "h": 600},
-                       {"time": 500, "x": 20, "y": 800, "w": 430, "h": 600}]"#,
-    );
+    // Play-critical without a timer of its own (D3): a window ending on
+    // `screen` is noted, a moving one refused.
+    let keyed = |fields: &str, last: &str| {
+        cover(fields).replace(
+            r#""dst": [{"x": 20, "y": 800, "w": 430, "h": 600}]"#,
+            &format!(
+                r#""dst": [{{"time": 0, "x": 20, "y": 800, "w": 430, "h": 600}},
+                           {{"time": 500, "x": 20, "y": {last}, "w": 430, "h": 600}}]"#
+            ),
+        )
+    };
+    let ending = with("", &[&keyed(r#""loop": -1"#, "800")]);
+    assert_eq!(added_notes(&ending), [NoteKind::Deviation(DeviationId::D3)]);
+    let chart = ChartBuilder::new(150_000).build().unwrap();
+    let mut d = Drawn::over(ending.ok().skin.clone(), &chart);
+    assert_eq!((d.shown(500).len(), d.shown(501).len()), (1, 0));
     assert_eq!(
-        critical(with("", &[&ending])),
+        critical(with("", &[&keyed("", "700")])),
         (CriticalPart::Cover, NoteKind::Timer(TimerWhy::Untimed))
     );
     let l = with("", &[&cover(r#""blend": 2"#)]);
@@ -1118,7 +1127,7 @@ fn cover_set(sources: &str, extra: &str, images: &str, fields: &str, keys: &str)
 const OVER: &str = r#"{"x": 20, "y": 800, "w": 430, "h": 600}"#;
 
 #[test]
-fn selecting_paint_may_not_depend_on_the_state_start() {
+fn selecting_paint_varies_only_its_presentation_phase_untimed() {
     let untimed = (CriticalPart::Cover, NoteKind::Timer(TimerWhy::Untimed));
     let ending = r#"{"time": 0, "x": 20, "y": 800, "w": 430, "h": 600},
                     {"time": 500, "x": 20, "y": 800, "w": 430, "h": 600}"#;
@@ -1130,23 +1139,35 @@ fn selecting_paint_may_not_depend_on_the_state_start() {
         let d = format!(r#"{{"id": "s", "offset": 4{fields}, "dst": [{OVER}]}}"#);
         import_body(&body(group, &note(""), &[NOTES, &d]))
     };
-    // An ending window, a moving track and an untimed cycle refuse, for
-    // an image set and an image group alike.
+    // A moving track refuses; an ending window and an untimed cycle are
+    // noted, for an image set and an image group alike.
+    let l = cover_set("", cycling, r#""cover""#, "", moving);
+    assert_eq!(critical(l), untimed);
+    let timed = cover_set("", cycling, r#""cover""#, r#", "timer": 41"#, moving);
+    assert_eq!(d3_notes(&timed), 0);
     for (images, fields, keys) in [
         (r#""cover""#, r#", "loop": -1"#, ending),
-        (r#""cover""#, "", moving),
         (r#""cy", "cover""#, "", OVER),
     ] {
         let l = cover_set("", cycling, images, fields, keys);
-        assert_eq!(critical(l), untimed, "{images} {fields} {keys}");
-        // With a timer of their own each imports.
+        assert_eq!(d3_notes(&l), 1, "{images} {fields} {keys}");
         let timed = format!(r#", "timer": 41{fields}"#);
-        cover_set("", cycling, images, &timed, keys).ok();
+        let l = cover_set("", cycling, images, &timed, keys);
+        assert_eq!(d3_notes(&l), 0, "{images} {fields} {keys}");
     }
-    assert_eq!(critical(group_over("")), untimed);
-    group_over(r#", "timer": 41"#).ok();
+    assert_eq!(d3_notes(&group_over("")), 1);
+    assert_eq!(d3_notes(&group_over(r#", "timer": 41"#)), 0);
     // A static, perpetual one without a cycle imports untimed.
-    cover_set("", "", r#""cover", "cover""#, "", OVER).ok();
+    assert_eq!(
+        d3_notes(&cover_set("", "", r#""cover", "cover""#, "", OVER)),
+        0
+    );
+}
+
+/// The D3 deviation notes in `l`'s report.
+fn d3_notes(l: &Loaded) -> usize {
+    let d3 = NoteKind::Deviation(DeviationId::D3);
+    l.report().notes.iter().filter(|n| n.kind == d3).count()
 }
 
 #[test]

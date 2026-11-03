@@ -20,7 +20,7 @@ use skin_model::{
 };
 
 use super::super::geom::{Q, Rect};
-use super::super::policy::{self, CriticalPart, Role};
+use super::super::policy::{CriticalPart, Role};
 use super::super::report::{NoteKind, Span, TimerWhy};
 use super::super::track::{self, Stretch};
 use super::super::{Common, Cx, Dst, Opts};
@@ -125,7 +125,7 @@ impl Cx<'_> {
         else {
             return Ok(());
         };
-        if c.untimed && !policy::untimed_ok(true, true, c.track.end, true) {
+        if self.untimed_refused(&c, false) {
             return refuse(self, at, NoteKind::Timer(TimerWhy::Untimed));
         }
 
