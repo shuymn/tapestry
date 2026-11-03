@@ -4,7 +4,7 @@
 mod common;
 
 use common::play::{judged, tally};
-use common::{has, import_body};
+use common::{d3_notes, has, import_body};
 use rules::Judgment;
 use skin_beatoraja::{CriticalPart, ImportError, NoteKind, TimerWhy};
 
@@ -232,7 +232,8 @@ fn untimed(image: &str, dst: &str) -> common::Loaded {
 }
 
 #[test]
-fn untimed_critical_numbers_must_not_depend_on_the_start() {
+fn untimed_critical_numbers_vary_only_their_presentation_phase() {
+    // Static from 0 and perpetual: admitted without a note.
     for dst in [
         r#""dst": [{"time": 0, "w": 12, "h": 20}]"#,
         r#""timer": -1, "dst": [{"time": 0, "w": 12, "h": 20}]"#,
@@ -246,19 +247,70 @@ fn untimed_critical_numbers_must_not_depend_on_the_start() {
     let n20 = r#", "w": 120, "divx": 20, "cycle": 100, "timer": 41"#;
     let accepted = untimed(n20, r#""dst": [{"w": 12, "h": 20}]"#);
     assert!(accepted.report().notes.is_empty());
+    // Alpha, a delayed first key, an ending window and an untimed cycle
+    // run on `screen` from READY, each noted once.
     for (image, dst) in [
         (
             "",
-            r#""dst": [{"time": 0, "w": 12, "h": 20}, {"time": 100, "x": 5}]"#,
+            r#""loop": 100, "dst": [{"time": 0, "w": 12, "h": 20, "a": 0}, {"time": 100, "a": 255}]"#,
         ),
         ("", r#""loop": 10, "dst": [{"time": 10, "w": 12, "h": 20}]"#),
-        ("", r#""loop": -1, "dst": [{"time": 0, "w": 12, "h": 20}]"#),
         (
-            r#", "divx": 20, "cycle": 100"#,
+            "",
+            r#""loop": -1, "dst": [{"time": 0, "w": 12, "h": 20}, {"time": 100}]"#,
+        ),
+        (
+            r#", "w": 120, "divx": 20, "cycle": 100"#,
             r#""dst": [{"w": 12, "h": 20}]"#,
         ),
     ] {
-        let e = untimed(image, dst).err();
+        let l = untimed(image, dst);
+        assert_eq!(d3_notes(&l), 1, "{image} {dst}");
+    }
+    let alpha = |ms| {
+        let l = untimed(
+            "",
+            r#""loop": 100, "dst": [{"time": 0, "w": 12, "h": 20, "a": 0}, {"time": 100, "a": 255}]"#,
+        );
+        l.quads(ms).first().map(|q| q.color[3])
+    };
+    assert_eq!(alpha(0), Some(0.0));
+    assert_eq!(alpha(100), Some(1.0));
+    let delayed = |ms| {
+        untimed("", r#""loop": 10, "dst": [{"time": 10, "w": 12, "h": 20}]"#)
+            .quads(ms)
+            .len()
+    };
+    assert_eq!((delayed(5), delayed(10)), (0, 1));
+    let ending = |ms| {
+        untimed(
+            "",
+            r#""loop": -1, "dst": [{"time": 0, "w": 12, "h": 20}, {"time": 100}]"#,
+        )
+        .quads(ms)
+        .len()
+    };
+    assert_eq!((ending(100), ending(101)), (1, 0));
+    // The untimed cycle's frame by `screen` time: 50 ms a frame.
+    let uv = |ms| {
+        untimed(
+            r#", "w": 120, "divx": 20, "cycle": 100"#,
+            r#""dst": [{"w": 12, "h": 20}]"#,
+        )
+        .quads(ms)[0]
+            .uv
+    };
+    assert_ne!(uv(0), uv(50));
+    assert_eq!(uv(0), uv(100));
+    // Moving, resizing, turning or changing a colour channel other than
+    // alpha refuses.
+    for dst in [
+        r#""dst": [{"time": 0, "w": 12, "h": 20}, {"time": 100, "x": 5}]"#,
+        r#""dst": [{"time": 0, "w": 12, "h": 20}, {"time": 100, "w": 24}]"#,
+        r#""dst": [{"time": 0, "w": 12, "h": 20}, {"time": 100, "angle": 90}]"#,
+        r#""dst": [{"time": 0, "w": 12, "h": 20}, {"time": 100, "r": 0}]"#,
+    ] {
+        let e = untimed("", dst).err();
         assert!(
             matches!(
                 e,
@@ -268,9 +320,20 @@ fn untimed_critical_numbers_must_not_depend_on_the_start() {
                     ..
                 }
             ),
-            "{image} {dst}: {e:?}"
+            "{dst}: {e:?}"
         );
+        // On a timer of its own it imports, without a note.
+        let timed = untimed("", &format!(r#""timer": 41, {dst}"#));
+        assert_eq!(d3_notes(&timed), 0, "{dst}");
     }
+    // An untimed decorative number animates freely, without a note.
+    let l = import_body(
+        r#""value": [{"id": "v", "src": "n", "w": 120, "h": 20, "divx": 10, "digit": 4,
+                      "ref": 100, "cycle": 100}],
+           "destination": [{"id": "v", "dst": [{"time": 0, "w": 12, "h": 20},
+                                               {"time": 100, "x": 5, "r": 0}]}]"#,
+    );
+    assert_eq!(d3_notes(&l), 0);
 }
 
 /// The key-on timers 100–107 and key-off timers 120–127 map through the

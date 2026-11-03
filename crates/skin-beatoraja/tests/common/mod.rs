@@ -9,7 +9,8 @@ use std::fs;
 use std::path::Path;
 
 use skin_beatoraja::{
-    Config, Header, ImportError, Imported, InputLimit, NoteKind, Report, import, read_header,
+    Config, DeviationId, Header, ImportError, Imported, InputLimit, NoteKind, Report, import,
+    read_header,
 };
 use tempfile::TempDir;
 
@@ -365,6 +366,12 @@ pub fn import_config(
 /// Whether `r` has a note of `kind`.
 pub fn has(r: &Report, kind: NoteKind) -> bool {
     r.notes.iter().any(|n| n.kind == kind)
+}
+
+/// The D3 deviation notes in `l`'s report.
+pub fn d3_notes(l: &Loaded) -> usize {
+    let d3 = NoteKind::Deviation(DeviationId::D3);
+    l.report().notes.iter().filter(|n| n.kind == d3).count()
 }
 
 /// The note kinds of a report.
