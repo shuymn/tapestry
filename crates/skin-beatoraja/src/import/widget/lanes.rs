@@ -652,20 +652,26 @@ impl Cx<'_> {
         Ok(Some((image, r)))
     }
 
-    /// The rect stretch 5 gives a cover of one colour, y up: its
-    /// destination when a 1×1 frame fitted to its width would be taller,
-    /// else that fitted frame ([`Self::add_cover_image`]); the rows the
-    /// source crops are the same colour.
+    /// The rect stretch 5 gives a cover of one colour, y up: the source
+    /// fits a frame to the destination's width and trims its rows when
+    /// the destination is lower than the fitted frame, `h < w · ih / iw`,
+    /// keeping the destination (`skin/StretchType.java:65-68, 140-150`),
+    /// compared here as `h · iw < w · ih`, so a negative or zero width
+    /// takes the source's branch; the trimmed rows are the same colour.
     pub(super) fn solid_cover_rect(&self, c: &Common) -> Result<Rect, ImportError> {
         let at = c.span;
         let r = self.cover_rect(c)?;
         let cell = super::super::asset::SYSTEM_SIZE;
-        match trimmed(r, cell).ok_or_else(|| self.range(at, "dst"))? {
-            Some(_) => Ok(r),
-            None => track::stretch(Stretch::FitWidth, r, cell)
-                .map(|(r, _)| r)
-                .ok_or_else(|| self.range(at, "dst")),
+        let [iw, ih] = cell.map(Q::int);
+        let (Some(h), Some(w)) = (r.h.mul(iw), r.w.mul(ih)) else {
+            return Err(self.range(at, "dst"));
+        };
+        if h < w {
+            return Ok(r);
         }
+        track::stretch(Stretch::FitWidth, r, cell)
+            .map(|(r, _)| r)
+            .ok_or_else(|| self.range(at, "dst"))
     }
 }
 

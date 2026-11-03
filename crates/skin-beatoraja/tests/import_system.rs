@@ -162,6 +162,43 @@ fn an_offset_four_system_image_paints_sudden_plus() {
     }
 }
 
+/// A stretch-5 SUDDEN+ paint of black over `[x, y, w, h]` (source
+/// coordinates, y up): its quads' rects at cover 0.
+fn trimmed_paint(x: i32, y: i32, w: i32, h: i32) -> Vec<[i32; 4]> {
+    let lid = format!(
+        r#"{{"id": "-110", "offset": 4, "stretch": 5,
+            "dst": [{{"x": {x}, "y": {y}, "w": {w}, "h": {h}}}]}}"#
+    );
+    let l = with("", &[&lid]);
+    let chart = ChartBuilder::new(150_000).build().unwrap();
+    let mut d = Drawn::over(l.ok().skin.clone(), &chart);
+    d.frame(0, &[]).iter().map(|q| round(q.rect)).collect()
+}
+
+#[test]
+fn stretch_five_takes_the_sources_branch_for_any_sign() {
+    // The source trims when `h < w · ih / iw` (`skin/StretchType.java:
+    // 65-68, 140-150`): keeping the destination, else fitting a frame
+    // `w` high about the destination's centre. A model rect's y is
+    // 1080 − y − h.
+    let cases = [
+        // w −100 < h: fitted −100 high about y 825, the centre.
+        ((300, 800, -100, 50), [300, 305, -100, -100]),
+        // w 0 < h: fitted 0 high.
+        ((300, 800, 0, 50), [300, 255, 0, 0]),
+        // h −50 < w 100: trimmed, the destination kept.
+        ((200, 800, 100, -50), [200, 330, 100, -50]),
+        // h −50 < w 0: trimmed.
+        ((300, 800, 0, -50), [300, 330, 0, -50]),
+        // w 100 > h 50: trimmed; w 100 < h 300: fitted 100 high.
+        ((200, 800, 100, 50), [200, 230, 100, 50]),
+        ((200, 800, 100, 300), [200, 80, 100, 100]),
+    ];
+    for ((x, y, w, h), want) in cases {
+        assert_eq!(trimmed_paint(x, y, w, h), [want], "{x} {y} {w} {h}");
+    }
+}
+
 #[test]
 fn other_negative_ids_stay_dropped() {
     let l = import_body(
