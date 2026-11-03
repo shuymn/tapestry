@@ -4837,7 +4837,7 @@ pub(crate) mod tests {
     /// A screen that keeps each play frame's visible time and display
     /// offset.
     /// One frame's gain and display offset.
-    type FrameSeen = (Option<skin_model::Gain>, TimeUs);
+    type FrameSeen = (Option<skin_model::Gain>, TimeUs, Option<u32>);
 
     struct Inputs(Arc<std::sync::Mutex<Vec<FrameSeen>>>);
 
@@ -4856,10 +4856,11 @@ pub(crate) mod tests {
             false
         }
         fn build(&mut self, f: &FrameInput<'_>) -> Result<(), skin_model::BuildError> {
-            self.0
-                .lock()
-                .unwrap()
-                .push((f.lanes.gain, f.display_offset));
+            self.0.lock().unwrap().push((
+                f.lanes.gain,
+                f.display_offset,
+                f.readouts.native.target_green,
+            ));
             Ok(())
         }
         fn draw(&mut self) -> Result<FrameTiming, RenderError> {
@@ -4944,10 +4945,12 @@ pub(crate) mod tests {
             measure: play_measure(origin),
         });
         let gain = |n, d| skin_model::Gain::new(n, d);
-        let start = (gain(4, 1), TimeUs(0));
-        let faster = (gain(9, 2), TimeUs(0));
-        let later = (gain(9, 2), TimeUs(1_000));
-        let other = (None, TimeUs(1_000));
+        // The lanes' gain, the display offset and the native target: one
+        // snapshot each frame, whatever skin draws it.
+        let start = (gain(4, 1), TimeUs(0), Some(300));
+        let faster = (gain(9, 2), TimeUs(0), Some(300));
+        let later = (gain(9, 2), TimeUs(1_000), Some(300));
+        let other = (None, TimeUs(1_000), Some(300));
         assert!(wait_until(|| seen.lock().unwrap().contains(&start)));
         writer.write(snapshot(Some((9, 2)), 0, 1));
         assert!(wait_until(|| seen.lock().unwrap().contains(&faster)));

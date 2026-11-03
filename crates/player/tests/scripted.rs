@@ -490,8 +490,10 @@ fn an_invalid_key_config_exits_nonzero() {
 /// boundary and the audio thread's transport, and the notes, pressed
 /// 1.2 s later than the log has them, are played by that READY: every note
 /// judged PERFECT, and the audio restarted for it, its key sounds and BGM
-/// all sounding, as a play without the hold does. The saved record keeps the cancelled
-/// opening, Q's press in it, and the winning READY's input alone.
+/// all sounding, as a play without the hold does. The saved record keeps
+/// the cancelled opening, Q's press in it, and the winning READY's input
+/// alone; F2, pressed during the play, reaches the adjustments and no
+/// record, and the winning capture re-evaluates equal to the live play.
 #[test]
 fn the_start_gate_cancels_and_rearms_ready_on_the_real_threads() {
     const Q: u32 = 0x10;
@@ -525,6 +527,7 @@ fn the_start_gate_cancels_and_rearms_ready_on_the_real_threads() {
     fs::write(&log, replay::encode(&rec)).unwrap();
 
     let out = scripted_play(&chart_path, &log, &appdata)
+        .args(["--dev-speed", "F2", "--dev-adjust-at", "1500"])
         .output()
         .expect("run tapestry");
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -574,6 +577,13 @@ fn the_start_gate_cancels_and_rearms_ready_on_the_real_threads() {
         .filter(|e| !matches!(e.kind, eval::InputKind::Control { control, .. } if control.0 == Q))
         .count();
     assert_eq!(lanes, 2 * NOTES);
+    // F2 is in no opening.
+    let f2 = |e: &eval::PhysicalInputEvent| matches!(e.kind, eval::InputKind::Control { control, .. } if control.0 == 0x3C);
+    assert!(!rec.events.iter().any(f2) && !h.events.iter().any(f2));
+    assert!(
+        stdout.contains("adjust: hi-speed 4.50 floating"),
+        "{stdout}"
+    );
 }
 
 /// Quit on Q (0x10), the default START, is refused with the collision
