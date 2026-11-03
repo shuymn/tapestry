@@ -109,6 +109,7 @@ fn repeated_openings_allocate_nothing() {
         ],
         latched: 1,
         wrap: None,
+        ..AdjustmentBindings::default()
     })
     .unwrap();
     let latch = tap.latch();
@@ -154,7 +155,7 @@ fn repeated_openings_allocate_nothing() {
         if opening % 40 == 39 {
             while let Some(o) = rx.pop() {
                 observed += 1;
-                resyncs += usize::from(matches!(o.event, TapEvent::Resync(_)));
+                resyncs += usize::from(matches!(o.event, TapEvent::Resync { .. }));
             }
         }
         set.return_readers(readers);

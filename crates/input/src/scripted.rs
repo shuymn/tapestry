@@ -195,6 +195,10 @@ impl InputAdapter for ScriptedInput {
             }
         }
         sources.end_batch(now);
+        // The wake itself: the tap is due its ticks at the script's time
+        // now, whether or not an item was.
+        let now = sources.presentation_time(now);
+        sources.tick_presentation(now);
     }
 }
 
