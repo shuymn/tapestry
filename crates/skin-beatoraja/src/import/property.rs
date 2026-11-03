@@ -445,9 +445,36 @@ impl Value {
         )
     }
 
-    /// The play-critical values (owner decision 5).
-    pub(crate) fn critical(self) -> bool {
-        matches!(self, Self::ExScore | Self::MaxCombo)
+    /// The critical part a play-critical value shows (owner decision 5).
+    pub(crate) fn part(self) -> Option<super::policy::CriticalPart> {
+        match self {
+            Self::ExScore => Some(super::policy::CriticalPart::ExScore),
+            Self::MaxCombo => Some(super::policy::CriticalPart::MaxCombo),
+            _ => None,
+        }
+    }
+
+    /// The least and greatest value [`Self::expr`] gives: its field's
+    /// declared range, divided or reduced as the expression is.
+    pub(crate) fn range(self) -> (i64, i64) {
+        let e = self.expr();
+        let (name, op) = e.split_once(' ').map_or((e, None), |(n, r)| (n, Some(r)));
+        let (lo, hi) = match skin_model::PLAY.field(name).map(|(_, f)| f.ty) {
+            Some(skin_model::FieldTy::Int { lo, hi }) => (i64::from(lo), i64::from(hi)),
+            // Never met (a test reads every value); the widest range is
+            // the safe one.
+            _ => (i64::from(i32::MIN), i64::from(i32::MAX)),
+        };
+        let by = |r: &str| {
+            r.get(2..)
+                .and_then(|k| k.parse::<i64>().ok())
+                .filter(|&k| k > 0)
+        };
+        match op {
+            Some(r) if r.starts_with('/') => by(r).map_or((lo, hi), |k| (lo / k, hi / k)),
+            Some(r) if r.starts_with('%') => by(r).map_or((lo, hi), |k| (0, hi.min(k - 1))),
+            _ => (lo, hi),
+        }
     }
 }
 
@@ -469,7 +496,7 @@ pub(crate) fn value_prop(value: &super::Prop) -> IntProp {
     match value {
         super::Prop::Id(n) => int_by_id(*n),
         super::Prop::Name(s) => int_by_name(s).unwrap_or(IntProp::Unsupported(None)),
-        super::Prop::Null => IntProp::Null,
+        super::Prop::Null | super::Prop::Callable(_) => IntProp::Null,
     }
 }
 
@@ -731,7 +758,7 @@ mod tests {
         ] {
             assert_eq!(int_by_id(id), IntProp::Shown(value), "{id}");
             assert_eq!(int_by_name(name), Some(IntProp::Shown(value)), "{name}");
-            assert!(value.deviates() && !value.critical());
+            assert!(value.deviates() && value.part().is_none());
         }
         // The readouts, each guarded while it can be unknown.
         for (id, name, value, guard) in [
@@ -765,7 +792,7 @@ mod tests {
             assert_eq!(int_by_id(id), IntProp::Shown(value), "{id}");
             assert_eq!(int_by_name(name), Some(IntProp::Shown(value)), "{name}");
             assert_eq!(value.availability(), guard, "{name}");
-            assert!(value.deviates() && !value.critical());
+            assert!(value.deviates() && value.part().is_none());
             let scope = skin_model::Scope::new(&skin_model::PLAY);
             assert!(skin_model::compile(value.expr(), &scope, skin_model::Ty::Int).is_ok());
             if let Some(g) = guard {
@@ -808,7 +835,7 @@ mod tests {
                 assert_eq!(int_by_name(name), Some(IntProp::Shown(value)), "{name}");
             }
             assert_eq!((value.expr(), value.availability()), (expr, None));
-            assert!(!value.deviates() && !value.critical(), "{id}");
+            assert!(!value.deviates() && value.part().is_none(), "{id}");
             assert!(skin_model::compile(expr, &scope, skin_model::Ty::Int).is_ok());
         }
         // Neither is a value property; others keep needing their own data.
@@ -834,7 +861,7 @@ mod tests {
                 );
                 assert_eq!(value.expr(), expr, "{id}");
                 assert_eq!(value.availability(), Some(valid.as_str()), "{id}");
-                assert!(value.deviates() && !value.critical(), "{id}");
+                assert!(value.deviates() && value.part().is_none(), "{id}");
                 assert!(skin_model::compile(&expr, &scope, skin_model::Ty::Int).is_ok());
                 assert!(skin_model::compile(&valid, &scope, skin_model::Ty::Bool).is_ok());
             }
@@ -917,5 +944,26 @@ mod tests {
         assert_eq!(ops(IndexProp::Null), 1);
         assert!(!IndexProp::Null.deviates());
         assert_eq!(IndexProp::Unsupported(42).selector(), None);
+    }
+}
+
+#[cfg(test)]
+mod range_tests {
+    use super::{IntProp, int_by_id};
+
+    #[test]
+    fn every_shown_value_reads_a_declared_field() {
+        for id in 0..2_000 {
+            if let IntProp::Shown(v) = int_by_id(id) {
+                let field = v.expr().split(' ').next().unwrap_or("");
+                assert!(
+                    skin_model::PLAY.field(field).is_some(),
+                    "{id}: {}",
+                    v.expr()
+                );
+                let (lo, hi) = v.range();
+                assert!(lo >= 0 && lo <= hi && hi <= i64::from(i32::MAX), "{id}");
+            }
+        }
     }
 }

@@ -1044,6 +1044,32 @@ fn skin_json_accepts_ops_charged_for_a_dropped_element() {
 }
 
 #[test]
+fn replaced_callbacks_past_the_report_s_cap_are_counted() {
+    use skin_beatoraja::lua::Disposition;
+    // 5 000 replaced callbacks: the report keeps 4 096 notes and counts
+    // the rest as suppressed.
+    let entry = "local skin = { type = 0, name = \"many\", w = 1920, h = 1080 }
+if not skin_config then return skin end
+local ms = require(\"main_state\")
+skin.source = { { id = \"s\", path = \"strip.png\" } }
+skin.image = { { id = \"i\", src = \"s\", x = 0, y = 0, w = 10, h = 10 } }
+skin.destination = {}
+for k = 1, 5000 do
+  skin.destination[k] = { id = \"i\", draw = function() return ms.number(425) > 0 end, dst = { { w = 10, h = 10 } } }
+end
+return skin";
+    let (_, imported) = skin_lua(entry.as_bytes()).unwrap();
+    let i = imported.unwrap();
+    assert_eq!(i.callbacks.len(), 5_000);
+    assert!(
+        i.callbacks
+            .iter()
+            .all(|d| matches!(d, Disposition::Replaced(_)))
+    );
+    assert!(i.imported.report.suppressed > 0);
+}
+
+#[test]
 fn skin_lua_seeds_import_or_fail_as_built() {
     use skin_beatoraja::{LuaLimit, LuaWhy};
     use skin_model::RootError;
@@ -1056,8 +1082,10 @@ fn skin_lua_seeds_import_or_fail_as_built() {
             "config",
             "modules",
             "isolation",
-            "callable_decorative",
-            "callable_refused",
+            "callback_lowered",
+            "callback_replaced",
+            "callback_effect",
+            "host_write",
             "loop",
             "protected_loop",
             "memory",
@@ -1089,12 +1117,26 @@ fn skin_lua_seeds_import_or_fail_as_built() {
                     );
                 }
             }
-            "callable_refused" | "callable_decorative" => {
+            "callback_lowered" | "callback_replaced" => {
+                use skin_beatoraja::lua::Disposition;
+                let (_, imported) = result.unwrap_or_else(|e| panic!("{name}: {e}"));
+                let i = imported.unwrap_or_else(|e| panic!("{name}: {e:?}"));
+                let want: &[Disposition] = match name {
+                    "callback_lowered" => &[Disposition::Lowered, Disposition::Lowered],
+                    _ => &[Disposition::Replaced(
+                        skin_beatoraja::lua::Unsupported::Unmapped { api: 1, id: 425 },
+                    )],
+                };
+                assert_eq!(i.callbacks, want, "{name}");
+            }
+            "callback_effect" | "host_write" => {
                 let (_, imported) = result.unwrap_or_else(|e| panic!("{name}: {e}"));
                 let e = imported.expect_err(name);
                 let want = match name {
-                    "callable_decorative" => LuaWhy::Callable { field: "draw" },
-                    _ => LuaWhy::Callable { field: "value" },
+                    "callback_effect" => LuaWhy::Effect(
+                        skin_beatoraja::lua::Unsupported::Construct("call statement"),
+                    ),
+                    _ => LuaWhy::HostWrite,
                 };
                 assert_eq!(lua(&e), Some(want), "{name}");
             }

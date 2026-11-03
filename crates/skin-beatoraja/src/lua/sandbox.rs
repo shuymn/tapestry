@@ -53,6 +53,19 @@ pub(super) const HANDLER: &str = "tapestry.handler";
 /// face: it raises the fault in Lua when the host reports one.
 const SHIM: &str = "tapestry.shim";
 
+/// The registry names of a configured pass's tags: closures to their
+/// constructors' identities, and to their capture readers, both weak in
+/// their keys; and the tagger the instrumented chunks call
+/// ([`super::instrument`]).
+pub(super) const TAG_IDS: &str = "tapestry.tag_ids";
+pub(super) const TAG_READERS: &str = "tapestry.tag_readers";
+pub(super) const TAGGER: &str = "tapestry.tagger";
+
+/// The tagger: it records a closure's identity and reader and returns the
+/// closure. The sandbox's own Lua: no skin can name it.
+const TAG: &str = "local ids, readers = ...\n\
+return function(id, f, r) ids[f] = id readers[f] = r return f end";
+
 /// The error value Lua carries once the ledger holds a fault: a fixed,
 /// small string, whatever the fault.
 pub(super) const FAULT: &str = "the import was refused";
@@ -331,6 +344,22 @@ pub(super) fn vm(pass: &Rc<Pass>) -> mlua::Result<Lua> {
     super::host::install(&lua, pass)?;
     if let Some(bridge) = &pass.bridge {
         super::config::install(&lua, pass, &env, bridge)?;
+        // The tags, weak in their keys so that a closure's tag ends with
+        // it: an address is never read as another closure's.
+        let weak = lua.create_table()?;
+        weak.raw_set("__mode", "k")?;
+        let ids = lua.create_table()?;
+        ids.set_metatable(Some(weak.clone()))?;
+        let readers = lua.create_table()?;
+        readers.set_metatable(Some(weak))?;
+        let tagger: Function = lua
+            .load(TAG)
+            .set_name("=sandbox")
+            .set_mode(ChunkMode::Text)
+            .call((ids.clone(), readers.clone()))?;
+        lua.set_named_registry_value(TAG_IDS, ids)?;
+        lua.set_named_registry_value(TAG_READERS, readers)?;
+        lua.set_named_registry_value(TAGGER, tagger)?;
     }
     env.raw_set("require", loader::require(&lua, pass)?)?;
     env.raw_set("dofile", loader::dofile(&lua, pass)?)?;

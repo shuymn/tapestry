@@ -122,6 +122,11 @@ fn configured(body: &str) -> String {
     )
 }
 
+/// [`configured`] running `after` once its destinations are set.
+fn drawing(body: &str, after: &str) -> String {
+    configured(body).replace("\nreturn skin\n", &format!("\n{after}\nreturn skin\n"))
+}
+
 #[test]
 fn lua_import_memory_is_bounded_and_freed() {
     let mut peaks = Vec::new();
@@ -277,6 +282,114 @@ fn lua_import_memory_is_bounded_and_freed() {
         "instruction_cap",
         measure(|| header(looping.path()).unwrap_err()),
     );
+
+    // The callbacks' analysis near its caps: a module only the configured
+    // pass parses, one table short of the node cap; then one past it.
+    let near = format!(
+        "local t = {{ {} }}
+return t",
+        "1,".repeat(340_000)
+    );
+    let analysed = folder(&configured("local big = require(\"big\")"));
+    common::write(analysed.path(), "big.lua", near.as_bytes());
+    record("ast_nodes", measure(|| both(analysed.path()).unwrap()));
+    let past = format!(
+        "local t = {{ {} }}
+return t",
+        "1,".repeat(360_000)
+    );
+    common::write(analysed.path(), "big.lua", past.as_bytes());
+    record(
+        "ast_node_cap",
+        measure(|| {
+            let e = both(analysed.path()).unwrap_err();
+            assert!(
+                matches!(
+                    e,
+                    ImportError::Lua {
+                        why: LuaWhy::Limit(LuaLimit::AstNodes),
+                        ..
+                    }
+                ),
+                "{e:?}"
+            );
+        }),
+    );
+    // 2 000 callbacks lowered through small helpers, then helpers that
+    // expand past the expansion cap.
+    let mut helpers = String::from(
+        "local ms = require(\"main_state\")\nlocal function p0() return ms.number(110) > 0 end\n",
+    );
+    for k in 1..=31 {
+        helpers.push_str(&format!(
+            "local function p{k}() return p{0}() or p{0}() end\n",
+            k - 1
+        ));
+    }
+    let callbacks: String = (0..2_000)
+        .map(|k| {
+            format!(
+                "table.insert(skin.destination, {{ id = \"i\", draw = function() return p{}() end, dst = {{ {{ w = 64, h = 64 }} }} }})\n",
+                k % 5
+            )
+        })
+        .collect();
+    let expanded = folder(&drawing(&helpers, &callbacks));
+    record("callbacks", measure(|| both(expanded.path()).unwrap()));
+    let blowup = folder(&drawing(
+        &helpers,
+        "table.insert(skin.destination, { id = \"i\", draw = function() return p31() end, dst = { { w = 64, h = 64 } } })",
+    ));
+    record(
+        "expansion_cap",
+        measure(|| {
+            let e = both(blowup.path()).unwrap_err();
+            assert!(
+                matches!(
+                    e,
+                    ImportError::Lua {
+                        why: LuaWhy::Limit(LuaLimit::Expansion),
+                        ..
+                    }
+                ),
+                "{e:?}"
+            );
+        }),
+    );
+
+    // 600 keys of 50 004 bytes, shared by 20 nested tables through their
+    // first key `a`: the keys the conversion keeps are charged as they
+    // are copied, so it stops near the decoded-bytes cap instead of
+    // copying the shared keys once a table.
+    let shared = folder(&configured(
+        "local p = \"x\"\nwhile #p < 50000 do p = p .. p end\np = string.sub(p, 1, 50000)\n\
+         local keys = {}\nfor i = 1, 600 do keys[i] = \"b\" .. p .. string.format(\"%03d\", i) end\n\
+         local t = {}\nlocal top = t\n\
+         for level = 1, 20 do\n\
+           for i = 1, 600 do t[keys[i]] = true end\n\
+           local next = {}\n\
+           t.a = next\n\
+           t = next\n\
+         end\n\
+         skin.extra = top",
+    ));
+    let p = record(
+        "shared_keys",
+        measure(|| {
+            let e = both(shared.path()).unwrap_err();
+            assert!(
+                matches!(
+                    e,
+                    ImportError::Input {
+                        limit: InputLimit::DecodedBytes,
+                        ..
+                    }
+                ),
+                "{e:?}"
+            );
+        }),
+    );
+    assert!(p < 160 << 20, "the shared keys were copied again: {p}");
 
     let worst = peaks.iter().map(|(_, p)| *p).max().unwrap_or(0);
     println!("worst peak {worst} bytes; converted table at most {MAX_CONVERTED_BYTES} bytes");
