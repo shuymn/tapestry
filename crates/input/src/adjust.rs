@@ -988,11 +988,19 @@ impl AdjustmentTap {
     /// publishes whether anything is still owed, checking for room again
     /// after publishing it.
     fn flush(&mut self, at: TimeUs) {
+        self.flush_racing(at, || {});
+    }
+
+    /// [`flush`](Self::flush), with `before_publish` run between the
+    /// first attempt that found no room and the publication of `owed`: a
+    /// test forces a consumer's drain there.
+    fn flush_racing(&mut self, at: TimeUs, before_publish: impl FnOnce()) {
         self.send_owed_entries(at);
         if self.owed.is_empty() {
             self.owed_flag.store(false, Ordering::Release);
             return;
         }
+        before_publish();
         self.owed_flag.store(true, Ordering::Release);
         self.send_owed_entries(at);
         if self.owed.is_empty() {
@@ -1205,5 +1213,38 @@ mod tests {
             }
         });
         assert_eq!(held, 0, "the release is in the baseline");
+    }
+}
+
+#[cfg(test)]
+mod owed_tests {
+    use bms_model::TimeUs;
+
+    use super::{ADJUST_QUEUE, AdjustmentBindings, Marker, TapEvent, adjustment_queue};
+
+    /// E2's interleaving: the tap finds no room, the consumer drains
+    /// everything while `owed` still reads false, then the tap publishes
+    /// `owed`. Its recheck finds the room the drain made and sends what it
+    /// owes, so nothing waits on a wake no one will send.
+    #[test]
+    fn a_drain_before_owed_is_published_is_caught_by_the_recheck() {
+        let (mut tap, mut rx) = adjustment_queue(AdjustmentBindings::default()).unwrap();
+        tap.set_active(true);
+        tap.tick(TimeUs(0));
+        while rx.pop().is_some() {}
+        // Fill the queue to the last slot.
+        for k in 0..ADJUST_QUEUE as i64 {
+            tap.send(TimeUs(k + 1), TapEvent::Tick);
+        }
+        tap.owed.push(Marker::Fence(1));
+        let rx = std::cell::RefCell::new(rx);
+        tap.flush_racing(TimeUs(5_000), || {
+            let mut rx = rx.borrow_mut();
+            assert!(!rx.owed(), "not published yet");
+            while rx.pop().is_some() {}
+        });
+        let mut rx = rx.into_inner();
+        assert!(!rx.owed(), "the recheck sent it");
+        assert_eq!(rx.pop().map(|o| o.event), Some(TapEvent::Fence(1)));
     }
 }
