@@ -215,6 +215,13 @@ pub const IN_PLAY: &[Site] = &[
             "Rig::stepped",
             "Rig::input_failure",
             "Rig::abort_close",
+            "Rig::take_closing",
+            "Rig::declared_close",
+            "run_closing",
+            "ClosingStage::begin",
+            "ClosingStage::over",
+            "closing_time",
+            "closing_deadline",
             "open_gated",
             "Candidates::watch",
             "Candidates::wait_release",
@@ -224,7 +231,7 @@ pub const IN_PLAY: &[Site] = &[
     Site::Fns(
         "crates/game/src/session.rs",
         &[
-            "Loaded::ends_play",
+            "Loaded::closes_on",
             "Command::cause",
             "arrival",
             "replay_kind",
@@ -232,7 +239,10 @@ pub const IN_PLAY: &[Site] = &[
     ),
     Site::Fns(
         "crates/game/src/policy.rs",
-        &["DefaultPolicy::on_survival_failure"],
+        &[
+            "DefaultPolicy::on_survival_failure",
+            "DefaultPolicy::displayed_gauge",
+        ],
     ),
     Site::Fns(
         "crates/game/src/tuning.rs",
@@ -255,6 +265,7 @@ pub const IN_PLAY: &[Site] = &[
             "PlayerRig::now",
             "PlayerRig::wait",
             "PlayerRig::take",
+            "PlayerRig::take_closing",
             "PlayerRig::quitting",
             "PlayerRig::measured",
             "PlayerRig::focus_lost",
@@ -284,6 +295,8 @@ pub const IN_PLAY: &[Site] = &[
         &[
             "Controls::tuning",
             "Controls::take",
+            "Controls::take_closing",
+            "Controls::take_slot",
             "Controls::retry_at",
             "Controls::quitting",
             "Controls::focused",

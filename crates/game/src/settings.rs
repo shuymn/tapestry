@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use crate::adjust_keys::{AdjustKeyError, AdjustmentKeys};
 use crate::error::IoFailure;
 use crate::hispeed::{Cover, Covers, HiSpeedSettings, PlayOptions, PlayOptionsError};
+use crate::policy::FailureAction;
 use crate::presets::UnknownPreset;
 use crate::queue::{DEFAULT_QUEUED_PERIODS, QUEUED_PERIODS};
 use crate::save::write_atomic;
@@ -789,6 +790,11 @@ pub struct PlayerSettings {
     pub preset: String,
     /// The gauge shown, by its index in the preset.
     pub displayed_gauge: usize,
+    /// What the shown survival gauge's failure does: `"close"` (the
+    /// play enters Closing, then shows its result) or `"play-to-end"`
+    /// (design.md "Play Lifecycle", Closing). Declared before the tables,
+    /// so it is written before them.
+    pub on_failure: FailureAction,
     /// The speed settings, `[hispeed]` (design.md "Play Adjustments").
     pub hispeed: HiSpeedSettings,
     /// The lane covers, `[covers]`.
@@ -800,6 +806,7 @@ impl Default for PlayerSettings {
         Self {
             preset: "beatoraja-style".to_owned(),
             displayed_gauge: 0,
+            on_failure: FailureAction::Close,
             hispeed: HiSpeedSettings::default(),
             covers: CoverSettings::default(),
         }

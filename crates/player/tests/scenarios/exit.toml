@@ -29,8 +29,8 @@ result = "prev-preset"
 result = "back"
 
 # 7-13: A again with the log: to the end, retried from the result, retried
-# during the play, then quit during the play, which shows its result, and
-# back. The capture is the log's first play's.
+# during the play, then quit during the play, which closes it and shows
+# its result, and back. The capture is the log's first play's.
 [[step]]
 capture = { at = 3000, file = "a-log.png" }
 
@@ -62,8 +62,8 @@ play = { input = "auto", until = "end" }
 [[step]]
 result = "back"
 
-# 17: one practice round of A at 75 % with the log, then quit at the next
-# round's start, in its READY state, and back to selection.
+# 17: one practice round of A at 75 % with the log, left before the next
+# round opens, and back to selection.
 [[step]]
 practice = { path = "library/a/a.bms", from = 1, to = 2, speed = 75, lead_in_ms = 2000, gauge = 20, repeat = true, input = "logs/a.tprl", rounds = 1 }
 

@@ -9,13 +9,13 @@ mod common;
 use std::path::{Path, PathBuf};
 
 use bms_model::{Chart, ChartBuilder, TimeSource, TimeUs, VirtualClock};
-use common::{MS, lane, tapestry_settings};
+use common::{Built, MS, lane, tapestry_settings};
 use eval::{ControlId, InputKind, JudgeEventKind, SourceId};
 use game::{
-    AbortCause, AudioControl, AudioQueue, AudioWaitError, ChartIngest, Closing, Command, DataRoot,
-    DeviceSettings, EntryId, IngestError, Ingested, InputWaitError, LiveError, Loaded, Notice,
-    Opening, Parts, PlayEnd, PlayReport, Preparation, PreparationRefusal, RenderSide, ResultScreen,
-    Rig, SessionConfig, Settings, ViewStatus,
+    AbortCause, AudioControl, AudioQueue, AudioWaitError, Closing, Command, DataRoot,
+    DeviceSettings, EntryId, InputWaitError, LiveError, Loaded, Notice, Opening, Parts, PlayEnd,
+    PlayReport, Preparation, PreparationRefusal, RenderSide, ResultScreen, Rig, SessionConfig,
+    Settings, ViewStatus,
 };
 use input::{
     Action, DeviceId, DeviceKind, InputAdapter, Packet, ScriptItem, ScriptedInput, SourceReader,
@@ -32,32 +32,6 @@ const OFFSET: i64 = 3_000;
 const Z: ControlId = ControlId(0x2c);
 /// Lane 3's key (X).
 const X: ControlId = ControlId(0x2d);
-
-struct Built(Chart);
-
-impl ChartIngest for Built {
-    fn max_bytes(&self) -> usize {
-        1 << 20
-    }
-
-    fn accepts(&self, path: &Path) -> bool {
-        path.extension().is_some_and(|e| e == "chart")
-    }
-
-    fn ingest(
-        &self,
-        _bytes: &[u8],
-        _dir: &Path,
-        _seed: u64,
-        _speed: bms_model::Speed,
-    ) -> Result<Ingested, IngestError> {
-        Ok(Ingested {
-            labels: game::ChartLabels::default(),
-            chart: self.0.clone(),
-            warnings: Vec::new(),
-        })
-    }
-}
 
 /// Lane 1 at 1.0 s and 1.5 s.
 fn chart() -> Chart {
@@ -237,6 +211,22 @@ struct Fake {
     generation: u32,
     /// The bytes a gated play's exchange with the input side keeps.
     exchange: usize,
+    /// The play skin's declared Closing duration.
+    declared_close: Option<TimeUs>,
+    /// Each abort close asked, with the clock time, and the view's
+    /// Closing start and phase it found published.
+    abort_closes: Vec<(i64, Option<TimeUs>, bool)>,
+    /// Every abort close fails with this; an ordinary close still
+    /// succeeds.
+    abort_close_fails: Option<InputWaitError>,
+    /// Final closes asked (`end_feedback`).
+    end_feedbacks: usize,
+    /// Each command taken as Closing's, with its clock time.
+    closing_taken: Vec<(i64, Command)>,
+    /// The audio output fails from this clock time on.
+    output_fails_at: i64,
+    /// The last device is gone from this clock time on.
+    disconnected_at: i64,
 }
 
 impl Fake {
@@ -306,6 +296,13 @@ impl Fake {
             lifetime: false,
             generation: 0,
             exchange: 0,
+            declared_close: None,
+            abort_closes: Vec::new(),
+            abort_close_fails: None,
+            end_feedbacks: 0,
+            closing_taken: Vec::new(),
+            output_fails_at: i64::MAX,
+            disconnected_at: i64::MAX,
         }
     }
 
@@ -539,11 +536,46 @@ impl Rig for Fake {
     }
 
     fn connected(&self) -> bool {
-        true
+        self.clock.now().0 < self.disconnected_at
     }
 
     fn audio_failure(&self) -> Option<audio::OutputError> {
-        self.output_failed.then_some(audio::OutputError::DeviceLost)
+        (self.output_failed || self.clock.now().0 >= self.output_fails_at)
+            .then_some(audio::OutputError::DeviceLost)
+    }
+
+    fn declared_close(&self) -> Option<TimeUs> {
+        self.declared_close
+    }
+
+    fn take_closing(&mut self) -> Option<Command> {
+        let c = self.take()?;
+        self.closing_taken.push((self.clock.now().0, c));
+        Some(c)
+    }
+
+    fn abort_close(&mut self) -> Result<Closing, InputWaitError> {
+        let (closing, playing) = self
+            .side
+            .as_mut()
+            .map_or((None, false), |s| (s.view().closing, s.view().playing));
+        self.abort_closes
+            .push((self.clock.now().0, closing, playing));
+        if let Some(e) = self.abort_close_fails {
+            // A command that arrived while the request waited, then the
+            // failure, which sticks as on a poisoned link.
+            if let Some(c) = self.in_close.take() {
+                self.commands.push((i64::MIN, c));
+            }
+            self.failed = Some(e);
+            return Err(e);
+        }
+        self.close()
+    }
+
+    fn end_feedback(&mut self) -> Result<(), InputWaitError> {
+        self.end_feedbacks += 1;
+        Ok(())
     }
 
     fn screen_failed(&self) -> bool {
@@ -2624,12 +2656,12 @@ fn every_state_and_event_of_a_play() {
 
 /// The chart starts at chart time 0 (clock 8.3 s): the quit key in the
 /// step before it leaves the chart with no result, and from the step at it
-/// on aborts the play and shows its result in that step, ended midway and
-/// never cleared, until the back at 15 s. Both plays are saved, ended
-/// midway.
+/// on aborts the play into Closing, whose end 1 s later shows its result,
+/// ended midway and never cleared, until the back at 15 s. Both plays are
+/// saved, ended midway.
 #[test]
 fn the_quit_key_shows_the_result_from_the_charts_start() {
-    for (at, shown) in [(8_299_000, None), (8_300_000, Some(8_300_000))] {
+    for (at, shown) in [(8_299_000, None), (8_300_000, Some(9_300_000))] {
         let dir = tempfile::tempdir().unwrap();
         let mut loaded = loaded(dir.path());
         let items = vec![key(9_303_000, Z, 1), key(9_353_000, Z, 0)];
@@ -3082,7 +3114,7 @@ impl game::SessionPolicy for Strict {
         game::GaugeIndex(1)
     }
     fn on_survival_failure(&self) -> game::FailureAction {
-        game::FailureAction::EndPlay
+        game::FailureAction::Close
     }
 }
 
@@ -3197,5 +3229,893 @@ fn a_gated_play_admits_the_rigs_exchange_to_the_byte() {
             );
             assert!(rig.reports.is_empty());
         }
+    }
+}
+
+/// Session events, collected.
+#[derive(Clone, Default)]
+struct Events(std::rc::Rc<std::cell::RefCell<Vec<game::SessionEvent>>>);
+
+impl game::SessionEventSink for Events {
+    fn on_event(&mut self, ev: &game::SessionEvent) {
+        self.0.borrow_mut().push(*ev);
+    }
+}
+
+impl Events {
+    fn all(&self) -> Vec<game::SessionEvent> {
+        self.0.borrow().clone()
+    }
+}
+
+/// Sixteen notes on lane 1, 100 ms apart from 1 s: left unpressed, the
+/// tapestry preset's survival gauge (its second) fails at the fifteenth
+/// miss, at 2.58 s, and the last note's miss completes the play at 2.68 s.
+fn sixteen() -> Chart {
+    (0..16)
+        .fold(ChartBuilder::new(150_000), |b, i| {
+            b.tap(lane(1), TimeUs((1_000 + i * 100) * MS))
+        })
+        .build()
+        .unwrap()
+}
+
+/// A play of `chart` through `player.toml`'s policy: the gauge
+/// `displayed` shown, `on_failure` for its failure; the session's events
+/// into `events`, autoplayed with `autoplay`, its READY `lead_in` long.
+fn closing_loaded(
+    dir: &Path,
+    chart: Chart,
+    displayed: usize,
+    on_failure: game::FailureAction,
+    events: &Events,
+    autoplay: Option<game::AutoKeySounds>,
+    lead_in: TimeUs,
+) -> Loaded {
+    closing_loaded_with(
+        dir,
+        chart,
+        displayed,
+        on_failure,
+        events,
+        autoplay,
+        lead_in,
+        |p| p,
+    )
+}
+
+/// [`closing_loaded`] with its parts changed by `with`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "closing_loaded's, and the change"
+)]
+fn closing_loaded_with(
+    dir: &Path,
+    chart: Chart,
+    displayed: usize,
+    on_failure: game::FailureAction,
+    events: &Events,
+    autoplay: Option<game::AutoKeySounds>,
+    lead_in: TimeUs,
+    with: impl FnOnce(Parts) -> Parts,
+) -> Loaded {
+    let root = DataRoot::new(dir.to_owned());
+    let mut settings = tapestry_settings(&root);
+    settings.device.input_offset_us = OFFSET;
+    settings.player.displayed_gauge = displayed;
+    settings.player.on_failure = on_failure;
+    let chart_path = dir.join("play.chart");
+    std::fs::write(&chart_path, b"built in code").unwrap();
+    let parts = with(Parts {
+        ingest: Box::new(Built(chart)),
+        events: Box::new(events.clone()),
+        ..Parts::standard(&root, &settings.player)
+    });
+    let config = SessionConfig {
+        lead_in,
+        step: TimeUs(MS),
+        start: TimeUs(0),
+        effects: 4_096,
+        seed: 11,
+        speed: bms_model::Speed::NORMAL,
+        app_version: "0.0.0-test".to_owned(),
+        provenance: BuildProvenance::Development,
+        receive: ReceiveMethod::Scripted,
+        autoplay,
+    };
+    Loaded::load(root, settings, &chart_path, config, parts).unwrap()
+}
+
+/// [`closing_loaded`] of [`sixteen`] with the survival gauge shown.
+fn failing(dir: &Path, on_failure: game::FailureAction, events: &Events) -> Loaded {
+    closing_loaded(
+        dir,
+        sixteen(),
+        1,
+        on_failure,
+        events,
+        None,
+        TimeUs(1_000 * MS),
+    )
+}
+
+/// The play's origin on the rig's clock: READY opens at the clock's
+/// start, 1 s before chart time 0.
+const ORIGIN: i64 = CLOCK_START + 1_000_000;
+
+use game::{ClosingEnd, ClosingReport, FailureAction, SessionEvent};
+
+/// Where the sixteen-note play's survival failure is processed: the step
+/// at 2.584 s of play time, its advance finalizing 2.580 999 s.
+const FAILS_AT: i64 = 2_584_000;
+const FAILING_WATERMARK: i64 = 2_580_999;
+
+fn closing(report: &PlayReport) -> ClosingReport {
+    report.closing.expect("the play entered Closing")
+}
+
+fn start(attempt: u32) -> SessionEvent {
+    SessionEvent::Start { attempt }
+}
+
+fn end(attempt: u32, status: replay::EndStatus) -> SessionEvent {
+    SessionEvent::End { attempt, status }
+}
+
+/// The displayed survival gauge's failure under `close` enters Closing in
+/// the step of the failing advance: the view published at its entry has
+/// Closing's start and is not playing; Closing runs out at the first step
+/// 1 s on, and only then is the play saved, ended midway at the failing
+/// watermark, under `close-on-failure`, and its result shown. The saved
+/// record re-evaluates to the live result, the gauge's real failure time
+/// kept.
+#[test]
+fn a_displayed_survival_failure_closes_the_play() {
+    let dir = tempfile::tempdir().unwrap();
+    let events = Events::default();
+    let mut loaded = failing(dir.path(), FailureAction::Close, &events);
+    let mut rig = Fake::new(Vec::new(), &[(30_000_000, Command::Quit)], i64::MAX);
+    let left = game::live::run_chart(&mut loaded, &mut rig).unwrap();
+    assert_eq!(left, game::Leave::Back);
+    let one = &rig.reports[0];
+    assert_eq!(one.end, PlayEnd::Aborted(AbortCause::GaugeFailed));
+    // The failing advance's step, the last that published playing.
+    assert_eq!(rig.phases[0].last(), Some(&(FAILS_AT, true)));
+    assert_eq!(
+        rig.measured[0].last().unwrap().watermark,
+        Some(TimeUs(FAILING_WATERMARK))
+    );
+    assert_eq!(
+        closing(one),
+        ClosingReport {
+            started_at: TimeUs(FAILS_AT),
+            ended_at: TimeUs(FAILS_AT + 1_000_000),
+            end: ClosingEnd::RanOut,
+        }
+    );
+    assert_eq!(
+        rig.abort_closes,
+        [(ORIGIN + FAILS_AT, Some(TimeUs(FAILS_AT)), false)]
+    );
+    assert_eq!(rig.end_feedbacks, 1);
+    assert_eq!(rig.shown_at, [ORIGIN + FAILS_AT + 1_000_000]);
+    let record = one.record.as_ref().unwrap();
+    assert_eq!(record.status.end, replay::EndStatus::EndedMidway);
+    assert_eq!(record.status.finalized, TimeUs(FAILING_WATERMARK));
+    assert_eq!(record.session_policy, "close-on-failure");
+    let result = one.result.as_ref().unwrap();
+    assert!(result.matches_live);
+    let gauges = &result.evaluation.as_ref().unwrap().gauges;
+    assert_eq!(gauges[1].failed_at, Some(TimeUs(2_580_000)));
+    assert_eq!(
+        events.all(),
+        [
+            SessionEvent::Load,
+            start(1),
+            end(1, replay::EndStatus::EndedMidway),
+            SessionEvent::Result { attempt: 1 },
+        ]
+    );
+}
+
+/// A hidden survival gauge's failure stops nothing: with the first gauge
+/// shown, the play completes with its tail, no Closing, the hidden
+/// gauge's failure kept.
+#[test]
+fn a_hidden_survival_failure_plays_to_the_end() {
+    let dir = tempfile::tempdir().unwrap();
+    let events = Events::default();
+    let mut loaded = closing_loaded(
+        dir.path(),
+        sixteen(),
+        0,
+        FailureAction::Close,
+        &events,
+        None,
+        TimeUs(1_000 * MS),
+    );
+    let mut rig = Fake::new(Vec::new(), &[(30_000_000, Command::Quit)], i64::MAX);
+    game::live::run_chart(&mut loaded, &mut rig).unwrap();
+    let one = &rig.reports[0];
+    assert_eq!(one.end, PlayEnd::Completed);
+    assert_eq!(one.closing, None);
+    assert!(rig.abort_closes.is_empty());
+    let gauges = &one
+        .result
+        .as_ref()
+        .unwrap()
+        .evaluation
+        .as_ref()
+        .unwrap()
+        .gauges;
+    assert_eq!(gauges[1].failed_at, Some(TimeUs(2_580_000)));
+}
+
+/// Under play-to-end the shown survival gauge fails and the play goes on
+/// to its end, with no Closing, under `play-to-end`.
+#[test]
+fn play_to_end_keeps_playing_after_a_displayed_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let events = Events::default();
+    let mut loaded = failing(dir.path(), FailureAction::PlayToEnd, &events);
+    let mut rig = Fake::new(Vec::new(), &[(30_000_000, Command::Quit)], i64::MAX);
+    game::live::run_chart(&mut loaded, &mut rig).unwrap();
+    let one = &rig.reports[0];
+    assert_eq!(one.end, PlayEnd::Completed);
+    assert_eq!(one.closing, None);
+    let record = one.record.as_ref().unwrap();
+    assert_eq!(record.status.end, replay::EndStatus::PlayedToEnd);
+    assert_eq!(record.session_policy, "play-to-end");
+    let gauges = &one
+        .result
+        .as_ref()
+        .unwrap()
+        .evaluation
+        .as_ref()
+        .unwrap()
+        .gauges;
+    assert_eq!(gauges[1].failed_at, Some(TimeUs(2_580_000)));
+}
+
+/// The quit key while the chart plays, its gauges healthy, enters Closing
+/// with cause `Quit` under either `on_failure`: nothing is evaluated during
+/// it, the record ends at the step before the quit, and the result shows
+/// once it ran out: Start, End, Result.
+#[test]
+fn the_quit_key_during_play_enters_closing() {
+    for on_failure in [FailureAction::Close, FailureAction::PlayToEnd] {
+        let dir = tempfile::tempdir().unwrap();
+        let events = Events::default();
+        let mut loaded = closing_loaded(
+            dir.path(),
+            chart(),
+            1,
+            on_failure,
+            &events,
+            None,
+            TimeUs(1_000 * MS),
+        );
+        let items = vec![key(9_303_000, Z, 1), key(9_353_000, Z, 0)];
+        let commands = [(9_500_000, Command::Quit), (15_000_000, Command::Quit)];
+        let mut rig = Fake::new(items, &commands, i64::MAX);
+        let left = game::live::run_chart(&mut loaded, &mut rig).unwrap();
+        assert_eq!(left, game::Leave::Back, "{on_failure:?}");
+        let one = &rig.reports[0];
+        assert_eq!(one.end, PlayEnd::Aborted(AbortCause::Quit));
+        assert_eq!(
+            closing(one),
+            ClosingReport {
+                started_at: TimeUs(1_200_000),
+                ended_at: TimeUs(2_200_000),
+                end: ClosingEnd::RanOut,
+            }
+        );
+        // Healthy: nothing failed.
+        let gauges = &one
+            .result
+            .as_ref()
+            .unwrap()
+            .evaluation
+            .as_ref()
+            .unwrap()
+            .gauges;
+        assert!(gauges.iter().all(|g| g.failed_at.is_none()));
+        // No step after the quit's: the watermark and the events stop.
+        let last = rig.measured[0].iter().rev().find_map(|a| a.watermark);
+        assert_eq!(rig.phases[0].last().unwrap().0, 1_200_000);
+        let record = one.record.as_ref().unwrap();
+        assert_eq!(Some(record.status.finalized), last);
+        assert_eq!(record.status.end, replay::EndStatus::EndedMidway);
+        assert_eq!(rig.shown_at, [ORIGIN + 2_200_000]);
+        assert_eq!(
+            events.all(),
+            [
+                SessionEvent::Load,
+                start(1),
+                end(1, replay::EndStatus::EndedMidway),
+                SessionEvent::Result { attempt: 1 },
+            ]
+        );
+    }
+}
+
+/// The quit key in a full play's READY (its lead-in) leaves with no
+/// result and no Closing.
+#[test]
+fn a_quit_in_ready_leaves_without_closing() {
+    let dir = tempfile::tempdir().unwrap();
+    let events = Events::default();
+    let mut loaded = failing(dir.path(), FailureAction::Close, &events);
+    let mut rig = Fake::new(Vec::new(), &[(ORIGIN - 1_000, Command::Quit)], i64::MAX);
+    let left = game::live::run_chart(&mut loaded, &mut rig).unwrap();
+    assert_eq!(left, game::Leave::Back);
+    assert_eq!(rig.reports[0].closing, None);
+    assert!(rig.abort_closes.is_empty());
+    assert_eq!(rig.shows, 0);
+}
+
+/// In autoplay the quit key keeps its meaning: during play it aborts the
+/// play and its result shows at once, with no Closing; in READY it
+/// leaves. A gauge failure still closes an autoplayed play.
+#[test]
+fn autoplay_quits_at_once_and_closes_on_failure() {
+    for (at, shown) in [(ORIGIN - 1_000, false), (ORIGIN + 1_200_000, true)] {
+        let dir = tempfile::tempdir().unwrap();
+        let events = Events::default();
+        let mut loaded = closing_loaded(
+            dir.path(),
+            chart(),
+            1,
+            FailureAction::Close,
+            &events,
+            Some(game::AutoKeySounds::Scheduled),
+            TimeUs(1_000 * MS),
+        );
+        let commands = [(at, Command::Quit), (15_000_000, Command::Quit)];
+        let mut rig = Fake::new(Vec::new(), &commands, i64::MAX);
+        let left = game::live::run_chart(&mut loaded, &mut rig).unwrap();
+        assert_eq!(left, game::Leave::Back);
+        let one = &rig.reports[0];
+        assert_eq!(one.end, PlayEnd::Aborted(AbortCause::Quit), "{at}");
+        assert_eq!(one.closing, None, "{at}");
+        assert_eq!(rig.shown_at, if shown { vec![at] } else { vec![] });
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let events = Events::default();
+    let mut loaded = closing_loaded(
+        dir.path(),
+        sixteen(),
+        1,
+        FailureAction::Close,
+        &events,
+        Some(game::AutoKeySounds::Scheduled),
+        TimeUs(1_000 * MS),
+    );
+    let mut rig = Fake::new(Vec::new(), &[(30_000_000, Command::Quit)], i64::MAX);
+    game::live::run_chart(&mut loaded, &mut rig).unwrap();
+    let one = &rig.reports[0];
+    assert_eq!(one.end, PlayEnd::Aborted(AbortCause::GaugeFailed));
+    assert_eq!(closing(one).end, ClosingEnd::RanOut);
+}
+
+/// Where the sixteen-note play's Closing starts and runs out, on the
+/// rig's clock.
+const CLOSING_AT: i64 = ORIGIN + FAILS_AT;
+const RUNS_OUT_AT: i64 = CLOSING_AT + 1_000_000;
+
+/// A rig for the sixteen-note play: `commands`, then the quit key at 30 s
+/// that leaves the result.
+fn failing_rig(commands: &[(i64, Command)]) -> Fake {
+    let mut all = commands.to_vec();
+    all.push((30_000_000, Command::Quit));
+    Fake::new(Vec::new(), &all, i64::MAX)
+}
+
+/// The quit key during Closing does nothing, fresh, repeated, or carried
+/// from the close handshake: each is taken as Closing's, Closing runs out
+/// and its result shows, which only the quit at 30 s leaves.
+#[test]
+fn a_quit_in_closing_does_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let events = Events::default();
+    let mut loaded = failing(dir.path(), FailureAction::Close, &events);
+    let mut rig = failing_rig(&[
+        (11_000_000, Command::Quit),
+        (11_200_000, Command::Quit),
+        (11_200_000, Command::Quit),
+    ]);
+    rig.in_close = Some(Command::Quit);
+    let left = game::live::run_chart(&mut loaded, &mut rig).unwrap();
+    assert_eq!(left, game::Leave::Back);
+    assert!(rig.clock.now().0 >= 30_000_000);
+    assert_eq!(closing(&rig.reports[0]).end, ClosingEnd::RanOut);
+    assert_eq!(
+        closing(&rig.reports[0]).ended_at,
+        TimeUs(FAILS_AT + 1_000_000)
+    );
+    assert_eq!(
+        rig.closing_taken,
+        [
+            (CLOSING_AT, Command::Quit),
+            (11_000_000, Command::Quit),
+            (11_200_000, Command::Quit),
+            (11_200_000, Command::Quit),
+        ]
+    );
+    assert_eq!(rig.shown_at, [RUNS_OUT_AT]);
+}
+
+/// A record sink that presses `command` once, while the play is saved.
+struct PressOnce(
+    std::sync::Arc<std::sync::Mutex<Vec<Command>>>,
+    Option<Command>,
+);
+
+impl game::RecordSink for PressOnce {
+    fn save(&mut self, _rec: &replay::PlayRecord) -> Result<game::RecordRef, game::SaveError> {
+        if let Some(c) = self.1.take() {
+            self.0.lock().unwrap().push(c);
+        }
+        Ok(game::RecordRef {
+            path: "pressed.tprl".into(),
+        })
+    }
+}
+
+/// A retry during Closing ends it at that wake, fresh, carried from the
+/// close handshake, or behind a quit in the same drain: the play is saved
+/// ended midway, its cause kept, and retried with no result: Retry, End,
+/// then the next Start. Retries in the same wake and while it is saved
+/// add no attempt.
+#[test]
+fn a_retry_in_closing_saves_and_retries_once() {
+    let fresh = [(11_000_000, Command::Retry), (11_000_000, Command::Retry)];
+    let behind = [(11_000_000, Command::Quit), (11_000_000, Command::Retry)];
+    for (case, commands, carried, at) in [
+        ("fresh", &fresh[..], None, 11_000_000),
+        ("carried", &[][..], Some(Command::Retry), CLOSING_AT),
+        ("behind a quit", &behind[..], None, 11_000_000),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let events = Events::default();
+        let pressed = std::sync::Arc::default();
+        let mut loaded = closing_loaded_with(
+            dir.path(),
+            sixteen(),
+            1,
+            FailureAction::Close,
+            &events,
+            None,
+            TimeUs(1_000 * MS),
+            |p| Parts {
+                records: Some(Box::new(PressOnce(
+                    std::sync::Arc::clone(&pressed),
+                    Some(Command::Retry),
+                ))),
+                ..p
+            },
+        );
+        let mut rig = failing_rig(commands);
+        rig.pressed = pressed;
+        rig.in_close = carried;
+        let left = game::live::run_chart(&mut loaded, &mut rig).unwrap();
+        assert_eq!(left, game::Leave::Back, "{case}");
+        let one = &rig.reports[0];
+        assert_eq!(one.end, PlayEnd::Aborted(AbortCause::GaugeFailed), "{case}");
+        assert_eq!(
+            closing(one),
+            ClosingReport {
+                started_at: TimeUs(FAILS_AT),
+                ended_at: TimeUs(at - ORIGIN),
+                end: ClosingEnd::Retry,
+            },
+            "{case}"
+        );
+        assert_eq!(status(one).end, replay::EndStatus::EndedMidway, "{case}");
+        // One next attempt, which fails and closes in turn; its result is
+        // the only one.
+        assert_eq!(rig.reports.len(), 2, "{case}");
+        assert_eq!(rig.shows, 1, "{case}");
+        assert_eq!(
+            events.all()[..6],
+            [
+                SessionEvent::Load,
+                start(1),
+                SessionEvent::Retry { attempt: 1 },
+                end(1, replay::EndStatus::EndedMidway),
+                start(2),
+                end(2, replay::EndStatus::EndedMidway),
+            ],
+            "{case}"
+        );
+        assert_eq!(events.all()[6..], [SessionEvent::Result { attempt: 2 }]);
+    }
+}
+
+/// Closing the window during Closing cuts it at once and ends the run:
+/// the play is saved, and no result shows. With the longest close a skin
+/// can declare, the deadline does not overflow.
+#[test]
+fn a_window_close_in_closing_saves_and_ends_the_run() {
+    for declared in [None, Some(TimeUs(i64::from(i32::MAX) * 1_000))] {
+        let dir = tempfile::tempdir().unwrap();
+        let events = Events::default();
+        let mut loaded = failing(dir.path(), FailureAction::Close, &events);
+        let mut rig = Fake::new(Vec::new(), &[], CLOSING_AT + 1_000);
+        rig.declared_close = declared;
+        let left = game::live::run_chart(&mut loaded, &mut rig).unwrap();
+        assert_eq!(left, game::Leave::Quit);
+        let one = &rig.reports[0];
+        assert_eq!(
+            closing(one),
+            ClosingReport {
+                started_at: TimeUs(FAILS_AT),
+                ended_at: TimeUs(FAILS_AT + 1_000),
+                end: ClosingEnd::Cut(AbortCause::Quit),
+            }
+        );
+        assert!(matches!(one.saved, Some(Ok(_))), "{:?}", one.saved);
+        assert_eq!(rig.shows, 0);
+        assert_eq!(
+            events.all(),
+            [
+                SessionEvent::Load,
+                start(1),
+                end(1, replay::EndStatus::EndedMidway)
+            ]
+        );
+    }
+}
+
+/// Closing the window while the chart plays aborts the play with no
+/// Closing.
+#[test]
+fn a_window_close_during_play_enters_no_closing() {
+    let dir = tempfile::tempdir().unwrap();
+    let events = Events::default();
+    let mut loaded = failing(dir.path(), FailureAction::Close, &events);
+    let mut rig = Fake::new(Vec::new(), &[], ORIGIN + 1_200_000);
+    let left = game::live::run_chart(&mut loaded, &mut rig).unwrap();
+    assert_eq!(left, game::Leave::Quit);
+    let one = &rig.reports[0];
+    assert_eq!(one.end, PlayEnd::Aborted(AbortCause::Quit));
+    assert_eq!(one.closing, None);
+    assert!(rig.abort_closes.is_empty());
+}
+
+/// Focus loss and the removal of the last device during Closing change
+/// nothing: it runs out.
+#[test]
+fn focus_loss_and_device_removal_in_closing_change_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let events = Events::default();
+    let mut loaded = failing(dir.path(), FailureAction::Close, &events);
+    let focus = ScriptItem {
+        at: TimeUs(11_000_000),
+        action: Action::FocusLoss,
+    };
+    let mut rig = Fake::new(vec![focus], &[(30_000_000, Command::Quit)], i64::MAX);
+    rig.disconnected_at = 11_100_000;
+    game::live::run_chart(&mut loaded, &mut rig).unwrap();
+    let one = &rig.reports[0];
+    assert_eq!(closing(one).end, ClosingEnd::RanOut);
+    assert_eq!(closing(one).ended_at, TimeUs(FAILS_AT + 1_000_000));
+    assert_eq!(rig.shown_at, [RUNS_OUT_AT]);
+}
+
+/// A suspend in the drain that enters Closing (behind the quit key) or at
+/// the close handshake cuts Closing at once, its cause kept, and marks
+/// the record; one during Closing cuts it and leaves the record complete;
+/// a retry beside a suspend in Closing retries.
+#[test]
+fn a_suspend_cuts_closing_and_marks_only_what_recording_saw() {
+    // With the quit that enters it, in the play's last drain.
+    let dir = tempfile::tempdir().unwrap();
+    let events = Events::default();
+    let mut loaded = closing_loaded(
+        dir.path(),
+        chart(),
+        1,
+        FailureAction::Close,
+        &events,
+        None,
+        TimeUs(1_000 * MS),
+    );
+    let commands = [
+        (9_500_000, Command::Quit),
+        (9_500_000, Command::Suspend),
+        (15_000_000, Command::Quit),
+    ];
+    let mut rig = Fake::new(Vec::new(), &commands, i64::MAX);
+    game::live::run_chart(&mut loaded, &mut rig).unwrap();
+    let one = &rig.reports[0];
+    assert_eq!(one.end, PlayEnd::Aborted(AbortCause::Quit));
+    assert_eq!(
+        closing(one),
+        ClosingReport {
+            started_at: TimeUs(1_200_000),
+            ended_at: TimeUs(1_200_000),
+            end: ClosingEnd::Cut(AbortCause::Suspend),
+        }
+    );
+    assert!(status(one).incomplete.suspend);
+    assert_eq!(rig.shown_at, [9_500_000]);
+
+    // At the handshake, during Closing, and beside a retry.
+    for (case, carried, commands, ended, marked) in [
+        (
+            "handshake",
+            Some(Command::Suspend),
+            vec![],
+            CLOSING_AT,
+            true,
+        ),
+        (
+            "closing",
+            None,
+            vec![(11_000_000, Command::Suspend)],
+            11_000_000,
+            false,
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut loaded = failing(dir.path(), FailureAction::Close, &Events::default());
+        let mut rig = failing_rig(&commands);
+        rig.in_close = carried;
+        game::live::run_chart(&mut loaded, &mut rig).unwrap();
+        let one = &rig.reports[0];
+        assert_eq!(one.end, PlayEnd::Aborted(AbortCause::GaugeFailed), "{case}");
+        assert_eq!(
+            closing(one).end,
+            ClosingEnd::Cut(AbortCause::Suspend),
+            "{case}"
+        );
+        assert_eq!(closing(one).ended_at, TimeUs(ended - ORIGIN), "{case}");
+        assert_eq!(status(one).incomplete.suspend, marked, "{case}");
+        assert_eq!(rig.shown_at, [ended], "{case}");
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let mut loaded = failing(dir.path(), FailureAction::Close, &Events::default());
+    let mut rig = failing_rig(&[(11_000_000, Command::Suspend), (11_000_000, Command::Retry)]);
+    game::live::run_chart(&mut loaded, &mut rig).unwrap();
+    assert_eq!(closing(&rig.reports[0]).end, ClosingEnd::Retry);
+    assert!(!status(&rig.reports[0]).incomplete.suspend);
+    assert_eq!(rig.reports.len(), 2);
+}
+
+/// The input thread's, the audio output's and the screen's failures cut
+/// Closing to the result, the play's cause kept and its record complete,
+/// with their diagnostics; one at Closing's deadline is still latched.
+#[test]
+fn failures_cut_closing_with_their_diagnostics() {
+    for at in [11_000_000, RUNS_OUT_AT] {
+        // The input thread.
+        let dir = tempfile::tempdir().unwrap();
+        let mut loaded = failing(dir.path(), FailureAction::Close, &Events::default());
+        let mut rig = failing_rig(&[]);
+        rig.input_fails_at = at;
+        let ran = game::live::run_chart(&mut loaded, &mut rig);
+        assert!(
+            matches!(ran, Err(LiveError::Input(InputWaitError::Gone))),
+            "{ran:?}"
+        );
+        let one = &rig.reports[0];
+        assert_eq!(one.end, PlayEnd::Aborted(AbortCause::GaugeFailed));
+        assert_eq!(
+            closing(one).end,
+            ClosingEnd::Cut(AbortCause::InputFailed),
+            "{at}"
+        );
+        assert_eq!(closing(one).ended_at, TimeUs(at - ORIGIN));
+        assert_eq!(one.input_error, Some(InputWaitError::Gone));
+        assert!(!status(one).incomplete.any());
+        assert_eq!(rig.shown_at, [at]);
+
+        // The audio output.
+        let dir = tempfile::tempdir().unwrap();
+        let mut loaded = failing(dir.path(), FailureAction::Close, &Events::default());
+        let mut rig = failing_rig(&[]);
+        rig.output_fails_at = at;
+        game::live::run_chart(&mut loaded, &mut rig).unwrap();
+        let one = &rig.reports[0];
+        assert_eq!(
+            closing(one).end,
+            ClosingEnd::Cut(AbortCause::OutputFailed),
+            "{at}"
+        );
+        assert_eq!(closing(one).ended_at, TimeUs(at - ORIGIN));
+        assert_eq!(one.output_error, Some(audio::OutputError::DeviceLost));
+        assert_eq!(rig.shown_at, [at]);
+    }
+    // The screen: built again before the result shows.
+    let dir = tempfile::tempdir().unwrap();
+    let mut loaded = failing(dir.path(), FailureAction::Close, &Events::default());
+    let mut rig = failing_rig(&[]);
+    rig.screen_fails_at = 11_000_000;
+    game::live::run_chart(&mut loaded, &mut rig).unwrap();
+    let one = &rig.reports[0];
+    assert_eq!(closing(one).end, ClosingEnd::Cut(AbortCause::ScreenFailed));
+    assert_eq!(closing(one).ended_at, TimeUs(11_000_000 - ORIGIN));
+}
+
+/// Closing lasts the skin's declared close, at least 1 s: none, zero,
+/// negative and 500 ms give the floor, 3 s gives 3 s.
+#[test]
+fn closing_lasts_the_declared_close_at_least_the_floor() {
+    for (declared, lasts) in [
+        (None, 1_000_000),
+        (Some(0), 1_000_000),
+        (Some(-1), 1_000_000),
+        (Some(500_000), 1_000_000),
+        (Some(3_000_000), 3_000_000),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut loaded = failing(dir.path(), FailureAction::Close, &Events::default());
+        let mut rig = failing_rig(&[]);
+        rig.declared_close = declared.map(TimeUs);
+        game::live::run_chart(&mut loaded, &mut rig).unwrap();
+        let c = closing(&rig.reports[0]);
+        assert_eq!(c.end, ClosingEnd::RanOut, "{declared:?}");
+        assert_eq!(c.ended_at.0 - c.started_at.0, lasts, "{declared:?}");
+    }
+}
+
+/// The duration and the deadline, exactly: the floor, no cap, and a
+/// deadline that saturates at the end of the clock.
+#[test]
+fn closing_time_and_deadline_saturate() {
+    let max_ms = TimeUs(i64::from(i32::MAX) * 1_000);
+    assert_eq!(game::CLOSE_FLOOR, TimeUs(1_000_000));
+    assert_eq!(game::closing_time(None), game::CLOSE_FLOOR);
+    assert_eq!(
+        game::closing_time(Some(TimeUs(i64::MIN))),
+        game::CLOSE_FLOOR
+    );
+    assert_eq!(
+        game::closing_time(Some(TimeUs(1_000_001))),
+        TimeUs(1_000_001)
+    );
+    assert_eq!(game::closing_time(Some(max_ms)), max_ms);
+    assert_eq!(
+        game::closing_deadline(TimeUs(i64::MAX - 5), Some(max_ms)),
+        TimeUs(i64::MAX)
+    );
+    assert_eq!(
+        game::closing_deadline(TimeUs(i64::MAX - 5), None),
+        TimeUs(i64::MAX)
+    );
+    assert_eq!(
+        game::closing_deadline(TimeUs(2_000), Some(max_ms)),
+        TimeUs(2_000 + max_ms.0)
+    );
+}
+
+/// A quit at the chart's start before any advance, READY having no
+/// lead-in: Closing still runs and its result shows, and with nothing
+/// finalized no record is made or saved.
+#[test]
+fn a_closing_with_no_watermark_saves_nothing_and_shows_its_result() {
+    let dir = tempfile::tempdir().unwrap();
+    let events = Events::default();
+    let mut loaded = closing_loaded(
+        dir.path(),
+        chart(),
+        1,
+        FailureAction::Close,
+        &events,
+        None,
+        TimeUs(0),
+    );
+    let commands = [
+        (CLOCK_START + 1_000, Command::Quit),
+        (15_000_000, Command::Quit),
+    ];
+    let mut rig = Fake::new(Vec::new(), &commands, i64::MAX);
+    game::live::run_chart(&mut loaded, &mut rig).unwrap();
+    let one = &rig.reports[0];
+    assert_eq!(one.end, PlayEnd::Aborted(AbortCause::Quit));
+    assert_eq!(closing(one).end, ClosingEnd::RanOut);
+    assert_eq!((one.record.as_ref(), one.saved.as_ref()), (None, None));
+    assert_eq!(rig.shown_at, [CLOCK_START + 1_001_000]);
+}
+
+/// An abort close that fails, while the ordinary close would succeed,
+/// marks the record incomplete (input failed) with no arrivals, and the
+/// failure cuts Closing; a retry carried from that handshake still ends
+/// Closing first, and the run then ends with the input cause after the
+/// Retry and End events, with no next attempt.
+#[test]
+fn a_failed_abort_close_marks_the_record_and_ends_the_run() {
+    for carried in [None, Some(Command::Retry)] {
+        let dir = tempfile::tempdir().unwrap();
+        let events = Events::default();
+        let mut loaded = failing(dir.path(), FailureAction::Close, &events);
+        let mut rig = failing_rig(&[]);
+        rig.abort_close_fails = Some(InputWaitError::Timeout);
+        rig.in_close = carried;
+        let ran = game::live::run_chart(&mut loaded, &mut rig);
+        assert!(
+            matches!(ran, Err(LiveError::Input(InputWaitError::Timeout))),
+            "{ran:?}"
+        );
+        assert_eq!(rig.abort_closes.len(), 1);
+        assert_eq!(rig.end_feedbacks, 0);
+        let [one] = &rig.reports[..] else {
+            panic!("{} plays", rig.reports.len());
+        };
+        let record = one.record.as_ref().unwrap();
+        assert!(record.status.incomplete.input_failed);
+        assert!(record.arrivals.is_empty());
+        let retried = carried.is_some();
+        assert_eq!(
+            closing(one).end,
+            if retried {
+                ClosingEnd::Retry
+            } else {
+                ClosingEnd::Cut(AbortCause::InputFailed)
+            }
+        );
+        let mut expected = vec![SessionEvent::Load, start(1)];
+        if retried {
+            expected.push(SessionEvent::Retry { attempt: 1 });
+        }
+        expected.push(end(1, replay::EndStatus::EndedMidway));
+        if !retried {
+            expected.push(SessionEvent::Result { attempt: 1 });
+        }
+        assert_eq!(events.all(), expected);
+    }
+}
+
+/// Closing the window with a retry in the same Closing wake ends the run:
+/// no Retry event, no result.
+#[test]
+fn a_window_close_beside_a_retry_in_closing_ends_the_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let events = Events::default();
+    let mut loaded = failing(dir.path(), FailureAction::Close, &events);
+    let mut rig = Fake::new(Vec::new(), &[(11_000_000, Command::Retry)], 11_000_000);
+    let left = game::live::run_chart(&mut loaded, &mut rig).unwrap();
+    assert_eq!(left, game::Leave::Quit);
+    assert_eq!(
+        closing(&rig.reports[0]).end,
+        ClosingEnd::Cut(AbortCause::Quit)
+    );
+    assert_eq!(
+        events.all(),
+        [
+            SessionEvent::Load,
+            start(1),
+            end(1, replay::EndStatus::EndedMidway)
+        ]
+    );
+}
+
+/// A shown gauge the preset does not have resolves to the first, once for
+/// the attempt: the attempt the screen prepares, what closes the play and
+/// the report all use it, so the sixteen misses, failing only the hidden
+/// survival gauge, play to the end. Under the survival gauge's own index
+/// every one of them is the survival gauge.
+#[test]
+fn an_unknown_shown_gauge_resolves_to_the_first_everywhere() {
+    for (displayed, resolved, closes) in [(5, 0, false), (1, 1, true)] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut loaded = closing_loaded(
+            dir.path(),
+            sixteen(),
+            displayed,
+            FailureAction::Close,
+            &Events::default(),
+            None,
+            TimeUs(1_000 * MS),
+        );
+        let mut rig = failing_rig(&[]);
+        game::live::run_chart(&mut loaded, &mut rig).unwrap();
+        let index = game::GaugeIndex(resolved);
+        assert_eq!(loaded.displayed(), index, "{displayed}");
+        assert_eq!(rig.attempts[0].displayed, index, "{displayed}");
+        let one = &rig.reports[0];
+        assert_eq!(one.displayed_gauge, index, "{displayed}");
+        assert_eq!(one.closing.is_some(), closes, "{displayed}");
     }
 }

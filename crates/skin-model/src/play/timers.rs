@@ -543,7 +543,11 @@ impl Play {
         let ready = (now >= self.ready_at).then_some(self.ready_at);
         let play = (now >= self.play_at).then_some(self.play_at);
         let shown = frame.gauges.get(frame.gauge);
-        let failed = shown.and_then(|g| g.failed_at);
+        // From the lifecycle's Closing start, never the evaluator's
+        // `failed_at`: a failure that does not close the play (a hidden
+        // gauge's, any under play-to-end) starts nothing, and a quit that
+        // closes it does.
+        let failed = frame.closing;
         // The reducer's start, masked during READY, so skins animate the
         // full gauge from the start of play, and while the snapshot is
         // below the maximum: a dropped below-maximum effect cannot leave
