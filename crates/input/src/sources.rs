@@ -923,6 +923,9 @@ impl SourceSet {
     /// A device was removed. A participating source records `Disconnected`
     /// at the batch time, publishes that time as its final watermark, and
     /// closes; once the gate has tripped, nothing is recorded or published.
+    /// Once the recording is sealed ([`seal_recording`](Self::seal_recording)),
+    /// no `Disconnected` is pushed, but the source still publishes its
+    /// final watermark and closes.
     pub fn disconnect(&mut self, device: DeviceId) {
         if let Some(menu) = &mut self.menu {
             menu.removed(device);
