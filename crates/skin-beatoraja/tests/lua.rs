@@ -1330,7 +1330,7 @@ fn skin_config_follows_the_header_and_its_writes_stay_in_the_pass() {
                  filepath = { { name = \"bg\", path = \"bg/*.png\", def = \"b\" } },\n\
                  offset = { { name = \"o\", id = 40, x = true } },",
                 &format!(
-                    "assert(skin_config.file_path.bg == \"bg/b.png\", \"file_path\")\n\
+                    "assert(skin_config.file_path.bg == \"b.png\", \"file_path\")\n\
                      assert(skin_config.get_path(\"bg/*.png\") == \"bg/b.png\", \"get_path\")\n\
                      assert(skin_config.get_path(\"bg/*.png/x\") == \"bg/b.png/x\", \"get_path foot\")\n\
                      assert(skin_config.get_path(\"fx/*.png\") == nil, \"unchosen\")\n\
@@ -1366,6 +1366,79 @@ fn skin_config_follows_the_header_and_its_writes_stay_in_the_pass() {
     h.import(&config, &Cancel::new()).unwrap();
     h.import(&config, &Cancel::new()).unwrap();
     assert_eq!(config, kept);
+}
+
+#[test]
+fn a_skin_joins_a_choice_s_folder_and_its_file_path() {
+    // A file choice whose sidecar the skin finds by the chosen image's
+    // name, and a folder choice whose part it loads from inside.
+    let d = folder(&[
+        (
+            "s.luaskin",
+            &skin(
+                "filepath = {\n\
+                   { name = \"Judge\", path = \"custom/judge/*.png\", def = \"a\" },\n\
+                   { name = \"Frame\", path = \"custom/frame/*\" },\n\
+                 },",
+                &format!(
+                    "assert(skin_config.file_path.Judge == \"b.png\", \"judge\")\n\
+                     assert(skin_config.file_path.Frame == \"y\", \"frame\")\n\
+                     local judge = string.match(skin_config.get_path(\"custom/judge/\" .. skin_config.file_path.Judge), \"(.+)%.png$\") .. \".lua\"\n\
+                     local ok, setting = pcall(dofile, judge)\n\
+                     assert(ok and setting.offset_x == 7, \"judge sidecar\")\n\
+                     local frame = dofile(skin_config.get_path(\"custom/frame/\" .. skin_config.file_path.Frame .. \"/f.lua\"))\n\
+                     assert(frame.side == \"y\", \"frame part\")\n{DRAW_I}"
+                ),
+            ),
+        ),
+        ("custom/judge/a.png", ""),
+        ("custom/judge/a.lua", "return { offset_x = 1 }"),
+        ("custom/judge/b.png", ""),
+        ("custom/judge/b.lua", "return { offset_x = 7 }"),
+        ("custom/frame/x/f.lua", "return { side = \"x\" }"),
+        ("custom/frame/y/f.lua", "return { side = \"y\" }"),
+    ]);
+    let h = header(&d).unwrap();
+    let mut config = Config::defaults(h.header());
+    config.files.insert("Judge".into(), "b.png".into());
+    config.files.insert("Frame".into(), "y".into());
+    let r = h.import(&config, &Cancel::new()).unwrap();
+    for part in ["custom/judge/b.lua", "custom/frame/y/f.lua"] {
+        assert!(r.dependencies.iter().any(|d| d == part), "{part}");
+    }
+}
+
+#[test]
+fn a_path_in_file_path_reaches_only_the_skin_folder() {
+    let d = |body: &str| {
+        folder(&[
+            (
+                "s.luaskin",
+                &skin(
+                    "filepath = { { name = \"Judge\", path = \"custom/judge/*.png\" } },",
+                    &format!("{body}\n{DRAW_I}"),
+                ),
+            ),
+            ("custom/judge/a.png", ""),
+            ("custom/b.png", ""),
+        ])
+    };
+    // A configured path is no candidate: the choice keeps its first, by
+    // name, for both `file_path` and `get_path`.
+    let picked = d(
+        "assert(skin_config.file_path.Judge == \"a.png\", \"name\")\n\
+         assert(skin_config.get_path(\"custom/judge/*.png\") == \"custom/judge/a.png\", \"path\")",
+    );
+    let h = header(&picked).unwrap();
+    for path in ["../b.png", "custom/b.png", "custom/judge/a.png"] {
+        let mut config = Config::defaults(h.header());
+        config.files.insert("Judge".into(), path.into());
+        h.import(&config, &Cancel::new()).unwrap();
+    }
+    // A path the skin writes in is resolved and loaded in the folder.
+    let written = d("skin_config.file_path.Judge = \"../../../x.lua\"\n\
+         pcall(dofile, skin_config.get_path(\"custom/judge/\" .. skin_config.file_path.Judge))");
+    assert!(matches!(read(import(&written)), RootError::Underflow));
 }
 
 #[test]
