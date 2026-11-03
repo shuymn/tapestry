@@ -909,9 +909,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut b = builder(dir.path());
         let side = super::super::MAX_SIDE;
-        // Empty, too wide or tall, or 4097 × 2048, past the per-image
+        // Empty, too wide or tall, or 4097 × 3072, past the per-image
         // texels by one column of rows.
-        for size in [[0, 8], [8, 0], [side + 1, 1], [1, side + 1], [4_097, 2_048]] {
+        for size in [[0, 8], [8, 0], [side + 1, 1], [1, side + 1], [4_097, 3_072]] {
             let e = b.add_solid_image(solid(size)).unwrap_err();
             assert!(
                 matches!(e, ImageError::SolidSize { image: 0, .. }),
@@ -920,7 +920,8 @@ mod tests {
             assert_eq!(solid_state(&b), (0, 0, 0, 0, 0, 0, 0), "{size:?}");
         }
         // The per-image cap itself is accepted.
-        b.add_solid_image(solid([4_096, 2_048])).unwrap();
+        assert_eq!(4_096 * 3_072, super::super::MAX_IMAGE_TEXELS);
+        b.add_solid_image(solid([4_096, 3_072])).unwrap();
     }
 
     #[test]

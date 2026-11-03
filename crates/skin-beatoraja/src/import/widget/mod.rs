@@ -295,9 +295,14 @@ impl Cx<'_> {
                 return missing(NoteKind::MissingAsset);
             }
             Err(Failed::File { refused: false }) => return missing(NoteKind::MissingAsset),
-            // Only this importer refuses it: no hole stands for it.
+            // Only this importer refuses it: no hole stands for it. A file
+            // past a per-file cap is noted with that cap.
             Err(Failed::File { refused: true } | Failed::Name) => {
-                return refused(NoteKind::MissingAsset);
+                let why = self
+                    .assets
+                    .failed_cap(&name)
+                    .map_or(NoteKind::MissingAsset, |cap| NoteKind::OverCap { cap });
+                return refused(why);
             }
         };
         let [fw, fh] = self.assets.file_dims(file).unwrap_or([0, 0]);
