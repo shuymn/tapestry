@@ -35,6 +35,7 @@ mod config;
 mod convert;
 mod host;
 mod ledger;
+mod library;
 pub mod limits;
 mod loader;
 mod sandbox;
@@ -112,6 +113,9 @@ pub enum LuaWhy {
     RequireCycle,
     /// A metatable with `__gc` or `__mode`.
     Finalizer,
+    /// A library operation the sandbox's library does not implement, or a
+    /// primitive's result over its cap ([`limits::MAX_PRIMITIVE_BYTES`]).
+    Library { op: &'static str },
     /// A host API function called during import, by its index in
     /// [`HOST_APIS`]: there is no play state to read.
     LiveState { api: u16 },
@@ -145,6 +149,7 @@ impl fmt::Display for LuaWhy {
             Self::LoaderName => f.write_str("a loader's argument is not a file name"),
             Self::RequireCycle => f.write_str("a module requires itself"),
             Self::Finalizer => f.write_str("a metatable with __gc or __mode"),
+            Self::Library { op } => write!(f, "an unsupported library operation: {op}"),
             Self::LiveState { api } => {
                 let (m, n) = HOST_APIS
                     .get(usize::from(*api))
@@ -185,8 +190,6 @@ pub(crate) struct Pass {
     names: RefCell<Vec<(String, FileId)>>,
     cache: RefCell<Vec<(FileId, Option<RegistryKey>)>>,
     depth: Cell<u32>,
-    /// The metatable snapshots this pass attached and guards, by address.
-    snapshots: RefCell<Vec<usize>>,
     /// The host API functions, by address.
     hosts: RefCell<HashMap<usize, u16>>,
     handled: Cell<u64>,
@@ -229,7 +232,6 @@ impl Pass {
             names: RefCell::new(Vec::new()),
             cache: RefCell::new(Vec::new()),
             depth: Cell::new(0),
-            snapshots: RefCell::new(Vec::new()),
             hosts: RefCell::new(HashMap::new()),
             handled: Cell::new(0),
             last_error: RefCell::new(None),
@@ -271,14 +273,6 @@ impl Pass {
 
     fn last_error(&self) -> Option<Loc> {
         self.last_error.borrow().clone()
-    }
-
-    fn snapshot(&self, addr: usize) {
-        self.snapshots.borrow_mut().push(addr);
-    }
-
-    fn snapshot_of(&self, addr: usize) -> bool {
-        self.snapshots.borrow().contains(&addr)
     }
 
     fn host_api(&self, addr: usize, api: u16) {

@@ -961,7 +961,7 @@ skin.destination[2] = { id = "v", dst = { { w = 10, h = 10 } } }"#,
         ),
         (
             "memory",
-            lua_input(&["local s = string.rep(\"x\", 80 << 20)\nreturn { type = 0 }"]),
+            lua_input(&["local s = \"x\"\nfor i = 1, 40 do s = s .. s end\nreturn { type = 0 }"]),
         ),
         (
             "escape",

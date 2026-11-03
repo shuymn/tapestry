@@ -103,7 +103,7 @@ fn why<T: std::fmt::Debug>(r: Result<T, ImportError>) -> LuaWhy {
 }
 
 /// A loop of host calls that only a fault ends.
-const ENDLESS: &str = "local n = 0\nwhile true do n = n + 1 setmetatable({}, nil) end";
+const ENDLESS: &str = "local n = 0\nwhile true do n = n + 1 pcall(type, n) end";
 
 #[test]
 fn cancellation_is_seen_at_the_next_host_call_or_step() {

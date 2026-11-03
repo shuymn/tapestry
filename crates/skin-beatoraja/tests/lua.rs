@@ -268,14 +268,16 @@ fn the_instruction_limit_counts_both_passes() {
 
 #[test]
 fn memory_is_capped_before_it_is_allocated() {
-    // 24 MiB, built in a buffer and then copied, fit in the 64 MiB.
-    let fits = configured("local s = string.rep(\"x\", 24 << 20)");
+    // 24 MiB live, built by the VM's own concatenation, fit in the 64 MiB.
+    let fits = configured("local s = \"x\"\nfor i = 1, 24 do s = s .. s end");
     import(&fits).unwrap();
     for body in [
-        "local s = string.rep(\"x\", 80 << 20)",
+        "local s = \"x\"\nfor i = 1, 40 do s = s .. s end",
         "local s = string.rep(\"x\", 1 << 20)\nlocal t = {}\nfor i = 1, 100 do t[i] = s .. i end",
-        "pcall(string.rep, \"x\", 80 << 20)",
         "pcall(function() local s = \"x\" for i = 1, 40 do s = s .. s end end)",
+        // Inside the library: its own buffers exhaust memory.
+        "local s = string.rep(\"x\", 1 << 19)\nlocal t = {}\n\
+         pcall(function() for i = 1, 160 do t[i] = string.upper(s .. i) end end)",
     ] {
         let d = configured(body);
         assert_eq!(why(import(&d)), LuaWhy::Limit(LuaLimit::Memory), "{body}");
@@ -300,53 +302,147 @@ fn recursion_ends_in_a_located_error() {
 
 #[test]
 fn host_calls_are_capped_across_protected_calls() {
-    // `setmetatable` is a host function: one call each.
+    // A protected call settles through a host function: one call each.
     let n = MAX_HOST_CALLS;
-    let at = configured(&format!("for i = 1, {n} do setmetatable({{}}, nil) end"));
+    let at = configured(&format!("for i = 1, {n} do pcall(type, i) end"));
     let r = import(&at).unwrap();
     assert_eq!(r.usage.host_calls, n);
-    let over = configured(&format!(
-        "for i = 1, {} do setmetatable({{}}, nil) end",
-        n + 1
-    ));
+    let over = configured(&format!("for i = 1, {} do pcall(type, i) end", n + 1));
     assert_eq!(why(import(&over)), LuaWhy::Limit(LuaLimit::HostCalls));
     let caught = configured(&format!(
-        "pcall(function() for i = 1, {} do setmetatable({{}}, nil) end end)",
+        "pcall(function() for i = 1, {} do pcall(type, i) end end)",
         n + 1
     ));
     assert_eq!(why(import(&caught)), LuaWhy::Limit(LuaLimit::HostCalls));
 }
 
 #[test]
-fn native_library_work_is_charged_before_the_call() {
-    let fine = configured("assert(string.find(\"a.png\", \"%.png$\"))");
+fn the_library_runs_its_loops_as_metered_lua() {
+    // The forms the owner's skins use work as Lua's do.
+    let fine = configured(
+        "assert(string.find(\"a.png\", \"%.png$\") == 2)\n\
+         assert(select(2, string.gsub(\"a/b/c\", \"[/\\\\]\", \"-\")) == 2)\n\
+         assert(string.gsub(\"abc\", \"(%w)\", \"%1%1\") == \"aabbcc\")\n\
+         assert(string.match(\"skin/play/x.lua\", \"(.+)/\") == \"skin/play\")\n\
+         assert(string.match(\"key=val\", \"^(%a+)=(%a+)$\") == \"key\")\n\
+         local n = 0 for w in string.gmatch(\"one two  three\", \"%a+\") do n = n + 1 end\n\
+         assert(n == 3)\n\
+         local g = 0 for w in string.gmatch(\"^a^a\", \"^a\") do g = g + 1 end\n\
+         assert(g == 2, \"a leading ^ is a literal in gmatch\")\n\
+         assert(string.find(\"a+b\", \"+\", 1, true) == 2)\n\
+         assert(string.format(\"%02d:%s\", 7, \"x\") == \"07:x\")\n\
+         assert(tonumber(\"0x10\") == 16 and tonumber(\"10\", 2) == 2)\n\
+         local t = { 3, 1, 2 }\n\
+         table.sort(t) assert(t[1] == 1 and t[3] == 3)\n\
+         table.sort(t, function(a, b) return a > b end) assert(t[1] == 3)\n\
+         table.insert(t, 1, 9) assert(t[1] == 9 and #t == 4)\n\
+         assert(table.remove(t) == 1 and #t == 3)\n\
+         assert(table.concat({ 1, \"b\", 3 }, \",\") == \"1,b,3\")\n\
+         assert(select(\"#\", table.unpack({ 1, 2, 3 })) == 3)\n\
+         assert((\"abc\"):upper() == \"ABC\" and (\"abc\"):sub(2) == \"bc\")",
+    );
     import(&fine).unwrap();
+    // Backtracking and long copies are instructions: the cap ends them.
     for body in [
         "string.find(string.rep(\"a\", 3000), \"a*a*a*b\")",
         "pcall(string.gsub, string.rep(\"a\", 3000), \"(a-)(a-)(a-)b\", \"\")",
         "table.move({}, 1, 1 << 40, 1)",
-        "local s = string.rep(\"a\", 3000)\nlocal f = s.match\npcall(f, s, \".-.-.-x\")",
-        // Every argument form Lua accepts is charged as it is read.
         "table.move({}, 1.0, 2^40, 1.0)",
         "table.move({}, \"1\", \"1099511627776\", 1)",
-        "pcall(string.rep, \"xx\", \"1e8\")",
-        "table.concat(setmetatable({}, { __len = function() return 1 << 40 end }))",
-        "table.unpack({}, 1.0, 2^40)",
-        "for w in string.gmatch(string.rep(\"ab \", 100000), \"%a+\") do end",
-        // Repeated small results add up: each call's output is charged.
-        "for i = 1, 2000000 do local s = string.upper(\"abcdefghijklmnopqrstuvwxyz0123456789abcdefghij\") end",
-        "local s = string.rep(\"a\", 1000)\nlocal r = string.rep(\"b\", 1000)\n\
-         for i = 1, 200 do local t = string.gsub(s, \"a\", r) end",
-        "local s = string.rep(\"a\", 100000)\n\
-         for i = 1, 600 do for w in s:gmatch(\"^a+\") do end end",
+        "local t = {}\nfor i = 1, 1e6 do table.insert(t, 1, i) end",
+        // An exhausted iterator stays exhausted: each call is a few
+        // instructions, never a rescan.
+        "local it = string.gmatch(string.rep(\"a\", 1 << 16), \"z\")\nwhile true do it() end",
     ] {
         let d = configured(body);
         assert_eq!(
             why(import(&d)),
-            LuaWhy::Limit(LuaLimit::NativeWork),
+            LuaWhy::Limit(LuaLimit::Instructions),
             "{body}"
         );
     }
+    // Native primitives: a result over the per-call cap is refused before
+    // the call; small results add up to the byte budget.
+    for (body, want) in [
+        (
+            "pcall(string.rep, \"xx\", \"1e8\")",
+            LuaWhy::Library {
+                op: "result over the primitive cap",
+            },
+        ),
+        (
+            "local s = string.rep(\"a\", 1 << 20)\npcall(string.sub, s .. \"b\", 1)",
+            LuaWhy::Library {
+                op: "result over the primitive cap",
+            },
+        ),
+        (
+            "local s = string.rep(\"1\", 1 << 20)\npcall(tonumber, s .. \"1\")",
+            LuaWhy::Library {
+                op: "result over the primitive cap",
+            },
+        ),
+        (
+            "local s = string.rep(\"a\", 1 << 19)\nfor i = 1, 300 do local t = s:sub(1) end",
+            LuaWhy::Limit(LuaLimit::NativeWork),
+        ),
+        (
+            "local s = string.rep(\"1\", 1 << 19)\nfor i = 1, 300 do pcall(tonumber, s) end",
+            LuaWhy::Limit(LuaLimit::NativeWork),
+        ),
+        // A metatable the table functions would consult is refused, so
+        // `__len` is never read twice.
+        (
+            "local k = 0\n\
+             local t = setmetatable({}, { __len = function() k = k + 1 return k == 1 and 0 or 1 << 40 end })\n\
+             table.insert(t, 1, false)",
+            LuaWhy::Library {
+                op: "table with a metatable",
+            },
+        ),
+        (
+            "pcall(table.concat, setmetatable({}, { __index = {} }))",
+            LuaWhy::Library {
+                op: "table with a metatable",
+            },
+        ),
+        (
+            "string.find(\"(x)\", \"%b()\")",
+            LuaWhy::Library { op: "pattern %b" },
+        ),
+        (
+            "pcall(string.match, \"aa\", \"(a)%1\")",
+            LuaWhy::Library {
+                op: "pattern back reference",
+            },
+        ),
+        (
+            "local s = string.rep(\"a\", 1 << 20)\nstring.format(\"%s%s\", s, s)",
+            LuaWhy::Library {
+                op: "result over the primitive cap",
+            },
+        ),
+    ] {
+        let d = configured(body);
+        assert_eq!(why(import(&d)), want, "{body}");
+    }
+    // A replacement or a join that fails copies nothing: the result is
+    // built only once every piece is checked.
+    for body in [
+        "local big = string.rep(\"b\", 1 << 19)\n\
+         for i = 1, 300 do assert(not pcall(string.gsub, \"ab\", \".\", { a = big, b = {} })) end",
+        "local big = string.rep(\"b\", 1 << 19)\n\
+         for i = 1, 300 do assert(not pcall(table.concat, { big, big, {} })) end",
+    ] {
+        let r = import(&configured(body)).unwrap_or_else(|e| panic!("{body}: {e:?}"));
+        assert!(r.usage.native_work < 1 << 20, "{body}: {:?}", r.usage);
+    }
+    // The natives stay private: the strings' methods are the library's.
+    let d = configured(
+        "assert(getmetatable(\"\").__index == string, \"methods\")\n\
+         assert(string.dump == nil and (\"\").dump == nil, \"dump\")",
+    );
+    import(&d).unwrap();
 }
 
 #[test]

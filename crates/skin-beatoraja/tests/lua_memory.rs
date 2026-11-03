@@ -138,13 +138,27 @@ fn lua_import_memory_is_bounded_and_freed() {
     let small = folder(&configured(""));
     let base = record("small", measure(|| both(small.path()).unwrap()));
 
-    // The positive control: 24 MiB the VM allocates appear in the count.
-    let control = folder(&configured("local s = string.rep(\"x\", 24 << 20)"));
+    // The positive control: a 32 MiB string the VM builds appears in the
+    // count.
+    let control = folder(&configured(
+        "local s = \"x\"\nfor i = 1, 25 do s = s .. s end",
+    ));
     let p = record("control", measure(|| both(control.path()).unwrap()));
     assert!(
-        p - base >= 24 << 20,
+        p - base >= 32 << 20,
         "the counter misses VM allocation: {p}"
     );
+
+    // Caught errors keep their values in Lua: 500 caught errors carrying
+    // an 8 MiB string hold that one string, not 500 copies outside the VM.
+    let errors = folder(&configured(
+        "local big = \"x\"\nfor i = 1, 23 do big = big .. big end\n\
+         local kept = {}\n\
+         for i = 1, 500 do local ok, e = pcall(error, big, 0) kept[i] = e end\n\
+         for i = 1, 500 do local ok, e = pcall(table.sort, { 2, 1 }, function() error(big, 0) end) kept[500 + i] = e end",
+    ));
+    let p = record("retained_errors", measure(|| both(errors.path()).unwrap()));
+    assert!(p < 40 << 20, "caught errors grew memory: {p}");
 
     // The VM at its cap: refused, everything freed.
     let vm_cap = folder(&configured(
