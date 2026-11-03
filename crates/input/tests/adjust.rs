@@ -7,7 +7,8 @@ use eval::ControlId;
 use input::hid::{AxisCap, HidProduct, axis_control};
 use input::{
     ADJUST_QUEUE, AdjustmentBindings, AdjustmentReceiver, DeviceId, DeviceKind, Hold, HoldLatch,
-    MAX_TAPPED, Packet, SourceConfig, SourceSet, TapControl, TapError, TapEvent, adjustment_queue,
+    MAX_TAPPED, Packet, PresentationFocus, SourceConfig, SourceSet, TapControl, TapError, TapEvent,
+    adjustment_queue,
 };
 
 const Q: ControlId = ControlId(0x10);
@@ -82,6 +83,7 @@ fn rig(relative: bool) -> (SourceSet, AdjustmentReceiver, HoldLatch) {
         ],
         latched: (1 << START) | (1 << SELECT),
         wrap: None,
+        ..AdjustmentBindings::default()
     })
     .unwrap();
     let latch = tap.latch();
@@ -109,7 +111,17 @@ fn drain(rx: &mut AdjustmentReceiver) -> Vec<(i64, TapEvent)> {
 fn a_control_held_on_two_keyboards_is_pressed_once_and_released_by_the_last() {
     let (mut set, mut rx, _) = rig(false);
     batch(&mut set, 10, &[]);
-    assert_eq!(drain(&mut rx), [(10, TapEvent::Resync(0))], "the baseline");
+    assert_eq!(
+        drain(&mut rx),
+        [(
+            10,
+            TapEvent::Resync {
+                held: 0,
+                verified: true
+            }
+        )],
+        "the baseline"
+    );
     batch(&mut set, 20, &[packet(1, Q, 1), packet(2, Q, 1)]);
     batch(&mut set, 30, &[packet(1, Q, 1), packet(1, Q, 0)]);
     batch(
@@ -145,7 +157,13 @@ fn observations_are_numbered_in_order_while_recording_is_open() {
     assert_eq!(
         seen.iter().map(|o| (o.seq, o.event)).collect::<Vec<_>>(),
         [
-            (0, TapEvent::Resync(0)),
+            (
+                0,
+                TapEvent::Resync {
+                    held: 0,
+                    verified: true
+                }
+            ),
             (1, TapEvent::Press(SCRATCH)),
             (2, TapEvent::Press(AUX)),
             (3, TapEvent::Tick),
@@ -167,19 +185,27 @@ fn an_absolute_axis_moves_the_short_way_round_and_a_relative_one_as_reported() {
         drain(&mut rx),
         [
             // The first report is only a baseline.
-            (10, TapEvent::Resync(0)),
+            (
+                10,
+                TapEvent::Resync {
+                    held: 0,
+                    verified: true
+                }
+            ),
             (
                 20,
                 TapEvent::Axis {
                     control: AXIS,
-                    delta: 11
+                    delta: 11,
+                    revolution: 256
                 }
             ),
             (
                 30,
                 TapEvent::Axis {
                     control: AXIS,
-                    delta: -11
+                    delta: -11,
+                    revolution: 256
                 }
             ),
         ]
@@ -190,12 +216,19 @@ fn an_absolute_axis_moves_the_short_way_round_and_a_relative_one_as_reported() {
     assert_eq!(
         drain(&mut rx),
         [
-            (5, TapEvent::Resync(0)),
+            (
+                5,
+                TapEvent::Resync {
+                    held: 0,
+                    verified: true
+                }
+            ),
             (
                 10,
                 TapEvent::Axis {
                     control: AXIS,
-                    delta: -3
+                    delta: -3,
+                    revolution: 0
                 }
             ),
         ]
@@ -252,13 +285,52 @@ fn an_overflow_sends_a_loss_then_the_held_controls_and_nothing_between() {
     batch(&mut set, 20_000, &[packet(1, Q, 0), packet(1, W, 1)]);
     let events = drain(&mut rx);
     assert!(rx.dropped() > 0);
-    assert!(!events.iter().any(|(_, e)| *e == TapEvent::Lost));
+    // The loss is sent at once in the slots kept for it, its baseline
+    // START as held then; what follows it waits for room.
+    let marked: Vec<_> = events
+        .iter()
+        .map(|&(_, e)| e)
+        .filter(|e| !matches!(e, TapEvent::Axis { .. } | TapEvent::Tick))
+        .collect();
+    assert_eq!(
+        marked[..4],
+        [
+            TapEvent::Resync {
+                held: 0,
+                verified: true
+            },
+            TapEvent::Press(START),
+            TapEvent::Lost,
+            TapEvent::Resync {
+                held: 1 << START,
+                verified: true
+            },
+        ]
+    );
+    assert!(
+        marked[4..].iter().all(|e| matches!(
+            e,
+            TapEvent::Lost
+                | TapEvent::Resync {
+                    held: 1,
+                    verified: true
+                }
+        )),
+        "nothing between the losses: {marked:?}"
+    );
+    assert!(rx.owed(), "a recovery waits for room");
     batch(&mut set, 30_000, &[packet(1, SHIFT, 1)]);
     assert_eq!(
         drain(&mut rx),
         [
             (30_000, TapEvent::Lost),
-            (30_000, TapEvent::Resync(1 << SELECT)),
+            (
+                30_000,
+                TapEvent::Resync {
+                    held: 1 << SELECT,
+                    verified: true
+                }
+            ),
             (30_000, TapEvent::Press(SCRATCH)),
             (30_000, TapEvent::Tick),
         ]
@@ -274,8 +346,77 @@ fn an_overflow_sends_a_loss_then_the_held_controls_and_nothing_between() {
 }
 
 #[test]
-fn input_while_focus_is_away_is_answered_by_a_resynchronization() {
+fn focus_loss_sends_lost_at_once_and_return_sends_a_suppressed_baseline() {
     let (mut set, mut rx, latch) = rig(false);
+    let focus = PresentationFocus::new();
+    set.set_presentation_focus(focus.clone());
+    batch(&mut set, 10, &[]);
+    drain(&mut rx);
+    focus.set(false);
+    batch(&mut set, 20, &[packet(1, Q, 1)]);
+    batch(&mut set, 30, &[packet(1, W, 1)]);
+    assert_eq!(
+        drain(&mut rx),
+        [
+            (20, TapEvent::Lost),
+            (
+                20,
+                TapEvent::Resync {
+                    held: 0,
+                    verified: false
+                }
+            ),
+        ],
+        "the loss at once, then nothing while focus is away"
+    );
+    assert!(latch.read().held, "the latch follows the hand all the same");
+    focus.set(true);
+    batch(&mut set, 40, &[]);
+    assert_eq!(
+        drain(&mut rx),
+        [
+            (
+                40,
+                TapEvent::Resync {
+                    held: (1 << START) | (1 << SELECT),
+                    verified: true
+                }
+            ),
+            (40, TapEvent::Tick),
+        ]
+    );
+}
+
+#[test]
+fn a_loss_counted_between_two_samples_is_a_recovery() {
+    let (mut set, mut rx, _) = rig(false);
+    let focus = PresentationFocus::new();
+    set.set_presentation_focus(focus.clone());
+    batch(&mut set, 10, &[packet(1, Q, 1)]);
+    drain(&mut rx);
+    // Away and back between two batches: both samples see focus.
+    focus.set(false);
+    focus.set(true);
+    batch(&mut set, 20, &[]);
+    assert_eq!(
+        drain(&mut rx),
+        [
+            (20, TapEvent::Lost),
+            (
+                20,
+                TapEvent::Resync {
+                    held: 1 << START,
+                    verified: true
+                }
+            ),
+            (20, TapEvent::Tick),
+        ]
+    );
+}
+
+#[test]
+fn background_input_is_a_loss_answered_by_a_resynchronization() {
+    let (mut set, mut rx, _) = rig(false);
     batch(&mut set, 10, &[]);
     drain(&mut rx);
     let away = Packet {
@@ -283,17 +424,18 @@ fn input_while_focus_is_away_is_answered_by_a_resynchronization() {
         ..packet(1, Q, 1)
     };
     batch(&mut set, 20, &[away]);
-    batch(&mut set, 30, &[packet(1, W, 1)]);
-    assert_eq!(drain(&mut rx), [], "nothing while the gate is tripped");
-    assert!(latch.read().held, "the latch follows the hand all the same");
-    set.gate_mut().reset();
-    batch(&mut set, 40, &[]);
     assert_eq!(
         drain(&mut rx),
         [
-            (40, TapEvent::Lost),
-            (40, TapEvent::Resync((1 << START) | (1 << SELECT))),
-            (40, TapEvent::Tick),
+            (20, TapEvent::Lost),
+            (
+                20,
+                TapEvent::Resync {
+                    held: 1 << START,
+                    verified: true
+                }
+            ),
+            (20, TapEvent::Tick),
         ]
     );
 }
@@ -309,7 +451,16 @@ fn an_inactive_tap_counts_holders_and_sends_them_on_activation() {
     batch(&mut set, 20, &[]);
     assert_eq!(
         drain(&mut rx),
-        [(20, TapEvent::Resync(1 << START)), (20, TapEvent::Tick)],
+        [
+            (
+                20,
+                TapEvent::Resync {
+                    held: 1 << START,
+                    verified: true
+                }
+            ),
+            (20, TapEvent::Tick)
+        ],
         "one tick per batch time"
     );
 }
@@ -322,7 +473,13 @@ fn only_devices_whose_input_the_play_may_record_reach_the_tap() {
     batch(&mut set, 20, &[packet(3, TURN, 5)]);
     assert_eq!(
         drain(&mut rx),
-        [(10, TapEvent::Resync(0))],
+        [(
+            10,
+            TapEvent::Resync {
+                held: 0,
+                verified: true
+            }
+        )],
         "a controller that takes no part"
     );
     set.open_recording(TimeUs(25));
@@ -344,7 +501,16 @@ fn only_devices_whose_input_the_play_may_record_reach_the_tap() {
     batch(&mut set, 40, &[]);
     assert_eq!(
         drain(&mut rx),
-        [(40, TapEvent::Resync(1 << START)), (40, TapEvent::Tick)]
+        [
+            (
+                40,
+                TapEvent::Resync {
+                    held: 1 << START,
+                    verified: true
+                }
+            ),
+            (40, TapEvent::Tick)
+        ]
     );
 }
 
@@ -366,6 +532,7 @@ fn while_recording_is_closed_only_the_devices_that_would_be_sources_reach_the_ta
         controls: vec![(TapControl::Key(Q), START)],
         latched: 1 << START,
         wrap: None,
+        ..AdjustmentBindings::default()
     })
     .unwrap();
     let latch = tap.latch();
@@ -390,10 +557,34 @@ fn while_recording_is_closed_only_the_devices_that_would_be_sources_reach_the_ta
     assert_eq!(
         drain(&mut rx),
         [
-            (10, TapEvent::Resync(0)),
-            (20, TapEvent::Resync(0)),
-            (30, TapEvent::Resync(0)),
-            (40, TapEvent::Resync(1 << START)),
+            (
+                10,
+                TapEvent::Resync {
+                    held: 0,
+                    verified: true
+                }
+            ),
+            (
+                20,
+                TapEvent::Resync {
+                    held: 0,
+                    verified: true
+                }
+            ),
+            (
+                30,
+                TapEvent::Resync {
+                    held: 0,
+                    verified: true
+                }
+            ),
+            (
+                40,
+                TapEvent::Resync {
+                    held: 1 << START,
+                    verified: true
+                }
+            ),
             (40, TapEvent::Tick),
         ]
     );
@@ -415,13 +606,31 @@ fn a_change_of_the_devices_reaching_the_tap_is_a_new_baseline_with_the_same_held
     assert_eq!(
         drain(&mut rx),
         [
-            (10, TapEvent::Resync(0)),
+            (
+                10,
+                TapEvent::Resync {
+                    held: 0,
+                    verified: true
+                }
+            ),
             (10, TapEvent::Press(START)),
             (10, TapEvent::Tick),
             (20, TapEvent::Tick),
-            (30, TapEvent::Resync(1 << START)),
+            (
+                30,
+                TapEvent::Resync {
+                    held: 1 << START,
+                    verified: true
+                }
+            ),
             (30, TapEvent::Tick),
-            (40, TapEvent::Resync(1 << START)),
+            (
+                40,
+                TapEvent::Resync {
+                    held: 1 << START,
+                    verified: true
+                }
+            ),
             (40, TapEvent::Tick),
         ]
     );
@@ -439,8 +648,20 @@ fn a_baseline_for_a_device_change_precedes_the_rest_of_its_batch() {
     assert_eq!(
         drain(&mut rx),
         [
-            (10, TapEvent::Resync(0)),
-            (20, TapEvent::Resync(0)),
+            (
+                10,
+                TapEvent::Resync {
+                    held: 0,
+                    verified: true
+                }
+            ),
+            (
+                20,
+                TapEvent::Resync {
+                    held: 0,
+                    verified: true
+                }
+            ),
             (20, TapEvent::Press(START)),
             (20, TapEvent::Release(START)),
         ]
@@ -454,7 +675,13 @@ fn a_baseline_sent_on_activation_precedes_the_batch_it_starts() {
     assert_eq!(
         drain(&mut rx),
         [
-            (10, TapEvent::Resync(0)),
+            (
+                10,
+                TapEvent::Resync {
+                    held: 0,
+                    verified: true
+                }
+            ),
             (10, TapEvent::Press(START)),
             (10, TapEvent::Release(START)),
         ]
@@ -471,7 +698,13 @@ fn the_last_requests_are_closed_by_one_later_tick_once_nothing_is_held() {
     assert_eq!(
         drain(&mut rx),
         [
-            (10, TapEvent::Resync(0)),
+            (
+                10,
+                TapEvent::Resync {
+                    held: 0,
+                    verified: true
+                }
+            ),
             (20, TapEvent::Press(START)),
             (20, TapEvent::Release(START)),
             (30, TapEvent::Tick),
@@ -488,7 +721,8 @@ fn the_last_requests_are_closed_by_one_later_tick_once_nothing_is_held() {
                 60,
                 TapEvent::Axis {
                     control: AXIS,
-                    delta: 2
+                    delta: 2,
+                    revolution: 256
                 }
             ),
             (70, TapEvent::Tick),
@@ -512,6 +746,7 @@ fn an_axis_set_absolute_moves_the_short_way_round_its_configured_revolution() {
         )],
         latched: 0,
         wrap: Some(256),
+        ..AdjustmentBindings::default()
     })
     .unwrap();
     tap.set_active(true);
@@ -521,12 +756,19 @@ fn an_axis_set_absolute_moves_the_short_way_round_its_configured_revolution() {
     assert_eq!(
         drain(&mut rx),
         [
-            (10, TapEvent::Resync(0)),
+            (
+                10,
+                TapEvent::Resync {
+                    held: 0,
+                    verified: true
+                }
+            ),
             (
                 20,
                 TapEvent::Axis {
                     control: AXIS,
-                    delta: 11
+                    delta: 11,
+                    revolution: 256
                 }
             ),
         ]

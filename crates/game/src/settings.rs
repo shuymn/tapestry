@@ -18,11 +18,13 @@ use input::hid::{AxisCap, HidProduct, is_axis, wrap_range};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
+use crate::adjust_keys::{AdjustKeyError, AdjustmentKeys};
 use crate::error::IoFailure;
+use crate::hispeed::{Cover, Covers, HiSpeedSettings, PlayOptions, PlayOptionsError};
 use crate::presets::UnknownPreset;
 use crate::queue::{DEFAULT_QUEUED_PERIODS, QUEUED_PERIODS};
 use crate::save::write_atomic;
-use crate::tuning::{Adjust, DEFAULT_VISIBLE_TIME_MS, OFFSET_LIMIT_US, VISIBLE_TIME_MS};
+use crate::tuning::{Adjust, OFFSET_LIMIT_US, SPEED_KEYS};
 
 /// The directory holding every settings file, the presets and the records.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -81,6 +83,18 @@ pub enum SettingsError {
     /// `player.toml` reads, but a value cannot be used.
     #[error("the settings cannot be used: player.toml")]
     InvalidPlayer(#[source] PlayerSettingsError),
+    /// `device.toml` is not of [`DEVICE_SETTINGS_VERSION`]: `found` is its
+    /// `version`, `None` when it has none. Nothing is converted.
+    #[error(
+        "device.toml has version {}; this tapestry reads only version {DEVICE_SETTINGS_VERSION} \
+         (START/SELECT bindings). Move device.toml aside; tapestry then starts from defaults, \
+         and `tapestry keys` writes a new one.",
+        found.map_or_else(|| "none".to_owned(), |v| v.to_string())
+    )]
+    DeviceVersion {
+        /// The file's `version`, if it has one.
+        found: Option<i64>,
+    },
 }
 
 impl From<io::Error> for SettingsError {
@@ -126,18 +140,34 @@ pub enum DeviceSettingsError {
         end = QUEUED_PERIODS.end()
     )]
     QueuedPeriods(u32),
+    /// `[scratch] adjust_counts_per_step` of 0: a step needs movement.
+    #[error("[scratch] adjust_counts_per_step 0 is not positive")]
+    AdjustCountsPerStep,
 }
 
-/// Why [`PlayerSettings::validate`] refused a value.
+/// Why `player.toml` was refused: [`PlayerSettings::validate`], or a
+/// `visible_time_ms` found by [`load_settings`].
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum PlayerSettingsError {
-    /// A visible time outside [`VISIBLE_TIME_MS`].
+    /// The file sets `visible_time_ms`, which no longer sets hi-speed.
     #[error(
-        "visible_time_ms {0} is outside {start} to {end}",
-        start = VISIBLE_TIME_MS.start(),
-        end = VISIBLE_TIME_MS.end()
+        "visible_time_ms is no longer read; hi-speed is set by [hispeed] green_target \
+         (Floating) or classic_hispeed_x100 (Classic); remove the line"
     )]
-    VisibleTime(u32),
+    VisibleTimeRemoved,
+    /// A play option outside its range ([`PlayOptions::new`]), by its
+    /// table and key.
+    #[error("[{section}] {setting} {value} is outside {expected}")]
+    PlayOption {
+        /// The table: `hispeed` or `covers`.
+        section: &'static str,
+        /// The key.
+        setting: &'static str,
+        /// The value refused.
+        value: u32,
+        /// What the key takes.
+        expected: &'static str,
+    },
     /// A preset value that can name neither a built-in nor a user preset.
     #[error(transparent)]
     Preset(UnknownPreset),
@@ -155,8 +185,10 @@ pub struct LaneKey {
     pub lane: u8,
 }
 
-/// One kind of device's key config: lanes and system controls.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// One kind of device's key config: lanes, system controls and the play
+/// adjustments' roles (design.md "Play Adjustments", bindings). The
+/// default binds nothing.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct KeyConfig {
     /// The lane bindings.
@@ -165,6 +197,19 @@ pub struct KeyConfig {
     pub retry: Option<u32>,
     /// The control that quits, if bound.
     pub quit: Option<u32>,
+    /// START, if bound: a keyboard key or a controller's button.
+    pub start: Option<u32>,
+    /// SELECT, if bound, likewise.
+    pub select: Option<u32>,
+    /// The auxiliary negative key, if bound, likewise.
+    pub aux_negative: Option<u32>,
+    /// The auxiliary positive key, if bound, likewise.
+    pub aux_positive: Option<u32>,
+    /// The scratch's positive digital direction: one of the scratch lane's
+    /// own buttons or keys.
+    pub scratch_positive: Option<u32>,
+    /// The scratch's negative digital direction, likewise.
+    pub scratch_negative: Option<u32>,
 }
 
 /// What a control is bound to in a key config.
@@ -176,6 +221,27 @@ pub enum Role {
     Retry,
     /// Quit.
     Quit,
+    /// START.
+    Start,
+    /// SELECT.
+    Select,
+    /// The auxiliary negative key.
+    AuxNegative,
+    /// The auxiliary positive key.
+    AuxPositive,
+    /// The scratch's positive digital direction.
+    ScratchPositive,
+    /// The scratch's negative digital direction.
+    ScratchNegative,
+}
+
+impl Role {
+    /// Whether it is a play adjustments' role rather than a lane, retry or
+    /// quit.
+    #[must_use]
+    pub const fn is_adjustment(self) -> bool {
+        !matches!(self, Self::Lane(_) | Self::Retry | Self::Quit)
+    }
 }
 
 impl fmt::Display for Role {
@@ -185,6 +251,12 @@ impl fmt::Display for Role {
             Self::Lane(n) => write!(f, "key {n}"),
             Self::Retry => f.write_str("retry"),
             Self::Quit => f.write_str("quit"),
+            Self::Start => f.write_str("START"),
+            Self::Select => f.write_str("SELECT"),
+            Self::AuxNegative => f.write_str("the auxiliary negative key"),
+            Self::AuxPositive => f.write_str("the auxiliary positive key"),
+            Self::ScratchPositive => f.write_str("the scratch's positive direction"),
+            Self::ScratchNegative => f.write_str("the scratch's negative direction"),
         }
     }
 }
@@ -217,6 +289,10 @@ pub enum KeyError {
     /// reads them from the window's keyboard messages only.
     #[error("{0} takes keyboard keys only")]
     NotAKeyboardKey(Role),
+    /// A play adjustments' binding that cannot be used
+    /// ([`AdjustmentKeys::check`]).
+    #[error(transparent)]
+    Adjustment(AdjustKeyError),
 }
 
 /// F9: shows and hides the measurement overlay during play (design.md "Latency
@@ -245,30 +321,48 @@ pub fn reserved_key(code: u32) -> Option<&'static str> {
     if code == OVERLAY_KEY {
         return Some("the measurement overlay");
     }
+    if SPEED_KEYS.contains(&code) {
+        return Some("hi-speed");
+    }
     Adjust::from_key(code).map(Adjust::name)
 }
 
 impl KeyConfig {
-    /// Every binding with its role: the lanes, then retry and quit.
+    /// Every binding with its role: the lanes, retry and quit, then the
+    /// play adjustments' roles, the scratch's directions last.
     pub fn roles(&self) -> impl Iterator<Item = (u32, Role)> + '_ {
+        let adjustments = [
+            (self.start, Role::Start),
+            (self.select, Role::Select),
+            (self.aux_negative, Role::AuxNegative),
+            (self.aux_positive, Role::AuxPositive),
+            (self.scratch_positive, Role::ScratchPositive),
+            (self.scratch_negative, Role::ScratchNegative),
+        ];
         self.lanes
             .iter()
             .map(|k| (k.control, Role::Lane(k.lane)))
             .chain(self.retry.map(|c| (c, Role::Retry)))
             .chain(self.quit.map(|c| (c, Role::Quit)))
+            .chain(
+                adjustments
+                    .into_iter()
+                    .filter_map(|(c, r)| c.map(|c| (c, r))),
+            )
     }
 
     /// Checks the key config of a kind of device: every lane exists, no
     /// control has two roles (keyboard keys by
     /// [`key_identity`](input::raw::key_identity)), a keyboard binds no reserved key, and only a
-    /// keyboard binds retry and quit.
+    /// keyboard binds retry and quit; then the play adjustments' roles
+    /// ([`AdjustmentKeys::check`]).
     ///
     /// # Errors
     ///
     /// The first binding that breaks a rule.
     pub fn check(&self, kind: DeviceKind) -> Result<(), KeyError> {
         let mut seen: Vec<(u32, Role)> = Vec::new();
-        for (control, role) in self.roles() {
+        for (control, role) in self.roles().filter(|(_, r)| !r.is_adjustment()) {
             // Keyboard keys are compared as the window tells them apart,
             // so two names of one key are one key.
             let key = match kind {
@@ -300,7 +394,9 @@ impl KeyConfig {
             }
             seen.push((key, role));
         }
-        Ok(())
+        AdjustmentKeys::of(self)
+            .check(kind)
+            .map_err(KeyError::Adjustment)
     }
 
     /// The generated keyboard's key config in an autoplay session
@@ -315,10 +411,15 @@ impl KeyConfig {
         }
     }
 
-    /// Every recorded control: the lanes and the system controls.
+    /// Every recorded control: the lanes, the system controls, START,
+    /// SELECT and the auxiliary keys (design.md "Input", roles of
+    /// controls). The scratch's directions are its lane controls already.
     #[must_use]
     pub fn recorded(&self) -> Vec<ControlId> {
-        self.roles().map(|(c, _)| ControlId(c)).collect()
+        self.roles()
+            .filter(|(_, r)| !matches!(r, Role::ScratchPositive | Role::ScratchNegative))
+            .map(|(c, _)| ControlId(c))
+            .collect()
     }
 
     /// The lane bindings the evaluator reads; an entry with a lane the
@@ -373,8 +474,9 @@ const fn axis_of(kind: DeviceKind, control: u32) -> bool {
 /// revolution has come from the device's declaration unless set here; the
 /// thresholds and release time default to [`ScratchSettings::DEFAULT`],
 /// starting points tuned by playing. The resolved settings are what the
-/// input log records; [`menu_reversed`](Self::menu_reversed) is not among
-/// them, since it never reaches play.
+/// input log records; [`menu_reversed`](Self::menu_reversed) and the
+/// adjustment settings are not among them, since they never reach
+/// judgment.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct ScratchConfig {
@@ -395,6 +497,14 @@ pub struct ScratchConfig {
     /// rather than higher ones (design.md "Menu input"). Menus only: play
     /// and the input log never see it.
     pub menu_reversed: bool,
+    /// Whether the axis adjusts (design.md "Play Adjustments") the other
+    /// way from its movement: turned toward lower values, it raises
+    /// SUDDEN+ and speeds up.
+    pub adjust_reversed: bool,
+    /// For an axis that does not wrap, or is relative, the movement that
+    /// makes one adjustment step; positive. Absent, such an axis does not
+    /// adjust.
+    pub adjust_counts_per_step: Option<u32>,
 }
 
 impl Default for ScratchConfig {
@@ -407,6 +517,8 @@ impl Default for ScratchConfig {
             hold_threshold: d.hold_threshold,
             release_after_us: d.release_after_us,
             menu_reversed: false,
+            adjust_reversed: false,
+            adjust_counts_per_step: None,
         }
     }
 }
@@ -491,10 +603,16 @@ impl From<ControllerDevice> for HidProduct {
     }
 }
 
+/// The `version` a `device.toml` carries; [`load_settings`] refuses any
+/// other, and a file without one.
+pub const DEVICE_SETTINGS_VERSION: u32 = 2;
+
 /// `device.toml`: what belongs to this PC and its devices.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct DeviceSettings {
+    /// The file's layout, [`DEVICE_SETTINGS_VERSION`].
+    pub version: u32,
     /// The key config shared by every keyboard.
     pub keyboard: KeyConfig,
     /// The controller key config: its buttons and axes by HID usage
@@ -543,6 +661,7 @@ impl Default for DeviceSettings {
         // Scan codes: left shift for the scratch, then Z S X D C F V.
         let codes = [0x2a, 0x2c, 0x1f, 0x2d, 0x20, 0x2e, 0x21, 0x2f];
         Self {
+            version: DEVICE_SETTINGS_VERSION,
             keyboard: KeyConfig {
                 lanes: (0..)
                     .zip(codes)
@@ -551,12 +670,18 @@ impl Default for DeviceSettings {
                 // Backspace retries and Escape quits.
                 retry: Some(0x0e),
                 quit: Some(0x01),
+                // START on Q, SELECT on W, the auxiliary keys on Up and
+                // Down, and the scratch key as the scratch's positive
+                // direction.
+                start: Some(0x10),
+                select: Some(0x11),
+                aux_negative: Some(0xE048),
+                aux_positive: Some(0xE050),
+                scratch_positive: Some(0x2a),
+                scratch_negative: None,
             },
-            controller: KeyConfig {
-                lanes: Vec::new(),
-                retry: None,
-                quit: None,
-            },
+            // Nothing until key config captures it.
+            controller: KeyConfig::default(),
             controller_device: None,
             input_offset_us: 0,
             audio_offset_us: 0,
@@ -582,11 +707,12 @@ impl DeviceSettings {
     }
 
     /// Checks what [`Settings::load`] cannot leave to the types: both key
-    /// configs ([`KeyConfig::check`]), a controller key config binding a
-    /// lane only with its [`controller_device`](Self::controller_device),
-    /// the input and display offsets within ±[`OFFSET_LIMIT_US`], the
-    /// master volume from 0.0 to 1.0, and the queued periods within
-    /// [`QUEUED_PERIODS`].
+    /// configs ([`KeyConfig::check`], the play adjustments' roles
+    /// included), a controller key config binding anything only with its
+    /// [`controller_device`](Self::controller_device), the input and
+    /// display offsets within ±[`OFFSET_LIMIT_US`], the master volume from
+    /// 0.0 to 1.0, the queued periods within [`QUEUED_PERIODS`], and a
+    /// positive `[scratch] adjust_counts_per_step`.
     ///
     /// # Errors
     ///
@@ -598,7 +724,7 @@ impl DeviceSettings {
         self.controller
             .check(DeviceKind::Controller)
             .map_err(DeviceSettingsError::ControllerKeys)?;
-        if !self.controller.lanes.is_empty() && self.controller_device.is_none() {
+        if self.controller.roles().next().is_some() && self.controller_device.is_none() {
             return Err(DeviceSettingsError::ControllerUnnamed);
         }
         for (name, value) in [
@@ -616,6 +742,9 @@ impl DeviceSettings {
         }
         if !QUEUED_PERIODS.contains(&self.queued_periods) {
             return Err(DeviceSettingsError::QueuedPeriods(self.queued_periods));
+        }
+        if self.scratch.adjust_counts_per_step == Some(0) {
+            return Err(DeviceSettingsError::AdjustCountsPerStep);
         }
         Ok(())
     }
@@ -654,30 +783,113 @@ impl DeviceSettings {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct PlayerSettings {
-    /// Hi-speed as the visible time, ms: how long a note takes from the top of
-    /// the lane to the judgment line at the chart's start BPM (design.md
-    /// "Algorithms").
-    pub visible_time_ms: u32,
     /// The preset plays use, by name: a built-in's, or a user preset's in
     /// `presets/` (design.md "Standard Presets", "User Presets");
     /// `beatoraja-style` by default.
     pub preset: String,
     /// The gauge shown, by its index in the preset.
     pub displayed_gauge: usize,
+    /// The speed settings, `[hispeed]` (design.md "Play Adjustments").
+    pub hispeed: HiSpeedSettings,
+    /// The lane covers, `[covers]`.
+    pub covers: CoverSettings,
 }
 
 impl Default for PlayerSettings {
     fn default() -> Self {
         Self {
-            visible_time_ms: DEFAULT_VISIBLE_TIME_MS,
             preset: "beatoraja-style".to_owned(),
             displayed_gauge: 0,
+            hispeed: HiSpeedSettings::default(),
+            covers: CoverSettings::default(),
+        }
+    }
+}
+
+/// `[covers]` of `player.toml`: each lane cover's amount, ‰, and its
+/// switch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct CoverSettings {
+    /// SUDDEN+'s amount.
+    pub sudden: u16,
+    /// Whether SUDDEN+ is on.
+    pub sudden_on: bool,
+    /// LIFT's amount.
+    pub lift: u16,
+    /// Whether LIFT is on.
+    pub lift_on: bool,
+    /// HIDDEN+'s amount.
+    pub hidden: u16,
+    /// Whether HIDDEN+ is on.
+    pub hidden_on: bool,
+}
+
+impl Default for CoverSettings {
+    fn default() -> Self {
+        Self::from(Covers::default())
+    }
+}
+
+impl From<Covers> for CoverSettings {
+    fn from(c: Covers) -> Self {
+        Self {
+            sudden: c.sudden.amount,
+            sudden_on: c.sudden.on,
+            lift: c.lift.amount,
+            lift_on: c.lift.on,
+            hidden: c.hidden.amount,
+            hidden_on: c.hidden.on,
+        }
+    }
+}
+
+impl From<CoverSettings> for Covers {
+    fn from(c: CoverSettings) -> Self {
+        let cover = |amount, on| Cover { amount, on };
+        Self {
+            sudden: cover(c.sudden, c.sudden_on),
+            lift: cover(c.lift, c.lift_on),
+            hidden: cover(c.hidden, c.hidden_on),
         }
     }
 }
 
 impl PlayerSettings {
-    /// Checks the visible time is within [`VISIBLE_TIME_MS`], and that the
+    /// The play options `[hispeed]` and `[covers]` set, validated
+    /// ([`PlayOptions::new`]); settings [`Settings::load`] gave always have
+    /// them.
+    ///
+    /// # Errors
+    ///
+    /// [`PlayerSettingsError::PlayOption`]: the first value outside its
+    /// range, by table and key.
+    pub fn options(&self) -> Result<PlayOptions, PlayerSettingsError> {
+        PlayOptions::new(self.hispeed, self.covers.into()).map_err(|e| match e {
+            PlayOptionsError::Invalid {
+                setting,
+                value,
+                expected,
+            } => PlayerSettingsError::PlayOption {
+                section: if matches!(setting, "sudden" | "lift" | "hidden") {
+                    "covers"
+                } else {
+                    "hispeed"
+                },
+                setting,
+                value,
+                expected,
+            },
+        })
+    }
+
+    /// Stores `options` as `[hispeed]` and `[covers]`, to be written.
+    pub fn set_options(&mut self, options: &PlayOptions) {
+        self.hispeed = options.hispeed();
+        self.covers = options.covers().into();
+    }
+
+    /// Checks the play options ([`options`](Self::options)), and that the
     /// preset is a built-in's name or one a user preset can take. Whether
     /// that user preset exists is checked when it is loaded ([`Shelf`]).
     ///
@@ -687,9 +899,7 @@ impl PlayerSettings {
     ///
     /// [`Shelf`]: crate::presets::Shelf
     pub fn validate(&self) -> Result<(), PlayerSettingsError> {
-        if !VISIBLE_TIME_MS.contains(&self.visible_time_ms) {
-            return Err(PlayerSettingsError::VisibleTime(self.visible_time_ms));
-        }
+        self.options()?;
         if !rules::BUILT_IN_PRESETS.contains(&self.preset.as_str())
             && rules_toml::check_user_preset_name(&self.preset).is_err()
         {
@@ -701,16 +911,66 @@ impl PlayerSettings {
     }
 }
 
+/// A settings file's type: what [`load_settings`] reads, and what it
+/// refuses before reading it as the type.
+pub trait SettingsFile: DeserializeOwned + Default {
+    /// Refuses a file of a layout this version does not read, from its
+    /// TOML table; nothing is converted.
+    ///
+    /// # Errors
+    ///
+    /// The refusal.
+    fn refuse(table: &toml::Table) -> Result<(), SettingsError>;
+}
+
+impl SettingsFile for DeviceSettings {
+    /// Refuses a file without `version = 2` ([`DEVICE_SETTINGS_VERSION`]):
+    /// [`SettingsError::DeviceVersion`]. A `version` that is not an integer
+    /// is left to the typed parse.
+    fn refuse(table: &toml::Table) -> Result<(), SettingsError> {
+        let found = match table.get("version") {
+            None => None,
+            Some(toml::Value::Integer(v)) => Some(*v),
+            Some(_) => return Ok(()),
+        };
+        if found == Some(i64::from(DEVICE_SETTINGS_VERSION)) {
+            Ok(())
+        } else {
+            Err(SettingsError::DeviceVersion { found })
+        }
+    }
+}
+
+impl SettingsFile for PlayerSettings {
+    /// Refuses a `visible_time_ms`:
+    /// [`PlayerSettingsError::VisibleTimeRemoved`].
+    fn refuse(table: &toml::Table) -> Result<(), SettingsError> {
+        if table.contains_key("visible_time_ms") {
+            return Err(SettingsError::InvalidPlayer(
+                PlayerSettingsError::VisibleTimeRemoved,
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Reads a settings file; a file that does not exist gives the defaults.
+/// The text is read as a TOML table first, which
+/// [`SettingsFile::refuse`] checks, then as `T`.
 ///
 /// # Errors
 ///
-/// [`SettingsError::Io`] when the file exists but cannot be read, and
+/// [`SettingsError::Io`] when the file exists but cannot be read,
 /// [`SettingsError::Parse`] for text of another shape, including an
-/// unknown key.
-pub fn load_settings<T: DeserializeOwned + Default>(path: &Path) -> Result<T, SettingsError> {
+/// unknown key and a TOML float where an integer belongs, and what
+/// [`SettingsFile::refuse`] refuses.
+pub fn load_settings<T: SettingsFile>(path: &Path) -> Result<T, SettingsError> {
     match fs::read_to_string(path) {
-        Ok(text) => toml::from_str(&text).map_err(SettingsError::Parse),
+        Ok(text) => {
+            let table: toml::Table = toml::from_str(&text).map_err(SettingsError::Parse)?;
+            T::refuse(&table)?;
+            toml::from_str(&text).map_err(SettingsError::Parse)
+        }
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(T::default()),
         Err(e) => Err(e.into()),
     }

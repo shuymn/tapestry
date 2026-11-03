@@ -10,7 +10,7 @@ use skin_beatoraja::{Header, ImportError, Imported, NoteKind, Rule, Syntax, Usag
 
 use crate::{
     RawSummary, SEEDED_BYTES, bms_load, draw, preset_canonical, raw_input, replay_body,
-    replay_file, seeded_readouts, seeds, skin_fnt, skin_json, skin_lua,
+    replay_file, seeded_readouts, seeds, skin_fnt, skin_json, skin_lua, skin_png,
 };
 
 /// Every seed in `expected` is generated, and no other: a deleted seed
@@ -35,6 +35,7 @@ fn replay_body_seeds_reach_sections_counts_and_successful_decodes() {
             "practice_round",
             "ready_history",
             "cancelled_capture",
+            "adjustment_controls",
             "section_past_end",
             "too_many_openings",
             "history_events_beyond_limit",
@@ -54,8 +55,13 @@ fn replay_body_seeds_reach_sections_counts_and_successful_decodes() {
     for (name, body) in seeds {
         let result = replay_body(&body).map(|_| ());
         match name {
-            "two_sources" | "no_events" | "extremes" | "practice_round" | "ready_history"
-            | "cancelled_capture" => {
+            "two_sources"
+            | "no_events"
+            | "extremes"
+            | "practice_round"
+            | "ready_history"
+            | "cancelled_capture"
+            | "adjustment_controls" => {
                 assert_eq!(result, Ok(()), "{name}");
             }
             "section_past_end" => assert!(
@@ -124,6 +130,7 @@ fn replay_file_seeds_decode_or_fail_at_the_envelope() {
             "practice_round",
             "ready_history",
             "cancelled_capture",
+            "adjustment_controls",
             "bad_magic",
             "unsupported_version",
             "older_version",
@@ -137,8 +144,13 @@ fn replay_file_seeds_decode_or_fail_at_the_envelope() {
     for (name, file) in seeds {
         let result = replay_file(&file).map(|_| ());
         let expected = match name {
-            "two_sources" | "no_events" | "extremes" | "practice_round" | "ready_history"
-            | "cancelled_capture" => Ok(()),
+            "two_sources"
+            | "no_events"
+            | "extremes"
+            | "practice_round"
+            | "ready_history"
+            | "cancelled_capture"
+            | "adjustment_controls" => Ok(()),
             "bad_magic" => Err(DecodeError::BadMagic),
             "unsupported_version" => Err(DecodeError::UnsupportedVersion(
                 replay::FORMAT_VERSION.wrapping_add(1),
@@ -866,12 +878,12 @@ fn skin_import_seeds_import_and_draw_as_built() {
             }
             "readouts" => {
                 use skin_beatoraja::{DeviationId, PropertyKind};
-                // Each readout number D4, and the adjustment condition
-                // twice; 15 is no value property, so `ref` 71 shows; 131
+                // Each readout number D4, and none for the adjustment
+                // condition, which reads the snapshot; 15 is no value property, so `ref` 71 shows; 131
                 // resolves to nothing; 92 is unsupported.
                 let mut k = kinds(&i);
                 k.sort_by_key(|n| format!("{n:?}"));
-                let mut want = vec![NoteKind::Deviation(DeviationId::D4); 18];
+                let mut want = vec![NoteKind::Deviation(DeviationId::D4); 16];
                 want.push(NoteKind::Ignored { field: "value" });
                 want.push(NoteKind::UnsupportedProperty {
                     kind: PropertyKind::Integer,
@@ -1161,6 +1173,58 @@ fn skin_lua_seeds_import_or_fail_as_built() {
                 }
             }
         }
+    }
+}
+
+#[test]
+fn skin_png_seeds_build_or_fail_as_built() {
+    use skin_model::{AtlasError, ImageError};
+    let seeds = seeds::skin_pngs();
+    let banded = [
+        "banded_grey1",
+        "banded_indexed8",
+        "banded_bad_text",
+        "cancelled_early",
+        "cancelled_late",
+    ];
+    assert_names(
+        &seeds,
+        &[
+            "grey8",
+            "grey16",
+            "grey_alpha8",
+            "rgb8",
+            "rgb16_trns",
+            "rgba8",
+            "rgba16",
+            "indexed8_trns",
+            "grey1_trns",
+            "bad_text",
+            banded[0],
+            banded[1],
+            banded[2],
+            banded[3],
+            banded[4],
+        ],
+    );
+    for (name, bytes) in seeds {
+        // `skin_png` checks every texel of its cells and the second build.
+        let o = skin_png(&bytes);
+        assert_eq!(o.banded, banded.contains(&name), "{name}");
+        let fails = name == "banded_bad_text";
+        assert_eq!(
+            o.built.is_err(),
+            fails,
+            "{name}: {:?}",
+            o.built.as_ref().err()
+        );
+        if fails {
+            assert!(
+                matches!(o.built, Err(AtlasError::Image(ImageError::Png { .. }))),
+                "{name}"
+            );
+        }
+        assert_eq!(o.cancelled, name.starts_with("cancelled"), "{name}");
     }
 }
 

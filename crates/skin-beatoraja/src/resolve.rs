@@ -276,15 +276,26 @@ impl Definition {
         self.store.take().unwrap_or_default()
     }
 
+    /// Whether the Lua candidate this definition belongs to was
+    /// cancelled.
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.cancel.as_ref().is_some_and(Cancel::is_cancelled)
+    }
+
     /// A cancellation of the Lua candidate this definition belongs to.
     pub(crate) fn cancelled(&self, at: impl FnOnce() -> Option<Loc>) -> Result<(), ImportError> {
-        if self.cancel.as_ref().is_some_and(Cancel::is_cancelled) {
-            return Err(ImportError::Lua {
-                at: at(),
-                why: LuaWhy::Cancelled,
-            });
+        if self.is_cancelled() {
+            return Err(Self::cancellation(at()));
         }
         Ok(())
+    }
+
+    /// The error a cancellation stops the import with, at `at`.
+    pub(crate) fn cancellation(at: Option<Loc>) -> ImportError {
+        ImportError::Lua {
+            at,
+            why: LuaWhy::Cancelled,
+        }
     }
 
     pub(crate) fn root(&self) -> &Root {

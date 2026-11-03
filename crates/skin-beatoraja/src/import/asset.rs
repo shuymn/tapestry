@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use skin_model::{
     AdmitError, BitmapFontError, Charge, FileDef, Filter, FntAdmitError, FntError, FntFileError,
     FntLimit, FontAdmitError, FontDef, FontError, ImageDef, ImageError, MAX_PATH_BYTES, Refused,
-    Root, Sheet, SheetBuilder, SolidImageDef,
+    Root, Sheet, SheetBuilder, SolidImageDef, TexelCap, Unbanded,
 };
 
 use super::Config;
@@ -134,6 +134,14 @@ pub(crate) fn join(dir: &str, name: &str) -> String {
     }
 }
 
+/// Why an asset request stopped the import: an aggregate limit, or a
+/// cancellation, which no cache keeps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Stop {
+    Limit(ImportLimit),
+    Cancelled,
+}
+
 /// Why a file was not admitted, for its users.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Failed {
@@ -151,7 +159,7 @@ pub(crate) enum Failed {
 type FileFailure = (bool, Option<ImageError>);
 
 /// Whether `e` refuses a file the source may still draw: its name or
-/// place, its size or dimensions past the caps, a header past the
+/// place, its size or dimensions past the caps, a header past a
 /// decoder's allocation cap, or a format only the source decodes.
 fn refused(e: &ImageError) -> bool {
     matches!(
@@ -159,7 +167,8 @@ fn refused(e: &ImageError) -> bool {
         ImageError::Decode {
             source: image::ImageError::Limits(_),
             ..
-        } | ImageError::PathRejected { .. }
+        } | ImageError::DecoderLimit { .. }
+            | ImageError::PathRejected { .. }
             | ImageError::PathEscapes { .. }
             | ImageError::FileTooLarge { .. }
             | ImageError::TotalBytesTooLarge { .. }
@@ -169,6 +178,28 @@ fn refused(e: &ImageError) -> bool {
             | ImageError::TooManyTexels { .. }
             | ImageError::TotalTooLarge { .. }
     )
+}
+
+/// The per-file cap `e` names, if any, for
+/// [`NoteKind::OverCap`](super::report::NoteKind::OverCap).
+fn cap(e: &ImageError) -> Option<&'static str> {
+    Some(match e {
+        ImageError::TooWide { .. } => "per-file side",
+        ImageError::TooManyTexels { cap, .. } => match cap {
+            TexelCap::Banded => "banded texel",
+            TexelCap::FullDecode(Unbanded::Format) => "full-decode texel",
+            TexelCap::FullDecode(Unbanded::Interlaced) => "interlaced texel",
+            TexelCap::FullDecode(Unbanded::Animated) => "animated texel",
+        },
+        ImageError::FileTooLarge { .. } => "per-file byte",
+        ImageError::HeaderTooLarge { .. } => "header byte",
+        ImageError::Decode {
+            source: image::ImageError::Limits(_),
+            ..
+        }
+        | ImageError::DecoderLimit { .. } => "decoder allocation",
+        _ => return None,
+    })
 }
 
 /// A font as a text element uses it.
@@ -346,6 +377,15 @@ impl Assets {
         }
     }
 
+    /// The per-file cap a failed file passed, while its error is kept.
+    pub(crate) fn failed_cap(&self, path: &str) -> Option<&'static str> {
+        let key = (path.to_owned(), None);
+        match self.files.get(&key) {
+            Some(Err((_, Some(e)))) => cap(e),
+            _ => None,
+        }
+    }
+
     pub(crate) fn file_dims(&self, file: u32) -> Option<[u32; 2]> {
         self.builder.file_dims(file)
     }
@@ -413,23 +453,28 @@ impl Assets {
     /// Admits `.fnt` file `name` and its pages once: a repeated request
     /// returns the first outcome. Each attempt, image and frame is charged
     /// to `budget` as the builder reaches it; the builder's own totals
-    /// bound the bytes, glyphs and kerning pairs.
+    /// bound the bytes, glyphs and kerning pairs. `cancel` is asked while
+    /// the pages are validated.
     ///
     /// # Errors
     ///
-    /// An aggregate limit.
+    /// An aggregate limit, or the cancellation, which is not kept as the
+    /// file's outcome.
     pub(crate) fn fnt_file(
         &mut self,
         budget: &mut Budget,
         name: &str,
-    ) -> Result<Result<u16, FntFailure>, ImportLimit> {
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<Result<u16, FntFailure>, Stop> {
         if let Some(&r) = self.fnt_files.get(name) {
             return Ok(r);
         }
         let files = self.builder.file_count();
-        let admitted = self
-            .builder
-            .admit_fnt(name, &mut |c| budget.fnt_charge(c).map_err(|_| Refused));
+        let admitted = self.builder.admit_fnt(
+            name,
+            &mut |c| budget.fnt_charge(c).map_err(|_| Refused),
+            cancel,
+        );
         let (glyphs, kernings) = self.builder.fnt_totals();
         budget.usage.glyphs = u32::try_from(glyphs).unwrap_or(u32::MAX);
         budget.usage.kernings = u32::try_from(kernings).unwrap_or(u32::MAX);
@@ -444,8 +489,9 @@ impl Assets {
                     .saturating_add(u32::try_from(pages).unwrap_or(u32::MAX));
                 Ok(i)
             }
+            Err(FntAdmitError::Cancelled) => return Err(Stop::Cancelled),
             Err(FntAdmitError::Limit(l)) => {
-                return Err(match l {
+                return Err(Stop::Limit(match l {
                     // The limit `Budget::fnt_charge` refuses each charge with.
                     FntLimit::Charge(c) => match c {
                         Charge::FileAttempt => ImportLimit::FileAttempts,
@@ -461,7 +507,7 @@ impl Assets {
                     FntLimit::Frames => ImportLimit::Frames,
                     FntLimit::Glyphs => ImportLimit::Glyphs,
                     FntLimit::Kernings => ImportLimit::Kernings,
-                });
+                }));
             }
             Err(FntAdmitError::File(FntFileError::Font(
                 FontError::PathRejected { .. }
@@ -572,8 +618,8 @@ mod tests {
         let mut budget = Budget::default();
         budget.usage.images = u32::try_from(skin_model::MAX_IMAGES - 1).unwrap();
         assert_eq!(
-            assets.fnt_file(&mut budget, "p.fnt"),
-            Err(ImportLimit::Images)
+            assets.fnt_file(&mut budget, "p.fnt", &|| false),
+            Err(Stop::Limit(ImportLimit::Images))
         );
         // The file and both pages were attempted; one page's image and
         // frame were charged.
@@ -584,10 +630,30 @@ mod tests {
         // With the allowance, the font is admitted once.
         let mut budget = Budget::default();
         let mut assets = Assets::new(&Root::new(dir.path()).unwrap());
-        assert_eq!(assets.fnt_file(&mut budget, "p.fnt"), Ok(Ok(0)));
-        assert_eq!(assets.fnt_file(&mut budget, "p.fnt"), Ok(Ok(0)));
+        assert_eq!(assets.fnt_file(&mut budget, "p.fnt", &|| false), Ok(Ok(0)));
+        assert_eq!(assets.fnt_file(&mut budget, "p.fnt", &|| false), Ok(Ok(0)));
         assert_eq!((budget.usage.images, budget.usage.file_attempts), (2, 3));
         assert_eq!((budget.usage.fonts, budget.usage.glyphs), (1, 2));
+    }
+
+    #[test]
+    fn a_cancel_while_pages_are_validated_stops_and_is_not_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let one = "info face=\"t\" size=8 padding=0,0,0,0\n\
+                   common lineHeight=8 base=6 scaleW=4 scaleH=4 pages=1\n\
+                   page id=0 file=\"a.png\"\n\
+                   char id=65 x=0 y=0 width=1 height=1 xoffset=0 yoffset=0 xadvance=1 page=0\n";
+        std::fs::write(dir.path().join("p.fnt"), one).unwrap();
+        png(dir.path(), "a.png", 4, 4);
+        let mut assets = Assets::new(&Root::new(dir.path()).unwrap());
+        let mut budget = Budget::default();
+        // Cancelled as its page is read: the import stops, and the file's
+        // outcome is not cached as a failure.
+        assert_eq!(
+            assets.fnt_file(&mut budget, "p.fnt", &|| true),
+            Err(Stop::Cancelled)
+        );
+        assert_eq!(assets.fnt_file(&mut budget, "p.fnt", &|| false), Ok(Ok(0)));
     }
 
     #[test]

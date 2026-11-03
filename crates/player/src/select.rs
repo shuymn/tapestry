@@ -791,6 +791,7 @@ mod tests {
             lanes,
             retry: None,
             quit: None,
+            ..KeyConfig::default()
         };
         let scratch = game::ScratchConfig {
             relative: Some(false),
@@ -839,6 +840,7 @@ mod tests {
             lanes: vec![lane(11, 1), lane(20, 0), lane(21, 0), lane(22, 0)],
             retry: None,
             quit: None,
+            ..KeyConfig::default()
         };
         let b = menu_bindings(&config, Some(product), &scratch).unwrap();
         assert_eq!(

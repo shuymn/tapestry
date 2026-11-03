@@ -1,112 +1,61 @@
 //! The start gate in a headless session (design.md "Play Lifecycle", the
 //! start gate): the scripted rig's input and audio sides of the
-//! generation-checked handshake, and the adjustment controls' reducer fed
+//! generation-checked handshake, and the adjustment controls' driver fed
 //! by the session's tap, so F1, F2, START and SELECT reach the reducer
-//! and its snapshot, never the visible-time ladder.
+//! and its snapshot through the same driver as the player's.
 //!
 //! The input side is the session's [`SourceSet`] with its adjustment tap:
 //! it opens a candidate only where START and SELECT are verifiably
-//! released and cancels the armed candidate as it accepts a hold. The
-//! audio side's engine holds the candidate's transport, and the pass whose
-//! block reaches the commit point (chart time 0, or a round's lead-in
-//! start), by its own wake, commits it by generation before anything of
-//! the schedule starts; a commit that finds the candidate cancelled
-//! stops its audio there, so its scheduled chart start and restore never
-//! run.
+//! released and cancels the armed candidate as it accepts a hold, marking
+//! both in the tap's stream, which the driver turns into the head's
+//! phases. The audio side's engine holds the candidate's transport, and
+//! the pass whose block reaches the commit point (chart time 0, or a
+//! round's lead-in start), by its own wake, commits it by generation
+//! before anything of the schedule starts; a commit that finds the
+//! candidate cancelled stops its audio there, so its scheduled chart start
+//! and restore never run.
+//!
+//! [`SourceSet`]: input::SourceSet
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
 use ::audio::AudioEngine;
 use bms_model::TimeUs;
-use input::{AdjustmentReceiver, AdjustmentTap, GateState, StartGate, TapError, adjustment_queue};
+use input::{GateState, SourceSet, StartGate};
 
-use crate::adjust_keys::AdjustmentPlan;
-use crate::adjustment::{
-    Adjustment, Event, Head, NoTempo, Observation, PresentationReader, PresentationWriter,
-    presentation_link,
-};
-use crate::hispeed::PlayOptions;
+use crate::driver::{AdjustDriver, InputPump};
+use crate::live::InputWaitError;
 
-/// The adjustment controls of a gated session: the tap's receiving end,
-/// the plan that turns its observations into the reducer's, the reducer
-/// and its publication.
-#[derive(Debug)]
-pub(crate) struct SessionAdjust {
-    receiver: AdjustmentReceiver,
-    plan: AdjustmentPlan,
-    reducer: Adjustment,
-    writer: PresentationWriter,
-    /// The latest observation's sequence, for the phases the rig adds.
-    seq: u64,
+/// The session's input side as the driver's waits need it: the input
+/// thread is the rig's own, so a fence is answered at once.
+pub(crate) struct SessionPump<'a> {
+    pub(crate) sources: &'a mut SourceSet,
+    /// The batch clock now: the script's time.
+    pub(crate) now: TimeUs,
+    pub(crate) display_offset_us: i64,
 }
 
-impl SessionAdjust {
-    /// The tap for `plan`, to install in the session's source set, and
-    /// the reducer with `options`, whose snapshots `reader` reads.
-    pub(crate) fn new(
-        plan: &AdjustmentPlan,
-        options: PlayOptions,
-        opens_at: TimeUs,
-        display_offset_us: i64,
-    ) -> Result<(Self, AdjustmentTap, PresentationReader), TapError> {
-        let (mut tap, receiver) = adjustment_queue(plan.bindings.clone())?;
-        tap.set_active(true);
-        let reducer = Adjustment::new(options, plan.roles, opens_at, display_offset_us);
-        let (writer, reader) = presentation_link(&reducer.snapshot());
-        Ok((
-            Self {
-                receiver,
-                plan: plan.clone(),
-                reducer,
-                writer,
-                seq: 0,
-            },
-            tap,
-            reader,
-        ))
+impl InputPump for SessionPump<'_> {
+    fn request_fence(&mut self, n: u64) {
+        let at = self.sources.presentation_time(self.now);
+        if let Some(tap) = self.sources.adjustment_mut() {
+            tap.fence(n, at);
+        }
     }
 
-    /// Feeds what the tap observed to the reducer and publishes one
-    /// snapshot.
-    fn drain(&mut self) {
-        let Self {
-            receiver,
-            plan,
-            reducer,
-            writer,
-            seq,
-        } = self;
-        let observations = std::iter::from_fn(|| receiver.pop()).filter_map(|o| {
-            *seq = o.seq;
-            plan.observation(&o)
-        });
-        reducer.drain(observations, &NoTempo, writer);
+    fn wake(&mut self) {
+        let at = self.sources.presentation_time(self.now);
+        self.sources.tick_presentation(at);
     }
 
-    /// The lifecycle's phase from receive time `at` on.
-    fn phase(&mut self, at: TimeUs, head: Head, generation: u32) {
-        let o = Observation {
-            time: at,
-            seq: self.seq,
-            event: Event::Phase { head, generation },
-        };
-        self.reducer.observe(o, &NoTempo);
+    fn display_offset_us(&self) -> i64 {
+        self.display_offset_us
     }
 
-    /// The settings with every accepted change.
-    pub(crate) const fn options(&self) -> PlayOptions {
-        self.reducer.options()
-    }
-
-    /// A new attempt ([`Adjustment::begin_attempt`]).
-    pub(crate) fn begin_attempt(
-        &mut self,
-        options: PlayOptions,
-        opens_at: TimeUs,
-        display_offset_us: i64,
-    ) {
-        self.reducer
-            .begin_attempt(options, opens_at, display_offset_us);
+    fn park(&mut self) -> Result<(), InputWaitError> {
+        // Nothing runs while the rig waits: what is not answered now never
+        // is.
+        Err(InputWaitError::Timeout)
     }
 }
 
@@ -117,25 +66,21 @@ pub(crate) struct ScriptedGate<'a> {
     gate: StartGate,
     /// Where the transport commits, in chart time.
     commit_at: TimeUs,
-    /// Where the attempt opens, in chart time: the frozen head's base.
-    opens_at: TimeUs,
     /// The armed candidate's generation, until the audio side commits
     /// or drops it.
     pending: Option<u32>,
-    adjust: &'a mut SessionAdjust,
+    pub(crate) adjust: &'a mut AdjustDriver,
 }
 
 impl<'a> ScriptedGate<'a> {
     pub(crate) const fn new(
         gate: StartGate,
         commit_at: TimeUs,
-        opens_at: TimeUs,
-        adjust: &'a mut SessionAdjust,
+        adjust: &'a mut AdjustDriver,
     ) -> Self {
         Self {
             gate,
             commit_at,
-            opens_at,
             pending: None,
             adjust,
         }
@@ -146,29 +91,18 @@ impl<'a> ScriptedGate<'a> {
         self.gate.state()
     }
 
-    /// Candidate `generation` opened at script time `at`, its chart time
-    /// 0 at `chart0` on the script's timeline.
-    pub(crate) fn opened(&mut self, generation: u32, at: TimeUs, chart0: TimeUs) {
+    /// Candidate `generation` opened: its transport waits for the commit.
+    /// The head follows it once the driver takes the tap's marker.
+    pub(crate) const fn opened(&mut self, generation: u32) {
         self.pending = Some(generation);
-        self.adjust.phase(
-            at,
-            Head::Clock {
-                at,
-                chart: TimeUs(at.0.saturating_sub(chart0.0)),
-            },
-            generation,
-        );
     }
 
-    /// Candidate `generation` was cancelled at script time `at`: nothing
-    /// of it is left to commit, and the presentation head freezes at the
-    /// attempt's `opens_at()` until the rearm.
-    pub(crate) fn cancelled(&mut self, generation: u32, at: TimeUs) {
+    /// Candidate `generation` was cancelled: nothing of it is left to
+    /// commit.
+    pub(crate) fn cancelled(&mut self, generation: u32) {
         if self.pending == Some(generation) {
             self.pending = None;
         }
-        let opens_at = self.opens_at;
-        self.adjust.phase(at, Head::Frozen { opens_at }, generation);
     }
 
     /// Cancels candidate `generation` unless its transport committed
@@ -200,8 +134,8 @@ impl<'a> ScriptedGate<'a> {
             .is_some_and(|generation| self.gate.commit(generation))
     }
 
-    /// The reducer's side, after the input side's batch.
-    pub(crate) fn drain(&mut self) {
-        self.adjust.drain();
+    /// The driver's side, after the input side's batch.
+    pub(crate) fn drain(&mut self, input: &mut SessionPump<'_>) {
+        self.adjust.pump(input);
     }
 }

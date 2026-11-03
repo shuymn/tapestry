@@ -1127,6 +1127,13 @@ impl Loaded {
         )
     }
 
+    /// The tempo provider of the coming attempt ([`AttemptTempo::prepare`]):
+    /// the chart as loaded, over its practice section if any.
+    #[must_use]
+    pub fn attempt_tempo(&self) -> crate::AttemptTempo {
+        crate::AttemptTempo::prepare(&self.chart, self.section())
+    }
+
     /// The play `start` was admitted: recording opened, the play was
     /// planned and its logic step built. Reports its start.
     pub fn admitted(&self, start: &PlayStart) {
@@ -1657,12 +1664,8 @@ impl<O: AudioOutput + Wakes> Session<O> {
         plan: &crate::AdjustmentPlan,
         options: crate::PlayOptions,
     ) -> Result<(), input::TapError> {
-        let (adjust, tap, reader) = crate::start_gate::SessionAdjust::new(
-            plan,
-            options,
-            self.loaded.opens_at(),
-            self.loaded.settings.device.display_offset_us,
-        )?;
+        let (adjust, tap, reader) =
+            crate::AdjustDriver::new(plan, options, self.loaded.settings.device.display_offset_us)?;
         let gate = tap.start_gate();
         self.sources.set_adjustment(tap);
         self.gate = Some(SessionGate {
@@ -1676,6 +1679,15 @@ impl<O: AudioOutput + Wakes> Session<O> {
     /// The adjustments' latest snapshot, with the start gate.
     pub fn presentation(&mut self) -> Option<&crate::adjustment::PresentationSnapshot> {
         self.gate.as_mut().map(|g| g.reader.read())
+    }
+
+    /// The adjustments' driver, with the start gate.
+    #[must_use]
+    pub const fn adjustments(&self) -> Option<&crate::AdjustDriver> {
+        match &self.gate {
+            Some(g) => Some(&g.adjust),
+            None => None,
+        }
     }
 
     /// The session's source set: its devices and the adjustment tap.
@@ -1707,19 +1719,9 @@ impl<O: AudioOutput + Wakes> Session<O> {
             .section()
             .map(|_| crate::Restorer::new(audio.engine().seek_source(), loaded.audio_schedule()));
         let commit_at = loaded.restore_at().unwrap_or(TimeUs(0));
+        let display_offset_us = loaded.settings.device.display_offset_us;
         let gate = gate.as_mut().map(|g| {
-            let options = g.adjust.options();
-            g.adjust.begin_attempt(
-                options,
-                loaded.opens_at(),
-                loaded.settings.device.display_offset_us,
-            );
-            crate::start_gate::ScriptedGate::new(
-                g.gate.clone(),
-                commit_at,
-                loaded.opens_at(),
-                &mut g.adjust,
-            )
+            crate::start_gate::ScriptedGate::new(g.gate.clone(), commit_at, &mut g.adjust)
         });
         let mut rig = SessionRig {
             step: loaded.config.step,
@@ -1738,6 +1740,7 @@ impl<O: AudioOutput + Wakes> Session<O> {
             restorer,
             restore: None,
             gate,
+            display_offset_us,
             close_at,
             closing: false,
         };
@@ -1765,7 +1768,7 @@ impl<O: AudioOutput + Wakes> Session<O> {
 #[derive(Debug)]
 struct SessionGate {
     gate: input::StartGate,
-    adjust: crate::start_gate::SessionAdjust,
+    adjust: crate::AdjustDriver,
     reader: crate::adjustment::PresentationReader,
 }
 
@@ -1819,6 +1822,8 @@ struct SessionRig<'s, O> {
     restore: Option<Box<crate::Restore>>,
     /// The start gate, in a gated session.
     gate: Option<crate::start_gate::ScriptedGate<'s>>,
+    /// The display offset the driver reads, µs.
+    display_offset_us: i64,
     /// When the window closes, on the script's timeline.
     close_at: Option<TimeUs>,
     closing: bool,
@@ -1933,7 +1938,14 @@ impl<O: AudioOutput + Wakes> Rig for SessionRig<'_, O> {
             self.closing |= self.close_at.is_some_and(|at| now >= at);
         }
         if let Some(g) = &mut self.gate {
-            g.drain();
+            let now = self
+                .script_origin
+                .map_or(global, |o| TimeUs(global.0 - o.0));
+            g.drain(&mut crate::start_gate::SessionPump {
+                sources: self.sources,
+                now,
+                display_offset_us: self.display_offset_us,
+            });
         }
         if !self.sealed {
             self.step_audio(global, false);
@@ -1993,6 +2005,8 @@ impl<O: AudioOutput + Wakes> Rig for SessionRig<'_, O> {
             .script_origin
             .get_or_insert(TimeUs(global.0 + lead_in.0));
         let now = TimeUs(global.0 - script_origin.0);
+        // The tap stamps on the session clock.
+        self.sources.set_presentation_offset(script_origin);
         self.script.input.poll(TimeUs(now.0 - 1), self.sources);
         self.sources.gate_mut().reset();
         let chart0 = TimeUs(now.0 + lead_in.0);
@@ -2005,7 +2019,7 @@ impl<O: AudioOutput + Wakes> Rig for SessionRig<'_, O> {
         };
         let origin = TimeUs(script_origin.0 + chart0.0);
         if let Some(g) = &mut self.gate {
-            g.opened(generation, now, chart0);
+            g.opened(generation);
         }
         Ok(Some(self.opening(origin, start)))
     }
@@ -2030,9 +2044,8 @@ impl<O: AudioOutput + Wakes> Rig for SessionRig<'_, O> {
 
     fn cancel_candidate(&mut self, generation: u32) {
         self.cancel_audio();
-        let now = self.play_time().unwrap_or(TimeUs(0));
         if let Some(g) = &mut self.gate {
-            g.cancelled(generation, now);
+            g.cancelled(generation);
         }
     }
 
@@ -2079,9 +2092,37 @@ impl<O: AudioOutput + Wakes> Rig for SessionRig<'_, O> {
         let origin = TimeUs(script_origin.0 + chart0.0);
         self.origin = Some(origin);
         if let Some(g) = &mut self.gate {
-            g.opened(generation, now, chart0);
+            g.opened(generation);
         }
         Ok(crate::live::Rearm::Opened { origin })
+    }
+
+    fn begin_presentation(
+        &mut self,
+        loaded: &Loaded,
+    ) -> Result<Option<crate::PreparationRefusal>, InputWaitError> {
+        let Some(g) = &mut self.gate else {
+            return Ok(None);
+        };
+        let global = self.clock.now();
+        let now = self
+            .script_origin
+            .map_or(global, |o| TimeUs(global.0 - o.0));
+        let mut pump = crate::start_gate::SessionPump {
+            sources: self.sources,
+            now,
+            display_offset_us: self.display_offset_us,
+        };
+        let refused = g.adjust.begin_presentation(loaded, &mut pump)?;
+        // A session prepares no screen: the attempt is prepared at once.
+        let _ = g.adjust.prepared();
+        Ok(refused)
+    }
+
+    fn end_presentation(&mut self) {
+        if let Some(g) = &mut self.gate {
+            g.adjust.invalidate();
+        }
     }
 
     fn restart_candidate(&mut self, origin: TimeUs, _generation: u32) {

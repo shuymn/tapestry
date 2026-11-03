@@ -411,8 +411,8 @@ fn cover_conditions_read_the_stored_switches() {
     };
 
     for (op, d4) in [
-        ("270", true),
-        (r#""lanecover1_changing""#, true),
+        ("270", false),
+        (r#""lanecover1_changing""#, false),
         ("271", false),
         (r#""!!lanecover1_on""#, false),
         ("272", false),

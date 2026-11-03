@@ -439,11 +439,13 @@ fn autoplay_keys_play_every_lane_whatever_device_toml_binds() {
         ],
         retry: None,
         quit: None,
+        ..KeyConfig::default()
     };
     let empty = KeyConfig {
         lanes: Vec::new(),
         retry: Some(0x0e),
         quit: Some(0x01),
+        ..KeyConfig::default()
     };
     // Q W E R T Y U I.
     let remapped = KeyConfig {
@@ -455,6 +457,7 @@ fn autoplay_keys_play_every_lane_whatever_device_toml_binds() {
             .collect(),
         retry: Some(0x0e),
         quit: Some(0x01),
+        ..KeyConfig::default()
     };
     for keyboard in [empty, remapped] {
         let (_dir, root) = temp_root();

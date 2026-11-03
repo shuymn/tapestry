@@ -39,6 +39,12 @@ pub struct Controls {
     /// A quit key press waiting to be taken, while it leaves the chart.
     leave: AtomicBool,
     focused: AtomicBool,
+    /// The window's focus as the adjustment tap reads it, with its losses
+    /// counted.
+    presentation: input::PresentationFocus,
+    /// F1 and F2 for the adjustment tap in an autoplay session, which no
+    /// keyboard reaches ([`set_window_keys`](Self::set_window_keys)).
+    window_keys: std::sync::Mutex<Option<input::WindowKeys>>,
     latch: OnceLock<FocusLatch>,
     /// Wakes the input thread on a focus change.
     input: OnceLock<Waker>,
@@ -48,6 +54,9 @@ pub struct Controls {
     tuning: Arc<LiveTuning>,
     /// Whether the measurement overlay shows (design.md "Latency Figures").
     overlay: Arc<AtomicBool>,
+    /// The scene epoch: a play starting or ending, or focus changing, moves
+    /// it, so a key held across it repeats no action.
+    scene: std::sync::atomic::AtomicU64,
 }
 
 impl Controls {
@@ -77,11 +86,14 @@ impl Controls {
             leaves: AtomicBool::new(false),
             leave: AtomicBool::new(false),
             focused: AtomicBool::new(true),
+            presentation: input::PresentationFocus::new(),
+            window_keys: std::sync::Mutex::new(None),
             latch: OnceLock::new(),
             input: OnceLock::new(),
             game: OnceLock::new(),
             tuning,
             overlay: Arc::new(AtomicBool::new(false)),
+            scene: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -222,7 +234,9 @@ impl Controls {
     /// (design.md "Input"). Then the input thread is woken, so an idle one
     /// sees the change, and the game thread.
     pub fn focus(&self, focused: bool) {
+        self.next_scene();
         self.focused.store(focused, Ordering::Release);
+        self.presentation.set(focused);
         if !focused && let Some(l) = self.latch.get() {
             l.latch();
         }
@@ -230,6 +244,52 @@ impl Controls {
             w.wake();
         }
         self.wake_game();
+    }
+
+    /// The scene changed (a play started or ended, focus changed): a held
+    /// settings key repeats no action until pressed afresh (the held-input
+    /// guard).
+    pub fn next_scene(&self) {
+        self.scene.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// The scene epoch now.
+    pub fn scene(&self) -> u64 {
+        self.scene.load(Ordering::Acquire)
+    }
+
+    /// The window's presentation focus, for the input thread's source set
+    /// ([`input::SourceSet::set_presentation_focus`]).
+    #[must_use]
+    pub const fn presentation_focus(&self) -> &input::PresentationFocus {
+        &self.presentation
+    }
+
+    /// From now on the window sends F1 and F2 to `keys`: an autoplay
+    /// session's speed keys.
+    pub fn set_window_keys(&self, keys: input::WindowKeys) {
+        *self
+            .window_keys
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(keys);
+    }
+
+    /// F1 (`key` 0) or F2 (1) had `event` on the window, `synthetic` when
+    /// the window system made it up for a focus change: sent to the
+    /// adjustment tap in an autoplay session, nothing otherwise. The input
+    /// thread is woken for it.
+    pub fn window_key(&self, key: u8, event: input::WindowKeyEvent, synthetic: bool) {
+        let mut keys = self
+            .window_keys
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(keys) = keys.as_mut() else {
+            return;
+        };
+        keys.key(key, event, synthetic);
+        if let Some(w) = self.input.get() {
+            w.wake();
+        }
     }
 
     /// Whether the window has focus.

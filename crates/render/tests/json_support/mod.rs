@@ -207,7 +207,7 @@ pub fn bundle_in(r: &Renderer, dir: &Path) -> Arc<SkinBundle> {
     let imported = import(dir);
     let skin = imported.skin;
     let variant = skin.variant([1_920, 1_080], &Layout::AUTHOR);
-    let atlas = skin.atlas(variant, r.atlas_limits()).unwrap();
+    let atlas = skin.atlas(variant, r.atlas_limits(), &|| false).unwrap();
     let scratch = imported.scratch.unwrap_or(Side::Left);
     Arc::new(SkinBundle::new(Arc::new(skin), atlas, ClipTable::default(), scratch).unwrap())
 }

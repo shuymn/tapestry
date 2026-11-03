@@ -7,7 +7,7 @@
 use bms_model::TimeUs;
 use eval::{ControlId, InputKind, InputStart, PhysicalInputEvent, SourceId};
 
-use crate::adjust::AdjustmentTap;
+use crate::adjust::{AdjustmentTap, PresentationFocus};
 use crate::gate::{Admit, DeviceId, FocusGate, Packet};
 use crate::hid::{AxisCap, HidProduct, MAX_AXES, is_axis};
 use crate::menu::MenuTap;
@@ -210,6 +210,14 @@ pub struct SourceSet {
     /// Where the adjustment controls go, recording open or not
     /// ([`set_adjustment`](Self::set_adjustment)).
     adjust: Option<AdjustmentTap>,
+    /// The window's presentation focus, sampled for the tap at each batch
+    /// and revalidated at an opening.
+    focus: PresentationFocus,
+    /// Added to the batch clock to give the presentation clock the tap
+    /// stamps on ([`set_presentation_offset`](Self::set_presentation_offset)).
+    presentation_offset: TimeUs,
+    /// A wake due besides the tap's ([`set_wake_at`](Self::set_wake_at)).
+    wake_at: Option<TimeUs>,
 }
 
 /// The mode `device.toml` sets for a controller model's bound axes.
@@ -251,6 +259,9 @@ impl SourceSet {
             menu: None,
             axis_mode: None,
             adjust: None,
+            focus: PresentationFocus::new(),
+            presentation_offset: TimeUs(0),
+            wake_at: None,
         })
     }
 
@@ -277,8 +288,12 @@ impl SourceSet {
         std::mem::swap(&mut fresh.gate, &mut self.gate);
         fresh.menu = self.menu.take();
         fresh.axis_mode = self.axis_mode.take();
+        fresh.focus = self.focus.clone();
+        fresh.presentation_offset = self.presentation_offset;
         if let Some(tap) = self.adjust.take() {
-            fresh.set_adjustment(tap);
+            // An ownership change: the tap sends a new baseline.
+            fresh.adjust = Some(tap);
+            fresh.recount_adjustment(true);
         }
         *self = fresh;
         Ok(())
@@ -301,8 +316,11 @@ impl SourceSet {
         self.batch_at = received;
         self.in_batch = true;
         let open = self.gate.check();
+        let (focused, losses) = self.focus.read();
+        let at = self.presentation_time(received);
         if let Some(tap) = &mut self.adjust {
-            tap.send_pending(received, open);
+            tap.set_focus(focused, losses);
+            tap.send_owed(at);
         }
         open
     }
@@ -315,12 +333,14 @@ impl SourceSet {
     /// here too, so a focus loss is seen even when no batch follows it;
     /// nothing is published once the gate has tripped, so the play ends at
     /// what was already finalized. The adjustment tap sends what it owes,
-    /// or a tick while a tapped control is held.
+    /// and a tick at the batch's time while a tapped control is held (as
+    /// [`tick_presentation`](Self::tick_presentation)).
     pub fn end_batch(&mut self, fresh: TimeUs) {
         self.in_batch = false;
         let open = self.gate.check();
+        let at = self.presentation_time(self.batch_at);
         if let Some(tap) = &mut self.adjust {
-            tap.end_batch(self.batch_at, open);
+            tap.tick(at);
         }
         if !open {
             return;
@@ -355,6 +375,7 @@ impl SourceSet {
         let admit = self.gate.admit(packet);
         self.offer_menu(packet);
         let max_held = self.config.max_held;
+        let at = self.presentation_time(self.batch_at);
         let Some(device) = self.devices.iter_mut().find(|d| d.id == packet.device) else {
             return admit;
         };
@@ -365,7 +386,9 @@ impl SourceSet {
             .as_ref()
             .filter(|_| reaches)
             .and_then(|t| t.number(device.kind, device.product, packet.control));
-        let foreground = admit == Admit::Record;
+        // Background input is a loss for the tap; whether focus is in is
+        // the presentation focus sampled for the batch.
+        let foreground = !packet.background;
         let axis = device
             .axes
             .iter()
@@ -389,12 +412,12 @@ impl SourceSet {
                 (prev.map_or(0, |p| value - i64::from(p)), Some(declared))
             };
             if let (Some(n), Some(tap)) = (tapped, &mut self.adjust) {
-                tap.axis(n, moved, wrap, self.batch_at, foreground);
+                tap.axis(n, moved, wrap, at, foreground);
             }
         } else {
             if let Some(was) = track(&mut device.held, max_held, packet.control, packet.value) {
                 if let (Some(n), Some(tap)) = (tapped, &mut self.adjust) {
-                    tap.button(n, was, packet.value != 0, self.batch_at, foreground);
+                    tap.button(n, was, packet.value != 0, at, foreground);
                 }
             } else {
                 // The state table is full; snapshots of this device may
@@ -479,16 +502,76 @@ impl SourceSet {
             reach,
             owners_changed,
         );
+        let at = self.presentation_time(self.batch_at);
         if self.in_batch
             && let Some(tap) = &mut self.adjust
         {
-            tap.send_pending(self.batch_at, !self.gate.is_tripped());
+            tap.send_owed(at);
         }
     }
 
     /// The adjustment tap, to set it active at each boundary.
     pub const fn adjustment_mut(&mut self) -> Option<&mut AdjustmentTap> {
         self.adjust.as_mut()
+    }
+
+    /// Reads the window's presentation focus from `focus` from now on
+    /// (focused until set).
+    pub fn set_presentation_focus(&mut self, focus: PresentationFocus) {
+        self.focus = focus;
+    }
+
+    /// Stamps the tap's observations and markers on the presentation clock
+    /// from now on: the batch clock plus `offset` (0 when the batch clock
+    /// is the process clock; a script's origin on it for a scripted one).
+    pub const fn set_presentation_offset(&mut self, offset: TimeUs) {
+        self.presentation_offset = offset;
+    }
+
+    /// The batch clock's time `at` on the presentation clock.
+    #[must_use]
+    pub const fn presentation_time(&self, at: TimeUs) -> TimeUs {
+        TimeUs(at.0.saturating_add(self.presentation_offset.0))
+    }
+
+    /// The input thread woke at `now` on the presentation clock, whether
+    /// or not a batch ran: the tap samples the focus, sends what it owes
+    /// and its due ticks ([`AdjustmentTap::tick`]).
+    pub fn tick_presentation(&mut self, now: TimeUs) {
+        let (focused, losses) = self.focus.read();
+        if let Some(tap) = &mut self.adjust {
+            tap.set_focus(focused, losses);
+            tap.tick(now);
+        }
+    }
+
+    /// When the input thread is next due a wake, on the presentation clock:
+    /// the tap's next tick ([`AdjustmentTap::next_due`]), or the deadline
+    /// set with [`set_wake_at`](Self::set_wake_at), whichever is sooner.
+    #[must_use]
+    pub fn next_due(&self) -> Option<TimeUs> {
+        let tap = self.adjust.as_ref().and_then(AdjustmentTap::next_due);
+        match (tap, self.wake_at) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
+    /// A wake the input thread is due at `at` on the presentation clock
+    /// besides the tap's, such as a timed script's next item; `None` for
+    /// none.
+    pub const fn set_wake_at(&mut self, at: Option<TimeUs>) {
+        self.wake_at = at;
+    }
+
+    /// Whether the presentation focus is in now and no loss was counted
+    /// since the batch sampled it: what an opening revalidates.
+    fn focus_held(&self) -> bool {
+        let Some(tap) = &self.adjust else {
+            return true;
+        };
+        let (focused, losses) = self.focus.read();
+        focused && tap.focused() && losses == tap.focus_losses()
     }
 
     /// Offers `packet` to the menu: only while recording is closed, and
@@ -842,14 +925,14 @@ impl SourceSet {
         // `remove` keeps the order devices were found in, which gives
         // source ids at the next open.
         let mut removed = self.devices.remove(i);
+        let at = self.presentation_time(self.batch_at);
         if let Some(tap) = &mut self.adjust
             && removed.adjusts
         {
             // What it held is released.
-            let foreground = !self.gate.is_tripped();
             for &(c, _) in &removed.held {
                 if let Some(n) = tap.number(removed.kind, removed.product, c) {
-                    tap.button(n, true, false, self.batch_at, foreground);
+                    tap.button(n, true, false, at, true);
                 }
             }
         }
@@ -1097,7 +1180,8 @@ impl SourceSet {
     /// first READY candidate `generation` at this boundary, only if START
     /// and SELECT are verifiably released here (design.md "Play
     /// Lifecycle", the start gate), and arms the tap's start gate for it.
-    /// `None` when one is held or may be: the opening is deferred and
+    /// `None` when one is held or may be, or the presentation focus is away
+    /// or was lost since the batch sampled it: the opening is deferred and
     /// nothing opens.
     pub fn open_candidate(
         &mut self,
@@ -1105,12 +1189,17 @@ impl SourceSet {
         origin: TimeUs,
         generation: u32,
     ) -> Option<&InputStart> {
-        if self.holding() {
+        if self.holding() || !self.focus_held() {
             return None;
         }
         let _ = self.open_attempt(now, origin);
-        if let Some(tap) = &self.adjust {
+        let (at, origin) = (self.presentation_time(now), self.presentation_time(origin));
+        if let Some(tap) = &mut self.adjust {
+            // The opening's marker is sent here, at the same boundary as
+            // the input-side hook would, its origin mapped through the
+            // presentation offset.
             tap.gate().arm(generation);
+            tap.opened(generation, origin, at);
         }
         self.recording.as_ref().map(|r| &r.start)
     }
@@ -1118,24 +1207,32 @@ impl SourceSet {
     /// Seals the open candidate and opens candidate `generation` on the
     /// attempt's source table ([`reopen`](Self::reopen)), only if START
     /// and SELECT are verifiably released at this boundary, and arms the
-    /// tap's start gate for it. Without allocating.
+    /// tap's start gate for it. Without allocating. Either opening sends
+    /// the tap's [`TapEvent::Opened`](crate::TapEvent::Opened) with its
+    /// chart time 0, `origin`, on the presentation clock.
     ///
     /// # Errors
     ///
-    /// [`ReopenError::Held`] when one is held or may be, and what
-    /// [`reopen`](Self::reopen) refuses; nothing changes.
+    /// [`ReopenError::Held`] when one is held or may be, or the focus is
+    /// away or was lost (as for [`open_candidate`](Self::open_candidate)),
+    /// and what [`reopen`](Self::reopen) refuses; nothing changes.
     pub fn reopen_candidate(
         &mut self,
         now: TimeUs,
         origin: TimeUs,
         generation: u32,
     ) -> Result<&InputStart, ReopenError> {
-        if self.holding() {
+        if self.holding() || !self.focus_held() {
             return Err(ReopenError::Held);
         }
         let _ = self.reopen(now, origin)?;
-        if let Some(tap) = &self.adjust {
+        let (at, origin) = (self.presentation_time(now), self.presentation_time(origin));
+        if let Some(tap) = &mut self.adjust {
+            // The opening's marker is sent here, at the same boundary as
+            // the input-side hook would, its origin mapped through the
+            // presentation offset.
             tap.gate().arm(generation);
+            tap.opened(generation, origin, at);
         }
         self.recording
             .as_ref()

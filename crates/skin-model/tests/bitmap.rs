@@ -78,7 +78,7 @@ fn sheet(dir: &Path, chains: &[&[&str]]) -> Sheet {
                     u16::try_from(i).unwrap()
                 } else {
                     files.push(*name);
-                    b.admit_fnt(name, &mut |_| Ok(())).unwrap()
+                    b.admit_fnt(name, &mut |_| Ok(()), &|| false).unwrap()
                 }
             })
             .collect();
@@ -378,7 +378,7 @@ fn glyph_uvs_are_found_in_each_atlas() {
             max_layers: 8,
             reserved_layers: reserved,
         };
-        let atlas = h.skin.atlas(Variant::Lo, limits).unwrap();
+        let atlas = h.skin.atlas(Variant::Lo, limits, &|| false).unwrap();
         let side = atlas.side() as f32;
         let uvs = atlas.into_parts().1;
         let page = uvs.frames()[0];
@@ -479,7 +479,7 @@ fn bitmap_texts_fill_the_widget_quads() {
         .save_with_format(dir.path().join("d.png"), ImageFormat::Png)
         .unwrap();
     let mut b = SheetBuilder::new(&Root::new(dir.path()).unwrap());
-    let f = b.admit_fnt("f.fnt", &mut |_| Ok(())).unwrap();
+    let f = b.admit_fnt("f.fnt", &mut |_| Ok(()), &|| false).unwrap();
     b.add_bitmap_font(f, &[]).unwrap();
     let file = b
         .admit_file(skin_model::FileDef {

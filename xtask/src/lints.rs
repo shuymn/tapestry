@@ -185,6 +185,7 @@ pub const IN_PLAY: &[Site] = &[
     Site::File("crates/player/src/input_side.rs"),
     // The logic step and its sinks.
     Site::File("crates/game/src/adjustment.rs"),
+    Site::File("crates/game/src/driver.rs"),
     Site::Fns(
         "crates/game/src/adjust_keys.rs",
         &["AdjustmentPlan::observation"],
@@ -238,13 +239,17 @@ pub const IN_PLAY: &[Site] = &[
             "Adjust::is_input_offset",
             "Tuning::adjust",
             "Tuning::volume",
-            "Tuning::visible_time",
         ],
     ),
     Site::Fns(
         "crates/player/src/play.rs",
         &[
             "PlayerRig::sync",
+            "PlayerRig::speed_line",
+            "PlayerRig::adjustments_failure",
+            "PlayerRig::serve_adjustments",
+            "serve_adjustments",
+            "PlayerPump::display_offset_us",
             "PlayerRig::send_end",
             "PlayerRig::now",
             "PlayerRig::wait",
@@ -339,6 +344,7 @@ pub const IN_PLAY: &[Site] = &[
     Site::File("crates/render/src/measure.rs"),
     Site::File("crates/render/src/overlay.rs"),
     Site::File("crates/render/src/pace.rs"),
+    Site::File("crates/render/src/presentation.rs"),
     Site::File("crates/render/src/projection.rs"),
     Site::File("crates/render/src/renderer.rs"),
     Site::File("crates/render/src/simple.rs"),

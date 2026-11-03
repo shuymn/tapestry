@@ -1319,7 +1319,10 @@ fn check_f11(i: Imported, chart: &bms_model::Chart) {
         max_layers: 8,
         reserved_layers: 1,
     };
-    let atlas = i.skin.atlas(skin_model::Variant::Lo, limits).unwrap();
+    let atlas = i
+        .skin
+        .atlas(skin_model::Variant::Lo, limits, &|| false)
+        .unwrap();
     let mut d = Drawn::over(i.skin, chart);
     let q = d.frame(1_000, &[]);
     assert_eq!(q.len(), skin_model::LANE_QUADS as usize);

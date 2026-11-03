@@ -755,7 +755,10 @@ mod tests {
             max_layers: 2,
             reserved_layers: 1,
         };
-        let (_, uvs) = skin.atlas(Variant::Lo, limits).unwrap().into_parts();
+        let (_, uvs) = skin
+            .atlas(Variant::Lo, limits, &|| false)
+            .unwrap()
+            .into_parts();
         let gauges = [GaugeDesc {
             start: GaugeValue(0),
             max: GaugeValue::FULL,

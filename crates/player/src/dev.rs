@@ -15,7 +15,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -54,6 +54,7 @@ pub fn hold_measuring(stop: &mut dyn FnMut() -> bool) -> bool {
         return true;
     }
     println!("dev: the measurement holds {} ms", total.as_millis());
+    let _stall = Stall::begin();
     let began = std::time::Instant::now();
     loop {
         if stop() {
@@ -67,6 +68,148 @@ pub fn hold_measuring(stop: &mut dyn FnMut() -> bool) -> bool {
     }
 }
 
+/// How long the next load's decode holds at its first decoded file, ms
+/// (a script's `slow-decoding`).
+static SLOW_DECODING: AtomicU64 = AtomicU64::new(0);
+/// How long the render thread holds the next attempt's preparation, ms
+/// (a script's `slow-preparing`).
+static SLOW_PREPARING: AtomicU64 = AtomicU64::new(0);
+/// How long the render thread holds the next chart's load, ms (a
+/// script's `slow-chart-load`).
+static SLOW_CHART_LOAD: AtomicU64 = AtomicU64::new(0);
+/// A load's phase holds now (`slow-decoding`, `slow-measuring`,
+/// `slow-preparing`): a `press-loading` press waits for it.
+static STALLED: AtomicBool = AtomicBool::new(false);
+
+/// Marks a hold for its length.
+struct Stall;
+
+impl Stall {
+    fn begin() -> Self {
+        STALLED.store(true, Ordering::SeqCst);
+        Self
+    }
+}
+
+impl Drop for Stall {
+    fn drop(&mut self) {
+        STALLED.store(false, Ordering::SeqCst);
+    }
+}
+/// The phase of the next load in which F2 is pressed on the window (a
+/// script's `press-loading`): one of [`LoadPhase`], `u8::MAX` for none.
+static PRESS_LOADING: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(u8::MAX);
+
+/// A phase of a load the game thread waits through, serving the
+/// adjustments.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LoadPhase {
+    /// The sounds decode.
+    Decoding,
+    /// The loudness is measured.
+    Measuring,
+    /// The render thread prepares the attempt.
+    Preparing,
+    /// The render thread loads the chart.
+    ChartLoad,
+}
+
+impl LoadPhase {
+    /// The phase a script names.
+    pub fn named(name: &str) -> Option<Self> {
+        match name {
+            "decoding" => Some(Self::Decoding),
+            "measuring" => Some(Self::Measuring),
+            "preparing" => Some(Self::Preparing),
+            "chart-load" => Some(Self::ChartLoad),
+            _ => None,
+        }
+    }
+}
+
+/// The next load's decode holds `ms` at its first decoded file
+/// (`slow-decoding`).
+pub fn slow_decoding(ms: u64) {
+    SLOW_DECODING.store(ms, Ordering::Relaxed);
+}
+
+/// Holds the decode as `slow-decoding` says, once: on the decode's own
+/// thread, while the game thread serves the adjustments.
+pub fn hold_decoding() {
+    hold(LoadPhase::Decoding);
+}
+
+/// The render thread holds the next chart's load `ms`
+/// (`slow-chart-load`).
+pub fn slow_chart_load(ms: u64) {
+    SLOW_CHART_LOAD.store(ms, Ordering::Relaxed);
+}
+
+/// Holds `phase` on the thread running it as its `slow-` step says, once.
+/// Only a phase the render thread runs holds here.
+pub fn hold(phase: LoadPhase) {
+    let (slow, what) = match phase {
+        LoadPhase::ChartLoad => (&SLOW_CHART_LOAD, "the chart's load"),
+        LoadPhase::Preparing => (&SLOW_PREPARING, "the preparation"),
+        LoadPhase::Decoding => (&SLOW_DECODING, "the decode"),
+        LoadPhase::Measuring => return,
+    };
+    let ms = slow.swap(0, Ordering::Relaxed);
+    if ms > 0 {
+        println!("dev: {what} holds {ms} ms");
+        let _stall = Stall::begin();
+        std::thread::sleep(Duration::from_millis(ms));
+    }
+}
+
+/// The render thread holds the next attempt's preparation `ms`
+/// (`slow-preparing`).
+pub fn slow_preparing(ms: u64) {
+    SLOW_PREPARING.store(ms, Ordering::Relaxed);
+}
+
+/// Holds the attempt's preparation on the render thread as
+/// `slow-preparing` says, once, while the game thread waits for it.
+pub fn hold_preparing() {
+    hold(LoadPhase::Preparing);
+}
+
+/// F2 is pressed on the window at the first wait of `phase` in the next
+/// load (`press-loading`): an autoplay session's speed key, which reaches
+/// the adjustments through the window's queue.
+pub fn press_loading(phase: LoadPhase) {
+    PRESS_LOADING.store(phase as u8, Ordering::Relaxed);
+}
+
+/// Presses F2 on the window when a `press-loading` press is due in
+/// `phase`, the load's phase now, while that phase holds.
+pub fn press_due(controls: &crate::controls::Controls, phase: LoadPhase) {
+    if !STALLED.load(Ordering::SeqCst) {
+        return;
+    }
+    let due = PRESS_LOADING
+        .compare_exchange(phase as u8, u8::MAX, Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok();
+    if due {
+        controls.window_key(1, input::WindowKeyEvent::Press, false);
+        controls.window_key(1, input::WindowKeyEvent::Release, false);
+        println!("dev: F2 pressed while {phase:?}");
+    }
+}
+
+/// Prints the adjustments' published hi-speed after `phase` of a load.
+pub fn print_adjustments(phase: &str, driver: Option<&game::AdjustDriver>) {
+    let Some(h) = driver.and_then(|d| d.snapshot().hispeed) else {
+        return;
+    };
+    let (n, d) = (u128::from(h.num()), u128::from(h.den()));
+    let x = (200 * n + d) / (2 * d);
+    println!(
+        "dev: adjustments after {phase}: hi-speed {}.{:02}",
+        x / 100,
+        x % 100
+    );
+}
 /// Background measurements hold at their gate (`hold-background`).
 static GATE_ARMED: AtomicBool = AtomicBool::new(false);
 
@@ -231,6 +374,14 @@ pub struct Options {
     pub adjust_on_end: Vec<game::Adjust>,
     /// The chart time, ms, at which `adjust_in_play` is pressed.
     pub adjust_at_ms: i64,
+    /// F1 and F2, by scan code, pressed and released on a scripted play's
+    /// keyboard at `adjust_at_ms` (`--dev-speed`): packets the adjustment
+    /// tap observes and recording does not, as the speed keys are.
+    pub speed_keys: Vec<u32>,
+    /// Keys held on a scripted play's keyboard while it loads, before its
+    /// first opening (`--dev-loading`): each by scan code with its press and
+    /// release times after loading starts, fed only to the adjustment tap.
+    pub loading_keys: Vec<(u32, TimeUs, TimeUs)>,
     /// Show the measurement overlay from the start, without its key.
     pub overlay: bool,
     /// The result screen's input, scripted (`--dev-result`): `next`,
@@ -250,32 +401,12 @@ pub struct Options {
     /// Play a mid-chart start from this time of the chart's 1× time to its
     /// end (`--dev-start <ms>`; design.md "Shortening Launch-Based Checks").
     pub start: Option<TimeUs>,
-    /// Run the plays through the start gate (`--dev-start-gate`; design.md
-    /// "Play Lifecycle", the start gate) on the default adjustment
-    /// bindings, planned against the key config of `device.toml`: each
-    /// READY a candidate START or SELECT cancels before its transport
-    /// commits. START or SELECT on a key the key config binds to retry,
-    /// quit or a lane is refused, and the run ends with that error before
-    /// any play opens. Production plays run without it until S10-04b.
-    pub start_gate: bool,
 }
 
 impl Options {
     /// Applies the options to a play's rig, the same on every path that
-    /// plays a chart (`play`, interactive or headless): `device` is the
-    /// device settings the play uses, whose key config the start gate is
-    /// planned against.
-    ///
-    /// # Errors
-    ///
-    /// The start gate asked for and refused: what the bindings' plan
-    /// refuses ([`game::AdjustKeyError`]: START or SELECT on a key bound to
-    /// retry, quit or a lane), or what the tap refuses.
-    pub fn tune(
-        self,
-        rig: &mut crate::play::PlayerRig<'_>,
-        device: &game::DeviceSettings,
-    ) -> anyhow::Result<()> {
+    /// plays a chart (`play`, interactive or headless).
+    pub fn tune(self, rig: &mut crate::play::PlayerRig<'_>) {
         if self.auto_retry {
             rig.auto_retries = 1;
             rig.quit_after_end = Some(Duration::from_millis(300));
@@ -290,10 +421,8 @@ impl Options {
         rig.adjust_at = TimeUs(self.adjust_at_ms.saturating_mul(1_000));
         rig.adjust_on_end = self.adjust_on_end;
         rig.result_script = self.result;
-        if self.start_gate {
-            install_start_gate(rig, device).context("dev: the start gate cannot be installed")?;
-        }
-        Ok(())
+        rig.loading_script = !self.loading_keys.is_empty();
+        rig.speed_in_play = self.speed_keys;
     }
 
     /// The session's input with the development options applied: an input
@@ -325,7 +454,14 @@ impl Options {
             _ if self.headless => Err(UsageError::Usage(
                 "--dev-headless needs --auto or --dev-perfect".to_owned(),
             )),
-            _ => Ok(log.map_or(input, crate::PlayInput::Script)),
+            _ => Ok(log.map_or(input, |log| {
+                let at = TimeUs(self.adjust_at_ms.saturating_mul(1_000));
+                crate::PlayInput::Script(ScriptInput {
+                    log,
+                    speed: self.speed_keys.iter().map(|&k| (k, at)).collect(),
+                    loading: self.loading_keys.clone(),
+                })
+            })),
         }
     }
 
@@ -341,7 +477,6 @@ impl Options {
             "dev-overlay" => self.overlay = true,
             "dev-headless" => self.headless = true,
             "dev-perfect" => self.perfect = true,
-            "dev-start-gate" => self.start_gate = true,
             "dev-adjust-at" => {
                 self.adjust_at_ms = p.value()?.to_string_lossy().parse().map_err(|_| {
                     UsageError::Usage("--dev-adjust-at takes milliseconds".to_owned())
@@ -350,6 +485,14 @@ impl Options {
             "dev-adjust" => {
                 self.adjust_in_play =
                     adjust_keys(&p.value()?.to_string_lossy()).map_err(UsageError::Usage)?;
+            }
+            "dev-loading" => {
+                self.loading_keys =
+                    loading_keys(&p.value()?.to_string_lossy()).map_err(UsageError::Usage)?;
+            }
+            "dev-speed" => {
+                self.speed_keys =
+                    speed_keys(&p.value()?.to_string_lossy()).map_err(UsageError::Usage)?;
             }
             "dev-adjust-end" => {
                 self.adjust_on_end =
@@ -541,6 +684,18 @@ pub enum SelectStep {
     /// milliseconds before its first block, stopped as a measurement is: a
     /// slow measurement, a load's or the background's.
     SlowMeasuring(u64),
+    /// The next load's decode holds this many milliseconds at its first
+    /// file (`slow-decoding`).
+    SlowDecoding(u64),
+    /// The next attempt's preparation holds this many milliseconds on the
+    /// render thread (`slow-preparing`).
+    SlowPreparing(u64),
+    /// The next chart's load holds this many milliseconds on the render
+    /// thread (`slow-chart-load`).
+    SlowChartLoad(u64),
+    /// F2 is pressed on the window in this phase of the next load
+    /// (`press-loading`).
+    PressLoading(LoadPhase),
     /// Every background measurement from here on holds at its gate, past
     /// its first stop check and its line, until a load waits for it or the
     /// run ends.
@@ -653,7 +808,7 @@ impl SelectScript {
                 Some(("wait", f)) => Ok(SelectStep::Wait(f.to_owned())),
                 Some(("search", t)) => Ok(SelectStep::Search(t.to_owned())),
                 Some(("sleep", ms)) => ms.parse().map(SelectStep::Sleep).map_err(|_| {
-                    format!("{s} is not pick=, wait=, search=, sleep=, idle=, slow-load=, slow-measuring=, hold-background, background=running, background=idle, enter, prev-preset, next-preset, drawn, back, retry, next, prev, close-measuring, quit-measuring, quit-decoding, quit-loading, close-loading or close")
+                    format!("{s} is not pick=, wait=, search=, sleep=, idle=, slow-load=, slow-measuring=, slow-decoding=, slow-preparing=, slow-chart-load=, press-loading=, hold-background, background=running, background=idle, enter, prev-preset, next-preset, drawn, back, retry, next, prev, close-measuring, quit-measuring, quit-decoding, quit-loading, close-loading or close")
                 }),
                 Some(("idle", ms)) => ms
                     .parse()
@@ -667,6 +822,21 @@ impl SelectScript {
                     .parse()
                     .map(SelectStep::SlowMeasuring)
                     .map_err(|_| format!("{s} takes milliseconds")),
+                Some(("slow-decoding", ms)) => ms
+                    .parse()
+                    .map(SelectStep::SlowDecoding)
+                    .map_err(|_| format!("{s} takes milliseconds")),
+                Some(("slow-preparing", ms)) => ms
+                    .parse()
+                    .map(SelectStep::SlowPreparing)
+                    .map_err(|_| format!("{s} takes milliseconds")),
+                Some(("slow-chart-load", ms)) => ms
+                    .parse()
+                    .map(SelectStep::SlowChartLoad)
+                    .map_err(|_| format!("{s} takes milliseconds")),
+                Some(("press-loading", phase)) => LoadPhase::named(phase)
+                    .map(SelectStep::PressLoading)
+                    .ok_or_else(|| format!("{s} takes decoding, measuring, preparing or chart-load")),
                 Some(("background", "running")) => Ok(SelectStep::Background(true)),
                 Some(("background", "idle")) => Ok(SelectStep::Background(false)),
                 None if s == "enter" => Ok(SelectStep::Enter),
@@ -685,7 +855,7 @@ impl SelectScript {
                 None if s == "hold-background" => Ok(SelectStep::HoldBackground),
                 None if s == "close" => Ok(SelectStep::Close),
                 _ => Err(format!(
-                    "{s} is not pick=, wait=, search=, sleep=, idle=, slow-load=, slow-measuring=, hold-background, background=running, background=idle, enter, prev-preset, next-preset, drawn, back, retry, next, prev, close-measuring, quit-measuring, quit-decoding, quit-loading, close-loading or close"
+                    "{s} is not pick=, wait=, search=, sleep=, idle=, slow-load=, slow-measuring=, slow-decoding=, slow-preparing=, slow-chart-load=, press-loading=, hold-background, background=running, background=idle, enter, prev-preset, next-preset, drawn, back, retry, next, prev, close-measuring, quit-measuring, quit-decoding, quit-loading, close-loading or close"
                 )),
             })
             .map(|step| step.map(|s| (s, None)))
@@ -955,13 +1125,15 @@ impl MenuStats {
 }
 
 /// The scripted play's input: the log's events as a script, one device per
-/// source.
+/// source, and each speed key of `speed` pressed on the first keyboard at
+/// its time on the script's timeline and released 50 ms later, as packets
+/// no source records.
 ///
 /// # Errors
 ///
 /// Why the log cannot be read, or that it holds no played attempt (a
 /// capture cancelled before playback).
-pub fn script(log: &Path) -> anyhow::Result<ScriptedInput> {
+pub fn script(log: &Path, speed: &[(u32, TimeUs)]) -> anyhow::Result<ScriptedInput> {
     let limits = DecodeLimits::default();
     let bytes = read_bounded(log, limits.max_compressed)?;
     let rec = replay::decode(&bytes, &limits).with_context(|| log.display().to_string())?;
@@ -981,6 +1153,29 @@ pub fn script(log: &Path) -> anyhow::Result<ScriptedInput> {
     // Each controller declares the axes its record binds, as the adapter
     // would: only declared axes are recorded.
     let script = ScriptedInput::from_log(&rec.start, &rec.events, &kinds);
+    let keyboard = kinds.iter().position(|&k| k == DeviceKind::Keyboard);
+    let script = match keyboard {
+        Some(i) => script.with_packets(speed.iter().flat_map(|&(code, at)| {
+            let packet = |value| input::Packet {
+                device: input::DeviceId(i as u64),
+                control: eval::ControlId(code),
+                value,
+                background: false,
+            };
+            [
+                input::ScriptItem {
+                    at,
+                    action: input::Action::Packet(packet(1)),
+                },
+                input::ScriptItem {
+                    at: TimeUs(at.0 + 50_000),
+                    action: input::Action::Packet(packet(0)),
+                },
+            ]
+        })),
+        None if speed.is_empty() => script,
+        None => anyhow::bail!("--dev-speed needs a keyboard in the input log"),
+    };
     Ok(rec
         .devices
         .sources
@@ -1012,7 +1207,7 @@ fn read_limited(reader: impl std::io::Read, limit: usize) -> anyhow::Result<Vec<
     Ok(bytes)
 }
 
-/// Settings keys by name, comma-separated: `F1` to `F8`.
+/// Settings keys by name, comma-separated: `F3` to `F8`.
 ///
 /// # Errors
 ///
@@ -1023,7 +1218,114 @@ pub fn adjust_keys(list: &str) -> Result<Vec<game::Adjust>, String> {
             name.strip_prefix('F')
                 .and_then(|n| n.parse::<u32>().ok())
                 .and_then(|n| game::Adjust::from_key(0x3A + n))
-                .ok_or_else(|| format!("{name} is not a settings key (F1 to F8)"))
+                .ok_or_else(|| format!("{name} is not a settings key (F3 to F8)"))
+        })
+        .collect()
+}
+
+/// A scripted play's input (`--dev-scripted-input`): the log, the speed
+/// keys pressed during its plays ([`Options::speed_keys`]) and the keys
+/// held while it loads ([`Options::loading_keys`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScriptInput {
+    /// The input log.
+    pub log: PathBuf,
+    /// Speed keys by scan code, each pressed at its time on the script.
+    pub speed: Vec<(u32, TimeUs)>,
+    /// Keys held while loading, with their press and release times.
+    pub loading: Vec<(u32, TimeUs, TimeUs)>,
+}
+
+/// The keys of `list` held while loading, comma-separated as
+/// `<scan code in hex>@<press ms>-<release ms>` (`10-1500`: Q from the
+/// start for 1.5 s).
+///
+/// # Errors
+///
+/// An item not of that form, or released before it is pressed.
+pub fn loading_keys(list: &str) -> Result<Vec<(u32, TimeUs, TimeUs)>, String> {
+    list.split(',')
+        .map(|item| {
+            let bad = || format!("{item} is not <scan code>@<press ms>-<release ms>");
+            let (code, times) = item.split_once('@').ok_or_else(bad)?;
+            let (down, up) = times.split_once('-').ok_or_else(bad)?;
+            let code = u32::from_str_radix(code, 16).map_err(|_| bad())?;
+            let ms = |s: &str| {
+                s.parse::<i64>()
+                    .map(|m| TimeUs(m * 1_000))
+                    .map_err(|_| bad())
+            };
+            let (down, up) = (ms(down)?, ms(up)?);
+            if up <= down {
+                return Err(bad());
+            }
+            Ok((code, down, up))
+        })
+        .collect()
+}
+
+/// The keys held while a scripted play loads ([`loading_keys`]), as a
+/// script on the log's first keyboard, which it connects: its times are
+/// after loading starts. `None` without keys.
+///
+/// # Errors
+///
+/// Why the log cannot be read, or that it has no keyboard.
+pub fn loading_script(
+    log: &Path,
+    keys: &[(u32, TimeUs, TimeUs)],
+) -> anyhow::Result<Option<ScriptedInput>> {
+    if keys.is_empty() {
+        return Ok(None);
+    }
+    let limits = DecodeLimits::default();
+    let bytes = read_bounded(log, limits.max_compressed)?;
+    let rec = replay::decode(&bytes, &limits).with_context(|| log.display().to_string())?;
+    let Some(i) = rec
+        .devices
+        .sources
+        .iter()
+        .position(|s| s.kind == replay::DeviceKind::Keyboard)
+    else {
+        anyhow::bail!("--dev-loading needs a keyboard in the input log");
+    };
+    let device = input::DeviceId(i as u64);
+    let packet = |code, value| {
+        input::Action::Packet(input::Packet {
+            device,
+            control: eval::ControlId(code),
+            value,
+            background: false,
+        })
+    };
+    let mut items = vec![input::ScriptItem {
+        at: TimeUs(0),
+        action: input::Action::Connect(device, DeviceKind::Keyboard),
+    }];
+    for &(code, down, up) in keys {
+        items.push(input::ScriptItem {
+            at: down,
+            action: packet(code, 1),
+        });
+        items.push(input::ScriptItem {
+            at: up,
+            action: packet(code, 0),
+        });
+    }
+    Ok(Some(ScriptedInput::new(items)))
+}
+
+/// The speed keys of `list`, comma-separated: `F1` and `F2`.
+///
+/// # Errors
+///
+/// A name that is not F1 or F2.
+pub fn speed_keys(list: &str) -> Result<Vec<u32>, String> {
+    list.split(',')
+        .map(|name| match name {
+            "F1" => Ok(0x3B),
+            "F2" => Ok(0x3C),
+            _ => Err(format!("{name} is not a speed key (F1 or F2)")),
         })
         .collect()
 }
@@ -1407,28 +1709,6 @@ fn crc32(data: &[u8]) -> u32 {
         }
     }
     !c
-}
-
-/// Installs a start gate on the default adjustment bindings (START on Q,
-/// SELECT on W) in a development run's rig (`--dev-start-gate`; design.md
-/// "Play Lifecycle", the start gate), planned against `device`'s key
-/// configs, the ones the play's input uses; [`Options::tune`] is its one
-/// caller.
-fn install_start_gate(
-    rig: &mut crate::play::PlayerRig<'_>,
-    device: &game::DeviceSettings,
-) -> anyhow::Result<()> {
-    let keys = game::KeyConfigs {
-        keyboard: device.keyboard.clone(),
-        controller: device.controller.clone(),
-        controller_device: device.controller_device.map(Into::into),
-    };
-    let plan = game::AdjustmentConfig::default().plan(&keys, None, None)?;
-    rig.gate = Some(crate::start_gate::PlayerGate::install(
-        &rig.input,
-        plan.bindings,
-    )?);
-    Ok(())
 }
 
 #[cfg(test)]

@@ -52,8 +52,8 @@ pub fn ab_fonts() -> (TempDir, Sheet) {
         );
     }
     let mut b = skin_model::SheetBuilder::new(&skin_model::Root::new(root.path()).unwrap());
-    let a = b.admit_fnt("a.fnt", &mut |_| Ok(())).unwrap();
-    let f = b.admit_fnt("b.fnt", &mut |_| Ok(())).unwrap();
+    let a = b.admit_fnt("a.fnt", &mut |_| Ok(()), &|| false).unwrap();
+    let f = b.admit_fnt("b.fnt", &mut |_| Ok(()), &|| false).unwrap();
     b.add_bitmap_font(a, &[f]).unwrap();
     (root, b.finish())
 }
@@ -130,7 +130,21 @@ pub fn png_start(w: u32, h: u32) -> Vec<u8> {
 /// A header of `w`×`h` followed by the start of an image-data chunk that
 /// the file cuts short: a header with no pixels behind it.
 pub fn png_header(w: u32, h: u32) -> Vec<u8> {
+    png_header_with(w, h, false, &[])
+}
+
+/// [`png_header`], Adam7-interlaced or not, with the chunks `before`
+/// between the header and the image data.
+pub fn png_header_with(w: u32, h: u32, interlaced: bool, before: &[u8]) -> Vec<u8> {
     let mut out = png_start(w, h);
+    if interlaced {
+        // The IHDR's interlace byte, then its CRC again.
+        let at = out.len() - 5;
+        out[at] = 1;
+        let crc = crc32(&out[12..at + 1]);
+        out[at + 1..].copy_from_slice(&crc.to_be_bytes());
+    }
+    out.extend_from_slice(before);
     out.extend_from_slice(&1_000_u32.to_be_bytes());
     out.extend_from_slice(b"IDAT");
     out.extend_from_slice(&[0x78, 0x9c, 0, 0]);
@@ -198,5 +212,5 @@ pub fn content(atlas: &Atlas, frame: u32, reserved: u16) -> ([u32; 4], usize) {
 
 /// The atlas of `sheet` at [`LIMITS`], `Lo`.
 pub fn atlas(sheet: &Sheet) -> Atlas {
-    sheet.atlas(Variant::Lo, LIMITS).unwrap()
+    sheet.atlas(Variant::Lo, LIMITS, &|| false).unwrap()
 }

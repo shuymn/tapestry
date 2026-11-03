@@ -263,7 +263,11 @@ impl Drawn {
 
     /// `skin` played over `chart` whose BPM range is `bpm_range`.
     pub fn over_with(skin: Skin, chart: &bms_model::Chart, bpm_range: Option<BpmRange>) -> Self {
-        let uvs = skin.atlas(Variant::Lo, LIMITS).unwrap().into_parts().1;
+        let uvs = skin
+            .atlas(Variant::Lo, LIMITS, &|| false)
+            .unwrap()
+            .into_parts()
+            .1;
         let ctx = context_with(bpm_range);
         let play = skin.prepare(chart, &ctx).unwrap();
         let batch = QuadBatch::with_capacity(skin.quad_capacity(), skin.run_capacity());
@@ -433,7 +437,11 @@ pub struct Loader {
 
 impl Loader {
     pub fn new(skin: Skin) -> Self {
-        let uvs = skin.atlas(Variant::Lo, LIMITS).unwrap().into_parts().1;
+        let uvs = skin
+            .atlas(Variant::Lo, LIMITS, &|| false)
+            .unwrap()
+            .into_parts()
+            .1;
         let loading = skin.prepare_loading(Side::Left);
         let batch = QuadBatch::with_capacity(skin.quad_capacity(), skin.run_capacity());
         Self {

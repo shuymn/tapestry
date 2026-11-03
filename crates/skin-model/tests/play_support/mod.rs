@@ -328,7 +328,10 @@ pub const VIEW: LaneView = LaneView {
 
 /// The uv table of `skin`'s atlas at [`LIMITS`].
 pub fn uvs(skin: &Skin) -> UvTable {
-    skin.atlas(Variant::Lo, LIMITS).unwrap().into_parts().1
+    skin.atlas(Variant::Lo, LIMITS, &|| false)
+        .unwrap()
+        .into_parts()
+        .1
 }
 
 /// An element at x = `x` with a hold track from 0, on `timer`, showing

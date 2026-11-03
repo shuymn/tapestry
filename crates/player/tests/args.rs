@@ -369,7 +369,7 @@ fn dev_option_values_are_usage_errors() {
         ),
         (
             &["play", "a.bms", "--dev-adjust", "F9"],
-            "F9 is not a settings key (F1 to F8)",
+            "F9 is not a settings key (F3 to F8)",
         ),
         (
             &["keys", "--dev-scripted-keys", "zz"],
@@ -395,8 +395,8 @@ fn dev_options_are_taken_with_the_feature() {
         vec!["--dev-auto-retry".as_ref()],
         vec!["--dev-overlay".as_ref()],
         vec!["--dev-adjust-at".as_ref(), "1".as_ref()],
-        vec!["--dev-adjust".as_ref(), "F1".as_ref()],
-        vec!["--dev-adjust-end".as_ref(), "F1".as_ref()],
+        vec!["--dev-adjust".as_ref(), "F3".as_ref()],
+        vec!["--dev-adjust-end".as_ref(), "F3".as_ref()],
         vec!["--auto".as_ref(), "--dev-headless".as_ref()],
     ] {
         let out = Command::new(env!("CARGO_BIN_EXE_tapestry"))

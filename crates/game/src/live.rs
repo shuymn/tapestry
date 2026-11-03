@@ -349,11 +349,33 @@ pub trait Rig {
     fn before_play(&mut self, settings: &mut Settings) {
         let _ = settings;
     }
+    /// After the play preset was refreshed for a play and its practice
+    /// fitted to it, before the attempt's preparation: the presentation
+    /// takes the attempt (design.md "Play Adjustments", preparation): when
+    /// nothing is attached for it yet, the attempt is entered and its chart
+    /// attached, solving once. `Ok(Some(_))` refuses the attempt as a
+    /// preparation does (a Floating hi-speed that cannot be solved for the
+    /// chart). Nothing by default.
+    ///
+    /// # Errors
+    ///
+    /// Why the input thread did not answer the fence, which ends the run.
+    fn begin_presentation(
+        &mut self,
+        loaded: &Loaded,
+    ) -> Result<Option<PreparationRefusal>, InputWaitError> {
+        let _ = loaded;
+        Ok(None)
+    }
+    /// The play stopped before recording opened: what
+    /// [`begin_presentation`](Self::begin_presentation) attached is no
+    /// longer the coming attempt's. Nothing by default.
+    fn end_presentation(&mut self) {}
     /// Whether this rig's plays run the start gate (design.md "Play
     /// Lifecycle", the start gate): each READY is a candidate that a hold
     /// of START or SELECT before its transport commits cancels, and the
     /// methods below take part. `false` by default: the first READY opened
-    /// is the play, as the player's rig runs it until S10-04b.
+    /// is the play.
     fn gated(&self) -> bool {
         false
     }
@@ -803,7 +825,11 @@ fn play_and_next<R: Rig>(
     // refused before anything is prepared: one that would play a reset
     // value the player set does not open, the reset its reason.
     let ready = match loaded.refit_practice() {
-        Ok(()) => ready_to_open(loaded, rig),
+        Ok(()) => match rig.begin_presentation(loaded) {
+            Ok(None) => ready_to_open(loaded, rig),
+            Ok(Some(refusal)) => Err(LiveError::Preparation(refusal)),
+            Err(e) => Err(LiveError::Input(e)),
+        },
         Err(unfit) => Err(LiveError::Preparation(PreparationRefusal {
             location: None,
             reason: unfit.to_string(),
@@ -812,10 +838,12 @@ fn play_and_next<R: Rig>(
     match ready {
         Ok(true) => {}
         Ok(false) => {
+            rig.end_presentation();
             loaded.withdraw(start);
             return Ok(None);
         }
         Err(e) => {
+            rig.end_presentation();
             loaded.withdraw(start);
             return Err(refused(rig, e));
         }
@@ -844,10 +872,12 @@ fn play_and_next<R: Rig>(
     let opening = match opened {
         Ok(Some(opening)) => opening,
         Ok(None) => {
+            rig.end_presentation();
             loaded.withdraw(start);
             return Ok(None);
         }
         Err(e) => {
+            rig.end_presentation();
             loaded.withdraw(start);
             return Err(e);
         }

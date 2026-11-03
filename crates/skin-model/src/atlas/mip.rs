@@ -19,7 +19,8 @@ fn to_usize(n: u32) -> usize {
 /// Writes the `src_rect` (left, top, width, height) of `src` premultiplied
 /// into the allocation `alloc` of a page `side` texels wide, its content
 /// `GUTTER` texels in. Every texel of the allocation outside the content
-/// repeats the nearest content texel, so the whole allocation is filled.
+/// repeats the nearest content texel, so the whole allocation is filled:
+/// the whole image as one band ([`scatter`]), then [`complete`].
 pub(crate) fn blit(
     page: &mut [u8],
     side: u32,
@@ -27,26 +28,75 @@ pub(crate) fn blit(
     src_rect: [u32; 4],
     alloc: [u32; 4],
 ) {
-    let [sx, sy, w, h] = src_rect;
-    let [ax, ay, aw, ah] = alloc;
+    let [_, _, w, h] = src_rect;
     if w == 0 || h == 0 {
         return;
     }
-    let src_w = to_usize(src.width());
-    let raw = src.as_raw();
-    for dy in 0..ah {
-        let ry = sy + dy.saturating_sub(GUTTER).min(h - 1);
+    scatter(page, side, src, 0, src_rect, alloc);
+    complete(page, side, h, alloc);
+}
+
+/// Writes the rows of `src_rect` (left, top, width, height) that `band`,
+/// whose first row is `band_top`, holds, premultiplied, into the
+/// allocation `alloc` of a page `side` texels wide, as [`blit`] writes
+/// them, each row's texels outside the content repeating the nearest
+/// content texel; the rows above and below the content are left to
+/// [`complete`].
+pub(crate) fn scatter(
+    page: &mut [u8],
+    side: u32,
+    band: &RgbaImage,
+    band_top: u32,
+    src_rect: [u32; 4],
+    alloc: [u32; 4],
+) {
+    let [sx, sy, w, h] = src_rect;
+    let [ax, ay, aw, _] = alloc;
+    if w == 0 || h == 0 {
+        return;
+    }
+    let first = sy.max(band_top);
+    let end = sy
+        .saturating_add(h)
+        .min(band_top.saturating_add(band.height()));
+    let band_w = to_usize(band.width());
+    let raw = band.as_raw();
+    for y in first..end {
+        let dy = GUTTER + (y - sy);
         let start = (to_usize(ay + dy) * to_usize(side) + to_usize(ax)) * 4;
         let Some(row) = page.get_mut(start..start + to_usize(aw) * 4) else {
             continue;
         };
+        let by = to_usize(y - band_top);
         for (dx, texel) in (0..aw).zip(row.as_chunks_mut::<4>().0) {
             let rx = sx + dx.saturating_sub(GUTTER).min(w - 1);
-            let at = (to_usize(ry) * src_w + to_usize(rx)) * 4;
+            let at = (by * band_w + to_usize(rx)) * 4;
             let Some(&[r, g, b, a]) = raw.get(at..at + 4) else {
                 continue;
             };
             *texel = [premultiply(r, a), premultiply(g, a), premultiply(b, a), a];
+        }
+    }
+}
+
+/// Completes the allocation `alloc` of a page `side` texels wide whose
+/// `h` content rows [`scatter`] wrote: each row above them repeats the
+/// first, each row below them the last, so the allocation holds what
+/// [`blit`] writes.
+pub(crate) fn complete(page: &mut [u8], side: u32, h: u32, alloc: [u32; 4]) {
+    let [ax, ay, aw, ah] = alloc;
+    if h == 0 {
+        return;
+    }
+    let row_at = |dy: u32| (to_usize(ay + dy) * to_usize(side) + to_usize(ax)) * 4;
+    let len = to_usize(aw) * 4;
+    let last = GUTTER + h - 1;
+    for dy in (0..GUTTER).chain(last + 1..ah) {
+        let from = row_at(if dy < GUTTER { GUTTER } else { last });
+        let to = row_at(dy);
+        let fits = |at: usize| at.checked_add(len).is_some_and(|e| e <= page.len());
+        if fits(from) && fits(to) {
+            page.copy_within(from..from + len, to);
         }
     }
 }

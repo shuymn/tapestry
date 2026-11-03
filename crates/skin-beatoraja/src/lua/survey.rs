@@ -112,6 +112,7 @@ fn note(kind: &NoteKind) -> String {
         NoteKind::UnsupportedField { field } => format!("UnsupportedField {field}"),
         NoteKind::Ignored { field } => format!("Ignored {field}"),
         NoteKind::Callback { field, why } => format!("Callback {field} {}", unsupported(why)),
+        NoteKind::OverCap { cap } => format!("OverCap {cap}"),
         other => variant(other),
     }
 }

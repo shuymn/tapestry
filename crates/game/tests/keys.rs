@@ -7,9 +7,11 @@ use std::collections::VecDeque;
 use eval::ControlId;
 use std::time::Duration;
 
+use game::adjustment::Role as Adjust;
 use game::{
-    Bound, DeviceSettings, KeyConfig, KeyConfigEnd, KeyConfigFlow, KeyConfigs, KeyError, KeyScreen,
-    LaneKey, Press, Refusal, Role, capture_keys, capture_keys_within,
+    AdjustBinding, AdjustKeyError, Bound, DeviceSettings, KeyConfig, KeyConfigEnd, KeyConfigFlow,
+    KeyConfigs, KeyError, KeyScreen, LaneKey, Press, ROLES, Refusal, Role, capture_keys,
+    capture_keys_within,
 };
 use input::hid::{HidProduct, axis_cap};
 use input::{Capture, DeviceId, DeviceKind, Packet};
@@ -88,6 +90,8 @@ struct Scripted {
     /// How many times the capture had been armed at each show that asked
     /// for it.
     armings: Vec<u64>,
+    /// The shows that asked for the scratch axis's adjustment direction.
+    reversing: usize,
 }
 
 impl Scripted {
@@ -102,6 +106,7 @@ impl Scripted {
             asked: 0,
             revolution: None,
             armings: Vec::new(),
+            reversing: 0,
         }
     }
 }
@@ -114,6 +119,9 @@ impl KeyScreen for Scripted {
             self.asked += 1;
             self.revolution = self.capture.revolution(ControlId(AXIS));
             self.armings.push(self.capture.armings());
+        }
+        if flow.reversing() {
+            self.reversing += 1;
         }
     }
 
@@ -185,6 +193,7 @@ fn current() -> KeyConfigs {
             }],
             retry: None,
             quit: None,
+            ..KeyConfig::default()
         },
         controller_device: Some(MODEL_C),
     }
@@ -250,8 +259,16 @@ fn key_config_capture_binds_next_press() {
         // Quit: Enter again is refused; then Space.
         key(0x1c),
         key(0x39),
+        // START, SELECT and the auxiliary keys kept.
+        key(0x58),
+        key(0x58),
+        key(0x58),
+        key(0x58),
+        // The scratch's two buttons: the second pressed is positive.
+        button(29),
     ];
     let (end, screen) = run(&steps);
+    let d = DeviceSettings::default().keyboard;
     let lane = |control, lane| LaneKey { control, lane };
     assert_eq!(
         end,
@@ -268,14 +285,23 @@ fn key_config_capture_binds_next_press() {
                     ],
                     retry: Some(0x1c),
                     quit: Some(0x39),
+                    start: d.start,
+                    select: d.select,
+                    aux_negative: d.aux_negative,
+                    aux_positive: d.aux_positive,
+                    ..KeyConfig::default()
                 },
                 controller: KeyConfig {
                     lanes: vec![lane(30, 0), lane(29, 0), lane(31, 7)],
                     retry: None,
                     quit: None,
+                    scratch_positive: Some(29),
+                    scratch_negative: Some(30),
+                    ..KeyConfig::default()
                 },
                 controller_device: Some(MODEL_A),
             },
+            None,
             None,
             None
         )
@@ -321,6 +347,11 @@ fn key_config_capture_binds_next_press() {
             (Some(Role::Retry), overlap(0x20, l(3), Role::Retry)),
             (Some(Role::Quit), None),
             (Some(Role::Quit), overlap(0x1c, Role::Retry, Role::Quit)),
+            (Some(Role::Start), None),
+            (Some(Role::Select), None),
+            (Some(Role::AuxNegative), None),
+            (Some(Role::AuxPositive), None),
+            (Some(Role::ScratchPositive), None),
         ]
     );
 }
@@ -367,12 +398,27 @@ fn keep_keeps_the_current_bindings() {
     }
     assert_eq!(flow.press(keep), Press::Bound(Role::Retry, vec![kb(0x0e)]));
     // Escape stays the quit key.
+    assert_eq!(flow.press(keep), Press::Bound(Role::Quit, vec![kb(0x01)]));
+    for (role, control) in [
+        (Role::Start, 0x10),
+        (Role::Select, 0x11),
+        (Role::AuxNegative, 0xE048),
+    ] {
+        assert_eq!(flow.press(keep), Press::Bound(role, vec![kb(control)]));
+    }
+    // Each kind's one scratch control is its positive direction: done.
     let Press::Done(keys) = flow.press(keep) else {
         panic!("not done");
     };
     saves(&keys);
     assert_eq!(keys.keyboard, DeviceSettings::default().keyboard);
-    assert_eq!(keys.controller, current().controller);
+    assert_eq!(
+        keys.controller,
+        KeyConfig {
+            scratch_positive: Some(21),
+            ..current().controller
+        }
+    );
     assert_eq!(keys.controller_device, Some(MODEL_C));
     // Done stays done.
     assert_eq!(flow.press(kb(0x30)), Press::Done(keys));
@@ -383,6 +429,7 @@ fn keep_keeps_the_current_bindings() {
             lanes: Vec::new(),
             retry: None,
             quit: None,
+            ..KeyConfig::default()
         },
         controller: current().controller,
         controller_device: current().controller_device,
@@ -416,9 +463,7 @@ fn keep_keeps_the_current_bindings() {
         assert!(matches!(flow.press(keep), Press::Bound(..)));
     }
     assert_eq!(flow.press(keep), Press::Bound(Role::Retry, vec![kb(0x0e)]));
-    let Press::Done(keys) = flow.press(keep) else {
-        panic!("not done");
-    };
+    let keys = keep_until_done(&mut flow);
     saves(&keys);
     assert_eq!((keys.controller.retry, keys.controller.quit), (None, None));
     assert_eq!(keys.keyboard.quit, Some(0x01));
@@ -461,9 +506,7 @@ fn controller_bindings_belong_to_one_controller() {
         Press::Bound(..)
     ));
     assert!(matches!(flow.press(keep), Press::Bound(..)));
-    let Press::Done(keys) = flow.press(keep) else {
-        panic!("not done");
-    };
+    let keys = keep_until_done(&mut flow);
     saves(&keys);
     assert_eq!(keys.controller_device, Some(MODEL_A));
     assert_eq!(keys.controller.lanes.len(), 2);
@@ -479,6 +522,7 @@ fn controller_bindings_belong_to_one_controller() {
             }],
             retry: None,
             quit: None,
+            ..KeyConfig::default()
         },
         controller_device: Some(MODEL_C),
     });
@@ -494,10 +538,24 @@ fn controller_bindings_belong_to_one_controller() {
     for control in 0x10..=0x19 {
         assert!(matches!(flow.press(kb(control)), Press::Bound(..)));
     }
-    let Press::Done(keys) = flow.press(keep) else {
+    // Quit kept; START and SELECT kept would take Q and W, the scratch's.
+    assert!(matches!(flow.press(keep), Press::Bound(..)));
+    for control in [0x1e, 0x1f, 0x20, 0x22] {
+        assert!(matches!(flow.press(kb(control)), Press::Bound(..)));
+    }
+    // The scratch's two keys: W pressed is positive.
+    assert_eq!(flow.choosing(), Some(KB));
+    let Press::Done(keys) = flow.press(kb(0x11)) else {
         panic!("not done");
     };
     saves(&keys);
+    assert_eq!(
+        (
+            keys.keyboard.scratch_positive,
+            keys.keyboard.scratch_negative
+        ),
+        (Some(0x11), Some(0x10))
+    );
     assert!(keys.controller.lanes.is_empty());
     assert_eq!(keys.controller_device, None);
 }
@@ -526,7 +584,7 @@ fn controller_bindings_without_a_controller_are_not_kept() {
         ),
         Press::Bound(..)
     ));
-    for _ in 0..10 {
+    for _ in 0..20 {
         if let Press::Done(keys) = flow.press(keep) {
             saves(&keys);
             assert_eq!(keys.controller_device, Some(MODEL_B));
@@ -536,9 +594,27 @@ fn controller_bindings_without_a_controller_are_not_kept() {
     panic!("not done");
 }
 
-/// F12 for every role after the scratch: keep the current bindings.
+/// F12 for every role after the scratch: keep the current bindings, and
+/// then the scratch axis's current adjustment direction.
 fn keep_the_rest() -> Vec<Step> {
-    vec![key(0x58); 9]
+    vec![key(0x58); 14]
+}
+
+/// F12 until the flow is done: the new key configs.
+#[track_caller]
+fn keep_until_done(flow: &mut KeyConfigFlow) -> KeyConfigs {
+    let keep = Bound {
+        kind: KB,
+        control: game::KEEP_KEY,
+    };
+    for _ in 0..20 {
+        match flow.press(keep) {
+            Press::Done(keys) => return keys,
+            Press::Bound(..) => {}
+            other => panic!("{other:?} at {:?}", flow.role()),
+        }
+    }
+    panic!("not done");
 }
 
 /// Runs `steps` with `limit` for the range learning, the menu direction
@@ -585,7 +661,7 @@ fn an_axis_covers_both_directions_and_learns_its_range() {
     steps.push(TurnBack);
     steps.extend(keep_the_rest());
     let (end, screen) = run_within(&steps, HOUR);
-    let KeyConfigEnd::Done(keys, widened, menu_reversed) = end else {
+    let KeyConfigEnd::Done(keys, widened, menu_reversed, None) = end else {
         panic!("{end:?}");
     };
     assert_eq!(menu_reversed, Some(true));
@@ -617,7 +693,7 @@ fn a_genuine_255_position_axis_keeps_its_range() {
     steps.extend(keep_the_rest());
     let (end, screen) = run_within(&steps, HOUR);
     assert!(
-        matches!(end, KeyConfigEnd::Done(_, None, Some(false))),
+        matches!(end, KeyConfigEnd::Done(_, None, Some(false), None)),
         "{end:?}"
     );
     assert_eq!(
@@ -634,7 +710,7 @@ fn learning_ends_on_f12_or_at_its_time_limit() {
     steps.extend(keep_the_rest());
     let (end, screen) = run_within(&steps, HOUR);
     assert!(
-        matches!(end, KeyConfigEnd::Done(_, Some(256), None)),
+        matches!(end, KeyConfigEnd::Done(_, Some(256), None, None)),
         "{end:?}"
     );
     assert_eq!(screen.learnt.map(|l| l.observed), Some((-128, -128)));
@@ -646,7 +722,10 @@ fn learning_ends_on_f12_or_at_its_time_limit() {
     let mut steps = vec![Report(0), Turn, Report(5), key(0x58)];
     steps.extend(keep_the_rest());
     let (end, screen) = run_within(&steps, Duration::ZERO);
-    assert!(matches!(end, KeyConfigEnd::Done(_, None, None)), "{end:?}");
+    assert!(
+        matches!(end, KeyConfigEnd::Done(_, None, None, None)),
+        "{end:?}"
+    );
     assert_eq!(
         screen.learnt.map(|l| (l.observed, l.wrap)),
         Some(((5, 5), 255))
@@ -670,7 +749,7 @@ fn the_scratch_axis_is_turned_for_the_menu_direction() {
         steps.extend_from_slice(answer);
         steps.extend(keep_the_rest());
         let (end, screen) = run_within(&steps, Duration::ZERO);
-        let KeyConfigEnd::Done(keys, _, menu_reversed) = end else {
+        let KeyConfigEnd::Done(keys, _, menu_reversed, None) = end else {
             panic!("{end:?}");
         };
         assert_eq!(
@@ -705,7 +784,10 @@ fn the_scratch_axis_is_turned_for_the_menu_direction() {
     steps.extend([TurnBack, key(0x58)]);
     steps.extend(keep_the_rest());
     let (end, _) = run_settled(&steps, Duration::ZERO, HOUR);
-    assert!(matches!(end, KeyConfigEnd::Done(_, None, None)), "{end:?}");
+    assert!(
+        matches!(end, KeyConfigEnd::Done(_, None, None, None)),
+        "{end:?}"
+    );
 }
 
 /// F12 keeping a scratch bound to the axis learns and asks about that
@@ -723,6 +805,7 @@ fn keeping_the_scratch_axis_asks_about_that_axis() {
             }],
             retry: None,
             quit: None,
+            ..KeyConfig::default()
         },
         controller_device: Some(MODEL_A),
     };
@@ -731,7 +814,7 @@ fn keeping_the_scratch_axis_asks_about_that_axis() {
     let mut steps = vec![key(0x58), Report(0), TurnBack];
     steps.extend(keep_the_rest());
     let (end, screen) = run_from(&steps, kept, None, Duration::ZERO, Duration::ZERO);
-    let KeyConfigEnd::Done(keys, _, menu_reversed) = end else {
+    let KeyConfigEnd::Done(keys, _, menu_reversed, None) = end else {
         panic!("{end:?}");
     };
     assert_eq!(menu_reversed, Some(true));
@@ -751,7 +834,7 @@ fn the_menu_direction_is_counted_in_the_resolved_revolution() {
     steps.extend(keep_the_rest());
     let (end, screen) = run_from(&steps, current(), Some(300), HOUR, Duration::ZERO);
     assert!(
-        matches!(end, KeyConfigEnd::Done(_, Some(256), Some(false))),
+        matches!(end, KeyConfigEnd::Done(_, Some(256), Some(false), None)),
         "{end:?}"
     );
     assert_eq!(screen.revolution, Some(256));
@@ -760,7 +843,7 @@ fn the_menu_direction_is_counted_in_the_resolved_revolution() {
     steps.extend(keep_the_rest());
     let (end, screen) = run_from(&steps, current(), Some(300), Duration::ZERO, Duration::ZERO);
     assert!(
-        matches!(end, KeyConfigEnd::Done(_, None, Some(false))),
+        matches!(end, KeyConfigEnd::Done(_, None, Some(false), None)),
         "{end:?}"
     );
     assert_eq!(screen.revolution, Some(300));
@@ -782,7 +865,7 @@ fn a_turn_across_the_settle_time_is_no_answer() {
     steps.extend(keep_the_rest());
     let (end, _) = run_settled(&steps, Duration::ZERO, settle);
     assert!(
-        matches!(end, KeyConfigEnd::Done(_, None, Some(false))),
+        matches!(end, KeyConfigEnd::Done(_, None, Some(false), None)),
         "{end:?}"
     );
     let mut steps = vec![Report(0), Turn, Report(5)];
@@ -790,7 +873,7 @@ fn a_turn_across_the_settle_time_is_no_answer() {
     steps.extend(keep_the_rest());
     let (end, screen) = run_settled(&steps, Duration::ZERO, settle);
     assert!(
-        matches!(end, KeyConfigEnd::Done(_, None, Some(false))),
+        matches!(end, KeyConfigEnd::Done(_, None, Some(false), None)),
         "{end:?}"
     );
     assert_eq!(
@@ -809,9 +892,10 @@ fn a_button_or_key_scratch_is_asked_for_both_directions() {
     // Two buttons: both on lane 0, in binding order up and down for menus,
     // so no menu direction is asked for.
     let mut steps = vec![button(40), button(41)];
-    steps.extend(vec![key(0x58); 9]);
+    steps.extend(vec![key(0x58); 13]);
+    steps.push(button(40));
     let (end, screen) = run(&steps);
-    let KeyConfigEnd::Done(keys, None, None) = end else {
+    let KeyConfigEnd::Done(keys, None, None, None) = end else {
         panic!("{end:?}");
     };
     assert_eq!(screen.asked, 0);
@@ -819,9 +903,9 @@ fn a_button_or_key_scratch_is_asked_for_both_directions() {
     assert_eq!(keys.controller.lanes, [lane(40, 0), lane(41, 0)]);
     // A key, then F12 for none: one direction only.
     let mut steps = vec![key(0x36), key(0x58)];
-    steps.extend(vec![key(0x58); 9]);
+    steps.extend(vec![key(0x58); 13]);
     let (end, _) = run(&steps);
-    let KeyConfigEnd::Done(keys, None, None) = end else {
+    let KeyConfigEnd::Done(keys, None, None, None) = end else {
         panic!("{end:?}");
     };
     assert_eq!(
@@ -869,4 +953,335 @@ fn the_overlay_key_is_refused_for_either_scratch_direction() {
     assert!(flow.other_direction());
     assert_eq!(flow.press(f9), refused);
     assert!(flow.other_direction());
+}
+
+const fn kb(control: u32) -> Bound {
+    Bound { kind: KB, control }
+}
+
+const fn pad(control: u32) -> Bound {
+    Bound { kind: PAD, control }
+}
+
+/// F12 for the lanes, retry and quit: the current bindings.
+fn keep_to_start(flow: &mut KeyConfigFlow) {
+    for _ in 0..10 {
+        assert!(matches!(flow.press(kb(game::KEEP_KEY)), Press::Bound(..)));
+    }
+    assert_eq!(flow.role(), Some(Role::Start));
+}
+
+/// After quit come START, SELECT and the auxiliary negative and positive
+/// keys: a keyboard key or a button of the bound controller each, kept
+/// with F12; an axis, a reserved key and a control with another role are
+/// refused through the check `device.toml` gets at load.
+#[test]
+fn key_config_prompts_start_select_and_the_auxiliary_keys() {
+    assert_eq!(
+        ROLES[10..],
+        [
+            Role::Start,
+            Role::Select,
+            Role::AuxNegative,
+            Role::AuxPositive
+        ]
+    );
+    let mut flow = KeyConfigFlow::new(current());
+    keep_to_start(&mut flow);
+    assert_eq!(
+        flow.press(kb(0x13)),
+        Press::Bound(Role::Start, vec![kb(0x13)])
+    );
+    // SELECT on a button of the bound controller.
+    assert_eq!(
+        flow.press_from(pad(22), Some(MODEL_C)),
+        Press::Bound(Role::Select, vec![pad(22)])
+    );
+    let refused = |e| Press::Refused(Refusal::Key(KeyError::Adjustment(e)));
+    assert_eq!(
+        flow.press_from(pad(AXIS), Some(MODEL_C)),
+        refused(AdjustKeyError::Axis(Adjust::AuxNegative))
+    );
+    assert_eq!(
+        flow.press(kb(0x3b)),
+        refused(AdjustKeyError::Reserved {
+            control: 0x3b,
+            reserved_for: "hi-speed",
+        })
+    );
+    assert_eq!(
+        flow.press_from(pad(23), Some(MODEL_A)),
+        Press::Refused(Refusal::OtherController)
+    );
+    assert_eq!(flow.role(), Some(Role::AuxNegative));
+    assert_eq!(
+        flow.press(kb(game::KEEP_KEY)),
+        Press::Bound(Role::AuxNegative, vec![kb(0xE048)])
+    );
+    assert_eq!(
+        flow.press(kb(0x13)),
+        refused(AdjustKeyError::Overlap {
+            control: 0x13,
+            first: AdjustBinding::Adjustment(Adjust::Start),
+            second: AdjustBinding::Adjustment(Adjust::AuxPositive),
+        })
+    );
+    // The last: each kind's one scratch control is its positive direction.
+    let Press::Done(keys) = flow.press(kb(0x14)) else {
+        panic!("not done");
+    };
+    saves(&keys);
+    let k = &keys.keyboard;
+    assert_eq!(
+        (k.start, k.select, k.aux_negative, k.aux_positive),
+        (Some(0x13), None, Some(0xE048), Some(0x14))
+    );
+    assert_eq!((k.scratch_positive, k.scratch_negative), (Some(0x2a), None));
+    let c = &keys.controller;
+    assert_eq!((c.start, c.select), (None, Some(22)));
+    assert_eq!((c.scratch_positive, c.scratch_negative), (Some(21), None));
+    assert_eq!(keys.controller_device, Some(MODEL_C));
+}
+
+/// START, SELECT and the auxiliary keys take no lane's control, the
+/// scratch's included, and no retry or quit key.
+#[test]
+fn a_start_on_a_lane_key_is_refused() {
+    let mut flow = KeyConfigFlow::new(current());
+    keep_to_start(&mut flow);
+    let refused = |control, first| {
+        Press::Refused(Refusal::Key(KeyError::Adjustment(
+            AdjustKeyError::Overlap {
+                control,
+                first: AdjustBinding::Key(first),
+                second: AdjustBinding::Adjustment(Adjust::Start),
+            },
+        )))
+    };
+    assert_eq!(flow.press(kb(0x2c)), refused(0x2c, Role::Lane(1)));
+    assert_eq!(flow.press(kb(0x2a)), refused(0x2a, Role::Lane(0)));
+    assert_eq!(flow.press(kb(0x0e)), refused(0x0e, Role::Retry));
+    assert_eq!(
+        flow.press_from(pad(21), Some(MODEL_C)),
+        refused(21, Role::Lane(0))
+    );
+    assert_eq!(flow.role(), Some(Role::Start));
+    assert!(flow.refused().is_some());
+    assert_eq!(
+        flow.press(kb(0x13)),
+        Press::Bound(Role::Start, vec![kb(0x13)])
+    );
+    assert_eq!(flow.refused(), None);
+}
+
+/// With the scratch on an axis, the last prompt asks for it to be turned
+/// the way that raises SUDDEN+ and speeds up: a turn toward lower values
+/// sets `adjust_reversed`, one toward higher values clears it, and F12
+/// keeps the current setting. A button is no answer.
+#[test]
+fn the_scratch_axis_direction_writes_adjust_reversed() {
+    let answered = |answer: &[Step]| {
+        // The range learnt at once, menus turned forward, the rest kept.
+        let mut steps = vec![Report(0), Turn, Report(5), Turn];
+        steps.extend(vec![key(0x58); 13]);
+        steps.extend_from_slice(answer);
+        let (end, screen) = run_within(&steps, Duration::ZERO);
+        let KeyConfigEnd::Done(keys, _, Some(false), adjust_reversed) = end else {
+            panic!("{end:?}");
+        };
+        assert_eq!(keys.controller.scratch_positive, None);
+        assert!(screen.reversing >= 1);
+        adjust_reversed
+    };
+    assert_eq!(answered(&[TurnBack]), Some(true));
+    assert_eq!(answered(&[Turn]), Some(false));
+    assert_eq!(answered(&[key(0x58)]), None);
+    assert_eq!(answered(&[button(5), key(0x2c), TurnBack]), Some(true));
+    // Escape cancels there too.
+    let mut steps = vec![Report(0), Turn, Report(5), Turn];
+    steps.extend(vec![key(0x58); 13]);
+    steps.push(key(0x01));
+    let (end, _) = run_within(&steps, Duration::ZERO);
+    assert_eq!(end, KeyConfigEnd::Cancelled);
+
+    // The flow alone: a press is no answer; the answer ends it.
+    let mut flow = KeyConfigFlow::new(current());
+    assert!(matches!(
+        flow.press_from(pad(AXIS), Some(MODEL_A)),
+        Press::Bound(..)
+    ));
+    while !flow.reversing() {
+        assert!(matches!(flow.press(kb(game::KEEP_KEY)), Press::Bound(..)));
+    }
+    assert_eq!(flow.role(), None);
+    assert_eq!(flow.press(kb(0x30)), Press::Refused(Refusal::NotATurn));
+    let Press::Done(keys) = flow.reverse(Some(true)) else {
+        panic!("not done");
+    };
+    saves(&keys);
+    assert_eq!(flow.adjust_reversed(), Some(true));
+    assert!(!flow.reversing());
+}
+
+/// With the scratch on two buttons, the one pressed at the prompt is its
+/// positive direction and the other its negative one. Another control is
+/// refused, and F12 keeps a current choice among them.
+#[test]
+fn two_scratch_buttons_take_positive_then_negative() {
+    let mut flow = KeyConfigFlow::new(current());
+    for b in [pad(40), pad(41)] {
+        assert!(matches!(
+            flow.press_from(b, Some(MODEL_A)),
+            Press::Bound(..)
+        ));
+    }
+    while flow.role() != Some(Role::ScratchPositive) {
+        assert!(matches!(flow.press(kb(game::KEEP_KEY)), Press::Bound(..)));
+    }
+    assert_eq!(flow.choosing(), Some(PAD));
+    let not_scratch = |control| {
+        Press::Refused(Refusal::Key(KeyError::Adjustment(
+            AdjustKeyError::NotScratch {
+                control,
+                role: Adjust::ScratchPositive,
+            },
+        )))
+    };
+    assert_eq!(flow.press_from(pad(3), Some(MODEL_A)), not_scratch(3));
+    assert_eq!(flow.press(kb(0x2c)), not_scratch(0x2c));
+    assert_eq!(
+        flow.press(kb(game::KEEP_KEY)),
+        Press::Refused(Refusal::NothingToKeep(Role::ScratchPositive))
+    );
+    let Press::Done(keys) = flow.press_from(pad(41), Some(MODEL_A)) else {
+        panic!("not done");
+    };
+    saves(&keys);
+    assert_eq!(
+        (
+            keys.controller.scratch_positive,
+            keys.controller.scratch_negative
+        ),
+        (Some(41), Some(40))
+    );
+    // The keyboard has no scratch key now: no direction.
+    assert_eq!(keys.keyboard.scratch_positive, None);
+
+    // F12 keeps the current choice.
+    let mut flow = KeyConfigFlow::new(keys.clone());
+    let kept = keep_until_done(&mut flow);
+    assert_eq!(kept.controller, keys.controller);
+    // Two keys on the keyboard work alike.
+    let mut flow = KeyConfigFlow::new(current());
+    for b in [kb(0x36), kb(0x2a)] {
+        assert!(matches!(flow.press(b), Press::Bound(..)));
+    }
+    while flow.role() != Some(Role::ScratchPositive) {
+        assert!(matches!(flow.press(kb(game::KEEP_KEY)), Press::Bound(..)));
+    }
+    assert_eq!(flow.choosing(), Some(KB));
+    let Press::Done(keys) = flow.press(kb(0x2a)) else {
+        panic!("not done");
+    };
+    saves(&keys);
+    assert_eq!(
+        (
+            keys.keyboard.scratch_positive,
+            keys.keyboard.scratch_negative
+        ),
+        (Some(0x2a), Some(0x36))
+    );
+}
+
+/// More than two scratch keys of one kind: the positive one is chosen,
+/// then a distinct negative one, and the others stay lane-only; F12 at the
+/// positive prompt keeps both current directions.
+#[test]
+fn three_scratch_keys_take_a_positive_then_a_distinct_negative() {
+    let mut cur = current();
+    cur.keyboard.lanes.extend([
+        LaneKey {
+            control: 0x36,
+            lane: 0,
+        },
+        LaneKey {
+            control: 0x1d,
+            lane: 0,
+        },
+    ]);
+    cur.controller = KeyConfig::default();
+    cur.controller_device = None;
+    let to_directions = |flow: &mut KeyConfigFlow| {
+        while flow.role() != Some(Role::ScratchPositive) {
+            assert!(matches!(flow.press(kb(game::KEEP_KEY)), Press::Bound(..)));
+        }
+        assert_eq!(flow.choosing(), Some(KB));
+    };
+    let mut flow = KeyConfigFlow::new(cur.clone());
+    to_directions(&mut flow);
+    assert!(matches!(flow.press(kb(0x36)), Press::Bound(..)));
+    assert_eq!(flow.role(), Some(Role::ScratchNegative));
+    assert_eq!(
+        flow.press(kb(0x36)),
+        Press::Refused(Refusal::Key(KeyError::Adjustment(
+            AdjustKeyError::NotScratch {
+                control: 0x36,
+                role: Adjust::ScratchNegative,
+            },
+        )))
+    );
+    let Press::Done(keys) = flow.press(kb(0x1d)) else {
+        panic!("not done");
+    };
+    saves(&keys);
+    assert_eq!(
+        (
+            keys.keyboard.scratch_positive,
+            keys.keyboard.scratch_negative
+        ),
+        (Some(0x36), Some(0x1d))
+    );
+    // F12 keeps both current directions, with no negative prompt.
+    cur.keyboard.scratch_positive = Some(0x2a);
+    cur.keyboard.scratch_negative = Some(0x1d);
+    let mut flow = KeyConfigFlow::new(cur);
+    to_directions(&mut flow);
+    let Press::Done(keys) = flow.press(kb(game::KEEP_KEY)) else {
+        panic!("not done");
+    };
+    assert_eq!(
+        (
+            keys.keyboard.scratch_positive,
+            keys.keyboard.scratch_negative
+        ),
+        (Some(0x2a), Some(0x1d))
+    );
+}
+
+/// A controller's scratch direction is refused from a controller of
+/// unknown model or of another model than the one bound.
+#[test]
+fn a_scratch_direction_checks_the_controller() {
+    let mut flow = KeyConfigFlow::new(current());
+    for b in [pad(40), pad(41)] {
+        assert!(matches!(
+            flow.press_from(b, Some(MODEL_A)),
+            Press::Bound(..)
+        ));
+    }
+    while flow.role() != Some(Role::ScratchPositive) {
+        assert!(matches!(flow.press(kb(game::KEEP_KEY)), Press::Bound(..)));
+    }
+    assert_eq!(
+        flow.press_from(pad(41), None),
+        Press::Refused(Refusal::UnknownController)
+    );
+    assert_eq!(
+        flow.press_from(pad(41), Some(MODEL_B)),
+        Press::Refused(Refusal::OtherController)
+    );
+    assert!(matches!(
+        flow.press_from(pad(41), Some(MODEL_A)),
+        Press::Done(_)
+    ));
 }

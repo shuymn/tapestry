@@ -9,15 +9,33 @@
 //!
 //! Each tapped control has a number below [`MAX_TAPPED`]; one number may
 //! stand for the same control on several devices, which then count as one
-//! held control while any of them holds it. An overflow, or input taken
-//! while focus was away, sends [`TapEvent::Lost`] then
-//! [`TapEvent::Resync`] with the controls held, once the queue has room
-//! for both: nothing in between is sent, and no release is made up.
+//! held control while any of them holds it.
+//!
+//! Besides the observations, the tap sends markers of what the input
+//! thread decides at its boundaries, in the order it decides them: a READY
+//! candidate opened ([`TapEvent::Opened`]) or cancelled by a hold
+//! ([`TapEvent::Cancelled`]), and the answer to a fence the game thread
+//! asked for ([`TapEvent::Fence`]). A loss (a full queue, an observation
+//! the tap could not send, focus going away or a focus loss counted
+//! since) is a recovery: [`TapEvent::Lost`], then [`TapEvent::Resync`]
+//! with the controls held when it is sent. Markers and recoveries wait in
+//! a small FIFO (one recovery and one marker of each kind) that is flushed
+//! in order, stamped as it is sent, before any later observation; while
+//! anything waits there an observation is dropped, which is a loss, so
+//! nothing is ever sent out of order and no release is made up. The queue
+//! keeps [`RESERVED`] slots that only the FIFO takes. While the FIFO waits
+//! for room the tap publishes that it is owed a wake
+//! ([`AdjustmentReceiver::owed`]), checking for room again after
+//! publishing, so a consumer that drains after the check wakes it.
+//!
+//! Every observation and marker is stamped on the presentation clock, the
+//! process clock of the reducer's head; the caller maps each batch's time
+//! onto it.
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use bms_model::TimeUs;
 use eval::ControlId;
@@ -29,6 +47,11 @@ use crate::sources::DeviceKind;
 pub const ADJUST_QUEUE: usize = 1024;
 /// The most controls a tap observes, numbered below it.
 pub const MAX_TAPPED: usize = 128;
+/// The queue slots only markers and recoveries take: a recovery's two
+/// and one each for an opening, a cancellation and a fence.
+pub const RESERVED: usize = 5;
+/// The window's F1 and F2 events the window-key queue holds.
+pub const WINDOW_KEYS: usize = 64;
 
 /// A control the tap observes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -55,6 +78,11 @@ pub struct AdjustmentBindings {
     /// The values in a revolution of an absolute axis, for its movement
     /// the short way round; the declared one when `None`.
     pub wrap: Option<u32>,
+    /// The numbers that repeat while held (the scratch's digital
+    /// directions), a bit each: the tap is due a tick at each repeat.
+    pub repeating: u128,
+    /// The repeat period of `repeating`, µs; 0 for none.
+    pub repeat_us: i64,
 }
 
 /// Why [`adjustment_queue`] refused bindings.
@@ -87,21 +115,49 @@ pub enum TapEvent {
         control: u8,
         /// The signed movement.
         delta: i64,
+        /// The values in its revolution as the movement was counted; 0
+        /// for a relative or non-wrapping axis.
+        revolution: u32,
     },
-    /// A batch ended while a tapped control was held, or once after the
-    /// last request so its group closes.
+    /// The presentation clock passed: a tapped control is held, a repeat
+    /// is due, or the last requests' group closes.
     Tick,
     /// Observations were lost, or focus was.
     Lost,
-    /// The controls held, a bit each: after a loss, or as the baseline
-    /// when the tap becomes active.
-    Resync(u128),
+    /// The controls held, a bit each: after a loss, as the baseline when
+    /// the tap becomes active, or when the devices reaching it change.
+    /// `verified` is false when a device's held state is unknown or focus
+    /// is away: then the held set may miss a control.
+    Resync {
+        /// The controls held.
+        held: u128,
+        /// Whether `held` is known to be complete.
+        verified: bool,
+    },
+    /// READY candidate `generation` opened, its chart time 0 at `origin`
+    /// on the presentation clock.
+    Opened {
+        /// The candidate's generation.
+        generation: u32,
+        /// Its chart time 0.
+        origin: TimeUs,
+    },
+    /// A hold cancelled READY candidate `generation`: sent after the batch
+    /// whose observation caused it, so the requests at that batch's time
+    /// are made under the candidate's clock.
+    Cancelled {
+        /// The candidate's generation.
+        generation: u32,
+    },
+    /// The answer to fence `n`: everything observed before it was sent
+    /// before it.
+    Fence(u64),
 }
 
-/// An observation at a batch's receive time, on the input thread's clock.
+/// An observation at a batch's receive time, on the presentation clock.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TapObservation {
-    /// The batch's receive time.
+    /// The receive time, or for a marker the time it was sent.
     pub at: TimeUs,
     /// The tap's running sequence, ordering observations at one time.
     pub seq: u64,
@@ -264,12 +320,222 @@ impl StartGate {
     }
 }
 
-/// What the tap must send before anything else.
+/// An event of a window key: F1 or F2 as the window sees them in an
+/// autoplay session, where no keyboard reaches the tap.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Pending {
-    None,
-    Resync,
-    LostResync,
+pub enum WindowKeyEvent {
+    /// The key went down.
+    Press,
+    /// The keyboard repeated it.
+    Repeat,
+    /// The key went up.
+    Release,
+}
+
+#[derive(Debug, Default)]
+struct WindowKeyShared {
+    /// One word, so the input thread acknowledges an overflow against the
+    /// very held keys it takes as the baseline: the keys held as the
+    /// window last saw them (bits 0 and 1), whether the queue was full so
+    /// the window enqueues nothing until the input thread acknowledges it
+    /// ([`OVERFLOW`]), and a version counting every change (from bit 8).
+    word: AtomicU64,
+}
+
+/// [`WindowKeyShared::word`]'s overflow bit.
+const OVERFLOW: u64 = 1 << 2;
+
+/// The most tries one acknowledgement makes before it is left for the next
+/// wake: the input thread never spins on the window's word.
+const ACK_TRIES: u32 = 4;
+
+/// The held keys of a [`WindowKeyShared::word`].
+const fn held_keys(word: u64) -> u8 {
+    (word & 3) as u8
+}
+
+impl WindowKeyShared {
+    /// The held keys now.
+    fn held(&self) -> u8 {
+        held_keys(self.word.load(Ordering::Acquire))
+    }
+
+    /// Acknowledges an overflow: clears it in one step with reading the
+    /// held keys it returns as the baseline, so a change the window made
+    /// meanwhile (and could not queue) is never lost: the step fails and
+    /// is taken again with the newer keys. `between` runs between the read
+    /// and the step (a test forces an interleaving there).
+    fn acknowledge(&self, mut between: impl FnMut()) -> Option<u8> {
+        for _ in 0..ACK_TRIES {
+            let w = self.word.load(Ordering::Acquire);
+            between();
+            if self
+                .word
+                .compare_exchange(w, w & !OVERFLOW, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Some(held_keys(w));
+            }
+        }
+        // The window keeps changing its keys: the overflow stays, and the
+        // input thread tries again at its next wake.
+        None
+    }
+}
+
+/// The window's end of the window-key queue ([`window_keys`]): an ordered
+/// bounded queue of F1 and F2 events for the input thread.
+#[derive(Debug)]
+pub struct WindowKeys {
+    queue: rtrb::Producer<(u8, WindowKeyEvent)>,
+    shared: Arc<WindowKeyShared>,
+}
+
+/// The input thread's end of the window-key queue, given to the tap
+/// ([`AdjustmentTap::set_window_keys`]).
+#[derive(Debug)]
+pub struct WindowKeyReceiver {
+    queue: rtrb::Consumer<(u8, WindowKeyEvent)>,
+    shared: Arc<WindowKeyShared>,
+}
+
+/// A window-key queue of [`WINDOW_KEYS`] events. It allocates; nothing
+/// does after it.
+#[must_use]
+pub fn window_keys() -> (WindowKeys, WindowKeyReceiver) {
+    let (producer, consumer) = rtrb::RingBuffer::new(WINDOW_KEYS);
+    let shared = Arc::new(WindowKeyShared::default());
+    (
+        WindowKeys {
+            queue: producer,
+            shared: Arc::clone(&shared),
+        },
+        WindowKeyReceiver {
+            queue: consumer,
+            shared,
+        },
+    )
+}
+
+impl WindowKeys {
+    /// Key `key` (0 for F1, 1 for F2) had `event`. Its held state follows
+    /// every event; only a real one (`synthetic` false: not one the window
+    /// system makes up as focus changes) is queued, unless the queue
+    /// overflowed and the input thread has not caught up yet, which then
+    /// takes the held state as a baseline instead. `false` when it was not
+    /// queued.
+    pub fn key(&mut self, key: u8, event: WindowKeyEvent, synthetic: bool) -> bool {
+        let bit = 1_u64 << (key & 1);
+        let changed = |w: u64| {
+            let held = match event {
+                WindowKeyEvent::Press | WindowKeyEvent::Repeat => (w & 3) | bit,
+                WindowKeyEvent::Release => (w & 3) & !bit,
+            };
+            Some(((w >> 8).wrapping_add(1) << 8) | (w & OVERFLOW) | held)
+        };
+        // Every change moves the version, even one the window cannot queue.
+        let before = self
+            .shared
+            .word
+            .try_update(Ordering::AcqRel, Ordering::Acquire, changed)
+            .unwrap_or(0);
+        if synthetic || before & OVERFLOW != 0 {
+            return false;
+        }
+        if self.queue.push((key & 1, event)).is_ok() {
+            return true;
+        }
+        self.shared.word.fetch_or(OVERFLOW, Ordering::AcqRel);
+        false
+    }
+}
+
+/// What the tap owes before any later observation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Marker {
+    /// [`TapEvent::Lost`] when `lost`, then [`TapEvent::Resync`] with the
+    /// held set when it is sent.
+    Recovery {
+        lost: bool,
+    },
+    Opened {
+        generation: u32,
+        origin: TimeUs,
+    },
+    Cancelled {
+        generation: u32,
+    },
+    Fence(u64),
+}
+
+impl Marker {
+    const fn slots(self) -> usize {
+        match self {
+            Self::Recovery { lost: true } => 2,
+            _ => 1,
+        }
+    }
+
+    const fn same_kind(self, other: Self) -> bool {
+        matches!(
+            (self, other),
+            (Self::Recovery { .. }, Self::Recovery { .. })
+                | (Self::Opened { .. }, Self::Opened { .. })
+                | (Self::Cancelled { .. }, Self::Cancelled { .. })
+                | (Self::Fence(_), Self::Fence(_))
+        )
+    }
+}
+
+/// The FIFO of what the tap owes: at most one recovery and one marker of
+/// each kind, in the order they were decided.
+#[derive(Clone, Copy, Debug, Default)]
+struct Owed {
+    entries: [Option<Marker>; 4],
+}
+
+impl Owed {
+    fn is_empty(&self) -> bool {
+        self.entries[0].is_none()
+    }
+
+    fn front(&self) -> Option<Marker> {
+        self.entries[0]
+    }
+
+    fn pop(&mut self) {
+        self.entries.rotate_left(1);
+        if let Some(last) = self.entries.last_mut() {
+            *last = None;
+        }
+    }
+
+    /// Adds `m` behind what is owed. A recovery still unsent takes a later
+    /// loss in; any other kind still unsent is replaced in its place (the
+    /// game thread's credits keep that from happening).
+    fn push(&mut self, m: Marker) {
+        for slot in &mut self.entries {
+            match slot {
+                Some(Marker::Recovery { lost })
+                    if m.same_kind(Marker::Recovery { lost: false }) =>
+                {
+                    if let Marker::Recovery { lost: more } = m {
+                        *lost |= more;
+                    }
+                    return;
+                }
+                Some(e) if e.same_kind(m) => {
+                    *e = m;
+                    return;
+                }
+                Some(_) => {}
+                None => {
+                    *slot = Some(m);
+                    return;
+                }
+            }
+        }
+    }
 }
 
 /// The input thread's end of the tap. [`SourceSet`](crate::SourceSet)
@@ -279,23 +545,44 @@ pub struct AdjustmentTap {
     controls: Vec<(TapControl, u8)>,
     latched: u128,
     wrap: Option<u32>,
+    repeating: u128,
+    repeat_us: i64,
     /// Devices holding each number.
     holders: [u16; MAX_TAPPED],
+    /// When each number was last pressed, for its repeats.
+    pressed_at: [TimeUs; MAX_TAPPED],
     presses: u64,
     unverified: bool,
     active: bool,
-    pending: Pending,
+    /// The presentation focus as last sampled, and the focus losses
+    /// counted then.
+    focused: bool,
+    losses: u64,
+    owed: Owed,
     seq: u64,
+    /// The latest stamp sent: markers sent later never go before it.
+    last_at: TimeUs,
     last_tick: TimeUs,
     /// When the last request (a press, release, repeat or axis movement)
     /// was sent, while no later observation has closed the reducer's group
-    /// at that time: `end_batch` owes a tick until one does.
+    /// at that time: the tap owes a tick until one does.
     unclosed: Option<TimeUs>,
     queue: rtrb::Producer<TapObservation>,
     latch: Arc<AtomicU64>,
     /// The READY candidate's gate, cancelled as a hold is accepted.
     gate: StartGate,
     dropped: Arc<AtomicU64>,
+    owed_flag: Arc<AtomicBool>,
+    /// F1 and F2 from the window, with their numbers, and the keys the
+    /// tap counts held from them.
+    window: Option<(WindowKeyReceiver, [Option<u8>; 2])>,
+    window_held: u8,
+    /// The window's keys acknowledged with an overflow, the baseline of
+    /// the recovery it owes.
+    window_baseline: Option<u8>,
+    /// The candidate a hold of this batch cancelled: its marker follows the
+    /// batch.
+    cancelled: Option<u32>,
 }
 
 /// The logic thread's end of the tap.
@@ -303,6 +590,7 @@ pub struct AdjustmentTap {
 pub struct AdjustmentReceiver {
     queue: rtrb::Consumer<TapObservation>,
     dropped: Arc<AtomicU64>,
+    owed: Arc<AtomicBool>,
 }
 
 /// A tap for `bindings` and its receiver; the queue holds
@@ -328,27 +616,40 @@ pub fn adjustment_queue(
     }
     let (producer, consumer) = rtrb::RingBuffer::new(ADJUST_QUEUE);
     let dropped = Arc::new(AtomicU64::new(0));
+    let owed = Arc::new(AtomicBool::new(false));
     Ok((
         AdjustmentTap {
             controls,
             latched: bindings.latched,
             wrap: bindings.wrap,
+            repeating: bindings.repeating,
+            repeat_us: bindings.repeat_us,
             holders: [0; MAX_TAPPED],
+            pressed_at: [TimeUs(0); MAX_TAPPED],
             presses: 0,
             unverified: false,
             active: false,
-            pending: Pending::None,
+            focused: true,
+            losses: 0,
+            owed: Owed::default(),
             seq: 0,
+            last_at: TimeUs(i64::MIN),
             last_tick: TimeUs(i64::MIN),
             unclosed: None,
             queue: producer,
             latch: Arc::new(AtomicU64::new(0)),
             gate: StartGate::new(),
             dropped: Arc::clone(&dropped),
+            owed_flag: Arc::clone(&owed),
+            window: None,
+            window_held: 0,
+            window_baseline: None,
+            cancelled: None,
         },
         AdjustmentReceiver {
             queue: consumer,
             dropped,
+            owed,
         },
     ))
 }
@@ -379,15 +680,60 @@ impl AdjustmentTap {
         self.unverified || self.held_set() & self.latched != 0
     }
 
-    /// Whether observations are sent: set at each boundary. The held
-    /// controls are counted either way; turning it on sends them as the
-    /// baseline ([`TapEvent::Resync`]) at the start of the next batch,
-    /// before its packets.
+    /// Whether observations are sent. The held controls are counted
+    /// either way; turning it on sends them as the baseline
+    /// ([`TapEvent::Resync`]) before anything later.
     pub fn set_active(&mut self, active: bool) {
         if active && !self.active {
-            self.pending = Pending::Resync;
+            self.owed.push(Marker::Recovery { lost: false });
         }
         self.active = active;
+    }
+
+    /// Takes F1 and F2 from the window ([`window_keys`]) as the controls
+    /// numbered `numbers` (F1's, F2's): an autoplay session's speed keys.
+    pub fn set_window_keys(&mut self, keys: WindowKeyReceiver, numbers: [Option<u8>; 2]) {
+        self.window = Some((keys, numbers));
+    }
+
+    /// The presentation focus sampled for the next observations:
+    /// `focused`, and `losses` focus losses counted so far. Focus going
+    /// away, or a loss counted since the last sample, is a loss: the
+    /// recovery's held set is unverified while focus is away. Focus coming
+    /// back sends a verified baseline; until then observations are not
+    /// sent.
+    pub fn set_focus(&mut self, focused: bool, losses: u64) {
+        // Focus going away sends Lost and an unverified Resync at once, not
+        // a Resync held back until focus returns, so a marker behind the
+        // recovery never waits on focus; the return sends a verified one.
+        let lost = losses != self.losses || (self.focused && !focused);
+        let back = focused && !self.focused;
+        self.losses = losses;
+        self.focused = focused;
+        if lost || back {
+            // What was derived from the focus before is resolved now: the
+            // recovery's Lost or Resync closes the reducer's open group, so
+            // no closing tick is owed, and its baseline is read from the
+            // window's keys as they are when it is sent, not from an
+            // overflow acknowledged before the change.
+            self.unclosed = None;
+            self.window_baseline = None;
+        }
+        if self.active && (lost || back) {
+            self.owed.push(Marker::Recovery { lost });
+        }
+    }
+
+    /// Whether focus was in at the last sample.
+    #[must_use]
+    pub const fn focused(&self) -> bool {
+        self.focused
+    }
+
+    /// The focus losses counted at the last sample.
+    #[must_use]
+    pub const fn focus_losses(&self) -> u64 {
+        self.losses
     }
 
     /// The number of `control` of a device of `kind` and `product`.
@@ -430,18 +776,16 @@ impl AdjustmentTap {
                 *h = h.saturating_add(1);
             }
         }
-        if self.active
-            && self.pending == Pending::None
-            && (owners_changed || self.held_set() != before)
-        {
-            self.pending = Pending::Resync;
+        if self.active && (owners_changed || self.held_set() != before) {
+            self.owed.push(Marker::Recovery { lost: false });
         }
         self.set_unverified(unverified);
     }
 
     /// A button or key `n` of one device went from `was` held to `now`
-    /// held, in a batch received at `at`; `foreground` when it was
-    /// admitted for recording.
+    /// held, in a batch received at `at`; `foreground` unless it is
+    /// background input. A hold this cancels a READY candidate with is
+    /// followed by [`TapEvent::Cancelled`].
     pub(crate) fn button(&mut self, n: u8, was: bool, now: bool, at: TimeUs, foreground: bool) {
         let latched = self.latched & (1_u128 << (n & 127)) != 0;
         let Some(h) = self.holders.get_mut(usize::from(n)) else {
@@ -462,7 +806,14 @@ impl AdjustmentTap {
             (true, true) => Some(TapEvent::Repeat(n)),
             (false, false) => None,
         };
-        self.store_latch();
+        if let (Some(TapEvent::Press(_)), Some(p)) =
+            (event, self.pressed_at.get_mut(usize::from(n)))
+        {
+            *p = at;
+        }
+        if let Some(generation) = self.store_latch() {
+            self.cancelled = Some(generation);
+        }
         if let Some(event) = event {
             self.observe(at, event, foreground);
         }
@@ -480,10 +831,15 @@ impl AdjustmentTap {
         at: TimeUs,
         foreground: bool,
     ) {
-        let wrap = declared.map_or(0, |d| self.wrap.unwrap_or(d));
-        let delta = wrapped(raw, wrap);
+        let revolution = declared.map_or(0, |d| self.wrap.unwrap_or(d));
+        let delta = wrapped(raw, revolution);
         if delta != 0 {
-            self.observe(at, TapEvent::Axis { control: n, delta }, foreground);
+            let event = TapEvent::Axis {
+                control: n,
+                delta,
+                revolution,
+            };
+            self.observe(at, event, foreground);
         }
     }
 
@@ -491,114 +847,302 @@ impl AdjustmentTap {
     /// `unverified` holds.
     pub(crate) fn set_unverified(&mut self, unverified: bool) {
         self.unverified = unverified;
-        self.store_latch();
+        let cancelled = self.store_latch();
+        if let Some(generation) = cancelled
+            && self.active
+        {
+            self.owed.push(Marker::Cancelled { generation });
+        }
     }
 
-    /// Sends what is pending, stamped at `at`, once the queue has room;
-    /// `open` while the focus gate admits input. Packets observed
-    /// afterwards follow it.
-    pub(crate) fn send_pending(&mut self, at: TimeUs, open: bool) {
-        if self.active && open {
+    /// READY candidate `generation` opened at this boundary, its chart
+    /// time 0 at `origin` on the presentation clock: sent behind
+    /// everything observed before it, stamped `at` or later.
+    pub fn opened(&mut self, generation: u32, origin: TimeUs, at: TimeUs) {
+        if self.active {
+            self.owed.push(Marker::Opened { generation, origin });
             self.flush(at);
         }
     }
 
-    /// The end of a batch received at `at`; `open` while the focus gate
-    /// admits input. Sends what is pending once there is room, else a tick
-    /// while a tapped control is held, and one more at a later time once
-    /// nothing is, so the reducer's last group closes.
-    pub(crate) fn end_batch(&mut self, at: TimeUs, open: bool) {
+    /// The answer to fence `n`, at this boundary, stamped `at` or later.
+    pub fn fence(&mut self, n: u64, at: TimeUs) {
+        if self.active {
+            self.owed.push(Marker::Fence(n));
+            self.flush(at);
+        }
+    }
+
+    /// Sends what is owed, stamped `at` or later, as far as the queue has
+    /// room.
+    pub(crate) fn send_owed(&mut self, at: TimeUs) {
+        if self.active {
+            self.flush(at);
+        }
+    }
+
+    /// The presentation clock reached `at`, whether or not a batch ran:
+    /// the window's keys are taken, what is owed is sent, and a tick is
+    /// sent while a tapped control is held, and once more at a later time
+    /// once nothing is, so the reducer's last group closes.
+    pub fn tick(&mut self, at: TimeUs) {
         if !self.active {
             return;
         }
-        if !open {
-            self.pending = Pending::LostResync;
+        // A cancellation follows the batch whose hold caused it, not the
+        // causing press itself: SELECT is
+        // a hold too, so a request made with it in one batch is still made
+        // under the candidate's clock; the reducer closes the group at the
+        // cancel without ending a held gesture's context, so a scratch held
+        // with START goes on repeating.
+        if let Some(generation) = self.cancelled.take() {
+            self.owed.push(Marker::Cancelled { generation });
+        }
+        self.flush(at);
+        self.window_keys(at);
+        if !self.owed.is_empty() {
             return;
         }
-        if self.pending != Pending::None {
-            self.flush(at);
-            return;
-        }
-        let owed = self.unclosed.is_some_and(|t| at > t);
-        if at > self.last_tick && (owed || self.held_set() != 0) {
+        let closing = self.unclosed.is_some_and(|t| at > t);
+        if at > self.last_tick && (closing || self.held_set() != 0) {
+            // A tick at a repeat's deadline makes a request: like a press,
+            // it owes the tick that closes its group.
+            let repeats = self.next_repeat().is_some_and(|due| due <= at);
             self.last_tick = at;
-            self.observe(at, TapEvent::Tick, true);
+            // Only a tick the reducer takes owes a closing one: a tick
+            // dropped (focus away, a loss) made no request.
+            if self.observe(at, TapEvent::Tick, true) && repeats {
+                self.unclosed = Some(at);
+            }
         }
     }
 
-    /// Sends the pending loss or baseline once the queue has room for it.
+    /// When the tap is next due a tick on the presentation clock: a held
+    /// repeating control's next repeat, or the tick closing the last
+    /// requests' group. `None` while it owes something the queue has no
+    /// room for: the consumer's drain wakes the thread then
+    /// ([`AdjustmentReceiver::owed`]).
+    #[must_use]
+    pub fn next_due(&self) -> Option<TimeUs> {
+        // Nothing is due while focus is away (no tick is taken then) or
+        // while the tap owes a send the queue has no room for.
+        if !self.active || !self.focused || !self.owed.is_empty() {
+            return None;
+        }
+        let closing = self.unclosed.map(|t| TimeUs(t.0.saturating_add(1)));
+        match (closing, self.next_repeat()) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
+    /// The first repeat of a held repeating control after the last tick.
+    fn next_repeat(&self) -> Option<TimeUs> {
+        if self.repeat_us <= 0 {
+            return None;
+        }
+        let held = self.held_set() & self.repeating;
+        let mut due: Option<TimeUs> = None;
+        for (n, &pressed) in self.pressed_at.iter().enumerate() {
+            if held & (1_u128 << (n & 127)) == 0 {
+                continue;
+            }
+            let since = self.last_tick.0.saturating_sub(pressed.0).max(0);
+            let k = since / self.repeat_us + 1;
+            let at = TimeUs(pressed.0.saturating_add(k.saturating_mul(self.repeat_us)));
+            due = Some(due.map_or(at, |d| d.min(at)));
+        }
+        due
+    }
+
+    /// The window's F1 and F2 events, taken in order once nothing is owed:
+    /// after an overflow, the events queued before it, then a recovery
+    /// whose baseline is the window's held keys, all suppressed.
+    fn window_keys(&mut self, at: TimeUs) {
+        if !self.owed.is_empty() {
+            return;
+        }
+        let Some((keys, numbers)) = &mut self.window else {
+            return;
+        };
+        let numbers = *numbers;
+        let overflow = keys.shared.word.load(Ordering::Acquire) & OVERFLOW != 0;
+        let mut events = [None; WINDOW_KEYS];
+        let mut taken = 0;
+        while let Some(slot) = events.get_mut(taken)
+            && let Ok(e) = keys.queue.pop()
+        {
+            *slot = Some(e);
+            taken += 1;
+        }
+        for (key, event) in events.into_iter().flatten() {
+            let Some(n) = numbers.get(usize::from(key)).copied().flatten() else {
+                continue;
+            };
+            let bit = 1_u8 << key;
+            let tap = match event {
+                WindowKeyEvent::Press if self.window_held & bit == 0 => {
+                    self.window_held |= bit;
+                    TapEvent::Press(n)
+                }
+                WindowKeyEvent::Release if self.window_held & bit != 0 => {
+                    self.window_held &= !bit;
+                    TapEvent::Release(n)
+                }
+                WindowKeyEvent::Repeat if self.window_held & bit != 0 => TapEvent::Repeat(n),
+                _ => continue,
+            };
+            self.observe(at, tap, true);
+        }
+        if overflow
+            && let Some((keys, _)) = &self.window
+            && let Some(held) = keys.shared.acknowledge(|| {})
+        {
+            // What the window could not queue shows only in its held
+            // keys: they are the baseline, read in one step with the
+            // acknowledgement, and none of them acts.
+            self.window_baseline = Some(held);
+            self.owed.push(Marker::Recovery { lost: true });
+            self.flush(at);
+        }
+    }
+
+    /// Sends what is owed in order as far as the queue has room, then
+    /// publishes whether anything is still owed, checking for room again
+    /// after publishing it.
     fn flush(&mut self, at: TimeUs) {
-        match self.pending {
-            Pending::LostResync if self.queue.slots() >= 2 => {
-                self.send(at, TapEvent::Lost);
-                self.send(at, TapEvent::Resync(self.held_set()));
-                self.pending = Pending::None;
+        self.flush_racing(at, || {});
+    }
+
+    /// [`flush`](Self::flush), with `before_publish` run between the
+    /// first attempt that found no room and the publication of `owed`: a
+    /// test forces a consumer's drain there.
+    fn flush_racing(&mut self, at: TimeUs, before_publish: impl FnOnce()) {
+        self.send_owed_entries(at);
+        if self.owed.is_empty() {
+            self.owed_flag.store(false, Ordering::Release);
+            return;
+        }
+        before_publish();
+        self.owed_flag.store(true, Ordering::Release);
+        self.send_owed_entries(at);
+        if self.owed.is_empty() {
+            self.owed_flag.store(false, Ordering::Release);
+        }
+    }
+
+    fn send_owed_entries(&mut self, at: TimeUs) {
+        while let Some(m) = self.owed.front() {
+            if self.queue.slots() < m.slots() {
+                return;
             }
-            Pending::Resync if self.queue.slots() >= 1 => {
-                self.send(at, TapEvent::Resync(self.held_set()));
-                self.pending = Pending::None;
+            match m {
+                Marker::Recovery { lost } => {
+                    if lost {
+                        self.send(at, TapEvent::Lost);
+                    }
+                    let verified = self.focused && !self.unverified;
+                    // The window's keys: an overflow's acknowledged baseline,
+                    // else as the window holds them now (a made-up release
+                    // while focus was away shows only there), its queued
+                    // events before it dropped, as the loss drops them.
+                    if let Some((keys, _)) = &mut self.window {
+                        self.window_held = match self.window_baseline.take() {
+                            Some(held) => held,
+                            None => {
+                                while keys.queue.pop().is_ok() {}
+                                keys.shared.held()
+                            }
+                        };
+                    }
+                    let held = self.held_set();
+                    self.send(at, TapEvent::Resync { held, verified });
+                }
+                Marker::Opened { generation, origin } => {
+                    self.send(at, TapEvent::Opened { generation, origin });
+                }
+                Marker::Cancelled { generation } => {
+                    self.send(at, TapEvent::Cancelled { generation });
+                }
+                Marker::Fence(n) => {
+                    self.send(at, TapEvent::Fence(n));
+                }
             }
-            _ => {}
+            self.owed.pop();
         }
     }
 
     fn held_set(&self) -> u128 {
-        self.holders
+        let devices = self
+            .holders
             .iter()
             .zip(0_u32..)
             .filter(|&(h, _)| *h > 0)
-            .fold(0, |set, (_, n)| set | (1_u128 << n))
+            .fold(0, |set, (_, n)| set | (1_u128 << n));
+        let window = self.window.as_ref().map_or(0, |(_, numbers)| {
+            numbers
+                .iter()
+                .zip(0_u8..)
+                .filter(|&(n, key)| n.is_some() && self.window_held & (1 << key) != 0)
+                .fold(0, |set, (n, _)| set | n.map_or(0, |n| 1_u128 << (n & 127)))
+        });
+        devices | window
     }
 
-    /// Sends `event` unless something is pending; a background or
-    /// rejected input, or a full queue, makes the loss pending.
-    fn observe(&mut self, at: TimeUs, event: TapEvent, foreground: bool) {
-        if !self.active {
-            return;
+    /// Sends `event` once nothing is owed; anything else is a loss: a
+    /// background input, an observation behind something owed, or one the
+    /// queue (short of its reserved slots) has no room for. Nothing is sent
+    /// while focus is away; its return sends a baseline.
+    fn observe(&mut self, at: TimeUs, event: TapEvent, foreground: bool) -> bool {
+        if !self.active || !self.focused {
+            return false;
         }
-        if !foreground {
-            self.pending = Pending::LostResync;
-            return;
-        }
-        if self.pending != Pending::None {
-            return;
-        }
-        if !self.send(at, event) {
-            self.pending = Pending::LostResync;
-        }
-    }
-
-    fn send(&mut self, at: TimeUs, event: TapEvent) -> bool {
-        let seq = self.seq;
-        let sent = self.queue.push(TapObservation { at, seq, event }).is_ok();
-        if sent {
-            self.seq = seq.wrapping_add(1);
-            if matches!(
-                event,
-                TapEvent::Press(_)
-                    | TapEvent::Release(_)
-                    | TapEvent::Repeat(_)
-                    | TapEvent::Axis { .. }
-            ) {
-                self.unclosed = Some(at);
-            } else if self.unclosed.is_some_and(|t| at > t) {
-                self.unclosed = None;
-            }
-        } else {
+        self.flush(at);
+        if !foreground || !self.owed.is_empty() || self.queue.slots() <= RESERVED {
             self.dropped.fetch_add(1, Ordering::Relaxed);
+            self.owed.push(Marker::Recovery { lost: true });
+            self.flush(at);
+            return false;
         }
-        sent
+        self.send(at, event);
+        true
     }
 
-    fn store_latch(&self) {
+    fn send(&mut self, at: TimeUs, event: TapEvent) {
+        let at = at.max(self.last_at);
+        let seq = self.seq;
+        if self.queue.push(TapObservation { at, seq, event }).is_err() {
+            // The reserved slots make this unreachable for what is owed,
+            // and an observation is pushed only with room.
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        self.last_at = at;
+        self.seq = seq.wrapping_add(1);
+        if matches!(
+            event,
+            TapEvent::Press(_) | TapEvent::Release(_) | TapEvent::Repeat(_) | TapEvent::Axis { .. }
+        ) {
+            self.unclosed = Some(at);
+        } else if self.unclosed.is_some_and(|t| at > t) {
+            self.unclosed = None;
+        }
+    }
+
+    /// Stores the latch; the generation of the candidate a hold cancelled
+    /// in doing so.
+    fn store_latch(&self) -> Option<u32> {
         let held = self.held_set() & self.latched != 0;
         // Cancelled before the latch shows the hold: whoever reads the
         // hold finds the candidate cancelled already.
-        if held || self.unverified {
-            let _ = self.gate.cancel();
-        }
+        let cancelled = if held || self.unverified {
+            self.gate.cancel()
+        } else {
+            None
+        };
         let v = (self.presses << 2) | (u64::from(self.unverified) << 1) | u64::from(held);
         self.latch.store(v, Ordering::Release);
+        cancelled
     }
 }
 
@@ -608,9 +1152,152 @@ impl AdjustmentReceiver {
         self.queue.pop().ok()
     }
 
-    /// Observations dropped so far because the queue was full.
+    /// Observations dropped so far: lost to a full queue or behind
+    /// something owed.
     #[must_use]
     pub fn dropped(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)
+    }
+
+    /// Whether the tap waits for room to send what it owes: the consumer
+    /// wakes the input thread after a drain that finds it set.
+    #[must_use]
+    pub fn owed(&self) -> bool {
+        self.owed.load(Ordering::Acquire)
+    }
+}
+
+/// The window's presentation focus (design.md "Play Adjustments"), read by
+/// the input thread at every batch and boundary: whether the window has
+/// focus now, and how many times it has lost it. Not the recording's focus
+/// gate, which stays tripped until the next opening.
+#[derive(Clone, Debug)]
+pub struct PresentationFocus(Arc<FocusWords>);
+
+#[derive(Debug)]
+struct FocusWords {
+    focused: AtomicBool,
+    losses: AtomicU64,
+}
+
+impl Default for PresentationFocus {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PresentationFocus {
+    /// Focused, with no loss counted.
+    #[must_use]
+    pub fn new() -> Self {
+        Self(Arc::new(FocusWords {
+            focused: AtomicBool::new(true),
+            losses: AtomicU64::new(0),
+        }))
+    }
+
+    /// The window gained (`true`) or lost focus: a loss is counted, so one
+    /// that came back before the next read is still seen.
+    pub fn set(&self, focused: bool) {
+        if !focused {
+            self.0.losses.fetch_add(1, Ordering::AcqRel);
+        }
+        self.0.focused.store(focused, Ordering::Release);
+    }
+
+    /// Whether the window has focus, and the losses counted so far.
+    #[must_use]
+    pub fn read(&self) -> (bool, u64) {
+        let losses = self.0.losses.load(Ordering::Acquire);
+        (self.0.focused.load(Ordering::Acquire), losses)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{WindowKeyEvent, window_keys};
+
+    /// An overflow's acknowledgement takes the held keys in one step with
+    /// clearing the overflow: F2 released after the input thread read the
+    /// keys, and dropped by the window since the overflow still stood, is
+    /// in the baseline all the same.
+    #[test]
+    fn an_acknowledgement_keeps_a_release_made_while_it_reads() {
+        let (mut keys, receiver) = window_keys();
+        assert!(keys.key(1, WindowKeyEvent::Press, false));
+        for _ in 1..super::WINDOW_KEYS {
+            assert!(keys.key(1, WindowKeyEvent::Repeat, false));
+        }
+        assert!(!keys.key(1, WindowKeyEvent::Repeat, false), "overflowed");
+        let mut released = false;
+        let held = receiver.shared.acknowledge(|| {
+            if !std::mem::replace(&mut released, true) {
+                // Dropped: the overflow still stands.
+                assert!(!keys.key(1, WindowKeyEvent::Release, false));
+            }
+        });
+        assert_eq!(held, Some(0), "the release is in the baseline");
+    }
+
+    /// The acknowledgement is bounded: a window changing its keys between
+    /// every read and step leaves the overflow standing, for the next wake,
+    /// instead of holding the input thread; once the window is quiet it
+    /// goes through.
+    #[test]
+    fn a_busy_window_leaves_the_acknowledgement_for_the_next_wake() {
+        let (mut keys, receiver) = window_keys();
+        for _ in 0..=super::WINDOW_KEYS {
+            keys.key(1, WindowKeyEvent::Press, false);
+        }
+        let mut tries = 0;
+        let held = receiver.shared.acknowledge(|| {
+            tries += 1;
+            // A dropped repeat moves the version every time.
+            assert!(!keys.key(1, WindowKeyEvent::Repeat, false));
+        });
+        assert_eq!(held, None);
+        assert_eq!(tries, super::ACK_TRIES);
+        assert!(
+            receiver
+                .shared
+                .word
+                .load(std::sync::atomic::Ordering::Acquire)
+                & super::OVERFLOW
+                != 0
+        );
+        assert_eq!(receiver.shared.acknowledge(|| {}), Some(2));
+    }
+}
+
+#[cfg(test)]
+mod owed_tests {
+    use bms_model::TimeUs;
+
+    use super::{ADJUST_QUEUE, AdjustmentBindings, Marker, TapEvent, adjustment_queue};
+
+    /// E2's interleaving: the tap finds no room, the consumer drains
+    /// everything while `owed` still reads false, then the tap publishes
+    /// `owed`. Its recheck finds the room the drain made and sends what it
+    /// owes, so nothing waits on a wake no one will send.
+    #[test]
+    fn a_drain_before_owed_is_published_is_caught_by_the_recheck() {
+        let (mut tap, mut rx) = adjustment_queue(AdjustmentBindings::default()).unwrap();
+        tap.set_active(true);
+        tap.tick(TimeUs(0));
+        while rx.pop().is_some() {}
+        // Fill the queue to the last slot.
+        for k in 0..ADJUST_QUEUE as i64 {
+            tap.send(TimeUs(k + 1), TapEvent::Tick);
+        }
+        tap.owed.push(Marker::Fence(1));
+        let rx = std::cell::RefCell::new(rx);
+        tap.flush_racing(TimeUs(5_000), || {
+            let mut rx = rx.borrow_mut();
+            assert!(!rx.owed(), "not published yet");
+            while rx.pop().is_some() {}
+        });
+        let mut rx = rx.into_inner();
+        assert!(!rx.owed(), "the recheck sent it");
+        assert_eq!(rx.pop().map(|o| o.event), Some(TapEvent::Fence(1)));
     }
 }
