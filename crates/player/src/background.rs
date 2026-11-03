@@ -435,6 +435,11 @@ pub fn measure(job: &Job, stop: &(dyn Fn() -> bool + Sync)) -> Outcome {
         &format!("loudness: measuring {} in the background", job.name),
         false,
     );
+    // A script's gate (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    if !crate::dev::background_gate(stop) {
+        return Outcome::Stopped;
+    }
     // The player's parts are the standard ones: what reads its charts.
     let parts = game::Parts::unsaved(&game::PlayerSettings::default());
     let chart = match job.source.read(&parts, Speed::NORMAL) {

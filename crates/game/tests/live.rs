@@ -2496,6 +2496,7 @@ fn what_ifs_are_condensed_on_the_as_played_axis() {
         chart: &chart(),
         preset: &report.preset,
         live: &report.live,
+        tally: &report.tally,
     };
     let r = game::ReEvaluate::under(&ctx, &preset).unwrap();
     assert!(r.evaluation.final_deadline > axis.end);

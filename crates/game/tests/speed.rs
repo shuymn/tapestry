@@ -198,10 +198,11 @@ fn windows_stay_in_real_time_at_half_speed() {
             .find(|e| e.kind == JudgeEventKind::SongEnd)
             .unwrap()
             .time;
-        (judgments(&report.live), end.0 - last.0, last)
+        let counts = (report.tally.fast(), report.tally.slow());
+        (judgments(&report.live), end.0 - last.0, last, counts)
     };
-    let (normal, normal_tail, normal_last) = run(Speed::NORMAL);
-    let (half, half_tail, half_last) = run(Speed::SLOWEST);
+    let (normal, normal_tail, normal_last, normal_counts) = run(Speed::NORMAL);
+    let (half, half_tail, half_last, half_counts) = run(Speed::SLOWEST);
     // The chart plays at half speed: its last note, at 12 s, is at 24 s.
     assert_eq!(
         (normal_last, half_last),
@@ -212,6 +213,9 @@ fn windows_stay_in_real_time_at_half_speed() {
     assert_eq!(half, normal);
     let deviations: Vec<Option<i64>> = half.iter().map(|j| j.3).collect();
     assert_eq!(deviations, DEVIATIONS.map(Some));
+    // FAST and SLOW by the same real-time windows: three presses each
+    // side outside PERFECT, the speed applied once, by the chart.
+    assert_eq!((half_counts, normal_counts), ((3, 3), (3, 3)));
     // The late BAD edge after the last note, 180 ms, is the same real
     // time too.
     assert_eq!((half_tail, normal_tail), (180 * MS, 180 * MS));

@@ -428,6 +428,7 @@ pub fn draw(imported: &Imported) -> Vec<usize> {
         combo: 1,
         max_combo: 1,
         empty_poor: 0,
+        ..Default::default()
     };
     let states = [GaugeState {
         value: gauges[0].start,
@@ -581,6 +582,7 @@ fn lane_order_probes(
         combo: 0,
         max_combo: 0,
         empty_poor: 0,
+        ..Default::default()
     };
     let states = [GaugeState {
         value: GaugeValue(0),
@@ -645,6 +647,7 @@ fn gauge_probes(
         combo: 0,
         max_combo: 0,
         empty_poor: 0,
+        ..Default::default()
     };
     for (max, border) in [(7, 0), (7, 7), (7, 3), (i64::MAX, i64::MAX / 2)] {
         let descs = [GaugeDesc {
@@ -765,6 +768,7 @@ pub fn judged_rects(imported: &Imported, full: bool) -> Vec<[f32; 4]> {
         combo: 12,
         max_combo: 12,
         empty_poor: 0,
+        ..Default::default()
     };
     let mut batch = QuadBatch::with_capacity(skin.quad_capacity(), skin.run_capacity());
     let event = |ms: i64, kind| JudgeEvent {
@@ -856,6 +860,7 @@ fn grade_anchor_probes(
         combo: 12,
         max_combo: 12,
         empty_poor: 0,
+        ..Default::default()
     };
     let judgments = [
         Judgment::Perfect,
@@ -1060,6 +1065,7 @@ fn digit_probes(
             combo: value,
             max_combo: value,
             empty_poor: 0,
+            ..Default::default()
         };
         let effects = [JudgeEvent {
             seq: 0,
@@ -1322,6 +1328,7 @@ fn choice_probes(
             combo: 0,
             max_combo: 0,
             empty_poor: 0,
+            ..Default::default()
         };
         batch.clear();
         let notes = eval::NoteFacts::default();
@@ -1387,6 +1394,7 @@ fn rate_and_kind_probes(
         max_combo: max,
         // As many as the POORs: consistent under either policy.
         empty_poor: max,
+        ..Default::default()
     };
     for counted in [false, true] {
         let ctx = PlayContext {
@@ -1574,6 +1582,7 @@ fn readout_probes(
         combo: 0,
         max_combo: 0,
         empty_poor: 0,
+        ..Default::default()
     };
     let top = READOUT_MAX.unsigned_abs();
     for range in [
@@ -2001,6 +2010,15 @@ fn check_usage(i: &Imported) {
                 NoteFallback::Mine => 4,
             };
             entries += 1;
+        } else if n.kind == NoteKind::ColourClamped {
+            // A clamped colour channel is the other fallback (design:
+            // docs/stage3.md "Tracks").
+            assert_eq!(
+                n.severity,
+                Severity::Fallback,
+                "a clamped colour's severity"
+            );
+            assert!(n.at.is_some(), "an unlocated clamped colour");
         } else {
             assert_ne!(n.severity, Severity::Fallback, "a fallback of another kind");
         }

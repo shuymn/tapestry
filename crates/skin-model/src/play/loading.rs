@@ -84,6 +84,20 @@ const FIELDS: [LoadingField; field::COUNT] = {
         Unavailable, // duration.ms
         Unavailable, // duration.green
         Unavailable, // duration.valid
+        Unavailable, // count.fast
+        Unavailable, // count.slow
+        Unavailable, // count.early.perfect
+        Unavailable, // count.late.perfect
+        Unavailable, // count.early.great
+        Unavailable, // count.late.great
+        Unavailable, // count.early.good
+        Unavailable, // count.late.good
+        Unavailable, // count.early.bad
+        Unavailable, // count.late.bad
+        Unavailable, // count.early.poor
+        Unavailable, // count.late.poor
+        Unavailable, // count.early.empty_poor
+        Unavailable, // count.late.empty_poor
     ]
 };
 

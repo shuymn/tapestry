@@ -8,7 +8,7 @@
 use bms_model::TimeUs;
 use eval::{Evaluation, GaugeResult, JudgeEvent};
 use replay::verify::Coverage;
-use rules::{GaugeKind, GaugeValue, Judgment, PerJudgment};
+use rules::{GaugeKind, GaugeValue};
 
 use crate::result_screen::SHOWN_GAUGES;
 use crate::results::press_deviations;
@@ -103,14 +103,11 @@ impl GaugeTrace {
     };
 }
 
-/// Press deviations by judgment and in 2 ms bins (design.md "Play
-/// Lifecycle"): the presses the recommended offset reads.
+/// Press deviations in 2 ms bins (design.md "Play Lifecycle"): the
+/// presses the recommended offset reads. Each judgment's early and late
+/// counts are the evaluation's [`Tally`](eval::Tally), not these.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Timing {
-    /// Presses before their note, per judgment.
-    pub early: PerJudgment<u32>,
-    /// Presses after their note, per judgment.
-    pub late: PerJudgment<u32>,
     /// Presses exactly on their note.
     pub exact: u32,
     /// Every press by deviation: bin `i` holds
@@ -122,19 +119,9 @@ pub struct Timing {
     pub later: u32,
 }
 
-const ZERO: PerJudgment<u32> = PerJudgment {
-    perfect: 0,
-    great: 0,
-    good: 0,
-    bad: 0,
-    poor: 0,
-};
-
 impl Timing {
     /// No press.
     pub const NONE: Self = Self {
-        early: ZERO,
-        late: ZERO,
         exact: 0,
         bins: [0; TIMING_BINS],
         earlier: 0,
@@ -145,24 +132,9 @@ impl Timing {
     #[must_use]
     pub fn of(events: &[JudgeEvent]) -> Self {
         let mut t = Self::NONE;
-        for (j, d) in press_deviations(events) {
-            let side = match d.0.signum() {
-                -1 => Some(&mut t.early),
-                1 => Some(&mut t.late),
-                _ => None,
-            };
-            match side {
-                Some(side) => {
-                    let n = match j {
-                        Judgment::Perfect => &mut side.perfect,
-                        Judgment::Great => &mut side.great,
-                        Judgment::Good => &mut side.good,
-                        Judgment::Bad => &mut side.bad,
-                        Judgment::Poor => &mut side.poor,
-                    };
-                    *n = n.saturating_add(1);
-                }
-                None => t.exact = t.exact.saturating_add(1),
+        for (_, d) in press_deviations(events) {
+            if d.0 == 0 {
+                t.exact = t.exact.saturating_add(1);
             }
             let bin = d.0.saturating_sub(TIMING_LOW_US).div_euclid(TIMING_BIN_US);
             let slot = match usize::try_from(bin) {

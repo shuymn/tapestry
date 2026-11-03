@@ -373,6 +373,20 @@ impl Play {
             r.duration_ms,
             r.green,
             r.duration_valid,
+            count(t.fast()),
+            count(t.slow()),
+            count(t.early.perfect),
+            count(t.late.perfect),
+            count(t.early.great),
+            count(t.late.great),
+            count(t.early.good),
+            count(t.late.good),
+            count(t.early.bad),
+            count(t.late.bad),
+            count(t.early.poor),
+            count(t.late.poor),
+            count(t.empty_poor_early),
+            count(t.empty_poor_late),
         ];
     }
 

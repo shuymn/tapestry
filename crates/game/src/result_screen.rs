@@ -615,6 +615,7 @@ impl ResultScreen {
                 chart,
                 preset: &report.preset,
                 live: &report.live,
+                tally: &report.tally,
             },
             &preset,
         );

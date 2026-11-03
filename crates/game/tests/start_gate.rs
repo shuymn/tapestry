@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use bms_model::{Chart, ChartBuilder, SoundId, TimeUs};
-use common::{MS, PERIOD, RATE, count_judged, lane, tapestry_settings};
+use common::{MS, PERIOD, RATE, count_judged, judgments, lane, tapestry_settings};
 use eval::{ControlId, InputKind, PhysicalInputEvent, SourceId};
 use game::{
     AbortCause, AdjustmentConfig, ChartIngest, Command, DataRoot, DeviceSettings, HiSpeedSettings,
@@ -386,6 +386,76 @@ fn every_rearm_takes_a_fresh_origin_and_keeps_every_opening() {
     assert_eq!(count_judged(&report.live, Judgment::Perfect), 3);
     assert!(report.result.as_ref().unwrap().matches_live);
     assert_eq!(bgm_starts(&mut s), 1);
+    saved_decodes(&report);
+}
+
+/// FAST and SLOW are the winning READY's alone: a press 160 ms before
+/// a note at 100 ms in a cancelled candidate (BAD, FAST) is gone with it;
+/// the winner's press 30 ms late on that note counts SLOW, live and in
+/// the record's re-evaluation alike. The cancelled opening's recorded
+/// input, evaluated from its own snapshot to its close, witnesses that
+/// the candidate scored that press before the rearm.
+#[test]
+fn fast_and_slow_count_the_winning_ready_only() {
+    let (_dir, root) = temp_root();
+    let chart = ChartBuilder::new(150_000)
+        .sound("bgm.wav")
+        .tap(lane(1), TimeUs(100 * MS))
+        .tap(lane(1), TimeUs(1_000 * MS))
+        .tap(lane(2), TimeUs(1_200 * MS))
+        .tap(lane(3), TimeUs(1_400 * MS))
+        .bgm(TimeUs(0), SoundId(0))
+        .build()
+        .unwrap();
+    let device = audio::SimDevice::new(audio::SimConfig::steady(RATE, PERIOD, TimeUs(0)));
+    let out = audio::RecordingOutput::new(device, 0);
+    let mut s = session_of(
+        &root,
+        &Events::default(),
+        &chart,
+        common::sources(),
+        out,
+        true,
+    );
+    let mut items = vec![connect(0)];
+    items.extend(tap(1, -60));
+    items.push(raw(-50, 0, Q, 1));
+    items.push(raw(200, 0, Q, 0));
+    items.extend(tap(1, 1_200 + 130));
+    items.extend(notes_from(1_200));
+    let report = s.play(script(items, &[])).unwrap();
+
+    assert_eq!(report.end, PlayEnd::Completed);
+    let r = record(&report);
+    let [o] = &r.history.openings[..] else {
+        panic!("{:?}", r.history.openings);
+    };
+    let range = o.events.start as usize..o.events.end as usize;
+    let cancelled = eval::evaluate(
+        &chart,
+        &eval::EvalInput {
+            events: r.history.events[range].to_vec(),
+            device: r.devices.profile(),
+            start: o.start.clone(),
+            finalized: Some(o.closed),
+            section: None,
+        },
+        &rules::tapestry(),
+    )
+    .unwrap();
+    assert_eq!(
+        judgments(&cancelled.events),
+        [(1, 0, Judgment::Bad, Some(-160 * MS))]
+    );
+    assert_eq!((cancelled.tally.fast(), cancelled.tally.slow()), (1, 0));
+    // The rearm starts the winner from nothing.
+    assert_eq!(count_judged(&report.live, Judgment::Bad), 0);
+    assert_eq!(count_judged(&report.live, Judgment::Great), 1);
+    assert_eq!(count_judged(&report.live, Judgment::Perfect), 3);
+    assert_eq!((report.tally.fast(), report.tally.slow()), (0, 1));
+    let result = report.result.as_ref().unwrap();
+    assert!(result.matches_live);
+    assert_eq!(result.evaluation.as_ref().unwrap().tally, report.tally);
     saved_decodes(&report);
 }
 
