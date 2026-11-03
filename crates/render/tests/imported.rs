@@ -93,7 +93,7 @@ fn each_fresh_attempt_draws_its_own_bitmap_labels() {
 /// clock from origin 0, with the lift at `lift` ‰ (on) and text revision
 /// `text`.
 fn loading_at(lifetime: u64, now: i64, lift: u16, text: u64) -> LoadingFrame<'static> {
-    let mut f = LoadingFrame::interim(lifetime, TimeUs(now * MS), TimeUs(0));
+    let mut f = common::loading_frame(lifetime, TimeUs(now * MS), TimeUs(0));
     f.lanes.lift = lift;
     f.covers.lift = lift;
     f.covers.lift_enabled = true;

@@ -339,6 +339,7 @@ pub const IN_PLAY: &[Site] = &[
     Site::File("crates/render/src/measure.rs"),
     Site::File("crates/render/src/overlay.rs"),
     Site::File("crates/render/src/pace.rs"),
+    Site::File("crates/render/src/presentation.rs"),
     Site::File("crates/render/src/projection.rs"),
     Site::File("crates/render/src/renderer.rs"),
     Site::File("crates/render/src/simple.rs"),

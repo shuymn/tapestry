@@ -22,18 +22,14 @@ pub struct FrameInput<'a> {
     /// Chart time when the frame's work starts, read from QPC.
     pub now: TimeUs,
     /// The display latency offset: how much later than `now` the frame is
-    /// expected to reach the screen (design.md "Rendering and Skins").
+    /// expected to reach the screen (design.md "Rendering and Skins"), as
+    /// the presentation snapshot holds it.
     pub display_offset: TimeUs,
-    /// The simple skin's hi-speed as the visible time (design.md
-    /// "Algorithms"): how long a note's center takes from the top of the
-    /// lane to the judgment line while the chart scrolls at its initial
-    /// BPM. The note's edge shows slightly earlier.
-    pub visible_time: TimeUs,
-    /// The declarative skin's lanes: the exact original-lane gain and the
-    /// effective covers (design.md "Play readouts").
+    /// The lanes: the exact original-lane gain and the effective covers
+    /// (design.md "Play readouts"), from the frame's presentation
+    /// snapshot ([`presentation::frame`](crate::presentation::frame)).
     pub lanes: LaneView,
-    /// The declarative skin's readouts, from the same presentation
-    /// snapshot as `lanes`.
+    /// The readouts, from the same snapshot as `lanes`.
     pub readouts: FrameReadouts,
     /// The newest play state.
     pub view: &'a PlayView,
@@ -82,7 +78,7 @@ pub struct LoadingFrame<'a> {
     pub target: [u32; 2],
     /// The player's layout.
     pub layout: &'a Layout,
-    /// The hi-speed and the effective covers.
+    /// The effective covers; a loading frame has no gain.
     pub lanes: LaneView,
     /// The stored cover settings `lanes` follows.
     pub covers: CoverSettings,
@@ -92,37 +88,6 @@ pub struct LoadingFrame<'a> {
     /// The revision of the loading text installed for this lifetime; 0
     /// with none.
     pub text: u64,
-}
-
-impl LoadingFrame<'static> {
-    /// A frame of lifetime `lifetime` at `now` on the loading clock, from
-    /// its origin `since`, with the interim values the render thread gives
-    /// until the player's bridge (docs/stage3.md S10-03c-3): the author's
-    /// layout, every cover 0 and off and not being adjusted, no gain (a
-    /// loading frame has none), no gauge descriptor, progress 0 and no
-    /// text. The renderer applies its own target.
-    #[must_use]
-    pub const fn interim(lifetime: u64, now: TimeUs, since: TimeUs) -> Self {
-        Self {
-            lifetime,
-            now,
-            load: LoadState { since, percent: 0 },
-            target: [1_920, 1_080],
-            layout: &Layout::AUTHOR,
-            lanes: LaneView::NONE,
-            covers: CoverSettings {
-                cover: 0,
-                lift: 0,
-                hidden: 0,
-                cover_enabled: false,
-                lift_enabled: false,
-                hidden_enabled: false,
-                adjusting: false,
-            },
-            gauge: None,
-            text: 0,
-        }
-    }
 }
 
 impl<'a> LoadingFrame<'a> {
@@ -294,9 +259,7 @@ pub trait PlaySkin: Send {
 /// snapshot (design.md "Play readouts", "Play Adjustments", publication):
 /// the configured amounts and switches, and `adjusting` (condition 270,
 /// `lanecover1_changing`) true while START or SELECT is held, so an
-/// imported skin's 270 reads what the source tests. Until S10-04b-2 the
-/// player's frames keep unavailable readouts (`FrameReadouts::UNAVAILABLE`),
-/// which never call this: 270 keeps its documented D4 difference there.
+/// imported skin's 270 reads what the source tests.
 #[must_use]
 pub const fn cover_settings(s: &game::adjustment::PresentationSnapshot) -> CoverSettings {
     let covers = s.options.covers();

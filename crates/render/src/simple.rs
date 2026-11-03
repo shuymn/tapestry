@@ -5,11 +5,25 @@
 //! attempt's [`ExactPlayhead`], prepared in `prepare`, gives the playhead at
 //! the expected display time, sampled once a frame, so every note reaches
 //! the judgment line at exactly its judgment µs (design.md "Rendering and
-//! Skins", exact playhead). The hi-speed scale is fixed from the chart's
-//! initial rate, so a note takes exactly `visible_time` from the lane top to
-//! the judgment line at the start BPM. During play notes move through scroll
-//! positions at that fixed scale, so BPM changes speed them up or slow them
-//! down and STOPs freeze them, as the chart intends, and nothing ever jumps.
+//! Skins", exact playhead). The scale comes from the frame's exact
+//! original-lane gain `H`
+//! ([`LaneView::gain`](skin_model::LaneView::gain)): one measure of four
+//! beats takes `1 / H` of the original lane, from the lane top to the
+//! unlifted judgment line, through
+//! [`Gain::px_per_pos`](skin_model::Gain::px_per_pos) as the declarative
+//! skins' lanes take it. Notes move through scroll positions at that
+//! scale, so BPM changes speed them up or slow them down and STOPs freeze
+//! them, as the chart intends, and nothing jumps while `H` holds.
+//!
+//! The effective covers follow the lanes widget's geometry (design.md
+//! "Play Adjustments"): LIFT raises the judgment line by its share of the
+//! original lane; SUDDEN+ covers its share of what the lift leaves from
+//! the lane top down, and HIDDEN+ its share of it up from the raised line,
+//! each a solid rectangle over the notes. With no field left (LIFT or
+//! SUDDEN+ at 1 000 ‰) or no gain, only the judgment line is drawn: no
+//! note and no bar line. A line of text right of the lanes shows the native
+//! readouts ([`native_values`]).
+//!
 //! Only notes whose positions meet the visible range are visited, found per
 //! lane by binary search on positions. A note judged by an effect is hidden
 //! through a per-note bit set sized in `prepare`.
@@ -20,7 +34,7 @@ use bms_model::{Chart, LANE_COUNT, Lane, Note, NoteKind, Position, TimeUs};
 use eval::{InputFacts, JudgeEvent, JudgeEventKind, NoteFacts, Section};
 use game::ResultGraphs;
 use rules::{GaugeValue, Judgment, LnMode};
-use skin_model::{BuildError, ExactPlayhead, PrepareError};
+use skin_model::{BuildError, ExactPlayhead, NativeValues, PrepareError, native_values};
 
 use crate::atlas::{GLYPH_H, GLYPH_W, glyph_uv, solid_uv};
 use crate::{
@@ -30,7 +44,9 @@ use crate::{
 /// The layout, in layout pixels of the 1920×1080 base resolution, and the
 /// placement of notes in it.
 pub mod layout {
-    use bms_model::{Lane, Position, TimeUs};
+    use bms_model::{Lane, Position};
+    pub use skin_model::Scale;
+    use skin_model::{Gain, LaneView};
 
     /// Base width the layout is authored at.
     pub const WIDTH: f32 = 1920.0;
@@ -44,16 +60,18 @@ pub mod layout {
     pub const KEY_W: f32 = 64.0;
     /// Right edge of the last key lane.
     pub const LANES_RIGHT: f32 = LANE_LEFT + SCRATCH_W + 7.0 * KEY_W;
-    /// Top of the lanes, where a note appears `visible_time` before it
-    /// reaches the judgment line.
+    /// Top of the lanes, where the original lane starts.
     pub const LANE_TOP: f32 = 80.0;
-    /// The judgment line.
+    /// The judgment line with no lift: the original lane's end.
     pub const JUDGE_Y: f32 = 880.0;
     /// Bottom of the lanes: a late note keeps falling below the judgment
     /// line until here, or until its miss is judged.
     pub const LANE_BOTTOM: f32 = 960.0;
     /// Height of a note; a note's position is its vertical center.
     pub const NOTE_H: f32 = 16.0;
+    /// The original lane's length, which the gain scales: one measure at
+    /// `H` 1.
+    pub const LANE_LEN: f32 = JUDGE_Y - LANE_TOP;
 
     /// Left edge and width of `lane`.
     #[must_use]
@@ -64,69 +82,64 @@ pub mod layout {
         }
     }
 
-    /// Where the scroll stands for one frame: the playhead at the display
-    /// time and the pixels per unit of position.
+    /// Where the covers put the lane for one frame, in layout pixels: the
+    /// lanes widget's geometry over the original lane [`LANE_LEN`], each
+    /// amount at most 1 000 ‰.
     #[derive(Clone, Copy, Debug, PartialEq)]
-    pub struct Scale {
-        /// The display position at the judgment line.
-        pub at_line: Position,
-        /// Pixels per unit of position (2^-80 beat).
-        pub px_per_pos: f64,
+    pub struct Field {
+        /// The judgment line, raised by the lift's share of the lane.
+        pub line_y: f64,
+        /// SUDDEN+'s height from the lane top: its share of what the lift
+        /// leaves.
+        pub cover_px: f64,
+        /// HIDDEN+'s height up from the raised line: its share of what the
+        /// lift leaves.
+        pub hidden_px: f64,
+        /// The scroll's length, from the uncovered top to the line; exactly
+        /// 0 only when LIFT or SUDDEN+ is at 1 000 ‰.
+        pub span: f64,
     }
 
-    impl Scale {
-        /// The scale with the playhead at `at_line` and hi-speed
-        /// `visible_time`. A visible time below 1 µs counts as 1 µs.
-        ///
-        /// The lane from [`LANE_TOP`] to [`JUDGE_Y`] holds the scroll of
-        /// `visible_time` at the chart's initial rate, `initial_rate` units
-        /// per µs. The pixels per position never change during a play,
-        /// whatever the BPM at the playhead.
+    impl Field {
+        /// The field of the effective covers in `view`.
         #[must_use]
-        pub fn new(at_line: Position, initial_rate: i128, visible_time: TimeUs) -> Self {
-            let visible = visible_time.0.max(1) as f64;
-            let span = visible * initial_rate as f64;
+        pub fn of(view: &LaneView) -> Self {
+            let (lift, cover, hidden) = (
+                view.lift.min(1_000),
+                view.cover.min(1_000),
+                view.hidden.min(1_000),
+            );
+            let len = f64::from(LANE_LEN);
+            let left = len * f64::from(1_000 - lift) / 1_000.0;
+            let span = left * f64::from(1_000 - cover) / 1_000.0;
             Self {
-                at_line,
-                px_per_pos: f64::from(JUDGE_Y - LANE_TOP) / span,
+                line_y: f64::from(JUDGE_Y) - (len - left),
+                cover_px: left - span,
+                hidden_px: left * f64::from(hidden) / 1_000.0,
+                span,
             }
         }
+    }
 
-        /// The vertical center of something at display position `p`.
-        #[must_use]
-        pub fn y(&self, p: Position) -> f32 {
-            let ahead = p.minus(self.at_line) as f64;
-            (f64::from(JUDGE_Y) - ahead * self.px_per_pos) as f32
-        }
-
-        /// The positions whose vertical center lies `below` pixels under
-        /// the judgment line through `above` pixels over it, widened to
-        /// whole units.
-        #[must_use]
-        pub fn positions(&self, below: f32, above: f32) -> (Position, Position) {
-            let units = |px: f32| (f64::from(px) / self.px_per_pos).ceil() as i128;
-            (
-                Position(self.at_line.0.saturating_sub(units(below))),
-                Position(self.at_line.0.saturating_add(units(above))),
-            )
-        }
+    /// The scale of a frame whose playhead stands at `at_line`, with the
+    /// gain `gain` over the original lane and the judgment line at
+    /// `line_y` ([`Field::line_y`]). For a fixed gain the pixels per
+    /// position never change, whatever the BPM at the playhead.
+    #[must_use]
+    pub fn scale(at_line: Position, gain: Gain, line_y: f64) -> Scale {
+        Scale::from_gain(at_line, gain, f64::from(LANE_LEN), line_y)
     }
 
     /// The vertical center of something at display position `pos` in a
-    /// frame whose playhead stands at `at_line`, with the chart's
-    /// `initial_rate` and hi-speed `visible_time`.
+    /// frame whose playhead stands at `at_line`, with the gain `gain` and
+    /// no lift.
     #[must_use]
-    pub fn note_y(
-        pos: Position,
-        at_line: Position,
-        initial_rate: i128,
-        visible_time: TimeUs,
-    ) -> f32 {
-        Scale::new(at_line, initial_rate, visible_time).y(pos)
+    pub fn note_y(pos: Position, at_line: Position, gain: Gain) -> f32 {
+        scale(at_line, gain, f64::from(JUDGE_Y)).y(pos)
     }
 }
 
-use layout::{JUDGE_Y, LANE_BOTTOM, LANE_LEFT, LANE_TOP, LANES_RIGHT, NOTE_H, Scale};
+use layout::{Field, LANE_BOTTOM, LANE_LEFT, LANE_TOP, LANES_RIGHT, NOTE_H, Scale};
 
 type Rgba = [f32; 4];
 
@@ -150,6 +163,8 @@ pub(crate) const TEXT: Rgba = [0.9, 0.9, 0.9, 1.0];
 const READY_TEXT: Rgba = [1.0, 0.9, 0.4, 1.0];
 const BEAM: Rgba = [0.25, 0.3, 0.55, 0.8];
 const BOMB: Rgba = [1.0, 0.6, 0.15, 1.0];
+/// SUDDEN+ and HIDDEN+.
+const COVER: Rgba = [0.1, 0.1, 0.12, 1.0];
 
 /// Height of a mine.
 const MINE_H: f32 = 8.0;
@@ -179,6 +194,13 @@ const SCORE_X: f32 = 760.0;
 const SCORE_Y: f32 = 120.0;
 const SCORE_SCALE: f32 = 4.0;
 const SMALL_SCALE: f32 = 3.0;
+/// The native readouts' line, right of the lanes under the gauge's
+/// percentage, clear of every lane column: glyphs 10×14.
+const HUD_X: f32 = LANES_RIGHT + 16.0;
+const HUD_Y: f32 = 1040.0;
+const HUD_SCALE: f32 = 2.0;
+/// The longest native line: every value at its widest is 95 bytes.
+const HUD_BYTES: usize = 128;
 
 /// One bit per note of a lane.
 #[derive(Clone, Debug, Default)]
@@ -290,15 +312,14 @@ impl SimpleSkin {
     }
 
     /// The frame's scale: the playhead sampled once at the display time,
-    /// with the chart's initial rate and the hi-speed; `None` with no
-    /// attempt prepared.
-    fn scale(&self, f: &FrameInput<'_>) -> Option<Scale> {
+    /// with the lanes' gain and the judgment line of `field`; `None` with
+    /// no attempt prepared, no gain or no field left, when no note and no
+    /// bar line is drawn.
+    fn scale(&self, f: &FrameInput<'_>, field: &Field) -> Option<Scale> {
         let playhead = self.playhead.as_ref()?;
-        Some(Scale::new(
-            playhead.position_at(f.display_time()),
-            playhead.initial_rate(),
-            f.visible_time,
-        ))
+        let gain = f.lanes.gain?;
+        (field.span > 0.0)
+            .then(|| layout::scale(playhead.position_at(f.display_time()), gain, field.line_y))
     }
 
     /// Masks every note that is not one of the practice section's
@@ -482,7 +503,7 @@ impl SimpleSkin {
                             continue;
                         }
                         let tail = scale.y(end_pos);
-                        let head = head.min(JUDGE_Y);
+                        let head = head.min(scale.line_y as f32);
                         let body = if body_active(self.ln_mode, held == Some(i)) {
                             shade(color, LN_BODY_ACTIVE)
                         } else {
@@ -509,7 +530,7 @@ impl SimpleSkin {
     /// Each lane's key beam from the view's `input`, whatever effects were
     /// dropped: whole while the lane is held, notes or none, fading from
     /// its release; and its bomb from the effects.
-    fn effects(&self, out: &mut SpriteBatch, input: &InputFacts, at: TimeUs) {
+    fn effects(&self, out: &mut SpriteBatch, input: &InputFacts, at: TimeUs, line_y: f32) {
         for lane in Lane::all() {
             let (x, w) = layout::lane_x(lane);
             let key = input.lane(lane);
@@ -520,7 +541,7 @@ impl SimpleSkin {
             };
             if let Some(f) = beam {
                 let c = [BEAM[0], BEAM[1], BEAM[2], BEAM[3] * f];
-                rect(out, Blend::Add, x, LANE_TOP, w, JUDGE_Y - LANE_TOP, c);
+                rect(out, Blend::Add, x, LANE_TOP, w, line_y - LANE_TOP, c);
             }
             #[expect(clippy::indexing_slicing, reason = "`Lane::index` is below LANE_COUNT")]
             if let Some(f) = self.hit[lane.index()].and_then(|t| fade(at, t, BOMB_US)) {
@@ -531,13 +552,57 @@ impl SimpleSkin {
                     out,
                     Blend::Add,
                     cx - side / 2.0,
-                    JUDGE_Y - side / 2.0,
+                    line_y - side / 2.0,
                     side,
                     side,
                     c,
                 );
             }
         }
+    }
+
+    /// The judgment line centred on `line_y`.
+    fn line(out: &mut SpriteBatch, line_y: f32) {
+        let w = LANES_RIGHT - LANE_LEFT;
+        let y = line_y - JUDGE_LINE_H / 2.0;
+        rect(out, Blend::Alpha, LANE_LEFT, y, w, JUDGE_LINE_H, JUDGE_LINE);
+    }
+
+    /// SUDDEN+ from the lane top down and HIDDEN+ up from the raised line,
+    /// each a solid rectangle across the lanes over the notes; with
+    /// HIDDEN+ the judgment line is drawn again over it.
+    fn covers(out: &mut SpriteBatch, field: &Field) {
+        let w = LANES_RIGHT - LANE_LEFT;
+        if field.cover_px > 0.0 {
+            rect(
+                out,
+                Blend::Alpha,
+                LANE_LEFT,
+                LANE_TOP,
+                w,
+                field.cover_px as f32,
+                COVER,
+            );
+        }
+        if field.hidden_px > 0.0 {
+            let top = field.line_y - field.hidden_px;
+            rect(
+                out,
+                Blend::Alpha,
+                LANE_LEFT,
+                top as f32,
+                w,
+                field.hidden_px as f32,
+                COVER,
+            );
+            Self::line(out, field.line_y as f32);
+        }
+    }
+
+    /// The native readouts in one line right of the lanes ([`hud_line`]).
+    fn native_hud(out: &mut SpriteBatch, v: &NativeValues, covers: &skin_model::CoverSettings) {
+        let line = hud_line(v, covers);
+        text(out, HUD_X, HUD_Y, HUD_SCALE, TEXT, line.bytes());
     }
 
     fn hud(&self, f: &FrameInput<'_>, out: &mut SpriteBatch, at: TimeUs) {
@@ -623,17 +688,18 @@ impl PlaySkin for SimpleSkin {
         Ok(())
     }
 
-    /// The lanes, the judgment line and the gauge's frame, whatever the
-    /// frame: never refuses.
+    /// The lanes, the judgment line where the frame's lift puts it, its
+    /// covers and the gauge's frame, whatever the frame: never refuses.
     fn build_loading(
         &mut self,
-        _f: &LoadingFrame<'_>,
+        f: &LoadingFrame<'_>,
         out: &mut SpriteBatch,
     ) -> Result<(), BuildError> {
+        let field = Field::of(&f.lanes);
         Self::lanes_and_lines(out);
+        Self::line(out, field.line_y as f32);
+        Self::covers(out, &field);
         let w = LANES_RIGHT - LANE_LEFT;
-        let y = JUDGE_Y - JUDGE_LINE_H / 2.0;
-        rect(out, Blend::Alpha, LANE_LEFT, y, w, JUDGE_LINE_H, JUDGE_LINE);
         rect(out, Blend::Alpha, LANE_LEFT, GAUGE_Y, w, GAUGE_H, GAUGE_BG);
         Ok(())
     }
@@ -647,30 +713,34 @@ impl PlaySkin for SimpleSkin {
         self.judgment = None;
     }
 
-    /// Never refuses a frame.
+    /// Refuses only a frame whose readouts are malformed
+    /// ([`native_values`]), before pushing anything.
     fn build(&mut self, f: &FrameInput<'_>, out: &mut SpriteBatch) -> Result<(), BuildError> {
+        let native = native_values(&f.lanes, &f.readouts)?;
         for ev in f.effects {
             self.apply(ev);
         }
+        let field = Field::of(&f.lanes);
+        let line_y = field.line_y as f32;
         let half = NOTE_H / 2.0;
-        let range = self.scale(f).map(|s| {
-            let (from, to) = s.positions(LANE_BOTTOM - JUDGE_Y + half, JUDGE_Y - LANE_TOP + half);
+        let range = self.scale(f, &field).map(|s| {
+            let (from, to) = s.positions(LANE_BOTTOM - line_y + half, line_y - LANE_TOP + half);
             (s, from, to)
         });
         Self::lanes_and_lines(out);
         if let Some((scale, from, to)) = range {
             self.bar_lines(out, &scale, from, to);
         }
-        let w = LANES_RIGHT - LANE_LEFT;
-        let y = JUDGE_Y - JUDGE_LINE_H / 2.0;
-        rect(out, Blend::Alpha, LANE_LEFT, y, w, JUDGE_LINE_H, JUDGE_LINE);
+        Self::line(out, line_y);
         if let Some((scale, from, to)) = range {
             self.notes(out, &scale, (from, to), &f.view.notes, f.now);
         }
+        Self::covers(out, &field);
         // Feedback ages on the frame's own clock: the display offset moves
         // notes only.
         self.hud(f, out, f.now);
-        self.effects(out, &f.view.input, f.now);
+        Self::native_hud(out, &native, &f.readouts.covers);
+        self.effects(out, &f.view.input, f.now, line_y);
         Ok(())
     }
 
@@ -1017,6 +1087,87 @@ fn ready_text(out: &mut SpriteBatch) {
     text(out, x, JUDGMENT_Y, JUDGMENT_SCALE, READY_TEXT, label);
 }
 
+/// A line of text in a fixed buffer; what passes its end is dropped.
+struct HudLine {
+    buf: [u8; HUD_BYTES],
+    len: usize,
+}
+
+impl HudLine {
+    fn push(&mut self, s: &[u8]) {
+        for &c in s {
+            if let Some(b) = self.buf.get_mut(self.len) {
+                *b = c;
+                self.len += 1;
+            }
+        }
+    }
+
+    fn number(&mut self, n: u32) {
+        let mut buf = [0; 10];
+        self.push(decimal(n, &mut buf));
+    }
+
+    /// `n` hundredths as `units.hh`.
+    fn hundredths(&mut self, n: u32) {
+        self.number(n / 100);
+        let h = n % 100;
+        self.push(&[b'.', b'0' + (h / 10) as u8, b'0' + (h % 10) as u8]);
+    }
+
+    /// `v` while its cover is `on`, else `OFF`.
+    fn cover(&mut self, name: &[u8], v: u16, on: bool) {
+        self.push(b"  ");
+        self.push(name);
+        if on {
+            self.number(u32::from(v));
+        } else {
+            self.push(b"OFF");
+        }
+    }
+
+    fn bytes(&self) -> &[u8] {
+        self.buf.get(..self.len).unwrap_or(&[])
+    }
+}
+
+/// The native HUD's line: `HI-SPEED 3.20 FLOATING  GREEN 300 (TARGET 300)
+/// SUDDEN+ 200  LIFT OFF  HIDDEN+ OFF` (two spaces between the groups).
+/// The hi-speed is the gain in hundredths, rounded, then the mode,
+/// FLOATING or CLASSIC; GREEN is the current green number, with the
+/// target in Floating; each cover shows its white number while on and
+/// OFF while off. An unavailable value shows `-`.
+fn hud_line(v: &NativeValues, covers: &skin_model::CoverSettings) -> HudLine {
+    let mut line = HudLine {
+        buf: [0; HUD_BYTES],
+        len: 0,
+    };
+    line.push(b"HI-SPEED ");
+    match v.hispeed_x100 {
+        Some(h) => line.hundredths(h),
+        None => line.push(b"-"),
+    }
+    line.push(if v.floating {
+        b" FLOATING".as_slice()
+    } else {
+        b" CLASSIC".as_slice()
+    });
+    line.push(b"  GREEN ");
+    match v.duration {
+        Some(d) => line.number(d.green),
+        None => line.push(b"-"),
+    }
+    if let Some(g) = v.target_green {
+        line.push(b" (TARGET ");
+        line.number(g);
+        line.push(b")");
+    }
+    line.cover(b"SUDDEN+ ", v.sudden_white, covers.cover_enabled);
+    line.cover(b"LIFT ", v.lift_white, covers.lift_enabled);
+    line.cover(b"HIDDEN+ ", v.hidden_white, covers.hidden_enabled);
+    line
+}
+
 /// `n` in decimal, written at the end of `buf`.
 #[expect(
     clippy::indexing_slicing,
@@ -1070,12 +1221,25 @@ mod tests {
     use eval::{GaugeState, NoteHold, Tally};
     use game::PlayView;
 
+    use skin_model::{FrameReadouts, Gain, LaneView};
+
+    use super::layout::JUDGE_Y;
     use super::*;
 
     const MS: i64 = 1_000;
     /// 150 BPM, in thousandths.
     const BPM: i64 = 150_000;
-    const VISIBLE: TimeUs = TimeUs(600 * MS);
+    /// `H` 8/3: 600 ms of 150 BPM (1.5 beats) from the lane top to the
+    /// line, 533.33 px a beat.
+    const LANES: LaneView = LaneView {
+        gain: Gain::new(8, 3),
+        ..LaneView::NONE
+    };
+    /// `H` 12/5: 480 px a beat, 120 px a quarter beat.
+    const FAST: LaneView = LaneView {
+        gain: Gain::new(12, 5),
+        ..LaneView::NONE
+    };
 
     fn lane(i: u8) -> Lane {
         Lane::new(i).unwrap()
@@ -1185,9 +1349,8 @@ mod tests {
         FrameInput {
             now: TimeUs(now),
             display_offset: TimeUs(0),
-            visible_time: VISIBLE,
-            lanes: skin_model::LaneView::NONE,
-            readouts: skin_model::FrameReadouts::UNAVAILABLE,
+            lanes: LANES,
+            readouts: FrameReadouts::UNAVAILABLE,
             view,
             effects,
             gauge: 0,
@@ -1845,20 +2008,18 @@ mod tests {
         let chart = high_bpm();
         let mut s = skin(&chart);
         let v = view();
-        // The playhead at 1 µs, 10 µs visible: 800 px over 10 µs of the
-        // start BPM, so 80 px per µs of scroll at 9,990,400 BPM.
+        // The playhead at 1 µs, `H` 12/5: 120 px a quarter beat.
         let f = FrameInput {
-            visible_time: TimeUs(10),
+            lanes: FAST,
             ..frame(&v, 1, &[])
         };
         let batch = build(&mut s, &f);
         // By hand: measure 1's tap is judged at its floored µs, 1, so the
         // playhead there is measure 1's beat, 1/4, and the tap is centred
         // on the line, y = 880 exactly (the sampled scroll map put it 40 px
-        // higher, at 839.885, a µs of scroll short of its beat). Beat k/4
-        // is then (k - 1) × 15e6 / 9_990_400 µs of scroll ahead, drawn
-        // 80 px per µs above the line.
-        let y = |k: i32| 880.0 - 80.0 * f64::from(k - 1) * 15e6 / 9_990_400.0;
+        // higher, a µs of scroll short of its beat). Beat k/4 is then
+        // k - 1 quarter beats ahead, 120 px each above the line.
+        let y = |k: i32| 880.0 - 120.0 * f64::from(k - 1);
         assert_eq!(
             in_lane(&batch, lane(1), NOTE_WHITE).first(),
             Some(&[256.0, 872.0, 64.0, 16.0])
@@ -1897,8 +2058,7 @@ mod tests {
         // position, so it is centred on the line before any pixel is
         // rounded; in a practice round (from 4 µs to 12 µs: the taps at
         // measures 3-6) every target's the same. The sampled scroll map
-        // missed each by about half a µs of scroll, 40 px at 10 µs
-        // visible.
+        // missed each by about half a µs of scroll.
         let chart = high_bpm();
         let v = view();
         let round = Section {
@@ -1924,10 +2084,10 @@ mod tests {
                     for offset in [0, 3, -2] {
                         let f = FrameInput {
                             display_offset: TimeUs(offset),
-                            visible_time: TimeUs(10),
+                            lanes: FAST,
                             ..frame(&v, t.0 - offset, &[])
                         };
-                        let scale = s.scale(&f).unwrap();
+                        let scale = s.scale(&f, &Field::of(&f.lanes)).unwrap();
                         assert_eq!(scale.at_line, pos, "{t:?} offset {offset}");
                         assert_eq!(scale.y(pos), JUDGE_Y);
                         checked += 1;
@@ -1997,7 +2157,7 @@ mod tests {
             .chain([799_600, 1_199_600])
         {
             let f = frame(&v, now, &[]);
-            let scale = s.scale(&f).unwrap();
+            let scale = s.scale(&f, &Field::of(&f.lanes)).unwrap();
             assert_eq!(scale.at_line, playhead.position_at(TimeUs(now)), "{now}");
         }
         let on_line = build(&mut s, &frame(&v, 799_600, &[]));
@@ -2005,7 +2165,11 @@ mod tests {
             in_lane(&on_line, lane(1), NOTE_WHITE).first(),
             Some(&[256.0, 872.0, 64.0, 16.0])
         );
-        let rising = |now| s.scale(&frame(&v, now, &[])).unwrap().at_line;
+        let rising = |now| {
+            s.scale(&frame(&v, now, &[]), &Field::of(&LANES))
+                .unwrap()
+                .at_line
+        };
         assert!(rising(1_000_000) > rising(799_600));
     }
 
@@ -2129,8 +2293,7 @@ mod tests {
     fn bar_lines_of_equal_measures_are_drawn_evenly() {
         // Quarter-beat measures at 9,990,400 BPM last 1.5014... µs each, so
         // their floored times step by 1 or 2 µs; their positions are
-        // exactly a quarter beat apart. Over a 10 µs visible time a quarter
-        // beat is 120.1... px.
+        // exactly a quarter beat apart, 120 px at `H` 12/5.
         let mut text = String::from("#BPM 9990400\n#WAV01 a.wav\n");
         for m in 0..=64 {
             text.push_str(&format!("#{m:03}02:0.0625\n"));
@@ -2140,7 +2303,7 @@ mod tests {
         let mut s = skin(&chart);
         let v = view();
         let f = FrameInput {
-            visible_time: TimeUs(10),
+            lanes: FAST,
             ..frame(&v, 40, &[])
         };
         let batch = build(&mut s, &f);
@@ -2150,7 +2313,7 @@ mod tests {
             .map(|s| s.rect[1])
             .collect();
         assert!(ys.len() >= 6, "{ys:?}");
-        let quarter = 800.0 / (10.0 * 9_990_400.0 / 60_000_000.0) / 4.0;
+        let quarter = 120.0;
         for w in ys.windows(2) {
             let gap = w[0] - w[1];
             assert!((gap - quarter).abs() < 1e-2, "{ys:?}");
@@ -2266,16 +2429,17 @@ mod tests {
     }
 
     #[test]
-    fn visible_time_below_a_microsecond_counts_as_one() {
-        let chart = ChartBuilder::new(BPM).build().unwrap();
-        let rate = chart.scroll.initial_rate();
-        let one = layout::Scale::new(Position(0), rate, TimeUs(1));
-        // 1 µs of 150 BPM (2.5 millionths of a beat) on 800 px.
+    fn the_gain_sets_the_pixels_per_beat_over_the_original_lane() {
+        // `H` 1 puts a measure of four beats on the 800 px lane: 200 px a
+        // beat, whatever the lift.
         let beat = (1_u128 << 80) as f64;
-        assert!((one.px_per_pos * beat * 2.5e-6 - 800.0).abs() < 1e-6);
-        for v in [0, -5, i64::MIN] {
-            assert_eq!(layout::Scale::new(Position(0), rate, TimeUs(v)), one);
+        let one = Gain::new(1, 1).unwrap();
+        for line in [880.0, 600.0] {
+            let s = layout::scale(Position(0), one, line);
+            assert!((s.px_per_pos * beat - 200.0).abs() < 1e-9);
+            assert_eq!(s.y(Position(0)), line as f32);
         }
+        assert_eq!(layout::note_y(Position(1 << 80), Position(0), one), 680.0);
     }
 
     #[test]
@@ -2394,6 +2558,264 @@ mod tests {
         assert!(glyphs(&batch, READY_TEXT).is_empty());
     }
 
+    /// A frame of `chart` at `now` with the lanes `lanes`.
+    fn with_lanes(s: &mut SimpleSkin, v: &PlayView, now: i64, lanes: LaneView) -> SpriteBatch {
+        build(
+            s,
+            &FrameInput {
+                lanes,
+                ..frame(v, now, &[])
+            },
+        )
+    }
+
+    /// The cover rects, top first.
+    fn cover_rects(batch: &SpriteBatch) -> Vec<[f32; 4]> {
+        batch
+            .blended(Blend::Alpha)
+            .filter(|s| s.color == COVER)
+            .map(|s| s.rect)
+            .collect()
+    }
+
+    fn line_rects(batch: &SpriteBatch) -> Vec<[f32; 4]> {
+        batch
+            .blended(Blend::Alpha)
+            .filter(|s| s.color == JUDGE_LINE)
+            .map(|s| s.rect)
+            .collect()
+    }
+
+    /// Every note, mine and bar line drawn.
+    fn note_geometry(batch: &SpriteBatch) -> usize {
+        batch
+            .blended(Blend::Alpha)
+            .filter(|s| {
+                [NOTE_WHITE, NOTE_BLUE, NOTE_SCRATCH, MINE, BAR_LINE].contains(&s.color)
+                    || [NOTE_WHITE, NOTE_BLUE]
+                        .into_iter()
+                        .any(|c| s.color == shade(c, LN_BODY_INACTIVE))
+            })
+            .count()
+    }
+
+    /// 150 BPM: taps on key 1 at 0, 0.8 and 1.6 s, a long note on key 2
+    /// from 0.8 to 1.6 s and bar lines every 1.6 s: at 1.3 s the last
+    /// tap, the long note and a bar line are in the lane.
+    fn field_chart() -> Chart {
+        loaded(
+            "#BPM 150\n#LNTYPE 1\n#WAV01 a.wav\n#00011:0101\n#00052:0001\n#00152:01\n#00111:01\n",
+        )
+    }
+
+    /// LIFT raises the judgment line by its share of the original lane and
+    /// the notes with it, at the same pixels per beat; SUDDEN+ covers its
+    /// share of what the lift leaves from the top, HIDDEN+ its share up
+    /// from the raised line, with the line drawn again over it.
+    #[test]
+    fn covers_follow_the_lanes_widgets_geometry() {
+        let chart = ChartBuilder::new(BPM)
+            .tap(lane(3), TimeUs(1_000 * MS))
+            .build()
+            .unwrap();
+        let mut s = skin(&chart);
+        let v = view();
+        let lanes = LaneView {
+            cover: 250,
+            lift: 100,
+            hidden: 500,
+            ..LANES
+        };
+        let batch = with_lanes(&mut s, &v, 1_000 * MS, lanes);
+        // Lift 80 px: the line at 800; what is left is 720 px, SUDDEN+
+        // 180 of it from 80, HIDDEN+ 360 of it up from 800.
+        assert_eq!(
+            cover_rects(&batch),
+            [[160.0, 80.0, 544.0, 180.0], [160.0, 440.0, 544.0, 360.0]]
+        );
+        assert_eq!(
+            line_rects(&batch),
+            [[160.0, 797.0, 544.0, 6.0], [160.0, 797.0, 544.0, 6.0]]
+        );
+        // The note on the raised line; 0.3 s earlier, 0.75 beats at 533.33
+        // px a beat above it.
+        assert_eq!(
+            in_lane(&batch, lane(3), NOTE_WHITE),
+            [[384.0, 792.0, 64.0, 16.0]]
+        );
+        let earlier = with_lanes(&mut s, &v, 700 * MS, lanes);
+        assert_eq!(
+            in_lane(&earlier, lane(3), NOTE_WHITE),
+            [[384.0, 392.0, 64.0, 16.0]]
+        );
+        // Off covers paint nothing.
+        let open = with_lanes(&mut s, &v, 1_000 * MS, LANES);
+        assert!(cover_rects(&open).is_empty());
+        assert_eq!(line_rects(&open), [[160.0, 877.0, 544.0, 6.0]]);
+    }
+
+    /// With no field left (LIFT or SUDDEN+ at 1 000 ‰) or no gain, only
+    /// the judgment line is drawn, no note and no bar line; a normal field
+    /// draws them.
+    #[test]
+    fn a_zero_field_or_no_gain_draws_no_note_geometry() {
+        let chart = field_chart();
+        let mut s = skin(&chart);
+        let v = view_of(&chart, &[]);
+        let at = 1_300 * MS;
+        assert!(note_geometry(&with_lanes(&mut s, &v, at, LANES)) >= 4);
+        let cases = [
+            LaneView {
+                lift: 1_000,
+                ..LANES
+            },
+            LaneView {
+                cover: 1_000,
+                ..LANES
+            },
+            LaneView::NONE,
+        ];
+        for lanes in cases {
+            let batch = with_lanes(&mut s, &v, at, lanes);
+            assert_eq!(note_geometry(&batch), 0, "{lanes:?}");
+            assert_eq!(line_rects(&batch).len(), 1, "{lanes:?}");
+        }
+        // LIFT 1000 puts the line at the lane top; SUDDEN+ 1000 covers the
+        // whole lane above it.
+        let lifted = with_lanes(&mut s, &v, at, cases[0]);
+        assert_eq!(line_rects(&lifted), [[160.0, 77.0, 544.0, 6.0]]);
+        let covered = with_lanes(&mut s, &v, at, cases[1]);
+        assert_eq!(cover_rects(&covered), [[160.0, 80.0, 544.0, 800.0]]);
+    }
+
+    /// The native line: each value, or OFF for a cover that is off and
+    /// `-` for what is unavailable; the target in Floating only.
+    #[test]
+    fn the_native_line_shows_every_value() {
+        let covers = skin_model::CoverSettings {
+            cover: 200,
+            lift: 1_000,
+            hidden: 300,
+            cover_enabled: true,
+            lift_enabled: false,
+            hidden_enabled: false,
+            adjusting: false,
+        };
+        let v = NativeValues {
+            hispeed_x100: Some(320),
+            duration: Some(skin_model::RoundedDuration {
+                ms: 500,
+                green: 300,
+            }),
+            target_green: Some(300),
+            sudden_white: 200,
+            lift_white: 1_000,
+            hidden_white: 300,
+            floating: true,
+        };
+        assert_eq!(
+            hud_line(&v, &covers).bytes(),
+            b"HI-SPEED 3.20 FLOATING  GREEN 300 (TARGET 300)  SUDDEN+ 200  LIFT OFF  HIDDEN+ OFF"
+        );
+        let classic = NativeValues {
+            hispeed_x100: Some(1),
+            duration: None,
+            target_green: None,
+            floating: false,
+            ..v
+        };
+        let all = skin_model::CoverSettings {
+            lift_enabled: true,
+            hidden_enabled: true,
+            ..covers
+        };
+        assert_eq!(
+            hud_line(&classic, &all).bytes(),
+            b"HI-SPEED 0.01 CLASSIC  GREEN -  SUDDEN+ 200  LIFT 1000  HIDDEN+ 300"
+        );
+        let unknown = NativeValues {
+            hispeed_x100: None,
+            ..classic
+        };
+        assert!(
+            hud_line(&unknown, &all)
+                .bytes()
+                .starts_with(b"HI-SPEED - CLASSIC")
+        );
+        // The widest line fits.
+        let widest = NativeValues {
+            hispeed_x100: Some(2_000),
+            duration: Some(skin_model::RoundedDuration {
+                ms: u32::MAX,
+                green: u32::MAX,
+            }),
+            target_green: Some(6_000),
+            sudden_white: 1_000,
+            lift_white: 1_000,
+            hidden_white: 1_000,
+            floating: true,
+        };
+        let line = hud_line(&widest, &all);
+        assert!(line.bytes().ends_with(b"HIDDEN+ 1000"));
+        assert!(line.bytes().len() < HUD_BYTES);
+    }
+
+    /// The frame draws the native line from its readouts, glyph by glyph,
+    /// and refuses malformed readouts before pushing anything.
+    #[test]
+    fn the_frame_draws_the_native_line_and_refuses_malformed_readouts() {
+        let chart = ChartBuilder::new(BPM).build().unwrap();
+        let mut s = skin(&chart);
+        let v = view();
+        let batch = build(&mut s, &frame(&v, 0, &[]));
+        let line: Vec<[f32; 4]> = batch
+            .blended(Blend::Alpha)
+            .filter(|g| g.rect[1] == HUD_Y && g.color == TEXT)
+            .map(|g| g.uv)
+            .collect();
+        let want: Vec<u8> = b"HI-SPEED 2.67 CLASSIC  GREEN -  SUDDEN+ OFF  LIFT OFF  HIDDEN+ OFF"
+            .iter()
+            .copied()
+            .filter(|&c| c != b' ')
+            .collect();
+        assert_eq!(line, uvs(&want));
+        let malformed = FrameInput {
+            readouts: FrameReadouts {
+                native: skin_model::NativeReadouts {
+                    target_green: Some(0),
+                    floating: true,
+                    duration: None,
+                },
+                ..FrameReadouts::UNAVAILABLE
+            },
+            ..frame(&v, 0, &[])
+        };
+        let mut out = SpriteBatch::with_capacity(4096);
+        assert_eq!(
+            s.build(&malformed, &mut out),
+            Err(BuildError::InvalidReadouts)
+        );
+        assert_eq!(out.len(), 0);
+    }
+
+    /// The loading frame puts its line and covers where its lanes say.
+    #[test]
+    fn the_loading_frame_draws_its_covers() {
+        let mut s = SimpleSkin::new();
+        let mut batch = SpriteBatch::with_capacity(4096);
+        let f = LoadingFrame {
+            lanes: LaneView {
+                cover: 250,
+                lift: 100,
+                ..LaneView::NONE
+            },
+            ..crate::test_common::loading_frame(1, TimeUs(0), TimeUs(0))
+        };
+        assert_eq!(s.build_loading(&f, &mut batch), Ok(()));
+        assert_eq!(cover_rects(&batch), [[160.0, 80.0, 544.0, 180.0]]);
+        assert_eq!(line_rects(&batch), [[160.0, 797.0, 544.0, 6.0]]);
+    }
+
     /// The loading frame draws the lanes, the judgment line and the gauge's
     /// frame, but no note of the prepared chart, no READY text and nothing
     /// that allocates.
@@ -2405,7 +2827,7 @@ mod tests {
             .unwrap();
         let mut s = skin(&chart);
         let mut batch = SpriteBatch::with_capacity(4096);
-        let f = LoadingFrame::interim(1, TimeUs(0), TimeUs(0));
+        let f = crate::test_common::loading_frame(1, TimeUs(0), TimeUs(0));
         assert_eq!(s.build_loading(&f, &mut batch), Ok(()));
         assert!(batch.blended(Blend::Alpha).any(|s| s.color == JUDGE_LINE));
         assert!(batch.blended(Blend::Alpha).any(|s| s.color == LANE_BG));

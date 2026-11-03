@@ -13,10 +13,17 @@
 //! result screen's page, drawn every frame while it shows, allocates
 //! nothing either. The simple skin's READY rearms, of a whole play and of
 //! a practice round, and the frames after each allocate nothing, its
-//! prepared playhead kept. A declarative skin prepared for an attempt, its clips
-//! and its prepared text included, does the same with the snapshot's
-//! gauges changing: its first and later frames, a refused one, the frames
-//! around a resize, and a full batch with the overlay kept whole. A
+//! prepared playhead kept; so do its frames made from presentation
+//! snapshots (`render::presentation::frame` counted with them), the gain,
+//! the cover paints and the native line moving, a snapshot of another
+//! attempt, the fields with nothing left, and the frames after a rearm.
+//! The full lane fixture on a declarative skin draws every note category,
+//! its bar group and each cover paint, then frames with no field left
+//! and the frames after a rearm, without allocating. A declarative skin
+//! prepared for an attempt, its clips and its prepared text included,
+//! does the same with the snapshot's gauges changing: its first and later
+//! frames, a refused one, the frames around a resize, and a full batch
+//! with the overlay kept whole. A
 //! committed installation's loading presentation, with its lanes, its
 //! gauge drawn from a descriptor, progress and the chosen chart's text
 //! installed, builds its first and later loading frames, a refused one,
@@ -50,6 +57,7 @@ use bms_model::{Chart, ChartBuilder, TimeUs};
 use common::{GAUGES, MS, attempt, context, input, lane, offscreen, view};
 use decl_support::{FULL_LANES, Look, Part, bundle, full_readouts, lane_chart, part_counts};
 use eval::{JudgeEvent, JudgeEventKind};
+use game::adjustment::PresentationSnapshot;
 use render::{
     Blend, ClipTable, DeclSkin, FrameInput, Gpu, LoadingFrame, MAX_SPRITES, PlaySkin, Scissor,
     SimpleSkin, SkinError, Sprite, SpriteBatch, Staging,
@@ -483,6 +491,7 @@ fn frames_do_not_allocate_from_the_first() {
     assert!(staged > 27 * 60);
     assert_eq!(result_allocs, 0, "the result page allocated");
 
+    simple_presented_frames(&chart, &overlay);
     declarative_frames(&chart, &taps, &overlay, glyphs);
     declarative_lane_frames();
     loading_frames();
@@ -542,7 +551,7 @@ fn imported_frames(chart: &Chart, overlay: &[&str], glyphs: usize) {
     // Lift cycling 0 to 990 ‰ by 30 ‰ a frame: the paint below, across
     // and above its line.
     let lifted = |lifetime: u64, k: i64, lift: u16| {
-        let mut f = LoadingFrame::interim(lifetime, TimeUs(k * FRAME_US), TimeUs(0));
+        let mut f = common::loading_frame(lifetime, TimeUs(k * FRAME_US), TimeUs(0));
         f.lanes.lift = lift;
         f.covers.lift = lift;
         f.covers.lift_enabled = true;
@@ -813,7 +822,7 @@ fn loading_frames() {
         },
         gauge: Some(skin_model::LoadingGauge::of(0, &GAUGES[0])),
         text: 1,
-        ..LoadingFrame::interim(1, TimeUs(k * FRAME_US), TimeUs(0))
+        ..common::loading_frame(1, TimeUs(k * FRAME_US), TimeUs(0))
     };
     skin.enter_loading(1);
     let (first, first_allocs) = counted(|| {
@@ -848,7 +857,7 @@ fn loading_frames() {
     assert!(staging.instances().is_empty());
     // The next lifetime: its state started afresh in place, then its first
     // frame built, as the renderer's loading frame does both.
-    let next = LoadingFrame::interim(2, TimeUs((FRAMES + 2) * FRAME_US), TimeUs(0));
+    let next = common::loading_frame(2, TimeUs((FRAMES + 2) * FRAME_US), TimeUs(0));
     let (second, second_allocs) = counted(|| {
         skin.enter_loading(2);
         staging
@@ -860,6 +869,113 @@ fn loading_frames() {
         second_allocs, 0,
         "a second lifetime's first frame allocated"
     );
+}
+
+/// The presentation snapshots the simple skin's frames are made from:
+/// Floating at target green 300 with `H` from 1/100 to 3, covers moving
+/// on and off, then no field left (SUDDEN+ or LIFT at 1 000 ‰).
+fn snapshots() -> Vec<PresentationSnapshot> {
+    let mut out = Vec::new();
+    for k in 0..40_u16 {
+        let covers = game::Covers {
+            sudden: game::Cover {
+                amount: k * 20,
+                on: k % 3 != 0,
+            },
+            lift: game::Cover {
+                amount: k * 10,
+                on: k % 4 == 1,
+            },
+            hidden: game::Cover {
+                amount: 1_000 - k * 20,
+                on: k % 2 == 0,
+            },
+        };
+        out.push(snapshot(covers, u64::from(k) * 3 + 1));
+    }
+    for (sudden, lift) in [(1_000, 0), (0, 1_000), (1_000, 1_000)] {
+        let covers = game::Covers {
+            sudden: game::Cover {
+                amount: sudden,
+                on: true,
+            },
+            lift: game::Cover {
+                amount: lift,
+                on: true,
+            },
+            hidden: game::Cover::default(),
+        };
+        out.push(snapshot(covers, 1));
+    }
+    out
+}
+
+/// A snapshot with `covers` and `H` `h`/40.
+fn snapshot(covers: game::Covers, h: u64) -> PresentationSnapshot {
+    PresentationSnapshot {
+        options: game::PlayOptions::new(game::HiSpeedSettings::default(), covers).unwrap(),
+        hispeed: game::Ratio::new(h, 40),
+        target: None,
+        display_offset_us: 0,
+        adjusting: h.is_multiple_of(2),
+        generation: 0,
+        sequence: h,
+    }
+}
+
+/// The simple skin's frames made as the player makes them, each from a
+/// presentation snapshot through [`render::presentation::frame`] at the
+/// chart's tempo: the gain, the cover paints and the native line moving
+/// from frame to frame, a snapshot of another attempt, the fields with
+/// nothing left, and the frames after a rearm, from the first, allocate
+/// nothing.
+fn simple_presented_frames(chart: &Chart, overlay: &[&str]) {
+    let snapshots = snapshots();
+    let mut skin = SimpleSkin::new();
+    skin.prepare_attempt(chart, None).unwrap();
+    let mut staging = Staging::new(
+        u32::try_from(MAX_SPRITES).unwrap(),
+        &skin.canvas([1920, 1080]),
+    );
+    let v = view(42, 1_234);
+    let refs = game::References::all(game::Ratio::integer(150));
+    let frame = |staging: &mut Staging, skin: &mut SimpleSkin, k: i64| {
+        let i = usize::try_from(k).unwrap() % snapshots.len();
+        let (lanes, readouts) = render::presentation::frame(
+            &snapshots[i],
+            Some(game::Ratio::integer(150)),
+            Some(refs),
+            bms_model::Speed::NORMAL,
+            k % 7 != 6,
+        );
+        let f = FrameInput {
+            lanes,
+            readouts,
+            overlay,
+            ..input(&v, TimeUs(500 * MS + k * FRAME_US), TimeUs(8 * MS), &[])
+        };
+        staging.build(skin, &f).map(|()| staging.instances().len())
+    };
+    let (first, first_allocs) = counted(|| frame(&mut staging, &mut skin, 0));
+    assert!(first.unwrap() > 0);
+    assert_eq!(first_allocs, 0, "a presented first frame allocated");
+    let (drawn, later_allocs) = counted(|| {
+        (1..FRAMES)
+            .map(|k| frame(&mut staging, &mut skin, k))
+            .sum::<Result<usize, BuildError>>()
+    });
+    assert!(drawn.unwrap() > 0);
+    assert_eq!(later_allocs, 0, "a presented later frame allocated");
+    for k in 0..3 {
+        let (drawn, rearm_allocs) = counted(|| {
+            skin.rearm();
+            (0..i64::try_from(snapshots.len()).unwrap())
+                .map(|j| frame(&mut staging, &mut skin, j))
+                .sum::<Result<usize, BuildError>>()
+        });
+        assert!(drawn.unwrap() > 0);
+        assert_eq!(rearm_allocs, 0, "rearm {k} or a presented frame allocated");
+    }
 }
 
 /// The full lane fixture on a declarative skin: its first frame at a
@@ -916,6 +1032,10 @@ fn declarative_lane_frames() {
         "the full lane fixture's later frames allocated"
     );
     for (cover, lift) in [(200, 1_000), (1_000, 100), (1_000, 1_000)] {
+        // The field first draws every category.
+        assert_eq!(frame(&mut staging, &mut skin, 900, FULL_LANES), Ok(()));
+        let counts = part_counts(&r, &b, staging.instances());
+        assert!(counts.iter().all(|&n| n > 0), "{counts:?}");
         let zero = LaneView {
             cover,
             lift,
@@ -930,6 +1050,29 @@ fn declarative_lane_frames() {
             assert_eq!(counts[p as usize - 1], 0, "{p:?}, {case}");
         }
         assert!(counts[Part::Sudden as usize - 1] > 0, "{case}");
+    }
+    // READY rearmed: the first and later frames after it, at a field and
+    // at none, allocate nothing, and the first draws every category.
+    for k in 0..3 {
+        let (built, allocs) = counted(|| {
+            skin.rearm();
+            frame(&mut staging, &mut skin, 900, FULL_LANES)
+        });
+        assert_eq!(built, Ok(()));
+        assert_eq!(allocs, 0, "rearm {k} or its first frame allocated");
+        let counts = part_counts(&r, &b, staging.instances());
+        assert!(counts.iter().all(|&n| n > 0), "rearm {k}: {counts:?}");
+        let (later, allocs) = counted(|| {
+            (1..60).try_for_each(|j| {
+                let lanes = LaneView {
+                    cover: if j % 10 == 0 { 1_000 } else { 200 },
+                    ..FULL_LANES
+                };
+                frame(&mut staging, &mut skin, 900 + j * 17, lanes)
+            })
+        });
+        assert_eq!(later, Ok(()));
+        assert_eq!(allocs, 0, "a frame after rearm {k} allocated");
     }
 }
 
