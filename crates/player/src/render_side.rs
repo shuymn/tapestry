@@ -73,7 +73,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use bms_model::{Chart, TimeSource, TimeUs};
+use bms_model::{Chart, Speed, TimeSource, TimeUs};
 use eval::{JudgeEvent, Section};
 use game::{Chain, Preparation, PreparationRefusal, RenderSide, ResultGraphs};
 use input::QpcClock;
@@ -91,7 +91,6 @@ use crate::loading_text::LoadingText;
 use crate::loading_text::Stage;
 use crate::measure::{Drawn, Figures, Measure, PlayMeasure};
 use crate::menu_screen::{MenuPage, SPLASH};
-use crate::tuning::LiveTuning;
 
 /// What draws: the renderer, or a double in tests.
 pub trait Screen: Send {
@@ -469,6 +468,10 @@ pub(crate) fn refusal(reason: impl Into<String>) -> Preparation {
 
 /// What the game thread tells the render thread.
 pub enum RenderMsg {
+    /// The adjustments' presentation from now on: the reader of the
+    /// snapshots every play and loading frame is drawn from. Sent once, at
+    /// the start.
+    Presentation(Box<game::adjustment::PresentationReader>),
     /// Make sure the screen can draw, building it again if it failed (the
     /// device's recovery, for a play and the menus alike), and answer when
     /// it can. It prepares no attempt.
@@ -585,9 +588,6 @@ pub enum RenderMsg {
 /// The inputs of every play's frames.
 #[derive(Clone, Debug)]
 pub struct View {
-    /// Hi-speed (the visible time) and the display offset, read at every
-    /// frame.
-    pub tuning: Arc<LiveTuning>,
     /// The effect queue's capacity: the most effects one frame drains.
     pub effects: usize,
 }
@@ -982,6 +982,12 @@ impl RenderLink {
         drop(self.shared.clear_end(upto));
     }
 
+    /// How many end pages were shown so far.
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn end_pages_shown(&self) -> u64 {
+        self.end_pages.load(Ordering::Relaxed)
+    }
+
     /// Waits at most `timeout` until the end page shown last has been
     /// presented, and the frame sink has seen it (dev-tools: a script's
     /// `drawn` step). Whether it was.
@@ -1027,7 +1033,7 @@ impl RenderLink {
     pub fn prepare_attempt(
         &self,
         attempt: AttemptContext,
-        cancelled: impl Fn() -> bool,
+        mut cancelled: impl FnMut() -> bool,
     ) -> Result<Preparation, ScreenError> {
         let request = self.requests.fetch_add(1, Ordering::Relaxed) + 1;
         let (reply, rx) = mpsc::sync_channel(1);
@@ -1088,6 +1094,12 @@ impl RenderLink {
         }
     }
 
+    /// Hands the render thread the adjustments' snapshots, which every
+    /// play and loading frame is drawn from from now on.
+    pub fn presentation(&self, reader: game::adjustment::PresentationReader) {
+        self.send(RenderMsg::Presentation(Box::new(reader)));
+    }
+
     /// Drops what the last attempt's preparation staged, if it was not
     /// committed; it never installs.
     pub fn discard_attempt(&self) {
@@ -1124,15 +1136,15 @@ impl RenderLink {
     ///
     /// # Errors
     ///
-    /// As [`PendingLoad::wait`].
+    /// As [`PendingLoad::wait_serving`].
     #[cfg(test)]
     pub fn load(&self, chart: Arc<Chart>, section: Option<Section>) -> Result<(), ScreenError> {
-        self.begin_load(chart, section).wait(self)
+        self.begin_load(chart, section).wait_serving(self, || {})
     }
 
     /// Starts preparing `chart` for every play from now on; the game
     /// thread goes on with the rest of the load and waits for the answer
-    /// later ([`PendingLoad::wait`]). A pending load dropped unanswered
+    /// later ([`PendingLoad::wait_serving`]). A pending load dropped unanswered
     /// leaves the screen with the chart, which the next load replaces.
     pub fn begin_load(&self, chart: Arc<Chart>, section: Option<Section>) -> PendingLoad {
         let (reply, rx) = mpsc::sync_channel(1);
@@ -1314,15 +1326,32 @@ impl RenderLink {
 pub struct PendingLoad(Receiver<Result<(), RenderError>>);
 
 impl PendingLoad {
-    /// Waits for the answer, at most [`LOAD_TIMEOUT`] from here.
+    /// Waits for the answer, at most the answer's bound from here, calling
+    /// `serve` every [`CANCEL_POLL`] at most meanwhile: the game thread
+    /// serves the adjustments through the chart's load on the render
+    /// thread.
     ///
     /// # Errors
     ///
     /// Why the screen cannot be built or cannot draw the chart, and
-    /// [`ScreenError::NoAnswer`] after [`LOAD_TIMEOUT`]; a late answer goes
-    /// nowhere.
-    pub fn wait(self, link: &RenderLink) -> Result<(), ScreenError> {
-        link.answer(&self.0)
+    /// [`ScreenError::NoAnswer`] past the bound; a late answer goes nowhere.
+    pub fn wait_serving(
+        self,
+        link: &RenderLink,
+        mut serve: impl FnMut(),
+    ) -> Result<(), ScreenError> {
+        let deadline = Instant::now() + link.answer_timeout;
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match self.0.recv_timeout(left.min(CANCEL_POLL)) {
+                Ok(ready) => return Ok(ready?),
+                Err(mpsc::RecvTimeoutError::Disconnected) => return Err(ScreenError::Ended),
+                Err(mpsc::RecvTimeoutError::Timeout) if left.is_zero() => {
+                    return Err(ScreenError::NoAnswer);
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => serve(),
+            }
+        }
     }
 }
 
@@ -1555,6 +1584,8 @@ pub fn spawn(
                 requested: 0,
                 attempt: None,
                 prepared: None,
+                presentation: None,
+                current: None,
                 #[cfg(feature = "dev-tools")]
                 menu_stats: crate::dev::MenuStats::default(),
                 #[cfg(feature = "dev-tools")]
@@ -1625,27 +1656,83 @@ fn take_loading(
 /// The loading frame of lifetime `lifetime` at `now` on the loading clock
 /// (design.md "Rendering and Skins", loading state): its origin, progress,
 /// gauge descriptor and text revision from the lifetime's newest state
-/// `update`; no gain, the author's layout and every cover 0 and off until
-/// the presentation snapshot reaches the frame (S10-04b-2). Without a
-/// state yet it is the lifetime's first moment: from `now`, nothing
-/// loaded. Allocates nothing.
+/// `update`; the author's layout, and the covers and `adjusting` of the
+/// adjustments' newest `snapshot` (every cover 0 and off without one), no
+/// gain, which a loading frame has none of. Without a state yet it is the
+/// lifetime's first moment: from `now`, nothing loaded. Allocates nothing.
+#[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 fn loading_frame_of(
     lifetime: u64,
     now: TimeUs,
     update: Option<&LoadingUpdate>,
+    snapshot: Option<&game::adjustment::PresentationSnapshot>,
 ) -> LoadingFrame<'static> {
-    let Some(u) = update else {
-        return LoadingFrame::interim(lifetime, now, now);
+    let (lanes, covers) = match snapshot {
+        Some(s) => {
+            let (lanes, readouts) =
+                render::presentation::frame(s, None, None, Speed::NORMAL, false);
+            (lanes, readouts.covers)
+        }
+        None => (
+            skin_model::LaneView::NONE,
+            skin_model::FrameReadouts::UNAVAILABLE.covers,
+        ),
+    };
+    let (since, percent, gauge, text) = match update {
+        Some(u) => (u.origin, i32::from(u.percent), u.gauge, u.revision),
+        None => (now, 0, None, 0),
     };
     LoadingFrame {
-        load: skin_model::LoadState {
-            since: u.origin,
-            percent: i32::from(u.percent),
-        },
-        gauge: u.gauge,
-        text: u.revision,
-        ..LoadingFrame::interim(lifetime, now, u.origin)
+        lifetime,
+        now,
+        load: skin_model::LoadState { since, percent },
+        // The renderer applies its own target.
+        target: [1_920, 1_080],
+        layout: &skin_model::Layout::AUTHOR,
+        lanes,
+        covers,
+        gauge,
+        text,
     }
+}
+
+/// One play frame's presentation at chart time `now`: the newest snapshot
+/// from `reader` projected with the committed attempt's tempo and epoch
+/// (`current`) at the display head, `now` plus the snapshot's display
+/// offset; the lanes, the readouts and that offset. Without a reader
+/// nothing is known: no gain, every readout unavailable and no offset.
+/// Without a committed attempt the snapshot still gives the covers, the
+/// settings and the display offset, but no gain or value that depends on
+/// it. Allocates nothing.
+#[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+fn play_presentation(
+    reader: Option<&mut game::adjustment::PresentationReader>,
+    current: Option<&(game::AttemptTempo, u64)>,
+    now: TimeUs,
+) -> (skin_model::LaneView, skin_model::FrameReadouts, TimeUs) {
+    let Some(reader) = reader else {
+        return (
+            skin_model::LaneView::NONE,
+            skin_model::FrameReadouts::UNAVAILABLE,
+            TimeUs(0),
+        );
+    };
+    let s = *reader.read();
+    let offset = TimeUs(s.display_offset_us);
+    let (lanes, readouts) = match current {
+        Some((tempo, epoch)) => {
+            let head = TimeUs(now.0.saturating_add(offset.0));
+            render::presentation::frame(
+                &s,
+                game::adjustment::TempoMap::bpm_at(tempo, head),
+                tempo.references().ok(),
+                tempo.speed(),
+                s.epoch == *epoch,
+            )
+        }
+        None => render::presentation::frame(&s, None, None, Speed::NORMAL, false),
+    };
+    (lanes, readouts, offset)
 }
 
 /// What a preparation or a load leaves drawn: the splash stays until what
@@ -1730,6 +1817,8 @@ struct Preparing {
 struct Prepared {
     token: PreparedToken,
     declarative: bool,
+    /// The attempt's tempo and presentation epoch, current once committed.
+    presentation: (game::AttemptTempo, u64),
 }
 
 struct Run {
@@ -1779,6 +1868,11 @@ struct Run {
     attempt: Option<Preparing>,
     /// The attempt's preparation answered ready and not yet committed.
     prepared: Option<Prepared>,
+    /// The adjustments' snapshots ([`RenderMsg::Presentation`]).
+    presentation: Option<game::adjustment::PresentationReader>,
+    /// The committed attempt's tempo and presentation epoch, which its
+    /// play frames project the snapshot with.
+    current: Option<(game::AttemptTempo, u64)>,
     /// The select screen's frames (dev-tools).
     #[cfg(feature = "dev-tools")]
     menu_stats: crate::dev::MenuStats,
@@ -1838,6 +1932,8 @@ impl Run {
                     section,
                     reply,
                 }) => {
+                    #[cfg(feature = "dev-tools")]
+                    crate::dev::hold(crate::dev::LoadPhase::ChartLoad);
                     // What the screen draws of the chart (dev-tools): a
                     // section's targets only.
                     #[cfg(feature = "dev-tools")]
@@ -1974,6 +2070,10 @@ impl Run {
                         reply,
                     });
                     mode = after_preparing(mode);
+                    continue;
+                }
+                Ok(RenderMsg::Presentation(reader)) => {
+                    self.presentation = Some(*reader);
                     continue;
                 }
                 Ok(RenderMsg::Commit { request, reply }) => {
@@ -2175,29 +2275,23 @@ impl Run {
                     }
                     let origin = view.origin.unwrap_or(*origin);
                     let now = TimeUs(self.clock.now().0 - origin.0);
-                    // Hi-speed and the display offset change anytime and move
-                    // the notes only: they reach the screen here and nowhere
-                    // near judgment. Hi-speed changes are not in the v1 log;
-                    // they arrive with the separate hi-speed stream and a
-                    // format version bump (design.md "Operations unrelated to
-                    // judgment go in a separate stream").
-                    let t = self.view.tuning.get();
+                    // The adjustments change anytime and move the notes
+                    // only: one snapshot per frame gives the lanes, the
+                    // readouts and the display offset together, and nothing
+                    // of it reaches judgment.
+                    let (lanes, readouts, display_offset) =
+                        play_presentation(self.presentation.as_mut(), self.current.as_ref(), now);
                     let overlay = self.measure.overlay();
                     let shown = overlay.iter().take_while(|l| !l.is_empty()).count();
                     #[expect(
                         clippy::indexing_slicing,
                         reason = "`shown` counts a prefix of `overlay`"
                     )]
-                    // The declarative skin's lanes and readouts stay
-                    // unavailable until the presentation snapshot reaches
-                    // the frame (S10-04b-2); the simple skin draws from
-                    // the visible time.
                     let f = FrameInput {
                         now,
-                        display_offset: TimeUs(t.display_offset_us),
-                        visible_time: t.visible_time(),
-                        lanes: skin_model::LaneView::NONE,
-                        readouts: skin_model::FrameReadouts::UNAVAILABLE,
+                        display_offset,
+                        lanes,
+                        readouts,
                         view,
                         effects: &effects,
                         gauge: *gauge,
@@ -2240,7 +2334,13 @@ impl Run {
                     #[cfg(feature = "dev-tools")]
                     let [_, _, _, before] = crate::alloc_count::counts();
                     let drawn = if let Some(lifetime) = loading_frame {
-                        let frame = loading_frame_of(lifetime, self.clock.now(), update.as_deref());
+                        let snapshot = self.presentation.as_mut().map(|r| *r.read());
+                        let frame = loading_frame_of(
+                            lifetime,
+                            self.clock.now(),
+                            update.as_deref(),
+                            snapshot.as_ref(),
+                        );
                         match screen.loading(page, update.as_deref(), *changed, &frame) {
                             Ok(Ok(t)) => Ok(t),
                             Ok(Err(e)) => {
@@ -2440,6 +2540,8 @@ impl Run {
             text: &text,
             target: screen.target(),
         };
+        #[cfg(feature = "dev-tools")]
+        crate::dev::hold_preparing();
         let Some(answer) = screen.prepare_attempt(&a, p.skin.as_ref(), p.request) else {
             return;
         };
@@ -2450,6 +2552,7 @@ impl Run {
                     device: screen.device(),
                 },
                 declarative: p.skin.is_some(),
+                presentation: (p.attempt.tempo().clone(), p.attempt.epoch()),
             });
         }
         if answer.is_err() {
@@ -2502,6 +2605,7 @@ impl Run {
         if p.declarative {
             self.committed = screen.installation();
         }
+        self.current = Some(p.presentation);
         commits.committed = request;
         Ok(())
     }
@@ -3270,15 +3374,14 @@ pub(crate) mod tests {
             crate::input_side::Mode::Clock,
             input::Waker::new().unwrap(),
         );
-        let mut gate = crate::start_gate::PlayerGate::install(
-            &input,
-            input::AdjustmentBindings {
-                controls: vec![(input::TapControl::Key(eval::ControlId(0x10)), 0)],
-                latched: 1,
-                wrap: None,
-            },
-        )
+        let (mut tap, _rx) = input::adjustment_queue(input::AdjustmentBindings {
+            controls: vec![(input::TapControl::Key(eval::ControlId(0x10)), 0)],
+            latched: 1,
+            ..input::AdjustmentBindings::default()
+        })
         .unwrap();
+        tap.set_active(true);
+        let mut gate = crate::start_gate::PlayerGate::install(&input, tap);
         let count = || seen.lock().unwrap().len();
         link.loading().show(one_line("L"));
         assert!(wait_until(|| count() >= 2));
@@ -4315,15 +4418,7 @@ pub(crate) mod tests {
     }
 
     fn view() -> View {
-        View {
-            tuning: Arc::new(crate::tuning::LiveTuning::new(game::Tuning {
-                visible_time_ms: 600,
-                volume_percent: 100,
-                display_offset_us: 0,
-                input_offset_us: 0,
-            })),
-            effects: 16,
-        }
+        View { effects: 16 }
     }
 
     /// Builds up to `ok` screens, then fails; counts the builds.
@@ -4770,7 +4865,10 @@ pub(crate) mod tests {
 
     /// A screen that keeps each play frame's visible time and display
     /// offset.
-    struct Inputs(Arc<std::sync::Mutex<Vec<(TimeUs, TimeUs)>>>);
+    /// One frame's gain and display offset.
+    type FrameSeen = (Option<skin_model::Gain>, TimeUs, Option<u32>);
+
+    struct Inputs(Arc<std::sync::Mutex<Vec<FrameSeen>>>);
 
     impl Screen for Inputs {
         fn load(
@@ -4787,10 +4885,11 @@ pub(crate) mod tests {
             false
         }
         fn build(&mut self, f: &FrameInput<'_>) -> Result<(), skin_model::BuildError> {
-            self.0
-                .lock()
-                .unwrap()
-                .push((f.visible_time, f.display_offset));
+            self.0.lock().unwrap().push((
+                f.lanes.gain,
+                f.display_offset,
+                f.readouts.native.target_green,
+            ));
             Ok(())
         }
         fn draw(&mut self) -> Result<FrameTiming, RenderError> {
@@ -4805,27 +4904,24 @@ pub(crate) mod tests {
         }
     }
 
-    /// The render thread reads hi-speed and the display offset at every
-    /// frame: each change reaches the frames drawn after it, and no later
-    /// frame goes back. The two change one at a time, as two keys do.
+    /// The render thread reads one presentation snapshot at every frame:
+    /// the gain of the committed attempt's epoch and the display offset
+    /// change together with each published snapshot, a snapshot of
+    /// another epoch gives no gain, and no later frame goes back.
     #[test]
-    fn render_frames_follow_hi_speed_and_display_offset() {
-        use game::Adjust;
+    fn render_frames_follow_the_presentation_snapshot() {
+        use game::adjustment::{PresentationSnapshot, presentation_link};
 
         let chart = ChartBuilder::new(120_000)
             .tap(Lane::new(1).unwrap(), TimeUs(1_000_000))
             .build()
             .unwrap();
-        let tuning = view().tuning;
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let screen_seen = Arc::clone(&seen);
         let make: MakeScreen =
             Box::new(move || Ok(Box::new(Inputs(Arc::clone(&screen_seen))) as Box<dyn Screen>));
         let clock = QpcClock::start();
-        let view = View {
-            tuning: Arc::clone(&tuning),
-            effects: 16,
-        };
+        let view = View { effects: 16 };
         let link = spawn(
             make,
             Some(Arc::new(chart.clone())),
@@ -4837,6 +4933,27 @@ pub(crate) mod tests {
         )
         .unwrap();
         let (rule, device) = (rules::tapestry(), DeviceProfile::default());
+        let snapshot = |h: Option<(u64, u64)>, offset, epoch| PresentationSnapshot {
+            hispeed: h.and_then(|(n, d)| game::Ratio::new(n, d)),
+            display_offset_us: offset,
+            epoch,
+            ..PresentationSnapshot {
+                options: game::PlayOptions::default(),
+                hispeed: None,
+                target: None,
+                display_offset_us: 0,
+                adjusting: false,
+                generation: 0,
+                sequence: 0,
+                epoch: 0,
+            }
+        };
+        let (mut writer, reader) = presentation_link(&snapshot(Some((4, 1)), 0, 1));
+        link.presentation(reader);
+        // The attempt prepared and committed as epoch 1.
+        let ready = link.prepare_attempt(attempt(&chart, None), || false);
+        assert!(matches!(ready, Ok(Preparation::Ready)), "{ready:?}");
+        link.commit_attempt().unwrap();
         let (_logic, side) = Logic::<SourceReader>::new(
             &chart,
             &rule,
@@ -4856,19 +4973,26 @@ pub(crate) mod tests {
             gauge: 0,
             measure: play_measure(origin),
         });
-        let start = (TimeUs(600_000), TimeUs(0));
-        let faster = (TimeUs(569_000), TimeUs(0));
-        let later = (TimeUs(569_000), TimeUs(1_000));
+        let gain = |n, d| skin_model::Gain::new(n, d);
+        // The lanes' gain, the display offset and the native target: one
+        // snapshot each frame, whatever skin draws it.
+        let start = (gain(4, 1), TimeUs(0), Some(300));
+        let faster = (gain(9, 2), TimeUs(0), Some(300));
+        let later = (gain(9, 2), TimeUs(1_000), Some(300));
+        let other = (None, TimeUs(1_000), Some(300));
         assert!(wait_until(|| seen.lock().unwrap().contains(&start)));
-        assert!(tuning.adjust(Adjust::HiSpeedUp));
+        writer.write(snapshot(Some((9, 2)), 0, 1));
         assert!(wait_until(|| seen.lock().unwrap().contains(&faster)));
-        assert!(tuning.adjust(Adjust::DisplayOffsetUp));
+        writer.write(snapshot(Some((9, 2)), 1_000, 1));
         assert!(wait_until(|| seen.lock().unwrap().contains(&later)));
+        // A snapshot of another attempt's epoch: no gain, its offset kept.
+        writer.write(snapshot(Some((9, 2)), 1_000, 2));
+        assert!(wait_until(|| seen.lock().unwrap().contains(&other)));
         link.exit();
-        // The frames go through the three states in order, each once.
+        // The frames go through the states in order, each once.
         let mut frames = seen.lock().unwrap().clone();
         frames.dedup();
-        assert_eq!(frames, [start, faster, later]);
+        assert_eq!(frames, [start, faster, later, other]);
     }
 
     /// A screen whose every play frame fails, as a lost surface does.
@@ -5082,10 +5206,7 @@ pub(crate) mod tests {
             }) as Box<dyn Screen>)
         });
         let clock = QpcClock::start();
-        let view = View {
-            effects: buffer,
-            ..view()
-        };
+        let view = View { effects: buffer };
         let link = spawn(
             make,
             Some(Arc::new(chart.clone())),
@@ -7071,10 +7192,7 @@ pub(crate) mod tests {
             Some(Arc::new(chart.clone())),
             None,
             clock,
-            View {
-                effects: buffer,
-                ..view()
-            },
+            View { effects: buffer },
             measure(clock),
             Box::new(NoFrames),
         )
@@ -8337,7 +8455,7 @@ pub(crate) mod tests {
             &labels,
             chart,
         );
-        AttemptContext::new(attempt, crate::attempt_context::SIMPLE_SCRATCH)
+        AttemptContext::new(attempt, crate::attempt_context::SIMPLE_SCRATCH, 1)
     }
 
     /// The selection installs the bundle, uploading it once, and its

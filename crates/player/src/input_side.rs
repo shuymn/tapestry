@@ -92,6 +92,24 @@ pub enum Request {
     },
     /// Close recording at the next boundary.
     Close,
+    /// Feed the loading script ([`Script::loading`]) from now on, its time 0
+    /// at `at` on the clock, while recording is closed: its packets reach
+    /// only the adjustment tap, and the thread wakes for each of its items
+    /// though Idle. It ends at the boundary of the first successful
+    /// opening, which the play's script takes over from on the same
+    /// devices, or at [`Request::EndLoadingScript`]. Not answered (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    LoadingScript {
+        /// The script's time 0 on the clock.
+        at: TimeUs,
+    },
+    /// Stop feeding the loading script: the load was cancelled or refused,
+    /// or the window closes. Not answered (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    EndLoadingScript,
+    /// Answer fence `n` in the adjustment tap's stream at the next
+    /// boundary ([`input::TapEvent::Fence`]). Not answered otherwise.
+    Fence(u64),
     /// The adjustment controls' tap from now on, whose hold latch and
     /// start gate the gated openings and rearms use. Not answered.
     Tap(Box<input::AdjustmentTap>),
@@ -315,6 +333,57 @@ impl InputLink {
         if self.failed.is_none() && self.requests.send(Request::Tap(Box::new(tap))).is_ok() {
             self.waker.wake();
         }
+    }
+
+    /// Asks the input thread to answer fence `n` in the adjustment tap's
+    /// stream at its next boundary: sent without waiting; the answer is
+    /// the tap's marker. A failed link sends nothing.
+    pub fn request_fence(&self, n: u64) {
+        if self.failed.is_none() && self.requests.send(Request::Fence(n)).is_ok() {
+            self.waker.wake();
+        }
+    }
+
+    /// Starts feeding the play's loading script, its time 0 at `at`
+    /// ([`Request::LoadingScript`]; dev-tools). A failed link sends nothing.
+    #[cfg(feature = "dev-tools")]
+    pub fn loading_script(&self, at: TimeUs) {
+        if self.failed.is_none() && self.requests.send(Request::LoadingScript { at }).is_ok() {
+            self.waker.wake();
+        }
+    }
+
+    /// Stops feeding the loading script ([`Request::EndLoadingScript`];
+    /// dev-tools).
+    #[cfg(feature = "dev-tools")]
+    pub fn end_loading_script(&self) {
+        if self.failed.is_none() && self.requests.send(Request::EndLoadingScript).is_ok() {
+            self.waker.wake();
+        }
+    }
+
+    /// The awake time now: the clock the input thread's answers are bounded
+    /// on, which stands still through a suspend.
+    #[must_use]
+    pub fn awake_now(&self) -> Duration {
+        (self.awake)()
+    }
+
+    /// Measures the awake time with `awake` from now on (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub(crate) fn set_awake(&mut self, awake: fn() -> Duration) {
+        self.awake = awake;
+    }
+
+    /// Wakes the input thread: the adjustment tap waits for room.
+    pub fn wake_input(&self) {
+        self.waker.wake();
+    }
+
+    /// Whether the input thread is gone.
+    #[must_use]
+    pub fn gone(&self) -> bool {
+        self.state.gone.load(Ordering::Acquire)
     }
 
     /// Asks the input thread to seal the cancelled READY candidate's
@@ -545,6 +614,9 @@ pub struct Script {
     pub current: input::ScriptedInput,
     /// The source set's sizes, for a fresh one at each play.
     pub sources: input::SourceConfig,
+    /// The keys held while the play loads, before its first opening
+    /// ([`Request::LoadingScript`]), if any.
+    pub loading: Option<input::ScriptedInput>,
 }
 
 /// The input thread's end: called at every boundary between batches.
@@ -572,6 +644,10 @@ pub struct Hook {
     handed: rtrb::Producer<Box<Handoff>>,
     /// The open recording's handoff storage, reserved at its opening.
     handoff: Option<Box<Handoff>>,
+    /// The loading script being fed, with its time 0 on the clock
+    /// (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    loading: Option<(input::ScriptedInput, TimeUs)>,
 }
 
 /// A linked hook and link; the link wakes the input thread through
@@ -603,6 +679,8 @@ pub fn link(controls: Arc<Controls>, mode: Mode, waker: Waker) -> (Hook, InputLi
             handoffs: handoff_rx,
             handed: handed_tx,
             handoff: None,
+            #[cfg(feature = "dev-tools")]
+            loading: None,
         },
         InputLink {
             requests: req_tx,
@@ -642,10 +720,14 @@ impl Hook {
                 input::InputAdapter::poll(feeder, TimeUs(now.0 - origin.0), sources);
             }
             (Mode::Autoplay(_), None) => sources.end_batch(now),
-            // A script runs on its own timeline, which a rearm does not move.
+            // A script runs on its own timeline, which a rearm does not move;
+            // before its first opening a loading script runs on its own.
             #[cfg(feature = "dev-tools")]
             (Mode::Script(script), origin) => {
-                if let Some(origin) = self.script_origin.or(origin) {
+                if let Some((loading, at)) = &mut self.loading {
+                    sources.set_presentation_offset(*at);
+                    input::InputAdapter::poll(loading, TimeUs(now.0 - at.0), sources);
+                } else if let Some(origin) = self.script_origin.or(origin) {
                     input::InputAdapter::poll(
                         &mut script.current,
                         TimeUs(now.0 - origin.0),
@@ -670,7 +752,30 @@ impl Hook {
                     None => Reply::Deferred,
                 },
                 Request::Tap(tap) => {
+                    sources.set_presentation_focus(self.controls.presentation_focus().clone());
                     sources.set_adjustment(*tap);
+                    continue;
+                }
+                #[cfg(feature = "dev-tools")]
+                Request::LoadingScript { at } => {
+                    if let Mode::Script(script) = &self.mode
+                        && let Some(loading) = &script.loading
+                        && self.origin.is_none()
+                    {
+                        self.loading = Some((loading.clone(), at));
+                    }
+                    continue;
+                }
+                #[cfg(feature = "dev-tools")]
+                Request::EndLoadingScript => {
+                    self.loading = None;
+                    sources.set_wake_at(None);
+                    continue;
+                }
+                Request::Fence(n) => {
+                    if let Some(tap) = sources.adjustment_mut() {
+                        tap.fence(n, now);
+                    }
                     continue;
                 }
                 Request::Close => {
@@ -729,6 +834,11 @@ impl Hook {
             handoff.fill(sources);
             sources.hand_off();
             let _ = self.handed.push(handoff);
+        }
+        // A loading script wakes the thread for its next item, Idle or not.
+        #[cfg(feature = "dev-tools")]
+        if let Some((loading, at)) = &self.loading {
+            sources.set_wake_at(loading.next_at().map(|t| TimeUs(t.0.saturating_add(at.0))));
         }
         self.publish(sources);
         if self.origin.is_some()
@@ -811,7 +921,17 @@ impl Hook {
                     sources.set_takes_part(d, false);
                 }
                 reset_gate(sources, &self.controls);
-                sources.open_recording(TimeUs(-lead_in.0))
+                // The feeder's batches are on the play's time: the tap
+                // stamps them on the clock from the opening's origin.
+                sources.set_presentation_offset(origin);
+                match gate {
+                    None => sources.open_recording(TimeUs(-lead_in.0)),
+                    Some(generation) => candidate(sources.open_candidate(
+                        TimeUs(-lead_in.0),
+                        TimeUs(0),
+                        generation,
+                    ))?,
+                }
             }
             #[cfg(feature = "dev-tools")]
             Mode::Script(script) => {
@@ -820,8 +940,15 @@ impl Hook {
                 // from its start, on devices as they were before it: they
                 // connect, with their recorded controls, before the
                 // opening.
+                // A loading script's devices are the play's: the play's
+                // script takes over on the same set, its held state kept.
+                let loading = self.loading.is_some();
                 let script_origin = match self.script_origin.filter(|_| gate.is_some()) {
                     Some(o) => o,
+                    None if loading => {
+                        script.current = script.log.clone();
+                        origin
+                    }
                     None => {
                         script.current = script.log.clone();
                         // The same gate: the latch the controls hold trips it.
@@ -839,11 +966,20 @@ impl Hook {
                 input::InputAdapter::poll(&mut script.current, TimeUs(open_at.0 - 1), sources);
                 reset_gate(sources, &self.controls);
                 self.script_origin = Some(script_origin);
+                // The script's batches are on its timeline: the tap stamps
+                // them on the clock from its origin.
+                sources.set_presentation_offset(script_origin);
                 match gate {
                     None => sources.open_recording(open_at),
                     Some(generation) => {
                         let chart0 = TimeUs(open_at.0 + lead_in.0);
-                        candidate(sources.open_candidate(open_at, chart0, generation))?
+                        let start = candidate(sources.open_candidate(open_at, chart0, generation))?;
+                        // The first successful opening ends the loading
+                        // script; a deferred one keeps feeding it, so the
+                        // release it waits for arrives.
+                        self.loading = None;
+                        sources.set_wake_at(None);
+                        start
                     }
                 }
             }
@@ -947,6 +1083,8 @@ impl Hook {
         let lines = out_of_range_warnings(sources);
         sources.close_recording();
         self.origin = None;
+        // Between plays every batch is on the clock.
+        sources.set_presentation_offset(TimeUs(0));
         self.script_origin = None;
         self.handoff = None;
         (closed, lines)
@@ -2037,6 +2175,7 @@ mod menu_tests {
             lanes,
             retry: None,
             quit: None,
+            ..KeyConfig::default()
         }
     }
 
@@ -2341,7 +2480,7 @@ mod gate_tests {
         let (tap, _rx) = adjustment_queue(AdjustmentBindings {
             controls: vec![(TapControl::Key(Q), 0)],
             latched: 1,
-            wrap: None,
+            ..AdjustmentBindings::default()
         })
         .unwrap();
         let gate = tap.start_gate();
@@ -2527,15 +2666,14 @@ mod gate_tests {
     #[test]
     fn the_player_gates_exchange_counts_in_the_admission() {
         let (mut sources, mut hook, link, _) = rig();
-        let mut gate = crate::start_gate::PlayerGate::install(
-            &link,
-            AdjustmentBindings {
-                controls: vec![(TapControl::Key(Q), 0)],
-                latched: 1,
-                wrap: None,
-            },
-        )
+        let (mut tap, _rx) = adjustment_queue(AdjustmentBindings {
+            controls: vec![(TapControl::Key(Q), 0)],
+            latched: 1,
+            ..AdjustmentBindings::default()
+        })
         .unwrap();
+        tap.set_active(true);
+        let mut gate = crate::start_gate::PlayerGate::install(&link, tap);
         let opening = open(&mut hook, &link, &mut sources, 10).unwrap();
         gate.opened(1, &opening);
         assert!(
@@ -2583,15 +2721,14 @@ mod gate_tests {
         let controls = Arc::new(Controls::new(QpcClock::start()));
         controls.set_latch(sources.gate().handle());
         let (mut hook, mut link) = link(controls, Mode::Clock, Waker::new().unwrap());
-        let mut gate = crate::start_gate::PlayerGate::install(
-            &link,
-            AdjustmentBindings {
-                controls: vec![(TapControl::Key(Q), 0)],
-                latched: 1,
-                wrap: None,
-            },
-        )
+        let (mut tap, _rx) = adjustment_queue(AdjustmentBindings {
+            controls: vec![(TapControl::Key(Q), 0)],
+            latched: 1,
+            ..AdjustmentBindings::default()
+        })
         .unwrap();
+        tap.set_active(true);
+        let mut gate = crate::start_gate::PlayerGate::install(&link, tap);
         let opening = open(&mut hook, &link, &mut sources, 10).unwrap();
         gate.opened(1, &opening);
         batch(&mut hook, &mut sources, 20, &[packet(1, Q, 1)]);

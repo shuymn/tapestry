@@ -591,7 +591,7 @@ fn compile(file: &File, base: &Path, roots: &[(PathBuf, PathBuf)]) -> Result<Com
                     None => chart_input = Some((input, o)),
                 }
                 if let Some((_, Some(path))) = log {
-                    logs.push(super::script(&path).map_err(|e| at(format!("{e:#}")))?);
+                    logs.push(super::script(&path, &[]).map_err(|e| at(format!("{e:#}")))?);
                     log_paths.push(path);
                 }
                 let until = match &p.until {
@@ -755,7 +755,7 @@ fn practice_goal(
     let k = match log_paths.iter().position(|l| *l == path) {
         Some(k) => k,
         None => {
-            logs.push(super::script(&path).map_err(|e| format!("{e:#}"))?);
+            logs.push(super::script(&path, &[]).map_err(|e| format!("{e:#}"))?);
             log_paths.push(path);
             log_paths.len() - 1
         }

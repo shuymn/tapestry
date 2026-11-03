@@ -53,7 +53,7 @@ const fn right(rect: [i32; 4], dx: i32) -> [i32; 4] {
 /// A loading frame of lifetime `lifetime` at `now` ms on the loading
 /// clock, from origin 0.
 fn frame_at(lifetime: u64, now: i64) -> LoadingFrame<'static> {
-    LoadingFrame::interim(lifetime, TimeUs(now * MS), TimeUs(0))
+    common::loading_frame(lifetime, TimeUs(now * MS), TimeUs(0))
 }
 
 /// Red, with the loading elements.

@@ -217,6 +217,7 @@ fn batches_do_not_allocate() {
                 } else {
                     Phase::Open
                 },
+                due: None,
             }
         },
     );

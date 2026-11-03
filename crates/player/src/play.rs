@@ -47,6 +47,75 @@ const PARK: Duration = Duration::from_millis(2);
 /// screen's failure, a timed quit).
 const IDLE_PARK: Duration = Duration::from_micros(game::IDLE_WAIT.0.unsigned_abs());
 
+/// How long a wait for the input thread's marker parks at most
+/// ([`game::InputPump::park`]).
+pub(crate) const MARKER_PARK: Duration = Duration::from_millis(1);
+
+/// How long an operation waits for the input thread's markers in all, in
+/// awake time, before the input thread counts as failed (design.md "Input
+/// thread failure": 2 s of awake time, a suspend not counted).
+const MARKER_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// The input thread as the adjustment driver needs it
+/// ([`game::InputPump`]): fences through its link, wakes, and the display
+/// offset the window steps.
+pub(crate) struct PlayerPump<'a> {
+    pub(crate) input: &'a InputLink,
+    pub(crate) tuning: &'a crate::tuning::LiveTuning,
+    /// When this pump's waits began, in awake time: they end
+    /// [`MARKER_TIMEOUT`] of awake time later, a suspend not counted.
+    pub(crate) since: Option<Duration>,
+}
+
+impl game::InputPump for PlayerPump<'_> {
+    fn request_fence(&mut self, n: u64) {
+        self.input.request_fence(n);
+    }
+
+    fn wake(&mut self) {
+        self.input.wake_input();
+    }
+
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn display_offset_us(&self) -> i64 {
+        self.tuning.display_offset_us()
+    }
+
+    fn park(&mut self) -> Result<(), InputWaitError> {
+        if self.input.gone() {
+            return Err(InputWaitError::Gone);
+        }
+        if let Some(e) = self.input.failure() {
+            return Err(e);
+        }
+        let now = self.input.awake_now();
+        let since = *self.since.get_or_insert(now);
+        if now.saturating_sub(since) >= MARKER_TIMEOUT {
+            return Err(InputWaitError::Timeout);
+        }
+        thread::park_timeout(MARKER_PARK);
+        Ok(())
+    }
+}
+
+/// One drain of the adjustments' driver, if there is one: what the tap
+/// observed since reaches the reducer and its snapshot (design.md "Play
+/// Adjustments"). Allocates nothing.
+#[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+pub(crate) fn serve_adjustments(
+    adjust: Option<&mut game::AdjustDriver>,
+    input: &InputLink,
+    tuning: &crate::tuning::LiveTuning,
+) {
+    if let Some(driver) = adjust {
+        driver.pump(&mut PlayerPump {
+            input,
+            tuning,
+            since: None,
+        });
+    }
+}
+
 /// Each saved play's record and figures, in order (dev-tools).
 #[cfg(feature = "dev-tools")]
 pub type MeasuredPlays = std::sync::Arc<std::sync::Mutex<Vec<(std::path::PathBuf, Figures)>>>;
@@ -97,6 +166,8 @@ pub struct PlayerRig<'a> {
     pub files: SettingsFiles,
     /// The settings keys' values last acted on.
     pub seen: Delivered,
+    /// The hi-speed line the end screen was last sent with.
+    pub shown_speed: end_screen::SpeedLine,
     /// The end screen's page while it shows: the summary's lines and the
     /// view's graphs; the settings lines are added each time it is sent.
     pub end_page: Option<EndPage>,
@@ -157,10 +228,18 @@ pub struct PlayerRig<'a> {
     /// Retries still to send by itself at an end screen (dev-tools).
     #[cfg(feature = "dev-tools")]
     pub auto_retries: u32,
+    /// A loading script is to be fed before the first opening
+    /// (`--dev-loading`), until it is started.
+    #[cfg(feature = "dev-tools")]
+    pub loading_script: bool,
     /// Settings keys pressed by themselves when the first play reaches
     /// chart time `adjust_at` (dev-tools).
     #[cfg(feature = "dev-tools")]
     pub adjust_in_play: Vec<game::Adjust>,
+    /// Speed keys pressed by themselves on the window when an autoplay
+    /// session's first play reaches chart time `adjust_at` (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    pub speed_in_play: Vec<u32>,
     #[cfg(feature = "dev-tools")]
     pub adjust_at: TimeUs,
     /// The select screen, with song selection.
@@ -173,13 +252,112 @@ pub struct PlayerRig<'a> {
     #[cfg(feature = "dev-tools")]
     pub adjust_on_end: Vec<game::Adjust>,
     /// The start gate's player side (design.md "Play Lifecycle", the start
-    /// gate): `None` runs the plays as before, every first READY the play;
-    /// production constructs it so until S10-04b, and development runs
-    /// set it ([`crate::start_gate::PlayerGate::install`]).
+    /// gate), installed with the adjustments' driver by every launcher:
+    /// `None` runs the plays ungated, every first READY the play.
     pub gate: Option<crate::start_gate::PlayerGate>,
+    /// The adjustments' driver (design.md "Play Adjustments"): the game
+    /// thread's one writer of the presentation, installed with the gate.
+    pub adjust: Option<game::AdjustDriver>,
 }
 
 impl PlayerRig<'_> {
+    /// One drain of the adjustments' driver ([`serve_adjustments`]).
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    pub(crate) fn serve_adjustments(&mut self) {
+        serve_adjustments(self.adjust.as_mut(), &self.input, self.controls.tuning());
+    }
+
+    /// The adjustments as the play left them, on the console: the active
+    /// hi-speed, the mode, the target green number and the covers.
+    fn print_adjustments(&self) {
+        let Some(driver) = &self.adjust else {
+            return;
+        };
+        let s = driver.snapshot();
+        let h = s
+            .hispeed
+            .map(|h| {
+                // Hundredths, a half rounded up.
+                let (n, d) = (u128::from(h.num()), u128::from(h.den()));
+                (200 * n + d) / (2 * d)
+            })
+            .map_or_else(|| "-".to_owned(), |x| format!("{}.{:02}", x / 100, x % 100));
+        let o = s.options;
+        let c = o.covers();
+        let cover = |c: game::Cover| {
+            if c.on {
+                c.amount.to_string()
+            } else {
+                "off".to_owned()
+            }
+        };
+        println!(
+            "adjust: hi-speed {h} {} target {} sudden {} lift {} hidden {} out-of-order {}",
+            match o.hispeed().mode {
+                game::SpeedMode::Floating => "floating",
+                game::SpeedMode::Classic => "classic",
+            },
+            o.hispeed().green_target,
+            cover(c.sudden),
+            cover(c.lift),
+            cover(c.hidden),
+            driver.diagnostics().out_of_order,
+        );
+    }
+
+    /// The window's scene-scoped state moves on: the settings keys' scene
+    /// epoch ([`Controls::next_scene`]), so a held F3 to F8 repeats no
+    /// action. Every scene change and attempt entry calls it, beside the
+    /// adjustments' context change.
+    fn next_window_scene(&self) {
+        self.controls.next_scene();
+    }
+
+    /// Every scene change outside an attempt's entry (a play's result,
+    /// selection, the practice page) goes through here: the window's scene
+    /// epoch moves on, and the driver fences the input thread and changes
+    /// the adjustments' context ([`game::AdjustDriver::scene_changed`]).
+    /// An attempt's entry goes through [`enter_attempt`](Self::enter_attempt),
+    /// which does both too. A failed fence is latched in the driver and
+    /// ends the run ([`Rig::input_failure`]).
+    pub(crate) fn enter_scene(&mut self) {
+        self.next_window_scene();
+        if let Some((driver, mut pump)) = self.adjustments() {
+            let _ = driver.scene_changed(&mut pump);
+        }
+    }
+
+    /// The coming attempt's entry, at a loading state's start: the
+    /// window's scene epoch moves on and the adjustments enter the attempt
+    /// ([`game::AdjustDriver::enter_attempt`]).
+    pub(crate) fn enter_attempt(&mut self) {
+        self.next_window_scene();
+        if let Some((driver, mut pump)) = self.adjustments() {
+            let _ = driver.enter_attempt(None, &mut pump);
+        }
+    }
+
+    /// The adjustments' first failed wait on the input thread, latched by
+    /// the driver.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn adjustments_failure(&self) -> Option<InputWaitError> {
+        self.adjust.as_ref().and_then(game::AdjustDriver::failure)
+    }
+
+    /// The driver and its pump, for a wait on the input thread; `None` once
+    /// a wait failed, so nothing more is asked of the input thread.
+    pub(crate) fn adjustments(&mut self) -> Option<(&mut game::AdjustDriver, PlayerPump<'_>)> {
+        if self.adjustments_failure().is_some() {
+            return None;
+        }
+        let pump = PlayerPump {
+            input: &self.input,
+            tuning: self.controls.tuning(),
+            since: None,
+        };
+        self.adjust.as_mut().map(|d| (d, pump))
+    }
+
     /// Writes changed settings, then ends the render and audio threads;
     /// how the render thread ended: when [`RenderEnd::Stuck`], the window
     /// must stay open until the process exits.
@@ -195,6 +373,9 @@ impl PlayerRig<'_> {
     /// `player.toml`, each atomically and only if it changed. Called when a
     /// play ends and when the run ends, never during a play.
     fn persist(&mut self) {
+        if let Some(driver) = &self.adjust {
+            self.files.set_options(driver.options());
+        }
         self.files
             .write(self.controls.tuning().get(), self.queue.periods());
     }
@@ -232,15 +413,38 @@ impl PlayerRig<'_> {
     /// audio thread, and a shown end screen is drawn again.
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub(crate) fn sync(&mut self) {
-        let Some(t) = self.seen.take_new(self.controls.tuning()) else {
-            return;
+        let tuned = self.seen.take_new(self.controls.tuning());
+        if tuned.is_some() {
+            // Always within 0 to unity: loading and `Tuning` keep it there.
+            let _ = self
+                .audio
+                .control
+                .set_volume(self.controls.tuning().volume());
+        }
+        // The end screen's hi-speed line follows the adjustments too.
+        let speed = self.speed_line();
+        if tuned.is_some() || speed != self.shown_speed {
+            self.shown_speed = speed;
+            self.send_end(tuned.unwrap_or_else(|| self.controls.tuning().get()));
+        }
+    }
+
+    /// The hi-speed the end screen shows: the adjustments' newest state,
+    /// its green number at the attempt's reference tempo.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn speed_line(&self) -> end_screen::SpeedLine {
+        let Some(driver) = &self.adjust else {
+            return end_screen::SpeedLine::default();
         };
-        // Always within 0 to unity: loading and `Tuning` keep it there.
-        let _ = self
-            .audio
-            .control
-            .set_volume(self.controls.tuning().volume());
-        self.send_end(t);
+        let s = driver.snapshot();
+        let h = s.options.hispeed();
+        let reference = driver.tempo().and_then(|t| {
+            let (k, d) = t.speed().ratio();
+            let speed = game::Ratio::new(u64::from(k), u64::from(d))?;
+            let bpm = t.references().ok()?.get(h.reference);
+            bpm.times(speed).ok()
+        });
+        end_screen::SpeedLine::of(&s, reference)
     }
 
     /// Hands the end screen's page, with the settings lines of `t` and the
@@ -248,7 +452,8 @@ impl PlayerRig<'_> {
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn send_end(&self, t: Tuning) {
         if let Some(base) = &self.end_page {
-            self.render.show_end(end_screen::with_settings(base, t));
+            self.render
+                .show_end(end_screen::with_settings(base, t, self.speed_line()));
         }
     }
 
@@ -339,10 +544,6 @@ impl PlayerRig<'_> {
     }
 }
 
-/// A round's restore at chart time `at`, its lead-in's start, planned on
-/// the line the audio thread last published for a play whose chart time 0
-/// lies at `origin`, the opening's: `at` is then `RESTORE_AHEAD` in the
-/// output's future (design.md "Mid-Chart Start and Section Repeat").
 /// The render thread's commit of the attempt prepared: while a loading
 /// lifetime runs (`loading`), it is ready first, so its progress reaches
 /// 100 before the commit and the end of loading.
@@ -368,6 +569,10 @@ pub(crate) fn refresh_loading_gauge(
     }
 }
 
+/// A round's restore at chart time `at`, its lead-in's start, planned on
+/// the line the audio thread last published for a play whose chart time 0
+/// lies at `origin`, the opening's: `at` is then `RESTORE_AHEAD` in the
+/// output's future (design.md "Mid-Chart Start and Section Repeat").
 fn plan_restore(
     restorer: &game::Restorer,
     counters: &game::AudioCounters,
@@ -420,6 +625,7 @@ impl Rig for PlayerRig<'_> {
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn wait(&mut self) {
         thread::park_timeout(if self.in_play { PARK } else { IDLE_PARK });
+        self.serve_adjustments();
         // A scenario's `until`: the command, sent once, as its key would.
         #[cfg(feature = "dev-tools")]
         if let Some(sc) = &mut self.scenario
@@ -437,6 +643,21 @@ impl Rig for PlayerRig<'_> {
                 self.controls.tuning().adjust(a);
             }
         }
+        // An autoplay session's speed keys come from the window's queue.
+        #[cfg(feature = "dev-tools")]
+        if let Some(origin) = self.origin
+            && self.autoplay
+            && !self.speed_in_play.is_empty()
+            && until_due(origin, self.adjust_at, self.clock.now())
+        {
+            for code in self.speed_in_play.drain(..) {
+                let key = u8::from(code != game::SPEED_KEYS[0]);
+                self.controls
+                    .window_key(key, input::WindowKeyEvent::Press, false);
+                self.controls
+                    .window_key(key, input::WindowKeyEvent::Release, false);
+            }
+        }
         self.sync();
     }
 
@@ -445,6 +666,7 @@ impl Rig for PlayerRig<'_> {
         if left > 0 {
             thread::park_timeout(Duration::from_micros(left.unsigned_abs()));
         }
+        self.serve_adjustments();
         self.sync();
     }
 
@@ -551,16 +773,29 @@ impl Rig for PlayerRig<'_> {
             loaded.preset(),
             self.gauge,
         );
-        let attempt = AttemptContext::new(loaded.attempt(), SIMPLE_SCRATCH);
+        // The attempt attached last is the one prepared: its epoch is
+        // the frames'.
+        let epoch = self.adjust.as_mut().and_then(game::AdjustDriver::prepared);
+        let attempt = AttemptContext::new(loaded.attempt(), SIMPLE_SCRATCH, epoch.unwrap_or(0));
+        // The adjustments are served while the screen prepares, so an
+        // adjustment then is published before the preparation ends.
+        let mut adjust = self.adjust.take();
         let rig = &*self;
-        rig.render.prepare_attempt(attempt, || {
+        let prepared = rig.render.prepare_attempt(attempt, || {
+            #[cfg(feature = "dev-tools")]
+            crate::dev::press_due(rig.controls, crate::dev::LoadPhase::Preparing);
+            serve_adjustments(adjust.as_mut(), &rig.input, rig.controls.tuning());
             preparation_stops(
                 rig.quitting(),
                 rig.controls.leaving(),
                 rig.input_failure(),
                 rig.audio_failure(),
             )
-        })
+        });
+        self.adjust = adjust;
+        #[cfg(feature = "dev-tools")]
+        crate::dev::print_adjustments("preparing", self.adjust.as_ref());
+        prepared
     }
 
     fn open(&mut self, lead_in: TimeUs) -> Result<Opening<SourceReader>, InputWaitError> {
@@ -585,6 +820,37 @@ impl Rig for PlayerRig<'_> {
         self.gate.is_some()
     }
 
+    fn begin_presentation(
+        &mut self,
+        loaded: &Loaded,
+    ) -> Result<Option<game::PreparationRefusal>, InputWaitError> {
+        // The loading script runs from here to the first opening.
+        #[cfg(feature = "dev-tools")]
+        if std::mem::take(&mut self.loading_script) {
+            self.input.loading_script(self.clock.now());
+        }
+        if let Some(e) = self.adjustments_failure() {
+            return Err(e);
+        }
+        // An attempt entered here (nothing attached at a loading state)
+        // is a scene change for the window too.
+        if self.adjust.as_ref().is_some_and(|d| !d.has_pending()) {
+            self.next_window_scene();
+        }
+        match self.adjustments() {
+            Some((driver, mut pump)) => driver.begin_presentation(loaded, &mut pump),
+            None => Ok(None),
+        }
+    }
+
+    fn end_presentation(&mut self) {
+        #[cfg(feature = "dev-tools")]
+        self.input.end_loading_script();
+        if let Some(driver) = &mut self.adjust {
+            driver.invalidate();
+        }
+    }
+
     fn open_candidate(
         &mut self,
         lead_in: TimeUs,
@@ -592,6 +858,11 @@ impl Rig for PlayerRig<'_> {
     ) -> Result<Option<Opening<SourceReader>>, InputWaitError> {
         if let Some(window) = &self.window {
             window.wait_to_open();
+        }
+        // The previous opening's marker is taken first: the tap owes one
+        // at most.
+        if let Some((driver, mut pump)) = self.adjustments() {
+            driver.before_opening(&mut pump)?;
         }
         self.in_play = true;
         self.lead_in = lead_in;
@@ -604,6 +875,11 @@ impl Rig for PlayerRig<'_> {
         if let (Some(opening), Some(gate)) = (&opened, &mut self.gate) {
             gate.opened(generation, opening);
             gate.end_paused_loading(&self.render);
+        }
+        if opened.is_none()
+            && let Some(driver) = &mut self.adjust
+        {
+            driver.no_opening();
         }
         Ok(opened)
     }
@@ -655,6 +931,13 @@ impl Rig for PlayerRig<'_> {
         history: &mut game::HistoryRecorder,
         start: &mut eval::InputStart,
     ) -> Result<game::Rearm, InputWaitError> {
+        // The cancellation's and the previous opening's markers are taken
+        // first: the tap owes one of each at most.
+        let cancelled = self.gate.as_ref().map(|g| g.state().generation);
+        if let (Some(cancelled), Some((driver, mut pump))) = (cancelled, self.adjustments()) {
+            driver.after_cancel(cancelled, &mut pump)?;
+            driver.before_opening(&mut pump)?;
+        }
         let Some(gate) = &mut self.gate else {
             return Ok(game::Rearm::Held);
         };
@@ -669,6 +952,11 @@ impl Rig for PlayerRig<'_> {
         if let game::Rearm::Opened { origin } = rearmed {
             self.origin = Some(origin);
             self.ready_state_at = Some(TimeUs(origin.0 - lead_in.0));
+        }
+        if rearmed == game::Rearm::Held
+            && let Some(driver) = &mut self.adjust
+        {
+            driver.no_opening();
         }
         Ok(rearmed)
     }
@@ -702,6 +990,8 @@ impl Rig for PlayerRig<'_> {
     }
 
     fn start(&mut self, origin: TimeUs, sounds: AudioQueue, screen: RenderSide) {
+        // A new scene: a settings key held into the play repeats nothing.
+        self.next_window_scene();
         // The play's setup ends here, before anything is handed over; the
         // page faults count from here too.
         let started = self.clock.now();
@@ -872,7 +1162,7 @@ impl Rig for PlayerRig<'_> {
 
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn input_failure(&self) -> Option<InputWaitError> {
-        self.input.failure()
+        self.input.failure().or(self.adjustments_failure())
     }
 
     fn before_play(&mut self, settings: &mut Settings) {
@@ -883,10 +1173,17 @@ impl Rig for PlayerRig<'_> {
         self.result_input.release();
         let t = self.controls.tuning().close_end_screen();
         t.apply_to(settings);
+        // The adjustments' settings as every accepted change left them.
+        if let Some(driver) = &self.adjust {
+            settings.player.set_options(&driver.options());
+        }
         self.input_offset_us = t.input_offset_us;
     }
 
     fn ended(&mut self, report: &PlayReport) {
+        // The result is another scene: held adjustment controls act no more
+        // until pressed afresh.
+        self.enter_scene();
         if let Some(c) = self.figures.as_ref().and_then(|f| f.ready_state) {
             println!(
                 "ready: setup {} us, first frame {} after it started",
@@ -907,6 +1204,7 @@ impl Rig for PlayerRig<'_> {
             }
         }
         self.print(report);
+        self.print_adjustments();
         #[cfg(feature = "dev-tools")]
         self.scenario_ended(report);
         self.print_restored();
@@ -1047,6 +1345,43 @@ mod tests {
     use game::Command;
 
     use super::{until_due, until_fired};
+
+    /// The awake time the marker wait reads, set by the test.
+    static AWAKE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    fn awake() -> std::time::Duration {
+        std::time::Duration::from_millis(AWAKE_MS.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    /// A wait for the input thread's markers is bounded by 2 s of awake
+    /// time: time passed in a suspend, which the awake clock does not
+    /// count, never times it out, and 2 s awake does.
+    #[test]
+    fn the_marker_wait_counts_awake_time_only() {
+        use game::InputPump as _;
+        use std::sync::atomic::Ordering;
+        let controls =
+            std::sync::Arc::new(crate::controls::Controls::new(input::QpcClock::start()));
+        let (_hook, mut link) = crate::input_side::link(
+            std::sync::Arc::clone(&controls),
+            crate::input_side::Mode::Clock,
+            input::Waker::new().unwrap(),
+        );
+        link.set_awake(awake);
+        let mut pump = super::PlayerPump {
+            input: &link,
+            tuning: controls.tuning(),
+            since: None,
+        };
+        AWAKE_MS.store(1_000, Ordering::SeqCst);
+        assert_eq!(pump.park(), Ok(()));
+        // A long suspend: wall time passes, awake time does not.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        AWAKE_MS.store(2_999, Ordering::SeqCst);
+        assert_eq!(pump.park(), Ok(()), "1.999 s awake");
+        AWAKE_MS.store(3_000, Ordering::SeqCst);
+        assert_eq!(pump.park(), Err(game::InputWaitError::Timeout));
+    }
 
     /// A scenario's `until` is due at its chart time exactly: chart time 0
     /// lies at 6 s on the clock, so chart time 2.25 s is clock time 8.25 s.

@@ -79,6 +79,20 @@ impl ScriptedInput {
         self
     }
 
+    /// The script with `extra` items fed among its own, each after the
+    /// script's items at the same time: for packets no source records,
+    /// which only the adjustment tap observes.
+    #[must_use]
+    pub fn with_packets(mut self, extra: impl IntoIterator<Item = ScriptItem>) -> Self {
+        for item in extra {
+            let at = self.items.partition_point(|i| i.at <= item.at);
+            self.items.insert(at, item);
+            self.connect_lists.insert(at, None);
+            self.connect_axes.insert(at, Vec::new());
+        }
+        self
+    }
+
     /// Records `controls` from `device` each time the script connects it.
     #[must_use]
     pub fn with_recorded(mut self, device: DeviceId, controls: Vec<ControlId>) -> Self {
@@ -157,6 +171,12 @@ impl ScriptedInput {
         script
     }
 
+    /// The time of the next item to feed, if any.
+    #[must_use]
+    pub fn next_at(&self) -> Option<TimeUs> {
+        self.items.get(self.next).map(|i| i.at)
+    }
+
     /// Whether every item has been fed.
     #[must_use]
     pub fn is_done(&self) -> bool {
@@ -195,6 +215,10 @@ impl InputAdapter for ScriptedInput {
             }
         }
         sources.end_batch(now);
+        // The wake itself: the tap is due its ticks at the script's time
+        // now, whether or not an item was.
+        let now = sources.presentation_time(now);
+        sources.tick_presentation(now);
     }
 }
 

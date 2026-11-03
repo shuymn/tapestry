@@ -252,9 +252,9 @@ const GAUGE_GROOVE: i32 = 42;
 const GAUGE_HARD: i32 = 43;
 const GAUGE_EX: i32 = 1_046;
 /// The cover switches (`BooleanPropertyFactory.java:565-572`):
-/// `lanecover1_changing`, here the cover-adjustment mode where the source
-/// tests START or SELECT held (D4); `lanecover1_on`, `lift1_on` and
-/// `hidden1_on`, the stored switches.
+/// `lanecover1_changing`, the cover-adjustment mode: START or SELECT held
+/// as the adjustments' snapshot reads them; `lanecover1_on`, `lift1_on`
+/// and `hidden1_on`, the stored switches.
 const COVER_CHANGING: i32 = 270;
 const COVER_ON: i32 = 271;
 const LIFT_ON: i32 = 272;
@@ -307,7 +307,7 @@ fn builtin(id: i32) -> Option<(String, bool)> {
             gauge_kind(&["assist_easy", "easy", "ex_hard", "hazard"]),
             true,
         )),
-        COVER_CHANGING => Some(("cover.adjusting".to_owned(), true)),
+        COVER_CHANGING => Some(("cover.adjusting".to_owned(), false)),
         COVER_ON => Some(("cover.enabled".to_owned(), false)),
         LIFT_ON => Some(("lift.enabled".to_owned(), false)),
         HIDDEN_ON => Some(("hidden.enabled".to_owned(), false)),
@@ -518,7 +518,7 @@ mod tests {
     fn cover_switches_read_the_stored_settings() {
         let none = BTreeMap::new();
         for (id, name, src, d4) in [
-            (270, "lanecover1_changing", "cover.adjusting", true),
+            (270, "lanecover1_changing", "cover.adjusting", false),
             (271, "lanecover1_on", "cover.enabled", false),
             (272, "lift1_on", "lift.enabled", false),
             (273, "hidden1_on", "hidden.enabled", false),

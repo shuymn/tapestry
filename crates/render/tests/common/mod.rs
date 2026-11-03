@@ -13,7 +13,8 @@ use render::text::MenuText;
 use render::{AdapterChoice, AttemptInput, FrameInput, LoadingFrame, Renderer, SkinBundle, Target};
 use rules::{GaugeValue, PerJudgment};
 use skin_model::{
-    Attempt, ChartText, FrameReadouts, Gain, GaugeDesc, GaugeLook, LaneView, PlayContext, Side,
+    Attempt, ChartText, FrameReadouts, Gain, GaugeDesc, GaugeLook, LaneView, Layout, LoadState,
+    PlayContext, Side,
 };
 
 pub const MS: i64 = 1_000;
@@ -21,10 +22,8 @@ pub const MS: i64 = 1_000;
 /// black above and below, so expected rows also check the letterbox.
 pub const WIDTH: u32 = 1280;
 pub const HEIGHT: u32 = 1024;
-pub const VISIBLE: TimeUs = TimeUs(600 * MS);
-/// The declarative skins' lanes: `H` 10/3, which puts 600 ms of 120 BPM
-/// over the original lane as [`VISIBLE`] does for the simple skin, and no
-/// cover.
+/// Every skin's lanes: `H` 10/3, which puts 600 ms of 120 BPM over the
+/// original lane, and no cover.
 pub const LANES: LaneView = LaneView {
     gain: Gain::new(10, 3),
     ..LaneView::NONE
@@ -235,7 +234,6 @@ pub fn input<'a>(
     FrameInput {
         now,
         display_offset,
-        visible_time: VISIBLE,
         lanes: LANES,
         readouts: FrameReadouts::UNAVAILABLE,
         view,
@@ -243,6 +241,24 @@ pub fn input<'a>(
         gauge: 0,
         overlay: &[],
         target: [WIDTH, HEIGHT],
+    }
+}
+
+/// A loading frame of lifetime `lifetime` at `now` on the loading clock,
+/// from its origin `since`: the author's layout, every cover 0 and off and
+/// not being adjusted, no gain, no gauge descriptor, progress 0 and no
+/// text. The renderer applies its own target.
+pub const fn loading_frame(lifetime: u64, now: TimeUs, since: TimeUs) -> LoadingFrame<'static> {
+    LoadingFrame {
+        lifetime,
+        now,
+        load: LoadState { since, percent: 0 },
+        target: [1_920, 1_080],
+        layout: &Layout::AUTHOR,
+        lanes: LaneView::NONE,
+        covers: FrameReadouts::UNAVAILABLE.covers,
+        gauge: None,
+        text: 0,
     }
 }
 

@@ -17,6 +17,7 @@
 
 use std::cmp::Ordering;
 
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// An exact non-negative ratio in lowest terms, its denominator positive.
@@ -141,8 +142,10 @@ const fn gcd(mut a: u128, mut b: u128) -> u128 {
 #[error("the exact value does not fit")]
 pub struct Unrepresentable;
 
-/// How the multiplier follows the player's settings.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// How the multiplier follows the player's settings; `"classic"` or
+/// `"floating"` in `player.toml`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum SpeedMode {
     /// A saved multiplier, edited directly.
     Classic,
@@ -151,17 +154,21 @@ pub enum SpeedMode {
     Floating,
 }
 
-/// The chart tempo a preparation solves from.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// The chart tempo a preparation solves from; `"start"`, `"max"`, `"main"`
+/// or `"min"` in `player.toml`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum HiSpeedReference {
     /// The chart's initial tempo.
     #[default]
     Start,
     /// The highest tempo.
+    #[serde(rename = "max")]
     Maximum,
     /// The tempo weighted by its notes.
     Main,
     /// The lowest tempo.
+    #[serde(rename = "min")]
     Minimum,
 }
 
@@ -203,8 +210,10 @@ impl References {
     }
 }
 
-/// The speed settings, as integers: multipliers and steps in hundredths.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// The speed settings, as integers: multipliers and steps in hundredths;
+/// `[hispeed]` in `player.toml`, under these names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
 pub struct HiSpeedSettings {
     /// Classic or Floating.
     pub mode: SpeedMode,
