@@ -1,6 +1,6 @@
 //! The simple skin drawn on WARP and read back: notes sit where the
-//! attempt's exact playhead, the hi-speed visible time and the display
-//! latency offset put them, so a note meets the judgment line at its
+//! attempt's exact playhead, the lanes' gain and the display latency
+//! offset put them, so a note meets the judgment line at its
 //! judgment µs even at a fractional-µs time; a refused preparation leaves
 //! nothing of its attempt drawn; and its feedback fades with its colour
 //! composited once. Sprites are drawn
@@ -9,9 +9,9 @@
 //!
 //! Expected rows are worked out by hand from the layout: the lane runs from
 //! y = 80 to the judgment line at y = 880 (800 px), a note is 16 px tall
-//! and centered on its position, and the visible time is 600 ms. Every
-//! chart here starts at 120 BPM, so the lane holds a fixed 1.2 beats (600 ms
-//! at the start BPM) for the whole play: 666.67 px per beat. The 1280×1024
+//! and centered on its position, and the gain `H` is 10/3, 200 · H =
+//! 666.67 px per beat. Most charts here start at 120 BPM, so the lane holds
+//! 1.2 beats, 600 ms at the start BPM. The 1280×1024
 //! target shows the 1920×1080 layout at 2/3 scale with 152 black rows on
 //! top, so a layout row y lands on screen row 152 + 2y/3. Lane 7 spans
 //! x = 640..704 (screen column 448 at its middle), lane 5 x = 512..576
@@ -19,12 +19,13 @@
 
 mod common;
 
-use bms_model::{Chart, ChartBuilder, TimeUs};
+use bms_model::{Chart, ChartBuilder, Speed, TimeUs};
 use common::{MS, input, lane, note_center, view, warp, white_rows};
 use eval::{JudgeEvent, JudgeEventKind};
 use render::text::MenuText;
-use render::{Blend, Renderer, Sprite, SpriteBatch};
+use render::{Blend, PlaySkin, Renderer, SimpleSkin, Sprite, SpriteBatch};
 use rules::Judgment;
+use skin_model::{FrameReadouts, Gain, LaneView};
 
 const LANE_7: u32 = 448;
 const LANE_5: u32 = 362;
@@ -110,27 +111,112 @@ fn bpm_change_speeds_notes_up_without_a_jump() {
     assert!((after / before - 2.0).abs() < 0.1, "{before} then {after}");
 }
 
+/// The frame's lanes and readouts from one presentation snapshot through
+/// [`render::presentation::frame`]: Floating with `H` 16/5 and target
+/// green 300 at 150 BPM, with `covers`.
+fn presented(covers: game::Covers) -> (LaneView, FrameReadouts) {
+    let options = game::PlayOptions::new(game::HiSpeedSettings::default(), covers).unwrap();
+    let snapshot = game::adjustment::PresentationSnapshot {
+        options,
+        hispeed: game::Ratio::new(16, 5),
+        target: None,
+        display_offset_us: 0,
+        adjusting: false,
+        generation: 0,
+        sequence: 1,
+        epoch: 0,
+    };
+    let bpm = Some(game::Ratio::integer(150));
+    let refs = game::References::all(game::Ratio::integer(150));
+    render::presentation::frame(&snapshot, bpm, Some(refs), Speed::NORMAL, true)
+}
+
+fn sudden(amount: u16) -> game::Covers {
+    game::Covers {
+        sudden: game::Cover { amount, on: true },
+        ..game::Covers::default()
+    }
+}
+
+/// At 150 BPM and `H` 3.2 (16/5) a note's centre takes exactly 500 ms
+/// from the lane top to the judgment line (design.md "Play Adjustments":
+/// green 300): a lane 7 note at 1.0 s shown at 0.5 s is centred on the
+/// lane top (y = 80), only its lower half showing, y = 80..88, screen rows
+/// 205.33..210.67, middle 208.0; 6 ms earlier it is 9.6 px higher, wholly
+/// above the lane; at 1.0 s it is on the line. SUDDEN+ 250 covers the
+/// lane's top 200 px over it; at SUDDEN+ 1000 no field is left, and no
+/// note is drawn even on the line.
 #[test]
-fn visible_time_is_exact_at_the_start_bpm() {
-    // 120 BPM, 240 BPM from 1.5 s; a lane 7 note at 1.0 s, beat 2. Shown at
-    // 0.4 s (beat 0.8), exactly 600 ms before it, the note is centered on
-    // the lane top (y = 80) and only its lower half shows, y = 80..88,
-    // screen rows 205.33..210.67, middle 208.0. 6 ms earlier it is wholly
-    // above the lane.
-    let chart = ChartBuilder::new(120_000)
-        .bpm(TimeUs(1_500 * MS), 240_000)
+fn a_note_travels_500_ms_at_3_2() {
+    let chart = ChartBuilder::new(150_000)
         .tap(lane(7), TimeUs(1_000 * MS))
         .build()
         .unwrap();
     let mut r = warp(&chart);
+    let v = view(0, 0);
+    let shown = |r: &mut Renderer, now_ms: i64, covers: game::Covers| {
+        let (lanes, readouts) = presented(covers);
+        let f = render::FrameInput {
+            lanes,
+            readouts,
+            ..input(&v, TimeUs(now_ms * MS), TimeUs(0), &[])
+        };
+        let timing = r.frame(&f).unwrap();
+        assert!(timing.presented);
+        r.read_back()
+    };
+    let open = game::Covers::default();
     assert_eq!(
-        white_rows(&draw(&mut r, 394 * MS, 0), LANE_7),
+        white_rows(&shown(&mut r, 494, open), LANE_7),
         Vec::<u32>::new()
     );
-    let top = draw(&mut r, 400 * MS, 0);
+    let top = shown(&mut r, 500, open);
     assert_row(&top, LANE_7, 208.0);
     assert!(white_rows(&top, LANE_7).len() <= 6);
-    assert_row(&draw(&mut r, 1_000 * MS, 0), LANE_7, 738.67);
+    assert_row(&shown(&mut r, 1_000, open), LANE_7, 738.67);
+
+    // 575 ms: 425 ms before, 680 px above the line, centred on y = 200,
+    // screen row 285.33, under SUDDEN+ 250 (y 80 to 280, rows 205.33 to
+    // 338.67), which paints the cover's grey there.
+    assert_row(&shown(&mut r, 575, open), LANE_7, 285.33);
+    let covered = shown(&mut r, 575, sudden(250));
+    assert_eq!(white_rows(&covered, LANE_7), Vec::<u32>::new());
+    let grey = common::rgb_at(&covered, common::WIDTH, (LANE_7, 285));
+    assert!(grey.iter().all(|&c| (15..=45).contains(&c)), "{grey:?}");
+
+    // No field: nothing of the note at any time.
+    for now in [500, 575, 1_000] {
+        assert_eq!(
+            white_rows(&shown(&mut r, now, sudden(1_000)), LANE_7),
+            Vec::<u32>::new(),
+            "{now}"
+        );
+    }
+}
+
+/// The native line right of the lanes shows the frame's native values,
+/// one glyph per character that is not a space: `H` 3.20 in Floating,
+/// green 300 with target 300, SUDDEN+ 250 with the other covers off.
+#[test]
+fn the_native_line_shows_the_presented_values() {
+    let chart = ChartBuilder::new(150_000).build().unwrap();
+    let mut skin = SimpleSkin::new();
+    skin.prepare_attempt(&chart, None).unwrap();
+    let v = view(0, 0);
+    let (lanes, readouts) = presented(sudden(250));
+    let f = render::FrameInput {
+        lanes,
+        readouts,
+        ..input(&v, TimeUs(0), TimeUs(0), &[])
+    };
+    let mut batch = SpriteBatch::with_capacity(4_096);
+    skin.build(&f, &mut batch).unwrap();
+    let line = "HI-SPEED 3.20 FLOATING  GREEN 300 (TARGET 300)  SUDDEN+ 250  LIFT OFF  HIDDEN+ OFF";
+    let glyphs = batch
+        .blended(Blend::Alpha)
+        .filter(|s| s.rect[1] == 1_040.0 && s.rect[3] == 14.0)
+        .count();
+    assert_eq!(glyphs, line.bytes().filter(|&c| c != b' ').count());
 }
 
 #[test]
@@ -385,8 +471,8 @@ fn assert_rows(got: &[f64], want: &[f64]) {
 /// displayed at an endpoint's µs draws it centred on the line (row 880),
 /// whatever the display offset, long-note ends and a practice round's
 /// targets included, and the other notes and the bar lines at their
-/// stored distances from it. With 10 µs visible a µs of scroll at the
-/// start BPM is 80 px and a measure (a quarter beat) 120.115 px. The
+/// stored distances from it. At `H` 12/5 a measure (a quarter beat) is
+/// 120 px. The
 /// sampled scroll map drew each endpoint at its µs about half a µs of
 /// scroll short of its beat, 40 px above the line (rows 839.9, 839.7,
 /// 839.4, 839.2 and 839.0 for measures 1, 3, 5, 7 and 9), and everything
@@ -394,7 +480,7 @@ fn assert_rows(got: &[f64], want: &[f64]) {
 #[test]
 fn endpoints_meet_the_line_at_fractional_us() {
     let chart = fractional();
-    let measure = 80.0 * 15e6 / 9_990_400.0;
+    let measure = 120.0;
     // Measure m's row when measure k is on the line.
     let y = |m: i32, k: i32| 880.0 - f64::from(m - k) * measure;
     let mut r = common::offscreen(FULL.0, FULL.1);
@@ -403,7 +489,10 @@ fn endpoints_meet_the_line_at_fractional_us() {
     let v = view(0, 0);
     let draw = |r: &mut Renderer, now: i64, offset: i64| {
         let f = render::FrameInput {
-            visible_time: TimeUs(10),
+            lanes: LaneView {
+                gain: Gain::new(12, 5),
+                ..LaneView::NONE
+            },
             target: [FULL.0, FULL.1],
             ..input(&v, TimeUs(now), TimeUs(offset), &[])
         };

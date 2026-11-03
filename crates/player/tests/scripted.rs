@@ -399,10 +399,12 @@ fn perfect_measurement_judges_key_sounds_and_saves() {
         input_offset_us: 30_000,
         ..DeviceSettings::default()
     };
-    // Other physical keys (Q, W): the generated keys must still be the
-    // ones recorded.
+    // Other physical keys (Q, W, START and SELECT by default, so those
+    // move to E and R): the generated keys must still be the ones
+    // recorded.
     let lanes = &mut device.keyboard.lanes;
     (lanes[1].control, lanes[2].control) = (0x10, 0x11);
+    (device.keyboard.start, device.keyboard.select) = (Some(0x12), Some(0x13));
     game::save_settings(&fx.appdata.join("tapestry").join("device.toml"), &device).unwrap();
     let out = Command::new(env!("CARGO_BIN_EXE_tapestry"))
         .arg("play")
@@ -481,15 +483,17 @@ fn an_invalid_key_config_exits_nonzero() {
     }
 }
 
-/// The start gate on the real threads (`--dev-start-gate`; design.md
+/// The start gate on the real threads, which every play runs (design.md
 /// "Play Lifecycle", the start gate): START (Q) held 300 ms before chart
 /// time 0 cancels the first READY through the input thread's latch, its
 /// release at 200 ms rearms a fresh READY through the input thread's
 /// boundary and the audio thread's transport, and the notes, pressed
 /// 1.2 s later than the log has them, are played by that READY: every note
 /// judged PERFECT, and the audio restarted for it, its key sounds and BGM
-/// all sounding, as an ungated play's do. The saved record keeps the cancelled
-/// opening, Q's press in it, and the winning READY's input alone.
+/// all sounding, as a play without the hold does. The saved record keeps
+/// the cancelled opening, Q's press in it, and the winning READY's input
+/// alone; F2, pressed during the play, reaches the adjustments and no
+/// record, and the winning capture re-evaluates equal to the live play.
 #[test]
 fn the_start_gate_cancels_and_rearms_ready_on_the_real_threads() {
     const Q: u32 = 0x10;
@@ -500,10 +504,10 @@ fn the_start_gate_cancels_and_rearms_ready_on_the_real_threads() {
         appdata,
         ..
     } = fixture();
-    let ungated = scripted_play(&chart_path, &log, &dir.path().join("ungated"))
+    let unheld = scripted_play(&chart_path, &log, &dir.path().join("unheld"))
         .output()
         .expect("run tapestry");
-    let ungated = onsets(&String::from_utf8_lossy(&ungated.stdout));
+    let unheld = onsets(&String::from_utf8_lossy(&unheld.stdout));
     let mut rec = replay::decode(&fs::read(&log).unwrap(), &DecodeLimits::default()).unwrap();
     let q = |ms: i64, value: i32| eval::PhysicalInputEvent {
         received: TimeUs(ms * 1_000),
@@ -523,21 +527,21 @@ fn the_start_gate_cancels_and_rearms_ready_on_the_real_threads() {
     fs::write(&log, replay::encode(&rec)).unwrap();
 
     let out = scripted_play(&chart_path, &log, &appdata)
-        .arg("--dev-start-gate")
+        .args(["--dev-speed", "F2", "--dev-adjust-at", "1500"])
         .output()
         .expect("run tapestry");
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     println!("{stdout}{stderr}");
     assert_eq!(out.status.code(), Some(0));
-    // The same sounds as the ungated play: the key sounds, and the BGM,
+    // The same sounds as the play without the hold: the key sounds, and the BGM,
     // which starts only once the rearmed candidate's transport commits.
     // Where they fall is the real threads' timing, which the stepped
     // worker fixes exactly (start_gate.rs,
     // `a_rearmed_candidate_starts_its_bgm_at_its_own_origin`).
     let gated = onsets(&stdout);
-    assert!(!ungated.is_empty());
-    assert_eq!(gated.len(), ungated.len(), "{gated:?} {ungated:?}");
+    assert!(!unheld.is_empty());
+    assert_eq!(gated.len(), unheld.len(), "{gated:?} {unheld:?}");
     assert!(
         stdout.contains(&format!(
             "play 1: Completed; perfect {NOTES} great 0 good 0 bad 0 poor 0; re-evaluation matches live: true"
@@ -573,14 +577,20 @@ fn the_start_gate_cancels_and_rearms_ready_on_the_real_threads() {
         .filter(|e| !matches!(e.kind, eval::InputKind::Control { control, .. } if control.0 == Q))
         .count();
     assert_eq!(lanes, 2 * NOTES);
+    // F2 is in no opening.
+    let f2 = |e: &eval::PhysicalInputEvent| matches!(e.kind, eval::InputKind::Control { control, .. } if control.0 == 0x3C);
+    assert!(!rec.events.iter().any(f2) && !h.events.iter().any(f2));
+    assert!(
+        stdout.contains("adjust: hi-speed 4.50 floating"),
+        "{stdout}"
+    );
 }
 
-/// `--dev-start-gate` is planned against `device.toml`'s key config: quit
-/// on Q (0x10), the default START, is refused before any play opens, so
-/// the run ends with the collision and a nonzero exit, and nothing is
-/// recorded.
+/// Quit on Q (0x10), the default START, is refused with the collision
+/// when `device.toml` loads, before any play opens, so the run ends with
+/// a nonzero exit, and nothing is recorded.
 #[test]
-fn a_start_gate_on_the_quit_key_opens_no_play() {
+fn a_colliding_device_toml_opens_no_play() {
     let Fixture {
         dir: _dir,
         chart_path,
@@ -592,15 +602,17 @@ fn a_start_gate_on_the_quit_key_opens_no_play() {
     device.keyboard.quit = Some(0x10);
     game::save_settings(&appdata.join("tapestry").join("device.toml"), &device).unwrap();
     let out = scripted_play(&chart_path, &log, &appdata)
-        .arg("--dev-start-gate")
         .output()
         .expect("run tapestry");
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(1), "{stdout}{stderr}");
-    let line =
-        "dev: the start gate cannot be installed: control 0x10 is bound to both quit and START";
-    assert!(stderr.lines().any(|l| l == line), "{line:?} in {stderr}");
+    let line = "the settings cannot be used: device.toml: keyboard key config: \
+                control 0x10 is bound to both quit and START";
+    assert!(
+        stderr.lines().any(|l| l.ends_with(line)),
+        "{line:?} in {stderr}"
+    );
     assert!(!stdout.contains("play 1:"), "{stdout}");
     assert!(!appdata.join("tapestry").join("records").exists());
 }
@@ -665,20 +677,7 @@ fn run_retried(fx: &Fixture, extra: &[&str]) -> (String, Vec<PlayRecord>) {
 /// The judgments a record re-evaluates to; the run itself checked that
 /// they equal its live stream ("re-evaluation matches live").
 fn judged(chart: &bms_model::Chart, rec: &PlayRecord) -> Vec<eval::JudgeEvent> {
-    let evaluation = eval::evaluate(
-        chart,
-        &EvalInput {
-            events: rec.events.clone(),
-            device: rec.devices.profile(),
-            start: rec.start.clone(),
-            finalized: Some(rec.status.finalized),
-            section: None,
-        },
-        &rules::RulePreset::from_canonical_bytes(&rec.preset.canonical_bytes).unwrap(),
-    )
-    .unwrap();
-    evaluation
-        .events
+    all_events(chart, rec)
         .into_iter()
         .filter(|e| matches!(e.kind, JudgeEventKind::Judged { .. }))
         .collect()
@@ -702,32 +701,55 @@ fn writes_only_between_plays(stdout: &str) {
     assert!(writes > 0, "{stdout}");
 }
 
-/// Hi-speed (F2) and the display offset (F6), changed during the first
-/// play through the settings keys' path, move notes only: a note 300 ms
-/// ahead of the display time sits 800 * 300 * (1/569 - 1/600) = 21.793
-/// layout pixels higher, and both plays judge exactly as a run without the
-/// change. The second play starts with the new display offset; neither
-/// play's input offset moves.
+/// One F2 press in each play (a scripted packet only the adjustment tap
+/// observes) and the display offset (F6) in the first move notes only: F2 is
+/// exactly one Floating step, 4.00 to 4.50 at 120 BPM and the target
+/// green number 300, so a note 300 ms ahead of the display time sits
+/// 120 · (4.5 − 4) = 60 layout pixels higher; both plays judge exactly as
+/// a run without the change, and F2 is in neither record. The display
+/// offset persists; neither play's input offset moves.
 #[test]
-fn hi_speed_change_moves_notes_not_judgment() {
+fn one_f2_press_steps_hi_speed_once_and_moves_notes_not_judgment() {
     let plain = fixture();
     let (plain_out, without) = run_retried(&plain, &[]);
     // The retried play's load time is reported.
     assert!(plain_out.contains("retry "), "{plain_out}");
+    assert_eq!(
+        plain_out
+            .matches("adjust: hi-speed 4.00 floating target 300")
+            .count(),
+        2,
+        "{plain_out}"
+    );
     let changed = fixture();
     let (stdout, with) = run_retried(
         &changed,
-        &["--dev-adjust", "F2,F6", "--dev-adjust-at", "2250"],
+        &[
+            "--dev-speed",
+            "F2",
+            "--dev-adjust",
+            "F6",
+            "--dev-adjust-at",
+            "2250",
+        ],
     );
     writes_only_between_plays(&stdout);
+    // Each play's press steps once; a retry solves from the target again
+    // before its own press.
+    assert_eq!(
+        stdout
+            .matches("adjust: hi-speed 4.50 floating target 300")
+            .count(),
+        2,
+        "{stdout}"
+    );
     let root = game::DataRoot::new(changed.appdata.join("tapestry"));
     let s = game::Settings::load(&root).unwrap();
-    assert_eq!(s.player.visible_time_ms, 569);
     assert_eq!(s.device.display_offset_us, 1_000);
 
     assert_eq!((without.len(), with.len()), (2, 2));
     for (a, b) in without.iter().zip(&with) {
-        assert_eq!(a.events, b.events);
+        assert_eq!(a.events, b.events, "F2 is not recorded");
         assert_eq!(a.devices.sources, b.devices.sources);
         let (ja, jb) = (judged(&plain.chart, a), judged(&changed.chart, b));
         assert_eq!(ja.len(), NOTES);
@@ -738,31 +760,29 @@ fn hi_speed_change_moves_notes_not_judgment() {
     assert_eq!(display(&with[1]), TimeUs(1_000));
 
     // The same note (lane 1's at 2.5 s) at the same display time (2.2 s)
-    // with 600 and 569 ms: its stored position, and the playhead the
-    // attempt prepares, sampled there.
+    // at 4.00 and 4.50: its stored position, and the playhead the attempt
+    // prepares, sampled there.
     let chart = &changed.chart;
     let playhead = skin_model::ExactPlayhead::prepare(chart, None).unwrap();
     let note = chart.lanes[1][1];
     assert_eq!(note.time, TimeUs(2_500_000));
-    let y = |visible| {
+    let y = |num, den| {
         render::layout::note_y(
             note.pos,
             playhead.position_at(TimeUs(2_200_000)),
-            playhead.initial_rate(),
-            TimeUs(visible),
+            skin_model::Gain::new(num, den).unwrap(),
         )
     };
-    // By hand: 880 - 800 * 300 / 600 = 480; 880 - 800 * 300 / 569 =
-    // 458.2074.
-    assert!((y(600_000) - 480.0).abs() < 1e-3);
-    let after = i64::from(s.player.visible_time_ms) * 1_000;
-    assert!((y(after) - 458.207_4).abs() < 1e-3);
+    // By hand: 0.6 beats ahead, 200 · H pixels a beat: 880 − 480 = 400
+    // and 880 − 540 = 340.
+    assert!((y(4, 1) - 400.0).abs() < 1e-3);
+    assert!((y(9, 2) - 340.0).abs() < 1e-3);
 }
 
-/// Settings keys pressed in the first play (hi-speed up twice, volume down,
-/// display offset up three times, and input offset up, which a play
-/// refuses) and on its end screen (input offset up twice) are written to
-/// `player.toml` and `device.toml` when a play ends, never during one.
+/// Settings keys pressed in the first play (volume down, display offset up
+/// three times, and input offset up, which a play refuses) and on its end
+/// screen (input offset up twice) are written to `device.toml` when a play
+/// ends, never during one.
 /// Each play is recorded with the offsets it started with: the input
 /// offset changed on the end screen is the retried play's, never the
 /// first one's.
@@ -773,7 +793,7 @@ fn settings_keys_persist_and_the_input_offset_waits_for_the_next_play() {
         &fx,
         &[
             "--dev-adjust",
-            "F2,F2,F3,F6,F6,F6,F8",
+            "F3,F6,F6,F6,F8",
             "--dev-adjust-at",
             "2250",
             "--dev-adjust-end",
@@ -788,9 +808,8 @@ fn settings_keys_persist_and_the_input_offset_waits_for_the_next_play() {
 
     let root = game::DataRoot::new(fx.appdata.join("tapestry"));
     let s = game::Settings::load(&root).unwrap();
-    // Two hi-speed steps from 600 ms (569, then 540 ms); 100 - 5 %; 3 * 1 ms; F8 during play does nothing,
-    // 2 * 1 ms on the end screen.
-    assert_eq!(s.player.visible_time_ms, 540);
+    // 100 - 5 %; 3 * 1 ms; F8 during play does nothing, 2 * 1 ms on the
+    // end screen.
     assert_eq!(s.device.master_volume, 0.95);
     assert_eq!(s.device.display_offset_us, 3_000);
     assert_eq!(s.device.input_offset_us, 2_000);
@@ -1306,6 +1325,8 @@ fn auto_play_uses_its_own_keys_and_keeps_device_toml() {
     let device = DeviceSettings {
         keyboard: game::KeyConfig {
             lanes: Vec::new(),
+            // No scratch key: no scratch direction either.
+            scratch_positive: None,
             ..DeviceSettings::default().keyboard
         },
         ..DeviceSettings::default()
@@ -1593,4 +1614,293 @@ fn dev_start_inside_a_lone_long_note_exits_one() {
     );
     assert!(!stdout.contains("play started"), "{stdout}");
     assert!(!fx.appdata.join("tapestry").join("records").exists());
+}
+
+/// The loading script on the real threads (`--dev-loading`; design.md
+/// "Play Adjustments"): START (Q) held from the start of loading for
+/// 1.5 s, with recording closed, defers the opening; the loading script
+/// goes on feeding through the deferral, so its release opens it, and the
+/// play's script takes over on the same devices. Nothing of the loading
+/// script is recorded, and the play opened about 1.5 s after it was first
+/// asked for.
+#[test]
+fn a_loading_script_press_defers_the_opening_and_its_release_opens_it() {
+    const Q: u32 = 0x10;
+    let Fixture {
+        dir: _dir,
+        chart_path,
+        log,
+        events,
+        appdata,
+        ..
+    } = fixture();
+    let out = scripted_play(&chart_path, &log, &appdata)
+        .args(["--dev-loading", "10@0-1500"])
+        .output()
+        .expect("run tapestry");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stdout}{stderr}");
+    assert!(stdout.contains("play 1:"), "{stdout}");
+    let saved = records(&appdata);
+    assert_eq!(saved.len(), 1, "{saved:?}");
+    let rec = replay::decode(&fs::read(&saved[0]).unwrap(), &DecodeLimits::default()).unwrap();
+    // No cancelled candidate: the opening was deferred, not cancelled.
+    assert!(rec.history.openings.is_empty(), "{:?}", rec.history);
+    // The script keeps the timeline of the opening first asked for; the
+    // play opened about 1.5 s later, at the release, so the log's presses
+    // land that much earlier on its chart time.
+    let early = events[0].received.0 - rec.events[0].received.0;
+    assert!((1_400_000..1_700_000).contains(&early), "{early} {stderr}");
+    assert!(!rec.events.iter().any(|e| matches!(
+        e.kind,
+        eval::InputKind::Control { control, .. } if control.0 == Q
+    )));
+}
+
+/// An autoplay session keeps F1 and F2 (design.md "Play Adjustments"): no
+/// keyboard reaches the tap, so the window queues them for it; one F2
+/// press during the play is exactly one Floating step, 4.00 to 4.50 at
+/// 120 BPM and the target green number 300, and nothing is saved.
+#[test]
+fn autoplay_f2_steps_hi_speed_once() {
+    let (_dir, chart, appdata) = auto_fixture();
+    let out = auto_run(
+        &chart,
+        &appdata,
+        &[
+            "--dev-speed".as_ref(),
+            "F2".as_ref(),
+            "--dev-adjust-at".as_ref(),
+            "1000".as_ref(),
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+    assert!(
+        stdout.contains("adjust: hi-speed 4.50 floating target 300"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("autoplay: not saved"), "{stdout}");
+}
+
+/// Every observation is stamped on the process clock (design.md "Play
+/// Adjustments", clock domains): a scripted play's loading script, on its
+/// own timeline from the start of loading, holds SELECT and taps a white
+/// key, lowering G to 299 before the chart's tempo is known; the attempt
+/// then solves once at 120 BPM, 144000 / (120 · 299) = 4.01, and the
+/// play's script, on the timeline of the first opening, holds START
+/// before the commit, so READY is cancelled and rearmed. Nothing the
+/// reducer takes is out of order.
+#[test]
+fn presentation_times_follow_the_process_clock_under_a_script() {
+    const Q: u32 = 0x10;
+    let Fixture {
+        dir: _dir,
+        chart_path,
+        log,
+        appdata,
+        ..
+    } = fixture();
+    let mut rec = replay::decode(&fs::read(&log).unwrap(), &DecodeLimits::default()).unwrap();
+    let q = |ms: i64, value: i32| eval::PhysicalInputEvent {
+        received: TimeUs(ms * 1_000),
+        source: eval::SourceId(0),
+        kind: eval::InputKind::Control {
+            control: eval::ControlId(Q),
+            value,
+        },
+    };
+    let mut events = vec![q(-300, 1), q(200, 0)];
+    events.extend(rec.events.iter().map(|e| eval::PhysicalInputEvent {
+        received: TimeUs(e.received.0 + 1_200_000),
+        ..*e
+    }));
+    rec.events = events;
+    rec.status.finalized = TimeUs(rec.status.finalized.0 + 1_200_000);
+    fs::write(&log, replay::encode(&rec)).unwrap();
+    let out = scripted_play(&chart_path, &log, &appdata)
+        .args(["--dev-loading", "11@0-300,2c@100-150"])
+        .output()
+        .expect("run tapestry");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stdout}{stderr}");
+    assert!(
+        stdout.contains("adjust: hi-speed 4.01 floating target 299"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("out-of-order 0"), "{stdout}");
+    let saved = records(&appdata);
+    assert_eq!(saved.len(), 1, "{saved:?}");
+    let rec = replay::decode(&fs::read(&saved[0]).unwrap(), &DecodeLimits::default()).unwrap();
+    assert_eq!(
+        rec.history.openings.len(),
+        1,
+        "the rearm: {:?}",
+        rec.history
+    );
+}
+
+/// A chart for the outcome mix at 120 BPM (a measure is 2 s): key 1, 2, 3
+/// and 4 in measure 1; the scratch and key 5's long note (1/4 to 3/4) in
+/// measure 2; key 6 and key 7 in measure 3.
+const MIX_CHART: &str = "#PLAYER 1\n#TITLE mix\n#BPM 120\n#WAV01 click.wav\n#LNTYPE 1\n\
+                         #00111:01000000\n#00112:00010000\n#00113:00000100\n#00114:00000001\n\
+                         #00216:01\n#00255:00010001\n#00318:01\n#00319:00000100\n";
+
+/// The winning capture re-evaluates equal to the live play, on the real
+/// threads (design.md "Play Lifecycle", the start gate; B9): a READY
+/// cancelled by START first, then the play with every outcome the
+/// evaluator has: PERFECT, a GREAT pressed early (counted FAST), a POOR
+/// miss, a long note judged at its release (the long notes judge their
+/// release, so a separate CN mode adds nothing here), an empty POOR and a
+/// scratch hit, with START, SELECT and the auxiliary keys pressed during
+/// it, which are recorded, and F2, which is not. The cancelled opening
+/// keeps START's press.
+#[test]
+fn the_winning_capture_reevaluates_equal_to_live() {
+    const Q: u32 = 0x10;
+    const W: u32 = 0x11;
+    const UP: u32 = 0xE048;
+    const KEY6: u32 = 0x21;
+    const KEY7: u32 = 0x2f;
+    const KEY2: u32 = 0x1f;
+    let fx = fixture_of(MIX_CHART);
+    let mut rec = replay::decode(&fs::read(&fx.log).unwrap(), &DecodeLimits::default()).unwrap();
+    let key = |ms: i64, control: u32, value: i32| eval::PhysicalInputEvent {
+        received: TimeUs(ms * 1_000),
+        source: eval::SourceId(0),
+        kind: eval::InputKind::Control {
+            control: eval::ControlId(control),
+            value,
+        },
+    };
+    let key7 = fx.chart.lanes[7][0].time.0 / 1_000;
+    let mut events: Vec<_> = rec
+        .events
+        .iter()
+        .filter(
+            |e| !matches!(e.kind, eval::InputKind::Control { control, .. } if control.0 == KEY6),
+        )
+        .map(|e| match e.kind {
+            // Key 2 pressed 40 ms early: a GREAT, counted FAST.
+            eval::InputKind::Control { control, value: 1 } if control.0 == KEY2 => {
+                eval::PhysicalInputEvent {
+                    received: TimeUs(e.received.0 - 40_000),
+                    ..*e
+                }
+            }
+            _ => *e,
+        })
+        .collect();
+    // An empty POOR on key 7 400 ms before its note; START, SELECT and the
+    // auxiliary key during the play.
+    events.extend([
+        key(key7 - 400, KEY7, 1),
+        key(key7 - 380, KEY7, 0),
+        key(2_500, W, 1),
+        key(2_520, UP, 1),
+        key(2_540, UP, 0),
+        key(2_560, W, 0),
+        key(3_300, Q, 1),
+        key(3_320, Q, 0),
+    ]);
+    events.sort_by_key(|e| e.received);
+    // START held before chart time 0 cancels the first READY; the play's
+    // input comes 1.2 s later.
+    let mut shifted = vec![key(-300, Q, 1), key(200, Q, 0)];
+    shifted.extend(events.iter().map(|e| eval::PhysicalInputEvent {
+        received: TimeUs(e.received.0 + 1_200_000),
+        ..*e
+    }));
+    rec.events = shifted;
+    rec.status.finalized = TimeUs(8_000_000);
+    fs::write(&fx.log, replay::encode(&rec)).unwrap();
+
+    let out = scripted_play(&fx.chart_path, &fx.log, &fx.appdata)
+        .args(["--dev-speed", "F2", "--dev-adjust-at", "1500"])
+        .output()
+        .expect("run tapestry");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stdout}{stderr}");
+    assert!(
+        stdout.contains("re-evaluation matches live: true"),
+        "{stdout}"
+    );
+    let saved = records(&fx.appdata);
+    assert_eq!(saved.len(), 1, "{saved:?}");
+    let rec = replay::decode(&fs::read(&saved[0]).unwrap(), &DecodeLimits::default()).unwrap();
+    // The cancelled opening holds START's press.
+    let h = &rec.history;
+    assert_eq!(h.openings.len(), 1, "{h:?}");
+    let o = &h.openings[0];
+    let cancelled = &h.events[o.events.start as usize..o.events.end as usize];
+    let has = |events: &[eval::PhysicalInputEvent], c: u32| {
+        events.iter().any(|e| {
+            e.kind
+                == eval::InputKind::Control {
+                    control: eval::ControlId(c),
+                    value: 1,
+                }
+        })
+    };
+    assert!(has(cancelled, Q));
+    // The winning opening records START, SELECT and the auxiliary key, and
+    // not F2.
+    for c in [Q, W, UP] {
+        assert!(has(&rec.events, c), "{c:#x}");
+    }
+    assert!(!has(&rec.events, 0x3C) && !has(&h.events, 0x3C));
+    // Every outcome, re-evaluated from the record.
+    let all = all_events(&fx.chart, &rec);
+    let judged: Vec<_> = all
+        .iter()
+        .filter(|e| matches!(e.kind, JudgeEventKind::Judged { .. }))
+        .collect();
+    let count = |j: Judgment| {
+        judged
+            .iter()
+            .filter(|e| matches!(e.kind, JudgeEventKind::Judged { judgment, .. } if judgment == j))
+            .count()
+    };
+    assert!(count(Judgment::Perfect) >= 1, "{judged:?}");
+    assert_eq!(count(Judgment::Great), 1, "{judged:?}");
+    assert_eq!(count(Judgment::Poor), 1, "{judged:?}");
+    let fast = judged.iter().any(|e| {
+        matches!(e.kind, JudgeEventKind::Judged { judgment: Judgment::Great, deviation: Some(d), .. } if d.0 < 0)
+    });
+    assert!(fast, "{judged:?}");
+    let released = judged.iter().any(|e| {
+        matches!(e.kind, JudgeEventKind::Judged { lane, release: Some(_), .. } if lane.index() == 5)
+    });
+    assert!(released, "{judged:?}");
+    let scratch = judged.iter().any(|e| {
+        matches!(e.kind, JudgeEventKind::Judged { lane, judgment: Judgment::Perfect, .. } if lane.index() == 0)
+    });
+    assert!(scratch, "{judged:?}");
+    assert!(
+        all.iter()
+            .any(|e| matches!(e.kind, JudgeEventKind::EmptyPoor { .. })),
+        "{all:?}"
+    );
+}
+
+/// Every event a record re-evaluates to.
+fn all_events(chart: &bms_model::Chart, rec: &PlayRecord) -> Vec<eval::JudgeEvent> {
+    eval::evaluate(
+        chart,
+        &EvalInput {
+            events: rec.events.clone(),
+            device: rec.devices.profile(),
+            start: rec.start.clone(),
+            finalized: Some(rec.status.finalized),
+            section: None,
+        },
+        &rules::RulePreset::from_canonical_bytes(&rec.preset.canonical_bytes).unwrap(),
+    )
+    .unwrap()
+    .events
 }

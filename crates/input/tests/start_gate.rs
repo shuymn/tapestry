@@ -43,6 +43,7 @@ fn rig(max_held: usize) -> (SourceSet, StartGate) {
         controls: vec![(TapControl::Key(Q), 0), (TapControl::Key(W), 1)],
         latched: 0b11,
         wrap: None,
+        ..AdjustmentBindings::default()
     })
     .unwrap();
     tap.set_active(true);

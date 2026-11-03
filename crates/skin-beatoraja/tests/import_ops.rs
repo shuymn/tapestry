@@ -325,9 +325,10 @@ fn cover_switches_by_number_and_name_build_one_condition() {
         repeated.ok().skin.ops().total(),
         once.ok().skin.ops().total()
     );
-    // 270's control reading is D4, once however often it is listed.
+    // 270 reads the adjustments' snapshot as the source reads its
+    // controls: no deviation, however often it is listed.
     let changing = image(r#""op": [270, "lanecover1_changing"]"#);
-    assert_eq!(common::kinds(changing.report()), [D4]);
+    assert!(common::kinds(changing.report()).is_empty());
     // The built-in wins over an item declared with its number.
     let declared = import_body(
         r#""property": [{"name": "p", "item": [{"name": "x", "op": 272}], "def": "x"}],

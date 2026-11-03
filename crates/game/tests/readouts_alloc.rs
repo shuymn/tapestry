@@ -52,6 +52,7 @@ fn the_projections_allocate_nothing() {
                 adjusting: true,
                 generation: 0,
                 sequence: 1,
+                epoch: 0,
             })
         })
         .collect();

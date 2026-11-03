@@ -71,6 +71,10 @@ struct LoadHost<'a> {
     render: &'a RenderLink,
     /// The load's lines, which say the chart is being measured.
     page: Option<&'a LoadingText>,
+    /// The adjustments' driver, served at every check of the measurement
+    /// and through the 1× decode.
+    adjust: Option<&'a mut game::AdjustDriver>,
+    input: &'a crate::input_side::InputLink,
     /// The measurement closes the window (a script's `close-measuring`,
     /// dev-tools).
     #[cfg(feature = "dev-tools")]
@@ -85,14 +89,29 @@ impl crate::loudness::Host for LoadHost<'_> {
     fn at_normal(&mut self) -> anyhow::Result<(bms_model::Chart, Arc<audio::SoundBank>)> {
         let chart = self.loaded.chart_at(bms_model::Speed::NORMAL)?;
         let controls = self.controls;
-        let bank = audio::load_bank_reporting(
-            &chart,
-            self.rate,
-            bms_model::Speed::NORMAL,
-            &audio::BankLimits::default(),
-            &|_, _| {},
-            &|| controls.quitting() || controls.leaving(),
-        )?;
+        let rate = self.rate;
+        let decode = || {
+            audio::load_bank_reporting(
+                &chart,
+                rate,
+                bms_model::Speed::NORMAL,
+                &audio::BankLimits::default(),
+                &|_, _| {},
+                &|| controls.quitting() || controls.leaving(),
+            )
+        };
+        // Decoded on its own thread while this one serves the adjustments.
+        let (adjust, input) = (&mut self.adjust, self.input);
+        let bank = std::thread::scope(|s| {
+            let worker = s.spawn(decode);
+            while !worker.is_finished() {
+                crate::play::serve_adjustments(adjust.as_deref_mut(), input, controls.tuning());
+                std::thread::park_timeout(crate::play::MARKER_PARK);
+            }
+            worker
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+        })?;
         Ok((chart, Arc::new(bank)))
     }
 
@@ -109,6 +128,14 @@ impl crate::loudness::Host for LoadHost<'_> {
     }
 
     fn cancelled(&mut self) -> bool {
+        // Every block of the measurement serves the adjustments.
+        #[cfg(feature = "dev-tools")]
+        crate::dev::press_due(self.controls, crate::dev::LoadPhase::Measuring);
+        crate::play::serve_adjustments(
+            self.adjust.as_deref_mut(),
+            self.input,
+            self.controls.tuning(),
+        );
         self.controls.quitting() || self.controls.leaving()
     }
 }
@@ -501,6 +528,10 @@ impl Selection {
                     script.slow_load.get_or_insert_default().close = true;
                 }
                 Some(SelectStep::SlowMeasuring(ms)) => crate::dev::slow_measuring(ms),
+                Some(SelectStep::SlowDecoding(ms)) => crate::dev::slow_decoding(ms),
+                Some(SelectStep::SlowPreparing(ms)) => crate::dev::slow_preparing(ms),
+                Some(SelectStep::SlowChartLoad(ms)) => crate::dev::slow_chart_load(ms),
+                Some(SelectStep::PressLoading(ms)) => crate::dev::press_loading(ms),
                 Some(SelectStep::HoldBackground) => crate::dev::hold_background(),
                 Some(SelectStep::Background(running)) => {
                     let done = if running {
@@ -1405,6 +1436,7 @@ impl PlayerRig<'_> {
                         log: log.clone(),
                         current: log.clone(),
                         sources: crate::source_config(),
+                        loading: None,
                     };
                     self.input
                         .switch(Mode::Script(Box::new(script)), crate::source_config());
@@ -1465,6 +1497,10 @@ impl AppRig for PlayerRig<'_> {
     /// stage: a loading lifetime begins, with the shown gauge's descriptor
     /// from the validated preset selection has chosen.
     fn entered_loading(&mut self, chart: &std::path::Path) {
+        // The coming attempt's entry: its loading-time adjustments are its
+        // own, and solve nothing until its chart is read. A failed fence is
+        // the input thread's failure, which ends the run.
+        self.enter_attempt();
         let Some(sel) = &mut self.selection else {
             return;
         };
@@ -1501,6 +1537,15 @@ impl AppRig for PlayerRig<'_> {
     }
 
     fn load_chart(&mut self, loaded: &Loaded) -> Result<Loading, ChartLoadError> {
+        // The chart, speed and section are final: the presentation solves
+        // for them once, so what the player adjusts while loading applies
+        // to this attempt. A refusal is reported by the play's preparation
+        // ([`game::Rig::begin_presentation`]), which attaches again: a
+        // refused attach leaves nothing pending. A failed
+        // fence is latched in the driver and ends the run.
+        if let Some((driver, mut pump)) = self.adjustments() {
+            let _ = driver.attach_loaded(loaded, &mut pump);
+        }
         // A practice's Start chooses again: its load times run from it.
         let now = self.clock.now();
         let sel = self.selection.as_mut().ok_or(ChartLoadError::NoSelection)?;
@@ -1601,20 +1646,42 @@ impl AppRig for PlayerRig<'_> {
             .is_some_and(|s| std::mem::take(&mut s.quit_decoding));
         // The quit key or a close stops the decode at the next file or
         // packet, and no bank is made.
-        let decoded_bank = audio::load_bank_reporting(
-            chart,
-            rate,
-            speed,
-            &audio::BankLimits::default(),
-            &|done, files| {
-                progress.decoded(done, files);
+        // The sounds decode on their own thread while this one serves the
+        // adjustments, so one made during a long decode is published before
+        // loading ends (design.md "Play Adjustments").
+        let decode = || {
+            audio::load_bank_reporting(
+                chart,
+                rate,
+                speed,
+                &audio::BankLimits::default(),
+                &|done, files| {
+                    #[cfg(feature = "dev-tools")]
+                    crate::dev::hold_decoding();
+                    progress.decoded(done, files);
+                    #[cfg(feature = "dev-tools")]
+                    if quit_decoding && done == 1 {
+                        controls.command(game::Command::Quit);
+                    }
+                },
+                &|| controls.quitting() || controls.leaving(),
+            )
+        };
+        let (adjust, input) = (&mut self.adjust, &self.input);
+        let decoded_bank = std::thread::scope(|s| {
+            let worker = s.spawn(decode);
+            while !worker.is_finished() {
                 #[cfg(feature = "dev-tools")]
-                if quit_decoding && done == 1 {
-                    controls.command(game::Command::Quit);
-                }
-            },
-            &|| controls.quitting() || controls.leaving(),
-        );
+                crate::dev::press_due(controls, crate::dev::LoadPhase::Decoding);
+                crate::play::serve_adjustments(adjust.as_mut(), input, controls.tuning());
+                std::thread::park_timeout(crate::play::MARKER_PARK);
+            }
+            worker
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+        });
+        #[cfg(feature = "dev-tools")]
+        crate::dev::print_adjustments("decoding", self.adjust.as_ref());
         let bank = match decoded_bank {
             Ok(bank) => {
                 progress.completed();
@@ -1666,6 +1733,8 @@ impl AppRig for PlayerRig<'_> {
             controls: self.controls,
             render: &self.render,
             page: page.as_ref(),
+            adjust: self.adjust.as_mut(),
+            input: &self.input,
             #[cfg(feature = "dev-tools")]
             close,
             #[cfg(feature = "dev-tools")]
@@ -1690,6 +1759,8 @@ impl AppRig for PlayerRig<'_> {
             println!("load: cancelled");
             return Ok(Loading::Cancelled);
         }
+        #[cfg(feature = "dev-tools")]
+        crate::dev::print_adjustments("measuring", self.adjust.as_ref());
         let measured = self.clock.now();
         // A cached measurement asks nothing: the screen is not waited for
         // after a quit or a close.
@@ -1698,7 +1769,18 @@ impl AppRig for PlayerRig<'_> {
             return Ok(Loading::Cancelled);
         }
         show_stage(&self.render, page.as_ref(), Stage::Screen);
-        screen.wait(&self.render).map_err(ChartLoadError::Screen)?;
+        // The chart loads on the render thread: the adjustments are served
+        // through the wait.
+        let (adjust, input, controls) = (&mut self.adjust, &self.input, self.controls);
+        screen
+            .wait_serving(&self.render, || {
+                #[cfg(feature = "dev-tools")]
+                crate::dev::press_due(controls, crate::dev::LoadPhase::ChartLoad);
+                crate::play::serve_adjustments(adjust.as_mut(), input, controls.tuning());
+            })
+            .map_err(ChartLoadError::Screen)?;
+        #[cfg(feature = "dev-tools")]
+        crate::dev::print_adjustments("chart-load", self.adjust.as_ref());
         let ready = self.clock.now();
         #[cfg(feature = "dev-tools")]
         let feed = self.scenario_input(feed);
@@ -1785,6 +1867,9 @@ impl AppRig for PlayerRig<'_> {
     }
 
     fn entered_selection(&mut self) {
+        // Another scene: held adjustment controls act no more until
+        // pressed afresh.
+        self.enter_scene();
         recover(
             &mut self.result_input,
             Owner::Select,
@@ -1813,6 +1898,7 @@ impl AppRig for PlayerRig<'_> {
     }
 
     fn entered_practice(&mut self, screen: &PracticeScreen) {
+        self.enter_scene();
         recover(
             &mut self.result_input,
             Owner::Practice,
@@ -2621,6 +2707,7 @@ mod tests {
                 .to_vec(),
             retry: None,
             quit: None,
+            ..game::KeyConfig::default()
         };
         let bindings = crate::select::menu_bindings(
             &config,

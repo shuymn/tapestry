@@ -14,17 +14,10 @@
 //!   candidate's rearm, which carries a round's restore planned again in a
 //!   spare box ([`game::Restorer::replan`]).
 //!
-//! Production constructs no gate until S10-04b: its plays keep opening
-//! their first READY as the play. Development runs install one.
+//! Every run installs the gate with the adjustments' driver
+//! (`install_adjustments` in `main.rs`).
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
-#![cfg_attr(
-    not(any(feature = "dev-tools", test)),
-    expect(
-        dead_code,
-        reason = "production installs no start gate until S10-04b turns it on; development runs and tests do"
-    )
-)]
 
 use std::time::{Duration, Instant};
 
@@ -32,10 +25,7 @@ use audio::OutputError;
 use bms_model::TimeUs;
 use eval::InputStart;
 use game::{AudioControl, HistoryRecorder, InputWaitError, Opening, Rearm as LiveRearm};
-use input::{
-    AdjustmentBindings, AdjustmentReceiver, GatePhase, GateState, HoldLatch, SourceReader,
-    StartGate, TapError, adjustment_queue,
-};
+use input::{GatePhase, GateState, HoldLatch, SourceReader, StartGate};
 use replay::{CancelReason, MAX_CANCELLED_EVENTS, MAX_OPENING_ARRIVALS};
 
 use crate::input_side::{self, InputLink, RearmOutcome};
@@ -49,9 +39,6 @@ const DROP_TIMEOUT: Duration = game::SWITCH_TIMEOUT;
 pub struct PlayerGate {
     gate: StartGate,
     latch: HoldLatch,
-    /// The tap's queue's other end, kept so the queue stays open; the
-    /// controls' reducer reads it from S10-04b.
-    _adjust: AdjustmentReceiver,
     /// The candidate armed last.
     armed: u32,
     /// Whether the attempt's first candidate was handed to audio.
@@ -72,22 +59,15 @@ pub struct PlayerGate {
 }
 
 impl PlayerGate {
-    /// Sends the input thread a tap of `bindings` and keeps its start gate
-    /// and hold latch.
-    ///
-    /// # Errors
-    ///
-    /// What the tap refuses of `bindings`.
-    pub fn install(input: &InputLink, bindings: AdjustmentBindings) -> Result<Self, TapError> {
-        let (mut tap, receiver) = adjustment_queue(bindings)?;
-        tap.set_active(true);
+    /// Sends the input thread `tap`, whose receiver the adjustments'
+    /// driver reads, and keeps its start gate and hold latch.
+    pub fn install(input: &InputLink, tap: input::AdjustmentTap) -> Self {
         let gate = tap.start_gate();
         let latch = tap.latch();
         input.tap(tap);
-        Ok(Self {
+        Self {
             gate,
             latch,
-            _adjust: receiver,
             armed: 0,
             started: false,
             rearm: None,
@@ -95,7 +75,7 @@ impl PlayerGate {
             spare: None,
             loading: false,
             unacknowledged: false,
-        })
+        }
     }
 
     /// Candidate `generation` opened with `opening`: the rearm's buffers
@@ -419,15 +399,14 @@ mod tests {
     fn installed() -> (PlayerGate, Hook, InputLink) {
         let controls = Arc::new(Controls::new(QpcClock::start()));
         let (hook, input) = link(controls, Mode::Clock, Waker::new().unwrap());
-        let gate = PlayerGate::install(
-            &input,
-            AdjustmentBindings {
-                controls: vec![(TapControl::Key(ControlId(0x10)), 0)],
-                latched: 1,
-                wrap: None,
-            },
-        )
+        let (mut tap, _rx) = input::adjustment_queue(AdjustmentBindings {
+            controls: vec![(TapControl::Key(ControlId(0x10)), 0)],
+            latched: 1,
+            ..AdjustmentBindings::default()
+        })
         .unwrap();
+        tap.set_active(true);
+        let gate = PlayerGate::install(&input, tap);
         (gate, hook, input)
     }
 

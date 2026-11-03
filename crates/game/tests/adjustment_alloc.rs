@@ -131,11 +131,19 @@ fn the_reducer_and_its_publication_allocate_nothing() {
         ),
         o(610, Event::Repeat(c(9))),
         o(611, Event::Lost),
-        o(612, Event::Resync(HeldSet::default().with(c(1)))),
+        o(
+            612,
+            Event::Resync {
+                held: HeldSet::default().with(c(1)),
+                verified: true,
+            },
+        ),
         o(613, Event::Release(c(1))),
         o(614, Event::Ownership),
         o(615, Event::Tick),
     ];
+    let mut b = Adjustment::new(classic, roles, TimeUs(-2_000_000), 0);
+    let (mut wb, mut rb) = presentation_link(&b.snapshot());
     // The first drain is counted too.
     counting::track(true);
     counting::self_check();
@@ -144,10 +152,13 @@ fn the_reducer_and_its_publication_allocate_nothing() {
         a.drain(chunk.iter().copied(), &Map, &mut w);
         let _ = r.read();
     }
-    // Full covers in a new attempt, Classic: a cover operation at the end.
-    a.begin_attempt(classic, TimeUs(-2_000_000), 0);
+    // The next attempt entered, the holds carried over.
+    a.enter_attempt(Some(TimeUs(-2_000_000)), &Map);
     a.drain(script.iter().copied(), &Map, &mut w);
-    let s = *r.read();
+    let _ = r.read();
+    // Full covers, Classic: a cover operation at the end.
+    b.drain(script.iter().copied(), &Map, &mut wb);
+    let s = *rb.read();
     let calls = counting::calls() - before;
     counting::track(false);
     assert_eq!(calls, 0, "the reducer allocated or freed {calls} times");

@@ -883,7 +883,7 @@ fn unknown_preset_name_is_refused() {
 fn missing_preset_key_takes_the_new_default() {
     let (_dir, root) = temp_root();
     fs::create_dir_all(root.path()).unwrap();
-    fs::write(root.player_settings(), "visible_time_ms = 600\n").unwrap();
+    fs::write(root.player_settings(), "displayed_gauge = 0\n").unwrap();
     let report = play_17_ms_late(&root);
     assert_eq!(
         played_under(&report),
@@ -2233,6 +2233,7 @@ fn a_chart_too_large_to_reserve_is_refused_without_inputs() {
         lanes: Vec::new(),
         retry: None,
         quit: None,
+        ..game::KeyConfig::default()
     };
     let parts = Parts {
         ingest: Box::new(Built(b.build().unwrap())),

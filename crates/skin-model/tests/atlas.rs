@@ -178,10 +178,10 @@ fn the_side_counts_the_reserved_layers() {
         reserved_layers: reserved,
     };
     // With a reserved layer: 5 × 256² < 2 × 512².
-    let a = sheet.atlas(Variant::Lo, limits(1)).unwrap();
+    let a = sheet.atlas(Variant::Lo, limits(1), &|| false).unwrap();
     assert_eq!((a.side(), a.pages().len()), (256, 4));
     // With none, the two cost the same and fewer pages win.
-    let a = sheet.atlas(Variant::Lo, limits(0)).unwrap();
+    let a = sheet.atlas(Variant::Lo, limits(0), &|| false).unwrap();
     assert_eq!((a.side(), a.pages().len()), (512, 1));
 }
 
@@ -198,8 +198,8 @@ fn a_hi_atlas_reads_the_hi_files() {
         ..whole(0)
     };
     let sheet = load(d.path(), vec![a, file("b.png")], vec![half, whole(1)]).unwrap();
-    let lo = sheet.atlas(Variant::Lo, LIMITS).unwrap();
-    let hi = sheet.atlas(Variant::Hi, LIMITS).unwrap();
+    let lo = sheet.atlas(Variant::Lo, LIMITS, &|| false).unwrap();
+    let hi = sheet.atlas(Variant::Hi, LIMITS, &|| false).unwrap();
     assert_eq!((lo.variant(), hi.variant()), (Variant::Lo, Variant::Hi));
     let (r, p) = content(&lo, 0, 1);
     assert_eq!(r[2..], [3, 4]);

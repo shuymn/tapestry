@@ -333,6 +333,7 @@ impl Setup {
                     published,
                     read,
                     phase: phase(at, requests),
+                    due: None,
                 }
             };
             cadence::run(&clock, &mut waiter, &stop, &mut cadence, &mut report, wake)
@@ -761,4 +762,38 @@ fn a_failed_wait_ends_the_loop() {
     let run = setup.run(|_, _| Phase::Open);
     assert_eq!(run.result, Err(WaitFailed));
     assert_eq!(run.seen.len(), 3);
+}
+
+#[test]
+fn the_taps_deadline_wakes_an_idle_thread() {
+    let mut c = Cadence::new(Driven::Input, TimeUs(0));
+    let idle = |due| Boundary {
+        published: TimeUs(10),
+        read: Some(0),
+        phase: Phase::Idle,
+        due,
+    };
+    let _ = c.processed(TimeUs(10), idle(Some(TimeUs(50_010))));
+    assert_eq!(
+        c.wait(TimeUs(20)),
+        Wait {
+            deadline: Some(TimeUs(50_010)),
+            input: true
+        },
+        "Idle keeps no heartbeat, but waits for the tap's deadline"
+    );
+    assert_eq!(c.woke(Woken::Timer, TimeUs(50_000)), None, "not yet");
+    assert_eq!(
+        c.woke(Woken::Timer, TimeUs(50_010)),
+        Some(cadence::Cause::Due)
+    );
+    let _ = c.processed(TimeUs(50_010), idle(None));
+    assert_eq!(
+        c.wait(TimeUs(50_020)),
+        Wait {
+            deadline: None,
+            input: true
+        },
+        "no deadline: it sleeps until input or the wake event"
+    );
 }

@@ -45,6 +45,7 @@ mod gpu;
 pub mod measure;
 mod overlay;
 mod pace;
+pub mod presentation;
 mod projection;
 mod renderer;
 mod simple;

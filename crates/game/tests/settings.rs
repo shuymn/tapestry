@@ -5,9 +5,10 @@ use std::fs;
 use bms_model::{Lane, TimeUs};
 use eval::{AxisBinding, AxisMode, Binding, ControlId, ScratchSettings, SourceProfile};
 use game::{
-    Adjust, Chain, ControllerDevice, DataRoot, DeviceSettings, KeyConfig, KeyError, LaneKey,
-    LibrarySettings, LocalRecords, PlayerSettings, RecordSink, Role, ScratchConfig, Settings,
-    SettingsError, Tuning, load_settings, save_settings, write_atomic,
+    Adjust, Chain, ControllerDevice, CoverSettings, DataRoot, DeviceSettings, HiSpeedReference,
+    HiSpeedSettings, KeyConfig, KeyError, LaneKey, LibrarySettings, LocalRecords, PlayerSettings,
+    PlayerSettingsError, RecordSink, Role, ScratchConfig, Settings, SettingsError, SpeedMode,
+    Tuning, load_settings, save_settings, write_atomic,
 };
 use input::DeviceKind;
 use input::hid::AxisCap;
@@ -25,6 +26,7 @@ fn temp_root() -> (tempfile::TempDir, DataRoot) {
 fn changed() -> Settings {
     Settings {
         device: DeviceSettings {
+            version: 2,
             keyboard: KeyConfig {
                 lanes: vec![
                     LaneKey {
@@ -38,6 +40,12 @@ fn changed() -> Settings {
                 ],
                 retry: Some(0x13),
                 quit: None,
+                start: Some(0x22),
+                select: Some(0x23),
+                aux_negative: Some(0x24),
+                aux_positive: Some(0x25),
+                scratch_positive: Some(0x39),
+                scratch_negative: None,
             },
             controller: KeyConfig {
                 lanes: vec![
@@ -57,6 +65,8 @@ fn changed() -> Settings {
                 ],
                 retry: None,
                 quit: None,
+                start: Some(11),
+                ..KeyConfig::default()
             },
             controller_device: Some(ControllerDevice {
                 vendor_id: 0x0A1B,
@@ -76,6 +86,8 @@ fn changed() -> Settings {
                 hold_threshold: 3,
                 release_after_us: 80_000,
                 menu_reversed: true,
+                adjust_reversed: true,
+                adjust_counts_per_step: Some(16),
             },
             queued_periods: 3,
             library: LibrarySettings {
@@ -83,9 +95,24 @@ fn changed() -> Settings {
             },
         },
         player: PlayerSettings {
-            visible_time_ms: 2_350,
             preset: "wide".to_owned(),
             displayed_gauge: 1,
+            hispeed: HiSpeedSettings {
+                mode: SpeedMode::Classic,
+                reference: HiSpeedReference::Maximum,
+                classic_hispeed_x100: 235,
+                classic_step_x100: 10,
+                floating_step_x100: 25,
+                green_target: 280,
+            },
+            covers: CoverSettings {
+                sudden: 120,
+                sudden_on: true,
+                lift: 80,
+                lift_on: true,
+                hidden: 40,
+                hidden_on: true,
+            },
         },
     }
 }
@@ -116,7 +143,11 @@ fn device_and_player_settings_round_trip() {
     // A hand-written file in the same units reads the same.
     fs::write(
         root.player_settings(),
-        "visible_time_ms = 2350\npreset = \"wide\"\ndisplayed_gauge = 1\n",
+        "preset = \"wide\"\ndisplayed_gauge = 1\n\
+         [hispeed]\nmode = \"classic\"\nreference = \"max\"\nclassic_hispeed_x100 = 235\n\
+         classic_step_x100 = 10\nfloating_step_x100 = 25\ngreen_target = 280\n\
+         [covers]\nsudden = 120\nsudden_on = true\nlift = 80\nlift_on = true\n\
+         hidden = 40\nhidden_on = true\n",
     )
     .unwrap();
     assert_eq!(Settings::load(&root).unwrap().player, s.player);
@@ -124,7 +155,7 @@ fn device_and_player_settings_round_trip() {
     // is refused like any other.
     fs::write(
         root.device_settings(),
-        "[library]\nroots = ['D:\\BMS', \"songs/new\"]\n",
+        "version = 2\n[library]\nroots = ['D:\\BMS', \"songs/new\"]\n",
     )
     .unwrap();
     assert_eq!(
@@ -133,11 +164,23 @@ fn device_and_player_settings_round_trip() {
     );
     // The scratch's menu direction as a person writes it; absent, it is
     // not reversed.
-    fs::write(root.device_settings(), "[scratch]\nmenu_reversed = true\n").unwrap();
+    fs::write(
+        root.device_settings(),
+        "version = 2\n[scratch]\nmenu_reversed = true\n",
+    )
+    .unwrap();
     assert!(Settings::load(&root).unwrap().device.scratch.menu_reversed);
-    fs::write(root.device_settings(), "[scratch]\npress_threshold = 5\n").unwrap();
+    fs::write(
+        root.device_settings(),
+        "version = 2\n[scratch]\npress_threshold = 5\n",
+    )
+    .unwrap();
     assert!(!Settings::load(&root).unwrap().device.scratch.menu_reversed);
-    fs::write(root.device_settings(), "[library]\nroot = 'D:\\BMS'\n").unwrap();
+    fs::write(
+        root.device_settings(),
+        "version = 2\n[library]\nroot = 'D:\\BMS'\n",
+    )
+    .unwrap();
     assert!(matches!(
         load_settings::<DeviceSettings>(&root.device_settings()),
         Err(SettingsError::Parse(e)) if e.message().contains("root")
@@ -145,15 +188,11 @@ fn device_and_player_settings_round_trip() {
     s.save(&root).unwrap();
 
     // The settings keys' values, stepped and written as the game does at
-    // the end of a play, come back the same: hi-speed up twice (2350 ms
-    // lies between the steps 2240 and 2362, so 2240 and then 2125 ms),
-    // volume down once (75 − 5 = 70 %), display offset
-    // up once (16.7 + 1 = 17.7 ms) and input offset down three times
-    // (4.5 − 3 = 1.5 ms).
+    // the end of a play, come back the same: volume down once (75 − 5 =
+    // 70 %), display offset up once (16.7 + 1 = 17.7 ms) and input offset
+    // down three times (4.5 − 3 = 1.5 ms).
     let mut t = Tuning::of(&s);
     for a in [
-        Adjust::HiSpeedUp,
-        Adjust::HiSpeedUp,
         Adjust::VolumeDown,
         Adjust::DisplayOffsetUp,
         Adjust::InputOffsetDown,
@@ -167,7 +206,6 @@ fn device_and_player_settings_round_trip() {
     stepped.save(&root).unwrap();
     let back = Settings::load(&root).unwrap();
     assert_eq!(back, stepped);
-    assert_eq!(back.player.visible_time_ms, 2_125);
     assert_eq!(back.device.master_volume, 0.7);
     assert_eq!(back.device.display_offset_us, 17_700);
     assert_eq!(back.device.input_offset_us, 1_500);
@@ -176,7 +214,7 @@ fn device_and_player_settings_round_trip() {
     assert_eq!(back.device.controller, s.device.controller);
     assert_eq!(back.device.controller_device, s.device.controller_device);
     assert_eq!(back.device.audio_offset_us, -12_000);
-    assert_eq!(back.player.preset, "wide");
+    assert_eq!(back.player, s.player);
     assert_eq!(Tuning::of(&back), t);
 }
 
@@ -184,7 +222,7 @@ fn device_and_player_settings_round_trip() {
 fn unreadable_settings_are_errors_not_defaults() {
     let (_dir, root) = temp_root();
     fs::create_dir_all(root.path()).unwrap();
-    fs::write(root.player_settings(), "visible_time_ms = \"fast\"").unwrap();
+    fs::write(root.player_settings(), "displayed_gauge = \"fast\"").unwrap();
     assert!(matches!(
         load_settings::<PlayerSettings>(&root.player_settings()),
         Err(SettingsError::Parse(_))
@@ -209,14 +247,13 @@ fn unreadable_settings_are_errors_not_defaults() {
 #[test]
 fn key_config_gives_profiles_and_recorded_controls() {
     let s = changed().device;
+    // START, SELECT and the auxiliary keys are recorded; the scratch's
+    // direction is its lane key already.
     assert_eq!(
         s.keyboard.recorded(),
-        vec![ControlId(0x1e), ControlId(0x39), ControlId(0x13)]
+        [0x1e, 0x39, 0x13, 0x22, 0x23, 0x24, 0x25].map(ControlId)
     );
-    assert_eq!(
-        s.controller.recorded(),
-        vec![ControlId(7), ControlId(9), ControlId(0x1_0030)]
-    );
+    assert_eq!(s.controller.recorded(), [7, 9, 0x1_0030, 11].map(ControlId));
     // The controller declares X with 255 values; the file's 1024 wins.
     let declared = vec![AxisCap {
         control: ControlId(0x1_0030),
@@ -754,6 +791,7 @@ fn key_configs_that_reuse_a_control_or_bind_a_reserved_key_are_refused_on_load()
                     .collect(),
                 retry,
                 quit,
+                ..KeyConfig::default()
             };
             d.controller_device = Some(ControllerDevice {
                 vendor_id: 1,
@@ -809,10 +847,6 @@ fn controller_bindings_without_their_controller_are_refused_on_load() {
 fn settings_outside_their_ranges_are_refused_on_load() {
     let player = PlayerSettings::default();
     let device = DeviceSettings::default();
-    let p = |ms: u32| PlayerSettings {
-        visible_time_ms: ms,
-        ..player.clone()
-    };
     // The edges load; one step past each does not.
     for ok in [
         with(|d| d.input_offset_us = 1_000_000),
@@ -858,25 +892,292 @@ fn settings_outside_their_ranges_are_refused_on_load() {
     for (d, says) in &refused {
         assert_invalid(d, &player, says);
     }
-    for ok in [100, 4_000] {
-        assert!(load_written(&device, &p(ok)).is_ok(), "{ok}");
-    }
     assert_invalid(
-        &device,
-        &p(99),
-        "player.toml: visible_time_ms 99 is outside 100 to 4000",
+        &with(|d| d.scratch.adjust_counts_per_step = Some(0)),
+        &player,
+        "device.toml: [scratch] adjust_counts_per_step 0 is not positive",
     );
-    assert_invalid(&device, &p(4_001), "visible_time_ms 4001");
+    assert!(
+        load_written(
+            &with(|d| d.scratch.adjust_counts_per_step = Some(1)),
+            &player
+        )
+        .is_ok()
+    );
+
+    // The play options, located by table and key.
+    let p = |f: fn(&mut PlayerSettings)| {
+        let mut p = player.clone();
+        f(&mut p);
+        p
+    };
+    for ok in [
+        p(|p| p.covers.sudden = 1_000),
+        p(|p| p.covers.lift = 1_000),
+        p(|p| p.covers.hidden = 1_000),
+        p(|p| p.hispeed.green_target = 1),
+        p(|p| p.hispeed.green_target = 6_000),
+        p(|p| p.hispeed.classic_hispeed_x100 = 2_000),
+        p(|p| p.hispeed.floating_step_x100 = 5),
+    ] {
+        assert!(load_written(&device, &ok).is_ok(), "{ok:?}");
+    }
+    let refused = [
+        (
+            p(|p| p.covers.sudden = 1_001),
+            "player.toml: [covers] sudden 1001 is outside 0 to 1000",
+        ),
+        (
+            p(|p| p.covers.hidden = 1_001),
+            "player.toml: [covers] hidden 1001 is outside 0 to 1000",
+        ),
+        (
+            p(|p| p.hispeed.green_target = 0),
+            "player.toml: [hispeed] green_target 0 is outside 1 to 6000",
+        ),
+        (
+            p(|p| p.hispeed.classic_hispeed_x100 = 2_001),
+            "player.toml: [hispeed] classic_hispeed_x100 2001 is outside 1 to 2000",
+        ),
+        (
+            p(|p| p.hispeed.floating_step_x100 = 7),
+            "player.toml: [hispeed] floating_step_x100 7 is outside 5 to 100 in steps of 5",
+        ),
+    ];
+    for (p, says) in &refused {
+        assert_invalid(&device, p, says);
+        assert!(p.options().is_err());
+    }
+    assert_eq!(
+        p(|p| p.covers.sudden = 1_001).options(),
+        Err(PlayerSettingsError::PlayOption {
+            section: "covers",
+            setting: "sudden",
+            value: 1_001,
+            expected: "0 to 1000",
+        })
+    );
+}
+
+/// The play options are integers in `player.toml`, and come back as they
+/// were stored, through the file and through [`PlayerSettings::options`].
+#[test]
+fn play_options_round_trip_as_integers() {
+    let (_dir, root) = temp_root();
+    let mut s = Settings::load(&root).unwrap();
+    assert_eq!(s.player.options().unwrap(), game::PlayOptions::default());
+    let options = changed().player.options().unwrap();
+    s.player.set_options(&options);
+    s.save(&root).unwrap();
+    let text = fs::read_to_string(root.player_settings()).unwrap();
+    for line in [
+        "[hispeed]",
+        "mode = \"classic\"",
+        "reference = \"max\"",
+        "classic_hispeed_x100 = 235",
+        "classic_step_x100 = 10",
+        "floating_step_x100 = 25",
+        "green_target = 280",
+        "[covers]",
+        "sudden = 120",
+        "sudden_on = true",
+        "lift = 80",
+        "hidden = 40",
+    ] {
+        assert!(text.lines().any(|l| l == line), "{line} in {text}");
+    }
+    assert!(!text.contains('.'), "no floats: {text}");
+    let back = Settings::load(&root).unwrap();
+    assert_eq!(back.player.options().unwrap(), options);
+    assert_eq!(back.player, s.player);
+    // Every reference and both modes by their names.
+    for (mode, reference) in [
+        ("floating", "start"),
+        ("classic", "main"),
+        ("floating", "min"),
+    ] {
+        fs::write(
+            root.player_settings(),
+            format!("[hispeed]\nmode = \"{mode}\"\nreference = \"{reference}\"\n"),
+        )
+        .unwrap();
+        let h = Settings::load(&root).unwrap().player.hispeed;
+        let back = toml::to_string(&h).unwrap();
+        assert!(back.contains(&format!("mode = \"{mode}\"")), "{back}");
+        assert!(
+            back.contains(&format!("reference = \"{reference}\"")),
+            "{back}"
+        );
+    }
+}
+
+/// A float in `[hispeed]` or `[covers]` is refused as text of another
+/// shape: the play options are integers.
+#[test]
+fn a_float_play_option_is_refused() {
+    let (_dir, root) = temp_root();
+    fs::create_dir_all(root.path()).unwrap();
+    for text in [
+        "[hispeed]\ngreen_target = 300.0\n",
+        "[hispeed]\nclassic_hispeed_x100 = 1.5\n",
+        "[covers]\nsudden = 100.0\n",
+    ] {
+        fs::write(root.player_settings(), text).unwrap();
+        assert!(
+            matches!(Settings::load(&root), Err(SettingsError::Parse(_))),
+            "{text}"
+        );
+    }
+    fs::write(root.player_settings(), "[hispeed]\ngreen_target = 300\n").unwrap();
+    assert_eq!(
+        Settings::load(&root).unwrap().player.hispeed.green_target,
+        300
+    );
+}
+
+/// A `player.toml` setting `visible_time_ms` is refused before anything
+/// else in it is read, with what sets hi-speed now; nothing is converted.
+#[test]
+fn a_player_toml_with_visible_time_ms_is_refused() {
+    let (_dir, root) = temp_root();
+    fs::create_dir_all(root.path()).unwrap();
+    for text in [
+        "visible_time_ms = 600\n",
+        // Before the typed parse: an unknown key or a bad value beside it
+        // does not hide it.
+        "visible_time_ms = 600\npreset = 3\n",
+    ] {
+        fs::write(root.player_settings(), text).unwrap();
+        let e = Settings::load(&root).unwrap_err();
+        assert_eq!(
+            e,
+            SettingsError::InvalidPlayer(PlayerSettingsError::VisibleTimeRemoved)
+        );
+        assert_eq!(
+            Chain(&e).to_string(),
+            "the settings cannot be used: player.toml: visible_time_ms is no longer read; \
+             hi-speed is set by [hispeed] green_target (Floating) or classic_hispeed_x100 \
+             (Classic); remove the line"
+        );
+        assert_eq!(fs::read_to_string(root.player_settings()).unwrap(), text);
+    }
+}
+
+/// A `device.toml` without `version = 2`, none or another, is refused with
+/// what to do; nothing is converted, and the file is left as it was. A
+/// missing file gives the defaults, written with `version = 2`.
+#[test]
+fn a_device_toml_without_version_2_is_refused() {
+    let (_dir, root) = temp_root();
+    fs::create_dir_all(root.path()).unwrap();
+    let says = |found: &str| {
+        format!(
+            "device.toml has version {found}; this tapestry reads only version 2 \
+             (START/SELECT bindings). Move device.toml aside; tapestry then starts from \
+             defaults, and `tapestry keys` writes a new one."
+        )
+    };
+    for (text, found, shown) in [
+        ("[library]\nroots = []\n", None, "none"),
+        ("version = 1\n", Some(1), "1"),
+        ("version = 3\nmaster_volume = 0.5\n", Some(3), "3"),
+    ] {
+        fs::write(root.device_settings(), text).unwrap();
+        let e = Settings::load(&root).unwrap_err();
+        assert_eq!(e, SettingsError::DeviceVersion { found });
+        assert_eq!(Chain(&e).to_string(), says(shown));
+        assert_eq!(fs::read_to_string(root.device_settings()).unwrap(), text);
+    }
+    fs::write(root.device_settings(), "version = 2\n").unwrap();
+    assert_eq!(
+        Settings::load(&root).unwrap().device,
+        DeviceSettings::default()
+    );
+    // Missing: the defaults, saved with their version.
+    fs::remove_file(root.device_settings()).unwrap();
+    let s = Settings::load(&root).unwrap();
+    assert_eq!(s.device.version, game::DEVICE_SETTINGS_VERSION);
+    s.save(&root).unwrap();
+    let text = fs::read_to_string(root.device_settings()).unwrap();
+    assert!(text.lines().any(|l| l == "version = 2"), "{text}");
+}
+
+/// A `device.toml` whose adjustment roles collide with a lane, retry,
+/// quit, each other or a reserved key, or whose scratch direction is not
+/// the scratch's own key, is refused when it is loaded.
+#[test]
+fn a_colliding_device_toml_is_refused_at_load() {
+    let player = PlayerSettings::default();
+    for (d, says) in [
+        (
+            with(|d| d.keyboard.start = Some(lane_key(1))),
+            "device.toml: keyboard key config: control 0x2c is bound to both key 1 and START",
+        ),
+        (
+            with(|d| d.keyboard.select = Some(0x0e)),
+            "device.toml: keyboard key config: control 0xe is bound to both retry and SELECT",
+        ),
+        (
+            with(|d| d.keyboard.aux_positive = Some(0x10)),
+            "bound to both START and the auxiliary positive key",
+        ),
+        (
+            with(|d| d.keyboard.aux_negative = Some(0x3c)),
+            "key 0x3c is reserved for hi-speed",
+        ),
+        (
+            with(|d| d.keyboard.scratch_negative = Some(lane_key(2))),
+            "the scratch's negative direction takes one of the scratch's own controls, not 0x1f",
+        ),
+        (
+            with(|d| {
+                d.controller.start = Some(4);
+                d.controller_device = Some(ControllerDevice {
+                    vendor_id: 1,
+                    product_id: 2,
+                    interface: None,
+                });
+                d.controller.lanes = vec![LaneKey {
+                    control: 4,
+                    lane: 3,
+                }];
+            }),
+            "device.toml: controller key config: control 0x4 is bound to both key 3 and START",
+        ),
+        (
+            with(|d| d.controller.select = Some(5)),
+            "controller key config: it does not say which controller it belongs to",
+        ),
+    ] {
+        assert_invalid(&d, &player, says);
+    }
+    // Moved together with the lane they share, the defaults load.
+    let moved = with(|d| {
+        set_lane(d, 0, 0x36);
+        d.keyboard.scratch_positive = Some(0x36);
+        d.keyboard.scratch_negative = Some(0x2a);
+        d.keyboard.lanes.push(LaneKey {
+            control: 0x2a,
+            lane: 0,
+        });
+    });
+    assert!(load_written(&moved, &player).is_ok());
 }
 
 #[test]
 fn settings_keys_step_and_stop_at_their_bounds() {
-    // F1 to F8, nothing either side; F12 is reserved too.
+    // F3 to F8, nothing either side; F1 and F2 (hi-speed, through the
+    // play adjustments) and F12 are reserved too.
     let keys: Vec<u32> = Adjust::ALL.iter().map(|a| a.key()).collect();
-    assert_eq!(keys, [0x3b, 0x3c, 0x3d, 0x3e, 0x3f, 0x40, 0x41, 0x42]);
+    assert_eq!(keys, [0x3d, 0x3e, 0x3f, 0x40, 0x41, 0x42]);
     for a in Adjust::ALL {
         assert_eq!(Adjust::from_key(a.key()), Some(a));
         assert!(game::reserved_key(a.key()).is_some());
+    }
+    assert_eq!(game::SPEED_KEYS, [0x3b, 0x3c]);
+    for key in game::SPEED_KEYS {
+        assert_eq!(Adjust::from_key(key), None);
+        assert_eq!(game::reserved_key(key), Some("hi-speed"));
     }
     assert_eq!(game::OVERLAY_KEY, 0x43);
     assert_eq!(
@@ -893,27 +1194,12 @@ fn settings_keys_step_and_stop_at_their_bounds() {
     assert!(game::reserved_key(game::PREV_PRESET_KEY).is_some());
 
     let t = Tuning {
-        visible_time_ms: 600,
         volume_percent: 40,
         display_offset_us: 2_000,
         input_offset_us: -3_000,
     };
     // Each key moves its own value only.
     let steps = [
-        (
-            Adjust::HiSpeedDown,
-            Tuning {
-                visible_time_ms: 632,
-                ..t
-            },
-        ),
-        (
-            Adjust::HiSpeedUp,
-            Tuning {
-                visible_time_ms: 569,
-                ..t
-            },
-        ),
         (
             Adjust::VolumeDown,
             Tuning {
@@ -960,24 +1246,6 @@ fn settings_keys_step_and_stop_at_their_bounds() {
     for (a, after) in steps {
         assert_eq!(t.adjust(a), after, "{a:?}");
     }
-
-    // Hi-speed stops at 100 ms (fastest) and 4000 ms (slowest), also from
-    // values between two steps.
-    let vis = |ms| Tuning {
-        visible_time_ms: ms,
-        ..t
-    };
-    assert_eq!(vis(100).adjust(Adjust::HiSpeedUp).visible_time_ms, 100);
-    assert_eq!(vis(103).adjust(Adjust::HiSpeedUp).visible_time_ms, 100);
-    assert_eq!(
-        vis(4_000).adjust(Adjust::HiSpeedDown).visible_time_ms,
-        4_000
-    );
-    assert_eq!(
-        vis(3_990).adjust(Adjust::HiSpeedDown).visible_time_ms,
-        4_000
-    );
-    assert_eq!(vis(600).visible_time(), TimeUs(600_000));
     // Volume stops at 0 % and at unity.
     let vol = |p| Tuning {
         volume_percent: p,
@@ -1012,49 +1280,6 @@ fn settings_keys_step_and_stop_at_their_bounds() {
     );
 }
 
-/// Each hi-speed press changes the scroll speed (the inverse of the visible
-/// time) by one ratio, `6^(1/34)`, within rounding to a whole ms, from the
-/// fastest bound to the slowest and back; the default lies on the way and
-/// both bounds clamp.
-#[test]
-fn hi_speed_steps_change_speed_by_an_equal_ratio() {
-    let ratio = 6f64.powf(1.0 / 34.0);
-    let at = |ms| Tuning {
-        visible_time_ms: ms,
-        volume_percent: 40,
-        display_offset_us: 2_000,
-        input_offset_us: -3_000,
-    };
-    let walk = |from: u32, adjust: Adjust| {
-        let mut seen = vec![from];
-        loop {
-            let next = at(*seen.last().unwrap()).adjust(adjust).visible_time_ms;
-            if next == *seen.last().unwrap() {
-                return seen;
-            }
-            seen.push(next);
-        }
-    };
-    let slower = walk(100, Adjust::HiSpeedDown);
-    assert_eq!(slower.len(), 71);
-    assert_eq!(slower[70], 4_000);
-    assert!(slower.contains(&600));
-    for pair in slower.windows(2) {
-        let (a, b) = (f64::from(pair[0]), f64::from(pair[1]));
-        // Each value is an exact step rounded by at most 0.5 ms.
-        assert!(
-            (b - ratio * a).abs() <= 0.5 * (1.0 + ratio),
-            "{a} -> {b} is not one step of {ratio}"
-        );
-    }
-    // At both ends the ratio is the same, not the 25 ms of a fixed step.
-    let speed_ratio = |a: u32, b: u32| f64::from(b) / f64::from(a);
-    assert!((speed_ratio(100, slower[1]) - speed_ratio(slower[69], 4_000)).abs() < 0.01);
-    let mut faster = walk(4_000, Adjust::HiSpeedUp);
-    faster.reverse();
-    assert_eq!(faster, slower);
-}
-
 /// A volume between whole percents is written back as it was until a
 /// volume key moves it; then it is the step's whole percent.
 #[test]
@@ -1064,9 +1289,9 @@ fn an_untouched_volume_keeps_its_exact_value() {
     let t = Tuning::of(&s);
     assert_eq!(t.volume_percent, 75);
     let mut kept = s.clone();
-    t.adjust(Adjust::HiSpeedDown).apply_to(&mut kept);
+    t.adjust(Adjust::DisplayOffsetDown).apply_to(&mut kept);
     assert_eq!(kept.device.master_volume, 0.754);
-    assert_eq!(kept.player.visible_time_ms, 2_362);
+    assert_eq!(kept.device.display_offset_us, 15_700);
     let mut moved = s.clone();
     t.adjust(Adjust::VolumeUp).apply_to(&mut moved);
     assert_eq!(moved.device.master_volume, 0.8);
@@ -1140,11 +1365,12 @@ fn two_names_of_one_key_cannot_have_two_roles() {
     ];
     assert!(load_written(&pad, &player).is_ok());
     // The settings keys and the keep key have one name each.
-    for code in game::Adjust::ALL.iter().map(|a| a.key()).chain([
-        game::KEEP_KEY,
-        game::OVERLAY_KEY,
-        game::PREV_PRESET_KEY,
-    ]) {
+    for code in game::Adjust::ALL
+        .iter()
+        .map(|a| a.key())
+        .chain(game::SPEED_KEYS)
+        .chain([game::KEEP_KEY, game::OVERLAY_KEY, game::PREV_PRESET_KEY])
+    {
         for other in (0..=0xFF).chain(0xE000..=0xE1FF) {
             let same = input::raw::key_identity(eval::ControlId(other))
                 == input::raw::key_identity(eval::ControlId(code));

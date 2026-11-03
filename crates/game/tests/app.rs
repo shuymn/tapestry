@@ -128,6 +128,12 @@ impl ChartIngest for Charts {
                 return game::BmsIngest.ingest(text, dir, seed, speed);
             }
             b"a" => chart_a(),
+            // 150 BPM, 300 from 50 ms.
+            b"tempo" => ChartBuilder::new(150_000)
+                .bpm(TimeUs(50 * MS), 300_000)
+                .tap(lane(1), TimeUs(1_000 * MS))
+                .build()
+                .unwrap(),
             b"b" => chart_b(),
             b"silent" => silent(),
             b"long" => long(),
@@ -237,6 +243,10 @@ struct SurfaceLost;
 struct Headless {
     clock: VirtualClock,
     sources: SourceSet,
+    /// The adjustments' driver, when a test installs one
+    /// ([`Headless::adjust`]), and the hi-speed each load ended with.
+    adjust: Option<game::AdjustDriver>,
+    solved: Vec<Option<game::Ratio>>,
     script: ScriptedInput,
     paths: Vec<PathBuf>,
     preset: PathBuf,
@@ -381,6 +391,26 @@ struct Play {
 }
 
 impl Headless {
+    /// Installs the adjustments' driver on the default bindings with
+    /// `options`, its tap in the rig's source set.
+    fn adjust(&mut self, options: game::PlayOptions) {
+        let device = game::DeviceSettings::default();
+        let plan = game::AdjustmentConfig::of(&device)
+            .plan(&game::KeyConfigs::from(&device), None, None)
+            .unwrap();
+        let (driver, tap, _reader) = game::AdjustDriver::new(&plan, options, 0).unwrap();
+        self.sources.set_adjustment(tap);
+        self.adjust = Some(driver);
+    }
+
+    /// One drain of the driver, if any.
+    fn pump(&mut self) {
+        let now = self.clock.now();
+        if let Some(driver) = &mut self.adjust {
+            driver.pump(&mut Pump(&mut self.sources, now));
+        }
+    }
+
     fn new(dir: &Path, refusal: Refusal, acts: Vec<(i64, Act)>) -> Self {
         let paths: Vec<_> = ["a", "b", "refused", "practice"]
             .iter()
@@ -443,6 +473,8 @@ impl Headless {
             opens: 0,
             close_in_load: false,
             load_ms: 0,
+            adjust: None,
+            solved: Vec::new(),
             in_load: None,
             quit_pressed: false,
             loading: None,
@@ -607,6 +639,7 @@ impl Rig for Headless {
     fn wait(&mut self) {
         self.clock.advance(TimeUs(MS));
         self.tick();
+        self.pump();
     }
 
     fn take(&mut self) -> Option<Command> {
@@ -919,6 +952,12 @@ impl AppRig for Headless {
     }
 
     fn load_chart(&mut self, loaded: &Loaded) -> Result<Loading, BankLost> {
+        let now = self.clock.now();
+        if let Some(driver) = &mut self.adjust {
+            driver
+                .attach_loaded(loaded, &mut Pump(&mut self.sources, now))
+                .unwrap();
+        }
         self.hits = presses(loaded.chart());
         self.speeds.push(loaded.config().speed);
         let i = self.chosen.unwrap();
@@ -930,6 +969,9 @@ impl AppRig for Headless {
             self.quitting = true;
         }
         let cancelled = self.slow_load();
+        if let Some(driver) = &self.adjust {
+            self.solved.push(driver.snapshot().hispeed);
+        }
         if !cancelled && i == 2 && self.refusal == Refusal::Bank {
             return Err(BankLost);
         }
@@ -943,6 +985,12 @@ impl AppRig for Headless {
     }
 
     fn entered_loading(&mut self, chart: &Path) {
+        let now = self.clock.now();
+        if let Some(driver) = &mut self.adjust {
+            driver
+                .enter_attempt(None, &mut Pump(&mut self.sources, now))
+                .unwrap();
+        }
         let Some(i) = self.paths.iter().position(|p| p == chart) else {
             self.violations
                 .push(format!("the loading state of {}", chart.display()));
@@ -3470,4 +3518,54 @@ proptest! {
         let returned = rig.chooses - usize::from(!rig.in_selection);
         prop_assert_eq!(rig.entries, 1 + returned);
     }
+}
+
+/// The input side as the adjustments' driver needs it: the rig's own, so a
+/// fence is answered at once.
+struct Pump<'a>(&'a mut SourceSet, TimeUs);
+
+impl game::InputPump for Pump<'_> {
+    fn request_fence(&mut self, n: u64) {
+        let now = self.1;
+        if let Some(tap) = self.0.adjustment_mut() {
+            tap.fence(n, now);
+        }
+    }
+    fn wake(&mut self) {
+        self.0.tick_presentation(self.1);
+    }
+    fn display_offset_us(&self) -> i64 {
+        0
+    }
+    fn park(&mut self) -> Result<(), game::InputWaitError> {
+        Err(game::InputWaitError::Timeout)
+    }
+}
+
+/// A long load: the chart's tempo, 150 BPM changing to 300 at 50 ms, is
+/// attached at the load's start with the head frozen at the opening, so
+/// Floating solves at the initial tempo however long the load runs: G 300
+/// and SUDDEN+ 200 give 144000 · 0.8 / (150 · 300) = 2.56 (design.md "Play
+/// Adjustments", tempo).
+#[test]
+fn a_long_load_solves_at_the_initial_tempo() {
+    let acts = vec![(0, Act::Choose(0)), (30_000, Act::Close)];
+    let (rig, _, ran) = run(Refusal::Missing, acts, |rig| {
+        std::fs::write(&rig.paths[0], b"tempo").unwrap();
+        rig.load_ms = 20_000;
+        let options = game::PlayOptions::new(
+            game::HiSpeedSettings::default(),
+            game::Covers {
+                sudden: game::Cover {
+                    amount: 200,
+                    on: true,
+                },
+                ..game::Covers::default()
+            },
+        )
+        .unwrap();
+        rig.adjust(options);
+    });
+    ran.unwrap();
+    assert_eq!(rig.solved, [Some(game::Ratio::new(64, 25).unwrap())]);
 }

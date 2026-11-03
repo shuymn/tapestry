@@ -283,7 +283,11 @@ fn both_skins_show_the_snapshot_when_effects_are_dropped() {
         max_layers: 8,
         reserved_layers: 1,
     };
-    let uvs = model.atlas(Variant::Lo, limits).unwrap().into_parts().1;
+    let uvs = model
+        .atlas(Variant::Lo, limits, &|| false)
+        .unwrap()
+        .into_parts()
+        .1;
     let seen = Arc::new(Mutex::new(Vec::new()));
     let noted = Arc::clone(&seen);
     let made = Mutex::new(Some((model, uvs)));

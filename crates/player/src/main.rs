@@ -165,14 +165,13 @@ fn play_command(p: args::Play, clock: QpcClock) -> ExitCode {
     #[cfg(feature = "dev-tools")]
     let ran = launch(&chart, p.input, p.dev, clock, headless, play);
     #[cfg(not(feature = "dev-tools"))]
-    let ran = play(&chart, p.input, None, clock, |_, _| anyhow::Ok(()));
+    let ran = play(&chart, p.input, None, clock, |_| {});
     report(ran)
 }
 
-/// What configures a play's rig from the development options, given the
-/// device settings the play uses (dev-tools).
+/// What configures a play's rig from the development options (dev-tools).
 #[cfg(feature = "dev-tools")]
-type Tune = Box<dyn FnOnce(&mut PlayerRig<'_>, &DeviceSettings) -> anyhow::Result<()>>;
+type Tune = Box<dyn FnOnce(&mut PlayerRig<'_>)>;
 
 /// Launches `play` of `chart` with its development options (dev-tools):
 /// an input log or `--dev-headless` through `headless` ([`headless`] in
@@ -191,9 +190,9 @@ fn launch<T>(
 ) -> T {
     // A mid-chart start (`--dev-start`).
     let start = options.start;
-    let scripted = options.headless || matches!(input, PlayInput::Script(_));
+    let scripted = options.headless || matches!(input, PlayInput::Script(..));
     let frames = options.frames.take();
-    let tune: Tune = Box::new(move |rig, device| options.tune(rig, device));
+    let tune: Tune = Box::new(move |rig| options.tune(rig));
     if scripted {
         headless(chart, input, start, frames, clock, tune)
     } else {
@@ -237,11 +236,10 @@ fn measure_play(chart: &Path, perfect: bool, clock: QpcClock) -> anyhow::Result<
     } else {
         PlayInput::Devices
     };
-    let ran = play(chart, input, None, clock, true, move |rig, _| {
+    let ran = play(chart, input, None, clock, true, move |rig| {
         rig.measured_plays = Some(kept);
         rig.load_start = load_start;
         rig.quit_after_end = Some(std::time::Duration::from_millis(300));
-        Ok(())
     });
     let stopped = capture.stop();
     ran?;
@@ -328,10 +326,11 @@ enum PlayInput {
     /// input offset of 0, its key sounds scheduled with the BGM; nothing
     /// is saved.
     Autoplay,
-    /// An input log replayed as a script, with the configured keys; plays
-    /// are saved (dev-tools).
+    /// An input log replayed as a script, with the configured keys, and
+    /// the speed keys pressed on its keyboard as unrecorded packets the
+    /// adjustment tap observes; plays are saved (dev-tools).
     #[cfg(feature = "dev-tools")]
-    Script(PathBuf),
+    Script(dev::ScriptInput),
     /// Autoplay's generated input, keys and planning, with key sounds sent
     /// from judgments; plays are saved: the perfect measurement
     /// (dev-tools).
@@ -356,7 +355,7 @@ fn load(chart: &Path, input: &PlayInput) -> anyhow::Result<Loaded> {
             Some(AutoKeySounds::Scheduled),
         ),
         #[cfg(feature = "dev-tools")]
-        PlayInput::Script(_) => (
+        PlayInput::Script(..) => (
             ReceiveMethod::Scripted,
             Parts::standard(&root, &settings.player),
             None,
@@ -492,12 +491,14 @@ fn prepare(chart: &Path, input: &PlayInput, start: Option<TimeUs>) -> anyhow::Re
             generated(loaded, chart)
         }
         #[cfg(feature = "dev-tools")]
-        PlayInput::Script(log) => {
-            let script = dev::script(log)?;
+        PlayInput::Script(input) => {
+            let script = dev::script(&input.log, &input.speed)?;
+            let loading = dev::loading_script(&input.log, &input.loading)?;
             let script = input_side::Script {
                 log: script.clone(),
                 current: script,
                 sources: source_config(),
+                loading,
             };
             Ok(Prepared {
                 loaded,
@@ -671,13 +672,9 @@ fn presents_of(chart: &bms_model::Chart, lead_in: TimeUs, refresh_mhz: Option<u3
     usize::try_from(us * mhz / 1_000_000_000 * 5 / 4).unwrap_or(usize::MAX)
 }
 
-/// The frames' inputs: hi-speed and the display offset as the settings
-/// keys leave them.
-fn view(controls: &Controls) -> View {
-    View {
-        tuning: Arc::clone(controls.tuning()),
-        effects: EFFECTS,
-    }
+/// The frames' inputs.
+fn view() -> View {
+    View { effects: EFFECTS }
 }
 
 /// The controls, with the settings keys starting from the loaded values,
@@ -704,6 +701,48 @@ struct Threads {
     steps: rtrb::Producer<StepSample>,
 }
 
+/// Installs the adjustments in `rig` (design.md "Play Adjustments"): the
+/// bindings of `settings`'s key configs planned for the tap, the driver
+/// with the player's options and the display offset, its snapshots handed
+/// to the render thread, and the tap with its start gate to the input
+/// thread. In an autoplay session F1 and F2 come from the window
+/// ([`Controls::set_window_keys`]), as no keyboard reaches the tap.
+///
+/// # Errors
+///
+/// What the plan refuses of the bindings (more controls than the tap
+/// takes), or what the tap refuses.
+fn install_adjustments(rig: &mut PlayerRig<'_>, settings: &Settings) -> anyhow::Result<()> {
+    let device = &settings.device;
+    let keys = game::KeyConfigs::from(device);
+    let config = game::AdjustmentConfig::of(device);
+    // A wrapping axis steps by its revolution; any other by the quantum
+    // `device.toml` sets.
+    let quantum = config
+        .counts_per_step
+        .and_then(game::adjustment::AxisQuantum::per_step);
+    let plan = config.plan(&keys, quantum, device.scratch.wrap)?;
+    let options = settings.player.options()?;
+    let (driver, mut tap, reader) =
+        game::AdjustDriver::new(&plan, options, rig.controls.tuning().display_offset_us())?;
+    if rig.autoplay {
+        let number = |code: u32| {
+            plan.bindings
+                .controls
+                .iter()
+                .find(|(c, _)| *c == input::TapControl::Key(eval::ControlId(code)))
+                .map(|&(_, n)| n)
+        };
+        let [f1, f2] = game::SPEED_KEYS;
+        let (keys, receiver) = input::window_keys();
+        tap.set_window_keys(receiver, [number(f1), number(f2)]);
+        rig.controls.set_window_keys(keys);
+    }
+    rig.render.presentation(reader);
+    rig.gate = Some(crate::start_gate::PlayerGate::install(&rig.input, tap));
+    rig.adjust = Some(driver);
+    Ok(())
+}
 /// The game thread's rig around the started threads, for plays under
 /// `root` with `settings`, by generated input when `autoplay`.
 fn rig<'a>(
@@ -713,7 +752,7 @@ fn rig<'a>(
     threads: Threads,
     controls: &'a Controls,
     clock: QpcClock,
-) -> PlayerRig<'a> {
+) -> anyhow::Result<PlayerRig<'a>> {
     let Threads {
         input,
         audio,
@@ -721,7 +760,7 @@ fn rig<'a>(
         steps,
     } = threads;
     let device = &settings.device;
-    PlayerRig {
+    let mut rig = PlayerRig {
         input,
         audio,
         render,
@@ -739,6 +778,7 @@ fn rig<'a>(
         input_offset_us: device.input_offset_us,
         files: SettingsFiles::new(root.clone(), settings.clone()),
         seen: Delivered::default(),
+        shown_speed: end_screen::SpeedLine::default(),
         end_page: None,
         hints: Hints::new(device.keyboard.retry, device.keyboard.quit),
         result_input: result_input::ResultInput::new(Arc::new(MenuQueue::default()), None),
@@ -777,16 +817,23 @@ fn rig<'a>(
         #[cfg(feature = "dev-tools")]
         auto_retries: 0,
         #[cfg(feature = "dev-tools")]
+        loading_script: false,
+        #[cfg(feature = "dev-tools")]
         adjust_in_play: Vec::new(),
+        #[cfg(feature = "dev-tools")]
+        speed_in_play: Vec::new(),
         #[cfg(feature = "dev-tools")]
         adjust_at: TimeUs(0),
         #[cfg(feature = "dev-tools")]
         adjust_on_end: Vec::new(),
         selection: None,
         gain: audio::Gain::HEADROOM,
-        // Production plays run without the start gate until S10-04b.
         gate: None,
-    }
+        adjust: None,
+    };
+    install_adjustments(&mut rig, settings)
+        .context("the adjustment controls cannot be installed")?;
+    Ok(rig)
 }
 
 /// Opens the window, then starts the input thread, and checks that the
@@ -900,7 +947,7 @@ fn play(
     start: Option<TimeUs>,
     clock: QpcClock,
     #[cfg(feature = "dev-tools")] keep_presents: bool,
-    tune: impl FnOnce(&mut PlayerRig<'_>, &DeviceSettings) -> anyhow::Result<()>,
+    tune: impl FnOnce(&mut PlayerRig<'_>),
 ) -> anyhow::Result<()> {
     #[cfg(feature = "dev-tools")]
     alloc_count::tag(alloc_count::Tag::Logic);
@@ -1005,7 +1052,7 @@ fn play(
         Some(Arc::new(loaded.chart().clone())),
         loaded.section().cloned(),
         clock,
-        view(&controls),
+        view(),
         measure,
         Box::new(NoFrames),
     );
@@ -1032,7 +1079,7 @@ fn play(
         threads,
         &controls,
         clock,
-    );
+    )?;
     if let Some(keyboard) = keyboard {
         rig.recorded.keyboard = keyboard;
     }
@@ -1041,9 +1088,8 @@ fn play(
     rig.gain = gain;
     rig.result_input = menus;
     rig.queue_most = opened.most_queued_periods;
-    // A tuning refused ends the run before any play opens.
-    let ran = tune(&mut rig, &loaded.settings().device)
-        .and_then(|()| Ok(game::live::run_chart(&mut loaded, &mut rig)?));
+    tune(&mut rig);
+    let ran = game::live::run_chart(&mut loaded, &mut rig).map_err(anyhow::Error::from);
     #[cfg(feature = "dev-tools")]
     let script_failed = result_script_failure(&rig);
     let rendered = rig.shut_down();
@@ -1353,17 +1399,16 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
     #[cfg(not(feature = "dev-tools"))]
     let frames: Box<dyn render_side::FrameSink> = Box::new(NoFrames);
     #[cfg_attr(not(feature = "dev-tools"), allow(unused_mut))]
-    let mut render =
-        match render_side::spawn(make, None, None, clock, view(&controls), measure, frames) {
-            Ok(r) => r,
-            Err(e) => {
-                audio.exit();
-                if let Some(w) = window_thread {
-                    w.close();
-                }
-                return Err(e.into());
+    let mut render = match render_side::spawn(make, None, None, clock, view(), measure, frames) {
+        Ok(r) => r,
+        Err(e) => {
+            audio.exit();
+            if let Some(w) = window_thread {
+                w.close();
             }
-        };
+            return Err(e.into());
+        }
+    };
     #[cfg(feature = "dev-tools")]
     if let Some(bound) = s.dev.render_timeout {
         render.set_timeouts(bound, bound);
@@ -1377,7 +1422,7 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
         render,
         steps: probes.steps.0,
     };
-    let mut rig = rig(&root, &settings, autoplay, threads, &controls, clock);
+    let mut rig = rig(&root, &settings, autoplay, threads, &controls, clock)?;
     rig.window = window_thread.as_ref().map(window::WindowThread::shown);
     rig.queue_most = opened.most_queued_periods;
     rig.result_input = menus;
@@ -1485,7 +1530,7 @@ fn headless(
     start: Option<TimeUs>,
     frames: Option<PathBuf>,
     clock: QpcClock,
-    tune: impl FnOnce(&mut PlayerRig<'_>, &DeviceSettings) -> anyhow::Result<()>,
+    tune: impl FnOnce(&mut PlayerRig<'_>),
 ) -> anyhow::Result<()> {
     alloc_count::tag(alloc_count::Tag::Logic);
     let Prepared {
@@ -1549,7 +1594,7 @@ fn headless(
         Some(Arc::new(loaded.chart().clone())),
         loaded.section().cloned(),
         clock,
-        view(&controls),
+        view(),
         measure,
         dump,
     )?;
@@ -1567,7 +1612,7 @@ fn headless(
         threads,
         &controls,
         clock,
-    );
+    )?;
     if let Some(keyboard) = keyboard {
         rig.recorded.keyboard = keyboard;
     }
@@ -1575,9 +1620,8 @@ fn headless(
     rig.gain = gain;
     rig.quit_after_end = Some(std::time::Duration::from_millis(300));
     rig.queue_most = opened.most_queued_periods;
-    // As in `play`: a tuning refused opens no play.
-    let ran = tune(&mut rig, &loaded.settings().device)
-        .and_then(|()| Ok(game::live::run_chart(&mut loaded, &mut rig)?));
+    tune(&mut rig);
+    let ran = game::live::run_chart(&mut loaded, &mut rig).map_err(anyhow::Error::from);
     let script_failed = result_script_failure(&rig);
     // Offscreen: no window to keep.
     let _ = rig.shut_down();
@@ -1792,25 +1836,25 @@ mod tests {
             render,
             steps: rtrb::RingBuffer::new(1).0,
         };
-        let mut rig = super::rig(&root, &settings, false, threads, &controls, clock);
+        let mut rig = super::rig(&root, &settings, false, threads, &controls, clock).unwrap();
         let out = f(&mut rig, &settings.device);
-        let gated = rig.gate.is_some();
+        let gated = rig.gate.is_some() && rig.adjust.is_some();
         let _ = rig.shut_down();
         (out, gated)
     }
 
     /// Which launcher [`super::launch`] chose for `input` and `options`,
-    /// the tuner it handed over applied to a rig of `device`: what the
-    /// tuner returned and whether the rig ended with a start gate.
+    /// the tuner it handed over applied to a rig of `device`: whether the
+    /// rig ended with a start gate.
     #[cfg(feature = "dev-tools")]
     fn launched(
         input: super::PlayInput,
         options: crate::dev::Options,
         device: &game::DeviceSettings,
-    ) -> (&'static str, anyhow::Result<()>, bool) {
+    ) -> (&'static str, bool) {
         let run = |name, tune: super::Tune| {
-            let (ran, gated) = on_rig(device.clone(), tune);
-            (name, ran, gated)
+            let ((), gated) = on_rig(device.clone(), |rig, _| tune(rig));
+            (name, gated)
         };
         super::launch(
             std::path::Path::new("chart.bms"),
@@ -1822,55 +1866,122 @@ mod tests {
         )
     }
 
-    /// `--dev-start-gate` alone.
-    #[cfg(feature = "dev-tools")]
-    fn gate_option() -> crate::dev::Options {
-        crate::dev::Options {
-            start_gate: true,
-            ..crate::dev::Options::default()
-        }
-    }
-
-    /// `--dev-start-gate` installs the gate on the interactive play's rig,
-    /// as on a scripted one's: both launchers get the same tuner.
+    /// Every launcher's rig runs the start gate with the adjustments'
+    /// driver, whatever the development options: production plays are
+    /// gated.
     #[cfg(feature = "dev-tools")]
     #[test]
-    fn the_start_gate_option_gates_the_interactive_play() {
+    fn every_launcher_gates_its_plays() {
         use super::PlayInput;
         let device = game::DeviceSettings::default();
-        let (name, ran, gated) = launched(PlayInput::Devices, gate_option(), &device);
-        ran.unwrap();
-        assert_eq!((name, gated), ("interactive", true));
-        let script = PlayInput::Script(std::path::PathBuf::from("log.tprl"));
-        let (name, ran, gated) = launched(script, gate_option(), &device);
-        ran.unwrap();
-        assert_eq!((name, gated), ("headless", true));
-        let (name, ran, gated) =
+        let launched_devices =
             launched(PlayInput::Devices, crate::dev::Options::default(), &device);
-        ran.unwrap();
-        assert_eq!((name, gated), ("interactive", false));
+        assert_eq!(launched_devices, ("interactive", true));
+        let script = PlayInput::Script(crate::dev::ScriptInput {
+            log: std::path::PathBuf::from("log.tprl"),
+            speed: Vec::new(),
+            loading: Vec::new(),
+        });
+        assert_eq!(
+            launched(script, crate::dev::Options::default(), &device),
+            ("headless", true)
+        );
     }
 
-    /// The interactive play's gate is planned against the play's own key
-    /// config: quit on Q (0x10), the default START, is refused with the
-    /// collision as the tuner's result, and the rig keeps no gate.
+    /// While the end screen shows, the game thread sends its page again
+    /// when the hi-speed line changes, as when a settings value does, and
+    /// not otherwise.
     #[cfg(feature = "dev-tools")]
     #[test]
-    fn the_start_gate_refuses_start_on_the_quit_key() {
-        let mut device = game::DeviceSettings::default();
-        device.keyboard.quit = Some(0x10);
-        let (name, ran, gated) = launched(super::PlayInput::Devices, gate_option(), &device);
-        assert_eq!(name, "interactive");
-        let e = ran.unwrap_err();
+    fn the_end_screen_follows_the_hi_speed_line() {
+        let (shown, _) = on_rig(game::DeviceSettings::default(), |rig, _| {
+            rig.end_page = Some(crate::render_side::EndPage::default());
+            let pages = |rig: &crate::play::PlayerRig<'_>| rig.render.end_pages_shown();
+            let before = pages(rig);
+            // The first look: the line differs from the default one.
+            rig.sync();
+            let first = pages(rig);
+            rig.sync();
+            let unchanged = pages(rig);
+            // The adjustments changed the line since it was sent.
+            rig.shown_speed = crate::end_screen::SpeedLine {
+                hispeed_x100: Some(370),
+                ..rig.shown_speed
+            };
+            rig.sync();
+            let changed = pages(rig);
+            (first - before, unchanged - first, changed - unchanged)
+        });
+        assert_eq!(shown, (1, 0, 1));
+    }
+
+    /// A fence the input thread does not answer within its bound fails the
+    /// adjustments for good: the failure is the run's input failure, and
+    /// nothing more is asked of the driver, whatever the input thread does
+    /// after.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn a_failed_fence_while_loading_ends_the_run() {
+        use game::Rig as _;
+        let (failed, _) = on_rig(game::DeviceSettings::default(), |rig, _| {
+            // The input thread does not run: the entry's fence times out.
+            rig.enter_attempt();
+            let first = rig.input_failure();
+            let asked = rig.adjustments().is_some();
+            // A second entry asks nothing and keeps the first failure.
+            rig.enter_attempt();
+            (first, asked, rig.input_failure())
+        });
         assert_eq!(
-            e.downcast_ref::<game::AdjustKeyError>(),
-            Some(&game::AdjustKeyError::Overlap {
-                control: 0x10,
-                first: game::AdjustBinding::Key(game::Role::Quit),
-                second: game::AdjustBinding::Adjustment(game::adjustment::Role::Start),
-            }),
-            "{e:#}"
+            failed,
+            (
+                Some(game::InputWaitError::Timeout),
+                false,
+                Some(game::InputWaitError::Timeout)
+            )
         );
-        assert!(!gated);
+    }
+
+    /// Entering selection is a scene change: it fences the input thread
+    /// for the adjustments (here it never answers, so the fence fails and
+    /// ends the run, which shows it was asked).
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn entering_selection_fences_the_adjustments() {
+        use game::AppRig as _;
+        use game::Rig as _;
+        let (failed, _) = on_rig(game::DeviceSettings::default(), |rig, _| {
+            assert_eq!(rig.input_failure(), None);
+            rig.entered_selection();
+            rig.input_failure()
+        });
+        assert_eq!(failed, Some(game::InputWaitError::Timeout));
+    }
+
+    /// Every scene change and attempt entry moves the window's scene epoch
+    /// on with the adjustments' context: selection, the practice page's
+    /// loading state, a play's opening. A settings key held across one
+    /// repeats no action (the window's guard). Here the input thread never
+    /// answers, so the first fence fails and is latched: the epoch moves on
+    /// all the same.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn every_scene_change_moves_the_window_scene_on() {
+        use game::AppRig as _;
+        let (moved, _) = on_rig(game::DeviceSettings::default(), |rig, _| {
+            let mut moved = Vec::new();
+            let mut last = rig.controls.scene();
+            let mut step = |rig: &mut crate::play::PlayerRig<'_>, what: &'static str| {
+                let now = rig.controls.scene();
+                moved.push((what, now > last));
+                last = now;
+            };
+            rig.entered_selection();
+            step(rig, "selection");
+            rig.entered_loading(std::path::Path::new("chart.bms"));
+            step(rig, "loading");
+            moved
+        });
+        assert_eq!(moved, [("selection", true), ("loading", true)]);
     }
 }

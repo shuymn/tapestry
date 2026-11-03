@@ -129,7 +129,7 @@ fn a_bundle_checks_its_clips_and_its_layers() {
         ..r.atlas_limits()
     };
     let atlas = |reserved| {
-        skin.atlas(skin_model::Variant::Lo, limits(reserved))
+        skin.atlas(skin_model::Variant::Lo, limits(reserved), &|| false)
             .unwrap()
     };
     let clip = || render::ClipTable::new(vec![[0.0, 0.0, 960.0, 1_080.0]]).unwrap();
@@ -628,4 +628,140 @@ fn a_first_replacement_counts_the_simple_attempt() {
         (after.attempt, after.staged_attempt),
         (peak.staged_attempt, 0)
     );
+}
+
+/// The expected native line of `SimpleSkin` for `v` and `covers`, as its
+/// glyphs are counted: every character but a space.
+fn native_line(v: &skin_model::NativeValues, covers: &skin_model::CoverSettings) -> String {
+    let h = v
+        .hispeed_x100
+        .map_or_else(|| "-".to_owned(), |x| format!("{}.{:02}", x / 100, x % 100));
+    let green = v
+        .duration
+        .map_or_else(|| "-".to_owned(), |d| d.green.to_string());
+    let mode = if v.floating { "FLOATING" } else { "CLASSIC" };
+    let target = v
+        .target_green
+        .map_or_else(String::new, |t| format!(" (TARGET {t})"));
+    let white = |on: bool, w: u16| if on { w.to_string() } else { "OFF".to_owned() };
+    format!(
+        "HI-SPEED {h} {mode}  GREEN {green}{target}  SUDDEN+ {}  LIFT {}  HIDDEN+ {}",
+        white(covers.cover_enabled, v.sudden_white),
+        white(covers.lift_enabled, v.lift_white),
+        white(covers.hidden_enabled, v.hidden_white),
+    )
+}
+
+/// Both skins draw one snapshot sequence (design.md "Play readouts"): each
+/// snapshot, through `render::presentation::frame`, gives one frame input
+/// that `SimpleSkin` and `DeclSkin` both build from, across a cover, a
+/// target, an `H` and a tempo change. The declarative skin's model reads
+/// exactly the lanes and readouts the simple skin's native line shows,
+/// and its cover paint follows the cover.
+#[test]
+fn both_skins_draw_one_snapshot_sequence() {
+    let chart = lane_chart();
+    let dir = tempfile::tempdir().unwrap();
+    let r = offscreen(1_920, 1_080);
+    let look = Look {
+        structure: true,
+        full_lanes: true,
+        ..red()
+    };
+    let (a, _) = bundle(&r, dir.path(), &look);
+    let ctx = context(&GAUGES, false);
+    let mut decl = DeclSkin::new(a.clone());
+    decl.prepare(r.gpu(), &attempt(&r, &chart, &ctx)).unwrap();
+    let canvas = decl.canvas([1_920, 1_080]);
+    let mut staging = Staging::with_runs(decl.capacity(), decl.run_capacity(), &canvas);
+    staging.set_clips(a.clips().clone());
+    let mut simple = render::SimpleSkin::new();
+    simple.prepare_attempt(&chart, None).unwrap();
+    let mut batch = render::SpriteBatch::with_capacity(MAX_SPRITES);
+    let v = view(0, 0);
+
+    let snapshot = |covers: game::Covers, g: u32, h: (u64, u64)| {
+        let hispeed = game::HiSpeedSettings {
+            green_target: g,
+            ..game::HiSpeedSettings::default()
+        };
+        game::adjustment::PresentationSnapshot {
+            options: game::PlayOptions::new(hispeed, covers).unwrap(),
+            hispeed: game::Ratio::new(h.0, h.1),
+            target: None,
+            display_offset_us: 0,
+            adjusting: false,
+            generation: 0,
+            sequence: 1,
+            epoch: 1,
+        }
+    };
+    let sudden = |amount| game::Covers {
+        sudden: game::Cover { amount, on: true },
+        ..game::Covers::default()
+    };
+    let open = game::Covers::default();
+    let steps = [
+        (snapshot(open, 300, (16, 5)), 150),
+        (snapshot(sudden(250), 300, (16, 5)), 150),
+        (snapshot(sudden(250), 299, (16, 5)), 150),
+        (snapshot(sudden(250), 299, (37, 10)), 150),
+        (snapshot(sudden(250), 299, (37, 10)), 300),
+    ];
+    let mut lines = Vec::new();
+    for (s, bpm) in steps {
+        let refs = game::References::all(game::Ratio::integer(150));
+        let (lanes, readouts) = render::presentation::frame(
+            &s,
+            Some(game::Ratio::integer(bpm)),
+            Some(refs),
+            bms_model::Speed::NORMAL,
+            true,
+        );
+        let f = FrameInput {
+            lanes,
+            readouts,
+            ..input(&v, TimeUs(900_000), TimeUs(0), &[])
+        };
+        // The declarative skin's model reads this frame's lanes and
+        // readouts, and builds from them.
+        let model = render::skin_frame(&f);
+        assert_eq!((model.lanes, model.readouts), (lanes, readouts));
+        staging.build(&mut decl, &f).unwrap();
+        let counts = format!("{:?}", staging.instances());
+        // The simple skin's native line shows the same native values.
+        let native = skin_model::native_values(&lanes, &readouts).unwrap();
+        assert_eq!(
+            skin_model::native_values(&model.lanes, &model.readouts).unwrap(),
+            native
+        );
+        batch.clear();
+        simple.build(&f, &mut batch).unwrap();
+        let line = native_line(&native, &readouts.covers);
+        let glyphs = batch
+            .blended(render::Blend::Alpha)
+            .filter(|s| s.rect[1] == 1_040.0 && s.rect[3] == 14.0)
+            .count();
+        assert_eq!(
+            glyphs,
+            line.bytes().filter(|&c| c != b' ').count(),
+            "{line}"
+        );
+        lines.push((line, counts));
+    }
+    let shown: Vec<&str> = lines.iter().map(|(l, _)| l.as_str()).collect();
+    assert_eq!(
+        shown,
+        [
+            "HI-SPEED 3.20 FLOATING  GREEN 300 (TARGET 300)  SUDDEN+ OFF  LIFT OFF  HIDDEN+ OFF",
+            "HI-SPEED 3.20 FLOATING  GREEN 225 (TARGET 300)  SUDDEN+ 250  LIFT OFF  HIDDEN+ OFF",
+            "HI-SPEED 3.20 FLOATING  GREEN 225 (TARGET 299)  SUDDEN+ 250  LIFT OFF  HIDDEN+ OFF",
+            "HI-SPEED 3.70 FLOATING  GREEN 195 (TARGET 299)  SUDDEN+ 250  LIFT OFF  HIDDEN+ OFF",
+            "HI-SPEED 3.70 FLOATING  GREEN 97 (TARGET 299)  SUDDEN+ 250  LIFT OFF  HIDDEN+ OFF",
+        ]
+    );
+    // The declarative skin's quads follow the snapshot: the cover, then
+    // `H`, move what it draws.
+    assert_ne!(lines[0].1, lines[1].1);
+    assert_ne!(lines[2].1, lines[3].1);
 }

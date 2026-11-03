@@ -325,36 +325,76 @@ fn an_entry_the_source_could_draw_drops_the_set() {
     }
 }
 
-/// A decorative image cut from a file past the per-file texel cap (a
-/// 6400×7941 animation sheet) drops, its note naming that cap rather
-/// than a missing file.
+/// The CRC of a PNG chunk's type and data (ISO 3309, bit by bit).
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFF_u32;
+    for &b in bytes {
+        crc ^= u32::from(b);
+        for _ in 0..8 {
+            crc = if crc & 1 == 1 {
+                (crc >> 1) ^ 0xEDB8_8320
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    !crc
+}
+
+/// An 8-bit RGBA PNG header declaring `w`×`h` and the start of its image
+/// data, with no pixels behind it.
+fn png_header(w: u32, h: u32) -> Vec<u8> {
+    let mut out = b"\x89PNG\r\n\x1a\n".to_vec();
+    let mut body = b"IHDR".to_vec();
+    body.extend_from_slice(&w.to_be_bytes());
+    body.extend_from_slice(&h.to_be_bytes());
+    body.extend_from_slice(&[8, 6, 0, 0, 0]);
+    out.extend_from_slice(&13_u32.to_be_bytes());
+    out.extend_from_slice(&body);
+    out.extend_from_slice(&crc32(&body).to_be_bytes());
+    out.extend_from_slice(&1_000_u32.to_be_bytes());
+    out.extend_from_slice(b"IDAT\x78\x9c\0\0");
+    out
+}
+
+/// A decorative image cut from a file past a per-file texel cap drops,
+/// its note naming that cap rather than a missing file: a 6400×7941
+/// animation sheet as a BMP passes the full-decode cap (as a PNG it would
+/// be decoded in bands), and a PNG past 64 Mi texels the banded one.
 #[test]
 fn a_file_past_the_texel_cap_drops_naming_the_cap() {
-    let json = format!(
-        r#"{{"type": 0, "w": 1920, "h": 1080,
-           "source": [{{"id": "close", "path": "close.bmp"}}],
-           "image": [{{"id": "i", "src": "close", "w": 1280, "h": 720}}],
-           "destination": [{{"id": "i", {KEY}}}]}}"#
-    );
-    let dir = common::skin_with(&json, &[]);
-    common::write(dir.path(), "close.bmp", &common::bmp_header(6_400, 7_941));
-    let l = common::Loaded {
-        result: common::import_dir(dir.path()),
-        dir,
-    };
-    let why = NoteKind::OverCap {
-        cap: "per-file texel",
-    };
-    let dropped: Vec<_> = l
-        .report()
-        .notes
-        .iter()
-        .filter(|n| n.severity == Severity::Dropped)
-        .map(|n| n.kind)
-        .collect();
-    assert_eq!(dropped, [why]);
-    assert_eq!(why.to_string(), "a file over the per-file texel cap");
-    assert!(l.quads(0).is_empty());
+    for (name, bytes, cap) in [
+        (
+            "close.bmp",
+            common::bmp_header(6_400, 7_941),
+            "full-decode texel",
+        ),
+        ("close.png", png_header(8_192, 8_193), "banded texel"),
+    ] {
+        let json = format!(
+            r#"{{"type": 0, "w": 1920, "h": 1080,
+               "source": [{{"id": "close", "path": "{name}"}}],
+               "image": [{{"id": "i", "src": "close", "w": 1280, "h": 720}}],
+               "destination": [{{"id": "i", {KEY}}}]}}"#
+        );
+        let dir = common::skin_with(&json, &[]);
+        common::write(dir.path(), name, &bytes);
+        let l = common::Loaded {
+            result: common::import_dir(dir.path()),
+            dir,
+        };
+        let why = NoteKind::OverCap { cap };
+        let dropped: Vec<_> = l
+            .report()
+            .notes
+            .iter()
+            .filter(|n| n.severity == Severity::Dropped)
+            .map(|n| n.kind)
+            .collect();
+        assert_eq!(dropped, [why], "{name}");
+        assert_eq!(why.to_string(), format!("a file over the {cap} cap"));
+        assert!(l.quads(0).is_empty(), "{name}");
+    }
 }
 
 #[test]

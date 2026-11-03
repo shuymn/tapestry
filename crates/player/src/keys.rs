@@ -10,8 +10,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use anyhow::Context as _;
 use eval::ControlId;
 use game::{
-    Bound, DeviceSettings, KeyConfigEnd, KeyConfigFlow, KeyConfigs, KeyError, KeyScreen, Refusal,
-    Role, capture_keys, load_settings, save_settings,
+    AdjustKeyError, Bound, DeviceSettings, KeyConfigEnd, KeyConfigFlow, KeyConfigs, KeyError,
+    KeyScreen, Refusal, Role, capture_keys, load_settings, save_settings,
 };
 use input::hid::is_axis;
 use input::{Capture, DeviceKind, QpcClock};
@@ -43,6 +43,17 @@ fn role(r: Role) -> String {
     r.to_string().to_uppercase()
 }
 
+/// A role's short name, for its row and its prompt.
+fn label(r: Role) -> String {
+    match r {
+        Role::AuxNegative => "AUX -".to_owned(),
+        Role::AuxPositive => "AUX +".to_owned(),
+        Role::ScratchPositive => "SCRATCH +".to_owned(),
+        Role::ScratchNegative => "SCRATCH -".to_owned(),
+        r => role(r),
+    }
+}
+
 fn names(bound: &[Bound]) -> String {
     if bound.is_empty() {
         return "UNBOUND".to_owned();
@@ -68,6 +79,21 @@ fn refusal(r: Refusal) -> String {
             format!("{} TAKES KEYBOARD KEYS ONLY: PRESS A KEY", role(r))
         }
         Refusal::Key(KeyError::NoSuchLane(l)) => format!("LANE {l} DOES NOT EXIST"),
+        Refusal::Key(KeyError::Adjustment(e)) => match e {
+            AdjustKeyError::Overlap { first, .. } => format!(
+                "ALREADY BOUND TO {}: PRESS ANOTHER",
+                first.to_string().to_uppercase()
+            ),
+            AdjustKeyError::Reserved { reserved_for, .. } => format!(
+                "RESERVED FOR {}: PRESS ANOTHER",
+                reserved_for.to_uppercase()
+            ),
+            AdjustKeyError::Axis(_) => "TAKES A KEY OR A BUTTON, NOT AN AXIS".to_owned(),
+            AdjustKeyError::NotScratch { .. } => {
+                "NOT A SCRATCH KEY OR BUTTON: PRESS ONE OF THEM".to_owned()
+            }
+            AdjustKeyError::TooMany => "TOO MANY ADJUSTMENT CONTROLS".to_owned(),
+        },
         Refusal::NothingToKeep(r) => {
             format!("{} HAS NO BINDING TO KEEP: PRESS A CONTROL", role(r))
         }
@@ -75,6 +101,7 @@ fn refusal(r: Refusal) -> String {
         Refusal::UnknownController => {
             "THIS CONTROLLER CANNOT BE TOLD APART: PRESS ANOTHER".to_owned()
         }
+        Refusal::NotATurn => "TURN THE TURNTABLE, OR F12 TO KEEP".to_owned(),
     }
 }
 
@@ -98,6 +125,11 @@ pub fn lines(flow: &KeyConfigFlow) -> Vec<String> {
     } else if flow.turning() {
         l.push("TURN THE TURNTABLE THE WAY THAT SCROLLS MENUS DOWN (F12: KEEP)".to_owned());
         l.push(String::new());
+    } else if flow.reversing() {
+        l.push(
+            "TURN THE TURNTABLE THE WAY THAT RAISES SUDDEN+ AND SPEEDS UP (F12: KEEP)".to_owned(),
+        );
+        l.push(detail);
     } else {
         match flow.role() {
             Some(r @ (Role::Retry | Role::Quit)) => {
@@ -109,6 +141,18 @@ pub fn lines(flow: &KeyConfigFlow) -> Vec<String> {
             Some(Role::Lane(0)) => l.push(
                 "PRESS THE KEY OR BUTTON FOR ONE SCRATCH DIRECTION, OR TURN THE AXIS".to_owned(),
             ),
+            Some(Role::ScratchPositive) => l.push(format!(
+                "PRESS THE SCRATCH {} THAT RAISES SUDDEN+ AND SPEEDS UP (F12: KEEP)",
+                match flow.choosing() {
+                    Some(DeviceKind::Controller) => "BUTTON",
+                    _ => "KEY",
+                }
+            )),
+            Some(r @ (Role::AuxNegative | Role::AuxPositive)) => l.push(format!(
+                "PRESS THE KEY OR BUTTON FOR {} ({})",
+                label(r),
+                role(r)
+            )),
             Some(r) => l.push(format!("PRESS THE KEY OR BUTTON FOR {}", role(r))),
             None => l.push("DONE".to_owned()),
         }
@@ -130,7 +174,7 @@ pub fn lines(flow: &KeyConfigFlow) -> Vec<String> {
         let label = if i == 1 && *r == Role::Lane(0) {
             "SCRATCH 2".to_owned()
         } else {
-            role(*r)
+            label(*r)
         };
         l.push(format!("{label:<8} {value}"));
     }
@@ -177,12 +221,14 @@ impl KeyScreen for Screen<'_> {
 
 /// Puts a finished key config into `device`: the bindings, the scratch
 /// axis's revolution when it was learnt beyond its declared range, and its
-/// menu direction when it was turned for it (else the current one stays).
+/// menu and adjustment directions when it was turned for them (else the
+/// current ones stay).
 fn apply(
     device: &mut DeviceSettings,
     keys: KeyConfigs,
     widened: Option<u32>,
     menu_reversed: Option<bool>,
+    adjust_reversed: Option<bool>,
 ) {
     device.keyboard = keys.keyboard;
     device.controller = keys.controller;
@@ -195,6 +241,9 @@ fn apply(
     }
     if let Some(reversed) = menu_reversed {
         device.scratch.menu_reversed = reversed;
+    }
+    if let Some(reversed) = adjust_reversed {
+        device.scratch.adjust_reversed = reversed;
     }
 }
 
@@ -251,11 +300,7 @@ pub fn run(
         controls: &controls,
         presented: window_thread.link().presented(),
     };
-    let current = KeyConfigs {
-        keyboard: device.keyboard.clone(),
-        controller: device.controller.clone(),
-        controller_device: device.controller_device.map(Into::into),
-    };
+    let current = KeyConfigs::from(&device);
     let end = capture_keys(&capture, &mut screen, current, device.scratch.wrap);
     drop(screen);
     #[cfg(feature = "dev-tools")]
@@ -263,8 +308,8 @@ pub fn run(
     drop(input);
     window_thread.close();
     match end {
-        KeyConfigEnd::Done(keys, widened, menu_reversed) => {
-            apply(&mut device, keys, widened, menu_reversed);
+        KeyConfigEnd::Done(keys, widened, menu_reversed, adjust_reversed) => {
+            apply(&mut device, keys, widened, menu_reversed, adjust_reversed);
             save_settings(&path, &device).with_context(|| path.display().to_string())?;
             println!("keys: saved to {}", path.display());
         }
@@ -297,17 +342,21 @@ mod tests {
     /// Offers one packet per wait, as the input thread offers them: a
     /// keyboard key (`Ok`) or the scratch axis turned (`Err`, its value's
     /// sign the direction). Keeps the lines shown while the menu direction
-    /// is asked for.
+    /// and the adjustment direction are asked for.
     struct Scripted {
         capture: Capture,
         steps: std::vec::IntoIter<Result<u32, i32>>,
         asked: Vec<String>,
+        reversing: Vec<String>,
     }
 
     impl KeyScreen for Scripted {
         fn show(&mut self, flow: &KeyConfigFlow) {
             if flow.turning() {
                 self.asked = lines(flow);
+            }
+            if flow.reversing() {
+                self.reversing = lines(flow);
             }
         }
 
@@ -336,22 +385,25 @@ mod tests {
     }
 
     /// Key config with the scratch bound to the axis, its range skipped
-    /// (F12), `answer` at the menu direction prompt, and the rest kept,
-    /// written over `device` as `tapestry keys` writes it.
-    fn configured(answer: Result<u32, i32>, device: &mut DeviceSettings) -> Vec<String> {
+    /// (F12), `answer` at the menu direction prompt, the rest kept, and
+    /// `adjust` at the adjustment direction prompt, written over `device` as
+    /// `tapestry keys` writes it. The lines of both prompts.
+    fn configured(
+        answer: Result<u32, i32>,
+        adjust: Result<u32, i32>,
+        device: &mut DeviceSettings,
+    ) -> (Vec<String>, Vec<String>) {
         let capture = Capture::new();
         let mut steps = vec![Err(1), Ok(game::KEEP_KEY), answer];
-        steps.extend([Ok(game::KEEP_KEY); 9]);
+        steps.extend([Ok(game::KEEP_KEY); 13]);
+        steps.push(adjust);
         let mut screen = Scripted {
             capture: capture.clone(),
             steps: steps.into_iter(),
             asked: Vec::new(),
+            reversing: Vec::new(),
         };
-        let current = KeyConfigs {
-            keyboard: device.keyboard.clone(),
-            controller: device.controller.clone(),
-            controller_device: device.controller_device.map(Into::into),
-        };
+        let current = KeyConfigs::from(&*device);
         let end = capture_keys_within(
             &capture,
             &mut screen,
@@ -360,12 +412,12 @@ mod tests {
             Duration::ZERO,
             Duration::ZERO,
         );
-        let KeyConfigEnd::Done(keys, widened, menu_reversed) = end else {
+        let KeyConfigEnd::Done(keys, widened, menu_reversed, adjust_reversed) = end else {
             panic!("{end:?}");
         };
-        apply(device, keys, widened, menu_reversed);
+        apply(device, keys, widened, menu_reversed, adjust_reversed);
         assert_eq!(device.validate(), Ok(()));
-        screen.asked
+        (screen.asked, screen.reversing)
     }
 
     /// The axis turned toward lower values at the prompt writes the menu
@@ -373,19 +425,95 @@ mod tests {
     /// keeps what `device.toml` had.
     #[test]
     fn key_config_writes_the_menu_direction_turned() {
+        let keep = Ok(game::KEEP_KEY);
         let mut device = DeviceSettings::default();
-        let asked = configured(Err(-1), &mut device);
+        let (asked, _) = configured(Err(-1), keep, &mut device);
         assert_eq!(
             asked[2],
             "TURN THE TURNTABLE THE WAY THAT SCROLLS MENUS DOWN (F12: KEEP)"
         );
         assert!(device.scratch.menu_reversed);
-        configured(Ok(game::KEEP_KEY), &mut device);
+        configured(keep, keep, &mut device);
         assert!(device.scratch.menu_reversed, "F12 keeps it");
-        configured(Err(1), &mut device);
+        configured(Err(1), keep, &mut device);
         assert!(!device.scratch.menu_reversed);
-        configured(Ok(game::KEEP_KEY), &mut device);
+        configured(keep, keep, &mut device);
         assert!(!device.scratch.menu_reversed, "F12 keeps it");
+        assert!(!device.scratch.adjust_reversed);
+    }
+
+    /// The axis turned toward lower values at the last prompt writes the
+    /// adjustment direction reversed, toward higher values not reversed,
+    /// and F12 keeps what `device.toml` had; the menu direction is apart.
+    #[test]
+    fn key_config_writes_the_adjustment_direction_turned() {
+        let keep = Ok(game::KEEP_KEY);
+        let mut device = DeviceSettings::default();
+        let (_, reversing) = configured(Err(1), Err(-1), &mut device);
+        assert_eq!(
+            reversing[2],
+            "TURN THE TURNTABLE THE WAY THAT RAISES SUDDEN+ AND SPEEDS UP (F12: KEEP)"
+        );
+        assert!(device.scratch.adjust_reversed);
+        assert!(!device.scratch.menu_reversed);
+        configured(keep, keep, &mut device);
+        assert!(device.scratch.adjust_reversed, "F12 keeps it");
+        configured(keep, Err(1), &mut device);
+        assert!(!device.scratch.adjust_reversed);
+    }
+
+    /// After quit: START, SELECT, the auxiliary keys, then the positive
+    /// direction of a scratch on two buttons, each named on its row.
+    #[test]
+    fn the_screen_prompts_for_the_adjustment_roles() {
+        let kb = |control| Bound {
+            kind: DeviceKind::Keyboard,
+            control,
+        };
+        let pad = |control| Bound {
+            kind: DeviceKind::Controller,
+            control,
+        };
+        let model = Some(MODEL);
+        let mut flow = KeyConfigFlow::new(KeyConfigs::from(&DeviceSettings::default()));
+        flow.press_from(pad(40), model);
+        flow.press_from(pad(41), model);
+        for _ in 0..9 {
+            flow.press(kb(game::KEEP_KEY));
+        }
+        let l = lines(&flow);
+        assert_eq!(l[2], "PRESS THE KEY OR BUTTON FOR START");
+        assert_eq!(l[16], "START    <");
+        assert_eq!(l[17], "SELECT   (NOW KEY 0011)");
+        assert_eq!(l[18], "AUX -    (NOW KEY E048)");
+        assert_eq!(l[19], "AUX +    (NOW KEY E050)");
+        // START on a lane key is refused.
+        flow.press(kb(0x2c));
+        assert_eq!(lines(&flow)[3], "ALREADY BOUND TO KEY 1: PRESS ANOTHER");
+        flow.press(kb(game::KEEP_KEY));
+        flow.press(kb(game::KEEP_KEY));
+        assert_eq!(
+            lines(&flow)[2],
+            "PRESS THE KEY OR BUTTON FOR AUX - (THE AUXILIARY NEGATIVE KEY)"
+        );
+        flow.press(kb(game::KEEP_KEY));
+        flow.press(kb(game::KEEP_KEY));
+        let l = lines(&flow);
+        assert_eq!(
+            l[2],
+            "PRESS THE SCRATCH BUTTON THAT RAISES SUDDEN+ AND SPEEDS UP (F12: KEEP)"
+        );
+        assert_eq!(l[20], "SCRATCH + <");
+        flow.press_from(pad(3), model);
+        assert_eq!(
+            lines(&flow)[3],
+            "NOT A SCRATCH KEY OR BUTTON: PRESS ONE OF THEM"
+        );
+        assert!(matches!(
+            flow.press_from(pad(41), model),
+            game::Press::Done(_)
+        ));
+        assert_eq!(lines(&flow)[20], "SCRATCH + BUTTON 41");
     }
 
     #[test]
@@ -396,6 +524,7 @@ mod tests {
                 lanes: Vec::new(),
                 retry: None,
                 quit: None,
+                ..KeyConfig::default()
             },
             controller_device: None,
         });
@@ -453,6 +582,7 @@ mod tests {
                 lanes: Vec::new(),
                 retry: None,
                 quit: None,
+                ..KeyConfig::default()
             },
             controller_device: None,
         });

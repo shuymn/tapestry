@@ -25,7 +25,7 @@ type Painted = ([i32; 4], [f32; 4], [u8; 4], Blend);
 /// Each quad of `l` at `ms` over an empty chart.
 fn painted(l: &Loaded, ms: i64) -> Vec<Painted> {
     let skin = l.ok().skin.clone();
-    let atlas = skin.atlas(Variant::Lo, LIMITS).unwrap();
+    let atlas = skin.atlas(Variant::Lo, LIMITS, &|| false).unwrap();
     let mut d = Drawn::new(skin, 0);
     let quads = d.frame(ms, &[]);
     let runs = d.batch.runs().to_vec();
@@ -124,7 +124,7 @@ fn an_offset_four_system_image_paints_sudden_plus() {
     let l = with("", &[&lid]);
     assert_eq!(l.report().usage.file_attempts, 1, "a.png alone");
     let skin = l.ok().skin.clone();
-    let atlas = skin.atlas(Variant::Lo, LIMITS).unwrap();
+    let atlas = skin.atlas(Variant::Lo, LIMITS, &|| false).unwrap();
     let mut d = Drawn::new(skin, 0);
     d.view.cover = 500;
     let quads = d.frame(1_000, &[]);

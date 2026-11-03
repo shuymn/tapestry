@@ -1,8 +1,8 @@
 //! The play adjustments' bindings (design.md "Play Adjustments", bindings
 //! and dispatch): START, SELECT and the auxiliary keys of each kind of
-//! device beside its [`KeyConfig`], the scratch's positive and negative
+//! device in its [`KeyConfig`], the scratch's positive and negative
 //! digital directions among its own lane controls, the reversal of its
-//! axis, and the refusal of a control given two roles. A plan numbers the
+//! axis from `[scratch]`, and the refusal of a control given two roles. A plan numbers the
 //! bound controls for the input side's tap and the reducer, and turns the
 //! tap's observations into the reducer's.
 
@@ -14,87 +14,68 @@ use input::raw::key_identity;
 use input::{AdjustmentBindings, DeviceKind, MAX_TAPPED, TapControl, TapEvent, TapObservation};
 
 use crate::adjustment::{
-    AxisQuantum, ControlId, ControlRoles, Event, HeldSet, Observation, Role as Adjust,
+    AxisQuantum, ControlId, ControlRoles, Event, HeldSet, Observation, REPEAT_US, Role as Adjust,
 };
 use crate::keys::KeyConfigs;
-use crate::settings::{KeyConfig, Role as KeyRole, reserved_key};
-use crate::tuning::Adjust as SettingsKey;
+use crate::settings::{DeviceSettings, KeyConfig, Role as KeyRole, reserved_key};
+use crate::tuning::SPEED_KEYS;
 
 // The tap's numbers are the reducer's controls, and both sets are a u128.
 const _: () = assert!(MAX_TAPPED == crate::adjustment::MAX_CONTROLS && MAX_TAPPED == 128);
 
-/// One kind of device's adjustment roles; each a keyboard scan code or a
-/// controller's button, `None` when unbound.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct AdjustmentKeys {
-    /// START.
-    pub start: Option<u32>,
-    /// SELECT.
-    pub select: Option<u32>,
-    /// The auxiliary negative key.
-    pub aux_negative: Option<u32>,
-    /// The auxiliary positive key.
-    pub aux_positive: Option<u32>,
-    /// The scratch's positive digital direction: one of the scratch lane's
-    /// own controls.
-    pub scratch_positive: Option<u32>,
-    /// The scratch's negative digital direction, likewise.
-    pub scratch_negative: Option<u32>,
+/// One kind of device's adjustment roles: a view of its [`KeyConfig`]'s
+/// START, SELECT, auxiliary keys and scratch directions, each a keyboard
+/// scan code or a controller's button.
+#[derive(Clone, Copy, Debug)]
+pub struct AdjustmentKeys<'a>(&'a KeyConfig);
+
+/// The reducer's role of a key config's adjustment role; `None` for a
+/// lane, retry or quit.
+const fn adjustment_role(role: KeyRole) -> Option<Adjust> {
+    match role {
+        KeyRole::Start => Some(Adjust::Start),
+        KeyRole::Select => Some(Adjust::Select),
+        KeyRole::AuxNegative => Some(Adjust::AuxNegative),
+        KeyRole::AuxPositive => Some(Adjust::AuxPositive),
+        KeyRole::ScratchPositive => Some(Adjust::ScratchPositive),
+        KeyRole::ScratchNegative => Some(Adjust::ScratchNegative),
+        KeyRole::Lane(_) | KeyRole::Retry | KeyRole::Quit => None,
+    }
 }
 
-impl AdjustmentKeys {
-    /// Every keyboard's: Q and W, Up and Down, and Left Shift (the default
-    /// scratch key) as the positive scratch.
-    pub const KEYBOARD: Self = Self {
-        start: Some(0x10),
-        select: Some(0x11),
-        aux_negative: Some(0xE048),
-        aux_positive: Some(0xE050),
-        scratch_positive: Some(0x2a),
-        scratch_negative: None,
-    };
-
-    /// The controller's: nothing until captured.
-    pub const CONTROLLER: Self = Self {
-        start: None,
-        select: None,
-        aux_negative: None,
-        aux_positive: None,
-        scratch_positive: None,
-        scratch_negative: None,
-    };
-
-    /// Every binding with its role.
-    pub fn roles(&self) -> impl Iterator<Item = (u32, Adjust)> + '_ {
-        [
-            (self.start, Adjust::Start),
-            (self.select, Adjust::Select),
-            (self.aux_negative, Adjust::AuxNegative),
-            (self.aux_positive, Adjust::AuxPositive),
-            (self.scratch_positive, Adjust::ScratchPositive),
-            (self.scratch_negative, Adjust::ScratchNegative),
-        ]
-        .into_iter()
-        .filter_map(|(c, r)| c.map(|c| (c, r)))
+impl<'a> AdjustmentKeys<'a> {
+    /// The adjustment roles `keys` binds.
+    #[must_use]
+    pub const fn of(keys: &'a KeyConfig) -> Self {
+        Self(keys)
     }
 
-    /// Checks these beside `keys`, of a kind of device: START, SELECT and
-    /// the auxiliary keys take buttons or keys that no lane, retry, quit
-    /// or other role has, and no key the game reserves; a scratch
-    /// direction takes one of the scratch lane's own buttons or keys, each
-    /// direction its own. Keyboard keys are compared as the window tells
-    /// them apart.
+    /// Every binding with its role.
+    pub fn roles(&self) -> impl Iterator<Item = (u32, Adjust)> + 'a {
+        self.0
+            .roles()
+            .filter_map(|(c, r)| adjustment_role(r).map(|a| (c, a)))
+    }
+
+    /// Checks these beside the key config's lanes, retry and quit, of a
+    /// kind of device: START, SELECT and the auxiliary keys take buttons
+    /// or keys that no lane, retry, quit or other role has, and no key the
+    /// game reserves; a scratch direction takes one of the scratch lane's
+    /// own buttons or keys, each direction its own. Keyboard keys are
+    /// compared as the window tells them apart.
     ///
     /// # Errors
     ///
     /// The first binding that breaks a rule.
-    pub fn check(&self, keys: &KeyConfig, kind: DeviceKind) -> Result<(), AdjustKeyError> {
+    pub fn check(&self, kind: DeviceKind) -> Result<(), AdjustKeyError> {
         let identity = |c: u32| match kind {
             DeviceKind::Keyboard => key_identity(InputControl(c)).0,
             DeviceKind::Controller => c,
         };
-        let mut seen: Vec<(u32, AdjustBinding)> = keys
+        let mut seen: Vec<(u32, AdjustBinding)> = self
+            .0
             .roles()
+            .filter(|(_, r)| !r.is_adjustment())
             .map(|(c, r)| (identity(c), AdjustBinding::Key(r)))
             .collect();
         for (control, role) in self.roles() {
@@ -204,73 +185,64 @@ pub enum AdjustKeyError {
     TooMany,
 }
 
-/// Both kinds of device's adjustment bindings and the scratch axis's
-/// reversal.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// What the play adjustments take from `device.toml` beside the key
+/// configs, whose roles they bind: the scratch axis's `[scratch]` settings.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AdjustmentConfig {
-    /// Every keyboard's.
-    pub keyboard: AdjustmentKeys,
-    /// The controller's.
-    pub controller: AdjustmentKeys,
-    /// Whether the scratch axis adjusts the other way from its movement.
+    /// Whether the scratch axis adjusts the other way from its movement
+    /// (`adjust_reversed`).
     pub reversed: bool,
-}
-
-impl Default for AdjustmentConfig {
-    fn default() -> Self {
-        Self {
-            keyboard: AdjustmentKeys::KEYBOARD,
-            controller: AdjustmentKeys::CONTROLLER,
-            reversed: false,
-        }
-    }
+    /// The movement of a scratch axis that does not wrap, or is relative,
+    /// that makes one step (`adjust_counts_per_step`); positive.
+    pub counts_per_step: Option<u32>,
 }
 
 impl AdjustmentConfig {
-    /// Checks both kinds ([`AdjustmentKeys::check`]).
-    ///
-    /// # Errors
-    ///
-    /// The first binding that breaks a rule.
-    pub fn check(&self, keys: &KeyConfigs) -> Result<(), AdjustKeyError> {
-        self.keyboard.check(&keys.keyboard, DeviceKind::Keyboard)?;
-        self.controller
-            .check(&keys.controller, DeviceKind::Controller)
+    /// The settings `device` gives.
+    #[must_use]
+    pub const fn of(device: &DeviceSettings) -> Self {
+        Self {
+            reversed: device.scratch.adjust_reversed,
+            counts_per_step: device.scratch.adjust_counts_per_step,
+        }
     }
 
     /// Numbers every adjustment control of `keys` for the tap and the
-    /// reducer: these roles, the lane keys as white and black keys, F1
-    /// and F2, and the controller's scratch axis when it has a `quantum`,
+    /// reducer: their adjustment roles, the lane keys as white and black
+    /// keys, F1 and F2, and the controller's scratch axis: a wrapping axis
+    /// steps by its revolution as each packet counted it, any other by
+    /// `quantum` (none without one),
     /// its movement counted the short way round `wrap` (the declared
     /// revolution when `None`). The controller's controls are tapped on
     /// its model only.
     ///
     /// # Errors
     ///
-    /// As [`check`](Self::check), or more controls than [`MAX_TAPPED`].
+    /// What [`AdjustmentKeys::check`] refuses for either kind, or more
+    /// controls than [`MAX_TAPPED`].
     pub fn plan(
         &self,
         keys: &KeyConfigs,
         quantum: Option<AxisQuantum>,
         wrap: Option<u32>,
     ) -> Result<AdjustmentPlan, AdjustKeyError> {
-        self.check(keys)?;
+        AdjustmentKeys::of(&keys.keyboard).check(DeviceKind::Keyboard)?;
+        AdjustmentKeys::of(&keys.controller).check(DeviceKind::Controller)?;
         let mut plan = AdjustmentPlan {
             roles: ControlRoles::default(),
             bindings: AdjustmentBindings {
                 controls: Vec::new(),
                 latched: 0,
                 wrap,
+                repeating: 0,
+                repeat_us: REPEAT_US,
             },
             axis: None,
             reversed: self.reversed,
         };
-        let speed = [
-            (SettingsKey::HiSpeedDown.key(), Adjust::Slower),
-            (SettingsKey::HiSpeedUp.key(), Adjust::Faster),
-        ];
-        let keyboard = self
-            .keyboard
+        let [slower, faster] = SPEED_KEYS;
+        let speed = [(slower, Adjust::Slower), (faster, Adjust::Faster)];
+        let keyboard = AdjustmentKeys::of(&keys.keyboard)
             .roles()
             .chain(lane_roles(&keys.keyboard))
             .chain(speed);
@@ -284,10 +256,11 @@ impl AdjustmentConfig {
             product,
             control: InputControl(control),
         };
-        for (control, role) in self.controller.roles().chain(lane_roles(&keys.controller)) {
+        let controller = AdjustmentKeys::of(&keys.controller).roles();
+        for (control, role) in controller.chain(lane_roles(&keys.controller)) {
             plan.add(tapped(control), Some(role))?;
         }
-        if let Some(quantum) = quantum {
+        {
             let axis = keys
                 .controller
                 .lanes
@@ -321,7 +294,7 @@ pub struct AdjustmentPlan {
     pub roles: ControlRoles,
     /// The tap's bindings ([`input::adjustment_queue`]).
     pub bindings: AdjustmentBindings,
-    axis: Option<(u8, AxisQuantum)>,
+    axis: Option<(u8, Option<AxisQuantum>)>,
     reversed: bool,
 }
 
@@ -339,6 +312,9 @@ impl AdjustmentPlan {
             if matches!(role, Adjust::Start | Adjust::Select) {
                 self.bindings.latched |= 1 << n;
             }
+            if matches!(role, Adjust::ScratchPositive | Adjust::ScratchNegative) {
+                self.bindings.repeating |= 1 << n;
+            }
         }
         Ok(n)
     }
@@ -351,7 +327,8 @@ impl AdjustmentPlan {
 
     /// The reducer's observation of the tap's `o`: its time and sequence,
     /// the scratch axis's movement signed by the reversal and given its
-    /// quantum. `None` for an axis the plan does not tap.
+    /// quantum. `None` for an axis the plan does not tap or cannot step, and
+    /// for the lifecycle's markers.
     #[must_use]
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub fn observation(&self, o: &TapObservation) -> Option<Observation> {
@@ -359,8 +336,15 @@ impl AdjustmentPlan {
             TapEvent::Press(n) => Event::Press(ControlId(n)),
             TapEvent::Release(n) => Event::Release(ControlId(n)),
             TapEvent::Repeat(n) => Event::Repeat(ControlId(n)),
-            TapEvent::Axis { control, delta } => {
+            TapEvent::Axis {
+                control,
+                delta,
+                revolution,
+            } => {
                 let (n, quantum) = self.axis.filter(|&(n, _)| n == control)?;
+                // A wrapping axis by the revolution it was counted on, so
+                // its controller need not be connected at the plan.
+                let quantum = AxisQuantum::wrapping(revolution).or(quantum)?;
                 Event::Axis {
                     control: ControlId(n),
                     delta: if self.reversed {
@@ -373,7 +357,14 @@ impl AdjustmentPlan {
             }
             TapEvent::Tick => Event::Tick,
             TapEvent::Lost => Event::Lost,
-            TapEvent::Resync(held) => Event::Resync(HeldSet(held)),
+            TapEvent::Resync { held, verified } => Event::Resync {
+                held: HeldSet(held),
+                verified,
+            },
+            // The lifecycle's markers are the driver's.
+            TapEvent::Opened { .. } | TapEvent::Cancelled { .. } | TapEvent::Fence(_) => {
+                return None;
+            }
         };
         Some(Observation {
             time: o.at,

@@ -46,6 +46,7 @@ fn snapshot(mode: SpeedMode, green: u32, covers: Covers, h: Option<Ratio>) -> Pr
         adjusting: false,
         generation: 0,
         sequence: 1,
+        epoch: 0,
     }
 }
 
