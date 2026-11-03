@@ -11,7 +11,7 @@ use crate::limits::{
     MAX_FILE_CHOICES, MAX_LIST_ENTRIES, MAX_OFFSETS, MAX_OPTION_ITEMS, MAX_OPTIONS,
 };
 use crate::resolve::{Definition, Resolved, resolve};
-use crate::tree::NONE;
+use crate::tree::{NONE, Scalar};
 
 /// The skin sizes accepted, width by height: the 16:9 entries of the
 /// source's size list (`Resolution.java:9-23` at `0.8.9`). The source
@@ -169,6 +169,9 @@ impl Resolved<'_> {
             let [name, item, def] = d.fields(rec, ["name", "item", "def"]);
             let mut items = Vec::new();
             if let Some(list) = item {
+                if matches!(d.arena.scalar(list), Scalar::Callable) {
+                    return Err(d.callable_error(list, "item"));
+                }
                 if !d.arena.is_array(list) {
                     return Err(d.type_error(list, "item", "an array"));
                 }
@@ -182,6 +185,9 @@ impl Resolved<'_> {
                         return Err(over(d, it, InputLimit::OptionItems));
                     }
                     item_count += 1;
+                    if matches!(d.arena.scalar(it), Scalar::Callable) {
+                        return Err(d.callable_error(it, "item"));
+                    }
                     if !d.arena.is_object(it) {
                         return Err(d.type_error(it, "item", "an object"));
                     }

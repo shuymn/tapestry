@@ -188,16 +188,12 @@ impl Q {
         // such as 2^-80 needs no denominator past i128.
         let (m, e) = if m == 0 {
             (0, 0)
-        } else {
+        } else if e < 0 {
+            // Only a negative exponent leaves a denominator to reduce.
             let common = m.trailing_zeros().min(e.unsigned_abs());
-            (
-                m >> common,
-                if e < 0 {
-                    e + i32::try_from(common).ok()?
-                } else {
-                    e
-                },
-            )
+            (m >> common, e + i32::try_from(common).ok()?)
+        } else {
+            (m, e)
         };
         let m = if negative { -m } else { m };
         if e >= 0 {
@@ -357,6 +353,8 @@ mod tests {
         assert_eq!(Q::float(0.5), Q::new(1, 2));
         assert_eq!(Q::float(-0.75), Q::new(-3, 4));
         assert_eq!(Q::float(3.0), Some(Q::int(3)));
+        assert_eq!(Q::float(2.0_f64.powi(53)), Some(Q::int(1_i128 << 53)));
+        assert_eq!(Q::float(-(2.0_f64.powi(60))), Some(Q::int(-(1_i128 << 60))));
         assert_eq!(Q::float(0.0), Some(Q::ZERO));
         // 2^-80 reduces to 1 / 2^80; 2^-130 has no i128 denominator.
         assert_eq!(Q::float(2.0_f64.powi(-80)), Q::new(1, 1 << 80));

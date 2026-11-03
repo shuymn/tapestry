@@ -872,6 +872,9 @@ impl Resolver<'_, '_> {
                 while next != NONE {
                     let branch = next;
                     next = self.arena().node(branch).next_sibling;
+                    if self.callable(branch) {
+                        return Err(self.def.callable_error(branch, "other"));
+                    }
                     let cond = self.arena().first_member_ci(branch, "if");
                     if self.test(cond)? {
                         return match self.arena().first_member_ci(branch, "value") {
@@ -919,12 +922,17 @@ impl Resolver<'_, '_> {
             next = self.arena().node(item).next_sibling;
             let held = if self.is_number(item) {
                 self.test_number(item)?
+            } else if self.callable(item) {
+                return Err(self.def.callable_error(item, "if"));
             } else if self.arena().is_array(item) {
                 let mut held = false;
                 let mut alt = self.arena().node(item).first_child;
                 while alt != NONE {
                     let one = alt;
                     alt = self.arena().node(one).next_sibling;
+                    if self.callable(one) {
+                        return Err(self.def.callable_error(one, "if"));
+                    }
                     if self.is_number(one) && self.test_number(one)? {
                         held = true;
                         break;

@@ -484,6 +484,13 @@ fn a_metatable_is_fixed_when_it_is_attached() {
             "local mt = {}\nlocal t = setmetatable({}, mt)",
             "getmetatable(t).__mode = \"v\"",
         ),
+        // A failed replacement leaves the guard in place.
+        (
+            "local mt = {}\nlocal t = setmetatable({}, mt)\n\
+             assert(not pcall(setmetatable, t, 1))\n\
+             assert(not pcall(setmetatable, 1, {}))",
+            "getmetatable(t).__mode = \"v\"",
+        ),
     ] {
         let d = folder(&[(
             "s.luaskin",
@@ -1055,6 +1062,29 @@ fn the_header_pass_refuses_a_function_only_where_it_reads() {
             "if",
             2,
         ),
+        // Every operand a condition visits, and every choice branch.
+        (
+            "property = { { [\"if\"] = {\n function() end }, value = {} } }",
+            "if",
+            2,
+        ),
+        (
+            "property = { { [\"if\"] = { {\n function() end } }, value = {} } }",
+            "if",
+            2,
+        ),
+        ("property = { {\n function() end } }", "other", 2),
+        // A function as an option's item list, or as one item.
+        (
+            "property = { { name = \"o\", item =\n function() end } }",
+            "item",
+            2,
+        ),
+        (
+            "property = { { name = \"o\", item = {\n function() end } } }",
+            "item",
+            2,
+        ),
     ] {
         let d = folder(&[("s.luaskin", &format!("return {{ type = 0, {fields} }}"))]);
         assert_eq!(
@@ -1063,6 +1093,13 @@ fn the_header_pass_refuses_a_function_only_where_it_reads() {
             "{fields}"
         );
     }
+    // A condition stops at its first operand that fails, as it always
+    // has: the function after it is not visited.
+    let d = folder(&[(
+        "s.luaskin",
+        "return { type = 0, property = { { [\"if\"] = { 901, function() end }, value = { name = \"o\" } } } }",
+    )]);
+    assert!(header(&d).unwrap().header().options.is_empty());
 }
 
 #[test]
