@@ -662,6 +662,10 @@ struct Shared {
     /// The commits answered and given up on, which the game thread and the
     /// render thread settle under its lock.
     commits: Mutex<Commits>,
+    /// Set when the game thread stopped waiting for a commit's answer,
+    /// before it takes the commits' lock (tests).
+    #[cfg(test)]
+    commit_timed_out: AtomicBool,
 }
 
 /// The last request committed and the last whose commit the game thread
@@ -1100,6 +1104,8 @@ impl RenderLink {
                 Err(ScreenError::Lost)
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
+                #[cfg(test)]
+                self.shared.commit_timed_out.store(true, Ordering::Release);
                 let mut commits = self.shared.commits();
                 if commits.committed >= request {
                     let r = commits.receipt;
@@ -1560,6 +1566,8 @@ pub fn spawn(
         loading: Mutex::new(LoadingSlot::default()),
         producer: Mutex::new(None),
         commits: Mutex::new(Commits::default()),
+        #[cfg(test)]
+        commit_timed_out: AtomicBool::new(false),
     });
     let thread_shared = Arc::clone(&shared);
     let (ended_tx, ended) = mpsc::sync_channel::<()>(0);
@@ -1835,8 +1843,6 @@ struct Preparing {
 struct Prepared {
     token: PreparedToken,
     declarative: bool,
-    /// The declarative skin's declared Closing duration: its receipt.
-    close: Option<TimeUs>,
     /// The attempt's tempo and presentation epoch, current once committed.
     presentation: (game::AttemptTempo, u64),
 }
@@ -2572,7 +2578,6 @@ impl Run {
                     device: screen.device(),
                 },
                 declarative: p.skin.is_some(),
-                close: p.skin.as_ref().and_then(|b| b.skin().close()),
                 presentation: (p.attempt.tempo().clone(), p.attempt.epoch()),
             });
         }
@@ -2595,7 +2600,8 @@ impl Run {
     /// waiting, on the screen it was prepared on (its device's). Another request's commit changes nothing; one refused by
     /// the screen discards the staging. Committed, a declarative bundle is
     /// kept for a screen built again. The receipt taken under the
-    /// commits' lock is answered: the declared Closing duration.
+    /// commits' lock is answered: the declared Closing duration of the
+    /// declarative installation the attempt draws with, staged or in use.
     fn commit(&mut self, request: u64) -> Result<Option<TimeUs>, CommitError> {
         // Held through the installation: a withdrawal waits for it, or it
         // sees the withdrawal and installs nothing.
@@ -2627,13 +2633,16 @@ impl Run {
         if p.declarative {
             self.committed = screen.installation();
         }
+        // The installation the attempt draws with: the one it staged, or
+        // the one in use it was readied on.
+        let close = self
+            .committed
+            .as_ref()
+            .and_then(|i| i.bundle().skin().close());
         self.current = Some(p.presentation);
         commits.committed = request;
-        commits.receipt = Receipt {
-            request,
-            close: p.close,
-        };
-        Ok(p.close)
+        commits.receipt = Receipt { request, close };
+        Ok(close)
     }
 
     /// Whether `request` is newer than every request asked of the render
@@ -6449,7 +6458,8 @@ pub(crate) mod tests {
             if self.shared.hold.load(Ordering::Acquire) {
                 return None;
             }
-            assert!(skin.is_some());
+            // Without a skin chosen, the installation in use draws.
+            assert!(skin.is_some() || self.installed.is_some());
             self.note(&format!(
                 "prepare {request} {:?} {}",
                 a.context.scratch, a.text.title
@@ -6757,25 +6767,30 @@ pub(crate) mod tests {
         link.set_timeouts(Duration::from_secs(10), Duration::from_secs(5));
 
         // Installed past the bound: the commit waits in the screen,
-        // holding the commits' lock, until well after the game thread
-        // stopped waiting for the answer.
+        // holding the commits' lock, until the game thread stopped
+        // waiting for the answer, so the receipt is read past the bound.
         assert_eq!(
             link.select(Some(bundle_closing(longest))).wait().unwrap(),
             Preparation::Ready
         );
         ready(&link);
         link.set_timeouts(Duration::from_millis(100), Duration::from_secs(5));
+        link.shared.commit_timed_out.store(false, Ordering::Release);
         screens.hold_commit.store(true, Ordering::Release);
         let release = std::thread::spawn({
             let screens = screens.clone();
+            let shared = Arc::clone(&link.shared);
             move || {
                 assert!(wait_until(|| screens.commit_held.load(Ordering::Acquire)));
-                std::thread::sleep(Duration::from_millis(500));
+                assert!(wait_until(|| shared
+                    .commit_timed_out
+                    .load(Ordering::Acquire)));
                 screens.hold_commit.store(false, Ordering::Release);
             }
         });
         commit(&link, &mut declared).unwrap();
         release.join().unwrap();
+        assert!(link.shared.commit_timed_out.load(Ordering::Acquire));
         assert_eq!(declared, longest);
         assert_eq!(
             game::closing_time(declared),
@@ -6807,6 +6822,63 @@ pub(crate) mod tests {
         ready(&link);
         crate::play::commit_ready(&link, false, &mut declared).unwrap();
         assert_eq!(declared, None);
+        link.exit();
+    }
+
+    /// An attempt prepared with no skin chosen (`select(None)`) draws with
+    /// the installation in use, so its receipt is that skin's declared
+    /// duration, on the first commit after the choice and on a retry.
+    #[test]
+    fn the_skin_in_use_gives_its_declared_close() {
+        let chart = Arc::new(ChartBuilder::new(120_000).build().unwrap());
+        let three = Some(TimeUs(3_000_000));
+        let screens = Installers::default();
+        let link = screens.spawn(&chart, &bundle_closing(three));
+        assert_eq!(link.select(None).wait().unwrap(), Preparation::Ready);
+        let mut declared = None;
+        for _ in 0..2 {
+            let ready = link.prepare_attempt(titled(&chart), || false);
+            assert_eq!(ready.unwrap(), Preparation::Ready);
+            crate::play::commit_ready(&link, false, &mut declared).unwrap();
+            assert_eq!(declared, three);
+        }
+        link.exit();
+    }
+
+    /// Past the bound, a receipt is read only for the request waited for:
+    /// with a later request committed and the receipt another request's,
+    /// the commit answers installed with no declared duration, never the
+    /// other request's.
+    #[test]
+    fn a_receipt_past_the_bound_is_only_its_own_requests() {
+        let chart = Arc::new(ChartBuilder::new(120_000).build().unwrap());
+        let screens = Installers::default();
+        let mut link = screens.spawn(&chart, &bundle_closing(Some(TimeUs(3_000_000))));
+        let mut declared = None;
+        let ready = link.prepare_attempt(titled(&chart), || false);
+        assert_eq!(ready.unwrap(), Preparation::Ready);
+        crate::play::commit_ready(&link, false, &mut declared).unwrap();
+        assert_eq!(declared, Some(TimeUs(3_000_000)));
+        let ready = link.prepare_attempt(titled(&chart), || false);
+        assert_eq!(ready.unwrap(), Preparation::Ready);
+
+        // The render thread stalls in a loading frame, so the commit is
+        // not taken within the bound, while the commits show a later
+        // request committed and the first attempt's receipt.
+        let frames = || screens.loading.load(Ordering::Acquire);
+        link.loading().show(one_line("loading"));
+        assert!(wait_until(|| frames() > 0));
+        screens.stall.store(true, Ordering::Release);
+        assert!(wait_until(|| screens.stalled.load(Ordering::Acquire)));
+        let request = link.requests.load(Ordering::Relaxed);
+        link.shared.commits().committed = request + 1;
+        link.set_timeouts(Duration::from_millis(100), Duration::from_secs(5));
+        link.shared.commit_timed_out.store(false, Ordering::Release);
+        crate::play::commit_ready(&link, false, &mut declared).unwrap();
+        assert!(link.shared.commit_timed_out.load(Ordering::Acquire));
+        assert_ne!(link.shared.commits().receipt.request, request);
+        assert_eq!(declared, None);
+        screens.stall.store(false, Ordering::Release);
         link.exit();
     }
 
