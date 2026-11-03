@@ -701,7 +701,19 @@ impl Adjustment {
             }
             Event::Ownership => self.end_context(tempo),
             Event::Phase { head, generation } => {
-                self.end_context(tempo);
+                // A new READY generation ends the dispatch context. A cancel
+                // (the head frozen, the generation kept) only closes the open
+                // group, under the candidate's clock, before the head
+                // freezes: a gesture accepted in or after the batch whose
+                // hold caused it, such as a scratch held with START, keeps
+                // its context and goes on repeating. The tap sends the cancel
+                // after that batch, so the batch's requests are made under
+                // the candidate's clock too.
+                if generation == self.generation {
+                    self.close(tempo);
+                } else {
+                    self.end_context(tempo);
+                }
                 self.head = head;
                 self.generation = generation;
             }

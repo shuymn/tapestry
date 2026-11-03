@@ -805,3 +805,20 @@ fn a_device_change_while_loading_is_a_new_baseline() {
     assert!(!rig.snap().options.covers().sudden.on);
     assert_eq!(rig.driver.diagnostics().out_of_order, 0);
 }
+
+#[test]
+fn a_gesture_accepted_with_the_cancelling_hold_keeps_repeating() {
+    // START and the scratch's positive direction in one batch during an
+    // armed READY: START cancels the candidate after the batch, and the
+    // scratch's fine steps go on repeating every 50 ms.
+    let mut rig = Rig::new(PlayOptions::default());
+    rig.enter(-1_000_000);
+    rig.attach(tempo(150, None), -1_000_000).unwrap();
+    rig.open(100 * MS, 1_100_000, 1);
+    rig.keys(200 * MS, &[(Q, true), (0x2a, true)]);
+    for k in 1..=4 {
+        rig.tick(200 * MS + k * 50 * MS);
+    }
+    // 3.20 and five steps of 0.01: the press and four repeats.
+    assert_eq!(rig.snap().hispeed, Some(r(325, 100)));
+}
