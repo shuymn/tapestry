@@ -712,26 +712,34 @@ fn gauge_max_from_an_initial_full_gauge() {
     assert_eq!(h.start_ms(timer::GAUGE_MAX), Some(0));
 }
 
+/// `failed` starts at the play's Closing start (the frame's `closing`),
+/// for a quit with every gauge healthy too, and never from a gauge's own
+/// fail time: a shown survival gauge failed with no Closing (play-to-end)
+/// leaves it off.
 #[test]
-fn failed_comes_from_the_shown_gauges_fail_time() {
+fn failed_comes_from_the_closing_start_not_a_fail_time() {
     let chart = taps_chart();
     let mut h = Harness::empty(&chart, &full(0));
+    // A quit's Closing: no gauge failed.
+    assert!(h.gauges.iter().all(|g| g.failed_at.is_none()));
+    h.closing = Some(TimeUs(1_500 * MS));
+    h.frame(2_055, &[]);
+    assert_eq!(h.start_ms(timer::FAILED), Some(1_500));
+    assert_eq!(h.elapsed(timer::FAILED), 555);
+    // The shown survival gauge failed, the play going on to its end.
+    h.closing = None;
+    h.gauge = 1;
     h.gauges[1] = GaugeState {
         value: GaugeValue(0),
         reference: pct(10),
         failed_at: Some(TimeUs(2_000 * MS)),
     };
-    h.frame(2_055, &[]);
-    assert_eq!(h.start_ms(timer::FAILED), None);
-    h.gauge = 1;
-    h.frame(2_055, &[]);
-    assert_eq!(h.start_ms(timer::FAILED), Some(2_000));
-    assert_eq!(h.elapsed(timer::FAILED), 55);
-    // A gauge at 0 that has not failed.
-    h.gauge = 0;
-    h.gauges[0] = state(GaugeValue(0));
     h.frame(2_100, &[]);
     assert_eq!(h.start_ms(timer::FAILED), None);
+    // The same failure closing the play, Closing starting at its step.
+    h.closing = Some(TimeUs(2_004 * MS));
+    h.frame(2_100, &[]);
+    assert_eq!(h.start_ms(timer::FAILED), Some(2_004));
 }
 
 #[test]

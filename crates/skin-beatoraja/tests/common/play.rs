@@ -356,6 +356,7 @@ impl Drawn {
             layout: &Layout::AUTHOR,
             lanes: self.view,
             playing: true,
+            closing: None,
             readouts: self.readouts.unwrap_or_else(|| readouts_for(self.view)),
         };
         self.skin

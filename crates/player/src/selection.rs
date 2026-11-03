@@ -1267,6 +1267,10 @@ impl PlayerRig<'_> {
 
     /// Before a play's screen is readied (a scenario): the `play` step due
     /// is the one a failure from here to the play's start is named by.
+    /// Once a practice's rounds have all started, the next round is left
+    /// here, at the round boundary, by the quit key, before its attempt is
+    /// prepared or anything opens, so it never plays: the rounds return to
+    /// the practice page however late the game thread takes the key.
     #[cfg(feature = "dev-tools")]
     pub(crate) fn scenario_pending(&mut self) {
         let (Some(sc), Some(script)) = (
@@ -1276,6 +1280,15 @@ impl PlayerRig<'_> {
             return;
         };
         script.announce();
+        if let Some(&SelectStep::Rounds(r)) = script.front()
+            && sc.rounds >= r
+        {
+            sc.rounds = 0;
+            sc.pending = None;
+            script.done();
+            self.controls.command(game::Command::Quit);
+            return;
+        }
         sc.pending = matches!(
             script.front(),
             Some(SelectStep::Play(_) | SelectStep::Rounds(_))
@@ -1302,17 +1315,12 @@ impl PlayerRig<'_> {
                 sc.until = p.until;
                 sc.captures.bind(self.generation);
             }
-            // A practice's round: the one after the last is left at its
-            // start by the quit key, which returns to the practice page.
-            Some(&SelectStep::Rounds(r)) => {
+            // A practice's round, counted; the one after the last is left
+            // before it opens ([`Self::scenario_pending`]).
+            Some(&SelectStep::Rounds(_)) => {
                 sc.until = None;
                 sc.captures.bind(self.generation);
                 sc.rounds = sc.rounds.saturating_add(1);
-                if sc.rounds > r {
-                    sc.rounds = 0;
-                    script.done();
-                    self.controls.command(game::Command::Quit);
-                }
             }
             _ => {
                 script.fail("a play started where this step was due".to_owned());
@@ -1358,10 +1366,10 @@ impl PlayerRig<'_> {
         ) else {
             return;
         };
-        let Some(sent) = sc.sent.take() else {
+        let Some((sent, at)) = sc.sent.take() else {
             return;
         };
-        if let (Some(why), Some(o)) = (sent.missed(report), script.last_done()) {
+        if let (Some(why), Some(o)) = (sent.missed(report, self.autoplay, at), script.last_done()) {
             script.fail_at(o, why);
             self.controls.close();
         }

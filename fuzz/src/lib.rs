@@ -471,6 +471,7 @@ pub fn draw(imported: &Imported, seed: &[u8]) -> Vec<usize> {
             lanes: LANES_OFF,
             readouts: readouts_for(LANES_OFF),
             playing: true,
+            closing: None,
         };
         skin.build(&mut play, &frame, &uvs, &mut batch)
             .expect("the frame builds");
@@ -521,6 +522,7 @@ pub fn draw(imported: &Imported, seed: &[u8]) -> Vec<usize> {
             lanes: frame_lanes,
             readouts,
             playing: true,
+            closing: None,
         };
         skin.build(&mut play, &frame, &uvs, &mut batch)
             .expect("the frame builds");
@@ -616,6 +618,7 @@ fn lane_order_probes(
             lanes: view,
             readouts: readouts_for(view),
             playing: true,
+            closing: None,
         };
         skin.build(&mut play, &frame, uvs, batch)
             .expect("the frame builds");
@@ -697,6 +700,7 @@ fn gauge_probes(
                 lanes: LANES_OFF,
                 readouts: readouts_for(LANES_OFF),
                 playing: true,
+                closing: None,
             };
             skin.build(&mut play, &frame, uvs, batch)
                 .expect("the frame builds");
@@ -819,6 +823,7 @@ pub fn judged_rects(imported: &Imported, full: bool) -> Vec<[f32; 4]> {
             lanes: LANES_OFF,
             readouts: readouts_for(LANES_OFF),
             playing: true,
+            closing: None,
         };
         skin.build(&mut play, &frame, &uvs, &mut batch)
             .expect("the frame builds");
@@ -934,6 +939,7 @@ fn grade_anchor_probes(
                 lanes: view,
                 readouts: readouts_for(view),
                 playing: true,
+                closing: None,
             };
             skin.build(&mut play, &frame, uvs, batch)
                 .expect("the frame builds");
@@ -1104,6 +1110,7 @@ fn digit_probes(
             lanes: LANES_OFF,
             readouts: readouts_for(LANES_OFF),
             playing: true,
+            closing: None,
         };
         skin.build(&mut play, &frame, uvs, batch)
             .expect("the frame builds");
@@ -1188,6 +1195,7 @@ fn long_note_probes(
                 lanes,
                 readouts: readouts_for(lanes),
                 playing: true,
+                closing: None,
             };
             skin.build(&mut play, &frame, uvs, batch)
                 .expect("the frame builds");
@@ -1254,6 +1262,7 @@ fn bar_probes(
             lanes,
             readouts: readouts_for(lanes),
             playing: true,
+            closing: None,
         };
         skin.build(&mut play, &frame, uvs, batch)
             .expect("the frame builds");
@@ -1357,6 +1366,7 @@ fn choice_probes(
             lanes: LANES_OFF,
             readouts: readouts_for(LANES_OFF),
             playing: true,
+            closing: None,
         };
         skin.build(&mut play, &frame, uvs, batch)
             .expect("a consistent snapshot builds");
@@ -1447,6 +1457,7 @@ fn rate_and_kind_probes(
                 lanes: LANES_OFF,
                 readouts: readouts_for(LANES_OFF),
                 playing: true,
+                closing: None,
             };
             skin.build(&mut play, &frame, uvs, batch)
                 .expect("a consistent snapshot builds");
@@ -1719,6 +1730,7 @@ fn readout_probes(
                 lanes,
                 readouts,
                 playing: true,
+                closing: None,
             };
             skin.build(&mut play, &frame, uvs, batch)
                 .expect("consistent readouts build");

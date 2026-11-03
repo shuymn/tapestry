@@ -157,8 +157,9 @@ pub struct PlayStep {
 pub enum UntilCommand {
     /// The retry key: the chart is played again.
     Retry,
-    /// The quit key before the play completes: it ends midway, and its
-    /// result shows.
+    /// The quit key before the play completes: it ends midway, through
+    /// Closing once the chart started outside autoplay, and its result
+    /// shows.
     Quit,
     /// The quit key once the play is complete, its tail still sounding:
     /// the tail is skipped to the result (design.md "Audio tail").
@@ -176,21 +177,78 @@ impl UntilCommand {
     }
 
     /// Why a play that ended as `report` did not land where this command
-    /// says, if it did not.
+    /// says, if it did not. `autoplay`: the play was autoplayed; `sent_at`:
+    /// the play time the key was sent at.
+    ///
+    /// A quit is checked by what the play did, not by when it was asked
+    /// for: the play's own cause is the quit, unless the key came in a
+    /// Closing that had started, where it does nothing (told apart from a
+    /// quit that was taken); Closing follows only a played attempt outside
+    /// autoplay, and must once the play's evaluation finalized its chart's
+    /// start.
+    /// A retry is taken once: the play, its tail or its Closing ended by
+    /// it.
     #[must_use]
-    pub fn missed(self, report: &game::PlayReport) -> Option<&'static str> {
+    pub fn missed(
+        self,
+        report: &game::PlayReport,
+        autoplay: bool,
+        sent_at: TimeUs,
+    ) -> Option<&'static str> {
         let completed = report.end == game::PlayEnd::Completed;
+        let quit = report.end == game::PlayEnd::Aborted(game::AbortCause::Quit);
         match self {
             Self::Quit if completed => Some(
                 "the quit came after the play completed, which skips to its result: \
                  use command = \"skip\"",
             ),
+            Self::Quit if !quit && report.closing.is_some_and(|c| c.started_at <= sent_at) => {
+                Some("the quit came during Closing, where it does nothing")
+            }
+            Self::Quit if !quit => Some("the play ended for another cause before the quit"),
+            Self::Quit if report.closing.is_some() && !may_close(report, autoplay) => {
+                Some("the quit entered Closing in autoplay or before playback, which it never does")
+            }
+            Self::Quit if report.closing.is_none() && must_close(report, autoplay) => {
+                Some("the quit during play did not enter Closing")
+            }
             Self::Skip if !report.tail_skipped => {
                 Some("the play was not complete, its tail still sounding, at at_ms")
             }
+            Self::Retry if !retried(report) => Some("the retry was not taken"),
             Self::Retry | Self::Quit | Self::Skip => None,
         }
     }
+}
+
+/// Whether Closing may follow the quit key that ended `report`'s play: a
+/// played attempt outside autoplay.
+fn may_close(report: &game::PlayReport, autoplay: bool) -> bool {
+    !autoplay && report.played()
+}
+
+/// Whether Closing must follow it: it may, and the play's evaluation had
+/// already finalized its chart's start (a round's section start), so the
+/// quit was taken during play whatever the input side's lag.
+fn must_close(report: &game::PlayReport, autoplay: bool) -> bool {
+    let Some(record) = report.record.as_ref() else {
+        return false;
+    };
+    let start = match &record.play_type {
+        replay::PlayType::Full => TimeUs(0),
+        replay::PlayType::MidChartStart(p) | replay::PlayType::SectionRepeat(p) => p.start,
+    };
+    may_close(report, autoplay) && record.status.finalized >= start
+}
+
+/// Whether the retry key ended `report`'s play, its tail or its Closing.
+fn retried(report: &game::PlayReport) -> bool {
+    let retry = game::AbortCause::Retry;
+    report.end == game::PlayEnd::Aborted(retry)
+        || report.tail_cut == Some(retry)
+        || report
+            .closing
+            .is_some_and(|c| c.end == game::ClosingEnd::Retry)
 }
 
 /// `--dev-scenario`'s arguments.
@@ -667,7 +725,8 @@ fn compile(file: &File, base: &Path, roots: &[(PathBuf, PathBuf)]) -> Result<Com
                     }
                     _ => return Err(at("give either path or search".to_owned())),
                 }
-                // The rounds after the last are counted to its start.
+                // One more than the rounds fits: the count reaches it at the
+                // boundary after the last, where the rounds are left.
                 let n = u16::try_from(p.rounds)
                     .ok()
                     .filter(|&n| n >= 1 && n.checked_add(1).is_some())
@@ -1163,9 +1222,9 @@ pub struct State {
     pub pending: Option<Origin>,
     /// The current play's `until`, until it is sent.
     pub until: Option<(TimeUs, UntilCommand)>,
-    /// The current play's `until` command once sent, until its end is
-    /// checked against it.
-    pub sent: Option<UntilCommand>,
+    /// The current play's `until` command once sent, with the play time
+    /// it was sent at, until its end is checked against it.
+    pub sent: Option<(UntilCommand, TimeUs)>,
     /// The practice page as last shown.
     pub practice: Option<game::PracticeScreen>,
     /// Whether the page was shown since a step last pressed a key on it:
@@ -1273,6 +1332,171 @@ mod tests {
         CaptureState, Captures, InputRef, Origin, PlayStep, SelectStep, StepKind, UntilCommand,
         find, parse, write_new,
     };
+
+    /// A play report ending as `end`, its record finalized at
+    /// `finalized` (none for `None`), with `closing`.
+    fn ended(
+        end: game::PlayEnd,
+        finalized: Option<i64>,
+        closing: Option<game::ClosingReport>,
+    ) -> game::PlayReport {
+        let preset = rules::tapestry();
+        let record = finalized.map(|f| replay::PlayRecord {
+            versions: replay::Versions {
+                evaluator: 1,
+                app: "0.0.0-test".to_owned(),
+                provenance: replay::BuildProvenance::Development,
+            },
+            chart: replay::ChartRecord::default(),
+            preset: replay::PresetRecord::of(&preset),
+            session_policy: "close-on-failure".to_owned(),
+            devices: replay::DeviceRecord {
+                sources: Vec::new(),
+                audio_offset: TimeUs(0),
+                display_offset: TimeUs(0),
+                wake: replay::WakePolicy::Timer {
+                    heartbeat_us: 1_000,
+                },
+            },
+            play_type: replay::PlayType::Full,
+            speed: bms_model::Speed::NORMAL,
+            start: eval::InputStart::default(),
+            events: Vec::new(),
+            arrivals: Vec::new(),
+            status: replay::Status {
+                end: replay::EndStatus::EndedMidway,
+                finalized: TimeUs(f),
+                incomplete: replay::Incomplete::default(),
+            },
+            history: Default::default(),
+        });
+        game::PlayReport {
+            attempt: 1,
+            end,
+            tail_cut: None,
+            tail_skipped: false,
+            closing,
+            reload_error: None,
+            output_error: None,
+            input_error: None,
+            live: Vec::new(),
+            tally: eval::Tally::default(),
+            displayed_gauge: game::GaugeIndex(0),
+            record,
+            saved: None,
+            result: None,
+            best: None,
+            preset,
+        }
+    }
+
+    fn closed(started_at: i64, end: game::ClosingEnd) -> Option<game::ClosingReport> {
+        Some(game::ClosingReport {
+            started_at: TimeUs(started_at),
+            ended_at: TimeUs(started_at + 1_000_000),
+            end,
+        })
+    }
+
+    /// The `until quit` oracle checks what the play did: a quit taken
+    /// during play with Closing, in READY or autoplay without it, whatever
+    /// the gauges; a quit sent into a Closing a failure started is told
+    /// apart as ignored; a quit that should have closed the play and did
+    /// not, or closed one in autoplay, is a miss.
+    #[test]
+    fn the_quit_oracle_reads_the_plays_phase_and_cause() {
+        use game::{AbortCause, ClosingEnd, PlayEnd};
+        let quit = PlayEnd::Aborted(AbortCause::Quit);
+        let failed = PlayEnd::Aborted(AbortCause::GaugeFailed);
+        let ran_out = ClosingEnd::RanOut;
+        let at = TimeUs(1_500_000);
+        let q = UntilCommand::Quit;
+        // Taken during play: Closing.
+        assert_eq!(
+            q.missed(
+                &ended(quit, Some(1_498_000), closed(1_500_000, ran_out)),
+                false,
+                at
+            ),
+            None
+        );
+        // In READY: none.
+        assert_eq!(
+            q.missed(&ended(quit, Some(-2_000), None), false, TimeUs(-1_000)),
+            None
+        );
+        // In autoplay during play: none, and Closing there is a miss.
+        assert_eq!(
+            q.missed(&ended(quit, Some(1_498_000), None), true, at),
+            None
+        );
+        assert!(
+            q.missed(
+                &ended(quit, Some(1_498_000), closed(1_500_000, ran_out)),
+                true,
+                at
+            )
+            .is_some()
+        );
+        // During play with no Closing: a miss.
+        assert_eq!(
+            q.missed(&ended(quit, Some(1_498_000), None), false, at),
+            Some("the quit during play did not enter Closing")
+        );
+        // Sent into the Closing of a failure: ignored, told apart.
+        assert_eq!(
+            q.missed(
+                &ended(failed, Some(1_200_000), closed(1_204_000, ran_out)),
+                false,
+                at
+            ),
+            Some("the quit came during Closing, where it does nothing")
+        );
+        // A failure before the quit, with no Closing.
+        assert_eq!(
+            q.missed(&ended(failed, Some(1_200_000), None), false, at),
+            Some("the play ended for another cause before the quit")
+        );
+    }
+
+    /// The `until retry` oracle wants the retry taken: the play, or its
+    /// Closing, ended by it.
+    #[test]
+    fn the_retry_oracle_wants_the_retry_taken() {
+        use game::{AbortCause, ClosingEnd, PlayEnd};
+        let r = UntilCommand::Retry;
+        let at = TimeUs(1_500_000);
+        let retried = PlayEnd::Aborted(AbortCause::Retry);
+        let failed = PlayEnd::Aborted(AbortCause::GaugeFailed);
+        assert_eq!(
+            r.missed(&ended(retried, Some(1_498_000), None), false, at),
+            None
+        );
+        assert_eq!(
+            r.missed(
+                &ended(
+                    failed,
+                    Some(1_200_000),
+                    closed(1_204_000, ClosingEnd::Retry)
+                ),
+                false,
+                at
+            ),
+            None
+        );
+        assert_eq!(
+            r.missed(
+                &ended(
+                    failed,
+                    Some(1_200_000),
+                    closed(1_204_000, ClosingEnd::RanOut)
+                ),
+                false,
+                at
+            ),
+            Some("the retry was not taken")
+        );
+    }
 
     /// A folder with `library/a/a.bms` and `library/b/b.bms`.
     fn folder() -> tempfile::TempDir {

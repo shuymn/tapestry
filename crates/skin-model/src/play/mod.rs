@@ -266,6 +266,10 @@ pub struct SkinFrame<'a> {
     /// false during READY and after a stop, the finish or the fade
     /// out. A gauge failure during the frame's own update leaves it true.
     pub playing: bool,
+    /// Where the play entered Closing, on its play clock (the play view's
+    /// `closing`): the `failed` timer's start, for the displayed survival
+    /// gauge's failure and the quit key alike; `None` outside Closing.
+    pub closing: Option<TimeUs>,
     /// The render target's size in pixels; the skin computes its canvas
     /// from it.
     pub target: [u32; 2],
@@ -812,6 +816,7 @@ mod tests {
                     notes,
                     complete: false,
                     playing: true,
+                    closing: None,
                     target: [1_920, 1_080],
                     layout: &layout,
                     lanes: VIEW,
@@ -895,6 +900,7 @@ mod tests {
             input: &eval::InputFacts::NONE,
             complete: false,
             playing: true,
+            closing: None,
             target: [1_920, 1_080],
             layout: &layout,
             lanes: VIEW,

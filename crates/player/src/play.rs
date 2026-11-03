@@ -140,7 +140,10 @@ pub struct PlayerRig<'a> {
     pub clock: QpcClock,
     /// What each play records.
     pub recorded: Recorded,
-    /// The gauge to show.
+    /// The gauge to show, by its index in the play preset: from the
+    /// settings until a play's attempt resolves it
+    /// ([`game::Loaded::displayed`]), then the attempt's, for its loading
+    /// gauge and its frames alike.
     pub gauge: usize,
     /// Whether the session plays generated input (design.md "Autoplay"):
     /// no recommended input offset, and "not saved" when nothing was.
@@ -529,6 +532,9 @@ impl PlayerRig<'_> {
                 report.attempt, report.end
             ),
         }
+        if let Some(c) = &report.closing {
+            println!("{}", closing_line(c));
+        }
         match &report.saved {
             Some(Ok(r)) => println!("saved: {}", r.path.display()),
             Some(Err(e)) => eprintln!("not saved: {}", Chain(e)),
@@ -542,6 +548,22 @@ impl PlayerRig<'_> {
             self.times.retry.map_or_else(|| "-".to_owned(), ms)
         );
     }
+}
+
+/// The report's line for a play's Closing (design.md "Play Lifecycle",
+/// Closing): its start on the play clock, how long it lasted and how it
+/// ended.
+pub(crate) fn closing_line(c: &game::ClosingReport) -> String {
+    let end = match c.end {
+        game::ClosingEnd::RanOut => "ran out".to_owned(),
+        game::ClosingEnd::Retry => "retried".to_owned(),
+        game::ClosingEnd::Cut(cause) => format!("cut by {cause:?}"),
+    };
+    format!(
+        "closing: from {} us, {} us, {end}",
+        c.started_at.0,
+        c.ended_at.0.saturating_sub(c.started_at.0)
+    )
 }
 
 /// The render thread's commit of the attempt prepared: while a loading
@@ -631,7 +653,8 @@ impl Rig for PlayerRig<'_> {
         if let Some(sc) = &mut self.scenario
             && let Some(command) = until_fired(&mut sc.until, self.origin, self.clock.now())
         {
-            sc.sent = Some(command);
+            let at = TimeUs(self.clock.now().0 - self.origin.map_or(0, |o| o.0));
+            sc.sent = Some((command, at));
             self.controls.command(command.command());
         }
         #[cfg(feature = "dev-tools")]
@@ -673,6 +696,17 @@ impl Rig for PlayerRig<'_> {
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn take(&mut self) -> Option<Command> {
         let c = self.controls.take();
+        if c == Some(Command::Retry) {
+            self.pending_retry = self.controls.retry_at();
+        }
+        c
+    }
+
+    /// As [`take`](Self::take), with the quit key taken without dropping a
+    /// retry pressed with it ([`Controls::take_closing`]).
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn take_closing(&mut self) -> Option<Command> {
+        let c = self.controls.take_closing();
         if c == Some(Command::Retry) {
             self.pending_retry = self.controls.retry_at();
         }
@@ -765,8 +799,9 @@ impl Rig for PlayerRig<'_> {
     /// at the threads for a failure's cause.
     ///
     /// The loading lifetime's gauge descriptor is replaced first from the
-    /// preset the play refreshed.
+    /// preset the play refreshed, with the gauge the attempt shows.
     fn prepare_attempt(&mut self, loaded: &Loaded) -> Result<Preparation, ScreenError> {
+        self.gauge = loaded.displayed().0;
         refresh_loading_gauge(
             &self.render,
             self.loading_active(),
@@ -1284,6 +1319,36 @@ pub(crate) fn prepare_render(
     *end_page = None;
     render.clear_end();
     render.prepare()
+}
+
+#[cfg(test)]
+mod closing_tests {
+    use bms_model::TimeUs;
+    use game::{AbortCause, ClosingEnd, ClosingReport};
+
+    use super::closing_line;
+
+    /// The Closing line gives its start, its length and its end.
+    #[test]
+    fn the_closing_line_gives_start_length_and_end() {
+        let c = |end| ClosingReport {
+            started_at: TimeUs(2_584_000),
+            ended_at: TimeUs(3_584_000),
+            end,
+        };
+        assert_eq!(
+            closing_line(&c(ClosingEnd::RanOut)),
+            "closing: from 2584000 us, 1000000 us, ran out"
+        );
+        assert_eq!(
+            closing_line(&c(ClosingEnd::Retry)),
+            "closing: from 2584000 us, 1000000 us, retried"
+        );
+        assert_eq!(
+            closing_line(&c(ClosingEnd::Cut(AbortCause::Suspend))),
+            "closing: from 2584000 us, 1000000 us, cut by Suspend"
+        );
+    }
 }
 
 #[cfg(test)]
