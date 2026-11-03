@@ -30,6 +30,7 @@ pub fn all() -> Vec<(&'static str, Vec<Seed>)> {
         ("skin_json", skin_jsons()),
         ("skin_lua", skin_luas()),
         ("skin_fnt", skin_fnts()),
+        ("skin_png", skin_pngs()),
     ]
 }
 
@@ -1711,4 +1712,121 @@ fn configured_fails_entry() -> String {
         r#"{{"type": 0, "property": [{{"name": "m", "item": [{{"op": 901}}]}}, {includes},
         {{"if": 901, "values": {{"include": "none.json"}}}}]}}"#
     )
+}
+
+/// A PNG of `w`×`h` in `color` at `depth`, every sample zero, with the
+/// chunks `before` its image data (a palette and transparency set through
+/// the encoder) and `after` it.
+fn seed_png(
+    [w, h]: [u32; 2],
+    (color, depth): (png::ColorType, png::BitDepth),
+    interlaced: bool,
+    before: &[(&[u8; 4], &[u8])],
+    after: &[(&[u8; 4], &[u8])],
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut enc = png::Encoder::new(&mut out, w, h);
+    enc.set_color(color);
+    enc.set_depth(depth);
+    enc.set_compression(png::Compression::High);
+    for &(kind, data) in before {
+        match kind {
+            b"PLTE" => enc.set_palette(data.to_vec()),
+            b"tRNS" => enc.set_trns(data.to_vec()),
+            _ => {}
+        }
+    }
+    let mut writer = enc.write_header().expect("a PNG header");
+    for &(kind, data) in before {
+        if kind != b"PLTE" && kind != b"tRNS" {
+            writer
+                .write_chunk(png::chunk::ChunkType(*kind), data)
+                .expect("a chunk");
+        }
+    }
+    let bits = color.samples() * depth as usize;
+    let line = (usize::try_from(w).expect("a width") * bits).div_ceil(8);
+    writer
+        .write_image_data(&vec![0; line * usize::try_from(h).expect("a height")])
+        .expect("the image data");
+    for &(kind, data) in after {
+        writer
+            .write_chunk(png::chunk::ChunkType(*kind), data)
+            .expect("a chunk");
+    }
+    writer.finish().expect("the end");
+    if interlaced {
+        // The header's interlace byte and its CRC: the encoder writes only
+        // non-interlaced data, so the refusal comes from the header.
+        out[28] = 1;
+        let crc = crc32(&out[12..29]);
+        out[29..33].copy_from_slice(&crc.to_be_bytes());
+    }
+    out
+}
+
+/// The CRC of a PNG chunk's type and data (ISO 3309, bit by bit).
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFF_u32;
+    for &b in bytes {
+        crc ^= u32::from(b);
+        for _ in 0..8 {
+            crc = if crc & 1 == 1 {
+                (crc >> 1) ^ 0xEDB8_8320
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    !crc
+}
+
+/// `skin_png` seeds: PNGs past the full-decode cap (4097×3073, 12.6 Mi
+/// texels), decoded in bands, in narrow colour types so each stays small
+/// and quick, with a palette, transparency and chunks after the image
+/// data; one cut short; one interlaced, refused; and a small PNG decoded
+/// whole.
+#[must_use]
+pub fn skin_pngs() -> Vec<Seed> {
+    use png::BitDepth::{Eight, Four, One, Two};
+    use png::ColorType::{Grayscale, Indexed};
+    let big = [4_097, 3_073];
+    let palette: Vec<u8> = (0..16_u8).flat_map(|i| [i * 16, 255 - i * 16, 7]).collect();
+    let cut = {
+        let mut p = seed_png(big, (Grayscale, One), false, &[], &[]);
+        p.truncate(p.len() / 2);
+        p
+    };
+    vec![
+        ("grey1", seed_png(big, (Grayscale, One), false, &[], &[])),
+        (
+            "grey2_trns_text",
+            seed_png(
+                big,
+                (Grayscale, Two),
+                false,
+                &[(b"tRNS", &[0, 0])],
+                &[(b"tEXt", b"k\0v")],
+            ),
+        ),
+        (
+            "palette4",
+            seed_png(
+                big,
+                (Indexed, Four),
+                false,
+                &[(b"PLTE", &palette), (b"tRNS", &[0, 128, 255])],
+                &[],
+            ),
+        ),
+        ("cut", cut),
+        (
+            "interlaced",
+            seed_png(big, (Grayscale, One), true, &[], &[]),
+        ),
+        (
+            "small",
+            seed_png([40, 30], (png::ColorType::Rgba, Eight), false, &[], &[]),
+        ),
+    ]
 }

@@ -94,7 +94,7 @@ fn mixed() -> (tempfile::TempDir, Sheet, [u32; 6]) {
             filter: Filter::Linear,
         })
         .unwrap();
-    b.admit_fnt("f.fnt", &mut |_| Ok(())).unwrap();
+    b.admit_fnt("f.fnt", &mut |_| Ok(()), &|| false).unwrap();
     // The same colour and size again: its own image, the same cell.
     let s2 = b.add_solid_image(solid_def([32, 8], half)).unwrap();
     // The page is image 4.
@@ -107,7 +107,7 @@ fn generated_images_keep_their_add_order_and_colours() {
     assert_eq!(ids, [0, 1, 2, 3, 4, 5]);
     assert_eq!((sheet.image_count(), sheet.frame_count()), (6, 6));
     for variant in [Variant::Lo, Variant::Hi] {
-        let a = sheet.atlas(variant, LIMITS).unwrap();
+        let a = sheet.atlas(variant, LIMITS, &|| false).unwrap();
         // [255, 0, 0, 128] premultiplied; a colour with no alpha is all
         // zeros; both through the gutter and every mip level.
         allocation_is(&a, 0, [128, 0, 0, 128]);
@@ -146,7 +146,7 @@ fn a_sheet_of_generated_images_alone_reads_nothing() {
     let sheet = b.finish();
     drop(d);
     for variant in [Variant::Lo, Variant::Hi] {
-        let a = sheet.atlas(variant, LIMITS).unwrap();
+        let a = sheet.atlas(variant, LIMITS, &|| false).unwrap();
         for (frame, c) in (0..).zip([RED, [255, 255, 0, 255], WHITE]) {
             allocation_is(&a, frame, c);
         }

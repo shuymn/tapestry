@@ -4,7 +4,7 @@
 [package]
 name = "fuzz"
 version = "0.0.0"
-description = "Fuzz targets: chart loading, input log decoding, Raw Input packet decoding, canonical preset decoding, skin definition reading and import, Lua skins, and bitmap font parsing."
+description = "Fuzz targets: chart loading, input log decoding, Raw Input packet decoding, canonical preset decoding, skin definition reading and import, Lua skins, bitmap font parsing, and skin images decoded in bands."
 edition = "2024"
 # GPL because it links `input` (design.md "Licenses"). Tooling, never shipped.
 license = "GPL-3.0-or-later"
@@ -81,6 +81,13 @@ bench = false
 [[bin]]
 name = "skin_fnt"
 path = "fuzz_targets/skin_fnt.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "skin_png"
+path = "fuzz_targets/skin_png.rs"
 test = false
 doc = false
 bench = false

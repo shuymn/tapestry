@@ -365,7 +365,7 @@ pub fn draw(imported: &Imported, seed: &[u8]) -> Vec<usize> {
         reserved_layers: 1,
     };
     let uvs = skin
-        .atlas(Variant::Lo, limits)
+        .atlas(Variant::Lo, limits, &|| false)
         .expect("an imported sheet builds its atlas")
         .into_parts()
         .1;
@@ -724,7 +724,7 @@ pub fn judged_rects(imported: &Imported, full: bool) -> Vec<[f32; 4]> {
         reserved_layers: 1,
     };
     let uvs = skin
-        .atlas(Variant::Lo, limits)
+        .atlas(Variant::Lo, limits, &|| false)
         .expect("an imported sheet builds its atlas")
         .into_parts()
         .1;
@@ -2204,6 +2204,112 @@ fn check_usage(i: &Imported) {
         i.skin.digit_offset_count() <= usize::try_from(u.digit_offsets).unwrap_or(usize::MAX),
         "more digit offsets kept than charged"
     );
+}
+
+/// A folder for `skin_png`'s file, rewritten by each input.
+fn png_dir() -> &'static Path {
+    static DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
+    DIR.get_or_init(|| {
+        tempfile::Builder::new()
+            .prefix("tapestry-fuzz-png-")
+            .tempdir()
+            .expect("create an image folder")
+    })
+    .path()
+}
+
+/// What `skin_png` saw.
+#[derive(Debug)]
+pub enum PngOutcome {
+    /// Admission refused the file.
+    Refused(skin_model::ImageError),
+    /// The atlas of its cells, of the file's dimensions, was built.
+    Built([u32; 2]),
+    /// The file was admitted and its atlas refused.
+    Failed([u32; 2], skin_model::AtlasError),
+}
+
+/// Target `skin_png`: an image file's bytes, written to a temporary skin
+/// folder, admitted as an image file (a PNG past the full-decode cap is
+/// decoded in bands) and, when admitted, built into an atlas of five
+/// cells: its corners, a row across its middle and a column down it, each
+/// at most 32 texels. The atlas is built again with a cancel at an ask
+/// the input's length picks: it must be cancelled, or give the same
+/// pages; a cancel never surfaces as another error.
+///
+/// # Panics
+///
+/// If a cancelled build fails otherwise or differs from the first.
+#[must_use]
+pub fn skin_png(data: &[u8]) -> PngOutcome {
+    use skin_model::{AtlasError, AtlasLimits, FileDef, Filter, ImageDef, Root, SheetBuilder};
+    const LIMITS: AtlasLimits = AtlasLimits {
+        max_side: 256,
+        max_layers: 8,
+        reserved_layers: 1,
+    };
+    let dir = png_dir();
+    std::fs::write(dir.join("a.png"), data).expect("write the image");
+    let root = Root::new(dir).expect("the image folder");
+    let mut b = SheetBuilder::new(&root);
+    let file = match b.admit_file(FileDef {
+        path: "a.png".into(),
+        hi: None,
+    }) {
+        Ok(f) => f,
+        Err(skin_model::AdmitError::File(e) | skin_model::AdmitError::Limit(e)) => {
+            return PngOutcome::Refused(e);
+        }
+    };
+    let [w, h] = b.file_dims(file).expect("an admitted file's dimensions");
+    let (cw, ch) = (w.min(32), h.min(32));
+    for rect in [
+        [0, 0, cw, ch],
+        [w - cw, h - ch, cw, ch],
+        [0, h / 2, cw, 1],
+        [w / 2, 0, 1, ch],
+        [w - cw, 0, cw, ch],
+    ] {
+        b.add_image(ImageDef {
+            file,
+            rect: Some(rect),
+            grid: [1, 1],
+            cycle: None,
+            filter: Filter::Linear,
+        })
+        .expect("a cell inside its file");
+    }
+    let sheet = b.finish();
+    let first = sheet.atlas(skin_model::Variant::Lo, LIMITS, &|| false);
+    let at = data.len() % 61 + 1;
+    let asked = std::cell::Cell::new(0);
+    let cancel = || {
+        asked.set(asked.get() + 1);
+        asked.get() >= at
+    };
+    let again = sheet.atlas(skin_model::Variant::Lo, LIMITS, &cancel);
+    match (&first, again) {
+        (_, Err(AtlasError::Cancelled)) => {}
+        (Ok(a), Ok(b)) => {
+            let levels = |x: &skin_model::Atlas| -> Vec<Vec<u8>> {
+                x.pages()
+                    .iter()
+                    .flat_map(|p| (0..skin_model::MIP_LEVELS).filter_map(|k| p.level(k)))
+                    .map(<[u8]>::to_vec)
+                    .collect()
+            };
+            assert!(levels(a) == levels(&b), "a second build differs");
+        }
+        (Err(e), Err(f)) => assert!(
+            e.to_string() == f.to_string(),
+            "a second build fails otherwise: {e} then {f}"
+        ),
+        (first, again) => panic!("a second build differs: {first:?} then {again:?}"),
+    }
+    match first {
+        Ok(_) => PngOutcome::Built([w, h]),
+        Err(e) => PngOutcome::Failed([w, h], e),
+    }
 }
 
 /// Target `skin_fnt`: a bitmap `.fnt` file's bytes, parsed with one

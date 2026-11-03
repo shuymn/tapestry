@@ -21,12 +21,13 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use image::codecs::png::{CompressionType, FilterType, PngEncoder};
 use image::{ExtendedColorType, ImageEncoder, ImageFormat, RgbImage};
 use image_support::{
-    LIMITS, bmp_header, chunk, dir, file, load, load_files, png_header, png_start, save, solid,
-    whole, write,
+    LIMITS, bmp_header, chunk, dir, file, load, load_files, png_header, png_header_with, png_start,
+    save, solid, whole, write,
 };
 use skin_model::{
     AtlasError, AtlasLimits, FileAt, ImageDef, ImageError, MAX_FILE_BYTES, MAX_IMAGE_TEXELS,
-    MAX_TOTAL_FILE_BYTES, MAX_TOTAL_TEXELS, Sheet, Variant,
+    MAX_STREAMED_TEXELS, MAX_TOTAL_FILE_BYTES, MAX_TOTAL_TEXELS, Sheet, TexelCap, Unbanded,
+    Variant,
 };
 
 struct Peak;
@@ -227,13 +228,74 @@ fn headers_are_checked_before_pixels() {
             h: 1
         }
     ));
-    // 4 096 × 3 072 is the texel cap; one more row passes it.
+    // 4 096 × 3 072 is the full-decode texel cap; a PNG one row past it
+    // is admitted to be decoded in bands, up to 8 192 × 8 192; one more
+    // row passes the banded cap.
     assert_eq!(4_096 * 3_072, MAX_IMAGE_TEXELS);
-    write(root, "big.png", &png_header(4_096, 3_073));
-    let err = load_small(root, &["big.png"]).unwrap_err();
-    assert!(matches!(err, ImageError::TooManyTexels { at: AT0 }));
+    assert_eq!(8_192 * 8_192, MAX_STREAMED_TEXELS);
     write(root, "cap.png", &png_header(4_096, 3_072));
     load_small(root, &["cap.png"]).unwrap();
+    write(root, "big.png", &png_header(4_096, 3_073));
+    load_small(root, &["big.png"]).unwrap();
+    write(root, "banded.png", &png_header(8_192, 8_192));
+    load_small(root, &["banded.png"]).unwrap();
+    write(root, "huge.png", &png_header(8_192, 8_193));
+    let err = load_small(root, &["huge.png"]).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            ImageError::TooManyTexels {
+                at: AT0,
+                cap: TexelCap::Banded
+            }
+        ),
+        "{err:?}"
+    );
+    // Past the full-decode cap, an interlaced or animated PNG, a JPEG and
+    // a BMP are refused, each with its reason; at the cap they are not.
+    let actl = chunk(b"acTL", &[0, 0, 0, 1, 0, 0, 0, 0]);
+    let cases: [(&str, Vec<u8>, Vec<u8>, Unbanded); 4] = [
+        (
+            "adam7.png",
+            png_header_with(4_096, 3_073, true, &[]),
+            png_header_with(4_096, 3_072, true, &[]),
+            Unbanded::Interlaced,
+        ),
+        (
+            "anim.png",
+            png_header_with(4_096, 3_073, false, &actl),
+            png_header_with(4_096, 3_072, false, &actl),
+            Unbanded::Animated,
+        ),
+        (
+            "big.jpg",
+            jpeg_sized(4_096, 3_073),
+            jpeg_sized(4_096, 3_072),
+            Unbanded::Format,
+        ),
+        (
+            "big.bmp",
+            bmp_header(4_096, 3_073),
+            bmp_header(4_096, 3_072),
+            Unbanded::Format,
+        ),
+    ];
+    for (name, over, at_cap, why) in cases {
+        write(root, name, &over);
+        let err = load_small(root, &[name]).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ImageError::TooManyTexels {
+                    at: AT0,
+                    cap: TexelCap::FullDecode(w)
+                } if w == why
+            ),
+            "{name}: {err:?}"
+        );
+        write(root, name, &at_cap);
+        load_small(root, &[name]).unwrap();
+    }
     // Ten at the cap and one of 8 Mi fill the total; one texel more
     // passes it.
     write(root, "rest.png", &png_header(4_096, 2_048));
@@ -259,12 +321,6 @@ fn headers_are_checked_before_pixels() {
     let err = load_small(root, &["wide.bmp"]).unwrap_err();
     assert!(
         matches!(err, ImageError::TooWide { at: AT0, .. }),
-        "{err:?}"
-    );
-    write(root, "big.bmp", &bmp_header(4_096, 4_096));
-    let err = load_small(root, &["big.bmp"]).unwrap_err();
-    assert!(
-        matches!(err, ImageError::TooManyTexels { at: AT0 }),
         "{err:?}"
     );
     write(root, "zero.png", &png_header(0, 4));
@@ -302,6 +358,19 @@ fn jpeg_frame_at(at: usize) -> Vec<u8> {
     out
 }
 
+/// An 8×8 JPEG whose frame header declares `w`×`h`.
+fn jpeg_sized(w: u16, h: u16) -> Vec<u8> {
+    let mut out = jpeg_frame_at(0);
+    let sof = out
+        .windows(2)
+        .position(|m| m == [0xFF, 0xC0])
+        .expect("a baseline frame header");
+    // Marker, length, precision, then height and width.
+    out[sof + 5..sof + 7].copy_from_slice(&h.to_be_bytes());
+    out[sof + 7..sof + 9].copy_from_slice(&w.to_be_bytes());
+    out
+}
+
 #[test]
 fn a_header_must_lie_within_its_first_mebibyte() {
     let d = dir();
@@ -323,7 +392,7 @@ fn a_header_must_lie_within_its_first_mebibyte() {
     );
     write(root, "early.jpg", &jpeg_frame_at((1 << 20) - 100));
     let sheet = load_small(root, &["early.jpg"]).unwrap();
-    sheet.atlas(Variant::Lo, LIMITS).unwrap();
+    sheet.atlas(Variant::Lo, LIMITS, &|| false).unwrap();
 }
 
 #[test]
@@ -344,18 +413,25 @@ fn atlas_caps_come_before_its_pages() {
         reserved_layers: 1,
     };
     let page = 256 * 256 * 4;
-    let (err, peak) = measure(|| sheet.atlas(Variant::Lo, limits).unwrap_err());
+    let (err, peak) = measure(|| sheet.atlas(Variant::Lo, limits, &|| false).unwrap_err());
     assert!(matches!(err, AtlasError::TooManyPages), "{err:?}");
     assert!(peak < page, "peak {peak}");
     let roomier = AtlasLimits {
         max_layers: 3,
         ..limits
     };
-    assert_eq!(sheet.atlas(Variant::Lo, roomier).unwrap().pages().len(), 2);
+    assert_eq!(
+        sheet
+            .atlas(Variant::Lo, roomier, &|| false)
+            .unwrap()
+            .pages()
+            .len(),
+        2
+    );
     // 250 texels pad to 272, past a 256 side.
     save(root, "b.png", &solid(250, 4, [255; 4]));
     let sheet = load_files(root, &["b.png"]).unwrap();
-    let (err, peak) = measure(|| sheet.atlas(Variant::Lo, limits).unwrap_err());
+    let (err, peak) = measure(|| sheet.atlas(Variant::Lo, limits, &|| false).unwrap_err());
     assert!(
         matches!(err, AtlasError::CellTooLarge { w: 250, h: 4 }),
         "{err:?}"
@@ -378,7 +454,10 @@ fn atlas_caps_come_before_its_pages() {
         },
     ] {
         assert!(
-            matches!(sheet.atlas(Variant::Lo, bad), Err(AtlasError::Limits)),
+            matches!(
+                sheet.atlas(Variant::Lo, bad, &|| false),
+                Err(AtlasError::Limits)
+            ),
             "{bad:?}"
         );
     }
@@ -390,7 +469,7 @@ fn a_file_whose_dimensions_changed_is_refused() {
     save(d.path(), "a.png", &solid(4, 4, [255; 4]));
     let sheet = load_files(d.path(), &["a.png"]).unwrap();
     save(d.path(), "a.png", &solid(5, 4, [255; 4]));
-    let err = sheet.atlas(Variant::Lo, LIMITS).unwrap_err();
+    let err = sheet.atlas(Variant::Lo, LIMITS, &|| false).unwrap_err();
     assert!(
         matches!(
             err,
@@ -412,7 +491,7 @@ fn files_grown_since_load_are_charged_again() {
         .open(root.join("a.png"))
         .unwrap();
     f.set_len(MAX_FILE_BYTES + 1).unwrap();
-    let err = sheet.atlas(Variant::Lo, LIMITS).unwrap_err();
+    let err = sheet.atlas(Variant::Lo, LIMITS, &|| false).unwrap_err();
     assert!(
         matches!(err, AtlasError::Image(ImageError::FileTooLarge { at: AT0 })),
         "{err:?}"
@@ -429,7 +508,7 @@ fn files_grown_since_load_are_charged_again() {
         f.set_len(MAX_FILE_BYTES).unwrap();
     }
     const { assert!(17 * MAX_FILE_BYTES > MAX_TOTAL_FILE_BYTES) };
-    let err = sheet.atlas(Variant::Lo, LIMITS).unwrap_err();
+    let err = sheet.atlas(Variant::Lo, LIMITS, &|| false).unwrap_err();
     assert!(
         matches!(
             err,
@@ -466,7 +545,7 @@ fn one_file_decodes_within_its_bound() {
         ..whole(0)
     };
     let sheet = load(d.path(), vec![file("deep.png")], vec![corner]).unwrap();
-    let (atlas, peak) = measure(|| sheet.atlas(Variant::Lo, LIMITS).unwrap());
+    let (atlas, peak) = measure(|| sheet.atlas(Variant::Lo, LIMITS, &|| false).unwrap());
     assert_eq!(atlas.side(), 256);
     // One page of 256 with its mips, then the file: the larger of the
     // encoded bytes beside the native image (8 B a texel) and the native
@@ -481,4 +560,165 @@ fn one_file_decodes_within_its_bound() {
     );
     // The bound is reached: the conversion did run beside the native image.
     assert!(peak >= 12 * texels, "peak {peak}");
+}
+
+/// Writes a `w`×`h` 8-bit RGBA PNG at `path`, row by row, texel `(x, y)`
+/// the colour `texel` gives; each row filtered against the one above, so
+/// rows that repeat compress to almost nothing.
+fn stream_png(path: &std::path::Path, w: u32, h: u32, texel: impl Fn(u32, u32) -> [u8; 4]) {
+    let f = std::io::BufWriter::new(File::create(path).unwrap());
+    let mut enc = png::Encoder::new(f, w, h);
+    enc.set_color(png::ColorType::Rgba);
+    enc.set_depth(png::BitDepth::Eight);
+    enc.set_compression(png::Compression::Fast);
+    enc.set_filter(png::Filter::Up);
+    let mut header = enc.write_header().unwrap();
+    let mut out = header.stream_writer().unwrap();
+    let mut row = Vec::with_capacity(usize::try_from(w).unwrap() * 4);
+    for y in 0..h {
+        row.clear();
+        row.extend((0..w).flat_map(|x| texel(x, y)));
+        out.write_all(&row).unwrap();
+    }
+    out.finish().unwrap();
+}
+
+/// The bytes of `pages` pages of `side` with their mips.
+fn page_bytes(pages: usize, side: u32) -> i64 {
+    let side = i64::from(side);
+    let one: i64 = (0..4).map(|k| (side >> k) * (side >> k) * 4).sum();
+    i64::try_from(pages).unwrap() * one
+}
+
+/// The bound a file decoded in bands stays within beside the pages:
+/// `W_band = max(2E, E + 16 MiB)` for `E` encoded bytes, plus the 1 MiB
+/// margin the whole-file bound keeps for the tables. The 16 MiB holds
+/// `png`'s own count (its metadata and output row, within its 1 MiB
+/// limit), its window of filtered rows (128 KiB at first, growing by rows
+/// of at most 128 KiB + 1 at 16 384 texels of 16-bit RGBA, with the old
+/// and new buffers live together while it grows), the inflater's tables
+/// (about 18 KiB), the 1 KiB palette table, one expanded row, one band
+/// native beside its RGBA8 copy (16 rows × 16 384 texels × (8 + 4) B =
+/// 3 MiB at the widest) and the routing index (at most 65 536 cells).
+fn banded_bound(encoded: i64) -> i64 {
+    (2 * encoded).max(encoded + 16 * MIB) + MIB
+}
+
+const LIMITS_8K: AtlasLimits = AtlasLimits {
+    max_side: 8_192,
+    max_layers: 2,
+    reserved_layers: 1,
+};
+
+/// The memory witness for a file decoded in bands: a 6400×7941 RGBA8
+/// sheet of 55 frames of 1280×720 (five a row, eleven rows, 21 rows
+/// below them unused), 48.5 Mi texels, more than 4 × the full-decode
+/// cap. Decoded whole it would hold its RGBA8 image, 194 MiB; in bands
+/// the build peaks at the pages beside
+/// `W_band = max(2E, E + 16 MiB) + 1 MiB` ([`banded_bound`]): with `E`
+/// about 0.1 MiB here, 16.1 MiB + 1 MiB. Each frame, padded to 1296×736,
+/// packs six a row and eleven rows deep in one page of 8 192, whose four
+/// levels hold 256 + 64 + 16 + 4 MiB.
+#[test]
+fn a_sheet_past_the_full_decode_cap_decodes_in_bands_within_its_bound() {
+    let d = dir();
+    let (w, h) = (6_400_u32, 7_941_u32);
+    let (cw, ch) = (1_280_u32, 720_u32);
+    assert!(u64::from(w) * u64::from(h) > 4 * MAX_IMAGE_TEXELS);
+    // Frame `(c, r)` is one colour, half transparent in odd frames; its
+    // first column marks its index.
+    let colour = |c: u32, r: u32| {
+        let i = u8::try_from(r * 5 + c).unwrap();
+        [i * 4, 255 - i, 77, if i % 2 == 1 { 128 } else { 255 }]
+    };
+    stream_png(&d.path().join("close.png"), w, h, |x, y| {
+        colour((x / cw).min(4), (y / ch).min(10))
+    });
+    let encoded =
+        i64::try_from(std::fs::metadata(d.path().join("close.png")).unwrap().len()).unwrap();
+    let frames = ImageDef {
+        rect: Some([0, 0, 5 * cw, 11 * ch]),
+        grid: [5, 11],
+        ..whole(0)
+    };
+    let sheet = load(d.path(), vec![file("close.png")], vec![frames]).unwrap();
+    let (atlas, peak) = measure(|| sheet.atlas(Variant::Lo, LIMITS_8K, &|| false).unwrap());
+    let pages = page_bytes(atlas.pages().len(), atlas.side());
+    let bound = pages + banded_bound(encoded);
+    assert!(
+        peak <= bound,
+        "peak {peak}, bound {bound}, encoded {encoded}"
+    );
+    // The encoded bytes were live beside the pages.
+    assert!(peak >= pages + encoded, "peak {peak}");
+    // Every frame holds its colour, premultiplied, at its first texel.
+    assert_eq!(sheet.frame_count(), 55);
+    let side = atlas.side();
+    for (i, f) in atlas.uvs().frames().iter().enumerate() {
+        let i = u32::try_from(i).unwrap();
+        let [r, g, b, a] = colour(i % 5, i / 5);
+        let pre = |c: u8| u8::try_from((u32::from(c) * u32::from(a) + 127) / 255).unwrap();
+        let page = &atlas.pages()[usize::from(f.layer) - 1];
+        let (x, y) = (
+            (f.uv[0] * side as f32) as usize,
+            (f.uv[1] * side as f32) as usize,
+        );
+        let at = (y * side as usize + x) * 4;
+        assert_eq!(
+            page.level(0).unwrap()[at..at + 4],
+            [pre(r), pre(g), pre(b), a],
+            "frame {i}"
+        );
+    }
+}
+
+/// Routing keeps a window of the cells a band crosses: 1,100 cells of
+/// 1×4000, each its own column of a 1100×12000 file decoded in bands, a
+/// third of them crossing every band, decode within the same bound, each
+/// cell its column's colour from its first row to its last.
+#[test]
+fn many_tall_thin_cells_route_within_the_bound() {
+    let d = dir();
+    let (w, h) = (1_100_u32, 12_000_u32);
+    assert!(u64::from(w) * u64::from(h) > MAX_IMAGE_TEXELS);
+    let colour = |x: u32, y: u32| {
+        let [lo, hi] = u16::try_from(x).unwrap().to_le_bytes();
+        [lo, hi, u8::try_from(y / 4_000).unwrap(), 255]
+    };
+    stream_png(&d.path().join("thin.png"), w, h, colour);
+    let encoded =
+        i64::try_from(std::fs::metadata(d.path().join("thin.png")).unwrap().len()).unwrap();
+    let images = (0..w)
+        .map(|x| ImageDef {
+            rect: Some([x, (x % 3) * 4_000, 1, 4_000]),
+            ..whole(0)
+        })
+        .collect();
+    let sheet = load(d.path(), vec![file("thin.png")], images).unwrap();
+    // Two pages of 8 192 and no reserved layer: the 128 Mi texel cap.
+    let limits = AtlasLimits {
+        max_side: 8_192,
+        max_layers: 2,
+        reserved_layers: 0,
+    };
+    let (atlas, peak) = measure(|| sheet.atlas(Variant::Lo, limits, &|| false).unwrap());
+    let pages = page_bytes(atlas.pages().len(), atlas.side());
+    let bound = pages + banded_bound(encoded);
+    assert!(
+        peak <= bound,
+        "peak {peak}, bound {bound}, encoded {encoded}"
+    );
+    let side = atlas.side() as usize;
+    for (x, f) in (0_u32..).zip(atlas.uvs().frames()) {
+        let page = atlas.pages()[usize::from(f.layer)].level(0).unwrap();
+        let (u, v0, v1) = (
+            (f.uv[0] * side as f32) as usize,
+            (f.uv[1] * side as f32) as usize,
+            (f.uv[3] * side as f32) as usize,
+        );
+        for v in [v0, v1 - 1] {
+            let at = (v * side + u) * 4;
+            assert_eq!(page[at..at + 4], colour(x, (x % 3) * 4_000), "cell {x}");
+        }
+    }
 }

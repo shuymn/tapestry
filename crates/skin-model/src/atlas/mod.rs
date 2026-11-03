@@ -17,8 +17,11 @@ mod mip;
 mod pack;
 pub(crate) mod uv;
 
+use ::image::RgbaImage;
+
+use crate::image::decode::{self, Bands, Site};
 use crate::image::path;
-use crate::image::{self, decode};
+use crate::image::{self, Stop};
 use crate::image::{CellSource, FileAt, ImageError, MAX_FILE_BYTES, MAX_TOTAL_FILE_BYTES, Sheet};
 use pack::PackError;
 use uv::{FrameUv, UvTable};
@@ -73,6 +76,18 @@ pub enum AtlasError {
     Misaligned,
     #[error(transparent)]
     Image(#[from] ImageError),
+    /// The build was cancelled: neither a file's failure nor a limit.
+    #[error("the atlas build was cancelled")]
+    Cancelled,
+}
+
+impl From<Stop> for AtlasError {
+    fn from(s: Stop) -> Self {
+        match s {
+            Stop::Cancelled => Self::Cancelled,
+            Stop::Image(e) => Self::Image(e),
+        }
+    }
 }
 
 /// One page: its mip levels, each RGBA8, premultiplied, row by row.
@@ -164,14 +179,28 @@ impl Sheet {
     /// every file to be read again (its path, at most [`MAX_FILE_BYTES`],
     /// and at most [`MAX_TOTAL_FILE_BYTES`] across them), and reads and
     /// decodes one file at a time, each into memory freed before the next:
-    /// a file whose dimensions changed since load is refused. Generated
-    /// cells ([`SolidImageDef`](crate::SolidImageDef)) are written last,
-    /// at one size in both variants, reading nothing.
+    /// whole, or in bands of rows when it was admitted to be
+    /// ([`MAX_STREAMED_TEXELS`](crate::MAX_STREAMED_TEXELS)), each band
+    /// written to every cell it crosses. A file whose dimensions, or for
+    /// one decoded in bands its format or header fields, changed since
+    /// load is refused. Generated cells
+    /// ([`SolidImageDef`](crate::SolidImageDef)) are written last, at one
+    /// size in both variants, reading nothing.
+    ///
+    /// `cancel` is asked as each file's bytes are read, before each band
+    /// and each read after a banded file's rows, and before each page's
+    /// mip level.
     ///
     /// # Errors
     ///
-    /// The first check that fails.
-    pub fn atlas(&self, variant: Variant, limits: AtlasLimits) -> Result<Atlas, AtlasError> {
+    /// The first check that fails; [`AtlasError::Cancelled`] once `cancel`
+    /// said so.
+    pub fn atlas(
+        &self,
+        variant: Variant,
+        limits: AtlasLimits,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<Atlas, AtlasError> {
         let max_pages = page_cap(&limits)?;
         let cap = pack::side_cap(limits.max_side.min(MAX_PAGE_SIDE));
         let files = self.files();
@@ -222,9 +251,10 @@ impl Sheet {
             });
         }
 
-        self.fill(variant, &rects, &packing, &mut pages)?;
+        self.fill(variant, &rects, &packing, &mut pages, cancel)?;
         for page in &mut pages {
             for k in 1..MIP_LEVELS {
+                decode::checkpoint(cancel, Site::Mip).map_err(|_| AtlasError::Cancelled)?;
                 let (done, rest) = page.levels.split_at_mut(k);
                 if let (Some(src), Some(dst)) = (done.last(), rest.first_mut()) {
                     let src_side = side >> (k - 1);
@@ -265,6 +295,7 @@ impl Sheet {
         rects: &[[u32; 4]],
         packing: &pack::Packing,
         pages: &mut [Page],
+        cancel: &dyn Fn() -> bool,
     ) -> Result<(), AtlasError> {
         let files = self.files();
         let cells = self.cells();
@@ -296,28 +327,29 @@ impl Sheet {
             if total > MAX_TOTAL_FILE_BYTES {
                 return Err(ImageError::TotalBytesTooLarge { at }.into());
             }
-            resolved.push((at, canonical, version.dims));
+            resolved.push((at, canonical, (version.dims, version.mode)));
         }
 
+        // The placements of one file's cells, reused across files.
+        let mut places = Vec::new();
+        let mut active = Vec::new();
         let mut budget = MAX_TOTAL_FILE_BYTES;
-        for ((at, canonical, dims), &(_, start, end)) in resolved.into_iter().zip(&used) {
-            let bytes = image::read_encoded(&canonical, at, MAX_FILE_BYTES.min(budget))?;
+        for ((at, canonical, header), &(_, start, end)) in resolved.into_iter().zip(&used) {
+            let bytes = image::read_encoded(&canonical, at, MAX_FILE_BYTES.min(budget), cancel)?;
             budget = budget.saturating_sub(u64::try_from(bytes.len()).unwrap_or(budget));
-            let image = decode::decode(bytes, dims).map_err(|e| ImageError::decode(at, e))?;
-            for i in start..end {
-                let (Some(place), Some(&rect)) = (packing.places.get(i), rects.get(i)) else {
-                    continue;
-                };
-                let Some(page) = usize::try_from(place.page)
-                    .ok()
-                    .and_then(|p| pages.get_mut(p))
-                else {
-                    continue;
-                };
-                let Some(level) = page.levels.first_mut() else {
-                    continue;
-                };
-                mip::blit(level, packing.side, &image, rect, place.alloc);
+            places.clear();
+            places.extend((start..end).filter_map(|i| {
+                let place = packing.places.get(i)?;
+                Some(Placement {
+                    rect: *rects.get(i)?,
+                    page: usize::try_from(place.page).ok()?,
+                    alloc: place.alloc,
+                })
+            }));
+            let mut router = Router::new(&mut places, &mut active, pages, packing.side);
+            match image::decode_file(bytes, at, header, cancel, &mut router)? {
+                Some(image) => router.blit(&image),
+                None => router.complete(),
             }
         }
 
@@ -331,13 +363,159 @@ impl Sheet {
             };
             let Some(level) = usize::try_from(place.page)
                 .ok()
-                .and_then(|p| pages.get_mut(p))
-                .and_then(|page| page.levels.first_mut())
+                .and_then(|p| level0(pages, p))
             else {
                 continue;
             };
             mip::blit_solid(level, packing.side, color, place.alloc);
         }
         Ok(())
+    }
+}
+
+/// Page `page`'s level 0.
+fn level0(pages: &mut [Page], page: usize) -> Option<&mut Vec<u8>> {
+    pages.get_mut(page)?.levels.first_mut()
+}
+
+/// Where one cell of a file goes: its rectangle in the file, its page and
+/// its allocation there.
+#[derive(Clone, Copy, Debug)]
+struct Placement {
+    rect: [u32; 4],
+    page: usize,
+    alloc: [u32; 4],
+}
+
+impl Placement {
+    fn top(&self) -> u32 {
+        self.rect[1]
+    }
+
+    /// The row past the cell's last.
+    fn bottom(&self) -> u32 {
+        self.rect[1].saturating_add(self.rect[3])
+    }
+}
+
+/// Routes a file's bands to its cells: the placements in order of their
+/// first row, and a window of the ones the current band crosses, entered
+/// at their first row and left after their last, so the routing holds
+/// O(cells) and does O(cells + rows) work besides the texels it writes.
+struct Router<'a> {
+    places: &'a [Placement],
+    /// The next placement to enter, by first row.
+    next: usize,
+    /// The window: indices into `places`.
+    active: &'a mut Vec<usize>,
+    pages: &'a mut [Page],
+    side: u32,
+}
+
+impl<'a> Router<'a> {
+    fn new(
+        places: &'a mut [Placement],
+        active: &'a mut Vec<usize>,
+        pages: &'a mut [Page],
+        side: u32,
+    ) -> Self {
+        places.sort_unstable_by_key(Placement::top);
+        active.clear();
+        Self {
+            places,
+            next: 0,
+            active,
+            pages,
+            side,
+        }
+    }
+
+    /// Writes a whole file's every placement.
+    fn blit(self, image: &RgbaImage) {
+        for p in self.places {
+            if let Some(level) = level0(self.pages, p.page) {
+                mip::blit(level, self.side, image, p.rect, p.alloc);
+            }
+        }
+    }
+
+    /// Completes every placement's allocation once all its rows are
+    /// written: its first and last rows repeated through the gutter and
+    /// the alignment padding, as [`mip::blit`] fills them.
+    fn complete(self) {
+        for p in self.places {
+            if let Some(level) = level0(self.pages, p.page) {
+                mip::complete(level, self.side, p.rect[3], p.alloc);
+            }
+        }
+    }
+}
+
+impl Bands for Router<'_> {
+    fn wants(&mut self, top: u32, bottom: u32) -> bool {
+        let places = self.places;
+        self.active
+            .retain(|&i| places.get(i).is_some_and(|p| p.bottom() > top));
+        while let Some(p) = places.get(self.next)
+            && p.top() < bottom
+        {
+            if p.bottom() > top {
+                self.active.push(self.next);
+            }
+            self.next += 1;
+        }
+        !self.active.is_empty()
+    }
+
+    fn put(&mut self, top: u32, band: &RgbaImage) {
+        for &i in self.active.iter() {
+            let Some(p) = self.places.get(i) else {
+                continue;
+            };
+            if let Some(level) = level0(self.pages, p.page) {
+                mip::scatter(level, self.side, band, top, p.rect, p.alloc);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_window_holds_the_cells_a_band_crosses() {
+        // Cells of rows 0..40, 10..20 and 30..60, out of order.
+        let mut places: Vec<Placement> = [[0, 30, 1, 30], [0, 0, 1, 40], [0, 10, 1, 10]]
+            .into_iter()
+            .map(|rect| Placement {
+                rect,
+                page: 0,
+                alloc: [0, 0, 24, 80],
+            })
+            .collect();
+        let mut active = Vec::new();
+        let mut router = Router::new(&mut places, &mut active, &mut [], 256);
+        let mut seen = Vec::new();
+        for top in (0..64).step_by(16) {
+            let wants = router.wants(top, top + 16);
+            let mut tops: Vec<u32> = router
+                .active
+                .iter()
+                .map(|&i| router.places[i].top())
+                .collect();
+            tops.sort_unstable();
+            seen.push((wants, tops));
+        }
+        assert_eq!(
+            seen,
+            [
+                (true, vec![0, 10]),
+                (true, vec![0, 10, 30]),
+                (true, vec![0, 30]),
+                (true, vec![30]),
+            ]
+        );
+        assert!(!router.wants(64, 80));
     }
 }

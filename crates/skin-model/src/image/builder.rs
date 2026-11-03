@@ -14,6 +14,7 @@ use std::io::Read as _;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 
+use super::decode::Bands;
 use super::fnt::{
     Fnt, FntError, FntErrorKind, FntFile, FntLimits, FntPage, MAX_FNT_BYTES, MAX_FONT_GLYPHS,
     MAX_FONT_KERNINGS, MAX_SHEET_GLYPHS, MAX_SHEET_KERNINGS,
@@ -22,9 +23,9 @@ use super::font::{self, FontDef, FontError, MAX_FONTS, MAX_TOTAL_FONT_BYTES};
 use super::path::{self, PathError, Root};
 use super::{
     Cell, File, FileAt, FileDef, Image, ImageDef, ImageError, MAX_FILE_BYTES, MAX_FILES,
-    MAX_IMAGE_TEXELS, MAX_IMAGES, MAX_SIDE, NEXT_SHEET, Sheet, SolidImageDef, Total, Version,
-    add_frames, check_cycle, checked_header, cut, decode, image_frames, push_frames, push_solid,
-    read_encoded, read_file, renumber, resolve_file, texels,
+    MAX_IMAGE_TEXELS, MAX_IMAGES, MAX_SIDE, NEXT_SHEET, Sheet, SolidImageDef, Stop, Total, Version,
+    add_frames, check_cycle, checked_header, cut, decode_file, image_frames, push_frames,
+    push_solid, read_encoded, read_file, renumber, resolve_file, texels,
 };
 use crate::quad::Filter;
 use crate::widget::text::MAX_TEXT_ELEMENTS;
@@ -142,6 +143,10 @@ pub enum FntAdmitError {
     Limit(FntLimit),
     #[error(transparent)]
     File(FntFileError),
+    /// The admission was cancelled while it validated a page: neither the
+    /// file's failure nor a limit.
+    #[error("the admission was cancelled")]
+    Cancelled,
 }
 
 /// Why [`SheetBuilder::add_bitmap_font`] refused a bitmap font.
@@ -169,14 +174,35 @@ fn page_error(page: usize, e: ImageError) -> FntAdmitError {
     let kind = match e {
         ImageError::Missing { .. } => FntErrorKind::PageMissing { page },
         ImageError::Decode { .. }
+        | ImageError::Png { .. }
         | ImageError::Io { .. }
-        | ImageError::DimensionsChanged { .. } => FntErrorKind::PageBroken { page },
+        | ImageError::DimensionsChanged { .. }
+        | ImageError::HeaderChanged { .. } => FntErrorKind::PageBroken { page },
         _ => FntErrorKind::PageRefused { page },
     };
     FntAdmitError::File(FntFileError::Page {
         error: FntError { line: 0, kind },
         source: e,
     })
+}
+
+/// Page `page`'s validation stopped: cancelled, or failed ([`page_error`]).
+fn page_stop(page: usize, s: Stop) -> FntAdmitError {
+    match s {
+        Stop::Cancelled => FntAdmitError::Cancelled,
+        Stop::Image(e) => page_error(page, e),
+    }
+}
+
+/// A page validated in bands: decoded, never converted.
+struct Validate;
+
+impl Bands for Validate {
+    fn wants(&mut self, _: u32, _: u32) -> bool {
+        false
+    }
+
+    fn put(&mut self, _: u32, _: &::image::RgbaImage) {}
 }
 
 /// The folder part of a skin-relative name, `""` for none.
@@ -384,7 +410,10 @@ impl SheetBuilder {
     /// Admits a bitmap font file `name` and its pages, returning its index
     /// among the `.fnt` files. `charge` is called immediately before each
     /// guarded piece of work; a refusal aborts with [`FntLimit::Charge`],
-    /// and what it charged before stays charged.
+    /// and what it charged before stays charged. `cancel` is asked while
+    /// the pages are validated: as each page's bytes are read, and for a
+    /// page decoded in bands, before each band and each read after its
+    /// rows.
     ///
     /// In order: a font slot (outline fonts and `.fnt` files at most
     /// [`MAX_FONTS`]); a file attempt (shared with
@@ -398,8 +427,10 @@ impl SheetBuilder {
     /// attempt, metadata, byte totals, image and frame; then each header
     /// and the texel totals; then every glyph inside its page; then each
     /// page decoded and dropped, one at a time, so a corrupt page fails
-    /// this font rather than the atlas. Each page becomes a whole-file
-    /// image of one frame, filtered linearly.
+    /// this font rather than the atlas: whole, or in bands of rows when it
+    /// was admitted to be ([`MAX_STREAMED_TEXELS`](super::MAX_STREAMED_TEXELS)).
+    /// Each page becomes a whole-file image of one frame, filtered
+    /// linearly.
     ///
     /// On any failure the builder is as it was, but for the attempts and
     /// the font bytes spent.
@@ -409,11 +440,13 @@ impl SheetBuilder {
     /// [`FntAdmitError::Limit`] for a refused charge and every aggregate
     /// limit, the sheet's glyph and kerning totals included (also when the
     /// file's own cap is reached at the same glyph or pair);
-    /// [`FntAdmitError::File`] for this file alone.
+    /// [`FntAdmitError::File`] for this file alone;
+    /// [`FntAdmitError::Cancelled`] once `cancel` said so.
     pub fn admit_fnt(
         &mut self,
         name: &str,
         charge: &mut dyn FnMut(Charge) -> Result<(), Refused>,
+        cancel: &dyn Fn() -> bool,
     ) -> Result<u16, FntAdmitError> {
         let limit = FntAdmitError::Limit;
         let file_err = |e| FntAdmitError::File(FntFileError::Fnt(e));
@@ -500,16 +533,16 @@ impl SheetBuilder {
                 file: first + p,
                 hi: false,
             };
-            let d = checked_header(at, resolved).map_err(|e| page_error(p, e))?;
+            let (d, mode) = checked_header(at, resolved).map_err(|e| page_error(p, e))?;
             lo_texels = lo_texels.with(texels(d)).ok_or(limit(FntLimit::Texels))?;
             hi_texels = hi_texels.with(texels(d)).ok_or(limit(FntLimit::Texels))?;
-            dims.push(d);
+            dims.push((d, mode));
         }
         for g in file.glyphs().iter().chain(file.missing().as_ref()) {
             let [x, y, w, h] = g.src.map(u32::from);
             let inside = dims
                 .get(usize::from(g.page))
-                .is_some_and(|&[pw, ph]| x + w <= pw && y + h <= ph);
+                .is_some_and(|&([pw, ph], _)| x + w <= pw && y + h <= ph);
             if !inside {
                 return Err(file_err(FntError {
                     line: 0,
@@ -520,24 +553,26 @@ impl SheetBuilder {
 
         // Every page decodes, one at a time, so a corrupt page fails this
         // font here rather than the atlas later.
-        for (p, (resolved, &d)) in paths.iter().zip(&dims).enumerate() {
+        for (p, (resolved, &header)) in paths.iter().zip(&dims).enumerate() {
             let at = FileAt {
                 file: first + p,
                 hi: false,
             };
-            let bytes = read_encoded(resolved, at, MAX_FILE_BYTES).map_err(|e| page_error(p, e))?;
-            decode::decode(bytes, d).map_err(|e| page_error(p, ImageError::decode(at, e)))?;
+            let bytes =
+                read_encoded(resolved, at, MAX_FILE_BYTES, cancel).map_err(|e| page_stop(p, e))?;
+            decode_file(bytes, at, header, cancel, &mut Validate).map_err(|e| page_stop(p, e))?;
         }
 
         // Kept.
         let mut pages = Vec::with_capacity(dims.len());
-        for (name, d) in file.pages().iter().zip(dims) {
+        for (name, (d, mode)) in file.pages().iter().zip(dims) {
             let file_index =
                 u32::try_from(self.files.len()).map_err(|_| limit(FntLimit::Attempts))?;
             self.files.push(File {
                 lo: Version {
                     name: name.clone(),
                     dims: d,
+                    mode,
                 },
                 hi: None,
             });
@@ -1074,7 +1109,7 @@ mod tests {
     }
 
     fn admit(b: &mut SheetBuilder, name: &str) -> Result<u16, FntAdmitError> {
-        b.admit_fnt(name, &mut free)
+        b.admit_fnt(name, &mut free, &|| false)
     }
 
     /// What a failed admission must leave as it was.
@@ -1097,10 +1132,14 @@ mod tests {
         let mut b = builder(dir.path());
         let mut log = Vec::new();
         let i = b
-            .admit_fnt("a.fnt", &mut |c| {
-                log.push(c);
-                Ok(())
-            })
+            .admit_fnt(
+                "a.fnt",
+                &mut |c| {
+                    log.push(c);
+                    Ok(())
+                },
+                &|| false,
+            )
             .unwrap();
         assert_eq!(i, 0);
         let len = fs::metadata(dir.path().join("a.fnt")).unwrap().len();
@@ -1222,15 +1261,19 @@ mod tests {
         let mut images = 0;
         let headers = reads();
         let e = b
-            .admit_fnt("a.fnt", &mut |c| {
-                if c == Charge::Image {
-                    images += 1;
-                    if images == 2 {
-                        return Err(Refused);
+            .admit_fnt(
+                "a.fnt",
+                &mut |c| {
+                    if c == Charge::Image {
+                        images += 1;
+                        if images == 2 {
+                            return Err(Refused);
+                        }
                     }
-                }
-                Ok(())
-            })
+                    Ok(())
+                },
+                &|| false,
+            )
             .unwrap_err();
         assert!(matches!(
             e,
@@ -1414,6 +1457,66 @@ mod tests {
             Err(FntAdmitError::Limit(FntLimit::Frames))
         ));
         b.frames.truncate(1);
+        admit(&mut b, "a.fnt").unwrap();
+    }
+
+    /// A 1-bit grey PNG of `w`×`h`, all black, cut short in its image data
+    /// when `cut`.
+    fn grey_png(dir: &Path, name: &str, [w, h]: [u32; 2], cut: bool) {
+        let mut out = Vec::new();
+        let mut enc = png::Encoder::new(&mut out, w, h);
+        enc.set_color(png::ColorType::Grayscale);
+        enc.set_depth(png::BitDepth::One);
+        let mut writer = enc.write_header().unwrap();
+        let line = usize::try_from(w.div_ceil(8)).unwrap();
+        writer
+            .write_image_data(&vec![0; line * usize::try_from(h).unwrap()])
+            .unwrap();
+        writer.finish().unwrap();
+        if cut {
+            out.truncate(out.len() / 2);
+        }
+        fs::write(dir.join(name), out).unwrap();
+    }
+
+    #[test]
+    fn an_oversized_page_is_validated_in_bands() {
+        use super::super::decode::{Mode, SITE, Site};
+        // 4 097 × 3 073 texels: past the full-decode cap.
+        let dims = [4_097, 3_073];
+        assert!(texels(dims) > MAX_IMAGE_TEXELS);
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.fnt"), fnt_text(1, 0, 1)).unwrap();
+        grey_png(dir.path(), "p0.png", dims, false);
+        let mut b = builder(dir.path());
+        admit(&mut b, "a.fnt").unwrap();
+        assert!(matches!(b.files[0].lo.mode, Mode::Banded(_)));
+        // A cancel while its bands are decoded is the admission's, neither
+        // the file's failure nor a limit, and keeps nothing.
+        let before = kept(&b);
+        let cancel = || SITE.with(std::cell::Cell::get) == Some(Site::Band);
+        let e = b.admit_fnt("a.fnt", &mut free, &cancel).unwrap_err();
+        assert!(matches!(e, FntAdmitError::Cancelled), "{e:?}");
+        assert_eq!(kept(&b), before);
+        // Cut short: the page is broken, as a whole page would be.
+        grey_png(dir.path(), "p0.png", dims, true);
+        let FntAdmitError::File(e) = admit(&mut b, "a.fnt").unwrap_err() else {
+            panic!()
+        };
+        assert_eq!(e.fnt().unwrap().kind, FntErrorKind::PageBroken { page: 0 });
+    }
+
+    #[test]
+    fn a_cancel_while_a_page_is_read_is_no_failure() {
+        use super::super::decode::{SITE, Site};
+        let dir = tempfile::tempdir().unwrap();
+        write_fnt(dir.path(), "a.fnt", &fnt_text(1, 0, 1), 1);
+        let mut b = builder(dir.path());
+        let before = kept(&b);
+        let cancel = || SITE.with(std::cell::Cell::get) == Some(Site::Read);
+        let e = b.admit_fnt("a.fnt", &mut free, &cancel).unwrap_err();
+        assert!(matches!(e, FntAdmitError::Cancelled), "{e:?}");
+        assert_eq!(kept(&b), before);
         admit(&mut b, "a.fnt").unwrap();
     }
 }

@@ -9,8 +9,8 @@ use rules::{CanonicalError, RuleError};
 use skin_beatoraja::{Header, ImportError, Imported, NoteKind, Rule, Syntax, Usage};
 
 use crate::{
-    RawSummary, SEEDED_BYTES, bms_load, draw, preset_canonical, raw_input, replay_body,
-    replay_file, seeded_readouts, seeds, skin_fnt, skin_json, skin_lua,
+    PngOutcome, RawSummary, SEEDED_BYTES, bms_load, draw, preset_canonical, raw_input, replay_body,
+    replay_file, seeded_readouts, seeds, skin_fnt, skin_json, skin_lua, skin_png,
 };
 
 /// Every seed in `expected` is generated, and no other: a deleted seed
@@ -1118,6 +1118,57 @@ fn skin_lua_seeds_import_or_fail_as_built() {
                     _ => unreachable!("{name}"),
                 }
             }
+        }
+    }
+}
+
+#[test]
+fn skin_png_seeds_build_or_fail_as_built() {
+    use skin_model::{AtlasError, ImageError, TexelCap, Unbanded};
+    let seeds = seeds::skin_pngs();
+    assert_names(
+        &seeds,
+        &[
+            "grey1",
+            "grey2_trns_text",
+            "palette4",
+            "cut",
+            "interlaced",
+            "small",
+        ],
+    );
+    for (name, bytes) in seeds {
+        assert!(bytes.len() <= 65_536, "{name}: {} bytes", bytes.len());
+        let outcome = skin_png(&bytes);
+        match name {
+            "grey1" | "grey2_trns_text" | "palette4" => {
+                assert!(
+                    matches!(outcome, PngOutcome::Built([4_097, 3_073])),
+                    "{name}: {outcome:?}"
+                );
+            }
+            "small" => assert!(
+                matches!(outcome, PngOutcome::Built([40, 30])),
+                "{name}: {outcome:?}"
+            ),
+            "cut" => assert!(
+                matches!(
+                    outcome,
+                    PngOutcome::Failed(_, AtlasError::Image(ImageError::Png { .. }))
+                ),
+                "{name}: {outcome:?}"
+            ),
+            "interlaced" => assert!(
+                matches!(
+                    outcome,
+                    PngOutcome::Refused(ImageError::TooManyTexels {
+                        cap: TexelCap::FullDecode(Unbanded::Interlaced),
+                        ..
+                    })
+                ),
+                "{name}: {outcome:?}"
+            ),
+            _ => panic!("no expectation for seed {name}"),
         }
     }
 }

@@ -324,17 +324,19 @@ impl Cx<'_> {
             None => {
                 let names = self.fallbacks(rec, at)?;
                 let primary = asset::join(&self.entry_dir, path);
+                let def = &self.def;
                 let primary = self
                     .assets
-                    .fnt_file(&mut self.budget, &primary)
-                    .map_err(|l| self.limit(at, l))?;
+                    .fnt_file(&mut self.budget, &primary, &|| def.is_cancelled())
+                    .map_err(|s| self.stopped(at, s))?;
                 let mut fallbacks = Vec::with_capacity(names.len());
                 if primary.is_ok() {
                     for name in &names {
+                        let def = &self.def;
                         match self
                             .assets
-                            .fnt_file(&mut self.budget, name)
-                            .map_err(|l| self.limit(at, l))?
+                            .fnt_file(&mut self.budget, name, &|| def.is_cancelled())
+                            .map_err(|s| self.stopped(at, s))?
                         {
                             Ok(f) => fallbacks.push(f),
                             Err(failure) => {

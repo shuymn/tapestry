@@ -129,7 +129,7 @@ fn a_bundle_checks_its_clips_and_its_layers() {
         ..r.atlas_limits()
     };
     let atlas = |reserved| {
-        skin.atlas(skin_model::Variant::Lo, limits(reserved))
+        skin.atlas(skin_model::Variant::Lo, limits(reserved), &|| false)
             .unwrap()
     };
     let clip = || render::ClipTable::new(vec![[0.0, 0.0, 960.0, 1_080.0]]).unwrap();

@@ -79,7 +79,7 @@ fn fallbacks(l: &Loaded) -> Vec<(&'static str, u8, NoteFallback)> {
 /// colour.
 fn painted(l: &Loaded, chart: &Chart, ms: i64) -> Vec<([i32; 4], [u8; 4])> {
     let skin = l.ok().skin.clone();
-    let atlas = skin.atlas(Variant::Lo, LIMITS).unwrap();
+    let atlas = skin.atlas(Variant::Lo, LIMITS, &|| false).unwrap();
     let mut d = Drawn::over(skin, chart);
     d.frame(ms, &[])
         .iter()
