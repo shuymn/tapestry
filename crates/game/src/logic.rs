@@ -5,7 +5,7 @@
 
 use std::fmt;
 
-use bms_model::{Chart, TimeUs};
+use bms_model::{Chart, Lane, SoundId, TimeUs};
 use eval::{
     DeviceProfile, EvalError, EvalInput, Evaluator, GaugeState, InputStart, JudgeEvent,
     PhysicalInputEvent, Published, SourceId, SourceState, Staged, merge, watermark,
@@ -24,6 +24,13 @@ pub trait EventSink {
     /// cancelled candidate's events are discarded. Nothing by default.
     fn rearm(&mut self, origin: TimeUs) {
         let _ = origin;
+    }
+    /// A press of the audio tail's feedback on `lane` plays `sound`
+    /// (design.md "Play Lifecycle", the audio tail): a key sound with no
+    /// event behind it, its press received at `origin`. Nothing by
+    /// default.
+    fn key_sound(&mut self, lane: Lane, sound: SoundId, origin: TimeUs) {
+        let _ = (lane, sound, origin);
     }
 }
 
@@ -224,6 +231,9 @@ pub struct Logic<'a, R = SourceReader> {
     finalized: Option<TimeUs>,
     overflowed: bool,
     aborted: Option<AbortCause>,
+    /// Inputs the audio tail's feedback popped and could not convert
+    /// ([`feedback_to`](Self::feedback_to)).
+    feedback_dropped: u64,
 }
 
 impl<R> fmt::Debug for Logic<'_, R> {
@@ -340,6 +350,7 @@ impl<'a, R: SourceRead> Logic<'a, R> {
             finalized: None,
             overflowed: false,
             aborted: None,
+            feedback_dropped: 0,
         };
         Ok((logic, side))
     }
@@ -362,13 +373,7 @@ impl<'a, R: SourceRead> Logic<'a, R> {
             return self.idle();
         }
         // (1) Every watermark first.
-        let mut open = false;
-        for (r, p) in self.readers.iter().zip(&mut self.published) {
-            if p.state != SourceState::Retired {
-                *p = r.published();
-            }
-            open |= p.state == SourceState::Open;
-        }
+        let open = self.read_publications();
         // (3), taken here since it depends only on the publications: the
         // global watermark. With no source left open the play is over: it
         // ends at what was already finalized, before a closed source's
@@ -447,14 +452,7 @@ impl<'a, R: SourceRead> Logic<'a, R> {
                 oldest = Some(oldest.map_or(o, |t| t.min(o)));
             }
         }
-        for ((s, p), staged) in self
-            .sources
-            .iter()
-            .zip(&mut self.published)
-            .zip(&self.staged)
-        {
-            p.retire_if_drained(s.drained, staged);
-        }
+        self.retire_drained();
         self.publish_view();
         Advance {
             watermark: Some(w),
@@ -464,6 +462,100 @@ impl<'a, R: SourceRead> Logic<'a, R> {
             finalization_delay: Some(TimeUs(now.0.saturating_sub(w.0))),
             judgment_latency: oldest.map(|o| TimeUs(now.0.saturating_sub(o.0))),
         }
+    }
+
+    /// One step of the audio tail's feedback, once evaluation is complete
+    /// (design.md "Play Lifecycle", the audio tail): the same reads, pops,
+    /// staging and merge through the global watermark as
+    /// [`advance_to`](Self::advance_to), from the staging the completion
+    /// left on, then conversion without judging
+    /// ([`Evaluator::feedback_to`]): each press sends its unjudged sound to
+    /// every sink ([`EventSink::key_sound`]), and the view is published
+    /// with the lanes' input and the conversion watermark moved on, the
+    /// scored stream, the tally, the gauges, the note facts and the
+    /// finalized watermark as the completion froze them. Nothing is
+    /// recorded or spends the budget. The staging holds at most what
+    /// [`advance_to`](Self::advance_to)'s merge holds: an input beyond it
+    /// is dropped and counted ([`feedback_dropped`](Self::feedback_dropped)),
+    /// never allocated for. Returns the watermark converted through, or
+    /// `None` with no source left open. Allocates nothing.
+    pub fn feedback_to(&mut self) -> Option<TimeUs> {
+        // A feedback step emits no event.
+        self.out.clear();
+        let open = self.read_publications();
+        let w = watermark(&self.published, self.device).filter(|_| open)?;
+        let room = self.merged.capacity();
+        let mut staged: usize = self.staged.iter().map(Staged::len).sum();
+        for (((s, r), p), buffer) in self
+            .sources
+            .iter_mut()
+            .zip(&mut self.readers)
+            .zip(&self.published)
+            .zip(&mut self.staged)
+        {
+            let up_to = p.received_up_to;
+            if p.state == SourceState::Retired {
+                continue;
+            }
+            s.drained = false;
+            while s.last_popped.is_none_or(|t| t <= up_to) {
+                let Some(ev) = r.pop() else {
+                    s.drained = true;
+                    break;
+                };
+                s.last_popped = Some(ev.received);
+                if staged >= room || buffer.push(ev).is_err() {
+                    self.feedback_dropped = self.feedback_dropped.saturating_add(1);
+                } else {
+                    staged += 1;
+                }
+            }
+        }
+        merge(&mut self.staged, self.device, w, &mut self.merged);
+        let sinks = &mut self.sinks;
+        self.evaluator
+            .feedback_to(&self.merged, w, |lane, sound, origin| {
+                for sink in sinks.iter_mut() {
+                    sink.key_sound(lane, sound, origin);
+                }
+            });
+        self.merged.clear();
+        self.retire_drained();
+        self.publish_view();
+        Some(w)
+    }
+
+    /// Reads every source's publication, a retired one's sticking; returns
+    /// whether a source is still open.
+    fn read_publications(&mut self) -> bool {
+        let mut open = false;
+        for (r, p) in self.readers.iter().zip(&mut self.published) {
+            if p.state != SourceState::Retired {
+                *p = r.published();
+            }
+            open |= p.state == SourceState::Open;
+        }
+        open
+    }
+
+    /// Retires each closed source whose queue and staging are drained.
+    fn retire_drained(&mut self) {
+        for ((s, p), staged) in self
+            .sources
+            .iter()
+            .zip(&mut self.published)
+            .zip(&self.staged)
+        {
+            p.retire_if_drained(s.drained, staged);
+        }
+    }
+
+    /// Inputs the audio tail's feedback dropped, its staging full
+    /// ([`feedback_to`](Self::feedback_to)): none of them is in the
+    /// record, which closed at completion.
+    #[must_use]
+    pub const fn feedback_dropped(&self) -> u64 {
+        self.feedback_dropped
     }
 
     /// Ends the play at the watermark already finalized, with no further
@@ -672,6 +764,7 @@ impl<'a, R: SourceRead> Logic<'a, R> {
         self.finalized = None;
         self.overflowed = false;
         self.aborted = None;
+        self.feedback_dropped = 0;
         self.generation += 1;
         self.origin = Some(origin);
         self.render.rearm(origin);

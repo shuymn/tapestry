@@ -926,6 +926,57 @@ impl<'a> Evaluator<'a> {
         }
     }
 
+    /// Converts `inputs`, in the order [`merge`](crate::merge) produced and
+    /// with evaluation times at or before `watermark`, without judging
+    /// (design.md "Play Lifecycle", the audio tail): each edge updates the
+    /// lanes' input ([`input`](Self::input)), each press edge calls
+    /// `sound` with its lane, the sound an unjudged press plays there (the
+    /// rule a press without a judgment follows in
+    /// [`advance_to`](Self::advance_to), over this evaluation's targets
+    /// only) and the input's receive time, and each pending scratch
+    /// release falls due at its deadline, after an input at the same
+    /// time. Nothing is judged, scored or emitted, and the finalized
+    /// watermark stays where it is: after completion, conversion goes on
+    /// past it. A press whose target has no sound calls nothing. Allocates
+    /// nothing.
+    pub fn feedback_to(
+        &mut self,
+        inputs: &[PhysicalInputEvent],
+        watermark: TimeUs,
+        mut sound: impl FnMut(Lane, SoundId, TimeUs),
+    ) {
+        for ev in inputs {
+            let t = evaluation_time(ev, self.device).min(watermark);
+            self.feedback_releases(|d| d < t);
+            let edges = self.conversion.apply(ev, t);
+            for &edge in edges.as_slice() {
+                match edge {
+                    LaneEdge::Press(lane) => {
+                        self.input.press(lane, t);
+                        let table = *self.lane_table(lane.index());
+                        let scan = self.scan(lane.index(), t, &table);
+                        if let Some(s) = self.sound_of(lane.index(), &scan) {
+                            sound(lane, s, ev.received);
+                        }
+                    }
+                    LaneEdge::Release(lane) => self.input.release(lane, t),
+                }
+            }
+        }
+        self.feedback_releases(|d| d <= watermark);
+        self.input.convert_to(watermark);
+    }
+
+    /// Releases every pending scratch release whose deadline `due` takes,
+    /// in deadline order, into the lanes' input only.
+    fn feedback_releases(&mut self, due: impl Fn(TimeUs) -> bool) {
+        while let Some((at, _, axis)) = self.conversion.next_release().filter(|&(d, ..)| due(d)) {
+            if let Some(LaneEdge::Release(lane)) = self.conversion.release_due(axis) {
+                self.input.release(lane, at);
+            }
+        }
+    }
+
     /// The earliest pending deadline by (time, kind, lane): the lanes'
     /// chart deadlines, the pending scratch releases, and the song end,
     /// which comes after every chart deadline (none is later than it).
@@ -1170,6 +1221,23 @@ impl<'a> Evaluator<'a> {
         }
     }
 
+    /// The sound of a press on `lane` whose scan found `scan` (design.md
+    /// "The Only Output Is the Judgment Event Stream"): the note taken,
+    /// else the one an empty POOR is against, else the lane's latest
+    /// target before the press, else its first; `None` for a lane without
+    /// targets or a target without a sound.
+    fn sound_of(&self, lane: usize, scan: &Scan) -> Option<SoundId> {
+        let state = self.lanes.get(lane)?;
+        let k = scan
+            .primary
+            .map(|(_, k)| k)
+            .or(scan.against)
+            .or(scan.before)
+            .or((!state.targets.is_empty()).then_some(0))?;
+        let &i = state.targets.get(k)?;
+        self.chart.lanes.get(lane)?.get(i)?.sound
+    }
+
     /// A press edge on `lane` at evaluation time `t`. In a section's
     /// lead-in (`lead_in`), a press that judges no target is ignored.
     fn press(
@@ -1191,19 +1259,17 @@ impl<'a> Evaluator<'a> {
             reason = "`lane` comes from `Lane::index`, below LANE_COUNT"
         )]
         let state = &self.lanes[lane];
+        let scan = self.scan(lane, t, &table);
         let Scan {
             primary: best,
             against,
-            before,
-        } = self.scan(lane, t, &table);
+            ..
+        } = scan;
         // A lead-in press judges only inside its lane's first unjudged
         // target's early window: no sound, no empty POOR otherwise.
         if lead_in && best.is_none() {
             return;
         }
-        // The sound (design.md "The Only Output Is the Judgment Event
-        // Stream"): the note taken, else the one the empty POOR is against,
-        // else the lane's latest note before the press, else its first.
         // An empty POOR, early when pressed at or before the note it is
         // against.
         let empty_poor = against
@@ -1211,17 +1277,8 @@ impl<'a> Evaluator<'a> {
             .and_then(|k| state.targets.get(k))
             .and_then(|&i| notes.get(i))
             .map(|n| t <= n.time);
-        let target = best
-            .map(|(_, k)| k)
-            .or(against)
-            .or(before)
-            .or((!state.targets.is_empty()).then_some(0));
         let rule = self.rule.empty_poor;
-        #[expect(
-            clippy::indexing_slicing,
-            reason = "`target` is a position the scan found, or 0 of non-empty `targets`, all below `targets.len()`"
-        )]
-        if let Some(sound) = target.and_then(|k| notes[state.targets[k]].sound) {
+        if let Some(sound) = self.sound_of(lane, &scan) {
             self.emit(
                 t,
                 Some(origin),

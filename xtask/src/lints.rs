@@ -258,6 +258,7 @@ pub const IN_PLAY: &[Site] = &[
             "PlayerRig::seal_audio",
             "PlayerRig::ring_out",
             "PlayerRig::audio_done",
+            "PlayerRig::hand_off",
             "PlayerRig::input_failure",
             "PlayerRig::holding",
             "PlayerRig::candidate",
