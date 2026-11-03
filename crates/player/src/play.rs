@@ -140,11 +140,14 @@ pub struct PlayerRig<'a> {
     pub clock: QpcClock,
     /// What each play records.
     pub recorded: Recorded,
-    /// The gauge to show, by its index in the play preset: from the
-    /// settings until a play's attempt resolves it
-    /// ([`game::Loaded::displayed`]), then the attempt's, for its loading
-    /// gauge and its frames alike.
+    /// The gauge the settings show (`displayed_gauge`), by its index in
+    /// a play preset, never changed by an attempt: each preset resolves it
+    /// afresh, the select screen's loading gauge included
+    /// ([`loading_gauge`]).
     pub gauge: usize,
+    /// The gauge the current attempt shows, as it resolved the settings'
+    /// ([`game::Loaded::displayed`]): its loading gauge and its frames.
+    pub attempt_gauge: usize,
     /// Whether the session plays generated input (design.md "Autoplay"):
     /// no recommended input offset, and "not saved" when nothing was.
     pub autoplay: bool,
@@ -817,12 +820,12 @@ impl Rig for PlayerRig<'_> {
     /// The loading lifetime's gauge descriptor is replaced first from the
     /// preset the play refreshed, with the gauge the attempt shows.
     fn prepare_attempt(&mut self, loaded: &Loaded) -> Result<Preparation, ScreenError> {
-        self.gauge = loaded.displayed().0;
+        self.attempt_gauge = loaded.displayed().0;
         refresh_loading_gauge(
             &self.render,
             self.loading_active(),
             loaded.preset(),
-            self.gauge,
+            self.attempt_gauge,
         );
         // The attempt attached last is the one prepared: its epoch is
         // the frames'.
@@ -1099,7 +1102,7 @@ impl Rig for PlayerRig<'_> {
         self.scenario_started();
         self.render.send(RenderMsg::Play {
             side: screen,
-            gauge: self.gauge,
+            gauge: self.attempt_gauge,
             measure: Box::new(measure),
         });
     }
