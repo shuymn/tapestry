@@ -1,66 +1,83 @@
--- The sandbox's string and table library (library.rs): every loop whose
--- length a skin chooses runs here, as Lua, so the instruction hook meters
--- it and sees cancellation. The native functions it keeps are called only
--- with validated arguments and a result size charged first (charge), and
--- reach no skin: they are this chunk's upvalues. An unsupported form is
+-- The sandbox's library (library.rs): the base, string, table and math
+-- functions a skin may call, the allowlist the owner's skins use. Every
+-- loop whose length a skin chooses runs here, as Lua, so the instruction
+-- hook meters it and sees cancellation. A native function this chunk
+-- keeps is its private upvalue and is called only with arguments of the
+-- exact Lua type it takes, checked first, never coerced (a string where
+-- a number belongs, or the reverse, is an error), and only for a result
+-- whose size is known and charged first (bytes). An unsupported form is
 -- refused (refuse), never approximated.
-local native, charge, refuse, snapshot, cap = ...
+local native, charge, refuse, bridge, cap = ...
 
-local byte, sub, len = native.byte, native.sub, native.len
-local native_char, native_rep = native.char, native.rep
-local native_upper, native_lower, native_reverse = native.upper, native.lower, native.reverse
-local native_format, native_concat, native_unpack = native.format, native.concat, native.unpack
+local byte, sub = native.byte, native.sub
+local native_char, native_upper, native_lower = native.char, native.upper, native.lower
+local native_format, native_concat = native.format, native.concat
 local native_tonumber, native_tostring = native.tonumber, native.tostring
 local native_setmetatable, native_getmetatable = native.setmetatable, native.getmetatable
-local tointeger, mathtype, maxinteger = native.tointeger, native.mathtype, native.maxinteger
-local type, error, select, rawget, rawset, rawlen = type, error, select, rawget, rawset, rawlen
+local native_select, native_error = native.select, native.error
+local native_floor, native_ceil, native_abs = native.floor, native.ceil, native.abs
+local tointeger, mathtype, unpack = native.tointeger, native.mathtype, native.unpack
+local type, next = native.type, native.next
+local rawget, rawset, rawlen = native.rawget, native.rawset, native.rawlen
+local error, select = native_error, native_select
 
 -- The refusal codes library.rs names.
 local PATTERN_BALANCE, PATTERN_FRONTIER, PATTERN_BACKREF = 1, 2, 3
-local METATABLE, TOO_LARGE, FORMAT = 4, 5, 6
+local METATABLE, TOO_LARGE, FORMAT, PATTERN_ZERO = 4, 5, 6, 7
+local FINALIZER, TONUMBER = 8, 9
+
+-- The most values string.char takes in one call.
+local MAX_VALUES = 4096
+-- The most results string.byte gives in one call: what fits in the 20
+-- free stack slots Lua gives every native call (LUA_MINSTACK), so the
+-- native never grows the stack and cannot fail to.
+local MAX_RESULTS = 16
 
 local function arg_error(n, fname, msg)
-  error("bad argument #" .. n .. " to '" .. fname .. "' (" .. msg .. ")", 3)
+  native_error("bad argument #" .. n .. " to '" .. fname .. "' (" .. msg .. ")", 3)
 end
 
--- Argument n as Lua's checklstring reads it: a string, or a number as its
--- text.
+local function got(v)
+  return v == nil and "no value" or type(v)
+end
+
+-- Argument n, which must be a string.
 local function str(v, n, fname)
-  local t = type(v)
-  if t == "string" then
-    return v
-  elseif t == "number" then
-    return native_tostring(v)
+  if type(v) ~= "string" then
+    arg_error(n, fname, "string expected, got " .. got(v))
   end
-  arg_error(n, fname, "string expected, got " .. (v == nil and "no value" or t))
+  return v
 end
 
--- Argument n as Lua's checkinteger reads it: an integer, a float with an
--- integral value, or a short numeric string.
+-- Argument n, which must be an integer, or a float with an integral
+-- value; never a string.
 local function int(v, n, fname, default)
   if v == nil and default ~= nil then
     return default
   end
-  local t = type(v)
-  if t == "string" and len(v) <= 64 then
-    v = native_tonumber(v)
-    t = type(v)
+  if type(v) ~= "number" then
+    arg_error(n, fname, "number expected, got " .. got(v))
   end
-  if t == "number" then
-    local i = tointeger(v)
-    if i then
-      return i
-    end
+  local i = tointeger(v)
+  if i == nil then
     arg_error(n, fname, "number has no integer representation")
   end
-  arg_error(n, fname, "number expected, got " .. (v == nil and "no value" or t))
+  return i
+end
+
+-- Argument n, which must be a number.
+local function num(v, n, fname)
+  if type(v) ~= "number" then
+    arg_error(n, fname, "number expected, got " .. got(v))
+  end
+  return v
 end
 
 -- A table these functions read raw: one with a metatable, which Lua's
 -- own functions would consult, is refused.
 local function plain(t, n, fname)
   if type(t) ~= "table" then
-    arg_error(n, fname, "table expected, got " .. (t == nil and "no value" or type(t)))
+    arg_error(n, fname, "table expected, got " .. got(t))
   end
   if native_getmetatable(t) ~= nil then
     refuse(METATABLE)
@@ -108,11 +125,13 @@ end
 
 local string_lib = {}
 
-string_lib.len = len
+function string_lib.len(s)
+  return #str(s, 1, "len")
+end
 
 function string_lib.sub(s, i, j)
-  s = str(s, 1, "sub")
-  local l = len(s)
+  str(s, 1, "sub")
+  local l = #s
   i = start_of(int(i, 2, "sub", 1), l)
   j = end_of(int(j, 3, "sub", -1), l)
   if i <= j then
@@ -122,123 +141,132 @@ function string_lib.sub(s, i, j)
 end
 
 function string_lib.upper(s)
-  s = str(s, 1, "upper")
-  bytes(len(s))
+  bytes(#str(s, 1, "upper"))
   return native_upper(s)
 end
 
 function string_lib.lower(s)
-  s = str(s, 1, "lower")
-  bytes(len(s))
+  bytes(#str(s, 1, "lower"))
   return native_lower(s)
 end
 
-function string_lib.reverse(s)
-  s = str(s, 1, "reverse")
-  bytes(len(s))
-  return native_reverse(s)
-end
-
-function string_lib.rep(s, n, sep)
-  s = str(s, 1, "rep")
-  n = int(n, 2, "rep")
-  sep = sep == nil and "" or str(sep, 3, "rep")
-  if n <= 0 then
-    return ""
-  end
-  local each = len(s) + len(sep)
-  if each > 0 and n > cap // each + 1 then
-    refuse(TOO_LARGE)
-  end
-  bytes(n * len(s) + (n - 1) * len(sep))
-  return native_rep(s, n, sep)
-end
-
 function string_lib.byte(s, i, j)
-  s = str(s, 1, "byte")
-  local l = len(s)
+  str(s, 1, "byte")
+  local l = #s
   local pi = int(i, 2, "byte", 1)
   i = start_of(pi, l)
   j = end_of(int(j, 3, "byte", pi), l)
-  if i <= j then
-    bytes(j - i + 1)
+  if i > j then
+    return
+  end
+  if j - i + 1 > MAX_RESULTS then
+    refuse(TOO_LARGE)
   end
   return byte(s, i, j)
 end
 
 function string_lib.char(...)
-  local n = select("#", ...)
+  local n = native_select("#", ...)
+  if n > MAX_VALUES then
+    refuse(TOO_LARGE)
+  end
+  local args = { ... }
+  for k = 1, n do
+    local c = args[k]
+    if mathtype(c) ~= "integer" then
+      arg_error(k, "char", "integer expected, got " .. (mathtype(c) or got(c)))
+    end
+    if c < 0 or c > 255 then
+      arg_error(k, "char", "value out of range")
+    end
+  end
   bytes(n)
   return native_char(...)
 end
 
--- The conversions string.format takes, by their letter: a number's text
--- is at most 99 width plus its digits; a string's is its length.
-local NUMERIC = { d = 1, i = 1, u = 1, c = 1, x = 1, X = 1, o = 1, e = 1, E = 1, f = 1, F = 1,
-  g = 1, G = 1, a = 1, A = 1 }
-
+-- string.format's conversions the library takes: `d` (an integer), `f`
+-- (a number) and `s` (any value, by its tostring), with the flags `-`
+-- and `0`, a width and a precision of at most two digits each, and
+-- `%%`. Any other is refused.
 function string_lib.format(fmt, ...)
-  fmt = str(fmt, 1, "format")
+  str(fmt, 1, "format")
   local args = { ... }
-  local nargs = select("#", ...)
-  local total, argi, i, l = len(fmt), 0, 1, len(fmt)
+  local nargs = native_select("#", ...)
+  local l = #fmt
+  local total, argi, i = 0, 0, 1
   while i <= l do
     local c = byte(fmt, i)
-    if c == 37 then
+    if c ~= 37 then
+      total = total + 1
       i = i + 1
-      if byte(fmt, i) == 37 then
-        i = i + 1
-      else
-        local width = 0
-        while true do
-          c = byte(fmt, i)
-          if c == nil then
-            break
-          end
-          if c >= 48 and c <= 57 then
-            width = width * 10 + (c - 48)
-          elseif c ~= 45 and c ~= 43 and c ~= 32 and c ~= 35 and c ~= 46 then
-            break
-          end
-          i = i + 1
-        end
-        if c == nil then
-          refuse(FORMAT)
-        end
-        local letter = sub(fmt, i, i)
-        i = i + 1
-        argi = argi + 1
-        if argi > nargs then
-          arg_error(argi + 1, "format", "no value")
-        end
-        if letter == "s" then
-          -- Converted once here, so the native call reads no metamethod.
-          local v = args[argi]
-          if type(v) ~= "string" then
-            v = native_tostring(v)
-            args[argi] = v
-          end
-          total = total + len(v) + width
-        elseif letter == "q" then
-          local v = args[argi]
-          total = total + 2 * (type(v) == "string" and len(v) or 32) + 2
-        elseif NUMERIC[letter] then
-          total = total + width + 330
-        else
-          refuse(FORMAT)
-        end
-      end
+    elseif byte(fmt, i + 1) == 37 then
+      total = total + 1
+      i = i + 2
     else
       i = i + 1
+      while byte(fmt, i) == 45 or byte(fmt, i) == 48 do
+        i = i + 1
+      end
+      local width, digits = 0, 0
+      while (byte(fmt, i) or 0) >= 48 and (byte(fmt, i) or 0) <= 57 do
+        width = width * 10 + (byte(fmt, i) - 48)
+        digits = digits + 1
+        i = i + 1
+      end
+      local precision, pdigits = nil, 0
+      if byte(fmt, i) == 46 then
+        precision = 0
+        i = i + 1
+        while (byte(fmt, i) or 0) >= 48 and (byte(fmt, i) or 0) <= 57 do
+          precision = precision * 10 + (byte(fmt, i) - 48)
+          pdigits = pdigits + 1
+          i = i + 1
+        end
+      end
+      if digits > 2 or pdigits > 2 then
+        refuse(FORMAT)
+      end
+      local letter = byte(fmt, i)
+      i = i + 1
+      argi = argi + 1
+      if argi > nargs then
+        arg_error(argi + 1, "format", "no value")
+      end
+      local v = args[argi]
+      if letter == 100 then -- d
+        if precision ~= nil then
+          refuse(FORMAT)
+        end
+        args[argi] = int(v, argi + 1, "format")
+        total = total + width + 20
+      elseif letter == 102 then -- f
+        num(v, argi + 1, "format")
+        total = total + width + (precision or 6) + 320
+      elseif letter == 115 then -- s
+        if type(v) ~= "string" then
+          v = native_tostring(v)
+          args[argi] = v
+        end
+        local n = #v
+        if precision ~= nil and precision < n then
+          n = precision
+        end
+        total = total + (width > n and width or n)
+      else
+        refuse(FORMAT)
+      end
+      if total > cap then
+        refuse(TOO_LARGE)
+      end
     end
   end
   bytes(total)
-  return native_format(fmt, native_unpack(args, 1, nargs))
+  return native_format(fmt, unpack(args, 1, argi))
 end
 
 ---------------------------------------------------------------------------
--- patterns: one matcher, Lua 5.4's (lstrlib.c), for find, match, gmatch
--- and gsub. %b, %f and back references are refused.
+-- patterns: one matcher, Lua 5.4's (lstrlib.c), for find, match and
+-- gsub. %b, %f, %z and back references are refused.
 
 local MAXCAPTURES, MAXDEPTH = 32, 200
 local CAP_UNFINISHED, CAP_POSITION = -1, -2
@@ -264,6 +292,9 @@ local function match_class(c, cl)
   local lower = cl
   if is_upper(cl) then
     lower = cl + 32
+  end
+  if lower == 122 then
+    refuse(PATTERN_ZERO)
   end
   local f = CLASSES[lower]
   if not f then
@@ -485,9 +516,10 @@ function do_match(si, pi)
   return si
 end
 
+-- A fresh state for each matching call, so that a replacement function
+-- that matches too leaves the outer call's state alone.
 local function prepare(s, p)
-  M.s, M.sl, M.p, M.pl = s, len(s), p, len(p)
-  M.init, M.len = {}, {}
+  M = { s = s, sl = #s, p = p, pl = #p, init = {}, len = {} }
 end
 
 local function reset()
@@ -524,12 +556,12 @@ local function captures(si, e, whole)
   for i = 1, n do
     out[i] = capture(i, si, e)
   end
-  return native_unpack(out, 1, n)
+  return unpack(out, 1, n)
 end
 
 -- Whether a pattern has none of the special characters.
 local function no_specials(p)
-  for i = 1, len(p) do
+  for i = 1, #p do
     local c = byte(p, i)
     if c == 94 or c == 36 or c == 42 or c == 43 or c == 63 or c == 46 or c == 40
       or c == 41 or c == 91 or c == 93 or c == 37 or c == 45 then
@@ -540,7 +572,7 @@ local function no_specials(p)
 end
 
 local function plain_find(s, p, init)
-  local sl, pl = len(s), len(p)
+  local sl, pl = #s, #p
   if pl == 0 then
     return init, init - 1
   end
@@ -562,7 +594,7 @@ end
 local function find_aux(s, p, init, plain_arg, find, fname)
   s = str(s, 1, fname)
   p = str(p, 2, fname)
-  local sl = len(s)
+  local sl = #s
   init = start_of(int(init, 3, fname, 1), sl)
   if init > sl + 1 then
     return nil
@@ -599,39 +631,11 @@ function string_lib.match(s, p, init)
   return find_aux(s, p, init, false, false, "match")
 end
 
--- A leading `^` is a literal in gmatch, as in Lua 5.4; an exhausted
--- iterator stays exhausted.
-function string_lib.gmatch(s, p, init)
-  s = str(s, 1, "gmatch")
-  p = str(p, 2, "gmatch")
-  local sl = len(s)
-  local pos = start_of(int(init, 3, "gmatch", 1), sl)
-  local last = nil
-  local done = false
-  return function()
-    if done then
-      return nil
-    end
-    prepare(s, p)
-    local si = pos
-    while si <= sl + 1 do
-      reset()
-      local e = do_match(si, 1)
-      if e and e ~= last then
-        pos, last = e, e
-        return captures(si, e, true)
-      end
-      si = si + 1
-    end
-    done = true
-    return nil
-  end
-end
 
 -- The text of a gsub replacement for a match from si to e.
 local function replacement(repl, kind, si, e, out)
   if kind == "string" then
-    local rl = len(repl)
+    local rl = #repl
     local i = 1
     while i <= rl do
       local c = byte(repl, i)
@@ -673,7 +677,9 @@ local function replacement(repl, kind, si, e, out)
   if kind == "table" then
     v = rawget(repl, key)
   else
+    local outer = M
     v = repl(captures(si, e, true))
+    M = outer
   end
   if v == nil or v == false then
     bytes(e - si)
@@ -688,9 +694,9 @@ end
 local function join(out, sep)
   local total = 0
   for k = 1, #out do
-    total = total + len(out[k])
+    total = total + #out[k]
   end
-  bytes(total + len(sep) * (#out > 0 and #out - 1 or 0))
+  bytes(total + #sep * (#out > 0 and #out - 1 or 0))
   return native_concat(out, sep)
 end
 
@@ -698,16 +704,12 @@ function string_lib.gsub(s, p, repl, max_n)
   s = str(s, 1, "gsub")
   p = str(p, 2, "gsub")
   local kind = type(repl)
-  if kind == "number" then
-    repl = native_tostring(repl)
-    kind = "string"
-  end
   if kind == "table" then
     plain(repl, 3, "gsub")
   elseif kind ~= "string" and kind ~= "function" then
     arg_error(3, "gsub", "string/function/table expected, got " .. kind)
   end
-  local sl = len(s)
+  local sl = #s
   max_n = int(max_n, 4, "gsub", sl + 1)
   prepare(s, p)
   local pi = 1
@@ -728,7 +730,6 @@ function string_lib.gsub(s, p, repl, max_n)
       end
       replacement(repl, kind, si, e, out)
       si, last, copied = e, e, e
-      prepare(s, p)
     elseif si <= sl then
       si = si + 1
     else
@@ -787,37 +788,6 @@ function table_lib.remove(t, pos)
   return v
 end
 
-function table_lib.move(a1, f, e, t, a2)
-  plain(a1, 1, "move")
-  f = int(f, 2, "move")
-  e = int(e, 3, "move")
-  t = int(t, 4, "move")
-  if a2 == nil then
-    a2 = a1
-  else
-    plain(a2, 5, "move")
-  end
-  if e >= f then
-    if not (f > 0 or e < maxinteger + f) then
-      arg_error(3, "move", "too many elements to move")
-    end
-    local n = e - f
-    if t > maxinteger - n then
-      arg_error(4, "move", "destination wrap around")
-    end
-    if t > e or t <= f or a1 ~= a2 then
-      for i = 0, n do
-        rawset(a2, t + i, rawget(a1, f + i))
-      end
-    else
-      for i = n, 0, -1 do
-        rawset(a2, t + i, rawget(a1, f + i))
-      end
-    end
-  end
-  return a2
-end
-
 function table_lib.concat(t, sep, i, j)
   plain(t, 1, "concat")
   sep = sep == nil and "" or str(sep, 2, "concat")
@@ -835,29 +805,6 @@ function table_lib.concat(t, sep, i, j)
     out[#out + 1] = v
   end
   return join(out, sep)
-end
-
-function table_lib.unpack(t, i, j)
-  plain(t, 1, "unpack")
-  i = int(i, 2, "unpack", 1)
-  j = int(j, 3, "unpack", rawlen(t))
-  if i > j then
-    return
-  end
-  if j - i >= 1000000 then
-    error("too many results to unpack", 2)
-  end
-  local out = {}
-  for k = i, j do
-    out[k - i + 1] = rawget(t, k)
-  end
-  return native_unpack(out, 1, j - i + 1)
-end
-
-function table_lib.pack(...)
-  local t = { ... }
-  t.n = select("#", ...)
-  return t
 end
 
 -- A merge sort: stable, its comparisons the skin's comparator or `<`.
@@ -909,56 +856,195 @@ function table_lib.sort(t, comp)
   end
 end
 
+
+---------------------------------------------------------------------------
+-- math: the functions the skins use, on numbers only
+
+local math_lib = {}
+
+function math_lib.floor(x)
+  return native_floor(num(x, 1, "floor"))
+end
+
+function math_lib.ceil(x)
+  return native_ceil(num(x, 1, "ceil"))
+end
+
+function math_lib.abs(x)
+  return native_abs(num(x, 1, "abs"))
+end
+
+-- The largest (or smallest) argument, compared in Lua: the first of
+-- equal ones, as Lua's own.
+local function extreme(name, larger, ...)
+  local n = native_select("#", ...)
+  local args = { ... }
+  local best = num(args[1], 1, name)
+  for k = 2, n do
+    local v = num(args[k], k, name)
+    if larger(v, best) then
+      best = v
+    end
+  end
+  return best
+end
+
+function math_lib.max(...)
+  return extreme("max", function(a, b) return a > b end, ...)
+end
+
+function math_lib.min(...)
+  return extreme("min", function(a, b) return a < b end, ...)
+end
+
 ---------------------------------------------------------------------------
 -- base functions
 
-local function tonumber(v, base)
-  if type(v) == "string" then
-    bytes(len(v))
+local base = {}
+
+-- The decimal and hexadecimal numerals Lua reads without a base: each
+-- byte one a numeral may hold, checked in Lua before the short string is
+-- read natively.
+local NUMERAL = {}
+do
+  local chars = "0123456789abcdefABCDEFxXpP+-. \t\n\v\f\r"
+  for i = 1, #chars do
+    NUMERAL[byte(chars, i)] = true
   end
-  if base == nil then
+end
+
+function base.tonumber(v, b)
+  if b == nil then
+    local t = type(v)
+    if t == "number" then
+      return v
+    elseif t ~= "string" then
+      if v == nil then
+        arg_error(1, "tonumber", "value expected")
+      end
+      return nil
+    end
+    if #v > 200 then
+      refuse(TONUMBER)
+    end
+    for i = 1, #v do
+      if not NUMERAL[byte(v, i)] then
+        return nil
+      end
+    end
     return native_tonumber(v)
   end
-  return native_tonumber(v, base)
+  -- Base 10 only, the base the skins use: digits, a sign and spaces.
+  if mathtype(b) ~= "integer" or b ~= 10 then
+    refuse(TONUMBER)
+  end
+  str(v, 1, "tonumber")
+  local i, l = 1, #v
+  local function space(c) return c == 32 or (c >= 9 and c <= 13) end
+  while i <= l and space(byte(v, i)) do
+    i = i + 1
+  end
+  local negative = false
+  if byte(v, i) == 45 then
+    negative = true
+    i = i + 1
+  end
+  local n, digits = 0, 0
+  while i <= l do
+    local c = byte(v, i)
+    if c < 48 or c > 57 then
+      break
+    end
+    n = n * 10 + (c - 48)
+    digits = digits + 1
+    i = i + 1
+  end
+  while i <= l and space(byte(v, i)) do
+    i = i + 1
+  end
+  if digits == 0 or i <= l then
+    return nil
+  end
+  return negative and -n or n
+end
+
+function base.select(n, ...)
+  if n ~= "#" then
+    n = int(n, 1, "select")
+  end
+  return native_select(n, ...)
+end
+
+function base.error(msg, level)
+  level = int(level, 2, "error", 1)
+  if level > 0 then
+    level = level + 1
+  end
+  return native_error(msg, level)
 end
 
 -- The metatables this sandbox attached, each a snapshot it guards, and
--- the snapshot attached to each table.
-local ours, attached = {}, {}
+-- the snapshot attached to each table; neither keeps a table alive.
+local ours = native_setmetatable({}, { __mode = "k" })
+local attached = native_setmetatable({}, { __mode = "k" })
 
-local function setmetatable(t, mt)
+-- A copy of the skin's metatable, made in Lua (its entries metered),
+-- refused with `__gc` (a finalizer) or `__mode` (weak references).
+local function snapshot(mt)
+  local copy = {}
+  for k, v in next, mt do
+    rawset(copy, k, v)
+  end
+  if rawget(copy, "__gc") ~= nil or rawget(copy, "__mode") ~= nil then
+    refuse(FINALIZER)
+  end
+  bridge.metatable()
+  return copy
+end
+
+function base.setmetatable(t, mt)
   if type(t) ~= "table" then
-    arg_error(1, "setmetatable", "table expected, got " .. (t == nil and "no value" or type(t)))
+    arg_error(1, "setmetatable", "table expected, got " .. got(t))
   end
   if mt ~= nil and type(mt) ~= "table" then
     arg_error(2, "setmetatable", "nil or table expected")
   end
   local current = attached[t]
   if current ~= nil and not ours[current] then
-    error("cannot change a protected metatable", 2)
+    native_error("cannot change a protected metatable", 2)
   end
   if current == nil and native_getmetatable(t) ~= nil then
-    -- A metatable attached outside this function: only the sandbox's own.
-    error("cannot change a protected metatable", 2)
+    native_error("cannot change a protected metatable", 2)
   end
   -- Every check is made before the guard is lifted.
   local copy = nil
   if mt ~= nil then
     copy = snapshot(mt)
+    -- A metatable the skin did not protect itself names the skin's own
+    -- table to getmetatable, and is guarded by the library.
+    if rawget(mt, "__metatable") == nil then
+      rawset(copy, "__metatable", mt)
+      ours[copy] = true
+    end
   end
   if current ~= nil then
     rawset(current, "__metatable", nil)
+    ours[current] = nil
   end
   native_setmetatable(t, copy)
-  if copy ~= nil then
-    attached[t] = copy
-    if rawget(copy, "__metatable") == mt then
-      ours[copy] = true
-    end
-  else
-    attached[t] = nil
-  end
+  attached[t] = copy
   return t
 end
 
-return string_lib, table_lib, tonumber, setmetatable
+-- A bridge function taking one string: its argument checked here, so the
+-- host never raises an error.
+function base.string_bridge(f, name)
+  return function(v)
+    if type(v) ~= "string" then
+      arg_error(1, name, "string expected, got " .. got(v))
+    end
+    return f(v)
+  end
+end
+
+return string_lib, table_lib, math_lib, base

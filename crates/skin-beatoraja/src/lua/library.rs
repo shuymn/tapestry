@@ -1,20 +1,33 @@
-//! The sandbox's `string` and `table` libraries, `tonumber` and
-//! `setmetatable` (`library.lua`): Lua implementations, so that every loop
-//! whose length a skin chooses (a pattern match, a table copy, a sort, a
-//! format's scan) runs as metered Lua instructions and sees cancellation
-//! at each instruction step.
+//! The sandbox's library (`library.lua`): the base, `string`, `table` and
+//! `math` functions a skin may call, an allowlist of what the owner's
+//! skins use, every one implemented or wrapped in Lua.
 //!
-//! The native functions they keep are called only by `library.lua`, never
-//! by a skin, and only with validated arguments whose result's size is
-//! known first: that size is charged in bytes to
-//! [`MAX_NATIVE_WORK`](super::limits::MAX_NATIVE_WORK), and a result over
-//! [`MAX_PRIMITIVE_BYTES`](super::limits::MAX_PRIMITIVE_BYTES) is refused
-//! before the call. Tables are read raw, and one with a metatable, which
-//! Lua's own table functions would consult, is refused. The pattern forms
-//! the library does not implement, `%b`, `%f` and back references, are
-//! refused, as is a format conversion it does not size. An ordinary error
-//! stays a Lua value raised in Lua; the host's three primitives (`charge`,
-//! `refuse`, `snapshot`) fail only with the ledger's fault.
+//! - base: `select`, `error`, `tonumber` (a numeral of at most 200
+//!   bytes, or base 10) and `setmetatable` from the library; `assert`,
+//!   `getmetatable`, `ipairs`, `next`, `pairs`, `tostring` and `type` as
+//!   Lua has them (none coerces or loops natively over skin data);
+//! - `string`: `len`, `sub`, `byte` (16 results at most), `char`,
+//!   `upper`, `lower`, `find`, `match`, `gsub` and `format` (`%d`, `%f`,
+//!   `%s` and `%%`, with `-`, `0`, a width and a precision of two
+//!   digits); strings' methods are these, and strings have no arithmetic
+//!   metamethods;
+//! - `table`: `insert`, `remove`, `concat` and `sort`;
+//! - `math`: `floor`, `ceil`, `abs`, `max` and `min`.
+//!
+//! Every loop whose length a skin chooses (a pattern match, a table
+//! shift, a sort, a format's scan, a metatable's copy) runs as metered
+//! Lua and sees cancellation at each instruction step. A native function
+//! the library keeps is its private upvalue, called only with arguments
+//! of the exact Lua type it takes, checked first and never coerced, and
+//! only for a result whose size is known and charged in bytes to
+//! [`MAX_NATIVE_WORK`](super::limits::MAX_NATIVE_WORK) first, a result
+//! over [`MAX_PRIMITIVE_BYTES`](super::limits::MAX_PRIMITIVE_BYTES)
+//! refused. A table with a metatable, which Lua's own table functions
+//! would consult, is refused, as are `%b`, `%f`, `%z` and back
+//! references, an unsized format conversion and any other `tonumber`
+//! base. An ordinary error stays a Lua value raised in Lua; the host's
+//! primitives fail only with the ledger's fault, and its bridge functions
+//! take their arguments checked here and never raise one.
 
 use std::rc::Rc;
 
@@ -22,29 +35,31 @@ use mlua::chunk::ChunkMode;
 use mlua::{Function, Lua, Table, Value};
 
 use super::limits::MAX_PRIMITIVE_BYTES;
-use super::{LuaLimit, LuaWhy, Pass};
+use super::{LuaWhy, Pass};
 
 /// The library, compiled in the sandbox before any skin code.
 const LIBRARY: &str = include_str!("library.lua");
 
-/// What `library.lua` refuses, by its refusal code (1 first).
-pub(crate) const REFUSED: [&str; 6] = [
+/// The registry name of the library's wrapper for a host function taking
+/// one string.
+pub(super) const STRING_BRIDGE: &str = "tapestry.string_bridge";
+
+/// What `library.lua` refuses, by its refusal code (1 first); code 8 is a
+/// finalizer, [`LuaWhy::Finalizer`].
+pub(crate) const REFUSED: [&str; 9] = [
     "pattern %b",
     "pattern %f",
     "pattern back reference",
     "table with a metatable",
     "result over the primitive cap",
     "format conversion",
+    "pattern %z",
+    "metatable with __gc or __mode",
+    "tonumber of a long numeral or another base",
 ];
 
-/// A failed allocation is the memory fault; any other failure of a
-/// primitive is already the ledger's fault.
-fn fault(pass: &Pass, lua: &Lua, e: mlua::Error) -> mlua::Error {
-    match e {
-        mlua::Error::MemoryError(_) => pass.ledger.fail_lua(lua, LuaWhy::Limit(LuaLimit::Memory)),
-        e => e,
-    }
-}
+/// The code of a finalizer refusal.
+const FINALIZER: i64 = 8;
 
 /// Installs the library in `env`, from the natives of `base`, the VM's
 /// own globals, which no skin reaches.
@@ -53,20 +68,31 @@ pub(super) fn install(lua: &Lua, pass: &Rc<Pass>, env: &Table, base: &Table) -> 
     let table: Table = base.raw_get("table")?;
     let math: Table = base.raw_get("math")?;
     let native = lua.create_table()?;
-    for name in [
-        "byte", "sub", "len", "char", "rep", "upper", "lower", "reverse", "format",
-    ] {
+    for name in ["byte", "sub", "char", "upper", "lower", "format"] {
         native.raw_set(name, string.raw_get::<Function>(name)?)?;
     }
     for name in ["concat", "unpack"] {
         native.raw_set(name, table.raw_get::<Function>(name)?)?;
     }
-    for name in ["tonumber", "tostring", "setmetatable", "getmetatable"] {
+    for name in [
+        "tonumber",
+        "tostring",
+        "setmetatable",
+        "getmetatable",
+        "select",
+        "error",
+        "next",
+        "rawget",
+        "rawset",
+        "rawlen",
+        "type",
+    ] {
         native.raw_set(name, base.raw_get::<Function>(name)?)?;
     }
-    native.raw_set("tointeger", math.raw_get::<Function>("tointeger")?)?;
+    for name in ["floor", "ceil", "abs", "tointeger"] {
+        native.raw_set(name, math.raw_get::<Function>(name)?)?;
+    }
     native.raw_set("mathtype", math.raw_get::<Function>("type")?)?;
-    native.raw_set("maxinteger", i64::MAX)?;
 
     let p = Rc::clone(pass);
     let charge = lua.create_function(move |lua, n: i64| {
@@ -76,6 +102,9 @@ pub(super) fn install(lua: &Lua, pass: &Rc<Pass>, env: &Table, base: &Table) -> 
     })?;
     let p = Rc::clone(pass);
     let refuse = lua.create_function(move |lua, code: i64| -> mlua::Result<()> {
+        if code == FINALIZER {
+            return Err(p.ledger.fail_lua(lua, LuaWhy::Finalizer));
+        }
         let op = usize::try_from(code - 1)
             .ok()
             .and_then(|i| REFUSED.get(i))
@@ -83,54 +112,45 @@ pub(super) fn install(lua: &Lua, pass: &Rc<Pass>, env: &Table, base: &Table) -> 
             .unwrap_or("library");
         Err(p.ledger.fail_lua(lua, LuaWhy::Library { op }))
     })?;
+    let bridge = lua.create_table()?;
     let p = Rc::clone(pass);
-    let snapshot = lua.create_function(move |lua, mt: Table| {
-        p.ledger.check(lua)?;
-        p.ledger.update(|c| c.metatables += 1);
-        snapshot(lua, &p, &mt).map_err(|e| fault(&p, lua, e))
-    })?;
-    let (string_lib, table_lib, tonumber, setmetatable): (Table, Table, Function, Function) = lua
+    bridge.raw_set(
+        "metatable",
+        lua.create_function(move |lua, ()| {
+            p.ledger.check(lua)?;
+            p.ledger.update(|c| c.metatables += 1);
+            Ok(())
+        })?,
+    )?;
+    let (string_lib, table_lib, math_lib, lib): (Table, Table, Table, Table) = lua
         .load(LIBRARY)
         .set_name("=library")
         .set_mode(ChunkMode::Text)
-        .call((native, charge, refuse, snapshot, MAX_PRIMITIVE_BYTES))?;
-    // Strings' methods are the library's too.
+        // No globals: every name the library uses is its own.
+        .set_environment(lua.create_table()?)
+        .call((native, charge, refuse, bridge, MAX_PRIMITIVE_BYTES))?;
+    // Strings' methods are the library's, and strings have no other
+    // metamethod: none of their native arithmetic coercions is reachable.
     if let Some(mt) = lua
         .load("return getmetatable('')")
         .set_name("=library")
         .eval::<Option<Table>>()?
     {
+        let keys = mt
+            .pairs::<Value, Value>()
+            .map(|p| p.map(|(k, _)| k))
+            .collect::<mlua::Result<Vec<Value>>>()?;
+        for k in keys {
+            mt.raw_set(k, Value::Nil)?;
+        }
         mt.raw_set("__index", string_lib.clone())?;
     }
     env.raw_set("string", string_lib)?;
     env.raw_set("table", table_lib)?;
-    env.raw_set("tonumber", tonumber)?;
-    env.raw_set("setmetatable", setmetatable)?;
+    env.raw_set("math", math_lib)?;
+    for name in ["tonumber", "select", "error", "setmetatable"] {
+        env.raw_set(name, lib.raw_get::<Function>(name)?)?;
+    }
+    lua.set_named_registry_value(STRING_BRIDGE, lib.raw_get::<Function>("string_bridge")?)?;
     Ok(())
-}
-
-/// A copy of the skin's metatable `mt`, its entries charged before they
-/// are copied, refused with `__gc` (a finalizer) or `__mode` (weak
-/// references). Unless the skin protected it with `__metatable`, the copy
-/// names `mt` there, so that `getmetatable` gives the skin its own table,
-/// which it may change without reaching the copy.
-fn snapshot(lua: &Lua, pass: &Pass, mt: &Table) -> mlua::Result<Table> {
-    let mut entries = 0_u64;
-    for pair in mt.pairs::<Value, Value>() {
-        pair?;
-        entries += 1;
-    }
-    pass.ledger.native(lua, entries)?;
-    let copy = lua.create_table()?;
-    for pair in mt.pairs::<Value, Value>() {
-        let (k, v) = pair?;
-        copy.raw_set(k, v)?;
-    }
-    if !copy.raw_get::<Value>("__gc")?.is_nil() || !copy.raw_get::<Value>("__mode")?.is_nil() {
-        return Err(pass.ledger.fail_lua(lua, LuaWhy::Finalizer));
-    }
-    if copy.raw_get::<Value>("__metatable")?.is_nil() {
-        copy.raw_set("__metatable", mt.clone())?;
-    }
-    Ok(copy)
 }

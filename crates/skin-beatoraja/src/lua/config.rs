@@ -26,7 +26,7 @@
 
 use std::rc::Rc;
 
-use mlua::{Lua, Table, Value};
+use mlua::{Function, Lua, Table, Value};
 
 use super::{Pass, host};
 use crate::header::Header;
@@ -127,16 +127,20 @@ pub(super) fn install(
         }
         offset.raw_set(name.as_str(), t)?;
     }
-    let get_path = host(lua, pass, |lua, pass, args| {
-        let Some(Value::String(p)) = args.front() else {
-            return Err(mlua::Error::runtime("get_path takes a path"));
+    // The library checks the argument; the host returns a path or nil and
+    // never raises an error.
+    let native = host(lua, pass, |lua, pass, args| {
+        let path = match args.front() {
+            Some(Value::String(p)) => p.to_str().ok().map(|p| p.to_owned()),
+            _ => None,
         };
-        let p = p.to_str()?.to_owned();
-        match pass.bridge.as_ref().and_then(|b| b.path(&p)) {
+        match path.and_then(|p| pass.bridge.as_ref().and_then(|b| b.path(&p))) {
             Some(s) => Ok(Value::String(lua.create_string(s)?)),
             None => Ok(Value::Nil),
         }
     })?;
+    let wrap: Function = lua.named_registry_value(super::library::STRING_BRIDGE)?;
+    let get_path: Function = wrap.call((native, "get_path"))?;
     let config = lua.create_table()?;
     config.raw_set("option", option)?;
     config.raw_set("enabled_options", enabled)?;

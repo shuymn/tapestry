@@ -207,8 +207,10 @@ impl Ledger {
     }
 }
 
-/// How far up the stack [`running`] looks for a Lua function.
-const LOOK_UP: usize = 64;
+/// How far up the stack [`running`] looks for a Lua function: past the
+/// deepest the library's matcher recurses (its 200 levels, each a few
+/// frames).
+const LOOK_UP: usize = 2_048;
 
 /// Where `lua` runs: the innermost Lua function with a current line, by
 /// its module's name. The chunks are named `@` and their skin-relative

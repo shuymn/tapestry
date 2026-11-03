@@ -160,9 +160,21 @@ fn lua_import_memory_is_bounded_and_freed() {
     let p = record("retained_errors", measure(|| both(errors.path()).unwrap()));
     assert!(p < 40 << 20, "caught errors grew memory: {p}");
 
+    // A bridge's error is a Lua string too, whatever the names a
+    // traceback would find: 20,000 kept errors with an 8 MiB name in
+    // every table the skin reaches.
+    let bridge = folder(&configured(
+        "local big = \"x\"\nfor i = 1, 23 do big = big .. big end\n\
+         for _, t in ipairs({ _G, string, table, math, skin_config }) do t[big] = pcall end\n\
+         local kept = {}\n\
+         for i = 1, 20000 do local ok, e = pcall(skin_config.get_path, i) kept[i] = e end",
+    ));
+    let p = record("bridge_errors", measure(|| both(bridge.path()).unwrap()));
+    assert!(p < 48 << 20, "bridge errors grew memory: {p}");
+
     // The VM at its cap: refused, everything freed.
     let vm_cap = folder(&configured(
-        "local t = {}\nlocal s = string.rep(\"x\", 1 << 20)\nfor i = 1, 100 do t[i] = s .. i end",
+        "local t = {}\nlocal s = \"x\"\nfor i = 1, 20 do s = s .. s end\nfor i = 1, 100 do t[i] = s .. i end",
     ));
     let p = record(
         "memory_cap",
@@ -208,7 +220,7 @@ fn lua_import_memory_is_bounded_and_freed() {
 
     // The decoded bytes at their cap.
     let decoded = folder(&configured(
-        "local s = string.rep(\"x\", 64 << 10)\nlocal t = {}\n\
+        "local s = \"x\"\nfor i = 1, 16 do s = s .. s end\nlocal t = {}\n\
          for i = 1, 520 do t[i] = s end\nskin.extra = t",
     ));
     record(

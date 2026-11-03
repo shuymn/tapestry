@@ -15,9 +15,32 @@ use skin_beatoraja::{
 use skin_model::RootError;
 use tempfile::TempDir;
 
-/// A skin folder with `files` and a 64×64 `a.png`.
+/// A `rep` the fixtures build long strings with, by the VM's own
+/// concatenation (the library has no `string.rep`), on the entry's first
+/// line so that its line numbers stay.
+const REP: &str = "local function rep(s, n) local r, p = \"\", s \
+    while n > 0 do if n % 2 == 1 then r = r .. p end n = n // 2 \
+    if n > 0 then p = p .. p end end return r end ";
+
+/// A skin folder with `files` and a 64×64 `a.png`; the entry
+/// `s.luaskin` has [`REP`].
 fn folder(files: &[(&str, &str)]) -> TempDir {
-    let d = common::skin(files);
+    let with_rep: Vec<(String, String)> = files
+        .iter()
+        .map(|(name, text)| {
+            let text = if *name == "s.luaskin" {
+                format!("{REP}{text}")
+            } else {
+                (*text).to_owned()
+            };
+            ((*name).to_owned(), text)
+        })
+        .collect();
+    let refs: Vec<(&str, &str)> = with_rep
+        .iter()
+        .map(|(n, t)| (n.as_str(), t.as_str()))
+        .collect();
+    let d = common::skin(&refs);
     common::png(d.path(), "a.png", 64, 64);
     d
 }
@@ -144,8 +167,22 @@ fn the_environment_is_an_allowlist() {
         "string.pack",
         "string.unpack",
         "string.packsize",
+        "string.rep",
+        "string.reverse",
+        "string.gmatch",
+        "table.move",
+        "table.unpack",
+        "table.pack",
+        "rawequal",
+        "rawget",
+        "rawlen",
+        "rawset",
         "math.random",
         "math.randomseed",
+        "math.tointeger",
+        "math.type",
+        "math.mininteger",
+        "math.huge",
     ];
     let present = [
         "assert",
@@ -155,10 +192,6 @@ fn the_environment_is_an_allowlist() {
         "next",
         "pairs",
         "pcall",
-        "rawequal",
-        "rawget",
-        "rawlen",
-        "rawset",
         "select",
         "setmetatable",
         "tonumber",
@@ -173,8 +206,21 @@ fn the_environment_is_an_allowlist() {
         "string.format",
         "table.concat",
         "table.sort",
+        "string.len",
+        "string.sub",
+        "string.byte",
+        "string.char",
+        "string.upper",
+        "string.lower",
+        "string.match",
+        "string.gsub",
+        "table.insert",
+        "table.remove",
         "math.floor",
-        "math.mininteger",
+        "math.ceil",
+        "math.abs",
+        "math.max",
+        "math.min",
     ];
     let lookup = |name: &str| match name.split_once('.') {
         Some((lib, f)) => format!("(_G[\"{lib}\"] or {{}})[\"{f}\"]"),
@@ -273,11 +319,12 @@ fn memory_is_capped_before_it_is_allocated() {
     import(&fits).unwrap();
     for body in [
         "local s = \"x\"\nfor i = 1, 40 do s = s .. s end",
-        "local s = string.rep(\"x\", 1 << 20)\nlocal t = {}\nfor i = 1, 100 do t[i] = s .. i end",
+        "local s = rep(\"x\", 1 << 20)\nlocal t = {}\nfor i = 1, 100 do t[i] = s .. i end",
         "pcall(function() local s = \"x\" for i = 1, 40 do s = s .. s end end)",
-        // Inside the library: its own buffers exhaust memory.
-        "local s = string.rep(\"x\", 1 << 19)\nlocal t = {}\n\
-         pcall(function() for i = 1, 160 do t[i] = string.upper(s .. i) end end)",
+        // Inside a primitive: the argument is built once, the copies made
+        // by `upper` itself.
+        "local s = rep(\"x\", 1 << 19)\nlocal t = {}\n\
+         pcall(function() for i = 1, 160 do t[i] = string.upper(s) end end)",
     ] {
         let d = configured(body);
         assert_eq!(why(import(&d)), LuaWhy::Limit(LuaLimit::Memory), "{body}");
@@ -325,30 +372,23 @@ fn the_library_runs_its_loops_as_metered_lua() {
          assert(string.gsub(\"abc\", \"(%w)\", \"%1%1\") == \"aabbcc\")\n\
          assert(string.match(\"skin/play/x.lua\", \"(.+)/\") == \"skin/play\")\n\
          assert(string.match(\"key=val\", \"^(%a+)=(%a+)$\") == \"key\")\n\
-         local n = 0 for w in string.gmatch(\"one two  three\", \"%a+\") do n = n + 1 end\n\
-         assert(n == 3)\n\
-         local g = 0 for w in string.gmatch(\"^a^a\", \"^a\") do g = g + 1 end\n\
-         assert(g == 2, \"a leading ^ is a literal in gmatch\")\n\
          assert(string.find(\"a+b\", \"+\", 1, true) == 2)\n\
          assert(string.format(\"%02d:%s\", 7, \"x\") == \"07:x\")\n\
-         assert(tonumber(\"0x10\") == 16 and tonumber(\"10\", 2) == 2)\n\
+         assert(tonumber(\"0x10\") == 16 and tonumber(\" 42 \", 10) == 42 and tonumber(\"4x\", 10) == nil)\n\
          local t = { 3, 1, 2 }\n\
          table.sort(t) assert(t[1] == 1 and t[3] == 3)\n\
          table.sort(t, function(a, b) return a > b end) assert(t[1] == 3)\n\
          table.insert(t, 1, 9) assert(t[1] == 9 and #t == 4)\n\
          assert(table.remove(t) == 1 and #t == 3)\n\
          assert(table.concat({ 1, \"b\", 3 }, \",\") == \"1,b,3\")\n\
-         assert(select(\"#\", table.unpack({ 1, 2, 3 })) == 3)\n\
+         assert(math.max(1, 3, 2) == 3 and math.min(2.5, 1) == 1 and math.floor(2.5) == 2)\n\
          assert((\"abc\"):upper() == \"ABC\" and (\"abc\"):sub(2) == \"bc\")",
     );
     import(&fine).unwrap();
     // Backtracking and long copies are instructions: the cap ends them.
     for body in [
-        "string.find(string.rep(\"a\", 3000), \"a*a*a*b\")",
-        "pcall(string.gsub, string.rep(\"a\", 3000), \"(a-)(a-)(a-)b\", \"\")",
-        "table.move({}, 1, 1 << 40, 1)",
-        "table.move({}, 1.0, 2^40, 1.0)",
-        "table.move({}, \"1\", \"1099511627776\", 1)",
+        "string.find(rep(\"a\", 3000), \"a*a*a*b\")",
+        "pcall(string.gsub, rep(\"a\", 3000), \"(a-)(a-)(a-)b\", \"\")",
         "local t = {}\nfor i = 1, 1e6 do table.insert(t, 1, i) end",
     ] {
         let d = configured(body);
@@ -359,32 +399,40 @@ fn the_library_runs_its_loops_as_metered_lua() {
         );
     }
     // Native primitives: a result over the per-call cap is refused before
-    // the call; small results add up to the byte budget.
+    // the call; small results add up to the byte budget; an unsupported
+    // form is refused, never approximated.
+    let cap = LuaWhy::Library {
+        op: "result over the primitive cap",
+    };
+    let format = LuaWhy::Library {
+        op: "format conversion",
+    };
+    let tonumber = LuaWhy::Library {
+        op: "tonumber of a long numeral or another base",
+    };
+    let zero = LuaWhy::Library { op: "pattern %z" };
+    // Varargs of `n` copies of 65, for a call with that many arguments.
+    let args = "local function many(k, ...) if k == 0 then return ... end return many(k - 1, 65, ...) end\n";
     for (body, want) in [
         (
-            "pcall(string.rep, \"xx\", \"1e8\")",
-            LuaWhy::Library {
-                op: "result over the primitive cap",
-            },
+            "local s = rep(\"a\", 1 << 20)\npcall(string.sub, s .. \"b\", 1)".to_owned(),
+            cap,
         ),
         (
-            "local s = string.rep(\"a\", 1 << 20)\npcall(string.sub, s .. \"b\", 1)",
-            LuaWhy::Library {
-                op: "result over the primitive cap",
-            },
+            "local s = rep(\"a\", 1 << 20)\nstring.format(\"%s%s\", s, s)".to_owned(),
+            cap,
         ),
         (
-            "local s = string.rep(\"1\", 1 << 20)\npcall(tonumber, s .. \"1\")",
-            LuaWhy::Library {
-                op: "result over the primitive cap",
-            },
+            "pcall(string.byte, rep(\"a\", 5000), 1, -1)".to_owned(),
+            cap,
         ),
+        (format!("{args}pcall(string.char, many(5000))"), cap),
         (
-            "local s = string.rep(\"a\", 1 << 19)\nfor i = 1, 300 do local t = s:sub(1) end",
+            "local s = rep(\"a\", 1 << 19)\nfor i = 1, 300 do local t = s:sub(1) end".to_owned(),
             LuaWhy::Limit(LuaLimit::NativeWork),
         ),
         (
-            "local s = string.rep(\"1\", 1 << 19)\nfor i = 1, 300 do pcall(tonumber, s) end",
+            "local s = rep(\"a\", 1 << 19)\nfor i = 1, 300 do local t = s:upper() end".to_owned(),
             LuaWhy::Limit(LuaLimit::NativeWork),
         ),
         // A metatable the table functions would consult is refused, so
@@ -392,61 +440,296 @@ fn the_library_runs_its_loops_as_metered_lua() {
         (
             "local k = 0\n\
              local t = setmetatable({}, { __len = function() k = k + 1 return k == 1 and 0 or 1 << 40 end })\n\
-             table.insert(t, 1, false)",
+             table.insert(t, 1, false)"
+                .to_owned(),
             LuaWhy::Library {
                 op: "table with a metatable",
             },
         ),
         (
-            "pcall(table.concat, setmetatable({}, { __index = {} }))",
+            "pcall(table.concat, setmetatable({}, { __index = {} }))".to_owned(),
             LuaWhy::Library {
                 op: "table with a metatable",
             },
         ),
         (
-            "string.find(\"(x)\", \"%b()\")",
+            "string.find(\"(x)\", \"%b()\")".to_owned(),
             LuaWhy::Library { op: "pattern %b" },
         ),
         (
-            "pcall(string.match, \"aa\", \"(a)%1\")",
+            "pcall(string.match, \"aa\", \"(a)%1\")".to_owned(),
             LuaWhy::Library {
                 op: "pattern back reference",
             },
         ),
+        // `%z` is refused, not read as a literal `z`, in every API and
+        // inside a set.
+        ("pcall(string.find, \"z\", \"%z\")".to_owned(), zero),
+        ("pcall(string.match, \"z\", \"%Z\")".to_owned(), zero),
+        ("pcall(string.gsub, \"z\", \"[%z]\", \"\")".to_owned(), zero),
+        // A conversion the library does not size is refused: `%q`, a
+        // width or precision of three digits, one that would wrap.
+        ("pcall(string.format, \"%q\", \"\\127\")".to_owned(), format),
+        ("pcall(string.format, \"%999d\", 1)".to_owned(), format),
+        ("pcall(string.format, \"%.100f\", 1)".to_owned(), format),
         (
-            "local s = string.rep(\"a\", 1 << 20)\nstring.format(\"%s%s\", s, s)",
-            LuaWhy::Library {
-                op: "result over the primitive cap",
-            },
+            "local s = rep(\"a\", 1 << 19)\n\
+             pcall(string.format, \"%s%18446744073692774400d\", s, 0)"
+                .to_owned(),
+            format,
+        ),
+        ("pcall(string.format, \"%x\", 1)".to_owned(), format),
+        // `tonumber` reads base 10 and short numerals only.
+        ("pcall(tonumber, \"10\", 2)".to_owned(), tonumber),
+        ("pcall(tonumber, \"10\", 10.0)".to_owned(), tonumber),
+        (
+            "local s = rep(\"1\", 1 << 20)\npcall(tonumber, s)".to_owned(),
+            tonumber,
         ),
     ] {
-        let d = configured(body);
+        let d = configured(&body);
         assert_eq!(why(import(&d)), want, "{body}");
     }
     // A replacement or a join that fails copies nothing: the result is
     // built only once every piece is checked.
     for body in [
-        "local big = string.rep(\"b\", 1 << 19)\n\
+        "local big = rep(\"b\", 1 << 19)\n\
          for i = 1, 300 do assert(not pcall(string.gsub, \"ab\", \".\", { a = big, b = {} })) end",
-        "local big = string.rep(\"b\", 1 << 19)\n\
+        "local big = rep(\"b\", 1 << 19)\n\
          for i = 1, 300 do assert(not pcall(table.concat, { big, big, {} })) end",
     ] {
         let r = import(&configured(body)).unwrap_or_else(|e| panic!("{body}: {e:?}"));
         assert!(r.usage.native_work < 1 << 20, "{body}: {:?}", r.usage);
     }
-    // An exhausted iterator stays exhausted: each later call is a few
-    // instructions, never a rescan of its subject.
-    let d = configured(
-        "local it = string.gmatch(string.rep(\"a\", 1 << 16), \"z\")\n\
-         for i = 1, 100000 do assert(it() == nil) end",
-    );
-    import(&d).unwrap();
     // The natives stay private: the strings' methods are the library's.
     let d = configured(
         "assert(getmetatable(\"\").__index == string, \"methods\")\n\
          assert(string.dump == nil and (\"\").dump == nil, \"dump\")",
     );
     import(&d).unwrap();
+}
+
+#[test]
+fn the_library_never_coerces_a_string_to_a_number_or_back() {
+    // Each is an ordinary error the skin can catch: a string where a
+    // number belongs, a number where a string belongs, a fraction where
+    // an integer belongs, a value out of range, string arithmetic.
+    for call in [
+        "string.char(\"65\")",
+        "string.char(65.5)",
+        "string.char(256)",
+        "string.char(-1)",
+        "string.sub(\"abc\", \"1\")",
+        "string.sub(\"abc\", 1.5)",
+        "string.byte(\"abc\", \"1\")",
+        "string.upper(1)",
+        "string.len(1)",
+        "string.find(1, \"1\")",
+        "string.find(\"abc\", \"b\", \"1\")",
+        "string.gsub(\"abc\", \"b\", \"x\", \"1\")",
+        "string.gsub(\"abc\", \"b\", 7)",
+        "string.format(\"%d\", \"1\")",
+        "string.format(\"%d\", 1.5)",
+        "string.format(\"%f\", \"1\")",
+        "string.format(1)",
+        "math.floor(\"1\")",
+        "math.ceil(\"1\")",
+        "math.abs(\"1\")",
+        "math.max(1, \"2\")",
+        "math.min(\"1\")",
+        "math.max()",
+        "table.insert({}, \"1\", 2)",
+        "table.remove({ 1 }, \"1\")",
+        "table.concat({ 1 }, 1)",
+        "select(\"1\", 1)",
+        "error(\"x\", \"1\")",
+        "(\"1\") + 1",
+        "-(\"1\")",
+        "(\"1\") * \"2\"",
+        "skin_config.get_path(1)",
+    ] {
+        let d = configured(&format!(
+            "local ok, e = pcall(function() return {call} end)\n\
+             assert(not ok and type(e) == \"string\", \"accepted\")"
+        ));
+        import(&d).unwrap_or_else(|e| panic!("{call}: {e:?}"));
+    }
+    // What they do take, they take as Lua does.
+    let d = configured(
+        "assert(string.char(72, 105) == \"Hi\" and string.char() == \"\")\n\
+         assert(select(\"#\", string.byte(\"abc\", 1, -1)) == 3 and string.byte(\"abc\", 2.0) == 98)\n\
+         assert(string.byte(\"abc\", 10) == nil and string.sub(\"abc\", -2) == \"bc\")\n\
+         assert(string.format(\"%5.1f|%-3d|%03d|%.2s|%s|%%\", 2.25, 7, 7, \"abc\", true) == \"  2.2|7  |007|ab|true|%\")\n\
+         assert(tonumber(\"12\") == 12 and tonumber(\"1e2\") == 100.0 and tonumber(\" 0x1p4 \") == 16.0)\n\
+         assert(tonumber(\"x\") == nil and tonumber({}) == nil and tonumber(\"-7\", 10) == -7)\n\
+         assert(math.max(2, 7.5, 7) == 7.5 and math.min(3, -1) == -1 and math.abs(-2) == 2)\n\
+         assert(math.floor(-1.5) == -2 and math.ceil(1.2) == 2 and math.floor(3) == 3)\n\
+         assert(getmetatable(\"\").__add == nil and getmetatable(\"\").__index == string)\n\
+         assert(skin_config.get_path(\"none.png\") == \"none.png\")",
+    );
+    import(&d).unwrap();
+}
+
+#[test]
+fn the_library_s_matcher_agrees_with_lua_s_own() {
+    // Each call's results, serialized the same way in the sandbox and in
+    // an unrestricted VM, the oracle.
+    const SER: &str = "local function ser(...)\n\
+           local n, out = select(\"#\", ...), {}\n\
+           for i = 1, n do local v = select(i, ...) out[i] = type(v) .. \":\" .. tostring(v) end\n\
+           return table.concat(out, \",\")\n\
+         end\n";
+    let cases = [
+        "string.find(\"hello world\", \"o w\")",
+        "string.find(\"hello\", \"l+\")",
+        "string.find(\"hello\", \"(l)(l)\")",
+        "string.find(\"hello\", \"()ll()\")",
+        "string.find(\"a.b\", \".\", 1, true)",
+        "string.find(\"a.b\", \"%.\")",
+        "string.find(\"abc\", \"b\", -1)",
+        "string.find(\"abc\", \"b\", -10)",
+        "string.find(\"abc\", \"\", 10)",
+        "string.find(\"abc\", \"\", 4)",
+        "string.find(\"abc\", \"^b\")",
+        "string.find(\"abc\", \"c$\")",
+        "string.find(\"a$c\", \"$c\")",
+        "string.match(\"key = value\", \"^(%w+)%s*=%s*(%w+)$\")",
+        "string.match(\"  x  \", \"^%s*(.-)%s*$\")",
+        "string.match(\"2024-01-02\", \"(%d+)-(%d+)-(%d+)\")",
+        "string.match(\"abc123\", \"%a*\")",
+        "string.match(\"abc123\", \"[%a_][%w_]*\")",
+        "string.match(\"x-y\", \"[a-x]%-[^a-x]\")",
+        "string.match(\"]\", \"[]]\")",
+        "string.match(\"a^\", \"[%^^]\")",
+        "string.match(\"tab\\there\", \"%c\")",
+        "string.match(\"AbC\", \"%u%l%u\")",
+        "string.match(\"f0A\", \"%x+\")",
+        "string.match(\"a,b;\", \"%p\")",
+        "string.match(\"a b\", \"%S+%s%S+\")",
+        "string.match(\"aaa\", \"a-b\")",
+        "string.match(\"aaab\", \"a-b\")",
+        "string.match(\"ab\", \"a?b?c?\")",
+        "string.match(\"hello\", \"()\", 3)",
+        "string.match(\"path/to/file.png\", \"(.+)/\")",
+        "string.match(\"path/to/file.png\", \"([^/]+)%.(%w+)$\")",
+        "string.match(\"abc\", \".\", -1)",
+        "string.gsub(\"hello world\", \"o\", \"0\")",
+        "string.gsub(\"hello world\", \"(%w+)\", \"<%1>\")",
+        "string.gsub(\"hello\", \"\", \"-\")",
+        "string.gsub(\"abc\", \"%w\", \"%0%0\", 2)",
+        "string.gsub(\"abc\", \"^a\", \"x\")",
+        "string.gsub(\"a b c\", \"%s\", \"%%\")",
+        "string.gsub(\"a=1, b=2\", \"(%w+)=(%w+)\", \"%2=%1\")",
+        "string.gsub(\"$name is $age\", \"%$(%w+)\", { name = \"x\", age = 3 })",
+        "string.gsub(\"$name is $none\", \"%$(%w+)\", { name = false })",
+        "string.gsub(\"abc\", \"%w\", function(c) return c:upper() .. \".\" end)",
+        "string.gsub(\"abc\", \"(b)\", function() return nil end)",
+        "string.gsub(\"abc\", \"()b\", function(p) return p end)",
+        "string.gsub(\"x = 1\", \"%s*=%s*\", \"=\")",
+        "string.gsub(\"abc\", \".-\", \"-\")",
+        "string.gsub(\"abc\", \"x*\", \"-\")",
+        // A replacement function that matches too, then returns false or
+        // nil: the outer subject is kept.
+        "string.gsub(\"ab\", \".\", function() string.match(\"XY\", \"(.)\") return false end)",
+        "string.gsub(\"ab\", \".\", function() string.find(\"XY\", \"(.)\") return nil end)",
+        "string.gsub(\"ab\", \"(.)\", function(c) return string.gsub(c, \".\", \"%0%0\") end)",
+    ];
+    let oracle = mlua::Lua::new();
+    for case in cases {
+        let want: String = oracle
+            .load(format!("{SER}return string.format(\"%q\", ser({case}))"))
+            .eval()
+            .unwrap_or_else(|e| panic!("{case}: {e}"));
+        let d = configured(&format!(
+            "{SER}assert(ser({case}) == {want}, \"disagrees\")"
+        ));
+        import(&d).unwrap_or_else(|e| panic!("{case}: {e:?}"));
+    }
+}
+
+#[test]
+fn a_deep_match_is_located_at_the_skin_s_call() {
+    // The matcher recurses once a capture: its error is raised many
+    // trusted frames below the skin's line.
+    let d = configured("\nstring.match(\"\", rep(\"(\", 33))");
+    assert_eq!(located(import(&d)), (LuaWhy::Error, "s.luaskin".into(), 6));
+}
+
+#[test]
+fn a_metatable_s_copy_is_metered() {
+    // Each attachment copies the skin's metatable entry by entry as
+    // instructions: copying a large one many times reaches the cap.
+    let d = configured(
+        "local mt = {}\nfor i = 1, 100000 do mt[i] = i end\n\
+         for i = 1, 200 do setmetatable({}, mt) end",
+    );
+    assert_eq!(why(import(&d)), LuaWhy::Limit(LuaLimit::Instructions));
+}
+
+#[test]
+fn a_skin_s_own_metatable_protection_holds() {
+    // A `__metatable` the skin set is its own guard, even one naming the
+    // metatable itself: the library never lifts it.
+    for mt in [
+        "{ __metatable = \"locked\" }",
+        "(function() local m = {} m.__metatable = m return m end)()",
+    ] {
+        let d = configured(&format!(
+            "local mt = {mt}\nlocal t = setmetatable({{}}, mt)\n\
+             assert(getmetatable(t) == mt.__metatable, \"its guard\")\n\
+             assert(not pcall(setmetatable, t, {{}}), \"replaced\")\n\
+             assert(not pcall(setmetatable, t, nil), \"removed\")"
+        ));
+        import(&d).unwrap_or_else(|e| panic!("{mt}: {e:?}"));
+    }
+}
+
+#[test]
+fn protected_calls_and_loads_give_back_at_most_16_results() {
+    // The native xpcall pushes its status after the results without
+    // making room: results come back packed, and more than fit the free
+    // slots of a native call are refused.
+    const MANY: &str = "local function many(k, ...) if k == 0 then return ... end return many(k - 1, k, ...) end\n";
+    let d = configured(&format!(
+        "{MANY}assert(select(\"#\", pcall(many, 16)) == 17 and select(\"#\", xpcall(many, error, 16)) == 17)\n\
+         local ok, a, b = pcall(many, 2) assert(ok and a == 1 and b == 2 and select(\"#\", pcall(many, 0)) == 1)\n\
+         assert(select(\"#\", string.byte(rep(\"a\", 16), 1, -1)) == 16)"
+    ));
+    import(&d).unwrap();
+    let results = LuaWhy::Library {
+        op: "protected call results",
+    };
+    for body in [
+        "pcall(many, 40)",
+        "xpcall(many, error, 40)",
+        "pcall(many, 17)",
+        "xpcall(many, error, 17)",
+        "pcall(pcall, many, 16)",
+    ] {
+        let d = configured(&format!("{MANY}{body}"));
+        assert_eq!(why(import(&d)), results, "{body}");
+    }
+    let values = |n: usize| {
+        (1..=n)
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    for (n, ok) in [(16, true), (17, false), (40, false)] {
+        let d = folder(&[
+            (
+                "s.luaskin",
+                &skin("", &format!("dofile(\"p.lua\")\n{DRAW_I}")),
+            ),
+            ("p.lua", &format!("return {}", values(n))),
+        ]);
+        let r = import(&d);
+        if ok {
+            r.unwrap();
+        } else {
+            assert_eq!(why(r), results);
+        }
+    }
 }
 
 #[test]
@@ -474,15 +757,11 @@ fn finalizers_and_weak_tables_are_refused() {
 #[test]
 fn a_metatable_is_fixed_when_it_is_attached() {
     // Garbage enough for the collector to run several cycles.
-    let churn = "for i = 1, 400 do local s = string.rep(\"x\", 1 << 16) .. i end";
+    let churn = "for i = 1, 400 do local s = rep(\"x\", 1 << 16) .. i end";
     for (attach, change) in [
         (
             "local mt = {}\nlocal t = setmetatable({}, mt)",
             "mt.__mode = \"v\"",
-        ),
-        (
-            "local mt = {}\nlocal t = setmetatable({}, mt)",
-            "rawset(mt, \"__mode\", \"v\")",
         ),
         (
             "local mt = {}\nlocal t = setmetatable({}, mt)",
@@ -879,9 +1158,9 @@ fn skin_config_follows_the_header_and_its_writes_stay_in_the_pass() {
                      -- The skin's own writes are seen by its later reads.\n\
                      skin_config.offset.o.x = 123\n\
                      skin_config.option.opt = 900\n\
-                     rawset(skin_config, \"extra\", true)\n\
+                     skin_config.extra = true\n\
                      assert(skin_config.offset.o.x == 123 and skin_config.option.opt == 900, \"written\")\n\
-                     assert(skin_config.extra == true, \"rawset\")\n{DRAW_I}"
+                     assert(skin_config.extra == true, \"extra\")\n{DRAW_I}"
                 ),
             ),
         ),
@@ -917,7 +1196,7 @@ fn host_modules_hold_the_pinned_names_and_refuse_calls() {
            return { type = 0 }\n\
          end\n\
          local ms = require(\"main_state\")\n\
-         assert(ms.timer_off_value == math.mininteger, \"off value\")\n\
+         assert(ms.timer_off_value == -9223372036854775807 - 1, \"off value\")\n\
          assert(ms.event_observe_boolean == nil and ms.lua_version == nil, \"absent\")\n\
          assert(require(\"event_util\").event_observe_boolean == nil, \"absent event\")\n\
          return { type = 0 }",
@@ -1206,7 +1485,13 @@ fn numbers_keep_their_subtype_and_exact_value() {
         matches!(r, Err(ImportError::Type { field: "x", .. })),
         "{r:?}"
     );
-    for value in ["4294967297", "-2147483649", "0/0", "1/0", "math.mininteger"] {
+    for value in [
+        "4294967297",
+        "-2147483649",
+        "0/0",
+        "1/0",
+        "-9223372036854775807 - 1",
+    ] {
         let d = folder(&[("s.luaskin", &drawn(&format!("loop = {value},")))]);
         let r = import(&d);
         assert!(
@@ -1319,10 +1604,10 @@ fn the_converted_table_takes_the_definition_bounds() {
     assert!(8_usize.pow(7) + 8_usize.pow(6) > MAX_NODES);
     let deep = configured("local t = {}\nfor i = 1, 70 do t = { t } end\nskin.extra = t");
     assert_eq!(input(import(&deep)), InputLimit::Depth);
-    let long = configured("skin.extra = string.rep(\"x\", (64 << 10) + 1)");
+    let long = configured("skin.extra = rep(\"x\", (64 << 10) + 1)");
     assert_eq!(input(import(&long)), InputLimit::StringBytes);
     let many = configured(
-        "local s = string.rep(\"x\", 64 << 10)\nlocal t = {}\n\
+        "local s = rep(\"x\", 64 << 10)\nlocal t = {}\n\
          for i = 1, 520 do t[i] = s end\nskin.extra = t",
     );
     assert_eq!(input(import(&many)), InputLimit::DecodedBytes);

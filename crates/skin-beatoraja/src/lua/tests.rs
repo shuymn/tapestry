@@ -169,7 +169,7 @@ fn every_pass_drops_its_vm_on_every_outcome() {
     assert_eq!(live(), 0);
     for entry in [
         "while true do end",
-        "local s = string.rep(\"x\", 80 << 20)",
+        "local s = \"x\"\nfor i = 1, 27 do s = s .. s end",
         "error(\"x\")",
         "return 1",
     ] {

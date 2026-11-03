@@ -207,10 +207,14 @@ pub(super) fn run(
 ) -> mlua::Result<MultiValue> {
     let xpcall: Function = lua.named_registry_value(sandbox::XPCALL)?;
     let handler: Function = lua.named_registry_value(sandbox::HANDLER)?;
+    // The results come back packed: the native xpcall pushes its status
+    // after them without making room.
+    let packed: Function = lua.named_registry_value(sandbox::PACKED)?;
     let seen = pass.handled_count();
     let mut call = MultiValue::new();
-    call.push_back(Value::Function(f));
+    call.push_back(Value::Function(packed));
     call.push_back(Value::Function(handler));
+    call.push_back(Value::Function(f));
     call.extend(args);
     let mut r = match xpcall.call::<MultiValue>(call) {
         Ok(r) => r,
@@ -228,7 +232,19 @@ pub(super) fn run(
     pass.ledger.check(lua)?;
     let ok = r.pop_front().is_some_and(|v| v.as_boolean() == Some(true));
     if ok {
-        return Ok(r);
+        let Some(Value::Table(t)) = r.pop_front() else {
+            return Err(pass.ledger.fail_lua(lua, LuaWhy::Error));
+        };
+        let n: i64 = t.raw_get("n")?;
+        if n > sandbox::MAX_RESULTS {
+            return Err(pass.ledger.fail_lua(
+                lua,
+                LuaWhy::Library {
+                    op: sandbox::TOO_MANY,
+                },
+            ));
+        }
+        return (1..=n).map(|i| t.raw_get::<Value>(i)).collect();
     }
     if pass.handled_count() == seen {
         // No handler ran: Lua runs none for an allocation failure.
