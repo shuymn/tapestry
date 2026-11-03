@@ -562,3 +562,85 @@ fn a_recovery_takes_the_window_keys_as_the_window_holds_them() {
     set.tick_presentation(TimeUs(50));
     assert!(drain(&mut rx).contains(&TapEvent::Press(FASTER)));
 }
+
+/// Owed state × focus: a repeat's closing tick (`unclosed`) is not owed
+/// while focus is away, and nothing is due then; on return the deadlines
+/// lie ahead, so the thread never wakes at once again and again.
+#[test]
+fn a_repeat_due_while_focus_is_away_leaves_no_elapsed_deadline() {
+    let (mut set, mut rx, focus) = rig();
+    batch(&mut set, 0, &[packet(SHIFT, 1)]);
+    set.tick_presentation(TimeUs(1));
+    drain(&mut rx);
+    // Focus goes before the next repeat; the repeat's deadline passes.
+    focus.set(false);
+    set.tick_presentation(TimeUs(10_000));
+    set.tick_presentation(TimeUs(50_000));
+    assert_eq!(set.next_due(), None, "nothing is due while away");
+    set.tick_presentation(TimeUs(50_001));
+    assert_eq!(set.next_due(), None);
+    // Back: the next deadline lies ahead of now.
+    focus.set(true);
+    set.tick_presentation(TimeUs(60_000));
+    let due = set.next_due().expect("the held scratch repeats");
+    assert!(due > TimeUs(60_000), "{due:?}");
+}
+
+/// Owed state × focus: an overflow's acknowledged baseline owed behind a
+/// recovery that cannot flush yields to a focus change: F2, held at the
+/// acknowledgement, released while focus was away, is not held on return,
+/// and its next press acts.
+#[test]
+fn a_focus_change_replaces_an_owed_overflow_baseline() {
+    let (mut set, mut rx, focus) = rig();
+    let (mut keys, receiver) = window_keys();
+    set.adjustment_mut()
+        .unwrap()
+        .set_window_keys(receiver, [Some(SLOWER), Some(FASTER)]);
+    batch(&mut set, 10, &[]);
+    keys.key(1, WindowKeyEvent::Press, false);
+    set.tick_presentation(TimeUs(20));
+    assert!(drain(&mut rx).contains(&TapEvent::Press(FASTER)));
+    // The queue full but for one slot, nothing owed: ticks of the held F2
+    // up to the reserved slots, then four fences in them.
+    let mut at = 30;
+    for _ in 0..ADJUST_QUEUE - RESERVED {
+        at += 1;
+        set.tick_presentation(TimeUs(at));
+    }
+    for k in 1..=4 {
+        set.adjustment_mut().unwrap().fence(k, TimeUs(at + 1));
+    }
+    assert!(!rx.owed());
+    // The window's queue overflows with F2 held: the acknowledgement's
+    // recovery waits for room.
+    for _ in 0..=WINDOW_KEYS {
+        keys.key(1, WindowKeyEvent::Repeat, false);
+    }
+    set.tick_presentation(TimeUs(at + 2));
+    assert!(rx.owed());
+    // Away; the window makes up F2's release; back before the recovery
+    // went.
+    focus.set(false);
+    keys.key(1, WindowKeyEvent::Release, true);
+    set.tick_presentation(TimeUs(at + 3));
+    focus.set(true);
+    drain(&mut rx);
+    set.tick_presentation(TimeUs(at + 4));
+    let back = drain(&mut rx);
+    let baseline = back
+        .iter()
+        .rev()
+        .find(|e| matches!(e, TapEvent::Resync { .. }));
+    assert_eq!(
+        baseline,
+        Some(&TapEvent::Resync {
+            held: 0,
+            verified: true
+        }),
+        "{back:?}"
+    );
+    keys.key(1, WindowKeyEvent::Press, false);
+    set.tick_presentation(TimeUs(at + 5));
+    assert!(drain(&mut rx).contains(&TapEvent::Press(FASTER)));
+}

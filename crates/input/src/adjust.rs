@@ -345,6 +345,10 @@ struct WindowKeyShared {
 /// [`WindowKeyShared::word`]'s overflow bit.
 const OVERFLOW: u64 = 1 << 2;
 
+/// The most tries one acknowledgement makes before it is left for the next
+/// wake: the input thread never spins on the window's word.
+const ACK_TRIES: u32 = 4;
+
 /// The held keys of a [`WindowKeyShared::word`].
 const fn held_keys(word: u64) -> u8 {
     (word & 3) as u8
@@ -361,8 +365,8 @@ impl WindowKeyShared {
     /// meanwhile (and could not queue) is never lost: the step fails and
     /// is taken again with the newer keys. `between` runs between the read
     /// and the step (a test forces an interleaving there).
-    fn acknowledge(&self, mut between: impl FnMut()) -> u8 {
-        loop {
+    fn acknowledge(&self, mut between: impl FnMut()) -> Option<u8> {
+        for _ in 0..ACK_TRIES {
             let w = self.word.load(Ordering::Acquire);
             between();
             if self
@@ -370,9 +374,12 @@ impl WindowKeyShared {
                 .compare_exchange(w, w & !OVERFLOW, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
-                return held_keys(w);
+                return Some(held_keys(w));
             }
         }
+        // The window keeps changing its keys: the overflow stays, and the
+        // input thread tries again at its next wake.
+        None
     }
 }
 
@@ -704,6 +711,15 @@ impl AdjustmentTap {
         let back = focused && !self.focused;
         self.losses = losses;
         self.focused = focused;
+        if lost || back {
+            // What was derived from the focus before is resolved now: the
+            // recovery's Lost or Resync closes the reducer's open group, so
+            // no closing tick is owed, and its baseline is read from the
+            // window's keys as they are when it is sent, not from an
+            // overflow acknowledged before the change.
+            self.unclosed = None;
+            self.window_baseline = None;
+        }
         if self.active && (lost || back) {
             self.owed.push(Marker::Recovery { lost });
         }
@@ -894,8 +910,9 @@ impl AdjustmentTap {
             // it owes the tick that closes its group.
             let repeats = self.next_repeat().is_some_and(|due| due <= at);
             self.last_tick = at;
-            self.observe(at, TapEvent::Tick, true);
-            if repeats {
+            // Only a tick the reducer takes owes a closing one: a tick
+            // dropped (focus away, a loss) made no request.
+            if self.observe(at, TapEvent::Tick, true) && repeats {
                 self.unclosed = Some(at);
             }
         }
@@ -908,7 +925,9 @@ impl AdjustmentTap {
     /// ([`AdjustmentReceiver::owed`]).
     #[must_use]
     pub fn next_due(&self) -> Option<TimeUs> {
-        if !self.active || !self.owed.is_empty() {
+        // Nothing is due while focus is away (no tick is taken then) or
+        // while the tap owes a send the queue has no room for.
+        if !self.active || !self.focused || !self.owed.is_empty() {
             return None;
         }
         let closing = self.unclosed.map(|t| TimeUs(t.0.saturating_add(1)));
@@ -976,11 +995,14 @@ impl AdjustmentTap {
             };
             self.observe(at, tap, true);
         }
-        if overflow && let Some((keys, _)) = &self.window {
+        if overflow
+            && let Some((keys, _)) = &self.window
+            && let Some(held) = keys.shared.acknowledge(|| {})
+        {
             // What the window could not queue shows only in its held
             // keys: they are the baseline, read in one step with the
             // acknowledgement, and none of them acts.
-            self.window_baseline = Some(keys.shared.acknowledge(|| {}));
+            self.window_baseline = Some(held);
             self.owed.push(Marker::Recovery { lost: true });
             self.flush(at);
         }
@@ -1072,18 +1094,19 @@ impl AdjustmentTap {
     /// background input, an observation behind something owed, or one the
     /// queue (short of its reserved slots) has no room for. Nothing is sent
     /// while focus is away; its return sends a baseline.
-    fn observe(&mut self, at: TimeUs, event: TapEvent, foreground: bool) {
+    fn observe(&mut self, at: TimeUs, event: TapEvent, foreground: bool) -> bool {
         if !self.active || !self.focused {
-            return;
+            return false;
         }
         self.flush(at);
         if !foreground || !self.owed.is_empty() || self.queue.slots() <= RESERVED {
             self.dropped.fetch_add(1, Ordering::Relaxed);
             self.owed.push(Marker::Recovery { lost: true });
             self.flush(at);
-            return;
+            return false;
         }
         self.send(at, event);
+        true
     }
 
     fn send(&mut self, at: TimeUs, event: TapEvent) {
@@ -1214,7 +1237,36 @@ mod tests {
                 assert!(!keys.key(1, WindowKeyEvent::Release, false));
             }
         });
-        assert_eq!(held, 0, "the release is in the baseline");
+        assert_eq!(held, Some(0), "the release is in the baseline");
+    }
+
+    /// The acknowledgement is bounded: a window changing its keys between
+    /// every read and step leaves the overflow standing, for the next wake,
+    /// instead of holding the input thread; once the window is quiet it
+    /// goes through.
+    #[test]
+    fn a_busy_window_leaves_the_acknowledgement_for_the_next_wake() {
+        let (mut keys, receiver) = window_keys();
+        for _ in 0..=super::WINDOW_KEYS {
+            keys.key(1, WindowKeyEvent::Press, false);
+        }
+        let mut tries = 0;
+        let held = receiver.shared.acknowledge(|| {
+            tries += 1;
+            // A dropped repeat moves the version every time.
+            assert!(!keys.key(1, WindowKeyEvent::Repeat, false));
+        });
+        assert_eq!(held, None);
+        assert_eq!(tries, super::ACK_TRIES);
+        assert!(
+            receiver
+                .shared
+                .word
+                .load(std::sync::atomic::Ordering::Acquire)
+                & super::OVERFLOW
+                != 0
+        );
+        assert_eq!(receiver.shared.acknowledge(|| {}), Some(2));
     }
 }
 
