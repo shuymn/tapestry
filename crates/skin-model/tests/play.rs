@@ -13,9 +13,9 @@ use rules::{GaugeValue, Judgment};
 use skin_model::{
     Attempt, Blend, BpmRange, ClipId, CoverSettings, DurationRatio, Ease, ElementDef, End,
     ErrorKind, Export, FrameReadouts, GREEN_MAX, GaugeDesc, KeyDef, LaneView, LoadError,
-    MAX_ELEMENTS, MAX_OPS, MAX_SKIN_KEYS, MAX_WHEN_TIMERS, PLAY, PlayContext, PrepareError, Prop,
-    READOUT_MAX, Schema, Scope, Side, TIMER_OFF, TimerDef, TimerRef, Track, Ty, compile, field,
-    timer,
+    MAX_ELEMENTS, MAX_OPS, MAX_SKIN_KEYS, MAX_WHEN_TIMERS, NativeReadouts, PLAY, PlayContext,
+    PrepareError, Prop, READOUT_MAX, Schema, Scope, Side, TIMER_OFF, TimerDef, TimerRef, Track, Ty,
+    compile, field, timer,
 };
 
 const BPM_150: i64 = 150_000;
@@ -1095,10 +1095,8 @@ const COVERS_OFF: CoverSettings = CoverSettings {
 
 /// Nothing known, every cover off at 0.
 const UNKNOWN: FrameReadouts = FrameReadouts {
-    bpm_current_x100: None,
-    hispeed_x100: None,
-    duration: None,
     covers: COVERS_OFF,
+    ..FrameReadouts::UNAVAILABLE
 };
 
 fn ratio(numerator: u128, denominator: u128) -> Option<DurationRatio> {
@@ -1292,6 +1290,7 @@ fn readouts_show_what_the_frame_supplies() {
         hispeed_x100: Some(105),
         duration: ratio(600, 1),
         covers: COVERS_OFF,
+        ..UNKNOWN
     });
     h.frame(0, &[]);
     #[rustfmt::skip]
@@ -1306,6 +1305,7 @@ fn readouts_show_what_the_frame_supplies() {
         hispeed_x100: Some(0),
         duration: ratio(0, 1),
         covers: COVERS_OFF,
+        ..UNKNOWN
     });
     h.frame(2_500, &[]);
     assert_eq!(h.field(field::BPM_CURRENT_X100), 0);
@@ -1515,7 +1515,147 @@ fn invalid_readouts() -> Vec<(FrameReadouts, LaneView)> {
         (with(stored(0, 0, 300)), view(0, 0, 300)),
         (with(stored(300, 0, 0)), view(300, 0, 0)),
         (with(stored(0, 300, 0)), view(0, 300, 0)),
+        // A variant: a zero denominator, then ms past the maximum
+        // (`2·top + 1` halves round to `top + 1`) and far past it.
+        (variant(7, ratio(1, 0)), none),
+        (variant(0, ratio(u128::from(top) * 2 + 1, 2)), none),
+        (variant(3, ratio(u128::MAX, 1)), none),
+        // The native block: a zero denominator, its rounding past the
+        // maximum, a target outside 1 to 6 000 or outside Floating.
+        (native(ratio(1, 0), None, false), none),
+        (native(ratio(u128::from(top) * 2 + 1, 2), None, false), none),
+        (native(None, Some(0), true), none),
+        (native(None, Some(6_001), true), none),
+        (native(None, Some(300), false), none),
     ]
+}
+
+/// [`UNKNOWN`] with variant `i` set to `d`.
+fn variant(i: usize, d: Option<DurationRatio>) -> FrameReadouts {
+    let mut r = UNKNOWN;
+    r.duration_variants[i] = d;
+    r
+}
+
+/// [`UNKNOWN`] with the native block's inputs.
+fn native(
+    duration: Option<DurationRatio>,
+    target_green: Option<u32>,
+    floating: bool,
+) -> FrameReadouts {
+    FrameReadouts {
+        native: NativeReadouts {
+            duration,
+            target_green,
+            floating,
+        },
+        ..UNKNOWN
+    }
+}
+
+/// The fields of the eight variants, slots 51 to 74, and the native
+/// block, 75 to 85.
+fn appended_fields(h: &Harness) -> (&[i32], &[i32]) {
+    let fields = h.play.state().fields;
+    let first = usize::from(field::DURATION_VARIANTS);
+    let native = usize::from(field::NATIVE_HISPEED_X100);
+    (&fields[first..native], &fields[native..field::COUNT])
+}
+
+/// Each variant rounds its ms half up and its green number half up from
+/// the exact ratio × 3/5, beside its own validity; the native block
+/// rounds `H` from the gain, `T` and `3T/5` the same way, and gives the
+/// whites from the stored covers over the effective lift. 502.5 ms is 503
+/// in every order, its green 301.5 → 302 here and ⌊3 · 503 / 5⌋ = 301 in
+/// slot 35 (design.md "Play readouts").
+#[test]
+fn variants_round_half_up_from_the_exact_ratio() {
+    let chart = taps(&[1_000]);
+    let mut h = Harness::new(load(Vec::new(), Vec::new()).unwrap(), &chart, &full(0));
+    let half = ratio(1_005, 2);
+    let mut variants = [None; 8];
+    // 502.5 ms (green 301.5), 937.5 ms (562.5), 1/3 ms (1/5), 0, two
+    // unknown, 2 000 000 ms exactly (1 200 000), 5/6 ms (1/2).
+    for (v, d) in variants.iter_mut().zip([
+        half,
+        ratio(1_875, 2),
+        ratio(1, 3),
+        ratio(0, 1),
+        None,
+        None,
+        ratio(2_000_000, 1),
+        ratio(5, 6),
+    ]) {
+        *v = d;
+    }
+    h.view = LaneView {
+        gain: skin_model::Gain::new(16, 5),
+        cover: 0,
+        lift: 300,
+        hidden: 0,
+    };
+    h.readouts = Some(FrameReadouts {
+        duration: half,
+        covers: CoverSettings {
+            cover: 200,
+            lift: 300,
+            hidden: 500,
+            cover_enabled: false,
+            lift_enabled: true,
+            hidden_enabled: false,
+            adjusting: false,
+        },
+        duration_variants: variants,
+        native: NativeReadouts {
+            duration: half,
+            target_green: Some(300),
+            floating: true,
+        },
+        ..UNKNOWN
+    });
+    h.frame(0, &[]);
+    let (variants, native) = appended_fields(&h);
+    #[rustfmt::skip]
+    assert_eq!(
+        variants,
+        [
+            503, 302, 1,
+            938, 563, 1,
+            0, 0, 1,
+            0, 0, 1,
+            0, 0, 0,
+            0, 0, 0,
+            2_000_000, 1_200_000, 1,
+            1, 1, 1,
+        ]
+    );
+    // H 3.20; 503 and 302; target 300; whites ⌊700 · 200 / 1 000⌋ = 140,
+    // the configured 300, ⌊700 · 500 / 1 000⌋ = 350; Floating.
+    assert_eq!(native, [320, 1, 503, 302, 1, 300, 1, 140, 300, 350, 1]);
+    // Slots 34 and 35 keep the source's order: 503, then ⌊1509 / 5⌋.
+    assert_eq!(
+        (h.field(field::DURATION_MS), h.field(field::DURATION_GREEN)),
+        (503, 301)
+    );
+    // No gain, no native duration, Classic: those read 0 and invalid,
+    // the whites stay.
+    h.view.gain = None;
+    h.readouts = Some(FrameReadouts {
+        covers: CoverSettings {
+            cover: 200,
+            lift: 300,
+            hidden: 500,
+            cover_enabled: false,
+            lift_enabled: true,
+            hidden_enabled: false,
+            adjusting: false,
+        },
+        ..UNKNOWN
+    });
+    h.frame(10, &[]);
+    let (variants, native) = appended_fields(&h);
+    assert!(variants.iter().all(|&v| v == 0));
+    assert_eq!(native, [0, 0, 0, 0, 0, 0, 0, 140, 300, 350, 0]);
 }
 
 /// An invalid readout refuses the frame before its effects, after the

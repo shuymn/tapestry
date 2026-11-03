@@ -1625,18 +1625,17 @@ fn take_loading(
 /// The loading frame of lifetime `lifetime` at `now` on the loading clock
 /// (design.md "Rendering and Skins", loading state): its origin, progress,
 /// gauge descriptor and text revision from the lifetime's newest state
-/// `update`, and the lanes' `visible_time` from the tuning snapshot; the
-/// author's layout and every cover 0 and off until the cover settings
-/// reach the frame (S10-04). Without a state yet it is the lifetime's
-/// first moment: from `now`, nothing loaded. Allocates nothing.
+/// `update`; no gain, the author's layout and every cover 0 and off until
+/// the presentation snapshot reaches the frame (S10-04b-2). Without a
+/// state yet it is the lifetime's first moment: from `now`, nothing
+/// loaded. Allocates nothing.
 fn loading_frame_of(
     lifetime: u64,
     now: TimeUs,
     update: Option<&LoadingUpdate>,
-    visible_time: TimeUs,
 ) -> LoadingFrame<'static> {
     let Some(u) = update else {
-        return LoadingFrame::interim(lifetime, now, now, visible_time);
+        return LoadingFrame::interim(lifetime, now, now);
     };
     LoadingFrame {
         load: skin_model::LoadState {
@@ -1645,7 +1644,7 @@ fn loading_frame_of(
         },
         gauge: u.gauge,
         text: u.revision,
-        ..LoadingFrame::interim(lifetime, now, u.origin, visible_time)
+        ..LoadingFrame::interim(lifetime, now, u.origin)
     }
 }
 
@@ -2189,10 +2188,16 @@ impl Run {
                         clippy::indexing_slicing,
                         reason = "`shown` counts a prefix of `overlay`"
                     )]
+                    // The declarative skin's lanes and readouts stay
+                    // unavailable until the presentation snapshot reaches
+                    // the frame (S10-04b-2); the simple skin draws from
+                    // the visible time.
                     let f = FrameInput {
                         now,
                         display_offset: TimeUs(t.display_offset_us),
                         visible_time: t.visible_time(),
+                        lanes: skin_model::LaneView::NONE,
+                        readouts: skin_model::FrameReadouts::UNAVAILABLE,
                         view,
                         effects: &effects,
                         gauge: *gauge,
@@ -2235,13 +2240,7 @@ impl Run {
                     #[cfg(feature = "dev-tools")]
                     let [_, _, _, before] = crate::alloc_count::counts();
                     let drawn = if let Some(lifetime) = loading_frame {
-                        let visible = self.view.tuning.get().visible_time();
-                        let frame = loading_frame_of(
-                            lifetime,
-                            self.clock.now(),
-                            update.as_deref(),
-                            visible,
-                        );
+                        let frame = loading_frame_of(lifetime, self.clock.now(), update.as_deref());
                         match screen.loading(page, update.as_deref(), *changed, &frame) {
                             Ok(Ok(t)) => Ok(t),
                             Ok(Err(e)) => {

@@ -28,12 +28,7 @@ fn frames(d: &mut Drawn, ms: i64) -> Vec<usize> {
 
 /// The readouts with the lane cover switched `on`.
 fn cover_switch(on: bool) -> FrameReadouts {
-    let mut r = readouts_for(LaneView {
-        visible_time: bms_model::TimeUs(0),
-        cover: 0,
-        lift: 0,
-        hidden: 0,
-    });
+    let mut r = readouts_for(LaneView::NONE);
     r.covers.cover_enabled = on;
     r
 }

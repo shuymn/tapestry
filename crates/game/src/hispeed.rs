@@ -520,7 +520,10 @@ pub fn duration_ms(bpm: Ratio, h: Ratio, covers: &Covers) -> Result<Ratio, Unrep
 /// The product of `nums` over the product of `dens`, each pair of factors
 /// cancelled first, so a result whose lowest terms fit never overflows on
 /// the way.
-fn cancelled(mut nums: [u128; 3], mut dens: [u128; 3]) -> Result<Ratio, Unrepresentable> {
+pub(crate) fn cancelled(
+    mut nums: [u128; 3],
+    mut dens: [u128; 3],
+) -> Result<Ratio, Unrepresentable> {
     for n in &mut nums {
         for d in &mut dens {
             let g = gcd(*n, *d);

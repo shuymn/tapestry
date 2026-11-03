@@ -340,7 +340,8 @@ fn write_png(path: &Path, w: u32, h: u32) {
 /// What an imported skin draws: the quads of frames at a few times of a
 /// 100-note play with a perfect judgment at each, each frame within the
 /// skin's quad capacity; its loading state is built too, within the same
-/// capacities.
+/// capacities. `seed` names one more readout frame's gain, covers,
+/// duration variants and native block.
 ///
 /// # Panics
 ///
@@ -348,7 +349,7 @@ fn write_png(path: &Path, w: u32, h: u32) {
 /// frame holds more quads than the skin's capacity, or a refused loading
 /// state builds again.
 #[must_use]
-pub fn draw(imported: &Imported) -> Vec<usize> {
+pub fn draw(imported: &Imported, seed: &[u8]) -> Vec<usize> {
     use bms_model::{ChartBuilder, Lane, TimeUs};
     use eval::{GaugeState, JudgeEvent, JudgeEventKind, Tally};
     use rules::{GaugeValue, Judgment, PerJudgment};
@@ -494,7 +495,7 @@ pub fn draw(imported: &Imported) -> Vec<usize> {
     ] {
         batch.clear();
         let frame_lanes = LaneView {
-            visible_time: TimeUs(600_000),
+            gain: GAIN_600_MS,
             cover,
             lift,
             hidden: if hidden_on { hidden } else { 0 },
@@ -526,7 +527,7 @@ pub fn draw(imported: &Imported) -> Vec<usize> {
         check_batch(skin, &batch);
     }
     rate_and_kind_probes(skin, &chart, &uvs, &mut batch);
-    readout_probes(skin, &chart, &uvs, &mut batch);
+    readout_probes(skin, &chart, &uvs, &mut batch, seed);
     choice_probes(skin, &chart, &uvs, &mut batch);
     bar_probes(skin, &ctx, (&tally, &states), &uvs, &mut batch);
     long_note_probes(skin, &ctx, (&tally, &states), &uvs, &mut batch);
@@ -593,7 +594,7 @@ fn lane_order_probes(
     }];
     for (k, cover) in [0_u16, 300, 1_000, 0, 500].into_iter().enumerate() {
         let view = LaneView {
-            visible_time: TimeUs(600_000),
+            gain: GAIN_600_MS,
             cover,
             lift: 0,
             hidden: 0,
@@ -911,7 +912,7 @@ fn grade_anchor_probes(
         .enumerate()
         {
             let view = LaneView {
-                visible_time: TimeUs(600_000),
+                gain: GAIN_600_MS,
                 cover,
                 lift: cover / 2,
                 hidden: 0,
@@ -983,7 +984,7 @@ fn loading_probes(
         }
         batch.clear();
         let lanes = LaneView {
-            visible_time: TimeUs(600_000),
+            gain: GAIN_600_MS,
             cover,
             lift: 0,
             hidden: 0,
@@ -1156,7 +1157,7 @@ fn long_note_probes(
         ] {
             batch.clear();
             let lanes = LaneView {
-                visible_time: TimeUs(600_000),
+                gain: GAIN_600_MS,
                 cover,
                 lift: 0,
                 hidden: 0,
@@ -1232,7 +1233,7 @@ fn bar_probes(
     ] {
         batch.clear();
         let lanes = LaneView {
-            visible_time: TimeUs(600_000),
+            gain: GAIN_600_MS,
             cover,
             lift,
             hidden: 0,
@@ -1522,9 +1523,12 @@ fn check_runs(batch: &skin_model::QuadBatch) {
     );
 }
 
+/// The gain that puts 600 ms of 150 BPM over the original lane: `H` 8/3.
+const GAIN_600_MS: Option<skin_model::Gain> = skin_model::Gain::new(8, 3);
+
 /// Lanes at 600 ms with no cover.
 const LANES_OFF: skin_model::LaneView = skin_model::LaneView {
-    visible_time: bms_model::TimeUs(600_000),
+    gain: GAIN_600_MS,
     cover: 0,
     lift: 0,
     hidden: 0,
@@ -1535,9 +1539,6 @@ const LANES_OFF: skin_model::LaneView = skin_model::LaneView {
 /// 1 000), so the frame is consistent.
 fn readouts_for(view: skin_model::LaneView) -> skin_model::FrameReadouts {
     skin_model::FrameReadouts {
-        bpm_current_x100: None,
-        hispeed_x100: None,
-        duration: None,
         covers: skin_model::CoverSettings {
             cover: view.cover.min(1_000),
             lift: view.lift.min(1_000),
@@ -1547,26 +1548,31 @@ fn readouts_for(view: skin_model::LaneView) -> skin_model::FrameReadouts {
             hidden_enabled: true,
             adjusting: false,
         },
+        ..skin_model::FrameReadouts::UNAVAILABLE
     }
 }
 
 /// The readouts at their extremes, each frame consistent: explicit
 /// tempo, hi-speed and duration, hi-speed unavailable, every cover at
 /// 1 000, covers off with stored amounts, durations of wide integer
-/// ratios and the largest readouts, before, during and past the chart,
-/// each inside the schema's ranges and the skin's capacities.
+/// ratios and the largest readouts, the lanes' gain at both ends and
+/// absent, the eight duration variants and the native block known and
+/// not, before, during and past the chart, then one frame whose gain,
+/// covers, variants and native block come from `seed`, each inside the
+/// schema's ranges and the skin's capacities.
 fn readout_probes(
     skin: &skin_model::Skin,
     chart: &bms_model::Chart,
     uvs: &skin_model::UvTable,
     batch: &mut skin_model::QuadBatch,
+    seed: &[u8],
 ) {
     use bms_model::TimeUs;
     use eval::{GaugeState, Tally};
     use rules::{GaugeValue, PerJudgment};
     use skin_model::{
-        Attempt, BpmRange, CoverSettings, DurationRatio, FrameReadouts, GaugeDesc, GaugeLook,
-        LaneView, Layout, PLAY, PlayContext, READOUT_MAX, Side, SkinFrame, field,
+        Attempt, BpmRange, CoverSettings, FrameReadouts, Gain, GaugeDesc, GaugeLook, LaneView,
+        Layout, NativeReadouts, PLAY, PlayContext, READOUT_MAX, Side, SkinFrame, field,
     };
 
     let descs = [GaugeDesc {
@@ -1596,6 +1602,73 @@ fn readout_probes(
         ..Default::default()
     };
     let top = READOUT_MAX.unsigned_abs();
+    // A ratio as the producer gives it: unavailable where it rounds past
+    // the maximum or has no denominator.
+    let ratios = [
+        (6_675, 10),
+        (u128::MAX, 1),
+        (u128::MAX, u128::MAX),
+        (u128::from(top) * 2 + 1, 2),
+        (1, u128::MAX),
+        (0, 7),
+        (u128::from(top) * 2 - 1, 2),
+        (5, 0),
+    ];
+    let gains = [
+        Gain::new(8, 3),
+        Gain::new(1, 100),
+        Gain::new(20, 1),
+        None,
+        Gain::new(u64::MAX, u64::MAX / 20),
+        Gain::new(u64::MAX / 100 + 1, u64::MAX),
+    ];
+    let probes = [
+        (Some(15_000), Some(105), 0, 1_000, 1_000, 1_000, true, false),
+        (Some(0), None, 1, 500, 250, 0, false, true),
+        (Some(top), Some(top), 2, 1_000, 0, 1_000, true, true),
+        (None, Some(0), 3, 0, 1_000, 500, false, false),
+        (Some(1), None, 4, 251, 999, 1, true, false),
+        (None, None, 5, 0, 0, 0, false, false),
+    ];
+    let frames = [-1_000_i64, 0, 999, 1_500, 2_000, 9_000_000]
+        .into_iter()
+        .zip(probes)
+        .enumerate()
+        .map(
+            |(k, (now_ms, (bpm, hs, ratio, cover, lift, hidden, on, adjusting)))| {
+                let covers = CoverSettings {
+                    cover,
+                    lift,
+                    hidden,
+                    cover_enabled: on,
+                    lift_enabled: !on,
+                    hidden_enabled: on,
+                    adjusting,
+                };
+                let at = |i: usize| {
+                    ratios
+                        .get((ratio + i) % ratios.len())
+                        .copied()
+                        .and_then(produced)
+                };
+                let floating = k % 2 == 0;
+                let readouts = FrameReadouts {
+                    bpm_current_x100: bpm,
+                    hispeed_x100: hs,
+                    duration: at(0),
+                    covers,
+                    duration_variants: std::array::from_fn(|i| at(i + 1)),
+                    native: NativeReadouts {
+                        duration: at(k),
+                        target_green: floating.then_some([1, 300, 6_000][k % 3]),
+                        floating,
+                    },
+                };
+                (now_ms, gains.get(k).copied().flatten(), readouts)
+            },
+        );
+    let (gain, seeded) = seeded_readouts(seed);
+    let frames: Vec<_> = frames.chain([(1_000, gain, seeded)]).collect();
     for range in [
         None,
         Some(BpmRange {
@@ -1620,51 +1693,14 @@ fn readout_probes(
         let mut play = skin
             .prepare(chart, &ctx)
             .expect("an imported skin prepares");
-        let ratios = [
-            (6_675, 10),
-            (u128::MAX, 1),
-            (u128::MAX, u128::MAX),
-            (u128::from(top) * 2 + 1, 2),
-            (1, u128::MAX),
-            (0, 7),
-        ];
-        let probes = [
-            (Some(15_000), Some(105), 0, 1_000, 1_000, 1_000, true, false),
-            (Some(0), None, 1, 500, 250, 0, false, true),
-            (Some(top), Some(top), 2, 1_000, 0, 1_000, true, true),
-            (None, Some(0), 3, 0, 1_000, 500, false, false),
-            (Some(1), None, 4, 251, 999, 1, true, false),
-            (None, None, 5, 0, 0, 0, false, false),
-        ];
-        for (now_ms, (bpm, hs, ratio, cover, lift, hidden, on, adjusting)) in
-            [-1_000_i64, 0, 999, 1_500, 2_000, 9_000_000]
-                .into_iter()
-                .zip(probes)
-        {
-            // A duration rounding past the maximum is refused; this probe
-            // draws only valid frames, so those leave the duration unknown.
-            let duration = ratios
-                .get(ratio)
-                .filter(|&&(n, d)| n / d < u128::from(top))
-                .map(|&(numerator, denominator)| DurationRatio {
-                    numerator,
-                    denominator,
-                });
-            let covers = CoverSettings {
-                cover,
-                lift,
-                hidden,
-                cover_enabled: on,
-                lift_enabled: !on,
-                hidden_enabled: on,
-                adjusting,
-            };
+        for &(now_ms, gain, readouts) in &frames {
+            let c = readouts.covers;
             let effective = |enabled: bool, v: u16| if enabled { v } else { 0 };
             let lanes = LaneView {
-                visible_time: TimeUs(600_000),
-                cover: effective(on, cover),
-                lift: effective(!on, lift),
-                hidden: effective(on, hidden),
+                gain,
+                cover: effective(c.cover_enabled, c.cover),
+                lift: effective(c.lift_enabled, c.lift),
+                hidden: effective(c.hidden_enabled, c.hidden),
             };
             batch.clear();
             let notes = eval::NoteFacts::default();
@@ -1681,12 +1717,7 @@ fn readout_probes(
                 target: [1_920, 1_080],
                 layout: &Layout::AUTHOR,
                 lanes,
-                readouts: FrameReadouts {
-                    bpm_current_x100: bpm,
-                    hispeed_x100: hs,
-                    duration,
-                    covers,
-                },
+                readouts,
                 playing: true,
             };
             skin.build(&mut play, &frame, uvs, batch)
@@ -1698,19 +1729,105 @@ fn readout_probes(
                 }
             }
             let read = |slot: u16| fields.get(usize::from(slot)).copied();
-            assert_eq!(read(field::HISPEED_VALID), Some(i32::from(hs.is_some())));
+            let valid = |known: bool| Some(i32::from(known));
+            assert_eq!(
+                read(field::HISPEED_VALID),
+                valid(readouts.hispeed_x100.is_some())
+            );
             assert_eq!(
                 read(field::DURATION_VALID),
-                Some(i32::from(duration.is_some()))
+                valid(readouts.duration.is_some())
+            );
+            assert_eq!(read(field::BPM_RANGE_VALID), valid(range.is_some()));
+            assert_eq!(read(field::COVER_PERMILLE), Some(i32::from(c.cover)));
+            for (i, v) in (0_u16..).zip(&readouts.duration_variants) {
+                let slot = field::duration_variant(i / 2, i % 2 == 0) + 2;
+                assert_eq!(read(slot), valid(v.is_some()), "variant {i}");
+            }
+            assert_eq!(read(field::NATIVE_HISPEED_VALID), valid(gain.is_some()));
+            assert_eq!(
+                read(field::NATIVE_DURATION_VALID),
+                valid(readouts.native.duration.is_some())
             );
             assert_eq!(
-                read(field::BPM_RANGE_VALID),
-                Some(i32::from(range.is_some()))
+                read(field::NATIVE_TARGET_VALID),
+                valid(readouts.native.target_green.is_some())
             );
-            assert_eq!(read(field::COVER_PERMILLE), Some(i32::from(cover)));
+            assert_eq!(read(field::NATIVE_LIFT_WHITE), Some(i32::from(c.lift)));
             check_batch(skin, batch);
         }
     }
+}
+
+/// A duration ratio as the producer gives it: unavailable where it rounds
+/// past the readout maximum or has no denominator.
+fn produced((numerator, denominator): (u128, u128)) -> Option<skin_model::DurationRatio> {
+    let top = u128::from(skin_model::READOUT_MAX.unsigned_abs());
+    (denominator > 0 && numerator / denominator < top).then_some(skin_model::DurationRatio {
+        numerator,
+        denominator,
+    })
+}
+
+/// The bytes [`seeded_readouts`] reads: the gain's two terms, the switches,
+/// three covers, the target, the tempo and the hi-speed, then ten ratios
+/// (the eight variants, the native and the source duration) of two
+/// 16-byte terms each.
+#[cfg(test)]
+pub(crate) const SEEDED_BYTES: usize = 8 + 8 + 1 + 3 * 2 + 2 + 4 + 4 + 10 * 32;
+
+/// One readout frame's gain and readouts from `seed`, read cyclically, so
+/// any nonempty input names a gain, covers, eight variants, a native
+/// block and a source duration, each consistent as a producer gives it;
+/// an empty seed reads as zeros.
+pub(crate) fn seeded_readouts(
+    seed: &[u8],
+) -> (Option<skin_model::Gain>, skin_model::FrameReadouts) {
+    use skin_model::{CoverSettings, FrameReadouts, Gain, NativeReadouts, READOUT_MAX};
+
+    let top = READOUT_MAX.unsigned_abs();
+    let mut bytes = seed.iter().copied().cycle();
+    let mut next = |n: usize| {
+        (0..n).fold(0_u128, |v, _| {
+            v << 8 | u128::from(bytes.next().unwrap_or(0))
+        })
+    };
+    let small = |v: u128| u16::try_from(v % 1_001).unwrap_or(0);
+    let (num, den) = (next(8), next(8));
+    let gain = Gain::new(
+        u64::try_from(num).unwrap_or(0),
+        u64::try_from(den).unwrap_or(0),
+    );
+    let flags = next(1);
+    let seeded_covers = CoverSettings {
+        cover: small(next(2)),
+        lift: small(next(2)),
+        hidden: small(next(2)),
+        cover_enabled: flags & 1 != 0,
+        lift_enabled: flags & 2 != 0,
+        hidden_enabled: flags & 4 != 0,
+        adjusting: flags & 8 != 0,
+    };
+    let floating = flags & 16 != 0;
+    let target = u32::try_from(next(2) % 6_001).unwrap_or(0);
+    let bpm = u32::try_from(next(4)).ok().filter(|&b| b <= top);
+    let hispeed = u32::try_from(next(4)).ok().filter(|&h| h <= top);
+    let mut ratio = || produced((next(16), next(16)));
+    let duration_variants = std::array::from_fn(|_| ratio());
+    let native = ratio();
+    let seeded = FrameReadouts {
+        bpm_current_x100: bpm,
+        hispeed_x100: hispeed,
+        duration: ratio(),
+        covers: seeded_covers,
+        duration_variants,
+        native: NativeReadouts {
+            duration: native,
+            target_green: (floating && target > 0).then_some(target),
+            floating,
+        },
+    };
+    (gain, seeded)
 }
 
 /// The header's counts are inside their caps, its size is an accepted
@@ -1797,7 +1914,7 @@ pub fn skin_json(data: &[u8]) -> Result<(Header, Result<Imported, ImportError>),
     let imported = import(&mut def, &header, &Config::defaults(&header));
     if let Ok(i) = &imported {
         check_usage(i);
-        black_box(draw(i));
+        black_box(draw(i, data));
     }
     Ok((configured, imported))
 }
@@ -1971,7 +2088,7 @@ pub fn skin_lua(data: &[u8]) -> Result<(Header, Result<LuaImported, ImportError>
     }
     let _ = outcome(&last_items(h.header()));
     if let Ok(i) = &first {
-        black_box(draw(&i.imported));
+        black_box(draw(&i.imported, data));
     }
     Ok((h.header().clone(), first))
 }

@@ -9,8 +9,8 @@ use rules::{CanonicalError, RuleError};
 use skin_beatoraja::{Header, ImportError, Imported, NoteKind, Rule, Syntax, Usage};
 
 use crate::{
-    RawSummary, bms_load, draw, preset_canonical, raw_input, replay_body, replay_file, seeds,
-    skin_fnt, skin_json, skin_lua,
+    RawSummary, SEEDED_BYTES, bms_load, draw, preset_canonical, raw_input, replay_body,
+    replay_file, seeded_readouts, seeds, skin_fnt, skin_json, skin_lua,
 };
 
 /// Every seed in `expected` is generated, and no other: a deleted seed
@@ -673,7 +673,7 @@ fn skin_import_seeds_import_and_draw_as_built() {
         let i = imported.unwrap_or_else(|e| panic!("{name}: {e}"));
         let u = i.report.usage;
         // Quads at 0, 50, 500 and 5,000 ms, each with a perfect judgment.
-        let drawn = draw(&i);
+        let drawn = draw(&i, &[]);
         match name {
             "images" => {
                 assert_eq!(u, usage(2, 2, 14, 2), "{name}");
@@ -1176,4 +1176,36 @@ fn skin_fnt_seeds_parse_or_fail_as_built() {
             "{name}"
         );
     }
+}
+
+/// The seeded readout frame reads every one of its bytes: a seed whose
+/// ten ratios each have a nonzero numerator gives ten known, nonzero
+/// durations, the source duration last at bytes 321 to 352; and a short
+/// nonempty seed, read cyclically, still names every ratio.
+#[test]
+fn every_seeded_ratio_can_be_nonzero() {
+    let mut seed = vec![1_u8; SEEDED_BYTES - 10 * 32];
+    for i in 1..=10_u128 {
+        seed.extend((1_000 * i).to_be_bytes());
+        seed.extend(3_u128.to_be_bytes());
+    }
+    assert_eq!(seed.len(), SEEDED_BYTES);
+    let ratios = |seed: &[u8]| {
+        let (_, r) = seeded_readouts(seed);
+        let mut all = r.duration_variants.to_vec();
+        all.extend([r.native.duration, r.duration]);
+        all
+    };
+    let read = ratios(&seed);
+    for (i, d) in (1..=10_u128).zip(&read) {
+        let d = d.expect("known");
+        assert_eq!((d.numerator, d.denominator), (1_000 * i, 3), "ratio {i}");
+    }
+    // Ratios of the repeated bytes 0x0101…: each exactly 1, so known and
+    // nonzero.
+    assert!(
+        ratios(&[1])
+            .iter()
+            .all(|d| d.is_some_and(|d| d.numerator > 0))
+    );
 }

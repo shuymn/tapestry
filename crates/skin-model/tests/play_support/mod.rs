@@ -12,7 +12,7 @@ use image::{ImageFormat, Rgba, RgbaImage};
 use rules::{GaugeValue, Judgment, PerJudgment};
 use skin_model::{
     Anchor, AtlasLimits, Attempt, Blend, BuildError, CoverSettings, Ease, ElementDef, End, FileDef,
-    Filter, Fit, FrameReadouts, GaugeDesc, GaugeLook, ImageDef, KeyDef, LaneView, Layout,
+    Filter, Fit, FrameReadouts, Gain, GaugeDesc, GaugeLook, ImageDef, KeyDef, LaneView, Layout,
     LoadError, PLAY, Place, Play, PlayContext, Program, QuadBatch, Region, RegionDef, Scope, Sheet,
     Side, Skin, SkinDef, SkinFrame, Source, TimerRef, Ty, UvTable, Variant, compile,
 };
@@ -217,9 +217,6 @@ pub fn full(lead_in_ms: i64) -> PlayContext<'static> {
 /// at 1 000), so the frame is consistent.
 pub fn readouts_for(view: LaneView) -> FrameReadouts {
     FrameReadouts {
-        bpm_current_x100: None,
-        hispeed_x100: None,
-        duration: None,
         covers: CoverSettings {
             cover: view.cover.min(1_000),
             lift: view.lift.min(1_000),
@@ -229,6 +226,7 @@ pub fn readouts_for(view: LaneView) -> FrameReadouts {
             hidden_enabled: true,
             adjusting: false,
         },
+        ..FrameReadouts::UNAVAILABLE
     }
 }
 
@@ -315,9 +313,14 @@ pub fn load(whens: Vec<Program>, elements: Vec<ElementDef>) -> Result<Skin, Load
     Skin::new(def(whens, white_sheet(), elements))
 }
 
-/// What a frame shows the lanes by default: 600 ms visible, no covers.
+/// The gain that shows 600 ms over the whole lane at 150 BPM: `H` 8/3,
+/// as `240000 / (150 · 600)`.
+pub const GAIN_600_MS_AT_150: Option<Gain> = Gain::new(8, 3);
+
+/// What a frame shows the lanes by default: 600 ms over the lane at 150
+/// BPM, no covers.
 pub const VIEW: LaneView = LaneView {
-    visible_time: TimeUs(600 * MS),
+    gain: GAIN_600_MS_AT_150,
     cover: 0,
     lift: 0,
     hidden: 0,

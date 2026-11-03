@@ -48,14 +48,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use bms_model::{Chart, ChartBuilder, TimeUs};
 use common::{GAUGES, MS, attempt, context, input, lane, offscreen, view};
-use decl_support::{Look, bundle};
+use decl_support::{FULL_LANES, Look, Part, bundle, full_readouts, lane_chart, part_counts};
 use eval::{JudgeEvent, JudgeEventKind};
 use render::{
     Blend, ClipTable, DeclSkin, FrameInput, Gpu, LoadingFrame, MAX_SPRITES, PlaySkin, Scissor,
     SimpleSkin, SkinError, Sprite, SpriteBatch, Staging,
 };
 use rules::Judgment;
-use skin_model::{BuildError, ClipId};
+use skin_model::{BuildError, ClipId, LaneView};
 
 struct Counting;
 
@@ -484,6 +484,7 @@ fn frames_do_not_allocate_from_the_first() {
     assert_eq!(result_allocs, 0, "the result page allocated");
 
     declarative_frames(&chart, &taps, &overlay, glyphs);
+    declarative_lane_frames();
     loading_frames();
     imported_frames(&chart, &overlay, glyphs);
 }
@@ -541,8 +542,7 @@ fn imported_frames(chart: &Chart, overlay: &[&str], glyphs: usize) {
     // Lift cycling 0 to 990 ‰ by 30 ‰ a frame: the paint below, across
     // and above its line.
     let lifted = |lifetime: u64, k: i64, lift: u16| {
-        let mut f =
-            LoadingFrame::interim(lifetime, TimeUs(k * FRAME_US), TimeUs(0), common::VISIBLE);
+        let mut f = LoadingFrame::interim(lifetime, TimeUs(k * FRAME_US), TimeUs(0));
         f.lanes.lift = lift;
         f.covers.lift = lift;
         f.covers.lift_enabled = true;
@@ -813,7 +813,7 @@ fn loading_frames() {
         },
         gauge: Some(skin_model::LoadingGauge::of(0, &GAUGES[0])),
         text: 1,
-        ..LoadingFrame::interim(1, TimeUs(k * FRAME_US), TimeUs(0), common::VISIBLE)
+        ..LoadingFrame::interim(1, TimeUs(k * FRAME_US), TimeUs(0))
     };
     skin.enter_loading(1);
     let (first, first_allocs) = counted(|| {
@@ -848,12 +848,7 @@ fn loading_frames() {
     assert!(staging.instances().is_empty());
     // The next lifetime: its state started afresh in place, then its first
     // frame built, as the renderer's loading frame does both.
-    let next = LoadingFrame::interim(
-        2,
-        TimeUs((FRAMES + 2) * FRAME_US),
-        TimeUs(0),
-        common::VISIBLE,
-    );
+    let next = LoadingFrame::interim(2, TimeUs((FRAMES + 2) * FRAME_US), TimeUs(0));
     let (second, second_allocs) = counted(|| {
         skin.enter_loading(2);
         staging
@@ -865,6 +860,77 @@ fn loading_frames() {
         second_allocs, 0,
         "a second lifetime's first frame allocated"
     );
+}
+
+/// The full lane fixture on a declarative skin: its first frame at a
+/// field draws every note category, the bar group and each cover paint
+/// as quads, then frames moving the playhead, the gain and the covers,
+/// and frames with no field left (LIFT or SUDDEN+ at 1 000 ‰), which
+/// draw no note geometry and keep SUDDEN+'s paint, all allocate nothing.
+fn declarative_lane_frames() {
+    let r = offscreen(1_920, 1_080);
+    let dir = tempfile::tempdir().unwrap();
+    let look = Look {
+        structure: true,
+        full_lanes: true,
+        ..Look::left([255, 0, 0, 255])
+    };
+    let (b, _) = bundle(&r, dir.path(), &look);
+    let chart = lane_chart();
+    let ctx = context(&GAUGES, false);
+    let mut skin = DeclSkin::new(b.clone());
+    skin.prepare(r.gpu(), &attempt(&r, &chart, &ctx)).unwrap();
+    let canvas = skin.canvas([1920, 1080]);
+    let mut staging = Staging::with_runs(skin.capacity(), skin.run_capacity(), &canvas);
+    staging.set_clips(b.clips().clone());
+    let v = view(0, 0);
+    let frame = |staging: &mut Staging, skin: &mut DeclSkin, now_ms: i64, lanes: LaneView| {
+        let f = FrameInput {
+            lanes,
+            readouts: full_readouts(lanes),
+            ..input(&v, TimeUs(now_ms * MS), TimeUs(0), &[])
+        };
+        staging.build(skin, &f)
+    };
+    let (first, first_allocs) = counted(|| frame(&mut staging, &mut skin, 900, FULL_LANES));
+    assert_eq!(first, Ok(()));
+    assert_eq!(
+        first_allocs, 0,
+        "the full lane fixture's first frame allocated"
+    );
+    let counts = part_counts(&r, &b, staging.instances());
+    assert!(counts.iter().all(|&n| n > 0), "{counts:?}");
+    let (later, later_allocs) = counted(|| {
+        (1..FRAMES).try_for_each(|k| {
+            let lanes = LaneView {
+                gain: skin_model::Gain::new(1 + u64::try_from(k % 20).unwrap(), 3),
+                cover: u16::try_from(k % 900).unwrap(),
+                ..FULL_LANES
+            };
+            frame(&mut staging, &mut skin, 900 + k, lanes)
+        })
+    });
+    assert_eq!(later, Ok(()));
+    assert_eq!(
+        later_allocs, 0,
+        "the full lane fixture's later frames allocated"
+    );
+    for (cover, lift) in [(200, 1_000), (1_000, 100), (1_000, 1_000)] {
+        let zero = LaneView {
+            cover,
+            lift,
+            ..FULL_LANES
+        };
+        let (built, allocs) = counted(|| frame(&mut staging, &mut skin, 900, zero));
+        assert_eq!(built, Ok(()));
+        assert_eq!(allocs, 0, "a frame with no field allocated");
+        let counts = part_counts(&r, &b, staging.instances());
+        let case = format!("cover {cover}, lift {lift}: {counts:?}");
+        for p in Part::NOTES {
+            assert_eq!(counts[p as usize - 1], 0, "{p:?}, {case}");
+        }
+        assert!(counts[Part::Sudden as usize - 1] > 0, "{case}");
+    }
 }
 
 /// A declarative skin prepared for an attempt of `chart`, as the

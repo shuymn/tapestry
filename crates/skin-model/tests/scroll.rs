@@ -1,17 +1,18 @@
 //! The scroll arithmetic against the simple skin's original: `reference`
 //! holds the original's constants and `Scale` verbatim (crates/render/src/
-//! simple.rs, `layout`), a property test checks that the copy, given the
-//! simple skin's span and line and the same playhead position and initial
-//! rate as the original, produces the same bits, and a drift guard fails
+//! simple.rs, `layout`), a property test checks that the model's `Scale`,
+//! given the original's line, pixels per position and playhead position,
+//! places and windows positions to the same bits, and a drift guard fails
 //! once the original changes without the reference. Both skins take that
 //! position from the exact playhead (`ExactPlayhead`); only the arithmetic
-//! from a position to pixels is tied here. Render is Windows-only, so the
+//! from a position to pixels is tied here, the model's pixels per position
+//! coming from the gain (`Gain::px_per_pos`). Render is Windows-only, so the
 //! original is read as text, not linked. The guard goes when the original
 //! is deleted.
 
 use bms_model::{Position, ScrollMap, TimeUs};
 use proptest::prelude::*;
-use skin_model::Scale;
+use skin_model::{Gain, Scale};
 
 #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
 mod reference {
@@ -166,9 +167,11 @@ proptest! {
     ) {
         let at_line = Position(at_line);
         let original = reference::Scale::new(at_line, rate, TimeUs(visible));
-        let copy = Scale::new(at_line, rate, TimeUs(visible), span(), 880.0);
-        prop_assert_eq!(copy.at_line, original.at_line);
-        prop_assert_eq!(copy.px_per_pos.to_bits(), original.px_per_pos.to_bits());
+        let copy = Scale {
+            at_line,
+            px_per_pos: original.px_per_pos,
+            line_y: f64::from(reference::JUDGE_Y),
+        };
         // Near the line as well as anywhere.
         let near = ps.iter().map(|p| Position(copy.at_line.0.saturating_add(p >> 64)));
         for p in ps.iter().map(|&p| Position(p)).chain(near) {
@@ -176,4 +179,40 @@ proptest! {
         }
         prop_assert_eq!(copy.positions(below, above), original.positions(below, above));
     }
+}
+
+/// A gain needs both terms positive and lies within 1/100 to 20.
+#[test]
+fn gain_refuses_zero_and_out_of_range() {
+    for (num, den) in [(0, 1), (1, 0), (0, 0), (1, 101), (2_001, 100), (21, 1)] {
+        assert_eq!(Gain::new(num, den), None, "{num}/{den}");
+    }
+}
+
+#[test]
+fn gain_accepts_both_ends() {
+    for (num, den) in [(1, 100), (20, 1), (2_000, 100), (u64::MAX, u64::MAX)] {
+        let g = Gain::new(num, den).unwrap();
+        assert_eq!((g.num(), g.den()), (num, den));
+    }
+}
+
+/// Terms near `u64::MAX` compare exactly and still give a finite,
+/// positive scale.
+#[test]
+fn gain_with_large_terms_is_finite() {
+    let g = Gain::new(u64::MAX - 1, (u64::MAX - 1) / 3).unwrap();
+    let beat = (1_u128 << 80) as f64;
+    for len in [1.0, 800.0, 1e6] {
+        let p = g.px_per_pos(len);
+        assert!(p.is_finite() && p > 0.0, "{len}: {p}");
+        // H 3 over `len` px: a beat is `3 · len / 4` px.
+        assert!((p * beat / (0.75 * len) - 1.0).abs() < 1e-12, "{len}");
+    }
+    // One unit past either end at the largest terms, and the end itself.
+    let (k, h) = (u64::MAX / 20, u64::MAX / 100);
+    assert_eq!(Gain::new(20 * k + 1, k), None);
+    assert!(Gain::new(20 * k, k).is_some());
+    assert_eq!(Gain::new(h - 1, 100 * h), None);
+    assert!(Gain::new(h, 100 * h).is_some());
 }

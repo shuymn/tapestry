@@ -32,6 +32,7 @@ mod practice_screen;
 mod prepare;
 pub mod presets;
 mod queue;
+pub mod readouts;
 mod ready_history;
 mod render;
 mod restore;
