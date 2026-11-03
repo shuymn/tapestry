@@ -1178,7 +1178,7 @@ fn json_included_by_a_lua_skin_is_read_once_for_both_passes() {
         ("p.json", "[{\"name\": \"o\"}]"),
     ]);
     let h = header(&d).unwrap();
-    std::fs::write(d.path().join("p.json"), "this is no JSON").unwrap();
+    std::fs::write(d.path().join("p.json"), "[{").unwrap();
     h.import(&Config::defaults(h.header()), &Cancel::new())
         .unwrap();
 }
