@@ -1681,6 +1681,15 @@ impl<O: AudioOutput + Wakes> Session<O> {
         self.gate.as_mut().map(|g| g.reader.read())
     }
 
+    /// The adjustments' driver, with the start gate.
+    #[must_use]
+    pub const fn adjustments(&self) -> Option<&crate::AdjustDriver> {
+        match &self.gate {
+            Some(g) => Some(&g.adjust),
+            None => None,
+        }
+    }
+
     /// The session's source set: its devices and the adjustment tap.
     pub const fn sources(&self) -> &SourceSet {
         &self.sources

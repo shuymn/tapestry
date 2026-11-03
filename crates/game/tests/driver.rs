@@ -763,23 +763,6 @@ fn the_previous_charts_double_press_does_not() {
 }
 
 #[test]
-fn a_withdrawn_attempt_re_solves_with_a_new_epoch() {
-    let mut rig = Rig::new(PlayOptions::default());
-    rig.enter(-1_000_000);
-    let first = rig.attach(tempo(150, None), -1_000_000).unwrap();
-    rig.tap(10 * MS, F2);
-    assert_eq!(rig.snap().hispeed, Some(r(37, 10)));
-    // Withdrawn before recording opened: nothing pending or active.
-    rig.driver.invalidate();
-    assert!(!rig.driver.has_pending());
-    rig.enter(-1_000_000);
-    let second = rig.attach(tempo(150, None), -1_000_000).unwrap();
-    assert!(second > first);
-    let s = rig.drain();
-    assert_eq!((s.hispeed, s.epoch), (Some(r(16, 5)), second));
-}
-
-#[test]
 fn a_device_change_while_loading_is_a_new_baseline() {
     let mut rig = Rig::new(PlayOptions::default());
     rig.enter(-1_000_000);

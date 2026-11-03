@@ -1190,3 +1190,26 @@ fn a_practice_round_commits_at_its_lead_in_start() {
     assert_eq!(r.history.openings[0].origin, TimeUs(-400 * MS));
     assert_eq!(count_judged(&report.live, Judgment::Perfect), 2);
 }
+
+/// A play withdrawn before recording opens (a quit while a hold defers its
+/// opening) leaves no attempt attached: the lifecycle's withdrawal hook
+/// invalidates its epoch, and the next play attaches as a new one.
+#[test]
+fn a_withdrawn_attempt_re_solves_with_a_new_epoch() {
+    let (_dir, root) = temp_root();
+    let mut s = session(&root, &Events::default());
+    let items = vec![connect(0), raw(-2_000, 0, Q, 1)];
+    let ran = s.play(script(items, &[(-500, Command::Quit)]));
+    assert!(matches!(ran, Err(game::SessionPlayError::Left)), "{ran:?}");
+    let first = s.presentation().unwrap().epoch;
+    let driver = s.adjustments().unwrap();
+    assert_eq!((driver.active(), driver.has_pending()), (None, false));
+    // Q released before the next opening.
+    let mut items = vec![raw(-1_500, 0, Q, 0)];
+    items.extend(notes_from(0));
+    let played = s.play(script(items, &[])).unwrap();
+    assert!(played.played());
+    let second = s.presentation().unwrap().epoch;
+    assert!(second > first, "{first} then {second}");
+    assert_eq!(s.adjustments().unwrap().active(), Some(second));
+}
