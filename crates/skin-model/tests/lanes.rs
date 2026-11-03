@@ -594,6 +594,28 @@ fn readout_fields_add_no_visits_or_quads() {
     let none = run(FrameReadouts::UNAVAILABLE);
     assert!(none.0.iter().all(|&n| n > 0), "{:?}", none.0);
     assert_eq!(run(known), none);
+    // At the visit budget exactly: `LANE_VISITS` judged taps in view, all
+    // visited and none drawn, end the visits with nothing dropped, and one
+    // tap more is dropped once; a readout spending a visit or a quad of the
+    // lanes would drop one more either way.
+    let per_lane = i64::from(LANE_VISITS) / 8;
+    let mut effects = Vec::new();
+    for l in Lane::all() {
+        for n in 0..per_lane {
+            let n = usize::try_from(n).unwrap();
+            let l = u8::try_from(l.index()).unwrap();
+            effects.push(ev(0, judged(l, n, Judgment::Great, Some(0), None, 1)));
+        }
+    }
+    for (extra, dropped) in [(0, 0), (1, 1)] {
+        for readouts in [FrameReadouts::UNAVAILABLE, known] {
+            let mut h = Harness::new(budget_skin(), &taps(per_lane, 250, extra), &full(0));
+            h.readouts = Some(readouts);
+            h.frame(1_000, &effects);
+            assert!(rects(&h, NOTE).is_empty());
+            assert_eq!(h.batch.dropped(), dropped, "{extra} more, {readouts:?}");
+        }
+    }
 }
 
 #[test]
