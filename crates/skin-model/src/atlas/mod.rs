@@ -181,9 +181,8 @@ impl Sheet {
     /// decodes one file at a time, each into memory freed before the next:
     /// whole, or in bands of rows when it was admitted to be
     /// ([`MAX_STREAMED_TEXELS`](crate::MAX_STREAMED_TEXELS)), each band
-    /// written to every cell it crosses. A file whose dimensions, or for
-    /// one decoded in bands its format or header fields, changed since
-    /// load is refused. Generated cells
+    /// written to every cell it crosses. A file whose dimensions or format,
+    /// or a PNG whose header fields, changed since load is refused. Generated cells
     /// ([`SolidImageDef`](crate::SolidImageDef)) are written last, at one
     /// size in both variants, reading nothing.
     ///
@@ -330,14 +329,15 @@ impl Sheet {
             resolved.push((at, canonical, (version.dims, version.mode)));
         }
 
-        // The placements of one file's cells, reused across files.
-        let mut places = Vec::new();
-        let mut active = Vec::new();
         let mut budget = MAX_TOTAL_FILE_BYTES;
         for ((at, canonical, header), &(_, start, end)) in resolved.into_iter().zip(&used) {
             let bytes = image::read_encoded(&canonical, at, MAX_FILE_BYTES.min(budget), cancel)?;
             budget = budget.saturating_sub(u64::try_from(bytes.len()).unwrap_or(budget));
-            places.clear();
+            // This file's placements and window, at their exact size, made
+            // after its bytes are read and freed with them: nothing of one
+            // file's routing is live while the next file is read.
+            let mut places = Vec::with_capacity(end.saturating_sub(start));
+            let mut active = Vec::with_capacity(end.saturating_sub(start));
             places.extend((start..end).filter_map(|i| {
                 let place = packing.places.get(i)?;
                 Some(Placement {

@@ -36,8 +36,9 @@ pub(crate) const PNG_WORK_BYTES: usize = 1 << 20;
 /// How a file is decoded, decided from its header at admission.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Mode {
-    /// Whole, through `image`: at most [`MAX_IMAGE_TEXELS`].
-    Full,
+    /// Whole, through `image`: at most [`MAX_IMAGE_TEXELS`], with a PNG's
+    /// header fields (none for a JPEG or BMP).
+    Full(Option<PngHeader>),
     /// In bands of [`BAND_ROWS`] rows: a non-interlaced, non-animated PNG
     /// past [`MAX_IMAGE_TEXELS`], with the header fields admission read.
     Banded(PngHeader),
@@ -240,9 +241,14 @@ pub(crate) fn header(file: &mut File, len: u64) -> Result<Probe, DecodeError> {
         Err(_) if more => return Err(DecodeError::HeaderTooLarge),
         Err(e) => return Err(DecodeError::Image(e)),
     };
+    let png = format == Some(ImageFormat::Png);
     let mode = if !oversized(dims) {
-        Ok(Mode::Full)
-    } else if format == Some(ImageFormat::Png) {
+        Ok(Mode::Full(if png {
+            Some(png_ihdr(&bytes)?.1)
+        } else {
+            None
+        }))
+    } else if png {
         png_mode(&bytes)?
     } else {
         Err(Unbanded::Format)
@@ -267,6 +273,58 @@ fn png_decoder<R: BufRead + Seek>(r: R) -> png::Decoder<R> {
     });
     decoder.set_transformations(png::Transformations::EXPAND);
     decoder
+}
+
+/// The dimensions and header fields in a PNG's `IHDR`.
+fn png_ihdr(bytes: &[u8]) -> Result<([u32; 2], PngHeader), DecodeError> {
+    let mut decoder = png::Decoder::new_with_limits(
+        Cursor::new(bytes),
+        png::Limits {
+            bytes: PNG_WORK_BYTES,
+        },
+    );
+    let info = decoder.read_header_info()?;
+    let (w, h) = info.size();
+    let header = PngHeader {
+        color: info.color_type,
+        depth: info.bit_depth,
+        interlaced: info.interlaced,
+    };
+    Ok(([w, h], header))
+}
+
+/// Checks `bytes`, a file admitted for a whole decode with `dims` and
+/// `header`, before it is decoded: a PNG admitted must still be one with
+/// the same dimensions and header fields, and a JPEG or BMP must not
+/// have become a PNG.
+///
+/// # Errors
+///
+/// [`DecodeError::Changed`] for other dimensions,
+/// [`DecodeError::HeaderChanged`] for another format or header field.
+pub(crate) fn check_whole(
+    bytes: &[u8],
+    dims: [u32; 2],
+    header: Option<PngHeader>,
+) -> Result<(), DecodeError> {
+    let format = ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(DecodeError::Io)?
+        .format();
+    match (header, format == Some(ImageFormat::Png)) {
+        (None, false) => Ok(()),
+        (Some(_), false) | (None, true) => Err(DecodeError::HeaderChanged),
+        (Some(header), true) => {
+            let (now_dims, now) = png_ihdr(bytes)?;
+            if now_dims != dims {
+                Err(DecodeError::Changed)
+            } else if now != header {
+                Err(DecodeError::HeaderChanged)
+            } else {
+                Ok(())
+            }
+        }
+    }
 }
 
 /// The banded mode of an oversized PNG's first bytes, or why it has none.
@@ -324,7 +382,7 @@ pub(crate) trait Bands {
 }
 
 /// The encoded bytes as `png` reads them: once every row is read, each
-/// read asks `cancel` first.
+/// read asks `cancel` first, the rest of the image data included.
 struct Source<'a> {
     bytes: Cursor<Vec<u8>>,
     cancel: &'a dyn Fn() -> bool,
@@ -473,10 +531,11 @@ pub(crate) fn banded(
         }
         top = bottom;
     }
-    // Every row read: the reader is exhausted, then the chunks after the
-    // image data are read through `IEND`.
-    reader.read_row(&mut row).map_err(png_halt)?;
+    // Every row read: from here each read asks `cancel`, as the reader is
+    // exhausted (draining the rest of the image data chunks) and the
+    // chunks after them are read through `IEND`.
     trailing.set(true);
+    reader.read_row(&mut row).map_err(png_halt)?;
     reader.finish().map_err(png_halt)
 }
 

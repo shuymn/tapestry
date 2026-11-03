@@ -722,3 +722,98 @@ fn many_tall_thin_cells_route_within_the_bound() {
         }
     }
 }
+
+/// [`stream_png`] at 16 bits a sample.
+fn stream_png16(path: &std::path::Path, w: u32, h: u32, texel: impl Fn(u32, u32) -> [u16; 4]) {
+    let f = std::io::BufWriter::new(File::create(path).unwrap());
+    let mut enc = png::Encoder::new(f, w, h);
+    enc.set_color(png::ColorType::Rgba);
+    enc.set_depth(png::BitDepth::Sixteen);
+    enc.set_compression(png::Compression::Fast);
+    enc.set_filter(png::Filter::Up);
+    let mut header = enc.write_header().unwrap();
+    let mut out = header.stream_writer().unwrap();
+    let mut row = Vec::with_capacity(usize::try_from(w).unwrap() * 8);
+    for y in 0..h {
+        row.clear();
+        row.extend((0..w).flat_map(|x| texel(x, y)).flat_map(u16::to_be_bytes));
+        out.write_all(&row).unwrap();
+    }
+    out.finish().unwrap();
+}
+
+/// One file's routing is freed before the next file is read, and the
+/// widest band fits the bound. `many.png` (2049×16, decoded whole) has
+/// 32 769 cells of 1×1 in its first band; `deep.png` is 16 384 × 1 025
+/// RGBA16 (16.8 Mi texels, decoded in bands: each band 16 rows × 16 384
+/// texels, 2 MiB native beside 1 MiB RGBA8), padded after `IEND` to
+/// `E` = 32 MiB, so its bound is `max(2E, E + 16 MiB) + 1 MiB` =
+/// 64 MiB + 1 MiB beside the pages. Built with `many.png` read first, the
+/// peak past the pages is that of the build reading `deep.png` first:
+/// none of `many.png`'s routing (about 1.5 MiB for its cells) is live
+/// while `deep.png` is read and decoded.
+#[test]
+fn one_files_routing_is_freed_before_the_next_file_is_read() {
+    let d = dir();
+    save(d.path(), "many.png", &solid(2_049, 16, [9, 8, 7, 255]));
+    let deep = d.path().join("deep.png");
+    let colour = [0x8080_u16, 0x4000, 0xFFFF, 0xFFFF];
+    stream_png16(&deep, 16_384, 1_025, |_, _| colour);
+    let f = File::options().write(true).open(&deep).unwrap();
+    f.set_len(MAX_FILE_BYTES).unwrap();
+    drop(f);
+    let encoded = i64::try_from(MAX_FILE_BYTES).unwrap();
+    let images = |many: u32, deep: u32| {
+        let mut v: Vec<ImageDef> = (0..16)
+            .flat_map(|r| {
+                [0, 1_024].map(|x| ImageDef {
+                    rect: Some([x, r, 1_024, 1]),
+                    grid: [1_024, 1],
+                    ..whole(many)
+                })
+            })
+            .collect();
+        v.push(ImageDef {
+            rect: Some([2_048, 0, 1, 1]),
+            ..whole(many)
+        });
+        v.push(ImageDef {
+            rect: Some([0, 0, 8, 1_025]),
+            ..whole(deep)
+        });
+        v
+    };
+    let build = |files: [&str; 2], many: u32, deep: u32| {
+        let sheet = load(d.path(), files.map(file).to_vec(), images(many, deep)).unwrap();
+        assert_eq!(sheet.frame_count(), 32_770);
+        // Two pages of 8 192 and no reserved layer: the 128 Mi texel cap.
+        let limits = AtlasLimits {
+            max_side: 8_192,
+            max_layers: 2,
+            reserved_layers: 0,
+        };
+        let (atlas, peak) = measure(|| sheet.atlas(Variant::Lo, limits, &|| false).unwrap());
+        let pages = page_bytes(atlas.pages().len(), atlas.side());
+        let bound = pages + banded_bound(encoded);
+        assert!(peak <= bound, "peak {peak}, bound {bound}");
+        // The deep cell's first texel, its 16-bit samples rounded as a
+        // whole decode rounds them.
+        let f = atlas.uvs().frames()[32_769];
+        let side = atlas.side() as usize;
+        let (x, y) = (
+            (f.uv[0] * side as f32) as usize,
+            (f.uv[1] * side as f32) as usize,
+        );
+        let page = atlas.pages()[usize::from(f.layer)].level(0).unwrap();
+        let at = (y * side + x) * 4;
+        let want = colour.map(|v| u8::try_from((u32::from(v) + 128) / 257).unwrap());
+        assert_eq!(page[at..at + 4], want);
+        peak - pages
+    };
+    let deep_first = build(["deep.png", "many.png"], 1, 0);
+    let many_first = build(["many.png", "deep.png"], 0, 1);
+    assert!(
+        many_first <= deep_first + (256 << 10),
+        "many first {many_first}, deep first {deep_first}"
+    );
+}

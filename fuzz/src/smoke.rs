@@ -9,7 +9,7 @@ use rules::{CanonicalError, RuleError};
 use skin_beatoraja::{Header, ImportError, Imported, NoteKind, Rule, Syntax, Usage};
 
 use crate::{
-    PngOutcome, RawSummary, SEEDED_BYTES, bms_load, draw, preset_canonical, raw_input, replay_body,
+    RawSummary, SEEDED_BYTES, bms_load, draw, preset_canonical, raw_input, replay_body,
     replay_file, seeded_readouts, seeds, skin_fnt, skin_json, skin_lua, skin_png,
 };
 
@@ -1124,52 +1124,53 @@ fn skin_lua_seeds_import_or_fail_as_built() {
 
 #[test]
 fn skin_png_seeds_build_or_fail_as_built() {
-    use skin_model::{AtlasError, ImageError, TexelCap, Unbanded};
+    use skin_model::{AtlasError, ImageError};
     let seeds = seeds::skin_pngs();
+    let banded = [
+        "banded_grey1",
+        "banded_indexed8",
+        "banded_bad_text",
+        "cancelled_early",
+        "cancelled_late",
+    ];
     assert_names(
         &seeds,
         &[
-            "grey1",
-            "grey2_trns_text",
-            "palette4",
-            "cut",
-            "interlaced",
-            "small",
+            "grey8",
+            "grey16",
+            "grey_alpha8",
+            "rgb8",
+            "rgb16_trns",
+            "rgba8",
+            "rgba16",
+            "indexed8_trns",
+            "grey1_trns",
+            "bad_text",
+            banded[0],
+            banded[1],
+            banded[2],
+            banded[3],
+            banded[4],
         ],
     );
     for (name, bytes) in seeds {
-        assert!(bytes.len() <= 65_536, "{name}: {} bytes", bytes.len());
-        let outcome = skin_png(&bytes);
-        match name {
-            "grey1" | "grey2_trns_text" | "palette4" => {
-                assert!(
-                    matches!(outcome, PngOutcome::Built([4_097, 3_073])),
-                    "{name}: {outcome:?}"
-                );
-            }
-            "small" => assert!(
-                matches!(outcome, PngOutcome::Built([40, 30])),
-                "{name}: {outcome:?}"
-            ),
-            "cut" => assert!(
-                matches!(
-                    outcome,
-                    PngOutcome::Failed(_, AtlasError::Image(ImageError::Png { .. }))
-                ),
-                "{name}: {outcome:?}"
-            ),
-            "interlaced" => assert!(
-                matches!(
-                    outcome,
-                    PngOutcome::Refused(ImageError::TooManyTexels {
-                        cap: TexelCap::FullDecode(Unbanded::Interlaced),
-                        ..
-                    })
-                ),
-                "{name}: {outcome:?}"
-            ),
-            _ => panic!("no expectation for seed {name}"),
+        // `skin_png` checks every texel of its cells and the second build.
+        let o = skin_png(&bytes);
+        assert_eq!(o.banded, banded.contains(&name), "{name}");
+        let fails = name == "banded_bad_text";
+        assert_eq!(
+            o.built.is_err(),
+            fails,
+            "{name}: {:?}",
+            o.built.as_ref().err()
+        );
+        if fails {
+            assert!(
+                matches!(o.built, Err(AtlasError::Image(ImageError::Png { .. }))),
+                "{name}"
+            );
         }
+        assert_eq!(o.cancelled, name.starts_with("cancelled"), "{name}");
     }
 }
 

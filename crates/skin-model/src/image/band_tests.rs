@@ -237,7 +237,7 @@ fn both(png: &Png) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
     let dir = tempfile::tempdir().unwrap();
     let bytes = png.encode();
     let whole = sheet(dir.path(), &bytes, cells(png.w, png.h));
-    assert_eq!(whole.files[0].lo.mode, Mode::Full);
+    assert!(matches!(whole.files[0].lo.mode, Mode::Full(Some(_))));
     let full = levels(&whole.atlas(Variant::Lo, LIMITS, &never).unwrap());
     let bands = banded(whole, &bytes);
     let band = levels(&bands.atlas(Variant::Lo, LIMITS, &never).unwrap());
@@ -546,4 +546,61 @@ fn only_bands_something_draws_are_converted() {
     decode::banded(bytes, [7, 50], header, &never, &mut log).unwrap();
     assert_eq!(log.asked, [(0, 16), (16, 32), (32, 48), (48, 50)]);
     assert_eq!(log.put, [(32, 7, 16), (48, 7, 2)]);
+}
+
+#[test]
+fn a_whole_png_whose_header_changed_is_refused() {
+    // Admitted as a 61×53 RGBA8 PNG decoded whole, then replaced at the
+    // same size by a 16-bit RGB one, and by an interlaced one.
+    let good = Png::new(61, 53, png::ColorType::Rgba, png::BitDepth::Eight).encode();
+    let mut adam7 = good.clone();
+    adam7[28] = 1;
+    fix_crc(&mut adam7, 8);
+    for other in [
+        Png::new(61, 53, png::ColorType::Rgb, png::BitDepth::Sixteen).encode(),
+        adam7,
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let s = sheet(dir.path(), &good, cells(61, 53));
+        assert!(matches!(s.files[0].lo.mode, Mode::Full(Some(_))));
+        fs::write(dir.path().join("a.png"), &other).unwrap();
+        let e = s.atlas(Variant::Lo, LIMITS, &never).unwrap_err();
+        assert!(
+            matches!(e, AtlasError::Image(ImageError::HeaderChanged { .. })),
+            "{e:?}"
+        );
+    }
+}
+
+#[test]
+fn a_cancel_after_the_last_band_is_seen_in_the_rest_of_the_image_data() {
+    // A 4 097 × 3 073 PNG, decoded in bands, whose image data ends with an
+    // extra chunk whose CRC is wrong: drained after the last row, before
+    // the chunks after the image data. A cancel from the last band on
+    // stops the build there as a cancellation, never as that chunk's
+    // failure.
+    let (w, h) = (4_097, 3_073);
+    let mut png = Png::new(w, h, png::ColorType::Grayscale, png::BitDepth::One);
+    png.data.fill(0);
+    let mut bytes = png.encode();
+    let iend = last_chunk(&bytes, b"IEND");
+    let mut extra = 4_u32.to_be_bytes().to_vec();
+    extra.extend_from_slice(b"IDAT\x01\x02\x03\x04\0\0\0\0");
+    bytes.splice(iend..iend, extra);
+    let dir = tempfile::tempdir().unwrap();
+    let corners = vec![
+        image([0, 0, 16, 16], [1, 1]),
+        image([w - 16, h - 16, 16, 16], [1, 1]),
+    ];
+    let s = sheet(dir.path(), &bytes, corners);
+    assert!(matches!(s.files[0].lo.mode, Mode::Banded(_)));
+    let cancel = || SITE.with(Counter::get) == Some(Site::Trailing);
+    let e = s.atlas(Variant::Lo, LIMITS, &cancel).unwrap_err();
+    assert!(matches!(e, AtlasError::Cancelled), "{e:?}");
+    // Not cancelled, the extra chunk's CRC refuses the file.
+    let e = s.atlas(Variant::Lo, LIMITS, &never).unwrap_err();
+    assert!(
+        matches!(e, AtlasError::Image(ImageError::Png { .. })),
+        "{e:?}"
+    );
 }

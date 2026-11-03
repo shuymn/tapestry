@@ -232,8 +232,9 @@ pub enum ImageError {
     EmptyCell { image: usize },
     #[error("{at}'s dimensions changed since the skin was loaded")]
     DimensionsChanged { at: FileAt },
-    /// The format, colour type, bit depth, interlacing or animation of a
-    /// file decoded in bands changed since the skin was loaded.
+    /// A file's format, or a PNG's colour type, bit depth or interlacing
+    /// (or, decoded in bands, its animation), changed since the skin was
+    /// loaded.
     #[error("{at}'s header changed since the skin was loaded")]
     HeaderChanged { at: FileAt },
     /// The PNG decoder of a file decoded in bands, or of an oversized
@@ -352,7 +353,8 @@ pub(crate) fn decode_file(
     bands: &mut dyn decode::Bands,
 ) -> Result<Option<::image::RgbaImage>, Stop> {
     match mode {
-        Mode::Full => decode::decode(bytes, dims)
+        Mode::Full(header) => decode::check_whole(&bytes, dims, header)
+            .and_then(|()| decode::decode(bytes, dims))
             .map(Some)
             .map_err(|e| Stop::Image(ImageError::decode(at, e))),
         Mode::Banded(header) => decode::banded(bytes, dims, header, cancel, bands)

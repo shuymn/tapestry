@@ -109,6 +109,8 @@ members = ["."]
 # `#[no_mangle]`, which that lint flags.
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
+# cargo-fuzz builds the targets with `--cfg fuzzing`; `skin_png` reads it.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }
 
 [lints.clippy]
 all = { level = "warn", priority = -1 }
