@@ -12,7 +12,7 @@
 //!
 //! The player's counting allocator exists only in its development builds,
 //! so its allocation guards are unit tests of its binary, named `*_alloc`:
-//! every `#[test]` under the package's `src` whose body names the counter's
+//! every `#[test]` reachable from the binary's root whose body names the counter's
 //! module ([`COUNTER`], an identifier, not a string) must be, and one that
 //! measures through a helper must be named so too, since the body check
 //! does not follow calls. Each must be selected by a release command of a
@@ -328,6 +328,12 @@ impl Walk<'_> {
                             gated.as_deref(),
                         )?;
                         continue;
+                    }
+                    if m.attrs.iter().any(|a| a.path().is_ident("cfg_attr")) {
+                        bail!(
+                            "{file}: module `{child}` has a `#[cfg_attr]` on its `mod` line, \
+                             which may change the file it reads"
+                        );
                     }
                     if followed {
                         bail!(
@@ -950,7 +956,13 @@ jobs:
     /// The fixture workflow with `tempo_alloc` left out of [`ALLOC_STEP`]
     /// and a step `Extra` whose block command is `lines`.
     fn with_extra(lines: &[&str]) -> String {
-        let mut text = workflow("--test alloc");
+        extra_step("--test alloc", lines)
+    }
+
+    /// The fixture workflow with `alloc_tests` in [`ALLOC_STEP`] and a step
+    /// `Extra` whose block command is `lines`.
+    fn extra_step(alloc_tests: &str, lines: &[&str]) -> String {
+        let mut text = workflow(alloc_tests);
         text.push_str("      - name: Extra\n        run: |\n");
         for line in lines {
             text.push_str("          ");
@@ -1200,7 +1212,7 @@ mod tests {
                     ("src/main.rs", format!("#[{off}]\nmod m;")),
                     ("src/m.rs", GUARD_FN.into()),
                 ],
-                "is under `cfg_attr(".into(),
+                "has a `#[cfg_attr]` on its `mod` line".into(),
             ),
             (
                 "a mod line's cfg inside an inline module",
@@ -1230,7 +1242,19 @@ mod tests {
                     ),
                     ("shared/g.rs", GUARD_FN.into()),
                 ],
-                "is under `cfg_attr(".into(),
+                "has a `#[cfg_attr]` on its `mod` line".into(),
+            ),
+            (
+                "a mod line's cfg_attr choosing another file",
+                vec![
+                    (
+                        "src/main.rs",
+                        "#[cfg_attr(test, path = \"support_tests.rs\")]\nmod support;".into(),
+                    ),
+                    ("src/support.rs", String::new()),
+                    ("src/support_tests.rs", format!("#[cfg(unix)]\n{GUARD_FN}")),
+                ],
+                "has a `#[cfg_attr]` on its `mod` line".into(),
             ),
             (
                 "a file's inner cfg, across a file",
@@ -1347,10 +1371,7 @@ mod tests {
     /// The fixture workflow, every integration guard in its step, and a
     /// step `Extra` whose block command is `lines`.
     fn with_unit_step(lines: &[&str]) -> String {
-        with_extra(lines).replace(
-            "--test alloc -- --test not_a_target",
-            "--test alloc --test tempo_alloc -- --test not_a_target",
-        )
+        extra_step("--test alloc --test tempo_alloc", lines)
     }
 
     #[test]
@@ -1385,10 +1406,10 @@ mod tests {
         }
     }
 
-    /// A release command naming the package in any other form is refused:
-    /// a test name before `--` (which runs one test while the filters
-    /// would credit all), `--ignored` (which runs none), other selection
-    /// flags, and other cargo arguments.
+    /// A release command naming the package in any form but the canonical
+    /// one is refused: a test name before `--`, `--ignored`,
+    /// `--include-ignored`, `--bench`, `--list`, a `--skip` with no
+    /// pattern, other feature spellings, other packages, and `--no-run`.
     #[test]
     fn a_unit_command_of_another_form_is_refused() {
         let unit = unit(&[(GUARD, true)]);

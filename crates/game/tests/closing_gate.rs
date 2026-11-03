@@ -428,3 +428,58 @@ fn the_source_limit_flag_is_frozen_in_closing() {
         );
     }
 }
+
+/// Commands pending together in one wake are taken as the player's
+/// controls take them, whatever order the script published them in: a
+/// suspend before a retry (the play aborts as suspended), a quit dropping
+/// a retry during play (the quit enters Closing, which runs out), and in
+/// Closing a quit keeping the retry with it (Closing ends by the retry).
+#[test]
+fn a_batch_of_commands_is_taken_as_the_controls_take_it() {
+    use Command::{Quit, Retry, Suspend};
+    for (at, batch, end, closing_end) in [
+        (1_500, [Retry, Suspend], AbortCause::Suspend, None),
+        (1_500, [Suspend, Retry], AbortCause::Suspend, None),
+        (
+            1_500,
+            [Retry, Quit],
+            AbortCause::Quit,
+            Some(ClosingEnd::RanOut),
+        ),
+        (
+            1_500,
+            [Quit, Retry],
+            AbortCause::Quit,
+            Some(ClosingEnd::RanOut),
+        ),
+        (
+            3_000,
+            [Retry, Quit],
+            AbortCause::GaugeFailed,
+            Some(ClosingEnd::Retry),
+        ),
+        (
+            3_000,
+            [Quit, Retry],
+            AbortCause::GaugeFailed,
+            Some(ClosingEnd::Retry),
+        ),
+    ] {
+        let (_dir, root) = temp_root();
+        let mut s = session(&root, &notes(16), 0);
+        let commands = batch.map(|c| (at, c));
+        let report = s.play(script(vec![connect()], &commands)).unwrap();
+        assert_eq!(report.end, PlayEnd::Aborted(end), "{batch:?} at {at}");
+        assert_eq!(
+            report.closing.map(|c| c.end),
+            closing_end,
+            "{batch:?} at {at}"
+        );
+        if let Some(c) = report.closing {
+            assert_eq!(
+                c.ended_at == TimeUs(at * MS),
+                closing_end == Some(ClosingEnd::Retry)
+            );
+        }
+    }
+}

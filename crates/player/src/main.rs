@@ -774,6 +774,7 @@ fn rig<'a>(
             scratch: device.scratch,
         },
         gauge: settings.player.displayed_gauge,
+        attempt_gauge: settings.player.displayed_gauge,
         autoplay,
         input_offset_us: device.input_offset_us,
         files: SettingsFiles::new(root.clone(), settings.clone()),
@@ -1887,6 +1888,39 @@ mod tests {
         }
     }
 
+    /// Commands pending together are taken in the controls' order,
+    /// whatever order they were published in, with the retry's receipt
+    /// kept only when the retry is taken: a suspend before a retry, both
+    /// taken; a quit during play dropping a retry pressed with it, no
+    /// receipt.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn a_batch_of_commands_is_taken_in_the_controls_order() {
+        use Command::{Quit, Retry, Suspend};
+        use game::{Command, Rig as _};
+        for (batch, taken, receipt) in [
+            ([Retry, Suspend], [Some(Suspend), Some(Retry)], true),
+            ([Suspend, Retry], [Some(Suspend), Some(Retry)], true),
+            ([Retry, Quit], [Some(Quit), None], false),
+            ([Quit, Retry], [Some(Quit), None], false),
+        ] {
+            let ((), _) = on_rig(game::DeviceSettings::default(), |rig, _| {
+                for c in batch {
+                    rig.controls.command(c);
+                }
+                assert_eq!([rig.take(), rig.take()], taken, "{batch:?}");
+                assert_eq!(rig.take(), None, "{batch:?}");
+                let expected = if receipt {
+                    rig.controls.retry_at()
+                } else {
+                    None
+                };
+                assert_eq!(rig.pending_retry, expected, "{batch:?}");
+                assert_eq!(rig.pending_retry.is_some(), receipt, "{batch:?}");
+            });
+        }
+    }
+
     /// The gauge each play frame was drawn with.
     #[cfg(feature = "dev-tools")]
     type Gauges = Arc<std::sync::Mutex<Vec<usize>>>;
@@ -1933,6 +1967,98 @@ mod tests {
         }
     }
 
+    /// Settings showing gauge `displayed`.
+    #[cfg(feature = "dev-tools")]
+    fn gauge_settings(displayed: usize) -> game::Settings {
+        game::Settings {
+            device: game::DeviceSettings::default(),
+            player: game::PlayerSettings {
+                displayed_gauge: displayed,
+                ..Default::default()
+            },
+        }
+    }
+
+    /// A one-note chart loaded in `dir` with `settings` under the play
+    /// preset `preset`.
+    #[cfg(feature = "dev-tools")]
+    fn loaded_under(
+        dir: &std::path::Path,
+        settings: &game::Settings,
+        preset: &str,
+    ) -> game::Loaded {
+        let mut settings = settings.clone();
+        settings.player.preset = preset.to_owned();
+        let root = game::DataRoot::new(dir.join(preset));
+        let chart_path = dir.join("a.bms");
+        std::fs::write(&chart_path, "#BPM 120\n#00111:01\n").unwrap();
+        let config = game::SessionConfig {
+            lead_in: bms_model::TimeUs(1_000_000),
+            step: bms_model::TimeUs(1_000),
+            start: bms_model::TimeUs(0),
+            effects: 64,
+            seed: 1,
+            speed: bms_model::Speed::NORMAL,
+            app_version: "0.0.0-test".to_owned(),
+            provenance: replay::BuildProvenance::Development,
+            receive: replay::ReceiveMethod::Scripted,
+            autoplay: None,
+        };
+        let parts = game::Parts::unsaved(&settings.player);
+        game::Loaded::load(root, settings, &chart_path, config, parts).unwrap()
+    }
+
+    /// A render thread whose screen notes each play frame's gauge into
+    /// `seen`, with `loaded`'s chart.
+    #[cfg(feature = "dev-tools")]
+    fn gauge_render(seen: &Gauges, loaded: &game::Loaded) -> crate::render_side::RenderLink {
+        let noted = Arc::clone(seen);
+        let render = crate::render_side::tests::spawn_empty(Box::new(move || {
+            Ok(Box::new(GaugeFrames {
+                seen: Arc::clone(&noted),
+            }) as Box<dyn crate::render_side::Screen>)
+        }));
+        render.load(Arc::new(loaded.chart().clone()), None).unwrap();
+        render
+    }
+
+    /// The gauge the settings show stays the settings' across attempts
+    /// under different presets on one rig: under tapestry, which has two
+    /// gauges, the attempt shows the first for the settings' HAZARD (5);
+    /// the next chart's loading gauge under beatoraja-style is still
+    /// HAZARD's, and so is that attempt's.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn the_settings_gauge_survives_a_preset_without_it() {
+        use game::Rig as _;
+        let dir = tempfile::tempdir().unwrap();
+        let settings = gauge_settings(5);
+        let short = loaded_under(dir.path(), &settings, "tapestry");
+        let long = loaded_under(dir.path(), &settings, "beatoraja-style");
+        assert_eq!(short.displayed(), game::GaugeIndex(0));
+        assert_eq!(long.displayed(), game::GaugeIndex(5));
+        let seen = Gauges::default();
+        let render = gauge_render(&seen, &short);
+        on_rig_with(settings, render, |rig, _| {
+            assert_eq!(
+                rig.prepare_attempt(&short).unwrap(),
+                game::Preparation::Ready
+            );
+            assert_eq!(rig.attempt_gauge, 0);
+            let preset = rules::beatoraja_style();
+            assert!(crate::loading_state::shown_gauge(&preset, 5).is_some());
+            assert_eq!(
+                crate::play::loading_gauge(&preset, rig.gauge),
+                crate::loading_state::shown_gauge(&preset, 5)
+            );
+            assert_eq!(
+                rig.prepare_attempt(&long).unwrap(),
+                game::Preparation::Ready
+            );
+            assert_eq!(rig.attempt_gauge, 5);
+        });
+    }
+
     /// The play's frames are drawn with the gauge the attempt resolved
     /// (`game::Loaded::displayed`), sent with the play
     /// (`RenderMsg::Play`), whatever the settings name: the HARD gauge as
@@ -1943,46 +2069,11 @@ mod tests {
         use game::Rig as _;
         for (set, shown) in [(3, 3), (99, 0)] {
             let dir = tempfile::tempdir().unwrap();
-            let root = game::DataRoot::new(dir.path().join("loaded"));
-            let player = game::PlayerSettings {
-                displayed_gauge: set,
-                ..Default::default()
-            };
-            let settings = game::Settings {
-                device: game::DeviceSettings::default(),
-                player,
-            };
-            let chart_path = dir.path().join("a.bms");
-            std::fs::write(&chart_path, "#BPM 120\n#00111:01\n").unwrap();
-            let config = game::SessionConfig {
-                lead_in: bms_model::TimeUs(1_000_000),
-                step: bms_model::TimeUs(1_000),
-                start: bms_model::TimeUs(0),
-                effects: 64,
-                seed: 1,
-                speed: bms_model::Speed::NORMAL,
-                app_version: "0.0.0-test".to_owned(),
-                provenance: replay::BuildProvenance::Development,
-                receive: replay::ReceiveMethod::Scripted,
-                autoplay: None,
-            };
-            let loaded = game::Loaded::load(
-                root,
-                settings.clone(),
-                &chart_path,
-                config,
-                game::Parts::unsaved(&settings.player),
-            )
-            .unwrap();
+            let settings = gauge_settings(set);
+            let loaded = loaded_under(dir.path(), &settings, "beatoraja-style");
             assert_eq!(loaded.displayed(), game::GaugeIndex(shown));
             let seen = Gauges::default();
-            let noted = Arc::clone(&seen);
-            let render = crate::render_side::tests::spawn_empty(Box::new(move || {
-                Ok(Box::new(GaugeFrames {
-                    seen: Arc::clone(&noted),
-                }) as Box<dyn crate::render_side::Screen>)
-            }));
-            render.load(Arc::new(loaded.chart().clone()), None).unwrap();
+            let render = gauge_render(&seen, &loaded);
             on_rig_with(settings, render, |rig, settings| {
                 assert_eq!(
                     rig.prepare_attempt(&loaded).unwrap(),

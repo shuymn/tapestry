@@ -260,8 +260,9 @@ pub(crate) struct Assets {
     fonts: HashMap<String, Font>,
     /// Admitted `.fnt` files and cached failures, by name.
     fnt_files: HashMap<String, Result<u16, FntFailure>>,
-    /// Bitmap fonts by font record, or the primary file's failure.
-    bitmap_fonts: HashMap<u32, Result<u32, FntFailure>>,
+    /// Bitmap fonts by font record, or the primary file's failure, each
+    /// with the first fallback only this importer refused.
+    bitmap_fonts: HashMap<u32, (Result<u32, FntFailure>, Option<FntFailure>)>,
     /// The generated note part images, by [`NoteFallback`]: at most
     /// three, however many parts draw them.
     note_fallbacks: [Option<u32>; 3],
@@ -565,13 +566,17 @@ impl Assets {
     }
 
     /// The bitmap font made for font record `rec`, or its primary file's
-    /// failure.
-    pub(crate) fn bitmap_font(&self, rec: u32) -> Option<Result<u32, FntFailure>> {
+    /// failure, and the first fallback the source draws that it lost.
+    pub(crate) fn bitmap_font(
+        &self,
+        rec: u32,
+    ) -> Option<(Result<u32, FntFailure>, Option<FntFailure>)> {
         self.bitmap_fonts.get(&rec).copied()
     }
 
     /// Records font record `rec`'s outcome: a bitmap font of admitted
-    /// files `primary` and `fallbacks`, or the primary's failure.
+    /// files `primary` and `fallbacks`, or the primary's failure, with
+    /// `lost`, the first fallback the source draws that it lacks.
     ///
     /// # Errors
     ///
@@ -580,6 +585,7 @@ impl Assets {
         &mut self,
         rec: u32,
         files: Result<(u16, &[u16]), FntFailure>,
+        lost: Option<FntFailure>,
     ) -> Result<Result<u32, FntFailure>, ImportLimit> {
         let outcome = match files {
             Ok((primary, fallbacks)) => match self.builder.add_bitmap_font(primary, fallbacks) {
@@ -591,7 +597,7 @@ impl Assets {
             },
             Err(f) => Err(f),
         };
-        self.bitmap_fonts.insert(rec, outcome);
+        self.bitmap_fonts.insert(rec, (outcome, lost));
         Ok(outcome)
     }
 

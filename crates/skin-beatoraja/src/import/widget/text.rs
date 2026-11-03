@@ -1,5 +1,6 @@
 //! Text: the effective string, the font, the box and the
-//! deviations D5, D6, D12 and D13. All text is decorative.
+//! deviations D5, D6, D12 and D13. Text is decorative unless it is
+//! failure presentation (owner decision 16).
 
 use skin_model::{
     Align, FontRef, MAX_FALLBACKS, MAX_TEXT_BYTES, Overflow, Source, TextDef, TextField, TextValue,
@@ -56,7 +57,7 @@ impl Cx<'_> {
     /// A text object.
     pub(in super::super) fn text(&mut self, dst: Dst, rec: u32) -> Result<(), ImportError> {
         let at = dst.span;
-        let role = Role::Decorative;
+        let role = Role::Decorative.or_failure(dst.failure);
         let [
             font,
             size,
@@ -211,11 +212,17 @@ impl Cx<'_> {
             self.ignored(at, NoteKind::Ignored { field: "stretch" });
         }
         let tf = if path.to_ascii_lowercase().ends_with(".fnt") {
-            // A non-positive size cannot be drawn: the source's
-            // `setScale` throws at 0 (gdx 1.9.9 `setScale`, jar lines
-            // 868-869) and mirrors the text below it.
-            if size <= 0 {
+            // The source scales the font by the signed size
+            // (`JsonSkinObjectLoader.java:652`, `SkinTextBitmap.java:
+            // 118-123`): `setScale` throws at 0 (gdx 1.9.9 `setScale`, jar
+            // lines 868-869), so nothing is drawn there either, and a
+            // negative size mirrors the text, which is not reproduced.
+            if size == 0 {
                 self.ignored(at, NoteKind::Ignored { field: "size" });
+                return Ok(());
+            }
+            if size < 0 {
+                self.drop_el(role, at, NoteKind::UnsupportedField { field: "size" })?;
                 return Ok(());
             }
             let em = Q::int(size)
@@ -309,9 +316,11 @@ impl Cx<'_> {
     /// The bitmap font of `.fnt` font record `rec` with primary `path`:
     /// made once per record, its files admitted once per name. A fallback
     /// that fails is skipped with a note, ignored when the source also
-    /// fails to load it and dropped otherwise; a primary that fails ignores
-    /// the element when the source also draws nothing, and drops it
-    /// otherwise. `None` when the element went.
+    /// fails to load it and dropped otherwise; such a loss, kept with the
+    /// font, refuses a critical text whether it made the font or uses it
+    /// later. A primary that fails ignores the element when the source
+    /// also draws nothing, and drops it otherwise. `None` when the element
+    /// went.
     fn bitmap_font(
         &mut self,
         role: Role,
@@ -320,7 +329,14 @@ impl Cx<'_> {
         path: &str,
     ) -> Result<Option<u32>, ImportError> {
         let outcome = match self.assets.bitmap_font(rec) {
-            Some(o) => o,
+            Some((o, lost)) => {
+                // A fallback the source draws that this importer lost when
+                // the font was made refuses a critical text.
+                if let (Some(failure), Role::Critical(_)) = (lost, role) {
+                    self.drop_el(role, at, failure_note(failure))?;
+                }
+                o
+            }
             None => {
                 let names = self.fallbacks(rec, at)?;
                 let primary = asset::join(&self.entry_dir, path);
@@ -330,6 +346,7 @@ impl Cx<'_> {
                     .fnt_file(&mut self.budget, &primary, &|| def.is_cancelled())
                     .map_err(|s| self.stopped(at, s))?;
                 let mut fallbacks = Vec::with_capacity(names.len());
+                let mut lost = None;
                 if primary.is_ok() {
                     for name in &names {
                         let def = &self.def;
@@ -341,23 +358,29 @@ impl Cx<'_> {
                             Ok(f) => fallbacks.push(f),
                             Err(failure) => {
                                 // Where the source draws the fallback, its
-                                // omission is ours: dropped, not ignored.
-                                let severity = match failure {
-                                    FntFailure::Fnt(e) if !e.kind.upstream_fails() => {
-                                        Severity::Dropped
-                                    }
-                                    FntFailure::Refused => Severity::Dropped,
-                                    FntFailure::Fnt(_) | FntFailure::Missing => Severity::Ignored,
+                                // omission is ours: a critical text is
+                                // refused and any other dropped, and the
+                                // loss stays with the font for its later
+                                // users; otherwise it is ignored.
+                                let ours = match failure {
+                                    FntFailure::Fnt(e) => !e.kind.upstream_fails(),
+                                    FntFailure::Refused => true,
+                                    FntFailure::Missing => false,
                                 };
                                 let why = failure_note(failure);
-                                self.note(Some(at), severity, why);
+                                if ours {
+                                    lost = lost.or(Some(failure));
+                                    self.drop_el(role, at, why)?;
+                                } else {
+                                    self.ignored(at, why);
+                                }
                             }
                         }
                     }
                 }
                 let files = primary.map(|p| (p, fallbacks.as_slice()));
                 self.assets
-                    .add_bitmap_font(rec, files)
+                    .add_bitmap_font(rec, files, lost)
                     .map_err(|l| self.limit(at, l))?
             }
         };
