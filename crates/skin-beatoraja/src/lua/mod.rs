@@ -281,6 +281,10 @@ pub(crate) enum Module {
     Done(Value),
 }
 
+/// A parsed file's chunk as the configured pass compiles it: instrumented,
+/// or `None` to run as written (it has no constructor).
+type Chunk = Option<Arc<[u8]>>;
+
 /// One pass's state, shared by the VM's host functions.
 pub(crate) struct Pass {
     ledger: Ledger,
@@ -298,9 +302,9 @@ pub(crate) struct Pass {
     handled: Cell<u64>,
     last_error: RefCell<Option<Loc>>,
     bridge: Option<Bridge>,
-    /// The configured pass's instrumented chunks by identity, and its
-    /// parsed files in the same order.
-    parsed: RefCell<Vec<(FileId, Arc<[u8]>)>>,
+    /// The configured pass's chunks by identity, and the parsed files
+    /// that have constructors, in the order they were parsed.
+    parsed: RefCell<Vec<(FileId, Chunk)>>,
     files: RefCell<Vec<callback::ParsedFile>>,
     #[cfg(feature = "dev-tools")]
     timings: Cell<Timings>,

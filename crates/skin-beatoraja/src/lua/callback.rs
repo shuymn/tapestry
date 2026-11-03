@@ -35,6 +35,7 @@
 
 use std::cell::{Cell, RefCell};
 
+use super::limits::MAX_AST_DEPTH;
 use super::syntax::{Ast, Bin, CHUNK_ENV, DeclKind, Expr, NONE, Stmt, Un};
 use super::{HOST_APIS, Unsupported};
 use crate::error::{ImportError, Loc};
@@ -119,6 +120,20 @@ pub(crate) enum Ty {
     Config,
 }
 
+/// What a walk past [`MAX_AST_DEPTH`] gives: the depth cap, fatal
+/// wherever it is met ([`super::LuaLimit::AstDepth`]).
+pub(crate) const TOO_DEEP: Unsupported = Unsupported::Construct("nesting past the depth cap");
+
+/// The refusal of `why` found at `at`: the depth cap is a limit, any
+/// other reason an unknown effect.
+pub(crate) fn effect(why: Unsupported) -> super::LuaWhy {
+    if why == TOO_DEEP {
+        super::LuaWhy::Limit(super::LuaLimit::AstDepth)
+    } else {
+        super::LuaWhy::Effect(why)
+    }
+}
+
 /// A located unsupported construct: the file and line of its tree.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Found {
@@ -194,6 +209,13 @@ impl Analysis {
     /// The class of instance `i`: its result type when it is write-free,
     /// else the construct that has an unknown effect.
     pub(crate) fn classify(&self, i: u32) -> Result<Ty, Found> {
+        self.classify_at(i, 0)
+    }
+
+    /// [`Self::classify`] `depth` levels into a walk: every level of an
+    /// expression and every helper call counts one, and a walk past
+    /// [`MAX_AST_DEPTH`] stops at [`TOO_DEEP`].
+    fn classify_at(&self, i: u32, depth: u32) -> Result<Ty, Found> {
         {
             let mut classes = self.classes.borrow_mut();
             if classes.len() < self.instances.len() {
@@ -217,14 +239,14 @@ impl Analysis {
                 *s = State::InProgress;
             }
         }
-        let r = self.classify_body(i);
+        let r = self.classify_body(i, depth);
         if let Some(s) = self.classes.borrow_mut().get_mut(i as usize) {
             *s = State::Done(r);
         }
         r
     }
 
-    fn classify_body(&self, i: u32) -> Result<Ty, Found> {
+    fn classify_body(&self, i: u32, depth: u32) -> Result<Ty, Found> {
         let untagged = |file| Found {
             why: Unsupported::Capture("an untagged closure"),
             file,
@@ -250,6 +272,7 @@ impl Analysis {
             inst: i,
             file: inst.file,
             locals: Vec::new(),
+            depth: std::cell::Cell::new(depth),
         };
         for &s in ast.list(f.body) {
             let line = ast.stmt_line(s);
@@ -316,6 +339,8 @@ struct Classify<'a> {
     file: u16,
     /// The body's locals so far and their types.
     locals: Vec<(u32, Ty)>,
+    /// How deep the walk is.
+    depth: std::cell::Cell<u32>,
 }
 
 impl Classify<'_> {
@@ -328,6 +353,17 @@ impl Classify<'_> {
     }
 
     fn expr(&self, e: u32) -> Result<Ty, Found> {
+        let d = self.depth.get();
+        if d >= MAX_AST_DEPTH {
+            return Err(self.at(TOO_DEEP, e));
+        }
+        self.depth.set(d + 1);
+        let r = self.expr_inner(e);
+        self.depth.set(d);
+        r
+    }
+
+    fn expr_inner(&self, e: u32) -> Result<Ty, Found> {
         let construct = |w: &'static str| Err(self.at(Unsupported::Construct(w), e));
         match self.ast.expr(e) {
             Expr::Int(_) => Ok(Ty::Int),
@@ -484,7 +520,7 @@ impl Classify<'_> {
                 if !args.is_empty() {
                     return Err(self.at(Unsupported::Construct("helper arguments"), e));
                 }
-                match self.an.classify(j) {
+                match self.an.classify_at(j, self.depth.get() + 1) {
                     Ok(t @ (Ty::Int | Ty::Bool)) => Ok(t),
                     Ok(_) => Err(self.at(Unsupported::Type, e)),
                     Err(f) if f.why == Unsupported::Recursion => {
@@ -617,7 +653,7 @@ pub(crate) fn admit(arena: &Arena) -> Result<(), ImportError> {
                 if first.is_none() {
                     first = Some(ImportError::Lua {
                         at: at.or_else(|| Some(arena.loc(id))),
-                        why: super::LuaWhy::Effect(why),
+                        why: effect(why),
                     });
                 }
             }

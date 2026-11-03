@@ -291,6 +291,44 @@ fn bounds_are_fatal_even_for_decorative_callbacks() {
     assert_eq!(why(run(&entry, &cancel)), LuaWhy::Cancelled);
 }
 
+#[test]
+fn every_walk_over_a_tree_stops_at_the_depth_cap() {
+    let fatal = LuaWhy::Limit(LuaLimit::AstDepth);
+    // Classification, at admission, of a function nothing consumes: a
+    // left-leaning chain the parser reads without recursing.
+    let chain = vec!["1"; 100_000].join("+");
+    let entry = skin(
+        &format!("skin.extra = function() return {chain} == 0 end"),
+        "",
+    );
+    assert_eq!(why(import(&entry)), fatal);
+    // Classification through helpers, each calling the one before.
+    let mut helpers = String::from(
+        "local function h0() return ms.number(110) > 0 end
+",
+    );
+    for k in 1..150 {
+        helpers.push_str(&format!(
+            "local function h{k}() return h{}() and true end
+",
+            k - 1
+        ));
+    }
+    let entry = skin(&helpers, &image("function() return h149() end"));
+    assert_eq!(why(import(&entry)), fatal);
+    // Lowering, which inlines each local where it is read: shallow for
+    // classification, deep once inlined.
+    let mut locals = String::from("local a0 = ms.number(110) ");
+    for k in 1..150 {
+        locals.push_str(&format!("local a{k} = a{} + 1 ", k - 1));
+    }
+    let entry = skin(
+        "",
+        &image(&format!("function() {locals} return a149 > 0 end")),
+    );
+    assert_eq!(why(import(&entry)), fatal);
+}
+
 /// The model fields read by the counts the oracle sets, by property id:
 /// written from the play schema's names, apart from the importer.
 const FIELDS: [(i64, &str); 9] = [

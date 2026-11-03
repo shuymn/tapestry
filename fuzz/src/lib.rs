@@ -2105,7 +2105,8 @@ pub fn skin_lua(data: &[u8]) -> Result<(Header, Result<LuaImported, ImportError>
 }
 
 /// A candidate that imports was refused at none of its callbacks and
-/// analysed every one; each decorative one replaced is reported.
+/// analysed every one; each decorative one replaced is reported, among
+/// the retained notes or counted as suppressed past the report's cap.
 fn check_callbacks(i: &LuaImported) {
     use skin_beatoraja::NoteKind;
     use skin_beatoraja::lua::Disposition;
@@ -2126,7 +2127,11 @@ fn check_callbacks(i: &LuaImported) {
         .iter()
         .filter(|n| matches!(n.kind, NoteKind::Callback { .. }))
         .count();
-    assert!(noted >= replaced, "a replaced callback was not reported");
+    let suppressed = usize::try_from(i.imported.report.suppressed).unwrap_or(usize::MAX);
+    assert!(
+        noted.saturating_add(suppressed) >= replaced,
+        "a replaced callback was not reported"
+    );
 }
 
 /// An import's charged counters are within the model's caps.

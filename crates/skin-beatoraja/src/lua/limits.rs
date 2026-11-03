@@ -65,7 +65,10 @@ pub const MAX_PRIMITIVE_BYTES: i64 = 1 << 20;
 pub const MAX_AST_NODES: u64 = 1 << 20;
 /// The deepest nesting of statements and subexpressions the analysis's
 /// parser recurses into, checked before each level: Lua's own parser
-/// stops at the same depth (`LUAI_MAXCCALLS`).
+/// stops at the same depth (`LUAI_MAXCCALLS`). Every other recursive walk
+/// over a tree (classification, sizing and lowering, through inlined
+/// locals and helpers) stops at it too, fatal: a left-leaning chain the
+/// parser reads without recursing is as deep as it is long.
 pub const MAX_AST_DEPTH: u32 = 200;
 /// The most closure instances and captured values the analysis copies
 /// out of a configured pass before its VM is dropped, each charged before

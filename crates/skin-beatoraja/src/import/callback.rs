@@ -52,9 +52,9 @@ use super::timer::{Custom, Timer};
 use super::{Cx, Prop};
 use crate::error::ImportError;
 use crate::lua::callback::{
-    Analysis, Callee, Captured, Disposition, Ty, numeral, resolve_callee, tree,
+    Analysis, Callee, Captured, Disposition, TOO_DEEP, Ty, numeral, resolve_callee, tree,
 };
-use crate::lua::limits::MAX_EXPANDED_NODES;
+use crate::lua::limits::{MAX_AST_DEPTH, MAX_EXPANDED_NODES};
 use crate::lua::syntax::{Ast, Bin, Expr, Stmt, Un};
 use crate::lua::{HOST_APIS, LuaLimit, LuaWhy, Unsupported};
 use crate::tree::{Kind, LuaScalar, NONE};
@@ -141,6 +141,9 @@ struct Lower<'a> {
     out: Lowered,
     /// Each instance's expanded size, once computed.
     sizes: Vec<Option<u64>>,
+    /// How deep the current walk is: every expression level, an inlined
+    /// local's and a helper's included.
+    depth: u32,
 }
 
 impl Lower<'_> {
@@ -227,6 +230,10 @@ impl Lower<'_> {
     }
 
     fn size_expr(&mut self, ast: &Ast, inst: u32, locals: &[(u32, u64)], e: u32) -> R<u64> {
+        self.deeper(|l| l.size_expr_inner(ast, inst, locals, e))
+    }
+
+    fn size_expr_inner(&mut self, ast: &Ast, inst: u32, locals: &[(u32, u64)], e: u32) -> R<u64> {
         Ok(match ast.expr(e) {
             Expr::Local(d) => match locals.iter().rev().find(|(l, _)| *l == d) {
                 Some(&(_, n)) => n,
@@ -261,6 +268,10 @@ impl Lower<'_> {
     }
 
     fn expr(&mut self, ast: &Ast, inst: u32, locals: &[(u32, u32)], e: u32) -> R<V> {
+        self.deeper(|l| l.expr_inner(ast, inst, locals, e))
+    }
+
+    fn expr_inner(&mut self, ast: &Ast, inst: u32, locals: &[(u32, u32)], e: u32) -> R<V> {
         let unsupported = |w| Err(Stop::Unsupported(w));
         match ast.expr(e) {
             Expr::Int(n) => Self::literal(n),
@@ -502,58 +513,77 @@ impl Lower<'_> {
     }
 
     /// The critical part a read reachable from instance `i` shows, its
-    /// helpers included: what a callback's role depends on.
-    fn part(&self, i: u32, seen: &mut Vec<u32>) -> Option<CriticalPart> {
-        if seen.contains(&i) {
-            return None;
-        }
-        seen.push(i);
-        let (ast, func, _) = tree(self.an, i)?;
-        let f = ast.func(func)?;
+    /// helpers included: what a callback's role depends on. A worklist,
+    /// each instance visited once, so no nesting deepens it.
+    fn part(&self, i: u32) -> Option<CriticalPart> {
+        let mut seen = vec![i];
+        let mut pending = vec![i];
         let mut stack: Vec<u32> = Vec::new();
-        for &s in ast.list(f.body) {
-            match ast.stmt(s) {
-                Stmt::Local { exprs, .. } | Stmt::Return(exprs) => {
-                    stack.extend_from_slice(ast.list(exprs));
+        while let Some(i) = pending.pop() {
+            let Some((ast, func, _)) = tree(self.an, i) else {
+                continue;
+            };
+            let Some(f) = ast.func(func) else {
+                continue;
+            };
+            stack.clear();
+            for &s in ast.list(f.body) {
+                match ast.stmt(s) {
+                    Stmt::Local { exprs, .. } | Stmt::Return(exprs) => {
+                        stack.extend_from_slice(ast.list(exprs));
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
-        }
-        while let Some(e) = stack.pop() {
-            match ast.expr(e) {
-                Expr::Paren(x) | Expr::Unary(_, x) => stack.push(x),
-                Expr::Binary(_, a, b) => {
-                    stack.push(a);
-                    stack.push(b);
+            while let Some(e) = stack.pop() {
+                match ast.expr(e) {
+                    Expr::Paren(x) | Expr::Unary(_, x) => stack.push(x),
+                    Expr::Binary(_, a, b) => {
+                        stack.push(a);
+                        stack.push(b);
+                    }
+                    Expr::Call { callee, args } => match resolve_callee(self.an, ast, i, callee) {
+                        Ok(Callee::Helper(j)) => {
+                            if !seen.contains(&j) {
+                                seen.push(j);
+                                pending.push(j);
+                            }
+                        }
+                        Ok(Callee::Host(api)) => {
+                            let is_number = HOST_APIS
+                                .get(usize::from(api))
+                                .is_some_and(|&(_, n)| n == "number");
+                            let id = ast
+                                .list(args)
+                                .first()
+                                .and_then(|&a| numeral(ast, a))
+                                .and_then(|n| i32::try_from(n).ok());
+                            if is_number
+                                && let Some(IntProp::Shown(v)) = id.map(property::int_by_id)
+                                && let Some(part) = v.part()
+                            {
+                                return Some(part);
+                            }
+                        }
+                        Err(_) => {}
+                    },
+                    _ => {}
                 }
-                Expr::Call { callee, args } => match resolve_callee(self.an, ast, i, callee) {
-                    Ok(Callee::Helper(j)) => {
-                        if let Some(p) = self.part(j, seen) {
-                            return Some(p);
-                        }
-                    }
-                    Ok(Callee::Host(api)) => {
-                        let is_number = HOST_APIS
-                            .get(usize::from(api))
-                            .is_some_and(|&(_, n)| n == "number");
-                        let id = ast
-                            .list(args)
-                            .first()
-                            .and_then(|&a| numeral(ast, a))
-                            .and_then(|n| i32::try_from(n).ok());
-                        if is_number
-                            && let Some(IntProp::Shown(v)) = id.map(property::int_by_id)
-                            && let Some(part) = v.part()
-                        {
-                            return Some(part);
-                        }
-                    }
-                    Err(_) => {}
-                },
-                _ => {}
             }
         }
         None
+    }
+
+    /// Runs `f` one level deeper into a walk: past [`MAX_AST_DEPTH`] the
+    /// lowering stops at the depth cap, fatal.
+    fn deeper<T>(&mut self, f: impl FnOnce(&mut Self) -> R<T>) -> R<T> {
+        if self.depth >= MAX_AST_DEPTH {
+            return Err(Stop::Fatal(LuaWhy::Limit(LuaLimit::AstDepth)));
+        }
+        self.depth += 1;
+        let r = f(self);
+        self.depth -= 1;
+        r
     }
 }
 
@@ -638,10 +668,14 @@ impl Cx<'_> {
                 config: false,
             },
             sizes: Vec::new(),
+            depth: 0,
         };
         let ty = match an.classify(inst) {
             Ok(ty) => ty,
-            Err(f) => return Ok(Lowering::Unsupported(f.why, l.part(inst, &mut Vec::new()))),
+            Err(f) if f.why == TOO_DEEP => {
+                return Err(fatal(LuaWhy::Limit(LuaLimit::AstDepth)));
+            }
+            Err(f) => return Ok(Lowering::Unsupported(f.why, l.part(inst))),
         };
         let r = l.size(inst).and_then(|n| {
             let total = an.expanded.get().saturating_add(n);
@@ -656,12 +690,9 @@ impl Cx<'_> {
                 l.out.src = src;
                 Ok(Lowering::Lowered(l.out, ty))
             }
-            Ok(_) => Ok(Lowering::Unsupported(
-                Unsupported::Type,
-                l.part(inst, &mut Vec::new()),
-            )),
+            Ok(_) => Ok(Lowering::Unsupported(Unsupported::Type, l.part(inst))),
             Err(Stop::Unsupported(why)) => {
-                let part = l.out.part.or_else(|| l.part(inst, &mut Vec::new()));
+                let part = l.out.part.or_else(|| l.part(inst));
                 Ok(Lowering::Unsupported(why, part))
             }
             Err(Stop::Fatal(why)) => Err(fatal(why)),

@@ -211,8 +211,9 @@ pub(super) fn compile(lua: &Lua, pass: &Pass, key: &str) -> mlua::Result<(Functi
 }
 
 /// The instrumented chunk of source `id`, parsed and charged on its first
-/// load in the pass; `None` when neither the parser nor Lua reads it, so
-/// that Lua's own compilation reports its syntax error.
+/// load in the pass; `None` when it has no constructor, or when neither
+/// the parser nor Lua reads it (Lua's own compilation then reports its
+/// syntax error): the source is compiled as it is.
 fn instrumented(
     lua: &Lua,
     pass: &Pass,
@@ -224,9 +225,9 @@ fn instrumented(
         .borrow()
         .iter()
         .find(|(i, _)| i == id)
-        .map(|(_, c)| Arc::clone(c))
+        .map(|(_, c)| c.clone())
     {
-        return Ok(Some(code));
+        return Ok(code);
     }
     let name = id.name().to_owned();
     let at = |line: u32| {
@@ -260,17 +261,26 @@ fn instrumented(
             };
         }
     };
+    // A chunk with no constructor makes no closure: it runs as written.
+    if ast.funcs.len() <= 1 {
+        pass.parsed.borrow_mut().push((id.clone(), None));
+        return Ok(None);
+    }
     let Ok(file) = u16::try_from(pass.files.borrow().len()) else {
         return Err(fail(0, LuaWhy::Limit(LuaLimit::AstNodes)));
     };
-    let Some(code) = instrument::instrument(bytes, &ast, file) else {
-        return Err(fail(0, LuaWhy::Limit(LuaLimit::Generated)));
+    let code = match instrument::instrument(bytes, &ast, file, &|| pass.ledger.cancelled()) {
+        Ok(code) => code,
+        Err(instrument::Stop::Generated) => {
+            return Err(fail(0, LuaWhy::Limit(LuaLimit::Generated)));
+        }
+        Err(instrument::Stop::Cancelled) => return Err(fail(0, LuaWhy::Cancelled)),
     };
     let code: Arc<[u8]> = Arc::from(code);
     pass.files.borrow_mut().push(ParsedFile { name, ast });
     pass.parsed
         .borrow_mut()
-        .push((id.clone(), Arc::clone(&code)));
+        .push((id.clone(), Some(Arc::clone(&code))));
     Ok(Some(code))
 }
 

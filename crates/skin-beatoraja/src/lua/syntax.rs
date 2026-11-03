@@ -30,6 +30,9 @@ const CHECK_EVERY: u32 = 4_096;
 /// No node.
 pub(crate) const NONE: u32 = u32::MAX;
 
+/// The prefix of the tagger's name ([`super::instrument`]).
+pub(crate) const TAG_PREFIX: &[u8] = b"tapestry_tag";
+
 /// The `_ENV` a chunk's functions start with: the chunk's own upvalue,
 /// the pass's globals.
 pub(crate) const CHUNK_ENV: u32 = u32::MAX - 1;
@@ -223,6 +226,12 @@ pub(crate) struct Ast {
     /// String literals and field names: spans of [`Self::bytes`].
     pub(crate) strs: Vec<(u32, u32)>,
     pub(crate) bytes: Vec<u8>,
+    /// Where each statement but a `return` ends: the byte after its last
+    /// token, in increasing order.
+    pub(crate) stmt_ends: Vec<u32>,
+    /// The numbers `n` of the names `tapestry_tag<n>` the source uses,
+    /// which the tagger's name avoids ([`super::instrument`]).
+    pub(crate) tag_names: Vec<u64>,
 }
 
 impl Ast {
@@ -635,8 +644,10 @@ impl Lexer<'_> {
                 c if is_space(c) => self.pos += 1,
                 b'-' if self.at(1) == Some(b'-') => {
                     self.pos += 2;
+                    // A bracket that opens no long comment starts a short one
+                    // (`llex.c`): `--[=` is a comment to the line's end.
                     if self.cur() == Some(b'[')
-                        && let Some(level) = self.long_open()?
+                        && let Ok(Some(level)) = self.long_open()
                     {
                         self.long_body(level, None)?;
                         continue;
@@ -666,6 +677,13 @@ impl Lexer<'_> {
                     self.pos += 1;
                 }
                 let word = self.src.get(start..self.pos).unwrap_or_default();
+                if let Some(n) = word
+                    .strip_prefix(TAG_PREFIX)
+                    .and_then(|d| std::str::from_utf8(d).ok())
+                    .and_then(|d| d.parse::<u64>().ok())
+                {
+                    ast.tag_names.push(n);
+                }
                 KEYWORDS
                     .iter()
                     .find(|(k, _)| *k == word)
@@ -875,6 +893,8 @@ struct Parser<'a, 'c> {
     funcs: Vec<FuncState>,
     /// The shared scratch stack lists are gathered on.
     scratch: Vec<u32>,
+    /// Where the last token consumed ends.
+    last_end: u32,
 }
 
 /// Parses `src`, charging its nodes to `charged` (the candidate's count
@@ -897,6 +917,7 @@ pub(crate) fn parse(src: &[u8], charged: &mut u64, cancel: &dyn Fn() -> bool) ->
         active: Vec::new(),
         funcs: Vec::new(),
         scratch: Vec::new(),
+        last_end: 0,
     };
     p.chunk()?;
     Ok(p.ast)
@@ -934,6 +955,7 @@ impl Parser<'_, '_> {
     fn advance(&mut self) -> Result<Token, Fail> {
         let t = self.tok;
         self.tok = self.lex.next(&mut self.ast)?;
+        self.last_end = t.end;
         Ok(t)
     }
 
@@ -962,10 +984,12 @@ impl Parser<'_, '_> {
     fn peek(&mut self) -> Result<Tok, Fail> {
         let saved = self.lex;
         let (strs, bytes) = (self.ast.strs.len(), self.ast.bytes.len());
+        let tags = self.ast.tag_names.len();
         let t = self.lex.next(&mut self.ast)?;
         self.lex = saved;
         self.ast.strs.truncate(strs);
         self.ast.bytes.truncate(bytes);
+        self.ast.tag_names.truncate(tags);
         Ok(t.tok)
     }
 
@@ -1156,6 +1180,7 @@ impl Parser<'_, '_> {
         self.enter()?;
         let r = self.statement_inner();
         self.leave();
+        self.ast.stmt_ends.push(self.last_end);
         r
     }
 
@@ -1786,8 +1811,16 @@ mod tests {
     }
 
     #[test]
+    fn a_bracket_that_opens_no_long_comment_is_a_short_one() {
+        let a = ok("--[= short comment\nlocal x = 1 --[==x\nlocal y = 2 --[\n");
+        assert_eq!(a.decls.len(), 2);
+    }
+
+    #[test]
     fn malformed_sources_are_refused() {
+        // A bracket that opens no long string is an error.
         for bad in [
+            "local s = [=x",
             "local",
             "x =",
             "f() = 1",

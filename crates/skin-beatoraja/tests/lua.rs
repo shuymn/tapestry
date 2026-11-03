@@ -1826,3 +1826,22 @@ fn errors_are_located_in_their_module() {
     let d = folder(&[("s.luaskin", "\x1bLua")]);
     assert_eq!(why(header(&d)), LuaWhy::Syntax);
 }
+
+#[test]
+fn tagging_keeps_statement_boundaries() {
+    // A constructor that ends a statement still ends it once tagged: the
+    // `(` that starts the next statement calls nothing of it.
+    for body in [
+        "local function identity(f) changed = true return f end\n(function() return true end)()",
+        "local g = function() changed = true end\n(function() return true end)()",
+        "h = function() changed = true end\n(function() return true end)()",
+        "local t = {}\nfunction t.m() changed = true end\n(function() return true end)()",
+        "local u = 1, function() changed = true end\n(function() return true end)()",
+        "repeat local r = 1 until function() changed = true end\n(function() return true end)()",
+    ] {
+        let d = configured(&format!(
+            "local changed = false\n{body}\nassert(not changed, \"changed\")"
+        ));
+        import(&d).unwrap_or_else(|e| panic!("{body}: {e:?}"));
+    }
+}
