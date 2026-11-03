@@ -607,3 +607,201 @@ fn the_driver_gives_one_state_whatever_the_drain_splits() {
         assert_eq!(run(drains), one, "{drains:?}");
     }
 }
+
+impl Rig {
+    /// The audio side commits READY candidate `generation`: holds are
+    /// ordinary adjustments from now on.
+    fn commit(&mut self, generation: u32) -> &mut Self {
+        assert!(
+            self.set
+                .adjustment_mut()
+                .unwrap()
+                .start_gate()
+                .commit(generation)
+        );
+        self
+    }
+
+    /// Rearms READY candidate `generation` at `at`, its chart time 0 at
+    /// `origin` on the clock: the cancelled one sealed, readers back.
+    fn rearm(&mut self, at: i64, origin: i64, generation: u32) -> &mut Self {
+        assert!(at > self.now);
+        self.now = at;
+        self.set.begin_batch(TimeUs(at));
+        let readers = self.set.take_readers();
+        self.set.return_readers(readers);
+        assert!(
+            self.set
+                .reopen_candidate(TimeUs(at), TimeUs(origin), generation)
+                .is_ok()
+        );
+        self.set.end_batch(TimeUs(at + 1));
+        self
+    }
+}
+
+const AUX_UP: u32 = 0xE050;
+
+#[test]
+fn ready_adjustments_use_the_candidate_clock() {
+    // 150 BPM, 300 from chart time 1 s; the attempt opens at -1 s.
+    let mut rig = Rig::new(options(SpeedMode::Floating, 100, 300, sudden(200)));
+    rig.enter(-1_000_000);
+    rig.attach(tempo(150, Some((1_000_000, 300))), -1_000_000)
+        .unwrap();
+    assert_eq!(rig.drain().hispeed, Some(r(64, 25)), "at the frozen head");
+    // READY's chart time 0 at 0.5 s on the clock; at 2 s it is 1.5 s, past
+    // the change: a START + auxiliary cover step solves at 300.
+    // START is a hold that cancels the candidate, after its batch: the
+    // step pressed with it is made under the candidate's clock.
+    rig.open(100 * MS, 500_000, 1);
+    rig.keys(2_000_000, &[(Q, true), (AUX_UP, true)])
+        .keys(2_020_000, &[(AUX_UP, false), (Q, false)]);
+    let s = rig.snap();
+    assert_eq!(s.options.covers().sudden.amount, 210);
+    // 144000 · 0.79 / (300 · 300) = 158/125.
+    assert_eq!(s.hispeed, Some(r(158, 125)));
+    assert_eq!(rig.driver.diagnostics().out_of_order, 0);
+}
+
+#[test]
+fn a_rearm_keeps_h_and_the_double_press() {
+    let mut rig = Rig::new(PlayOptions::default());
+    rig.enter(-1_000_000);
+    rig.attach(tempo(150, None), -1_000_000).unwrap();
+    rig.open(100 * MS, 1_100_000, 1);
+    rig.tap(200 * MS, F2);
+    assert_eq!(rig.snap().hispeed, Some(r(37, 10)));
+    // START cancels the candidate; released, READY rearms.
+    rig.keys(300 * MS, &[(Q, true)])
+        .keys(350 * MS, &[(Q, false)]);
+    rig.drain();
+    rig.rearm(400 * MS, 1_400_000, 2);
+    let s = rig.snap();
+    assert_eq!(s.hispeed, Some(r(37, 10)), "no new solve at the rearm");
+    assert_eq!(s.generation, 2);
+    assert!(!s.options.covers().sudden.on);
+    // The press that cancelled and one after the rearm, 300 ms apart: a
+    // double press.
+    rig.keys(600 * MS, &[(Q, true)])
+        .keys(610 * MS, &[(Q, false)]);
+    assert!(rig.snap().options.covers().sudden.on);
+}
+
+#[test]
+fn in_play_adjustments_follow_the_transition_table() {
+    // Covers off, 150 BPM then 300 from 2 s: a fine step adds 0.01 and
+    // solves nothing, so 3.20 becomes 3.21 at 300 BPM.
+    let mut rig = Rig::new(PlayOptions::default());
+    rig.enter(-1_000_000);
+    rig.attach(tempo(150, Some((2_000_000, 300))), -1_000_000)
+        .unwrap();
+    rig.open(100 * MS, 1_100_000, 1);
+    rig.commit(1);
+    rig.keys(4_000_000, &[(Q, true)])
+        .tap(4_010_000, AUX_UP)
+        .keys(4_020_000, &[(Q, false)]);
+    assert_eq!(rig.snap().hispeed, Some(r(321, 100)));
+    // SUDDEN+ shown at 0 by a double press solves at the event's tempo:
+    // 144000 / (300 · 300) = 1.6.
+    rig.keys(5_000_000, &[(Q, true)])
+        .keys(5_010_000, &[(Q, false)])
+        .keys(5_100_000, &[(Q, true)])
+        .keys(5_110_000, &[(Q, false)]);
+    let s = rig.snap();
+    assert!(s.options.covers().sudden.on);
+    assert_eq!(s.hispeed, Some(r(8, 5)));
+    // At 300 BPM with SUDDEN+ 300, G 300 → 299 gives 336/299.
+    let mut rig = Rig::new(options(SpeedMode::Floating, 100, 300, sudden(300)));
+    rig.enter(-1_000_000);
+    rig.attach(tempo(300, None), -1_000_000).unwrap();
+    rig.open(100 * MS, 1_100_000, 1);
+    rig.commit(1);
+    rig.keys(3_000_000, &[(W, true)])
+        .tap(3_010_000, Z)
+        .keys(3_020_000, &[(W, false)]);
+    assert_eq!(rig.snap().hispeed, Some(r(336, 299)));
+    assert_eq!(rig.driver.diagnostics().out_of_order, 0);
+}
+
+#[test]
+fn screen_recovery_keeps_the_floating_override() {
+    // The screen's recovery touches no attempt: a pending attachment is
+    // kept, so the next preparation does not solve again.
+    let mut rig = Rig::new(PlayOptions::default());
+    rig.enter(-1_000_000);
+    let epoch = rig.attach(tempo(150, None), -1_000_000).unwrap();
+    rig.tap(10 * MS, F2);
+    assert_eq!(rig.snap().hispeed, Some(r(37, 10)));
+    assert!(rig.driver.has_pending());
+    assert_eq!(rig.driver.prepared(), Some(epoch));
+    assert_eq!(rig.drain().hispeed, Some(r(37, 10)));
+}
+
+#[test]
+fn a_loading_double_press_survives_into_the_play() {
+    let mut rig = Rig::new(PlayOptions::default());
+    rig.enter(-1_000_000);
+    rig.keys(10 * MS, &[(Q, true)]).keys(20 * MS, &[(Q, false)]);
+    rig.attach(tempo(150, None), -1_000_000).unwrap();
+    rig.keys(300 * MS, &[(Q, true)])
+        .keys(310 * MS, &[(Q, false)]);
+    assert!(rig.snap().options.covers().sudden.on);
+}
+
+#[test]
+fn the_previous_charts_double_press_does_not() {
+    let mut rig = Rig::new(PlayOptions::default());
+    rig.enter(-1_000_000);
+    rig.attach(tempo(150, None), -1_000_000).unwrap();
+    rig.keys(10 * MS, &[(Q, true)]).keys(20 * MS, &[(Q, false)]);
+    // The next chart's loading starts within 500 ms.
+    rig.enter(-1_000_000);
+    rig.keys(300 * MS, &[(Q, true)])
+        .keys(310 * MS, &[(Q, false)]);
+    assert!(!rig.snap().options.covers().sudden.on);
+}
+
+#[test]
+fn a_withdrawn_attempt_re_solves_with_a_new_epoch() {
+    let mut rig = Rig::new(PlayOptions::default());
+    rig.enter(-1_000_000);
+    let first = rig.attach(tempo(150, None), -1_000_000).unwrap();
+    rig.tap(10 * MS, F2);
+    assert_eq!(rig.snap().hispeed, Some(r(37, 10)));
+    // Withdrawn before recording opened: nothing pending or active.
+    rig.driver.invalidate();
+    assert!(!rig.driver.has_pending());
+    rig.enter(-1_000_000);
+    let second = rig.attach(tempo(150, None), -1_000_000).unwrap();
+    assert!(second > first);
+    let s = rig.drain();
+    assert_eq!((s.hispeed, s.epoch), (Some(r(16, 5)), second));
+}
+
+#[test]
+fn a_device_change_while_loading_is_a_new_baseline() {
+    let mut rig = Rig::new(PlayOptions::default());
+    rig.enter(-1_000_000);
+    // A second keyboard, then START held on the first.
+    rig.set.begin_batch(TimeUs(5 * MS));
+    rig.set.connect(DeviceId(2), DeviceKind::Keyboard);
+    rig.set.end_batch(TimeUs(5 * MS + 1));
+    rig.now = 5 * MS;
+    rig.keys(10 * MS, &[(Q, true)]);
+    assert!(rig.snap().adjusting);
+    // The second keyboard leaves: an ownership change, a new baseline with
+    // START still held and suppressed.
+    rig.set.begin_batch(TimeUs(100 * MS));
+    rig.set.disconnect(DeviceId(2));
+    rig.set.end_batch(TimeUs(100 * MS + 1));
+    rig.now = 100 * MS;
+    assert!(rig.snap().adjusting);
+    // A press before the baseline does not count toward a double press
+    // with the next.
+    rig.keys(200 * MS, &[(Q, false)])
+        .keys(300 * MS, &[(Q, true)])
+        .keys(310 * MS, &[(Q, false)]);
+    assert!(!rig.snap().options.covers().sudden.on);
+    assert_eq!(rig.driver.diagnostics().out_of_order, 0);
+}
