@@ -572,8 +572,9 @@ pub(crate) fn closing_line(c: &game::ClosingReport) -> String {
 /// The render thread's commit of the attempt prepared: while a loading
 /// lifetime runs (`loading`), it is ready first, so its progress reaches
 /// 100 before the commit and the end of loading. `declared` becomes the
-/// commit's receipt, the play skin's declared Closing duration, and
-/// `None` when nothing was installed.
+/// commit's receipt: the declared Closing duration of the declarative
+/// installation the committed attempt draws with, the one it staged or
+/// the one already in use; an error clears it.
 pub(crate) fn commit_ready(
     render: &RenderLink,
     loading: bool,
