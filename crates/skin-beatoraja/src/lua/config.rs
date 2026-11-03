@@ -27,6 +27,7 @@
 use std::rc::Rc;
 
 use mlua::{Function, Lua, Table, Value};
+use skin_model::MAX_PATH_BYTES;
 
 use super::{Pass, host};
 use crate::header::Header;
@@ -130,13 +131,16 @@ pub(super) fn install(
     // The library checks the argument; the host returns a path or nil and
     // never raises an error.
     let native = host(lua, pass, |lua, pass, args| {
+        // Its length is checked before any copy, as the library's is.
         let path = match args.front() {
-            Some(Value::String(p)) => p.to_str().ok().map(|p| p.to_owned()),
+            Some(Value::String(p)) if p.as_bytes().len() <= MAX_PATH_BYTES => {
+                p.to_str().ok().map(|p| p.to_owned())
+            }
             _ => None,
         };
         match path.and_then(|p| pass.bridge.as_ref().and_then(|b| b.path(&p))) {
-            Some(s) => Ok(Value::String(lua.create_string(s)?)),
-            None => Ok(Value::Nil),
+            Some(s) if s.len() <= MAX_PATH_BYTES => Ok(Value::String(lua.create_string(s)?)),
+            _ => Ok(Value::Nil),
         }
     })?;
     let wrap: Function = lua.named_registry_value(super::library::STRING_BRIDGE)?;

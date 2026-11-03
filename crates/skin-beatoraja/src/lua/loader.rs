@@ -29,7 +29,7 @@ use std::sync::Arc;
 
 use mlua::chunk::ChunkMode;
 use mlua::{Function, Lua, MultiValue, Value};
-use skin_model::{FileId, Root, RootError};
+use skin_model::{FileId, MAX_PATH_BYTES, Root, RootError};
 
 use super::{LuaLimit, LuaWhy, Module, Pass, host, sandbox};
 use crate::error::{ImportError, InputLimit, Loc};
@@ -296,8 +296,9 @@ fn refused(lua: &Lua, pass: &Pass, name: String) -> mlua::Error {
 
 /// The string argument of a loader.
 fn name_arg(lua: &Lua, pass: &Pass, args: &MultiValue) -> mlua::Result<Vec<u8>> {
+    // The length is checked on the borrowed bytes, before any copy.
     match args.front() {
-        Some(Value::String(s)) => Ok(s.as_bytes().to_vec()),
+        Some(Value::String(s)) if s.as_bytes().len() <= MAX_PATH_BYTES => Ok(s.as_bytes().to_vec()),
         _ => Err(pass.ledger.fail_lua(lua, LuaWhy::LoaderName)),
     }
 }

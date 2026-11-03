@@ -149,13 +149,14 @@ fn lua_import_memory_is_bounded_and_freed() {
         "the counter misses VM allocation: {p}"
     );
 
-    // Caught errors keep their values in Lua: 500 caught errors carrying
-    // an 8 MiB string hold that one string, not 500 copies outside the VM.
+    // Caught errors keep their values in Lua: ten caught errors carrying
+    // an 8 MiB string hold that one string, not ten copies outside the VM
+    // (each message is charged as native work, so ten fit the budget).
     let errors = folder(&configured(
         "local big = \"x\"\nfor i = 1, 23 do big = big .. big end\n\
          local kept = {}\n\
-         for i = 1, 500 do local ok, e = pcall(error, big, 0) kept[i] = e end\n\
-         for i = 1, 500 do local ok, e = pcall(table.sort, { 2, 1 }, function() error(big, 0) end) kept[500 + i] = e end",
+         for i = 1, 5 do local ok, e = pcall(error, big, 0) kept[i] = e end\n\
+         for i = 1, 5 do local ok, e = pcall(table.sort, { 2, 1 }, function() error(big, 0) end) kept[5 + i] = e end",
     ));
     let p = record("retained_errors", measure(|| both(errors.path()).unwrap()));
     assert!(p < 40 << 20, "caught errors grew memory: {p}");

@@ -111,7 +111,7 @@ pub enum LuaWhy {
     LoaderName,
     /// A module required while it loads.
     RequireCycle,
-    /// A metatable with `__gc` or `__mode`.
+    /// A metatable with `__gc`, `__mode` or `__close`.
     Finalizer,
     /// A library operation the sandbox's library does not implement, or a
     /// primitive's result over its cap ([`limits::MAX_PRIMITIVE_BYTES`]).
@@ -148,7 +148,7 @@ impl fmt::Display for LuaWhy {
             Self::Error => f.write_str("a Lua error"),
             Self::LoaderName => f.write_str("a loader's argument is not a file name"),
             Self::RequireCycle => f.write_str("a module requires itself"),
-            Self::Finalizer => f.write_str("a metatable with __gc or __mode"),
+            Self::Finalizer => f.write_str("a metatable with __gc, __mode or __close"),
             Self::Library { op } => write!(f, "an unsupported library operation: {op}"),
             Self::LiveState { api } => {
                 let (m, n) = HOST_APIS

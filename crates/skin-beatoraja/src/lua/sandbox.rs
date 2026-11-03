@@ -6,22 +6,24 @@
 //! thread the host creates inherits. The globals are a new table holding
 //! only:
 //!
-//! - the base functions `assert`, `getmetatable`, `ipairs`, `next`,
-//!   `pairs`, `tostring`, `type` and `_VERSION`, and `_G`;
+//! - the base functions `assert`, `getmetatable`, `next`, `pairs`,
+//!   `tostring`, `type` and `_VERSION`, and `_G`;
 //! - the sandbox's own library ([`super::library`]), an allowlist of what
-//!   the owner's skins use: `select`, `error`, `tonumber`, `setmetatable`
-//!   and parts of `string`, `table` and `math`, whose long loops are
-//!   metered Lua and never coerce a string to a number or back (the
-//!   VM's own `string`, `table` and `math` tables stay out of reach, so
-//!   `string.dump`, binary packing and random sources are absent);
-//!   `setmetatable` attaches a snapshot of the metatable the
-//!   skin passes, refusing one with `__gc` (a finalizer) or `__mode` (weak
-//!   references), either of which lets the collector change what the skin
-//!   computes: a later change to the skin's table never reaches the
-//!   snapshot, and `getmetatable` gives the skin its own table back;
+//!   the owner's skins use: `select`, `error`, `ipairs`, `tonumber`,
+//!   `setmetatable` and parts of `string`, `table` and `math`, whose long
+//!   loops are metered Lua and never coerce a string to a number or back
+//!   (the VM's own `string`, `table` and `math` tables stay out of reach,
+//!   so `string.dump`, binary packing and random sources are absent);
+//!   `setmetatable` attaches a snapshot of the metatable the skin passes,
+//!   refusing one with `__gc` (a finalizer), `__mode` (weak references),
+//!   either of which lets the collector change what the skin computes,
+//!   or `__close` (code run while an error unwinds): a later change to
+//!   the skin's table never reaches the snapshot, and `getmetatable`
+//!   gives the skin its own table back;
 //! - `pcall` and `xpcall`, which return an ordinary error as Lua does but
-//!   raise a fault of the ledger again, and refuse an error no handler
-//!   saw (an allocation failure);
+//!   raise a fault of the ledger again, never running the skin's handler
+//!   once one is recorded, and refuse an error no handler saw (an
+//!   allocation failure);
 //! - the confined loaders `require` and `dofile` ([`super::loader`]).
 //!
 //! There is no `io`, `os`, `debug`, `package`, `load`, `loadfile`,
@@ -46,10 +48,9 @@ pub(super) const PACKED: &str = "tapestry.packed";
 pub(super) const HANDLER: &str = "tapestry.handler";
 
 /// The base functions the environment keeps as they are.
-const BASE: [&str; 8] = [
+const BASE: [&str; 7] = [
     "assert",
     "getmetatable",
-    "ipairs",
     "next",
     "pairs",
     "tostring",
@@ -63,7 +64,7 @@ const BASE: [&str; 8] = [
 /// allocation failure; a skin's handler can fail, recurse or exhaust its
 /// stack) is told apart and stays fatal.
 const PROTECTED: &str = r##"
-local xpcall_native, settle, select, unpack = ...
+local xpcall_native, settle, select, unpack, alive = ...
 -- The protected function's results come back as one table: the native
 -- xpcall pushes its status after the results without making room, so it
 -- is given one result at a time only.
@@ -88,6 +89,9 @@ end
 local function xpcall(f, msgh, ...)
   local seen = {false}
   return finish(seen, xpcall_native(packed, function(e)
+    -- After a fault (raised from the instruction hook, where hooks are
+    -- off) the skin's handler is never run: this raises it again.
+    alive()
     local r = msgh(e)
     seen[1] = true
     return r
@@ -168,6 +172,11 @@ pub(super) fn vm(pass: &Rc<Pass>) -> mlua::Result<Lua> {
         {
             return Err(pass.ledger.fail_lua(lua, LuaWhy::Library { op: TOO_MANY }));
         }
+        // The error's message was formatted natively, its length charged.
+        if !ok && let Some(Value::String(s)) = args.get(2) {
+            let n = u64::try_from(s.as_bytes().len()).unwrap_or(u64::MAX);
+            pass.ledger.native(lua, n)?;
+        }
         if !ok && !seen {
             let memory = match args.get(2) {
                 Some(Value::String(s)) => s.as_bytes().as_ref() == MEMORY_ERROR.as_bytes(),
@@ -192,6 +201,7 @@ pub(super) fn vm(pass: &Rc<Pass>) -> mlua::Result<Lua> {
             base.raw_get::<Function>("select")?,
             base.raw_get::<Table>("table")?
                 .raw_get::<Function>("unpack")?,
+            host(&lua, pass, |lua, pass, _| pass.ledger.check(lua))?,
         ))?;
     lua.set_named_registry_value(PACKED, packed)?;
     env.raw_set("pcall", pcall)?;

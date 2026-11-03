@@ -570,16 +570,31 @@ fn the_library_never_coerces_a_string_to_a_number_or_back() {
     import(&d).unwrap();
 }
 
-#[test]
-fn the_library_s_matcher_agrees_with_lua_s_own() {
-    // Each call's results, serialized the same way in the sandbox and in
-    // an unrestricted VM, the oracle.
+/// Asserts that each of `cases` gives the same results in the sandbox as
+/// in an unrestricted VM, the oracle, each serialized the same way.
+#[track_caller]
+fn agrees_with_lua(cases: &[&str]) {
     const SER: &str = "local function ser(...)\n\
            local n, out = select(\"#\", ...), {}\n\
            for i = 1, n do local v = select(i, ...) out[i] = type(v) .. \":\" .. tostring(v) end\n\
            return table.concat(out, \",\")\n\
          end\n";
-    let cases = [
+    let oracle = mlua::Lua::new();
+    for case in cases {
+        let want: String = oracle
+            .load(format!("{SER}return string.format(\"%q\", ser({case}))"))
+            .eval()
+            .unwrap_or_else(|e| panic!("{case}: {e}"));
+        let d = configured(&format!(
+            "{SER}assert(ser({case}) == {want}, \"disagrees\")"
+        ));
+        import(&d).unwrap_or_else(|e| panic!("{case}: {e:?}"));
+    }
+}
+
+#[test]
+fn the_library_s_matcher_agrees_with_lua_s_own() {
+    agrees_with_lua(&[
         "string.find(\"hello world\", \"o w\")",
         "string.find(\"hello\", \"l+\")",
         "string.find(\"hello\", \"(l)(l)\")",
@@ -633,17 +648,142 @@ fn the_library_s_matcher_agrees_with_lua_s_own() {
         "string.gsub(\"ab\", \".\", function() string.match(\"XY\", \"(.)\") return false end)",
         "string.gsub(\"ab\", \".\", function() string.find(\"XY\", \"(.)\") return nil end)",
         "string.gsub(\"ab\", \"(.)\", function(c) return string.gsub(c, \".\", \"%0%0\") end)",
-    ];
-    let oracle = mlua::Lua::new();
-    for case in cases {
-        let want: String = oracle
-            .load(format!("{SER}return string.format(\"%q\", ser({case}))"))
-            .eval()
-            .unwrap_or_else(|e| panic!("{case}: {e}"));
-        let d = configured(&format!(
-            "{SER}assert(ser({case}) == {want}, \"disagrees\")"
-        ));
-        import(&d).unwrap_or_else(|e| panic!("{case}: {e:?}"));
+        // 32 captures come back through Lua's own returns.
+        "string.find(\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"(a)(a)(a)(a)(a)(a)(a)(a)(a)(a)(a)(a)(a)(a)(a)(a)(a)(a)(a)(a)(a)(a)(a)(a)(a)(a)(a)(a)(a)(a)(a)(a)\")",
+    ]);
+}
+
+#[test]
+fn tonumber_agrees_with_lua_s_own() {
+    agrees_with_lua(&[
+        "tonumber(\"+7\", 10)",
+        "tonumber(\" -12 \", 10)",
+        "tonumber(\"\\t+0\\n\", 10)",
+        "tonumber(\"99999999999999999999\", 10)",
+        "tonumber(\"-9223372036854775808\", 10)",
+        "tonumber(\"9223372036854775808\", 10)",
+        "tonumber(\"1e2\", 10)",
+        "tonumber(\"\", 10)",
+        "tonumber(\" \", 10)",
+        "tonumber(\"-\", 10)",
+        "tonumber(\"+-1\", 10)",
+        "tonumber(\"0x10\", 10)",
+        "tonumber(\"7a\", 10)",
+        "tonumber(\"0x10\")",
+        "tonumber(\" 10 \")",
+        "tonumber(\"+10\")",
+        "tonumber(\"1e2\")",
+        "tonumber(\".5\")",
+        "tonumber(\"5.\")",
+        "tonumber(\"0x1p4\")",
+        "tonumber(\"1e\")",
+        "tonumber(\"--1\")",
+        "tonumber(\"inf\")",
+        "tonumber(\"nan\")",
+        "tonumber(\"99999999999999999999\")",
+        "tonumber(12)",
+        "tonumber(1.5)",
+        "tonumber({})",
+    ]);
+}
+
+/// Imports `d` on another thread, failing the test if it takes over a
+/// minute (a loop the instruction cap does not see).
+#[track_caller]
+fn import_within_a_minute(d: TempDir) -> Result<LuaImported, ImportError> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(import(&d));
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(60))
+        .expect("the import ran past a minute")
+}
+
+#[test]
+fn no_skin_code_runs_once_a_fault_is_raised() {
+    // The instruction cap is raised from the hook, where Lua turns hooks
+    // off and runs the message handler: the skin's handler is skipped.
+    for body in [
+        "xpcall(function() while true do end end, function() while true do end end)",
+        "xpcall(function() while true do end end, function(e) for i = 1, 1e12 do end return e end)",
+        "pcall(xpcall, function() while true do end end, function() while true do end end)",
+    ] {
+        let r = import_within_a_minute(configured(body));
+        assert_eq!(why(r), LuaWhy::Limit(LuaLimit::Instructions), "{body}");
+    }
+    // An ordinary error still reaches the skin's handler.
+    let d = configured(
+        "local ok, e = xpcall(error, function(m) return \"handled \" .. m end, \"x\", 0)\n\
+         assert(not ok and e == \"handled x\")",
+    );
+    import(&d).unwrap();
+    // Code run while an error unwinds is refused at its metatable.
+    let d = configured("local t <close> = setmetatable({}, { __close = function() end })");
+    assert_eq!(why(import(&d)), LuaWhy::Finalizer);
+}
+
+#[test]
+fn natives_never_read_a_skin_s_long_value() {
+    // ipairs's step takes an integer, never a numeral string it would
+    // parse natively.
+    let d = configured(
+        "local step, t = ipairs({ 5 })\n\
+         local zeros = rep(\"0\", 1 << 23)\n\
+         for i = 1, 1000 do assert(not pcall(step, t, zeros)) end\n\
+         assert(not pcall(step, t, 0.5))\n\
+         local n = 0 for i, v in ipairs({ 1, 2, 3 }) do n = n + i * v end assert(n == 14)\n\
+         local p = setmetatable({}, { __index = function(_, i) if i < 4 then return i end end })\n\
+         local m = 0 for i in ipairs(p) do m = i end assert(m == 3)",
+    );
+    let r = import(&d).unwrap();
+    assert!(r.usage.native_work < 1 << 20, "{:?}", r.usage);
+    // A metatable's `__name` is copied into each tostring and type error:
+    // a long one is refused.
+    let name = LuaWhy::Library {
+        op: "metatable __name over 64 bytes",
+    };
+    let d = configured("setmetatable({}, { __name = rep(\"n\", 65) })");
+    assert_eq!(why(import(&d)), name);
+    let d = configured(
+        "local t = setmetatable({}, { __name = rep(\"n\", 64) })\n\
+         assert(tostring(t):sub(1, 66) == rep(\"n\", 64) .. \": \")\n\
+         assert(string.format(\"%.3s\", t) == \"nnn\")",
+    );
+    import(&d).unwrap();
+    // A format's `%s` reads the whole string even when its precision
+    // keeps none: the bytes read are charged.
+    let d = configured(
+        "local s = rep(\"a\", 1 << 23)\nfor i = 1, 20 do string.format(\"%.0s\", s) end",
+    );
+    assert_eq!(why(import(&d)), LuaWhy::Limit(LuaLimit::NativeWork));
+    // An error's message is charged once formatted.
+    let d = configured("local s = rep(\"a\", 1 << 23)\nfor i = 1, 20 do pcall(error, s) end");
+    assert_eq!(why(import(&d)), LuaWhy::Limit(LuaLimit::NativeWork));
+    // A format takes at most 32 conversions.
+    let d = configured(
+        "local function many(k, ...) if k == 0 then return ... end return many(k - 1, 1, ...) end\n\
+         assert(string.format(rep(\"%d\", 32), many(32)) == rep(\"1\", 32))\n\
+         pcall(string.format, rep(\"%d\", 33), many(33))",
+    );
+    assert_eq!(
+        why(import(&d)),
+        LuaWhy::Library {
+            op: "format conversion"
+        }
+    );
+    // Bridge and loader names are measured before they are copied.
+    let d = configured("pcall(skin_config.get_path, rep(\"a\", 1025))");
+    assert_eq!(
+        why(import(&d)),
+        LuaWhy::Library {
+            op: "bridge argument over the path limit"
+        }
+    );
+    let d = configured("assert(skin_config.get_path(rep(\"a\", 1024)) == rep(\"a\", 1024))");
+    import(&d).unwrap();
+    for call in ["require", "dofile"] {
+        let d = configured(&format!("pcall({call}, rep(\"a\", 1025))"));
+        assert_eq!(why(import(&d)), LuaWhy::LoaderName, "{call}");
     }
 }
 

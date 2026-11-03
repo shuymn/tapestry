@@ -7,7 +7,7 @@
 -- a number belongs, or the reverse, is an error), and only for a result
 -- whose size is known and charged first (bytes). An unsupported form is
 -- refused (refuse), never approximated.
-local native, charge, refuse, bridge, cap = ...
+local native, charge, refuse, bridge, cap, max_path = ...
 
 local byte, sub = native.byte, native.sub
 local native_char, native_upper, native_lower = native.char, native.upper, native.lower
@@ -16,7 +16,7 @@ local native_tonumber, native_tostring = native.tonumber, native.tostring
 local native_setmetatable, native_getmetatable = native.setmetatable, native.getmetatable
 local native_select, native_error = native.select, native.error
 local native_floor, native_ceil, native_abs = native.floor, native.ceil, native.abs
-local tointeger, mathtype, unpack = native.tointeger, native.mathtype, native.unpack
+local tointeger, mathtype = native.tointeger, native.mathtype
 local type, next = native.type, native.next
 local rawget, rawset, rawlen = native.rawget, native.rawset, native.rawlen
 local error, select = native_error, native_select
@@ -24,7 +24,7 @@ local error, select = native_error, native_select
 -- The refusal codes library.rs names.
 local PATTERN_BALANCE, PATTERN_FRONTIER, PATTERN_BACKREF = 1, 2, 3
 local METATABLE, TOO_LARGE, FORMAT, PATTERN_ZERO = 4, 5, 6, 7
-local FINALIZER, TONUMBER = 8, 9
+local FINALIZER, TONUMBER, NAME, PATH = 8, 9, 10, 11
 
 -- The most values string.char takes in one call.
 local MAX_VALUES = 4096
@@ -32,6 +32,22 @@ local MAX_VALUES = 4096
 -- free stack slots Lua gives every native call (LUA_MINSTACK), so the
 -- native never grows the stack and cannot fail to.
 local MAX_RESULTS = 16
+-- The most conversions one string.format takes.
+local MAX_CONVERSIONS = 32
+-- The longest `__name` a metatable may hold: Lua copies it into every
+-- `tostring` of the table and every type error naming it.
+local MAX_NAME = 64
+
+-- The values t[i] to t[n], returned by Lua itself: the VM grows its
+-- stack for them, and an allocation failure there is fatal, where a
+-- native `unpack` would raise an ordinary error. Each return moves the
+-- values after it, so n stays small (at most 32 here).
+local function spread(t, i, n)
+  if i > n then
+    return
+  end
+  return t[i], spread(t, i + 1, n)
+end
 
 local function arg_error(n, fname, msg)
   native_error("bad argument #" .. n .. " to '" .. fname .. "' (" .. msg .. ")", 3)
@@ -193,7 +209,7 @@ function string_lib.format(fmt, ...)
   local args = { ... }
   local nargs = native_select("#", ...)
   local l = #fmt
-  local total, argi, i = 0, 0, 1
+  local total, scan, argi, i = 0, 0, 0, 1
   while i <= l do
     local c = byte(fmt, i)
     if c ~= 37 then
@@ -229,6 +245,9 @@ function string_lib.format(fmt, ...)
       local letter = byte(fmt, i)
       i = i + 1
       argi = argi + 1
+      if argi > MAX_CONVERSIONS then
+        refuse(FORMAT)
+      end
       if argi > nargs then
         arg_error(argi + 1, "format", "no value")
       end
@@ -248,6 +267,9 @@ function string_lib.format(fmt, ...)
           args[argi] = v
         end
         local n = #v
+        -- The native reads the whole string (it checks for zeros) even
+        -- when a precision keeps less of it.
+        scan = scan + n
         if precision ~= nil and precision < n then
           n = precision
         end
@@ -261,7 +283,10 @@ function string_lib.format(fmt, ...)
     end
   end
   bytes(total)
-  return native_format(fmt, unpack(args, 1, argi))
+  if scan > total then
+    charge(scan - total)
+  end
+  return native_format(fmt, spread(args, 1, argi))
 end
 
 ---------------------------------------------------------------------------
@@ -556,7 +581,7 @@ local function captures(si, e, whole)
   for i = 1, n do
     out[i] = capture(i, si, e)
   end
-  return unpack(out, 1, n)
+  return spread(out, 1, n)
 end
 
 -- Whether a pattern has none of the special characters.
@@ -948,6 +973,8 @@ function base.tonumber(v, b)
   if byte(v, i) == 45 then
     negative = true
     i = i + 1
+  elseif byte(v, i) == 43 then
+    i = i + 1
   end
   local n, digits = 0, 0
   while i <= l do
@@ -989,14 +1016,21 @@ local ours = native_setmetatable({}, { __mode = "k" })
 local attached = native_setmetatable({}, { __mode = "k" })
 
 -- A copy of the skin's metatable, made in Lua (its entries metered),
--- refused with `__gc` (a finalizer) or `__mode` (weak references).
+-- refused with `__gc` (a finalizer), `__mode` (weak references) or
+-- `__close` (code run while an error unwinds), or with a `__name`
+-- string longer than MAX_NAME.
 local function snapshot(mt)
   local copy = {}
   for k, v in next, mt do
     rawset(copy, k, v)
   end
-  if rawget(copy, "__gc") ~= nil or rawget(copy, "__mode") ~= nil then
+  if rawget(copy, "__gc") ~= nil or rawget(copy, "__mode") ~= nil
+    or rawget(copy, "__close") ~= nil then
     refuse(FINALIZER)
+  end
+  local name = rawget(copy, "__name")
+  if type(name) == "string" and #name > MAX_NAME then
+    refuse(NAME)
   end
   bridge.metatable()
   return copy
@@ -1043,8 +1077,32 @@ function base.string_bridge(f, name)
     if type(v) ~= "string" then
       arg_error(1, name, "string expected, got " .. got(v))
     end
+    if #v > max_path then
+      refuse(PATH)
+    end
     return f(v)
   end
+end
+
+-- ipairs, its step in Lua: the index is checked to be an integer, never
+-- read from a string natively.
+local function ipairs_step(t, i)
+  if mathtype(i) ~= "integer" then
+    arg_error(2, "ipairs", "integer expected, got " .. (mathtype(i) or got(i)))
+  end
+  i = i + 1
+  local v = t[i]
+  if v == nil then
+    return nil
+  end
+  return i, v
+end
+
+function base.ipairs(t)
+  if t == nil then
+    arg_error(1, "ipairs", "table expected, got no value")
+  end
+  return ipairs_step, t, 0
 end
 
 return string_lib, table_lib, math_lib, base
