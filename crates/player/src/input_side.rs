@@ -370,7 +370,7 @@ impl InputLink {
     }
 
     /// Measures the awake time with `awake` from now on (tests).
-    #[cfg(test)]
+    #[cfg(all(test, feature = "dev-tools"))]
     pub(crate) fn set_awake(&mut self, awake: fn() -> Duration) {
         self.awake = awake;
     }
