@@ -11,14 +11,22 @@
 //! crate's guard may have a step of its own on a Windows job (render's).
 //!
 //! The player's counting allocator exists only in its development builds,
-//! so its allocation guards are unit tests of its binary: every `#[test]`
-//! under the package's `src` whose body reads the counter ([`COUNTER`]) is
-//! one, and must be named `*_alloc` too. Each must be selected by the
-//! release command of a step (on a Windows job, [`UNIT_STEP`]): a
-//! `cargo test --release` naming the package, its binary and its
-//! [`UNIT_FEATURE`] feature, whose libtest filters after `--` select the
-//! test by its path (`module::tests::name`) as libtest does: a substring,
-//! or the whole path with `--exact`, and no `--skip` matching it.
+//! so its allocation guards are unit tests of its binary, named `*_alloc`:
+//! every `#[test]` under the package's `src` whose body names the counter's
+//! module ([`COUNTER`], an identifier, not a string) must be, and one that
+//! measures through a helper must be named so too, since the body check
+//! does not follow calls. Each must be selected by a release command of a
+//! step (on a Windows job, [`UNIT_STEP`]). Such a command names the package
+//! and has exactly the form of [`UNIT_COMMAND`], followed by libtest's
+//! substring filters and only `--exact` and `--skip`; it selects a test by
+//! its path (`module::tests::name`) as libtest does. Any other command
+//! naming the package, and any guard the files cannot place for certain (a
+//! `cfg` other than `test` or the feature, `#[ignore]`, a module's `#[path]`,
+//! `include!` anywhere under `src`), is an error rather than read as cargo
+//! or libtest might.
+//!
+//! The check catches omissions, not adversarial edits: a step a condition
+//! disables (`if: false`) still counts.
 //!
 //! The workflow is read line by line, enough for its own form: the list
 //! items with a `name:` and a `run:` (inline or a `|` block; a folded `>`
@@ -44,6 +52,22 @@ pub const UNIT_FEATURE: &str = "dev-tools";
 pub const COUNTER: &str = "alloc_count";
 /// The release step of the player's allocation guards.
 pub const UNIT_STEP: &str = "Player allocation guards (release)";
+/// The package's binary, whose unit tests the guards are.
+pub const UNIT_BIN: &str = "tapestry";
+/// The arguments after `cargo test` of a release command that runs the
+/// unit guards, before libtest's `--`.
+pub const UNIT_COMMAND: &[&str] = &[
+    "--release",
+    "--locked",
+    "-p",
+    UNIT_PACKAGE,
+    "--features",
+    UNIT_FEATURE,
+    "--bin",
+    UNIT_BIN,
+];
+/// The `cfg` predicates a unit guard and its modules may carry.
+const UNIT_CFGS: &[&str] = &["test", "feature=\"dev-tools\""];
 
 /// A unit test of [`UNIT_PACKAGE`]'s binary.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -54,13 +78,6 @@ pub struct UnitTest {
     pub file: String,
     /// Whether its body reads the counting allocator ([`COUNTER`]).
     pub counts: bool,
-}
-
-/// The binary whose unit tests are checked, and its tests.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct UnitTests {
-    pub bin: String,
-    pub tests: Vec<UnitTest>,
 }
 
 /// An allocation guard: a package and its integration test.
@@ -84,27 +101,21 @@ pub struct Step {
 struct ReleaseTest {
     packages: Vec<String>,
     tests: Vec<String>,
-    bins: Vec<String>,
-    features: Vec<String>,
-    all_features: bool,
-    /// libtest's filters, skips and `--exact`, after `--`.
+    /// For the unit guards' command ([`UNIT_COMMAND`]), what it selects.
+    unit: Option<Selection>,
+}
+
+/// libtest's selection of a unit guards' command, after `--`.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Selection {
     filters: Vec<String>,
     skips: Vec<String>,
     exact: bool,
 }
 
-impl ReleaseTest {
-    /// Whether it runs unit test `path` of binary `bin` of `package` with
-    /// [`UNIT_FEATURE`].
-    fn runs_unit(&self, package: &str, bin: &str, path: &str) -> bool {
-        let feature = format!("{package}/{UNIT_FEATURE}");
-        let built = self.packages.iter().any(|p| p == package)
-            && self.bins.iter().any(|b| b == bin)
-            && (self.all_features
-                || self
-                    .features
-                    .iter()
-                    .any(|f| f == UNIT_FEATURE || *f == feature));
+impl Selection {
+    /// Whether it runs the unit test whose path is `path`.
+    fn runs(&self, path: &str) -> bool {
         let matches = |pattern: &String| {
             if self.exact {
                 pattern == path
@@ -112,8 +123,7 @@ impl ReleaseTest {
                 path.contains(pattern.as_str())
             }
         };
-        built
-            && (self.filters.is_empty() || self.filters.iter().any(matches))
+        (self.filters.is_empty() || self.filters.iter().any(matches))
             && !self.skips.iter().any(matches)
     }
 }
@@ -150,22 +160,25 @@ pub fn run(manifest: &Path) -> anyhow::Result<Vec<String>> {
             let Some(bin) = package.targets.iter().find(|t| t.is_bin()) else {
                 bail!("package `{UNIT_PACKAGE}` has no binary");
             };
+            if bin.name != UNIT_BIN {
+                bail!(
+                    "package `{UNIT_PACKAGE}`'s binary is `{}`, not `{UNIT_BIN}`",
+                    bin.name
+                );
+            }
             let src = bin
                 .src_path
                 .as_std_path()
                 .parent()
                 .context("a binary's source has a directory")?;
-            Some(UnitTests {
-                bin: bin.name.clone(),
-                tests: unit_tests(root, src)?,
-            })
+            Some(unit_tests(root, src)?)
         }
         None => None,
     };
     let path = root.join(WORKFLOW);
     let workflow = std::fs::read_to_string(&path)
         .with_context(|| format!("cannot read {}", path.display()))?;
-    check(&guards, unit.as_ref(), &workflow)
+    check(&guards, unit.as_deref(), &workflow)
 }
 
 /// The unit tests of the crate whose root directory is `src`, read from
@@ -184,11 +197,11 @@ fn unit_tests(root: &Path, src: &Path) -> anyhow::Result<Vec<UnitTest>> {
         }
         Ok(())
     }
+    let mut paths = Vec::new();
+    walk(src, &mut paths)?;
+    paths.sort();
     let mut files = Vec::new();
-    walk(src, &mut files)?;
-    files.sort();
-    let mut out = Vec::new();
-    for path in files {
+    for path in paths {
         let relative = path.strip_prefix(src).unwrap_or(&path);
         let module = module_path(&relative.to_string_lossy().replace('\\', "/"));
         let file = path
@@ -198,9 +211,256 @@ fn unit_tests(root: &Path, src: &Path) -> anyhow::Result<Vec<UnitTest>> {
             .replace('\\', "/");
         let text = std::fs::read_to_string(&path)
             .with_context(|| format!("cannot read {}", path.display()))?;
-        out.extend(tests_in(&text, &module, &file)?);
+        files.push((module, file, text));
+    }
+    let files: Vec<(&str, &str, &str)> = files
+        .iter()
+        .map(|(m, f, t)| (m.as_str(), f.as_str(), t.as_str()))
+        .collect();
+    // A `#[path]` is relative to the declaring file's directory.
+    let resolve = |declaring: &str, path: &str| -> anyhow::Result<(String, String)> {
+        let mut target = std::path::PathBuf::new();
+        let base = root.join(declaring);
+        for c in base.parent().unwrap_or(root).join(path).components() {
+            match c {
+                std::path::Component::ParentDir => {
+                    target.pop();
+                }
+                std::path::Component::CurDir => {}
+                c => target.push(c),
+            }
+        }
+        let text = std::fs::read_to_string(&target)
+            .with_context(|| format!("cannot read {}", target.display()))?;
+        let shown = target
+            .strip_prefix(root)
+            .unwrap_or(&target)
+            .to_string_lossy()
+            .replace('\\', "/");
+        Ok((shown, text))
+    };
+    crate_tests(&files, &resolve)
+}
+
+/// Reads the file a `#[path]` names, from the declaring file and the path:
+/// its path to show, and its text.
+type Resolve<'a> = &'a dyn Fn(&str, &str) -> anyhow::Result<(String, String)>;
+
+/// The unit tests of a crate's files, each `(module path, file, text)`,
+/// with the files their `#[path]` modules name, which `resolve` reads from
+/// the declaring file and the path: a module declared under a `cfg` other
+/// than [`UNIT_CFGS`] (on its `mod` line, or inside its file) carries it to
+/// every test in it. `include!`, a `#[path]` inside an inline module, and a
+/// `mod x;` in a file reached by `#[path]` are errors.
+fn crate_tests(files: &[(&str, &str, &str)], resolve: Resolve) -> anyhow::Result<Vec<UnitTest>> {
+    // Each file with its module and whether a `#[path]` reached it.
+    let mut queue: Vec<(String, String, String, bool)> = files
+        .iter()
+        .map(|&(m, f, t)| (m.to_owned(), f.to_owned(), t.to_owned(), false))
+        .collect();
+    let mut parsed = Vec::new();
+    // Modules whose declaration carries another `cfg`, with it.
+    let mut declared: Vec<(String, String)> = Vec::new();
+    while let Some((module, file, text, followed)) = queue.pop() {
+        if has_macro(
+            &text.parse().map_err(|e| anyhow::anyhow!("{file}: {e}"))?,
+            "include",
+        ) {
+            bail!(
+                "{file} uses `include!`, whose code this check cannot place; its unit guards \
+                 could run unseen"
+            );
+        }
+        let syntax = syn::parse_file(&text).with_context(|| format!("parsing {file}"))?;
+        let mut paths = Vec::new();
+        declarations(
+            &syntax.items,
+            &module,
+            &file,
+            true,
+            &mut declared,
+            &mut paths,
+        )?;
+        for (child, path) in paths {
+            if followed {
+                bail!("{file}: module `{child}` is declared in a file reached by `#[path]`");
+            }
+            if let Some(path) = path {
+                let (target, text) = resolve(&file, &path)?;
+                queue.push((child, target, text, true));
+            }
+        }
+        parsed.push((module, file, syntax));
+    }
+    parsed.sort_by(|a, b| a.1.cmp(&b.1));
+    let mut out = Vec::new();
+    for (module, file, syntax) in &parsed {
+        let inherited = declared
+            .iter()
+            .find(|(m, _)| module == m || module.starts_with(&format!("{m}::")))
+            .map(|(_, cfg)| cfg.clone())
+            .or_else(|| other_cfg(&syntax.attrs));
+        collect(&syntax.items, module, file, inherited.as_deref(), &mut out)?;
     }
     Ok(out)
+}
+
+/// The `mod` declarations (`mod x;`) under `items`, in module `module`:
+/// each with its `#[path]`, if any, into `paths` (a `#[path]` inside an
+/// inline module, `top` false, is an error), and those that carry a `cfg`
+/// other than [`UNIT_CFGS`] with it into `cfgs`.
+fn declarations(
+    items: &[syn::Item],
+    module: &str,
+    file: &str,
+    top: bool,
+    cfgs: &mut Vec<(String, String)>,
+    paths: &mut Vec<(String, Option<String>)>,
+) -> anyhow::Result<()> {
+    for item in items {
+        if let syn::Item::Mod(m) = item {
+            let child = join(module, &m.ident.to_string());
+            let path = m.attrs.iter().find(|a| a.path().is_ident("path"));
+            match &m.content {
+                Some((_, inner)) => {
+                    if path.is_some() {
+                        bail!(
+                            "{file}: module `{child}` has a `#[path]`, which this check does not follow"
+                        );
+                    }
+                    declarations(inner, &child, file, false, cfgs, paths)?;
+                }
+                None => {
+                    let path = match path.map(|a| &a.meta) {
+                        Some(syn::Meta::NameValue(syn::MetaNameValue {
+                            value:
+                                syn::Expr::Lit(syn::ExprLit {
+                                    lit: syn::Lit::Str(s),
+                                    ..
+                                }),
+                            ..
+                        })) if top => Some(s.value()),
+                        Some(_) => bail!(
+                            "{file}: module `{child}` has a `#[path]`, which this check does not follow"
+                        ),
+                        None => None,
+                    };
+                    if let Some(cfg) = other_cfg(&m.attrs) {
+                        cfgs.push((child.clone(), cfg));
+                    }
+                    paths.push((child, path));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The `#[test]` functions under `items`, in module `module`, inside a
+/// `cfg` other than [`UNIT_CFGS`] when `outer` is one.
+fn collect(
+    items: &[syn::Item],
+    module: &str,
+    file: &str,
+    outer: Option<&str>,
+    out: &mut Vec<UnitTest>,
+) -> anyhow::Result<()> {
+    for item in items {
+        match item {
+            syn::Item::Fn(f) if f.attrs.iter().any(|a| a.path().is_ident("test")) => {
+                let path = join(module, &f.sig.ident.to_string());
+                let counts = has_ident(&f.block.to_token_stream(), COUNTER);
+                if counts || is_guard(&f.sig.ident.to_string()) {
+                    let cfg = outer.map(str::to_owned).or_else(|| other_cfg(&f.attrs));
+                    if let Some(cfg) = cfg {
+                        bail!(
+                            "allocation guard `{path}` ({file}) is under `{cfg}`, which the \
+                             release command may not build: only `cfg(test)` and \
+                             `cfg(feature = \"{UNIT_FEATURE}\")` are allowed"
+                        );
+                    }
+                    if f.attrs
+                        .iter()
+                        .any(|a| a.path().is_ident("ignore") || a.path().is_ident("cfg_attr"))
+                    {
+                        bail!(
+                            "allocation guard `{path}` ({file}) has `#[ignore]` or `#[cfg_attr]`, \
+                             so the release command may not run it"
+                        );
+                    }
+                }
+                out.push(UnitTest {
+                    path,
+                    file: file.to_owned(),
+                    counts,
+                });
+            }
+            syn::Item::Mod(m) => {
+                if let Some((_, inner)) = &m.content {
+                    let cfg = outer.map(str::to_owned).or_else(|| other_cfg(&m.attrs));
+                    collect(
+                        inner,
+                        &join(module, &m.ident.to_string()),
+                        file,
+                        cfg.as_deref(),
+                        out,
+                    )?;
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn join(module: &str, name: &str) -> String {
+    if module.is_empty() {
+        name.to_owned()
+    } else {
+        format!("{module}::{name}")
+    }
+}
+
+/// The first `cfg` of `attrs` (outer or inner) other than [`UNIT_CFGS`],
+/// as written.
+fn other_cfg(attrs: &[syn::Attribute]) -> Option<String> {
+    attrs.iter().find_map(|a| {
+        let syn::Meta::List(list) = &a.meta else {
+            return None;
+        };
+        if !a.path().is_ident("cfg") {
+            return None;
+        }
+        let predicate: String = list
+            .tokens
+            .to_string()
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        (!UNIT_CFGS.contains(&predicate.as_str())).then(|| format!("cfg({})", list.tokens))
+    })
+}
+
+/// Whether `tokens` hold the identifier `name`, at any depth.
+fn has_ident(tokens: &proc_macro2::TokenStream, name: &str) -> bool {
+    tokens.clone().into_iter().any(|t| match t {
+        proc_macro2::TokenTree::Ident(i) => i == name,
+        proc_macro2::TokenTree::Group(g) => has_ident(&g.stream(), name),
+        _ => false,
+    })
+}
+
+/// Whether `tokens` invoke macro `name` (`name!`), at any depth.
+fn has_macro(tokens: &proc_macro2::TokenStream, name: &str) -> bool {
+    let trees: Vec<proc_macro2::TokenTree> = tokens.clone().into_iter().collect();
+    trees.iter().enumerate().any(|(i, t)| match t {
+        proc_macro2::TokenTree::Ident(id) => {
+            id == name
+                && matches!(trees.get(i + 1), Some(proc_macro2::TokenTree::Punct(p)) if p.as_char() == '!')
+        }
+        proc_macro2::TokenTree::Group(g) => has_macro(&g.stream(), name),
+        _ => false,
+    })
 }
 
 /// The module path of a crate's file from its path under `src`: the root
@@ -216,43 +476,6 @@ fn module_path(relative: &str) -> String {
     parts.join("::")
 }
 
-/// The `#[test]` functions of one file whose module path is `module`,
-/// with those of its inline modules.
-fn tests_in(text: &str, module: &str, file: &str) -> anyhow::Result<Vec<UnitTest>> {
-    fn collect(items: &[syn::Item], module: &str, file: &str, out: &mut Vec<UnitTest>) {
-        for item in items {
-            match item {
-                syn::Item::Fn(f) if f.attrs.iter().any(|a| a.path().is_ident("test")) => {
-                    let name = f.sig.ident.to_string();
-                    let counts = f.block.to_token_stream().to_string().contains(COUNTER);
-                    out.push(UnitTest {
-                        path: join(module, &name),
-                        file: file.to_owned(),
-                        counts,
-                    });
-                }
-                syn::Item::Mod(m) => {
-                    if let Some((_, inner)) = &m.content {
-                        collect(inner, &join(module, &m.ident.to_string()), file, out);
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-    fn join(module: &str, name: &str) -> String {
-        if module.is_empty() {
-            name.to_owned()
-        } else {
-            format!("{module}::{name}")
-        }
-    }
-    let parsed = syn::parse_file(text).with_context(|| format!("parsing {file}"))?;
-    let mut out = Vec::new();
-    collect(&parsed.items, module, file, &mut out);
-    Ok(out)
-}
-
 /// Whether an integration test is an allocation guard by its name.
 pub fn is_guard(test: &str) -> bool {
     test == "alloc" || test.ends_with("_alloc")
@@ -264,7 +487,7 @@ pub fn is_guard(test: &str) -> bool {
 /// name than `*_alloc`.
 pub fn check(
     guards: &[Guard],
-    unit: Option<&UnitTests>,
+    unit: Option<&[UnitTest]>,
     workflow: &str,
 ) -> anyhow::Result<Vec<String>> {
     let steps = steps(workflow)?;
@@ -307,8 +530,8 @@ pub fn check(
             )
         });
     }
-    if let Some(u) = unit {
-        for t in &u.tests {
+    if let Some(unit) = unit {
+        for t in unit {
             let name = t.path.rsplit("::").next().unwrap_or(&t.path);
             if t.counts && !is_guard(name) {
                 diagnostics.push(format!(
@@ -321,15 +544,16 @@ pub fn check(
             if !is_guard(name)
                 || commands
                     .iter()
-                    .any(|(_, c)| c.runs_unit(UNIT_PACKAGE, &u.bin, &t.path))
+                    .any(|(_, c)| c.unit.as_ref().is_some_and(|u| u.runs(&t.path)))
             {
                 continue;
             }
             diagnostics.push(format!(
                 "allocation guard `{}` ({}) runs in no release step of {WORKFLOW}: select it in \
-                 `{UNIT_STEP}` (`cargo test --release -p {UNIT_PACKAGE} --features \
-                 {UNIT_FEATURE} --bin {} -- _alloc`)",
-                t.path, t.file, u.bin
+                 `{UNIT_STEP}` (`cargo test {} -- _alloc`)",
+                t.path,
+                t.file,
+                UNIT_COMMAND.join(" ")
             ));
         }
     }
@@ -460,10 +684,72 @@ fn release_tests(step: &str, run: &str) -> anyhow::Result<Vec<ReleaseTest>> {
                     command.trim()
                 );
             }
-            out.extend(release_test(&tokens));
+            if names_package(&tokens, UNIT_PACKAGE) {
+                out.push(ReleaseTest {
+                    unit: Some(unit_selection(step, command.trim(), &tokens)?),
+                    ..ReleaseTest::default()
+                });
+            } else {
+                out.extend(release_test(&tokens));
+            }
         }
     }
     Ok(out)
+}
+
+/// Whether a command's arguments name package `package`.
+fn names_package(tokens: &[&str], package: &str) -> bool {
+    tokens
+        .windows(2)
+        .any(|w| (w[0] == "-p" || w[0] == "--package") && w[1] == package)
+        || tokens.iter().any(|t| {
+            [
+                format!("-p{package}"),
+                format!("-p={package}"),
+                format!("--package={package}"),
+            ]
+            .contains(&(*t).to_owned())
+        })
+}
+
+/// What the unit guards' release command `command` selects: its arguments
+/// must be [`UNIT_COMMAND`], then, after `--`, substring filters with only
+/// `--exact` and `--skip`; any other form is an error.
+fn unit_selection(step: &str, command: &str, tokens: &[&str]) -> anyhow::Result<Selection> {
+    let refuse = || {
+        anyhow::anyhow!(
+            "{WORKFLOW}: step `{step}` runs `{command}`, which names `{UNIT_PACKAGE}` but is not \
+             its allocation guards' release command: use `cargo test {} -- <filters>`, with \
+             only `--exact` and `--skip <pattern>` besides the filters",
+            UNIT_COMMAND.join(" ")
+        )
+    };
+    let start = tokens
+        .windows(2)
+        .position(|w| w == ["cargo", "test"])
+        .ok_or_else(refuse)?
+        + 2;
+    let args = tokens.get(start..).unwrap_or_default();
+    let (head, tail) = match args.iter().position(|&a| a == "--") {
+        Some(i) => (&args[..i], &args[i + 1..]),
+        None => (args, &[][..]),
+    };
+    if head != UNIT_COMMAND {
+        return Err(refuse());
+    }
+    let mut selection = Selection::default();
+    let mut tail = tail.iter().copied();
+    while let Some(arg) = tail.next() {
+        match arg {
+            "--exact" => selection.exact = true,
+            "--skip" => selection
+                .skips
+                .push(tail.next().ok_or_else(refuse)?.to_owned()),
+            _ if arg.starts_with('-') => return Err(refuse()),
+            _ => selection.filters.push(arg.to_owned()),
+        }
+    }
+    Ok(selection)
 }
 
 /// One line's commands, split at `;`, `&&`, `||` and `|`, up to a comment:
@@ -517,59 +803,23 @@ fn release_test(tokens: &[&str]) -> Option<ReleaseTest> {
         };
         match arg {
             "--" => {
-                let rest: Vec<&str> = args.collect();
-                if rest.contains(&"--list") {
+                if args.any(|a| a == "--list") {
                     return None;
                 }
-                libtest_args(&rest, &mut command);
                 break;
             }
             "--release" => release = true,
             "--no-run" => return None,
-            "--all-features" => command.all_features = true,
             _ => {
                 if let Some(p) = value("--package", Some("-p")) {
                     command.packages.push(p);
                 } else if let Some(t) = value("--test", None) {
                     command.tests.push(t);
-                } else if let Some(b) = value("--bin", None) {
-                    command.bins.push(b);
-                } else if let Some(f) = value("--features", Some("-F")) {
-                    command
-                        .features
-                        .extend(f.split(',').filter(|f| !f.is_empty()).map(str::to_owned));
                 }
             }
         }
     }
     release.then_some(command)
-}
-
-/// libtest's arguments after `--`: filters, `--skip` patterns and
-/// `--exact`; the options that take a value skip it.
-fn libtest_args(args: &[&str], command: &mut ReleaseTest) {
-    const VALUED: &[&str] = &[
-        "--test-threads",
-        "--logfile",
-        "--format",
-        "--color",
-        "-Z",
-        "--shuffle-seed",
-    ];
-    let mut args = args.iter().copied();
-    while let Some(arg) = args.next() {
-        if arg == "--exact" {
-            command.exact = true;
-        } else if arg == "--skip" {
-            command.skips.extend(args.next().map(str::to_owned));
-        } else if let Some(skip) = arg.strip_prefix("--skip=") {
-            command.skips.push(skip.to_owned());
-        } else if VALUED.contains(&arg) {
-            args.next();
-        } else if !arg.starts_with('-') {
-            command.filters.push(arg.to_owned());
-        }
-    }
 }
 
 #[cfg(test)]
@@ -659,8 +909,7 @@ jobs:
             [ReleaseTest {
                 packages: vec!["eval".into(), "game".into()],
                 tests: vec!["alloc".into()],
-                filters: vec!["not_a_target".into()],
-                ..ReleaseTest::default()
+                unit: None,
             }]
         );
         assert!(release_tests("", &steps[1].run).unwrap().is_empty());
@@ -838,15 +1087,33 @@ jobs:
         assert_eq!(module_path("render_side/mod.rs"), "render_side");
     }
 
-    /// Unit tests are found in inline modules with their paths, and a
-    /// test reading the counting allocator is told apart from one that
-    /// does not; a helper reading it is not a test.
+    /// Reads a `#[path]` module's file from fixtures, by its path.
+    fn elsewhere(declaring: &str, path: &str) -> anyhow::Result<(String, String)> {
+        let text = match path {
+            "../shared/guard.rs" => "#[test]\nfn shared_alloc() {}\n",
+            "../shared/nested.rs" => "mod deeper;\n",
+            _ => bail!("{declaring}: no {path}"),
+        };
+        Ok((path.trim_start_matches("../").to_owned(), text.to_owned()))
+    }
+
+    fn found(files: &[(&str, &str, &str)]) -> Vec<(String, bool)> {
+        crate_tests(files, &elsewhere)
+            .unwrap()
+            .into_iter()
+            .map(|t| (t.path, t.counts))
+            .collect()
+    }
+
+    /// Unit tests are found in inline modules with their paths; a test is
+    /// told to count by the counter's identifier in its body, not by a
+    /// string, and a helper reading it is not a test.
     #[test]
     fn unit_tests_are_found_with_their_paths_and_whether_they_count() {
         let text = "\
 fn helper() { let _ = crate::alloc_count::this_thread(); }
 #[test]
-fn top() {}
+fn top() { let _ = \"alloc_count\"; }
 #[cfg(test)]
 mod tests {
     #[cfg(feature = \"dev-tools\")]
@@ -861,39 +1128,108 @@ mod tests {
     }
 }
 ";
-        let tests = tests_in(text, "measure", "crates/player/src/measure.rs").unwrap();
-        let found: Vec<(&str, bool)> = tests.iter().map(|t| (t.path.as_str(), t.counts)).collect();
+        let file = "crates/player/src/measure.rs";
         assert_eq!(
-            found,
+            found(&[("measure", file, text)]),
             [
-                ("measure::top", false),
-                ("measure::tests::counted_alloc", true),
-                ("measure::tests::inner::plain", false),
+                ("measure::top".to_owned(), false),
+                ("measure::tests::counted_alloc".to_owned(), true),
+                ("measure::tests::inner::plain".to_owned(), false),
             ]
         );
     }
 
-    fn unit(tests: &[(&str, bool)]) -> UnitTests {
-        UnitTests {
-            bin: "tapestry".to_owned(),
-            tests: tests
-                .iter()
-                .map(|&(path, counts)| UnitTest {
-                    path: path.to_owned(),
-                    file: "crates/player/src/input_side.rs".to_owned(),
-                    counts,
-                })
-                .collect(),
-        }
+    /// A guard the files cannot place for certain is an error: under
+    /// another `cfg` on itself, its inline module, its file or its `mod`
+    /// line; ignored; in a module with `#[path]`; or with `include!`
+    /// anywhere in the crate. Tests that are not guards may carry any.
+    #[test]
+    fn a_guard_the_files_cannot_place_is_an_error() {
+        let guard = "#[test]\nfn a_alloc() {}\n";
+        let error =
+            |files: &[(&str, &str, &str)]| crate_tests(files, &elsewhere).unwrap_err().to_string();
+        let under = |path: &str, cfg: &str| {
+            format!(
+                "allocation guard `{path}` (m.rs) is under `{cfg}`, which the release \
+                 command may not build: only `cfg(test)` and `cfg(feature = \"dev-tools\")` \
+                 are allowed"
+            )
+        };
+        let cfg = |cfg: &str| under("m::a_alloc", cfg);
+        let own = format!("#[cfg(not(windows))]\n{guard}");
+        assert_eq!(error(&[("m", "m.rs", &own)]), cfg("cfg(not (windows))"));
+        let inline = format!("#[cfg(debug_assertions)]\nmod t {{\n{guard}}}\n");
+        assert_eq!(
+            error(&[("m", "m.rs", &inline)]),
+            under("m::t::a_alloc", "cfg(debug_assertions)")
+        );
+        let inner = format!("#![cfg(unix)]\n{guard}");
+        assert_eq!(error(&[("m", "m.rs", &inner)]), cfg("cfg(unix)"));
+        let declared = [
+            ("", "main.rs", "#[cfg(feature = \"other\")]\nmod m;\n"),
+            ("m", "m.rs", guard),
+        ];
+        assert_eq!(error(&declared), cfg("cfg(feature = \"other\")"));
+        let ignored = format!("#[ignore]\n{guard}");
+        assert_eq!(
+            error(&[("m", "m.rs", &ignored)]),
+            "allocation guard `m::a_alloc` (m.rs) has `#[ignore]` or `#[cfg_attr]`, so the \
+             release command may not run it"
+        );
+        // A `#[path]` module's file is read, its declaration's cfg kept;
+        // one inside an inline module, or a module such a file declares,
+        // is not followed.
+        let shared = |attrs: &str| format!("{attrs}#[path = \"../shared/guard.rs\"]\nmod s;\n");
+        assert_eq!(
+            found(&[("", "main.rs", &shared(""))]),
+            [("s::shared_alloc".to_owned(), false)]
+        );
+        assert_eq!(
+            error(&[("", "main.rs", &shared("#[cfg(unix)]\n"))]),
+            "allocation guard `s::shared_alloc` (shared/guard.rs) is under `cfg(unix)`, which \
+             the release command may not build: only `cfg(test)` and \
+             `cfg(feature = \"dev-tools\")` are allowed"
+        );
+        assert_eq!(
+            error(&[("", "main.rs", &format!("mod t {{\n{}}}\n", shared("")))]),
+            "main.rs: module `t::s` has a `#[path]`, which this check does not follow"
+        );
+        assert_eq!(
+            error(&[("", "main.rs", "#[path = \"../shared/nested.rs\"]\nmod n;\n")]),
+            "shared/nested.rs: module `n::deeper` is declared in a file reached by `#[path]`"
+        );
+        assert_eq!(
+            error(&[("m", "m.rs", "include!(\"tests.rs\");\n")]),
+            "m.rs uses `include!`, whose code this check cannot place; its unit guards could \
+             run unseen"
+        );
+        // Allowed: the feature and `test`, and any cfg on a non-guard.
+        let allowed = format!(
+            "#[cfg(not(windows))]\n#[test]\nfn other() {{}}\n#[cfg(test)]\nmod t {{\n\
+             #[cfg(feature = \"dev-tools\")]\n{guard}}}\n"
+        );
+        assert_eq!(found(&[("m", "m.rs", &allowed)]).len(), 2);
+    }
+
+    fn unit(tests: &[(&str, bool)]) -> Vec<UnitTest> {
+        tests
+            .iter()
+            .map(|&(path, counts)| UnitTest {
+                path: path.to_owned(),
+                file: "crates/player/src/input_side.rs".to_owned(),
+                counts,
+            })
+            .collect()
     }
 
     const GUARD: &str = "input_side::gate_tests::abort_close_alloc";
+    const UNIT_RUN: &str =
+        "cargo test --release --locked -p player --features dev-tools --bin tapestry";
 
     fn unselected() -> String {
         format!(
             "allocation guard `{GUARD}` (crates/player/src/input_side.rs) runs in no release \
-             step of {WORKFLOW}: select it in `{UNIT_STEP}` (`cargo test --release -p player \
-             --features dev-tools --bin tapestry -- _alloc`)"
+             step of {WORKFLOW}: select it in `{UNIT_STEP}` (`{UNIT_RUN} -- _alloc`)"
         )
     }
 
@@ -907,50 +1243,75 @@ mod tests {
     }
 
     #[test]
-    fn a_unit_guard_selected_by_a_release_step_passes() {
+    fn a_unit_guard_selected_by_the_release_command_passes() {
         let unit = unit(&[(GUARD, true), ("input_side::tests::plain", false)]);
-        for command in [
-            "cargo test --release --locked -p player --features dev-tools --bin tapestry -- _alloc",
-            "cargo test --release -p player -F player/dev-tools,game/dev-tools --bin=tapestry \
-             -- --test-threads 1 close_alloc",
-            "cargo test --release -p player --all-features --bin tapestry -- --exact \
-             input_side::gate_tests::abort_close_alloc",
-            "cargo test --release -p player --features=dev-tools --bin tapestry",
+        for tail in [
+            " -- _alloc",
+            " -- other close_alloc --skip menu_",
+            " -- --exact input_side::gate_tests::abort_close_alloc",
+            "",
         ] {
-            let diags = check(&guards(), Some(&unit), &with_unit_step(&[command])).unwrap();
+            let command = format!("{UNIT_RUN}{tail}");
+            let diags = check(&guards(), Some(&unit), &with_unit_step(&[&command])).unwrap();
             assert_eq!(diags, Vec::<String>::new(), "{command}");
         }
     }
 
     #[test]
-    fn a_unit_guard_no_release_step_selects_fails() {
+    fn a_unit_guard_its_command_does_not_select_fails() {
         let unit = unit(&[(GUARD, true)]);
         for command in [
-            // Dev profile.
+            // Not a release command naming the package.
             "cargo test --locked -p player --features dev-tools --bin tapestry -- _alloc",
-            // Without the counting allocator, the binary or the package.
-            "cargo test --release -p player --bin tapestry -- _alloc",
-            "cargo test --release -p player --features dev-tools -- _alloc",
-            "cargo test --release -p game --features dev-tools --bin tapestry -- _alloc",
+            "cargo test --release --workspace -- _alloc",
             // Filtered out, skipped, or not the whole path with `--exact`.
-            "cargo test --release -p player --features dev-tools --bin tapestry -- menu_",
-            "cargo test --release -p player --features dev-tools --bin tapestry -- _alloc \
-             --skip gate_tests",
-            "cargo test --release -p player --features dev-tools --bin tapestry -- --exact _alloc",
-            // Listed only.
-            "cargo test --release -p player --features dev-tools --bin tapestry -- --list",
+            &format!("{UNIT_RUN} -- menu_"),
+            &format!("{UNIT_RUN} -- _alloc --skip gate_tests"),
+            &format!("{UNIT_RUN} -- --exact _alloc"),
         ] {
             let diags = check(&guards(), Some(&unit), &with_unit_step(&[command])).unwrap();
             assert_eq!(diags, [unselected()], "{command}");
         }
     }
 
+    /// A release command naming the package in any other form is refused:
+    /// a test name before `--` (which runs one test while the filters
+    /// would credit all), `--ignored` (which runs none), other selection
+    /// flags, and other cargo arguments.
+    #[test]
+    fn a_unit_command_of_another_form_is_refused() {
+        let unit = unit(&[(GUARD, true)]);
+        for command in [
+            &format!("{UNIT_RUN} abort_close_alloc -- _alloc"),
+            &format!("{UNIT_RUN} -- _alloc --ignored"),
+            &format!("{UNIT_RUN} -- _alloc --include-ignored"),
+            &format!("{UNIT_RUN} -- --bench _alloc"),
+            &format!("{UNIT_RUN} -- _alloc --skip"),
+            "cargo test --release --locked -p player -F player/dev-tools --bin tapestry -- _alloc",
+            "cargo test --release --locked -p player --features dev-tools -- _alloc",
+            "cargo test --release --locked -p player -p game --features dev-tools --bin tapestry",
+            &format!("{UNIT_RUN} --no-run"),
+            &format!("{UNIT_RUN} -- --list"),
+        ] {
+            let e = check(&guards(), Some(&unit), &with_unit_step(&[command])).unwrap_err();
+            assert_eq!(
+                e.to_string(),
+                format!(
+                    "{WORKFLOW}: step `Extra` runs `{command}`, which names `player` but is not \
+                     its allocation guards' release command: use `cargo test --release --locked \
+                     -p player --features dev-tools --bin tapestry -- <filters>`, with only \
+                     `--exact` and `--skip <pattern>` besides the filters"
+                ),
+                "{command}"
+            );
+        }
+    }
+
     #[test]
     fn a_unit_test_that_counts_under_another_name_fails() {
         let unit = unit(&[("input_side::gate_tests::a_handoff_keeps_the_sources", true)]);
-        let command =
-            "cargo test --release -p player --features dev-tools --bin tapestry -- handoff";
-        let diags = check(&guards(), Some(&unit), &with_unit_step(&[command])).unwrap();
+        let command = format!("{UNIT_RUN} -- handoff");
+        let diags = check(&guards(), Some(&unit), &with_unit_step(&[&command])).unwrap();
         assert_eq!(
             diags,
             [format!(
