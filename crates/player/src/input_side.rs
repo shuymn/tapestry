@@ -1945,9 +1945,12 @@ mod link_tests {
         assert_eq!(link.failure(), None);
         link.timeout = SHORT;
         waker.pause();
-        let begun = Instant::now();
+        // Measured on the awake clock the bound is kept on, which moves in
+        // timer ticks and can reach it just before the wall clock does.
+        let begun = link.awake_now();
         assert_eq!(link.close().err(), Some(InputWaitError::Timeout));
-        assert!(begun.elapsed() >= SHORT, "{:?}", begun.elapsed());
+        let waited = link.awake_now().saturating_sub(begun);
+        assert!(waited >= SHORT, "{waited:?}");
         waker.resume();
         // The late reply to the close arrives.
         waker.two_more_wakes();
