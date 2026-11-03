@@ -1114,6 +1114,11 @@ impl Rig for PlayerRig<'_> {
 
     fn ended(&mut self, report: &PlayReport) {
         self.controls.next_scene();
+        // The result is another scene: held adjustment controls act no more
+        // until pressed afresh.
+        if let Some(driver) = &mut self.adjust {
+            driver.scene_changed();
+        }
         if let Some(c) = self.figures.as_ref().and_then(|f| f.ready_state) {
             println!(
                 "ready: setup {} us, first frame {} after it started",

@@ -822,3 +822,25 @@ fn a_gesture_accepted_with_the_cancelling_hold_keeps_repeating() {
     // 3.20 and five steps of 0.01: the press and four repeats.
     assert_eq!(rig.snap().hispeed, Some(r(325, 100)));
 }
+
+#[test]
+fn a_scene_change_stops_held_controls_until_a_fresh_press() {
+    let mut rig = Rig::new(options(SpeedMode::Classic, 320, 300, Covers::default()));
+    rig.enter(-1_000_000);
+    rig.attach(tempo(150, None), -1_000_000).unwrap();
+    // F2 held: its press and a keyboard repeat step.
+    rig.keys(10 * MS, &[(F2, true)])
+        .keys(20 * MS, &[(F2, true)]);
+    assert_eq!(rig.snap().hispeed, Some(r(370, 100)));
+    // The play ends and its result shows: the repeats step nothing more.
+    rig.driver.scene_changed();
+    rig.keys(40 * MS, &[(F2, true)])
+        .keys(50 * MS, &[(F2, true)]);
+    let s = rig.snap();
+    assert_eq!(s.hispeed, Some(r(370, 100)));
+    assert_eq!(s.options.hispeed().classic_hispeed_x100, 370);
+    // Released and pressed afresh, it steps again.
+    rig.keys(60 * MS, &[(F2, false)])
+        .keys(70 * MS, &[(F2, true)]);
+    assert_eq!(rig.snap().hispeed, Some(r(395, 100)));
+}

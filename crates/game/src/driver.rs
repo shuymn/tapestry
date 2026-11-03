@@ -320,6 +320,28 @@ impl AdjustDriver {
         Ok(epoch)
     }
 
+    /// The scene changed (a play ended and its result shows): an
+    /// ownership change at the latest observation's stamp, so a control
+    /// held across it (F1 or F2 repeating, a scratch held with START)
+    /// takes no further action until released and pressed afresh.
+    /// Publishes the result.
+    pub fn scene_changed(&mut self) {
+        let (time, seq) = self.reducer.last().unwrap_or((TimeUs(i64::MIN), 0));
+        let ownership = Observation {
+            time,
+            seq,
+            event: Event::Ownership,
+        };
+        match &self.tempo {
+            Some(t) => self
+                .reducer
+                .feed([Augmented::Obs(ownership)], t, &mut self.writer),
+            None => self
+                .reducer
+                .feed([Augmented::Obs(ownership)], &NoTempo, &mut self.writer),
+        }
+    }
+
     /// Whether an attempt is attached and not yet prepared.
     #[must_use]
     pub const fn has_pending(&self) -> bool {
