@@ -6,20 +6,26 @@
 //! - [`build`] is a pure function of its inputs: the folder, the header,
 //!   the configuration named against it, the import, the atlas and the
 //!   bundle, with its text producer only when the skin has rasterized
-//!   text. It installs nothing.
-//! - [`run_cancellable`] runs one job on a spawned `skin-import` thread
-//!   with owned inputs. A completed outcome is returned only once the
-//!   thread has ended, so every VM of the job is dropped. A stop cancels
-//!   the job and waits at most [`STOP_WAIT`]; a job past it is abandoned
-//!   to the process's exit, and its late outcome is dropped on its own
-//!   thread.
+//!   text. It installs nothing. A Lua play skin whose base import reads a
+//!   chart fact ends pending ([`KindOutcome::Pending`]), with what each
+//!   attempt's [`specialize`] starts from; [`facts`] derives an attempt's
+//!   facts.
+//! - [`run_job`] runs one job on a spawned `skin-import` thread with owned
+//!   inputs. A completed outcome is returned only once the thread has
+//!   ended, so every VM of the job is dropped. Cancelling the attempt
+//!   cancels the job and waits for its thread's end without a bound;
+//!   ending the run cancels it and waits at most [`STOP_WAIT`], and a job
+//!   past it is abandoned to the process's exit, its late outcome dropped
+//!   on its own thread. [`run_cancellable`] is it with the run's end
+//!   only.
 //! - [`startup`] imports and selects each configured kind of a launch
 //!   path, one kind after another, before the first screen.
 //! - The reports: the stdout line of each kind ([`line`]), the log's
 //!   summary of an installed skin ([`log_installed`]), and the select
 //!   screen's notice of a screen kind other than play ([`notice`]).
 //!
-//! Skins are imported at startup only; nothing here runs after it.
+//! Skins are imported at startup only: a pending play skin is still
+//! refused there, and nothing here runs after it yet.
 
 use std::fmt::Write as _;
 use std::panic::{self, AssertUnwindSafe};
@@ -31,13 +37,15 @@ use std::time::{Duration, Instant};
 use game::{Chain, Preparation, SkinChoice, SkinChoices};
 use render::{ClipTable, DefaultFont, OutlineError, OutlineText, SkinBundle};
 use skin_beatoraja::{
-    Cancel, Config, Definition, Fact, FactId, Header, ImportError, ImportFacts, Imported,
-    LuaHeader, LuaOutcome, Note, NoteLoc, Report, Rule, Usage,
+    Cancel, Config, Definition, Fact, FactDeps, FactId, Header, ImportError, ImportFacts, Imported,
+    LuaHeader, LuaOutcome, LuaUsage, Note, NoteLoc, Report, Rule, Usage,
 };
 use skin_model::{AtlasLimits, FontReader, Layout, Root, ScreenKind, Side};
 
 use crate::log_file;
 use crate::render_side::{RenderLink, SELECT_SLICE};
+
+pub mod facts;
 
 /// How long a stopped job is waited for before it is abandoned: the
 /// background work's stop bound.
@@ -72,6 +80,65 @@ pub enum KindOutcome {
     BuiltIn(String),
     /// Refused, with the located reason: nothing is selected.
     Refused(String),
+    /// A Lua play skin whose base import read a fact the base snapshot
+    /// has pending: what each attempt's [`specialize`] starts from, and
+    /// the base import's report.
+    Pending(
+        #[cfg_attr(not(test), expect(dead_code, reason = "activated by S10-07c-2"))]
+        Arc<PendingPlay>,
+        PendingNote,
+    ),
+}
+
+/// A pending play skin, built for each attempt ([`specialize`]): the
+/// header pass's result, the configuration named against its header, and
+/// the target startup packed for. Owned, with no Lua state.
+#[derive(Debug)]
+pub struct PendingPlay {
+    header: LuaHeader,
+    config: Config,
+    target: ImportTarget,
+}
+
+/// What a pending base import reports: the fact that stopped it, and the
+/// files and the sandbox's caps it used so far.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingNote {
+    pub fact: FactId,
+    pub dependencies: Vec<String>,
+    pub usage: LuaUsage,
+}
+
+/// `fact` by name.
+const fn fact_name(fact: FactId) -> &'static str {
+    match fact {
+        FactId::Autoplay => "autoplay",
+        FactId::JudgeClass => "the chart's judgment class",
+        FactId::PlayLevel => "the chart's play level",
+    }
+}
+
+impl PendingNote {
+    /// The refusal of a skin that cannot be built before a chart is
+    /// chosen: what startup reports for a pending play skin.
+    pub fn refusal(&self) -> String {
+        format!(
+            "the skin reads {} as it is built, which is known only once a chart is \
+             chosen; such skins are not installed yet",
+            fact_name(self.fact)
+        )
+    }
+}
+
+/// A pending play skin built for an attempt's facts: the bundle, the
+/// import's report, and the facts it read, which say whether it fits
+/// another attempt ([`FactDeps::holds`]).
+#[derive(Debug)]
+#[cfg_attr(not(test), expect(dead_code, reason = "activated by S10-07c-2"))]
+pub struct Specialization {
+    pub bundle: Arc<SkinBundle>,
+    pub summary: Summary,
+    pub facts: FactDeps,
 }
 
 /// An import's report as the log shows it: the definition files read, the
@@ -159,11 +226,9 @@ pub const fn name(kind: ScreenKind) -> &'static str {
 /// 3. The configuration: each option and file choice by name, against the
 ///    header; an unknown name refuses.
 /// 4. The import, Lua against the base facts; a kind with no importer
-///    keeps its built-in screen, and a Lua skin reading a chart fact
-///    refuses.
-/// 5. The pack: the variant for the target, the atlas within its limits,
-///    and the bundle, with its text producer only when the skin has
-///    rasterized text.
+///    keeps its built-in screen, and a Lua play skin reading a chart fact
+///    ends pending, built for each attempt ([`specialize`]).
+/// 5. The pack ([`pack`]).
 pub fn build(
     kind: ScreenKind,
     choice: &SkinChoice,
@@ -174,6 +239,7 @@ pub fn build(
     match built(kind, choice, autoplay, target, cancel) {
         Ok(Built::Bundle(b, summary)) => KindOutcome::Bundle(b, summary),
         Ok(Built::NoImporter(why)) => KindOutcome::BuiltIn(why),
+        Ok(Built::Pending(p, note)) => KindOutcome::Pending(p, note),
         Err(why) => KindOutcome::Refused(why),
     }
 }
@@ -182,6 +248,7 @@ pub fn build(
 enum Built {
     Bundle(Arc<SkinBundle>, Summary),
     NoImporter(String),
+    Pending(Arc<PendingPlay>, PendingNote),
 }
 
 /// The header pass's result, by format.
@@ -199,6 +266,15 @@ impl Pass {
     }
 }
 
+/// [`STOPPED`] once `cancel` is cancelled.
+fn stopped(cancel: &Cancel) -> Result<(), String> {
+    if cancel.is_cancelled() {
+        Err(STOPPED.to_owned())
+    } else {
+        Ok(())
+    }
+}
+
 fn built(
     kind: ScreenKind,
     choice: &SkinChoice,
@@ -206,13 +282,7 @@ fn built(
     target: &ImportTarget,
     cancel: &Cancel,
 ) -> Result<Built, String> {
-    let stopped = || {
-        if cancel.is_cancelled() {
-            Err(STOPPED.to_owned())
-        } else {
-            Ok(())
-        }
-    };
+    let stopped = || stopped(cancel);
     let text = |e: &ImportError| Chain(e).to_string();
     // 1. The folder.
     Root::new(&choice.root).map_err(|e| {
@@ -258,15 +328,22 @@ fn built(
             match h.import(&config, &facts, cancel) {
                 Ok(LuaOutcome::Imported(i)) => Ok(i.imported),
                 Ok(LuaOutcome::Pending(p)) => {
-                    let fact = match p.pending {
-                        FactId::Autoplay => "autoplay",
-                        FactId::JudgeClass => "the chart's judgment class",
-                        FactId::PlayLevel => "the chart's play level",
+                    let note = PendingNote {
+                        fact: p.pending,
+                        dependencies: p.dependencies,
+                        usage: p.usage,
                     };
-                    return Err(format!(
-                        "the skin reads {fact} as it is built, which is known only once a \
-                         chart is chosen; such skins are not installed yet"
-                    ));
+                    // Only play's configured pass runs: another kind
+                    // has no importer yet, so it never gets here.
+                    if kind != ScreenKind::Play {
+                        return Err(note.refusal());
+                    }
+                    let pending = PendingPlay {
+                        header: h,
+                        config,
+                        target: *target,
+                    };
+                    return Ok(Built::Pending(Arc::new(pending), note));
                 }
                 Err(e) => Err(e),
             }
@@ -279,7 +356,58 @@ fn built(
     };
     stopped()?;
     // 5. The pack.
-    let summary = Summary::of(imported.report, &header);
+    let (bundle, summary) = pack(imported, &header, target, cancel)?;
+    Ok(Built::Bundle(bundle, summary))
+}
+
+/// Builds `pending` for an attempt's `facts`, asking `cancel` between its
+/// phases, in its Lua pass and in its atlas: the configured pass from the
+/// header pass's state ([`LuaHeader::import`]), then the pack for the
+/// target startup took ([`pack`]). A pure function of its inputs, the
+/// skin's files included: it installs nothing.
+///
+/// # Errors
+///
+/// The located reason the import or the pack refuses, and a read of a
+/// fact `facts` leaves pending.
+#[cfg_attr(not(test), expect(dead_code, reason = "activated by S10-07c-2"))]
+pub fn specialize(
+    pending: &PendingPlay,
+    facts: &ImportFacts,
+    cancel: &Cancel,
+) -> Result<Specialization, String> {
+    let imported = match pending.header.import(&pending.config, facts, cancel) {
+        Ok(LuaOutcome::Imported(i)) => i,
+        Ok(LuaOutcome::Pending(p)) => {
+            return Err(format!(
+                "the skin reads {}, which the attempt's facts leave pending",
+                fact_name(p.pending)
+            ));
+        }
+        Err(e) => return Err(Chain(&e).to_string()),
+    };
+    stopped(cancel)?;
+    let header = pending.header.header();
+    let (bundle, summary) = pack(imported.imported, header, &pending.target, cancel)?;
+    Ok(Specialization {
+        bundle,
+        summary,
+        facts: imported.facts,
+    })
+}
+
+/// The pack of `imported`, imported with `header`: the variant for
+/// `target`, the atlas within its limits, and the bundle, with its text
+/// producer only when the skin has rasterized text; `cancel` asked
+/// between its phases and in the atlas.
+fn pack(
+    imported: Imported,
+    header: &Header,
+    target: &ImportTarget,
+    cancel: &Cancel,
+) -> Result<(Arc<SkinBundle>, Summary), String> {
+    let stopped = || stopped(cancel);
+    let summary = Summary::of(imported.report, header);
     let skin = imported.skin;
     let variant = skin.variant(target.size, &Layout::AUTHOR);
     let atlas = skin
@@ -313,7 +441,7 @@ fn built(
             .map_err(|e| format!("the skin cannot be bundled: {}", Chain(&e)))?,
         None => bundle,
     };
-    Ok(Built::Bundle(Arc::new(bundle), summary))
+    Ok((Arc::new(bundle), summary))
 }
 
 /// The configuration `choice` names against `header`: each named option's
@@ -365,7 +493,7 @@ fn config(header: &Header, choice: &SkinChoice) -> Result<Config, String> {
     Ok(config)
 }
 
-/// How a job on its own thread ended, as [`run_cancellable`] returns it.
+/// How a job on its own thread ended, as [`run_job`] returns it.
 #[derive(Debug)]
 pub enum Ran<T> {
     /// The job's outcome, its thread ended.
@@ -373,10 +501,18 @@ pub enum Ran<T> {
     /// No outcome, its thread ended: it panicked ([`PANICKED`]), ended
     /// without a message ([`ENDED`]), or could not start.
     Refused(String),
-    /// Stopped, and its thread had not ended within [`STOP_WAIT`]: it is
-    /// left to the process's exit, and its outcome, if it comes, is
-    /// dropped there. Only while the run ends.
+    /// The run ended, and the job's thread had not ended within
+    /// [`STOP_WAIT`]: it is left to the process's exit, and its outcome,
+    /// if it comes, is dropped there. Only while the run ends.
     Abandoned,
+}
+
+/// [`run_job`] with the run's end only: `stop` is the window's close.
+pub fn run_cancellable<T: Send + 'static>(
+    job: impl FnOnce(&Cancel) -> T + Send + 'static,
+    stop: impl FnMut() -> bool,
+) -> Ran<T> {
+    run_job(job, || false, stop)
 }
 
 /// Runs `job` on a spawned `skin-import` thread with what it owns, the
@@ -384,42 +520,52 @@ pub enum Ran<T> {
 ///
 /// - Completion means the thread has ended: once the outcome is in, the
 ///   wait goes on until the thread has finished, then joins it.
-/// - Once `stop` turns true (the window closing), the job is cancelled
-///   and the thread waited for at most [`STOP_WAIT`] from then, an
-///   outcome already received included; past it, [`Ran::Abandoned`].
+/// - Once `cancel_attempt` turns true (the attempt's quit), the job is
+///   cancelled and the wait goes on, without a bound, until its thread
+///   ends; it never abandons the job. `end_run` is still asked meanwhile.
+/// - Once `end_run` turns true (the window closing, a thread's failure),
+///   before or after `cancel_attempt`, the job is cancelled and the thread
+///   waited for at most [`STOP_WAIT`] from then, an outcome already
+///   received included; past it, [`Ran::Abandoned`].
 /// - A panic in `job` is caught on its thread and sent as
-///   [`PANICKED`]; a thread that ends without sending is [`ENDED`].
+///   [`PANICKED`]; a thread that ends without sending is [`ENDED`]; a
+///   thread that cannot start refuses at once.
 ///
 /// [`STOP_WAIT`] bounds the job's body, up to the thread's
 /// `is_finished`; the join after it is not bounded. A thread whose
 /// thread-local destructors block would hold it, which no job here has
 /// (waiting on the native thread's end needs platform calls).
-pub fn run_cancellable<T: Send + 'static>(
+///
+/// Under dev-tools, each job started counts in [`jobs_started`] and each
+/// join in [`jobs_joined`]: a job that could not start counts in
+/// neither, and an abandoned one only in the first.
+pub fn run_job<T: Send + 'static>(
     job: impl FnOnce(&Cancel) -> T + Send + 'static,
-    mut stop: impl FnMut() -> bool,
+    mut cancel_attempt: impl FnMut() -> bool,
+    mut end_run: impl FnMut() -> bool,
 ) -> Ran<T> {
     let cancel = Cancel::new();
     let (tx, rx) = mpsc::sync_channel::<Result<T, &'static str>>(1);
     let theirs = cancel.clone();
-    let spawned = thread::Builder::new()
-        .name("skin-import".to_owned())
-        .spawn(move || {
-            let sent = match panic::catch_unwind(AssertUnwindSafe(|| job(&theirs))) {
-                Ok(outcome) => Ok(outcome),
-                Err(payload) => {
-                    // Dropped before the send: a payload whose drop panics
-                    // ends the thread without a message.
-                    drop(payload);
-                    Err(PANICKED)
-                }
-            };
-            // Past an abandonment nobody receives: the outcome is dropped
-            // here, on this thread.
-            let _ = tx.send(sent);
-            #[cfg(test)]
-            tests::exit_gate();
-        });
-    let handle = match spawned {
+    let body = move || {
+        #[cfg(test)]
+        let _worker = tests::WorkerEnd;
+        let sent = match panic::catch_unwind(AssertUnwindSafe(|| job(&theirs))) {
+            Ok(outcome) => Ok(outcome),
+            Err(payload) => {
+                // Dropped before the send: a payload whose drop panics
+                // ends the thread without a message.
+                drop(payload);
+                Err(PANICKED)
+            }
+        };
+        // Past an abandonment nobody receives: the outcome is dropped
+        // here, on this thread.
+        let _ = tx.send(sent);
+        #[cfg(test)]
+        tests::exit_gate();
+    };
+    let handle = match spawn(body) {
         Ok(h) => h,
         Err(e) => return Ran::Refused(format!("the import thread cannot start: {e}")),
     };
@@ -427,10 +573,15 @@ pub fn run_cancellable<T: Send + 'static>(
     JOBS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let mut deadline: Option<Instant> = None;
     let mut outcome: Option<Ran<T>> = None;
+    let mut attempt_cancelled = false;
     loop {
-        if deadline.is_none() && stop() {
+        if deadline.is_none() && end_run() {
             cancel.cancel();
             deadline = Some(Instant::now() + STOP_WAIT);
+        }
+        if deadline.is_none() && !attempt_cancelled && cancel_attempt() {
+            cancel.cancel();
+            attempt_cancelled = true;
         }
         if deadline.is_some_and(|d| Instant::now() >= d) {
             // Detached: the handle and the receiver go, so a late outcome
@@ -448,11 +599,32 @@ pub fn run_cancellable<T: Send + 'static>(
             },
             Some(done) if handle.is_finished() => {
                 let _ = handle.join();
+                #[cfg(feature = "dev-tools")]
+                JOINED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 return done;
             }
             Some(_) => thread::sleep(SELECT_SLICE),
         }
     }
+}
+
+/// Starts `body` on a `skin-import` thread; a test can have the start
+/// refused.
+fn spawn(body: impl FnOnce() + Send + 'static) -> std::io::Result<thread::JoinHandle<()>> {
+    #[cfg(test)]
+    if tests::spawn_refused() {
+        return Err(std::io::Error::other("refused by the test"));
+    }
+    #[cfg(test)]
+    tests::worker_starting();
+    let spawned = thread::Builder::new()
+        .name("skin-import".to_owned())
+        .spawn(body);
+    #[cfg(test)]
+    if spawned.is_err() {
+        tests::spawn_failed();
+    }
+    spawned
 }
 
 /// What became of a kind at startup, for its line and the log.
@@ -554,14 +726,27 @@ pub fn log_installed(
     );
 }
 
-/// The jobs [`run_cancellable`] has started in the process (dev-tools).
+/// The jobs [`run_job`] has started in the process (dev-tools).
 #[cfg(feature = "dev-tools")]
 static JOBS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// The jobs [`run_cancellable`] has started in the process (dev-tools).
+/// The job threads [`run_job`] has joined in the process (dev-tools).
+#[cfg(feature = "dev-tools")]
+static JOINED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The jobs [`run_job`] has started in the process (dev-tools).
 #[cfg(feature = "dev-tools")]
 pub fn jobs_started() -> u64 {
     JOBS.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// The job threads [`run_job`] has joined in the process (dev-tools):
+/// each ended thread whose outcome it returned, a panic's and a silent
+/// end's included; never an abandoned one.
+#[cfg(feature = "dev-tools")]
+#[cfg_attr(not(test), expect(dead_code, reason = "activated by S10-07c-2"))]
+pub fn jobs_joined() -> u64 {
+    JOINED.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 /// A launch path, by the screen kinds its startup imports, in order.
@@ -672,6 +857,8 @@ pub fn startup(
             _ if stop() => return Err(StartupEnd::Closed),
             Ran::Abandoned => return Err(StartupEnd::Closed),
             Ran::Refused(why) | Ran::Done(KindOutcome::Refused(why)) => Shown::Refused(why),
+            // Not installed yet: refused as before a chart is chosen.
+            Ran::Done(KindOutcome::Pending(_, note)) => Shown::Refused(note.refusal()),
             Ran::Done(KindOutcome::BuiltIn(why)) => Shown::BuiltIn(why),
             Ran::Done(KindOutcome::Bundle(bundle, summary)) => {
                 let (texels, side) = (bundle.atlas_texels(), bundle.side());

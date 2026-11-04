@@ -75,7 +75,6 @@ pub struct Source {
 /// Headers read and ignored without a warning: descriptive ones, and ones
 /// for what stage 1 does not show or use.
 const IGNORED_HEADERS: &[&str] = &[
-    "PLAYLEVEL",
     "DIFFICULTY",
     "STAGEFILE",
     "BANNER",
@@ -314,6 +313,7 @@ fn parse_header(
         "ARTIST" => source.labels.artist = value.to_owned(),
         "SUBARTIST" => source.labels.subartist = value.to_owned(),
         "GENRE" => source.labels.genre = value.to_owned(),
+        "PLAYLEVEL" => source.labels.playlevel = value.to_owned(),
         "BPM" => {
             source.bpm = Some(bpm(value, line, "#BPM")?);
         }

@@ -7,26 +7,54 @@
 use std::fs;
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use bms_model::{ChartBuilder, TimeUs};
 use game::{Chain, SkinChoice};
 use render::{AttemptInput, Renderer, SkinBundle};
-use skin_beatoraja::{Cancel, Note, NoteKind, NoteLoc, Rule, Severity};
+use skin_beatoraja::{
+    Cancel, Fact, FactId, FactRead, FactValue, ImportFacts, JudgeClass, Note, NoteKind, NoteLoc,
+    Rule, Severity,
+};
 use skin_model::{ChartText, ScreenKind};
 
 use crate::render_json::centre;
 
 use super::{
-    Atlas, ENDED, ImportTarget, KindOutcome, PANICKED, Ran, STOP_WAIT, Shown, Summary, build, line,
-    log_installed, notice, run_cancellable,
+    Atlas, ENDED, ImportTarget, KindOutcome, PANICKED, PendingNote, PendingPlay, Ran, STOP_WAIT,
+    Shown, Summary, build, line, log_installed, notice, run_cancellable, run_job, specialize,
 };
 
 /// Whether a job's thread holds after its send, and how many wait there.
 static EXIT: Mutex<(bool, usize)> = Mutex::new((false, 0));
 static EXIT_OPENED: Condvar = Condvar::new();
+
+/// The job threads started and not yet at their body's end, an abandoned
+/// one included: what [`serial`] drains between tests.
+static WORKERS: AtomicUsize = AtomicUsize::new(0);
+
+/// A job thread is about to start; its [`WorkerEnd`], or
+/// [`spawn_failed`], counts its end.
+pub(super) fn worker_starting() {
+    WORKERS.fetch_add(1, Ordering::SeqCst);
+}
+
+/// The job thread counted by [`worker_starting`] did not start.
+pub(super) fn spawn_failed() {
+    WORKERS.fetch_sub(1, Ordering::SeqCst);
+}
+
+/// Held by a job thread's body: its drop, past [`exit_gate`] or in an
+/// unwind that skips it, counts the thread ended.
+pub(super) struct WorkerEnd;
+
+impl Drop for WorkerEnd {
+    fn drop(&mut self) {
+        WORKERS.fetch_sub(1, Ordering::SeqCst);
+    }
+}
 
 /// The job thread's exit barrier, after its send and before it returns.
 pub(super) fn exit_gate() {
@@ -47,11 +75,32 @@ fn exit_waiting() -> usize {
     EXIT.lock().unwrap_or_else(PoisonError::into_inner).1
 }
 
+/// Whether the next job's thread is refused its start, as the system's
+/// refusal would.
+static REFUSE_SPAWN: AtomicBool = AtomicBool::new(false);
+
+/// Whether this job's thread is refused its start: once per
+/// [`refuse_spawn`].
+pub(super) fn spawn_refused() -> bool {
+    REFUSE_SPAWN.swap(false, Ordering::SeqCst)
+}
+
+fn refuse_spawn() {
+    REFUSE_SPAWN.store(true, Ordering::SeqCst);
+}
+
 /// The tests that run jobs, or hold the process-wide barriers, one at a
-/// time; each barrier is released when the test ends, failed or not.
+/// time; each barrier is released when the test ends, failed or not, and
+/// the test's job threads, an abandoned one included, are waited for
+/// then, so none reaches a barrier of the next test.
 fn serial() -> Serial {
     static SERIAL: Mutex<()> = Mutex::new(());
-    Serial(SERIAL.lock().unwrap_or_else(PoisonError::into_inner))
+    let serial = Serial(SERIAL.lock().unwrap_or_else(PoisonError::into_inner));
+    assert!(
+        wait_until(|| WORKERS.load(Ordering::SeqCst) == 0),
+        "an earlier test's job thread is still running"
+    );
+    serial
 }
 
 struct Serial(#[expect(dead_code, reason = "held for its drop")] MutexGuard<'static, ()>);
@@ -59,8 +108,10 @@ struct Serial(#[expect(dead_code, reason = "held for its drop")] MutexGuard<'sta
 impl Drop for Serial {
     fn drop(&mut self) {
         hold_exit(false);
+        REFUSE_SPAWN.store(false, Ordering::SeqCst);
         #[cfg(feature = "dev-tools")]
         skin_beatoraja::lua::vm_hooks::release();
+        wait_until(|| WORKERS.load(Ordering::SeqCst) == 0);
     }
 }
 
@@ -191,6 +242,14 @@ fn bundled(o: KindOutcome) -> (Arc<SkinBundle>, Summary) {
 fn refused(o: KindOutcome) -> String {
     match o {
         KindOutcome::Refused(why) => why,
+        other => panic!("{other:?}"),
+    }
+}
+
+#[track_caller]
+fn pending(o: KindOutcome) -> (Arc<PendingPlay>, PendingNote) {
+    match o {
+        KindOutcome::Pending(p, note) => (p, note),
         other => panic!("{other:?}"),
     }
 }
@@ -544,8 +603,9 @@ fn lua_skin(body: &str) -> tempfile::TempDir {
 
 /// A Lua play skin builds against the base facts: autoplay (option 33,
 /// on) is known, so a skin reading it builds for the session's value; a
-/// skin reading the chart's judgment class is refused, since that is known
-/// only once a chart is chosen.
+/// skin reading the chart's judgment class (option 180) or its play level
+/// (number 96), known only once a chart is chosen, ends pending, naming
+/// the fact and the files read so far.
 #[test]
 fn a_lua_skin_builds_on_the_base_facts() {
     // Its VMs count, and are held, with the hooks' tests'.
@@ -561,10 +621,194 @@ fn a_lua_skin_builds_on_the_base_facts() {
         let p = frame(&mut r, &b, request);
         assert_eq!(at(&p, x), RED, "autoplay {autoplay}");
     }
-    let dir = lua_skin("if ms.option(180) then x = 500 end");
-    let why = refused(play(&choice(dir.path(), "play.luaskin"), &t));
+    for (body, fact) in [
+        ("if ms.option(180) then x = 500 end", FactId::JudgeClass),
+        ("x = ms.number(96)", FactId::PlayLevel),
+    ] {
+        let dir = lua_skin(body);
+        let (_, note) = pending(play(&choice(dir.path(), "play.luaskin"), &t));
+        assert_eq!(note.fact, fact, "{body}");
+        assert_eq!(note.dependencies, ["play.luaskin"], "{body}");
+        assert!(note.usage.instructions > 0, "{body}: {:?}", note.usage);
+    }
+}
+
+/// A Lua play skin whose configured pass draws `blue.png` for an easy
+/// chart (option 183) and `red.png` otherwise, at [`COLOUR`].
+fn class_skin() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let [x, y, w, h] = COLOUR;
+    let entry = format!(
+        "local skin = {{ type = 0, name = \"t\", w = 1920, h = 1080 }}\n\
+         if not skin_config then return skin end\n\
+         local ms = require(\"main_state\")\n\
+         local path = \"red.png\"\n\
+         if ms.option(183) then path = \"blue.png\" end\n\
+         skin.source = {{ {{ id = \"a\", path = path }} }}\n\
+         skin.image = {{ {{ id = \"i\", src = \"a\", x = 0, y = 0, w = 16, h = 16 }} }}\n\
+         skin.destination = {{ {{ id = \"i\", dst = {{ {{ x = {x}, y = {}, w = {w}, h = {h} }} }} }} }}\n\
+         return skin\n",
+        1_080 - y - h
+    );
+    fs::write(dir.path().join("play.luaskin"), entry).unwrap();
+    png(&dir.path().join("red.png"), 16, 16, RED);
+    png(&dir.path().join("blue.png"), 16, 16, BLUE);
+    dir
+}
+
+/// A pending skin reading the judgment class, specialized for the facts of
+/// loaded charts, draws its class's image: red for `#RANK 2` (normal) and
+/// for no rank, blue for `#RANK 3` (easy); each specialization records the
+/// class it read, which another chart of the class holds.
+#[test]
+fn a_specialization_draws_its_charts_class() {
+    let _serial = serial();
+    let mut r = crate::render_common::offscreen(1_920, 1_080);
+    let t = target(&r);
+    let dir = class_skin();
+    let (p, note) = pending(play(&choice(dir.path(), "play.luaskin"), &t));
+    assert_eq!(note.fact, FactId::JudgeClass);
+    let facts =
+        |text| super::facts::attempt_facts(&super::facts::tests::loaded(text, "tapestry"), false);
+    let mut request = 0;
+    for (text, colour, class) in [
+        ("#RANK 2\n", RED, JudgeClass::Normal),
+        ("", RED, JudgeClass::Normal),
+        ("#RANK 3\n", BLUE, JudgeClass::Easy),
+    ] {
+        let f = facts(text);
+        let s = specialize(&p, &f, &Cancel::new()).unwrap();
+        assert_eq!(s.summary.sources, ["play.luaskin"], "{text:?}");
+        request += 1;
+        let pixels = frame(&mut r, &s.bundle, request);
+        assert_eq!(centre(&pixels, COLOUR), colour, "{text:?}");
+        assert_eq!(
+            s.facts.reads,
+            [FactRead {
+                fact: FactId::JudgeClass,
+                value: FactValue::Class(Some(class)),
+            }],
+            "{text:?}"
+        );
+        assert!(s.facts.holds(&f), "{text:?}");
+        assert_eq!(
+            s.facts.holds(&facts("#RANK 3\n")),
+            class == JudgeClass::Easy
+        );
+    }
+}
+
+/// A pending skin whose header pass loads `hdr.lua` and includes
+/// `props.json` (its options), and whose configured pass loads `cfg.lua`,
+/// includes `img.json` (its images) and then reads the play level: each
+/// module names the image file its source draws, `h` at x 0 and `c` at
+/// x 200, and `img.json`'s image `j` at x 400 takes source `r` (red) or `b`
+/// (blue).
+fn sources_skin() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    fs::write(
+        d.join("play.luaskin"),
+        "local skin = { type = 0, name = \"t\", w = 1920, h = 1080,\n\
+         property = { include = \"props.json\" }, image = { include = \"img.json\" } }\n\
+         local hdr = require(\"hdr\")\n\
+         if not skin_config then return skin end\n\
+         local cfg = require(\"cfg\")\n\
+         local level = require(\"main_state\").number(96)\n\
+         skin.source = { { id = \"h\", path = hdr }, { id = \"c\", path = cfg },\n\
+         { id = \"r\", path = \"red.png\" }, { id = \"b\", path = \"blue.png\" } }\n\
+         skin.destination = {\n\
+         { id = \"h\", dst = { { x = 0, y = 0, w = 64, h = 64 } } },\n\
+         { id = \"c\", dst = { { x = 200, y = 0, w = 64, h = 64 } } },\n\
+         { id = \"j\", dst = { { x = 400, y = 0, w = 64, h = 64 } } } }\n\
+         return skin\n",
+    )
+    .unwrap();
+    fs::write(d.join("hdr.lua"), "return \"red.png\"").unwrap();
+    fs::write(d.join("cfg.lua"), "return \"red.png\"").unwrap();
+    fs::write(d.join("props.json"), r#"[{"name": "o"}]"#).unwrap();
+    fs::write(d.join("img.json"), images_json("r")).unwrap();
+    png(&d.join("red.png"), 64, 64, RED);
+    png(&d.join("blue.png"), 64, 64, BLUE);
+    dir
+}
+
+/// [`sources_skin`]'s `img.json`, image `j` taking source `j_src`.
+fn images_json(j_src: &str) -> String {
+    format!(
+        r#"[{{"id": "h", "src": "h", "x": 0, "y": 0, "w": 64, "h": 64}},
+            {{"id": "c", "src": "c", "x": 0, "y": 0, "w": 64, "h": 64}},
+            {{"id": "j", "src": "{j_src}", "x": 0, "y": 0, "w": 64, "h": 64}}]"#
+    )
+}
+
+/// A specialization starts from the header pass's store: a module and a
+/// JSON include the header pass read keep the bytes read at startup (an
+/// include broken since is not read), while a module and an include only
+/// the configured pass reads are read again, an edit seen and a removal
+/// refused naming the file. A specialization already made is not changed
+/// by the edits, and its facts still hold.
+#[test]
+fn a_specialization_reads_again_only_what_the_header_pass_did_not() {
+    let _serial = serial();
+    let mut r = crate::render_common::offscreen(1_920, 1_080);
+    let t = target(&r);
+    let dir = sources_skin();
+    let d = dir.path();
+    let (p, note) = pending(play(&choice(d, "play.luaskin"), &t));
+    assert_eq!(note.fact, FactId::PlayLevel);
+    let mut facts = ImportFacts::base(ScreenKind::Play, Fact::Known(false));
+    facts.chart_rank = Fact::Known(None);
+    facts.play_level = Fact::Known(12);
+    // Source y 0 is the canvas's bottom: the images lie on rows 1016 to 1079.
+    let at = |p: &[u8]| [32, 232, 432].map(|x| crate::render_common::rgb_at(p, 1_920, (x, 1_048)));
+
+    let first = specialize(&p, &facts, &Cancel::new()).unwrap();
+    assert_eq!(at(&frame(&mut r, &first.bundle, 1)), [RED, RED, RED]);
+    assert_eq!(
+        first.facts.reads,
+        [FactRead {
+            fact: FactId::PlayLevel,
+            value: FactValue::Level(12),
+        }]
+    );
+
+    fs::write(d.join("hdr.lua"), "return \"blue.png\"").unwrap();
+    fs::write(d.join("cfg.lua"), "return \"blue.png\"").unwrap();
+    fs::write(d.join("img.json"), images_json("b")).unwrap();
+    fs::write(d.join("props.json"), "[{").unwrap();
+    let edited = specialize(&p, &facts, &Cancel::new()).unwrap();
+    assert_eq!(at(&frame(&mut r, &edited.bundle, 2)), [RED, BLUE, BLUE]);
+    // The earlier specialization is unchanged, and fits the same facts.
+    assert_eq!(at(&frame(&mut r, &first.bundle, 3)), [RED, RED, RED]);
+    assert!(first.facts.holds(&facts));
+
+    fs::remove_file(d.join("cfg.lua")).unwrap();
+    let why = specialize(&p, &facts, &Cancel::new()).unwrap_err();
+    assert!(why.contains("cannot read cfg.lua"), "{why}");
+}
+
+/// A specialization whose facts leave a fact pending refuses, as an
+/// internal error, and a cancelled one stops.
+#[test]
+fn a_specialization_refuses_a_pending_fact_and_stops_when_cancelled() {
+    let _serial = serial();
+    let r = crate::render_common::offscreen(1_920, 1_080);
+    let t = target(&r);
+    let dir = class_skin();
+    let (p, _) = pending(play(&choice(dir.path(), "play.luaskin"), &t));
+    let base = ImportFacts::base(ScreenKind::Play, Fact::Known(false));
+    assert_eq!(
+        specialize(&p, &base, &Cancel::new()).unwrap_err(),
+        "the skin reads the chart's judgment class, which the attempt's facts leave pending"
+    );
+    let mut facts = base;
+    facts.chart_rank = Fact::Known(None);
+    let cancel = Cancel::new();
+    cancel.cancel();
+    let why = specialize(&p, &facts, &cancel).unwrap_err();
     assert!(
-        why.starts_with("the skin reads the chart's judgment class"),
+        why.ends_with(&skin_beatoraja::LuaWhy::Cancelled.to_string()),
         "{why}"
     );
 }
@@ -653,6 +897,40 @@ impl Drop for Witness {
         let name = std::thread::current().name().map(str::to_owned);
         *self.1.lock().unwrap() = Some(name.unwrap_or_default());
     }
+}
+
+/// The signals [`run_job`] asks, which a test sets: the attempt's
+/// cancellation, and the run's end (the caller folds the window's close
+/// and the threads' failures into one).
+#[derive(Clone, Default)]
+struct Signals {
+    attempt: Arc<AtomicBool>,
+    end: Arc<AtomicBool>,
+}
+
+/// Runs `job` through [`run_job`] on another thread with the signals the
+/// test sets: the signals and the runner's answer.
+fn started_job<T: Send + 'static>(
+    job: impl FnOnce(&Cancel) -> T + Send + 'static,
+) -> (Signals, std::sync::mpsc::Receiver<Ran<T>>) {
+    let signals = Signals::default();
+    let s = signals.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let ran = run_job(
+            job,
+            || s.attempt.load(Ordering::SeqCst),
+            || s.end.load(Ordering::SeqCst),
+        );
+        let _ = tx.send(ran);
+    });
+    (signals, rx)
+}
+
+/// The jobs started and joined so far (dev-tools).
+#[cfg(feature = "dev-tools")]
+fn counted() -> (u64, u64) {
+    (super::jobs_started(), super::jobs_joined())
 }
 
 /// Runs `job` on another thread with a stop the test sets: the runner's
@@ -762,24 +1040,27 @@ fn a_stop_mid_lua_cancels_and_returns_after_the_vm_and_the_thread() {
 /// is checked against cannot end before the test releases them, which it
 /// does only after waiting [`HELD_FOR`]: a runner that waited for its job
 /// would answer nothing within that wait.
-const LATE: Duration = Duration::from_secs(2);
+const LATE: Duration = Duration::from_millis(750);
 /// How long the abandonment tests wait for the runner, the job held
 /// meanwhile; past [`STOP_WAIT`] + [`LATE`].
 const HELD_FOR: Duration = Duration::from_secs(7);
 
-/// A VM held past the stop bound: the runner gives up at the bound, the
-/// VM still counted; once released, the outcome finds nobody and is
-/// dropped on the job's own thread. Unheld and uncancelled, the looping
-/// fixture would run to the sandbox's 5 s Lua time cap; held, it never
-/// ends before the release.
+/// A VM held past the stop bound when the run ends: the runner gives up
+/// at the bound, the VM still counted and the job started but not
+/// joined. Ending the test's serialization releases the VM and waits for
+/// the abandoned thread: by then its outcome, finding nobody, has been
+/// dropped on its own thread, and it is joined by nobody. Unheld and
+/// uncancelled, the looping fixture would run to the sandbox's 5 s Lua
+/// time cap; held, it never ends before the release.
 #[cfg(feature = "dev-tools")]
 #[test]
 fn a_job_past_the_stop_wait_is_abandoned() {
     use skin_beatoraja::lua::vm_hooks;
-    let _serial = serial();
+    let serial = serial();
     let dir = looping();
     let dropped = Arc::new(Mutex::new(None));
     let base = vm_hooks::live();
+    let (started_before, joined) = counted();
     vm_hooks::hold();
     let (stop, rx) = started(looping_job(dir.path(), &dropped));
     executing(base);
@@ -787,15 +1068,16 @@ fn a_job_past_the_stop_wait_is_abandoned() {
     stop.store(true, Ordering::SeqCst);
     let ran = rx.recv_timeout(HELD_FOR);
     let after = stopped.elapsed();
-    let live = vm_hooks::live();
-    vm_hooks::release();
     assert!(matches!(ran, Ok(Ran::Abandoned)), "{ran:?}");
     assert!(after >= STOP_WAIT, "{after:?}");
     assert!(after < STOP_WAIT + LATE, "{after:?}");
-    assert_eq!(live, base + 1);
-    assert!(wait_until(|| dropped.lock().unwrap().is_some()));
+    assert_eq!(vm_hooks::live(), base + 1);
+    assert_eq!(counted(), (started_before + 1, joined));
+    drop(serial);
+    assert_eq!(WORKERS.load(Ordering::SeqCst), 0);
     assert_eq!(dropped.lock().unwrap().as_deref(), Some("skin-import"));
-    assert!(wait_until(|| vm_hooks::live() == base));
+    assert_eq!(vm_hooks::live(), base);
+    assert_eq!(counted(), (started_before + 1, joined));
 }
 
 /// An outcome already received does not end the wait for the thread: held
@@ -819,9 +1101,127 @@ fn a_received_outcome_still_waits_within_the_stop_bound() {
     assert!(matches!(rx.recv_timeout(STOP_WAIT), Ok(Ran::Done(7))));
 }
 
+/// Cancelling the attempt while the looping pass's Lua executes cancels
+/// it, and the runner waits for the job's thread however long it takes:
+/// with the VM's destruction held past the stop bound it has not
+/// returned, and once released it returns the Lua cancellation, the job's
+/// thread joined and its VM gone.
+#[cfg(feature = "dev-tools")]
+#[test]
+fn an_attempts_cancel_waits_for_the_thread_past_the_stop_bound() {
+    use skin_beatoraja::lua::vm_hooks;
+    let _serial = serial();
+    let dir = looping();
+    let dropped = Arc::new(Mutex::new(None));
+    let base = vm_hooks::live();
+    let (started, joined) = counted();
+    vm_hooks::hold();
+    let (signals, rx) = started_job(looping_job(dir.path(), &dropped));
+    executing(base);
+    signals.attempt.store(true, Ordering::SeqCst);
+    assert!(wait_until(|| vm_hooks::waiting() == 1));
+    let early = rx.recv_timeout(STOP_WAIT + LATE);
+    assert!(
+        early.is_err(),
+        "returned before the thread ended: {early:?}"
+    );
+    assert_eq!(vm_hooks::live(), base + 1);
+    assert_eq!(counted(), (started + 1, joined));
+    vm_hooks::release();
+    cancelled(rx.recv_timeout(STOP_WAIT).unwrap());
+    assert_eq!(vm_hooks::live(), base);
+    assert_eq!(counted(), (started + 1, joined + 1));
+}
+
+/// An outcome already received under the attempt's cancellation still
+/// waits for its thread past the stop bound: the runner returns the
+/// outcome only once the thread, held after its send, is released.
+#[test]
+fn an_attempts_cancel_never_abandons_a_held_thread() {
+    let _serial = serial();
+    hold_exit(true);
+    let (signals, rx) = started_job(|_: &Cancel| 7_u32);
+    assert!(wait_until(|| exit_waiting() == 1));
+    signals.attempt.store(true, Ordering::SeqCst);
+    let early = rx.recv_timeout(STOP_WAIT + LATE);
+    hold_exit(false);
+    assert!(
+        early.is_err(),
+        "returned before the thread ended: {early:?}"
+    );
+    assert!(matches!(rx.recv_timeout(STOP_WAIT), Ok(Ran::Done(7))));
+}
+
+/// The escalation: the attempt cancelled and the VM's destruction held
+/// past the stop bound, then the run's end (a close or a thread's
+/// failure) without releasing it: the runner abandons the job within the
+/// stop bound of that end, started and never joined. Ending the test's
+/// serialization releases the VM and waits for the abandoned thread.
+#[cfg(feature = "dev-tools")]
+#[test]
+fn the_runs_end_during_an_attempts_cancel_abandons_within_the_bound() {
+    use skin_beatoraja::lua::vm_hooks;
+    let serial = serial();
+    let dir = looping();
+    let dropped = Arc::new(Mutex::new(None));
+    let base = vm_hooks::live();
+    let (started, joined) = counted();
+    vm_hooks::hold();
+    let (signals, rx) = started_job(looping_job(dir.path(), &dropped));
+    executing(base);
+    signals.attempt.store(true, Ordering::SeqCst);
+    assert!(wait_until(|| vm_hooks::waiting() == 1));
+    let early = rx.recv_timeout(STOP_WAIT + Duration::from_millis(500));
+    assert!(early.is_err(), "{early:?}");
+    let ended = Instant::now();
+    signals.end.store(true, Ordering::SeqCst);
+    let ran = rx.recv_timeout(HELD_FOR);
+    let after = ended.elapsed();
+    assert!(matches!(ran, Ok(Ran::Abandoned)), "{ran:?}");
+    assert!(after >= STOP_WAIT && after < STOP_WAIT + LATE, "{after:?}");
+    assert_eq!(counted(), (started + 1, joined));
+    drop(serial);
+    assert_eq!(WORKERS.load(Ordering::SeqCst), 0);
+    assert_eq!(vm_hooks::live(), base);
+    assert_eq!(counted(), (started + 1, joined));
+}
+
+/// A thread that cannot start refuses at once, its job never run, and
+/// counts as neither started nor joined; a normal end counts one start
+/// and one join.
+#[test]
+fn a_spawn_failure_refuses_and_counts_nothing() {
+    let _serial = serial();
+    #[cfg(feature = "dev-tools")]
+    let (started, joined) = counted();
+    let ran = Arc::new(AtomicBool::new(false));
+    refuse_spawn();
+    let theirs = Arc::clone(&ran);
+    match run_job(
+        move |_: &Cancel| theirs.store(true, Ordering::SeqCst),
+        || false,
+        || false,
+    ) {
+        Ran::Refused(why) => {
+            assert_eq!(why, "the import thread cannot start: refused by the test");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(!ran.load(Ordering::SeqCst));
+    #[cfg(feature = "dev-tools")]
+    assert_eq!(counted(), (started, joined));
+
+    assert!(matches!(
+        run_job(|_: &Cancel| 7_u32, || false, || false),
+        Ran::Done(7)
+    ));
+    #[cfg(feature = "dev-tools")]
+    assert_eq!(counted(), (started + 1, joined + 1));
+}
+
 /// A panic in the job is a refusal received from its thread; a thread
 /// that ends without sending (its panic's payload panicking as it is
-/// dropped) is another.
+/// dropped) is another. Each counts one start and one join.
 #[test]
 fn a_panic_and_a_silent_end_are_told_apart() {
     struct Bomb;
@@ -831,16 +1231,22 @@ fn a_panic_and_a_silent_end_are_told_apart() {
         }
     }
     let _serial = serial();
+    #[cfg(feature = "dev-tools")]
+    let (started_before, joined) = counted();
     let (_stop, rx) = started(|_: &Cancel| -> u32 { panic!("the job panics") });
     match rx.recv_timeout(STOP_WAIT).unwrap() {
         Ran::Refused(why) => assert_eq!(why, PANICKED),
         other => panic!("{other:?}"),
     }
+    #[cfg(feature = "dev-tools")]
+    assert_eq!(counted(), (started_before + 1, joined + 1));
     let (_stop, rx) = started(|_: &Cancel| -> u32 { std::panic::panic_any(Bomb) });
     match rx.recv_timeout(STOP_WAIT).unwrap() {
         Ran::Refused(why) => assert_eq!(why, ENDED),
         other => panic!("{other:?}"),
     }
+    #[cfg(feature = "dev-tools")]
+    assert_eq!(counted(), (started_before + 2, joined + 2));
 }
 
 /// A logger that keeps each record's message.
