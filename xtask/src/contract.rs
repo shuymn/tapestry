@@ -15,7 +15,11 @@
 //! design.md is read with a CommonMark parser (`pulldown-cmark`, with
 //! tables): its headings, the contract section's list items and the threat
 //! table are what that parser returns, so code blocks, inline code and
-//! other markdown elsewhere cannot change them. The cited files are read
+//! other markdown elsewhere cannot change them. Only top-level blocks
+//! count, outside block quotes, list items and footnotes. A heading is
+//! keyed by its plain text (inline markup dropped, a code span by its
+//! content), and a clause is a top-level list item's own text, without
+//! the lists nested in it. The cited files are read
 //! as text, line by line. A cited `fn` is not proven to be compiled: one
 //! inside a raw string, a macro never invoked or a `cfg` that removes it
 //! still counts. A citation names a file, not a module path, and an
@@ -24,7 +28,6 @@
 
 use std::collections::BTreeMap;
 use std::io;
-use std::ops::Range;
 use std::path::Path;
 
 use anyhow::Context as _;
@@ -57,22 +60,22 @@ pub fn check(design: &str, read: impl Fn(&str) -> io::Result<String>) -> Vec<Str
     diags
 }
 
-/// A heading: its line index, level and source text.
-struct Heading<'a> {
+/// A top-level heading: its line index, level and plain text.
+struct Heading {
     line: usize,
     level: usize,
-    text: &'a str,
+    text: String,
 }
 
-/// A list item at the top level of a list: its line index and its source
-/// text after the marker, its lines joined by spaces.
+/// An item of a top-level list: its line index and its own inline text,
+/// without the blocks nested in it.
 struct Item {
     line: usize,
     text: String,
 }
 
-/// A table: its line index, its header's first cell and each body row's
-/// line index and first cell.
+/// A top-level table: its line index, its header's first cell and each
+/// body row's line index and first cell.
 struct Table {
     line: usize,
     header: String,
@@ -80,15 +83,25 @@ struct Table {
 }
 
 /// What the checker reads from design.md, as the CommonMark parser
-/// returns it.
-struct Doc<'a> {
-    headings: Vec<Heading<'a>>,
+/// returns it. Headings, list items and tables count only outside block
+/// quotes, list items and footnotes.
+struct Doc {
+    headings: Vec<Heading>,
     items: Vec<Item>,
     tables: Vec<Table>,
 }
 
-impl<'a> Doc<'a> {
-    fn parse(source: &'a str) -> Self {
+/// Where the inline text of the current event goes.
+enum Into {
+    Nothing,
+    Heading(usize, usize),
+    Item,
+    /// A table cell, and whether it is its row's first.
+    Cell(bool),
+}
+
+impl Doc {
+    fn parse(source: &str) -> Self {
         let starts: Vec<usize> = std::iter::once(0)
             .chain(source.match_indices('\n').map(|(i, _)| i + 1))
             .collect();
@@ -98,52 +111,112 @@ impl<'a> Doc<'a> {
             items: Vec::new(),
             tables: Vec::new(),
         };
-        let mut lists = 0_usize;
-        // The cell being read, and whether it is a row's first.
-        let mut cell: Option<(String, bool)> = None;
+        // Open block quotes, list items and footnotes.
+        let mut containers = 0_usize;
+        // Inside a top-level item: the depth of the blocks nested in it.
+        let mut nested: Option<usize> = None;
+        let mut into = Into::Nothing;
+        let mut text = String::new();
         let mut column = 0_usize;
         for (event, range) in Parser::new_ext(source, Options::ENABLE_TABLES).into_offset_iter() {
+            let line = line_of(range.start);
             match event {
-                Event::Start(Tag::Heading { level, .. }) => doc.headings.push(Heading {
-                    line: line_of(range.start),
-                    level: level as usize,
-                    text: heading_text(source, range),
-                }),
-                Event::Start(Tag::List(_)) => lists += 1,
-                Event::End(TagEnd::List(_)) => lists = lists.saturating_sub(1),
-                Event::Start(Tag::Item) if lists == 1 => doc.items.push(Item {
-                    line: line_of(range.start),
-                    text: item_text(source.get(range).unwrap_or_default()),
-                }),
-                Event::Start(Tag::Table(_)) => doc.tables.push(Table {
-                    line: line_of(range.start),
+                Event::Start(Tag::Heading { level, .. }) if containers == 0 => {
+                    into = Into::Heading(line, level as usize);
+                    text.clear();
+                }
+                Event::End(TagEnd::Heading(_)) => {
+                    if let Into::Heading(line, level) = into {
+                        doc.headings.push(Heading {
+                            line,
+                            level,
+                            text: text.trim().to_owned(),
+                        });
+                        into = Into::Nothing;
+                    }
+                }
+                Event::Start(Tag::Item) => {
+                    if containers == 0 {
+                        doc.items.push(Item {
+                            line,
+                            text: String::new(),
+                        });
+                        nested = Some(0);
+                        into = Into::Item;
+                    } else if let Some(depth) = nested.as_mut() {
+                        *depth += 1;
+                    }
+                    containers += 1;
+                }
+                Event::End(TagEnd::Item) => {
+                    containers = containers.saturating_sub(1);
+                    match nested {
+                        Some(0) => {
+                            if let Some(item) = doc.items.last_mut() {
+                                item.text = text.trim().to_owned();
+                            }
+                            text.clear();
+                            nested = None;
+                            into = Into::Nothing;
+                        }
+                        Some(depth) => nested = Some(depth - 1),
+                        None => {}
+                    }
+                }
+                Event::Start(Tag::List(_)) => {
+                    if let Some(depth) = nested.as_mut() {
+                        *depth += 1;
+                    }
+                }
+                Event::End(TagEnd::List(_)) => {
+                    if let Some(depth) = nested.as_mut()
+                        && *depth > 0
+                    {
+                        *depth -= 1;
+                    }
+                }
+                Event::Start(Tag::BlockQuote(_) | Tag::FootnoteDefinition(_)) => containers += 1,
+                Event::End(TagEnd::BlockQuote(_) | TagEnd::FootnoteDefinition) => {
+                    containers = containers.saturating_sub(1);
+                }
+                Event::Start(Tag::Table(_)) if containers == 0 => doc.tables.push(Table {
+                    line,
                     header: String::new(),
                     rows: Vec::new(),
                 }),
-                Event::Start(Tag::TableHead) => column = 0,
-                Event::Start(Tag::TableRow) => {
+                Event::Start(Tag::TableHead) if containers == 0 => column = 0,
+                Event::Start(Tag::TableRow) if containers == 0 => {
                     column = 0;
                     if let Some(t) = doc.tables.last_mut() {
-                        t.rows.push((line_of(range.start), String::new()));
+                        t.rows.push((line, String::new()));
                     }
                 }
-                Event::Start(Tag::TableCell) => {
-                    cell = Some((String::new(), column == 0));
+                Event::Start(Tag::TableCell) if containers == 0 => {
+                    into = Into::Cell(column == 0);
+                    text.clear();
                     column += 1;
                 }
-                Event::Text(text) | Event::Code(text) => {
-                    if let Some((s, _)) = cell.as_mut() {
-                        s.push_str(&text);
-                    }
-                }
                 Event::End(TagEnd::TableCell) => {
-                    if let (Some((text, true)), Some(t)) = (cell.take(), doc.tables.last_mut()) {
-                        let text = text.trim().to_owned();
+                    if let (Into::Cell(true), Some(t)) = (&into, doc.tables.last_mut()) {
+                        let cell = text.trim().to_owned();
                         match t.rows.last_mut() {
-                            Some(row) => row.1 = text,
-                            None => t.header = text,
+                            Some(row) => row.1 = cell,
+                            None => t.header = cell,
                         }
                     }
+                    if let Into::Cell(_) = into {
+                        into = Into::Nothing;
+                    }
+                }
+                Event::Text(s) => push(&into, nested, &mut text, &s),
+                // A heading is keyed by its plain text; a clause keeps its
+                // code spans' backticks, which mark its citations.
+                Event::Code(s) => match into {
+                    Into::Item => push(&into, nested, &mut text, &format!("`{s}`")),
+                    _ => push(&into, nested, &mut text, &s),
+                },
+                Event::SoftBreak | Event::HardBreak | Event::End(TagEnd::Paragraph) => {
+                    push(&into, nested, &mut text, " ");
                 }
                 _ => {}
             }
@@ -152,42 +225,17 @@ impl<'a> Doc<'a> {
     }
 }
 
-/// An ATX heading's text without its `#` marks, or a setext heading's
-/// first line.
-fn heading_text(source: &str, range: Range<usize>) -> &str {
-    let raw = source.get(range).unwrap_or_default();
-    let first = raw.lines().next().unwrap_or_default().trim();
-    match first.strip_prefix('#') {
-        Some(_) => {
-            let text = first.trim_start_matches('#').trim();
-            // An optional closing sequence after a space.
-            match text.trim_end_matches('#') {
-                rest if rest.len() < text.len() && (rest.is_empty() || rest.ends_with(' ')) => {
-                    rest.trim_end()
-                }
-                _ => text,
-            }
-        }
-        None => first,
-    }
-}
-
-/// A list item's source after its marker, its lines trimmed and joined by
-/// spaces.
-fn item_text(raw: &str) -> String {
-    let raw = raw.trim_start();
-    let digits = raw.bytes().take_while(u8::is_ascii_digit).count();
-    let rest = match raw.get(digits..) {
-        Some(r) if digits > 0 => r.strip_prefix(['.', ')']).unwrap_or(r),
-        Some(r) => r.strip_prefix(['-', '*', '+']).unwrap_or(r),
-        None => raw,
+/// Appends `s` to `text` when it belongs to a heading, a table cell, or a
+/// top-level item's own text (not a block nested in it).
+fn push(into: &Into, nested: Option<usize>, text: &mut String, s: &str) {
+    let keep = match into {
+        Into::Nothing => false,
+        Into::Item => nested == Some(0),
+        Into::Heading(..) | Into::Cell(_) => true,
     };
-    let lines: Vec<&str> = rest
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .collect();
-    lines.join(" ")
+    if keep {
+        text.push_str(s);
+    }
 }
 
 /// The line range of the section under the heading `text` at `level`, up
@@ -749,6 +797,121 @@ fn with_a_long_attribute() {}
         assert_eq!(
             run(&hidden, SOURCE),
             ["docs/design.md:30: \"Hidden\" is not a design.md heading"]
+        );
+    }
+
+    #[test]
+    fn a_heading_in_a_block_quote_does_not_end_a_section() {
+        let quoted = design_with(
+            "### Threats and Mitigations\n",
+            "### Threats and Mitigations\n\n> ## Example\n",
+        );
+        assert_eq!(run(&quoted, SOURCE), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_heading_in_a_block_quote_does_not_end_the_contract() {
+        let quoted = design_with(
+            "the section it names.\n",
+            "the section it names.\n\n> ## Roadmap\n",
+        );
+        let quoted = quoted.replace(
+            ". Spec: `crates/a/tests/a.rs::judged_once`",
+            ". Evidence: `crates/a/tests/a.rs::judged_once`",
+        );
+        assert_eq!(
+            run(&quoted, SOURCE),
+            ["docs/design.md:26: the clause has no `Spec:`"]
+        );
+    }
+
+    /// `DESIGN` with its "## Watermark" heading replaced by `heading`.
+    fn heading(heading: &str) -> String {
+        design_with("## Watermark\n", heading)
+    }
+
+    #[test]
+    fn a_setext_heading_is_keyed_by_all_its_lines() {
+        let two_lines = heading("Watermark\ncontinued\n---------\n");
+        assert_eq!(
+            run(&two_lines, SOURCE),
+            [
+                "docs/design.md:26: \"Watermark\" is not a design.md heading",
+                "docs/design.md:27: \"Watermark\" is not a design.md heading",
+            ]
+        );
+        let cited = two_lines.replace("\"Watermark\"", "\"Watermark continued\"");
+        assert_eq!(run(&cited, SOURCE), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_closing_sequence_is_not_heading_text() {
+        // The parser strips one after a space; after a tab (pulldown-cmark
+        // 0.13) it keeps it as text, and the check takes what it returns.
+        assert_eq!(
+            run(&heading("## Watermark ###\n"), SOURCE),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            run(&heading("## Watermark\t###\n"), SOURCE),
+            [
+                "docs/design.md:24: \"Watermark\" is not a design.md heading",
+                "docs/design.md:25: \"Watermark\" is not a design.md heading",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_setext_heading_starting_with_a_hash_keeps_it() {
+        assert_eq!(
+            run(&heading("#Watermark\n---\n"), SOURCE),
+            [
+                "docs/design.md:25: \"Watermark\" is not a design.md heading",
+                "docs/design.md:26: \"Watermark\" is not a design.md heading",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_heading_is_keyed_by_its_plain_text() {
+        assert_eq!(
+            run(&heading("## *Watermark*\n"), SOURCE),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn a_nested_list_is_not_part_of_its_clause() {
+        // The citations in a nested list leave the clause without them.
+        let nested_spec = design_with(
+            "Spec: `crates/a/tests/a.rs::judged_once`, `crates/a/tests/a.rs::in_a_proptest`.",
+            "Spec:\n  - `crates/a/tests/a.rs::judged_once`, `crates/a/tests/a.rs::in_a_proptest`.",
+        );
+        assert_eq!(
+            run(&nested_spec, SOURCE),
+            [format!(
+                "{FIRST}: `Spec:` is not a list of `<file>::<test>` separated by \", \" and ending in \".\""
+            )]
+        );
+        // A note nested under a whole clause leaves the clause whole.
+        let nested_note = design_with(
+            "`crates/a/tests/a.rs::in_a_proptest`.\n",
+            "`crates/a/tests/a.rs::in_a_proptest`.\n  - A note under the clause.\n",
+        );
+        assert_eq!(run(&nested_note, SOURCE), Vec::<String>::new());
+    }
+
+    #[test]
+    fn crlf_line_endings_keep_the_line_numbers() {
+        let crlf = design_with("SHALL judge", "judges")
+            .replace("| T02 |", "|  |")
+            .replace('\n', "\r\n");
+        assert_eq!(
+            run(&crlf, SOURCE),
+            [
+                format!("{FIRST}: the clause has no SHALL"),
+                "docs/design.md:16: the threat row has no ID".to_owned(),
+            ]
         );
     }
 
