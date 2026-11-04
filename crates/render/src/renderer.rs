@@ -3211,8 +3211,9 @@ mod tests {
         }
     }
 
-    /// A staging refused before its text is prepared, here by the device
-    /// refusing its new atlas, leaves no earlier preparation's report.
+    /// A staging refused before its text is prepared, by the device
+    /// refusing its new atlas or by the shared admission, leaves no
+    /// earlier preparation's report.
     #[test]
     fn an_early_refusal_clears_the_text_report() {
         let mut r = crate::test_common::offscreen(1_920, 1_080);
@@ -3230,6 +3231,32 @@ mod tests {
         );
         assert_eq!(r.text_report().upload_bytes, 0);
         assert_eq!(r.text_report().counts, crate::TextCounts::default());
+        assert_eq!(r.memory().text_upload, 0);
+
+        // A refusal by the shared admission, the first step that can
+        // refuse: a tiny selection skin committed, and a play candidate
+        // whose atlas alone is the shared limit.
+        let token = stage_labels(&mut r, &a, &labels("t", "", ""), 3).unwrap();
+        r.commit(token).unwrap();
+        assert!(r.text_report().upload_bytes > 0);
+        let tiny = crate::test_decl::solid_bundle(
+            &r,
+            &crate::test_decl::Look::left([0, 255, 0, 255]),
+            [16, 16],
+        );
+        let token = r
+            .install(skin_model::ScreenKind::Selection, &tiny, 4)
+            .unwrap();
+        r.commit(token).unwrap();
+        let big = crate::test_decl::solid_bundle(
+            &r,
+            &crate::test_decl::Look::left([0, 0, 255, 255]),
+            [4_096, 3_072],
+        );
+        assert_eq!(big.atlas_texels(), super::SHARED_TEXELS);
+        let e = stage_labels(&mut r, &big, &labels("t", "", ""), 5).unwrap_err();
+        assert!(matches!(e, RenderError::Admission { .. }), "{e:?}");
+        assert_eq!(r.text_report().upload_bytes, 0);
         assert_eq!(r.memory().text_upload, 0);
     }
 }

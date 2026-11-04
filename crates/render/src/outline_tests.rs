@@ -423,10 +423,24 @@ fn a_constant_mvar_cap_stays_at_the_box_top() {
         1, 0, 0, 8, 1, 20, 0x6370, 0x6874, 1, 0, 1, 0, 16, 2, 0, 26, 0, 38, 1, 1, 0xc000, 0xc000,
         0, 2, 1, 1, 0, 0, 200, 1, 1, 1, 0, 0,
     ]);
-    spec.extra
-        .extend([(*b"fvar", fvar), (*b"gvar", gvar), (*b"MVAR", mvar)]);
+    spec.extra.extend([
+        (*b"fvar", fvar),
+        (*b"gvar", gvar.clone()),
+        (*b"MVAR", mvar.clone()),
+    ]);
     let t = producer_of(&spec).unwrap();
     let a = fits(&t, &req(SKIN, "A", 100.0));
     assert_eq!(a.size, [30, 70]);
     assert!(a.ink[1].abs() < 1e-5, "{:?}", a.ink);
+    // The selected delta raised to 300 at the axis's minimum: at wght
+    // 400, half way there, the cap height is 850, so A starts 0.15 em
+    // below the box top.
+    let mut raised = mvar;
+    raised[66..68].copy_from_slice(&300_i16.to_be_bytes());
+    let mvar_at = spec.extra.iter().position(|(t, _)| t == b"MVAR").unwrap();
+    spec.extra[mvar_at].1 = raised;
+    let t = producer_of(&spec).unwrap();
+    let a = fits(&t, &req(SKIN, "A", 100.0));
+    assert_eq!(a.size, [30, 70]);
+    assert!((a.ink[1] - 0.15).abs() < 1e-5, "{:?}", a.ink);
 }
