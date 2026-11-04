@@ -16,7 +16,7 @@ use crate::import::Config;
 use crate::import::callback::LOWERED;
 
 /// A skin folder whose `s.luaskin` is `entry`, with a 64×64 `a.png`.
-fn folder(entry: &str) -> tempfile::TempDir {
+pub(super) fn folder(entry: &str) -> tempfile::TempDir {
     let d = tempfile::tempdir().unwrap();
     std::fs::write(d.path().join("s.luaskin"), entry).unwrap();
     let file = std::fs::File::create(d.path().join("a.png")).unwrap();
@@ -224,6 +224,57 @@ fn refusals_name_their_reason_and_run_no_handler() {
         let entry = skin(body, &dst);
         assert_eq!(why(import(&entry)), want, "{body} / {dst}");
     }
+}
+
+/// Chunk A of the capture proof's guard: `cfg` aliases `skin_config` at
+/// chunk level, and its helper `w` runs `body` at frame time, on line 3.
+fn writer_chunk(body: &str) -> String {
+    format!(
+        "local cfg = skin_config\nlocal function w()\n  {body}\n  return true\nend\nreturn {{ w = w }}\n"
+    )
+}
+
+/// Chunk B: binds A's export at construction; a decorative `draw` calls
+/// it, beside a critical gauge `draw` reading the option `x` (1).
+fn reader_entry() -> String {
+    skin(
+        "local w = require(\"a\").w\nskin_config.option.x = 1",
+        &format!(
+            "{}{}",
+            image("function() return w() end"),
+            gauge("function() return skin_config.option[\"x\"] == 1 end")
+        ),
+    )
+}
+
+#[test]
+fn a_frame_time_writer_of_the_option_path_refuses_before_any_fold() {
+    // `w` replaces `skin_config.option` through the alias: a later
+    // critical read would see another table, so the candidate refuses at
+    // admission, located at the assignment, and nothing is lowered.
+    LOWERED.with(|l| l.borrow_mut().clear());
+    let a = writer_chunk("cfg.option = { x = 2 }");
+    match run_with(&reader_entry(), &[("a.lua", &a)], &Cancel::new()) {
+        Err(ImportError::Lua { why, at: Some(at) }) => {
+            assert_eq!(why, LuaWhy::Effect(Unsupported::Construct("assignment")));
+            assert_eq!((at.file.as_str(), at.line), ("a.lua", 3));
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(LOWERED.with(|l| l.borrow().is_empty()));
+    // The same chain without the write: the critical reader lowers, the
+    // option folded.
+    LOWERED.with(|l| l.borrow_mut().clear());
+    let a = writer_chunk("");
+    let i = run_with(&reader_entry(), &[("a.lua", &a)], &Cancel::new()).unwrap();
+    assert_eq!(
+        i.callbacks[1],
+        super::Disposition::Lowered,
+        "{:?}",
+        i.callbacks
+    );
+    let lowered = LOWERED.with(|l| l.borrow().clone());
+    assert!(lowered.iter().any(|s| s == "true"), "{lowered:?}");
 }
 
 #[test]
@@ -797,6 +848,7 @@ fn known() -> super::facts::ImportFacts {
         scene: ScreenKind::Play,
         autoplay: Fact::Known(true),
         chart_rank: Fact::Known(Some(ChartRank::Rank(2))),
+        play_level: Fact::Known(12),
     }
 }
 

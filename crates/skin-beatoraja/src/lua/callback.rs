@@ -32,6 +32,16 @@
 //! has a mapping is decided where it is consumed (`import::callback`).
 //! Anything else has an effect the analysis does not rule out, and
 //! refuses the candidate ([`admit`]).
+//!
+//! So once [`admit`] accepts every callable, no callback the import can
+//! reach writes anything at frame time, through any helper: not the
+//! `_ENV` binding a configuration read resolves through, not
+//! `skin_config` or its `option` table, and no metatable. That is the
+//! noninterference half of the capture proof that lets a configuration
+//! read fold in any callback, a play-critical one included; the other
+//! halves (the raw path, the final integer entry) are checked at the read.
+//! [`admit`] records its acceptance on the [`Analysis`], and lowering
+//! takes the analysis only through the [`Admitted`] witness it gives.
 
 use std::cell::{Cell, RefCell};
 
@@ -204,9 +214,69 @@ pub(crate) struct Analysis {
     pub(crate) work: Cell<u64>,
     /// The candidate's cancellation request.
     pub(crate) cancel: Option<super::Cancel>,
+    /// Whether [`admit`] accepted every callable of this analysis.
+    admitted: Cell<bool>,
+    /// The callbacks consumed, in order, for the report.
+    #[cfg(feature = "dev-tools")]
+    pub(crate) consumed: RefCell<Vec<Consumed>>,
+    /// Why each callable the import read but did not consume was left,
+    /// by callable, for the report.
+    #[cfg(feature = "dev-tools")]
+    pub(crate) unused: RefCell<HashMap<u32, Unused>>,
+}
+
+/// The witness that [`admit`] accepted every callable of an [`Analysis`]:
+/// lowering, configuration folds included, takes its analysis only
+/// through it. It borrows that analysis, so a fold is tied to the
+/// analysis admission proved write-free.
+#[derive(Clone, Copy)]
+pub(crate) struct Admitted<'a>(&'a Analysis);
+
+impl<'a> Admitted<'a> {
+    /// The admitted analysis.
+    pub(crate) fn analysis(self) -> &'a Analysis {
+        self.0
+    }
+}
+
+/// Why a classified callback the import read was never consumed, for the
+/// report; one it never read is in a field no consumer reads.
+#[cfg(feature = "dev-tools")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Unused {
+    /// Its element was dropped before the callback was consumed.
+    Dropped,
+    /// A condition before it folded false.
+    FoldedFalse,
+}
+
+/// A callback where the import consumed it, for the report.
+#[cfg(feature = "dev-tools")]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Consumed {
+    /// The node holding it.
+    pub(crate) node: u32,
+    pub(crate) field: &'static str,
+    /// Its role: the critical part, `None` when decorative.
+    pub(crate) part: Option<crate::import::CriticalPart>,
+    pub(crate) disposition: Disposition,
+    /// Why it did not lower, when it did not.
+    pub(crate) why: Option<Unsupported>,
 }
 
 impl Analysis {
+    /// The witness that [`admit`] accepted this analysis, if it did.
+    pub(crate) fn admitted(&self) -> Option<Admitted<'_>> {
+        self.admitted.get().then_some(Admitted(self))
+    }
+
+    /// Records that the import left callable `c` unconsumed for `why`,
+    /// replacing an earlier reason.
+    #[cfg(feature = "dev-tools")]
+    pub(crate) fn unused(&self, c: u32, why: Unused) {
+        self.unused.borrow_mut().insert(c, why);
+    }
+
     /// An empty analysis that sees `cancel`, set before any capture so
     /// that every charge polls it.
     pub(crate) fn with_cancel(cancel: super::Cancel) -> Self {
@@ -794,7 +864,13 @@ pub(crate) fn admit(arena: &Arena) -> Result<(), ImportError> {
             }
         }
     }
-    first.map_or(Ok(()), Err)
+    match first {
+        Some(e) => Err(e),
+        None => {
+            an.admitted.set(true);
+            Ok(())
+        }
+    }
 }
 
 /// The nodes holding a callable, in conversion order, with the

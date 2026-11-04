@@ -1009,7 +1009,13 @@ impl<'d> Cx<'d> {
                     }
                 },
             };
+            #[cfg(feature = "dev-tools")]
+            let folded = matches!(cond, Cond::Fold(false));
             if !self.condition(role, at, cond, &mut conds, &mut deviates)? {
+                #[cfg(feature = "dev-tools")]
+                if folded && let Prop::Callable(id) = dst.draw {
+                    self.unused(id, crate::lua::callback::Unused::FoldedFalse);
+                }
                 return Ok(None);
             }
         }

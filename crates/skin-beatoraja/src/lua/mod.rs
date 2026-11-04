@@ -7,8 +7,9 @@
 //! converted ([`convert`]) and read through the definition's header path.
 //! [`LuaHeader::import`] runs the configured pass for a [`Config`] and a
 //! snapshot of import facts ([`facts`]): another fresh VM runs the entry
-//! with a pass-local `skin_config` ([`config`]) and `main_state.option`
-//! answering the snapshot's facts, and the table it returns is converted
+//! with a pass-local `skin_config` ([`config`]) and `main_state.option`,
+//! `number` and `text` answering the snapshot's facts and the scene's
+//! constants, and the table it returns is converted
 //! into the resolved representation and imported through
 //! [`crate::import`], the one import path. The passes share only the
 //! immutable snapshots of the sources they read ([`loader`]) and the
@@ -225,8 +226,6 @@ pub enum Unsupported {
     Unmapped { api: u16, id: i64 },
     /// An integer intermediate that could leave the expressions' range.
     Range,
-    /// A configuration read in a play-critical callback.
-    Config,
 }
 
 impl fmt::Display for Unsupported {
@@ -247,7 +246,6 @@ impl fmt::Display for Unsupported {
             Self::Capture(c) => write!(f, "{c} not proven"),
             Self::Unmapped { api: a, id } => write!(f, "{}({id}) has no mapping", api(*a)),
             Self::Range => f.write_str("an integer that could leave the expression range"),
-            Self::Config => f.write_str("a configuration read in a play-critical callback"),
         }
     }
 }
@@ -690,6 +688,9 @@ pub(crate) struct Outcome<T, E = ImportError> {
     pub(crate) callbacks: Vec<callback::Disposition>,
     /// The facts the configured pass read, however far it got.
     pub(crate) reads: Vec<FactRead>,
+    /// The report's records of the callbacks ([`survey::records`]).
+    #[cfg(feature = "dev-tools")]
+    pub(crate) records: Vec<(Loc, survey::Consumer)>,
 }
 
 /// The header pass, with its metadata.
@@ -707,6 +708,8 @@ pub(crate) fn header_pass(root: &Path, entry: &str, cancel: &Cancel) -> Outcome<
                 dependencies: Vec::new(),
                 callbacks: Vec::new(),
                 reads: Vec::new(),
+                #[cfg(feature = "dev-tools")]
+                records: Vec::new(),
             };
         }
     };
@@ -747,6 +750,8 @@ pub(crate) fn header_pass(root: &Path, entry: &str, cancel: &Cancel) -> Outcome<
         dependencies,
         callbacks: Vec::new(),
         reads: Vec::new(),
+        #[cfg(feature = "dev-tools")]
+        records: Vec::new(),
     }
 }
 
@@ -937,6 +942,8 @@ impl LuaHeader {
     ) -> Outcome<Imported, Stop> {
         let slot = self.header.kind;
         let mut callbacks = Vec::new();
+        #[cfg(feature = "dev-tools")]
+        let mut records = Vec::new();
         let result = def.and_then(|mut def| {
             let r =
                 admit(&mut def, slot).and_then(|()| import(&mut def, &self.header, config, slot));
@@ -945,6 +952,10 @@ impl LuaHeader {
                 counts.expanded = an.expanded.get();
                 counts.analysis_work = an.work.get();
                 callbacks = an.outcomes.borrow().clone();
+                #[cfg(feature = "dev-tools")]
+                {
+                    records = survey::records(&def.arena, an, r.is_ok());
+                }
             }
             r.map_err(Stop::Fault)
         });
@@ -954,6 +965,8 @@ impl LuaHeader {
             dependencies: store.dependencies,
             callbacks,
             reads,
+            #[cfg(feature = "dev-tools")]
+            records,
         }
     }
 

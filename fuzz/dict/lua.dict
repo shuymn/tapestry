@@ -19,6 +19,8 @@
 "ms.number(110)"
 "ms.number(425)"
 "ms.option(42)"
+"ms.number(96)"
+"ms.text(1003)"
 "ms.gauge_type()"
 "ms.timer(143)"
 "ms.timer_off_value"

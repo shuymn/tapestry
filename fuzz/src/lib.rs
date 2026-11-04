@@ -2148,7 +2148,8 @@ pub fn skin_lua(data: &[u8]) -> Result<(Header, Result<LuaOutcome, ImportError>)
 
 /// The play snapshot of a `skin_lua` input's first two bytes: autoplay
 /// unavailable, off, on or pending by `a` modulo 4, on a result scene
-/// for 255; the chart's rank unavailable, pending, a `#RANK` from -8 to
+/// for 255; the play level unavailable, pending, or `a / 16` (twice) by
+/// `a / 4` modulo 4; the chart's rank unavailable, pending, a `#RANK` from -8 to
 /// 54 or none read for 55, or a `#DEFEXRANK` from 0 to 315 % in steps of
 /// 5 % by `r`'s low two bits and the rest.
 #[must_use]
@@ -2172,10 +2173,16 @@ pub fn lua_facts(a: u8, r: u8) -> ImportFacts {
         2 => Fact::Known(Some(ChartRank::Rank(i32::from(v) - 8))),
         _ => Fact::Known(Some(ChartRank::DefExRankMilli(i64::from(v) * 5_000))),
     };
+    let play_level = match (a >> 2) % 4 {
+        0 => Fact::Unavailable,
+        1 => Fact::Pending,
+        _ => Fact::Known(i32::from(a >> 4)),
+    };
     ImportFacts {
         scene,
         autoplay,
         chart_rank,
+        play_level,
     }
 }
 
