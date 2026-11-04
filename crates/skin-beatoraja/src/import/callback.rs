@@ -654,10 +654,35 @@ impl Cx<'_> {
         Some((c, lua.callables.get(c as usize)?.instance))
     }
 
-    fn set_outcome(&self, c: u32, d: Disposition) {
-        if let Some(an) = self.analysis() {
-            an.set_outcome(c, d);
-        }
+    /// Records what became of callable `c` at node `id`, consumed in
+    /// `field` with `role`: its disposition `d`, then, for the report, a
+    /// record with `why` it did not lower.
+    fn outcome(
+        &self,
+        (c, id): (u32, u32),
+        field: &'static str,
+        role: Role,
+        (d, why): (Disposition, Option<Unsupported>),
+    ) {
+        let Some(an) = self.analysis() else {
+            return;
+        };
+        an.set_outcome(c, d);
+        #[cfg(feature = "dev-tools")]
+        an.consumed
+            .borrow_mut()
+            .push(crate::lua::callback::Consumed {
+                node: id,
+                field,
+                part: match role {
+                    Role::Critical(p) => Some(p),
+                    Role::Decorative => None,
+                },
+                disposition: d,
+                why,
+            });
+        #[cfg(not(feature = "dev-tools"))]
+        let _ = (id, field, role, why);
     }
 
     /// Records why the callback at node `id`, read, was not consumed:
@@ -669,35 +694,6 @@ impl Cx<'_> {
             an.unused(c, why);
         }
     }
-
-    /// Records the callback at node `id` consumed in `field` with `role`,
-    /// as `d`, for `why`.
-    #[cfg(feature = "dev-tools")]
-    fn consumed(
-        &self,
-        id: u32,
-        field: &'static str,
-        role: Role,
-        (d, why): (Disposition, Option<Unsupported>),
-    ) {
-        if let Some(an) = self.analysis() {
-            an.consumed
-                .borrow_mut()
-                .push(crate::lua::callback::Consumed {
-                    node: id,
-                    field,
-                    part: match role {
-                        Role::Critical(p) => Some(p),
-                        Role::Decorative => None,
-                    },
-                    disposition: d,
-                    why,
-                });
-        }
-    }
-
-    #[cfg(not(feature = "dev-tools"))]
-    fn consumed(&self, _: u32, _: &'static str, _: Role, _: (Disposition, Option<Unsupported>)) {}
 
     /// The definition's callback analysis.
     fn analysis(&self) -> Option<&Analysis> {
@@ -809,8 +805,7 @@ impl Cx<'_> {
         let critical = role != Role::Decorative;
         let why = match self.lower(id) {
             Ok(Lowering::Lowered(l, Ty::Bool)) => {
-                self.set_outcome(c, Disposition::Lowered);
-                self.consumed(id, "draw", role, (Disposition::Lowered, None));
+                self.outcome((c, id), "draw", role, (Disposition::Lowered, None));
                 #[cfg(test)]
                 LOWERED.with(|w| {
                     let mut all: Vec<String> = l.guards.iter().map(|g| (*g).to_owned()).collect();
@@ -831,18 +826,20 @@ impl Cx<'_> {
             Ok(Lowering::Lowered(..)) => Unsupported::Type,
             Ok(Lowering::Unsupported(why, _)) => why,
             Err(e) => {
-                self.set_outcome(c, Disposition::Refused);
-                self.consumed(id, "draw", role, (Disposition::Refused, None));
+                self.outcome((c, id), "draw", role, (Disposition::Refused, None));
                 return Err(e);
             }
         };
         if critical {
-            self.set_outcome(c, Disposition::Refused);
-            self.consumed(id, "draw", role, (Disposition::Refused, Some(why)));
+            self.outcome((c, id), "draw", role, (Disposition::Refused, Some(why)));
             return Err(self.critical(id, "draw", why));
         }
-        self.set_outcome(c, Disposition::Replaced(why));
-        self.consumed(id, "draw", role, (Disposition::Replaced(why), Some(why)));
+        self.outcome(
+            (c, id),
+            "draw",
+            role,
+            (Disposition::Replaced(why), Some(why)),
+        );
         self.drop_el(
             Role::Decorative,
             at,
@@ -864,9 +861,8 @@ impl Cx<'_> {
         let c = self.callable_at(id).map_or(NONE, |(c, _)| c);
         let (why, part) = match self.lower(id) {
             Ok(Lowering::Lowered(l, Ty::Int)) => {
-                self.set_outcome(c, Disposition::Lowered);
-                self.consumed(
-                    id,
+                self.outcome(
+                    (c, id),
                     "value",
                     l.part.map_or(base, Role::Critical),
                     (Disposition::Lowered, None),
@@ -884,24 +880,21 @@ impl Cx<'_> {
             Ok(Lowering::Lowered(l, _)) => (Unsupported::Type, l.part),
             Ok(Lowering::Unsupported(why, part)) => (why, part),
             Err(e) => {
-                self.set_outcome(c, Disposition::Refused);
-                self.consumed(id, "value", base, (Disposition::Refused, None));
+                self.outcome((c, id), "value", base, (Disposition::Refused, None));
                 return Err(e);
             }
         };
         if part.is_some() || base != Role::Decorative {
-            self.set_outcome(c, Disposition::Refused);
-            self.consumed(
-                id,
+            self.outcome(
+                (c, id),
                 "value",
                 part.map_or(base, Role::Critical),
                 (Disposition::Refused, Some(why)),
             );
             return Err(self.critical(id, "value", why));
         }
-        self.set_outcome(c, Disposition::Replaced(why));
-        self.consumed(
-            id,
+        self.outcome(
+            (c, id),
             "value",
             Role::Decorative,
             (Disposition::Replaced(why), Some(why)),
