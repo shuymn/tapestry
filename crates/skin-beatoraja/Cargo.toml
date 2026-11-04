@@ -9,7 +9,8 @@ publish.workspace = true
 
 [features]
 # The Lua conversion report (src/bin/lua_report.rs), for the developer's
-# PC only (docs/stage3.md §3).
+# PC only (docs/stage3.md §3), and the sandbox's VM hooks for the player's
+# import tests (src/lua/vm_hooks.rs).
 dev-tools = []
 
 [dependencies]

@@ -1185,3 +1185,60 @@ fn an_adjustment_during_a_stalled_chart_load_is_published_before_it_ends() {
         "dev: the chart's load holds 1500 ms",
     );
 }
+
+/// A self-made play skin in `dir`: one blue image over the whole canvas,
+/// so a frame it draws has no judgment line.
+fn write_blue_skin(dir: &Path) {
+    fs::create_dir_all(dir).unwrap();
+    let file = fs::File::create(dir.join("blue.png")).unwrap();
+    let mut e = png::Encoder::new(std::io::BufWriter::new(file), 16, 16);
+    e.set_color(png::ColorType::Rgba);
+    e.set_depth(png::BitDepth::Eight);
+    let blue: Vec<u8> = (0..16 * 16).flat_map(|_| [0, 0, 255, 255]).collect();
+    e.write_header().unwrap().write_image_data(&blue).unwrap();
+    fs::write(
+        dir.join("s.json"),
+        r#"{"type": 0, "w": 1920, "h": 1080,
+            "source": [{"id": "b", "path": "blue.png"}],
+            "image": [{"id": "b", "src": "b", "x": 0, "y": 0, "w": 16, "h": 16}],
+            "destination": [{"id": "b", "dst": [{"x": 0, "y": 0, "w": 1920, "h": 1080}]}]}"#,
+    )
+    .unwrap();
+}
+
+/// `player.toml` choosing the skin in `skin` for every kind.
+fn every_kind(skin: &Path) -> String {
+    ["play", "selection", "decision", "result"]
+        .map(|kind| {
+            format!(
+                "[skins.{kind}]\nroot = '{}'\nentry = 's.json'\n",
+                skin.display()
+            )
+        })
+        .concat()
+}
+
+/// Skins are not imported at startup yet: with every kind's skin
+/// configured in `player.toml`, the run reports no skin, the play screen
+/// loads in the built-in skin (its judgment line drawn, which the
+/// configured skin would cover), and the chart plays to its result.
+#[test]
+fn configured_skins_stay_dormant_at_startup() {
+    let fx = fixture();
+    write_chart(&fx.library, "a", "a.bms", "譜面A", 8_000);
+    let skin = fx.appdata.join("skin");
+    write_blue_skin(&skin);
+    let root = DataRoot::new(fx.appdata.join("tapestry"));
+    fs::write(root.player_settings(), every_kind(&skin)).unwrap();
+    let frames = fx.appdata.join("frames");
+    let frames_arg = frames.display().to_string();
+    let (_, stdout) = run(
+        &fx,
+        "pick=a.bms,slow-load=500,enter,back,close",
+        &["--dev-frames", &frames_arg],
+    );
+    assert!(lines(&stdout, "skin:").is_empty(), "{stdout}");
+    assert!(find_from(&stdout, 0, "play started").is_some(), "{stdout}");
+    let loading = dumped_rgba(&frames.join("loading.png"));
+    assert!(has_red_run(&loading, loading.0 / 5), "no judgment line");
+}

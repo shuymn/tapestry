@@ -70,6 +70,35 @@ pub fn warnings(what: &str, items: impl ExactSizeIterator<Item = impl Display>) 
     warnings_to(what, items, &mut io::stderr().lock(), log::logger());
 }
 
+/// Logs `line` as `<what>: <line>` into `log`, then the first
+/// [`WARNINGS_LOGGED`] of `notes` as `<what>: <note>`, then one count of
+/// the notes left out: the ones past the cap and the `suppressed` ones
+/// their source kept only as a count. Nothing goes to stderr.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "production imports no skin yet")
+)]
+pub fn summary_to(
+    what: &str,
+    line: &str,
+    notes: impl ExactSizeIterator<Item = impl Display>,
+    suppressed: u32,
+    log: &dyn Log,
+) {
+    log.log(&own(Level::Info, format_args!("{what}: {line}")));
+    let n = notes.len();
+    for note in notes.take(WARNINGS_LOGGED) {
+        log.log(&own(Level::Info, format_args!("{what}: {note}")));
+    }
+    let more = n.saturating_sub(WARNINGS_LOGGED);
+    if more > 0 || suppressed > 0 {
+        let args = format_args!(
+            "{what}: {more} more notes not logged ({n} kept), {suppressed} more not kept"
+        );
+        log.log(&own(Level::Info, args));
+    }
+}
+
 /// Sums up a chart's missing sound files in one line, the count and the
 /// first [`MISSING_NAMED`] names with control characters escaped, on
 /// stderr and in the log like any chart warning. Nothing when none is

@@ -617,6 +617,64 @@ fn a_colliding_device_toml_opens_no_play() {
     assert!(!appdata.join("tapestry").join("records").exists());
 }
 
+/// Skins are not imported at startup yet: `tapestry play` with a play
+/// and a result skin configured in `player.toml` reports no skin and
+/// plays and records the chart in the built-in skin, as without them.
+#[test]
+fn configured_skins_stay_dormant_on_the_direct_path() {
+    let Fixture {
+        dir,
+        chart_path,
+        log,
+        appdata,
+        ..
+    } = fixture();
+    let skin = dir.path().join("skin");
+    fs::create_dir_all(&skin).unwrap();
+    let file = fs::File::create(skin.join("blue.png")).unwrap();
+    let mut e = png::Encoder::new(std::io::BufWriter::new(file), 16, 16);
+    e.set_color(png::ColorType::Rgba);
+    e.set_depth(png::BitDepth::Eight);
+    let blue: Vec<u8> = (0..16 * 16).flat_map(|_| [0, 0, 255, 255]).collect();
+    e.write_header().unwrap().write_image_data(&blue).unwrap();
+    fs::write(
+        skin.join("s.json"),
+        r#"{"type": 0, "w": 1920, "h": 1080,
+            "source": [{"id": "b", "path": "blue.png"}],
+            "image": [{"id": "b", "src": "b", "x": 0, "y": 0, "w": 16, "h": 16}],
+            "destination": [{"id": "b", "dst": [{"x": 0, "y": 0, "w": 1920, "h": 1080}]}]}"#,
+    )
+    .unwrap();
+    let root = appdata.join("tapestry");
+    fs::create_dir_all(&root).unwrap();
+    let table = |kind: &str| {
+        format!(
+            "[skins.{kind}]\nroot = '{}'\nentry = 's.json'\n",
+            skin.display()
+        )
+    };
+    fs::write(
+        root.join("player.toml"),
+        format!("{}{}", table("play"), table("result")),
+    )
+    .unwrap();
+    let out = scripted_play(&chart_path, &log, &appdata)
+        .output()
+        .expect("run tapestry");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stdout}{stderr}");
+    assert!(
+        !stdout
+            .lines()
+            .chain(stderr.lines())
+            .any(|l| l.starts_with("skin:")),
+        "{stdout}{stderr}"
+    );
+    assert!(stdout.contains("play 1:"), "{stdout}");
+    assert_eq!(records(&appdata).len(), 1);
+}
+
 /// A capture cancelled before playback is no script: the run ends with
 /// the reason and a nonzero exit, and nothing is recorded.
 #[test]

@@ -18,7 +18,7 @@ windows-only = true
 [features]
 default = []
 # Development features. Never enabled in production builds (R3).
-dev-tools = ["game/dev-tools", "dep:serde", "dep:toml"]
+dev-tools = ["game/dev-tools", "skin-beatoraja/dev-tools", "dep:serde", "dep:toml"]
 
 [dependencies]
 anyhow.workspace = true
@@ -34,6 +34,7 @@ render.workspace = true
 replay.workspace = true
 rtrb.workspace = true
 rules.workspace = true
+skin-beatoraja.workspace = true
 skin-model.workspace = true
 serde = { workspace = true, optional = true }
 thiserror.workspace = true
@@ -52,7 +53,6 @@ winit.workspace = true
 bms-parser.workspace = true
 png.workspace = true
 rusqlite.workspace = true
-skin-beatoraja.workspace = true
 # The render tests' shared helpers wait on the device.
 wgpu.workspace = true
 tempfile.workspace = true
@@ -63,7 +63,6 @@ workspace = true
 
 # Tests include fixtures from other crates by path, which cargo-machete does not
 # follow: the library's (the bests tests open its database with rusqlite) and
-# render's declarative and imported skin support (it writes PNG files and
-# imports through skin-beatoraja).
+# render's declarative and imported skin support (it writes PNG files).
 [package.metadata.cargo-machete]
-ignored = ["png", "rusqlite", "skin-beatoraja", "wgpu"]
+ignored = ["png", "rusqlite", "wgpu"]

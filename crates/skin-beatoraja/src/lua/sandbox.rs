@@ -240,6 +240,8 @@ pub(super) fn vm(pass: &Rc<Pass>) -> mlua::Result<Lua> {
     lua.set_memory_limit(MAX_LUA_MEMORY)?;
     #[cfg(test)]
     lua.set_app_data(super::tests::Live::new());
+    #[cfg(feature = "dev-tools")]
+    lua.set_app_data(super::vm_hooks::Live::new());
     let hook = Rc::clone(pass);
     let after_fault = std::cell::Cell::new(0_u32);
     lua.set_global_hook(

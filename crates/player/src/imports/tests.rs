@@ -1,0 +1,835 @@
+//! The builds and their thread on self-made skins written here: the
+//! configured folder and names, options and file choices by name, the
+//! text producer, cancellation mid-Lua and abandonment past the stop
+//! bound (dev-tools, through the sandbox's VM hooks), panics, and the
+//! reports.
+
+use std::fs;
+use std::io::BufWriter;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant};
+
+use bms_model::{ChartBuilder, TimeUs};
+use game::{Chain, SkinChoice};
+use render::{AttemptInput, Renderer, SkinBundle};
+use skin_beatoraja::{Cancel, Note, NoteKind, NoteLoc, Rule, Severity};
+use skin_model::{ChartText, ScreenKind};
+
+use super::{
+    ENDED, ImportTarget, KindOutcome, PANICKED, Ran, STOP_WAIT, Shown, Summary, build, line,
+    log_installed, notice, run_cancellable,
+};
+
+/// Whether a job's thread holds after its send, and how many wait there.
+static EXIT: Mutex<(bool, usize)> = Mutex::new((false, 0));
+static EXIT_OPENED: Condvar = Condvar::new();
+
+/// The job thread's exit barrier, after its send and before it returns.
+pub(super) fn exit_gate() {
+    let mut g = EXIT.lock().unwrap_or_else(PoisonError::into_inner);
+    g.1 += 1;
+    while g.0 {
+        g = EXIT_OPENED.wait(g).unwrap_or_else(PoisonError::into_inner);
+    }
+    g.1 -= 1;
+}
+
+fn hold_exit(on: bool) {
+    EXIT.lock().unwrap_or_else(PoisonError::into_inner).0 = on;
+    EXIT_OPENED.notify_all();
+}
+
+fn exit_waiting() -> usize {
+    EXIT.lock().unwrap_or_else(PoisonError::into_inner).1
+}
+
+/// The tests that run jobs, or hold the process-wide barriers, one at a
+/// time; each barrier is released when the test ends, failed or not.
+fn serial() -> Serial {
+    static SERIAL: Mutex<()> = Mutex::new(());
+    Serial(SERIAL.lock().unwrap_or_else(PoisonError::into_inner))
+}
+
+struct Serial(#[expect(dead_code, reason = "held for its drop")] MutexGuard<'static, ()>);
+
+impl Drop for Serial {
+    fn drop(&mut self) {
+        hold_exit(false);
+        #[cfg(feature = "dev-tools")]
+        skin_beatoraja::lua::vm_hooks::release();
+    }
+}
+
+/// Waits up to 30 s for `done`.
+fn wait_until(done: impl Fn() -> bool) -> bool {
+    let end = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < end {
+        if done() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    done()
+}
+
+/// Writes a `w`×`h` PNG of one colour at `path`.
+fn png(path: &Path, w: u32, h: u32, [r, g, b]: [u8; 3]) {
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir).unwrap();
+    }
+    let file = fs::File::create(path).unwrap();
+    let mut e = png::Encoder::new(BufWriter::new(file), w, h);
+    e.set_color(png::ColorType::Rgba);
+    e.set_depth(png::BitDepth::Eight);
+    let data: Vec<u8> = (0..w * h).flat_map(|_| [r, g, b, 255]).collect();
+    e.write_header().unwrap().write_image_data(&data).unwrap();
+}
+
+/// `s` as a JSON string's contents.
+fn json_str(s: &str) -> String {
+    s.replace('\\', "\\\\")
+}
+
+/// A destination of `id` over y-down canvas rect `[x, y, w, h]`.
+fn dst(id: &str, [x, y, w, h]: [i32; 4]) -> String {
+    let y = 1_080 - y - h;
+    format!(r#"{{"id": "{id}", "dst": [{{"x": {x}, "y": {y}, "w": {w}, "h": {h}}}]}}"#)
+}
+
+const RED: [u8; 3] = [255, 0, 0];
+const BLUE: [u8; 3] = [0, 0, 255];
+const GREEN: [u8; 3] = [0, 255, 0];
+const YELLOW: [u8; 3] = [255, 255, 0];
+/// Where the option's image draws.
+const COLOUR: [i32; 4] = [100, 100, 100, 100];
+/// Where the file choice's image draws.
+const BACKGROUND: [i32; 4] = [300, 100, 100, 100];
+
+/// A play skin with option "Color" (items Red, the default, and Blue,
+/// each drawing its own image at [`COLOUR`]) and file choice
+/// "Background" (`bg/a.png` green, the default, and `bg/b.png` yellow,
+/// drawn at [`BACKGROUND`]).
+fn options_skin() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let json = format!(
+        r#"{{"type": 0, "w": 1920, "h": 1080,
+            "property": [{{"name": "Color", "item": [{{"name": "Red", "op": 901}},
+                                                     {{"name": "Blue", "op": 902}}],
+                           "def": "Red"}}],
+            "filepath": [{{"name": "Background", "path": "bg/*.png", "def": "a"}}],
+            "source": [{{"if": 901, "values": [{{"id": "c", "path": "red.png"}}]}},
+                       {{"if": 902, "values": [{{"id": "c", "path": "blue.png"}}]}},
+                       {{"id": "b", "path": "bg/*.png"}}],
+            "image": [{{"id": "c", "src": "c", "x": 0, "y": 0, "w": 16, "h": 16}},
+                      {{"id": "b", "src": "b", "x": 0, "y": 0, "w": 16, "h": 16}}],
+            "destination": [{}, {}]}}"#,
+        dst("c", COLOUR),
+        dst("b", BACKGROUND)
+    );
+    fs::write(d.join("s.json"), json).unwrap();
+    png(&d.join("red.png"), 16, 16, RED);
+    png(&d.join("blue.png"), 16, 16, BLUE);
+    png(&d.join("bg/a.png"), 16, 16, GREEN);
+    png(&d.join("bg/b.png"), 16, 16, YELLOW);
+    dir
+}
+
+/// A play skin `entry` whose play-critical EX score number reads its
+/// digits from `path`, and `n.png` (the digits, red).
+fn critical_skin(dir: &Path, entry: &str, path: &str) {
+    let json = format!(
+        r#"{{"type": 0, "w": 1920, "h": 1080,
+            "source": [{{"id": "n", "path": "{}"}}],
+            "value": [{{"id": "ex", "src": "n", "w": 120, "h": 20, "divx": 10, "digit": 4,
+                        "ref": 71}}],
+            "destination": [{}]}}"#,
+        json_str(path),
+        dst("ex", [0, 0, 120, 20])
+    );
+    fs::write(dir.join(entry), json).unwrap();
+    png(&dir.join("n.png"), 120, 20, RED);
+}
+
+/// The choice of `entry` in `root`, nothing named.
+fn choice(root: impl Into<PathBuf>, entry: &str) -> SkinChoice {
+    SkinChoice {
+        root: root.into(),
+        entry: entry.to_owned(),
+        options: Default::default(),
+        files: Default::default(),
+    }
+}
+
+/// What `r` packs for, with the generated default font.
+fn target(r: &Renderer) -> ImportTarget {
+    ImportTarget {
+        limits: r.atlas_limits(),
+        size: [1_920, 1_080],
+        default_font: || Ok(crate::render_outline::default_font()),
+    }
+}
+
+/// Builds `choice` as a play skin for `t`.
+fn play(choice: &SkinChoice, t: &ImportTarget) -> KindOutcome {
+    build(ScreenKind::Play, choice, false, t, &Cancel::new())
+}
+
+#[track_caller]
+fn bundled(o: KindOutcome) -> (Arc<SkinBundle>, Summary) {
+    match o {
+        KindOutcome::Bundle(b, s) => (b, s),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[track_caller]
+fn refused(o: KindOutcome) -> String {
+    match o {
+        KindOutcome::Refused(why) => why,
+        other => panic!("{other:?}"),
+    }
+}
+
+/// A frame of `b`'s attempt on `r`, read back.
+fn frame(r: &mut Renderer, b: &Arc<SkinBundle>, request: u64) -> Vec<u8> {
+    let chart = ChartBuilder::new(120_000).build().unwrap();
+    let ctx = crate::render_common::context(&crate::render_common::GAUGES, false);
+    let text = ChartText {
+        title: "",
+        subtitle: "",
+        artist: "",
+        subartist: "",
+        genre: "",
+    };
+    let a = AttemptInput {
+        chart: &chart,
+        context: &ctx,
+        text: &text,
+        target: r.target(),
+    };
+    let token = r.stage(b, &a, request).unwrap();
+    r.commit(token).unwrap();
+    let v = crate::render_common::view(0, 0);
+    let input = crate::render_common::input(&v, TimeUs(0), TimeUs(0), &[]);
+    assert!(r.frame(&input).unwrap().presented);
+    crate::render_common::read_back(r)
+}
+
+/// A skin of another kind than the one it is built for refuses; a kind
+/// with no importer yet runs the importer and keeps its built-in screen.
+#[test]
+fn a_skin_builds_only_for_its_own_kind_and_importer() {
+    let r = crate::render_common::offscreen(1_920, 1_080);
+    let t = target(&r);
+    let dir = options_skin();
+    fs::write(
+        dir.path().join("r.json"),
+        r#"{"type": 7, "w": 1920, "h": 1080}"#,
+    )
+    .unwrap();
+    let c = Cancel::new();
+    let as_result = build(
+        ScreenKind::Result,
+        &choice(dir.path(), "s.json"),
+        false,
+        &t,
+        &c,
+    );
+    assert_eq!(
+        refused(as_result),
+        "a 7-key play skin in the single-chart result slot"
+    );
+    match build(
+        ScreenKind::Result,
+        &choice(dir.path(), "r.json"),
+        false,
+        &t,
+        &c,
+    ) {
+        KindOutcome::BuiltIn(why) => {
+            assert_eq!(why, "single-chart result skins are not imported yet");
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+/// The colour at the centre of canvas rect `rect` of a 1920-wide read back.
+fn centre(pixels: &[u8], [x, y, w, h]: [i32; 4]) -> [u8; 3] {
+    let at = |v: i32| u32::try_from(v).unwrap();
+    crate::render_common::rgb_at(pixels, 1_920, (at(x + w / 2), at(y + h / 2)))
+}
+
+/// The configured folder is the user's absolute choice, taken with
+/// forward, back or mixed separators, and refused naming it when it is
+/// not a folder; the entry and every name a skin's play-critical image
+/// gives stay under the folder's name and containment rules, a drive,
+/// UNC, verbatim or stream name, or a link out of the folder, refusing
+/// the whole build with the located reason.
+#[test]
+fn the_folder_is_taken_as_given_and_names_stay_inside_it() {
+    let r = crate::render_common::offscreen(1_920, 1_080);
+    let t = target(&r);
+    let outer = tempfile::tempdir().unwrap();
+    let skin = outer.path().join("skin");
+    fs::create_dir_all(&skin).unwrap();
+    critical_skin(&skin, "s.json", "n.png");
+    let back = skin.display().to_string();
+    let forward = back.replace('\\', "/");
+    let mixed = forward.replacen('/', "\\", 2);
+    assert!(forward.contains('/') && mixed.contains('/') && mixed.contains('\\'));
+    for root in [&back, &forward, &mixed] {
+        bundled(play(&choice(root, "s.json"), &t));
+    }
+    // Not a folder.
+    let missing = skin.join("missing");
+    let why = refused(play(&choice(&missing, "s.json"), &t));
+    assert!(why.contains(&missing.display().to_string()), "{why}");
+    let why = refused(play(&choice(skin.join("n.png"), "s.json"), &t));
+    assert!(why.ends_with("not a folder"), "{why}");
+
+    // An outside file a link inside points to.
+    fs::write(outer.path().join("outside.json"), "{}").unwrap();
+    png(&outer.path().join("outside.png"), 120, 20, RED);
+    std::os::windows::fs::symlink_file(outer.path().join("outside.json"), skin.join("out.json"))
+        .unwrap();
+    std::os::windows::fs::symlink_file(outer.path().join("outside.png"), skin.join("out.png"))
+        .unwrap();
+    let rejected = "the name is not a relative path";
+    let escapes = "the name resolves outside the skin folder";
+    for (entry, says) in [
+        ("C:s.json", rejected),
+        (r"\\server\share\s.json", rejected),
+        (r"\\?\C:\s.json", rejected),
+        ("s.json:stream", rejected),
+        ("out.json", escapes),
+    ] {
+        let why = refused(play(&choice(&skin, entry), &t));
+        assert!(why.contains(says), "{entry}: {why}");
+    }
+    // The importer reads a play-critical image through the same rules and
+    // refuses the whole skin at the element: a name of the wrong form as a
+    // file it cannot read, a link out of the folder by the folder's rule.
+    let unreadable = "bad.json:5:29: the EX score number cannot be imported: \
+                      a missing or unreadable file";
+    let outside = "bad.json:5:29: a play-critical image: file 0 resolves outside the skin folder";
+    for (name, says) in [
+        ("C:n.png", unreadable),
+        (r"\\server\share\n.png", unreadable),
+        (r"\\?\C:\n.png", unreadable),
+        ("n.png:stream", unreadable),
+        ("out.png", outside),
+    ] {
+        critical_skin(&skin, "bad.json", name);
+        let why = refused(play(&choice(&skin, "bad.json"), &t));
+        assert_eq!(why, says, "{name}");
+    }
+    // A font file's name: the text set in it is decorative, so it is
+    // dropped at its location, and no font is read for it.
+    for path in ["C:ttf.ttf", "out.ttf"] {
+        let fonts = [crate::render_outline::FontRec {
+            id: "f",
+            path,
+            kind: None,
+        }];
+        let texts = [crate::render_outline::text(
+            "f",
+            100,
+            crate::render_outline::Value::Ref(10),
+            [100, 100, 1_000, 100],
+        )];
+        let dir = crate::render_outline::folder(&[], &fonts, &texts);
+        fs::write(
+            outer.path().join("outside.ttf"),
+            crate::font_support::build(&crate::font_support::latin("Skin")),
+        )
+        .unwrap();
+        if path == "out.ttf" {
+            std::os::windows::fs::symlink_file(
+                outer.path().join("outside.ttf"),
+                dir.path().join("out.ttf"),
+            )
+            .unwrap();
+        }
+        let (b, summary) = bundled(play(&choice(dir.path(), "s.json"), &t));
+        assert!(b.text_residency().is_none(), "{path}");
+        let dropped: Vec<_> = summary
+            .notes
+            .iter()
+            .map(|n| (n.at.map(|at| at.source), n.severity, n.kind))
+            .collect();
+        assert_eq!(
+            dropped,
+            [(Some(0), Severity::Dropped, NoteKind::MissingAsset)],
+            "{path}"
+        );
+    }
+}
+
+/// Options and file choices by name: Blue's image and `b.png` draw, the
+/// report names `b.png` as configured; the defaults draw Red and `a.png`;
+/// unknown names refuse with their diagnostics.
+#[test]
+fn options_and_file_choices_are_chosen_by_name() {
+    let mut r = crate::render_common::offscreen(1_920, 1_080);
+    let t = target(&r);
+    let dir = options_skin();
+    let mut c = choice(dir.path(), "s.json");
+    let (b, summary) = bundled(play(&c, &t));
+    let p = frame(&mut r, &b, 1);
+    assert_eq!((centre(&p, COLOUR), centre(&p, BACKGROUND)), (RED, GREEN));
+    assert_eq!(summary.files[0].candidate.as_deref(), Some("a.png"));
+    assert_eq!(summary.files[0].rule, Rule::Default);
+
+    c.options.insert("Color".into(), "Blue".into());
+    c.files.insert("Background".into(), "b.png".into());
+    let (b, summary) = bundled(play(&c, &t));
+    let p = frame(&mut r, &b, 2);
+    assert_eq!((centre(&p, COLOUR), centre(&p, BACKGROUND)), (BLUE, YELLOW));
+    assert_eq!(summary.files.len(), 1);
+    let f = &summary.files[0];
+    assert_eq!(
+        (f.choice.as_str(), f.candidate.as_deref(), f.rule),
+        ("Background", Some("b.png"), Rule::Configured)
+    );
+
+    for (option, item, says) in [
+        (
+            "Colour",
+            "Blue",
+            r#"option "Colour" is not in the skin's header"#,
+        ),
+        ("Color", "Green", r#"option "Color" has no item "Green""#),
+    ] {
+        let mut c = choice(dir.path(), "s.json");
+        c.options.insert(option.into(), item.into());
+        assert_eq!(refused(play(&c, &t)), says);
+    }
+    for (file, candidate, says) in [
+        (
+            "Background",
+            "c.png",
+            r#"file choice "Background" has no candidate "c.png""#,
+        ),
+        (
+            "Backdrop",
+            "a.png",
+            r#"file choice "Backdrop" is not in the skin's header"#,
+        ),
+    ] {
+        let mut c = choice(dir.path(), "s.json");
+        c.files.insert(file.into(), candidate.into());
+        assert_eq!(refused(play(&c, &t)), says);
+    }
+}
+
+/// A Lua play skin whose configured pass runs `body` with `ms` the host
+/// module, drawing a 64×64 red `a.png` at `x`, which `body` sets.
+fn lua_skin(body: &str) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let entry = format!(
+        "local skin = {{ type = 0, name = \"t\", w = 1920, h = 1080 }}\n\
+         if not skin_config then return skin end\n\
+         local ms = require(\"main_state\")\n\
+         skin.source = {{ {{ id = \"a\", path = \"a.png\" }} }}\n\
+         skin.image = {{ {{ id = \"i\", src = \"a\", x = 0, y = 0, w = 64, h = 64 }} }}\n\
+         local x = 0\n\
+         {body}\n\
+         skin.destination = {{ {{ id = \"i\", dst = {{ {{ x = x, y = 0, w = 64, h = 64 }} }} }} }}\n\
+         return skin\n"
+    );
+    fs::write(dir.path().join("play.luaskin"), entry).unwrap();
+    png(&dir.path().join("a.png"), 64, 64, RED);
+    dir
+}
+
+/// A Lua play skin builds against the base facts: autoplay (option 33,
+/// on) is known, so a skin reading it builds for the session's value; a
+/// skin reading the chart's judgment class is refused, since that is known
+/// only once a chart is chosen.
+#[test]
+fn a_lua_skin_builds_on_the_base_facts() {
+    // Its VMs count, and are held, with the hooks' tests'.
+    let _serial = serial();
+    let mut r = crate::render_common::offscreen(1_920, 1_080);
+    let t = target(&r);
+    let dir = lua_skin("if ms.option(33) then x = 500 end");
+    let c = choice(dir.path(), "play.luaskin");
+    // Source y 0 is the canvas's bottom: the image lies on rows 1016 to 1079.
+    let at = |p: &[u8], x| crate::render_common::rgb_at(p, 1_920, (x, 1_048));
+    for (autoplay, x, request) in [(false, 32, 1), (true, 532, 2)] {
+        let (b, _) = bundled(build(ScreenKind::Play, &c, autoplay, &t, &Cancel::new()));
+        let p = frame(&mut r, &b, request);
+        assert_eq!(at(&p, x), RED, "autoplay {autoplay}");
+    }
+    let dir = lua_skin("if ms.option(180) then x = 500 end");
+    let why = refused(play(&choice(dir.path(), "play.luaskin"), &t));
+    assert!(
+        why.starts_with("the skin reads the chart's judgment class"),
+        "{why}"
+    );
+}
+
+/// A skin without text, with bitmap text only, and with text in a font
+/// file and in the default font each bundle; only the last has a text
+/// producer.
+#[test]
+fn a_text_producer_comes_only_with_rasterized_text() {
+    use crate::render_outline::{Value, distance_field, text, ttf};
+    let r = crate::render_common::offscreen(1_920, 1_080);
+    let t = target(&r);
+    let plain = options_skin();
+    let bitmap = crate::render_json::folder();
+    let outline = crate::render_outline::folder(
+        &[(
+            "ttf.ttf",
+            crate::font_support::build(&crate::font_support::latin("Skin")),
+        )],
+        &[ttf(), distance_field()],
+        &[
+            text("f", 100, Value::Ref(10), [100, 100, 1_000, 100]),
+            text("d", 100, Value::Ref(10), [100, 300, 1_000, 100]),
+        ],
+    );
+    let mut producers = Vec::new();
+    for dir in [&plain, &bitmap, &outline] {
+        let (b, _) = bundled(play(&choice(dir.path(), "s.json"), &t));
+        producers.push((b.text_layer().is_some(), b.text_residency().is_some()));
+    }
+    assert_eq!(producers, [(false, false), (false, false), (true, true)]);
+}
+
+/// A Lua skin whose header pass loops for ever in metered Lua: each
+/// comparison is one instruction over 1 MiB, so the loop runs to the
+/// sandbox's time cap (seconds) unless cancelled, and a cancellation is
+/// seen within a check's 100 instructions.
+#[cfg(feature = "dev-tools")]
+fn looping() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("s.luaskin"),
+        "local function rep(s, n) local r, p = \"\", s \
+         while n > 0 do if n % 2 == 1 then r = r .. p end n = n // 2 \
+         if n > 0 then p = p .. p end end return r end\n\
+         local s, t = rep(\"x\", 1 << 20), rep(\"x\", 1 << 20)\n\
+         while true do if s == t then end end\n",
+    )
+    .unwrap();
+    dir
+}
+
+/// A job building `dir`'s looping skin, its outcome kept by a witness
+/// that records the thread it is dropped on.
+#[cfg(feature = "dev-tools")]
+fn looping_job(
+    dir: &Path,
+    dropped: &Arc<Mutex<Option<String>>>,
+) -> impl FnOnce(&Cancel) -> Witness + Send + 'static {
+    let c = choice(dir, "s.luaskin");
+    let dropped = Arc::clone(dropped);
+    move |cancel| {
+        let t = ImportTarget {
+            limits: skin_model::AtlasLimits {
+                max_side: 4_096,
+                max_layers: 16,
+                reserved_layers: render::RESERVED_LAYERS,
+            },
+            size: [1_920, 1_080],
+            default_font: render::DefaultFont::runtime,
+        };
+        Witness(
+            Some(build(ScreenKind::Play, &c, false, &t, cancel)),
+            dropped,
+        )
+    }
+}
+
+/// An outcome that notes the thread it is dropped on.
+#[cfg(feature = "dev-tools")]
+struct Witness(Option<KindOutcome>, Arc<Mutex<Option<String>>>);
+
+#[cfg(feature = "dev-tools")]
+impl Drop for Witness {
+    fn drop(&mut self) {
+        let name = std::thread::current().name().map(str::to_owned);
+        *self.1.lock().unwrap() = Some(name.unwrap_or_default());
+    }
+}
+
+/// Runs `job` on another thread with a stop the test sets: the runner's
+/// thread, the stop and the runner's answer.
+fn started<T: Send + 'static>(
+    job: impl FnOnce(&Cancel) -> T + Send + 'static,
+) -> (Arc<AtomicBool>, std::sync::mpsc::Receiver<Ran<T>>) {
+    let stop = Arc::new(AtomicBool::new(false));
+    let theirs = Arc::clone(&stop);
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let ran = run_cancellable(job, move || theirs.load(Ordering::SeqCst));
+        let _ = tx.send(ran);
+    });
+    (stop, rx)
+}
+
+/// The refusal a cancelled Lua pass gives, as its outcome's text ends.
+#[cfg(feature = "dev-tools")]
+#[track_caller]
+fn cancelled(ran: Ran<Witness>) {
+    let Ran::Done(mut w) = ran else {
+        panic!("{ran:?}");
+    };
+    let why = refused(w.0.take().unwrap());
+    let lua = skin_beatoraja::LuaWhy::Cancelled.to_string();
+    assert!(why.ends_with(&lua), "{why}");
+}
+
+#[cfg(feature = "dev-tools")]
+impl std::fmt::Debug for Witness {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+/// A stop while the looping pass's VM lives cancels it: the job ends with
+/// the Lua cancellation, not a cap. With the VM's destruction held, the
+/// runner stays blocked midway, the VM still counted, and returns only
+/// once it is released and gone; with the job's thread held after its
+/// send, the runner stays blocked until that is released too.
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_stop_mid_lua_cancels_and_returns_after_the_vm_and_the_thread() {
+    use skin_beatoraja::lua::vm_hooks;
+    let _serial = serial();
+    let dir = looping();
+    let dropped = Arc::new(Mutex::new(None));
+    let base = vm_hooks::live();
+    let midway = Duration::from_millis(300);
+
+    let (stop, rx) = started(looping_job(dir.path(), &dropped));
+    assert!(wait_until(|| vm_hooks::live() > base));
+    stop.store(true, Ordering::SeqCst);
+    cancelled(rx.recv_timeout(STOP_WAIT).unwrap());
+    assert_eq!(vm_hooks::live(), base);
+
+    // The VM's destruction held, released before the stop bound.
+    vm_hooks::hold();
+    let (stop, rx) = started(looping_job(dir.path(), &dropped));
+    assert!(wait_until(|| vm_hooks::live() > base));
+    stop.store(true, Ordering::SeqCst);
+    assert!(wait_until(|| vm_hooks::waiting() == 1));
+    assert!(
+        rx.recv_timeout(midway).is_err(),
+        "returned before the VM ended"
+    );
+    assert_eq!(vm_hooks::live(), base + 1);
+    vm_hooks::release();
+    cancelled(rx.recv_timeout(STOP_WAIT).unwrap());
+    assert_eq!(vm_hooks::live(), base);
+
+    // The thread held after its send.
+    hold_exit(true);
+    let (stop, rx) = started(looping_job(dir.path(), &dropped));
+    assert!(wait_until(|| vm_hooks::live() > base));
+    stop.store(true, Ordering::SeqCst);
+    assert!(wait_until(|| exit_waiting() == 1));
+    let early = rx.recv_timeout(midway);
+    hold_exit(false);
+    assert!(
+        early.is_err(),
+        "returned before the thread ended: {early:?}"
+    );
+    cancelled(rx.recv_timeout(STOP_WAIT).unwrap());
+}
+
+/// A VM held past the stop bound: the runner gives up within the bound
+/// and a slice's scheduling, the VM still counted; once released, the
+/// outcome finds nobody and is dropped on the job's own thread.
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_job_past_the_stop_wait_is_abandoned() {
+    use skin_beatoraja::lua::vm_hooks;
+    let _serial = serial();
+    let dir = looping();
+    let dropped = Arc::new(Mutex::new(None));
+    let base = vm_hooks::live();
+    vm_hooks::hold();
+    let (stop, rx) = started(looping_job(dir.path(), &dropped));
+    assert!(wait_until(|| vm_hooks::live() > base));
+    let stopped = Instant::now();
+    stop.store(true, Ordering::SeqCst);
+    let ran = rx.recv_timeout(STOP_WAIT + Duration::from_secs(5));
+    let after = stopped.elapsed();
+    let live = vm_hooks::live();
+    vm_hooks::release();
+    assert!(matches!(ran, Ok(Ran::Abandoned)), "{ran:?}");
+    assert!(after >= STOP_WAIT, "{after:?}");
+    assert!(after < STOP_WAIT + Duration::from_millis(500), "{after:?}");
+    assert_eq!(live, base + 1);
+    assert!(wait_until(|| dropped.lock().unwrap().is_some()));
+    assert_eq!(dropped.lock().unwrap().as_deref(), Some("skin-import"));
+    assert!(wait_until(|| vm_hooks::live() == base));
+}
+
+/// An outcome already received does not end the wait for the thread: held
+/// after its send past the stop bound, the job is abandoned at the bound.
+#[test]
+fn a_received_outcome_still_waits_within_the_stop_bound() {
+    let _serial = serial();
+    hold_exit(true);
+    let (stop, rx) = started(|_: &Cancel| 7_u32);
+    assert!(wait_until(|| exit_waiting() == 1));
+    assert!(rx.recv_timeout(Duration::from_millis(300)).is_err());
+    let stopped = Instant::now();
+    stop.store(true, Ordering::SeqCst);
+    let ran = rx.recv_timeout(STOP_WAIT + Duration::from_secs(5));
+    let after = stopped.elapsed();
+    hold_exit(false);
+    assert!(matches!(ran, Ok(Ran::Abandoned)), "{ran:?}");
+    assert!(
+        after >= STOP_WAIT && after < STOP_WAIT + Duration::from_millis(500),
+        "{after:?}"
+    );
+    // Released, an unstopped job's outcome comes once its thread ends.
+    let (_stop, rx) = started(|_: &Cancel| 7_u32);
+    assert!(matches!(rx.recv_timeout(STOP_WAIT), Ok(Ran::Done(7))));
+}
+
+/// A panic in the job is a refusal received from its thread; a thread
+/// that ends without sending (its panic's payload panicking as it is
+/// dropped) is another.
+#[test]
+fn a_panic_and_a_silent_end_are_told_apart() {
+    struct Bomb;
+    impl Drop for Bomb {
+        fn drop(&mut self) {
+            panic!("the payload's drop panics");
+        }
+    }
+    let _serial = serial();
+    let (_stop, rx) = started(|_: &Cancel| -> u32 { panic!("the job panics") });
+    match rx.recv_timeout(STOP_WAIT).unwrap() {
+        Ran::Refused(why) => assert_eq!(why, PANICKED),
+        other => panic!("{other:?}"),
+    }
+    let (_stop, rx) = started(|_: &Cancel| -> u32 { std::panic::panic_any(Bomb) });
+    match rx.recv_timeout(STOP_WAIT).unwrap() {
+        Ran::Refused(why) => assert_eq!(why, ENDED),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// A logger that keeps each record's message.
+#[derive(Default)]
+struct Kept(Mutex<Vec<String>>);
+
+impl log::Log for Kept {
+    fn enabled(&self, _: &log::Metadata<'_>) -> bool {
+        true
+    }
+
+    fn log(&self, record: &log::Record<'_>) {
+        assert_eq!(record.target(), "tapestry");
+        self.0.lock().unwrap().push(record.args().to_string());
+    }
+
+    fn flush(&self) {}
+}
+
+/// An installed skin's log: its summary line with its files, choices,
+/// counters, its atlas's texels and the committed total against the
+/// shared limit; then at most 100 notes, located, and a count of the rest
+/// with the ones the import kept only as a count.
+#[test]
+fn an_installed_skin_logs_its_summary_and_notes() {
+    let r = crate::render_common::offscreen(1_920, 1_080);
+    let dir = options_skin();
+    let mut c = choice(dir.path(), "s.json");
+    c.files.insert("Background".into(), "b.png".into());
+    let (b, mut summary) = bundled(play(&c, &target(&r)));
+    let note = Note {
+        at: Some(NoteLoc {
+            source: 0,
+            line: 3,
+            col: 7,
+        }),
+        severity: Severity::Ignored,
+        kind: NoteKind::MissingAsset,
+    };
+    summary.notes = vec![note; 150];
+    summary.suppressed = 2;
+    let kept = Kept::default();
+    let texels = b.atlas_texels();
+    log_installed(ScreenKind::Play, &summary, texels, texels + 5, &kept);
+    let logged = kept.0.into_inner().unwrap();
+    assert_eq!(logged.len(), 1 + 100 + 1, "{logged:?}");
+    let head = &logged[0];
+    assert!(
+        head.starts_with("skin: play: installed; files s.json; "),
+        "{head}"
+    );
+    assert!(
+        head.contains("choices Background = b.png (Configured)"),
+        "{head}"
+    );
+    assert!(
+        head.ends_with(&format!(
+            "atlas {texels} texels, committed {} of {} texels",
+            texels + 5,
+            render::SHARED_TEXELS
+        )),
+        "{head}"
+    );
+    assert_eq!(
+        logged[1],
+        format!(
+            "skin: play: s.json:3:7: Ignored: {}",
+            NoteKind::MissingAsset
+        )
+    );
+    assert_eq!(
+        logged[101],
+        "skin: play: 50 more notes not logged (150 kept), 2 more not kept"
+    );
+    // Within the cap and none suppressed: no count.
+    summary.notes.truncate(2);
+    summary.suppressed = 0;
+    let kept = Kept::default();
+    log_installed(ScreenKind::Play, &summary, texels, texels, &kept);
+    assert_eq!(kept.0.into_inner().unwrap().len(), 3);
+}
+
+/// The reports' text: each kind's line, a non-play kind's notice, and an
+/// admission refusal reaching play's notice as its text only.
+#[test]
+fn the_reports_carry_text_only() {
+    assert_eq!(
+        line(ScreenKind::Play, &Shown::Installed),
+        "skin: play: installed"
+    );
+    assert_eq!(
+        line(ScreenKind::Result, &Shown::BuiltIn("why".into())),
+        "skin: result: built-in: why"
+    );
+    assert_eq!(
+        line(ScreenKind::Decision, &Shown::Refused("why".into())),
+        "skin: decision: refused: why"
+    );
+    assert_eq!(
+        notice(ScreenKind::Result, "why"),
+        "リザルトのスキンは使えません（内蔵画面）: why"
+    );
+    let admission = render::RenderError::Admission {
+        kind: ScreenKind::Play,
+        needed: render::SHARED_TEXELS + 1,
+        limit: render::SHARED_TEXELS,
+    };
+    let reason = Chain(&admission).to_string();
+    let state =
+        crate::render_side::SkinState::answered(Ok(crate::render_side::refusal(reason.clone())));
+    let crate::render_side::SkinState::Refused(shown) = state else {
+        panic!("{state:?}");
+    };
+    assert_eq!(shown, format!("スキンを使えません: {reason}"));
+}

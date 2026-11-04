@@ -55,6 +55,8 @@ pub mod survey;
 pub(crate) mod syntax;
 #[cfg(test)]
 pub(crate) mod tests;
+#[cfg(feature = "dev-tools")]
+pub mod vm_hooks;
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;

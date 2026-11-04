@@ -1494,7 +1494,7 @@ impl Drop for PendingSelect {
 
 /// How long the game thread waits for a selection's answer at each look:
 /// the menus, quit and cancellation are served between looks.
-const SELECT_SLICE: Duration = Duration::from_millis(1);
+pub(crate) const SELECT_SLICE: Duration = Duration::from_millis(1);
 
 /// The play skin's installation as the game thread sees it: a chart is
 /// admitted (chosen to play, or a practice Start) only once the skin it
@@ -1541,24 +1541,31 @@ impl SkinState {
             let Some(answer) = pending.poll(SELECT_SLICE) else {
                 return Err("スキンを準備しています".to_owned());
             };
-            *self = match answer {
-                Ok(Preparation::Ready) => Self::Ready,
-                Ok(Preparation::Refused(why)) => {
-                    eprintln!("render: the play skin was refused: {why}");
-                    Self::Refused(format!("スキンを使えません: {why}"))
-                }
-                Ok(Preparation::Cancelled) => {
-                    Self::Refused("スキンの準備は取り消されました".to_owned())
-                }
-                Err(e) => {
-                    eprintln!("render: the play skin cannot be installed: {}", Chain(&e));
-                    Self::Refused(format!("スキンを準備できません: {}", Chain(&e)))
-                }
-            };
+            *self = Self::answered(answer);
         }
         match self {
             Self::Refused(notice) => Err(notice.clone()),
             Self::Ready | Self::Selecting(_) => Ok(()),
+        }
+    }
+
+    /// The state a play skin's selection leaves once `answer` came: ready,
+    /// or refused with the notice, the render thread's reason carried as
+    /// text only.
+    pub fn answered(answer: Result<Preparation, ScreenError>) -> Self {
+        match answer {
+            Ok(Preparation::Ready) => Self::Ready,
+            Ok(Preparation::Refused(why)) => {
+                eprintln!("render: the play skin was refused: {why}");
+                Self::Refused(format!("スキンを使えません: {why}"))
+            }
+            Ok(Preparation::Cancelled) => {
+                Self::Refused("スキンの準備は取り消されました".to_owned())
+            }
+            Err(e) => {
+                eprintln!("render: the play skin cannot be installed: {}", Chain(&e));
+                Self::Refused(format!("スキンを準備できません: {}", Chain(&e)))
+            }
         }
     }
 }
