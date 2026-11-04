@@ -525,9 +525,16 @@ mod tests {
     }
 
     #[test]
-    fn cover_switches_read_the_stored_settings() {
+    fn cover_switches_and_bpm_change_conditions_map() {
         let none = BTreeMap::new();
         for (id, name, src, d4) in [
+            (
+                176,
+                "chart_no_bpmchange",
+                "bpm.change_valid && !bpm.change",
+                true,
+            ),
+            (177, "chart_bpmchange", "bpm.change", true),
             (270, "lanecover1_changing", "cover.adjusting", false),
             (271, "lanecover1_on", "cover.enabled", false),
             (272, "lift1_on", "lift.enabled", false),
@@ -543,22 +550,6 @@ mod tests {
             // The built-ins win over items declared with their numbers.
             let items = BTreeMap::from([(id, false)]);
             assert_eq!(numeric(id, &items), expr(src, d4));
-        }
-    }
-
-    #[test]
-    fn bpm_change_conditions_read_the_charts_fact() {
-        let none = BTreeMap::new();
-        for (id, name, src) in [
-            (176, "chart_no_bpmchange", "bpm.change_valid && !bpm.change"),
-            (177, "chart_bpmchange", "bpm.change"),
-        ] {
-            assert_eq!(numeric(id, &none), expr(src, true));
-            assert_eq!(numeric(-id, &none), expr(&format!("!({src})"), true));
-            assert_eq!(named(name), Some(expr(src, true)));
-            // The built-ins win over items declared with their numbers.
-            let items = BTreeMap::from([(id, false)]);
-            assert_eq!(numeric(id, &items), expr(src, true));
         }
     }
 
