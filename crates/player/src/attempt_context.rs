@@ -240,5 +240,7 @@ mod tests {
         assert_eq!(range, None, "past the readouts' maximum");
         let (change, _) = context(3_000_000_000_000, 4_000_000_000_000);
         assert_eq!(change, Some(false), "both saturate");
+        let (change, _) = context(2_147_483_646_000, 2_147_483_647_000);
+        assert_eq!(change, Some(true), "the last whole BPM below saturation");
     }
 }
