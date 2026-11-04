@@ -230,17 +230,17 @@ fn an_unavailable_fact_refuses_at_the_read() {
     );
 }
 
-/// The ways a skin can call `call` under protection: `pcall` of the
-/// host function itself and of a closure, and `xpcall` with a handler
-/// that returns the error, each on the body's second line. That no skin
-/// code runs after the call is shown with a witness only the crate's own
-/// tests have (`lua::tests`).
-fn protected(call: &str) -> [String; 3] {
+/// The ways a skin can call `main_state.<api>` with `call` under
+/// protection: `pcall` of the host function itself and of a closure, and
+/// `xpcall` with a handler that returns the error, each on the body's
+/// second line. That no skin code runs after the call is shown with a
+/// witness only the crate's own tests have (`lua::tests`).
+fn protected(api: &str, call: &str) -> [String; 3] {
     [
-        format!("local a = 1\npcall(ms.option, {call})"),
-        format!("local a = 1\npcall(function() return ms.option({call}) end)"),
+        format!("local a = 1\npcall(ms.{api}, {call})"),
+        format!("local a = 1\npcall(function() return ms.{api}({call}) end)"),
         format!(
-            "local a = 1\nxpcall(function() return ms.option({call}) end, function(e) return e end)"
+            "local a = 1\nxpcall(function() return ms.{api}({call}) end, function(e) return e end)"
         ),
     ]
 }
@@ -250,7 +250,7 @@ fn protected_calls_do_not_catch_a_fact_refusal_or_a_pending_read() {
     let line = BODY_LINE + 1;
     let at = |why| (why, "s.luaskin".to_owned(), line);
     let known = play(Fact::Known(true), Fact::Known(Some(ChartRank::Rank(2))));
-    for body in protected("33") {
+    for body in protected("option", "33") {
         let facts = play(Fact::Unavailable, Fact::Unavailable);
         assert_eq!(
             located(import(&folder(&body), &facts)),
@@ -258,14 +258,14 @@ fn protected_calls_do_not_catch_a_fact_refusal_or_a_pending_read() {
             "{body}"
         );
     }
-    for body in protected("33.0") {
+    for body in protected("option", "33.0") {
         assert_eq!(
             located(import(&folder(&body), &known)),
             at(LuaWhy::FactArgument),
             "{body}"
         );
     }
-    for body in protected("182") {
+    for body in protected("option", "182") {
         let p = pending(import(
             &folder(&body),
             &ImportFacts::base(ScreenKind::Play, Fact::Known(true)),
@@ -301,7 +301,7 @@ fn an_integer_outside_i32_refuses() {
             (LuaWhy::FactArgument, "s.luaskin".to_owned(), BODY_LINE + 1),
             "{arg}"
         );
-        for body in protected(arg) {
+        for body in protected("option", arg) {
             assert_eq!(
                 located(import(&folder(&body), &known)),
                 (LuaWhy::FactArgument, "s.luaskin".to_owned(), BODY_LINE + 1),
@@ -498,20 +498,11 @@ fn a_base_import_stops_pending_at_the_play_level() {
 fn protected_calls_do_not_catch_a_play_level_refusal_or_a_pending_read() {
     let line = BODY_LINE + 1;
     let at = |why| (why, "s.luaskin".to_owned(), line);
-    let forms = |api: &str, call: &str| {
-        [
-            format!("local a = 1\npcall(ms.{api}, {call})"),
-            format!("local a = 1\npcall(function() return ms.{api}({call}) end)"),
-            format!(
-                "local a = 1\nxpcall(function() return ms.{api}({call}) end, function(e) return e end)"
-            ),
-        ]
-    };
     let unavailable = LuaWhy::Unavailable {
         api: NUMBER,
         id: 96,
     };
-    for body in forms("number", "96") {
+    for body in protected("number", "96") {
         let d = folder(&body);
         let facts = leveled(Fact::Unavailable);
         assert_eq!(located(import(&d, &facts)), at(unavailable), "{body}");
@@ -528,7 +519,7 @@ fn protected_calls_do_not_catch_a_play_level_refusal_or_a_pending_read() {
         ("text", "\"1003\"", LuaWhy::FactArgument),
         ("text", "12", LuaWhy::LiveState { api: TEXT }),
     ] {
-        for body in forms(api, call) {
+        for body in protected(api, call) {
             let d = folder(&body);
             assert_eq!(
                 located(import(&d, &leveled(Fact::Known(12)))),
