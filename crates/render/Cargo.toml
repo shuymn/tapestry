@@ -56,3 +56,7 @@ workspace = true
 [[bench]]
 name = "skin"
 harness = false
+
+[[bench]]
+name = "outline_text"
+harness = false
