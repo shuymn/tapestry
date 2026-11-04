@@ -994,7 +994,7 @@ impl Rig for PlayerRig<'_> {
         // The render thread's staging and upload of the specialization,
         // apart from the job's time.
         if specialized {
-            crate::imports::log_staged(staging.elapsed());
+            crate::imports::log_staged(staging.elapsed(), &prepared);
         }
         #[cfg(feature = "dev-tools")]
         crate::dev::print_adjustments("preparing", self.adjust.as_ref());
