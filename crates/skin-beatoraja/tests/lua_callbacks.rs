@@ -50,7 +50,7 @@ fn import(d: &TempDir, fc: i32) -> Result<LuaImported, ImportError> {
         options: vec![Some(fc)],
         ..Config::default()
     };
-    h.import(&config, &cancel)
+    common::lua_play(&h, &config, &cancel)
 }
 
 /// How many callables ended each way: lowered, replaced, refused,

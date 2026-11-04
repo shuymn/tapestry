@@ -361,6 +361,8 @@ pub(super) fn vm(pass: &Rc<Pass>) -> mlua::Result<Lua> {
         lua.set_named_registry_value(TAG_READERS, readers)?;
         lua.set_named_registry_value(TAGGER, tagger)?;
     }
+    #[cfg(test)]
+    super::tests::install_continued(&lua, &env)?;
     env.raw_set("require", loader::require(&lua, pass)?)?;
     env.raw_set("dofile", loader::dofile(&lua, pass)?)?;
     env.raw_set("_G", env.clone())?;

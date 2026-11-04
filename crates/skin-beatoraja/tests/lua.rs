@@ -291,7 +291,11 @@ fn the_instruction_limit_counts_both_passes() {
     let h = header(&halves).unwrap();
     assert!(h.usage().instructions >= 6_000_000, "{:?}", h.usage());
     assert_eq!(
-        why(h.import(&Config::defaults(h.header()), &Cancel::new())),
+        why(common::lua_play(
+            &h,
+            &Config::defaults(h.header()),
+            &Cancel::new()
+        )),
         LuaWhy::Limit(LuaLimit::Instructions)
     );
 }
@@ -1037,7 +1041,7 @@ fn cancellation_refuses_both_passes() {
     );
     let h = header(&d).unwrap();
     assert_eq!(
-        why(h.import(&Config::defaults(h.header()), &cancel)),
+        why(common::lua_play(&h, &Config::defaults(h.header()), &cancel)),
         LuaWhy::Cancelled
     );
 }
@@ -1078,9 +1082,11 @@ fn results_and_errors_cross_threads() {
         .join()
         .unwrap()
         .unwrap();
-    let r = std::thread::spawn(move || h.import(&Config::defaults(h.header()), &Cancel::new()))
-        .join()
-        .unwrap();
+    let r = std::thread::spawn(move || {
+        common::lua_play(&h, &Config::defaults(h.header()), &Cancel::new())
+    })
+    .join()
+    .unwrap();
     assert_eq!(r.unwrap().imported.report.usage.elements, 1);
 }
 
@@ -1310,13 +1316,12 @@ fn the_passes_diverge_on_skin_config_and_share_nothing() {
     assert_eq!(h.header().options.len(), 1);
     // The header pass ran without `skin_config`; the configured pass saw
     // the default item, then the configured one.
-    h.import(&Config::defaults(h.header()), &Cancel::new())
-        .unwrap();
+    common::lua_play(&h, &Config::defaults(h.header()), &Cancel::new()).unwrap();
     let other = Config {
         options: vec![Some(900)],
         ..Config::default()
     };
-    let (w, _, line) = located(h.import(&other, &Cancel::new()));
+    let (w, _, line) = located(common::lua_play(&h, &other, &Cancel::new()));
     assert_eq!((w, line), (LuaWhy::Error, 7));
 }
 
@@ -1363,8 +1368,8 @@ fn skin_config_follows_the_header_and_its_writes_stay_in_the_pass() {
     let kept = config.clone();
     // Each configured pass starts from the host's values again: the
     // second would fail its first assertions after the first's writes.
-    h.import(&config, &Cancel::new()).unwrap();
-    h.import(&config, &Cancel::new()).unwrap();
+    common::lua_play(&h, &config, &Cancel::new()).unwrap();
+    common::lua_play(&h, &config, &Cancel::new()).unwrap();
     assert_eq!(config, kept);
 }
 
@@ -1402,7 +1407,7 @@ fn a_skin_joins_a_choice_s_folder_and_its_file_path() {
     let mut config = Config::defaults(h.header());
     config.files.insert("Judge".into(), "b.png".into());
     config.files.insert("Frame".into(), "y".into());
-    let r = h.import(&config, &Cancel::new()).unwrap();
+    let r = common::lua_play(&h, &config, &Cancel::new()).unwrap();
     for part in ["custom/judge/b.lua", "custom/frame/y/f.lua"] {
         assert!(r.dependencies.iter().any(|d| d == part), "{part}");
     }
@@ -1433,7 +1438,7 @@ fn a_path_in_file_path_reaches_only_the_skin_folder() {
     for path in ["../b.png", "custom/b.png", "custom/judge/a.png"] {
         let mut config = Config::defaults(h.header());
         config.files.insert("Judge".into(), path.into());
-        h.import(&config, &Cancel::new()).unwrap();
+        common::lua_play(&h, &config, &Cancel::new()).unwrap();
     }
     // A path the skin writes in is resolved and loaded in the folder.
     let written = d("skin_config.file_path.Judge = \"../../../x.lua\"\n\
@@ -1473,7 +1478,11 @@ fn host_modules_hold_the_pinned_names_and_refuse_calls() {
             ),
         )]);
         let h = header(&d).unwrap();
-        let w = why(h.import(&Config::defaults(h.header()), &Cancel::new()));
+        let w = why(common::lua_play(
+            &h,
+            &Config::defaults(h.header()),
+            &Cancel::new(),
+        ));
         assert_eq!(
             w,
             LuaWhy::LiveState {
@@ -1482,8 +1491,7 @@ fn host_modules_hold_the_pinned_names_and_refuse_calls() {
             "{module}.{api}"
         );
     }
-    h.import(&Config::defaults(h.header()), &Cancel::new())
-        .unwrap();
+    common::lua_play(&h, &Config::defaults(h.header()), &Cancel::new()).unwrap();
 }
 
 #[test]
@@ -1595,7 +1603,11 @@ fn the_header_pass_refuses_a_function_only_where_it_reads() {
     ] {
         let d = folder(&[("s.luaskin", &format!("return {{ type = 0, {fields} }}"))]);
         let h = header(&d).unwrap_or_else(|e| panic!("{fields}: {e:?}"));
-        let (w, file, line) = located(h.import(&Config::defaults(h.header()), &Cancel::new()));
+        let (w, file, line) = located(common::lua_play(
+            &h,
+            &Config::defaults(h.header()),
+            &Cancel::new(),
+        ));
         assert!(matches!(w, LuaWhy::Effect(_)), "{fields}: {w:?}");
         assert_eq!((file.as_str(), line), ("s.luaskin", 2), "{fields}");
     }
@@ -1694,7 +1706,11 @@ fn json_included_by_a_lua_skin_is_charged_to_the_candidate() {
     let h = header(&big).unwrap();
     assert!(h.usage().input_bytes >= 15 << 20, "{:?}", h.usage());
     assert_eq!(
-        input(h.import(&Config::defaults(h.header()), &Cancel::new())),
+        input(common::lua_play(
+            &h,
+            &Config::defaults(h.header()),
+            &Cancel::new()
+        )),
         InputLimit::InputBytes
     );
 }
@@ -1714,7 +1730,11 @@ fn json_included_by_a_lua_skin_shares_the_load_allowance() {
     let h = header(&d).unwrap();
     assert_eq!(h.usage().loads, 600);
     assert_eq!(
-        input(h.import(&Config::defaults(h.header()), &Cancel::new())),
+        input(common::lua_play(
+            &h,
+            &Config::defaults(h.header()),
+            &Cancel::new()
+        )),
         InputLimit::IncludeParses
     );
 }
@@ -1732,8 +1752,7 @@ fn json_included_by_a_lua_skin_is_read_once_for_both_passes() {
     ]);
     let h = header(&d).unwrap();
     std::fs::write(d.path().join("p.json"), "[{").unwrap();
-    h.import(&Config::defaults(h.header()), &Cancel::new())
-        .unwrap();
+    common::lua_play(&h, &Config::defaults(h.header()), &Cancel::new()).unwrap();
 }
 
 #[test]

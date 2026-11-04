@@ -74,7 +74,7 @@ fn run_with(
         std::fs::write(d.path().join(name), text).unwrap();
     }
     let h = read_lua_header(d.path(), "s.luaskin", cancel)?;
-    h.import(&Config::defaults(h.header()), cancel)
+    super::tests::play(&h, &Config::defaults(h.header()), cancel)
 }
 
 /// Imports `entry` and checks that copying its captures made no host
@@ -366,7 +366,11 @@ fn classification_sees_cancellation() {
     let remote = cancel.clone();
     super::tests::at_converted(move || remote.cancel());
     assert_eq!(
-        why(h.import(&Config::defaults(h.header()), &cancel)),
+        why(super::tests::play(
+            &h,
+            &Config::defaults(h.header()),
+            &cancel
+        )),
         LuaWhy::Cancelled
     );
 }
@@ -413,7 +417,8 @@ fn option_tables_are_interned_once_a_pass() {
     let d = folder(&options_entry(600, 6_000, 100, true));
     let cancel = Cancel::new();
     let h = read_lua_header(d.path(), "s.luaskin", &cancel).unwrap();
-    let (def, _, _) = h.configured(&Config::defaults(h.header()), &cancel);
+    let facts = super::facts::ImportFacts::unavailable(super::facts::Scene::Play);
+    let (def, _, _, _) = h.configured(&Config::defaults(h.header()), &facts, &cancel);
     let def = def.unwrap();
     let an = def
         .arena
@@ -757,4 +762,85 @@ fn lowered_callbacks_agree_with_the_closures_they_come_from() {
         }
     }
     assert_eq!(checked, 6 * 6 * 6 * 6);
+}
+
+type Captures = Vec<super::callback::Captured>;
+type Lowerings = Result<(Vec<super::Disposition>, Vec<String>), ImportError>;
+
+/// The configured pass of `entry` against `facts`: its captured values,
+/// then the import's callbacks and the sources it lowered, or its
+/// refusal.
+fn with_facts(entry: &str, facts: &super::facts::ImportFacts) -> (Captures, Lowerings) {
+    let d = folder(entry);
+    let cancel = Cancel::new();
+    let h = read_lua_header(d.path(), "s.luaskin", &cancel).unwrap();
+    let config = Config::defaults(h.header());
+    let (def, counts, store, reads) = h.configured(&config, facts, &cancel);
+    let def = def.unwrap();
+    let an = def.arena.lua.as_deref().and_then(|l| l.analysis.as_deref());
+    let captured = an.unwrap().captured.clone();
+    LOWERED.with(|l| l.borrow_mut().clear());
+    let o = h.finish(Ok(def), counts, store, reads, &config);
+    let r = match o.result {
+        Ok(_) => Ok((o.callbacks, LOWERED.with(|l| l.borrow().clone()))),
+        Err(super::ledger::Stop::Fault(e)) => Err(e),
+        Err(super::ledger::Stop::Pending(p)) => panic!("{p:?}"),
+    };
+    (captured, r)
+}
+
+/// A play snapshot with every fact known.
+fn known() -> super::facts::ImportFacts {
+    use super::facts::{ChartRank, Fact, ImportFacts, Scene};
+    ImportFacts {
+        scene: Scene::Play,
+        autoplay: Fact::Known(true),
+        chart_rank: Fact::Known(Some(ChartRank::Rank(2))),
+    }
+}
+
+#[test]
+fn a_callback_keeps_the_option_host_and_lowers_a_supported_option() {
+    use super::callback::Captured;
+    // A closure holding `main_state.option` captures the host function by
+    // identity (no conversion takes it as a value: the callback refuses).
+    let entry = skin(
+        "local option = ms.option",
+        &image("function() local f = option return true end"),
+    );
+    let (captured, _) = with_facts(&entry, &known());
+    assert!(captured.contains(&Captured::Host(0)), "{captured:?}");
+    // A read of a supported option lowers to its expression.
+    let entry = skin("", &image("function() return ms.option(271) end"));
+    let (_, r) = with_facts(&entry, &known());
+    let (callbacks, sources) = r.unwrap();
+    assert_eq!(callbacks, [super::Disposition::Lowered]);
+    let [src] = sources.as_slice() else {
+        panic!("{sources:?}")
+    };
+    let program = compile(src, &Scope::new(&PLAY), Ty::Bool).unwrap();
+    let (slot, _) = PLAY.field("cover.enabled").unwrap();
+    let timers = vec![-1_i32; PLAY.timers.len()];
+    for on in [false, true] {
+        let mut fields = vec![0_i32; PLAY.fields.len()];
+        fields[usize::from(slot)] = i32::from(on);
+        let state = State {
+            fields: &fields,
+            timers: &timers,
+        };
+        assert_eq!(program.eval_bool(&state), on);
+    }
+}
+
+#[test]
+fn a_callback_s_fact_read_is_not_folded() {
+    let entry = skin("", &image("function() return ms.option(33) end"));
+    let unmapped = super::Disposition::Replaced(Unsupported::Unmapped { api: 0, id: 33 });
+    let unavailable = super::facts::ImportFacts::unavailable(super::facts::Scene::Play);
+    for facts in [unavailable, known()] {
+        let (_, r) = with_facts(&entry, &facts);
+        let (callbacks, sources) = r.unwrap();
+        assert_eq!(callbacks, [unmapped], "{facts:?}");
+        assert!(sources.is_empty(), "{sources:?}");
+    }
 }

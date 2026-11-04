@@ -21,8 +21,8 @@ use std::time::Duration;
 
 use common::{png, write};
 use criterion::{Criterion, criterion_group, criterion_main};
-use skin_beatoraja::lua::Timings;
-use skin_beatoraja::{Cancel, Config, read_lua_header};
+use skin_beatoraja::lua::{LuaTimed, Timings};
+use skin_beatoraja::{Cancel, Config, ImportFacts, Scene, read_lua_header};
 
 fn typical(root: &Path) {
     png(root, "a.png", 64, 64);
@@ -66,10 +66,14 @@ fn stage(c: &mut Criterion, name: &str, root: &Path, pick: fn(&Timings) -> Durat
     let cancel = Cancel::new();
     let h = read_lua_header(root, "s.luaskin", &cancel).expect("the header pass runs");
     let config = Config::defaults(h.header());
+    let facts = ImportFacts::unavailable(Scene::Play);
     c.bench_function(name, |b| {
         b.iter_custom(|iters| {
             (0..iters)
-                .map(|_| pick(&h.timed(&config, &cancel).expect("the skin imports")))
+                .map(|_| match h.timed(&config, &facts, &cancel) {
+                    Ok(LuaTimed::Imported(t)) => pick(&t),
+                    other => panic!("the skin does not import: {other:?}"),
+                })
                 .sum()
         });
     });

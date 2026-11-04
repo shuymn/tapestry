@@ -12,6 +12,20 @@ use super::{Cancel, LuaHeader, LuaLimit, LuaWhy, read_lua_header};
 use crate::error::ImportError;
 use crate::import::Config;
 
+/// The configured pass of `h` with `config` on a play scene whose import
+/// facts are all unavailable, which never ends pending.
+pub(crate) fn play(
+    h: &LuaHeader,
+    config: &Config,
+    cancel: &Cancel,
+) -> Result<super::LuaImported, ImportError> {
+    let facts = super::facts::ImportFacts::unavailable(super::facts::Scene::Play);
+    match h.import(config, &facts, cancel)? {
+        super::LuaOutcome::Imported(i) => Ok(i),
+        super::LuaOutcome::Pending(p) => panic!("pending with no pending fact: {p:?}"),
+    }
+}
+
 /// What a test does at a point of the import.
 type Action = Box<dyn Fn()>;
 
@@ -33,6 +47,23 @@ thread_local! {
 
 thread_local! {
     static AT_EXPANSION: RefCell<Option<Action>> = RefCell::new(None);
+    /// Whether a VM built now gets `continued`, and how often a skin
+    /// called it: a witness that is no host function, so the ledger
+    /// neither charges nor refuses it.
+    static CONTINUED_ON: Cell<bool> = const { Cell::new(false) };
+    static CONTINUED: Cell<u32> = const { Cell::new(0) };
+}
+
+/// Gives the skin the global `continued` when a test asked for it.
+pub(crate) fn install_continued(lua: &mlua::Lua, env: &mlua::Table) -> mlua::Result<()> {
+    if CONTINUED_ON.with(Cell::get) {
+        let f = lua.create_function(|_, ()| {
+            CONTINUED.with(|n| n.set(n.get() + 1));
+            Ok(())
+        })?;
+        env.raw_set("continued", f)?;
+    }
+    Ok(())
 }
 
 thread_local! {
@@ -202,13 +233,11 @@ fn every_pass_drops_its_vm_on_every_outcome() {
     let ok = folder("return { type = 0 }");
     let h = header(ok.path(), &Cancel::new()).unwrap();
     assert_eq!(live(), 0);
-    h.import(&Config::defaults(h.header()), &Cancel::new())
-        .unwrap();
+    super::tests::play(&h, &Config::defaults(h.header()), &Cancel::new()).unwrap();
     assert_eq!(live(), 0);
     let fails = folder("if skin_config then error(\"x\") end\nreturn { type = 0 }");
     let h = header(fails.path(), &Cancel::new()).unwrap();
-    h.import(&Config::defaults(h.header()), &Cancel::new())
-        .unwrap_err();
+    super::tests::play(&h, &Config::defaults(h.header()), &Cancel::new()).unwrap_err();
     assert_eq!(live(), 0);
     for entry in [
         "while true do end",
@@ -233,8 +262,8 @@ fn the_instruction_hook_covers_a_thread_the_host_creates() {
     let f = lua.load("while true do end").into_function().unwrap();
     let thread = lua.create_thread(f).unwrap();
     assert!(thread.resume::<()>(()).is_err());
-    match pass.ledger.take_fault() {
-        Some(ImportError::Lua { why, .. }) => {
+    match pass.ledger.take_stop() {
+        Some(super::ledger::Stop::Fault(ImportError::Lua { why, .. })) => {
             assert_eq!(why, LuaWhy::Limit(LuaLimit::Instructions));
         }
         other => panic!("{other:?}"),
@@ -272,9 +301,62 @@ fn the_time_cap_spans_both_passes() {
     let mut h = header(d.path(), &Cancel::new()).unwrap();
     h.spent = MAX_LUA_TIME - Duration::from_millis(300);
     let start = Instant::now();
-    let r = h.import(&Config::defaults(h.header()), &Cancel::new());
+    let r = super::tests::play(&h, &Config::defaults(h.header()), &Cancel::new());
     let took = start.elapsed();
     // Without the carried time it would run its own 5 s.
     assert_eq!(why(r), LuaWhy::Limit(LuaLimit::Time));
     assert!(took < Duration::from_secs(3), "{took:?}");
+}
+
+/// Imports a play skin whose configured pass runs `body` against
+/// `facts` with the witness `continued` present, and returns the outcome
+/// and how often the skin called the witness.
+fn continued(
+    body: &str,
+    facts: &super::facts::ImportFacts,
+) -> (Result<super::LuaOutcome, ImportError>, u32) {
+    let d = folder(&format!(
+        "if not skin_config then return {{ type = 0 }} end\n\
+         local ms = require(\"main_state\")\n\
+         {body}\n\
+         return {{ type = 0 }}"
+    ));
+    let h = header(d.path(), &Cancel::new()).unwrap();
+    CONTINUED_ON.with(|on| on.set(true));
+    CONTINUED.with(|n| n.set(0));
+    let r = h.import(&Config::defaults(h.header()), facts, &Cancel::new());
+    CONTINUED_ON.with(|on| on.set(false));
+    (r, CONTINUED.with(Cell::get))
+}
+
+#[test]
+fn no_skin_code_runs_after_a_fact_stop_inside_a_protected_call() {
+    use super::facts::{ChartRank, Fact, ImportFacts, Scene};
+    let unavailable = ImportFacts::unavailable(Scene::Play);
+    let base = ImportFacts::base(Scene::Play, Fact::Known(true));
+    let known = ImportFacts {
+        chart_rank: Fact::Known(Some(ChartRank::Rank(2))),
+        ..base
+    };
+    // The witness sees a skin go on after an error a protected call
+    // catches.
+    let (r, n) = continued("pcall(error, \"x\")\ncontinued()", &unavailable);
+    assert!(matches!(r, Ok(super::LuaOutcome::Imported(_))), "{r:?}");
+    assert_eq!(n, 1);
+    for (call, facts) in [("33", unavailable), ("33.0", known), ("182", base)] {
+        for wrap in [
+            format!("pcall(ms.option, {call})"),
+            format!("pcall(function() return ms.option({call}) end)"),
+            format!(
+                "xpcall(function() return ms.option({call}) end, function(e) continued() return e end)"
+            ),
+        ] {
+            let (r, n) = continued(&format!("{wrap}\ncontinued()"), &facts);
+            match (call, &r) {
+                ("182", Ok(super::LuaOutcome::Pending(_))) | (_, Err(_)) => {}
+                _ => panic!("{wrap}: {r:?}"),
+            }
+            assert_eq!(n, 0, "{wrap}");
+        }
+    }
 }

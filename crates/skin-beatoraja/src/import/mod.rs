@@ -16,7 +16,7 @@ mod budget;
 pub(crate) mod callback;
 pub(crate) mod geom;
 mod object;
-mod ops;
+pub(crate) mod ops;
 mod policy;
 mod property;
 mod report;
