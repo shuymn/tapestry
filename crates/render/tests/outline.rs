@@ -487,12 +487,15 @@ fn cleared_loading_slots_release_their_lines() {
 /// A replaced loading slot lets go of its old line, and only that slot:
 /// with the loading lines filling the layer, the title's text replaced by
 /// another installed, an attempt under pressure evicts the old title's
-/// line and never the artist's or the new title's, both still drawn.
+/// line and never the artist's or the new title's: the loading frame draws
+/// as before the attempt, and both lines are hits when asked again,
+/// nothing laid out.
 #[test]
 fn replaced_loading_slots_release_their_lines() {
     let dir = step_skin();
     let mut r = offscreen(1_920, 1_080);
-    let b = outline_support::bundle_in(&r, dir.path(), &default_font());
+    let menu = MenuText::new(&r);
+    let (b, c) = counted(&r, dir.path());
     common::install(&mut r, &b, 1);
     r.enter_loading(1);
     prepare_loading(&mut r, 1, &labels("A", "B"));
@@ -502,7 +505,16 @@ fn replaced_loading_slots_release_their_lines() {
         .unwrap();
     assert_eq!(r.text_report().counts.evictions, 0);
     assert_eq!(r.install_staged_loading_text(), Ok(true));
+    let drawn = loading_frame(&mut r, &menu);
+    assert!(lit(&drawn).is_some());
+
     stage(&mut r, &b, &labels("D", "E"), 2);
     let counts = r.text_report().counts;
     assert_eq!(counts.evictions, 1, "{counts:?}");
+    assert_eq!(loading_frame(&mut r, &menu), drawn);
+    let layouts = c.layouts.load(Ordering::SeqCst);
+    prepare_loading(&mut r, 3, &labels("C", "B"));
+    let counts = r.text_report().counts;
+    assert_eq!((counts.hits, counts.placements), (2, 0), "{counts:?}");
+    assert_eq!(c.layouts.load(Ordering::SeqCst), layouts);
 }

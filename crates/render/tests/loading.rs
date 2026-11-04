@@ -786,9 +786,18 @@ fn loading_text_holders_are_witnessed() {
     install(&mut r, &a, 1);
     r.enter_loading(1);
     let title = TextSlots::field(TextField::Title);
+    // No title: no line, an empty holder.
+    r.prepare_loading_text(1, 1, title, &chosen("", "", ""))
+        .unwrap();
+    let empty = r.memory().staged_text;
     r.prepare_loading_text(1, 1, title, &chosen("B", "", ""))
         .unwrap();
     let short = r.memory().staged_text;
+    // Two held lines (the title and the full title): their strings, 4
+    // bytes, and the list's own storage, each element holding two keys
+    // with a string header each.
+    let headers = 2 * 2 * size_of::<String>();
+    assert!(short - empty >= 4 + headers as u64, "{empty} {short}");
     r.prepare_loading_text(1, 2, title, &chosen("BBBB", "", ""))
         .unwrap();
     let staged = r.memory();
