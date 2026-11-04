@@ -295,12 +295,11 @@ fn opt_string(
 /// so that the tag follows every `*` and the path's last `*` stays the
 /// pattern's. `None` for any other `|`.
 fn untagged(path: &str) -> Option<&str> {
-    let Some(body) = path.strip_suffix('|') else {
-        return (!path.contains('|')).then_some(path);
+    let Some((pattern, rest)) = path.split_once('|') else {
+        return Some(path);
     };
-    let (pattern, tag) = body.rsplit_once('|')?;
-    (!tag.is_empty() && !tag.contains(['/', '\\', '*']) && !pattern.contains('|'))
-        .then_some(pattern)
+    let tag = rest.strip_suffix('|')?;
+    (!tag.is_empty() && !tag.contains(['/', '\\', '*', '|'])).then_some(pattern)
 }
 
 /// The entries matching file choice `path` (node `id`): its folder,
