@@ -178,8 +178,9 @@ impl Cx<'_> {
     /// returns for the uncropped rect `[x, y, w, h]` (texels, y down, the
     /// source's size), asked once that rect is known; a cropped image is
     /// cached apart from the uncropped one, sharing its file. A crop
-    /// `crop` refuses with a reason, or any crop of rows cut to the
-    /// file's last row, drops the element as its role says.
+    /// `crop` refuses with a reason, or any crop of a frame taller than
+    /// one row cut to the file's last row, drops the element as its role
+    /// says.
     pub(super) fn add_src_image_cropped(
         &mut self,
         c: &Common,
@@ -201,17 +202,9 @@ impl Cx<'_> {
         let linear = c.filter == skin_model::Filter::Linear;
         let key = (rec, linear, grid, false);
         if let Some((def, cell)) = self.assets.base(key) {
-            let (frame, rows_cut) = nominal(def.rect.unwrap_or_default(), cell, grid);
-            let crop = match crop(self, frame)? {
-                Ok(Some(_)) if rows_cut => {
-                    self.drop_el(role, at, NoteKind::SourceRect)?;
-                    return Ok(None);
-                }
-                Ok(crop) => crop,
-                Err(why) => {
-                    self.drop_el(role, at, why)?;
-                    return Ok(None);
-                }
+            let rect = def.rect.unwrap_or_default();
+            let Some(crop) = self.frame_crop(c, rect, cell, grid, crop)? else {
+                return Ok(None);
             };
             if let Some(found) = self.assets.image(key, crop) {
                 self.cycle_kept(c, cycle.as_ref());
@@ -243,23 +236,36 @@ impl Cx<'_> {
             cycle,
             filter: c.filter,
         };
-        let (frame, rows_cut) = nominal(rect, cell, grid);
-        let crop = match crop(self, frame)? {
-            Ok(Some(_)) if rows_cut => {
-                self.drop_el(role, at, NoteKind::SourceRect)?;
-                return Ok(None);
-            }
-            Ok(crop) => crop,
-            Err(why) => {
-                self.drop_el(role, at, why)?;
-                return Ok(None);
-            }
+        let Some(crop) = self.frame_crop(c, rect, cell, grid, crop)? else {
+            return Ok(None);
         };
         let found = self.add_image(c, key, crop, def, cell)?;
         if found.is_some() {
             self.cycle_kept(c, cycle.as_ref());
         }
         Ok(found)
+    }
+
+    /// What `crop` returns for model rect `rect` of `grid` frames of
+    /// `cell`, asked with the frame the source cuts ([`nominal`]); `None`
+    /// once `c` is dropped as its role says, for a crop `crop` refuses or
+    /// any crop of a frame taller than one row cut to the file's last row.
+    fn frame_crop(
+        &mut self,
+        c: &Common,
+        rect: [u32; 4],
+        cell: [u32; 2],
+        grid: [u32; 2],
+        crop: impl FnOnce(&Self, [u32; 4]) -> Result<Result<Option<Crop>, NoteKind>, ImportError>,
+    ) -> Result<Option<Option<Crop>>, ImportError> {
+        let (frame, rows_cut) = nominal(rect, cell, grid);
+        let why = match crop(self, frame)? {
+            Ok(Some(_)) if rows_cut => NoteKind::SourceRect,
+            Ok(crop) => return Ok(Some(crop)),
+            Err(why) => why,
+        };
+        self.drop_el(c.role, c.span, why)?;
+        Ok(None)
     }
 
     /// Where `s`'s first `grid` columns and rows lie, its image charged:
@@ -568,12 +574,10 @@ impl Cx<'_> {
 /// coordinates leave the source's `int` sums, where its coordinates wrap
 /// and it draws no edge line.
 fn cut_axis(at: u32, cell: u32, grid: u32, extent: u32) -> Option<[u32; 2]> {
-    let end = i64::from(at) + i64::from(cell) * i64::from(grid);
-    if end > i64::from(i32::MAX) {
-        return None;
-    }
     let len = cell.checked_mul(grid)?;
-    if at.checked_add(len).is_some_and(|e| e <= extent) {
+    let end = at.checked_add(len)?;
+    i32::try_from(end).ok()?;
+    if end <= extent {
         return Some([at, len]);
     }
     (at >= extent && cell > 0 && extent > 0 && grid == 1).then(|| [extent - 1, 1])
@@ -581,7 +585,8 @@ fn cut_axis(at: u32, cell: u32, grid: u32, extent: u32) -> Option<[u32; 2]> {
 
 /// The rect of `grid` frames of `cell` that model rect `rect` stands
 /// for (`rect`'s corner, the source's size), and whether its rows were
-/// cut to the file's last row ([`cut_axis`]).
+/// cut to the file's last row ([`cut_axis`]), seen for a frame taller
+/// than one row: a one-row frame cut there is that row either way.
 fn nominal(rect: [u32; 4], cell: [u32; 2], grid: [u32; 2]) -> ([u32; 4], bool) {
     let w = cell[0].saturating_mul(grid[0]);
     let h = cell[1].saturating_mul(grid[1]);
