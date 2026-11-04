@@ -108,6 +108,12 @@ impl Pos {
 /// any other field is [`Pos::Other`].
 #[derive(Debug)]
 pub(crate) struct Class {
+    /// The source's class name, which the schema is checked against.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "read by the schema's test and Debug")
+    )]
+    pub(crate) name: &'static str,
     pub(crate) fields: &'static [(&'static str, Pos)],
 }
 
@@ -124,6 +130,7 @@ impl Class {
 
 /// `JsonSkin.Skin` (`JsonSkin.java:7-57`): the returned table.
 pub(crate) static ROOT_SCHEMA: Class = Class {
+    name: "Skin",
     fields: &[
         ("customEvents", Pos::Array(&CUSTOM_EVENT)),
         ("customTimers", Pos::Array(&CUSTOM_TIMER)),
@@ -131,11 +138,11 @@ pub(crate) static ROOT_SCHEMA: Class = Class {
         ("floatvalue", Pos::Array(&FLOAT_VALUE)),
         ("font", Pos::Array(&FONT)),
         ("graph", Pos::Array(&GRAPH)),
-        ("hiddenCover", Pos::Array(&COVER)),
+        ("hiddenCover", Pos::Array(&HIDDEN_COVER)),
         ("image", Pos::Array(&IMAGE)),
         ("imageset", Pos::Array(&IMAGE_SET)),
         ("judge", Pos::Array(&JUDGE)),
-        ("liftCover", Pos::Array(&COVER)),
+        ("liftCover", Pos::Array(&LIFT_COVER)),
         ("note", Pos::Class(&NOTE_SET)),
         ("slider", Pos::Array(&SLIDER)),
         ("songlist", Pos::Class(&SONG_LIST)),
@@ -146,16 +153,19 @@ pub(crate) static ROOT_SCHEMA: Class = Class {
 
 /// `Font` (`JsonSkin.java:100-105`).
 static FONT: Class = Class {
+    name: "Font",
     fields: &[("fallback", Pos::FontFallbackArray)],
 };
 
 /// `Image` (`JsonSkin.java:112-127`).
 static IMAGE: Class = Class {
+    name: "Image",
     fields: &[("act", Pos::Prop(S::Event)), ("timer", Pos::Prop(S::Timer))],
 };
 
 /// `ImageSet` (`JsonSkin.java:129-136`).
 static IMAGE_SET: Class = Class {
+    name: "ImageSet",
     fields: &[
         ("act", Pos::Prop(S::Event)),
         ("value", Pos::Prop(S::Integer)),
@@ -164,6 +174,7 @@ static IMAGE_SET: Class = Class {
 
 /// `Value` (`JsonSkin.java:138-157`).
 static VALUE: Class = Class {
+    name: "Value",
     fields: &[
         ("offset", Pos::Array(&VALUE)),
         ("timer", Pos::Prop(S::Timer)),
@@ -173,6 +184,7 @@ static VALUE: Class = Class {
 
 /// `FloatValue` (`JsonSkin.java:159-181`).
 static FLOAT_VALUE: Class = Class {
+    name: "FloatValue",
     fields: &[
         ("offset", Pos::Array(&VALUE)),
         ("timer", Pos::Prop(S::Timer)),
@@ -182,6 +194,7 @@ static FLOAT_VALUE: Class = Class {
 
 /// `Text` (`JsonSkin.java:183-201`).
 static TEXT: Class = Class {
+    name: "Text",
     fields: &[
         ("event", Pos::Prop(S::StringWriter)),
         ("value", Pos::Prop(S::String)),
@@ -190,6 +203,7 @@ static TEXT: Class = Class {
 
 /// `Slider` (`JsonSkin.java:203-223`).
 static SLIDER: Class = Class {
+    name: "Slider",
     fields: &[
         ("event", Pos::Prop(S::FloatWriter)),
         ("timer", Pos::Prop(S::Timer)),
@@ -199,19 +213,28 @@ static SLIDER: Class = Class {
 
 /// `Graph` (`JsonSkin.java:225-242`).
 static GRAPH: Class = Class {
+    name: "Graph",
     fields: &[
         ("timer", Pos::Prop(S::Timer)),
         ("value", Pos::Prop(S::Float)),
     ],
 };
 
-/// `HiddenCover` and `LiftCover` (`JsonSkin.java:380-408`).
-static COVER: Class = Class {
+/// `HiddenCover` (`JsonSkin.java:380-393`).
+static HIDDEN_COVER: Class = Class {
+    name: "HiddenCover",
+    fields: &[("timer", Pos::Prop(S::Timer))],
+};
+
+/// `LiftCover` (`JsonSkin.java:395-408`).
+static LIFT_COVER: Class = Class {
+    name: "LiftCover",
     fields: &[("timer", Pos::Prop(S::Timer))],
 };
 
 /// `NoteSet` (`JsonSkin.java:339-367`).
 static NOTE_SET: Class = Class {
+    name: "NoteSet",
     fields: &[
         ("bpm", Pos::Array(&DESTINATION)),
         ("group", Pos::Array(&DESTINATION)),
@@ -222,6 +245,7 @@ static NOTE_SET: Class = Class {
 
 /// `Judge` (`JsonSkin.java:429-435`).
 static JUDGE: Class = Class {
+    name: "Judge",
     fields: &[
         ("images", Pos::Array(&DESTINATION)),
         ("numbers", Pos::Array(&DESTINATION)),
@@ -230,6 +254,7 @@ static JUDGE: Class = Class {
 
 /// `SongList` (`JsonSkin.java:437-451`).
 static SONG_LIST: Class = Class {
+    name: "SongList",
     fields: &[
         ("graph", Pos::Class(&DESTINATION)),
         ("label", Pos::Array(&DESTINATION)),
@@ -246,6 +271,7 @@ static SONG_LIST: Class = Class {
 
 /// `Destination` (`JsonSkin.java:453-482`).
 static DESTINATION: Class = Class {
+    name: "Destination",
     fields: &[
         ("draw", Pos::Prop(S::Boolean)),
         ("op", Pos::OpArray),
@@ -255,6 +281,7 @@ static DESTINATION: Class = Class {
 
 /// `CustomEvent` (`JsonSkin.java:546-551`).
 static CUSTOM_EVENT: Class = Class {
+    name: "CustomEvent",
     fields: &[
         ("action", Pos::Prop(S::Event)),
         ("condition", Pos::Prop(S::Boolean)),
@@ -263,6 +290,7 @@ static CUSTOM_EVENT: Class = Class {
 
 /// `CustomTimer` (`JsonSkin.java:553-556`).
 static CUSTOM_TIMER: Class = Class {
+    name: "CustomTimer",
     fields: &[("timer", Pos::Prop(S::Timer))],
 };
 
@@ -282,7 +310,8 @@ mod tests {
             &TEXT,
             &SLIDER,
             &GRAPH,
-            &COVER,
+            &HIDDEN_COVER,
+            &LIFT_COVER,
             &NOTE_SET,
             &JUDGE,
             &SONG_LIST,
@@ -302,5 +331,104 @@ mod tests {
         }
         assert!(matches!(ROOT_SCHEMA.field(b"Destination"), Pos::Other));
         assert!(matches!(ROOT_SCHEMA.field(b"property"), Pos::Other));
+    }
+
+    /// Every field of `JsonSkin.java` at `0.8.9` that leads to a property
+    /// field, an `op` list or a font's fallbacks, by class, written out
+    /// from the source apart from the schema.
+    const SOURCE: &[(&str, &str, &str)] = &[
+        ("CustomEvent", "action", "Prop(Event)"),
+        ("CustomEvent", "condition", "Prop(Boolean)"),
+        ("CustomTimer", "timer", "Prop(Timer)"),
+        ("Destination", "draw", "Prop(Boolean)"),
+        ("Destination", "op", "OpArray"),
+        ("Destination", "timer", "Prop(Timer)"),
+        ("FloatValue", "offset", "Array(Value)"),
+        ("FloatValue", "timer", "Prop(Timer)"),
+        ("FloatValue", "value", "Prop(Float)"),
+        ("Font", "fallback", "FontFallbackArray"),
+        ("Graph", "timer", "Prop(Timer)"),
+        ("Graph", "value", "Prop(Float)"),
+        ("HiddenCover", "timer", "Prop(Timer)"),
+        ("Image", "act", "Prop(Event)"),
+        ("Image", "timer", "Prop(Timer)"),
+        ("ImageSet", "act", "Prop(Event)"),
+        ("ImageSet", "value", "Prop(Integer)"),
+        ("Judge", "images", "Array(Destination)"),
+        ("Judge", "numbers", "Array(Destination)"),
+        ("LiftCover", "timer", "Prop(Timer)"),
+        ("NoteSet", "bpm", "Array(Destination)"),
+        ("NoteSet", "group", "Array(Destination)"),
+        ("NoteSet", "stop", "Array(Destination)"),
+        ("NoteSet", "time", "Array(Destination)"),
+        ("Skin", "customEvents", "Array(CustomEvent)"),
+        ("Skin", "customTimers", "Array(CustomTimer)"),
+        ("Skin", "destination", "Array(Destination)"),
+        ("Skin", "floatvalue", "Array(FloatValue)"),
+        ("Skin", "font", "Array(Font)"),
+        ("Skin", "graph", "Array(Graph)"),
+        ("Skin", "hiddenCover", "Array(HiddenCover)"),
+        ("Skin", "image", "Array(Image)"),
+        ("Skin", "imageset", "Array(ImageSet)"),
+        ("Skin", "judge", "Array(Judge)"),
+        ("Skin", "liftCover", "Array(LiftCover)"),
+        ("Skin", "note", "Class(NoteSet)"),
+        ("Skin", "slider", "Array(Slider)"),
+        ("Skin", "songlist", "Class(SongList)"),
+        ("Skin", "text", "Array(Text)"),
+        ("Skin", "value", "Array(Value)"),
+        ("Slider", "event", "Prop(FloatWriter)"),
+        ("Slider", "timer", "Prop(Timer)"),
+        ("Slider", "value", "Prop(Float)"),
+        ("SongList", "graph", "Class(Destination)"),
+        ("SongList", "label", "Array(Destination)"),
+        ("SongList", "lamp", "Array(Destination)"),
+        ("SongList", "level", "Array(Destination)"),
+        ("SongList", "listoff", "Array(Destination)"),
+        ("SongList", "liston", "Array(Destination)"),
+        ("SongList", "playerlamp", "Array(Destination)"),
+        ("SongList", "rivallamp", "Array(Destination)"),
+        ("SongList", "text", "Array(Destination)"),
+        ("SongList", "trophy", "Array(Destination)"),
+        ("Text", "event", "Prop(StringWriter)"),
+        ("Text", "value", "Prop(String)"),
+        ("Value", "offset", "Array(Value)"),
+        ("Value", "timer", "Prop(Timer)"),
+        ("Value", "value", "Prop(Integer)"),
+    ];
+
+    #[test]
+    fn the_schema_is_the_source_s() {
+        // Every class reachable from the returned table, each once.
+        let mut seen: Vec<&str> = Vec::new();
+        let mut pending = vec![&ROOT_SCHEMA];
+        let mut got: Vec<(&str, &str, String)> = Vec::new();
+        while let Some(c) = pending.pop() {
+            if seen.contains(&c.name) {
+                continue;
+            }
+            seen.push(c.name);
+            for &(field, pos) in c.fields {
+                let kind = match pos {
+                    Pos::Class(d) => {
+                        pending.push(d);
+                        format!("Class({})", d.name)
+                    }
+                    Pos::Array(d) => {
+                        pending.push(d);
+                        format!("Array({})", d.name)
+                    }
+                    Pos::Prop(s) => format!("Prop({s:?})"),
+                    other => format!("{other:?}"),
+                };
+                got.push((c.name, field, kind));
+            }
+        }
+        got.sort();
+        let want: Vec<(&str, &str, String)> = SOURCE
+            .iter()
+            .map(|&(c, f, k)| (c, f, k.to_owned()))
+            .collect();
+        assert_eq!(got, want);
     }
 }

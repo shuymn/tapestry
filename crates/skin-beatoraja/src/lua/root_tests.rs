@@ -8,6 +8,7 @@ use super::callback_tests::{gauge, image, import, skin};
 use super::{Disposition, LuaImported, LuaWhy, Unsupported};
 use crate::error::ImportError;
 use crate::import::NoteKind;
+use crate::tree::Kind;
 
 /// A frame-time writer: classified, it refuses at its assignment.
 const WRITER: &str = "function() n = n + 1 return true end";
@@ -27,25 +28,55 @@ fn beside(body: &str, dst: &str) -> String {
     )
 }
 
-/// Checks that `r` refuses the critical reader in `field` because the
-/// analysis is open, located at the open site: a converted value of the
-/// entry, line 0.
+/// The configured pass of `entry`: its definition, converted and not
+/// yet imported.
+fn configured(entry: &str) -> crate::resolve::Definition {
+    let d = super::callback_tests::folder(entry);
+    let cancel = super::Cancel::new();
+    let h = super::read_lua_header(d.path(), "s.luaskin", &cancel).unwrap();
+    let facts = super::facts::ImportFacts::unavailable(skin_model::ScreenKind::Play);
+    let config = crate::import::Config::defaults(h.header());
+    h.configured(&config, &facts, &cancel).0.unwrap()
+}
+
+/// The analysis of `def`.
+fn analysis(def: &crate::resolve::Definition) -> &super::callback::Analysis {
+    def.arena
+        .lua
+        .as_deref()
+        .and_then(|l| l.analysis.as_deref())
+        .unwrap()
+}
+
+/// Checks that importing `entry` refuses its critical `draw` reader
+/// because the analysis is open, located exactly at the open site: the
+/// converted node of `kind` under `key` that the configured pass met
+/// first.
 #[track_caller]
-fn interferes(r: Result<LuaImported, ImportError>, field: &str) {
-    match r {
+fn interferes(entry: &str, (kind, key): (Kind, Option<&str>)) {
+    let def = configured(entry);
+    let open = analysis(&def).open.expect("an open site");
+    assert_eq!(def.arena.node(open).kind, kind);
+    let got: Option<String> = def.arena.key(open).map(Iterator::collect);
+    assert_eq!(got.as_deref(), key);
+    let site = def.loc(open);
+    assert_eq!((site.file.as_str(), site.line), ("s.luaskin", 0));
+    match import(entry) {
         Err(ImportError::Lua {
             why:
                 LuaWhy::Critical {
-                    field: f,
+                    field: "draw",
                     why: Unsupported::Interference,
                 },
             at: Some(at),
-        }) => {
-            assert_eq!(f, field);
-            assert_eq!((at.file.as_str(), at.line), ("s.luaskin", 0));
-        }
+        }) => assert_eq!(at, site),
         other => panic!("{other:?}"),
     }
+}
+
+/// A script's site: its string under `key`.
+fn script(key: &str) -> (Kind, Option<&str>) {
+    (Kind::Lua, Some(key))
 }
 
 /// Checks that `r` imported with the critical reader lowered.
@@ -123,27 +154,31 @@ fn every_op_entry_and_every_array_entry_is_read() {
 
 #[test]
 fn a_root_the_analysis_cannot_see_voids_the_capture_proof() {
-    for (body, dst) in [
+    for (body, dst, site) in [
         // Scripts: a `draw` and a `timer` the source compiles.
         (
             "",
             image("\"(function() skin_config.option.x = 2 return true end)()\""),
+            script("draw"),
         ),
         (
             "",
             "{ id = \"i\", timer = \"(function() skin_config.option.x = 2 return 0 end)()\", \
              dst = { { w = 6, h = 6 } } },"
                 .to_owned(),
+            script("timer"),
         ),
         // A string property's and an integer property's names that their
         // own factories do not resolve.
         (
             "skin.text = { { id = \"t\", value = \"score\" } }",
             String::new(),
+            script("value"),
         ),
         (
             "skin.value = { { id = \"v\", value = \"ranking_exscore+1\" } }",
             String::new(),
+            script("value"),
         ),
         // A mixed `op` list whose positional entry holds a function.
         (
@@ -151,9 +186,10 @@ fn a_root_the_analysis_cannot_see_voids_the_capture_proof() {
             format!(
                 "{{ id = \"i\", op = {{ {WRITER}, k = 1 }}, dst = {{ {{ w = 6, h = 6 }} }} }},"
             ),
+            (Kind::Mixed, Some("op")),
         ),
     ] {
-        interferes(import(&beside(body, &dst)), "draw");
+        interferes(&beside(body, &dst), site);
     }
     // The table met first at an ignored key and then at an `op`, or the
     // other way round: its unread entry is seen at the `op` either way.
@@ -163,7 +199,7 @@ fn a_root_the_analysis_cannot_see_voids_the_capture_proof() {
              skin.{key} = conditions"
         );
         let dst = "{ id = \"i\", op = conditions, dst = { { w = 6, h = 6 } } },";
-        interferes(import(&beside(&body, dst)), "draw");
+        interferes(&beside(&body, dst), (Kind::Mixed, Some("op")));
     }
     // A script beside a critical module read: the module's binding is
     // not proven either.
@@ -175,7 +211,7 @@ fn a_root_the_analysis_cannot_see_voids_the_capture_proof() {
             image("\"(function() return true end)()\"")
         ),
     );
-    interferes(import(&entry), "draw");
+    interferes(&entry, script("draw"));
     // Controls: a name the field's own factory resolves; a mixed list
     // whose positional entry is a number; a mixed record, whose other
     // entries the source never reads. Each lowers.
@@ -196,18 +232,19 @@ fn a_font_fallback_with_a_metatable_opens_the_analysis() {
         format!("skin.font = {{ {{ id = \"f\", path = \"a.ttf\", fallback = {fallback} }} }}")
     };
     let meta = format!("setmetatable({{}}, {{ __index = {WRITER} }})");
-    interferes(import(&beside(&font(&format!("{{ {meta} }}")), "")), "draw");
+    interferes(
+        &beside(&font(&format!("{{ {meta} }}")), ""),
+        (Kind::Empty, None),
+    );
     lowers(import(&beside(&font("{ { path = \"a\" } }"), "")));
     // A mixed fallback list whose positional entry is that table: unread,
     // whether met there directly or first through an ignored key.
     let mixed = format!("local hidden = {meta}\nlocal fb = {{ hidden, keep = \"a.ttf\" }}\n");
-    interferes(
-        import(&beside(&format!("{mixed}{}", font("fb")), "")),
-        "draw",
-    );
+    let listed = (Kind::Mixed, Some("fallback"));
+    interferes(&beside(&format!("{mixed}{}", font("fb")), ""), listed);
     for key in ["aaa", "zzz"] {
         let body = format!("{mixed}skin.{key} = fb\n{}", font("fb"));
-        interferes(import(&beside(&body, "")), "draw");
+        interferes(&beside(&body, ""), listed);
     }
 }
 
@@ -384,22 +421,118 @@ fn the_open_site_is_counted_where_the_conversion_meets_it() {
          skin.aaa = mixed",
         "{ id = \"i\", op = mixed, dst = { { w = 6, h = 6 } } },",
     );
-    let d = super::callback_tests::folder(&entry);
-    let cancel = super::Cancel::new();
-    let h = super::read_lua_header(d.path(), "s.luaskin", &cancel).unwrap();
-    let facts = super::facts::ImportFacts::unavailable(skin_model::ScreenKind::Play);
-    let (def, _, _, _) = h.configured(
-        &crate::import::Config::defaults(h.header()),
-        &facts,
-        &cancel,
-    );
-    let def = def.unwrap();
-    let an = def
-        .arena
-        .lua
-        .as_deref()
-        .and_then(|l| l.analysis.as_deref())
-        .unwrap();
+    let def = configured(&entry);
+    let an = analysis(&def);
     assert_eq!((an.scripts, an.unread), (1, 1));
     assert!(an.open.is_some());
+}
+
+/// `critical`, a critical gauge `draw`, beside a decorative `draw` script
+/// that opens the analysis, after `body`.
+fn opened(body: &str, critical: &str) -> String {
+    skin(
+        body,
+        &format!(
+            "{}{}",
+            gauge(critical),
+            image("\"(function() return true end)()\"")
+        ),
+    )
+}
+
+#[test]
+fn an_open_analysis_proves_no_fold_and_no_binding() {
+    // A captured scalar, `timer_off_value` and a helper: each lowers
+    // while the analysis is closed, and refuses the critical reader at
+    // the script while it is open.
+    for (body, critical) in [
+        ("local on = true", "function() return on end"),
+        (
+            "",
+            "function() return ms.timer_off_value == ms.timer(41) end",
+        ),
+        (
+            "local function h() return true end",
+            "function() return h() end",
+        ),
+    ] {
+        lowers(import(&skin(body, &gauge(critical))));
+        interferes(&opened(body, critical), script("draw"));
+    }
+}
+
+#[test]
+fn an_open_analysis_replaces_a_decorative_reader() {
+    // A decorative reader is replaced, reported.
+    let entry = skin(
+        "skin_config.option.x = 1",
+        &format!(
+            "{}{}",
+            image("function() return skin_config.option[\"x\"] == 1 end"),
+            image("\"(function() return true end)()\"")
+        ),
+    );
+    let i = import(&entry).unwrap();
+    let why = Unsupported::Interference;
+    assert_eq!(i.callbacks, [Disposition::Replaced(why)]);
+    assert!(noted(&i, NoteKind::Callback { field: "draw", why }));
+}
+
+#[test]
+fn an_open_analysis_still_lowers_literals() {
+    // One of literals alone still lowers.
+    let i = import(&opened("", "function() local a = 1 return a + 1 > 1 end")).unwrap();
+    assert_eq!(i.callbacks, [Disposition::Lowered]);
+}
+
+#[test]
+fn op_functions_join_in_the_source_s_order() {
+    use crate::import::ops::{Cond, named, numeric};
+    use skin_model::{PLAY, Scope, State, Ty, compile};
+    let expr = |c: Option<Cond>| match c {
+        Some(Cond::Expr { src, .. }) => src,
+        other => panic!("{other:?}"),
+    };
+    let none = std::collections::BTreeMap::new();
+    let name = crate::import::ops::KNOWN_BOOLEAN_IDS
+        .iter()
+        .find(|(id, _)| *id == 272)
+        .map(|&(_, n)| n)
+        .unwrap();
+    // A function, a name and an id in the list, and a `draw`.
+    let entry = skin(
+        "",
+        &format!(
+            "{{ id = \"i\", op = {{ function() return ms.option(273) end, \"{name}\", 271 }},\n\
+             draw = function() return ms.option(270) end, dst = {{ {{ w = 64, h = 64 }} }} }},"
+        ),
+    );
+    crate::import::VISIBLE.with(|v| v.borrow_mut().clear());
+    let i = import(&entry).unwrap();
+    assert_eq!(i.callbacks, [Disposition::Lowered, Disposition::Lowered]);
+    let visible = crate::import::VISIBLE.with(|v| v.borrow().clone());
+    let [Some(visible)] = visible.as_slice() else {
+        panic!("{visible:?}")
+    };
+    // The id first, then the function and the name in the list's order,
+    // then `draw`, each function's read wrapped as it is lowered.
+    let want = format!(
+        "({}) && (({})) && ({}) && (({}))",
+        expr(Some(numeric(271, &none))),
+        expr(Some(numeric(273, &none))),
+        expr(named(name)),
+        expr(Some(numeric(270, &none))),
+    );
+    let want = compile(&want, &Scope::new(&PLAY), Ty::Bool).unwrap();
+    assert_eq!(*visible, want);
+    // Evaluated, it is the conjunction of the four.
+    let timers = vec![-1_i32; PLAY.timers.len()];
+    for v in [0, 1] {
+        let fields = vec![v; PLAY.fields.len()];
+        let state = State {
+            fields: &fields,
+            timers: &timers,
+        };
+        assert_eq!(visible.eval_bool(&state), want.eval_bool(&state));
+    }
 }

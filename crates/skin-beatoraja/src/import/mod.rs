@@ -230,6 +230,13 @@ enum Prop {
     Callable(u32),
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Each element's compiled visibility this thread imported, in order.
+    pub(crate) static VISIBLE: std::cell::RefCell<Vec<Option<Program>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
 /// A destination option (`JsonSkinSerializer.java:115-131`).
 #[derive(Clone, Debug)]
 enum Op {
@@ -1260,6 +1267,8 @@ impl<'d> Cx<'d> {
         } else {
             Some(self.compile(&src, Ty::Bool, at)?)
         };
+        #[cfg(test)]
+        VISIBLE.with(|v| v.borrow_mut().push(visible.clone()));
 
         if text || o.unrotated {
             if angle || offset.r != 0 {
