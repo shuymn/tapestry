@@ -116,6 +116,60 @@ fn an_attempts_skin_is_reused_while_its_facts_hold() {
     assert!(matches!(how, Specialized::Ran));
 }
 
+/// A kept specialization is reused while its facts hold, whatever became
+/// of the skin's files since: a module the header pass loaded and one only
+/// the configured pass loads edited, then removed, change nothing; the
+/// same bundle is given, and no job or Lua pass runs. Another level, a fact
+/// the skin read, builds again and reads the files as they are now.
+#[test]
+fn a_kept_specialization_is_reused_after_its_files_change() {
+    let _serial = serial();
+    let r = crate::render_common::offscreen(1_920, 1_080);
+    let t = target(&r);
+    let dir = super::sources_skin();
+    let d = dir.path();
+    let (p, _) = pending(play(&choice(d, "play.luaskin"), &t));
+    let mut skin = PendingSkin::new(p);
+    let one = u64::from(cfg!(feature = "dev-tools"));
+    let passes = || {
+        #[cfg(feature = "dev-tools")]
+        return skin_beatoraja::lua::vm_hooks::passes();
+        #[cfg(not(feature = "dev-tools"))]
+        0
+    };
+    let (got, how, _, ran) = attempt(&mut skin, "#PLAYLEVEL 12\n");
+    assert!(matches!(how, Specialized::Ran));
+    assert_eq!(ran, (one, one));
+    let kept = ready(got);
+
+    std::fs::write(d.join("hdr.lua"), "return \"blue.png\"").unwrap();
+    std::fs::write(d.join("cfg.lua"), "return \"blue.png\"").unwrap();
+    for removed in [false, true] {
+        if removed {
+            std::fs::remove_file(d.join("hdr.lua")).unwrap();
+            std::fs::remove_file(d.join("cfg.lua")).unwrap();
+        }
+        let before = passes();
+        let (got, how, waited, ran) = attempt(&mut skin, "#PLAYLEVEL 12\n");
+        assert!(
+            matches!(how, Specialized::Reused) && !waited,
+            "removed {removed}"
+        );
+        assert_eq!(ran, (0, 0), "removed {removed}");
+        assert_eq!(passes(), before, "removed {removed}");
+        assert!(Arc::ptr_eq(&ready(got), &kept), "removed {removed}");
+    }
+
+    // Another level builds again, and the configured-only module is gone.
+    let (got, how, _, ran) = attempt(&mut skin, "#PLAYLEVEL 13\n");
+    assert!(matches!(how, Specialized::Ran));
+    assert_eq!(ran, (one, one));
+    let ForAttempt::Refused(why) = got else {
+        panic!("{got:?}");
+    };
+    assert!(why.contains("cannot read cfg.lua"), "{why}");
+}
+
 /// The attempt's quit during a looping specialization cancels the attempt
 /// once the job's thread has ended, its VM closed; with the VM's
 /// destruction held, the quit waits past the stop bound, and the run's

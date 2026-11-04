@@ -339,7 +339,7 @@ impl PlayerRig<'_> {
             // A script's step on the specialization (dev-tools), asked at
             // every look of the wait, an attempt's quit included.
             #[cfg(feature = "dev-tools")]
-            crate::dev::specialization_signal(rig.controls);
+            crate::dev::specialization_signal(rig.controls, || rig.input.fail_for_script());
             rig.controls.quitting()
                 || rig.input_failure().is_some()
                 || rig.audio_failure().is_some()

@@ -209,10 +209,35 @@ pub enum Specializing {
     Quit,
     /// Close the window (`close-specializing`).
     Close,
+    /// Fail the input thread, as its hook's end does
+    /// (`input-failure-specializing`).
+    InputFailure,
     /// Hold every VM's destruction, press the quit key, and close the
     /// window once the quit has waited past the stop bound
     /// (`escalate-specializing`).
     Escalate,
+    /// As [`Escalate`](Self::Escalate), failing the input thread instead
+    /// of closing (`escalate-input-failure-specializing`).
+    EscalateInputFailure,
+}
+
+impl Specializing {
+    /// The mode a script or `--dev-specializing` names.
+    pub fn named(name: &str) -> Option<Self> {
+        match name {
+            "quit" => Some(Self::Quit),
+            "close" => Some(Self::Close),
+            "input-failure" => Some(Self::InputFailure),
+            "escalate" => Some(Self::Escalate),
+            "escalate-input-failure" => Some(Self::EscalateInputFailure),
+            _ => None,
+        }
+    }
+
+    /// Whether every VM's destruction is held and the quit pressed first.
+    const fn escalates(self) -> bool {
+        matches!(self, Self::Escalate | Self::EscalateInputFailure)
+    }
 }
 
 /// The specialization's script step armed, its steps' baseline, and when
@@ -247,15 +272,15 @@ pub fn specialization_began() {
     let mut armed = SPECIALIZING.lock().unwrap_or_else(PoisonError::into_inner);
     if let Some((s, from, _)) = armed.as_mut() {
         *from = skin_beatoraja::lua::vm_hooks::steps();
-        if *s == Specializing::Escalate {
+        if s.escalates() {
             skin_beatoraja::lua::vm_hooks::hold();
         }
     }
 }
 
 /// Acts on the armed step once the specialization's Lua executes, asked
-/// at each look of the job's wait.
-pub fn specialization_signal(controls: &crate::controls::Controls) {
+/// at each look of the job's wait; `fail_input` fails the input thread.
+pub fn specialization_signal(controls: &crate::controls::Controls, fail_input: impl Fn()) {
     let mut armed = SPECIALIZING.lock().unwrap_or_else(PoisonError::into_inner);
     let Some((s, from, quit_at)) = armed.as_mut() else {
         return;
@@ -271,6 +296,10 @@ pub fn specialization_signal(controls: &crate::controls::Controls) {
         controls.close();
         println!("dev: closed while specializing");
     };
+    let fail = || {
+        fail_input();
+        println!("dev: input failed while specializing");
+    };
     match (*s, *quit_at) {
         (Specializing::Quit, _) => {
             quit();
@@ -280,13 +309,21 @@ pub fn specialization_signal(controls: &crate::controls::Controls) {
             close();
             *armed = None;
         }
-        (Specializing::Escalate, None) => {
+        (Specializing::InputFailure, _) => {
+            fail();
+            *armed = None;
+        }
+        (Specializing::Escalate | Specializing::EscalateInputFailure, None) => {
             quit();
             *quit_at = Some(Instant::now());
         }
-        (Specializing::Escalate, Some(at)) => {
+        (s, Some(at)) => {
             if at.elapsed() >= crate::imports::STOP_WAIT + Duration::from_millis(500) {
-                close();
+                if s == Specializing::Escalate {
+                    close();
+                } else {
+                    fail();
+                }
                 *armed = None;
             }
         }
@@ -911,7 +948,7 @@ impl SelectScript {
                 Some(("wait", f)) => Ok(SelectStep::Wait(f.to_owned())),
                 Some(("search", t)) => Ok(SelectStep::Search(t.to_owned())),
                 Some(("sleep", ms)) => ms.parse().map(SelectStep::Sleep).map_err(|_| {
-                    format!("{s} is not pick=, wait=, search=, sleep=, idle=, slow-load=, slow-measuring=, slow-decoding=, slow-preparing=, slow-specializing=, slow-chart-load=, press-loading=, hold-background, background=running, background=idle, enter, prev-preset, next-preset, drawn, back, retry, next, prev, close-measuring, quit-measuring, quit-decoding, quit-loading, close-loading, quit-specializing, close-specializing, escalate-specializing or close")
+                    format!("{s} is not pick=, wait=, search=, sleep=, idle=, slow-load=, slow-measuring=, slow-decoding=, slow-preparing=, slow-specializing=, slow-chart-load=, press-loading=, hold-background, background=running, background=idle, enter, prev-preset, next-preset, drawn, back, retry, next, prev, close-measuring, quit-measuring, quit-decoding, quit-loading, close-loading, <quit|close|input-failure|escalate|escalate-input-failure>-specializing or close")
                 }),
                 Some(("idle", ms)) => ms
                     .parse()
@@ -959,19 +996,16 @@ impl SelectScript {
                 None if s == "quit-decoding" => Ok(SelectStep::QuitDecoding),
                 None if s == "quit-loading" => Ok(SelectStep::QuitLoading),
                 None if s == "close-loading" => Ok(SelectStep::CloseLoading),
-                None if s == "quit-specializing" => {
-                    Ok(SelectStep::Specializing(Specializing::Quit))
-                }
-                None if s == "close-specializing" => {
-                    Ok(SelectStep::Specializing(Specializing::Close))
-                }
-                None if s == "escalate-specializing" => {
-                    Ok(SelectStep::Specializing(Specializing::Escalate))
+                None if let Some(mode) = s
+                    .strip_suffix("-specializing")
+                    .and_then(Specializing::named) =>
+                {
+                    Ok(SelectStep::Specializing(mode))
                 }
                 None if s == "hold-background" => Ok(SelectStep::HoldBackground),
                 None if s == "close" => Ok(SelectStep::Close),
                 _ => Err(format!(
-                    "{s} is not pick=, wait=, search=, sleep=, idle=, slow-load=, slow-measuring=, slow-decoding=, slow-preparing=, slow-specializing=, slow-chart-load=, press-loading=, hold-background, background=running, background=idle, enter, prev-preset, next-preset, drawn, back, retry, next, prev, close-measuring, quit-measuring, quit-decoding, quit-loading, close-loading, quit-specializing, close-specializing, escalate-specializing or close"
+                    "{s} is not pick=, wait=, search=, sleep=, idle=, slow-load=, slow-measuring=, slow-decoding=, slow-preparing=, slow-specializing=, slow-chart-load=, press-loading=, hold-background, background=running, background=idle, enter, prev-preset, next-preset, drawn, back, retry, next, prev, close-measuring, quit-measuring, quit-decoding, quit-loading, close-loading, <quit|close|input-failure|escalate|escalate-input-failure>-specializing or close"
                 )),
             })
             .map(|step| step.map(|s| (s, None)))

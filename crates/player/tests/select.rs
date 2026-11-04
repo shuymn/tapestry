@@ -1746,6 +1746,98 @@ fn a_close_during_a_specialization_ends_the_run() {
     }
 }
 
+/// A failure of the input thread while a pending skin's specialization
+/// loops, and while a quit waits for a job whose VM is held past the stop
+/// bound, leaves the job's wait within the stop bound and ends the run
+/// with the failure's cause: no selection is entered again and no play
+/// opens.
+#[test]
+fn an_input_failure_during_a_specialization_ends_the_run() {
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+    for step in [
+        "input-failure-specializing",
+        "escalate-input-failure-specializing",
+    ] {
+        let fx = fixture();
+        write_ranked(&fx, "a", "a.bms", Some(2));
+        write_class_skin(&fx, "while true do end");
+        let mut child = select(
+            &fx,
+            &format!("sleep=1500,{step},pick=a.bms,enter,close"),
+            &[],
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+        let out = child.stdout.take().unwrap();
+        let err = child.stderr.take().unwrap();
+        let errors = std::thread::spawn(move || std::io::read_to_string(err).unwrap());
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            for line in BufReader::new(out).lines() {
+                let Ok(line) = line else { break };
+                if tx.send((Instant::now(), line)).is_err() {
+                    break;
+                }
+            }
+        });
+        let deadline = Instant::now() + Duration::from_secs(600);
+        let mut seen: Vec<(Instant, String)> = Vec::new();
+        loop {
+            match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                Ok(l) => seen.push(l),
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    let _ = child.kill();
+                    panic!("{step}: the run did not end in time: {seen:?}");
+                }
+            }
+        }
+        let status = child.wait().unwrap();
+        let stderr = errors.join().unwrap();
+        let stdout: String = seen.iter().map(|(_, l)| format!("{l}\n")).collect();
+        assert_eq!(status.code(), Some(1), "{step}: {stdout}\n{stderr}");
+        assert!(
+            stderr.contains("the input thread"),
+            "{step}: {stdout}\n{stderr}"
+        );
+        let when = |line: &str| {
+            seen.iter()
+                .find(|(_, l)| l == line)
+                .map(|(t, _)| *t)
+                .unwrap_or_else(|| panic!("{step}: no {line}: {stdout}"))
+        };
+        let failed = when("dev: input failed while specializing");
+        let left = when("dev: specialization wait left");
+        // The stop bound (2 s) and a slice, with room for a loaded machine.
+        assert!(
+            left.duration_since(failed) < Duration::from_secs(3),
+            "{step}: {:?}",
+            left.duration_since(failed)
+        );
+        if step.starts_with("escalate") {
+            let quit = when("dev: quit pressed while specializing");
+            assert!(
+                failed.duration_since(quit) >= Duration::from_secs(2),
+                "{stdout}"
+            );
+        }
+        assert!(
+            lines(&stdout, "play started").is_empty(),
+            "{step}: {stdout}"
+        );
+        assert!(
+            lines(&stdout, "dev: lua at open").is_empty(),
+            "{step}: {stdout}"
+        );
+        let listed = stdout.rfind("select: 1 charts listed");
+        let chose = stdout.find("select: chose a.bms").unwrap();
+        assert!(listed.is_none_or(|l| l < chose), "{step}: {stdout}");
+    }
+}
+
 /// A pending skin that cannot be built for the chosen chart shows its
 /// reason on the select screen, the skin in use never standing in, and
 /// the chart stays admitted: the next choice builds it again.

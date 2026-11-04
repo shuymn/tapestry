@@ -923,6 +923,78 @@ fn a_refused_specialization_returns_to_the_practice_page() {
     assert!(fx.played_records().0.is_empty());
 }
 
+/// The quit key while a pending skin's specialization loops, started from
+/// a practice Start, cancels it and returns to the practice page only once
+/// the job's thread has ended (inside the child: no VM open, every job
+/// started joined), with no round opened; the scenario's rounds then fail
+/// for want of one.
+#[test]
+fn the_quit_key_during_a_practice_specialization_returns_to_the_page() {
+    let fx = Fixture::new();
+    write_chart(&fx.library(), "a", "譜面A");
+    let key7 = bms_parser::load_bms(
+        b"#BPM 120\n#00119:0000000000010000\n",
+        &fx.base,
+        &Default::default(),
+    )
+    .unwrap()
+    .chart;
+    write_log(
+        &fx.base.join("logs").join("k7.tprl"),
+        &hits(&key7, |_| true),
+        1,
+    );
+    let skin = fx.base.join("skin");
+    fs::create_dir_all(&skin).unwrap();
+    fs::write(
+        skin.join("play.luaskin"),
+        "local skin = { type = 0, name = \"class\", w = 1920, h = 1080 }\n\
+         if not skin_config then return skin end\n\
+         local easy = require(\"main_state\").option(183)\n\
+         while true do end\n",
+    )
+    .unwrap();
+    fs::create_dir_all(fx.data()).unwrap();
+    fs::write(
+        fx.data().join("player.toml"),
+        format!(
+            "[skins.play]\nroot = '{}'\nentry = 'play.luaskin'\n",
+            skin.display()
+        ),
+    )
+    .unwrap();
+    let out = fx
+        .command(&scenario(&[
+            "practice = { path = \"library/a/a.bms\", from = 1, to = 2, speed = 100, \
+             lead_in_ms = 2000, gauge = 20, repeat = true, input = \"logs/k7.tprl\", rounds = 1 }",
+            "quit = {}",
+        ]))
+        .args(["--dev-specializing", "quit"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert_eq!(out.status.code(), Some(1), "{stdout}\n{stderr}");
+    let at = |from: usize, line: &str| {
+        stdout[from..]
+            .find(line)
+            .map(|i| i + from)
+            .unwrap_or_else(|| panic!("no {line}:\n{stdout}"))
+    };
+    let page = at(0, "practice: on the practice screen");
+    let quit = at(page, "dev: quit pressed while specializing");
+    let left = at(quit, "dev: specialization wait left");
+    let ended = at(left, "dev: specialization ended: live 0 joined 2 of 2");
+    at(ended, "practice: on the practice screen");
+    assert!(
+        format!("{stdout}{stderr}").contains("no round started"),
+        "{stdout}\n{stderr}"
+    );
+    assert!(lines(&stdout, "play started").is_empty(), "{stdout}");
+    assert!(lines(&stdout, "skin: play: refused").is_empty(), "{stdout}");
+    assert!(fx.records().is_empty());
+}
+
 /// The peaks the recording output found after each sound's onset.
 fn onset_peaks(stdout: &str) -> Vec<f64> {
     let line = lines(stdout, "dev: audio onset peaks:")[0];
