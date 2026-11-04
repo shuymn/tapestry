@@ -221,6 +221,7 @@ fn bpm_keeps_eighteen_fractional_digits_and_cuts_the_rest() {
     assert_eq!(times(&loaded.chart.lanes[1]), vec![2_000_000]);
 }
 
+// Covers: T01
 #[test]
 fn oversized_measure_count_is_rejected() {
     let dir = folder(&["click.wav"]);
@@ -248,6 +249,7 @@ fn oversized_measure_count_is_rejected() {
     );
 }
 
+// Covers: T01
 #[test]
 fn text_limits_name_the_line() {
     let dir = folder(&["click.wav"]);
@@ -287,6 +289,7 @@ fn text_limits_name_the_line() {
     );
 }
 
+// Covers: T01
 #[test]
 fn tiny_bpm_exceeding_duration_cap_is_rejected() {
     // 4 beats at 0.000001 BPM last 2.4e14 µs, far past 60 minutes, though
@@ -312,6 +315,7 @@ fn chart_ending_exactly_at_duration_cap_loads() {
     );
 }
 
+// Covers: T01
 #[test]
 fn time_past_the_duration_cap_by_less_than_a_microsecond_is_refused() {
     // A 0.000001-unit STOP at 120 BPM lasts 1.25 / 120 µs: the time floors

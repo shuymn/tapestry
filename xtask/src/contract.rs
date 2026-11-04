@@ -12,6 +12,17 @@
 //! table's first column is `ID`, and each row's ID is `T` and two digits,
 //! used once.
 //!
+//! A tag is a line `// Covers: <ID>`, one threat ID per line, in the run of
+//! comments and attributes directly above a `#[test]` fn of a `.rs` file
+//! under `crates/` (`xtask/`, whose fixtures are strings, is not scanned).
+//! It must name a threat ID and sit above a test that is not `#[ignore]`d.
+//! The `### Verification` table, the heading after the threat section, has
+//! one row per threat ID in ID order: its `Tagged tests` cell is generated
+//! from the tags (grouped by file, files and tests in order, or
+//! `Unverified`), and its `Note` cell is kept as written. A table that
+//! differs from the generated one fails; `--update` rewrites the table's
+//! lines alone, in the file's line ending.
+//!
 //! design.md is read with a CommonMark parser (`pulldown-cmark`, with
 //! tables): its headings, the contract section's list items and the threat
 //! table are what that parser returns, so code blocks, inline code and
@@ -26,8 +37,9 @@
 //! attribute spelled unusually (`#[ignore/* c */]`) is not recognized. CI
 //! building and running the tests, and review, cover those.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
+use std::ops::Range;
 use std::path::Path;
 
 use anyhow::Context as _;
@@ -39,25 +51,126 @@ pub const DESIGN: &str = "docs/design.md";
 pub const CONTRACT: &str = "Behavioral Contract";
 /// The level-3 heading over the threat table.
 pub const THREATS: &str = "Threats and Mitigations";
+/// The level-3 heading over the generated table, right after [`THREATS`].
+pub const VERIFICATION: &str = "Verification";
+/// The directory scanned for tags, relative to the workspace root.
+pub const TAGGED: &str = "crates";
+/// What starts a tag line, after its indentation.
+const TAG: &str = "// Covers:";
 
-pub fn run(manifest: &Path) -> anyhow::Result<Vec<String>> {
+/// Checks the workspace of `manifest`; with `update`, first rewrites the
+/// Verification table of design.md when it is not the generated one.
+pub fn run(manifest: &Path, update: bool) -> anyhow::Result<Vec<String>> {
     let root = manifest
         .parent()
         .context("the workspace manifest has no directory")?;
-    let design = std::fs::read_to_string(root.join(DESIGN))
-        .with_context(|| format!("cannot read {DESIGN}"))?;
-    Ok(check(&design, |file| {
-        std::fs::read_to_string(root.join(file))
-    }))
+    let path = root.join(DESIGN);
+    let design = std::fs::read_to_string(&path).with_context(|| format!("cannot read {DESIGN}"))?;
+    let sources = sources(root)?;
+    let read = |file: &str| std::fs::read_to_string(root.join(file));
+    if !update {
+        return Ok(check(&design, &sources, read));
+    }
+    let (updated, diags) = self::update(&design, &sources, read);
+    if updated != design {
+        std::fs::write(&path, &updated).with_context(|| format!("cannot write {DESIGN}"))?;
+        eprintln!("check-contract: rewrote the {VERIFICATION} table of {DESIGN}");
+    }
+    Ok(diags)
 }
 
-/// The diagnostics for `design`, reading each cited file through `read`.
-pub fn check(design: &str, read: impl Fn(&str) -> io::Result<String>) -> Vec<String> {
+/// The `.rs` files under [`TAGGED`] that hold a tag, as (path relative to
+/// `root` with `/` separators, contents), in path order.
+pub fn sources(root: &Path) -> anyhow::Result<Vec<(String, String)>> {
+    let mut out = Vec::new();
+    let mut dirs = vec![(root.join(TAGGED), TAGGED.to_owned())];
+    while let Some((dir, rel)) = dirs.pop() {
+        let entries = std::fs::read_dir(&dir).with_context(|| format!("cannot read `{rel}`"))?;
+        for entry in entries {
+            let entry = entry.with_context(|| format!("cannot read `{rel}`"))?;
+            let kind = entry
+                .file_type()
+                .with_context(|| format!("cannot read `{rel}`"))?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let path = format!("{rel}/{name}");
+            if kind.is_dir() {
+                dirs.push((entry.path(), path));
+            } else if kind.is_file() && name.ends_with(".rs") {
+                let text = std::fs::read_to_string(entry.path())
+                    .with_context(|| format!("cannot read `{path}`"))?;
+                if text.contains(TAG) {
+                    out.push((path, text));
+                }
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// The diagnostics for `design`, reading each cited file through `read`
+/// and the tags from `sources` (path, contents).
+pub fn check(
+    design: &str,
+    sources: &[(String, String)],
+    read: impl Fn(&str) -> io::Result<String>,
+) -> Vec<String> {
+    let (mut diags, generated) = analyze(design, sources, &read);
+    if let Some(Generated { range, line, text }) = generated
+        && let Some(current) = design.get(range)
+        && current != text
+    {
+        // The first line that differs, or the table's first.
+        let differs = current
+            .split('\n')
+            .zip(text.split('\n'))
+            .position(|(a, b)| a != b)
+            .unwrap_or(0);
+        diags.push(format!(
+            "{}: the {VERIFICATION} table is not the generated one; run `cargo xtask check-contract --update`",
+            at(line + differs)
+        ));
+    }
+    diags
+}
+
+/// `design` with its Verification table replaced by the generated one, and
+/// the diagnostics other than a stale table.
+pub fn update(
+    design: &str,
+    sources: &[(String, String)],
+    read: impl Fn(&str) -> io::Result<String>,
+) -> (String, Vec<String>) {
+    let (diags, generated) = analyze(design, sources, &read);
+    let mut out = design.to_owned();
+    if let Some(Generated { range, text, .. }) = generated {
+        out.replace_range(range, &text);
+    }
+    (out, diags)
+}
+
+/// The generated Verification table, for the byte range it replaces.
+struct Generated {
+    range: Range<usize>,
+    /// The line index of the range's start.
+    line: usize,
+    text: String,
+}
+
+/// Every diagnostic but a stale Verification table, and the generated table
+/// when design.md has one to replace.
+fn analyze(
+    design: &str,
+    sources: &[(String, String)],
+    read: &impl Fn(&str) -> io::Result<String>,
+) -> (Vec<String>, Option<Generated>) {
     let doc = Doc::parse(design);
     let mut diags = Vec::new();
-    contract(&doc, &read, &mut diags);
-    threats(&doc, &mut diags);
-    diags
+    contract(&doc, read, &mut diags);
+    let ids = threats(&doc, &mut diags);
+    let tagged = tags(sources, ids.as_ref(), &mut diags);
+    let generated = ids.and_then(|ids| verification(&doc, design, &ids, &tagged, &mut diags));
+    (diags, generated)
 }
 
 /// A top-level heading: its line index, level and plain text.
@@ -74,12 +187,22 @@ struct Item {
     text: String,
 }
 
-/// A top-level table: its line index, its header's first cell and each
-/// body row's line index and first cell.
+/// A top-level table: its line index and byte range, its header's first
+/// cell as plain text, its header's cells as written, and its body rows.
 struct Table {
     line: usize,
+    range: Range<usize>,
     header: String,
-    rows: Vec<(usize, String)>,
+    columns: Vec<String>,
+    rows: Vec<Row>,
+}
+
+/// A body row of a table: its line index, its first cell as plain text and
+/// its cells as written, trimmed.
+struct Row {
+    line: usize,
+    id: String,
+    cells: Vec<String>,
 }
 
 /// What the checker reads from design.md, as the CommonMark parser
@@ -181,26 +304,39 @@ impl Doc {
                 }
                 Event::Start(Tag::Table(_)) if containers == 0 => doc.tables.push(Table {
                     line,
+                    range: range.clone(),
                     header: String::new(),
+                    columns: Vec::new(),
                     rows: Vec::new(),
                 }),
                 Event::Start(Tag::TableHead) if containers == 0 => column = 0,
                 Event::Start(Tag::TableRow) if containers == 0 => {
                     column = 0;
                     if let Some(t) = doc.tables.last_mut() {
-                        t.rows.push((line, String::new()));
+                        t.rows.push(Row {
+                            line,
+                            id: String::new(),
+                            cells: Vec::new(),
+                        });
                     }
                 }
                 Event::Start(Tag::TableCell) if containers == 0 => {
                     into = Into::Cell(column == 0);
                     text.clear();
                     column += 1;
+                    if let Some(t) = doc.tables.last_mut() {
+                        let raw = source.get(range.clone()).unwrap_or("").trim().to_owned();
+                        match t.rows.last_mut() {
+                            Some(row) => row.cells.push(raw),
+                            None => t.columns.push(raw),
+                        }
+                    }
                 }
                 Event::End(TagEnd::TableCell) => {
                     if let (Into::Cell(true), Some(t)) = (&into, doc.tables.last_mut()) {
                         let cell = text.trim().to_owned();
                         match t.rows.last_mut() {
-                            Some(row) => row.1 = cell,
+                            Some(row) => row.id = cell,
                             None => t.header = cell,
                         }
                     }
@@ -244,13 +380,19 @@ fn section(headings: &[Heading], level: usize, text: &str) -> Option<(usize, usi
     let i = headings
         .iter()
         .position(|h| h.level == level && h.text == text)?;
-    let start = headings.get(i)?.line + 1;
+    section_at(headings, i)
+}
+
+/// The line range of the section under `headings[i]`, up to the next
+/// heading at its level or above.
+fn section_at(headings: &[Heading], i: usize) -> Option<(usize, usize)> {
+    let heading = headings.get(i)?;
     let stop = headings
         .iter()
         .skip(i + 1)
-        .find(|h| h.level <= level)
+        .find(|h| h.level <= heading.level)
         .map_or(usize::MAX, |h| h.line);
-    Some((start, stop))
+    Some((heading.line + 1, stop))
 }
 
 fn at(line: usize) -> String {
@@ -383,21 +525,34 @@ fn check_test(at: &str, file: &str, test: &str, source: &str, diags: &mut Vec<St
         }
         return;
     };
-    let attrs = attributes(&lines, def);
+    let (_, attrs) = attributes(&lines, def);
     let place = format!("`{file}:{}`", def + 1);
-    if !attrs.iter().any(|a| a == "#[test]") {
+    if !is_test(&attrs) {
         diags.push(format!("{at}: {place} `{test}` is not a #[test]"));
     }
-    if attrs.iter().any(|a| {
-        a.strip_prefix("#[ignore")
-            .is_some_and(|r| r.starts_with([']', ' ', '=']))
-    }) {
+    if is_ignored(&attrs) {
         diags.push(format!("{at}: {place} `{test}` is #[ignore]d"));
     }
 }
 
+fn is_test(attrs: &[String]) -> bool {
+    attrs.iter().any(|a| a == "#[test]")
+}
+
+fn is_ignored(attrs: &[String]) -> bool {
+    attrs.iter().any(|a| {
+        a.strip_prefix("#[ignore")
+            .is_some_and(|r| r.starts_with([']', ' ', '=']))
+    })
+}
+
 /// Whether `line` starts the definition of `fn name`.
 fn defines(line: &str, name: &str) -> bool {
+    fn_name(line) == Some(name)
+}
+
+/// The name of the fn whose definition `line` starts.
+fn fn_name(line: &str) -> Option<&str> {
     let mut rest = line.trim_start();
     'prefixes: loop {
         for prefix in [
@@ -415,15 +570,19 @@ fn defines(line: &str, name: &str) -> bool {
         }
         break;
     }
-    rest.strip_prefix("fn ")
-        .and_then(|r| r.strip_prefix(name))
-        .is_some_and(|r| r.starts_with(['(', '<']))
+    let rest = rest.strip_prefix("fn ")?;
+    let end = rest
+        .find(|c: char| !c.is_alphanumeric() && c != '_')
+        .unwrap_or(rest.len());
+    let (name, after) = rest.split_at(end);
+    (!name.is_empty() && after.starts_with(['(', '<'])).then_some(name)
 }
 
-/// The attributes, one string each, in the run of comments and attributes
-/// directly above line `def`. An attribute over several lines ends with a
-/// line ending in `]` and starts at the nearest `#[` above it.
-fn attributes(lines: &[&str], def: usize) -> Vec<String> {
+/// The first line index of the run of comments and attributes directly
+/// above line `def`, and its attributes, one string each. An attribute over
+/// several lines ends with a line ending in `]` and starts at the nearest
+/// `#[` above it.
+fn attributes(lines: &[&str], def: usize) -> (usize, Vec<String>) {
     let mut out = Vec::new();
     let mut i = def;
     while let Some(prev) = i.checked_sub(1) {
@@ -452,34 +611,41 @@ fn attributes(lines: &[&str], def: usize) -> Vec<String> {
             break;
         }
     }
-    out
+    (i, out)
 }
 
-fn threats(doc: &Doc, diags: &mut Vec<String>) {
+/// Whether `id` is `T` and two digits.
+fn well_formed(id: &str) -> bool {
+    id.strip_prefix('T')
+        .is_some_and(|n| n.len() == 2 && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Checks the threat table's IDs, and returns them; `None` when there is
+/// no table to read them from or one of its IDs is reported, since the
+/// Verification table is generated from a valid threat table only.
+fn threats(doc: &Doc, diags: &mut Vec<String>) -> Option<BTreeSet<String>> {
     let Some((start, stop)) = section(&doc.headings, 3, THREATS) else {
         diags.push(format!("{DESIGN}: no \"### {THREATS}\" section"));
-        return;
+        return None;
     };
     let Some(table) = doc.tables.iter().find(|t| (start..stop).contains(&t.line)) else {
         diags.push(format!("{DESIGN}: no table under \"### {THREATS}\""));
-        return;
+        return None;
     };
     if table.header != "ID" {
         diags.push(format!(
             "{}: the threat table's first column is not \"ID\"",
             at(table.line)
         ));
-        return;
+        return None;
     }
+    let reported = diags.len();
     let mut seen: BTreeMap<&str, usize> = BTreeMap::new();
-    for (line, id) in &table.rows {
-        let (line, id) = (*line, id.as_str());
-        let well_formed = id
-            .strip_prefix('T')
-            .is_some_and(|n| n.len() == 2 && n.bytes().all(|b| b.is_ascii_digit()));
+    for row in &table.rows {
+        let (line, id) = (row.line, row.id.as_str());
         if id.is_empty() {
             diags.push(format!("{}: the threat row has no ID", at(line)));
-        } else if !well_formed {
+        } else if !well_formed(id) {
             diags.push(format!(
                 "{}: threat ID `{id}` is not `T` and two digits",
                 at(line)
@@ -494,17 +660,166 @@ fn threats(doc: &Doc, diags: &mut Vec<String>) {
             seen.insert(id, line);
         }
     }
+    (diags.len() == reported).then(|| seen.into_keys().map(str::to_owned).collect())
+}
+
+/// The tagged tests: threat ID, then file, then test names.
+type Tagged = BTreeMap<String, BTreeMap<String, BTreeSet<String>>>;
+
+/// Checks the tags of `sources` and returns the tests they tag. A tag's ID
+/// is checked against `ids` when the threat table could be read.
+fn tags(
+    sources: &[(String, String)],
+    ids: Option<&BTreeSet<String>>,
+    diags: &mut Vec<String>,
+) -> Tagged {
+    let mut tagged = Tagged::new();
+    for (file, source) in sources {
+        let lines: Vec<&str> = source.lines().collect();
+        // Each fn: the start of its run, its line, its name.
+        let fns: Vec<(usize, usize, &str)> = lines
+            .iter()
+            .enumerate()
+            .filter_map(|(i, l)| fn_name(l).map(|name| (attributes(&lines, i).0, i, name)))
+            .collect();
+        for (i, line) in lines.iter().enumerate() {
+            let Some(rest) = line.trim().strip_prefix(TAG) else {
+                continue;
+            };
+            let place = format!("{file}:{}", i + 1);
+            let id = rest.trim();
+            if !well_formed(id) || !rest.starts_with(' ') {
+                diags.push(format!(
+                    "{place}: a tag is `{TAG} <ID>` with one threat ID, not `{}`",
+                    line.trim()
+                ));
+                continue;
+            }
+            let known = ids.is_none_or(|ids| ids.contains(id));
+            if !known {
+                diags.push(format!("{place}: `{id}` is not a threat ID"));
+            }
+            // The first fn below the tag, if the tag is in its run.
+            let below = fns.iter().find(|&&(_, def, _)| def > i);
+            let test = below.and_then(|&(start, def, name)| {
+                let (_, attrs) = attributes(&lines, def);
+                (start <= i && is_test(&attrs)).then_some((name, is_ignored(&attrs)))
+            });
+            match test {
+                None => diags.push(format!(
+                    "{place}: the tag is not in the comments and attributes directly above a #[test] fn"
+                )),
+                Some((name, true)) => {
+                    diags.push(format!("{place}: the tag is on `{name}`, which is #[ignore]d"));
+                }
+                Some((name, false)) if known => {
+                    tagged
+                        .entry(id.to_owned())
+                        .or_default()
+                        .entry(file.clone())
+                        .or_default()
+                        .insert(name.to_owned());
+                }
+                Some(_) => {}
+            }
+        }
+    }
+    tagged
+}
+
+/// Checks that the Verification table follows the threat section with its
+/// columns, and returns its generated text for its byte range.
+fn verification(
+    doc: &Doc,
+    design: &str,
+    ids: &BTreeSet<String>,
+    tagged: &Tagged,
+    diags: &mut Vec<String>,
+) -> Option<Generated> {
+    let threats = doc
+        .headings
+        .iter()
+        .position(|h| h.level == 3 && h.text == THREATS)?;
+    let next = threats + 1;
+    let Some((start, stop)) = doc
+        .headings
+        .get(next)
+        .filter(|h| h.level == 3 && h.text == VERIFICATION)
+        .and_then(|_| section_at(&doc.headings, next))
+    else {
+        diags.push(format!(
+            "{DESIGN}: no \"### {VERIFICATION}\" section right after \"### {THREATS}\""
+        ));
+        return None;
+    };
+    let Some(table) = doc.tables.iter().find(|t| (start..stop).contains(&t.line)) else {
+        diags.push(format!("{DESIGN}: no table under \"### {VERIFICATION}\""));
+        return None;
+    };
+    if table.columns != ["ID", "Tagged tests", "Note"] {
+        diags.push(format!(
+            "{}: the {VERIFICATION} table's columns are not \"ID\", \"Tagged tests\" and \"Note\"",
+            at(table.line)
+        ));
+        return None;
+    }
+    let current = design.get(table.range.clone())?;
+    let eol = if current.split('\n').next()?.ends_with('\r') {
+        "\r\n"
+    } else {
+        "\n"
+    };
+    let mut notes: BTreeMap<&str, &str> = BTreeMap::new();
+    for row in &table.rows {
+        if let Some(note) = row.cells.get(2) {
+            notes.entry(row.id.as_str()).or_insert(note.as_str());
+        }
+    }
+    let mut lines = vec![
+        "| ID | Tagged tests | Note |".to_owned(),
+        "| --- | --- | --- |".to_owned(),
+    ];
+    for id in ids {
+        let cell = match tagged.get(id) {
+            None => "Unverified".to_owned(),
+            Some(files) => files
+                .iter()
+                .map(|(file, tests)| {
+                    let tests: Vec<String> = tests.iter().map(|t| format!("`{t}`")).collect();
+                    format!("`{file}`: {}", tests.join(", "))
+                })
+                .collect::<Vec<_>>()
+                .join("; "),
+        };
+        let note = notes.get(id.as_str()).copied().unwrap_or("");
+        lines.push(if note.is_empty() {
+            format!("| {id} | {cell} | |")
+        } else {
+            format!("| {id} | {cell} | {note} |")
+        });
+    }
+    let mut text = lines.join(eol);
+    if current.ends_with('\n') {
+        text.push_str(eol);
+    }
+    Some(Generated {
+        range: table.range.clone(),
+        line: table.line,
+        text,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use std::io;
 
-    use super::check;
+    use super::{check, update};
 
     const TESTS: &str = "crates/a/tests/a.rs";
+    const TAGGED: &str = "crates/b/tests/b.rs";
 
-    /// A design.md excerpt that passes, citing two tests of [`TESTS`].
+    /// A design.md excerpt that passes, citing two tests of [`TESTS`] and
+    /// listing the tagged tests of [`TAGGED_SOURCE`].
     const DESIGN: &str = "\
 # Design
 
@@ -524,6 +839,13 @@ The watermark prose.
 | T02 | Archives | zip slip |
 
 Notes on the table.
+
+### Verification
+
+| ID | Tagged tests | Note |
+| --- | --- | --- |
+| T01 | `crates/b/tests/b.rs`: `bounded`, `generated` | |
+| T02 | Unverified | CI step \"Archives\" |
 
 ## Behavioral Contract
 
@@ -563,14 +885,57 @@ fn ignored() {}
 fn with_a_long_attribute() {}
 ";
 
-    fn run(design: &str, source: &str) -> Vec<String> {
-        check(design, |file| {
+    /// The tagged test file: two tagged tests, one in a proptest body, and
+    /// a helper, a const and an ignored test, all untagged.
+    const TAGGED_SOURCE: &str = "\
+/// A test of T01.
+// Covers: T01
+#[test]
+fn bounded() {}
+
+fn helper() {}
+
+const LIMIT: u8 = 1;
+
+proptest! {
+    // Covers: T01
+    #[test]
+    fn generated(x in 0..1) {}
+}
+
+#[test]
+#[ignore = \"slow\"]
+fn ignored() {}
+";
+
+    fn read(source: &str) -> impl Fn(&str) -> io::Result<String> {
+        move |file| {
             if file == TESTS {
                 Ok(source.to_owned())
             } else {
                 Err(io::ErrorKind::NotFound.into())
             }
-        })
+        }
+    }
+
+    /// The tagged sources, [`TAGGED`] holding `tagged`.
+    fn sources(tagged: &str) -> Vec<(String, String)> {
+        vec![(TAGGED.to_owned(), tagged.to_owned())]
+    }
+
+    /// The check of `design` with [`TESTS`] holding `source`.
+    fn run(design: &str, source: &str) -> Vec<String> {
+        check(design, &sources(TAGGED_SOURCE), read(source))
+    }
+
+    /// The check of `DESIGN` with [`TAGGED`] holding `tagged`.
+    fn run_tagged(tagged: &str) -> Vec<String> {
+        check(DESIGN, &sources(tagged), read(SOURCE))
+    }
+
+    /// `--update` of `design` with [`TAGGED`] holding `tagged`.
+    fn update_tagged(design: &str, tagged: &str) -> (String, Vec<String>) {
+        update(design, &sources(tagged), read(SOURCE))
     }
 
     /// `DESIGN` with `from` replaced by `to`, which must occur once.
@@ -584,7 +949,7 @@ fn with_a_long_attribute() {}
         design_with("`crates/a/tests/a.rs::judged_once`", to)
     }
 
-    const FIRST: &str = "docs/design.md:24";
+    const FIRST: &str = "docs/design.md:31";
 
     #[test]
     fn the_valid_fixture_passes() {
@@ -682,7 +1047,7 @@ fn with_a_long_attribute() {}
             run(&renamed, SOURCE),
             [
                 format!("{FIRST}: \"Watermark\" is not a design.md heading"),
-                "docs/design.md:25: \"Watermark\" is not a design.md heading".to_owned(),
+                "docs/design.md:32: \"Watermark\" is not a design.md heading".to_owned(),
             ]
         );
         // The headings the check reads under.
@@ -695,7 +1060,7 @@ fn with_a_long_attribute() {}
         assert_eq!(
             run(&threats, SOURCE),
             [
-                "docs/design.md:25: \"Threats and Mitigations\" is not a design.md heading",
+                "docs/design.md:32: \"Threats and Mitigations\" is not a design.md heading",
                 "docs/design.md: no \"### Threats and Mitigations\" section",
             ]
         );
@@ -710,19 +1075,19 @@ fn with_a_long_attribute() {}
     #[test]
     fn missing_malformed_and_duplicate_threat_ids_are_reported() {
         assert_eq!(
-            run(&design_with("| T02 |", "|  |"), SOURCE),
+            run(&design_with("| T02 | Archives", "|  | Archives"), SOURCE),
             ["docs/design.md:16: the threat row has no ID"]
         );
         assert_eq!(
-            run(&design_with("| T02 |", "| T2 |"), SOURCE),
+            run(&design_with("| T02 | Archives", "| T2 | Archives"), SOURCE),
             ["docs/design.md:16: threat ID `T2` is not `T` and two digits"]
         );
         assert_eq!(
-            run(&design_with("| T02 |", "| T01 |"), SOURCE),
+            run(&design_with("| T02 | Archives", "| T01 | Archives"), SOURCE),
             ["docs/design.md:16: threat ID `T01` is already used on line 15"]
         );
         assert_eq!(
-            run(&design_with("| ID |", "| Key |"), SOURCE),
+            run(&design_with("| ID | Attack", "| Key | Attack"), SOURCE),
             ["docs/design.md:13: the threat table's first column is not \"ID\""]
         );
     }
@@ -762,14 +1127,14 @@ fn with_a_long_attribute() {}
         let hidden = hidden.replace("once (\"Watermark\")", "once (\"Hidden\")");
         assert_eq!(
             run(&hidden, SOURCE),
-            ["docs/design.md:30: \"Hidden\" is not a design.md heading"]
+            ["docs/design.md:37: \"Hidden\" is not a design.md heading"]
         );
     }
 
     #[test]
     fn an_indented_threat_row_is_still_checked() {
         assert_eq!(
-            run(&design_with("| T02 |", "  |  |"), SOURCE),
+            run(&design_with("| T02 | Archives", "  |  | Archives"), SOURCE),
             ["docs/design.md:16: the threat row has no ID"]
         );
     }
@@ -796,7 +1161,7 @@ fn with_a_long_attribute() {}
         let hidden = hidden.replace("once (\"Watermark\")", "once (\"Hidden\")");
         assert_eq!(
             run(&hidden, SOURCE),
-            ["docs/design.md:30: \"Hidden\" is not a design.md heading"]
+            ["docs/design.md:37: \"Hidden\" is not a design.md heading"]
         );
     }
 
@@ -821,7 +1186,7 @@ fn with_a_long_attribute() {}
         );
         assert_eq!(
             run(&quoted, SOURCE),
-            ["docs/design.md:26: the clause has no `Spec:`"]
+            ["docs/design.md:33: the clause has no `Spec:`"]
         );
     }
 
@@ -836,8 +1201,8 @@ fn with_a_long_attribute() {}
         assert_eq!(
             run(&two_lines, SOURCE),
             [
-                "docs/design.md:26: \"Watermark\" is not a design.md heading",
-                "docs/design.md:27: \"Watermark\" is not a design.md heading",
+                "docs/design.md:33: \"Watermark\" is not a design.md heading",
+                "docs/design.md:34: \"Watermark\" is not a design.md heading",
             ]
         );
         let cited = two_lines.replace("\"Watermark\"", "\"Watermark continued\"");
@@ -855,8 +1220,8 @@ fn with_a_long_attribute() {}
         assert_eq!(
             run(&heading("## Watermark\t###\n"), SOURCE),
             [
-                "docs/design.md:24: \"Watermark\" is not a design.md heading",
-                "docs/design.md:25: \"Watermark\" is not a design.md heading",
+                "docs/design.md:31: \"Watermark\" is not a design.md heading",
+                "docs/design.md:32: \"Watermark\" is not a design.md heading",
             ]
         );
     }
@@ -866,8 +1231,8 @@ fn with_a_long_attribute() {}
         assert_eq!(
             run(&heading("#Watermark\n---\n"), SOURCE),
             [
-                "docs/design.md:25: \"Watermark\" is not a design.md heading",
-                "docs/design.md:26: \"Watermark\" is not a design.md heading",
+                "docs/design.md:32: \"Watermark\" is not a design.md heading",
+                "docs/design.md:33: \"Watermark\" is not a design.md heading",
             ]
         );
     }
@@ -904,7 +1269,7 @@ fn with_a_long_attribute() {}
     #[test]
     fn crlf_line_endings_keep_the_line_numbers() {
         let crlf = design_with("SHALL judge", "judges")
-            .replace("| T02 |", "|  |")
+            .replace("| T02 | Archives", "|  | Archives")
             .replace('\n', "\r\n");
         assert_eq!(
             run(&crlf, SOURCE),
@@ -920,6 +1285,190 @@ fn with_a_long_attribute() {}
         assert_eq!(
             run(&design_with("SHALL judge", "SHALLOW judges"), SOURCE),
             [format!("{FIRST}: the clause has no SHALL")]
+        );
+    }
+
+    /// `TAGGED_SOURCE` with `from` replaced by `to`, which must occur once.
+    fn tagged_with(from: &str, to: &str) -> String {
+        assert_eq!(TAGGED_SOURCE.matches(from).count(), 1, "{from}");
+        TAGGED_SOURCE.replace(from, to)
+    }
+
+    /// The tag above `bounded`.
+    const BOUNDED: &str = "// Covers: T01\n#[test]\nfn bounded";
+    /// The fixture's generated row of T01.
+    const T01_ROW: &str = "| T01 | `crates/b/tests/b.rs`: `bounded`, `generated` | |";
+    const STALE: &str = "the Verification table is not the generated one; run `cargo xtask check-contract --update`";
+
+    #[test]
+    fn an_unknown_or_malformed_tag_is_reported() {
+        let unknown = tagged_with(BOUNDED, &format!("// Covers: T09\n{BOUNDED}"));
+        assert_eq!(
+            run_tagged(&unknown),
+            ["crates/b/tests/b.rs:2: `T09` is not a threat ID"]
+        );
+        // One threat ID per tag line.
+        let two = tagged_with(BOUNDED, &format!("// Covers: T01, T02\n{BOUNDED}"));
+        assert_eq!(
+            run_tagged(&two),
+            [
+                "crates/b/tests/b.rs:2: a tag is `// Covers: <ID>` with one threat ID, not `// Covers: T01, T02`"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_stray_tag_is_reported() {
+        let stray = "the tag is not in the comments and attributes directly above a #[test] fn";
+        let helper = tagged_with("fn helper", "// Covers: T01\nfn helper");
+        assert_eq!(
+            run_tagged(&helper),
+            [format!("crates/b/tests/b.rs:6: {stray}")]
+        );
+        let constant = tagged_with("const LIMIT", "// Covers: T01\nconst LIMIT");
+        assert_eq!(
+            run_tagged(&constant),
+            [format!("crates/b/tests/b.rs:8: {stray}")]
+        );
+        let last = format!("{TAGGED_SOURCE}// Covers: T01\n");
+        assert_eq!(
+            run_tagged(&last),
+            [format!("crates/b/tests/b.rs:19: {stray}")]
+        );
+    }
+
+    #[test]
+    fn a_tag_on_an_ignored_test_is_reported() {
+        let ignored = tagged_with("#[test]\n#[ignore", "// Covers: T01\n#[test]\n#[ignore");
+        assert_eq!(
+            run_tagged(&ignored),
+            ["crates/b/tests/b.rs:16: the tag is on `ignored`, which is #[ignore]d"]
+        );
+    }
+
+    #[test]
+    fn only_rust_files_under_crates_are_scanned_for_tags() {
+        let root = tempfile::tempdir().unwrap();
+        let write = |path: &str, text: &str| {
+            let path = root.path().join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        let tag = "// Covers: T01\n#[test]\nfn t() {}\n";
+        write("crates/a/tests/t.rs", tag);
+        write("crates/a/src/lib.rs", "fn untagged() {}\n");
+        write("crates/a/notes.txt", tag);
+        write("xtask/src/fixture.rs", tag);
+        assert_eq!(
+            super::sources(root.path()).unwrap(),
+            [("crates/a/tests/t.rs".to_owned(), tag.to_owned())]
+        );
+    }
+
+    #[test]
+    fn a_threat_without_tags_is_unverified_and_passes() {
+        let design = design_with(T01_ROW, "| T01 | Unverified | |");
+        assert_eq!(check(&design, &[], read(SOURCE)), Vec::<String>::new());
+        assert_eq!(
+            update(&design, &[], read(SOURCE)),
+            (design.clone(), Vec::new())
+        );
+    }
+
+    #[test]
+    fn a_stale_table_is_reported_and_update_regenerates_it() {
+        // A new tagged test of T02.
+        let added = format!("{TAGGED_SOURCE}\n// Covers: T02\n#[test]\nfn extracted() {{}}\n");
+        assert_eq!(run_tagged(&added), [format!("docs/design.md:25: {STALE}")]);
+        let expected = design_with(
+            "| T02 | Unverified | CI step \"Archives\" |",
+            "| T02 | `crates/b/tests/b.rs`: `extracted` | CI step \"Archives\" |",
+        );
+        assert_eq!(
+            update_tagged(DESIGN, &added),
+            (expected.clone(), Vec::new())
+        );
+        // A second update changes nothing, and the result passes.
+        assert_eq!(
+            update_tagged(&expected, &added),
+            (expected.clone(), Vec::new())
+        );
+        assert_eq!(
+            check(&expected, &sources(&added), read(SOURCE)),
+            Vec::<String>::new()
+        );
+        // A removed tag and a renamed test leave the table stale too.
+        let removed = tagged_with(BOUNDED, "#[test]\nfn bounded");
+        assert_eq!(
+            run_tagged(&removed),
+            [format!("docs/design.md:24: {STALE}")]
+        );
+        let renamed = tagged_with("fn bounded", "fn bounded_by_the_cap");
+        assert_eq!(
+            run_tagged(&renamed),
+            [format!("docs/design.md:24: {STALE}")]
+        );
+        assert_eq!(
+            update_tagged(DESIGN, &renamed).0,
+            design_with(
+                T01_ROW,
+                "| T01 | `crates/b/tests/b.rs`: `bounded_by_the_cap`, `generated` | |"
+            )
+        );
+    }
+
+    #[test]
+    fn update_keeps_a_note_as_written() {
+        // A stale cell beside a note with markup and an escaped pipe.
+        let noted = design_with(T01_ROW, "| T01 | old | `a \\| b` and *c* |");
+        assert_eq!(run(&noted, SOURCE), [format!("docs/design.md:24: {STALE}")]);
+        let expected = design_with(
+            T01_ROW,
+            "| T01 | `crates/b/tests/b.rs`: `bounded`, `generated` | `a \\| b` and *c* |",
+        );
+        assert_eq!(update_tagged(&noted, TAGGED_SOURCE), (expected, Vec::new()));
+    }
+
+    #[test]
+    fn update_keeps_crlf_line_endings() {
+        let crlf = DESIGN.replace('\n', "\r\n");
+        let stale = design_with(T01_ROW, "| T01 | old | |").replace('\n', "\r\n");
+        assert_eq!(run(&stale, SOURCE), [format!("docs/design.md:24: {STALE}")]);
+        assert_eq!(update_tagged(&stale, TAGGED_SOURCE), (crlf, Vec::new()));
+    }
+
+    #[test]
+    fn tagged_tests_are_ordered_by_id_file_and_name() {
+        // Files out of path order, tests out of name order, IDs mixed.
+        let z = "// Covers: T02\n#[test]\nfn zeta() {}\n\n// Covers: T02\n// Covers: T01\n#[test]\nfn alpha() {}\n";
+        let a = "mod tests {\n    // Covers: T02\n    #[test]\n    fn mid() {}\n    // Covers: T02\n    #[test]\n    fn beta() {}\n}\n";
+        let shuffled = [
+            ("crates/z/tests/z.rs".to_owned(), z.to_owned()),
+            ("crates/a/src/lib.rs".to_owned(), a.to_owned()),
+        ];
+        let expected = design_with(T01_ROW, "| T01 | `crates/z/tests/z.rs`: `alpha` | |").replace(
+            "| T02 | Unverified |",
+            "| T02 | `crates/a/src/lib.rs`: `beta`, `mid`; `crates/z/tests/z.rs`: `alpha`, `zeta` |",
+        );
+        assert_eq!(
+            update(DESIGN, &shuffled, read(SOURCE)),
+            (expected, Vec::new())
+        );
+    }
+
+    #[test]
+    fn a_missing_or_misshapen_verification_table_is_reported() {
+        assert_eq!(
+            run(&design_with("### Verification", "### Evidence"), SOURCE),
+            [
+                "docs/design.md: no \"### Verification\" section right after \"### Threats and Mitigations\""
+            ]
+        );
+        assert_eq!(
+            run(&design_with("| Tagged tests |", "| Tests |"), SOURCE),
+            [
+                "docs/design.md:22: the Verification table's columns are not \"ID\", \"Tagged tests\" and \"Note\""
+            ]
         );
     }
 }

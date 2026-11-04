@@ -561,6 +561,7 @@ fn growing(last: usize, notes: usize) -> String {
     text
 }
 
+// Covers: T01
 #[test]
 fn time_size_cap_is_reached_at_the_computed_measure() {
     // An independent script sums the exact fractions: entering measure 808
@@ -574,6 +575,7 @@ fn time_size_cap_is_reached_at_the_computed_measure() {
     );
 }
 
+// Covers: T01
 #[test]
 fn a_stop_that_overflows_the_time_cap_is_refused() {
     // Measure 0 starts with a 1-unit STOP at BPM 3: 1_250_000 / 3 µs, a
