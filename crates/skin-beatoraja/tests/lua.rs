@@ -1073,7 +1073,10 @@ fn cancellation_stops_a_running_pass() {
 #[test]
 fn results_and_errors_cross_threads() {
     fn send<T: Send + 'static>() {}
+    fn sync<T: Sync>() {}
     send::<LuaHeader>();
+    // Shared by every specialization of a pending skin.
+    sync::<LuaHeader>();
     send::<LuaImported>();
     send::<ImportError>();
     let d = folder(&[("s.luaskin", &drawn(""))]);

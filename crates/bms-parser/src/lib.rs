@@ -244,6 +244,8 @@ pub struct Labels {
     pub subartist: String,
     /// `#GENRE`.
     pub genre: String,
+    /// `#PLAYLEVEL`, as text: a reader parses it by its own rules.
+    pub playlevel: String,
 }
 
 /// A loaded chart and what the loader skipped or assumed.
