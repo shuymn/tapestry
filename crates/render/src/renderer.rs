@@ -721,6 +721,10 @@ pub struct Renderer {
     /// A unit test's hooks into the text upload.
     #[cfg(test)]
     pub(crate) text_hooks: text_upload::Hooks,
+    /// Development builds: the next text preparation's wait for the GPU
+    /// fails ([`fail_next_text_wait`](Self::fail_next_text_wait)).
+    #[cfg(feature = "dev-tools")]
+    text_wait_fault: bool,
 }
 
 impl Renderer {
@@ -823,6 +827,8 @@ impl Renderer {
             buffer_fault: false,
             #[cfg(test)]
             text_hooks: text_upload::Hooks::default(),
+            #[cfg(feature = "dev-tools")]
+            text_wait_fault: false,
             id: RENDERERS.fetch_add(1, Ordering::Relaxed),
         })
     }
@@ -1307,6 +1313,8 @@ impl Renderer {
                         held: &held,
                         #[cfg(test)]
                         hooks: &mut self.text_hooks,
+                        #[cfg(feature = "dev-tools")]
+                        wait_fault: &mut self.text_wait_fault,
                     },
                     &bundle
                         .skin()
@@ -1953,6 +1961,8 @@ impl Renderer {
                         held: &held,
                         #[cfg(test)]
                         hooks: &mut self.text_hooks,
+                        #[cfg(feature = "dev-tools")]
+                        wait_fault: &mut self.text_wait_fault,
                     },
                     &requests,
                     skin.text_slots(),
@@ -1973,6 +1983,15 @@ impl Renderer {
             holder,
         });
         Ok(())
+    }
+
+    /// Development builds: the next preparation of rasterized text that
+    /// uploads fails waiting for the GPU as a failing device does
+    /// ([`RenderError::Poll`], not a refusal), its cache closed until the
+    /// renderer is built again.
+    #[cfg(feature = "dev-tools")]
+    pub fn fail_next_text_wait(&mut self) {
+        self.text_wait_fault = true;
     }
 
     /// The loading lifetime and revision of the text staged, if any.

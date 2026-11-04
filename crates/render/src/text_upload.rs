@@ -150,6 +150,10 @@ pub(crate) struct Prepare<'a> {
     pub(crate) held: &'a [&'a Holder],
     #[cfg(test)]
     pub(crate) hooks: &'a mut Hooks,
+    /// Development builds: the wait fails, taking it, as a device failing
+    /// would ([`crate::Renderer::fail_next_text_wait`]).
+    #[cfg(feature = "dev-tools")]
+    pub(crate) wait_fault: &'a mut bool,
 }
 
 /// Prepares the rasterized lines of `requests` (in slot order) for a
@@ -241,11 +245,17 @@ pub(crate) fn prepare(
     // no device-lost callback is registered), a gap left open here. Only a
     // failing wait is treated as the device's failure below.
     let waited = if submission.is_some() {
-        // A unit test may make the wait fail in place of waiting.
+        // A unit test, or a development build, may make the wait fail in
+        // place of waiting.
         #[cfg(test)]
         let injected = hooks.wait.take();
         #[cfg(not(test))]
         let injected: Option<RenderError> = None;
+        #[cfg(feature = "dev-tools")]
+        let injected = injected.or_else(|| {
+            std::mem::take(&mut *p.wait_fault)
+                .then_some(RenderError::Poll(wgpu::PollError::Timeout))
+        });
         let w = match injected {
             Some(e) => Err(e),
             None => wait_for_gpu(p.gpu),

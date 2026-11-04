@@ -8421,6 +8421,10 @@ pub(crate) mod tests {
         builds: Arc<AtomicU32>,
         resize: Resize,
         fail: Arc<AtomicBool>,
+        /// Taken by the next loading frame: its renderer's next text
+        /// preparation fails waiting for the GPU.
+        #[cfg(feature = "dev-tools")]
+        text_fault: Arc<AtomicBool>,
     }
 
     impl Recorder {
@@ -8563,6 +8567,10 @@ pub(crate) mod tests {
             if self.fail.load(Ordering::Acquire) {
                 return Err(RenderError::SurfaceLost);
             }
+            #[cfg(feature = "dev-tools")]
+            if self.text_fault.swap(false, Ordering::AcqRel) {
+                self.menu.renderer_mut().fail_next_text_wait();
+            }
             {
                 let mut resize = self.resize.lock().unwrap();
                 if let Some((at, (w, h))) = *resize
@@ -8596,6 +8604,10 @@ pub(crate) mod tests {
         resize: Resize,
         fail: Arc<AtomicBool>,
         made: Arc<AtomicU32>,
+        /// Set: the next loading frame's renderer fails its next text
+        /// preparation's wait for the GPU.
+        #[cfg(feature = "dev-tools")]
+        text_fault: Arc<AtomicBool>,
     }
 
     impl Recording {
@@ -8607,6 +8619,10 @@ pub(crate) mod tests {
             let resize: Resize = Arc::new(std::sync::Mutex::new(None));
             let fail = Arc::new(AtomicBool::new(false));
             let made = Arc::new(AtomicU32::new(0));
+            #[cfg(feature = "dev-tools")]
+            let text_fault = Arc::new(AtomicBool::new(false));
+            #[cfg(feature = "dev-tools")]
+            let t = Arc::clone(&text_fault);
             let (s, b, r, f, m) = (
                 Arc::clone(&shots),
                 Arc::clone(&builds),
@@ -8632,6 +8648,8 @@ pub(crate) mod tests {
                     builds: Arc::clone(&b),
                     resize: Arc::clone(&r),
                     fail: Arc::clone(&f),
+                    #[cfg(feature = "dev-tools")]
+                    text_fault: Arc::clone(&t),
                 }) as Box<dyn Screen>)
             });
             let recording = Self {
@@ -8640,6 +8658,8 @@ pub(crate) mod tests {
                 resize,
                 fail,
                 made,
+                #[cfg(feature = "dev-tools")]
+                text_fault,
             };
             (spawn_empty(make), recording)
         }
@@ -9068,6 +9088,76 @@ pub(crate) mod tests {
             shots[..end].iter().all(|s| s.when == Some(when)),
             "{shots:?}"
         );
+    }
+
+    /// The device failing while the loading text's upload is waited for
+    /// is not a refused text: the screen is dropped as after any device
+    /// failure, its text layer's cache closed with it, and the screen built
+    /// again prepares the chosen chart's text afresh and draws it.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn a_device_failure_preparing_loading_text_drops_the_screen() {
+        let (link, rec, _text, _dir) = bridge_recording();
+        link.begin_loading(&chosen_by("T", Some("x")), None);
+        let sink = link.loading();
+        sink.report(LoadInput::Stage(Stage::Chart), Some(one_line("T")));
+        let shown = rec.until(0, |s| s.red.is_some_and(|r| r.title && r.artist));
+        let first_device = rec.shots()[0].device;
+        rec.text_fault.store(true, Ordering::Release);
+        sink.report(
+            LoadInput::Chart(ChosenChart {
+                title: Some("T".to_owned()),
+                artist: Some("y".to_owned()),
+                ..ChosenChart::default()
+            }),
+            None,
+        );
+        assert!(wait_until(|| link.failed()), "the screen was kept");
+        link.prepare().unwrap();
+        sink.report(LoadInput::Stage(Stage::Loudness), Some(one_line("T")));
+        rec.until(shown, |s| {
+            s.device != first_device && s.red.is_some_and(|r| r.title && r.artist)
+        });
+        link.end_loading().unwrap();
+        link.exit();
+        assert_eq!(rec.made.load(Ordering::SeqCst), 2);
+    }
+
+    /// A refusal at one size is forgotten once a later preparation
+    /// installs: text installed at 1920 × 1080, refused at 960 × 540, then
+    /// installed again at 1920 × 1080; back at 960 × 540 the slots are
+    /// prepared for that size again, never kept with the larger size's
+    /// lines.
+    #[test]
+    fn a_refusal_is_forgotten_once_text_installs() {
+        let (link, rec, text, _dir) = bridge_recording();
+        link.begin_loading(&chosen_by("T", Some("x")), None);
+        let sink = link.loading();
+        sink.report(LoadInput::Stage(Stage::Chart), Some(one_line("T")));
+        let shown = rec.until(0, |s| s.red.is_some_and(|r| r.title && r.artist));
+        text.refuse.store(true, Ordering::SeqCst);
+        *rec.resize.lock().unwrap() = Some((None, (960, 540)));
+        let small = rec.until(shown, |s| s.target == [960, 540]);
+        let refused = rec.more(small, 2);
+        text.refuse.store(false, Ordering::SeqCst);
+        *rec.resize.lock().unwrap() = Some((None, (1_920, 1_080)));
+        let back = rec.until(refused, |s| {
+            s.target == [1_920, 1_080] && s.staged == 0 && s.red.is_some_and(|r| r.title)
+        });
+        let laid = text.strings.lock().unwrap().len();
+        *rec.resize.lock().unwrap() = Some((None, (960, 540)));
+        let again = rec.until(back, |s| s.target == [960, 540]);
+        let end = rec.more(again, 3);
+        link.end_loading().unwrap();
+        link.exit();
+
+        let shots = rec.shots();
+        let at_small: Vec<&Shot> = shots[back..end]
+            .iter()
+            .filter(|s| s.target == [960, 540])
+            .collect();
+        assert!(at_small.iter().any(|s| s.staged > 0), "{at_small:?}");
+        assert!(text.strings.lock().unwrap().len() > laid);
     }
 
     /// Within one lifetime the loading clock and the `when` timer go on
