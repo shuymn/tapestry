@@ -497,10 +497,7 @@ impl Loader {
 pub fn quad_texel(atlas: &Atlas, q: &Quad) -> [u8; 4] {
     let side = atlas.side();
     let at = |a: f32, b: f32| ((a + b) / 2.0 * side as f32) as u32;
-    let (x, y) = (at(q.uv[0], q.uv[2]), at(q.uv[1], q.uv[3]));
-    let level = atlas.pages()[usize::from(q.layer) - 1].level(0).unwrap();
-    let i = ((y * side + x) * 4) as usize;
-    level[i..i + 4].try_into().unwrap()
+    texel(atlas, q, at(q.uv[0], q.uv[2]), at(q.uv[1], q.uv[3]))
 }
 
 /// The atlas texel at fraction `fu` across and `fv` down `q`'s uv, from
@@ -514,9 +511,13 @@ pub fn quad_texel(atlas: &Atlas, q: &Quad) -> [u8; 4] {
 pub fn texel_at(atlas: &Atlas, q: &Quad, fu: f32, fv: f32) -> [u8; 4] {
     let side = atlas.side();
     let at = |a: f32, b: f32, f: f32| ((a + (b - a) * f) * side as f32) as u32;
-    let (x, y) = (at(q.uv[0], q.uv[2], fu), at(q.uv[1], q.uv[3], fv));
+    texel(atlas, q, at(q.uv[0], q.uv[2], fu), at(q.uv[1], q.uv[3], fv))
+}
+
+/// The texel at column `x`, row `y` of `q`'s page, from its first level.
+fn texel(atlas: &Atlas, q: &Quad, x: u32, y: u32) -> [u8; 4] {
     let level = atlas.pages()[usize::from(q.layer) - 1].level(0).unwrap();
-    let i = ((y * side + x) * 4) as usize;
+    let i = usize::try_from((y * atlas.side() + x) * 4).unwrap();
     level[i..i + 4].try_into().unwrap()
 }
 

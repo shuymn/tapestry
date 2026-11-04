@@ -261,7 +261,8 @@ fn back_nodes_past_the_edge_draw_the_edge_column() {
     let quads = Drawn::with_look(skin, 100, GaugeLook::Hazard).frame(1_000, &[]);
     let at = |q, u, v| common::play::texel_at(&atlas, q, u, v);
     let back: Vec<_> = quads.iter().filter(|q| at(q, 0.5, 0.5)[0] == 63).collect();
-    assert_eq!(back.len(), quads.len() - 1);
+    // Ten segments at the start value: one front, nine back.
+    assert_eq!((quads.len(), back.len()), (10, 9));
     for q in back {
         let top = at(q, 0.1, 0.1);
         assert!(
