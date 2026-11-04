@@ -8841,21 +8841,7 @@ pub(crate) mod tests {
     /// the renderer's memory until installed.
     #[test]
     fn a_lifetimes_descriptor_and_chart_text_change_in_place() {
-        let (link, rec) = Recording::new();
-        let dir = tempfile::tempdir().unwrap();
-        let (skin, text) = crate::render_decl::bundle(
-            &crate::render_common::offscreen(1_920, 1_080),
-            dir.path(),
-            &bridge_look(),
-        );
-        let text = text.unwrap();
-        let chart = Arc::new(ChartBuilder::new(120_000).build().unwrap());
-        link.load(Arc::clone(&chart), None).unwrap();
-        assert_eq!(
-            link.select(ScreenKind::Play, Some(skin)).wait().unwrap(),
-            Preparation::Ready
-        );
-
+        let (link, rec, text, _dir) = bridge_recording();
         link.begin_loading(&chosen_by("T", Some("x")), None);
         let sink = link.loading();
         sink.report(LoadInput::Stage(Stage::Chart), Some(one_line("T")));
