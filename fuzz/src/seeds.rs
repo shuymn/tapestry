@@ -816,6 +816,9 @@ pub fn skin_jsons() -> Vec<Seed> {
             ]),
         ),
         ("not_play", skin_input(&[r#"{"type": 1}"#])),
+        ("header_selection", skin_input(&[r#"{"type": 5}"#])),
+        ("header_decision", skin_input(&[r#"{"type": 6}"#])),
+        ("header_result", skin_input(&[r#"{"type": 7}"#])),
         ("size", skin_input(&[r#"{"type": 0, "w": 1366, "h": 768}"#])),
         (
             "syntax",
@@ -919,6 +922,8 @@ fn lua_input(files: &[&str]) -> Vec<u8> {
 /// [`crate::lua_facts`]'s bytes for autoplay off and for `#RANK 2`.
 pub const LUA_AUTOPLAY_OFF: u8 = 1;
 pub const LUA_RANK_2: u8 = (10 << 2) | 2;
+/// [`crate::lua_facts`]'s first byte for a result scene.
+pub const LUA_RESULT_SCENE: u8 = u8::MAX;
 
 /// The header of the `skin_lua` seeds: an option, a file choice over the
 /// folder's PNGs and an offset. The configured pass adds `body`.
@@ -945,7 +950,10 @@ return skin
 /// one refusal per boundary: a callback with an unknown effect, a write
 /// to a host module, the instruction and memory caps (also inside a
 /// protected call), a path out of the folder, a coroutine, malformed
-/// Lua and a value that is no table.
+/// Lua and a value that is no table; then a selection skin in its own
+/// slot, which has no importer yet, and a play skin in the result slot
+/// and one whose configured pass returns the result type, each in
+/// another kind's slot.
 #[must_use]
 pub fn skin_luas() -> Vec<Seed> {
     let config = lua_skin(
@@ -1035,6 +1043,13 @@ assert(not ms.option(33) and ms.option(32) and ms.option(182) and not ms.option(
         ),
         ("syntax", lua_input(&["return {"])),
         ("not_table", lua_input(&["return 1"])),
+        ("lua_selection", lua_input(&["return { type = 5 }"])),
+        ("slot_scene", {
+            let mut input = lua_input(&[&lua_skin("")]);
+            input[0] = LUA_RESULT_SCENE;
+            input
+        }),
+        ("slot_retype", lua_input(&[&lua_skin("skin.type = 7")])),
     ]
 }
 

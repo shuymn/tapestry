@@ -7,6 +7,7 @@ use super::asset::ADMITS;
 use super::report::WALKED;
 use super::{Config, Event, Imported, NoteKind, Severity, TRACE, import};
 use crate::error::ImportError;
+use skin_model::ScreenKind;
 
 fn png(root: &Path, name: &str, w: u32, h: u32) {
     let file = std::fs::File::create(root.join(name)).unwrap();
@@ -515,4 +516,78 @@ fn image_choices_charge_their_entries_before_their_tables_and_images() {
     let (r, trace, _) = run(&group);
     r.unwrap();
     assert_eq!(trace, [Charge, Refs, Compile, Charge, Admit, Table]);
+}
+
+/// A skin of type `ty` whose configured resolution includes `trap.json`
+/// (option 901, on by default, which the header pass leaves off) and
+/// that draws a critical EX score number from a missing file.
+fn trapped(ty: i32) -> String {
+    format!(
+        r#"{{"type": {ty}, "w": 1920, "h": 1080,
+            "property": [
+                {{"name": "mode", "item": [{{"name": "on", "op": 901}}], "def": "on"}},
+                {{"if": 901, "values": [{{"include": "trap.json"}}]}}
+            ],
+            "source": [{{"id": "gone", "path": "gone.png"}}],
+            "value": [{{"id": "ex", "src": "gone", "w": 10, "h": 1, "divx": 10,
+                        "digit": 4, "ref": 71}}],
+            "destination": [{{"id": "ex", "dst": [{{"w": 1, "h": 1}}]}}]}}"#
+    )
+}
+
+/// Imports [`trapped`]`(ty)` into `slot`, `trap.json` present when
+/// `trap`: the result and the asset admissions made.
+fn into_slot(ty: i32, slot: ScreenKind, trap: bool) -> (Result<Imported, ImportError>, u32) {
+    let d = tempfile::tempdir().unwrap();
+    std::fs::write(d.path().join("s.json"), trapped(ty)).unwrap();
+    if trap {
+        std::fs::write(d.path().join("trap.json"), r#"{"name": "trapped"}"#).unwrap();
+    }
+    ADMITS.with(|n| n.set(0));
+    let (mut def, h) = crate::read_header(d.path(), "s.json").unwrap();
+    let r = import(&mut def, &h, &Config::defaults(&h), slot);
+    (r, ADMITS.with(std::cell::Cell::get))
+}
+
+#[test]
+fn a_skin_in_another_slot_refuses_before_anything_is_read() {
+    use ScreenKind::{Play, Result, Selection};
+    for (ty, slot, found) in [(5, Play, Selection), (0, Result, Play)] {
+        // No trap file: a resolution would refuse on reading it.
+        let (r, admits) = into_slot(ty, slot, false);
+        match r {
+            Err(ImportError::Slot {
+                at: None,
+                slot: s,
+                found: f,
+            }) => assert_eq!((s, f), (slot, found)),
+            other => panic!("{ty}: {:?}", other.map(|i| i.report)),
+        }
+        assert_eq!(admits, 0, "{ty}");
+    }
+    // The control: in its own slot the same skin resolves past the trap
+    // and reaches its critical number's missing file.
+    let (r, admits) = into_slot(0, Play, true);
+    assert!(
+        matches!(r, Err(ImportError::Asset { .. })),
+        "{:?}",
+        r.map(|i| i.report)
+    );
+    assert!(admits >= 1);
+}
+
+#[test]
+fn a_kind_with_no_importer_refuses_before_anything_is_read() {
+    for (ty, kind) in [
+        (5, ScreenKind::Selection),
+        (6, ScreenKind::Decision),
+        (7, ScreenKind::Result),
+    ] {
+        let (r, admits) = into_slot(ty, kind, false);
+        match r {
+            Err(ImportError::NoImporter { kind: k }) => assert_eq!(k, kind),
+            other => panic!("{ty}: {:?}", other.map(|i| i.report)),
+        }
+        assert_eq!(admits, 0, "{ty}");
+    }
 }

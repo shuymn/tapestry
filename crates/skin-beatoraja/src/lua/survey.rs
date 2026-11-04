@@ -351,4 +351,39 @@ return { type = 0 }",
             u64::try_from(entry.len() + 2 * json.len()).unwrap()
         );
     }
+
+    #[test]
+    fn screen_kind_refusals_have_their_labels_and_locations() {
+        let run = |entry: &str| {
+            let d = folder(&[("s.luaskin", entry)]);
+            // The snapshot's scene is the header's kind, whatever is given.
+            survey(
+                d.path(),
+                "s.luaskin",
+                &ImportFacts::unavailable(ScreenKind::Result),
+                &Cancel::new(),
+            )
+        };
+        let s = run("return { type = 1 }");
+        assert_eq!(s.outcome, "header unsupported screen kind");
+        assert_eq!(s.kind, None);
+        let (module, line, _) = s.at.unwrap();
+        assert_eq!((module, line), (0, 0));
+        for (ty, kind, label) in [
+            (5, ScreenKind::Selection, "no importer for Selection"),
+            (6, ScreenKind::Decision, "no importer for Decision"),
+            (7, ScreenKind::Result, "no importer for Result"),
+        ] {
+            let s = run(&format!("return {{ type = {ty} }}"));
+            assert_eq!(
+                (s.outcome.as_str(), s.at, s.kind),
+                (label, None, Some(kind))
+            );
+        }
+        let s = run("if skin_config then return { type = 7 } end\nreturn { type = 0 }");
+        assert_eq!(s.outcome, "skin in another slot");
+        assert_eq!(s.kind, Some(ScreenKind::Play));
+        let (module, line, _) = s.at.unwrap();
+        assert_eq!((module, line), (0, 0));
+    }
 }

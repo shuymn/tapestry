@@ -2025,7 +2025,8 @@ fn check_lua(usage: &LuaUsage, dependencies: &[String]) {
 /// `strip.png` and `grid.png`; a file outside the folder is there to be
 /// refused). The header pass runs once ([`read_lua_header`]); its header
 /// must be within its caps. The configured pass then runs against that
-/// snapshot with the header's defaults, twice, which must give the same
+/// snapshot, its play scene taken as the header's kind (a result scene
+/// stays one, so a skin of another kind meets the wrong slot), with the header's defaults, twice, which must give the same
 /// outcome (the passes share no Lua state), and once with each option's
 /// last item. Every candidate's use of the sandbox must be within its caps
 /// and consult only the folder's files; an imported or pending result's
@@ -2067,6 +2068,10 @@ pub fn skin_lua(data: &[u8]) -> Result<(Header, Result<LuaOutcome, ImportError>)
     let h = read_lua_header(&dir, LUA_FILES[0], &cancel)?;
     check_header(h.header());
     check_lua(&h.usage(), h.dependencies());
+    let mut facts = facts;
+    if facts.scene == ScreenKind::Play {
+        facts.scene = h.header().kind;
+    }
     let defaults = Config::defaults(h.header());
     let outcome = |config: &Config| {
         let r = h.import(config, &facts, &cancel);
