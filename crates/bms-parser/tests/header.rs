@@ -75,7 +75,8 @@ fn read_header_takes_the_loaders_file_cap() {
 
 /// The loader's labels come from the resolved chart: a taken `#IF`
 /// branch's declarations count and an untaken one's do not, unlike
-/// `read_header`, which skips every block; the last declaration wins.
+/// `read_header`, which skips every block; the last declaration wins,
+/// its value trimmed of Unicode whitespace.
 #[test]
 fn the_loaders_labels_come_from_the_taken_branches() {
     let text = "\
@@ -84,14 +85,17 @@ fn the_loaders_labels_come_from_the_taken_branches() {
 #ARTIST Someone
 #SUBTITLE First
 #SUBTITLE [ANOTHER]
+#PLAYLEVEL 12
 #BPM 120
 #SETRANDOM 2
 #IF 1
 #GENRE Untaken
+#PLAYLEVEL 3
 #ENDIF
 #IF 2
 #ARTIST Branch two
 #SUBARTIST Two
+#PLAYLEVEL \u{3000}9a \t
 #ENDIF
 #ENDRANDOM
 #00111:01
@@ -107,6 +111,7 @@ fn the_loaders_labels_come_from_the_taken_branches() {
             artist: "Branch two".to_owned(),
             subartist: "Two".to_owned(),
             genre: String::new(),
+            playlevel: "9a".to_owned(),
         }
     );
     let header = read_header(text.as_bytes(), &Limits::default()).unwrap();

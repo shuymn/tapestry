@@ -162,6 +162,7 @@ mod tests {
                 artist: "a".to_owned(),
                 subartist: "sa".to_owned(),
                 genre: "g".to_owned(),
+                playlevel: "12".to_owned(),
             },
             &chart,
         );
