@@ -1099,7 +1099,7 @@ fn play(
     rig.result_input = menus;
     rig.queue_most = opened.most_queued_periods;
     tune(&mut rig);
-    let ran = game::live::run_chart(&mut loaded, &mut rig).map_err(anyhow::Error::from);
+    let ran = skins_then_chart(&mut loaded, &mut rig);
     #[cfg(feature = "dev-tools")]
     let script_failed = result_script_failure(&rig);
     let rendered = rig.shut_down();
@@ -1119,6 +1119,38 @@ fn play(
         anyhow::bail!("dev: the result script failed: {why}");
     }
     Ok(())
+}
+
+/// Startup's skins of `launch` for `rig` ([`imports::startup`]), from
+/// `settings`, the window's close stopping them.
+fn start_skins(
+    rig: &PlayerRig<'_>,
+    settings: &Settings,
+    launch: imports::Launch,
+) -> Result<imports::Started, imports::StartupEnd> {
+    let build: imports::Build = Arc::new(imports::build);
+    imports::startup(
+        &rig.render,
+        &settings.player.skins,
+        launch,
+        rig.autoplay,
+        &build,
+        || rig.controls.quitting(),
+    )
+}
+
+/// `tapestry play`'s chart after its skins: a play skin that cannot be
+/// used fails the run before any recording opens, and a close during
+/// startup ends it with nothing played.
+fn skins_then_chart(loaded: &mut Loaded, rig: &mut PlayerRig<'_>) -> anyhow::Result<()> {
+    let settings = loaded.settings().clone();
+    match start_skins(rig, &settings, imports::Launch::Direct) {
+        Ok(_) => game::live::run_chart(loaded, rig)
+            .map(|_| ())
+            .map_err(anyhow::Error::from),
+        Err(imports::StartupEnd::Closed) => Ok(()),
+        Err(imports::StartupEnd::Failed(e)) => Err(e),
+    }
 }
 
 /// Why the scripted result input of a run without selection failed, if it
@@ -1472,6 +1504,21 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
             nearest: None,
         });
     }
+    // The skins, before the first screen: a refused play skin admits no
+    // chart, and another kind's refusal is the select screen's notice.
+    let (begin, failed) = match start_skins(&rig, &settings, imports::Launch::Selection) {
+        Ok(started) => {
+            if let Some(notice) = started.play {
+                rig.skin = render_side::SkinState::Refused(notice);
+            }
+            if let (Some(notice), Some(sel)) = (started.notice, &mut rig.selection) {
+                sel.screen.set_notice(Some(notice));
+            }
+            (true, None)
+        }
+        Err(imports::StartupEnd::Closed) => (false, None),
+        Err(imports::StartupEnd::Failed(e)) => (false, Some(e)),
+    };
     // Autoplay saves nothing, but in a scenario, whose logs' plays are
     // saved.
     #[cfg(feature = "dev-tools")]
@@ -1495,7 +1542,13 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
         parts,
         Box::new(game::NoSessionEvents),
     );
-    let ran = app.run(&mut rig);
+    let ran = if begin { app.run(&mut rig) } else { Ok(()) };
+    #[cfg(feature = "dev-tools")]
+    println!(
+        "dev: skin imports {} lua passes {}",
+        imports::jobs_started(),
+        skin_beatoraja::lua::vm_hooks::passes()
+    );
     #[cfg(feature = "dev-tools")]
     let script_failed = rig
         .selection
@@ -1516,6 +1569,9 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
     }
     if let Some(t) = clocked_thread {
         t.detach();
+    }
+    if let Some(e) = failed {
+        return Err(e);
     }
     #[cfg(feature = "dev-tools")]
     if let Some((sc, script)) = scenario {
@@ -1631,7 +1687,7 @@ fn headless(
     rig.quit_after_end = Some(std::time::Duration::from_millis(300));
     rig.queue_most = opened.most_queued_periods;
     tune(&mut rig);
-    let ran = game::live::run_chart(&mut loaded, &mut rig).map_err(anyhow::Error::from);
+    let ran = skins_then_chart(&mut loaded, &mut rig);
     let script_failed = result_script_failure(&rig);
     // Offscreen: no window to keep.
     let _ = rig.shut_down();

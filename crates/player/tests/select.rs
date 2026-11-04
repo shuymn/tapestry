@@ -1218,12 +1218,19 @@ fn every_kind(skin: &Path) -> String {
         .concat()
 }
 
-/// Skins are not imported at startup yet: with every kind's skin
-/// configured in `player.toml`, the run reports no skin, the play screen
-/// loads in the built-in skin (its judgment line drawn, which the
-/// configured skin would cover), and the chart plays to its result.
+/// The RGB at the centre of a dumped frame.
+fn centre_rgb((w, h, rgba): &(usize, usize, Vec<u8>)) -> [u8; 3] {
+    let i = ((h / 2) * w + w / 2) * 4;
+    [rgba[i], rgba[i + 1], rgba[i + 2]]
+}
+
+/// With every kind's skin configured as the same play skin, startup
+/// installs it for play before selection lists the library, and reports
+/// each other kind as refused, that skin being of another kind; the play
+/// screen then loads in it (blue over the whole canvas, no judgment line)
+/// and the chart plays to its result.
 #[test]
-fn configured_skins_stay_dormant_at_startup() {
+fn a_configured_play_skin_is_installed_at_startup() {
     let fx = fixture();
     write_chart(&fx.library, "a", "a.bms", "譜面A", 8_000);
     let skin = fx.appdata.join("skin");
@@ -1237,8 +1244,127 @@ fn configured_skins_stay_dormant_at_startup() {
         "pick=a.bms,slow-load=500,enter,back,close",
         &["--dev-frames", &frames_arg],
     );
-    assert!(lines(&stdout, "skin:").is_empty(), "{stdout}");
-    assert!(find_from(&stdout, 0, "play started").is_some(), "{stdout}");
+    let skins = lines(&stdout, "skin:");
+    assert_eq!(skins.len(), 4, "{stdout}");
+    assert_eq!(skins[0], "skin: play: installed");
+    for (line, kind) in skins[1..].iter().zip(["selection", "decision", "result"]) {
+        assert!(
+            line.starts_with(&format!("skin: {kind}: refused: a 7-key play skin in the ")),
+            "{line}"
+        );
+    }
+    let installed = find_from(&stdout, 0, "skin: play: installed").unwrap();
+    let listed = find_from(&stdout, 0, "select: 1 charts listed").unwrap();
+    assert!(installed < listed, "{stdout}");
+    assert!(
+        find_from(&stdout, listed, "play started").is_some(),
+        "{stdout}"
+    );
     let loading = dumped_rgba(&frames.join("loading.png"));
-    assert!(has_red_run(&loading, loading.0 / 5), "no judgment line");
+    assert!(!has_red_run(&loading, loading.0 / 5), "a judgment line");
+    assert_eq!(centre_rgb(&loading), [0, 0, 255]);
+}
+
+/// A Lua play skin in `dir`, `play.luaskin`: `blue.png` over the whole
+/// canvas.
+fn write_blue_lua_skin(dir: &Path) {
+    write_blue_skin(dir);
+    fs::write(
+        dir.join("play.luaskin"),
+        "local skin = { type = 0, name = \"blue\", w = 1920, h = 1080 }\n\
+         if not skin_config then return skin end\n\
+         skin.source = { { id = \"b\", path = \"blue.png\" } }\n\
+         skin.image = { { id = \"b\", src = \"b\", x = 0, y = 0, w = 16, h = 16 } }\n\
+         skin.destination = { { id = \"b\", dst = { { x = 0, y = 0, w = 1920, h = 1080 } } } }\n\
+         return skin\n",
+    )
+    .unwrap();
+}
+
+/// Skins are imported at startup only: with a Lua play skin installed,
+/// its files changed as soon as startup reports it (the image turned red,
+/// the entry broken), a run of two plays with a retry and a return to
+/// selection keeps drawing the startup skin, and the run's import and Lua
+/// pass counts stay those of startup's one import (its two passes).
+#[test]
+fn no_skin_is_imported_after_startup() {
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+    let fx = fixture();
+    write_chart(&fx.library, "a", "a.bms", "譜面A", 8_000);
+    let skin = fx.appdata.join("skin");
+    write_blue_lua_skin(&skin);
+    let root = DataRoot::new(fx.appdata.join("tapestry"));
+    fs::write(
+        root.player_settings(),
+        format!(
+            "[skins.play]\nroot = '{}'\nentry = 'play.luaskin'\n",
+            skin.display()
+        ),
+    )
+    .unwrap();
+    let frames = fx.appdata.join("frames");
+    let frames_arg = frames.display().to_string();
+    let mut child = select(
+        &fx,
+        "sleep=1500,pick=a.bms,enter,retry,back,wait=a.bms,pick=a.bms,enter,back,close",
+        &["--dev-frames", &frames_arg],
+    )
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
+    let out = child.stdout.take().unwrap();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(out).lines() {
+            let Ok(line) = line else { break };
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let deadline = Instant::now() + Duration::from_secs(600);
+    let mut stdout = String::new();
+    let mut edited = false;
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match rx.recv_timeout(left) {
+            Ok(line) => {
+                if line == "skin: play: installed" && !edited {
+                    let red = fs::File::create(skin.join("blue.png")).unwrap();
+                    let mut e = png::Encoder::new(std::io::BufWriter::new(red), 16, 16);
+                    e.set_color(png::ColorType::Rgba);
+                    e.set_depth(png::BitDepth::Eight);
+                    let red: Vec<u8> = (0..16 * 16).flat_map(|_| [255, 0, 0, 255]).collect();
+                    e.write_header().unwrap().write_image_data(&red).unwrap();
+                    fs::write(skin.join("play.luaskin"), "error(\"changed\")\n").unwrap();
+                    edited = true;
+                }
+                stdout.push_str(&line);
+                stdout.push('\n');
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let _ = child.kill();
+                panic!("the run did not end in time:\n{stdout}");
+            }
+        }
+    }
+    let status = child.wait().unwrap();
+    assert_eq!(status.code(), Some(0), "{stdout}");
+    assert!(edited, "{stdout}");
+    assert_eq!(
+        lines(&stdout, "skin:"),
+        ["skin: play: installed"],
+        "{stdout}"
+    );
+    assert_eq!(lines(&stdout, "play started").len(), 3, "{stdout}");
+    assert_eq!(
+        lines(&stdout, "dev: skin imports "),
+        ["dev: skin imports 1 lua passes 2"],
+        "{stdout}"
+    );
+    let loading = dumped_rgba(&frames.join("loading.png"));
+    assert_eq!(centre_rgb(&loading), [0, 0, 255]);
 }

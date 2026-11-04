@@ -720,6 +720,10 @@ impl Screen for MenuScreen {
         self.renderer.target()
     }
 
+    fn atlas_limits(&self) -> Option<skin_model::AtlasLimits> {
+        Some(self.renderer.atlas_limits())
+    }
+
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn minimized(&self) -> bool {
         self.renderer.is_minimized()

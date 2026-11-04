@@ -502,7 +502,7 @@ fn a_text_producer_comes_only_with_rasterized_text() {
 /// sandbox's time cap (seconds) unless cancelled, and a cancellation is
 /// seen within a check's 100 instructions.
 #[cfg(feature = "dev-tools")]
-fn looping() -> tempfile::TempDir {
+pub(super) fn looping() -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     fs::write(
         dir.path().join("s.luaskin"),
@@ -594,7 +594,7 @@ impl std::fmt::Debug for Witness {
 /// strings takes.
 #[cfg(feature = "dev-tools")]
 #[track_caller]
-fn executing(base: usize) {
+pub(super) fn executing(base: usize) {
     use skin_beatoraja::lua::vm_hooks;
     assert!(wait_until(|| vm_hooks::live() > base));
     let from = vm_hooks::steps();
@@ -888,3 +888,5 @@ fn the_reports_carry_text_only() {
     };
     assert_eq!(shown, format!("スキンを使えません: {reason}"));
 }
+
+mod startup;
