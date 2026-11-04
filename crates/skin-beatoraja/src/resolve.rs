@@ -993,53 +993,33 @@ impl Resolver<'_, '_> {
     }
 
     /// Whether condition `cond` holds; an array's items are tested in
-    /// order up to the first that fails.
+    /// order up to the first that fails, an item that is an array holding
+    /// when one of its alternatives does.
     fn test(&mut self, cond: Option<u32>) -> Result<bool, ImportError> {
         let Some(cond) = cond else {
             return Ok(true);
         };
-        if self.is_number(cond) {
-            return self.test_number(cond);
-        }
-        if self.callable(cond) {
-            return Err(self.def.callable_error(cond, "if"));
-        }
-        if self.arena().is_mixed(cond) {
-            return Err(self.def.mixed_error(cond));
-        }
         if !self.arena().is_array(cond) {
-            return Ok(false);
+            return self.test_one(cond);
         }
         let mut next = self.arena().node(cond).first_child;
         while next != NONE {
             let item = next;
             next = self.arena().node(item).next_sibling;
-            let held = if self.is_number(item) {
-                self.test_number(item)?
-            } else if self.callable(item) {
-                return Err(self.def.callable_error(item, "if"));
-            } else if self.arena().is_mixed(item) {
-                return Err(self.def.mixed_error(item));
-            } else if self.arena().is_array(item) {
+            let held = if self.arena().is_array(item) {
                 let mut held = false;
                 let mut alt = self.arena().node(item).first_child;
                 while alt != NONE {
                     let one = alt;
                     alt = self.arena().node(one).next_sibling;
-                    if self.callable(one) {
-                        return Err(self.def.callable_error(one, "if"));
-                    }
-                    if self.arena().is_mixed(one) {
-                        return Err(self.def.mixed_error(one));
-                    }
-                    if self.is_number(one) && self.test_number(one)? {
+                    if self.test_one(one)? {
                         held = true;
                         break;
                     }
                 }
                 held
             } else {
-                false
+                self.test_one(item)?
             };
             if !held {
                 return Ok(false);
@@ -1048,10 +1028,21 @@ impl Resolver<'_, '_> {
         Ok(true)
     }
 
-    /// `n` enabled for `n >= 0`, `-n` not enabled for `n < 0`; `i32::MIN`,
+    /// One condition that is not read as a list: a number `n` holds when
+    /// enabled for `n >= 0`, `-n` not enabled for `n < 0`; `i32::MIN`,
     /// which has no negation in `i32`, is a range error (the source's
-    /// wrapping negation is not reproduced).
-    fn test_number(&mut self, id: u32) -> Result<bool, ImportError> {
+    /// wrapping negation is not reproduced). A function or a mixed Lua
+    /// table is refused, and any other value is false.
+    fn test_one(&mut self, id: u32) -> Result<bool, ImportError> {
+        if self.callable(id) {
+            return Err(self.def.callable_error(id, "if"));
+        }
+        if self.arena().is_mixed(id) {
+            return Err(self.def.mixed_error(id));
+        }
+        if !self.is_number(id) {
+            return Ok(false);
+        }
         let op = self.def.int(id, "if")?;
         if op >= 0 {
             return Ok(self.enabled.contains(&op));
