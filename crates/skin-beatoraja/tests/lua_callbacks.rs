@@ -325,3 +325,23 @@ fn timers_compare_with_the_off_value() {
         })
     ));
 }
+
+/// A draw callback reading the chart's BPM-change condition lowers, with
+/// one D4 note, and follows the play context's fact.
+#[test]
+fn a_bpm_change_callback_reads_the_charts_fact() {
+    let d = folder(&skin(&image_at(
+        0,
+        "draw = function()\n return ms.option(177)\n end,",
+    )));
+    let i = import(&d, 905).unwrap();
+    assert_eq!(counts(&i), [1, 0, 0, 0]);
+    let d4 = NoteKind::Deviation(skin_beatoraja::DeviationId::D4);
+    assert_eq!(common::kinds(&i.imported.report), [d4]);
+    let chart = bms_model::ChartBuilder::new(150_000).build().unwrap();
+    for (fact, shown) in [(Some(true), true), (Some(false), false), (None, false)] {
+        let skin = i.imported.skin.clone();
+        let mut play = Drawn::over_with(skin, &chart, None, fact);
+        assert_eq!(play.frame(0, &[]).len(), usize::from(shown), "{fact:?}");
+    }
+}

@@ -79,8 +79,8 @@ const E: Export = Export::Exportable;
 const T: Export = Export::TapestryOnly;
 
 /// The play screen's state. Fields come from the play view's snapshot,
-/// the rates' whole-attempt denominator, the gauge kind and the BPM range
-/// from the play context, the readouts from the frame and the clocks from
+/// the rates' whole-attempt denominator, the gauge kind, the BPM range and
+/// the BPM-change fact from the play context, the readouts from the frame and the clocks from
 /// the prepared chart; timers from the play context, the scroll map, the
 /// snapshot's fail time and the drained effects (stage3.md R3).
 pub static PLAY: Schema = Schema {
@@ -190,6 +190,8 @@ pub static PLAY: Schema = Schema {
         int("native.lift.white", COVER_PERMILLE, T),
         int("native.hidden.white", COVER_PERMILLE, T),
         flag("native.floating", T),
+        flag("bpm.change", T),
+        flag("bpm.change_valid", T),
     ],
     timers: &[
         timer("ready", E),
@@ -389,8 +391,13 @@ pub mod field {
     pub const NATIVE_HIDDEN_WHITE: u16 = 84;
     /// Whether the speed mode is Floating.
     pub const NATIVE_FLOATING: u16 = 85;
+    /// Whether the chart's whole BPM extremes differ, uncapped; false
+    /// while `bpm.change_valid` is false.
+    pub const BPM_CHANGE: u16 = 86;
+    /// Whether the play context gives the chart's BPM-change fact.
+    pub const BPM_CHANGE_VALID: u16 = 87;
     /// The number of fields.
-    pub const COUNT: usize = 86;
+    pub const COUNT: usize = 88;
 
     /// The `duration.<t>.<k>.ms` slot of the variant at `tempo` (0 to 3:
     /// current, main, min, max), `covered` or not; `.green` and `.valid`
@@ -578,6 +585,8 @@ mod tests {
             ("native.duration.valid", T),
             ("native.target.valid", T),
             ("native.floating", T),
+            ("bpm.change", T),
+            ("bpm.change_valid", T),
         ] {
             assert!(
                 matches!(ty(name), Some((FieldTy::Bool, e)) if e == export),
@@ -611,7 +620,8 @@ mod tests {
     }
 
     /// Slots 51 to 74 are `51 + 3 · (2t + k) + {0, 1, 2}` for the tempo
-    /// `t` and the cover `k`, and the native block follows to 85.
+    /// `t` and the cover `k`, the native block follows to 85, and the
+    /// BPM-change fact takes 86 and 87.
     #[test]
     fn duration_variants_and_the_native_block_take_their_slots() {
         let slot = |name: &str| PLAY.field(name).map(|(s, _)| s);
@@ -648,7 +658,11 @@ mod tests {
             assert_eq!(usize::from(s), 75 + i, "{name}");
             assert_eq!(slot(name), Some(s), "{name}");
         }
-        assert_eq!(field::COUNT, 86);
+        assert_eq!(field::BPM_CHANGE, 86);
+        assert_eq!(slot("bpm.change"), Some(86));
+        assert_eq!(field::BPM_CHANGE_VALID, 87);
+        assert_eq!(slot("bpm.change_valid"), Some(87));
+        assert_eq!(field::COUNT, 88);
     }
 
     #[test]

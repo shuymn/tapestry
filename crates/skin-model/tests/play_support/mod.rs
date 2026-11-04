@@ -209,6 +209,7 @@ pub fn full(lead_in_ms: i64) -> PlayContext<'static> {
         ln_default: rules::LnMode::Ln,
         last_note_end: NO_END,
         bpm_range: None,
+        bpm_whole_change: None,
     }
 }
 

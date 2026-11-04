@@ -392,6 +392,7 @@ pub fn draw(imported: &Imported, seed: &[u8]) -> Vec<usize> {
         ln_default: rules::LnMode::Ln,
         last_note_end: TimeUs(0),
         bpm_range: None,
+        bpm_whole_change: None,
     };
     let mut play = skin
         .prepare(&chart, &ctx)
@@ -673,6 +674,7 @@ fn gauge_probes(
             ln_default: rules::LnMode::Ln,
             last_note_end: TimeUs(0),
             bpm_range: None,
+            bpm_whole_change: None,
         };
         let mut play = skin
             .prepare(chart, &ctx)
@@ -756,6 +758,7 @@ pub fn judged_rects(imported: &Imported, full: bool) -> Vec<[f32; 4]> {
         ln_default: rules::LnMode::Ln,
         last_note_end: TimeUs(0),
         bpm_range: None,
+        bpm_whole_change: None,
     };
     let mut play = skin
         .prepare(&chart, &ctx)
@@ -1321,6 +1324,7 @@ fn choice_probes(
         ln_default: rules::LnMode::Ln,
         last_note_end: TimeUs(0),
         bpm_range: None,
+        bpm_whole_change: None,
     };
     let mut play = skin
         .prepare(chart, &ctx)
@@ -1428,6 +1432,7 @@ fn rate_and_kind_probes(
             ln_default: rules::LnMode::Ln,
             last_note_end: TimeUs(0),
             bpm_range: None,
+            bpm_whole_change: None,
         };
         let mut play = skin
             .prepare(chart, &ctx)
@@ -1701,6 +1706,7 @@ fn readout_probes(
             ln_default: rules::LnMode::Ln,
             last_note_end: TimeUs(0),
             bpm_range: range,
+            bpm_whole_change: None,
         };
         let mut play = skin
             .prepare(chart, &ctx)

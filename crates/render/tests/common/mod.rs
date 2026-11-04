@@ -80,6 +80,7 @@ pub fn context(gauges: &[GaugeDesc], counted: bool) -> PlayContext<'_> {
         ln_default: rules::LnMode::Ln,
         last_note_end: TimeUs(3_600_000 * MS),
         bpm_range: None,
+        bpm_whole_change: None,
     }
 }
 

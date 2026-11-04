@@ -86,6 +86,11 @@ pub struct PlayContext<'a> {
     /// by the play speed), which `bpm.min_x100` and `bpm.max_x100` read;
     /// `None` when the caller has no exact range, which hides them.
     pub bpm_range: Option<BpmRange>,
+    /// Whether the same chart's whole BPM extremes differ, uncapped:
+    /// `w(min) < w(max)` with `w(t) = min(⌊t⌋, 2³¹ − 1)`, which
+    /// `bpm.change` reads; `None` when the caller has no chart, which
+    /// clears `bpm.change_valid`.
+    pub bpm_whole_change: Option<bool>,
 }
 
 /// A chart's BPM range in floored hundredths of a BPM.
@@ -382,6 +387,8 @@ pub struct Play {
     readout_end: TimeUs,
     /// The context's [`PlayContext::bpm_range`], validated.
     bpm_range: Option<BpmRange>,
+    /// The context's [`PlayContext::bpm_whole_change`].
+    bpm_whole_change: Option<bool>,
     scratch: Side,
     /// Whether a long note's release is judged on its own (CN and HCN).
     separate_end_judgment: bool,
@@ -528,6 +535,7 @@ impl Play {
             last_note_end: ctx.last_note_end,
             readout_end,
             bpm_range: ctx.bpm_range,
+            bpm_whole_change: ctx.bpm_whole_change,
             scratch: ctx.scratch,
             // As eval decides the chart's mode (evaluator.rs, `ln_mode`):
             // a new preset mode must be placed here.
@@ -779,6 +787,7 @@ mod tests {
             ln_default: rules::LnMode::Ln,
             last_note_end: TimeUs(3_000 * MS),
             bpm_range: None,
+            bpm_whole_change: None,
         };
         let mut play = skin.prepare(&chart, &ctx).unwrap();
         let zero = PerJudgment {

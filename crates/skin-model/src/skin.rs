@@ -2389,6 +2389,7 @@ mod tests {
             ln_default: rules::LnMode::Ln,
             last_note_end: TimeUs(0),
             bpm_range: None,
+            bpm_whole_change: None,
         };
         let mut play = skin.prepare(&chart, &ctx).unwrap();
         skin.attach_bitmap_text(&mut play, &ChartText::default());

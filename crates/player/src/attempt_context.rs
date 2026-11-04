@@ -92,6 +92,7 @@ impl AttemptContext {
             ln_default: self.ln_default,
             last_note_end: self.last_note_end,
             bpm_range: bpm_range(self.tempo.meta()),
+            bpm_whole_change: Some(bpm_whole_change(self.tempo.meta())),
         }
     }
 }
@@ -110,6 +111,18 @@ fn bpm_range(meta: &bms_model::TempoMeta) -> Option<BpmRange> {
         min_x100: x100(meta.min)?,
         max_x100: x100(meta.max)?,
     })
+}
+
+/// Whether the chart's original lowest and highest tempos differ in whole
+/// BPMs, each truncated and saturating at `i32::MAX` as the source's
+/// integer song data does, uncapped by the readouts' maximum (design.md
+/// "Play readouts").
+fn bpm_whole_change(meta: &bms_model::TempoMeta) -> bool {
+    // `Tempo::MAX` is below 10^12 BPM, so the quotient never overflows.
+    let whole = |t: bms_model::Tempo| {
+        (t.units() / bms_model::Tempo::UNITS_PER_BPM).min(u128::from(i32::MAX.unsigned_abs()))
+    };
+    whole(meta.min) < whole(meta.max)
 }
 
 #[cfg(test)]
@@ -173,6 +186,7 @@ mod tests {
         assert_eq!(ctx.ln_default, preset.ln_mode.default);
         assert_eq!(ctx.scratch, Side::Right);
         assert_eq!(ctx.last_note_end, TimeUs(1_000_000));
+        assert_eq!(ctx.bpm_whole_change, Some(false));
         assert_eq!(
             ctx.bpm_range,
             Some(skin_model::BpmRange {
@@ -191,5 +205,42 @@ mod tests {
             ],
             ["t", "s", "a", "sa", "g"]
         );
+    }
+
+    /// The BPM-change fact compares the chart's whole extremes, each
+    /// truncated and saturating at `i32::MAX`, apart from the capped BPM
+    /// range.
+    #[test]
+    fn the_bpm_change_fact_compares_saturated_whole_extremes() {
+        let preset = rules::tapestry();
+        let context = |initial: i64, change: i64| {
+            let chart = bms_model::ChartBuilder::new(initial)
+                .bpm(TimeUs(1_000_000), change)
+                .build()
+                .unwrap();
+            let attempt = Attempt::new(
+                1,
+                &preset,
+                TimeUs(0),
+                None,
+                TimeUs(2_000_000),
+                &ChartLabels::default(),
+                &chart,
+            );
+            let owned = AttemptContext::new(attempt, Side::Left, 0);
+            let ctx = owned.context();
+            (ctx.bpm_whole_change, ctx.bpm_range)
+        };
+        let (change, _) = context(150_000, 150_500);
+        assert_eq!(change, Some(false), "150 -> 150.5");
+        let (change, _) = context(150_000, 151_000);
+        assert_eq!(change, Some(true), "150 -> 151");
+        let (change, range) = context(150_000, 30_000_000_000);
+        assert_eq!(change, Some(true), "150 -> 30 000 000");
+        assert_eq!(range, None, "past the readouts' maximum");
+        let (change, _) = context(3_000_000_000_000, 4_000_000_000_000);
+        assert_eq!(change, Some(false), "both saturate");
+        let (change, _) = context(2_147_483_646_000, 2_147_483_647_000);
+        assert_eq!(change, Some(true), "the last whole BPM below saturation");
     }
 }

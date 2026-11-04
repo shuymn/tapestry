@@ -75,7 +75,7 @@ fn rate_bp(ex: u32, targets: u64) -> i32 {
 
 /// The readout fields of one frame, `field::BPM_CURRENT_X100` to
 /// `field::DURATION_VALID` and from `field::DURATION_VARIANTS` to
-/// `field::NATIVE_FLOATING`, validated before anything is applied.
+/// `field::BPM_CHANGE_VALID`, validated before anything is applied.
 #[derive(Clone, Copy)]
 struct Readouts {
     /// Per variant in slot order: ms, green and validity.
@@ -86,6 +86,8 @@ struct Readouts {
     bpm_max: i32,
     bpm_current_valid: i32,
     bpm_range_valid: i32,
+    bpm_change: i32,
+    bpm_change_valid: i32,
     remaining_s: i32,
     elapsed_s: i32,
     covers: Covers,
@@ -387,6 +389,8 @@ impl Play {
             bpm_max,
             bpm_current_valid,
             bpm_range_valid,
+            bpm_change: i32::from(self.bpm_whole_change == Some(true)),
+            bpm_change_valid: i32::from(self.bpm_whole_change.is_some()),
             remaining_s: seconds(end - now.max(start), true),
             elapsed_s: seconds(now - start, false),
             covers,
@@ -461,7 +465,7 @@ impl Play {
         let targets = u64::from(self.reducer.targets());
         let n = &r.native;
         let [native_ms, native_green, native_valid] = duration_fields(n.duration);
-        let native: [i32; field::COUNT - field::NATIVE_HISPEED_X100 as usize] = [
+        let native: [i32; (field::NATIVE_FLOATING + 1 - field::NATIVE_HISPEED_X100) as usize] = [
             n.hispeed_x100.map_or(0, field_of),
             i32::from(n.hispeed_x100.is_some()),
             native_ms,
@@ -531,7 +535,8 @@ impl Play {
         let fields = head
             .into_iter()
             .chain(r.variants.into_iter().flatten())
-            .chain(native);
+            .chain(native)
+            .chain([r.bpm_change, r.bpm_change_valid]);
         for (slot, v) in self.fields.iter_mut().zip(fields) {
             *slot = v;
         }

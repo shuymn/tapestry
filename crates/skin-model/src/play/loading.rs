@@ -144,6 +144,10 @@ const FIELDS: [LoadingField; field::COUNT] = {
         Unavailable, // native.lift.white
         Unavailable, // native.hidden.white
         Unavailable, // native.floating
+        // The BPM-change fact, 86 and 87: a play context's, which no
+        // loading frame carries.
+        Unavailable, // bpm.change
+        Unavailable, // bpm.change_valid
     ]
 };
 
@@ -458,6 +462,9 @@ mod tests {
             }
         }
         assert_eq!(loading_field(field::GAUGE), Some(LoadingField::Unavailable));
+        for slot in [field::BPM_CHANGE, field::BPM_CHANGE_VALID] {
+            assert_eq!(loading_field(slot), Some(LoadingField::Unavailable));
+        }
         assert_eq!(loading_field(u16::try_from(field::COUNT).unwrap()), None);
         for (i, t) in PLAY.timers.iter().enumerate() {
             let slot = u16::try_from(i).unwrap();

@@ -181,3 +181,27 @@ fn the_gauge_draws_its_empty_frame_while_loading() {
     l.gauge = None;
     assert!(l.frame(116).is_empty());
 }
+
+/// Every sign of the BPM-change conditions draws nothing while loading,
+/// where no chart fact is given; so does SUDDEN+'s paint under one, while
+/// the same paint under the adjustment condition alone draws.
+#[test]
+fn bpm_change_conditions_draw_nothing_while_loading() {
+    for op in ["176", "-176", "177", "-177"] {
+        let loaded = import_body(&format!(
+            r#"{IMAGES}, "destination": [{{"id": "i", "op": [{op}],
+                                          "dst": [{{"w": 10, "h": 10}}]}}]"#
+        ));
+        assert_eq!(common::kinds(loaded.report()), [D4], "{op}");
+        let mut l = loaded.loading();
+        l.adjusting = true;
+        assert!(l.frame(0).is_empty(), "{op}");
+    }
+    for (op, shown) in [("270, 177", false), ("270, -177", false), ("270", true)] {
+        let mut l = common::lanes::with("", &[&common::lanes::cover(&format!(r#""op": [{op}]"#))])
+            .loading();
+        l.adjusting = true;
+        let paints = l.rects(0).into_iter().filter(|r| r[2] == 430).count();
+        assert_eq!(paints, usize::from(shown), "{op}");
+    }
+}
