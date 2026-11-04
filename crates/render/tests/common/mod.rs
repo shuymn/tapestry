@@ -14,7 +14,7 @@ use render::{AdapterChoice, AttemptInput, FrameInput, LoadingFrame, Renderer, Sk
 use rules::{GaugeValue, PerJudgment};
 use skin_model::{
     Attempt, ChartText, FrameReadouts, Gain, GaugeDesc, GaugeLook, LaneView, Layout, LoadState,
-    PlayContext, Side,
+    PlayContext, ScreenKind, Side,
 };
 
 pub const MS: i64 = 1_000;
@@ -284,7 +284,7 @@ pub fn loading(r: &mut Renderer, text: &MenuText, f: &LoadingFrame<'_>) -> Vec<u
 
 /// Installs `b` chart-independently for `request` and commits it.
 pub fn install(r: &mut Renderer, b: &Arc<SkinBundle>, request: u64) {
-    let token = r.install(b, request).unwrap();
+    let token = r.install(ScreenKind::Play, b, request).unwrap();
     r.commit(token).unwrap();
 }
 

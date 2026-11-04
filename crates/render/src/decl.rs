@@ -127,6 +127,9 @@ pub struct SkinBundle {
     /// The text layer after the pages, if the atlas has one.
     text_layer: Option<u16>,
     text: Option<Arc<dyn AttemptText>>,
+    /// Whether its installation keeps a Lua VM, charged
+    /// [`VM_TEXELS`](crate::VM_TEXELS) while committed.
+    vm: bool,
 }
 
 impl fmt::Debug for SkinBundle {
@@ -138,6 +141,7 @@ impl fmt::Debug for SkinBundle {
             .field("clips", &self.clips.len())
             .field("scratch", &self.scratch)
             .field("text", &self.text)
+            .field("vm", &self.vm)
             .finish_non_exhaustive()
     }
 }
@@ -205,6 +209,7 @@ impl SkinBundle {
             scratch,
             text_layer,
             text: None,
+            vm: false,
         })
     }
 
@@ -239,6 +244,32 @@ impl SkinBundle {
     #[must_use]
     pub const fn side(&self) -> u32 {
         self.side
+    }
+
+    /// The same bundle declaring that its installation keeps a Lua VM:
+    /// charged [`VM_TEXELS`](crate::VM_TEXELS) beside its atlas while
+    /// committed ([`Renderer::admit`](crate::Renderer::admit)).
+    #[must_use]
+    pub const fn keeping_vm(mut self) -> Self {
+        self.vm = true;
+        self
+    }
+
+    /// Whether its installation keeps a Lua VM ([`keeping_vm`](Self::keeping_vm)).
+    #[must_use]
+    pub const fn keeps_vm(&self) -> bool {
+        self.vm
+    }
+
+    /// The level-0 texels of the atlas array its installation uploads:
+    /// its pages and the renderer's reserved layers, at its page side.
+    #[must_use]
+    pub fn atlas_texels(&self) -> u64 {
+        let side = u64::from(self.side);
+        let layers = u64::try_from(self.pages.len())
+            .unwrap_or(u64::MAX)
+            .saturating_add(u64::from(RESERVED_LAYERS));
+        side.saturating_mul(side).saturating_mul(layers)
     }
 
     /// The producer of its attempts' and its loading frames' prepared

@@ -28,7 +28,9 @@ use render::{
     AttemptInput, CommitError, FrameInput, Gpu, Installation, LoadingFrame, LoadingTextError,
     PlaySkin, PreparedToken, RenderError, Renderer, SkinBundle, SkinError, Sprite, SpriteBatch,
 };
-use skin_model::{BuildError, TextField, TextImage, TextSlots, TextTable, TextTableError};
+use skin_model::{
+    BuildError, ScreenKind, TextField, TextImage, TextSlots, TextTable, TextTableError,
+};
 
 const BLACK: [u8; 3] = [0; 3];
 const RED: [u8; 3] = [255, 0, 0];
@@ -216,7 +218,7 @@ fn a_new_lifetime_draws_after_a_refused_one() {
         r.loading_frame(&bad, &text).unwrap(),
         Err(BuildError::InvalidReadouts)
     );
-    let presentation = r.installation().unwrap().loading().clone();
+    let presentation = r.installation(ScreenKind::Play).unwrap().loading().clone();
     assert_eq!(presentation.refused(), Some(BuildError::InvalidReadouts));
     let token = stage(&mut r, &a, &chart, 2).unwrap();
     r.commit(token).unwrap();
@@ -249,7 +251,12 @@ fn when_starts_follow_the_installation_and_the_lifetime() {
     let text = MenuText::new(&r);
     let (a, _) = bundle(&r, dir.path(), &loader());
     install(&mut r, &a, 1);
-    let start = |r: &Renderer| r.installation().unwrap().loading().timer(WHEN_SLOT);
+    let start = |r: &Renderer| {
+        r.installation(ScreenKind::Play)
+            .unwrap()
+            .loading()
+            .timer(WHEN_SLOT)
+    };
     loading(&mut r, &text, &frame_at(1, 100));
     assert_eq!(start(&r), Some(TimeUs(100 * MS)));
     let token = stage(&mut r, &a, &chart, 2).unwrap();
@@ -258,12 +265,17 @@ fn when_starts_follow_the_installation_and_the_lifetime() {
     assert_eq!(start(&r), Some(TimeUs(100 * MS)), "the same bundle staged");
 
     // Restored on another renderer: the very state.
-    let kept = r.installation().unwrap();
+    let kept = r.installation(ScreenKind::Play).unwrap();
     drop(r);
     let mut r = offscreen(1_920, 1_080);
     let text = MenuText::new(&r);
-    r.restore(&kept).unwrap();
-    assert!(r.installation().unwrap().loading().same(kept.loading()));
+    r.restore(ScreenKind::Play, &kept).unwrap();
+    assert!(
+        r.installation(ScreenKind::Play)
+            .unwrap()
+            .loading()
+            .same(kept.loading())
+    );
     loading(&mut r, &text, &frame_at(1, 300));
     assert_eq!(start(&r), Some(TimeUs(100 * MS)), "restored");
 
@@ -297,7 +309,7 @@ fn installations_and_attempts_keep_the_newer_request() {
     let mut r = offscreen(1_920, 1_080);
     let (a, _) = bundle(&r, dir.path(), &loader());
     let (b, _) = bundle(&r, dir.path(), &Look::left([0, 255, 0, 255]));
-    let selection = r.install(&a, 5).unwrap();
+    let selection = r.install(ScreenKind::Play, &a, 5).unwrap();
     let play = stage(&mut r, &a, &chart, 6).unwrap();
     assert_eq!(
         r.commit(selection),
@@ -306,7 +318,7 @@ fn installations_and_attempts_keep_the_newer_request() {
             asked: 5
         })
     );
-    let stale = r.install(&b, 4).unwrap_err();
+    let stale = r.install(ScreenKind::Play, &b, 4).unwrap_err();
     assert!(
         matches!(
             stale,
@@ -320,10 +332,10 @@ fn installations_and_attempts_keep_the_newer_request() {
     assert!(stale.is_refusal());
     assert_eq!(r.staged(), Some(play));
     r.commit(play).unwrap();
-    assert!(Arc::ptr_eq(r.installed().unwrap(), &a));
+    assert!(Arc::ptr_eq(r.installed(ScreenKind::Play).unwrap(), &a));
     // A late selection of an older request installs nothing.
     assert!(matches!(
-        r.install(&b, 5),
+        r.install(ScreenKind::Play, &b, 5),
         Err(RenderError::Superseded {
             request: 5,
             newer: 6
@@ -336,16 +348,16 @@ fn installations_and_attempts_keep_the_newer_request() {
             asked: 5
         })
     );
-    assert!(Arc::ptr_eq(r.installed().unwrap(), &a));
-    let token = r.install(&b, 7).unwrap();
+    assert!(Arc::ptr_eq(r.installed(ScreenKind::Play).unwrap(), &a));
+    let token = r.install(ScreenKind::Play, &b, 7).unwrap();
     r.commit(token).unwrap();
-    assert!(Arc::ptr_eq(r.installed().unwrap(), &b));
+    assert!(Arc::ptr_eq(r.installed(ScreenKind::Play).unwrap(), &b));
     // A discarded staging and a refused one still bound what stages: a
     // late older request never stages after them.
     stage(&mut r, &a, &chart, 9).unwrap();
     r.discard();
     assert!(matches!(
-        r.install(&a, 8),
+        r.install(ScreenKind::Play, &a, 8),
         Err(RenderError::Superseded {
             request: 8,
             newer: 9
@@ -362,13 +374,13 @@ fn installations_and_attempts_keep_the_newer_request() {
     text.unwrap().refuse.store(true, Ordering::SeqCst);
     assert!(stage(&mut r, &refusing, &chart, 11).is_err());
     assert!(matches!(
-        r.install(&a, 10),
+        r.install(ScreenKind::Play, &a, 10),
         Err(RenderError::Superseded {
             request: 10,
             newer: 11
         })
     ));
-    assert!(Arc::ptr_eq(r.installed().unwrap(), &b));
+    assert!(Arc::ptr_eq(r.installed(ScreenKind::Play).unwrap(), &b));
 }
 
 /// A replacement refused after its resources were made leaves the
@@ -383,7 +395,7 @@ fn a_failed_replacement_keeps_the_old_loading_frames() {
     let (a, _) = bundle(&r, dir.path(), &loader());
     install(&mut r, &a, 1);
     loading(&mut r, &text, &frame_at(1, 0));
-    let before = r.installation().unwrap();
+    let before = r.installation(ScreenKind::Play).unwrap();
     let look = Look {
         text: true,
         loading: true,
@@ -396,7 +408,7 @@ fn a_failed_replacement_keeps_the_old_loading_frames() {
     let p = loading(&mut r, &text, &frame_at(1, 100));
     assert_eq!(at(&p, BACKGROUND), RED);
     assert_eq!(at(&p, right(ANIMATION, 100)), RED);
-    let after = r.installation().unwrap();
+    let after = r.installation(ScreenKind::Play).unwrap();
     assert!(Arc::ptr_eq(after.bundle(), &a));
     assert!(after.loading().same(before.loading()));
 }
@@ -485,7 +497,7 @@ fn loading_text_installs_only_for_its_installation() {
     let play = stage(&mut r, &a, &chart, 2).unwrap();
     r.commit(play).unwrap();
     assert_eq!(r.loading_text_key(), Some(key));
-    let selection = r.install(&b, 3).unwrap();
+    let selection = r.install(ScreenKind::Play, &b, 3).unwrap();
     assert_eq!(r.loading_text_key(), Some(key));
     r.commit(selection).unwrap();
     assert_eq!(
@@ -495,15 +507,15 @@ fn loading_text_installs_only_for_its_installation() {
     let fresh = r.loading_text_key().unwrap();
     r.install_loading_text(fresh, TextSlots::ALL, &lines(&b))
         .unwrap();
-    let installation = r.installation().unwrap();
-    r.restore(&installation).unwrap();
+    let installation = r.installation(ScreenKind::Play).unwrap();
+    r.restore(ScreenKind::Play, &installation).unwrap();
     assert_eq!(
         r.install_loading_text(fresh, TextSlots::ALL, &lines(&b)),
         Err(LoadingTextError::Stale)
     );
     let restored = r.loading_text_key().unwrap();
     let mut other = offscreen(1_920, 1_080);
-    other.restore(&installation).unwrap();
+    other.restore(ScreenKind::Play, &installation).unwrap();
     assert_eq!(
         other.install_loading_text(restored, TextSlots::ALL, &lines(&b)),
         Err(LoadingTextError::Stale)
@@ -552,7 +564,7 @@ fn a_replacement_counts_both_presentations() {
     let (a, _) = bundle(&r, dir.path(), &loader());
     install(&mut r, &a, 1);
     loading(&mut r, &text, &frame_at(1, 0));
-    let kept: Installation = r.installation().unwrap();
+    let kept: Installation = r.installation(ScreenKind::Play).unwrap();
     let installed = r.memory();
     assert_eq!(installed.loading, kept.loading().bytes());
     assert!(installed.loading > 0);
@@ -563,7 +575,7 @@ fn a_replacement_counts_both_presentations() {
     r.commit(same).unwrap();
 
     let (b, _) = bundle(&r, dir.path(), &loader());
-    let token = r.install(&b, 3).unwrap();
+    let token = r.install(ScreenKind::Play, &b, 3).unwrap();
     let peak = r.memory();
     assert_eq!(peak.loading, kept.loading().bytes());
     assert!(peak.staged_loading > 0);

@@ -15,7 +15,10 @@ fn imported_recording() -> (super::super::RenderLink, Recording, tempfile::TempD
     let (dir, skin) = crate::render_json::bundle(&crate::render_common::offscreen(1_920, 1_080));
     let chart = Arc::new(ChartBuilder::new(120_000).build().unwrap());
     link.load(chart, None).unwrap();
-    assert_eq!(link.select(Some(skin)).wait().unwrap(), Preparation::Ready);
+    assert_eq!(
+        link.select(ScreenKind::Play, Some(skin)).wait().unwrap(),
+        Preparation::Ready
+    );
     (link, rec, dir)
 }
 
@@ -110,7 +113,10 @@ fn changed_fields_and_a_cancelled_load_draw_only_current_bitmap_text() {
     let bundle = rec.shots()[retitled - 1].bundle;
     let replacement = Some(Arc::as_ptr(&other) as *const () as usize);
     assert_ne!(bundle, replacement);
-    assert_eq!(link.select(Some(other)).wait().unwrap(), Preparation::Ready);
+    assert_eq!(
+        link.select(ScreenKind::Play, Some(other)).wait().unwrap(),
+        Preparation::Ready
+    );
     let moved = rec.until(retitled, |s| {
         s.bundle == replacement && s.glyphs == Some([b, e, BLACK, b])
     });
