@@ -447,12 +447,13 @@ pub fn run_cancellable<T: Send + 'static>(
                 }
                 Err(RecvTimeoutError::Timeout) => {}
             },
-            Some(_) if handle.is_finished() => break,
+            Some(done) if handle.is_finished() => {
+                let _ = handle.join();
+                return done;
+            }
             Some(_) => thread::sleep(SELECT_SLICE),
         }
     }
-    let _ = handle.join();
-    outcome.unwrap_or(Ran::Abandoned)
 }
 
 /// What became of a kind at startup, for its line and the log.

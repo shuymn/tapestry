@@ -17,6 +17,8 @@ use render::{AttemptInput, Renderer, SkinBundle};
 use skin_beatoraja::{Cancel, Note, NoteKind, NoteLoc, Rule, Severity};
 use skin_model::{ChartText, ScreenKind};
 
+use crate::render_json::centre;
+
 use super::{
     ENDED, ImportTarget, KindOutcome, PANICKED, Ran, STOP_WAIT, Shown, Summary, build, line,
     log_installed, notice, run_cancellable,
@@ -254,12 +256,6 @@ fn a_skin_builds_only_for_its_own_kind_and_importer() {
         }
         other => panic!("{other:?}"),
     }
-}
-
-/// The colour at the centre of canvas rect `rect` of a 1920-wide read back.
-fn centre(pixels: &[u8], [x, y, w, h]: [i32; 4]) -> [u8; 3] {
-    let at = |v: i32| u32::try_from(v).unwrap();
-    crate::render_common::rgb_at(pixels, 1_920, (at(x + w / 2), at(y + h / 2)))
 }
 
 /// The configured folder is the user's absolute choice, taken with
