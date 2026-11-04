@@ -1535,6 +1535,110 @@ fn a_pending_skin_is_reused_while_its_class_holds() {
     assert_eq!(centre_rgb(&play), [0, 0, 255], "{stdout}");
 }
 
+/// A retry after the play preset's file was edited so that the chart's
+/// class changes (`#DEFEXRANK 120` with `#RANK 1`: hard under the
+/// tapestry policy, very easy under the beatoraja-style one) builds the
+/// pending skin again in the retry, which has no loading state, so the
+/// wait shows as the preparation page's notice; the retry's play draws
+/// the new class's image (blue for very easy) where the first drew red.
+#[test]
+fn a_retry_after_a_preset_edit_builds_the_skin_again() {
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+    let fx = fixture();
+    let chart = write_chart(&fx.library, "a", "a.bms", "a.bms", 8_000);
+    let mut text = fs::read_to_string(&chart).unwrap();
+    text.push_str("#DEFEXRANK 120\n#RANK 1\n");
+    fs::write(&chart, text).unwrap();
+    write_class_skin(&fx, "if ms.option(184) then path = \"blue.png\" end");
+    let root = DataRoot::new(fx.appdata.join("tapestry"));
+    let settings = fs::read_to_string(root.player_settings()).unwrap();
+    fs::write(
+        root.player_settings(),
+        format!("preset = 'mine'\n{settings}"),
+    )
+    .unwrap();
+    fs::create_dir_all(root.presets()).unwrap();
+    let mine = root.presets().join("mine.toml");
+    fs::write(&mine, game::preset_to_toml(&rules::tapestry())).unwrap();
+    let frames = fx.appdata.join("frames");
+    let frames_arg = frames.display().to_string();
+    let mut child = select(
+        &fx,
+        "sleep=1500,pick=a.bms,enter,drawn,slow-specializing=1500,retry,back,close",
+        &["--dev-frames", &frames_arg],
+    )
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
+    let out = child.stdout.take().unwrap();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(out).lines() {
+            let Ok(line) = line else { break };
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let deadline = Instant::now() + Duration::from_secs(600);
+    let mut stdout = String::new();
+    let mut edited = false;
+    loop {
+        match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(line) => {
+                // During the first play: the preset's file is edited.
+                if line == "play started" && !edited {
+                    fs::write(&mine, game::preset_to_toml(&rules::beatoraja_style())).unwrap();
+                    edited = true;
+                }
+                stdout.push_str(&line);
+                stdout.push('\n');
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let _ = child.kill();
+                panic!("the run did not end in time:\n{stdout}");
+            }
+        }
+    }
+    let status = child.wait().unwrap();
+    assert_eq!(status.code(), Some(0), "{stdout}");
+    assert_eq!(
+        attempt_lines(&stdout),
+        ["skin: play: specialized", "skin: play: specialized"],
+        "{stdout}"
+    );
+    let at = |from: usize, line: &str| {
+        find_from(&stdout, from, line).unwrap_or_else(|| panic!("no {line}:\n{stdout}"))
+    };
+    let first = at(0, "play started");
+    let building = at(first, "skin: play: building for the chart");
+    let page = at(building, "dev: drawn notice: スキンを準備しています");
+    let again = at(page, "skin: play: specialized");
+    at(again, "play started");
+    // The retry's stage is no loading state's.
+    assert_eq!(
+        lines(&stdout, "load: building the play skin").len(),
+        1,
+        "{stdout}"
+    );
+    let mut plays: Vec<_> = fs::read_dir(&frames)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("play-"))
+        })
+        .collect();
+    plays.sort();
+    assert_eq!(plays.len(), 2, "{plays:?}: {stdout}");
+    assert_eq!(centre_rgb(&dumped_rgba(&plays[0])), [255, 0, 0], "{stdout}");
+    assert_eq!(centre_rgb(&dumped_rgba(&plays[1])), [0, 0, 255], "{stdout}");
+}
+
 /// The quit key while a pending skin's specialization loops cancels it
 /// and returns to selection only once the job's thread has ended (inside
 /// the child: no VM open, every job started joined), with no play opened;

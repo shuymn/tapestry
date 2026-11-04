@@ -297,29 +297,37 @@ impl PlayerRig<'_> {
         let rig = &*self;
         let wait = || {
             println!("skin: play: building for the chart");
-            #[cfg(feature = "dev-tools")]
-            crate::dev::specialization_began();
             match rig.selection.as_ref() {
                 Some(sel) if sel.loading.is_some() => crate::selection::show_stage(
                     &rig.render,
                     sel.loading.as_ref(),
                     crate::loading_text::Stage::Skin,
                 ),
+                // The wait in the page's notice line.
                 Some(sel) => {
-                    let page = sel.screen.page(crate::loading_text::SKIN_WAIT);
+                    let mut page = sel.screen.page("");
+                    if let Some(notice) = page
+                        .lines
+                        .iter_mut()
+                        .find(|l| l.style == crate::menu_screen::LineStyle::Notice)
+                    {
+                        crate::loading_text::SKIN_WAIT.clone_into(&mut notice.text);
+                    }
                     rig.render.send(RenderMsg::Menu(Box::new(page)));
                 }
                 None => {
                     let page = crate::menu_screen::MenuPage {
                         lines: vec![crate::menu_screen::MenuLine {
                             text: crate::loading_text::SKIN_WAIT.to_owned(),
-                            style: crate::menu_screen::LineStyle::Title,
+                            style: crate::menu_screen::LineStyle::Notice,
                         }],
                         caret: None,
                     };
                     rig.render.send(RenderMsg::Menu(Box::new(page)));
                 }
             }
+            #[cfg(feature = "dev-tools")]
+            crate::dev::specialization_began();
         };
         let quit = || {
             #[cfg(feature = "dev-tools")]

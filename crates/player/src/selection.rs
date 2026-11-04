@@ -541,6 +541,7 @@ impl Selection {
                 Some(SelectStep::SlowMeasuring(ms)) => crate::dev::slow_measuring(ms),
                 Some(SelectStep::SlowDecoding(ms)) => crate::dev::slow_decoding(ms),
                 Some(SelectStep::SlowPreparing(ms)) => crate::dev::slow_preparing(ms),
+                Some(SelectStep::SlowSpecializing(ms)) => crate::dev::slow_specializing(ms),
                 Some(SelectStep::SlowChartLoad(ms)) => crate::dev::slow_chart_load(ms),
                 Some(SelectStep::PressLoading(ms)) => crate::dev::press_loading(ms),
                 Some(SelectStep::HoldBackground) => crate::dev::hold_background(),
@@ -669,6 +670,8 @@ pub fn script_result(
                     c.arm(k);
                 }
             }
+            // Holds the retry's specialization.
+            Some(&SelectStep::SlowSpecializing(ms)) => crate::dev::slow_specializing(ms),
             Some(SelectStep::Drawn) => {
                 if !render.wait_end_drawn(crate::dev::STEP_TIMEOUT) {
                     script.fail("the result's page was not drawn".to_owned());

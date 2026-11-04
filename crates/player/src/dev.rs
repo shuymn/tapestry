@@ -74,6 +74,10 @@ static SLOW_DECODING: AtomicU64 = AtomicU64::new(0);
 /// How long the render thread holds the next attempt's preparation, ms
 /// (a script's `slow-preparing`).
 static SLOW_PREPARING: AtomicU64 = AtomicU64::new(0);
+/// How long the next pending play skin's specialization waits after
+/// its wait is shown, before its job starts, ms (a script's
+/// `slow-specializing`).
+static SLOW_SPECIALIZING: AtomicU64 = AtomicU64::new(0);
 /// How long the render thread holds the next chart's load, ms (a
 /// script's `slow-chart-load`).
 static SLOW_CHART_LOAD: AtomicU64 = AtomicU64::new(0);
@@ -224,9 +228,22 @@ pub fn specializing(s: Specializing) {
     *SPECIALIZING.lock().unwrap_or_else(PoisonError::into_inner) = Some((s, u64::MAX, None));
 }
 
-/// A specialization's job starts: an armed step counts the Lua's steps
-/// from here, and an escalation holds every VM's destruction.
+/// The next specialization holds `ms` once its wait is shown
+/// (`slow-specializing`).
+pub fn slow_specializing(ms: u64) {
+    SLOW_SPECIALIZING.store(ms, Ordering::Relaxed);
+}
+
+/// A specialization's job starts, its wait shown: it holds as
+/// `slow-specializing` says, once, so the wait is drawn; an armed step
+/// counts the Lua's steps from here, and an escalation holds every VM's
+/// destruction.
 pub fn specialization_began() {
+    let ms = SLOW_SPECIALIZING.swap(0, Ordering::Relaxed);
+    if ms > 0 {
+        println!("dev: the specialization holds {ms} ms");
+        std::thread::sleep(Duration::from_millis(ms));
+    }
     let mut armed = SPECIALIZING.lock().unwrap_or_else(PoisonError::into_inner);
     if let Some((s, from, _)) = armed.as_mut() {
         *from = skin_beatoraja::lua::vm_hooks::steps();
@@ -773,6 +790,9 @@ pub enum SelectStep {
     /// The next attempt's preparation holds this many milliseconds on the
     /// render thread (`slow-preparing`).
     SlowPreparing(u64),
+    /// The next pending play skin's specialization holds this many
+    /// milliseconds once its wait is shown (`slow-specializing`).
+    SlowSpecializing(u64),
     /// The next chart's load holds this many milliseconds on the render
     /// thread (`slow-chart-load`).
     SlowChartLoad(u64),
@@ -891,7 +911,7 @@ impl SelectScript {
                 Some(("wait", f)) => Ok(SelectStep::Wait(f.to_owned())),
                 Some(("search", t)) => Ok(SelectStep::Search(t.to_owned())),
                 Some(("sleep", ms)) => ms.parse().map(SelectStep::Sleep).map_err(|_| {
-                    format!("{s} is not pick=, wait=, search=, sleep=, idle=, slow-load=, slow-measuring=, slow-decoding=, slow-preparing=, slow-chart-load=, press-loading=, hold-background, background=running, background=idle, enter, prev-preset, next-preset, drawn, back, retry, next, prev, close-measuring, quit-measuring, quit-decoding, quit-loading, close-loading, quit-specializing, close-specializing, escalate-specializing or close")
+                    format!("{s} is not pick=, wait=, search=, sleep=, idle=, slow-load=, slow-measuring=, slow-decoding=, slow-preparing=, slow-specializing=, slow-chart-load=, press-loading=, hold-background, background=running, background=idle, enter, prev-preset, next-preset, drawn, back, retry, next, prev, close-measuring, quit-measuring, quit-decoding, quit-loading, close-loading, quit-specializing, close-specializing, escalate-specializing or close")
                 }),
                 Some(("idle", ms)) => ms
                     .parse()
@@ -908,6 +928,10 @@ impl SelectScript {
                 Some(("slow-decoding", ms)) => ms
                     .parse()
                     .map(SelectStep::SlowDecoding)
+                    .map_err(|_| format!("{s} takes milliseconds")),
+                Some(("slow-specializing", ms)) => ms
+                    .parse()
+                    .map(SelectStep::SlowSpecializing)
                     .map_err(|_| format!("{s} takes milliseconds")),
                 Some(("slow-preparing", ms)) => ms
                     .parse()
@@ -947,7 +971,7 @@ impl SelectScript {
                 None if s == "hold-background" => Ok(SelectStep::HoldBackground),
                 None if s == "close" => Ok(SelectStep::Close),
                 _ => Err(format!(
-                    "{s} is not pick=, wait=, search=, sleep=, idle=, slow-load=, slow-measuring=, slow-decoding=, slow-preparing=, slow-chart-load=, press-loading=, hold-background, background=running, background=idle, enter, prev-preset, next-preset, drawn, back, retry, next, prev, close-measuring, quit-measuring, quit-decoding, quit-loading, close-loading, quit-specializing, close-specializing, escalate-specializing or close"
+                    "{s} is not pick=, wait=, search=, sleep=, idle=, slow-load=, slow-measuring=, slow-decoding=, slow-preparing=, slow-specializing=, slow-chart-load=, press-loading=, hold-background, background=running, background=idle, enter, prev-preset, next-preset, drawn, back, retry, next, prev, close-measuring, quit-measuring, quit-decoding, quit-loading, close-loading, quit-specializing, close-specializing, escalate-specializing or close"
                 )),
             })
             .map(|step| step.map(|s| (s, None)))
@@ -1664,7 +1688,8 @@ fn onsets(samples: &[f32]) -> Vec<usize> {
 /// Writes frames as PNG files: `select.png` at the first select screen
 /// frame, `loading.png` at the first loading state frame, `ready.png` at
 /// the first frame of the lead-in, `play.png` at the first frame at or
-/// after `play_at`, and `end.png` at the first end screen frame.
+/// after `play_at` (and each play's own as `play-<generation>.png`),
+/// and `end.png` at the first end screen frame.
 pub struct FrameDump {
     dir: PathBuf,
     play_at: TimeUs,
@@ -1673,6 +1698,9 @@ pub struct FrameDump {
     end: bool,
     select: bool,
     loading: bool,
+    /// The generation of the play whose `play-<generation>.png` was
+    /// written last.
+    numbered: Option<u64>,
 }
 
 impl FrameDump {
@@ -1686,6 +1714,7 @@ impl FrameDump {
             end: false,
             select: false,
             loading: false,
+            numbered: None,
         }
     }
 
@@ -1711,6 +1740,14 @@ impl FrameSink for FrameDump {
     fn frame(&mut self, screen: &dyn Screen, drawn: &Drawn<'_>) {
         if !drawn.timing.presented {
             return;
+        }
+        // Each play's own frame at `play_at`, by its generation.
+        if let (Some(t), Some(g)) = (drawn.play, drawn.generation)
+            && t >= self.play_at
+            && self.numbered != Some(g)
+        {
+            self.numbered = Some(g);
+            self.save(screen, &format!("play-{g}.png"));
         }
         match drawn.play {
             Some(t) if t.0 < 0 && !self.ready_state => {
