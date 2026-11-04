@@ -847,6 +847,82 @@ fn no_skin_is_imported_after_startup_through_practice() {
     );
 }
 
+/// A practice Start with a pending play skin that cannot be built for the
+/// chart (its configured pass, after reading the judgment class, loads a
+/// missing module) returns to the practice page, which shows the reason;
+/// no round opens and the skin in use never stands in. The scenario's
+/// rounds then fail naming that refusal.
+#[test]
+fn a_refused_specialization_returns_to_the_practice_page() {
+    let fx = Fixture::new();
+    write_chart(&fx.library(), "a", "譜面A");
+    let key7 = bms_parser::load_bms(
+        b"#BPM 120\n#00119:0000000000010000\n",
+        &fx.base,
+        &Default::default(),
+    )
+    .unwrap()
+    .chart;
+    write_log(
+        &fx.base.join("logs").join("k7.tprl"),
+        &hits(&key7, |_| true),
+        1,
+    );
+    let skin = fx.base.join("skin");
+    fs::create_dir_all(&skin).unwrap();
+    fs::write(
+        skin.join("play.luaskin"),
+        "local skin = { type = 0, name = \"class\", w = 1920, h = 1080 }\n\
+         if not skin_config then return skin end\n\
+         local ms = require(\"main_state\")\n\
+         local easy = ms.option(183)\n\
+         local m = require(\"missing\")\n\
+         return skin\n",
+    )
+    .unwrap();
+    fs::create_dir_all(fx.data()).unwrap();
+    fs::write(
+        fx.data().join("player.toml"),
+        format!(
+            "[skins.play]\nroot = '{}'\nentry = 'play.luaskin'\n",
+            skin.display()
+        ),
+    )
+    .unwrap();
+    let (out, stdout, stderr) = fx.run(&scenario(&[
+        "practice = { path = \"library/a/a.bms\", from = 1, to = 2, speed = 100, \
+         lead_in_ms = 2000, gauge = 20, repeat = true, input = \"logs/k7.tprl\", rounds = 1 }",
+        "quit = {}",
+    ]));
+    assert_eq!(out.status.code(), Some(1), "{stdout}\n{stderr}");
+    assert!(
+        stdout.contains("skin: play: pending: reads the chart's judgment class"),
+        "{stdout}"
+    );
+    let reason = "the play skin cannot be built for this chart: ";
+    let opened = stdout
+        .find("practice: on the practice screen")
+        .unwrap_or_else(|| panic!("{stdout}"));
+    let refused = stdout
+        .find(&format!("practice: refused: {reason}"))
+        .unwrap_or_else(|| panic!("{stdout}"));
+    assert!(opened < refused, "{stdout}");
+    assert!(
+        stdout[refused..]
+            .lines()
+            .next()
+            .unwrap()
+            .contains("missing"),
+        "{stdout}"
+    );
+    assert!(
+        format!("{stdout}{stderr}").contains(&format!("the practice was refused: {reason}")),
+        "{stdout}\n{stderr}"
+    );
+    assert!(lines(&stdout, "play started").is_empty(), "{stdout}");
+    assert!(fx.played_records().0.is_empty());
+}
+
 /// The peaks the recording output found after each sound's onset.
 fn onset_peaks(stdout: &str) -> Vec<f64> {
     let line = lines(stdout, "dev: audio onset peaks:")[0];

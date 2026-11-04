@@ -4378,6 +4378,69 @@ pub(crate) mod tests {
         link.exit();
     }
 
+    /// A pending play skin's specialization staged with its attempt
+    /// through a real menu screen and renderer on WARP, beside a committed
+    /// result skin: one whose atlas is the whole shared limit is refused
+    /// with the renderer's admission, as a healthy refusal (no failure
+    /// reported), and one within the limit is ready and commits.
+    #[test]
+    fn a_specialization_past_the_shared_texels_is_refused() {
+        use crate::render_decl::{Look, solid_bundle};
+        let make: MakeScreen = Box::new(|| {
+            let renderer = render::Renderer::new(
+                render::Target::Offscreen {
+                    width: 1_920,
+                    height: 1_080,
+                },
+                render::AdapterChoice::Warp,
+            )?;
+            Ok(Box::new(crate::menu_screen::MenuScreen::new(renderer, None)) as Box<dyn Screen>)
+        });
+        // Built for WARP's limits, as the render thread's screen.
+        let r = crate::render_common::offscreen(1_920, 1_080);
+        let big = solid_bundle(&r, &Look::left([0, 0, 255, 255]), [4_096, 3_072]);
+        assert_eq!(big.atlas_texels(), render::SHARED_TEXELS);
+        let (result, play) = (
+            solid_bundle(&r, &Look::left([255, 0, 0, 255]), [16, 16]),
+            solid_bundle(&r, &Look::left([0, 255, 0, 255]), [16, 16]),
+        );
+        drop(r);
+        let link = spawn_empty(make);
+        let chart = Arc::new(ChartBuilder::new(120_000).build().unwrap());
+        link.load(Arc::clone(&chart), None).unwrap();
+        assert_eq!(
+            link.select(ScreenKind::Result, Some(result))
+                .wait()
+                .unwrap(),
+            Preparation::Ready
+        );
+        assert_eq!(
+            link.pend(ScreenKind::Play).wait().unwrap(),
+            Preparation::Ready
+        );
+        let answer = specialized(&link, &chart, &big).unwrap();
+        let Preparation::Refused(why) = answer else {
+            panic!("{answer:?}");
+        };
+        let needed = render::SHARED_TEXELS + 256 * 256 * 2;
+        assert_eq!(
+            why.reason,
+            format!(
+                "the {} skin needs {needed} texels with the other screens' skins, past {}",
+                ScreenKind::Play,
+                render::SHARED_TEXELS
+            )
+        );
+        assert!(!link.failed());
+        // The positive control: a specialization within the limit.
+        assert_eq!(
+            specialized(&link, &chart, &play).unwrap(),
+            Preparation::Ready
+        );
+        link.commit_attempt().unwrap();
+        link.exit();
+    }
+
     /// The default skin's refusal of an attempt (a chart row past its
     /// exact playhead's domain) through a real menu screen and renderer on
     /// WARP: the attempt is refused with the skin's reason, no failure is
