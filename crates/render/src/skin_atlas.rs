@@ -283,6 +283,13 @@ fn level_bytes(side: u32) -> u64 {
     u64::from(side) * u64::from(side) * 4
 }
 
+/// Unit tests read the text layer back.
+const READ_BACK: wgpu::TextureUsages = if cfg!(test) {
+    wgpu::TextureUsages::COPY_SRC
+} else {
+    wgpu::TextureUsages::empty()
+};
+
 fn create(device: &wgpu::Device, side: u32, layers: u32, levels: u32) -> wgpu::Texture {
     device.create_texture(&wgpu::TextureDescriptor {
         label: Some("atlas"),
@@ -295,7 +302,7 @@ fn create(device: &wgpu::Device, side: u32, layers: u32, levels: u32) -> wgpu::T
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format: wgpu::TextureFormat::Rgba8Unorm,
-        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST | READ_BACK,
         view_formats: &[],
     })
 }

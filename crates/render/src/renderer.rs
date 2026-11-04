@@ -2460,4 +2460,362 @@ mod tests {
         r.install_atlas(&pages, ClipTable::default()).unwrap();
         assert_eq!(r.atlas_size(), (256, 2));
     }
+    /// A producer laying a string out by its first letter: `T`, `U` and
+    /// `V` as 2032 × 1000 lines (half the 2048 layer each), anything else
+    /// 100 × 50; every line full coverage. It fails its rasterization
+    /// number `fail_at` (from 1), counting from its creation.
+    #[derive(Debug)]
+    struct Sized {
+        rasters: std::sync::atomic::AtomicU32,
+        fail_at: std::sync::atomic::AtomicU32,
+    }
+
+    impl crate::AttemptText for Sized {
+        fn layout(
+            &self,
+            req: &skin_model::TextRequest,
+            em_px: f32,
+            _: crate::LineBounds,
+        ) -> crate::LineFit {
+            let size = if req.text.starts_with(['T', 'U', 'V']) {
+                [2_032, 1_000]
+            } else {
+                [100, 50]
+            };
+            crate::LineFit::Fits(crate::LineLayout {
+                font: req.font,
+                size,
+                ink: [0.0, 0.0, 1.0, 1.0],
+                advance: 1.0,
+                raster_em: em_px,
+                glyphs: Box::new([]),
+            })
+        }
+
+        fn raster(&self, _: &crate::LineLayout, out: &mut [u8]) -> Result<(), SkinError> {
+            use std::sync::atomic::Ordering;
+            let n = self.rasters.fetch_add(1, Ordering::SeqCst) + 1;
+            if n == self.fail_at.load(Ordering::SeqCst) {
+                return Err(SkinError {
+                    reason: "an injected failure".to_owned(),
+                });
+            }
+            out.fill(255);
+            Ok(())
+        }
+
+        fn resident(&self) -> crate::TextResidency {
+            crate::TextResidency::default()
+        }
+    }
+
+    /// An imported skin of `n` texts showing the title, the artist, the
+    /// genre and literals, with the [`Sized`] producer.
+    fn sized_bundle(
+        r: &Renderer,
+        n: usize,
+    ) -> (
+        tempfile::TempDir,
+        std::sync::Arc<crate::SkinBundle>,
+        std::sync::Arc<Sized>,
+    ) {
+        use crate::outline_support::{Value, folder, text, ttf};
+        let refs = [10, 16, 13];
+        let texts: Vec<_> = (0..n)
+            .map(|i| {
+                let value = refs
+                    .get(i)
+                    .map_or_else(|| Value::Literal(format!("x{i}")), |&r| Value::Ref(r));
+                let y = i32::try_from(i).unwrap() * 60;
+                text("f", 50, value, [0, y, 100, 50])
+            })
+            .collect();
+        let font = crate::font_support::build(&crate::font_support::latin("Skin"));
+        let dir = folder(&[("ttf.ttf", font)], &[ttf()], &texts);
+        let producer = std::sync::Arc::new(Sized {
+            rasters: std::sync::atomic::AtomicU32::new(0),
+            fail_at: std::sync::atomic::AtomicU32::new(0),
+        });
+        let p = std::sync::Arc::clone(&producer);
+        let b = crate::outline_support::bundle_with(r, dir.path(), move |_| {
+            p as std::sync::Arc<dyn crate::AttemptText>
+        });
+        (dir, b, producer)
+    }
+
+    fn labels<'a>(title: &'a str, artist: &'a str, genre: &'a str) -> skin_model::ChartText<'a> {
+        skin_model::ChartText {
+            title,
+            subtitle: "",
+            artist,
+            subartist: "",
+            genre,
+        }
+    }
+
+    fn stage_labels(
+        r: &mut Renderer,
+        b: &std::sync::Arc<crate::SkinBundle>,
+        text: &skin_model::ChartText<'_>,
+        request: u64,
+    ) -> Result<super::PreparedToken, RenderError> {
+        use crate::test_common::{GAUGES, context};
+        let chart = bms_model::ChartBuilder::new(120_000).build().unwrap();
+        let ctx = context(&GAUGES, false);
+        let a = crate::AttemptInput {
+            chart: &chart,
+            context: &ctx,
+            text,
+            target: r.target(),
+        };
+        r.stage(b, &a, request)
+    }
+
+    /// A buffer whose usage mixes both map modes: every device's
+    /// validation refuses it.
+    fn refuse(gpu: &crate::Gpu) {
+        let _ = gpu.device().create_buffer(&wgpu::BufferDescriptor {
+            label: Some("refused"),
+            size: 4,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::MAP_WRITE,
+            mapped_at_creation: false,
+        });
+    }
+
+    /// Level `k` of the atlas's text layer, read back: RGBA8, `side >> k`
+    /// texels square.
+    fn read_text_layer(r: &Renderer, k: u32) -> Vec<u8> {
+        let device = r.gpu.device();
+        let side = r.atlas.side() >> k;
+        let row = side * 4;
+        let padded =
+            row.div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("text layer"),
+            size: u64::from(padded * side),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder =
+            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: r.atlas.texture(),
+                mip_level: k,
+                origin: wgpu::Origin3d {
+                    x: 0,
+                    y: 0,
+                    z: r.atlas.text_layer().unwrap(),
+                },
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded),
+                    rows_per_image: Some(side),
+                },
+            },
+            super::extent(side, side),
+        );
+        r.gpu.queue().submit([encoder.finish()]);
+        let slice = buffer.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |m| m.unwrap());
+        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        let data = slice.get_mapped_range().unwrap();
+        let mut out = Vec::with_capacity((row * side) as usize);
+        for y in 0..side as usize {
+            let start = y * padded as usize;
+            out.extend_from_slice(&data[start..start + row as usize]);
+        }
+        out
+    }
+
+    /// The upload's boundaries in order: every write, then the one
+    /// submission inside the scopes, the wait's return, the publication,
+    /// and only then `stage`'s return; the report's submission is the one
+    /// waited for. A fault inside the scopes comes back from `stage` after
+    /// the wait, the lines released. Only after a successful staging does
+    /// a read-back, with its own submission, see the line.
+    #[test]
+    fn upload_ordered_before_return() {
+        use super::text_upload::Step::{
+            Published, RolledBack, StageReturned, Submitted, WaitReturned, Written,
+        };
+        let mut r = crate::test_common::offscreen(1_920, 1_080);
+        let (_dir, b, _) = sized_bundle(&r, 1);
+        crate::test_common::install(&mut r, &b, 1);
+        r.text_hooks.steps.clear();
+        r.text_hooks.fault_after = Some((1, refuse));
+        let e = stage_labels(&mut r, &b, &labels("s", "", ""), 2).unwrap_err();
+        assert!(
+            matches!(e, RenderError::Atlas(UploadError::Device(_))),
+            "{e:?}"
+        );
+        assert!(e.is_refusal());
+        assert_eq!(
+            r.text_hooks.steps,
+            [
+                Written,
+                Written,
+                Written,
+                Written,
+                Submitted,
+                WaitReturned,
+                RolledBack
+            ]
+        );
+        assert_eq!(r.text_cache.len(), 0);
+        r.text_hooks.fault_after = None;
+        r.text_hooks.steps.clear();
+        let token = stage_labels(&mut r, &b, &labels("s", "", ""), 3).unwrap();
+        assert_eq!(
+            r.text_hooks.steps,
+            [
+                Written,
+                Written,
+                Written,
+                Written,
+                Submitted,
+                WaitReturned,
+                Published,
+                StageReturned
+            ]
+        );
+        let submission = r.text_report().submission.clone().unwrap();
+        r.gpu
+            .device()
+            .poll(wgpu::PollType::Wait {
+                submission_index: Some(submission),
+                timeout: None,
+            })
+            .unwrap();
+        r.commit(token).unwrap();
+        let level = read_text_layer(&r, 0);
+        let (_, rect, _) = r.text_cache.rects()[0].clone();
+        let side = r.atlas.side();
+        let at = |x: u32, y: u32| &level[((y * side + x) * 4) as usize..][..4];
+        let g = skin_model::GUTTER;
+        assert_eq!(at(rect[0] + g, rect[1] + g), [255; 4]);
+        assert_eq!(at(rect[0], rect[1]), [0; 4], "the gutter");
+    }
+
+    /// Failures in the middle of an upload, with no frame drawn between
+    /// them: the producer's at its third line, then the device's after two
+    /// writes. Each time the GPU is waited for before the new lines are
+    /// released, and the layer's free area comes back to what it was; a
+    /// final staging places every line.
+    #[test]
+    fn repeated_mid_raster_failures() {
+        use super::text_upload::Step::{RolledBack, WaitReturned};
+        use std::sync::atomic::Ordering;
+        let mut r = crate::test_common::offscreen(1_920, 1_080);
+        let (_dir, b, p) = sized_bundle(&r, 5);
+        crate::test_common::install(&mut r, &b, 1);
+        let free = r.text_cache.free();
+        p.fail_at.store(3, Ordering::SeqCst);
+        r.text_hooks.steps.clear();
+        let e = stage_labels(&mut r, &b, &labels("a", "b", "c"), 2).unwrap_err();
+        assert!(matches!(e, RenderError::Skin(_)), "{e:?}");
+        assert_eq!(p.rasters.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            r.text_hooks.steps.iter().rev().take(2).collect::<Vec<_>>(),
+            [&RolledBack, &WaitReturned]
+        );
+        assert_eq!((r.text_cache.free(), r.text_cache.len()), (free, 0));
+
+        p.fail_at.store(0, Ordering::SeqCst);
+        r.text_hooks.fault_after = Some((2, refuse));
+        r.text_hooks.steps.clear();
+        let e = stage_labels(&mut r, &b, &labels("a", "b", "c"), 3).unwrap_err();
+        assert!(
+            matches!(e, RenderError::Atlas(UploadError::Device(_))),
+            "{e:?}"
+        );
+        assert_eq!(
+            r.text_hooks.steps.iter().rev().take(2).collect::<Vec<_>>(),
+            [&RolledBack, &WaitReturned]
+        );
+        assert_eq!((r.text_cache.free(), r.text_cache.len()), (free, 0));
+
+        r.text_hooks.fault_after = None;
+        let token = stage_labels(&mut r, &b, &labels("a", "b", "c"), 4).unwrap();
+        r.commit(token).unwrap();
+        assert_eq!(r.text_cache.len(), 5);
+        assert!(r.text_report().notes.is_empty());
+    }
+
+    /// A full-width tall line comes back on a shelf rounded up, and a
+    /// freed tall rectangle taken by a small line shows nothing of the
+    /// tall one at any level: the whole returned rectangle is written.
+    #[test]
+    fn shelf_rounding_and_reuse() {
+        // 4096 × 1040 asked for on a 4096 layer: 1088 tall.
+        let mut c = crate::text_cache::TextCache::new(4_096, 2);
+        let tall = |req: &skin_model::TextRequest, em: f32, _: crate::LineBounds| {
+            crate::LineFit::Fits(crate::LineLayout {
+                font: req.font,
+                size: [4_080, 1_024],
+                ink: [0.0, 0.0, 1.0, 1.0],
+                advance: 1.0,
+                raster_em: em,
+                glyphs: Box::new([]),
+            })
+        };
+        let req = skin_model::TextRequest {
+            slot: 0,
+            text: "T".to_owned(),
+            font: skin_model::FontRef::Default,
+            em_px: 100.0,
+        };
+        let p = c.place(
+            std::slice::from_ref(&req),
+            crate::LineBounds::for_side(4_096),
+            &[],
+            tall,
+        );
+        assert_eq!(p.new[0].rect[2..], [4_096, 1_088]);
+
+        let mut r = crate::test_common::offscreen(1_920, 1_080);
+        let (_dir, b, _) = sized_bundle(&r, 1);
+        crate::test_common::install(&mut r, &b, 1);
+        for (request, title) in [(2, "T"), (3, "U")] {
+            let token = stage_labels(&mut r, &b, &labels(title, "", ""), request).unwrap();
+            r.commit(token).unwrap();
+        }
+        let rects = r.text_cache.rects();
+        let t = rects.iter().find(|(s, ..)| s == "T").unwrap().1;
+        // A small line, with U installed: T is evicted, and its space is
+        // reused.
+        let token = stage_labels(&mut r, &b, &labels("s", "", ""), 4).unwrap();
+        assert!(r.text_report().counts.evictions >= 1);
+        r.commit(token).unwrap();
+        let (_, s, size) = r
+            .text_cache
+            .rects()
+            .into_iter()
+            .find(|(s, ..)| s == "s")
+            .unwrap();
+        assert!(
+            s[0] >= t[0]
+                && s[1] >= t[1]
+                && s[0] + s[2] <= t[0] + t[2]
+                && s[1] + s[3] <= t[1] + t[3]
+        );
+        let side = r.atlas.side();
+        let g = skin_model::GUTTER;
+        for k in 0..4_u32 {
+            let level = read_text_layer(&r, k);
+            let at = |x: u32, y: u32| level[(((y >> k) * (side >> k) + (x >> k)) * 4) as usize];
+            // The rectangle's last texel, past the small line: zero, where
+            // the tall line was white.
+            assert_eq!(at(s[0] + s[2] - 1, s[1] + s[3] - 1), 0, "level {k}");
+            assert_eq!(at(s[0], s[1]), 0, "level {k}");
+            if k == 0 {
+                assert_eq!(at(s[0] + g, s[1] + g), 255);
+                assert_eq!(at(s[0] + g + size[0], s[1] + g), 0);
+            }
+        }
+    }
 }

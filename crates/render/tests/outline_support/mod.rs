@@ -13,7 +13,9 @@ use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 
-use render::{ClipTable, DefaultFont, OutlineError, OutlineText, Renderer, SkinBundle};
+use render::{
+    AttemptText, ClipTable, DefaultFont, OutlineError, OutlineText, Renderer, SkinBundle,
+};
 use skin_model::{FontReader, Layout, Side, Skin};
 use tempfile::TempDir;
 
@@ -119,7 +121,7 @@ pub fn folder(files: &[(&str, Vec<u8>)], fonts: &[FontRec], texts: &[TextSpec]) 
 pub fn import(dir: &Path) -> skin_beatoraja::Imported {
     let (mut def, header) = skin_beatoraja::read_header(dir, "s.json").unwrap();
     let config = skin_beatoraja::Config::defaults(&header);
-    skin_beatoraja::import(&mut def, &header, &config).unwrap()
+    skin_beatoraja::import(&mut def, &header, &config, skin_model::ScreenKind::Play).unwrap()
 }
 
 /// The font files `skin`'s texts are set in, read for installation.
@@ -139,14 +141,23 @@ pub fn producer(skin: &Skin, default: &Arc<DefaultFont>) -> Result<OutlineText, 
 /// The skin of `dir` as a bundle for `r`, with its producer: imported, its
 /// atlas with the text layer for a 1920×1080 target.
 pub fn bundle_in(r: &Renderer, dir: &Path, default: &Arc<DefaultFont>) -> Arc<SkinBundle> {
+    bundle_with(r, dir, |skin| Arc::new(producer(skin, default).unwrap()))
+}
+
+/// [`bundle_in`] with the producer `text` makes of the skin.
+pub fn bundle_with(
+    r: &Renderer,
+    dir: &Path,
+    text: impl FnOnce(&Skin) -> Arc<dyn AttemptText>,
+) -> Arc<SkinBundle> {
     let imported = import(dir);
     let skin = imported.skin;
-    let text = producer(&skin, default).unwrap();
+    let text = text(&skin);
     let variant = skin.variant([1_920, 1_080], &Layout::AUTHOR);
     let atlas = skin.atlas(variant, r.atlas_limits(), &|| false).unwrap();
     let scratch = imported.scratch.unwrap_or(Side::Left);
     let bundle = SkinBundle::new(Arc::new(skin), atlas, ClipTable::default(), scratch).unwrap();
-    Arc::new(bundle.with_text(Arc::new(text)).unwrap())
+    Arc::new(bundle.with_text(text).unwrap())
 }
 
 /// A TrueType font record `f` of `ttf.ttf`.

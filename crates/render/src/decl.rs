@@ -223,6 +223,12 @@ impl SkinBundle {
         Ok(self)
     }
 
+    /// What its text producer keeps resident, if it has one.
+    #[must_use]
+    pub fn text_residency(&self) -> Option<TextResidency> {
+        self.text.as_ref().map(|t| t.resident())
+    }
+
     /// The text layer after its pages, if its atlas has one.
     #[must_use]
     pub const fn text_layer(&self) -> Option<u16> {

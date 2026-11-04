@@ -234,6 +234,15 @@ impl TextCache {
         self.entries.len()
     }
 
+    /// Each entry's string, returned rectangle and line size.
+    #[cfg(test)]
+    pub(crate) fn rects(&self) -> Vec<(String, [u32; 4], [u32; 2])> {
+        self.entries
+            .iter()
+            .map(|e| (e.key.text.clone(), e.rect, e.size))
+            .collect()
+    }
+
     /// Its aliases.
     #[cfg(test)]
     pub(crate) fn aliases(&self) -> usize {
