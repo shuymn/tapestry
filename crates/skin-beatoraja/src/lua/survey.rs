@@ -331,18 +331,6 @@ mod tests {
         d
     }
 
-    /// A white 64×64 PNG at `path`.
-    fn png(path: &std::path::Path) {
-        let file = std::fs::File::create(path).unwrap();
-        let mut enc = png::Encoder::new(std::io::BufWriter::new(file), 64, 64);
-        enc.set_color(png::ColorType::Rgba);
-        enc.set_depth(png::BitDepth::Eight);
-        enc.write_header()
-            .unwrap()
-            .write_image_data(&[255_u8; 64 * 64 * 4])
-            .unwrap();
-    }
-
     #[test]
     fn each_consumer_has_a_record_and_an_unused_callback_its_reason() {
         let entry = "local skin = { type = 0, name = \"t\", w = 1920, h = 1080,\n\
@@ -358,10 +346,14 @@ mod tests {
                { id = \"i\", mouseRect = { x = 0, y = 0, w = 1, h = 1 }, draw = function() return true end, dst = { { w = 64, h = 64 } } },\n\
                { id = \"g\", draw = function() return ms.gauge_type() == 4 end, dst = { { w = 64, h = 64 } } },\n\
                { id = \"i\", draw = function() return ms.number(425) > 0 end, dst = { { w = 64, h = 64 } } },\n\
+               { id = \"ex\", dst = { { w = 6, h = 6 } } }, { id = \"odd\", dst = { { w = 6, h = 6 } } },\n\
+             }\n\
+             skin.value = {\n\
+               { id = \"ex\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, digit = 4, value = function() return ms.number(101) end },\n\
+               { id = \"odd\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, digit = 4, value = function() return ms.number(425) end },\n\
              }\n\
              return skin\n";
-        let d = folder(&[("s.luaskin", entry)]);
-        png(&d.path().join("a.png"));
+        let d = crate::lua::callback_tests::folder(entry);
         let s = survey(
             d.path(),
             "s.luaskin",
@@ -389,6 +381,14 @@ mod tests {
                 (
                     Some(13),
                     "draw",
+                    "decorative",
+                    "replaced Unmapped main_state.number 425",
+                    Some("Unmapped main_state.number 425")
+                ),
+                (Some(17), "value", "critical ExScore", "lowered", None),
+                (
+                    Some(18),
+                    "value",
                     "decorative",
                     "replaced Unmapped main_state.number 425",
                     Some("Unmapped main_state.number 425")

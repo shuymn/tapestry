@@ -16,7 +16,7 @@ use crate::import::Config;
 use crate::import::callback::LOWERED;
 
 /// A skin folder whose `s.luaskin` is `entry`, with a 64×64 `a.png`.
-fn folder(entry: &str) -> tempfile::TempDir {
+pub(super) fn folder(entry: &str) -> tempfile::TempDir {
     let d = tempfile::tempdir().unwrap();
     std::fs::write(d.path().join("s.luaskin"), entry).unwrap();
     let file = std::fs::File::create(d.path().join("a.png")).unwrap();
