@@ -58,11 +58,13 @@ pub struct OptionItem {
 }
 
 /// A file choice (`filepath`): a path whose last component holds `*`
-/// wildcards, and the folder entries that match it.
+/// wildcards and may end in a `|tag|`, and the folder entries that match
+/// it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FileSpec {
     pub name: Option<String>,
-    /// The path as written, relative to the definition's folder.
+    /// The path as written, relative to the definition's folder, tag
+    /// included: the key source paths are substituted by.
     pub path: Option<String>,
     /// The default entry's name, or that name without its extension.
     pub def: Option<String>,
@@ -284,15 +286,34 @@ fn opt_string(
     })
 }
 
+/// File choice `path` without its tag. A last component may end in
+/// `|tag|`, which only tells choices over one pattern apart: the source
+/// lists the text up to the first `|` and after the last
+/// (`SkinConfigurationView.java:374-381` at `0.8.9`) and keys the choice
+/// by the whole path. The form taken is exactly two `|`, the closing one
+/// last, and a tag that is not empty and holds no `/`, `\`, `*` or `|`,
+/// so that the tag follows every `*` and the path's last `*` stays the
+/// pattern's. `None` for any other `|`.
+fn untagged(path: &str) -> Option<&str> {
+    let Some(body) = path.strip_suffix('|') else {
+        return (!path.contains('|')).then_some(path);
+    };
+    let (pattern, tag) = body.rsplit_once('|')?;
+    (!tag.is_empty() && !tag.contains(['/', '\\', '*']) && !pattern.contains('|'))
+        .then_some(pattern)
+}
+
 /// The entries matching file choice `path` (node `id`): its folder,
 /// joined to the definition's folder, listed through the skin folder's
 /// root with what remains of the entry allowance, and filtered by its
-/// last component. The whole name, as written and joined to the
-/// definition's folder, has the form [`Root::check_name`] requires before
-/// it is split. Only the last component may hold wildcards, and only `*`
-/// (`|`, `?`, `[`, `]`, `{` and `}` are refused rather than given the
-/// source's meanings). A folder that does not exist has no entries, as
-/// the source skips it (SkinConfigurationView.java:383-386).
+/// last component without its tag ([`untagged`]). The whole name, tag
+/// included, as written and joined to the definition's folder, has the
+/// form [`Root::check_name`] requires before it is split. Only the last
+/// component may hold wildcards, and only `*` (`?`, `[`, `]`, `{` and `}`
+/// in the pattern, and any `|` but a tag's, are refused rather than given
+/// the source's meanings); all of this is checked before any folder is
+/// listed. A folder that does not exist has no entries, as the source
+/// skips it (SkinConfigurationView.java:383-386).
 fn candidates(d: &mut Definition, id: u32, path: &str) -> Result<Vec<String>, ImportError> {
     let entry_dir = d.entry_dir();
     let full = if entry_dir.is_empty() {
@@ -307,8 +328,11 @@ fn candidates(d: &mut Definition, id: u32, path: &str) -> Result<Vec<String>, Im
             source,
         });
     }
-    let (folder, pattern) = path.rsplit_once(['/', '\\']).unwrap_or(("", path));
-    if folder.contains('*') || pattern.contains(['|', '?', '[', ']', '{', '}']) {
+    let Some(untagged) = untagged(path) else {
+        return Err(ImportError::Pattern { at: d.loc(id) });
+    };
+    let (folder, pattern) = untagged.rsplit_once(['/', '\\']).unwrap_or(("", untagged));
+    if folder.contains('*') || pattern.contains(['?', '[', ']', '{', '}']) {
         return Err(ImportError::Pattern { at: d.loc(id) });
     }
     let folded = pattern.to_ascii_lowercase();
@@ -316,6 +340,8 @@ fn candidates(d: &mut Definition, id: u32, path: &str) -> Result<Vec<String>, Im
         .rsplit_once(['/', '\\'])
         .map_or(String::new(), |(dir, _)| dir.to_owned());
     let remaining = MAX_LIST_ENTRIES - d.run.entries;
+    #[cfg(test)]
+    LISTED.with(|l| l.set([l.get()[0] + 1, l.get()[1]]));
     let listing = match d.root().list(&dir, remaining) {
         Ok(listing) => listing,
         Err(RootError::Missing | RootError::NotAFolder) => return Ok(Vec::new()),
@@ -337,14 +363,98 @@ fn candidates(d: &mut Definition, id: u32, path: &str) -> Result<Vec<String>, Im
     Ok(listing
         .entries
         .into_iter()
-        .filter(|e| matches(&e.name, &folded))
+        .filter(|e| {
+            #[cfg(test)]
+            LISTED.with(|l| l.set([l.get()[0], l.get()[1] + 1]));
+            matches(&e.name, &folded)
+        })
         .map(|e| e.name)
         .collect())
 }
 
 #[cfg(test)]
+thread_local! {
+    /// This thread's file choice listings: the folders it asked the root
+    /// to list, and the listed entries the pattern examined.
+    static LISTED: std::cell::Cell<[usize; 2]> = const { std::cell::Cell::new([0, 0]) };
+}
+
+#[cfg(test)]
 mod tests {
-    use super::matches;
+    use std::path::Path;
+
+    use super::{Header, LISTED, matches, read_header};
+    use crate::error::{ImportError, InputLimit};
+    use crate::limits::MAX_LIST_ENTRIES;
+
+    fn write(root: &Path, name: &str) {
+        let path = root.join(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, b"").unwrap();
+    }
+
+    /// The header of `s.json` in `root` with file choices `paths`, and the
+    /// listings it asked for and the listed entries its patterns examined.
+    fn observed(root: &Path, paths: &[&str]) -> (Result<Header, ImportError>, [usize; 2]) {
+        let records: Vec<String> = paths
+            .iter()
+            .map(|p| format!(r#"{{"path": "{p}"}}"#))
+            .collect();
+        let text = format!(r#"{{"type": 0, "filepath": [{}]}}"#, records.join(","));
+        std::fs::write(root.join("s.json"), text).unwrap();
+        LISTED.with(|l| l.set([0, 0]));
+        let header = read_header(root, "s.json").map(|(_, h)| h);
+        (header, LISTED.with(std::cell::Cell::get))
+    }
+
+    #[test]
+    fn a_malformed_tag_is_refused_before_any_listing() {
+        let d = tempfile::tempdir().unwrap();
+        write(d.path(), "bg/a.png");
+        write(d.path(), "bg/b.txt");
+        // The positive control: a well-formed tag over the same folder
+        // lists it once and examines both entries.
+        let (h, seen) = observed(d.path(), &["bg/*.png|x|"]);
+        assert_eq!(h.unwrap().files[0].candidates, ["a.png"]);
+        assert_eq!(seen, [1, 2]);
+        for path in ["bg/*.png|x", "bg/*.png|x|y|", "bg/*.png||", "bg|x|/*.png"] {
+            let (h, seen) = observed(d.path(), &[path]);
+            assert!(matches!(h, Err(ImportError::Pattern { .. })), "{path}");
+            assert_eq!(seen, [0, 0], "{path}");
+        }
+        // A malformed tag after a well-formed choice stops before its own
+        // listing.
+        let (h, seen) = observed(d.path(), &["bg/*.png|x|", "bg/*.png|y"]);
+        assert!(matches!(h, Err(ImportError::Pattern { .. })));
+        assert_eq!(seen, [1, 2]);
+    }
+
+    #[test]
+    fn a_tagged_listing_past_the_allowance_examines_none_of_its_entries() {
+        let d = tempfile::tempdir().unwrap();
+        for i in 0..MAX_LIST_ENTRIES / 2 {
+            let ext = if i % 2 == 0 { "png" } else { "txt" };
+            write(d.path(), &format!("a/{i}.{ext}"));
+        }
+        let tagged = ["a/*.png|x|", "a/*.png|y|"];
+        let (h, seen) = observed(d.path(), &tagged);
+        let h = h.unwrap();
+        assert_eq!(h.files[0].candidates.len(), MAX_LIST_ENTRIES / 4);
+        assert_eq!(h.files[0].candidates, h.files[1].candidates);
+        assert_eq!(seen, [2, MAX_LIST_ENTRIES]);
+        write(d.path(), "a/one-more.txt");
+        let (h, seen) = observed(d.path(), &tagged);
+        assert!(matches!(
+            h,
+            Err(ImportError::Input {
+                limit: InputLimit::ListEntries,
+                ..
+            })
+        ));
+        // Both listings were asked for; only the first one's entries were
+        // examined.
+        assert_eq!(seen, [2, MAX_LIST_ENTRIES / 2 + 1]);
+    }
 
     #[test]
     fn patterns_match_ignoring_ascii_case() {

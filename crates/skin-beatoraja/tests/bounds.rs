@@ -164,6 +164,24 @@ fn folder_entries_are_counted_across_listings_before_filtering() {
     assert_eq!(limit(header(&d)), InputLimit::ListEntries);
 }
 
+#[test]
+fn tagged_listings_are_each_counted() {
+    let d = skin(&[]);
+    // Matching and non-matching names, all counted, by each tagged
+    // choice's own listing of the one folder.
+    for i in 0..MAX_LIST_ENTRIES / 2 {
+        let ext = if i % 2 == 0 { "png" } else { "txt" };
+        write(d.path(), &format!("a/{i}.{ext}"), b"");
+    }
+    let text = play(r#""filepath": [{"path": "a/*.png|x|"}, {"path": "a/*.png|y|"}]"#);
+    write(d.path(), "s.json", text.as_bytes());
+    let h = header(&d).unwrap();
+    assert_eq!(h.files[0].candidates.len(), MAX_LIST_ENTRIES / 4);
+    assert_eq!(h.files[0].candidates, h.files[1].candidates);
+    write(d.path(), "a/one-more.txt", b"");
+    assert_eq!(limit(header(&d)), InputLimit::ListEntries);
+}
+
 /// A skin with `n` records in `field`, each `record`.
 fn records(field: &str, record: &str, n: usize) -> tempfile::TempDir {
     let list = vec![record; n].join(",");

@@ -459,17 +459,52 @@ fn file_choices_allow_wildcards_in_the_last_component_only() {
         "bg/a?.png",
         "bg/[ab].png",
         "bg/{a,b}",
-        "bg/*.png|x|",
+        // `|` in any form but one tag closing the name.
+        "bg/*.png|x",
+        "bg/*|.png",
+        "bg/*.png|x|y|",
+        "bg/*.png|x|y",
+        "bg/*.png|x|.png",
+        "bg/*|x|.png",
+        "bg/*.png||",
+        "bg/*.png|a/b|",
+        r"bg/*.png|a\\b|",
+        "bg/*.png|a*|",
+        "bg|x|/*.png",
+        "bg|/*.png|x|",
     ] {
         let text = play(&format!(r#""filepath": [{{"path": "{path}"}}]"#));
         assert!(
             matches!(
-                header(&skin(&[("s.json", &text)])),
+                header(&skin(&[("s.json", &text), ("bg/a.png", "")])),
                 Err(ImportError::Pattern { .. })
             ),
             "{path}"
         );
     }
+    // The whole name, tag included, is checked before the tag is split.
+    let long_tag = format!("bg/*.png|{}|", "a".repeat(skin_model::MAX_PATH_BYTES));
+    for path in [r"bg/*.png|a:b|", r"bg/*.png|a\u0000b|", long_tag.as_str()] {
+        let text = play(&format!(r#""filepath": [{{"path": "{path}"}}]"#));
+        match header(&skin(&[("s.json", &text), ("bg/a.png", "")])) {
+            Err(ImportError::Read {
+                source: RootError::Rejected,
+                ..
+            }) => {}
+            other => panic!("{path}: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn tagged_file_choices_list_their_pattern() {
+    // `candidates` also checks that the path keeps its tag.
+    let untagged = candidates("bg/*.png");
+    assert_eq!(candidates("bg/*.png|x|"), untagged);
+    assert_eq!(candidates("bg/a*|lift|"), ["a.png"]);
+    assert_eq!(candidates("custom/*|x|"), ["f.json", "one", "two"]);
+    // Inside a tag, the pattern's refused characters are plain text.
+    assert_eq!(candidates("bg/*.png|[a]{b}?|"), untagged);
 }
 
 #[test]

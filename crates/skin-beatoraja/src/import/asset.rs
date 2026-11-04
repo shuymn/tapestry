@@ -793,10 +793,23 @@ mod tests {
             prefixes: vec![
                 ("bg/*.png".into(), Some("dark.png".into())),
                 ("fx/*".into(), None),
+                ("parts/*.png|lift|".into(), Some("b.png".into())),
+                ("parts/*.png|hidden|".into(), Some("c.png".into())),
             ],
         };
         assert_eq!(c.substitute("bg/*.png"), Path::File("bg/dark.png".into()));
         assert_eq!(c.substitute("fx/*"), Path::Missing);
+        // A tagged key is the whole path: each source takes its own tag's
+        // pick, and an untagged source is no tagged key's.
+        assert_eq!(
+            c.substitute("parts/*.png|lift|"),
+            Path::File("parts/b.png".into())
+        );
+        assert_eq!(
+            c.substitute("parts/*.png|hidden|"),
+            Path::File("parts/c.png".into())
+        );
+        assert_eq!(c.substitute("parts/*.png"), Path::Glob);
         assert_eq!(c.substitute("etc/*.png"), Path::Glob);
         assert_eq!(c.substitute("a.png"), Path::File("a.png".into()));
         assert!(is_movie("x/A.MP4") && !is_movie("a.png"));
