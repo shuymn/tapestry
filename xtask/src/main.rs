@@ -33,8 +33,10 @@ commands:
                                           rules are configured and fire on their fixtures
   check-alloc-tests                       check that every allocation test runs in a
                                           release step of CI
-  check-contract                          check that the design.md contract clauses cite
-                                          headings and tests that exist, and the threat IDs
+  check-contract [--update]               check that the design.md contract clauses cite
+                                          headings and tests that exist, the threat IDs,
+                                          the Covers: tags and the Verification table;
+                                          --update rewrites that table first
   banned-words (--staged|--all) [--list <path>]
                                           check paths and contents in the index for
                                           terms in banned-words.txt
@@ -61,8 +63,12 @@ fn main() -> ExitCode {
         Some("check-alloc-tests") if rest.is_empty() => {
             report("check-alloc-tests", alloc_tests::run(&workspace_manifest()))
         }
-        Some("check-contract") if rest.is_empty() => {
-            report("check-contract", contract::run(&workspace_manifest()))
+        Some("check-contract") if rest.is_empty() => report(
+            "check-contract",
+            contract::run(&workspace_manifest(), false),
+        ),
+        Some("check-contract") if rest == ["--update"] => {
+            report("check-contract", contract::run(&workspace_manifest(), true))
         }
         Some("banned-words") => banned_words::run(&rest),
         Some("portable") => portable::run(&workspace_manifest(), &rest),

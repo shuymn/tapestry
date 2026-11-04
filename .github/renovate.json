@@ -13,5 +13,13 @@
   },
   "nix": {
     "enabled": true
-  }
+  },
+  "packageRules": [
+    {
+      "description": "Keep the direct skrifa aligned with swash, so the face checks and variable metrics parse fonts as swash's outline scaler does and no further skrifa version is built; update it by hand when updating swash.",
+      "matchManagers": ["cargo"],
+      "matchPackageNames": ["skrifa"],
+      "enabled": false
+    }
+  ]
 }

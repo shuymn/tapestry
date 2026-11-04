@@ -2,3 +2,6 @@
 # proptest failure persistence: local only (docs/setup.md "Property Tests")
 proptest-regressions/
 *.proptest-regressions
+# The temporary file of `cargo xtask check-contract --update`, renamed over
+# design.md once written
+/docs/design.md.update
