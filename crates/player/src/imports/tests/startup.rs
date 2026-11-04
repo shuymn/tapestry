@@ -339,6 +339,54 @@ fn a_refused_play_skin_fails_the_direct_path_at_once() {
     link.exit();
 }
 
+/// A Lua play skin whose base import reads a chart fact ends pending, and
+/// startup still refuses it with the reason it gave before a chart is
+/// chosen: on the song selection path no chart is admitted, and the
+/// direct path fails; nothing is selected either way.
+#[test]
+fn a_pending_play_skin_is_refused_at_startup() {
+    let _serial = serial();
+    for (body, fact) in [
+        (
+            "if ms.option(180) then x = 500 end",
+            "the chart's judgment class",
+        ),
+        ("x = ms.number(96)", "the chart's play level"),
+    ] {
+        let dir = super::lua_skin(body);
+        let choices = SkinChoices {
+            play: Some(choice(dir.path(), "play.luaskin")),
+            ..SkinChoices::default()
+        };
+        let why = format!(
+            "the skin reads {fact} as it is built, which is known only once a chart is \
+             chosen; such skins are not installed yet"
+        );
+        let build: Build = Arc::new(build);
+        let screens = Installers::default();
+        let link = screens.spawn_bare();
+        let started = startup(&link, &choices, Launch::Selection, false, &build, || false).unwrap();
+        assert_eq!(
+            started,
+            Started {
+                play: Some(format!("スキンを使えません: {why}")),
+                notice: None,
+            }
+        );
+        let failure = failed(startup(
+            &link,
+            &choices,
+            Launch::Direct,
+            false,
+            &build,
+            || false,
+        ));
+        assert_eq!(failure, format!("the play skin cannot be used: {why}"));
+        assert!(screens.log().is_empty(), "{:?}", screens.log());
+        link.exit();
+    }
+}
+
 /// A close during startup ends it within the stop bound, with no further
 /// build or selection: while play's job runs Lua, while the result kind's
 /// job runs after play's skin was committed, and while play's selection
