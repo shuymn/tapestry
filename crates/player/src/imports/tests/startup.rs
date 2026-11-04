@@ -277,8 +277,7 @@ fn a_refused_play_skin_fails_the_direct_path_at_once() {
         }
     }
     let _serial = serial();
-    let (_dir, choices) = skins(&[ScreenKind::Play, ScreenKind::Result]);
-    let dir = options_skin();
+    let (dir, choices) = skins(&[ScreenKind::Play, ScreenKind::Result]);
     critical_skin(dir.path(), "bad.json", "C:n.png");
     let refused_choices = SkinChoices {
         play: Some(choice(dir.path(), "bad.json")),

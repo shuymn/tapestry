@@ -1522,7 +1522,9 @@ pub(crate) const SELECT_SLICE: Duration = Duration::from_millis(1);
 /// The play skin's installation as the game thread sees it: a chart is
 /// admitted (chosen to play, or a practice Start) only once the skin it
 /// shows is installed, so the loading state always draws the skin's own
-/// loading frame. Production draws the simple skin, always ready.
+/// loading frame. Startup leaves it ready, or refused when the configured
+/// play skin was refused ([`crate::imports::startup`]); without one the
+/// simple skin draws, always ready.
 #[derive(Debug, Default)]
 pub enum SkinState {
     /// Installed: charts are admitted.

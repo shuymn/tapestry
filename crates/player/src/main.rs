@@ -1143,8 +1143,7 @@ fn start_skins(
 /// used fails the run before any recording opens, and a close during
 /// startup ends it with nothing played.
 fn skins_then_chart(loaded: &mut Loaded, rig: &mut PlayerRig<'_>) -> anyhow::Result<()> {
-    let settings = loaded.settings().clone();
-    match start_skins(rig, &settings, imports::Launch::Direct) {
+    match start_skins(rig, loaded.settings(), imports::Launch::Direct) {
         Ok(_) => game::live::run_chart(loaded, rig)
             .map(|_| ())
             .map_err(anyhow::Error::from),
