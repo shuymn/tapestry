@@ -142,9 +142,10 @@ pub fn check(
         && let Some(current) = design.get(range)
         && current != text
     {
-        // The first line that differs, a missing or extra one included.
+        // The first line that differs, a missing or extra one included,
+        // without their line endings (a last line has none).
         let (old, new): (Vec<&str>, Vec<&str>) =
-            (current.split('\n').collect(), text.split('\n').collect());
+            (current.lines().collect(), text.lines().collect());
         let differs = (0..old.len().max(new.len()))
             .find(|&i| old.get(i) != new.get(i))
             .unwrap_or(0);
@@ -1541,6 +1542,18 @@ fn ignored() {}
             update_tagged(&misshapen, TAGGED_SOURCE),
             (misshapen.clone(), reported.map(str::to_owned).to_vec())
         );
+        // The heading kept, its table removed.
+        let table = "| ID | Tagged tests | Note |\n| --- | --- | --- |\n";
+        let tableless = design_with(
+            &format!("{table}{T01_ROW}\n| T02 | Unverified | CI step \"Archives\" |\n"),
+            "",
+        );
+        let reported = ["docs/design.md: no table under \"### Verification\""];
+        assert_eq!(run(&tableless, SOURCE), reported);
+        assert_eq!(
+            update_tagged(&tableless, TAGGED_SOURCE),
+            (tableless.clone(), reported.map(str::to_owned).to_vec())
+        );
     }
 
     #[test]
@@ -1550,6 +1563,17 @@ fn ignored() {}
             "Notes on the table.\n\n#### Loading notes\n\nMore notes.\n",
         );
         assert_eq!(run(&nested, SOURCE), Vec::<String>::new());
+        // A heading at level 3 or above between them is not allowed.
+        let missing = [
+            "docs/design.md: no \"### Verification\" section right after \"### Threats and Mitigations\"",
+        ];
+        for heading in ["### Loading notes", "## Loading notes"] {
+            let between = design_with(
+                "Notes on the table.\n",
+                &format!("Notes on the table.\n\n{heading}\n\nMore notes.\n"),
+            );
+            assert_eq!(run(&between, SOURCE), missing, "{heading}");
+        }
     }
 
     #[test]
@@ -1569,6 +1593,23 @@ fn ignored() {}
             [
                 "docs/design.md: no \"## Behavioral Contract\" section".to_owned(),
                 format!("docs/design.md:25: {STALE}"),
+            ]
+        );
+        // The same in a CRLF file, missing the last row or with one extra.
+        assert_eq!(
+            run(&cut.replace('\n', "\r\n"), SOURCE),
+            [
+                "docs/design.md: no \"## Behavioral Contract\" section".to_owned(),
+                format!("docs/design.md:25: {STALE}"),
+            ]
+        );
+        let full = DESIGN.get(..DESIGN.find(t02).unwrap() + t02.len()).unwrap();
+        let crlf_extra = format!("{full}| T03 | Unverified | |").replace('\n', "\r\n");
+        assert_eq!(
+            run(&crlf_extra, SOURCE),
+            [
+                "docs/design.md: no \"## Behavioral Contract\" section".to_owned(),
+                format!("docs/design.md:26: {STALE}"),
             ]
         );
     }
