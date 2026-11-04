@@ -7417,11 +7417,7 @@ pub(crate) mod tests {
                 .unwrap(),
             Preparation::Ready
         );
-        let frames = || screens.loading.load(Ordering::Acquire);
-        link.loading().show(one_line("loading"));
-        assert!(wait_until(|| frames() > 0));
-        screens.stall.store(true, Ordering::Release);
-        assert!(wait_until(|| screens.stalled.load(Ordering::Acquire)));
+        stall_render(&link, &screens);
         let mut pending = link.select(ScreenKind::Selection, None);
         let (_, apart) = std::sync::mpsc::sync_channel(1);
         let rx = std::mem::replace(&mut pending.rx, apart);

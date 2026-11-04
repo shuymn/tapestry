@@ -21,10 +21,9 @@ use bms_model::{ChartBuilder, TimeUs};
 use common::{GAUGES, attempt, context, input, offscreen, view};
 use decl_support::{Look, solid_bundle};
 use render::{
-    CommitError, PreparedToken, RenderError, Renderer, SHARED_TEXELS, Scissor, SkinBundle,
-    VM_TEXELS,
+    CommitError, PreparedToken, RenderError, Renderer, SHARED_TEXELS, SkinBundle, VM_TEXELS,
 };
-use skin_model::{AtlasLimits, ClipId, ScreenKind};
+use skin_model::{AtlasLimits, ScreenKind};
 
 /// Big's cell: past a 4 096-texel page with its gutter, so its one page
 /// is 8 192 texels a side, beside the reserved layer.
@@ -278,33 +277,6 @@ fn a_removed_installation_gives_its_charge_back() {
     assert!(r.installed(ScreenKind::Selection).is_none());
     assert_eq!(r.admission().charge(ScreenKind::Selection), 0);
     r.admit(ScreenKind::Play, &big).unwrap();
-}
-
-/// Another kind's staging is projected at its commit onto the target as
-/// it is then: staged at 1 920×1 080 and committed after a resize to
-/// 960×540, its slot's viewport and clip scissor are the new size's.
-#[test]
-fn a_slot_is_projected_at_its_commit() {
-    let mut r = offscreen(1_920, 1_080);
-    let green = tiny(&r, GREEN);
-    let token = r.install(ScreenKind::Selection, &green, 1).unwrap();
-    r.resize(960, 540);
-    r.commit(token).unwrap();
-    let staging = r.slot_staging(ScreenKind::Selection).unwrap();
-    assert_eq!(staging.projection().target(), [960, 540]);
-    assert_eq!(staging.projection().viewport(), [0.0, 0.0, 960.0, 540.0]);
-    assert_eq!(
-        staging.scissor(Some(ClipId(0))),
-        Scissor::Rect([0, 0, 480, 540])
-    );
-    // A later resize projects it too.
-    r.resize(1_920, 1_080);
-    let staging = r.slot_staging(ScreenKind::Selection).unwrap();
-    assert_eq!(
-        staging.scissor(Some(ClipId(0))),
-        Scissor::Rect([0, 0, 960, 1_080])
-    );
-    assert!(r.slot_staging(ScreenKind::Play).is_none());
 }
 
 /// Another kind's staging of play's installed bundle shares its CPU

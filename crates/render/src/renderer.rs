@@ -1053,19 +1053,6 @@ impl Renderer {
         (self.staging.capacity(), self.staging.run_capacity())
     }
 
-    /// The staging of `kind`'s committed slot: its projection and its
-    /// clips' scissors on the current target. `None` for play, whose
-    /// staging is the renderer's own, and for a kind with nothing
-    /// committed.
-    #[must_use]
-    pub fn slot_staging(&self, kind: ScreenKind) -> Option<&Staging> {
-        let i = Self::screen(kind)?;
-        self.screens
-            .get(i)
-            .and_then(Option::as_ref)
-            .map(|s| &s.resources.staging)
-    }
-
     /// The play skin's fixed clips in use.
     #[must_use]
     pub const fn clips(&self) -> &ClipTable {
@@ -2556,6 +2543,39 @@ mod tests {
             [r, b]
         };
         assert_eq!((at(480), at(1_440)), ([255, 0], [0, 0]));
+    }
+
+    /// Another kind's staging is projected at its commit onto the target as
+    /// it is then: staged at 1 920×1 080 and committed after a resize to
+    /// 960×540, its slot's viewport and clip scissor are the new size's,
+    /// and a later resize projects the slot again.
+    #[test]
+    fn a_slot_is_projected_at_its_commit() {
+        use crate::Scissor;
+        use crate::test_common::offscreen;
+        use crate::test_decl::{Look, bundle};
+        use skin_model::{ClipId, ScreenKind};
+
+        let slot = |r: &Renderer| {
+            let i = Renderer::screen(ScreenKind::Selection).unwrap();
+            let slot = r.screens.get(i).and_then(Option::as_ref).unwrap();
+            (
+                slot.resources.staging.projection(),
+                slot.resources.staging.scissor(Some(ClipId(0))),
+            )
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let mut r = offscreen(1_920, 1_080);
+        let (green, _) = bundle(&r, dir.path(), &Look::left([0, 255, 0, 255]));
+        let token = r.install(ScreenKind::Selection, &green, 1).unwrap();
+        r.resize(960, 540);
+        r.commit(token).unwrap();
+        let (projection, scissor) = slot(&r);
+        assert_eq!(projection.target(), [960, 540]);
+        assert_eq!(projection.viewport(), [0.0, 0.0, 960.0, 540.0]);
+        assert_eq!(scissor, Scissor::Rect([0, 0, 480, 540]));
+        r.resize(1_920, 1_080);
+        assert_eq!(slot(&r).1, Scissor::Rect([0, 0, 960, 1_080]));
     }
 
     /// A refusal after the texture exists, injected between the candidate's
