@@ -16,7 +16,11 @@
 //! comments and attributes directly above a `#[test]` fn of a `.rs` file
 //! under `crates/` (`xtask/`, whose fixtures are strings, is not scanned).
 //! It must name a threat ID and sit above a test that is not `#[ignore]`d.
-//! The `### Verification` table, the heading after the threat section, has
+//! The files are not lexed: a line whose text starts with `// Covers:` is
+//! a tag even inside a block comment or a multiline string, and is
+//! reported there when it is not directly above a `#[test]` fn.
+//! The `### Verification` table, under the next heading at level 3 or
+//! above after the threat section (deeper headings may come between), has
 //! one row per threat ID in ID order: its `Tagged tests` cell is generated
 //! from the tags (grouped by file, files and tests in order, or
 //! `Unverified`), and its `Note` cell is kept as written. A table that
@@ -73,10 +77,28 @@ pub fn run(manifest: &Path, update: bool) -> anyhow::Result<Vec<String>> {
     }
     let (updated, diags) = self::update(&design, &sources, read);
     if updated != design {
-        std::fs::write(&path, &updated).with_context(|| format!("cannot write {DESIGN}"))?;
+        replace(&path, &updated).with_context(|| format!("cannot write {DESIGN}"))?;
         eprintln!("check-contract: rewrote the {VERIFICATION} table of {DESIGN}");
     }
     Ok(diags)
+}
+
+/// The file [`replace`] writes beside `path` before renaming it over.
+fn temporary(path: &Path) -> std::path::PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_owned();
+    name.push(".update");
+    path.with_file_name(name)
+}
+
+/// Replaces the contents of `path` with `text` by writing a file beside it
+/// and renaming it over `path`, so a failed write leaves `path` whole.
+fn replace(path: &Path, text: &str) -> io::Result<()> {
+    let tmp = temporary(path);
+    let written = std::fs::write(&tmp, text).and_then(|()| std::fs::rename(&tmp, path));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written
 }
 
 /// The `.rs` files under [`TAGGED`] that hold a tag, as (path relative to
@@ -120,11 +142,11 @@ pub fn check(
         && let Some(current) = design.get(range)
         && current != text
     {
-        // The first line that differs, or the table's first.
-        let differs = current
-            .split('\n')
-            .zip(text.split('\n'))
-            .position(|(a, b)| a != b)
+        // The first line that differs, a missing or extra one included.
+        let (old, new): (Vec<&str>, Vec<&str>) =
+            (current.split('\n').collect(), text.split('\n').collect());
+        let differs = (0..old.len().max(new.len()))
+            .find(|&i| old.get(i) != new.get(i))
             .unwrap_or(0);
         diags.push(format!(
             "{}: the {VERIFICATION} table is not the generated one; run `cargo xtask check-contract --update`",
@@ -740,13 +762,16 @@ fn verification(
         .headings
         .iter()
         .position(|h| h.level == 3 && h.text == THREATS)?;
-    let next = threats + 1;
-    let Some((start, stop)) = doc
+    // The next heading at level 3 or above; deeper ones in the notes are
+    // part of the threat section.
+    let next = doc
         .headings
-        .get(next)
-        .filter(|h| h.level == 3 && h.text == VERIFICATION)
-        .and_then(|_| section_at(&doc.headings, next))
-    else {
+        .iter()
+        .enumerate()
+        .skip(threats + 1)
+        .find(|(_, h)| h.level <= 3)
+        .filter(|(_, h)| h.level == 3 && h.text == VERIFICATION);
+    let Some((start, stop)) = next.and_then(|(i, _)| section_at(&doc.headings, i)) else {
         diags.push(format!(
             "{DESIGN}: no \"### {VERIFICATION}\" section right after \"### {THREATS}\""
         ));
@@ -1315,6 +1340,45 @@ fn ignored() {}
                 "crates/b/tests/b.rs:2: a tag is `// Covers: <ID>` with one threat ID, not `// Covers: T01, T02`"
             ]
         );
+        // A space after the colon.
+        let tight = tagged_with(BOUNDED, &format!("// Covers:T01\n{BOUNDED}"));
+        assert_eq!(
+            run_tagged(&tight),
+            [
+                "crates/b/tests/b.rs:2: a tag is `// Covers: <ID>` with one threat ID, not `// Covers:T01`"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_tag_separated_from_its_test_by_a_blank_line_is_stray() {
+        let spaced = format!("{TAGGED_SOURCE}// Covers: T01\n\n#[test]\nfn spaced() {{}}\n");
+        assert_eq!(
+            run_tagged(&spaced),
+            [
+                "crates/b/tests/b.rs:19: the tag is not in the comments and attributes directly above a #[test] fn"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_tag_line_in_a_block_comment_or_string_is_still_read() {
+        // A known limitation: the lines are not lexed, so a line starting
+        // with the tag text counts as a tag wherever it is.
+        let commented = tagged_with("const LIMIT", "/*\n// Covers: T01\n*/\nconst LIMIT");
+        let stray = "the tag is not in the comments and attributes directly above a #[test] fn";
+        assert_eq!(
+            run_tagged(&commented),
+            [format!("crates/b/tests/b.rs:9: {stray}")]
+        );
+        let string = tagged_with(
+            "const LIMIT: u8 = 1;",
+            "const TEXT: &str = \"\n// Covers: T01\n\";",
+        );
+        assert_eq!(
+            run_tagged(&string),
+            [format!("crates/b/tests/b.rs:9: {stray}")]
+        );
     }
 
     #[test]
@@ -1458,17 +1522,67 @@ fn ignored() {}
 
     #[test]
     fn a_missing_or_misshapen_verification_table_is_reported() {
+        let missing = design_with("### Verification", "### Evidence");
+        let reported = [
+            "docs/design.md: no \"### Verification\" section right after \"### Threats and Mitigations\"",
+        ];
+        assert_eq!(run(&missing, SOURCE), reported);
+        // `--update` leaves it as it is and still reports it.
         assert_eq!(
-            run(&design_with("### Verification", "### Evidence"), SOURCE),
+            update_tagged(&missing, TAGGED_SOURCE),
+            (missing.clone(), reported.map(str::to_owned).to_vec())
+        );
+        let misshapen = design_with("| Tagged tests |", "| Tests |");
+        let reported = [
+            "docs/design.md:22: the Verification table's columns are not \"ID\", \"Tagged tests\" and \"Note\"",
+        ];
+        assert_eq!(run(&misshapen, SOURCE), reported);
+        assert_eq!(
+            update_tagged(&misshapen, TAGGED_SOURCE),
+            (misshapen.clone(), reported.map(str::to_owned).to_vec())
+        );
+    }
+
+    #[test]
+    fn a_deeper_heading_in_the_threat_notes_is_allowed() {
+        let nested = design_with(
+            "Notes on the table.\n",
+            "Notes on the table.\n\n#### Loading notes\n\nMore notes.\n",
+        );
+        assert_eq!(run(&nested, SOURCE), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_missing_or_extra_last_row_is_reported_on_its_line() {
+        let t02 = "| T02 | Unverified | CI step \"Archives\" |\n";
+        let missing = design_with(t02, "");
+        assert_eq!(
+            run(&missing, SOURCE),
+            [format!("docs/design.md:25: {STALE}")]
+        );
+        let extra = design_with(t02, &format!("{t02}| T03 | Unverified | |\n"));
+        assert_eq!(run(&extra, SOURCE), [format!("docs/design.md:26: {STALE}")]);
+        // The file ending after the T01 row, with no line ending.
+        let cut = DESIGN.get(..DESIGN.find(t02).unwrap() - 1).unwrap();
+        assert_eq!(
+            run(cut, SOURCE),
             [
-                "docs/design.md: no \"### Verification\" section right after \"### Threats and Mitigations\""
+                "docs/design.md: no \"## Behavioral Contract\" section".to_owned(),
+                format!("docs/design.md:25: {STALE}"),
             ]
         );
-        assert_eq!(
-            run(&design_with("| Tagged tests |", "| Tests |"), SOURCE),
-            [
-                "docs/design.md:22: the Verification table's columns are not \"ID\", \"Tagged tests\" and \"Note\""
-            ]
-        );
+    }
+
+    #[test]
+    fn a_failed_write_leaves_the_file_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("design.md");
+        std::fs::write(&path, "old").unwrap();
+        super::replace(&path, "new").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
+        // The temporary file cannot be written: a directory is in its way.
+        std::fs::create_dir(super::temporary(&path)).unwrap();
+        assert!(super::replace(&path, "newer").is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
     }
 }

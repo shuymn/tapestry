@@ -221,7 +221,6 @@ fn bpm_keeps_eighteen_fractional_digits_and_cuts_the_rest() {
     assert_eq!(times(&loaded.chart.lanes[1]), vec![2_000_000]);
 }
 
-// Covers: T01
 #[test]
 fn oversized_measure_count_is_rejected() {
     let dir = folder(&["click.wav"]);
