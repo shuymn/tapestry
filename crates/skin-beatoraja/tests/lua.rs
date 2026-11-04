@@ -11,7 +11,7 @@ use skin_beatoraja::lua::Unsupported;
 use skin_beatoraja::lua::limits::{MAX_HOST_CALLS, MAX_INSTRUCTIONS, MAX_LUA_TIME};
 use skin_beatoraja::{
     Cancel, Config, ImportError, InputLimit, LuaHeader, LuaImported, LuaLimit, LuaWhy, NoteKind,
-    OffsetValue, read_lua_header,
+    OffsetValue, Severity, read_lua_header,
 };
 use skin_model::{RootError, ScreenKind};
 use tempfile::TempDir;
@@ -1942,17 +1942,25 @@ fn tables_are_read_raw_and_their_shape_is_checked() {
            __pairs = function() error(\"pairs\") end, __len = function() error(\"len\") end })",
     );
     import(&guarded).unwrap();
+    // Without a string key, only `1..=n` is a shape: sparse integers, and
+    // keys that are neither strings nor integers, are refused.
     for (body, want) in [
-        ("skin.extra = { 1, 2, x = 3 }", LuaWhy::Mixed),
         ("skin.extra = { 1, nil, 3 }", LuaWhy::Sparse),
+        ("skin.extra = { [1] = 1, [3] = 2 }", LuaWhy::Sparse),
         ("skin.extra = { [0] = 1 }", LuaWhy::Sparse),
         ("skin.extra = { [1.5] = 1 }", LuaWhy::Key),
+        ("skin.extra = { 1, [1.5] = 2 }", LuaWhy::Key),
         ("skin.extra = { [true] = 1 }", LuaWhy::Key),
         ("skin.extra = skin", LuaWhy::Cycle),
         ("skin.extra = \"\\xff\"", LuaWhy::NotUtf8),
     ] {
         assert_eq!(why(import(&configured(body))), want, "{body}");
     }
+    // A string key beside them makes a mixed table, which an unread
+    // field holds with one note.
+    let r = import(&configured("skin.extra = { 1, 2, x = 3 }")).unwrap();
+    assert_eq!(r.imported.report.usage.elements, 1);
+    assert_eq!(kinds(&r), [NON_STRING_KEYS]);
     let d = folder(&[("s.luaskin", "return 1")]);
     assert_eq!(why(header(&d)), LuaWhy::Returned);
     // A table reached twice is converted twice; an empty one takes its
@@ -2127,4 +2135,275 @@ fn a_timed_configured_pass_of_another_type_refuses_at_its_type() {
         h.timed(&Config::defaults(h.header()), &facts, &Cancel::new())
             .map(|_| ())
     });
+}
+
+/// The note a table with string keys and others gets.
+const NON_STRING_KEYS: NoteKind = NoteKind::Ignored {
+    field: "non-string keys",
+};
+
+/// The kinds of `r`'s notes.
+fn kinds(r: &LuaImported) -> Vec<NoteKind> {
+    common::kinds(&r.imported.report)
+}
+
+/// A destination's `dst` drawing image `i` once.
+const DST: &str = "dst = { { x = 0, y = 0, w = 64, h = 64 } }";
+
+#[test]
+fn a_mixed_table_is_a_record_of_its_string_keys() {
+    // Its other entries are never read, whatever their key: the image
+    // draws as without them, with one ignored note.
+    let image = |extra: &str| {
+        configured(&format!(
+            "skin.image = {{ {{ id = \"i\", src = \"a\", x = 0, y = 0, w = 64, h = 64{extra} }} }}"
+        ))
+    };
+    // Each folder is kept until its atlas is built.
+    let d = image("");
+    let base = import(&d).unwrap();
+    let usage = base.imported.report.usage;
+    let want = common::play::Drawn::new(base.imported.skin, 100).rects(1_000);
+    assert_eq!(want.len(), 1);
+    for extra in [", 41", ", [1.5] = 2", ", [true] = 1"] {
+        let d = image(extra);
+        let r = import(&d).unwrap();
+        let report = &r.imported.report;
+        assert_eq!(kinds(&r), [NON_STRING_KEYS], "{extra}");
+        assert_eq!(report.notes[0].severity, Severity::Ignored);
+        assert!(report.notes[0].at.is_some());
+        assert_eq!(
+            (report.usage.images, report.usage.frames),
+            (usage.images, usage.frames)
+        );
+        assert_eq!(report.usage.file_attempts, usage.file_attempts);
+        let rects = common::play::Drawn::new(r.imported.skin, 100).rects(1_000);
+        assert_eq!(rects, want, "{extra}");
+    }
+}
+
+#[test]
+fn a_mixed_table_has_no_wrapper_meaning() {
+    // An `include` beside a positional entry is a field like any other:
+    // the record is drawn as a failure-timed destination, and the absent
+    // `empty.json` is never read.
+    let failure = |extra: &str| folder(&[("s.luaskin", &drawn(&format!("timer = 3{extra}, ")))]);
+    let plain = import(&failure("")).unwrap();
+    let r = import(&failure(", include = \"empty.json\", 41")).unwrap();
+    assert_eq!(kinds(&r), [NON_STRING_KEYS]);
+    assert_eq!(r.imported.report.usage.elements, 1);
+    assert_eq!(
+        r.imported.report.usage.elements,
+        plain.imported.report.usage.elements
+    );
+    assert_eq!(
+        r.imported.report.usage.file_attempts,
+        plain.imported.report.usage.file_attempts
+    );
+    assert_eq!(r.dependencies, plain.dependencies);
+    assert_eq!(r.dependencies, ["s.luaskin"]);
+    // Nor are `if`, `value` and `values`: read as a choice, the condition
+    // on option 900 (not enabled) would drop the record; as fields, the
+    // record itself is drawn.
+    let other = "{ id = \"i\", dst = { { x = 100, y = 0, w = 8, h = 8 } } }";
+    for wrapper in [
+        format!("[\"if\"] = {{ 900 }}, value = {other}"),
+        format!("[\"if\"] = {{ 900 }}, values = {{ {other} }}"),
+        format!("IF = {{ 900 }}, Value = {other}"),
+    ] {
+        let r = import(&failure(&format!(", {wrapper}, 41"))).unwrap();
+        assert_eq!(kinds(&r), [NON_STRING_KEYS], "{wrapper}");
+        assert_eq!(r.imported.report.usage.elements, 1, "{wrapper}");
+        assert_eq!(r.imported.report.usage.keys, 1, "{wrapper}");
+    }
+}
+
+#[test]
+fn a_mixed_keyframe_is_a_record_with_defaults() {
+    // The first keyframe keeps its string field and defaults the rest
+    // (time 0, zero geometry): at 500 ms the image is halfway to its
+    // second keyframe, with and without the failure timer.
+    for timer in ["", "timer = 3, "] {
+        let d = folder(&[(
+            "s.luaskin",
+            &skin(
+                "",
+                &format!(
+                    "skin.destination = {{ {{ id = \"i\", loop = -1, {timer}dst = {{ {{ x = 1, 41 }},\n\
+                       {{ time = 1000, x = 0, y = 0, w = 64, h = 64 }} }} }} }}"
+                ),
+            ),
+        )]);
+        let r = import(&d).unwrap();
+        assert_eq!(kinds(&r), [NON_STRING_KEYS], "{timer}");
+        assert_eq!(r.imported.report.usage.keys, 2, "{timer}");
+        let want: &[[i32; 4]] = if timer.is_empty() {
+            &[[1, 1048, 32, 32]]
+        } else {
+            // The failure timer never starts in a plain play.
+            &[]
+        };
+        let mut drawn = common::play::Drawn::new(r.imported.skin, 100);
+        assert_eq!(drawn.rects(500), want, "{timer}");
+    }
+}
+
+#[test]
+fn a_mixed_table_s_other_values_are_never_converted() {
+    // A closure the admission refuses where it is read.
+    let closure = "function() return ms.number(110) end";
+    let body = |record: &str| {
+        folder(&[(
+            "s.luaskin",
+            &skin(
+                "",
+                &format!(
+                    "local ms = require(\"main_state\")\n\
+                     skin.destination = {{ {record} }}"
+                ),
+            ),
+        )])
+    };
+    let read = import(&body(&format!(
+        "{{ id = \"i\", timer = 3, draw = {closure}, {DST} }}"
+    )));
+    assert!(read.is_err(), "{read:?}");
+    // Under a positional key it is never read: no callable is recorded.
+    let r = import(&body(&format!(
+        "{{ id = \"i\", timer = 3, {DST}, {closure} }}"
+    )))
+    .unwrap();
+    assert!(r.callbacks.is_empty(), "{:?}", r.callbacks);
+    assert_eq!(kinds(&r), [NON_STRING_KEYS]);
+    assert_eq!(r.imported.report.usage.elements, 1);
+}
+
+#[test]
+fn mixed_table_notes_are_capped() {
+    let d = configured("skin.extra = {}\nfor k = 1, 4097 do skin.extra[k] = { 1, x = 1 } end");
+    let r = import(&d).unwrap();
+    let report = &r.imported.report;
+    assert_eq!(report.notes.len(), 4_096);
+    assert!(report.notes.iter().all(|n| n.kind == NON_STRING_KEYS));
+    assert_eq!(report.suppressed, 1);
+    assert_eq!(report.usage.elements, 1);
+}
+
+#[test]
+fn a_mixed_table_where_an_array_or_condition_is_read_is_refused() {
+    let entry = |body: &str| skin("", body);
+    let drawn_after = |body: &str| skin("", &format!("{body}\n{DRAW_I}"));
+    for body in [
+        // An array field, and one with an `include` key.
+        entry(&format!(
+            "skin.destination = {{ {{ id = \"i\", {DST} }}, n = 1 }}"
+        )),
+        entry(&format!(
+            "skin.destination = {{ {{ id = \"i\", {DST} }}, include = \"x.json\" }}"
+        )),
+        // A destination's keys.
+        entry(
+            "skin.destination = { { id = \"i\", dst = { { x = 0, y = 0, w = 64, h = 64 }, foo = 1 } } }",
+        ),
+        // A literal array.
+        drawn_after(
+            "skin.liftCover = { { id = \"l\", src = \"a\", x = 0, y = 0, w = 8, h = 8 }, n = 1 }",
+        ),
+        // A value's offset rows.
+        drawn_after(
+            "skin.value = { { id = \"v\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10,\n\
+               digit = 1, ref = 71, offset = { { x = 1 }, n = 1 } } }",
+        ),
+        // A condition, a condition's item, and an item's alternative.
+        entry(&format!(
+            "skin.destination = {{ {{ [\"if\"] = {{ 900, x = 1 }}, value = {{ id = \"i\", {DST} }} }} }}"
+        )),
+        entry(&format!(
+            "skin.destination = {{ {{ [\"if\"] = {{ {{ 900, x = 1 }} }}, value = {{ id = \"i\", {DST} }} }} }}"
+        )),
+        entry(&format!(
+            "skin.destination = {{ {{ [\"if\"] = {{ {{ {{ 900, x = 1 }} }} }}, value = {{ id = \"i\", {DST} }} }} }}"
+        )),
+        // A branch of a choice list, which would otherwise select nothing.
+        entry(&format!(
+            "skin.destination = {{ {{ {{ value = {{ id = \"i\", {DST} }}, 41 }} }} }}"
+        )),
+    ] {
+        // `x.json`, were it read, is no JSON.
+        let d = folder(&[("s.luaskin", &body), ("x.json", "not json")]);
+        assert_eq!(why(import(&d)), LuaWhy::Mixed, "{body}");
+    }
+    // The header's options.
+    let d = folder(&[(
+        "s.luaskin",
+        &skin(
+            "property = { { name = \"o\", item = { { name = \"a\", op = 900 } } }, n = 1 },",
+            DRAW_I,
+        ),
+    )]);
+    assert_eq!(why(header(&d)), LuaWhy::Mixed);
+    // A reader of its own refuses with its type error.
+    let d = folder(&[(
+        "s.luaskin",
+        &entry(&format!(
+            "skin.destination = {{ {{ id = \"i\", op = {{ 900, x = 1 }}, {DST} }} }}"
+        )),
+    )]);
+    let r = import(&d);
+    assert!(
+        matches!(r, Err(ImportError::Type { field: "op", .. })),
+        "{r:?}"
+    );
+}
+
+/// `json`, a JSON value of objects, arrays, strings and numbers, as a
+/// Lua table constructor.
+fn lua_table(json: &str) -> String {
+    let json = json.replace('[', "{").replace(']', "}");
+    let mut out = String::new();
+    let mut rest = json.as_str();
+    while let Some(open) = rest.find('"') {
+        out.push_str(&rest[..open]);
+        let after = &rest[open + 1..];
+        let close = after.find('"').unwrap();
+        let s = &after[..close];
+        rest = &after[close + 1..];
+        match rest.trim_start().strip_prefix(':') {
+            Some(r) => {
+                out.push_str(&format!("[\"{s}\"] ="));
+                rest = r;
+            }
+            None => out.push_str(&format!("\"{s}\"")),
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+#[test]
+fn a_mixed_note_part_array_is_refused() {
+    // Lanes with distinct active (`deco`) and inactive bodies; `LNBA`
+    // and `HID` stand for `lnbodyActive` and `hidden`.
+    let json = format!(
+        r#"{{"type": 0, "w": 1920, "h": 1080, "source": [{{"id": "a", "path": "a.png"}}], {}}}"#,
+        common::lanes::body(
+            "",
+            &common::lanes::note(r#""lnbodyActive": LNBA, "hidden": HID"#),
+            &[common::lanes::NOTES]
+        )
+    );
+    let lua = format!("return {}", lua_table(&json));
+    let deco = "\"deco\", ".repeat(8);
+    let lanes = |lnba: &str, hid: &str| {
+        folder(&[("s.luaskin", &lua.replace("LNBA", lnba).replace("HID", hid))])
+    };
+    // As arrays, they import.
+    let r = import(&lanes(&format!("{{ {deco} }}"), "{}")).unwrap();
+    assert!(!kinds(&r).contains(&NON_STRING_KEYS), "{:?}", kinds(&r));
+    // The body probe never reads it as empty, which would select the
+    // inactive bodies.
+    let mixed = lanes(&format!("{{ {deco} n = 8 }}"), "{}");
+    assert_eq!(why(import(&mixed)), LuaWhy::Mixed);
+    let mixed = lanes(&format!("{{ {deco} }}"), "{ \"x\", n = 1 }");
+    assert_eq!(why(import(&mixed)), LuaWhy::Mixed);
 }

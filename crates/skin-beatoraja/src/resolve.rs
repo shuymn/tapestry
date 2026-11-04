@@ -369,6 +369,18 @@ impl Definition {
         }
     }
 
+    /// A Lua table with string keys and others ([`Kind::Mixed`]) where an
+    /// array, a condition or a choice branch is read: refused at the
+    /// table, since the source lists every value in its VM's table order
+    /// (`LuaSkinLoader.java:174-186` at `0.8.9`), which is not reproduced,
+    /// and a mixed branch has no `if` or `value` to choose by.
+    pub(crate) fn mixed_error(&self, id: u32) -> ImportError {
+        ImportError::Lua {
+            at: Some(self.loc(id)),
+            why: LuaWhy::Mixed,
+        }
+    }
+
     /// A string field (`Json.readValue` to `String`, Json.java:1014 and
     /// JsonValue.java:172-186): a number as written, a boolean as `true`
     /// or `false`, `null` as absent. A Lua integer is its decimal digits,
@@ -689,6 +701,9 @@ impl Resolved<'_> {
                 continue;
             };
             if LITERAL.contains(name) {
+                if r.def.arena.is_mixed(id) {
+                    return Err(r.def.mixed_error(id));
+                }
                 if r.def.arena.is_array(id) {
                     let items: Vec<u32> = r.def.arena.children(id).collect();
                     for item in items {
@@ -892,6 +907,7 @@ impl Resolver<'_, '_> {
                     None => Ok(()),
                 },
             },
+            Kind::Mixed => Err(self.def.mixed_error(id)),
             Kind::Quoted | Kind::Bare | Kind::Lua => match self.strict {
                 _ if self.callable(id) => Err(self.def.callable_error(id, "other")),
                 Some(field) if !matches!(self.arena().scalar(id), Scalar::Null) => {
@@ -946,6 +962,10 @@ impl Resolver<'_, '_> {
                     if self.callable(branch) {
                         return Err(self.def.callable_error(branch, "other"));
                     }
+                    // A mixed table has no `if` or `value` to choose by.
+                    if self.arena().is_mixed(branch) {
+                        return Err(self.def.mixed_error(branch));
+                    }
                     let cond = self.arena().first_member_ci(branch, "if");
                     if self.test(cond)? {
                         return match self.arena().first_member_ci(branch, "value") {
@@ -973,45 +993,33 @@ impl Resolver<'_, '_> {
     }
 
     /// Whether condition `cond` holds; an array's items are tested in
-    /// order up to the first that fails.
+    /// order up to the first that fails, an item that is an array holding
+    /// when one of its alternatives does.
     fn test(&mut self, cond: Option<u32>) -> Result<bool, ImportError> {
         let Some(cond) = cond else {
             return Ok(true);
         };
-        if self.is_number(cond) {
-            return self.test_number(cond);
-        }
-        if self.callable(cond) {
-            return Err(self.def.callable_error(cond, "if"));
-        }
         if !self.arena().is_array(cond) {
-            return Ok(false);
+            return self.test_one(cond);
         }
         let mut next = self.arena().node(cond).first_child;
         while next != NONE {
             let item = next;
             next = self.arena().node(item).next_sibling;
-            let held = if self.is_number(item) {
-                self.test_number(item)?
-            } else if self.callable(item) {
-                return Err(self.def.callable_error(item, "if"));
-            } else if self.arena().is_array(item) {
+            let held = if self.arena().is_array(item) {
                 let mut held = false;
                 let mut alt = self.arena().node(item).first_child;
                 while alt != NONE {
                     let one = alt;
                     alt = self.arena().node(one).next_sibling;
-                    if self.callable(one) {
-                        return Err(self.def.callable_error(one, "if"));
-                    }
-                    if self.is_number(one) && self.test_number(one)? {
+                    if self.test_one(one)? {
                         held = true;
                         break;
                     }
                 }
                 held
             } else {
-                false
+                self.test_one(item)?
             };
             if !held {
                 return Ok(false);
@@ -1020,10 +1028,21 @@ impl Resolver<'_, '_> {
         Ok(true)
     }
 
-    /// `n` enabled for `n >= 0`, `-n` not enabled for `n < 0`; `i32::MIN`,
+    /// One condition that is not read as a list: a number `n` holds when
+    /// enabled for `n >= 0`, `-n` not enabled for `n < 0`; `i32::MIN`,
     /// which has no negation in `i32`, is a range error (the source's
-    /// wrapping negation is not reproduced).
-    fn test_number(&mut self, id: u32) -> Result<bool, ImportError> {
+    /// wrapping negation is not reproduced). A function or a mixed Lua
+    /// table is refused, and any other value is false.
+    fn test_one(&mut self, id: u32) -> Result<bool, ImportError> {
+        if self.callable(id) {
+            return Err(self.def.callable_error(id, "if"));
+        }
+        if self.arena().is_mixed(id) {
+            return Err(self.def.mixed_error(id));
+        }
+        if !self.is_number(id) {
+            return Ok(false);
+        }
         let op = self.def.int(id, "if")?;
         if op >= 0 {
             return Ok(self.enabled.contains(&op));
