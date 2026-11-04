@@ -8,7 +8,7 @@ use game::{
     Adjust, Chain, ControllerDevice, CoverSettings, DataRoot, DeviceSettings, FailureAction,
     HiSpeedReference, HiSpeedSettings, KeyConfig, KeyError, LaneKey, LibrarySettings, LocalRecords,
     PlayerSettings, PlayerSettingsError, RecordSink, Role, ScratchConfig, Settings, SettingsError,
-    SpeedMode, Tuning, load_settings, save_settings, write_atomic,
+    SkinChoice, SkinChoices, SpeedMode, Tuning, load_settings, save_settings, write_atomic,
 };
 use input::DeviceKind;
 use input::hid::AxisCap;
@@ -114,8 +114,168 @@ fn changed() -> Settings {
                 hidden: 40,
                 hidden_on: true,
             },
+            skins: SkinChoices {
+                play: Some(play_choice()),
+                ..SkinChoices::default()
+            },
         },
     }
+}
+
+/// A play skin's choice with an option and a file choice.
+fn play_choice() -> SkinChoice {
+    SkinChoice {
+        root: r"D:\skins\Mine".into(),
+        entry: "play/play7.luaskin".to_owned(),
+        options: [("Lane cover".to_owned(), "On".to_owned())].into(),
+        files: [("Background".to_owned(), "bg2.png".to_owned())].into(),
+    }
+}
+
+/// `[skins.play]` as a person writes it reads as its choice; an unknown
+/// key in a kind's table, or in `[skins]`, is refused naming it; an empty
+/// root, and an entry that is empty, absolute, drive-relative, UNC,
+/// verbatim, a stream, or climbs out of the folder, are refused naming
+/// the table and key; a file without `[skins]` chooses no skin.
+#[test]
+fn skin_choices_load_and_refuse_by_table_and_key() {
+    let (_dir, root) = temp_root();
+    fs::create_dir_all(root.path()).unwrap();
+    let load = |text: &str| {
+        fs::write(root.player_settings(), text).unwrap();
+        Settings::load(&root)
+    };
+    let s = load(
+        "[skins.play]\nroot = 'D:\\skins\\Mine'\nentry = 'play/play7.luaskin'\n\
+         options = { \"Lane cover\" = \"On\" }\nfiles = { \"Background\" = \"bg2.png\" }\n",
+    )
+    .unwrap();
+    assert_eq!(s.player.skins.play, Some(play_choice()));
+    assert_eq!(
+        [
+            &s.player.skins.selection,
+            &s.player.skins.decision,
+            &s.player.skins.result
+        ],
+        [&None; 3]
+    );
+    // Only the two keys it needs; the other kinds have the same shape.
+    let s = load("[skins.result]\nroot = 'D:/r'\nentry = 'a/../r.json'\n").unwrap();
+    let result = s.player.skins.result.unwrap();
+    assert_eq!(
+        (result.entry.as_str(), result.options.len()),
+        ("a/../r.json", 0)
+    );
+    assert!(s.player.skins.play.is_none());
+
+    for (text, table, key) in [
+        (
+            "[skins.play]\nroot = 'D:/s'\nentry = 'a.json'\ncolour = 1\n",
+            "skins.play",
+            "colour",
+        ),
+        (
+            "[skins.result]\nroot = 'D:/s'\nentry = 'a.json'\nroots = 'x'\n",
+            "skins.result",
+            "roots",
+        ),
+        (
+            "[skins.menu]\nroot = 'D:/s'\nentry = 'a.json'\n",
+            "skins",
+            "menu",
+        ),
+    ] {
+        match load(text) {
+            Err(e @ SettingsError::InvalidPlayer(PlayerSettingsError::SkinKey { .. })) => {
+                let e = Chain(&e).to_string();
+                assert!(
+                    e.contains(&format!("player.toml: [{table}] has no key {key};")),
+                    "{e}"
+                );
+            }
+            other => panic!("{other:?} for {text}"),
+        }
+    }
+    for (kind, key, value, says) in [
+        ("play", "root", "", "[skins.play] root '' is empty"),
+        ("play", "entry", "", "[skins.play] entry '' is empty"),
+        (
+            "decision",
+            "entry",
+            "/play.json",
+            "is not a name relative to root",
+        ),
+        (
+            "play",
+            "entry",
+            "\\\\play.json",
+            "is not a name relative to root",
+        ),
+        (
+            "play",
+            "entry",
+            "C:\\\\s\\\\play.json",
+            "is not a name relative to root",
+        ),
+        (
+            "play",
+            "entry",
+            "C:play.json",
+            "is not a name relative to root",
+        ),
+        (
+            "play",
+            "entry",
+            "\\\\\\\\server\\\\s\\\\play.json",
+            "is not a name relative to root",
+        ),
+        (
+            "play",
+            "entry",
+            "\\\\\\\\?\\\\C:\\\\play.json",
+            "is not a name relative to root",
+        ),
+        (
+            "play",
+            "entry",
+            "play.json:stream",
+            "is not a name relative to root",
+        ),
+        ("selection", "entry", "../play.json", "leads out of root"),
+        ("play", "entry", "a/../../play.json", "leads out of root"),
+        (
+            "play",
+            "entry",
+            "a\\\\..\\\\..\\\\play.json",
+            "leads out of root",
+        ),
+    ] {
+        let root_line = if key == "root" {
+            format!("root = \"{value}\"")
+        } else {
+            "root = 'D:/s'".to_owned()
+        };
+        let entry_line = if key == "entry" {
+            format!("entry = \"{value}\"")
+        } else {
+            "entry = 'a.json'".to_owned()
+        };
+        let text = format!("[skins.{kind}]\n{root_line}\n{entry_line}\n");
+        match load(&text) {
+            Err(e @ SettingsError::InvalidPlayer(PlayerSettingsError::Skin { .. })) => {
+                let e = Chain(&e).to_string();
+                assert!(e.contains(&format!("[skins.{kind}] {key} ")), "{e}");
+                assert!(e.contains(says), "{e} lacks {says}");
+            }
+            other => panic!("{other:?} for {text}"),
+        }
+    }
+    // Without `[skins]`, no kind has a skin, and none is written back.
+    let s = load("preset = \"tapestry\"\n").unwrap();
+    assert_eq!(s.player.skins, SkinChoices::default());
+    save_settings(&root.player_settings(), &s.player).unwrap();
+    let text = fs::read_to_string(root.player_settings()).unwrap();
+    assert!(!text.contains("skins"), "{text}");
 }
 
 #[test]
@@ -148,7 +308,9 @@ fn device_and_player_settings_round_trip() {
          [hispeed]\nmode = \"classic\"\nreference = \"max\"\nclassic_hispeed_x100 = 235\n\
          classic_step_x100 = 10\nfloating_step_x100 = 25\ngreen_target = 280\n\
          [covers]\nsudden = 120\nsudden_on = true\nlift = 80\nlift_on = true\n\
-         hidden = 40\nhidden_on = true\n",
+         hidden = 40\nhidden_on = true\n\
+         [skins.play]\nroot = 'D:\\skins\\Mine'\nentry = 'play/play7.luaskin'\n\
+         options = { \"Lane cover\" = \"On\" }\nfiles = { \"Background\" = \"bg2.png\" }\n",
     )
     .unwrap();
     assert_eq!(Settings::load(&root).unwrap().player, s.player);

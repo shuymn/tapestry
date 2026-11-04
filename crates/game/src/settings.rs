@@ -3,6 +3,7 @@
 //! with `presets/` and `records/`. The data root is a parameter; the player
 //! resolves the real one.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::fs;
 use std::io;
@@ -172,6 +173,30 @@ pub enum PlayerSettingsError {
     /// A preset value that can name neither a built-in nor a user preset.
     #[error(transparent)]
     Preset(UnknownPreset),
+    /// A `[skins.<kind>]` value that cannot name a skin, by its table and
+    /// key ([`SkinChoice::check`]).
+    #[error("[skins.{kind}] {key} '{value}' {why}")]
+    Skin {
+        /// The kind's table: `play`, `selection`, `decision` or `result`.
+        kind: &'static str,
+        /// The key: `root` or `entry`.
+        key: &'static str,
+        /// The value refused.
+        value: String,
+        /// Why.
+        why: &'static str,
+    },
+    /// A key `[skins]` or a `[skins.<kind>]` table does not take.
+    #[error(
+        "[{table}] has no key {key}; [skins] takes play, selection, decision and result, \
+         and each of them root, entry, options and files"
+    )]
+    SkinKey {
+        /// The table: `skins` or `skins.<kind>`.
+        table: String,
+        /// The key.
+        key: String,
+    },
 }
 
 /// A control bound to a lane, in a settings file.
@@ -799,6 +824,11 @@ pub struct PlayerSettings {
     pub hispeed: HiSpeedSettings,
     /// The lane covers, `[covers]`.
     pub covers: CoverSettings,
+    /// The skin chosen for each screen kind, `[skins.<kind>]`; a kind
+    /// without a table draws its built-in screen. Read once, at startup
+    /// (design.md "Settings Files").
+    #[serde(skip_serializing_if = "SkinChoices::is_empty")]
+    pub skins: SkinChoices,
 }
 
 impl Default for PlayerSettings {
@@ -809,7 +839,116 @@ impl Default for PlayerSettings {
             on_failure: FailureAction::Close,
             hispeed: HiSpeedSettings::default(),
             covers: CoverSettings::default(),
+            skins: SkinChoices::default(),
         }
+    }
+}
+
+/// `[skins]` of `player.toml`: the skin chosen for each screen kind, by
+/// the settings' own names of the kinds.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SkinChoices {
+    /// `[skins.play]`: the play screen's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub play: Option<SkinChoice>,
+    /// `[skins.selection]`: the select screen's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection: Option<SkinChoice>,
+    /// `[skins.decision]`: the decision screen's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision: Option<SkinChoice>,
+    /// `[skins.result]`: the result screen's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<SkinChoice>,
+}
+
+impl SkinChoices {
+    /// Whether no kind has a skin chosen.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.play.is_none()
+            && self.selection.is_none()
+            && self.decision.is_none()
+            && self.result.is_none()
+    }
+
+    /// Each kind's table name and its choice, in startup order: play,
+    /// selection, decision, result.
+    #[must_use]
+    pub const fn by_kind(&self) -> [(&'static str, Option<&SkinChoice>); 4] {
+        [
+            ("play", self.play.as_ref()),
+            ("selection", self.selection.as_ref()),
+            ("decision", self.decision.as_ref()),
+            ("result", self.result.as_ref()),
+        ]
+    }
+}
+
+/// One `[skins.<kind>]` table: a skin folder, its definition, and the
+/// user's options and file choices by name, resolved against the skin's
+/// header when it is imported.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SkinChoice {
+    /// The skin folder, an absolute path the user chose: every file the
+    /// skin reads stays inside it.
+    pub root: PathBuf,
+    /// The definition, relative to `root`: a Lua skin when it ends in
+    /// `.luaskin` or `.lua`, else a JSON definition.
+    pub entry: String,
+    /// Option name to the name of the item selected; an option not named
+    /// takes its default.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub options: BTreeMap<String, String>,
+    /// File choice name to the candidate chosen; one not named takes its
+    /// default.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub files: BTreeMap<String, String>,
+}
+
+impl SkinChoice {
+    /// Checks that `root` is given and that `entry` is a name inside it:
+    /// not empty, not rooted, drive, UNC, verbatim or stream (no `:`), no
+    /// NUL, and no `..` leading above the folder. Containment, links
+    /// included, is checked again when the skin is read.
+    ///
+    /// # Errors
+    ///
+    /// [`PlayerSettingsError::Skin`] for the first value refused, under
+    /// table `kind`.
+    pub fn check(&self, kind: &'static str) -> Result<(), PlayerSettingsError> {
+        let refuse = |key, value: &str, why| {
+            Err(PlayerSettingsError::Skin {
+                kind,
+                key,
+                value: value.to_owned(),
+                why,
+            })
+        };
+        if self.root.as_os_str().is_empty() {
+            return refuse("root", "", "is empty");
+        }
+        let entry = self.entry.as_str();
+        if entry.is_empty() {
+            return refuse("entry", entry, "is empty");
+        }
+        if entry.starts_with(['/', '\\']) || entry.contains([':', '\0']) {
+            return refuse("entry", entry, "is not a name relative to root");
+        }
+        let mut depth = 0_usize;
+        for part in entry.split(['/', '\\']) {
+            match part {
+                "" | "." => {}
+                ".." => match depth.checked_sub(1) {
+                    Some(d) => depth = d,
+                    None => return refuse("entry", entry, "leads out of root"),
+                },
+                _ => depth += 1,
+            }
+        }
+        Ok(())
     }
 }
 
@@ -896,8 +1035,9 @@ impl PlayerSettings {
         self.covers = options.covers().into();
     }
 
-    /// Checks the play options ([`options`](Self::options)), and that the
-    /// preset is a built-in's name or one a user preset can take. Whether
+    /// Checks the play options ([`options`](Self::options)), the skin
+    /// choices ([`SkinChoice::check`]), and that the preset is a
+    /// built-in's name or one a user preset can take. Whether
     /// that user preset exists is checked when it is loaded ([`Shelf`]).
     ///
     /// # Errors
@@ -907,6 +1047,11 @@ impl PlayerSettings {
     /// [`Shelf`]: crate::presets::Shelf
     pub fn validate(&self) -> Result<(), PlayerSettingsError> {
         self.options()?;
+        for (kind, choice) in self.skins.by_kind() {
+            if let Some(choice) = choice {
+                choice.check(kind)?;
+            }
+        }
         if !rules::BUILT_IN_PRESETS.contains(&self.preset.as_str())
             && rules_toml::check_user_preset_name(&self.preset).is_err()
         {
@@ -949,17 +1094,44 @@ impl SettingsFile for DeviceSettings {
 }
 
 impl SettingsFile for PlayerSettings {
-    /// Refuses a `visible_time_ms`:
-    /// [`PlayerSettingsError::VisibleTimeRemoved`].
+    /// Refuses a `visible_time_ms`
+    /// ([`PlayerSettingsError::VisibleTimeRemoved`]), and an unknown key
+    /// in `[skins]` or a `[skins.<kind>]` table by its table and key
+    /// ([`PlayerSettingsError::SkinKey`]). A value of another type is left
+    /// to the typed parse.
     fn refuse(table: &toml::Table) -> Result<(), SettingsError> {
         if table.contains_key("visible_time_ms") {
             return Err(SettingsError::InvalidPlayer(
                 PlayerSettingsError::VisibleTimeRemoved,
             ));
         }
+        let Some(toml::Value::Table(skins)) = table.get("skins") else {
+            return Ok(());
+        };
+        let unknown = |table: String, key: &str| {
+            SettingsError::InvalidPlayer(PlayerSettingsError::SkinKey {
+                table,
+                key: key.to_owned(),
+            })
+        };
+        for (kind, choice) in skins {
+            if !SKIN_KINDS.contains(&kind.as_str()) {
+                return Err(unknown("skins".to_owned(), kind));
+            }
+            if let toml::Value::Table(choice) = choice
+                && let Some(key) = choice.keys().find(|k| !SKIN_KEYS.contains(&k.as_str()))
+            {
+                return Err(unknown(format!("skins.{kind}"), key));
+            }
+        }
         Ok(())
     }
 }
+
+/// The kinds `[skins]` takes, by the settings' names.
+const SKIN_KINDS: [&str; 4] = ["play", "selection", "decision", "result"];
+/// The keys a `[skins.<kind>]` table takes.
+const SKIN_KEYS: [&str; 4] = ["root", "entry", "options", "files"];
 
 /// Reads a settings file; a file that does not exist gives the defaults.
 /// The text is read as a TOML table first, which

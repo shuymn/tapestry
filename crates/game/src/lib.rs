@@ -130,7 +130,8 @@ pub use settings::{
     ControllerDevice, CoverSettings, DEVICE_SETTINGS_VERSION, DataRoot, DeviceSettings,
     DeviceSettingsError, KeyConfig, KeyError, LaneKey, LibrarySettings, NEXT_PRESET_KEY,
     OVERLAY_KEY, PREV_PRESET_KEY, PlayerSettings, PlayerSettingsError, Role, ScratchConfig,
-    SettingsError, SettingsFile, load_settings, reserved_key, save_settings,
+    SettingsError, SettingsFile, SkinChoice, SkinChoices, load_settings, reserved_key,
+    save_settings,
 };
 pub use sound::{AudioQueue, AudioSink, RunnerAudio, Wakes, audio_link, audio_link_at};
 pub use tempo::{AttemptTempo, MAIN_HISTOGRAM_LIMIT, ReferenceError};
