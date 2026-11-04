@@ -23,22 +23,23 @@
 //! prepared for an attempt, its clips and its prepared text included,
 //! does the same with the snapshot's gauges changing: its first and later
 //! frames, a refused one, the frames around a resize, and a full batch
-//! with the overlay kept whole. A
-//! committed installation's loading presentation, with its lanes, its
-//! gauge drawn from a descriptor, progress and the chosen chart's text
-//! installed, builds its first and later loading frames, a refused one,
-//! and the next lifetime's first
-//! frame, its state started afresh in place, without allocating; the
-//! load's lines are drawn in a text pass outside this count. An imported
+//! with the overlay kept whole. A committed installation's loading
+//! presentation, with its lanes, its gauge drawn from a descriptor,
+//! progress and the chosen chart's rasterized text installed, builds its
+//! first and later loading frames, a refused one, and the next lifetime's
+//! first frame, its state started afresh in place, without allocating;
+//! the load's lines are drawn in a text pass outside this count. An imported
 //! skin (JSON, a bitmap font and page images through the importer) does
 //! the same with its bitmap text installed: its loading frames with
 //! covers moving its trimmed paint every frame, each frame's runs
 //! resolved to scissors, inline clips included, as the renderer draws
 //! them, across a resize, a refusal and the next lifetime; and an
 //! attempt's play frames with bitmap labels, batches short of sprites and
-//! of runs keeping the overlay whole. A skin refused because with the
-//! other screens' skins it passes the texels they share is refused
-//! without allocating, before anything is staged.
+//! of runs keeping the overlay whole. An imported skin with outline text
+//! builds its play frames and then its loading frames, each with lines
+//! rasterized by its producer, without allocating. A skin refused
+//! because with the other screens' skins it passes the texels they share
+//! is refused without allocating, before anything is staged.
 //!
 //! The counting allocator counts only on the thread that opted in, so the
 //! harness's own threads do not disturb it. This file holds a single test
@@ -866,6 +867,9 @@ fn loading_frames() {
     };
     r.prepare_loading_text(1, 1, skin_model::TextSlots::ALL, &chart)
         .unwrap();
+    // The chart text's lines rasterized into the text layer: the title,
+    // the artist, the genre and the full title.
+    assert_eq!(r.text_report().counts.placements, 4);
     assert_eq!(r.install_staged_loading_text(), Ok(true));
     let mut skin = DeclSkin::of(&r.installation(ScreenKind::Play).unwrap());
     let mut staging = Staging::with_runs(
@@ -1260,7 +1264,8 @@ fn declarative_frames(chart: &Chart, taps: &[(u8, TimeUs)], overlay: &[&str], gl
 /// Play frames of an imported skin whose title, artist and a literal are
 /// rasterized outline text, staged and committed on WARP: the renderer's
 /// builds (what each frame does before `submit` calls into wgpu) draw the
-/// lines and allocate nothing, from the first frame on.
+/// lines and allocate nothing, from the first frame on; then its loading
+/// frames with the chosen chart's lines prepared and installed.
 fn outline_frames(chart: &Chart, overlay: &[&str]) {
     use outline_support::{Value, default_font, text, ttf};
     let mut r = offscreen(1_920, 1_080);
@@ -1313,4 +1318,33 @@ fn outline_frames(chart: &Chart, overlay: &[&str]) {
     assert!(later.unwrap() > 0);
     assert_eq!(later_allocs, 0, "a later outline text frame allocated");
     r.submit().unwrap();
+
+    // The loading presentation's chart text rasterized by the same
+    // producer into the same layer and installed between frames: the
+    // renderer's loading builds draw it and allocate nothing either.
+    r.enter_loading(1);
+    let chosen = skin_model::ChartText {
+        title: "Chosen",
+        ..labels
+    };
+    r.prepare_loading_text(1, 1, skin_model::TextSlots::ALL, &chosen)
+        .unwrap();
+    // The new title placed; the artist and the literal hits.
+    let counts = r.text_report().counts;
+    assert_eq!((counts.placements, counts.hits), (1, 2), "{counts:?}");
+    assert_eq!(r.install_staged_loading_text(), Ok(true));
+    let at = |k: i64| common::loading_frame(1, TimeUs(k * FRAME_US), TimeUs(0));
+    let (first, first_allocs) = counted(|| r.build_loading(&at(0)));
+    first.unwrap();
+    assert_eq!(first_allocs, 0, "an outline text loading frame allocated");
+    let (later, later_allocs) = counted(|| {
+        (1..FRAMES)
+            .try_for_each(|k| r.build_loading(&at(k)))
+            .map(|()| FRAMES - 1)
+    });
+    assert!(later.unwrap() > 0);
+    assert_eq!(
+        later_allocs, 0,
+        "a later outline text loading frame allocated"
+    );
 }

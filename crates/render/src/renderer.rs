@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use bms_model::Chart;
 use eval::Section;
 use skin_model::{
-    AtlasLimits, BitmapLines, BuildError, ChartText, ScreenKind, TextSlots, TextTable,
+    AtlasLimits, BitmapLines, BuildError, ChartText, Layout, ScreenKind, TextSlots, TextTable,
     TextTableError,
 };
 use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
@@ -180,17 +180,22 @@ struct StagedText {
     table: Option<TextTable>,
     /// The bitmap-font slots' lines, laid out by the skin.
     bitmap: BitmapLines,
+    /// The text layer's lines its table draws, held until it is installed
+    /// or dropped.
+    holder: Holder,
 }
 
 impl StagedText {
-    /// The bytes it holds: itself, its rasterized lines, and its bitmap
-    /// lines with their glyphs.
+    /// The bytes it holds: itself, its rasterized lines with their
+    /// holder's list, and its bitmap lines with their glyphs.
     fn bytes(&self) -> u64 {
         let lines = self
             .table
             .as_ref()
             .map_or(0, |t| t.len() * size_of::<Option<skin_model::TextImage>>());
-        u64::try_from(size_of::<Self>() + lines + self.bitmap.heap_bytes()).unwrap_or(u64::MAX)
+        let held = self.holder.bytes();
+        u64::try_from(size_of::<Self>() + lines + held + self.bitmap.heap_bytes())
+            .unwrap_or(u64::MAX)
     }
 }
 
@@ -482,7 +487,7 @@ pub struct MemoryWitness {
     /// The staged installation's, when it is another installation's.
     pub staged_loading: u64,
     /// The chosen chart's loading text prepared and waiting to install
-    /// ([`Renderer::prepare_loading_text`]).
+    /// ([`Renderer::prepare_loading_text`]), with its holder's list.
     pub staged_text: u64,
     /// The default font, shared by every text producer: counted once, in
     /// no bundle.
@@ -498,7 +503,7 @@ pub struct MemoryWitness {
     /// The bytes the queue staged for the last text preparation's writes.
     pub text_upload: u64,
     /// The installed text layer's cache: its entries, aliases and the
-    /// installed attempt's holder.
+    /// holders of the installed attempt and the installed loading lines.
     pub text_cache: u64,
     /// The staged resources' text cache, when they are new, and the staged
     /// attempt's holder.
@@ -656,6 +661,9 @@ pub struct Renderer {
     text_cache: TextCache,
     /// The lines the installed attempt's table draws.
     installed_text: Holder,
+    /// The lines the installed presentation's loading text slots draw,
+    /// slot by slot.
+    installed_loading: Holder,
     /// The text preparation's buffers.
     text_scratch: TextScratch,
     /// What the last text preparation did.
@@ -713,6 +721,10 @@ pub struct Renderer {
     /// A unit test's hooks into the text upload.
     #[cfg(test)]
     pub(crate) text_hooks: text_upload::Hooks,
+    /// Development builds: the next text preparation's wait for the GPU
+    /// fails ([`fail_next_text_wait`](Self::fail_next_text_wait)).
+    #[cfg(feature = "dev-tools")]
+    text_wait_fault: bool,
 }
 
 impl Renderer {
@@ -793,6 +805,7 @@ impl Renderer {
             staging,
             text_cache: TextCache::none(),
             installed_text: Holder::default(),
+            installed_loading: Holder::default(),
             text_scratch: TextScratch::default(),
             text_report: TextReport::default(),
             skin,
@@ -814,6 +827,8 @@ impl Renderer {
             buffer_fault: false,
             #[cfg(test)]
             text_hooks: text_upload::Hooks::default(),
+            #[cfg(feature = "dev-tools")]
+            text_wait_fault: false,
             id: RENDERERS.fetch_add(1, Ordering::Relaxed),
         })
     }
@@ -950,6 +965,7 @@ impl Renderer {
         self.skin = skin;
         self.installed = None;
         self.installed_text = Holder::default();
+        self.installed_loading = Holder::default();
         self.refused = None;
         self.loading_refused = None;
         self.project();
@@ -1266,17 +1282,27 @@ impl Renderer {
             };
             skin.prepare(&self.gpu, &a).map_err(RenderError::Skin)?;
             if let Some(producer) = bundle.text_producer() {
+                let key = self.loading_text_key();
                 // The staging's own resources, or the installed ones,
-                // whose installed attempt's lines stay.
+                // whose installed attempt's lines stay, with the installed
+                // loading lines and the loading text staged for them.
                 let (atlas, cache, held) = match resources.as_mut() {
-                    Some(r) => (&r.atlas, &mut r.text_cache, None),
-                    None => (
-                        &self.atlas,
-                        &mut self.text_cache,
-                        Some(&self.installed_text),
-                    ),
+                    Some(r) => (&r.atlas, &mut r.text_cache, Vec::<&Holder>::new()),
+                    None => {
+                        let staged = self
+                            .staged_text
+                            .as_ref()
+                            .filter(|t| key == Some(t.key))
+                            .map(|t| &t.holder);
+                        let held = [
+                            Some(&self.installed_text),
+                            Some(&self.installed_loading),
+                            staged,
+                        ];
+                        let held = held.into_iter().flatten().collect();
+                        (&self.atlas, &mut self.text_cache, held)
+                    }
                 };
-                let held: Vec<&Holder> = held.into_iter().collect();
                 let prepared = text_upload::prepare(
                     text_upload::Prepare {
                         gpu: &self.gpu,
@@ -1287,10 +1313,13 @@ impl Renderer {
                         held: &held,
                         #[cfg(test)]
                         hooks: &mut self.text_hooks,
+                        #[cfg(feature = "dev-tools")]
+                        wait_fault: &mut self.text_wait_fault,
                     },
-                    bundle.skin(),
-                    a.text,
-                    a.target,
+                    &bundle
+                        .skin()
+                        .text_requests(a.text, a.target, &Layout::AUTHOR),
+                    bundle.skin().text_slots(),
                 );
                 let (table, holder, report) = prepared?;
                 self.text_report = report;
@@ -1314,8 +1343,10 @@ impl Renderer {
         Ok(token)
     }
 
-    /// What the last preparation of an attempt's rasterized text did: its
-    /// notes, counts, upload bytes and submission.
+    /// What the last preparation of rasterized text did, an attempt's
+    /// ([`stage`](Self::stage)) or the loading text's
+    /// ([`prepare_loading_text`](Self::prepare_loading_text)): its notes,
+    /// counts, upload bytes and submission.
     #[must_use]
     pub const fn text_report(&self) -> &TextReport {
         &self.text_report
@@ -1475,13 +1506,17 @@ impl Renderer {
     }
 
     /// Replaces the atlas, its bind group, the staging and the instance
-    /// buffer with `r`, together.
+    /// buffer with `r`, together. The installed loading lines' holder goes
+    /// with the cache it held lines in: the new resources' key makes the
+    /// presentation's loading text stale, and the player clears it before
+    /// the next loading frame is built.
     fn replace_resources(&mut self, r: Resources) {
         self.atlas = r.atlas;
         self.atlas_bind = r.atlas_bind;
         self.staging = r.staging;
         self.instances = r.instances;
         self.text_cache = r.text_cache;
+        self.installed_loading = Holder::default();
         self.resources += 1;
     }
 
@@ -1583,7 +1618,8 @@ impl Renderer {
             text_cache: self
                 .text_cache
                 .bytes()
-                .saturating_add(bytes(self.installed_text.bytes())),
+                .saturating_add(bytes(self.installed_text.bytes()))
+                .saturating_add(bytes(self.installed_loading.bytes())),
             staged_text_cache: res
                 .map_or(0, |r| r.text_cache.bytes())
                 .saturating_add(staged.map_or(0, |p| bytes(p.text.bytes()))),
@@ -1851,43 +1887,92 @@ impl Renderer {
         let Some(installed) = self.installed.as_ref() else {
             return Err(LoadingTextError::Stale);
         };
-        Ok(installed
+        installed
             .loading()
-            .install_text(installed.bundle(), which, table)?)
+            .install_text(installed.bundle(), which, table)?;
+        // Those slots no longer draw the text layer's lines.
+        self.installed_loading
+            .release_named(installed.bundle().skin(), which);
+        Ok(())
     }
 
     /// Prepares the chosen chart's text `chart` of `revision` for loading
-    /// lifetime `lifetime`, the slots `which` names: the bitmap-font lines
-    /// laid out by the installation's skin, held staged until
+    /// lifetime `lifetime`, the slots `which` names, held staged until
     /// [`install_staged_loading_text`](Self::install_staged_loading_text),
-    /// replacing text staged before: at most one preparation waits. Before
-    /// recording opens and outside a frame's build, such as in a loading
-    /// frame's call before it builds: it allocates. Nothing is staged without
-    /// a declarative installation. No rasterized loading lines are prepared
-    /// yet: they come with their holders in the text layer, and until then
-    /// the staged text clears the rasterized slots while its bitmap lines
-    /// install.
+    /// replacing text staged before: at most one preparation waits. The
+    /// rasterized slots' lines are placed in the installed resources' text
+    /// layer and uploaded through the bundle's producer, as an attempt's
+    /// are ([`stage`](Self::stage)), never writing to or freeing a line the
+    /// installed attempt, the attempt staged on these resources or the
+    /// installed loading lines hold; the staged text holds its own until
+    /// it is installed or dropped. The bitmap-font lines are laid out by
+    /// the installation's skin. Before recording opens and outside a
+    /// frame's build, such as in a loading frame's call before it builds:
+    /// it allocates and waits for the GPU. Nothing is staged without a
+    /// declarative installation; without a producer the staged text clears
+    /// the rasterized slots.
     ///
     /// # Errors
     ///
-    /// None yet: the rasterized lines' refusal comes with them.
+    /// As an attempt's text ([`stage`](Self::stage)): the producer's
+    /// refusal of a line ([`RenderError::Skin`]), the device's refusal of
+    /// a write ([`RenderError::Atlas`]), both refusals
+    /// ([`RenderError::is_refusal`]), or the device failing while it is
+    /// waited for. Nothing is staged, and what was installed stays.
     pub fn prepare_loading_text(
         &mut self,
         lifetime: u64,
         revision: u64,
         which: TextSlots,
         chart: &ChartText<'_>,
-    ) -> Result<(), SkinError> {
+    ) -> Result<(), RenderError> {
         self.staged_text = None;
         let (Some(key), Some(installed)) = (self.loading_text_key(), self.installed.as_ref())
         else {
             return Ok(());
         };
-        let bundle = installed.bundle();
-        // The rasterized loading lines come with their holders in the
-        // text layer; until then the staged text clears those slots.
-        let table = None;
-        let bitmap = bundle.skin().loading_bitmap_lines(which, chart);
+        let bundle = Arc::clone(installed.bundle());
+        let skin = bundle.skin();
+        let (table, holder) = match bundle.text_producer() {
+            Some(producer) => {
+                // A failure leaves no earlier preparation's report.
+                self.text_report = TextReport::default();
+                let mut requests = skin.text_requests(chart, self.target(), &Layout::AUTHOR);
+                requests.retain(|r| skin.names_text_slot(which, r.slot));
+                // The attempt staged on these resources keeps its lines.
+                let pending = self
+                    .pending
+                    .as_ref()
+                    .filter(|p| p.token.kind == ScreenKind::Play && p.resources.is_none())
+                    .map(|p| &p.text);
+                let held = [
+                    Some(&self.installed_text),
+                    pending,
+                    Some(&self.installed_loading),
+                ];
+                let held: Vec<&Holder> = held.into_iter().flatten().collect();
+                let (table, holder, report) = text_upload::prepare(
+                    text_upload::Prepare {
+                        gpu: &self.gpu,
+                        atlas: &self.atlas,
+                        cache: &mut self.text_cache,
+                        scratch: &mut self.text_scratch,
+                        producer: producer.as_ref(),
+                        held: &held,
+                        #[cfg(test)]
+                        hooks: &mut self.text_hooks,
+                        #[cfg(feature = "dev-tools")]
+                        wait_fault: &mut self.text_wait_fault,
+                    },
+                    &requests,
+                    skin.text_slots(),
+                )?;
+                self.text_report = report;
+                (Some(table), holder)
+            }
+            None => (None, Holder::default()),
+        };
+        let bitmap = skin.loading_bitmap_lines(which, chart);
         self.staged_text = Some(StagedText {
             key,
             lifetime,
@@ -1895,8 +1980,18 @@ impl Renderer {
             which,
             table,
             bitmap,
+            holder,
         });
         Ok(())
+    }
+
+    /// Development builds: the next preparation of rasterized text that
+    /// uploads fails waiting for the GPU as a failing device does
+    /// ([`RenderError::Poll`], not a refusal), its cache closed until the
+    /// renderer is built again.
+    #[cfg(feature = "dev-tools")]
+    pub fn fail_next_text_wait(&mut self) {
+        self.text_wait_fault = true;
     }
 
     /// The loading lifetime and revision of the text staged, if any.
@@ -1932,16 +2027,22 @@ impl Renderer {
             staged.table.as_ref(),
             staged.bitmap,
         )?;
+        // Its slots draw its lines now, and no longer the ones before.
+        self.installed_loading
+            .release_named(installed.bundle().skin(), staged.which);
+        self.installed_loading.extend(staged.holder);
         Ok(true)
     }
 
     /// Clears the installed presentation's slots `which` names, so they
     /// draw nothing from its next loading frame until text is installed
-    /// for them again; no timer changes. Nothing without a declarative
-    /// installation.
+    /// for them again, and lets go of their lines in the text layer; no
+    /// timer changes. Nothing without a declarative installation.
     pub fn clear_loading_text(&mut self, which: TextSlots) {
         if let Some(installed) = &self.installed {
             installed.loading().clear_text(installed.bundle(), which);
+            self.installed_loading
+                .release_named(installed.bundle().skin(), which);
         }
     }
 

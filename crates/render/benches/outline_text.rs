@@ -13,7 +13,9 @@
 //!    `Renderer::stage` with its wait for the GPU: six lines at 73, 42,
 //!    26, 42, 26 and 31 px (title, artist, genre, subtitle and two
 //!    literals, Japanese where the font has it), each attempt cold with
-//!    new labels, warm with the same ones.
+//!    new labels, warm with the same ones; then the loading text's
+//!    preparation of the same lines, cold and warm, median and p95 of 30,
+//!    each the whole `Renderer::prepare_loading_text` with its wait.
 //! 3. The atlas side with and without the text layer, the layer's bytes
 //!    with its mips, the bytes the last cold preparation staged, the
 //!    largest line, and the preparation's buffers.
@@ -39,7 +41,7 @@ use render::{
     AttemptInput, AttemptText, DefaultFont, LineBounds, LineFit, LineLayout, OutlineText,
     SkinError, TextResidency, text::fonts_dir,
 };
-use skin_model::{ChartText, Layout, ScreenKind, TextRequest};
+use skin_model::{ChartText, Layout, ScreenKind, TextRequest, TextSlots};
 
 /// The producer, timing its layouts and rasterizations.
 #[derive(Debug)]
@@ -226,6 +228,42 @@ fn main() {
         let gate = if ms(cp) <= 8.0 { "within" } else { "past" };
         println!(
             "{name}: cold median {:.2} ms, p95 {:.2} ms ({gate} the 8 ms gate); warm median {:.2} ms, p95 {:.2} ms",
+            ms(cm),
+            ms(cp),
+            ms(wm),
+            ms(wp)
+        );
+        // The loading text's preparation of the same labels, cold on an
+        // empty cache and warm with every line a hit, each the whole
+        // `Renderer::prepare_loading_text` with its wait for the GPU.
+        let mut revision = 0;
+        let mut loading = |r: &mut render::Renderer, title: &str| {
+            revision += 1;
+            let labels = ChartText {
+                title,
+                subtitle: "サブタイトル",
+                artist: "アーティスト",
+                subartist: "",
+                genre: "ジャンル",
+            };
+            r.enter_loading(1);
+            let t = Instant::now();
+            r.prepare_loading_text(1, revision, TextSlots::ALL, &labels)
+                .unwrap();
+            t.elapsed()
+        };
+        let cold: Vec<Duration> = (0..30)
+            .map(|i| {
+                r.restore(ScreenKind::Play, &installation).unwrap();
+                loading(&mut r, &format!("曲名テスト {i}"))
+            })
+            .collect();
+        let placed = r.text_report().counts.placements;
+        let warm: Vec<Duration> = (0..30).map(|_| loading(&mut r, "曲名テスト 29")).collect();
+        let (cm, cp) = stats(cold);
+        let (wm, wp) = stats(warm);
+        println!(
+            "{name}: loading text, {placed} lines: cold median {:.2} ms, p95 {:.2} ms; warm median {:.2} ms, p95 {:.2} ms",
             ms(cm),
             ms(cp),
             ms(wm),

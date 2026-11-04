@@ -11,6 +11,12 @@ publish.workspace = true
 [package.metadata.tapestry]
 windows-only = true
 
+[features]
+default = []
+# Development features. Never enabled in production builds (R3): a fault
+# injected into the text preparation's wait for the GPU.
+dev-tools = []
+
 [dependencies]
 bms-model.workspace = true
 bytemuck.workspace = true

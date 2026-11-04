@@ -1,7 +1,7 @@
-//! Preparing an attempt's rasterized text (design.md "Rendering and
-//! Skins"): the lines placed in the text layer's cache
-//! ([`crate::text_cache`]), then rasterized and uploaded, one at a time,
-//! before READY and outside every frame build.
+//! Preparing rasterized text, an attempt's or the loading presentation's
+//! (design.md "Rendering and Skins"): the lines placed in the text layer's
+//! cache ([`crate::text_cache`]), then rasterized and uploaded, one at a
+//! time, before READY and outside every frame build.
 //!
 //! Nothing is written until placement has succeeded. Each new line is
 //! rasterized, expanded to premultiplied white `(c, c, c, c)` over its
@@ -14,7 +14,7 @@
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
-use skin_model::{ChartText, GUTTER, Layout, MIP_LEVELS, Skin, TextTable, downsample_rgba};
+use skin_model::{GUTTER, MIP_LEVELS, TextRequest, TextTable, downsample_rgba};
 
 use crate::decl::AttemptText;
 use crate::gpu::Gpu;
@@ -44,7 +44,8 @@ pub const fn text_upload_bound(side: u32) -> u64 {
     s * s * 4 * 85 / 64 + 64 * (1_096 * 224 + 548 * 240 + 274 * 248 + 137 * 252)
 }
 
-/// What the last preparation of an attempt's text did.
+/// What the last preparation of rasterized text did, an attempt's or the
+/// loading text's.
 #[derive(Clone, Debug, Default)]
 pub struct TextReport {
     /// One line per request without an image: its slot and why.
@@ -149,10 +150,15 @@ pub(crate) struct Prepare<'a> {
     pub(crate) held: &'a [&'a Holder],
     #[cfg(test)]
     pub(crate) hooks: &'a mut Hooks,
+    /// Development builds: the wait fails, taking it, as a device failing
+    /// would ([`crate::Renderer::fail_next_text_wait`]).
+    #[cfg(feature = "dev-tools")]
+    pub(crate) wait_fault: &'a mut bool,
 }
 
-/// Prepares `chart`'s rasterized lines of `skin` on a `target`-pixel
-/// target: the table, the holder of its lines, and the report.
+/// Prepares the rasterized lines of `requests` (in slot order) for a
+/// table of `slots` slots: the table, the holder of its lines, and the
+/// report.
 ///
 /// # Errors
 ///
@@ -165,15 +171,13 @@ pub(crate) struct Prepare<'a> {
 /// published, and the cache takes no more lines.
 pub(crate) fn prepare(
     p: Prepare<'_>,
-    skin: &Skin,
-    chart: &ChartText<'_>,
-    target: [u32; 2],
+    requests: &[TextRequest],
+    slots: usize,
 ) -> Result<(TextTable, Holder, TextReport), RenderError> {
-    let requests = skin.text_requests(chart, target, &Layout::AUTHOR);
     let side = p.cache.side();
     let bounds = LineBounds::for_side(side);
     let producer = p.producer;
-    let placement = p.cache.place(&requests, bounds, p.held, |r, em, b| {
+    let placement = p.cache.place(requests, bounds, p.held, |r, em, b| {
         producer.layout(r, em, b)
     });
     let mut report = TextReport {
@@ -241,11 +245,17 @@ pub(crate) fn prepare(
     // no device-lost callback is registered), a gap left open here. Only a
     // failing wait is treated as the device's failure below.
     let waited = if submission.is_some() {
-        // A unit test may make the wait fail in place of waiting.
+        // A unit test, or a development build, may make the wait fail in
+        // place of waiting.
         #[cfg(test)]
         let injected = hooks.wait.take();
         #[cfg(not(test))]
         let injected: Option<RenderError> = None;
+        #[cfg(feature = "dev-tools")]
+        let injected = injected.or_else(|| {
+            std::mem::take(&mut *p.wait_fault)
+                .then_some(RenderError::Poll(wgpu::PollError::Timeout))
+        });
         let w = match injected {
             Some(e) => Err(e),
             None => wait_for_gpu(p.gpu),
@@ -276,7 +286,7 @@ pub(crate) fn prepare(
         hooks.step(p.gpu, cache, Step::RolledBack);
         return Err(e);
     }
-    let (lines, holder, notes) = cache.publish(placement, skin.text_slots(), p.held);
+    let (lines, holder, notes) = cache.publish(placement, slots, p.held);
     #[cfg(test)]
     hooks.step(p.gpu, cache, Step::Published);
     report.notes = notes;
