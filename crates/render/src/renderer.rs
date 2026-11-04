@@ -1053,6 +1053,19 @@ impl Renderer {
         (self.staging.capacity(), self.staging.run_capacity())
     }
 
+    /// The staging of `kind`'s committed slot: its projection and its
+    /// clips' scissors on the current target. `None` for play, whose
+    /// staging is the renderer's own, and for a kind with nothing
+    /// committed.
+    #[must_use]
+    pub fn slot_staging(&self, kind: ScreenKind) -> Option<&Staging> {
+        let i = Self::screen(kind)?;
+        self.screens
+            .get(i)
+            .and_then(Option::as_ref)
+            .map(|s| &s.resources.staging)
+    }
+
     /// The play skin's fixed clips in use.
     #[must_use]
     pub const fn clips(&self) -> &ClipTable {
@@ -1337,12 +1350,19 @@ impl Renderer {
                 self.activate_decl_skin(pending.skin);
             }
             Some(i) => {
-                if let (Some(resources), Some(slot)) = (pending.resources, self.screens.get_mut(i))
-                {
-                    *slot = Some(Slot {
-                        installation: pending.skin.installation(),
-                        resources,
-                    });
+                if let Some(mut resources) = pending.resources {
+                    // Projected afresh, as play's commit projects its
+                    // own: the target may have been resized since the
+                    // staging.
+                    let installation = pending.skin.installation();
+                    let canvas = installation.bundle().skin().canvas(self.target());
+                    resources.staging.project(&canvas);
+                    if let Some(slot) = self.screens.get_mut(i) {
+                        *slot = Some(Slot {
+                            installation,
+                            resources,
+                        });
+                    }
                 }
             }
         }
