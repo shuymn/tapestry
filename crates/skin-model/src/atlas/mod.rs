@@ -14,6 +14,7 @@
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
 mod mip;
+pub use mip::downsample_rgba;
 mod pack;
 pub(crate) mod uv;
 
@@ -56,8 +57,10 @@ pub const MAX_PAGE_SIDE: u32 = 8_192;
 /// The most skin pages, also capped by the device's layers.
 pub const MAX_PAGES: u32 = 64;
 /// The most level-0 texels across every layer of the array, the reserved
-/// ones included; the mips add a third.
+/// ones and the text layer included; the mips add a third.
 pub const MAX_ATLAS_TEXELS: u64 = 128 << 20;
+/// The smallest page side of an atlas with a text layer.
+pub const MIN_TEXT_SIDE: u32 = 2_048;
 
 /// Which files an atlas reads: the 1x ones, or each file's @2x version
 /// where it has one.
@@ -128,9 +131,18 @@ pub struct Atlas {
     pages: Vec<Page>,
     uvs: UvTable,
     variant: Variant,
+    text_layer: Option<u16>,
 }
 
 impl Atlas {
+    /// The layer kept for rasterized text, after the pages, if the atlas
+    /// has one ([`Sheet::atlas_reserving`]). It has no CPU page: the
+    /// renderer creates it zeroed and writes lines into it.
+    #[must_use]
+    pub fn text_layer(&self) -> Option<u16> {
+        self.text_layer
+    }
+
     /// Every page's side at level 0.
     #[must_use]
     pub fn side(&self) -> u32 {
@@ -168,18 +180,20 @@ fn alloc_level(bytes: u64) -> Result<Vec<u8>, AtlasError> {
     Ok(v)
 }
 
-/// The layer count the limits allow for skin pages.
-fn page_cap(limits: &AtlasLimits) -> Result<u32, AtlasError> {
+/// The layer count the limits allow for skin pages, with `extra` layers
+/// kept after them.
+fn page_cap(limits: &AtlasLimits, extra: u32) -> Result<u32, AtlasError> {
     let AtlasLimits {
         max_side,
         max_layers,
         reserved_layers,
     } = *limits;
-    if reserved_layers >= max_layers || max_side < MIN_PAGE_SIDE {
+    let kept = reserved_layers.saturating_add(extra);
+    if kept >= max_layers || max_side < MIN_PAGE_SIDE {
         return Err(AtlasError::Limits);
     }
-    let pages = (max_layers - reserved_layers).min(MAX_PAGES);
-    let last = u64::from(reserved_layers) + u64::from(pages) - 1;
+    let pages = (max_layers - kept).min(MAX_PAGES);
+    let last = u64::from(kept) + u64::from(pages) - 1;
     if last > u64::from(u16::MAX) {
         return Err(AtlasError::Limits);
     }
@@ -223,7 +237,28 @@ impl Sheet {
         limits: AtlasLimits,
         cancel: &dyn Fn() -> bool,
     ) -> Result<Atlas, AtlasError> {
-        let max_pages = page_cap(&limits)?;
+        self.atlas_reserving(variant, limits, false, cancel)
+    }
+
+    /// [`atlas`](Self::atlas), with a text layer kept after the pages when
+    /// `text` is set: the page side is then at least [`MIN_TEXT_SIDE`], the
+    /// packing's cost and the [`MAX_ATLAS_TEXELS`] check count the layer,
+    /// and the device's layers must hold it. The layer has no CPU page
+    /// ([`Atlas::text_layer`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`atlas`](Self::atlas).
+    pub fn atlas_reserving(
+        &self,
+        variant: Variant,
+        limits: AtlasLimits,
+        text: bool,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<Atlas, AtlasError> {
+        let extra = u32::from(text);
+        let min_side = if text { MIN_TEXT_SIDE } else { 0 };
+        let max_pages = page_cap(&limits, extra)?;
         let cap = pack::side_cap(limits.max_side.min(MAX_PAGE_SIDE));
         let files = self.files();
         // Each cell's rectangle in the version the variant reads.
@@ -251,16 +286,16 @@ impl Sheet {
             rects.push(rect);
             padded.push(size);
         }
-        let packing =
-            pack::pack(&padded, cap, max_pages, limits.reserved_layers).map_err(|e| match e {
-                PackError::TooManyPages => AtlasError::TooManyPages,
-                PackError::Misaligned => AtlasError::Misaligned,
-            })?;
+        let kept = limits.reserved_layers + extra;
+        let packing = pack::pack(&padded, cap, max_pages, kept, min_side).map_err(|e| match e {
+            PackError::TooManyPages => AtlasError::TooManyPages,
+            PackError::Misaligned => AtlasError::Misaligned,
+        })?;
         // Only the rectangles and the places stay beside the files
         // ([`CELL_TABLE_BYTES`]).
         drop(padded);
         let side = packing.side;
-        let texels = pack::cost(limits.reserved_layers, packing.pages, side);
+        let texels = pack::cost(kept, packing.pages, side);
         if texels > MAX_ATLAS_TEXELS {
             return Err(AtlasError::AtlasTooLarge { texels });
         }
@@ -304,11 +339,18 @@ impl Sheet {
                 layer,
             });
         }
+        let text_layer = if text {
+            let layer = limits.reserved_layers + packing.pages;
+            Some(u16::try_from(layer).map_err(|_| AtlasError::Limits)?)
+        } else {
+            None
+        };
         Ok(Atlas {
             side,
             pages,
             uvs: UvTable::new(self.id(), frames.into_boxed_slice()),
             variant,
+            text_layer,
         })
     }
 
