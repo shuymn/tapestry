@@ -627,6 +627,8 @@ fn run_pass(pass: &Rc<Pass>, entry: &str) -> Result<Converted, Stop> {
     #[cfg(feature = "dev-tools")]
     let start = std::time::Instant::now();
     let r = sandbox::vm(pass).map(|lua| {
+        #[cfg(feature = "dev-tools")]
+        vm_hooks::opened();
         let run = loader::compile(&lua, pass, entry).and_then(|(f, id)| {
             let values = loader::run(&lua, pass, f, MultiValue::new())?;
             pass.ledger.memory(lua.used_memory());
@@ -646,7 +648,11 @@ fn run_pass(pass: &Rc<Pass>, entry: &str) -> Result<Converted, Stop> {
         });
         #[cfg(feature = "dev-tools")]
         let done = std::time::Instant::now();
+        #[cfg(feature = "dev-tools")]
+        vm_hooks::closing();
         drop(lua);
+        #[cfg(feature = "dev-tools")]
+        vm_hooks::closed();
         #[cfg(feature = "dev-tools")]
         pass.timings.set(Timings {
             execution: executed - start,

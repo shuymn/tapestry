@@ -164,6 +164,34 @@ fn warnings_to(
     }
 }
 
+/// The lines `write` logs through a logger over the run's sink and its
+/// bounds, each without its time and level (tests).
+#[cfg(test)]
+pub(crate) fn through_the_sink(write: impl FnOnce(&dyn Log)) -> Vec<String> {
+    let log = FileLog {
+        state: Mutex::new(Some(Logged {
+            sink: Sink::new(Vec::new(), Caps::FILE, Instant::now()),
+            _lease: None,
+        })),
+    };
+    write(&log);
+    let out = log
+        .state
+        .into_inner()
+        .ok()
+        .flatten()
+        .and_then(|l| l.sink.out)
+        .unwrap_or_default();
+    String::from_utf8_lossy(&out)
+        .lines()
+        .map(|l| {
+            // `<ms> <LEVEL> <message>`.
+            let mut parts = l.trim_start().splitn(3, ' ');
+            parts.nth(2).unwrap_or_default().trim_start().to_owned()
+        })
+        .collect()
+}
+
 /// A record of this crate's target.
 fn own<'a>(level: Level, args: fmt::Arguments<'a>) -> Record<'a> {
     Record::builder()

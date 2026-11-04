@@ -592,8 +592,25 @@ impl std::fmt::Debug for Witness {
     }
 }
 
-/// A stop while the looping pass's VM lives cancels it: the job ends with
-/// the Lua cancellation, not a cap. With the VM's destruction held, the
+/// Waits until the looping pass's VM is open beyond the `base` open
+/// before and its Lua is executing the loop: the instruction hook has run
+/// [`LOOP_STEPS`] steps since the VM was seen, more than building its
+/// strings takes.
+#[cfg(feature = "dev-tools")]
+#[track_caller]
+fn executing(base: usize) {
+    use skin_beatoraja::lua::vm_hooks;
+    assert!(wait_until(|| vm_hooks::live() > base));
+    let from = vm_hooks::steps();
+    assert!(wait_until(|| vm_hooks::steps() >= from + LOOP_STEPS));
+}
+
+/// Instruction hook steps of 100 instructions: the strings take a few.
+#[cfg(feature = "dev-tools")]
+const LOOP_STEPS: u64 = 20;
+
+/// A stop while the looping pass's Lua executes its loop cancels it: the
+/// job ends with the Lua cancellation, not a cap. With the VM's destruction held, the
 /// runner stays blocked midway, the VM still counted, and returns only
 /// once it is released and gone; with the job's thread held after its
 /// send, the runner stays blocked until that is released too.
@@ -608,7 +625,7 @@ fn a_stop_mid_lua_cancels_and_returns_after_the_vm_and_the_thread() {
     let midway = Duration::from_millis(300);
 
     let (stop, rx) = started(looping_job(dir.path(), &dropped));
-    assert!(wait_until(|| vm_hooks::live() > base));
+    executing(base);
     stop.store(true, Ordering::SeqCst);
     cancelled(rx.recv_timeout(STOP_WAIT).unwrap());
     assert_eq!(vm_hooks::live(), base);
@@ -616,7 +633,7 @@ fn a_stop_mid_lua_cancels_and_returns_after_the_vm_and_the_thread() {
     // The VM's destruction held, released before the stop bound.
     vm_hooks::hold();
     let (stop, rx) = started(looping_job(dir.path(), &dropped));
-    assert!(wait_until(|| vm_hooks::live() > base));
+    executing(base);
     stop.store(true, Ordering::SeqCst);
     assert!(wait_until(|| vm_hooks::waiting() == 1));
     assert!(
@@ -631,7 +648,7 @@ fn a_stop_mid_lua_cancels_and_returns_after_the_vm_and_the_thread() {
     // The thread held after its send.
     hold_exit(true);
     let (stop, rx) = started(looping_job(dir.path(), &dropped));
-    assert!(wait_until(|| vm_hooks::live() > base));
+    executing(base);
     stop.store(true, Ordering::SeqCst);
     assert!(wait_until(|| exit_waiting() == 1));
     let early = rx.recv_timeout(midway);
@@ -656,7 +673,7 @@ fn a_job_past_the_stop_wait_is_abandoned() {
     let base = vm_hooks::live();
     vm_hooks::hold();
     let (stop, rx) = started(looping_job(dir.path(), &dropped));
-    assert!(wait_until(|| vm_hooks::live() > base));
+    executing(base);
     let stopped = Instant::now();
     stop.store(true, Ordering::SeqCst);
     let ran = rx.recv_timeout(STOP_WAIT + Duration::from_secs(5));
@@ -737,9 +754,9 @@ impl log::Log for Kept {
     fn flush(&self) {}
 }
 
-/// An installed skin's log: its summary line with its files, choices,
-/// counters, its atlas's texels and the committed total against the
-/// shared limit; then at most 100 notes, located, and a count of the rest
+/// An installed skin's log: its summary line with its atlas's texels and
+/// the committed total against the shared limit, counters, files and
+/// choices; then at most 100 notes, located, and a count of the rest
 /// with the ones the import kept only as a count.
 #[test]
 fn an_installed_skin_logs_its_summary_and_notes() {
@@ -766,19 +783,15 @@ fn an_installed_skin_logs_its_summary_and_notes() {
     assert_eq!(logged.len(), 1 + 100 + 1, "{logged:?}");
     let head = &logged[0];
     assert!(
-        head.starts_with("skin: play: installed; files s.json; "),
-        "{head}"
-    );
-    assert!(
-        head.contains("choices Background = b.png (Configured)"),
-        "{head}"
-    );
-    assert!(
-        head.ends_with(&format!(
-            "atlas {texels} texels, committed {} of {} texels",
+        head.starts_with(&format!(
+            "skin: play: installed; atlas {texels} texels, committed {} of {} texels; ",
             texels + 5,
             render::SHARED_TEXELS
         )),
+        "{head}"
+    );
+    assert!(
+        head.ends_with("; files s.json; choices Background = b.png (Configured)"),
         "{head}"
     );
     assert_eq!(
@@ -798,6 +811,43 @@ fn an_installed_skin_logs_its_summary_and_notes() {
     let kept = Kept::default();
     log_installed(ScreenKind::Play, &summary, texels, texels, &kept);
     assert_eq!(kept.0.into_inner().unwrap().len(), 3);
+}
+
+/// Through the run's sink, which cuts a record at 1 KiB, a skin of many
+/// definition files keeps its texel figures and counters in the summary
+/// line: they come before the lists that may be cut.
+#[test]
+fn the_texel_figures_survive_a_long_summary() {
+    let r = crate::render_common::offscreen(1_920, 1_080);
+    let dir = options_skin();
+    let (b, mut summary) = bundled(play(&choice(dir.path(), "s.json"), &target(&r)));
+    summary.sources = (0..60)
+        .map(|i| format!("parts/a-rather-long-definition-name-{i:02}.json"))
+        .collect();
+    let texels = b.atlas_texels();
+    let lines = crate::log_file::through_the_sink(|log| {
+        log_installed(ScreenKind::Play, &summary, texels, texels + 5, log);
+    });
+    let head = &lines[0];
+    let u = &summary.usage;
+    let figures = format!(
+        "skin: play: installed; atlas {texels} texels, committed {} of {} texels; \
+         elements {} images {} frames {} files {} fonts {} texts {} notes {}; files ",
+        texels + 5,
+        render::SHARED_TEXELS,
+        u.elements,
+        u.images,
+        u.frames,
+        u.files,
+        u.fonts,
+        u.texts,
+        u.notes
+    );
+    assert!(head.starts_with(&figures), "{head}");
+    assert!(
+        !head.contains("parts/a-rather-long-definition-name-59.json"),
+        "{head}"
+    );
 }
 
 /// The reports' text: each kind's line, a non-play kind's notice, and an

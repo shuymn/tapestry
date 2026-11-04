@@ -241,6 +241,13 @@ fn skin_choices_load_and_refuse_by_table_and_key() {
             "play.json:stream",
             "is not a name relative to root",
         ),
+        // A NUL, escaped in the TOML text.
+        (
+            "play",
+            "entry",
+            "play\\u0000.json",
+            "is not a name relative to root",
+        ),
         ("selection", "entry", "../play.json", "leads out of root"),
         ("play", "entry", "a/../../play.json", "leads out of root"),
         (

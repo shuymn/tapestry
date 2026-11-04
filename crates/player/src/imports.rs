@@ -392,6 +392,11 @@ pub enum Ran<T> {
 ///   outcome already received included; past it, [`Ran::Abandoned`].
 /// - A panic in `job` is caught on its thread and sent as
 ///   [`PANICKED`]; a thread that ends without sending is [`ENDED`].
+///
+/// [`STOP_WAIT`] bounds the job's body, up to the thread's
+/// `is_finished`; the join after it is not bounded. A thread whose
+/// thread-local destructors block would hold it, which no job here has
+/// (waiting on the native thread's end needs platform calls).
 pub fn run_cancellable<T: Send + 'static>(
     job: impl FnOnce(&Cancel) -> T + Send + 'static,
     mut stop: impl FnMut() -> bool,
@@ -485,11 +490,12 @@ pub fn notice(kind: ScreenKind, why: &str) -> String {
     format!("{screen}のスキンは使えません（内蔵画面）: {why}")
 }
 
-/// Logs an installed skin of `kind`: one line with its definition files,
-/// file choices and counters, its atlas's texels and the texels every
-/// kind's committed skin is charged together, against the shared limit;
-/// then its notes, located, at most the log's cap, and a count of the
-/// rest (design.md "Log File"), into `log` (the run's, [`log::logger`]).
+/// Logs an installed skin of `kind`: one line with its atlas's texels and
+/// the texels every kind's committed skin is charged together against the
+/// shared limit, its counters, then its definition files and file
+/// choices, the lists last since a record is cut at the log's line cap;
+/// then its notes, located, at most the log's cap, and a count of the rest
+/// (design.md "Log File"), into `log` (the run's, [`log::logger`]).
 pub fn log_installed(
     kind: ScreenKind,
     summary: &Summary,
@@ -497,7 +503,21 @@ pub fn log_installed(
     committed: u64,
     log: &dyn log::Log,
 ) {
-    let mut head = format!("installed; files {}; choices ", summary.sources.join(", "));
+    let u = &summary.usage;
+    let mut head = format!(
+        "installed; atlas {atlas_texels} texels, committed {committed} of {} texels; \
+         elements {} images {} frames {} files {} fonts {} texts {} notes {}; files {}; \
+         choices ",
+        render::SHARED_TEXELS,
+        u.elements,
+        u.images,
+        u.frames,
+        u.files,
+        u.fonts,
+        u.texts,
+        u.notes,
+        summary.sources.join(", ")
+    );
     if summary.files.is_empty() {
         head.push_str("none");
     }
@@ -508,20 +528,6 @@ pub fn log_installed(
         let candidate = f.candidate.as_deref().unwrap_or("none");
         let _ = write!(head, "{} = {candidate} ({:?})", f.choice, f.rule);
     }
-    let u = &summary.usage;
-    let _ = write!(
-        head,
-        "; elements {} images {} frames {} files {} fonts {} texts {} notes {}; \
-         atlas {atlas_texels} texels, committed {committed} of {} texels",
-        u.elements,
-        u.images,
-        u.frames,
-        u.files,
-        u.fonts,
-        u.texts,
-        u.notes,
-        render::SHARED_TEXELS
-    );
     let notes = summary.notes.iter().map(|n| {
         let at =
             n.at.map_or_else(|| "config".to_owned(), |at| summary.locate(at));
