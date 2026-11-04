@@ -499,7 +499,7 @@ fn skin_json_seeds_resolve_or_fail_as_built() {
                 "{name}: {result:?}"
             ),
             "not_play" => assert!(
-                matches!(result, Err(ImportError::NotPlay7 { .. })),
+                matches!(result, Err(ImportError::UnsupportedKind { .. })),
                 "{name}: {result:?}"
             ),
             "size" => assert!(

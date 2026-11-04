@@ -21,10 +21,10 @@ use replay::{DecodeError, DecodeLimits, FORMAT_VERSION, MAGIC, PlayRecord};
 use rules::{CanonicalError, RulePreset};
 use skin_beatoraja::{
     Cancel, ChartRank, Config, DeviationId, Fact, FactDeps, Header, ImportError, ImportFacts,
-    Imported, LuaImported, LuaOutcome, LuaUsage, NoteFallback, NoteKind, SIZES, Scene, Severity,
-    import, read_header, read_lua_header, resolve,
+    Imported, LuaImported, LuaOutcome, LuaUsage, NoteFallback, NoteKind, SIZES, Severity, import,
+    read_header, read_lua_header, resolve,
 };
-use skin_model::{FntError, FntFile, FntLimits};
+use skin_model::{FntError, FntFile, FntLimits, ScreenKind};
 
 /// An empty folder for the chart's sounds. Nothing is written to it, so
 /// every `#WAV` name resolves to no file.
@@ -1924,7 +1924,7 @@ pub fn skin_json(data: &[u8]) -> Result<(Header, Result<Imported, ImportError>),
         "resolving again with no option enabled changed the header: {again:?}"
     );
     let configured = configured?;
-    let imported = import(&mut def, &header, &Config::defaults(&header));
+    let imported = import(&mut def, &header, &Config::defaults(&header), header.kind);
     if let Ok(i) = &imported {
         check_usage(i);
         black_box(draw(i, data));
@@ -2049,7 +2049,7 @@ pub fn skin_lua(data: &[u8]) -> Result<(Header, Result<LuaOutcome, ImportError>)
     let dir = lua_dir().join("skin");
     let (facts, data) = match data {
         [a, r, rest @ ..] => (lua_facts(*a, *r), rest),
-        _ => (ImportFacts::unavailable(Scene::Play), data),
+        _ => (ImportFacts::unavailable(ScreenKind::Play), data),
     };
     let mut parts = data.splitn(LUA_FILES.len(), |&b| b == 0);
     for name in LUA_FILES {
@@ -2149,9 +2149,9 @@ pub fn skin_lua(data: &[u8]) -> Result<(Header, Result<LuaOutcome, ImportError>)
 #[must_use]
 pub fn lua_facts(a: u8, r: u8) -> ImportFacts {
     let scene = if a == u8::MAX {
-        Scene::Result
+        ScreenKind::Result
     } else {
-        Scene::Play
+        ScreenKind::Play
     };
     let autoplay = match a % 4 {
         0 => Fact::Unavailable,

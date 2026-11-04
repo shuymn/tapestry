@@ -126,7 +126,8 @@ fn option_items_are_counted_before_anything_is_gathered() {
     )]);
     let (mut def, h) = read_header(d.path(), "s.json").unwrap();
     let config = Config::defaults(&h);
-    let (result, seen) = largest(|| import(&mut def, &h, &config).map(|_| ()));
+    let (result, seen) =
+        largest(|| import(&mut def, &h, &config, skin_model::ScreenKind::Play).map(|_| ()));
     assert!(
         matches!(
             result,
@@ -170,7 +171,8 @@ fn option_items_are_counted_before_anything_is_gathered() {
     let config = Config::defaults(&h);
     WATCHED.store(34 * op, Ordering::Relaxed);
     SEEN.store(0, Ordering::Relaxed);
-    let (result, _) = largest(|| import(&mut def, &h, &config).map(|_| ()));
+    let (result, _) =
+        largest(|| import(&mut def, &h, &config, skin_model::ScreenKind::Play).map(|_| ()));
     WATCHED.store(usize::MAX, Ordering::Relaxed);
     assert!(
         matches!(
@@ -210,7 +212,8 @@ fn option_items_are_counted_before_anything_is_gathered() {
         let config = Config::defaults(&h);
         WATCHED.store(n * size_of::<u32>(), Ordering::Relaxed);
         SEEN.store(0, Ordering::Relaxed);
-        let (result, _) = largest(|| import(&mut def, &h, &config).map(|_| ()));
+        let (result, _) =
+            largest(|| import(&mut def, &h, &config, skin_model::ScreenKind::Play).map(|_| ()));
         WATCHED.store(usize::MAX, Ordering::Relaxed);
         assert!(
             matches!(result, Err(ImportError::Limit { limit, .. }) if limit == want),
@@ -244,7 +247,8 @@ fn option_items_are_counted_before_anything_is_gathered() {
     for size in watched {
         WATCHED.store(size, Ordering::Relaxed);
         SEEN.store(0, Ordering::Relaxed);
-        let (result, _) = largest(|| import(&mut def, &h, &config).map(|_| ()));
+        let (result, _) =
+            largest(|| import(&mut def, &h, &config, skin_model::ScreenKind::Play).map(|_| ()));
         WATCHED.store(usize::MAX, Ordering::Relaxed);
         assert!(
             matches!(
@@ -273,7 +277,8 @@ fn option_items_are_counted_before_anything_is_gathered() {
         let config = Config::defaults(&h);
         WATCHED.store(ten, Ordering::Relaxed);
         SEEN.store(0, Ordering::Relaxed);
-        let (result, _) = largest(|| import(&mut def, &h, &config).map(|_| ()));
+        let (result, _) =
+            largest(|| import(&mut def, &h, &config, skin_model::ScreenKind::Play).map(|_| ()));
         WATCHED.store(usize::MAX, Ordering::Relaxed);
         if kept {
             assert!(result.is_ok(), "{result:?}");

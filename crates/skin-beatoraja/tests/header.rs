@@ -1,4 +1,4 @@
-//! The header: the skin type and size, typed fields as the source reads
+//! The header: the screen kind and size, typed fields as the source reads
 //! them, records read literally, file choices listed, and the header pass
 //! resolved with no option enabled.
 
@@ -10,34 +10,56 @@ use common::{header, names, play, skin};
 use skin_beatoraja::{
     FileSpec, ImportError, OffsetSpec, OptionItem, OptionSpec, SIZES, read_header, resolve,
 };
-use skin_model::RootError;
+use skin_model::{RootError, ScreenKind};
 
 #[test]
-fn only_the_7_key_play_type_is_accepted() {
-    for (text, refused) in [
-        ("{}", true),
-        (r#"{"type": 1}"#, true),
-        (r#"{"type": -1}"#, true),
-        (r#"{"type": 0}"#, false),
-        (r#"{"type": "0"}"#, false),
+fn the_four_screen_types_are_accepted_as_their_kinds() {
+    for (text, kind) in [
+        (r#"{"type": 0}"#, ScreenKind::Play),
+        (r#"{"type": 5}"#, ScreenKind::Selection),
+        (r#"{"type": 6}"#, ScreenKind::Decision),
+        (r#"{"type": 7}"#, ScreenKind::Result),
+        (r#"{"type": "0"}"#, ScreenKind::Play),
+        (r#"{"type": "6"}"#, ScreenKind::Decision),
         // A fraction truncates toward zero.
-        (r#"{"type": 0.9}"#, false),
-        (r#"{"type": -0.5}"#, false),
-        (r#"{"type": 1, "type": 0}"#, false),
+        (r#"{"type": 0.9}"#, ScreenKind::Play),
+        (r#"{"type": -0.5}"#, ScreenKind::Play),
+        (r#"{"type": 7.9}"#, ScreenKind::Result),
+        // The last of duplicates wins.
+        (r#"{"type": 1, "type": 0}"#, ScreenKind::Play),
+        (r#"{"type": 0, "type": 5}"#, ScreenKind::Selection),
     ] {
+        let h = header(&skin(&[("s.json", text)])).unwrap_or_else(|e| panic!("{text}: {e}"));
+        assert_eq!(h.kind, kind, "{text}");
+    }
+}
+
+#[test]
+fn any_other_type_is_refused_where_it_is_written() {
+    // No type, or one in another case, which is another field.
+    for text in ["{}", r#"{"Type": 0}"#] {
         let result = header(&skin(&[("s.json", text)]));
-        assert_eq!(
-            matches!(result, Err(ImportError::NotPlay7 { .. })),
-            refused,
+        assert!(
+            matches!(
+                result,
+                Err(ImportError::UnsupportedKind { at: None, ty: None })
+            ),
             "{text}: {result:?}"
         );
-        if !refused {
-            result.unwrap();
+    }
+    for ty in [-1, 1, 4, 8, 18, i32::MAX] {
+        let text = format!(r#"{{"type": {ty}}}"#);
+        match header(&skin(&[("s.json", &text)])) {
+            Err(ImportError::UnsupportedKind {
+                at: Some(at),
+                ty: Some(t),
+            }) => {
+                assert_eq!(t, ty, "{text}");
+                assert_eq!((at.file.as_str(), at.line, at.col), ("s.json", 1, 10));
+            }
+            other => panic!("{text}: {other:?}"),
         }
     }
-    // A field named in another case is another field.
-    let result = header(&skin(&[("s.json", r#"{"Type": 0}"#)]));
-    assert!(matches!(result, Err(ImportError::NotPlay7 { at: None })));
     let result = header(&skin(&[("s.json", "[]")]));
     assert!(
         matches!(

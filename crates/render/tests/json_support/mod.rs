@@ -188,7 +188,8 @@ pub fn folder() -> TempDir {
 pub fn import(dir: &Path) -> skin_beatoraja::Imported {
     let (mut def, header) = skin_beatoraja::read_header(dir, "s.json").unwrap();
     let config = skin_beatoraja::Config::defaults(&header);
-    let imported = skin_beatoraja::import(&mut def, &header, &config).unwrap();
+    let imported =
+        skin_beatoraja::import(&mut def, &header, &config, skin_model::ScreenKind::Play).unwrap();
     let notes = &imported.report.notes;
     assert!(
         notes

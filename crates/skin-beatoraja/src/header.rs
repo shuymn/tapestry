@@ -4,7 +4,7 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
-use skin_model::{Root, RootError};
+use skin_model::{Root, RootError, ScreenKind};
 
 use crate::error::{ImportError, InputLimit};
 use crate::limits::{
@@ -28,6 +28,8 @@ pub const SIZES: [[u32; 2]; 5] = [
 /// A definition's header, as resolved for one set of enabled options.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Header {
+    /// The screen the skin is made for, as its `type` names it.
+    pub kind: ScreenKind,
     pub name: Option<String>,
     pub author: Option<String>,
     /// Width and height, one of [`SIZES`].
@@ -253,6 +255,7 @@ impl Resolved<'_> {
         }
 
         Ok(Header {
+            kind: self.kind,
             name,
             author,
             size: self.size,

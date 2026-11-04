@@ -27,7 +27,12 @@ fn run(json: &str) -> (Result<Imported, ImportError>, Vec<Event>, u32) {
     TRACE.with(|t| t.borrow_mut().clear());
     ADMITS.with(|n| n.set(0));
     let (mut def, h) = crate::read_header(d.path(), "s.json").unwrap();
-    let r = import(&mut def, &h, &Config::defaults(&h));
+    let r = import(
+        &mut def,
+        &h,
+        &Config::defaults(&h),
+        skin_model::ScreenKind::Play,
+    );
     (
         r,
         TRACE.with(|t| t.take()),

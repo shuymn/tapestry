@@ -147,7 +147,13 @@ fn element_cap(root: &Path) {
 
 fn run(root: &Path) -> usize {
     let (mut def, header) = read_header(root, "s.json").unwrap();
-    let imported = import(&mut def, &header, &Config::defaults(&header)).unwrap();
+    let imported = import(
+        &mut def,
+        &header,
+        &Config::defaults(&header),
+        skin_model::ScreenKind::Play,
+    )
+    .unwrap();
     imported.report.usage.elements as usize
 }
 

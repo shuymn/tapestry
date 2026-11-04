@@ -19,7 +19,7 @@ pub(crate) fn play(
     config: &Config,
     cancel: &Cancel,
 ) -> Result<super::LuaImported, ImportError> {
-    let facts = super::facts::ImportFacts::unavailable(super::facts::Scene::Play);
+    let facts = super::facts::ImportFacts::unavailable(skin_model::ScreenKind::Play);
     match h.import(config, &facts, cancel)? {
         super::LuaOutcome::Imported(i) => Ok(i),
         super::LuaOutcome::Pending(p) => panic!("pending with no pending fact: {p:?}"),
@@ -331,9 +331,10 @@ fn continued(
 
 #[test]
 fn no_skin_code_runs_after_a_fact_stop_inside_a_protected_call() {
-    use super::facts::{ChartRank, Fact, ImportFacts, Scene};
-    let unavailable = ImportFacts::unavailable(Scene::Play);
-    let base = ImportFacts::base(Scene::Play, Fact::Known(true));
+    use super::facts::{ChartRank, Fact, ImportFacts};
+    use skin_model::ScreenKind;
+    let unavailable = ImportFacts::unavailable(ScreenKind::Play);
+    let base = ImportFacts::base(ScreenKind::Play, Fact::Known(true));
     let known = ImportFacts {
         chart_rank: Fact::Known(Some(ChartRank::Rank(2))),
         ..base

@@ -9,9 +9,10 @@ use common::play::Drawn;
 use skin_beatoraja::lua::HOST_APIS;
 use skin_beatoraja::{
     Cancel, ChartRank, Config, Fact, FactDeps, FactId, FactRead, FactValue, ImportError,
-    ImportFacts, JudgeClass, LuaHeader, LuaImported, LuaOutcome, LuaPending, LuaWhy, Scene,
+    ImportFacts, JudgeClass, LuaHeader, LuaImported, LuaOutcome, LuaPending, LuaWhy,
     read_lua_header,
 };
+use skin_model::ScreenKind;
 use tempfile::TempDir;
 
 /// The line of a skin's `body` first line ([`folder`]).
@@ -45,7 +46,7 @@ fn header(d: &TempDir) -> LuaHeader {
 /// A play snapshot.
 fn play(autoplay: Fact<bool>, chart_rank: Fact<Option<ChartRank>>) -> ImportFacts {
     ImportFacts {
-        scene: Scene::Play,
+        scene: ScreenKind::Play,
         autoplay,
         chart_rank,
     }
@@ -105,7 +106,7 @@ fn class(c: Option<JudgeClass>) -> FactRead {
 
 fn deps(reads: &[FactRead]) -> FactDeps {
     FactDeps {
-        scene: Scene::Play,
+        scene: ScreenKind::Play,
         reads: reads.to_vec(),
     }
 }
@@ -191,7 +192,7 @@ fn the_judgment_class_follows_the_source_s_bands() {
 #[test]
 fn course_mode_is_a_constant_and_records_nothing() {
     let d = folder("assert(ms.option(290) == false and ms.option(-290) == true)");
-    let i = imported(import(&d, &ImportFacts::unavailable(Scene::Play)));
+    let i = imported(import(&d, &ImportFacts::unavailable(ScreenKind::Play)));
     assert_eq!(i.facts, deps(&[]));
 }
 
@@ -249,7 +250,7 @@ fn protected_calls_do_not_catch_a_fact_refusal_or_a_pending_read() {
     for body in protected("182") {
         let p = pending(import(
             &folder(&body),
-            &ImportFacts::base(Scene::Play, Fact::Known(true)),
+            &ImportFacts::base(ScreenKind::Play, Fact::Known(true)),
         ));
         assert_eq!(
             (p.pending, p.facts),
@@ -303,14 +304,17 @@ fn an_id_the_source_does_not_know_is_false_and_unrecorded() {
 }
 
 #[test]
-fn another_scene_refuses_before_any_lua_runs() {
+fn another_scene_refuses_before_the_configured_pass() {
+    // A play skin imported into the result slot refuses on its header:
+    // the configured pass, which would fail, never runs.
     let d = folder("error(\"the configured pass ran\")");
     let mut facts = play(Fact::Known(true), Fact::Known(Some(ChartRank::Rank(2))));
-    facts.scene = Scene::Result;
+    facts.scene = ScreenKind::Result;
     match import(&d, &facts) {
-        Err(ImportError::Lua {
-            why: LuaWhy::Scene,
+        Err(ImportError::Slot {
             at: None,
+            slot: ScreenKind::Result,
+            found: ScreenKind::Play,
         }) => {}
         other => panic!("{other:?}"),
     }
@@ -361,7 +365,7 @@ fn a_change_to_an_unread_fact_still_holds() {
 fn another_scene_never_holds() {
     let on = play(Fact::Known(true), Fact::Known(Some(ChartRank::Rank(2))));
     let result = ImportFacts {
-        scene: Scene::Result,
+        scene: ScreenKind::Result,
         ..on
     };
     for body in ["", "x = ms.option(33) and 1 or 0"] {
@@ -370,7 +374,7 @@ fn another_scene_never_holds() {
         assert!(!i.facts.holds(&result), "{body}");
     }
     let deps = FactDeps {
-        scene: Scene::Result,
+        scene: ScreenKind::Result,
         reads: Vec::new(),
     };
     assert!(!deps.holds(&on));
@@ -397,18 +401,18 @@ fn a_base_import_stops_pending_at_a_chart_fact() {
     let d = folder("local on = ms.option(33)\nx = ms.option(182) and 1 or 0");
     let p = pending(import(
         &d,
-        &ImportFacts::base(Scene::Play, Fact::Known(true)),
+        &ImportFacts::base(ScreenKind::Play, Fact::Known(true)),
     ));
     assert_eq!(p.pending, FactId::JudgeClass);
     assert_eq!(p.facts, deps(&[autoplay(true)]));
     assert_eq!(p.dependencies, ["s.luaskin"]);
     assert!(
         p.facts
-            .holds(&ImportFacts::base(Scene::Play, Fact::Known(true)))
+            .holds(&ImportFacts::base(ScreenKind::Play, Fact::Known(true)))
     );
     assert!(
         !p.facts
-            .holds(&ImportFacts::base(Scene::Play, Fact::Known(false)))
+            .holds(&ImportFacts::base(ScreenKind::Play, Fact::Known(false)))
     );
     // The attempt's final snapshot imports.
     let i = imported(import(
@@ -452,7 +456,7 @@ fn the_timed_import_keeps_a_pending_result() {
     let d = folder("local on = ms.option(33)\nx = ms.option(182) and 1 or 0");
     let h = header(&d);
     let config = Config::defaults(h.header());
-    let base = ImportFacts::base(Scene::Play, Fact::Known(true));
+    let base = ImportFacts::base(ScreenKind::Play, Fact::Known(true));
     match h.timed(&config, &base, &Cancel::new()) {
         Ok(LuaTimed::Pending(p)) => {
             assert_eq!(p.pending, FactId::JudgeClass);
