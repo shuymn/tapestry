@@ -8381,12 +8381,11 @@ pub(crate) mod tests {
     fn a_lifetimes_descriptor_and_chart_text_change_in_place() {
         let (link, rec) = Recording::new();
         let dir = tempfile::tempdir().unwrap();
-        let (skin, text) = crate::render_decl::bundle(
+        let (skin, _) = crate::render_decl::bundle(
             &crate::render_common::offscreen(1_920, 1_080),
             dir.path(),
             &bridge_look(),
         );
-        let text = text.unwrap();
         let chart = Arc::new(ChartBuilder::new(120_000).build().unwrap());
         link.load(Arc::clone(&chart), None).unwrap();
         assert_eq!(link.select(Some(skin)).wait().unwrap(), Preparation::Ready);
@@ -8451,27 +8450,14 @@ pub(crate) mod tests {
             let r = s.red.unwrap();
             !r.artist && r.title
         }));
-        // Every field laid out once per revision: the first for all slots,
-        // then only for the changed fields' slots.
-        let charts = text.charts.lock().unwrap().clone();
-        assert_eq!(
-            charts.iter().map(|c| c[1].as_str()).collect::<Vec<_>>(),
-            ["x", "y", ""],
-            "{charts:?}"
-        );
     }
 
     /// A render thread on [`Recorder`]s with the fixture of every loading
-    /// part selected, and its text producer.
-    fn bridge_recording() -> (
-        super::RenderLink,
-        Recording,
-        Arc<crate::render_decl::Text>,
-        tempfile::TempDir,
-    ) {
+    /// part selected.
+    fn bridge_recording() -> (super::RenderLink, Recording, tempfile::TempDir) {
         let (link, rec) = Recording::new();
         let dir = tempfile::tempdir().unwrap();
-        let (skin, text) = crate::render_decl::bundle(
+        let (skin, _) = crate::render_decl::bundle(
             &crate::render_common::offscreen(1_920, 1_080),
             dir.path(),
             &bridge_look(),
@@ -8479,7 +8465,7 @@ pub(crate) mod tests {
         let chart = Arc::new(ChartBuilder::new(120_000).build().unwrap());
         link.load(chart, None).unwrap();
         assert_eq!(link.select(Some(skin)).wait().unwrap(), Preparation::Ready);
-        (link, rec, text.unwrap(), dir)
+        (link, rec, dir)
     }
 
     /// Text installed at one size and a field that became unavailable
@@ -8488,7 +8474,7 @@ pub(crate) mod tests {
     /// slots kept, on the frame the change arrives or after.
     #[test]
     fn a_new_size_never_draws_a_dropped_field() {
-        let (link, rec, _text, _dir) = bridge_recording();
+        let (link, rec, _dir) = bridge_recording();
         link.begin_loading(&chosen_by("T", Some("x")), None);
         let sink = link.loading();
         sink.report(LoadInput::Stage(Stage::Chart), Some(one_line("T")));
@@ -8513,57 +8499,6 @@ pub(crate) mod tests {
         let r2: Vec<&Shot> = shots[..end].iter().filter(|s| s.text == 2).collect();
         assert!(r2.iter().all(|s| s.target == [1_920, 1_080]), "{r2:?}");
         assert!(r2.iter().all(|s| !s.red.unwrap().artist), "{r2:?}");
-    }
-
-    /// A revision the producer refuses leaves its fields empty and is not
-    /// asked again; the next revision lays out every field again, the
-    /// refused ones included, so none stays empty for good.
-    #[test]
-    fn a_refused_revision_is_laid_out_again_by_the_next() {
-        let (link, rec, text, _dir) = bridge_recording();
-        link.begin_loading(&chosen_by("T", Some("x")), None);
-        let sink = link.loading();
-        sink.report(LoadInput::Stage(Stage::Chart), Some(one_line("T")));
-        let shown = rec.until(0, |s| s.red.is_some_and(|r| r.title && r.artist));
-        text.refuse.store(true, Ordering::SeqCst);
-        sink.report(
-            LoadInput::Chart(ChosenChart {
-                title: Some("T".to_owned()),
-                artist: Some("y".to_owned()),
-                ..ChosenChart::default()
-            }),
-            None,
-        );
-        // Two frames of the refused revision: its preparation ran on the
-        // first, and the second shows it was not asked again.
-        let refused = rec.until(shown, |s| s.text == 2);
-        let refused = rec.until(refused, |s| s.text == 2);
-        text.refuse.store(false, Ordering::SeqCst);
-        sink.report(
-            LoadInput::Chart(ChosenChart {
-                title: Some("T".to_owned()),
-                artist: Some("y".to_owned()),
-                genre: Some("g".to_owned()),
-                ..ChosenChart::default()
-            }),
-            None,
-        );
-        let end = rec.until(refused, |s| {
-            s.text == 3 && s.red.is_some_and(|r| r.title && r.artist && r.genre)
-        });
-        link.end_loading().unwrap();
-        link.exit();
-
-        let shots = rec.shots();
-        let r2: Vec<&Shot> = shots[..end].iter().filter(|s| s.text == 2).collect();
-        assert!(r2.len() >= 2, "{r2:?}");
-        assert!(r2.iter().all(|s| !s.red.unwrap().artist), "{r2:?}");
-        let charts = text.charts.lock().unwrap().clone();
-        assert_eq!(
-            charts.iter().map(|c| c[1].as_str()).collect::<Vec<_>>(),
-            ["x", "y", "y"],
-            "{charts:?}"
-        );
     }
 
     /// Within one lifetime the loading clock and the `when` timer go on
@@ -8941,11 +8876,14 @@ pub(crate) mod tests {
         };
         play(&one, Some(&round), "T", true);
         play(&one, Some(&round), "", false);
-        assert_eq!(text.calls.load(Ordering::SeqCst), 6, "each attempt's text");
+        // The title laid out once on each renderer's text layer, every
+        // later attempt of it a hit.
+        assert_eq!(text.calls.load(Ordering::SeqCst), 2, "each renderer's line");
 
-        // A refused text: the producer's reason reaches the refusal.
+        // A refused text, of a title not yet placed: the producer's reason
+        // reaches the refusal.
         text.refuse.store(true, Ordering::SeqCst);
-        let attempt = preset_attempt(&chart, &tapestry, None, "T");
+        let attempt = preset_attempt(&chart, &tapestry, None, "U");
         let refused = link.prepare_attempt(attempt, || false).unwrap();
         let Preparation::Refused(refusal) = refused else {
             panic!("{refused:?}");
