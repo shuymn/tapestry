@@ -548,6 +548,8 @@ pub fn run_job<T: Send + 'static>(
     let (tx, rx) = mpsc::sync_channel::<Result<T, &'static str>>(1);
     let theirs = cancel.clone();
     let body = move || {
+        #[cfg(test)]
+        let _worker = tests::WorkerEnd;
         let sent = match panic::catch_unwind(AssertUnwindSafe(|| job(&theirs))) {
             Ok(outcome) => Ok(outcome),
             Err(payload) => {
@@ -613,9 +615,16 @@ fn spawn(body: impl FnOnce() + Send + 'static) -> std::io::Result<thread::JoinHa
     if tests::spawn_refused() {
         return Err(std::io::Error::other("refused by the test"));
     }
-    thread::Builder::new()
+    #[cfg(test)]
+    tests::worker_starting();
+    let spawned = thread::Builder::new()
         .name("skin-import".to_owned())
-        .spawn(body)
+        .spawn(body);
+    #[cfg(test)]
+    if spawned.is_err() {
+        tests::spawn_failed();
+    }
+    spawned
 }
 
 /// What became of a kind at startup, for its line and the log.

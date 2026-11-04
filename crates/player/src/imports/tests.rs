@@ -7,7 +7,7 @@
 use std::fs;
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -30,6 +30,31 @@ use super::{
 /// Whether a job's thread holds after its send, and how many wait there.
 static EXIT: Mutex<(bool, usize)> = Mutex::new((false, 0));
 static EXIT_OPENED: Condvar = Condvar::new();
+
+/// The job threads started and not yet at their body's end, an abandoned
+/// one included: what [`serial`] drains between tests.
+static WORKERS: AtomicUsize = AtomicUsize::new(0);
+
+/// A job thread is about to start; its [`WorkerEnd`], or
+/// [`spawn_failed`], counts its end.
+pub(super) fn worker_starting() {
+    WORKERS.fetch_add(1, Ordering::SeqCst);
+}
+
+/// The job thread counted by [`worker_starting`] did not start.
+pub(super) fn spawn_failed() {
+    WORKERS.fetch_sub(1, Ordering::SeqCst);
+}
+
+/// Held by a job thread's body: its drop, past [`exit_gate`] or in an
+/// unwind that skips it, counts the thread ended.
+pub(super) struct WorkerEnd;
+
+impl Drop for WorkerEnd {
+    fn drop(&mut self) {
+        WORKERS.fetch_sub(1, Ordering::SeqCst);
+    }
+}
 
 /// The job thread's exit barrier, after its send and before it returns.
 pub(super) fn exit_gate() {
@@ -65,10 +90,17 @@ fn refuse_spawn() {
 }
 
 /// The tests that run jobs, or hold the process-wide barriers, one at a
-/// time; each barrier is released when the test ends, failed or not.
+/// time; each barrier is released when the test ends, failed or not, and
+/// the test's job threads, an abandoned one included, are waited for
+/// then, so none reaches a barrier of the next test.
 fn serial() -> Serial {
     static SERIAL: Mutex<()> = Mutex::new(());
-    Serial(SERIAL.lock().unwrap_or_else(PoisonError::into_inner))
+    let serial = Serial(SERIAL.lock().unwrap_or_else(PoisonError::into_inner));
+    assert!(
+        wait_until(|| WORKERS.load(Ordering::SeqCst) == 0),
+        "an earlier test's job thread is still running"
+    );
+    serial
 }
 
 struct Serial(#[expect(dead_code, reason = "held for its drop")] MutexGuard<'static, ()>);
@@ -79,6 +111,7 @@ impl Drop for Serial {
         REFUSE_SPAWN.store(false, Ordering::SeqCst);
         #[cfg(feature = "dev-tools")]
         skin_beatoraja::lua::vm_hooks::release();
+        wait_until(|| WORKERS.load(Ordering::SeqCst) == 0);
     }
 }
 
@@ -867,14 +900,12 @@ impl Drop for Witness {
 }
 
 /// The signals [`run_job`] asks, which a test sets: the attempt's
-/// cancellation, and the run's end by the window's close, the input
-/// thread's failure or the audio thread's.
+/// cancellation, and the run's end (the caller folds the window's close
+/// and the threads' failures into one).
 #[derive(Clone, Default)]
 struct Signals {
     attempt: Arc<AtomicBool>,
-    close: Arc<AtomicBool>,
-    input: Arc<AtomicBool>,
-    audio: Arc<AtomicBool>,
+    end: Arc<AtomicBool>,
 }
 
 /// Runs `job` through [`run_job`] on another thread with the signals the
@@ -889,11 +920,7 @@ fn started_job<T: Send + 'static>(
         let ran = run_job(
             job,
             || s.attempt.load(Ordering::SeqCst),
-            || {
-                s.close.load(Ordering::SeqCst)
-                    || s.input.load(Ordering::SeqCst)
-                    || s.audio.load(Ordering::SeqCst)
-            },
+            || s.end.load(Ordering::SeqCst),
         );
         let _ = tx.send(ran);
     });
@@ -1013,24 +1040,27 @@ fn a_stop_mid_lua_cancels_and_returns_after_the_vm_and_the_thread() {
 /// is checked against cannot end before the test releases them, which it
 /// does only after waiting [`HELD_FOR`]: a runner that waited for its job
 /// would answer nothing within that wait.
-const LATE: Duration = Duration::from_secs(2);
+const LATE: Duration = Duration::from_millis(750);
 /// How long the abandonment tests wait for the runner, the job held
 /// meanwhile; past [`STOP_WAIT`] + [`LATE`].
 const HELD_FOR: Duration = Duration::from_secs(7);
 
-/// A VM held past the stop bound: the runner gives up at the bound, the
-/// VM still counted; once released, the outcome finds nobody and is
-/// dropped on the job's own thread. Unheld and uncancelled, the looping
-/// fixture would run to the sandbox's 5 s Lua time cap; held, it never
-/// ends before the release.
+/// A VM held past the stop bound when the run ends: the runner gives up
+/// at the bound, the VM still counted and the job started but not
+/// joined. Ending the test's serialization releases the VM and waits for
+/// the abandoned thread: by then its outcome, finding nobody, has been
+/// dropped on its own thread, and it is joined by nobody. Unheld and
+/// uncancelled, the looping fixture would run to the sandbox's 5 s Lua
+/// time cap; held, it never ends before the release.
 #[cfg(feature = "dev-tools")]
 #[test]
 fn a_job_past_the_stop_wait_is_abandoned() {
     use skin_beatoraja::lua::vm_hooks;
-    let _serial = serial();
+    let serial = serial();
     let dir = looping();
     let dropped = Arc::new(Mutex::new(None));
     let base = vm_hooks::live();
+    let (started_before, joined) = counted();
     vm_hooks::hold();
     let (stop, rx) = started(looping_job(dir.path(), &dropped));
     executing(base);
@@ -1038,15 +1068,16 @@ fn a_job_past_the_stop_wait_is_abandoned() {
     stop.store(true, Ordering::SeqCst);
     let ran = rx.recv_timeout(HELD_FOR);
     let after = stopped.elapsed();
-    let live = vm_hooks::live();
-    vm_hooks::release();
     assert!(matches!(ran, Ok(Ran::Abandoned)), "{ran:?}");
     assert!(after >= STOP_WAIT, "{after:?}");
     assert!(after < STOP_WAIT + LATE, "{after:?}");
-    assert_eq!(live, base + 1);
-    assert!(wait_until(|| dropped.lock().unwrap().is_some()));
+    assert_eq!(vm_hooks::live(), base + 1);
+    assert_eq!(counted(), (started_before + 1, joined));
+    drop(serial);
+    assert_eq!(WORKERS.load(Ordering::SeqCst), 0);
     assert_eq!(dropped.lock().unwrap().as_deref(), Some("skin-import"));
-    assert!(wait_until(|| vm_hooks::live() == base));
+    assert_eq!(vm_hooks::live(), base);
+    assert_eq!(counted(), (started_before + 1, joined));
 }
 
 /// An outcome already received does not end the wait for the thread: held
@@ -1121,14 +1152,16 @@ fn an_attempts_cancel_never_abandons_a_held_thread() {
     assert!(matches!(rx.recv_timeout(STOP_WAIT), Ok(Ran::Done(7))));
 }
 
-/// Ending the run while the looping pass's VM is held past the stop bound
-/// abandons the job at the bound, unjoined; once released, its outcome
-/// finds nobody and is dropped on the job's own thread.
+/// The escalation: the attempt cancelled and the VM's destruction held
+/// past the stop bound, then the run's end (a close or a thread's
+/// failure) without releasing it: the runner abandons the job within the
+/// stop bound of that end, started and never joined. Ending the test's
+/// serialization releases the VM and waits for the abandoned thread.
 #[cfg(feature = "dev-tools")]
 #[test]
-fn the_runs_end_abandons_a_job_past_the_stop_bound() {
+fn the_runs_end_during_an_attempts_cancel_abandons_within_the_bound() {
     use skin_beatoraja::lua::vm_hooks;
-    let _serial = serial();
+    let serial = serial();
     let dir = looping();
     let dropped = Arc::new(Mutex::new(None));
     let base = vm_hooks::live();
@@ -1136,73 +1169,28 @@ fn the_runs_end_abandons_a_job_past_the_stop_bound() {
     vm_hooks::hold();
     let (signals, rx) = started_job(looping_job(dir.path(), &dropped));
     executing(base);
+    signals.attempt.store(true, Ordering::SeqCst);
+    assert!(wait_until(|| vm_hooks::waiting() == 1));
+    let early = rx.recv_timeout(STOP_WAIT + Duration::from_millis(500));
+    assert!(early.is_err(), "{early:?}");
     let ended = Instant::now();
-    signals.close.store(true, Ordering::SeqCst);
+    signals.end.store(true, Ordering::SeqCst);
     let ran = rx.recv_timeout(HELD_FOR);
     let after = ended.elapsed();
-    let live = vm_hooks::live();
-    vm_hooks::release();
     assert!(matches!(ran, Ok(Ran::Abandoned)), "{ran:?}");
     assert!(after >= STOP_WAIT && after < STOP_WAIT + LATE, "{after:?}");
-    assert_eq!(live, base + 1);
-    assert!(wait_until(|| dropped.lock().unwrap().is_some()));
-    assert_eq!(dropped.lock().unwrap().as_deref(), Some("skin-import"));
-    assert!(wait_until(|| vm_hooks::live() == base));
+    assert_eq!(counted(), (started + 1, joined));
+    drop(serial);
+    assert_eq!(WORKERS.load(Ordering::SeqCst), 0);
+    assert_eq!(vm_hooks::live(), base);
     assert_eq!(counted(), (started + 1, joined));
 }
 
-/// The escalation: the attempt cancelled and the VM's destruction held
-/// past the stop bound, then the run's end (a close, the input thread's
-/// failure or the audio thread's) without releasing it: the runner
-/// abandons the job within the stop bound of that end.
-#[cfg(feature = "dev-tools")]
-#[test]
-fn the_runs_end_during_an_attempts_cancel_abandons_within_the_bound() {
-    use skin_beatoraja::lua::vm_hooks;
-    let _serial = serial();
-    let dir = looping();
-    let dropped = Arc::new(Mutex::new(None));
-    let base = vm_hooks::live();
-    for end in ["close", "input", "audio"] {
-        let (started, joined) = counted();
-        vm_hooks::hold();
-        let (signals, rx) = started_job(looping_job(dir.path(), &dropped));
-        executing(base);
-        signals.attempt.store(true, Ordering::SeqCst);
-        assert!(wait_until(|| vm_hooks::waiting() == 1), "{end}");
-        let early = rx.recv_timeout(STOP_WAIT + Duration::from_millis(500));
-        assert!(early.is_err(), "{end}: {early:?}");
-        let flag = match end {
-            "close" => &signals.close,
-            "input" => &signals.input,
-            _ => &signals.audio,
-        };
-        let ended = Instant::now();
-        flag.store(true, Ordering::SeqCst);
-        let ran = rx.recv_timeout(HELD_FOR);
-        let after = ended.elapsed();
-        vm_hooks::release();
-        assert!(matches!(ran, Ok(Ran::Abandoned)), "{end}: {ran:?}");
-        assert!(
-            after >= STOP_WAIT && after < STOP_WAIT + LATE,
-            "{end}: {after:?}"
-        );
-        assert!(wait_until(|| vm_hooks::live() == base), "{end}");
-        assert_eq!(counted(), (started + 1, joined), "{end}");
-    }
-}
-
 /// A thread that cannot start refuses at once, its job never run, and
-/// counts as neither started nor joined; a normal end, a panic and a
-/// silent end each count one start and one join.
+/// counts as neither started nor joined; a normal end counts one start
+/// and one join.
 #[test]
-fn a_spawn_failure_refuses_and_each_join_counts() {
-    struct Bomb;
-    impl Drop for Bomb {
-        fn drop(&mut self) {
-            panic!("the payload's drop panics");
-        }
-    }
+fn a_spawn_failure_refuses_and_counts_nothing() {
     let _serial = serial();
     #[cfg(feature = "dev-tools")]
     let (started, joined) = counted();
@@ -1227,31 +1215,13 @@ fn a_spawn_failure_refuses_and_each_join_counts() {
         run_job(|_: &Cancel| 7_u32, || false, || false),
         Ran::Done(7)
     ));
-    let panicked = run_job(
-        |_: &Cancel| -> u32 { panic!("the job panics") },
-        || false,
-        || false,
-    );
-    assert!(
-        matches!(&panicked, Ran::Refused(why) if why == PANICKED),
-        "{panicked:?}"
-    );
-    let silent = run_job(
-        |_: &Cancel| -> u32 { std::panic::panic_any(Bomb) },
-        || false,
-        || false,
-    );
-    assert!(
-        matches!(&silent, Ran::Refused(why) if why == ENDED),
-        "{silent:?}"
-    );
     #[cfg(feature = "dev-tools")]
-    assert_eq!(counted(), (started + 3, joined + 3));
+    assert_eq!(counted(), (started + 1, joined + 1));
 }
 
 /// A panic in the job is a refusal received from its thread; a thread
 /// that ends without sending (its panic's payload panicking as it is
-/// dropped) is another.
+/// dropped) is another. Each counts one start and one join.
 #[test]
 fn a_panic_and_a_silent_end_are_told_apart() {
     struct Bomb;
@@ -1261,16 +1231,22 @@ fn a_panic_and_a_silent_end_are_told_apart() {
         }
     }
     let _serial = serial();
+    #[cfg(feature = "dev-tools")]
+    let (started_before, joined) = counted();
     let (_stop, rx) = started(|_: &Cancel| -> u32 { panic!("the job panics") });
     match rx.recv_timeout(STOP_WAIT).unwrap() {
         Ran::Refused(why) => assert_eq!(why, PANICKED),
         other => panic!("{other:?}"),
     }
+    #[cfg(feature = "dev-tools")]
+    assert_eq!(counted(), (started_before + 1, joined + 1));
     let (_stop, rx) = started(|_: &Cancel| -> u32 { std::panic::panic_any(Bomb) });
     match rx.recv_timeout(STOP_WAIT).unwrap() {
         Ran::Refused(why) => assert_eq!(why, ENDED),
         other => panic!("{other:?}"),
     }
+    #[cfg(feature = "dev-tools")]
+    assert_eq!(counted(), (started_before + 2, joined + 2));
 }
 
 /// A logger that keeps each record's message.
