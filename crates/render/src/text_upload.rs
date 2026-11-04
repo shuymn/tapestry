@@ -29,6 +29,9 @@ use crate::text_cache::{Holder, TextCache, TextCounts};
 pub const MAX_RECT_H: u32 = 1_096;
 /// The widest rectangle: [`MAX_LINE_W`].
 pub const MAX_RECT_W: u32 = MAX_LINE_W;
+/// The largest glyph mask a producer renders, live beside the
+/// preparation's buffers: a line's pixels at most, 4 080 × 1 024.
+pub const MAX_TEXT_MASK_BYTES: u64 = (MAX_LINE_W as u64 - 2 * GUTTER as u64) * MAX_LINE_H as u64;
 
 /// The most bytes the queue stages for one preparation's text on a layer
 /// `side` texels square: the whole layer at every level, plus each of 64
@@ -70,6 +73,16 @@ impl TextScratch {
         u64::try_from(self.a8.capacity() + rgba).unwrap_or(u64::MAX)
     }
 
+    /// The producer's glyph mask's bound once a line was rasterized
+    /// ([`MAX_TEXT_MASK_BYTES`]), 0 before.
+    pub(crate) fn mask_bound(&self) -> u64 {
+        if self.a8.capacity() > 0 {
+            MAX_TEXT_MASK_BYTES
+        } else {
+            0
+        }
+    }
+
     fn reserve(&mut self) {
         let a8 = (MAX_LINE_W as usize) * (MAX_LINE_H as usize);
         let level0 = (MAX_RECT_W as usize) * (MAX_RECT_H as usize) * 4;
@@ -89,12 +102,17 @@ pub(crate) enum Step {
     WaitReturned,
     Published,
     RolledBack,
+    Abandoned,
     StageReturned,
 }
 
 /// A fault a unit test makes the device raise.
 #[cfg(test)]
 pub(crate) type Fault = fn(&Gpu);
+
+/// What a unit test runs at each step, seeing the cache as it is then.
+#[cfg(test)]
+pub(crate) type Observe = fn(&Gpu, &TextCache, Step);
 
 /// Unit tests' hooks into an upload.
 #[cfg(test)]
@@ -104,6 +122,20 @@ pub(crate) struct Hooks {
     pub(crate) steps: Vec<Step>,
     /// Run inside the scopes after this many writes.
     pub(crate) fault_after: Option<(usize, Fault)>,
+    /// Run at each step.
+    pub(crate) observe: Option<Observe>,
+    /// The wait's failure, in place of waiting.
+    pub(crate) wait: Option<RenderError>,
+}
+
+#[cfg(test)]
+impl Hooks {
+    fn step(&mut self, gpu: &Gpu, cache: &TextCache, step: Step) {
+        self.steps.push(step);
+        if let Some(observe) = self.observe {
+            observe(gpu, cache, step);
+        }
+    }
 }
 
 /// Everything one preparation reads and writes.
@@ -124,10 +156,13 @@ pub(crate) struct Prepare<'a> {
 ///
 /// # Errors
 ///
-/// The producer's refusal of a line ([`RenderError::Skin`]), the device's
-/// refusal of a write ([`RenderError::Atlas`]) or its failure waiting: the
-/// new lines are released after the GPU has finished, and the lines placed
-/// before stay.
+/// The producer's refusal of a line ([`RenderError::Skin`]) or the
+/// device's refusal of a write ([`RenderError::Atlas`]): the new lines are
+/// released after the GPU has finished, and the lines placed before stay.
+/// The device failing while it is waited for ([`RenderError::Poll`], not a
+/// refusal, so the renderer is built again as after any device failure):
+/// whether the writes finished is unknown, so nothing is released or
+/// published, and the cache takes no more lines.
 pub(crate) fn prepare(
     p: Prepare<'_>,
     skin: &Skin,
@@ -153,6 +188,7 @@ pub(crate) fn prepare(
     let texture = p.atlas.texture();
     let layer = p.atlas.text_layer();
     let scratch = &mut *p.scratch;
+    let cache = &mut *p.cache;
     #[cfg(test)]
     let hooks = &mut *p.hooks;
     let mut written = 0_usize;
@@ -178,7 +214,7 @@ pub(crate) fn prepare(
                 written += 1;
                 #[cfg(test)]
                 {
-                    hooks.steps.push(Step::Written);
+                    hooks.step(p.gpu, cache, Step::Written);
                     if let Some((after, fault)) = hooks.fault_after
                         && written == after
                     {
@@ -192,35 +228,52 @@ pub(crate) fn prepare(
         let submission = (written > 0).then(|| queue.submit([]));
         #[cfg(test)]
         if submission.is_some() {
-            hooks.steps.push(Step::Submitted);
+            hooks.step(p.gpu, cache, Step::Submitted);
         }
         (raster, submission)
     });
     report.upload_bytes = bytes;
     report.submission = submission.clone();
+    // A device lost while its writes are queued is not detected here: on
+    // the pinned wgpu, a destroyed device drops the writes and the wait
+    // still returns, so the lines are published unwritten. The renderer
+    // has no device-loss detection on its uploads (the atlas's included:
+    // no device-lost callback is registered), a gap left open here. Only a
+    // failing wait is treated as the device's failure below.
     let waited = if submission.is_some() {
+        #[cfg(test)]
+        let w = hooks.wait.take().map_or_else(|| wait_for_gpu(p.gpu), Err);
+        #[cfg(not(test))]
         let w = wait_for_gpu(p.gpu);
         #[cfg(test)]
-        hooks.steps.push(Step::WaitReturned);
+        hooks.step(p.gpu, cache, Step::WaitReturned);
         w
     } else {
         Ok(())
     };
-    let failed = match (raster, refused, waited) {
-        (Err(e), _, _) => Some(e),
-        (Ok(()), Some(e), _) => Some(RenderError::Atlas(UploadError::Device(e))),
-        (Ok(()), None, Err(e)) => Some(e),
-        (Ok(()), None, Ok(())) => None,
-    };
-    if let Some(e) = failed {
-        p.cache.rollback(&placement);
+    if let Err(e) = waited {
+        // The device failed: the writes may still be pending, so their
+        // rectangles stay taken and unpublished, and the cache is closed
+        // until the renderer is built again with a fresh one.
+        cache.abandon();
         #[cfg(test)]
-        hooks.steps.push(Step::RolledBack);
+        hooks.step(p.gpu, cache, Step::Abandoned);
         return Err(e);
     }
-    let (lines, holder, notes) = p.cache.publish(placement, skin.text_slots(), p.held);
+    let failed = match (raster, refused) {
+        (Err(e), _) => Some(e),
+        (Ok(()), Some(e)) => Some(RenderError::Atlas(UploadError::Device(e))),
+        (Ok(()), None) => None,
+    };
+    if let Some(e) = failed {
+        cache.rollback(&placement);
+        #[cfg(test)]
+        hooks.step(p.gpu, cache, Step::RolledBack);
+        return Err(e);
+    }
+    let (lines, holder, notes) = cache.publish(placement, skin.text_slots(), p.held);
     #[cfg(test)]
-    hooks.steps.push(Step::Published);
+    hooks.step(p.gpu, cache, Step::Published);
     report.notes = notes;
     Ok((TextTable::new(lines), holder, report))
 }

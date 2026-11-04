@@ -290,4 +290,6 @@ fn witness_terms_are_disjoint() {
     assert!(m.text_cache > 0 && m.text_scratch > 0);
     assert_eq!(m.text_upload, r.text_report().upload_bytes);
     assert_eq!(m.staged_text_cache, 0);
+    assert_eq!(m.text_mask, render::MAX_TEXT_MASK_BYTES);
+    assert_eq!(render::MAX_TEXT_MASK_BYTES, 4_177_920);
 }

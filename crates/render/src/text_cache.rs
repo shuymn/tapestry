@@ -217,6 +217,27 @@ impl TextCache {
         }
     }
 
+    /// Closes the cache after a device failure: nothing places, hits or
+    /// is published again, and the renderer is built again with a fresh
+    /// one.
+    pub(crate) fn abandon(&mut self) {
+        let side = self.side;
+        *self = Self::none();
+        self.side = side;
+    }
+
+    /// Whether it places nothing: no layer, or abandoned.
+    #[cfg(test)]
+    pub(crate) fn closed(&self) -> bool {
+        self.alloc.is_none()
+    }
+
+    /// Its new entries, not yet published.
+    #[cfg(test)]
+    pub(crate) fn unpublished(&self) -> usize {
+        self.entries.iter().filter(|e| !e.published).count()
+    }
+
     /// The layer's side; 0 without a layer.
     pub(crate) const fn side(&self) -> u32 {
         self.side
@@ -249,19 +270,22 @@ impl TextCache {
         self.aliases.len()
     }
 
-    /// The bytes it holds: its entries and aliases with their strings.
+    /// The bytes it holds: its lists' retained capacities and their
+    /// strings.
     pub(crate) fn bytes(&self) -> u64 {
-        let entries: usize = self
+        let lists = self.entries.capacity() * size_of::<Entry>()
+            + self.aliases.capacity() * size_of::<Alias>();
+        let strings: usize = self
             .entries
             .iter()
-            .map(|e| size_of::<Entry>() + e.key.text.capacity())
+            .map(|e| e.key.text.capacity())
+            .chain(
+                self.aliases
+                    .iter()
+                    .map(|a| a.key.text.capacity() + a.line.text.capacity()),
+            )
             .sum();
-        let aliases: usize = self
-            .aliases
-            .iter()
-            .map(|a| size_of::<Alias>() + a.key.text.capacity() + a.line.text.capacity())
-            .sum();
-        u64::try_from(entries + aliases).unwrap_or(u64::MAX)
+        u64::try_from(lists + strings).unwrap_or(u64::MAX)
     }
 
     fn tick(&mut self) -> u64 {

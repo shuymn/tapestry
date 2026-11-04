@@ -387,6 +387,12 @@ pub struct MemoryWitness {
     pub default_font: u64,
     /// The text preparation's line and rectangle buffers.
     pub text_scratch: u64,
+    /// The producer's glyph mask, live beside them while a line is
+    /// rasterized: its bound, a line's pixels ([`MAX_TEXT_MASK_BYTES`]),
+    /// once a preparation has rasterized.
+    ///
+    /// [`MAX_TEXT_MASK_BYTES`]: crate::MAX_TEXT_MASK_BYTES
+    pub text_mask: u64,
     /// The bytes the queue staged for the last text preparation's writes.
     pub text_upload: u64,
     /// The installed text layer's cache: its entries, aliases and the
@@ -415,6 +421,7 @@ impl MemoryWitness {
             .saturating_add(self.staged_text)
             .saturating_add(self.default_font)
             .saturating_add(self.text_scratch)
+            .saturating_add(self.text_mask)
             .saturating_add(self.text_upload)
             .saturating_add(self.text_cache)
             .saturating_add(self.staged_text_cache)
@@ -1057,6 +1064,8 @@ impl Renderer {
                 target: self.target(),
                 ..*a
             };
+            // A failed preparation leaves no earlier one's report.
+            self.text_report = TextReport::default();
             skin.prepare(&self.gpu, &a).map_err(RenderError::Skin)?;
             if let Some(producer) = bundle.text_producer() {
                 // The staging's own resources, or the installed ones,
@@ -1297,6 +1306,7 @@ impl Renderer {
         MemoryWitness {
             default_font,
             text_scratch: self.text_scratch.bytes(),
+            text_mask: self.text_scratch.mask_bound(),
             text_upload: self.text_report.upload_bytes,
             text_cache: self
                 .text_cache
@@ -1575,19 +1585,20 @@ impl Renderer {
     }
 
     /// Prepares the chosen chart's text `chart` of `revision` for loading
-    /// lifetime `lifetime`, the slots `which` names: the rasterized lines
-    /// with the producer of the installation in use, and the bitmap-font
-    /// lines laid out by its skin. It holds both staged until
+    /// lifetime `lifetime`, the slots `which` names: the bitmap-font lines
+    /// laid out by the installation's skin, held staged until
     /// [`install_staged_loading_text`](Self::install_staged_loading_text),
     /// replacing text staged before: at most one preparation waits. Before
     /// recording opens and outside a frame's build, such as in a loading
     /// frame's call before it builds: it allocates. Nothing is staged without
-    /// a declarative installation; without a producer, the staged text
-    /// clears the rasterized slots, and its bitmap lines still install.
+    /// a declarative installation. No rasterized loading lines are prepared
+    /// yet: they come with their holders in the text layer, and until then
+    /// the staged text clears the rasterized slots while its bitmap lines
+    /// install.
     ///
     /// # Errors
     ///
-    /// The producer's refusal: nothing is staged.
+    /// None yet: the rasterized lines' refusal comes with them.
     pub fn prepare_loading_text(
         &mut self,
         lifetime: u64,
@@ -2632,12 +2643,39 @@ mod tests {
         out
     }
 
+    /// What [`observe`] saw at each step: the step, the cache's
+    /// unpublished entries and free texels, and whether the GPU had
+    /// reported the upload's submission done.
+    static SEEN: std::sync::Mutex<Vec<(super::text_upload::Step, usize, i64, bool)>> =
+        std::sync::Mutex::new(Vec::new());
+    /// Set by the queue's own callback once the submitted work is done: it
+    /// runs only while the device is polled, so only the production wait
+    /// can have run it by the wait's return.
+    static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    fn observe(gpu: &crate::Gpu, cache: &super::TextCache, step: super::text_upload::Step) {
+        use std::sync::atomic::Ordering;
+        if step == super::text_upload::Step::Submitted {
+            DONE.store(false, Ordering::SeqCst);
+            gpu.queue()
+                .on_submitted_work_done(|| DONE.store(true, Ordering::SeqCst));
+        }
+        SEEN.lock().unwrap().push((
+            step,
+            cache.unpublished(),
+            cache.free(),
+            DONE.load(Ordering::SeqCst),
+        ));
+    }
+
     /// The upload's boundaries in order: every write, then the one
     /// submission inside the scopes, the wait's return, the publication,
-    /// and only then `stage`'s return; the report's submission is the one
-    /// waited for. A fault inside the scopes comes back from `stage` after
-    /// the wait, the lines released. Only after a successful staging does
-    /// a read-back, with its own submission, see the line.
+    /// and only then `stage`'s return. Until the wait has returned, the
+    /// new line is allocated and unpublished; at its return the queue has
+    /// reported the submitted work done (its callback, run only by the
+    /// production wait's poll), and only then is the line published, or,
+    /// after a fault inside the scopes, released, the layer's free area as
+    /// before. The line is a tall one, so its upload is not done at once.
     #[test]
     fn upload_ordered_before_return() {
         use super::text_upload::Step::{
@@ -2646,16 +2684,20 @@ mod tests {
         let mut r = crate::test_common::offscreen(1_920, 1_080);
         let (_dir, b, _) = sized_bundle(&r, 1);
         crate::test_common::install(&mut r, &b, 1);
+        let free = r.text_cache.free();
+        r.text_hooks.observe = Some(observe);
         r.text_hooks.steps.clear();
         r.text_hooks.fault_after = Some((1, refuse));
-        let e = stage_labels(&mut r, &b, &labels("s", "", ""), 2).unwrap_err();
+        let e = stage_labels(&mut r, &b, &labels("T", "", ""), 2).unwrap_err();
         assert!(
             matches!(e, RenderError::Atlas(UploadError::Device(_))),
             "{e:?}"
         );
         assert!(e.is_refusal());
+        let seen = std::mem::take(&mut *SEEN.lock().unwrap());
+        let steps: Vec<_> = seen.iter().map(|s| s.0).collect();
         assert_eq!(
-            r.text_hooks.steps,
+            steps,
             [
                 Written,
                 Written,
@@ -2666,10 +2708,19 @@ mod tests {
                 RolledBack
             ]
         );
-        assert_eq!(r.text_cache.len(), 0);
+        for &(step, unpublished, f, done) in &seen[..6] {
+            assert_eq!(unpublished, 1, "{step:?}");
+            assert!(f < free, "{step:?}: the line's rectangle is taken");
+            assert_eq!(done, step == WaitReturned, "{step:?}");
+        }
+        assert_eq!((seen[6].1, seen[6].2), (0, free), "released after the wait");
+
         r.text_hooks.fault_after = None;
         r.text_hooks.steps.clear();
-        let token = stage_labels(&mut r, &b, &labels("s", "", ""), 3).unwrap();
+        DONE.store(false, std::sync::atomic::Ordering::SeqCst);
+        let token = stage_labels(&mut r, &b, &labels("T", "", ""), 3).unwrap();
+        r.text_hooks.observe = None;
+        let seen = std::mem::take(&mut *SEEN.lock().unwrap());
         assert_eq!(
             r.text_hooks.steps,
             [
@@ -2683,14 +2734,13 @@ mod tests {
                 StageReturned
             ]
         );
-        let submission = r.text_report().submission.clone().unwrap();
-        r.gpu
-            .device()
-            .poll(wgpu::PollType::Wait {
-                submission_index: Some(submission),
-                timeout: None,
-            })
-            .unwrap();
+        for &(step, unpublished, f, done) in &seen[..6] {
+            assert_eq!(unpublished, 1, "{step:?}");
+            assert!(f < free, "{step:?}");
+            assert_eq!(done, step == WaitReturned, "{step:?}");
+        }
+        assert_eq!(seen[6].1, 0, "published");
+        assert!(r.text_report().submission.is_some());
         r.commit(token).unwrap();
         let level = read_text_layer(&r, 0);
         let (_, rect, _) = r.text_cache.rects()[0].clone();
@@ -2699,6 +2749,33 @@ mod tests {
         let g = skin_model::GUTTER;
         assert_eq!(at(rect[0] + g, rect[1] + g), [255; 4]);
         assert_eq!(at(rect[0], rect[1]), [0; 4], "the gutter");
+    }
+
+    /// The device failing while the upload is waited for, unlike a
+    /// validation refusal inside the scopes: not a refusal (the renderer
+    /// is built again), the new line neither published nor released, as
+    /// its writes may still be pending, and the cache places nothing more.
+    #[test]
+    fn a_device_failure_mid_upload_closes_the_cache() {
+        let mut r = crate::test_common::offscreen(1_920, 1_080);
+        let (_dir, b, _) = sized_bundle(&r, 1);
+        crate::test_common::install(&mut r, &b, 1);
+        r.text_hooks.wait = Some(RenderError::Poll(wgpu::PollError::Timeout));
+        let e = stage_labels(&mut r, &b, &labels("T", "", ""), 2).unwrap_err();
+        assert!(matches!(e, RenderError::Poll(_)), "{e:?}");
+        assert!(!e.is_refusal());
+        use super::text_upload::Step::{Abandoned, WaitReturned};
+        assert_eq!(
+            r.text_hooks.steps.iter().rev().take(2).collect::<Vec<_>>(),
+            [&Abandoned, &WaitReturned]
+        );
+        assert!(r.text_cache.closed());
+        assert!(r.staged().is_none());
+        // The next staging places no line: every request is refused.
+        let token = stage_labels(&mut r, &b, &labels("s", "", ""), 3).unwrap();
+        assert_eq!(r.text_report().counts.placements, 0);
+        assert_eq!(r.text_report().notes, [(0, crate::TextNote::LayerFull)]);
+        r.commit(token).unwrap();
     }
 
     /// Failures in the middle of an upload, with no frame drawn between
@@ -2713,22 +2790,32 @@ mod tests {
         let mut r = crate::test_common::offscreen(1_920, 1_080);
         let (_dir, b, p) = sized_bundle(&r, 5);
         crate::test_common::install(&mut r, &b, 1);
-        let free = r.text_cache.free();
-        p.fail_at.store(3, Ordering::SeqCst);
+        // An earlier attempt placed: its report is replaced by a failure.
+        let token = stage_labels(&mut r, &b, &labels("p", "q", "r"), 2).unwrap();
+        r.commit(token).unwrap();
+        assert!(r.text_report().upload_bytes > 0);
+        let (free, placed) = (r.text_cache.free(), r.text_cache.len());
+        let before = p.rasters.load(Ordering::SeqCst);
+        p.fail_at.store(before + 3, Ordering::SeqCst);
         r.text_hooks.steps.clear();
-        let e = stage_labels(&mut r, &b, &labels("a", "b", "c"), 2).unwrap_err();
+        let e = stage_labels(&mut r, &b, &labels("a", "b", "c"), 3).unwrap_err();
         assert!(matches!(e, RenderError::Skin(_)), "{e:?}");
-        assert_eq!(p.rasters.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            (r.text_report().upload_bytes, r.memory().text_upload),
+            (0, 0),
+            "an earlier preparation's report"
+        );
+        assert_eq!(p.rasters.load(Ordering::SeqCst), before + 3);
         assert_eq!(
             r.text_hooks.steps.iter().rev().take(2).collect::<Vec<_>>(),
             [&RolledBack, &WaitReturned]
         );
-        assert_eq!((r.text_cache.free(), r.text_cache.len()), (free, 0));
+        assert_eq!((r.text_cache.free(), r.text_cache.len()), (free, placed));
 
         p.fail_at.store(0, Ordering::SeqCst);
         r.text_hooks.fault_after = Some((2, refuse));
         r.text_hooks.steps.clear();
-        let e = stage_labels(&mut r, &b, &labels("a", "b", "c"), 3).unwrap_err();
+        let e = stage_labels(&mut r, &b, &labels("a", "b", "c"), 4).unwrap_err();
         assert!(
             matches!(e, RenderError::Atlas(UploadError::Device(_))),
             "{e:?}"
@@ -2737,12 +2824,12 @@ mod tests {
             r.text_hooks.steps.iter().rev().take(2).collect::<Vec<_>>(),
             [&RolledBack, &WaitReturned]
         );
-        assert_eq!((r.text_cache.free(), r.text_cache.len()), (free, 0));
+        assert_eq!((r.text_cache.free(), r.text_cache.len()), (free, placed));
 
         r.text_hooks.fault_after = None;
-        let token = stage_labels(&mut r, &b, &labels("a", "b", "c"), 4).unwrap();
+        let token = stage_labels(&mut r, &b, &labels("a", "b", "c"), 5).unwrap();
         r.commit(token).unwrap();
-        assert_eq!(r.text_cache.len(), 5);
+        assert_eq!(r.text_cache.len(), placed + 3, "the literals hit");
         assert!(r.text_report().notes.is_empty());
     }
 
