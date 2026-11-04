@@ -367,3 +367,27 @@ fn the_probe_and_rendering_share_the_checked_helper() {
     assert!(out.iter().filter(|&&c| c == 255).count() > 1_000);
     let _ = Arc::strong_count(&default_font());
 }
+
+#[test]
+fn a_variable_face_is_drawn_where_it_is_shaped() {
+    // wght from 100 to 900, default 700: cosmic-text shapes at 400, half
+    // way to the minimum, where A's top is raised by 150 of its 300 units.
+    let mut spec = font_support::latin("Variable");
+    spec.variation = Some(font_support::Variation {
+        min: 100,
+        default: 700,
+        max: 900,
+        glyph: font_support::capital(0),
+        rise: 300,
+    });
+    let t = producer_of(&spec).unwrap();
+    let a = fits(&t, &req(SKIN, "A", 100.0));
+    assert_eq!(a.size, [30, 85], "A at wght 400");
+    // The box top is the cap height, 700, so A reaches 0.15 em above it.
+    assert!((a.ink[1] + 0.15).abs() < 1e-5, "{a:?}");
+    let out = raster(&t, &a);
+    assert!(
+        out[..30].iter().all(|&c| c > 200),
+        "the raised top is drawn"
+    );
+}

@@ -342,13 +342,15 @@ impl Fallback for NoFallback {
     }
 }
 
-/// A face of a font system: its id, its data, where swash finds it, and
-/// its cap height in em.
+/// A face of a font system: its id, its data, where swash finds it, the
+/// variation coordinates it is shaped and drawn at, and its cap height in
+/// em there.
 struct Face {
     id: fontdb::ID,
     data: Arc<Vec<u8>>,
     offset: u32,
     key: swash::CacheKey,
+    coords: Vec<swash::NormalizedCoord>,
     cap_em: f32,
 }
 
@@ -654,6 +656,7 @@ impl OutlineText {
                     inner
                         .scale
                         .builder(face.swash())
+                        .normalized_coords(&face.coords)
                         .size(line.raster_em)
                         .hint(false)
                         .build(),
@@ -763,7 +766,8 @@ fn measure(
                 let Some(f) = system.faces.get(face) else {
                     continue;
                 };
-                scaler = Some((face, scale.builder(f.swash()).size(em).hint(false).build()));
+                let builder = scale.builder(f.swash()).normalized_coords(&f.coords);
+                scaler = Some((face, builder.size(em).hint(false).build()));
             }
             let Some((_, s)) = scaler.as_mut() else {
                 continue;
@@ -986,12 +990,15 @@ fn build_system(
         }
         let font = swash::FontRef::from_index(data, usize::try_from(*index).unwrap_or(usize::MAX))
             .ok_or("swash cannot read its face")?;
-        let cap_em = cap_height(font).ok_or("no cap height: no OS/2 cap height, H or ascender")?;
+        let coords = shaping_coords(data, *index)?;
+        let cap_em =
+            cap_height(font, &coords).ok_or("no cap height: no OS/2 cap height, H or ascender")?;
         out.push(Face {
             id,
             data: Arc::clone(data),
             offset: font.offset,
             key: font.key,
+            coords,
             cap_em,
         });
     }
@@ -1006,8 +1013,20 @@ fn build_system(
 /// `font`'s cap height in em: a positive OS/2 `sCapHeight` (swash reads 0
 /// for a table before version 2 or none), else the top of its own `H`
 /// above the baseline, else a positive ascender.
-fn cap_height(font: swash::FontRef<'_>) -> Option<f32> {
-    let m = font.metrics(&[]);
+/// The normalized variation coordinates face `index` of `data` is shaped
+/// at: cosmic-text shapes every face at a `wght` of 400
+/// (`fontdb::Weight::NORMAL`, the weight its faces are registered and
+/// asked for at), so its outlines, metrics and cap height are taken there
+/// too. Empty for a face without variations.
+fn shaping_coords(data: &[u8], index: u32) -> Result<Vec<swash::NormalizedCoord>, String> {
+    let font = skrifa::FontRef::from_index(data, index).map_err(|e| e.to_string())?;
+    let weight = f32::from(fontdb::Weight::NORMAL.0);
+    let location = font.axes().location([(skrifa::Tag::new(b"wght"), weight)]);
+    Ok(location.coords().iter().map(|c| c.to_bits()).collect())
+}
+
+fn cap_height(font: swash::FontRef<'_>, coords: &[swash::NormalizedCoord]) -> Option<f32> {
+    let m = font.metrics(coords);
     let upem = f32::from(m.units_per_em);
     if upem <= 0.0 {
         return None;
@@ -1019,7 +1038,11 @@ fn cap_height(font: swash::FontRef<'_>) -> Option<f32> {
     let h = font.charmap().map('H');
     if h != 0 {
         let mut ctx = ScaleContext::new();
-        let mut scaler = ctx.builder(font).hint(false).build();
+        let mut scaler = ctx
+            .builder(font)
+            .normalized_coords(coords)
+            .hint(false)
+            .build();
         let mut outline = Outline::new();
         if scaler.scale_outline_into(h, &mut outline) {
             let top = outline

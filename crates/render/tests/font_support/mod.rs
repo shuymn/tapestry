@@ -40,6 +40,20 @@ pub struct Spec {
     pub multiple: Option<(u16, Vec<u16>)>,
     /// Further tables, written as given.
     pub extra: Vec<([u8; 4], Vec<u8>)>,
+    /// A `wght` axis and one glyph's variation along it.
+    pub variation: Option<Variation>,
+}
+
+/// A `wght` axis from `min` to `max` with default `default`, along which
+/// `glyph`, a rectangle, has its top raised by `rise` units at `min` (and
+/// in proportion between `min` and `default`).
+#[derive(Clone, Copy, Debug)]
+pub struct Variation {
+    pub min: i16,
+    pub default: i16,
+    pub max: i16,
+    pub glyph: u16,
+    pub rise: i16,
 }
 
 /// The glyph of the font's `n`-th Latin capital (`A` + n) in [`latin`].
@@ -91,6 +105,7 @@ pub fn latin(family: &str) -> Spec {
         os2: Os2::V4 { cap_height: 700 },
         multiple: None,
         extra: Vec::new(),
+        variation: None,
     }
 }
 
@@ -202,8 +217,72 @@ fn tables(spec: &Spec) -> Vec<([u8; 4], Vec<u8>)> {
     if let Some((from, to)) = &spec.multiple {
         t.push((*b"GSUB", gsub(*from, to)));
     }
+    if let Some(v) = spec.variation {
+        t.push((*b"fvar", fvar(v)));
+        t.push((*b"gvar", gvar(v, n)));
+    }
     t.extend(spec.extra.iter().cloned());
     t
+}
+
+fn fixed(v: i16) -> u32 {
+    u32::from_be_bytes((i32::from(v) << 16).to_be_bytes())
+}
+
+fn fvar(v: Variation) -> Vec<u8> {
+    let mut o = Vec::new();
+    for x in [1_u16, 0, 16, 2, 1, 20, 0, 8] {
+        be16(&mut o, x);
+    }
+    o.extend_from_slice(b"wght");
+    for x in [v.min, v.default, v.max] {
+        be32(&mut o, fixed(x));
+    }
+    be16(&mut o, 0);
+    be16(&mut o, 256);
+    o
+}
+
+/// One tuple at the axis's minimum for `v.glyph`, applying to all its
+/// points: its four corners and four phantom points, the top two raised.
+fn gvar(v: Variation, n: u16) -> Vec<u8> {
+    let mut data = Vec::new();
+    be16(&mut data, 0x8001); // shared point numbers, one tuple
+    be16(&mut data, 10); // the serialized data, after this header
+    be16(&mut data, 18); // the tuple's data
+    be16(&mut data, 0x8000); // an embedded peak
+    be16(&mut data, 0xC000); // -1.0: the axis's minimum
+    data.push(0); // shared points: all of them
+    data.push(0x87); // x: eight zeros
+    data.push(0x47); // y: eight words
+    for dy in [0, 0, v.rise, v.rise, 0, 0, 0, 0] {
+        bei16(&mut data, dy);
+    }
+    while data.len() % 4 != 0 {
+        data.push(0);
+    }
+    let header = 20 + 4 * (usize::from(n) + 1);
+    let mut o = Vec::new();
+    be16(&mut o, 1);
+    be16(&mut o, 0);
+    be16(&mut o, 1);
+    be16(&mut o, 0);
+    be32(&mut o, u32::try_from(header).unwrap());
+    be16(&mut o, n);
+    be16(&mut o, 1); // long offsets
+    be32(&mut o, u32::try_from(header).unwrap());
+    for g in 0..=n {
+        be32(
+            &mut o,
+            if g <= v.glyph {
+                0
+            } else {
+                u32::try_from(data.len()).unwrap()
+            },
+        );
+    }
+    o.extend_from_slice(&data);
+    o
 }
 
 fn head(spec: &Spec) -> Vec<u8> {
