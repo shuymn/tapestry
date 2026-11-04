@@ -116,6 +116,10 @@ pub enum Disposition {
     /// Never read by the source: not at a property field or an `op`
     /// entry ([`super::schema`]). Converted and charged, never classified.
     Inert,
+    /// Not a root, but captured by one, which the source may call it
+    /// through: classified with that root, never consumed in its own
+    /// field.
+    Captured,
     /// Classified write-free, never consumed.
     ClassifiedOnly,
     /// Converted into an expression.
@@ -863,7 +867,12 @@ pub(crate) fn admit(arena: &Arena) -> Result<(), ImportError> {
             continue;
         }
         if !callable.root {
-            an.set_outcome(c, Disposition::Inert);
+            let d = if callable.instance == NONE {
+                Disposition::Inert
+            } else {
+                Disposition::Captured
+            };
+            an.set_outcome(c, d);
             continue;
         }
         let r = if callable.kind == CallableKind::Lua && callable.instance != NONE {

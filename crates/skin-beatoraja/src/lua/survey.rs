@@ -39,8 +39,8 @@ pub struct Survey {
     pub callables: BTreeMap<(&'static str, String), u32>,
     /// What became of them: `lowered`, `replaced` with its reason,
     /// `refused`, `classified only` (returned but never consumed),
-    /// `inert` (never read by the source) and `never analysed` (the import
-    /// stopped before them).
+    /// `inert` (never read by the source), `captured` (no root, but reached
+    /// through one) and `never analysed` (the import stopped before them).
     pub outcomes: BTreeMap<String, u32>,
     /// One record per consumer the import reached, in the order it
     /// reached them, then one per callable classified but never
@@ -82,7 +82,8 @@ pub struct Consumer {
     /// Why it did not lower, or why it was never consumed: `element
     /// dropped earlier`, `condition folded false`, `field not consumed`,
     /// `import stopped earlier` when the import ended before reading it,
-    /// or `never read by the source` when it is inert.
+    /// `never read by the source` when it is inert, or `reached through a
+    /// root` when a root captures it.
     pub reason: Option<String>,
 }
 
@@ -109,36 +110,30 @@ pub(crate) fn records(arena: &Arena, an: &Analysis, completed: bool) -> Vec<(Loc
     let unused = an.unused.borrow();
     let mut seen = std::collections::HashSet::new();
     for (id, c) in callable_nodes(arena) {
-        let d = outcomes.get(c as usize).copied();
-        if !matches!(d, Some(Disposition::ClassifiedOnly | Disposition::Inert)) || !seen.insert(c) {
+        let Some(d) = outcomes.get(c as usize).copied() else {
             continue;
-        }
-        if d == Some(Disposition::Inert) {
-            out.push((
-                arena.loc(id),
-                Consumer {
-                    at: None,
-                    field: field(arena, id),
-                    role: "-".to_owned(),
-                    disposition: disposition(&Disposition::Inert),
-                    reason: Some("never read by the source".to_owned()),
-                },
-            ));
-            continue;
-        }
-        let reason = match unused.get(&c) {
-            Some(Unused::Dropped) => "element dropped earlier",
-            Some(Unused::FoldedFalse) => "condition folded false",
-            None if completed => "field not consumed",
-            None => "import stopped earlier",
         };
+        let reason = match d {
+            Disposition::Inert => "never read by the source",
+            Disposition::Captured => "reached through a root",
+            Disposition::ClassifiedOnly => match unused.get(&c) {
+                Some(Unused::Dropped) => "element dropped earlier",
+                Some(Unused::FoldedFalse) => "condition folded false",
+                None if completed => "field not consumed",
+                None => "import stopped earlier",
+            },
+            _ => continue,
+        };
+        if !seen.insert(c) {
+            continue;
+        }
         out.push((
             arena.loc(id),
             Consumer {
                 at: None,
                 field: field(arena, id),
                 role: "-".to_owned(),
-                disposition: disposition(&Disposition::ClassifiedOnly),
+                disposition: disposition(&d),
                 reason: Some(reason.to_owned()),
             },
         ));
@@ -211,6 +206,7 @@ fn disposition(d: &Disposition) -> String {
     match d {
         Disposition::NeverAnalysed => "never analysed".into(),
         Disposition::Inert => "inert".into(),
+        Disposition::Captured => "captured".into(),
         Disposition::ClassifiedOnly => "classified only".into(),
         Disposition::Lowered => "lowered".into(),
         Disposition::Replaced(why) => format!("replaced {}", unsupported(why)),

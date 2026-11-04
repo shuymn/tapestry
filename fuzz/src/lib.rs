@@ -2214,7 +2214,10 @@ fn check_callbacks(i: &LuaImported) {
     let mut replaced = 0;
     for d in &i.callbacks {
         match d {
-            Disposition::Lowered | Disposition::ClassifiedOnly | Disposition::Inert => {}
+            Disposition::Lowered
+            | Disposition::ClassifiedOnly
+            | Disposition::Inert
+            | Disposition::Captured => {}
             Disposition::Replaced(_) => replaced += 1,
             Disposition::Refused | Disposition::NeverAnalysed => {
                 panic!("an imported candidate with a callback {d:?}")

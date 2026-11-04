@@ -101,7 +101,7 @@ fn a_function_the_source_never_reads_is_inert() {
         &gauge("function() return h() end"),
     );
     let i = import(&entry).unwrap();
-    assert_eq!(i.callbacks, [Disposition::Inert, Disposition::Lowered]);
+    assert_eq!(i.callbacks, [Disposition::Captured, Disposition::Lowered]);
 }
 
 #[test]

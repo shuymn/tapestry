@@ -589,7 +589,23 @@ impl Conv<'_> {
         let r = self.capture_pending();
         #[cfg(test)]
         super::tests::capturing(false);
-        r
+        r?;
+        self.reached();
+        Ok(())
+    }
+
+    /// Gives each callable that is no root but that a root captured, so
+    /// that the source calls it through that root, its instance: one
+    /// hash a callable, each already charged as a node.
+    fn reached(&mut self) {
+        for (addr, &i) in &self.seen {
+            if let Some(c) = self.callables.get_mut(i as usize)
+                && !c.root
+                && let Some(&inst) = self.instance_of.get(addr)
+            {
+                c.instance = inst;
+            }
+        }
     }
 
     fn capture_pending(&mut self) -> Result<(), ImportError> {
