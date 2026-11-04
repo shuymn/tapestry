@@ -327,9 +327,10 @@ pub const VIEW: LaneView = LaneView {
     hidden: 0,
 };
 
-/// The uv table of `skin`'s atlas at [`LIMITS`].
+/// The uv table of `skin`'s sheet at [`LIMITS`], without a text layer.
 pub fn uvs(skin: &Skin) -> UvTable {
-    skin.atlas(Variant::Lo, LIMITS, &|| false)
+    skin.sheet()
+        .atlas(Variant::Lo, LIMITS, &|| false)
         .unwrap()
         .into_parts()
         .1

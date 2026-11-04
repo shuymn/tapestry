@@ -64,10 +64,18 @@ pub(crate) fn side_cap(max_side: u32) -> u32 {
 }
 
 /// The candidate sides for cells of `padded` sizes: the powers of two from
-/// [`MIN_PAGE_SIDE`] (or the largest cell rounded up) to `cap`.
-pub(crate) fn candidates(padded: &[[u32; 2]], cap: u32) -> impl Iterator<Item = u32> {
+/// [`MIN_PAGE_SIDE`] or `min_side` (or the largest cell rounded up) to
+/// `cap`.
+pub(crate) fn candidates(
+    padded: &[[u32; 2]],
+    cap: u32,
+    min_side: u32,
+) -> impl Iterator<Item = u32> {
     let largest = padded.iter().flatten().copied().max().unwrap_or(0);
-    let start = largest.max(MIN_PAGE_SIDE).checked_next_power_of_two();
+    let start = largest
+        .max(MIN_PAGE_SIDE)
+        .max(min_side)
+        .checked_next_power_of_two();
     std::iter::successors(start, |s| s.checked_mul(2)).take_while(move |&s| s <= cap)
 }
 
@@ -177,23 +185,28 @@ pub(crate) fn cost(reserved: u32, pages: u32, side: u32) -> u64 {
 
 /// Packs cells of `padded` sizes at the cheapest candidate side under this
 /// packing: the fewest texels across all layers, ties going to fewer
-/// pages, among the sides that fit `max_pages`.
+/// pages, among the sides from `min_side` that fit `max_pages`. `reserved`
+/// counts every layer beside the pages.
 pub(crate) fn pack(
     padded: &[[u32; 2]],
     cap: u32,
     max_pages: u32,
     reserved: u32,
+    min_side: u32,
 ) -> Result<Packing, PackError> {
     if padded.is_empty() {
+        let Some(side) = candidates(padded, cap, min_side).next() else {
+            return Err(PackError::TooManyPages);
+        };
         return Ok(Packing {
-            side: MIN_PAGE_SIDE,
+            side,
             pages: 0,
             places: Vec::new(),
         });
     }
     let order = order(padded);
     let mut best: Option<Packing> = None;
-    for side in candidates(padded, cap) {
+    for side in candidates(padded, cap, min_side) {
         let Some(p) = pack_side(padded, &order, side, max_pages, MAX_CELLS_PER_PAGE)? else {
             continue;
         };
@@ -293,10 +306,10 @@ mod tests {
             let sizes: Vec<[u32; 2]> = contents.iter().map(|&c| padded(c).unwrap()).collect();
             let largest = sizes.iter().flatten().copied().max().unwrap();
             prop_assume!(largest <= cap);
-            let Ok(p) = pack(&sizes, cap, layers, reserved) else {
+            let Ok(p) = pack(&sizes, cap, layers, reserved, 0) else {
                 // No candidate fits: every candidate fails the page cap.
                 let order = order(&sizes);
-                for side in candidates(&sizes, cap) {
+                for side in candidates(&sizes, cap, 0) {
                     let fit = pack_side(&sizes, &order, side, layers, MAX_CELLS_PER_PAGE).unwrap();
                     prop_assert!(fit.is_none());
                 }
@@ -321,13 +334,13 @@ mod tests {
             // reserved ones included, ties to fewer pages.
             let order = order(&sizes);
             let want = |pages: u32, side: u32| (u64::from(reserved + pages) * u64::from(side) * u64::from(side), pages);
-            for side in candidates(&sizes, cap) {
+            for side in candidates(&sizes, cap, 0) {
                 if let Some(q) = pack_side(&sizes, &order, side, layers, MAX_CELLS_PER_PAGE).unwrap() {
                     prop_assert!(want(p.pages, p.side) <= want(q.pages, q.side));
                 }
             }
             // Deterministic.
-            prop_assert_eq!(pack(&sizes, cap, layers, reserved).unwrap(), p);
+            prop_assert_eq!(pack(&sizes, cap, layers, reserved, 0).unwrap(), p);
         }
     }
 }

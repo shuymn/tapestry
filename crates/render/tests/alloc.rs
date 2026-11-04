@@ -49,7 +49,9 @@
 
 mod common;
 mod decl_support;
+mod font_support;
 mod json_support;
+mod outline_support;
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -68,7 +70,7 @@ use render::{
     Renderer, SHARED_TEXELS, Scissor, SimpleSkin, SkinError, Sprite, SpriteBatch, Staging,
 };
 use rules::Judgment;
-use skin_model::{BuildError, ClipId, LaneView, ScreenKind};
+use skin_model::{BuildError, ClipId, LaneView, ScreenKind, TextImage, TextTable};
 
 struct Counting;
 
@@ -501,6 +503,7 @@ fn frames_do_not_allocate_from_the_first() {
     declarative_lane_frames();
     loading_frames();
     imported_frames(&chart, &overlay, glyphs);
+    outline_frames(&chart, &overlay);
     shared_admission();
 }
 
@@ -1150,11 +1153,13 @@ fn declarative_frames(chart: &Chart, taps: &[(u8, TimeUs)], overlay: &[&str], gl
         text: true,
         ..Look::left([255, 0, 0, 255])
     };
-    let (b, text) = bundle(&r, dir.path(), &look);
+    let (b, _) = bundle(&r, dir.path(), &look);
     let ctx = context(&GAUGES, false);
     let mut skin = DeclSkin::new(b.clone());
     skin.prepare(r.gpu(), &attempt(&r, chart, &ctx)).unwrap();
-    assert_eq!(text.unwrap().calls.load(Ordering::SeqCst), 1);
+    // The text element's line: frame 0, as a staging would attach one.
+    let line = TextImage::new(b.uvs().get(0).unwrap(), [0.0, 0.0, 1.0, 1.0], 1.0);
+    skin.attach_text(TextTable::new(vec![line])).unwrap();
     let (capacity, runs) = (skin.capacity(), skin.run_capacity());
     assert_eq!(capacity, 65);
     let mut staging = Staging::with_runs(capacity, runs, &skin.canvas([1920, 1080]));
@@ -1250,4 +1255,62 @@ fn declarative_frames(chart: &Chart, taps: &[(u8, TimeUs)], overlay: &[&str], gl
     assert_eq!(small.instances().len(), 8 + glyphs);
     assert_eq!(overlay_drawn(&small), glyphs, "the overlay was cut");
     assert_eq!(full_allocs, 0, "a declarative skin's full batch allocated");
+}
+
+/// Play frames of an imported skin whose title, artist and a literal are
+/// rasterized outline text, staged and committed on WARP: the renderer's
+/// builds (what each frame does before `submit` calls into wgpu) draw the
+/// lines and allocate nothing, from the first frame on.
+fn outline_frames(chart: &Chart, overlay: &[&str]) {
+    use outline_support::{Value, default_font, text, ttf};
+    let mut r = offscreen(1_920, 1_080);
+    let font = font_support::build(&font_support::latin("Skin"));
+    let dir = outline_support::folder(
+        &[("ttf.ttf", font)],
+        &[ttf(), outline_support::distance_field()],
+        &[
+            text("f", 100, Value::Ref(10), [100, 100, 800, 100]),
+            text("f", 60, Value::Ref(16), [100, 300, 800, 60]),
+            text(
+                "d",
+                40,
+                Value::Literal("Lit".to_owned()),
+                [100, 400, 800, 40],
+            ),
+        ],
+    );
+    let b = outline_support::bundle_in(&r, dir.path(), &default_font());
+    let labels = skin_model::ChartText {
+        title: "Title",
+        subtitle: "",
+        artist: "Artist",
+        subartist: "",
+        genre: "",
+    };
+    let ctx = context(&GAUGES, false);
+    let a = render::AttemptInput {
+        chart,
+        context: &ctx,
+        text: &labels,
+        target: r.target(),
+    };
+    let token = r.stage(&b, &a, 1).unwrap();
+    r.commit(token).unwrap();
+    assert_eq!(r.text_report().counts.placements, 3);
+    let v = view(0, 0);
+    let frame = |k: i64| FrameInput {
+        overlay,
+        ..input(&v, TimeUs(k * FRAME_US), TimeUs(0), &[])
+    };
+    let (first, first_allocs) = counted(|| r.build(&frame(0)));
+    first.unwrap();
+    assert_eq!(first_allocs, 0, "an outline text frame allocated");
+    let (later, later_allocs) = counted(|| {
+        (1..FRAMES)
+            .try_for_each(|k| r.build(&frame(k)))
+            .map(|()| FRAMES - 1)
+    });
+    assert!(later.unwrap() > 0);
+    assert_eq!(later_allocs, 0, "a later outline text frame allocated");
+    r.submit().unwrap();
 }

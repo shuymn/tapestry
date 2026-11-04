@@ -1,5 +1,6 @@
 //! A skin's font files, checked at load: their count, their paths inside
-//! the skin folder, their sizes and their first bytes. They are not
+//! the skin folder, their sizes and their first bytes; then read again for
+//! installation by a [`FontReader`], against one budget. They are not
 //! parsed here.
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
@@ -52,6 +53,10 @@ pub enum FontError {
     TotalTooLarge { font: usize },
     #[error("font {font} is not a TrueType, OpenType or collection file")]
     Unsupported { font: usize },
+    #[error("the sheet has no font {font}")]
+    Unknown { font: usize },
+    #[error("font {font} changed while it was read")]
+    Changed { font: usize },
     #[error("font {font}")]
     Io {
         font: usize,
@@ -79,6 +84,13 @@ pub(crate) fn resolve(root: &Path, font: usize, name: &str) -> Result<(PathBuf, 
     path::resolve(root, name).map_err(|e| FontError::path(font, e))
 }
 
+/// Whether `bytes` start with a TrueType, OpenType or collection magic.
+fn has_magic(bytes: &[u8]) -> bool {
+    bytes
+        .first_chunk::<4>()
+        .is_some_and(|magic| MAGICS.contains(magic))
+}
+
 /// Whether the resolved font file starts with a TrueType, OpenType or
 /// collection magic.
 pub(crate) fn check_magic(font: usize, p: &Path) -> Result<(), FontError> {
@@ -91,7 +103,7 @@ pub(crate) fn check_magic(font: usize, p: &Path) -> Result<(), FontError> {
         }
         Err(source) => return Err(FontError::Io { font, source }),
     }
-    if MAGICS.contains(&magic) {
+    if has_magic(&magic) {
         Ok(())
     } else {
         Err(FontError::Unsupported { font })
@@ -145,5 +157,108 @@ impl Sheet {
     #[must_use]
     pub fn font_count(&self) -> usize {
         self.fonts.len()
+    }
+}
+
+/// Reads a sheet's font files for installation, against one budget of
+/// [`MAX_TOTAL_FONT_BYTES`] bytes actually read. Each name is resolved
+/// again inside the skin folder; the opened handle must be a regular file
+/// of at most [`MAX_FONT_BYTES`] and of the budget left; at most that
+/// handle's length plus one byte is read; and the magic is checked on the
+/// bytes read. What a read takes from the budget stays taken, a failed
+/// read's included.
+#[derive(Debug)]
+pub struct FontReader<'a> {
+    sheet: &'a Sheet,
+    remaining: u64,
+}
+
+impl<'a> FontReader<'a> {
+    /// A reader of `sheet`'s fonts with the whole budget.
+    #[must_use]
+    pub fn new(sheet: &'a Sheet) -> Self {
+        Self {
+            sheet,
+            remaining: MAX_TOTAL_FONT_BYTES,
+        }
+    }
+
+    /// The budget's bytes not yet read.
+    #[must_use]
+    pub fn remaining(&self) -> u64 {
+        self.remaining
+    }
+
+    /// Font `font`'s bytes, read whole.
+    ///
+    /// # Errors
+    ///
+    /// [`FontError::Unknown`] for an index past the sheet's fonts; the
+    /// path checks' errors; [`FontError::TooLarge`] past
+    /// [`MAX_FONT_BYTES`] and [`FontError::TotalTooLarge`] past the budget
+    /// left, both by the opened handle's length; [`FontError::Changed`]
+    /// when another number of bytes than that length was read; and
+    /// [`FontError::Unsupported`] for bytes without a font magic.
+    pub fn read(&mut self, font: u32) -> Result<Vec<u8>, FontError> {
+        let index = usize::try_from(font).unwrap_or(usize::MAX);
+        let name = self
+            .sheet
+            .fonts
+            .get(index)
+            .ok_or(FontError::Unknown { font: index })?;
+        let (canonical, _) = resolve(&self.sheet.root, index, name)?;
+        let (file, len) = path::open(&canonical).map_err(|e| FontError::path(index, e))?;
+        if len > MAX_FONT_BYTES {
+            return Err(FontError::TooLarge { font: index });
+        }
+        if len > self.remaining {
+            return Err(FontError::TotalTooLarge { font: index });
+        }
+        let (taken, read) = read_limited(file, len, index);
+        self.remaining = self.remaining.saturating_sub(taken);
+        let bytes = read?;
+        if !has_magic(&bytes) {
+            return Err(FontError::Unsupported { font: index });
+        }
+        Ok(bytes)
+    }
+}
+
+/// At most `len + 1` bytes of `reader`, into a buffer reserved for `len`,
+/// with the bytes read: `len` bytes exactly, or [`FontError::Changed`]
+/// when the source holds another number.
+fn read_limited(reader: impl io::Read, len: u64, font: usize) -> (u64, Result<Vec<u8>, FontError>) {
+    let mut bytes = Vec::new();
+    let reserved = usize::try_from(len)
+        .ok()
+        .is_some_and(|n| bytes.try_reserve_exact(n).is_ok());
+    if !reserved {
+        return (0, Err(FontError::TooLarge { font }));
+    }
+    let read = reader.take(len.saturating_add(1)).read_to_end(&mut bytes);
+    let n = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    let out = match read {
+        Err(source) => Err(FontError::Io { font, source }),
+        Ok(_) if n != len => Err(FontError::Changed { font }),
+        Ok(_) => Ok(bytes),
+    };
+    (n, out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn another_length_than_the_handle_s_is_a_change() {
+        let grown = [0_u8, 1, 0, 0, 9, 9];
+        let (n, r) = read_limited(&grown[..], 4, 3);
+        assert_eq!(n, 5, "one byte past the length");
+        assert!(matches!(r, Err(FontError::Changed { font: 3 })), "{r:?}");
+        let (n, r) = read_limited(&grown[..3], 4, 3);
+        assert_eq!(n, 3);
+        assert!(matches!(r, Err(FontError::Changed { font: 3 })), "{r:?}");
+        let (n, r) = read_limited(&grown[..4], 4, 3);
+        assert_eq!((n, r.unwrap()), (4, vec![0, 1, 0, 0]));
     }
 }

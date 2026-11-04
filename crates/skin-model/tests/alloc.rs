@@ -1126,7 +1126,8 @@ fn load(
         max_layers: 16,
         reserved_layers: u32::from(RESERVED),
     };
-    let atlas = skin.atlas(Variant::Lo, limits, &|| false).unwrap();
+    // The sheet's pages alone: a text layer would need a side of 2048.
+    let atlas = skin.sheet().atlas(Variant::Lo, limits, &|| false).unwrap();
     assert!(atlas.pages().len() >= 2, "{} pages", atlas.pages().len());
     let (_, uvs) = atlas.into_parts();
     // Frames run image by image: image k's frames follow image k - 1's.

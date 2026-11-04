@@ -33,6 +33,12 @@
 #[cfg(test)]
 extern crate self as render;
 #[cfg(test)]
+#[path = "../tests/font_support/mod.rs"]
+mod font_support;
+#[cfg(test)]
+#[path = "../tests/outline_support/mod.rs"]
+mod outline_support;
+#[cfg(test)]
 #[path = "../tests/common/mod.rs"]
 mod test_common;
 #[cfg(test)]
@@ -43,6 +49,7 @@ mod atlas;
 mod decl;
 mod gpu;
 pub mod measure;
+mod outline;
 mod overlay;
 mod pace;
 pub mod presentation;
@@ -54,12 +61,19 @@ mod skin_atlas;
 mod sprite;
 mod staging;
 pub mod text;
+mod text_cache;
+mod text_upload;
 
 pub use atlas::{ATLAS_SIZE, GLYPH_H, GLYPH_W, glyph_rows, solid_uv};
 pub use decl::{
     AttemptText, BundleError, DeclSkin, Installation, LoadingPresentation, SkinBundle, skin_frame,
 };
 pub use gpu::{AdapterChoice, Gpu};
+pub use outline::{
+    DefaultFont, LineBounds, LineFit, LineLayout, MAX_DEFAULT_FONT_BYTES, MAX_LINE_H, MAX_LINE_W,
+    MAX_SHAPED_GLYPHS, OutlineError, OutlineText, PlacedGlyph, RASTER_MARGIN, RasterError,
+    TextNote, TextResidency,
+};
 pub use overlay::{OVERLAY_RUNS, OVERLAY_SPRITES};
 pub use projection::{ClipError, ClipTable, MAX_CLIPS, Projection};
 pub use renderer::{
@@ -75,3 +89,5 @@ pub use skin::{AttemptInput, FrameInput, LoadingFrame, PlaySkin, SkinError, cove
 pub use skin_atlas::{AtlasPages, PageLevels, RESERVED_LAYERS, UploadError, atlas_limits};
 pub use sprite::{Blend, FLAG_NEAREST, Instance, Run, Sprite, SpriteBatch};
 pub use staging::{Scissor, Staging};
+pub use text_cache::{MAX_ALIASES, MAX_ROUNDS, MAX_TEXT_ENTRIES, TextCounts};
+pub use text_upload::{MAX_RECT_H, MAX_RECT_W, MAX_TEXT_MASK_BYTES, TextReport, text_upload_bound};
