@@ -652,6 +652,15 @@ impl Lower<'_> {
                     continue;
                 };
                 let args = ast.list(args);
+                // The call resolved and each argument read as an id, one
+                // unit each.
+                self.an
+                    .charge(
+                        u64::try_from(args.len())
+                            .unwrap_or(u64::MAX)
+                            .saturating_add(1),
+                    )
+                    .map_err(stop)?;
                 let resolved = if open {
                     None
                 } else {

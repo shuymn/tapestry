@@ -418,7 +418,18 @@ impl<'a> Walk<'a> {
         }
         self.an.clock.clear();
         // Writers: every prototype that calls one, through any chain.
+        // Each prototype and call edge one unit, before the index is
+        // built.
+        let unit = |w| Found {
+            why: w,
+            file: 0,
+            line: 0,
+        };
+        let edges = u64::try_from(self.edges.len()).unwrap_or(u64::MAX);
         let n = self.writes.len();
+        self.an
+            .charge(edges.saturating_add(u64::try_from(n).unwrap_or(u64::MAX)))
+            .map_err(|w| (None, unit(w)))?;
         let mut callers: Vec<Vec<u32>> = vec![Vec::new(); n];
         for &(from, to) in &self.edges {
             if let Some(c) = callers.get_mut(to as usize) {
@@ -430,11 +441,6 @@ impl<'a> Walk<'a> {
             .filter_map(|(p, &w)| w.then_some(p))
             .collect();
         while let Some(p) = pending.pop() {
-            let unit = |w| Found {
-                why: w,
-                file: 0,
-                line: 0,
-            };
             self.an.charge(1).map_err(|w| (None, unit(w)))?;
             for &q in callers
                 .get(p as usize)
@@ -451,6 +457,8 @@ impl<'a> Walk<'a> {
                 }
             }
         }
+        let n = u64::try_from(roots.len()).unwrap_or(u64::MAX);
+        self.an.charge(n).map_err(|w| (None, unit(w)))?;
         let mut writers = self.an.writers.borrow_mut();
         for i in roots {
             if self
@@ -537,6 +545,9 @@ impl<'a> Walk<'a> {
         if inst.values.is_none() && f.upvalues.1 > 0 {
             self.outside(&b, f.line, Unsupported::Capture("no reader"));
         }
+        self.an
+            .charge(u64::from(f.params.1))
+            .map_err(|w| self.fatal(&b, f.line, w))?;
         for &d in ast.list(f.params) {
             b.locals.insert(d, K::UNKNOWN);
         }
@@ -634,6 +645,15 @@ impl<'a> Walk<'a> {
             }
             Stmt::Return(list) => {
                 let t = self.list(b, list)?;
+                // The join of the results so far, one unit a position.
+                let n = b
+                    .ret
+                    .as_ref()
+                    .map_or(0, |r| r.fixed.len())
+                    .max(t.fixed.len());
+                self.an
+                    .charge(u64::try_from(n).unwrap_or(u64::MAX))
+                    .map_err(|w| self.fatal(b, line, w))?;
                 b.ret = Some(match b.ret.take() {
                     Some(r) => r.join(&t),
                     None => t,
@@ -980,7 +1000,19 @@ impl<'a> Walk<'a> {
                     Ok(Tuple::unknown())
                 }
             },
-            Ref::Lib(l) => self.lib(b, l, args, ids, line),
+            Ref::Lib(l) => {
+                // Its condition reads each argument and a format's bytes,
+                // one unit each.
+                let format = match ids.first().map(|&e| b.ast.expr(e)) {
+                    Some(Expr::Str(s)) => b.ast.str(s).len(),
+                    _ => 0,
+                };
+                let n = args.fixed.len().saturating_add(format);
+                self.an
+                    .charge(u64::try_from(n).unwrap_or(u64::MAX))
+                    .map_err(|w| self.fatal(b, line, w))?;
+                self.lib(b, l, args, ids, line)
+            }
             _ => {
                 self.outside(b, line, Unsupported::Callee);
                 Ok(Tuple::unknown())
