@@ -218,18 +218,8 @@ fn noted(i: &LuaImported, kind: NoteKind) -> bool {
 
 /// Checks that `r` refuses the critical callable in `field` for `why`.
 #[track_caller]
-fn critical(r: Result<LuaImported, ImportError>, field: &str, why: Unsupported) {
-    assert_eq!(
-        super::tests::why(r),
-        LuaWhy::Critical {
-            field: match field {
-                "op" => "op",
-                "timer" => "timer",
-                _ => "value",
-            },
-            why
-        }
-    );
+fn critical(r: Result<LuaImported, ImportError>, field: &'static str, why: Unsupported) {
+    assert_eq!(super::tests::why(r), LuaWhy::Critical { field, why });
 }
 
 /// [`skin`] with `image` added to its images.

@@ -217,8 +217,11 @@ pub(crate) struct Analysis {
     /// converted node. While it is set, no proof that rests on captured
     /// state holds ([`Unsupported::Interference`]).
     pub(crate) open: Option<u32>,
-    /// How many script roots and unread-entry roots the conversion met.
+    /// How many script roots and unread-entry roots the conversion met,
+    /// for the report.
+    #[cfg(any(test, feature = "dev-tools"))]
     pub(crate) scripts: u32,
+    #[cfg(any(test, feature = "dev-tools"))]
     pub(crate) unread: u32,
     classes: RefCell<Vec<State>>,
     /// The classes of function prototypes by their file, function and

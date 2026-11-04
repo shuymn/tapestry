@@ -153,9 +153,6 @@ struct Lower<'a> {
     an: &'a Analysis,
     custom: &'a Custom,
     cancelled: &'a dyn Fn() -> bool,
-    /// Whether the analysis is open ([`Analysis::open`]): no fold of a
-    /// captured value and no host module or helper binding is proven.
-    open: bool,
     out: Lowered,
     /// Each instance's expanded size, once computed, for the instances
     /// this lowering reaches.
@@ -173,7 +170,6 @@ impl<'a> Lower<'a> {
             an,
             custom,
             cancelled,
-            open: an.open.is_some(),
             out: Lowered {
                 src: String::new(),
                 guards: Vec::new(),
@@ -640,7 +636,7 @@ impl Lower<'_> {
     /// included. While the analysis is open, code it does not see may
     /// change that state, so none holds.
     fn bound(&self) -> R<()> {
-        if self.open {
+        if self.an.open.is_some() {
             return Err(Stop::Unsupported(Unsupported::Interference));
         }
         Ok(())

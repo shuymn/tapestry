@@ -477,7 +477,10 @@ impl Conv<'_> {
             .and_then(|b| std::str::from_utf8(b).ok())
             .unwrap_or_default();
         if !ser.resolves(name) {
-            self.analysis.scripts = self.analysis.scripts.saturating_add(1);
+            #[cfg(any(test, feature = "dev-tools"))]
+            {
+                self.analysis.scripts = self.analysis.scripts.saturating_add(1);
+            }
             self.open(id);
         }
         Ok(())
@@ -941,7 +944,10 @@ impl Conv<'_> {
         let id = self.node(kind, span, 0)?;
         if self.tags.is_some() {
             if pos.lists() && summary.unread {
-                self.analysis.unread = self.analysis.unread.saturating_add(1);
+                #[cfg(any(test, feature = "dev-tools"))]
+                {
+                    self.analysis.unread = self.analysis.unread.saturating_add(1);
+                }
                 self.open(id);
             }
             if matches!(pos, Pos::FontFallback) && summary.meta {
