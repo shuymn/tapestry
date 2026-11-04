@@ -243,6 +243,9 @@ impl DefaultFont {
             return Err(OutlineError::font(None, "larger than 32 MiB"));
         }
         let mut data = Vec::new();
+        let exact = usize::try_from(len).map_err(|_| OutlineError::font(None, "too large"))?;
+        data.try_reserve_exact(exact)
+            .map_err(|_| OutlineError::font(None, "too large"))?;
         file.take(MAX_DEFAULT_FONT_BYTES)
             .read_to_end(&mut data)
             .map_err(fail)?;
@@ -660,7 +663,10 @@ impl OutlineText {
             let Some(s) = scaler.as_mut() else {
                 continue;
             };
-            if !s.scale_outline_into(swash::GlyphId::from(g.glyph), &mut inner.outline) {
+            // A glyph with no outline (a space) draws nothing.
+            if !s.scale_outline_into(swash::GlyphId::from(g.glyph), &mut inner.outline)
+                || inner.outline.points().is_empty()
+            {
                 continue;
             }
             let Some(b) = place_points(
@@ -732,6 +738,7 @@ fn measure(
     let mut ink: Option<[f32; 4]> = None;
     let mut advance = 0.0_f32;
     let mut glyphs = Vec::new();
+    let mut scaler: Option<(usize, swash::scale::Scaler<'_>)> = None;
     for line in lines {
         if !line.w.is_finite() || line.w.abs() > MAX_LAYOUT_COORD {
             return Err(TextNote::TooLarge);
@@ -750,11 +757,21 @@ fn measure(
             let Some(face) = system.faces.iter().position(|f| f.id == g.font_id) else {
                 continue;
             };
-            let Some(f) = system.faces.get(face) else {
+            // One scaler per run of glyphs of one face: building one
+            // parses the face.
+            if scaler.as_ref().is_none_or(|(f, _)| *f != face) {
+                let Some(f) = system.faces.get(face) else {
+                    continue;
+                };
+                scaler = Some((face, scale.builder(f.swash()).size(em).hint(false).build()));
+            }
+            let Some((_, s)) = scaler.as_mut() else {
                 continue;
             };
-            let mut scaler = scale.builder(f.swash()).size(em).hint(false).build();
-            if !scaler.scale_outline_into(swash::GlyphId::from(g.glyph_id), outline) {
+            // A glyph with no outline (a space) has no ink.
+            if !s.scale_outline_into(swash::GlyphId::from(g.glyph_id), outline)
+                || outline.points().is_empty()
+            {
                 continue;
             }
             let Some(b) = place_points(outline.points(), [x, y], window, points) else {

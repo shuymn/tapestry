@@ -359,7 +359,8 @@ fn the_probe_and_rendering_share_the_checked_helper() {
     let before = raster_calls();
     let t = producer_of(&font_support::latin("Probe")).unwrap();
     assert!(raster_calls() > before, "the probes rasterized nothing");
-    let l = fits(&t, &req(SKIN, "AB", 100.0));
+    // A space has no outline: no ink, nothing rasterized for it.
+    let l = fits(&t, &req(SKIN, "A B", 100.0));
     let calls = raster_calls();
     let out = raster(&t, &l);
     assert_eq!(raster_calls(), calls + 2);

@@ -198,6 +198,14 @@ impl AtlasTexture {
                 write(gpu.queue(), &texture, layer, level, side >> level, bytes);
             }
         }
+        if pages.text_layer {
+            // One zero texel written to each level of the text layer: the
+            // device zeroes the rest of each level now, with the upload,
+            // and not at the first text written into it.
+            for level in 0..levels {
+                write(gpu.queue(), &texture, layers - 1, level, 1, &[0; 4]);
+            }
+        }
         let mut atlas = Self::of(&texture, side, layers, levels);
         atlas.text_layer = pages.text_layer.then(|| layers - 1);
         atlas
