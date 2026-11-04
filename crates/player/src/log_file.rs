@@ -74,10 +74,6 @@ pub fn warnings(what: &str, items: impl ExactSizeIterator<Item = impl Display>) 
 /// [`WARNINGS_LOGGED`] of `notes` as `<what>: <note>`, then one count of
 /// the notes left out: the ones past the cap and the `suppressed` ones
 /// their source kept only as a count. Nothing goes to stderr.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "production imports no skin yet")
-)]
 pub fn summary_to(
     what: &str,
     line: &str,

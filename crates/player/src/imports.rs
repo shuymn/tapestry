@@ -13,17 +13,13 @@
 //!   the job and waits at most [`STOP_WAIT`]; a job past it is abandoned
 //!   to the process's exit, and its late outcome is dropped on its own
 //!   thread.
+//! - [`startup`] imports and selects each configured kind of a launch
+//!   path, one kind after another, before the first screen.
 //! - The reports: the stdout line of each kind ([`line`]), the log's
 //!   summary of an installed skin ([`log_installed`]), and the select
 //!   screen's notice of a screen kind other than play ([`notice`]).
 //!
-//! Skins are imported at startup only; production startup does not run
-//! them yet, and every kind draws its built-in screen.
-
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "production imports no skin yet")
-)]
+//! Skins are imported at startup only; nothing here runs after it.
 
 use std::fmt::Write as _;
 use std::panic::{self, AssertUnwindSafe};
@@ -32,7 +28,7 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use game::{Chain, SkinChoice};
+use game::{Chain, Preparation, SkinChoice, SkinChoices};
 use render::{ClipTable, DefaultFont, OutlineError, OutlineText, SkinBundle};
 use skin_beatoraja::{
     Cancel, Config, Definition, Fact, FactId, Header, ImportError, ImportFacts, Imported,
@@ -41,7 +37,7 @@ use skin_beatoraja::{
 use skin_model::{AtlasLimits, FontReader, Layout, Root, ScreenKind, Side};
 
 use crate::log_file;
-use crate::render_side::SELECT_SLICE;
+use crate::render_side::{RenderLink, SELECT_SLICE};
 
 /// How long a stopped job is waited for before it is abandoned: the
 /// background work's stop bound.
@@ -426,6 +422,8 @@ pub fn run_cancellable<T: Send + 'static>(
         Ok(h) => h,
         Err(e) => return Ran::Refused(format!("the import thread cannot start: {e}")),
     };
+    #[cfg(feature = "dev-tools")]
+    JOBS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let mut deadline: Option<Instant> = None;
     let mut outcome: Option<Ran<T>> = None;
     loop {
@@ -491,8 +489,17 @@ pub fn notice(kind: ScreenKind, why: &str) -> String {
     format!("{screen}のスキンは使えません（内蔵画面）: {why}")
 }
 
-/// Logs an installed skin of `kind`: one line with its atlas's texels and
-/// the texels every kind's committed skin is charged together against the
+/// An installed bundle's atlas array: its level-0 texels
+/// ([`SkinBundle::atlas_texels`]) and its pages' side.
+#[derive(Clone, Copy, Debug)]
+pub struct Atlas {
+    pub texels: u64,
+    pub side: u32,
+}
+
+/// Logs an installed skin of `kind`: one line with its atlas's texels, page
+/// side and layers, and the texels every kind's committed skin is charged
+/// together against the
 /// shared limit, its counters, then its definition files and file
 /// choices, the lists last since a record is cut at the log's line cap;
 /// then its notes, located, at most the log's cap, and a count of the rest
@@ -500,15 +507,18 @@ pub fn notice(kind: ScreenKind, why: &str) -> String {
 pub fn log_installed(
     kind: ScreenKind,
     summary: &Summary,
-    atlas_texels: u64,
+    atlas: Atlas,
     committed: u64,
     log: &dyn log::Log,
 ) {
     let u = &summary.usage;
+    let Atlas { texels, side } = atlas;
+    let square = u64::from(side).saturating_mul(u64::from(side)).max(1);
     let mut head = format!(
-        "installed; atlas {atlas_texels} texels, committed {committed} of {} texels; \
-         elements {} images {} frames {} files {} fonts {} texts {} notes {}; files {}; \
-         choices ",
+        "installed; atlas {texels} texels (side {side}, {} layers), committed {committed} \
+         of {} texels; elements {} images {} frames {} files {} fonts {} texts {} notes {}; \
+         files {}; choices ",
+        texels / square,
         render::SHARED_TEXELS,
         u.elements,
         u.images,
@@ -541,6 +551,214 @@ pub fn log_installed(
         summary.suppressed,
         log,
     );
+}
+
+/// The jobs [`run_cancellable`] has started in the process (dev-tools).
+#[cfg(feature = "dev-tools")]
+static JOBS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The jobs [`run_cancellable`] has started in the process (dev-tools).
+#[cfg(feature = "dev-tools")]
+pub fn jobs_started() -> u64 {
+    JOBS.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// A launch path, by the screen kinds its startup imports, in order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Launch {
+    /// Song selection: play, selection, decision, result.
+    Selection,
+    /// `tapestry play <chart>`: play, then result; a play skin that cannot
+    /// be used fails the run.
+    Direct,
+}
+
+impl Launch {
+    const fn kinds(self) -> &'static [ScreenKind] {
+        match self {
+            Self::Selection => &[
+                ScreenKind::Play,
+                ScreenKind::Selection,
+                ScreenKind::Decision,
+                ScreenKind::Result,
+            ],
+            Self::Direct => &[ScreenKind::Play, ScreenKind::Result],
+        }
+    }
+}
+
+/// A kind's build as [`startup`] runs it: [`build`] in production.
+pub type Build =
+    Arc<dyn Fn(ScreenKind, &SkinChoice, bool, &ImportTarget, &Cancel) -> KindOutcome + Send + Sync>;
+
+/// What startup leaves for the first screen.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Started {
+    /// Play's admission notice when its skin was refused (song selection):
+    /// no chart is admitted, and the built-in skin does not stand in.
+    pub play: Option<String>,
+    /// The select screen's one notice line for the other kinds refused or
+    /// left built in.
+    pub notice: Option<String>,
+}
+
+/// Why startup ended the run.
+#[derive(Debug)]
+pub enum StartupEnd {
+    /// The window closed: the run ends as at any close.
+    Closed,
+    /// The run fails with this error.
+    Failed(anyhow::Error),
+}
+
+/// Imports and selects the skin configured for each kind of `launch`, in
+/// order, one kind at a time: each job is joined, and each selection
+/// answered, before the next kind's job starts, so at most one candidate
+/// exists beside the committed installations. An unconfigured kind sends
+/// nothing. Each kind's outcome is one `skin:` line on stdout and in the
+/// log, and an installed skin's summary is logged ([`log_installed`]).
+///
+/// - A play skin that cannot be used refuses every chart on the song
+///   selection path ([`Started::play`]); on the direct path it fails the
+///   run, whatever refused it, before the result kind's build starts.
+/// - Another kind refused, or with no importer yet, keeps its built-in
+///   screen, with one notice line ([`Started::notice`]).
+/// - A healthy refusal of an installation moves on to the next kind.
+///
+/// # Errors
+///
+/// [`StartupEnd::Closed`] once `stop` (the window's close) is seen: no
+/// further build, selection or screen follows; a job past [`STOP_WAIT`]
+/// is abandoned. [`StartupEnd::Failed`] for the direct path's play
+/// refusal, a selection unanswered past its bound (no later kind's build
+/// starts), and the render thread's end or failure.
+pub fn startup(
+    render: &RenderLink,
+    skins: &SkinChoices,
+    launch: Launch,
+    autoplay: bool,
+    build: &Build,
+    mut stop: impl FnMut() -> bool,
+) -> Result<Started, StartupEnd> {
+    let mut started = Started::default();
+    let mut notices = Vec::new();
+    let mut committed = 0_u64;
+    for &kind in launch.kinds() {
+        let Some(choice) = choice_of(skins, kind) else {
+            continue;
+        };
+        if stop() {
+            return Err(StartupEnd::Closed);
+        }
+        let Some((limits, size)) = render.atlas_limits() else {
+            return Err(StartupEnd::Failed(anyhow::anyhow!(
+                "the screen packs no skin"
+            )));
+        };
+        let target = ImportTarget {
+            limits,
+            size,
+            default_font: DefaultFont::runtime,
+        };
+        let job = {
+            let build = Arc::clone(build);
+            let choice = choice.clone();
+            move |cancel: &Cancel| build(kind, &choice, autoplay, &target, cancel)
+        };
+        let ran = run_cancellable(job, &mut stop);
+        let shown = match ran {
+            // A job stopped by the close, cancelled or abandoned.
+            _ if stop() => return Err(StartupEnd::Closed),
+            Ran::Abandoned => return Err(StartupEnd::Closed),
+            Ran::Refused(why) | Ran::Done(KindOutcome::Refused(why)) => Shown::Refused(why),
+            Ran::Done(KindOutcome::BuiltIn(why)) => Shown::BuiltIn(why),
+            Ran::Done(KindOutcome::Bundle(bundle, summary)) => {
+                let (texels, side) = (bundle.atlas_texels(), bundle.side());
+                match selected(render, kind, bundle, &mut stop) {
+                    Ok(None) => {
+                        committed = committed.saturating_add(texels);
+                        let atlas = Atlas { texels, side };
+                        log_installed(kind, &summary, atlas, committed, log::logger());
+                        Shown::Installed
+                    }
+                    Ok(Some(why)) => Shown::Refused(why),
+                    Err(StartupEnd::Failed(e)) => {
+                        report(kind, &Shown::Refused(format!("{e:#}")));
+                        return Err(StartupEnd::Failed(e));
+                    }
+                    Err(closed) => return Err(closed),
+                }
+            }
+        };
+        report(kind, &shown);
+        match shown {
+            Shown::Installed => {}
+            Shown::Refused(why) | Shown::BuiltIn(why) if kind == ScreenKind::Play => {
+                if launch == Launch::Direct {
+                    return Err(StartupEnd::Failed(anyhow::anyhow!(
+                        "the play skin cannot be used: {why}"
+                    )));
+                }
+                started.play = Some(format!("スキンを使えません: {why}"));
+            }
+            Shown::Refused(why) | Shown::BuiltIn(why) => notices.push(notice(kind, &why)),
+        }
+    }
+    if !notices.is_empty() {
+        started.notice = Some(notices.join(" / "));
+    }
+    Ok(started)
+}
+
+/// Prints and logs `kind`'s outcome line ([`line`]).
+fn report(kind: ScreenKind, shown: &Shown) {
+    let l = line(kind, shown);
+    println!("{l}");
+    log::info!("{l}");
+}
+
+/// `kind`'s configured choice.
+const fn choice_of(skins: &SkinChoices, kind: ScreenKind) -> Option<&SkinChoice> {
+    match kind {
+        ScreenKind::Play => skins.play.as_ref(),
+        ScreenKind::Selection => skins.selection.as_ref(),
+        ScreenKind::Decision => skins.decision.as_ref(),
+        ScreenKind::Result => skins.result.as_ref(),
+    }
+}
+
+/// Selects `bundle` for `kind` and polls the answer to its end: `None`
+/// installed, or the healthy refusal's reason.
+fn selected(
+    render: &RenderLink,
+    kind: ScreenKind,
+    bundle: Arc<SkinBundle>,
+    stop: &mut impl FnMut() -> bool,
+) -> Result<Option<String>, StartupEnd> {
+    let mut pending = render.select(kind, Some(bundle));
+    loop {
+        if stop() {
+            // Withdrawn as it drops: a completion after it installs
+            // nothing.
+            drop(pending);
+            return Err(StartupEnd::Closed);
+        }
+        match pending.poll(SELECT_SLICE) {
+            None => {}
+            Some(Ok(Preparation::Ready)) => return Ok(None),
+            Some(Ok(Preparation::Refused(why))) => return Ok(Some(why.to_string())),
+            Some(Ok(Preparation::Cancelled)) => {
+                return Err(StartupEnd::Failed(anyhow::anyhow!(
+                    "the {} skin's installation was cancelled",
+                    name(kind)
+                )));
+            }
+            Some(Err(e)) => {
+                let what = format!("the {} skin cannot be installed", name(kind));
+                return Err(StartupEnd::Failed(anyhow::Error::new(e).context(what)));
+            }
+        }
+    }
 }
 
 #[cfg(test)]

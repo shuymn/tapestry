@@ -771,6 +771,82 @@ fn practice_after_autoplay_plays_its_log() {
     assert_eq!(lines(&stdout, "dev: audio onsets 4:").len(), 1, "{stdout}");
 }
 
+/// Skins are imported at startup only: with a Lua play skin configured,
+/// a run of an autoplay, a retry from its result, a return to selection
+/// and a practice Start with its round imports nothing more than
+/// startup's one import (its two Lua passes).
+#[test]
+fn no_skin_is_imported_after_startup_through_practice() {
+    let fx = Fixture::new();
+    write_chart(&fx.library(), "a", "譜面A");
+    let key7 = bms_parser::load_bms(
+        b"#BPM 120\n#00119:0000000000010000\n",
+        &fx.base,
+        &Default::default(),
+    )
+    .unwrap()
+    .chart;
+    write_log(
+        &fx.base.join("logs").join("k7.tprl"),
+        &hits(&key7, |_| true),
+        1,
+    );
+    let skin = fx.base.join("skin");
+    fs::create_dir_all(&skin).unwrap();
+    let file = fs::File::create(skin.join("blue.png")).unwrap();
+    let mut e = png::Encoder::new(std::io::BufWriter::new(file), 16, 16);
+    e.set_color(png::ColorType::Rgba);
+    e.set_depth(png::BitDepth::Eight);
+    let blue: Vec<u8> = (0..16 * 16).flat_map(|_| [0, 0, 255, 255]).collect();
+    e.write_header().unwrap().write_image_data(&blue).unwrap();
+    fs::write(
+        skin.join("play.luaskin"),
+        "local skin = { type = 0, name = \"blue\", w = 1920, h = 1080 }\n\
+         if not skin_config then return skin end\n\
+         skin.source = { { id = \"b\", path = \"blue.png\" } }\n\
+         skin.image = { { id = \"b\", src = \"b\", x = 0, y = 0, w = 16, h = 16 } }\n\
+         skin.destination = { { id = \"b\", dst = { { x = 0, y = 0, w = 1920, h = 1080 } } } }\n\
+         return skin\n",
+    )
+    .unwrap();
+    fs::create_dir_all(fx.data()).unwrap();
+    fs::write(
+        fx.data().join("player.toml"),
+        format!(
+            "[skins.play]\nroot = '{}'\nentry = 'play.luaskin'\n",
+            skin.display()
+        ),
+    )
+    .unwrap();
+    let (out, stdout, stderr) = fx.run(&scenario(&[
+        "select = { path = \"library/a/a.bms\" }",
+        "play = { input = \"auto\", until = \"end\" }",
+        "result = \"retry\"",
+        "play = { input = \"auto\", until = \"end\" }",
+        "result = \"back\"",
+        "practice = { path = \"library/a/a.bms\", from = 1, to = 2, speed = 100, \
+         lead_in_ms = 2000, gauge = 20, repeat = true, input = \"logs/k7.tprl\", rounds = 1 }",
+        "quit = {}",
+    ]));
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+    assert_eq!(
+        lines(&stdout, "skin:"),
+        ["skin: play: installed"],
+        "{stdout}"
+    );
+    assert!(
+        !lines(&stdout, "practice: on the practice screen").is_empty(),
+        "{stdout}"
+    );
+    // The two plays and the round.
+    assert_eq!(lines(&stdout, "play started").len(), 3, "{stdout}");
+    assert_eq!(
+        lines(&stdout, "dev: skin imports "),
+        ["dev: skin imports 1 lua passes 2"],
+        "{stdout}"
+    );
+}
+
 /// The peaks the recording output found after each sound's onset.
 fn onset_peaks(stdout: &str) -> Vec<f64> {
     let line = lines(stdout, "dev: audio onset peaks:")[0];
