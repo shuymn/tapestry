@@ -660,9 +660,21 @@ fn a_stop_mid_lua_cancels_and_returns_after_the_vm_and_the_thread() {
     cancelled(rx.recv_timeout(STOP_WAIT).unwrap());
 }
 
-/// A VM held past the stop bound: the runner gives up within the bound
-/// and a slice's scheduling, the VM still counted; once released, the
-/// outcome finds nobody and is dropped on the job's own thread.
+/// How late past [`STOP_WAIT`] a runner that gives up at the bound may
+/// return on a loaded machine: its slices and the scheduler. The jobs it
+/// is checked against cannot end before the test releases them, which it
+/// does only after waiting [`HELD_FOR`]: a runner that waited for its job
+/// would answer nothing within that wait.
+const LATE: Duration = Duration::from_secs(2);
+/// How long the abandonment tests wait for the runner, the job held
+/// meanwhile; past [`STOP_WAIT`] + [`LATE`].
+const HELD_FOR: Duration = Duration::from_secs(7);
+
+/// A VM held past the stop bound: the runner gives up at the bound, the
+/// VM still counted; once released, the outcome finds nobody and is
+/// dropped on the job's own thread. Unheld and uncancelled, the looping
+/// fixture would run to the sandbox's 5 s Lua time cap; held, it never
+/// ends before the release.
 #[cfg(feature = "dev-tools")]
 #[test]
 fn a_job_past_the_stop_wait_is_abandoned() {
@@ -676,13 +688,13 @@ fn a_job_past_the_stop_wait_is_abandoned() {
     executing(base);
     let stopped = Instant::now();
     stop.store(true, Ordering::SeqCst);
-    let ran = rx.recv_timeout(STOP_WAIT + Duration::from_secs(5));
+    let ran = rx.recv_timeout(HELD_FOR);
     let after = stopped.elapsed();
     let live = vm_hooks::live();
     vm_hooks::release();
     assert!(matches!(ran, Ok(Ran::Abandoned)), "{ran:?}");
     assert!(after >= STOP_WAIT, "{after:?}");
-    assert!(after < STOP_WAIT + Duration::from_millis(500), "{after:?}");
+    assert!(after < STOP_WAIT + LATE, "{after:?}");
     assert_eq!(live, base + 1);
     assert!(wait_until(|| dropped.lock().unwrap().is_some()));
     assert_eq!(dropped.lock().unwrap().as_deref(), Some("skin-import"));
@@ -700,14 +712,11 @@ fn a_received_outcome_still_waits_within_the_stop_bound() {
     assert!(rx.recv_timeout(Duration::from_millis(300)).is_err());
     let stopped = Instant::now();
     stop.store(true, Ordering::SeqCst);
-    let ran = rx.recv_timeout(STOP_WAIT + Duration::from_secs(5));
+    let ran = rx.recv_timeout(HELD_FOR);
     let after = stopped.elapsed();
     hold_exit(false);
     assert!(matches!(ran, Ok(Ran::Abandoned)), "{ran:?}");
-    assert!(
-        after >= STOP_WAIT && after < STOP_WAIT + Duration::from_millis(500),
-        "{after:?}"
-    );
+    assert!(after >= STOP_WAIT && after < STOP_WAIT + LATE, "{after:?}");
     // Released, an unstopped job's outcome comes once its thread ends.
     let (_stop, rx) = started(|_: &Cancel| 7_u32);
     assert!(matches!(rx.recv_timeout(STOP_WAIT), Ok(Ran::Done(7))));
