@@ -324,3 +324,33 @@ fn each_selected_image_keeps_its_own_native_size() {
     let keep = |ex, target| shape_rects(shapes([1_280, 720], 9, keys), ex, target)[0];
     assert_eq!(keep(1, [1_280, 720]), [-12, 694, 64, 32]);
 }
+
+/// A frame cut past the file's edge keeps the source's cell as its size:
+/// an image and an image set's entry, each an 8×64 frame past a.png's
+/// right edge, keep 8×64 target pixels under no resize, and the entry
+/// fits that cell inside its box under stretch 1.
+#[test]
+fn a_frame_past_the_edge_keeps_its_cell() {
+    let edge = r#""src": "a", "x": 64, "w": 8, "h": 64"#;
+    let keys = r#"{"x": 0, "y": 0, "w": 200, "h": 100}"#;
+    let body = format!(
+        r#""image": [{{"id": "i", {edge}}}],
+           "destination": [{{"id": "i", "timer": 41, "stretch": 9, "dst": [{keys}]}}]"#
+    );
+    assert_eq!(target_rects(&body, [1_920, 1_080], 0), [[146, 973, 8, 64]]);
+    let set = |stretch: i32| {
+        format!(
+            r#""image": [{{"id": "small", "src": "a", "w": 16, "h": 16}}, {{"id": "e", {edge}}}],
+               "imageset": [{{"id": "s", "images": ["small", "e"], "value": 71}}],
+               "destination": [{{"id": "s", "stretch": {stretch}, "dst": [{keys}]}}]"#
+        )
+    };
+    let entry = |stretch| {
+        let l = import_sized([1_280, 720], &set(stretch), &[]);
+        assert!(!has(l.report(), NoteKind::SourceRect), "{:?}", l.report());
+        shape_rects(l, 1, [1_920, 1_080])
+    };
+    assert_eq!(entry(9), [[146, 973, 8, 64]]);
+    // 8×64 inside 300×150 is 18.75×150, from x 140.625 to 159.375.
+    assert_eq!(entry(1), [[141, 930, 18, 150]]);
+}

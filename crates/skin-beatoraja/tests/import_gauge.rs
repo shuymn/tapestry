@@ -5,10 +5,10 @@
 
 mod common;
 
-use common::play::round;
+use common::play::{Drawn, round};
 use common::{Loaded, d3_notes, has, import_body, import_sized};
 use skin_beatoraja::{CriticalPart, DeviationId, ImportError, NoteKind, TimerWhy};
-use skin_model::Filter;
+use skin_model::{Filter, GaugeLook};
 
 /// Node images n0..n35, each an 8×8 cell of `a`, and `extra` records.
 fn images(extra: &str) -> String {
@@ -235,6 +235,44 @@ fn a_node_whose_source_is_undefined_refuses() {
             );
         }
         e => panic!("{e:?}"),
+    }
+}
+
+#[test]
+fn back_nodes_past_the_edge_draw_the_edge_column() {
+    // The hazard look's back nodes (n2, n3 of four) cut 8×8 frames past
+    // a.png's right edge (64×64): every segment but the front one
+    // samples the edge column's rows 0-7 or 8-15, the same across
+    // each segment. The import reads a.png's header, the atlas its
+    // texels, painted with `coord` in between.
+    let edge = r#", {"id": "e2", "src": "a", "x": 64, "y": 0, "w": 8, "h": 8},
+                   {"id": "e3", "src": "a", "x": 100, "y": 8, "w": 8, "h": 8}"#;
+    let l = gauge_with(
+        r#""nodes": ["n0", "n1", "e2", "e3"], "parts": 10"#,
+        "",
+        edge,
+    );
+    assert!(!has(l.report(), NoteKind::SourceRect));
+    common::png_with(l.dir.path(), "a.png", 64, 64, common::coord);
+    let skin = l.ok().skin.clone();
+    let atlas = skin
+        .atlas(skin_model::Variant::Lo, common::play::LIMITS, &|| false)
+        .unwrap();
+    let quads = Drawn::with_look(skin, 100, GaugeLook::Hazard).frame(1_000, &[]);
+    let at = |q, u, v| common::play::texel_at(&atlas, q, u, v);
+    let back: Vec<_> = quads.iter().filter(|q| at(q, 0.5, 0.5)[0] == 63).collect();
+    // Ten segments at the start value: one front, nine back.
+    assert_eq!((quads.len(), back.len()), (10, 9));
+    for q in back {
+        let top = at(q, 0.1, 0.1);
+        assert!(
+            top == common::coord(63, 0) || top == common::coord(63, 8),
+            "{top:?}"
+        );
+        for (u, v) in [(0.9, 0.1), (0.1, 0.9), (0.9, 0.9)] {
+            let want = common::coord(63, u32::from(top[1]) + if v > 0.5 { 7 } else { 0 });
+            assert_eq!(at(q, u, v), want, "{u} {v}");
+        }
     }
 }
 
