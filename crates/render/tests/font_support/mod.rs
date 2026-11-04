@@ -180,7 +180,7 @@ fn directory(out: &mut Vec<u8>, tables: &[([u8; 4], Vec<u8>)], base: usize) {
     be16(out, pow * 16);
     be16(out, log);
     be16(out, n * 16 - pow * 16);
-    let mut at = 12 + 16 * tables.len();
+    let at = 12 + 16 * tables.len();
     let mut body = Vec::new();
     for (tag, data) in &tables {
         out.extend_from_slice(tag);
@@ -192,8 +192,6 @@ fn directory(out: &mut Vec<u8>, tables: &[([u8; 4], Vec<u8>)], base: usize) {
             body.push(0);
         }
     }
-    at += body.len();
-    let _ = at;
     out.extend_from_slice(&body);
 }
 

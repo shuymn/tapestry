@@ -324,7 +324,7 @@ impl TextCache {
         for round in 0..MAX_ROUNDS {
             counts.rounds = round + 1;
             let cap = MAX_TEXT_EM_PX / f32::from(1_u16 << round);
-            if let Some(mut p) = self.round(
+            if let Some(p) = self.round(
                 requests,
                 bounds,
                 held,
@@ -333,7 +333,6 @@ impl TextCache {
                 &mut layout,
                 &mut counts,
             ) {
-                p.counts = counts;
                 return p;
             }
         }

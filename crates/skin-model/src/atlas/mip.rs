@@ -124,12 +124,6 @@ fn mean(a: u8, b: u8, c: u8, d: u8) -> u8 {
     u8::try_from((sum + 2) / 4).unwrap_or(u8::MAX)
 }
 
-/// Fills `dst`, half of `src`'s `side` per axis, with the 2×2 box average
-/// of `src`, per channel.
-pub(crate) fn downsample(src: &[u8], side: u32, dst: &mut [u8]) {
-    downsample_rgba(src, side, dst);
-}
-
 /// Fills `dst`, half of `src` per axis, with the 2×2 box average of `src`
 /// per channel, as a page's mip levels are made: `src` is RGBA8 rows of
 /// `width` texels, both sides even, and `dst` rows of `width / 2`. A

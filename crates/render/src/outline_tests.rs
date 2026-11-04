@@ -2,8 +2,6 @@
 //! fallback, cap heights, the glyph and pixel bounds, the refit, and the
 //! checks that keep anything unchecked from the rasterizer.
 
-use std::sync::Arc;
-
 use skin_model::{FontRef, Skin, TextRequest};
 use swash::zeno::{Point, Verb};
 
@@ -365,7 +363,6 @@ fn the_probe_and_rendering_share_the_checked_helper() {
     let out = raster(&t, &l);
     assert_eq!(raster_calls(), calls + 2);
     assert!(out.iter().filter(|&&c| c == 255).count() > 1_000);
-    let _ = Arc::strong_count(&default_font());
 }
 
 #[test]

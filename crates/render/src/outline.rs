@@ -902,10 +902,7 @@ fn composite(
     let mut mask =
         vec![0_u8; usize::try_from(u64::from(mw) * u64::from(mh)).map_err(|_| RasterError::Size)?];
     rasterize_checked(&local, verbs, [mw, mh], &mut mask)?;
-    let (row, mw_us) = (
-        usize::try_from(w).unwrap_or(0),
-        usize::try_from(mw).unwrap_or(0),
-    );
+    let mw_us = usize::try_from(mw).unwrap_or(0);
     for (my, src) in (0..).zip(mask.chunks_exact(mw_us.max(1))) {
         let start = usize::try_from(u64::from(y0 + my) * u64::from(w) + u64::from(x0))
             .unwrap_or(usize::MAX);
@@ -915,7 +912,6 @@ fn composite(
         for (d, s) in dst.iter_mut().zip(src) {
             *d = d.saturating_add(*s);
         }
-        let _ = row;
     }
     Ok(())
 }

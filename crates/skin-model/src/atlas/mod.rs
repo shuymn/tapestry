@@ -318,7 +318,7 @@ impl Sheet {
                 let (done, rest) = page.levels.split_at_mut(k);
                 if let (Some(src), Some(dst)) = (done.last(), rest.first_mut()) {
                     let src_side = side >> (k - 1);
-                    mip::downsample(src, src_side, dst);
+                    mip::downsample_rgba(src, src_side, dst);
                 }
             }
         }

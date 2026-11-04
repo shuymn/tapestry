@@ -195,8 +195,7 @@ pub(crate) fn pack(
     min_side: u32,
 ) -> Result<Packing, PackError> {
     if padded.is_empty() {
-        let side = MIN_PAGE_SIDE.max(min_side).checked_next_power_of_two();
-        let Some(side) = side.filter(|&s| s <= cap) else {
+        let Some(side) = candidates(padded, cap, min_side).next() else {
             return Err(PackError::TooManyPages);
         };
         return Ok(Packing {
