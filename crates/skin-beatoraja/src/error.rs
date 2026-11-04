@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-use skin_model::{CompileError, ImageError, LoadError, RootError};
+use skin_model::{CompileError, ImageError, LoadError, RootError, ScreenKind};
 
 use crate::import::{CriticalPart, ImportLimit, NoteKind};
 use crate::lua::LuaWhy;
@@ -171,9 +171,23 @@ pub enum ImportError {
         at: Loc,
         field: &'static str,
     },
-    /// The definition is not of the 7-key play type, or names no type.
-    NotPlay7 {
+    /// The definition names no screen kind tapestry imports: no `type`
+    /// (`at` and `ty` are `None`), or type `ty` at `at`.
+    UnsupportedKind {
         at: Option<Loc>,
+        ty: Option<i32>,
+    },
+    /// A skin of kind `found` imported into the `slot` kind's slot: its
+    /// header's kind (`at` is `None`), or the `type` at `at` a configured
+    /// Lua pass returned.
+    Slot {
+        at: Option<Loc>,
+        slot: ScreenKind,
+        found: ScreenKind,
+    },
+    /// A skin of a kind no importer maps yet, imported into its own slot.
+    NoImporter {
+        kind: ScreenKind,
     },
     /// The skin's size is not one of [`crate::SIZES`].
     Resolution {
@@ -254,7 +268,16 @@ impl fmt::Display for ImportError {
                 expected,
             } => write!(f, "{at}: `{field}` must be {expected}"),
             Self::Range { at, field } => write!(f, "{at}: `{field}` is outside i32"),
-            Self::NotPlay7 { at } => write!(f, "{}not a 7-key play skin", At(at)),
+            Self::UnsupportedKind { at, ty: None } => {
+                write!(f, "{}names no screen type", At(at))
+            }
+            Self::UnsupportedKind { at, ty: Some(ty) } => {
+                write!(f, "{}type {ty} is not a supported screen kind", At(at))
+            }
+            Self::Slot { at, slot, found } => {
+                write!(f, "{}a {found} skin in the {slot} slot", At(at))
+            }
+            Self::NoImporter { kind } => write!(f, "{kind} skins are not imported yet"),
             Self::Resolution { at, w, h } => {
                 write!(f, "{}an unsupported skin size {w}x{h}", At(at))
             }

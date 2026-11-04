@@ -13,7 +13,7 @@ use skin_beatoraja::{
     Cancel, Config, ImportError, InputLimit, LuaHeader, LuaImported, LuaLimit, LuaWhy, NoteKind,
     OffsetValue, read_lua_header,
 };
-use skin_model::RootError;
+use skin_model::{RootError, ScreenKind};
 use tempfile::TempDir;
 
 /// A `rep` the fixtures build long strings with, by the VM's own
@@ -1936,4 +1936,76 @@ fn tagging_keeps_statement_boundaries() {
         ));
         import(&d).unwrap_or_else(|e| panic!("{body}: {e:?}"));
     }
+}
+
+#[test]
+fn the_header_pass_gives_the_kind_the_type_names() {
+    for (ty, kind) in [
+        (0, ScreenKind::Play),
+        (5, ScreenKind::Selection),
+        (6, ScreenKind::Decision),
+        (7, ScreenKind::Result),
+    ] {
+        let d = folder(&[("s.luaskin", &format!("return {{ type = {ty} }}"))]);
+        assert_eq!(header(&d).unwrap().header().kind, kind, "{ty}");
+    }
+    let d = folder(&[("s.luaskin", "return { type = 1 }")]);
+    assert!(matches!(
+        header(&d),
+        Err(ImportError::UnsupportedKind { ty: Some(1), .. })
+    ));
+}
+
+/// A play skin whose configured pass sets `skin.type` to `ty`, then runs
+/// `body`.
+fn retyped(ty: i32, body: &str) -> TempDir {
+    configured(&format!("skin.type = {ty}\n{body}"))
+}
+
+/// A function the callback admission refuses.
+const UNSUPPORTED: &str = "skin.extra = { function() end }";
+
+/// Checks `run`, an import into the play slot, on a play skin whose
+/// configured pass returns type 7, also with a callback the admission
+/// refuses: a refusal located at the configured table's `type`, where an
+/// unsupported type 3 is refused too.
+fn refuses_a_retype(run: impl Fn(&TempDir) -> Result<(), ImportError>) {
+    // The callback alone refuses the skin.
+    assert!(matches!(
+        run(&retyped(0, UNSUPPORTED)),
+        Err(ImportError::Lua { .. })
+    ));
+    for body in ["", UNSUPPORTED] {
+        let at = match run(&retyped(3, body)) {
+            Err(ImportError::UnsupportedKind {
+                at: Some(at),
+                ty: Some(3),
+            }) => at,
+            other => panic!("{body}: {other:?}"),
+        };
+        match run(&retyped(7, body)) {
+            Err(ImportError::Slot {
+                at: Some(a),
+                slot: ScreenKind::Play,
+                found: ScreenKind::Result,
+            }) => assert_eq!(a, at, "{body}"),
+            other => panic!("{body}: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn a_configured_pass_of_another_type_refuses_at_its_type() {
+    refuses_a_retype(|d| import(d).map(|_| ()));
+}
+
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_timed_configured_pass_of_another_type_refuses_at_its_type() {
+    refuses_a_retype(|d| {
+        let h = header(d).unwrap();
+        let facts = skin_beatoraja::ImportFacts::unavailable(ScreenKind::Play);
+        h.timed(&Config::defaults(h.header()), &facts, &Cancel::new())
+            .map(|_| ())
+    });
 }

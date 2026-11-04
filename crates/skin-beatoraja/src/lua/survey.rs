@@ -9,6 +9,8 @@ use std::collections::BTreeMap;
 
 use std::path::Path;
 
+use skin_model::ScreenKind;
+
 use super::convert::callables;
 use super::facts::{FactRead, ImportFacts};
 use super::ledger::Stop;
@@ -47,6 +49,8 @@ pub struct Survey {
     /// The facts the configured pass recorded, in first-read order.
     pub reads: Vec<FactRead>,
     pub usage: LuaUsage,
+    /// The screen kind the header pass gave, when it gave a header.
+    pub kind: Option<ScreenKind>,
 }
 
 /// The name of `v`'s variant alone, without the values it holds.
@@ -68,7 +72,9 @@ fn label(e: &ImportError) -> String {
             field, expected, ..
         } => format!("type `{field}` {expected}"),
         ImportError::Range { field, .. } => format!("range `{field}`"),
-        ImportError::NotPlay7 { .. } => "not 7-key play".into(),
+        ImportError::UnsupportedKind { .. } => "unsupported screen kind".into(),
+        ImportError::Slot { .. } => "skin in another slot".into(),
+        ImportError::NoImporter { kind } => format!("no importer for {kind:?}"),
         ImportError::Resolution { w, h, .. } => format!("size {w}x{h}"),
         ImportError::Limit { limit, .. } => format!("limit {limit:?}"),
         ImportError::Critical { part, why, .. } => format!("critical {part:?}: {}", note(why)),
@@ -139,7 +145,8 @@ fn at_of(e: &ImportError) -> Option<&Loc> {
     match e {
         ImportError::Read { at, .. }
         | ImportError::Input { at, .. }
-        | ImportError::NotPlay7 { at }
+        | ImportError::UnsupportedKind { at, .. }
+        | ImportError::Slot { at, .. }
         | ImportError::Resolution { at, .. }
         | ImportError::Limit { at, .. }
         | ImportError::Model { at, .. }
@@ -153,13 +160,16 @@ fn at_of(e: &ImportError) -> Option<&Loc> {
         | ImportError::Critical { at, .. }
         | ImportError::Expr { at, .. }
         | ImportError::Asset { at, .. } => Some(at),
+        ImportError::NoImporter { .. } => None,
     }
 }
 
 /// Runs the Lua skin `entry` of skin folder `root` with its default
-/// configuration against the import facts `facts`, counts the functions its configured definition holds
-/// and imports it, keeping what the candidate used and consulted however
-/// far it got, and reports only allowlisted labels and numbers.
+/// configuration against the import facts `facts` on the scene of the
+/// kind its header pass gives (`facts.scene` is not read), counts the
+/// functions its configured definition holds and imports it, keeping what
+/// the candidate used and consulted however far it got, and reports only
+/// allowlisted labels and numbers.
 #[must_use]
 pub fn survey(root: &Path, entry: &str, facts: &ImportFacts, cancel: &Cancel) -> Survey {
     let header = header_pass(root, entry, cancel);
@@ -176,7 +186,15 @@ pub fn survey(root: &Path, entry: &str, facts: &ImportFacts, cancel: &Cancel) ->
         }
     };
     let config = Config::defaults(h.header());
-    let mut s = Survey::default();
+    let kind = h.header().kind;
+    let facts = &ImportFacts {
+        scene: kind,
+        ..*facts
+    };
+    let mut s = Survey {
+        kind: Some(kind),
+        ..Survey::default()
+    };
     // One configured pass: its functions counted, then its definition
     // imported.
     let (def, counts, store, reads) = h.configured(&config, facts, cancel);
@@ -225,7 +243,7 @@ pub fn survey(root: &Path, entry: &str, facts: &ImportFacts, cancel: &Cancel) ->
 #[cfg(test)]
 mod tests {
     use super::{Cancel, ImportFacts, survey};
-    use crate::lua::facts::Scene;
+    use skin_model::ScreenKind;
 
     fn folder(files: &[(&str, &str)]) -> tempfile::TempDir {
         let d = tempfile::tempdir().unwrap();
@@ -248,7 +266,7 @@ mod tests {
         let s = survey(
             d.path(),
             "s.luaskin",
-            &ImportFacts::unavailable(Scene::Play),
+            &ImportFacts::unavailable(ScreenKind::Play),
             &Cancel::new(),
         );
         assert_eq!(s.outcome, "lua Error");
@@ -263,7 +281,7 @@ mod tests {
         let s = survey(
             d.path(),
             "s.luaskin",
-            &ImportFacts::unavailable(Scene::Play),
+            &ImportFacts::unavailable(ScreenKind::Play),
             &Cancel::new(),
         );
         assert_eq!(s.outcome, "header lua Mixed");
@@ -283,7 +301,7 @@ return { type = 0 }",
         let s = survey(
             d.path(),
             "s.luaskin",
-            &ImportFacts::unavailable(Scene::Play),
+            &ImportFacts::unavailable(ScreenKind::Play),
             &Cancel::new(),
         );
         assert_eq!(crate::lua::tests::PASSES.with(std::cell::Cell::get), 2);
@@ -301,7 +319,7 @@ return { type = 0 }",
         let s = survey(
             d.path(),
             "s.luaskin",
-            &ImportFacts::unavailable(Scene::Play),
+            &ImportFacts::unavailable(ScreenKind::Play),
             &Cancel::new(),
         );
         let kinds: Vec<(&str, u32)> = s
@@ -324,7 +342,7 @@ return { type = 0 }",
         let s = survey(
             d.path(),
             "s.luaskin",
-            &ImportFacts::unavailable(Scene::Play),
+            &ImportFacts::unavailable(ScreenKind::Play),
             &Cancel::new(),
         );
         assert_eq!(s.outcome, "header include cycle");
@@ -332,5 +350,40 @@ return { type = 0 }",
             s.usage.input_bytes,
             u64::try_from(entry.len() + 2 * json.len()).unwrap()
         );
+    }
+
+    #[test]
+    fn screen_kind_refusals_have_their_labels_and_locations() {
+        let run = |entry: &str| {
+            let d = folder(&[("s.luaskin", entry)]);
+            // The snapshot's scene is the header's kind, whatever is given.
+            survey(
+                d.path(),
+                "s.luaskin",
+                &ImportFacts::unavailable(ScreenKind::Result),
+                &Cancel::new(),
+            )
+        };
+        let s = run("return { type = 1 }");
+        assert_eq!(s.outcome, "header unsupported screen kind");
+        assert_eq!(s.kind, None);
+        let (module, line, _) = s.at.unwrap();
+        assert_eq!((module, line), (0, 0));
+        for (ty, kind, label) in [
+            (5, ScreenKind::Selection, "no importer for Selection"),
+            (6, ScreenKind::Decision, "no importer for Decision"),
+            (7, ScreenKind::Result, "no importer for Result"),
+        ] {
+            let s = run(&format!("return {{ type = {ty} }}"));
+            assert_eq!(
+                (s.outcome.as_str(), s.at, s.kind),
+                (label, None, Some(kind))
+            );
+        }
+        let s = run("if skin_config then return { type = 7 } end\nreturn { type = 0 }");
+        assert_eq!(s.outcome, "skin in another slot");
+        assert_eq!(s.kind, Some(ScreenKind::Play));
+        let (module, line, _) = s.at.unwrap();
+        assert_eq!((module, line), (0, 0));
     }
 }

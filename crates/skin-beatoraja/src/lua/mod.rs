@@ -65,13 +65,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use mlua::{Lua, MultiValue, RegistryKey, Value};
-use skin_model::{FileId, Root};
+use skin_model::{FileId, Root, ScreenKind};
 
 pub use self::callback::Disposition;
 use self::config::Bridge;
 pub use self::convert::MAX_CONVERTED_BYTES;
 pub use self::facts::{
-    ChartRank, Fact, FactDeps, FactId, FactRead, FactValue, ImportFacts, JudgeClass, Scene,
+    ChartRank, Fact, FactDeps, FactId, FactRead, FactValue, ImportFacts, JudgeClass,
 };
 pub use self::host::HOST_APIS;
 pub use self::ledger::{Cancel, LuaUsage};
@@ -165,8 +165,6 @@ pub enum LuaWhy {
     Unavailable { api: u16, id: i32 },
     /// A host API's argument that is not a Lua integer within `i32`.
     FactArgument,
-    /// The snapshot's scene is not the scene of the skin's kind.
-    Scene,
     /// The entry returned no table.
     Returned,
     /// A table key that is neither a string nor an integer, or a table the
@@ -278,7 +276,6 @@ impl fmt::Display for LuaWhy {
                 write!(f, "{m}.{n}({id}) reads a fact this scene cannot give")
             }
             Self::FactArgument => f.write_str("a host API's argument is not an integer id"),
-            Self::Scene => f.write_str("the skin is imported for another scene"),
             Self::Returned => f.write_str("the skin returned no table"),
             Self::Key => f.write_str("a table key that is not a string or an integer"),
             Self::Mixed => f.write_str("a table with string and integer keys"),
@@ -779,6 +776,23 @@ fn definition(
     )
 }
 
+/// Refuses a configured definition whose `type` names another kind than
+/// `slot` ([`ImportError::Slot`], located at it), then admits its
+/// callables ([`callback::admit`]). A configured pass may return another
+/// type than its header pass, and that refusal comes before any
+/// callable's.
+fn admit(def: &mut Definition, slot: ScreenKind) -> Result<(), ImportError> {
+    let (found, node) = def.kind()?;
+    if found != slot {
+        return Err(ImportError::Slot {
+            at: Some(def.loc(node)),
+            slot,
+            found,
+        });
+    }
+    callback::admit(&def.arena)
+}
+
 /// Carries what the common reader did with `def`'s includes into the
 /// candidate: the bytes and loads it charged, which the next pass starts
 /// from, and the snapshots it read and added, its files among the
@@ -816,7 +830,9 @@ impl LuaHeader {
     /// # Errors
     ///
     /// What [`read_lua_header`] refuses; a snapshot of another scene than
-    /// the skin's kind ([`LuaWhy::Scene`]), a fact it has unavailable
+    /// the skin's kind ([`ImportError::Slot`]), by its header or by the
+    /// `type` the configured pass returns, or of a kind no importer maps
+    /// yet ([`ImportError::NoImporter`]); a fact it has unavailable
     /// ([`LuaWhy::Unavailable`]) or a bad id ([`LuaWhy::FactArgument`]);
     /// and what [`crate::import`] refuses of the converted definition.
     pub fn import(
@@ -878,10 +894,10 @@ impl LuaHeader {
                 }));
             }
         };
-        callback::admit(&def.arena)?;
+        admit(&mut def, facts.scene)?;
         let mut t = LAST_TIMINGS.with(Cell::get);
         let start = std::time::Instant::now();
-        std::hint::black_box(import(&mut def, &self.header, config)?);
+        std::hint::black_box(import(&mut def, &self.header, config, facts.scene)?);
         t.import = start.elapsed();
         Ok(LuaTimed::Imported(t))
     }
@@ -898,8 +914,9 @@ impl LuaHeader {
         self.finish(def, counts, store, reads, config)
     }
 
-    /// The common import of a configured pass's outcome, with the
-    /// candidate's metadata kept on every outcome.
+    /// The common import of a configured pass's outcome into the slot of
+    /// the header's kind, which [`Self::configured`] checked the snapshot's
+    /// scene against, with the candidate's metadata kept on every outcome.
     pub(crate) fn finish(
         &self,
         def: Result<Definition, Stop>,
@@ -908,10 +925,11 @@ impl LuaHeader {
         reads: Vec<FactRead>,
         config: &Config,
     ) -> Outcome<Imported, Stop> {
+        let slot = self.header.kind;
         let mut callbacks = Vec::new();
         let result = def.and_then(|mut def| {
             let r =
-                callback::admit(&def.arena).and_then(|()| import(&mut def, &self.header, config));
+                admit(&mut def, slot).and_then(|()| import(&mut def, &self.header, config, slot));
             store = common_reads(&mut def, &mut counts);
             if let Some(an) = def.arena.lua.as_deref().and_then(|l| l.analysis.as_deref()) {
                 counts.expanded = an.expanded.get();
@@ -932,20 +950,28 @@ impl LuaHeader {
     /// The configured pass: the converted definition, holding the
     /// candidate's snapshots, its usage and the facts it read; on failure
     /// or a pending fact, the stop with the usage, the snapshots and the
-    /// facts read so far. A snapshot of another scene than the skin's
-    /// kind refuses before any Lua runs: every skin imported is a play
-    /// skin.
+    /// facts read so far. A snapshot of another scene than the header's
+    /// kind ([`ImportError::Slot`]), or of a kind no importer maps yet
+    /// ([`ImportError::NoImporter`]), refuses before the configured pass
+    /// runs, so no asset or configured-only include is read.
     pub(crate) fn configured(
         &self,
         config: &Config,
         facts: &ImportFacts,
         cancel: &Cancel,
     ) -> (Result<Definition, Stop>, Counts, Store, Vec<FactRead>) {
-        if facts.scene != Scene::Play {
-            let e = ImportError::Lua {
+        let refused = if facts.scene != self.header.kind {
+            Some(ImportError::Slot {
                 at: None,
-                why: LuaWhy::Scene,
-            };
+                slot: facts.scene,
+                found: self.header.kind,
+            })
+        } else if facts.scene != ScreenKind::Play {
+            Some(ImportError::NoImporter { kind: facts.scene })
+        } else {
+            None
+        };
+        if let Some(e) = refused {
             return (
                 Err(Stop::Fault(e)),
                 self.counts,

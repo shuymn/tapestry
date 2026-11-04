@@ -29,7 +29,7 @@ pub fn lua_play(
     config: &Config,
     cancel: &skin_beatoraja::Cancel,
 ) -> Result<skin_beatoraja::LuaImported, ImportError> {
-    let facts = skin_beatoraja::ImportFacts::unavailable(skin_beatoraja::Scene::Play);
+    let facts = skin_beatoraja::ImportFacts::unavailable(skin_model::ScreenKind::Play);
     match h.import(config, &facts, cancel)? {
         skin_beatoraja::LuaOutcome::Imported(i) => Ok(i),
         skin_beatoraja::LuaOutcome::Pending(p) => panic!("pending with no pending fact: {p:?}"),
@@ -276,7 +276,12 @@ pub fn hd(body: &str) -> String {
 /// Imports `s.json` of `root` with its header's defaults.
 pub fn import_dir(root: &Path) -> Result<Imported, ImportError> {
     let (mut def, h) = read_header(root, "s.json")?;
-    import(&mut def, &h, &Config::defaults(&h))
+    import(
+        &mut def,
+        &h,
+        &Config::defaults(&h),
+        skin_model::ScreenKind::Play,
+    )
 }
 
 /// Imports `s.json` of `root` with `edit` applied to the defaults.
@@ -284,7 +289,7 @@ pub fn import_with(root: &Path, edit: impl FnOnce(&mut Config)) -> Result<Import
     let (mut def, h) = read_header(root, "s.json")?;
     let mut config = Config::defaults(&h);
     edit(&mut config);
-    import(&mut def, &h, &config)
+    import(&mut def, &h, &config, skin_model::ScreenKind::Play)
 }
 
 /// A skin folder with `files` (name and size) as PNGs and `json` as

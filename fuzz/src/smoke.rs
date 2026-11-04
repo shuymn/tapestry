@@ -7,6 +7,7 @@ use std::path::Path;
 use replay::{DecodeError, DecodeLimits, Section};
 use rules::{CanonicalError, RuleError};
 use skin_beatoraja::{Header, ImportError, Imported, NoteKind, Rule, Syntax, Usage};
+use skin_model::ScreenKind;
 
 use crate::{
     RawSummary, SEEDED_BYTES, bms_load, draw, preset_canonical, raw_input, replay_body,
@@ -344,6 +345,9 @@ fn skin_json_seeds_resolve_or_fail_as_built() {
             "lenient",
             "cycle",
             "not_play",
+            "header_selection",
+            "header_decision",
+            "header_result",
             "size",
             "syntax",
             "missing",
@@ -469,7 +473,10 @@ fn skin_json_seeds_resolve_or_fail_as_built() {
             }
             continue;
         }
-        let result = skin_json(&data).map(|(h, _)| h);
+        let (result, imported) = match skin_json(&data) {
+            Ok((h, i)) => (Ok(h), Some(i)),
+            Err(e) => (Err(e), None),
+        };
         match name {
             "options" => {
                 let h = result.unwrap_or_else(|e| panic!("{name}: {e}"));
@@ -499,9 +506,29 @@ fn skin_json_seeds_resolve_or_fail_as_built() {
                 "{name}: {result:?}"
             ),
             "not_play" => assert!(
-                matches!(result, Err(ImportError::NotPlay7 { .. })),
+                matches!(
+                    result,
+                    Err(ImportError::UnsupportedKind {
+                        at: Some(_),
+                        ty: Some(1)
+                    })
+                ),
                 "{name}: {result:?}"
             ),
+            "header_selection" | "header_decision" | "header_result" => {
+                // Imported into its own slot, which has no importer yet.
+                let kind = match name {
+                    "header_selection" => ScreenKind::Selection,
+                    "header_decision" => ScreenKind::Decision,
+                    _ => ScreenKind::Result,
+                };
+                let h = result.unwrap_or_else(|e| panic!("{name}: {e}"));
+                assert_eq!(h.kind, kind, "{name}");
+                match imported {
+                    Some(Err(ImportError::NoImporter { kind: k })) => assert_eq!(k, kind, "{name}"),
+                    other => panic!("{name}: {:?}", other.map(|r| r.map(|i| i.report))),
+                }
+            }
             "size" => assert!(
                 matches!(result, Err(ImportError::Resolution { .. })),
                 "{name}: {result:?}"
@@ -1110,6 +1137,9 @@ fn skin_lua_seeds_import_or_fail_as_built() {
             "config_local",
             "syntax",
             "not_table",
+            "lua_selection",
+            "slot_scene",
+            "slot_retype",
         ],
     );
     let lua = |e: &ImportError| match e {
@@ -1155,6 +1185,35 @@ fn skin_lua_seeds_import_or_fail_as_built() {
                     _ => LuaWhy::HostWrite,
                 };
                 assert_eq!(lua(&e), Some(want), "{name}");
+            }
+            "lua_selection" | "slot_scene" | "slot_retype" => {
+                let (h, imported) = result.unwrap_or_else(|e| panic!("{name}: {e}"));
+                let e = imported_lua(imported).expect_err(name);
+                match (name, &e) {
+                    ("lua_selection", ImportError::NoImporter { kind }) => {
+                        assert_eq!(
+                            (h.kind, *kind),
+                            (ScreenKind::Selection, ScreenKind::Selection)
+                        );
+                    }
+                    (
+                        "slot_scene",
+                        ImportError::Slot {
+                            at: None,
+                            slot: ScreenKind::Result,
+                            found: ScreenKind::Play,
+                        },
+                    )
+                    | (
+                        "slot_retype",
+                        ImportError::Slot {
+                            at: Some(_),
+                            slot: ScreenKind::Play,
+                            found: ScreenKind::Result,
+                        },
+                    ) => {}
+                    _ => panic!("{name}: {e:?}"),
+                }
             }
             _ => {
                 let e = result.expect_err(name);

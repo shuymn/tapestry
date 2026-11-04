@@ -11,6 +11,7 @@ use std::rc::Rc;
 use super::{Cancel, LuaHeader, LuaLimit, LuaWhy, read_lua_header};
 use crate::error::ImportError;
 use crate::import::Config;
+use skin_model::ScreenKind;
 
 /// The configured pass of `h` with `config` on a play scene whose import
 /// facts are all unavailable, which never ends pending.
@@ -19,7 +20,7 @@ pub(crate) fn play(
     config: &Config,
     cancel: &Cancel,
 ) -> Result<super::LuaImported, ImportError> {
-    let facts = super::facts::ImportFacts::unavailable(super::facts::Scene::Play);
+    let facts = super::facts::ImportFacts::unavailable(skin_model::ScreenKind::Play);
     match h.import(config, &facts, cancel)? {
         super::LuaOutcome::Imported(i) => Ok(i),
         super::LuaOutcome::Pending(p) => panic!("pending with no pending fact: {p:?}"),
@@ -331,9 +332,9 @@ fn continued(
 
 #[test]
 fn no_skin_code_runs_after_a_fact_stop_inside_a_protected_call() {
-    use super::facts::{ChartRank, Fact, ImportFacts, Scene};
-    let unavailable = ImportFacts::unavailable(Scene::Play);
-    let base = ImportFacts::base(Scene::Play, Fact::Known(true));
+    use super::facts::{ChartRank, Fact, ImportFacts};
+    let unavailable = ImportFacts::unavailable(ScreenKind::Play);
+    let base = ImportFacts::base(ScreenKind::Play, Fact::Known(true));
     let known = ImportFacts {
         chart_rank: Fact::Known(Some(ChartRank::Rank(2))),
         ..base
@@ -358,5 +359,74 @@ fn no_skin_code_runs_after_a_fact_stop_inside_a_protected_call() {
             }
             assert_eq!(n, 0, "{wrap}");
         }
+    }
+}
+
+/// A Lua skin of type `ty` whose configured pass draws a critical EX
+/// score number from a missing file.
+fn kind_skin(ty: i32) -> tempfile::TempDir {
+    folder(&format!(
+        "local skin = {{ type = {ty}, w = 1920, h = 1080 }}\n\
+         if not skin_config then return skin end\n\
+         skin.source = {{ {{ id = \"gone\", path = \"gone.png\" }} }}\n\
+         skin.value = {{ {{ id = \"ex\", src = \"gone\", w = 10, h = 1, divx = 10, digit = 4, ref = 71 }} }}\n\
+         skin.destination = {{ {{ id = \"ex\", dst = {{ {{ w = 1, h = 1 }} }} }} }}\n\
+         return skin\n"
+    ))
+}
+
+/// Both passes of [`kind_skin`]`(ty)` on scene `scene`: the result, the
+/// passes run and the asset admissions made.
+fn kind_import(ty: i32, scene: ScreenKind) -> (Result<super::LuaOutcome, ImportError>, usize, u32) {
+    let d = kind_skin(ty);
+    PASSES.with(|n| n.set(0));
+    crate::import::asset::ADMITS.with(|n| n.set(0));
+    let cancel = Cancel::new();
+    let h = header(d.path(), &cancel).unwrap();
+    let facts = super::facts::ImportFacts::unavailable(scene);
+    let r = h.import(&Config::defaults(h.header()), &facts, &cancel);
+    (
+        r,
+        PASSES.with(Cell::get),
+        crate::import::asset::ADMITS.with(Cell::get),
+    )
+}
+
+#[test]
+fn a_lua_skin_in_another_slot_refuses_before_the_configured_pass() {
+    use ScreenKind::{Play, Result, Selection};
+    for (ty, scene, found) in [(5, Play, Selection), (0, Result, Play)] {
+        let (r, passes, admits) = kind_import(ty, scene);
+        match r {
+            Err(ImportError::Slot {
+                at: None,
+                slot,
+                found: f,
+            }) => assert_eq!((slot, f), (scene, found)),
+            other => panic!("{ty}: {other:?}"),
+        }
+        assert_eq!((passes, admits), (1, 0), "{ty}");
+    }
+    // The control: in its own slot the configured pass runs and the
+    // import reaches its critical number's missing file.
+    let (r, passes, admits) = kind_import(0, Play);
+    assert!(matches!(r, Err(ImportError::Asset { .. })), "{r:?}");
+    assert_eq!(passes, 2);
+    assert!(admits >= 1);
+}
+
+#[test]
+fn a_lua_kind_with_no_importer_refuses_before_the_configured_pass() {
+    for (ty, kind) in [
+        (5, ScreenKind::Selection),
+        (6, ScreenKind::Decision),
+        (7, ScreenKind::Result),
+    ] {
+        let (r, passes, admits) = kind_import(ty, kind);
+        match r {
+            Err(ImportError::NoImporter { kind: k }) => assert_eq!(k, kind),
+            other => panic!("{ty}: {other:?}"),
+        }
+        assert_eq!((passes, admits), (1, 0), "{ty}");
     }
 }

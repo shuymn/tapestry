@@ -124,7 +124,13 @@ fn measure_prepared(
 ) -> i64 {
     let ((def, header, imported, prepared), p) = peak(|| {
         let (mut def, header) = read_header(root, "s.json").unwrap();
-        let imported = import(&mut def, &header, &Config::defaults(&header)).unwrap();
+        let imported = import(
+            &mut def,
+            &header,
+            &Config::defaults(&header),
+            skin_model::ScreenKind::Play,
+        )
+        .unwrap();
         let prepared = common::play::prepared(&imported.skin, chart);
         (def, header, imported, prepared)
     });
@@ -137,7 +143,13 @@ fn measure_prepared(
 /// What importing `s.json` of `root` stops at.
 fn refused(root: &Path) -> ImportError {
     let (mut def, header) = read_header(root, "s.json").unwrap();
-    import(&mut def, &header, &Config::defaults(&header)).unwrap_err()
+    import(
+        &mut def,
+        &header,
+        &Config::defaults(&header),
+        skin_model::ScreenKind::Play,
+    )
+    .unwrap_err()
 }
 
 fn as_u32(n: usize) -> u32 {
@@ -1157,7 +1169,13 @@ fn f10_refuses_past_its_caps() {
             },
             None => {
                 let (mut def, header) = read_header(d.path(), "s.json").unwrap();
-                let i = import(&mut def, &header, &Config::defaults(&header)).unwrap();
+                let i = import(
+                    &mut def,
+                    &header,
+                    &Config::defaults(&header),
+                    skin_model::ScreenKind::Play,
+                )
+                .unwrap();
                 assert_eq!(i.report.usage.keys, 65_533);
             }
         }
@@ -1398,7 +1416,8 @@ const EMPTY_TABLES: usize = MAX_NODES / 2 - 1_000;
 fn import_peak(root: &Path) -> i64 {
     let (mut def, header) = read_header(root, "s.json").unwrap();
     let config = Config::defaults(&header);
-    let (imported, p) = peak(|| import(&mut def, &header, &config).unwrap());
+    let (imported, p) =
+        peak(|| import(&mut def, &header, &config, skin_model::ScreenKind::Play).unwrap());
     assert_eq!(imported.report.usage.note_fallbacks, 48);
     p
 }

@@ -417,7 +417,7 @@ fn option_tables_are_interned_once_a_pass() {
     let d = folder(&options_entry(600, 6_000, 100, true));
     let cancel = Cancel::new();
     let h = read_lua_header(d.path(), "s.luaskin", &cancel).unwrap();
-    let facts = super::facts::ImportFacts::unavailable(super::facts::Scene::Play);
+    let facts = super::facts::ImportFacts::unavailable(skin_model::ScreenKind::Play);
     let (def, _, _, _) = h.configured(&Config::defaults(h.header()), &facts, &cancel);
     let def = def.unwrap();
     let an = def
@@ -791,9 +791,10 @@ fn with_facts(entry: &str, facts: &super::facts::ImportFacts) -> (Captures, Lowe
 
 /// A play snapshot with every fact known.
 fn known() -> super::facts::ImportFacts {
-    use super::facts::{ChartRank, Fact, ImportFacts, Scene};
+    use super::facts::{ChartRank, Fact, ImportFacts};
+    use skin_model::ScreenKind;
     ImportFacts {
-        scene: Scene::Play,
+        scene: ScreenKind::Play,
         autoplay: Fact::Known(true),
         chart_rank: Fact::Known(Some(ChartRank::Rank(2))),
     }
@@ -836,7 +837,7 @@ fn a_callback_keeps_the_option_host_and_lowers_a_supported_option() {
 fn a_callback_s_fact_read_is_not_folded() {
     let entry = skin("", &image("function() return ms.option(33) end"));
     let unmapped = super::Disposition::Replaced(Unsupported::Unmapped { api: 0, id: 33 });
-    let unavailable = super::facts::ImportFacts::unavailable(super::facts::Scene::Play);
+    let unavailable = super::facts::ImportFacts::unavailable(skin_model::ScreenKind::Play);
     for facts in [unavailable, known()] {
         let (_, r) = with_facts(&entry, &facts);
         let (callbacks, sources) = r.unwrap();
