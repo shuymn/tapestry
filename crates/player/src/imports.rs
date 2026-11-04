@@ -227,8 +227,7 @@ pub const fn name(kind: ScreenKind) -> &'static str {
 ///    header; an unknown name refuses.
 /// 4. The import, Lua against the base facts; a kind with no importer
 ///    keeps its built-in screen, and a Lua play skin reading a chart fact
-///    ends pending, built for each attempt ([`specialize`]); another kind
-///    reading one refuses.
+///    ends pending, built for each attempt ([`specialize`]).
 /// 5. The pack ([`pack`]).
 pub fn build(
     kind: ScreenKind,
@@ -334,6 +333,8 @@ fn built(
                         dependencies: p.dependencies,
                         usage: p.usage,
                     };
+                    // Only play's configured pass runs: another kind
+                    // has no importer yet, so it never gets here.
                     if kind != ScreenKind::Play {
                         return Err(note.refusal());
                     }
