@@ -112,16 +112,13 @@ impl Objects {
         tables: &Tables,
         id: &str,
     ) -> Result<bool, ImportError> {
-        let mut found = 0;
-        for (slot, &(name, _)) in self.maps.iter_mut().zip(&ORDER) {
-            if slot.is_none() {
-                *slot = Some(index(def, records(tables, name), false)?);
-            }
-            if slot.as_ref().is_some_and(|m| m.contains_key(id)) {
-                found += 1;
-                if found > 1 {
+        let mut found = false;
+        for &(_, object) in &ORDER {
+            if self.names(def, tables, id, object)? {
+                if found {
                     return Ok(true);
                 }
+                found = true;
             }
         }
         Ok(false)
