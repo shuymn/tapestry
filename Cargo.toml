@@ -82,8 +82,9 @@ wgpu = { version = "30.0.1", default-features = false, features = ["std", "parki
 wgpu-hal = { version = "30.0.1", features = ["dx12"] }
 # Menu text: `cosmic-text` layout (re-exported) and its glyph atlas on wgpu 30.
 glyphon = "0.12.0"
-# render: play text outlines and their rasterizer, the versions cosmic-text
-# 0.19 itself uses, and the face checks at installation.
+# render: swash, the outline scaler and rasterizer at the version cosmic-text
+# 0.19 uses; skrifa, for the face checks at installation and variable metrics,
+# kept at the version swash itself uses so both parse fonts alike.
 skrifa = "0.44.0"
 swash = "0.2.10"
 unicode-script = "0.5.8"
