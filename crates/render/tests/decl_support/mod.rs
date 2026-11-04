@@ -24,8 +24,9 @@ use skin_model::{
     CoverPaintDef, CoverSettings, CoverTrim, Ease, ElementDef, End, FileDef, Filter, Fit, Follow,
     FontRef, FrameReadouts, FrameUv, Gain, GaugeDef, GaugeLook, GaugeParts, ImageDef, KeyDef,
     LaneParts, LaneStyle, LaneView, LanesDef, Layout, Motion, Overflow, PLAY, Place, Region,
-    RegionDef, Scope, Sheet, Side, Skin, SkinDef, Source, SourceLanes, TextDef, TextField,
-    TextImage, TextTable, TextValue, TimerRef, Track, Ty, Variant, WidgetDefs, compile,
+    RegionDef, Root, Scope, Sheet, SheetBuilder, Side, Skin, SkinDef, SolidImageDef, Source,
+    SourceLanes, TextDef, TextField, TextImage, TextTable, TextValue, TimerRef, Track, Ty, Variant,
+    WidgetDefs, compile,
 };
 
 /// A track holding canvas `rect` from 0.
@@ -352,6 +353,11 @@ pub fn skin(dir: &Path, look: &Look) -> Skin {
         images,
     )
     .unwrap();
+    skin_of(sheet, look)
+}
+
+/// The compiled skin of `look` drawing image 0 of `sheet`.
+fn skin_of(sheet: Sheet, look: &Look) -> Skin {
     let clipped = look.clip.is_some();
     let [x, y, ..] = look.rect;
     let mut elements = vec![image(look.rect, clipped)];
@@ -569,6 +575,26 @@ pub fn skin(dir: &Path, look: &Look) -> Skin {
         close: None,
     })
     .unwrap()
+}
+
+/// A bundle of `look` for `r`'s device whose image is generated, no file
+/// read: one `size` cell of `look.rgba`, the whole of image 0. The
+/// atlas's page side is the least that holds the cell with its gutter.
+pub fn solid_bundle(r: &Renderer, look: &Look, size: [u32; 2]) -> Arc<SkinBundle> {
+    let dir = tempfile::tempdir().unwrap();
+    let mut b = SheetBuilder::new(&Root::new(dir.path()).unwrap());
+    b.add_solid_image(SolidImageDef {
+        size,
+        color: look.rgba,
+        filter: Filter::Nearest,
+    })
+    .unwrap();
+    let skin = skin_of(b.finish(), look);
+    let atlas = skin
+        .atlas(Variant::Lo, r.atlas_limits(), &|| false)
+        .unwrap();
+    let clips = ClipTable::new(look.clip.into_iter().collect()).unwrap();
+    Arc::new(SkinBundle::new(Arc::new(skin), atlas, clips, Side::Left).unwrap())
 }
 
 /// A bundle of `look` for `r`'s device, its image in `dir`, with its text
