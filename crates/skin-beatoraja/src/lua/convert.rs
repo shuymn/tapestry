@@ -37,13 +37,17 @@
 //! In the configured pass, each root skin closure is looked up
 //! by its tag ([`super::instrument`]) and its captures are copied
 //! ([`super::callback`]): its reader is called (the sandbox's generated
-//! code, which only reads its bindings) and each value kept as an owned
-//! integer, boolean, host function or module by identity, another
-//! closure instance (whose captures are copied in turn), or the `_ENV` it
-//! reads globals through, inspected raw: whether its `skin_config` is the
-//! pass's own table, no metatable on the way, and the integer entries of
-//! `skin_config.option`. Each instance, value and entry is charged before
-//! it is kept ([`MAX_CAPTURES`]).
+//! code, which only reads its bindings) and each value kept as owned data:
+//! a scalar, a string interned (its bytes hashed as analysis work and
+//! kept against [`MAX_DECODED_BYTES`] once), a host function, a host
+//! module or a library function by identity, another closure instance
+//! (whose captures are copied in turn), or a table by identity with
+//! whether it has a metatable, whether it is the pass's own
+//! `skin_config` recorded. Then the entries on the function's static
+//! access paths are read raw and kept the same way, each step one unit
+//! of analysis work: no other entry of a table is read. Each instance,
+//! value, table and entry is charged before it is kept
+//! ([`MAX_CAPTURES`]).
 //!
 //! The converted structure takes the parsed definition's bounds, each
 //! checked before the value is added: [`MAX_DEPTH`], [`MAX_NODES`] (a
@@ -57,9 +61,10 @@ use std::rc::Rc;
 use mlua::{Function, Lua, Table, Value};
 use skin_model::FileId;
 
-use super::callback::{self, Analysis, Captured, EnvCapture, Instance};
+use super::callback::{self, Analysis, Captured, Instance};
 use super::limits::MAX_CAPTURES;
 use super::schema::{Pos, ROOT_SCHEMA};
+use super::syntax::Ast;
 use super::{LuaLimit, LuaWhy, Pass};
 use crate::error::{ImportError, InputLimit, Loc};
 use crate::limits::{MAX_DECODED_BYTES, MAX_DEPTH, MAX_NODES, MAX_STRING_BYTES};
@@ -71,6 +76,9 @@ use crate::tree::{
 struct Tags {
     ids: Table,
     readers: Table,
+    /// The sandbox's library functions, to their index in
+    /// [`super::sandbox::LIBS`].
+    libs: Table,
     /// The host module proxies: address, module, unchanged.
     proxies: Vec<(usize, u8, bool)>,
     config: Option<Table>,
@@ -170,6 +178,7 @@ pub(super) fn convert(
             Ok(Tags {
                 ids: lua.named_registry_value(super::sandbox::TAG_IDS)?,
                 readers: lua.named_registry_value(super::sandbox::TAG_READERS)?,
+                libs: lua.named_registry_value(super::sandbox::LIB_IDS)?,
                 proxies: super::host::proxies(lua)?,
                 config,
             })
@@ -189,8 +198,7 @@ pub(super) fn convert(
         tags,
         instance_of: HashMap::new(),
         pending: Vec::new(),
-        env_of: HashMap::new(),
-        option_set_of: HashMap::new(),
+        table_of: HashMap::new(),
         shapes: HashMap::new(),
         module_index: (0_u16..)
             .zip(&modules)
@@ -278,10 +286,8 @@ struct Conv<'a> {
     /// captures are still to copy.
     instance_of: HashMap<usize, u32>,
     pending: Vec<(u32, Function)>,
-    /// `_ENV` captures by the table's address.
-    env_of: HashMap<usize, u32>,
-    /// Option tables read, by address.
-    option_set_of: HashMap<usize, u32>,
+    /// Captured tables, by address.
+    table_of: HashMap<usize, u32>,
     /// Tables enumerated, by address.
     shapes: HashMap<usize, (Shape, Summary)>,
     /// The loaded modules' indices, by name: a callable's provenance is
@@ -626,27 +632,24 @@ impl Conv<'_> {
             };
             // The reader is generated code that returns its bindings:
             // reading a binding runs no metamethod.
-            let values = reader
+            let values: Vec<Value> = reader
                 .call::<mlua::MultiValue>(())
-                .map_err(|e| self.mlua(&e))?;
+                .map_err(|e| self.mlua(&e))?
+                .into_iter()
+                .collect();
             let Some(inst) = self.analysis.instances.get(i as usize).copied() else {
                 continue;
             };
-            let ups: Vec<(u32, bool)> = {
-                let files = self.pass.files.borrow();
-                let Some(ast) = files.get(usize::from(inst.file)).map(|f| &f.ast) else {
-                    continue;
-                };
-                let Some(func) = ast.func(inst.func) else {
-                    continue;
-                };
-                ast.list(func.upvalues)
-                    .iter()
-                    .map(|&u| (u, callback::is_env(ast, u)))
-                    .collect()
+            let pass = self.pass;
+            let files = pass.files.borrow();
+            let Some(ast) = files.get(usize::from(inst.file)).map(|f| &f.ast) else {
+                continue;
+            };
+            let Some(func) = ast.func(inst.func) else {
+                continue;
             };
             // Each binding's position, hashed once a function.
-            for (k, &(up, _)) in (0_u32..).zip(&ups) {
+            for (k, &up) in (0_u32..).zip(ast.list(func.upvalues)) {
                 self.analysis
                     .slots
                     .entry((inst.file, inst.func, up))
@@ -655,31 +658,111 @@ impl Conv<'_> {
             let start = u32::try_from(self.analysis.captured.len())
                 .map_err(|_| self.lua(LuaWhy::Limit(LuaLimit::Captures)))?;
             let mut n = 0_u32;
-            for (k, v) in values.into_iter().enumerate() {
+            for v in &values {
                 self.charge()?;
-                let env = ups.get(k).is_some_and(|&(_, env)| env);
-                let c = self.captured(v, env)?;
+                let c = self.captured(v)?;
                 self.analysis.captured.push(c);
                 n += 1;
             }
             if let Some(x) = self.analysis.instances.get_mut(i as usize) {
                 x.values = Some((start, n));
             }
+            self.paths(ast, inst, &values)?;
         }
         Ok(())
     }
 
-    /// One captured value, `env` when its binding is an `_ENV`.
-    fn captured(&mut self, v: Value, env: bool) -> Result<Captured, ImportError> {
+    /// Copies the entries on instance `inst`'s static access paths
+    /// ([`super::syntax::Path`]), from its reader's `values`: each step one
+    /// unit of analysis work and its key hashed, each entry not yet copied
+    /// charged as a capture before it is read raw and kept. A step from
+    /// anything but a captured table (a host module's proxy, a string, an
+    /// unknown value) copies nothing, and nor do the steps after it.
+    fn paths(&mut self, ast: &Ast, inst: Instance, values: &[Value]) -> Result<(), ImportError> {
+        let Some(func) = ast.func(inst.func) else {
+            return Ok(());
+        };
+        let paths = ast.paths(func);
+        // Each step's table, when it reads one: at most the function's
+        // paths, each charged as a tree node.
+        let mut at: Vec<Option<(Table, u32)>> = Vec::with_capacity(paths.len());
+        for p in paths {
+            self.analysis.charge(1).map_err(|w| self.fatal(w))?;
+            let from = if p.parent == super::syntax::NONE {
+                let k = self
+                    .analysis
+                    .slots
+                    .get(&(inst.file, inst.func, p.root))
+                    .copied();
+                match k.and_then(|k| values.get(k as usize)) {
+                    Some(Value::Table(t)) => self
+                        .table_of
+                        .get(&t.to_pointer().addr())
+                        .map(|&id| (t.clone(), id)),
+                    _ => None,
+                }
+            } else {
+                at.get(p.parent as usize).cloned().flatten()
+            };
+            let Some((t, id)) = from else {
+                at.push(None);
+                continue;
+            };
+            let key = ast.str(p.key);
+            let k = self.intern(key)?;
+            let v: Value = t
+                .raw_get(mlua::BString::from(key))
+                .map_err(|e| self.mlua(&e))?;
+            let known = self
+                .analysis
+                .tables
+                .get(id as usize)
+                .and_then(|m| m.get(&k))
+                .copied();
+            let c = match known {
+                Some(c) => c,
+                None => {
+                    self.charge()?;
+                    let c = self.captured(&v)?;
+                    if let Some(m) = self.analysis.tables.get_mut(id as usize) {
+                        m.insert(k, c);
+                    }
+                    c
+                }
+            };
+            at.push(match (c, v) {
+                (Captured::Table { id, .. }, Value::Table(t)) => Some((t, id)),
+                _ => None,
+            });
+        }
+        Ok(())
+    }
+
+    /// One captured value: a scalar, a string interned, a host function,
+    /// a library function or a host module by identity, a tagged closure's
+    /// instance, or a table by identity with whether it has a metatable
+    /// (its entries copied only along static access paths).
+    fn captured(&mut self, v: &Value) -> Result<Captured, ImportError> {
         Ok(match v {
             Value::Nil => Captured::Nil,
-            Value::Boolean(b) => Captured::Bool(b),
-            Value::Integer(i) => Captured::Int(i),
+            Value::Boolean(b) => Captured::Bool(*b),
+            Value::Integer(i) => Captured::Int(*i),
+            Value::Number(x) => Captured::Float(x.to_bits()),
+            Value::String(s) => {
+                let s = s.as_bytes();
+                if s.len() > MAX_STRING_BYTES {
+                    Captured::Other
+                } else {
+                    Captured::Str(self.intern(&s)?)
+                }
+            }
             Value::Function(g) => {
                 if let Some(api) = self.pass.host_api_of(g.to_pointer().addr()) {
                     Captured::Host(api)
+                } else if let Some(lib) = self.lib(g)? {
+                    Captured::Lib(lib)
                 } else {
-                    match self.tagged(&g)? {
+                    match self.tagged(g)? {
                         Some(j) => Captured::Closure(j),
                         None => Captured::Other,
                     }
@@ -694,96 +777,62 @@ impl Conv<'_> {
                 match proxy {
                     Some((_, m, true)) => Captured::Module(m),
                     Some(_) => Captured::Other,
-                    None if env => Captured::Env(self.env(&t)?),
-                    None => Captured::Other,
+                    None => Captured::Table {
+                        id: self.table_id(t)?,
+                        meta: t.metatable().is_some(),
+                    },
                 }
             }
             _ => Captured::Other,
         })
     }
 
-    /// The capture of `_ENV` table `t`, inspected raw once.
-    fn env(&mut self, t: &Table) -> Result<u32, ImportError> {
-        let addr = t.to_pointer().addr();
-        if let Some(&i) = self.env_of.get(&addr) {
-            return Ok(i);
+    /// Library function `g`'s index in [`super::sandbox::LIBS`], when it is
+    /// the sandbox's own: one raw read of the registry's table.
+    fn lib(&self, g: &Function) -> Result<Option<u16>, ImportError> {
+        let Some(tags) = &self.tags else {
+            return Ok(None);
+        };
+        match tags.libs.raw_get::<Value>(g.clone()) {
+            Ok(Value::Integer(i)) => Ok(u16::try_from(i).ok()),
+            Ok(_) => Ok(None),
+            Err(e) => Err(self.mlua(&e)),
         }
-        let mut cap = EnvCapture::default();
-        let config = self.tags.as_ref().and_then(|tags| tags.config.clone());
-        let option = (|| {
-            if t.metatable().is_some() {
-                return Err("_ENV's metatable");
-            }
-            let Ok(Value::Table(sc)) = t.raw_get::<Value>("skin_config") else {
-                return Err("skin_config");
-            };
-            if config.is_none_or(|c| c.to_pointer() != sc.to_pointer()) {
-                return Err("skin_config");
-            }
-            if sc.metatable().is_some() {
-                return Err("skin_config's metatable");
-            }
-            let Ok(Value::Table(option)) = sc.raw_get::<Value>("option") else {
-                return Err("skin_config.option");
-            };
-            if option.metatable().is_some() {
-                return Err("skin_config.option's metatable");
-            }
-            Ok(option)
-        })();
-        match option {
-            Err(why) => cap.unproven = Some(why),
-            Ok(option) => cap.options = self.option_set(&option)?,
-        }
-        self.charge()?;
-        let i = u32::try_from(self.analysis.envs.len())
-            .map_err(|_| self.lua(LuaWhy::Limit(LuaLimit::Captures)))?;
-        self.analysis.envs.push(cap);
-        self.env_of.insert(addr, i);
-        Ok(i)
     }
 
-    /// The integer entries of option table `t`, read once a pass by its
-    /// address: each name hashed (its bytes charged as analysis work) and
-    /// interned once (its bytes charged as decoded bytes), the entries
-    /// kept by name id.
-    fn option_set(&mut self, t: &Table) -> Result<u32, ImportError> {
+    /// Table `t`'s index among the captured tables, found by its address
+    /// or added (charged as a capture first) with no entry copied.
+    fn table_id(&mut self, t: &Table) -> Result<u32, ImportError> {
         let addr = t.to_pointer().addr();
-        if let Some(&i) = self.option_set_of.get(&addr) {
-            return Ok(i);
+        if let Some(&id) = self.table_of.get(&addr) {
+            return Ok(id);
         }
-        let mut set = HashMap::new();
-        for (seen, pair) in t.pairs::<Value, Value>().enumerate() {
-            self.poll(seen)?;
-            // Every entry is charged, whatever it holds.
-            self.charge()?;
-            let (k, v) = pair.map_err(|e| self.mlua(&e))?;
-            let (Value::String(k), Value::Integer(v)) = (k, v) else {
-                continue;
-            };
-            let k = k.as_bytes();
-            if k.len() > MAX_STRING_BYTES {
-                continue;
-            }
-            let len = u64::try_from(k.len()).unwrap_or(u64::MAX);
-            self.analysis.charge(len).map_err(|w| self.fatal(w))?;
-            let id = match self.analysis.option_names.get(&*k) {
-                Some(&id) => id,
-                None => {
-                    self.retain(len)?;
-                    let id = u32::try_from(self.analysis.option_names.len())
-                        .map_err(|_| self.lua(LuaWhy::Limit(LuaLimit::Captures)))?;
-                    self.analysis.option_names.insert(Box::from(&*k), id);
-                    id
-                }
-            };
-            set.insert(id, v);
-        }
-        let i = u32::try_from(self.analysis.option_sets.len())
+        self.charge()?;
+        let id = u32::try_from(self.analysis.tables.len())
             .map_err(|_| self.lua(LuaWhy::Limit(LuaLimit::Captures)))?;
-        self.analysis.option_sets.push(set);
-        self.option_set_of.insert(addr, i);
-        Ok(i)
+        self.analysis.tables.push(HashMap::new());
+        self.table_of.insert(addr, id);
+        let config = self.tags.as_ref().and_then(|tags| tags.config.as_ref());
+        if config.is_some_and(|c| c.to_pointer() == t.to_pointer()) {
+            self.analysis.config = Some(id);
+        }
+        Ok(id)
+    }
+
+    /// String `s`'s id among the pass's interned names: one hash, its
+    /// bytes charged as analysis work first; a new one kept, its bytes
+    /// charged against the retained bytes before it is copied.
+    fn intern(&mut self, s: &[u8]) -> Result<u32, ImportError> {
+        let len = u64::try_from(s.len()).unwrap_or(u64::MAX);
+        self.analysis.charge(len).map_err(|w| self.fatal(w))?;
+        if let Some(&id) = self.analysis.names.get(s) {
+            return Ok(id);
+        }
+        self.retain(len)?;
+        let id = u32::try_from(self.analysis.names.len())
+            .map_err(|_| self.lua(LuaWhy::Limit(LuaLimit::Captures)))?;
+        self.analysis.names.insert(Box::from(s), id);
+        Ok(id)
     }
 
     /// `len` bytes the conversion keeps beside the arena (an enumerated

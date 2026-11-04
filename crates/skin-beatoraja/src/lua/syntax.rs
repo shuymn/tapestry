@@ -7,14 +7,19 @@
 //! matching source text.
 //!
 //! Every name is resolved where it is read: to a local declaration (a
-//! `local`, a parameter, `self`, a loop variable), or to a global, read
+//! `local`, a parameter, `self`, a loop variable), to the chunk's own
+//! `_ENV` cell for a bare `_ENV` no local shadows, or to a global, read
 //! through the `_ENV` in scope. A declaration counts the assignments to
 //! it after its own. A function lists the declarations of enclosing
 //! functions it reads directly, its upvalues, `_ENV` among them when it
-//! reads a global.
+//! reads a global, and its static access paths: each chain of indexes by
+//! constant strings from one of its upvalues or a global, the entries its
+//! captures copy. Every statement keeps its parts, and a float numeral
+//! its value.
 //!
 //! Bounds, each charged before its work: [`MAX_AST_NODES`] nodes
-//! (expressions, statements, declarations, functions and list entries)
+//! (expressions, statements, declarations, functions, path steps and list
+//! entries)
 //! across a candidate's files, and [`MAX_AST_DEPTH`] levels of statements
 //! and subexpressions, checked before recursing, as Lua's own parser
 //! counts them (`LUAI_MAXCCALLS`); cancellation is seen every
@@ -92,13 +97,14 @@ pub(crate) enum Expr {
     Vararg,
     /// An integer numeral.
     Int(i64),
-    /// A float numeral (its value is never needed).
-    Float,
+    /// A float numeral, by its value's bits.
+    Float(u64),
     /// A string literal, by its index in [`Ast::strs`].
     Str(u32),
     /// A function constructor, by its index in [`Ast::funcs`].
     Func(u32),
-    /// A local declaration's value.
+    /// A local declaration's value, or [`CHUNK_ENV`] for a bare `_ENV`
+    /// no local `_ENV` shadows: the chunk's own `_ENV` cell.
     Local(u32),
     /// A global, by its name's index in [`Ast::strs`], read through `env`:
     /// a declaration named `_ENV`, or [`CHUNK_ENV`].
@@ -127,20 +133,103 @@ pub(crate) enum Expr {
     Table(List),
 }
 
-/// A statement. Those the callbacks never take keep only what binding
-/// needs: their construct's name.
+/// A statement, with its parts: a block is a list of statements.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Stmt {
     /// `local` names (declarations) `=` expressions.
-    Local { names: List, exprs: List },
+    Local {
+        names: List,
+        exprs: List,
+    },
     /// `return` expressions.
     Return(List),
     /// `;`.
     Empty,
-    /// Any other statement, by its construct's name: a function
-    /// statement, a call statement, an assignment, `do`, `while`,
-    /// `repeat`, `if`, `for`, `goto`, a label or `break`.
-    Other(&'static str),
+    /// Targets (each a local, a global or an index) `=` expressions.
+    Assign {
+        targets: List,
+        exprs: List,
+    },
+    /// A call statement: its call or method call expression.
+    Call(u32),
+    /// `if`: three ids an arm, its condition and its block's list (start,
+    /// length), the `else` arm's condition [`NONE`].
+    If(List),
+    While {
+        cond: u32,
+        body: List,
+    },
+    Repeat {
+        body: List,
+        cond: u32,
+    },
+    /// A numeric `for`: its variable's declaration and its bounds, the
+    /// step [`NONE`] when absent.
+    NumericFor {
+        var: u32,
+        start: u32,
+        limit: u32,
+        step: u32,
+        body: List,
+    },
+    /// A generic `for`: its variables' declarations and its expressions.
+    GenericFor {
+        names: List,
+        exprs: List,
+        body: List,
+    },
+    Do(List),
+    /// `local function`: its declaration and its function.
+    LocalFunction {
+        decl: u32,
+        func: u32,
+    },
+    /// A function statement: its target (a local, a global or an index)
+    /// and its function.
+    Function {
+        target: u32,
+        func: u32,
+    },
+    Break,
+    /// `goto` and a label, by their name's index in [`Ast::strs`].
+    Goto(u32),
+    Label(u32),
+}
+
+impl Stmt {
+    /// The construct's name, as a refusal names it.
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Local { .. } => "local",
+            Self::Return(_) => "return",
+            Self::Empty => ";",
+            Self::Assign { .. } => "assignment",
+            Self::Call(_) => "call statement",
+            Self::If(_) => "if",
+            Self::While { .. } => "while",
+            Self::Repeat { .. } => "repeat",
+            Self::NumericFor { .. } => "numeric for",
+            Self::GenericFor { .. } => "generic for",
+            Self::Do(_) => "do",
+            Self::LocalFunction { .. } | Self::Function { .. } => "function",
+            Self::Break => "break",
+            Self::Goto(_) => "goto",
+            Self::Label(_) => "label",
+        }
+    }
+}
+
+/// One step of a static access path: the constant string `key` (an index
+/// of [`Ast::strs`]) read from the value of step `parent` (an index among
+/// its function's paths) or, for a first step (`parent` [`NONE`]), from
+/// binding `root`, an upvalue of the function: an enclosing function's
+/// declaration or [`CHUNK_ENV`]. A global read is a first step from the
+/// `_ENV` it is read through.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Path {
+    pub(crate) parent: u32,
+    pub(crate) root: u32,
+    pub(crate) key: u32,
 }
 
 /// What declared a local.
@@ -210,6 +299,9 @@ pub(crate) struct Func {
     pub(crate) upvalues: List,
     /// More upvalues than [`MAX_READER`]: it has no reader.
     pub(crate) unread: bool,
+    /// Its static access paths, a span of [`Ast::paths`] (start, length),
+    /// each step after its parent: the entries its captures copy.
+    pub(crate) paths: (u32, u32),
 }
 
 /// One file's tree.
@@ -222,6 +314,8 @@ pub(crate) struct Ast {
     pub(crate) decls: Vec<Decl>,
     pub(crate) funcs: Vec<Func>,
     pub(crate) lists: Vec<u32>,
+    /// Every function's static access paths, each function's together.
+    pub(crate) paths: Vec<Path>,
     /// String literals and field names: spans of [`Self::bytes`].
     pub(crate) strs: Vec<(u32, u32)>,
     pub(crate) bytes: Vec<u8>,
@@ -264,6 +358,12 @@ impl Ast {
         self.funcs.get(id as usize)
     }
 
+    /// Function `f`'s static access paths.
+    pub(crate) fn paths(&self, f: &Func) -> &[Path] {
+        let (s, n) = (f.paths.0 as usize, f.paths.1 as usize);
+        self.paths.get(s..s + n).unwrap_or_default()
+    }
+
     /// The bytes of string `id`.
     pub(crate) fn str(&self, id: u32) -> &[u8] {
         self.strs
@@ -290,7 +390,8 @@ enum Tok {
     Eof,
     Name,
     Int(i64),
-    Float,
+    /// A float numeral, by its value's bits.
+    Float(u64),
     Str(u32),
     // Keywords.
     And,
@@ -825,7 +926,8 @@ fn utf8(v: u32, out: &mut Vec<u8>) {
 /// A numeral's token, as `luaO_str2num` reads it: an integer when it has
 /// only decimal digits that fit (an overflowing one is a float) or is
 /// hexadecimal without a point or an exponent (wrapping), else a float
-/// when it reads as one; `None` when it is malformed.
+/// when it reads as one, its value rounded to nearest as `strtod` rounds
+/// it; `None` when it is malformed.
 fn number(text: &[u8], tick: &mut dyn FnMut() -> Result<(), Fail>) -> Result<Option<Tok>, Fail> {
     // Each byte visited once per scan, each visit a tick.
     let mut all = |t: &[u8], f: fn(&u8) -> bool| -> Result<bool, Fail> {
@@ -849,7 +951,10 @@ fn number(text: &[u8], tick: &mut dyn FnMut() -> Result<(), Fail>) -> Result<Opt
             }
             return Ok(Some(Tok::Int(v.cast_signed())));
         }
-        return Ok(float(digits, true, tick)?.then_some(Tok::Float));
+        if !float(digits, true, tick)? {
+            return Ok(None);
+        }
+        return Ok(Some(Tok::Float(hex_float(digits, tick)?)));
     }
     if !text.is_empty() && all(text, u8::is_ascii_digit)? {
         let mut v: i64 = 0;
@@ -860,12 +965,117 @@ fn number(text: &[u8], tick: &mut dyn FnMut() -> Result<(), Fail>) -> Result<Opt
                 .and_then(|v| v.checked_add(i64::from(d - b'0')))
             {
                 Some(n) => v = n,
-                None => return Ok(Some(Tok::Float)),
+                None => return Ok(Some(Tok::Float(decimal_float(text)))),
             }
         }
         return Ok(Some(Tok::Int(v)));
     }
-    Ok(float(text, false, tick)?.then_some(Tok::Float))
+    Ok(float(text, false, tick)?.then(|| Tok::Float(decimal_float(text))))
+}
+
+/// The bits of decimal float numeral `t`, already checked: Rust's reading
+/// rounds to nearest, as `strtod` does.
+fn decimal_float(t: &[u8]) -> u64 {
+    std::str::from_utf8(t)
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(0.0)
+        .to_bits()
+}
+
+/// The most significant hexadecimal digits a float numeral's value keeps
+/// exactly: past them, a digit only moves the exponent and, when not
+/// zero, marks the value as above the kept ones (which rounding sees).
+const HEX_DIGITS: u32 = 30;
+
+/// The bits of hexadecimal float numeral `t` (after its `0x`), already
+/// checked: rounded to nearest, ties to even, as `strtod` rounds it; each
+/// digit visited a tick.
+fn hex_float(t: &[u8], tick: &mut dyn FnMut() -> Result<(), Fail>) -> Result<u64, Fail> {
+    let (mut m, mut e, mut sig, mut sticky, mut dot) = (0_u128, 0_i64, 0_u32, false, false);
+    let mut i = 0;
+    while let Some(&c) = t.get(i) {
+        if c == b'.' {
+            dot = true;
+        } else if let Some(d) = char::from(c).to_digit(16) {
+            tick()?;
+            if sig == 0 && d == 0 {
+                // A leading zero.
+            } else if sig < HEX_DIGITS {
+                sig += 1;
+                m = m * 16 + u128::from(d);
+            } else {
+                sticky |= d != 0;
+                e += 4;
+            }
+            if dot {
+                e -= 4;
+            }
+        } else {
+            break;
+        }
+        i += 1;
+    }
+    if matches!(t.get(i), Some(b'p' | b'P')) {
+        i += 1;
+        let neg = t.get(i) == Some(&b'-');
+        if matches!(t.get(i), Some(b'+' | b'-')) {
+            i += 1;
+        }
+        let mut x: i64 = 0;
+        while let Some(&c) = t.get(i).filter(|c| c.is_ascii_digit()) {
+            tick()?;
+            x = (x * 10 + i64::from(c - b'0')).min(1 << 24);
+            i += 1;
+        }
+        e += if neg { -x } else { x };
+    }
+    Ok(scaled(m, e, sticky).to_bits())
+}
+
+/// `m · 2^e`, `sticky` when the true value is a little above it, rounded
+/// to the nearest `f64`, ties to even.
+fn scaled(m: u128, e: i64, sticky: bool) -> f64 {
+    if m == 0 {
+        return 0.0;
+    }
+    let n = i64::from(128 - m.leading_zeros());
+    // The value's top bit, then the significand bits a normal or a
+    // subnormal result keeps.
+    let top = n - 1 + e;
+    let keep = if top >= -1022 { 53 } else { 53 - (-1022 - top) };
+    if keep < 0 {
+        return 0.0;
+    }
+    let shift = n - keep;
+    let (mut q, mut low) = (m, e);
+    if shift > 0 {
+        let s = u32::try_from(shift).unwrap_or(127);
+        q = m >> s;
+        let rem = m & ((1_u128 << s) - 1);
+        let half = 1_u128 << (s - 1);
+        if rem > half || (rem == half && (sticky || q & 1 == 1)) {
+            q += 1;
+        }
+        low = e + shift;
+    }
+    if top + i64::from(q >> keep.max(0) != 0) > 1023 {
+        return f64::INFINITY;
+    }
+    // `q` holds at most 54 bits, its lowest bit's weight `2^low` is at
+    // least the least subnormal and at most the value's top bit, and the
+    // result is representable: an exact conversion and one exact product.
+    let q = q as f64;
+    q * pow2(low)
+}
+
+/// `2^k` for `k` in `-1074..=1023`, built from its bits.
+fn pow2(k: i64) -> f64 {
+    if k >= -1022 {
+        f64::from_bits(u64::try_from(k + 1023).unwrap_or(0) << 52)
+    } else {
+        f64::from_bits(1_u64 << u32::try_from(k + 1074).unwrap_or(0))
+    }
 }
 
 /// Whether `t` is a float numeral's mantissa and exponent: digits with
@@ -927,6 +1137,19 @@ struct FuncState {
     unread: bool,
     /// The length of the scope stack where its locals start.
     base: usize,
+    /// Its static access paths so far.
+    paths: Vec<Path>,
+}
+
+/// Where a suffixed expression stands on a static access path.
+#[derive(Clone, Copy)]
+enum PathAt {
+    /// On none.
+    Off,
+    /// At an upvalue binding, before any step.
+    Root(u32),
+    /// After a step, by its index among the function's paths.
+    Step(u32),
 }
 
 /// The most locals a function has in scope at once: Lua's own
@@ -1166,7 +1389,9 @@ impl<'a> Parser<'a, '_> {
         f.upvalues.push(up);
     }
 
-    /// A name read as a value: a local, or a global through `_ENV`.
+    /// A name read as a value: a local, the chunk's `_ENV` cell for a bare
+    /// `_ENV` no local shadows (Lua's own upvalue of the chunk, never a
+    /// global named `_ENV`), or a global through `_ENV`.
     fn name_expr(&mut self, t: Token) -> Result<u32, Fail> {
         let name = self.name_bytes((t.start, t.end));
         if let Some(d) = self.lookup(name) {
@@ -1175,8 +1400,56 @@ impl<'a> Parser<'a, '_> {
         }
         let env = self.lookup(b"_ENV").unwrap_or(CHUNK_ENV);
         self.use_binding(env);
+        if name == b"_ENV" {
+            return self.expr(Expr::Local(CHUNK_ENV), t.line);
+        }
         let name = self.field_name(t);
         self.expr(Expr::Global { name, env }, t.line)
+    }
+
+    /// Whether binding `d` (a declaration or [`CHUNK_ENV`]) is an upvalue
+    /// of the current function, one whose captures are copied: never in
+    /// the chunk, which no root is.
+    fn is_upvalue(&self, d: u32) -> bool {
+        let current = self.current_func();
+        if current == 0 || current == NONE {
+            return false;
+        }
+        d == CHUNK_ENV
+            || self
+                .ast
+                .decls
+                .get(d as usize)
+                .is_some_and(|x| x.func != current)
+    }
+
+    /// Where expression `e`, just read, stands on a static access path: a
+    /// global read through an upvalue `_ENV` is its first step.
+    fn path_root(&mut self, e: u32) -> Result<PathAt, Fail> {
+        match self.ast.expr(e) {
+            Expr::Local(d) if self.is_upvalue(d) => Ok(PathAt::Root(d)),
+            Expr::Global { name, env } if self.is_upvalue(env) => {
+                self.path_step(PathAt::Root(env), name)
+            }
+            _ => Ok(PathAt::Off),
+        }
+    }
+
+    /// The step reading the constant string `key` after `at`, charged
+    /// before it is added.
+    fn path_step(&mut self, at: PathAt, key: u32) -> Result<PathAt, Fail> {
+        let (parent, root) = match at {
+            PathAt::Off => return Ok(PathAt::Off),
+            PathAt::Root(r) => (NONE, r),
+            PathAt::Step(p) => (p, NONE),
+        };
+        self.charge()?;
+        let Some(f) = self.funcs.last_mut() else {
+            return Ok(PathAt::Off);
+        };
+        let i = u32::try_from(f.paths.len()).unwrap_or(NONE);
+        f.paths.push(Path { parent, root, key });
+        Ok(PathAt::Step(i))
     }
 
     /// A field name as a string.
@@ -1202,6 +1475,7 @@ impl<'a> Parser<'a, '_> {
             body: (0, 0),
             upvalues: (0, 0),
             unread: false,
+            paths: (0, 0),
         });
         self.funcs.push(FuncState {
             id: 0,
@@ -1209,6 +1483,7 @@ impl<'a> Parser<'a, '_> {
             seen: HashSet::new(),
             unread: false,
             base: 0,
+            paths: Vec::new(),
         });
         let body = self.block()?;
         if !self.check(Tok::Eof) {
@@ -1283,38 +1558,41 @@ impl<'a> Parser<'a, '_> {
             }
             Tok::If => {
                 self.advance()?;
-                self.cond_block(Tok::Then)?;
+                let mark = self.scratch.len();
+                self.arm(Tok::Then)?;
                 while self.check(Tok::Elseif) {
                     self.advance()?;
-                    self.cond_block(Tok::Then)?;
+                    self.arm(Tok::Then)?;
                 }
                 if self.accept(Tok::Else)? {
-                    self.block()?;
+                    let (s, n) = self.block()?;
+                    self.scratch.extend([NONE, s, n]);
                 }
                 self.expect(Tok::End)?;
-                self.stmt(Stmt::Other("if"), line)
+                let arms = self.list_from(mark)?;
+                self.stmt(Stmt::If(arms), line)
             }
             Tok::While => {
                 self.advance()?;
-                self.cond_block(Tok::Do)?;
+                let (cond, body) = self.cond_block(Tok::Do)?;
                 self.expect(Tok::End)?;
-                self.stmt(Stmt::Other("while"), line)
+                self.stmt(Stmt::While { cond, body }, line)
             }
             Tok::Do => {
                 self.advance()?;
-                self.block()?;
+                let body = self.block()?;
                 self.expect(Tok::End)?;
-                self.stmt(Stmt::Other("do"), line)
+                self.stmt(Stmt::Do(body), line)
             }
             Tok::For => self.for_stat(line),
             Tok::Repeat => {
                 self.advance()?;
                 let scope = self.active.len();
-                self.block_open()?;
+                let body = self.block_open()?;
                 self.expect(Tok::Until)?;
-                self.expression()?;
+                let cond = self.expression()?;
                 self.unbind_to(scope);
-                self.stmt(Stmt::Other("repeat"), line)
+                self.stmt(Stmt::Repeat { body, cond }, line)
             }
             Tok::Function => self.function_stat(line),
             Tok::Local => {
@@ -1329,36 +1607,46 @@ impl<'a> Parser<'a, '_> {
                     if let Some(d) = self.ast.decls.get_mut(decl as usize) {
                         d.init = e;
                     }
-                    self.stmt(Stmt::Other("function"), line)
+                    self.stmt(Stmt::LocalFunction { decl, func }, line)
                 } else {
                     self.local_stat(line)
                 }
             }
             Tok::DColon => {
                 self.advance()?;
-                self.expect(Tok::Name)?;
+                let t = self.expect(Tok::Name)?;
                 self.expect(Tok::DColon)?;
-                self.stmt(Stmt::Other("label"), line)
+                let name = self.field_name(t);
+                self.stmt(Stmt::Label(name), line)
             }
             Tok::Return => Err(self.fail()),
             Tok::Break => {
                 self.advance()?;
-                self.stmt(Stmt::Other("break"), line)
+                self.stmt(Stmt::Break, line)
             }
             Tok::Goto => {
                 self.advance()?;
-                self.expect(Tok::Name)?;
-                self.stmt(Stmt::Other("goto"), line)
+                let t = self.expect(Tok::Name)?;
+                let name = self.field_name(t);
+                self.stmt(Stmt::Goto(name), line)
             }
             _ => self.expr_stat(line),
         }
     }
 
     /// A condition, `kw` and a block.
-    fn cond_block(&mut self, kw: Tok) -> Result<(), Fail> {
-        self.expression()?;
+    fn cond_block(&mut self, kw: Tok) -> Result<(u32, List), Fail> {
+        let cond = self.expression()?;
         self.expect(kw)?;
-        self.block()?;
+        let body = self.block()?;
+        Ok((cond, body))
+    }
+
+    /// An `if` arm onto the scratch stack: its condition, `kw`, and its
+    /// block's list.
+    fn arm(&mut self, kw: Tok) -> Result<(), Fail> {
+        let (cond, (s, n)) = self.cond_block(kw)?;
+        self.scratch.extend([cond, s, n]);
         Ok(())
     }
 
@@ -1367,19 +1655,30 @@ impl<'a> Parser<'a, '_> {
         let first = self.expect(Tok::Name)?;
         let scope = self.active.len();
         if self.accept(Tok::Assign)? {
-            self.expression()?;
+            let start = self.expression()?;
             self.expect(Tok::Comma)?;
-            self.expression()?;
-            if self.accept(Tok::Comma)? {
-                self.expression()?;
-            }
-            let d = self.declare((first.start, first.end), DeclKind::ForVar)?;
+            let limit = self.expression()?;
+            let step = if self.accept(Tok::Comma)? {
+                self.expression()?
+            } else {
+                NONE
+            };
+            let var = self.declare((first.start, first.end), DeclKind::ForVar)?;
             self.expect(Tok::Do)?;
-            self.bind(d)?;
-            self.block()?;
+            self.bind(var)?;
+            let body = self.block()?;
             self.unbind_to(scope);
             self.expect(Tok::End)?;
-            return self.stmt(Stmt::Other("numeric for"), line);
+            return self.stmt(
+                Stmt::NumericFor {
+                    var,
+                    start,
+                    limit,
+                    step,
+                    body,
+                },
+                line,
+            );
         }
         let mut names = vec![(first.start, first.end)];
         while self.accept(Tok::Comma)? {
@@ -1389,16 +1688,19 @@ impl<'a> Parser<'a, '_> {
         self.expect(Tok::In)?;
         let mark = self.scratch.len();
         self.exprlist()?;
-        self.scratch.truncate(mark);
+        let exprs = self.list_from(mark)?;
         self.expect(Tok::Do)?;
+        let mark = self.scratch.len();
         for n in names {
             let d = self.declare(n, DeclKind::ForVar)?;
             self.bind(d)?;
+            self.scratch.push(d);
         }
-        self.block()?;
+        let names = self.list_from(mark)?;
+        let body = self.block()?;
         self.unbind_to(scope);
         self.expect(Tok::End)?;
-        self.stmt(Stmt::Other("generic for"), line)
+        self.stmt(Stmt::GenericFor { names, exprs, body }, line)
     }
 
     fn function_stat(&mut self, line: u32) -> Result<u32, Fail> {
@@ -1410,46 +1712,33 @@ impl<'a> Parser<'a, '_> {
         self.scratch.push(first.start);
         self.scratch.push(first.end);
         let mut method = false;
-        let mut dotted = false;
+        let mut fields = Vec::new();
         loop {
-            if self.accept(Tok::Dot)? {
-                dotted = true;
-            } else if self.accept(Tok::Colon)? {
+            if self.accept(Tok::Colon)? {
                 method = true;
-            } else {
+            } else if !self.accept(Tok::Dot)? {
                 break;
             }
             let t = self.expect(Tok::Name)?;
             self.scratch.push(t.start);
             self.scratch.push(t.end);
+            fields.push(t);
             if method {
                 break;
             }
         }
         let names = self.list_from(mark)?;
-        if dotted || method {
-            self.name_expr(first)?;
-        } else {
-            self.assign_name(first)?;
+        let mut target = self.name_expr(first)?;
+        if fields.is_empty() {
+            self.target(target)?;
         }
-        self.body(Form::Named { names, method }, start, method, line)?;
-        self.stmt(Stmt::Other("function"), line)
-    }
-
-    /// Assignment to a plain name: a write to its local, or a global
-    /// through `_ENV`.
-    fn assign_name(&mut self, t: Token) -> Result<(), Fail> {
-        let name = self.name_bytes((t.start, t.end));
-        if let Some(d) = self.lookup(name) {
-            self.use_binding(d);
-            if let Some(x) = self.ast.decls.get_mut(d as usize) {
-                x.writes = x.writes.saturating_add(1);
-            }
-        } else {
-            let env = self.lookup(b"_ENV").unwrap_or(CHUNK_ENV);
-            self.use_binding(env);
+        for t in fields {
+            let s = self.field_name(t);
+            let key = self.expr(Expr::Str(s), t.line)?;
+            target = self.expr(Expr::Index { obj: target, key }, t.line)?;
         }
-        Ok(())
+        let func = self.body(Form::Named { names, method }, start, method, line)?;
+        self.stmt(Stmt::Function { target, func }, line)
     }
 
     fn local_stat(&mut self, line: u32) -> Result<u32, Fail> {
@@ -1499,21 +1788,25 @@ impl<'a> Parser<'a, '_> {
     fn expr_stat(&mut self, line: u32) -> Result<u32, Fail> {
         let e = self.suffixed()?;
         if self.check(Tok::Assign) || self.check(Tok::Comma) {
+            let mark = self.scratch.len();
             self.target(e)?;
+            self.scratch.push(e);
             while self.accept(Tok::Comma)? {
                 let t = self.suffixed()?;
                 self.target(t)?;
+                self.scratch.push(t);
             }
+            let targets = self.list_from(mark)?;
             self.expect(Tok::Assign)?;
             let mark = self.scratch.len();
             self.exprlist()?;
-            self.scratch.truncate(mark);
-            return self.stmt(Stmt::Other("assignment"), line);
+            let exprs = self.list_from(mark)?;
+            return self.stmt(Stmt::Assign { targets, exprs }, line);
         }
         if !matches!(self.ast.expr(e), Expr::Call { .. } | Expr::Method { .. }) {
             return Err(self.fail());
         }
-        self.stmt(Stmt::Other("call statement"), line)
+        self.stmt(Stmt::Call(e), line)
     }
 
     /// An assignment's target: a local written, a global, or a field.
@@ -1545,6 +1838,7 @@ impl<'a> Parser<'a, '_> {
             body: (0, 0),
             upvalues: (0, 0),
             unread: false,
+            paths: (0, 0),
         });
         let base = self.active.len();
         self.funcs.push(FuncState {
@@ -1553,6 +1847,7 @@ impl<'a> Parser<'a, '_> {
             seen: HashSet::new(),
             unread: false,
             base,
+            paths: Vec::new(),
         });
         let scope = self.active.len();
         self.expect(Tok::LParen)?;
@@ -1586,11 +1881,18 @@ impl<'a> Parser<'a, '_> {
         let end = self.expect(Tok::End)?;
         self.unbind_to(scope);
         let state = self.funcs.pop();
-        let (ups, unread) = state.map_or((Vec::new(), false), |s| (s.upvalues, s.unread));
+        let (ups, unread, paths) = state.map_or((Vec::new(), false, Vec::new()), |s| {
+            (s.upvalues, s.unread, s.paths)
+        });
         let mark = self.scratch.len();
         self.scratch.extend(ups.iter().copied());
         let upvalues = self.list_from(mark)?;
+        // Its paths, each charged as it was added, kept together.
+        let start = u32::try_from(self.ast.paths.len()).unwrap_or(NONE);
+        let count = u32::try_from(paths.len()).unwrap_or(0);
+        self.ast.paths.extend(paths);
         if let Some(f) = self.ast.funcs.get_mut(id as usize) {
+            f.paths = (start, count);
             f.open = open;
             f.end = end.end;
             f.params = params;
@@ -1688,7 +1990,7 @@ impl<'a> Parser<'a, '_> {
         let t = self.tok;
         let e = match t.tok {
             Tok::Int(n) => Expr::Int(n),
-            Tok::Float => Expr::Float,
+            Tok::Float(b) => Expr::Float(b),
             Tok::Str(s) => Expr::Str(s),
             Tok::Nil => Expr::Nil,
             Tok::True => Expr::True,
@@ -1723,8 +2025,11 @@ impl<'a> Parser<'a, '_> {
         }
     }
 
+    /// A primary expression and its suffixes, each index by a constant
+    /// string on a static access path a step of it.
     fn suffixed(&mut self) -> Result<u32, Fail> {
         let mut e = self.primary()?;
+        let mut at = self.path_root(e)?;
         loop {
             let line = self.tok.line;
             match self.tok.tok {
@@ -1734,12 +2039,17 @@ impl<'a> Parser<'a, '_> {
                     let s = self.field_name(n);
                     let key = self.expr(Expr::Str(s), n.line)?;
                     e = self.expr(Expr::Index { obj: e, key }, line)?;
+                    at = self.path_step(at, s)?;
                 }
                 Tok::LBracket => {
                     self.advance()?;
                     let key = self.expression()?;
                     self.expect(Tok::RBracket)?;
                     e = self.expr(Expr::Index { obj: e, key }, line)?;
+                    at = match self.ast.expr(key) {
+                        Expr::Str(s) => self.path_step(at, s)?,
+                        _ => PathAt::Off,
+                    };
                 }
                 Tok::Colon => {
                     self.advance()?;
@@ -1747,10 +2057,12 @@ impl<'a> Parser<'a, '_> {
                     let name = self.field_name(n);
                     let args = self.args()?;
                     e = self.expr(Expr::Method { obj: e, name, args }, line)?;
+                    at = PathAt::Off;
                 }
                 Tok::LParen | Tok::Str(_) | Tok::LBrace => {
                     let args = self.args()?;
                     e = self.expr(Expr::Call { callee: e, args }, line)?;
+                    at = PathAt::Off;
                 }
                 _ => return Ok(e),
             }
@@ -1823,7 +2135,7 @@ impl<'a> Parser<'a, '_> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Expr, Fail, number, parse};
+    use super::{CHUNK_ENV, Expr, Fail, NONE, Stmt, number, parse};
 
     fn ok(src: &str) -> super::Ast {
         let mut n = 0;
@@ -1838,9 +2150,40 @@ mod tests {
         assert_eq!(n(b"0x10"), Some(Tok::Int(16)));
         assert_eq!(n(b"0xffffffffffffffff"), Some(Tok::Int(-1)));
         assert_eq!(n(b"9223372036854775807"), Some(Tok::Int(i64::MAX)));
-        assert_eq!(n(b"9223372036854775808"), Some(Tok::Float));
-        for f in ["1.0", "1e5", ".5", "5.", "0x1p4", "0x.8", "1e+5", "3E-2"] {
-            assert_eq!(n(f.as_bytes()), Some(Tok::Float), "{f}");
+        let float = |x: f64| Some(Tok::Float(x.to_bits()));
+        assert_eq!(
+            n(b"9223372036854775808"),
+            float(9_223_372_036_854_775_808.0)
+        );
+        for (f, x) in [
+            ("1.0", 1.0),
+            ("1e5", 1e5),
+            (".5", 0.5),
+            ("5.", 5.0),
+            ("0x1p4", 16.0),
+            ("0x.8", 0.5),
+            ("1e+5", 1e5),
+            ("3E-2", 3e-2),
+            ("0x1.8p-1", 0.75),
+            ("0xA.8P1", 21.0),
+            ("1e400", f64::INFINITY),
+            ("0x1p1024", f64::INFINITY),
+            ("0x1p-1074", f64::from_bits(1)),
+            ("0x1p-1075", 0.0),
+            ("0x1.8p-1075", f64::from_bits(1)),
+            ("0x1p-1076", 0.0),
+            // 2^53 + 1 and + 3: ties to even, down then up.
+            ("0x20000000000001.", 9_007_199_254_740_992.0),
+            ("0x20000000000003.", 9_007_199_254_740_996.0),
+            // Past the kept digits, a nonzero digit breaks the tie up.
+            (
+                "0x20000000000001000000000000000001.",
+                9_007_199_254_740_994.0 * 2f64.powi(72),
+            ),
+            ("0x0.0000001p28", 1.0),
+            ("0x1.fffffffffffff8p0", 2.0),
+        ] {
+            assert_eq!(n(f.as_bytes()), float(x), "{f}");
         }
         for bad in ["1e", "0x", "1..2", "0x1e+", "1p4", "."] {
             assert_eq!(n(bad.as_bytes()), None, "{bad}");
@@ -1882,6 +2225,150 @@ mod tests {
         // A write is counted.
         let a = ok("local m = 1\nm = 2\nlocal function h() m = 3 end");
         assert_eq!(a.decl(0).unwrap().writes, 2);
+    }
+
+    #[test]
+    fn a_bare_env_is_the_chunk_s_cell() {
+        // Read with no local `_ENV` in scope: the chunk's own upvalue, not
+        // a global named `_ENV`; `_ENV.x` is the global `x`.
+        let a = ok("local function f() return _ENV.x end\n_ENV = {}");
+        let f = a.func(1).unwrap();
+        assert_eq!(a.list(f.upvalues), [CHUNK_ENV]);
+        let &[ret] = a.list(f.body) else { panic!() };
+        let Stmt::Return(list) = a.stmt(ret) else {
+            panic!()
+        };
+        let Expr::Index { obj, key } = a.expr(a.list(list)[0]) else {
+            panic!()
+        };
+        assert_eq!(a.expr(obj), Expr::Local(CHUNK_ENV));
+        assert!(matches!(a.expr(key), Expr::Str(s) if a.str(s) == b"x"));
+        // Its one path step reads `x` from the cell.
+        let &[p] = a.paths(f) else { panic!() };
+        assert_eq!(
+            (p.parent, p.root, a.str(p.key)),
+            (NONE, CHUNK_ENV, &b"x"[..])
+        );
+        // Assigned, it is the cell again.
+        let &[_, assign] = a.list(a.func(0).unwrap().body) else {
+            panic!()
+        };
+        let Stmt::Assign { targets, .. } = a.stmt(assign) else {
+            panic!()
+        };
+        assert_eq!(a.expr(a.list(targets)[0]), Expr::Local(CHUNK_ENV));
+        // A local `_ENV` shadows it.
+        let a = ok("local _ENV = {}\nlocal function g() return _ENV end");
+        let g = a.func(1).unwrap();
+        assert_eq!(a.list(g.upvalues), [0]);
+    }
+
+    #[test]
+    fn statements_keep_their_parts() {
+        let a = ok("local t = {}\n\
+            t.a, t.b = 1, 2\n\
+            if t then f() elseif t.a then elseif t.b then else end\n\
+            while t do break end\n\
+            repeat local z = 1 until z\n\
+            for i = 1, 2 do end for i = 1, 2, 3 do end\n\
+            for k, v in pairs(t) do end\n\
+            do goto x end ::x::\n\
+            local function h() end\n\
+            function t.c:m() end\n\
+            t:m()");
+        let top = a.list(a.func(0).unwrap().body);
+        let names: Vec<&str> = top.iter().map(|&s| a.stmt(s).name()).collect();
+        assert_eq!(
+            names,
+            [
+                "local",
+                "assignment",
+                "if",
+                "while",
+                "repeat",
+                "numeric for",
+                "numeric for",
+                "generic for",
+                "do",
+                "label",
+                "function",
+                "function",
+                "call statement"
+            ]
+        );
+        let Stmt::Assign { targets, exprs } = a.stmt(top[1]) else {
+            panic!()
+        };
+        assert_eq!((targets.1, exprs.1), (2, 2));
+        // Four arms, the `else` arm's condition none.
+        let Stmt::If(arms) = a.stmt(top[2]) else {
+            panic!()
+        };
+        let arms = a.list(arms);
+        assert_eq!(arms.len(), 12);
+        assert_eq!(arms[9], NONE);
+        assert_eq!(a.list((arms[1], arms[2])).len(), 1);
+        let Stmt::NumericFor { step, .. } = a.stmt(top[5]) else {
+            panic!()
+        };
+        assert_eq!(step, NONE);
+        let Stmt::NumericFor { step, .. } = a.stmt(top[6]) else {
+            panic!()
+        };
+        assert_ne!(step, NONE);
+        let Stmt::GenericFor { names, exprs, .. } = a.stmt(top[7]) else {
+            panic!()
+        };
+        assert_eq!((names.1, exprs.1), (2, 1));
+        let Stmt::Do(body) = a.stmt(top[8]) else {
+            panic!()
+        };
+        assert!(matches!(a.stmt(a.list(body)[0]), Stmt::Goto(s) if a.str(s) == b"x"));
+        assert!(matches!(
+            a.stmt(top[10]),
+            Stmt::LocalFunction { func: 1, .. }
+        ));
+        // `function t.c:m()` targets `t.c.m`.
+        let Stmt::Function { target, func: 2 } = a.stmt(top[11]) else {
+            panic!()
+        };
+        let Expr::Index { key, .. } = a.expr(target) else {
+            panic!()
+        };
+        assert!(matches!(a.expr(key), Expr::Str(s) if a.str(s) == b"m"));
+    }
+
+    #[test]
+    fn static_paths_are_upvalue_and_global_chains_with_constant_keys() {
+        let a = ok("local u = {}\n\
+            local function f(p)\n\
+              local l = {}\n\
+              return u.a.b, g.c[\"d\"], p.x, l.y, u[p], u.a:m(), (u).z, h().w, u.a\n\
+            end");
+        let f = a.func(1).unwrap();
+        let steps: Vec<(u32, u32, &[u8])> = a
+            .paths(f)
+            .iter()
+            .map(|p| (p.parent, p.root, a.str(p.key)))
+            .collect();
+        // `u.a.b`, the global `g`, `.c`, `["d"]`, `u.a` before `:m`, and
+        // `u.a` again; not through a parameter, a local of its own, a
+        // dynamic key, parentheses or a call.
+        assert_eq!(
+            steps,
+            [
+                (NONE, 0, &b"a"[..]),
+                (0, NONE, b"b"),
+                (NONE, CHUNK_ENV, b"g"),
+                (2, NONE, b"c"),
+                (3, NONE, b"d"),
+                (NONE, 0, b"a"),
+                (NONE, CHUNK_ENV, b"h"),
+                (NONE, 0, b"a"),
+            ]
+        );
+        // The chunk, which no root is, records none.
+        assert!(a.paths(a.func(0).unwrap()).is_empty());
     }
 
     #[test]

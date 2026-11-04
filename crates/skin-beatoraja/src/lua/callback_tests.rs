@@ -117,11 +117,12 @@ fn refusals_name_their_reason_and_run_no_handler() {
             image("function() return ms.number(1) and true end"),
             effect(Unsupported::Truthiness),
         ),
-        // Recursion.
+        // Recursion, through a helper bound after its caller: the
+        // captured final binding proves it.
         (
             "local f\nlocal function g() return f() end\nf = function() return g() end",
             image("function() return g() end"),
-            effect(Unsupported::Binding("a helper")),
+            effect(Unsupported::Recursion),
         ),
         (
             "local function r() return r() end",
@@ -464,9 +465,10 @@ fn options_entry(keys: usize, bytes: usize, count: usize, envs: bool) -> String 
 }
 
 #[test]
-fn option_tables_are_interned_once_a_pass() {
+fn option_tables_are_copied_by_path_once_a_pass() {
     // 100 `_ENV` tables over one option table of 600 names of 6 000
-    // bytes: its names are read and interned once, not once an `_ENV`.
+    // bytes: of the option table, only the entry a path reads is copied,
+    // once, its name interned once; each instance's path hashes it.
     let d = folder(&options_entry(600, 6_000, 100, true));
     let cancel = Cancel::new();
     let h = read_lua_header(d.path(), "s.luaskin", &cancel).unwrap();
@@ -479,12 +481,18 @@ fn option_tables_are_interned_once_a_pass() {
         .as_deref()
         .and_then(|l| l.analysis.as_deref())
         .unwrap();
-    assert_eq!(an.envs.len(), 100);
-    assert_eq!(an.option_sets.len(), 1);
-    assert_eq!(an.option_names.len(), 600);
-    // One hash of each name, its bytes charged.
+    // The 100 `_ENV` tables, `skin_config` and its `option`.
+    assert_eq!(an.tables.len(), 102);
+    let option = an.tables.iter().filter(|t| t.len() == 1).count();
+    assert!(option >= 1);
+    let copied: usize = an.tables.iter().map(std::collections::HashMap::len).sum();
+    // `skin_config` in each `_ENV`, `option` once, the read entry once.
+    assert_eq!(copied, 102);
+    assert_eq!(an.names.len(), 3);
+    // Each instance hashes the name copying its path: 100 times, never
+    // once each of the 600 entries.
     let work = an.work.get();
-    assert!((600 * 6_000..2 * 600 * 6_000).contains(&work), "{work}");
+    assert!((100 * 6_000..2 * 100 * 6_000).contains(&work), "{work}");
 }
 
 #[test]
