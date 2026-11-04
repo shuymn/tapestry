@@ -39,7 +39,7 @@ use render::{
     AttemptInput, AttemptText, DefaultFont, LineBounds, LineFit, LineLayout, OutlineText,
     SkinError, TextResidency, text::fonts_dir,
 };
-use skin_model::{ChartText, Layout, TextRequest};
+use skin_model::{ChartText, Layout, ScreenKind, TextRequest};
 
 /// The producer, timing its layouts and rasterizations.
 #[derive(Debug)]
@@ -202,10 +202,10 @@ fn main() {
         };
         // Cold: the installation restored before each attempt, its text
         // cache empty, so every line is laid out, placed and uploaded.
-        let installation = r.installation().unwrap();
+        let installation = r.installation(ScreenKind::Play).unwrap();
         let cold: Vec<Duration> = (0..30)
             .map(|i| {
-                r.restore(&installation).unwrap();
+                r.restore(ScreenKind::Play, &installation).unwrap();
                 prepare(&mut r, &format!("曲名テスト {i}"))
             })
             .collect();
