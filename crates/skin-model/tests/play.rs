@@ -49,6 +49,7 @@ fn in_section(s: &Section) -> PlayContext<'_> {
         ln_default: rules::LnMode::Ln,
         last_note_end: TimeUs(0),
         bpm_range: None,
+        bpm_whole_change: None,
     }
 }
 
@@ -524,6 +525,7 @@ fn targets_match_the_evaluators() {
         ln_default: rules::LnMode::Ln,
         last_note_end: TimeUs(0),
         bpm_range: None,
+        bpm_whole_change: None,
     };
     let section_ctx = PlayContext {
         attempt: Attempt::Section(&edge),
@@ -1560,7 +1562,8 @@ fn appended_fields(h: &Harness) -> (&[i32], &[i32]) {
     let fields = h.play.state().fields;
     let first = usize::from(field::DURATION_VARIANTS);
     let native = usize::from(field::NATIVE_HISPEED_X100);
-    (&fields[first..native], &fields[native..field::COUNT])
+    let end = usize::from(field::NATIVE_FLOATING) + 1;
+    (&fields[first..native], &fields[native..end])
 }
 
 /// Each variant rounds its ms half up and its green number half up from

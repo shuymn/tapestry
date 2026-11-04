@@ -376,11 +376,11 @@ fn check_f2(_: &Header, i: Imported) {
         "100", "0", "0", "0", "0", "0", "300", "75", "150", "0", "0", "0", "1",
         "500", "250", "120", "375", "105", "1", "5", "668", "400",
     ];
-    let mut d = Drawn::over_with(i.skin, &chart, Some(range));
+    let mut d = Drawn::over_with(i.skin, &chart, Some(range), None);
     d.readouts = Some(known);
     assert_eq!(f2_numbers(&mut d), f2_expected(&shown));
     // Unknown, the tempo, hi-speed and duration numbers draw nothing.
-    let mut d = Drawn::over_with(d.skin, &chart, None);
+    let mut d = Drawn::over_with(d.skin, &chart, None, None);
     d.readouts = Some(skin_model::FrameReadouts {
         bpm_current_x100: None,
         hispeed_x100: None,

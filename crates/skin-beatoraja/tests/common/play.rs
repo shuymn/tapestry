@@ -190,11 +190,15 @@ pub fn follow(notes: &mut NoteFacts, chart: &Chart, ev: &JudgeEvent) {
 
 /// The attempt every drawn import plays: the whole chart, no lead-in.
 pub fn context() -> PlayContext<'static> {
-    context_with(None)
+    context_with(None, None)
 }
 
-/// [`context`] with the chart's BPM range `bpm_range`.
-fn context_with(bpm_range: Option<BpmRange>) -> PlayContext<'static> {
+/// [`context`] with the chart's BPM range `bpm_range` and BPM-change fact
+/// `bpm_whole_change`.
+fn context_with(
+    bpm_range: Option<BpmRange>,
+    bpm_whole_change: Option<bool>,
+) -> PlayContext<'static> {
     PlayContext {
         gauges: &GAUGES,
         attempt: Attempt::Full { lead_in: TimeUs(0) },
@@ -204,6 +208,7 @@ fn context_with(bpm_range: Option<BpmRange>) -> PlayContext<'static> {
         ln_default: rules::LnMode::Ln,
         last_note_end: NO_END,
         bpm_range,
+        bpm_whole_change,
     }
 }
 
@@ -261,17 +266,23 @@ impl Drawn {
 
     /// `skin` played over `chart`.
     pub fn over(skin: Skin, chart: &bms_model::Chart) -> Self {
-        Self::over_with(skin, chart, None)
+        Self::over_with(skin, chart, None, None)
     }
 
-    /// `skin` played over `chart` whose BPM range is `bpm_range`.
-    pub fn over_with(skin: Skin, chart: &bms_model::Chart, bpm_range: Option<BpmRange>) -> Self {
+    /// `skin` played over `chart` whose BPM range is `bpm_range` and
+    /// BPM-change fact `bpm_whole_change`.
+    pub fn over_with(
+        skin: Skin,
+        chart: &bms_model::Chart,
+        bpm_range: Option<BpmRange>,
+        bpm_whole_change: Option<bool>,
+    ) -> Self {
         let uvs = skin
             .atlas(Variant::Lo, LIMITS, &|| false)
             .unwrap()
             .into_parts()
             .1;
-        let ctx = context_with(bpm_range);
+        let ctx = context_with(bpm_range, bpm_whole_change);
         let play = skin.prepare(chart, &ctx).unwrap();
         let batch = QuadBatch::with_capacity(skin.quad_capacity(), skin.run_capacity());
         Self {
@@ -438,6 +449,8 @@ pub struct Loader {
     /// The descriptor each frame gives: by default the drawn play's gauge.
     pub gauge: Option<LoadingGauge>,
     pub percent: i32,
+    /// Whether the stored covers are being adjusted: START or SELECT held.
+    pub adjusting: bool,
 }
 
 impl Loader {
@@ -456,6 +469,7 @@ impl Loader {
             batch,
             gauge: Some(LoadingGauge::of(0, &GAUGES[0])),
             percent: 0,
+            adjusting: false,
         }
     }
 
@@ -463,6 +477,8 @@ impl Loader {
     pub fn frame(&mut self, ms: i64) -> Vec<Quad> {
         self.batch.clear();
         let view = LaneView::NONE;
+        let mut covers = readouts_for(view).covers;
+        covers.adjusting = self.adjusting;
         let frame = LoadingFrame {
             now: TimeUs(ms * MS),
             load: LoadState {
@@ -472,7 +488,7 @@ impl Loader {
             target: [1_920, 1_080],
             layout: &Layout::AUTHOR,
             lanes: view,
-            covers: readouts_for(view).covers,
+            covers,
             gauge: self.gauge,
         };
         self.skin

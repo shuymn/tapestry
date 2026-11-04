@@ -1682,6 +1682,7 @@ fn build_does_not_allocate() {
         ln_default: rules::LnMode::Ln,
         last_note_end: TimeUs(0),
         bpm_range: None,
+        bpm_whole_change: None,
     };
     let round = Section {
         start: TimeUs(30_000 * MS),
@@ -3562,6 +3563,7 @@ fn readouts_do_not_allocate(loaded: &Loaded, descs: &[GaugeDesc]) {
             min_x100: 15_000,
             max_x100: 15_000,
         }),
+        bpm_whole_change: None,
     };
     let round = PlayContext {
         attempt: Attempt::Section(&section),
