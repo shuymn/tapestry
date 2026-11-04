@@ -245,6 +245,8 @@ pub(super) fn vm(pass: &Rc<Pass>) -> mlua::Result<Lua> {
     lua.set_global_hook(
         HookTriggers::new().every_nth_instruction(INSTRUCTION_STEP),
         move |lua, _| {
+            #[cfg(feature = "dev-tools")]
+            super::vm_hooks::step();
             if hook.ledger.faulted() {
                 let n = after_fault.get().saturating_add(1);
                 after_fault.set(n);

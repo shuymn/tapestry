@@ -70,6 +70,35 @@ pub fn warnings(what: &str, items: impl ExactSizeIterator<Item = impl Display>) 
     warnings_to(what, items, &mut io::stderr().lock(), log::logger());
 }
 
+/// Logs `line` as `<what>: <line>` into `log`, then the first
+/// [`WARNINGS_LOGGED`] of `notes` as `<what>: <note>`, then one count of
+/// the notes left out: the ones past the cap and the `suppressed` ones
+/// their source kept only as a count. Nothing goes to stderr.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "production imports no skin yet")
+)]
+pub fn summary_to(
+    what: &str,
+    line: &str,
+    notes: impl ExactSizeIterator<Item = impl Display>,
+    suppressed: u32,
+    log: &dyn Log,
+) {
+    log.log(&own(Level::Info, format_args!("{what}: {line}")));
+    let n = notes.len();
+    for note in notes.take(WARNINGS_LOGGED) {
+        log.log(&own(Level::Info, format_args!("{what}: {note}")));
+    }
+    let more = n.saturating_sub(WARNINGS_LOGGED);
+    if more > 0 || suppressed > 0 {
+        let args = format_args!(
+            "{what}: {more} more notes not logged ({n} kept), {suppressed} more not kept"
+        );
+        log.log(&own(Level::Info, args));
+    }
+}
+
 /// Sums up a chart's missing sound files in one line, the count and the
 /// first [`MISSING_NAMED`] names with control characters escaped, on
 /// stderr and in the log like any chart warning. Nothing when none is
@@ -133,6 +162,34 @@ fn warnings_to(
         let args = format_args!("{what}: {more} more warnings not logged ({n} in all)");
         log.log(&own(Level::Warn, args));
     }
+}
+
+/// The lines `write` logs through a logger over the run's sink and its
+/// bounds, each without its time and level (tests).
+#[cfg(test)]
+pub(crate) fn through_the_sink(write: impl FnOnce(&dyn Log)) -> Vec<String> {
+    let log = FileLog {
+        state: Mutex::new(Some(Logged {
+            sink: Sink::new(Vec::new(), Caps::FILE, Instant::now()),
+            _lease: None,
+        })),
+    };
+    write(&log);
+    let out = log
+        .state
+        .into_inner()
+        .ok()
+        .flatten()
+        .and_then(|l| l.sink.out)
+        .unwrap_or_default();
+    String::from_utf8_lossy(&out)
+        .lines()
+        .map(|l| {
+            // `<ms> <LEVEL> <message>`.
+            let mut parts = l.trim_start().splitn(3, ' ');
+            parts.nth(2).unwrap_or_default().trim_start().to_owned()
+        })
+        .collect()
 }
 
 /// A record of this crate's target.
