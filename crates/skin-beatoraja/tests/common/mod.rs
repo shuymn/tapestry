@@ -372,8 +372,9 @@ pub fn import_body(body: &str) -> Loaded {
     import_sized([1_920, 1_080], body, &[])
 }
 
-/// Imports a `size` skin of `body` with source `a` (a 64×64 `a.png`)
-/// and source `n` (a 120×20 `n.png`), and `files` written as PNGs.
+/// Imports a `size` skin of `body` with sources `a` (a 64×64 `a.png`),
+/// `n` (a 120×20 `n.png`) and `zz` (a `zz.png` never written), and
+/// `files` written as PNGs.
 pub fn import_sized(size: [u32; 2], body: &str, files: &[(&str, u32, u32)]) -> Loaded {
     import_config(size, body, files, |_| {})
 }
@@ -387,8 +388,8 @@ pub fn import_config(
 ) -> Loaded {
     let [w, h] = size;
     let json = format!(
-        r#"{{"type": 0, "w": {w}, "h": {h},
-            "source": [{{"id": "a", "path": "a.png"}}, {{"id": "n", "path": "n.png"}}], {body}}}"#
+        r#"{{"type": 0, "w": {w}, "h": {h}, "source": [{{"id": "zz", "path": "zz.png"}},
+            {{"id": "a", "path": "a.png"}}, {{"id": "n", "path": "n.png"}}], {body}}}"#
     );
     let dir = skin_with(&json, &[("a.png", 64, 64), ("n.png", 120, 20)]);
     for &(name, w, h) in files {

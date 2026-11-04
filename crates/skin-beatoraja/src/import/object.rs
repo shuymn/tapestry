@@ -105,6 +105,25 @@ impl Objects {
         Ok(None)
     }
 
+    /// Whether more than one table has a record of id `id`.
+    pub(crate) fn shared(
+        &mut self,
+        def: &mut Definition,
+        tables: &Tables,
+        id: &str,
+    ) -> Result<bool, ImportError> {
+        let mut found = false;
+        for &(_, object) in &ORDER {
+            if self.names(def, tables, id, object)? {
+                if found {
+                    return Ok(true);
+                }
+                found = true;
+            }
+        }
+        Ok(false)
+    }
+
     /// Whether a record of `object`'s table has id `id`.
     pub(crate) fn names(
         &mut self,

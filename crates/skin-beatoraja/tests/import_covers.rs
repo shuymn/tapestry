@@ -52,8 +52,18 @@ fn d9(a: LaneApprox) -> NoteKind {
     NoteKind::Deviation(DeviationId::D9(a))
 }
 
-/// An image record whose source does not exist: a critical element
-/// drawing it refuses, a decorative one is dropped.
+/// Asserts `l` refused with a file's error: a critical element drawing a
+/// file that does not exist.
+#[track_caller]
+fn assert_asset(l: Loaded, case: &str) {
+    match l.err() {
+        ImportError::Asset { .. } => {}
+        e => panic!("{case}: {e:?}"),
+    }
+}
+
+/// An image record whose source names a file that does not exist: a
+/// critical element drawing it refuses, a decorative one is dropped.
 const GHOST: &str = r#"{"id": "ghost", "src": "zz", "w": 16, "h": 16}"#;
 
 /// `d` drawing [`GHOST`].
@@ -199,7 +209,6 @@ fn a_clamped_colour_over_the_lanes_is_reported_once() {
 
 #[test]
 fn an_unknown_span_keeps_offset_four_critical() {
-    let missing = (CriticalPart::Cover, NoteKind::MissingAsset);
     // A full cover before the notes, past destinations naming nothing,
     // reaches the lanes: SUDDEN+'s paint, whose missing file refuses.
     let early = ghostly(&cover(""));
@@ -208,7 +217,7 @@ fn an_unknown_span_keeps_offset_four_critical() {
         r#"{"id": "nothing", "dst": [{"w": 1, "h": 1}]}"#,
     ] {
         let l = import_body(&body(GHOST, &note(""), &[none, &early, NOTES]));
-        assert_eq!(critical(l), missing, "{none}");
+        assert_asset(l, none);
     }
     // Lanes that cannot be read ahead leave the span unknown.
     let all = common::lanes::lane_rects(200, 600);
@@ -217,7 +226,7 @@ fn an_unknown_span_keeps_offset_four_critical() {
     let notes = common::lanes::note_with(&seven, "");
     let off = ghostly(&deco("", r#"{"x": 0, "y": 0, "w": 10, "h": 10}"#));
     let l = import_body(&body(GHOST, &notes, &[&off, NOTES]));
-    assert_eq!(critical(l), missing);
+    assert_asset(l, "unknown span");
     // Off readable lanes the same image is decorative: dropped.
     let l = import_body(&body(GHOST, &note(""), &[NOTES, &off]));
     assert!(
@@ -261,8 +270,8 @@ fn offset_four_elements_that_may_reach_the_lanes_are_sudden_plus() {
             r#"{"x": 0, "y": 0, "w": 10, "h": 10}"#,
         ),
     ];
-    // Each is SUDDEN+'s paint, play-critical: drawing a missing file, it
-    // refuses.
+    // Each is SUDDEN+'s paint, play-critical: it refuses, as a cover or
+    // with its missing file's error.
     for d in &cases {
         let d = &ghostly(d);
         let l = import_config(
@@ -279,7 +288,14 @@ fn offset_four_elements_that_may_reach_the_lanes_are_sudden_plus() {
                 );
             },
         );
-        assert_eq!(critical(l).0, CriticalPart::Cover, "{d}");
+        match l.err() {
+            ImportError::Asset { .. }
+            | ImportError::Critical {
+                part: CriticalPart::Cover,
+                ..
+            } => {}
+            e => panic!("{d}: {e:?}"),
+        }
     }
     // Frames selected by an expression: an image group and image sets.
     // A `ref` is an image-index property, 40 the shown gauge's type and 42
@@ -1128,10 +1144,7 @@ fn a_slider_off_the_lanes_is_decorative() {
         let d = format!(r#"{{"id": "sl", "dst": [{rect}]}}"#);
         with(&object, &[&d])
     };
-    assert_eq!(
-        critical(ghost(r#"{"x": 20, "y": 800, "w": 430, "h": 600}"#)),
-        (CriticalPart::Cover, NoteKind::MissingAsset)
-    );
+    assert_asset(ghost(r#"{"x": 20, "y": 800, "w": 430, "h": 600}"#), "over");
     let l = ghost(r#"{"x": 0, "y": 0, "w": 10, "h": 10}"#);
     assert!(
         l.report()
