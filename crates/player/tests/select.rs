@@ -1265,6 +1265,56 @@ fn a_configured_play_skin_is_installed_at_startup() {
     assert_eq!(centre_rgb(&loading), [0, 0, 255]);
 }
 
+/// A play skin that cannot be read admits no chart: the run reports it
+/// refused, the select page shows the result kind's notice line at its
+/// first entry (a result-type skin there has no importer yet), and
+/// choosing a chart is refused with play's notice, no play starting.
+#[test]
+fn a_refused_play_skin_admits_no_chart_and_a_notice_shows() {
+    let fx = fixture();
+    write_chart(&fx.library, "a", "a.bms", "譜面A", 8_000);
+    let skin = fx.appdata.join("skin");
+    fs::create_dir_all(&skin).unwrap();
+    fs::write(skin.join("r.json"), r#"{"type": 7, "w": 1920, "h": 1080}"#).unwrap();
+    let root = DataRoot::new(fx.appdata.join("tapestry"));
+    fs::write(
+        root.player_settings(),
+        format!(
+            "[skins.play]\nroot = '{0}'\nentry = 'missing.json'\n\
+             [skins.result]\nroot = '{0}'\nentry = 'r.json'\n",
+            skin.display()
+        ),
+    )
+    .unwrap();
+    let (_, stdout) = run(&fx, "pick=a.bms,enter,sleep=500,close", &[]);
+    let skins = lines(&stdout, "skin:");
+    assert_eq!(skins.len(), 2, "{stdout}");
+    assert!(
+        skins[0].starts_with("skin: play: refused: cannot read missing.json"),
+        "{stdout}"
+    );
+    let built_in = "single-chart result skins are not imported yet";
+    assert_eq!(skins[1], format!("skin: result: built-in: {built_in}"));
+    let notices = lines(&stdout, "dev: select notice: ");
+    assert_eq!(
+        notices.first().copied(),
+        Some(
+            format!("dev: select notice: リザルトのスキンは使えません（内蔵画面）: {built_in}")
+                .as_str()
+        ),
+        "{stdout}"
+    );
+    let refused = lines(&stdout, "select: not admitted a.bms: ");
+    assert_eq!(refused.len(), 1, "{stdout}");
+    assert!(
+        refused[0].starts_with(
+            "select: not admitted a.bms: スキンを使えません: cannot read missing.json"
+        ),
+        "{stdout}"
+    );
+    assert!(lines(&stdout, "play started").is_empty(), "{stdout}");
+}
+
 /// A Lua play skin in `dir`, `play.luaskin`: `blue.png` over the whole
 /// canvas.
 fn write_blue_lua_skin(dir: &Path) {

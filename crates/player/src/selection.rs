@@ -365,6 +365,16 @@ impl Selection {
                     file_name(&chart.path)
                 );
             }
+            // The notice line the page shows, for a script's checks
+            // (dev-tools).
+            #[cfg(feature = "dev-tools")]
+            if self.script.is_some()
+                && let Some(notice) = page.lines.iter().find(|l| {
+                    l.style == crate::menu_screen::LineStyle::Notice && !l.text.is_empty()
+                })
+            {
+                println!("dev: select notice: {}", notice.text);
+            }
             render.send(RenderMsg::Menu(Box::new(page)));
         }
     }

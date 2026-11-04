@@ -489,8 +489,17 @@ pub fn notice(kind: ScreenKind, why: &str) -> String {
     format!("{screen}のスキンは使えません（内蔵画面）: {why}")
 }
 
-/// Logs an installed skin of `kind`: one line with its atlas's texels and
-/// the texels every kind's committed skin is charged together against the
+/// An installed bundle's atlas array: its level-0 texels
+/// ([`SkinBundle::atlas_texels`]) and its pages' side.
+#[derive(Clone, Copy, Debug)]
+pub struct Atlas {
+    pub texels: u64,
+    pub side: u32,
+}
+
+/// Logs an installed skin of `kind`: one line with its atlas's texels, page
+/// side and layers, and the texels every kind's committed skin is charged
+/// together against the
 /// shared limit, its counters, then its definition files and file
 /// choices, the lists last since a record is cut at the log's line cap;
 /// then its notes, located, at most the log's cap, and a count of the rest
@@ -498,15 +507,18 @@ pub fn notice(kind: ScreenKind, why: &str) -> String {
 pub fn log_installed(
     kind: ScreenKind,
     summary: &Summary,
-    atlas_texels: u64,
+    atlas: Atlas,
     committed: u64,
     log: &dyn log::Log,
 ) {
     let u = &summary.usage;
+    let Atlas { texels, side } = atlas;
+    let square = u64::from(side).saturating_mul(u64::from(side)).max(1);
     let mut head = format!(
-        "installed; atlas {atlas_texels} texels, committed {committed} of {} texels; \
-         elements {} images {} frames {} files {} fonts {} texts {} notes {}; files {}; \
-         choices ",
+        "installed; atlas {texels} texels (side {side}, {} layers), committed {committed} \
+         of {} texels; elements {} images {} frames {} files {} fonts {} texts {} notes {}; \
+         files {}; choices ",
+        texels / square,
         render::SHARED_TEXELS,
         u.elements,
         u.images,
@@ -661,20 +673,24 @@ pub fn startup(
             Ran::Refused(why) | Ran::Done(KindOutcome::Refused(why)) => Shown::Refused(why),
             Ran::Done(KindOutcome::BuiltIn(why)) => Shown::BuiltIn(why),
             Ran::Done(KindOutcome::Bundle(bundle, summary)) => {
-                let texels = bundle.atlas_texels();
-                match selected(render, kind, bundle, &mut stop)? {
-                    None => {
+                let (texels, side) = (bundle.atlas_texels(), bundle.side());
+                match selected(render, kind, bundle, &mut stop) {
+                    Ok(None) => {
                         committed = committed.saturating_add(texels);
-                        log_installed(kind, &summary, texels, committed, log::logger());
+                        let atlas = Atlas { texels, side };
+                        log_installed(kind, &summary, atlas, committed, log::logger());
                         Shown::Installed
                     }
-                    Some(why) => Shown::Refused(why),
+                    Ok(Some(why)) => Shown::Refused(why),
+                    Err(StartupEnd::Failed(e)) => {
+                        report(kind, &Shown::Refused(format!("{e:#}")));
+                        return Err(StartupEnd::Failed(e));
+                    }
+                    Err(closed) => return Err(closed),
                 }
             }
         };
-        let l = line(kind, &shown);
-        println!("{l}");
-        log::info!("{l}");
+        report(kind, &shown);
         match shown {
             Shown::Installed => {}
             Shown::Refused(why) | Shown::BuiltIn(why) if kind == ScreenKind::Play => {
@@ -692,6 +708,13 @@ pub fn startup(
         started.notice = Some(notices.join(" / "));
     }
     Ok(started)
+}
+
+/// Prints and logs `kind`'s outcome line ([`line`]).
+fn report(kind: ScreenKind, shown: &Shown) {
+    let l = line(kind, shown);
+    println!("{l}");
+    log::info!("{l}");
 }
 
 /// `kind`'s configured choice.
