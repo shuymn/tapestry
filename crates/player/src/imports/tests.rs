@@ -421,6 +421,107 @@ fn options_and_file_choices_are_chosen_by_name() {
     }
 }
 
+/// Where each of [`tagged_skin`]'s choices draws: Cover, Lift, Hidden
+/// and Frame.
+const TAGGED: [[i32; 4]; 4] = [
+    [100, 300, 100, 100],
+    [300, 300, 100, 100],
+    [500, 300, 100, 100],
+    [700, 300, 100, 100],
+];
+
+/// A play skin with three tagged file choices over `parts/*.png`, Cover,
+/// Lift and Hidden (`a.png` green, their default, and `b.png` yellow),
+/// and the folder choice Frame over `frames/*` (`x/f.png` red, the
+/// default, and `y/f.png` blue), each drawing at its place in [`TAGGED`].
+fn tagged_skin() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let [cover, lift, hidden, frame] = TAGGED;
+    let json = format!(
+        r#"{{"type": 0, "w": 1920, "h": 1080,
+            "filepath": [{{"name": "Cover", "path": "parts/*.png|cover|", "def": "a"}},
+                         {{"name": "Lift", "path": "parts/*.png|lift|", "def": "a"}},
+                         {{"name": "Hidden", "path": "parts/*.png|hidden|", "def": "a"}},
+                         {{"name": "Frame", "path": "frames/*", "def": "x"}}],
+            "source": [{{"id": "c", "path": "parts/*.png|cover|"}},
+                       {{"id": "l", "path": "parts/*.png|lift|"}},
+                       {{"id": "h", "path": "parts/*.png|hidden|"}},
+                       {{"id": "f", "path": "frames/*/f.png"}}],
+            "image": [{{"id": "c", "src": "c", "x": 0, "y": 0, "w": 16, "h": 16}},
+                      {{"id": "l", "src": "l", "x": 0, "y": 0, "w": 16, "h": 16}},
+                      {{"id": "h", "src": "h", "x": 0, "y": 0, "w": 16, "h": 16}},
+                      {{"id": "f", "src": "f", "x": 0, "y": 0, "w": 16, "h": 16}}],
+            "destination": [{}, {}, {}, {}]}}"#,
+        dst("c", cover),
+        dst("l", lift),
+        dst("h", hidden),
+        dst("f", frame)
+    );
+    fs::write(d.join("s.json"), json).unwrap();
+    png(&d.join("parts/a.png"), 16, 16, GREEN);
+    png(&d.join("parts/b.png"), 16, 16, YELLOW);
+    png(&d.join("frames/x/f.png"), 16, 16, RED);
+    png(&d.join("frames/y/f.png"), 16, 16, BLUE);
+    dir
+}
+
+/// Tagged and folder choices by their names and their candidates' entry
+/// names: only the configured choice changes; a value with the tag, a
+/// path or another letter case is no candidate, and a key that is no
+/// choice's name is not in the header.
+#[test]
+fn tagged_and_directory_choices_are_chosen_by_name() {
+    let mut r = crate::render_common::offscreen(1_920, 1_080);
+    let t = target(&r);
+    let dir = tagged_skin();
+    let colours = |p: &[u8]| TAGGED.map(|at| centre(p, at));
+    let c = choice(dir.path(), "s.json");
+    let (b, _) = bundled(play(&c, &t));
+    let p = frame(&mut r, &b, 1);
+    assert_eq!(colours(&p), [GREEN, GREEN, GREEN, RED]);
+
+    let mut c = choice(dir.path(), "s.json");
+    c.files.insert("Lift".into(), "b.png".into());
+    let (b, summary) = bundled(play(&c, &t));
+    let p = frame(&mut r, &b, 2);
+    assert_eq!(colours(&p), [GREEN, YELLOW, GREEN, RED]);
+    let lift = summary.files.iter().find(|f| f.choice == "Lift").unwrap();
+    assert_eq!(
+        (lift.candidate.as_deref(), lift.rule),
+        (Some("b.png"), Rule::Configured)
+    );
+
+    let mut c = choice(dir.path(), "s.json");
+    c.files.insert("Frame".into(), "y".into());
+    let (b, _) = bundled(play(&c, &t));
+    let p = frame(&mut r, &b, 3);
+    assert_eq!(colours(&p), [GREEN, GREEN, GREEN, BLUE]);
+
+    for (file, candidate) in [
+        ("Lift", "b.png|lift|"),
+        ("Lift", "parts/b.png"),
+        ("Lift", "B.png"),
+        ("Frame", "Y"),
+        ("Frame", "frames/y"),
+    ] {
+        let mut c = choice(dir.path(), "s.json");
+        c.files.insert(file.into(), candidate.into());
+        assert_eq!(
+            refused(play(&c, &t)),
+            format!(r#"file choice "{file}" has no candidate "{candidate}""#)
+        );
+    }
+    for file in ["parts/*.png|lift|", "lift"] {
+        let mut c = choice(dir.path(), "s.json");
+        c.files.insert(file.into(), "b.png".into());
+        assert_eq!(
+            refused(play(&c, &t)),
+            format!(r#"file choice "{file}" is not in the skin's header"#)
+        );
+    }
+}
+
 /// A Lua play skin whose configured pass runs `body` with `ms` the host
 /// module, drawing a 64×64 red `a.png` at `x`, which `body` sets.
 fn lua_skin(body: &str) -> tempfile::TempDir {

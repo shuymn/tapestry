@@ -4,7 +4,7 @@
 
 mod common;
 
-use common::{Loaded, has, hd, import_with, png, skin};
+use common::{Loaded, has, hd, import_with, join, png, skin, skin_with};
 use skin_beatoraja::{Config, FileChoice, ImportError, ImportLimit, NoteKind, Rule};
 
 /// A skin whose file choice `bg/*.png` has `def`, over `bg/` holding
@@ -149,4 +149,119 @@ fn names_of_the_wrong_form_count_every_attempt() {
         ),
         "{e:?}"
     );
+}
+
+/// A skin whose file choices `choices` (name, path, def) are listed over
+/// `parts/` holding `a.png` (8×8), `b.png` (16×16) and `c.png` (24×24),
+/// and whose sources `sources` are each drawn at its native size at
+/// `x` = 200 × its index.
+fn tagged(choices: &[(&str, &str, &str)], sources: &[&str]) -> Loaded {
+    let choices = join(
+        choices
+            .iter()
+            .map(|(n, p, d)| format!(r#"{{"name": "{n}", "path": "{p}", "def": "{d}"}}"#)),
+    );
+    let source = join(
+        sources
+            .iter()
+            .enumerate()
+            .map(|(i, p)| format!(r#"{{"id": "s{i}", "path": "{p}"}}"#)),
+    );
+    let image = join(
+        (0..sources.len()).map(|i| format!(r#"{{"id": "i{i}", "src": "s{i}", "w": -1, "h": -1}}"#)),
+    );
+    let dst = join((0..sources.len()).map(|i| {
+        format!(
+            r#"{{"id": "i{i}", "stretch": 9, "dst": [{{"x": {}, "w": 100, "h": 100}}]}}"#,
+            200 * i
+        )
+    }));
+    let json = hd(&format!(
+        r#""filepath": [{choices}], "source": [{source}], "image": [{image}], "destination": [{dst}]"#
+    ));
+    let dir = skin_with(
+        &json,
+        &[
+            ("parts/a.png", 8, 8),
+            ("parts/b.png", 16, 16),
+            ("parts/c.png", 24, 24),
+        ],
+    );
+    let result = import_with(dir.path(), |_| {});
+    Loaded { dir, result }
+}
+
+/// The native side drawn in each of `n` sources' 100-wide places, in
+/// order; `None` where nothing is drawn.
+fn sides(l: Loaded, n: i32) -> Vec<Option<i32>> {
+    let rects = l.rects(0);
+    (0..n)
+        .map(|i| {
+            let place = 200 * i..200 * i + 100;
+            rects.iter().find(|r| place.contains(&r[0])).map(|r| r[2])
+        })
+        .collect()
+}
+
+#[test]
+fn tagged_choices_substitute_independently() {
+    let l = tagged(
+        &[
+            ("Cover", "parts/*.png|cover|", "a"),
+            ("Lift", "parts/*.png|lift|", "b"),
+            ("Hidden", "parts/*.png|hidden|", "c"),
+        ],
+        &[
+            "parts/*.png|lift|",
+            "parts/*.png|hidden|",
+            "parts/*.png|cover|",
+        ],
+    );
+    assert_eq!(sides(l, 3), [Some(16), Some(24), Some(8)]);
+}
+
+#[test]
+fn the_first_declared_prefix_substitutes_and_a_kept_tag_reads_nothing() {
+    let sources = ["parts/*.png|lift|", "parts/*.png"];
+    // A tagged key declared first takes its own source; the untagged one
+    // takes the rest.
+    let l = tagged(
+        &[
+            ("Lift", "parts/*.png|lift|", "b"),
+            ("All", "parts/*.png", "a"),
+        ],
+        &sources,
+    );
+    assert_eq!(sides(l, 2), [Some(16), Some(8)]);
+    // An untagged key declared first also prefixes the tagged source,
+    // which keeps its tag: `parts/a.png|lift|`, read in the skin folder
+    // like any other name, is no file there and draws nothing.
+    let l = tagged(
+        &[
+            ("All", "parts/*.png", "a"),
+            ("Lift", "parts/*.png|lift|", "b"),
+        ],
+        &sources,
+    );
+    assert!(has(l.report(), NoteKind::MissingAsset), "{:?}", l.report());
+    assert_eq!(sides(l, 2), [None, Some(8)]);
+}
+
+#[test]
+fn tagged_patterns_fold_case_as_untagged_ones_do() {
+    let l = tagged(
+        &[("Lift", "parts/*.PNG|t|", "B")],
+        &["parts/*.PNG|t|", "parts/*.PNG|T|"],
+    );
+    // The pattern lists `b.png`, and the default differing in case picks
+    // it; the tag and the key compare exactly, so `|T|` is a glob no
+    // choice covers.
+    assert_eq!(files(&l), [chosen(Some(1), Rule::Default, false)]);
+    assert!(has(
+        l.report(),
+        NoteKind::UnsupportedField {
+            field: "source glob"
+        }
+    ));
+    assert_eq!(sides(l, 2), [Some(16), None]);
 }

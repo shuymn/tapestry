@@ -154,7 +154,7 @@ pub enum ImportError {
         at: Loc,
     },
     /// A file choice's path is not a folder and one last component with
-    /// `*` wildcards.
+    /// `*` wildcards, ending in at most one `|tag|`.
     Pattern {
         at: Loc,
     },
@@ -260,7 +260,8 @@ impl fmt::Display for ImportError {
             }
             Self::Pattern { at } => write!(
                 f,
-                "{at}: a file choice's path must be a folder and one name with `*` wildcards"
+                "{at}: a file choice's path must be a folder and one name with `*` wildcards, \
+                 ending in at most one `|tag|`"
             ),
             Self::Type {
                 at,

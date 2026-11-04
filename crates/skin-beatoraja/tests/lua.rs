@@ -1447,6 +1447,125 @@ fn a_path_in_file_path_reaches_only_the_skin_folder() {
 }
 
 #[test]
+fn tagged_choices_in_a_lua_skin() {
+    // Three choices over one pattern, told apart by their tags: each
+    // tagged key takes its own pick, and `file_path` holds the entry's
+    // name, never the tag.
+    let d = |picks: [&str; 3]| {
+        let [cover, lift, hidden] = picks;
+        folder(&[
+            (
+                "s.luaskin",
+                &skin(
+                    "filepath = {\n\
+                       { name = \"Cover\", path = \"parts/*.png|cover|\", def = \"a\" },\n\
+                       { name = \"Lift\", path = \"parts/*.png|lift|\", def = \"b\" },\n\
+                       { name = \"Hidden\", path = \"parts/*.png|hidden|\", def = \"c\" },\n\
+                     },",
+                    &format!(
+                        "for name, w in pairs({{ Cover = {{ \"cover\", \"{cover}\" }}, \
+                             Lift = {{ \"lift\", \"{lift}\" }}, Hidden = {{ \"hidden\", \"{hidden}\" }} }}) do\n\
+                           assert(skin_config.file_path[name] == w[2], name .. \" file_path\")\n\
+                           assert(skin_config.get_path(\"parts/*.png|\" .. w[1] .. \"|\") == \"parts/\" .. w[2], name .. \" get_path\")\n\
+                         end\n{DRAW_I}"
+                    ),
+                ),
+            ),
+            ("parts/a.png", ""),
+            ("parts/b.png", ""),
+            ("parts/c.png", ""),
+        ])
+    };
+    let defaults = d(["a.png", "b.png", "c.png"]);
+    let h = header(&defaults).unwrap();
+    assert!(
+        h.header()
+            .files
+            .iter()
+            .all(|f| f.candidates == ["a.png", "b.png", "c.png"])
+    );
+    common::lua_play(&h, &Config::defaults(h.header()), &Cancel::new()).unwrap();
+    // Configuring one tagged choice changes only it.
+    let lifted = d(["a.png", "c.png", "c.png"]);
+    let h = header(&lifted).unwrap();
+    let mut config = Config::defaults(h.header());
+    config.files.insert("Lift".into(), "c.png".into());
+    common::lua_play(&h, &config, &Cancel::new()).unwrap();
+}
+
+#[test]
+fn get_path_substitutes_by_the_source_formula() {
+    // The first declared key that prefixes the path substitutes; the
+    // result is the path up to its last `*`, the pick, and the path after
+    // the key, returned as it is.
+    let d = |choices: &str, body: &str| {
+        folder(&[
+            (
+                "s.luaskin",
+                &skin(
+                    &format!("filepath = {{ {choices} }},"),
+                    &format!("{body}\n{DRAW_I}"),
+                ),
+            ),
+            ("parts/a.png", ""),
+            ("parts/b.png", ""),
+            ("pre/preone.png", ""),
+        ])
+    };
+    let untagged_first = d(
+        "{ name = \"All\", path = \"parts/*.png\", def = \"a\" },\n\
+         { name = \"Lift\", path = \"parts/*.png|lift|\", def = \"b\" },",
+        "assert(skin_config.get_path(\"parts/*.png\") == \"parts/a.png\", \"untagged\")\n\
+         assert(skin_config.get_path(\"parts/*.png|lift|\") == \"parts/a.png|lift|\", \"tag kept\")\n\
+         assert(skin_config.file_path.Lift == \"b.png\", \"own pick\")",
+    );
+    let tagged_first = d(
+        "{ name = \"Lift\", path = \"parts/*.png|lift|\", def = \"b\" },\n\
+         { name = \"All\", path = \"parts/*.png\", def = \"a\" },\n\
+         { name = \"Pre\", path = \"pre/pre*.png|a|\" },",
+        "assert(skin_config.get_path(\"parts/*.png|lift|\") == \"parts/b.png\", \"tagged\")\n\
+         assert(skin_config.get_path(\"parts/*.png\") == \"parts/a.png\", \"untagged\")\n\
+         assert(skin_config.get_path(\"parts/*.png|lift|/*/x\") == \"parts/*.png|lift|/b.png/*/x\", \"last star\")\n\
+         assert(skin_config.file_path.Pre == \"preone.png\", \"prefix pick\")\n\
+         assert(skin_config.get_path(\"pre/pre*.png|a|\") == \"pre/prepreone.png\", \"literal prefix\")",
+    );
+    for d in [untagged_first, tagged_first] {
+        let h = header(&d).unwrap();
+        common::lua_play(&h, &Config::defaults(h.header()), &Cancel::new()).unwrap();
+    }
+}
+
+#[test]
+fn a_directory_choice_loads_its_selected_part() {
+    // Folders are candidates beside files; the default's first match by
+    // name or stem is the folder `y`, sorted before the file `y.lua`.
+    let d = folder(&[
+        (
+            "s.luaskin",
+            &skin(
+                "filepath = { { name = \"Frame\", path = \"custom/frame/*\", def = \"y\" } },",
+                &format!(
+                    "assert(skin_config.file_path.Frame == \"y\", \"frame\")\n\
+                     local frame = dofile(skin_config.get_path(\"custom/frame/*\") .. \"/f.lua\")\n\
+                     assert(frame.side == \"y\", \"frame part\")\n{DRAW_I}"
+                ),
+            ),
+        ),
+        ("custom/frame/x/f.lua", "return { side = \"x\" }"),
+        ("custom/frame/y/f.lua", "return { side = \"y\" }"),
+        ("custom/frame/y.lua", "return { side = \"file\" }"),
+    ]);
+    let h = header(&d).unwrap();
+    assert_eq!(h.header().files[0].candidates, ["x", "y", "y.lua"]);
+    let r = common::lua_play(&h, &Config::defaults(h.header()), &Cancel::new()).unwrap();
+    assert!(
+        r.dependencies.iter().any(|d| d == "custom/frame/y/f.lua"),
+        "{:?}",
+        r.dependencies
+    );
+}
+
+#[test]
 fn host_modules_hold_the_pinned_names_and_refuse_calls() {
     // The header pass's modules are empty, as the source loads them.
     let d = folder(&[(
