@@ -750,3 +750,58 @@ fn staged_chart_text_is_bounded() {
     assert_eq!(r.memory().staged_text, 0);
     assert_eq!(r.install_staged_loading_text(), Ok(false));
 }
+
+/// Only the slots asked for are laid out: with the title asked, the
+/// title's line (the full title the same line) is the only one, though
+/// the chart has an artist and a genre; their slots stay empty.
+#[test]
+fn only_the_named_slots_are_laid_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut r = offscreen(1_920, 1_080);
+    let text = MenuText::new(&r);
+    let (a, producer) = bundle(&r, dir.path(), &chart_texts([255, 0, 0, 255]));
+    let producer = producer.unwrap();
+    install(&mut r, &a, 1);
+    r.enter_loading(1);
+    let title = TextSlots::field(TextField::Title);
+    r.prepare_loading_text(1, 1, title, &chosen("B", "b", "g"))
+        .unwrap();
+    assert_eq!(*producer.strings.lock().unwrap(), ["B"]);
+    assert_eq!(r.install_staged_loading_text(), Ok(true));
+    assert_eq!(
+        texts(&loading(&mut r, &text, &frame_at(1, 0))),
+        [RED, BLACK, BLACK, RED]
+    );
+}
+
+/// The witness counts the staged loading text's holder with that text,
+/// its strings included, and the installed loading lines' holder with the
+/// text cache once installed; replacing the skin with `set_skin` lets go
+/// of the installed lines' holder, the cache staying.
+#[test]
+fn loading_text_holders_are_witnessed() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut r = offscreen(1_920, 1_080);
+    let (a, _) = bundle(&r, dir.path(), &chart_texts([255, 0, 0, 255]));
+    install(&mut r, &a, 1);
+    r.enter_loading(1);
+    let title = TextSlots::field(TextField::Title);
+    r.prepare_loading_text(1, 1, title, &chosen("B", "", ""))
+        .unwrap();
+    let short = r.memory().staged_text;
+    r.prepare_loading_text(1, 2, title, &chosen("BBBB", "", ""))
+        .unwrap();
+    let staged = r.memory();
+    // Two slots (the title and the full title), each holding its alias's
+    // and its line's string, 3 bytes longer.
+    assert_eq!(staged.staged_text - short, 2 * 2 * 3);
+    assert_eq!(r.install_staged_loading_text(), Ok(true));
+    let installed = r.memory();
+    assert_eq!(installed.staged_text, 0);
+    assert!(
+        installed.text_cache > staged.text_cache,
+        "{installed:?} {staged:?}"
+    );
+    r.set_skin(Box::new(render::SimpleSkin::new())).unwrap();
+    assert_eq!(r.memory().text_cache, staged.text_cache);
+}

@@ -483,3 +483,26 @@ fn cleared_loading_slots_release_their_lines() {
         .unwrap();
     assert_eq!(r.memory().text_cache, 0);
 }
+
+/// A replaced loading slot lets go of its old line, and only that slot:
+/// with the loading lines filling the layer, the title's text replaced by
+/// another installed, an attempt under pressure evicts the old title's
+/// line and never the artist's or the new title's, both still drawn.
+#[test]
+fn replaced_loading_slots_release_their_lines() {
+    let dir = step_skin();
+    let mut r = offscreen(1_920, 1_080);
+    let b = outline_support::bundle_in(&r, dir.path(), &default_font());
+    common::install(&mut r, &b, 1);
+    r.enter_loading(1);
+    prepare_loading(&mut r, 1, &labels("A", "B"));
+    assert_eq!(r.install_staged_loading_text(), Ok(true));
+    let title = TextSlots::field(skin_model::TextField::Title);
+    r.prepare_loading_text(1, 2, title, &labels("C", "B"))
+        .unwrap();
+    assert_eq!(r.text_report().counts.evictions, 0);
+    assert_eq!(r.install_staged_loading_text(), Ok(true));
+    stage(&mut r, &b, &labels("D", "E"), 2);
+    let counts = r.text_report().counts;
+    assert_eq!(counts.evictions, 1, "{counts:?}");
+}
