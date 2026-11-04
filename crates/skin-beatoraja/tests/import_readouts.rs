@@ -298,7 +298,7 @@ fn readouts_show_their_fields() {
         min_x100: 7_599,
         max_x100: 30_000,
     };
-    let mut d = Drawn::over_with(loaded.ok().skin.clone(), &chart(), Some(range));
+    let mut d = Drawn::over_with(loaded.ok().skin.clone(), &chart(), Some(range), None);
     d.readouts = Some(KNOWN);
     #[rustfmt::skip]
     let at_start = [
@@ -457,5 +457,34 @@ fn cover_conditions_read_the_stored_switches() {
         assert!(d.frame(0, &[]).is_empty(), "{negated}");
         d.readouts = Some(covers(false, false, false, false));
         assert_eq!(d.frame(16, &[]).len(), 1, "{negated}");
+    }
+}
+
+/// The chart's BPM-change conditions, by number or name and either sign,
+/// each with one D4 note, read the play context's fact: 176 while it says
+/// no change, 177 while it says a change, neither while it is unknown,
+/// where the negations draw.
+#[test]
+fn bpm_change_conditions_read_the_charts_fact() {
+    let chart = ChartBuilder::new(150_000).build().unwrap();
+    // Shown with no change, a change, and an unknown fact.
+    for (op, shown) in [
+        ("176", [true, false, false]),
+        ("-176", [false, true, true]),
+        ("177", [false, true, false]),
+        ("-177", [true, false, true]),
+        (r#""chart_bpmchange""#, [false, true, false]),
+        (r#""!chart_no_bpmchange""#, [false, true, true]),
+    ] {
+        let loaded = image(op);
+        assert_eq!(common::kinds(loaded.report()), [D4], "{op}");
+        for (fact, shown) in [Some(false), Some(true), None].into_iter().zip(shown) {
+            let mut d = Drawn::over_with(loaded.ok().skin.clone(), &chart, None, fact);
+            assert_eq!(
+                d.frame(0, &[]).len(),
+                usize::from(shown),
+                "{op} at {fact:?}"
+            );
+        }
     }
 }

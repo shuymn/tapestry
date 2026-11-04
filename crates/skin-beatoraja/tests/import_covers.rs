@@ -1231,3 +1231,26 @@ fn a_critical_set_keeps_missing_files_as_holes() {
     let l = cover_set(sources, refused, r#""cover", "gone""#, "", OVER);
     assert!(matches!(l.err(), ImportError::Asset { .. }));
 }
+
+/// SUDDEN+'s paint under the adjustment and BPM-change conditions imports
+/// with one D4 note and draws only while the covers are adjusted over a
+/// chart whose BPM changes.
+#[test]
+fn sudden_plus_paint_follows_the_bpm_change_condition() {
+    let l = with("", &[&cover(r#""op": [270, 177]"#)]);
+    assert_eq!(added_notes(&l), [NoteKind::Deviation(DeviationId::D4)]);
+    let chart = ChartBuilder::new(150_000).build().unwrap();
+    for (fact, adjusting, shown) in [
+        (Some(true), true, true),
+        (Some(true), false, false),
+        (Some(false), true, false),
+        (None, true, false),
+    ] {
+        let mut d = Drawn::over_with(l.ok().skin.clone(), &chart, None, fact);
+        let mut r = common::play::readouts_for(d.view);
+        r.covers.adjusting = adjusting;
+        d.readouts = Some(r);
+        let paints = d.shown(0).into_iter().filter(|r| r[2] == 430).count();
+        assert_eq!(paints, usize::from(shown), "{fact:?}, {adjusting}");
+    }
+}

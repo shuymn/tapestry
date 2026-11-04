@@ -171,6 +171,17 @@ fn known_unsupported_built_ins_drop() {
     );
     let e = critical(r#""op": [202]"#).err();
     assert!(matches!(e, ImportError::Critical { why: w, .. } if w == why));
+    // The chart conditions beside the BPM-change pair stay unsupported.
+    for id in [172, 1_177] {
+        let why = NoteKind::UnsupportedProperty {
+            kind: PropertyKind::Boolean,
+            id: Some(id),
+        };
+        assert!(
+            has(image(&format!(r#""op": [{id}]"#)).report(), why),
+            "{id}"
+        );
+    }
 }
 
 #[test]
@@ -338,4 +349,18 @@ fn cover_switches_by_number_and_name_build_one_condition() {
     let mut d = declared.drawn();
     // The drawn play's covers are on: the negated switch hides it.
     assert!(d.frame(0, &[]).is_empty());
+}
+
+/// Both signs of one BPM-change condition fit one source and never draw,
+/// whatever the chart's fact.
+#[test]
+fn both_signs_of_a_bpm_change_condition_never_draw() {
+    let loaded = image(r#""op": [176, -176]"#);
+    assert_eq!(common::kinds(loaded.report()), [D4]);
+    let chart = bms_model::ChartBuilder::new(150_000).build().unwrap();
+    for fact in [Some(false), Some(true), None] {
+        let skin = loaded.ok().skin.clone();
+        let mut d = common::play::Drawn::over_with(skin, &chart, None, fact);
+        assert!(d.frame(0, &[]).is_empty(), "{fact:?}");
+    }
 }

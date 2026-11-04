@@ -259,6 +259,13 @@ const COVER_CHANGING: i32 = 270;
 const COVER_ON: i32 = 271;
 const LIFT_ON: i32 = 272;
 const HIDDEN_ON: i32 = 273;
+/// The chart's BPM-change conditions (`BooleanPropertyFactory.java:439-440`):
+/// `chart_no_bpmchange` and `chart_bpmchange`, whether the chart's whole
+/// lowest and highest BPMs (`song/SongData.java:176-177`) are equal or
+/// differ, evaluated once per chart (`skin/Skin.java:199-212`). The model
+/// reads the play context's exact BPM-change fact (D4).
+const CHART_NO_BPM_CHANGE: i32 = 176;
+const CHART_BPM_CHANGE: i32 = 177;
 
 /// A condition as the importer reads it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -311,6 +318,8 @@ fn builtin(id: i32) -> Option<(String, bool)> {
         COVER_ON => Some(("cover.enabled".to_owned(), false)),
         LIFT_ON => Some(("lift.enabled".to_owned(), false)),
         HIDDEN_ON => Some(("hidden.enabled".to_owned(), false)),
+        CHART_NO_BPM_CHANGE => Some(("bpm.change_valid && !bpm.change".to_owned(), true)),
+        CHART_BPM_CHANGE => Some(("bpm.change".to_owned(), true)),
         _ => None,
     }
 }
@@ -422,23 +431,23 @@ mod tests {
 
     #[test]
     fn every_supported_condition_fits_one_source() {
-        // The built-ins with an expression, each sign: the closed set a
-        // destination's conditions come from, deduplicated.
+        // One sign of every built-in with an expression, the longer,
+        // negated one: a destination that does not list both signs of an
+        // id joins at most these.
         let mut exprs = Vec::new();
         for &(id, _) in KNOWN_BOOLEAN_IDS {
-            if [GAUGE_GROOVE, GAUGE_HARD, GAUGE_EX].contains(&id) {
-                continue;
-            }
-            for op in [id, -id] {
-                if let Cond::Expr { src, .. } = numeric(op, &BTreeMap::new()) {
-                    exprs.push(src);
+            let positive = numeric(id, &BTreeMap::new());
+            if let Cond::Expr { src, .. } = numeric(-id, &BTreeMap::new()) {
+                if let Cond::Expr { src: p, .. } = positive {
+                    assert!(src.len() > p.len(), "{id}");
                 }
+                exprs.push(src);
             }
         }
-        assert_eq!(exprs.len(), 32);
+        assert_eq!(exprs.len(), 21);
         let joined: usize =
             exprs.iter().map(|e| e.len() + 2).sum::<usize>() + 4 * (exprs.len() - 1);
-        assert_eq!(joined, 974);
+        assert_eq!(joined, 880);
         // A number's availability joins them: the longest still fits.
         let guard = [
             "bpm.range_valid",
@@ -450,6 +459,7 @@ mod tests {
         .map(|g| g.len() + 2 + 4)
         .max()
         .unwrap_or(0);
+        assert_eq!(guard, 23);
         assert!(joined + guard <= skin_model::MAX_SOURCE_BYTES);
     }
 
@@ -508,7 +518,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(exprs.len(), 38);
+        assert_eq!(exprs.len(), 42);
         let joined: usize =
             exprs.iter().map(|e| e.len() + 2).sum::<usize>() + 4 * (exprs.len() - 1);
         assert!(joined > skin_model::MAX_SOURCE_BYTES, "{joined}");
@@ -533,6 +543,22 @@ mod tests {
             // The built-ins win over items declared with their numbers.
             let items = BTreeMap::from([(id, false)]);
             assert_eq!(numeric(id, &items), expr(src, d4));
+        }
+    }
+
+    #[test]
+    fn bpm_change_conditions_read_the_charts_fact() {
+        let none = BTreeMap::new();
+        for (id, name, src) in [
+            (176, "chart_no_bpmchange", "bpm.change_valid && !bpm.change"),
+            (177, "chart_bpmchange", "bpm.change"),
+        ] {
+            assert_eq!(numeric(id, &none), expr(src, true));
+            assert_eq!(numeric(-id, &none), expr(&format!("!({src})"), true));
+            assert_eq!(named(name), Some(expr(src, true)));
+            // The built-ins win over items declared with their numbers.
+            let items = BTreeMap::from([(id, false)]);
+            assert_eq!(numeric(id, &items), expr(src, true));
         }
     }
 
