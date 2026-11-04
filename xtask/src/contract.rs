@@ -699,11 +699,11 @@ fn tags(
     let mut tagged = Tagged::new();
     for (file, source) in sources {
         let lines: Vec<&str> = source.lines().collect();
-        // Each fn: the start of its run, its line, its name.
-        let fns: Vec<(usize, usize, &str)> = lines
+        // Each fn: its line and its name.
+        let fns: Vec<(usize, &str)> = lines
             .iter()
             .enumerate()
-            .filter_map(|(i, l)| fn_name(l).map(|name| (attributes(&lines, i).0, i, name)))
+            .filter_map(|(i, l)| fn_name(l).map(|name| (i, name)))
             .collect();
         for (i, line) in lines.iter().enumerate() {
             let Some(rest) = line.trim().strip_prefix(TAG) else {
@@ -723,9 +723,9 @@ fn tags(
                 diags.push(format!("{place}: `{id}` is not a threat ID"));
             }
             // The first fn below the tag, if the tag is in its run.
-            let below = fns.iter().find(|&&(_, def, _)| def > i);
-            let test = below.and_then(|&(start, def, name)| {
-                let (_, attrs) = attributes(&lines, def);
+            let below = fns.iter().find(|&&(def, _)| def > i);
+            let test = below.and_then(|&(def, name)| {
+                let (start, attrs) = attributes(&lines, def);
                 (start <= i && is_test(&attrs)).then_some((name, is_ignored(&attrs)))
             });
             match test {
