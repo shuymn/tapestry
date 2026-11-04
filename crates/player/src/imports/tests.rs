@@ -20,7 +20,7 @@ use skin_model::{ChartText, ScreenKind};
 use crate::render_json::centre;
 
 use super::{
-    ENDED, ImportTarget, KindOutcome, PANICKED, Ran, STOP_WAIT, Shown, Summary, build, line,
+    Atlas, ENDED, ImportTarget, KindOutcome, PANICKED, Ran, STOP_WAIT, Shown, Summary, build, line,
     log_installed, notice, run_cancellable,
 };
 
@@ -603,7 +603,7 @@ fn a_text_producer_comes_only_with_rasterized_text() {
 /// sandbox's time cap (seconds) unless cancelled, and a cancellation is
 /// seen within a check's 100 instructions.
 #[cfg(feature = "dev-tools")]
-fn looping() -> tempfile::TempDir {
+pub(super) fn looping() -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     fs::write(
         dir.path().join("s.luaskin"),
@@ -695,7 +695,7 @@ impl std::fmt::Debug for Witness {
 /// strings takes.
 #[cfg(feature = "dev-tools")]
 #[track_caller]
-fn executing(base: usize) {
+pub(super) fn executing(base: usize) {
     use skin_beatoraja::lua::vm_hooks;
     assert!(wait_until(|| vm_hooks::live() > base));
     let from = vm_hooks::steps();
@@ -884,13 +884,19 @@ fn an_installed_skin_logs_its_summary_and_notes() {
     summary.suppressed = 2;
     let kept = Kept::default();
     let texels = b.atlas_texels();
-    log_installed(ScreenKind::Play, &summary, texels, texels + 5, &kept);
+    let atlas = Atlas {
+        texels,
+        side: b.side(),
+    };
+    let layers = texels / u64::from(b.side()).pow(2);
+    log_installed(ScreenKind::Play, &summary, atlas, texels + 5, &kept);
     let logged = kept.0.into_inner().unwrap();
     assert_eq!(logged.len(), 1 + 100 + 1, "{logged:?}");
     let head = &logged[0];
     assert!(
         head.starts_with(&format!(
-            "skin: play: installed; atlas {texels} texels, committed {} of {} texels; ",
+            "skin: play: installed; atlas {texels} texels (side {}, {layers} layers), committed {} of {} texels; ",
+            b.side(),
             texels + 5,
             render::SHARED_TEXELS
         )),
@@ -915,7 +921,7 @@ fn an_installed_skin_logs_its_summary_and_notes() {
     summary.notes.truncate(2);
     summary.suppressed = 0;
     let kept = Kept::default();
-    log_installed(ScreenKind::Play, &summary, texels, texels, &kept);
+    log_installed(ScreenKind::Play, &summary, atlas, texels, &kept);
     assert_eq!(kept.0.into_inner().unwrap().len(), 3);
 }
 
@@ -931,14 +937,20 @@ fn the_texel_figures_survive_a_long_summary() {
         .map(|i| format!("parts/a-rather-long-definition-name-{i:02}.json"))
         .collect();
     let texels = b.atlas_texels();
+    let atlas = Atlas {
+        texels,
+        side: b.side(),
+    };
+    let layers = texels / u64::from(b.side()).pow(2);
     let lines = crate::log_file::through_the_sink(|log| {
-        log_installed(ScreenKind::Play, &summary, texels, texels + 5, log);
+        log_installed(ScreenKind::Play, &summary, atlas, texels + 5, log);
     });
     let head = &lines[0];
     let u = &summary.usage;
     let figures = format!(
-        "skin: play: installed; atlas {texels} texels, committed {} of {} texels; \
+        "skin: play: installed; atlas {texels} texels (side {}, {layers} layers), committed {} of {} texels; \
          elements {} images {} frames {} files {} fonts {} texts {} notes {}; files ",
+        b.side(),
         texels + 5,
         render::SHARED_TEXELS,
         u.elements,
@@ -989,3 +1001,5 @@ fn the_reports_carry_text_only() {
     };
     assert_eq!(shown, format!("スキンを使えません: {reason}"));
 }
+
+mod startup;

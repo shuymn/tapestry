@@ -326,6 +326,12 @@ pub trait Screen: Send {
     fn target(&self) -> [u32; 2] {
         [1_920, 1_080]
     }
+    /// The limits a skin's atlas is packed within for this screen's
+    /// device ([`render::Renderer::atlas_limits`]); `None` for a screen
+    /// that installs no declarative skin, the default.
+    fn atlas_limits(&self) -> Option<skin_model::AtlasLimits> {
+        None
+    }
     /// Whether the window is minimized: frames are neither paced nor
     /// presented until a nonzero size is applied. The default is never.
     fn minimized(&self) -> bool {
@@ -687,6 +693,10 @@ struct Shared {
     /// before it takes the commits' lock (tests).
     #[cfg(test)]
     commit_timed_out: AtomicBool,
+    /// The atlas limits and the target size of the screen built last,
+    /// written at each build: what a skin is packed for
+    /// ([`RenderLink::atlas_limits`]).
+    packing: Mutex<Option<(skin_model::AtlasLimits, [u32; 2])>>,
 }
 
 /// The last request committed and the last whose commit the game thread
@@ -799,6 +809,12 @@ struct EndSlot {
 }
 
 impl Shared {
+    /// Publishes what skins are packed for on `screen`, just built.
+    fn built(&self, screen: &dyn Screen) {
+        *self.packing.lock().unwrap_or_else(PoisonError::into_inner) =
+            screen.atlas_limits().map(|l| (l, screen.target()));
+    }
+
     fn slot(&self) -> std::sync::MutexGuard<'_, EndSlot> {
         self.end_page.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -1159,12 +1175,8 @@ impl RenderLink {
     /// so its screen draws its built-in presentation. The game thread
     /// goes on and polls the answer ([`PendingSelect::poll`]); a skin past
     /// the texels the screens share is refused with the reason.
-    /// Production selection draws the simple skin and selects nothing;
-    /// tests choose a fixture.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "production selects no declarative skin yet")
-    )]
+    /// Startup selects each configured kind's skin
+    /// ([`crate::imports::startup`]).
     pub fn select(&self, kind: ScreenKind, skin: Option<Arc<SkinBundle>>) -> PendingSelect {
         let request = self.requests.fetch_add(1, Ordering::Relaxed) + 1;
         let (reply, rx) = mpsc::sync_channel(1);
@@ -1181,6 +1193,17 @@ impl RenderLink {
             shared: Arc::clone(&self.shared),
             settled: false,
         }
+    }
+
+    /// The atlas limits of the screen built last and its target size:
+    /// what a skin is packed for; `None` before a screen that installs
+    /// declarative skins was built.
+    pub fn atlas_limits(&self) -> Option<(skin_model::AtlasLimits, [u32; 2])> {
+        *self
+            .shared
+            .packing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Prepares `chart` for every play from now on, and waits until it is.
@@ -1499,7 +1522,9 @@ pub(crate) const SELECT_SLICE: Duration = Duration::from_millis(1);
 /// The play skin's installation as the game thread sees it: a chart is
 /// admitted (chosen to play, or a practice Start) only once the skin it
 /// shows is installed, so the loading state always draws the skin's own
-/// loading frame. Production draws the simple skin, always ready.
+/// loading frame. Startup leaves it ready, or refused when the configured
+/// play skin was refused ([`crate::imports::startup`]); without one the
+/// simple skin draws, always ready.
 #[derive(Debug, Default)]
 pub enum SkinState {
     /// Installed: charts are admitted.
@@ -1602,6 +1627,7 @@ pub fn spawn(
         commits: Mutex::new(Commits::default()),
         #[cfg(test)]
         commit_timed_out: AtomicBool::new(false),
+        packing: Mutex::new(None),
     });
     let thread_shared = Arc::clone(&shared);
     let (ended_tx, ended) = mpsc::sync_channel::<()>(0);
@@ -1619,6 +1645,7 @@ pub fn spawn(
                 section.as_ref(),
             ) {
                 Ok(screen) => {
+                    thread_shared.built(screen.as_ref());
                     let _ = ready_tx.send(Ok(()));
                     screen
                 }
@@ -2590,6 +2617,11 @@ impl Run {
         }
     }
 
+    /// Publishes what skins are packed for on the screen just built.
+    fn built(&self, screen: &dyn Screen) {
+        self.shared.built(screen);
+    }
+
     /// Builds the screen again after a failure, without a chart: the
     /// device's recovery. A screen that can draw is kept as it is.
     fn recover(&mut self) -> Result<(), RenderError> {
@@ -2598,6 +2630,7 @@ impl Run {
             // The committed bundle, from memory: never read again from its
             // files, never another skin in its place.
             let screen = build(&mut self.make, &mut self.committed, None, None)?;
+            self.built(screen.as_ref());
             self.screen = Some(screen);
             // The new screen takes the window's size afresh.
             self.applied = None;
@@ -2900,6 +2933,7 @@ impl Run {
             (Some(s), Some(chart)) => s.load(chart, section),
             (Some(_), None) => Ok(()),
             (None, _) => build(&mut self.make, &mut self.committed, chart, section).map(|s| {
+                self.built(s.as_ref());
                 self.screen = Some(s);
                 // The new screen takes the window's size afresh.
                 self.applied = None;
@@ -6655,6 +6689,13 @@ pub(crate) mod tests {
         }
         fn installation(&self, kind: ScreenKind) -> Option<render::Installation> {
             self.installed.get(kind).cloned()
+        }
+        fn atlas_limits(&self) -> Option<skin_model::AtlasLimits> {
+            Some(skin_model::AtlasLimits {
+                max_side: 8_192,
+                max_layers: 256,
+                reserved_layers: render::RESERVED_LAYERS,
+            })
         }
         fn restore(
             &mut self,

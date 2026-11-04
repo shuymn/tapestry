@@ -17,6 +17,8 @@ use std::sync::{Condvar, Mutex, PoisonError};
 static LIVE: AtomicUsize = AtomicUsize::new(0);
 /// The instruction hook steps run.
 static STEPS: AtomicU64 = AtomicU64::new(0);
+/// The passes whose VM was created.
+static PASSES: AtomicU64 = AtomicU64::new(0);
 
 /// Whether destructions are held, and how many wait at the barrier.
 static BARRIER: Mutex<Barrier> = Mutex::new(Barrier {
@@ -34,6 +36,12 @@ struct Barrier {
 #[must_use]
 pub fn live() -> usize {
     LIVE.load(Ordering::SeqCst)
+}
+
+/// The Lua passes that have created their VM in the process so far.
+#[must_use]
+pub fn passes() -> u64 {
+    PASSES.load(Ordering::SeqCst)
 }
 
 /// The instruction hook steps every VM has run so far.
@@ -80,6 +88,7 @@ pub(super) fn thread_live() -> usize {
 /// alike.
 pub(super) fn opened() -> Open {
     LIVE.fetch_add(1, Ordering::SeqCst);
+    PASSES.fetch_add(1, Ordering::SeqCst);
     #[cfg(test)]
     THREAD_LIVE.with(|n| n.set(n.get() + 1));
     Open
