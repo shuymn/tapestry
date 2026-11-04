@@ -469,18 +469,8 @@ fn option_tables_are_copied_by_path_once_a_pass() {
     // 100 `_ENV` tables over one option table of 600 names of 6 000
     // bytes: of the option table, only the entry a path reads is copied,
     // once, its name interned once; each instance's path hashes it.
-    let d = folder(&options_entry(600, 6_000, 100, true));
-    let cancel = Cancel::new();
-    let h = read_lua_header(d.path(), "s.luaskin", &cancel).unwrap();
-    let facts = super::facts::ImportFacts::unavailable(skin_model::ScreenKind::Play);
-    let (def, _, _, _) = h.configured(&Config::defaults(h.header()), &facts, &cancel);
-    let def = def.unwrap();
-    let an = def
-        .arena
-        .lua
-        .as_deref()
-        .and_then(|l| l.analysis.as_deref())
-        .unwrap();
+    let def = super::root_tests::configured(&options_entry(600, 6_000, 100, true));
+    let an = super::root_tests::analysis(&def);
     // The 100 `_ENV` tables, `skin_config` and its `option`.
     assert_eq!(an.tables.len(), 102);
     let option = an.tables.iter().filter(|t| t.len() == 1).count();
