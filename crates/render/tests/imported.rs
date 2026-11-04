@@ -22,7 +22,7 @@ use json_support::{
 };
 use render::text::MenuText;
 use render::{AttemptInput, LoadingFrame, LoadingTextError, Renderer, SkinBundle};
-use skin_model::{ChartText, TextField, TextSlots, timer};
+use skin_model::{ChartText, ScreenKind, TextField, TextSlots, timer};
 
 const BLACK: [u8; 3] = [0; 3];
 const MS: i64 = 1_000;
@@ -276,7 +276,10 @@ fn lift_paint_is_cut_at_its_trim_line_as_the_covers_change() {
 
 /// The installed presentation's `screen` timer start.
 fn screen(r: &Renderer) -> Option<TimeUs> {
-    r.installation().unwrap().loading().timer(timer::SCREEN)
+    r.installation(ScreenKind::Play)
+        .unwrap()
+        .loading()
+        .timer(timer::SCREEN)
 }
 
 /// The centre of canvas rect `rect`, as a pixel.

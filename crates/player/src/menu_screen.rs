@@ -36,7 +36,7 @@ use render::{
     AttemptInput, Blend, CommitError, FrameTiming, Installation, LoadingFrame, LoadingTextError,
     LoadingTextKey, PreparedToken, RenderError, Renderer, SkinBundle, Sprite, solid_uv,
 };
-use skin_model::{BuildError, ChartText, TextField, TextSlots};
+use skin_model::{BuildError, ChartText, ScreenKind, TextField, TextSlots};
 
 use crate::loading_state::LoadingUpdate;
 use crate::loading_text::ChosenChart;
@@ -557,27 +557,37 @@ impl Screen for MenuScreen {
         self.renderer.discard();
     }
 
-    /// Stages `skin`'s chart-independent installation, answering at
-    /// once; a refusal on a healthy device ([`RenderError::is_refusal`])
-    /// keeps the installation in use.
+    /// Stages `skin`'s chart-independent installation of `kind`,
+    /// answering at once; a refusal on a healthy device
+    /// ([`RenderError::is_refusal`]), the texels the screens share
+    /// included, keeps every installation in use.
     fn install(
         &mut self,
+        kind: ScreenKind,
         skin: &Arc<SkinBundle>,
         request: u64,
     ) -> Result<Preparation, RenderError> {
-        match self.renderer.install(skin, request) {
+        match self.renderer.install(kind, skin, request) {
             Ok(_) => Ok(Preparation::Ready),
             Err(e) if e.is_refusal() => Ok(refusal(game::Chain(&e).to_string())),
             Err(e) => Err(e),
         }
     }
 
-    fn installation(&self) -> Option<Installation> {
-        self.renderer.installation()
+    fn installation(&self, kind: ScreenKind) -> Option<Installation> {
+        self.renderer.installation(kind)
     }
 
-    fn restore(&mut self, installation: &Installation) -> Result<(), RenderError> {
-        self.renderer.restore(installation)
+    fn restore(
+        &mut self,
+        kind: ScreenKind,
+        installation: &Installation,
+    ) -> Result<(), RenderError> {
+        self.renderer.restore(kind, installation)
+    }
+
+    fn remove(&mut self, kind: ScreenKind) {
+        self.renderer.remove(kind);
     }
 
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]

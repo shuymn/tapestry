@@ -3,8 +3,8 @@
 //! committed whole, its skin, uv table, atlas, clips and capacities
 //! switching together; a staging refused or a commit refused leaving the
 //! installation in use drawing; the installed bundle reused by a later
-//! attempt, which starts fresh; a committed bundle restored on another
-//! renderer from memory alone; and the bytes a replacement holds at its
+//! attempt, which starts fresh; each kind's committed bundle restored on
+//! another renderer from memory alone; and the bytes a replacement holds at its
 //! peak.
 //!
 //! The skins are fixed 1920×1080 canvases on a 1920×1080 target, so canvas
@@ -28,7 +28,7 @@ use render::{
 };
 
 use rules::GaugeValue;
-use skin_model::{BuildError, GaugeDesc, GaugeLook, Side};
+use skin_model::{BuildError, GaugeDesc, GaugeLook, ScreenKind, Side};
 
 const BLACK: [u8; 3] = [0; 3];
 const RED: [u8; 3] = [255, 0, 0];
@@ -171,11 +171,11 @@ fn a_commit_switches_the_whole_installation_together() {
 
     let token = stage(&mut r, &a, &chart, 1).unwrap();
     assert_eq!(r.staged(), Some(token));
-    assert!(r.installed().is_none());
+    assert!(r.installed(ScreenKind::Play).is_none());
     let before = r.resource_generation();
     r.commit(token).unwrap();
     assert!(r.staged().is_none());
-    assert!(Arc::ptr_eq(r.installed().unwrap(), &a));
+    assert!(Arc::ptr_eq(r.installed(ScreenKind::Play).unwrap(), &a));
     assert_eq!(r.resource_generation(), before + 1);
     assert_eq!((r.atlas_size().0, r.capacity()), (256, least));
     assert_eq!(r.clips().len(), 1);
@@ -191,7 +191,7 @@ fn a_commit_switches_the_whole_installation_together() {
     }
     assert_eq!((r.atlas_size().0, r.capacity()), (256, least));
     r.commit(token).unwrap();
-    assert!(Arc::ptr_eq(r.installed().unwrap(), &b));
+    assert!(Arc::ptr_eq(r.installed(ScreenKind::Play).unwrap(), &b));
     assert_eq!(r.atlas_size().0, 512);
     assert_eq!(r.capacity(), (9_501, 9_501));
     let (sprites, p) = frame(&mut r);
@@ -229,11 +229,12 @@ fn a_refused_staging_leaves_the_installation_in_use_drawing() {
     assert_eq!(
         r.commit(PreparedToken {
             request: 2,
-            device: r.device_generation()
+            device: r.device_generation(),
+            kind: ScreenKind::Play,
         }),
         Err(CommitError::NothingStaged)
     );
-    assert!(Arc::ptr_eq(r.installed().unwrap(), &a));
+    assert!(Arc::ptr_eq(r.installed(ScreenKind::Play).unwrap(), &a));
     assert_eq!(r.resource_generation(), generation);
     let (sprites, p) = frame(&mut r);
     assert_eq!(sprites, 1);
@@ -278,7 +279,7 @@ fn a_commit_checks_the_request_and_the_device_apart() {
     };
     assert_eq!(r.commit(moved), Err(CommitError::Device));
     assert_eq!(r.staged(), Some(token));
-    assert!(r.installed().is_none());
+    assert!(r.installed(ScreenKind::Play).is_none());
 
     r.commit(token).unwrap();
     let (_, p) = frame(&mut r);
@@ -418,8 +419,9 @@ fn repeated_rearms_keep_the_memory_witness_flat() {
     halves(&read_back(&r), RED, BLACK);
 }
 
-/// A renderer made again after a device failure restores the committed
-/// bundle from memory, its image files gone: it draws nothing until an
+/// A renderer made again after a device failure restores each kind's
+/// committed bundle from memory into that kind's own slot, its image files
+/// gone, with the same charges as before: play's draws nothing until an
 /// attempt is staged, which reuses the restored resources and draws as
 /// before.
 #[test]
@@ -430,14 +432,36 @@ fn a_restored_bundle_needs_no_file() {
     let (a, _) = bundle(&r, dir.path(), &red());
     let token = stage(&mut r, &a, &chart, 1).unwrap();
     r.commit(token).unwrap();
+    // The other kinds' own images: green, blue on a 512-texel page, white.
+    let others = [
+        (ScreenKind::Selection, Look::left([0, 255, 0, 255])),
+        (ScreenKind::Decision, blue()),
+        (ScreenKind::Result, Look::left([255, 255, 255, 255])),
+    ];
+    let mut request = 1;
+    let mut kept = vec![(ScreenKind::Play, r.installation(ScreenKind::Play).unwrap())];
+    for (kind, look) in &others {
+        let (b, _) = bundle(&r, dir.path(), look);
+        request += 1;
+        let token = r.install(*kind, &b, request).unwrap();
+        r.commit(token).unwrap();
+        kept.push((*kind, r.installation(*kind).unwrap()));
+    }
+    let admission = r.admission();
+    assert_eq!(admission.candidate, None);
+    assert!(admission.committed.iter().all(|&c| c > 0), "{admission:?}");
     drop(r);
     dir.close().unwrap();
 
     let mut again = offscreen(1_920, 1_080);
-    again
-        .restore(&render::Installation::new(Arc::clone(&a)))
-        .unwrap();
-    assert!(Arc::ptr_eq(again.installed().unwrap(), &a));
+    for (kind, installation) in &kept {
+        again.restore(*kind, installation).unwrap();
+    }
+    for (kind, installation) in &kept {
+        let installed = again.installed(*kind).unwrap();
+        assert!(Arc::ptr_eq(installed, installation.bundle()), "{kind:?}");
+    }
+    assert_eq!(again.admission(), admission);
     let generation = again.resource_generation();
     let (sprites, p) = frame(&mut again);
     assert_eq!(sprites, 0);

@@ -12,7 +12,8 @@ use std::time::{Duration, Instant};
 use bms_model::Chart;
 use eval::Section;
 use skin_model::{
-    AtlasLimits, BitmapLines, BuildError, ChartText, TextSlots, TextTable, TextTableError,
+    AtlasLimits, BitmapLines, BuildError, ChartText, ScreenKind, TextSlots, TextTable,
+    TextTableError,
 };
 use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
 use windows::Win32::Graphics::Dxgi::{DXGI_FRAME_STATISTICS, IDXGISwapChain3};
@@ -39,6 +40,34 @@ static RENDERERS: AtomicU64 = AtomicU64::new(0);
 /// Sprites one frame of the built-in screens can draw, across both
 /// blends: the least the renderer's batch holds ([`PlaySkin::capacity`]).
 pub const MAX_SPRITES: usize = 8_192;
+
+/// The level-0 texels every screen kind's committed installation shares
+/// with a candidate ([`Renderer::admit`]): one atlas array's cap
+/// ([`skin_model::MAX_ATLAS_TEXELS`]), so any skin that fits alone is
+/// admitted on its own.
+pub const SHARED_TEXELS: u64 = skin_model::MAX_ATLAS_TEXELS;
+
+/// What an installation keeping a Lua VM is charged beside its atlas, in
+/// level-0 texels: a VM's memory cap (64 MiB) at the 4 bytes of an RGBA8
+/// texel. A fixed charge, not a measurement.
+pub const VM_TEXELS: u64 = 16 << 20;
+
+/// The screen kinds in their order: the order of
+/// [`Admission::committed`] and of a recovery's restores.
+const KINDS: [ScreenKind; 4] = [
+    ScreenKind::Play,
+    ScreenKind::Selection,
+    ScreenKind::Decision,
+    ScreenKind::Result,
+];
+
+/// What `bundle` is charged against [`SHARED_TEXELS`] while committed:
+/// its atlas array's level-0 texels, and [`VM_TEXELS`] when it keeps a
+/// VM.
+fn charge_of(bundle: &SkinBundle) -> u64 {
+    let vm = if bundle.keeps_vm() { VM_TEXELS } else { 0 };
+    bundle.atlas_texels().saturating_add(vm)
+}
 
 const SPRITE_WGSL: &str = r"
 // An `Instance`: its pivot and angle share location 3, and its flags hold
@@ -253,20 +282,36 @@ pub enum RenderError {
         /// The newer request staged or committed.
         newer: u64,
     },
+    /// A skin of `kind` with every other kind's committed skin would
+    /// pass the texels the screens share ([`Renderer::admit`]): nothing
+    /// was allocated, and every installation in use stays.
+    #[error("the {kind} skin needs {needed} texels with the other screens' skins, past {limit}")]
+    Admission {
+        /// The kind the skin was asked for.
+        kind: ScreenKind,
+        /// The other kinds' committed charges and the skin's.
+        needed: u64,
+        /// [`SHARED_TEXELS`].
+        limit: u64,
+    },
 }
 
 impl RenderError {
     /// Whether this is a refusal of what was asked while the device stays
     /// healthy (design.md "Play Lifecycle", preparing each attempt): the
     /// skin cannot draw the attempt, its atlas is past the checks or was
-    /// refused by the device for memory or validation, or its sprites do
-    /// not fit a buffer. The renderer is unchanged and goes on drawing; an
-    /// attempt is refused, not the screen. Anything else, the device or
-    /// the surface failing, drops the screen.
+    /// refused by the device for memory or validation, its sprites do
+    /// not fit a buffer, or it is past the texels the screens share. The
+    /// renderer is unchanged and goes on drawing; an attempt is refused,
+    /// not the screen. Anything else, the device or the surface failing,
+    /// drops the screen.
     #[must_use]
     pub const fn is_refusal(&self) -> bool {
         match self {
-            Self::Skin(_) | Self::Capacity { .. } | Self::Superseded { .. } => true,
+            Self::Skin(_)
+            | Self::Capacity { .. }
+            | Self::Superseded { .. }
+            | Self::Admission { .. } => true,
             Self::Atlas(UploadError::Device(e)) => matches!(
                 e,
                 wgpu::Error::OutOfMemory { .. } | wgpu::Error::Validation { .. }
@@ -277,15 +322,18 @@ impl RenderError {
     }
 }
 
-/// An installation staged by [`Renderer::stage`] and not yet committed:
-/// the request it answers and the renderer, so its device, it was staged
-/// on.
+/// An installation staged by [`Renderer::stage`] or
+/// [`Renderer::install`] and not yet committed: the request it answers,
+/// the renderer, so its device, it was staged on, and the screen kind it
+/// installs for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PreparedToken {
     /// The preparation request it answers.
     pub request: u64,
     /// [`Renderer::device_generation`] of the renderer that staged it.
     pub device: u64,
+    /// The screen kind it installs for.
+    pub kind: ScreenKind,
 }
 
 /// Why [`Renderer::commit`] installed nothing. The installation in use
@@ -302,6 +350,14 @@ pub enum CommitError {
         staged: u64,
         /// The request committed.
         asked: u64,
+    },
+    /// The staged installation is for another screen kind.
+    #[error("the staged installation is for the {staged} screen, not the {asked} screen")]
+    Kind {
+        /// The kind staged.
+        staged: ScreenKind,
+        /// The kind committed.
+        asked: ScreenKind,
     },
     /// The token was staged on another renderer, whose device this one
     /// replaced.
@@ -327,21 +383,67 @@ struct Resources {
     instances: wgpu::Buffer,
 }
 
-/// An installation staged and not yet committed: the fresh skin with its
-/// prepared attempt, or none for a chart-independent installation
-/// ([`Renderer::install`]), sharing the installation's loading
-/// presentation, and its own resources, or `None` when it reuses the
-/// installed bundle's.
+/// A screen kind's committed installation other than play's: its
+/// installation and its own resources. No frame draws it yet.
+struct Slot {
+    installation: Installation,
+    resources: Resources,
+}
+
+/// An installation staged and not yet committed, of the kind its token
+/// names: the fresh skin with its prepared attempt, or none for a
+/// chart-independent installation ([`Renderer::install`]; a kind other
+/// than play's is never prepared, its skin only carrying its
+/// installation), sharing the installation's loading presentation, and
+/// its own resources, or `None` when it reuses its kind's committed
+/// bundle's.
 struct Pending {
     token: PreparedToken,
     skin: DeclSkin,
     resources: Option<Resources>,
 }
 
-/// What a renderer holds in memory for its play skin, in bytes, as a
-/// witness of the peak a skin's replacement reaches (design.md "Memory
-/// Budget"): the installed resources and the staged ones live together
-/// until the commit.
+/// The level-0 texels charged against [`SHARED_TEXELS`] now
+/// ([`Renderer::admission`]): what [`Renderer::admit`] sums.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Admission {
+    /// Each kind's committed installation, in [`ScreenKind`] order (play,
+    /// selection, decision, result); 0 for none, and for play's built-in
+    /// skin.
+    pub committed: [u64; 4],
+    /// The staged installation's kind and charge, if any.
+    pub candidate: Option<(ScreenKind, u64)>,
+}
+
+impl Admission {
+    /// `kind`'s committed charge.
+    #[must_use]
+    pub const fn charge(&self, kind: ScreenKind) -> u64 {
+        let [play, selection, decision, result] = self.committed;
+        match kind {
+            ScreenKind::Play => play,
+            ScreenKind::Selection => selection,
+            ScreenKind::Decision => decision,
+            ScreenKind::Result => result,
+        }
+    }
+
+    /// Every kind's committed charge together.
+    #[must_use]
+    pub const fn committed_total(&self) -> u64 {
+        let [play, selection, decision, result] = self.committed;
+        play.saturating_add(selection)
+            .saturating_add(decision)
+            .saturating_add(result)
+    }
+}
+
+/// What a renderer holds in memory for its play skin and the one staged
+/// installation of any kind, in bytes, as a witness of the peak a skin's
+/// replacement reaches (design.md "Memory Budget"): the installed
+/// resources and the staged ones live together until the commit. The
+/// other kinds' committed installations are reported only through
+/// [`Renderer::admission`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MemoryWitness {
     /// The installed bundle's CPU description, kept for recovery.
@@ -523,6 +625,10 @@ pub struct Renderer {
     /// presentation; `None` for the simple skin or one set with
     /// [`set_skin`](Self::set_skin).
     installed: Option<Installation>,
+    /// The selection, decision and result screens' committed
+    /// installations, each with its own atlas array, so changing screens
+    /// never swaps an atlas ([`screen`](Self::screen) gives a kind's).
+    screens: [Option<Slot>; 3],
     /// The request committed last ([`commit`](Self::commit)): no staging
     /// or commit of a request up to it is taken.
     committed: u64,
@@ -644,6 +750,7 @@ impl Renderer {
             staging,
             skin,
             installed: None,
+            screens: [None, None, None],
             committed: 0,
             requested: 0,
             resources: 0,
@@ -719,12 +826,40 @@ impl Renderer {
             }
         }
         self.project();
+        let target = self.target();
+        for slot in self.screens.iter_mut().flatten() {
+            let canvas = slot.installation.bundle().skin().canvas(target);
+            slot.resources.staging.project(&canvas);
+        }
     }
 
     /// Projects the play skin's canvas and clips onto the current target.
     fn project(&mut self) {
         let canvas = self.skin.canvas(self.target());
         self.staging.project(&canvas);
+    }
+
+    /// Where `kind`'s slot is in [`screens`](Self::screens); `None` for
+    /// play, whose installation is the renderer's own fields.
+    const fn screen(kind: ScreenKind) -> Option<usize> {
+        match kind {
+            ScreenKind::Play => None,
+            ScreenKind::Selection => Some(0),
+            ScreenKind::Decision => Some(1),
+            ScreenKind::Result => Some(2),
+        }
+    }
+
+    /// `kind`'s committed installation, if any.
+    fn committed_installation(&self, kind: ScreenKind) -> Option<&Installation> {
+        match Self::screen(kind) {
+            None => self.installed.as_ref(),
+            Some(i) => self
+                .screens
+                .get(i)
+                .and_then(Option::as_ref)
+                .map(|s| &s.installation),
+        }
     }
 
     /// Replaces the play skin, sizing the batch, the staging and the
@@ -891,18 +1026,18 @@ impl Renderer {
         self.id
     }
 
-    /// The declarative bundle installed, if any.
+    /// The declarative bundle committed for `kind`, if any.
     #[must_use]
-    pub fn installed(&self) -> Option<&Arc<SkinBundle>> {
-        self.installed.as_ref().map(Installation::bundle)
+    pub fn installed(&self, kind: ScreenKind) -> Option<&Arc<SkinBundle>> {
+        self.committed_installation(kind).map(Installation::bundle)
     }
 
-    /// The declarative installation in use, its bundle with its loading
-    /// presentation, shared: what the render thread keeps to restore on a
-    /// renderer built again ([`restore`](Self::restore)).
+    /// `kind`'s committed declarative installation, its bundle with its
+    /// loading presentation, shared: what the render thread keeps to
+    /// restore on a renderer built again ([`restore`](Self::restore)).
     #[must_use]
-    pub fn installation(&self) -> Option<Installation> {
-        self.installed.clone()
+    pub fn installation(&self, kind: ScreenKind) -> Option<Installation> {
+        self.committed_installation(kind).cloned()
     }
 
     /// How many times the atlas and the staging were replaced.
@@ -953,36 +1088,96 @@ impl Renderer {
         a: &AttemptInput<'_>,
         request: u64,
     ) -> Result<PreparedToken, RenderError> {
-        self.stage_with(bundle, Some(a), request)
+        self.stage_with(ScreenKind::Play, bundle, Some(a), request)
     }
 
-    /// Stages `bundle`'s chart-independent installation for `request`: as
-    /// [`stage`](Self::stage), the atlas with the built-in layer, the
-    /// clips, the staging, the instance buffer and the loading
-    /// presentation, with no attempt and no `Play`. Its frames draw
+    /// Stages `bundle`'s chart-independent installation of `kind` for
+    /// `request`: as [`stage`](Self::stage), the atlas with the built-in
+    /// layer, the clips, the staging, the instance buffer and the loading
+    /// presentation, with no attempt and no `Play`. Play's frames draw
     /// nothing of a play until an attempt is staged and committed; its
-    /// loading frames draw its presentation. Staging the bundle installed
-    /// keeps its resources and its presentation.
+    /// loading frames draw its presentation. Another kind's installation
+    /// takes its own slot at its commit and is not drawn yet. Staging
+    /// `kind`'s committed bundle keeps its resources and its presentation.
     ///
     /// # Errors
     ///
     /// As [`stage`](Self::stage).
     pub fn install(
         &mut self,
+        kind: ScreenKind,
         bundle: &Arc<SkinBundle>,
         request: u64,
     ) -> Result<PreparedToken, RenderError> {
-        self.stage_with(bundle, None, request)
+        self.stage_with(kind, bundle, None, request)
+    }
+
+    /// Whether `bundle` as `kind`'s installation fits the texels the
+    /// screens share: every other kind's committed charge and `bundle`'s
+    /// ([`Admission`]), at most [`SHARED_TEXELS`]. The candidate replaces
+    /// its kind's charge, so the state after its commit is what is
+    /// admitted. `kind`'s committed bundle itself allocates nothing again
+    /// and is admitted as it is. Allocates nothing.
+    ///
+    /// A read-only budget query: `Ok` means the hypothetical replacement
+    /// fits the charges committed now. It reserves nothing, changes no
+    /// staging, validates no device resource, and does not promise that a
+    /// later installation succeeds; every staging checks admission itself.
+    ///
+    /// # Errors
+    ///
+    /// [`RenderError::Admission`] with the sum, past the limit.
+    pub fn admit(&self, kind: ScreenKind, bundle: &SkinBundle) -> Result<(), RenderError> {
+        if self
+            .committed_installation(kind)
+            .is_some_and(|i| std::ptr::eq(Arc::as_ptr(i.bundle()), bundle))
+        {
+            return Ok(());
+        }
+        let others = KINDS
+            .iter()
+            .filter(|&&k| k != kind)
+            .fold(0u64, |sum, &k| sum.saturating_add(self.charge(k)));
+        let needed = others.saturating_add(charge_of(bundle));
+        if needed > SHARED_TEXELS {
+            return Err(RenderError::Admission {
+                kind,
+                needed,
+                limit: SHARED_TEXELS,
+            });
+        }
+        Ok(())
+    }
+
+    /// `kind`'s committed charge.
+    fn charge(&self, kind: ScreenKind) -> u64 {
+        self.committed_installation(kind)
+            .map_or(0, |i| charge_of(i.bundle()))
+    }
+
+    /// The charges [`admit`](Self::admit) sums now, and the staged
+    /// installation's.
+    #[must_use]
+    pub fn admission(&self) -> Admission {
+        Admission {
+            committed: KINDS.map(|k| self.charge(k)),
+            candidate: self
+                .pending
+                .as_ref()
+                .map(|p| (p.token.kind, charge_of(p.skin.bundle()))),
+        }
     }
 
     /// [`stage`](Self::stage) with attempt `a`, or
     /// [`install`](Self::install) without one. A request not newer than
     /// every one asked for or committed (staged, discarded or refused
     /// included) is refused, the staging kept; any other refusal drops
-    /// the staging. The bundle installed keeps its loading presentation;
-    /// another gets a fresh one.
+    /// the staging. Admission ([`admit`](Self::admit)) is checked before
+    /// anything is allocated. `kind`'s committed bundle keeps its loading
+    /// presentation; another gets a fresh one.
     fn stage_with(
         &mut self,
+        kind: ScreenKind,
         bundle: &Arc<SkinBundle>,
         a: Option<&AttemptInput<'_>>,
         request: u64,
@@ -995,9 +1190,9 @@ impl Renderer {
         }
         self.requested = request;
         self.pending = None;
+        self.admit(kind, bundle)?;
         let installed = self
-            .installed
-            .as_ref()
+            .committed_installation(kind)
             .filter(|i| Arc::ptr_eq(i.bundle(), bundle));
         let (installation, resources) = match installed {
             Some(i) => (i.clone(), None),
@@ -1017,6 +1212,7 @@ impl Renderer {
         let token = PreparedToken {
             request,
             device: self.id,
+            kind,
         };
         self.pending = Some(Pending {
             token,
@@ -1091,16 +1287,19 @@ impl Renderer {
         instance_buffer(self.gpu.device(), instances)
     }
 
-    /// Installs the staging of `token` whole, between frames: its skin
-    /// with its prepared attempt, and its atlas, bind group, clips,
+    /// Installs the staging of `token` whole, between frames. Play's: its
+    /// skin with its prepared attempt, and its atlas, bind group, clips,
     /// staging and instance buffer together when it has its own; the ones
-    /// they replace are dropped. Frames are built again after a refused
-    /// one.
+    /// they replace are dropped, and frames are built again after a
+    /// refused one. Another kind's: its installation and resources become
+    /// that kind's slot, nothing of play's changing; a staging of the
+    /// kind's committed bundle keeps the slot.
     ///
     /// # Errors
     ///
-    /// [`CommitError`] when `token` is not the staging's, by its renderer
-    /// or its request: nothing changes, and the staging stays staged.
+    /// [`CommitError`] when `token` is not the staging's, by its renderer,
+    /// its request or its kind: nothing changes, and the staging stays
+    /// staged.
     pub fn commit(&mut self, token: PreparedToken) -> Result<(), CommitError> {
         if token.device != self.id {
             return Err(CommitError::Device);
@@ -1120,14 +1319,40 @@ impl Renderer {
                 asked: token.request,
             });
         }
+        if staged.kind != token.kind {
+            return Err(CommitError::Kind {
+                staged: staged.kind,
+                asked: token.kind,
+            });
+        }
         let Some(pending) = self.pending.take() else {
             return Err(CommitError::NothingStaged);
         };
-        if let Some(r) = pending.resources {
-            self.replace_resources(r);
-        }
         self.committed = token.request;
-        self.activate_decl_skin(pending.skin);
+        match Self::screen(token.kind) {
+            None => {
+                if let Some(r) = pending.resources {
+                    self.replace_resources(r);
+                }
+                self.activate_decl_skin(pending.skin);
+            }
+            Some(i) => {
+                if let Some(mut resources) = pending.resources {
+                    // Projected afresh, as play's commit projects its
+                    // own: the target may have been resized since the
+                    // staging.
+                    let installation = pending.skin.installation();
+                    let canvas = installation.bundle().skin().canvas(self.target());
+                    resources.staging.project(&canvas);
+                    if let Some(slot) = self.screens.get_mut(i) {
+                        *slot = Some(Slot {
+                            installation,
+                            resources,
+                        });
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1161,39 +1386,83 @@ impl Renderer {
         self.pending = None;
     }
 
-    /// Installs `installation` with no attempt prepared, at once: a
-    /// renderer built again after a device failure restores the committed
-    /// installation from memory this way, its loading presentation the
-    /// very state, `when` starts included, and the next attempt is
-    /// prepared afresh through [`stage`](Self::stage), which reuses its
-    /// resources.
+    /// Installs `installation` as `kind`'s with no attempt prepared, at
+    /// once: a renderer built again after a device failure restores each
+    /// kind's committed installation from memory this way, its loading
+    /// presentation the very state, `when` starts included, and play's
+    /// next attempt is prepared afresh through [`stage`](Self::stage),
+    /// which reuses its resources. A staging is dropped. Admission is
+    /// checked as for a staging: kinds restored one at a time, in
+    /// [`Admission::committed`]'s order, are each a subset of a set
+    /// admitted together.
     ///
     /// # Errors
     ///
-    /// As [`stage`](Self::stage); the installation in use stays.
-    pub fn restore(&mut self, installation: &Installation) -> Result<(), RenderError> {
+    /// As [`stage`](Self::stage); every installation in use stays.
+    pub fn restore(
+        &mut self,
+        kind: ScreenKind,
+        installation: &Installation,
+    ) -> Result<(), RenderError> {
         self.pending = None;
+        self.admit(kind, installation.bundle())?;
         let r = self.resources_for(installation.bundle())?;
-        self.replace_resources(r);
-        self.activate_decl_skin(DeclSkin::of(installation));
+        match Self::screen(kind) {
+            None => {
+                self.replace_resources(r);
+                self.activate_decl_skin(DeclSkin::of(installation));
+            }
+            Some(i) => {
+                if let Some(slot) = self.screens.get_mut(i) {
+                    *slot = Some(Slot {
+                        installation: installation.clone(),
+                        resources: r,
+                    });
+                }
+            }
+        }
         Ok(())
     }
 
+    /// Drops `kind`'s committed installation and its charge, and a
+    /// staging of `kind`: its screen draws its built-in presentation.
+    /// Play's installation is never removed this way: for play it does
+    /// nothing.
+    pub fn remove(&mut self, kind: ScreenKind) {
+        let Some(i) = Self::screen(kind) else {
+            return;
+        };
+        if let Some(slot) = self.screens.get_mut(i) {
+            *slot = None;
+        }
+        if self.pending.as_ref().is_some_and(|p| p.token.kind == kind) {
+            self.pending = None;
+        }
+    }
+
     /// The bytes held for the play skin now, the staged installation's
-    /// included ([`MemoryWitness`]).
+    /// included ([`MemoryWitness`]). The staged bundle's CPU description
+    /// is counted unless it is play's installed bundle, and its loading
+    /// presentation unless it is play's installed presentation: another
+    /// kind's staging of play's bundle shares its pages but has its own
+    /// presentation.
     #[must_use]
     pub fn memory(&self) -> MemoryWitness {
-        let staged = self.pending.as_ref();
+        let staged = self.pending.as_ref().map(|p| (p, p.skin.installation()));
         let installed = self.installed.as_ref();
-        let other = staged
-            .map(|p| p.skin.installation())
-            .filter(|s| !installed.is_some_and(|i| Arc::ptr_eq(i.bundle(), s.bundle())));
+        let cpu = staged
+            .as_ref()
+            .filter(|(_, s)| !installed.is_some_and(|i| Arc::ptr_eq(i.bundle(), s.bundle())));
+        let loading = staged
+            .as_ref()
+            .filter(|(_, s)| !installed.is_some_and(|i| i.loading().same(s.loading())));
+        let staged = staged.as_ref().map(|(p, _)| *p);
         let res = staged.and_then(|p| p.resources.as_ref());
         MemoryWitness {
             committed_cpu: installed.map_or(0, |i| i.bundle().resident_bytes()),
-            staged_cpu: other.as_ref().map_or(0, |s| s.bundle().resident_bytes()),
+            staged_cpu: cpu.map_or(0, |(_, s)| s.bundle().resident_bytes()),
             loading: installed.map_or(0, |i| i.loading().bytes()),
-            staged_loading: other.as_ref().map_or(0, |s| s.loading().bytes()),
+            staged_loading: loading.map_or(0, |(_, s)| s.loading().bytes()),
             staged_text: self.staged_text.as_ref().map_or(0, StagedText::bytes),
             atlas: self.atlas.bytes(),
             staged_atlas: res.map_or(0, |r| r.atlas.bytes()),
@@ -2274,6 +2543,39 @@ mod tests {
             [r, b]
         };
         assert_eq!((at(480), at(1_440)), ([255, 0], [0, 0]));
+    }
+
+    /// Another kind's staging is projected at its commit onto the target as
+    /// it is then: staged at 1 920×1 080 and committed after a resize to
+    /// 960×540, its slot's viewport and clip scissor are the new size's,
+    /// and a later resize projects the slot again.
+    #[test]
+    fn a_slot_is_projected_at_its_commit() {
+        use crate::Scissor;
+        use crate::test_common::offscreen;
+        use crate::test_decl::{Look, bundle};
+        use skin_model::{ClipId, ScreenKind};
+
+        let slot = |r: &Renderer| {
+            let i = Renderer::screen(ScreenKind::Selection).unwrap();
+            let slot = r.screens.get(i).and_then(Option::as_ref).unwrap();
+            (
+                slot.resources.staging.projection(),
+                slot.resources.staging.scissor(Some(ClipId(0))),
+            )
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let mut r = offscreen(1_920, 1_080);
+        let (green, _) = bundle(&r, dir.path(), &Look::left([0, 255, 0, 255]));
+        let token = r.install(ScreenKind::Selection, &green, 1).unwrap();
+        r.resize(960, 540);
+        r.commit(token).unwrap();
+        let (projection, scissor) = slot(&r);
+        assert_eq!(projection.target(), [960, 540]);
+        assert_eq!(projection.viewport(), [0.0, 0.0, 960.0, 540.0]);
+        assert_eq!(scissor, Scissor::Rect([0, 0, 480, 540]));
+        r.resize(1_920, 1_080);
+        assert_eq!(slot(&r).1, Scissor::Rect([0, 0, 960, 1_080]));
     }
 
     /// A refusal after the texture exists, injected between the candidate's
