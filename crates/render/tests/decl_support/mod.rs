@@ -621,20 +621,43 @@ fn skin_of(sheet: Sheet, look: &Look, chart_font: Option<u32>) -> Skin {
 /// read: one `size` cell of `look.rgba`, the whole of image 0. The
 /// atlas's page side is the least that holds the cell with its gutter.
 pub fn solid_bundle(r: &Renderer, look: &Look, size: [u32; 2]) -> Arc<SkinBundle> {
+    solid_cells_bundle(r, look, &[(size, look.rgba)])
+}
+
+/// [`solid_bundle`] with one generated cell per `(size, colour)` of
+/// `cells`, image 0 the first, and with its text element's producer
+/// ([`Text`]) when `look` has one: its atlas then has the text layer.
+pub fn solid_cells_bundle(
+    r: &Renderer,
+    look: &Look,
+    cells: &[([u32; 2], [u8; 4])],
+) -> Arc<SkinBundle> {
     let dir = tempfile::tempdir().unwrap();
     let mut b = SheetBuilder::new(&Root::new(dir.path()).unwrap());
-    b.add_solid_image(SolidImageDef {
-        size,
-        color: look.rgba,
-        filter: Filter::Nearest,
-    })
-    .unwrap();
+    for &(size, color) in cells {
+        b.add_solid_image(SolidImageDef {
+            size,
+            color,
+            filter: Filter::Nearest,
+        })
+        .unwrap();
+    }
     let skin = skin_of(b.finish(), look, None);
     let atlas = skin
         .atlas(Variant::Lo, r.atlas_limits(), &|| false)
         .unwrap();
     let clips = ClipTable::new(look.clip.into_iter().collect()).unwrap();
-    Arc::new(SkinBundle::new(Arc::new(skin), atlas, clips, Side::Left).unwrap())
+    let bundle = SkinBundle::new(Arc::new(skin), atlas, clips, Side::Left).unwrap();
+    if !look.text {
+        return Arc::new(bundle);
+    }
+    let text: Arc<dyn AttemptText> = Arc::new(Text {
+        calls: AtomicU32::new(0),
+        rasters: AtomicU32::new(0),
+        refuse: AtomicBool::new(false),
+        strings: Mutex::new(Vec::new()),
+    });
+    Arc::new(bundle.with_text(text).unwrap())
 }
 
 /// A bundle of `look` for `r`'s device, its image in `dir`, with its text

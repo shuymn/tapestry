@@ -262,13 +262,15 @@ impl SkinBundle {
     }
 
     /// The level-0 texels of the atlas array its installation uploads:
-    /// its pages and the renderer's reserved layers, at its page side.
+    /// its pages, the renderer's reserved layers and its text layer, if it
+    /// has one, at its page side.
     #[must_use]
     pub fn atlas_texels(&self) -> u64 {
         let side = u64::from(self.side);
         let layers = u64::try_from(self.pages.len())
             .unwrap_or(u64::MAX)
-            .saturating_add(u64::from(RESERVED_LAYERS));
+            .saturating_add(u64::from(RESERVED_LAYERS))
+            .saturating_add(u64::from(self.text_layer.is_some()));
         side.saturating_mul(side).saturating_mul(layers)
     }
 
