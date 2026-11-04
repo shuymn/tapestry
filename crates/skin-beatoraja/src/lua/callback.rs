@@ -8,10 +8,14 @@
 //! instance, as is each closure a root captures: its
 //! function's tree in the file that defined it ([`super::syntax`]) and
 //! the values its capture reader returned after the pass
-//! ([`super::instrument`]): Lua integers (the integer subtype only),
-//! booleans, host functions and modules by identity, other closure
-//! instances, and the `_ENV` it reads, inspected raw. Nothing else is
-//! kept, and nothing is run.
+//! ([`super::instrument`]), their final bindings: nil, booleans, Lua
+//! integers and floats, strings (interned), host functions, host modules
+//! and the sandbox's library functions by identity, other closure
+//! instances, and tables by identity with whether each has a metatable.
+//! Of a table, only the entries on the function's static access paths
+//! ([`super::syntax::Path`]: constant string keys from an upvalue or a
+//! global) are copied, each read raw; the `_ENV` its globals are read
+//! through is such a table. Nothing else is kept, and nothing is run.
 //!
 //! [`classify`] decides a callback's class on its tree and its captures
 //! by a positive allowlist, never by running it:
@@ -19,11 +23,12 @@
 //! - its body is `local name = E` lines and then `return E`, without
 //!   parameters;
 //! - `E` is built from integer numerals, `true` and `false`; captured
-//!   integers and booleans; `H.f(n)` with `H` a chunk local bound once to
-//!   `require("main_state")` (or to another such local) and captured as
-//!   the host module, `f` one of `number`, `option`, `timer`, `gauge_type`,
-//!   and `n` integer numerals; `H.timer_off_value`; calls of chunk-local
-//!   helpers that are themselves of this form; `+ - *` and comparisons of
+//!   integers and booleans; `H.f(n)` with `H` an upvalue, a global or
+//!   `_ENV.name` whose captured final binding is the host module (a global
+//!   read through an `_ENV` without a metatable), `f` one of `number`,
+//!   `option`, `timer`, `gauge_type`, and `n` integer numerals;
+//!   `H.timer_off_value`; calls of helpers, upvalues whose captured final
+//!   binding is a closure itself of this form; `+ - *` and comparisons of
 //!   integers; `==` and `~=` of `gauge_type()` with a numeral, of a timer
 //!   with the off value, and of `skin_config.option["name"]` with a
 //!   numeral, `skin_config` proven to be the pass's own table with no
@@ -38,13 +43,14 @@
 //! So once [`admit`] accepts every root, no callback the import can
 //! reach writes anything at frame time, through any helper: not the
 //! `_ENV` binding a configuration read resolves through, not
-//! `skin_config` or its `option` table, and no metatable. With
-//! [`Analysis::open`] unset (no script, unread listed entry or font
-//! fallback metatable, which run code the analysis never sees), that is
-//! the noninterference half of the capture proof that lets a
-//! configuration read fold in any callback, a play-critical one included;
-//! the other halves (the raw path, the final integer entry) are checked at
-//! the read. [`admit`] records its acceptance on the [`Analysis`], and
+//! `skin_config` or its `option` table, not a binding of the host module
+//! or a helper, and no metatable. With [`Analysis::open`] unset (no
+//! script, unread listed entry or font fallback metatable, which run code
+//! the analysis never sees), that is the noninterference half of the
+//! capture proof that lets a configuration read fold and a host module or
+//! helper binding hold in any callback, a play-critical one included; the
+//! other halves (the raw path, the final binding) are checked at the
+//! read. [`admit`] records its acceptance on the [`Analysis`], and
 //! lowering takes the analysis only through the [`Admitted`] witness it
 //! gives.
 
@@ -53,7 +59,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
 use super::limits::{MAX_ANALYSIS_WORK, MAX_AST_DEPTH};
-use super::syntax::{Ast, Bin, CHUNK_ENV, DeclKind, Expr, NONE, Stmt, Un};
+use super::syntax::{Ast, Bin, CHUNK_ENV, Expr, NONE, Stmt, Un};
 use super::{HOST_APIS, Unsupported};
 use crate::error::{ImportError, Loc};
 use crate::tree::{Arena, CallableKind, Kind, LuaScalar};
@@ -68,33 +74,35 @@ pub(crate) struct ParsedFile {
     pub(crate) ast: Ast,
 }
 
-/// A value a closure's reader returned.
+/// A value a closure's reader returned, or a table entry on one of its
+/// static access paths: the captured object graph.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum Captured {
     Nil,
     Bool(bool),
     Int(i64),
+    /// A float, by its bits.
+    Float(u64),
+    /// A string, by its index among [`Analysis::names`].
+    Str(u32),
     /// A host API function, by its index in [`HOST_APIS`].
     Host(u16),
-    /// A host module, unchanged since the pass built it.
+    /// A host module, its proxy unchanged since the pass built it.
     Module(u8),
     /// Another closure instance.
     Closure(u32),
-    /// The `_ENV` table, by its index in [`Analysis::envs`].
-    Env(u32),
-    /// Anything else: a float, a string, another table, a library
-    /// function, a closure without a tag.
+    /// A table, by its index in [`Analysis::tables`], and whether it has
+    /// a metatable.
+    Table {
+        id: u32,
+        meta: bool,
+    },
+    /// A function of the sandbox's library, by its index in
+    /// [`super::sandbox::LIBS`]: the sandbox's own, by identity.
+    Lib(u16),
+    /// Anything else: a closure without a tag, a host module's proxy the
+    /// skin changed, a coroutine or userdata.
     Other,
-}
-
-/// An `_ENV` table, inspected raw.
-#[derive(Debug, Default)]
-pub(crate) struct EnvCapture {
-    /// Why `skin_config.option` is not proven: `None` when it is.
-    pub(crate) unproven: Option<&'static str>,
-    /// Its `skin_config.option` table's integer entries, by its index in
-    /// [`Analysis::option_sets`].
-    pub(crate) options: u32,
 }
 
 /// A closure instance.
@@ -202,15 +210,17 @@ pub(crate) struct Analysis {
     pub(crate) files: Vec<ParsedFile>,
     pub(crate) instances: Vec<Instance>,
     pub(crate) captured: Vec<Captured>,
-    pub(crate) envs: Vec<EnvCapture>,
     /// Each captured function's upvalue positions, by its file, function
     /// and binding: one hash a read.
     pub(crate) slots: HashMap<(u16, u32, u32), u32>,
-    /// Option names interned once a pass, by their bytes; every option
-    /// table refers to them by id.
-    pub(crate) option_names: HashMap<Box<[u8]>, u32>,
-    /// Each distinct option table's integer entries, by name id.
-    pub(crate) option_sets: Vec<HashMap<u32, i64>>,
+    /// Strings interned once a pass, by their bytes: the keys of copied
+    /// entries and the captured strings refer to them by id.
+    pub(crate) names: HashMap<Box<[u8]>, u32>,
+    /// Each distinct captured table's copied entries, by key id: only
+    /// those on a captured function's static access paths, each read raw.
+    pub(crate) tables: Vec<HashMap<u32, Captured>>,
+    /// The captured table that is the pass's own `skin_config`, if one is.
+    pub(crate) config: Option<u32>,
     /// The first place, in conversion order, where the source runs code
     /// the analysis does not see: a script root, an unread entry of a
     /// table it lists, or a font fallback with a metatable; by the
@@ -331,15 +341,82 @@ impl Analysis {
         Ok(())
     }
 
-    /// Entry `k` of option table `set`: one hash of `k`, its bytes
-    /// charged first.
-    pub(crate) fn option(&self, set: u32, k: &[u8]) -> Result<Option<i64>, Unsupported> {
+    /// The copied entry `k` of captured table `table`: one hash of `k`,
+    /// its bytes charged first; `None` when no static access path copied
+    /// it (an entry the source holds as nil is copied as [`Captured::Nil`]).
+    pub(crate) fn entry(&self, table: u32, k: &[u8]) -> Result<Option<Captured>, Unsupported> {
         self.charge(u64::try_from(k.len()).unwrap_or(u64::MAX))?;
         Ok(self
-            .option_names
+            .names
             .get(k)
-            .and_then(|id| self.option_sets.get(set as usize)?.get(id))
+            .and_then(|id| self.tables.get(table as usize)?.get(id))
             .copied())
+    }
+
+    /// Global `name` read through binding `env` in instance `i`: its
+    /// `_ENV` captured as a table without a metatable, the entry read raw.
+    pub(crate) fn global(
+        &self,
+        i: u32,
+        env: u32,
+        name: &[u8],
+    ) -> Result<Option<Captured>, Unsupported> {
+        match self.upvalue(i, env) {
+            Some(Captured::Table { meta: true, .. }) => {
+                Err(Unsupported::Capture("_ENV's metatable"))
+            }
+            Some(Captured::Table { id, meta: false }) => self.entry(id, name),
+            _ => Err(Unsupported::Capture("_ENV")),
+        }
+    }
+
+    /// The final binding `h` names in instance `i`'s body, when `h` is one
+    /// the captures hold: an upvalue, a global, or `_ENV.name` of the
+    /// `_ENV` binding (the same global); `None` for any other expression.
+    pub(crate) fn binding(
+        &self,
+        ast: &Ast,
+        i: u32,
+        h: u32,
+    ) -> Result<Option<Captured>, Unsupported> {
+        match ast.expr(h) {
+            Expr::Local(d) => Ok(self.upvalue(i, d)),
+            Expr::Global { name, env } => self.global(i, env, ast.str(name)),
+            Expr::Index { obj, key } => match (ast.expr(obj), ast.expr(key)) {
+                (Expr::Local(env), Expr::Str(s)) if is_env(ast, env) => {
+                    self.global(i, env, ast.str(s))
+                }
+                _ => Ok(None),
+            },
+            _ => Ok(None),
+        }
+    }
+
+    /// The integer entry `k` of `skin_config.option` read through binding
+    /// `env` in instance `i`, proven on the captured graph: the `_ENV` a
+    /// table without a metatable, its raw `skin_config` the pass's own
+    /// table and its raw `option`, neither with a metatable, and the raw
+    /// entry a Lua integer.
+    pub(crate) fn option_entry(&self, i: u32, env: u32, k: &[u8]) -> Result<i64, Unsupported> {
+        let Some(Captured::Table { id: sc, meta }) = self.global(i, env, b"skin_config")? else {
+            return Err(Unsupported::Capture("skin_config"));
+        };
+        if self.config != Some(sc) {
+            return Err(Unsupported::Capture("skin_config"));
+        }
+        if meta {
+            return Err(Unsupported::Capture("skin_config's metatable"));
+        }
+        let Some(Captured::Table { id: option, meta }) = self.entry(sc, b"option")? else {
+            return Err(Unsupported::Capture("skin_config.option"));
+        };
+        if meta {
+            return Err(Unsupported::Capture("skin_config.option's metatable"));
+        }
+        match self.entry(option, k)? {
+            Some(Captured::Int(v)) => Ok(v),
+            _ => Err(Unsupported::Capture("an option entry")),
+        }
     }
 
     pub(crate) fn instance(&self, i: u32) -> Option<&Instance> {
@@ -522,7 +599,7 @@ impl Analysis {
                     };
                     return cx.expr(e);
                 }
-                Stmt::Other(what) => return Err(at(Unsupported::Construct(what), line)),
+                other => return Err(at(Unsupported::Construct(other.name()), line)),
             }
         }
         Err(at(Unsupported::Construct("no return"), f.line))
@@ -589,7 +666,7 @@ impl Classify<'_> {
         match self.ast.expr(e) {
             Expr::Int(_) => Ok(Ty::Int),
             Expr::True | Expr::False => Ok(Ty::Bool),
-            Expr::Float => construct("float"),
+            Expr::Float(_) => construct("float"),
             Expr::Str(_) => construct("string"),
             Expr::Nil => construct("nil"),
             Expr::Vararg => construct("vararg"),
@@ -665,12 +742,18 @@ impl Classify<'_> {
             Expr::Str(s) => Some(self.ast.str(s)),
             _ => None,
         };
-        // `H.timer_off_value`.
-        if let Expr::Local(d) = self.ast.expr(obj)
-            && key_str == Some(b"timer_off_value")
+        // `H.timer_off_value`, `H` a binding the captures hold.
+        if key_str == Some(b"timer_off_value")
+            && let Some(bound) = self
+                .an
+                .binding(self.ast, self.inst, obj)
+                .map_err(|why| self.at(why, e))?
         {
-            self.module(obj, d)?;
-            return Ok(Ty::TimerOff);
+            return match bound {
+                Captured::Module(MAIN_STATE) => Ok(Ty::TimerOff),
+                Captured::Module(_) => Err(self.at(Unsupported::Binding("another host module"), e)),
+                _ => Err(self.at(Unsupported::Binding("a host module"), e)),
+            };
         }
         // `skin_config.option["name"]`.
         if let Expr::Index { obj: cfg, key: opt } = self.ast.expr(obj)
@@ -688,38 +771,9 @@ impl Classify<'_> {
     /// The proven integer entry `k` of `skin_config.option`, read through
     /// `env`.
     fn config(&self, e: u32, env: u32, k: &[u8]) -> Result<i64, Found> {
-        let Some(Captured::Env(i)) = self.an.upvalue(self.inst, env) else {
-            return Err(self.at(Unsupported::Capture("_ENV"), e));
-        };
-        let capture = self
-            .an
-            .envs
-            .get(i as usize)
-            .ok_or(self.at(Unsupported::Capture("_ENV"), e))?;
-        if let Some(why) = capture.unproven {
-            return Err(self.at(Unsupported::Capture(why), e));
-        }
         self.an
-            .option(capture.options, k)
-            .map_err(|why| self.at(why, e))?
-            .ok_or(self.at(Unsupported::Capture("an option entry"), e))
-    }
-
-    /// Checks that local `d` read at `e` is the host module `main_state`,
-    /// bound once to `require("main_state")` or another such local.
-    fn module(&self, e: u32, d: u32) -> Result<(), Found> {
-        match self.an.upvalue(self.inst, d) {
-            Some(Captured::Module(MAIN_STATE)) => {}
-            Some(Captured::Module(_)) => {
-                return Err(self.at(Unsupported::Binding("another host module"), e));
-            }
-            _ => return Err(self.at(Unsupported::Binding("a host module"), e)),
-        }
-        if module_binding(self.ast, d, 0, true) {
-            Ok(())
-        } else {
-            Err(self.at(Unsupported::Binding("a host module"), e))
-        }
+            .option_entry(self.inst, env, k)
+            .map_err(|why| self.at(why, e))
     }
 
     fn call(&self, e: u32, callee: u32, args: &[u32]) -> Result<Ty, Found> {
@@ -756,29 +810,15 @@ impl Classify<'_> {
     }
 }
 
-/// Whether declaration `d` is initialized by `require("main_state")`,
-/// directly or through locals, `depth` aliases deep; when `once`, each of
-/// them a chunk local never assigned after its declaration.
-fn module_binding(ast: &Ast, d: u32, depth: u32, once: bool) -> bool {
-    let Some(decl) = ast.decl(d) else {
-        return false;
-    };
-    if depth > 16 || (once && (decl.func != 0 || decl.writes > 0 || decl.kind != DeclKind::Local)) {
-        return false;
-    }
-    match ast.expr(decl.init) {
-        Expr::Call { callee, args } => {
-            let req = matches!(ast.expr(callee), Expr::Global { name, .. } if ast.str(name) == b"require");
-            let arg = matches!(ast.list(args), &[a] if matches!(ast.expr(a), Expr::Str(s) if ast.str(s) == b"main_state"));
-            req && arg
-        }
-        Expr::Local(other) => module_binding(ast, other, depth + 1, once),
-        _ => false,
-    }
-}
-
-/// What a call's callee is in instance `inst`'s body: a mapped host API
-/// of the proven module, or a chunk-local helper instance.
+/// What a call's callee is in instance `inst`'s body, proven by the
+/// captured graph: `H.f` with `H`'s final binding ([`Analysis::binding`])
+/// the host module, its proxy unchanged, `f` one of its APIs; or an
+/// upvalue whose final binding is a closure instance, a helper. That
+/// holds at frame time only while the candidate is closed: no root writes
+/// (admission) and no code the analysis does not see runs
+/// ([`Analysis::open`]), which lowering checks before it resolves a call.
+/// `H.f` with `f` a `main_state` API and `H` bound to anything else is
+/// [`Unsupported::Binding`].
 pub(crate) fn resolve_callee(
     an: &Analysis,
     ast: &Ast,
@@ -787,26 +827,28 @@ pub(crate) fn resolve_callee(
 ) -> Result<Callee, Unsupported> {
     match ast.expr(callee) {
         Expr::Index { obj, key } => {
-            let Expr::Local(d) = ast.expr(obj) else {
-                return Err(Unsupported::Callee);
-            };
             let Expr::Str(s) = ast.expr(key) else {
                 return Err(Unsupported::Callee);
             };
-            // A local bound to the module and written again, or bound to
-            // it through something else, is not proven.
-            if module_binding(ast, d, 0, false) && !module_binding(ast, d, 0, true) {
-                return Err(Unsupported::Binding("a host module"));
-            }
-            let module = match an.upvalue(inst, d) {
-                Some(Captured::Module(m)) => m,
-                _ => return Err(Unsupported::Callee),
+            let name = ast.str(s);
+            let bound = an.binding(ast, inst, obj)?;
+            let Some(Captured::Module(module)) = bound else {
+                let main = super::host::MODULES
+                    .get(usize::from(MAIN_STATE))
+                    .copied()
+                    .unwrap_or("");
+                let api = HOST_APIS
+                    .iter()
+                    .any(|&(m, n)| m == main && n.as_bytes() == name);
+                if bound.is_some() && api {
+                    return Err(Unsupported::Binding("a host module"));
+                }
+                return Err(Unsupported::Callee);
             };
             let module_name = super::host::MODULES
                 .get(usize::from(module))
                 .copied()
                 .unwrap_or("");
-            let name = ast.str(s);
             let api = HOST_APIS
                 .iter()
                 .position(|&(m, n)| m == module_name && n.as_bytes() == name)
@@ -815,25 +857,12 @@ pub(crate) fn resolve_callee(
             if module != MAIN_STATE {
                 return Err(Unsupported::HostApi(api));
             }
-            if !module_binding(ast, d, 0, true) {
-                return Err(Unsupported::Binding("a host module"));
-            }
             Ok(Callee::Host(api))
         }
-        Expr::Local(d) => {
-            let Some(Captured::Closure(j)) = an.upvalue(inst, d) else {
-                return Err(Unsupported::Callee);
-            };
-            let ok = ast.decl(d).is_some_and(|x| {
-                x.func == 0
-                    && x.writes == 0
-                    && matches!(x.kind, DeclKind::Local | DeclKind::LocalFunction)
-            });
-            if !ok {
-                return Err(Unsupported::Binding("a helper"));
-            }
-            Ok(Callee::Helper(j))
-        }
+        Expr::Local(d) => match an.upvalue(inst, d) {
+            Some(Captured::Closure(j)) => Ok(Callee::Helper(j)),
+            _ => Err(Unsupported::Callee),
+        },
         _ => Err(Unsupported::Callee),
     }
 }

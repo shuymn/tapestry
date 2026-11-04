@@ -61,6 +61,51 @@ pub(super) const TAG_IDS: &str = "tapestry.tag_ids";
 pub(super) const TAG_READERS: &str = "tapestry.tag_readers";
 pub(super) const TAGGER: &str = "tapestry.tagger";
 
+/// The registry name of a configured pass's library functions, each to
+/// its index in [`LIBS`]: recorded before any skin code runs, and holding
+/// them, so a skin's own function never takes one's identity.
+pub(super) const LIB_IDS: &str = "tapestry.lib_ids";
+
+/// The library functions a capture knows by identity
+/// ([`super::callback::Captured::Lib`]): a global, or a member of a
+/// library table, as the sandbox installs them.
+pub(crate) const LIBS: [&str; 34] = [
+    "assert",
+    "dofile",
+    "error",
+    "getmetatable",
+    "ipairs",
+    "next",
+    "pairs",
+    "pcall",
+    "require",
+    "select",
+    "setmetatable",
+    "tonumber",
+    "tostring",
+    "type",
+    "xpcall",
+    "math.abs",
+    "math.ceil",
+    "math.floor",
+    "math.max",
+    "math.min",
+    "string.byte",
+    "string.char",
+    "string.find",
+    "string.format",
+    "string.gsub",
+    "string.len",
+    "string.lower",
+    "string.match",
+    "string.sub",
+    "string.upper",
+    "table.concat",
+    "table.insert",
+    "table.remove",
+    "table.sort",
+];
+
 /// The tagger: it records a closure's identity and reader and returns the
 /// closure. The sandbox's own Lua: no skin can name it.
 const TAG: &str = "local ids, readers = ...\n\
@@ -230,6 +275,25 @@ where
     shim.call((host_raw(lua, pass, f)?, arity))
 }
 
+/// The functions of [`LIBS`] as `env` holds them before any skin code,
+/// each to its index.
+fn lib_ids(lua: &Lua, env: &Table) -> mlua::Result<Table> {
+    let ids = lua.create_table()?;
+    for (i, name) in (0_i64..).zip(LIBS) {
+        let f = match name.split_once('.') {
+            Some((lib, member)) => match env.raw_get::<Value>(lib)? {
+                Value::Table(t) => t.raw_get::<Value>(member)?,
+                _ => Value::Nil,
+            },
+            None => env.raw_get::<Value>(name)?,
+        };
+        if let Value::Function(f) = f {
+            ids.raw_set(f, i)?;
+        }
+    }
+    Ok(ids)
+}
+
 /// A fresh VM for one pass, its environment built and its caps set.
 pub(super) fn vm(pass: &Rc<Pass>) -> mlua::Result<Lua> {
     let lua = Lua::new_with(
@@ -367,6 +431,9 @@ pub(super) fn vm(pass: &Rc<Pass>) -> mlua::Result<Lua> {
     super::tests::install_continued(&lua, &env)?;
     env.raw_set("require", loader::require(&lua, pass)?)?;
     env.raw_set("dofile", loader::dofile(&lua, pass)?)?;
+    if pass.bridge.is_some() {
+        lua.set_named_registry_value(LIB_IDS, lib_ids(&lua, &env)?)?;
+    }
     env.raw_set("_G", env.clone())?;
     lua.set_globals(env)?;
     Ok(lua)

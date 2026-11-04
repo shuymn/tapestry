@@ -44,6 +44,8 @@ mod callback_tests;
 mod config;
 mod convert;
 pub mod facts;
+#[cfg(test)]
+mod graph_tests;
 mod host;
 mod instrument;
 mod ledger;
@@ -211,7 +213,7 @@ pub enum Unsupported {
     Construct(&'static str),
     /// A global other than `skin_config`.
     Global,
-    /// A host module or helper not bound once as a chunk local.
+    /// A host module or helper whose captured final binding is not one.
     Binding(&'static str),
     /// A host API outside the bridges, by its index in [`HOST_APIS`]: a
     /// writer, or a reader with no conversion.
@@ -248,7 +250,7 @@ impl fmt::Display for Unsupported {
         match self {
             Self::Construct(c) => write!(f, "an unsupported construct ({c})"),
             Self::Global => f.write_str("a global other than skin_config"),
-            Self::Binding(b) => write!(f, "{b} not bound once as a chunk local"),
+            Self::Binding(b) => write!(f, "{b} not proven by its captured binding"),
             Self::HostApi(a) => write!(f, "{} has no conversion", api(*a)),
             Self::Callee => f.write_str("a call of an unknown function"),
             Self::Truthiness => f.write_str("an integer used as a condition"),
