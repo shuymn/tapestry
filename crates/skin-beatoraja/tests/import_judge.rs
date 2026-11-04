@@ -45,7 +45,8 @@ const VALUES: &str = r#""value": [
     {"id": "zero", "src": "n", "w": 120, "h": 20, "divx": 10, "digit": 0},
     {"id": "wide", "src": "n", "w": 120, "h": 20, "divx": 10, "digit": 13}]"#;
 
-/// Seven grade images over `a`, and `gone` from a missing file.
+/// Seven grade images over `a`, `gone` from a missing file and `undef`
+/// from a source no record defines.
 fn images() -> String {
     let v: Vec<String> = (0..7)
         .map(|k| {
@@ -56,7 +57,8 @@ fn images() -> String {
         })
         .collect();
     format!(
-        r#""image": [{}, {{"id": "gone", "src": "gone", "w": 8, "h": 8}}]"#,
+        r#""image": [{}, {{"id": "gone", "src": "zz", "w": 8, "h": 8}},
+                     {{"id": "undef", "src": "nope", "w": 8, "h": 8}}]"#,
         v.join(", ")
     )
 }
@@ -414,15 +416,27 @@ fn judges_refuse_what_the_model_cannot_share() {
         critical(skin(VALUES, &hidden, &[DST])),
         (CriticalPart::Judge, NoteKind::RuntimeOffset(5))
     );
-    // A missing texture.
+    // A missing texture refuses with its file's error, never falling
+    // back to another grade.
     let gone = judge_rec(
         &[grade(0, "").replace("g0", "gone")],
         &[combo("ten", 10)],
         "",
     );
+    match skin(VALUES, &gone, &[DST]).err() {
+        ImportError::Asset { .. } => {}
+        e => panic!("{e:?}"),
+    }
+    // A grade whose source no record defines: the source leaves it blank,
+    // a part of the judge the import does not drop.
+    let undef = judge_rec(
+        &[grade(0, "").replace("g0", "undef")],
+        &[combo("ten", 10)],
+        "",
+    );
     assert_eq!(
-        critical(skin(VALUES, &gone, &[DST])),
-        (CriticalPart::Judge, NoteKind::MissingAsset)
+        critical(skin(VALUES, &undef, &[DST])),
+        (CriticalPart::Judge, NoteKind::UndefinedSource)
     );
 }
 

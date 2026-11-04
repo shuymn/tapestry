@@ -105,6 +105,28 @@ impl Objects {
         Ok(None)
     }
 
+    /// Whether more than one table has a record of id `id`.
+    pub(crate) fn shared(
+        &mut self,
+        def: &mut Definition,
+        tables: &Tables,
+        id: &str,
+    ) -> Result<bool, ImportError> {
+        let mut found = 0;
+        for (slot, &(name, _)) in self.maps.iter_mut().zip(&ORDER) {
+            if slot.is_none() {
+                *slot = Some(index(def, records(tables, name), false)?);
+            }
+            if slot.as_ref().is_some_and(|m| m.contains_key(id)) {
+                found += 1;
+                if found > 1 {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
     /// Whether a record of `object`'s table has id `id`.
     pub(crate) fn names(
         &mut self,
