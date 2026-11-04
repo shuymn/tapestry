@@ -292,4 +292,10 @@ fn witness_terms_are_disjoint() {
     assert_eq!(m.staged_text_cache, 0);
     assert_eq!(m.text_mask, render::MAX_TEXT_MASK_BYTES);
     assert_eq!(render::MAX_TEXT_MASK_BYTES, 4_177_920);
+    // The scratch holds the A8 line and the rectangle's RGBA levels,
+    // never the mask: 4 080 × 1 024 and 4 096 × 1 096 × 4 × 85 / 64.
+    assert_eq!(m.text_scratch, 4_177_920 + 23_848_960);
+    // The mask counts once in the total, apart from every other term.
+    let without = render::MemoryWitness { text_mask: 0, ..m };
+    assert_eq!(m.total(), without.total() + render::MAX_TEXT_MASK_BYTES);
 }

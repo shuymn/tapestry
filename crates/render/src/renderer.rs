@@ -1240,6 +1240,11 @@ impl Renderer {
         }
         self.requested = request;
         self.pending = None;
+        // An attempt's staging that fails, at any step, leaves no earlier
+        // preparation's text report.
+        if a.is_some() {
+            self.text_report = TextReport::default();
+        }
         self.admit(kind, bundle)?;
         let installed = self
             .committed_installation(kind)
@@ -1259,8 +1264,6 @@ impl Renderer {
                 target: self.target(),
                 ..*a
             };
-            // A failed preparation leaves no earlier one's report.
-            self.text_report = TextReport::default();
             skin.prepare(&self.gpu, &a).map_err(RenderError::Skin)?;
             if let Some(producer) = bundle.text_producer() {
                 // The staging's own resources, or the installed ones,
@@ -3206,5 +3209,27 @@ mod tests {
                 assert_eq!(at(s[0] + g + size[0], s[1] + g), 0);
             }
         }
+    }
+
+    /// A staging refused before its text is prepared, here by the device
+    /// refusing its new atlas, leaves no earlier preparation's report.
+    #[test]
+    fn an_early_refusal_clears_the_text_report() {
+        let mut r = crate::test_common::offscreen(1_920, 1_080);
+        let (_dir, a, _) = sized_bundle(&r, 1);
+        let token = stage_labels(&mut r, &a, &labels("s", "", ""), 1).unwrap();
+        r.commit(token).unwrap();
+        assert!(r.text_report().upload_bytes > 0);
+        let (_other, b, _) = sized_bundle(&r, 1);
+        r.atlas_fault = Some(refuse);
+        let e = stage_labels(&mut r, &b, &labels("s", "", ""), 2).unwrap_err();
+        r.atlas_fault = None;
+        assert!(
+            matches!(e, RenderError::Atlas(UploadError::Device(_))),
+            "{e:?}"
+        );
+        assert_eq!(r.text_report().upload_bytes, 0);
+        assert_eq!(r.text_report().counts, crate::TextCounts::default());
+        assert_eq!(r.memory().text_upload, 0);
     }
 }

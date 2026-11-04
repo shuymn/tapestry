@@ -84,7 +84,7 @@ impl TextScratch {
     }
 
     fn reserve(&mut self) {
-        let a8 = (MAX_LINE_W as usize) * (MAX_LINE_H as usize);
+        let a8 = usize::try_from(MAX_TEXT_MASK_BYTES).unwrap_or(0);
         let level0 = (MAX_RECT_W as usize) * (MAX_RECT_H as usize) * 4;
         self.a8.reserve_exact(a8.saturating_sub(self.a8.len()));
         for (k, v) in self.rgba.iter_mut().enumerate() {
@@ -241,10 +241,15 @@ pub(crate) fn prepare(
     // no device-lost callback is registered), a gap left open here. Only a
     // failing wait is treated as the device's failure below.
     let waited = if submission.is_some() {
+        // A unit test may make the wait fail in place of waiting.
         #[cfg(test)]
-        let w = hooks.wait.take().map_or_else(|| wait_for_gpu(p.gpu), Err);
+        let injected = hooks.wait.take();
         #[cfg(not(test))]
-        let w = wait_for_gpu(p.gpu);
+        let injected: Option<RenderError> = None;
+        let w = match injected {
+            Some(e) => Err(e),
+            None => wait_for_gpu(p.gpu),
+        };
         #[cfg(test)]
         hooks.step(p.gpu, cache, Step::WaitReturned);
         w
