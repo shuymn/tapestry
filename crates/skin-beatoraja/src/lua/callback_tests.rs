@@ -33,7 +33,7 @@ pub(super) fn folder(entry: &str) -> tempfile::TempDir {
 /// A skin whose configured pass runs `body` with `ms` the host module,
 /// source `a`, image `i` and gauge nodes `n0`..`n3`, then `dst`, the
 /// destinations' list.
-fn skin(body: &str, dst: &str) -> String {
+pub(super) fn skin(body: &str, dst: &str) -> String {
     format!(
         "local skin = {{ type = 0, name = \"t\", w = 1920, h = 1080 }}\n\
          if not skin_config then return skin end\n\
@@ -50,12 +50,12 @@ fn skin(body: &str, dst: &str) -> String {
 }
 
 /// An image destination drawn under `draw`.
-fn image(draw: &str) -> String {
+pub(super) fn image(draw: &str) -> String {
     format!("{{ id = \"i\", draw = {draw}, dst = {{ {{ x = 0, y = 0, w = 64, h = 64 }} }} }},")
 }
 
 /// A gauge destination drawn under `draw`: critical.
-fn gauge(draw: &str) -> String {
+pub(super) fn gauge(draw: &str) -> String {
     format!("{{ id = \"g\", draw = {draw}, dst = {{ {{ x = 100, y = 500, w = 100, h = 10 }} }} }},")
 }
 
@@ -64,7 +64,7 @@ fn run(entry: &str, cancel: &Cancel) -> Result<super::LuaImported, ImportError> 
 }
 
 /// [`run`] with `files` beside the entry.
-fn run_with(
+pub(super) fn run_with(
     entry: &str,
     files: &[(&str, &str)],
     cancel: &Cancel,
@@ -79,7 +79,7 @@ fn run_with(
 
 /// Imports `entry` and checks that copying its captures made no host
 /// call, so ran no skin handler.
-fn import(entry: &str) -> Result<super::LuaImported, ImportError> {
+pub(super) fn import(entry: &str) -> Result<super::LuaImported, ImportError> {
     CAPTURE_CALLS.with(|n| n.set(0));
     let r = run(entry, &Cancel::new());
     assert_eq!(CAPTURE_CALLS.with(Cell::get), 0, "{entry}");
@@ -337,11 +337,13 @@ fn bounds_are_fatal_even_for_decorative_callbacks() {
 #[test]
 fn every_walk_over_a_tree_stops_at_the_depth_cap() {
     let fatal = LuaWhy::Limit(LuaLimit::AstDepth);
-    // Classification, at admission, of a function nothing consumes: a
+    // Classification, at admission, of a root nothing consumes: a
     // left-leaning chain the parser reads without recursing.
     let chain = vec!["1"; 100_000].join("+");
     let entry = skin(
-        &format!("skin.extra = function() return {chain} == 0 end"),
+        &format!(
+            "skin.customEvents = {{ {{ id = 1000, action = function() return {chain} == 0 end }} }}"
+        ),
         "",
     );
     assert_eq!(why(import(&entry)), fatal);
@@ -378,10 +380,10 @@ fn many(count: usize, distinct: bool) -> String {
     format!(
         "local s = {{ type = 0, name = \"t\", w = 1920, h = 1080 }}\n\
          if not skin_config then return s end\n\
-         s.extra = {{}}\n\
-         for i = 1, {count} do local k = i s.extra[i] = function()\n\
+         s.customEvents = {{}}\n\
+         for i = 1, {count} do local k = i s.customEvents[i] = {{ action = function()\n\
          {own}{body}return true\n\
-         end end\n\
+         end }} end\n\
          return s"
     )
 }
@@ -445,11 +447,11 @@ fn options(keys: usize, bytes: usize, count: usize, envs: bool) -> String {
          p = string.sub(p, 1, {bytes} - 8)\n\
          local last\n\
          for i = 1, {keys} do last = p .. string.format(\"%08d\", i) skin_config.option[last] = i end\n\
-         s.extra = {{}}\n\
+         s.customEvents = {{}}\n\
          for i = 1, {count} do\n\
          local own = i\n\
          {env}\
-         s.extra[i] = function() local mine = own return skin_config.option[\"{{LAST}}\"] == 1 end\n\
+         s.customEvents[i] = {{ action = function() local mine = own return skin_config.option[\"{{LAST}}\"] == 1 end }}\n\
          end\n\
          return s"
     )

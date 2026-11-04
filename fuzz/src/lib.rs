@@ -2205,15 +2205,19 @@ fn check_facts(deps: &FactDeps, facts: &ImportFacts) {
 }
 
 /// A candidate that imports was refused at none of its callbacks and
-/// analysed every one; each decorative one replaced is reported, among
-/// the retained notes or counted as suppressed past the report's cap.
+/// analysed every root (any other function is inert); each decorative
+/// one replaced is reported, among the retained notes or counted as
+/// suppressed past the report's cap.
 fn check_callbacks(i: &LuaImported) {
     use skin_beatoraja::NoteKind;
     use skin_beatoraja::lua::Disposition;
     let mut replaced = 0;
     for d in &i.callbacks {
         match d {
-            Disposition::Lowered | Disposition::ClassifiedOnly => {}
+            Disposition::Lowered
+            | Disposition::ClassifiedOnly
+            | Disposition::Inert
+            | Disposition::Captured => {}
             Disposition::Replaced(_) => replaced += 1,
             Disposition::Refused | Disposition::NeverAnalysed => {
                 panic!("an imported candidate with a callback {d:?}")

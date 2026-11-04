@@ -96,7 +96,7 @@ impl Cx<'_> {
         frames: u32,
         s: &SrcImage,
     ) -> Result<Result<Option<CycleDef>, NoteKind>, ImportError> {
-        let cycle = match self.cycle(c.span, frames, &s.timer, s.cycle)? {
+        let cycle = match self.cycle((c.span, c.role), frames, &s.timer, s.cycle)? {
             Ok(v) => v,
             Err(why) => return Ok(Err(why)),
         };
@@ -156,7 +156,7 @@ impl Cx<'_> {
                 div(self.int_or(divx, "divx", 1)?),
                 div(self.int_or(divy, "divy", 1)?),
             ],
-            timer: self.prop(timer, "timer")?,
+            timer: self.callback_prop(timer, "timer")?,
             cycle: self.int_or(cycle, "cycle", 0)?,
         })
     }
@@ -543,10 +543,17 @@ impl Cx<'_> {
         let at = dst.span;
         let [r, value, images, act] = self.def.fields(rec, ["ref", "value", "images", "act"]);
         let r = self.int_or(r, "ref", 0)?;
-        let value = self.prop(value, "value")?;
+        let value = self.callback_prop(value, "value")?;
         let selector = image_choice::set_selector(&value, r);
         let (charged, lowered) = self.lowered(&dst)?;
         let role = lowered.role(dst.failure);
+        // A function's value has no consumer, and it never falls back to
+        // `ref`: by its element's role and the part its reads show.
+        if let Prop::Callable(id) = value {
+            let role = self.callback_part(id)?.map_or(role, Role::Critical);
+            let why = self.unconsumed(role, id, "value", "image set value")?;
+            return self.drop_el(role, at, why);
+        }
         let (src, deviates) = match selector {
             SetSelector::Unsupported { why, .. } => {
                 return self.drop_el(role, at, why);

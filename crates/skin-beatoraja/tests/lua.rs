@@ -6,9 +6,9 @@
 mod common;
 
 use skin_beatoraja::limits::{MAX_FILE_BYTES, MAX_INCLUDE_DEPTH, MAX_INCLUDE_PARSES, MAX_NODES};
-use skin_beatoraja::lua::HOST_APIS;
 use skin_beatoraja::lua::Unsupported;
 use skin_beatoraja::lua::limits::{MAX_HOST_CALLS, MAX_INSTRUCTIONS, MAX_LUA_TIME};
+use skin_beatoraja::lua::{Disposition, HOST_APIS};
 use skin_beatoraja::{
     Cancel, Config, ImportError, InputLimit, LuaHeader, LuaImported, LuaLimit, LuaWhy, NoteKind,
     OffsetValue, Severity, read_lua_header,
@@ -1637,19 +1637,14 @@ fn every_function_in_the_definition_is_classified_and_consumed_where_read() {
             "{fields}"
         );
     }
-    // A write-free function in a field that takes none is refused there,
-    // at its definition.
-    for (fields, field) in [
-        ("timer = function() return 0 end,", "timer"),
-        ("blend = function() return 1 end,", "blend"),
-    ] {
-        let d = folder(&[("s.luaskin", &drawn(fields))]);
-        assert_eq!(
-            located(import(&d)),
-            (LuaWhy::Callable { field }, "s.luaskin".into(), 5),
-            "{fields}"
-        );
-    }
+    // A function in a field that takes none, which the source never
+    // reads, is inert, and refused where the import reads it, at its
+    // definition.
+    let d = folder(&[("s.luaskin", &drawn("blend = function() return 1 end,"))]);
+    assert_eq!(
+        located(import(&d)),
+        (LuaWhy::Callable { field: "blend" }, "s.luaskin".into(), 5)
+    );
     // A gauge's condition and a number's value convert.
     let images: String = (0..4)
         .map(|k| {
@@ -1683,15 +1678,18 @@ fn every_function_in_the_definition_is_classified_and_consumed_where_read() {
         ),
     )]);
     import(&d).unwrap();
-    // A function nothing reads is classified too.
-    let d = configured("skin.unread = { function() end }");
+    // A root nothing consumes is classified too; a function the source
+    // never reads is inert.
+    let d = configured("skin.customEvents = { { id = 1000, action = function() end } }");
     assert_eq!(
         why(import(&d)),
         LuaWhy::Effect(Unsupported::Construct("no return"))
     );
+    let d = configured("skin.unread = { function() end }");
+    assert_eq!(import(&d).unwrap().callbacks, [Disposition::Inert]);
     // A module's function is located in that module.
     let d = folder(&[
-        ("s.luaskin", &drawn("loop = require(\"f\"),")),
+        ("s.luaskin", &drawn("draw = require(\"f\"),")),
         ("f.lua", "local x = 1\nreturn function() end"),
     ]);
     assert_eq!(
@@ -1704,7 +1702,9 @@ fn every_function_in_the_definition_is_classified_and_consumed_where_read() {
     );
     // A host function has no tree: it is refused at its value, line 0
     // and its ordinal in the table.
-    let d = configured("skin.timer_fn = require(\"timer_util\").now_timer");
+    let d = configured(
+        "skin.customEvents = { { id = 1000, action = require(\"timer_util\").now_timer } }",
+    );
     match import(&d) {
         Err(ImportError::Lua {
             why: LuaWhy::Effect(Unsupported::Capture("not a skin closure")),
@@ -1716,12 +1716,12 @@ fn every_function_in_the_definition_is_classified_and_consumed_where_read() {
 
 #[test]
 fn the_header_pass_refuses_a_function_only_where_it_reads() {
-    // Where it does not: a key of an option item the header never reads,
-    // or a field outside the header. The header pass reads past it; the
-    // configured pass refuses it at its construct (it returns nothing).
+    // Where it does not: a field outside the header. The header pass
+    // reads past it; the configured pass refuses a root there at its
+    // construct (it returns nothing).
     for fields in [
-        "property = { { name = \"o\", item = { { name = \"a\", op = 900,\n is_selected = function() end } } } }",
-        "w = 1920, h = 1080,\n helper = function() end",
+        "customEvents = { { id = 1000,\n action = function() end } }",
+        "w = 1920, h = 1080, destination = { { id = \"i\",\n draw = function() end } }",
     ] {
         let d = folder(&[("s.luaskin", &format!("return {{ type = 0, {fields} }}"))]);
         let h = header(&d).unwrap_or_else(|e| panic!("{fields}: {e:?}"));
@@ -1732,6 +1732,19 @@ fn the_header_pass_refuses_a_function_only_where_it_reads() {
         ));
         assert!(matches!(w, LuaWhy::Effect(_)), "{fields}: {w:?}");
         assert_eq!((file.as_str(), line), ("s.luaskin", 2), "{fields}");
+    }
+    // A key of an option item that neither the header nor the source
+    // reads, or a field outside the source's skin: the header pass reads
+    // past it, and the configured pass leaves it inert.
+    for fields in [
+        "property = { { name = \"o\", item = { { name = \"a\", op = 900,\n is_selected = function() end } } } }",
+        "w = 1920, h = 1080,\n helper = function() end",
+    ] {
+        let d = folder(&[("s.luaskin", &format!("return {{ type = 0, {fields} }}"))]);
+        let h = header(&d).unwrap_or_else(|e| panic!("{fields}: {e:?}"));
+        let i = common::lua_play(&h, &Config::defaults(h.header()), &Cancel::new())
+            .unwrap_or_else(|e| panic!("{fields}: {e:?}"));
+        assert_eq!(i.callbacks, [Disposition::Inert], "{fields}");
     }
     // Where the header's reading meets it: a value, a record, a list or a
     // condition, refused by the header pass at its definition.
@@ -2093,7 +2106,7 @@ fn retyped(ty: i32, body: &str) -> TempDir {
 }
 
 /// A function the callback admission refuses.
-const UNSUPPORTED: &str = "skin.extra = { function() end }";
+const UNSUPPORTED: &str = "skin.customEvents = { { action = function() end } }";
 
 /// Checks `run`, an import into the play slot, on a play skin whose
 /// configured pass returns type 7, also with a callback the admission

@@ -120,6 +120,9 @@ pub(crate) struct Callable {
     pub(crate) kind: CallableKind,
     /// Its closure instance in [`LuaText::analysis`], `NONE` without one.
     pub(crate) instance: u32,
+    /// Whether the source reads it: it is met at a property field or an
+    /// `op` entry ([`crate::lua::convert`]'s schema). Any other is inert.
+    pub(crate) root: bool,
 }
 
 /// What a function a Lua skin's table held is.

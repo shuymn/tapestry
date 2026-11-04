@@ -315,7 +315,7 @@ impl Cx<'_> {
         let ty = self.int_or(ty, "type", 0)?;
         let angle = self.int_or(angle, "angle", 0)?;
         let range = self.int_or(range, "range", 0)?;
-        let value = self.prop(value, "value")?;
+        let value = self.callback_prop(value, "value")?;
         let ref_num = match ref_num {
             Some(f) => self.def.bool(f, "isRefNum")?,
             None => false,
