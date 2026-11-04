@@ -115,3 +115,74 @@ fn fonts_stay_in_the_skin_folder() {
     let err = with(&skin, &["none.ttf"]).unwrap_err();
     assert!(matches!(err, FontError::Missing { font: 0 }), "{err:?}");
 }
+
+#[path = "image_support/mod.rs"]
+mod image_support;
+
+#[test]
+fn font_reader_budgets() {
+    use skin_model::FontReader;
+    let d = tempfile::tempdir().unwrap();
+    let names: Vec<String> = (0..MAX_FONTS).map(|i| format!("f{i}.ttf")).collect();
+    for n in &names {
+        write(d.path(), n, &TRUETYPE, 4);
+    }
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let sheet = with(d.path(), &refs).unwrap();
+    // Grown after load to 32 MiB each: two fill the budget by the bytes
+    // read, and the third is past what is left.
+    for n in &names {
+        write(d.path(), n, &TRUETYPE, MAX_FONT_BYTES);
+    }
+    let mut reader = FontReader::new(&sheet);
+    assert_eq!(reader.read(0).unwrap().len() as u64, MAX_FONT_BYTES);
+    assert_eq!(reader.remaining(), MAX_TOTAL_FONT_BYTES - MAX_FONT_BYTES);
+    reader.read(1).unwrap();
+    assert_eq!(reader.remaining(), 0);
+    let err = reader.read(2).unwrap_err();
+    assert!(
+        matches!(err, FontError::TotalTooLarge { font: 2 }),
+        "{err:?}"
+    );
+    // Each file's own cap holds even with the budget left.
+    write(d.path(), "f3.ttf", &TRUETYPE, MAX_FONT_BYTES + 1);
+    let err = FontReader::new(&sheet).read(3).unwrap_err();
+    assert!(matches!(err, FontError::TooLarge { font: 3 }), "{err:?}");
+    let err = FontReader::new(&sheet).read(16).unwrap_err();
+    assert!(matches!(err, FontError::Unknown { font: 16 }), "{err:?}");
+}
+
+#[test]
+fn font_reader_checks_the_files_again() {
+    use skin_model::FontReader;
+    let outer = tempfile::tempdir().unwrap();
+    let skin = outer.path().join("skin");
+    std::fs::create_dir_all(skin.join("sub")).unwrap();
+    std::fs::create_dir(outer.path().join("away")).unwrap();
+    write(&skin, "a.ttf", &TRUETYPE, 8);
+    write(&skin, "b.ttf", b"OTTO", 8);
+    write(&skin.join("sub"), "c.ttf", &TRUETYPE, 8);
+    write(&outer.path().join("away"), "c.ttf", &TRUETYPE, 8);
+    let sheet = with(&skin, &["a.ttf", "b.ttf", "sub/c.ttf"]).unwrap();
+    // As loaded, each reads.
+    let mut reader = FontReader::new(&sheet);
+    for f in 0..3 {
+        assert_eq!(reader.read(f).unwrap().len(), 8);
+    }
+    // A file swapped for a folder, a magic changed, a folder swapped for
+    // a link out of the skin.
+    std::fs::remove_file(skin.join("a.ttf")).unwrap();
+    std::fs::create_dir(skin.join("a.ttf")).unwrap();
+    write(&skin, "b.ttf", b"wOFF", 8);
+    std::fs::remove_dir_all(skin.join("sub")).unwrap();
+    image_support::link_dir(&skin.join("sub"), &outer.path().join("away"));
+    let mut reader = FontReader::new(&sheet);
+    let err = reader.read(0).unwrap_err();
+    assert!(matches!(err, FontError::NotAFile { font: 0 }), "{err:?}");
+    let err = reader.read(1).unwrap_err();
+    assert!(matches!(err, FontError::Unsupported { font: 1 }), "{err:?}");
+    let err = reader.read(2).unwrap_err();
+    assert!(matches!(err, FontError::PathEscapes { font: 2 }), "{err:?}");
+    // The bytes read are charged, a refused file's included.
+    assert_eq!(reader.remaining(), MAX_TOTAL_FONT_BYTES - 8);
+}

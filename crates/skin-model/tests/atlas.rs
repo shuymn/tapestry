@@ -262,3 +262,111 @@ fn shared_rectangles_share_a_place_and_builds_repeat() {
     }
     assert!(a.pages()[0].level(4).is_none());
 }
+
+#[test]
+fn atlas_reserves_a_text_layer() {
+    let d = dir();
+    // Four frames of 240 (256 padded), as above.
+    save(d.path(), "a.png", &solid(480, 480, WHITE));
+    let sheet = load(
+        d.path(),
+        vec![file("a.png")],
+        vec![ImageDef {
+            grid: [2, 2],
+            ..whole(0)
+        }],
+    )
+    .unwrap();
+    let limits = |max_side, max_layers| AtlasLimits {
+        max_side,
+        max_layers,
+        reserved_layers: 1,
+    };
+    let plain = sheet
+        .atlas(Variant::Lo, limits(8_192, 16), &|| false)
+        .unwrap();
+    assert_eq!((plain.side(), plain.pages().len()), (256, 4));
+    assert_eq!(plain.text_layer(), None);
+    // With the layer: one page of 2048, the layer after it, no CPU page.
+    let text = sheet
+        .atlas_reserving(Variant::Lo, limits(8_192, 16), true, &|| false)
+        .unwrap();
+    assert_eq!((text.side(), text.pages().len()), (2_048, 1));
+    assert_eq!(text.text_layer(), Some(2));
+    assert!(text.uvs().frames().iter().all(|f| f.layer == 1));
+    // A device whose layers leave none for the text, or whose side is
+    // below 2048, cannot hold it.
+    let err = sheet
+        .atlas_reserving(Variant::Lo, limits(8_192, 2), true, &|| false)
+        .unwrap_err();
+    assert!(matches!(err, skin_model::AtlasError::Limits), "{err:?}");
+    let err = sheet
+        .atlas_reserving(Variant::Lo, limits(1_024, 16), true, &|| false)
+        .unwrap_err();
+    assert!(
+        matches!(err, skin_model::AtlasError::TooManyPages),
+        "{err:?}"
+    );
+    // The texel cap counts the layer: a frame past 4096 wide needs a page
+    // of 8192, whose two layers make 128 Mi texels; the text layer is a
+    // third.
+    save(d.path(), "wide.png", &solid(4_100, 8, WHITE));
+    let wide = load(d.path(), vec![file("wide.png")], vec![whole(0)]).unwrap();
+    let a = wide
+        .atlas(Variant::Lo, limits(8_192, 16), &|| false)
+        .unwrap();
+    assert_eq!(a.side(), 8_192);
+    let err = wide
+        .atlas_reserving(Variant::Lo, limits(8_192, 16), true, &|| false)
+        .unwrap_err();
+    assert!(
+        matches!(err, skin_model::AtlasError::AtlasTooLarge { texels } if texels == 3 << 26),
+        "{err:?}"
+    );
+    // A sheet without frames still gets the layer, on no page.
+    let empty = load(d.path(), Vec::new(), Vec::new()).unwrap();
+    let a = empty
+        .atlas_reserving(Variant::Lo, limits(8_192, 16), true, &|| false)
+        .unwrap();
+    assert_eq!(
+        (a.side(), a.pages().len(), a.text_layer()),
+        (2_048, 0, Some(1))
+    );
+}
+
+#[test]
+fn the_rectangular_mip_helper_equals_the_page_mips() {
+    let d = dir();
+    // A frame of distinct texels, so every average differs.
+    let mut img = RgbaImage::new(40, 24);
+    for (x, y, p) in img.enumerate_pixels_mut() {
+        *p = Rgba([(x * 6) as u8, (y * 10) as u8, ((x + y) * 3) as u8, 255]);
+    }
+    save(d.path(), "a.png", &img);
+    let sheet = load(d.path(), vec![file("a.png")], vec![whole(0)]).unwrap();
+    let a = atlas(&sheet);
+    // The frame's allocation, aligned to 8: copied out of level 0, its
+    // levels by the helper match the page's over it.
+    let (rect, page) = content(&a, 0, 1);
+    let [x, y, w, h] = rect;
+    let (ax, ay) = (x - skin_model::GUTTER, y - skin_model::GUTTER);
+    let (aw, ah) = (
+        (w + 2 * skin_model::GUTTER).next_multiple_of(8),
+        (h + 2 * skin_model::GUTTER).next_multiple_of(8),
+    );
+    let mut level: Vec<u8> = (0..ah)
+        .flat_map(|ty| (0..aw).map(move |tx| (tx, ty)))
+        .flat_map(|(tx, ty)| texel(&a, page, 0, ax + tx, ay + ty))
+        .collect();
+    for k in 1..skin_model::MIP_LEVELS {
+        let (pw, ph) = (aw >> (k - 1), ah >> (k - 1));
+        let mut next = vec![0; (pw / 2 * ph / 2 * 4) as usize];
+        skin_model::downsample_rgba(&level, pw, &mut next);
+        let page_level: Vec<u8> = (0..ph / 2)
+            .flat_map(|ty| (0..pw / 2).map(move |tx| (tx, ty)))
+            .flat_map(|(tx, ty)| texel(&a, page, k, (ax >> k) + tx, (ay >> k) + ty))
+            .collect();
+        assert_eq!(next, page_level, "level {k}");
+        level = next;
+    }
+}

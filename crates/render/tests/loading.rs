@@ -433,7 +433,8 @@ fn installed_text_never_passes_to_the_next_lifetime() {
             ..loader()
         },
     );
-    let uv = producer.unwrap().uv;
+    assert!(producer.is_some());
+    let uv = a.uvs().get(0).unwrap();
     let lines = || {
         let mut slots = vec![None; a.skin().text_slots()];
         *slots.first_mut().unwrap() = TextImage::new(uv, [0.0, 0.0, 1.0, 1.0], 1.0);
@@ -633,7 +634,7 @@ fn chosen_chart_text_installs_only_where_it_was_prepared() {
     let dir = tempfile::tempdir().unwrap();
     let mut r = offscreen(1_920, 1_080);
     let text = MenuText::new(&r);
-    let (a, producer) = bundle(&r, dir.path(), &chart_texts([255, 0, 0, 255]));
+    let (a, _) = bundle(&r, dir.path(), &chart_texts([255, 0, 0, 255]));
     let (b, _) = bundle(&r, dir.path(), &chart_texts([0, 255, 0, 255]));
     install(&mut r, &a, 1);
     r.enter_loading(1);
@@ -653,10 +654,6 @@ fn chosen_chart_text_installs_only_where_it_was_prepared() {
         texts(&loading(&mut r, &text, &frame_at(1, 16))),
         [RED, BLACK, BLACK, RED],
         "the title and the full title, nothing unavailable"
-    );
-    assert_eq!(
-        producer.unwrap().charts.lock().unwrap().last().unwrap(),
-        &["B".to_owned(), String::new(), String::new()]
     );
 
     // The title cleared: its slot and the full title's draw nothing.
@@ -725,7 +722,7 @@ fn staged_chart_text_is_bounded() {
     let (a, _) = bundle(&r, dir.path(), &chart_texts([255, 0, 0, 255]));
     install(&mut r, &a, 1);
     r.enter_loading(1);
-    r.prepare_loading_text(1, 1, TextSlots::ALL, &chosen("A", "", ""))
+    r.prepare_loading_text(1, 1, TextSlots::ALL, &chosen("B", "b", ""))
         .unwrap();
     let one = r.memory();
     assert!(one.staged_text > 0);

@@ -348,7 +348,14 @@ fn a_retry_reuses_the_resources_with_a_fresh_attempt() {
     r.commit(token).unwrap();
     assert_eq!(r.resource_generation(), generation);
     assert_eq!(r.refused(), None);
-    assert_eq!(text.calls.load(Ordering::SeqCst), 2, "each attempt's text");
+    assert_eq!(
+        (
+            text.calls.load(Ordering::SeqCst),
+            r.text_report().counts.hits
+        ),
+        (1, 1),
+        "the retry's text hits the line the first attempt placed"
+    );
     let mut v = view(0, 0);
     v.gauges.push(GaugeState {
         value: GaugeValue::FULL,
@@ -401,7 +408,9 @@ fn repeated_rearms_keep_the_memory_witness_flat() {
     r.commit(token).unwrap();
     let generation = r.resource_generation();
     let first = r.frame(&at(900)).unwrap();
-    assert_eq!(first.sprites, staging.instances().len());
+    // The staging attaches the text element's line; the skin staged
+    // apart has none.
+    assert_eq!(first.sprites, staging.instances().len() + 1);
     let memory = r.memory();
     for k in 0..50 {
         r.frame(&at(900 + k * 17)).unwrap();

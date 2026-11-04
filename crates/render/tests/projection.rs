@@ -142,6 +142,7 @@ fn install(r: &mut Renderer, clips: Vec<[f32; 4]>) {
         &AtlasPages {
             side: 256,
             pages: &pages,
+            text_layer: false,
         },
         ClipTable::new(clips).unwrap(),
     )
@@ -452,6 +453,7 @@ fn a_refused_atlas_keeps_the_one_in_use() {
     let past_side = AtlasPages {
         side: max * 2,
         pages: &[],
+        text_layer: false,
     };
     let e = r.install_atlas(&past_side, whole()).unwrap_err();
     assert!(
@@ -465,6 +467,7 @@ fn a_refused_atlas_keeps_the_one_in_use() {
     let past_layers = AtlasPages {
         side: 256,
         pages: &all,
+        text_layer: false,
     };
     let e = r.install_atlas(&past_layers, whole()).unwrap_err();
     assert!(
@@ -475,6 +478,7 @@ fn a_refused_atlas_keeps_the_one_in_use() {
     let short = AtlasPages {
         side: 256,
         pages: &all[..1],
+        text_layer: false,
     };
     let e = r.install_atlas(&short, whole()).unwrap_err();
     assert!(

@@ -84,7 +84,8 @@ mod widget;
 pub use atlas::uv::{FrameUv, UvTable};
 pub use atlas::{
     ALIGN, ATLAS_TABLE_BYTES, Atlas, AtlasError, AtlasLimits, CELL_TABLE_BYTES, FILE_TABLE_BYTES,
-    GUTTER, MAX_ATLAS_TEXELS, MAX_PAGE_SIDE, MAX_PAGES, MIN_PAGE_SIDE, MIP_LEVELS, Page, Variant,
+    GUTTER, MAX_ATLAS_TEXELS, MAX_PAGE_SIDE, MAX_PAGES, MIN_PAGE_SIDE, MIN_TEXT_SIDE, MIP_LEVELS,
+    Page, Variant, downsample_rgba,
 };
 pub use canvas::{Canvas, Fit, MAX_CANVAS};
 pub use expr::{
@@ -100,7 +101,9 @@ pub use image::fnt::{
     FntError, FntErrorKind, FntFile, FntGlyph, FntKerning, FntLimits, MAX_FNT_BYTES, MAX_FNT_PAGES,
     MAX_FNT_VALUE, MAX_FONT_GLYPHS, MAX_FONT_KERNINGS, MAX_SHEET_GLYPHS, MAX_SHEET_KERNINGS,
 };
-pub use image::font::{FontDef, FontError, MAX_FONT_BYTES, MAX_FONTS, MAX_TOTAL_FONT_BYTES};
+pub use image::font::{
+    FontDef, FontError, FontReader, MAX_FONT_BYTES, MAX_FONTS, MAX_TOTAL_FONT_BYTES,
+};
 pub use image::path::{Entry, FileId, Listing, Root, RootError};
 pub use image::{
     CycleDef, FileAt, FileDef, HEADER_BYTES, ImageDef, ImageError, MAX_FILE_BYTES, MAX_FILES,

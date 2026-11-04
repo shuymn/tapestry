@@ -19,7 +19,7 @@ use std::sync::{Arc, OnceLock};
 
 use bms_model::{ChartBuilder, TimeUs};
 use common::{GAUGES, attempt, context, input, offscreen, view};
-use decl_support::{Look, solid_bundle};
+use decl_support::{Look, solid_bundle, solid_cells_bundle};
 use render::{
     CommitError, PreparedToken, RenderError, Renderer, SHARED_TEXELS, SkinBundle, VM_TEXELS,
 };
@@ -327,4 +327,41 @@ fn a_removal_drops_only_its_kinds_staging() {
         &red
     ));
     assert!(r.installed(ScreenKind::Selection).is_none());
+}
+
+/// A candidate's text layer is charged with its pages: three 4 096-texel
+/// pages, the reserved layer and the text layer are 80 Mi texels. With
+/// play's tiny skin and two other kinds each keeping a VM committed, and
+/// the candidate keeping one too, 48 Mi texels and four tiny atlases are
+/// charged beside it: with its text layer it passes the limit and is
+/// refused, before anything is staged; without the layer (64 Mi) it would
+/// fit.
+#[test]
+fn a_candidate_s_text_layer_is_charged() {
+    const PAGE: u64 = 4_096 * 4_096;
+    let mut r = offscreen(1_920, 1_080);
+    let t = tiny(&r, RED);
+    play(&mut r, &t, 1);
+    let vm = |r: &Renderer| Arc::new(Arc::try_unwrap(tiny(r, GREEN)).unwrap().keeping_vm());
+    let (d, re) = (vm(&r), vm(&r));
+    commit(&mut r, ScreenKind::Decision, &d, 2);
+    commit(&mut r, ScreenKind::Result, &re, 3);
+    let cell = [4_000, 3_000];
+    let look = Look {
+        text: true,
+        ..Look::left(RED)
+    };
+    let cells = [(cell, RED), (cell, GREEN), (cell, [0, 0, 255, 255])];
+    let candidate = solid_cells_bundle(&r, &look, &cells);
+    assert_eq!((candidate.side(), candidate.text_layer()), (4_096, Some(4)));
+    let candidate = Arc::new(Arc::try_unwrap(candidate).unwrap().keeping_vm());
+    let committed = TINY + 2 * (TINY + VM_TEXELS);
+    let needed = committed + 5 * PAGE + VM_TEXELS;
+    assert!(needed > SHARED_TEXELS && needed - PAGE <= SHARED_TEXELS);
+    let e = r.admit(ScreenKind::Selection, &candidate).unwrap_err();
+    refused(&e, ScreenKind::Selection, needed);
+    let e = r.install(ScreenKind::Selection, &candidate, 4).unwrap_err();
+    refused(&e, ScreenKind::Selection, needed);
+    assert!(r.staged().is_none());
+    assert_eq!(candidate.atlas_texels(), 5 * PAGE);
 }

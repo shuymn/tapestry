@@ -18,15 +18,17 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use bms_model::{Chart, ChartBuilder, Lane, LnMode, TimeUs};
-use render::{AttemptText, ClipTable, Instance, Renderer, SkinBundle, SkinError};
+use render::{
+    AttemptText, ClipTable, Instance, LineBounds, LineFit, LineLayout, Renderer, SkinBundle,
+    SkinError, TextResidency,
+};
 use skin_model::{
-    Align, Anchor, BarGroupDef, Bind, Blend, ChartText, ClipId, CoverImage, CoverMotion,
-    CoverPaintDef, CoverSettings, CoverTrim, Ease, ElementDef, End, FileDef, Filter, Fit, Follow,
-    FontRef, FrameReadouts, FrameUv, Gain, GaugeDef, GaugeLook, GaugeParts, ImageDef, KeyDef,
-    LaneParts, LaneStyle, LaneView, LanesDef, Layout, Motion, Overflow, PLAY, Place, Region,
-    RegionDef, Root, Scope, Sheet, SheetBuilder, Side, Skin, SkinDef, SolidImageDef, Source,
-    SourceLanes, TextDef, TextField, TextImage, TextTable, TextValue, TimerRef, Track, Ty, Variant,
-    WidgetDefs, compile,
+    Align, Anchor, BarGroupDef, Bind, Blend, ClipId, CoverImage, CoverMotion, CoverPaintDef,
+    CoverSettings, CoverTrim, Ease, ElementDef, End, FileDef, Filter, Fit, Follow, FontRef,
+    FrameReadouts, Gain, GaugeDef, GaugeLook, GaugeParts, ImageDef, KeyDef, LaneParts, LaneStyle,
+    LaneView, LanesDef, Motion, Overflow, PLAY, Place, Region, RegionDef, Root, Scope, Sheet,
+    SheetBuilder, Side, Skin, SkinDef, SolidImageDef, Source, SourceLanes, TextDef, TextField,
+    TextRequest, TextValue, TimerRef, Track, Ty, Variant, WidgetDefs, compile,
 };
 
 /// A track holding canvas `rect` from 0.
@@ -53,6 +55,28 @@ fn png(path: &Path, side: u32, rgba: [u8; 4]) {
     e.set_depth(png::BitDepth::Eight);
     let data: Vec<u8> = (0..side * side).flat_map(|_| rgba).collect();
     e.write_header().unwrap().write_image_data(&data).unwrap();
+}
+
+/// The chart text's bitmap font file.
+const CHART_FONT: &str = "chart.fnt";
+
+/// Writes [`CHART_FONT`] in `dir`: size 100 with base 100, every printable
+/// ASCII character a 100 × 100 glyph of `rgba` advancing 100, so a line's
+/// first 100 × 100 square from its box's top left is that colour.
+fn chart_font(dir: &Path, rgba: [u8; 4]) {
+    let mut s = String::from(
+        "info face=\"solid\" size=100 padding=0,0,0,0\n\
+         common lineHeight=100 base=100 scaleW=128 scaleH=128 pages=1\n\
+         page id=0 file=\"chart.png\"\n",
+    );
+    for c in 32..127 {
+        s.push_str(&format!(
+            "char id={c} x=0 y=0 width=100 height=100 xoffset=0 yoffset=0 xadvance=100 \
+             page=0 chnl=15\n"
+        ));
+    }
+    std::fs::write(dir.join(CHART_FONT), s).unwrap();
+    png(&dir.join("chart.png"), 128, rgba);
 }
 
 /// An element drawing image 0 over canvas `rect` from `ready` on, under
@@ -283,44 +307,49 @@ impl Look {
     }
 }
 
-/// A text producer giving every text slot whose string resolves to
-/// something the image of the fixture's frame 0, and no line to the
-/// others, counting its calls and noting each chart's title, artist and
-/// genre, or refusing while `refuse` is set.
+/// A text producer laying every request out as a filled square of
+/// [`STUB_LINE`] pixels, one em on a side from the box's top left, so a
+/// line draws the element's colour over its box; counting its layouts and
+/// noting each request's string, or refusing to rasterize while `refuse`
+/// is set.
 #[derive(Debug)]
 pub struct Text {
-    pub uv: FrameUv,
     pub calls: AtomicU32,
+    pub rasters: AtomicU32,
     pub refuse: AtomicBool,
-    pub charts: Mutex<Vec<[String; 3]>>,
+    pub strings: Mutex<Vec<String>>,
 }
 
+/// A stub line's side, in pixels.
+pub const STUB_LINE: u32 = 16;
+
 impl AttemptText for Text {
-    fn prepare(
-        &self,
-        skin: &Skin,
-        chart: &ChartText<'_>,
-        target: [u32; 2],
-    ) -> Result<Option<TextTable>, SkinError> {
+    fn layout(&self, req: &TextRequest, em_px: f32, _: LineBounds) -> LineFit {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        self.charts.lock().unwrap().push([
-            chart.title.to_owned(),
-            chart.artist.to_owned(),
-            chart.genre.to_owned(),
-        ]);
+        self.strings.lock().unwrap().push(req.text.clone());
+        LineFit::Fits(LineLayout {
+            font: req.font,
+            size: [STUB_LINE; 2],
+            ink: [0.0, 0.0, 1.0, 1.0],
+            advance: 1.0,
+            raster_em: em_px,
+            glyphs: Box::new([]),
+        })
+    }
+
+    fn raster(&self, _: &LineLayout, out: &mut [u8]) -> Result<(), SkinError> {
+        self.rasters.fetch_add(1, Ordering::SeqCst);
         if self.refuse.load(Ordering::SeqCst) {
             return Err(SkinError {
                 reason: "the text cannot be prepared".to_owned(),
             });
         }
-        let line = TextImage::new(self.uv, [0.0, 0.0, 1.0, 1.0], 1.0);
-        let mut slots = vec![None; skin.text_slots()];
-        for request in skin.text_requests(chart, target, &Layout::AUTHOR) {
-            if let Some(slot) = slots.get_mut(usize::from(request.slot)) {
-                *slot = line;
-            }
-        }
-        Ok(Some(TextTable::new(slots)))
+        out.fill(255);
+        Ok(())
+    }
+
+    fn resident(&self) -> TextResidency {
+        TextResidency::default()
     }
 }
 
@@ -344,20 +373,31 @@ pub fn skin(dir: &Path, look: &Look) -> Skin {
             ..images[0]
         }));
     }
-    let sheet = Sheet::new(
-        dir,
-        vec![FileDef {
-            path: name.as_str().into(),
-            hi: None,
-        }],
-        images,
-    )
-    .unwrap();
-    skin_of(sheet, look)
+    let file = FileDef {
+        path: name.as_str().into(),
+        hi: None,
+    };
+    let (sheet, chart_font) = if look.chart_text {
+        // The chart's text in a bitmap font of the look's colour, staged
+        // with the loading text as bitmap lines.
+        chart_font(dir, look.rgba);
+        let mut b = SheetBuilder::new(&Root::new(dir).unwrap());
+        b.admit_file(file).unwrap();
+        for i in images {
+            b.add_image(i).unwrap();
+        }
+        let f = b.admit_fnt(CHART_FONT, &mut |_| Ok(()), &|| false).unwrap();
+        let font = b.add_bitmap_font(f, &[]).unwrap();
+        (b.finish(), Some(font))
+    } else {
+        (Sheet::new(dir, vec![file], images).unwrap(), None)
+    };
+    skin_of(sheet, look, chart_font)
 }
 
-/// The compiled skin of `look` drawing image 0 of `sheet`.
-fn skin_of(sheet: Sheet, look: &Look) -> Skin {
+/// The compiled skin of `look` drawing image 0 of `sheet`, its chart text
+/// in bitmap font `chart_font`.
+fn skin_of(sheet: Sheet, look: &Look, chart_font: Option<u32>) -> Skin {
     let clipped = look.clip.is_some();
     let [x, y, ..] = look.rect;
     let mut elements = vec![image(look.rect, clipped)];
@@ -402,7 +442,7 @@ fn skin_of(sheet: Sheet, look: &Look) -> Skin {
             let slot = u32::try_from(widgets.texts.len()).unwrap();
             widgets.texts.push(TextDef {
                 value: TextValue::Field(field),
-                font: FontRef::Default,
+                font: FontRef::Bitmap(chart_font.unwrap()),
                 align: Align::Left,
                 overflow: Overflow::Spill,
             });
@@ -581,20 +621,43 @@ fn skin_of(sheet: Sheet, look: &Look) -> Skin {
 /// read: one `size` cell of `look.rgba`, the whole of image 0. The
 /// atlas's page side is the least that holds the cell with its gutter.
 pub fn solid_bundle(r: &Renderer, look: &Look, size: [u32; 2]) -> Arc<SkinBundle> {
+    solid_cells_bundle(r, look, &[(size, look.rgba)])
+}
+
+/// [`solid_bundle`] with one generated cell per `(size, colour)` of
+/// `cells`, image 0 the first, and with its text element's producer
+/// ([`Text`]) when `look` has one: its atlas then has the text layer.
+pub fn solid_cells_bundle(
+    r: &Renderer,
+    look: &Look,
+    cells: &[([u32; 2], [u8; 4])],
+) -> Arc<SkinBundle> {
     let dir = tempfile::tempdir().unwrap();
     let mut b = SheetBuilder::new(&Root::new(dir.path()).unwrap());
-    b.add_solid_image(SolidImageDef {
-        size,
-        color: look.rgba,
-        filter: Filter::Nearest,
-    })
-    .unwrap();
-    let skin = skin_of(b.finish(), look);
+    for &(size, color) in cells {
+        b.add_solid_image(SolidImageDef {
+            size,
+            color,
+            filter: Filter::Nearest,
+        })
+        .unwrap();
+    }
+    let skin = skin_of(b.finish(), look, None);
     let atlas = skin
         .atlas(Variant::Lo, r.atlas_limits(), &|| false)
         .unwrap();
     let clips = ClipTable::new(look.clip.into_iter().collect()).unwrap();
-    Arc::new(SkinBundle::new(Arc::new(skin), atlas, clips, Side::Left).unwrap())
+    let bundle = SkinBundle::new(Arc::new(skin), atlas, clips, Side::Left).unwrap();
+    if !look.text {
+        return Arc::new(bundle);
+    }
+    let text: Arc<dyn AttemptText> = Arc::new(Text {
+        calls: AtomicU32::new(0),
+        rasters: AtomicU32::new(0),
+        refuse: AtomicBool::new(false),
+        strings: Mutex::new(Vec::new()),
+    });
+    Arc::new(bundle.with_text(text).unwrap())
 }
 
 /// A bundle of `look` for `r`'s device, its image in `dir`, with its text
@@ -604,18 +667,17 @@ pub fn bundle(r: &Renderer, dir: &Path, look: &Look) -> (Arc<SkinBundle>, Option
     let atlas = skin
         .atlas(Variant::Lo, r.atlas_limits(), &|| false)
         .unwrap();
-    let uv = atlas.uvs().get(0).unwrap();
     let clips = ClipTable::new(look.clip.into_iter().collect()).unwrap();
     let bundle = SkinBundle::new(Arc::new(skin), atlas, clips, Side::Left).unwrap();
-    if !look.text && !look.chart_text {
+    if !look.text {
         return (Arc::new(bundle), None);
     }
     let text = Arc::new(Text {
-        uv,
         calls: AtomicU32::new(0),
+        rasters: AtomicU32::new(0),
         refuse: AtomicBool::new(false),
-        charts: Mutex::new(Vec::new()),
+        strings: Mutex::new(Vec::new()),
     });
     let producer: Arc<dyn AttemptText> = text.clone();
-    (Arc::new(bundle.with_text(producer)), Some(text))
+    (Arc::new(bundle.with_text(producer).unwrap()), Some(text))
 }

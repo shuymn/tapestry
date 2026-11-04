@@ -1442,19 +1442,49 @@ impl Skin {
         &self.sheet
     }
 
-    /// Builds the sheet's atlas for `variant`, asking `cancel` as it goes
-    /// ([`Sheet::atlas`]).
+    /// Builds the sheet's atlas for `variant`, asking `cancel` as it goes,
+    /// with a text layer when the skin has rasterized text
+    /// ([`has_outline_text`](Self::has_outline_text),
+    /// [`Sheet::atlas_reserving`]).
     ///
     /// # Errors
     ///
-    /// As [`Sheet::atlas`].
+    /// As [`Sheet::atlas_reserving`].
     pub fn atlas(
         &self,
         variant: Variant,
         limits: AtlasLimits,
         cancel: &dyn Fn() -> bool,
     ) -> Result<Atlas, AtlasError> {
-        self.sheet.atlas(variant, limits, cancel)
+        self.sheet
+            .atlas_reserving(variant, limits, self.has_outline_text(), cancel)
+    }
+
+    /// Whether some text element is rasterized: set in the default font or
+    /// a font file, not a bitmap font.
+    #[must_use]
+    pub fn has_outline_text(&self) -> bool {
+        self.texts
+            .iter()
+            .any(|t| matches!(t.font, FontRef::Default | FontRef::File(_)))
+    }
+
+    /// The font files the rasterized text elements are set in, each once,
+    /// in index order: the ones a [`FontReader`](crate::FontReader) reads
+    /// for installation.
+    #[must_use]
+    pub fn outline_fonts(&self) -> Vec<u32> {
+        let mut fonts: Vec<u32> = self
+            .texts
+            .iter()
+            .filter_map(|t| match t.font {
+                FontRef::File(f) => Some(f),
+                FontRef::Default | FontRef::Bitmap(_) => None,
+            })
+            .collect();
+        fonts.sort_unstable();
+        fonts.dedup();
+        fonts
     }
 
     /// The operations every frame's expressions run.
