@@ -780,14 +780,7 @@ fn with_facts(entry: &str, facts: &super::facts::ImportFacts) -> (Captures, Lowe
     let an = def.arena.lua.as_deref().and_then(|l| l.analysis.as_deref());
     let captured = an.unwrap().captured.clone();
     LOWERED.with(|l| l.borrow_mut().clear());
-    let o = h.finish(
-        Ok(def),
-        counts,
-        store,
-        reads,
-        &config,
-        skin_model::ScreenKind::Play,
-    );
+    let o = h.finish(Ok(def), counts, store, reads, &config);
     let r = match o.result {
         Ok(_) => Ok((o.callbacks, LOWERED.with(|l| l.borrow().clone()))),
         Err(super::ledger::Stop::Fault(e)) => Err(e),

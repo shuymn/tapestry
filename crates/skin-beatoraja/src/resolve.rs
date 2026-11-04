@@ -561,19 +561,13 @@ pub fn resolve<'d>(
         parses: def.entry_parses,
         ..Run::default()
     };
-    let top = def.top;
-    if !def.arena.is_object(top) {
-        return Err(def.type_error(top, "(root)", "an object"));
-    }
     // The top level is read literally, ordinary fields only
     // (JSONSkinLoader.java:98-102, `JsonSkin.Skin` has no serializer).
-    let [ty, w, h, name, author, property, filepath, offset] = def.fields(
-        top,
-        [
-            "type", "w", "h", "name", "author", "property", "filepath", "offset",
-        ],
+    let (kind, kind_node) = def.kind()?;
+    let [w, h, name, author, property, filepath, offset] = def.fields(
+        def.top,
+        ["w", "h", "name", "author", "property", "filepath", "offset"],
     );
-    let (kind, kind_node) = def.kind_at(ty)?;
     // 1280×720 when omitted (JsonSkin.java:12-13).
     let w_v = w.map_or(Ok(1280), |id| def.int(id, "w"))?;
     let h_v = h.map_or(Ok(720), |id| def.int(id, "h"))?;

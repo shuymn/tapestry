@@ -911,11 +911,12 @@ impl LuaHeader {
         cancel: &Cancel,
     ) -> Outcome<Imported, Stop> {
         let (def, counts, store, reads) = self.configured(config, facts, cancel);
-        self.finish(def, counts, store, reads, config, facts.scene)
+        self.finish(def, counts, store, reads, config)
     }
 
-    /// The common import of a configured pass's outcome into the `slot`
-    /// kind's slot, with the candidate's metadata kept on every outcome.
+    /// The common import of a configured pass's outcome into the slot of
+    /// the header's kind, which [`Self::configured`] checked the snapshot's
+    /// scene against, with the candidate's metadata kept on every outcome.
     pub(crate) fn finish(
         &self,
         def: Result<Definition, Stop>,
@@ -923,8 +924,8 @@ impl LuaHeader {
         mut store: Store,
         reads: Vec<FactRead>,
         config: &Config,
-        slot: ScreenKind,
     ) -> Outcome<Imported, Stop> {
+        let slot = self.header.kind;
         let mut callbacks = Vec::new();
         let result = def.and_then(|mut def| {
             let r =

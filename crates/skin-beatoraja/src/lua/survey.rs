@@ -217,7 +217,7 @@ pub fn survey(root: &Path, entry: &str, facts: &ImportFacts, cancel: &Cancel) ->
             }
         }
     }
-    let o = h.finish(def, counts, store, reads, &config, kind);
+    let o = h.finish(def, counts, store, reads, &config);
     s.reads.clone_from(&o.reads);
     for d in &o.callbacks {
         *s.outcomes.entry(disposition(d)).or_default() += 1;
