@@ -991,8 +991,8 @@ fn build_system(
         let font = swash::FontRef::from_index(data, usize::try_from(*index).unwrap_or(usize::MAX))
             .ok_or("swash cannot read its face")?;
         let coords = shaping_coords(data, *index)?;
-        let cap_em =
-            cap_height(font, &coords).ok_or("no cap height: no OS/2 cap height, H or ascender")?;
+        let cap_em = cap_height(data, *index, font, &coords)
+            .ok_or("no cap height: no OS/2 cap height, H or ascender")?;
         out.push(Face {
             id,
             data: Arc::clone(data),
@@ -1010,9 +1010,6 @@ fn build_system(
     })
 }
 
-/// `font`'s cap height in em: a positive OS/2 `sCapHeight` (swash reads 0
-/// for a table before version 2 or none), else the top of its own `H`
-/// above the baseline, else a positive ascender.
 /// The normalized variation coordinates face `index` of `data` is shaped
 /// at: cosmic-text shapes every face at a `wght` of 400
 /// (`fontdb::Weight::NORMAL`, the weight its faces are registered and
@@ -1025,14 +1022,33 @@ fn shaping_coords(data: &[u8], index: u32) -> Result<Vec<swash::NormalizedCoord>
     Ok(location.coords().iter().map(|c| c.to_bits()).collect())
 }
 
-fn cap_height(font: swash::FontRef<'_>, coords: &[swash::NormalizedCoord]) -> Option<f32> {
-    let m = font.metrics(coords);
+/// Face `index` of `data`'s cap height in em at `coords`: a positive OS/2
+/// `sCapHeight` (none before version 2), else the top of its own `H` above
+/// the baseline, else a positive ascender.
+///
+/// The table metrics come from skrifa, its `MVAR` deltas applied at
+/// `coords`; swash 0.2.10 reads `MVAR`'s delta-set indices swapped.
+fn cap_height(
+    data: &[u8],
+    index: u32,
+    font: swash::FontRef<'_>,
+    coords: &[swash::NormalizedCoord],
+) -> Option<f32> {
+    let face = skrifa::FontRef::from_index(data, index).ok()?;
+    let location: Vec<skrifa::instance::NormalizedCoord> = coords
+        .iter()
+        .map(|&c| skrifa::instance::NormalizedCoord::from_bits(c))
+        .collect();
+    let m = face.metrics(
+        skrifa::instance::Size::unscaled(),
+        skrifa::instance::LocationRef::new(&location),
+    );
     let upem = f32::from(m.units_per_em);
     if upem <= 0.0 {
         return None;
     }
     let positive = |v: f32| (v.is_finite() && v > 0.0).then_some(v / upem);
-    if let Some(c) = positive(m.cap_height) {
+    if let Some(c) = m.cap_height.and_then(positive) {
         return Some(c);
     }
     let h = font.charmap().map('H');

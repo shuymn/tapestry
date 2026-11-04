@@ -371,23 +371,62 @@ fn the_probe_and_rendering_share_the_checked_helper() {
 #[test]
 fn a_variable_face_is_drawn_where_it_is_shaped() {
     // wght from 100 to 900, default 700: cosmic-text shapes at 400, half
-    // way to the minimum, where A's top is raised by 150 of its 300 units.
+    // way to the minimum, where H's top is raised by 150 of its 300 units.
+    // With no OS/2 cap height, the cap height is that H's top: 850.
     let mut spec = font_support::latin("Variable");
+    spec.os2 = Os2::V1;
     spec.variation = Some(font_support::Variation {
         min: 100,
         default: 700,
         max: 900,
-        glyph: font_support::capital(0),
+        glyph: font_support::capital(7),
         rise: 300,
     });
     let t = producer_of(&spec).unwrap();
-    let a = fits(&t, &req(SKIN, "A", 100.0));
-    assert_eq!(a.size, [30, 85], "A at wght 400");
-    // The box top is the cap height, 700, so A reaches 0.15 em above it.
-    assert!((a.ink[1] + 0.15).abs() < 1e-5, "{a:?}");
-    let out = raster(&t, &a);
+    let h = fits(&t, &req(SKIN, "H", 100.0));
+    assert_eq!(h.size[1], 85, "H at wght 400: {h:?}");
+    // The box top is that cap height, so H starts at it.
+    assert!(h.ink[1].abs() < 1e-5, "{h:?}");
+    let out = raster(&t, &h);
+    let w = h.size[0] as usize;
+    // Its last column is partly covered.
     assert!(
-        out[..30].iter().all(|&c| c > 200),
+        out[..w - 1].iter().all(|&c| c > 200),
         "the raised top is drawn"
     );
+    // A, not varied, sits 0.15 em below that box top.
+    let a = fits(&t, &req(SKIN, "A", 100.0));
+    assert_eq!(a.size[1], 70);
+    assert!((a.ink[1] - 0.15).abs() < 1e-5, "{a:?}");
+}
+
+#[test]
+fn a_constant_mvar_cap_stays_at_the_box_top() {
+    fn words(xs: &[u16]) -> Vec<u8> {
+        xs.iter().copied().flat_map(u16::to_be_bytes).collect()
+    }
+    let mut spec = font_support::latin("Mvar");
+    let mut fvar = words(&[1, 0, 16, 2, 1, 20, 0, 8]);
+    fvar.extend_from_slice(b"wght");
+    for value in [100_i32, 700, 900] {
+        fvar.extend_from_slice(&(value << 16).to_be_bytes());
+    }
+    fvar.extend(words(&[0, 256]));
+    let n = u16::try_from(spec.glyphs.len()).unwrap();
+    let start = 20 + 4 * (u32::from(n) + 1);
+    let mut gvar = words(&[1, 0, 1, 0]);
+    gvar.extend_from_slice(&start.to_be_bytes());
+    gvar.extend(words(&[n, 1]));
+    gvar.extend_from_slice(&start.to_be_bytes());
+    gvar.resize(usize::try_from(start).unwrap(), 0);
+    let mvar = words(&[
+        1, 0, 0, 8, 1, 20, 0x6370, 0x6874, 1, 0, 1, 0, 16, 2, 0, 26, 0, 38, 1, 1, 0xc000, 0xc000,
+        0, 2, 1, 1, 0, 0, 200, 1, 1, 1, 0, 0,
+    ]);
+    spec.extra
+        .extend([(*b"fvar", fvar), (*b"gvar", gvar), (*b"MVAR", mvar)]);
+    let t = producer_of(&spec).unwrap();
+    let a = fits(&t, &req(SKIN, "A", 100.0));
+    assert_eq!(a.size, [30, 70]);
+    assert!(a.ink[1].abs() < 1e-5, "{:?}", a.ink);
 }
