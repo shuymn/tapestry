@@ -66,27 +66,27 @@ url = "https://github.com/EmbarkStudios/cargo-deny/releases/download/0.20.2/carg
 url_api = "https://api.github.com/repos/EmbarkStudios/cargo-deny/releases/assets/471599057"
 
 [[tools."github:babarot/gh-infra"]]
-version = "0.18.0"
+version = "0.19.0"
 backend = "github:babarot/gh-infra"
 specifiers = ["0"]
 
 [tools."github:babarot/gh-infra"."platforms.linux-x64"]
-checksum = "sha256:b3a1c51899cda58eed6313a9f83e059b9980a1417e455190049e83d7da35818e"
+checksum = "sha256:53279aaff9ec965e352f4ddb260edfafbac21992732dab4c76a9de59414c651d"
 checksum_source = "mise-versions"
-url = "https://github.com/babarot/gh-infra/releases/download/v0.18.0/gh-infra_linux_amd64.tar.gz"
-url_api = "https://api.github.com/repos/babarot/gh-infra/releases/assets/697883292"
+url = "https://github.com/babarot/gh-infra/releases/download/v0.19.0/gh-infra_linux_amd64.tar.gz"
+url_api = "https://api.github.com/repos/babarot/gh-infra/releases/assets/703991219"
 
 [tools."github:babarot/gh-infra"."platforms.macos-arm64"]
-checksum = "sha256:210f9f57a2b61bc25c025fe5e8cb7cce6b3fc194f8a9c15dd20cc3757aae0e9c"
+checksum = "sha256:91b4241a43b3ebf07209ba26deb68f5a85abdf93a9de3cfb32416c0ba6dbbad2"
 checksum_source = "mise-versions"
-url = "https://github.com/babarot/gh-infra/releases/download/v0.18.0/gh-infra_darwin_arm64.tar.gz"
-url_api = "https://api.github.com/repos/babarot/gh-infra/releases/assets/697883261"
+url = "https://github.com/babarot/gh-infra/releases/download/v0.19.0/gh-infra_darwin_arm64.tar.gz"
+url_api = "https://api.github.com/repos/babarot/gh-infra/releases/assets/703991190"
 
 [tools."github:babarot/gh-infra"."platforms.windows-x64"]
-checksum = "sha256:11019730004d7cf90ca959a6dd48354b525a133c49cf16d7a9132282f3817901"
+checksum = "sha256:de81ed20a3fd7b75202f5d964e26fb00384e2aa3c99a7b9fadf636ef72e45a79"
 checksum_source = "mise-versions"
-url = "https://github.com/babarot/gh-infra/releases/download/v0.18.0/gh-infra_windows_amd64.zip"
-url_api = "https://api.github.com/repos/babarot/gh-infra/releases/assets/697883300"
+url = "https://github.com/babarot/gh-infra/releases/download/v0.19.0/gh-infra_windows_amd64.zip"
+url_api = "https://api.github.com/repos/babarot/gh-infra/releases/assets/703991223"
 
 [[tools."github:bnjbvr/cargo-machete"]]
 version = "0.9.2"
@@ -109,7 +109,7 @@ url = "https://github.com/bnjbvr/cargo-machete/releases/download/v0.9.2/cargo-ma
 url_api = "https://api.github.com/repos/bnjbvr/cargo-machete/releases/assets/397131414"
 
 [[tools."github:nextest-rs/nextest"]]
-version = "0.9.150"
+version = "0.9.151"
 backend = "github:nextest-rs/nextest"
 specifiers = ["0.9"]
 
@@ -117,21 +117,21 @@ specifiers = ["0.9"]
 version_prefix = "cargo-nextest-"
 
 [tools."github:nextest-rs/nextest"."platforms.linux-x64"]
-checksum = "sha256:b0959bc64232974224cf9fb22c915845398c0e8668fa7831eb5b43fb1eef781f"
-url = "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.150/cargo-nextest-0.9.150-x86_64-unknown-linux-gnu.tar.gz"
-url_api = "https://api.github.com/repos/nextest-rs/nextest/releases/assets/679066447"
+checksum = "sha256:1d4ce302b820c41f4b89c5fb9bce45f0f0c94882c1cf08fc360caf08be6e7df4"
+url = "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.151/cargo-nextest-0.9.151-x86_64-unknown-linux-gnu.tar.gz"
+url_api = "https://api.github.com/repos/nextest-rs/nextest/releases/assets/703600788"
 provenance = "github-attestations"
 
 [tools."github:nextest-rs/nextest"."platforms.macos-arm64"]
-checksum = "sha256:82a759b4d218d38359424196ab244c470e8f7c7d149c814fbbeef4d67c3c301a"
-url = "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.150/cargo-nextest-0.9.150-universal-apple-darwin.tar.gz"
-url_api = "https://api.github.com/repos/nextest-rs/nextest/releases/assets/679078149"
+checksum = "sha256:d1d7d025d4bfc9fb154cd76aea3949bd78534829a0589abefa6e5dd4edb135dd"
+url = "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.151/cargo-nextest-0.9.151-universal-apple-darwin.tar.gz"
+url_api = "https://api.github.com/repos/nextest-rs/nextest/releases/assets/703616437"
 provenance = "github-attestations"
 
 [tools."github:nextest-rs/nextest"."platforms.windows-x64"]
-checksum = "sha256:6fd8f9ba48c946a79a5bcdd35bf4f922447b149f7ca6c3ff7f39e12f32ef78db"
-url = "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.150/cargo-nextest-0.9.150-x86_64-pc-windows-msvc.zip"
-url_api = "https://api.github.com/repos/nextest-rs/nextest/releases/assets/679074354"
+checksum = "sha256:ba35ee0ce14ace65cd8c7aaa9613adb7d2644b0fe3866e85131eb4c269786efb"
+url = "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.151/cargo-nextest-0.9.151-x86_64-pc-windows-msvc.zip"
+url_api = "https://api.github.com/repos/nextest-rs/nextest/releases/assets/703606896"
 provenance = "github-attestations"
 
 [[tools."github:rust-cross/cargo-xwin"]]
