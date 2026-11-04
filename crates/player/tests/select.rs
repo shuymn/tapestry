@@ -1254,10 +1254,15 @@ fn a_configured_play_skin_is_installed_at_startup() {
         );
     }
     let installed = find_from(&stdout, 0, "skin: play: installed").unwrap();
-    let listed = find_from(&stdout, 0, "select: 1 charts listed").unwrap();
+    // The first listing, whatever its count: the scan may not have read
+    // the chart yet.
+    let listed = stdout
+        .lines()
+        .position(|l| l.starts_with("select: ") && l.ends_with(" charts listed"))
+        .unwrap();
     assert!(installed < listed, "{stdout}");
     assert!(
-        find_from(&stdout, listed, "play started").is_some(),
+        find_from(&stdout, installed, "play started").is_some(),
         "{stdout}"
     );
     let loading = dumped_rgba(&frames.join("loading.png"));
