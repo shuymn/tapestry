@@ -6,8 +6,8 @@
 //!
 //! A pass's VM counts from its creation until it is closed. The barrier
 //! waits before the VM is dropped, so while a destruction is held the VM
-//! is still open (`lua_close` has not run); the count goes down only once
-//! it is closed. Each instruction hook step counts one step, before the
+//! is still open (`lua_close` has not run); the count goes down once it
+//! is closed, or as a panic unwinds the pass. Each instruction hook step counts one step, before the
 //! hook's own checks, so a test sees Lua executing.
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -62,9 +62,38 @@ pub fn waiting() -> usize {
         .waiting
 }
 
-/// A pass's VM was created.
-pub(super) fn opened() {
+#[cfg(test)]
+thread_local! {
+    /// [`LIVE`]'s share of this thread, for the crate's own tests, which
+    /// run beside others opening VMs.
+    static THREAD_LIVE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// This thread's VMs open (the crate's tests).
+#[cfg(test)]
+pub(super) fn thread_live() -> usize {
+    THREAD_LIVE.with(std::cell::Cell::get)
+}
+
+/// A pass's VM was created: it counts until the guard returned is
+/// dropped, after the VM on the normal path and on a panic's unwinding
+/// alike.
+pub(super) fn opened() -> Open {
     LIVE.fetch_add(1, Ordering::SeqCst);
+    #[cfg(test)]
+    THREAD_LIVE.with(|n| n.set(n.get() + 1));
+    Open
+}
+
+/// A pass's VM counted open; its drop counts it closed.
+pub(super) struct Open;
+
+impl Drop for Open {
+    fn drop(&mut self) {
+        LIVE.fetch_sub(1, Ordering::SeqCst);
+        #[cfg(test)]
+        THREAD_LIVE.with(|n| n.set(n.get() - 1));
+    }
 }
 
 /// One instruction hook step.
@@ -81,9 +110,4 @@ pub(super) fn closing() {
         b = RELEASED.wait(b).unwrap_or_else(PoisonError::into_inner);
     }
     b.waiting -= 1;
-}
-
-/// A pass's VM was dropped, `lua_close` run.
-pub(super) fn closed() {
-    LIVE.fetch_sub(1, Ordering::SeqCst);
 }
