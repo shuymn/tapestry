@@ -114,6 +114,9 @@ impl Cx<'_> {
             return Ok(Scan::default());
         };
         let arena = &self.def.arena;
+        if arena.is_mixed(f) {
+            return Err(self.def.mixed_error(f));
+        }
         if !arena.is_array(f) {
             if lenient {
                 return Err(self.def.type_error(f, field, "an array"));

@@ -27,9 +27,9 @@ fn render(a: &Arena, id: u32) -> String {
         String::new()
     };
     let body = match n.kind {
-        Kind::Object | Kind::Array => {
+        Kind::Object | Kind::Array | Kind::Mixed => {
             let inner: Vec<String> = a.children(id).map(|c| render(a, c)).collect();
-            if n.kind == Kind::Object {
+            if n.kind != Kind::Array {
                 format!("{{{}}}", inner.join(","))
             } else {
                 format!("[{}]", inner.join(","))
