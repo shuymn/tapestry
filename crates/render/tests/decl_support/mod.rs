@@ -57,28 +57,6 @@ fn png(path: &Path, side: u32, rgba: [u8; 4]) {
     e.write_header().unwrap().write_image_data(&data).unwrap();
 }
 
-/// The chart text's bitmap font file.
-const CHART_FONT: &str = "chart.fnt";
-
-/// Writes [`CHART_FONT`] in `dir`: size 100 with base 100, every printable
-/// ASCII character a 100 × 100 glyph of `rgba` advancing 100, so a line's
-/// first 100 × 100 square from its box's top left is that colour.
-fn chart_font(dir: &Path, rgba: [u8; 4]) {
-    let mut s = String::from(
-        "info face=\"solid\" size=100 padding=0,0,0,0\n\
-         common lineHeight=100 base=100 scaleW=128 scaleH=128 pages=1\n\
-         page id=0 file=\"chart.png\"\n",
-    );
-    for c in 32..127 {
-        s.push_str(&format!(
-            "char id={c} x=0 y=0 width=100 height=100 xoffset=0 yoffset=0 xadvance=100 \
-             page=0 chnl=15\n"
-        ));
-    }
-    std::fs::write(dir.join(CHART_FONT), s).unwrap();
-    png(&dir.join("chart.png"), 128, rgba);
-}
-
 /// An element drawing image 0 over canvas `rect` from `ready` on, under
 /// clip 0 when `clipped`.
 fn image(rect: [i32; 4], clipped: bool) -> ElementDef {
@@ -128,10 +106,11 @@ pub struct Look {
     /// of 50 segments over [`GAUGE`], every part drawing the image,
     /// both on the untimed `screen` timer.
     pub structure: bool,
-    /// Four text elements on the untimed `screen` timer, each a 100×100
-    /// square where its line draws: the title over [`TITLE`], the artist
-    /// over [`ARTIST`], the genre over [`GENRE`] and the full title over
-    /// [`FULL_TITLE`].
+    /// Four text elements in the default font, laid out by [`Text`] and
+    /// tinted the look's colour, on the untimed `screen` timer, each a
+    /// 100×100 square where its line draws: the title over [`TITLE`], the
+    /// artist over [`ARTIST`], the genre over [`GENRE`] and the full title
+    /// over [`FULL_TITLE`].
     pub chart_text: bool,
     /// With `loading`, two progress marks: over [`PERCENT_MARK`] while
     /// `load.percent` reads 40, and over [`PROGRESS_MARK`] on `when`
@@ -373,31 +352,20 @@ pub fn skin(dir: &Path, look: &Look) -> Skin {
             ..images[0]
         }));
     }
-    let file = FileDef {
-        path: name.as_str().into(),
-        hi: None,
-    };
-    let (sheet, chart_font) = if look.chart_text {
-        // The chart's text in a bitmap font of the look's colour, staged
-        // with the loading text as bitmap lines.
-        chart_font(dir, look.rgba);
-        let mut b = SheetBuilder::new(&Root::new(dir).unwrap());
-        b.admit_file(file).unwrap();
-        for i in images {
-            b.add_image(i).unwrap();
-        }
-        let f = b.admit_fnt(CHART_FONT, &mut |_| Ok(()), &|| false).unwrap();
-        let font = b.add_bitmap_font(f, &[]).unwrap();
-        (b.finish(), Some(font))
-    } else {
-        (Sheet::new(dir, vec![file], images).unwrap(), None)
-    };
-    skin_of(sheet, look, chart_font)
+    let sheet = Sheet::new(
+        dir,
+        vec![FileDef {
+            path: name.as_str().into(),
+            hi: None,
+        }],
+        images,
+    )
+    .unwrap();
+    skin_of(sheet, look)
 }
 
-/// The compiled skin of `look` drawing image 0 of `sheet`, its chart text
-/// in bitmap font `chart_font`.
-fn skin_of(sheet: Sheet, look: &Look, chart_font: Option<u32>) -> Skin {
+/// The compiled skin of `look` drawing image 0 of `sheet`.
+fn skin_of(sheet: Sheet, look: &Look) -> Skin {
     let clipped = look.clip.is_some();
     let [x, y, ..] = look.rect;
     let mut elements = vec![image(look.rect, clipped)];
@@ -442,12 +410,27 @@ fn skin_of(sheet: Sheet, look: &Look, chart_font: Option<u32>) -> Skin {
             let slot = u32::try_from(widgets.texts.len()).unwrap();
             widgets.texts.push(TextDef {
                 value: TextValue::Field(field),
-                font: FontRef::Bitmap(chart_font.unwrap()),
+                font: FontRef::Default,
                 align: Align::Left,
                 overflow: Overflow::Spill,
             });
+            // The line's white coverage tinted the look's colour.
+            let [x, y, w, h] = rect;
+            let [r, g, b, a] = look.rgba.map(i32::from);
+            let mut props = [None; 9];
+            props[..8].copy_from_slice(&[x, y, w, h, a, r, g, b].map(Some));
+            let track = Track::new(
+                &[KeyDef {
+                    at: TimeUs(0),
+                    props,
+                }],
+                Ease::Linear,
+                End::Hold,
+            )
+            .unwrap();
             elements.push(ElementDef {
                 source: Source::Text(slot),
+                track,
                 timer: TimerRef::Builtin(skin_model::timer::SCREEN),
                 ..image(rect, false)
             });
@@ -642,13 +625,13 @@ pub fn solid_cells_bundle(
         })
         .unwrap();
     }
-    let skin = skin_of(b.finish(), look, None);
+    let skin = skin_of(b.finish(), look);
     let atlas = skin
         .atlas(Variant::Lo, r.atlas_limits(), &|| false)
         .unwrap();
     let clips = ClipTable::new(look.clip.into_iter().collect()).unwrap();
     let bundle = SkinBundle::new(Arc::new(skin), atlas, clips, Side::Left).unwrap();
-    if !look.text {
+    if !look.text && !look.chart_text {
         return Arc::new(bundle);
     }
     let text: Arc<dyn AttemptText> = Arc::new(Text {
@@ -669,7 +652,7 @@ pub fn bundle(r: &Renderer, dir: &Path, look: &Look) -> (Arc<SkinBundle>, Option
         .unwrap();
     let clips = ClipTable::new(look.clip.into_iter().collect()).unwrap();
     let bundle = SkinBundle::new(Arc::new(skin), atlas, clips, Side::Left).unwrap();
-    if !look.text {
+    if !look.text && !look.chart_text {
         return (Arc::new(bundle), None);
     }
     let text = Arc::new(Text {

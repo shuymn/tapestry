@@ -359,16 +359,26 @@ impl MenuScreen {
     /// lifetime or revision has passed), and the text the update needs
     /// ([`text_plan`]) is cleared and prepared through the installation's
     /// producer, staged for the next loading frame. A request refused,
-    /// by the producer or by its table, is not asked again; what the slots
-    /// hold is then unknown, so the next request prepares every slot.
-    /// Preparing allocates: it runs only when the update needs new text,
-    /// never in a frame's build.
+    /// by the producer or by its table, is not asked again until text
+    /// installs after it; what the slots hold is then unknown, so the next
+    /// request prepares every slot. Preparing allocates: it runs only when
+    /// the update needs new text, never in a frame's build.
+    ///
+    /// # Errors
+    ///
+    /// The device failing while the text is prepared (not a refusal,
+    /// [`RenderError::is_refusal`]): the screen is dropped and built again.
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
-    fn chosen_text(&mut self, update: &LoadingUpdate, lifetime: u64) {
+    fn chosen_text(&mut self, update: &LoadingUpdate, lifetime: u64) -> Result<(), RenderError> {
         self.renderer.enter_loading(lifetime);
         if let Some(staged) = self.chosen.staged.take() {
             match self.renderer.install_staged_loading_text() {
-                Ok(true) => self.chosen.installed = Some(staged),
+                // Every slot holds what was asked: a refusal before it no
+                // longer describes them, so it is forgotten.
+                Ok(true) => {
+                    self.chosen.installed = Some(staged);
+                    self.chosen.refused = None;
+                }
                 Ok(false) => {}
                 Err(e @ LoadingTextError::Table(_)) => {
                     eprintln!("render: the chosen chart's text was not installed: {e}");
@@ -382,7 +392,7 @@ impl MenuScreen {
         }
         let Some(key) = self.renderer.loading_text_key() else {
             self.chosen = ChosenTextState::default();
-            return;
+            return Ok(());
         };
         let asked = AskedText {
             key,
@@ -396,7 +406,7 @@ impl MenuScreen {
             self.chosen.refused.as_ref(),
             &asked,
         ) else {
-            return;
+            return Ok(());
         };
         self.renderer.clear_loading_text(which);
         let c = &update.chart;
@@ -415,12 +425,18 @@ impl MenuScreen {
             .prepare_loading_text(lifetime, update.revision, which, &chart)
         {
             Ok(()) => self.chosen.staged = Some(asked),
-            Err(e) => {
-                eprintln!("render: the chosen chart's text was not prepared: {e}");
+            Err(e) if e.is_refusal() => {
+                eprintln!(
+                    "render: the chosen chart's text was not prepared: {}",
+                    game::Chain(&e)
+                );
                 self.chosen.installed = None;
                 self.chosen.refused = Some(asked);
             }
+            // The device failed: the screen is dropped and built again.
+            Err(e) => return Err(e),
         }
+        Ok(())
     }
 
     /// Tells `sink` of its first frame presented and the caret's area of
@@ -664,7 +680,7 @@ impl Screen for MenuScreen {
         frame: &LoadingFrame<'_>,
     ) -> Result<Result<FrameTiming, BuildError>, RenderError> {
         if let Some(update) = update {
-            self.chosen_text(update, frame.lifetime);
+            self.chosen_text(update, frame.lifetime)?;
         }
         if changed || self.stale || self.text.is_none() {
             self.prepare(page, LOADING_LEFT, LOADING_TOP)?;
