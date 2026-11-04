@@ -133,7 +133,7 @@ proptest! {
         let (mut def, header) = read_header(dir.path(), "s.json").unwrap();
         let mut config = Config::defaults(&header);
         config.offsets.insert(40, skin_beatoraja::OffsetValue { x: 3, w: -5, ..Default::default() });
-        match import(&mut def, &header, &config) {
+        match import(&mut def, &header, &config, skin_model::ScreenKind::Play) {
             Ok(imported) => {
                 let capacity = imported.skin.quad_capacity() as usize;
                 let mut drawn = Drawn::new(imported.skin, 100);
@@ -167,7 +167,13 @@ fn the_play_objects_import() {
     png(dir.path(), "a.png", 64, 64);
     font(dir.path(), "f.ttf");
     let (mut def, header) = read_header(dir.path(), "s.json").unwrap();
-    let imported = import(&mut def, &header, &Config::defaults(&header)).unwrap();
+    let imported = import(
+        &mut def,
+        &header,
+        &Config::defaults(&header),
+        skin_model::ScreenKind::Play,
+    )
+    .unwrap();
     assert!(imported.scratch.is_some());
     assert_eq!(imported.report.usage.widget_quads, 51 + 4);
 }

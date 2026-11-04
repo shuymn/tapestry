@@ -42,7 +42,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 
-use skin_model::{FileId, Root, RootError};
+use skin_model::{FileId, Root, RootError, ScreenKind};
 
 use self::digit_offsets::DigitOffsetTables;
 use crate::error::{ImportError, InputLimit, Loc};
@@ -54,8 +54,18 @@ use crate::limits::{
 use crate::lua::{Cancel, LuaWhy, Store};
 use crate::tree::{Arena, ESCAPED, Kind, NONE, Scalar, Text, Unescape};
 
-/// The type number of a 7-key play skin (`SkinType.java:12` at `0.8.9`).
-const PLAY_7: i32 = 0;
+/// The screen kind of type number `ty`: 0 7-key play, 5 song selection,
+/// 6 song decision, 7 single-chart result (`SkinType.java:12`, `:17-19`
+/// at `0.8.9`). Every other number is a screen tapestry does not import.
+fn kind_of(ty: i32) -> Option<ScreenKind> {
+    match ty {
+        0 => Some(ScreenKind::Play),
+        5 => Some(ScreenKind::Selection),
+        6 => Some(ScreenKind::Decision),
+        7 => Some(ScreenKind::Result),
+        _ => None,
+    }
+}
 
 /// A definition file read and parsed, not resolved. Resolving it
 /// ([`resolve`]) adds the included files it reaches and drops them again
@@ -96,6 +106,9 @@ pub(crate) struct Run {
 /// records, in order, as nodes of the definition's arena.
 pub struct Resolved<'d> {
     pub(crate) def: &'d mut Definition,
+    /// The screen kind its `type` names, and that node.
+    pub(crate) kind: ScreenKind,
+    pub(crate) kind_node: u32,
     pub(crate) name: Option<u32>,
     pub(crate) author: Option<u32>,
     pub(crate) size: [u32; 2],
@@ -486,6 +499,42 @@ impl Definition {
         }
         fields.map(|f| self.arena.last_member(id, f))
     }
+
+    /// The screen kind the entry's top-level `type` names, and its node,
+    /// read as [`resolve`] reads it, without resolving anything.
+    ///
+    /// # Errors
+    ///
+    /// The root is no object, or what [`Self::kind_at`] refuses.
+    pub(crate) fn kind(&mut self) -> Result<(ScreenKind, u32), ImportError> {
+        let top = self.top;
+        if !self.arena.is_object(top) {
+            return Err(self.type_error(top, "(root)", "an object"));
+        }
+        let [ty] = self.fields(top, ["type"]);
+        self.kind_at(ty)
+    }
+
+    /// The screen kind of `type` node `ty`, and the node.
+    ///
+    /// # Errors
+    ///
+    /// `ty` is missing, which the source reads as -1 and gives no header
+    /// (JsonSkin.java:9, JSONSkinLoader.java:118), or names no kind
+    /// ([`ImportError::UnsupportedKind`]); it is no integer within `i32`.
+    fn kind_at(&mut self, ty: Option<u32>) -> Result<(ScreenKind, u32), ImportError> {
+        let Some(id) = ty else {
+            return Err(ImportError::UnsupportedKind { at: None, ty: None });
+        };
+        let n = self.int(id, "type")?;
+        match kind_of(n) {
+            Some(kind) => Ok((kind, id)),
+            None => Err(ImportError::UnsupportedKind {
+                at: Some(self.loc(id)),
+                ty: Some(n),
+            }),
+        }
+    }
 }
 
 /// Resolves `def` with the options in `enabled`: the header's top-level
@@ -497,10 +546,10 @@ impl Definition {
 ///
 /// # Errors
 ///
-/// The root is no object, the type is not the 7-key play type, the size
-/// is not one of [`crate::SIZES`], an include cannot be read or parsed or
-/// forms a cycle, a field has the wrong type, or an input bound is
-/// reached.
+/// The root is no object, the type names no screen kind tapestry imports
+/// ([`ImportError::UnsupportedKind`]), the size is not one of
+/// [`crate::SIZES`], an include cannot be read or parsed or forms a
+/// cycle, a field has the wrong type, or an input bound is reached.
 pub fn resolve<'d>(
     def: &'d mut Definition,
     enabled: &BTreeSet<i32>,
@@ -512,28 +561,13 @@ pub fn resolve<'d>(
         parses: def.entry_parses,
         ..Run::default()
     };
-    let top = def.top;
-    if !def.arena.is_object(top) {
-        return Err(def.type_error(top, "(root)", "an object"));
-    }
     // The top level is read literally, ordinary fields only
     // (JSONSkinLoader.java:98-102, `JsonSkin.Skin` has no serializer).
-    let [ty, w, h, name, author, property, filepath, offset] = def.fields(
-        top,
-        [
-            "type", "w", "h", "name", "author", "property", "filepath", "offset",
-        ],
+    let (kind, kind_node) = def.kind()?;
+    let [w, h, name, author, property, filepath, offset] = def.fields(
+        def.top,
+        ["w", "h", "name", "author", "property", "filepath", "offset"],
     );
-    // A missing type is -1 and gives no header (JsonSkin.java:9,
-    // JSONSkinLoader.java:118).
-    let Some(ty) = ty else {
-        return Err(ImportError::NotPlay7 { at: None });
-    };
-    if def.int(ty, "type")? != PLAY_7 {
-        return Err(ImportError::NotPlay7 {
-            at: Some(def.loc(ty)),
-        });
-    }
     // 1280×720 when omitted (JsonSkin.java:12-13).
     let w_v = w.map_or(Ok(1280), |id| def.int(id, "w"))?;
     let h_v = h.map_or(Ok(720), |id| def.int(id, "h"))?;
@@ -561,6 +595,8 @@ pub fn resolve<'d>(
     let [options, files, offsets] = lists;
     Ok(Resolved {
         def: r.def,
+        kind,
+        kind_node,
         name,
         author,
         size,

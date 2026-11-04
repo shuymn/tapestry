@@ -1,7 +1,8 @@
 //! Import facts (design.md "beatoraja Lua Skins", import facts;
 //! docs/stage3.md §3, Lua): the owned snapshot of the scene a skin is
-//! imported for, which the configured pass answers `main_state.option`
-//! from, and the dependencies an import records on it.
+//! imported for, the skin's own kind ([`ScreenKind`]), which the
+//! configured pass answers `main_state.option` from, and the dependencies
+//! an import records on it.
 //!
 //! The snapshot is plain data the caller fills, immutable for the pass,
 //! so every read of one pass sees one scene. The facts are published by
@@ -9,7 +10,7 @@
 //! answer them (`skin/property/BooleanPropertyFactory.java`):
 //!
 //! - 33 and 32, autoplay on and off (`:416-419`): the snapshot's
-//!   [`ImportFacts::autoplay`] on [`Scene::Play`], a constant `false` on
+//!   [`ImportFacts::autoplay`] on [`ScreenKind::Play`], a constant `false` on
 //!   every other scene, as the source's are off the play state;
 //! - 180 to 184, the chart's judgment class (`:448-452`): the source's
 //!   bands over [`ImportFacts::chart_rank`], the rank the play preset's
@@ -35,14 +36,7 @@
 //! invalidation and refusing a stale completion belong to the caller
 //! (docs/stage3.md S10-07).
 
-/// The scene a skin is imported for.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Scene {
-    Play,
-    Selection,
-    Decision,
-    Result,
-}
+use skin_model::ScreenKind;
 
 /// A fact as the snapshot has it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -128,9 +122,9 @@ impl JudgeClass {
 /// The facts of one scene, for one configured pass.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ImportFacts {
-    pub scene: Scene,
+    pub scene: ScreenKind,
     /// Whether the session plays automatically; read on
-    /// [`Scene::Play`] only.
+    /// [`ScreenKind::Play`] only.
     pub autoplay: Fact<bool>,
     /// The rank the play preset's header policy reads from the drawn
     /// chart, `None` when it reads none (`rules::ReadHeaders::rank`);
@@ -141,7 +135,7 @@ pub struct ImportFacts {
 impl ImportFacts {
     /// Every fact unavailable.
     #[must_use]
-    pub fn unavailable(scene: Scene) -> Self {
+    pub fn unavailable(scene: ScreenKind) -> Self {
         Self {
             scene,
             autoplay: Fact::Unavailable,
@@ -150,13 +144,13 @@ impl ImportFacts {
     }
 
     /// The base snapshot: the session's facts known, the chart's pending
-    /// (unavailable on [`Scene::Selection`], which has no chart).
+    /// (unavailable on [`ScreenKind::Selection`], which has no chart).
     #[must_use]
-    pub fn base(scene: Scene, autoplay: Fact<bool>) -> Self {
+    pub fn base(scene: ScreenKind, autoplay: Fact<bool>) -> Self {
         Self {
             scene,
             autoplay,
-            chart_rank: if scene == Scene::Selection {
+            chart_rank: if scene == ScreenKind::Selection {
                 Fact::Unavailable
             } else {
                 Fact::Pending
@@ -210,7 +204,7 @@ pub struct FactRead {
 /// first-read order.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FactDeps {
-    pub scene: Scene,
+    pub scene: ScreenKind,
     pub reads: Vec<FactRead>,
 }
 
@@ -262,7 +256,7 @@ pub(crate) fn option(facts: &ImportFacts, n: i32) -> OptionRead {
         known: true,
     };
     let fact = match id {
-        AUTOPLAY_OFF | AUTOPLAY_ON if facts.scene != Scene::Play => return constant(false),
+        AUTOPLAY_OFF | AUTOPLAY_ON if facts.scene != ScreenKind::Play => return constant(false),
         COURSE_MODE => return constant(false),
         AUTOPLAY_OFF | AUTOPLAY_ON => FactId::Autoplay,
         _ if JudgeClass::of_option(id).is_some() => FactId::JudgeClass,
@@ -286,19 +280,35 @@ pub(crate) fn option(facts: &ImportFacts, n: i32) -> OptionRead {
 
 #[cfg(test)]
 mod tests {
-    use super::{Fact, ImportFacts, OptionRead, Scene, option};
+    use skin_model::ScreenKind;
+
+    use super::{Fact, ImportFacts, OptionRead, option};
 
     #[test]
     fn the_scene_s_constants_hold_off_play() {
-        // Autoplay is false off the play scene, whatever the snapshot.
-        let mut f = ImportFacts::unavailable(Scene::Result);
-        f.autoplay = Fact::Known(true);
-        for (n, value) in [(33, false), (-33, true), (32, false), (-290, true)] {
-            assert_eq!(
-                option(&f, n),
-                OptionRead::Constant { value, known: true },
-                "{n}"
-            );
+        // Autoplay (32, 33) is false off the play scene whatever the
+        // snapshot, and course mode (290) is false on every scene.
+        for scene in [
+            ScreenKind::Selection,
+            ScreenKind::Decision,
+            ScreenKind::Result,
+        ] {
+            let mut f = ImportFacts::unavailable(scene);
+            f.autoplay = Fact::Known(true);
+            for (n, value) in [
+                (32, false),
+                (-32, true),
+                (33, false),
+                (-33, true),
+                (290, false),
+                (-290, true),
+            ] {
+                assert_eq!(
+                    option(&f, n),
+                    OptionRead::Constant { value, known: true },
+                    "{scene:?} {n}"
+                );
+            }
         }
     }
 }

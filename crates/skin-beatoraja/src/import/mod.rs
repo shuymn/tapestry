@@ -30,7 +30,7 @@ use bms_model::TimeUs;
 use skin_model::{
     Anchor, Blend, CycleDef, Ease, ElementDef, Filter, Fit, Follow, Grade, KeyDef, LanesDef,
     LanesError, LoadError, MAX_GEOMETRY, Native, PLAY, Place, Program, Region, RegionDef, Scope,
-    Skin, SkinDef, Source, TimerRef, Track, Ty, WidgetDefs, compile, timer as slot,
+    ScreenKind, Skin, SkinDef, Source, TimerRef, Track, Ty, WidgetDefs, compile, timer as slot,
 };
 
 pub use budget::ImportLimit;
@@ -140,22 +140,46 @@ const OFFSET_ALL: i32 = 10;
 /// The highest offset id (`SkinProperty.java:972`).
 const OFFSET_MAX: i32 = 199;
 
-/// Imports `def`, whose header `header` was read from it, with `config`.
+/// Imports `def`, whose header `header` was read from it, with `config`
+/// into the `slot` kind's slot. A header of another kind than `slot`, or
+/// a slot no importer maps yet, refuses before anything is resolved or
+/// read; the play kind is mapped.
 ///
 /// # Errors
 ///
-/// What resolution refuses; an importer budget or aggregate asset limit
-/// ([`ImportError::Limit`]); geometry outside the model
-/// ([`ImportError::Range`]); a play-critical element the importer cannot
-/// reproduce ([`ImportError::Critical`], [`ImportError::Asset`]); a skin
-/// the model refuses ([`ImportError::Model`]).
+/// A skin of another kind than `slot`, by its header or by the `type` its
+/// resolution names ([`ImportError::Slot`]); a kind with no importer yet
+/// ([`ImportError::NoImporter`]); what resolution refuses; an importer
+/// budget or aggregate asset limit ([`ImportError::Limit`]); geometry
+/// outside the model ([`ImportError::Range`]); a play-critical element
+/// the importer cannot reproduce ([`ImportError::Critical`],
+/// [`ImportError::Asset`]); a skin the model refuses
+/// ([`ImportError::Model`]).
 pub fn import(
     def: &mut Definition,
     header: &Header,
     config: &Config,
+    slot: ScreenKind,
 ) -> Result<Imported, ImportError> {
+    if header.kind != slot {
+        return Err(ImportError::Slot {
+            at: None,
+            slot,
+            found: header.kind,
+        });
+    }
+    if slot != ScreenKind::Play {
+        return Err(ImportError::NoImporter { kind: slot });
+    }
     let enabled = config.enabled();
     let mut resolved = resolve(def, &enabled)?;
+    if resolved.kind != slot {
+        return Err(ImportError::Slot {
+            at: Some(resolved.def.loc(resolved.kind_node)),
+            slot,
+            found: resolved.kind,
+        });
+    }
     let tables = resolved.tables(&enabled)?;
     let Resolved { def, size, .. } = resolved;
     let mut files = Vec::new();

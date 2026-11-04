@@ -57,7 +57,12 @@ fn json(fonts: &str, sources: &[&str]) -> String {
 /// Imports `play/s.json` of `root` with its header's defaults.
 fn import_play(root: &Path) -> Result<Imported, ImportError> {
     let (mut def, h) = read_header(root, "play/s.json")?;
-    import(&mut def, &h, &Config::defaults(&h))
+    import(
+        &mut def,
+        &h,
+        &Config::defaults(&h),
+        skin_model::ScreenKind::Play,
+    )
 }
 
 /// A skin folder `skin` inside a temporary folder, with `play/s.json`
