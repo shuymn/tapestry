@@ -50,7 +50,10 @@ mod ledger;
 mod library;
 pub mod limits;
 mod loader;
+#[cfg(test)]
+mod root_tests;
 mod sandbox;
+mod schema;
 #[cfg(feature = "dev-tools")]
 pub mod survey;
 pub(crate) mod syntax;
@@ -227,6 +230,13 @@ pub enum Unsupported {
     Unmapped { api: u16, id: i64 },
     /// An integer intermediate that could leave the expressions' range.
     Range,
+    /// A function at a field whose consumer, named here, takes none.
+    Consumer(&'static str),
+    /// A proof that rests on captured state, void because code the
+    /// analysis does not see (a script, an unread entry, a metatable read
+    /// while the table is deserialized) runs in the source and may change
+    /// that state.
+    Interference,
 }
 
 impl fmt::Display for Unsupported {
@@ -247,6 +257,10 @@ impl fmt::Display for Unsupported {
             Self::Capture(c) => write!(f, "{c} not proven"),
             Self::Unmapped { api: a, id } => write!(f, "{}({id}) has no mapping", api(*a)),
             Self::Range => f.write_str("an integer that could leave the expression range"),
+            Self::Consumer(c) => write!(f, "a function where the {c} takes none"),
+            Self::Interference => {
+                f.write_str("captured state that code outside the analysis may change")
+            }
         }
     }
 }

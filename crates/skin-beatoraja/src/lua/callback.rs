@@ -3,7 +3,9 @@
 //! (design.md "beatoraja Lua Skins", per-frame closures; docs/stage3.md
 //! §3, per-frame functions).
 //!
-//! Each callable the converted table holds is a closure instance: its
+//! Each root the converted table holds (a function at a property field
+//! or an `op` entry, [`super::schema`]; any other is inert) is a closure
+//! instance, as is each closure a root captures: its
 //! function's tree in the file that defined it ([`super::syntax`]) and
 //! the values its capture reader returned after the pass
 //! ([`super::instrument`]): Lua integers (the integer subtype only),
@@ -33,15 +35,18 @@
 //! Anything else has an effect the analysis does not rule out, and
 //! refuses the candidate ([`admit`]).
 //!
-//! So once [`admit`] accepts every callable, no callback the import can
+//! So once [`admit`] accepts every root, no callback the import can
 //! reach writes anything at frame time, through any helper: not the
 //! `_ENV` binding a configuration read resolves through, not
-//! `skin_config` or its `option` table, and no metatable. That is the
-//! noninterference half of the capture proof that lets a configuration
-//! read fold in any callback, a play-critical one included; the other
-//! halves (the raw path, the final integer entry) are checked at the read.
-//! [`admit`] records its acceptance on the [`Analysis`], and lowering
-//! takes the analysis only through the [`Admitted`] witness it gives.
+//! `skin_config` or its `option` table, and no metatable. With
+//! [`Analysis::open`] unset (no script, unread listed entry or font
+//! fallback metatable, which run code the analysis never sees), that is
+//! the noninterference half of the capture proof that lets a
+//! configuration read fold in any callback, a play-critical one included;
+//! the other halves (the raw path, the final integer entry) are checked at
+//! the read. [`admit`] records its acceptance on the [`Analysis`], and
+//! lowering takes the analysis only through the [`Admitted`] witness it
+//! gives.
 
 use std::cell::{Cell, RefCell};
 
@@ -108,6 +113,13 @@ pub(crate) struct Instance {
 pub enum Disposition {
     /// Outside the traversal: the import stopped first.
     NeverAnalysed,
+    /// Never read by the source: not at a property field or an `op`
+    /// entry ([`super::schema`]). Converted and charged, never classified.
+    Inert,
+    /// Not a root, but captured by one, which the source may call it
+    /// through: classified with that root, never consumed in its own
+    /// field.
+    Captured,
     /// Classified write-free, never consumed.
     ClassifiedOnly,
     /// Converted into an expression.
@@ -199,6 +211,18 @@ pub(crate) struct Analysis {
     pub(crate) option_names: HashMap<Box<[u8]>, u32>,
     /// Each distinct option table's integer entries, by name id.
     pub(crate) option_sets: Vec<HashMap<u32, i64>>,
+    /// The first place, in conversion order, where the source runs code
+    /// the analysis does not see: a script root, an unread entry of a
+    /// table it lists, or a font fallback with a metatable; by the
+    /// converted node. While it is set, no proof that rests on captured
+    /// state holds ([`Unsupported::Interference`]).
+    pub(crate) open: Option<u32>,
+    /// How many script roots and unread-entry roots the conversion met,
+    /// for the report.
+    #[cfg(any(test, feature = "dev-tools"))]
+    pub(crate) scripts: u32,
+    #[cfg(any(test, feature = "dev-tools"))]
+    pub(crate) unread: u32,
     classes: RefCell<Vec<State>>,
     /// The classes of function prototypes by their file, function and
     /// captured values: instances that share all three share a class,
@@ -814,11 +838,12 @@ pub(crate) fn resolve_callee(
     }
 }
 
-/// Classifies every callable a converted table holds, recording each as
-/// classified or refused: the first with an unknown effect refuses the
-/// candidate at its construct (design.md "beatoraja Lua Skins", what
-/// cannot be converted). A host or library function, which has no tree,
-/// is refused at its value.
+/// Classifies every root a converted table holds, recording each as
+/// classified or refused, and every other callable as inert: the first
+/// root with an unknown effect refuses the candidate at its construct
+/// (design.md "beatoraja Lua Skins", what cannot be converted). A host or
+/// library function at a root, which has no tree, is refused at its
+/// value.
 pub(crate) fn admit(arena: &Arena) -> Result<(), ImportError> {
     let Some(lua) = arena.lua.as_deref() else {
         return Ok(());
@@ -842,6 +867,15 @@ pub(crate) fn admit(arena: &Arena) -> Result<(), ImportError> {
             continue;
         };
         if an.outcomes.borrow().get(c as usize) != Some(&Disposition::NeverAnalysed) {
+            continue;
+        }
+        if !callable.root {
+            let d = if callable.instance == NONE {
+                Disposition::Inert
+            } else {
+                Disposition::Captured
+            };
+            an.set_outcome(c, d);
             continue;
         }
         let r = if callable.kind == CallableKind::Lua && callable.instance != NONE {

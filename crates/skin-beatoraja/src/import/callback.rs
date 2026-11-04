@@ -1,7 +1,10 @@
 //! Lua callbacks where the import consumes them (design.md "beatoraja Lua
 //! Skins", per-frame closures; docs/stage3.md §3, per-frame functions):
-//! an element's `draw` after its role and its ops are decided, and a
-//! number's `value` where a `value` field is resolved, before `ref`.
+//! an element's `op` functions and `draw` after its role and its numeric
+//! ops are decided, and a number's `value` where a `value` field is
+//! resolved, before `ref`. A function at a field whose consumer takes
+//! none (a `timer`, a text's or an image set's `value`) follows its
+//! element's role ([`Cx::unconsumed`]).
 //!
 //! A write-free callback ([`crate::lua::callback`]) is lowered into an
 //! expression's source, compiled through the importer's compile path and
@@ -26,6 +29,12 @@
 //!   integer entry checked at the read, noninterference by admission,
 //!   [`crate::lua::callback`]), so lowering takes its analysis only
 //!   through the [`Admitted`] witness.
+//!
+//! While the analysis is open ([`Analysis::open`]), no fold of a captured
+//! value (an upvalue, `skin_config.option`, `timer_off_value`) and no host
+//! module or helper binding is proven: a callback that needs one is
+//! unsupported for [`Unsupported::Interference`], and a critical one
+//! refuses the candidate at the open site.
 //!
 //! Helpers are inlined, each call charged its expanded size before it is
 //! expanded ([`MAX_EXPANDED_NODES`]), and locals inlined where they are
@@ -153,6 +162,26 @@ struct Lower<'a> {
     depth: u32,
 }
 
+impl<'a> Lower<'a> {
+    /// A lowering of `an`'s callbacks with `custom`'s timers, seeing
+    /// `cancelled`.
+    fn new(an: &'a Analysis, custom: &'a Custom, cancelled: &'a dyn Fn() -> bool) -> Self {
+        Self {
+            an,
+            custom,
+            cancelled,
+            out: Lowered {
+                src: String::new(),
+                guards: Vec::new(),
+                part: None,
+                deviates: false,
+            },
+            sizes: std::collections::HashMap::new(),
+            depth: 0,
+        }
+    }
+}
+
 impl Lower<'_> {
     /// A generated string kept: past [`MAX_SOURCE_BYTES`] fatal, its
     /// bytes charged as analysis work (each level copies its operands').
@@ -260,6 +289,7 @@ impl Lower<'_> {
                 .saturating_add(self.size_expr(ast, inst, locals, b)?)
                 .saturating_add(1),
             Expr::Call { callee, .. } => {
+                self.bound()?;
                 match resolve_callee(self.an, ast, inst, callee).map_err(Stop::Unsupported)? {
                     Callee::Helper(j) => self.size(j)?.saturating_add(1),
                     Callee::Host(_) => 1,
@@ -312,6 +342,7 @@ impl Lower<'_> {
                     let before = locals.get(..k).unwrap_or_default();
                     return self.expr(ast, inst, before, init);
                 }
+                self.bound()?;
                 match self.an.upvalue(inst, d) {
                     Some(Captured::Int(n)) => self.literal(n),
                     Some(Captured::Bool(b)) => self.boolean(b.to_string()),
@@ -319,6 +350,7 @@ impl Lower<'_> {
                 }
             }
             Expr::Index { obj, key } => {
+                self.bound()?;
                 if let Expr::Str(s) = ast.expr(key)
                     && ast.str(s) == b"timer_off_value"
                 {
@@ -327,6 +359,7 @@ impl Lower<'_> {
                 self.config(ast, inst, obj, key)
             }
             Expr::Call { callee, args } => {
+                self.bound()?;
                 match resolve_callee(self.an, ast, inst, callee).map_err(Stop::Unsupported)? {
                     Callee::Helper(j) => self.expand(j),
                     Callee::Host(api) => {
@@ -597,6 +630,18 @@ impl Lower<'_> {
         Ok(None)
     }
 
+    /// What a proof resting on captured state needs: a fold of a captured
+    /// value (an upvalue, `skin_config.option`, `timer_off_value`) or a
+    /// host module or helper binding, the syntactic chunk-local proof
+    /// included. While the analysis is open, code it does not see may
+    /// change that state, so none holds.
+    fn bound(&self) -> R<()> {
+        if self.an.open.is_some() {
+            return Err(Stop::Unsupported(Unsupported::Interference));
+        }
+        Ok(())
+    }
+
     /// A scan of `n` locals (at most Lua's 200) charged before it is made.
     fn charge_scan(&self, n: usize) -> R<()> {
         self.an
@@ -645,7 +690,7 @@ impl Cx<'_> {
     }
 
     /// The callable at node `id`: its index and its instance.
-    fn callable_at(&self, id: u32) -> Option<(u32, u32)> {
+    pub(super) fn callable_at(&self, id: u32) -> Option<(u32, u32)> {
         let lua = self.def.arena.lua.as_deref()?;
         let n = self.def.arena.nodes.get(id as usize)?;
         let LuaScalar::Callable(c) = *lua.values.get(n.end as usize)? else {
@@ -734,19 +779,7 @@ impl Cx<'_> {
             ));
         };
         let cancelled = || def.cancelled(|| None).is_err();
-        let mut l = Lower {
-            an,
-            custom: &self.custom,
-            cancelled: &cancelled,
-            out: Lowered {
-                src: String::new(),
-                guards: Vec::new(),
-                part: None,
-                deviates: false,
-            },
-            sizes: std::collections::HashMap::new(),
-            depth: 0,
-        };
+        let mut l = Lower::new(an, &self.custom, &cancelled);
         let part = |l: &Lower<'_>| match l.part(inst) {
             Ok(p) => Ok(p),
             Err(Stop::Fatal(why)) => Err(fatal(why)),
@@ -781,23 +814,76 @@ impl Cx<'_> {
         }
     }
 
-    /// The refusal of critical callback `id` in `field`.
+    /// The refusal of critical callback `id` in `field`: located at its
+    /// definition, or, for [`Unsupported::Interference`], at the open
+    /// site that voids its proof.
     fn critical(&self, id: u32, field: &'static str, why: Unsupported) -> ImportError {
+        let site = match why {
+            Unsupported::Interference => self.analysis().and_then(|an| an.open),
+            _ => None,
+        };
         ImportError::Lua {
-            at: Some(self.def.loc(id)),
+            at: Some(self.def.loc(site.unwrap_or(id))),
             why: LuaWhy::Critical { field, why },
         }
     }
 
-    /// An element's `draw` callback at node `id`, for an element of
-    /// `role` at `at`: its condition joined to `conds` (its guards first),
-    /// or `Ok(false)` when it is replaced by `false` and the element is
-    /// dropped with the reason.
+    /// The callable at node `id`, read in `field` whose consumer takes
+    /// none ([`Unsupported::Consumer`] `consumer`), for an element of
+    /// `role`: a critical one refuses the candidate, a decorative one is
+    /// replaced, the note to drop its element with returned.
+    pub(super) fn unconsumed(
+        &self,
+        role: Role,
+        id: u32,
+        field: &'static str,
+        consumer: &'static str,
+    ) -> Result<NoteKind, ImportError> {
+        let c = self.callable_at(id).map_or(NONE, |(c, _)| c);
+        let why = Unsupported::Consumer(consumer);
+        if role != Role::Decorative {
+            self.outcome((c, id), field, role, (Disposition::Refused, Some(why)));
+            return Err(self.critical(id, field, why));
+        }
+        self.outcome(
+            (c, id),
+            field,
+            role,
+            (Disposition::Replaced(why), Some(why)),
+        );
+        Ok(NoteKind::Callback { field, why })
+    }
+
+    /// The critical part what the callable at node `id` reads shows, its
+    /// helpers included (a cap or cancellation fatal): `None` without
+    /// an analysis.
+    pub(super) fn callback_part(&self, id: u32) -> Result<Option<CriticalPart>, ImportError> {
+        let (Some(an), Some((_, inst))) = (self.analysis(), self.callable_at(id)) else {
+            return Ok(None);
+        };
+        if inst == NONE {
+            return Ok(None);
+        }
+        let cancelled = || self.def.cancelled(|| None).is_err();
+        match Lower::new(an, &self.custom, &cancelled).part(inst) {
+            Ok(p) => Ok(p),
+            Err(Stop::Fatal(why)) => Err(ImportError::Lua {
+                at: Some(self.def.loc(id)),
+                why,
+            }),
+            Err(Stop::Unsupported(_)) => Ok(None),
+        }
+    }
+
+    /// An element's `draw` callback, or one of its `op` items, at node
+    /// `id` in `field`, for an element of `role` at `at`: its condition
+    /// joined to `conds` (its guards first), or `Ok(false)` when it is
+    /// replaced by `false` and the element is dropped with the reason.
     pub(super) fn draw_callback(
         &mut self,
         role: Role,
         at: Span,
-        id: u32,
+        (id, field): (u32, &'static str),
         conds: &mut Vec<String>,
         deviates: &mut bool,
     ) -> Result<bool, ImportError> {
@@ -805,7 +891,7 @@ impl Cx<'_> {
         let critical = role != Role::Decorative;
         let why = match self.lower(id) {
             Ok(Lowering::Lowered(l, Ty::Bool)) => {
-                self.outcome((c, id), "draw", role, (Disposition::Lowered, None));
+                self.outcome((c, id), field, role, (Disposition::Lowered, None));
                 #[cfg(test)]
                 LOWERED.with(|w| {
                     let mut all: Vec<String> = l.guards.iter().map(|g| (*g).to_owned()).collect();
@@ -826,25 +912,21 @@ impl Cx<'_> {
             Ok(Lowering::Lowered(..)) => Unsupported::Type,
             Ok(Lowering::Unsupported(why, _)) => why,
             Err(e) => {
-                self.outcome((c, id), "draw", role, (Disposition::Refused, None));
+                self.outcome((c, id), field, role, (Disposition::Refused, None));
                 return Err(e);
             }
         };
         if critical {
-            self.outcome((c, id), "draw", role, (Disposition::Refused, Some(why)));
-            return Err(self.critical(id, "draw", why));
+            self.outcome((c, id), field, role, (Disposition::Refused, Some(why)));
+            return Err(self.critical(id, field, why));
         }
         self.outcome(
             (c, id),
-            "draw",
+            field,
             role,
             (Disposition::Replaced(why), Some(why)),
         );
-        self.drop_el(
-            Role::Decorative,
-            at,
-            NoteKind::Callback { field: "draw", why },
-        )?;
+        self.drop_el(Role::Decorative, at, NoteKind::Callback { field, why })?;
         Ok(false)
     }
 

@@ -35,6 +35,7 @@ use skin_model::{
 
 pub use budget::ImportLimit;
 pub use policy::CriticalPart;
+pub(crate) use property::{int_by_name, str_by_name};
 pub use report::{
     DeviationId, FileChoice, LaneApprox, Note, NoteFallback, NoteKind, NoteLoc, Object, PartWhy,
     PropertyKind, Report, Rule, Severity, TimerWhy, TrackWhy, Usage,
@@ -229,11 +230,20 @@ enum Prop {
     Callable(u32),
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Each element's compiled visibility this thread imported, in order.
+    pub(crate) static VISIBLE: std::cell::RefCell<Vec<Option<Program>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
 /// A destination option (`JsonSkinSerializer.java:115-131`).
 #[derive(Clone, Debug)]
 enum Op {
     Id(i32),
     Name(String),
+    /// A Lua function, by its node ([`Cx::callback_prop`]).
+    Callable(u32),
 }
 
 /// Whether a reading of a destination's keys ([`Cx::read_keys`]) draws
@@ -558,6 +568,9 @@ impl<'d> Cx<'d> {
                 Some(f) => self.def.int(f, "id")?,
                 None => 0,
             };
+            // A function has no target the import follows: an unknown
+            // custom timer, never consumed.
+            let t = t.filter(|&f| self.callable_at(f).is_none());
             let target = match self.prop(t, "timer")? {
                 Prop::Id(n) if n >= 0 => Some(n),
                 _ => None,
@@ -688,7 +701,7 @@ impl<'d> Cx<'d> {
         let ops = self.ops(op)?;
         let blend = self.int_or(blend, "blend", 0)?;
         let filter = self.int_or(filter, "filter", 0)?;
-        let timer = self.prop(timer, "timer")?;
+        let timer = self.callback_prop(timer, "timer")?;
         let looped = self.int_or(looped, "loop", 0)?;
         let center = self.int_or(center, "center", 0)?;
         let stretch = self.int_or(stretch, "stretch", -1)?;
@@ -712,8 +725,8 @@ impl<'d> Cx<'d> {
         Ok((id, dst))
     }
 
-    /// A destination's `op` items: numbers and names, `null` items
-    /// skipped.
+    /// A destination's `op` items: numbers, names and Lua functions,
+    /// `null` items skipped.
     fn ops(&mut self, op: Option<u32>) -> Result<Vec<Op>, ImportError> {
         let mut ops = Vec::new();
         if let Some(op) = op {
@@ -722,10 +735,11 @@ impl<'d> Cx<'d> {
             }
             let items: Vec<u32> = self.def.arena.children(op).collect();
             for item in items {
-                match self.prop(Some(item), "op")? {
+                match self.callback_prop(Some(item), "op")? {
                     Prop::Id(n) => ops.push(Op::Id(n)),
                     Prop::Name(s) => ops.push(Op::Name(s)),
-                    Prop::Null | Prop::Callable(_) => {}
+                    Prop::Callable(id) => ops.push(Op::Callable(id)),
+                    Prop::Null => {}
                 }
             }
         }
@@ -737,7 +751,7 @@ impl<'d> Cx<'d> {
     /// before anything else of it is read or charged.
     fn record_failure(&mut self, rec: u32) -> Result<bool, ImportError> {
         let [timer, op, draw] = self.def.fields(rec, ["timer", "op", "draw"]);
-        let timer = self.prop(timer, "timer")?;
+        let timer = self.callback_prop(timer, "timer")?;
         if !self.failure_timed(&timer) {
             return Ok(false);
         }
@@ -775,7 +789,7 @@ impl<'d> Cx<'d> {
                 self.op_cond(*n),
                 Some(Cond::Fold(false) | Cond::Undefined(_))
             ),
-            Op::Name(_) => false,
+            Op::Name(_) | Op::Callable(_) => false,
         })
     }
 
@@ -1003,7 +1017,12 @@ impl<'d> Cx<'d> {
         let mut conds: Vec<String> = o.guard.into_iter().map(str::to_owned).collect();
         let mut deviates = false;
         let mut seen = BTreeSet::new();
-        for op in &dst.ops {
+        // The source's order: the numeric ids first, then the names and
+        // functions in the list's order, then `draw`
+        // (`JsonSkin.java:468-480`, `SkinObject.java:282-315`).
+        let ids = dst.ops.iter().filter(|op| matches!(op, Op::Id(_)));
+        let others = dst.ops.iter().filter(|op| !matches!(op, Op::Id(_)));
+        for op in ids.chain(others) {
             let cond = match op {
                 Op::Id(n) => {
                     if !seen.insert(*n) {
@@ -1025,13 +1044,30 @@ impl<'d> Cx<'d> {
                         return Ok(None);
                     }
                 },
+                Op::Callable(id) => {
+                    let id = *id;
+                    if !self.draw_callback(role, at, (id, "op"), &mut conds, &mut deviates)? {
+                        return Ok(None);
+                    }
+                    continue;
+                }
             };
             #[cfg(feature = "dev-tools")]
             let folded = matches!(cond, Cond::Fold(false));
             if !self.condition(role, at, cond, &mut conds, &mut deviates)? {
                 #[cfg(feature = "dev-tools")]
-                if folded && let Prop::Callable(id) = dst.draw {
-                    self.unused(id, crate::lua::callback::Unused::FoldedFalse);
+                if folded {
+                    let callables = dst.ops.iter().filter_map(|op| match op {
+                        Op::Callable(id) => Some(*id),
+                        _ => None,
+                    });
+                    let draw = match dst.draw {
+                        Prop::Callable(id) => Some(id),
+                        _ => None,
+                    };
+                    for id in callables.chain(draw) {
+                        self.unused(id, crate::lua::callback::Unused::FoldedFalse);
+                    }
                 }
                 return Ok(None);
             }
@@ -1061,7 +1097,7 @@ impl<'d> Cx<'d> {
                 }
             }
             Prop::Callable(id) => {
-                if !self.draw_callback(role, at, *id, &mut conds, &mut deviates)? {
+                if !self.draw_callback(role, at, (*id, "draw"), &mut conds, &mut deviates)? {
                     return Ok(None);
                 }
             }
@@ -1075,7 +1111,11 @@ impl<'d> Cx<'d> {
                 self.drop_el(role, at, NoteKind::Timer(TimerWhy::Script))?;
                 return Ok(None);
             }
-            Prop::Callable(id) => return Err(self.def.callable_error(id, "timer")),
+            Prop::Callable(id) => {
+                let why = self.unconsumed(role, id, "timer", "timer")?;
+                self.drop_el(role, at, why)?;
+                return Ok(None);
+            }
             Prop::Id(n) => match self.custom.resolve(n) {
                 Timer::Unset => {
                     self.ignored(at, NoteKind::Timer(TimerWhy::Unset(n)));
@@ -1227,6 +1267,8 @@ impl<'d> Cx<'d> {
         } else {
             Some(self.compile(&src, Ty::Bool, at)?)
         };
+        #[cfg(test)]
+        VISIBLE.with(|v| v.borrow_mut().push(visible.clone()));
 
         if text || o.unrotated {
             if angle || offset.r != 0 {
@@ -1346,12 +1388,13 @@ impl<'d> Cx<'d> {
         timer::model_ref(t, &self.ranks).ok_or_else(|| self.range(at, "timer"))
     }
 
-    /// An image's frame cycle (`SkinSourceImage.java:73-89`): `Ok(None)`
-    /// for no cycle; `Err(why)` for one the model cannot run. A cycle
-    /// without a timer runs on `screen`, which no timer id maps to.
+    /// An image's frame cycle (`SkinSourceImage.java:73-89`), for an
+    /// element of `role`: `Ok(None)` for no cycle; `Err(why)` for one the
+    /// model cannot run. A cycle without a timer runs on `screen`, which
+    /// no timer id maps to.
     fn cycle(
         &mut self,
-        at: Span,
+        (at, role): (Span, Role),
         frames: u32,
         t: &Prop,
         cycle: i32,
@@ -1367,7 +1410,7 @@ impl<'d> Cx<'d> {
             Prop::Null => TimerRef::Builtin(slot::SCREEN),
             Prop::Id(n) if n < 0 => TimerRef::Builtin(slot::SCREEN),
             Prop::Name(_) => return Ok(Err(NoteKind::Timer(TimerWhy::Script))),
-            Prop::Callable(id) => return Err(self.def.callable_error(id, "timer")),
+            Prop::Callable(id) => return Ok(Err(self.unconsumed(role, id, "timer", "timer")?)),
             Prop::Id(n) => match self.custom.resolve(n) {
                 Timer::Unset => {
                     self.ignored(at, NoteKind::Timer(TimerWhy::Unset(n)));

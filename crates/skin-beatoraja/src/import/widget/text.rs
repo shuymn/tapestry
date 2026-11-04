@@ -90,10 +90,17 @@ impl Cx<'_> {
         );
         // The effective string (`JsonSkinObjectLoader.java:633-636`,
         // `SkinText.java:102`).
-        let resolved = match self.prop(value, "value")? {
+        let resolved = match self.callback_prop(value, "value")? {
             Prop::Id(n) => property::str_by_id(n),
             Prop::Name(s) => property::str_by_name(&s).unwrap_or(StrProp::Unsupported(None)),
-            Prop::Null | Prop::Callable(_) => StrProp::Null,
+            // A function's string has no consumer, and it never falls
+            // back to `ref`.
+            Prop::Callable(id) => {
+                let why = self.unconsumed(role, id, "value", "text value")?;
+                self.drop_el(role, at, why)?;
+                return Ok(());
+            }
+            Prop::Null => StrProp::Null,
         };
         let resolved = match resolved {
             StrProp::Null => property::str_by_id(self.int_or(r, "ref", 0)?),
