@@ -261,6 +261,7 @@ fn built(
                     let fact = match p.pending {
                         FactId::Autoplay => "autoplay",
                         FactId::JudgeClass => "the chart's judgment class",
+                        FactId::PlayLevel => "the chart's play level",
                     };
                     return Err(format!(
                         "the skin reads {fact} as it is built, which is known only once a \

@@ -104,14 +104,19 @@ pub(crate) fn callables(
     let lua = arena.lua.as_deref();
     callback::callable_nodes(arena).filter_map(move |(id, i)| {
         let kind = lua?.callables.get(i as usize)?.kind;
-        let key: String = arena.key(id).map(Iterator::collect).unwrap_or_default();
-        let field = FIELDS
-            .iter()
-            .find(|f| **f == key)
-            .copied()
-            .unwrap_or("other");
-        Some((id, field, kind))
+        Some((id, field(arena, id), kind))
     })
+}
+
+/// The field holding node `id` ([`FIELDS`]), or `other`.
+#[cfg(feature = "dev-tools")]
+pub(crate) fn field(arena: &Arena, id: u32) -> &'static str {
+    let key: String = arena.key(id).map(Iterator::collect).unwrap_or_default();
+    FIELDS
+        .iter()
+        .find(|f| **f == key)
+        .copied()
+        .unwrap_or("other")
 }
 
 /// Converts `value`, what the entry of `entry` returned, with `modules`

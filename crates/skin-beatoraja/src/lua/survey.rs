@@ -11,7 +11,8 @@ use std::path::Path;
 
 use skin_model::ScreenKind;
 
-use super::convert::callables;
+use super::callback::{Analysis, Unused, callable_nodes};
+use super::convert::{callables, field};
 use super::facts::{FactRead, ImportFacts};
 use super::ledger::Stop;
 use super::{
@@ -19,7 +20,7 @@ use super::{
 };
 use crate::error::{ImportError, Loc};
 use crate::import::{Config, NoteKind};
-use crate::tree::CallableKind;
+use crate::tree::{Arena, CallableKind};
 
 /// One import's outcome under allowlisted labels.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -40,17 +41,86 @@ pub struct Survey {
     /// `refused`, `classified only` (returned but never consumed) and
     /// `never analysed` (the import stopped before them).
     pub outcomes: BTreeMap<String, u32>,
+    /// One record per consumer the import reached, in the order it
+    /// reached them, then one per callable classified but never
+    /// consumed, with why.
+    pub consumers: Vec<Consumer>,
     /// The import's notes, by kind.
     pub notes: BTreeMap<String, u32>,
-    /// The configured pass's reads of `main_state.option`, by what they
-    /// met: `option <id> read`, `pending`, `unavailable`, `constant` or
-    /// `live state`, `option unknown` and `option argument`.
+    /// The configured pass's reads of `main_state.option`, `number` and
+    /// `text`, by what they met: `<api> <id> read`, `pending`,
+    /// `unavailable`, `constant` or `live state`, `option unknown` and
+    /// `<api> argument`.
     pub facts: BTreeMap<String, u32>,
     /// The facts the configured pass recorded, in first-read order.
     pub reads: Vec<FactRead>,
     pub usage: LuaUsage,
     /// The screen kind the header pass gave, when it gave a header.
     pub kind: Option<ScreenKind>,
+}
+
+/// A callback where the import consumed it, or a callable it classified
+/// and never consumed, under allowlisted labels.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Consumer {
+    /// Its definition: a module index, a line and a column.
+    pub at: Option<(usize, u32, u32)>,
+    /// The field that holds it ([`super::convert::FIELDS`], or `other`).
+    pub field: &'static str,
+    /// `decorative`, `critical <part>`, or `-` when never consumed.
+    pub role: String,
+    /// What became of it, labelled as [`Survey::outcomes`].
+    pub disposition: String,
+    /// Why it did not lower, or why it was never consumed: `element
+    /// dropped earlier`, `condition folded false`, `field not consumed`, or
+    /// `import stopped earlier` when the import ended before reading it.
+    pub reason: Option<String>,
+}
+
+/// The records of `arena`'s callbacks after an import ([`Consumer`]),
+/// each located by file name; `completed` when the import finished, so
+/// that a callback it never read was in a field no consumer reads.
+pub(crate) fn records(arena: &Arena, an: &Analysis, completed: bool) -> Vec<(Loc, Consumer)> {
+    let mut out = Vec::new();
+    for c in an.consumed.borrow().iter() {
+        out.push((
+            arena.loc(c.node),
+            Consumer {
+                at: None,
+                field: c.field,
+                role: c
+                    .part
+                    .map_or_else(|| "decorative".to_owned(), |p| format!("critical {p:?}")),
+                disposition: disposition(&c.disposition),
+                reason: c.why.as_ref().map(unsupported),
+            },
+        ));
+    }
+    let outcomes = an.outcomes.borrow();
+    let unused = an.unused.borrow();
+    let mut seen = std::collections::HashSet::new();
+    for (id, c) in callable_nodes(arena) {
+        if outcomes.get(c as usize) != Some(&Disposition::ClassifiedOnly) || !seen.insert(c) {
+            continue;
+        }
+        let reason = match unused.get(&c) {
+            Some(Unused::Dropped) => "element dropped earlier",
+            Some(Unused::FoldedFalse) => "condition folded false",
+            None if completed => "field not consumed",
+            None => "import stopped earlier",
+        };
+        out.push((
+            arena.loc(id),
+            Consumer {
+                at: None,
+                field: field(arena, id),
+                role: "-".to_owned(),
+                disposition: disposition(&Disposition::ClassifiedOnly),
+                reason: Some(reason.to_owned()),
+            },
+        ));
+    }
+    out
 }
 
 /// The name of `v`'s variant alone, without the values it holds.
@@ -219,6 +289,14 @@ pub fn survey(root: &Path, entry: &str, facts: &ImportFacts, cancel: &Cancel) ->
     }
     let o = h.finish(def, counts, store, reads, &config);
     s.reads.clone_from(&o.reads);
+    s.consumers = o
+        .records
+        .into_iter()
+        .map(|(at, c)| Consumer {
+            at: locate(Some(&at), &o.dependencies),
+            ..c
+        })
+        .collect();
     for d in &o.callbacks {
         *s.outcomes.entry(disposition(d)).or_default() += 1;
     }
@@ -251,6 +329,114 @@ mod tests {
             std::fs::write(d.path().join(name), text).unwrap();
         }
         d
+    }
+
+    #[test]
+    fn each_consumer_has_a_record_and_an_unused_callback_its_reason() {
+        let entry = "local skin = { type = 0, name = \"t\", w = 1920, h = 1080,\n\
+               property = { { name = \"fc\", item = { { name = \"off\", op = 905 }, { name = \"on\", op = 906 } } } } }\n\
+             if not skin_config then return skin end\n\
+             local ms = require(\"main_state\")\n\
+             skin.source = { { id = \"a\", path = \"a.png\" } }\n\
+             skin.image = { { id = \"i\", src = \"a\", x = 0, y = 0, w = 64, h = 64 } }\n\
+             skin.gauge = { id = \"g\", nodes = { \"i\", \"i\", \"i\", \"i\" }, parts = 10 }\n\
+             skin.extra = { function() return true end }\n\
+             skin.destination = {\n\
+               { id = \"i\", op = { 906 }, draw = function() return true end, dst = { { w = 64, h = 64 } } },\n\
+               { id = \"i\", mouseRect = { x = 0, y = 0, w = 1, h = 1 }, draw = function() return true end, dst = { { w = 64, h = 64 } } },\n\
+               { id = \"g\", draw = function() return ms.gauge_type() == 4 end, dst = { { w = 64, h = 64 } } },\n\
+               { id = \"i\", draw = function() return ms.number(425) > 0 end, dst = { { w = 64, h = 64 } } },\n\
+               { id = \"ex\", dst = { { w = 6, h = 6 } } }, { id = \"odd\", dst = { { w = 6, h = 6 } } },\n\
+             }\n\
+             skin.value = {\n\
+               { id = \"ex\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, digit = 4, value = function() return ms.number(101) end },\n\
+               { id = \"odd\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, digit = 4, value = function() return ms.number(425) end },\n\
+             }\n\
+             return skin\n";
+        let d = crate::lua::callback_tests::folder(entry);
+        let s = survey(
+            d.path(),
+            "s.luaskin",
+            &ImportFacts::unavailable(ScreenKind::Play),
+            &Cancel::new(),
+        );
+        assert_eq!(s.outcome, "imported");
+        let got: Vec<_> = s
+            .consumers
+            .iter()
+            .map(|c| {
+                (
+                    c.at.map(|(_, line, _)| line),
+                    c.field,
+                    c.role.as_str(),
+                    c.disposition.as_str(),
+                    c.reason.as_deref(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (Some(12), "draw", "critical Gauge", "lowered", None),
+                (
+                    Some(13),
+                    "draw",
+                    "decorative",
+                    "replaced Unmapped main_state.number 425",
+                    Some("Unmapped main_state.number 425")
+                ),
+                (Some(17), "value", "critical ExScore", "lowered", None),
+                (
+                    Some(18),
+                    "value",
+                    "decorative",
+                    "replaced Unmapped main_state.number 425",
+                    Some("Unmapped main_state.number 425")
+                ),
+                (
+                    Some(10),
+                    "draw",
+                    "-",
+                    "classified only",
+                    Some("condition folded false")
+                ),
+                (
+                    Some(11),
+                    "draw",
+                    "-",
+                    "classified only",
+                    Some("element dropped earlier")
+                ),
+                (
+                    Some(8),
+                    "other",
+                    "-",
+                    "classified only",
+                    Some("field not consumed")
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_callback_an_import_never_reached_is_not_called_unconsumed() {
+        // Admission refuses at the second function: the import never
+        // reads the first, classified one.
+        let d = folder(&[(
+            "s.luaskin",
+            "if not skin_config then return { type = 0 } end\n\
+             return { type = 0, extra = { function() return true end,\n\
+               function() local n = 0 n = 1 return true end } }",
+        )]);
+        let s = survey(
+            d.path(),
+            "s.luaskin",
+            &ImportFacts::unavailable(ScreenKind::Play),
+            &Cancel::new(),
+        );
+        assert_eq!(s.outcome, "lua effect Construct assignment");
+        let reasons: Vec<_> = s.consumers.iter().map(|c| c.reason.as_deref()).collect();
+        assert_eq!(reasons, [Some("import stopped earlier")]);
     }
 
     #[test]

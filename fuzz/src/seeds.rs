@@ -922,6 +922,8 @@ fn lua_input(files: &[&str]) -> Vec<u8> {
 /// [`crate::lua_facts`]'s bytes for autoplay off and for `#RANK 2`.
 pub const LUA_AUTOPLAY_OFF: u8 = 1;
 pub const LUA_RANK_2: u8 = (10 << 2) | 2;
+/// [`crate::lua_facts`]'s first byte for autoplay off and play level 9.
+pub const LUA_AUTOPLAY_OFF_LEVEL_9: u8 = (9 << 4) | (2 << 2) | LUA_AUTOPLAY_OFF;
 /// [`crate::lua_facts`]'s first byte for a result scene.
 pub const LUA_RESULT_SCENE: u8 = u8::MAX;
 
@@ -1001,7 +1003,9 @@ skin.destination[2] = { id = "i", draw = function() ms.set_timer(1, 0) return tr
     );
     let facts = lua_skin(
         r#"local ms = require("main_state")
-assert(not ms.option(33) and ms.option(32) and ms.option(182) and not ms.option(290))"#,
+assert(not ms.option(33) and ms.option(32) and ms.option(182) and not ms.option(290))
+assert(ms.number(96) == 9 and ms.text(1003) == "")
+assert(pcall(function() return string.find(ms.text(1002), "x") end))"#,
     );
     let host_write =
         lua_skin(r#"local ms = require("main_state") pcall(function() ms.number = nil end)"#);
@@ -1014,7 +1018,11 @@ assert(not ms.option(33) and ms.option(32) and ms.option(182) and not ms.option(
             lua_input(&[&isolation, "runs = (runs or 0) + 1\nreturn { runs = runs }"]),
         ),
         ("callback_lowered", lua_input(&[&lowered])),
-        ("facts", lua_input(&[&facts])),
+        ("facts", {
+            let mut input = lua_input(&[&facts]);
+            input[0] = LUA_AUTOPLAY_OFF_LEVEL_9;
+            input
+        }),
         ("callback_replaced", lua_input(&[&replaced])),
         ("callback_effect", lua_input(&[&effect])),
         ("host_write", lua_input(&[&host_write])),

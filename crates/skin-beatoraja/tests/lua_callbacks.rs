@@ -195,22 +195,6 @@ fn a_critical_callback_that_does_not_convert_refuses() {
         }) => assert_eq!(at.line, 13),
         other => panic!("{other:?}"),
     }
-    // A configuration read is folded only for decorative callbacks.
-    let d = folder(&skin(
-        "skin.gauge = { id = \"g\", nodes = { \"n0\", \"n1\", \"n2\", \"n3\" }, parts = 10 }\n\
-         table.insert(skin.destination, { id = \"g\", draw = function() return en() end,\n\
-           dst = { { x = 100, y = 500, w = 100, h = 10 } } })",
-    ));
-    assert!(matches!(
-        import(&d, 906),
-        Err(ImportError::Lua {
-            why: LuaWhy::Critical {
-                why: Unsupported::Config,
-                ..
-            },
-            ..
-        })
-    ));
     // An EX score read makes a number critical: one that does not convert
     // refuses, though the rest of it reads decorative counts.
     let d = folder(&skin(
@@ -233,6 +217,56 @@ fn a_critical_callback_that_does_not_convert_refuses() {
     ));
     let i = import(&d, 905).unwrap();
     assert_eq!(counts(&i), [0, 1, 0, 0]);
+}
+
+/// A play skin whose gauge flash, drawn from x 500, is a `draw` in a part
+/// the entry loads with `dofile`, `main_state` a local of the part's
+/// chunk: shown at the fifth and sixth gauge types while the option
+/// `flash` is 930 (931 the other item).
+fn gauge_flash() -> TempDir {
+    let d = folder(
+        "local skin = { type = 0, name = \"t\", w = 1920, h = 1080,\n\
+           property = { { name = \"flash\", item = { { name = \"on\", op = 930 }, { name = \"off\", op = 931 } } } } }\n\
+         if not skin_config then return skin end\n\
+         skin.source = { { id = \"a\", path = \"a.png\" } }\n\
+         skin.image = {\n\
+           { id = \"n0\", src = \"a\", x = 0, y = 0, w = 8, h = 8 }, { id = \"n1\", src = \"a\", x = 8, y = 0, w = 8, h = 8 },\n\
+           { id = \"n2\", src = \"a\", x = 16, y = 0, w = 8, h = 8 }, { id = \"n3\", src = \"a\", x = 24, y = 0, w = 8, h = 8 } }\n\
+         skin.gauge = { id = \"g\", nodes = { \"n0\", \"n1\", \"n2\", \"n3\" }, parts = 10 }\n\
+         skin.destination = { { id = \"g\", dst = { { x = 100, y = 500, w = 100, h = 10 } } } }\n\
+         for _, d in ipairs(dofile(\"frame/flash.lua\")) do table.insert(skin.destination, d) end\n\
+         return skin\n",
+    );
+    common::write(
+        d.path(),
+        "frame/flash.lua",
+        b"local main_state = require(\"main_state\")\n\
+          return { { id = \"g\", blend = 2, draw = function()\n\
+            return main_state.gauge_type() == 4 and skin_config.option[\"flash\"] == 930\n\
+              or main_state.gauge_type() == 5 and skin_config.option[\"flash\"] == 930\n\
+          end, dst = { { x = 500, y = 500, w = 100, h = 10 } } } }\n",
+    );
+    d
+}
+
+#[test]
+fn a_critical_callback_folds_configuration() {
+    let d = gauge_flash();
+    for flash in [930, 931] {
+        // The critical gauge `draw` is consumed and lowered, the option
+        // folded.
+        let i = import(&d, flash).unwrap();
+        assert_eq!(i.callbacks, [Disposition::Lowered], "{flash}");
+        // Over the six gauge kinds, the flash shows at the fifth and
+        // sixth only under 930, and never under 931.
+        for look in GaugeLook::ALL {
+            let skin = import(&d, flash).unwrap().imported.skin;
+            let quads = Drawn::with_look(skin, 10, look).frame(1_000, &[]);
+            let flashes = quads.iter().any(|q| q.rect[0] >= 499.0);
+            let want = flash == 930 && matches!(look, GaugeLook::ExHard | GaugeLook::Hazard);
+            assert_eq!(flashes, want, "{flash} at {look:?}");
+        }
+    }
 }
 
 #[test]
