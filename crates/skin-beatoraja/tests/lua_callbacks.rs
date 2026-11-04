@@ -312,18 +312,14 @@ fn timers_compare_with_the_off_value() {
     )));
     let i = import(&d, 905).unwrap();
     assert_eq!(counts(&i), [3, 0, 0, 0]);
-    // A timer's value as a number is not converted.
+    // A timer's value as a number is not converted: the decorative
+    // image is replaced.
     let d = folder(&skin(&image_at(
         0,
         "draw = function() return ms.timer(41) > 0 end,",
     )));
-    assert!(matches!(
-        import(&d, 905),
-        Err(ImportError::Lua {
-            why: LuaWhy::Effect(Unsupported::Type),
-            ..
-        })
-    ));
+    let i = import(&d, 905).unwrap();
+    assert_eq!(i.callbacks, [Disposition::Replaced(Unsupported::Type)]);
 }
 
 /// A draw callback reading the chart's BPM-change condition lowers, with

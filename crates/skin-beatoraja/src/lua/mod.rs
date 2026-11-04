@@ -41,8 +41,12 @@
 pub(crate) mod callback;
 #[cfg(test)]
 mod callback_tests;
+mod clock;
 mod config;
 mod convert;
+mod effects;
+#[cfg(test)]
+mod effects_tests;
 pub mod facts;
 #[cfg(test)]
 mod graph_tests;
@@ -85,6 +89,7 @@ pub use self::host::HOST_APIS;
 pub use self::ledger::{Cancel, LuaUsage};
 use self::ledger::{Counts, Ledger, Stop};
 pub(crate) use self::loader::Store;
+pub(crate) use self::sandbox::LIBS;
 use self::sandbox::host;
 use crate::error::{ImportError, Loc};
 use crate::header::Header;
@@ -118,6 +123,8 @@ pub enum LuaLimit {
     Expansion,
     /// [`limits::MAX_ANALYSIS_WORK`].
     AnalysisWork,
+    /// [`limits::MAX_ANALYSIS_TIME`].
+    AnalysisTime,
     /// The generated source's bound: an instrumented chunk's
     /// ([`instrument::MAX_ADDED_BYTES`]), the rewritten chunks a pass
     /// keeps ([`limits::MAX_REWRITTEN_BYTES`]) or a lowered expression's
@@ -139,6 +146,7 @@ impl fmt::Display for LuaLimit {
             Self::Captures => "the capture limit",
             Self::Expansion => "the helper expansion limit",
             Self::AnalysisWork => "the analysis work limit",
+            Self::AnalysisTime => "the analysis time limit",
             Self::Generated => "the generated source limit",
         })
     }
@@ -196,9 +204,6 @@ pub enum LuaWhy {
     /// A chunk Lua compiles whose bindings the analysis's parser cannot
     /// establish.
     Unbound,
-    /// A callback with an effect the analysis does not rule out, located
-    /// at its construct.
-    Effect(Unsupported),
     /// A play-critical callback in field `field` that does not convert.
     Critical {
         field: &'static str,
@@ -234,11 +239,17 @@ pub enum Unsupported {
     Range,
     /// A function at a field whose consumer, named here, takes none.
     Consumer(&'static str),
-    /// A proof that rests on captured state, void because code the
-    /// analysis does not see (a script, an unread entry, a metatable read
-    /// while the table is deserialized) runs in the source and may change
-    /// that state.
+    /// A proof that rests on captured state, void because the candidate
+    /// is open: code the analysis does not model (a script, an unread
+    /// entry, a metatable read while the table is deserialized, a
+    /// construct outside the modeled subset) may run in the source and
+    /// change that state.
     Interference,
+    /// A callback whose reach writes at frame time: it never lowers.
+    Writes,
+    /// A read whose id, or a call whose callee, the role scan cannot
+    /// resolve, so whose role is unknown: critical.
+    Unresolved(&'static str),
 }
 
 impl fmt::Display for Unsupported {
@@ -263,6 +274,8 @@ impl fmt::Display for Unsupported {
             Self::Interference => {
                 f.write_str("captured state that code outside the analysis may change")
             }
+            Self::Writes => f.write_str("a write at frame time"),
+            Self::Unresolved(w) => write!(f, "an unresolved {w}"),
         }
     }
 }
@@ -305,7 +318,6 @@ impl fmt::Display for LuaWhy {
             }
             Self::HostWrite => f.write_str("a write to a host module"),
             Self::Unbound => f.write_str("a Lua chunk the analysis cannot bind"),
-            Self::Effect(why) => write!(f, "a callback with an unknown effect: {why}"),
             Self::Critical { field, why } => {
                 write!(f, "a play-critical callback in `{field}`: {why}")
             }
@@ -707,7 +719,7 @@ pub(crate) struct Outcome<T, E = ImportError> {
     pub(crate) reads: Vec<FactRead>,
     /// The report's records of the callbacks ([`survey::records`]).
     #[cfg(feature = "dev-tools")]
-    pub(crate) records: Vec<(Loc, survey::Consumer)>,
+    pub(crate) records: survey::Records,
 }
 
 /// The header pass, with its metadata.
@@ -726,7 +738,7 @@ pub(crate) fn header_pass(root: &Path, entry: &str, cancel: &Cancel) -> Outcome<
                 callbacks: Vec::new(),
                 reads: Vec::new(),
                 #[cfg(feature = "dev-tools")]
-                records: Vec::new(),
+                records: survey::Records::default(),
             };
         }
     };
@@ -768,7 +780,7 @@ pub(crate) fn header_pass(root: &Path, entry: &str, cancel: &Cancel) -> Outcome<
         callbacks: Vec::new(),
         reads: Vec::new(),
         #[cfg(feature = "dev-tools")]
-        records: Vec::new(),
+        records: survey::Records::default(),
     }
 }
 
@@ -960,7 +972,7 @@ impl LuaHeader {
         let slot = self.header.kind;
         let mut callbacks = Vec::new();
         #[cfg(feature = "dev-tools")]
-        let mut records = Vec::new();
+        let mut records = survey::Records::default();
         let result = def.and_then(|mut def| {
             let r =
                 admit(&mut def, slot).and_then(|()| import(&mut def, &self.header, config, slot));

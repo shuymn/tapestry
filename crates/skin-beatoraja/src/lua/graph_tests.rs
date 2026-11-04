@@ -78,7 +78,7 @@ fn a_bare_env_reads_the_chunk_s_globals() {
 }
 
 #[test]
-fn a_frame_time_writer_of_the_global_module_is_refused_at_admission() {
+fn a_frame_time_writer_of_the_global_module_voids_its_binding() {
     let (body, draw) = GLOBAL;
     let entry = skin(
         body,
@@ -90,7 +90,13 @@ fn a_frame_time_writer_of_the_global_module_is_refused_at_admission() {
     );
     match import(&entry) {
         Err(ImportError::Lua { why, .. }) => {
-            assert_eq!(why, LuaWhy::Effect(Unsupported::Construct("assignment")));
+            assert_eq!(
+                why,
+                LuaWhy::Critical {
+                    field: "draw",
+                    why: Unsupported::Interference
+                }
+            );
         }
         other => panic!("{other:?}"),
     }
@@ -121,7 +127,16 @@ fn a_binding_to_anything_but_the_module_is_refused() {
     ] {
         let entry = skin(body, &gauge(GLOBAL.1));
         match import(&entry) {
-            Err(ImportError::Lua { why, .. }) => assert_eq!(why, LuaWhy::Effect(want), "{body}"),
+            Err(ImportError::Lua { why, .. }) => {
+                assert_eq!(
+                    why,
+                    LuaWhy::Critical {
+                        field: "draw",
+                        why: want
+                    },
+                    "{body}"
+                );
+            }
             other => panic!("{body}: {other:?}"),
         }
     }

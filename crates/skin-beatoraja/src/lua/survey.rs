@@ -11,7 +11,7 @@ use std::path::Path;
 
 use skin_model::ScreenKind;
 
-use super::callback::{Analysis, Unused, callable_nodes};
+use super::callback::{Analysis, Found, Site, Unused, callable_nodes};
 use super::convert::{callables, field};
 use super::facts::{FactRead, ImportFacts};
 use super::ledger::Stop;
@@ -53,6 +53,12 @@ pub struct Survey {
     /// lists every entry of a table whose entries the conversion left
     /// unread hold a function, a string or a table.
     pub root_unread: u32,
+    /// Whether the configured definition's roots stay inside the modeled
+    /// subset once the effect walk ran: `closed`, or `open` with why;
+    /// empty when the import stopped before the walk.
+    pub effects: String,
+    /// Where the analysis was opened, located as [`Self::at`].
+    pub effects_at: Option<(usize, u32, u32)>,
     /// The import's notes, by kind.
     pub notes: BTreeMap<String, u32>,
     /// The configured pass's reads of `main_state.option`, `number` and
@@ -87,10 +93,46 @@ pub struct Consumer {
     pub reason: Option<String>,
 }
 
-/// The records of `arena`'s callbacks after an import ([`Consumer`]),
-/// each located by file name; `completed` when the import finished, so
-/// that a callback it never read was in a field no consumer reads.
-pub(crate) fn records(arena: &Arena, an: &Analysis, completed: bool) -> Vec<(Loc, Consumer)> {
+/// What an import's analysis recorded for the report.
+#[derive(Debug, Default)]
+pub(crate) struct Records {
+    /// The callbacks ([`Consumer`]), each located by file name.
+    pub(crate) consumers: Vec<(Loc, Consumer)>,
+    /// `closed`, or `open` with why and where, once the effect walk ran.
+    pub(crate) effects: Option<(String, Option<Loc>)>,
+}
+
+/// The effects label of `an` once its walk ran: `closed`, or `open` with
+/// why, located at the open site.
+fn effects(arena: &Arena, an: &Analysis) -> Option<(String, Option<Loc>)> {
+    an.admitted()?;
+    Some(match an.open.get() {
+        None => ("closed".to_owned(), None),
+        Some(o) => {
+            let at = match o.site {
+                Site::Node(n) => arena.loc(n),
+                Site::Code { file, line } => an.loc(&Found {
+                    why: o.why,
+                    file,
+                    line,
+                }),
+            };
+            (format!("open {}", unsupported(&o.why)), Some(at))
+        }
+    })
+}
+
+/// The records of `arena`'s callbacks after an import ([`Records`]);
+/// `completed` when the import finished, so that a callback it never read
+/// was in a field no consumer reads.
+pub(crate) fn records(arena: &Arena, an: &Analysis, completed: bool) -> Records {
+    Records {
+        consumers: consumers(arena, an, completed),
+        effects: effects(arena, an),
+    }
+}
+
+fn consumers(arena: &Arena, an: &Analysis, completed: bool) -> Vec<(Loc, Consumer)> {
     let mut out = Vec::new();
     for c in an.consumed.borrow().iter() {
         out.push((
@@ -172,7 +214,6 @@ fn label(e: &ImportError) -> String {
         ImportError::Lua { why, .. } => match why {
             LuaWhy::LiveState { api: a } => format!("lua live state {}", api(*a)),
             LuaWhy::Unavailable { api: a, id } => format!("lua unavailable {} {id}", api(*a)),
-            LuaWhy::Effect(why) => format!("lua effect {}", unsupported(why)),
             LuaWhy::Critical { field, why } => {
                 format!("lua critical {field} {}", unsupported(why))
             }
@@ -197,6 +238,7 @@ fn unsupported(why: &Unsupported) -> String {
         Unsupported::HostApi(a) => format!("HostApi {}", api(*a)),
         Unsupported::Unmapped { api: a, id } => format!("Unmapped {} {id}", api(*a)),
         Unsupported::Consumer(c) => format!("Consumer {c}"),
+        Unsupported::Unresolved(w) => format!("Unresolved {w}"),
         other => variant(other),
     }
 }
@@ -314,8 +356,13 @@ pub fn survey(root: &Path, entry: &str, facts: &ImportFacts, cancel: &Cancel) ->
     }
     let o = h.finish(def, counts, store, reads, &config);
     s.reads.clone_from(&o.reads);
+    if let Some((label, at)) = &o.records.effects {
+        s.effects.clone_from(label);
+        s.effects_at = locate(at.as_ref(), &o.dependencies);
+    }
     s.consumers = o
         .records
+        .consumers
         .into_iter()
         .map(|(at, c)| Consumer {
             at: locate(Some(&at), &o.dependencies),
@@ -452,13 +499,13 @@ mod tests {
 
     #[test]
     fn a_callback_an_import_never_reached_is_not_called_unconsumed() {
-        // Admission refuses at the second function: the import never
-        // reads the first, classified one.
+        // The import refuses a mixed destination list after admission: it
+        // never reads the classified action.
         let d = folder(&[(
             "s.luaskin",
             "if not skin_config then return { type = 0 } end\n\
-             return { type = 0, customEvents = { { action = function() return true end },\n\
-               { action = function() local n = 0 n = 1 return true end } } }",
+             return { type = 0, customEvents = { { action = function() return true end } },\n\
+               destination = { k = 1, {} } }",
         )]);
         let s = survey(
             d.path(),
@@ -466,7 +513,8 @@ mod tests {
             &ImportFacts::unavailable(ScreenKind::Play),
             &Cancel::new(),
         );
-        assert_eq!(s.outcome, "lua effect Construct assignment");
+        assert_eq!(s.outcome, "lua Mixed");
+        assert_eq!(s.effects, "open Construct an unread entry");
         let reasons: Vec<_> = s.consumers.iter().map(|c| c.reason.as_deref()).collect();
         assert_eq!(reasons, [Some("import stopped earlier")]);
     }
@@ -550,10 +598,12 @@ return { type = 0 }",
             .map(|((_, kind), n)| (kind.as_str(), *n))
             .collect();
         assert_eq!(kinds, [("library", 3), ("lua", 1)]);
-        // A library function has no tree, and the empty function returns
-        // nothing: each refuses the candidate, the first at its value.
-        assert_eq!(s.outcome, "lua effect Capture not a skin closure");
-        assert_eq!(s.outcomes.get("refused"), Some(&4));
+        // A library function has no tree: the first opens the analysis at
+        // its value; nothing consumes any of them.
+        assert_eq!(s.outcome, "imported");
+        assert_eq!(s.effects, "open Capture not a skin closure");
+        assert_eq!(s.effects_at.map(|(m, line, _)| (m, line)), Some((0, 0)));
+        assert_eq!(s.outcomes.get("classified only"), Some(&4));
     }
 
     #[test]

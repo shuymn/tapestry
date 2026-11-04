@@ -123,6 +123,14 @@ fn main() {
         }
         println!("  root script: {}", survey.root_script);
         println!("  root unread: {}", survey.root_unread);
+        if !survey.effects.is_empty() {
+            let at = survey
+                .effects_at
+                .map_or_else(String::new, |(module, line, col)| {
+                    format!(" at module {module}, line {line}, column {col}")
+                });
+            println!("  effects: {}{at}", survey.effects);
+        }
         for (outcome, n) in &survey.outcomes {
             println!("  callback {outcome}: {n}");
         }

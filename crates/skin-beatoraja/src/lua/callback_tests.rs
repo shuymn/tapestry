@@ -90,64 +90,102 @@ pub(super) fn import(entry: &str) -> Result<super::LuaImported, ImportError> {
 /// call (`pcall`'s wrapper charges one).
 const PROBE: &str = "local function probe() pcall(type, 1) end";
 
+/// The configured pass of `entry`, with `files` beside it, imported: its
+/// refusal, if any, and what became of each callable however far it got.
+pub(super) fn outcome(
+    entry: &str,
+    files: &[(&str, &str)],
+) -> (Result<(), ImportError>, Vec<super::Disposition>) {
+    let d = folder(entry);
+    for (name, text) in files {
+        std::fs::write(d.path().join(name), text).unwrap();
+    }
+    let cancel = Cancel::new();
+    let h = read_lua_header(d.path(), "s.luaskin", &cancel).unwrap();
+    let facts = super::facts::ImportFacts::unavailable(skin_model::ScreenKind::Play);
+    CAPTURE_CALLS.with(|n| n.set(0));
+    let o = h.complete(&Config::defaults(h.header()), &facts, &cancel);
+    assert_eq!(CAPTURE_CALLS.with(Cell::get), 0, "{entry}");
+    let r = match o.result {
+        Ok(_) => Ok(()),
+        Err(super::ledger::Stop::Fault(e)) => Err(e),
+        Err(super::ledger::Stop::Pending(p)) => panic!("{p:?}"),
+    };
+    (r, o.callbacks)
+}
+
 #[test]
 fn refusals_name_their_reason_and_run_no_handler() {
-    let effect = |w| LuaWhy::Effect(w);
-    for (body, dst, want) in [
-        // The module reassigned, or written through an alias.
+    use super::Disposition::{Refused, Replaced};
+    let critical = |why| Some(LuaWhy::Critical { field: "draw", why });
+    for (body, dst, want, callbacks) in [
+        // The module reassigned at construction: the candidate stays
+        // closed, and the binding is refused; written through an alias,
+        // fatal.
         (
             "ms = { number = function() return 1 end }",
             gauge("function() return ms.number(110) > 0 end"),
-            effect(Unsupported::Binding("a host module")),
+            critical(Unsupported::Binding("a host module")),
+            vec![Refused],
         ),
         (
             "local m = ms\npcall(function() m.number = nil end)",
             gauge("function() return ms.number(110) > 0 end"),
-            LuaWhy::HostWrite,
+            Some(LuaWhy::HostWrite),
+            vec![],
         ),
-        // An impure helper.
+        // An impure helper: its caller writes.
         (
             "local n = 0\nlocal function bump() n = n + 1 return true end",
             gauge("function() return bump() end"),
-            effect(Unsupported::Construct("assignment")),
+            critical(Unsupported::Writes),
+            vec![Refused],
         ),
         // Integer truthiness.
         (
             "",
             image("function() return ms.number(1) and true end"),
-            effect(Unsupported::Truthiness),
+            None,
+            vec![Replaced(Unsupported::Truthiness)],
         ),
         // Recursion, through a helper bound after its caller: the
         // captured final binding proves it.
         (
             "local f\nlocal function g() return f() end\nf = function() return g() end",
             image("function() return g() end"),
-            effect(Unsupported::Recursion),
+            None,
+            vec![Replaced(Unsupported::Recursion)],
         ),
         (
             "local function r() return r() end",
             image("function() return r() end"),
-            effect(Unsupported::Recursion),
+            None,
+            vec![Replaced(Unsupported::Recursion)],
         ),
         // `/` in a comparison.
         (
             "",
             image("function() return ms.number(110) / 2 > 0 end"),
-            effect(Unsupported::Construct("/")),
+            None,
+            vec![Replaced(Unsupported::Construct("/"))],
         ),
         // A global read.
         (
             "",
             image("function() return flag end"),
-            effect(Unsupported::Global),
+            None,
+            vec![Replaced(Unsupported::Global)],
         ),
         // An upvalue mutated by the callback.
         (
             "local n = 0",
             image("function() n = n + 1 return true end"),
-            effect(Unsupported::Construct("assignment")),
+            None,
+            vec![Replaced(Unsupported::Writes)],
         ),
-        // A decorative writer beside a critical gauge callback.
+        // A decorative writer beside a critical gauge callback: the
+        // writer is replaced, and the module binding the gauge needs
+        // fails at the write.
         (
             "",
             format!(
@@ -155,81 +193,101 @@ fn refusals_name_their_reason_and_run_no_handler() {
                 image("function() ms.set_timer(1, 0) return true end"),
                 gauge("function() return ms.gauge_type() == 4 end")
             ),
-            effect(Unsupported::Construct("call statement")),
+            critical(Unsupported::Interference),
+            vec![Replaced(Unsupported::Writes), Refused],
         ),
         (
             "",
             image("function() return ms.set_timer(1, 0) end"),
-            effect(Unsupported::HostApi(12)),
+            None,
+            vec![Replaced(Unsupported::Writes)],
         ),
         // A forbidden string operation.
         (
             "",
             image("function() return (\"\").x end"),
-            effect(Unsupported::Construct("index")),
+            None,
+            vec![Replaced(Unsupported::Construct("index"))],
         ),
         // A table comparison.
         (
             "",
             image("function() return {} == {} end"),
-            effect(Unsupported::Construct("table")),
+            None,
+            vec![Replaced(Unsupported::Construct("table"))],
         ),
         // `<close>` and a generic `for`.
         (
             "",
             image("function() local x <close> = nil return true end"),
-            effect(Unsupported::Construct("<close>")),
+            None,
+            vec![Replaced(Unsupported::Construct("<close>"))],
         ),
         (
             "",
             image("function() for k in pairs({}) do end return true end"),
-            effect(Unsupported::Construct("generic for")),
+            None,
+            vec![Replaced(Unsupported::Construct("generic for"))],
         ),
         // `_ENV` with a metatable; `skin_config.option` with one, or
         // without the raw entry.
         (
             &format!("{PROBE}\nsetmetatable(_ENV, {{ __index = function() probe() end }})"),
             image("function() return skin_config.option[\"x\"] == 1 end"),
-            effect(Unsupported::Capture("_ENV's metatable")),
+            None,
+            vec![Replaced(Unsupported::Capture("_ENV's metatable"))],
         ),
         (
             &format!(
                 "{PROBE}\nsetmetatable(skin_config.option, {{ __index = function() probe() return 1 end }})"
             ),
             image("function() return skin_config.option[\"x\"] == 1 end"),
-            effect(Unsupported::Capture("skin_config.option's metatable")),
+            None,
+            vec![Replaced(Unsupported::Capture(
+                "skin_config.option's metatable",
+            ))],
         ),
         (
             "",
             image("function() return skin_config.option[\"x\"] == 1 end"),
-            effect(Unsupported::Capture("an option entry")),
+            None,
+            vec![Replaced(Unsupported::Capture("an option entry"))],
         ),
         (
             "skin_config.option.x = \"1\"",
             image("function() return skin_config.option[\"x\"] == 1 end"),
-            effect(Unsupported::Capture("an option entry")),
+            None,
+            vec![Replaced(Unsupported::Capture("an option entry"))],
         ),
         // `skin_config` replaced.
         (
             "skin_config = { option = { x = 1 } }",
             image("function() return skin_config.option[\"x\"] == 1 end"),
-            effect(Unsupported::Capture("skin_config")),
+            None,
+            vec![Replaced(Unsupported::Capture("skin_config"))],
         ),
         // A float.
         (
             "",
             image("function() return ms.number(110) > 1.0 end"),
-            effect(Unsupported::Construct("float")),
+            None,
+            vec![Replaced(Unsupported::Construct("float"))],
         ),
     ] {
         let entry = skin(body, &dst);
-        assert_eq!(why(import(&entry)), want, "{body} / {dst}");
+        let (r, got) = outcome(&entry, &[]);
+        let why = match r {
+            Ok(()) => None,
+            Err(ImportError::Lua { why, .. }) => Some(why),
+            Err(e) => panic!("{body} / {dst}: {e:?}"),
+        };
+        assert_eq!((why, got), (want, callbacks), "{body} / {dst}");
     }
 }
 
 /// Chunk A of the capture proof's guard: `cfg` aliases `skin_config` at
 /// chunk level, and its helper `w` runs `body` at frame time, on line 3.
-fn writer_chunk(body: &str) -> String {
+pub(super) fn writer_chunk(body: &str) -> String {
     format!(
         "local cfg = skin_config\nlocal function w()\n  {body}\n  return true\nend\nreturn {{ w = w }}\n"
     )
@@ -237,7 +295,7 @@ fn writer_chunk(body: &str) -> String {
 
 /// Chunk B: binds A's export at construction; a decorative `draw` calls
 /// it, beside a critical gauge `draw` reading the option `x` (1).
-fn reader_entry() -> String {
+pub(super) fn reader_entry() -> String {
     skin(
         "local w = require(\"a\").w\nskin_config.option.x = 1",
         &format!(
@@ -246,36 +304,6 @@ fn reader_entry() -> String {
             gauge("function() return skin_config.option[\"x\"] == 1 end")
         ),
     )
-}
-
-#[test]
-fn a_frame_time_writer_of_the_option_path_refuses_before_any_fold() {
-    // `w` replaces `skin_config.option` through the alias: a later
-    // critical read would see another table, so the candidate refuses at
-    // admission, located at the assignment, and nothing is lowered.
-    LOWERED.with(|l| l.borrow_mut().clear());
-    let a = writer_chunk("cfg.option = { x = 2 }");
-    match run_with(&reader_entry(), &[("a.lua", &a)], &Cancel::new()) {
-        Err(ImportError::Lua { why, at: Some(at) }) => {
-            assert_eq!(why, LuaWhy::Effect(Unsupported::Construct("assignment")));
-            assert_eq!((at.file.as_str(), at.line), ("a.lua", 3));
-        }
-        other => panic!("{other:?}"),
-    }
-    assert!(LOWERED.with(|l| l.borrow().is_empty()));
-    // The same chain without the write: the critical reader lowers, the
-    // option folded.
-    LOWERED.with(|l| l.borrow_mut().clear());
-    let a = writer_chunk("");
-    let i = run_with(&reader_entry(), &[("a.lua", &a)], &Cancel::new()).unwrap();
-    assert_eq!(
-        i.callbacks[1],
-        super::Disposition::Lowered,
-        "{:?}",
-        i.callbacks
-    );
-    let lowered = LOWERED.with(|l| l.borrow().clone());
-    assert!(lowered.iter().any(|s| s == "true"), "{lowered:?}");
 }
 
 #[test]

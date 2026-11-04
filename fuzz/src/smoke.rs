@@ -1163,28 +1163,25 @@ fn skin_lua_seeds_import_or_fail_as_built() {
                     );
                 }
             }
-            "callback_lowered" | "callback_replaced" => {
-                use skin_beatoraja::lua::Disposition;
+            "callback_lowered" | "callback_replaced" | "callback_effect" => {
+                use skin_beatoraja::lua::{Disposition, Unsupported};
                 let (_, imported) = result.unwrap_or_else(|e| panic!("{name}: {e}"));
                 let i = imported_lua(imported).unwrap_or_else(|e| panic!("{name}: {e:?}"));
                 let want: &[Disposition] = match name {
                     "callback_lowered" => &[Disposition::Lowered, Disposition::Lowered],
-                    _ => &[Disposition::Replaced(
-                        skin_beatoraja::lua::Unsupported::Unmapped { api: 1, id: 425 },
-                    )],
+                    // A decorative writer never lowers.
+                    "callback_effect" => &[Disposition::Replaced(Unsupported::Writes)],
+                    _ => &[Disposition::Replaced(Unsupported::Unmapped {
+                        api: 1,
+                        id: 425,
+                    })],
                 };
                 assert_eq!(i.callbacks, want, "{name}");
             }
-            "callback_effect" | "host_write" => {
+            "host_write" => {
                 let (_, imported) = result.unwrap_or_else(|e| panic!("{name}: {e}"));
                 let e = imported_lua(imported).expect_err(name);
-                let want = match name {
-                    "callback_effect" => LuaWhy::Effect(
-                        skin_beatoraja::lua::Unsupported::Construct("call statement"),
-                    ),
-                    _ => LuaWhy::HostWrite,
-                };
-                assert_eq!(lua(&e), Some(want), "{name}");
+                assert_eq!(lua(&e), Some(LuaWhy::HostWrite), "{name}");
             }
             "lua_selection" | "slot_scene" | "slot_retype" => {
                 let (h, imported) = result.unwrap_or_else(|e| panic!("{name}: {e}"));
