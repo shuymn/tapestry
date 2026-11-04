@@ -7,14 +7,15 @@
 //! removed installation gives its charge back.
 //!
 //! "Big" is one generated cell, no file read, whose atlas array is exactly
-//! the shared limit; it is never uploaded: every case with it is refused
-//! before allocation or checked through `Renderer::admit`. "Tiny" is a
-//! 16×16 cell on one 256-texel page.
+//! the shared limit, built once for the whole binary; it is never
+//! uploaded: every case with it is refused before allocation or checked
+//! through `Renderer::admit`. "Tiny" is a 16×16 cell on one 256-texel
+//! page.
 
 mod common;
 mod decl_support;
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use bms_model::{ChartBuilder, TimeUs};
 use common::{GAUGES, attempt, context, input, offscreen, view};
@@ -22,7 +23,7 @@ use decl_support::{Look, solid_bundle};
 use render::{
     CommitError, PreparedToken, RenderError, Renderer, SHARED_TEXELS, SkinBundle, VM_TEXELS,
 };
-use skin_model::ScreenKind;
+use skin_model::{AtlasLimits, ScreenKind};
 
 /// Big's cell: past a 4 096-texel page with its gutter, so its one page
 /// is 8 192 texels a side, beside the reserved layer.
@@ -34,11 +35,23 @@ const GREEN: [u8; 4] = [0, 255, 0, 255];
 /// The left half's centre, where every fixture draws.
 const LEFT: (u32, u32) = (480, 540);
 
-/// Big: its atlas array is exactly [`SHARED_TEXELS`].
+/// Big: its atlas array is exactly [`SHARED_TEXELS`]. Built once for
+/// every test of this binary, on the first test's device (every test
+/// runs on WARP, whose atlas limits are the same), so its CPU pages are
+/// held once however many tests run at a time; no test commits it.
 fn big(r: &Renderer) -> Arc<SkinBundle> {
-    let b = solid_bundle(r, &Look::left([0, 0, 255, 255]), BIG);
+    static BIG_BUNDLE: OnceLock<(AtlasLimits, Arc<SkinBundle>)> = OnceLock::new();
+    let (limits, b) = BIG_BUNDLE.get_or_init(|| {
+        let b = solid_bundle(r, &Look::left([0, 0, 255, 255]), BIG);
+        (r.atlas_limits(), b)
+    });
+    assert_eq!(
+        *limits,
+        r.atlas_limits(),
+        "built for another device's limits"
+    );
     assert_eq!(b.atlas_texels(), SHARED_TEXELS);
-    b
+    Arc::clone(b)
 }
 
 /// Tiny of `rgba`, over the left half.
