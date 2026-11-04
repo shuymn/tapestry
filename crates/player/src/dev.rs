@@ -14,10 +14,10 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use audio::{AudioOutput, OutputError, RecordingOutput, SimConfig, SimDevice, Wake};
@@ -194,6 +194,85 @@ pub fn press_due(controls: &crate::controls::Controls, phase: LoadPhase) {
         controls.window_key(1, input::WindowKeyEvent::Press, false);
         controls.window_key(1, input::WindowKeyEvent::Release, false);
         println!("dev: F2 pressed while {phase:?}");
+    }
+}
+
+/// What a script does to the next pending play skin's specialization
+/// once its Lua executes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Specializing {
+    /// Press the quit key (`quit-specializing`).
+    Quit,
+    /// Close the window (`close-specializing`).
+    Close,
+    /// Hold every VM's destruction, press the quit key, and close the
+    /// window once the quit has waited past the stop bound
+    /// (`escalate-specializing`).
+    Escalate,
+}
+
+/// The specialization's script step armed, its steps' baseline, and when
+/// an escalation's quit was pressed.
+static SPECIALIZING: Mutex<Option<(Specializing, u64, Option<Instant>)>> = Mutex::new(None);
+
+/// Instruction hook steps past the job's start that show its Lua
+/// executing.
+const SPECIALIZING_STEPS: u64 = 20;
+
+/// Arms `s` for the next specialization.
+pub fn specializing(s: Specializing) {
+    *SPECIALIZING.lock().unwrap_or_else(PoisonError::into_inner) = Some((s, u64::MAX, None));
+}
+
+/// A specialization's job starts: an armed step counts the Lua's steps
+/// from here, and an escalation holds every VM's destruction.
+pub fn specialization_began() {
+    let mut armed = SPECIALIZING.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some((s, from, _)) = armed.as_mut() {
+        *from = skin_beatoraja::lua::vm_hooks::steps();
+        if *s == Specializing::Escalate {
+            skin_beatoraja::lua::vm_hooks::hold();
+        }
+    }
+}
+
+/// Acts on the armed step once the specialization's Lua executes, asked
+/// at each look of the job's wait.
+pub fn specialization_signal(controls: &crate::controls::Controls) {
+    let mut armed = SPECIALIZING.lock().unwrap_or_else(PoisonError::into_inner);
+    let Some((s, from, quit_at)) = armed.as_mut() else {
+        return;
+    };
+    if skin_beatoraja::lua::vm_hooks::steps() < from.saturating_add(SPECIALIZING_STEPS) {
+        return;
+    }
+    let quit = || {
+        controls.command(game::Command::Quit);
+        println!("dev: quit pressed while specializing");
+    };
+    let close = || {
+        controls.close();
+        println!("dev: closed while specializing");
+    };
+    match (*s, *quit_at) {
+        (Specializing::Quit, _) => {
+            quit();
+            *armed = None;
+        }
+        (Specializing::Close, _) => {
+            close();
+            *armed = None;
+        }
+        (Specializing::Escalate, None) => {
+            quit();
+            *quit_at = Some(Instant::now());
+        }
+        (Specializing::Escalate, Some(at)) => {
+            if at.elapsed() >= crate::imports::STOP_WAIT + Duration::from_millis(500) {
+                close();
+                *armed = None;
+            }
+        }
     }
 }
 
@@ -680,6 +759,10 @@ pub enum SelectStep {
     QuitLoading,
     /// Halfway through the next slow load, close the window.
     CloseLoading,
+    /// What the next pending play skin's specialization gets once its Lua
+    /// executes (`quit-specializing`, `close-specializing`,
+    /// `escalate-specializing`).
+    Specializing(Specializing),
     /// Every loudness measurement from here on holds this many
     /// milliseconds before its first block, stopped as a measurement is: a
     /// slow measurement, a load's or the background's.
@@ -808,7 +891,7 @@ impl SelectScript {
                 Some(("wait", f)) => Ok(SelectStep::Wait(f.to_owned())),
                 Some(("search", t)) => Ok(SelectStep::Search(t.to_owned())),
                 Some(("sleep", ms)) => ms.parse().map(SelectStep::Sleep).map_err(|_| {
-                    format!("{s} is not pick=, wait=, search=, sleep=, idle=, slow-load=, slow-measuring=, slow-decoding=, slow-preparing=, slow-chart-load=, press-loading=, hold-background, background=running, background=idle, enter, prev-preset, next-preset, drawn, back, retry, next, prev, close-measuring, quit-measuring, quit-decoding, quit-loading, close-loading or close")
+                    format!("{s} is not pick=, wait=, search=, sleep=, idle=, slow-load=, slow-measuring=, slow-decoding=, slow-preparing=, slow-chart-load=, press-loading=, hold-background, background=running, background=idle, enter, prev-preset, next-preset, drawn, back, retry, next, prev, close-measuring, quit-measuring, quit-decoding, quit-loading, close-loading, quit-specializing, close-specializing, escalate-specializing or close")
                 }),
                 Some(("idle", ms)) => ms
                     .parse()
@@ -852,10 +935,19 @@ impl SelectScript {
                 None if s == "quit-decoding" => Ok(SelectStep::QuitDecoding),
                 None if s == "quit-loading" => Ok(SelectStep::QuitLoading),
                 None if s == "close-loading" => Ok(SelectStep::CloseLoading),
+                None if s == "quit-specializing" => {
+                    Ok(SelectStep::Specializing(Specializing::Quit))
+                }
+                None if s == "close-specializing" => {
+                    Ok(SelectStep::Specializing(Specializing::Close))
+                }
+                None if s == "escalate-specializing" => {
+                    Ok(SelectStep::Specializing(Specializing::Escalate))
+                }
                 None if s == "hold-background" => Ok(SelectStep::HoldBackground),
                 None if s == "close" => Ok(SelectStep::Close),
                 _ => Err(format!(
-                    "{s} is not pick=, wait=, search=, sleep=, idle=, slow-load=, slow-measuring=, slow-decoding=, slow-preparing=, slow-chart-load=, press-loading=, hold-background, background=running, background=idle, enter, prev-preset, next-preset, drawn, back, retry, next, prev, close-measuring, quit-measuring, quit-decoding, quit-loading, close-loading or close"
+                    "{s} is not pick=, wait=, search=, sleep=, idle=, slow-load=, slow-measuring=, slow-decoding=, slow-preparing=, slow-chart-load=, press-loading=, hold-background, background=running, background=idle, enter, prev-preset, next-preset, drawn, back, retry, next, prev, close-measuring, quit-measuring, quit-decoding, quit-loading, close-loading, quit-specializing, close-specializing, escalate-specializing or close"
                 )),
             })
             .map(|step| step.map(|s| (s, None)))

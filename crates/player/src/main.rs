@@ -773,6 +773,7 @@ fn rig<'a>(
         audio,
         render,
         skin: render_side::SkinState::Ready,
+        pending: None,
         controls,
         clock,
         recorded: input_side::Recorded {
@@ -1144,9 +1145,12 @@ fn start_skins(
 /// startup ends it with nothing played.
 fn skins_then_chart(loaded: &mut Loaded, rig: &mut PlayerRig<'_>) -> anyhow::Result<()> {
     match start_skins(rig, loaded.settings(), imports::Launch::Direct) {
-        Ok(_) => game::live::run_chart(loaded, rig)
-            .map(|_| ())
-            .map_err(anyhow::Error::from),
+        Ok(started) => {
+            rig.pending = started.pending;
+            game::live::run_chart(loaded, rig)
+                .map(|_| ())
+                .map_err(anyhow::Error::from)
+        }
         Err(imports::StartupEnd::Closed) => Ok(()),
         Err(imports::StartupEnd::Failed(e)) => Err(e),
     }
@@ -1510,6 +1514,8 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
             if let Some(notice) = started.play {
                 rig.skin = render_side::SkinState::Refused(notice);
             }
+            // A pending play skin admits charts, each built for.
+            rig.pending = started.pending;
             if let (Some(notice), Some(sel)) = (started.notice, &mut rig.selection) {
                 sel.screen.set_notice(Some(notice));
             }

@@ -13,7 +13,6 @@ use skin_model::ScreenKind;
 /// `autoplay`: the play scene, autoplay known, the rank the play preset's
 /// header policy reads from the chart (as the evaluator judges with it),
 /// and the chart's play level parsed by [`level_of`].
-#[cfg_attr(not(test), expect(dead_code, reason = "activated by S10-07c-2"))]
 pub fn attempt_facts(loaded: &Loaded, autoplay: bool) -> ImportFacts {
     let read = loaded
         .preset()

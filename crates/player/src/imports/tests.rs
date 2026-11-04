@@ -1408,4 +1408,5 @@ fn the_reports_carry_text_only() {
     assert_eq!(shown, format!("スキンを使えません: {reason}"));
 }
 
+mod attempt;
 mod startup;

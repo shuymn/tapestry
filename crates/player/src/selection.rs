@@ -534,6 +534,7 @@ impl Selection {
                 Some(SelectStep::QuitLoading) => {
                     script.slow_load.get_or_insert_default().quit = true
                 }
+                Some(SelectStep::Specializing(s)) => crate::dev::specializing(s),
                 Some(SelectStep::CloseLoading) => {
                     script.slow_load.get_or_insert_default().close = true;
                 }
@@ -1001,7 +1002,7 @@ fn cancelled(controls: &crate::controls::Controls) -> bool {
 
 /// Shows the load's lines of `page` at `stage` on the play screen, and
 /// says so on the console; nothing without them.
-fn show_stage(render: &RenderLink, page: Option<&LoadingText>, stage: Stage) {
+pub(crate) fn show_stage(render: &RenderLink, page: Option<&LoadingText>, stage: Stage) {
     let Some(page) = page else {
         return;
     };
