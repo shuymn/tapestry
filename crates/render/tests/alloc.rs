@@ -63,7 +63,7 @@ use render::{
     SimpleSkin, SkinError, Sprite, SpriteBatch, Staging,
 };
 use rules::Judgment;
-use skin_model::{BuildError, ClipId, LaneView};
+use skin_model::{BuildError, ClipId, LaneView, TextImage, TextTable};
 
 struct Counting;
 
@@ -1092,11 +1092,13 @@ fn declarative_frames(chart: &Chart, taps: &[(u8, TimeUs)], overlay: &[&str], gl
         text: true,
         ..Look::left([255, 0, 0, 255])
     };
-    let (b, text) = bundle(&r, dir.path(), &look);
+    let (b, _) = bundle(&r, dir.path(), &look);
     let ctx = context(&GAUGES, false);
     let mut skin = DeclSkin::new(b.clone());
     skin.prepare(r.gpu(), &attempt(&r, chart, &ctx)).unwrap();
-    assert_eq!(text.unwrap().calls.load(Ordering::SeqCst), 1);
+    // The text element's line: frame 0, as a staging would attach one.
+    let line = TextImage::new(b.uvs().get(0).unwrap(), [0.0, 0.0, 1.0, 1.0], 1.0);
+    skin.attach_text(TextTable::new(vec![line])).unwrap();
     let (capacity, runs) = (skin.capacity(), skin.run_capacity());
     assert_eq!(capacity, 65);
     let mut staging = Staging::with_runs(capacity, runs, &skin.canvas([1920, 1080]));

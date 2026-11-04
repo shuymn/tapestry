@@ -25,31 +25,54 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use bms_model::{Chart, TimeUs};
 use eval::Section;
 use skin_model::{
-    Atlas, BitmapLines, BuildError, Canvas, ChartText, Layout, Loading, Page, Play, Side, Skin,
-    SkinFrame, TextSlots, TextTable, TextTableError, UvTable,
+    Atlas, BitmapLines, BuildError, Canvas, Layout, Loading, Page, Play, Side, Skin, SkinFrame,
+    TextRequest, TextSlots, TextTable, TextTableError, UvTable,
 };
+
+use crate::outline::{LineBounds, LineFit, LineLayout, TextResidency};
 
 use crate::projection::ClipTable;
 use crate::skin_atlas::{AtlasPages, PageLevels, RESERVED_LAYERS};
 use crate::{AttemptInput, FrameInput, Gpu, LoadingFrame, PlaySkin, SkinError, SpriteBatch};
 
-/// Prepares the rasterized text of one attempt: the installation seam a
-/// text producer plugs into (bitmap text needs none: the skin lays its
-/// lines out itself). It runs at the attempt's preparation, never in a
-/// frame, and its table is attached to the attempt's fresh `Play`.
+/// Lays out and rasterizes the lines of a skin's rasterized text: the
+/// installation seam a text producer plugs into ([`OutlineText`] in
+/// production; bitmap text needs none, the skin lays its lines out
+/// itself). It is pure: the renderer owns the cache, the placement, the
+/// upload and their failures, and calls it at an attempt's preparation,
+/// never in a frame.
+///
+/// [`OutlineText`]: crate::OutlineText
 pub trait AttemptText: Send + Sync + fmt::Debug {
-    /// The table of `chart`'s lines for `skin` on a `target`-pixel target,
-    /// one per text slot ([`Skin::text_slots`]), or `None` to attach none.
+    /// Shapes and fits `req` at `em_px` within `bounds`: no pixels.
+    fn layout(&self, req: &TextRequest, em_px: f32, bounds: LineBounds) -> LineFit;
+
+    /// Rasterizes `layout` into `out`: A8 coverage of `layout.size`, row
+    /// by row, zeroed by the caller.
     ///
     /// # Errors
     ///
-    /// Why the attempt's text cannot be prepared: the attempt is refused.
-    fn prepare(
-        &self,
-        skin: &Skin,
-        chart: &ChartText<'_>,
-        target: [u32; 2],
-    ) -> Result<Option<TextTable>, SkinError>;
+    /// Why the line cannot be rasterized: the preparation is refused.
+    fn raster(&self, layout: &LineLayout, out: &mut [u8]) -> Result<(), SkinError>;
+
+    /// The bytes it keeps resident: its font snapshots exactly.
+    fn resident(&self) -> TextResidency;
+}
+
+impl AttemptText for crate::OutlineText {
+    fn layout(&self, req: &TextRequest, em_px: f32, bounds: LineBounds) -> LineFit {
+        self.layout_line(req, em_px, bounds)
+    }
+
+    fn raster(&self, layout: &LineLayout, out: &mut [u8]) -> Result<(), SkinError> {
+        self.raster_line(layout, out).map_err(|e| SkinError {
+            reason: e.to_string(),
+        })
+    }
+
+    fn resident(&self) -> TextResidency {
+        self.residency()
+    }
 }
 
 /// Why a bundle was not made.
@@ -75,6 +98,9 @@ pub enum BundleError {
         /// The highest layer the pages fill after the reserved ones.
         end: u32,
     },
+    /// A text producer was given a bundle whose atlas has no text layer.
+    #[error("the atlas has no text layer for the skin's rasterized text")]
+    NoTextLayer,
     /// The skin's elements name more fixed clips than the table has.
     #[error("the skin draws under {referenced} clips, the table has {clips}")]
     Clips {
@@ -98,6 +124,8 @@ pub struct SkinBundle {
     uvs: UvTable,
     clips: ClipTable,
     scratch: Side,
+    /// The text layer after the pages, if the atlas has one.
+    text_layer: Option<u16>,
     text: Option<Arc<dyn AttemptText>>,
 }
 
@@ -132,6 +160,7 @@ impl SkinBundle {
         scratch: Side,
     ) -> Result<Self, BundleError> {
         let side = atlas.side();
+        let text_layer = atlas.text_layer();
         let (pages, uvs) = atlas.into_parts();
         if uvs.sheet_id() != skin.sheet().id() || uvs.frames().len() != skin.frame_count() {
             return Err(BundleError::Atlas {
@@ -149,6 +178,17 @@ impl SkinBundle {
                 return Err(BundleError::Layers { first, last, end });
             }
         }
+        if let Some(layer) = text_layer {
+            let pages = u32::try_from(pages.len()).unwrap_or(u32::MAX);
+            let after = RESERVED_LAYERS.saturating_add(pages);
+            if u32::from(layer) != after {
+                return Err(BundleError::Layers {
+                    first: layer,
+                    last: layer,
+                    end: after,
+                });
+            }
+        }
         let referenced = skin.clip_count();
         if referenced > clips.len() {
             return Err(BundleError::Clips {
@@ -163,15 +203,36 @@ impl SkinBundle {
             uvs,
             clips,
             scratch,
+            text_layer,
             text: None,
         })
     }
 
-    /// The same bundle with `text` preparing each attempt's text.
-    #[must_use]
-    pub fn with_text(mut self, text: Arc<dyn AttemptText>) -> Self {
+    /// The same bundle with `text` laying out and rasterizing its
+    /// attempts' text.
+    ///
+    /// # Errors
+    ///
+    /// [`BundleError::NoTextLayer`] when its atlas has no text layer
+    /// (`skin_model::Sheet::atlas_reserving`).
+    pub fn with_text(mut self, text: Arc<dyn AttemptText>) -> Result<Self, BundleError> {
+        if self.text_layer.is_none() {
+            return Err(BundleError::NoTextLayer);
+        }
         self.text = Some(text);
-        self
+        Ok(self)
+    }
+
+    /// The text layer after its pages, if its atlas has one.
+    #[must_use]
+    pub const fn text_layer(&self) -> Option<u16> {
+        self.text_layer
+    }
+
+    /// Its pages' side.
+    #[must_use]
+    pub const fn side(&self) -> u32 {
+        self.side
     }
 
     /// The producer of its attempts' and its loading frames' prepared
@@ -221,12 +282,15 @@ impl SkinBundle {
         upload(&AtlasPages {
             side: self.side,
             pages: &levels,
+            text_layer: self.text_layer.is_some(),
         })
     }
 
     /// The bytes it keeps resident on the CPU: every level of every page,
-    /// the uv table and the clip table. The compiled skin is shared with
-    /// whoever compiled it and counted there.
+    /// the uv table, the clip table and its text producer's skin font
+    /// snapshots. The compiled skin is shared with whoever compiled it and
+    /// counted there; the default font is shared by every producer and
+    /// counted once ([`MemoryWitness::default_font`](crate::MemoryWitness)).
     #[must_use]
     pub fn resident_bytes(&self) -> u64 {
         let levels: usize = self
@@ -237,7 +301,10 @@ impl SkinBundle {
             .sum();
         let uvs = size_of_val(self.uvs.frames());
         let clips = self.clips.len() * size_of::<[f32; 4]>();
-        u64::try_from(levels + uvs + clips).unwrap_or(u64::MAX)
+        let fonts = self.text.as_ref().map_or(0, |t| t.resident().skin_fonts);
+        u64::try_from(levels + uvs + clips)
+            .unwrap_or(u64::MAX)
+            .saturating_add(fonts)
     }
 }
 
@@ -572,6 +639,28 @@ impl DeclSkin {
         }
     }
 
+    /// Attaches the prepared attempt's rasterized lines, one per text
+    /// slot: the renderer's staging prepares them in its text layer
+    /// ([`Renderer::stage`](crate::Renderer::stage)); a skin drawn outside
+    /// a renderer takes its own.
+    ///
+    /// # Errors
+    ///
+    /// Without a prepared attempt, or for a table of another length.
+    pub fn attach_text(&mut self, table: TextTable) -> Result<(), SkinError> {
+        let Some(play) = &mut self.play else {
+            return Err(SkinError {
+                reason: "no attempt is prepared".to_owned(),
+            });
+        };
+        self.bundle
+            .skin
+            .attach_text(play, table)
+            .map_err(|e| SkinError {
+                reason: e.to_string(),
+            })
+    }
+
     /// Whether an attempt is prepared.
     #[must_use]
     pub const fn prepared(&self) -> bool {
@@ -580,8 +669,9 @@ impl DeclSkin {
 }
 
 impl PlaySkin for DeclSkin {
-    /// A fresh `Play` of the attempt, with its bitmap lines laid out and
-    /// its prepared text attached; the previous attempt's goes first, so
+    /// A fresh `Play` of the attempt, with its bitmap lines laid out; the
+    /// renderer prepares its rasterized text and attaches it
+    /// ([`DeclSkin::attach_text`]). The previous attempt's goes first, so
     /// a refusal leaves none.
     fn prepare(&mut self, _gpu: &Gpu, a: &AttemptInput<'_>) -> Result<(), SkinError> {
         self.play = None;
@@ -590,13 +680,6 @@ impl PlaySkin for DeclSkin {
             reason: e.to_string(),
         })?;
         skin.attach_bitmap_text(&mut play, a.text);
-        if let Some(text) = &self.bundle.text
-            && let Some(table) = text.prepare(skin, a.text, a.target)?
-        {
-            skin.attach_text(&mut play, table).map_err(|e| SkinError {
-                reason: e.to_string(),
-            })?;
-        }
         self.play = Some(play);
         Ok(())
     }

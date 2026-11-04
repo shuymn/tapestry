@@ -28,6 +28,8 @@ use crate::simple::{result_screen, text_screen};
 use crate::skin_atlas::{self, AtlasPages, AtlasTexture, UploadError};
 use crate::staging::{Scissor, Staging};
 use crate::text::MenuText;
+use crate::text_cache::{Holder, TextCache};
+use crate::text_upload::{self, TextReport, TextScratch};
 use crate::{
     AttemptInput, Blend, FrameInput, Instance, LoadingFrame, OVERLAY_SPRITES, PlaySkin, SimpleSkin,
     SkinError, SpriteBatch,
@@ -325,6 +327,8 @@ struct Resources {
     atlas_bind: wgpu::BindGroup,
     staging: Staging,
     instances: wgpu::Buffer,
+    /// The text layer's cache: empty with the atlas.
+    text_cache: TextCache,
 }
 
 /// An installation staged and not yet committed: the fresh skin with its
@@ -336,6 +340,9 @@ struct Pending {
     token: PreparedToken,
     skin: DeclSkin,
     resources: Option<Resources>,
+    /// The lines its attempt's table draws, in its resources' cache or the
+    /// installed one.
+    text: Holder,
 }
 
 /// What a renderer holds in memory for its play skin, in bytes, as a
@@ -375,6 +382,19 @@ pub struct MemoryWitness {
     /// The chosen chart's loading text prepared and waiting to install
     /// ([`Renderer::prepare_loading_text`]).
     pub staged_text: u64,
+    /// The default font, shared by every text producer: counted once, in
+    /// no bundle.
+    pub default_font: u64,
+    /// The text preparation's line and rectangle buffers.
+    pub text_scratch: u64,
+    /// The bytes the queue staged for the last text preparation's writes.
+    pub text_upload: u64,
+    /// The installed text layer's cache: its entries, aliases and the
+    /// installed attempt's holder.
+    pub text_cache: u64,
+    /// The staged resources' text cache, when they are new, and the staged
+    /// attempt's holder.
+    pub staged_text_cache: u64,
 }
 
 impl MemoryWitness {
@@ -393,6 +413,11 @@ impl MemoryWitness {
             .saturating_add(self.loading)
             .saturating_add(self.staged_loading)
             .saturating_add(self.staged_text)
+            .saturating_add(self.default_font)
+            .saturating_add(self.text_scratch)
+            .saturating_add(self.text_upload)
+            .saturating_add(self.text_cache)
+            .saturating_add(self.staged_text_cache)
     }
 }
 
@@ -518,6 +543,14 @@ pub struct Renderer {
     /// The batch, its staging copied into `instances` each frame, and the
     /// play skin's projection and clip scissors.
     staging: Staging,
+    /// The text layer's cache of the atlas in use.
+    text_cache: TextCache,
+    /// The lines the installed attempt's table draws.
+    installed_text: Holder,
+    /// The text preparation's buffers.
+    text_scratch: TextScratch,
+    /// What the last text preparation did.
+    text_report: TextReport,
     skin: Box<dyn PlaySkin>,
     /// The declarative installation in use, its bundle with its loading
     /// presentation; `None` for the simple skin or one set with
@@ -564,6 +597,9 @@ pub struct Renderer {
     /// allocation would: a unit test.
     #[cfg(test)]
     buffer_fault: bool,
+    /// A unit test's hooks into the text upload.
+    #[cfg(test)]
+    pub(crate) text_hooks: text_upload::Hooks,
 }
 
 impl Renderer {
@@ -642,6 +678,10 @@ impl Renderer {
             atlas_bind,
             instances,
             staging,
+            text_cache: TextCache::none(),
+            installed_text: Holder::default(),
+            text_scratch: TextScratch::default(),
+            text_report: TextReport::default(),
             skin,
             installed: None,
             committed: 0,
@@ -658,6 +698,8 @@ impl Renderer {
             atlas_fault: None,
             #[cfg(test)]
             buffer_fault: false,
+            #[cfg(test)]
+            text_hooks: text_upload::Hooks::default(),
             id: RENDERERS.fetch_add(1, Ordering::Relaxed),
         })
     }
@@ -765,6 +807,7 @@ impl Renderer {
         }
         self.skin = skin;
         self.installed = None;
+        self.installed_text = Holder::default();
         self.refused = None;
         self.loading_refused = None;
         self.project();
@@ -1006,13 +1049,47 @@ impl Renderer {
                 Some(self.resources_for(bundle)?),
             ),
         };
+        let mut resources = resources;
         let mut skin = DeclSkin::of(&installation);
+        let mut text = Holder::default();
         if let Some(a) = a {
             let a = AttemptInput {
                 target: self.target(),
                 ..*a
             };
             skin.prepare(&self.gpu, &a).map_err(RenderError::Skin)?;
+            if let Some(producer) = bundle.text_producer() {
+                // The staging's own resources, or the installed ones,
+                // whose installed attempt's lines stay.
+                let (atlas, cache, held) = match resources.as_mut() {
+                    Some(r) => (&r.atlas, &mut r.text_cache, None),
+                    None => (
+                        &self.atlas,
+                        &mut self.text_cache,
+                        Some(&self.installed_text),
+                    ),
+                };
+                let held: Vec<&Holder> = held.into_iter().collect();
+                let prepared = text_upload::prepare(
+                    text_upload::Prepare {
+                        gpu: &self.gpu,
+                        atlas,
+                        cache,
+                        scratch: &mut self.text_scratch,
+                        producer: producer.as_ref(),
+                        held: &held,
+                        #[cfg(test)]
+                        hooks: &mut self.text_hooks,
+                    },
+                    bundle.skin(),
+                    a.text,
+                    a.target,
+                );
+                let (table, holder, report) = prepared?;
+                self.text_report = report;
+                skin.attach_text(table).map_err(RenderError::Skin)?;
+                text = holder;
+            }
         }
         let token = PreparedToken {
             request,
@@ -1022,8 +1099,18 @@ impl Renderer {
             token,
             skin,
             resources,
+            text,
         });
+        #[cfg(test)]
+        self.text_hooks.steps.push(text_upload::Step::StageReturned);
         Ok(token)
+    }
+
+    /// What the last preparation of an attempt's rasterized text did: its
+    /// notes, counts, upload bytes and submission.
+    #[must_use]
+    pub const fn text_report(&self) -> &TextReport {
+        &self.text_report
     }
 
     /// The resources of `bundle`: a staging sized for its capacities with
@@ -1069,11 +1156,15 @@ impl Renderer {
         }
         staging.set_font_scale(atlas.font_scale());
         wait_for_gpu(&self.gpu)?;
+        let text_cache = bundle
+            .text_layer()
+            .map_or_else(TextCache::none, |layer| TextCache::new(atlas.side(), layer));
         Ok(Resources {
             atlas,
             atlas_bind,
             staging,
             instances: buffer,
+            text_cache,
         })
     }
 
@@ -1126,6 +1217,7 @@ impl Renderer {
         if let Some(r) = pending.resources {
             self.replace_resources(r);
         }
+        self.installed_text = pending.text;
         self.committed = token.request;
         self.activate_decl_skin(pending.skin);
         Ok(())
@@ -1152,6 +1244,7 @@ impl Renderer {
         self.atlas_bind = r.atlas_bind;
         self.staging = r.staging;
         self.instances = r.instances;
+        self.text_cache = r.text_cache;
         self.resources += 1;
     }
 
@@ -1175,6 +1268,7 @@ impl Renderer {
         self.pending = None;
         let r = self.resources_for(installation.bundle())?;
         self.replace_resources(r);
+        self.installed_text = Holder::default();
         self.activate_decl_skin(DeclSkin::of(installation));
         Ok(())
     }
@@ -1189,7 +1283,28 @@ impl Renderer {
             .map(|p| p.skin.installation())
             .filter(|s| !installed.is_some_and(|i| Arc::ptr_eq(i.bundle(), s.bundle())));
         let res = staged.and_then(|p| p.resources.as_ref());
+        let bytes = |n: usize| u64::try_from(n).unwrap_or(u64::MAX);
+        let default_font = [
+            installed.map(Installation::bundle),
+            staged.map(|p| p.skin.bundle()),
+        ]
+        .into_iter()
+        .flatten()
+        .filter_map(|b| b.text_producer())
+        .map(|t| t.resident().default_font)
+        .max()
+        .unwrap_or(0);
         MemoryWitness {
+            default_font,
+            text_scratch: self.text_scratch.bytes(),
+            text_upload: self.text_report.upload_bytes,
+            text_cache: self
+                .text_cache
+                .bytes()
+                .saturating_add(bytes(self.installed_text.bytes())),
+            staged_text_cache: res
+                .map_or(0, |r| r.text_cache.bytes())
+                .saturating_add(staged.map_or(0, |p| bytes(p.text.bytes()))),
             committed_cpu: installed.map_or(0, |i| i.bundle().resident_bytes()),
             staged_cpu: other.as_ref().map_or(0, |s| s.bundle().resident_bytes()),
             loading: installed.map_or(0, |i| i.loading().bytes()),
@@ -1486,10 +1601,9 @@ impl Renderer {
             return Ok(());
         };
         let bundle = installed.bundle();
-        let table = match bundle.text_producer() {
-            Some(text) => text.prepare(bundle.skin(), chart, self.target())?,
-            None => None,
-        };
+        // The rasterized loading lines come with their holders in the
+        // text layer; until then the staged text clears those slots.
+        let table = None;
         let bitmap = bundle.skin().loading_bitmap_lines(which, chart);
         self.staged_text = Some(StagedText {
             key,
@@ -1884,7 +1998,7 @@ fn finish_uploads(gpu: &Gpu) -> Result<(), RenderError> {
 }
 
 /// Waits until the GPU has done every submission, submitting nothing.
-fn wait_for_gpu(gpu: &Gpu) -> Result<(), RenderError> {
+pub(crate) fn wait_for_gpu(gpu: &Gpu) -> Result<(), RenderError> {
     gpu.device()
         .poll(wgpu::PollType::wait_indefinitely())
         .map(|_| ())
@@ -2306,6 +2420,7 @@ mod tests {
         let pages = AtlasPages {
             side: 256,
             pages: &[page],
+            text_layer: false,
         };
         r.atlas_fault = Some(|gpu| {
             let _ = gpu.device().create_buffer(&wgpu::BufferDescriptor {

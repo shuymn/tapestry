@@ -2,8 +2,9 @@
 //! all share one power-of-two side. Layer 0 is reserved for the built-in
 //! atlas (the bitmap font and the solid block, [`crate::atlas`]) at its top
 //! left; a skin's pages follow it, each with its four supplied mip levels
-//! (docs/stage3.md R7). Without a skin's pages the array is the built-in
-//! atlas alone, one 128-texel layer.
+//! (docs/stage3.md R7), then the skin's text layer, if it has one, created
+//! zeroed and written by the text preparation. Without a skin's pages the
+//! array is the built-in atlas alone, one 128-texel layer.
 //!
 //! Uploading is preparation work, never a frame's: the pages are checked
 //! against the device's limits and against themselves before anything is
@@ -33,6 +34,8 @@ pub struct AtlasPages<'a> {
     pub side: u32,
     /// The pages, in layer order.
     pub pages: &'a [PageLevels<'a>],
+    /// Whether a zeroed text layer follows the pages.
+    pub text_layer: bool,
 }
 
 /// Why a skin's atlas was not uploaded. The atlas in use stays.
@@ -47,7 +50,7 @@ pub enum UploadError {
         /// The device's largest texture side.
         max: u32,
     },
-    /// The pages and the reserved layer are more layers than the device's
+    /// The pages, the reserved layer and the text layer are more layers than the device's
     /// arrays hold, or than a sprite's 16-bit layer names.
     #[error("{layers} layers, past the device's {max}")]
     Layers {
@@ -127,7 +130,8 @@ pub(crate) fn check_pages(
     }
     let layers = u64::try_from(pages.pages.len())
         .unwrap_or(u64::MAX)
-        .saturating_add(u64::from(RESERVED_LAYERS));
+        .saturating_add(u64::from(RESERVED_LAYERS))
+        .saturating_add(u64::from(pages.text_layer));
     // A sprite names its layer in 16 bits.
     let max_layers = limits.max_texture_array_layers.min(1 << 16);
     let Some(layer_count) = u32::try_from(layers).ok().filter(|&n| n <= max_layers) else {
@@ -160,10 +164,13 @@ pub(crate) fn check_pages(
 /// The atlas texture array on the GPU.
 #[derive(Debug)]
 pub(crate) struct AtlasTexture {
+    texture: wgpu::Texture,
     view: wgpu::TextureView,
     side: u32,
     layers: u32,
     levels: u32,
+    /// The text layer, after the pages, if the array has one.
+    text_layer: Option<u32>,
 }
 
 impl AtlasTexture {
@@ -191,7 +198,9 @@ impl AtlasTexture {
                 write(gpu.queue(), &texture, layer, level, side >> level, bytes);
             }
         }
-        Self::of(&texture, side, layers, levels)
+        let mut atlas = Self::of(&texture, side, layers, levels);
+        atlas.text_layer = pages.text_layer.then(|| layers - 1);
+        atlas
     }
 
     fn of(texture: &wgpu::Texture, side: u32, layers: u32, levels: u32) -> Self {
@@ -201,11 +210,23 @@ impl AtlasTexture {
             ..wgpu::TextureViewDescriptor::default()
         });
         Self {
+            texture: texture.clone(),
             view,
             side,
             layers,
             levels,
+            text_layer: None,
         }
+    }
+
+    /// The array, for the text layer's writes.
+    pub(crate) const fn texture(&self) -> &wgpu::Texture {
+        &self.texture
+    }
+
+    /// The text layer, if the array has one.
+    pub(crate) const fn text_layer(&self) -> Option<u32> {
+        self.text_layer
     }
 
     /// The array's view, for the sprites' bind group.
@@ -243,7 +264,11 @@ impl AtlasTexture {
         let skin = (0..self.levels)
             .map(|k| padded(self.side >> k))
             .sum::<u64>();
-        padded(ATLAS_SIZE) + u64::from(self.layers.saturating_sub(RESERVED_LAYERS)) * skin
+        let pages = self
+            .layers
+            .saturating_sub(RESERVED_LAYERS)
+            .saturating_sub(u32::from(self.text_layer.is_some()));
+        padded(ATLAS_SIZE) + u64::from(pages) * skin
     }
 
     /// What layer 0's uv is multiplied by at staging: the built-in atlas's
@@ -328,6 +353,7 @@ mod tests {
         let some = |side, n: usize| AtlasPages {
             side,
             pages: &all[..n],
+            text_layer: false,
         };
         for side in [0, 64, 100, 129, 16_384] {
             assert!(
@@ -375,6 +401,7 @@ mod tests {
         let ok = AtlasPages {
             side: 256,
             pages: &pages,
+            text_layer: false,
         };
         assert_eq!(check_pages(&ok, &limits()).unwrap(), 3);
         let bad_page: PageLevels<'_> = [&l0, &l1, &l2, &short];
@@ -382,6 +409,7 @@ mod tests {
         let bad = AtlasPages {
             side: 256,
             pages: &pages,
+            text_layer: false,
         };
         assert!(matches!(
             check_pages(&bad, &limits()),
@@ -396,6 +424,7 @@ mod tests {
         let none = AtlasPages {
             side: 512,
             pages: &[],
+            text_layer: false,
         };
         assert_eq!(check_pages(&none, &limits()).unwrap(), 1);
     }
