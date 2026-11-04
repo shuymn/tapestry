@@ -2041,6 +2041,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "read-fonts"
+version = "0.42.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2c69341f5f744623061a258e9d06a0213783a89ec23b6efb88a1c0c4ed285559"
+dependencies = [
+ "bytemuck",
+ "font-types 0.12.7",
+ "once_cell",
+]
+
+[[package]]
 name = "realfft"
 version = "3.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2129,7 +2140,7 @@ dependencies = [
  "sha2",
  "skin-beatoraja",
  "skin-model",
- "skrifa 0.44.0",
+ "skrifa 0.45.1",
  "swash",
  "tempfile",
  "thiserror 2.0.21",
@@ -2461,6 +2472,16 @@ checksum = "819ab7d62b1d3e72d9d9dea5650bac30424f9111364bb94928dbf5ecad1baa68"
 dependencies = [
  "bytemuck",
  "read-fonts 0.41.0",
+]
+
+[[package]]
+name = "skrifa"
+version = "0.45.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dd5b090b1690f1c63a8659574ea987c557f1cc571e24dedcba89458f32d0ccb5"
+dependencies = [
+ "bytemuck",
+ "read-fonts 0.42.1",
 ]
 
 [[package]]
