@@ -6678,6 +6678,10 @@ pub(crate) mod tests {
         }
         fn remove(&mut self, kind: ScreenKind) {
             self.note(&format!("remove {kind:?}"));
+            while self.shared.hold_remove.load(Ordering::Acquire) {
+                self.shared.remove_held.store(true, Ordering::Release);
+                std::thread::sleep(Duration::from_millis(1));
+            }
             self.installed.clear(kind);
         }
         fn wait(&self) -> bool {
@@ -6758,6 +6762,10 @@ pub(crate) mod tests {
         hold_commit: Arc<AtomicBool>,
         /// Set once a commit waits on `hold_commit`.
         commit_held: Arc<AtomicBool>,
+        /// Removals wait, once noted, while set.
+        hold_remove: Arc<AtomicBool>,
+        /// Set once a removal waits on `hold_remove`.
+        remove_held: Arc<AtomicBool>,
         log: Log,
         /// Each restore that installed, with its kind, in order.
         restored: Arc<std::sync::Mutex<Vec<(ScreenKind, render::Installation)>>>,
@@ -7359,6 +7367,37 @@ pub(crate) mod tests {
             .filter(|s| s.contains("remove"))
             .collect();
         assert_eq!(removals, ["1 remove Selection"]);
+    }
+
+    /// A removal holds the commits' lock from its withdrawal check through
+    /// the removal, as a commit does: held inside the screen's removal,
+    /// the lock is taken, so a withdrawal either comes before the check
+    /// or finds the removal done.
+    #[test]
+    fn a_removal_holds_the_commits_lock() {
+        let chart = Arc::new(ChartBuilder::new(120_000).build().unwrap());
+        let (play, selection) = (bundle(), bundle());
+        let screens = Installers::default();
+        let link = screens.spawn(&chart, &play);
+        assert_eq!(
+            link.select(ScreenKind::Selection, Some(selection))
+                .wait()
+                .unwrap(),
+            Preparation::Ready
+        );
+        screens.hold_remove.store(true, Ordering::Release);
+        let pending = link.select(ScreenKind::Selection, None);
+        assert!(wait_until(|| screens.remove_held.load(Ordering::Acquire)));
+        // Looked at, then let go before asserting, so a failure never
+        // leaves the render thread held.
+        let held = matches!(
+            link.shared.commits.try_lock(),
+            Err(std::sync::TryLockError::WouldBlock)
+        );
+        screens.hold_remove.store(false, Ordering::Release);
+        assert!(held, "the commits' lock is free during the removal");
+        assert_eq!(pending.wait().unwrap(), Preparation::Ready);
+        link.exit();
     }
 
     /// No skin chosen for the selection screen, withdrawn while the render

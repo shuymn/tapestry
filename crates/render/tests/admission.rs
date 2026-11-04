@@ -328,3 +328,31 @@ fn another_kinds_staging_counts_its_own_presentation() {
     let again = r.memory();
     assert_eq!((again.staged_cpu, again.staged_loading), (0, 0));
 }
+
+/// A kind's committed bundle staged again and then removed cannot commit
+/// its token: the removal dropped the staging with the slot. Another
+/// kind's staging survives a removal and commits.
+#[test]
+fn a_removal_drops_only_its_kinds_staging() {
+    let mut r = offscreen(1_920, 1_080);
+    let green = tiny(&r, GREEN);
+    commit(&mut r, ScreenKind::Selection, &green, 1);
+    let token = r.install(ScreenKind::Selection, &green, 2).unwrap();
+    assert_eq!(r.memory().staged_atlas, 0, "the slot's resources reused");
+    r.remove(ScreenKind::Selection);
+    assert!(r.staged().is_none());
+    assert_eq!(r.commit(token), Err(CommitError::NothingStaged));
+    assert!(r.installed(ScreenKind::Selection).is_none());
+
+    commit(&mut r, ScreenKind::Selection, &green, 3);
+    let red = tiny(&r, RED);
+    let token = r.install(ScreenKind::Decision, &red, 4).unwrap();
+    r.remove(ScreenKind::Selection);
+    assert_eq!(r.staged(), Some(token));
+    r.commit(token).unwrap();
+    assert!(Arc::ptr_eq(
+        r.installed(ScreenKind::Decision).unwrap(),
+        &red
+    ));
+    assert!(r.installed(ScreenKind::Selection).is_none());
+}
