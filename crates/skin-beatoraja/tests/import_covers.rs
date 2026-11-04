@@ -914,6 +914,57 @@ fn a_cropped_cover_is_its_own_image_of_the_same_file() {
     }
 }
 
+/// The texels SUDDEN+'s paint over [20, 560, 80, 320] samples at 1 000 ‰
+/// in `l` (`a.png` painted with [`common::coord`] first: the import reads
+/// its header, the atlas its texels): its top and bottom rows at u 0.1
+/// and 0.9.
+fn edge_paint(l: &Loaded) -> Vec<[u8; 4]> {
+    common::png_with(l.dir.path(), "a.png", 64, 256, common::coord);
+    let skin = l.ok().skin.clone();
+    let atlas = skin
+        .atlas(skin_model::Variant::Lo, common::play::LIMITS, &|| false)
+        .unwrap();
+    let chart = ChartBuilder::new(150_000)
+        .tap(Lane::new(1).unwrap(), TimeUs(5_000 * MS))
+        .build()
+        .unwrap();
+    let mut d = Drawn::over(skin, &chart);
+    d.view.cover = 1_000;
+    let q: Vec<_> = d
+        .frame(1_000, &[])
+        .into_iter()
+        .filter(|q| q.rect == [20.0, 560.0, 80.0, 320.0])
+        .collect();
+    assert_eq!(q.len(), 1);
+    let ends = [(0.1, 0.01), (0.9, 0.01), (0.1, 0.99), (0.9, 0.99)];
+    ends.iter()
+        .map(|&(u, v)| common::play::texel_at(&atlas, &q[0], u, v))
+        .collect()
+}
+
+#[test]
+fn a_trimmed_cover_past_the_edge_crops_its_cells_rows() {
+    // An 8×64 frame past a.png's right edge (64×256) fit to 80 would be
+    // 640 high: stretch 5 keeps the 320 px destination and the cell's
+    // middle 32 rows (16 to 47) of the edge column, whether the
+    // uncropped image was added before, after or not at all.
+    let frame = r#"{"id": "ce", "src": "a", "x": 64, "y": 0, "w": 8, "h": 64}"#;
+    let paint = stretched("ce", 5).replace(r#""w": 430, "h": 600"#, r#""w": 80, "h": 320"#);
+    let plain = r#"{"id": "ce", "dst": [{"x": 0, "y": 0, "w": 10, "h": 10}]}"#;
+    let want = [16, 16, 47, 47].map(|y| common::coord(63, y));
+    for dsts in [vec![&*paint], vec![plain, &paint], vec![&paint, plain]] {
+        let l = tall(frame, &dsts);
+        assert!(!has(l.report(), NoteKind::SourceRect), "{dsts:?}");
+        assert_eq!(edge_paint(&l), want, "{dsts:?}");
+    }
+    // A frame cut to the file's last row has no rows to crop.
+    let below = frame.replace(r#""x": 64, "y": 0"#, r#""x": 0, "y": 256"#);
+    assert_eq!(
+        critical(tall(&below, &[&paint])),
+        (CriticalPart::Cover, NoteKind::SourceRect)
+    );
+}
+
 #[test]
 fn other_stretches_refuse_the_covers() {
     // SUDDEN+'s and LIFT's paint refuse the other trimming stretches and

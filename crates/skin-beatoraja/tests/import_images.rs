@@ -510,6 +510,93 @@ fn mirrored_or_outside_source_rects() {
     }
 }
 
+/// The quads at `ms` of `l`, its `a.png` painted with [`common::coord`]
+/// first (the import reads the file's header, the atlas its texels), each
+/// with its atlas texel at `(fu, fv)`.
+fn painted_at(l: common::Loaded, ms: i64, at: &[(f32, f32)]) -> Vec<Vec<[u8; 4]>> {
+    common::png_with(l.dir.path(), "a.png", 64, 64, common::coord);
+    let skin = l.ok().skin.clone();
+    let atlas = skin
+        .atlas(skin_model::Variant::Lo, common::play::LIMITS, &|| false)
+        .unwrap();
+    l.quads(ms)
+        .iter()
+        .map(|q| {
+            at.iter()
+                .map(|&(fu, fv)| common::play::texel_at(&atlas, q, fu, fv))
+                .collect()
+        })
+        .collect()
+}
+
+/// A single frame lying wholly at or past the file's right or bottom edge
+/// is that edge's last column or row, which the source's texture,
+/// clamped to its edge, samples (`JsonSkinObjectLoader.java:601-621`,
+/// libGDX 1.9.9 `GLTexture` defaults): each row (column) of the line
+/// kept, the same across the frame, with no note.
+#[test]
+fn a_frame_past_the_edge_draws_the_edge_line() {
+    let c = common::coord;
+    // Rows 0, 31 and 63 sampled at u 0.1 and 0.9.
+    let rows: Vec<(f32, f32)> = [0.5, 31.5, 63.5]
+        .iter()
+        .flat_map(|r| [(0.1, r / 64.0), (0.9, r / 64.0)])
+        .collect();
+    for x in [64, 100] {
+        let l = cut(&format!(r#""x": {x}, "w": 8, "h": 64"#), "");
+        assert!(l.report().notes.is_empty(), "{x}: {:?}", l.report());
+        let want = [0, 0, 31, 31, 63, 63].map(|y| c(63, y));
+        assert_eq!(painted_at(l, 0, &rows), [want.to_vec()], "x {x}");
+    }
+    let columns: Vec<(f32, f32)> = rows.iter().map(|&(v, u)| (u, v)).collect();
+    for y in [64, 100] {
+        let l = cut(&format!(r#""y": {y}, "w": 64, "h": 8"#), "");
+        assert!(l.report().notes.is_empty(), "{y}: {:?}", l.report());
+        let want = [0, 0, 31, 31, 63, 63].map(|x| c(x, 63));
+        assert_eq!(painted_at(l, 0, &columns), [want.to_vec()], "y {y}");
+    }
+    // Several frames on the clamped axis: one column of four row frames
+    // each samples its own quarter of the edge column.
+    let ends = [(0.1, 0.1), (0.9, 0.1), (0.1, 0.9), (0.9, 0.9)];
+    for frame in 0..4 {
+        let l = cut(
+            r#""x": 64, "w": 8, "h": 64, "divy": 4, "timer": 41, "cycle": 400"#,
+            "",
+        );
+        assert!(l.report().notes.is_empty(), "{:?}", l.report());
+        let top = 16 * frame;
+        let want = [top + 1, top + 1, top + 14, top + 14].map(|y| c(63, y));
+        assert_eq!(
+            painted_at(l, i64::from(frame) * 100 + 50, &ends),
+            [want.to_vec()],
+            "frame {frame}"
+        );
+    }
+}
+
+/// A frame past the edge whose coordinates leave the source's `int`
+/// sums, where its uvs wrap and it draws no edge line, or one of several
+/// frames on the axis it leaves, stays a dropped source rectangle.
+#[test]
+fn past_edge_cuts_the_source_cannot_clamp_drop() {
+    for src in [
+        r#""x": 64, "w": 2147483647, "h": 64"#,
+        r#""x": 2147483640, "w": 16, "h": 64"#,
+        r#""y": 64, "w": 64, "h": 2147483647"#,
+        r#""y": 2147483640, "w": 64, "h": 16"#,
+        r#""x": 64, "w": 16, "h": 64, "divx": 2"#,
+        r#""y": 64, "w": 64, "h": 16, "divy": 2"#,
+    ] {
+        let loaded = cut(src, "");
+        assert_eq!(
+            common::kinds(loaded.report()),
+            [NoteKind::SourceRect],
+            "{src}"
+        );
+        assert!(loaded.quads(0).is_empty(), "{src}");
+    }
+}
+
 /// An element drawn only under the mouse is dropped, and refuses a
 /// critical one (`SkinObject.java:603-607`): the play has no mouse.
 #[test]

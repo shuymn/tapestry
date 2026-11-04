@@ -149,6 +149,19 @@ pub fn padded(text: &str, len: usize) -> Vec<u8> {
 
 /// A `w`×`h` PNG of opaque texels at `root/name`.
 pub fn png(root: &Path, name: &str, w: u32, h: u32) {
+    png_with(root, name, w, h, |_, _| [255; 4]);
+}
+
+/// A texel naming its own place, for files up to 256×256: column `x` in
+/// red, row `y` in green.
+pub fn coord(x: u32, y: u32) -> [u8; 4] {
+    let byte = |v: u32| u8::try_from(v).unwrap();
+    [byte(x), byte(y), 90, 255]
+}
+
+/// A `w`×`h` PNG at `root/name` whose texel at column `x`, row `y` (from
+/// the top) is `texel(x, y)`.
+pub fn png_with(root: &Path, name: &str, w: u32, h: u32, texel: impl Fn(u32, u32) -> [u8; 4]) {
     let path = root.join(name);
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     let file = fs::File::create(path).unwrap();
@@ -156,8 +169,11 @@ pub fn png(root: &Path, name: &str, w: u32, h: u32) {
     enc.set_color(png::ColorType::Rgba);
     enc.set_depth(png::BitDepth::Eight);
     let mut w8 = enc.write_header().unwrap();
-    let texels = usize::try_from(w * h).unwrap();
-    w8.write_image_data(&[255_u8].repeat(texels * 4)).unwrap();
+    let data: Vec<u8> = (0..h)
+        .flat_map(|y| (0..w).map(move |x| (x, y)))
+        .flat_map(|(x, y)| texel(x, y))
+        .collect();
+    w8.write_image_data(&data).unwrap();
 }
 
 /// A 24-bit BMP header declaring `w`×`h` with no pixels behind it: the
