@@ -13,10 +13,13 @@
 //! used once.
 //!
 //! Everything is read as text, line by line: design.md's headings (outside
-//! code fences), the contract section's bullets, the threat table, and the
+//! code fences, each closed by its own marker), the contract section's
+//! bullets, the threat table (rows indented up to three spaces), and the
 //! cited files. A cited `fn` is not proven to be compiled: one inside a
 //! raw string, a macro never invoked or a `cfg` that removes it still
-//! counts. CI building and running the tests covers those.
+//! counts. A citation names a file, not a module path, and an attribute
+//! spelled unusually (`#[ignore/* c */]`) is not recognized. CI building
+//! and running the tests, and review, cover those.
 
 use std::collections::BTreeMap;
 use std::io;
@@ -59,17 +62,43 @@ struct Heading<'a> {
     text: &'a str,
 }
 
-/// The ATX headings outside code fences.
+/// `line` without the up to three spaces of indentation a block may have.
+fn unindent(line: &str) -> &str {
+    let spaces = line.bytes().take(4).take_while(|&b| b == b' ').count();
+    line.get(spaces.min(3)..).unwrap_or(line)
+}
+
+/// A code fence line's marker and its length: three or more backticks or
+/// tildes.
+fn fence(line: &str) -> Option<(u8, usize)> {
+    let line = unindent(line);
+    let marker = *line
+        .as_bytes()
+        .first()
+        .filter(|&&b| b == b'`' || b == b'~')?;
+    let len = line.bytes().take_while(|&b| b == marker).count();
+    (len >= 3).then_some((marker, len))
+}
+
+/// The ATX headings outside code fences. A fence closes on a line of its
+/// own marker, at least as long as the opening one and nothing after it.
 fn headings<'a>(lines: &[&'a str]) -> Vec<Heading<'a>> {
     let mut out = Vec::new();
-    let mut fenced = false;
+    let mut open: Option<(u8, usize)> = None;
     for (line, text) in lines.iter().enumerate() {
-        let trimmed = text.trim_start();
-        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-            fenced = !fenced;
+        if let Some((marker, len)) = open {
+            let closes = fence(text).is_some_and(|(m, l)| {
+                m == marker
+                    && l >= len
+                    && unindent(text).get(l..).is_some_and(|r| r.trim().is_empty())
+            });
+            if closes {
+                open = None;
+            }
             continue;
         }
-        if fenced {
+        if let Some(f) = fence(text) {
+            open = Some(f);
             continue;
         }
         let level = text.bytes().take_while(|&b| b == b'#').count();
@@ -132,7 +161,10 @@ fn check_clause(
     diags: &mut Vec<String>,
 ) {
     let at = at(line);
-    if !clause.contains("SHALL") {
+    if !clause
+        .split(|c: char| !c.is_alphanumeric() && c != '_')
+        .any(|word| word == "SHALL")
+    {
         diags.push(format!("{at}: the clause has no SHALL"));
     }
     let Some((claim, spec)) = clause.split_once("Spec:") else {
@@ -305,8 +337,8 @@ fn threats(lines: &[&str], headings: &[Heading], diags: &mut Vec<String>) {
         diags.push(format!("{DESIGN}: no \"### {THREATS}\" section"));
         return;
     };
-    let Some(table) = (start..stop).find(|&i| lines.get(i).is_some_and(|l| l.starts_with('|')))
-    else {
+    let is_row = |i: usize| lines.get(i).is_some_and(|l| unindent(l).starts_with('|'));
+    let Some(table) = (start..stop).find(|&i| is_row(i)) else {
         diags.push(format!("{DESIGN}: no table under \"### {THREATS}\""));
         return;
     };
@@ -326,7 +358,7 @@ fn threats(lines: &[&str], headings: &[Heading], diags: &mut Vec<String>) {
     }
     let mut seen: BTreeMap<&str, usize> = BTreeMap::new();
     // The header and its separator row come first.
-    let rows = (table + 2..stop).take_while(|&i| lines.get(i).is_some_and(|l| l.starts_with('|')));
+    let rows = (table + 2..stop).take_while(|&i| is_row(i));
     for i in rows {
         let id = first_cell(i).unwrap_or_default();
         let well_formed = id
@@ -596,5 +628,44 @@ fn with_a_long_attribute() {}
         assert_eq!(run(&edited, SOURCE), Vec::<String>::new());
         let source = SOURCE.replace("fn helper() {}", "fn helper() {}\n    fn other() {}");
         assert_eq!(run(DESIGN, &source), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_fence_closes_only_on_its_own_marker() {
+        // A tilde fence holding a backtick line: the fence ends at the tilde line.
+        let tilde = design_with(
+            "The watermark prose.",
+            "The watermark prose.\n\n~~~md\n```\n~~~",
+        );
+        assert_eq!(run(&tilde, SOURCE), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_heading_inside_a_longer_fence_is_not_a_heading() {
+        let hidden = design_with(
+            "The watermark prose.",
+            "The watermark prose.\n\n````md\n```\n## Hidden\n```\n````",
+        );
+        let hidden = hidden.replace("once (\"Watermark\")", "once (\"Hidden\")");
+        assert_eq!(
+            run(&hidden, SOURCE),
+            ["docs/design.md:30: \"Hidden\" is not a design.md heading"]
+        );
+    }
+
+    #[test]
+    fn an_indented_threat_row_is_still_checked() {
+        assert_eq!(
+            run(&design_with("| T02 |", "  |  |"), SOURCE),
+            ["docs/design.md:16: the threat row has no ID"]
+        );
+    }
+
+    #[test]
+    fn shall_counts_only_as_a_whole_word() {
+        assert_eq!(
+            run(&design_with("SHALL judge", "SHALLOW judges"), SOURCE),
+            [format!("{FIRST}: the clause has no SHALL")]
+        );
     }
 }
