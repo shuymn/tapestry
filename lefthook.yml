@@ -19,6 +19,10 @@ pre-commit:
     alloc-tests:
       glob: "{.github/workflows/ci.yml,**/tests/**/*.rs,**/Cargo.toml}"
       run: mise exec -- cargo xtask check-alloc-tests
+    # A contract clause, a threat ID or a cited test changed.
+    contract:
+      glob: "{docs/design.md,crates/**/*.rs}"
+      run: mise exec -- cargo xtask check-contract
     shellcheck:
       glob: "**/*.sh"
       run: mise exec -- shellcheck {staged_files}

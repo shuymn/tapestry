@@ -508,6 +508,9 @@ jobs:
       # Each allocation guard also runs in a release step above.
       - name: Allocation tests in release steps
         run: mise exec -- cargo xtask check-alloc-tests
+      # Docs-only changes too: a clause and its tests change together.
+      - name: Contract index
+        run: mise exec -- cargo xtask check-contract
       - name: actionlint
         run: mise exec -- actionlint
       - name: shellcheck
