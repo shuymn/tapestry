@@ -173,7 +173,8 @@ pub enum LuaWhy {
     /// A table key that is neither a string nor an integer, or a table the
     /// conversion cannot read.
     Key,
-    /// A table with both string and integer keys.
+    /// A table with string keys and others where an array, a condition
+    /// or a choice branch is read.
     Mixed,
     /// A table of integer keys other than `1..=n`.
     Sparse,
@@ -278,7 +279,7 @@ impl fmt::Display for LuaWhy {
             Self::FactArgument => f.write_str("a host API's argument is not an integer id"),
             Self::Returned => f.write_str("the skin returned no table"),
             Self::Key => f.write_str("a table key that is not a string or an integer"),
-            Self::Mixed => f.write_str("a table with string and integer keys"),
+            Self::Mixed => f.write_str("a table with string and other keys where an array is read"),
             Self::Sparse => f.write_str("an array with holes"),
             Self::Cycle => f.write_str("a table inside itself"),
             Self::Value => f.write_str("an unsupported Lua value"),

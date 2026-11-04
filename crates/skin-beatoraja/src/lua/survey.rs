@@ -463,14 +463,17 @@ mod tests {
 
     #[test]
     fn a_converted_value_is_located_by_its_ordinal() {
-        let d = folder(&[("s.luaskin", "return { type = 0, extra = { 1, x = 2 } }")]);
+        let d = folder(&[(
+            "s.luaskin",
+            "return { type = 0, extra = { [1] = 1, [3] = 2 } }",
+        )]);
         let s = survey(
             d.path(),
             "s.luaskin",
             &ImportFacts::unavailable(ScreenKind::Play),
             &Cancel::new(),
         );
-        assert_eq!(s.outcome, "header lua Mixed");
+        assert_eq!(s.outcome, "header lua Sparse");
         let (module, line, col) = s.at.unwrap();
         assert_eq!((module, line), (0, 0));
         assert!(col > 1, "{col}");
