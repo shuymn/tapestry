@@ -84,7 +84,7 @@ wgpu-hal = { version = "30.0.1", features = ["dx12"] }
 glyphon = "0.12.0"
 # render: play text outlines and their rasterizer, the versions cosmic-text
 # 0.19 itself uses, and the face checks at installation.
-skrifa = "0.44.0"
+skrifa = "0.48.0"
 swash = "0.2.10"
 unicode-script = "0.5.8"
 
