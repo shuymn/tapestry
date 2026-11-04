@@ -17,8 +17,11 @@
 //! require them and keep their functions, which its per-frame functions
 //! call; a call during import reads live play state, or acts on files,
 //! the network or audio, none of which an import may, and is refused
-//! rather than answered with an invented value; only `main_state.option`
-//! answers the import facts of the pass's snapshot ([`super::facts`]).
+//! rather than answered with an invented value; only `main_state.option`,
+//! `main_state.number` and `main_state.text` answer, from the import facts
+//! of the pass's snapshot and the scene's constants ([`super::facts`]).
+//! These three return a status into Lua, never a Rust error, and are
+//! counted as host calls like every other.
 //! There each module is read-only: the skin gets an empty proxy whose `__index` is the
 //! module's table, out of the skin's reach, and whose `__newindex`
 //! refuses the write as a fault ([`LuaWhy::HostWrite`]), whatever local
@@ -30,7 +33,7 @@
 
 use mlua::{Lua, MultiValue, Table, Value};
 
-use super::facts::{self, OptionRead};
+use super::facts::{self, NumberRead, OptionRead, TextRead};
 use super::{LuaWhy, Pass, host};
 
 /// The host API functions, by module: what a report names, and what a
@@ -105,6 +108,24 @@ pub const HOST_APIS: [(&str, &str); 65] = [
 
 /// `main_state.option`'s index in [`HOST_APIS`].
 const OPTION: u16 = 0;
+/// `main_state.number`'s index in [`HOST_APIS`].
+const NUMBER: u16 = 1;
+/// `main_state.text`'s index in [`HOST_APIS`].
+const TEXT: u16 = 3;
+
+/// A host API's argument as an import fact's id: a Lua integer within
+/// `i32` (the integer subtype: `33.0` and `"33"` are not), or a refusal,
+/// fatal and located, labelled `<api> argument`.
+fn fact_id(lua: &Lua, pass: &Pass, args: &MultiValue, api: &str) -> mlua::Result<i32> {
+    let n = match args.front() {
+        Some(Value::Integer(n)) => i32::try_from(*n).ok(),
+        _ => None,
+    };
+    n.ok_or_else(|| {
+        pass.count_fact(|| format!("{api} argument"));
+        pass.ledger.fail_lua(lua, LuaWhy::FactArgument)
+    })
+}
 
 /// `main_state.option(n)` during the configured pass: an import fact from
 /// the pass's snapshot ([`facts::option`]), recorded on its first read;
@@ -114,14 +135,7 @@ const OPTION: u16 = 0;
 /// the snapshot has unavailable and a built-in that is not a fact. A fact
 /// the snapshot has pending stops the pass by the same fatal path.
 fn option(lua: &Lua, pass: &Pass, args: MultiValue) -> mlua::Result<bool> {
-    let n = match args.front() {
-        Some(Value::Integer(n)) => i32::try_from(*n).ok(),
-        _ => None,
-    };
-    let Some(n) = n else {
-        pass.count_fact(|| "option argument".to_owned());
-        return Err(pass.ledger.fail_lua(lua, LuaWhy::FactArgument));
-    };
+    let n = fact_id(lua, pass, &args, "option")?;
     let Some(snapshot) = &pass.facts else {
         return Err(pass.ledger.fail_lua(lua, LuaWhy::LiveState { api: OPTION }));
     };
@@ -159,6 +173,61 @@ fn option(lua: &Lua, pass: &Pass, args: MultiValue) -> mlua::Result<bool> {
     }
 }
 
+/// `main_state.number(n)` during the configured pass: the play level, an
+/// import fact ([`facts::number`]), answered and recorded on its first
+/// read, or ending the pass pending, or refused when unavailable; every
+/// other id reads play state, refused. An argument that is not an
+/// integer within `i32` refuses ([`LuaWhy::FactArgument`]). Every refusal
+/// is fatal and located, as `option`'s.
+fn number(lua: &Lua, pass: &Pass, args: MultiValue) -> mlua::Result<i64> {
+    let n = fact_id(lua, pass, &args, "number")?;
+    let Some(snapshot) = &pass.facts else {
+        return Err(pass.ledger.fail_lua(lua, LuaWhy::LiveState { api: NUMBER }));
+    };
+    match facts::number(snapshot, n) {
+        NumberRead::Fact { value, read } => {
+            pass.count_fact(|| format!("number {n} read"));
+            pass.read_fact(read);
+            Ok(i64::from(value))
+        }
+        NumberRead::Pending(fact) => {
+            pass.count_fact(|| format!("number {n} pending"));
+            Err(pass.ledger.pending(fact))
+        }
+        NumberRead::Unavailable => {
+            pass.count_fact(|| format!("number {n} unavailable"));
+            Err(pass
+                .ledger
+                .fail_lua(lua, LuaWhy::Unavailable { api: NUMBER, id: n }))
+        }
+        NumberRead::LiveState => {
+            pass.count_fact(|| format!("number {n} live state"));
+            Err(pass.ledger.fail_lua(lua, LuaWhy::LiveState { api: NUMBER }))
+        }
+    }
+}
+
+/// `main_state.text(n)` during the configured pass: a scene's constant
+/// ([`facts::text`]), a string made in the VM under its memory cap and
+/// recorded nowhere; every other id reads play state, refused. Its
+/// argument is checked as `number`'s.
+fn text(lua: &Lua, pass: &Pass, args: MultiValue) -> mlua::Result<mlua::LuaString> {
+    let n = fact_id(lua, pass, &args, "text")?;
+    let Some(snapshot) = &pass.facts else {
+        return Err(pass.ledger.fail_lua(lua, LuaWhy::LiveState { api: TEXT }));
+    };
+    match facts::text(snapshot, n) {
+        TextRead::Constant(s) => {
+            pass.count_fact(|| format!("text {n} constant"));
+            lua.create_string(s)
+        }
+        TextRead::LiveState => {
+            pass.count_fact(|| format!("text {n} live state"));
+            Err(pass.ledger.fail_lua(lua, LuaWhy::LiveState { api: TEXT }))
+        }
+    }
+}
+
 /// The host modules' names.
 pub(super) const MODULES: [&str; 3] = ["main_state", "timer_util", "event_util"];
 
@@ -192,6 +261,10 @@ pub(super) fn install(lua: &Lua, pass: &std::rc::Rc<Pass>) -> mlua::Result<()> {
             }
             let f = if index == OPTION {
                 host(lua, pass, 1, option)?
+            } else if index == NUMBER {
+                host(lua, pass, 1, number)?
+            } else if index == TEXT {
+                host(lua, pass, 1, text)?
             } else {
                 host(lua, pass, 0, move |lua, pass, _| -> mlua::Result<()> {
                     Err(pass.ledger.fail_lua(lua, LuaWhy::LiveState { api: index }))

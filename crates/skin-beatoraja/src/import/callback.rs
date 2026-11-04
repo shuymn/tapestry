@@ -21,8 +21,11 @@
 //! - `gauge_type() == k` and `~=`: `gauge.kind` against the look `k`
 //!   selects (0 to 5, `assist_easy` to `hazard`; any other `k` matches no
 //!   look), under `gauge.valid`, as JSON's gauge conditions;
-//! - `skin_config.option["name"] == k`, decorative callbacks only: its
-//!   captured value, folded.
+//! - `skin_config.option["name"] == k`, in any callback: its captured
+//!   value, folded under the capture proof (the raw path and the final
+//!   integer entry checked at the read, noninterference by admission,
+//!   [`crate::lua::callback`]), so lowering takes its analysis only
+//!   through the [`Admitted`] witness.
 //!
 //! Helpers are inlined, each call charged its expanded size before it is
 //! expanded ([`MAX_EXPANDED_NODES`]), and locals inlined where they are
@@ -52,7 +55,8 @@ use super::timer::{Custom, Timer};
 use super::{Cx, Prop};
 use crate::error::ImportError;
 use crate::lua::callback::{
-    Analysis, Callee, Captured, Disposition, Ty, fatal as sentinel, numeral, resolve_callee, tree,
+    Admitted, Analysis, Callee, Captured, Disposition, Ty, fatal as sentinel, numeral,
+    resolve_callee, tree,
 };
 use crate::lua::limits::{MAX_AST_DEPTH, MAX_EXPANDED_NODES};
 use crate::lua::syntax::{Ast, Bin, Expr, Stmt, Un};
@@ -71,8 +75,6 @@ pub(crate) struct Lowered {
     /// The critical part a read shows.
     pub(crate) part: Option<CriticalPart>,
     pub(crate) deviates: bool,
-    /// Whether it folds a configuration read.
-    pub(crate) config: bool,
 }
 
 /// A number's resolved value: a property's or a callback's.
@@ -142,7 +144,6 @@ struct Lower<'a> {
     an: &'a Analysis,
     custom: &'a Custom,
     cancelled: &'a dyn Fn() -> bool,
-    critical: bool,
     out: Lowered,
     /// Each instance's expanded size, once computed, for the instances
     /// this lowering reaches.
@@ -363,11 +364,9 @@ impl Lower<'_> {
         self.int(src, n, n)
     }
 
-    /// `skin_config.option["name"]`: its captured value.
+    /// `skin_config.option["name"]`: its captured value, which admission
+    /// proved no callback writes.
     fn config(&mut self, ast: &Ast, inst: u32, obj: u32, key: u32) -> R<V> {
-        if self.critical {
-            return Err(Stop::Unsupported(Unsupported::Config));
-        }
         let (Expr::Index { obj: cfg, .. }, Expr::Str(k)) = (ast.expr(obj), ast.expr(key)) else {
             return Err(Stop::Unsupported(Unsupported::Type));
         };
@@ -378,7 +377,6 @@ impl Lower<'_> {
             return Err(Stop::Unsupported(Unsupported::Capture("_ENV")));
         };
         let k = ast.str(k);
-        self.out.config = true;
         let set = self
             .an
             .envs
@@ -639,6 +637,8 @@ impl Cx<'_> {
             && n.kind == Kind::Lua
             && matches!(lua.values.get(n.end as usize), Some(LuaScalar::Callable(_)))
         {
+            #[cfg(feature = "dev-tools")]
+            self.unused(f, crate::lua::callback::Unused::Dropped);
             return Ok(Prop::Callable(f));
         }
         self.prop(field, name)
@@ -655,20 +655,61 @@ impl Cx<'_> {
     }
 
     fn set_outcome(&self, c: u32, d: Disposition) {
-        if let Some(an) = self
-            .def
-            .arena
-            .lua
-            .as_deref()
-            .and_then(|l| l.analysis.as_deref())
-        {
+        if let Some(an) = self.analysis() {
             an.set_outcome(c, d);
         }
     }
 
-    /// Lowers the callable at node `id`, as a critical callback when
-    /// `critical`.
-    fn lower(&mut self, id: u32, critical: bool) -> Result<Lowering, ImportError> {
+    /// Records why the callback at node `id`, read, was not consumed:
+    /// its element dropped before it, or a condition before it folded
+    /// false. A consumed callback's record supersedes it.
+    #[cfg(feature = "dev-tools")]
+    pub(super) fn unused(&self, id: u32, why: crate::lua::callback::Unused) {
+        if let (Some(an), Some((c, _))) = (self.analysis(), self.callable_at(id)) {
+            an.unused(c, why);
+        }
+    }
+
+    /// Records the callback at node `id` consumed in `field` with `role`,
+    /// as `d`, for `why`.
+    #[cfg(feature = "dev-tools")]
+    fn consumed(
+        &self,
+        id: u32,
+        field: &'static str,
+        role: Role,
+        (d, why): (Disposition, Option<Unsupported>),
+    ) {
+        if let Some(an) = self.analysis() {
+            an.consumed
+                .borrow_mut()
+                .push(crate::lua::callback::Consumed {
+                    node: id,
+                    field,
+                    part: match role {
+                        Role::Critical(p) => Some(p),
+                        Role::Decorative => None,
+                    },
+                    disposition: d,
+                    why,
+                });
+        }
+    }
+
+    #[cfg(not(feature = "dev-tools"))]
+    fn consumed(&self, _: u32, _: &'static str, _: Role, _: (Disposition, Option<Unsupported>)) {}
+
+    /// The definition's callback analysis.
+    fn analysis(&self) -> Option<&Analysis> {
+        self.def
+            .arena
+            .lua
+            .as_deref()
+            .and_then(|l| l.analysis.as_deref())
+    }
+
+    /// Lowers the callable at node `id`.
+    fn lower(&mut self, id: u32) -> Result<Lowering, ImportError> {
         let at = self.def.loc(id);
         let fatal = |why| ImportError::Lua {
             at: Some(at.clone()),
@@ -687,18 +728,25 @@ impl Cx<'_> {
                 None,
             ));
         };
+        // Every import runs after admission, which refuses the candidate
+        // unless it accepts every callable: an analysis it did not accept
+        // lowers nothing.
+        let Some(an) = an.admitted().map(Admitted::analysis) else {
+            return Ok(Lowering::Unsupported(
+                Unsupported::Capture("an unadmitted callback"),
+                None,
+            ));
+        };
         let cancelled = || def.cancelled(|| None).is_err();
         let mut l = Lower {
             an,
             custom: &self.custom,
             cancelled: &cancelled,
-            critical,
             out: Lowered {
                 src: String::new(),
                 guards: Vec::new(),
                 part: None,
                 deviates: false,
-                config: false,
             },
             sizes: std::collections::HashMap::new(),
             depth: 0,
@@ -759,9 +807,10 @@ impl Cx<'_> {
     ) -> Result<bool, ImportError> {
         let c = self.callable_at(id).map_or(NONE, |(c, _)| c);
         let critical = role != Role::Decorative;
-        let why = match self.lower(id, critical) {
+        let why = match self.lower(id) {
             Ok(Lowering::Lowered(l, Ty::Bool)) => {
                 self.set_outcome(c, Disposition::Lowered);
+                self.consumed(id, "draw", role, (Disposition::Lowered, None));
                 #[cfg(test)]
                 LOWERED.with(|w| {
                     let mut all: Vec<String> = l.guards.iter().map(|g| (*g).to_owned()).collect();
@@ -783,14 +832,17 @@ impl Cx<'_> {
             Ok(Lowering::Unsupported(why, _)) => why,
             Err(e) => {
                 self.set_outcome(c, Disposition::Refused);
+                self.consumed(id, "draw", role, (Disposition::Refused, None));
                 return Err(e);
             }
         };
         if critical {
             self.set_outcome(c, Disposition::Refused);
+            self.consumed(id, "draw", role, (Disposition::Refused, Some(why)));
             return Err(self.critical(id, "draw", why));
         }
         self.set_outcome(c, Disposition::Replaced(why));
+        self.consumed(id, "draw", role, (Disposition::Replaced(why), Some(why)));
         self.drop_el(
             Role::Decorative,
             at,
@@ -810,12 +862,15 @@ impl Cx<'_> {
         base: Role,
     ) -> Result<Option<NumberValue>, ImportError> {
         let c = self.callable_at(id).map_or(NONE, |(c, _)| c);
-        let (why, part) = match self.lower(id, base != Role::Decorative) {
-            Ok(Lowering::Lowered(l, _)) if l.config && l.part.is_some() => {
-                (Unsupported::Config, l.part)
-            }
+        let (why, part) = match self.lower(id) {
             Ok(Lowering::Lowered(l, Ty::Int)) => {
                 self.set_outcome(c, Disposition::Lowered);
+                self.consumed(
+                    id,
+                    "value",
+                    l.part.map_or(base, Role::Critical),
+                    (Disposition::Lowered, None),
+                );
                 #[cfg(test)]
                 LOWERED.with(|w| w.borrow_mut().push(l.src.clone()));
                 let guard = (!l.guards.is_empty()).then(|| l.guards.join(" && "));
@@ -830,14 +885,27 @@ impl Cx<'_> {
             Ok(Lowering::Unsupported(why, part)) => (why, part),
             Err(e) => {
                 self.set_outcome(c, Disposition::Refused);
+                self.consumed(id, "value", base, (Disposition::Refused, None));
                 return Err(e);
             }
         };
         if part.is_some() || base != Role::Decorative {
             self.set_outcome(c, Disposition::Refused);
+            self.consumed(
+                id,
+                "value",
+                part.map_or(base, Role::Critical),
+                (Disposition::Refused, Some(why)),
+            );
             return Err(self.critical(id, "value", why));
         }
         self.set_outcome(c, Disposition::Replaced(why));
+        self.consumed(
+            id,
+            "value",
+            Role::Decorative,
+            (Disposition::Replaced(why), Some(why)),
+        );
         self.drop_el(
             Role::Decorative,
             at,

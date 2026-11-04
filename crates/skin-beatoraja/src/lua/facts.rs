@@ -22,6 +22,17 @@
 //! - 290, course mode (`:526-527`): a constant `false`, as there are no
 //!   courses.
 //!
+//! `main_state.number` and `main_state.text` answer these ids, the rest
+//! being play state:
+//!
+//! - number 96, the play level (`IntegerPropertyFactory.java:154`,
+//!   `:580-584`): the snapshot's [`ImportFacts::play_level`], bound to the
+//!   chart, as `SongData.getLevel()` gives it (`song/SongData.java:167`);
+//! - texts 1001 to 1003, the difficulty table's name, level and both
+//!   (`StringPropertyFactory.java:259-261`): the constant `""`, unrecorded,
+//!   as there are no difficulty tables and outside a table the source's
+//!   strings are empty (`PlayerResource.java:128-129`, `:531-535`).
+//!
 //! An import records each fact it read once, with the derived value it
 //! read (the class, never the rank), in first-read order ([`FactDeps`]);
 //! [`FactDeps::holds`] says whether a result still fits a snapshot.
@@ -130,6 +141,12 @@ pub struct ImportFacts {
     /// chart, `None` when it reads none (`rules::ReadHeaders::rank`);
     /// [`Fact::Unavailable`] when there is no chart.
     pub chart_rank: Fact<Option<ChartRank>>,
+    /// The chart's play level as the source parses `#PLAYLEVEL` (Java's
+    /// `Integer.parseInt`: an optional `+` or `-`, then one or more
+    /// characters `Character.digit(c, 10)` accepts, over UTF-16 code
+    /// units, within `i32`; anything else 0); [`Fact::Unavailable`] when
+    /// there is no chart.
+    pub play_level: Fact<i32>,
 }
 
 impl ImportFacts {
@@ -140,6 +157,7 @@ impl ImportFacts {
             scene,
             autoplay: Fact::Unavailable,
             chart_rank: Fact::Unavailable,
+            play_level: Fact::Unavailable,
         }
     }
 
@@ -147,14 +165,16 @@ impl ImportFacts {
     /// (unavailable on [`ScreenKind::Selection`], which has no chart).
     #[must_use]
     pub fn base(scene: ScreenKind, autoplay: Fact<bool>) -> Self {
+        let (chart_rank, play_level) = if scene == ScreenKind::Selection {
+            (Fact::Unavailable, Fact::Unavailable)
+        } else {
+            (Fact::Pending, Fact::Pending)
+        };
         Self {
             scene,
             autoplay,
-            chart_rank: if scene == ScreenKind::Selection {
-                Fact::Unavailable
-            } else {
-                Fact::Pending
-            },
+            chart_rank,
+            play_level,
         }
     }
 
@@ -171,6 +191,11 @@ impl ImportFacts {
                 Fact::Pending => Fact::Pending,
                 Fact::Unavailable => Fact::Unavailable,
             },
+            FactId::PlayLevel => match self.play_level {
+                Fact::Known(l) => Fact::Known(FactValue::Level(l)),
+                Fact::Pending => Fact::Pending,
+                Fact::Unavailable => Fact::Unavailable,
+            },
         }
     }
 }
@@ -182,6 +207,8 @@ pub enum FactId {
     Autoplay,
     /// Options 180 to 184.
     JudgeClass,
+    /// Number 96.
+    PlayLevel,
 }
 
 /// A fact's derived value, as an import read it.
@@ -191,6 +218,8 @@ pub enum FactValue {
     Bool(bool),
     /// [`FactId::JudgeClass`]: the class, or none.
     Class(Option<JudgeClass>),
+    /// [`FactId::PlayLevel`]: the level.
+    Level(i32),
 }
 
 /// One fact an import read, with the value it read.
@@ -267,6 +296,7 @@ pub(crate) fn option(facts: &ImportFacts, n: i32) -> OptionRead {
             let on = match value {
                 FactValue::Bool(on) => on == (id == AUTOPLAY_ON),
                 FactValue::Class(c) => c.is_some() && c == JudgeClass::of_option(id),
+                FactValue::Level(_) => false,
             };
             OptionRead::Fact {
                 value: negate(on),
@@ -275,6 +305,63 @@ pub(crate) fn option(facts: &ImportFacts, n: i32) -> OptionRead {
         }
         Fact::Pending => OptionRead::Pending(fact),
         Fact::Unavailable => OptionRead::Unavailable,
+    }
+}
+
+/// The number id of the play level.
+const PLAY_LEVEL: i32 = 96;
+
+/// What `number(n)` is during the configured pass, for an `n` within
+/// `i32`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NumberRead {
+    /// A published fact: the answer, and the read to record.
+    Fact { value: i32, read: FactRead },
+    /// A published fact the snapshot has pending.
+    Pending(FactId),
+    /// A published fact the snapshot has unavailable.
+    Unavailable,
+    /// Not a published fact.
+    LiveState,
+}
+
+/// Answers `number(n)` from `facts`.
+pub(crate) fn number(facts: &ImportFacts, n: i32) -> NumberRead {
+    if n != PLAY_LEVEL {
+        return NumberRead::LiveState;
+    }
+    match facts.value(FactId::PlayLevel) {
+        Fact::Known(value @ FactValue::Level(level)) => NumberRead::Fact {
+            value: level,
+            read: FactRead {
+                fact: FactId::PlayLevel,
+                value,
+            },
+        },
+        Fact::Known(_) | Fact::Unavailable => NumberRead::Unavailable,
+        Fact::Pending => NumberRead::Pending(FactId::PlayLevel),
+    }
+}
+
+/// The text ids of the difficulty table's name, level and both.
+const TABLE_TEXTS: std::ops::RangeInclusive<i32> = 1001..=1003;
+
+/// What `text(n)` is during the configured pass, for an `n` within `i32`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TextRead {
+    /// The scene's constant: the value, nothing recorded.
+    Constant(&'static str),
+    /// Not a published fact.
+    LiveState,
+}
+
+/// Answers `text(n)` on `facts`' scene: the table texts are empty, as
+/// there are no difficulty tables.
+pub(crate) fn text(_facts: &ImportFacts, n: i32) -> TextRead {
+    if TABLE_TEXTS.contains(&n) {
+        TextRead::Constant("")
+    } else {
+        TextRead::LiveState
     }
 }
 

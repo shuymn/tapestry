@@ -43,12 +43,21 @@ fn header(d: &TempDir) -> LuaHeader {
     read_lua_header(d.path(), "s.luaskin", &Cancel::new()).unwrap()
 }
 
-/// A play snapshot.
+/// A play snapshot, the play level unavailable.
 fn play(autoplay: Fact<bool>, chart_rank: Fact<Option<ChartRank>>) -> ImportFacts {
     ImportFacts {
         scene: ScreenKind::Play,
         autoplay,
         chart_rank,
+        play_level: Fact::Unavailable,
+    }
+}
+
+/// A play snapshot with the play level `level`, the rest unavailable.
+fn leveled(level: Fact<i32>) -> ImportFacts {
+    ImportFacts {
+        play_level: level,
+        ..ImportFacts::unavailable(ScreenKind::Play)
     }
 }
 
@@ -104,6 +113,13 @@ fn class(c: Option<JudgeClass>) -> FactRead {
     }
 }
 
+fn level(l: i32) -> FactRead {
+    FactRead {
+        fact: FactId::PlayLevel,
+        value: FactValue::Level(l),
+    }
+}
+
 fn deps(reads: &[FactRead]) -> FactDeps {
     FactDeps {
         scene: ScreenKind::Play,
@@ -112,6 +128,8 @@ fn deps(reads: &[FactRead]) -> FactDeps {
 }
 
 const OPTION: u16 = 0;
+const NUMBER: u16 = 1;
+const TEXT: u16 = 3;
 
 fn unavailable(id: i32) -> LuaWhy {
     LuaWhy::Unavailable { api: OPTION, id }
@@ -447,6 +465,196 @@ fn a_chart_with_no_rank_header_is_judged_and_classed_as_rank_2() {
     let i = imported(import(&d, &facts));
     assert_eq!(i.facts, deps(&[class(Some(JudgeClass::Normal))]));
     assert_eq!(x(i), 1);
+}
+
+#[test]
+fn the_play_level_is_answered_and_recorded_once() {
+    assert_eq!(HOST_APIS[usize::from(NUMBER)], ("main_state", "number"));
+    let d = folder("x = ms.number(96) * 10 + ms.number(96)");
+    for l in [12, 0, -1] {
+        let facts = leveled(Fact::Known(l));
+        let i = imported(import(&d, &facts));
+        assert_eq!(i.facts, deps(&[level(l)]), "{l}");
+        assert!(i.facts.holds(&facts));
+        assert_eq!(x(i), l * 11, "{l}");
+    }
+}
+
+#[test]
+fn a_base_import_stops_pending_at_the_play_level() {
+    let d = folder("local on = ms.option(33)\nx = ms.number(96)");
+    let base = ImportFacts::base(ScreenKind::Play, Fact::Known(true));
+    assert_eq!(base.play_level, Fact::Pending);
+    let p = pending(import(&d, &base));
+    assert_eq!(p.pending, FactId::PlayLevel);
+    assert_eq!(p.facts, deps(&[autoplay(true)]));
+    // Selection has no chart: its level is unavailable.
+    let selection = ImportFacts::base(ScreenKind::Selection, Fact::Known(true));
+    assert_eq!(selection.play_level, Fact::Unavailable);
+}
+
+// Covers: T09
+#[test]
+fn protected_calls_do_not_catch_a_play_level_refusal_or_a_pending_read() {
+    let line = BODY_LINE + 1;
+    let at = |why| (why, "s.luaskin".to_owned(), line);
+    let forms = |api: &str, call: &str| {
+        [
+            format!("local a = 1\npcall(ms.{api}, {call})"),
+            format!("local a = 1\npcall(function() return ms.{api}({call}) end)"),
+            format!(
+                "local a = 1\nxpcall(function() return ms.{api}({call}) end, function(e) return e end)"
+            ),
+        ]
+    };
+    let unavailable = LuaWhy::Unavailable {
+        api: NUMBER,
+        id: 96,
+    };
+    for body in forms("number", "96") {
+        let d = folder(&body);
+        let facts = leveled(Fact::Unavailable);
+        assert_eq!(located(import(&d, &facts)), at(unavailable), "{body}");
+        let p = pending(import(&d, &leveled(Fact::Pending)));
+        assert_eq!(
+            (p.pending, p.facts),
+            (FactId::PlayLevel, deps(&[])),
+            "{body}"
+        );
+    }
+    for (api, call, why) in [
+        ("number", "96.0", LuaWhy::FactArgument),
+        ("number", "97", LuaWhy::LiveState { api: NUMBER }),
+        ("text", "\"1003\"", LuaWhy::FactArgument),
+        ("text", "12", LuaWhy::LiveState { api: TEXT }),
+    ] {
+        for body in forms(api, call) {
+            let d = folder(&body);
+            assert_eq!(
+                located(import(&d, &leveled(Fact::Known(12)))),
+                at(why),
+                "{body}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_read_play_level_that_changes_no_longer_holds() {
+    let d = folder("x = ms.number(96)");
+    let i = imported(import(&d, &leveled(Fact::Known(12))));
+    assert!(i.facts.holds(&leveled(Fact::Known(12))));
+    assert!(!i.facts.holds(&leveled(Fact::Known(11))));
+    assert!(!i.facts.holds(&leveled(Fact::Pending)));
+    assert!(!i.facts.holds(&leveled(Fact::Unavailable)));
+    // A level nothing read may change.
+    let d = folder("x = ms.option(33) and 1 or 0");
+    let i = imported(import(&d, &play(Fact::Known(true), Fact::Unavailable)));
+    for l in [
+        Fact::Known(12),
+        Fact::Known(0),
+        Fact::Pending,
+        Fact::Unavailable,
+    ] {
+        let facts = ImportFacts {
+            play_level: l,
+            ..play(Fact::Known(true), Fact::Unavailable)
+        };
+        assert!(i.facts.holds(&facts), "{l:?}");
+    }
+}
+
+#[test]
+fn mixed_facts_are_recorded_in_first_read_order() {
+    let d = folder(
+        "local a = ms.option(33)\nlocal l = ms.number(96)\nlocal c = ms.option(182)\n\
+         local again = ms.number(96) + (ms.option(33) and 1 or 0)",
+    );
+    let facts = ImportFacts {
+        play_level: Fact::Known(7),
+        ..play(Fact::Known(false), Fact::Known(Some(ChartRank::Rank(2))))
+    };
+    let i = imported(import(&d, &facts));
+    assert_eq!(
+        i.facts,
+        deps(&[autoplay(false), level(7), class(Some(JudgeClass::Normal))])
+    );
+}
+
+#[test]
+fn the_play_level_s_argument_must_be_an_integer_within_i32() {
+    let facts = leveled(Fact::Known(12));
+    for arg in ["96.0", "\"96\"", "2^31", "2147483648", ""] {
+        let d = folder(&format!("local a = 1\nx = ms.number({arg})"));
+        assert_eq!(
+            located(import(&d, &facts)),
+            (LuaWhy::FactArgument, "s.luaskin".to_owned(), BODY_LINE + 1),
+            "{arg}"
+        );
+    }
+    // Every other id reads play state.
+    for arg in ["97", "-96", "71"] {
+        let d = folder(&format!("local a = 1\nx = ms.number({arg})"));
+        assert_eq!(
+            located(import(&d, &facts)),
+            (
+                LuaWhy::LiveState { api: NUMBER },
+                "s.luaskin".to_owned(),
+                BODY_LINE + 1
+            ),
+            "{arg}"
+        );
+    }
+}
+
+#[test]
+fn the_table_texts_are_empty_and_recorded_nowhere() {
+    assert_eq!(HOST_APIS[usize::from(TEXT)], ("main_state", "text"));
+    let d = folder(
+        "for id = 1001, 1003 do\n\
+           local s = ms.text(id)\n\
+           assert(type(s) == \"string\" and s == \"\")\n\
+         end",
+    );
+    let i = imported(import(&d, &ImportFacts::unavailable(ScreenKind::Play)));
+    assert_eq!(i.facts, deps(&[]));
+    for (arg, why) in [
+        ("12", LuaWhy::LiveState { api: TEXT }),
+        ("1000", LuaWhy::LiveState { api: TEXT }),
+        ("1004", LuaWhy::LiveState { api: TEXT }),
+        ("1003.0", LuaWhy::FactArgument),
+        ("\"1003\"", LuaWhy::FactArgument),
+    ] {
+        let d = folder(&format!("local a = 1\nlocal s = ms.text({arg})"));
+        assert_eq!(
+            located(import(&d, &ImportFacts::unavailable(ScreenKind::Play))),
+            (why, "s.luaskin".to_owned(), BODY_LINE + 1),
+            "{arg}"
+        );
+    }
+}
+
+#[test]
+fn a_part_that_searches_the_table_level_completes() {
+    // A part loaded under protection reads the table texts as it is
+    // built and searches one: it completes, and the skin imports.
+    let d = folder(
+        "local ok, name = pcall(dofile, \"customize/table.lua\")\n\
+         assert(ok and name == \"\")\n\
+         x = 100",
+    );
+    common::write(
+        d.path(),
+        "customize/table.lua",
+        b"local main_state = require(\"main_state\")\n\
+          local name = main_state.text(1003)\n\
+          if string.find(main_state.text(1002), \"x\") then error(\"found\") end\n\
+          return name\n",
+    );
+    let i = imported(import(&d, &ImportFacts::unavailable(ScreenKind::Play)));
+    assert_eq!(i.facts, deps(&[]));
+    assert_eq!(i.dependencies, ["s.luaskin", "customize/table.lua"]);
+    assert_eq!(x(i), 100);
 }
 
 #[cfg(feature = "dev-tools")]

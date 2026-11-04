@@ -1,16 +1,20 @@
 //! The Lua conversion report (docs/stage3.md §3, the conversion report),
 //! for the developer's PC:
 //! `lua_report [--autoplay on|off] [--rank <n>|defex <milli>|none]
-//! <root> <entry> [<root> <entry>]...`
+//! [--level <n>|pending] <root> <entry> [<root> <entry>]...`
 //! imports each Lua skin, `entry` relative to its skin folder `root`,
 //! with its default configuration on the scene of the kind its header
-//! names, against import facts with autoplay and the rank the preset
-//! read as given (`none` for a chart with no rank header; each
+//! names, against import facts with autoplay, the rank the preset read
+//! and the chart's play level as given (`none` for a chart with no rank
+//! header, `pending` for a level the base snapshot has pending; each
 //! unavailable when not given), and prints its kind, what did not convert
-//! as allowlisted counts and outcomes and the import facts it read and
-//! recorded, each skin by its index in the arguments and each file by its
-//! index among those it consulted, then the skins per kind (`none` for a
-//! header refused). It prints no source, name, path, string or Lua error.
+//! as allowlisted counts and outcomes, a record per callback consumer
+//! (where it is defined, its field, role, disposition and reason, and
+//! why a callback classified but never consumed was left), and the import
+//! facts it read and recorded, each skin by its index in the arguments and
+//! each file by its index among those it consulted, then the skins per
+//! kind (`none` for a header refused). It prints no source, name, path,
+//! string or Lua error.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -21,7 +25,7 @@ use skin_beatoraja::lua::survey::survey;
 use skin_model::ScreenKind;
 
 const USAGE: &str = "usage: lua_report [--autoplay on|off] [--rank <n>|defex <milli>|none] \
-                     <root> <entry> [<root> <entry>]...";
+                     [--level <n>|pending] <root> <entry> [<root> <entry>]...";
 
 fn usage() -> ! {
     eprintln!("{USAGE}");
@@ -29,8 +33,9 @@ fn usage() -> ! {
 }
 
 /// The snapshot the flags at the front of `args` give, its scene each
-/// skin's own, and the arguments after them.
-fn facts(mut args: &[String]) -> (ImportFacts, &[String]) {
+/// skin's own, and the arguments after them; `None` for a flag it does
+/// not read.
+fn facts(mut args: &[String]) -> Option<(ImportFacts, &[String])> {
     let mut facts = ImportFacts::unavailable(ScreenKind::Play);
     loop {
         match args {
@@ -38,12 +43,19 @@ fn facts(mut args: &[String]) -> (ImportFacts, &[String]) {
                 facts.autoplay = Fact::Known(match v.as_str() {
                     "on" => true,
                     "off" => false,
-                    _ => usage(),
+                    _ => return None,
                 });
                 args = rest;
             }
+            [flag, v, rest @ ..] if flag == "--level" => {
+                facts.play_level = match v.as_str() {
+                    "pending" => Fact::Pending,
+                    n => Fact::Known(n.parse().ok()?),
+                };
+                args = rest;
+            }
             [flag, defex, m, rest @ ..] if flag == "--rank" && defex == "defex" => {
-                let m = m.parse().unwrap_or_else(|_| usage());
+                let m = m.parse().ok()?;
                 facts.chart_rank = Fact::Known(Some(ChartRank::DefExRankMilli(m)));
                 args = rest;
             }
@@ -52,18 +64,21 @@ fn facts(mut args: &[String]) -> (ImportFacts, &[String]) {
                 args = rest;
             }
             [flag, r, rest @ ..] if flag == "--rank" => {
-                let r = r.parse().unwrap_or_else(|_| usage());
+                let r = r.parse().ok()?;
                 facts.chart_rank = Fact::Known(Some(ChartRank::Rank(r)));
                 args = rest;
             }
-            _ => return (facts, args),
+            [flag, ..] if flag.starts_with("--") => return None,
+            _ => return Some((facts, args)),
         }
     }
 }
 
 fn main() {
     let all: Vec<String> = std::env::args().skip(1).collect();
-    let (facts, args) = facts(&all);
+    let Some((facts, args)) = facts(&all) else {
+        usage()
+    };
     if args.is_empty() || !args.len().is_multiple_of(2) {
         usage();
     }
@@ -107,6 +122,20 @@ fn main() {
         for (outcome, n) in &survey.outcomes {
             println!("  callback {outcome}: {n}");
         }
+        for c in &survey.consumers {
+            let at = c.at.map_or_else(
+                || "module ?".to_owned(),
+                |(module, line, _)| format!("module {module}, line {line}"),
+            );
+            let reason = c
+                .reason
+                .as_deref()
+                .map_or_else(String::new, |r| format!(" ({r})"));
+            println!(
+                "  consumer {at}: {} {} {}{reason}",
+                c.field, c.role, c.disposition
+            );
+        }
         for (kind, n) in &survey.notes {
             println!("  note {kind}: {n}");
         }
@@ -119,5 +148,46 @@ fn main() {
     }
     for (kind, n) in &kinds {
         println!("kind {kind}: {n}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use skin_beatoraja::lua::facts::{ChartRank, Fact};
+
+    use super::facts;
+
+    fn args(s: &str) -> Vec<String> {
+        s.split_whitespace().map(str::to_owned).collect()
+    }
+
+    #[test]
+    fn the_flags_set_the_snapshot_and_leave_the_skins() {
+        let a = args("--autoplay off --rank 2 --level 12 root s.luaskin");
+        let (f, rest) = facts(&a).unwrap();
+        assert_eq!(f.autoplay, Fact::Known(false));
+        assert_eq!(f.chart_rank, Fact::Known(Some(ChartRank::Rank(2))));
+        assert_eq!(f.play_level, Fact::Known(12));
+        assert_eq!(rest, ["root", "s.luaskin"]);
+        let a = args("--level pending root s.luaskin");
+        let (f, _) = facts(&a).unwrap();
+        assert_eq!(f.play_level, Fact::Pending);
+        assert_eq!(f.chart_rank, Fact::Unavailable);
+        let a = args("root s.luaskin");
+        assert_eq!(facts(&a).unwrap().0.play_level, Fact::Unavailable);
+    }
+
+    #[test]
+    fn a_bad_flag_or_value_is_refused() {
+        for a in [
+            "--level x root s",
+            "--level 2147483648 root s",
+            "--level",
+            "--autoplay maybe root s",
+            "--rank x root s",
+            "--other 1 root s",
+        ] {
+            assert!(facts(&args(a)).is_none(), "{a}");
+        }
     }
 }

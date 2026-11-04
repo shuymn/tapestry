@@ -343,6 +343,7 @@ fn continued(
     (r, CONTINUED.with(Cell::get))
 }
 
+// Covers: T09
 #[test]
 fn no_skin_code_runs_after_a_fact_stop_inside_a_protected_call() {
     use super::facts::{ChartRank, Fact, ImportFacts};
@@ -357,17 +358,28 @@ fn no_skin_code_runs_after_a_fact_stop_inside_a_protected_call() {
     let (r, n) = continued("pcall(error, \"x\")\ncontinued()", &unavailable);
     assert!(matches!(r, Ok(super::LuaOutcome::Imported(_))), "{r:?}");
     assert_eq!(n, 1);
-    for (call, facts) in [("33", unavailable), ("33.0", known), ("182", base)] {
+    for (api, call, facts) in [
+        ("option", "33", unavailable),
+        ("option", "33.0", known),
+        ("option", "182", base),
+        ("number", "96", unavailable),
+        ("number", "96.0", known),
+        ("number", "97", known),
+        ("number", "96", base),
+        ("text", "\"1003\"", known),
+        ("text", "12", known),
+    ] {
         for wrap in [
-            format!("pcall(ms.option, {call})"),
-            format!("pcall(function() return ms.option({call}) end)"),
+            format!("pcall(ms.{api}, {call})"),
+            format!("pcall(function() return ms.{api}({call}) end)"),
             format!(
-                "xpcall(function() return ms.option({call}) end, function(e) continued() return e end)"
+                "xpcall(function() return ms.{api}({call}) end, function(e) continued() return e end)"
             ),
         ] {
             let (r, n) = continued(&format!("{wrap}\ncontinued()"), &facts);
-            match (call, &r) {
-                ("182", Ok(super::LuaOutcome::Pending(_))) | (_, Err(_)) => {}
+            match &r {
+                Ok(super::LuaOutcome::Pending(_)) if facts == base => {}
+                Err(_) => {}
                 _ => panic!("{wrap}: {r:?}"),
             }
             assert_eq!(n, 0, "{wrap}");
