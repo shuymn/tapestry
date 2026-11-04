@@ -250,6 +250,9 @@ pub enum NoteKind {
     UndefinedOp(i32),
     /// A destination naming no object: the source skips it.
     UndefinedObject,
+    /// An image's `src` naming no `source` record: absent, or an id no
+    /// record has. The source makes no image of it.
+    UndefinedSource,
     Blend(i32),
     Stretch(i32),
     /// An offset the play sets at run time.
@@ -316,6 +319,7 @@ impl fmt::Display for NoteKind {
             Self::UnsupportedField { field } => write!(f, "an unsupported `{field}`"),
             Self::UndefinedOp(id) => write!(f, "an undefined condition {id}"),
             Self::UndefinedObject => f.write_str("no object of this id"),
+            Self::UndefinedSource => f.write_str("no source of this id"),
             Self::Blend(b) => write!(f, "an unsupported blend {b}"),
             Self::Stretch(s) => write!(f, "an unsupported stretch {s}"),
             Self::RuntimeOffset(id) => write!(f, "a run-time offset {id}"),

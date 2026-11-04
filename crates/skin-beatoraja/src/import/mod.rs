@@ -824,6 +824,28 @@ impl<'d> Cx<'d> {
                 why: NoteKind::UnsupportedField { field: "id" },
             });
         }
+        // The source makes no object of these when `src` names no source,
+        // and skips the destination (`JSONSkinLoader.java:326-338,
+        // 484-492`, `JsonSkinObjectLoader.java:42-72, 394-455`,
+        // `JsonPlaySkinObjectLoader.java:183-214`), whatever its role. An
+        // id another table names keeps the role's handling.
+        if matches!(
+            object,
+            Object::Image
+                | Object::Slider
+                | Object::Graph
+                | Object::HiddenCover
+                | Object::LiftCover
+        ) {
+            let [src] = self.def.fields(orec, ["src"]);
+            let src = self.opt_string(src, "src")?;
+            if self.source_rec(src.as_deref())?.is_none()
+                && !self.objects.shared(self.def, &self.tables, &id)?
+            {
+                self.ignored(at, NoteKind::UndefinedSource);
+                return Ok(());
+            }
+        }
         match object {
             Object::Image => self.image(dst, orec)?,
             Object::ImageSet => self.image_set(dst, orec)?,
@@ -1466,17 +1488,19 @@ impl<'d> Cx<'d> {
         self.lane_approx(c.span, part, LaneApprox::CoverMotion)
     }
 
-    /// The source's `source` table, by id: the last of an id wins
-    /// (`JSONSkinLoader.java:312-314`).
-    fn source_path(&mut self, src: Option<&str>) -> Result<Option<String>, ImportError> {
+    /// The `source` record `src` names: the last of an id wins
+    /// (`JSONSkinLoader.java:312-314`). `None` when `src` is absent or no
+    /// record has it, which the source treats as no image.
+    fn source_rec(&mut self, src: Option<&str>) -> Result<Option<u32>, ImportError> {
         if self.sources.is_none() {
             let recs = object::records(&self.tables, "source").to_vec();
             self.sources = Some(object::index(self.def, &recs, true)?);
         }
-        let Some(rec) = src.and_then(|s| self.sources.as_ref().and_then(|m| m.get(s)).copied())
-        else {
-            return Ok(None);
-        };
+        Ok(src.and_then(|s| self.sources.as_ref().and_then(|m| m.get(s)).copied()))
+    }
+
+    /// Source record `rec`'s `path`.
+    fn source_path(&mut self, rec: u32) -> Result<Option<String>, ImportError> {
         let [path] = self.def.fields(rec, ["path"]);
         self.opt_string(path, "path")
     }

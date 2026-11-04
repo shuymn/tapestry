@@ -156,7 +156,7 @@ fn set(images: &str, set: &str) -> common::Loaded {
                      {{"id": "i1", "src": "a", "x": 16, "w": 16, "h": 16, "len": 4, "ref": 42}},
                      {{"id": "i2", "src": "a", "x": 32, "w": 16, "h": 16}},
                      {{"id": "mv", "src": "m"}},
-                     {{"id": "gone", "src": "nothing"}}],
+                     {{"id": "gone", "src": "lost"}}],
            "imageset": [{{"id": "s", "images": {images} {set}}}],
            "destination": [{{"id": "s", {KEY}}}]}}"#
     );

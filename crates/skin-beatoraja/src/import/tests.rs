@@ -76,6 +76,22 @@ fn each_compile_follows_its_charges_and_each_admission_its_image_charge() {
 }
 
 #[test]
+fn a_source_with_no_path_refuses_failure_presentation_before_any_file() {
+    let json = r#"{"type": 0, "w": 1920, "h": 1080, "source": [{"id": "p"}],
+        "image": [{"id": "i", "src": "p", "w": 8, "h": 8}],
+        "destination": [{"id": "i", "timer": 3, "dst": [{"w": 1, "h": 1}]}]}"#;
+    let (r, _, admits) = run(json);
+    match r {
+        Err(ImportError::Critical { part, why, .. }) => assert_eq!(
+            (part, why),
+            (crate::CriticalPart::Failure, NoteKind::MissingAsset)
+        ),
+        other => panic!("{:?}", other.map(|i| i.report)),
+    }
+    assert_eq!(admits, 0);
+}
+
+#[test]
 fn failure_presentation_is_classified_without_work_of_its_own() {
     use Event::{Admit, Charge, Compile};
     // The same destinations on `failed` and on READY: classifying them
