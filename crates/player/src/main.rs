@@ -28,6 +28,7 @@ mod controls;
 #[cfg(feature = "dev-tools")]
 mod dev;
 mod end_screen;
+mod imports;
 mod input_side;
 mod keys;
 mod loading_state;
@@ -52,8 +53,12 @@ mod start_gate;
 mod tuning;
 mod window;
 
-// The render crate's WARP helpers and declarative and imported skin
-// fixtures, for the tests that drive a real menu screen.
+// The render crate's WARP helpers and its declarative, imported and
+// rasterized-text skin fixtures, for the tests that drive a real menu
+// screen or build skins.
+#[cfg(test)]
+#[path = "../../render/tests/font_support/mod.rs"]
+mod font_support;
 #[cfg(test)]
 #[path = "../../render/tests/common/mod.rs"]
 mod render_common;
@@ -63,6 +68,9 @@ mod render_decl;
 #[cfg(test)]
 #[path = "../../render/tests/json_support/mod.rs"]
 mod render_json;
+#[cfg(test)]
+#[path = "../../render/tests/outline_support/mod.rs"]
+mod render_outline;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;

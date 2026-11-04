@@ -55,6 +55,8 @@ pub mod survey;
 pub(crate) mod syntax;
 #[cfg(test)]
 pub(crate) mod tests;
+#[cfg(feature = "dev-tools")]
+pub mod vm_hooks;
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -625,6 +627,10 @@ fn run_pass(pass: &Rc<Pass>, entry: &str) -> Result<Converted, Stop> {
     #[cfg(feature = "dev-tools")]
     let start = std::time::Instant::now();
     let r = sandbox::vm(pass).map(|lua| {
+        // Counted closed when dropped: after `lua` below, or as a panic
+        // unwinds.
+        #[cfg(feature = "dev-tools")]
+        let open = vm_hooks::opened();
         let run = loader::compile(&lua, pass, entry).and_then(|(f, id)| {
             let values = loader::run(&lua, pass, f, MultiValue::new())?;
             pass.ledger.memory(lua.used_memory());
@@ -644,7 +650,11 @@ fn run_pass(pass: &Rc<Pass>, entry: &str) -> Result<Converted, Stop> {
         });
         #[cfg(feature = "dev-tools")]
         let done = std::time::Instant::now();
+        #[cfg(feature = "dev-tools")]
+        vm_hooks::closing();
         drop(lua);
+        #[cfg(feature = "dev-tools")]
+        drop(open);
         #[cfg(feature = "dev-tools")]
         pass.timings.set(Timings {
             execution: executed - start,

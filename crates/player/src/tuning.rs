@@ -414,6 +414,30 @@ mod tests {
         assert_eq!(files.player_error(), None);
     }
 
+    /// The select screen's preset written to `player.toml` keeps the
+    /// `[skins]` tables the file was loaded with, unchanged.
+    #[test]
+    fn a_chosen_preset_keeps_the_skin_choices() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = game::DataRoot::new(dir.path().to_owned());
+        std::fs::write(
+            root.player_settings(),
+            "[skins.play]\nroot = 'D:\\skins\\Mine'\nentry = 'play/play7.luaskin'\n\
+             options = { \"Lane cover\" = \"On\" }\n\
+             [skins.result]\nroot = 'D:/skins/R'\nentry = 'result.json'\n\
+             files = { \"Background\" = \"b.png\" }\n",
+        )
+        .unwrap();
+        let loaded = game::Settings::load(&root).unwrap();
+        assert!(loaded.player.skins.play.is_some() && loaded.player.skins.result.is_some());
+        let mut files = SettingsFiles::new(root.clone(), loaded.clone());
+        let t = Tuning::of(&loaded);
+        assert_eq!(files.choose_preset("lr2-style", t, 2), Ok(()));
+        let s = game::Settings::load(&root).unwrap();
+        assert_eq!(s.player.preset, "lr2-style");
+        assert_eq!(s.player.skins, loaded.player.skins);
+    }
+
     /// A chosen preset that cannot be written is kept, with the error, and
     /// written by the next ordinary write, which clears the error; choosing
     /// back the preset the file holds clears it too.

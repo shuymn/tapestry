@@ -229,6 +229,19 @@ fn a_panic_in_a_host_function_unwinds_and_drops_the_vm() {
     assert_eq!(live(), 0);
 }
 
+/// A panic in a host function counts the VM closed in the dev-tools
+/// hooks too, so a later caller's count starts from its base.
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_panic_in_a_host_function_closes_the_vm_in_the_hooks() {
+    let base = super::vm_hooks::thread_live();
+    let d = folder(ENDLESS);
+    at_host_call(3, || panic!("a host function panicked"));
+    let r = std::panic::catch_unwind(|| header(d.path(), &Cancel::new()));
+    assert!(r.is_err());
+    assert_eq!(super::vm_hooks::thread_live(), base);
+}
+
 #[test]
 fn every_pass_drops_its_vm_on_every_outcome() {
     let ok = folder("return { type = 0 }");
