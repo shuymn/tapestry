@@ -173,8 +173,8 @@ pub enum LuaWhy {
     /// A table key that is neither a string nor an integer, or a table the
     /// conversion cannot read.
     Key,
-    /// A table with string keys and others where an array or a condition
-    /// is read.
+    /// A table with string keys and others where an array, a condition
+    /// or a choice branch is read.
     Mixed,
     /// A table of integer keys other than `1..=n`.
     Sparse,

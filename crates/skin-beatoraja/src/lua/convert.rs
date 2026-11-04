@@ -10,14 +10,15 @@
 //! source's Lua loader reads it (`LuaSkinLoader.java:187-205` at `0.8.9`):
 //! the other entries are never read (not converted, charged as nodes or
 //! captured), the node is listed in [`LuaText::mixed`] for the import to
-//! note, and the definition's readers refuse it where an array or a
-//! condition is read. Sparse integer keys alone, and keys that are
-//! neither strings nor integers without a string key, are refused, as is
-//! a table met again inside itself. A table reached twice is converted,
-//! and charged, at each place. An empty table is neither: [`Kind::Empty`],
-//! which the definition's readers read as the empty array or the empty
-//! object their field expects. A number keeps its subtype and value: an integer
-//! as its `i64`, a float as its `f64`, never through text. A string must
+//! note, and the definition's readers refuse it where an array, a
+//! condition or a choice branch is read. Sparse integer keys alone, and
+//! keys that are neither strings nor integers without a string key, are
+//! refused, as is a table met again inside itself. A table reached twice
+//! is converted, and charged, at each place. An empty table is neither:
+//! [`Kind::Empty`], which the definition's readers read as the empty
+//! array or the empty object their field expects. A number keeps its
+//! subtype and value: an integer as its `i64`, a float as its `f64`,
+//! never through text. A string must
 //! be UTF-8. A function becomes a typed callable, each instance once; any
 //! other value is refused.
 //!

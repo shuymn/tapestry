@@ -2210,6 +2210,50 @@ fn a_mixed_table_has_no_wrapper_meaning() {
     );
     assert_eq!(r.dependencies, plain.dependencies);
     assert_eq!(r.dependencies, ["s.luaskin"]);
+    // Nor are `if`, `value` and `values`: read as a choice, the condition
+    // on option 900 (not enabled) would drop the record; as fields, the
+    // record itself is drawn.
+    let other = "{ id = \"i\", dst = { { x = 100, y = 0, w = 8, h = 8 } } }";
+    for wrapper in [
+        format!("[\"if\"] = {{ 900 }}, value = {other}"),
+        format!("[\"if\"] = {{ 900 }}, values = {{ {other} }}"),
+        format!("IF = {{ 900 }}, Value = {other}"),
+    ] {
+        let r = import(&failure(&format!(", {wrapper}, 41"))).unwrap();
+        assert_eq!(kinds(&r), [NON_STRING_KEYS], "{wrapper}");
+        assert_eq!(r.imported.report.usage.elements, 1, "{wrapper}");
+        assert_eq!(r.imported.report.usage.keys, 1, "{wrapper}");
+    }
+}
+
+#[test]
+fn a_mixed_keyframe_is_a_record_with_defaults() {
+    // The first keyframe keeps its string field and defaults the rest
+    // (time 0, zero geometry): at 500 ms the image is halfway to its
+    // second keyframe, with and without the failure timer.
+    for timer in ["", "timer = 3, "] {
+        let d = folder(&[(
+            "s.luaskin",
+            &skin(
+                "",
+                &format!(
+                    "skin.destination = {{ {{ id = \"i\", loop = -1, {timer}dst = {{ {{ x = 1, 41 }},\n\
+                       {{ time = 1000, x = 0, y = 0, w = 64, h = 64 }} }} }} }}"
+                ),
+            ),
+        )]);
+        let r = import(&d).unwrap();
+        assert_eq!(kinds(&r), [NON_STRING_KEYS], "{timer}");
+        assert_eq!(r.imported.report.usage.keys, 2, "{timer}");
+        let want: &[[i32; 4]] = if timer.is_empty() {
+            &[[1, 1048, 32, 32]]
+        } else {
+            // The failure timer never starts in a plain play.
+            &[]
+        };
+        let mut drawn = common::play::Drawn::new(r.imported.skin, 100);
+        assert_eq!(drawn.rects(500), want, "{timer}");
+    }
 }
 
 #[test]
@@ -2287,6 +2331,10 @@ fn a_mixed_table_where_an_array_or_condition_is_read_is_refused() {
         )),
         entry(&format!(
             "skin.destination = {{ {{ [\"if\"] = {{ {{ {{ 900, x = 1 }} }} }}, value = {{ id = \"i\", {DST} }} }} }}"
+        )),
+        // A branch of a choice list, which would otherwise select nothing.
+        entry(&format!(
+            "skin.destination = {{ {{ {{ value = {{ id = \"i\", {DST} }}, 41 }} }} }}"
         )),
     ] {
         // `x.json`, were it read, is no JSON.

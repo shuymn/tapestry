@@ -370,9 +370,10 @@ impl Definition {
     }
 
     /// A Lua table with string keys and others ([`Kind::Mixed`]) where an
-    /// array or a condition is read: refused at the table, since the
-    /// source lists every value in its VM's table order
-    /// (`LuaSkinLoader.java:174-186` at `0.8.9`), which is not reproduced.
+    /// array, a condition or a choice branch is read: refused at the
+    /// table, since the source lists every value in its VM's table order
+    /// (`LuaSkinLoader.java:174-186` at `0.8.9`), which is not reproduced,
+    /// and a mixed branch has no `if` or `value` to choose by.
     pub(crate) fn mixed_error(&self, id: u32) -> ImportError {
         ImportError::Lua {
             at: Some(self.loc(id)),
@@ -960,6 +961,10 @@ impl Resolver<'_, '_> {
                     next = self.arena().node(branch).next_sibling;
                     if self.callable(branch) {
                         return Err(self.def.callable_error(branch, "other"));
+                    }
+                    // A mixed table has no `if` or `value` to choose by.
+                    if self.arena().is_mixed(branch) {
+                        return Err(self.def.mixed_error(branch));
                     }
                     let cond = self.arena().first_member_ci(branch, "if");
                     if self.test(cond)? {
