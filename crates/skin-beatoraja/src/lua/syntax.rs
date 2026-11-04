@@ -262,8 +262,6 @@ pub(crate) struct Decl {
     /// The expression whose first value initializes it (`local x = e`),
     /// else [`NONE`]; a `local function`'s is its function's expression.
     pub(crate) init: u32,
-    /// The assignments to it after its declaration.
-    pub(crate) writes: u32,
     /// Whether it is named `_ENV`.
     pub(crate) env: bool,
 }
@@ -990,7 +988,10 @@ const HEX_DIGITS: u32 = 30;
 
 /// The bits of hexadecimal float numeral `t` (after its `0x`), already
 /// checked: rounded to nearest, ties to even, as `strtod` rounds it; each
-/// digit visited a tick.
+/// digit visited a tick. The bits follow the sandbox's VM (Lua 5.4 with a
+/// correctly rounding `strtod`), not the source's LuaJ, which can round a
+/// long hexadecimal numeral otherwise; nothing reads float bits before
+/// the presentation program (docs/stage3.md S7-06d).
 fn hex_float(t: &[u8], tick: &mut dyn FnMut() -> Result<(), Fail>) -> Result<u64, Fail> {
     let (mut m, mut e, mut sig, mut sticky, mut dot) = (0_u128, 0_i64, 0_u32, false, false);
     let mut i = 0;
@@ -1317,7 +1318,6 @@ impl<'a> Parser<'a, '_> {
             kind,
             attrib: Attrib::None,
             init: NONE,
-            writes: 0,
             env,
         });
         Ok(u32::try_from(self.ast.decls.len() - 1).unwrap_or(NONE))
@@ -1566,10 +1566,12 @@ impl<'a> Parser<'a, '_> {
                 }
                 if self.accept(Tok::Else)? {
                     let (s, n) = self.block()?;
-                    self.scratch.extend([NONE, s, n]);
+                    for id in [NONE, s, n] {
+                        self.push_charged(id)?;
+                    }
                 }
                 self.expect(Tok::End)?;
-                let arms = self.list_from(mark)?;
+                let arms = self.list_charged(mark);
                 self.stmt(Stmt::If(arms), line)
             }
             Tok::While => {
@@ -1646,7 +1648,9 @@ impl<'a> Parser<'a, '_> {
     /// block's list.
     fn arm(&mut self, kw: Tok) -> Result<(), Fail> {
         let (cond, (s, n)) = self.cond_block(kw)?;
-        self.scratch.extend([cond, s, n]);
+        for id in [cond, s, n] {
+            self.push_charged(id)?;
+        }
         Ok(())
     }
 
@@ -1694,9 +1698,9 @@ impl<'a> Parser<'a, '_> {
         for n in names {
             let d = self.declare(n, DeclKind::ForVar)?;
             self.bind(d)?;
-            self.scratch.push(d);
+            self.push_charged(d)?;
         }
-        let names = self.list_from(mark)?;
+        let names = self.list_charged(mark);
         let body = self.block()?;
         self.unbind_to(scope);
         self.expect(Tok::End)?;
@@ -1707,12 +1711,15 @@ impl<'a> Parser<'a, '_> {
         let start = self.advance()?.start;
         let first = self.expect(Tok::Name)?;
         // The first name is read (a field target) or assigned (a plain
-        // name).
+        // name); each name but the last is read, a static access path's
+        // step when it is one, and the last is assigned.
         let mark = self.scratch.len();
         self.scratch.push(first.start);
         self.scratch.push(first.end);
+        let mut target = self.name_expr(first)?;
+        let mut at = PathAt::Off;
+        let mut read: Option<u32> = None;
         let mut method = false;
-        let mut fields = Vec::new();
         loop {
             if self.accept(Tok::Colon)? {
                 method = true;
@@ -1722,20 +1729,21 @@ impl<'a> Parser<'a, '_> {
             let t = self.expect(Tok::Name)?;
             self.scratch.push(t.start);
             self.scratch.push(t.end);
-            fields.push(t);
+            at = match read {
+                None => self.path_root(target)?,
+                Some(key) => self.path_step(at, key)?,
+            };
+            let s = self.field_name(t);
+            let key = self.expr(Expr::Str(s), t.line)?;
+            target = self.expr(Expr::Index { obj: target, key }, t.line)?;
+            read = Some(s);
             if method {
                 break;
             }
         }
         let names = self.list_from(mark)?;
-        let mut target = self.name_expr(first)?;
-        if fields.is_empty() {
+        if read.is_none() {
             self.target(target)?;
-        }
-        for t in fields {
-            let s = self.field_name(t);
-            let key = self.expr(Expr::Str(s), t.line)?;
-            target = self.expr(Expr::Index { obj: target, key }, t.line)?;
         }
         let func = self.body(Form::Named { names, method }, start, method, line)?;
         self.stmt(Stmt::Function { target, func }, line)
@@ -1790,13 +1798,13 @@ impl<'a> Parser<'a, '_> {
         if self.check(Tok::Assign) || self.check(Tok::Comma) {
             let mark = self.scratch.len();
             self.target(e)?;
-            self.scratch.push(e);
+            self.push_charged(e)?;
             while self.accept(Tok::Comma)? {
                 let t = self.suffixed()?;
                 self.target(t)?;
-                self.scratch.push(t);
+                self.push_charged(t)?;
             }
-            let targets = self.list_from(mark)?;
+            let targets = self.list_charged(mark);
             self.expect(Tok::Assign)?;
             let mark = self.scratch.len();
             self.exprlist()?;
@@ -1809,18 +1817,30 @@ impl<'a> Parser<'a, '_> {
         self.stmt(Stmt::Call(e), line)
     }
 
-    /// An assignment's target: a local written, a global, or a field.
-    fn target(&mut self, e: u32) -> Result<(), Fail> {
+    /// Checks an assignment's target: a local, a global, or a field.
+    fn target(&self, e: u32) -> Result<(), Fail> {
         match self.ast.expr(e) {
-            Expr::Local(d) => {
-                if let Some(x) = self.ast.decls.get_mut(d as usize) {
-                    x.writes = x.writes.saturating_add(1);
-                }
-                Ok(())
-            }
-            Expr::Global { .. } | Expr::Index { .. } => Ok(()),
+            Expr::Local(_) | Expr::Global { .. } | Expr::Index { .. } => Ok(()),
             _ => Err(self.fail()),
         }
+    }
+
+    /// Entry `id` onto the scratch stack, charged as a list entry before
+    /// it is pushed: a list of such entries is taken by
+    /// [`Self::list_charged`].
+    fn push_charged(&mut self, id: u32) -> Result<(), Fail> {
+        self.charge()?;
+        self.scratch.push(id);
+        Ok(())
+    }
+
+    /// The scratch entries from `mark`, each already charged by
+    /// [`Self::push_charged`], moved into a list.
+    fn list_charged(&mut self, mark: usize) -> List {
+        let n = self.scratch.len().saturating_sub(mark);
+        let start = u32::try_from(self.ast.lists.len()).unwrap_or(NONE);
+        self.ast.lists.extend(self.scratch.drain(mark..));
+        (start, u32::try_from(n).unwrap_or(NONE))
     }
 
     /// A function body after its name: parameters, block and `end`.
@@ -2222,9 +2242,9 @@ mod tests {
         // The second `x`'s initializer reads the first.
         let second = a.decl(2).unwrap();
         assert_eq!(a.expr(second.init), Expr::Local(0));
-        // A write is counted.
+        // A write in a nested function makes the local its upvalue.
         let a = ok("local m = 1\nm = 2\nlocal function h() m = 3 end");
-        assert_eq!(a.decl(0).unwrap().writes, 2);
+        assert_eq!(a.list(a.func(1).unwrap().upvalues), [0]);
     }
 
     #[test]
@@ -2369,6 +2389,15 @@ mod tests {
         );
         // The chunk, which no root is, records none.
         assert!(a.paths(a.func(0).unwrap()).is_empty());
+        // A function statement reads every name of its target but the
+        // last, which it assigns.
+        let a = ok("local t = {}\nlocal function f() function t.c.d:m() end function g() end end");
+        let steps: Vec<(u32, u32, &[u8])> = a
+            .paths(a.func(1).unwrap())
+            .iter()
+            .map(|p| (p.parent, p.root, a.str(p.key)))
+            .collect();
+        assert_eq!(steps, [(NONE, 0, &b"c"[..]), (0, NONE, b"d")]);
     }
 
     #[test]

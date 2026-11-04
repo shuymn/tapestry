@@ -159,6 +159,58 @@ fn a_dynamic_key_ends_the_path() {
     assert_eq!(an.names.len(), 1, "only `k`'s value");
 }
 
+/// A skin whose configured pass returns a table with 523 distinct keys of
+/// 64 005 bytes, which the conversion keeps (33 474 615 bytes), and makes
+/// `count` closures, each capturing its own distinct string of 64 005
+/// bytes.
+fn strings(count: usize) -> String {
+    skin(
+        &format!(
+            "local p = \"x\"\n\
+             while #p < 64000 do p = p .. p end\n\
+             p = string.sub(p, 1, 64000)\n\
+             skin.extra = {{}}\n\
+             for i = 1, 523 do skin.extra[p .. string.format(\"%05d\", i)] = 1 end\n\
+             skin.customEvents = {{}}\n\
+             for i = 1, {count} do\n\
+               local own = p .. string.format(\"%05d\", 1000 + i)\n\
+               skin.customEvents[i] = {{ action = function() local mine = own return true end }}\n\
+             end"
+        ),
+        "",
+    )
+}
+
+/// The configured pass of `entry`, or its refusal.
+fn configure(entry: &str) -> Result<crate::resolve::Definition, ImportError> {
+    let d = super::callback_tests::folder(entry);
+    let cancel = super::Cancel::new();
+    let h = super::read_lua_header(d.path(), "s.luaskin", &cancel).unwrap();
+    let facts = super::facts::ImportFacts::unavailable(skin_model::ScreenKind::Play);
+    let config = crate::import::Config::defaults(h.header());
+    match h.configured(&config, &facts, &cancel).0 {
+        Ok(def) => Ok(def),
+        Err(super::ledger::Stop::Fault(e)) => Err(e),
+        Err(super::ledger::Stop::Pending(p)) => panic!("{p:?}"),
+    }
+}
+
+#[test]
+fn captured_strings_are_charged_against_the_retained_bytes() {
+    // Beside the kept keys, one captured string fits under the 32 MiB
+    // (33 554 432 bytes) of retained bytes; a second does not, refused
+    // before it is kept.
+    let def = configure(&strings(1)).unwrap();
+    assert_eq!(analysis(&def).names.len(), 1);
+    match configure(&strings(2)) {
+        Err(ImportError::Input {
+            limit: crate::error::InputLimit::DecodedBytes,
+            ..
+        }) => {}
+        other => panic!("{:?}", other.map(|_| ())),
+    }
+}
+
 #[test]
 fn captures_keep_floats_strings_tables_and_library_functions() {
     let entry = skin(

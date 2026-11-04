@@ -632,11 +632,10 @@ impl Conv<'_> {
             };
             // The reader is generated code that returns its bindings:
             // reading a binding runs no metamethod.
-            let values: Vec<Value> = reader
+            let values = reader
                 .call::<mlua::MultiValue>(())
                 .map_err(|e| self.mlua(&e))?
-                .into_iter()
-                .collect();
+                .into_vec();
             let Some(inst) = self.analysis.instances.get(i as usize).copied() else {
                 continue;
             };
@@ -708,21 +707,27 @@ impl Conv<'_> {
                 at.push(None);
                 continue;
             };
+            // The key hashed, its bytes charged first; an entry not yet
+            // copied charged as a capture before its key is interned (hashed
+            // and charged again) and it is read.
             let key = ast.str(p.key);
-            let k = self.intern(key)?;
+            self.charge_hash(key)?;
+            let known = self
+                .analysis
+                .names
+                .get(key)
+                .and_then(|k| self.analysis.tables.get(id as usize)?.get(k))
+                .copied();
+            if known.is_none() {
+                self.charge()?;
+            }
             let v: Value = t
                 .raw_get(mlua::BString::from(key))
                 .map_err(|e| self.mlua(&e))?;
-            let known = self
-                .analysis
-                .tables
-                .get(id as usize)
-                .and_then(|m| m.get(&k))
-                .copied();
             let c = match known {
                 Some(c) => c,
                 None => {
-                    self.charge()?;
+                    let k = self.intern(key)?;
                     let c = self.captured(&v)?;
                     if let Some(m) = self.analysis.tables.get_mut(id as usize) {
                         m.insert(k, c);
@@ -819,12 +824,18 @@ impl Conv<'_> {
         Ok(id)
     }
 
+    /// A hash of `s`, its bytes charged as analysis work before it is made.
+    fn charge_hash(&self, s: &[u8]) -> Result<(), ImportError> {
+        let len = u64::try_from(s.len()).unwrap_or(u64::MAX);
+        self.analysis.charge(len).map_err(|w| self.fatal(w))
+    }
+
     /// String `s`'s id among the pass's interned names: one hash, its
     /// bytes charged as analysis work first; a new one kept, its bytes
     /// charged against the retained bytes before it is copied.
     fn intern(&mut self, s: &[u8]) -> Result<u32, ImportError> {
+        self.charge_hash(s)?;
         let len = u64::try_from(s.len()).unwrap_or(u64::MAX);
-        self.analysis.charge(len).map_err(|w| self.fatal(w))?;
         if let Some(&id) = self.analysis.names.get(s) {
             return Ok(id);
         }
