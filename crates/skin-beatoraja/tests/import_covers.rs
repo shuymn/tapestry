@@ -11,7 +11,7 @@
 mod common;
 
 use bms_model::{ChartBuilder, Lane, TimeUs};
-use common::lanes::{NOTES, body, cover, lift, lift_object, note, with};
+use common::lanes::{NOTES, body, cover, hidden, hidden_object, lift, lift_object, note, with};
 use common::play::{Drawn, MS};
 use common::{Loaded, d3_notes, has, import_body, import_config, import_sized};
 use skin_beatoraja::{
@@ -814,10 +814,8 @@ fn rows_drawn(l: &Loaded, width: f32) -> f32 {
     rows_at(l, [20.0, 280.0, 430.0, 600.0], width)
 }
 
-/// The rows of its frame the one quad drawn over `rect` keeps, from its
-/// uv's aspect against the frame's `width` texels (the atlas pages are
-/// square).
-fn rows_at(l: &Loaded, rect: [f32; 4], width: f32) -> f32 {
+/// The one quad drawn over `rect` at 1 000 ‰ in `l`, a tap ahead.
+fn cover_quad(l: &Loaded, rect: [f32; 4]) -> skin_model::Quad {
     let chart = ChartBuilder::new(150_000)
         .tap(Lane::new(1).unwrap(), TimeUs(5_000 * MS))
         .build()
@@ -831,7 +829,14 @@ fn rows_at(l: &Loaded, rect: [f32; 4], width: f32) -> f32 {
         .filter(|q| q.rect == rect)
         .collect();
     assert_eq!(q.len(), 1);
-    let [u0, v0, u1, v1] = q[0].uv;
+    q[0]
+}
+
+/// The rows of its frame the one quad drawn over `rect` keeps, from its
+/// uv's aspect against the frame's `width` texels (the atlas pages are
+/// square).
+fn rows_at(l: &Loaded, rect: [f32; 4], width: f32) -> f32 {
+    let [u0, v0, u1, v1] = cover_quad(l, rect).uv;
     width * (v1 - v0) / (u1 - u0)
 }
 
@@ -912,6 +917,72 @@ fn a_cropped_cover_is_its_own_image_of_the_same_file() {
         assert_eq!(rows_drawn(l, 43.0), 60.0);
         assert_eq!(rows_at(l, whole, 43.0), 120.0);
     }
+}
+
+/// The texels the one quad drawn over `rect` at 1 000 ‰ in `l` samples at
+/// each `(u, v)` fraction, `a.png` painted with [`common::coord`] first
+/// (the import reads its header, the atlas its texels).
+fn edge_paint(l: &Loaded, rect: [f32; 4], at: &[(f32, f32)]) -> Vec<[u8; 4]> {
+    common::png_with(l.dir.path(), "a.png", 64, 256, common::coord);
+    let atlas = l
+        .ok()
+        .skin
+        .atlas(skin_model::Variant::Lo, common::play::LIMITS, &|| false)
+        .unwrap();
+    let q = cover_quad(l, rect);
+    at.iter()
+        .map(|&(u, v)| common::play::texel_at(&atlas, &q, u, v))
+        .collect()
+}
+
+#[test]
+fn a_trimmed_cover_past_the_edge_crops_its_cells_rows() {
+    // An 8×64 frame past a.png's right edge (64×256) fit to 80 would be
+    // 640 high: stretch 5 keeps the 320 px destination and the cell's
+    // middle 32 rows (16 to 47) of the edge column, whether the
+    // uncropped image was added before, after or not at all.
+    let frame = r#"{"id": "ce", "src": "a", "x": 64, "y": 0, "w": 8, "h": 64}"#;
+    let paint = stretched("ce", 5).replace(r#""w": 430, "h": 600"#, r#""w": 80, "h": 320"#);
+    let plain = r#"{"id": "ce", "dst": [{"x": 0, "y": 0, "w": 10, "h": 10}]}"#;
+    let ends = [(0.1, 0.01), (0.9, 0.01), (0.1, 0.99), (0.9, 0.99)];
+    let want = [16, 16, 47, 47].map(|y| common::coord(63, y));
+    for dsts in [vec![&*paint], vec![plain, &paint], vec![&paint, plain]] {
+        let l = tall(frame, &dsts);
+        assert!(!has(l.report(), NoteKind::SourceRect), "{dsts:?}");
+        let got = edge_paint(&l, [20.0, 560.0, 80.0, 320.0], &ends);
+        assert_eq!(got, want, "{dsts:?}");
+    }
+    // A frame of more than one row cut to the file's last row has no
+    // rows to crop, whether the uncropped image was added first or not.
+    let below = frame.replace(r#""x": 64, "y": 0"#, r#""x": 0, "y": 256"#);
+    for dsts in [vec![&*paint], vec![plain, &paint]] {
+        assert_eq!(
+            critical(tall(&below, &dsts)),
+            (CriticalPart::Cover, NoteKind::SourceRect),
+            "{dsts:?}"
+        );
+    }
+    // A one-row frame there is the last row, which the source samples
+    // too: 8×1 fit to 80 is 10 high, cropped to the 5 px destination.
+    let row = below.replace(r#""h": 64"#, r#""h": 1"#);
+    let thin = paint.replace(r#""h": 320"#, r#""h": 5"#);
+    let l = tall(&row, &[&thin]);
+    assert!(!has(l.report(), NoteKind::SourceRect));
+    let mid = [(0.1, 0.5), (0.9, 0.5)];
+    let got = edge_paint(&l, [20.0, 875.0, 80.0, 5.0], &mid);
+    assert_eq!(got, [common::coord(0, 255), common::coord(7, 255)]);
+}
+
+#[test]
+fn a_trimmed_hidden_cover_cut_to_the_last_row_drops() {
+    // HIDDEN+'s paint is decorative: an 8×64 frame below a.png's last row
+    // (64×64), cropped under stretch 5, drops with `SourceRect`.
+    let object = hidden_object("").replace(
+        r#""x": 32, "y": 24, "w": 16, "h": 16"#,
+        r#""x": 0, "y": 64, "w": 8, "h": 64"#,
+    );
+    let l = with(&object, &[&hidden(r#""stretch": 5"#)]);
+    assert!(has(l.report(), NoteKind::SourceRect), "{:?}", l.report());
 }
 
 #[test]
