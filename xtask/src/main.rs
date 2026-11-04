@@ -6,6 +6,7 @@ mod alloc_tests;
 mod arch;
 mod banned_words;
 mod binary;
+mod contract;
 mod demo;
 #[cfg(test)]
 mod fixture;
@@ -32,6 +33,8 @@ commands:
                                           rules are configured and fire on their fixtures
   check-alloc-tests                       check that every allocation test runs in a
                                           release step of CI
+  check-contract                          check that the design.md contract clauses cite
+                                          headings and tests that exist, and the threat IDs
   banned-words (--staged|--all) [--list <path>]
                                           check paths and contents in the index for
                                           terms in banned-words.txt
@@ -57,6 +60,9 @@ fn main() -> ExitCode {
         }
         Some("check-alloc-tests") if rest.is_empty() => {
             report("check-alloc-tests", alloc_tests::run(&workspace_manifest()))
+        }
+        Some("check-contract") if rest.is_empty() => {
+            report("check-contract", contract::run(&workspace_manifest()))
         }
         Some("banned-words") => banned_words::run(&rest),
         Some("portable") => portable::run(&workspace_manifest(), &rest),
