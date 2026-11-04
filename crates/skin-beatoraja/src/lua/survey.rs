@@ -38,13 +38,21 @@ pub struct Survey {
     /// holds them and what they are.
     pub callables: BTreeMap<(&'static str, String), u32>,
     /// What became of them: `lowered`, `replaced` with its reason,
-    /// `refused`, `classified only` (returned but never consumed) and
-    /// `never analysed` (the import stopped before them).
+    /// `refused`, `classified only` (returned but never consumed),
+    /// `inert` (never read by the source) and `never analysed` (the import
+    /// stopped before them).
     pub outcomes: BTreeMap<String, u32>,
     /// One record per consumer the import reached, in the order it
     /// reached them, then one per callable classified but never
-    /// consumed, with why.
+    /// consumed, with why, or inert.
     pub consumers: Vec<Consumer>,
+    /// The configured pass's script roots: strings at property fields
+    /// that their field's name loader does not resolve.
+    pub root_script: u32,
+    /// The configured pass's unread-entry roots: places where the source
+    /// lists every entry of a table whose entries the conversion left
+    /// unread hold a function, a string or a table.
+    pub root_unread: u32,
     /// The import's notes, by kind.
     pub notes: BTreeMap<String, u32>,
     /// The configured pass's reads of `main_state.option`, `number` and
@@ -72,8 +80,9 @@ pub struct Consumer {
     /// What became of it, labelled as [`Survey::outcomes`].
     pub disposition: String,
     /// Why it did not lower, or why it was never consumed: `element
-    /// dropped earlier`, `condition folded false`, `field not consumed`, or
-    /// `import stopped earlier` when the import ended before reading it.
+    /// dropped earlier`, `condition folded false`, `field not consumed`,
+    /// `import stopped earlier` when the import ended before reading it,
+    /// or `never read by the source` when it is inert.
     pub reason: Option<String>,
 }
 
@@ -100,7 +109,21 @@ pub(crate) fn records(arena: &Arena, an: &Analysis, completed: bool) -> Vec<(Loc
     let unused = an.unused.borrow();
     let mut seen = std::collections::HashSet::new();
     for (id, c) in callable_nodes(arena) {
-        if outcomes.get(c as usize) != Some(&Disposition::ClassifiedOnly) || !seen.insert(c) {
+        let d = outcomes.get(c as usize).copied();
+        if !matches!(d, Some(Disposition::ClassifiedOnly | Disposition::Inert)) || !seen.insert(c) {
+            continue;
+        }
+        if d == Some(Disposition::Inert) {
+            out.push((
+                arena.loc(id),
+                Consumer {
+                    at: None,
+                    field: field(arena, id),
+                    role: "-".to_owned(),
+                    disposition: disposition(&Disposition::Inert),
+                    reason: Some("never read by the source".to_owned()),
+                },
+            ));
             continue;
         }
         let reason = match unused.get(&c) {
@@ -178,6 +201,7 @@ fn unsupported(why: &Unsupported) -> String {
         Unsupported::Capture(c) => format!("Capture {c}"),
         Unsupported::HostApi(a) => format!("HostApi {}", api(*a)),
         Unsupported::Unmapped { api: a, id } => format!("Unmapped {} {id}", api(*a)),
+        Unsupported::Consumer(c) => format!("Consumer {c}"),
         other => variant(other),
     }
 }
@@ -186,6 +210,7 @@ fn unsupported(why: &Unsupported) -> String {
 fn disposition(d: &Disposition) -> String {
     match d {
         Disposition::NeverAnalysed => "never analysed".into(),
+        Disposition::Inert => "inert".into(),
         Disposition::ClassifiedOnly => "classified only".into(),
         Disposition::Lowered => "lowered".into(),
         Disposition::Replaced(why) => format!("replaced {}", unsupported(why)),
@@ -286,6 +311,10 @@ pub fn survey(root: &Path, entry: &str, facts: &ImportFacts, cancel: &Cancel) ->
                 *s.callables.entry((field, kind)).or_default() += 1;
             }
         }
+        if let Some(an) = def.arena.lua.as_deref().and_then(|l| l.analysis.as_deref()) {
+            s.root_script = an.scripts;
+            s.root_unread = an.unread;
+        }
     }
     let o = h.finish(def, counts, store, reads, &config);
     s.reads.clone_from(&o.reads);
@@ -340,7 +369,7 @@ mod tests {
              skin.source = { { id = \"a\", path = \"a.png\" } }\n\
              skin.image = { { id = \"i\", src = \"a\", x = 0, y = 0, w = 64, h = 64 } }\n\
              skin.gauge = { id = \"g\", nodes = { \"i\", \"i\", \"i\", \"i\" }, parts = 10 }\n\
-             skin.extra = { function() return true end }\n\
+             skin.extra = { function() return true end } skin.customEvents = { { id = 1000, action = function() return true end } }\n\
              skin.destination = {\n\
                { id = \"i\", op = { 906 }, draw = function() return true end, dst = { { w = 64, h = 64 } } },\n\
                { id = \"i\", mouseRect = { x = 0, y = 0, w = 1, h = 1 }, draw = function() return true end, dst = { { w = 64, h = 64 } } },\n\
@@ -394,6 +423,13 @@ mod tests {
                     Some("Unmapped main_state.number 425")
                 ),
                 (
+                    Some(8),
+                    "other",
+                    "-",
+                    "classified only",
+                    Some("field not consumed")
+                ),
+                (
                     Some(10),
                     "draw",
                     "-",
@@ -411,8 +447,8 @@ mod tests {
                     Some(8),
                     "other",
                     "-",
-                    "classified only",
-                    Some("field not consumed")
+                    "inert",
+                    Some("never read by the source")
                 ),
             ]
         );
@@ -425,8 +461,8 @@ mod tests {
         let d = folder(&[(
             "s.luaskin",
             "if not skin_config then return { type = 0 } end\n\
-             return { type = 0, extra = { function() return true end,\n\
-               function() local n = 0 n = 1 return true end } }",
+             return { type = 0, customEvents = { { action = function() return true end },\n\
+               { action = function() local n = 0 n = 1 return true end } } }",
         )]);
         let s = survey(
             d.path(),
@@ -502,7 +538,8 @@ return { type = 0 }",
         let d = folder(&[(
             "s.luaskin",
             "if skin_config then\n\
-               return { type = 0, extra = { string.find, string.len, type, function() end } }\n\
+               return { type = 0, customEvents = { { action = string.find }, { action = string.len },\n\
+                 { action = type }, { action = function() end } } }\n\
              end\nreturn { type = 0 }",
         )]);
         let s = survey(

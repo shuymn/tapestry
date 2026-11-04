@@ -571,19 +571,30 @@ fn numbered(name: &str, prefix: &str, suffix: &str, first: i32, count: i32) -> O
     (first..first + count).contains(&n).then_some(n)
 }
 
+/// The pattern names' numbers 1 to 10, as `numberedNames` writes them
+/// (`IntegerPropertyFactory.java:1072-1078`).
+const RANKS: [&str; 10] = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10"];
+
 /// `getIntegerProperty(String)` (`IntegerPropertyFactory.java:51-62`):
-/// `None` for a name the factory does not know, a script.
+/// `None` for a name the factory does not know, a script. Every pattern
+/// name is matched by equality, as the factory's are
+/// (`IntegerPropertyFactory.java:1029-1037`).
 pub(crate) fn int_by_name(name: &str) -> Option<IntProp> {
     if let Some(&(id, _)) = VALUE_TYPES.iter().find(|(_, n)| *n == name) {
         return Some(int_by_id(id));
     }
-    let pattern = numbered(name, "ranking_exscore", "", 1, 10).is_some()
-        || numbered(name, "ranking_index", "", 1, 10).is_some()
+    let ranked = |prefix: &str| {
+        name.strip_prefix(prefix)
+            .is_some_and(|n| RANKS.contains(&n))
+    };
+    let pattern = ranked("ranking_exscore")
+        || ranked("ranking_index")
         || FOLDER_NAMES.contains(&name)
-        || ["", "_rate", "_rate_afterdot"].iter().any(|suffix| {
-            IR_CLEARS
-                .iter()
-                .any(|c| name == format!("ir_player_{c}{suffix}"))
+        || name.strip_prefix("ir_player_").is_some_and(|rest| {
+            IR_CLEARS.iter().any(|c| {
+                rest.strip_prefix(c)
+                    .is_some_and(|suffix| ["", "_rate", "_rate_afterdot"].contains(&suffix))
+            })
         });
     pattern.then_some(IntProp::Unsupported(None))
 }
@@ -904,6 +915,43 @@ mod tests {
             str_by_name("targetnamep10"),
             Some(StrProp::Unsupported(None))
         );
+    }
+
+    #[test]
+    fn names_resolve_exactly_as_the_source_s_factories_resolve_them() {
+        // The integer patterns' names by equality
+        // (`IntegerPropertyFactory.java:1029-1037`, `:1072-1078`): any
+        // other spelling of a rank is a script.
+        for name in [
+            "ranking_exscore1",
+            "ranking_exscore10",
+            "ranking_index1",
+            "ranking_index10",
+            "ir_player_lightassist_rate_afterdot",
+            "folder_prefect",
+        ] {
+            assert_eq!(
+                int_by_name(name),
+                Some(IntProp::Unsupported(None)),
+                "{name}"
+            );
+        }
+        for name in [
+            "ranking_exscore+1",
+            "ranking_exscore01",
+            "ranking_exscore0",
+            "ranking_exscore11",
+            "ranking_index010",
+            "ranking_index-1",
+            "ir_player_assist_rated",
+        ] {
+            assert_eq!(int_by_name(name), None, "{name}");
+        }
+        // The string patterns parse their number as `Integer.parseInt`
+        // does (`StringPropertyFactory.java:57-63`), apart from digits
+        // other than ASCII, which are left to scripts.
+        assert_eq!(str_by_name("key+1"), Some(StrProp::Unsupported(None)));
+        assert_eq!(str_by_name("key\u{ff11}"), None);
     }
 
     #[test]

@@ -8,9 +8,11 @@
 //! and the chart's play level as given (`none` for a chart with no rank
 //! header, `pending` for a level the base snapshot has pending; each
 //! unavailable when not given), and prints its kind, what did not convert
-//! as allowlisted counts and outcomes, a record per callback consumer
-//! (where it is defined, its field, role, disposition and reason, and
-//! why a callback classified but never consumed was left), and the import
+//! as allowlisted counts and outcomes, how many script and unread-entry
+//! roots its configured table holds, a record per callback consumer
+//! (where it is defined, its field, role, disposition and reason, why a
+//! callback classified but never consumed was left, and each inert
+//! function the source never reads), and the import
 //! facts it read and recorded, each skin by its index in the arguments and
 //! each file by its index among those it consulted, then the skins per
 //! kind (`none` for a header refused). It prints no source, name, path,
@@ -119,6 +121,8 @@ fn main() {
         for ((field, kind), n) in &survey.callables {
             println!("  callable {field} {kind}: {n}");
         }
+        println!("  root script: {}", survey.root_script);
+        println!("  root unread: {}", survey.root_unread);
         for (outcome, n) in &survey.outcomes {
             println!("  callback {outcome}: {n}");
         }

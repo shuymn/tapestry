@@ -21,7 +21,20 @@
 //! UTF-8. A function becomes a typed callable, each instance once; any
 //! other value is refused.
 //!
-//! In the configured pass, each skin closure the table holds is looked up
+//! Each value is converted at its position in the source's schema
+//! ([`super::schema`]). In the configured pass, a function at a property
+//! field or an `op` entry is a root, marked when it is first met there
+//! (one met before only where the source never reads it is inert until
+//! then); a string at a property field its own name loader does not
+//! resolve is a script, its bytes charged as analysis work before the
+//! recognizer reads them. Each table's unread entries and metatable are
+//! summarized once, with its shape, and the summary applied at each place
+//! it is met: unread entries holding a function, a string or a table
+//! where the source lists every entry, or a metatable on a font fallback,
+//! like a script, open the analysis at the first such node
+//! ([`super::callback::Analysis::open`]).
+//!
+//! In the configured pass, each root skin closure is looked up
 //! by its tag ([`super::instrument`]) and its captures are copied
 //! ([`super::callback`]): its reader is called (the sandbox's generated
 //! code, which only reads its bindings) and each value kept as an owned
@@ -46,6 +59,7 @@ use skin_model::FileId;
 
 use super::callback::{self, Analysis, Captured, EnvCapture, Instance};
 use super::limits::MAX_CAPTURES;
+use super::schema::{Pos, ROOT_SCHEMA};
 use super::{LuaLimit, LuaWhy, Pass};
 use crate::error::{ImportError, InputLimit, Loc};
 use crate::limits::{MAX_DECODED_BYTES, MAX_DEPTH, MAX_NODES, MAX_STRING_BYTES};
@@ -193,7 +207,7 @@ pub(super) fn convert(
         decoded: 0,
         retained: 0,
     };
-    let top = c.table(&t, None, 1)?;
+    let top = c.table(&t, None, 1, Pos::Class(&ROOT_SCHEMA))?;
     c.capture()?;
     #[cfg(test)]
     super::tests::converted_witness();
@@ -245,6 +259,18 @@ enum Shape {
     Mixed(Rc<[Vec<u8>]>),
 }
 
+/// What a table holds that the conversion does not see, computed with its
+/// [`Shape`] once a conversion by its identity, and applied at each place
+/// it is met ([`Conv::table`]).
+#[derive(Clone, Copy, Debug, Default)]
+struct Summary {
+    /// It is [`Shape::Mixed`] and an entry under a key that is not a
+    /// string holds a function, a string or a table: what the source
+    /// reads as an element where it lists every entry.
+    unread: bool,
+    /// It has a metatable.
+    meta: bool,
+}
 struct Conv<'a> {
     pass: &'a Pass,
     tags: Option<Tags>,
@@ -257,7 +283,7 @@ struct Conv<'a> {
     /// Option tables read, by address.
     option_set_of: HashMap<usize, u32>,
     /// Tables enumerated, by address.
-    shapes: HashMap<usize, Shape>,
+    shapes: HashMap<usize, (Shape, Summary)>,
     /// The loaded modules' indices, by name: a callable's provenance is
     /// one hash of its source's name (at most 1 024 bytes).
     module_index: HashMap<&'a str, u16>,
@@ -362,17 +388,29 @@ impl Conv<'_> {
         Ok(id)
     }
 
-    /// Value `v`, its key's span when it has one, at
-    /// `depth`.
-    fn value(&mut self, v: &Value, span: Option<Span>, depth: u32) -> Result<u32, ImportError> {
+    /// Value `v`, its key's span when it has one, at `depth` and at
+    /// position `pos` of the source's schema.
+    fn value(
+        &mut self,
+        v: &Value,
+        span: Option<Span>,
+        depth: u32,
+        pos: Pos,
+    ) -> Result<u32, ImportError> {
         match v {
-            Value::Table(t) => self.table(t, span, depth),
+            Value::Table(t) => self.table(t, span, depth, pos),
             Value::Boolean(b) => self.scalar(LuaScalar::Bool(*b), span),
             Value::Integer(n) => self.scalar(LuaScalar::Int(*n), span),
             Value::Number(n) => self.scalar(LuaScalar::Float(*n), span),
             Value::String(s) => {
                 let (start, end) = self.text(&s.as_bytes())?;
-                self.scalar(LuaScalar::Str { start, end }, span)
+                let id = self.scalar(LuaScalar::Str { start, end }, span)?;
+                if let Pos::Prop(ser) = pos
+                    && self.tags.is_some()
+                {
+                    self.script(id, ser, (start, end))?;
+                }
+                Ok(id)
             }
             Value::Function(f) => {
                 let addr = f.to_pointer().addr();
@@ -387,10 +425,67 @@ impl Conv<'_> {
                         i
                     }
                 };
+                if matches!(pos, Pos::Prop(_)) {
+                    self.root(index, f)?;
+                }
                 self.scalar(LuaScalar::Callable(index), span)
             }
             _ => Err(self.lua(LuaWhy::Value)),
         }
+    }
+
+    /// Marks callable `i`, function `f`, as a root the first time it is
+    /// met at a property field or an `op` entry, a skin closure tagged
+    /// then: one met first where the source never reads it is inert until
+    /// then.
+    fn root(&mut self, i: u32, f: &Function) -> Result<(), ImportError> {
+        let Some(&c) = self.callables.get(i as usize) else {
+            return Ok(());
+        };
+        if c.root {
+            return Ok(());
+        }
+        let instance = if c.kind == CallableKind::Lua {
+            self.tagged(f)?.unwrap_or(NONE)
+        } else {
+            NONE
+        };
+        if let Some(c) = self.callables.get_mut(i as usize) {
+            c.root = true;
+            c.instance = instance;
+        }
+        Ok(())
+    }
+
+    /// The string at node `id`, span `text`, at a property field of
+    /// serializer `ser`: a script root when the field's name loader does
+    /// not resolve it, its bytes charged as analysis work before the
+    /// recognizer reads them.
+    fn script(
+        &mut self,
+        id: u32,
+        ser: super::schema::Serializer,
+        (start, end): Span,
+    ) -> Result<(), ImportError> {
+        let len = u64::from(end.saturating_sub(start));
+        self.analysis
+            .charge(len.saturating_add(1))
+            .map_err(|w| self.fatal(w))?;
+        let name = self
+            .bytes
+            .get(start as usize..end as usize)
+            .and_then(|b| std::str::from_utf8(b).ok())
+            .unwrap_or_default();
+        if !ser.resolves(name) {
+            self.analysis.scripts = self.analysis.scripts.saturating_add(1);
+            self.open(id);
+        }
+        Ok(())
+    }
+
+    /// Records node `id` as the open site unless one came before it.
+    fn open(&mut self, id: u32) {
+        self.analysis.open.get_or_insert(id);
     }
 
     /// What function `f`, at `addr`, is and where it was defined.
@@ -401,6 +496,7 @@ impl Conv<'_> {
                 line: 0,
                 kind: CallableKind::Host(api),
                 instance: NONE,
+                root: false,
             });
         }
         let info = f.info();
@@ -412,6 +508,7 @@ impl Conv<'_> {
                 line: 0,
                 kind: CallableKind::Library,
                 instance: NONE,
+                root: false,
             });
         }
         let source = info.source.as_deref().and_then(|s| s.strip_prefix('@'));
@@ -421,7 +518,6 @@ impl Conv<'_> {
             self.analysis.charge(len).map_err(|w| self.fatal(w))?;
         }
         let module = source.and_then(|s| self.module_index.get(s).copied());
-        let instance = self.tagged(f)?.unwrap_or(NONE);
         Ok(Callable {
             module,
             line: info
@@ -429,7 +525,8 @@ impl Conv<'_> {
                 .and_then(|l| u32::try_from(l).ok())
                 .unwrap_or(0),
             kind: CallableKind::Lua,
-            instance,
+            instance: NONE,
+            root: false,
         })
     }
 
@@ -695,17 +792,23 @@ impl Conv<'_> {
     /// met, and cancellation is seen every [`CHECK_EVERY`] entries and
     /// once the scan is done; `next`'s own walk over empty slots is
     /// bounded by the table's capacity in VM memory, met once per table.
-    fn enumerate(&mut self, t: &Table) -> Result<Shape, ImportError> {
+    /// Its [`Summary`] comes from the same scan: each entry's value type
+    /// read from the pair in hand, and the metatable, raw.
+    fn enumerate(&mut self, t: &Table) -> Result<(Shape, Summary), ImportError> {
         let (mut n, mut ints) = (0_usize, 0_usize);
         let (mut min, mut max) = (i64::MAX, i64::MIN);
         let mut keys: Vec<Vec<u8>> = Vec::new();
+        let mut held = false;
         for pair in t.pairs::<Value, Value>() {
             self.poll(n)?;
             if self.nodes.len().saturating_add(n) >= MAX_NODES {
                 return Err(self.input(InputLimit::Nodes));
             }
-            let (k, _) = pair.map_err(|e| self.mlua(&e))?;
+            let (k, v) = pair.map_err(|e| self.mlua(&e))?;
             n += 1;
+            if !matches!(k, Value::String(_)) {
+                held |= matches!(v, Value::Function(_) | Value::String(_) | Value::Table(_));
+            }
             match k {
                 Value::String(s) => {
                     let s = s.as_bytes();
@@ -728,25 +831,30 @@ impl Conv<'_> {
         if self.pass.ledger.cancelled() {
             return Err(self.lua(LuaWhy::Cancelled));
         }
-        if n == 0 {
-            Ok(Shape::Empty)
+        let shape = if n == 0 {
+            Shape::Empty
         } else if !keys.is_empty() {
             let all = keys.len() == n;
             let keys = self.sorted(keys)?;
-            Ok(if all {
+            if all {
                 Shape::Object(keys)
             } else {
                 Shape::Mixed(keys)
-            })
+            }
         } else if ints == n {
             let count = i64::try_from(ints).unwrap_or(i64::MAX);
             if min != 1 || max != count {
                 return Err(self.lua(LuaWhy::Sparse));
             }
-            Ok(Shape::Array(ints))
+            Shape::Array(ints)
         } else {
-            Err(self.lua(LuaWhy::Key))
-        }
+            return Err(self.lua(LuaWhy::Key));
+        };
+        let summary = Summary {
+            unread: held && matches!(shape, Shape::Mixed(_)),
+            meta: t.metatable().is_some(),
+        };
+        Ok((shape, summary))
     }
 
     /// `keys` sorted by their bytes, the bytes compared counted and the
@@ -773,8 +881,20 @@ impl Conv<'_> {
         Ok(Rc::from(keys))
     }
 
-    /// Table `t`, its key's span when it has one, at `depth`.
-    fn table(&mut self, t: &Table, span: Option<Span>, depth: u32) -> Result<u32, ImportError> {
+    /// Table `t`, its key's span when it has one, at `depth` and at
+    /// position `pos`. Its [`Summary`] applies at this place whether or
+    /// not the table was enumerated here: unread entries where the source
+    /// lists every entry, or a metatable on a font fallback, open the
+    /// analysis at its node. Each entry takes its position from `pos`: an
+    /// element's where every entry is one, a class's field by its key (one
+    /// search, charged first), and nothing the source reads elsewhere.
+    fn table(
+        &mut self,
+        t: &Table,
+        span: Option<Span>,
+        depth: u32,
+        pos: Pos,
+    ) -> Result<u32, ImportError> {
         if depth > MAX_DEPTH {
             return Err(self.input(InputLimit::Depth));
         }
@@ -785,12 +905,12 @@ impl Conv<'_> {
         // The table's shape, enumerated once a conversion by its identity:
         // a table met again through another reference is not scanned
         // again, while each reference is charged its nodes and key bytes.
-        let shape = match self.shapes.get(&addr) {
-            Some(shape) => shape.clone(),
+        let (shape, summary) = match self.shapes.get(&addr) {
+            Some(cached) => cached.clone(),
             None => {
-                let shape = self.enumerate(t)?;
-                self.shapes.insert(addr, shape.clone());
-                shape
+                let scanned = self.enumerate(t)?;
+                self.shapes.insert(addr, scanned.clone());
+                scanned
             }
         };
         let (kind, n) = match &shape {
@@ -803,6 +923,15 @@ impl Conv<'_> {
             return Err(self.input(InputLimit::Nodes));
         }
         let id = self.node(kind, span, 0)?;
+        if self.tags.is_some() {
+            if pos.lists() && summary.unread {
+                self.analysis.unread = self.analysis.unread.saturating_add(1);
+                self.open(id);
+            }
+            if matches!(pos, Pos::FontFallback) && summary.meta {
+                self.open(id);
+            }
+        }
         self.path.push(addr);
         let mut prev = NONE;
         let mut link = |c: &mut Self, child: u32| {
@@ -813,10 +942,11 @@ impl Conv<'_> {
             }
             prev = child;
         };
+        let element = pos.element();
         if kind == Kind::Array {
             for i in 1..=n {
                 let v: Value = t.raw_get(i).map_err(|e| self.mlua(&e))?;
-                let child = self.value(&v, None, depth + 1)?;
+                let child = self.value(&v, None, depth + 1, element)?;
                 link(self, child);
             }
         } else if let Shape::Object(keys) | Shape::Mixed(keys) = &shape {
@@ -825,10 +955,17 @@ impl Conv<'_> {
             // never read.
             for k in keys.iter() {
                 let span = self.text(k)?;
+                let at = match pos {
+                    Pos::Class(c) => {
+                        self.analysis.charge(1).map_err(|w| self.fatal(w))?;
+                        c.field(k)
+                    }
+                    _ => element,
+                };
                 let v: Value = t
                     .raw_get(mlua::BString::from(k.as_slice()))
                     .map_err(|e| self.mlua(&e))?;
-                let child = self.value(&v, Some(span), depth + 1)?;
+                let child = self.value(&v, Some(span), depth + 1, at)?;
                 link(self, child);
             }
         }
