@@ -116,6 +116,8 @@ unicode-normalization = "0.1.26"
 
 # xtask (dev tooling, never shipped)
 cargo_metadata = "0.23.1"
+# The contract check reads design.md as CommonMark.
+pulldown-cmark = { version = "0.13.6", default-features = false }
 # The lint site check parses Rust source.
 proc-macro2 = { version = "1.0.107", default-features = false }
 quote = { version = "1.0.47", default-features = false }

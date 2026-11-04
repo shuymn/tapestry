@@ -2,7 +2,7 @@
 //! Contract" names design.md headings and tests that exist, and every row
 //! of design.md "Threats and Mitigations" has its own threat ID.
 //!
-//! A clause is a bullet of the contract section, one line in the form
+//! A clause is a list item of the contract section, in the form
 //! `- <clause with SHALL> ("<heading>"[, ...]). Spec: `<file>::<test>`[, ...].`
 //! Each quoted heading must be a design.md heading, so renaming a cited
 //! heading fails the check, as does renaming the contract or threat
@@ -12,20 +12,23 @@
 //! table's first column is `ID`, and each row's ID is `T` and two digits,
 //! used once.
 //!
-//! Everything is read as text, line by line: design.md's headings (outside
-//! code fences, each closed by its own marker), the contract section's
-//! bullets, the threat table (rows indented up to three spaces), and the
-//! cited files. A cited `fn` is not proven to be compiled: one inside a
-//! raw string, a macro never invoked or a `cfg` that removes it still
-//! counts. A citation names a file, not a module path, and an attribute
-//! spelled unusually (`#[ignore/* c */]`) is not recognized. CI building
-//! and running the tests, and review, cover those.
+//! design.md is read with a CommonMark parser (`pulldown-cmark`, with
+//! tables): its headings, the contract section's list items and the threat
+//! table are what that parser returns, so code blocks, inline code and
+//! other markdown elsewhere cannot change them. The cited files are read
+//! as text, line by line. A cited `fn` is not proven to be compiled: one
+//! inside a raw string, a macro never invoked or a `cfg` that removes it
+//! still counts. A citation names a file, not a module path, and an
+//! attribute spelled unusually (`#[ignore/* c */]`) is not recognized. CI
+//! building and running the tests, and review, cover those.
 
 use std::collections::BTreeMap;
 use std::io;
+use std::ops::Range;
 use std::path::Path;
 
 use anyhow::Context as _;
+use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 
 /// The design document, relative to the workspace root.
 pub const DESIGN: &str = "docs/design.md";
@@ -47,77 +50,149 @@ pub fn run(manifest: &Path) -> anyhow::Result<Vec<String>> {
 
 /// The diagnostics for `design`, reading each cited file through `read`.
 pub fn check(design: &str, read: impl Fn(&str) -> io::Result<String>) -> Vec<String> {
-    let lines: Vec<&str> = design.lines().collect();
-    let headings = headings(&lines);
+    let doc = Doc::parse(design);
     let mut diags = Vec::new();
-    contract(&lines, &headings, &read, &mut diags);
-    threats(&lines, &headings, &mut diags);
+    contract(&doc, &read, &mut diags);
+    threats(&doc, &mut diags);
     diags
 }
 
-/// A heading: its line index, level and text.
+/// A heading: its line index, level and source text.
 struct Heading<'a> {
     line: usize,
     level: usize,
     text: &'a str,
 }
 
-/// `line` without the up to three spaces of indentation a block may have.
-fn unindent(line: &str) -> &str {
-    let spaces = line.bytes().take(4).take_while(|&b| b == b' ').count();
-    line.get(spaces.min(3)..).unwrap_or(line)
+/// A list item at the top level of a list: its line index and its source
+/// text after the marker, its lines joined by spaces.
+struct Item {
+    line: usize,
+    text: String,
 }
 
-/// A code fence line's marker and its length: three or more backticks or
-/// tildes.
-fn fence(line: &str) -> Option<(u8, usize)> {
-    let line = unindent(line);
-    let marker = *line
-        .as_bytes()
-        .first()
-        .filter(|&&b| b == b'`' || b == b'~')?;
-    let len = line.bytes().take_while(|&b| b == marker).count();
-    (len >= 3).then_some((marker, len))
+/// A table: its line index, its header's first cell and each body row's
+/// line index and first cell.
+struct Table {
+    line: usize,
+    header: String,
+    rows: Vec<(usize, String)>,
 }
 
-/// The ATX headings outside code fences. A fence closes on a line of its
-/// own marker, at least as long as the opening one and nothing after it.
-fn headings<'a>(lines: &[&'a str]) -> Vec<Heading<'a>> {
-    let mut out = Vec::new();
-    let mut open: Option<(u8, usize)> = None;
-    for (line, text) in lines.iter().enumerate() {
-        if let Some((marker, len)) = open {
-            let closes = fence(text).is_some_and(|(m, l)| {
-                m == marker
-                    && l >= len
-                    && unindent(text).get(l..).is_some_and(|r| r.trim().is_empty())
-            });
-            if closes {
-                open = None;
+/// What the checker reads from design.md, as the CommonMark parser
+/// returns it.
+struct Doc<'a> {
+    headings: Vec<Heading<'a>>,
+    items: Vec<Item>,
+    tables: Vec<Table>,
+}
+
+impl<'a> Doc<'a> {
+    fn parse(source: &'a str) -> Self {
+        let starts: Vec<usize> = std::iter::once(0)
+            .chain(source.match_indices('\n').map(|(i, _)| i + 1))
+            .collect();
+        let line_of = |offset: usize| starts.partition_point(|&s| s <= offset).saturating_sub(1);
+        let mut doc = Doc {
+            headings: Vec::new(),
+            items: Vec::new(),
+            tables: Vec::new(),
+        };
+        let mut lists = 0_usize;
+        // The cell being read, and whether it is a row's first.
+        let mut cell: Option<(String, bool)> = None;
+        let mut column = 0_usize;
+        for (event, range) in Parser::new_ext(source, Options::ENABLE_TABLES).into_offset_iter() {
+            match event {
+                Event::Start(Tag::Heading { level, .. }) => doc.headings.push(Heading {
+                    line: line_of(range.start),
+                    level: level as usize,
+                    text: heading_text(source, range),
+                }),
+                Event::Start(Tag::List(_)) => lists += 1,
+                Event::End(TagEnd::List(_)) => lists = lists.saturating_sub(1),
+                Event::Start(Tag::Item) if lists == 1 => doc.items.push(Item {
+                    line: line_of(range.start),
+                    text: item_text(source.get(range).unwrap_or_default()),
+                }),
+                Event::Start(Tag::Table(_)) => doc.tables.push(Table {
+                    line: line_of(range.start),
+                    header: String::new(),
+                    rows: Vec::new(),
+                }),
+                Event::Start(Tag::TableHead) => column = 0,
+                Event::Start(Tag::TableRow) => {
+                    column = 0;
+                    if let Some(t) = doc.tables.last_mut() {
+                        t.rows.push((line_of(range.start), String::new()));
+                    }
+                }
+                Event::Start(Tag::TableCell) => {
+                    cell = Some((String::new(), column == 0));
+                    column += 1;
+                }
+                Event::Text(text) | Event::Code(text) => {
+                    if let Some((s, _)) = cell.as_mut() {
+                        s.push_str(&text);
+                    }
+                }
+                Event::End(TagEnd::TableCell) => {
+                    if let (Some((text, true)), Some(t)) = (cell.take(), doc.tables.last_mut()) {
+                        let text = text.trim().to_owned();
+                        match t.rows.last_mut() {
+                            Some(row) => row.1 = text,
+                            None => t.header = text,
+                        }
+                    }
+                }
+                _ => {}
             }
-            continue;
         }
-        if let Some(f) = fence(text) {
-            open = Some(f);
-            continue;
-        }
-        let level = text.bytes().take_while(|&b| b == b'#').count();
-        if (1..=6).contains(&level)
-            && let Some(rest) = text[level..].strip_prefix(' ')
-        {
-            out.push(Heading {
-                line,
-                level,
-                text: rest.trim(),
-            });
-        }
+        doc
     }
-    out
+}
+
+/// An ATX heading's text without its `#` marks, or a setext heading's
+/// first line.
+fn heading_text(source: &str, range: Range<usize>) -> &str {
+    let raw = source.get(range).unwrap_or_default();
+    let first = raw.lines().next().unwrap_or_default().trim();
+    match first.strip_prefix('#') {
+        Some(_) => {
+            let text = first.trim_start_matches('#').trim();
+            // An optional closing sequence after a space.
+            match text.trim_end_matches('#') {
+                rest if rest.len() < text.len() && (rest.is_empty() || rest.ends_with(' ')) => {
+                    rest.trim_end()
+                }
+                _ => text,
+            }
+        }
+        None => first,
+    }
+}
+
+/// A list item's source after its marker, its lines trimmed and joined by
+/// spaces.
+fn item_text(raw: &str) -> String {
+    let raw = raw.trim_start();
+    let digits = raw.bytes().take_while(u8::is_ascii_digit).count();
+    let rest = match raw.get(digits..) {
+        Some(r) if digits > 0 => r.strip_prefix(['.', ')']).unwrap_or(r),
+        Some(r) => r.strip_prefix(['-', '*', '+']).unwrap_or(r),
+        None => raw,
+    };
+    let lines: Vec<&str> = rest
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    lines.join(" ")
 }
 
 /// The line range of the section under the heading `text` at `level`, up
 /// to the next heading at that level or above.
-fn section(headings: &[Heading], level: usize, text: &str, end: usize) -> Option<(usize, usize)> {
+fn section(headings: &[Heading], level: usize, text: &str) -> Option<(usize, usize)> {
     let i = headings
         .iter()
         .position(|h| h.level == level && h.text == text)?;
@@ -126,7 +201,7 @@ fn section(headings: &[Heading], level: usize, text: &str, end: usize) -> Option
         .iter()
         .skip(i + 1)
         .find(|h| h.level <= level)
-        .map_or(end, |h| h.line);
+        .map_or(usize::MAX, |h| h.line);
     Some((start, stop))
 }
 
@@ -134,21 +209,21 @@ fn at(line: usize) -> String {
     format!("{DESIGN}:{}", line + 1)
 }
 
-fn contract(
-    lines: &[&str],
-    headings: &[Heading],
-    read: &impl Fn(&str) -> io::Result<String>,
-    diags: &mut Vec<String>,
-) {
-    let Some((start, stop)) = section(headings, 2, CONTRACT, lines.len()) else {
+fn contract(doc: &Doc, read: &impl Fn(&str) -> io::Result<String>, diags: &mut Vec<String>) {
+    let Some((start, stop)) = section(&doc.headings, 2, CONTRACT) else {
         diags.push(format!("{DESIGN}: no \"## {CONTRACT}\" section"));
         return;
     };
     let mut files = BTreeMap::new();
-    for (i, line) in lines.iter().enumerate().take(stop).skip(start) {
-        if let Some(clause) = line.strip_prefix("- ") {
-            check_clause(i, clause, headings, read, &mut files, diags);
-        }
+    for item in doc.items.iter().filter(|i| (start..stop).contains(&i.line)) {
+        check_clause(
+            item.line,
+            &item.text,
+            &doc.headings,
+            read,
+            &mut files,
+            diags,
+        );
     }
 }
 
@@ -332,53 +407,43 @@ fn attributes(lines: &[&str], def: usize) -> Vec<String> {
     out
 }
 
-fn threats(lines: &[&str], headings: &[Heading], diags: &mut Vec<String>) {
-    let Some((start, stop)) = section(headings, 3, THREATS, lines.len()) else {
+fn threats(doc: &Doc, diags: &mut Vec<String>) {
+    let Some((start, stop)) = section(&doc.headings, 3, THREATS) else {
         diags.push(format!("{DESIGN}: no \"### {THREATS}\" section"));
         return;
     };
-    let is_row = |i: usize| lines.get(i).is_some_and(|l| unindent(l).starts_with('|'));
-    let Some(table) = (start..stop).find(|&i| is_row(i)) else {
+    let Some(table) = doc.tables.iter().find(|t| (start..stop).contains(&t.line)) else {
         diags.push(format!("{DESIGN}: no table under \"### {THREATS}\""));
         return;
     };
-    let first_cell = |i: usize| {
-        lines
-            .get(i)
-            .and_then(|l| l.trim().strip_prefix('|'))
-            .and_then(|l| l.split('|').next())
-            .map(str::trim)
-    };
-    if first_cell(table) != Some("ID") {
+    if table.header != "ID" {
         diags.push(format!(
             "{}: the threat table's first column is not \"ID\"",
-            at(table)
+            at(table.line)
         ));
         return;
     }
     let mut seen: BTreeMap<&str, usize> = BTreeMap::new();
-    // The header and its separator row come first.
-    let rows = (table + 2..stop).take_while(|&i| is_row(i));
-    for i in rows {
-        let id = first_cell(i).unwrap_or_default();
+    for (line, id) in &table.rows {
+        let (line, id) = (*line, id.as_str());
         let well_formed = id
             .strip_prefix('T')
             .is_some_and(|n| n.len() == 2 && n.bytes().all(|b| b.is_ascii_digit()));
         if id.is_empty() {
-            diags.push(format!("{}: the threat row has no ID", at(i)));
+            diags.push(format!("{}: the threat row has no ID", at(line)));
         } else if !well_formed {
             diags.push(format!(
                 "{}: threat ID `{id}` is not `T` and two digits",
-                at(i)
+                at(line)
             ));
         } else if let Some(&first) = seen.get(id) {
             diags.push(format!(
                 "{}: threat ID `{id}` is already used on line {}",
-                at(i),
+                at(line),
                 first + 1
             ));
         } else {
-            seen.insert(id, i);
+            seen.insert(id, line);
         }
     }
 }
@@ -658,6 +723,32 @@ fn with_a_long_attribute() {}
         assert_eq!(
             run(&design_with("| T02 |", "  |  |"), SOURCE),
             ["docs/design.md:16: the threat row has no ID"]
+        );
+    }
+
+    #[test]
+    fn a_fence_inside_a_list_item_closes_there() {
+        let listed = design_with("Notes on the table.", "- ```text\n  code\n  ```");
+        assert_eq!(run(&listed, SOURCE), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_line_of_inline_code_opens_no_fence() {
+        let inline = design_with("Notes on the table.", "``` inline ```");
+        assert_eq!(run(&inline, SOURCE), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_no_break_space_does_not_close_a_fence() {
+        // `~~~` and a no-break space is a line of the code block.
+        let hidden = design_with(
+            "The watermark prose.",
+            "The watermark prose.\n\n~~~\n~~~\u{a0}\n## Hidden\n~~~\u{a0}\n~~~",
+        );
+        let hidden = hidden.replace("once (\"Watermark\")", "once (\"Hidden\")");
+        assert_eq!(
+            run(&hidden, SOURCE),
+            ["docs/design.md:30: \"Hidden\" is not a design.md heading"]
         );
     }
 
