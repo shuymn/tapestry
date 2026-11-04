@@ -306,3 +306,25 @@ fn a_slot_is_projected_at_its_commit() {
     );
     assert!(r.slot_staging(ScreenKind::Play).is_none());
 }
+
+/// Another kind's staging of play's installed bundle shares its CPU
+/// description but has its own loading presentation, which the witness
+/// counts; play's own staging of it shares both.
+#[test]
+fn another_kinds_staging_counts_its_own_presentation() {
+    let mut r = offscreen(1_920, 1_080);
+    let red = tiny(&r, RED);
+    commit(&mut r, ScreenKind::Play, &red, 1);
+    let installed = r.memory();
+    assert!(installed.loading > 0);
+
+    r.install(ScreenKind::Selection, &red, 2).unwrap();
+    let staged = r.memory();
+    assert_eq!(staged.staged_cpu, 0, "the pages are play's");
+    assert_eq!(staged.staged_loading, installed.loading);
+    assert!(staged.staged_atlas > 0, "its own atlas array");
+
+    r.install(ScreenKind::Play, &red, 3).unwrap();
+    let again = r.memory();
+    assert_eq!((again.staged_cpu, again.staged_loading), (0, 0));
+}

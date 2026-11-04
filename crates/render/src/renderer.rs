@@ -1454,20 +1454,28 @@ impl Renderer {
     }
 
     /// The bytes held for the play skin now, the staged installation's
-    /// included ([`MemoryWitness`]).
+    /// included ([`MemoryWitness`]). The staged bundle's CPU description
+    /// is counted unless it is play's installed bundle, and its loading
+    /// presentation unless it is play's installed presentation: another
+    /// kind's staging of play's bundle shares its pages but has its own
+    /// presentation.
     #[must_use]
     pub fn memory(&self) -> MemoryWitness {
-        let staged = self.pending.as_ref();
+        let staged = self.pending.as_ref().map(|p| (p, p.skin.installation()));
         let installed = self.installed.as_ref();
-        let other = staged
-            .map(|p| p.skin.installation())
-            .filter(|s| !installed.is_some_and(|i| Arc::ptr_eq(i.bundle(), s.bundle())));
+        let cpu = staged
+            .as_ref()
+            .filter(|(_, s)| !installed.is_some_and(|i| Arc::ptr_eq(i.bundle(), s.bundle())));
+        let loading = staged
+            .as_ref()
+            .filter(|(_, s)| !installed.is_some_and(|i| i.loading().same(s.loading())));
+        let staged = staged.as_ref().map(|(p, _)| *p);
         let res = staged.and_then(|p| p.resources.as_ref());
         MemoryWitness {
             committed_cpu: installed.map_or(0, |i| i.bundle().resident_bytes()),
-            staged_cpu: other.as_ref().map_or(0, |s| s.bundle().resident_bytes()),
+            staged_cpu: cpu.map_or(0, |(_, s)| s.bundle().resident_bytes()),
             loading: installed.map_or(0, |i| i.loading().bytes()),
-            staged_loading: other.as_ref().map_or(0, |s| s.loading().bytes()),
+            staged_loading: loading.map_or(0, |(_, s)| s.loading().bytes()),
             staged_text: self.staged_text.as_ref().map_or(0, StagedText::bytes),
             atlas: self.atlas.bytes(),
             staged_atlas: res.map_or(0, |r| r.atlas.bytes()),
