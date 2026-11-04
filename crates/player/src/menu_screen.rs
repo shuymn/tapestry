@@ -416,7 +416,10 @@ impl MenuScreen {
         {
             Ok(()) => self.chosen.staged = Some(asked),
             Err(e) => {
-                eprintln!("render: the chosen chart's text was not prepared: {e}");
+                eprintln!(
+                    "render: the chosen chart's text was not prepared: {}",
+                    game::Chain(&e)
+                );
                 self.chosen.installed = None;
                 self.chosen.refused = Some(asked);
             }

@@ -20,11 +20,12 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use bms_model::{Chart, ChartBuilder, TimeUs};
 use common::{GAUGES, context, input, offscreen, read_back, view};
 use outline_support::{FontRec, Value, default_font, distance_field, text, ttf};
+use render::text::MenuText;
 use render::{
     AttemptInput, AttemptText, LineBounds, LineFit, LineLayout, OutlineText, Renderer, SkinBundle,
     SkinError, TextResidency, text_upload_bound,
 };
-use skin_model::{ChartText, TextRequest};
+use skin_model::{ChartText, TextRequest, TextSlots};
 
 fn chart() -> Chart {
     ChartBuilder::new(120_000).build().unwrap()
@@ -40,15 +41,17 @@ fn labels<'a>(title: &'a str, artist: &'a str) -> ChartText<'a> {
     }
 }
 
-/// The producer, counting the lines it rasterizes.
+/// The producer, counting the lines it lays out and rasterizes.
 #[derive(Debug)]
 struct Counting {
     inner: OutlineText,
+    layouts: AtomicU32,
     rasters: AtomicU32,
 }
 
 impl AttemptText for Counting {
     fn layout(&self, req: &TextRequest, em_px: f32, bounds: LineBounds) -> LineFit {
+        self.layouts.fetch_add(1, Ordering::SeqCst);
         self.inner.layout(req, em_px, bounds)
     }
 
@@ -69,6 +72,7 @@ fn counted(r: &Renderer, dir: &Path) -> (Arc<SkinBundle>, Arc<Counting>) {
     let b = outline_support::bundle_with(r, dir, |skin| {
         let c = Arc::new(Counting {
             inner: outline_support::producer(skin, &default).unwrap(),
+            layouts: AtomicU32::new(0),
             rasters: AtomicU32::new(0),
         });
         kept = Some(Arc::clone(&c));
@@ -298,4 +302,184 @@ fn witness_terms_are_disjoint() {
     // The mask counts once in the total, apart from every other term.
     let without = render::MemoryWitness { text_mask: 0, ..m };
     assert_eq!(m.total(), without.total() + render::MAX_TEXT_MASK_BYTES);
+}
+
+/// A face whose `A` to `F` are blocks 7.8 em wide and 3.5 em tall less
+/// 0.2 em a letter on: at em 256 two of them fill a 2048 layer, and each
+/// letter draws its own height.
+fn steps() -> Vec<u8> {
+    let mut s = font_support::latin("Steps");
+    for n in 0..6_u16 {
+        s.glyphs[usize::from(font_support::capital(n))] = font_support::Glyph {
+            advance: 7_850,
+            rect: Some([0, 0, 7_800, 3_500 - 200 * i16::try_from(n).unwrap()]),
+        };
+    }
+    font_support::build(&s)
+}
+
+/// A skin of a title and an artist in [`steps`] at em 256.
+fn step_skin() -> tempfile::TempDir {
+    outline_support::folder(
+        &[("ttf.ttf", steps())],
+        &[ttf()],
+        &[
+            text("f", 256, Value::Ref(10), [0, 0, 100, 256]),
+            text("f", 256, Value::Ref(16), [0, 400, 100, 256]),
+        ],
+    )
+}
+
+/// A loading frame of lifetime 1 drawn and read back.
+fn loading_frame(r: &mut Renderer, menu: &MenuText) -> Vec<u8> {
+    common::loading(r, menu, &common::loading_frame(1, TimeUs(0), TimeUs(0)))
+}
+
+/// The loading text of `text` prepared for lifetime 1 at `revision`, every
+/// slot.
+fn prepare_loading(r: &mut Renderer, revision: u64, text: &ChartText<'_>) {
+    r.prepare_loading_text(1, revision, TextSlots::ALL, text)
+        .unwrap();
+}
+
+/// The attempt staged on the installed resources keeps its lines while
+/// the loading text is prepared under pressure: with the installed
+/// attempt's lines filling the layer, the loading lines find no room at
+/// the full em, evict nothing and are set smaller; the installed attempt
+/// still draws untouched, and once committed the staged attempt draws as
+/// it does where no loading text was prepared.
+#[test]
+fn attempt_pin_survives_loading() {
+    let dir = step_skin();
+    let mut r = offscreen(1_920, 1_080);
+    let b = outline_support::bundle_in(&r, dir.path(), &default_font());
+    let token = stage(&mut r, &b, &labels("A", "B"), 1);
+    r.commit(token).unwrap();
+    let installed = frame(&mut r);
+    let staged = stage(&mut r, &b, &labels("C", "D"), 2);
+    assert!(r.text_report().counts.rounds > 1);
+
+    r.enter_loading(1);
+    prepare_loading(&mut r, 1, &labels("E", "F"));
+    let report = r.text_report();
+    assert!(report.notes.is_empty(), "{:?}", report.notes);
+    assert_eq!(report.counts.evictions, 0, "{:?}", report.counts);
+    assert!(report.counts.rounds > 1, "{:?}", report.counts);
+    assert_eq!(report.counts.placements, 2);
+    assert_eq!(frame(&mut r), installed);
+    r.commit(staged).unwrap();
+    let committed = frame(&mut r);
+
+    let mut q = offscreen(1_920, 1_080);
+    let qb = outline_support::bundle_in(&q, dir.path(), &default_font());
+    let token = stage(&mut q, &qb, &labels("A", "B"), 1);
+    q.commit(token).unwrap();
+    let token = stage(&mut q, &qb, &labels("C", "D"), 2);
+    q.commit(token).unwrap();
+    assert_eq!(committed, frame(&mut q));
+}
+
+/// The staged loading text and then the installed loading lines keep
+/// their lines while an attempt is staged under pressure: with the
+/// loading lines filling the layer, the attempt's lines evict none of
+/// them and are set smaller, and the loading frame draws the loading
+/// lines as it does where no attempt was staged.
+#[test]
+fn loading_pins_survive_attempt() {
+    let dir = step_skin();
+    let mut r = offscreen(1_920, 1_080);
+    let menu = MenuText::new(&r);
+    let b = outline_support::bundle_in(&r, dir.path(), &default_font());
+    common::install(&mut r, &b, 1);
+    r.enter_loading(1);
+    prepare_loading(&mut r, 1, &labels("A", "B"));
+    assert_eq!(r.text_report().counts.rounds, 1);
+
+    // Staged: held by the staged text.
+    stage(&mut r, &b, &labels("C", "D"), 2);
+    let report = r.text_report();
+    assert!(report.notes.is_empty(), "{:?}", report.notes);
+    assert_eq!(report.counts.evictions, 0, "{:?}", report.counts);
+    assert!(report.counts.rounds > 1, "{:?}", report.counts);
+    assert_eq!(r.install_staged_loading_text(), Ok(true));
+    let drawn = loading_frame(&mut r, &menu);
+    assert!(lit(&drawn).is_some(), "the loading lines drew nothing");
+
+    // Installed: held by the installed lines. The attempt staged before
+    // is replaced, so its lines may go, and only they.
+    stage(&mut r, &b, &labels("E", "F"), 3);
+    let report = r.text_report();
+    assert!(report.notes.is_empty(), "{:?}", report.notes);
+    assert!(report.counts.rounds > 1, "{:?}", report.counts);
+    assert_eq!(loading_frame(&mut r, &menu), drawn);
+
+    let mut q = offscreen(1_920, 1_080);
+    let qmenu = MenuText::new(&q);
+    let qb = outline_support::bundle_in(&q, dir.path(), &default_font());
+    common::install(&mut q, &qb, 1);
+    q.enter_loading(1);
+    prepare_loading(&mut q, 1, &labels("A", "B"));
+    assert_eq!(q.install_staged_loading_text(), Ok(true));
+    assert_eq!(drawn, loading_frame(&mut q, &qmenu));
+}
+
+/// Loading lines set at a smaller em under pressure are found again by
+/// the attempt of the same labels through their aliases: in its first
+/// round, every request a hit, nothing laid out or rasterized again.
+#[test]
+fn loading_to_attempt_reuse_after_refit() {
+    let dir = step_skin();
+    let mut r = offscreen(1_920, 1_080);
+    let (b, c) = counted(&r, dir.path());
+    let token = stage(&mut r, &b, &labels("A", "B"), 1);
+    r.commit(token).unwrap();
+    r.enter_loading(1);
+    prepare_loading(&mut r, 1, &labels("C", "D"));
+    let refit = r.text_report().counts;
+    assert!(refit.rounds > 1, "{refit:?}");
+    assert_eq!(refit.placements, 2);
+    assert_eq!(r.install_staged_loading_text(), Ok(true));
+    let (layouts, rasters) = (
+        c.layouts.load(Ordering::SeqCst),
+        c.rasters.load(Ordering::SeqCst),
+    );
+
+    let token = stage(&mut r, &b, &labels("C", "D"), 2);
+    let counts = r.text_report().counts;
+    assert_eq!(
+        (counts.rounds, counts.hits, counts.placements),
+        (1, 2, 0),
+        "{counts:?}"
+    );
+    assert_eq!(c.layouts.load(Ordering::SeqCst), layouts);
+    assert_eq!(c.rasters.load(Ordering::SeqCst), rasters);
+    r.commit(token).unwrap();
+    assert!(lit(&frame(&mut r)).is_some());
+}
+
+/// A cleared loading slot lets go of its line, and only that slot: with
+/// the loading lines filling the layer and the title cleared, an attempt
+/// under pressure evicts the title's line and never the artist's, which
+/// its slot still draws. Replaced resources start with nothing held: once
+/// the installation is restored, the installed text layer's cache and
+/// holders hold no bytes.
+#[test]
+fn cleared_loading_slots_release_their_lines() {
+    let dir = step_skin();
+    let mut r = offscreen(1_920, 1_080);
+    let b = outline_support::bundle_in(&r, dir.path(), &default_font());
+    common::install(&mut r, &b, 1);
+    r.enter_loading(1);
+    prepare_loading(&mut r, 1, &labels("A", "B"));
+    assert_eq!(r.install_staged_loading_text(), Ok(true));
+    r.clear_loading_text(TextSlots::field(skin_model::TextField::Title));
+    stage(&mut r, &b, &labels("C", "D"), 2);
+    let counts = r.text_report().counts;
+    assert_eq!(counts.evictions, 1, "{counts:?}");
+    assert!(r.memory().text_cache > 0);
+
+    let installation = r.installation(skin_model::ScreenKind::Play).unwrap();
+    r.restore(skin_model::ScreenKind::Play, &installation)
+        .unwrap();
+    assert_eq!(r.memory().text_cache, 0);
 }

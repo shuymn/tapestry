@@ -1793,6 +1793,14 @@ impl Skin {
         Loading::new(self.whens.len(), self.text_slots(), scratch)
     }
 
+    /// Whether text slot `slot` is one that `which` names (a composite
+    /// with its parts), as [`install_loading_text`](Self::install_loading_text)
+    /// and [`clear_loading_text`](Self::clear_loading_text) name them.
+    #[must_use]
+    pub fn names_text_slot(&self, which: TextSlots, slot: u16) -> bool {
+        self.named_slots(which).any(|(s, ..)| s == slot)
+    }
+
     /// The text elements `which` names, as `(slot, its value, its
     /// bitmap font)`.
     fn named_slots(

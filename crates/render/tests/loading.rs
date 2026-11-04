@@ -634,7 +634,8 @@ fn chosen_chart_text_installs_only_where_it_was_prepared() {
     let dir = tempfile::tempdir().unwrap();
     let mut r = offscreen(1_920, 1_080);
     let text = MenuText::new(&r);
-    let (a, _) = bundle(&r, dir.path(), &chart_texts([255, 0, 0, 255]));
+    let (a, producer) = bundle(&r, dir.path(), &chart_texts([255, 0, 0, 255]));
+    let producer = producer.unwrap();
     let (b, _) = bundle(&r, dir.path(), &chart_texts([0, 255, 0, 255]));
     install(&mut r, &a, 1);
     r.enter_loading(1);
@@ -655,6 +656,9 @@ fn chosen_chart_text_installs_only_where_it_was_prepared() {
         [RED, BLACK, BLACK, RED],
         "the title and the full title, nothing unavailable"
     );
+    // Laid out by the bundle's producer: the title, and the full title
+    // the same line.
+    assert_eq!(*producer.strings.lock().unwrap(), ["B"]);
 
     // The title cleared: its slot and the full title's draw nothing.
     r.clear_loading_text(TextSlots::field(TextField::Title));
@@ -714,7 +718,9 @@ fn chosen_chart_text_installs_only_where_it_was_prepared() {
 }
 
 /// Text requested again and again keeps one table staged, the newest,
-/// and the memory witness counts it: the same as one request's.
+/// and the memory witness counts it: the same as one request's. Lines
+/// placed once are hits from the next request of them on, so the text
+/// layer's cache stays and nothing more is uploaded.
 #[test]
 fn staged_chart_text_is_bounded() {
     let dir = tempfile::tempdir().unwrap();
@@ -724,9 +730,17 @@ fn staged_chart_text_is_bounded() {
     r.enter_loading(1);
     r.prepare_loading_text(1, 1, TextSlots::ALL, &chosen("B", "b", ""))
         .unwrap();
+    let first = r.memory().staged_text;
+    assert!(first > 0);
+    r.prepare_loading_text(1, 2, TextSlots::ALL, &chosen("A", "a", ""))
+        .unwrap();
+    assert!(r.text_report().upload_bytes > 0);
+    r.prepare_loading_text(1, 3, TextSlots::ALL, &chosen("A", "a", ""))
+        .unwrap();
     let one = r.memory();
-    assert!(one.staged_text > 0);
-    for revision in 2..20 {
+    assert_eq!(one.staged_text, first);
+    assert_eq!(one.text_upload, 0, "hits upload nothing");
+    for revision in 4..20 {
         r.prepare_loading_text(1, revision, TextSlots::ALL, &chosen("A", "a", ""))
             .unwrap();
         assert_eq!(r.memory(), one, "revision {revision}");
