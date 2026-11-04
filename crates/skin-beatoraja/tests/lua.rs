@@ -2187,15 +2187,7 @@ fn a_mixed_table_has_no_wrapper_meaning() {
     // An `include` beside a positional entry is a field like any other:
     // the record is drawn as a failure-timed destination, and the absent
     // `empty.json` is never read.
-    let failure = |extra: &str| {
-        folder(&[(
-            "s.luaskin",
-            &skin(
-                "",
-                &format!("skin.destination = {{ {{ id = \"i\", timer = 3, {DST}{extra} }} }}"),
-            ),
-        )])
-    };
+    let failure = |extra: &str| folder(&[("s.luaskin", &drawn(&format!("timer = 3{extra}, ")))]);
     let plain = import(&failure("")).unwrap();
     let r = import(&failure(", include = \"empty.json\", 41")).unwrap();
     assert_eq!(kinds(&r), [NON_STRING_KEYS]);
