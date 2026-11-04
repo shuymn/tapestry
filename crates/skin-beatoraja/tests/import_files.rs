@@ -4,7 +4,7 @@
 
 mod common;
 
-use common::{Loaded, has, hd, import_with, png, skin};
+use common::{Loaded, has, hd, import_with, join, png, skin, skin_with};
 use skin_beatoraja::{Config, FileChoice, ImportError, ImportLimit, NoteKind, Rule};
 
 /// A skin whose file choice `bg/*.png` has `def`, over `bg/` holding
@@ -156,37 +156,37 @@ fn names_of_the_wrong_form_count_every_attempt() {
 /// and whose sources `sources` are each drawn at its native size at
 /// `x` = 200 × its index.
 fn tagged(choices: &[(&str, &str, &str)], sources: &[&str]) -> Loaded {
-    let choices: Vec<String> = choices
-        .iter()
-        .map(|(n, p, d)| format!(r#"{{"name": "{n}", "path": "{p}", "def": "{d}"}}"#))
-        .collect();
-    let source: Vec<String> = sources
-        .iter()
-        .enumerate()
-        .map(|(i, p)| format!(r#"{{"id": "s{i}", "path": "{p}"}}"#))
-        .collect();
-    let image: Vec<String> = (0..sources.len())
-        .map(|i| format!(r#"{{"id": "i{i}", "src": "s{i}", "w": -1, "h": -1}}"#))
-        .collect();
-    let dst: Vec<String> = (0..sources.len())
-        .map(|i| {
-            format!(
-                r#"{{"id": "i{i}", "stretch": 9, "dst": [{{"x": {}, "w": 100, "h": 100}}]}}"#,
-                200 * i
-            )
-        })
-        .collect();
+    let choices = join(
+        choices
+            .iter()
+            .map(|(n, p, d)| format!(r#"{{"name": "{n}", "path": "{p}", "def": "{d}"}}"#)),
+    );
+    let source = join(
+        sources
+            .iter()
+            .enumerate()
+            .map(|(i, p)| format!(r#"{{"id": "s{i}", "path": "{p}"}}"#)),
+    );
+    let image = join(
+        (0..sources.len()).map(|i| format!(r#"{{"id": "i{i}", "src": "s{i}", "w": -1, "h": -1}}"#)),
+    );
+    let dst = join((0..sources.len()).map(|i| {
+        format!(
+            r#"{{"id": "i{i}", "stretch": 9, "dst": [{{"x": {}, "w": 100, "h": 100}}]}}"#,
+            200 * i
+        )
+    }));
     let json = hd(&format!(
-        r#""filepath": [{}], "source": [{}], "image": [{}], "destination": [{}]"#,
-        choices.join(","),
-        source.join(","),
-        image.join(","),
-        dst.join(",")
+        r#""filepath": [{choices}], "source": [{source}], "image": [{image}], "destination": [{dst}]"#
     ));
-    let dir = skin(&[("s.json", &json)]);
-    for (name, side) in [("a.png", 8), ("b.png", 16), ("c.png", 24)] {
-        png(dir.path(), &format!("parts/{name}"), side, side);
-    }
+    let dir = skin_with(
+        &json,
+        &[
+            ("parts/a.png", 8, 8),
+            ("parts/b.png", 16, 16),
+            ("parts/c.png", 24, 24),
+        ],
+    );
     let result = import_with(dir.path(), |_| {});
     Loaded { dir, result }
 }
