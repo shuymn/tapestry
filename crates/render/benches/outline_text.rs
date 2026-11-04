@@ -1,13 +1,16 @@
 //! Measurements of rasterized play text (design.md "Rendering and
-//! Skins"), on WARP in release: printed, not compared, by
-//! `cargo bench -p render --bench outline_text`.
+//! Skins"), in release: printed, not compared, by
+//! `cargo bench -p render --bench outline_text`, on the adapter
+//! `TAPESTRY_BENCH_ADAPTER` names (`high`, the default, the hardware GPU;
+//! `low`; `warp`), its name printed.
 //!
 //! 1. Installation time (median and p95 of 10) and snapshot bytes of each
 //!    font: the generated Latin face, `YuGothM.ttc` when the system has
 //!    it, and every file named in `TAPESTRY_TEXT_FONTS` (separated by
 //!    `;`), read in place.
 //! 2. A cold and a warm preparation of an attempt's text, median and p95
-//!    of 30 at 1920 × 1080, against the 8 ms gate: six lines at 73, 42,
+//!    of 30 at 1920 × 1080, against the 8 ms gate, each the whole
+//!    `Renderer::stage` with its wait for the GPU: six lines at 73, 42,
 //!    26, 42, 26 and 31 px (title, artist, genre, subtitle and two
 //!    literals, Japanese where the font has it), each attempt cold with
 //!    new labels, warm with the same ones.
@@ -29,8 +32,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bms_model::ChartBuilder;
-use common::{GAUGES, context, offscreen};
+use common::{GAUGES, context};
 use outline_support::{Value, text, ttf};
+use render::{AdapterChoice, Renderer, Target};
 use render::{
     AttemptInput, AttemptText, DefaultFont, LineBounds, LineFit, LineLayout, OutlineText,
     SkinError, TextResidency, text::fonts_dir,
@@ -65,6 +69,18 @@ impl AttemptText for Timed {
     }
 }
 
+/// The adapter `TAPESTRY_BENCH_ADAPTER` names: `warp`, `low` (low power)
+/// or `high` (high performance, the default: the hardware GPU where there
+/// is one).
+fn adapter_choice() -> AdapterChoice {
+    match std::env::var("TAPESTRY_BENCH_ADAPTER").as_deref() {
+        Ok("warp") => AdapterChoice::Warp,
+        Ok("low") => AdapterChoice::LowPower,
+        Ok("high") | Err(_) => AdapterChoice::HighPerformance,
+        Ok(other) => panic!("TAPESTRY_BENCH_ADAPTER={other}: warp, low or high"),
+    }
+}
+
 /// The median and the 95th percentile of `samples`.
 fn stats(mut samples: Vec<Duration>) -> (Duration, Duration) {
     samples.sort_unstable();
@@ -79,6 +95,7 @@ fn ms(d: Duration) -> f64 {
 fn main() {
     let default = DefaultFont::runtime().unwrap_or_else(|_| outline_support::default_font());
     println!("default font: {} bytes", default.bytes());
+    let choice = adapter_choice();
     let mut fonts: Vec<(String, Vec<u8>)> = vec![(
         "generated Latin".to_owned(),
         font_support::build(&font_support::latin("Latin")),
@@ -137,7 +154,15 @@ fn main() {
             ms(ip),
             bytes.len()
         );
-        let mut r = offscreen(1_920, 1_080);
+        let mut r = Renderer::new(
+            Target::Offscreen {
+                width: 1_920,
+                height: 1_080,
+            },
+            choice,
+        )
+        .expect("a renderer on the chosen adapter");
+        println!("{name}: adapter {}", r.gpu().adapter().name);
         let variant = skin.variant([1_920, 1_080], &Layout::AUTHOR);
         let plain = skin
             .sheet()
