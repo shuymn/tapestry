@@ -440,6 +440,21 @@ fn judges_refuse_what_the_model_cannot_share() {
     );
 }
 
+#[test]
+fn a_count_whose_source_is_undefined_refuses() {
+    // The source drops the combo (`SkinJudge.java:109-123`), a part of
+    // the judge the import does not drop.
+    let values = VALUES.replace(
+        r#"{"id": "ten", "src": "n""#,
+        r#"{"id": "ten", "src": "nope""#,
+    );
+    let count = judge_rec(&grades(1), &[combo("ten", 10)], "");
+    assert_eq!(
+        critical(skin(&values, &count, &[DST])),
+        (CriticalPart::Judge, NoteKind::UndefinedSource)
+    );
+}
+
 fn judge_two() -> Loaded {
     skin(
         r#""value": []"#,

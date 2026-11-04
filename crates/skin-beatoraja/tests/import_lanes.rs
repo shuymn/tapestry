@@ -743,8 +743,10 @@ fn a_group_following_the_lift_moves_with_it() {
 
 #[test]
 fn groups_that_cannot_draw_drop_alone() {
-    let gone = r#"{"id": "gone", "src": "zz", "x": 0, "y": 0, "w": 8, "h": 2}"#;
+    let gone = r#"{"id": "gone", "src": "zz", "x": 0, "y": 0, "w": 8, "h": 2},
+                  {"id": "undef", "x": 0, "y": 0, "w": 8, "h": 2}"#;
     let cases = [
+        (dst("undef", "", ACROSS), NoteKind::UndefinedSource),
         (dst("nope", "", ACROSS), NoteKind::UndefinedObject),
         (
             format!(r#"{{"id": null, "dst": [{{{ACROSS}}}]}}"#),

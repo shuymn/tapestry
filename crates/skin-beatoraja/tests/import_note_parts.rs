@@ -252,6 +252,24 @@ fn a_broken_resolved_image_refuses_without_fallback() {
     }
 }
 
+#[test]
+fn a_part_whose_source_is_undefined_refuses() {
+    // The source fails the whole skin on it
+    // (`JsonPlaySkinObjectLoader.java:46-170`); no generated paint.
+    let undef = r#"{"id": "undef", "x": 0, "y": 0, "w": 8, "h": 20}"#;
+    let mine = r#""mine": ["mi", "mi", "mi", "mi", "mi", "mi", "mi", "undef"]"#;
+    let n = note_edit(&[(&list("mine", "mi"), mine)], "");
+    match import_body(&body(undef, &n, &[NOTES])).err() {
+        ImportError::Critical { part, why, .. } => {
+            assert_eq!(
+                (part, why),
+                (CriticalPart::Lanes, NoteKind::UndefinedSource)
+            );
+        }
+        e => panic!("{e:?}"),
+    }
+}
+
 /// The refusal's file, line and column, and those of the first `marker`
 /// in that file, `skip` bytes into it.
 #[track_caller]

@@ -219,6 +219,26 @@ fn parted(fields: &str) -> Loaded {
 }
 
 #[test]
+fn a_node_whose_source_is_undefined_refuses() {
+    // The source fails the whole skin on it
+    // (`JsonSkinObjectLoader.java:509-556`).
+    let l = gauge_with(
+        r#""nodes": ["n0", "n1", "n2", "u"], "parts": 10"#,
+        "",
+        r#", {"id": "u", "w": 8, "h": 8}"#,
+    );
+    match l.err() {
+        ImportError::Critical { part, why, .. } => {
+            assert_eq!(
+                (part, why),
+                (CriticalPart::Gauge, NoteKind::UndefinedSource)
+            );
+        }
+        e => panic!("{e:?}"),
+    }
+}
+
+#[test]
 fn parts_bound_the_segments() {
     assert!(has(
         parted(r#""parts": 0"#).report(),

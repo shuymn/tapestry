@@ -134,7 +134,8 @@ fn a_lua_failure_image_with_no_source_is_ignored() {
     let d = tempfile::tempdir().unwrap();
     write(d.path(), "s.luaskin", lua.as_bytes());
     png(d.path(), "a.png", 64, 64);
-    let r = common::lua_import(d.path()).unwrap().imported.report;
+    let i = common::lua_import(d.path()).unwrap().imported;
+    let r = &i.report;
     let undefined: Vec<_> = r
         .notes
         .iter()
@@ -142,7 +143,10 @@ fn a_lua_failure_image_with_no_source_is_ignored() {
         .collect();
     assert_eq!(undefined.len(), 1, "{:?}", r.notes);
     assert_eq!(undefined[0].severity, Severity::Ignored);
-    assert_eq!((r.usage.images, r.usage.file_attempts), (0, 0));
+    // Nothing is read, charged or kept for it.
+    let u = r.usage;
+    assert_eq!((u.images, u.frames, u.file_attempts), (0, 0, 0));
+    assert_eq!(i.skin.quad_capacity(), 0);
 }
 
 /// A skin of `sources` and `images` (with `a.png`, 64×64) drawing `dsts`.
@@ -230,26 +234,21 @@ fn a_defined_source_whose_file_is_missing_stays_an_asset() {
     );
 }
 
-/// A skin of `members` over source `a` drawing `dsts`.
+/// A skin of `members` drawing `dsts`.
 fn members(members: &str, dsts: &str) -> Loaded {
-    let json = format!(
-        r#"{{"type": 0, "w": 1920, "h": 1080, "source": [{{"id": "a", "path": "a.png"}}],
-            {members}, "destination": [{dsts}]}}"#
-    );
-    let dir = skin_with(&json, &[("a.png", 64, 64)]);
-    let result = import_dir(dir.path());
-    Loaded { dir, result }
+    import_body(&format!(r#"{members}, "destination": [{dsts}]"#))
+}
+
+/// A number of property `r` whose source is undefined.
+fn number(r: i32) -> String {
+    format!(
+        r#""value": [{{"id": "v", "src": "u", "w": 10, "h": 1, "divx": 10,
+                      "digit": 4, "ref": {r}}}]"#
+    )
 }
 
 #[test]
-fn other_consumers_keep_their_outcome_with_the_undefined_source() {
-    let number = |r: i32| {
-        format!(
-            r#""value": [{{"id": "v", "src": "u", "w": 10, "h": 1, "divx": 10,
-                          "digit": 4, "ref": {r}}}]"#
-        )
-    };
-    // A critical EX score number refuses; a decorative number is dropped.
+fn a_critical_number_whose_source_is_undefined_refuses() {
     match members(&number(71), &plain("v")).err() {
         ImportError::Critical { part, why, .. } => {
             assert_eq!(
@@ -259,6 +258,10 @@ fn other_consumers_keep_their_outcome_with_the_undefined_source() {
         }
         e => panic!("{e:?}"),
     }
+}
+
+#[test]
+fn a_decorative_number_whose_source_is_undefined_is_dropped() {
     let l = members(&number(110), &plain("v"));
     assert!(
         l.report()
@@ -268,7 +271,10 @@ fn other_consumers_keep_their_outcome_with_the_undefined_source() {
         "{:?}",
         l.report().notes
     );
-    // An image-set entry is a hole.
+}
+
+#[test]
+fn an_image_set_entry_whose_source_is_undefined_is_a_hole() {
     let set = r#""image": [{"id": "i", "src": "a", "w": 8, "h": 8}, {"id": "u", "w": 8, "h": 8}],
                  "imageset": [{"id": "s", "images": ["i", "u"], "ref": 40}]"#;
     let l = members(set, &plain("s"));
