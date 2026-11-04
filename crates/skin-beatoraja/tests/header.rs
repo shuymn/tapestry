@@ -473,14 +473,20 @@ fn file_choices_allow_wildcards_in_the_last_component_only() {
         "bg|x|/*.png",
         "bg|/*.png|x|",
     ] {
-        let text = play(&format!(r#""filepath": [{{"path": "{path}"}}]"#));
-        assert!(
-            matches!(
-                header(&skin(&[("s.json", &text), ("bg/a.png", "")])),
-                Err(ImportError::Pattern { .. })
-            ),
-            "{path}"
-        );
+        // Refused at its own path value, the second choice's, on line 2.
+        let text = play(&format!(
+            "\"filepath\": [{{\"path\": \"bg/*.png\"}},\n  {{\"path\": \"{path}\"}}]"
+        ));
+        match header(&skin(&[("s.json", &text), ("bg/a.png", "")])) {
+            Err(ImportError::Pattern { at }) => {
+                assert_eq!(
+                    (at.file.as_str(), at.line, at.col),
+                    ("s.json", 2, 13),
+                    "{path}"
+                );
+            }
+            other => panic!("{path}: {other:?}"),
+        }
     }
     // The whole name, tag included, is checked before the tag is split.
     let long_tag = format!("bg/*.png|{}|", "a".repeat(skin_model::MAX_PATH_BYTES));
