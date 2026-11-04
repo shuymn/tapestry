@@ -271,7 +271,10 @@ impl Cx<'_> {
                 missing: false,
             }))
         };
-        let Some(path) = self.source_path(s.src.as_deref())? else {
+        let Some(source) = self.source_rec(s.src.as_deref())? else {
+            return missing(NoteKind::UndefinedSource);
+        };
+        let Some(path) = self.source_path(source)? else {
             return missing(NoteKind::MissingAsset);
         };
         if asset::is_movie(&path) {

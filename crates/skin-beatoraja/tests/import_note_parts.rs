@@ -240,18 +240,32 @@ fn empty_ids_resolve_like_any_other() {
 
 #[test]
 fn a_broken_resolved_image_refuses_without_fallback() {
-    // `lost` names a source with no file: refused as before, never
-    // replaced with generated paint.
+    // `lost` names a source with no file: refused with the file's error,
+    // never replaced with generated paint.
     let lost = r#"{"id": "lost", "src": "zz", "x": 0, "y": 0, "w": 8, "h": 20}"#;
     let mine = r#""mine": ["mi", "mi", "mi", "mi", "mi", "mi", "mi", "lost"]"#;
     let n = note_edit(&[(&list("mine", "mi"), mine)], "");
     let l = import_body(&body(lost, &n, &[NOTES]));
     match l.err() {
-        ImportError::Critical {
-            part: CriticalPart::Lanes,
-            why,
-            ..
-        } => assert!(!matches!(why, NoteKind::NotePartFallback { .. }), "{why:?}"),
+        ImportError::Asset { .. } => {}
+        e => panic!("{e:?}"),
+    }
+}
+
+#[test]
+fn a_part_whose_source_is_undefined_refuses() {
+    // The source fails the whole skin on it
+    // (`JsonPlaySkinObjectLoader.java:46-170`); no generated paint.
+    let undef = r#"{"id": "undef", "x": 0, "y": 0, "w": 8, "h": 20}"#;
+    let mine = r#""mine": ["mi", "mi", "mi", "mi", "mi", "mi", "mi", "undef"]"#;
+    let n = note_edit(&[(&list("mine", "mi"), mine)], "");
+    match import_body(&body(undef, &n, &[NOTES])).err() {
+        ImportError::Critical { part, why, .. } => {
+            assert_eq!(
+                (part, why),
+                (CriticalPart::Lanes, NoteKind::UndefinedSource)
+            );
+        }
         e => panic!("{e:?}"),
     }
 }

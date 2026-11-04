@@ -317,7 +317,8 @@ fn a_page_past_the_image_budget_stops_before_it_is_read() {
     let images = MAX_IMAGES - 1;
     let dsts = vec![r#"{"id": "i", "dst": [{"x": 0, "y": 0, "w": 1, "h": 1}]}"#; images].join(", ");
     let s = format!(
-        r#"{{"type": 0, "w": 1920, "h": 1080, "image": [{{"id": "i", "src": "none"}}],
+        r#"{{"type": 0, "w": 1920, "h": 1080, "source": [{{"id": "none", "path": "none.png"}}],
+            "image": [{{"id": "i", "src": "none"}}],
             "font": [{{"id": "a", "path": "p.fnt"}}],
             "text": [{{"id": "t", "font": "a", "size": 24, "constantText": "A"}}],
             "destination": [{dsts}, {{"id": "t", "dst": [{{"x": 0, "y": 0, "w": 10, "h": 10}}]}}]}}"#
