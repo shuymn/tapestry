@@ -18,9 +18,11 @@
 //! with its entry. At most [`MAX_ALIASES`]; past them the least recently
 //! used one that no holder and no current request uses is pruned.
 //!
-//! **Pins.** A [`Holder`] (an installed or a staged attempt) holds the
-//! entries its table draws and the aliases its requests used. Nothing
-//! writes to or frees an entry a holder or the current round holds.
+//! **Pins.** A [`Holder`] (the installed attempt, the attempt staged on
+//! the same resources, the installed loading lines, the staged loading
+//! text) holds, slot by slot, the entries its lines draw and the aliases
+//! its requests used. Nothing writes to or frees an entry a holder or the
+//! current round holds.
 //!
 //! **Rounds.** Each request takes a hit or a new entry; a failed
 //! allocation evicts unpinned published entries, least recently used
@@ -34,7 +36,9 @@
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
 use etagere::{AllocId, AllocatorOptions, AtlasAllocator, size2};
-use skin_model::{FontRef, FrameUv, GUTTER, MAX_TEXT_EM_PX, TextImage, TextRequest};
+use skin_model::{
+    FontRef, FrameUv, GUTTER, MAX_TEXT_EM_PX, Skin, TextImage, TextRequest, TextSlots,
+};
 
 use crate::outline::{LineBounds, LineFit, LineLayout, TextNote};
 
@@ -90,32 +94,51 @@ struct Alias {
     used: u64,
 }
 
-/// What a preparation holds in a cache: the entries its table draws and
-/// the aliases its requests used, at most one per request.
+/// One line a holder holds: the slot whose request it answers, the alias
+/// that request used and the entry it draws.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Held {
+    slot: u16,
+    alias: LineKey,
+    line: LineKey,
+}
+
+/// What a preparation's lines hold in a cache, slot by slot: the entries
+/// its table draws and the aliases its requests used, at most one line
+/// per request.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Holder {
-    entries: Vec<LineKey>,
-    aliases: Vec<LineKey>,
+    lines: Vec<Held>,
 }
 
 impl Holder {
-    /// The bytes it holds on the heap: its lists and their strings.
+    /// The bytes it holds on the heap: its list and its strings.
     pub(crate) fn bytes(&self) -> usize {
         let strings: usize = self
-            .entries
+            .lines
             .iter()
-            .chain(&self.aliases)
-            .map(|k| k.text.capacity())
+            .map(|h| h.alias.text.capacity() + h.line.text.capacity())
             .sum();
-        (self.entries.capacity() + self.aliases.capacity()) * size_of::<LineKey>() + strings
+        self.lines.capacity() * size_of::<Held>() + strings
     }
 
     fn holds(&self, key: &LineKey) -> bool {
-        self.entries.contains(key)
+        self.lines.iter().any(|h| &h.line == key)
     }
 
     fn uses(&self, alias: &LineKey) -> bool {
-        self.aliases.contains(alias)
+        self.lines.iter().any(|h| &h.alias == alias)
+    }
+
+    /// Lets go of the lines of `skin`'s slots that `which` names: those
+    /// slots no longer draw them. Nothing is allocated.
+    pub(crate) fn release_named(&mut self, skin: &Skin, which: TextSlots) {
+        self.lines.retain(|h| !skin.names_text_slot(which, h.slot));
+    }
+
+    /// Takes `other`'s lines beside its own, for slots it no longer holds.
+    pub(crate) fn extend(&mut self, other: Self) {
+        self.lines.extend(other.lines);
     }
 }
 
@@ -135,8 +158,8 @@ pub struct TextCounts {
 /// One request's outcome.
 #[derive(Debug)]
 enum Slot {
-    /// An entry, by key.
-    Line(LineKey),
+    /// An entry, by key, and the alias the request used.
+    Line { alias: LineKey, line: LineKey },
     /// No line, with a note or none (nothing to draw).
     None(Option<TextNote>),
 }
@@ -150,8 +173,6 @@ pub(crate) struct Placement {
     /// their layouts.
     pub(crate) new: Vec<NewLine>,
     pub(crate) counts: TextCounts,
-    /// The aliases the requests used: (alias, line).
-    aliases: Vec<(LineKey, LineKey)>,
 }
 
 /// A new entry to upload: its returned rectangle and its layout.
@@ -318,7 +339,6 @@ impl TextCache {
                 slots: slots.collect(),
                 new: Vec::new(),
                 counts,
-                aliases: Vec::new(),
             };
         }
         for round in 0..MAX_ROUNDS {
@@ -338,7 +358,6 @@ impl TextCache {
         }
         // Every round failed: published hits stay, the rest get nothing.
         let mut slots = Vec::with_capacity(requests.len());
-        let mut aliases = Vec::new();
         for r in requests {
             let alias = LineKey::of(r, r.em_px);
             let line = self
@@ -350,8 +369,7 @@ impl TextCache {
             let hit = self.entry(&line).is_some_and(|e| e.published);
             if hit {
                 counts.hits += 1;
-                aliases.push((alias, line.clone()));
-                slots.push((r.slot, Slot::Line(line)));
+                slots.push((r.slot, Slot::Line { alias, line }));
             } else {
                 slots.push((r.slot, Slot::None(Some(TextNote::LayerFull))));
             }
@@ -360,7 +378,6 @@ impl TextCache {
             slots,
             new: Vec::new(),
             counts,
-            aliases,
         }
     }
 
@@ -382,7 +399,6 @@ impl TextCache {
     ) -> Option<Placement> {
         let mut slots = Vec::with_capacity(requests.len());
         let mut new: Vec<NewLine> = Vec::new();
-        let mut aliases = Vec::with_capacity(requests.len());
         // This round's pins: its hits and its new entries.
         let mut pins: Vec<LineKey> = Vec::new();
         let hits_before = counts.hits;
@@ -402,8 +418,7 @@ impl TextCache {
                 if !pins.contains(&key) {
                     pins.push(key.clone());
                 }
-                aliases.push((alias, key.clone()));
-                slots.push((r.slot, Slot::Line(key)));
+                slots.push((r.slot, Slot::Line { alias, line: key }));
                 continue;
             }
             let line = match layout(r, em, bounds) {
@@ -427,8 +442,13 @@ impl TextCache {
                 return None;
             };
             pins.push(key.clone());
-            aliases.push((alias, key.clone()));
-            slots.push((r.slot, Slot::Line(key.clone())));
+            slots.push((
+                r.slot,
+                Slot::Line {
+                    alias,
+                    line: key.clone(),
+                },
+            ));
             new.push(NewLine {
                 key,
                 rect,
@@ -441,7 +461,6 @@ impl TextCache {
             slots,
             new,
             counts: *counts,
-            aliases,
         })
     }
 
@@ -533,7 +552,10 @@ impl TextCache {
         }
         let now = self.tick();
         let mut holder = Holder::default();
-        for (alias, line) in &placement.aliases {
+        for (slot, s) in &placement.slots {
+            let Slot::Line { alias, line } = s else {
+                continue;
+            };
             match self.aliases.iter_mut().find(|a| &a.key == alias) {
                 Some(a) => {
                     a.line = line.clone();
@@ -545,9 +567,11 @@ impl TextCache {
                     used: now,
                 }),
             }
-            if !holder.aliases.contains(alias) {
-                holder.aliases.push(alias.clone());
-            }
+            holder.lines.push(Held {
+                slot: *slot,
+                alias: alias.clone(),
+                line: line.clone(),
+            });
         }
         while self.aliases.len() > MAX_ALIASES {
             let current = &holder;
@@ -567,16 +591,13 @@ impl TextCache {
         let mut notes = Vec::new();
         for (slot, s) in placement.slots {
             match s {
-                Slot::Line(key) => {
+                Slot::Line { line: key, .. } => {
                     let image = self.entry(&key).and_then(|e| self.image(e));
                     if let Some(e) = self.entries.iter_mut().find(|e| e.key == key) {
                         e.used = now;
                     }
                     if let Some(l) = lines.get_mut(usize::from(slot)) {
                         *l = image;
-                    }
-                    if !holder.entries.contains(&key) {
-                        holder.entries.push(key);
                     }
                 }
                 Slot::None(Some(note)) => notes.push((slot, note)),
@@ -757,7 +778,7 @@ mod tests {
             assert!(c.aliases() <= MAX_ALIASES);
         }
         assert_eq!(c.aliases(), MAX_ALIASES);
-        for a in &protected.aliases {
+        for a in protected.lines.iter().map(|h| &h.alias) {
             assert!(c.aliases.iter().any(|x| &x.key == a), "{a:?} pruned");
         }
         let oldest = 10.0_f32.to_bits();
