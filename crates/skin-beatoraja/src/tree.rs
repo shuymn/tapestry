@@ -89,8 +89,6 @@ pub(crate) struct LuaText {
     /// The configured pass's trees and captures; `None` for the header
     /// pass's table.
     pub(crate) analysis: Option<Box<crate::lua::callback::Analysis>>,
-    /// The [`Kind::Mixed`] nodes, in conversion order.
-    pub(crate) mixed: Vec<u32>,
 }
 
 /// A Lua scalar, its subtype and exact value kept: an integer as the

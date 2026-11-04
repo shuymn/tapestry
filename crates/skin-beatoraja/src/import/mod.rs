@@ -427,9 +427,13 @@ impl<'d> Cx<'d> {
             u32::try_from(cx.tables.digit_offsets.len()).unwrap_or(u32::MAX);
         // A Lua table's entries under keys other than strings are never
         // read, as the source's Lua loader ignores them
-        // (`LuaSkinLoader.java:187-205` at `0.8.9`): noted at each table.
-        let mixed = cx.def.arena.lua.as_deref().map(|l| l.mixed.clone());
-        for node in mixed.unwrap_or_default() {
+        // (`LuaSkinLoader.java:187-205` at `0.8.9`): noted at each table,
+        // in conversion order (a node's id). Only a Lua table is mixed.
+        let nodes = u32::try_from(cx.def.arena.nodes.len()).unwrap_or(u32::MAX);
+        for node in 0..nodes {
+            if !cx.def.arena.is_mixed(node) {
+                continue;
+            }
             let at = cx.arena_span(node);
             cx.ignored(
                 at,

@@ -9,17 +9,16 @@
 //! and others is [`Kind::Mixed`], an object of its string keys as the
 //! source's Lua loader reads it (`LuaSkinLoader.java:187-205` at `0.8.9`):
 //! the other entries are never read (not converted, charged as nodes or
-//! captured), the node is listed in [`LuaText::mixed`] for the import to
-//! note, and the definition's readers refuse it where an array, a
-//! condition or a choice branch is read. Sparse integer keys alone, and
-//! keys that are neither strings nor integers without a string key, are
-//! refused, as is a table met again inside itself. A table reached twice
-//! is converted, and charged, at each place. An empty table is neither:
-//! [`Kind::Empty`], which the definition's readers read as the empty
-//! array or the empty object their field expects. A number keeps its
-//! subtype and value: an integer as its `i64`, a float as its `f64`,
-//! never through text. A string must
-//! be UTF-8. A function becomes a typed callable, each instance once; any
+//! captured), the import notes it, and the definition's readers refuse
+//! it where an array, a condition or a choice branch is read. Sparse
+//! integer keys alone, and keys that are neither strings nor integers
+//! without a string key, are refused, as is a table met again inside
+//! itself. A table reached twice is converted, and charged, at each
+//! place. An empty table is neither: [`Kind::Empty`], which the
+//! definition's readers read as the empty array or the empty object their
+//! field expects. A number keeps its subtype and value: an integer as its
+//! `i64`, a float as its `f64`, never through text. A string must be
+//! UTF-8. A function becomes a typed callable, each instance once; any
 //! other value is refused.
 //!
 //! In the configured pass, each skin closure the table holds is looked up
@@ -189,7 +188,6 @@ pub(super) fn convert(
         bytes: Vec::new(),
         values: Vec::new(),
         callables: Vec::new(),
-        mixed: Vec::new(),
         seen: HashMap::new(),
         path: Vec::new(),
         decoded: 0,
@@ -205,7 +203,6 @@ pub(super) fn convert(
         bytes,
         values,
         callables,
-        mixed,
         mut analysis,
         ..
     } = c;
@@ -229,7 +226,6 @@ pub(super) fn convert(
         modules,
         callables,
         analysis,
-        mixed,
     }));
     Ok((arena, top))
 }
@@ -271,8 +267,6 @@ struct Conv<'a> {
     bytes: Vec<u8>,
     values: Vec<LuaScalar>,
     callables: Vec<Callable>,
-    /// The [`Kind::Mixed`] nodes ([`LuaText::mixed`]).
-    mixed: Vec<u32>,
     /// Callables by the function's address.
     seen: HashMap<usize, u32>,
     /// The tables on the path from the root, by address.
@@ -702,7 +696,7 @@ impl Conv<'_> {
     /// once the scan is done; `next`'s own walk over empty slots is
     /// bounded by the table's capacity in VM memory, met once per table.
     fn enumerate(&mut self, t: &Table) -> Result<Shape, ImportError> {
-        let (mut n, mut ints, mut others) = (0_usize, 0_usize, 0_usize);
+        let (mut n, mut ints) = (0_usize, 0_usize);
         let (mut min, mut max) = (i64::MAX, i64::MIN);
         let mut keys: Vec<Vec<u8>> = Vec::new();
         for pair in t.pairs::<Value, Value>() {
@@ -728,7 +722,7 @@ impl Conv<'_> {
                     min = min.min(i);
                     max = max.max(i);
                 }
-                _ => others += 1,
+                _ => {}
             }
         }
         if self.pass.ledger.cancelled() {
@@ -744,7 +738,7 @@ impl Conv<'_> {
             } else {
                 Shape::Mixed(keys)
             })
-        } else if others == 0 {
+        } else if ints == n {
             let count = i64::try_from(ints).unwrap_or(i64::MAX);
             if min != 1 || max != count {
                 return Err(self.lua(LuaWhy::Sparse));
@@ -809,9 +803,6 @@ impl Conv<'_> {
             return Err(self.input(InputLimit::Nodes));
         }
         let id = self.node(kind, span, 0)?;
-        if kind == Kind::Mixed {
-            self.mixed.push(id);
-        }
         self.path.push(addr);
         let mut prev = NONE;
         let mut link = |c: &mut Self, child: u32| {
