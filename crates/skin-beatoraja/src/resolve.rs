@@ -369,6 +369,17 @@ impl Definition {
         }
     }
 
+    /// A Lua table with string keys and others ([`Kind::Mixed`]) where an
+    /// array or a condition is read: refused at the table, since the
+    /// source lists every value in its VM's table order
+    /// (`LuaSkinLoader.java:174-186` at `0.8.9`), which is not reproduced.
+    pub(crate) fn mixed_error(&self, id: u32) -> ImportError {
+        ImportError::Lua {
+            at: Some(self.loc(id)),
+            why: LuaWhy::Mixed,
+        }
+    }
+
     /// A string field (`Json.readValue` to `String`, Json.java:1014 and
     /// JsonValue.java:172-186): a number as written, a boolean as `true`
     /// or `false`, `null` as absent. A Lua integer is its decimal digits,
@@ -689,6 +700,9 @@ impl Resolved<'_> {
                 continue;
             };
             if LITERAL.contains(name) {
+                if r.def.arena.is_mixed(id) {
+                    return Err(r.def.mixed_error(id));
+                }
                 if r.def.arena.is_array(id) {
                     let items: Vec<u32> = r.def.arena.children(id).collect();
                     for item in items {
@@ -892,6 +906,7 @@ impl Resolver<'_, '_> {
                     None => Ok(()),
                 },
             },
+            Kind::Mixed => Err(self.def.mixed_error(id)),
             Kind::Quoted | Kind::Bare | Kind::Lua => match self.strict {
                 _ if self.callable(id) => Err(self.def.callable_error(id, "other")),
                 Some(field) if !matches!(self.arena().scalar(id), Scalar::Null) => {
@@ -984,6 +999,9 @@ impl Resolver<'_, '_> {
         if self.callable(cond) {
             return Err(self.def.callable_error(cond, "if"));
         }
+        if self.arena().is_mixed(cond) {
+            return Err(self.def.mixed_error(cond));
+        }
         if !self.arena().is_array(cond) {
             return Ok(false);
         }
@@ -995,6 +1013,8 @@ impl Resolver<'_, '_> {
                 self.test_number(item)?
             } else if self.callable(item) {
                 return Err(self.def.callable_error(item, "if"));
+            } else if self.arena().is_mixed(item) {
+                return Err(self.def.mixed_error(item));
             } else if self.arena().is_array(item) {
                 let mut held = false;
                 let mut alt = self.arena().node(item).first_child;
@@ -1003,6 +1023,9 @@ impl Resolver<'_, '_> {
                     alt = self.arena().node(one).next_sibling;
                     if self.callable(one) {
                         return Err(self.def.callable_error(one, "if"));
+                    }
+                    if self.arena().is_mixed(one) {
+                        return Err(self.def.mixed_error(one));
                     }
                     if self.is_number(one) && self.test_number(one)? {
                         held = true;

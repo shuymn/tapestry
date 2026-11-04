@@ -5,11 +5,18 @@
 //! Tables are read raw: entries by `next`, values by `rawget`, never a
 //! metamethod. A table whose keys are exactly the integers `1..=n` is an
 //! array, one whose keys are all strings an object, its members sorted by
-//! their bytes (a Lua table has no order of its own); mixed, sparse and
-//! other keys are refused, as is a table met again inside itself. A table
-//! reached twice is converted, and charged, at each place. An empty
-//! table is neither: [`Kind::Empty`], which the definition's readers read
-//! as the empty array or the empty object their field expects. A number keeps its subtype and value: an integer
+//! their bytes (a Lua table has no order of its own). One with string keys
+//! and others is [`Kind::Mixed`], an object of its string keys as the
+//! source's Lua loader reads it (`LuaSkinLoader.java:187-205` at `0.8.9`):
+//! the other entries are never read (not converted, charged as nodes or
+//! captured), the node is listed in [`LuaText::mixed`] for the import to
+//! note, and the definition's readers refuse it where an array or a
+//! condition is read. Sparse integer keys alone, and keys that are
+//! neither strings nor integers without a string key, are refused, as is
+//! a table met again inside itself. A table reached twice is converted,
+//! and charged, at each place. An empty table is neither: [`Kind::Empty`],
+//! which the definition's readers read as the empty array or the empty
+//! object their field expects. A number keeps its subtype and value: an integer
 //! as its `i64`, a float as its `f64`, never through text. A string must
 //! be UTF-8. A function becomes a typed callable, each instance once; any
 //! other value is refused.
@@ -181,6 +188,7 @@ pub(super) fn convert(
         bytes: Vec::new(),
         values: Vec::new(),
         callables: Vec::new(),
+        mixed: Vec::new(),
         seen: HashMap::new(),
         path: Vec::new(),
         decoded: 0,
@@ -196,6 +204,7 @@ pub(super) fn convert(
         bytes,
         values,
         callables,
+        mixed,
         mut analysis,
         ..
     } = c;
@@ -219,6 +228,7 @@ pub(super) fn convert(
         modules,
         callables,
         analysis,
+        mixed,
     }));
     Ok((arena, top))
 }
@@ -234,6 +244,8 @@ enum Shape {
     Array(usize),
     /// String keys, sorted by their bytes.
     Object(Rc<[Vec<u8>]>),
+    /// String keys, sorted by their bytes, beside other keys left unread.
+    Mixed(Rc<[Vec<u8>]>),
 }
 
 struct Conv<'a> {
@@ -258,6 +270,8 @@ struct Conv<'a> {
     bytes: Vec<u8>,
     values: Vec<LuaScalar>,
     callables: Vec<Callable>,
+    /// The [`Kind::Mixed`] nodes ([`LuaText::mixed`]).
+    mixed: Vec<u32>,
     /// Callables by the function's address.
     seen: HashMap<usize, u32>,
     /// The tables on the path from the root, by address.
@@ -679,14 +693,15 @@ impl Conv<'_> {
     }
 
     /// Table `t`'s keys, read once by `next`: their kind and count, an
-    /// object's keys copied out (no handle per key stays on Lua's stack)
-    /// and sorted by their bytes. Each entry is counted against the node
+    /// object's or a mixed table's string keys copied out (no handle per
+    /// key stays on Lua's stack) and sorted by their bytes; no value is
+    /// read. Each entry is counted against the node
     /// cap and each key's bytes against the decoded-bytes cap as it is
     /// met, and cancellation is seen every [`CHECK_EVERY`] entries and
     /// once the scan is done; `next`'s own walk over empty slots is
     /// bounded by the table's capacity in VM memory, met once per table.
     fn enumerate(&mut self, t: &Table) -> Result<Shape, ImportError> {
-        let (mut n, mut ints) = (0_usize, 0_usize);
+        let (mut n, mut ints, mut others) = (0_usize, 0_usize, 0_usize);
         let (mut min, mut max) = (i64::MAX, i64::MIN);
         let mut keys: Vec<Vec<u8>> = Vec::new();
         for pair in t.pairs::<Value, Value>() {
@@ -712,7 +727,7 @@ impl Conv<'_> {
                     min = min.min(i);
                     max = max.max(i);
                 }
-                _ => return Err(self.lua(LuaWhy::Key)),
+                _ => others += 1,
             }
         }
         if self.pass.ledger.cancelled() {
@@ -720,37 +735,47 @@ impl Conv<'_> {
         }
         if n == 0 {
             Ok(Shape::Empty)
-        } else if keys.len() == n {
-            // Sorted by their bytes, the bytes compared counted and the
-            // cancellation request seen every 64 KiB of them: once seen,
-            // the rest of the sort compares nothing.
-            let ledger = &self.pass.ledger;
-            let (mut compared, mut stop) = (0_usize, false);
-            keys.sort_unstable_by(|a, b| {
-                if stop {
-                    return std::cmp::Ordering::Equal;
-                }
-                let before = compared;
-                compared = compared.saturating_add(a.len().min(b.len()) + 1);
-                if before >> 16 != compared >> 16 && ledger.cancelled() {
-                    stop = true;
-                    return std::cmp::Ordering::Equal;
-                }
-                a.cmp(b)
-            });
-            if stop {
-                return Err(self.lua(LuaWhy::Cancelled));
-            }
-            Ok(Shape::Object(Rc::from(keys)))
-        } else if ints == n {
-            let count = i64::try_from(n).unwrap_or(i64::MAX);
+        } else if !keys.is_empty() {
+            let all = keys.len() == n;
+            let keys = self.sorted(keys)?;
+            Ok(if all {
+                Shape::Object(keys)
+            } else {
+                Shape::Mixed(keys)
+            })
+        } else if others == 0 {
+            let count = i64::try_from(ints).unwrap_or(i64::MAX);
             if min != 1 || max != count {
                 return Err(self.lua(LuaWhy::Sparse));
             }
-            Ok(Shape::Array(n))
+            Ok(Shape::Array(ints))
         } else {
-            Err(self.lua(LuaWhy::Mixed))
+            Err(self.lua(LuaWhy::Key))
         }
+    }
+
+    /// `keys` sorted by their bytes, the bytes compared counted and the
+    /// cancellation request seen every 64 KiB of them: once seen, the rest
+    /// of the sort compares nothing.
+    fn sorted(&self, mut keys: Vec<Vec<u8>>) -> Result<Rc<[Vec<u8>]>, ImportError> {
+        let ledger = &self.pass.ledger;
+        let (mut compared, mut stop) = (0_usize, false);
+        keys.sort_unstable_by(|a, b| {
+            if stop {
+                return std::cmp::Ordering::Equal;
+            }
+            let before = compared;
+            compared = compared.saturating_add(a.len().min(b.len()) + 1);
+            if before >> 16 != compared >> 16 && ledger.cancelled() {
+                stop = true;
+                return std::cmp::Ordering::Equal;
+            }
+            a.cmp(b)
+        });
+        if stop {
+            return Err(self.lua(LuaWhy::Cancelled));
+        }
+        Ok(Rc::from(keys))
     }
 
     /// Table `t`, its key's span when it has one, at `depth`.
@@ -777,11 +802,15 @@ impl Conv<'_> {
             Shape::Empty => (Kind::Empty, 0),
             Shape::Array(n) => (Kind::Array, *n),
             Shape::Object(keys) => (Kind::Object, keys.len()),
+            Shape::Mixed(keys) => (Kind::Mixed, keys.len()),
         };
         if self.nodes.len().saturating_add(n) >= MAX_NODES {
             return Err(self.input(InputLimit::Nodes));
         }
         let id = self.node(kind, span, 0)?;
+        if kind == Kind::Mixed {
+            self.mixed.push(id);
+        }
         self.path.push(addr);
         let mut prev = NONE;
         let mut link = |c: &mut Self, child: u32| {
@@ -798,9 +827,10 @@ impl Conv<'_> {
                 let child = self.value(&v, None, depth + 1)?;
                 link(self, child);
             }
-        } else if let Shape::Object(keys) = &shape {
+        } else if let Shape::Object(keys) | Shape::Mixed(keys) = &shape {
             // Each key's bytes charged again for this reference as they
-            // are copied into the arena.
+            // are copied into the arena; a mixed table's other keys are
+            // never read.
             for k in keys.iter() {
                 let span = self.text(k)?;
                 let v: Value = t

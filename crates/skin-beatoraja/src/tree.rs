@@ -28,6 +28,10 @@ pub(crate) enum Kind {
     /// An empty Lua table: no members and no items, which an array reader
     /// and an object reader each read as their own empty value.
     Empty,
+    /// A Lua table with string keys and others: an object of its string
+    /// keys, the others unread, never an array and without wrapper
+    /// meaning ([`Arena::first_member_ci`]).
+    Mixed,
 }
 
 /// The node is an object member: `key_start..key_end` is its name.
@@ -85,6 +89,8 @@ pub(crate) struct LuaText {
     /// The configured pass's trees and captures; `None` for the header
     /// pass's table.
     pub(crate) analysis: Option<Box<crate::lua::callback::Analysis>>,
+    /// The [`Kind::Mixed`] nodes, in conversion order.
+    pub(crate) mixed: Vec<u32>,
 }
 
 /// A Lua scalar, its subtype and exact value kept: an integer as the
@@ -381,9 +387,15 @@ impl Arena {
     }
 
     /// Whether node `id` is read as an object: a JSON object, or an empty
-    /// Lua table.
+    /// or mixed Lua table.
     pub(crate) fn is_object(&self, id: u32) -> bool {
-        matches!(self.node(id).kind, Kind::Object | Kind::Empty)
+        matches!(self.node(id).kind, Kind::Object | Kind::Empty | Kind::Mixed)
+    }
+
+    /// Whether node `id` is a Lua table with string keys and others
+    /// ([`Kind::Mixed`]).
+    pub(crate) fn is_mixed(&self, id: u32) -> bool {
+        self.node(id).kind == Kind::Mixed
     }
 
     /// The children of a container, in order.
@@ -405,9 +417,11 @@ impl Arena {
     /// The first member of object `id` whose name equals `name` ignoring
     /// ASCII case: a wrapper lookup, as `JsonValue.get` does
     /// (JsonValue.java:95-99). Java compares Unicode-aware; matching ASCII
-    /// case only is an intentional subset.
+    /// case only is an intentional subset. A mixed Lua table has none: the
+    /// source's Lua loader reads no wrapper (`LuaSkinLoader.java:171-210`
+    /// at `0.8.9`), and its string keys stay a record's fields.
     pub(crate) fn first_member_ci(&self, id: u32, name: &str) -> Option<u32> {
-        if !self.is_object(id) {
+        if !self.is_object(id) || self.is_mixed(id) {
             return None;
         }
         self.children(id).find(|&c| {
@@ -423,7 +437,7 @@ impl Arena {
         let n = *self.node(id);
         let escaped = n.flags & ESCAPED != 0;
         match n.kind {
-            Kind::Object | Kind::Empty => Scalar::Object,
+            Kind::Object | Kind::Empty | Kind::Mixed => Scalar::Object,
             Kind::Array => Scalar::Array,
             Kind::Quoted => Scalar::Str {
                 raw: self.raw(id),

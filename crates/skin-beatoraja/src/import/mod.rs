@@ -425,6 +425,19 @@ impl<'d> Cx<'d> {
         };
         cx.budget.usage.resolved_digit_offsets =
             u32::try_from(cx.tables.digit_offsets.len()).unwrap_or(u32::MAX);
+        // A Lua table's entries under keys other than strings are never
+        // read, as the source's Lua loader ignores them
+        // (`LuaSkinLoader.java:187-205` at `0.8.9`): noted at each table.
+        let mixed = cx.def.arena.lua.as_deref().map(|l| l.mixed.clone());
+        for node in mixed.unwrap_or_default() {
+            let at = cx.arena_span(node);
+            cx.ignored(
+                at,
+                NoteKind::Ignored {
+                    field: "non-string keys",
+                },
+            );
+        }
         cx.config_notes();
         cx.custom_timers()?;
         Ok(cx)
