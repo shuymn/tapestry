@@ -182,5 +182,82 @@ fn an_impossible_entry_drops_its_image_set() {
     assert_eq!(kinds(l.report()), [OVER]);
     assert_eq!(l.report().notes[0].severity, Severity::Dropped);
     assert_eq!(l.ok().skin.choice_ref_count(), 0);
+    // Its fitting entry stays out of the sheet too.
+    assert_eq!(l.ok().skin.sheet().image_count(), 0);
     assert!(l.quads(0).is_empty());
+}
+
+#[test]
+fn a_dropped_image_set_cannot_fail_the_atlas() {
+    // Its fitting entry is past `LIMITS`' 4 096 side: kept in the sheet, it
+    // would fail the build of a skin that draws nothing of it.
+    let l = import_wide(
+        [8_177, 2],
+        r#""image": [{"id": "big", "src": "w", "w": 8176, "h": 2},
+                     {"id": "whole", "src": "w", "w": -1, "h": -1}],
+           "imageset": [{"id": "s", "images": ["big", "whole"]}],
+           "destination": [{"id": "s", "dst": [{"w": 10, "h": 10}]}]"#,
+    );
+    assert_eq!(kinds(l.report()), [OVER]);
+    let limits = common::play::LIMITS;
+    assert!(l.ok().skin.atlas(Variant::Lo, limits, &|| false).is_ok());
+}
+
+#[test]
+fn a_dropped_image_set_keeps_images_others_use() {
+    // `plain` is drawn before the set and the set shares its image; `after`
+    // follows it. Only the set goes, and `plain` and `after` keep their
+    // images, in order.
+    let l = import_wide(
+        [8_177, 4],
+        r#""image": [{"id": "plain", "src": "w", "w": 8, "h": 2},
+                     {"id": "small", "src": "w", "y": 2, "w": 8, "h": 2},
+                     {"id": "whole", "src": "w", "w": -1, "h": -1},
+                     {"id": "after", "src": "w", "x": 8, "w": 8, "h": 2}],
+           "imageset": [{"id": "s", "images": ["plain", "small", "whole"]},
+                        {"id": "kept", "images": ["plain", "after"]}],
+           "destination": [{"id": "kept", "dst": [{"w": 20, "h": 20}]},
+                           {"id": "s", "dst": [{"w": 10, "h": 10}]}]"#,
+    );
+    assert_eq!(
+        kinds(l.report()),
+        [NoteKind::CellTooLarge { w: 8_177, h: 4 }]
+    );
+    assert_eq!(l.ok().skin.sheet().image_count(), 2);
+    assert_eq!(l.ok().skin.choice_ref_count(), 2);
+    assert_eq!(l.quads(0).len(), 1);
+}
+
+#[test]
+fn a_set_adds_its_entries_once_in_order() {
+    // A repeated entry is one image, charged once, and the set still
+    // selects each entry's own cell.
+    let l = import_wide(
+        [64, 2],
+        r#""image": [{"id": "x", "src": "w", "w": 8, "h": 2},
+                     {"id": "y", "src": "w", "x": 8, "w": 16, "h": 2}],
+           "imageset": [{"id": "s", "images": ["x", "y", "x"], "ref": 0}],
+           "destination": [{"id": "s", "dst": [{"w": 8, "h": 8}]}]"#,
+    );
+    assert!(l.report().notes.is_empty(), "{:?}", l.report().notes);
+    assert_eq!(l.report().usage.images, 2);
+    assert_eq!(l.ok().skin.sheet().image_count(), 2);
+    assert_eq!(l.ok().skin.choice_ref_count(), 3);
+}
+
+#[test]
+fn an_image_set_dropped_by_its_stretch_adds_nothing() {
+    // Stretch 1 changes branch between the entries' keys for the wide
+    // entry: the set goes before its entries reach the sheet.
+    let l = import_wide(
+        [64, 64],
+        r#""image": [{"id": "x", "src": "w", "w": 16, "h": 16},
+                     {"id": "y", "src": "w", "w": 64, "h": 8}],
+           "imageset": [{"id": "s", "images": ["x", "y"]}],
+           "destination": [{"id": "s", "stretch": 1,
+                            "dst": [{"time": 0, "w": 32, "h": 32},
+                                    {"time": 100, "w": 32, "h": 2}]}]"#,
+    );
+    assert_eq!(kinds(l.report()), [NoteKind::Stretch(1)]);
+    assert_eq!(l.ok().skin.sheet().image_count(), 0);
 }

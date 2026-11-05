@@ -1321,7 +1321,7 @@ The extension points exist from the first version as named interfaces in code, a
 
 | Extension point | Plugged in for the first version | Added later |
 | --- | --- | --- |
-| Ingestion | BMS/BME adapter, including `#RANDOM`, writing the common chart model | PMS, BMSON, and other formats |
+| Ingestion | BMS adapter for `.bms`, `.bme` and `.bml` files, which read alike, including `#RANDOM`, writing the common chart model | PMS, BMSON, and other formats |
 | Chart transformation | None (the stage exists between ingestion and evaluation and passes the chart through) | MIRROR, RANDOM options and the like |
 | Input | Raw Input adapter for keyboards and HID dedicated controllers | MIDI and other input adapters |
 | Evaluation | — (no plug-in point) | — |
@@ -1615,7 +1615,7 @@ Rust is recommended as the core language. The evaluator can be shared between th
 | Layer | crate | Role |
 | --- | --- | --- |
 | L0 | `bms-model` | Chart types, time (µs) types |
-| L1 | `bms-parser` | Loading BMS/BME/PMS/BMSON, `#RANDOM`, time computation with rational numbers |
+| L1 | `bms-parser` | Loading BMS/BME/BML/PMS/BMSON, `#RANDOM`, time computation with rational numbers |
 | L2 | `rules` | Preset types, validation, canonical encoding and its bounded decoder, judgment window and gauge tables. Takes no external dependency, so `eval`'s dependency closure stays free of external crates |
 | L2 | `rules-toml` | Preset files (TOML) to and from `rules::RulePreset`; the file's shape lives here, so `rules` stays free of `serde` and `toml` |
 | L2 | `eval` | The evaluator and its input contract (physical input events, device profile, start snapshot, watermark and merge), which `input` and `replay` use. Depends only on `bms-model` and `rules` |

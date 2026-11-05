@@ -322,6 +322,26 @@ impl SheetBuilder {
     /// would have had.
     pub fn add_image(&mut self, def: ImageDef) -> Result<u32, ImageError> {
         let image = self.images.len();
+        let (rect, cell) = self.checked_cut(&def)?;
+        let drawn = push_frames(&def, rect, cell, &mut self.cell_ids, &mut self.frames);
+        self.images.push(drawn);
+        u32::try_from(image).map_err(|_| ImageError::TooManyImages { n: image + 1 })
+    }
+
+    /// Makes every check of [`add_image`](Self::add_image) for `def` as
+    /// the next image, adding nothing, and returns the cell it would cut in
+    /// its file's 1x version.
+    ///
+    /// # Errors
+    ///
+    /// As [`add_image`](Self::add_image).
+    pub fn check_image(&self, def: &ImageDef) -> Result<[u32; 2], ImageError> {
+        self.checked_cut(def).map(|(_, cell)| cell)
+    }
+
+    /// [`Self::check_image`]'s checks, and the rectangle and cell they cut.
+    fn checked_cut(&self, def: &ImageDef) -> Result<([u32; 4], [u32; 2]), ImageError> {
+        let image = self.images.len();
         if image >= MAX_IMAGES {
             return Err(ImageError::TooManyImages { n: image + 1 });
         }
@@ -331,27 +351,10 @@ impl SheetBuilder {
         else {
             return Err(ImageError::UnknownFile { image });
         };
-        check_cycle(image, &def)?;
-        let n = image_frames(image, &def)?;
+        check_cycle(image, def)?;
+        let n = image_frames(image, def)?;
         add_frames(self.frames.len(), n)?;
-        let (rect, cell) = cut(image, &def, file.lo.dims)?;
-        let drawn = push_frames(&def, rect, cell, &mut self.cell_ids, &mut self.frames);
-        self.images.push(drawn);
-        u32::try_from(image).map_err(|_| ImageError::TooManyImages { n: image + 1 })
-    }
-
-    /// The cell [`add_image`](Self::add_image) would cut from `def` in its
-    /// file's 1x version; `None` when it would refuse the file, the grid
-    /// or the cut.
-    #[must_use]
-    pub fn image_cell(&self, def: &ImageDef) -> Option<[u32; 2]> {
-        if def.grid.contains(&0) {
-            return None;
-        }
-        let file = usize::try_from(def.file)
-            .ok()
-            .and_then(|f| self.files.get(f))?;
-        cut(0, def, file.lo.dims).ok().map(|(_, cell)| cell)
+        cut(image, def, file.lo.dims)
     }
 
     /// Adds a generated image of one colour, returning its index. No file
@@ -440,11 +443,11 @@ impl SheetBuilder {
     /// more than the sheet has left of [`MAX_SHEET_GLYPHS`] and
     /// [`MAX_SHEET_KERNINGS`]. Then the pages, all or nothing: each page's
     /// attempt, metadata, byte totals, image and frame; then each header
-    /// and the texel totals; then every page small enough for an atlas page
-    /// ([`cell_fits_page`]) and every glyph inside its page; then each page
-    /// decoded and dropped, one at a time, so a corrupt page fails this font
-    /// rather than the atlas: whole, or in bands of rows when it was
-    /// admitted to be ([`MAX_STREAMED_TEXELS`](super::MAX_STREAMED_TEXELS)).
+    /// and the texel totals; then every glyph inside its page; then each
+    /// page decoded and dropped, one at a time, so a corrupt page fails
+    /// this font rather than the atlas: whole, or in bands of rows when it
+    /// was admitted to be ([`MAX_STREAMED_TEXELS`](super::MAX_STREAMED_TEXELS));
+    /// then every page small enough for an atlas page ([`cell_fits_page`]).
     /// Each page becomes a whole-file image of one frame, filtered
     /// linearly.
     ///
@@ -554,15 +557,6 @@ impl SheetBuilder {
             hi_texels = hi_texels.with(texels(d)).ok_or(limit(FntLimit::Texels))?;
             dims.push((d, mode));
         }
-        // A page is one cell of the atlas.
-        if let Some(p) = dims.iter().position(|&(d, _)| !cell_fits_page(d)) {
-            return Err(file_err(FntError {
-                line: 0,
-                kind: FntErrorKind::PageRefused {
-                    page: u8::try_from(p).unwrap_or(u8::MAX),
-                },
-            }));
-        }
         for g in file.glyphs().iter().chain(file.missing().as_ref()) {
             let [x, y, w, h] = g.src.map(u32::from);
             let inside = dims
@@ -586,6 +580,17 @@ impl SheetBuilder {
             let bytes =
                 read_encoded(resolved, at, MAX_FILE_BYTES, cancel).map_err(|e| page_stop(p, e))?;
             decode_file(bytes, at, header, cancel, &mut Validate).map_err(|e| page_stop(p, e))?;
+        }
+
+        // A page is one cell of the atlas. A corrupt one above stays corrupt
+        // whatever its size: the source fails on it too.
+        if let Some(p) = dims.iter().position(|&(d, _)| !cell_fits_page(d)) {
+            return Err(file_err(FntError {
+                line: 0,
+                kind: FntErrorKind::PageRefused {
+                    page: u8::try_from(p).unwrap_or(u8::MAX),
+                },
+            }));
         }
 
         // Kept.
