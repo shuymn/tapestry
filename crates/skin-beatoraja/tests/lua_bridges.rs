@@ -131,6 +131,31 @@ fn the_combo_break_counts_sum_the_scored_judgments() {
     assert_eq!(digits("ref = 425", counts(0, [0, 0], 5)), 1, "0");
 }
 
+/// A sum's range is its terms': arithmetic that could leave `i32` over it
+/// is refused, where the same factor stays inside over one count.
+#[test]
+fn a_sums_range_bounds_a_callbacks_arithmetic() {
+    let draw = |expr: &str| {
+        let dir = folder(&format!(
+            "table.insert(skin.destination, {{ id = \"i0\", draw = function() return {expr} > 0 end,\n\
+               dst = {{ {{ w = 10, h = 10 }} }} }})"
+        ));
+        import(&dir).unwrap().callbacks
+    };
+    assert_eq!(draw("ms.number(113) * 100"), [Disposition::Lowered]);
+    for expr in [
+        "ms.number(425) * 100",
+        "ms.number(427) * 100",
+        "ms.judge(4) * 200",
+    ] {
+        assert_eq!(
+            draw(expr),
+            [Disposition::Replaced(Unsupported::Range)],
+            "{expr}"
+        );
+    }
+}
+
 /// One empty POOR alone under a preset that counts it as a POOR: `ref` 114
 /// keeps the preset's count, the rest the scored POORs.
 #[test]
