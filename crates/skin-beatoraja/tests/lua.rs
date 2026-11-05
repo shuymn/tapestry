@@ -6,7 +6,6 @@
 mod common;
 
 use skin_beatoraja::limits::{MAX_FILE_BYTES, MAX_INCLUDE_DEPTH, MAX_INCLUDE_PARSES, MAX_NODES};
-use skin_beatoraja::lua::Unsupported;
 use skin_beatoraja::lua::limits::{MAX_HOST_CALLS, MAX_INSTRUCTIONS, MAX_LUA_TIME};
 use skin_beatoraja::lua::{Disposition, HOST_APIS};
 use skin_beatoraja::{
@@ -1618,14 +1617,20 @@ fn host_modules_hold_the_pinned_names_and_refuse_calls() {
 
 #[test]
 fn every_function_in_the_definition_is_classified_and_consumed_where_read() {
-    // A write-free condition converts; a decorative one with no result is
-    // replaced, wherever it is.
+    // A write-free condition converts, one with no result too, as the
+    // false its missing result is, wherever it is.
     let d = folder(&[("s.luaskin", &drawn("draw = function() return true end,"))]);
     import(&d).unwrap();
-    let no_return = Disposition::Replaced(Unsupported::Construct("no return"));
     for fields in ["draw = function() end,", "op = { function() end },"] {
         let d = folder(&[("s.luaskin", &drawn(fields))]);
-        assert_eq!(import(&d).unwrap().callbacks, [no_return], "{fields}");
+        let i = import(&d).unwrap();
+        assert_eq!(i.callbacks, [Disposition::Lowered], "{fields}");
+        assert!(
+            common::play::Drawn::new(i.imported.skin, 0)
+                .frame(1_000, &[])
+                .is_empty(),
+            "{fields}"
+        );
     }
     // A function in a field that takes none, which the source never
     // reads, is inert, and refused where the import reads it, at its
@@ -1679,7 +1684,7 @@ fn every_function_in_the_definition_is_classified_and_consumed_where_read() {
         ("s.luaskin", &drawn("draw = require(\"f\"),")),
         ("f.lua", "local x = 1\nreturn function() end"),
     ]);
-    assert_eq!(import(&d).unwrap().callbacks, [no_return]);
+    assert_eq!(import(&d).unwrap().callbacks, [Disposition::Lowered]);
     // A host function has no tree: it opens the analysis, and nothing
     // consumes it.
     let d = configured(
@@ -2242,7 +2247,7 @@ fn a_mixed_keyframe_is_a_record_with_defaults() {
 #[test]
 fn a_mixed_table_s_other_values_are_never_converted() {
     // A closure the admission refuses where it is read.
-    let closure = "function() return ms.number(110) end";
+    let closure = "function() return ms.number(110) / 2 > 0 end";
     let body = |record: &str| {
         folder(&[(
             "s.luaskin",

@@ -21,6 +21,15 @@
 //! not use as a name. Every line keeps its number: text is only inserted
 //! within lines, and a rewritten function name keeps its line breaks. A
 //! chunk without a constructor is not rewritten.
+//!
+//! Each `local d = X.timer_off_value` with one name and one expression
+//! ([`super::syntax::Mark`]) becomes `local d = T(id, X, nil, true)
+//! .timer_off_value`, `id` the declaration's identity: called so, the
+//! tagger is the provenance marker. It records whether `X` is `rawequal`
+//! to the host module's proxy, the conjunction over every execution of
+//! that declaration, in a table only the sandbox holds, and returns `X`
+//! unchanged, so the index runs as before. The record is copied with the
+//! captures after the pass ([`super::callback::Analysis::marks`]).
 
 use super::syntax::{Ast, CHUNK_ENV, DeclKind, Form, TAG_PREFIX};
 
@@ -181,6 +190,58 @@ pub(crate) fn instrument(
         if added > cap {
             return Err(Stop::Generated);
         }
+    }
+    // Each marked declaration's `X` passed through the tagger as a
+    // marker, its bytes charged before the edits are kept.
+    for (index, m) in ast.marks.iter().enumerate() {
+        if index % CHECK_EVERY == 0 && index > 0 && cancelled() {
+            return Err(Stop::Cancelled);
+        }
+        let id = (u64::from(file) << 32) | u64::from(m.decl);
+        let close = ",nil,true)";
+        // `T(id,` and the close, measured before either is built.
+        let mut digits = 1;
+        let mut rest = id;
+        while rest >= 10 {
+            rest /= 10;
+            digits += 1;
+        }
+        let n = t.len() + 1 + digits + 1 + close.len();
+        // A test can spend the allowance first, so the real check
+        // refuses.
+        #[cfg(test)]
+        let before = {
+            if super::tests::fail_at("mark bytes") {
+                added = cap;
+            }
+            added
+        };
+        if added.saturating_add(n) > cap {
+            return Err(Stop::Generated);
+        }
+        added = added.saturating_add(n);
+        #[cfg(test)]
+        {
+            super::tests::site_charged(
+                "mark bytes",
+                u64::try_from(added - before).unwrap_or(u64::MAX),
+            );
+            super::tests::site_did("mark bytes");
+            super::tests::site_did("work:mark");
+        }
+        let open = format!("{t}({id},");
+        edits.push(Edit {
+            at: m.start as usize,
+            order: 1,
+            skip: 0,
+            text: open,
+        });
+        edits.push(Edit {
+            at: m.dot as usize,
+            order: 0,
+            skip: 0,
+            text: close.to_owned(),
+        });
     }
     edits.sort_by_key(|e| (e.at, e.order));
     let prefix = format!("local {t}=...;return function(...) ");

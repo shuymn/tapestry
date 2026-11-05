@@ -107,9 +107,19 @@ pub(crate) const LIBS: [&str; 34] = [
 ];
 
 /// The tagger: it records a closure's identity and reader and returns the
-/// closure. The sandbox's own Lua: no skin can name it.
-const TAG: &str = "local ids, readers = ...\n\
-return function(id, f, r) ids[f] = id readers[f] = r return f end";
+/// closure; called with a fourth argument, it is the provenance marker
+/// ([`super::instrument`]), recording whether its value is the host
+/// module's proxy, ANDed over every call with that identity, and
+/// returning the value. The sandbox's own Lua: no skin can name it.
+const TAG: &str = "local ids, readers, marks, ms, rawequal = ...\n\
+return function(id, f, r, m)\n\
+if m then local v = marks[id] marks[id] = (v == nil or v) and rawequal(f, ms) return f end\n\
+ids[f] = id readers[f] = r return f end";
+
+/// The registry name of a configured pass's provenance records: each
+/// marked declaration's identity to whether every value it read
+/// `timer_off_value` from was the host module.
+pub(super) const TAG_MARKS: &str = "tapestry.tag_marks";
 
 /// The error value Lua carries once the ledger holds a fault: a fixed,
 /// small string, whatever the fault.
@@ -418,11 +428,15 @@ pub(super) fn vm(pass: &Rc<Pass>) -> mlua::Result<Lua> {
         ids.set_metatable(Some(weak.clone()))?;
         let readers = lua.create_table()?;
         readers.set_metatable(Some(weak))?;
+        let marks = lua.create_table()?;
+        let ms = super::host::module(&lua, b"main_state")?;
+        let rawequal: Function = lua.globals().raw_get("rawequal")?;
         let tagger: Function = lua
             .load(TAG)
             .set_name("=sandbox")
             .set_mode(ChunkMode::Text)
-            .call((ids.clone(), readers.clone()))?;
+            .call((ids.clone(), readers.clone(), marks.clone(), ms, rawequal))?;
+        lua.set_named_registry_value(TAG_MARKS, marks)?;
         lua.set_named_registry_value(TAG_IDS, ids)?;
         lua.set_named_registry_value(TAG_READERS, readers)?;
         lua.set_named_registry_value(TAGGER, tagger)?;

@@ -341,3 +341,37 @@ fn a_bpm_change_callback_reads_the_charts_fact() {
         assert_eq!(play.frame(0, &[]).len(), usize::from(shown), "{fact:?}");
     }
 }
+
+#[test]
+fn a_configured_offset_folds_into_a_draw() {
+    // The offset's entries are plain tables the pass builds, read along a
+    // static path from an upvalue: the draw folds to the configured
+    // alpha's sign.
+    let d = folder(
+        "local skin = { type = 0, name = \"t\", w = 1920, h = 1080,\n\
+           offset = { { name = \"bga\", id = 40, a = true } } }\n\
+         if not skin_config then return skin end\n\
+         local offset = { bga = skin_config.offset[\"bga\"] }\n\
+         skin.source = { { id = \"a\", path = \"a.png\" } }\n\
+         skin.image = { { id = \"i\", src = \"a\", x = 0, y = 0, w = 64, h = 64 } }\n\
+         skin.destination = { { id = \"i\", draw = function() return offset.bga.a >= 0 end,\n\
+           dst = { { x = 0, y = 0, w = 64, h = 64 } } } }\n\
+         return skin\n",
+    );
+    let cancel = Cancel::new();
+    let h = read_lua_header(d.path(), "s.luaskin", &cancel).unwrap();
+    for (a, shown) in [(0, true), (-1, false)] {
+        let mut config = Config::defaults(h.header());
+        config.offsets.insert(
+            40,
+            skin_beatoraja::OffsetValue {
+                a,
+                ..Default::default()
+            },
+        );
+        let i = common::lua_play(&h, &config, &cancel).unwrap();
+        assert_eq!(i.callbacks, [Disposition::Lowered], "{a}");
+        let quads = Drawn::new(i.imported.skin, 0).frame(1_000, &[]);
+        assert_eq!(!quads.is_empty(), shown, "{a}");
+    }
+}

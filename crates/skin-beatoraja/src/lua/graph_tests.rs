@@ -8,7 +8,7 @@
 use super::callback::Captured;
 use super::callback_tests::{gauge, image, import, skin};
 use super::root_tests::{analysis, configured, interferes, lowers, opened, script};
-use super::{LuaWhy, Unsupported};
+use super::{Disposition, LuaWhy, Unsupported};
 use crate::error::ImportError;
 use crate::import::callback::LOWERED;
 
@@ -112,33 +112,29 @@ fn a_binding_the_graph_proves_holds_only_while_the_analysis_is_closed() {
 }
 
 #[test]
-fn a_binding_to_anything_but_the_module_is_refused() {
-    // The global replaced by a table, and a global `_ENV` with a
-    // metatable, whose reads the raw graph does not see.
-    for (body, want) in [
-        (
-            "main_state = { gauge_type = function() return 4 end }",
-            Unsupported::Binding("a host module"),
-        ),
-        (
-            "main_state = require(\"main_state\")\nsetmetatable(_ENV, {})",
-            Unsupported::Capture("_ENV's metatable"),
-        ),
-    ] {
-        let entry = skin(body, &gauge(GLOBAL.1));
-        match import(&entry) {
-            Err(ImportError::Lua { why, .. }) => {
-                assert_eq!(
-                    why,
-                    LuaWhy::Critical {
-                        field: "draw",
-                        why: want
-                    },
-                    "{body}"
-                );
+fn a_binding_to_anything_but_the_module_folds_as_lua_reads_it() {
+    // The global replaced by a table of the skin's own functions folds
+    // through it: the gauge reads the skin's constant.
+    let entry = skin(
+        "main_state = { gauge_type = function() return 4 end }",
+        &gauge(GLOBAL.1),
+    );
+    assert_eq!(import(&entry).unwrap().callbacks, [Disposition::Lowered]);
+    // A global `_ENV` with a metatable, whose reads the raw graph does
+    // not see: it opens the candidate, which voids the capture.
+    let entry = skin(
+        "main_state = require(\"main_state\")\nsetmetatable(_ENV, {})",
+        &gauge(GLOBAL.1),
+    );
+    match import(&entry) {
+        Err(ImportError::Lua { why, .. }) => assert_eq!(
+            why,
+            LuaWhy::Critical {
+                field: "draw",
+                why: Unsupported::Interference
             }
-            other => panic!("{body}: {other:?}"),
-        }
+        ),
+        other => panic!("{other:?}"),
     }
 }
 

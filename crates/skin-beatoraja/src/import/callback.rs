@@ -6,59 +6,67 @@
 //! none (a `timer`, a text's or an image set's `value`) follows its
 //! element's role ([`Cx::unconsumed`]).
 //!
-//! A write-free callback ([`crate::lua::callback`]) is lowered into an
-//! expression's source, compiled through the importer's compile path and
-//! its budget like any condition or value: each read takes its JSON
-//! mapping, with that mapping's availability guard (joined into the
-//! element's visibility, so a value that can be unknown draws nothing
-//! while it is), its D4 deviation and its critical part (`number(101)`
-//! the EX score, as 101 in JSON):
+//! A write-free root is partially evaluated into its residual
+//! ([`crate::lua::residual`], taking the analysis only through the
+//! [`crate::lua::callback::Admitted`] witness), converted as its consumer
+//! converts it, and emitted here as an expression's source, compiled
+//! through the importer's compile path and its budget like any condition
+//! or value. The conversion comes first, so a result of a kind its
+//! consumer does not take is refused as that (a `text(1)` value is a
+//! type the number does not take) before its reads are looked at; the
+//! reads the residual recorded are kept apart from the result, so a
+//! conversion or a fold never drops one. Every recorded read is then
+//! attached, before anything is emitted, whether or not the result still
+//! uses it: its JSON
+//! mapping, that mapping's availability guard (joined into the element's
+//! visibility, so a value that can be unknown draws nothing while it is),
+//! its D4 deviation and its critical part (`number(101)` the EX score, as
+//! 101 in JSON); one with no mapping refuses the callback:
 //!
 //! - `number(n)`: the value property `n` ([`property::int_by_id`]), its
 //!   range that of its fields;
 //! - `option(n)`: the built-in boolean property `n` ([`ops::numeric`] with
 //!   no option items, as the source's function reads only the factory),
 //!   one it does not know `false`, as the source's is;
-//! - `timer(n) == timer_off_value` and `~=`: `!on(t)` and `on(t)` of the
-//!   JSON mapping's timer `t`, a timer never set off;
-//! - `gauge_type() == k` and `~=`: `gauge.kind` against the look `k`
-//!   selects (0 to 5, `assist_easy` to `hazard`; any other `k` matches no
-//!   look), under `gauge.valid`, as JSON's gauge conditions;
-//! - `skin_config.option["name"] == k`, in any callback: its captured
-//!   value, folded under the capture proof (the raw path and the final
-//!   integer entry checked at the read, noninterference by the effect
-//!   walk, [`crate::lua::callback`]), so lowering takes its analysis only
-//!   through the [`Admitted`] witness.
+//! - `timer(n)` against the off value, `==` and `~=`: `!on(t)` and
+//!   `on(t)` of the JSON mapping's timer `t`, a timer never set off; any
+//!   other use of a timer is a type it does not take;
+//! - `gauge_type()` against a known `k`, `==` and `~=`: `gauge.kind`
+//!   against the look `k` selects (0 to 5, `assist_easy` to `hazard`; any
+//!   other `k` matches no look), under `gauge.valid`, as JSON's gauge
+//!   conditions.
 //!
-//! While the candidate is open ([`Analysis::open`]), no fold of a
-//! captured value (an upvalue, `skin_config.option`, `timer_off_value`)
-//! and no host module or helper binding is proven: a callback that needs
-//! one is unsupported for [`Unsupported::Interference`], and a critical
-//! one refuses the candidate at the open site. A root whose reach writes
-//! never lowers ([`Unsupported::Writes`]). Each lowering is a phase of
-//! the analysis's time budget, located at its callable.
-//!
-//! Helpers are inlined, each call charged its expanded size before it is
-//! expanded ([`MAX_EXPANDED_NODES`]), and locals inlined where they are
-//! read, so a read nothing uses is dropped. Every integer intermediate is
-//! bounded from the ranges of what it reads, and one that could leave
-//! `i32` is unsupported: within that range Lua's integers and the
-//! expressions' agree. The generated source is bounded by
-//! [`MAX_SOURCE_BYTES`].
+//! The rest maps as it reads: integers, booleans, `-`, `!`, `+ - *` and
+//! comparisons, every integer node bounded from the ranges of what it
+//! reads, one that could leave `i32` unsupported (within that range Lua's
+//! integers and the expressions' agree). A select becomes `(if C then A
+//! else B)` only when the result and every arm are one kind, integer or
+//! boolean, after conversion (otherwise [`Unsupported::Type`]); the
+//! residual's own refusals give totality, the closed candidate and its
+//! node kinds purity, and the ranges, the residual's height and a trial
+//! compile of the source within R4's limits ([`LIMITS`]) the rest. A
+//! boolean select with a constant arm, or an arm that is its condition,
+//! is `&&`, `||` or `!` of it. Each node is emitted once a lowering, a
+//! shared one read from the memo; every generated string has its length
+//! checked against [`MAX_SOURCE_BYTES`] (fatal past it) and charged
+//! before it is built. Each lowering is a phase of the analysis's time
+//! budget, located at its callable.
 //!
 //! A callback that does not lower is unsupported: a decorative one is
 //! replaced by its typed constant, `false` for a `draw` (the element is
 //! never drawn) and the omitted number for a `value`, reported with the
-//! reason; a critical one refuses the candidate at its definition. A
-//! `value`'s role is its reads' ([`Lower::scan`] over its whole tree and
-//! its helpers): one that reads the EX score or the max combo is
-//! critical, whether or not the rest lowers, and so is one with an id or
-//! callee the scan cannot resolve. A cap, cancellation or the time budget
-//! refuses the candidate whatever the role.
+//! reason; a critical one refuses the candidate at its definition, or,
+//! for [`Unsupported::Interference`] (a capture read while the candidate
+//! is open), at the open site. A root whose reach writes never lowers
+//! ([`Unsupported::Writes`]). A `value`'s role is its reads' ([`Lower::scan`]
+//! over its whole tree and its helpers): one that reads the EX score or
+//! the max combo is critical, whether or not the rest lowers, and so is
+//! one with an id or callee the scan cannot resolve. A cap, cancellation
+//! or the time budget refuses the candidate whatever the role.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 
-use skin_model::{MAX_SOURCE_BYTES, PLAY};
+use skin_model::{MAX_SOURCE_BYTES, PLAY, Scope, Ty};
 
 use super::ops::{self, Cond};
 use super::policy::{CriticalPart, Role};
@@ -68,11 +76,13 @@ use super::timer::{Custom, Timer};
 use super::{Cx, Prop};
 use crate::error::ImportError;
 use crate::lua::callback::{
-    Admitted, Analysis, Callee, Captured, Disposition, Found, Site, Ty, fatal as sentinel, numeral,
+    Analysis, Callee, Captured, Disposition, Found, Site, fatal as sentinel, numeral,
     resolve_callee, tree,
 };
-use crate::lua::limits::{MAX_AST_DEPTH, MAX_EXPANDED_NODES};
-use crate::lua::syntax::{Ast, Bin, DeclKind, Expr, List, Stmt, Un};
+use crate::lua::residual::{
+    self, Conv, LIMITS, Node, R, Residual, Stop, Val, charge, did, stop, units,
+};
+use crate::lua::syntax::{Ast, Bin, DeclKind, Expr, List, Stmt};
 use crate::lua::{HOST_APIS, LuaLimit, LuaWhy, Unsupported};
 use crate::tree::{Kind, LuaScalar, NONE};
 
@@ -117,38 +127,54 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
+/// A lowered callback's guards, critical part and deviation.
+#[cfg(test)]
+pub(crate) type Meta = (Vec<&'static str>, Option<CriticalPart>, bool);
+
+#[cfg(test)]
+thread_local! {
+    /// Beside [`LOWERED`], each lowered callback's guards, critical part
+    /// and deviation.
+    pub(crate) static LOWERED_META: std::cell::RefCell<Vec<Meta>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// The last trial compile: its source, and its error's kind.
+    pub(crate) static TRIED: std::cell::RefCell<Option<(String, Option<skin_model::ErrorKind>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 #[cfg(test)]
 thread_local! {
     /// The instances this thread's role scans visited, each visit counted.
     pub(crate) static SCANNED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-/// Why lowering stopped.
-enum Stop {
-    Unsupported(Unsupported),
-    Fatal(LuaWhy),
-}
-
-/// A walk's stop for `why`: fatal for a cap or cancellation.
-fn stop(why: Unsupported) -> Stop {
-    sentinel(why).map_or(Stop::Unsupported(why), Stop::Fatal)
-}
-
-type R<T> = Result<T, Stop>;
-
-/// A lowered subexpression.
-enum V {
-    Int {
-        src: String,
-        lo: i64,
-        hi: i64,
-    },
+/// A read as its mapping gives it, attached before anything is emitted.
+#[derive(Debug)]
+enum Mapped {
+    /// `number(n)`: its field's expression and range.
+    Int { src: String, lo: i64, hi: i64 },
+    /// `option(n)`: its condition.
     Bool(String),
+    /// `gauge_type()`, read only against a look.
     Gauge,
-    /// A mapped timer's name, or `None` for one never set.
+    /// `timer(n)`: its JSON mapping's timer name, or `None` for one never
+    /// set, read only against the off value.
     Timer(Option<&'static str>),
-    TimerOff,
-    Config(i64),
+}
+
+/// An emitted subexpression.
+#[derive(Debug)]
+enum V {
+    Int { src: String, lo: i64, hi: i64 },
+    Bool(String),
+}
+
+impl V {
+    fn src(&self) -> &str {
+        match self {
+            Self::Int { src, .. } | Self::Bool(src) => src,
+        }
+    }
 }
 
 /// The JSON mapping's timer name of model slot `slot`.
@@ -156,68 +182,95 @@ fn timer_name(slot: u16) -> Option<&'static str> {
     PLAY.timers.get(usize::from(slot)).map(|t| t.name)
 }
 
-/// An instance's body as [`Lower::body`] reads it.
-type Body<'a> = (&'a Ast, Vec<(u32, u32)>, u32);
+/// The R4 symbol of comparison or arithmetic operator `op`.
+fn symbol(op: Bin) -> &'static str {
+    match op {
+        Bin::Add => "+",
+        Bin::Sub => "-",
+        Bin::Mul => "*",
+        Bin::Eq => "==",
+        Bin::Ne => "!=",
+        Bin::Lt => "<",
+        Bin::Le => "<=",
+        Bin::Gt => ">",
+        _ => ">=",
+    }
+}
 
+/// The emitter of a callback's residual onto the expressions, and the
+/// role scan.
 struct Lower<'a> {
     an: &'a Analysis,
     custom: &'a Custom,
-    cancelled: &'a dyn Fn() -> bool,
     out: Lowered,
-    /// Each instance's expanded size, once computed, for the instances
-    /// this lowering reaches.
-    sizes: std::collections::HashMap<u32, u64>,
-    /// How deep the current walk is: every expression level, an inlined
-    /// local's and a helper's included.
-    depth: u32,
+    /// Each read's mapping, by its node.
+    mapped: HashMap<u32, Mapped>,
+    /// Each node emitted, by its node: a shared node is emitted once.
+    memo: HashMap<u32, V>,
 }
 
 impl<'a> Lower<'a> {
-    /// A lowering of `an`'s callbacks with `custom`'s timers, seeing
-    /// `cancelled`.
-    fn new(an: &'a Analysis, custom: &'a Custom, cancelled: &'a dyn Fn() -> bool) -> Self {
+    /// A lowering of `an`'s callbacks with `custom`'s timers.
+    fn new(an: &'a Analysis, custom: &'a Custom) -> Self {
         Self {
             an,
             custom,
-            cancelled,
             out: Lowered {
                 src: String::new(),
                 guards: Vec::new(),
                 part: None,
                 deviates: false,
             },
-            sizes: std::collections::HashMap::new(),
-            depth: 0,
+            mapped: HashMap::new(),
+            memo: HashMap::new(),
         }
     }
 }
 
 impl Lower<'_> {
-    /// A generated string kept: past [`MAX_SOURCE_BYTES`] fatal, its
-    /// bytes charged as analysis work (each level copies its operands').
-    fn bytes(&self, src: String) -> R<String> {
-        if src.len() > MAX_SOURCE_BYTES {
+    /// `parts` joined into one generated string: their length summed and
+    /// checked against [`MAX_SOURCE_BYTES`] (fatal past it), charged, then
+    /// allocated.
+    fn text(an: &Analysis, parts: &[&str]) -> R<String> {
+        let n = parts.iter().fold(0_usize, |n, p| n.saturating_add(p.len()));
+        if n > MAX_SOURCE_BYTES {
             return Err(Stop::Fatal(LuaWhy::Limit(LuaLimit::Generated)));
         }
-        self.an
-            .charge(u64::try_from(src.len()).unwrap_or(u64::MAX))
-            .map_err(stop)?;
-        Ok(src)
-    }
-
-    fn int(&self, src: String, lo: i64, hi: i64) -> R<V> {
-        if lo < i64::from(i32::MIN) || hi > i64::from(i32::MAX) {
-            return Err(Stop::Unsupported(Unsupported::Range));
+        charge(an, "text", units(n))?;
+        did("text");
+        let mut s = String::with_capacity(n);
+        for p in parts {
+            s.push_str(p);
         }
-        Ok(V::Int {
-            src: self.bytes(src)?,
-            lo,
-            hi,
-        })
+        Ok(s)
     }
 
-    fn boolean(&self, src: String) -> R<V> {
-        Ok(V::Bool(self.bytes(src)?))
+    /// Integer `n`'s literal, `(-m)` when negative: its digits counted,
+    /// then checked, charged and written as [`Self::text`] does.
+    fn int_text(an: &Analysis, n: i64) -> R<String> {
+        let mut m = n.unsigned_abs();
+        let mut digits = 1_usize;
+        while m >= 10 {
+            m /= 10;
+            digits += 1;
+        }
+        let len = digits + if n < 0 { 3 } else { 0 };
+        if len > MAX_SOURCE_BYTES {
+            return Err(Stop::Fatal(LuaWhy::Limit(LuaLimit::Generated)));
+        }
+        charge(an, "text", units(len))?;
+        did("text");
+        #[cfg(test)]
+        did("work:int");
+        let mut s = String::with_capacity(len);
+        if n < 0 {
+            s.push_str("(-");
+        }
+        let _ = std::fmt::Write::write_fmt(&mut s, format_args!("{}", n.unsigned_abs()));
+        if n < 0 {
+            s.push(')');
+        }
+        Ok(s)
     }
 
     fn guard(&mut self, g: &'static str) {
@@ -226,205 +279,45 @@ impl Lower<'_> {
         }
     }
 
-    /// The body of instance `i`: its tree, its locals (each declaration
-    /// and its initializer) and its return expression.
-    fn body(an: &Analysis, i: u32) -> R<Body<'_>> {
-        let unsupported = Stop::Unsupported(Unsupported::Capture("an untagged closure"));
-        let (ast, func) = tree(an, i).ok_or(unsupported)?;
-        let f = ast
-            .func(func)
-            .ok_or(Stop::Unsupported(Unsupported::Capture(
-                "an untagged closure",
-            )))?;
-        let mut locals = Vec::new();
-        for &s in ast.list(f.body) {
-            an.charge(1).map_err(stop)?;
-            match ast.stmt(s) {
-                Stmt::Local { names, exprs } => {
-                    if let (&[d], &[e]) = (ast.list(names), ast.list(exprs)) {
-                        locals.push((d, e));
-                    }
-                }
-                Stmt::Return(list) => {
-                    if let &[e] = ast.list(list) {
-                        return Ok((ast, locals, e));
-                    }
-                }
-                _ => {}
+    /// Residual `res` emitted as the source of an expression of the
+    /// consumer's type: every read attached first (its mapping, guard,
+    /// deviation and part, an unmapped one refused), then the nodes the
+    /// root reaches, then a trial compile.
+    fn emit_root(&mut self, res: &Residual, conv: Conv) -> R<String> {
+        for &r in &res.reads {
+            charge(self.an, "attach", 1)?;
+            did("attach");
+            if let Node::Read { api, arg } = res.node(r) {
+                let m = self.map(api, arg)?;
+                self.mapped.insert(r, m);
             }
         }
-        Err(Stop::Unsupported(Unsupported::Construct("no return")))
-    }
-
-    /// Instance `i`'s expanded size: its return expression's nodes, each
-    /// local and helper read counted at its full size.
-    fn size(&mut self, i: u32) -> R<u64> {
-        if let Some(&n) = self.sizes.get(&i) {
-            return Ok(n);
-        }
-        if (self.cancelled)() {
-            return Err(Stop::Fatal(LuaWhy::Cancelled));
-        }
-        let (ast, locals, ret) = Self::body(self.an, i)?;
-        let mut sized: Vec<(u32, u64)> = Vec::with_capacity(locals.len());
-        for &(d, e) in &locals {
-            let n = self.size_expr(ast, i, &sized, e)?;
-            sized.push((d, n));
-        }
-        let n = self.size_expr(ast, i, &sized, ret)?;
-        // Sparse: an entry for each instance this lowering sized.
-        self.sizes.insert(i, n);
-        Ok(n)
-    }
-
-    fn size_expr(&mut self, ast: &Ast, inst: u32, locals: &[(u32, u64)], e: u32) -> R<u64> {
-        self.deeper(|l| l.size_expr_inner(ast, inst, locals, e))
-    }
-
-    fn size_expr_inner(&mut self, ast: &Ast, inst: u32, locals: &[(u32, u64)], e: u32) -> R<u64> {
-        Ok(match ast.expr(e) {
-            Expr::Local(d) => {
-                self.charge_scan(locals.len())?;
-                locals
-                    .iter()
-                    .rev()
-                    .find(|(l, _)| *l == d)
-                    .map_or(1, |&(_, n)| n)
-            }
-            Expr::Paren(x) | Expr::Unary(_, x) => {
-                self.size_expr(ast, inst, locals, x)?.saturating_add(1)
-            }
-            Expr::Binary(_, a, b) => self
-                .size_expr(ast, inst, locals, a)?
-                .saturating_add(self.size_expr(ast, inst, locals, b)?)
-                .saturating_add(1),
-            Expr::Call { callee, .. } => {
-                self.bound()?;
-                match resolve_callee(self.an, ast, inst, callee).map_err(Stop::Unsupported)? {
-                    Callee::Helper(j) => self.size(j)?.saturating_add(1),
-                    Callee::Host(_) => 1,
-                }
-            }
-            _ => 1,
-        })
-    }
-
-    /// Instance `i` sized, its expanded size charged against
-    /// [`MAX_EXPANDED_NODES`], then lowered.
-    fn expand(&mut self, i: u32) -> R<V> {
-        let n = self.size(i)?;
-        let total = self.an.expanded.get().saturating_add(n);
-        if total > MAX_EXPANDED_NODES {
-            return Err(Stop::Fatal(LuaWhy::Limit(LuaLimit::Expansion)));
-        }
-        self.an.expanded.set(total);
-        self.instance(i)
-    }
-
-    /// Instance `i` lowered.
-    fn instance(&mut self, i: u32) -> R<V> {
+        self.emit(res, res.root)?;
+        let (src, ty) = match (self.memo.get(&res.root), conv) {
+            (Some(V::Bool(s)), Conv::Truthy) => (s, Ty::Bool),
+            (Some(V::Int { src, .. }), Conv::Int) => (src, Ty::Int),
+            _ => return Err(Stop::Unsupported(Unsupported::Type)),
+        };
+        charge(self.an, "memo", units(src.len()))?;
+        did("memo");
+        let src = src.clone();
+        charge(self.an, "compile", units(src.len()))?;
+        did("compile");
+        let tried = skin_model::compile(&src, &Scope::new(&PLAY), ty);
         #[cfg(test)]
-        crate::lua::tests::expansion_witness();
-        if (self.cancelled)() {
-            return Err(Stop::Fatal(LuaWhy::Cancelled));
+        TRIED.with(|t| {
+            *t.borrow_mut() = Some((src.clone(), tried.as_ref().err().map(|e| e.kind.clone())));
+        });
+        if tried.is_err() {
+            return Err(Stop::Unsupported(LIMITS));
         }
-        let (ast, locals, ret) = Self::body(self.an, i)?;
-        self.expr(ast, i, &locals, ret)
+        Ok(src)
     }
 
-    fn expr(&mut self, ast: &Ast, inst: u32, locals: &[(u32, u32)], e: u32) -> R<V> {
-        self.deeper(|l| l.expr_inner(ast, inst, locals, e))
-    }
-
-    fn expr_inner(&mut self, ast: &Ast, inst: u32, locals: &[(u32, u32)], e: u32) -> R<V> {
-        let unsupported = |w| Err(Stop::Unsupported(w));
-        match ast.expr(e) {
-            Expr::Int(n) => self.literal(n),
-            Expr::True => self.boolean("true".into()),
-            Expr::False => self.boolean("false".into()),
-            Expr::Paren(x) => self.expr(ast, inst, locals, x),
-            Expr::Local(d) => {
-                self.charge_scan(locals.len())?;
-                if let Some((k, &(_, init))) =
-                    locals.iter().enumerate().rev().find(|(_, (l, _))| *l == d)
-                {
-                    // The locals before it, as its initializer saw them.
-                    let before = locals.get(..k).unwrap_or_default();
-                    return self.expr(ast, inst, before, init);
-                }
-                self.bound()?;
-                match self.an.upvalue(inst, d) {
-                    Some(Captured::Int(n)) => self.literal(n),
-                    Some(Captured::Bool(b)) => self.boolean(b.to_string()),
-                    _ => unsupported(Unsupported::Capture("an upvalue")),
-                }
-            }
-            Expr::Index { obj, key } => {
-                self.bound()?;
-                if let Expr::Str(s) = ast.expr(key)
-                    && ast.str(s) == b"timer_off_value"
-                {
-                    return Ok(V::TimerOff);
-                }
-                self.config(ast, inst, obj, key)
-            }
-            Expr::Call { callee, args } => {
-                self.bound()?;
-                match resolve_callee(self.an, ast, inst, callee).map_err(Stop::Unsupported)? {
-                    Callee::Helper(j) => self.expand(j),
-                    Callee::Host(api) => {
-                        let arg = ast.list(args).first().and_then(|&a| numeral(ast, a));
-                        self.read(api, arg)
-                    }
-                }
-            }
-            Expr::Unary(op, x) => match (op, self.expr(ast, inst, locals, x)?) {
-                (Un::Neg, V::Int { src, lo, hi }) => self.int(
-                    format!("(-{src})"),
-                    hi.checked_neg().unwrap_or(i64::MAX),
-                    lo.checked_neg().unwrap_or(i64::MAX),
-                ),
-                (Un::Not, V::Bool(s)) => self.boolean(format!("(!{s})")),
-                _ => unsupported(Unsupported::Type),
-            },
-            Expr::Binary(op, a, b) => {
-                let (va, vb) = (
-                    self.expr(ast, inst, locals, a)?,
-                    self.expr(ast, inst, locals, b)?,
-                );
-                self.binary(op, va, vb)
-            }
-            _ => unsupported(Unsupported::Type),
-        }
-    }
-
-    fn literal(&self, n: i64) -> R<V> {
-        let src = if n < 0 {
-            format!("(-{})", n.unsigned_abs())
-        } else {
-            n.to_string()
-        };
-        self.int(src, n, n)
-    }
-
-    /// `skin_config.option["name"]`: its captured value, which no code the
-    /// source runs at frame time writes while the effect walk found the
-    /// candidate closed ([`Self::bound`] checks it before this is read).
-    fn config(&mut self, ast: &Ast, inst: u32, obj: u32, key: u32) -> R<V> {
-        let (Expr::Index { obj: cfg, .. }, Expr::Str(k)) = (ast.expr(obj), ast.expr(key)) else {
-            return Err(Stop::Unsupported(Unsupported::Type));
-        };
-        let Expr::Global { env, .. } = ast.expr(cfg) else {
-            return Err(Stop::Unsupported(Unsupported::Type));
-        };
-        self.an
-            .option_entry(inst, env, ast.str(k))
-            .map(V::Config)
-            .map_err(stop)
-    }
-
-    /// A host read of API `api` with the numeral `arg`.
-    fn read(&mut self, api: u16, arg: Option<i64>) -> R<V> {
+    /// Host read `api` of `arg` mapped: `number(n)` and `option(n)`
+    /// through the JSON mappings, `timer(n)` through the custom timers,
+    /// `gauge_type()` under `gauge.valid`; any other a refusal.
+    fn map(&mut self, api: u16, arg: Option<i64>) -> R<Mapped> {
         let name = HOST_APIS.get(usize::from(api)).map_or("", |&(_, n)| n);
         let unmapped = || {
             Stop::Unsupported(Unsupported::Unmapped {
@@ -434,7 +327,11 @@ impl Lower<'_> {
         };
         let id = arg.and_then(|a| i32::try_from(a).ok());
         match name {
-            "gauge_type" => Ok(V::Gauge),
+            "gauge_type" => {
+                self.guard("gauge.valid");
+                self.out.deviates = true;
+                Ok(Mapped::Gauge)
+            }
             "number" => {
                 let IntProp::Shown(v) = property::int_by_id(id.ok_or_else(unmapped)?) else {
                     return Err(unmapped());
@@ -445,27 +342,24 @@ impl Lower<'_> {
                 self.out.deviates |= v.deviates();
                 self.out.part = self.out.part.or(v.part());
                 let (lo, hi) = v.range();
-                self.int(format!("({})", v.expr()), lo, hi)
+                let src = Self::text(self.an, &["(", v.expr(), ")"])?;
+                Ok(Mapped::Int { src, lo, hi })
             }
-            "option" => match ops::numeric(id.ok_or_else(unmapped)?, &BTreeMap::new()) {
-                Cond::Expr {
-                    src,
-                    display_deviation,
-                } => {
-                    self.out.deviates |= display_deviation;
-                    self.boolean(format!("({src})"))
-                }
-                Cond::Fold(b) => self.boolean(b.to_string()),
-                Cond::Undefined(_) => self.boolean("false".into()),
-                Cond::Unsupported(_) => Err(unmapped()),
-            },
+            "option" => {
+                let id = id.ok_or_else(unmapped)?;
+                // The mapping builds its condition: its bound charged first.
+                charge(self.an, "option", units(ops::MAX_COND_BYTES))?;
+                #[cfg(test)]
+                did("work:option");
+                self.option(ops::numeric(id, &BTreeMap::new()), unmapped)
+            }
             "timer" => {
                 let id = id.filter(|&n| n >= 0).ok_or_else(unmapped)?;
                 match self.custom.resolve(id) {
                     Timer::Builtin(slot) => {
-                        Ok(V::Timer(Some(timer_name(slot).ok_or_else(unmapped)?)))
+                        Ok(Mapped::Timer(Some(timer_name(slot).ok_or_else(unmapped)?)))
                     }
-                    Timer::Unset => Ok(V::Timer(None)),
+                    Timer::Unset => Ok(Mapped::Timer(None)),
                     Timer::Rank(_) | Timer::Unsupported => Err(unmapped()),
                 }
             }
@@ -473,99 +367,219 @@ impl Lower<'_> {
         }
     }
 
-    fn binary(&mut self, op: Bin, a: V, b: V) -> R<V> {
-        let sym = match op {
-            Bin::Add => "+",
-            Bin::Sub => "-",
-            Bin::Mul => "*",
-            Bin::Eq => "==",
-            Bin::Ne => "!=",
-            Bin::Lt => "<",
-            Bin::Le => "<=",
-            Bin::Gt => ">",
-            Bin::Ge => ">=",
-            Bin::And => "&&",
-            Bin::Or => "||",
-            _ => return Err(Stop::Unsupported(Unsupported::Type)),
-        };
-        let eq = op == Bin::Eq;
-        match (a, b) {
-            (
-                V::Int {
-                    src: x,
-                    lo: al,
-                    hi: ah,
-                },
-                V::Int {
-                    src: y,
-                    lo: bl,
-                    hi: bh,
-                },
-            ) => {
-                let src = format!("({x} {sym} {y})");
-                let corners = |f: fn(i128, i128) -> i128| {
-                    let c = [
-                        f(al.into(), bl.into()),
-                        f(al.into(), bh.into()),
-                        f(ah.into(), bl.into()),
-                        f(ah.into(), bh.into()),
-                    ];
-                    let lo = c.iter().copied().min().unwrap_or(0);
-                    let hi = c.iter().copied().max().unwrap_or(0);
-                    (
-                        i64::try_from(lo).unwrap_or(i64::MIN),
-                        i64::try_from(hi).unwrap_or(i64::MAX),
-                    )
-                };
-                match op {
-                    Bin::Add => {
-                        let (lo, hi) = corners(|p, q| p + q);
-                        self.int(src, lo, hi)
-                    }
-                    Bin::Sub => {
-                        let (lo, hi) = corners(|p, q| p - q);
-                        self.int(src, lo, hi)
-                    }
-                    Bin::Mul => {
-                        let (lo, hi) = corners(|p, q| p * q);
-                        self.int(src, lo, hi)
-                    }
-                    Bin::Eq | Bin::Ne | Bin::Lt | Bin::Le | Bin::Gt | Bin::Ge => self.boolean(src),
-                    _ => Err(Stop::Unsupported(Unsupported::Truthiness)),
-                }
+    /// An option read's mapped condition `c`, built within the bound
+    /// already charged.
+    fn option(&mut self, c: Cond, unmapped: impl FnOnce() -> Stop) -> R<Mapped> {
+        match c {
+            Cond::Expr {
+                src,
+                display_deviation,
+            } => {
+                self.out.deviates |= display_deviation;
+                Ok(Mapped::Bool(Self::text(self.an, &["(", &src, ")"])?))
             }
-            (V::Bool(x), V::Bool(y)) if matches!(op, Bin::And | Bin::Or) => {
-                self.boolean(format!("({x} {sym} {y})"))
-            }
-            (V::Gauge, V::Int { lo, hi, .. }) | (V::Int { lo, hi, .. }, V::Gauge)
-                if lo == hi && matches!(op, Bin::Eq | Bin::Ne) =>
-            {
-                self.guard("gauge.valid");
-                self.out.deviates = true;
-                let look = usize::try_from(lo).ok().and_then(|k| LOOKS.get(k));
-                self.boolean(match look {
-                    Some(name) => format!("(gauge.kind {sym} {name})"),
-                    None => (!eq).to_string(),
-                })
-            }
-            (V::Timer(t), V::TimerOff) | (V::TimerOff, V::Timer(t))
-                if matches!(op, Bin::Eq | Bin::Ne) =>
-            {
-                self.boolean(match (t, eq) {
-                    (Some(name), true) => format!("(!on({name}))"),
-                    (Some(name), false) => format!("on({name})"),
-                    (None, on) => on.to_string(),
-                })
-            }
-            (V::Config(v), V::Int { lo, hi, .. }) | (V::Int { lo, hi, .. }, V::Config(v))
-                if lo == hi && matches!(op, Bin::Eq | Bin::Ne) =>
-            {
-                self.boolean(((v == lo) == eq).to_string())
-            }
-            _ => Err(Stop::Unsupported(Unsupported::Type)),
+            Cond::Fold(b) => Ok(Mapped::Bool(Self::text(
+                self.an,
+                &[if b { "true" } else { "false" }],
+            )?)),
+            Cond::Undefined(_) => Ok(Mapped::Bool(Self::text(self.an, &["false"])?)),
+            Cond::Unsupported(_) => Err(unmapped()),
         }
     }
 
+    /// An integer subexpression, its range within `i32` (where Lua's
+    /// integers and the expressions' agree).
+    fn int(src: String, lo: i64, hi: i64) -> R<V> {
+        if lo < i64::from(i32::MIN) || hi > i64::from(i32::MAX) {
+            return Err(Stop::Unsupported(Unsupported::Range));
+        }
+        Ok(V::Int { src, lo, hi })
+    }
+
+    /// Node `r` emitted into the memo, once: each visit charged.
+    fn emit(&mut self, res: &Residual, r: u32) -> R<()> {
+        charge(self.an, "emit", 1)?;
+        did("emit");
+        if self.memo.contains_key(&r) {
+            return Ok(());
+        }
+        let v = self.emit_node(res, r)?;
+        self.memo.insert(r, v);
+        Ok(())
+    }
+
+    /// The emitted operand `r`.
+    fn get(&self, r: u32) -> R<&V> {
+        self.memo
+            .get(&r)
+            .ok_or(Stop::Unsupported(Unsupported::Type))
+    }
+
+    fn emit_node(&mut self, res: &Residual, r: u32) -> R<V> {
+        let an = self.an;
+        let ty = || Err(Stop::Unsupported(Unsupported::Type));
+        match res.node(r) {
+            Node::Known(Val::Int(n)) => Self::int(Self::int_text(an, n)?, n, n),
+            Node::Known(Val::Bool(b)) => Ok(V::Bool(Self::text(
+                an,
+                &[if b { "true" } else { "false" }],
+            )?)),
+            Node::Known(_) | Node::Unreachable => ty(),
+            Node::Read { .. } => match self.mapped.get(&r) {
+                Some(Mapped::Int { src, lo, hi }) => Self::int(Self::text(an, &[src])?, *lo, *hi),
+                Some(Mapped::Bool(src)) => Ok(V::Bool(Self::text(an, &[src])?)),
+                _ => ty(),
+            },
+            Node::Not(x) => {
+                self.emit(res, x)?;
+                match self.get(x)? {
+                    V::Bool(s) => Ok(V::Bool(Self::text(an, &["(!", s, ")"])?)),
+                    V::Int { .. } => ty(),
+                }
+            }
+            Node::Neg(x) => {
+                self.emit(res, x)?;
+                match self.get(x)? {
+                    // Every operand is within `i32` ([`Self::int`]): its
+                    // negation, sums, differences and products fit `i64`.
+                    V::Int { src, lo, hi } => {
+                        Self::int(Self::text(an, &["(-", src, ")"])?, -*hi, -*lo)
+                    }
+                    V::Bool(_) => ty(),
+                }
+            }
+            Node::Arith(op, a, b) => {
+                self.emit(res, a)?;
+                self.emit(res, b)?;
+                let (
+                    V::Int {
+                        src: x,
+                        lo: al,
+                        hi: ah,
+                    },
+                    V::Int {
+                        src: y,
+                        lo: bl,
+                        hi: bh,
+                    },
+                ) = (self.get(a)?, self.get(b)?)
+                else {
+                    return ty();
+                };
+                let f = |p: i64, q: i64| match op {
+                    Bin::Add => p + q,
+                    Bin::Sub => p - q,
+                    _ => p * q,
+                };
+                let c = [f(*al, *bl), f(*al, *bh), f(*ah, *bl), f(*ah, *bh)];
+                let lo = c.iter().copied().min().unwrap_or(0);
+                let hi = c.iter().copied().max().unwrap_or(0);
+                let src = Self::text(an, &["(", x, " ", symbol(op), " ", y, ")"])?;
+                Self::int(src, lo, hi)
+            }
+            Node::Cmp(op, a, b) => self.compare(res, op, a, b),
+            Node::Select { cond, then, other } => {
+                self.emit(res, cond)?;
+                self.emit(res, then)?;
+                self.emit(res, other)?;
+                let V::Bool(c) = self.get(cond)? else {
+                    return ty();
+                };
+                match (self.get(then)?, self.get(other)?) {
+                    (V::Bool(t), V::Bool(o)) => {
+                        // An arm that is the condition itself is the
+                        // value the condition gives there.
+                        let arm = |x: u32, b: bool| {
+                            if x == cond {
+                                Some(Val::Bool(b))
+                            } else {
+                                res.val(x)
+                            }
+                        };
+                        let src = match (arm(then, true), arm(other, false)) {
+                            (Some(Val::Bool(true)), Some(Val::Bool(false))) => {
+                                Self::text(an, &[c])?
+                            }
+                            (Some(Val::Bool(false)), Some(Val::Bool(true))) => {
+                                Self::text(an, &["(!", c, ")"])?
+                            }
+                            (_, Some(Val::Bool(false))) => {
+                                Self::text(an, &["(", c, " && ", t, ")"])?
+                            }
+                            (Some(Val::Bool(true)), _) => {
+                                Self::text(an, &["(", c, " || ", o, ")"])?
+                            }
+                            _ => Self::text(an, &["(if ", c, " then ", t, " else ", o, ")"])?,
+                        };
+                        Ok(V::Bool(src))
+                    }
+                    (
+                        V::Int {
+                            src: t,
+                            lo: tl,
+                            hi: th,
+                        },
+                        V::Int {
+                            src: o,
+                            lo: ol,
+                            hi: oh,
+                        },
+                    ) => {
+                        let (lo, hi) = ((*tl).min(*ol), (*th).max(*oh));
+                        let src = Self::text(an, &["(if ", c, " then ", t, " else ", o, ")"])?;
+                        Self::int(src, lo, hi)
+                    }
+                    _ => ty(),
+                }
+            }
+        }
+    }
+
+    /// A comparison: `gauge_type()` against a known look, a timer against
+    /// the off value, or integers or booleans.
+    fn compare(&mut self, res: &Residual, op: Bin, a: u32, b: u32) -> R<V> {
+        let an = self.an;
+        let eq = op == Bin::Eq;
+        let read = |r: u32| match res.node(r) {
+            Node::Read { .. } => self.mapped.get(&r),
+            _ => None,
+        };
+        let sides = [(a, b), (b, a)];
+        for (x, y) in sides {
+            match (read(x), res.val(y)) {
+                (Some(Mapped::Gauge), Some(Val::Int(k))) if matches!(op, Bin::Eq | Bin::Ne) => {
+                    let look = usize::try_from(k).ok().and_then(|k| LOOKS.get(k));
+                    return Ok(V::Bool(match look {
+                        Some(name) => {
+                            Self::text(an, &["(gauge.kind ", symbol(op), " ", name, ")"])?
+                        }
+                        None => Self::text(an, &[if eq { "false" } else { "true" }])?,
+                    }));
+                }
+                (Some(Mapped::Timer(t)), Some(Val::OffValue)) => {
+                    let t = *t;
+                    return Ok(V::Bool(match (t, eq) {
+                        (Some(name), true) => Self::text(an, &["(!on(", name, "))"])?,
+                        (Some(name), false) => Self::text(an, &["on(", name, ")"])?,
+                        (None, on) => Self::text(an, &[if on { "true" } else { "false" }])?,
+                    }));
+                }
+                _ => {}
+            }
+        }
+        self.emit(res, a)?;
+        self.emit(res, b)?;
+        let (x, y) = (self.get(a)?, self.get(b)?);
+        let both = matches!((x, y), (V::Int { .. }, V::Int { .. }))
+            || matches!((x, y), (V::Bool(_), V::Bool(_))) && matches!(op, Bin::Eq | Bin::Ne);
+        if !both {
+            return Err(Stop::Unsupported(Unsupported::Type));
+        }
+        Ok(V::Bool(Self::text(
+            an,
+            &["(", x.src(), " ", symbol(op), " ", y.src(), ")"],
+        )?))
+    }
     /// The role scan of instance `i` (design.md "beatoraja Lua Skins",
     /// roles): every expression of its whole tree and of the helpers it
     /// calls, each id a `number` read takes resolved to the critical part
@@ -586,7 +600,6 @@ impl Lower<'_> {
         let mut blocks: Vec<List> = Vec::new();
         let mut stack: Vec<u32> = Vec::new();
         let mut calls: Vec<u32> = Vec::new();
-        let mut reassigned: HashSet<u32> = HashSet::new();
         while let Some(i) = pending.pop() {
             let Some((ast, func)) = tree(self.an, i) else {
                 out.unresolved = out.unresolved.or(Some("callee"));
@@ -601,12 +614,12 @@ impl Lower<'_> {
             self.an.charge(u64::from(f.params.1)).map_err(stop)?;
             let own = params.get(&i).cloned().unwrap_or_default();
             // The whole tree, function constructors' bodies included: the
-            // locals assigned again and the calls collected first, each
-            // statement and expression one unit.
+            // calls collected first, each statement and expression one
+            // unit. A local assigned again is the parser's
+            // ([`crate::lua::syntax::Decl::assigned`]).
             blocks.clear();
             stack.clear();
             calls.clear();
-            reassigned.clear();
             blocks.push(f.body);
             loop {
                 if let Some(l) = blocks.pop() {
@@ -615,7 +628,7 @@ impl Lower<'_> {
                         self.an
                             .charge(stmt_width(ast, s).saturating_add(1))
                             .map_err(stop)?;
-                        stmt_parts(ast, s, &mut blocks, &mut stack, &mut reassigned);
+                        stmt_parts(ast, s, &mut blocks, &mut stack);
                     }
                     continue;
                 }
@@ -659,7 +672,6 @@ impl Lower<'_> {
                 inst: i,
                 func,
                 own: &own,
-                reassigned: &reassigned,
                 open,
             };
             for &e in &calls {
@@ -742,37 +754,12 @@ impl Lower<'_> {
         Ok(out)
     }
 
-    /// What a proof resting on captured state needs: a fold of a captured
-    /// value (an upvalue, `skin_config.option`, `timer_off_value`) or a
-    /// host module or helper binding, each proven by its captured final
-    /// binding. While the analysis is open, code it does not see may
-    /// change that state, so none holds.
-    fn bound(&self) -> R<()> {
-        if self.an.open.get().is_some() {
-            return Err(Stop::Unsupported(Unsupported::Interference));
-        }
-        Ok(())
-    }
-
     /// `n` units of work charged before they are done: a scan of `n`
     /// locals (at most Lua's 200), or `n` parameters' joins.
     fn charge_scan(&self, n: usize) -> R<()> {
         self.an
             .charge(u64::try_from(n).unwrap_or(u64::MAX))
             .map_err(stop)
-    }
-
-    /// Runs `f` one level deeper into a walk: past [`MAX_AST_DEPTH`] the
-    /// lowering stops at the depth cap, fatal.
-    fn deeper<T>(&mut self, f: impl FnOnce(&mut Self) -> R<T>) -> R<T> {
-        if self.depth >= MAX_AST_DEPTH {
-            return Err(Stop::Fatal(LuaWhy::Limit(LuaLimit::AstDepth)));
-        }
-        self.an.charge(1).map_err(stop)?;
-        self.depth += 1;
-        let r = f(self);
-        self.depth -= 1;
-        r
     }
 }
 
@@ -809,8 +796,6 @@ struct Ids<'a> {
     func: u32,
     /// Its parameters' joins over its call sites.
     own: &'a [Scan],
-    /// Its locals assigned after their declaration.
-    reassigned: &'a HashSet<u32>,
     open: bool,
 }
 
@@ -833,7 +818,7 @@ impl Ids<'_> {
         match decl {
             // A parameter assigned again holds what the body assigns, not
             // what its callers pass.
-            Some(x) if x.kind == DeclKind::Param && !self.reassigned.contains(&d) => {
+            Some(x) if x.kind == DeclKind::Param && !x.assigned => {
                 let params = self.ast.func(self.func).map_or((0, 0), |f| f.params);
                 // Its position, each parameter one unit.
                 self.an.charge(u64::from(params.1)).map_err(stop)?;
@@ -842,9 +827,7 @@ impl Ids<'_> {
                     .copied()
                     .unwrap_or(Scan::unresolved("id")))
             }
-            Some(x)
-                if x.kind == DeclKind::Local && x.init != NONE && !self.reassigned.contains(&d) =>
-            {
+            Some(x) if x.kind == DeclKind::Local && x.init != NONE && !x.assigned => {
                 Ok(numeral(self.ast, x.init).map_or(Scan::unresolved("id"), number_part))
             }
             Some(_) => Ok(Scan::unresolved("id")),
@@ -883,14 +866,9 @@ fn stmt_width(ast: &Ast, s: u32) -> u64 {
     }
 }
 
-/// Statement `s`'s blocks, expressions and locals it assigns again.
-fn stmt_parts(
-    ast: &Ast,
-    s: u32,
-    blocks: &mut Vec<List>,
-    exprs: &mut Vec<u32>,
-    reassigned: &mut HashSet<u32>,
-) {
+/// Statement `s`'s blocks and expressions; a local it assigns is no
+/// expression read.
+fn stmt_parts(ast: &Ast, s: u32, blocks: &mut Vec<List>, exprs: &mut Vec<u32>) {
     let mut expr = |e: u32| {
         if e != NONE {
             exprs.push(e);
@@ -903,9 +881,7 @@ fn stmt_parts(
         Stmt::Assign { targets, exprs: l } => {
             for &t in ast.list(targets) {
                 match ast.expr(t) {
-                    Expr::Local(d) => {
-                        reassigned.insert(d);
-                    }
+                    Expr::Local(_) => {}
                     _ => expr(t),
                 }
             }
@@ -948,9 +924,7 @@ fn stmt_parts(
         }
         Stmt::Function { target, func } => {
             match ast.expr(target) {
-                Expr::Local(d) => {
-                    reassigned.insert(d);
-                }
+                Expr::Local(_) => {}
                 _ => expr(target),
             }
             if let Some(f) = ast.func(func) {
@@ -986,7 +960,7 @@ fn lib_callee(an: &Analysis, ast: &Ast, inst: u32, callee: u32) -> Result<bool, 
 
 /// What lowering a callback gave.
 enum Lowering {
-    Lowered(Lowered, Ty),
+    Lowered(Lowered),
     Unsupported(Unsupported, Scan),
 }
 
@@ -1070,22 +1044,22 @@ impl Cx<'_> {
             .and_then(|l| l.analysis.as_deref())
     }
 
-    /// Lowers the callable at node `id`, a phase of the analysis's time
-    /// budget located at it.
-    fn lower(&mut self, id: u32) -> Result<Lowering, ImportError> {
+    /// Lowers the callable at node `id`, converted by `conv`, a phase of
+    /// the analysis's time budget located at it.
+    fn lower(&mut self, id: u32, conv: Conv) -> Result<Lowering, ImportError> {
         let at = self.def.loc(id);
         let fatal = |why| ImportError::Lua {
             at: Some(at.clone()),
             why,
         };
         let Some(an) = self.analysis() else {
-            return self.lower_in(id);
+            return self.lower_in(id, conv);
         };
         let phase = crate::lua::callback::Phase::Lower;
         an.clock
             .enter(phase, Some(id))
             .map_err(|w| fatal(sentinel(w).unwrap_or(LuaWhy::Limit(LuaLimit::AnalysisTime))))?;
-        let r = self.lower_in(id);
+        let r = self.lower_in(id, conv);
         let left = self
             .analysis()
             .map_or(Ok(()), |an| an.clock.leave())
@@ -1095,7 +1069,7 @@ impl Cx<'_> {
     }
 
     /// [`Self::lower`]'s work.
-    fn lower_in(&mut self, id: u32) -> Result<Lowering, ImportError> {
+    fn lower_in(&mut self, id: u32, conv: Conv) -> Result<Lowering, ImportError> {
         let at = self.def.loc(id);
         let fatal = |why| ImportError::Lua {
             at: Some(at.clone()),
@@ -1112,14 +1086,15 @@ impl Cx<'_> {
         };
         // Every import runs after admission, which runs the effect walk:
         // an analysis it did not admit lowers nothing.
-        let Some(an) = an.admitted().map(Admitted::analysis) else {
+        let Some(adm) = an.admitted() else {
             return Ok(Lowering::Unsupported(
                 Unsupported::Capture("an unadmitted callback"),
                 Scan::default(),
             ));
         };
+        let an = adm.analysis();
         let cancelled = || def.cancelled(|| None).is_err();
-        let mut l = Lower::new(an, &self.custom, &cancelled);
+        let mut l = Lower::new(an, &self.custom);
         let scan = |l: &Lower<'_>| match l.scan(inst) {
             Ok(s) => Ok(s),
             Err(Stop::Fatal(why)) => Err(fatal(why)),
@@ -1132,24 +1107,15 @@ impl Cx<'_> {
         if an.writes(inst) {
             return Ok(Lowering::Unsupported(Unsupported::Writes, scan(&l)?));
         }
-        let ty = match an.classify(inst) {
-            Ok(ty) => ty,
-            Err(f) => {
-                if let Some(why) = sentinel(f.why) {
-                    return Err(fatal(why));
-                }
-                return Ok(Lowering::Unsupported(f.why, scan(&l)?));
-            }
-        };
-        let r = l.expand(inst);
+        let r = residual::evaluate(adm, inst, conv, &cancelled)
+            .and_then(|res: Residual| l.emit_root(&res, conv));
         #[cfg(test)]
-        crate::lua::tests::memo_witness(l.sizes.len());
+        crate::lua::tests::memo_witness(l.memo.len());
         match r {
-            Ok(V::Int { src, .. }) | Ok(V::Bool(src)) => {
+            Ok(src) => {
                 l.out.src = src;
-                Ok(Lowering::Lowered(l.out, ty))
+                Ok(Lowering::Lowered(l.out))
             }
-            Ok(_) => Ok(Lowering::Unsupported(Unsupported::Type, scan(&l)?)),
             Err(Stop::Unsupported(why)) => {
                 let mut s = scan(&l)?;
                 s.part = l.out.part.or(s.part);
@@ -1238,8 +1204,7 @@ impl Cx<'_> {
         an.clock
             .enter(crate::lua::callback::Phase::Scan, Some(id))
             .map_err(time)?;
-        let cancelled = || self.def.cancelled(|| None).is_err();
-        let r = Lower::new(an, &self.custom, &cancelled).scan(inst);
+        let r = Lower::new(an, &self.custom).scan(inst);
         let left = an.clock.leave().map_err(time);
         let scan = match r {
             Ok(s) => s,
@@ -1272,8 +1237,8 @@ impl Cx<'_> {
     ) -> Result<bool, ImportError> {
         let c = self.callable_at(id).map_or(NONE, |(c, _)| c);
         let critical = role != Role::Decorative;
-        let why = match self.lower(id) {
-            Ok(Lowering::Lowered(l, Ty::Bool)) => {
+        let why = match self.lower(id, Conv::Truthy) {
+            Ok(Lowering::Lowered(l)) => {
                 self.outcome((c, id), field, role, (Disposition::Lowered, None));
                 #[cfg(test)]
                 LOWERED.with(|w| {
@@ -1281,6 +1246,8 @@ impl Cx<'_> {
                     all.push(l.src.clone());
                     w.borrow_mut().push(all.join(" && "));
                 });
+                #[cfg(test)]
+                LOWERED_META.with(|w| w.borrow_mut().push((l.guards.clone(), l.part, l.deviates)));
                 for g in l.guards {
                     if !conds.iter().any(|c| c == g) {
                         conds.push(g.to_owned());
@@ -1292,7 +1259,6 @@ impl Cx<'_> {
                 }
                 return Ok(true);
             }
-            Ok(Lowering::Lowered(..)) => Unsupported::Type,
             Ok(Lowering::Unsupported(why, _)) => why,
             Err(e) => {
                 self.outcome((c, id), field, role, (Disposition::Refused, None));
@@ -1327,8 +1293,8 @@ impl Cx<'_> {
         base: Role,
     ) -> Result<Option<NumberValue>, ImportError> {
         let c = self.callable_at(id).map_or(NONE, |(c, _)| c);
-        let (why, scan) = match self.lower(id) {
-            Ok(Lowering::Lowered(l, Ty::Int)) => {
+        let (why, scan) = match self.lower(id, Conv::Int) {
+            Ok(Lowering::Lowered(l)) => {
                 self.outcome(
                     (c, id),
                     "value",
@@ -1337,6 +1303,8 @@ impl Cx<'_> {
                 );
                 #[cfg(test)]
                 LOWERED.with(|w| w.borrow_mut().push(l.src.clone()));
+                #[cfg(test)]
+                LOWERED_META.with(|w| w.borrow_mut().push((l.guards.clone(), l.part, l.deviates)));
                 let guard = (!l.guards.is_empty()).then(|| l.guards.join(" && "));
                 return Ok(Some(NumberValue {
                     expr: l.src,
@@ -1345,13 +1313,6 @@ impl Cx<'_> {
                     deviates: l.deviates,
                 }));
             }
-            Ok(Lowering::Lowered(l, _)) => (
-                Unsupported::Type,
-                Scan {
-                    part: l.part,
-                    unresolved: None,
-                },
-            ),
             Ok(Lowering::Unsupported(why, scan)) => (why, scan),
             Err(e) => {
                 self.outcome((c, id), "value", base, (Disposition::Refused, None));

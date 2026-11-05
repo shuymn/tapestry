@@ -116,17 +116,17 @@ pub(super) fn outcome(
 
 #[test]
 fn refusals_name_their_reason_and_run_no_handler() {
-    use super::Disposition::{Refused, Replaced};
+    use super::Disposition::{Lowered, Refused, Replaced};
     let critical = |why| Some(LuaWhy::Critical { field: "draw", why });
     for (body, dst, want, callbacks) in [
         // The module reassigned at construction: the candidate stays
-        // closed, and the binding is refused; written through an alias,
-        // fatal.
+        // closed, and the callback folds through the table it holds, as
+        // Lua reads it; written through an alias, fatal.
         (
             "ms = { number = function() return 1 end }",
             gauge("function() return ms.number(110) > 0 end"),
-            critical(Unsupported::Binding("a host module")),
-            vec![Refused],
+            None,
+            vec![Lowered],
         ),
         (
             "local m = ms\npcall(function() m.number = nil end)",
@@ -141,12 +141,13 @@ fn refusals_name_their_reason_and_run_no_handler() {
             critical(Unsupported::Writes),
             vec![Refused],
         ),
-        // Integer truthiness.
+        // Integer truthiness folds, the unmapped read it drops still
+        // refused.
         (
             "",
             image("function() return ms.number(1) and true end"),
             None,
-            vec![Replaced(Unsupported::Truthiness)],
+            vec![Replaced(Unsupported::Unmapped { api: 1, id: 1 })],
         ),
         // Recursion, through a helper bound after its caller: the
         // captured final binding proves it.
@@ -169,13 +170,8 @@ fn refusals_name_their_reason_and_run_no_handler() {
             None,
             vec![Replaced(Unsupported::Construct("/"))],
         ),
-        // A global read.
-        (
-            "",
-            image("function() return flag end"),
-            None,
-            vec![Replaced(Unsupported::Global)],
-        ),
+        // A global nothing set folds to nil.
+        ("", image("function() return flag end"), None, vec![Lowered]),
         // An upvalue mutated by the callback.
         (
             "local n = 0",
@@ -229,13 +225,15 @@ fn refusals_name_their_reason_and_run_no_handler() {
             None,
             vec![Replaced(Unsupported::Construct("generic for"))],
         ),
-        // `_ENV` with a metatable; `skin_config.option` with one, or
-        // without the raw entry.
+        // `_ENV` with a metatable, and `skin_config.option` with one, each
+        // read through it opening the candidate. Without the raw entry, it folds
+        // to nil; a string entry is unequal to a numeral; a replaced
+        // `skin_config` is read as Lua reads it.
         (
             &format!("{PROBE}\nsetmetatable(_ENV, {{ __index = function() probe() end }})"),
             image("function() return skin_config.option[\"x\"] == 1 end"),
             None,
-            vec![Replaced(Unsupported::Capture("_ENV's metatable"))],
+            vec![Replaced(Unsupported::Interference)],
         ),
         (
             &format!(
@@ -243,28 +241,25 @@ fn refusals_name_their_reason_and_run_no_handler() {
             ),
             image("function() return skin_config.option[\"x\"] == 1 end"),
             None,
-            vec![Replaced(Unsupported::Capture(
-                "skin_config.option's metatable",
-            ))],
+            vec![Replaced(Unsupported::Interference)],
         ),
         (
             "",
             image("function() return skin_config.option[\"x\"] == 1 end"),
             None,
-            vec![Replaced(Unsupported::Capture("an option entry"))],
+            vec![Lowered],
         ),
         (
             "skin_config.option.x = \"1\"",
             image("function() return skin_config.option[\"x\"] == 1 end"),
             None,
-            vec![Replaced(Unsupported::Capture("an option entry"))],
+            vec![Lowered],
         ),
-        // `skin_config` replaced.
         (
             "skin_config = { option = { x = 1 } }",
             image("function() return skin_config.option[\"x\"] == 1 end"),
             None,
-            vec![Replaced(Unsupported::Capture("skin_config"))],
+            vec![Lowered],
         ),
         // A float.
         (
@@ -376,7 +371,7 @@ fn every_walk_over_a_tree_stops_at_the_depth_cap() {
         "",
     );
     assert_eq!(why(import(&entry)), fatal);
-    // Classification through helpers, each calling the one before.
+    // Evaluation through helpers, each calling the one before.
     let mut helpers = String::from("local function h0() return ms.number(110) > 0 end\n");
     for k in 1..150 {
         helpers.push_str(&format!(
@@ -386,8 +381,9 @@ fn every_walk_over_a_tree_stops_at_the_depth_cap() {
     }
     let entry = skin(&helpers, &image("function() return h149() end"));
     assert_eq!(why(import(&entry)), fatal);
-    // Lowering, which inlines each local where it is read: shallow for
-    // classification, deep once inlined.
+    // Evaluation binds each local to its node once: a long chain of
+    // locals is shallow, and its residual's height past the expressions'
+    // nesting follows the role.
     let mut locals = String::from("local a0 = ms.number(110) ");
     for k in 1..150 {
         locals.push_str(&format!("local a{k} = a{} + 1 ", k - 1));
@@ -396,7 +392,10 @@ fn every_walk_over_a_tree_stops_at_the_depth_cap() {
         "",
         &image(&format!("function() {locals} return a149 > 0 end")),
     );
-    assert_eq!(why(import(&entry)), fatal);
+    assert_eq!(
+        import(&entry).unwrap().callbacks,
+        [super::Disposition::Replaced(super::residual::LIMITS)]
+    );
 }
 
 /// A skin whose configured pass makes `count` closures of one function
@@ -528,16 +527,14 @@ fn option_lookups_hash_the_name_and_charge_its_bytes() {
     assert!(start.elapsed() < std::time::Duration::from_secs(20));
 }
 
-#[test]
-fn the_role_scan_visits_each_helper_once() {
-    // A binary tree of 16 383 helper closures, 8 192 leaves each
-    // capturing its own index, under 32 numbers whose callback does not
-    // convert: each one's role scan visits its value and every helper
-    // once, a hash a check.
-    let body = "local level = {}\n\
+/// A binary tree of 16 383 helper closures, `root`, 8 192 leaves each
+/// capturing its own index, under 32 numbers drawing `value`.
+pub(super) fn helper_tree(value: &str) -> String {
+    let body = format!(
+        "local level = {{}}\n\
         for i = 1, 8192 do local k = i level[i] = function() local own = k return 0 end end\n\
         while #level > 1 do\n\
-          local up = {}\n\
+          local up = {{}}\n\
           for i = 1, #level, 2 do\n\
             local left, right = level[i], level[i + 1]\n\
             up[#up + 1] = function() local x = left() local y = right() return 0 end\n\
@@ -545,14 +542,26 @@ fn the_role_scan_visits_each_helper_once() {
           level = up\n\
         end\n\
         local root = level[1]\n\
-        skin.value = { { id = \"v\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, digit = 3,\n\
-          value = function() local unused = root() return ms.number(425) end } }";
+        skin.value = {{ {{ id = \"v\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, digit = 3,\n\
+          value = {value} }} }}"
+    );
     let dst: String = (0..32)
         .map(|k| format!("{{ id = \"v\", dst = {{ {{ x = {k}, y = 0, w = 6, h = 6 }} }} }},"))
         .collect();
+    skin(&body, &dst)
+}
+
+#[test]
+fn the_role_scan_visits_each_helper_once() {
+    // Under 32 numbers whose callback does not convert: each one's role
+    // scan visits its value and every helper once, a hash a check. The
+    // tree is called behind a condition folded false, which evaluation
+    // never enters and the scan reads.
+    let entry =
+        helper_tree("function() if false then local unused = root() end return ms.number(425) end");
     let start = std::time::Instant::now();
     crate::import::callback::SCANNED.with(|n| n.set(0));
-    let i = import(&skin(body, &dst)).unwrap();
+    let i = import(&entry).unwrap();
     assert!(
         i.callbacks
             .iter()
@@ -650,16 +659,16 @@ fn rewritten_chunks_share_one_allowance() {
 }
 
 #[test]
-fn a_lowering_sizes_only_what_it_reaches() {
-    // 60 000 closures nothing consumes, then one number callback read by
-    // 16 000 destinations: each lowering holds a memo slot for the one
-    // instance it sizes, not one for every instance.
-    let body = "s_extra = {}\n\
-        for i = 1, 60000 do s_extra[i] = function() return 0 end end\n\
-        skin.extra = s_extra\n\
-        skin.value = { { id = \"v\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, digit = 3,\n\
-          value = function() return ms.number(425) end } }";
-    let dst: String = (0..16_000)
+fn a_lowering_s_memo_holds_only_what_it_emits() {
+    // 60 000 callable roots nothing consumes (classified, never
+    // consumed), then one number callback read by 4 000 destinations:
+    // each lowering holds a memo slot for the one node it emits, not one
+    // for every instance.
+    let body = "skin.customEvents = {}\n\
+        for i = 1, 60000 do skin.customEvents[i] = { id = 1000 + i, action = function() return 0 end } end\n\
+        skin.value = { { id = \"v\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, digit = 1,\n\
+          value = function() return ms.number(110) end } }";
+    let dst: String = (0..4_000)
         .map(|k| {
             format!(
                 "{{ id = \"v\", dst = {{ {{ x = {}, y = 0, w = 6, h = 6 }} }} }},",
@@ -668,9 +677,16 @@ fn a_lowering_sizes_only_what_it_reaches() {
         })
         .collect();
     super::tests::MEMO_SLOTS.with(|n| n.set(0));
-    import(&skin(body, &dst)).unwrap();
+    let i = import(&skin(body, &dst)).unwrap();
+    assert_eq!(
+        i.callbacks
+            .iter()
+            .filter(|d| **d == super::Disposition::ClassifiedOnly)
+            .count(),
+        60_000
+    );
     let slots = super::tests::MEMO_SLOTS.with(Cell::get);
-    assert!(slots <= 16_000, "{slots} memo slots");
+    assert_eq!(slots, 4_000, "{slots} memo slots");
 }
 
 /// The model fields read by the counts the oracle sets, by property id:

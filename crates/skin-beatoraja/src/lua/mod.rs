@@ -58,6 +58,9 @@ mod ledger;
 mod library;
 pub mod limits;
 mod loader;
+pub(crate) mod residual;
+#[cfg(test)]
+mod residual_tests;
 #[cfg(test)]
 mod root_tests;
 mod sandbox;
@@ -218,8 +221,6 @@ pub enum LuaWhy {
 pub enum Unsupported {
     /// A construct outside the converted form.
     Construct(&'static str),
-    /// A global other than `skin_config`.
-    Global,
     /// A host module or helper whose captured final binding is not one.
     Binding(&'static str),
     /// A host API outside the bridges, by its index in [`HOST_APIS`]: a
@@ -227,8 +228,6 @@ pub enum Unsupported {
     HostApi(u16),
     /// A call of something that is not a host API or a helper.
     Callee,
-    /// `and`, `or` or `not` of an integer, whose truthiness is Lua's.
-    Truthiness,
     /// Operands of types the operator does not take.
     Type,
     /// A helper that calls itself.
@@ -262,11 +261,9 @@ impl fmt::Display for Unsupported {
         };
         match self {
             Self::Construct(c) => write!(f, "an unsupported construct ({c})"),
-            Self::Global => f.write_str("a global other than skin_config"),
             Self::Binding(b) => write!(f, "{b} not proven by its captured binding"),
             Self::HostApi(a) => write!(f, "{} has no conversion", api(*a)),
             Self::Callee => f.write_str("a call of an unknown function"),
-            Self::Truthiness => f.write_str("an integer used as a condition"),
             Self::Type => f.write_str("operands of an unsupported type"),
             Self::Recursion => f.write_str("a helper that calls itself"),
             Self::Capture(c) => write!(f, "{c} not proven"),
