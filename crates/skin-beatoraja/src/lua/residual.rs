@@ -561,20 +561,14 @@ impl<'a> Eval<'a> {
                 let (ns, es) = (ast.list(names), ast.list(exprs));
                 // Each name and value, charged before the attributes are
                 // scanned and the values buffered.
-                charge(self.an, "list", units(ns.len() + es.len()))?;
-                did("list");
+                charge(self.an, "list:local", units(ns.len() + es.len()))?;
+                did("list:local");
                 for &d in ns {
                     if ast.decl(d).is_some_and(|x| x.attrib == Attrib::Close) {
                         return construct("<close>");
                     }
                 }
-                let mut vals = Vec::with_capacity(ns.len().min(es.len()));
-                for (k, &e) in es.iter().enumerate() {
-                    let v = self.expr(f, e)?;
-                    if k < ns.len() {
-                        vals.push(v);
-                    }
-                }
+                let vals = self.values(f, es, ns.len())?;
                 for (k, &d) in ns.iter().enumerate() {
                     let v = match vals.get(k) {
                         Some(&v) => v,
@@ -586,8 +580,12 @@ impl<'a> Eval<'a> {
             }
             Stmt::Assign { targets, exprs } => {
                 let ts = ast.list(targets);
-                charge(self.an, "list", units(ts.len() + ast.list(exprs).len()))?;
-                did("list");
+                charge(
+                    self.an,
+                    "list:assign",
+                    units(ts.len() + ast.list(exprs).len()),
+                )?;
+                did("list:assign");
                 let mut slots = Vec::with_capacity(ts.len());
                 for &t in ts {
                     let Expr::Local(d) = ast.expr(t) else {
@@ -606,13 +604,7 @@ impl<'a> Eval<'a> {
                 if sorted.windows(2).any(|w| w.first() == w.get(1)) {
                     return construct("a target assigned twice");
                 }
-                let mut vals = Vec::with_capacity(slots.len());
-                for (k, &e) in ast.list(exprs).iter().enumerate() {
-                    let v = self.expr(f, e)?;
-                    if k < slots.len() {
-                        vals.push(v);
-                    }
-                }
+                let vals = self.values(f, ast.list(exprs), slots.len())?;
                 for (k, &slot) in slots.iter().enumerate() {
                     let v = match vals.get(k) {
                         Some(&v) => v,
@@ -912,30 +904,37 @@ impl<'a> Eval<'a> {
         }
     }
 
+    /// Expressions `es` evaluated left to right, every one of them, the
+    /// first `keep` values kept; the list's length already charged.
+    fn values(&mut self, f: &mut Frame<'a>, es: &[u32], keep: usize) -> R<Vec<u32>> {
+        let mut vals = Vec::with_capacity(keep.min(es.len()));
+        for (k, &e) in es.iter().enumerate() {
+            let v = self.expr(f, e)?;
+            if k < keep {
+                vals.push(v);
+            }
+        }
+        Ok(vals)
+    }
+
     fn call(&mut self, f: &mut Frame<'a>, callee: u32, args: List) -> R<u32> {
         let c = self.expr(f, callee)?;
         let args = f.ast.list(args);
         match self.val(c) {
             Some(Val::Closure(j)) => {
                 self.an.charge(1).map_err(stop)?;
-                charge(self.an, "list", units(args.len()))?;
-                did("list");
-                let mut xs = Vec::with_capacity(args.len());
-                for &a in args {
-                    xs.push(self.expr(f, a)?);
-                }
+                charge(self.an, "list:call", units(args.len()))?;
+                did("list:call");
+                let xs = self.values(f, args, args.len())?;
                 self.deeper(|ev| ev.function(j, &xs))
             }
             Some(Val::Host(api)) => {
                 let Some((arity, _)) = reader(api) else {
                     return refuse(Unsupported::HostApi(api));
                 };
-                charge(self.an, "list", units(args.len()))?;
-                did("list");
-                let mut xs = Vec::with_capacity(args.len());
-                for &a in args {
-                    xs.push(self.expr(f, a)?);
-                }
+                charge(self.an, "list:host", units(args.len()))?;
+                did("list:host");
+                let xs = self.values(f, args, args.len())?;
                 if xs.len() != arity {
                     return construct("host arguments");
                 }

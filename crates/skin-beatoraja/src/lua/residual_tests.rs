@@ -234,20 +234,24 @@ fn state(reads: &Reads) -> (Vec<i32>, Vec<i32>) {
     (fields, timers)
 }
 
-/// Lowered sources `srcs` evaluated as `ty` with `reads`.
-fn evaluate(srcs: &[String], ty: Ty, reads: &Reads) -> Vec<i64> {
+/// Lowered sources `srcs` compiled as `ty`.
+fn programs(srcs: &[String], ty: Ty) -> Vec<skin_model::Program> {
+    srcs.iter()
+        .map(|s| compile(s, &Scope::new(&PLAY), ty).unwrap_or_else(|e| panic!("{s}: {e:?}")))
+        .collect()
+}
+
+/// Programs `ps` of type `ty` evaluated with `reads`.
+fn evaluate(ps: &[skin_model::Program], ty: Ty, reads: &Reads) -> Vec<i64> {
     let (fields, timers) = state(reads);
     let st = State {
         fields: &fields,
         timers: &timers,
     };
-    srcs.iter()
-        .map(|s| {
-            let p = compile(s, &Scope::new(&PLAY), ty).unwrap_or_else(|e| panic!("{s}: {e:?}"));
-            match ty {
-                Ty::Bool => i64::from(p.eval_bool(&st)),
-                _ => i64::from(p.eval(&st)),
-            }
+    ps.iter()
+        .map(|p| match ty {
+            Ty::Bool => i64::from(p.eval_bool(&st)),
+            _ => i64::from(p.eval(&st)),
         })
         .collect()
 }
@@ -286,13 +290,15 @@ fn grid(counts: &[i64]) -> Vec<Reads> {
 #[track_caller]
 fn agrees(entry: &str, options: &[(&str, i64)], lowered: &[String], draws: bool, counts: &[i64]) {
     let oracle = Oracle::new(entry, options);
+    let ty = if draws { Ty::Bool } else { Ty::Int };
+    let ps = programs(lowered, ty);
     for reads in grid(counts) {
         if draws {
             let want: Vec<i64> = oracle.draws(&reads).into_iter().map(i64::from).collect();
-            assert_eq!(evaluate(lowered, Ty::Bool, &reads), want, "{reads:?}");
+            assert_eq!(evaluate(&ps, ty, &reads), want, "{reads:?}");
         } else {
             assert_eq!(
-                evaluate(lowered, Ty::Int, &reads),
+                evaluate(&ps, ty, &reads),
                 oracle.values(&reads),
                 "{reads:?} {lowered:?}"
             );
@@ -855,11 +861,8 @@ fn witness(name: &'static str, entry: &str, units: u64, why: LuaWhy, line: u32) 
     let r = run(entry);
     r.r.unwrap_or_else(|e| panic!("{name}: {e:?}"));
     assert_eq!(site(name).0, units, "{name}");
-    fail_next(Some(name));
-    let r = run(entry);
-    let started = site(name).1;
-    fail_next(None);
-    match r.r {
+    let (r, started) = forced(name, entry, name);
+    match r {
         Err(ImportError::Lua { why: w, at }) => {
             assert_eq!(w, why, "{name}");
             let at = at.unwrap();
@@ -1069,18 +1072,41 @@ fn the_marker_s_bytes_are_measured_before_they_are_formatted() {
 
 #[test]
 fn a_statement_s_lists_are_charged_before_they_are_read() {
-    // `local` names and values, an assignment's targets and values, and
-    // a call's arguments: each list's length charged before it is
-    // scanned or buffered.
+    // `local` names and values, an assignment's targets and values, a
+    // helper call's arguments and a host call's: each list's length
+    // charged before it is scanned or buffered.
     let entry = skin(
         "local function h(x, y) return x == 1 end",
-        &image("function() local a, b = 1, 2 a, b = 3, 4 return h(1, 2) end"),
+        &image(
+            "function() local a, b = 1, 2 a, b = 3, 4 return h(1, 2) and ms.number(110) > 0 end",
+        ),
     );
     assert!(closed(&entry));
     fail_next(None);
     let r = run(&entry);
     assert_eq!(r.callbacks, [Disposition::Lowered]);
-    assert_eq!(site("list").0, 4 + 4 + 2);
+    let lists = [
+        ("list:local", 4),
+        ("list:assign", 4),
+        ("list:call", 2),
+        ("list:host", 1),
+    ];
+    for (name, units) in lists {
+        assert_eq!(site(name).0, units, "{name}");
+    }
+    for (name, _) in lists {
+        // The real allowance spent at that list: refused there, its
+        // work never started.
+        let (r, started) = forced(name, &entry, name);
+        match r {
+            Err(ImportError::Lua {
+                why: LuaWhy::Limit(LuaLimit::AnalysisWork),
+                at: Some(at),
+            }) => assert_eq!(at.line, destinations(&entry), "{name}"),
+            other => panic!("{name}: {other:?}"),
+        }
+        assert_eq!(started, 0, "{name}");
+    }
 }
 
 #[test]
@@ -1089,24 +1115,11 @@ fn a_helper_tree_inlined_by_many_consumers_meets_the_expansion_cap() {
     // binary tree of 16 383 helper closures, which each of 32 numbers
     // calls, is inlined in full by every consumer, past the cumulative
     // node cap: fatal.
-    let body = "local level = {}\n\
-        for i = 1, 8192 do local k = i level[i] = function() local own = k return 0 end end\n\
-        while #level > 1 do\n\
-          local up = {}\n\
-          for i = 1, #level, 2 do\n\
-            local left, right = level[i], level[i + 1]\n\
-            up[#up + 1] = function() local x = left() local y = right() return 0 end\n\
-          end\n\
-          level = up\n\
-        end\n\
-        local root = level[1]\n\
-        skin.value = { { id = \"v\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, digit = 3,\n\
-          value = function() local unused = root() return ms.number(425) end } }";
-    let dst: String = (0..32)
-        .map(|k| format!("{{ id = \"v\", dst = {{ {{ x = {k}, y = 0, w = 6, h = 6 }} }} }},"))
-        .collect();
+    let entry = super::callback_tests::helper_tree(
+        "function() local unused = root() return ms.number(425) end",
+    );
     assert!(matches!(
-        run(&skin(body, &dst)).r,
+        run(&entry).r,
         Err(ImportError::Lua {
             why: LuaWhy::Limit(LuaLimit::Expansion),
             ..

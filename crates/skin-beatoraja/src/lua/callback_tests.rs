@@ -527,17 +527,14 @@ fn option_lookups_hash_the_name_and_charge_its_bytes() {
     assert!(start.elapsed() < std::time::Duration::from_secs(20));
 }
 
-#[test]
-fn the_role_scan_visits_each_helper_once() {
-    // A binary tree of 16 383 helper closures, 8 192 leaves each
-    // capturing its own index, under 32 numbers whose callback does not
-    // convert: each one's role scan visits its value and every helper
-    // once, a hash a check. The tree is called behind a condition folded
-    // false, which evaluation never enters and the scan reads.
-    let body = "local level = {}\n\
+/// A binary tree of 16 383 helper closures, `root`, 8 192 leaves each
+/// capturing its own index, under 32 numbers drawing `value`.
+pub(super) fn helper_tree(value: &str) -> String {
+    let body = format!(
+        "local level = {{}}\n\
         for i = 1, 8192 do local k = i level[i] = function() local own = k return 0 end end\n\
         while #level > 1 do\n\
-          local up = {}\n\
+          local up = {{}}\n\
           for i = 1, #level, 2 do\n\
             local left, right = level[i], level[i + 1]\n\
             up[#up + 1] = function() local x = left() local y = right() return 0 end\n\
@@ -545,14 +542,26 @@ fn the_role_scan_visits_each_helper_once() {
           level = up\n\
         end\n\
         local root = level[1]\n\
-        skin.value = { { id = \"v\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, digit = 3,\n\
-          value = function() if false then local unused = root() end return ms.number(425) end } }";
+        skin.value = {{ {{ id = \"v\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, digit = 3,\n\
+          value = {value} }} }}"
+    );
     let dst: String = (0..32)
         .map(|k| format!("{{ id = \"v\", dst = {{ {{ x = {k}, y = 0, w = 6, h = 6 }} }} }},"))
         .collect();
+    skin(&body, &dst)
+}
+
+#[test]
+fn the_role_scan_visits_each_helper_once() {
+    // Under 32 numbers whose callback does not convert: each one's role
+    // scan visits its value and every helper once, a hash a check. The
+    // tree is called behind a condition folded false, which evaluation
+    // never enters and the scan reads.
+    let entry =
+        helper_tree("function() if false then local unused = root() end return ms.number(425) end");
     let start = std::time::Instant::now();
     crate::import::callback::SCANNED.with(|n| n.set(0));
-    let i = import(&skin(body, &dst)).unwrap();
+    let i = import(&entry).unwrap();
     assert!(
         i.callbacks
             .iter()
