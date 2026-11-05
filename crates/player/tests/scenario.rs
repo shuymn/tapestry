@@ -225,7 +225,7 @@ impl Fixture {
 
 /// The scenario of `steps`, over `library`, with `out` as its output.
 fn scenario(steps: &[&str]) -> String {
-    let mut text = "version = 2\noutput = \"out\"\n[library]\nroots = [\"library\"]\n".to_owned();
+    let mut text = "version = 3\noutput = \"out\"\n[library]\nroots = [\"library\"]\n".to_owned();
     for s in steps {
         text.push_str("[[step]]\n");
         text.push_str(s);
@@ -628,10 +628,10 @@ fn a_stalled_capture_exits_one_within_the_bound() {
 #[test]
 fn other_scenario_version_is_refused() {
     let fx = Fixture::new();
-    let (out, _, stderr) = fx.run("version = 3\nwhat_v3_adds = true\n");
+    let (out, _, stderr) = fx.run("version = 4\nwhat_v4_adds = true\n");
     assert_eq!(out.status.code(), Some(1), "{stderr}");
     assert!(
-        stderr.contains("version 3 is not supported; this build reads version 2"),
+        stderr.contains("version 4 is not supported; this build reads version 3"),
         "{stderr}"
     );
     assert!(!stderr.contains("what_v3_adds"), "{stderr}");
@@ -639,10 +639,128 @@ fn other_scenario_version_is_refused() {
     let (out, _, stderr) = fx.run("[library]\nroots = [\"library\"]\n");
     assert_eq!(out.status.code(), Some(1), "{stderr}");
     assert!(
-        stderr.contains("no version; this build reads version 2"),
+        stderr.contains("no version; this build reads version 3"),
         "{stderr}"
     );
     assert!(!fx.data().join("library.db").exists());
+}
+
+/// A scenario's `size` sets the frames' size, and its captures keep their
+/// axes: a loading frame, a READY frame by time since READY, two chart
+/// times on one play, each with what its frame was beside it. A later
+/// chart time sits on the play's own axis, past READY.
+#[test]
+fn a_sized_scenario_captures_on_each_axis() {
+    let fx = Fixture::new();
+    write_chart(&fx.library(), "a", "譜面A");
+    let text = scenario(&[
+        "capture = { loading = true, file = \"load.png\" }",
+        "capture = { ready_at = 200, file = \"ready.png\" }",
+        "capture = { at = 0, file = \"start.png\" }",
+        "capture = { at = 2500, file = \"note.png\" }",
+        "select = { path = \"library/a/a.bms\" }",
+        "play = { input = \"auto\", until = \"end\" }",
+        "result = \"back\"",
+        "quit = {}",
+    ])
+    .replacen(
+        "output = \"out\"\n",
+        "output = \"out\"\nsize = [640, 360]\n",
+        1,
+    );
+    let (out, stdout, stderr) = fx.run(&text);
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+    let dir = fx.base.join("out");
+    let num = |text: &str, key: &str| -> Option<i64> {
+        let rest = text.split(&format!("\"{key}\":")).nth(1)?;
+        rest.split([',', '}']).next()?.parse().ok()
+    };
+    let word = |text: &str, key: &str| -> String {
+        let rest = text.split(&format!("\"{key}\":\"")).nth(1).unwrap();
+        rest.split('"').next().unwrap().to_owned()
+    };
+    for (name, axis, phase) in [
+        ("load", "loading", "loading"),
+        ("ready", "ready", "ready"),
+        ("start", "chart", "play"),
+        ("note", "chart", "play"),
+    ] {
+        let png = fs::read(dir.join(format!("{name}.png"))).unwrap();
+        assert_eq!(&png[..4], b"\x89PNG", "{name}");
+        // 8-bit RGBA at the file's size.
+        assert_eq!(
+            (
+                u32::from_be_bytes(png[16..20].try_into().unwrap()),
+                u32::from_be_bytes(png[20..24].try_into().unwrap()),
+                png[24],
+                png[25]
+            ),
+            (640, 360, 8, 6),
+            "{name}"
+        );
+        let side = fs::read_to_string(dir.join(format!("{name}.json"))).unwrap();
+        assert_eq!(word(&side, "axis"), axis, "{side}");
+        assert_eq!(word(&side, "phase"), phase, "{side}");
+    }
+    let side = |name: &str| fs::read_to_string(dir.join(format!("{name}.json"))).unwrap();
+    assert!(num(&side("ready"), "ready_us").unwrap() >= 200_000);
+    assert!(num(&side("ready"), "chart_us").unwrap() < 0);
+    assert!(num(&side("start"), "chart_us").unwrap() >= 0);
+    let note = side("note");
+    assert!(num(&note, "chart_us").unwrap() >= 2_500_000);
+    assert!(num(&note, "finalized_us").is_some(), "{note}");
+    assert!(num(&note, "events").is_some(), "{note}");
+    assert_ne!(num(&side("start"), "frame"), num(&note, "frame"));
+}
+
+/// `play --dev-headless --dev-size` writes its frames at that size.
+#[test]
+fn a_headless_play_takes_a_size() {
+    let fx = Fixture::new();
+    write_chart(&fx.library(), "a", "譜面A");
+    let frames = fx.base.join("frames");
+    fs::create_dir_all(&frames).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_tapestry"))
+        .arg("play")
+        .arg(fx.library().join("a").join("a.bms"))
+        .args(["--auto", "--dev-headless", "--dev-size", "320x180"])
+        .arg("--dev-frames")
+        .arg(&frames)
+        .args(["--dev-render-timeout", "600"])
+        .env("LOCALAPPDATA", &fx.appdata)
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let mut seen = 0;
+    for entry in fs::read_dir(&frames).unwrap() {
+        let png = fs::read(entry.unwrap().path()).unwrap();
+        assert_eq!(u32::from_be_bytes(png[16..20].try_into().unwrap()), 320);
+        assert_eq!(u32::from_be_bytes(png[20..24].try_into().unwrap()), 180);
+        seen += 1;
+    }
+    assert!(seen > 0);
+}
+
+/// A READY capture past READY's end fails the run rather than show play.
+#[test]
+fn a_ready_capture_past_ready_fails_the_run() {
+    let fx = Fixture::new();
+    write_chart(&fx.library(), "a", "譜面A");
+    let (out, stdout, stderr) = fx.run(&scenario(&[
+        "capture = { ready_at = 1500, file = \"late.png\" }",
+        "select = { path = \"library/a/a.bms\" }",
+        "play = { input = \"auto\", until = \"end\" }",
+        "result = \"back\"",
+        "quit = {}",
+    ]));
+    assert_eq!(out.status.code(), Some(1), "{stdout}\n{stderr}");
+    assert!(stderr.contains("its READY state ended first"), "{stderr}");
+    assert!(!fx.base.join("out").join("late.png").exists());
 }
 
 /// A capture whose file is a folder when its frame comes fails the run,

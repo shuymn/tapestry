@@ -12,8 +12,9 @@
 //! thread's frame sink.
 //!
 //! ```toml
-//! version = 2
+//! version = 3
 //! output = "out"                 # needed by captures; made by the run
+//! size = [1920, 1080]            # optional: the offscreen target
 //!
 //! [library]
 //! roots = ["library"]            # relative to this file
@@ -21,6 +22,9 @@
 //!
 //! [[step]]
 //! capture = { at = 3000, file = "a.png" }   # chart ms, the next play's
+//! # or { ready_at = 500, file = … }: ms since its READY state began; or
+//! # { loading = true, file = … }: its loading state's first frame. Beside
+//! # each PNG, a JSON file of the same name says what the frame was.
 //!
 //! [[step]]
 //! select = { path = "library/a/a.bms" }     # or { search = "text" }
@@ -72,7 +76,7 @@ use crate::measure::Drawn;
 use crate::render_side::{FrameSink, RenderEnd, Screen};
 
 /// The one version of the file this build reads.
-const VERSION: i64 = 2;
+const VERSION: i64 = 3;
 
 /// The largest file read.
 const MAX_FILE: usize = 1 << 20;
@@ -317,6 +321,7 @@ struct File {
     #[expect(dead_code, reason = "checked by `Header` first")]
     version: i64,
     output: Option<PathBuf>,
+    size: Option<[i64; 2]>,
     library: Library,
     #[serde(default)]
     step: Vec<Step>,
@@ -407,7 +412,9 @@ enum ResultKind {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CaptureSpec {
-    at: i64,
+    at: Option<i64>,
+    ready_at: Option<i64>,
+    loading: Option<bool>,
     file: PathBuf,
 }
 
@@ -470,6 +477,8 @@ pub struct Session {
     pub logs: Vec<ScriptedInput>,
     /// The captures, by [`SelectStep::Capture`].
     pub captures: Captures,
+    /// The offscreen target's size, when the file gives one.
+    pub size: Option<(u32, u32)>,
 }
 
 impl fmt::Debug for Session {
@@ -520,6 +529,10 @@ fn parse(text: &str, base: &Path) -> Result<Scenario, String> {
     if file.step.len() > usize::from(u16::MAX) {
         return Err(format!("more than {} steps", u16::MAX));
     }
+    let size = file
+        .size
+        .map(|[w, h]| super::checked_size(w, h))
+        .transpose()?;
     let roots = roots(&file.library.roots, base)?;
     let compiled = compile(&file, base, &roots)?;
     let output = match &file.output {
@@ -529,8 +542,8 @@ fn parse(text: &str, base: &Path) -> Result<Scenario, String> {
     let captures = compiled
         .captures
         .into_iter()
-        .map(|(file, at, origin)| Capture {
-            at,
+        .map(|(file, axis, origin)| Capture {
+            axis,
             path: output
                 .as_deref()
                 .map_or_else(PathBuf::new, |o| o.join(file)),
@@ -546,8 +559,26 @@ fn parse(text: &str, base: &Path) -> Result<Scenario, String> {
             roots: roots.into_iter().map(|(path, _)| path).collect(),
             logs: compiled.logs,
             captures: Captures(Arc::new(Mutex::new(captures))),
+            size,
         },
     })
+}
+
+/// The axis a `capture` step names: exactly one of `at`, `ready_at` and
+/// `loading = true`.
+fn capture_axis(c: &CaptureSpec) -> Result<Axis, String> {
+    let ms = |v: i64, name: &str| {
+        v.checked_mul(1_000)
+            .map(TimeUs)
+            .ok_or_else(|| format!("{name} is too large"))
+    };
+    match (c.at, c.ready_at, c.loading) {
+        (Some(at), None, None) => Ok(Axis::Chart(ms(at, "at")?)),
+        (None, Some(r), None) if r < 0 => Err("ready_at must be 0 or more".to_owned()),
+        (None, Some(r), None) => Ok(Axis::Ready(ms(r, "ready_at")?)),
+        (None, None, Some(true)) => Ok(Axis::Loading),
+        _ => Err("give one of at, ready_at and loading = true".to_owned()),
+    }
 }
 
 /// `p` against `base`, absolute and normalized.
@@ -584,8 +615,8 @@ fn roots(given: &[PathBuf], base: &Path) -> Result<Vec<(PathBuf, PathBuf)>, Stri
 struct Compiled {
     steps: Vec<(SelectStep, Origin)>,
     logs: Vec<ScriptedInput>,
-    /// Each capture's file (under the output), time and step.
-    captures: Vec<(PathBuf, TimeUs, Origin)>,
+    /// Each capture's file (under the output), axis and step.
+    captures: Vec<(PathBuf, Axis, Origin)>,
 }
 
 /// Where the sequence of steps stands.
@@ -608,7 +639,7 @@ fn compile(file: &File, base: &Path, roots: &[(PathBuf, PathBuf)]) -> Result<Com
     let mut logs = Vec::new();
     // Each log decoded once, by its path.
     let mut log_paths: Vec<PathBuf> = Vec::new();
-    let mut captures: Vec<(PathBuf, TimeUs, Origin)> = Vec::new();
+    let mut captures: Vec<(PathBuf, Axis, Origin)> = Vec::new();
     // Captures no play has followed yet.
     let mut waiting: Vec<Origin> = Vec::new();
     let mut seq = Seq::Select;
@@ -711,9 +742,7 @@ fn compile(file: &File, base: &Path, roots: &[(PathBuf, PathBuf)]) -> Result<Com
                 next
             }
             (Seq::Select | Seq::Result, Step::Capture(c)) => {
-                let us =
-                    c.at.checked_mul(1_000)
-                        .ok_or_else(|| at("at is too large".to_owned()))?;
+                let axis = capture_axis(c).map_err(at)?;
                 let rel = capture_file(&c.file).map_err(at)?;
                 let key = rel.to_string_lossy().to_lowercase();
                 if let Some((_, _, other)) = captures
@@ -728,7 +757,7 @@ fn compile(file: &File, base: &Path, roots: &[(PathBuf, PathBuf)]) -> Result<Com
                 }
                 let k = u16::try_from(captures.len())
                     .map_err(|_| at("too many captures".to_owned()))?;
-                captures.push((rel, TimeUs(us), o));
+                captures.push((rel, axis, o));
                 waiting.push(o);
                 steps.push((SelectStep::Capture(k), o));
                 seq
@@ -904,7 +933,7 @@ fn is_link(meta: &fs::Metadata) -> bool {
 fn make_output(
     base: &Path,
     output: &Path,
-    captures: &[(PathBuf, TimeUs, Origin)],
+    captures: &[(PathBuf, Axis, Origin)],
 ) -> Result<PathBuf, String> {
     if !stays_below(output) {
         return Err(format!(
@@ -993,12 +1022,42 @@ pub enum CaptureState {
     Failed(String),
 }
 
-/// One capture: the first presented frame at or after `at` of the play
-/// it is bound to, written to `path`.
+/// What a capture waits for, of the play it is bound to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Axis {
+    /// The first presented frame at or after this chart time.
+    Chart(TimeUs),
+    /// The first presented frame at or after this time since its READY
+    /// state began; a frame past READY fails it (design.md "Play
+    /// Lifecycle": a different length, not an interchangeable time).
+    Ready(TimeUs),
+    /// The first presented frame of its loading state.
+    Loading,
+}
+
+impl Axis {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Chart(_) => "chart",
+            Self::Ready(_) => "ready",
+            Self::Loading => "loading",
+        }
+    }
+
+    const fn target(self) -> i64 {
+        match self {
+            Self::Chart(t) | Self::Ready(t) => t.0,
+            Self::Loading => 0,
+        }
+    }
+}
+
+/// One capture: a frame of the play it is bound to, as its axis says,
+/// written to `path`, with what the frame was beside it.
 #[derive(Clone, Debug)]
 pub struct Capture {
-    /// The chart time.
-    pub at: TimeUs,
+    /// What it waits for.
+    pub axis: Axis,
     /// The file, created new.
     pub path: PathBuf,
     /// Its step.
@@ -1063,7 +1122,11 @@ impl Captures {
             match c.state {
                 CaptureState::Bound(g) if g == generation => {
                     c.state = CaptureState::Failed(if answered {
-                        format!("the play ended before a frame at {} ms", c.at.0 / 1_000)
+                        format!(
+                            "the play ended before a frame at {} ms on its {} axis",
+                            c.axis.target() / 1_000,
+                            c.axis.name()
+                        )
                     } else {
                         "the render thread did not answer".to_owned()
                     });
@@ -1121,7 +1184,7 @@ impl Captures {
             captures
                 .into_iter()
                 .map(|(at, path)| Capture {
-                    at,
+                    axis: Axis::Chart(at),
                     path,
                     origin,
                     state: CaptureState::Unarmed,
@@ -1156,6 +1219,8 @@ pub struct ScenarioFrames {
     /// How long each capture's read-back stalls first: a test's stand-in
     /// for a render thread stuck in its work ([`STALL_ENV`]).
     stall: Option<Duration>,
+    /// The presented frames so far: captures of one number are one frame.
+    frame: u64,
 }
 
 /// The environment variable that stalls each capture's read-back by its
@@ -1169,6 +1234,7 @@ impl ScenarioFrames {
         Self {
             captures,
             stall: None,
+            frame: 0,
         }
     }
 
@@ -1178,26 +1244,28 @@ impl ScenarioFrames {
             .ok()
             .and_then(|ms| ms.parse().ok())
             .map(Duration::from_millis);
-        Self { captures, stall }
+        Self {
+            captures,
+            stall,
+            frame: 0,
+        }
     }
 }
 
 impl FrameSink for ScenarioFrames {
     fn frame(&mut self, screen: &dyn Screen, drawn: &Drawn<'_>) {
-        let (Some(generation), Some(t)) = (drawn.generation, drawn.play) else {
-            return;
-        };
         if !drawn.timing.presented {
             return;
         }
-        let due: Vec<(usize, PathBuf)> = {
+        self.frame = self.frame.wrapping_add(1);
+        let due: Vec<(usize, PathBuf, Axis, u64)> = {
             let mut list = self.captures.lock();
             list.iter_mut()
                 .enumerate()
-                .filter(|(_, c)| c.state == CaptureState::Bound(generation) && t >= c.at)
-                .map(|(i, c)| {
+                .filter_map(|(i, c)| {
+                    let generation = capture_due(c, drawn)?;
                     c.state = CaptureState::Saving(generation);
-                    (i, c.path.clone())
+                    Some((i, c.path.clone(), c.axis, generation))
                 })
                 .collect()
         };
@@ -1211,10 +1279,22 @@ impl FrameSink for ScenarioFrames {
         let image = screen
             .read_back()
             .map(|(w, h, pixels)| super::png(w, h, &pixels));
-        for (i, path) in due {
-            let outcome = match &image {
-                None => Err("nothing to read back".to_owned()),
-                Some(png) => write_new(&path, png).map_err(|e| e.to_string()),
+        for (i, path, axis, generation) in due {
+            let overshot = matches!(axis, Axis::Ready(_)) && drawn.play.is_some_and(|t| t.0 >= 0);
+            let outcome = if overshot {
+                Err("its READY state ended first".to_owned())
+            } else {
+                match &image {
+                    None => Err("nothing to read back".to_owned()),
+                    Some(png) => write_new(&path, png)
+                        .and_then(|()| {
+                            write_new(
+                                &path.with_extension("json"),
+                                sidecar(axis, self.frame, drawn).as_bytes(),
+                            )
+                        })
+                        .map_err(|e| e.to_string()),
+                }
             };
             if let Some(c) = self.captures.lock().get_mut(i)
                 && c.state == CaptureState::Saving(generation)
@@ -1226,6 +1306,56 @@ impl FrameSink for ScenarioFrames {
             }
         }
     }
+}
+
+/// The generation capture `c` saves `drawn` under, if `drawn` is the frame
+/// it waits for.
+fn capture_due(c: &Capture, drawn: &Drawn<'_>) -> Option<u64> {
+    let at = match c.axis {
+        Axis::Chart(at) => at,
+        // Past READY is an overshoot, for the caller to fail at once.
+        Axis::Ready(since) => TimeUs((since.0 - crate::LEAD_IN.0).min(0)),
+        // Armed, whether or not its play has started; its frames carry no
+        // play to bind to.
+        Axis::Loading => {
+            return match c.state {
+                CaptureState::Pending if drawn.loading => Some(0),
+                CaptureState::Bound(g) if drawn.loading => Some(g),
+                _ => None,
+            };
+        }
+    };
+    let (Some(generation), Some(t)) = (drawn.generation, drawn.play) else {
+        return None;
+    };
+    (c.state == CaptureState::Bound(generation) && t >= at).then_some(generation)
+}
+
+/// What the capture of `axis` on frame number `frame` was: its PNG's
+/// companion. A frame's play state may lag its time, which the view says.
+fn sidecar(axis: Axis, frame: u64, drawn: &Drawn<'_>) -> String {
+    let opt = |v: Option<i64>| v.map_or_else(|| "null".to_owned(), |v| v.to_string());
+    let phase = match drawn.play {
+        Some(t) if t.0 < 0 => "ready",
+        Some(_) => "play",
+        None if drawn.loading => "loading",
+        None => "other",
+    };
+    let view = drawn.view;
+    format!(
+        "{{\"axis\":\"{}\",\"target_us\":{},\"frame\":{frame},\"phase\":\"{phase}\",\
+         \"chart_us\":{},\"ready_us\":{},\"at_us\":{},\"generation\":{},\
+         \"view_generation\":{},\"finalized_us\":{},\"events\":{}}}\n",
+        axis.name(),
+        axis.target(),
+        opt(drawn.play.map(|t| t.0)),
+        opt(drawn.play.map(|t| t.0 + crate::LEAD_IN.0)),
+        drawn.at.0,
+        opt(drawn.generation.and_then(|g| i64::try_from(g).ok())),
+        opt(view.and_then(|v| i64::try_from(v.generation).ok())),
+        opt(view.and_then(|v| v.finalized).map(|t| t.0)),
+        opt(view.and_then(|v| i64::try_from(v.events).ok())),
+    )
 }
 
 /// The rig's part of a scenario run (dev-tools).
@@ -1282,6 +1412,7 @@ pub fn run(args: ScenarioArgs, clock: QpcClock) -> anyhow::Result<()> {
                 frames: None,
                 render_timeout: args.render_timeout,
                 stop_timeout: None,
+                size: None,
                 scenario: Some(session),
             },
         },
@@ -1545,7 +1676,7 @@ mod tests {
 
     /// The file of `steps` (TOML `[[step]]` bodies, one per entry).
     fn file(output: Option<&str>, steps: &[&str]) -> String {
-        let mut text = "version = 2\n".to_owned();
+        let mut text = "version = 3\n".to_owned();
         if let Some(o) = output {
             writeln!(text, "output = \"{o}\"").unwrap();
         }
@@ -1927,7 +2058,7 @@ mod tests {
     #[test]
     fn bounds_are_checked() {
         let dir = folder();
-        let mut text = "version = 2\nstep = [".to_owned();
+        let mut text = "version = 3\nstep = [".to_owned();
         for _ in 0..=u16::MAX {
             text.push_str("{quit={}},");
         }
@@ -1975,7 +2106,7 @@ mod tests {
     fn an_oversized_file_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("big.toml");
-        let mut text = "version = 2\n".to_owned();
+        let mut text = "version = 3\n".to_owned();
         text.push_str(&"#".repeat(super::MAX_FILE));
         fs::write(&path, text).unwrap();
         let e = format!("{:#}", super::load(&path).unwrap_err());
@@ -1995,17 +2126,109 @@ mod tests {
             let e = refused(dir.path(), None, &[step]);
             assert!(e.contains(&format!("line {line}")), "{step}: {e}");
         }
-        let e = parse("version = 2\nfast = true\n", dir.path()).unwrap_err();
+        let e = parse("version = 3\nfast = true\n", dir.path()).unwrap_err();
         assert!(e.contains("fast"), "{e}");
         // Another version, the previous one too, is refused.
         assert_eq!(
             parse("version = 1\nfast = true\n", dir.path()).unwrap_err(),
-            "version 1 is not supported; this build reads version 2"
+            "version 1 is not supported; this build reads version 3"
         );
         assert_eq!(
             parse("[library]\n", dir.path()).unwrap_err(),
-            "no version; this build reads version 2"
+            "no version; this build reads version 3"
         );
+    }
+
+    /// A capture names one axis, READY's from its start; a size is in
+    /// bounds; each refused with its line.
+    #[test]
+    fn capture_axes_and_sizes_are_checked() {
+        let capture = |body: &str| {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("a.bms"), "").unwrap();
+            let text = format!(
+                "version = 3\noutput = \"out\"\n[library]\nroots = [\".\"]\n[[step]]\ncapture = {{ {body}file = \"a.png\" }}\n[[step]]\nselect = {{ path = \"a.bms\" }}\n[[step]]\nplay = {{ input = \"auto\", until = \"end\" }}\n[[step]]\nresult = \"back\"\n[[step]]\nquit = {{}}\n"
+            );
+            parse(&text, dir.path()).map(|p| p.session.captures.0.lock().unwrap()[0].axis)
+        };
+        assert_eq!(capture("at = 5, "), Ok(super::Axis::Chart(TimeUs(5_000))));
+        assert_eq!(capture("ready_at = 0, "), Ok(super::Axis::Ready(TimeUs(0))));
+        assert_eq!(capture("loading = true, "), Ok(super::Axis::Loading));
+        for bad in [
+            "",
+            "at = 1, ready_at = 1, ",
+            "at = 1, loading = true, ",
+            "loading = false, ",
+        ] {
+            let e = capture(bad).unwrap_err();
+            assert!(e.contains("give one of"), "{bad}: {e}");
+        }
+        let e = capture("ready_at = -1, ").unwrap_err();
+        assert!(e.contains("ready_at must be 0 or more"), "{e}");
+        assert!(capture("at = -9223372036854775808, ").is_err());
+
+        let dir = tempfile::tempdir().unwrap();
+        let sized = |size: &str| {
+            let text = format!(
+                "version = 3\nsize = {size}\n[library]\nroots = [\".\"]\n[[step]]\nquit = {{}}\n"
+            );
+            parse(&text, dir.path()).map(|p| p.session.size)
+        };
+        assert_eq!(sized("[1920, 1080]"), Ok(Some((1920, 1080))));
+        for bad in ["[0, 1080]", "[1920, -1]", "[8193, 1080]"] {
+            let e = sized(bad).unwrap_err();
+            assert!(e.contains("each side must be"), "{bad}: {e}");
+        }
+    }
+
+    /// Captures of one frame share its number, and later frames count on;
+    /// READY overshoot writes nothing.
+    #[test]
+    fn captures_due_on_one_frame_are_one_frame() {
+        use super::{FrameSink as _, ScenarioFrames};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = |name: &str| dir.path().join(name);
+        let c = Captures::of(vec![
+            (TimeUs(0), path("a.png")),
+            (TimeUs(1_000), path("b.png")),
+            (TimeUs(5_000), path("c.png")),
+        ]);
+        {
+            let mut list = c.0.lock().unwrap();
+            list[2].axis = super::Axis::Ready(TimeUs(9_000_000));
+        }
+        for i in 0..3 {
+            c.arm(i);
+        }
+        c.bind(1);
+        let mut sink = ScenarioFrames::new(c.clone());
+        // Released from the start: its read-back answers at once.
+        let (entered, _seen) = std::sync::mpsc::channel();
+        let (_, held) = std::sync::mpsc::channel::<()>();
+        let screen = Stalling {
+            entered,
+            held: std::sync::Mutex::new(held),
+        };
+        sink.frame(&screen, &drawn(1, -5));
+        sink.frame(&screen, &drawn(1, 2));
+        assert_eq!(
+            fs::read_to_string(path("a.json"))
+                .unwrap()
+                .split("\"frame\":")
+                .nth(1),
+            fs::read_to_string(path("b.json"))
+                .unwrap()
+                .split("\"frame\":")
+                .nth(1)
+        );
+        let side = fs::read_to_string(path("a.json")).unwrap();
+        assert!(side.contains("\"frame\":2,"), "{side}");
+        assert!(side.contains("\"chart_us\":2000,"), "{side}");
+        assert!(side.contains("\"phase\":\"play\""), "{side}");
+        // Its READY state ended first.
+        assert!(matches!(c.states()[2], CaptureState::Failed(_)));
+        assert!(!path("c.png").exists() && !path("c.json").exists());
     }
 
     /// Captures arm, bind to the next play only, and settle when it ends:
@@ -2035,7 +2258,7 @@ mod tests {
         assert_eq!(settled.failed.len(), 1);
         assert_eq!(
             settled.failed[0].1,
-            "the play ended before a frame at 1000 ms"
+            "the play ended before a frame at 1000 ms on its chart axis"
         );
         c.bind(6);
         c.0.lock().unwrap()[1].state = CaptureState::Succeeded;
@@ -2352,6 +2575,7 @@ mod tests {
     pub(crate) fn drawn(generation: u64, ms: i64) -> crate::measure::Drawn<'static> {
         crate::measure::Drawn {
             play: Some(TimeUs(ms * 1_000)),
+            view: None,
             menu: false,
             loading: false,
             generation: Some(generation),

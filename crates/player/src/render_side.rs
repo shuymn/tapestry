@@ -2509,6 +2509,8 @@ impl Run {
                     loading: None,
                 };
             }
+            #[cfg(feature = "dev-tools")]
+            let mut view_stamp = None;
             let drawn = match &mut mode {
                 Mode::Idle => continue,
                 Mode::Splash { pending } => {
@@ -2568,6 +2570,14 @@ impl Run {
                         continue;
                     };
                     *skipped = 0;
+                    #[cfg(feature = "dev-tools")]
+                    {
+                        view_stamp = Some(crate::measure::ViewStamp {
+                            generation: view.generation,
+                            finalized: view.finalized,
+                            events: view.events,
+                        });
+                    }
                     // A rearmed READY candidate is drawn from its own origin,
                     // the skin's runtime starting over first.
                     if view.generation != *rearms {
@@ -2710,6 +2720,8 @@ impl Run {
                 Ok((timing, play)) => {
                     let d = Drawn {
                         play,
+                        #[cfg(feature = "dev-tools")]
+                        view: view_stamp,
                         // The measured play's: none once its figures are
                         // taken, so no frame after a `Finish` is its.
                         #[cfg(feature = "dev-tools")]
