@@ -25,7 +25,8 @@
 //! # or { ready_at = 500, file = … }: ms since its first candidate's READY
 //! # state began; or
 //! # { loading = true, file = … }: its loading state's first frame. Beside
-//! # each PNG, a JSON file of the same name says what the frame was.
+//! # each PNG, a JSON file of the same name says what the frame was, and a
+//! # play frame of an imported skin a JSON lines file its display list.
 //!
 //! [[step]]
 //! select = { path = "library/a/a.bms" }     # or { search = "text" }
@@ -1295,6 +1296,12 @@ impl FrameSink for ScenarioFrames {
         let image = screen
             .read_back()
             .map(|(w, h, pixels)| super::png(w, h, &pixels));
+        // Its list too, outside the play's measured region; loading frames
+        // are smoke only and have none.
+        let list = drawn
+            .play
+            .and_then(|_| screen.display_list())
+            .map(|l| display_list_lines(&l, drawn));
         for (i, path, axis, generation) in due {
             let outcome = match &image {
                 None => Err("nothing to read back".to_owned()),
@@ -1305,7 +1312,15 @@ impl FrameSink for ScenarioFrames {
                             sidecar(axis, self.frame, drawn).as_bytes(),
                         )
                     })
-                    .map_err(|e| e.to_string()),
+                    .map_err(|e| e.to_string())
+                    .and_then(|()| match &list {
+                        None => Ok(()),
+                        Some(Err(why)) => Err(why.clone()),
+                        Some(Ok(lines)) => {
+                            write_new(&path.with_extension("jsonl"), lines.as_bytes())
+                                .map_err(|e| e.to_string())
+                        }
+                    }),
             };
             if let Some(c) = self.captures.lock().get_mut(i)
                 && c.state == CaptureState::Saving(generation)
@@ -1389,6 +1404,130 @@ fn sidecar(axis: Axis, frame: u64, drawn: &Drawn<'_>) -> String {
         opt(view.and_then(|v| v.finalized).map(|t| t.0)),
         opt(view.and_then(|v| i64::try_from(v.events).ok())),
     )
+}
+
+/// A JSON string of `s`.
+fn json_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if u32::from(c) < 0x20 => out.push_str(&format!("\\u{:04x}", u32::from(c))),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// `values` as a JSON array.
+fn json_array<T: fmt::Display>(values: &[T]) -> String {
+    let inner: Vec<String> = values.iter().map(ToString::to_string).collect();
+    format!("[{}]", inner.join(","))
+}
+
+/// `drawn`'s list as JSON lines: the frame's state, then the elements, then
+/// the quads in draw order; an error if it would misattribute.
+fn display_list_lines(list: &skin_model::DisplayList, drawn: &Drawn<'_>) -> Result<String, String> {
+    use std::fmt::Write as _;
+
+    use skin_model::{Blend, QuadSource};
+
+    if list.observations_dropped > 0 {
+        return Err(format!(
+            "{} observations had no room",
+            list.observations_dropped
+        ));
+    }
+    let opt = |v: Option<i64>| v.map_or_else(|| "null".to_owned(), |v| v.to_string());
+    let mut out = String::new();
+    let state = drawn.view.map(|v| {
+        let c = v.tally.counts;
+        let gauges: Vec<String> = v.gauges.iter().map(|g| opt(*g)).collect();
+        format!(
+            ",\"counts\":[{},{},{},{},{}],\"empty_poor\":{},\"ex_score\":{},\"combo\":{},\
+             \"max_combo\":{},\"shown_gauge\":{},\"gauges\":[{}],\"look\":{}",
+            c.perfect,
+            c.great,
+            c.good,
+            c.bad,
+            c.poor,
+            v.tally.empty_poor,
+            v.tally.ex_score,
+            v.tally.combo,
+            v.tally.max_combo,
+            v.shown_gauge,
+            gauges.join(","),
+            v.look
+                .map_or_else(|| "null".to_owned(), |l| json_string(&format!("{l:?}"))),
+        )
+    });
+    let _ = writeln!(
+        out,
+        "{{\"state\":true,\"element_count\":{},\"quads_dropped\":{}{}}}",
+        list.element_count,
+        list.quads_dropped,
+        state.unwrap_or_default()
+    );
+    for e in &list.elements {
+        let o = e.observation;
+        let _ = writeln!(
+            out,
+            "{{\"element\":{},\"quad_start\":{},\"outcome\":\"{:?}\",\"value\":{},\"choice\":{},\
+             \"t_us\":{},\"text\":{}}}",
+            o.element,
+            o.quad_start,
+            o.outcome,
+            opt(o.value),
+            opt(o.choice.map(i64::from)),
+            opt(o.t.map(|t| t.0)),
+            e.text
+                .as_deref()
+                .map_or_else(|| "null".to_owned(), json_string),
+        );
+    }
+    for (seq, q) in list.quads.iter().enumerate() {
+        let source = match &q.source {
+            QuadSource::File {
+                frame,
+                name,
+                rect,
+                flip,
+            } => format!(
+                "\"frame\":{frame},\"file\":{},\"src\":{},\"flip\":{}",
+                json_string(name),
+                json_array(rect),
+                json_array(flip)
+            ),
+            QuadSource::Solid { frame, color } => {
+                format!("\"frame\":{frame},\"solid\":{}", json_array(color))
+            }
+            QuadSource::Other => "\"frame\":null".to_owned(),
+        };
+        let _ = writeln!(
+            out,
+            "{{\"seq\":{seq},\"element_of\":{},\"rect\":{},\"pivot\":{},\"angle\":{},\"color\":{},\
+             \"blend\":\"{}\",\"clip\":{},\"clip_geometry\":{},\"clip_rect\":{},\"filter\":\"{:?}\",{source}}}",
+            opt(q.element.map(i64::from)),
+            json_array(&q.rect),
+            json_array(&q.pivot),
+            q.angle,
+            json_array(&q.color),
+            match q.blend {
+                Blend::Alpha => "alpha",
+                Blend::Add => "add",
+            },
+            opt(q.clip.map(i64::from)),
+            q.clip_geometry
+                .map_or_else(|| "null".to_owned(), |r| json_array(&r)),
+            q.clip_rect
+                .map_or_else(|| "null".to_owned(), |r| json_array(&r)),
+            q.filter,
+        );
+    }
+    Ok(out)
 }
 
 /// The play phase a frame's sidecar names: one decision over the acquired
@@ -2688,6 +2827,29 @@ mod tests {
         assert!(matches!(c.states()[0], CaptureState::Failed(_)));
     }
 
+    /// A list that lost observations would misattribute: its capture fails.
+    #[test]
+    fn a_list_without_room_for_its_observations_is_refused() {
+        let mut list = skin_model::DisplayList {
+            element_count: 1,
+            elements: Vec::new(),
+            quads: Vec::new(),
+            quads_dropped: 0,
+            observations_dropped: 0,
+        };
+        let lines = super::display_list_lines(&list, &drawn(1, 2)).unwrap();
+        assert!(lines.contains("\"element_count\":1"), "{lines}");
+        list.observations_dropped = 3;
+        let e = super::display_list_lines(&list, &drawn(1, 2)).unwrap_err();
+        assert_eq!(e, "3 observations had no room");
+    }
+
+    /// A JSON string escapes what JSON must.
+    #[test]
+    fn a_json_string_is_escaped() {
+        assert_eq!(super::json_string("a\"\\\n"), "\"a\\\"\\\\\\u000a\"");
+    }
+
     /// A view of a full play's first candidate, playing.
     fn drawn_view() -> crate::measure::ViewStamp {
         crate::measure::ViewStamp {
@@ -2698,6 +2860,10 @@ mod tests {
             complete: false,
             closing: None,
             ready: Some((TimeUs(-1_000_000), TimeUs(0))),
+            tally: eval::Tally::default(),
+            shown_gauge: 0,
+            gauges: [None; crate::measure::MAX_STAMPED_GAUGES],
+            look: None,
         }
     }
 

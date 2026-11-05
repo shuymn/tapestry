@@ -357,6 +357,12 @@ pub trait Screen: Send {
     /// The last frame's pixels (RGBA8) and size, for an offscreen target.
     #[cfg(feature = "dev-tools")]
     fn read_back(&self) -> Option<(u32, u32, Vec<u8>)>;
+
+    /// The last play frame's list, for a skin that keeps one.
+    #[cfg(feature = "dev-tools")]
+    fn display_list(&self) -> Option<skin_model::DisplayList> {
+        None
+    }
 }
 
 /// The window's newest physical size, from the window thread to the render
@@ -1768,6 +1774,8 @@ pub fn spawn(
                 #[cfg(feature = "dev-tools")]
                 ready: None,
                 #[cfg(feature = "dev-tools")]
+                gauge_looks: None,
+                #[cfg(feature = "dev-tools")]
                 menu_stats: crate::dev::MenuStats::default(),
                 #[cfg(feature = "dev-tools")]
                 loading_stats: crate::dev::MenuStats::default(),
@@ -2120,6 +2128,9 @@ struct Prepared {
     /// The attempt's READY on the chart's axis (dev-tools).
     #[cfg(feature = "dev-tools")]
     ready: (TimeUs, TimeUs),
+    /// The attempt's gauges' looks, in the preset's order (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    gauge_looks: Vec<skin_model::GaugeLook>,
 }
 
 struct Run {
@@ -2182,6 +2193,9 @@ struct Run {
     /// The committed attempt's READY on the chart's axis (dev-tools).
     #[cfg(feature = "dev-tools")]
     ready: Option<(TimeUs, TimeUs)>,
+    /// The committed attempt's gauges' looks (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    gauge_looks: Option<Vec<skin_model::GaugeLook>>,
     /// The select screen's frames (dev-tools).
     #[cfg(feature = "dev-tools")]
     menu_stats: crate::dev::MenuStats,
@@ -2590,6 +2604,13 @@ impl Run {
                             complete: view.complete,
                             closing: view.closing,
                             ready: self.ready,
+                            tally: view.tally,
+                            shown_gauge: *gauge,
+                            gauges: crate::measure::gauge_values(&view.gauges),
+                            look: self
+                                .gauge_looks
+                                .as_ref()
+                                .and_then(|l| l.get(*gauge).copied()),
                         });
                     }
                     // A rearmed READY candidate is drawn from its own origin,
@@ -2930,6 +2951,8 @@ impl Run {
                 presentation: (p.attempt.tempo().clone(), p.attempt.epoch()),
                 #[cfg(feature = "dev-tools")]
                 ready: p.attempt.ready(),
+                #[cfg(feature = "dev-tools")]
+                gauge_looks: p.attempt.gauge_looks(),
             });
         }
         if answer.is_err() {
@@ -3012,6 +3035,7 @@ impl Run {
         #[cfg(feature = "dev-tools")]
         {
             self.ready = Some(p.ready);
+            self.gauge_looks = Some(p.gauge_looks);
         }
         commits.committed = request;
         commits.receipt = Receipt { request, close };

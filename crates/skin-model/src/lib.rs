@@ -77,6 +77,8 @@ mod canvas;
 mod expr;
 mod image;
 mod layout;
+#[cfg(feature = "dev-tools")]
+mod observation;
 mod place;
 mod play;
 mod quad;
@@ -120,6 +122,10 @@ pub use image::{
 pub use layout::{
     Adjust, Anchor, Controls, LANE_WIDTH_PCT, Layout, LayoutError, MAX_INSET, MAX_OFFSET, Region,
     RegionDef, SCALE_PCT,
+};
+#[cfg(feature = "dev-tools")]
+pub use observation::{
+    DisplayList, ElementObservation, ListedElement, ListedQuad, Outcome, QuadSource,
 };
 pub use place::{
     Affine, Bind, Fill, Follow, MIN_VISIBLE, Native, Place, Placement, RegionPlacement,
