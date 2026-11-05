@@ -2124,7 +2124,14 @@ impl Skin {
             Phase::Play { play, notes, .. } => Some((play, notes)),
             Phase::Loading { .. } => None,
         };
+        #[cfg(feature = "dev-tools")]
+        let mut element = 0_u32;
         for e in &self.elements {
+            #[cfg(feature = "dev-tools")]
+            {
+                out.observe(element);
+                element = element.saturating_add(1);
+            }
             // While loading, an element reading what loading lacks draws
             // nothing: its condition is false, its value or selector
             // unread.
@@ -2138,13 +2145,19 @@ impl Skin {
                     continue;
                 };
                 if !placement.region(e.region).visible {
+                    #[cfg(feature = "dev-tools")]
+                    out.observed(crate::observation::Outcome::RegionHidden);
                     continue;
                 }
-                let Some((_, s)) =
+                let Some((_t, s)) =
                     sample(rt.starts, now, state, e.slot, e.visible.as_ref(), &e.track)
                 else {
+                    #[cfg(feature = "dev-tools")]
+                    out.observed(crate::observation::Outcome::NotSampled);
                     continue;
                 };
+                #[cfg(feature = "dev-tools")]
+                out.observed_time(_t);
                 let d = Draw {
                     play,
                     starts: rt.starts,
@@ -2166,6 +2179,8 @@ impl Skin {
                 continue;
             }
             if !placement.region(e.region).visible {
+                #[cfg(feature = "dev-tools")]
+                out.observed(crate::observation::Outcome::RegionHidden);
                 continue;
             }
             let paint = match e.kind {
@@ -2174,6 +2189,8 @@ impl Skin {
             };
             // HIDDEN+'s paint shows only while HIDDEN+ is on, at any amount.
             if paint.is_some_and(|p| p.motion == CoverMotion::Hidden) && !scene.hidden_enabled {
+                #[cfg(feature = "dev-tools")]
+                out.observed(crate::observation::Outcome::HiddenOff);
                 continue;
             }
             // An image choice's entry, before its track is sampled.
@@ -2184,8 +2201,12 @@ impl Skin {
             let choice = match table {
                 Some(i) => {
                     let Some(p) = self.image_choices.get(i).and_then(|c| c.select(state)) else {
+                        #[cfg(feature = "dev-tools")]
+                        out.observed(crate::observation::Outcome::NoChoice);
                         continue;
                     };
+                    #[cfg(feature = "dev-tools")]
+                    out.observed_choice(self.image_choices.get(i).and_then(|c| c.index_of(p)));
                     Some(p)
                 }
                 None => None,
@@ -2193,8 +2214,12 @@ impl Skin {
             let track = choice.and_then(|p| p.track.as_ref()).unwrap_or(&e.track);
             let Some((t, s)) = sample(rt.starts, now, state, e.slot, e.visible.as_ref(), track)
             else {
+                #[cfg(feature = "dev-tools")]
+                out.observed(crate::observation::Outcome::NotSampled);
                 continue;
             };
+            #[cfg(feature = "dev-tools")]
+            out.observed_time(t);
             let affine = placement.affine(e.region, e.fill);
             let map = placement.bind(e.bind);
             // The covers' motion, after the track and before the lane map
@@ -2210,12 +2235,20 @@ impl Skin {
                     let gate = match &p.gate {
                         Some(gate) => match gate.sample(t) {
                             Some(gs) => gs.rect,
-                            None => continue,
+                            None => {
+                                #[cfg(feature = "dev-tools")]
+                                out.observed(crate::observation::Outcome::GateNotSampled);
+                                continue;
+                            }
                         },
                         None => s.rect,
                     };
                     let clip = match p.outcome(gate, dy, g, map, affine) {
-                        TrimOutcome::Suppressed => continue,
+                        TrimOutcome::Suppressed => {
+                            #[cfg(feature = "dev-tools")]
+                            out.observed(crate::observation::Outcome::TrimSuppressed);
+                            continue;
+                        }
                         TrimOutcome::Unclipped => None,
                         TrimOutcome::Clipped(c) => Some(c),
                     };
@@ -2255,6 +2288,8 @@ impl Skin {
                 Kind::Number(i) => {
                     if let Some(n) = self.numbers.get(i) {
                         let v = n.value.eval(state);
+                        #[cfg(feature = "dev-tools")]
+                        out.observed_value(i64::from(v));
                         n.digits.draw(v, rect, &brush, &at, out);
                     }
                 }
@@ -2310,6 +2345,26 @@ impl Skin {
                 Kind::Lanes => {}
             }
         }
+        #[cfg(feature = "dev-tools")]
+        out.end_observations();
+    }
+
+    /// The string text element `element` shows for `chart`, if it is one.
+    #[cfg(feature = "dev-tools")]
+    pub(crate) fn element_text(&self, element: u32, chart: &ChartText<'_>) -> Option<String> {
+        let e = self.elements.get(usize::try_from(element).ok()?)?;
+        let Kind::Text(i, _) = e.kind else {
+            return None;
+        };
+        let def = self.texts.get(i)?;
+        Some(text::clean(&def.value.resolve(chart)))
+    }
+
+    /// The skin's number of elements.
+    #[cfg(feature = "dev-tools")]
+    #[must_use]
+    pub const fn element_count(&self) -> usize {
+        self.elements.len()
     }
 }
 

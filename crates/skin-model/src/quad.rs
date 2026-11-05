@@ -7,6 +7,9 @@
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
+#[cfg(feature = "dev-tools")]
+use crate::observation::{ElementObservation, Outcome};
+
 /// One quad in canvas pixels.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -116,6 +119,19 @@ pub struct QuadBatch {
     /// Those with the reserve: quads, runs.
     all: (u32, u32),
     dropped: u32,
+    /// What each element's draw evaluated, allocated once for the most
+    /// elements a skin has.
+    #[cfg(feature = "dev-tools")]
+    observations: Vec<ElementObservation>,
+    /// Whether the last observation takes what the draw finds next.
+    #[cfg(feature = "dev-tools")]
+    observing: bool,
+    /// Observations with no room.
+    #[cfg(feature = "dev-tools")]
+    observations_dropped: u32,
+    /// Where the skin's elements ended: what follows is its owner's.
+    #[cfg(feature = "dev-tools")]
+    observation_end: Option<u32>,
 }
 
 /// `n` as a `Vec` capacity, and the cap the batch then enforces (0 on a
@@ -150,6 +166,14 @@ impl QuadBatch {
             own,
             all: (quad_all, run_all),
             dropped: 0,
+            #[cfg(feature = "dev-tools")]
+            observations: Vec::with_capacity(crate::MAX_ELEMENTS),
+            #[cfg(feature = "dev-tools")]
+            observing: false,
+            #[cfg(feature = "dev-tools")]
+            observations_dropped: 0,
+            #[cfg(feature = "dev-tools")]
+            observation_end: None,
         }
     }
 
@@ -160,6 +184,104 @@ impl QuadBatch {
         self.runs.clear();
         (self.quad_cap, self.run_cap) = self.own;
         self.dropped = 0;
+        #[cfg(feature = "dev-tools")]
+        {
+            self.observations.clear();
+            self.observing = false;
+            self.observations_dropped = 0;
+            self.observation_end = None;
+        }
+    }
+
+    /// Opens element `element`'s observation, at the quads held so far. Past
+    /// the capacity it counts, and nothing is observed until the next one
+    /// fits. Never allocates.
+    #[cfg(feature = "dev-tools")]
+    pub(crate) fn observe(&mut self, element: u32) {
+        self.observing = self.observations.len() < self.observations.capacity();
+        if !self.observing {
+            self.observations_dropped = self.observations_dropped.saturating_add(1);
+            return;
+        }
+        let quad_start = self.len();
+        self.observations.push(ElementObservation {
+            element,
+            quad_start,
+            outcome: Outcome::Sampled,
+            value: None,
+            choice: None,
+            t: None,
+        });
+    }
+
+    /// The open observation, if any.
+    #[cfg(feature = "dev-tools")]
+    fn observing(&mut self) -> Option<&mut ElementObservation> {
+        if self.observing {
+            self.observations.last_mut()
+        } else {
+            None
+        }
+    }
+
+    /// The draw stopped with the open observation's element.
+    #[cfg(feature = "dev-tools")]
+    pub(crate) fn observed(&mut self, outcome: Outcome) {
+        if let Some(o) = self.observing() {
+            o.outcome = outcome;
+        }
+    }
+
+    /// The open observation's element's track was sampled at `t` µs.
+    #[cfg(feature = "dev-tools")]
+    pub(crate) fn observed_time(&mut self, t: i64) {
+        if let Some(o) = self.observing() {
+            o.t = Some(bms_model::TimeUs(t));
+        }
+    }
+
+    /// The open observation's number shows `value`.
+    #[cfg(feature = "dev-tools")]
+    pub(crate) fn observed_value(&mut self, value: i64) {
+        if let Some(o) = self.observing() {
+            o.value = Some(value);
+        }
+    }
+
+    /// The open observation's image choice selected entry `choice`.
+    #[cfg(feature = "dev-tools")]
+    pub(crate) fn observed_choice(&mut self, choice: Option<u32>) {
+        if let Some(o) = self.observing() {
+            o.choice = choice;
+        }
+    }
+
+    /// The skin's elements are done: quads from here are not theirs.
+    #[cfg(feature = "dev-tools")]
+    pub(crate) fn end_observations(&mut self) {
+        self.observing = false;
+        self.observation_end = Some(self.len());
+    }
+
+    /// This frame's observations, in draw order.
+    #[cfg(feature = "dev-tools")]
+    #[must_use]
+    pub fn observations(&self) -> &[ElementObservation] {
+        &self.observations
+    }
+
+    /// Observations with no room since the last [`clear`](Self::clear).
+    #[cfg(feature = "dev-tools")]
+    #[must_use]
+    pub const fn observations_dropped(&self) -> u32 {
+        self.observations_dropped
+    }
+
+    /// Where the skin's elements ended among the quads, once they have.
+    #[cfg(feature = "dev-tools")]
+    #[must_use]
+    pub const fn observation_end(&self) -> Option<u32> {
+        self.observation_end
     }
 
     /// Opens the reserve until the next [`clear`](Self::clear): later

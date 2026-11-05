@@ -15,7 +15,7 @@ windows-only = true
 default = []
 # Development features. Never enabled in production builds (R3): a fault
 # injected into the text preparation's wait for the GPU.
-dev-tools = []
+dev-tools = ["skin-model/dev-tools"]
 
 [dependencies]
 bms-model.workspace = true

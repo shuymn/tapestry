@@ -7,6 +7,12 @@ license = "GPL-3.0-or-later"
 repository.workspace = true
 publish.workspace = true
 
+[features]
+default = []
+# Element observations and the display list a capture reads (design.md
+# "Shortening Launch-Based Checks").
+dev-tools = []
+
 [dependencies]
 bms-model.workspace = true
 etagere.workspace = true
