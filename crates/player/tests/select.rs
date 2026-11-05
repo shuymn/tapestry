@@ -1561,7 +1561,7 @@ fn a_per_chart_skin_shows_its_text_as_its_lifetime_allows() {
         fs::write(
             dir.join(name),
             format!(
-                "#PLAYER 1\n{headers}#PLAYLEVEL 3\n#BPM 120\n#WAV01 key.wav\n#00111:01010101\n"
+                "#PLAYER 1\n{headers}#PLAYLEVEL 3\n#BPM 120\n#WAV01 key.wav\n#00138:01\n#00111:01010101\n"
             ),
         )
         .unwrap();
