@@ -4,6 +4,8 @@
 
 #![cfg(feature = "dev-tools")]
 
+mod text_skin;
+
 use std::fs;
 use std::io::{BufRead as _, BufReader};
 use std::path::{Path, PathBuf};
@@ -1533,6 +1535,78 @@ fn a_pending_skin_is_reused_while_its_class_holds() {
     );
     let play = dumped_rgba(&frames.join("play.png"));
     assert_eq!(centre_rgb(&play), [0, 0, 255], "{stdout}");
+}
+
+/// What a skin built per chart shows of its text, and when, on the real
+/// threads (design.md "The pending presentation"). Loading shows the
+/// load's lines on a cleared canvas until a specialization commits; the
+/// lifetime's first frame of the skin has no chosen text, which is prepared
+/// on a frame for the next; READY shows the attempt's text. Each attempt's
+/// play shows its own chart's, the title or the string for none: a retry,
+/// with no loading state, as a reused specialization; a chart of another
+/// class through a replacement; the op-80 text never, the op-81 text
+/// always.
+#[test]
+fn a_per_chart_skin_shows_its_text_as_its_lifetime_allows() {
+    use text_skin::{Band, bars};
+    let fx = fixture();
+    let chart = |folder: &str, name: &str, headers: &str| {
+        let dir = fx.library.join(folder);
+        fs::create_dir_all(&dir).unwrap();
+        write_wav(&dir.join("key.wav"), 8_000);
+        fs::write(
+            dir.join(name),
+            format!(
+                "#PLAYER 1\n{headers}#PLAYLEVEL 3\n#BPM 120\n#WAV01 key.wav\n#00111:01010101\n"
+            ),
+        )
+        .unwrap();
+    };
+    chart("a", "a.bms", "#TITLE aa\n#RANK 3\n");
+    chart("b", "b.bms", "#RANK 1\n");
+    text_skin::write(&fx.appdata.join("skin"), &fx.appdata);
+    let frames = fx.appdata.join("frames");
+    let frames_arg = frames.display().to_string();
+    let (_, stdout) = run(
+        &fx,
+        "pick=a.bms,enter,drawn,retry,drawn,back,wait=b.bms,pick=b.bms,enter,drawn,back,close",
+        &["--dev-frames", &frames_arg],
+    );
+    assert_eq!(
+        attempt_lines(&stdout),
+        [
+            "skin: play: specialized",
+            "skin: play: reused",
+            "skin: play: specialized"
+        ],
+        "{stdout}"
+    );
+    let all = [Band::Always, Band::Loading, Band::Loaded];
+    let shown = |name: &str| all.map(|b| bars(&frames.join(name), b));
+    // The pending presentation: nothing of the skin.
+    assert_eq!(shown("loading.png"), [0, 0, 0], "{stdout}");
+    // The first frame the skin draws in a lifetime, when one comes: no
+    // chosen text.
+    let dumps: Vec<_> = fs::read_dir(&frames)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    for skin in dumps.iter().filter(|n| n.starts_with("loading-skin-")) {
+        assert_eq!(shown(skin), [0, 0, 0], "{skin}");
+    }
+    // READY: the attempt's text, the op-80 text gone.
+    assert_eq!(shown("ready.png"), [2, 0, 2], "{stdout}");
+    // Each play's own frame, in order: the first chart, its retry, then
+    // the other chart with its string for no title.
+    let mut plays: Vec<_> = dumps.iter().filter(|n| n.starts_with("play-")).collect();
+    plays.sort_by_key(|n| {
+        n.trim_start_matches("play-")
+            .trim_end_matches(".png")
+            .parse::<u64>()
+            .unwrap()
+    });
+    let plays: Vec<_> = plays.iter().map(|n| shown(n)).collect();
+    assert_eq!(plays, [[2, 0, 2], [2, 0, 2], [3, 0, 3]], "{stdout}");
 }
 
 /// A retry after the play preset's file was edited so that the chart's
