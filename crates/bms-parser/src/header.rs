@@ -59,8 +59,8 @@ pub struct Header {
 ///
 /// Only top-level commands count: a command inside an `#IF` or `#SWITCH`
 /// block is skipped, since which branch is read depends on a draw. No
-/// `#RANDOM` is drawn, no channel line or time is read, and no value is
-/// checked, so a chart the loader refuses still has a header.
+/// `#RANDOM` is drawn, no time is computed and no value is checked, so a chart
+/// the loader refuses still has a header.
 ///
 /// # Errors
 ///
@@ -107,7 +107,8 @@ pub(crate) fn listing(text: &str) -> Listing {
             continue;
         };
         if let Some((_, channel, data)) = split_channel(body) {
-            if !(two && seven)
+            // A two-player object settles the mode.
+            if !two
                 && (two_player(channel) || key_6_or_7(channel))
                 && objects(channel, data.trim()).any(|(_, id)| id.is_some())
             {
