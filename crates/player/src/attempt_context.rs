@@ -67,6 +67,20 @@ impl AttemptContext {
         &self.tempo
     }
 
+    /// The attempt's READY on the chart's axis: where its recording opens,
+    /// as the session's `opens_at` says, and its end, where play starts
+    /// (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    pub const fn ready(&self) -> (TimeUs, TimeUs) {
+        match &self.kind {
+            AttemptKind::Full { lead_in } => (TimeUs(-lead_in.0), TimeUs(0)),
+            AttemptKind::Section(s) => (
+                TimeUs(s.start.0 - s.lead_in.0 - game::RESTORE_AHEAD.0),
+                s.start,
+            ),
+        }
+    }
+
     /// The presentation epoch the attempt was attached as.
     pub const fn epoch(&self) -> u64 {
         self.epoch

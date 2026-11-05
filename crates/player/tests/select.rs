@@ -488,6 +488,28 @@ fn has_red_run((w, _, rgba): &(usize, usize, Vec<u8>), len: usize) -> bool {
     })
 }
 
+/// `--dev-size` sets the size of headless selection's frames.
+#[test]
+fn headless_selection_takes_a_size() {
+    let fx = fixture();
+    write_chart(&fx.library, "a", "a.bms", "譜面A", 8_000);
+    let frames = fx.appdata.join("frames");
+    let frames_arg = frames.display().to_string();
+    run(
+        &fx,
+        "pick=a.bms,enter,back,close",
+        &["--dev-frames", &frames_arg, "--dev-size", "320x180"],
+    );
+    let mut seen = 0;
+    for entry in fs::read_dir(&frames).unwrap() {
+        let png = fs::read(entry.unwrap().path()).unwrap();
+        assert_eq!(u32::from_be_bytes(png[16..20].try_into().unwrap()), 320);
+        assert_eq!(u32::from_be_bytes(png[20..24].try_into().unwrap()), 180);
+        seen += 1;
+    }
+    assert!(seen > 0);
+}
+
 /// Choosing a chart switches at once to the play screen in its loading
 /// state, the lanes and judgment line drawn without notes, the chart's
 /// lines saying each stage over it, drawn on (its frame dumped) while a

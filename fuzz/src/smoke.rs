@@ -1082,7 +1082,7 @@ skin.source = { { id = \"s\", path = \"strip.png\" } }
 skin.image = { { id = \"i\", src = \"s\", x = 0, y = 0, w = 10, h = 10 } }
 skin.destination = {}
 for k = 1, 5000 do
-  skin.destination[k] = { id = \"i\", draw = function() return ms.number(425) > 0 end, dst = { { w = 10, h = 10 } } }
+  skin.destination[k] = { id = \"i\", draw = function() return ms.number(426) > 0 end, dst = { { w = 10, h = 10 } } }
 end
 return skin";
     let input = [
@@ -1168,12 +1168,12 @@ fn skin_lua_seeds_import_or_fail_as_built() {
                 let (_, imported) = result.unwrap_or_else(|e| panic!("{name}: {e}"));
                 let i = imported_lua(imported).unwrap_or_else(|e| panic!("{name}: {e:?}"));
                 let want: &[Disposition] = match name {
-                    "callback_lowered" => &[Disposition::Lowered, Disposition::Lowered],
+                    "callback_lowered" => &[Disposition::Lowered; 4],
                     // A decorative writer never lowers.
                     "callback_effect" => &[Disposition::Replaced(Unsupported::Writes)],
                     _ => &[Disposition::Replaced(Unsupported::Unmapped {
                         api: 1,
-                        id: 425,
+                        id: 426,
                     })],
                 };
                 assert_eq!(i.callbacks, want, "{name}");

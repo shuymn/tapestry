@@ -19,7 +19,8 @@ pub const MS: i64 = 1_000;
 /// A notes' end past every frame the tests build: timer 143 stays off.
 pub const NO_END: TimeUs = TimeUs(3_600_000 * MS);
 
-const GAUGES: [GaugeDesc; 1] = [desc(GaugeLook::Normal)];
+#[allow(dead_code, reason = "not every test binary reads them")]
+pub const GAUGES: [GaugeDesc; 1] = [desc(GaugeLook::Normal)];
 
 const fn desc(look: GaugeLook) -> GaugeDesc {
     GaugeDesc {
@@ -222,7 +223,8 @@ pub fn prepared(skin: &Skin, chart: &bms_model::Chart) -> (skin_model::Play, Qua
 }
 
 /// A chart with `notes` notes on lane 1, one every 10 ms from 1 s.
-fn chart(notes: u32) -> bms_model::Chart {
+#[allow(dead_code, reason = "not every test binary builds one")]
+pub fn chart(notes: u32) -> bms_model::Chart {
     (0..notes)
         .fold(ChartBuilder::new(150_000), |b, i| {
             b.tap(

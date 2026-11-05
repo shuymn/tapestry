@@ -823,11 +823,11 @@ fn lua_callbacks_on_failure_presentation_lower_or_refuse() {
     }
     // Unsupported: on `failed` refused at the callback, elsewhere
     // replaced and dropped with its reason.
-    let unmapped = Unsupported::Unmapped { api: 1, id: 425 };
+    let unmapped = Unsupported::Unmapped { api: 1, id: 426 };
     // Located at the callback: the destination's line, or the number's.
     for (field, draw, value, line) in [
-        ("draw", Some("ms.number(425) > 0"), None, 7),
-        ("value", None, Some("ms.number(110) + ms.number(425)"), 6),
+        ("draw", Some("ms.number(426) > 0"), None, 7),
+        ("value", None, Some("ms.number(110) + ms.number(426)"), 6),
     ] {
         let d = lua_callback_skin(3, draw, value);
         match common::lua_import(d.path()) {

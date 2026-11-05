@@ -90,7 +90,7 @@ jobs:
           persist-credentials: false
       - uses: jdx/mise-action@f5be966e4a917d54244728e6a5fdcd1d93a35e6c # v5.2.6
         with:
-          version: 2026.11.0
+          version: 2026.11.1
           install: true
           cache: true
           cache_save: ${{ github.ref == 'refs/heads/main' }}
@@ -140,7 +140,7 @@ jobs:
           persist-credentials: false
       - uses: jdx/mise-action@f5be966e4a917d54244728e6a5fdcd1d93a35e6c # v5.2.6
         with:
-          version: 2026.11.0
+          version: 2026.11.1
           install: true
           cache: true
           cache_save: ${{ github.ref == 'refs/heads/main' }}
@@ -185,7 +185,8 @@ jobs:
               "play x.bms --auto --dev-headless" "play x.bms --dev-perfect" \
               "--dev-adjust-at 1" \
               "play x.bms --dev-adjust-at 1" "play x.bms --dev-adjust F1" \
-              "play x.bms --dev-adjust-end F1" "keys --dev-scripted-keys 1" \
+              "play x.bms --dev-adjust-end F1" "play x.bms --dev-size 8x8" \
+              "keys --dev-scripted-keys 1" \
               "measure play x.bms" "--dev-scenario x"; do
             arg=$(echo "$args" | grep -o -e "--dev-[a-z-]*" -e "^measure")
             set +e
@@ -219,7 +220,7 @@ jobs:
           persist-credentials: false
       - uses: jdx/mise-action@f5be966e4a917d54244728e6a5fdcd1d93a35e6c # v5.2.6
         with:
-          version: 2026.11.0
+          version: 2026.11.1
           install: true
           cache: true
           cache_save: ${{ github.ref == 'refs/heads/main' }}
@@ -301,7 +302,7 @@ jobs:
           persist-credentials: false
       - uses: jdx/mise-action@f5be966e4a917d54244728e6a5fdcd1d93a35e6c # v5.2.6
         with:
-          version: 2026.11.0
+          version: 2026.11.1
           install: true
           cache: true
           cache_save: ${{ github.ref == 'refs/heads/main' }}
@@ -394,7 +395,7 @@ jobs:
           persist-credentials: false
       - uses: jdx/mise-action@f5be966e4a917d54244728e6a5fdcd1d93a35e6c # v5.2.6
         with:
-          version: 2026.11.0
+          version: 2026.11.1
           install: true
           cache: true
           cache_save: ${{ github.ref == 'refs/heads/main' }}
@@ -498,7 +499,7 @@ jobs:
           persist-credentials: false
       - uses: jdx/mise-action@f5be966e4a917d54244728e6a5fdcd1d93a35e6c # v5.2.6
         with:
-          version: 2026.11.0
+          version: 2026.11.1
           install: true
           install_args: rust actionlint shellcheck
           cache: true
