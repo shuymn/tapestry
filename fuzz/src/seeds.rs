@@ -995,7 +995,7 @@ skin.destination[3] = { id = "v", dst = { { w = 10, h = 10 } } }"#,
     );
     let replaced = lua_skin(
         r#"local ms = require("main_state")
-skin.destination[2] = { id = "i", draw = function() return ms.number(425) > 0 end, dst = { { w = 10, h = 10 } } }"#,
+skin.destination[2] = { id = "i", draw = function() return ms.number(426) > 0 end, dst = { { w = 10, h = 10 } } }"#,
     );
     let effect = lua_skin(
         r#"local ms = require("main_state")
