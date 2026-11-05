@@ -2389,6 +2389,7 @@ mod tests {
         .unwrap();
         let chart = ChartBuilder::new(150_000).build().unwrap();
         let ctx = PlayContext {
+            autoplay: false,
             gauges: &[],
             attempt: Attempt::Full { lead_in: TimeUs(0) },
             empty_poor_breaks_combo: false,

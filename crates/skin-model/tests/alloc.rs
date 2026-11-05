@@ -1685,6 +1685,7 @@ fn build_does_not_allocate() {
     let mut small = QuadBatch::with_capacity(8, 4);
     let lead_in = 1_000 * MS;
     let full = PlayContext {
+        autoplay: false,
         gauges: &descs,
         attempt: Attempt::Full {
             lead_in: TimeUs(lead_in),
@@ -1990,6 +1991,7 @@ fn build_does_not_allocate() {
     for ms in (0..2_000).step_by(16) {
         batch.clear();
         let frame = LoadingFrame {
+            autoplay: false,
             now: TimeUs(ms * MS),
             load: LoadState {
                 since: TimeUs(0),
@@ -2028,6 +2030,7 @@ fn loading_frame<'a>(
 ) -> LoadingFrame<'a> {
     let view = views.lanes[(no / 7) % views.lanes.len()];
     LoadingFrame {
+        autoplay: false,
         now: TimeUs(since.0 + i64::try_from(no).unwrap() * 16 * MS),
         load: LoadState {
             since,
@@ -3574,6 +3577,7 @@ fn readouts_do_not_allocate(loaded: &Loaded, descs: &[GaugeDesc]) {
         initial_gauges: vec![GaugeValue(70 * GaugeValue::PERCENT), GaugeValue::FULL],
     };
     let full = PlayContext {
+        autoplay: false,
         gauges: descs,
         attempt: Attempt::Full {
             lead_in: TimeUs(1_000 * MS),

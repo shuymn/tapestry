@@ -256,6 +256,13 @@ const GAUGE_EX: i32 = 1_046;
 /// as the adjustments' snapshot reads them; `lanecover1_on`, `lift1_on`
 /// and `hidden1_on`, the stored switches.
 const COVER_CHANGING: i32 = 270;
+/// `autoplay_off` and `autoplay_on` (`BooleanPropertyFactory.java:416-419`):
+/// whether the play mode is autoplay, the attempt's.
+const AUTOPLAY_OFF: i32 = 32;
+const AUTOPLAY_ON: i32 = 33;
+/// `mode_course` (`BooleanPropertyFactory.java:526-527`): a scene
+/// constant, false, as there are no courses.
+const COURSE_MODE: i32 = 290;
 /// `judge_great_exist` to `judge_poor_exist`
 /// (`BooleanPropertyFactory.java:554-561`): whether the count is above 0,
 /// the POOR's the scored POORs', without empty POORs.
@@ -349,6 +356,8 @@ fn builtin(id: i32) -> Option<(Body, bool)> {
         GOOD_EXIST => (Body::Text("count.good > 0"), false),
         BAD_EXIST => (Body::Text("count.bad > 0"), false),
         POOR_EXIST => (Body::Text("count.early.poor + count.late.poor > 0"), false),
+        AUTOPLAY_OFF => (Body::Text("!autoplay"), false),
+        AUTOPLAY_ON => (Body::Text("autoplay"), false),
         COVER_CHANGING => (Body::Text("cover.adjusting"), false),
         COVER_ON => (Body::Text("cover.enabled"), false),
         LIFT_ON => (Body::Text("lift.enabled"), false),
@@ -373,7 +382,7 @@ pub(crate) fn is_builtin(id: i32) -> bool {
 /// state whichever widget draws it, where the source reads it from a
 /// judge region its judge widget makes (`JudgeManager.java:129, 686`).
 fn built_in_cond(id: i32, negative: bool) -> Cond {
-    if id == TABLE_SONG {
+    if id == TABLE_SONG || id == COURSE_MODE {
         return Cond::Fold(negative);
     }
     match builtin(id) {
@@ -603,7 +612,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(exprs.len(), 50);
+        assert_eq!(exprs.len(), 54);
         let joined: usize =
             exprs.iter().map(|e| e.len() + 2).sum::<usize>() + 4 * (exprs.len() - 1);
         assert!(joined > skin_model::MAX_SOURCE_BYTES, "{joined}");

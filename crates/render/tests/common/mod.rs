@@ -70,6 +70,7 @@ pub const GAUGES: [GaugeDesc; 1] = [GaugeDesc {
 /// snapshot a declarative skin refuses.
 pub fn context(gauges: &[GaugeDesc], counted: bool) -> PlayContext<'_> {
     PlayContext {
+        autoplay: false,
         gauges,
         attempt: Attempt::Full {
             lead_in: TimeUs(1_000 * MS),
@@ -253,6 +254,7 @@ pub fn input<'a>(
 /// text. The renderer applies its own target.
 pub const fn loading_frame(lifetime: u64, now: TimeUs, since: TimeUs) -> LoadingFrame<'static> {
     LoadingFrame {
+        autoplay: false,
         lifetime,
         now,
         load: LoadState { since, percent: 0 },

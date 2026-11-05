@@ -933,15 +933,17 @@ fn a_callback_keeps_the_option_host_and_lowers_a_supported_option() {
     }
 }
 
+/// A frame-time read of a construction fact is the frame's field, never
+/// the snapshot's value: autoplay reads `autoplay`, whatever the facts.
 #[test]
 fn a_callback_s_fact_read_is_not_folded() {
     let entry = skin("", &image("function() return ms.option(33) end"));
-    let unmapped = super::Disposition::Replaced(Unsupported::Unmapped { api: 0, id: 33 });
+    let lowered = super::Disposition::Lowered;
     let unavailable = super::facts::ImportFacts::unavailable(skin_model::ScreenKind::Play);
     for facts in [unavailable, known()] {
         let (_, r) = with_facts(&entry, &facts);
         let (callbacks, sources) = r.unwrap();
-        assert_eq!(callbacks, [unmapped], "{facts:?}");
-        assert!(sources.is_empty(), "{sources:?}");
+        assert_eq!(callbacks, [lowered], "{facts:?}");
+        assert_eq!(sources, ["(autoplay)"], "{facts:?}");
     }
 }
