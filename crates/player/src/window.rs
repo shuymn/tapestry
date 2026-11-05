@@ -792,7 +792,8 @@ fn menu_key(key: PhysicalKey, repeat: bool) -> Option<MenuKey> {
         KeyCode::ArrowDown => (MenuKey::Down, true),
         KeyCode::PageUp => (MenuKey::PageUp, true),
         KeyCode::PageDown => (MenuKey::PageDown, true),
-        KeyCode::Backspace => (MenuKey::Backspace, true),
+        KeyCode::Backspace if repeat => (MenuKey::BackspaceHeld, true),
+        KeyCode::Backspace => (MenuKey::Backspace, false),
         KeyCode::ArrowLeft => (MenuKey::Left, false),
         KeyCode::ArrowRight => (MenuKey::Right, false),
         KeyCode::Home => (MenuKey::Home, false),
@@ -1047,6 +1048,19 @@ mod tests {
             assert_eq!(window_key(raw), pressed);
             assert!(game::reserved_key(raw).is_some());
         }
+    }
+
+    /// Backspace is one press and then its repeats, which only the search box
+    /// reads: a held key does not climb the folders.
+    #[test]
+    fn a_held_backspace_is_its_own_key() {
+        use crate::select::MenuKey;
+        let backspace = PhysicalKey::Code(KeyCode::Backspace);
+        assert_eq!(super::menu_key(backspace, false), Some(MenuKey::Backspace));
+        assert_eq!(
+            super::menu_key(backspace, true),
+            Some(MenuKey::BackspaceHeld)
+        );
     }
 
     /// Pause bound to retry and NumLock to quit, as `tapestry keys`
