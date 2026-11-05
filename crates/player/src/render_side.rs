@@ -1084,15 +1084,21 @@ impl RenderLink {
         self.end_pages.load(Ordering::Relaxed)
     }
 
+    /// Whether the end page shown last has been presented, and the frame
+    /// sink has seen it (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    pub fn end_page_drawn(&self) -> bool {
+        self.shared.end_drawn.load(Ordering::Acquire) >= self.end_pages.load(Ordering::Relaxed)
+    }
+
     /// Waits at most `timeout` until the end page shown last has been
     /// presented, and the frame sink has seen it (dev-tools: a script's
     /// `drawn` step). Whether it was.
     #[cfg(feature = "dev-tools")]
     pub fn wait_end_drawn(&self, timeout: Duration) -> bool {
-        let shown = self.end_pages.load(Ordering::Relaxed);
         let deadline = std::time::Instant::now() + timeout;
         loop {
-            if self.shared.end_drawn.load(Ordering::Acquire) >= shown {
+            if self.end_page_drawn() {
                 return true;
             }
             if std::time::Instant::now() >= deadline {
@@ -6199,6 +6205,33 @@ pub(crate) mod tests {
             link.exit();
         }
     }
+    /// A scripted run's end screen is over after its time once its page was
+    /// drawn: never while the render thread is stuck before drawing it,
+    /// short of the wait's bound, and at once when the screen failed.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn a_scripted_end_waits_for_its_page() {
+        use crate::dev::STEP_TIMEOUT;
+        use crate::play::scripted_end_over;
+        let after = Duration::from_millis(300);
+        let (link, _, hold, release) = ends();
+        link.show_end(page("first", None));
+        assert!(link.wait_end_drawn(Duration::from_secs(10)));
+        assert!(!scripted_end_over(after, Duration::from_millis(299), &link));
+        assert!(scripted_end_over(after, after, &link));
+        // Stuck in the next page's frame: the page after it is not drawn.
+        hold.store(true, Ordering::SeqCst);
+        link.show_end(page("stuck", None));
+        assert!(wait_until(|| !hold.load(Ordering::SeqCst)));
+        link.show_end(page("waiting", None));
+        assert!(!scripted_end_over(after, after, &link));
+        assert!(!scripted_end_over(after, STEP_TIMEOUT - after, &link));
+        assert!(scripted_end_over(after, STEP_TIMEOUT, &link));
+        release.send(()).unwrap();
+        assert!(wait_until(|| scripted_end_over(after, after, &link)));
+        link.exit();
+    }
+
     /// A script's `drawn` step: the wait ends once the page shown last has
     /// been presented, and gives up at its bound while the render thread
     /// is stuck before drawing it.

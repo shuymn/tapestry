@@ -233,7 +233,8 @@ pub struct PlayerRig<'a> {
     /// The scenario the run plays (dev-tools).
     #[cfg(feature = "dev-tools")]
     pub scenario: Option<crate::dev::scenario::State>,
-    /// Quit once the end screen has shown this long (scripted runs).
+    /// Quit once the end screen has shown this long and its page has been
+    /// drawn (scripted runs; [`scripted_end_over`]).
     #[cfg(feature = "dev-tools")]
     pub quit_after_end: Option<Duration>,
     #[cfg(feature = "dev-tools")]
@@ -877,7 +878,7 @@ impl Rig for PlayerRig<'_> {
     fn quitting(&self) -> bool {
         #[cfg(feature = "dev-tools")]
         if let (Some(after), Some(shown)) = (self.quit_after_end, self.end_shown)
-            && shown.elapsed() >= after
+            && scripted_end_over(after, shown.elapsed(), &self.render)
         {
             return true;
         }
@@ -1592,6 +1593,17 @@ mod restore_tests {
         let left: Vec<f32> = out.samples().iter().step_by(2).copied().collect();
         assert_eq!(left.iter().position(|&x| x != 0.0), Some(10_560));
     }
+}
+
+/// Whether a scripted run's end screen, shown for `shown`, is over: after
+/// `after`, once the page shown last was presented and the frame sink has
+/// seen it, however long the render thread takes on a loaded machine. A
+/// failed screen draws no page, and one that never comes ends the wait at
+/// [`STEP_TIMEOUT`](crate::dev::STEP_TIMEOUT).
+#[cfg(feature = "dev-tools")]
+pub(crate) fn scripted_end_over(after: Duration, shown: Duration, render: &RenderLink) -> bool {
+    shown >= after
+        && (render.end_page_drawn() || render.failed() || shown >= crate::dev::STEP_TIMEOUT)
 }
 
 #[cfg(all(test, feature = "dev-tools"))]
