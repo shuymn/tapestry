@@ -177,6 +177,33 @@ fn choosing_a_chart_plays_it_and_returns() {
     assert!(!fx.appdata.join("tapestry").join("records").exists());
 }
 
+/// On the real threads: back from the all-chart list a script opens on, into
+/// a folder, a chart of its song folders chosen and played, back on its row,
+/// then out to the folder's row.
+#[test]
+fn a_folder_is_entered_a_chart_chosen_and_the_cursor_kept() {
+    let fx = fixture();
+    write_chart(&fx.library, "shard0/song", "z.bms", "譜面Z", 8_000);
+    write_chart(&fx.library, "shard1/song", "a.bms", "譜面A", 8_000);
+    write_chart(&fx.library, "shard1/song2", "b.bms", "譜面B", 8_000);
+    let (_, stdout) = run(
+        &fx,
+        "wait=b.bms,up,row=all,folder=shard1,row=a.bms,pick=b.bms,enter,drawn,back,row=b.bms,up,\
+         row=shard1,all,row=z.bms,up,row=all,close",
+        &[],
+    );
+    assert!(
+        stdout
+            .lines()
+            .any(|l| l.starts_with("select: chose b.bms ")),
+        "{stdout}"
+    );
+    assert!(
+        stdout.lines().any(|l| l.starts_with("play 1: Completed")),
+        "{stdout}"
+    );
+}
+
 /// On the real threads, a result switches presets with the arrow keys
 /// (scripted): the play under the default beatoraja-style shows as played,
 /// then lr2-style and tapestry as what-ifs, wrapping past the last, and
