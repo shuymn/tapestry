@@ -225,7 +225,7 @@ impl Fixture {
 
 /// The scenario of `steps`, over `library`, with `out` as its output.
 fn scenario(steps: &[&str]) -> String {
-    let mut text = "version = 3\noutput = \"out\"\n[library]\nroots = [\"library\"]\n".to_owned();
+    let mut text = "version = 4\noutput = \"out\"\n[library]\nroots = [\"library\"]\n".to_owned();
     for s in steps {
         text.push_str("[[step]]\n");
         text.push_str(s);
@@ -628,18 +628,18 @@ fn a_stalled_capture_exits_one_within_the_bound() {
 #[test]
 fn other_scenario_version_is_refused() {
     let fx = Fixture::new();
-    let (out, _, stderr) = fx.run("version = 4\nwhat_v4_adds = true\n");
+    let (out, _, stderr) = fx.run("version = 5\nwhat_v5_adds = true\n");
     assert_eq!(out.status.code(), Some(1), "{stderr}");
     assert!(
-        stderr.contains("version 4 is not supported; this build reads version 3"),
+        stderr.contains("version 5 is not supported; this build reads version 4"),
         "{stderr}"
     );
-    assert!(!stderr.contains("what_v4_adds"), "{stderr}");
+    assert!(!stderr.contains("what_v5_adds"), "{stderr}");
     assert!(!fx.data().join("library.db").exists());
     let (out, _, stderr) = fx.run("[library]\nroots = [\"library\"]\n");
     assert_eq!(out.status.code(), Some(1), "{stderr}");
     assert!(
-        stderr.contains("no version; this build reads version 3"),
+        stderr.contains("no version; this build reads version 4"),
         "{stderr}"
     );
     assert!(!fx.data().join("library.db").exists());
@@ -1630,6 +1630,71 @@ fn restart_keeps_the_chosen_preset() {
         decoded.preset.sha256,
         replay::preset_hash(&rules::lr2_style())
     );
+}
+
+/// Input generated to press nothing misses every note: with the HAZARD
+/// gauge shown its first miss fails it, the play enters Closing, and it is
+/// played and saved as a log's play is, with no judgment but misses.
+#[test]
+fn a_generated_no_press_play_misses_into_closing() {
+    let fx = Fixture::new();
+    write_chart(&fx.library(), "a", "譜面A");
+    fs::create_dir_all(fx.data()).unwrap();
+    fs::write(
+        fx.data().join("player.toml"),
+        "displayed_gauge = 5\non_failure = \"close\"\n",
+    )
+    .unwrap();
+    let (out, stdout, stderr) = fx.run(&scenario(&[
+        "capture = { at = 2800, file = \"c.png\" }",
+        "select = { path = \"library/a/a.bms\" }",
+        "play = { input = { miss = \"all\" }, until = \"end\" }",
+        "result = \"back\"",
+        "quit = {}",
+    ]));
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+    assert_eq!(
+        lines(&stdout, "play 1: Aborted(GaugeFailed)").len(),
+        1,
+        "{stdout}"
+    );
+    assert_eq!(lines(&stdout, "closing: ").len(), 1, "{stdout}");
+    let side = fs::read_to_string(fx.base.join("out").join("c.json")).unwrap();
+    assert!(side.contains("\"phase\":\"closing\""), "{side}");
+    let (records, _) = fx.played_records();
+    assert_eq!(records.len(), 1, "{records:?}");
+    let rec = replay::decode(&fs::read(&records[0]).unwrap(), &DecodeLimits::default()).unwrap();
+    assert!(
+        rec.events
+            .iter()
+            .all(|e| !matches!(e.kind, eval::InputKind::Control { value, .. } if value != 0)),
+        "{:?}",
+        rec.events.first()
+    );
+}
+
+/// A generated input is no input file: an unknown word is refused by its
+/// line, and a `play` of it after one of autoplay needs the chart again.
+#[test]
+fn a_generated_input_is_checked() {
+    let fx = Fixture::new();
+    write_chart(&fx.library(), "a", "譜面A");
+    let (out, _, stderr) = fx.run(&scenario(&[
+        "select = { path = \"library/a/a.bms\" }",
+        "play = { input = { miss = \"some\" }, until = \"end\" }",
+        "quit = {}",
+    ]));
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("line "), "{stderr}");
+    let (out, _, stderr) = fx.run(&scenario(&[
+        "select = { path = \"library/a/a.bms\" }",
+        "play = { input = \"auto\", until = { at_ms = 1, command = \"retry\" } }",
+        "play = { input = { miss = \"all\" }, until = \"end\" }",
+        "result = \"back\"",
+        "quit = {}",
+    ]));
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("input differs from step 2's"), "{stderr}");
 }
 
 /// A log that presses nothing, played with the HAZARD gauge shown: its

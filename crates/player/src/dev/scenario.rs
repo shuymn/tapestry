@@ -12,7 +12,7 @@
 //! thread's frame sink.
 //!
 //! ```toml
-//! version = 3
+//! version = 4
 //! output = "out"                 # needed by captures; made by the run
 //! size = [1920, 1080]            # optional: the offscreen target
 //!
@@ -33,7 +33,9 @@
 //!
 //! [[step]]
 //! play = { input = "auto", until = "end" }
-//! # input = "auto" | "<input log, relative to this file>"
+//! # input = "auto" | "<input log, relative to this file>" | { miss = "all" }
+//! # { miss = "all" }: generated for the chart, no key pressed, every note
+//! # missed, played and saved as a log's play is
 //! # until = "end" | { at_ms = 2250, command = "retry" | "quit" | "skip" }
 //! # "quit": the quit key before the play completes, which ends it midway
 //! # on its result; "skip": the quit key once it is complete, its tail
@@ -78,7 +80,7 @@ use crate::measure::Drawn;
 use crate::render_side::{FrameSink, RenderEnd, Screen};
 
 /// The one version of the file this build reads.
-const VERSION: i64 = 3;
+const VERSION: i64 = 4;
 
 /// The largest file read.
 const MAX_FILE: usize = 1 << 20;
@@ -370,8 +372,30 @@ struct SelectSpec {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PlaySpec {
-    input: String,
+    input: InputSpec,
     until: Until,
+}
+
+/// A `play` step's input: autoplay or a log by its path, or input made for
+/// the chart.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum InputSpec {
+    Named(String),
+    Generated(GeneratedSpec),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GeneratedSpec {
+    miss: MissWord,
+}
+
+/// Which notes generated input leaves unpressed.
+#[derive(Deserialize)]
+enum MissWord {
+    #[serde(rename = "all")]
+    All,
 }
 
 #[derive(Deserialize)]
@@ -639,8 +663,8 @@ enum Seq {
 fn compile(file: &File, base: &Path, roots: &[(PathBuf, PathBuf)]) -> Result<Compiled, String> {
     let mut steps = Vec::new();
     let mut logs = Vec::new();
-    // Each log decoded once, by its path.
-    let mut log_paths: Vec<PathBuf> = Vec::new();
+    // Each log decoded once, by its path; a generated one by what it is.
+    let mut log_paths: Vec<LogKey> = Vec::new();
     let mut captures: Vec<(PathBuf, Axis, Origin)> = Vec::new();
     // Captures no play has followed yet.
     let mut waiting: Vec<Origin> = Vec::new();
@@ -677,14 +701,21 @@ fn compile(file: &File, base: &Path, roots: &[(PathBuf, PathBuf)]) -> Result<Com
                 Seq::Chosen
             }
             (Seq::Chosen | Seq::Replay, Step::Play(p)) => {
-                // A log by its path: the index it has, or gets once read.
-                let log = if p.input == "auto" {
-                    None
-                } else {
-                    let path = resolve(base, Path::new(&p.input)).map_err(at)?;
-                    let k = log_paths.iter().position(|l| *l == path);
-                    Some((k.unwrap_or(log_paths.len()), k.is_none().then_some(path)))
+                // A log by its path, or one generated: the index it has, or
+                // gets once made.
+                let key = match &p.input {
+                    InputSpec::Named(name) if name == "auto" => None,
+                    InputSpec::Named(name) => {
+                        Some(LogKey::Path(resolve(base, Path::new(name)).map_err(at)?))
+                    }
+                    InputSpec::Generated(GeneratedSpec {
+                        miss: MissWord::All,
+                    }) => Some(LogKey::NoPress),
                 };
+                let log = key.map(|key| {
+                    let k = log_paths.iter().position(|l| *l == key);
+                    (k.unwrap_or(log_paths.len()), k.is_none().then_some(key))
+                });
                 let input = match &log {
                     None => InputRef::Auto,
                     // Below the step count, itself within u16.
@@ -702,9 +733,20 @@ fn compile(file: &File, base: &Path, roots: &[(PathBuf, PathBuf)]) -> Result<Com
                     Some(_) => {}
                     None => chart_input = Some((input, o)),
                 }
-                if let Some((_, Some(path))) = log {
-                    logs.push(super::script(&path, &[]).map_err(|e| at(format!("{e:#}")))?);
-                    log_paths.push(path);
+                if let Some((_, Some(key))) = log {
+                    logs.push(match &key {
+                        LogKey::Path(path) => {
+                            super::script(path, &[]).map_err(|e| at(format!("{e:#}")))?
+                        }
+                        // One keyboard that presses nothing, as a log of no
+                        // events plays.
+                        LogKey::NoPress => ScriptedInput::from_log(
+                            &eval::InputStart::default(),
+                            &[],
+                            &[input::DeviceKind::Keyboard],
+                        ),
+                    });
+                    log_paths.push(key);
                 }
                 let until = match &p.until {
                     Until::End(EndWord::End) => None,
@@ -818,6 +860,14 @@ fn compile(file: &File, base: &Path, roots: &[(PathBuf, PathBuf)]) -> Result<Com
     })
 }
 
+/// A compiled log: read from its path, or made for the chart.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum LogKey {
+    Path(PathBuf),
+    /// No key pressed.
+    NoPress,
+}
+
 /// A `practice` step's page settings and input, checked: measures from 1
 /// with `to ≥ from`, a speed on the ladder in percent, a lead-in on the
 /// page's grid, a gauge value in percent, repeat on, and an input log (an
@@ -825,7 +875,7 @@ fn compile(file: &File, base: &Path, roots: &[(PathBuf, PathBuf)]) -> Result<Com
 fn practice_goal(
     p: &PracticeSpec,
     base: &Path,
-    log_paths: &mut Vec<PathBuf>,
+    log_paths: &mut Vec<LogKey>,
     logs: &mut Vec<ScriptedInput>,
 ) -> Result<PracticeGoal, String> {
     let from = p
@@ -862,11 +912,12 @@ fn practice_goal(
     if p.input == "auto" {
         return Err("input cannot be auto: an autoplay session cannot practice".to_owned());
     }
-    let path = resolve(base, Path::new(&p.input))?;
+    let file = resolve(base, Path::new(&p.input))?;
+    let path = LogKey::Path(file.clone());
     let k = match log_paths.iter().position(|l| *l == path) {
         Some(k) => k,
         None => {
-            logs.push(super::script(&path, &[]).map_err(|e| format!("{e:#}"))?);
+            logs.push(super::script(&file, &[]).map_err(|e| format!("{e:#}"))?);
             log_paths.push(path);
             log_paths.len() - 1
         }
@@ -1873,7 +1924,7 @@ mod tests {
 
     /// The file of `steps` (TOML `[[step]]` bodies, one per entry).
     fn file(output: Option<&str>, steps: &[&str]) -> String {
-        let mut text = "version = 3\n".to_owned();
+        let mut text = "version = 4\n".to_owned();
         if let Some(o) = output {
             writeln!(text, "output = \"{o}\"").unwrap();
         }
@@ -2255,7 +2306,7 @@ mod tests {
     #[test]
     fn bounds_are_checked() {
         let dir = folder();
-        let mut text = "version = 3\nstep = [".to_owned();
+        let mut text = "version = 4\nstep = [".to_owned();
         for _ in 0..=u16::MAX {
             text.push_str("{quit={}},");
         }
@@ -2303,7 +2354,7 @@ mod tests {
     fn an_oversized_file_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("big.toml");
-        let mut text = "version = 3\n".to_owned();
+        let mut text = "version = 4\n".to_owned();
         text.push_str(&"#".repeat(super::MAX_FILE));
         fs::write(&path, text).unwrap();
         let e = format!("{:#}", super::load(&path).unwrap_err());
@@ -2323,16 +2374,16 @@ mod tests {
             let e = refused(dir.path(), None, &[step]);
             assert!(e.contains(&format!("line {line}")), "{step}: {e}");
         }
-        let e = parse("version = 3\nfast = true\n", dir.path()).unwrap_err();
+        let e = parse("version = 4\nfast = true\n", dir.path()).unwrap_err();
         assert!(e.contains("fast"), "{e}");
         // Another version, the previous one too, is refused.
         assert_eq!(
             parse("version = 1\nfast = true\n", dir.path()).unwrap_err(),
-            "version 1 is not supported; this build reads version 3"
+            "version 1 is not supported; this build reads version 4"
         );
         assert_eq!(
             parse("[library]\n", dir.path()).unwrap_err(),
-            "no version; this build reads version 3"
+            "no version; this build reads version 4"
         );
     }
 
@@ -2344,7 +2395,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             std::fs::write(dir.path().join("a.bms"), "").unwrap();
             let text = format!(
-                "version = 3\noutput = \"out\"\n[library]\nroots = [\".\"]\n[[step]]\ncapture = {{ {body}file = \"a.png\" }}\n[[step]]\nselect = {{ path = \"a.bms\" }}\n[[step]]\nplay = {{ input = \"auto\", until = \"end\" }}\n[[step]]\nresult = \"back\"\n[[step]]\nquit = {{}}\n"
+                "version = 4\noutput = \"out\"\n[library]\nroots = [\".\"]\n[[step]]\ncapture = {{ {body}file = \"a.png\" }}\n[[step]]\nselect = {{ path = \"a.bms\" }}\n[[step]]\nplay = {{ input = \"auto\", until = \"end\" }}\n[[step]]\nresult = \"back\"\n[[step]]\nquit = {{}}\n"
             );
             parse(&text, dir.path()).map(|p| p.session.captures.0.lock().unwrap()[0].axis)
         };
@@ -2367,7 +2418,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let sized = |size: &str| {
             let text = format!(
-                "version = 3\nsize = {size}\n[library]\nroots = [\".\"]\n[[step]]\nquit = {{}}\n"
+                "version = 4\nsize = {size}\n[library]\nroots = [\".\"]\n[[step]]\nquit = {{}}\n"
             );
             parse(&text, dir.path()).map(|p| p.session.size)
         };
