@@ -10,7 +10,7 @@ use common::play::Drawn;
 use rules::GaugeValue;
 use skin_beatoraja::lua::{Disposition, Unsupported};
 use skin_beatoraja::{Cancel, Config, ImportError, LuaImported, LuaWhy, NoteKind, read_lua_header};
-use skin_model::{ChartText, GaugeLook, Layout};
+use skin_model::{ChartText, GaugeLook, Layout, MAX_TEXT_BYTES};
 use tempfile::TempDir;
 
 /// A skin folder whose `s.luaskin` is `entry`, with a 64×64 `a.png`.
@@ -335,6 +335,33 @@ fn a_table_line_folds_to_its_literal() {
     assert_eq!(text_lines(value, &NO_TEXT), ["no table"]);
     let negated = "function() if ms.option(-1008) then return \"x\" else return \"y\" end end";
     assert_eq!(text_lines(negated, &NO_TEXT), ["x"]);
+}
+
+/// A field's string for when it is empty is charged as the field in a
+/// bitmap font: a quad per byte of its cap.
+#[test]
+fn a_text_fallback_is_charged_as_its_field() {
+    let d = folder(&skin(
+        "skin.font = { { id = \"f\", path = \"f.fnt\" } }\n\
+         skin.text = { { id = \"t\", font = \"f\", size = 16, value = function()\n\
+           local tx = ms.text(10)\n\
+           if tx == \"\" then return \"a\" else return tx end end } }\n\
+         table.insert(skin.destination, { id = \"t\", dst = { { w = 64, h = 16 } } })",
+    ));
+    common::write(
+        d.path(),
+        "f.fnt",
+        b"info face=\"t\" size=16 padding=0,0,0,0\n\
+          common lineHeight=16 base=16 scaleW=64 scaleH=64 pages=1\n\
+          page id=0 file=\"a.png\"\nchars count=1\n\
+          char id=97 x=0 y=0 width=16 height=16 xoffset=0 yoffset=0 xadvance=16 page=0 chnl=15\n",
+    );
+    let i = import(&d, 905).unwrap();
+    assert_eq!(counts(&i), [1, 0, 0, 0]);
+    assert_eq!(
+        i.imported.report.usage.widget_quads,
+        u32::try_from(MAX_TEXT_BYTES).unwrap()
+    );
 }
 
 /// An empty result draws nothing, as an empty constant.

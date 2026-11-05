@@ -2354,6 +2354,7 @@ mod tests {
             play: Some(TimeUs(ms * 1_000)),
             menu: false,
             loading: false,
+            skin_loading: None,
             generation: Some(generation),
             timing: render::FrameTiming {
                 cpu: std::time::Duration::ZERO,
