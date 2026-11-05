@@ -506,26 +506,31 @@ mod tests {
         assert!(!is_builtin(3_016) && !is_builtin(3_036));
     }
 
+    /// The largest condition lists the surveyed skins write fit one source:
+    /// six built-in ops and a `draw` of its own, each the longest signed
+    /// built-in, joined with a number's longest availability guard. A
+    /// mapping long enough to break that fails here; every supported
+    /// condition together need not fit, and refuses at its destination
+    /// (`tests/import_ops.rs`, `every_condition_together_passes_the_source_limit`).
     #[test]
-    fn every_supported_condition_fits_one_source() {
-        // One sign of every built-in with an expression, the longer,
-        // negated one: a destination that does not list both signs of an
-        // id joins at most these.
-        let mut exprs = Vec::new();
+    fn the_largest_surveyed_condition_lists_fit_one_source() {
+        let mut longest = 0;
+        let mut supported = 0;
         for &(id, _) in KNOWN_BOOLEAN_IDS {
-            let positive = numeric(id, &BTreeMap::new());
-            if let Cond::Expr { src, .. } = numeric(-id, &BTreeMap::new()) {
-                if let Cond::Expr { src: p, .. } = positive {
-                    assert!(src.len() > p.len(), "{id}");
+            for op in [id, -id] {
+                if let Cond::Expr { src, .. } = numeric(op, &BTreeMap::new()) {
+                    longest = longest.max(src.len());
+                    supported += 1;
                 }
-                exprs.push(src);
+            }
+            if let (Cond::Expr { src: n, .. }, Cond::Expr { src: p, .. }) = (
+                numeric(-id, &BTreeMap::new()),
+                numeric(id, &BTreeMap::new()),
+            ) {
+                assert!(n.len() > p.len(), "{id}");
             }
         }
-        assert_eq!(exprs.len(), 25);
-        let joined: usize =
-            exprs.iter().map(|e| e.len() + 2).sum::<usize>() + 4 * (exprs.len() - 1);
-        assert_eq!(joined, 996);
-        // A number's availability joins them: the longest still fits.
+        assert!(supported > 0);
         let guard = [
             "bpm.range_valid",
             "bpm.current_valid",
@@ -537,7 +542,10 @@ mod tests {
         .max()
         .unwrap_or(0);
         assert_eq!(guard, 23);
-        assert!(joined + guard <= skin_model::MAX_SOURCE_BYTES);
+        // Each condition parenthesized and joined by ` && `.
+        let terms = 6 + 1;
+        let joined = terms * (longest + 2) + (terms - 1) * 4 + guard;
+        assert!(joined <= skin_model::MAX_SOURCE_BYTES, "{joined}");
     }
 
     fn expr(src: &str, display_deviation: bool) -> Cond {
