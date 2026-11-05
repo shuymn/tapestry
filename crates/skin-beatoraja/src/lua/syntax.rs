@@ -1280,17 +1280,23 @@ impl<'a> Parser<'a, '_> {
     }
 
     /// [`Self::charge`] at a named site, which a test can make fail.
+    /// For a test, the site records what the real charge added to the
+    /// node count, and can be made to meet a spent count, so the real
+    /// check refuses.
     fn charge_at(&mut self, site: &'static str) -> Result<(), Fail> {
         #[cfg(test)]
-        {
+        let before = {
             if super::tests::fail_at(site) {
-                return Err(Fail::Nodes);
+                *self.charged = MAX_AST_NODES;
             }
-            super::tests::site_charged(site, 1);
-        }
+            *self.charged
+        };
         #[cfg(not(test))]
         let _ = site;
-        self.charge()
+        let r = self.charge();
+        #[cfg(test)]
+        super::tests::site_charged(site, self.charged.saturating_sub(before));
+        r
     }
 
     fn enter(&mut self) -> Result<(), Fail> {

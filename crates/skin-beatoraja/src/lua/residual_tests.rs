@@ -826,9 +826,11 @@ fn destinations(entry: &str) -> u32 {
     u32::try_from(k + 1).unwrap()
 }
 
-/// Checks charge site `site`: `entry` charges `units` there, and with the
-/// charge made to fail the import stops fatally for `why` at `line` of
-/// `s.luaskin` with the site's work never started.
+/// Checks charge site `site`: `entry` makes the real charge there add
+/// `units` to its production counter, and with that counter spent before
+/// the site's first nonempty charge, the real check stops the import
+/// fatally for `why` at `line` of `s.luaskin`, the site's work never
+/// started.
 #[track_caller]
 fn witness(name: &'static str, entry: &str, units: u64, why: LuaWhy, line: u32) {
     fail_next(None);
@@ -880,7 +882,8 @@ fn every_new_charge_is_made_before_its_work() {
         &image(&format!("function() {body}return ms.number(110) > a8 end")),
     );
     witness("stmt", &entry, 10, work, at(&entry));
-    // W4: a helper chain three deep, each level of the walk.
+    // W4: a helper chain three deep, each level of the walk: 16
+    // expression and call levels and the four bodies' blocks.
     let entry = skin(
         "local function h3() return ms.number(110) > 0 end\n\
          local function h2() return h3() end\nlocal function h1() return h2() end",
@@ -889,7 +892,7 @@ fn every_new_charge_is_made_before_its_work() {
     witness(
         "depth",
         &entry,
-        16,
+        20,
         LuaWhy::Limit(LuaLimit::AstDepth),
         at(&entry),
     );
@@ -903,6 +906,28 @@ fn every_new_charge_is_made_before_its_work() {
         LuaWhy::Limit(LuaLimit::Expansion),
         at(&entry),
     );
+    // W6, by role: the height checked as each node is made. The chain of
+    // 65 locals pushes its read's five nodes, two a step to `a64`, and
+    // `a65`'s 1, then refuses `a65`'s sum before any is emitted.
+    let mut locals = String::from("local a1 = ms.number(110) ");
+    for k in 2..=65 {
+        locals.push_str(&format!("local a{k} = a{} + 1 ", k - 1));
+    }
+    let entry = skin("", &image(&format!("function() {locals}return a65 end")));
+    fail_next(None);
+    let r = run(&entry);
+    assert_eq!(r.callbacks, [Disposition::Replaced(LIMITS)]);
+    assert_eq!(site("node").0, 5 + 63 * 2 + 1);
+    assert_eq!(site("emit"), (0, 0));
+    // With the nesting the real check takes lowered to 2: the first node
+    // above it, the comparison, is refused, after the eight below it.
+    let entry = skin("", &image("function() return ms.number(110) + 1 > 0 end"));
+    fail_next(Some("height"));
+    let r = run(&entry);
+    let nodes = site("node").0;
+    fail_next(None);
+    assert_eq!(r.callbacks, [Disposition::Replaced(LIMITS)]);
+    assert_eq!(nodes, 8);
     // W7: two reads.
     let entry = skin(
         "",
@@ -975,6 +1000,118 @@ fn every_new_charge_is_made_before_its_work() {
 
 fn units(s: &str) -> u64 {
     u64::try_from(s.len()).unwrap()
+}
+
+/// Imports `entry` with the charge at `site` exhausted: the stop, and how
+/// often `work`, the work that charge protects, started.
+fn forced(name: &'static str, entry: &str, work: &'static str) -> (Result<(), ImportError>, u64) {
+    fail_next(Some(name));
+    let r = run(entry);
+    let started = site(work).1;
+    fail_next(None);
+    (r.r, started)
+}
+
+#[test]
+fn an_option_s_mapping_is_charged_before_it_is_built() {
+    // Its bound charged before the mapping builds its condition.
+    let entry = skin("", &image("function() return ms.option(271) end"));
+    let (r, started) = forced("option", &entry, "work:option");
+    assert!(
+        matches!(
+            r,
+            Err(ImportError::Lua {
+                why: LuaWhy::Limit(LuaLimit::AnalysisWork),
+                ..
+            })
+        ),
+        "{r:?}"
+    );
+    assert_eq!(started, 0);
+}
+
+#[test]
+fn an_integer_s_digits_are_charged_before_they_are_written() {
+    let entry = number("", "function() return 7 end");
+    let (r, started) = forced("text", &entry, "work:int");
+    assert!(r.is_err(), "{r:?}");
+    assert_eq!(started, 0);
+}
+
+#[test]
+fn the_marker_s_bytes_are_measured_before_they_are_formatted() {
+    let entry = skin(
+        "local OFF = ms.timer_off_value",
+        &image("function() return ms.timer(41) == OFF end"),
+    );
+    let (r, started) = forced("mark bytes", &entry, "work:mark");
+    assert!(r.is_err(), "{r:?}");
+    assert_eq!(started, 0);
+}
+
+#[test]
+fn a_statement_s_lists_are_charged_before_they_are_read() {
+    // `local` names and values, an assignment's targets and values, and
+    // a call's arguments: each list's length charged before it is
+    // scanned or buffered.
+    let entry = skin(
+        "local function h(x, y) return x == 1 end",
+        &image("function() local a, b = 1, 2 a, b = 3, 4 return h(1, 2) end"),
+    );
+    assert!(closed(&entry));
+    fail_next(None);
+    let r = run(&entry);
+    assert_eq!(r.callbacks, [Disposition::Lowered]);
+    assert_eq!(site("list").0, 4 + 4 + 2);
+}
+
+#[test]
+fn a_helper_tree_inlined_by_many_consumers_meets_the_expansion_cap() {
+    // A known limit: nothing is memoized across calls or lowerings, so a
+    // binary tree of 16 383 helper closures, which each of 32 numbers
+    // calls, is inlined in full by every consumer, past the cumulative
+    // node cap: fatal.
+    let body = "local level = {}\n\
+        for i = 1, 8192 do local k = i level[i] = function() local own = k return 0 end end\n\
+        while #level > 1 do\n\
+          local up = {}\n\
+          for i = 1, #level, 2 do\n\
+            local left, right = level[i], level[i + 1]\n\
+            up[#up + 1] = function() local x = left() local y = right() return 0 end\n\
+          end\n\
+          level = up\n\
+        end\n\
+        local root = level[1]\n\
+        skin.value = { { id = \"v\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, digit = 3,\n\
+          value = function() local unused = root() return ms.number(425) end } }";
+    let dst: String = (0..32)
+        .map(|k| format!("{{ id = \"v\", dst = {{ {{ x = {k}, y = 0, w = 6, h = 6 }} }} }},"))
+        .collect();
+    assert!(matches!(
+        run(&skin(body, &dst)).r,
+        Err(ImportError::Lua {
+            why: LuaWhy::Limit(LuaLimit::Expansion),
+            ..
+        })
+    ));
+}
+
+#[test]
+fn nested_blocks_count_toward_the_depth_cap() {
+    // A helper the first call primes in admission's cache, called again
+    // under 120 nested `do` blocks, its own body 120 blocks deep: the
+    // statements' nesting alone passes the depth cap.
+    let nest = |s: &str| format!("{}{}{}", "do ".repeat(120), s, " end".repeat(120));
+    let body = format!("local function h() {} end", nest("return true"));
+    let draw = format!("function() h() {} end", nest("return h()"));
+    let entry = skin(&body, &image(&draw));
+    match run(&entry).r {
+        Err(ImportError::Lua {
+            why: LuaWhy::Limit(LuaLimit::AstDepth),
+            at: Some(at),
+        }) => assert_eq!(at.line, destinations(&entry)),
+        other => panic!("{other:?}"),
+    }
 }
 
 #[test]

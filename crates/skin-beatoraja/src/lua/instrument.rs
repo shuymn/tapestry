@@ -198,22 +198,38 @@ pub(crate) fn instrument(
             return Err(Stop::Cancelled);
         }
         let id = (u64::from(file) << 32) | u64::from(m.decl);
-        let open = format!("{t}({id},");
         let close = ",nil,true)";
-        let n = open.len() + close.len();
-        #[cfg(test)]
-        {
-            if super::tests::fail_at("mark bytes") {
-                return Err(Stop::Generated);
-            }
-            super::tests::site_charged("mark bytes", u64::try_from(n).unwrap_or(u64::MAX));
+        // `T(id,` and the close, measured before either is built.
+        let mut digits = 1;
+        let mut rest = id;
+        while rest >= 10 {
+            rest /= 10;
+            digits += 1;
         }
-        added = added.saturating_add(n);
-        if added > cap {
+        let n = t.len() + 1 + digits + 1 + close.len();
+        // A test can spend the allowance first, so the real check
+        // refuses.
+        #[cfg(test)]
+        let before = {
+            if super::tests::fail_at("mark bytes") {
+                added = cap;
+            }
+            added
+        };
+        if added.saturating_add(n) > cap {
             return Err(Stop::Generated);
         }
+        added = added.saturating_add(n);
         #[cfg(test)]
-        super::tests::site_did("mark bytes");
+        {
+            super::tests::site_charged(
+                "mark bytes",
+                u64::try_from(added - before).unwrap_or(u64::MAX),
+            );
+            super::tests::site_did("mark bytes");
+            super::tests::site_did("work:mark");
+        }
+        let open = format!("{t}({id},");
         edits.push(Edit {
             at: m.start as usize,
             order: 1,

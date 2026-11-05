@@ -637,16 +637,22 @@ impl Conv<'_> {
         for (seen, pair) in marks.pairs::<Value, Value>().enumerate() {
             self.poll(seen)?;
             let (k, v) = pair.map_err(|e| self.mlua(&e))?;
+            // A test can spend the capture count first, so the real check
+            // refuses; the site records what the real charge added.
             #[cfg(test)]
-            {
+            let before = {
                 if super::tests::fail_at("mark copy") {
-                    return Err(self.lua(LuaWhy::Limit(LuaLimit::Captures)));
+                    self.pass.ledger.update(|c| c.captures = MAX_CAPTURES);
                 }
-                super::tests::site_charged("mark copy", 1);
-            }
+                self.pass.ledger.counts().captures
+            };
             self.charge()?;
             #[cfg(test)]
-            super::tests::site_did("mark copy");
+            {
+                let after = self.pass.ledger.counts().captures;
+                super::tests::site_charged("mark copy", after.saturating_sub(before));
+                super::tests::site_did("mark copy");
+            }
             if let (Value::Integer(k), Value::Boolean(v)) = (k, v) {
                 self.analysis.marks.insert(k.cast_unsigned(), v);
             }

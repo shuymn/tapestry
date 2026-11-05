@@ -11,8 +11,13 @@
 //! [`crate::lua::callback::Admitted`] witness), converted as its consumer
 //! converts it, and emitted here as an expression's source, compiled
 //! through the importer's compile path and its budget like any condition
-//! or value. Every read the residual recorded is attached first, before
-//! anything is emitted, whether or not the result still uses it: its JSON
+//! or value. The conversion comes first, so a result of a kind its
+//! consumer does not take is refused as that (a `text(1)` value is a
+//! type the number does not take) before its reads are looked at; the
+//! reads the residual recorded are kept apart from the result, so a
+//! conversion or a fold never drops one. Every recorded read is then
+//! attached, before anything is emitted, whether or not the result still
+//! uses it: its JSON
 //! mapping, that mapping's availability guard (joined into the element's
 //! visibility, so a value that can be unknown draws nothing while it is),
 //! its D4 deviation and its critical part (`number(101)` the EX score, as
@@ -240,6 +245,34 @@ impl Lower<'_> {
         Ok(s)
     }
 
+    /// Integer `n`'s literal, `(-m)` when negative: its digits counted,
+    /// then checked, charged and written as [`Self::text`] does.
+    fn int_text(an: &Analysis, n: i64) -> R<String> {
+        let mut m = n.unsigned_abs();
+        let mut digits = 1_usize;
+        while m >= 10 {
+            m /= 10;
+            digits += 1;
+        }
+        let len = digits + if n < 0 { 3 } else { 0 };
+        if len > MAX_SOURCE_BYTES {
+            return Err(Stop::Fatal(LuaWhy::Limit(LuaLimit::Generated)));
+        }
+        charge(an, "text", units(len))?;
+        did("text");
+        #[cfg(test)]
+        did("work:int");
+        let mut s = String::with_capacity(len);
+        if n < 0 {
+            s.push_str("(-");
+        }
+        let _ = std::fmt::Write::write_fmt(&mut s, format_args!("{}", n.unsigned_abs()));
+        if n < 0 {
+            s.push(')');
+        }
+        Ok(s)
+    }
+
     fn guard(&mut self, g: &'static str) {
         if !self.out.guards.contains(&g) {
             self.out.guards.push(g);
@@ -312,21 +345,14 @@ impl Lower<'_> {
                 let src = Self::text(self.an, &["(", v.expr(), ")"])?;
                 Ok(Mapped::Int { src, lo, hi })
             }
-            "option" => match ops::numeric(id.ok_or_else(unmapped)?, &BTreeMap::new()) {
-                Cond::Expr {
-                    src,
-                    display_deviation,
-                } => {
-                    self.out.deviates |= display_deviation;
-                    Ok(Mapped::Bool(Self::text(self.an, &["(", &src, ")"])?))
-                }
-                Cond::Fold(b) => Ok(Mapped::Bool(Self::text(
-                    self.an,
-                    &[if b { "true" } else { "false" }],
-                )?)),
-                Cond::Undefined(_) => Ok(Mapped::Bool(Self::text(self.an, &["false"])?)),
-                Cond::Unsupported(_) => Err(unmapped()),
-            },
+            "option" => {
+                let id = id.ok_or_else(unmapped)?;
+                // The mapping builds its condition: its bound charged first.
+                charge(self.an, "option", units(ops::MAX_COND_BYTES))?;
+                #[cfg(test)]
+                did("work:option");
+                self.option(ops::numeric(id, &BTreeMap::new()), unmapped)
+            }
             "timer" => {
                 let id = id.filter(|&n| n >= 0).ok_or_else(unmapped)?;
                 match self.custom.resolve(id) {
@@ -338,6 +364,26 @@ impl Lower<'_> {
                 }
             }
             _ => Err(Stop::Unsupported(Unsupported::HostApi(api))),
+        }
+    }
+
+    /// An option read's mapped condition `c`, built within the bound
+    /// already charged.
+    fn option(&mut self, c: Cond, unmapped: impl FnOnce() -> Stop) -> R<Mapped> {
+        match c {
+            Cond::Expr {
+                src,
+                display_deviation,
+            } => {
+                self.out.deviates |= display_deviation;
+                Ok(Mapped::Bool(Self::text(self.an, &["(", &src, ")"])?))
+            }
+            Cond::Fold(b) => Ok(Mapped::Bool(Self::text(
+                self.an,
+                &[if b { "true" } else { "false" }],
+            )?)),
+            Cond::Undefined(_) => Ok(Mapped::Bool(Self::text(self.an, &["false"])?)),
+            Cond::Unsupported(_) => Err(unmapped()),
         }
     }
 
@@ -373,15 +419,7 @@ impl Lower<'_> {
         let an = self.an;
         let ty = || Err(Stop::Unsupported(Unsupported::Type));
         match res.node(r) {
-            Node::Known(Val::Int(n)) => {
-                let s = n.unsigned_abs().to_string();
-                let src = if n < 0 {
-                    Self::text(an, &["(-", &s, ")"])?
-                } else {
-                    Self::text(an, &[&s])?
-                };
-                Self::int(src, n, n)
-            }
+            Node::Known(Val::Int(n)) => Self::int(Self::int_text(an, n)?, n, n),
             Node::Known(Val::Bool(b)) => Ok(V::Bool(Self::text(
                 an,
                 &[if b { "true" } else { "false" }],

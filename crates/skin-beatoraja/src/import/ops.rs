@@ -347,6 +347,10 @@ fn built_in_cond(id: i32, negative: bool) -> Cond {
     }
 }
 
+/// The most bytes a built-in's condition ([`numeric`]) holds, negation
+/// included: what a caller charges before it is built.
+pub(crate) const MAX_COND_BYTES: usize = 128;
+
 /// Numeric op `op` (non-zero): built-ins first, then the declared items
 /// `items`, each folded to whether it is selected.
 pub(crate) fn numeric(op: i32, items: &BTreeMap<i32, bool>) -> Cond {
@@ -393,6 +397,20 @@ pub(crate) fn named(name: &str) -> Option<Cond> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_built_in_condition_fits_its_bound() {
+        let none = BTreeMap::new();
+        let mut longest = 0;
+        for id in 1..=PRACTICE_ITEM_SELECTED + PRACTICE_ITEMS {
+            for op in [id, -id] {
+                if let Cond::Expr { src, .. } = numeric(op, &none) {
+                    longest = longest.max(src.len());
+                }
+            }
+        }
+        assert!(longest > 0 && longest <= MAX_COND_BYTES, "{longest}");
+    }
 
     /// Every id of the factory's `BooleanType` entries at `0.8.9`, the
     /// `SkinProperty` constants resolved, written out apart from the

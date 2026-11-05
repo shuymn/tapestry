@@ -188,18 +188,23 @@ fn construct<T>(what: &'static str) -> R<T> {
 }
 
 /// `n` units of analysis work charged at the named `site` before its
-/// work: a test can make it fail with [`TOO_MUCH`](super::callback::TOO_MUCH).
+/// work. For a test, the site records what the real charge added to the
+/// analysis's work, and can be made to meet an exhausted allowance at
+/// its first nonempty charge, so the real check refuses it.
 pub(crate) fn charge(an: &Analysis, site: &'static str, n: u64) -> R<()> {
     #[cfg(test)]
-    {
-        if super::tests::fail_at(site) {
-            return Err(stop(super::callback::TOO_MUCH));
+    let before = {
+        if n > 0 && super::tests::fail_at(site) {
+            an.work.set(super::limits::MAX_ANALYSIS_WORK);
         }
-        super::tests::site_charged(site, n);
-    }
+        an.work.get()
+    };
     #[cfg(not(test))]
     let _ = site;
-    an.charge(n).map_err(stop)
+    let r = an.charge(n).map_err(stop);
+    #[cfg(test)]
+    super::tests::site_charged(site, an.work.get().saturating_sub(before));
+    r
 }
 
 /// Records, for a test, that the work charged at `site` started.
@@ -340,22 +345,36 @@ impl<'a> Eval<'a> {
             Node::Known(_) | Node::Read { .. } | Node::Unreachable => height,
             _ => height.saturating_add(1),
         };
-        // Past R4's nesting, refused as it is made.
-        if usize::from(height) > skin_model::MAX_NESTING {
+        // Past R4's nesting, refused as it is made. A test can lower the
+        // nesting to 2, so the real check refuses the first node above a
+        // leaf's parent.
+        #[cfg(test)]
+        let nesting = if super::tests::fail_at("height") {
+            2
+        } else {
+            skin_model::MAX_NESTING
+        };
+        #[cfg(not(test))]
+        let nesting = skin_model::MAX_NESTING;
+        if usize::from(height) > nesting {
             return refuse(LIMITS);
         }
+        // For a test, the expanded count can be exhausted, so the real
+        // check refuses this node, and records what the node added.
         #[cfg(test)]
-        {
+        let before = {
             if super::tests::fail_at("node") {
-                return Err(Stop::Fatal(LuaWhy::Limit(LuaLimit::Expansion)));
+                self.an.expanded.set(MAX_EXPANDED_NODES);
             }
-            super::tests::site_charged("node", 1);
-        }
+            self.an.expanded.get()
+        };
         let total = self.an.expanded.get().saturating_add(1);
         if total > MAX_EXPANDED_NODES {
             return Err(Stop::Fatal(LuaWhy::Limit(LuaLimit::Expansion)));
         }
         self.an.expanded.set(total);
+        #[cfg(test)]
+        super::tests::site_charged("node", self.an.expanded.get().saturating_sub(before));
         did("node");
         let id = u32::try_from(self.res.nodes.len())
             .map_err(|_| Stop::Fatal(LuaWhy::Limit(LuaLimit::Expansion)))?;
@@ -399,17 +418,15 @@ impl<'a> Eval<'a> {
 
     /// Runs `f` one level deeper: past [`MAX_AST_DEPTH`] fatal.
     fn deeper<T>(&mut self, f: impl FnOnce(&mut Self) -> R<T>) -> R<T> {
+        // A test can put the walk at the cap, so the real check refuses.
+        #[cfg(test)]
+        if super::tests::fail_at("depth") {
+            self.depth = MAX_AST_DEPTH;
+        }
         if self.depth >= MAX_AST_DEPTH {
             return Err(Stop::Fatal(LuaWhy::Limit(LuaLimit::AstDepth)));
         }
-        #[cfg(test)]
-        {
-            if super::tests::fail_at("depth") {
-                return Err(Stop::Fatal(LuaWhy::Limit(LuaLimit::AstDepth)));
-            }
-            super::tests::site_charged("depth", 1);
-        }
-        self.an.charge(1).map_err(stop)?;
+        charge(self.an, "depth", 1)?;
         did("depth");
         self.depth += 1;
         let r = f(self);
@@ -461,7 +478,9 @@ impl<'a> Eval<'a> {
             return Err(Stop::Fatal(LuaWhy::Cancelled));
         }
         charge(self.an, "scan", units(self.stack.len()))?;
-        did("scan");
+        if !self.stack.is_empty() {
+            did("scan");
+        }
         if self.stack.contains(&j) {
             return refuse(Unsupported::Recursion);
         }
@@ -477,7 +496,9 @@ impl<'a> Eval<'a> {
         }
         let params = ast.list(f.params);
         charge(self.an, "bind", units(params.len().max(args.len())))?;
-        did("bind");
+        if !params.is_empty() || !args.is_empty() {
+            did("bind");
+        }
         let mut env = Vec::with_capacity(params.len());
         for (k, &p) in params.iter().enumerate() {
             let v = match args.get(k) {
@@ -507,7 +528,12 @@ impl<'a> Eval<'a> {
         }
     }
 
+    /// A block, one level deeper: statements nest as expressions do.
     fn block(&mut self, f: &mut Frame<'a>, body: List, done: &mut Done) -> R<()> {
+        self.deeper(|ev| ev.block_in(f, body, done))
+    }
+
+    fn block_in(&mut self, f: &mut Frame<'a>, body: List, done: &mut Done) -> R<()> {
         let mark = f.env.len();
         for &s in f.ast.list(body) {
             if matches!(done, Done::Yes(_)) {
@@ -533,6 +559,10 @@ impl<'a> Eval<'a> {
             Stmt::Empty => Ok(()),
             Stmt::Local { names, exprs } => {
                 let (ns, es) = (ast.list(names), ast.list(exprs));
+                // Each name and value, charged before the attributes are
+                // scanned and the values buffered.
+                charge(self.an, "list", units(ns.len() + es.len()))?;
+                did("list");
                 for &d in ns {
                     if ast.decl(d).is_some_and(|x| x.attrib == Attrib::Close) {
                         return construct("<close>");
@@ -556,6 +586,8 @@ impl<'a> Eval<'a> {
             }
             Stmt::Assign { targets, exprs } => {
                 let ts = ast.list(targets);
+                charge(self.an, "list", units(ts.len() + ast.list(exprs).len()))?;
+                did("list");
                 let mut slots = Vec::with_capacity(ts.len());
                 for &t in ts {
                     let Expr::Local(d) = ast.expr(t) else {
@@ -886,6 +918,8 @@ impl<'a> Eval<'a> {
         match self.val(c) {
             Some(Val::Closure(j)) => {
                 self.an.charge(1).map_err(stop)?;
+                charge(self.an, "list", units(args.len()))?;
+                did("list");
                 let mut xs = Vec::with_capacity(args.len());
                 for &a in args {
                     xs.push(self.expr(f, a)?);
@@ -896,6 +930,8 @@ impl<'a> Eval<'a> {
                 let Some((arity, _)) = reader(api) else {
                     return refuse(Unsupported::HostApi(api));
                 };
+                charge(self.an, "list", units(args.len()))?;
+                did("list");
                 let mut xs = Vec::with_capacity(args.len());
                 for &a in args {
                     xs.push(self.expr(f, a)?);
