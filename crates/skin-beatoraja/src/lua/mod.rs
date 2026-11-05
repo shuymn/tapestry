@@ -230,8 +230,6 @@ pub enum Unsupported {
     HostApi(u16),
     /// A call of something that is not a host API or a helper.
     Callee,
-    /// `and`, `or` or `not` of an integer, whose truthiness is Lua's.
-    Truthiness,
     /// Operands of types the operator does not take.
     Type,
     /// A helper that calls itself.
@@ -269,7 +267,6 @@ impl fmt::Display for Unsupported {
             Self::Binding(b) => write!(f, "{b} not proven by its captured binding"),
             Self::HostApi(a) => write!(f, "{} has no conversion", api(*a)),
             Self::Callee => f.write_str("a call of an unknown function"),
-            Self::Truthiness => f.write_str("an integer used as a condition"),
             Self::Type => f.write_str("operands of an unsupported type"),
             Self::Recursion => f.write_str("a helper that calls itself"),
             Self::Capture(c) => write!(f, "{c} not proven"),
