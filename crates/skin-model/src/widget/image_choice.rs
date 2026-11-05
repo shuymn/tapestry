@@ -135,4 +135,13 @@ impl ImageChoice {
             (None, PastTable::First) => self.parts.first()?.as_ref(),
         }
     }
+
+    /// The index of the entry `state` selects, as [`select`](Self::select)
+    /// finds it.
+    #[cfg(feature = "dev-tools")]
+    pub(crate) fn selected(&self, state: &State<'_>) -> Option<u32> {
+        let v = usize::try_from(self.value.eval(state)).ok()?;
+        let at = if v < self.parts.len() { v } else { 0 };
+        u32::try_from(at).ok()
+    }
 }

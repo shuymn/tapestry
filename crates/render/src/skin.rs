@@ -155,6 +155,14 @@ pub struct SkinError {
 /// frame. `build` must not allocate: everything it needs is sized in
 /// `prepare`.
 pub trait PlaySkin: Send {
+    /// What `batch`, this skin's last build, holds as a list; `None` for a
+    /// skin that keeps no observations (dev-tools: a scenario's captures).
+    #[cfg(feature = "dev-tools")]
+    fn display_list(&self, batch: &skin_model::QuadBatch) -> Option<skin_model::DisplayList> {
+        let _ = batch;
+        None
+    }
+
     /// Takes what the skin needs from the attempt `a` and the GPU, and
     /// starts the attempt's state fresh, so each retry and practice round
     /// calls it again. With a practice round's section, only its targets

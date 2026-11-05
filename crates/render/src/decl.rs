@@ -642,6 +642,9 @@ pub struct DeclSkin {
     bundle: Arc<SkinBundle>,
     loading: LoadingPresentation,
     play: Option<Play>,
+    /// The attempt's labels, for a captured list's text (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    labels: [String; 5],
 }
 
 impl DeclSkin {
@@ -660,6 +663,8 @@ impl DeclSkin {
             bundle: Arc::clone(&installation.bundle),
             loading: installation.loading.clone(),
             play: None,
+            #[cfg(feature = "dev-tools")]
+            labels: Default::default(),
         }
     }
 
@@ -720,7 +725,29 @@ impl PlaySkin for DeclSkin {
         })?;
         skin.attach_bitmap_text(&mut play, a.text);
         self.play = Some(play);
+        #[cfg(feature = "dev-tools")]
+        {
+            let t = a.text;
+            self.labels = [t.title, t.subtitle, t.artist, t.subartist, t.genre].map(str::to_owned);
+        }
         Ok(())
+    }
+
+    #[cfg(feature = "dev-tools")]
+    fn display_list(&self, batch: &skin_model::QuadBatch) -> Option<skin_model::DisplayList> {
+        let [title, subtitle, artist, subartist, genre] = &self.labels;
+        let chart = skin_model::ChartText {
+            title,
+            subtitle,
+            artist,
+            subartist,
+            genre,
+        };
+        Some(
+            self.bundle
+                .skin
+                .display_list(batch, &self.bundle.uvs, &chart),
+        )
     }
 
     /// A chart's load prepares nothing that depends on the play preset:

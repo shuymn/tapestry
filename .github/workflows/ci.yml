@@ -244,7 +244,7 @@ jobs:
           cache-bin: false
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Clippy (dev-tools)
-        run: mise exec -- cargo clippy -p player -p game -p skin-beatoraja --all-targets --locked --features player/dev-tools,game/dev-tools,skin-beatoraja/dev-tools -- -D warnings
+        run: mise exec -- cargo clippy -p player -p game -p skin-beatoraja -p skin-model --all-targets --locked --features player/dev-tools,game/dev-tools,skin-beatoraja/dev-tools,skin-model/dev-tools -- -D warnings
       - name: Development build includes dev-tools (positive control)
         run: |
           mise exec -- cargo build --locked -p player --features dev-tools
@@ -252,7 +252,7 @@ jobs:
           target/debug/tapestry.exe --dev-tools-probe
       # The game on its threads, driven by a scripted input log, on WARP.
       - name: Test (dev-tools)
-        run: mise exec -- cargo nextest run -p player -p game -p skin-beatoraja --features player/dev-tools,game/dev-tools,skin-beatoraja/dev-tools --locked --no-fail-fast
+        run: mise exec -- cargo nextest run -p player -p game -p skin-beatoraja --features player/dev-tools,game/dev-tools,skin-beatoraja/dev-tools,skin-model/dev-tools --locked --no-fail-fast
       # The player's allocation guards are unit tests of its binary, whose
       # counting allocator exists only with dev-tools; `_alloc` selects them
       # (`cargo xtask check-alloc-tests`).
