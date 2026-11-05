@@ -726,9 +726,11 @@ impl SelectScreen {
         self.save_error = error;
     }
 
-    /// The preset whose bests the list shows; `None` shows none.
+    /// The preset whose bests the list shows; `None` shows none. Another
+    /// preset drops the scores read under the one before, which
+    /// [`set_bests`](Self::set_bests) replaces with its own.
     pub fn set_bests_preset(&mut self, preset: Option<RulePreset>) {
-        if preset.is_none() {
+        if preset != self.bests_preset {
             self.bests.clear();
         }
         self.bests_preset = preset;
@@ -1839,6 +1841,29 @@ mod tests {
                 ("                      ☆-   4.bms", LineStyle::Chart),
             ]
         );
+    }
+
+    /// A preset switch drops the scores read under the one before, so none
+    /// shows under the new preset until its own are read: a read that then
+    /// fails leaves the list unplayed, never the old preset's lamps.
+    #[test]
+    fn a_preset_switch_drops_the_old_presets_scores() {
+        use skin_model::RowScore;
+        let mut s = SelectScreen::new(Vec::new());
+        let mut e = entry(r"C:\charts\x\1.bms", "a");
+        e.sha256 = [1; 32];
+        s.set_entries(vec![e]);
+        s.set_bests_preset(Some(rules::tapestry()));
+        s.set_bests(std::collections::HashMap::from([(
+            [1; 32],
+            library::Score {
+                plays: 2,
+                best: None,
+            },
+        )]));
+        assert_eq!(s.view(1, 1).rows[1].score, RowScore::NoBest { plays: 2 });
+        s.set_bests_preset(Some(rules::lr2_style()));
+        assert_eq!(s.view(1, 1).rows[1].score, RowScore::Unplayed);
     }
 
     /// A row's difficulty is `#DIFFICULTY` when it is 1 to 5, spaces aside.
