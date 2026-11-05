@@ -765,7 +765,7 @@ mod tests {
          if not skin_config then return skin end\n\
          skin.source = { { id = \"a\", path = \"a.png\" } }\n\
          skin.image = { { id = \"i\", src = \"a\", x = 0, y = 0, w = 64, h = 64 } }\n\
-         skin.value = { { id = \"lv\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, digit = 2, ref = 96 } }\n\
+         skin.value = { { id = \"lv\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, digit = 2, ref = 425 } }\n\
          skin.judgegraph = { { id = \"jg\", src = \"a\", x = 0, y = 0, w = 64, h = 64 } }\n\
          skin.destination = {\n\
            { id = \"i\", dst = { { w = 64, h = 64 } } },\n\
@@ -830,7 +830,7 @@ mod tests {
                 Severity::Dropped,
                 NoteKind::UnsupportedProperty {
                     kind: PropertyKind::Integer,
-                    id: Some(96)
+                    id: Some(425)
                 }
             ))
         );
@@ -932,7 +932,7 @@ mod tests {
             kinds[2],
             [NoteKind::UnsupportedProperty {
                 kind: PropertyKind::Integer,
-                id: Some(96)
+                id: Some(425)
             }]
         );
         assert!(matches!(kinds[3][..], [NoteKind::Unsupported { .. }]));
