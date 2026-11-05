@@ -22,7 +22,8 @@
 //!
 //! [[step]]
 //! capture = { at = 3000, file = "a.png" }   # chart ms, the next play's
-//! # or { ready_at = 500, file = … }: ms since its READY state began; or
+//! # or { ready_at = 500, file = … }: ms since its first candidate's READY
+//! # state began; or
 //! # { loading = true, file = … }: its loading state's first frame. Beside
 //! # each PNG, a JSON file of the same name says what the frame was.
 //!
@@ -1028,8 +1029,8 @@ pub enum Axis {
     /// The first presented frame at or after this chart time.
     Chart(TimeUs),
     /// The first presented frame at or after this time since its READY
-    /// state began; a frame past READY fails it (design.md "Play
-    /// Lifecycle": a different length, not an interchangeable time).
+    /// state began, of the attempt's first candidate: a frame past READY
+    /// or of a rearmed candidate fails it (design.md "Play Lifecycle").
     Ready(TimeUs),
     /// The first presented frame of its loading state.
     Loading,
@@ -1227,6 +1228,16 @@ pub struct ScenarioFrames {
 /// value in milliseconds, for tests of a stuck render thread.
 pub const STALL_ENV: &str = "TAPESTRY_DEV_CAPTURE_STALL_MS";
 
+impl Captures {
+    /// Capture `i` waits on `axis` (tests).
+    #[cfg(test)]
+    pub fn set_axis(&self, i: usize, axis: Axis) {
+        if let Some(c) = self.lock().get_mut(i) {
+            c.axis = axis;
+        }
+    }
+}
+
 impl ScenarioFrames {
     /// The sink of `captures` (tests).
     #[cfg(test)]
@@ -1262,10 +1273,15 @@ impl FrameSink for ScenarioFrames {
             let mut list = self.captures.lock();
             list.iter_mut()
                 .enumerate()
-                .filter_map(|(i, c)| {
-                    let generation = capture_due(c, drawn)?;
-                    c.state = CaptureState::Saving(generation);
-                    Some((i, c.path.clone(), c.axis, generation))
+                .filter_map(|(i, c)| match capture_due(c, drawn)? {
+                    Due::Save(generation) => {
+                        c.state = CaptureState::Saving(generation);
+                        Some((i, c.path.clone(), c.axis, generation))
+                    }
+                    Due::Fail(why) => {
+                        c.state = CaptureState::Failed(format!("{}: {why}", c.path.display()));
+                        None
+                    }
                 })
                 .collect()
         };
@@ -1280,21 +1296,16 @@ impl FrameSink for ScenarioFrames {
             .read_back()
             .map(|(w, h, pixels)| super::png(w, h, &pixels));
         for (i, path, axis, generation) in due {
-            let overshot = matches!(axis, Axis::Ready(_)) && drawn.play.is_some_and(|t| t.0 >= 0);
-            let outcome = if overshot {
-                Err("its READY state ended first".to_owned())
-            } else {
-                match &image {
-                    None => Err("nothing to read back".to_owned()),
-                    Some(png) => write_new(&path, png)
-                        .and_then(|()| {
-                            write_new(
-                                &path.with_extension("json"),
-                                sidecar(axis, self.frame, drawn).as_bytes(),
-                            )
-                        })
-                        .map_err(|e| e.to_string()),
-                }
+            let outcome = match &image {
+                None => Err("nothing to read back".to_owned()),
+                Some(png) => write_new(&path, png)
+                    .and_then(|()| {
+                        write_new(
+                            &path.with_extension("json"),
+                            sidecar(axis, self.frame, drawn).as_bytes(),
+                        )
+                    })
+                    .map_err(|e| e.to_string()),
             };
             if let Some(c) = self.captures.lock().get_mut(i)
                 && c.state == CaptureState::Saving(generation)
@@ -1308,54 +1319,97 @@ impl FrameSink for ScenarioFrames {
     }
 }
 
-/// The generation capture `c` saves `drawn` under, if `drawn` is the frame
-/// it waits for.
-fn capture_due(c: &Capture, drawn: &Drawn<'_>) -> Option<u64> {
-    let at = match c.axis {
-        Axis::Chart(at) => at,
-        // Past READY is an overshoot, for the caller to fail at once.
-        Axis::Ready(since) => TimeUs((since.0 - crate::LEAD_IN.0).min(0)),
+/// What a frame means for a capture waiting on it.
+enum Due {
+    /// It is the frame: saved under this generation.
+    Save(u64),
+    /// The capture can no longer be met.
+    Fail(&'static str),
+}
+
+/// What `drawn` means for capture `c`, if anything.
+fn capture_due(c: &Capture, drawn: &Drawn<'_>) -> Option<Due> {
+    if let Axis::Loading = c.axis {
         // Armed, whether or not its play has started; its frames carry no
         // play to bind to.
-        Axis::Loading => {
-            return match c.state {
-                CaptureState::Pending if drawn.loading => Some(0),
-                CaptureState::Bound(g) if drawn.loading => Some(g),
-                _ => None,
-            };
-        }
-    };
+        return match c.state {
+            CaptureState::Pending if drawn.loading => Some(Due::Save(0)),
+            CaptureState::Bound(g) if drawn.loading => Some(Due::Save(g)),
+            _ => None,
+        };
+    }
     let (Some(generation), Some(t)) = (drawn.generation, drawn.play) else {
         return None;
     };
-    (c.state == CaptureState::Bound(generation) && t >= at).then_some(generation)
+    if c.state != CaptureState::Bound(generation) {
+        return None;
+    }
+    match c.axis {
+        Axis::Chart(at) => (t >= at).then_some(Due::Save(generation)),
+        Axis::Ready(since) => {
+            let view = drawn.view?;
+            if view.generation != 0 {
+                return Some(Due::Fail("its READY candidate was rearmed first"));
+            }
+            let (origin, end) = view.ready?;
+            if t >= end {
+                return Some(Due::Fail("its READY state ended first"));
+            }
+            (t.0 - origin.0 >= since.0).then_some(Due::Save(generation))
+        }
+        Axis::Loading => None,
+    }
 }
 
 /// What the capture of `axis` on frame number `frame` was: its PNG's
 /// companion. A frame's play state may lag its time, which the view says.
 fn sidecar(axis: Axis, frame: u64, drawn: &Drawn<'_>) -> String {
     let opt = |v: Option<i64>| v.map_or_else(|| "null".to_owned(), |v| v.to_string());
-    let phase = match drawn.play {
-        Some(t) if t.0 < 0 => "ready",
-        Some(_) => "play",
-        None if drawn.loading => "loading",
-        None => "other",
-    };
     let view = drawn.view;
+    let ready = view.and_then(|v| v.ready);
+    let loading = drawn.loading_stamp;
     format!(
-        "{{\"axis\":\"{}\",\"target_us\":{},\"frame\":{frame},\"phase\":\"{phase}\",\
-         \"chart_us\":{},\"ready_us\":{},\"at_us\":{},\"generation\":{},\
-         \"view_generation\":{},\"finalized_us\":{},\"events\":{}}}\n",
+        "{{\"axis\":\"{}\",\"target_us\":{},\"frame\":{frame},\"phase\":\"{}\",\
+         \"chart_us\":{},\"ready_us\":{},\"ready_origin_us\":{},\"play_at_us\":{},\
+         \"loading_us\":{},\"loading_origin_us\":{},\"settled\":{},\"completed_us\":{},\
+         \"generation\":{},\"view_generation\":{},\"finalized_us\":{},\"events\":{}}}\n",
         axis.name(),
         axis.target(),
+        phase(drawn),
         opt(drawn.play.map(|t| t.0)),
-        opt(drawn.play.map(|t| t.0 + crate::LEAD_IN.0)),
+        opt(drawn.play.zip(ready).map(|(t, (origin, _))| t.0 - origin.0)),
+        opt(ready.map(|(origin, _)| origin.0)),
+        opt(ready.map(|(_, end)| end.0)),
+        opt(loading.map(|l| l.sampled.0 - l.origin.0)),
+        opt(loading.map(|l| l.origin.0)),
+        loading.map_or_else(|| "null".to_owned(), |l| l.settled.to_string()),
         drawn.at.0,
         opt(drawn.generation.and_then(|g| i64::try_from(g).ok())),
         opt(view.and_then(|v| i64::try_from(v.generation).ok())),
         opt(view.and_then(|v| v.finalized).map(|t| t.0)),
         opt(view.and_then(|v| i64::try_from(v.events).ok())),
     )
+}
+
+/// The phase `drawn`'s acquired state is in: the view's own, which may lag
+/// the frame's time. A view past READY that stopped playing, the tail's,
+/// the ring-out's and a stop's, is `tail`.
+fn phase(drawn: &Drawn<'_>) -> &'static str {
+    match (drawn.play, drawn.view) {
+        (Some(_), Some(v)) if v.closing.is_some() => "closing",
+        (Some(_), Some(v)) if v.playing => "play",
+        (Some(_), Some(v))
+            if v.complete
+                || v.ready
+                    .zip(v.finalized)
+                    .is_some_and(|((_, end), finalized)| finalized >= end) =>
+        {
+            "tail"
+        }
+        (Some(_), _) => "ready",
+        (None, _) if drawn.loading => "loading",
+        (None, _) => "other",
+    }
 }
 
 /// The rig's part of a scenario run (dev-tools).
@@ -2181,6 +2235,52 @@ mod tests {
         }
     }
 
+    /// The sidecar says the acquired view's own finalized time and event
+    /// count.
+    #[test]
+    fn a_sidecar_says_the_views_finalized_time_and_events() {
+        let mut d = drawn(1, 2);
+        d.view = Some(crate::measure::ViewStamp {
+            generation: 3,
+            finalized: Some(TimeUs(1_234)),
+            events: 56,
+            ..drawn_view()
+        });
+        let side = super::sidecar(super::Axis::Chart(TimeUs(0)), 9, &d);
+        assert!(side.contains("\"view_generation\":3,"), "{side}");
+        assert!(side.contains("\"finalized_us\":1234,"), "{side}");
+        assert!(side.contains("\"events\":56"), "{side}");
+    }
+
+    /// A stop past READY is `tail`, whatever the frame's time; a view still
+    /// in READY is `ready` though the frame's time is past it.
+    #[test]
+    fn a_phase_comes_from_the_view() {
+        let view = |playing, complete, finalized| crate::measure::ViewStamp {
+            playing,
+            complete,
+            finalized,
+            ..drawn_view()
+        };
+        let mut d = drawn(1, 5);
+        for (v, want) in [
+            (view(true, false, Some(TimeUs(1))), "play"),
+            (view(false, true, Some(TimeUs(1))), "tail"),
+            (view(false, false, Some(TimeUs(1))), "tail"),
+            (view(false, false, Some(TimeUs(-1))), "ready"),
+            (
+                crate::measure::ViewStamp {
+                    closing: Some(TimeUs(1)),
+                    ..view(false, false, Some(TimeUs(1)))
+                },
+                "closing",
+            ),
+        ] {
+            d.view = Some(v);
+            assert_eq!(super::phase(&d), want, "{v:?}");
+        }
+    }
+
     /// Captures of one frame share its number, and later frames count on;
     /// READY overshoot writes nothing.
     #[test]
@@ -2571,11 +2671,25 @@ mod tests {
         assert!(matches!(c.states()[0], CaptureState::Failed(_)));
     }
 
+    /// A view of a full play's first candidate, playing.
+    fn drawn_view() -> crate::measure::ViewStamp {
+        crate::measure::ViewStamp {
+            generation: 0,
+            finalized: None,
+            events: 0,
+            playing: true,
+            complete: false,
+            closing: None,
+            ready: Some((TimeUs(-1_000_000), TimeUs(0))),
+        }
+    }
+
     /// A presented play frame of `generation` at chart time `ms`.
     pub(crate) fn drawn(generation: u64, ms: i64) -> crate::measure::Drawn<'static> {
         crate::measure::Drawn {
             play: Some(TimeUs(ms * 1_000)),
-            view: None,
+            view: Some(drawn_view()),
+            loading_stamp: None,
             menu: false,
             loading: false,
             generation: Some(generation),

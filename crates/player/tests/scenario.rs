@@ -634,7 +634,7 @@ fn other_scenario_version_is_refused() {
         stderr.contains("version 4 is not supported; this build reads version 3"),
         "{stderr}"
     );
-    assert!(!stderr.contains("what_v3_adds"), "{stderr}");
+    assert!(!stderr.contains("what_v4_adds"), "{stderr}");
     assert!(!fx.data().join("library.db").exists());
     let (out, _, stderr) = fx.run("[library]\nroots = [\"library\"]\n");
     assert_eq!(out.status.code(), Some(1), "{stderr}");
@@ -656,7 +656,7 @@ fn a_sized_scenario_captures_on_each_axis() {
     let text = scenario(&[
         "capture = { loading = true, file = \"load.png\" }",
         "capture = { ready_at = 200, file = \"ready.png\" }",
-        "capture = { at = 0, file = \"start.png\" }",
+        "capture = { at = 200, file = \"start.png\" }",
         "capture = { at = 2500, file = \"note.png\" }",
         "select = { path = \"library/a/a.bms\" }",
         "play = { input = \"auto\", until = \"end\" }",
@@ -671,14 +671,6 @@ fn a_sized_scenario_captures_on_each_axis() {
     let (out, stdout, stderr) = fx.run(&text);
     assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
     let dir = fx.base.join("out");
-    let num = |text: &str, key: &str| -> Option<i64> {
-        let rest = text.split(&format!("\"{key}\":")).nth(1)?;
-        rest.split([',', '}']).next()?.parse().ok()
-    };
-    let word = |text: &str, key: &str| -> String {
-        let rest = text.split(&format!("\"{key}\":\"")).nth(1).unwrap();
-        rest.split('"').next().unwrap().to_owned()
-    };
     for (name, axis, phase) in [
         ("load", "loading", "loading"),
         ("ready", "ready", "ready"),
@@ -699,18 +691,24 @@ fn a_sized_scenario_captures_on_each_axis() {
             "{name}"
         );
         let side = fs::read_to_string(dir.join(format!("{name}.json"))).unwrap();
-        assert_eq!(word(&side, "axis"), axis, "{side}");
-        assert_eq!(word(&side, "phase"), phase, "{side}");
+        assert_eq!(side_value(&side, "axis"), axis, "{side}");
+        assert_eq!(side_value(&side, "phase"), phase, "{side}");
     }
     let side = |name: &str| fs::read_to_string(dir.join(format!("{name}.json"))).unwrap();
-    assert!(num(&side("ready"), "ready_us").unwrap() >= 200_000);
-    assert!(num(&side("ready"), "chart_us").unwrap() < 0);
-    assert!(num(&side("start"), "chart_us").unwrap() >= 0);
+    assert!(side_num(&side("ready"), "ready_us") >= 200_000);
+    assert!(side_num(&side("ready"), "chart_us") < 0);
+    assert!(side_num(&side("start"), "chart_us") >= 0);
     let note = side("note");
-    assert!(num(&note, "chart_us").unwrap() >= 2_500_000);
-    assert!(num(&note, "finalized_us").is_some(), "{note}");
-    assert!(num(&note, "events").is_some(), "{note}");
-    assert_ne!(num(&side("start"), "frame"), num(&note, "frame"));
+    assert!(side_num(&note, "chart_us") >= 2_500_000);
+    // Its view's own: the evaluator had passed a note by then, and judged
+    // the notes at 2.0 s and later.
+    let finalized = side_num(&note, "finalized_us");
+    assert!(
+        (1..=side_num(&note, "chart_us")).contains(&finalized),
+        "{note}"
+    );
+    assert!(side_num(&note, "events") >= 1, "{note}");
+    assert_ne!(side_num(&side("start"), "frame"), side_num(&note, "frame"));
 }
 
 /// `play --dev-headless --dev-size` writes its frames at that size.
@@ -744,6 +742,206 @@ fn a_headless_play_takes_a_size() {
         seen += 1;
     }
     assert!(seen > 0);
+}
+
+/// `key` of a sidecar's JSON, as written.
+fn side_value(side: &str, key: &str) -> String {
+    let rest = side
+        .split(&format!("\"{key}\":"))
+        .nth(1)
+        .unwrap_or_else(|| panic!("no {key}: {side}"));
+    rest.split([',', '}'])
+        .next()
+        .unwrap()
+        .trim_matches('"')
+        .to_owned()
+}
+
+/// A number of a sidecar's JSON.
+fn side_num(side: &str, key: &str) -> i64 {
+    side_value(side, key)
+        .parse()
+        .unwrap_or_else(|_| panic!("{key} in {side}"))
+}
+
+/// A READY capture in a practice round runs on that round's READY: its
+/// lead-in of other than a second and its start at any chart time, at
+/// chart time past 0 too, its elapsed time counted from its own origin.
+#[test]
+fn a_ready_capture_follows_a_practices_lead_in_and_start() {
+    for (from, start) in [(1_i64, 0_i64), (2, 2_000_000)] {
+        let fx = Fixture::new();
+        write_chart(&fx.library(), "a", "譜面A");
+        let key7 = bms_parser::load_bms(
+            b"#BPM 120\n#00119:0000000000010000\n",
+            &fx.base,
+            &Default::default(),
+        )
+        .unwrap()
+        .chart;
+        write_log(
+            &fx.base.join("logs").join("k7.tprl"),
+            &hits(&key7, |_| true),
+            1,
+        );
+        let practice = format!(
+            "practice = {{ path = \"library/a/a.bms\", from = {from}, to = 2, speed = 100, \
+             lead_in_ms = 2000, gauge = 20, repeat = true, input = \"logs/k7.tprl\", rounds = 1 }}"
+        );
+        let (out, stdout, stderr) = fx.run(&scenario(&[
+            "select = { path = \"library/a/a.bms\" }",
+            "play = { input = \"auto\", until = \"end\" }",
+            "result = \"back\"",
+            "capture = { ready_at = 1500, file = \"r.png\" }",
+            &practice,
+            "quit = {}",
+        ]));
+        assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+        let side = fs::read_to_string(fx.base.join("out").join("r.json")).unwrap();
+        assert_eq!(side_value(&side, "phase"), "ready", "{side}");
+        assert_eq!(
+            side_num(&side, "ready_origin_us"),
+            start - 2_000_000,
+            "{side}"
+        );
+        assert_eq!(side_num(&side, "play_at_us"), start, "{side}");
+        let elapsed = side_num(&side, "ready_us");
+        assert!((1_500_000..2_000_000).contains(&elapsed), "{side}");
+        assert_eq!(
+            elapsed,
+            side_num(&side, "chart_us") - (start - 2_000_000),
+            "{side}"
+        );
+    }
+}
+
+/// A frame of the audio tail says so, its chart time past the end of
+/// evaluation; `completed_us` names when the frame's drawing ended.
+#[test]
+fn a_tail_frames_sidecar_says_tail() {
+    let fx = Fixture::new();
+    write_tail_chart(&fx.library());
+    let (out, stdout, stderr) = fx.run(&scenario(&[
+        "capture = { at = 1000, file = \"play.png\" }",
+        "capture = { at = 4500, file = \"tail.png\" }",
+        "select = { path = \"library/tail/tail.bms\" }",
+        "play = { input = \"auto\", until = \"end\" }",
+        "result = \"back\"",
+        "quit = {}",
+    ]));
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+    let read = |n: &str| fs::read_to_string(fx.base.join("out").join(n)).unwrap();
+    assert_eq!(side_value(&read("play.json"), "phase"), "play");
+    let tail = read("tail.json");
+    assert_eq!(side_value(&tail, "phase"), "tail", "{tail}");
+    assert!(side_num(&tail, "completed_us") > 0, "{tail}");
+}
+
+/// A frame of Closing says so: a log that presses nothing fails the HAZARD
+/// gauge at its first miss, and Closing lasts at least a second.
+#[test]
+fn a_closing_frames_sidecar_says_closing() {
+    let fx = Fixture::new();
+    write_chart(&fx.library(), "a", "譜面A");
+    write_log(&fx.base.join("logs").join("none.tprl"), &[], 1);
+    fs::create_dir_all(fx.data()).unwrap();
+    fs::write(
+        fx.data().join("player.toml"),
+        "displayed_gauge = 5\non_failure = \"close\"\n",
+    )
+    .unwrap();
+    let (out, stdout, stderr) = fx.run(&scenario(&[
+        "capture = { at = 2800, file = \"c.png\" }",
+        "select = { path = \"library/a/a.bms\" }",
+        "play = { input = \"logs/none.tprl\", until = \"end\" }",
+        "result = \"back\"",
+        "quit = {}",
+    ]));
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+    let side = fs::read_to_string(fx.base.join("out").join("c.json")).unwrap();
+    assert_eq!(side_value(&side, "phase"), "closing", "{side}");
+}
+
+/// A loading capture says where on its loading axis it was sampled: the
+/// origin and the elapsed time agree, and the completion time comes later.
+/// The frame's settledness is said too.
+#[test]
+fn a_loading_frames_sidecar_has_its_sampled_time() {
+    let fx = Fixture::new();
+    write_chart(&fx.library(), "a", "譜面A");
+    let (out, stdout, stderr) = fx.run(&scenario(&[
+        "capture = { loading = true, file = \"l.png\" }",
+        "select = { path = \"library/a/a.bms\" }",
+        "play = { input = \"auto\", until = \"end\" }",
+        "result = \"back\"",
+        "quit = {}",
+    ]));
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+    let side = fs::read_to_string(fx.base.join("out").join("l.json")).unwrap();
+    let elapsed = side_num(&side, "loading_us");
+    let origin = side_num(&side, "loading_origin_us");
+    assert!(elapsed >= 0, "{side}");
+    assert!(origin > 0, "{side}");
+    assert!(
+        side_num(&side, "completed_us") >= origin + elapsed,
+        "{side}"
+    );
+    assert!(
+        ["true", "false"].contains(&side_value(&side, "settled").as_str()),
+        "{side}"
+    );
+}
+
+/// A file taken by a folder on a capture's sidecar fails the run, its PNG
+/// written or not.
+#[test]
+fn a_sidecar_that_cannot_be_written_exits_one() {
+    let fx = Fixture::new();
+    write_chart(&fx.library(), "a", "譜面A");
+    let mut child = fx
+        .command(&scenario(&[
+            "capture = { at = 0, file = \"a.png\" }",
+            "select = { path = \"library/a/a.bms\" }",
+            "play = { input = \"auto\", until = \"end\" }",
+            "result = \"back\"",
+            "quit = {}",
+        ]))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let target = fx.base.join("out").join("a.json");
+    let mut stdout = String::new();
+    for line in BufReader::new(child.stdout.take().unwrap()).lines() {
+        let line = line.unwrap();
+        if line == "dev: scenario: step 2 (select)" {
+            fs::create_dir(&target).unwrap();
+        }
+        stdout.push_str(&line);
+        stdout.push('\n');
+    }
+    let out = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stdout}\n{stderr}");
+    assert!(stderr.contains("a.png"), "{stderr}");
+}
+
+/// Without a `size`, frames keep the default offscreen target.
+#[test]
+fn a_scenario_without_a_size_captures_at_the_default() {
+    let fx = Fixture::new();
+    write_chart(&fx.library(), "a", "譜面A");
+    let (out, stdout, stderr) = fx.run(&scenario(&[
+        "capture = { at = 0, file = \"a.png\" }",
+        "select = { path = \"library/a/a.bms\" }",
+        "play = { input = \"auto\", until = \"end\" }",
+        "result = \"back\"",
+        "quit = {}",
+    ]));
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+    let png = fs::read(fx.base.join("out").join("a.png")).unwrap();
+    assert_eq!(u32::from_be_bytes(png[16..20].try_into().unwrap()), 1280);
+    assert_eq!(u32::from_be_bytes(png[20..24].try_into().unwrap()), 720);
 }
 
 /// A READY capture past READY's end fails the run rather than show play.

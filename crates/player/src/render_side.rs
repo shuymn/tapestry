@@ -1766,6 +1766,8 @@ pub fn spawn(
                 presentation: None,
                 current: None,
                 #[cfg(feature = "dev-tools")]
+                ready: None,
+                #[cfg(feature = "dev-tools")]
                 menu_stats: crate::dev::MenuStats::default(),
                 #[cfg(feature = "dev-tools")]
                 loading_stats: crate::dev::MenuStats::default(),
@@ -2115,6 +2117,9 @@ struct Prepared {
     declarative: bool,
     /// The attempt's tempo and presentation epoch, current once committed.
     presentation: (game::AttemptTempo, u64),
+    /// The attempt's READY on the chart's axis (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    ready: (TimeUs, TimeUs),
 }
 
 struct Run {
@@ -2174,6 +2179,9 @@ struct Run {
     /// The committed attempt's tempo and presentation epoch, which its
     /// play frames project the snapshot with.
     current: Option<(game::AttemptTempo, u64)>,
+    /// The committed attempt's READY on the chart's axis (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    ready: Option<(TimeUs, TimeUs)>,
     /// The select screen's frames (dev-tools).
     #[cfg(feature = "dev-tools")]
     menu_stats: crate::dev::MenuStats,
@@ -2511,6 +2519,8 @@ impl Run {
             }
             #[cfg(feature = "dev-tools")]
             let mut view_stamp = None;
+            #[cfg(feature = "dev-tools")]
+            let mut loading_stamp = None;
             let drawn = match &mut mode {
                 Mode::Idle => continue,
                 Mode::Splash { pending } => {
@@ -2576,6 +2586,10 @@ impl Run {
                             generation: view.generation,
                             finalized: view.finalized,
                             events: view.events,
+                            playing: view.playing,
+                            complete: view.complete,
+                            closing: view.closing,
+                            ready: self.ready,
                         });
                     }
                     // A rearmed READY candidate is drawn from its own origin,
@@ -2647,6 +2661,15 @@ impl Run {
                     let pending = loading_frame.is_some_and(|l| {
                         pending_presentation(&self.committed, self.specialized_in, l)
                     });
+                    let sampled = self.clock.now();
+                    #[cfg(feature = "dev-tools")]
+                    {
+                        loading_stamp = loading_frame.map(|_| crate::measure::LoadingStamp {
+                            sampled,
+                            origin: update.as_deref().map_or(sampled, |u| u.origin),
+                            settled: !pending,
+                        });
+                    }
                     let drawn = if pending {
                         // No specialization committed in this lifetime:
                         // the load's lines on a cleared canvas.
@@ -2655,7 +2678,7 @@ impl Run {
                         let snapshot = self.presentation.as_mut().map(|r| *r.read());
                         let frame = loading_frame_of(
                             lifetime,
-                            self.clock.now(),
+                            sampled,
                             update.as_deref(),
                             snapshot.as_ref(),
                         );
@@ -2722,6 +2745,8 @@ impl Run {
                         play,
                         #[cfg(feature = "dev-tools")]
                         view: view_stamp,
+                        #[cfg(feature = "dev-tools")]
+                        loading_stamp,
                         // The measured play's: none once its figures are
                         // taken, so no frame after a `Finish` is its.
                         #[cfg(feature = "dev-tools")]
@@ -2903,6 +2928,8 @@ impl Run {
                 },
                 declarative: p.skin.is_some(),
                 presentation: (p.attempt.tempo().clone(), p.attempt.epoch()),
+                #[cfg(feature = "dev-tools")]
+                ready: p.attempt.ready(),
             });
         }
         if answer.is_err() {
@@ -2982,6 +3009,10 @@ impl Run {
             .get(ScreenKind::Play)
             .and_then(|i| i.bundle().skin().close());
         self.current = Some(p.presentation);
+        #[cfg(feature = "dev-tools")]
+        {
+            self.ready = Some(p.ready);
+        }
         commits.committed = request;
         commits.receipt = Receipt { request, close };
         Ok(close)
@@ -5207,6 +5238,85 @@ pub(crate) mod tests {
             let expected = u32::from(now.0 < -9_000_000);
             assert_eq!(rearms, expected, "a frame at {now:?}");
         }
+    }
+
+    /// A READY capture belongs to its attempt's first candidate: a real
+    /// rearm into the capture's window fails it, and no frame of the next
+    /// candidate satisfies it.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn a_ready_capture_fails_when_its_candidate_is_rearmed() {
+        use crate::dev::scenario::{Axis, CaptureState, Captures, ScenarioFrames};
+
+        let chart = ChartBuilder::new(120_000)
+            .tap(Lane::new(1).unwrap(), TimeUs(60_000_000))
+            .build()
+            .unwrap();
+        let (rule, device) = (rules::tapestry(), DeviceProfile::default());
+        let (mut logic, side) = Logic::<SourceReader>::new(
+            &chart,
+            &rule,
+            &device,
+            &InputStart::default(),
+            Vec::new(),
+            LogicConfig {
+                inputs: 0,
+                effects: 16,
+            },
+            Vec::new(),
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let taken = dir.path().join("r.png");
+        let captures = Captures::of(vec![(TimeUs(0), taken.clone())]);
+        captures.set_axis(0, Axis::Ready(TimeUs(500_000)));
+        captures.arm(0);
+        captures.bind(1);
+        let frames = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let noted = Arc::clone(&frames);
+        let make: MakeScreen = Box::new(move || {
+            Ok(Box::new(RearmedFrames {
+                frames: Arc::clone(&noted),
+                rearms: 0,
+            }) as Box<dyn Screen>)
+        });
+        let clock = QpcClock::start();
+        let shared_chart = Arc::new(chart.clone());
+        let link = spawn(
+            make,
+            Some(Arc::clone(&shared_chart)),
+            None,
+            clock,
+            view(),
+            measure(clock),
+            Box::new(ScenarioFrames::new(captures.clone())),
+        )
+        .unwrap();
+        let ready = link.prepare_attempt(attempt(&shared_chart, None), || false);
+        assert_eq!(ready.unwrap(), Preparation::Ready);
+        // Long before READY's window, so the first candidate's frames do
+        // not satisfy it.
+        link.send(RenderMsg::Play {
+            side,
+            gauge: 0,
+            measure: play_measure(TimeUs(clock.now().0 + 60_000_000)),
+        });
+        assert!(wait_until(|| frames.lock().unwrap().len() >= 2));
+        assert_eq!(captures.states()[0], CaptureState::Bound(1));
+        // The next candidate's chart time 0 lies inside the capture's
+        // window: the bug takes its frame.
+        logic.rearm(&InputStart::default(), TimeUs(clock.now().0 + 300_000));
+        assert!(wait_until(|| !matches!(
+            captures.states()[0],
+            CaptureState::Bound(1) | CaptureState::Saving(1)
+        )));
+        let _ = link.finish(clock.now());
+        link.exit();
+        match &captures.states()[0] {
+            CaptureState::Failed(why) => assert!(why.contains("rearmed"), "{why}"),
+            other => panic!("{other:?}"),
+        }
+        assert!(!taken.exists());
     }
 
     /// A refused frame stops the attempt without dropping the screen: it
