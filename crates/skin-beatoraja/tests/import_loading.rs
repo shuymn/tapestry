@@ -34,6 +34,27 @@ fn of_width(rects: &[[i32; 4]], w: i32) -> Option<[i32; 4]> {
     rects.iter().copied().find(|r| r[2] == w)
 }
 
+/// The play level is the chosen chart's while loading: its digits follow
+/// the frame's level, draw nothing without one, whatever a frame gave
+/// before, and a condition on it reads false without one rather than
+/// inverted.
+#[test]
+fn the_play_level_follows_the_frames_chosen_chart() {
+    let body = r#""value": [{"id": "v", "src": "n", "w": 120, "h": 20, "divx": 10, "digit": 4,
+                             "ref": 96}],
+                  "destination": [{"id": "v", "dst": [{"w": 12, "h": 20}]}]"#;
+    let mut l = import_body(body).loading();
+    assert_eq!(l.frame(0).len(), 0);
+    l.play_level = Some(12);
+    assert_eq!(l.frame(1).len(), 2);
+    l.play_level = Some(7);
+    assert_eq!(l.frame(2).len(), 1);
+    l.play_level = None;
+    assert_eq!(l.frame(3).len(), 0);
+    l.play_level = Some(i32::MAX);
+    assert_eq!(l.frame(4).len(), 0);
+}
+
 /// Untimed destinations and image cycles draw while loading, from the
 /// loading state's origin, while those on an explicit `ready` (40) stay
 /// absent; a play runs them again from `ready`'s start, READY's

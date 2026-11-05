@@ -1683,6 +1683,7 @@ fn build_does_not_allocate() {
         last_note_end: TimeUs(0),
         bpm_range: None,
         bpm_whole_change: None,
+        play_level: None,
     };
     let round = Section {
         start: TimeUs(30_000 * MS),
@@ -1986,6 +1987,7 @@ fn build_does_not_allocate() {
             lanes: views.lanes[0],
             covers: readouts_for(views.lanes[0]).covers,
             gauge: None,
+            play_level: None,
         };
         bitmap
             .build_loading(&mut loading, &frame, &uvs, &mut batch)
@@ -2022,6 +2024,7 @@ fn loading_frame<'a>(
         lanes: view,
         covers: readouts_for(view).covers,
         gauge: (no % 3 != 2).then(|| LoadingGauge::of(no % 2, &descs[no % 2])),
+        play_level: None,
     }
 }
 
@@ -3564,6 +3567,7 @@ fn readouts_do_not_allocate(loaded: &Loaded, descs: &[GaugeDesc]) {
             max_x100: 15_000,
         }),
         bpm_whole_change: None,
+        play_level: None,
     };
     let round = PlayContext {
         attempt: Attempt::Section(&section),

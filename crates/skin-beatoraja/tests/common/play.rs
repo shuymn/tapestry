@@ -209,6 +209,7 @@ fn context_with(
         last_note_end: NO_END,
         bpm_range,
         bpm_whole_change,
+        play_level: None,
     }
 }
 
@@ -269,6 +270,18 @@ impl Drawn {
         Self::over_with(skin, chart, None, None)
     }
 
+    /// `skin` played over `chart` whose play level is `play_level`.
+    pub fn over_level(skin: Skin, chart: &bms_model::Chart, play_level: Option<i32>) -> Self {
+        Self::over_context(
+            skin,
+            chart,
+            &PlayContext {
+                play_level,
+                ..context_with(None, None)
+            },
+        )
+    }
+
     /// `skin` played over `chart` whose BPM range is `bpm_range` and
     /// BPM-change fact `bpm_whole_change`.
     pub fn over_with(
@@ -277,13 +290,17 @@ impl Drawn {
         bpm_range: Option<BpmRange>,
         bpm_whole_change: Option<bool>,
     ) -> Self {
+        Self::over_context(skin, chart, &context_with(bpm_range, bpm_whole_change))
+    }
+
+    /// `skin` played over `chart` with the context `ctx`.
+    fn over_context(skin: Skin, chart: &bms_model::Chart, ctx: &PlayContext<'_>) -> Self {
         let uvs = skin
             .atlas(Variant::Lo, LIMITS, &|| false)
             .unwrap()
             .into_parts()
             .1;
-        let ctx = context_with(bpm_range, bpm_whole_change);
-        let play = skin.prepare(chart, &ctx).unwrap();
+        let play = skin.prepare(chart, ctx).unwrap();
         let batch = QuadBatch::with_capacity(skin.quad_capacity(), skin.run_capacity());
         Self {
             skin,
@@ -448,6 +465,8 @@ pub struct Loader {
     pub batch: QuadBatch,
     /// The descriptor each frame gives: by default the drawn play's gauge.
     pub gauge: Option<LoadingGauge>,
+    /// The chosen chart's play level each frame gives: by default none.
+    pub play_level: Option<i32>,
     pub percent: i32,
     /// Whether the stored covers are being adjusted: START or SELECT held.
     pub adjusting: bool,
@@ -468,6 +487,7 @@ impl Loader {
             loading,
             batch,
             gauge: Some(LoadingGauge::of(0, &GAUGES[0])),
+            play_level: None,
             percent: 0,
             adjusting: false,
         }
@@ -490,6 +510,7 @@ impl Loader {
             lanes: view,
             covers,
             gauge: self.gauge,
+            play_level: self.play_level,
         };
         self.skin
             .build_loading(&mut self.loading, &frame, &self.uvs, &mut self.batch)

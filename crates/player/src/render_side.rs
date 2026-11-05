@@ -1851,9 +1851,15 @@ fn loading_frame_of(
             skin_model::FrameReadouts::UNAVAILABLE.covers,
         ),
     };
-    let (since, percent, gauge, text) = match update {
-        Some(u) => (u.origin, i32::from(u.percent), u.gauge, u.revision),
-        None => (now, 0, None, 0),
+    let (since, percent, gauge, play_level, text) = match update {
+        Some(u) => (
+            u.origin,
+            i32::from(u.percent),
+            u.gauge,
+            u.chart.play_level,
+            u.revision,
+        ),
+        None => (now, 0, None, None, 0),
     };
     LoadingFrame {
         lifetime,
@@ -1865,6 +1871,7 @@ fn loading_frame_of(
         lanes,
         covers,
         gauge,
+        play_level,
         text,
     }
 }
@@ -7477,6 +7484,30 @@ pub(crate) mod tests {
         assert!(wait_until(|| skin() >= s + 3));
         link.end_loading().unwrap();
         link.exit();
+    }
+
+    /// A loading frame's play level is its lifetime's chosen chart's: the
+    /// published state's, none before a publication, and none in a next
+    /// lifetime whose chart has no entry, whatever came before.
+    #[test]
+    fn a_loading_frame_reads_only_its_lifetimes_play_level() {
+        let update = |lifetime, play_level| {
+            let text = LoadingText {
+                chart: ChosenChart {
+                    play_level,
+                    ..ChosenChart::default()
+                },
+                ..LoadingText::default()
+            };
+            crate::loading_state::LifetimeState::new(lifetime, TimeUs(0), &text, None)
+                .apply(LoadInput::Stage(Stage::Chart))
+        };
+        let level = |lifetime, u: Option<&LoadingUpdate>| {
+            super::loading_frame_of(lifetime, TimeUs(1_000), u, None).play_level
+        };
+        assert_eq!(level(1, None), None);
+        assert_eq!(level(1, Some(&update(1, Some(12)))), Some(12));
+        assert_eq!(level(2, Some(&update(2, None))), None);
     }
 
     /// Counts the frames the render thread finished.

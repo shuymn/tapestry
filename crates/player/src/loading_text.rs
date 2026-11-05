@@ -98,6 +98,9 @@ pub struct ChosenChart {
     pub subartist: Option<String>,
     /// `#GENRE`.
     pub genre: Option<String>,
+    /// The play level its `#PLAYLEVEL` gives ([`level_of`](crate::imports::facts::level_of)):
+    /// known once the entry is, a missing header 0, as an attempt's is.
+    pub play_level: Option<i32>,
 }
 
 /// The chart being loaded, as its lines name it.

@@ -393,6 +393,7 @@ pub fn draw(imported: &Imported, seed: &[u8]) -> Vec<usize> {
         last_note_end: TimeUs(0),
         bpm_range: None,
         bpm_whole_change: None,
+        play_level: None,
     };
     let mut play = skin
         .prepare(&chart, &ctx)
@@ -675,6 +676,7 @@ fn gauge_probes(
             last_note_end: TimeUs(0),
             bpm_range: None,
             bpm_whole_change: None,
+            play_level: None,
         };
         let mut play = skin
             .prepare(chart, &ctx)
@@ -759,6 +761,7 @@ pub fn judged_rects(imported: &Imported, full: bool) -> Vec<[f32; 4]> {
         last_note_end: TimeUs(0),
         bpm_range: None,
         bpm_whole_change: None,
+        play_level: None,
     };
     let mut play = skin
         .prepare(&chart, &ctx)
@@ -1010,6 +1013,7 @@ fn loading_probes(
             lanes,
             covers: readouts_for(lanes).covers,
             gauge,
+            play_level: None,
         };
         skin.build_loading(&mut loading, &frame, uvs, batch)
             .expect("the loading frame builds");
@@ -1027,6 +1031,7 @@ fn loading_probes(
         lanes: LANES_OFF,
         covers: readouts_for(LANES_OFF).covers,
         gauge: Some(normal),
+        play_level: None,
     };
     frame.covers.cover = 500;
     assert_eq!(
@@ -1325,6 +1330,7 @@ fn choice_probes(
         last_note_end: TimeUs(0),
         bpm_range: None,
         bpm_whole_change: None,
+        play_level: None,
     };
     let mut play = skin
         .prepare(chart, &ctx)
@@ -1433,6 +1439,7 @@ fn rate_and_kind_probes(
             last_note_end: TimeUs(0),
             bpm_range: None,
             bpm_whole_change: None,
+            play_level: None,
         };
         let mut play = skin
             .prepare(chart, &ctx)
@@ -1707,6 +1714,7 @@ fn readout_probes(
             last_note_end: TimeUs(0),
             bpm_range: range,
             bpm_whole_change: None,
+            play_level: None,
         };
         let mut play = skin
             .prepare(chart, &ctx)

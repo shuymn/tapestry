@@ -918,8 +918,15 @@ mod tests {
             artist: Some("a".to_owned()),
             subartist: None,
             genre: Some("g".to_owned()),
+            play_level: Some(12),
         };
         assert_eq!(fields_changed(&chart, &chart.clone()), TextSlots::NONE);
+        // The play level is no text: it names no slot.
+        let level = ChosenChart {
+            play_level: None,
+            ..chart.clone()
+        };
+        assert_eq!(fields_changed(&chart, &level), TextSlots::NONE);
         let artist = ChosenChart {
             artist: Some("b".to_owned()),
             ..chart.clone()

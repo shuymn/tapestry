@@ -1010,6 +1010,21 @@ fn cancelled(controls: &crate::controls::Controls) -> bool {
     controls.quitting() || controls.leaving()
 }
 
+/// What a loading frame may show of a chart, from its library entry's
+/// `header`.
+fn chosen_chart(h: &library::Header) -> ChosenChart {
+    ChosenChart {
+        title: h.title.clone(),
+        subtitle: h.subtitle.clone(),
+        artist: h.artist.clone(),
+        subartist: h.subartist.clone(),
+        genre: h.genre.clone(),
+        play_level: Some(crate::imports::facts::level_of(
+            h.playlevel.as_deref().unwrap_or_default(),
+        )),
+    }
+}
+
 /// Shows the load's lines of `page` at `stage` on the play screen, and
 /// says so on the console; nothing without them.
 pub(crate) fn show_stage(render: &RenderLink, page: Option<&LoadingText>, stage: Stage) {
@@ -1547,13 +1562,7 @@ impl AppRig for PlayerRig<'_> {
             artist: header.and_then(|h| h.artist.clone()).unwrap_or_default(),
             preset: sel.screen.preset().to_owned(),
             practice: sel.practicing,
-            chart: header.map_or_else(ChosenChart::default, |h| ChosenChart {
-                title: h.title.clone(),
-                subtitle: h.subtitle.clone(),
-                artist: h.artist.clone(),
-                subartist: h.subartist.clone(),
-                genre: h.genre.clone(),
-            }),
+            chart: header.map_or_else(ChosenChart::default, chosen_chart),
         };
         println!("load: the play screen loads {}", file_name(chart));
         let gauge = sel
@@ -2008,10 +2017,27 @@ mod tests {
     use bms_model::TimeUs;
     use game::DataRoot;
 
-    use super::Selection;
+    use super::{Selection, chosen_chart};
     use crate::result_input::{Pad, ResultInput};
     use crate::select::{MenuInput, MenuKey, MenuQueue, SelectScreen};
     use crate::shelf::{Shelf, open};
+
+    /// A chosen chart's level is its library entry's `#PLAYLEVEL`, parsed as
+    /// an attempt's is: a missing or unreadable one a known 0.
+    #[test]
+    fn the_chosen_charts_level_comes_from_its_entry() {
+        let level = |text: Option<&str>| {
+            chosen_chart(&library::Header {
+                playlevel: text.map(str::to_owned),
+                ..library::Header::default()
+            })
+            .play_level
+        };
+        assert_eq!(level(Some("12")), Some(12));
+        assert_eq!(level(Some("１２")), Some(12));
+        assert_eq!(level(Some("12+")), Some(0));
+        assert_eq!(level(None), Some(0));
+    }
 
     /// A healthy screen whose first loading frame comes after the hold's
     /// time, then one every 40 ms: the hold goes on until its reported
