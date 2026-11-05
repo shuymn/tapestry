@@ -284,44 +284,62 @@ pub(crate) enum Cond {
     Undefined(i32),
 }
 
-/// The shown gauge's kind is one of `kinds`, while it has one.
-fn gauge_kind(kinds: &[&str]) -> String {
-    let mut src = String::from("gauge.valid && (");
-    for (i, k) in kinds.iter().enumerate() {
-        if i > 0 {
-            src.push_str(" || ");
+/// A built-in's model expression, described without building it.
+#[derive(Clone, Copy)]
+enum Body {
+    /// The gauge's whole tens of percent `k`.
+    Range(i32),
+    Text(&'static str),
+    /// The shown gauge's kind is one of these, while it has one.
+    Kinds(&'static [&'static str]),
+}
+
+impl Body {
+    /// Writes the expression to `out`.
+    fn write(self, out: &mut String) {
+        match self {
+            Self::Range(k) => {
+                let _ = std::fmt::Write::write_fmt(
+                    out,
+                    format_args!("gauge >= {} && gauge < {}", 100 * k, 100 * (k + 1)),
+                );
+            }
+            Self::Text(s) => out.push_str(s),
+            Self::Kinds(kinds) => {
+                out.push_str("gauge.valid && (");
+                for (i, k) in kinds.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(" || ");
+                    }
+                    out.push_str("gauge.kind == ");
+                    out.push_str(k);
+                }
+                out.push(')');
+            }
         }
-        src.push_str("gauge.kind == ");
-        src.push_str(k);
     }
-    src.push(')');
-    src
 }
 
 /// The model expression of supported built-in `id` (positive), and
 /// whether it is D4.
-fn builtin(id: i32) -> Option<(String, bool)> {
-    match id {
-        GAUGE_RANGE..=240 => {
-            let k = id - GAUGE_RANGE;
-            let src = format!("gauge >= {} && gauge < {}", 100 * k, 100 * (k + 1));
-            Some((src, false))
-        }
-        JUDGE_PERFECT => Some(("on(judge.perfect)".to_owned(), false)),
-        GAUGE_GROOVE => Some((gauge_kind(&["assist_easy", "easy", "normal"]), true)),
-        GAUGE_HARD => Some((gauge_kind(&["hard", "ex_hard", "hazard"]), true)),
-        GAUGE_EX => Some((
-            gauge_kind(&["assist_easy", "easy", "ex_hard", "hazard"]),
+fn builtin(id: i32) -> Option<(Body, bool)> {
+    Some(match id {
+        GAUGE_RANGE..=240 => (Body::Range(id - GAUGE_RANGE), false),
+        JUDGE_PERFECT => (Body::Text("on(judge.perfect)"), false),
+        GAUGE_GROOVE => (Body::Kinds(&["assist_easy", "easy", "normal"]), true),
+        GAUGE_HARD => (Body::Kinds(&["hard", "ex_hard", "hazard"]), true),
+        GAUGE_EX => (
+            Body::Kinds(&["assist_easy", "easy", "ex_hard", "hazard"]),
             true,
-        )),
-        COVER_CHANGING => Some(("cover.adjusting".to_owned(), false)),
-        COVER_ON => Some(("cover.enabled".to_owned(), false)),
-        LIFT_ON => Some(("lift.enabled".to_owned(), false)),
-        HIDDEN_ON => Some(("hidden.enabled".to_owned(), false)),
-        CHART_NO_BPM_CHANGE => Some(("bpm.change_valid && !bpm.change".to_owned(), true)),
-        CHART_BPM_CHANGE => Some(("bpm.change".to_owned(), true)),
-        _ => None,
-    }
+        ),
+        COVER_CHANGING => (Body::Text("cover.adjusting"), false),
+        COVER_ON => (Body::Text("cover.enabled"), false),
+        LIFT_ON => (Body::Text("lift.enabled"), false),
+        HIDDEN_ON => (Body::Text("hidden.enabled"), false),
+        CHART_NO_BPM_CHANGE => (Body::Text("bpm.change_valid && !bpm.change"), true),
+        CHART_BPM_CHANGE => (Body::Text("bpm.change"), true),
+        _ => return None,
+    })
 }
 
 /// Whether `id` (positive) is a built-in boolean property.
@@ -333,22 +351,33 @@ pub(crate) fn is_builtin(id: i32) -> bool {
         || (PRACTICE_ITEM_SELECTED..PRACTICE_ITEM_SELECTED + PRACTICE_ITEMS).contains(&id)
 }
 
-/// A built-in, negated for `negative`. The latest judgment's PERFECT
-/// reads the judgment state whichever widget draws it, where the source
-/// reads it from a judge region its judge widget makes
-/// (`JudgeManager.java:129, 686`).
+/// A built-in, negated for `negative`, built in one allocation of
+/// [`MAX_COND_BYTES`]. The latest judgment's PERFECT reads the judgment
+/// state whichever widget draws it, where the source reads it from a
+/// judge region its judge widget makes (`JudgeManager.java:129, 686`).
 fn built_in_cond(id: i32, negative: bool) -> Cond {
     match builtin(id) {
-        Some((e, display_deviation)) => Cond::Expr {
-            src: if negative { format!("!({e})") } else { e },
-            display_deviation,
-        },
+        Some((body, display_deviation)) => {
+            let mut src = String::with_capacity(MAX_COND_BYTES);
+            if negative {
+                src.push_str("!(");
+            }
+            body.write(&mut src);
+            if negative {
+                src.push(')');
+            }
+            Cond::Expr {
+                src,
+                display_deviation,
+            }
+        }
         None => Cond::Unsupported(if negative { -id } else { id }),
     }
 }
 
-/// The most bytes a built-in's condition ([`numeric`]) holds, negation
-/// included: what a caller charges before it is built.
+/// The bytes a built-in's condition ([`numeric`]) is built in, its
+/// negation included, in one allocation: what a caller charges before it
+/// is built.
 pub(crate) const MAX_COND_BYTES: usize = 128;
 
 /// Numeric op `op` (non-zero): built-ins first, then the declared items
@@ -399,17 +428,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn every_built_in_condition_fits_its_bound() {
+    fn every_built_in_condition_is_built_once_within_its_bound() {
+        // The whole registry, both signs: each condition is made in one
+        // allocation of the bound its caller charges, never grown, so the
+        // bytes materialized are the bound's.
         let none = BTreeMap::new();
-        let mut longest = 0;
-        for id in 1..=PRACTICE_ITEM_SELECTED + PRACTICE_ITEMS {
+        let ids = KNOWN_BOOLEAN_IDS
+            .iter()
+            .map(|&(id, _)| id)
+            .chain(PRACTICE_ITEM..PRACTICE_ITEM + PRACTICE_ITEMS)
+            .chain(PRACTICE_ITEM_SELECTED..PRACTICE_ITEM_SELECTED + PRACTICE_ITEMS);
+        let mut built = 0;
+        for id in ids {
             for op in [id, -id] {
                 if let Cond::Expr { src, .. } = numeric(op, &none) {
-                    longest = longest.max(src.len());
+                    assert!(src.len() <= MAX_COND_BYTES, "{op}: {}", src.len());
+                    assert_eq!(src.capacity(), MAX_COND_BYTES, "{op}: grown or reallocated");
+                    built += 1;
                 }
             }
         }
-        assert!(longest > 0 && longest <= MAX_COND_BYTES, "{longest}");
+        assert!(built > 0);
     }
 
     /// Every id of the factory's `BooleanType` entries at `0.8.9`, the
