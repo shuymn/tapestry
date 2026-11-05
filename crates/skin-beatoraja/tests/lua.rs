@@ -2376,6 +2376,14 @@ fn a_lua_cell_no_atlas_page_holds_drops_its_element_alone() {
     assert_eq!(kinds(&r), [NoteKind::CellTooLarge { w: 8_177, h: 2 }]);
     assert_eq!(r.imported.report.notes[0].severity, Severity::Dropped);
     assert_eq!(r.imported.report.usage.files, 1);
+    // The fitting frames are what remains, drawn from a built atlas.
+    let skin = r.imported.skin;
+    let limits = common::play::LIMITS;
+    assert!(
+        skin.atlas(skin_model::Variant::Lo, limits, &|| false)
+            .is_ok()
+    );
+    assert_eq!(common::play::Drawn::new(skin, 10).frame(0, &[]).len(), 1);
 }
 
 /// `json`, a JSON value of objects, arrays, strings and numbers, as a

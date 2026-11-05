@@ -322,6 +322,26 @@ impl SheetBuilder {
     /// would have had.
     pub fn add_image(&mut self, def: ImageDef) -> Result<u32, ImageError> {
         let image = self.images.len();
+        let (rect, cell) = self.checked_cut(&def)?;
+        let drawn = push_frames(&def, rect, cell, &mut self.cell_ids, &mut self.frames);
+        self.images.push(drawn);
+        u32::try_from(image).map_err(|_| ImageError::TooManyImages { n: image + 1 })
+    }
+
+    /// Makes every check of [`add_image`](Self::add_image) for `def` as
+    /// the next image, adding nothing, and returns the cell it would cut in
+    /// its file's 1x version.
+    ///
+    /// # Errors
+    ///
+    /// As [`add_image`](Self::add_image).
+    pub fn check_image(&self, def: &ImageDef) -> Result<[u32; 2], ImageError> {
+        self.checked_cut(def).map(|(_, cell)| cell)
+    }
+
+    /// [`Self::check_image`]'s checks, and the rectangle and cell they cut.
+    fn checked_cut(&self, def: &ImageDef) -> Result<([u32; 4], [u32; 2]), ImageError> {
+        let image = self.images.len();
         if image >= MAX_IMAGES {
             return Err(ImageError::TooManyImages { n: image + 1 });
         }
@@ -331,27 +351,10 @@ impl SheetBuilder {
         else {
             return Err(ImageError::UnknownFile { image });
         };
-        check_cycle(image, &def)?;
-        let n = image_frames(image, &def)?;
+        check_cycle(image, def)?;
+        let n = image_frames(image, def)?;
         add_frames(self.frames.len(), n)?;
-        let (rect, cell) = cut(image, &def, file.lo.dims)?;
-        let drawn = push_frames(&def, rect, cell, &mut self.cell_ids, &mut self.frames);
-        self.images.push(drawn);
-        u32::try_from(image).map_err(|_| ImageError::TooManyImages { n: image + 1 })
-    }
-
-    /// The cell [`add_image`](Self::add_image) would cut from `def` in its
-    /// file's 1x version; `None` when it would refuse the file, the grid
-    /// or the cut.
-    #[must_use]
-    pub fn image_cell(&self, def: &ImageDef) -> Option<[u32; 2]> {
-        if def.grid.contains(&0) {
-            return None;
-        }
-        let file = usize::try_from(def.file)
-            .ok()
-            .and_then(|f| self.files.get(f))?;
-        cut(0, def, file.lo.dims).ok().map(|(_, cell)| cell)
+        cut(image, def, file.lo.dims)
     }
 
     /// Adds a generated image of one colour, returning its index. No file

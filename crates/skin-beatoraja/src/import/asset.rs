@@ -470,11 +470,22 @@ impl Assets {
         self.bases.get(&key).copied()
     }
 
+    /// Why the sheet would not take image `def` now, adding nothing. The
+    /// cell it admits, after an edge substitution and any crop in `def`,
+    /// must fit an atlas page; no import has an @2x file, so its 1x size is
+    /// the one an atlas reads.
+    pub(crate) fn check_image(&self, def: &ImageDef) -> Result<(), NotAdded> {
+        let [w, h] = self.builder.check_image(def).map_err(NotAdded::Image)?;
+        if cell_fits_page([w, h]) {
+            Ok(())
+        } else {
+            Err(NotAdded::CellTooLarge { w, h })
+        }
+    }
+
     /// Adds image `def` with cells of `cell` under `key`, its single
     /// frame cut to the rows of `crop` when there is one; returns the
-    /// image and its cell. The cell the sheet admits, after an edge
-    /// substitution and `crop`, must fit an atlas page; no import has an
-    /// @2x file, so its 1x size is the one an atlas reads.
+    /// image and its cell. Checked as [`Self::check_image`] says.
     pub(crate) fn add_image(
         &mut self,
         key: ImageKey,
@@ -492,11 +503,7 @@ impl Assets {
             ),
             _ => (def, cell),
         };
-        if let Some(admitted @ [w, h]) = self.builder.image_cell(&added)
-            && !cell_fits_page(admitted)
-        {
-            return Err(NotAdded::CellTooLarge { w, h });
-        }
+        self.check_image(&added)?;
         let i = self.builder.add_image(added).map_err(NotAdded::Image)?;
         self.bases.insert(key, (def, cell));
         self.images.insert((key, crop), (i, added_cell));
