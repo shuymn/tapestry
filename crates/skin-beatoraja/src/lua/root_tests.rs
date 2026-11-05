@@ -291,7 +291,7 @@ fn with_image(image: &str, dst: &str) -> String {
 }
 
 /// The read of an unmapped value property.
-const UNMAPPED: &str = "function() return ms.number(425) > 0 end";
+const UNMAPPED: &str = "function() return ms.number(426) > 0 end";
 
 #[test]
 fn an_op_function_is_a_condition_by_its_element_s_role() {
@@ -300,7 +300,7 @@ fn an_op_function_is_a_condition_by_its_element_s_role() {
     };
     let i = import(&skin("", &op("i", "function() return true end"))).unwrap();
     assert_eq!(i.callbacks, [Disposition::Lowered]);
-    let why = Unsupported::Unmapped { api: 1, id: 425 };
+    let why = Unsupported::Unmapped { api: 1, id: 426 };
     let i = import(&skin("", &op("i", UNMAPPED))).unwrap();
     assert_eq!(i.callbacks, [Disposition::Replaced(why)]);
     assert!(noted(&i, NoteKind::Callback { field: "op", why }));
@@ -372,27 +372,31 @@ fn a_string_or_choice_value_function_has_no_consumer_and_no_fallback() {
         }
     ));
     critical(import(&skin(text, &shown("timer = 3,"))), "value", consumer);
-    // An image set's value: by its role, which its reads also give.
+    // An image set's value that does not lower: by its role, which its
+    // reads also give, its reason kept, never its `ref`.
     let set = |f: &str| {
         format!(
             "skin.imageset = {{ {{ id = \"s\", ref = 10, images = {{ \"i\", \"i\" }}, value = {f} }} }}"
         )
     };
-    let consumer = Unsupported::Consumer("image set value");
+    let why = Unsupported::Type;
     let shown = "{ id = \"s\", dst = { { w = 64, h = 64 } } },";
-    let i = import(&skin(&set("function() return 1 end"), shown)).unwrap();
-    assert_eq!(i.callbacks, [Disposition::Replaced(consumer)]);
+    let i = import(&skin(&set("function() return \"x\" end"), shown)).unwrap();
+    assert_eq!(i.callbacks, [Disposition::Replaced(why)]);
     assert!(noted(
         &i,
         NoteKind::Callback {
             field: "value",
-            why: consumer
+            why
         }
     ));
     critical(
-        import(&skin(&set("function() return ms.number(101) end"), shown)),
+        import(&skin(
+            &set("function() local n = ms.number(101) return \"x\" end"),
+            shown,
+        )),
         "value",
-        consumer,
+        why,
     );
 }
 

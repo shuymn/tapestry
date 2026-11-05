@@ -25,6 +25,7 @@ use super::report::{NoteKind, Object, Span};
 use super::track::{self, Stretch};
 use super::{Common, Cx, Dst, Opts, Prop};
 use crate::error::ImportError;
+use crate::lua::residual::Conv;
 use image_choice::{Lowered, SetSelector};
 
 /// A track's keys baked against a cell, and the native size kept instead
@@ -553,20 +554,28 @@ impl Cx<'_> {
         let value = self.callback_prop(value, "value")?;
         let selector = image_choice::set_selector(&value, r);
         let (charged, lowered) = self.lowered(&dst)?;
-        let role = lowered.role(dst.failure);
-        // A function's value has no consumer, and it never falls back to
-        // `ref`: by its element's role and the part its reads show.
-        if let Prop::Callable(id) = value {
-            let role = self.callback_role(id, "value", role)?;
-            let why = self.unconsumed(role, id, "value", "image set value")?;
-            return self.drop_el(role, at, why);
-        }
-        let (src, deviates) = match selector {
-            SetSelector::Unsupported { why, .. } => {
-                return self.drop_el(role, at, why);
+        let mut role = lowered.role(dst.failure);
+        let (src, deviates) = if let Prop::Callable(id) = value {
+            // A function's value selects, its element's role joined by the
+            // part its reads show; it never falls back to `ref`.
+            role = self.callback_role(id, "value", role)?;
+            let Some(v) = self.value_callback(at, id, role, Conv::Index)? else {
+                return Ok(());
+            };
+            role = v.role;
+            let src = match v.guard {
+                Some(guard) => format!("if {guard} then {} else -1", v.expr),
+                None => v.expr,
+            };
+            (src, v.deviates)
+        } else {
+            match selector {
+                SetSelector::Unsupported { why, .. } => {
+                    return self.drop_el(role, at, why);
+                }
+                SetSelector::Null => ("0".to_owned(), false),
+                SetSelector::Expr { src, deviates, .. } => (src, deviates),
             }
-            SetSelector::Null => ("0".to_owned(), false),
-            SetSelector::Expr { src, deviates, .. } => (src, deviates),
         };
         if act.is_some() {
             self.ignored(at, NoteKind::Ignored { field: "act" });
@@ -574,7 +583,7 @@ impl Cx<'_> {
         if Stretch::of(dst.stretch) == Stretch::Trimmed {
             return self.drop_el(role, at, NoteKind::Stretch(dst.stretch));
         }
-        self.image_set_choices(dst, images, &src, deviates, charged, lowered)
+        self.image_set_choices(dst, images, &src, deviates, charged, (lowered, role))
     }
 }
 

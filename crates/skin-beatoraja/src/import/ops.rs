@@ -256,6 +256,13 @@ const GAUGE_EX: i32 = 1_046;
 /// as the adjustments' snapshot reads them; `lanecover1_on`, `lift1_on`
 /// and `hidden1_on`, the stored switches.
 const COVER_CHANGING: i32 = 270;
+/// `judge_great_exist` to `judge_poor_exist`
+/// (`BooleanPropertyFactory.java:554-561`): whether the count is above 0,
+/// the POOR's the scored POORs', without empty POORs.
+const GREAT_EXIST: i32 = 2_242;
+const GOOD_EXIST: i32 = 2_243;
+const BAD_EXIST: i32 = 2_244;
+const POOR_EXIST: i32 = 2_245;
 const COVER_ON: i32 = 271;
 const LIFT_ON: i32 = 272;
 const HIDDEN_ON: i32 = 273;
@@ -338,6 +345,10 @@ fn builtin(id: i32) -> Option<(Body, bool)> {
             Body::Kinds(&["assist_easy", "easy", "ex_hard", "hazard"]),
             true,
         ),
+        GREAT_EXIST => (Body::Text("count.great > 0"), false),
+        GOOD_EXIST => (Body::Text("count.good > 0"), false),
+        BAD_EXIST => (Body::Text("count.bad > 0"), false),
+        POOR_EXIST => (Body::Text("count.early.poor + count.late.poor > 0"), false),
         COVER_CHANGING => (Body::Text("cover.adjusting"), false),
         COVER_ON => (Body::Text("cover.enabled"), false),
         LIFT_ON => (Body::Text("lift.enabled"), false),
@@ -510,10 +521,10 @@ mod tests {
                 exprs.push(src);
             }
         }
-        assert_eq!(exprs.len(), 21);
+        assert_eq!(exprs.len(), 25);
         let joined: usize =
             exprs.iter().map(|e| e.len() + 2).sum::<usize>() + 4 * (exprs.len() - 1);
-        assert_eq!(joined, 880);
+        assert_eq!(joined, 996);
         // A number's availability joins them: the longest still fits.
         let guard = [
             "bpm.range_valid",
@@ -584,7 +595,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(exprs.len(), 42);
+        assert_eq!(exprs.len(), 50);
         let joined: usize =
             exprs.iter().map(|e| e.len() + 2).sum::<usize>() + 4 * (exprs.len() - 1);
         assert!(joined > skin_model::MAX_SOURCE_BYTES, "{joined}");

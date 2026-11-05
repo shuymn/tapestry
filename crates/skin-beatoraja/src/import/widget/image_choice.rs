@@ -277,9 +277,9 @@ impl Cx<'_> {
     /// An image set selecting by `src`: one entry per item of its
     /// `images` array, in order, repeats kept; a null item, an id no
     /// `image` record defines and a source proven missing are holes. It
-    /// is lowered as `lowered` says. Its images reach the sheet only once
-    /// every entry and its stretch are accepted, so a dropped set adds none:
-    /// images others use stay, each at its index.
+    /// is lowered as `lowered` says, with `role`, its value's reads joined. Its images reach the sheet
+    /// only once every entry and its stretch are accepted, so a dropped set
+    /// adds none: images others use stay, each at its index.
     pub(in super::super) fn image_set_choices(
         &mut self,
         dst: Dst,
@@ -287,10 +287,9 @@ impl Cx<'_> {
         src: &str,
         deviates: bool,
         charged: bool,
-        lowered: Lowered,
+        (lowered, role): (Lowered, Role),
     ) -> Result<(), ImportError> {
         let at = dst.span;
-        let role = lowered.role(dst.failure);
         let Some(list) = images else {
             self.ignored(at, NoteKind::Track(TrackWhy::NeverDrawn));
             return Ok(());

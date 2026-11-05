@@ -1285,3 +1285,94 @@ fn a_shown_survival_failure_closes_or_plays_to_the_end() {
         assert_eq!(record.session_policy, policy);
     }
 }
+
+/// The centre pixel of the 1280×720 capture at `path`.
+fn centre(path: &Path) -> [u8; 3] {
+    let mut reader = png::Decoder::new(BufReader::new(fs::File::open(path).unwrap()))
+        .read_info()
+        .unwrap();
+    let mut rgba = vec![0; reader.output_buffer_size().unwrap()];
+    let info = reader.next_frame(&mut rgba).unwrap();
+    let w = info.width as usize;
+    let i = (info.height as usize / 2 * w + w / 2) * 4;
+    [rgba[i], rgba[i + 1], rgba[i + 2]]
+}
+
+/// A play skin with a full-canvas image on the last note's timer, a read of
+/// the combo break its condition, opaque from 750 to 1250 ms on that timer:
+/// the shape of a skin's end-of-play image. A play ends with its audio, so
+/// the chart's BGM lasts through the capture: a miss has the image inside
+/// its window, a perfect play has none.
+#[test]
+fn a_missed_note_draws_the_finish_window() {
+    let fx = Fixture::new();
+    write_tail_chart(&fx.library());
+    let dir = fx.library().join("tail");
+    let text = "#PLAYER 1\n#TITLE finish\n#BPM 120\n#WAV01 key.wav\n#WAV02 bgm.wav\n\
+                #00138:01\n#00111:01000000\n#00101:02\n";
+    fs::write(dir.join("tail.bms"), text).unwrap();
+    let chart = bms_parser::load_bms(text.as_bytes(), &dir, &Default::default())
+        .unwrap()
+        .chart;
+    write_log(&fx.base.join("logs").join("miss.tprl"), &[], 1);
+    write_log(
+        &fx.base.join("logs").join("hit.tprl"),
+        &hits(&chart, |_| true),
+        1,
+    );
+    let skin = fx.base.join("skin");
+    fs::create_dir_all(&skin).unwrap();
+    let file = fs::File::create(skin.join("blue.png")).unwrap();
+    let mut e = png::Encoder::new(std::io::BufWriter::new(file), 16, 16);
+    e.set_color(png::ColorType::Rgba);
+    e.set_depth(png::BitDepth::Eight);
+    let blue: Vec<u8> = (0..16 * 16).flat_map(|_| [0, 0, 255, 255]).collect();
+    e.write_header().unwrap().write_image_data(&blue).unwrap();
+    fs::write(
+        skin.join("play.luaskin"),
+        "local skin = { type = 0, name = \"finish\", w = 1920, h = 1080 }\n\
+         if not skin_config then return skin end\n\
+         local ms = require(\"main_state\")\n\
+         skin.source = { { id = \"b\", path = \"blue.png\" } }\n\
+         skin.image = { { id = \"b\", src = \"b\", x = 0, y = 0, w = 16, h = 16 } }\n\
+         skin.destination = { { id = \"b\", timer = 143, loop = -1,\n\
+           draw = function() local cb = ms.number(425) return cb > 0 end, dst = {\n\
+             { time = 500, x = 0, y = 0, w = 1920, h = 1080, a = 0 },\n\
+             { time = 750, a = 255 }, { time = 1250, a = 255 }, { time = 1450, a = 0 } } } }\n\
+         return skin\n",
+    )
+    .unwrap();
+    fs::create_dir_all(fx.data()).unwrap();
+    fs::write(
+        fx.data().join("player.toml"),
+        format!(
+            "[skins.play]\nroot = '{}'\nentry = 'play.luaskin'\n",
+            skin.display()
+        ),
+    )
+    .unwrap();
+    let (out, stdout, stderr) = fx.run(&scenario(&[
+        "capture = { at = 2900, file = \"miss.png\" }",
+        "select = { path = \"library/tail/tail.bms\" }",
+        "play = { input = \"logs/miss.tprl\", until = \"end\" }",
+        "result = \"back\"",
+        "capture = { at = 2900, file = \"hit.png\" }",
+        "select = { path = \"library/tail/tail.bms\" }",
+        "play = { input = \"logs/hit.tprl\", until = \"end\" }",
+        "result = \"back\"",
+        "quit = {}",
+    ]));
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+    let plays = lines(&stdout, "play 1: ");
+    assert!(
+        plays[0].contains("perfect 0 great 0 good 0 bad 0 poor 1"),
+        "{stdout}"
+    );
+    assert!(
+        plays[1].contains("perfect 1 great 0 good 0 bad 0 poor 0"),
+        "{stdout}"
+    );
+    let out = fx.base.join("out");
+    assert_eq!(centre(&out.join("miss.png")), [0, 0, 255]);
+    assert_eq!(centre(&out.join("hit.png")), [0, 0, 0]);
+}

@@ -54,9 +54,9 @@
 //!   string arithmetic or ordering.
 //!
 //! The callback's result is then converted as its consumer converts it
-//! ([`Conv`]): a `draw` or `op` by truthiness, a number's `value` as an
-//! integer (nil and booleans 0), distributed into a [`Node::Select`]'s
-//! arms.
+//! ([`Conv`]): a `draw` or `op` by truthiness, a number's `value` or an
+//! image set's as an integer (nil and booleans 0), distributed into a
+//! [`Node::Select`]'s arms.
 //!
 //! The residual is a DAG in one arena a lowering, dropped with it. Every
 //! node is charged against [`MAX_EXPANDED_NODES`] before it is pushed
@@ -164,6 +164,9 @@ pub(crate) enum Conv {
     Truthy,
     /// A number's `value`: an integer, nil and booleans 0.
     Int,
+    /// An image set's `value`: as [`Self::Int`], and a root that is exactly
+    /// a `gauge_type()` read selects by the gauge's type.
+    Index,
 }
 
 /// Why evaluation stopped.
@@ -257,7 +260,7 @@ impl Residual {
 /// the residual keeps, and its arity.
 fn reader(api: u16) -> Option<(usize, u8)> {
     match HOST_APIS.get(usize::from(api)).copied()? {
-        ("main_state", "number" | "timer" | "event_index") => Some((1, INT)),
+        ("main_state", "number" | "timer" | "event_index" | "judge") => Some((1, INT)),
         ("main_state", "option") => Some((1, BOOL)),
         ("main_state", "text") => Some((1, STR)),
         ("main_state", "gauge_type") => Some((0, INT)),
@@ -319,7 +322,7 @@ pub(crate) fn evaluate(
     let v = ev.function(inst, &[])?;
     let root = match conv {
         Conv::Truthy => ev.truthy(v)?,
-        Conv::Int => ev.integer(v)?,
+        Conv::Int | Conv::Index => ev.integer(v)?,
     };
     ev.res.root = root;
     Ok(ev.res)
