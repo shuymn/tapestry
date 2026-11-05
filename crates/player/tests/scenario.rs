@@ -1621,23 +1621,24 @@ fn a_shown_survival_failure_closes_or_plays_to_the_end() {
     }
 }
 
-/// The centre pixel of the 1280×720 capture at `path`.
-fn centre(path: &Path) -> [u8; 3] {
+/// The pixel at column `x`, row `y` of the 1280×720 capture at `path`.
+fn pixel(path: &Path, x: usize, y: usize) -> [u8; 3] {
     let mut reader = png::Decoder::new(BufReader::new(fs::File::open(path).unwrap()))
         .read_info()
         .unwrap();
     let mut rgba = vec![0; reader.output_buffer_size().unwrap()];
     let info = reader.next_frame(&mut rgba).unwrap();
-    let w = info.width as usize;
-    let i = (info.height as usize / 2 * w + w / 2) * 4;
+    let i = (y * info.width as usize + x) * 4;
     [rgba[i], rgba[i + 1], rgba[i + 2]]
 }
 
 /// A play skin with a full-canvas image on the last note's timer, a read of
 /// the combo break its condition, opaque from 750 to 1250 ms on that timer:
-/// the shape of a skin's end-of-play image. A play ends with its audio, so
-/// the chart's BGM lasts through the capture: a miss has the image inside
-/// its window, a perfect play has none.
+/// the shape of a skin's end-of-play image, and an untimed corner on the
+/// same read. A play ends with its audio, so the chart's BGM lasts through
+/// the capture: a miss has the image inside its window, a perfect play has
+/// none. A retry of the miss starts from a clean snapshot: its first READY
+/// frame has no corner, with no tally set by hand.
 #[test]
 fn a_missed_note_draws_the_finish_window() {
     let fx = Fixture::new();
@@ -1673,7 +1674,9 @@ fn a_missed_note_draws_the_finish_window() {
          skin.destination = { { id = \"b\", timer = 143, loop = -1,\n\
            draw = function() local cb = ms.number(425) return cb > 0 end, dst = {\n\
              { time = 500, x = 0, y = 0, w = 1920, h = 1080, a = 0 },\n\
-             { time = 750, a = 255 }, { time = 1250, a = 255 }, { time = 1450, a = 0 } } } }\n\
+             { time = 750, a = 255 }, { time = 1250, a = 255 }, { time = 1450, a = 0 } } },\n\
+           { id = \"b\", draw = function() return ms.number(425) > 0 end,\n\
+             dst = { { x = 0, y = 0, w = 192, h = 108 } } } }\n\
          return skin\n",
     )
     .unwrap();
@@ -1690,6 +1693,9 @@ fn a_missed_note_draws_the_finish_window() {
         "capture = { at = 2900, file = \"miss.png\" }",
         "select = { path = \"library/tail/tail.bms\" }",
         "play = { input = \"logs/miss.tprl\", until = \"end\" }",
+        "capture = { ready_at = 0, file = \"retry.png\" }",
+        "result = \"retry\"",
+        "play = { input = \"logs/miss.tprl\", until = \"end\" }",
         "result = \"back\"",
         "capture = { at = 2900, file = \"hit.png\" }",
         "select = { path = \"library/tail/tail.bms\" }",
@@ -1698,16 +1704,28 @@ fn a_missed_note_draws_the_finish_window() {
         "quit = {}",
     ]));
     assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
-    let plays = lines(&stdout, "play 1: ");
-    assert!(
-        plays[0].contains("perfect 0 great 0 good 0 bad 0 poor 1"),
-        "{stdout}"
-    );
-    assert!(
-        plays[1].contains("perfect 1 great 0 good 0 bad 0 poor 0"),
-        "{stdout}"
-    );
+    let plays: Vec<&str> = stdout
+        .lines()
+        .filter(|l| l.starts_with("play ") && l.contains(": Completed"))
+        .collect();
+    let scores = [
+        "perfect 0 great 0 good 0 bad 0 poor 1",
+        "perfect 0 great 0 good 0 bad 0 poor 1",
+        "perfect 1 great 0 good 0 bad 0 poor 0",
+    ];
+    assert_eq!(plays.len(), 3, "{stdout}");
+    for (play, score) in plays.iter().zip(scores) {
+        assert!(play.contains(score), "{stdout}");
+    }
     let out = fx.base.join("out");
+    let (centre, corner) = (|p: &Path| pixel(p, 640, 360), |p: &Path| pixel(p, 20, 700));
     assert_eq!(centre(&out.join("miss.png")), [0, 0, 255]);
+    assert_eq!(corner(&out.join("miss.png")), [0, 0, 255]);
+    assert_eq!(
+        corner(&out.join("retry.png")),
+        [0, 0, 0],
+        "the retry's first frame"
+    );
     assert_eq!(centre(&out.join("hit.png")), [0, 0, 0]);
+    assert_eq!(corner(&out.join("hit.png")), [0, 0, 0]);
 }

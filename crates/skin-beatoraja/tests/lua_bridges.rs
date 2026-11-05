@@ -101,34 +101,56 @@ fn value_of(expr: &str, tally: eval::Tally, counted: bool) -> Vec<i32> {
     read(&mut d)
 }
 
-/// A number of `prop` drawn, as its digits: value 0 shows one.
-fn digits(prop: &str, tally: eval::Tally) -> usize {
+/// The digits a number of `prop` shows over `tally`, left to right, each
+/// glyph told by its uv against an EX score number cut from the same
+/// strip, drawn below it.
+fn digits(prop: &str, tally: eval::Tally) -> String {
     let mut d = drawn(
         &format!(
-            "skin.value = {{ {{ id = \"v\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, digit = 8, {prop} }} }}\n\
-             table.insert(skin.destination, {{ id = \"v\", dst = {{ {{ x = 0, y = 100, w = 6, h = 6 }} }} }})"
+            "skin.value = {{\n\
+               {{ id = \"v\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, digit = 8, {prop} }},\n\
+               {{ id = \"ex\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, digit = 1, ref = 71 }} }}\n\
+             table.insert(skin.destination, {{ id = \"v\", dst = {{ {{ x = 0, y = 900, w = 6, h = 6 }} }} }})\n\
+             table.insert(skin.destination, {{ id = \"ex\", dst = {{ {{ x = 0, y = 100, w = 6, h = 6 }} }} }})"
         ),
         20,
     );
     d.tally = tally;
-    d.frame(1_000, &[]).len()
+    let glyphs = d.ex_glyphs(1_000);
+    let mut shown: Vec<_> = d
+        .frame(1_000, &[])
+        .into_iter()
+        .filter(|q| q.rect[1] < 500.0)
+        .collect();
+    shown.sort_by(|a, b| a.rect[0].total_cmp(&b.rect[0]));
+    shown
+        .iter()
+        .map(|q| glyphs[&q.uv.map(f32::to_bits)])
+        .collect()
 }
 
 /// 425 is BAD and the scored POORs, 427 those and the empty POORs, by
 /// `ref`, by `value` and read in a callback.
 #[test]
 fn the_combo_break_counts_sum_the_scored_judgments() {
+    for prop in ["ref = 425", "value = 425"] {
+        assert_eq!(digits(prop, counts(0, [0, 0], 0)), "0", "{prop}");
+        assert_eq!(digits(prop, counts(3, [4, 5], 90)), "12", "{prop}");
+        assert_eq!(digits(prop, counts(3, [49, 50], 0)), "102", "{prop}");
+    }
+    for prop in ["ref = 427", "value = 427"] {
+        assert_eq!(digits(prop, counts(0, [0, 0], 0)), "0", "{prop}");
+        assert_eq!(digits(prop, counts(3, [4, 5], 0)), "12", "{prop}");
+        assert_eq!(digits(prop, counts(3, [4, 5], 90)), "102", "{prop}");
+    }
     let tally = || counts(3, [4, 5], 90);
-    assert_eq!(digits("ref = 425", tally()), 2, "12");
-    assert_eq!(digits("value = 425", tally()), 2, "12");
-    assert_eq!(digits("ref = 427", tally()), 3, "102");
     assert_eq!(value_of("ms.number(425)", tally(), false), [12]);
     assert_eq!(
         value_of("ms.number(427)", counts(1, [1, 1], 2), false),
         [5],
         "each term once"
     );
-    assert_eq!(digits("ref = 425", counts(0, [0, 0], 5)), 1, "0");
+    assert_eq!(digits("ref = 425", counts(0, [0, 0], 5)), "0");
 }
 
 /// A sum's range is its terms': arithmetic that could leave `i32` over it
@@ -200,11 +222,12 @@ fn judgment_conditions_read_their_counts() {
             ),
             20,
         );
+        let widths = |d: &mut Drawn| d.rects(1_000).iter().map(|r| r[2]).collect::<Vec<_>>();
         d.tally = counts(0, [0, 0], 0);
-        assert_eq!(d.rects(1_000)[0][2], 11, "{op} at 0");
+        assert_eq!(widths(&mut d), [11], "{op} at 0");
         set(&mut d.tally);
         d.tally.counts.poor = d.tally.early.poor + d.tally.late.poor;
-        assert_eq!(d.rects(1_000)[0][2], 10, "{op} above 0");
+        assert_eq!(widths(&mut d), [10], "{op} above 0");
     }
 }
 
