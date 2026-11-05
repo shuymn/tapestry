@@ -261,10 +261,15 @@ pub struct ScenarioArgs {
     pub file: PathBuf,
     /// `--dev-render-timeout`, as on song selection.
     pub render_timeout: Option<Duration>,
+    /// `--dev-specializing <mode>`: what the run's first pending play
+    /// skin's specialization gets once its Lua executes, as the select
+    /// script's `<mode>-specializing` step.
+    pub specializing: Option<super::Specializing>,
 }
 
 /// The arguments after `--dev-scenario`: the file, then
-/// `--dev-render-timeout <s>` at most once.
+/// `--dev-render-timeout <s>` and `--dev-specializing <mode>`, each at
+/// most once.
 ///
 /// # Errors
 ///
@@ -272,10 +277,22 @@ pub struct ScenarioArgs {
 pub fn args(p: &mut lexopt::Parser) -> Result<ScenarioArgs, UsageError> {
     let file = PathBuf::from(p.value()?);
     let mut render_timeout = None;
+    let mut specializing = None;
     while let Some(arg) = p.next()? {
         match arg {
             lexopt::Arg::Long("dev-render-timeout") if render_timeout.is_none() => {
                 render_timeout = Some(super::render_timeout(p)?);
+            }
+            lexopt::Arg::Long("dev-specializing") if specializing.is_none() => {
+                let mode = p.value()?;
+                let mode = mode.to_string_lossy();
+                specializing = Some(super::Specializing::named(&mode).ok_or_else(|| {
+                    UsageError::Usage(
+                        "--dev-specializing takes quit, close, input-failure, escalate or \
+                         escalate-input-failure"
+                            .to_owned(),
+                    )
+                })?);
             }
             other => return Err(other.unexpected().into()),
         }
@@ -283,6 +300,7 @@ pub fn args(p: &mut lexopt::Parser) -> Result<ScenarioArgs, UsageError> {
     Ok(ScenarioArgs {
         file,
         render_timeout,
+        specializing,
     })
 }
 
@@ -1251,6 +1269,9 @@ pub fn run(args: ScenarioArgs, clock: QpcClock) -> anyhow::Result<()> {
         script,
         session,
     } = load(&args.file)?;
+    if let Some(mode) = args.specializing {
+        super::specializing(mode);
+    }
     crate::select(
         crate::args::Select {
             input: crate::PlayInput::Autoplay,

@@ -25,7 +25,13 @@ pub enum Stage {
     Screen,
     /// Waiting for the library's scan to pause before READY.
     Scan,
+    /// Building a pending play skin for the chart.
+    Skin,
 }
+
+/// The wait for a pending play skin's specialization on a page other than
+/// the loading state's (a retry, a practice round).
+pub const SKIN_WAIT: &str = "スキンを準備しています";
 
 impl Stage {
     /// The sounds done and the files to decode, while their count is
@@ -46,6 +52,7 @@ impl Stage {
             Self::Loudness => "measuring the loudness",
             Self::Screen => "preparing the screen",
             Self::Scan => "waiting for the scan to pause",
+            Self::Skin => "building the play skin",
         }
     }
 
@@ -58,6 +65,7 @@ impl Stage {
             Self::Loudness => "音量を測定しています".to_owned(),
             Self::Screen => "画面を準備しています".to_owned(),
             Self::Scan => "ライブラリのスキャンの一時停止を待っています".to_owned(),
+            Self::Skin => SKIN_WAIT.to_owned(),
         }
     }
 }
@@ -151,7 +159,13 @@ mod tests {
             lines.contains(&"音を読み込んでいます".to_owned()),
             "{lines:?}"
         );
-        for stage in [Stage::Chart, Stage::Loudness, Stage::Screen, Stage::Scan] {
+        for stage in [
+            Stage::Chart,
+            Stage::Loudness,
+            Stage::Screen,
+            Stage::Scan,
+            Stage::Skin,
+        ] {
             let p = text.lines(stage);
             assert!(p.lines.len() <= PAGE_LINES);
             // No cursor: the play screen draws no bar under a line.

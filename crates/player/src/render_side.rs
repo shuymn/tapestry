@@ -303,6 +303,23 @@ pub trait Screen: Send {
         let _ = (update, frame);
         self.menu(page, changed).map(Ok)
     }
+    /// Draws the play screen's loading state while play's skin is pending
+    /// and no specialization of it was committed in the loading lifetime:
+    /// a cleared canvas with `page`, the load's lines, where
+    /// [`loading`](Self::loading) puts them, laid out again when `changed`.
+    /// No skin's frame is drawn. The default draws the lines as a menu
+    /// page.
+    ///
+    /// # Errors
+    ///
+    /// As [`menu`](Self::menu).
+    fn pending_loading(
+        &mut self,
+        page: &MenuPage,
+        changed: bool,
+    ) -> Result<FrameTiming, RenderError> {
+        self.menu(page, changed)
+    }
     /// Draws the launch screen `elapsed` after the render thread started,
     /// as [`text`](Self::text), until the game sends what to draw; `None`
     /// draws nothing instead (no launch screen).
@@ -489,6 +506,27 @@ pub(crate) fn refusal(reason: impl Into<String>) -> Preparation {
     })
 }
 
+/// The play skin an attempt is prepared with.
+#[derive(Debug)]
+pub enum AttemptSkin {
+    /// The skin in use: the one selected last, or the simple skin. While
+    /// play's skin is pending it is refused, the screen not asked.
+    InUse,
+    /// A pending play skin's specialization for this attempt, staged with
+    /// it and installed only by its commit.
+    Specialized(Arc<SkinBundle>),
+}
+
+/// What a selection ([`RenderMsg::Select`]) selects for its kind.
+#[derive(Debug)]
+pub enum Selected {
+    /// The skin, or `None` for the skin in use.
+    Skin(Option<Arc<SkinBundle>>),
+    /// Play's skin is pending: no installation until an attempt's
+    /// specialization is committed, and no attempt without one.
+    Pending,
+}
+
 /// What the game thread tells the render thread.
 pub enum RenderMsg {
     /// The adjustments' presentation from now on: the reader of the
@@ -508,6 +546,8 @@ pub enum RenderMsg {
         request: u64,
         /// The attempt, owned.
         attempt: Box<AttemptContext>,
+        /// The play skin it is prepared with.
+        skin: AttemptSkin,
         /// Where the answer goes.
         reply: mpsc::SyncSender<Result<Preparation, RenderError>>,
     },
@@ -537,17 +577,18 @@ pub enum RenderMsg {
     /// Install this declarative skin's chart-independent installation
     /// for the screen kind, and for play prepare every later attempt
     /// with it; `None` prepares play's later attempts with the skin in
-    /// use, and removes another kind's installation. Answer how it ended:
-    /// ready once committed or removed, a refusal keeping every
-    /// installation in use, or the screen's failure. Never committed or
-    /// removed once the request is withdrawn.
+    /// use, and removes another kind's installation; [`Selected::Pending`]
+    /// marks play's skin pending. Answer how it ended: ready once
+    /// committed or removed, a refusal keeping every installation in use,
+    /// or the screen's failure. Never committed or removed once the
+    /// request is withdrawn.
     Select {
         /// The request's number, of the same sequence as the attempts'.
         request: u64,
         /// The screen kind.
         kind: ScreenKind,
-        /// The skin, or `None` for the skin in use.
-        skin: Option<Arc<SkinBundle>>,
+        /// What is selected.
+        skin: Selected,
         /// Where the answer goes.
         reply: mpsc::SyncSender<Result<Preparation, RenderError>>,
     },
@@ -1073,21 +1114,39 @@ impl RenderLink {
         self.answer(&rx)
     }
 
-    /// Prepares the chart loaded last for `attempt`, as a new request that
-    /// supersedes the ones before, and waits for the answer, at most the
-    /// answer's bound, looking at `cancelled` every [`CANCEL_POLL`]: once
-    /// it says so, the preparation is [`Preparation::Cancelled`] without
-    /// waiting further. A cancelled or timed out request is discarded, so
-    /// its answer, however late, installs nothing.
+    /// [`prepare_attempt_with`](Self::prepare_attempt_with) the skin in
+    /// use (tests).
+    ///
+    /// # Errors
+    ///
+    /// As [`prepare_attempt_with`](Self::prepare_attempt_with).
+    #[cfg(test)]
+    pub fn prepare_attempt(
+        &self,
+        attempt: AttemptContext,
+        cancelled: impl FnMut() -> bool,
+    ) -> Result<Preparation, ScreenError> {
+        self.prepare_attempt_with(attempt, AttemptSkin::InUse, cancelled)
+    }
+
+    /// Prepares the chart loaded last for `attempt` with play skin
+    /// `skin`, as a new request that supersedes the ones before, and waits
+    /// for the answer, at most the answer's bound, looking at `cancelled`
+    /// every [`CANCEL_POLL`]: once it says so, the preparation is
+    /// [`Preparation::Cancelled`] without waiting further. A cancelled or
+    /// timed out request is discarded, so its answer, however late,
+    /// installs nothing. A pending play skin's specialization is staged
+    /// with the attempt, and only its commit installs it.
     ///
     /// # Errors
     ///
     /// Why the screen or its device cannot draw at all,
     /// [`ScreenError::NoAnswer`] past the bound and [`ScreenError::Ended`]
     /// when the render thread is gone.
-    pub fn prepare_attempt(
+    pub fn prepare_attempt_with(
         &self,
         attempt: AttemptContext,
+        skin: AttemptSkin,
         mut cancelled: impl FnMut() -> bool,
     ) -> Result<Preparation, ScreenError> {
         let request = self.requests.fetch_add(1, Ordering::Relaxed) + 1;
@@ -1095,6 +1154,7 @@ impl RenderLink {
         self.send(RenderMsg::PrepareAttempt {
             request,
             attempt: Box::new(attempt),
+            skin,
             reply,
         });
         let deadline = Instant::now() + self.answer_timeout;
@@ -1178,6 +1238,23 @@ impl RenderLink {
     /// Startup selects each configured kind's skin
     /// ([`crate::imports::startup`]).
     pub fn select(&self, kind: ScreenKind, skin: Option<Arc<SkinBundle>>) -> PendingSelect {
+        self.selecting(kind, Selected::Skin(skin))
+    }
+
+    /// Marks screen `kind`'s skin pending, as a selection is made
+    /// ([`select`](Self::select)), answered and withdrawn: committed, no
+    /// installation of it is kept and no attempt is prepared without a
+    /// specialization ([`AttemptSkin::Specialized`]), whose commit
+    /// installs it; the loading state shows the load's lines on a cleared
+    /// canvas until one is committed in its lifetime. Only play's skin
+    /// can be pending; another kind is refused. Startup marks a pending
+    /// play skin ([`crate::imports::startup`]).
+    pub fn pend(&self, kind: ScreenKind) -> PendingSelect {
+        self.selecting(kind, Selected::Pending)
+    }
+
+    /// Sends the selection of `skin` for `kind` as the next request.
+    fn selecting(&self, kind: ScreenKind, skin: Selected) -> PendingSelect {
         let request = self.requests.fetch_add(1, Ordering::Relaxed) + 1;
         let (reply, rx) = mpsc::sync_channel(1);
         self.send(RenderMsg::Select {
@@ -1521,13 +1598,16 @@ pub(crate) const SELECT_SLICE: Duration = Duration::from_millis(1);
 
 /// The play skin's installation as the game thread sees it: a chart is
 /// admitted (chosen to play, or a practice Start) only once the skin it
-/// shows is installed, so the loading state always draws the skin's own
-/// loading frame. Startup leaves it ready, or refused when the configured
-/// play skin was refused ([`crate::imports::startup`]); without one the
-/// simple skin draws, always ready.
+/// shows is installed or marked pending, so the loading state draws the
+/// skin's own loading frame, or, while pending, the load's lines on a
+/// cleared canvas until a specialization is committed in its lifetime.
+/// Startup leaves it ready, a pending play skin's marker included, or
+/// refused when the configured play skin was refused
+/// ([`crate::imports::startup`]); without one the simple skin draws,
+/// always ready.
 #[derive(Debug, Default)]
 pub enum SkinState {
-    /// Installed: charts are admitted.
+    /// Installed or pending: charts are admitted.
     #[default]
     Ready,
     /// A selection on its way: no chart is admitted until it is
@@ -1671,6 +1751,7 @@ pub fn spawn(
                 applied: None,
                 selected: None,
                 committed: Committed::default(),
+                specialized_in: None,
                 loading_refused: None,
                 paused: None,
                 requested: 0,
@@ -1827,6 +1908,16 @@ fn play_presentation(
     (lanes, readouts, offset)
 }
 
+/// Whether loading lifetime `lifetime` draws the pending presentation:
+/// play's skin is pending, and no specialization of it is kept that was
+/// committed while `lifetime` was current (`specialized_in`). Allocates
+/// nothing.
+#[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+fn pending_presentation(committed: &Committed, specialized_in: Option<u64>, lifetime: u64) -> bool {
+    committed.pending(ScreenKind::Play)
+        && (committed.get(ScreenKind::Play).is_none() || specialized_in != Some(lifetime))
+}
+
 /// What a preparation or a load leaves drawn: the splash stays until what
 /// comes next replaces it, since a hidden window shows on a presented
 /// frame and a play opens only once the window is shown, and so does the
@@ -1843,11 +1934,26 @@ fn after_preparing(mode: Mode) -> Mode {
     }
 }
 
-/// Each screen kind's declarative installation committed last, its
-/// loading presentation with it, kept apart from the screen: a screen
-/// built again restores exactly these, in [`Committed::KINDS`]' order.
+/// What one screen kind has committed.
 #[derive(Debug, Default)]
-struct Committed([Option<Installation>; 4]);
+enum Slot {
+    /// No declarative installation: the built-in presentation (play's
+    /// simple skin).
+    #[default]
+    BuiltIn,
+    /// Play's skin is pending ([`RenderLink::pend`]), with the
+    /// specialization committed last, if any.
+    Pending(Option<Installation>),
+    /// The declarative installation committed last.
+    Installed(Installation),
+}
+
+/// Each screen kind's declarative installation committed last, its
+/// loading presentation with it, kept apart from the screen, or play's
+/// pending marker: a screen built again restores exactly these, in
+/// [`Committed::KINDS`]' order.
+#[derive(Debug, Default)]
+struct Committed([Slot; 4]);
 
 impl Committed {
     /// The kinds in the order their installations are restored.
@@ -1867,15 +1973,19 @@ impl Committed {
         }
     }
 
-    /// `kind`'s installation, if any.
+    /// `kind`'s installation, if any: the one installed, or a pending
+    /// skin's specialization committed last.
     fn get(&self, kind: ScreenKind) -> Option<&Installation> {
-        self.0.get(Self::index(kind)).and_then(Option::as_ref)
+        match self.0.get(Self::index(kind)) {
+            Some(Slot::Installed(i) | Slot::Pending(Some(i))) => Some(i),
+            _ => None,
+        }
     }
 
-    /// Keeps `installation` as `kind`'s.
+    /// Keeps `installation` as `kind`'s, installed; `None` keeps none.
     fn set(&mut self, kind: ScreenKind, installation: Option<Installation>) {
         if let Some(entry) = self.0.get_mut(Self::index(kind)) {
-            *entry = installation;
+            *entry = installation.map_or(Slot::BuiltIn, Slot::Installed);
         }
     }
 
@@ -1883,14 +1993,29 @@ impl Committed {
     fn clear(&mut self, kind: ScreenKind) {
         self.set(kind, None);
     }
+
+    /// Marks `kind`'s skin pending, with `specialization` the one
+    /// committed, if any.
+    fn pend(&mut self, kind: ScreenKind, specialization: Option<Installation>) {
+        if let Some(entry) = self.0.get_mut(Self::index(kind)) {
+            *entry = Slot::Pending(specialization);
+        }
+    }
+
+    /// Whether `kind`'s skin is pending.
+    fn pending(&self, kind: ScreenKind) -> bool {
+        matches!(self.0.get(Self::index(kind)), Some(Slot::Pending(_)))
+    }
 }
 
 /// A screen made afresh, with every kind's `committed` installation
 /// restored in [`Committed::KINDS`]' order, and `chart` loaded. A kind
 /// other than play whose restore the new screen refuses on a healthy
 /// device (a new adapter's smaller limits, say) keeps no installation
-/// from then on, and its screen draws its built-in presentation; play's
-/// refusal, and any failure, fails the build.
+/// from then on, and its screen draws its built-in presentation; a
+/// pending play skin's specialization refused so keeps only the pending
+/// marker, the next attempt staging one again. Play's installed skin
+/// refused, and any failure, fails the build.
 fn build(
     make: &mut MakeScreen,
     committed: &mut Committed,
@@ -1904,6 +2029,13 @@ fn build(
         };
         match s.restore(kind, &installation) {
             Ok(()) => {}
+            Err(e) if committed.pending(kind) && e.is_refusal() => {
+                eprintln!(
+                    "render: the {kind} skin's specialization was not restored, the next attempt stages one again: {}",
+                    Chain(&e)
+                );
+                committed.pend(kind, None);
+            }
             Err(e) if kind != ScreenKind::Play && e.is_refusal() => {
                 eprintln!(
                     "render: the {kind} skin was not restored, its screen draws its built-in presentation: {}",
@@ -2005,6 +2137,11 @@ struct Run {
     /// presentation with it, kept apart from the screen: a screen built
     /// again restores exactly them.
     committed: Committed,
+    /// The loading lifetime current when a pending play skin's
+    /// specialization was last committed: its loading frames, and only
+    /// its, draw the skin's own; `None` when none was committed while a
+    /// lifetime was current.
+    specialized_in: Option<u64>,
     /// The loading lifetime whose loading frame the skin refused, and
     /// why: none of it is drawn again, and its end reports the refusal.
     loading_refused: Option<(u64, BuildError)>,
@@ -2212,14 +2349,10 @@ impl Run {
                 Ok(RenderMsg::PrepareAttempt {
                     request,
                     attempt,
+                    skin,
                     reply,
                 }) => {
-                    self.begin_attempt(Preparing {
-                        request,
-                        attempt,
-                        skin: self.selected.clone(),
-                        reply,
-                    });
+                    self.begin_attempt(request, attempt, skin, reply);
                     mode = after_preparing(mode);
                     continue;
                 }
@@ -2241,7 +2374,10 @@ impl Run {
                     skin,
                     reply,
                 }) => {
-                    let answer = self.select(request, kind, skin);
+                    let answer = match skin {
+                        Selected::Skin(skin) => self.select(request, kind, skin),
+                        Selected::Pending => self.pend(request, kind),
+                    };
                     let _ = reply.send(answer);
                     mode = after_preparing(mode);
                     continue;
@@ -2485,7 +2621,14 @@ impl Run {
                     // out again.
                     #[cfg(feature = "dev-tools")]
                     let [_, _, _, before] = crate::alloc_count::counts();
-                    let drawn = if let Some(lifetime) = loading_frame {
+                    let pending = loading_frame.is_some_and(|l| {
+                        pending_presentation(&self.committed, self.specialized_in, l)
+                    });
+                    let drawn = if pending {
+                        // No specialization committed in this lifetime:
+                        // the load's lines on a cleared canvas.
+                        screen.pending_loading(page, *changed)
+                    } else if let Some(lifetime) = loading_frame {
                         let snapshot = self.presentation.as_mut().map(|r| *r.read());
                         let frame = loading_frame_of(
                             lifetime,
@@ -2639,18 +2782,41 @@ impl Run {
         Ok(())
     }
 
-    /// Starts preparing the chart loaded last for `p`, recovering the
-    /// screen first: whatever an earlier request staged is discarded, and
-    /// `p` is asked of the screen at once and between frames until it
-    /// answers ([`poll_attempt`](Self::poll_attempt)).
-    fn begin_attempt(&mut self, p: Preparing) {
+    /// Starts preparing the chart loaded last for request `request`'s
+    /// `attempt` with `skin`, recovering the screen first: whatever an
+    /// earlier request staged is discarded, and the preparation is asked
+    /// of the screen at once and between frames until it answers
+    /// ([`poll_attempt`](Self::poll_attempt)). The skin in use while
+    /// play's skin is pending is refused once the earlier staging is
+    /// discarded, the screen not asked.
+    fn begin_attempt(
+        &mut self,
+        request: u64,
+        attempt: Box<AttemptContext>,
+        skin: AttemptSkin,
+        reply: mpsc::SyncSender<Result<Preparation, RenderError>>,
+    ) {
         // An older request than one asked already changes nothing.
-        if !self.newest(p.request) {
-            let _ = p.reply.send(Ok(refusal("a newer request superseded it")));
+        if !self.newest(request) {
+            let _ = reply.send(Ok(refusal("a newer request superseded it")));
             return;
         }
-        self.attempt = None;
-        self.drop_prepared();
+        // An older preparation, answered or not, and whatever it staged.
+        self.supersede_attempts("a newer request superseded it");
+        let skin = match skin {
+            AttemptSkin::Specialized(bundle) => Some(bundle),
+            AttemptSkin::InUse if self.committed.pending(ScreenKind::Play) => {
+                let _ = reply.send(Ok(refusal("the play skin awaits its specialization")));
+                return;
+            }
+            AttemptSkin::InUse => self.selected.clone(),
+        };
+        let p = Preparing {
+            request,
+            attempt,
+            skin,
+            reply,
+        };
         if let Err(e) = self.recover() {
             let _ = p.reply.send(Err(e));
             return;
@@ -2736,6 +2902,17 @@ impl Run {
     /// commits' lock is answered: the declared Closing duration of the
     /// declarative installation the attempt draws with, staged or in use.
     fn commit(&mut self, request: u64) -> Result<Option<TimeUs>, CommitError> {
+        // The loading lifetime current, if one is begun: a pending skin's
+        // specialization committed now draws its loading frames. Read
+        // before the commits' lock, which no loading lock nests in.
+        let lifetime = {
+            let producer = self.shared.producer();
+            let current = self.shared.loading_slot().lifetime;
+            producer
+                .as_ref()
+                .filter(|s| s.lifetime() == current)
+                .map(LifetimeState::lifetime)
+        };
         // Held through the installation: a withdrawal waits for it, or it
         // sees the withdrawal and installs nothing.
         let shared = Arc::clone(&self.shared);
@@ -2763,7 +2940,13 @@ impl Run {
             screen.discard();
             return Err(e);
         }
-        if p.declarative {
+        if p.declarative && self.committed.pending(ScreenKind::Play) {
+            // A pending skin's specialization: kept pending, drawn by the
+            // loading frames of the lifetime it was committed in.
+            self.committed
+                .pend(ScreenKind::Play, screen.installation(ScreenKind::Play));
+            self.specialized_in = lifetime;
+        } else if p.declarative {
             self.committed
                 .set(ScreenKind::Play, screen.installation(ScreenKind::Play));
         }
@@ -2810,15 +2993,7 @@ impl Run {
         if !self.newest(request) {
             return Ok(refusal("a newer request superseded it"));
         }
-        if let Some(p) = self.attempt.take() {
-            let _ = p
-                .reply
-                .send(Ok(refusal("a newer skin selection superseded it")));
-            if let Some(screen) = &mut self.screen {
-                screen.discard();
-            }
-        }
-        self.drop_prepared();
+        self.supersede_attempts("a newer skin selection superseded it");
         let Some(bundle) = skin else {
             if kind != ScreenKind::Play {
                 return self.remove(request, kind);
@@ -2871,6 +3046,52 @@ impl Run {
                 Err(e)
             }
         }
+    }
+
+    /// An attempt preparing or prepared, older than the request asked now,
+    /// is discarded with whatever the screen staged for it, whether or not
+    /// it answered: one still preparing is answered refused, for `why`.
+    fn supersede_attempts(&mut self, why: &str) {
+        if let Some(p) = self.attempt.take() {
+            let _ = p.reply.send(Ok(refusal(why)));
+            if let Some(screen) = &mut self.screen {
+                screen.discard();
+            }
+        }
+        self.drop_prepared();
+    }
+
+    /// Marks `kind`'s skin pending for request `request`, as a selection
+    /// is made ([`select`](Self::select)): a request not newer than one
+    /// asked already is refused, changing nothing, and so is a kind other
+    /// than play; else an older attempt preparing or prepared is
+    /// discarded and the screen recovered, and, unless the game thread
+    /// withdrew the request (checked under the commits' lock, as a
+    /// commit), play keeps only the pending marker: no installation, no
+    /// skin selected for later attempts, and no specialization drawn by
+    /// any loading lifetime yet. A withdrawal changes nothing.
+    fn pend(&mut self, request: u64, kind: ScreenKind) -> Result<Preparation, RenderError> {
+        if !self.newest(request) {
+            return Ok(refusal("a newer request superseded it"));
+        }
+        if kind != ScreenKind::Play {
+            return Ok(refusal(format!("the {kind} skin cannot be pending")));
+        }
+        self.supersede_attempts("a newer skin selection superseded it");
+        if let Err(e) = self.recover() {
+            self.shared.failed.store(true, Ordering::Release);
+            return Err(e);
+        }
+        let shared = Arc::clone(&self.shared);
+        let mut commits = shared.commits();
+        if commits.withdrawn >= request {
+            return Ok(Preparation::Cancelled);
+        }
+        self.committed.pend(kind, None);
+        self.selected = None;
+        self.specialized_in = None;
+        commits.committed = commits.committed.max(request);
+        Ok(Preparation::Ready)
     }
 
     /// Removes `kind`'s installation for request `request`, recovering
@@ -4156,6 +4377,69 @@ pub(crate) mod tests {
         lost.store(false, Ordering::Release);
         link.prepare().unwrap();
         assert_eq!(builds.load(Ordering::SeqCst), 2);
+        link.exit();
+    }
+
+    /// A pending play skin's specialization staged with its attempt
+    /// through a real menu screen and renderer on WARP, beside a committed
+    /// result skin: one whose atlas is the whole shared limit is refused
+    /// with the renderer's admission, as a healthy refusal (no failure
+    /// reported), and one within the limit is ready and commits.
+    #[test]
+    fn a_specialization_past_the_shared_texels_is_refused() {
+        use crate::render_decl::{Look, solid_bundle};
+        let make: MakeScreen = Box::new(|| {
+            let renderer = render::Renderer::new(
+                render::Target::Offscreen {
+                    width: 1_920,
+                    height: 1_080,
+                },
+                render::AdapterChoice::Warp,
+            )?;
+            Ok(Box::new(crate::menu_screen::MenuScreen::new(renderer, None)) as Box<dyn Screen>)
+        });
+        // Built for WARP's limits, as the render thread's screen.
+        let r = crate::render_common::offscreen(1_920, 1_080);
+        let big = solid_bundle(&r, &Look::left([0, 0, 255, 255]), [4_096, 3_072]);
+        assert_eq!(big.atlas_texels(), render::SHARED_TEXELS);
+        let (result, play) = (
+            solid_bundle(&r, &Look::left([255, 0, 0, 255]), [16, 16]),
+            solid_bundle(&r, &Look::left([0, 255, 0, 255]), [16, 16]),
+        );
+        drop(r);
+        let link = spawn_empty(make);
+        let chart = Arc::new(ChartBuilder::new(120_000).build().unwrap());
+        link.load(Arc::clone(&chart), None).unwrap();
+        assert_eq!(
+            link.select(ScreenKind::Result, Some(result))
+                .wait()
+                .unwrap(),
+            Preparation::Ready
+        );
+        assert_eq!(
+            link.pend(ScreenKind::Play).wait().unwrap(),
+            Preparation::Ready
+        );
+        let answer = specialized(&link, &chart, &big).unwrap();
+        let Preparation::Refused(why) = answer else {
+            panic!("{answer:?}");
+        };
+        let needed = render::SHARED_TEXELS + 256 * 256 * 2;
+        assert_eq!(
+            why.reason,
+            format!(
+                "the {} skin needs {needed} texels with the other screens' skins, past {}",
+                ScreenKind::Play,
+                render::SHARED_TEXELS
+            )
+        );
+        assert!(!link.failed());
+        // The positive control: a specialization within the limit.
+        assert_eq!(
+            specialized(&link, &chart, &play).unwrap(),
+            Preparation::Ready
+        );
+        link.commit_attempt().unwrap();
         link.exit();
     }
 
@@ -6604,6 +6888,9 @@ pub(crate) mod tests {
         staged: Option<(ScreenKind, render::Installation)>,
         /// Each kind's installation committed or restored.
         installed: super::Committed,
+        /// The request whose staging is held unanswered
+        /// (`hold_staged`).
+        held: Option<u64>,
     }
 
     impl Installer {
@@ -6633,12 +6920,32 @@ pub(crate) mod tests {
             if self.shared.hold.load(Ordering::Acquire) {
                 return None;
             }
+            // Read once: the request whose preparation stages and holds.
+            let hold = self.shared.hold_staged.load(Ordering::Acquire) == request;
+            // Staged already and held: asked again, still no answer.
+            if hold && self.held == Some(request) {
+                return None;
+            }
             // Without a skin chosen, the installation in use draws.
             assert!(skin.is_some() || self.installed.get(ScreenKind::Play).is_some());
             self.note(&format!(
                 "prepare {request} {:?} {}",
                 a.context.scratch, a.text.title
             ));
+            // The skin given is staged with the attempt, as the renderer
+            // stages it, and installed only by the commit.
+            if let Some(skin) = skin {
+                self.staged = Some((
+                    ScreenKind::Play,
+                    render::Installation::new(Arc::clone(skin)),
+                ));
+                *self.shared.staging.lock().unwrap() = Some(Arc::clone(skin));
+            }
+            // A screen may stage and answer later.
+            if hold {
+                self.held = Some(request);
+                return None;
+            }
             Some(Ok(Preparation::Ready))
         }
         fn device(&self) -> u64 {
@@ -6654,13 +6961,18 @@ pub(crate) mod tests {
                 std::thread::sleep(Duration::from_millis(1));
             }
             if let Some((kind, staged)) = self.staged.take() {
+                if kind == ScreenKind::Play {
+                    *self.shared.play.lock().unwrap() = Some(Arc::clone(staged.bundle()));
+                }
                 self.installed.set(kind, Some(staged));
             }
+            *self.shared.staging.lock().unwrap() = None;
             Ok(())
         }
         fn discard(&mut self) {
             self.note("discard");
             self.staged = None;
+            *self.shared.staging.lock().unwrap() = None;
         }
         fn install(
             &mut self,
@@ -6715,6 +7027,9 @@ pub(crate) mod tests {
             }
             if *self.shared.fail_restore.lock().unwrap() == Some(kind) {
                 return Err(RenderError::SurfaceLost);
+            }
+            if kind == ScreenKind::Play {
+                *self.shared.play.lock().unwrap() = Some(Arc::clone(installation.bundle()));
             }
             self.installed.set(kind, Some(installation.clone()));
             self.shared
@@ -6783,6 +7098,17 @@ pub(crate) mod tests {
             }
             Ok(Ok(timing(true)))
         }
+        fn pending_loading(
+            &mut self,
+            _page: &crate::menu_screen::MenuPage,
+            _changed: bool,
+        ) -> Result<FrameTiming, RenderError> {
+            if self.shared.fail.load(Ordering::Acquire) {
+                return Err(RenderError::SurfaceLost);
+            }
+            self.shared.pending.fetch_add(1, Ordering::AcqRel);
+            Ok(timing(true))
+        }
         #[cfg(feature = "dev-tools")]
         fn read_back(&self) -> Option<(u32, u32, Vec<u8>)> {
             None
@@ -6797,6 +7123,8 @@ pub(crate) mod tests {
         hold: Arc<AtomicBool>,
         fail: Arc<AtomicBool>,
         loading: Arc<AtomicU32>,
+        /// Loading frames drawn as the pending presentation.
+        pending: Arc<AtomicU32>,
         stall: Arc<AtomicBool>,
         /// Set while a loading frame is held by `stall`.
         stalled: Arc<AtomicBool>,
@@ -6823,6 +7151,15 @@ pub(crate) mod tests {
         fail_restore: Arc<std::sync::Mutex<Option<ScreenKind>>>,
         /// Each loading frame's device, lifetime and origin.
         origins: Arc<std::sync::Mutex<Vec<(u64, u64, TimeUs)>>>,
+        /// The play bundle the screen built last installed, by a commit or
+        /// a restore; a screen built again starts with none.
+        play: Arc<std::sync::Mutex<Option<Arc<render::SkinBundle>>>>,
+        /// The skin an attempt's preparation staged and neither committed
+        /// nor discarded, on the screen built last.
+        staging: Arc<std::sync::Mutex<Option<Arc<render::SkinBundle>>>>,
+        /// The request whose preparation stages, then does not answer; 0
+        /// for none.
+        hold_staged: Arc<std::sync::atomic::AtomicU64>,
     }
 
     impl Installers {
@@ -6849,11 +7186,14 @@ pub(crate) mod tests {
             let shared = self.clone();
             let make: MakeScreen = Box::new(move || {
                 let device = u64::from(shared.builds.fetch_add(1, Ordering::SeqCst) + 1);
+                *shared.play.lock().unwrap() = None;
+                *shared.staging.lock().unwrap() = None;
                 Ok(Box::new(Installer {
                     device,
                     shared: shared.clone(),
                     staged: None,
                     installed: super::Committed::default(),
+                    held: None,
                 }) as Box<dyn Screen>)
             });
             spawn_empty(make)
@@ -6862,6 +7202,369 @@ pub(crate) mod tests {
         pub(crate) fn log(&self) -> Vec<String> {
             self.log.lock().unwrap().clone()
         }
+
+        /// The play bundle the screen built last has installed.
+        fn play(&self) -> Option<Arc<render::SkinBundle>> {
+            self.play.lock().unwrap().clone()
+        }
+    }
+
+    /// Loads a chart on `link` and prepares an attempt with the skin in
+    /// use, which must be refused: the reason.
+    pub(crate) fn in_use_attempt(link: &super::RenderLink) -> String {
+        let chart = Arc::new(ChartBuilder::new(120_000).build().unwrap());
+        link.load(Arc::clone(&chart), None).unwrap();
+        match link.prepare_attempt(titled(&chart), || false).unwrap() {
+            Preparation::Refused(why) => why.reason,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// A render thread on new installers with a chart loaded and play's
+    /// skin marked pending.
+    pub(crate) fn pending_link() -> (Arc<Chart>, Installers, super::RenderLink) {
+        let chart = Arc::new(ChartBuilder::new(120_000).build().unwrap());
+        let screens = Installers::default();
+        let link = screens.spawn_bare();
+        link.load(Arc::clone(&chart), None).unwrap();
+        assert_eq!(
+            link.pend(ScreenKind::Play).wait().unwrap(),
+            Preparation::Ready
+        );
+        (chart, screens, link)
+    }
+
+    /// Prepares an attempt of `chart` on `link` with the specialization
+    /// `skin`.
+    pub(crate) fn specialized(
+        link: &super::RenderLink,
+        chart: &Chart,
+        skin: &Arc<render::SkinBundle>,
+    ) -> Result<Preparation, ScreenError> {
+        link.prepare_attempt_with(
+            titled(chart),
+            super::AttemptSkin::Specialized(Arc::clone(skin)),
+            || false,
+        )
+    }
+
+    /// Whether the screen's installed play bundle is `skin`, the very one.
+    pub(crate) fn installed_is(screens: &Installers, skin: &Arc<render::SkinBundle>) -> bool {
+        screens.play().is_some_and(|p| Arc::ptr_eq(&p, skin))
+    }
+
+    /// A pending play skin's specialization is staged with its attempt
+    /// and installed only by that attempt's commit. Each way an attempt
+    /// is discarded before its commit (the game's discard on a quit or a
+    /// failed restore check, the answer's bound, a newer request, the
+    /// screen built again) drops its staging, and the specialization
+    /// committed before stays installed, the very bundle; one committed
+    /// stays through a later cancellation.
+    #[test]
+    fn a_specialization_installs_only_by_its_commit() {
+        let (chart, screens, mut link) = pending_link();
+        let first = bundle();
+        assert_eq!(
+            specialized(&link, &chart, &first).unwrap(),
+            Preparation::Ready
+        );
+        assert!(screens.play().is_none(), "staged, not installed");
+        link.commit_attempt().unwrap();
+        assert!(installed_is(&screens, &first));
+
+        // Discarded by the game (a quit, a failed restore check, a
+        // thread's failure before the commit).
+        let other = bundle();
+        assert_eq!(
+            specialized(&link, &chart, &other).unwrap(),
+            Preparation::Ready
+        );
+        link.discard_attempt();
+        assert!(matches!(link.commit_attempt(), Err(ScreenError::Lost)));
+        assert!(installed_is(&screens, &first));
+
+        // Past the answer's bound.
+        link.set_timeouts(Duration::from_millis(100), Duration::from_secs(5));
+        screens.hold.store(true, Ordering::Release);
+        let late = specialized(&link, &chart, &other);
+        assert!(matches!(late, Err(ScreenError::NoAnswer)), "{late:?}");
+        screens.hold.store(false, Ordering::Release);
+        link.set_timeouts(Duration::from_secs(10), Duration::from_secs(5));
+        assert!(matches!(link.commit_attempt(), Err(ScreenError::Lost)));
+        assert!(installed_is(&screens, &first));
+
+        // Superseded by a newer request.
+        assert_eq!(
+            specialized(&link, &chart, &other).unwrap(),
+            Preparation::Ready
+        );
+        assert_eq!(
+            specialized(&link, &chart, &first).unwrap(),
+            Preparation::Ready
+        );
+        let (reply, rx) = std::sync::mpsc::sync_channel(1);
+        link.send(RenderMsg::Commit {
+            request: link.requests.load(Ordering::Relaxed) - 1,
+            reply,
+        });
+        assert!(rx.recv().unwrap().is_err());
+        link.discard_attempt();
+        assert!(installed_is(&screens, &first));
+
+        // The screen built again before the commit: the committed one is
+        // restored, and the staging is gone with the old screen.
+        assert_eq!(
+            specialized(&link, &chart, &other).unwrap(),
+            Preparation::Ready
+        );
+        rebuild_screen(&link, &screens);
+        assert!(matches!(link.commit_attempt(), Err(ScreenError::Lost)));
+        assert!(installed_is(&screens, &first));
+
+        // Committed, then a later attempt cancelled: it stays.
+        assert_eq!(
+            specialized(&link, &chart, &other).unwrap(),
+            Preparation::Ready
+        );
+        link.commit_attempt().unwrap();
+        assert!(installed_is(&screens, &other));
+        let cancelled = link.prepare_attempt_with(
+            titled(&chart),
+            super::AttemptSkin::Specialized(Arc::clone(&first)),
+            || true,
+        );
+        // Answered at once or cancelled: either way discarded.
+        assert!(cancelled.is_ok(), "{cancelled:?}");
+        link.discard_attempt();
+        assert!(installed_is(&screens, &other));
+        link.exit();
+    }
+
+    /// While play's skin is pending, an attempt with the skin in use is
+    /// refused without the screen asked to prepare it; and it still
+    /// supersedes an older request's staged specialization, which is
+    /// discarded, the committed one kept.
+    #[test]
+    fn an_in_use_attempt_is_refused_while_pending() {
+        let (chart, screens, link) = pending_link();
+        let first = bundle();
+        assert_eq!(
+            specialized(&link, &chart, &first).unwrap(),
+            Preparation::Ready
+        );
+        link.commit_attempt().unwrap();
+        assert_eq!(
+            specialized(&link, &chart, &bundle()).unwrap(),
+            Preparation::Ready
+        );
+        let before = screens.log().len();
+        let answer = link.prepare_attempt(titled(&chart), || false).unwrap();
+        let Preparation::Refused(why) = answer else {
+            panic!("{answer:?}");
+        };
+        assert_eq!(why.reason, "the play skin awaits its specialization");
+        assert_eq!(screens.log()[before..], ["1 discard"]);
+        assert!(matches!(link.commit_attempt(), Err(ScreenError::Lost)));
+        assert!(installed_is(&screens, &first));
+        link.exit();
+    }
+
+    /// A preparation that staged its specialization and has not answered
+    /// is superseded by the next request whatever it is: it is answered
+    /// refused, and its staging discarded, before the next one, an
+    /// attempt with the skin in use (refused while pending) or another
+    /// specialization (prepared and committed), so nothing of it stays
+    /// staged or installs.
+    #[test]
+    fn a_newer_request_discards_an_unanswered_staging() {
+        for next_in_use in [true, false] {
+            let (chart, screens, link) = pending_link();
+            let (held, next) = (bundle(), bundle());
+            let request = link.requests.fetch_add(1, Ordering::Relaxed) + 1;
+            // Held through the successor: it never answers by itself.
+            screens.hold_staged.store(request, Ordering::Release);
+            let (reply, rx) = std::sync::mpsc::sync_channel(1);
+            link.send(RenderMsg::PrepareAttempt {
+                request,
+                attempt: Box::new(titled(&chart)),
+                skin: super::AttemptSkin::Specialized(Arc::clone(&held)),
+                reply,
+            });
+            assert!(wait_until(|| screens.staging.lock().unwrap().is_some()));
+            if next_in_use {
+                let answer = link.prepare_attempt(titled(&chart), || false).unwrap();
+                let Preparation::Refused(why) = answer else {
+                    panic!("{answer:?}");
+                };
+                assert_eq!(why.reason, "the play skin awaits its specialization");
+            } else {
+                assert_eq!(
+                    specialized(&link, &chart, &next).unwrap(),
+                    Preparation::Ready
+                );
+            }
+            let older = rx.recv_timeout(Duration::from_secs(10)).unwrap().unwrap();
+            let Preparation::Refused(why) = older else {
+                panic!("{older:?}");
+            };
+            assert_eq!(why.reason, "a newer request superseded it");
+            // Nothing of the held one stays staged.
+            let staged = screens.staging.lock().unwrap().clone();
+            if next_in_use {
+                assert!(staged.is_none());
+            } else {
+                assert!(staged.is_some_and(|s| Arc::ptr_eq(&s, &next)));
+                link.commit_attempt().unwrap();
+                assert!(installed_is(&screens, &next));
+                assert!(screens.staging.lock().unwrap().is_none());
+            }
+            screens.hold_staged.store(0, Ordering::Release);
+            if next_in_use {
+                assert!(screens.play().is_none());
+            }
+            let log = screens.log();
+            let staged = log
+                .iter()
+                .position(|l| l == &format!("1 prepare {request} Right T"))
+                .unwrap();
+            assert_eq!(log[staged + 1], "1 discard", "{log:?}");
+            link.exit();
+        }
+    }
+
+    /// Loading frames of a lifetime draw the pending presentation until a
+    /// specialization is committed in that lifetime, then the skin's own;
+    /// a paused lifetime resumed (the start gate) draws the skin's own
+    /// again; the next lifetime is pending again until its own commit.
+    #[test]
+    fn the_pending_presentation_lasts_until_a_commit_in_its_lifetime() {
+        let (chart, screens, link) = pending_link();
+        let pending = || screens.pending.load(Ordering::Acquire);
+        let skin = || screens.loading.load(Ordering::Acquire);
+
+        // Lifetime 1: pending, then the skin's after its commit.
+        link.loading().show(one_line("one"));
+        assert!(wait_until(|| pending() >= 3));
+        assert_eq!(skin(), 0);
+        assert_eq!(
+            specialized(&link, &chart, &bundle()).unwrap(),
+            Preparation::Ready
+        );
+        link.commit_attempt().unwrap();
+        let from = pending();
+        assert!(wait_until(|| skin() >= 3));
+        let after = pending();
+        assert!(after <= from + 1, "{from} {after}");
+
+        // Paused and resumed: the skin's again.
+        link.pause_loading().unwrap();
+        let paused = skin();
+        link.resume_loading();
+        assert!(wait_until(|| skin() >= paused + 3));
+        link.end_loading().unwrap();
+
+        // Lifetime 2: pending again, though a specialization is kept.
+        let (p, s) = (pending(), skin());
+        link.loading().show(one_line("two"));
+        assert!(wait_until(|| pending() >= p + 3));
+        assert_eq!(skin(), s);
+        // Its own commit draws the skin's.
+        assert_eq!(
+            specialized(&link, &chart, &bundle()).unwrap(),
+            Preparation::Ready
+        );
+        link.commit_attempt().unwrap();
+        assert!(wait_until(|| skin() >= s + 3));
+        link.end_loading().unwrap();
+        link.exit();
+    }
+
+    /// A screen built again keeps the pending marker: a specialization
+    /// committed is restored, the very bundle; one whose restore is
+    /// refused on a healthy device leaves only the marker, the build
+    /// succeeding and the next attempt staging one again; with only the
+    /// marker nothing is restored, and an attempt without a
+    /// specialization is still refused.
+    #[test]
+    fn recovery_keeps_the_pending_marker() {
+        let (chart, screens, link) = pending_link();
+        // Only the marker: nothing restored.
+        rebuild(&screens, &link).unwrap();
+        assert!(restored(&screens).is_empty());
+
+        let first = bundle();
+        assert_eq!(
+            specialized(&link, &chart, &first).unwrap(),
+            Preparation::Ready
+        );
+        link.commit_attempt().unwrap();
+        rebuild(&screens, &link).unwrap();
+        let got = restored(&screens);
+        let [(ScreenKind::Play, kept)] = &got[..] else {
+            panic!("{got:?}");
+        };
+        assert!(Arc::ptr_eq(kept, &first));
+
+        // Refused on a healthy device: the build goes on, the marker kept.
+        *screens.refuse_restore.lock().unwrap() = Some(ScreenKind::Play);
+        rebuild(&screens, &link).unwrap();
+        *screens.refuse_restore.lock().unwrap() = None;
+        rebuild(&screens, &link).unwrap();
+        assert!(restored(&screens).is_empty(), "{:?}", restored(&screens));
+        assert_eq!(
+            in_use_attempt(&link),
+            "the play skin awaits its specialization"
+        );
+        let next = bundle();
+        assert_eq!(
+            specialized(&link, &chart, &next).unwrap(),
+            Preparation::Ready
+        );
+        link.commit_attempt().unwrap();
+        assert!(installed_is(&screens, &next));
+
+        // A failure restoring it fails the build, and the next restores it.
+        *screens.fail_restore.lock().unwrap() = Some(ScreenKind::Play);
+        assert!(rebuild(&screens, &link).is_err());
+        *screens.fail_restore.lock().unwrap() = None;
+        link.prepare().unwrap();
+        assert!(installed_is(&screens, &next));
+        link.exit();
+    }
+
+    /// The pending marker is a selection: withdrawn while the render
+    /// thread stalls (the game thread stopped waiting), it is answered
+    /// cancelled and changes nothing: play's installed skin stays and
+    /// still prepares attempts with the skin in use, no request is
+    /// counted committed, and loading frames stay the skin's own. Only
+    /// play's skin can be pending.
+    #[test]
+    fn a_withdrawn_pend_changes_nothing() {
+        let chart = Arc::new(ChartBuilder::new(120_000).build().unwrap());
+        let skin = bundle();
+        let screens = Installers::default();
+        let link = screens.spawn(&chart, &skin);
+        stall_render(&link, &screens);
+        let mut pending = link.pend(ScreenKind::Play);
+        let (_, apart) = std::sync::mpsc::sync_channel(1);
+        let rx = std::mem::replace(&mut pending.rx, apart);
+        drop(pending);
+        screens.stall.store(false, Ordering::Release);
+        let answer = rx.recv_timeout(Duration::from_secs(10)).unwrap().unwrap();
+        assert_eq!(answer, Preparation::Cancelled);
+        assert_eq!(link.shared.commits().committed, 1);
+        let frames = || screens.loading.load(Ordering::Acquire);
+        let from = frames();
+        assert!(wait_until(|| frames() >= from + 3));
+        assert_eq!(screens.pending.load(Ordering::Acquire), 0);
+        link.end_loading().unwrap();
+        ready_attempt(&link, &chart);
+        link.commit_attempt().unwrap();
+        assert!(installed_is(&screens, &skin));
+
+        let other = link.pend(ScreenKind::Result).wait().unwrap();
+        assert!(matches!(other, Preparation::Refused(_)), "{other:?}");
+        link.exit();
     }
 
     /// A ready preparation installs only by its own request's commit:
@@ -7648,7 +8351,7 @@ pub(crate) mod tests {
         link.send(RenderMsg::Select {
             request: 1,
             kind: ScreenKind::Play,
-            skin: Some(Arc::clone(&late)),
+            skin: super::Selected::Skin(Some(Arc::clone(&late))),
             reply,
         });
         let answer = rx.recv().unwrap().unwrap();
@@ -7658,6 +8361,7 @@ pub(crate) mod tests {
         link.send(RenderMsg::PrepareAttempt {
             request: 2,
             attempt: Box::new(titled(&chart)),
+            skin: super::AttemptSkin::InUse,
             reply,
         });
         let answer = rx.recv().unwrap().unwrap();

@@ -24,8 +24,9 @@
 //!   summary of an installed skin ([`log_installed`]), and the select
 //!   screen's notice of a screen kind other than play ([`notice`]).
 //!
-//! Skins are imported at startup only: a pending play skin is still
-//! refused there, and nothing here runs after it yet.
+//! Skins are imported at startup only, but for a pending play skin,
+//! built for each attempt that its kept specialization does not fit
+//! ([`PendingSkin`]); startup marks it pending on the render thread.
 
 use std::fmt::Write as _;
 use std::panic::{self, AssertUnwindSafe};
@@ -83,11 +84,7 @@ pub enum KindOutcome {
     /// A Lua play skin whose base import read a fact the base snapshot
     /// has pending: what each attempt's [`specialize`] starts from, and
     /// the base import's report.
-    Pending(
-        #[cfg_attr(not(test), expect(dead_code, reason = "activated by S10-07c-2"))]
-        Arc<PendingPlay>,
-        PendingNote,
-    ),
+    Pending(Arc<PendingPlay>, PendingNote),
 }
 
 /// A pending play skin, built for each attempt ([`specialize`]): the
@@ -120,7 +117,7 @@ const fn fact_name(fact: FactId) -> &'static str {
 
 impl PendingNote {
     /// The refusal of a skin that cannot be built before a chart is
-    /// chosen: what startup reports for a pending play skin.
+    /// chosen, of a kind other than play, which has no specialization.
     pub fn refusal(&self) -> String {
         format!(
             "the skin reads {} as it is built, which is known only once a chart is \
@@ -134,11 +131,153 @@ impl PendingNote {
 /// import's report, and the facts it read, which say whether it fits
 /// another attempt ([`FactDeps::holds`]).
 #[derive(Debug)]
-#[cfg_attr(not(test), expect(dead_code, reason = "activated by S10-07c-2"))]
 pub struct Specialization {
     pub bundle: Arc<SkinBundle>,
     pub summary: Summary,
     pub facts: FactDeps,
+}
+
+/// A pending play skin as the game thread keeps it through the run: what
+/// each specialization starts from, and the one specialization kept,
+/// reused while its facts hold.
+#[derive(Debug)]
+pub struct PendingSkin {
+    play: Arc<PendingPlay>,
+    cached: Option<Specialization>,
+}
+
+/// The play skin of an attempt at a pending play skin
+/// ([`PendingSkin::attempt`]).
+#[derive(Debug)]
+pub enum ForAttempt {
+    /// The specialization to prepare the attempt with.
+    Ready(Arc<SkinBundle>),
+    /// The attempt's quit, the window's close or a thread's failure came
+    /// during the specialization: the attempt is cancelled.
+    Cancelled,
+    /// The skin cannot be built for the attempt, with the reason.
+    Refused(String),
+}
+
+/// How a specialization's job ran, for its reports.
+#[derive(Debug)]
+pub enum Specialized {
+    /// The kept specialization fits the attempt's facts: no job ran.
+    Reused,
+    /// A job ran, ending as the attempt's skin says.
+    Ran,
+}
+
+impl ForAttempt {
+    /// Prints and logs the attempt's skin, as it came `how`:
+    /// `skin: play: specialized`, `skin: play: reused` or `skin: play:
+    /// refused for the chart: <reason>`; nothing when cancelled.
+    pub fn report(&self, how: &Specialized) {
+        let line = match (self, how) {
+            (Self::Ready(_), Specialized::Reused) => "skin: play: reused".to_owned(),
+            (Self::Ready(_), Specialized::Ran) => "skin: play: specialized".to_owned(),
+            (Self::Refused(why), _) => format!("skin: play: refused for the chart: {why}"),
+            (Self::Cancelled, _) => return,
+        };
+        println!("{line}");
+        log::info!("{line}");
+    }
+}
+
+/// Logs how the render thread's preparation of an attempt with a
+/// specialization ended (`answer`: staged and uploaded, refused,
+/// cancelled, or the screen's failure) and the time `took` from the
+/// request to its end.
+pub fn log_staged(took: Duration, answer: &Result<Preparation, crate::render_side::ScreenError>) {
+    let ms = took.as_millis();
+    match answer {
+        Ok(Preparation::Ready) => log::info!("skin: play: staged with the attempt in {ms} ms"),
+        Ok(Preparation::Refused(why)) => {
+            log::info!("skin: play: its staging was refused in {ms} ms: {why}");
+        }
+        Ok(Preparation::Cancelled) => {
+            log::info!("skin: play: its staging was cancelled after {ms} ms");
+        }
+        Err(e) => log::info!("skin: play: its staging failed after {ms} ms: {}", Chain(e)),
+    }
+}
+
+impl PendingSkin {
+    /// `play`, no specialization kept yet.
+    pub const fn new(play: Arc<PendingPlay>) -> Self {
+        Self { play, cached: None }
+    }
+
+    /// The skin of an attempt with `facts` (design.md "beatoraja Lua
+    /// Skins", import facts):
+    ///
+    /// - The specialization kept is reused while it holds for `facts`
+    ///   ([`FactDeps::holds`]): no job and no Lua.
+    /// - Else the one kept is dropped first, so at most the committed
+    ///   bundle and one candidate exist, `wait` shows the wait, and
+    ///   [`specialize`] runs on a job ([`run_job`]): `quit` (the attempt's
+    ///   quit key) cancels it and waits for its thread's end, and
+    ///   `end_run` (a close, a thread's failure) cancels it and waits at
+    ///   most [`STOP_WAIT`]. Its specialization is kept, whatever signal
+    ///   came, since it fits its facts.
+    /// - Once either signal came the attempt is cancelled; a refusal,
+    ///   a panic, a silent end or a thread that could not start refuses
+    ///   it, with the reason.
+    pub fn attempt(
+        &mut self,
+        facts: ImportFacts,
+        wait: impl FnOnce(),
+        mut quit: impl FnMut() -> bool,
+        mut end_run: impl FnMut() -> bool,
+    ) -> (ForAttempt, Specialized) {
+        if let Some(kept) = self.cached.as_ref().filter(|c| c.facts.holds(&facts)) {
+            return (
+                ForAttempt::Ready(Arc::clone(&kept.bundle)),
+                Specialized::Reused,
+            );
+        }
+        drop(self.cached.take());
+        wait();
+        let signaled = std::cell::Cell::new(false);
+        let play = Arc::clone(&self.play);
+        let from = Instant::now();
+        let ran = run_job(
+            move |cancel: &Cancel| specialize(&play, &facts, cancel),
+            || {
+                let seen = quit();
+                signaled.set(signaled.get() || seen);
+                seen
+            },
+            || {
+                let seen = end_run();
+                signaled.set(signaled.get() || seen);
+                seen
+            },
+        );
+        let took = from.elapsed();
+        let skin = match ran {
+            Ran::Done(Ok(s)) => {
+                let bundle = Arc::clone(&s.bundle);
+                let atlas = Atlas {
+                    texels: bundle.atlas_texels(),
+                    side: bundle.side(),
+                };
+                log_specialized(&s.summary, &s.facts, took, atlas, log::logger());
+                self.cached = Some(s);
+                ForAttempt::Ready(bundle)
+            }
+            Ran::Done(Err(why)) | Ran::Refused(why) => ForAttempt::Refused(format!(
+                "the play skin cannot be built for this chart: {why}"
+            )),
+            Ran::Abandoned => ForAttempt::Cancelled,
+        };
+        let skin = if signaled.get() {
+            ForAttempt::Cancelled
+        } else {
+            skin
+        };
+        (skin, Specialized::Ran)
+    }
 }
 
 /// An import's report as the log shows it: the definition files read, the
@@ -370,7 +509,6 @@ fn built(
 ///
 /// The located reason the import or the pack refuses, and a read of a
 /// fact `facts` leaves pending.
-#[cfg_attr(not(test), expect(dead_code, reason = "activated by S10-07c-2"))]
 pub fn specialize(
     pending: &PendingPlay,
     facts: &ImportFacts,
@@ -636,14 +774,22 @@ pub enum Shown {
     BuiltIn(String),
     /// Its skin was refused, for the reason.
     Refused(String),
+    /// Its skin is pending: it reads this chart fact as it is built, and
+    /// is built for each chart before its play.
+    Pending(FactId),
 }
 
 /// The stdout line of `kind`: `skin: <kind>: installed`, `skin: <kind>:
-/// built-in: <reason>` or `skin: <kind>: refused: <reason>`.
+/// built-in: <reason>`, `skin: <kind>: refused: <reason>` or `skin:
+/// <kind>: pending: <what it reads>`.
 pub fn line(kind: ScreenKind, shown: &Shown) -> String {
     let kind = name(kind);
     match shown {
         Shown::Installed => format!("skin: {kind}: installed"),
+        Shown::Pending(fact) => format!(
+            "skin: {kind}: pending: reads {} as it is built; built for each chart before its play",
+            fact_name(*fact)
+        ),
         Shown::BuiltIn(why) => format!("skin: {kind}: built-in: {why}"),
         Shown::Refused(why) => format!("skin: {kind}: refused: {why}"),
     }
@@ -684,15 +830,55 @@ pub fn log_installed(
     committed: u64,
     log: &dyn log::Log,
 ) {
-    let u = &summary.usage;
     let Atlas { texels, side } = atlas;
     let square = u64::from(side).saturating_mul(u64::from(side)).max(1);
-    let mut head = format!(
+    let head = format!(
         "installed; atlas {texels} texels (side {side}, {} layers), committed {committed} \
-         of {} texels; elements {} images {} frames {} files {} fonts {} texts {} notes {}; \
-         files {}; choices ",
+         of {} texels",
         texels / square,
         render::SHARED_TEXELS,
+    );
+    log_summary(kind, &head, summary, log);
+}
+
+/// Logs a pending play skin's specialization for an attempt, as an
+/// installed skin's summary ([`log_installed`]) after one line with the
+/// facts it read, the job's wall time (from its start to its thread's
+/// join: reads, scheduling and waits included) and its atlas.
+pub fn log_specialized(
+    summary: &Summary,
+    facts: &FactDeps,
+    job: Duration,
+    atlas: Atlas,
+    log: &dyn log::Log,
+) {
+    let Atlas { texels, side } = atlas;
+    let square = u64::from(side).saturating_mul(u64::from(side)).max(1);
+    let read = if facts.reads.is_empty() {
+        "none".to_owned()
+    } else {
+        facts
+            .reads
+            .iter()
+            .map(|r| format!("{:?}={:?}", r.fact, r.value))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let head = format!(
+        "specialized; facts {read}; job {} ms; atlas {texels} texels (side {side}, {} layers)",
+        job.as_millis(),
+        texels / square,
+    );
+    log_summary(ScreenKind::Play, &head, summary, log);
+}
+
+/// `head`, then `summary`'s counters, definition files and file choices
+/// on the same line, then its notes, located, as `kind`'s log summary.
+fn log_summary(kind: ScreenKind, head: &str, summary: &Summary, log: &dyn log::Log) {
+    let u = &summary.usage;
+    let mut head = format!(
+        "{head}; elements {} images {} frames {} files {} fonts {} texts {} notes {}; \
+         files {}; choices ",
         u.elements,
         u.images,
         u.frames,
@@ -744,7 +930,6 @@ pub fn jobs_started() -> u64 {
 /// each ended thread whose outcome it returned, a panic's and a silent
 /// end's included; never an abandoned one.
 #[cfg(feature = "dev-tools")]
-#[cfg_attr(not(test), expect(dead_code, reason = "activated by S10-07c-2"))]
 pub fn jobs_joined() -> u64 {
     JOINED.load(std::sync::atomic::Ordering::SeqCst)
 }
@@ -778,7 +963,7 @@ pub type Build =
     Arc<dyn Fn(ScreenKind, &SkinChoice, bool, &ImportTarget, &Cancel) -> KindOutcome + Send + Sync>;
 
 /// What startup leaves for the first screen.
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default)]
 pub struct Started {
     /// Play's admission notice when its skin was refused (song selection):
     /// no chart is admitted, and the built-in skin does not stand in.
@@ -786,7 +971,25 @@ pub struct Started {
     /// The select screen's one notice line for the other kinds refused or
     /// left built in.
     pub notice: Option<String>,
+    /// Play's pending skin, marked pending on the render thread: each
+    /// attempt is prepared with its specialization ([`PendingSkin`]).
+    pub pending: Option<PendingSkin>,
 }
+
+impl PartialEq for Started {
+    /// The notices equal, and the pending skins the same one, if any.
+    fn eq(&self, other: &Self) -> bool {
+        self.play == other.play
+            && self.notice == other.notice
+            && match (&self.pending, &other.pending) {
+                (None, None) => true,
+                (Some(a), Some(b)) => Arc::ptr_eq(&a.play, &b.play),
+                _ => false,
+            }
+    }
+}
+
+impl Eq for Started {}
 
 /// Why startup ended the run.
 #[derive(Debug)]
@@ -857,30 +1060,34 @@ pub fn startup(
             _ if stop() => return Err(StartupEnd::Closed),
             Ran::Abandoned => return Err(StartupEnd::Closed),
             Ran::Refused(why) | Ran::Done(KindOutcome::Refused(why)) => Shown::Refused(why),
-            // Not installed yet: refused as before a chart is chosen.
-            Ran::Done(KindOutcome::Pending(_, note)) => Shown::Refused(note.refusal()),
+            // Only play's skin can be pending ([`built`]).
+            Ran::Done(KindOutcome::Pending(play, note)) => {
+                match answered(kind, render.pend(kind), &mut stop)? {
+                    None => {
+                        started.pending = Some(PendingSkin::new(play));
+                        Shown::Pending(note.fact)
+                    }
+                    Some(why) => Shown::Refused(why),
+                }
+            }
             Ran::Done(KindOutcome::BuiltIn(why)) => Shown::BuiltIn(why),
             Ran::Done(KindOutcome::Bundle(bundle, summary)) => {
                 let (texels, side) = (bundle.atlas_texels(), bundle.side());
-                match selected(render, kind, bundle, &mut stop) {
-                    Ok(None) => {
+                let pending = render.select(kind, Some(bundle));
+                match answered(kind, pending, &mut stop)? {
+                    None => {
                         committed = committed.saturating_add(texels);
                         let atlas = Atlas { texels, side };
                         log_installed(kind, &summary, atlas, committed, log::logger());
                         Shown::Installed
                     }
-                    Ok(Some(why)) => Shown::Refused(why),
-                    Err(StartupEnd::Failed(e)) => {
-                        report(kind, &Shown::Refused(format!("{e:#}")));
-                        return Err(StartupEnd::Failed(e));
-                    }
-                    Err(closed) => return Err(closed),
+                    Some(why) => Shown::Refused(why),
                 }
             }
         };
         report(kind, &shown);
         match shown {
-            Shown::Installed => {}
+            Shown::Installed | Shown::Pending(_) => {}
             Shown::Refused(why) | Shown::BuiltIn(why) if kind == ScreenKind::Play => {
                 if launch == Launch::Direct {
                     return Err(StartupEnd::Failed(anyhow::anyhow!(
@@ -915,15 +1122,32 @@ const fn choice_of(skins: &SkinChoices, kind: ScreenKind) -> Option<&SkinChoice>
     }
 }
 
-/// Selects `bundle` for `kind` and polls the answer to its end: `None`
-/// installed, or the healthy refusal's reason.
-fn selected(
-    render: &RenderLink,
+/// [`polled`], with a failure reported as `kind`'s refused line once the
+/// selection is withdrawn: `None` committed, or the healthy refusal's
+/// reason.
+///
+/// # Errors
+///
+/// As [`polled`].
+fn answered(
     kind: ScreenKind,
-    bundle: Arc<SkinBundle>,
+    pending: crate::render_side::PendingSelect,
     stop: &mut impl FnMut() -> bool,
 ) -> Result<Option<String>, StartupEnd> {
-    let mut pending = render.select(kind, Some(bundle));
+    let answer = polled(kind, pending, stop);
+    if let Err(StartupEnd::Failed(e)) = &answer {
+        report(kind, &Shown::Refused(format!("{e:#}")));
+    }
+    answer
+}
+
+/// Polls `kind`'s selection `pending` (an installation or the pending
+/// marker) to its end: `None` committed, or the healthy refusal's reason.
+fn polled(
+    kind: ScreenKind,
+    mut pending: crate::render_side::PendingSelect,
+    stop: &mut impl FnMut() -> bool,
+) -> Result<Option<String>, StartupEnd> {
     loop {
         if stop() {
             // Withdrawn as it drops: a completion after it installs

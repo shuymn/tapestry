@@ -695,6 +695,24 @@ impl Screen for MenuScreen {
         Ok(timing)
     }
 
+    /// The cleared canvas with the load's lines where a skin's loading
+    /// frame has them; no skin's frame.
+    fn pending_loading(
+        &mut self,
+        page: &MenuPage,
+        changed: bool,
+    ) -> Result<FrameTiming, RenderError> {
+        if changed || self.stale || self.text.is_none() {
+            self.prepare(page, LOADING_LEFT, LOADING_TOP)?;
+        }
+        let Some(text) = &self.text else {
+            return Err(RenderError::OtherRenderersText);
+        };
+        let timing = self.renderer.menu_frame(|_| {}, text)?;
+        self.shown(timing.presented);
+        Ok(timing)
+    }
+
     fn menu(&mut self, page: &MenuPage, changed: bool) -> Result<FrameTiming, RenderError> {
         let timing = self.menu_frame(page, changed)?;
         self.shown(timing.presented);
