@@ -15,6 +15,8 @@ pub(crate) mod asset;
 mod budget;
 pub(crate) mod callback;
 pub(crate) mod geom;
+#[cfg(feature = "dev-tools")]
+pub(crate) mod ledger;
 mod object;
 pub(crate) mod ops;
 mod policy;
@@ -102,6 +104,60 @@ impl Config {
         }
     }
 
+    /// The configuration that names options and file choices against
+    /// `header`: each named option's item and each named file choice's
+    /// candidate, the rest the header's defaults ([`Self::defaults`]); no
+    /// offsets.
+    ///
+    /// # Errors
+    ///
+    /// The first name the header does not have, named.
+    pub fn named<'a>(
+        header: &Header,
+        options: impl IntoIterator<Item = (&'a str, &'a str)>,
+        files: impl IntoIterator<Item = (&'a str, &'a str)>,
+    ) -> Result<Self, String> {
+        let mut config = Self::defaults(header);
+        for (option, item) in options {
+            let Some((i, spec)) = header
+                .options
+                .iter()
+                .enumerate()
+                .find(|(_, o)| o.name.as_deref() == Some(option))
+            else {
+                return Err(format!("option \"{option}\" is not in the skin's header"));
+            };
+            let Some(chosen) = spec
+                .items
+                .iter()
+                .find(|it| it.name.as_deref() == Some(item))
+            else {
+                return Err(format!("option \"{option}\" has no item \"{item}\""));
+            };
+            if let Some(slot) = config.options.get_mut(i) {
+                *slot = Some(chosen.op);
+            }
+        }
+        for (file, candidate) in files {
+            let Some(spec) = header
+                .files
+                .iter()
+                .find(|f| f.name.as_deref() == Some(file))
+            else {
+                return Err(format!(
+                    "file choice \"{file}\" is not in the skin's header"
+                ));
+            };
+            if !spec.candidates.iter().any(|c| c == candidate) {
+                return Err(format!(
+                    "file choice \"{file}\" has no candidate \"{candidate}\""
+                ));
+            }
+            config.files.insert(file.to_owned(), candidate.to_owned());
+        }
+        Ok(config)
+    }
+
     /// Every selected item's number: what the source tree's conditions
     /// see (`JSONSkinLoader.java:254-260`).
     #[must_use]
@@ -182,6 +238,8 @@ pub fn import(
         });
     }
     let tables = resolved.tables(&enabled)?;
+    #[cfg(feature = "dev-tools")]
+    let mut ledger = ledger::Recorder::new(object::records(&tables, "destination").len());
     let Resolved { def, size, .. } = resolved;
     let mut files = Vec::new();
     let choices = Choices::new(header, config, &mut files);
@@ -194,8 +252,15 @@ pub fn import(
     let destinations = object::records(&cx.tables, "destination").to_vec();
     cx.span_hint = cx.lane_span_hint(&destinations);
     for (index, rec) in destinations.into_iter().enumerate() {
-        cx.destination(index, rec)?;
+        #[cfg(feature = "dev-tools")]
+        ledger.begin(&mut cx);
+        let read = cx.destination(index, rec);
+        #[cfg(feature = "dev-tools")]
+        ledger.end(&mut cx, index, read.is_err());
+        read?;
     }
+    #[cfg(feature = "dev-tools")]
+    ledger.publish(&mut cx);
     cx.finish(files)
 }
 
@@ -362,6 +427,13 @@ pub(crate) struct Cx<'d> {
     /// The destination being read, for the conversion report's records.
     #[cfg(feature = "dev-tools")]
     element: Option<crate::lua::survey::Element>,
+    /// A condition of the destination being read folded false, for the
+    /// conversion report's ledger.
+    #[cfg(feature = "dev-tools")]
+    folded: bool,
+    /// The notes as the ledger located them, for the report if none follow.
+    #[cfg(feature = "dev-tools")]
+    located: Option<Vec<Note>>,
 }
 
 /// A witness of the order of an import's work.
@@ -440,6 +512,10 @@ impl<'d> Cx<'d> {
             selectors: HashMap::new(),
             #[cfg(feature = "dev-tools")]
             element: None,
+            #[cfg(feature = "dev-tools")]
+            folded: false,
+            #[cfg(feature = "dev-tools")]
+            located: None,
         };
         cx.budget.usage.resolved_digit_offsets =
             u32::try_from(cx.tables.digit_offsets.len()).unwrap_or(u32::MAX);
@@ -1081,6 +1157,7 @@ impl<'d> Cx<'d> {
             if !self.condition(role, at, cond, &mut conds, &mut deviates)? {
                 #[cfg(feature = "dev-tools")]
                 if folded {
+                    self.folded = true;
                     let callables = dst.ops.iter().filter_map(|op| match op {
                         Op::Callable(id) => Some(*id),
                         _ => None,
@@ -1659,6 +1736,13 @@ impl<'d> Cx<'d> {
             let at = self.load_loc(&source);
             ImportError::Model { at, source }
         })?;
+        #[cfg(feature = "dev-tools")]
+        let notes = self
+            .located
+            .take()
+            .filter(|n| n.len() == self.notes.list.len())
+            .unwrap_or_else(|| report::locate(&self.def.arena, &self.notes.list));
+        #[cfg(not(feature = "dev-tools"))]
         let notes = report::locate(&self.def.arena, &self.notes.list);
         let report = Report {
             sources: self.def.arena.sources(),

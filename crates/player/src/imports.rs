@@ -590,45 +590,11 @@ fn pack(
 ///
 /// The first name the header does not have, named.
 fn config(header: &Header, choice: &SkinChoice) -> Result<Config, String> {
-    let mut config = Config::defaults(header);
-    for (option, item) in &choice.options {
-        let Some((i, spec)) = header
-            .options
-            .iter()
-            .enumerate()
-            .find(|(_, o)| o.name.as_deref() == Some(option.as_str()))
-        else {
-            return Err(format!("option \"{option}\" is not in the skin's header"));
-        };
-        let Some(chosen) = spec
-            .items
-            .iter()
-            .find(|it| it.name.as_deref() == Some(item.as_str()))
-        else {
-            return Err(format!("option \"{option}\" has no item \"{item}\""));
-        };
-        if let Some(slot) = config.options.get_mut(i) {
-            *slot = Some(chosen.op);
-        }
-    }
-    for (file, candidate) in &choice.files {
-        let Some(spec) = header
-            .files
-            .iter()
-            .find(|f| f.name.as_deref() == Some(file.as_str()))
-        else {
-            return Err(format!(
-                "file choice \"{file}\" is not in the skin's header"
-            ));
-        };
-        if !spec.candidates.iter().any(|c| c == candidate) {
-            return Err(format!(
-                "file choice \"{file}\" has no candidate \"{candidate}\""
-            ));
-        }
-        config.files.insert(file.clone(), candidate.clone());
-    }
-    Ok(config)
+    Config::named(
+        header,
+        choice.options.iter().map(|(o, i)| (o.as_str(), i.as_str())),
+        choice.files.iter().map(|(f, c)| (f.as_str(), c.as_str())),
+    )
 }
 
 /// How a job on its own thread ended, as [`run_job`] returns it.
