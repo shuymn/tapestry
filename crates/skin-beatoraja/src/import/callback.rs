@@ -1009,10 +1009,28 @@ impl Cx<'_> {
     /// record with `why` it did not lower.
     fn outcome(
         &self,
+        at: (u32, u32),
+        field: &'static str,
+        role: Role,
+        d: (Disposition, Option<Unsupported>),
+    ) {
+        self.record(at, field, role, d, None);
+    }
+
+    /// [`Self::outcome`] of callable `c` at node `id`, lowered to `l`.
+    fn lowered_outcome(&self, at: (u32, u32), field: &'static str, role: Role, l: &Lowered) {
+        self.record(at, field, role, (Disposition::Lowered, None), Some(l));
+    }
+
+    /// [`Self::outcome`]'s work, with what the callback lowered to, if it
+    /// did, for the report.
+    fn record(
+        &self,
         (c, id): (u32, u32),
         field: &'static str,
         role: Role,
         (d, why): (Disposition, Option<Unsupported>),
+        lowered: Option<&Lowered>,
     ) {
         let Some(an) = self.analysis() else {
             return;
@@ -1031,25 +1049,14 @@ impl Cx<'_> {
                 disposition: d,
                 why,
                 element: self.element.clone(),
-                lowered: None,
+                lowered: lowered.map(|l| crate::lua::survey::Lowered {
+                    src: l.src.clone(),
+                    guards: l.guards.clone(),
+                    constant: l.constant,
+                }),
             });
         #[cfg(not(feature = "dev-tools"))]
-        let _ = (id, field, role, why);
-    }
-
-    /// Records, for the report, what the callback [`Self::outcome`] just
-    /// recorded lowered to.
-    #[cfg(feature = "dev-tools")]
-    fn lowered_to(&self, l: &Lowered) {
-        if let Some(an) = self.analysis()
-            && let Some(c) = an.consumed.borrow_mut().last_mut()
-        {
-            c.lowered = Some(crate::lua::survey::Lowered {
-                src: l.src.clone(),
-                guards: l.guards.clone(),
-                constant: l.constant,
-            });
-        }
+        let _ = (id, field, role, why, lowered);
     }
 
     /// Records why the callback at node `id`, read, was not consumed:
@@ -1266,9 +1273,7 @@ impl Cx<'_> {
         let critical = role != Role::Decorative;
         let why = match self.lower(id, Conv::Truthy) {
             Ok(Lowering::Lowered(l)) => {
-                self.outcome((c, id), field, role, (Disposition::Lowered, None));
-                #[cfg(feature = "dev-tools")]
-                self.lowered_to(&l);
+                self.lowered_outcome((c, id), field, role, &l);
                 #[cfg(test)]
                 LOWERED.with(|w| {
                     let mut all: Vec<String> = l.guards.iter().map(|g| (*g).to_owned()).collect();
@@ -1324,14 +1329,7 @@ impl Cx<'_> {
         let c = self.callable_at(id).map_or(NONE, |(c, _)| c);
         let (why, scan) = match self.lower(id, Conv::Int) {
             Ok(Lowering::Lowered(l)) => {
-                self.outcome(
-                    (c, id),
-                    "value",
-                    l.part.map_or(base, Role::Critical),
-                    (Disposition::Lowered, None),
-                );
-                #[cfg(feature = "dev-tools")]
-                self.lowered_to(&l);
+                self.lowered_outcome((c, id), "value", l.part.map_or(base, Role::Critical), &l);
                 #[cfg(test)]
                 LOWERED.with(|w| w.borrow_mut().push(l.src.clone()));
                 #[cfg(test)]

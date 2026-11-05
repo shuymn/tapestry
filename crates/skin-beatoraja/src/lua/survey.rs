@@ -164,7 +164,8 @@ fn effects(arena: &Arena, an: &Analysis) -> Option<(String, Option<Loc>)> {
 
 /// The records of `arena`'s callbacks after an import ([`Records`]);
 /// `completed` when the import finished, so that a callback it never read
-/// was in a field no consumer reads.
+/// was in a field no consumer reads. The consumed records are taken out
+/// of `an`.
 pub(crate) fn records(arena: &Arena, an: &Analysis, completed: bool) -> Records {
     Records {
         consumers: consumers(arena, an, completed),
@@ -174,7 +175,7 @@ pub(crate) fn records(arena: &Arena, an: &Analysis, completed: bool) -> Records 
 
 fn consumers(arena: &Arena, an: &Analysis, completed: bool) -> Vec<(Loc, Consumer)> {
     let mut out = Vec::new();
-    for c in an.consumed.borrow().iter() {
+    for c in an.consumed.take() {
         out.push((
             arena.loc(c.node),
             Consumer {
@@ -187,8 +188,8 @@ fn consumers(arena: &Arena, an: &Analysis, completed: bool) -> Vec<(Loc, Consume
                 reason: c.why.as_ref().map(unsupported),
                 local: Some(Local {
                     file: String::new(),
-                    element: c.element.clone(),
-                    lowered: c.lowered.clone(),
+                    element: c.element,
+                    lowered: c.lowered,
                 }),
             },
         ));
