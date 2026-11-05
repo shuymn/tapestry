@@ -215,6 +215,13 @@ fn course_mode_is_a_constant_and_records_nothing() {
 }
 
 #[test]
+fn the_table_song_option_is_a_constant_and_records_nothing() {
+    let d = folder("assert(ms.option(1008) == false and ms.option(-1008) == true)");
+    let i = imported(import(&d, &ImportFacts::unavailable(ScreenKind::Play)));
+    assert_eq!(i.facts, deps(&[]));
+}
+
+#[test]
 fn an_unavailable_fact_refuses_at_the_read() {
     let d = folder("local a = 1\nx = ms.option(33) and 1 or 0");
     let facts = play(Fact::Unavailable, Fact::Known(Some(ChartRank::Rank(2))));
