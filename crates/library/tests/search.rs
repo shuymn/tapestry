@@ -633,6 +633,112 @@ fn a_level_stops_at_its_limit() {
     );
 }
 
+/// A hidden chart sorting first takes no place under a limit: the limit counts
+/// only listed charts, by every filter, and in a level.
+#[test]
+fn a_hidden_chart_takes_no_place_under_a_limit() {
+    let fx = Fixture::new();
+    fx.file("song/a.bms", "#TITLE aaa hit\n#00111:01\n");
+    fx.file("song/b.bms", "#TITLE aab hit\n#00121:01\n#00118:01\n");
+    fx.listed("song/z.bms", "zzz hit");
+    let lib = fx.scanned();
+    for text in ["", "hi", "hit"] {
+        for sort in [Sort::Title, Sort::Artist, Sort::Level] {
+            for by_folder in [false, true] {
+                let list = search_limited(&lib, text, sort, by_folder, 1);
+                let titles: Vec<_> = list.iter().map(|c| c.header.title.as_deref()).collect();
+                assert_eq!(titles, [Some("zzz hit")], "{text:?} {sort:?} {by_folder}");
+            }
+        }
+    }
+    let key = lib.top().unwrap()[0].key.clone();
+    let level = lib.level(&key, Sort::Title, 1).unwrap();
+    assert_eq!(chart_titles(&level), ["zzz hit"]);
+    assert!(!level.more);
+}
+
+/// Inserts listed charts (path, folder, title) under `root` directly: more
+/// than a test's scan should write, in folders no temporary folder can spell.
+fn insert_listed(db: &Path, root: &str, charts: &[(String, String, &str)]) {
+    let mut conn = rusqlite::Connection::open(db).unwrap();
+    let tx = conn.transaction().unwrap();
+    tx.execute("INSERT INTO roots (path) VALUES (?1)", [root])
+        .unwrap();
+    {
+        let mut insert = tx
+            .prepare(
+                "INSERT INTO charts (root, path, size, mtime_ns, sha256, md5, title, norm_text,
+                     title_key, folder, mode, random, loader)
+                 SELECT id, ?1, 0, 0, zeroblob(32), zeroblob(16), ?3, ?3, ?3, ?2, 0, 0, 0
+                 FROM roots WHERE path = ?4",
+            )
+            .unwrap();
+        for (path, folder, title) in charts {
+            insert
+                .execute(rusqlite::params![path, folder, title, root])
+                .unwrap();
+        }
+    }
+    tx.commit().unwrap();
+}
+
+/// A level's order is global over its song folders, however many there are:
+/// here the first chart is in the last folder, past SQLite's limit on
+/// parameters.
+#[test]
+fn a_levels_order_reaches_its_last_song_folder() {
+    const FOLDERS: usize = 33_000;
+    let fx = Fixture::new();
+    let (lib, _) = Library::open(&fx.db()).unwrap();
+    let sep = std::path::MAIN_SEPARATOR;
+    let charts: Vec<_> = (0..FOLDERS)
+        .map(|i| {
+            let folder = format!("flat{sep}s{i:05}");
+            let title = if i + 1 == FOLDERS { "A" } else { "Z" };
+            (format!("{folder}{sep}c.bms"), folder, title)
+        })
+        .collect();
+    insert_listed(&fx.db(), "flat", &charts);
+    let top = lib.top().unwrap();
+    assert_eq!(top[0].charts, FOLDERS as u64);
+    let level = lib.level(&top[0].key, Sort::Title, 1).unwrap();
+    assert_eq!(chart_titles(&level), ["A"]);
+    assert!(level.more);
+}
+
+/// A root that ends in its separator, a drive's or a share's, may directly
+/// hold charts: each is counted once and listed once.
+#[test]
+fn a_chart_at_a_drive_or_share_root_is_counted_once() {
+    let sep = std::path::MAIN_SEPARATOR;
+    for root in [
+        format!("D:{sep}"),
+        format!("{sep}{sep}server{sep}share{sep}"),
+    ] {
+        let fx = Fixture::new();
+        let (lib, _) = Library::open(&fx.db()).unwrap();
+        let chart = |folder: String, title: &'static str| {
+            (format!("{folder}{sep}{title}.bms"), folder, title)
+        };
+        insert_listed(
+            &fx.db(),
+            &root,
+            &[
+                (format!("{root}direct.bms"), root.clone(), "direct"),
+                chart(format!("{root}song"), "song"),
+                chart(format!("{root}shard{sep}deep"), "deep"),
+            ],
+        );
+        let top = lib.top().unwrap();
+        assert_eq!(top.len(), 1, "{root}");
+        assert_eq!(top[0].charts, 3, "{root}");
+        let level = lib.level(&top[0].key, Sort::Title, 10).unwrap();
+        assert_eq!(rows(&level), [("shard", 1)], "{root}");
+        assert_eq!(chart_titles(&level), ["direct", "song"], "{root}");
+        assert!(!level.more, "{root}");
+    }
+}
+
 /// Spellings of one root are one stored root; two roots each list theirs; a
 /// replaced root's rows go, and an unreadable one's stay.
 #[test]

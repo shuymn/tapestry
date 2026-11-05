@@ -25,9 +25,11 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::{MAIN_SEPARATOR, MAIN_SEPARATOR_STR, PathBuf};
+use std::rc::Rc;
 
 use bms_parser::Header;
-use rusqlite::{Connection, ToSql, params_from_iter};
+use rusqlite::types::Value;
+use rusqlite::{Connection, ToSql, params};
 use unicode_normalization::UnicodeNormalization as _;
 
 use crate::ChartEntry;
@@ -281,9 +283,10 @@ pub struct Level {
     pub more: bool,
 }
 
-/// The stored folders under `key` are `lo <= folder < hi`: the bytes of its
+/// The stored folders under `key` are `lo < folder < hi`: the bytes of its
 /// text, then exactly one separator, so a sibling sharing its text as a
-/// prefix (`a b`, `a]`) is not among them.
+/// prefix (`a b`, `a]`) is not among them, nor is a root that ends in its
+/// separator (`D:\`), which is `lo` itself.
 fn range(key: &str) -> (String, String) {
     let lo = if key.ends_with(MAIN_SEPARATOR) {
         key.to_owned()
@@ -301,7 +304,7 @@ fn under(conn: &Connection, key: &str) -> rusqlite::Result<Vec<(String, u64)>> {
     let (lo, hi) = range(key);
     let mut stmt = conn.prepare(
         "SELECT folder, COUNT(*) FROM charts
-         WHERE mode = 0 AND folder >= ?1 AND folder < ?2 GROUP BY folder",
+         WHERE mode = 0 AND folder > ?1 AND folder < ?2 GROUP BY folder",
     )?;
     let rows = stmt.query_map([&lo, &hi], |r| {
         Ok((r.get(0)?, u64::try_from(r.get::<_, i64>(1)?).unwrap_or(0)))
@@ -345,10 +348,19 @@ pub fn top(conn: &Connection) -> rusqlite::Result<Vec<FolderRow>> {
     Ok(rows)
 }
 
-/// The most song folders one chart query names: below SQLite's limit on
-/// parameters. Each holds a chart, so a level with more is past any list's
-/// limit.
-const MOST_FOLDERS: usize = 30_000;
+/// The statement that reads a level's chart rows, in `sort` order: ?1 is the
+/// array of folders that hold them, any number of them, and ?2 the limit. By
+/// `charts_browse`, since left to itself the planner walks `charts_title` over
+/// the whole library to avoid a sort of a few hundred rows.
+fn level_charts(sort: Sort) -> String {
+    format!(
+        "SELECT {} FROM charts c INDEXED BY charts_browse
+         WHERE c.mode = 0 AND c.folder IN rarray(?1)
+         ORDER BY {} LIMIT ?2",
+        db::ENTRY_COLUMNS,
+        order(sort, false),
+    )
+}
 
 /// See [`Library::level`](crate::Library::level). `between` runs between its
 /// two reads, for the test that a commit there changes neither.
@@ -381,10 +393,10 @@ pub fn level(
     let mut folders = Vec::new();
     // A song folder: charts of its own and nothing listed below it. It has no
     // row: its charts are this level's.
-    let mut holding = vec![key_text.to_owned()];
+    let mut holding = vec![Value::Text(key_text.to_owned())];
     for (name, (own, below)) in children {
         if below == 0 {
-            holding.push(format!("{lo}{name}"));
+            holding.push(Value::Text(format!("{lo}{name}")));
         } else {
             folders.push(FolderRow {
                 key: FolderKey(format!("{lo}{name}")),
@@ -397,28 +409,18 @@ pub fn level(
     let more_folders = folders.len() > limit;
     folders.truncate(limit);
     let left = limit - folders.len();
-    let more_named = holding.len() > MOST_FOLDERS;
-    holding.truncate(MOST_FOLDERS);
-    let marks = vec!["?"; holding.len()].join(", ");
-    let sql = format!(
-        "SELECT {} FROM charts c INDEXED BY charts_browse
-         WHERE c.mode = 0 AND c.folder IN ({marks})
-         ORDER BY {} LIMIT {}",
-        db::ENTRY_COLUMNS,
-        order(sort, false),
-        i64::try_from(left)
-            .unwrap_or(i64::MAX - 1)
-            .saturating_add(1),
-    );
-    let mut stmt = tx.prepare(&sql)?;
-    let rows = stmt.query(params_from_iter(&holding))?;
+    let past_limit = i64::try_from(left)
+        .unwrap_or(i64::MAX - 1)
+        .saturating_add(1);
+    let mut stmt = tx.prepare(&level_charts(sort))?;
+    let rows = stmt.query(params![Rc::new(holding), past_limit])?;
     let mut charts: Vec<ChartEntry> = rows.mapped(db::entry).collect::<rusqlite::Result<_>>()?;
     let more_charts = charts.len() > left;
     charts.truncate(left);
     Ok(Level {
         folders,
         charts,
-        more: more_folders || more_named || more_charts,
+        more: more_folders || more_charts,
     })
 }
 
@@ -478,6 +480,32 @@ mod tests {
         let title = plan(&candidates(ALL_LISTED, &order(Sort::Title, false), 1));
         assert!(title.contains("charts_title"), "{title}");
         assert!(!title.contains("TEMP B-TREE"), "{title}");
+    }
+
+    /// However many song folders a level has, its chart rows seek them by
+    /// `charts_browse`, for every order.
+    #[test]
+    fn a_levels_charts_read_the_browse_index() {
+        let conn = Connection::open_in_memory().unwrap();
+        rusqlite::vtab::array::load_module(&conn).unwrap();
+        db::create(&conn).unwrap();
+        for sort in [Sort::Title, Sort::Artist, Sort::Level, Sort::Modified] {
+            let sql = format!("EXPLAIN QUERY PLAN {}", level_charts(sort));
+            let mut stmt = conn.prepare(&sql).unwrap();
+            let rows = stmt
+                .query_map(params![Rc::new(Vec::<Value>::new()), 1], |r| {
+                    r.get::<_, String>(3)
+                })
+                .unwrap();
+            let plan = rows
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+                .join("; ");
+            assert!(
+                plan.contains("charts_browse (mode=? AND folder=?)"),
+                "{sort:?}: {plan}"
+            );
+        }
     }
 
     /// A commit between a level's two reads changes neither: its song folder

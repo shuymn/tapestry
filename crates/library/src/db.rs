@@ -67,6 +67,8 @@ pub fn connect(path: &Path) -> rusqlite::Result<Connection> {
     let conn = Connection::open(path)?;
     conn.busy_timeout(BUSY_TIMEOUT)?;
     conn.pragma_update(None, "foreign_keys", true)?;
+    // For a level's array of folders, which may pass the limit on parameters.
+    rusqlite::vtab::array::load_module(&conn)?;
     let mode: String =
         conn.pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get(0))?;
     if !mode.eq_ignore_ascii_case("wal") {
