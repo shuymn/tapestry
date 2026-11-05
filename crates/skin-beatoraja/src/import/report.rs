@@ -270,6 +270,12 @@ pub enum NoteKind {
     OverCap {
         cap: &'static str,
     },
+    /// A frame that cannot have a place in an atlas page: `w`×`h` are the
+    /// texels of the cell the sheet would admit (stage 3's D19).
+    CellTooLarge {
+        w: u32,
+        h: u32,
+    },
     /// A source rectangle with a negative corner or size (a mirrored
     /// cut), or one leaving its file, which the source cuts as given
     /// (`JsonSkinObjectLoader.java:600-619`).
@@ -329,6 +335,9 @@ impl fmt::Display for NoteKind {
             Self::Deviation(d) => write!(f, "deviation {d:?}"),
             Self::MissingAsset => f.write_str("a missing or unreadable file"),
             Self::OverCap { cap } => write!(f, "a file over the {cap} cap"),
+            Self::CellTooLarge { w, h } => {
+                write!(f, "a frame of {w}×{h} with its gutter does not fit a page")
+            }
             Self::SourceRect => f.write_str("a mirrored or out-of-file source rectangle"),
             Self::BitmapFont(e) => write!(f, "a bitmap font refused ({e})"),
             Self::Ignored { field } => write!(f, "`{field}` ignored"),

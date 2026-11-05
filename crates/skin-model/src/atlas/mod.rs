@@ -200,6 +200,22 @@ fn page_cap(limits: &AtlasLimits, extra: u32) -> Result<u32, AtlasError> {
     Ok(pages)
 }
 
+/// A cell's allocation size, its content with its gutter and alignment,
+/// when that fits a page of side `cap`.
+fn allocation(cell: [u32; 2], cap: u32) -> Option<[u32; 2]> {
+    pack::padded(cell).filter(|size| size.iter().all(|&s| s <= cap))
+}
+
+/// Whether a cell of `[w, h]` texels, in the version an atlas reads, fits
+/// the largest page any atlas has ([`MAX_PAGE_SIDE`]): the check
+/// [`Sheet::atlas_reserving`] makes of each cell. A lower device limit, the
+/// pages all the cells need and the array's texels are decided by that
+/// build.
+#[must_use]
+pub fn cell_fits_page(cell: [u32; 2]) -> bool {
+    allocation(cell, pack::side_cap(MAX_PAGE_SIDE)).is_some()
+}
+
 impl Sheet {
     /// Builds the atlas of `variant` within `limits`.
     ///
@@ -279,10 +295,7 @@ impl Sheet {
                 cell.rect
             };
             let [_, _, w, h] = rect;
-            let size = pack::padded([w, h]).ok_or(AtlasError::CellTooLarge { w, h })?;
-            if size.iter().any(|&s| s > cap) {
-                return Err(AtlasError::CellTooLarge { w, h });
-            }
+            let size = allocation([w, h], cap).ok_or(AtlasError::CellTooLarge { w, h })?;
             rects.push(rect);
             padded.push(size);
         }

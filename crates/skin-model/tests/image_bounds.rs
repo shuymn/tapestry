@@ -437,6 +437,28 @@ fn atlas_caps_come_before_its_pages() {
         "{err:?}"
     );
     assert!(peak < page, "peak {peak}");
+    // A cell fits the largest page at 8 176 texels: with both gutters
+    // exactly its side. At 8 177 alignment takes it to 8 200, which the
+    // build refuses as well, on either axis.
+    for cell in [[8_176, 1], [1, 8_176], [8_176, 8_176]] {
+        assert!(skin_model::cell_fits_page(cell), "{cell:?}");
+    }
+    let largest = AtlasLimits {
+        max_side: 8_192,
+        ..limits
+    };
+    for (w, h) in [(8_177, 1), (1, 8_177)] {
+        assert!(!skin_model::cell_fits_page([w, h]));
+        save(root, "c.png", &solid(w, h, [255; 4]));
+        let sheet = load_files(root, &["c.png"]).unwrap();
+        let err = sheet.atlas(Variant::Lo, largest, &|| false).unwrap_err();
+        assert!(
+            matches!(err, AtlasError::CellTooLarge { w: a, h: b } if (a, b) == (w, h)),
+            "{err:?}"
+        );
+    }
+    // Far past any page, and where the padding itself overflows.
+    assert!(!skin_model::cell_fits_page([u32::MAX, 1]));
     // Limits that leave no layer, a side below 256, or a layer past u16.
     for bad in [
         AtlasLimits {

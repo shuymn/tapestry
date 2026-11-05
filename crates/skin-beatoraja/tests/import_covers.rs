@@ -936,6 +936,39 @@ fn edge_paint(l: &Loaded, rect: [f32; 4], at: &[(f32, f32)]) -> Vec<[u8; 4]> {
 }
 
 #[test]
+fn a_cropped_cover_is_judged_by_the_rows_it_keeps() {
+    // An 8 177-row frame fits no atlas page, but stretch 5 keeps 89 of its
+    // rows: the sheet admits those, so SUDDEN+ stays, whatever else uses
+    // the record. Drawn whole, the same record is dropped on its own, and
+    // it refuses SUDDEN+ under a stretch that keeps every row.
+    let frame = r#"{"id": "ct", "src": "a", "x": 0, "y": 0, "w": 64, "h": 8177}"#;
+    let plain = r#"{"id": "ct", "dst": [{"x": 0, "y": 0, "w": 10, "h": 10}]}"#;
+    let over = NoteKind::CellTooLarge { w: 64, h: 8_177 };
+    let run = |dsts: &[&str]| {
+        let mut all = vec![NOTES];
+        all.extend_from_slice(dsts);
+        import_sized(
+            [1_920, 1_080],
+            &body(frame, &note(""), &all),
+            &[("a.png", 64, 8_177)],
+        )
+    };
+    let paint = stretched("ct", 5);
+    let l = run(&[&paint]);
+    assert!(!has(l.report(), over), "{:?}", l.report());
+    assert_eq!(rows_drawn(&l, 64.0), 89.0);
+    for dsts in [[plain, &*paint], [&*paint, plain]] {
+        let l = run(&dsts);
+        assert!(has(l.report(), over), "{:?}", l.report());
+        assert_eq!(rows_drawn(&l, 64.0), 89.0);
+    }
+    assert_eq!(
+        critical(run(&[&stretched("ct", 0)])),
+        (CriticalPart::Cover, over)
+    );
+}
+
+#[test]
 fn a_trimmed_cover_past_the_edge_crops_its_cells_rows() {
     // An 8×64 frame past a.png's right edge (64×256) fit to 80 would be
     // 640 high: stretch 5 keeps the 320 px destination and the cell's

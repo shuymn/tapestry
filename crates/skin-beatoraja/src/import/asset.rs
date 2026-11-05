@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use skin_model::{
     AdmitError, BitmapFontError, Charge, FileDef, Filter, FntAdmitError, FntError, FntFileError,
     FntLimit, FontAdmitError, FontDef, FontError, ImageDef, ImageError, MAX_PATH_BYTES, Refused,
-    Root, Sheet, SheetBuilder, SolidImageDef, TexelCap, Unbanded,
+    Root, Sheet, SheetBuilder, SolidImageDef, TexelCap, Unbanded, cell_fits_page,
 };
 
 use super::Config;
@@ -247,6 +247,15 @@ pub(crate) type ImageKey = (u32, bool, [u32; 2], bool);
 /// the count.
 pub(crate) type Crop = [u32; 2];
 
+/// Why an image was not added to the sheet.
+#[derive(Debug)]
+pub(crate) enum NotAdded {
+    /// Its cell, as the sheet would admit it, fits no atlas page.
+    CellTooLarge { w: u32, h: u32 },
+    /// The sheet refused it.
+    Image(ImageError),
+}
+
 /// The size of a note part's generated paint, as the source generates
 /// it (`play/SkinNote.java:113-138`).
 pub(crate) const FALLBACK_SIZE: [u32; 2] = [32, 8];
@@ -461,16 +470,29 @@ impl Assets {
         self.bases.get(&key).copied()
     }
 
+    /// Why the sheet would not take image `def` now, adding nothing. The
+    /// cell it admits, after an edge substitution and any crop in `def`,
+    /// must fit an atlas page; no import has an @2x file, so its 1x size is
+    /// the one an atlas reads.
+    pub(crate) fn check_image(&self, def: &ImageDef) -> Result<(), NotAdded> {
+        let [w, h] = self.builder.check_image(def).map_err(NotAdded::Image)?;
+        if cell_fits_page([w, h]) {
+            Ok(())
+        } else {
+            Err(NotAdded::CellTooLarge { w, h })
+        }
+    }
+
     /// Adds image `def` with cells of `cell` under `key`, its single
     /// frame cut to the rows of `crop` when there is one; returns the
-    /// image and its cell.
+    /// image and its cell. Checked as [`Self::check_image`] says.
     pub(crate) fn add_image(
         &mut self,
         key: ImageKey,
         crop: Option<Crop>,
         def: ImageDef,
         cell: [u32; 2],
-    ) -> Result<(u32, [u32; 2]), ImageError> {
+    ) -> Result<(u32, [u32; 2]), NotAdded> {
         let (added, added_cell) = match (crop, def.rect) {
             (Some([y, rows]), Some([x, _, w, _])) => (
                 ImageDef {
@@ -481,7 +503,8 @@ impl Assets {
             ),
             _ => (def, cell),
         };
-        let i = self.builder.add_image(added)?;
+        self.check_image(&added)?;
+        let i = self.builder.add_image(added).map_err(NotAdded::Image)?;
         self.bases.insert(key, (def, cell));
         self.images.insert((key, crop), (i, added_cell));
         Ok((i, added_cell))
