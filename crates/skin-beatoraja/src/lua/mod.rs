@@ -58,6 +58,7 @@ mod ledger;
 mod library;
 pub mod limits;
 mod loader;
+pub(crate) mod residual;
 #[cfg(test)]
 mod root_tests;
 mod sandbox;
