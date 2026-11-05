@@ -319,13 +319,10 @@ fn writers_never_lower() {
     assert_eq!(callbacks, [Disposition::Replaced(Unsupported::Writes)]);
     // Rm's target writer: a value that writes the upvalue it shows, a
     // critical EX score read.
-    let target = "local _number = 0\n\
-                  skin.value = { { id = \"v\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, digit = 4,\n\
-                    value = function() _number = ms.number(101) return _number end } }";
     let (r, callbacks) = outcome(
-        &skin(
-            target,
-            "{ id = \"v\", dst = { { x = 0, y = 0, w = 6, h = 6 } } },",
+        &number(
+            "local _number = 0",
+            "function() _number = ms.number(101) return _number end",
         ),
         &[],
     );

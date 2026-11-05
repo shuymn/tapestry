@@ -848,9 +848,10 @@ impl Classify<'_> {
 /// captured graph: `H.f` with `H`'s final binding ([`Analysis::binding`])
 /// the host module, its proxy unchanged, `f` one of its APIs; or an
 /// upvalue whose final binding is a closure instance, a helper. That
-/// holds at frame time only while the candidate is closed: no root writes
-/// (admission) and no code the analysis does not see runs
-/// ([`Analysis::open`]), which lowering checks before it resolves a call.
+/// holds at frame time only while the candidate is closed: the effect
+/// walk found every root inside the modeled subset, which writes nothing,
+/// and no code the analysis does not see runs ([`Analysis::open`] unset),
+/// which lowering checks before it resolves a call.
 /// `H.f` with `f` a `main_state` API and `H` bound to anything else is
 /// [`Unsupported::Binding`].
 pub(crate) fn resolve_callee(

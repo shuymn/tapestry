@@ -532,8 +532,8 @@ fn option_lookups_hash_the_name_and_charge_its_bytes() {
 fn the_role_scan_visits_each_helper_once() {
     // A binary tree of 16 383 helper closures, 8 192 leaves each
     // capturing its own index, under 32 numbers whose callback does not
-    // convert: each one's role scan visits every helper once, a hash a
-    // check.
+    // convert: each one's role scan visits its value and every helper
+    // once, a hash a check.
     let body = "local level = {}\n\
         for i = 1, 8192 do local k = i level[i] = function() local own = k return 0 end end\n\
         while #level > 1 do\n\
@@ -551,12 +551,16 @@ fn the_role_scan_visits_each_helper_once() {
         .map(|k| format!("{{ id = \"v\", dst = {{ {{ x = {k}, y = 0, w = 6, h = 6 }} }} }},"))
         .collect();
     let start = std::time::Instant::now();
+    crate::import::callback::SCANNED.with(|n| n.set(0));
     let i = import(&skin(body, &dst)).unwrap();
     assert!(
         i.callbacks
             .iter()
             .any(|d| matches!(d, super::Disposition::Replaced(_)))
     );
+    // 32 scans, each of the value and the 16 383 helpers once.
+    let scanned = crate::import::callback::SCANNED.with(Cell::get);
+    assert_eq!(scanned, 32 * (1 + 16_383));
     assert!(start.elapsed() < std::time::Duration::from_secs(20));
 }
 

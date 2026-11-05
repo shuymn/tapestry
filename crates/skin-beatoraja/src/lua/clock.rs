@@ -2,10 +2,11 @@
 //! a candidate's analysis spends inside its phases (design.md "Threat
 //! Model", T09).
 //!
-//! Four phases count: closing the captured object graph, the effect walk,
-//! admission, and each lowering of a callable. [`AnalysisClock::enter`]
-//! and [`AnalysisClock::leave`] bracket each one, so time between phases
-//! (the common import's other work) does not count. The clock is checked
+//! Five phases count: closing the captured object graph, the effect walk,
+//! admission, each lowering of a callable, and each role scan outside a
+//! lowering (an image set's value). [`AnalysisClock::enter`] and
+//! [`AnalysisClock::leave`] bracket each one, so time between phases (the
+//! common import's other work) does not count. The clock is checked
 //! at every `enter`, at every root of the walk, at the cancellation
 //! cadence of [`super::callback::Analysis::charge`], and at every `leave`
 //! after the phase's interval is added, so the last phase's time is

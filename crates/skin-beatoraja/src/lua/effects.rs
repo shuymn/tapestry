@@ -367,19 +367,28 @@ impl<'a> Walk<'a> {
         }
     }
 
-    /// One unit of work and one level deeper: past [`MAX_AST_DEPTH`] the
-    /// walk stops, fatal.
-    fn enter(&mut self, b: &Body<'_>, line: u32) -> R<()> {
-        self.an.charge(1).map_err(|w| self.fatal(b, line, w))?;
+    /// `n` units of work charged before they are done, located at `line`
+    /// of `b`.
+    fn charge_at(&self, b: &Body<'_>, line: u32, n: u64) -> R<()> {
+        self.an.charge(n).map_err(|w| self.fatal(b, line, w))
+    }
+
+    /// Runs `f` on `b` one level deeper at `line`: one unit of work
+    /// charged first, then past [`MAX_AST_DEPTH`] the walk stops, fatal.
+    fn deeper<'x, T>(
+        &mut self,
+        b: &mut Body<'x>,
+        line: u32,
+        f: impl FnOnce(&mut Self, &mut Body<'x>) -> R<T>,
+    ) -> R<T> {
+        self.charge_at(b, line, 1)?;
         if self.depth >= MAX_AST_DEPTH {
             return Err(self.fatal(b, line, TOO_DEEP));
         }
         self.depth += 1;
-        Ok(())
-    }
-
-    fn leave(&mut self) {
+        let r = f(self, b);
         self.depth = self.depth.saturating_sub(1);
+        r
     }
 
     /// Walks every root of `arena` in conversion order, each callable
@@ -548,9 +557,7 @@ impl<'a> Walk<'a> {
         if inst.values.is_none() && f.upvalues.1 > 0 {
             self.outside(&b, f.line, Unsupported::Capture("no reader"));
         }
-        self.an
-            .charge(u64::from(f.params.1))
-            .map_err(|w| self.fatal(&b, f.line, w))?;
+        self.charge_at(&b, f.line, u64::from(f.params.1))?;
         for &d in ast.list(f.params) {
             b.locals.insert(d, K::UNKNOWN);
         }
@@ -563,7 +570,7 @@ impl<'a> Walk<'a> {
         }
         // Each position padded with nil, one unit each.
         let n = u64::try_from(ret.fixed.len()).unwrap_or(u64::MAX);
-        an.charge(n).map_err(|w| self.fatal(&b, f.line, w))?;
+        self.charge_at(&b, f.line, n)?;
         Ok(ret.or_nil())
     }
 
@@ -572,10 +579,7 @@ impl<'a> Walk<'a> {
         let ast = b.ast;
         for &s in ast.list(l) {
             let line = ast.stmt_line(s);
-            self.enter(b, line)?;
-            let r = self.reassigned_stmt(b, s);
-            self.leave();
-            r?;
+            self.deeper(b, line, |w, b| w.reassigned_stmt(b, s))?;
         }
         Ok(())
     }
@@ -586,9 +590,7 @@ impl<'a> Walk<'a> {
             Stmt::Assign { targets, .. } => {
                 // Each target one unit.
                 let line = ast.stmt_line(s);
-                self.an
-                    .charge(u64::from(targets.1))
-                    .map_err(|w| self.fatal(b, line, w))?;
+                self.charge_at(b, line, u64::from(targets.1))?;
                 for &t in ast.list(targets) {
                     if let Expr::Local(d) = ast.expr(t) {
                         b.reassigned.insert(d);
@@ -621,10 +623,7 @@ impl<'a> Walk<'a> {
         let ast = b.ast;
         for &s in ast.list(l) {
             let line = ast.stmt_line(s);
-            self.enter(b, line)?;
-            let r = self.stmt(b, s, line);
-            self.leave();
-            r?;
+            self.deeper(b, line, |w, b| w.stmt(b, s, line))?;
         }
         Ok(())
     }
@@ -651,9 +650,7 @@ impl<'a> Walk<'a> {
             Stmt::Local { names, exprs } => {
                 let t = self.list(b, exprs)?;
                 // Each name one unit.
-                self.an
-                    .charge(u64::from(names.1))
-                    .map_err(|w| self.fatal(b, line, w))?;
+                self.charge_at(b, line, u64::from(names.1))?;
                 for (k, &d) in ast.list(names).iter().enumerate() {
                     if ast.decl(d).is_some_and(|x| x.attrib != Attrib::None) {
                         self.outside(b, line, Unsupported::Construct("local attribute"));
@@ -669,9 +666,7 @@ impl<'a> Walk<'a> {
                     .as_ref()
                     .map_or(0, |r| r.fixed.len())
                     .max(t.fixed.len());
-                self.an
-                    .charge(u64::try_from(n).unwrap_or(u64::MAX))
-                    .map_err(|w| self.fatal(b, line, w))?;
+                self.charge_at(b, line, u64::try_from(n).unwrap_or(u64::MAX))?;
                 b.ret = Some(match b.ret.take() {
                     Some(r) => r.join(&t),
                     None => t,
@@ -679,9 +674,7 @@ impl<'a> Walk<'a> {
             }
             Stmt::Assign { targets, exprs } => {
                 // Each target one unit.
-                self.an
-                    .charge(u64::from(targets.1))
-                    .map_err(|w| self.fatal(b, line, w))?;
+                self.charge_at(b, line, u64::from(targets.1))?;
                 for &t in ast.list(targets) {
                     match ast.expr(t) {
                         Expr::Local(d) if Self::own(b, d) => {}
@@ -739,9 +732,7 @@ impl<'a> Walk<'a> {
                     self.outside(b, line, Unsupported::Construct("generic for header"));
                 }
                 // Each name one unit.
-                self.an
-                    .charge(u64::from(names.1))
-                    .map_err(|w| self.fatal(b, line, w))?;
+                self.charge_at(b, line, u64::from(names.1))?;
                 for (k, &d) in ast.list(names).iter().enumerate() {
                     let num = k == 0 && modeled == Some(true);
                     Self::declare(b, d, if num { K::NUM } else { K::UNKNOWN });
@@ -831,10 +822,7 @@ impl<'a> Walk<'a> {
 
     fn multi(&mut self, b: &mut Body<'_>, e: u32) -> R<Tuple> {
         let line = b.ast.expr_line(e);
-        self.enter(b, line)?;
-        let r = self.expr(b, e, line);
-        self.leave();
-        r
+        self.deeper(b, line, |w, b| w.expr(b, e, line))
     }
 
     fn expr(&mut self, b: &mut Body<'_>, e: u32, line: u32) -> R<Tuple> {
@@ -1135,9 +1123,7 @@ impl<'a> Walk<'a> {
             _ => 0,
         };
         let n = args.fixed.len().saturating_add(format);
-        self.an
-            .charge(u64::try_from(n).unwrap_or(u64::MAX))
-            .map_err(|w| self.fatal(b, line, w))
+        self.charge_at(b, line, u64::try_from(n).unwrap_or(u64::MAX))
     }
 }
 

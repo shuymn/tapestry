@@ -117,6 +117,12 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The instances this thread's role scans visited, each visit counted.
+    pub(crate) static SCANNED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 /// Why lowering stopped.
 enum Stop {
     Unsupported(Unsupported),
@@ -401,8 +407,9 @@ impl Lower<'_> {
         self.int(src, n, n)
     }
 
-    /// `skin_config.option["name"]`: its captured value, which admission
-    /// proved no callback writes.
+    /// `skin_config.option["name"]`: its captured value, which no code the
+    /// source runs at frame time writes while the effect walk found the
+    /// candidate closed ([`Self::bound`] checks it before this is read).
     fn config(&mut self, ast: &Ast, inst: u32, obj: u32, key: u32) -> R<V> {
         let (Expr::Index { obj: cfg, .. }, Expr::Str(k)) = (ast.expr(obj), ast.expr(key)) else {
             return Err(Stop::Unsupported(Unsupported::Type));
@@ -588,6 +595,8 @@ impl Lower<'_> {
             let Some(f) = ast.func(func) else {
                 continue;
             };
+            #[cfg(test)]
+            SCANNED.with(|n| n.set(n.get() + 1));
             // Its parameters' joins copied, one unit each.
             self.an.charge(u64::from(f.params.1)).map_err(stop)?;
             let own = params.get(&i).cloned().unwrap_or_default();
@@ -697,9 +706,7 @@ impl Lower<'_> {
                             .and_then(|(t, g)| t.func(g))
                             .map_or(0, |g| g.params.1 as usize);
                         // Each parameter's join, one unit.
-                        self.an
-                            .charge(u64::try_from(n).unwrap_or(u64::MAX))
-                            .map_err(stop)?;
+                        self.charge_scan(n)?;
                         let mut joined = Vec::with_capacity(n);
                         for k in 0..n {
                             // A missing argument is nil: no id.
@@ -747,7 +754,8 @@ impl Lower<'_> {
         Ok(())
     }
 
-    /// A scan of `n` locals (at most Lua's 200) charged before it is made.
+    /// `n` units of work charged before they are done: a scan of `n`
+    /// locals (at most Lua's 200), or `n` parameters' joins.
     fn charge_scan(&self, n: usize) -> R<()> {
         self.an
             .charge(u64::try_from(n).unwrap_or(u64::MAX))

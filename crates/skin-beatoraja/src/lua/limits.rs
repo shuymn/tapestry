@@ -87,9 +87,10 @@ pub const MAX_CAPTURES: u64 = 1 << 16;
 pub const MAX_ANALYSIS_WORK: u64 = 1 << 24;
 /// The most monotonic time a candidate's analysis spends in its phases
 /// (closing the captured object graph, the effect walk, admission and
-/// each lowering of a callable), checked at each phase's start and end,
-/// at each root the walk visits and at the cancellation cadence of the
-/// work charged; the time between phases does not count. A backstop
+/// each lowering of a callable or role scan outside one), checked at
+/// each phase's start and end, at each root the walk visits and at the
+/// cancellation cadence of the work charged; the time between phases
+/// does not count. A backstop
 /// beside [`MAX_ANALYSIS_WORK`] for work a unit understates, as generous
 /// as [`MAX_LUA_TIME`].
 pub const MAX_ANALYSIS_TIME: std::time::Duration = std::time::Duration::from_secs(5);
