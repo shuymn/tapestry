@@ -258,6 +258,35 @@ fn a_page_no_atlas_page_holds_fails_its_font() {
 }
 
 #[test]
+fn a_corrupt_page_past_the_atlas_stays_a_broken_page() {
+    // The source fails on a corrupt page whatever its size, so even a
+    // critical text is only ignored: the size is judged of a valid page.
+    let text = json(
+        [1_920, 1_080],
+        r#"{"id": "a", "path": "p.fnt"}"#,
+        &[("a", 24, "A")],
+    )
+    .replace(r#""id": "t0", "dst""#, r#""id": "t0", "timer": 3, "dst""#);
+    let dir = skin(&[("s.json", &text)]);
+    fnt(dir.path(), "p.fnt", &[A]);
+    png(dir.path(), "p.fnt.png", 8_177, 32);
+    let page = std::fs::read(dir.path().join("p.fnt.png")).unwrap();
+    write(dir.path(), "p.fnt.png", &page[..page.len() - 24]);
+    let i = import(dir.path()).unwrap();
+    assert_eq!(
+        common::kinds(&i.report),
+        [bitmap(FntErrorKind::PageBroken { page: 0 })]
+    );
+    assert_eq!(i.skin.sheet().image_count(), 0);
+    let limits = common::play::LIMITS;
+    assert!(
+        i.skin
+            .atlas(skin_model::Variant::Lo, limits, &|| false)
+            .is_ok()
+    );
+}
+
+#[test]
 fn a_failing_primary_is_ignored_or_dropped() {
     let fonts = r#"{"id": "a", "path": "p.fnt"}"#;
     let cases: [(&str, Severity, NoteKind); 4] = [

@@ -443,11 +443,11 @@ impl SheetBuilder {
     /// more than the sheet has left of [`MAX_SHEET_GLYPHS`] and
     /// [`MAX_SHEET_KERNINGS`]. Then the pages, all or nothing: each page's
     /// attempt, metadata, byte totals, image and frame; then each header
-    /// and the texel totals; then every page small enough for an atlas page
-    /// ([`cell_fits_page`]) and every glyph inside its page; then each page
-    /// decoded and dropped, one at a time, so a corrupt page fails this font
-    /// rather than the atlas: whole, or in bands of rows when it was
-    /// admitted to be ([`MAX_STREAMED_TEXELS`](super::MAX_STREAMED_TEXELS)).
+    /// and the texel totals; then every glyph inside its page; then each
+    /// page decoded and dropped, one at a time, so a corrupt page fails
+    /// this font rather than the atlas: whole, or in bands of rows when it
+    /// was admitted to be ([`MAX_STREAMED_TEXELS`](super::MAX_STREAMED_TEXELS));
+    /// then every page small enough for an atlas page ([`cell_fits_page`]).
     /// Each page becomes a whole-file image of one frame, filtered
     /// linearly.
     ///
@@ -557,15 +557,6 @@ impl SheetBuilder {
             hi_texels = hi_texels.with(texels(d)).ok_or(limit(FntLimit::Texels))?;
             dims.push((d, mode));
         }
-        // A page is one cell of the atlas.
-        if let Some(p) = dims.iter().position(|&(d, _)| !cell_fits_page(d)) {
-            return Err(file_err(FntError {
-                line: 0,
-                kind: FntErrorKind::PageRefused {
-                    page: u8::try_from(p).unwrap_or(u8::MAX),
-                },
-            }));
-        }
         for g in file.glyphs().iter().chain(file.missing().as_ref()) {
             let [x, y, w, h] = g.src.map(u32::from);
             let inside = dims
@@ -589,6 +580,17 @@ impl SheetBuilder {
             let bytes =
                 read_encoded(resolved, at, MAX_FILE_BYTES, cancel).map_err(|e| page_stop(p, e))?;
             decode_file(bytes, at, header, cancel, &mut Validate).map_err(|e| page_stop(p, e))?;
+        }
+
+        // A page is one cell of the atlas. A corrupt one above stays corrupt
+        // whatever its size: the source fails on it too.
+        if let Some(p) = dims.iter().position(|&(d, _)| !cell_fits_page(d)) {
+            return Err(file_err(FntError {
+                line: 0,
+                kind: FntErrorKind::PageRefused {
+                    page: u8::try_from(p).unwrap_or(u8::MAX),
+                },
+            }));
         }
 
         // Kept.
