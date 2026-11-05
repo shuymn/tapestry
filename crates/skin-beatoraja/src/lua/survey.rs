@@ -656,6 +656,38 @@ mod tests {
     }
 
     #[test]
+    fn a_system_image_s_callback_names_its_kind() {
+        let entry = "local skin = { type = 0, name = \"t\", w = 1920, h = 1080 }\n\
+             if not skin_config then return skin end\n\
+             skin.destination = {\n\
+               { id = -110, draw = function() return true end, dst = { { w = 64, h = 64 } } },\n\
+             }\n\
+             return skin\n";
+        let d = crate::lua::callback_tests::folder(entry);
+        let s = survey(
+            d.path(),
+            "s.luaskin",
+            &ImportFacts::unavailable(ScreenKind::Play),
+            &Cancel::new(),
+            true,
+        );
+        assert_eq!(s.outcome, "imported");
+        let elements: Vec<_> = s
+            .consumers
+            .iter()
+            .map(|c| c.local.as_ref().and_then(|l| l.element.clone()))
+            .collect();
+        assert_eq!(
+            elements,
+            [Some(Element {
+                index: 0,
+                id: Some("-110".to_owned()),
+                kind: Some("SystemImage".to_owned()),
+            })]
+        );
+    }
+
+    #[test]
     fn a_callback_an_import_never_reached_is_not_called_unconsumed() {
         // The import refuses a mixed destination list after admission: it
         // never reads the classified action.

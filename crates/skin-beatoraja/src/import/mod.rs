@@ -829,6 +829,10 @@ impl<'d> Cx<'d> {
         if let Ok(n) = id.parse::<i32>()
             && n < 0
         {
+            #[cfg(feature = "dev-tools")]
+            if let Some(e) = &mut self.element {
+                e.kind = Some("SystemImage".to_owned());
+            }
             return self.system(dst, n);
         }
         let role = Role::Decorative.or_failure(dst.failure);
