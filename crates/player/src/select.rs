@@ -301,13 +301,10 @@ enum Place {
     /// The "all charts" row, then the one root's level or the roots' rows.
     #[default]
     Top,
-    /// A folder's level. A root stays a level while it has rows; any other
-    /// folder also stops being one when it becomes a song folder.
-    Folder {
-        key: FolderKey,
-        name: String,
-        root: bool,
-    },
+    /// A folder's level. A configured root stays a level while it has rows,
+    /// however it was reached; any other folder also stops being one when it
+    /// becomes a song folder.
+    Folder { key: FolderKey, name: String },
     /// The all-chart list.
     All,
 }
@@ -315,11 +312,12 @@ enum Place {
 /// Where the cursor goes when the next list arrives.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 enum Arrival {
-    /// To its row by the rule, over the list it is on. In a place just
-    /// entered that is its first row: no row of the place left is in it,
-    /// except the one root's own charts on Top, which lead the all-chart list.
+    /// To its row by the rule, over the list it is on.
     #[default]
     Keep,
+    /// To the first row: a place just entered. The place left is saved only
+    /// for the return to it.
+    First,
     /// To this saved list's row by the rule, at its line.
     Restore(Saved),
 }
@@ -351,8 +349,8 @@ pub struct SelectScreen {
     all_row: Option<u64>,
     /// The folder rows, after it.
     folders: Vec<FolderRow>,
-    /// Whether Top's folder rows are the roots.
-    top_lists_roots: bool,
+    /// The roots' keys, as Top last read them: a root is never a song folder.
+    root_keys: Vec<FolderKey>,
     /// The charts listed, after them; with the folder rows at most [`LIMIT`].
     entries: Vec<ChartEntry>,
     /// Whether there were more rows than [`LIMIT`].
@@ -447,9 +445,10 @@ impl SelectScreen {
     }
 
     /// Top's list: the "all charts" row of the library's `charts` listed, then
-    /// `level`, which is the one root's or the rows of the roots.
-    pub fn set_top(&mut self, level: Level, charts: u64, lists_roots: bool) {
-        self.top_lists_roots = lists_roots;
+    /// `level`, which is the one root's or the rows of the roots, whose keys
+    /// are `root_keys`.
+    pub fn set_top(&mut self, level: Level, root_keys: Vec<FolderKey>, charts: u64) {
+        self.root_keys = root_keys;
         self.arrive(Some(charts), level.folders, level.charts, level.more, false);
     }
 
@@ -460,10 +459,10 @@ impl SelectScreen {
     /// that place's saved list, and the list is to be read again.
     pub fn set_level(&mut self, level: Level) -> bool {
         let navigable = match &self.place {
-            Place::Folder { key, root, .. } => {
+            Place::Folder { key, .. } => {
                 let folder = key.path();
                 let own = |c: &ChartEntry| c.path.parent() == Some(folder.as_path());
-                let song_folder = !*root
+                let song_folder = !self.root_keys.contains(key)
                     && level.folders.is_empty()
                     && !level.more
                     && level.charts.iter().all(own);
@@ -480,8 +479,8 @@ impl SelectScreen {
     }
 
     /// Puts a new list in place. The cursor goes where [`Arrival`] says, by
-    /// [`Saved::resolve`], and the list scrolls so it stays on its line where
-    /// the list allows.
+    /// [`Saved::resolve`] unless the place was just entered, and the list
+    /// scrolls so it stays on its line where the list allows.
     fn arrive(
         &mut self,
         all_row: Option<u64>,
@@ -491,8 +490,9 @@ impl SelectScreen {
         headings: bool,
     ) {
         let saved = match std::mem::take(&mut self.arrival) {
-            Arrival::Keep => self.saved(),
-            Arrival::Restore(saved) => saved,
+            Arrival::Keep => Some(self.saved()),
+            Arrival::First => None,
+            Arrival::Restore(saved) => Some(saved),
         };
         let rows = folders.len() + entries.len();
         self.more = more || rows > LIMIT;
@@ -515,9 +515,17 @@ impl SelectScreen {
             }
             self.rows.push(Row::Chart(i));
         }
-        let fresh = self.row_ids().enumerate().map(|(i, id)| (id, i)).collect();
-        self.cursor = saved.resolve(&fresh);
-        self.scroll(saved.line);
+        match saved {
+            Some(saved) => {
+                let fresh = self.row_ids().enumerate().map(|(i, id)| (id, i)).collect();
+                self.cursor = saved.resolve(&fresh);
+                self.scroll(saved.line);
+            }
+            None => {
+                self.cursor = 0;
+                self.scroll(CURSOR_LINE);
+            }
+        }
     }
 
     /// How many selectable rows come before the charts.
@@ -557,7 +565,7 @@ impl SelectScreen {
     fn enter(&mut self, place: Place) -> Acted {
         let left = std::mem::replace(&mut self.place, place);
         self.stack.push((left, self.saved()));
-        self.arrival = Arrival::Keep;
+        self.arrival = Arrival::First;
         Acted::Search
     }
 
@@ -574,7 +582,7 @@ impl SelectScreen {
                 ..Saved::default()
             },
         ));
-        self.arrival = Arrival::Keep;
+        self.arrival = Arrival::First;
     }
 
     /// Puts the cursor on the chart at `path`; `false` when it is not
@@ -800,7 +808,6 @@ impl SelectScreen {
                 let place = Place::Folder {
                     key: row.key.clone(),
                     name: row.name.clone(),
-                    root: self.place == Place::Top && self.top_lists_roots,
                 };
                 self.enter(place)
             }
@@ -838,7 +845,7 @@ impl SelectScreen {
                     // keeps the place saved then.
                     self.under_query = Some(match std::mem::take(&mut self.arrival) {
                         Arrival::Restore(saved) => saved,
-                        Arrival::Keep => self.saved(),
+                        Arrival::Keep | Arrival::First => self.saved(),
                     });
                 }
                 self.query.push_str(&text);
@@ -1493,8 +1500,8 @@ mod tests {
                 charts,
                 ..library::Level::default()
             },
+            Vec::new(),
             5_001,
-            false,
         );
         assert_eq!(s.listed(), super::LIMIT);
         assert!(s.page("").lines[0].text.contains("5000以上 譜面"));

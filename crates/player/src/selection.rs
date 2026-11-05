@@ -196,17 +196,15 @@ impl Selection {
                 ListQuery::Top { one_root, sort } => {
                     let roots = self.shelf.top()?;
                     let charts = roots.iter().map(|r| r.charts).sum();
-                    let (level, lists_roots) = match roots.as_slice() {
-                        [root] if one_root => (self.shelf.level(&root.key, sort, limit)?, false),
-                        _ => (
-                            library::Level {
-                                folders: roots,
-                                ..library::Level::default()
-                            },
-                            true,
-                        ),
+                    let keys = roots.iter().map(|r| r.key.clone()).collect();
+                    let level = match roots.as_slice() {
+                        [root] if one_root => self.shelf.level(&root.key, sort, limit)?,
+                        _ => library::Level {
+                            folders: roots,
+                            ..library::Level::default()
+                        },
                     };
-                    self.screen.set_top(level, charts, lists_roots);
+                    self.screen.set_top(level, keys, charts);
                     return Ok(());
                 }
                 ListQuery::Level { key, sort } => {
@@ -3345,6 +3343,14 @@ mod tests {
                 root
             })
             .collect();
+        over(dir, roots)
+    }
+
+    /// [`tree`] over charts already written under `roots`.
+    fn over(
+        dir: &std::path::Path,
+        roots: Vec<std::path::PathBuf>,
+    ) -> (Selection, Vec<std::path::PathBuf>) {
         let (library, _) = open(&DataRoot::new(dir.join("data"))).unwrap();
         let shelf = Shelf::new(library, roots.clone(), Duration::ZERO, None);
         let mut sel = Selection {
@@ -3367,6 +3373,10 @@ mod tests {
         };
         let listed: usize = roots.iter().map(|r| walk_count(r)).sum();
         settle(&mut sel);
+        if roots.len() > 1 {
+            // Overlapping roots count their shared charts in each.
+            return (sel, roots);
+        }
         assert_eq!(sel.screen.listed(), listed, "{:?}", list(&sel));
         (sel, roots)
     }
@@ -3699,12 +3709,13 @@ mod tests {
         std::fs::remove_file(root.join("s/y/z.bms")).unwrap();
         settle(&mut sel);
         assert_eq!(list(&sel), ["a", ">m"]);
-        // Back in the parent, a new folder above and a removed one below leave
-        // the cursor on its row.
-        keys(&mut sel, &[MenuKey::Escape]);
+        // The parent changes while it is saved, a folder above it added and
+        // one below it removed: the return lands on its row.
         std::fs::remove_dir_all(root.join("t")).unwrap();
         write_chart(root, "r/q/k.bms");
         settle(&mut sel);
+        assert_eq!(list(&sel), ["a", ">m"]);
+        keys(&mut sel, &[MenuKey::Escape]);
         assert_eq!(
             list(&sel),
             [
@@ -3713,6 +3724,55 @@ mod tests {
                 format!(">{}", folder_row("s", 2))
             ]
         );
+    }
+
+    /// Entering the all-chart list puts the cursor on its first row, even
+    /// where Top's charts are listed there in another order: Top's saved
+    /// list is only for the return.
+    #[test]
+    fn the_all_chart_list_is_entered_on_its_first_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut sel, _) = tree(dir.path(), &[&["a/z.bms", "b/a.bms"]]);
+        assert_eq!(
+            list(&sel),
+            [format!(">{}", all_row(2)), "a".to_owned(), "z".to_owned()]
+        );
+        keys(&mut sel, &[MenuKey::Enter]);
+        assert_eq!(cursor(&sel).0, "z", "{:?}", list(&sel));
+        keys(&mut sel, &[MenuKey::Escape]);
+        assert_eq!(cursor(&sel).0, all_row(2));
+    }
+
+    /// A configured root stays a level however it is reached: through an
+    /// overlapping root above it, it holds its own charts only once its
+    /// subfolder empties, and stays open.
+    #[test]
+    fn an_overlapping_root_reached_through_another_stays_a_level() {
+        let dir = tempfile::tempdir().unwrap();
+        let outer = dir.path().join("root0");
+        write_chart(&outer, "A/x.bms");
+        write_chart(&outer, "A/B/y.bms");
+        write_chart(&outer, "Z/q/w.bms");
+        let (mut sel, _) = over(dir.path(), vec![outer.clone(), outer.join("A")]);
+        assert_eq!(
+            list(&sel),
+            [
+                format!(">{}", all_row(5)),
+                folder_row("root0", 3),
+                folder_row("A", 2),
+            ]
+        );
+        keys(&mut sel, &[MenuKey::Down, MenuKey::Enter]);
+        assert_eq!(
+            list(&sel),
+            [format!(">{}", folder_row("A", 2)), folder_row("Z", 1)]
+        );
+        keys(&mut sel, &[MenuKey::Enter]);
+        assert_eq!(list(&sel), [">x", "y"]);
+        std::fs::remove_file(outer.join("A/B/y.bms")).unwrap();
+        settle(&mut sel);
+        // Still in `A`: `root0`'s level would list `Z`'s row and `x`.
+        assert_eq!(list(&sel), [">x"]);
     }
 
     /// A place that stops being a level goes up to its nearest ancestor that
