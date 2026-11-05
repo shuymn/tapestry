@@ -207,8 +207,30 @@ fn order(sort: Sort, by_folder: bool) -> String {
     terms
 }
 
-/// Every listed chart, of [`candidates`].
-const ALL_LISTED: &str = "charts c WHERE c.mode = 0";
+/// Every listed chart, of [`candidates`], read the cheapest way for `sort`.
+/// The title order walks `charts_title` and needs no sort. Grouped, each order
+/// walks `charts_browse` folder by folder and sorts only within one, stopping
+/// at the limit, where the planner would sort the whole library. The other
+/// orders sort every listed chart whatever is read, and the table is cheaper
+/// to read in full than through an index that holds most of it.
+const fn all_listed(sort: Sort, by_folder: bool) -> &'static str {
+    match (by_folder, sort) {
+        (true, _) => "charts c INDEXED BY charts_browse WHERE c.mode = 0",
+        (false, Sort::Title) => "charts c WHERE c.mode = 0",
+        (false, _) => "charts c NOT INDEXED WHERE c.mode = 0",
+    }
+}
+
+/// The listed charts a `LIKE` pattern finds, of [`candidates`]: grouped, by
+/// `charts_browse` as in [`all_listed`], since the planner's `charts_title`
+/// visits the same rows and then sorts them all.
+const fn like_listed(by_folder: bool) -> &'static str {
+    if by_folder {
+        r"charts c INDEXED BY charts_browse WHERE c.norm_text LIKE ?1 ESCAPE '\' AND c.mode = 0"
+    } else {
+        r"charts c WHERE c.norm_text LIKE ?1 ESCAPE '\' AND c.mode = 0"
+    }
+}
 
 /// The statement that chooses a search's rows: its limit, parameter `limit`,
 /// counts only rows that match, and only listed ones match.
@@ -221,16 +243,13 @@ pub fn run(conn: &Connection, search: &Search<'_>) -> rusqlite::Result<Vec<Chart
     let limit = i64::try_from(search.limit).unwrap_or(i64::MAX);
     let filter = Filter::of(search.text);
     let (from, mut args): (&str, Vec<&dyn ToSql>) = match &filter {
-        Filter::All => (ALL_LISTED, Vec::new()),
+        Filter::All => (all_listed(search.sort, search.by_folder), Vec::new()),
         Filter::Phrase { phrase, needle } => (
             "charts_fts JOIN charts c ON c.id = charts_fts.rowid
              WHERE charts_fts MATCH ?1 AND instr(c.norm_text, ?2) > 0 AND c.mode = 0",
             vec![phrase, needle],
         ),
-        Filter::Like(pattern) => (
-            r"charts c WHERE c.norm_text LIKE ?1 ESCAPE '\' AND c.mode = 0",
-            vec![pattern],
-        ),
+        Filter::Like(pattern) => (like_listed(search.by_folder), vec![pattern]),
     };
     // The limit is the last parameter, in the candidates' query, so it
     // counts only rows that match.
@@ -472,14 +491,36 @@ mod tests {
         db::create(&conn).unwrap();
         let plan = |sql: &str| -> String {
             let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
-            let rows = stmt.query_map([200], |r| r.get::<_, String>(3)).unwrap();
+            let args = vec![200; stmt.parameter_count()];
+            let rows = stmt
+                .query_map(rusqlite::params_from_iter(args), |r| r.get::<_, String>(3))
+                .unwrap();
             rows.collect::<rusqlite::Result<Vec<_>>>()
                 .unwrap()
                 .join("; ")
         };
-        let title = plan(&candidates(ALL_LISTED, &order(Sort::Title, false), 1));
+        let of = |sort, by_folder| {
+            plan(&candidates(
+                all_listed(sort, by_folder),
+                &order(sort, by_folder),
+                1,
+            ))
+        };
+        let title = of(Sort::Title, false);
         assert!(title.contains("charts_title"), "{title}");
         assert!(!title.contains("TEMP B-TREE"), "{title}");
+        for sort in [Sort::Title, Sort::Artist, Sort::Level, Sort::Modified] {
+            // Grouped: sorted within a folder, so the limit stops the walk.
+            for from in [all_listed(sort, true), like_listed(true)] {
+                let grouped = plan(&candidates(from, &order(sort, true), 2));
+                assert!(grouped.contains("charts_browse (mode=?)"), "{grouped}");
+                assert!(!grouped.contains("FOR ORDER BY"), "{grouped}");
+            }
+        }
+        for sort in [Sort::Artist, Sort::Level, Sort::Modified] {
+            let whole = of(sort, false);
+            assert!(whole.starts_with("SCAN c;"), "{whole}");
+        }
     }
 
     /// However many song folders a level has, its chart rows seek them by
