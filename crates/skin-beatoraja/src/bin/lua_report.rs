@@ -278,7 +278,7 @@ mod tests {
 
     use skin_beatoraja::Cancel;
     use skin_beatoraja::lua::facts::ImportFacts;
-    use skin_beatoraja::lua::survey::{Choice, survey_with};
+    use skin_beatoraja::lua::survey::survey_with;
     use skin_model::ScreenKind;
 
     use super::{facts, report};
@@ -401,23 +401,23 @@ mod tests {
         for name in ["a.png", "b.png"] {
             std::fs::write(d.path().join(name), []).unwrap();
         }
-        let run = |choice: &Choice| {
+        // The command line's own flags, as `main` passes them on.
+        let run = |line: &str| {
+            let a = args(line);
+            let (_, choice, local, _) = facts(&a).unwrap();
             let s = survey_with(
                 d.path(),
                 "s.luaskin",
                 &ImportFacts::unavailable(ScreenKind::Play),
                 &Cancel::new(),
-                false,
-                choice,
+                local,
+                &choice,
             );
             report(0, &s)
         };
-        let plain = run(&Choice::default());
+        let plain = run("root s");
         assert!(plain.starts_with("skin 0: imported\n"), "{plain}");
-        let named = run(&Choice {
-            options: vec![("fc".to_owned(), "on".to_owned())],
-            files: vec![("bg".to_owned(), "b.png".to_owned())],
-        });
+        let named = run("--option fc on --file bg b.png root s");
         assert_eq!(named, plain);
         for private in ["resolved", "destination", "fc", "bg", "b.png"] {
             assert!(!named.contains(private), "{private} in {named}");

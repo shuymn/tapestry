@@ -18,7 +18,7 @@ thread_local! {
 }
 
 /// Runs `f`, an import, and returns the ledger it left: empty if it stopped
-/// before the destinations.
+/// before its tables resolved, a row per destination from then on.
 pub(crate) fn recording<T>(f: impl FnOnce() -> T) -> (T, Vec<DestinationEntry>) {
     ARMED.with(|a| a.set(true));
     LAST.with(|l| l.borrow_mut().clear());
