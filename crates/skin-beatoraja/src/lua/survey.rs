@@ -21,6 +21,8 @@ use super::{
     Cancel, Disposition, HOST_APIS, LAST_FACTS, LuaUsage, LuaWhy, Unsupported, header_pass,
 };
 use crate::error::{ImportError, Loc};
+use crate::import::ledger;
+pub use crate::import::ledger::{Became, DestinationEntry, DestinationNote};
 use crate::import::{Config, DeviationId, NoteKind};
 use crate::tree::{Arena, CallableKind};
 
@@ -73,6 +75,30 @@ pub struct Survey {
     pub usage: LuaUsage,
     /// The screen kind the header pass gave, when it gave a header.
     pub kind: Option<ScreenKind>,
+    /// The configuration as resolved, only when [`survey_with`] is asked
+    /// for developer-local detail.
+    pub resolved: Option<Resolved>,
+    /// What the import made of each destination ([`ledger`]), only when
+    /// asked for developer-local detail.
+    pub destinations: Vec<DestinationEntry>,
+}
+
+/// A configuration by the names the skin gives it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Resolved {
+    /// Each option's name and its selected item's name and number.
+    pub options: Vec<(Option<String>, Option<String>, Option<i32>)>,
+    /// Each file choice of the header, its name and the candidate the
+    /// import takes, `None` for none.
+    pub files: Vec<(Option<String>, Option<String>)>,
+}
+
+/// The options and file choices a survey names, by the skin's names; the
+/// rest take the header's defaults.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Choice {
+    pub options: Vec<(String, String)>,
+    pub files: Vec<(String, String)>,
 }
 
 /// A callback where the import consumed it, or a callable it classified
@@ -345,6 +371,36 @@ fn at_of(e: &ImportError) -> Option<&Loc> {
     }
 }
 
+/// `config` by the names `header` gives it.
+fn resolved(header: &crate::Header, config: &Config) -> Resolved {
+    let options = header
+        .options
+        .iter()
+        .zip(&config.options)
+        .map(|(o, op)| {
+            let item = o.items.iter().find(|i| Some(i.op) == *op);
+            (o.name.clone(), item.and_then(|i| i.name.clone()), *op)
+        })
+        .collect();
+    let files = header
+        .files
+        .iter()
+        .map(|f| {
+            let (pick, ..) = crate::import::asset::choose(
+                &f.candidates,
+                f.name.as_deref(),
+                f.def.as_deref(),
+                config,
+            );
+            (
+                f.name.clone(),
+                pick.and_then(|i| f.candidates.get(i)).cloned(),
+            )
+        })
+        .collect();
+    Resolved { options, files }
+}
+
 /// Runs the Lua skin `entry` of skin folder `root` with its default
 /// configuration against the import facts `facts` on the scene of the
 /// kind its header pass gives (`facts.scene` is not read), counts the
@@ -360,6 +416,20 @@ pub fn survey(
     cancel: &Cancel,
     local: bool,
 ) -> Survey {
+    survey_with(root, entry, facts, cancel, local, &Choice::default())
+}
+
+/// [`survey`] with the configuration `choice` names. Under `local`, also
+/// the configuration as resolved and the destination ledger.
+#[must_use]
+pub fn survey_with(
+    root: &Path,
+    entry: &str,
+    facts: &ImportFacts,
+    cancel: &Cancel,
+    local: bool,
+    choice: &Choice,
+) -> Survey {
     let header = header_pass(root, entry, cancel);
     let h = match header.result {
         Ok(h) => h,
@@ -373,7 +443,25 @@ pub fn survey(
             };
         }
     };
-    let config = Config::defaults(h.header());
+    let config = match Config::named(
+        h.header(),
+        choice.options.iter().map(|(o, i)| (o.as_str(), i.as_str())),
+        choice.files.iter().map(|(f, c)| (f.as_str(), c.as_str())),
+    ) {
+        Ok(config) => config,
+        Err(e) => {
+            return Survey {
+                // The names are those the command line gave.
+                outcome: if local {
+                    format!("config: {e}")
+                } else {
+                    "config".to_owned()
+                },
+                kind: Some(h.header().kind),
+                ..Survey::default()
+            };
+        }
+    };
     let kind = h.header().kind;
     let facts = &ImportFacts {
         scene: kind,
@@ -409,7 +497,16 @@ pub fn survey(
             s.root_unread = an.unread;
         }
     }
-    let o = h.finish(def, counts, store, reads, &config);
+    if local {
+        s.resolved = Some(resolved(h.header(), &config));
+    }
+    let o = if local {
+        let (o, destinations) = ledger::recording(|| h.finish(def, counts, store, reads, &config));
+        s.destinations = destinations;
+        o
+    } else {
+        h.finish(def, counts, store, reads, &config)
+    };
     s.reads.clone_from(&o.reads);
     if let Some((label, at)) = &o.records.effects {
         s.effects.clone_from(label);
@@ -451,7 +548,11 @@ pub fn survey(
 
 #[cfg(test)]
 mod tests {
-    use super::{Cancel, Element, ImportFacts, Local, Lowered, survey};
+    use super::Became;
+    use super::{
+        Cancel, Choice, Element, ImportFacts, Local, Lowered, Resolved, survey, survey_with,
+    };
+    use crate::import::{NoteKind, PropertyKind, Severity};
     use skin_model::ScreenKind;
 
     fn folder(files: &[(&str, &str)]) -> tempfile::TempDir {
@@ -655,6 +756,253 @@ mod tests {
         let s = run(false);
         assert_eq!(s.consumers.len(), 4);
         assert!(s.consumers.iter().all(|c| c.local.is_none()));
+    }
+
+    /// A skin whose destinations each become something else: `on` is its
+    /// option's other item.
+    const LEDGER: &str = "local skin = { type = 0, name = \"t\", w = 1920, h = 1080,\n\
+           property = { { name = \"fc\", item = { { name = \"off\", op = 905 }, { name = \"on\", op = 906 } } } } }\n\
+         if not skin_config then return skin end\n\
+         skin.source = { { id = \"a\", path = \"a.png\" } }\n\
+         skin.image = { { id = \"i\", src = \"a\", x = 0, y = 0, w = 64, h = 64 } }\n\
+         skin.value = { { id = \"lv\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, digit = 2, ref = 425 } }\n\
+         skin.judgegraph = { { id = \"jg\", src = \"a\", x = 0, y = 0, w = 64, h = 64 } }\n\
+         skin.destination = {\n\
+           { id = \"i\", dst = { { w = 64, h = 64 } } },\n\
+           { id = \"i\", op = { 906 }, dst = { { w = 64, h = 64 } } },\n\
+           { id = \"lv\", dst = { { w = 6, h = 6 } } },\n\
+           { id = \"jg\", dst = { { w = 6, h = 6 } } },\n\
+           { id = \"none\", dst = { { w = 6, h = 6 } } },\n\
+           { id = \"i\", dst = { { w = 64, h = 64 } } },\n\
+         }\n\
+         return skin\n";
+
+    fn ledger_survey(d: &tempfile::TempDir, local: bool, choice: &Choice) -> super::Survey {
+        survey_with(
+            d.path(),
+            "s.luaskin",
+            &ImportFacts::unavailable(ScreenKind::Play),
+            &Cancel::new(),
+            local,
+            choice,
+        )
+    }
+
+    #[test]
+    fn the_ledger_says_what_became_of_each_destination_with_its_notes() {
+        let d = crate::lua::callback_tests::folder(LEDGER);
+        let s = ledger_survey(&d, true, &Choice::default());
+        assert_eq!(s.outcome, "imported");
+        let got: Vec<_> = s
+            .destinations
+            .iter()
+            .map(|e| {
+                (
+                    e.index,
+                    e.id.as_deref(),
+                    e.kind.as_deref(),
+                    e.became,
+                    e.elements.clone(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (0, Some("i"), Some("Image"), Became::Retained, 0..1),
+                (1, Some("i"), Some("Image"), Became::Folded, 1..1),
+                (2, Some("lv"), Some("Value"), Became::Dropped, 1..1),
+                (3, Some("jg"), Some("JudgeGraph"), Became::Dropped, 1..1),
+                (4, Some("none"), None, Became::Ignored, 1..1),
+                (5, Some("i"), Some("Image"), Became::Retained, 1..2),
+            ]
+        );
+        // The property's own drop, and one through the policy's direct path.
+        let note = |i: usize| {
+            s.destinations[i]
+                .notes
+                .first()
+                .map(|n| (n.severity, n.kind))
+        };
+        assert_eq!(
+            note(2),
+            Some((
+                Severity::Dropped,
+                NoteKind::UnsupportedProperty {
+                    kind: PropertyKind::Integer,
+                    id: Some(425)
+                }
+            ))
+        );
+        assert!(matches!(
+            note(3),
+            Some((Severity::Dropped, NoteKind::Unsupported { .. }))
+        ));
+        let (file, ..) = s.destinations[2].notes[0].at.clone().unwrap();
+        assert_eq!(file, "s.luaskin");
+        assert_eq!(
+            s.resolved,
+            Some(Resolved {
+                options: vec![(Some("fc".to_owned()), Some("off".to_owned()), Some(905))],
+                files: Vec::new(),
+            })
+        );
+    }
+
+    #[test]
+    fn without_local_detail_there_is_no_ledger_and_no_names() {
+        let d = crate::lua::callback_tests::folder(LEDGER);
+        let s = ledger_survey(&d, false, &Choice::default());
+        assert_eq!(s.outcome, "imported");
+        assert!(s.destinations.is_empty());
+        assert_eq!(s.resolved, None);
+        // A later survey of the thread, asked, is not given an old ledger.
+        let again = ledger_survey(&d, true, &Choice::default());
+        assert_eq!(again.destinations.len(), 6);
+    }
+
+    #[test]
+    fn a_named_option_changes_what_the_ledger_finds() {
+        let d = crate::lua::callback_tests::folder(LEDGER);
+        let choice = Choice {
+            options: vec![("fc".to_owned(), "on".to_owned())],
+            files: Vec::new(),
+        };
+        let s = ledger_survey(&d, true, &choice);
+        assert_eq!(s.outcome, "imported");
+        assert_eq!(s.destinations[1].became, Became::Retained);
+        assert_eq!(
+            s.resolved.unwrap().options[0],
+            (Some("fc".to_owned()), Some("on".to_owned()), Some(906))
+        );
+        let bad = Choice {
+            options: vec![("fc".to_owned(), "never".to_owned())],
+            files: Vec::new(),
+        };
+        let s = ledger_survey(&d, true, &bad);
+        assert_eq!(s.outcome, "config: option \"fc\" has no item \"never\"");
+        assert!(s.destinations.is_empty());
+        // Without the request the outcome carries no name.
+        assert_eq!(ledger_survey(&d, false, &bad).outcome, "config");
+    }
+
+    #[test]
+    fn a_refusal_is_in_the_ledger_with_what_it_never_reached() {
+        let entry = "local skin = { type = 0, name = \"t\", w = 1920, h = 1080 }\n\
+             if not skin_config then return skin end\n\
+             skin.source = { { id = \"a\", path = \"a.png\" } }\n\
+             skin.image = { { id = \"i\", src = \"a\", x = 0, y = 0, w = 64, h = 64 } }\n\
+             skin.gauge = { id = \"g\", nodes = { \"i\", \"i\", \"i\", \"i\" }, parts = 10 }\n\
+             skin.destination = {\n\
+               { id = \"i\", dst = { { w = 64, h = 64 } } },\n\
+               { id = \"g\", dst = { { time = 0, w = 64, h = 64 }, { time = 100, w = 32, h = 64 } } },\n\
+               { id = \"i\", dst = { { w = 64, h = 64 } } },\n\
+             }\n\
+             return skin\n";
+        let d = crate::lua::callback_tests::folder(entry);
+        let s = ledger_survey(&d, true, &Choice::default());
+        assert!(s.outcome.starts_with("critical Gauge"), "{}", s.outcome);
+        let got: Vec<_> = s
+            .destinations
+            .iter()
+            .map(|e| (e.index, e.id.as_deref(), e.became))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (0, Some("i"), Became::Retained),
+                (1, Some("g"), Became::Refused),
+                (2, None, Became::NotReached),
+            ]
+        );
+    }
+
+    #[test]
+    fn each_destination_has_only_its_own_notes() {
+        let d = crate::lua::callback_tests::folder(LEDGER);
+        let s = ledger_survey(&d, true, &Choice::default());
+        let kinds: Vec<Vec<_>> = s
+            .destinations
+            .iter()
+            .map(|e| e.notes.iter().map(|n| n.kind).collect())
+            .collect();
+        assert_eq!(kinds[0], []);
+        assert_eq!(kinds[1], [NoteKind::Ignored { field: "op" }]);
+        assert_eq!(
+            kinds[2],
+            [NoteKind::UnsupportedProperty {
+                kind: PropertyKind::Integer,
+                id: Some(425)
+            }]
+        );
+        assert!(matches!(kinds[3][..], [NoteKind::Unsupported { .. }]));
+        assert_eq!(kinds[4], [NoteKind::UndefinedObject]);
+        assert_eq!(kinds[5], []);
+    }
+
+    #[test]
+    fn a_note_past_the_cap_still_says_what_became_of_its_destination() {
+        let entry = "local s = { type = 0, w = 1920, h = 1080 }\n\
+             if not skin_config then return s end\n\
+             s.judgegraph = { { id = \"jg\" } }\n\
+             s.destination = {}\n\
+             for i = 1, 4097 do s.destination[i] = { id = \"jg\", dst = { { w = 1, h = 1 } } } end\n\
+             return s\n";
+        let d = crate::lua::callback_tests::folder(entry);
+        let s = ledger_survey(&d, true, &Choice::default());
+        assert_eq!(s.outcome, "imported");
+        let last = s.destinations.last().unwrap();
+        assert_eq!((last.index, last.suppressed), (4096, 1));
+        assert!(last.notes.is_empty());
+        assert_eq!(last.became, Became::Dropped);
+    }
+
+    #[test]
+    fn a_refusal_before_the_first_destination_leaves_them_all_not_reached() {
+        let entry = "return { type = 0, w = 1920, h = 1080,\n\
+               customTimers = { { id = true } },\n\
+               destination = { { id = \"a\" }, { id = \"b\" } } }\n";
+        let d = crate::lua::callback_tests::folder(entry);
+        let s = ledger_survey(&d, true, &Choice::default());
+        assert_ne!(s.outcome, "imported");
+        let got: Vec<_> = s.destinations.iter().map(|e| (e.index, e.became)).collect();
+        assert_eq!(got, [(0, Became::NotReached), (1, Became::NotReached)]);
+    }
+
+    #[test]
+    fn every_file_choice_is_resolved_as_the_import_decides_it() {
+        let entry = "local skin = { type = 0, name = \"t\", w = 1920, h = 1080,\n\
+               filepath = {\n\
+                 { name = \"by default\", path = \"*.png\", def = \"b\" },\n\
+                 { name = \"first\", path = \"*.png\" },\n\
+                 { name = \"named\", path = \"*.png\" },\n\
+                 { name = \"nothing\", path = \"none/*.png\" },\n\
+                 { path = \"*.png\" },\n\
+               } }\n\
+             if not skin_config then return skin end\n\
+             skin.destination = { { id = -110, dst = { { w = 64, h = 64 } } } }\n\
+             return skin\n";
+        let d = crate::lua::callback_tests::folder(entry);
+        std::fs::copy(d.path().join("a.png"), d.path().join("b.png")).unwrap();
+        let choice = Choice {
+            options: Vec::new(),
+            files: vec![("named".to_owned(), "b.png".to_owned())],
+        };
+        let s = ledger_survey(&d, true, &choice);
+        assert_eq!(s.outcome, "imported");
+        let file = |name: Option<&str>, candidate: Option<&str>| {
+            (name.map(str::to_owned), candidate.map(str::to_owned))
+        };
+        assert_eq!(
+            s.resolved.unwrap().files,
+            [
+                file(Some("by default"), Some("b.png")),
+                file(Some("first"), Some("a.png")),
+                file(Some("named"), Some("b.png")),
+                file(Some("nothing"), None),
+                file(None, Some("a.png")),
+            ]
+        );
     }
 
     #[test]
