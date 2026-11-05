@@ -64,7 +64,7 @@
 //! one with an id or callee the scan cannot resolve. A cap, cancellation
 //! or the time budget refuses the candidate whatever the role.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 
 use skin_model::{MAX_SOURCE_BYTES, PLAY, Scope, Ty};
 
@@ -440,11 +440,11 @@ impl Lower<'_> {
             Node::Neg(x) => {
                 self.emit(res, x)?;
                 match self.get(x)? {
-                    V::Int { src, lo, hi } => Self::int(
-                        Self::text(an, &["(-", src, ")"])?,
-                        hi.checked_neg().unwrap_or(i64::MAX),
-                        lo.checked_neg().unwrap_or(i64::MAX),
-                    ),
+                    // Every operand is within `i32` ([`Self::int`]): its
+                    // negation, sums, differences and products fit `i64`.
+                    V::Int { src, lo, hi } => {
+                        Self::int(Self::text(an, &["(-", src, ")"])?, -*hi, -*lo)
+                    }
                     V::Bool(_) => ty(),
                 }
             }
@@ -466,25 +466,16 @@ impl Lower<'_> {
                 else {
                     return ty();
                 };
-                let f = |p: i128, q: i128| match op {
+                let f = |p: i64, q: i64| match op {
                     Bin::Add => p + q,
                     Bin::Sub => p - q,
                     _ => p * q,
                 };
-                let c = [
-                    f((*al).into(), (*bl).into()),
-                    f((*al).into(), (*bh).into()),
-                    f((*ah).into(), (*bl).into()),
-                    f((*ah).into(), (*bh).into()),
-                ];
+                let c = [f(*al, *bl), f(*al, *bh), f(*ah, *bl), f(*ah, *bh)];
                 let lo = c.iter().copied().min().unwrap_or(0);
                 let hi = c.iter().copied().max().unwrap_or(0);
                 let src = Self::text(an, &["(", x, " ", symbol(op), " ", y, ")"])?;
-                Self::int(
-                    src,
-                    i64::try_from(lo).unwrap_or(i64::MIN),
-                    i64::try_from(hi).unwrap_or(i64::MAX),
-                )
+                Self::int(src, lo, hi)
             }
             Node::Cmp(op, a, b) => self.compare(res, op, a, b),
             Node::Select { cond, then, other } => {
@@ -609,7 +600,6 @@ impl Lower<'_> {
         let mut blocks: Vec<List> = Vec::new();
         let mut stack: Vec<u32> = Vec::new();
         let mut calls: Vec<u32> = Vec::new();
-        let mut reassigned: HashSet<u32> = HashSet::new();
         while let Some(i) = pending.pop() {
             let Some((ast, func)) = tree(self.an, i) else {
                 out.unresolved = out.unresolved.or(Some("callee"));
@@ -624,12 +614,12 @@ impl Lower<'_> {
             self.an.charge(u64::from(f.params.1)).map_err(stop)?;
             let own = params.get(&i).cloned().unwrap_or_default();
             // The whole tree, function constructors' bodies included: the
-            // locals assigned again and the calls collected first, each
-            // statement and expression one unit.
+            // calls collected first, each statement and expression one
+            // unit. A local assigned again is the parser's
+            // ([`crate::lua::syntax::Decl::assigned`]).
             blocks.clear();
             stack.clear();
             calls.clear();
-            reassigned.clear();
             blocks.push(f.body);
             loop {
                 if let Some(l) = blocks.pop() {
@@ -638,7 +628,7 @@ impl Lower<'_> {
                         self.an
                             .charge(stmt_width(ast, s).saturating_add(1))
                             .map_err(stop)?;
-                        stmt_parts(ast, s, &mut blocks, &mut stack, &mut reassigned);
+                        stmt_parts(ast, s, &mut blocks, &mut stack);
                     }
                     continue;
                 }
@@ -682,7 +672,6 @@ impl Lower<'_> {
                 inst: i,
                 func,
                 own: &own,
-                reassigned: &reassigned,
                 open,
             };
             for &e in &calls {
@@ -807,8 +796,6 @@ struct Ids<'a> {
     func: u32,
     /// Its parameters' joins over its call sites.
     own: &'a [Scan],
-    /// Its locals assigned after their declaration.
-    reassigned: &'a HashSet<u32>,
     open: bool,
 }
 
@@ -831,7 +818,7 @@ impl Ids<'_> {
         match decl {
             // A parameter assigned again holds what the body assigns, not
             // what its callers pass.
-            Some(x) if x.kind == DeclKind::Param && !self.reassigned.contains(&d) => {
+            Some(x) if x.kind == DeclKind::Param && !x.assigned => {
                 let params = self.ast.func(self.func).map_or((0, 0), |f| f.params);
                 // Its position, each parameter one unit.
                 self.an.charge(u64::from(params.1)).map_err(stop)?;
@@ -840,9 +827,7 @@ impl Ids<'_> {
                     .copied()
                     .unwrap_or(Scan::unresolved("id")))
             }
-            Some(x)
-                if x.kind == DeclKind::Local && x.init != NONE && !self.reassigned.contains(&d) =>
-            {
+            Some(x) if x.kind == DeclKind::Local && x.init != NONE && !x.assigned => {
                 Ok(numeral(self.ast, x.init).map_or(Scan::unresolved("id"), number_part))
             }
             Some(_) => Ok(Scan::unresolved("id")),
@@ -881,14 +866,9 @@ fn stmt_width(ast: &Ast, s: u32) -> u64 {
     }
 }
 
-/// Statement `s`'s blocks, expressions and locals it assigns again.
-fn stmt_parts(
-    ast: &Ast,
-    s: u32,
-    blocks: &mut Vec<List>,
-    exprs: &mut Vec<u32>,
-    reassigned: &mut HashSet<u32>,
-) {
+/// Statement `s`'s blocks and expressions; a local it assigns is no
+/// expression read.
+fn stmt_parts(ast: &Ast, s: u32, blocks: &mut Vec<List>, exprs: &mut Vec<u32>) {
     let mut expr = |e: u32| {
         if e != NONE {
             exprs.push(e);
@@ -901,9 +881,7 @@ fn stmt_parts(
         Stmt::Assign { targets, exprs: l } => {
             for &t in ast.list(targets) {
                 match ast.expr(t) {
-                    Expr::Local(d) => {
-                        reassigned.insert(d);
-                    }
+                    Expr::Local(_) => {}
                     _ => expr(t),
                 }
             }
@@ -946,9 +924,7 @@ fn stmt_parts(
         }
         Stmt::Function { target, func } => {
             match ast.expr(target) {
-                Expr::Local(d) => {
-                    reassigned.insert(d);
-                }
+                Expr::Local(_) => {}
                 _ => expr(target),
             }
             if let Some(f) = ast.func(func) {

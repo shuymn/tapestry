@@ -2276,6 +2276,40 @@ mod tests {
     }
 
     #[test]
+    fn a_declaration_counts_every_assignment_after_it() {
+        // In its own function, in a nested function, as one target of a
+        // multiple assignment and as a function statement's plain name;
+        // never its own initialization.
+        let src = "local function f(id, other, kept)\n\
+             local g = function() id = 1 end\n\
+             local x, y\n\
+             x, other = 1, 2\n\
+             local h\n\
+             function h() end\n\
+             return id, kept, g, y\n\
+             end";
+        let a = ok(src);
+        let assigned = |name: &str| {
+            a.decls
+                .iter()
+                .find(|d| &src.as_bytes()[d.name.0 as usize..d.name.1 as usize] == name.as_bytes())
+                .map(|d| d.assigned)
+        };
+        for (name, want) in [
+            ("id", true),
+            ("other", true),
+            ("x", true),
+            ("h", true),
+            ("kept", false),
+            ("g", false),
+            ("y", false),
+            ("f", false),
+        ] {
+            assert_eq!(assigned(name), Some(want), "{name}");
+        }
+    }
+
+    #[test]
     fn numerals_take_lua_s_subtypes() {
         use super::Tok;
         let n = |t: &[u8]| number(t, &mut || Ok(())).unwrap();

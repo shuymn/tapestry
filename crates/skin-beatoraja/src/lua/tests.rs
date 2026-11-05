@@ -109,11 +109,11 @@ pub(crate) fn site(site: &'static str) -> (u64, u64) {
 }
 
 thread_local! {
-    /// The size-memo slots this thread's lowerings held, summed.
+    /// The emission-memo slots this thread's lowerings held, summed.
     pub(crate) static MEMO_SLOTS: Cell<usize> = const { Cell::new(0) };
 }
 
-/// Called as a lowering ends with `slots` size-memo slots.
+/// Called as a lowering ends with `slots` emission-memo slots.
 pub(crate) fn memo_witness(slots: usize) {
     MEMO_SLOTS.with(|n| n.set(n.get() + slots));
 }
