@@ -48,12 +48,31 @@ fn chart_dir() -> &'static Path {
 /// # Panics
 ///
 /// If a loaded chart breaks its base or link invariants, or its
-/// presentation validity disagrees with [`endpoint_conflict`]; and, loaded
+/// presentation validity disagrees with [`endpoint_conflict`]; if the listing
+/// or the summary disagrees with the load; and, loaded
 /// again at the practice speed [`practice_speed`] picks for `data`, if the
 /// mapped chart does, or keeps other rows, positions, tempos or identity
 /// than the 1× chart.
 pub fn bms_load(data: &[u8]) -> Result<Loaded, LoadError> {
-    let loaded = bms_parser::load_bms(data, chart_dir(), &LoadOptions::default())?;
+    let loaded = bms_parser::load_bms(data, chart_dir(), &LoadOptions::default());
+    let limits = bms_parser::Limits::default();
+    if let Ok(listing) = bms_parser::read_listing(data, &limits) {
+        // A chart the list keeps is never refused for a 2P lane.
+        assert!(
+            listing.mode == bms_parser::ChartMode::TwoPlayer
+                || !matches!(&loaded, Err(LoadError::Unsupported { what, .. })
+                    if what.starts_with("2P lane")),
+            "a chart with no two-player object is refused for one"
+        );
+    }
+    // The summary is the load's: only what needs the file system differs.
+    let summary = bms_parser::summarize(data, &limits);
+    match &loaded {
+        Ok(l) => assert_eq!(summary, Ok(bms_model::ChartSummary::of(&l.chart))),
+        Err(LoadError::SoundPathEscapes { .. } | LoadError::ChartDir { .. }) => {}
+        Err(e) => assert_eq!(summary.as_ref().err(), Some(e)),
+    }
+    let loaded = loaded?;
     check_loaded(&loaded.chart, bms_model::Speed::NORMAL);
     let speed = practice_speed(data);
     let opts = LoadOptions {

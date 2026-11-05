@@ -3,7 +3,7 @@
 
 use std::path::PathBuf;
 
-use crate::{ChartTimeline, ModelError, NoteAnchors, Position, ScrollMap, TimeUs};
+use crate::{ChartTimeline, ModelError, NoteAnchors, Position, ScrollMap, Tempo, TimeUs};
 
 /// Number of lanes: the scratch and seven keys.
 pub const LANE_COUNT: usize = 8;
@@ -256,6 +256,56 @@ pub struct Chart {
     pub meta: ChartMeta,
     /// What identifies the chart.
     pub identity: ChartIdentity,
+}
+
+/// What a song list shows of a chart's content before it is chosen
+/// (design.md "Loading and Song Selection", Summaries), read from a chart by
+/// [`ChartSummary::of`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChartSummary {
+    /// Notes hit once.
+    pub taps: u32,
+    /// Long notes, each judged once.
+    pub longs: u32,
+    /// Mines.
+    pub mines: u32,
+    /// The latest of every note's end and every BGM event's time, without
+    /// any sound's duration.
+    pub length: TimeUs,
+    /// The tempo before time 0.
+    pub tempo_start: Tempo,
+    /// The slowest tempo.
+    pub tempo_min: Tempo,
+    /// The fastest tempo.
+    pub tempo_max: Tempo,
+}
+
+impl ChartSummary {
+    /// The summary of `chart`.
+    #[must_use]
+    pub fn of(chart: &Chart) -> Self {
+        let (mut taps, mut longs, mut mines) = (0_u32, 0_u32, 0_u32);
+        let mut length = chart.bgm.iter().map(|e| e.time).max().unwrap_or(TimeUs(0));
+        for note in chart.lanes.iter().flatten() {
+            let count = match note.kind {
+                NoteKind::Tap => &mut taps,
+                NoteKind::Long { .. } => &mut longs,
+                NoteKind::Mine { .. } => &mut mines,
+            };
+            *count = count.saturating_add(1);
+            length = length.max(note.end());
+        }
+        let meta = chart.timeline.meta();
+        Self {
+            taps,
+            longs,
+            mines,
+            length,
+            tempo_start: meta.initial,
+            tempo_min: meta.min,
+            tempo_max: meta.max,
+        }
+    }
 }
 
 impl Chart {

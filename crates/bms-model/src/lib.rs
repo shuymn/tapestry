@@ -19,8 +19,8 @@ mod timeline;
 
 pub use builder::ChartBuilder;
 pub use chart::{
-    BgmEvent, Chart, ChartIdentity, ChartMeta, HeaderValue, JudgmentHeader, JudgmentHeaderName,
-    LANE_COUNT, Lane, LnMode, Note, NoteKind, SoundId, SoundRef,
+    BgmEvent, Chart, ChartIdentity, ChartMeta, ChartSummary, HeaderValue, JudgmentHeader,
+    JudgmentHeaderName, LANE_COUNT, Lane, LnMode, Note, NoteKind, SoundId, SoundRef,
 };
 pub use clock::{TimeSource, VirtualClock};
 pub use error::{EndpointLocation, EndpointPart, ModelError, PresentationError};
