@@ -13,11 +13,14 @@
 //! A selecting image that SUDDEN+ may paint lowers to a play-critical
 //! cover paint showing its table ([`Lowered::Paint`]).
 
+use std::collections::HashMap;
+
 use skin_model::{
-    CoverImage, CycleDef, ImageChoiceDef, ImageChoicePart, ImageSpan, PastTable, Program, Source,
-    Track, Ty,
+    CoverImage, CycleDef, ImageChoiceDef, ImageChoicePart, ImageDef, ImageSpan, PastTable, Program,
+    Source, Track, Ty,
 };
 
+use super::super::asset::{ImageKey, NotAdded};
 use super::super::policy::{CriticalPart, Role};
 use super::super::property::{self, IndexProp, IntProp, Value};
 use super::super::report::{NoteKind, PropertyKind, Span, TrackWhy};
@@ -120,6 +123,24 @@ struct Entry {
     cycle: Option<CycleDef>,
 }
 
+/// The cache key of record `rec`'s image for an image choice of `c`.
+fn choice_key(c: &Common, rec: u32, s: &SrcImage) -> ImageKey {
+    (rec, c.filter == skin_model::Filter::Linear, s.div, true)
+}
+
+/// A choice's image the sheet would not take, as a refusal no hole stands
+/// for.
+fn not_added(e: NotAdded) -> Unplaced {
+    let why = match e {
+        NotAdded::CellTooLarge { w, h } => NoteKind::CellTooLarge { w, h },
+        NotAdded::Image(_) => NoteKind::MissingAsset,
+    };
+    Unplaced {
+        why,
+        missing: false,
+    }
+}
+
 impl Cx<'_> {
     /// Selector `src` compiled once per import and charged for each
     /// destination that keeps a copy.
@@ -138,20 +159,16 @@ impl Cx<'_> {
         Ok(p)
     }
 
-    /// Admits record `rec`'s source `s` for an image choice, without the
-    /// sheet-level cycle its entries replace: its image and cell.
-    fn admit_choice(
+    /// Charges and places source `s` for an image choice,
+    /// without the sheet-level cycle its entries replace, and checks the
+    /// sheet would take it, adding nothing: its image and cell.
+    fn place_choice(
         &mut self,
         c: &Common,
-        rec: u32,
         s: &SrcImage,
-    ) -> Result<Result<(u32, [u32; 2]), Unplaced>, ImportError> {
+    ) -> Result<Result<(ImageDef, [u32; 2]), Unplaced>, ImportError> {
         let at = c.span;
         let frames = self.grid_frames(at, s.div)?;
-        let key = (rec, c.filter == skin_model::Filter::Linear, s.div, true);
-        if let Some(found) = self.assets.image(key, None) {
-            return Ok(Ok(found));
-        }
         self.budget.image(frames).map_err(|l| self.limit(at, l))?;
         #[cfg(test)]
         trace(Event::Charge);
@@ -159,20 +176,39 @@ impl Cx<'_> {
             Ok(found) => found,
             Err(u) => return Ok(Err(u)),
         };
-        let def = skin_model::ImageDef {
+        let def = ImageDef {
             file,
             rect: Some(rect),
             grid: s.div.map(|g| u16::try_from(g).unwrap_or(u16::MAX)),
             cycle: None,
             filter: c.filter,
         };
-        Ok(match self.assets.add_image(key, None, def, cell) {
-            Ok(found) => Ok(found),
-            Err(_) => Err(Unplaced {
-                why: NoteKind::MissingAsset,
-                missing: false,
-            }),
+        Ok(match self.assets.check_image(&def) {
+            Ok(()) => Ok((def, cell)),
+            Err(e) => Err(not_added(e)),
         })
+    }
+
+    /// Admits record `rec`'s source `s` for an image choice ([`Self::place_choice`]):
+    /// its image and cell.
+    fn admit_choice(
+        &mut self,
+        c: &Common,
+        rec: u32,
+        s: &SrcImage,
+    ) -> Result<Result<(u32, [u32; 2]), Unplaced>, ImportError> {
+        let key = choice_key(c, rec, s);
+        if let Some(found) = self.assets.image(key, None) {
+            return Ok(Ok(found));
+        }
+        let (def, cell) = match self.place_choice(c, s)? {
+            Ok(placed) => placed,
+            Err(u) => return Ok(Err(u)),
+        };
+        Ok(self
+            .assets
+            .add_image(key, None, def, cell)
+            .map_err(not_added))
     }
 
     /// An image group (`len` above 1) selecting by `src`: `len` runs of
@@ -241,7 +277,9 @@ impl Cx<'_> {
     /// An image set selecting by `src`: one entry per item of its
     /// `images` array, in order, repeats kept; a null item, an id no
     /// `image` record defines and a source proven missing are holes. It
-    /// is lowered as `lowered` says.
+    /// is lowered as `lowered` says. Its images reach the sheet only once
+    /// every entry and its stretch are accepted, so a dropped set adds none:
+    /// images others use stay, each at its index.
     pub(in super::super) fn image_set_choices(
         &mut self,
         dst: Dst,
@@ -275,15 +313,17 @@ impl Cx<'_> {
         #[cfg(test)]
         trace(Event::Table);
         let items: Vec<u32> = self.def.arena.children(list).collect();
-        let mut entries = Vec::with_capacity(items.len());
+        let mut pending = Vec::with_capacity(items.len());
+        let mut placed: HashMap<ImageKey, [u32; 2]> = HashMap::new();
+        let mut to_add = Vec::new();
         for item in items {
             let Some(name) = self.def.string(item, "images")? else {
-                entries.push(None);
+                pending.push(None);
                 continue;
             };
             let Some(rec) = self.image_rec(&name)? else {
                 self.ignored(self.arena_span(item), NoteKind::UndefinedObject);
-                entries.push(None);
+                pending.push(None);
                 continue;
             };
             let s = self.src_image(rec)?;
@@ -292,25 +332,54 @@ impl Cx<'_> {
                 Ok(cycle) => cycle,
                 Err(why) => return self.drop_el(c.role, at, why),
             };
-            match self.admit_choice(&c, rec, &s)? {
-                Ok((image, cell)) => entries.push(Some(Entry {
-                    image,
-                    cell,
-                    first: 0,
-                    frames: u16::try_from(n).map_err(|_| self.range(at, "images"))?,
-                    cycle,
-                })),
-                Err(Unplaced { why, missing: true }) => {
-                    self.ignored(self.arena_span(item), why);
-                    entries.push(None);
-                }
-                Err(Unplaced { why, .. }) => return self.drop_el(c.role, at, why),
-            }
+            let key = choice_key(&c, rec, &s);
+            let cell = match (placed.get(&key), self.assets.image(key, None)) {
+                (Some(&cell), _) | (None, Some((_, cell))) => cell,
+                (None, None) => match self.place_choice(&c, &s)? {
+                    Ok((def, cell)) => {
+                        placed.insert(key, cell);
+                        to_add.push((key, def, cell));
+                        cell
+                    }
+                    Err(Unplaced { why, missing: true }) => {
+                        self.ignored(self.arena_span(item), why);
+                        pending.push(None);
+                        continue;
+                    }
+                    Err(Unplaced { why, .. }) => return self.drop_el(c.role, at, why),
+                },
+            };
+            let frames = u16::try_from(n).map_err(|_| self.range(at, "images"))?;
+            pending.push(Some((key, cell, frames, cycle)));
         }
-        if entries.iter().all(Option::is_none) {
+        if pending.iter().all(Option::is_none) {
             self.ignored(at, NoteKind::Track(TrackWhy::NeverDrawn));
             return Ok(());
         }
+        for (_, cell, ..) in pending.iter().flatten() {
+            if self.baked_rects(&c, *cell)?.is_none() {
+                return self.drop_el(c.role, at, NoteKind::Stretch(c.stretch_mode));
+            }
+        }
+        for (key, def, cell) in to_add {
+            if let Err(e) = self.assets.add_image(key, None, def, cell) {
+                return self.drop_el(c.role, at, not_added(e).why);
+            }
+        }
+        let entries = pending
+            .into_iter()
+            .map(|entry| {
+                let (key, cell, frames, cycle) = entry?;
+                let (image, _) = self.assets.image(key, None)?;
+                Some(Entry {
+                    image,
+                    cell,
+                    first: 0,
+                    frames,
+                    cycle,
+                })
+            })
+            .collect();
         self.push_choices(c, value, entries, deviates, lowered)
     }
 
