@@ -232,10 +232,11 @@ fn an_operator_outside_the_subset_opens_the_candidate() {
         ("", "function(u) return #u > 0 end"),
         // `==` of two unknown values.
         ("", "function(u, v) return u == v end"),
-        // `string.byte` may give nothing: `math.floor` of nil.
+        // `string.byte` may give nothing: its first result, kept in a
+        // local, may be nil, which `math.floor` does not take.
         (
             "local s = \"a\"",
-            "function() return math.floor(string.byte(s)) > 0 end",
+            "function() local b = string.byte(s) return math.floor(b) > 0 end",
         ),
         // A bitwise operator, which the source's grammar does not have.
         ("", "function() return 1 & 1 == 1 end"),
@@ -485,4 +486,105 @@ fn the_last_phase_s_time_is_checked_when_it_ends() {
     fake::at_phase(Phase::Walk, true, || fake::advance(HALF));
     super::tests::at_expansion(|| fake::advance(HALF));
     assert_eq!(too_long(&one_lowering()), Some(10));
+}
+
+#[test]
+fn a_parameter_assigned_again_takes_no_call_site_id() {
+    // The helper's parameter is the EX score's id when it reads it, not
+    // the decorative id its caller passes.
+    let pre = "local function shown(id)\n  id = 101\n  return ms.number(id)\nend";
+    match outcome(&number(pre, "function() return shown(110) end"), &[]).0 {
+        Err(ImportError::Lua {
+            why: LuaWhy::Critical { field: "value", .. },
+            ..
+        }) => {}
+        other => panic!("{other:?}"),
+    }
+}
+
+/// The analysis work of importing `entry`.
+fn work(entry: &str) -> u64 {
+    super::callback_tests::run_with(entry, &[], &super::Cancel::new())
+        .unwrap()
+        .usage
+        .analysis_work
+}
+
+#[test]
+fn a_protected_format_s_bytes_are_charged() {
+    // The walk reads the format a protected `string.format` is given,
+    // each byte charged first, as an unprotected one's.
+    let call = |n: usize| {
+        let fmt = "x".repeat(n);
+        skin(
+            "",
+            &image(&format!(
+                "function() return pcall(string.format, \"{fmt}%d\", 1) end"
+            )),
+        )
+    };
+    let (short, long) = (work(&call(0)), work(&call(60_000)));
+    assert!(long - short >= 60_000, "{short} {long}");
+}
+
+#[test]
+fn every_name_a_statement_lists_is_charged() {
+    // 100 local names and 100 assignment targets, which the walk visits
+    // in their statements and the targets again in its reassignment
+    // pass, against one of each.
+    let names = |n: usize| {
+        let list = (0..n)
+            .map(|k| format!("a{k}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        skin(
+            "",
+            &image(&format!(
+                "function() local {list} {list} = 1 return true end"
+            )),
+        )
+    };
+    let (one, many) = (work(&names(1)), work(&names(100)));
+    assert!(many - one >= 3 * 99, "{one} {many}");
+}
+
+#[test]
+fn an_image_set_s_role_scan_is_timed() {
+    use super::clock::{Phase, fake};
+    // Past the budget inside the role scan of an image set's value: the
+    // candidate refuses at that value, defined on line 4.
+    fake::at_phase(Phase::Scan, true, || fake::advance(PAST));
+    let entry = skin(
+        "skin.imageset = { { id = \"s\", ref = 10, images = { \"i\", \"i\" }, value = function() return 1 end } }",
+        "{ id = \"s\", dst = { { w = 64, h = 64 } } },",
+    );
+    assert_eq!(too_long(&entry), Some(4));
+}
+
+#[test]
+fn a_protected_writer_writes() {
+    // A host writer and a library writer behind `pcall`.
+    opens(
+        "",
+        "function() pcall(ms.set_timer, 1, 0) return true end",
+        true,
+    );
+    opens(
+        "",
+        "function() pcall(setmetatable, {}, {}) return true end",
+        true,
+    );
+}
+
+#[test]
+fn a_writer_no_consumer_takes_is_replaced_as_a_writer() {
+    // A decorative destination's `timer` that writes: its reason is the
+    // write, not the missing consumer.
+    let entry = skin(
+        "local n = 0",
+        "{ id = \"i\", timer = function() n = n + 1 return 0 end, dst = { { w = 64, h = 10 } } },",
+    );
+    let (r, callbacks) = outcome(&entry, &[]);
+    r.unwrap();
+    assert_eq!(callbacks, [Disposition::Replaced(Unsupported::Writes)]);
 }

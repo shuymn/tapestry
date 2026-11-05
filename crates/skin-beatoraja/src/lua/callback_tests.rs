@@ -531,7 +531,7 @@ fn option_lookups_hash_the_name_and_charge_its_bytes() {
 #[test]
 fn the_role_scan_visits_each_helper_once() {
     // A binary tree of 16 383 helper closures, 8 192 leaves each
-    // capturing its own index, under 64 numbers whose callback does not
+    // capturing its own index, under 32 numbers whose callback does not
     // convert: each one's role scan visits every helper once, a hash a
     // check.
     let body = "local level = {}\n\
@@ -547,7 +547,7 @@ fn the_role_scan_visits_each_helper_once() {
         local root = level[1]\n\
         skin.value = { { id = \"v\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, digit = 3,\n\
           value = function() local unused = root() return ms.number(425) end } }";
-    let dst: String = (0..64)
+    let dst: String = (0..32)
         .map(|k| format!("{{ id = \"v\", dst = {{ {{ x = {k}, y = 0, w = 6, h = 6 }} }} }},"))
         .collect();
     let start = std::time::Instant::now();

@@ -34,6 +34,8 @@ pub(crate) enum Phase {
     Admit,
     /// One lowering of a callable.
     Lower,
+    /// A role scan outside a lowering: an image set's value.
+    Scan,
 }
 
 /// A point on the monotonic clock: [`std::time::Instant`], or a test's

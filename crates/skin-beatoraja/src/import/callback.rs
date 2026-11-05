@@ -602,7 +602,10 @@ impl Lower<'_> {
             loop {
                 if let Some(l) = blocks.pop() {
                     for &s in ast.list(l) {
-                        self.an.charge(1).map_err(stop)?;
+                        // The statement and each item its lists hold.
+                        self.an
+                            .charge(stmt_width(ast, s).saturating_add(1))
+                            .map_err(stop)?;
                         stmt_parts(ast, s, &mut blocks, &mut stack, &mut reassigned);
                     }
                     continue;
@@ -618,6 +621,7 @@ impl Lower<'_> {
                         stack.push(b);
                     }
                     Expr::Table(items) => {
+                        self.an.charge(u64::from(items.1)).map_err(stop)?;
                         stack.extend(ast.list(items).iter().copied().filter(|&x| x != NONE))
                     }
                     Expr::Func(g) => {
@@ -628,10 +632,12 @@ impl Lower<'_> {
                     Expr::Method { obj, args, .. } => {
                         out.unresolved = out.unresolved.or(Some("callee"));
                         stack.push(obj);
+                        self.an.charge(u64::from(args.1)).map_err(stop)?;
                         stack.extend_from_slice(ast.list(args));
                     }
                     Expr::Call { callee, args } => {
                         stack.push(callee);
+                        self.an.charge(u64::from(args.1)).map_err(stop)?;
                         stack.extend_from_slice(ast.list(args));
                         calls.push(e);
                     }
@@ -817,9 +823,13 @@ impl Ids<'_> {
         };
         let decl = self.ast.decl(d).filter(|x| x.func == self.func);
         match decl {
-            Some(x) if x.kind == DeclKind::Param => {
-                let f = self.ast.func(self.func);
-                let k = f.and_then(|f| self.ast.list(f.params).iter().position(|&p| p == d));
+            // A parameter assigned again holds what the body assigns, not
+            // what its callers pass.
+            Some(x) if x.kind == DeclKind::Param && !self.reassigned.contains(&d) => {
+                let params = self.ast.func(self.func).map_or((0, 0), |f| f.params);
+                // Its position, each parameter one unit.
+                self.an.charge(u64::from(params.1)).map_err(stop)?;
+                let k = self.ast.list(params).iter().position(|&p| p == d);
                 Ok(k.and_then(|k| self.own.get(k))
                     .copied()
                     .unwrap_or(Scan::unresolved("id")))
@@ -850,6 +860,18 @@ fn number_part(n: i64) -> Scan {
     Scan {
         part,
         unresolved: None,
+    }
+}
+
+/// How many items statement `s`'s lists hold, an upper bound of what
+/// [`stmt_parts`] visits beside the statement.
+fn stmt_width(ast: &Ast, s: u32) -> u64 {
+    let n = |l: List| u64::from(l.1);
+    match ast.stmt(s) {
+        Stmt::Local { names, exprs } | Stmt::GenericFor { names, exprs, .. } => n(names) + n(exprs),
+        Stmt::Assign { targets, exprs } => n(targets) + n(exprs),
+        Stmt::Return(l) | Stmt::If(l) => n(l),
+        _ => 4,
     }
 }
 
@@ -1161,8 +1183,14 @@ impl Cx<'_> {
         field: &'static str,
         consumer: &'static str,
     ) -> Result<NoteKind, ImportError> {
-        let c = self.callable_at(id).map_or(NONE, |(c, _)| c);
-        let why = Unsupported::Consumer(consumer);
+        let (c, inst) = self.callable_at(id).unwrap_or((NONE, NONE));
+        // A writer's reason is its write, whatever consumes it.
+        let writes = inst != NONE && self.analysis().is_some_and(|an| an.writes(inst));
+        let why = if writes {
+            Unsupported::Writes
+        } else {
+            Unsupported::Consumer(consumer)
+        };
         if role != Role::Decorative {
             self.outcome((c, id), field, role, (Disposition::Refused, Some(why)));
             return Err(self.critical(id, field, why));
@@ -1193,17 +1221,24 @@ impl Cx<'_> {
         if inst == NONE {
             return Ok(role);
         }
+        let fatal = |why| ImportError::Lua {
+            at: Some(self.def.loc(id)),
+            why,
+        };
+        let time = |w| fatal(sentinel(w).unwrap_or(LuaWhy::Limit(LuaLimit::AnalysisTime)));
+        // A phase of the analysis's time budget, located at the value.
+        an.clock
+            .enter(crate::lua::callback::Phase::Scan, Some(id))
+            .map_err(time)?;
         let cancelled = || self.def.cancelled(|| None).is_err();
-        let scan = match Lower::new(an, &self.custom, &cancelled).scan(inst) {
+        let r = Lower::new(an, &self.custom, &cancelled).scan(inst);
+        let left = an.clock.leave().map_err(time);
+        let scan = match r {
             Ok(s) => s,
-            Err(Stop::Fatal(why)) => {
-                return Err(ImportError::Lua {
-                    at: Some(self.def.loc(id)),
-                    why,
-                });
-            }
+            Err(Stop::Fatal(why)) => return Err(fatal(why)),
             Err(Stop::Unsupported(_)) => Scan::unresolved("callee"),
         };
+        left?;
         let role = scan.part.map_or(role, Role::Critical);
         if role == Role::Decorative
             && let Some(what) = scan.unresolved

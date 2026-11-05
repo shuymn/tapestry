@@ -22,10 +22,12 @@
 //! own parser ([`syntax`]) and runs it instrumented ([`instrument`]), so
 //! that each closure is tagged with its constructor and a capture reader;
 //! the conversion copies each callable's captures before the VM is
-//! dropped, and every callable is classified before the common import
-//! ([`callback::admit`]): one with an effect the analysis does not rule
-//! out refuses the candidate. The import converts the write-free ones
-//! where it consumes them (`import::callback`). The header pass refuses
+//! dropped, and every root's reach is walked before the common import
+//! ([`callback::admit`], [`effects`]): whether the candidate stays inside
+//! the modeled subset, and which roots write. Only a cap, cancellation
+//! or the analysis time budget refuses the candidate there. The import
+//! converts what it can where it consumes it (`import::callback`), and
+//! any other callback follows its role. The header pass refuses
 //! a function where its reading of the header meets it, as a value, a
 //! record, a list or a condition, so that the configured pass runs and
 //! the report sees what else it meets.

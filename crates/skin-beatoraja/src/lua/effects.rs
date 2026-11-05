@@ -500,6 +500,9 @@ impl<'a> Walk<'a> {
                     self.writes.push(false);
                     self.proto_of.insert(i, p);
                     let r = self.body(i, p)?;
+                    // Its results kept, one unit each.
+                    let n = u64::try_from(r.fixed.len()).unwrap_or(u64::MAX);
+                    self.an.charge(n).map_err(|why| Found { why, ..untagged })?;
                     if let Some(s) = self.states.get_mut(p as usize) {
                         *s = State::Done(r.clone());
                     }
@@ -555,7 +558,13 @@ impl<'a> Walk<'a> {
         self.block(&mut b, f.body)?;
         let ret = b.ret.take().unwrap_or_default();
         let always = returns(an, ast, f.body).map_err(|w| self.fatal(&b, f.line, w))?;
-        Ok(if always { ret } else { ret.or_nil() })
+        if always {
+            return Ok(ret);
+        }
+        // Each position padded with nil, one unit each.
+        let n = u64::try_from(ret.fixed.len()).unwrap_or(u64::MAX);
+        an.charge(n).map_err(|w| self.fatal(&b, f.line, w))?;
+        Ok(ret.or_nil())
     }
 
     /// Collects the locals of `b`'s function that block `l` assigns.
@@ -575,6 +584,11 @@ impl<'a> Walk<'a> {
         let ast = b.ast;
         match ast.stmt(s) {
             Stmt::Assign { targets, .. } => {
+                // Each target one unit.
+                let line = ast.stmt_line(s);
+                self.an
+                    .charge(u64::from(targets.1))
+                    .map_err(|w| self.fatal(b, line, w))?;
                 for &t in ast.list(targets) {
                     if let Expr::Local(d) = ast.expr(t) {
                         b.reassigned.insert(d);
@@ -636,6 +650,10 @@ impl<'a> Walk<'a> {
             Stmt::Empty | Stmt::Break | Stmt::Goto(_) | Stmt::Label(_) => {}
             Stmt::Local { names, exprs } => {
                 let t = self.list(b, exprs)?;
+                // Each name one unit.
+                self.an
+                    .charge(u64::from(names.1))
+                    .map_err(|w| self.fatal(b, line, w))?;
                 for (k, &d) in ast.list(names).iter().enumerate() {
                     if ast.decl(d).is_some_and(|x| x.attrib != Attrib::None) {
                         self.outside(b, line, Unsupported::Construct("local attribute"));
@@ -660,6 +678,10 @@ impl<'a> Walk<'a> {
                 });
             }
             Stmt::Assign { targets, exprs } => {
+                // Each target one unit.
+                self.an
+                    .charge(u64::from(targets.1))
+                    .map_err(|w| self.fatal(b, line, w))?;
                 for &t in ast.list(targets) {
                     match ast.expr(t) {
                         Expr::Local(d) if Self::own(b, d) => {}
@@ -716,6 +738,10 @@ impl<'a> Walk<'a> {
                 if modeled.is_none() {
                     self.outside(b, line, Unsupported::Construct("generic for header"));
                 }
+                // Each name one unit.
+                self.an
+                    .charge(u64::from(names.1))
+                    .map_err(|w| self.fatal(b, line, w))?;
                 for (k, &d) in ast.list(names).iter().enumerate() {
                     let num = k == 0 && modeled == Some(true);
                     Self::declare(b, d, if num { K::NUM } else { K::UNKNOWN });
@@ -1001,16 +1027,7 @@ impl<'a> Walk<'a> {
                 }
             },
             Ref::Lib(l) => {
-                // Its condition reads each argument and a format's bytes,
-                // one unit each.
-                let format = match ids.first().map(|&e| b.ast.expr(e)) {
-                    Some(Expr::Str(s)) => b.ast.str(s).len(),
-                    _ => 0,
-                };
-                let n = args.fixed.len().saturating_add(format);
-                self.an
-                    .charge(u64::try_from(n).unwrap_or(u64::MAX))
-                    .map_err(|w| self.fatal(b, line, w))?;
+                self.lib_charge(b, args, ids, line)?;
                 self.lib(b, l, args, ids, line)
             }
             _ => {
@@ -1088,13 +1105,39 @@ impl<'a> Walk<'a> {
                 self.call(b, f, args, ids, line)?;
                 true
             }
-            Ref::Host(api) => matches!(host(api, args), HostClass::Reads(_)),
+            Ref::Host(api) => match host(api, args) {
+                HostClass::Reads(_) => true,
+                HostClass::Writes => {
+                    self.write(b, line, Unsupported::HostApi(api));
+                    false
+                }
+                HostClass::Outside => false,
+            },
             Ref::Lib(l) => {
                 let name = LIBS.get(usize::from(l)).copied().unwrap_or("");
+                // Charged as an unprotected call of it is.
+                self.lib_charge(b, args, ids, line)?;
+                if LIB_WRITERS.contains(&name) {
+                    self.write(b, line, Unsupported::Construct(name));
+                    return Ok(false);
+                }
                 name != "pcall" && name != "xpcall" && pure(b.ast, name, args, ids).is_some()
             }
             _ => false,
         })
+    }
+
+    /// What a library call's condition reads, each argument and a
+    /// format's bytes one unit, charged before it is read.
+    fn lib_charge(&self, b: &Body<'_>, args: &Tuple, ids: &[u32], line: u32) -> R<()> {
+        let format = match ids.first().map(|&e| b.ast.expr(e)) {
+            Some(Expr::Str(s)) => b.ast.str(s).len(),
+            _ => 0,
+        };
+        let n = args.fixed.len().saturating_add(format);
+        self.an
+            .charge(u64::try_from(n).unwrap_or(u64::MAX))
+            .map_err(|w| self.fatal(b, line, w))
     }
 }
 
