@@ -25,6 +25,10 @@ use input::hid::{HidProduct, is_axis};
 use input::{MenuAction, MenuBindings, MenuEvent};
 use library::{ChartEntry, FolderKey, FolderRow, Level, Score, Search, Sort};
 use rules::RulePreset;
+use skin_model::{
+    ChartLabels, FolderId, MAX_VISIBLE_ROWS, Ratio, RowKey, RowKind, RowScore, RowView,
+    SelectedChart, SelectionPlace, SelectionView,
+};
 
 use crate::menu_screen::{Caret, LineStyle, MenuLine, MenuPage, PAGE_LINES};
 
@@ -919,23 +923,30 @@ impl SelectScreen {
                 .unwrap_or_default(),
             LineStyle::Notice,
         ));
-        let at = self.row_at_cursor();
-        for row in self.rows.iter().skip(self.top).take(LIST_LINES) {
+        // The list's page of rows, from the cursor's line to the page's end.
+        let view = self
+            .cursor_line()
+            .map_or_else(SelectionView::default, |at| {
+                self.view(at, LIST_LINES.saturating_sub(at + 1))
+            });
+        for (i, row) in view.rows.iter().enumerate() {
             let style = |other| {
-                if Some(*row) == at {
+                if Some(i) == view.cursor {
                     LineStyle::Cursor
                 } else {
                     other
                 }
             };
-            lines.push(match *row {
-                Row::All => line(
-                    format!("  ▶ 全譜面  ({})", self.all_row.unwrap_or(0)),
+            lines.push(match row.kind {
+                RowKind::All { charts } => {
+                    line(format!("  ▶ 全譜面  ({charts})"), style(LineStyle::Folder))
+                }
+                RowKind::Folder { charts } => line(
+                    format!("  ▶ {}  ({charts})", row.title),
                     style(LineStyle::Folder),
                 ),
-                Row::Folder(i) => line(self.folder_line(i), style(LineStyle::Folder)),
-                Row::Heading(i) => line(self.folder_name(i), LineStyle::Folder),
-                Row::Chart(i) => line(self.chart_line(i), style(LineStyle::Chart)),
+                RowKind::Heading => line(format!("▼ {}", row.title), LineStyle::Folder),
+                RowKind::Chart => line(self.chart_line(row), style(LineStyle::Chart)),
             });
         }
         if self.entries.is_empty() && self.folders.is_empty() {
@@ -959,58 +970,202 @@ impl SelectScreen {
         MenuPage { lines, caret }
     }
 
-    /// Folder row `i`: its directory's name and the charts under it.
-    fn folder_line(&self, i: usize) -> String {
-        self.folders
-            .get(i)
-            .map_or_else(String::new, |f| format!("  ▶ {}  ({})", f.name, f.charts))
+    /// The snapshot of the list: the cursor's row with up to `before` rows
+    /// above it and `after` below it that the list has, at most
+    /// [`MAX_VISIBLE_ROWS`] together, and what is known of the place, the
+    /// query and the chart under the cursor.
+    pub fn view(&self, before: usize, after: usize) -> SelectionView {
+        let at = self.cursor_row();
+        let (start, end) = at.map_or((0, 0), |at| {
+            let before = before.min(MAX_VISIBLE_ROWS - 1).min(at);
+            let after = after.min(MAX_VISIBLE_ROWS - 1 - before);
+            (at - before, (at + after + 1).min(self.rows.len()))
+        });
+        let rows = self
+            .rows
+            .get(start..end)
+            .unwrap_or_default()
+            .iter()
+            .map(|&row| self.row_view(row))
+            .collect();
+        let selectable = self.lead() + self.entries.len();
+        let position = (selectable > 1)
+            .then(|| Ratio::new(self.cursor as u64, selectable as u64 - 1))
+            .flatten();
+        let place = match &self.place {
+            _ if !self.query.is_empty() => SelectionPlace::Results,
+            Place::Top => SelectionPlace::Top,
+            Place::Folder { name, .. } => SelectionPlace::Folder(name.clone()),
+            Place::All => SelectionPlace::All,
+        };
+        SelectionView {
+            rows,
+            cursor: at.map(|at| at - start),
+            position,
+            place,
+            query: self.query.clone(),
+            selected: self.selected().map(|e| self.selected_chart(e)),
+        }
     }
 
-    /// The heading of chart `i`'s folder: its path under its root.
-    fn folder_name(&self, i: usize) -> String {
-        let Some(folder) = self.entries.get(i).and_then(|e| e.path.parent()) else {
-            return String::new();
+    /// A row of the list as the snapshot shows it.
+    fn row_view(&self, row: Row) -> RowView {
+        let count = |n: u64| u32::try_from(n).unwrap_or(u32::MAX);
+        let blank = |key, kind, title| RowView {
+            key,
+            kind,
+            title,
+            subtitle: String::new(),
+            artist: String::new(),
+            level: String::new(),
+            difficulty: None,
+            score: RowScore::Unplayed,
         };
+        match row {
+            Row::All => blank(
+                RowKey::All,
+                RowKind::All {
+                    charts: count(self.all_row.unwrap_or(0)),
+                },
+                String::new(),
+            ),
+            Row::Folder(i) => self.folders.get(i).map_or_else(
+                || blank(RowKey::All, RowKind::Heading, String::new()),
+                |f| {
+                    blank(
+                        RowKey::Folder(FolderId::new(f.key.path())),
+                        RowKind::Folder {
+                            charts: count(f.charts),
+                        },
+                        f.name.clone(),
+                    )
+                },
+            ),
+            Row::Heading(i) => {
+                let folder = self
+                    .entries
+                    .get(i)
+                    .and_then(|e| e.path.parent())
+                    .unwrap_or(Path::new(""));
+                blank(
+                    RowKey::Heading(FolderId::new(folder.to_owned())),
+                    RowKind::Heading,
+                    self.folder_name(folder),
+                )
+            }
+            Row::Chart(i) => self.entries.get(i).map_or_else(
+                || blank(RowKey::All, RowKind::Heading, String::new()),
+                |e| {
+                    let h = &e.header;
+                    let text = |f: &Option<String>| f.clone().unwrap_or_default();
+                    RowView {
+                        key: RowKey::Chart(e.path.clone()),
+                        kind: RowKind::Chart,
+                        title: text(&h.title),
+                        subtitle: text(&h.subtitle),
+                        artist: text(&h.artist),
+                        level: text(&h.playlevel),
+                        difficulty: difficulty(h.difficulty.as_deref()),
+                        score: self.score_of(e),
+                    }
+                },
+            ),
+        }
+    }
+
+    /// The chart's score under the chosen preset; unplayed without one.
+    fn score_of(&self, e: &ChartEntry) -> RowScore {
+        self.bests_preset.as_ref().map_or(RowScore::Unplayed, |p| {
+            crate::bests::row_score(self.bests.get(&e.sha256), p)
+        })
+    }
+
+    /// What is known of the chart under the cursor.
+    fn selected_chart(&self, e: &ChartEntry) -> SelectedChart {
+        let h = &e.header;
+        let text = |f: &Option<String>| f.clone().unwrap_or_default();
+        SelectedChart {
+            labels: ChartLabels {
+                title: text(&h.title),
+                subtitle: text(&h.subtitle),
+                artist: text(&h.artist),
+                subartist: text(&h.subartist),
+                genre: text(&h.genre),
+                level: text(&h.playlevel),
+                difficulty: difficulty(h.difficulty.as_deref()),
+            },
+            summary: e.summary,
+            random: e.random,
+            max_ex: max_ex(e, self.bests_preset.as_ref()),
+            score: self.score_of(e),
+        }
+    }
+
+    /// A heading's text: its folder under its root.
+    fn folder_name(&self, folder: &Path) -> String {
         let under = self
             .roots
             .iter()
             .find_map(|r| folder.strip_prefix(r).ok())
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or(folder);
-        format!("▼ {}", under.display())
+        under.display().to_string()
     }
 
-    /// Chart `i`'s line: its lamp and best EX under the chosen preset
-    /// ([`crate::bests::chart_cell`]), level, title, subtitle and artist,
-    /// or its file name when it has no title.
-    fn chart_line(&self, i: usize) -> String {
-        let Some(e) = self.entries.get(i) else {
-            return String::new();
+    /// A chart row's line: its lamp and best EX under the chosen preset
+    /// ([`crate::bests::chart_cell`]), level, title, subtitle and artist, or
+    /// its file name when it has no title.
+    fn chart_line(&self, row: &RowView) -> String {
+        let title = if row.title.is_empty() {
+            match &row.key {
+                RowKey::Chart(path) => path
+                    .file_name()
+                    .map_or_else(String::new, |n| n.to_string_lossy().into_owned()),
+                _ => String::new(),
+            }
+        } else {
+            row.title.clone()
         };
-        let h = &e.header;
-        let title = h.title.clone().unwrap_or_else(|| {
-            e.path
-                .file_name()
-                .map_or_else(String::new, |n| n.to_string_lossy().into_owned())
-        });
-        let cell = self.bests_preset.as_ref().map_or_else(
-            || " ".repeat(crate::bests::LAMP_COLUMNS + 6),
-            |p| crate::bests::chart_cell(self.bests.get(&e.sha256), p),
-        );
-        let mut text = format!(
-            "    {cell} ☆{:<3} {title}",
-            h.playlevel.as_deref().unwrap_or("-")
-        );
-        if let Some(sub) = &h.subtitle {
+        let cell = crate::bests::chart_cell(&row.score, self.bests_preset.as_ref());
+        let level = if row.level.is_empty() {
+            "-"
+        } else {
+            &row.level
+        };
+        let mut text = format!("    {cell} ☆{level:<3} {title}");
+        if !row.subtitle.is_empty() {
             text.push(' ');
-            text.push_str(sub);
+            text.push_str(&row.subtitle);
         }
-        if let Some(artist) = &h.artist {
+        if !row.artist.is_empty() {
             text.push_str("  / ");
-            text.push_str(artist);
+            text.push_str(&row.artist);
         }
         text
     }
+}
+
+/// `#DIFFICULTY` when it is 1 to 5.
+fn difficulty(text: Option<&str>) -> Option<u8> {
+    text.and_then(|d| d.trim().parse().ok())
+        .filter(|d| (1..=5).contains(d))
+}
+
+/// The largest EX score a chart's summary allows under `preset`: its judged
+/// notes (taps and long notes) at the preset's largest EX weight. `None` for a
+/// chart that draws, since its best may come from a draw with another note
+/// count, and without a summary or a preset.
+fn max_ex(e: &ChartEntry, preset: Option<&RulePreset>) -> Option<u64> {
+    if e.random {
+        return None;
+    }
+    let (summary, preset) = (e.summary?, preset?);
+    let ex = preset.score.ex;
+    let weight = [ex.perfect, ex.great, ex.good, ex.bad, ex.poor]
+        .into_iter()
+        .max()
+        .unwrap_or(0);
+    Some((u64::from(summary.taps) + u64::from(summary.longs)) * u64::from(weight))
 }
 
 #[cfg(test)]
@@ -1557,5 +1712,192 @@ mod tests {
                 "                      ☆-   う",
             ]
         );
+    }
+
+    fn view_keys(view: &skin_model::SelectionView) -> Vec<String> {
+        use skin_model::RowKey;
+        view.rows
+            .iter()
+            .map(|r| match &r.key {
+                RowKey::All => "all".to_owned(),
+                RowKey::Folder(f) => format!("folder {}", f.path().display()),
+                RowKey::Heading(f) => format!("heading {}", f.path().display()),
+                RowKey::Chart(p) => p.file_name().unwrap().to_string_lossy().into_owned(),
+            })
+            .collect()
+    }
+
+    /// The window holds at most `MAX_VISIBLE_ROWS` rows with the cursor's
+    /// inside, as many above and below as asked and the list has, headings
+    /// included; the position is exact over the selectable rows, none under
+    /// two.
+    #[test]
+    fn the_view_is_a_bounded_window_around_the_cursor() {
+        use skin_model::{MAX_VISIBLE_ROWS, Ratio, RowKey, RowKind};
+        let empty = SelectScreen::new(Vec::new()).view(10, 10);
+        assert_eq!(
+            (empty.rows.len(), empty.cursor, empty.position),
+            (0, None, None)
+        );
+        let mut one = SelectScreen::new(vec![PathBuf::from(r"C:\charts")]);
+        one.set_entries(folder("a", 1));
+        let v = one.view(10, 10);
+        assert_eq!(view_keys(&v), [r"heading C:\charts\a", "a00.bms"]);
+        assert_eq!(v.rows[0].kind, RowKind::Heading);
+        assert_eq!(v.rows[0].title, "a");
+        assert_eq!((v.cursor, v.position), (Some(1), None));
+        let mut s = SelectScreen::new(vec![PathBuf::from(r"C:\charts")]);
+        let names = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"];
+        s.set_entries(names.iter().flat_map(|f| folder(f, 10)).collect());
+        // At the start: the first heading, then the cursor's chart.
+        let v = s.view(100, 100);
+        assert_eq!(v.rows.len(), MAX_VISIBLE_ROWS);
+        assert_eq!(v.cursor, Some(1));
+        assert_eq!(v.position, Ratio::new(0, 99));
+        // In the middle, as asked.
+        for _ in 0..45 {
+            s.input(key(MenuKey::Down));
+        }
+        let v = s.view(2, 3);
+        assert_eq!(
+            view_keys(&v),
+            [
+                "e03.bms", "e04.bms", "e05.bms", "e06.bms", "e07.bms", "e08.bms"
+            ]
+        );
+        assert_eq!((v.cursor, v.position), (Some(2), Ratio::new(45, 99)));
+        // At the end.
+        s.input(key(MenuKey::End));
+        let v = s.view(100, 100);
+        assert_eq!(v.rows.len(), MAX_VISIBLE_ROWS);
+        assert_eq!(v.cursor, Some(MAX_VISIBLE_ROWS - 1));
+        assert_eq!(
+            v.rows[MAX_VISIBLE_ROWS - 1].key,
+            RowKey::Chart(PathBuf::from(r"C:\charts\j\j09.bms"))
+        );
+        assert_eq!(v.position, Ratio::new(99, 99));
+    }
+
+    /// The page drawn from the view is the page the list draws: headings, the
+    /// cursor's row, and each chart's lamp, best EX, level, title, subtitle
+    /// and artist under the chosen preset.
+    #[test]
+    fn the_page_is_drawn_from_the_view() {
+        let mut s = SelectScreen::new(vec![PathBuf::from(r"C:\charts")]);
+        let mut a = entry(r"C:\charts\x\1.bms", "あ");
+        a.sha256 = [1; 32];
+        a.header.playlevel = Some("12".to_owned());
+        a.header.subtitle = Some("[A]".to_owned());
+        a.header.artist = Some("art".to_owned());
+        let mut b = entry(r"C:\charts\x\2.bms", "い");
+        b.sha256 = [2; 32];
+        let mut c = entry(r"C:\charts\y\3.bms", "う");
+        c.sha256 = [3; 32];
+        c.header.title = None;
+        s.set_entries(vec![a, b, c]);
+        let mut preset = rules::tapestry();
+        preset.gauges[0].id = "easy".to_owned();
+        let easy = 0;
+        let best = |ex, bp, cleared: Vec<u8>, full_combo| library::Score {
+            plays: 4,
+            best: Some(library::Best {
+                ex,
+                bp,
+                cleared,
+                full_combo,
+            }),
+        };
+        s.set_bests_preset(Some(preset));
+        s.set_bests(std::collections::HashMap::from([
+            ([1; 32], best(1234, 5, vec![1 << easy], false)),
+            ([2; 32], best(99, 0, Vec::new(), true)),
+        ]));
+        s.input(key(MenuKey::Down));
+        let page = s.page("");
+        let lines: Vec<(&str, LineStyle)> = page.lines[3..8]
+            .iter()
+            .map(|l| (l.text.as_str(), l.style))
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                ("▼ x", LineStyle::Folder),
+                ("    EASY         1234 ☆12  あ [A]  / art", LineStyle::Chart),
+                ("    FC             99 ☆-   い", LineStyle::Cursor),
+                ("▼ y", LineStyle::Folder),
+                ("                      ☆-   3.bms", LineStyle::Chart),
+            ]
+        );
+    }
+
+    /// A row's difficulty is `#DIFFICULTY` when it is 1 to 5, spaces aside.
+    #[test]
+    fn a_difficulty_is_one_to_five() {
+        for (text, want) in [
+            ("1", Some(1)),
+            (" 5 ", Some(5)),
+            ("0", None),
+            ("6", None),
+            ("x", None),
+        ] {
+            let mut e = entry(r"C:\charts\x\1.bms", "a");
+            e.header.difficulty = Some(text.to_owned());
+            let mut s = SelectScreen::new(Vec::new());
+            s.set_entries(vec![e]);
+            let v = s.view(1, 1);
+            assert_eq!(v.rows[1].difficulty, want, "{text:?}");
+            assert_eq!(v.selected.unwrap().labels.difficulty, want, "{text:?}");
+        }
+    }
+
+    /// A chart that does not draw has a largest EX score: its judged notes at
+    /// the preset's largest EX weight. One that draws has none, even when its
+    /// best, from another draw, is past what its summary allows; so has one
+    /// without a summary or a preset.
+    #[test]
+    fn the_largest_ex_needs_one_draw_a_summary_and_a_preset() {
+        use bms_model::{ChartSummary, Tempo, TimeUs};
+        let tempo = Tempo::from_units(120 * Tempo::UNITS_PER_BPM).unwrap();
+        let summary = ChartSummary {
+            taps: 10,
+            longs: 5,
+            mines: 3,
+            length: TimeUs(1),
+            tempo_start: tempo,
+            tempo_min: tempo,
+            tempo_max: tempo,
+        };
+        let mut e = entry(r"C:\charts\x\1.bms", "a");
+        e.summary = Some(summary);
+        e.sha256 = [1; 32];
+        let max = |e: &ChartEntry, preset: Option<rules::RulePreset>| {
+            let mut s = SelectScreen::new(Vec::new());
+            s.set_entries(vec![e.clone()]);
+            s.set_bests_preset(preset);
+            s.set_bests(std::collections::HashMap::from([(
+                [1; 32],
+                library::Score {
+                    plays: 1,
+                    best: Some(library::Best {
+                        ex: 40,
+                        bp: 0,
+                        cleared: Vec::new(),
+                        full_combo: false,
+                    }),
+                },
+            )]));
+            s.view(0, 0).selected.unwrap().max_ex
+        };
+        assert_eq!(max(&e, Some(rules::tapestry())), Some(30));
+        let mut heavier = rules::tapestry();
+        heavier.score.ex.great = 4;
+        assert_eq!(max(&e, Some(heavier)), Some(60));
+        assert_eq!(max(&e, None), None);
+        let mut random = e.clone();
+        random.random = true;
+        assert_eq!(max(&random, Some(rules::tapestry())), None);
+        let mut refused = e;
+        refused.summary = None;
+        assert_eq!(max(&refused, Some(rules::tapestry())), None);
     }
 }

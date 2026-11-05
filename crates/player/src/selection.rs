@@ -3888,4 +3888,165 @@ mod tests {
         assert_eq!(by_artist[..2], by_title[..2]);
         assert!(by_artist[2].contains(" n "), "{by_artist:?}");
     }
+
+    /// What a skin reads of selection, by the groups of docs/stage3.md's
+    /// Selection table, taken from the view alone: a fact the view lacks
+    /// fails to compile or reads wrong here.
+    #[derive(Debug, PartialEq, Eq)]
+    struct Read {
+        // Rows, cursor and position.
+        rows: Vec<(String, skin_model::RowKind, String)>,
+        cursor: Option<usize>,
+        position: Option<skin_model::Ratio>,
+        // Folders.
+        place: skin_model::SelectionPlace,
+        folder_charts: Vec<u32>,
+        // Chart and query.
+        query: String,
+        labels: (String, String, String, Option<u8>),
+        notes: Option<(u32, u32, u32)>,
+        bpm: Option<(bms_model::Tempo, bms_model::Tempo, bms_model::Tempo)>,
+        length: Option<TimeUs>,
+        random: bool,
+        // Selected score.
+        score: skin_model::RowScore,
+        max_ex: Option<u64>,
+    }
+
+    fn read(view: &skin_model::SelectionView) -> Read {
+        use skin_model::RowKind;
+        let selected = view.selected.as_ref().expect("a chart is selected");
+        let summary = selected.summary;
+        Read {
+            rows: view
+                .rows
+                .iter()
+                .map(|r| (r.title.clone(), r.kind, r.level.clone()))
+                .collect(),
+            cursor: view.cursor,
+            position: view.position,
+            place: view.place.clone(),
+            folder_charts: view
+                .rows
+                .iter()
+                .filter_map(|r| match r.kind {
+                    RowKind::Folder { charts } | RowKind::All { charts } => Some(charts),
+                    RowKind::Chart | RowKind::Heading => None,
+                })
+                .collect(),
+            query: view.query.clone(),
+            labels: (
+                selected.labels.title.clone(),
+                selected.labels.artist.clone(),
+                selected.labels.level.clone(),
+                selected.labels.difficulty,
+            ),
+            notes: summary.map(|s| (s.taps, s.longs, s.mines)),
+            bpm: summary.map(|s| (s.tempo_start, s.tempo_min, s.tempo_max)),
+            length: summary.map(|s| s.length),
+            random: selected.random,
+            score: selected.score,
+            max_ex: selected.max_ex,
+        }
+    }
+
+    /// A stand-in consumer reads every needed fact of the Selection table's
+    /// groups from a view the player filled from a scanned library: the
+    /// rows, the cursor and its position, the folder counts, the chart's
+    /// labels and summary, the query, and the selected score with the largest
+    /// EX its rates divide by.
+    #[test]
+    fn a_consumer_reads_every_selection_fact_from_the_view() {
+        use skin_model::{OwnLamp, Ratio, RowKind, RowScore, SelectionPlace};
+        let dir = tempfile::tempdir().unwrap();
+        let (mut sel, roots) = tree(dir.path(), &[&["s/x/a.bms"]]);
+        // 150 BPM, then 300 at measure 1; two taps and a mine.
+        std::fs::write(
+            roots[0].join("c.bms"),
+            "#TITLE c\n#ARTIST art\n#PLAYLEVEL 7\n#DIFFICULTY 4\n#BPM 150\n#BPM01 300\n\
+             #00111:01\n#00118:01\n#001D3:01\n#00108:01\n#00211:01\n",
+        )
+        .unwrap();
+        settle(&mut sel);
+        let mut preset = rules::tapestry();
+        preset.gauges[0].id = "easy".to_owned();
+        let c = sel
+            .shelf
+            .search(&library::Search {
+                text: "c",
+                sort: library::Sort::Title,
+                by_folder: false,
+                limit: 1,
+            })
+            .unwrap()
+            .remove(0);
+        sel.screen.set_bests_preset(Some(preset));
+        sel.screen.set_bests(std::collections::HashMap::from([(
+            c.sha256,
+            library::Score {
+                plays: 3,
+                best: Some(library::Best {
+                    ex: 3,
+                    bp: 1,
+                    cleared: vec![1],
+                    full_combo: false,
+                }),
+            },
+        )]));
+        keys(&mut sel, &[MenuKey::Down, MenuKey::Down]);
+        let bpm =
+            |n: u128| bms_model::Tempo::from_units(n * bms_model::Tempo::UNITS_PER_BPM).unwrap();
+        let mut want = Read {
+            rows: vec![
+                (String::new(), RowKind::All { charts: 2 }, String::new()),
+                ("s".to_owned(), RowKind::Folder { charts: 1 }, String::new()),
+                ("c".to_owned(), RowKind::Chart, "7".to_owned()),
+            ],
+            cursor: Some(2),
+            position: Ratio::new(2, 2),
+            place: SelectionPlace::Top,
+            folder_charts: vec![2, 1],
+            query: String::new(),
+            labels: ("c".to_owned(), "art".to_owned(), "7".to_owned(), Some(4)),
+            notes: Some((3, 0, 1)),
+            bpm: Some((bpm(150), bpm(150), bpm(300))),
+            // Measure 1 at 1.6 s, then 0.8 s a measure: measure 2 at 2.4 s.
+            length: Some(TimeUs(2_400_000)),
+            random: false,
+            score: RowScore::Best {
+                plays: 3,
+                ex: 3,
+                bp: 1,
+                lamp: OwnLamp::Cleared {
+                    gauge: 0,
+                    rank: rules::tapestry().gauges[0].lamp,
+                },
+            },
+            max_ex: Some(6),
+        };
+        assert_eq!(read(&sel.screen.view(5, 5)), want);
+        // A query: its text, and the place is its results.
+        keys(&mut sel, &[MenuKey::Tab]);
+        sel.menu.push(MenuInput::Text("c".to_owned()));
+        keys(&mut sel, &[MenuKey::Enter]);
+        let view = sel.screen.view(5, 5);
+        let got = read(&view);
+        // The root's own charts are headed by the root's path; the list read
+        // again read the library's bests too, which hold no play.
+        want.score = RowScore::Unplayed;
+        want.rows = vec![
+            (
+                roots[0].display().to_string(),
+                RowKind::Heading,
+                String::new(),
+            ),
+            ("c".to_owned(), RowKind::Chart, "7".to_owned()),
+        ];
+        want.cursor = Some(1);
+        want.position = None;
+        want.place = SelectionPlace::Results;
+        want.folder_charts = Vec::new();
+        want.query = "c".to_owned();
+        assert_eq!(got, want);
+    }
 }
