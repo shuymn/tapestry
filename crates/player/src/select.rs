@@ -1152,7 +1152,8 @@ fn difficulty(text: Option<&str>) -> Option<u8> {
 }
 
 /// The largest EX score a chart's summary allows under `preset`: its judged
-/// notes (taps and long notes) at the preset's largest EX weight. `None` for a
+/// notes (taps and long notes) at the preset's largest EX weight, at most
+/// `u32::MAX` as the evaluator's EX score. `None` for a
 /// chart that draws, since its best may come from a draw with another note
 /// count, and without a summary or a preset.
 fn max_ex(e: &ChartEntry, preset: Option<&RulePreset>) -> Option<u64> {
@@ -1165,7 +1166,9 @@ fn max_ex(e: &ChartEntry, preset: Option<&RulePreset>) -> Option<u64> {
         .into_iter()
         .max()
         .unwrap_or(0);
-    Some((u64::from(summary.taps) + u64::from(summary.longs)) * u64::from(weight))
+    let notes = u64::from(summary.taps) + u64::from(summary.longs);
+    // The evaluator's EX score saturates at `u32::MAX`.
+    Some((notes * u64::from(weight)).min(u64::from(u32::MAX)))
 }
 
 #[cfg(test)]
@@ -1780,7 +1783,9 @@ mod tests {
 
     /// The page drawn from the view is the page the list draws: headings, the
     /// cursor's row, and each chart's lamp, best EX, level, title, subtitle
-    /// and artist under the chosen preset.
+    /// and artist under the chosen preset. A field present but empty shows as
+    /// an absent one: `-` for the level, no subtitle or artist, and the file
+    /// name for the title.
     #[test]
     fn the_page_is_drawn_from_the_view() {
         let mut s = SelectScreen::new(vec![PathBuf::from(r"C:\charts")]);
@@ -1794,7 +1799,12 @@ mod tests {
         let mut c = entry(r"C:\charts\y\3.bms", "う");
         c.sha256 = [3; 32];
         c.header.title = None;
-        s.set_entries(vec![a, b, c]);
+        // Present but empty: no level, no subtitle, no artist, the file name.
+        let mut d = entry(r"C:\charts\y\4.bms", "");
+        d.header.playlevel = Some(String::new());
+        d.header.subtitle = Some(String::new());
+        d.header.artist = Some(String::new());
+        s.set_entries(vec![a, b, c, d]);
         let mut preset = rules::tapestry();
         preset.gauges[0].id = "easy".to_owned();
         let easy = 0;
@@ -1814,7 +1824,7 @@ mod tests {
         ]));
         s.input(key(MenuKey::Down));
         let page = s.page("");
-        let lines: Vec<(&str, LineStyle)> = page.lines[3..8]
+        let lines: Vec<(&str, LineStyle)> = page.lines[3..9]
             .iter()
             .map(|l| (l.text.as_str(), l.style))
             .collect();
@@ -1826,6 +1836,7 @@ mod tests {
                 ("    FC             99 ☆-   い", LineStyle::Cursor),
                 ("▼ y", LineStyle::Folder),
                 ("                      ☆-   3.bms", LineStyle::Chart),
+                ("                      ☆-   4.bms", LineStyle::Chart),
             ]
         );
     }
@@ -1892,6 +1903,16 @@ mod tests {
         let mut heavier = rules::tapestry();
         heavier.score.ex.great = 4;
         assert_eq!(max(&e, Some(heavier)), Some(60));
+        // The evaluator's EX score saturates at `u32::MAX`, and so does this.
+        let mut huge = rules::tapestry();
+        huge.score.ex.perfect = 3_000_000_000;
+        let mut two = e.clone();
+        two.summary = Some(ChartSummary {
+            taps: 2,
+            longs: 0,
+            ..summary
+        });
+        assert_eq!(max(&two, Some(huge)), Some(u64::from(u32::MAX)));
         assert_eq!(max(&e, None), None);
         let mut random = e.clone();
         random.random = true;
