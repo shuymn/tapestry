@@ -276,6 +276,11 @@ mod tests {
     };
     use skin_beatoraja::{NoteKind, PropertyKind, Severity};
 
+    use skin_beatoraja::Cancel;
+    use skin_beatoraja::lua::facts::ImportFacts;
+    use skin_beatoraja::lua::survey::{Choice, survey_with};
+    use skin_model::ScreenKind;
+
     use super::{facts, report};
 
     fn args(s: &str) -> Vec<String> {
@@ -381,11 +386,53 @@ mod tests {
     }
 
     #[test]
+    fn a_valid_choice_without_local_detail_prints_nothing_new() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(
+            d.path().join("s.luaskin"),
+            "local skin = { type = 0, name = \"t\", w = 1920, h = 1080,\n\
+               property = { { name = \"fc\", item = { { name = \"off\", op = 905 }, { name = \"on\", op = 906 } } } },\n\
+               filepath = { { name = \"bg\", path = \"*.png\", def = \"a\" } } }\n\
+             if not skin_config then return skin end\n\
+             skin.destination = { { id = -110, dst = { { w = 64, h = 64 } } } }\n\
+             return skin\n",
+        )
+        .unwrap();
+        for name in ["a.png", "b.png"] {
+            std::fs::write(d.path().join(name), []).unwrap();
+        }
+        let run = |choice: &Choice| {
+            let s = survey_with(
+                d.path(),
+                "s.luaskin",
+                &ImportFacts::unavailable(ScreenKind::Play),
+                &Cancel::new(),
+                false,
+                choice,
+            );
+            report(0, &s)
+        };
+        let plain = run(&Choice::default());
+        assert!(plain.starts_with("skin 0: imported\n"), "{plain}");
+        let named = run(&Choice {
+            options: vec![("fc".to_owned(), "on".to_owned())],
+            files: vec![("bg".to_owned(), "b.png".to_owned())],
+        });
+        assert_eq!(named, plain);
+        for private in ["resolved", "destination", "fc", "bg", "b.png"] {
+            assert!(!named.contains(private), "{private} in {named}");
+        }
+    }
+
+    #[test]
     fn local_detail_lists_the_configuration_and_each_destination() {
         let s = Survey {
             resolved: Some(Resolved {
                 options: vec![(Some("fc".to_owned()), Some("on".to_owned()), Some(906))],
-                files: vec![("frame".to_owned(), "x".to_owned())],
+                files: vec![
+                    (Some("frame".to_owned()), Some("x".to_owned())),
+                    (None, None),
+                ],
             }),
             destinations: vec![
                 DestinationEntry {
@@ -438,7 +485,8 @@ mod tests {
             got,
             [
                 "  resolved option Some(\"fc\") Some(\"on\") Some(906)",
-                "  resolved file \"frame\" \"x\"",
+                "  resolved file Some(\"frame\") Some(\"x\")",
+                "  resolved file None None",
                 "  destination 3 \"lv\" Value Dropped",
                 "    note Dropped an unsupported Integer property 96 file \"play.lua\" line 0 column 601",
                 "  destination 4 \"i\" Image Retained elements 1..3 suppressed 2",

@@ -238,6 +238,8 @@ pub fn import(
         });
     }
     let tables = resolved.tables(&enabled)?;
+    #[cfg(feature = "dev-tools")]
+    let mut ledger = ledger::Recorder::new(object::records(&tables, "destination").len());
     let Resolved { def, size, .. } = resolved;
     let mut files = Vec::new();
     let choices = Choices::new(header, config, &mut files);
@@ -249,18 +251,16 @@ pub fn import(
     let mut cx = Cx::new(def, header, config, tables, choices, r, size[1])?;
     let destinations = object::records(&cx.tables, "destination").to_vec();
     cx.span_hint = cx.lane_span_hint(&destinations);
-    #[cfg(feature = "dev-tools")]
-    let mut ledger = ledger::Recorder::new(destinations.len());
     for (index, rec) in destinations.into_iter().enumerate() {
         #[cfg(feature = "dev-tools")]
         ledger.begin(&mut cx);
         let read = cx.destination(index, rec);
         #[cfg(feature = "dev-tools")]
-        ledger.end(&cx, index, read.is_err());
+        ledger.end(&mut cx, index, read.is_err());
         read?;
     }
     #[cfg(feature = "dev-tools")]
-    ledger.publish(&cx);
+    ledger.publish(&mut cx);
     cx.finish(files)
 }
 
@@ -428,6 +428,9 @@ pub(crate) struct Cx<'d> {
     /// conversion report's ledger.
     #[cfg(feature = "dev-tools")]
     folded: bool,
+    /// The notes as the ledger located them, for the report if none follow.
+    #[cfg(feature = "dev-tools")]
+    located: Option<Vec<Note>>,
 }
 
 /// A witness of the order of an import's work.
@@ -508,6 +511,8 @@ impl<'d> Cx<'d> {
             element: None,
             #[cfg(feature = "dev-tools")]
             folded: false,
+            #[cfg(feature = "dev-tools")]
+            located: None,
         };
         cx.budget.usage.resolved_digit_offsets =
             u32::try_from(cx.tables.digit_offsets.len()).unwrap_or(u32::MAX);
@@ -1713,7 +1718,14 @@ impl<'d> Cx<'d> {
             let at = self.load_loc(&source);
             ImportError::Model { at, source }
         })?;
-        let notes = report::locate(&self.def.arena, &self.notes.list);
+        #[cfg(feature = "dev-tools")]
+        let located = self
+            .located
+            .take()
+            .filter(|n| n.len() == self.notes.list.len());
+        #[cfg(not(feature = "dev-tools"))]
+        let located = None;
+        let notes = located.unwrap_or_else(|| report::locate(&self.def.arena, &self.notes.list));
         let report = Report {
             sources: self.def.arena.sources(),
             files,

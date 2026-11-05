@@ -88,8 +88,9 @@ pub struct Survey {
 pub struct Resolved {
     /// Each option's name and its selected item's name and number.
     pub options: Vec<(Option<String>, Option<String>, Option<i32>)>,
-    /// Each file choice's name and candidate.
-    pub files: Vec<(String, String)>,
+    /// Each file choice of the header, its name and the candidate the
+    /// import takes, `None` for none.
+    pub files: Vec<(Option<String>, Option<String>)>,
 }
 
 /// The options and file choices a survey names, by the skin's names; the
@@ -380,10 +381,21 @@ fn resolved(header: &crate::Header, config: &Config) -> Resolved {
             (o.name.clone(), item.and_then(|i| i.name.clone()), *op)
         })
         .collect();
-    let files = config
+    let files = header
         .files
         .iter()
-        .map(|(f, c)| (f.clone(), c.clone()))
+        .map(|f| {
+            let (pick, ..) = crate::import::asset::choose(
+                &f.candidates,
+                f.name.as_deref(),
+                f.def.as_deref(),
+                config,
+            );
+            (
+                f.name.clone(),
+                pick.and_then(|i| f.candidates.get(i)).cloned(),
+            )
+        })
         .collect();
     Resolved { options, files }
 }
@@ -900,6 +912,94 @@ mod tests {
                 (0, Some("i"), Became::Retained),
                 (1, Some("g"), Became::Refused),
                 (2, None, Became::NotReached),
+            ]
+        );
+    }
+
+    #[test]
+    fn each_destination_has_only_its_own_notes() {
+        let d = crate::lua::callback_tests::folder(LEDGER);
+        let s = ledger_survey(&d, true, &Choice::default());
+        let kinds: Vec<Vec<_>> = s
+            .destinations
+            .iter()
+            .map(|e| e.notes.iter().map(|n| n.kind).collect())
+            .collect();
+        assert_eq!(kinds[0], []);
+        assert_eq!(kinds[1], [NoteKind::Ignored { field: "op" }]);
+        assert_eq!(
+            kinds[2],
+            [NoteKind::UnsupportedProperty {
+                kind: PropertyKind::Integer,
+                id: Some(96)
+            }]
+        );
+        assert!(matches!(kinds[3][..], [NoteKind::Unsupported { .. }]));
+        assert_eq!(kinds[4], [NoteKind::UndefinedObject]);
+        assert_eq!(kinds[5], []);
+    }
+
+    #[test]
+    fn a_note_past_the_cap_still_says_what_became_of_its_destination() {
+        let entry = "local s = { type = 0, w = 1920, h = 1080 }\n\
+             if not skin_config then return s end\n\
+             s.judgegraph = { { id = \"jg\" } }\n\
+             s.destination = {}\n\
+             for i = 1, 4097 do s.destination[i] = { id = \"jg\", dst = { { w = 1, h = 1 } } } end\n\
+             return s\n";
+        let d = crate::lua::callback_tests::folder(entry);
+        let s = ledger_survey(&d, true, &Choice::default());
+        assert_eq!(s.outcome, "imported");
+        let last = s.destinations.last().unwrap();
+        assert_eq!((last.index, last.suppressed), (4096, 1));
+        assert!(last.notes.is_empty());
+        assert_eq!(last.became, Became::Dropped);
+    }
+
+    #[test]
+    fn a_refusal_before_the_first_destination_leaves_them_all_not_reached() {
+        let entry = "return { type = 0, w = 1920, h = 1080,\n\
+               customTimers = { { id = true } },\n\
+               destination = { { id = \"a\" }, { id = \"b\" } } }\n";
+        let d = crate::lua::callback_tests::folder(entry);
+        let s = ledger_survey(&d, true, &Choice::default());
+        assert_ne!(s.outcome, "imported");
+        let got: Vec<_> = s.destinations.iter().map(|e| (e.index, e.became)).collect();
+        assert_eq!(got, [(0, Became::NotReached), (1, Became::NotReached)]);
+    }
+
+    #[test]
+    fn every_file_choice_is_resolved_as_the_import_decides_it() {
+        let entry = "local skin = { type = 0, name = \"t\", w = 1920, h = 1080,\n\
+               filepath = {\n\
+                 { name = \"by default\", path = \"*.png\", def = \"b\" },\n\
+                 { name = \"first\", path = \"*.png\" },\n\
+                 { name = \"named\", path = \"*.png\" },\n\
+                 { name = \"nothing\", path = \"none/*.png\" },\n\
+                 { path = \"*.png\" },\n\
+               } }\n\
+             if not skin_config then return skin end\n\
+             skin.destination = { { id = -110, dst = { { w = 64, h = 64 } } } }\n\
+             return skin\n";
+        let d = crate::lua::callback_tests::folder(entry);
+        std::fs::copy(d.path().join("a.png"), d.path().join("b.png")).unwrap();
+        let choice = Choice {
+            options: Vec::new(),
+            files: vec![("named".to_owned(), "b.png".to_owned())],
+        };
+        let s = ledger_survey(&d, true, &choice);
+        assert_eq!(s.outcome, "imported");
+        let file = |name: Option<&str>, candidate: Option<&str>| {
+            (name.map(str::to_owned), candidate.map(str::to_owned))
+        };
+        assert_eq!(
+            s.resolved.unwrap().files,
+            [
+                file(Some("by default"), Some("b.png")),
+                file(Some("first"), Some("a.png")),
+                file(Some("named"), Some("b.png")),
+                file(Some("nothing"), None),
+                file(None, Some("a.png")),
             ]
         );
     }

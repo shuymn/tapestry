@@ -461,11 +461,23 @@ impl Span {
 pub(crate) struct Notes {
     pub(crate) list: Vec<(Option<Span>, Severity, NoteKind)>,
     pub(crate) suppressed: u32,
+    /// Every `Dropped` and `Ignored` note pushed, past the cap too, for
+    /// the conversion report's ledger.
+    #[cfg(feature = "dev-tools")]
+    pub(crate) dropped: u32,
+    #[cfg(feature = "dev-tools")]
+    pub(crate) ignored: u32,
 }
 
 impl Notes {
     /// Adds a note, or counts it past [`MAX_NOTES`].
     pub(crate) fn push(&mut self, at: Option<Span>, severity: Severity, kind: NoteKind) {
+        #[cfg(feature = "dev-tools")]
+        match severity {
+            Severity::Dropped => self.dropped = self.dropped.saturating_add(1),
+            Severity::Ignored => self.ignored = self.ignored.saturating_add(1),
+            _ => {}
+        }
         if self.list.len() < MAX_NOTES {
             self.list.push((at, severity, kind));
         } else {

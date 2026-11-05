@@ -73,12 +73,27 @@ pub struct DestinationEntry {
     pub suppressed: u32,
 }
 
+/// The row of a destination the import did not read.
+fn not_reached(index: usize, element: usize) -> DestinationEntry {
+    DestinationEntry {
+        index,
+        id: None,
+        kind: None,
+        became: Became::NotReached,
+        elements: element..element,
+        notes: Vec::new(),
+        suppressed: 0,
+    }
+}
+
 /// One destination read, before its notes are located.
 struct Read {
     id: Option<String>,
     kind: Option<String>,
     refused: bool,
     folded: bool,
+    dropped: bool,
+    ignored: bool,
     elements: Range<usize>,
     notes: Range<usize>,
     suppressed: u32,
@@ -92,17 +107,28 @@ pub(super) struct Recorder {
     elements_at: usize,
     notes_at: usize,
     suppressed_at: u32,
+    dropped_at: u32,
+    ignored_at: u32,
 }
 
 impl Recorder {
+    /// A list of `total` destinations, its tables resolved: from here on the
+    /// ledger has a row for each, however the import ends.
     pub(super) fn new(total: usize) -> Self {
+        let armed = ARMED.with(Cell::get);
+        if armed {
+            let rows = (0..total).map(|index| not_reached(index, 0)).collect();
+            LAST.with(|l| *l.borrow_mut() = rows);
+        }
         Self {
-            armed: ARMED.with(Cell::get),
+            armed,
             total,
             read: Vec::new(),
             elements_at: 0,
             notes_at: 0,
             suppressed_at: 0,
+            dropped_at: 0,
+            ignored_at: 0,
         }
     }
 
@@ -112,13 +138,15 @@ impl Recorder {
             self.elements_at = cx.elements.len();
             self.notes_at = cx.notes.list.len();
             self.suppressed_at = cx.notes.suppressed;
+            self.dropped_at = cx.notes.dropped;
+            self.ignored_at = cx.notes.ignored;
             cx.folded = false;
         }
     }
 
     /// After `cx` read destination `index`, `refused` if it refused it:
     /// then this is the import's end, as the destinations' end is.
-    pub(super) fn end(&mut self, cx: &Cx<'_>, index: usize, refused: bool) {
+    pub(super) fn end(&mut self, cx: &mut Cx<'_>, index: usize, refused: bool) {
         if !self.armed {
             return;
         }
@@ -129,6 +157,8 @@ impl Recorder {
             kind: e.and_then(|e| e.kind.clone()),
             refused,
             folded: cx.folded,
+            dropped: cx.notes.dropped > self.dropped_at,
+            ignored: cx.notes.ignored > self.ignored_at,
             elements: self.elements_at..cx.elements.len(),
             notes: self.notes_at..cx.notes.list.len(),
             suppressed: cx.notes.suppressed.saturating_sub(self.suppressed_at),
@@ -139,7 +169,7 @@ impl Recorder {
     }
 
     /// Locates the notes, once, and leaves the ledger for [`recording`].
-    pub(super) fn publish(&mut self, cx: &Cx<'_>) {
+    pub(super) fn publish(&mut self, cx: &mut Cx<'_>) {
         if !self.armed {
             return;
         }
@@ -166,16 +196,15 @@ impl Recorder {
                         kind: n.kind,
                     })
                     .collect();
-                let has = |s| notes.iter().any(|n| n.severity == s);
                 let became = if r.refused {
                     Became::Refused
                 } else if !r.elements.is_empty() {
                     Became::Retained
                 } else if r.folded {
                     Became::Folded
-                } else if has(Severity::Dropped) {
+                } else if r.dropped {
                     Became::Dropped
-                } else if has(Severity::Ignored) {
+                } else if r.ignored {
                     Became::Ignored
                 } else {
                     Became::NoElement
@@ -193,17 +222,10 @@ impl Recorder {
             .collect();
         let end = cx.elements.len();
         for index in entries.len()..self.total {
-            entries.push(DestinationEntry {
-                index,
-                id: None,
-                kind: None,
-                became: Became::NotReached,
-                elements: end..end,
-                notes: Vec::new(),
-                suppressed: 0,
-            });
+            entries.push(not_reached(index, end));
         }
         LAST.with(|l| *l.borrow_mut() = entries);
+        cx.located = Some(located);
         self.armed = false;
     }
 }
