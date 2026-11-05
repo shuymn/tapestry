@@ -1502,7 +1502,7 @@ fn a_pending_skin_is_reused_while_its_class_holds() {
     let frames_arg = frames.display().to_string();
     let (_, stdout) = run(
         &fx,
-        "sleep=1500,pick=a.bms,enter,retry,back,wait=b.bms,pick=b.bms,enter,back,\
+        "pick=a.bms,enter,retry,back,wait=b.bms,pick=b.bms,enter,back,\
          wait=c.bms,pick=c.bms,enter,back,close",
         &["--dev-frames", &frames_arg],
     );
@@ -1565,7 +1565,7 @@ fn a_retry_after_a_preset_edit_builds_the_skin_again() {
     let frames_arg = frames.display().to_string();
     let mut child = select(
         &fx,
-        "sleep=1500,pick=a.bms,enter,drawn,slow-specializing=1500,retry,back,close",
+        "pick=a.bms,enter,drawn,slow-specializing=1500,retry,back,close",
         &["--dev-frames", &frames_arg],
     )
     .stdout(Stdio::piped())
@@ -1650,7 +1650,7 @@ fn the_quit_key_during_a_specialization_returns_after_the_job() {
     write_class_skin(&fx, "if ms.option(183) == false then while true do end end");
     let (_, stdout) = run(
         &fx,
-        "sleep=1500,quit-specializing,pick=a.bms,enter,wait=a.bms,close",
+        "quit-specializing,pick=a.bms,enter,wait=a.bms,close",
         &[],
     );
     let at = |from: usize, line: &str| {
@@ -1665,52 +1665,69 @@ fn the_quit_key_during_a_specialization_returns_after_the_job() {
     assert!(lines(&stdout, "dev: lua at open").is_empty(), "{stdout}");
 }
 
+/// The select harness with `steps`, its stdout read line by line as it
+/// comes, each line with when it came, and its stderr whole: the run's
+/// status, its lines and its stderr. A run not ended within 600 s is
+/// killed, and the test fails naming `what` with the lines so far.
+fn timed_run(
+    fx: &Fixture,
+    steps: &str,
+    what: &str,
+) -> (
+    std::process::ExitStatus,
+    Vec<(std::time::Instant, String)>,
+    String,
+) {
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+    let mut child = select(fx, steps, &[])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let out = child.stdout.take().unwrap();
+    let err = child.stderr.take().unwrap();
+    let errors = std::thread::spawn(move || std::io::read_to_string(err).unwrap());
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(out).lines() {
+            let Ok(line) = line else { break };
+            if tx.send((Instant::now(), line)).is_err() {
+                break;
+            }
+        }
+    });
+    let deadline = Instant::now() + Duration::from_secs(600);
+    let mut seen: Vec<(Instant, String)> = Vec::new();
+    loop {
+        match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(l) => seen.push(l),
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let _ = child.kill();
+                panic!("{what}: the run did not end in time: {seen:?}");
+            }
+        }
+    }
+    let status = child.wait().unwrap();
+    (status, seen, errors.join().unwrap())
+}
+
 /// The window's close while a pending skin's specialization loops, and
 /// while a quit waits for a job whose VM is held past the stop bound,
 /// leaves the job's wait within the stop bound and ends the run: no
 /// selection is entered again and no play opens.
 #[test]
 fn a_close_during_a_specialization_ends_the_run() {
-    use std::sync::mpsc;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
     for step in ["close-specializing", "escalate-specializing"] {
         let fx = fixture();
         write_ranked(&fx, "a", "a.bms", Some(2));
         write_class_skin(&fx, "while true do end");
-        let mut child = select(
-            &fx,
-            &format!("sleep=1500,{step},pick=a.bms,enter,close"),
-            &[],
-        )
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-        let out = child.stdout.take().unwrap();
-        let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            for line in BufReader::new(out).lines() {
-                let Ok(line) = line else { break };
-                if tx.send((Instant::now(), line)).is_err() {
-                    break;
-                }
-            }
-        });
-        let deadline = Instant::now() + Duration::from_secs(600);
-        let mut seen: Vec<(Instant, String)> = Vec::new();
-        loop {
-            match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-                Ok(l) => seen.push(l),
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    let _ = child.kill();
-                    panic!("{step}: the run did not end in time: {seen:?}");
-                }
-            }
-        }
-        let status = child.wait().unwrap();
+        let (status, seen, stderr) =
+            timed_run(&fx, &format!("{step},pick=a.bms,enter,close"), step);
         let stdout: String = seen.iter().map(|(_, l)| format!("{l}\n")).collect();
-        assert_eq!(status.code(), Some(0), "{step}: {stdout}");
+        assert_eq!(status.code(), Some(0), "{step}: {stdout}\n{stderr}");
         let when = |line: &str| {
             seen.iter()
                 .find(|(_, l)| l == line)
@@ -1753,8 +1770,7 @@ fn a_close_during_a_specialization_ends_the_run() {
 /// opens.
 #[test]
 fn an_input_failure_during_a_specialization_ends_the_run() {
-    use std::sync::mpsc;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
     for step in [
         "input-failure-specializing",
         "escalate-input-failure-specializing",
@@ -1762,45 +1778,12 @@ fn an_input_failure_during_a_specialization_ends_the_run() {
         let fx = fixture();
         write_ranked(&fx, "a", "a.bms", Some(2));
         write_class_skin(&fx, "while true do end");
-        let mut child = select(
-            &fx,
-            &format!("sleep=1500,{step},pick=a.bms,enter,close"),
-            &[],
-        )
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-        let out = child.stdout.take().unwrap();
-        let err = child.stderr.take().unwrap();
-        let errors = std::thread::spawn(move || std::io::read_to_string(err).unwrap());
-        let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            for line in BufReader::new(out).lines() {
-                let Ok(line) = line else { break };
-                if tx.send((Instant::now(), line)).is_err() {
-                    break;
-                }
-            }
-        });
-        let deadline = Instant::now() + Duration::from_secs(600);
-        let mut seen: Vec<(Instant, String)> = Vec::new();
-        loop {
-            match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-                Ok(l) => seen.push(l),
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    let _ = child.kill();
-                    panic!("{step}: the run did not end in time: {seen:?}");
-                }
-            }
-        }
-        let status = child.wait().unwrap();
-        let stderr = errors.join().unwrap();
+        let (status, seen, stderr) =
+            timed_run(&fx, &format!("{step},pick=a.bms,enter,close"), step);
         let stdout: String = seen.iter().map(|(_, l)| format!("{l}\n")).collect();
         assert_eq!(status.code(), Some(1), "{step}: {stdout}\n{stderr}");
         assert!(
-            stderr.contains("the input thread"),
+            stderr.contains("the input thread is gone"),
             "{step}: {stdout}\n{stderr}"
         );
         let when = |line: &str| {
@@ -1848,7 +1831,7 @@ fn a_refused_specialization_shows_its_reason_on_the_select_screen() {
     write_class_skin(&fx, "local m = require(\"missing\")");
     let (_, stdout) = run(
         &fx,
-        "sleep=1500,pick=a.bms,enter,wait=a.bms,pick=a.bms,enter,wait=a.bms,close",
+        "pick=a.bms,enter,wait=a.bms,pick=a.bms,enter,wait=a.bms,close",
         &[],
     );
     let refused = lines(&stdout, "skin: play: refused for the chart: ");
