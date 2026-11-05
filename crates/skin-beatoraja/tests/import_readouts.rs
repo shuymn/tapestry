@@ -391,6 +391,42 @@ fn the_play_level_shows_under_its_availability() {
     assert!(by_name.report().notes.is_empty());
 }
 
+/// On a 24-glyph strip a negative play level takes the second half's digits
+/// and sign, and a positive one the first half's: the sign is kept, not only
+/// the magnitude.
+#[test]
+fn a_negative_play_level_shows_its_sign_and_digits() {
+    let loaded = import_body(
+        r#""value": [{"id": "v", "src": "n", "w": 120, "h": 20, "divx": 24, "digit": 4,
+                      "ref": 96}],
+           "destination": [{"id": "v", "dst": [{"w": 12, "h": 20}]}]"#,
+    );
+    let skin = loaded.ok().skin.clone();
+    // Each drawn cell's index in the uv table, left to right.
+    let cells = |level| {
+        let mut d = Drawn::over_level(skin.clone(), &chart(), Some(level));
+        let mut quads = d.frame(0, &[]);
+        quads.sort_by(|a, b| a.rect[0].total_cmp(&b.rect[0]));
+        quads
+            .iter()
+            .map(|q| {
+                d.uvs
+                    .frames()
+                    .iter()
+                    .position(|f| f.uv == q.uv && f.layer == q.layer)
+                    .expect("a frame of the sheet")
+            })
+            .collect::<Vec<_>>()
+    };
+    // The first half: digits from 0, the sign at 11.
+    let zero = cells(0)[1];
+    assert_eq!(cells(3), [zero + 11, zero + 3]);
+    assert_eq!(cells(12), [zero + 11, zero + 1, zero + 2]);
+    // The second half: digits from 12, the sign at 23.
+    assert_eq!(cells(-3), [zero + 23, zero + 15]);
+    assert_eq!(cells(-12), [zero + 23, zero + 13, zero + 14]);
+}
+
 #[test]
 fn ids_without_these_contracts_stay_unsupported() {
     for id in [92, 1_163, 1_164, 372, 373] {

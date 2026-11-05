@@ -115,7 +115,8 @@ pub struct Look {
     /// With `loading`, two progress marks: over [`PERCENT_MARK`] while
     /// `load.percent` reads 40, and over [`PROGRESS_MARK`] on `when`
     /// timer 1 ([`PROGRESS_SLOT`]), whose condition is
-    /// `load.percent >= 40`.
+    /// `load.percent >= 40`; and a mark over [`LEVEL_MARK`] while the
+    /// chosen chart's `chart.level` reads 12.
     pub progress: bool,
     /// With `structure`, the full lane fixture: the lanes placed as an
     /// imported skin's (`LaneStyle::Source`, the region 800 high from 80
@@ -257,6 +258,8 @@ pub const FULL_TITLE: [i32; 4] = [700, 600, 100, 100];
 pub const PERCENT_MARK: [i32; 4] = [1_000, 600, 100, 100];
 /// Where the mark on the progress `when` timer draws.
 pub const PROGRESS_MARK: [i32; 4] = [1_200, 600, 100, 100];
+/// Where the mark shown while `chart.level` reads 12 draws.
+pub const LEVEL_MARK: [i32; 4] = [1_400, 600, 100, 100];
 /// The progress `when` timer's slot.
 pub const PROGRESS_SLOT: u16 = skin_model::timer::BUILTIN + 1;
 
@@ -576,6 +579,11 @@ fn skin_of(sheet: Sheet, look: &Look) -> Skin {
                 timer: TimerRef::Builtin(skin_model::timer::SCREEN),
                 visible: Some(compile("load.percent == 40", &scope, Ty::Bool).unwrap()),
                 ..image(PERCENT_MARK, false)
+            });
+            elements.push(ElementDef {
+                timer: TimerRef::Builtin(skin_model::timer::SCREEN),
+                visible: Some(compile("chart.level == 12", &scope, Ty::Bool).unwrap()),
+                ..image(LEVEL_MARK, false)
             });
             elements.push(ElementDef {
                 timer: TimerRef::When(1),
