@@ -413,6 +413,13 @@ fn write_overlay(fig: &Figures, load: Option<(bool, i64)>, lines: &mut [Line; LI
 pub struct Drawn<'a> {
     /// The chart time of a play frame, `None` for a text or menu screen.
     pub play: Option<TimeUs>,
+    /// What the view a play frame acquired had reached (dev-tools: a
+    /// scenario's captures).
+    #[cfg(feature = "dev-tools")]
+    pub view: Option<ViewStamp>,
+    /// When a loading frame was sampled (dev-tools: a scenario's captures).
+    #[cfg(feature = "dev-tools")]
+    pub loading_stamp: Option<LoadingStamp>,
     /// Whether it was a menu screen (song selection), for the frame dump
     /// (dev-tools).
     #[cfg(feature = "dev-tools")]
@@ -438,6 +445,41 @@ pub struct Drawn<'a> {
     pub effects: &'a [JudgeEvent],
     /// When the frame was done, on the clock.
     pub at: TimeUs,
+}
+
+/// How far the view a play frame acquired had come: its state may lag the
+/// frame's time (dev-tools).
+#[cfg(feature = "dev-tools")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ViewStamp {
+    /// The READY candidate it is of.
+    pub generation: u64,
+    /// The chart time its evaluation had finalized.
+    pub finalized: Option<TimeUs>,
+    /// The judgment events it had published.
+    pub events: u64,
+    /// Whether it published the playing phase.
+    pub playing: bool,
+    /// Whether evaluation was complete.
+    pub complete: bool,
+    /// Where it entered Closing, once it has.
+    pub closing: Option<TimeUs>,
+    /// Its attempt's READY on the chart's axis, its opening and its end;
+    /// `None` before an attempt is committed.
+    pub ready: Option<(TimeUs, TimeUs)>,
+}
+
+/// What a loading frame sampled (dev-tools).
+#[cfg(feature = "dev-tools")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LoadingStamp {
+    /// The clock when it was sampled.
+    pub sampled: TimeUs,
+    /// The load's origin on the clock.
+    pub origin: TimeUs,
+    /// Whether it drew its skin's loading presentation rather than the
+    /// cleared placeholder of a pending specialization.
+    pub settled: bool,
 }
 
 /// The render thread's measurement of the current play.
@@ -1257,6 +1299,10 @@ mod frame_tests {
     ) -> Drawn<'_> {
         Drawn {
             play: Some(TimeUs(0)),
+            #[cfg(feature = "dev-tools")]
+            view: None,
+            #[cfg(feature = "dev-tools")]
+            loading_stamp: None,
             #[cfg(feature = "dev-tools")]
             menu: false,
             #[cfg(feature = "dev-tools")]

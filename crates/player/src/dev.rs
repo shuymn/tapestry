@@ -9,7 +9,8 @@
 //! way. `--dev-frames <dir>` also writes a READY frame, a play frame
 //! and the end screen there as PNG files. `--dev-overlay` shows the
 //! measurement overlay from the start. `--dev-start <ms>` plays a mid-chart
-//! start from that time of the chart to its end.
+//! start from that time of the chart to its end. `--dev-size <W>x<H>` sets
+//! the offscreen target's size.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -501,6 +502,45 @@ pub fn measure_args(p: &mut lexopt::Parser) -> Result<Command, UsageError> {
     Ok(Command::Measure { chart, perfect })
 }
 
+/// The offscreen target's size without `--dev-size` or a scenario's `size`.
+pub const DEFAULT_SIZE: (u32, u32) = (1280, 720);
+
+/// The largest side `--dev-size` and a scenario's `size` take: what the
+/// renderer's offscreen target is sure to hold.
+pub const MAX_SIZE_SIDE: u32 = 8192;
+
+/// `w`×`h` if each side is 1 to [`MAX_SIZE_SIDE`].
+///
+/// # Errors
+///
+/// Why it is not.
+pub fn checked_size(w: i64, h: i64) -> Result<(u32, u32), String> {
+    let side = |v: i64| {
+        u32::try_from(v)
+            .ok()
+            .filter(|s| (1..=MAX_SIZE_SIDE).contains(s))
+    };
+    match (side(w), side(h)) {
+        (Some(w), Some(h)) => Ok((w, h)),
+        _ => Err(format!(
+            "a size of {w}x{h}: each side must be 1 to {MAX_SIZE_SIDE}"
+        )),
+    }
+}
+
+/// The value of `--dev-size`: `<W>x<H>`.
+fn size(p: &mut lexopt::Parser) -> Result<(u32, u32), UsageError> {
+    let value = p.value()?;
+    let value = value.to_string_lossy();
+    let parsed = value
+        .split_once('x')
+        .and_then(|(w, h)| Some((w.parse().ok()?, h.parse().ok()?)));
+    let Some((w, h)) = parsed else {
+        return Err(UsageError::Usage("--dev-size takes <W>x<H>".to_owned()));
+    };
+    checked_size(w, h).map_err(UsageError::Usage)
+}
+
 /// The development options of `play`.
 #[derive(Debug, Default)]
 pub struct Options {
@@ -508,6 +548,8 @@ pub struct Options {
     pub scripted_input: Option<PathBuf>,
     /// Where to write frames.
     pub frames: Option<PathBuf>,
+    /// The offscreen target's size (`--dev-size`), for a headless run.
+    pub size: Option<(u32, u32)>,
     /// Retry once at the first end screen and quit at the second, to
     /// measure the retry time without a key press.
     pub auto_retry: bool,
@@ -644,6 +686,7 @@ impl Options {
             }
             "dev-scripted-input" => self.scripted_input = Some(PathBuf::from(p.value()?)),
             "dev-frames" => self.frames = Some(PathBuf::from(p.value()?)),
+            "dev-size" => self.size = Some(size(p)?),
             "dev-render-timeout" => self.render_timeout = Some(render_timeout(p)?),
             "dev-start" => self.start = Some(start(p)?),
             "dev-result" => {
@@ -690,6 +733,8 @@ pub struct SelectOptions {
     /// Where to write frames (`--dev-frames`): the select screen's first
     /// frame, and the first play's READY state, play and end frames.
     pub frames: Option<PathBuf>,
+    /// The offscreen target's size (`--dev-size`), for a headless run.
+    pub size: Option<(u32, u32)>,
     /// The render thread's bounds, as [`Options::render_timeout`]
     /// (`--dev-render-timeout`).
     pub render_timeout: Option<std::time::Duration>,
@@ -723,6 +768,7 @@ impl SelectOptions {
                 })?);
             }
             "dev-frames" => self.frames = Some(PathBuf::from(p.value()?)),
+            "dev-size" => self.size = Some(size(p)?),
             "dev-render-timeout" => self.render_timeout = Some(render_timeout(p)?),
             "dev-stop-timeout" => {
                 let secs = p.value()?.to_string_lossy().parse().map_err(|_| {

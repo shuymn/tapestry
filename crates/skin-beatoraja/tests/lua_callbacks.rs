@@ -162,11 +162,11 @@ fn shape_c_shows_the_pulse_at_the_ex_hard_and_hazard_gauges() {
 fn shape_d_s_unmapped_read_is_a_reported_false() {
     let d = folder(&skin(&image_at(
         0,
-        "draw = function()\n local broken = ms.number(425)\n return broken > 0\n end,",
+        "draw = function()\n local broken = ms.number(426)\n return broken > 0\n end,",
     )));
     let i = import(&d, 905).unwrap();
     assert_eq!(counts(&i), [0, 1, 0, 0]);
-    let why = Unsupported::Unmapped { api: 1, id: 425 };
+    let why = Unsupported::Unmapped { api: 1, id: 426 };
     assert_eq!(i.callbacks, [Disposition::Replaced(why)]);
     assert!(common::has(
         &i.imported.report,
@@ -181,7 +181,7 @@ fn a_critical_callback_that_does_not_convert_refuses() {
     // The gauge's condition reads an unmapped id.
     let d = folder(&skin(
         "skin.gauge = { id = \"g\", nodes = { \"n0\", \"n1\", \"n2\", \"n3\" }, parts = 10 }\n\
-         table.insert(skin.destination, { id = \"g\",\n draw = function() return ms.number(425) > 0 end,\n\
+         table.insert(skin.destination, { id = \"g\",\n draw = function() return ms.number(426) > 0 end,\n\
            dst = { { x = 100, y = 500, w = 100, h = 10 } } })",
     ));
     match import(&d, 905) {
@@ -189,7 +189,7 @@ fn a_critical_callback_that_does_not_convert_refuses() {
             why:
                 LuaWhy::Critical {
                     field: "draw",
-                    why: Unsupported::Unmapped { id: 425, .. },
+                    why: Unsupported::Unmapped { id: 426, .. },
                 },
             at: Some(at),
         }) => assert_eq!(at.line, 13),
@@ -199,7 +199,7 @@ fn a_critical_callback_that_does_not_convert_refuses() {
     // refuses, though the rest of it reads decorative counts.
     let d = folder(&skin(
         "skin.value = { { id = \"v\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, digit = 8,\n\
-           value = function() return ms.number(101) + ms.number(425) end } }\n\
+           value = function() return ms.number(101) + ms.number(426) end } }\n\
          table.insert(skin.destination, { id = \"v\", dst = { { x = 0, y = 100, w = 6, h = 6 } } })",
     ));
     assert!(matches!(
@@ -212,7 +212,7 @@ fn a_critical_callback_that_does_not_convert_refuses() {
     // The same unsupported read in a decorative number is replaced.
     let d = folder(&skin(
         "skin.value = { { id = \"v\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, digit = 8,\n\
-           value = function() return ms.number(110) + ms.number(425) end } }\n\
+           value = function() return ms.number(110) + ms.number(426) end } }\n\
          table.insert(skin.destination, { id = \"v\", dst = { { x = 0, y = 100, w = 6, h = 6 } } })",
     ));
     let i = import(&d, 905).unwrap();

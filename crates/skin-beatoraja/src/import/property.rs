@@ -261,6 +261,17 @@ pub(crate) enum Value {
     /// A judgment count: `count.perfect`..`count.poor`, then
     /// `count.empty_poor`.
     Count(u8),
+    /// The scored POORs, early and late: empty POORs never among them,
+    /// whatever the preset's `empty_poor.counted`, as the source keeps its
+    /// judge index 4 apart from 5 (`ScoreData.java:277-278`). `Count(4)`
+    /// includes them under such a preset.
+    ScoredPoor,
+    /// `combobreak` (425, `IntegerPropertyFactory.java:461-462`): BAD and
+    /// the scored POORs.
+    ComboBreak,
+    /// `bad_plus_poor_plus_miss` (427, `:465-467`): those and the empty
+    /// POORs.
+    BadPoorMiss,
     /// `totalearly` and `totallate` (423, 424): `count.fast` and
     /// `count.slow`, the early and the late judgments GREAT to POOR and
     /// empty POORs, as the source sums judges 1 to 5
@@ -379,6 +390,11 @@ impl Value {
             Self::Count(3) => "count.bad",
             Self::Count(4) => "count.poor",
             Self::Count(_) => "count.empty_poor",
+            Self::ScoredPoor => "count.early.poor + count.late.poor",
+            Self::ComboBreak => "count.bad + count.early.poor + count.late.poor",
+            Self::BadPoorMiss => {
+                "count.bad + count.early.poor + count.late.poor + count.empty_poor"
+            }
             Self::Fast => "count.fast",
             Self::Slow => "count.slow",
             Self::Early(0) => "count.early.perfect",
@@ -443,6 +459,9 @@ impl Value {
                 | Self::MaxCombo
                 | Self::GaugePercent
                 | Self::Count(_)
+                | Self::ScoredPoor
+                | Self::ComboBreak
+                | Self::BadPoorMiss
                 | Self::Fast
                 | Self::Slow
                 | Self::Early(_)
@@ -463,6 +482,13 @@ impl Value {
     /// The least and greatest value [`Self::expr`] gives: its field's
     /// declared range, divided or reduced as the expression is.
     pub(crate) fn range(self) -> (i64, i64) {
+        let sum = |terms: i64| (0, terms * i64::from(skin_model::MAX_COUNT));
+        match self {
+            Self::ScoredPoor => return sum(2),
+            Self::ComboBreak => return sum(3),
+            Self::BadPoorMiss => return sum(4),
+            _ => {}
+        }
         let e = self.expr();
         let (name, op) = e.split_once(' ').map_or((e, None), |(n, r)| (n, Some(r)));
         let (lo, hi) = match skin_model::PLAY.field(name).map(|(_, f)| f.ty) {
@@ -520,6 +546,8 @@ fn shown(id: i32) -> Option<Value> {
         116 | 156 => Value::WholeRateFraction,
         110..=114 => Value::Count(u8::try_from(id - 110).ok()?),
         420 => Value::Count(5),
+        425 => Value::ComboBreak,
+        427 => Value::BadPoorMiss,
         423 => Value::Fast,
         424 => Value::Slow,
         410..=419 => {
@@ -550,6 +578,19 @@ fn shown(id: i32) -> Option<Value> {
         312 => Value::Duration,
         313 => Value::DurationGreen,
         1_312..=1_327 => Value::DurationVariant(u8::try_from(id - 1_312).ok()?),
+        _ => return None,
+    })
+}
+
+/// What `main_state.judge(n)` reads (`MainStatePropertyLuaApiExporter.java:
+/// 87-93`): the count of judge index `n`, 0 PERFECT to 5 the empty POOR
+/// (`ScoreData.java:266`), `None` for any other index, which the source
+/// reads as 0 (`:279`).
+pub(crate) fn judge_count(n: i64) -> Option<Value> {
+    Some(match n {
+        0..=3 => Value::Count(u8::try_from(n).ok()?),
+        4 => Value::ScoredPoor,
+        5 => Value::Count(5),
         _ => return None,
     })
 }
