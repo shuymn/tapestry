@@ -72,6 +72,21 @@ impl Cx<'_> {
         Some(cleaned)
     }
 
+    /// What `fold` shows, for a text at `at`; `None` for nothing.
+    fn folded_text(&mut self, at: Span, fold: TextFold) -> Option<TextValue> {
+        match fold {
+            TextFold::Literal(s) => self.cleaned(at, &s).map(TextValue::Literal),
+            TextFold::Field(id) => field(id).map(TextValue::Field),
+            TextFold::FieldOr(id, s) => {
+                let field = field(id)?;
+                Some(match self.cleaned(at, &s) {
+                    Some(empty) => TextValue::FieldOr { field, empty },
+                    None => TextValue::Field(field),
+                })
+            }
+        }
+    }
+
     /// A text object.
     pub(in super::super) fn text(&mut self, dst: Dst, rec: u32) -> Result<(), ImportError> {
         let at = dst.span;
@@ -114,7 +129,6 @@ impl Cx<'_> {
             Prop::Id(n) => property::str_by_id(n),
             Prop::Name(s) => property::str_by_name(&s).unwrap_or(StrProp::Unsupported(None)),
             Prop::Callable(id) => match self.text_callback(role, id)? {
-                Ok(TextFold::Field(n)) => StrProp::Field(n),
                 Ok(fold) => {
                     folded = Some(fold);
                     StrProp::Null
@@ -130,32 +144,23 @@ impl Cx<'_> {
             (StrProp::Null, None) => property::str_by_id(self.int_or(r, "ref", 0)?),
             (p, _) => p,
         };
-        let text = match resolved {
-            StrProp::Null if folded.is_some() => {
+        let text = match (folded, resolved) {
+            (Some(fold), _) => {
                 // An empty result draws nothing (`SkinText.java:106-107`).
-                let value = match folded {
-                    Some(TextFold::FieldOr(id, s)) => match (field(id), self.cleaned(at, &s)) {
-                        (Some(f), Some(empty)) => Some(TextValue::FieldOr { field: f, empty }),
-                        (Some(f), None) => Some(TextValue::Field(f)),
-                        (None, _) => None,
-                    },
-                    Some(TextFold::Literal(s)) => self.cleaned(at, &s).map(TextValue::Literal),
-                    _ => None,
-                };
-                let Some(value) = value else {
+                let Some(value) = self.folded_text(at, fold) else {
                     self.ignored(at, NoteKind::Ignored { field: "value" });
                     return Ok(());
                 };
                 value
             }
-            StrProp::Field(id) => match field(id) {
+            (None, StrProp::Field(id)) => match field(id) {
                 Some(f) => TextValue::Field(f),
                 None => {
                     self.ignored(at, NoteKind::Ignored { field: "value" });
                     return Ok(());
                 }
             },
-            StrProp::Unsupported(id) => {
+            (None, StrProp::Unsupported(id)) => {
                 let why = NoteKind::UnsupportedProperty {
                     kind: PropertyKind::String,
                     id,
@@ -163,7 +168,7 @@ impl Cx<'_> {
                 self.drop_el(role, at, why)?;
                 return Ok(());
             }
-            StrProp::Null => {
+            (None, StrProp::Null) => {
                 let literal = self
                     .opt_string(constant, "constantText")?
                     .unwrap_or_default();

@@ -5,6 +5,7 @@
 
 mod common;
 
+use bms_model::TimeUs;
 use common::import_body;
 use common::play::{Loader, round};
 use skin_beatoraja::{DeviationId, NoteKind};
@@ -136,6 +137,14 @@ fn now_loading_and_loaded_follow_the_loading_state() {
     let ready = d.play.timer(timer::READY).expect("ready has started").0 / 1_000;
     assert_eq!(widths(&d.rects(ready)), [11, 12], "READY at elapsed zero");
     assert_eq!(widths(&d.rects(ready + 3_000)), [11, 12], "in the play");
+    d.playing = false;
+    assert_eq!(
+        widths(&d.rects(ready + 4_000)),
+        [11, 12],
+        "in the audio tail"
+    );
+    d.closing = Some(TimeUs((ready + 4_500) * 1_000));
+    assert_eq!(widths(&d.rects(ready + 5_000)), [11, 12], "in Closing");
 }
 
 /// The descriptor of a preset's gauge 0 with `look`, its border at 80 %.
