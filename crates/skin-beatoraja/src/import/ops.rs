@@ -256,6 +256,13 @@ const GAUGE_EX: i32 = 1_046;
 /// as the adjustments' snapshot reads them; `lanecover1_on`, `lift1_on`
 /// and `hidden1_on`, the stored switches.
 const COVER_CHANGING: i32 = 270;
+/// `autoplay_off` and `autoplay_on` (`BooleanPropertyFactory.java:413-416`):
+/// whether the play mode is autoplay, the attempt's.
+const AUTOPLAY_OFF: i32 = 32;
+const AUTOPLAY_ON: i32 = 33;
+/// `mode_course` (`BooleanPropertyFactory.java:523-524`): a scene
+/// constant, false, as there are no courses.
+const COURSE_MODE: i32 = 290;
 /// `judge_great_exist` to `judge_poor_exist`
 /// (`BooleanPropertyFactory.java:554-561`): whether the count is above 0,
 /// the POOR's the scored POORs', without empty POORs.
@@ -349,6 +356,8 @@ fn builtin(id: i32) -> Option<(Body, bool)> {
         GOOD_EXIST => (Body::Text("count.good > 0"), false),
         BAD_EXIST => (Body::Text("count.bad > 0"), false),
         POOR_EXIST => (Body::Text("count.early.poor + count.late.poor > 0"), false),
+        AUTOPLAY_OFF => (Body::Text("!autoplay"), false),
+        AUTOPLAY_ON => (Body::Text("autoplay"), false),
         COVER_CHANGING => (Body::Text("cover.adjusting"), false),
         COVER_ON => (Body::Text("cover.enabled"), false),
         LIFT_ON => (Body::Text("lift.enabled"), false),
@@ -373,7 +382,7 @@ pub(crate) fn is_builtin(id: i32) -> bool {
 /// state whichever widget draws it, where the source reads it from a
 /// judge region its judge widget makes (`JudgeManager.java:129, 686`).
 fn built_in_cond(id: i32, negative: bool) -> Cond {
-    if id == TABLE_SONG {
+    if id == TABLE_SONG || id == COURSE_MODE {
         return Cond::Fold(negative);
     }
     match builtin(id) {
@@ -506,38 +515,45 @@ mod tests {
         assert!(!is_builtin(3_016) && !is_builtin(3_036));
     }
 
+    /// The largest condition lists the surveyed skins write fit one source:
+    /// six built-in ops and a `draw` of its own, each the longest signed
+    /// built-in, joined with a number's longest availability guard. A
+    /// mapping long enough to break that fails here; every supported
+    /// condition together need not fit, and refuses at its destination
+    /// (`tests/import_ops.rs`, `every_condition_together_passes_the_source_limit`).
     #[test]
-    fn every_supported_condition_fits_one_source() {
-        // One sign of every built-in with an expression, the longer,
-        // negated one: a destination that does not list both signs of an
-        // id joins at most these.
-        let mut exprs = Vec::new();
+    fn the_largest_surveyed_condition_lists_fit_one_source() {
+        let mut longest = 0;
+        let mut supported = 0;
         for &(id, _) in KNOWN_BOOLEAN_IDS {
-            let positive = numeric(id, &BTreeMap::new());
-            if let Cond::Expr { src, .. } = numeric(-id, &BTreeMap::new()) {
-                if let Cond::Expr { src: p, .. } = positive {
-                    assert!(src.len() > p.len(), "{id}");
+            for op in [id, -id] {
+                if let Cond::Expr { src, .. } = numeric(op, &BTreeMap::new()) {
+                    longest = longest.max(src.len());
+                    supported += 1;
                 }
-                exprs.push(src);
+            }
+            if let (Cond::Expr { src: n, .. }, Cond::Expr { src: p, .. }) = (
+                numeric(-id, &BTreeMap::new()),
+                numeric(id, &BTreeMap::new()),
+            ) {
+                assert!(n.len() > p.len(), "{id}");
             }
         }
-        assert_eq!(exprs.len(), 25);
-        let joined: usize =
-            exprs.iter().map(|e| e.len() + 2).sum::<usize>() + 4 * (exprs.len() - 1);
-        assert_eq!(joined, 996);
-        // A number's availability joins them: the longest still fits.
-        let guard = [
-            "bpm.range_valid",
-            "bpm.current_valid",
-            "hispeed.valid",
-            "duration.valid",
-        ]
-        .iter()
-        .map(|g| g.len() + 2 + 4)
-        .max()
-        .unwrap_or(0);
-        assert_eq!(guard, 23);
-        assert!(joined + guard <= skin_model::MAX_SOURCE_BYTES);
+        assert!(supported > 0);
+        // The importer's own guards, over every integer property id.
+        let guard = (0..=2_000)
+            .filter_map(|id| match super::super::property::int_by_id(id) {
+                super::super::property::IntProp::Shown(v) => v.availability(),
+                _ => None,
+            })
+            .map(|g| g.len() + 2 + 4)
+            .max()
+            .unwrap_or(0);
+        assert_eq!(guard, 38);
+        // Each condition parenthesized and joined by ` && `.
+        let terms = 6 + 1;
+        let joined = terms * (longest + 2) + (terms - 1) * 4 + guard;
+        assert!(joined <= skin_model::MAX_SOURCE_BYTES, "{joined}");
     }
 
     fn expr(src: &str, display_deviation: bool) -> Cond {
@@ -595,7 +611,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(exprs.len(), 50);
+        assert_eq!(exprs.len(), 54);
         let joined: usize =
             exprs.iter().map(|e| e.len() + 2).sum::<usize>() + 4 * (exprs.len() - 1);
         assert!(joined > skin_model::MAX_SOURCE_BYTES, "{joined}");

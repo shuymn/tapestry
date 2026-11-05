@@ -114,6 +114,8 @@ pub struct LoadingText {
     pub preset: String,
     /// Whether it is a practice's Start.
     pub practice: bool,
+    /// Whether the play loaded is autoplay.
+    pub autoplay: bool,
     /// The chart's own fields, which a loading lifetime's state starts
     /// from ([`crate::loading_state`]).
     pub chart: ChosenChart,
@@ -155,6 +157,7 @@ mod tests {
             artist: "テスト".to_owned(),
             preset: "lr2-style".to_owned(),
             practice: false,
+            autoplay: false,
             chart: super::ChosenChart::default(),
         };
         let strings = |stage| {
