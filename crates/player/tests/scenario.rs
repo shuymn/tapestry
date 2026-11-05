@@ -1706,9 +1706,11 @@ fn pixel(path: &Path, x: usize, y: usize) -> [u8; 3] {
 /// the combo break its condition, opaque from 750 to 1250 ms on that timer:
 /// the shape of a skin's end-of-play image, in blue, and an untimed red
 /// corner on the same read. A play ends with its audio, so the chart's BGM lasts through
-/// the capture: a miss has the image inside its window, a perfect play has
-/// none. A retry of the miss starts from a clean snapshot: its first READY
-/// frame has no corner, with no tally set by hand.
+/// the capture: after a miss the corner shows, after a perfect play it does
+/// not. A retry of the miss starts from a clean snapshot: its first READY
+/// frame has no corner, with no tally set by hand. The blue window runs on
+/// the last-note timer, which only a frame at an exact time shows for
+/// certain: `lua_bridges` tests it at those times.
 #[test]
 fn a_missed_note_draws_the_finish_window() {
     let fx = Fixture::new();
@@ -1788,14 +1790,12 @@ fn a_missed_note_draws_the_finish_window() {
         assert!(play.contains(score), "{stdout}");
     }
     let out = fx.base.join("out");
-    let (centre, corner) = (|p: &Path| pixel(p, 640, 360), |p: &Path| pixel(p, 20, 700));
-    assert_eq!(centre(&out.join("miss.png")), [0, 0, 255]);
+    let corner = |p: &Path| pixel(p, 20, 700);
     assert_eq!(corner(&out.join("miss.png")), [255, 0, 0]);
     assert_eq!(
         corner(&out.join("retry.png")),
         [0, 0, 0],
         "the retry's first frame"
     );
-    assert_eq!(centre(&out.join("hit.png")), [0, 0, 0]);
     assert_eq!(corner(&out.join("hit.png")), [0, 0, 0]);
 }
