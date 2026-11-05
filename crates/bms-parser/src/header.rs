@@ -107,9 +107,10 @@ pub(crate) fn listing(text: &str) -> Listing {
             continue;
         };
         if let Some((_, channel, data)) = split_channel(body) {
-            // A two-player object settles the mode.
+            // Only what could still change the mode is decoded: a two-player
+            // object settles it, and a key 6 or 7 object leaves only those.
             if !two
-                && (two_player(channel) || key_6_or_7(channel))
+                && (two_player(channel) || (!seven && key_6_or_7(channel)))
                 && objects(channel, data.trim()).any(|(_, id)| id.is_some())
             {
                 two |= two_player(channel);
