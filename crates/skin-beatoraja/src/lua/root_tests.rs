@@ -10,7 +10,8 @@ use crate::error::ImportError;
 use crate::import::NoteKind;
 use crate::tree::Kind;
 
-/// A frame-time writer: classified, it refuses at its assignment.
+/// A frame-time writer: walked as a root, it opens the analysis at its
+/// assignment.
 const WRITER: &str = "function() n = n + 1 return true end";
 
 /// A critical gauge `draw` reading option `x`, which the body sets to 1.
@@ -55,7 +56,13 @@ pub(super) fn analysis(def: &crate::resolve::Definition) -> &super::callback::An
 #[track_caller]
 pub(super) fn interferes(entry: &str, (kind, key): (Kind, Option<&str>)) {
     let def = configured(entry);
-    let open = analysis(&def).open.expect("an open site");
+    let Some(super::callback::Open {
+        site: super::callback::Site::Node(open),
+        ..
+    }) = analysis(&def).open.get()
+    else {
+        panic!("no open node")
+    };
     assert_eq!(def.arena.node(open).kind, kind);
     let got: Option<String> = def.arena.key(open).map(Iterator::collect);
     assert_eq!(got.as_deref(), key);
@@ -113,7 +120,7 @@ fn a_function_the_source_never_reads_is_inert() {
     let i = lowers(import(&entry));
     assert_eq!(i.callbacks, [Disposition::Lowered, Disposition::Inert]);
     // Met at an ignored key and at a `draw`, in either order, it is a
-    // root: classified, and refused at its assignment.
+    // root: walked, and the critical reader refuses at its assignment.
     for key in ["aaa", "zzz"] {
         let entry = beside(
             &format!("local w = {WRITER}\nskin.{key} = {{ w }}"),
@@ -121,7 +128,10 @@ fn a_function_the_source_never_reads_is_inert() {
         );
         assert_eq!(
             super::tests::why(import(&entry)),
-            LuaWhy::Effect(Unsupported::Construct("assignment")),
+            LuaWhy::Critical {
+                field: "draw",
+                why: Unsupported::Interference
+            },
             "{key}"
         );
     }
@@ -138,18 +148,31 @@ fn a_function_the_source_never_reads_is_inert() {
 #[test]
 fn every_op_entry_and_every_array_entry_is_read() {
     // An `op` entry under a string key is a root, as is a `draw` in a
-    // destination under one.
+    // destination under one: each writer is walked, a writer root.
     for dst in [
         format!("{{ id = \"i\", op = {{ hidden = {WRITER} }}, dst = {{ {{ w = 6, h = 6 }} }} }},"),
         format!("extra = {{ id = \"i\", draw = {WRITER}, dst = {{ {{ w = 6, h = 6 }} }} }},"),
     ] {
         let entry = beside("", &dst);
-        assert_eq!(
-            super::tests::why(import(&entry)),
-            LuaWhy::Effect(Unsupported::Construct("assignment")),
-            "{dst}"
-        );
+        let def = configured(&entry);
+        super::callback::admit(&def.arena).unwrap();
+        let an = analysis(&def);
+        assert!(an.open.get().is_some(), "{dst}");
+        assert_eq!(an.writers.borrow().len(), 1, "{dst}");
     }
+    // The mixed `op` table's entry, consumed: the critical reader beside
+    // it refuses at the write.
+    let entry = beside(
+        "",
+        &format!("{{ id = \"i\", op = {{ hidden = {WRITER} }}, dst = {{ {{ w = 6, h = 6 }} }} }},"),
+    );
+    assert_eq!(
+        super::tests::why(import(&entry)),
+        LuaWhy::Critical {
+            field: "draw",
+            why: Unsupported::Interference
+        }
+    );
 }
 
 #[test]
@@ -424,7 +447,7 @@ fn the_open_site_is_counted_where_the_conversion_meets_it() {
     let def = configured(&entry);
     let an = analysis(&def);
     assert_eq!((an.scripts, an.unread), (1, 1));
-    assert!(an.open.is_some());
+    assert!(an.open.get().is_some());
 }
 
 /// `critical`, a critical gauge `draw`, beside a decorative `draw` script

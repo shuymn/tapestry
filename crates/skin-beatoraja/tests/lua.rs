@@ -1618,24 +1618,14 @@ fn host_modules_hold_the_pinned_names_and_refuse_calls() {
 
 #[test]
 fn every_function_in_the_definition_is_classified_and_consumed_where_read() {
-    // A write-free condition converts; one with no result refuses the
-    // candidate, wherever it is, at its construct.
+    // A write-free condition converts; a decorative one with no result is
+    // replaced, wherever it is.
     let d = folder(&[("s.luaskin", &drawn("draw = function() return true end,"))]);
     import(&d).unwrap();
-    for (fields, line) in [
-        ("draw = function() end,", 5),
-        ("op = { function() end },", 5),
-    ] {
+    let no_return = Disposition::Replaced(Unsupported::Construct("no return"));
+    for fields in ["draw = function() end,", "op = { function() end },"] {
         let d = folder(&[("s.luaskin", &drawn(fields))]);
-        assert_eq!(
-            located(import(&d)),
-            (
-                LuaWhy::Effect(Unsupported::Construct("no return")),
-                "s.luaskin".into(),
-                line
-            ),
-            "{fields}"
-        );
+        assert_eq!(import(&d).unwrap().callbacks, [no_return], "{fields}");
     }
     // A function in a field that takes none, which the source never
     // reads, is inert, and refused where the import reads it, at its
@@ -1681,57 +1671,37 @@ fn every_function_in_the_definition_is_classified_and_consumed_where_read() {
     // A root nothing consumes is classified too; a function the source
     // never reads is inert.
     let d = configured("skin.customEvents = { { id = 1000, action = function() end } }");
-    assert_eq!(
-        why(import(&d)),
-        LuaWhy::Effect(Unsupported::Construct("no return"))
-    );
+    assert_eq!(import(&d).unwrap().callbacks, [Disposition::ClassifiedOnly]);
     let d = configured("skin.unread = { function() end }");
     assert_eq!(import(&d).unwrap().callbacks, [Disposition::Inert]);
-    // A module's function is located in that module.
+    // A module's function is consumed like the entry's.
     let d = folder(&[
         ("s.luaskin", &drawn("draw = require(\"f\"),")),
         ("f.lua", "local x = 1\nreturn function() end"),
     ]);
-    assert_eq!(
-        located(import(&d)),
-        (
-            LuaWhy::Effect(Unsupported::Construct("no return")),
-            "f.lua".into(),
-            2
-        )
-    );
-    // A host function has no tree: it is refused at its value, line 0
-    // and its ordinal in the table.
+    assert_eq!(import(&d).unwrap().callbacks, [no_return]);
+    // A host function has no tree: it opens the analysis, and nothing
+    // consumes it.
     let d = configured(
         "skin.customEvents = { { id = 1000, action = require(\"timer_util\").now_timer } }",
     );
-    match import(&d) {
-        Err(ImportError::Lua {
-            why: LuaWhy::Effect(Unsupported::Capture("not a skin closure")),
-            at: Some(at),
-        }) => assert_eq!((at.file.as_str(), at.line), ("s.luaskin", 0)),
-        other => panic!("{other:?}"),
-    }
+    assert_eq!(import(&d).unwrap().callbacks, [Disposition::ClassifiedOnly]);
 }
 
 #[test]
 fn the_header_pass_refuses_a_function_only_where_it_reads() {
     // Where it does not: a field outside the header. The header pass
-    // reads past it; the configured pass refuses a root there at its
-    // construct (it returns nothing).
+    // reads past it; the configured pass classifies a root there, which
+    // nothing consumes.
     for fields in [
         "customEvents = { { id = 1000,\n action = function() end } }",
         "w = 1920, h = 1080, destination = { { id = \"i\",\n draw = function() end } }",
     ] {
         let d = folder(&[("s.luaskin", &format!("return {{ type = 0, {fields} }}"))]);
         let h = header(&d).unwrap_or_else(|e| panic!("{fields}: {e:?}"));
-        let (w, file, line) = located(common::lua_play(
-            &h,
-            &Config::defaults(h.header()),
-            &Cancel::new(),
-        ));
-        assert!(matches!(w, LuaWhy::Effect(_)), "{fields}: {w:?}");
-        assert_eq!((file.as_str(), line), ("s.luaskin", 2), "{fields}");
+        let i = common::lua_play(&h, &Config::defaults(h.header()), &Cancel::new())
+            .unwrap_or_else(|e| panic!("{fields}: {e:?}"));
+        assert_eq!(i.callbacks, [Disposition::ClassifiedOnly], "{fields}");
     }
     // A key of an option item that neither the header nor the source
     // reads, or a field outside the source's skin: the header pass reads
@@ -2105,8 +2075,12 @@ fn retyped(ty: i32, body: &str) -> TempDir {
     configured(&format!("skin.type = {ty}\n{body}"))
 }
 
-/// A function the callback admission refuses.
-const UNSUPPORTED: &str = "skin.customEvents = { { action = function() end } }";
+/// A function the callback admission refuses: its walk passes the depth
+/// cap.
+fn unsupported() -> String {
+    let chain = vec!["1"; 300].join("+");
+    format!("skin.customEvents = {{ {{ action = function() return {chain} end }} }}")
+}
 
 /// Checks `run`, an import into the play slot, on a play skin whose
 /// configured pass returns type 7, also with a callback the admission
@@ -2115,10 +2089,11 @@ const UNSUPPORTED: &str = "skin.customEvents = { { action = function() end } }";
 fn refuses_a_retype(run: impl Fn(&TempDir) -> Result<(), ImportError>) {
     // The callback alone refuses the skin.
     assert!(matches!(
-        run(&retyped(0, UNSUPPORTED)),
+        run(&retyped(0, &unsupported())),
         Err(ImportError::Lua { .. })
     ));
-    for body in ["", UNSUPPORTED] {
+    for body in [String::new(), unsupported()] {
+        let body = body.as_str();
         let at = match run(&retyped(3, body)) {
             Err(ImportError::UnsupportedKind {
                 at: Some(at),

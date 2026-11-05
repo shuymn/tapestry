@@ -216,7 +216,17 @@ pub(super) fn convert(
         retained: 0,
     };
     let top = c.table(&t, None, 1, Pos::Class(&ROOT_SCHEMA))?;
-    c.capture()?;
+    // Closing the captured object graph is a phase of the analysis's
+    // time budget.
+    let clock = super::clock::Phase::Graph;
+    c.analysis
+        .clock
+        .enter(clock, None)
+        .map_err(|w| c.fatal(w))?;
+    let r = c.capture();
+    let left = c.analysis.clock.leave();
+    r?;
+    left.map_err(|w| c.fatal(w))?;
     #[cfg(test)]
     super::tests::converted_witness();
     let configured = c.tags.is_some();
@@ -487,14 +497,20 @@ impl Conv<'_> {
             {
                 self.analysis.scripts = self.analysis.scripts.saturating_add(1);
             }
-            self.open(id);
+            self.open(id, super::Unsupported::Construct("a script"));
         }
         Ok(())
     }
 
-    /// Records node `id` as the open site unless one came before it.
-    fn open(&mut self, id: u32) {
-        self.analysis.open.get_or_insert(id);
+    /// Records node `id` as the open site, for `why`, unless one came
+    /// before it.
+    fn open(&mut self, id: u32, why: super::Unsupported) {
+        if self.analysis.open.get().is_none() {
+            self.analysis.open.set(Some(callback::Open {
+                site: callback::Site::Node(id),
+                why,
+            }));
+        }
     }
 
     /// What function `f`, at `addr`, is and where it was defined.
@@ -858,9 +874,14 @@ impl Conv<'_> {
         Ok(())
     }
 
-    /// The refusal a walk's sentinel stands for.
+    /// The refusal a walk's sentinel stands for: the time budget's
+    /// unlocated, since no phase of the conversion is at a callable.
     fn fatal(&self, why: super::Unsupported) -> ImportError {
-        self.lua(callback::fatal(why).unwrap_or(LuaWhy::Limit(LuaLimit::AnalysisWork)))
+        let lua = callback::fatal(why).unwrap_or(LuaWhy::Limit(LuaLimit::AnalysisWork));
+        if why == callback::TOO_LONG {
+            return ImportError::Lua { at: None, why: lua };
+        }
+        self.lua(lua)
     }
 
     /// Table `t`'s keys, read once by `next`: their kind and count, an
@@ -1008,10 +1029,13 @@ impl Conv<'_> {
                 {
                     self.analysis.unread = self.analysis.unread.saturating_add(1);
                 }
-                self.open(id);
+                self.open(id, super::Unsupported::Construct("an unread entry"));
             }
             if matches!(pos, Pos::FontFallback) && summary.meta {
-                self.open(id);
+                self.open(
+                    id,
+                    super::Unsupported::Capture("a font fallback's metatable"),
+                );
             }
         }
         self.path.push(addr);

@@ -35,24 +35,28 @@
 //!   metatable on the way and its entry a Lua integer; `and`, `or` and
 //!   `not` of booleans.
 //!
-//! A callback of this form is write-free: it reads, and whether each read
-//! has a mapping is decided where it is consumed (`import::callback`).
-//! Anything else has an effect the analysis does not rule out, and
-//! refuses the candidate ([`admit`]).
+//! A callback of this form reads, and whether each read has a mapping is
+//! decided where it is consumed (`import::callback`); anything else does
+//! not lower, and follows its role there.
 //!
-//! So once [`admit`] accepts every root, no callback the import can
-//! reach writes anything at frame time, through any helper: not the
-//! `_ENV` binding a configuration read resolves through, not
-//! `skin_config` or its `option` table, not a binding of the host module
-//! or a helper, and no metatable. With [`Analysis::open`] unset (no
-//! script, unread listed entry or font fallback metatable, which run code
-//! the analysis never sees), that is the noninterference half of the
-//! capture proof that lets a configuration read fold and a host module or
-//! helper binding hold in any callback, a play-critical one included; the
-//! other halves (the raw path, the final binding) are checked at the
-//! read. [`admit`] records its acceptance on the [`Analysis`], and
-//! lowering takes the analysis only through the [`Admitted`] witness it
-//! gives.
+//! What a fold or a binding rests on is decided apart, for every root at
+//! once, by [`admit`]: the effect walk ([`super::effects`]) checks every
+//! root's reach against the modeled subset, which writes no table,
+//! upvalue, global or module member, calls only host readers, pure
+//! library functions and closures of the same subset, and reaches no
+//! metamethod. With [`Analysis::open`] unset after it (no construct
+//! outside the subset, and no script, unread listed entry or font
+//! fallback metatable, which run code the analysis never sees), the
+//! candidate is closed: no code the source runs at frame time changes the
+//! `_ENV` binding a configuration read resolves through, `skin_config` or
+//! its `option` table, a binding of the host module or a helper, or a
+//! metatable. That is the noninterference half of the capture proof that
+//! lets a configuration read fold and a host module or helper binding
+//! hold in any callback, a play-critical one included; the other halves
+//! (the raw path, the final binding) are checked at the read. A root
+//! whose reach writes never lowers. [`admit`] records that the walk ran
+//! on the [`Analysis`], and lowering takes the analysis only through the
+//! [`Admitted`] witness it gives.
 
 use std::cell::{Cell, RefCell};
 
@@ -62,7 +66,7 @@ use super::limits::{MAX_ANALYSIS_WORK, MAX_AST_DEPTH};
 use super::syntax::{Ast, Bin, CHUNK_ENV, Expr, NONE, Stmt, Un};
 use super::{HOST_APIS, Unsupported};
 use crate::error::{ImportError, Loc};
-use crate::tree::{Arena, CallableKind, Kind, LuaScalar};
+use crate::tree::{Arena, Kind, LuaScalar};
 
 /// The host modules, in [`super::host`]'s order.
 pub(crate) const MAIN_STATE: u8 = 0;
@@ -164,6 +168,8 @@ pub(crate) const TOO_MUCH: Unsupported = Unsupported::Construct("analysis work p
 /// What a walk that saw the cancellation request gives: fatal.
 pub(crate) const CANCELLED: Unsupported = Unsupported::Construct("cancelled");
 
+pub(crate) use super::clock::{Phase, TOO_LONG};
+
 /// How many units of analysis work run between two looks at the
 /// cancellation request.
 const CHECK_EVERY: u64 = 4_096;
@@ -173,15 +179,10 @@ pub(crate) fn fatal(why: Unsupported) -> Option<super::LuaWhy> {
     match why {
         TOO_DEEP => Some(super::LuaWhy::Limit(super::LuaLimit::AstDepth)),
         TOO_MUCH => Some(super::LuaWhy::Limit(super::LuaLimit::AnalysisWork)),
+        TOO_LONG => Some(super::LuaWhy::Limit(super::LuaLimit::AnalysisTime)),
         CANCELLED => Some(super::LuaWhy::Cancelled),
         _ => None,
     }
-}
-
-/// The refusal of `why`: a cap or the cancellation request is fatal, any
-/// other reason an unknown effect.
-pub(crate) fn effect(why: Unsupported) -> super::LuaWhy {
-    fatal(why).unwrap_or(super::LuaWhy::Effect(why))
 }
 
 /// A located unsupported construct: the file and line of its tree.
@@ -190,6 +191,24 @@ pub(crate) struct Found {
     pub(crate) why: Unsupported,
     pub(crate) file: u16,
     pub(crate) line: u32,
+}
+
+/// Where the analysis was opened: a converted node (a script root, an
+/// unread entry, a font fallback with a metatable, a root that is no
+/// skin closure), or a line of a file's tree the effect walk met outside
+/// the subset.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Site {
+    Node(u32),
+    Code { file: u16, line: u32 },
+}
+
+/// The first place the source may run code the analysis does not model,
+/// and why ([`Analysis::open`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Open {
+    pub(crate) site: Site,
+    pub(crate) why: Unsupported,
 }
 
 /// A classification in progress or done, by instance.
@@ -202,7 +221,7 @@ enum State {
 
 /// A function prototype with its captured values: its file, its function
 /// and the values, in its upvalues' order.
-type ProtoKey = (u16, u32, Vec<Captured>);
+pub(crate) type ProtoKey = (u16, u32, Vec<Captured>);
 
 /// The owned analysis data of a configured pass.
 #[derive(Debug, Default)]
@@ -221,12 +240,20 @@ pub(crate) struct Analysis {
     pub(crate) tables: Vec<HashMap<u32, Captured>>,
     /// The captured table that is the pass's own `skin_config`, if one is.
     pub(crate) config: Option<u32>,
-    /// The first place, in conversion order, where the source runs code
-    /// the analysis does not see: a script root, an unread entry of a
-    /// table it lists, or a font fallback with a metatable; by the
-    /// converted node. While it is set, no proof that rests on captured
-    /// state holds ([`Unsupported::Interference`]).
-    pub(crate) open: Option<u32>,
+    /// The first place where the source may run code the analysis does
+    /// not model: in conversion order, a script root, an unread entry of
+    /// a table it lists, or a font fallback with a metatable; then, in the
+    /// effect walk's order ([`super::effects`]), a root that is no skin
+    /// closure or a construct outside the subset. While it is set, the
+    /// candidate is open, and no proof that rests on captured state holds
+    /// ([`Unsupported::Interference`]); unset after the walk, it is
+    /// closed.
+    pub(crate) open: Cell<Option<Open>>,
+    /// The root instances whose reach writes ([`super::effects`]): they
+    /// never lower ([`Unsupported::Writes`]).
+    pub(crate) writers: RefCell<std::collections::HashSet<u32>>,
+    /// The time the analysis spent in its phases ([`super::clock`]).
+    pub(crate) clock: super::clock::AnalysisClock,
     /// How many script roots and unread-entry roots the conversion met,
     /// for the report.
     #[cfg(any(test, feature = "dev-tools"))]
@@ -248,7 +275,8 @@ pub(crate) struct Analysis {
     pub(crate) work: Cell<u64>,
     /// The candidate's cancellation request.
     pub(crate) cancel: Option<super::Cancel>,
-    /// Whether [`admit`] accepted every callable of this analysis.
+    /// Whether [`admit`] ran the effect walk over every root of this
+    /// analysis.
     admitted: Cell<bool>,
     /// The callbacks consumed, in order, for the report.
     #[cfg(feature = "dev-tools")]
@@ -259,10 +287,10 @@ pub(crate) struct Analysis {
     pub(crate) unused: RefCell<HashMap<u32, Unused>>,
 }
 
-/// The witness that [`admit`] accepted every callable of an [`Analysis`]:
+/// The witness that [`admit`] walked every root of an [`Analysis`]:
 /// lowering, configuration folds included, takes its analysis only
 /// through it. It borrows that analysis, so a fold is tied to the
-/// analysis admission proved write-free.
+/// analysis whose closedness and writers admission decided.
 #[derive(Clone, Copy)]
 pub(crate) struct Admitted<'a>(&'a Analysis);
 
@@ -299,7 +327,7 @@ pub(crate) struct Consumed {
 }
 
 impl Analysis {
-    /// The witness that [`admit`] accepted this analysis, if it did.
+    /// The witness that [`admit`] walked this analysis, if it did.
     pub(crate) fn admitted(&self) -> Option<Admitted<'_>> {
         self.admitted.get().then_some(Admitted(self))
     }
@@ -321,8 +349,9 @@ impl Analysis {
     }
 
     /// `n` units of work charged before they are done, the cancellation
-    /// request seen every [`CHECK_EVERY`]: [`TOO_MUCH`] past the cap,
-    /// [`CANCELLED`] once it is requested.
+    /// request and the time budget seen every [`CHECK_EVERY`]:
+    /// [`TOO_MUCH`] past the cap, [`CANCELLED`] once it is requested,
+    /// [`TOO_LONG`] past the time budget.
     pub(crate) fn charge(&self, n: u64) -> Result<(), Unsupported> {
         let before = self.work.get();
         let after = before.saturating_add(n);
@@ -330,15 +359,22 @@ impl Analysis {
             return Err(TOO_MUCH);
         }
         self.work.set(after);
-        if before / CHECK_EVERY != after / CHECK_EVERY
-            && self
+        if before / CHECK_EVERY != after / CHECK_EVERY {
+            if self
                 .cancel
                 .as_ref()
                 .is_some_and(super::Cancel::is_cancelled)
-        {
-            return Err(CANCELLED);
+            {
+                return Err(CANCELLED);
+            }
+            self.clock.check()?;
         }
         Ok(())
+    }
+
+    /// Whether root instance `i` reaches a write.
+    pub(crate) fn writes(&self, i: u32) -> bool {
+        self.writers.borrow().contains(&i)
     }
 
     /// The copied entry `k` of captured table `table`: one hash of `k`,
@@ -527,11 +563,9 @@ impl Analysis {
         r
     }
 
-    /// The prototype key of instance `i`, its captured values charged as
-    /// they are copied.
-    /// [`Self::classify_at`]'s key for instance `i`, its values charged
-    /// before they are copied; `Ok(None)` without one.
-    fn proto_key(&self, i: u32) -> Result<Option<ProtoKey>, Unsupported> {
+    /// The prototype key of instance `i`, its values charged before they
+    /// are copied; `Ok(None)` without one.
+    pub(super) fn proto_key(&self, i: u32) -> Result<Option<ProtoKey>, Unsupported> {
         let Some(inst) = self.instance(i) else {
             return Ok(None);
         };
@@ -814,9 +848,10 @@ impl Classify<'_> {
 /// captured graph: `H.f` with `H`'s final binding ([`Analysis::binding`])
 /// the host module, its proxy unchanged, `f` one of its APIs; or an
 /// upvalue whose final binding is a closure instance, a helper. That
-/// holds at frame time only while the candidate is closed: no root writes
-/// (admission) and no code the analysis does not see runs
-/// ([`Analysis::open`]), which lowering checks before it resolves a call.
+/// holds at frame time only while the candidate is closed: the effect
+/// walk found every root inside the modeled subset, which writes nothing,
+/// and no code the analysis does not see runs ([`Analysis::open`] unset),
+/// which lowering checks before it resolves a call.
 /// `H.f` with `f` a `main_state` API and `H` bound to anything else is
 /// [`Unsupported::Binding`].
 pub(crate) fn resolve_callee(
@@ -867,12 +902,13 @@ pub(crate) fn resolve_callee(
     }
 }
 
-/// Classifies every root a converted table holds, recording each as
-/// classified or refused, and every other callable as inert: the first
-/// root with an unknown effect refuses the candidate at its construct
-/// (design.md "beatoraja Lua Skins", what cannot be converted). A host or
-/// library function at a root, which has no tree, is refused at its
-/// value.
+/// Admits the callables a converted table holds (design.md "beatoraja
+/// Lua Skins", effects by role): the effect walk over every root decides
+/// whether the candidate is closed and which roots write
+/// ([`super::effects`]), then each root is recorded as classified and
+/// every other callable as inert or captured. Only a cap, cancellation
+/// or the time budget refuses the candidate here, fatal; what a root does
+/// is decided by role where it is consumed.
 pub(crate) fn admit(arena: &Arena) -> Result<(), ImportError> {
     let Some(lua) = arena.lua.as_deref() else {
         return Ok(());
@@ -880,60 +916,56 @@ pub(crate) fn admit(arena: &Arena) -> Result<(), ImportError> {
     let Some(an) = lua.analysis.as_deref() else {
         return Ok(());
     };
-    an.outcomes
-        .borrow_mut()
-        .resize(lua.callables.len(), Disposition::NeverAnalysed);
-    let mut first: Option<ImportError> = None;
-    for (id, c) in callable_nodes(arena) {
-        // Each callable visited is a unit of work, cancellation seen.
-        if let Err(why) = an.charge(1) {
-            return Err(ImportError::Lua {
-                at: Some(arena.loc(id)),
-                why: effect(why),
-            });
-        }
-        let Some(callable) = lua.callables.get(c as usize) else {
-            continue;
-        };
-        if an.outcomes.borrow().get(c as usize) != Some(&Disposition::NeverAnalysed) {
-            continue;
-        }
-        if !callable.root {
-            let d = if callable.instance == NONE {
-                Disposition::Inert
-            } else {
-                Disposition::Captured
-            };
-            an.set_outcome(c, d);
-            continue;
-        }
-        let r = if callable.kind == CallableKind::Lua && callable.instance != NONE {
-            an.classify(callable.instance)
-                .map(|_| ())
-                .map_err(|f| (Some(an.loc(&f)), f.why))
+    // A fatal stop located at the construct it met, or, for the time
+    // budget, at the callable its phase retained.
+    let stop = |node: Option<u32>, f: Found| {
+        let at = if f.why == TOO_LONG {
+            node.map(|n| arena.loc(n))
+        } else if f.line > 0 {
+            Some(an.loc(&f))
         } else {
-            Err((None, Unsupported::Capture("not a skin closure")))
+            node.map(|n| arena.loc(n))
         };
-        match r {
-            Ok(()) => an.set_outcome(c, Disposition::ClassifiedOnly),
-            Err((at, why)) => {
-                an.set_outcome(c, Disposition::Refused);
-                if first.is_none() {
-                    first = Some(ImportError::Lua {
-                        at: at.or_else(|| Some(arena.loc(id))),
-                        why: effect(why),
-                    });
+        ImportError::Lua {
+            at,
+            why: fatal(f.why).unwrap_or(super::LuaWhy::Limit(super::LuaLimit::AnalysisWork)),
+        }
+    };
+    super::effects::walk(an, arena).map_err(|(node, f)| stop(node, f))?;
+    let unit = |why| Found {
+        why,
+        file: 0,
+        line: 0,
+    };
+    an.clock
+        .phase(super::clock::Phase::Admit, None, || {
+            an.outcomes
+                .borrow_mut()
+                .resize(lua.callables.len(), Disposition::NeverAnalysed);
+            for (_, c) in callable_nodes(arena) {
+                // Each callable visited is a unit of work, cancellation
+                // seen.
+                an.charge(1)?;
+                let Some(callable) = lua.callables.get(c as usize) else {
+                    continue;
+                };
+                if an.outcomes.borrow().get(c as usize) != Some(&Disposition::NeverAnalysed) {
+                    continue;
                 }
+                let d = if callable.root {
+                    Disposition::ClassifiedOnly
+                } else if callable.instance == NONE {
+                    Disposition::Inert
+                } else {
+                    Disposition::Captured
+                };
+                an.set_outcome(c, d);
             }
-        }
-    }
-    match first {
-        Some(e) => Err(e),
-        None => {
-            an.admitted.set(true);
             Ok(())
-        }
-    }
+        })
+        .map_err(|w| stop(None, unit(w)))?;
+    an.admitted.set(true);
+    Ok(())
 }
 
 /// The nodes holding a callable, in conversion order, with the

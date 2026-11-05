@@ -26,15 +26,17 @@
 //!   look), under `gauge.valid`, as JSON's gauge conditions;
 //! - `skin_config.option["name"] == k`, in any callback: its captured
 //!   value, folded under the capture proof (the raw path and the final
-//!   integer entry checked at the read, noninterference by admission,
-//!   [`crate::lua::callback`]), so lowering takes its analysis only
+//!   integer entry checked at the read, noninterference by the effect
+//!   walk, [`crate::lua::callback`]), so lowering takes its analysis only
 //!   through the [`Admitted`] witness.
 //!
-//! While the analysis is open ([`Analysis::open`]), no fold of a captured
-//! value (an upvalue, `skin_config.option`, `timer_off_value`) and no host
-//! module or helper binding is proven: a callback that needs one is
-//! unsupported for [`Unsupported::Interference`], and a critical one
-//! refuses the candidate at the open site.
+//! While the candidate is open ([`Analysis::open`]), no fold of a
+//! captured value (an upvalue, `skin_config.option`, `timer_off_value`)
+//! and no host module or helper binding is proven: a callback that needs
+//! one is unsupported for [`Unsupported::Interference`], and a critical
+//! one refuses the candidate at the open site. A root whose reach writes
+//! never lowers ([`Unsupported::Writes`]). Each lowering is a phase of
+//! the analysis's time budget, located at its callable.
 //!
 //! Helpers are inlined, each call charged its expanded size before it is
 //! expanded ([`MAX_EXPANDED_NODES`]), and locals inlined where they are
@@ -48,11 +50,13 @@
 //! replaced by its typed constant, `false` for a `draw` (the element is
 //! never drawn) and the omitted number for a `value`, reported with the
 //! reason; a critical one refuses the candidate at its definition. A
-//! `value`'s role is its reads': one that reads the EX score or the max
-//! combo is critical, whether or not the rest lowers. A cap or
-//! cancellation refuses the candidate whatever the role.
+//! `value`'s role is its reads' ([`Lower::scan`] over its whole tree and
+//! its helpers): one that reads the EX score or the max combo is
+//! critical, whether or not the rest lowers, and so is one with an id or
+//! callee the scan cannot resolve. A cap, cancellation or the time budget
+//! refuses the candidate whatever the role.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use skin_model::{MAX_SOURCE_BYTES, PLAY};
 
@@ -64,11 +68,11 @@ use super::timer::{Custom, Timer};
 use super::{Cx, Prop};
 use crate::error::ImportError;
 use crate::lua::callback::{
-    Admitted, Analysis, Callee, Captured, Disposition, Ty, fatal as sentinel, numeral,
+    Admitted, Analysis, Callee, Captured, Disposition, Found, Site, Ty, fatal as sentinel, numeral,
     resolve_callee, tree,
 };
 use crate::lua::limits::{MAX_AST_DEPTH, MAX_EXPANDED_NODES};
-use crate::lua::syntax::{Ast, Bin, Expr, Stmt, Un};
+use crate::lua::syntax::{Ast, Bin, DeclKind, Expr, List, Stmt, Un};
 use crate::lua::{HOST_APIS, LuaLimit, LuaWhy, Unsupported};
 use crate::tree::{Kind, LuaScalar, NONE};
 
@@ -111,6 +115,12 @@ thread_local! {
     /// condition (its guards joined first) or a `value`'s expression.
     pub(crate) static LOWERED: std::cell::RefCell<Vec<String>> =
         const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The instances this thread's role scans visited, each visit counted.
+    pub(crate) static SCANNED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// Why lowering stopped.
@@ -397,8 +407,9 @@ impl Lower<'_> {
         self.int(src, n, n)
     }
 
-    /// `skin_config.option["name"]`: its captured value, which admission
-    /// proved no callback writes.
+    /// `skin_config.option["name"]`: its captured value, which no code the
+    /// source runs at frame time writes while the effect walk found the
+    /// candidate closed ([`Self::bound`] checks it before this is read).
     fn config(&mut self, ast: &Ast, inst: u32, obj: u32, key: u32) -> R<V> {
         let (Expr::Index { obj: cfg, .. }, Expr::Str(k)) = (ast.expr(obj), ast.expr(key)) else {
             return Err(Stop::Unsupported(Unsupported::Type));
@@ -555,68 +566,180 @@ impl Lower<'_> {
         }
     }
 
-    /// The critical part a read reachable from instance `i` shows, its
-    /// helpers included: what a callback's role depends on. A worklist,
-    /// each instance visited once, so no nesting deepens it.
-    fn part(&self, i: u32) -> R<Option<CriticalPart>> {
-        // Each instance visited once: one hash a check.
-        let mut seen = std::collections::HashSet::from([i]);
+    /// The role scan of instance `i` (design.md "beatoraja Lua Skins",
+    /// roles): every expression of its whole tree and of the helpers it
+    /// calls, each id a `number` read takes resolved to the critical part
+    /// it shows. An id resolves from a numeral, a local of the same
+    /// function never assigned again and initialized by a numeral, a
+    /// captured integer, or a helper's parameter, the join of the ids its
+    /// call sites pass; a callee, to a host API, a helper or a library
+    /// function by its captured binding. While the candidate is open no
+    /// captured binding or value holds, so none resolves. A worklist: a
+    /// helper is scanned again only when a parameter's join grows, which
+    /// it does at most twice a parameter.
+    fn scan(&self, i: u32) -> R<Scan> {
+        let open = self.an.open.get().is_some();
+        let mut out = Scan::default();
+        // Each scanned instance's parameters' joins: one hash a check.
+        let mut params: HashMap<u32, Vec<Scan>> = HashMap::from([(i, Vec::new())]);
         let mut pending = vec![i];
+        let mut blocks: Vec<List> = Vec::new();
         let mut stack: Vec<u32> = Vec::new();
+        let mut calls: Vec<u32> = Vec::new();
+        let mut reassigned: HashSet<u32> = HashSet::new();
         while let Some(i) = pending.pop() {
             let Some((ast, func)) = tree(self.an, i) else {
+                out.unresolved = out.unresolved.or(Some("callee"));
                 continue;
             };
             let Some(f) = ast.func(func) else {
                 continue;
             };
+            #[cfg(test)]
+            SCANNED.with(|n| n.set(n.get() + 1));
+            // Its parameters' joins copied, one unit each.
+            self.an.charge(u64::from(f.params.1)).map_err(stop)?;
+            let own = params.get(&i).cloned().unwrap_or_default();
+            // The whole tree, function constructors' bodies included: the
+            // locals assigned again and the calls collected first, each
+            // statement and expression one unit.
+            blocks.clear();
             stack.clear();
-            for &s in ast.list(f.body) {
-                self.an.charge(1).map_err(stop)?;
-                match ast.stmt(s) {
-                    Stmt::Local { exprs, .. } | Stmt::Return(exprs) => {
-                        stack.extend_from_slice(ast.list(exprs));
+            calls.clear();
+            reassigned.clear();
+            blocks.push(f.body);
+            loop {
+                if let Some(l) = blocks.pop() {
+                    for &s in ast.list(l) {
+                        // The statement and each item its lists hold.
+                        self.an
+                            .charge(stmt_width(ast, s).saturating_add(1))
+                            .map_err(stop)?;
+                        stmt_parts(ast, s, &mut blocks, &mut stack, &mut reassigned);
                     }
-                    _ => {}
+                    continue;
                 }
-            }
-            while let Some(e) = stack.pop() {
+                let Some(e) = stack.pop() else {
+                    break;
+                };
                 self.an.charge(1).map_err(stop)?;
                 match ast.expr(e) {
                     Expr::Paren(x) | Expr::Unary(_, x) => stack.push(x),
-                    Expr::Binary(_, a, b) => {
+                    Expr::Binary(_, a, b) | Expr::Index { obj: a, key: b } => {
                         stack.push(a);
                         stack.push(b);
                     }
-                    Expr::Call { callee, args } => match resolve_callee(self.an, ast, i, callee) {
-                        Ok(Callee::Helper(j)) => {
-                            if seen.insert(j) {
-                                pending.push(j);
-                            }
+                    Expr::Table(items) => {
+                        self.an.charge(u64::from(items.1)).map_err(stop)?;
+                        stack.extend(ast.list(items).iter().copied().filter(|&x| x != NONE))
+                    }
+                    Expr::Func(g) => {
+                        if let Some(g) = ast.func(g) {
+                            blocks.push(g.body);
                         }
-                        Ok(Callee::Host(api)) => {
-                            let is_number = HOST_APIS
-                                .get(usize::from(api))
-                                .is_some_and(|&(_, n)| n == "number");
-                            let id = ast
-                                .list(args)
-                                .first()
-                                .and_then(|&a| numeral(ast, a))
-                                .and_then(|n| i32::try_from(n).ok());
-                            if is_number
-                                && let Some(IntProp::Shown(v)) = id.map(property::int_by_id)
-                                && let Some(part) = v.part()
-                            {
-                                return Ok(Some(part));
-                            }
-                        }
-                        Err(_) => {}
-                    },
+                    }
+                    Expr::Method { obj, args, .. } => {
+                        out.unresolved = out.unresolved.or(Some("callee"));
+                        stack.push(obj);
+                        self.an.charge(u64::from(args.1)).map_err(stop)?;
+                        stack.extend_from_slice(ast.list(args));
+                    }
+                    Expr::Call { callee, args } => {
+                        stack.push(callee);
+                        self.an.charge(u64::from(args.1)).map_err(stop)?;
+                        stack.extend_from_slice(ast.list(args));
+                        calls.push(e);
+                    }
                     _ => {}
                 }
             }
+            let ids = Ids {
+                an: self.an,
+                ast,
+                inst: i,
+                func,
+                own: &own,
+                reassigned: &reassigned,
+                open,
+            };
+            for &e in &calls {
+                let Expr::Call { callee, args } = ast.expr(e) else {
+                    continue;
+                };
+                let args = ast.list(args);
+                // The call resolved and each argument read as an id, one
+                // unit each.
+                self.an
+                    .charge(
+                        u64::try_from(args.len())
+                            .unwrap_or(u64::MAX)
+                            .saturating_add(1),
+                    )
+                    .map_err(stop)?;
+                let resolved = if open {
+                    None
+                } else {
+                    match resolve_callee(self.an, ast, i, callee) {
+                        Ok(c) => Some(Some(c)),
+                        Err(_) => lib_callee(self.an, ast, i, callee)
+                            .map_err(stop)?
+                            .then_some(None),
+                    }
+                };
+                match resolved {
+                    Some(Some(Callee::Host(api))) => {
+                        let name = HOST_APIS.get(usize::from(api)).map_or("", |&(_, n)| n);
+                        let read = match name {
+                            "number" => args.get(..1).unwrap_or_default(),
+                            "numbers" => args,
+                            _ => &[],
+                        };
+                        if name == "number" && args.is_empty() {
+                            out.unresolved = out.unresolved.or(Some("id"));
+                        }
+                        for &a in read {
+                            out = out.join(ids.id(a)?);
+                        }
+                    }
+                    Some(Some(Callee::Helper(j))) => {
+                        let n = tree(self.an, j)
+                            .and_then(|(t, g)| t.func(g))
+                            .map_or(0, |g| g.params.1 as usize);
+                        // Each parameter's join, one unit.
+                        self.charge_scan(n)?;
+                        let mut joined = Vec::with_capacity(n);
+                        for k in 0..n {
+                            // A missing argument is nil: no id.
+                            joined.push(match args.get(k) {
+                                Some(&a) => ids.id(a)?,
+                                None => Scan::unresolved("id"),
+                            });
+                        }
+                        let grew = match params.get_mut(&j) {
+                            None => {
+                                params.insert(j, joined);
+                                true
+                            }
+                            Some(slots) => {
+                                let mut grew = false;
+                                for (slot, s) in slots.iter_mut().zip(joined) {
+                                    let next = slot.join(s);
+                                    grew |= next != *slot;
+                                    *slot = next;
+                                }
+                                grew
+                            }
+                        };
+                        if grew {
+                            pending.push(j);
+                        }
+                    }
+                    Some(None) => {}
+                    None => out.unresolved = out.unresolved.or(Some("callee")),
+                }
+            }
         }
-        Ok(None)
+        Ok(out)
     }
 
     /// What a proof resting on captured state needs: a fold of a captured
@@ -625,13 +748,14 @@ impl Lower<'_> {
     /// binding. While the analysis is open, code it does not see may
     /// change that state, so none holds.
     fn bound(&self) -> R<()> {
-        if self.an.open.is_some() {
+        if self.an.open.get().is_some() {
             return Err(Stop::Unsupported(Unsupported::Interference));
         }
         Ok(())
     }
 
-    /// A scan of `n` locals (at most Lua's 200) charged before it is made.
+    /// `n` units of work charged before they are done: a scan of `n`
+    /// locals (at most Lua's 200), or `n` parameters' joins.
     fn charge_scan(&self, n: usize) -> R<()> {
         self.an
             .charge(u64::try_from(n).unwrap_or(u64::MAX))
@@ -652,10 +776,218 @@ impl Lower<'_> {
     }
 }
 
+/// What the role scan of a callback found: the critical part a read
+/// shows, and the first thing it could not resolve (an `id` or a
+/// `callee`), which makes the role unknown.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Scan {
+    pub(crate) part: Option<CriticalPart>,
+    pub(crate) unresolved: Option<&'static str>,
+}
+
+impl Scan {
+    fn unresolved(what: &'static str) -> Self {
+        Self {
+            part: None,
+            unresolved: Some(what),
+        }
+    }
+
+    fn join(self, o: Self) -> Self {
+        Self {
+            part: self.part.or(o.part),
+            unresolved: self.unresolved.or(o.unresolved),
+        }
+    }
+}
+
+/// The id resolution of one scanned function.
+struct Ids<'a> {
+    an: &'a Analysis,
+    ast: &'a Ast,
+    inst: u32,
+    func: u32,
+    /// Its parameters' joins over its call sites.
+    own: &'a [Scan],
+    /// Its locals assigned after their declaration.
+    reassigned: &'a HashSet<u32>,
+    open: bool,
+}
+
+impl Ids<'_> {
+    /// What expression `e`, read as a `number` id, shows.
+    fn id(&self, e: u32) -> R<Scan> {
+        if let Some(n) = numeral(self.ast, e) {
+            return Ok(number_part(n));
+        }
+        let mut e = e;
+        // Parentheses, each one unit.
+        while let Expr::Paren(x) = self.ast.expr(e) {
+            self.an.charge(1).map_err(stop)?;
+            e = x;
+        }
+        let Expr::Local(d) = self.ast.expr(e) else {
+            return Ok(Scan::unresolved("id"));
+        };
+        let decl = self.ast.decl(d).filter(|x| x.func == self.func);
+        match decl {
+            // A parameter assigned again holds what the body assigns, not
+            // what its callers pass.
+            Some(x) if x.kind == DeclKind::Param && !self.reassigned.contains(&d) => {
+                let params = self.ast.func(self.func).map_or((0, 0), |f| f.params);
+                // Its position, each parameter one unit.
+                self.an.charge(u64::from(params.1)).map_err(stop)?;
+                let k = self.ast.list(params).iter().position(|&p| p == d);
+                Ok(k.and_then(|k| self.own.get(k))
+                    .copied()
+                    .unwrap_or(Scan::unresolved("id")))
+            }
+            Some(x)
+                if x.kind == DeclKind::Local && x.init != NONE && !self.reassigned.contains(&d) =>
+            {
+                Ok(numeral(self.ast, x.init).map_or(Scan::unresolved("id"), number_part))
+            }
+            Some(_) => Ok(Scan::unresolved("id")),
+            None if self.open => Ok(Scan::unresolved("id")),
+            None => Ok(match self.an.upvalue(self.inst, d) {
+                Some(Captured::Int(n)) => number_part(n),
+                _ => Scan::unresolved("id"),
+            }),
+        }
+    }
+}
+
+/// The critical part `number(n)` shows.
+fn number_part(n: i64) -> Scan {
+    let part = i32::try_from(n)
+        .ok()
+        .and_then(|id| match property::int_by_id(id) {
+            IntProp::Shown(v) => v.part(),
+            _ => None,
+        });
+    Scan {
+        part,
+        unresolved: None,
+    }
+}
+
+/// How many items statement `s`'s lists hold, an upper bound of what
+/// [`stmt_parts`] visits beside the statement.
+fn stmt_width(ast: &Ast, s: u32) -> u64 {
+    let n = |l: List| u64::from(l.1);
+    match ast.stmt(s) {
+        Stmt::Local { names, exprs } | Stmt::GenericFor { names, exprs, .. } => n(names) + n(exprs),
+        Stmt::Assign { targets, exprs } => n(targets) + n(exprs),
+        Stmt::Return(l) | Stmt::If(l) => n(l),
+        _ => 4,
+    }
+}
+
+/// Statement `s`'s blocks, expressions and locals it assigns again.
+fn stmt_parts(
+    ast: &Ast,
+    s: u32,
+    blocks: &mut Vec<List>,
+    exprs: &mut Vec<u32>,
+    reassigned: &mut HashSet<u32>,
+) {
+    let mut expr = |e: u32| {
+        if e != NONE {
+            exprs.push(e);
+        }
+    };
+    match ast.stmt(s) {
+        Stmt::Local { exprs: l, .. } | Stmt::Return(l) => {
+            ast.list(l).iter().for_each(|&e| expr(e));
+        }
+        Stmt::Assign { targets, exprs: l } => {
+            for &t in ast.list(targets) {
+                match ast.expr(t) {
+                    Expr::Local(d) => {
+                        reassigned.insert(d);
+                    }
+                    _ => expr(t),
+                }
+            }
+            ast.list(l).iter().for_each(|&e| expr(e));
+        }
+        Stmt::Call(e) => expr(e),
+        Stmt::If(arms) => {
+            for arm in ast.list(arms).chunks(3) {
+                if let &[c, s, n] = arm {
+                    expr(c);
+                    blocks.push((s, n));
+                }
+            }
+        }
+        Stmt::While { cond, body } | Stmt::Repeat { body, cond } => {
+            expr(cond);
+            blocks.push(body);
+        }
+        Stmt::NumericFor {
+            start,
+            limit,
+            step,
+            body,
+            ..
+        } => {
+            expr(start);
+            expr(limit);
+            expr(step);
+            blocks.push(body);
+        }
+        Stmt::GenericFor { exprs: l, body, .. } => {
+            ast.list(l).iter().for_each(|&e| expr(e));
+            blocks.push(body);
+        }
+        Stmt::Do(body) => blocks.push(body),
+        Stmt::LocalFunction { func, .. } => {
+            if let Some(f) = ast.func(func) {
+                blocks.push(f.body);
+            }
+        }
+        Stmt::Function { target, func } => {
+            match ast.expr(target) {
+                Expr::Local(d) => {
+                    reassigned.insert(d);
+                }
+                _ => expr(target),
+            }
+            if let Some(f) = ast.func(func) {
+                blocks.push(f.body);
+            }
+        }
+        Stmt::Empty | Stmt::Break | Stmt::Goto(_) | Stmt::Label(_) => {}
+    }
+}
+
+/// Whether `callee` in instance `inst`'s body is a library function by
+/// its captured binding: an upvalue, a global, or an entry of one along
+/// its static access path; a protected call is not one.
+fn lib_callee(an: &Analysis, ast: &Ast, inst: u32, callee: u32) -> Result<bool, Unsupported> {
+    let c = match ast.expr(callee) {
+        Expr::Index { obj, key } => match (an.binding(ast, inst, obj)?, ast.expr(key)) {
+            (Some(Captured::Table { id, meta: false }), Expr::Str(k)) => {
+                an.entry(id, ast.str(k))?
+            }
+            _ => None,
+        },
+        _ => an.binding(ast, inst, callee)?,
+    };
+    // A protected call calls its target, which the scan does not follow.
+    Ok(match c {
+        Some(Captured::Lib(l)) => !matches!(
+            crate::lua::LIBS.get(usize::from(l)).copied(),
+            Some("pcall" | "xpcall")
+        ),
+        _ => false,
+    })
+}
+
 /// What lowering a callback gave.
 enum Lowering {
     Lowered(Lowered, Ty),
-    Unsupported(Unsupported, Option<CriticalPart>),
+    Unsupported(Unsupported, Scan),
 }
 
 impl Cx<'_> {
@@ -738,49 +1070,75 @@ impl Cx<'_> {
             .and_then(|l| l.analysis.as_deref())
     }
 
-    /// Lowers the callable at node `id`.
+    /// Lowers the callable at node `id`, a phase of the analysis's time
+    /// budget located at it.
     fn lower(&mut self, id: u32) -> Result<Lowering, ImportError> {
         let at = self.def.loc(id);
         let fatal = |why| ImportError::Lua {
             at: Some(at.clone()),
             why,
         };
+        let Some(an) = self.analysis() else {
+            return self.lower_in(id);
+        };
+        let phase = crate::lua::callback::Phase::Lower;
+        an.clock
+            .enter(phase, Some(id))
+            .map_err(|w| fatal(sentinel(w).unwrap_or(LuaWhy::Limit(LuaLimit::AnalysisTime))))?;
+        let r = self.lower_in(id);
+        let left = self
+            .analysis()
+            .map_or(Ok(()), |an| an.clock.leave())
+            .map_err(|w| fatal(sentinel(w).unwrap_or(LuaWhy::Limit(LuaLimit::AnalysisTime))));
+        let r = r?;
+        left.map(|()| r)
+    }
+
+    /// [`Self::lower`]'s work.
+    fn lower_in(&mut self, id: u32) -> Result<Lowering, ImportError> {
+        let at = self.def.loc(id);
+        let fatal = |why| ImportError::Lua {
+            at: Some(at.clone()),
+            why,
+        };
+        let untagged =
+            Lowering::Unsupported(Unsupported::Capture("an untagged closure"), Scan::default());
         let Some((_, inst)) = self.callable_at(id).filter(|&(_, i)| i != NONE) else {
-            return Ok(Lowering::Unsupported(
-                Unsupported::Capture("an untagged closure"),
-                None,
-            ));
+            return Ok(untagged);
         };
         let def: &crate::resolve::Definition = self.def;
         let Some(an) = def.arena.lua.as_deref().and_then(|l| l.analysis.as_deref()) else {
-            return Ok(Lowering::Unsupported(
-                Unsupported::Capture("an untagged closure"),
-                None,
-            ));
+            return Ok(untagged);
         };
-        // Every import runs after admission, which refuses the candidate
-        // unless it accepts every callable: an analysis it did not accept
-        // lowers nothing.
+        // Every import runs after admission, which runs the effect walk:
+        // an analysis it did not admit lowers nothing.
         let Some(an) = an.admitted().map(Admitted::analysis) else {
             return Ok(Lowering::Unsupported(
                 Unsupported::Capture("an unadmitted callback"),
-                None,
+                Scan::default(),
             ));
         };
         let cancelled = || def.cancelled(|| None).is_err();
         let mut l = Lower::new(an, &self.custom, &cancelled);
-        let part = |l: &Lower<'_>| match l.part(inst) {
-            Ok(p) => Ok(p),
+        let scan = |l: &Lower<'_>| match l.scan(inst) {
+            Ok(s) => Ok(s),
             Err(Stop::Fatal(why)) => Err(fatal(why)),
-            Err(Stop::Unsupported(_)) => Ok(None),
+            Err(Stop::Unsupported(w)) => Ok(Scan::unresolved(match w {
+                Unsupported::Construct(c) => c,
+                _ => "callee",
+            })),
         };
+        // A root whose reach writes never lowers.
+        if an.writes(inst) {
+            return Ok(Lowering::Unsupported(Unsupported::Writes, scan(&l)?));
+        }
         let ty = match an.classify(inst) {
             Ok(ty) => ty,
             Err(f) => {
                 if let Some(why) = sentinel(f.why) {
                     return Err(fatal(why));
                 }
-                return Ok(Lowering::Unsupported(f.why, part(&l)?));
+                return Ok(Lowering::Unsupported(f.why, scan(&l)?));
             }
         };
         let r = l.expand(inst);
@@ -791,13 +1149,11 @@ impl Cx<'_> {
                 l.out.src = src;
                 Ok(Lowering::Lowered(l.out, ty))
             }
-            Ok(_) => Ok(Lowering::Unsupported(Unsupported::Type, part(&l)?)),
+            Ok(_) => Ok(Lowering::Unsupported(Unsupported::Type, scan(&l)?)),
             Err(Stop::Unsupported(why)) => {
-                let found = match l.out.part {
-                    Some(p) => Some(p),
-                    None => part(&l)?,
-                };
-                Ok(Lowering::Unsupported(why, found))
+                let mut s = scan(&l)?;
+                s.part = l.out.part.or(s.part);
+                Ok(Lowering::Unsupported(why, s))
             }
             Err(Stop::Fatal(why)) => Err(fatal(why)),
         }
@@ -807,12 +1163,19 @@ impl Cx<'_> {
     /// definition, or, for [`Unsupported::Interference`], at the open
     /// site that voids its proof.
     fn critical(&self, id: u32, field: &'static str, why: Unsupported) -> ImportError {
-        let site = match why {
-            Unsupported::Interference => self.analysis().and_then(|an| an.open),
+        let open = match why {
+            Unsupported::Interference => self.analysis().and_then(|an| an.open.get()),
             _ => None,
         };
+        let at = match open.map(|o| o.site) {
+            Some(Site::Node(n)) => self.def.loc(n),
+            Some(Site::Code { file, line }) => self
+                .analysis()
+                .map_or_else(|| self.def.loc(id), |an| an.loc(&Found { why, file, line })),
+            None => self.def.loc(id),
+        };
         ImportError::Lua {
-            at: Some(self.def.loc(site.unwrap_or(id))),
+            at: Some(at),
             why: LuaWhy::Critical { field, why },
         }
     }
@@ -828,8 +1191,14 @@ impl Cx<'_> {
         field: &'static str,
         consumer: &'static str,
     ) -> Result<NoteKind, ImportError> {
-        let c = self.callable_at(id).map_or(NONE, |(c, _)| c);
-        let why = Unsupported::Consumer(consumer);
+        let (c, inst) = self.callable_at(id).unwrap_or((NONE, NONE));
+        // A writer's reason is its write, whatever consumes it.
+        let writes = inst != NONE && self.analysis().is_some_and(|an| an.writes(inst));
+        let why = if writes {
+            Unsupported::Writes
+        } else {
+            Unsupported::Consumer(consumer)
+        };
         if role != Role::Decorative {
             self.outcome((c, id), field, role, (Disposition::Refused, Some(why)));
             return Err(self.critical(id, field, why));
@@ -843,25 +1212,50 @@ impl Cx<'_> {
         Ok(NoteKind::Callback { field, why })
     }
 
-    /// The critical part what the callable at node `id` reads shows, its
-    /// helpers included (a cap or cancellation fatal): `None` without
-    /// an analysis.
-    pub(super) fn callback_part(&self, id: u32) -> Result<Option<CriticalPart>, ImportError> {
-        let (Some(an), Some((_, inst))) = (self.analysis(), self.callable_at(id)) else {
-            return Ok(None);
+    /// The role of the callable at node `id`, read as an element's value
+    /// for an element of `role`: critical when the role scan finds a
+    /// critical part (a cap or cancellation fatal); a decorative one whose
+    /// scan resolves not every id or callee refuses the candidate
+    /// ([`Unsupported::Unresolved`]).
+    pub(super) fn callback_role(
+        &self,
+        id: u32,
+        field: &'static str,
+        role: Role,
+    ) -> Result<Role, ImportError> {
+        let (Some(an), Some((c, inst))) = (self.analysis(), self.callable_at(id)) else {
+            return Ok(role);
         };
         if inst == NONE {
-            return Ok(None);
+            return Ok(role);
         }
+        let fatal = |why| ImportError::Lua {
+            at: Some(self.def.loc(id)),
+            why,
+        };
+        let time = |w| fatal(sentinel(w).unwrap_or(LuaWhy::Limit(LuaLimit::AnalysisTime)));
+        // A phase of the analysis's time budget, located at the value.
+        an.clock
+            .enter(crate::lua::callback::Phase::Scan, Some(id))
+            .map_err(time)?;
         let cancelled = || self.def.cancelled(|| None).is_err();
-        match Lower::new(an, &self.custom, &cancelled).part(inst) {
-            Ok(p) => Ok(p),
-            Err(Stop::Fatal(why)) => Err(ImportError::Lua {
-                at: Some(self.def.loc(id)),
-                why,
-            }),
-            Err(Stop::Unsupported(_)) => Ok(None),
+        let r = Lower::new(an, &self.custom, &cancelled).scan(inst);
+        let left = an.clock.leave().map_err(time);
+        let scan = match r {
+            Ok(s) => s,
+            Err(Stop::Fatal(why)) => return Err(fatal(why)),
+            Err(Stop::Unsupported(_)) => Scan::unresolved("callee"),
+        };
+        left?;
+        let role = scan.part.map_or(role, Role::Critical);
+        if role == Role::Decorative
+            && let Some(what) = scan.unresolved
+        {
+            let why = Unsupported::Unresolved(what);
+            self.outcome((c, id), field, role, (Disposition::Refused, Some(why)));
+            return Err(self.critical(id, field, why));
         }
+        Ok(role)
     }
 
     /// An element's `draw` callback, or one of its `op` items, at node
@@ -922,7 +1316,10 @@ impl Cx<'_> {
     /// A number's `value` callback at node `id`, for the number at `at`
     /// in `base` unless what it reads has a part of its own: its value,
     /// or `None` when it is replaced by the omitted number, reported; a
-    /// critical one refuses instead.
+    /// critical one refuses instead. One that does not lower and whose
+    /// role scan resolves not every id or callee is critical
+    /// ([`Unsupported::Unresolved`], unless the candidate is open or the
+    /// callback writes, which give their own reason).
     pub(super) fn value_callback(
         &mut self,
         at: Span,
@@ -930,7 +1327,7 @@ impl Cx<'_> {
         base: Role,
     ) -> Result<Option<NumberValue>, ImportError> {
         let c = self.callable_at(id).map_or(NONE, |(c, _)| c);
-        let (why, part) = match self.lower(id) {
+        let (why, scan) = match self.lower(id) {
             Ok(Lowering::Lowered(l, Ty::Int)) => {
                 self.outcome(
                     (c, id),
@@ -948,20 +1345,30 @@ impl Cx<'_> {
                     deviates: l.deviates,
                 }));
             }
-            Ok(Lowering::Lowered(l, _)) => (Unsupported::Type, l.part),
-            Ok(Lowering::Unsupported(why, part)) => (why, part),
+            Ok(Lowering::Lowered(l, _)) => (
+                Unsupported::Type,
+                Scan {
+                    part: l.part,
+                    unresolved: None,
+                },
+            ),
+            Ok(Lowering::Unsupported(why, scan)) => (why, scan),
             Err(e) => {
                 self.outcome((c, id), "value", base, (Disposition::Refused, None));
                 return Err(e);
             }
         };
-        if part.is_some() || base != Role::Decorative {
-            self.outcome(
-                (c, id),
-                "value",
-                part.map_or(base, Role::Critical),
-                (Disposition::Refused, Some(why)),
-            );
+        let role = scan.part.map_or(base, Role::Critical);
+        if role != Role::Decorative || scan.unresolved.is_some() {
+            let why = match (role, scan.unresolved) {
+                (Role::Decorative, Some(what))
+                    if !matches!(why, Unsupported::Interference | Unsupported::Writes) =>
+                {
+                    Unsupported::Unresolved(what)
+                }
+                _ => why,
+            };
+            self.outcome((c, id), "value", role, (Disposition::Refused, Some(why)));
             return Err(self.critical(id, "value", why));
         }
         self.outcome(

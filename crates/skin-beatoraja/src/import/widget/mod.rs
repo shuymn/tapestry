@@ -550,7 +550,7 @@ impl Cx<'_> {
         // A function's value has no consumer, and it never falls back to
         // `ref`: by its element's role and the part its reads show.
         if let Prop::Callable(id) = value {
-            let role = self.callback_part(id)?.map_or(role, Role::Critical);
+            let role = self.callback_role(id, "value", role)?;
             let why = self.unconsumed(role, id, "value", "image set value")?;
             return self.drop_el(role, at, why);
         }

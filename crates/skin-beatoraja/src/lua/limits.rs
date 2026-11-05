@@ -77,14 +77,23 @@ pub const MAX_AST_DEPTH: u32 = 200;
 /// kept.
 pub const MAX_CAPTURES: u64 = 1 << 16;
 /// The most units of work the callbacks' analysis does across a
-/// candidate: each expression or statement a classification, sizing,
-/// lowering or role scan visits, each local scanned, each captured value
+/// candidate: each expression or statement the effect walk, a
+/// classification, sizing, lowering or role scan visits, each local scanned, each captured value
 /// a prototype's key copies, each static access path step a capture
 /// follows, and each byte of a key or string hashed, charged before the
 /// work. Instances of one function with the
 /// same captured values are classified once, so a function created in a
 /// loop costs its body once.
 pub const MAX_ANALYSIS_WORK: u64 = 1 << 24;
+/// The most monotonic time a candidate's analysis spends in its phases
+/// (closing the captured object graph, the effect walk, admission and
+/// each lowering of a callable or role scan outside one), checked at
+/// each phase's start and end, at each root the walk visits and at the
+/// cancellation cadence of the work charged; the time between phases
+/// does not count. A backstop
+/// beside [`MAX_ANALYSIS_WORK`] for work a unit understates, as generous
+/// as [`MAX_LUA_TIME`].
+pub const MAX_ANALYSIS_TIME: std::time::Duration = std::time::Duration::from_secs(5);
 /// The most bytes of rewritten chunks a configured pass keeps
 /// ([`super::instrument`]): each chunk's source and what the rewrite
 /// adds, checked before it is built. Twice the read allowance
