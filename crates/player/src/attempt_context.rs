@@ -84,6 +84,12 @@ impl AttemptContext {
         }
     }
 
+    /// The attempt's gauges' looks, in the preset's order (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    pub fn gauge_looks(&self) -> Vec<skin_model::GaugeLook> {
+        self.gauges.iter().map(|g| g.look).collect()
+    }
+
     /// The presentation epoch the attempt was attached as.
     pub const fn epoch(&self) -> u64 {
         self.epoch

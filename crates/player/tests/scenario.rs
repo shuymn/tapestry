@@ -963,6 +963,76 @@ fn a_scenario_without_a_size_captures_at_the_default() {
     assert_eq!(u32::from_be_bytes(png[20..24].try_into().unwrap()), 720);
 }
 
+/// A play frame of an imported skin has its display list beside it: the
+/// frame's state, the skin's element with what the draw evaluated, and its
+/// quad on the canvas with the file and rectangle it shows. A
+/// loading frame and a frame of the built-in skin have none.
+#[test]
+fn a_captured_play_frame_of_a_skin_has_its_display_list() {
+    let fx = Fixture::new();
+    write_chart(&fx.library(), "a", "譜面A");
+    let skin = fx.base.join("skin");
+    fs::create_dir_all(&skin).unwrap();
+    let file = fs::File::create(skin.join("blue.png")).unwrap();
+    let mut e = png::Encoder::new(std::io::BufWriter::new(file), 16, 16);
+    e.set_color(png::ColorType::Rgba);
+    e.set_depth(png::BitDepth::Eight);
+    let blue: Vec<u8> = (0..16 * 16).flat_map(|_| [0, 0, 255, 255]).collect();
+    e.write_header().unwrap().write_image_data(&blue).unwrap();
+    fs::write(
+        skin.join("s.json"),
+        r#"{"type": 0, "w": 1920, "h": 1080,
+            "source": [{"id": "b", "path": "blue.png"}],
+            "image": [{"id": "b", "src": "b", "x": 4, "y": 2, "w": 8, "h": 8}],
+            "destination": [{"id": "b", "dst": [{"x": 0, "y": 0, "w": 1920, "h": 1080}]}]}"#,
+    )
+    .unwrap();
+    fs::create_dir_all(fx.data()).unwrap();
+    fs::write(
+        fx.data().join("player.toml"),
+        format!(
+            "[skins.play]\nroot = '{}'\nentry = 's.json'\n",
+            skin.display()
+        ),
+    )
+    .unwrap();
+    let text = scenario(&[
+        "capture = { loading = true, file = \"load.png\" }",
+        "capture = { at = 3200, file = \"note.png\" }",
+        "select = { path = \"library/a/a.bms\" }",
+        "play = { input = \"auto\", until = \"end\" }",
+        "result = \"back\"",
+        "quit = {}",
+    ])
+    .replacen(
+        "output = \"out\"\n",
+        "output = \"out\"\nsize = [640, 360]\n",
+        1,
+    );
+    let (out, stdout, stderr) = fx.run(&text);
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+    let dir = fx.base.join("out");
+    assert!(!dir.join("load.jsonl").exists());
+    let list = fs::read_to_string(dir.join("note.jsonl")).unwrap();
+    let mut lines = list.lines();
+    let state = lines.next().unwrap();
+    assert_eq!(side_num(state, "element_count"), 1, "{state}");
+    assert_eq!(side_num(state, "ex_score") % 2, 0, "{state}");
+    assert!(side_num(state, "combo") >= 1, "{state}");
+    assert_eq!(side_value(state, "look"), "Normal", "{state}");
+    let element = lines.next().unwrap();
+    assert_eq!(side_num(element, "element"), 0, "{element}");
+    assert_eq!(side_value(element, "outcome"), "Sampled", "{element}");
+    assert!(side_num(element, "t_us") > 3_200_000, "{element}");
+    let quad = lines.next().unwrap();
+    assert_eq!(side_num(quad, "element_of"), 0, "{quad}");
+    // On the skin's canvas, whatever the frame's size.
+    assert!(quad.contains("\"rect\":[0,0,1920,1080]"), "{quad}");
+    assert!(quad.contains("\"file\":\"blue.png\""), "{quad}");
+    assert!(quad.contains("\"src\":[4,2,8,8]"), "{quad}");
+    assert!(quad.contains("\"blend\":\"alpha\""), "{quad}");
+}
+
 /// A READY capture past READY's end fails the run rather than show play.
 #[test]
 fn a_ready_capture_past_ready_fails_the_run() {
