@@ -1391,18 +1391,28 @@ fn sidecar(axis: Axis, frame: u64, drawn: &Drawn<'_>) -> String {
     )
 }
 
-/// The phase `drawn` was drawn in, by what the screens choose from: Closing
-/// from the view, READY from the frame's time against where play starts,
-/// and playing from the view; a frame past READY its view no longer plays
-/// is the tail's, the ring-out's or a stop's.
+/// The play phase a frame's sidecar names: one decision over the acquired
+/// view's Closing, completion and playing flag and the frame's time against
+/// where play starts, the inputs the screens draw from.
+///
+/// It names the lifecycle state the frame was drawn in, not a promise about
+/// its pixels: timers and the built-in screen's READY text follow the frame's
+/// time alone, so a completed view before play starts is `tail` though those
+/// still read as READY (design.md "Mid-Chart Start and Section Repeat": a
+/// round completed there rings out without its notes). A quit during READY
+/// stays `ready`: no field says it, and it draws as READY. The views a
+/// playing flag before play starts would need do not occur, the lifecycle
+/// raising it only from the chart's start.
 fn phase(drawn: &Drawn<'_>) -> &'static str {
-    match (drawn.play, drawn.view) {
-        (Some(_), Some(v)) if v.closing.is_some() => "closing",
-        (Some(t), Some(v)) if v.ready.is_some_and(|(_, end)| t < end) => "ready",
-        (Some(_), Some(v)) if v.playing => "play",
-        (Some(_), Some(_)) => "tail",
-        (None, _) if drawn.loading => "loading",
-        _ => "other",
+    let (Some(t), Some(v)) = (drawn.play, drawn.view) else {
+        return if drawn.loading { "loading" } else { "other" };
+    };
+    let before_play = v.ready.is_some_and(|(_, start)| t < start);
+    match (v.closing.is_some(), v.complete, v.playing, before_play) {
+        (true, ..) => "closing",
+        (false, _, true, false) => "play",
+        (false, true, ..) | (false, false, false, false) => "tail",
+        (false, false, _, true) => "ready",
     }
 }
 
@@ -2246,45 +2256,46 @@ mod tests {
         assert!(side.contains("\"events\":56"), "{side}");
     }
 
-    /// A stop past READY is `tail`, whatever the frame's time; a view still
-    /// in READY is `ready` though the frame's time is past it.
+    /// Every combination of what `phase` decides from, for a full play and
+    /// a round starting later in the chart, each with what is drawn in it.
     #[test]
-    fn a_phase_comes_from_the_view() {
-        let view = |playing, complete, finalized| crate::measure::ViewStamp {
-            playing,
-            complete,
-            finalized,
-            ..drawn_view()
-        };
-        let mut d = drawn(1, 5);
-        for (v, want) in [
-            (view(true, false, Some(TimeUs(1))), "play"),
-            (view(false, true, Some(TimeUs(1))), "tail"),
-            (view(false, false, Some(TimeUs(1))), "tail"),
-            (
-                crate::measure::ViewStamp {
-                    closing: Some(TimeUs(1)),
-                    ..view(false, false, Some(TimeUs(1)))
-                },
-                "closing",
-            ),
-        ] {
-            d.view = Some(v);
-            assert_eq!(super::phase(&d), want, "{v:?}");
+    fn a_phase_is_one_decision_over_its_inputs() {
+        // Closing, complete, playing, before play starts; the phase; why.
+        #[rustfmt::skip]
+        const TABLE: [(bool, bool, bool, bool, &str, &str); 16] = [
+            (true, false, false, true, "closing", "the failed timer runs from the view's Closing"),
+            (true, false, false, false, "closing", "the failed timer runs from the view's Closing"),
+            (true, false, true, true, "closing", "Closing comes first, whatever the rest"),
+            (true, false, true, false, "closing", "Closing comes first, whatever the rest"),
+            (true, true, false, true, "closing", "Closing comes first, whatever the rest"),
+            (true, true, false, false, "closing", "Closing comes first, whatever the rest"),
+            (true, true, true, true, "closing", "Closing comes first, whatever the rest"),
+            (true, true, true, false, "closing", "Closing comes first, whatever the rest"),
+            (false, false, false, true, "ready", "READY's timers and text run; a quit in READY too"),
+            (false, false, false, false, "tail", "stopped past play's start, the play timer on"),
+            (false, false, true, true, "ready", "does not occur; the timers still read READY"),
+            (false, false, true, false, "play", "the last-note timer takes the playing flag"),
+            (false, true, false, true, "tail", "a round rings out without notes"),
+            (false, true, false, false, "tail", "the audio tail or a round's ring-out"),
+            (false, true, true, true, "tail", "does not occur; complete rings a round out"),
+            (false, true, true, false, "play", "the completing step still enters playing"),
+        ];
+        for (ready, start) in [(-1_000_000, 0), (-200_000, 2_000_000)] {
+            for (closing, complete, playing, before, want, why) in TABLE {
+                let mut d = drawn(1, 0);
+                d.play = Some(TimeUs(if before { start - 10_000 } else { start }));
+                d.view = Some(crate::measure::ViewStamp {
+                    closing: closing.then_some(TimeUs(1)),
+                    complete,
+                    playing,
+                    // Never read: a negative input offset moves it anywhere.
+                    finalized: Some(TimeUs(start + 9_000)),
+                    ready: Some((TimeUs(ready), TimeUs(start))),
+                    ..drawn_view()
+                });
+                assert_eq!(super::phase(&d), want, "{start}: {why}");
+            }
         }
-    }
-
-    /// A frame before play is READY's, as the screens draw it, however far
-    /// a negative input offset put the watermark.
-    #[test]
-    fn a_phase_before_play_is_ready() {
-        let mut d = drawn(1, -5);
-        d.view = Some(crate::measure::ViewStamp {
-            playing: false,
-            finalized: Some(TimeUs(9_000)),
-            ..drawn_view()
-        });
-        assert_eq!(super::phase(&d), "ready");
     }
 
     /// Captures of one frame share its number, and later frames count on;
