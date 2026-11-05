@@ -1985,6 +1985,14 @@ impl Renderer {
         Ok(())
     }
 
+    /// Development builds: the last frame's list, if its skin keeps one.
+    #[cfg(feature = "dev-tools")]
+    #[must_use]
+    pub fn display_list(&self) -> Option<skin_model::DisplayList> {
+        self.skin
+            .display_list(self.staging.batch().quads(), self.staging.clips())
+    }
+
     /// Development builds: the next preparation of rasterized text that
     /// uploads fails waiting for the GPU as a failing device does
     /// ([`RenderError::Poll`], not a refusal), its cache closed until the

@@ -11,7 +11,7 @@ publish.workspace = true
 # The Lua conversion report (src/bin/lua_report.rs), for the developer's
 # PC only (docs/stage3.md §3), and the sandbox's VM hooks for the player's
 # import tests (src/lua/vm_hooks.rs).
-dev-tools = []
+dev-tools = ["skin-model/dev-tools"]
 
 [dependencies]
 bms-model.workspace = true

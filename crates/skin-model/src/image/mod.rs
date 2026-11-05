@@ -441,6 +441,24 @@ pub struct Sheet {
     bitmap_fonts: Box<[Box<[u16]>]>,
 }
 
+#[cfg(feature = "dev-tools")]
+impl Sheet {
+    /// What frame `frame`, an index in the uv table, shows.
+    pub(crate) fn frame_source(&self, frame: u32) -> Option<crate::observation::Cell> {
+        use crate::observation::Cell as Shown;
+        let i = usize::try_from(frame).ok()?;
+        let cell = usize::try_from(*self.frames.get(i)?).ok()?;
+        let cell = self.cells.get(cell)?;
+        match cell.source {
+            CellSource::File(f) => Some(Shown::File {
+                name: self.files.get(usize::try_from(f).ok()?)?.lo.name.clone(),
+                rect: cell.rect,
+            }),
+            CellSource::Solid(color) => Some(Shown::Solid(color)),
+        }
+    }
+}
+
 /// Image `image`'s frame count: its grid has a column and a row, and at
 /// most [`MAX_IMAGE_FRAMES`] frames.
 fn image_frames(image: usize, def: &ImageDef) -> Result<u32, ImageError> {

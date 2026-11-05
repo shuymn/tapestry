@@ -759,6 +759,11 @@ impl Screen for MenuScreen {
         let pixels = self.renderer.read_back();
         (!pixels.is_empty()).then_some((w, h, pixels))
     }
+
+    #[cfg(feature = "dev-tools")]
+    fn display_list(&self) -> Option<skin_model::DisplayList> {
+        self.renderer.display_list()
+    }
 }
 
 impl MenuScreen {

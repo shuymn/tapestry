@@ -244,7 +244,7 @@ jobs:
           cache-bin: false
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Clippy (dev-tools)
-        run: mise exec -- cargo clippy -p player -p game -p skin-beatoraja --all-targets --locked --features player/dev-tools,game/dev-tools,skin-beatoraja/dev-tools -- -D warnings
+        run: mise exec -- cargo clippy -p player -p game -p skin-beatoraja -p skin-model --all-targets --locked --features player/dev-tools,game/dev-tools,skin-beatoraja/dev-tools,skin-model/dev-tools -- -D warnings
       - name: Development build includes dev-tools (positive control)
         run: |
           mise exec -- cargo build --locked -p player --features dev-tools
@@ -252,7 +252,7 @@ jobs:
           target/debug/tapestry.exe --dev-tools-probe
       # The game on its threads, driven by a scripted input log, on WARP.
       - name: Test (dev-tools)
-        run: mise exec -- cargo nextest run -p player -p game -p skin-beatoraja --features player/dev-tools,game/dev-tools,skin-beatoraja/dev-tools --locked --no-fail-fast
+        run: mise exec -- cargo nextest run -p player -p game -p skin-beatoraja -p skin-model --features player/dev-tools,game/dev-tools,skin-beatoraja/dev-tools,skin-model/dev-tools --locked --no-fail-fast
       # The player's allocation guards are unit tests of its binary, whose
       # counting allocator exists only with dev-tools; `_alloc` selects them
       # (`cargo xtask check-alloc-tests`).
@@ -342,6 +342,10 @@ jobs:
       # "Scope of No Allocation").
       - name: Allocation tests (release)
         run: mise exec -- cargo test --release --locked -p eval -p input -p game -p audio -p skin-model --test alloc --test audio_alloc --test audio_burst_alloc --test ring_out_alloc --test autoplay_iter_alloc --test loudness_alloc --test tempo_alloc --test adjustment_alloc --test rearm_alloc --test history_alloc --test restore_alloc --test reopen_alloc --test tail_alloc --test closing_alloc --test readouts_alloc --test driver_alloc
+      # The element observations a capture reads run in every play frame of a
+      # dev-tools build, so the skin's guard holds with them on too.
+      - name: Skin allocation test with observations (release)
+        run: mise exec -- cargo test --release --locked -p skin-model --features dev-tools --test alloc
       # The fuzz crate is its own workspace (fuzz/Cargo.toml), which the
       # workspace commands above do not reach.
       - name: Format (fuzz crate)
