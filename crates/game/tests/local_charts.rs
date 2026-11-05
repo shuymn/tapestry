@@ -4,9 +4,10 @@
 //! TAPESTRY_CHARTS_DIR=<dir> mise exec -- cargo test -p game --test local_charts -- --ignored --nocapture
 //! ```
 //!
-//! Every BMS/BME chart under the directory is loaded and played headlessly
-//! as an autoplay session (design.md "Autoplay"), so its generated input is
-//! planned and budgeted as production autoplay's is, whatever its density.
+//! Every `.bms`, `.bme` and `.bml` chart under the directory is loaded and
+//! played headlessly as an autoplay session (design.md "Autoplay"), so its
+//! generated input is planned and budgeted as production autoplay's is,
+//! whatever its density.
 //! Each must judge every judgeable note PERFECT, live evaluation must equal
 //! batch evaluation, and the record's log must decode to the record. One
 //! line per chart is printed with its number, note count and warning

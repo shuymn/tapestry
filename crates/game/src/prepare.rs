@@ -74,15 +74,18 @@ pub trait ChartIngest {
     ) -> Result<Ingested, IngestError>;
 }
 
-/// BMS and BME charts, through [`bms_parser::load_bms`].
+/// `.bms`, `.bme` and `.bml` charts, read alike through
+/// [`bms_parser::load_bms`].
 #[derive(Clone, Copy, Debug, Default)]
 pub struct BmsIngest;
 
 impl ChartIngest for BmsIngest {
     fn accepts(&self, path: &Path) -> bool {
-        path.extension()
-            .and_then(|e| e.to_str())
-            .is_some_and(|e| e.eq_ignore_ascii_case("bms") || e.eq_ignore_ascii_case("bme"))
+        path.extension().and_then(|e| e.to_str()).is_some_and(|e| {
+            ["bms", "bme", "bml"]
+                .iter()
+                .any(|x| e.eq_ignore_ascii_case(x))
+        })
     }
 
     fn max_bytes(&self) -> usize {

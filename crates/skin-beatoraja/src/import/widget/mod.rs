@@ -17,7 +17,7 @@ use skin_model::{
     CycleDef, ImageDef, MAX_SKIN_FRAMES, Native, Source, TimerRef, Track, timer as slot,
 };
 
-use super::asset::{self, Crop, Failed, ImageKey, Path};
+use super::asset::{self, Crop, Failed, ImageKey, NotAdded, Path};
 use super::budget::ImportLimit;
 use super::policy::{self, Role};
 use super::property::{self, IndexProp};
@@ -364,7 +364,8 @@ impl Cx<'_> {
     }
 
     /// Adds `def` cut to `crop` under `key`: a failure refuses a critical
-    /// element and drops any other.
+    /// element and drops any other, a cell no atlas page holds with its own
+    /// note.
     fn add_image(
         &mut self,
         c: &Common,
@@ -376,11 +377,17 @@ impl Cx<'_> {
         let (at, role) = (c.span, c.role);
         match self.assets.add_image(key, crop, def, cell) {
             Ok(found) => Ok(Some(found)),
-            Err(e) if matches!(role, Role::Critical(_)) => Err(ImportError::Asset {
-                at: self.loc(at),
-                source: e,
-            }),
-            Err(_) => {
+            Err(NotAdded::CellTooLarge { w, h }) => {
+                self.drop_el(role, at, NoteKind::CellTooLarge { w, h })?;
+                Ok(None)
+            }
+            Err(NotAdded::Image(e)) if matches!(role, Role::Critical(_)) => {
+                Err(ImportError::Asset {
+                    at: self.loc(at),
+                    source: e,
+                })
+            }
+            Err(NotAdded::Image(_)) => {
                 self.drop_el(role, at, NoteKind::MissingAsset)?;
                 Ok(None)
             }
