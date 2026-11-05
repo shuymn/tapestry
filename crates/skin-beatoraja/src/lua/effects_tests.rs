@@ -364,43 +364,45 @@ fn a_value_s_role_covers_its_whole_tree() {
         }) => why,
         other => panic!("{entry}: {other:?}"),
     };
-    // Rm's `getDummyNumber(102)`: a helper reading its parameter's id,
-    // joined over its call sites, here through a second helper; 101 is
-    // the EX score.
+    // Each value ends in `#`, which evaluation refuses before any read is
+    // attached: its role is the scan's. Rm's `getDummyNumber(102)`: a
+    // helper reading its parameter's id, joined over its call sites, here
+    // through a second helper; 101 is the EX score.
     let helper = "local function dummy(id) if id == 0 then return 0 end return ms.number(id) end\n\
                   local function shown(id) return dummy(id) end";
     assert_eq!(
         refused(&number(
             helper,
-            "function() return dummy(110) + shown(101) end"
+            "function() return dummy(110) + shown(101) + #\"\" end"
         )),
-        Unsupported::Construct("helper arguments")
+        Unsupported::Construct("#")
     );
     // A local initialized by a numeral, read inside an `if`.
     assert_eq!(
         refused(&number(
             "",
-            "function() local id = 101 if id > 0 then return ms.number(id) end return 0 end"
+            "function() local id = 101 if id > 0 then return ms.number(id) + #\"\" end return 0 end"
         )),
-        Unsupported::Construct("if")
+        Unsupported::Construct("#")
     );
     // An unknown id: the role is unknown, so critical.
     assert_eq!(
         refused(&number("", "function(p) return ms.number(p) end")),
         Unsupported::Unresolved("id")
     );
-    // An unresolved callee likewise.
+    // An unresolved callee likewise; the call of nil also opens the
+    // candidate, so the capture it reads through is void first.
     assert_eq!(
         refused(&number("local t = { }", "function() return t.f(1) end")),
-        Unsupported::Unresolved("callee")
+        Unsupported::Interference
     );
     // Controls: decorative ids, through a helper's parameter and a local,
     // are replaced.
     for (pre, value) in [
-        (helper, "function() return shown(110) end"),
+        (helper, "function() return shown(110) + #\"\" end"),
         (
             "",
-            "function() local id = 110 if id > 0 then return ms.number(id) end return 0 end",
+            "function() local id = 110 if id > 0 then return ms.number(id) + #\"\" end return 0 end",
         ),
     ] {
         let (r, callbacks) = outcome(&number(pre, value), &[]);
@@ -488,9 +490,15 @@ fn the_last_phase_s_time_is_checked_when_it_ends() {
 #[test]
 fn a_parameter_assigned_again_takes_no_call_site_id() {
     // The helper's parameter is the EX score's id when it reads it, not
-    // the decorative id its caller passes.
+    // the decorative id its caller passes (`#` keeps evaluation from
+    // attaching the read, so the scan decides).
     let pre = "local function shown(id)\n  id = 101\n  return ms.number(id)\nend";
-    match outcome(&number(pre, "function() return shown(110) end"), &[]).0 {
+    match outcome(
+        &number(pre, "function() return shown(110) + #\"\" end"),
+        &[],
+    )
+    .0
+    {
         Err(ImportError::Lua {
             why: LuaWhy::Critical { field: "value", .. },
             ..

@@ -67,9 +67,9 @@ pub const MAX_AST_NODES: u64 = 1 << 20;
 /// The deepest nesting of statements and subexpressions the analysis's
 /// parser recurses into, checked before each level: Lua's own parser
 /// stops at the same depth (`LUAI_MAXCCALLS`). Every other recursive walk
-/// over a tree (classification, sizing and lowering, through inlined
-/// locals and helpers) stops at it too, fatal: a left-leaning chain the
-/// parser reads without recursing is as deep as it is long.
+/// over a tree (the effect walk, and partial evaluation through inlined
+/// helpers) stops at it too, fatal: a left-leaning chain the parser
+/// reads without recursing is as deep as it is long.
 pub const MAX_AST_DEPTH: u32 = 200;
 /// The most closure instances, captured values, captured tables and table
 /// entries copied along static access paths the analysis keeps from a
@@ -77,13 +77,16 @@ pub const MAX_AST_DEPTH: u32 = 200;
 /// kept.
 pub const MAX_CAPTURES: u64 = 1 << 16;
 /// The most units of work the callbacks' analysis does across a
-/// candidate: each expression or statement the effect walk, a
-/// classification, sizing, lowering or role scan visits, each local scanned, each captured value
-/// a prototype's key copies, each static access path step a capture
-/// follows, and each byte of a key or string hashed, charged before the
-/// work. Instances of one function with the
-/// same captured values are classified once, so a function created in a
-/// loop costs its body once.
+/// candidate: each expression or statement the effect walk, a partial
+/// evaluation or a role scan visits, each local scanned, each inlined
+/// call, inline-stack entry and parameter bound, each environment slot
+/// copied or merged, each conversion, distribution, attachment and
+/// emission visit, each captured value a prototype's key copies, each
+/// static access path step a capture follows, and each byte of a key or
+/// string hashed, compared, generated or compiled, charged before the
+/// work. The effect walk visits instances of one function with the same
+/// captured values once, so a function created in a loop costs its body
+/// once there.
 pub const MAX_ANALYSIS_WORK: u64 = 1 << 24;
 /// The most monotonic time a candidate's analysis spends in its phases
 /// (closing the captured object graph, the effect walk, admission and
@@ -100,7 +103,7 @@ pub const MAX_ANALYSIS_TIME: std::time::Duration = std::time::Duration::from_sec
 /// ([`MAX_INPUT_BYTES`](crate::limits::MAX_INPUT_BYTES)), so a pass can
 /// rewrite every byte it may read.
 pub const MAX_REWRITTEN_BYTES: u64 = 1 << 26;
-/// The most expression nodes the lowering of a candidate's callbacks
-/// expands helpers into, each helper call charged its expanded size
-/// before it is expanded.
+/// The most residual nodes the partial evaluation of a candidate's
+/// callbacks makes in all ([`super::residual`]), each charged before it
+/// is pushed; past it, fatal.
 pub const MAX_EXPANDED_NODES: u64 = 1 << 20;

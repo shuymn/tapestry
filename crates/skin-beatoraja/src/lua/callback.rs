@@ -17,27 +17,12 @@
 //! global) are copied, each read raw; the `_ENV` its globals are read
 //! through is such a table. Nothing else is kept, and nothing is run.
 //!
-//! [`classify`] decides a callback's class on its tree and its captures
-//! by a positive allowlist, never by running it:
-//!
-//! - its body is `local name = E` lines and then `return E`, without
-//!   parameters;
-//! - `E` is built from integer numerals, `true` and `false`; captured
-//!   integers and booleans; `H.f(n)` with `H` an upvalue, a global or
-//!   `_ENV.name` whose captured final binding is the host module (a global
-//!   read through an `_ENV` without a metatable), `f` one of `number`,
-//!   `option`, `timer`, `gauge_type`, and `n` integer numerals;
-//!   `H.timer_off_value`; calls of helpers, upvalues whose captured final
-//!   binding is a closure itself of this form; `+ - *` and comparisons of
-//!   integers; `==` and `~=` of `gauge_type()` with a numeral, of a timer
-//!   with the off value, and of `skin_config.option["name"]` with a
-//!   numeral, `skin_config` proven to be the pass's own table with no
-//!   metatable on the way and its entry a Lua integer; `and`, `or` and
-//!   `not` of booleans.
-//!
-//! A callback of this form reads, and whether each read has a mapping is
-//! decided where it is consumed (`import::callback`); anything else does
-//! not lower, and follows its role there.
+//! A consumed callback is partially evaluated on its tree and these
+//! captures ([`super::residual`]), never by running it; whether each read
+//! it records has a mapping is decided where it is consumed
+//! (`import::callback`), and one that does not lower follows its role
+//! there. The provenance marker's records ([`Analysis::marks`]) are
+//! copied with the captures.
 //!
 //! What a fold or a binding rests on is decided apart, for every root at
 //! once, by [`admit`]: the effect walk ([`super::effects`]) checks every
@@ -62,8 +47,8 @@ use std::cell::{Cell, RefCell};
 
 use std::collections::HashMap;
 
-use super::limits::{MAX_ANALYSIS_WORK, MAX_AST_DEPTH};
-use super::syntax::{Ast, Bin, CHUNK_ENV, Expr, NONE, Stmt, Un};
+use super::limits::MAX_ANALYSIS_WORK;
+use super::syntax::{Ast, CHUNK_ENV, Expr, NONE, Un};
 use super::{HOST_APIS, Unsupported};
 use crate::error::{ImportError, Loc};
 use crate::tree::{Arena, Kind, LuaScalar};
@@ -142,22 +127,7 @@ pub enum Disposition {
     Refused,
 }
 
-/// A callback's type as classified.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Ty {
-    Int,
-    Bool,
-    /// `gauge_type()`.
-    Gauge,
-    /// `timer(n)`.
-    Timer,
-    /// `timer_off_value`.
-    TimerOff,
-    /// `skin_config.option["name"]`.
-    Config,
-}
-
-/// What a walk past [`MAX_AST_DEPTH`] gives: the depth cap, fatal
+/// What a walk past [`MAX_AST_DEPTH`](super::limits::MAX_AST_DEPTH) gives: the depth cap, fatal
 /// wherever it is met ([`super::LuaLimit::AstDepth`]).
 pub(crate) const TOO_DEEP: Unsupported = Unsupported::Construct("nesting past the depth cap");
 
@@ -211,14 +181,6 @@ pub(crate) struct Open {
     pub(crate) why: Unsupported,
 }
 
-/// A classification in progress or done, by instance.
-#[derive(Clone, Copy, Debug)]
-enum State {
-    Unvisited,
-    InProgress,
-    Done(Result<Ty, Found>),
-}
-
 /// A function prototype with its captured values: its file, its function
 /// and the values, in its upvalues' order.
 pub(crate) type ProtoKey = (u16, u32, Vec<Captured>);
@@ -268,11 +230,6 @@ pub(crate) struct Analysis {
     pub(crate) scripts: u32,
     #[cfg(any(test, feature = "dev-tools"))]
     pub(crate) unread: u32,
-    classes: RefCell<Vec<State>>,
-    /// The classes of function prototypes by their file, function and
-    /// captured values: instances that share all three share a class,
-    /// which is walked once.
-    protos: RefCell<HashMap<ProtoKey, Result<Ty, Found>>>,
     /// By callable.
     pub(crate) outcomes: RefCell<Vec<Disposition>>,
     /// Expression nodes expanded so far by lowering.
@@ -436,33 +393,6 @@ impl Analysis {
         }
     }
 
-    /// The integer entry `k` of `skin_config.option` read through binding
-    /// `env` in instance `i`, proven on the captured graph: the `_ENV` a
-    /// table without a metatable, its raw `skin_config` the pass's own
-    /// table and its raw `option`, neither with a metatable, and the raw
-    /// entry a Lua integer.
-    pub(crate) fn option_entry(&self, i: u32, env: u32, k: &[u8]) -> Result<i64, Unsupported> {
-        let Some(Captured::Table { id: sc, meta }) = self.global(i, env, b"skin_config")? else {
-            return Err(Unsupported::Capture("skin_config"));
-        };
-        if self.config != Some(sc) {
-            return Err(Unsupported::Capture("skin_config"));
-        }
-        if meta {
-            return Err(Unsupported::Capture("skin_config's metatable"));
-        }
-        let Some(Captured::Table { id: option, meta }) = self.entry(sc, b"option")? else {
-            return Err(Unsupported::Capture("skin_config.option"));
-        };
-        if meta {
-            return Err(Unsupported::Capture("skin_config.option's metatable"));
-        }
-        match self.entry(option, k)? {
-            Some(Captured::Int(v)) => Ok(v),
-            _ => Err(Unsupported::Capture("an option entry")),
-        }
-    }
-
     pub(crate) fn instance(&self, i: u32) -> Option<&Instance> {
         self.instances.get(i as usize)
     }
@@ -502,75 +432,6 @@ impl Analysis {
         }
     }
 
-    /// The class of instance `i`: its result type when it is write-free,
-    /// else the construct that has an unknown effect.
-    pub(crate) fn classify(&self, i: u32) -> Result<Ty, Found> {
-        self.classify_at(i, 0)
-    }
-
-    /// [`Self::classify`] `depth` levels into a walk: every level of an
-    /// expression and every helper call counts one, and a walk past
-    /// [`MAX_AST_DEPTH`] stops at [`TOO_DEEP`].
-    fn classify_at(&self, i: u32, depth: u32) -> Result<Ty, Found> {
-        {
-            let mut classes = self.classes.borrow_mut();
-            if classes.len() < self.instances.len() {
-                classes.resize(self.instances.len(), State::Unvisited);
-            }
-            match classes.get(i as usize).copied() {
-                Some(State::Done(r)) => return r,
-                Some(State::InProgress) => {
-                    let inst = self.instance(i);
-                    return Err(Found {
-                        why: Unsupported::Recursion,
-                        file: inst.map_or(0, |x| x.file),
-                        line: inst
-                            .and_then(|x| self.ast(x.file)?.func(x.func).map(|f| f.line))
-                            .unwrap_or(0),
-                    });
-                }
-                _ => {}
-            }
-            if let Some(s) = classes.get_mut(i as usize) {
-                *s = State::InProgress;
-            }
-        }
-        let key = match self.proto_key(i) {
-            Ok(key) => key,
-            Err(why) => {
-                let r = Err(Found {
-                    why,
-                    file: self.instance(i).map_or(0, |x| x.file),
-                    line: 0,
-                });
-                if let Some(s) = self.classes.borrow_mut().get_mut(i as usize) {
-                    *s = State::Done(r);
-                }
-                return r;
-            }
-        };
-        let cached = key
-            .as_ref()
-            .and_then(|k| self.protos.borrow().get(k).copied());
-        let r = match cached {
-            Some(r) => r,
-            None => {
-                let r = self.classify_body(i, depth);
-                // A cap or cancellation is not a class.
-                if let Some(k) = key
-                    && !r.is_err_and(|f| fatal(f.why).is_some())
-                {
-                    self.protos.borrow_mut().insert(k, r);
-                }
-                r
-            }
-        };
-        if let Some(s) = self.classes.borrow_mut().get_mut(i as usize) {
-            *s = State::Done(r);
-        }
-        r
-    }
-
     /// The prototype key of instance `i`, its values charged before they
     /// are copied; `Ok(None)` without one.
     pub(super) fn proto_key(&self, i: u32) -> Result<Option<ProtoKey>, Unsupported> {
@@ -586,65 +447,6 @@ impl Analysis {
             return Ok(None);
         };
         Ok(Some((inst.file, inst.func, values.to_vec())))
-    }
-
-    fn classify_body(&self, i: u32, depth: u32) -> Result<Ty, Found> {
-        let untagged = |file| Found {
-            why: Unsupported::Capture("an untagged closure"),
-            file,
-            line: 0,
-        };
-        let inst = *self.instance(i).ok_or(untagged(0))?;
-        let ast = self.ast(inst.file).ok_or(untagged(inst.file))?;
-        let f = ast.func(inst.func).ok_or(untagged(inst.file))?;
-        let at = |why, line| Found {
-            why,
-            file: inst.file,
-            line,
-        };
-        if f.params.1 > 0 || f.vararg {
-            return Err(at(Unsupported::Construct("parameters"), f.line));
-        }
-        if inst.values.is_none() && f.upvalues.1 > 0 {
-            return Err(at(Unsupported::Capture("no reader"), f.line));
-        }
-        let mut cx = Classify {
-            an: self,
-            ast,
-            inst: i,
-            file: inst.file,
-            locals: Vec::new(),
-            depth: std::cell::Cell::new(depth),
-        };
-        for &s in ast.list(f.body) {
-            let line = ast.stmt_line(s);
-            self.charge(1).map_err(|why| at(why, line))?;
-            match ast.stmt(s) {
-                Stmt::Empty => {}
-                Stmt::Local { names, exprs } => {
-                    let (&[d], &[e]) = (ast.list(names), ast.list(exprs)) else {
-                        return Err(at(Unsupported::Construct("local list"), line));
-                    };
-                    match ast.decl(d).map(|x| x.attrib) {
-                        Some(super::syntax::Attrib::Close) => {
-                            return Err(at(Unsupported::Construct("<close>"), line));
-                        }
-                        Some(_) => {}
-                        None => return Err(at(Unsupported::Construct("local"), line)),
-                    }
-                    let ty = cx.expr(e)?;
-                    cx.locals.push((d, ty));
-                }
-                Stmt::Return(list) => {
-                    let &[e] = ast.list(list) else {
-                        return Err(at(Unsupported::Construct("return list"), line));
-                    };
-                    return cx.expr(e);
-                }
-                other => return Err(at(Unsupported::Construct(other.name()), line)),
-            }
-        }
-        Err(at(Unsupported::Construct("no return"), f.line))
     }
 }
 
@@ -668,188 +470,6 @@ pub(crate) enum Callee {
     Host(u16),
     /// A helper instance.
     Helper(u32),
-}
-
-/// The walk of one instance's body.
-struct Classify<'a> {
-    an: &'a Analysis,
-    ast: &'a Ast,
-    inst: u32,
-    file: u16,
-    /// The body's locals so far and their types.
-    locals: Vec<(u32, Ty)>,
-    /// How deep the walk is.
-    depth: std::cell::Cell<u32>,
-}
-
-impl Classify<'_> {
-    fn at(&self, why: Unsupported, e: u32) -> Found {
-        Found {
-            why,
-            file: self.file,
-            line: self.ast.expr_line(e),
-        }
-    }
-
-    fn expr(&self, e: u32) -> Result<Ty, Found> {
-        self.an.charge(1).map_err(|why| self.at(why, e))?;
-        let d = self.depth.get();
-        if d >= MAX_AST_DEPTH {
-            return Err(self.at(TOO_DEEP, e));
-        }
-        self.depth.set(d + 1);
-        let r = self.expr_inner(e);
-        self.depth.set(d);
-        r
-    }
-
-    fn expr_inner(&self, e: u32) -> Result<Ty, Found> {
-        let construct = |w: &'static str| Err(self.at(Unsupported::Construct(w), e));
-        match self.ast.expr(e) {
-            Expr::Int(_) => Ok(Ty::Int),
-            Expr::True | Expr::False => Ok(Ty::Bool),
-            Expr::Float(_) => construct("float"),
-            Expr::Str(_) => construct("string"),
-            Expr::Nil => construct("nil"),
-            Expr::Vararg => construct("vararg"),
-            Expr::Func(_) => construct("function"),
-            Expr::Table(_) => construct("table"),
-            Expr::Method { .. } => construct("method call"),
-            Expr::Paren(x) => self.expr(x),
-            Expr::Local(d) => {
-                // The body's locals, at most Lua's 200, scanned and charged.
-                let n = u64::try_from(self.locals.len()).unwrap_or(u64::MAX);
-                self.an.charge(n).map_err(|why| self.at(why, e))?;
-                if let Some(&(_, ty)) = self.locals.iter().rev().find(|(l, _)| *l == d) {
-                    return Ok(ty);
-                }
-                match self.an.upvalue(self.inst, d) {
-                    Some(Captured::Int(_)) => Ok(Ty::Int),
-                    Some(Captured::Bool(_)) => Ok(Ty::Bool),
-                    _ => Err(self.at(Unsupported::Capture("an upvalue"), e)),
-                }
-            }
-            Expr::Global { .. } => Err(self.at(Unsupported::Global, e)),
-            Expr::Index { obj, key } => self.index(e, obj, key),
-            Expr::Call { callee, args } => self.call(e, callee, self.ast.list(args)),
-            Expr::Unary(op, x) => {
-                let t = self.expr(x)?;
-                match (op, t) {
-                    (Un::Neg, Ty::Int) => Ok(Ty::Int),
-                    (Un::Not, Ty::Bool) => Ok(Ty::Bool),
-                    (Un::Not, Ty::Int) => Err(self.at(Unsupported::Truthiness, e)),
-                    (Un::Len, _) => construct("#"),
-                    (Un::BNot, _) => construct("bitwise"),
-                    _ => Err(self.at(Unsupported::Type, e)),
-                }
-            }
-            Expr::Binary(op, a, b) => self.binary(e, op, a, b),
-        }
-    }
-
-    fn binary(&self, e: u32, op: Bin, a: u32, b: u32) -> Result<Ty, Found> {
-        let construct = |w: &'static str| Err(self.at(Unsupported::Construct(w), e));
-        match op {
-            Bin::Div => return construct("/"),
-            Bin::IDiv => return construct("//"),
-            Bin::Mod => return construct("%"),
-            Bin::Pow => return construct("^"),
-            Bin::Concat => return construct(".."),
-            Bin::BAnd | Bin::BOr | Bin::BXor | Bin::Shl | Bin::Shr => return construct("bitwise"),
-            _ => {}
-        }
-        let (ta, tb) = (self.expr(a)?, self.expr(b)?);
-        let lit = |x: u32| numeral(self.ast, x).is_some();
-        match op {
-            Bin::Add | Bin::Sub | Bin::Mul if ta == Ty::Int && tb == Ty::Int => Ok(Ty::Int),
-            Bin::Lt | Bin::Le | Bin::Gt | Bin::Ge if ta == Ty::Int && tb == Ty::Int => Ok(Ty::Bool),
-            Bin::Eq | Bin::Ne => match (ta, tb) {
-                (Ty::Int, Ty::Int) => Ok(Ty::Bool),
-                (Ty::Gauge | Ty::Config, Ty::Int) if lit(b) => Ok(Ty::Bool),
-                (Ty::Int, Ty::Gauge | Ty::Config) if lit(a) => Ok(Ty::Bool),
-                (Ty::Timer, Ty::TimerOff) | (Ty::TimerOff, Ty::Timer) => Ok(Ty::Bool),
-                _ => Err(self.at(Unsupported::Type, e)),
-            },
-            Bin::And | Bin::Or => match (ta, tb) {
-                (Ty::Bool, Ty::Bool) => Ok(Ty::Bool),
-                (Ty::Int, _) | (_, Ty::Int) => Err(self.at(Unsupported::Truthiness, e)),
-                _ => Err(self.at(Unsupported::Type, e)),
-            },
-            _ => Err(self.at(Unsupported::Type, e)),
-        }
-    }
-
-    fn index(&self, e: u32, obj: u32, key: u32) -> Result<Ty, Found> {
-        let key_str = match self.ast.expr(key) {
-            Expr::Str(s) => Some(self.ast.str(s)),
-            _ => None,
-        };
-        // `H.timer_off_value`, `H` a binding the captures hold.
-        if key_str == Some(b"timer_off_value")
-            && let Some(bound) = self
-                .an
-                .binding(self.ast, self.inst, obj)
-                .map_err(|why| self.at(why, e))?
-        {
-            return match bound {
-                Captured::Module(MAIN_STATE) => Ok(Ty::TimerOff),
-                Captured::Module(_) => Err(self.at(Unsupported::Binding("another host module"), e)),
-                _ => Err(self.at(Unsupported::Binding("a host module"), e)),
-            };
-        }
-        // `skin_config.option["name"]`.
-        if let Expr::Index { obj: cfg, key: opt } = self.ast.expr(obj)
-            && let Expr::Global { name, env } = self.ast.expr(cfg)
-            && self.ast.str(name) == b"skin_config"
-            && matches!(self.ast.expr(opt), Expr::Str(s) if self.ast.str(s) == b"option")
-            && let Some(k) = key_str
-        {
-            self.config(e, env, k)?;
-            return Ok(Ty::Config);
-        }
-        Err(self.at(Unsupported::Construct("index"), e))
-    }
-
-    /// The proven integer entry `k` of `skin_config.option`, read through
-    /// `env`.
-    fn config(&self, e: u32, env: u32, k: &[u8]) -> Result<i64, Found> {
-        self.an
-            .option_entry(self.inst, env, k)
-            .map_err(|why| self.at(why, e))
-    }
-
-    fn call(&self, e: u32, callee: u32, args: &[u32]) -> Result<Ty, Found> {
-        match resolve_callee(self.an, self.ast, self.inst, callee) {
-            Ok(Callee::Host(api)) => {
-                let (_, name) = HOST_APIS.get(usize::from(api)).copied().unwrap_or(("", ""));
-                let (arity, ty) = match name {
-                    "number" => (1, Ty::Int),
-                    "option" => (1, Ty::Bool),
-                    "timer" => (1, Ty::Timer),
-                    "gauge_type" => (0, Ty::Gauge),
-                    _ => return Err(self.at(Unsupported::HostApi(api), e)),
-                };
-                if args.len() != arity || args.iter().any(|&a| numeral(self.ast, a).is_none()) {
-                    return Err(self.at(Unsupported::Construct("host arguments"), e));
-                }
-                Ok(ty)
-            }
-            Ok(Callee::Helper(j)) => {
-                if !args.is_empty() {
-                    return Err(self.at(Unsupported::Construct("helper arguments"), e));
-                }
-                match self.an.classify_at(j, self.depth.get() + 1) {
-                    Ok(t @ (Ty::Int | Ty::Bool)) => Ok(t),
-                    Ok(_) => Err(self.at(Unsupported::Type, e)),
-                    Err(f) if f.why == Unsupported::Recursion => {
-                        Err(self.at(Unsupported::Recursion, e))
-                    }
-                    Err(f) => Err(f),
-                }
-            }
-            Err(why) => Err(self.at(why, e)),
-        }
-    }
 }
 
 /// What a call's callee is in instance `inst`'s body, proven by the
