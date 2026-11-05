@@ -563,11 +563,10 @@ impl Cx<'_> {
                 return Ok(());
             };
             role = v.role;
-            let src = match v.guard {
-                Some(guard) => format!("if {guard} then {} else -1", v.expr),
-                None => v.expr,
-            };
-            (src, v.deviates)
+            (
+                image_choice::guarded(&v.expr, v.guard.as_deref()),
+                v.deviates,
+            )
         } else {
             match selector {
                 SetSelector::Unsupported { why, .. } => {

@@ -43,9 +43,14 @@ pub(in super::super) enum SetSelector {
 
 /// The selector source of value `v`: hidden (−1) while it is unknown.
 fn value_selector(v: Value) -> String {
-    match v.availability() {
-        Some(valid) => format!("if {valid} then {} else -1", v.expr()),
-        None => v.expr().to_owned(),
+    guarded(v.expr(), v.availability())
+}
+
+/// Selector `src`, choosing no entry (-1) while `guard` is false.
+pub(in super::super) fn guarded(src: &str, guard: Option<&str>) -> String {
+    match guard {
+        Some(valid) => format!("if {valid} then {src} else -1"),
+        None => src.to_owned(),
     }
 }
 
