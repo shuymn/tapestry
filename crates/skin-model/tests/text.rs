@@ -182,6 +182,60 @@ fn literals_are_short_and_have_no_controls() {
 }
 
 #[test]
+fn a_fields_string_for_when_it_is_empty_is_held_as_a_literal() {
+    let one = |empty: &str| {
+        let value = TextValue::FieldOr {
+            field: TextField::Title,
+            empty: empty.to_owned(),
+        };
+        load(
+            vec![text(0, BOX)],
+            vec![def(value, Align::Left, Overflow::Spill)],
+        )
+    };
+    one("none").unwrap();
+    let over = "a".repeat(MAX_TEXT_BYTES + 1);
+    for bad in [over.as_str(), "", "A\nB", "A\u{7f}"] {
+        assert_eq!(text_error(one(bad)), (0, TextError::Literal), "{bad:?}");
+    }
+}
+
+/// The string shows only where its field's string is empty as written: a
+/// full field after joining, so a subtitle alone keeps it, and one of
+/// control characters alone draws nothing.
+#[test]
+fn a_fields_string_shows_only_for_an_empty_field() {
+    let or = |field| TextValue::FieldOr {
+        field,
+        empty: "none".to_owned(),
+    };
+    let skin = load(
+        vec![text(0, BOX), text(1, BOX)],
+        vec![
+            def(or(TextField::FullTitle), Align::Left, Overflow::Spill),
+            def(or(TextField::Genre), Align::Left, Overflow::Spill),
+        ],
+    )
+    .unwrap();
+    let got = |title: &'static str, subtitle: &'static str, genre: &'static str| {
+        let chart = ChartText {
+            title,
+            subtitle,
+            genre,
+            ..ChartText::default()
+        };
+        requests(&skin, &chart)
+            .into_iter()
+            .map(|r| r.text)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(got("T", "", "G"), ["T", "G"]);
+    assert_eq!(got("", "", ""), ["none", "none"]);
+    assert_eq!(got("", "S", ""), [" S", "none"]);
+    assert_eq!(got("\u{1}", "", "\u{1}"), [] as [&str; 0]);
+}
+
+#[test]
 fn text_is_unbound_unfilled_and_positive_in_height() {
     let placed = |place: Place, r: [i32; 4]| element(Source::Text(0), r, place);
     let one = |e: ElementDef| load(vec![e], vec![plain()]);

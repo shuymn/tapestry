@@ -8,6 +8,7 @@ use skin_model::{
 
 use super::super::asset::{self, FntFailure, Font};
 use super::super::budget::ImportLimit;
+use super::super::callback::TextFold;
 use super::super::geom::{Q, coords};
 use super::super::policy::Role;
 use super::super::property::{self, StrProp};
@@ -54,6 +55,23 @@ fn clean(s: &str) -> String {
 }
 
 impl Cx<'_> {
+    /// `literal` cleaned for a text at `at`, a D6 note when that changed it;
+    /// `None` when nothing is left.
+    fn cleaned(&mut self, at: Span, literal: &str) -> Option<String> {
+        let cleaned = clean(literal);
+        if cleaned.is_empty() {
+            return None;
+        }
+        if cleaned != literal {
+            self.note(
+                Some(at),
+                Severity::Deviation,
+                NoteKind::Deviation(DeviationId::D6),
+            );
+        }
+        Some(cleaned)
+    }
+
     /// A text object.
     pub(in super::super) fn text(&mut self, dst: Dst, rec: u32) -> Result<(), ImportError> {
         let at = dst.span;
@@ -89,24 +107,47 @@ impl Cx<'_> {
             ],
         );
         // The effective string (`JsonSkinObjectLoader.java:633-636`,
-        // `SkinText.java:102`).
+        // `SkinText.java:102`). A function folds or follows the role, and
+        // it never falls back to `ref`.
+        let mut folded = None;
         let resolved = match self.callback_prop(value, "value")? {
             Prop::Id(n) => property::str_by_id(n),
             Prop::Name(s) => property::str_by_name(&s).unwrap_or(StrProp::Unsupported(None)),
-            // A function's string has no consumer, and it never falls
-            // back to `ref`.
-            Prop::Callable(id) => {
-                let why = self.unconsumed(role, id, "value", "text value")?;
-                self.drop_el(role, at, why)?;
-                return Ok(());
-            }
+            Prop::Callable(id) => match self.text_callback(role, id)? {
+                Ok(TextFold::Field(n)) => StrProp::Field(n),
+                Ok(fold) => {
+                    folded = Some(fold);
+                    StrProp::Null
+                }
+                Err(why) => {
+                    self.drop_el(role, at, why)?;
+                    return Ok(());
+                }
+            },
             Prop::Null => StrProp::Null,
         };
-        let resolved = match resolved {
-            StrProp::Null => property::str_by_id(self.int_or(r, "ref", 0)?),
-            p => p,
+        let resolved = match (resolved, &folded) {
+            (StrProp::Null, None) => property::str_by_id(self.int_or(r, "ref", 0)?),
+            (p, _) => p,
         };
         let text = match resolved {
+            StrProp::Null if folded.is_some() => {
+                // An empty result draws nothing (`SkinText.java:106-107`).
+                let value = match folded {
+                    Some(TextFold::FieldOr(id, s)) => match (field(id), self.cleaned(at, &s)) {
+                        (Some(f), Some(empty)) => Some(TextValue::FieldOr { field: f, empty }),
+                        (Some(f), None) => Some(TextValue::Field(f)),
+                        (None, _) => None,
+                    },
+                    Some(TextFold::Literal(s)) => self.cleaned(at, &s).map(TextValue::Literal),
+                    _ => None,
+                };
+                let Some(value) = value else {
+                    self.ignored(at, NoteKind::Ignored { field: "value" });
+                    return Ok(());
+                };
+                value
+            }
             StrProp::Field(id) => match field(id) {
                 Some(f) => TextValue::Field(f),
                 None => {
@@ -126,8 +167,7 @@ impl Cx<'_> {
                 let literal = self
                     .opt_string(constant, "constantText")?
                     .unwrap_or_default();
-                let cleaned = clean(&literal);
-                if cleaned.is_empty() {
+                let Some(cleaned) = self.cleaned(at, &literal) else {
                     self.ignored(
                         at,
                         NoteKind::Ignored {
@@ -135,14 +175,7 @@ impl Cx<'_> {
                         },
                     );
                     return Ok(());
-                }
-                if cleaned != literal {
-                    self.note(
-                        Some(at),
-                        Severity::Deviation,
-                        NoteKind::Deviation(DeviationId::D6),
-                    );
-                }
+                };
                 TextValue::Literal(cleaned)
             }
         };
@@ -301,7 +334,7 @@ impl Cx<'_> {
         // A bitmap line pushes a quad per character at most.
         let quads = match (font, &text) {
             (FontRef::Bitmap(_), TextValue::Literal(s)) => s.chars().count(),
-            (FontRef::Bitmap(_), TextValue::Field(_)) => MAX_TEXT_BYTES,
+            (FontRef::Bitmap(_), TextValue::Field(_) | TextValue::FieldOr { .. }) => MAX_TEXT_BYTES,
             _ => 1,
         };
         self.budget

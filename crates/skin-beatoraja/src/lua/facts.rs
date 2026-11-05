@@ -357,10 +357,25 @@ pub(crate) enum TextRead {
     LiveState,
 }
 
+/// What option `n` answers on every scene, when it is a scene constant:
+/// course mode and `table_song`, false, a negative id negated.
+pub(crate) fn scene_option(n: i32) -> Option<bool> {
+    matches!(
+        n.checked_abs()?,
+        COURSE_MODE | crate::import::ops::TABLE_SONG
+    )
+    .then_some(n < 0)
+}
+
+/// Whether text `n` is the empty string on every scene: the table texts.
+pub(crate) fn scene_text(n: i32) -> bool {
+    TABLE_TEXTS.contains(&n)
+}
+
 /// Answers `text(n)` on `facts`' scene: the table texts are empty, as
 /// there are no difficulty tables.
 pub(crate) fn text(_facts: &ImportFacts, n: i32) -> TextRead {
-    if TABLE_TEXTS.contains(&n) {
+    if scene_text(n) {
         TextRead::Constant("")
     } else {
         TextRead::LiveState

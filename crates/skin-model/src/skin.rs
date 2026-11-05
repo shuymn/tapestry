@@ -660,7 +660,8 @@ fn check_widget_params(element: usize, source: Source, w: &WidgetDefs) -> Result
             }
         }
         Source::Text(i) => {
-            if let Some(TextValue::Literal(l)) = w.texts.get(index(i)).map(|t| &t.value)
+            if let Some(TextValue::Literal(l) | TextValue::FieldOr { empty: l, .. }) =
+                w.texts.get(index(i)).map(|t| &t.value)
                 && !text::literal_ok(l)
             {
                 let error = TextError::Literal;
