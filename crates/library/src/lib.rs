@@ -87,10 +87,11 @@ mod scan;
 mod search;
 
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::fmt;
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf, Prefix};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -635,11 +636,7 @@ impl Library {
             path: self.path.clone(),
             source,
         })?;
-        // One spelling of each root, from which every stored path derives.
-        let roots = roots
-            .iter()
-            .map(|root| root.components().collect())
-            .collect();
+        let roots = roots.iter().map(|root| one_spelling(root)).collect();
         scan::start(writer, roots, options, lease).map_err(LibraryError::Spawn)
     }
 
@@ -648,5 +645,86 @@ impl Library {
     #[cfg(test)]
     pub(crate) const fn reader(&self) -> &Connection {
         &self.reader
+    }
+}
+
+/// The one spelling of a configured root, from which every stored path derives
+/// (design.md "Loading and Song Selection").
+fn one_spelling(root: &Path) -> PathBuf {
+    let mut spelled = PathBuf::new();
+    for component in root.components() {
+        match component {
+            Component::Prefix(prefix) => {
+                if let Prefix::UNC(server, share) = prefix.kind() {
+                    // The prefix keeps the separators it was written with, and
+                    // a share root always holds its charts under its own
+                    // separator.
+                    let mut unc = OsString::from(r"\\");
+                    unc.push(server);
+                    unc.push(r"\");
+                    unc.push(share);
+                    unc.push(r"\");
+                    spelled.push(unc);
+                } else {
+                    spelled.push(prefix.as_os_str());
+                }
+            }
+            other => spelled.push(other),
+        }
+    }
+    spelled
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The spellings of a drive and a share, each to its one spelling. Only
+    /// Windows has them.
+    #[cfg(windows)]
+    #[test]
+    fn a_root_has_one_spelling() {
+        let table = [
+            (r"D:\Music", r"D:\Music"),
+            (r"D:\Music\", r"D:\Music"),
+            ("D:/Music", r"D:\Music"),
+            (r"D:/Music\", r"D:\Music"),
+            (r"D:\a\\b\.\c", r"D:\a\b\c"),
+            (r"D:\", r"D:\"),
+            ("D:/", r"D:\"),
+            (r"\\server\share\dir", r"\\server\share\dir"),
+            (r"\\server\share\dir\", r"\\server\share\dir"),
+            ("//server/share/dir", r"\\server\share\dir"),
+            ("//server/share/dir/", r"\\server\share\dir"),
+            (r"\\server/share\dir", r"\\server\share\dir"),
+            (r"\\server\share", r"\\server\share\"),
+            (r"\\server\share\", r"\\server\share\"),
+            ("//server/share", r"\\server\share\"),
+            ("//server/share/", r"\\server\share\"),
+            // A verbatim prefix takes its text literally.
+            (r"\\?\D:\Music", r"\\?\D:\Music"),
+            (r"\\?\UNC\server\share\dir", r"\\?\UNC\server\share\dir"),
+        ];
+        for (spelled, stored) in table {
+            assert_eq!(
+                one_spelling(Path::new(spelled)).to_str(),
+                Some(stored),
+                "{spelled}"
+            );
+        }
+    }
+
+    /// A chart directly in a share root has the root's own text as its folder,
+    /// which is what a level and a count read.
+    #[cfg(windows)]
+    #[test]
+    fn a_share_roots_spelling_is_its_charts_folder() {
+        let root = one_spelling(Path::new("//server/share"));
+        let chart = root.join("a.bms");
+        assert_eq!(
+            chart.parent().and_then(Path::to_str),
+            root.to_str(),
+            "{chart:?}"
+        );
     }
 }
