@@ -6888,7 +6888,8 @@ pub(crate) mod tests {
         staged: Option<(ScreenKind, render::Installation)>,
         /// Each kind's installation committed or restored.
         installed: super::Committed,
-        /// The request whose staging is held unanswered (`hold_staged`).
+        /// The request whose staging is held unanswered
+        /// (`hold_staged`).
         held: Option<u64>,
     }
 
@@ -6919,8 +6920,10 @@ pub(crate) mod tests {
             if self.shared.hold.load(Ordering::Acquire) {
                 return None;
             }
+            // Read once: the request whose preparation stages and holds.
+            let hold = self.shared.hold_staged.load(Ordering::Acquire) == request;
             // Staged already and held: asked again, still no answer.
-            if self.held == Some(request) && self.shared.hold_staged.load(Ordering::Acquire) {
+            if hold && self.held == Some(request) {
                 return None;
             }
             // Without a skin chosen, the installation in use draws.
@@ -6939,7 +6942,7 @@ pub(crate) mod tests {
                 *self.shared.staging.lock().unwrap() = Some(Arc::clone(skin));
             }
             // A screen may stage and answer later.
-            if self.shared.hold_staged.load(Ordering::Acquire) {
+            if hold {
                 self.held = Some(request);
                 return None;
             }
@@ -7154,8 +7157,9 @@ pub(crate) mod tests {
         /// The skin an attempt's preparation staged and neither committed
         /// nor discarded, on the screen built last.
         staging: Arc<std::sync::Mutex<Option<Arc<render::SkinBundle>>>>,
-        /// Preparations stage, then do not answer, while set.
-        hold_staged: Arc<AtomicBool>,
+        /// The request whose preparation stages, then does not answer; 0
+        /// for none.
+        hold_staged: Arc<std::sync::atomic::AtomicU64>,
     }
 
     impl Installers {
@@ -7376,8 +7380,9 @@ pub(crate) mod tests {
         for next_in_use in [true, false] {
             let (chart, screens, link) = pending_link();
             let (held, next) = (bundle(), bundle());
-            screens.hold_staged.store(true, Ordering::Release);
             let request = link.requests.fetch_add(1, Ordering::Relaxed) + 1;
+            // Held through the successor: it never answers by itself.
+            screens.hold_staged.store(request, Ordering::Release);
             let (reply, rx) = std::sync::mpsc::sync_channel(1);
             link.send(RenderMsg::PrepareAttempt {
                 request,
@@ -7386,7 +7391,6 @@ pub(crate) mod tests {
                 reply,
             });
             assert!(wait_until(|| screens.staging.lock().unwrap().is_some()));
-            screens.hold_staged.store(false, Ordering::Release);
             if next_in_use {
                 let answer = link.prepare_attempt(titled(&chart), || false).unwrap();
                 let Preparation::Refused(why) = answer else {
@@ -7398,18 +7402,23 @@ pub(crate) mod tests {
                     specialized(&link, &chart, &next).unwrap(),
                     Preparation::Ready
                 );
-                link.commit_attempt().unwrap();
-                assert!(installed_is(&screens, &next));
             }
             let older = rx.recv_timeout(Duration::from_secs(10)).unwrap().unwrap();
             let Preparation::Refused(why) = older else {
                 panic!("{older:?}");
             };
             assert_eq!(why.reason, "a newer request superseded it");
-            assert!(
-                screens.staging.lock().unwrap().is_none(),
-                "next in use {next_in_use}"
-            );
+            // Nothing of the held one stays staged.
+            let staged = screens.staging.lock().unwrap().clone();
+            if next_in_use {
+                assert!(staged.is_none());
+            } else {
+                assert!(staged.is_some_and(|s| Arc::ptr_eq(&s, &next)));
+                link.commit_attempt().unwrap();
+                assert!(installed_is(&screens, &next));
+                assert!(screens.staging.lock().unwrap().is_none());
+            }
+            screens.hold_staged.store(0, Ordering::Release);
             if next_in_use {
                 assert!(screens.play().is_none());
             }
