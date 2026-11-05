@@ -8,7 +8,7 @@
 
 use bms_model::TimeUs;
 
-use crate::{Blend, ChartText, Filter, QuadBatch, Skin, UvTable};
+use crate::{Blend, ChartText, ClipId, Filter, QuadBatch, Skin, UvTable};
 
 /// Why an element drew what it drew, at the point [`Skin::draw`](crate::Skin)
 /// stopped with it.
@@ -58,17 +58,20 @@ pub struct ListedElement {
 }
 
 /// Where a quad's texels come from, by the sheet.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum QuadSource {
-    /// A frame of an image of a file: the file's name and the frame's
-    /// rectangle in its 1x pixels.
+    /// A part of a frame of an image of a file: the file's name and the
+    /// part the quad samples, in the file's 1x pixels, with its mirroring.
     File {
         /// The frame's index in the uv table.
         frame: u32,
         /// The file's name, relative to the skin's folder.
         name: String,
-        /// Left, top, width, height.
-        rect: [u32; 4],
+        /// Left, top, width, height: the whole frame, or the part a crop or
+        /// a glyph samples.
+        rect: [f32; 4],
+        /// Whether it is sampled mirrored across, and up and down.
+        flip: [bool; 2],
     },
     /// A generated image of one colour.
     Solid {
@@ -99,6 +102,9 @@ pub struct ListedQuad {
     pub blend: Blend,
     /// Its run's clip, by index in the skin's clip table.
     pub clip: Option<u16>,
+    /// Its run's clip's rectangle on the canvas, as the clip table the
+    /// frame drew with gives it; `None` without a clip, or past the table.
+    pub clip_geometry: Option<[f32; 4]>,
     /// The clip rect its run carries.
     pub clip_rect: Option<[f32; 4]>,
     /// How the atlas is sampled.
@@ -125,13 +131,16 @@ pub struct DisplayList {
 
 impl Skin {
     /// `batch`, as this skin's [`Skin::build`] left it, as a list. `chart`
-    /// gives its text elements' strings. Allocates; only a capture calls it.
+    /// gives its text elements' strings and `clips` its fixed clips'
+    /// rectangles, as the installation drawing it has them. Allocates; only
+    /// a capture calls it.
     #[must_use]
     pub fn display_list(
         &self,
         batch: &QuadBatch,
         uvs: &UvTable,
         chart: &ChartText<'_>,
+        clips: &dyn Fn(ClipId) -> Option<[f32; 4]>,
     ) -> DisplayList {
         let observations = batch.observations();
         let end = batch.observation_end();
@@ -155,6 +164,7 @@ impl Skin {
                     color: q.color,
                     blend: run.key.blend,
                     clip: run.key.clip.map(|c| c.0),
+                    clip_geometry: run.key.clip.and_then(clips),
                     clip_rect: run.clip_rect.map(crate::ClipRect::rect),
                     filter: q.filter,
                     source: self.quad_source(uvs, q.layer, q.uv),
@@ -176,18 +186,54 @@ impl Skin {
         }
     }
 
-    /// The sheet's frame holding the centre of `uv` on `layer`.
+    /// The part of the sheet's frame holding the centre of `uv` on `layer`
+    /// that `uv` samples: both its corners taken back through the frame's
+    /// place in the atlas to its cell, so a crop, a glyph and a mirror stay
+    /// what they are.
     fn quad_source(&self, uvs: &UvTable, layer: u16, uv: [f32; 4]) -> QuadSource {
         let [l, t, r, b] = uv;
         let (x, y) = (f32::midpoint(l, r), f32::midpoint(t, b));
-        uvs.frames()
-            .iter()
-            .position(|f| {
+        let found = uvs.frames().iter().enumerate().find(|(_, f)| {
+            let [fl, ft, fr, fb] = f.uv;
+            f.layer == layer && fl <= x && x <= fr && ft <= y && y <= fb
+        });
+        let Some((i, f)) = found else {
+            return QuadSource::Other;
+        };
+        let Some(frame) = u32::try_from(i).ok() else {
+            return QuadSource::Other;
+        };
+        match self.sheet().frame_source(frame) {
+            Some(Cell::File { name, rect }) => {
                 let [fl, ft, fr, fb] = f.uv;
-                f.layer == layer && fl <= x && x <= fr && ft <= y && y <= fb
-            })
-            .and_then(|i| u32::try_from(i).ok())
-            .and_then(|frame| self.sheet().frame_source(frame))
-            .unwrap_or(QuadSource::Other)
+                let [cx, cy, cw, ch] = rect.map(|v| v as f32);
+                let across = |u: f32| cx + (u - fl) / (fr - fl) * cw;
+                let down = |v: f32| cy + (v - ft) / (fb - ft) * ch;
+                let (x0, x1, y0, y1) = (across(l), across(r), down(t), down(b));
+                // To a thousandth of a pixel, the most an `f32` uv says.
+                let round = |v: f32| (v * 1000.0).round() / 1000.0;
+                QuadSource::File {
+                    frame,
+                    name,
+                    rect: [
+                        round(x0.min(x1)),
+                        round(y0.min(y1)),
+                        round((x1 - x0).abs()),
+                        round((y1 - y0).abs()),
+                    ],
+                    flip: [x1 < x0, y1 < y0],
+                }
+            }
+            Some(Cell::Solid(color)) => QuadSource::Solid { frame, color },
+            None => QuadSource::Other,
+        }
     }
+}
+
+/// What a frame's cell is, by the sheet.
+pub(crate) enum Cell {
+    /// A file's name and the cell's rectangle in its 1x pixels.
+    File { name: String, rect: [u32; 4] },
+    /// A generated colour.
+    Solid([u8; 4]),
 }

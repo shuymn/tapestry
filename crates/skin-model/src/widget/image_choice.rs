@@ -136,12 +136,14 @@ impl ImageChoice {
         }
     }
 
-    /// The index of the entry `state` selects, as [`select`](Self::select)
-    /// finds it.
+    /// The index of `part`, an entry [`select`](Self::select) returned,
+    /// found by identity: its value is not evaluated again.
     #[cfg(feature = "dev-tools")]
-    pub(crate) fn selected(&self, state: &State<'_>) -> Option<u32> {
-        let v = usize::try_from(self.value.eval(state)).ok()?;
-        let at = if v < self.parts.len() { v } else { 0 };
+    pub(crate) fn index_of(&self, part: &ChoicePart) -> Option<u32> {
+        let at = self
+            .parts
+            .iter()
+            .position(|p| p.as_ref().is_some_and(|p| std::ptr::eq(p, part)))?;
         u32::try_from(at).ok()
     }
 }

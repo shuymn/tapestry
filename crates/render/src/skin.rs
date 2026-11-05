@@ -158,8 +158,12 @@ pub trait PlaySkin: Send {
     /// What `batch`, this skin's last build, holds as a list; `None` for a
     /// skin that keeps no observations (dev-tools: a scenario's captures).
     #[cfg(feature = "dev-tools")]
-    fn display_list(&self, batch: &skin_model::QuadBatch) -> Option<skin_model::DisplayList> {
-        let _ = batch;
+    fn display_list(
+        &self,
+        batch: &skin_model::QuadBatch,
+        clips: &crate::ClipTable,
+    ) -> Option<skin_model::DisplayList> {
+        let _ = (batch, clips);
         None
     }
 

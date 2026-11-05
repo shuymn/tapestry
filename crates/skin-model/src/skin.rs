@@ -2206,7 +2206,7 @@ impl Skin {
                         continue;
                     };
                     #[cfg(feature = "dev-tools")]
-                    out.observed_choice(self.image_choices.get(i).and_then(|c| c.selected(state)));
+                    out.observed_choice(self.image_choices.get(i).and_then(|c| c.index_of(p)));
                     Some(p)
                 }
                 None => None,

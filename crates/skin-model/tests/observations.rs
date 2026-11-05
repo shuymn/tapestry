@@ -213,7 +213,7 @@ fn a_display_list_attributes_quads_and_their_sources() {
     };
     assert!(h.batch.push(key, Quad::default()));
     let chart = ChartText::default();
-    let list = h.skin.display_list(&h.batch, &h.uvs, &chart);
+    let list = h.skin.display_list(&h.batch, &h.uvs, &chart, &|_| None);
     assert_eq!(list.element_count, 8);
     assert_eq!(list.observations_dropped, 0);
     assert_eq!(list.quads.len(), skin_quads + 1);
@@ -225,12 +225,83 @@ fn a_display_list_attributes_quads_and_their_sources() {
         panic!("{first:?}");
     };
     assert_eq!(name, &format!("{TEN}.png"));
-    assert_eq!(rect[2..], [2, 3]);
+    assert_eq!(rect[2..], [2.0, 3.0]);
     assert!(list.quads.iter().any(|q| q.element == Some(3)));
     // The quad pushed after the elements is nobody's.
     let last = list.quads.last().unwrap();
     assert_eq!(last.element, None);
     assert_eq!(last.blend, Blend::Add);
+}
+
+/// A quad sampling part of a frame, as a crop or a glyph does, is listed
+/// with that part, and one sampling it mirrored says so.
+#[test]
+fn a_listed_source_is_the_part_sampled_and_its_mirroring() {
+    let mut h = harness(outcomes());
+    h.frame(250, &[]);
+    let first = h.batch.quads()[0];
+    let [l, t, r, b] = first.uv;
+    let key = RunKey {
+        blend: Blend::Alpha,
+        clip: None,
+    };
+    h.batch.open_reserve();
+    // The right half, then the whole frame mirrored across.
+    let crop = Quad {
+        uv: [f32::midpoint(l, r), t, r, b],
+        ..first
+    };
+    let mirror = Quad {
+        uv: [r, t, l, b],
+        ..first
+    };
+    assert!(h.batch.push(key, crop));
+    assert!(h.batch.push(key, mirror));
+    let list = h
+        .skin
+        .display_list(&h.batch, &h.uvs, &ChartText::default(), &|_| None);
+    let source = |i: usize| list.quads[list.quads.len() - 2 + i].source.clone();
+    let QuadSource::File { rect: whole, .. } = list.quads[0].source.clone() else {
+        panic!();
+    };
+    let QuadSource::File { rect, flip, .. } = source(0) else {
+        panic!();
+    };
+    assert_eq!(
+        rect,
+        [
+            whole[0] + whole[2] / 2.0,
+            whole[1],
+            whole[2] / 2.0,
+            whole[3]
+        ]
+    );
+    assert_eq!(flip, [false, false]);
+    let QuadSource::File { rect, flip, .. } = source(1) else {
+        panic!();
+    };
+    assert_eq!(rect, whole);
+    assert_eq!(flip, [true, false]);
+}
+
+/// A quad's fixed clip is listed with the rectangle the installation that
+/// drew it gives that clip: one clip id, two tables, one of them empty.
+#[test]
+fn a_listed_clip_has_its_installations_rectangle() {
+    let clipped = ElementDef {
+        clip: Some(skin_model::ClipId(0)),
+        ..image(TEN)
+    };
+    let mut h = harness(load(vec![clipped], WidgetDefs::default()).unwrap());
+    h.frame(250, &[]);
+    let chart = ChartText::default();
+    for table in [[0.0, 0.0, 960.0, 1080.0], [100.0, 0.0, 0.0, 1080.0]] {
+        let list = h
+            .skin
+            .display_list(&h.batch, &h.uvs, &chart, &|id| (id.0 == 0).then_some(table));
+        let q = list.quads.first().unwrap();
+        assert_eq!((q.clip, q.clip_geometry), (Some(0), Some(table)));
+    }
 }
 
 /// A batch of too few places counts what it could not observe, and what it

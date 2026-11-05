@@ -1490,10 +1490,16 @@ fn display_list_lines(list: &skin_model::DisplayList, drawn: &Drawn<'_>) -> Resu
     }
     for (seq, q) in list.quads.iter().enumerate() {
         let source = match &q.source {
-            QuadSource::File { frame, name, rect } => format!(
-                "\"frame\":{frame},\"file\":{},\"src\":{}",
+            QuadSource::File {
+                frame,
+                name,
+                rect,
+                flip,
+            } => format!(
+                "\"frame\":{frame},\"file\":{},\"src\":{},\"flip\":{}",
                 json_string(name),
-                json_array(rect)
+                json_array(rect),
+                json_array(flip)
             ),
             QuadSource::Solid { frame, color } => {
                 format!("\"frame\":{frame},\"solid\":{}", json_array(color))
@@ -1503,7 +1509,7 @@ fn display_list_lines(list: &skin_model::DisplayList, drawn: &Drawn<'_>) -> Resu
         let _ = writeln!(
             out,
             "{{\"seq\":{seq},\"element_of\":{},\"rect\":{},\"pivot\":{},\"angle\":{},\"color\":{},\
-             \"blend\":\"{}\",\"clip\":{},\"clip_rect\":{},\"filter\":\"{:?}\",{source}}}",
+             \"blend\":\"{}\",\"clip\":{},\"clip_geometry\":{},\"clip_rect\":{},\"filter\":\"{:?}\",{source}}}",
             opt(q.element.map(i64::from)),
             json_array(&q.rect),
             json_array(&q.pivot),
@@ -1514,6 +1520,8 @@ fn display_list_lines(list: &skin_model::DisplayList, drawn: &Drawn<'_>) -> Resu
                 Blend::Add => "add",
             },
             opt(q.clip.map(i64::from)),
+            q.clip_geometry
+                .map_or_else(|| "null".to_owned(), |r| json_array(&r)),
             q.clip_rect
                 .map_or_else(|| "null".to_owned(), |r| json_array(&r)),
             q.filter,

@@ -734,7 +734,11 @@ impl PlaySkin for DeclSkin {
     }
 
     #[cfg(feature = "dev-tools")]
-    fn display_list(&self, batch: &skin_model::QuadBatch) -> Option<skin_model::DisplayList> {
+    fn display_list(
+        &self,
+        batch: &skin_model::QuadBatch,
+        clips: &ClipTable,
+    ) -> Option<skin_model::DisplayList> {
         let [title, subtitle, artist, subartist, genre] = &self.labels;
         let chart = skin_model::ChartText {
             title,
@@ -746,7 +750,7 @@ impl PlaySkin for DeclSkin {
         Some(
             self.bundle
                 .skin
-                .display_list(batch, &self.bundle.uvs, &chart),
+                .display_list(batch, &self.bundle.uvs, &chart, &|id| clips.get(id)),
         )
     }
 
