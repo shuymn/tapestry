@@ -356,6 +356,9 @@ pub(crate) struct Cx<'d> {
     /// Image selectors compiled once, by source; each copy kept is
     /// charged.
     selectors: HashMap<String, Program>,
+    /// The destination being read, for the conversion report's records.
+    #[cfg(feature = "dev-tools")]
+    element: Option<crate::lua::survey::Element>,
 }
 
 /// A witness of the order of an import's work.
@@ -432,6 +435,8 @@ impl<'d> Cx<'d> {
             judges: Vec::new(),
             cycled: BTreeSet::new(),
             selectors: HashMap::new(),
+            #[cfg(feature = "dev-tools")]
+            element: None,
         };
         cx.budget.usage.resolved_digit_offsets =
             u32::try_from(cx.tables.digit_offsets.len()).unwrap_or(u32::MAX);
@@ -807,6 +812,14 @@ impl<'d> Cx<'d> {
         #[cfg(test)]
         trace(Event::Charge);
         let (id, dst) = self.read_dst(index, rec)?;
+        #[cfg(feature = "dev-tools")]
+        {
+            self.element = Some(crate::lua::survey::Element {
+                index,
+                id: id.clone(),
+                kind: None,
+            });
+        }
         let Some(id) = id else {
             self.ignored(at, NoteKind::UndefinedObject);
             return Ok(());
@@ -816,6 +829,10 @@ impl<'d> Cx<'d> {
         if let Ok(n) = id.parse::<i32>()
             && n < 0
         {
+            #[cfg(feature = "dev-tools")]
+            if let Some(e) = &mut self.element {
+                e.kind = Some("SystemImage".to_owned());
+            }
             return self.system(dst, n);
         }
         let role = Role::Decorative.or_failure(dst.failure);
@@ -823,6 +840,10 @@ impl<'d> Cx<'d> {
             self.ignored(at, NoteKind::UndefinedObject);
             return Ok(());
         };
+        #[cfg(feature = "dev-tools")]
+        if let Some(e) = &mut self.element {
+            e.kind = Some(format!("{object:?}"));
+        }
         // The source draws the character when its file exists and the
         // notes otherwise: one id cannot be both.
         if object == Object::PmChara

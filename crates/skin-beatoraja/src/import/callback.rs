@@ -98,6 +98,10 @@ pub(crate) struct Lowered {
     /// The critical part a read shows.
     pub(crate) part: Option<CriticalPart>,
     pub(crate) deviates: bool,
+    /// Whether its residual folded to a known value, for the conversion
+    /// report.
+    #[cfg(feature = "dev-tools")]
+    pub(crate) constant: bool,
 }
 
 /// A number's resolved value: a property's or a callback's.
@@ -220,6 +224,8 @@ impl<'a> Lower<'a> {
                 guards: Vec::new(),
                 part: None,
                 deviates: false,
+                #[cfg(feature = "dev-tools")]
+                constant: false,
             },
             mapped: HashMap::new(),
             memo: HashMap::new(),
@@ -293,6 +299,10 @@ impl Lower<'_> {
             }
         }
         self.emit(res, res.root)?;
+        #[cfg(feature = "dev-tools")]
+        {
+            self.out.constant = matches!(res.node(res.root), Node::Known(_));
+        }
         let (src, ty) = match (self.memo.get(&res.root), conv) {
             (Some(V::Bool(s)), Conv::Truthy) => (s, Ty::Bool),
             (Some(V::Int { src, .. }), Conv::Int) => (src, Ty::Int),
@@ -999,10 +1009,28 @@ impl Cx<'_> {
     /// record with `why` it did not lower.
     fn outcome(
         &self,
+        at: (u32, u32),
+        field: &'static str,
+        role: Role,
+        d: (Disposition, Option<Unsupported>),
+    ) {
+        self.record(at, field, role, d, None);
+    }
+
+    /// [`Self::outcome`] of callable `c` at node `id`, lowered to `l`.
+    fn lowered_outcome(&self, at: (u32, u32), field: &'static str, role: Role, l: &Lowered) {
+        self.record(at, field, role, (Disposition::Lowered, None), Some(l));
+    }
+
+    /// [`Self::outcome`]'s work, with what the callback lowered to, if it
+    /// did, for the report.
+    fn record(
+        &self,
         (c, id): (u32, u32),
         field: &'static str,
         role: Role,
         (d, why): (Disposition, Option<Unsupported>),
+        lowered: Option<&Lowered>,
     ) {
         let Some(an) = self.analysis() else {
             return;
@@ -1020,9 +1048,15 @@ impl Cx<'_> {
                 },
                 disposition: d,
                 why,
+                element: self.element.clone(),
+                lowered: lowered.map(|l| crate::lua::survey::Lowered {
+                    src: l.src.clone(),
+                    guards: l.guards.clone(),
+                    constant: l.constant,
+                }),
             });
         #[cfg(not(feature = "dev-tools"))]
-        let _ = (id, field, role, why);
+        let _ = (id, field, role, why, lowered);
     }
 
     /// Records why the callback at node `id`, read, was not consumed:
@@ -1239,7 +1273,7 @@ impl Cx<'_> {
         let critical = role != Role::Decorative;
         let why = match self.lower(id, Conv::Truthy) {
             Ok(Lowering::Lowered(l)) => {
-                self.outcome((c, id), field, role, (Disposition::Lowered, None));
+                self.lowered_outcome((c, id), field, role, &l);
                 #[cfg(test)]
                 LOWERED.with(|w| {
                     let mut all: Vec<String> = l.guards.iter().map(|g| (*g).to_owned()).collect();
@@ -1295,12 +1329,7 @@ impl Cx<'_> {
         let c = self.callable_at(id).map_or(NONE, |(c, _)| c);
         let (why, scan) = match self.lower(id, Conv::Int) {
             Ok(Lowering::Lowered(l)) => {
-                self.outcome(
-                    (c, id),
-                    "value",
-                    l.part.map_or(base, Role::Critical),
-                    (Disposition::Lowered, None),
-                );
+                self.lowered_outcome((c, id), "value", l.part.map_or(base, Role::Critical), &l);
                 #[cfg(test)]
                 LOWERED.with(|w| w.borrow_mut().push(l.src.clone()));
                 #[cfg(test)]

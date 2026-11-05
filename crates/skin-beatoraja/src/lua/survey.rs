@@ -3,7 +3,9 @@
 //! allowlisted labels. Nothing the skin wrote reaches it: no source,
 //! name, path, string, generated definition or Lua error, only the
 //! importer's own labels, the host API names of [`HOST_APIS`], numbers,
-//! and module indices in place of file names.
+//! and module indices in place of file names. The one exception is a
+//! survey asked for developer-local detail ([`Local`]), whose output
+//! stays on the developer's PC.
 
 use std::collections::BTreeMap;
 
@@ -91,6 +93,44 @@ pub struct Consumer {
     /// `never read by the source` when it is inert, or `reached through a
     /// root` when a root captures it.
     pub reason: Option<String>,
+    /// What the skin wrote about it, only when [`survey`] is asked for
+    /// developer-local detail.
+    pub local: Option<Local>,
+}
+
+/// A record's developer-local detail (docs/stage3.md §3, the conversion
+/// report): names and source the skin wrote, which never leave the
+/// developer's PC.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Local {
+    /// Its file, relative to the skin folder.
+    pub file: String,
+    /// The destination it was consumed for: its index in the destination
+    /// list, its `id` and what that names; `None` when never consumed.
+    pub element: Option<Element>,
+    /// What it lowered to, when it lowered.
+    pub lowered: Option<Lowered>,
+}
+
+/// The destination a callback was consumed for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Element {
+    /// Its index in the destination list.
+    pub index: usize,
+    /// Its `id`, when it has one.
+    pub id: Option<String>,
+    /// The kind of object its `id` names, when it was looked up.
+    pub kind: Option<String>,
+}
+
+/// A lowered callback's generated expression.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Lowered {
+    pub src: String,
+    /// The availability guards of its reads, in order.
+    pub guards: Vec<&'static str>,
+    /// Whether it folded to a known value, which `src` writes.
+    pub constant: bool,
 }
 
 /// What an import's analysis recorded for the report.
@@ -124,7 +164,8 @@ fn effects(arena: &Arena, an: &Analysis) -> Option<(String, Option<Loc>)> {
 
 /// The records of `arena`'s callbacks after an import ([`Records`]);
 /// `completed` when the import finished, so that a callback it never read
-/// was in a field no consumer reads.
+/// was in a field no consumer reads. The consumed records are taken out
+/// of `an`.
 pub(crate) fn records(arena: &Arena, an: &Analysis, completed: bool) -> Records {
     Records {
         consumers: consumers(arena, an, completed),
@@ -134,7 +175,7 @@ pub(crate) fn records(arena: &Arena, an: &Analysis, completed: bool) -> Records 
 
 fn consumers(arena: &Arena, an: &Analysis, completed: bool) -> Vec<(Loc, Consumer)> {
     let mut out = Vec::new();
-    for c in an.consumed.borrow().iter() {
+    for c in an.consumed.take() {
         out.push((
             arena.loc(c.node),
             Consumer {
@@ -145,6 +186,11 @@ fn consumers(arena: &Arena, an: &Analysis, completed: bool) -> Vec<(Loc, Consume
                     .map_or_else(|| "decorative".to_owned(), |p| format!("critical {p:?}")),
                 disposition: disposition(&c.disposition),
                 reason: c.why.as_ref().map(unsupported),
+                local: Some(Local {
+                    file: String::new(),
+                    element: c.element,
+                    lowered: c.lowered,
+                }),
             },
         ));
     }
@@ -177,6 +223,7 @@ fn consumers(arena: &Arena, an: &Analysis, completed: bool) -> Vec<(Loc, Consume
                 role: "-".to_owned(),
                 disposition: disposition(&d),
                 reason: Some(reason.to_owned()),
+                local: Some(Local::default()),
             },
         ));
     }
@@ -302,9 +349,16 @@ fn at_of(e: &ImportError) -> Option<&Loc> {
 /// kind its header pass gives (`facts.scene` is not read), counts the
 /// functions its configured definition holds and imports it, keeping what
 /// the candidate used and consulted however far it got, and reports only
-/// allowlisted labels and numbers.
+/// allowlisted labels and numbers, unless `local` asks for each record's
+/// developer-local detail ([`Consumer::local`]).
 #[must_use]
-pub fn survey(root: &Path, entry: &str, facts: &ImportFacts, cancel: &Cancel) -> Survey {
+pub fn survey(
+    root: &Path,
+    entry: &str,
+    facts: &ImportFacts,
+    cancel: &Cancel,
+    local: bool,
+) -> Survey {
     let header = header_pass(root, entry, cancel);
     let h = match header.result {
         Ok(h) => h,
@@ -366,6 +420,10 @@ pub fn survey(root: &Path, entry: &str, facts: &ImportFacts, cancel: &Cancel) ->
         .into_iter()
         .map(|(at, c)| Consumer {
             at: locate(Some(&at), &o.dependencies),
+            local: c.local.filter(|_| local).map(|l| Local {
+                file: at.file.clone(),
+                ..l
+            }),
             ..c
         })
         .collect();
@@ -392,7 +450,7 @@ pub fn survey(root: &Path, entry: &str, facts: &ImportFacts, cancel: &Cancel) ->
 
 #[cfg(test)]
 mod tests {
-    use super::{Cancel, ImportFacts, survey};
+    use super::{Cancel, Element, ImportFacts, Local, Lowered, survey};
     use skin_model::ScreenKind;
 
     fn folder(files: &[(&str, &str)]) -> tempfile::TempDir {
@@ -431,6 +489,7 @@ mod tests {
             "s.luaskin",
             &ImportFacts::unavailable(ScreenKind::Play),
             &Cancel::new(),
+            false,
         );
         assert_eq!(s.outcome, "imported");
         let got: Vec<_> = s
@@ -498,6 +557,138 @@ mod tests {
     }
 
     #[test]
+    fn local_detail_names_the_file_element_and_lowered_expression_only_when_asked() {
+        let entry = "local skin = { type = 0, name = \"t\", w = 1920, h = 1080 }\n\
+             if not skin_config then return skin end\n\
+             local ms = require(\"main_state\")\n\
+             local m = require(\"parts.m\")\n\
+             skin.source = { { id = \"a\", path = \"a.png\" } }\n\
+             skin.image = { { id = \"i\", src = \"a\", x = 0, y = 0, w = 64, h = 64 } }\n\
+             skin.gauge = { id = \"g\", nodes = { \"i\", \"i\", \"i\", \"i\" }, parts = 10 }\n\
+             skin.destination = {\n\
+               { id = \"i\", draw = m.draw, dst = { { w = 64, h = 64 } } },\n\
+               { id = \"i\", draw = function() return 1 > 0 end, dst = { { w = 64, h = 64 } } },\n\
+               { id = \"g\", draw = function() return ms.gauge_type() == 4 end, dst = { { w = 64, h = 64 } } },\n\
+               { id = \"odd\", dst = { { w = 6, h = 6 } } },\n\
+             }\n\
+             skin.value = {\n\
+               { id = \"odd\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, digit = 4, value = function() return ms.number(425) end },\n\
+             }\n\
+             return skin\n";
+        let d = crate::lua::callback_tests::folder(entry);
+        std::fs::create_dir(d.path().join("parts")).unwrap();
+        std::fs::write(
+            d.path().join("parts").join("m.lua"),
+            "local ms = require(\"main_state\")\n\
+             return { draw = function() return ms.number(425) > 0 end }\n",
+        )
+        .unwrap();
+        let run = |local| {
+            survey(
+                d.path(),
+                "s.luaskin",
+                &ImportFacts::unavailable(ScreenKind::Play),
+                &Cancel::new(),
+                local,
+            )
+        };
+        let s = run(true);
+        assert_eq!(s.outcome, "imported");
+        let element = |index, id: &str, kind: &str| {
+            Some(Element {
+                index,
+                id: Some(id.to_owned()),
+                kind: Some(kind.to_owned()),
+            })
+        };
+        let lowered = |src: &str, guards: &[&'static str], constant| {
+            Some(Lowered {
+                src: src.to_owned(),
+                guards: guards.to_vec(),
+                constant,
+            })
+        };
+        let got: Vec<_> = s
+            .consumers
+            .iter()
+            .map(|c| (c.disposition.as_str(), c.local.clone()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (
+                    "replaced Unmapped main_state.number 425",
+                    Some(Local {
+                        file: "parts/m.lua".to_owned(),
+                        element: element(0, "i", "Image"),
+                        lowered: None,
+                    })
+                ),
+                (
+                    "lowered",
+                    Some(Local {
+                        file: "s.luaskin".to_owned(),
+                        element: element(1, "i", "Image"),
+                        lowered: lowered("true", &[], true),
+                    })
+                ),
+                (
+                    "lowered",
+                    Some(Local {
+                        file: "s.luaskin".to_owned(),
+                        element: element(2, "g", "Gauge"),
+                        lowered: lowered("(gauge.kind == ex_hard)", &["gauge.valid"], false),
+                    })
+                ),
+                (
+                    "replaced Unmapped main_state.number 425",
+                    Some(Local {
+                        file: "s.luaskin".to_owned(),
+                        element: element(3, "odd", "Value"),
+                        lowered: None,
+                    })
+                ),
+            ]
+        );
+        // Without the request, no record carries any of it.
+        let s = run(false);
+        assert_eq!(s.consumers.len(), 4);
+        assert!(s.consumers.iter().all(|c| c.local.is_none()));
+    }
+
+    #[test]
+    fn a_system_image_s_callback_names_its_kind() {
+        let entry = "local skin = { type = 0, name = \"t\", w = 1920, h = 1080 }\n\
+             if not skin_config then return skin end\n\
+             skin.destination = {\n\
+               { id = -110, draw = function() return true end, dst = { { w = 64, h = 64 } } },\n\
+             }\n\
+             return skin\n";
+        let d = crate::lua::callback_tests::folder(entry);
+        let s = survey(
+            d.path(),
+            "s.luaskin",
+            &ImportFacts::unavailable(ScreenKind::Play),
+            &Cancel::new(),
+            true,
+        );
+        assert_eq!(s.outcome, "imported");
+        let elements: Vec<_> = s
+            .consumers
+            .iter()
+            .map(|c| c.local.as_ref().and_then(|l| l.element.clone()))
+            .collect();
+        assert_eq!(
+            elements,
+            [Some(Element {
+                index: 0,
+                id: Some("-110".to_owned()),
+                kind: Some("SystemImage".to_owned()),
+            })]
+        );
+    }
+
+    #[test]
     fn a_callback_an_import_never_reached_is_not_called_unconsumed() {
         // The import refuses a mixed destination list after admission: it
         // never reads the classified action.
@@ -512,6 +703,7 @@ mod tests {
             "s.luaskin",
             &ImportFacts::unavailable(ScreenKind::Play),
             &Cancel::new(),
+            false,
         );
         assert_eq!(s.outcome, "lua Mixed");
         assert_eq!(s.effects, "open Construct an unread entry");
@@ -534,6 +726,7 @@ mod tests {
             "s.luaskin",
             &ImportFacts::unavailable(ScreenKind::Play),
             &Cancel::new(),
+            false,
         );
         assert_eq!(s.outcome, "lua Error");
         assert_eq!(s.modules, 2);
@@ -552,6 +745,7 @@ mod tests {
             "s.luaskin",
             &ImportFacts::unavailable(ScreenKind::Play),
             &Cancel::new(),
+            false,
         );
         assert_eq!(s.outcome, "header lua Sparse");
         let (module, line, col) = s.at.unwrap();
@@ -572,6 +766,7 @@ return { type = 0 }",
             "s.luaskin",
             &ImportFacts::unavailable(ScreenKind::Play),
             &Cancel::new(),
+            false,
         );
         assert_eq!(crate::lua::tests::PASSES.with(std::cell::Cell::get), 2);
         assert!(s.usage.instructions >= 4_000_000 && s.usage.instructions < 5_000_000);
@@ -591,6 +786,7 @@ return { type = 0 }",
             "s.luaskin",
             &ImportFacts::unavailable(ScreenKind::Play),
             &Cancel::new(),
+            false,
         );
         let kinds: Vec<(&str, u32)> = s
             .callables
@@ -616,6 +812,7 @@ return { type = 0 }",
             "s.luaskin",
             &ImportFacts::unavailable(ScreenKind::Play),
             &Cancel::new(),
+            false,
         );
         assert_eq!(s.outcome, "header include cycle");
         assert_eq!(
@@ -634,6 +831,7 @@ return { type = 0 }",
                 "s.luaskin",
                 &ImportFacts::unavailable(ScreenKind::Result),
                 &Cancel::new(),
+                false,
             )
         };
         let s = run("return { type = 1 }");
