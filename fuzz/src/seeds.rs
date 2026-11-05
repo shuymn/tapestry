@@ -991,7 +991,13 @@ end, dst = { { w = 10, h = 10 } } }
 skin.value = { { id = "v", src = "s", w = 100, h = 10, divx = 10, digit = 2, value = function()
   return ms.number(106) - (ms.number(110) + ms.number(111)) * 2
 end } }
-skin.destination[3] = { id = "v", dst = { { w = 10, h = 10 } } }"#,
+skin.destination[3] = { id = "v", dst = { { w = 10, h = 10 } } }
+skin.destination[4] = { id = "i", draw = function()
+  return ms.judge(4) + ms.number(427) > 0 and ms.option(2242) and ms.option(2243)
+    and not ms.option(2244) or ms.option(2245)
+end, dst = { { w = 10, h = 10 } } }
+skin.imageset = { { id = "c", images = { "i", "i" }, value = function() return ms.gauge_type() end } }
+skin.destination[5] = { id = "c", dst = { { w = 10, h = 10 } } }"#,
     );
     let replaced = lua_skin(
         r#"local ms = require("main_state")

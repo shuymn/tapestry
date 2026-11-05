@@ -1168,7 +1168,7 @@ fn skin_lua_seeds_import_or_fail_as_built() {
                 let (_, imported) = result.unwrap_or_else(|e| panic!("{name}: {e}"));
                 let i = imported_lua(imported).unwrap_or_else(|e| panic!("{name}: {e:?}"));
                 let want: &[Disposition] = match name {
-                    "callback_lowered" => &[Disposition::Lowered, Disposition::Lowered],
+                    "callback_lowered" => &[Disposition::Lowered; 4],
                     // A decorative writer never lowers.
                     "callback_effect" => &[Disposition::Replaced(Unsupported::Writes)],
                     _ => &[Disposition::Replaced(Unsupported::Unmapped {
