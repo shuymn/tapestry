@@ -1752,20 +1752,29 @@ impl FrameDump {
         }
     }
 
-    fn save(&self, screen: &dyn Screen, name: &str) {
-        let path = self.dir.join(name);
+    /// Writes the screen's last frame, read back and encoded once, as each
+    /// of `names`, in order.
+    fn save(&self, screen: &dyn Screen, names: &[String]) {
+        if names.is_empty() {
+            return;
+        }
         let Some((w, h, pixels)) = screen.read_back() else {
-            eprintln!(
-                "dev: {}: the screen has nothing to read back",
-                path.display()
-            );
+            for name in names {
+                eprintln!(
+                    "dev: {}: the screen has nothing to read back",
+                    self.dir.join(name).display()
+                );
+            }
             return;
         };
-        let written =
-            fs::create_dir_all(&self.dir).and_then(|()| fs::write(&path, png(w, h, &pixels)));
-        match written {
-            Ok(()) => println!("dev: frame {}", path.display()),
-            Err(e) => eprintln!("dev: {}: {e}", path.display()),
+        let encoded = png(w, h, &pixels);
+        for name in names {
+            let path = self.dir.join(name);
+            let written = fs::create_dir_all(&self.dir).and_then(|()| fs::write(&path, &encoded));
+            match written {
+                Ok(()) => println!("dev: frame {}", path.display()),
+                Err(e) => eprintln!("dev: {}: {e}", path.display()),
+            }
         }
     }
 }
@@ -1775,41 +1784,43 @@ impl FrameSink for FrameDump {
         if !drawn.timing.presented {
             return;
         }
+        let mut names = Vec::new();
         // Each play's own frame at `play_at`, by its generation.
         if let (Some(t), Some(g)) = (drawn.play, drawn.generation)
             && t >= self.play_at
             && self.numbered != Some(g)
         {
             self.numbered = Some(g);
-            self.save(screen, &format!("play-{g}.png"));
+            names.push(format!("play-{g}.png"));
         }
         match drawn.play {
             Some(t) if t.0 < 0 && !self.ready_state => {
                 self.ready_state = true;
-                self.save(screen, "ready.png");
+                names.push("ready.png".to_owned());
             }
             Some(t) if t >= self.play_at && !self.play => {
                 self.play = true;
-                self.save(screen, "play.png");
+                names.push("play.png".to_owned());
             }
             None if drawn.loading => {
                 if !self.loading {
                     self.loading = true;
-                    self.save(screen, "loading.png");
+                    names.push("loading.png".to_owned());
                 }
             }
             None if drawn.menu => {
                 if !self.select {
                     self.select = true;
-                    self.save(screen, "select.png");
+                    names.push("select.png".to_owned());
                 }
             }
             None if !self.end => {
                 self.end = true;
-                self.save(screen, "end.png");
+                names.push("end.png".to_owned());
             }
             _ => {}
         }
+        self.save(screen, &names);
     }
 }
 
