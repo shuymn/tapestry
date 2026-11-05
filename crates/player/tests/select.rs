@@ -191,7 +191,9 @@ fn a_folder_is_entered_a_chart_chosen_and_the_cursor_kept() {
         &[],
     );
     assert!(
-        stdout.lines().any(|l| l == "select: chose b.bms"),
+        stdout
+            .lines()
+            .any(|l| l.starts_with("select: chose b.bms ")),
         "{stdout}"
     );
     assert!(
