@@ -201,6 +201,25 @@ fn declared_options_fold() {
     assert!(image(r#""op": [900, -900]"#).quads(0).is_empty());
 }
 
+/// `table_song` is false: the group under its negation draws, the group
+/// under it never does, by number and by name, with nothing dropped.
+#[test]
+fn the_table_song_group_under_its_negation_draws() {
+    for (op, name, drawn) in [(-1_008, "!table_song", 1), (1_008, "table_song", 0)] {
+        for fields in [format!(r#""op": [{op}]"#), format!(r#""op": ["{name}"]"#)] {
+            let loaded = image(&fields);
+            let notes = &loaded.report().notes;
+            assert!(
+                !notes
+                    .iter()
+                    .any(|n| matches!(n.kind, NoteKind::UnsupportedProperty { .. })),
+                "{fields}: {notes:?}"
+            );
+            assert_eq!(loaded.quads(0).len(), drawn, "{fields}");
+        }
+    }
+}
+
 #[test]
 fn names_use_the_same_table() {
     let mut d = image(r#""op": ["!!judge_1p_perfect"]"#).drawn();

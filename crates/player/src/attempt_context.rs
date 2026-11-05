@@ -11,6 +11,8 @@ use bms_model::TimeUs;
 use game::{Attempt, AttemptKind, AttemptTempo, ChartLabels};
 use skin_model::{BpmRange, ChartText, GaugeDesc, PlayContext, Side};
 
+use crate::imports::facts::level_of;
+
 /// The scratch side the simple skin draws, its author's layout: it has no
 /// imported side and no player layout.
 pub const SIMPLE_SCRATCH: Side = Side::Left;
@@ -32,6 +34,9 @@ pub struct AttemptContext {
     /// The tempo provider and references of the chart as loaded at the
     /// attempt's speed, over its section.
     tempo: AttemptTempo,
+    /// The chart's play level, parsed from its label as the attempt's
+    /// import facts are ([`level_of`]).
+    play_level: i32,
     /// The presentation epoch the attempt was attached as: a snapshot of
     /// another epoch gives its frames no gain.
     epoch: u64,
@@ -49,6 +54,7 @@ impl AttemptContext {
             scratch,
             ln_default: attempt.ln_default,
             last_note_end: attempt.last_note_end,
+            play_level: level_of(&attempt.labels.playlevel),
             labels: attempt.labels,
             tempo: attempt.tempo,
             epoch,
@@ -93,6 +99,7 @@ impl AttemptContext {
             last_note_end: self.last_note_end,
             bpm_range: bpm_range(self.tempo.meta()),
             bpm_whole_change: Some(bpm_whole_change(self.tempo.meta())),
+            play_level: Some(self.play_level),
         }
     }
 }
@@ -188,6 +195,7 @@ mod tests {
         assert_eq!(ctx.scratch, Side::Right);
         assert_eq!(ctx.last_note_end, TimeUs(1_000_000));
         assert_eq!(ctx.bpm_whole_change, Some(false));
+        assert_eq!(ctx.play_level, Some(12));
         assert_eq!(
             ctx.bpm_range,
             Some(skin_model::BpmRange {
