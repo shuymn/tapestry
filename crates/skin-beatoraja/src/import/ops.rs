@@ -256,11 +256,11 @@ const GAUGE_EX: i32 = 1_046;
 /// as the adjustments' snapshot reads them; `lanecover1_on`, `lift1_on`
 /// and `hidden1_on`, the stored switches.
 const COVER_CHANGING: i32 = 270;
-/// `autoplay_off` and `autoplay_on` (`BooleanPropertyFactory.java:416-419`):
+/// `autoplay_off` and `autoplay_on` (`BooleanPropertyFactory.java:413-416`):
 /// whether the play mode is autoplay, the attempt's.
 const AUTOPLAY_OFF: i32 = 32;
 const AUTOPLAY_ON: i32 = 33;
-/// `mode_course` (`BooleanPropertyFactory.java:526-527`): a scene
+/// `mode_course` (`BooleanPropertyFactory.java:523-524`): a scene
 /// constant, false, as there are no courses.
 const COURSE_MODE: i32 = 290;
 /// `judge_great_exist` to `judge_poor_exist`

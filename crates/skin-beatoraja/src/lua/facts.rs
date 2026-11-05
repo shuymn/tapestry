@@ -9,7 +9,7 @@
 //! id, as the source's boolean properties at beatoraja's `0.8.9` tag
 //! answer them (`skin/property/BooleanPropertyFactory.java`):
 //!
-//! - 33 and 32, autoplay on and off (`:416-419`): the snapshot's
+//! - 33 and 32, autoplay on and off (`:413-416`): the snapshot's
 //!   [`ImportFacts::autoplay`] on [`ScreenKind::Play`], a constant `false` on
 //!   every other scene, as the source's are off the play state;
 //! - 180 to 184, the chart's judgment class (`:448-452`): the source's
@@ -19,7 +19,7 @@
 //!   from is judged with the window policy's absent window, which is the
 //!   `#RANK 2` window in every shipped preset, so its class is
 //!   [`JudgeClass::Normal`], the class of `#RANK 2`;
-//! - 290, course mode (`:526-527`): a constant `false`, as there are no
+//! - 290, course mode (`:523-524`): a constant `false`, as there are no
 //!   courses;
 //! - 1008, `table_song` (`:351-352`): a constant `false`, as there are no
 //!   difficulty tables.
