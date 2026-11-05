@@ -7479,6 +7479,53 @@ pub(crate) mod tests {
         link.exit();
     }
 
+    /// Counts the frames the render thread finished.
+    struct Frames(Arc<std::sync::atomic::AtomicU32>);
+
+    impl super::FrameSink for Frames {
+        fn frame(&mut self, _screen: &dyn Screen, _drawn: &super::Drawn<'_>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// A direct launch's wait for a pending skin's specialization, on the
+    /// screen a direct launch makes: the page is drawn, frame after frame,
+    /// on the one screen built, nothing failing.
+    #[test]
+    fn a_direct_launch_draws_the_skin_wait_on_its_screen() {
+        let builds = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let built = Arc::clone(&builds);
+        let make: MakeScreen = Box::new(move || {
+            built.fetch_add(1, Ordering::SeqCst);
+            let target = render::Target::Offscreen {
+                width: 1_280,
+                height: 720,
+            };
+            render::Renderer::new(target, render::AdapterChoice::Warp)
+                .map(|r| Box::new(crate::menu_screen::MenuScreen::new(r, None)) as Box<dyn Screen>)
+        });
+        let frames = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let clock = QpcClock::start();
+        let link = spawn(
+            make,
+            None,
+            None,
+            clock,
+            view(),
+            measure(clock),
+            Box::new(Frames(Arc::clone(&frames))),
+        )
+        .unwrap();
+        link.send(RenderMsg::Menu(Box::new(
+            crate::loading_text::skin_wait_page(),
+        )));
+        let drawn = wait_until(|| frames.load(Ordering::SeqCst) >= 3 || link.failed());
+        assert!(drawn);
+        assert!(!link.failed());
+        assert_eq!(builds.load(Ordering::SeqCst), 1);
+        link.exit();
+    }
+
     /// A screen built again keeps the pending marker: a specialization
     /// committed is restored, the very bundle; one whose restore is
     /// refused on a healthy device leaves only the marker, the build

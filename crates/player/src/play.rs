@@ -315,16 +315,9 @@ impl PlayerRig<'_> {
                     }
                     rig.render.send(RenderMsg::Menu(Box::new(page)));
                 }
-                None => {
-                    let page = crate::menu_screen::MenuPage {
-                        lines: vec![crate::menu_screen::MenuLine {
-                            text: crate::loading_text::SKIN_WAIT.to_owned(),
-                            style: crate::menu_screen::LineStyle::Notice,
-                        }],
-                        caret: None,
-                    };
-                    rig.render.send(RenderMsg::Menu(Box::new(page)));
-                }
+                None => rig.render.send(RenderMsg::Menu(Box::new(
+                    crate::loading_text::skin_wait_page(),
+                ))),
             }
             #[cfg(feature = "dev-tools")]
             crate::dev::specialization_began();

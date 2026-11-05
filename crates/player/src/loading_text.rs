@@ -70,6 +70,18 @@ impl Stage {
     }
 }
 
+/// The page a play without the selection screen shows while a pending play
+/// skin is specialized for its chart: the wait alone.
+pub fn skin_wait_page() -> MenuPage {
+    MenuPage {
+        lines: vec![MenuLine {
+            text: SKIN_WAIT.to_owned(),
+            style: LineStyle::Notice,
+        }],
+        caret: None,
+    }
+}
+
 /// The chosen chart's descriptive fields as its library entry has them,
 /// each `None` when unknown: what a skin's loading frame may show of the
 /// chart. Never filled from the file's name or another chart's fields; the
