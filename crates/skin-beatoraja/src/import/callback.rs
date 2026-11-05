@@ -1319,6 +1319,8 @@ impl Cx<'_> {
         id: u32,
     ) -> Result<Result<TextFold, NoteKind>, ImportError> {
         let c = self.callable_at(id).map_or(NONE, |(c, _)| c);
+        // Its reads decide its role before it folds.
+        let role = self.callback_role(id, "value", role)?;
         match self.lower_phase(id, |cx| cx.fold_text(id))? {
             Ok(Some(fold)) => {
                 self.record(

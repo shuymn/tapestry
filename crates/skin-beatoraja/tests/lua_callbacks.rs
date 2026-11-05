@@ -423,7 +423,7 @@ fn other_text_shapes_follow_the_role() {
         "function() return nil end",
         "function() return ms.text(1) end",
         "function() local n = ms.number(110) return \"x\" end",
-        "function() return ms.number(101) == 0 and \"a\" or \"b\" end",
+        "function() return ms.number(110) == 0 and \"a\" or \"b\" end",
         "function() if ms.option(289) then return ms.text(10) else return ms.text(11) end end",
         "function() local tx = ms.text(10)\n\
            if tx == \"\" then return tx else return \"x\" end end",
@@ -433,6 +433,53 @@ fn other_text_shapes_follow_the_role() {
     ] {
         text_follows_its_role(value, consumer);
     }
+}
+
+/// A value whose reads show a critical part is critical, whatever else it
+/// is: it refuses, by the reason it did not fold for, never its `ref`.
+#[test]
+fn a_text_value_reading_a_critical_part_refuses() {
+    let consumer = Unsupported::Consumer("text value");
+    for (value, why) in [
+        (
+            "function() return ms.number(101) == 0 and \"a\" or \"b\" end",
+            consumer,
+        ),
+        (
+            "function() local n = ms.number(101) return \"a\" end",
+            consumer,
+        ),
+        (
+            "function() return ms.number(101) .. \"a\" end",
+            Unsupported::Construct(".."),
+        ),
+    ] {
+        match import(&text_folder(value, ""), 905) {
+            Err(ImportError::Lua {
+                why:
+                    LuaWhy::Critical {
+                        field: "value",
+                        why: w,
+                    },
+                ..
+            }) => assert_eq!(w, why, "{value}"),
+            other => panic!("{value}: {other:?}"),
+        }
+    }
+}
+
+/// Under failure presentation a value that folds is drawn, as anywhere.
+#[test]
+fn a_failure_presentation_text_folds() {
+    let value = "function() local tx = ms.text(10)\n\
+       if tx == \"\" then return \"none\" else return tx end end";
+    let i = import(&text_folder(value, "timer = 3,"), 905).unwrap();
+    assert_eq!(counts(&i), [1, 0, 0, 0]);
+    let lines = i
+        .imported
+        .skin
+        .text_requests(&NO_TEXT, [1_920, 1_080], &Layout::AUTHOR);
+    assert_eq!(lines[0].text, "none");
 }
 
 /// An evaluation that stopped gives its own reason.
@@ -473,6 +520,13 @@ fn other_consumers_keep_their_text_reads() {
             "{draw}"
         );
     }
+    let d = folder(&skin(
+        "skin.value = { { id = \"v\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, digit = 8,\n\
+           value = function() if ms.text(12) == \"\" then return 1 else return 0 end end } }\n\
+         table.insert(skin.destination, { id = \"v\", dst = { { x = 0, y = 100, w = 6, h = 6 } } })",
+    ));
+    let i = import(&d, 905).unwrap();
+    assert_eq!(i.callbacks, [Disposition::Replaced(Unsupported::Type)]);
 }
 
 /// A play skin whose gauge flash, drawn from x 500, is a `draw` in a part

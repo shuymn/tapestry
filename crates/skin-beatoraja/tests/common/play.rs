@@ -106,6 +106,9 @@ pub struct Drawn {
     pub play: skin_model::Play,
     pub tally: Tally,
     pub gauges: Vec<GaugeState>,
+    /// Whether the play is still playing, for every frame
+    /// ([`SkinFrame::playing`]): off in its audio tail.
+    pub playing: bool,
     /// Where the play entered Closing, for every frame
     /// ([`SkinFrame::closing`]).
     pub closing: Option<TimeUs>,
@@ -312,6 +315,7 @@ impl Drawn {
                 reference: GAUGES[0].start,
                 failed_at: None,
             }],
+            playing: true,
             closing: None,
             batch,
             // 600 ms of 150 BPM over the original lane.
@@ -387,7 +391,7 @@ impl Drawn {
             target: self.target,
             layout: &Layout::AUTHOR,
             lanes: self.view,
-            playing: true,
+            playing: self.playing,
             closing: self.closing,
             readouts: self.readouts.unwrap_or_else(|| readouts_for(self.view)),
         };
