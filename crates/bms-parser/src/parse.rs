@@ -204,6 +204,27 @@ fn lane_of(digit: u8) -> Option<Lane> {
     Lane::new(index)
 }
 
+/// The objects of a channel line's data as the loader recognizes them: its
+/// complete pairs, by position, with `00` skipped, and each one's ID, `None`
+/// when the pair is invalid and so no object.
+pub fn objects<'a>(
+    channel: [u8; 2],
+    data: &'a str,
+) -> impl Iterator<Item = (u32, Option<u16>)> + 'a {
+    let (pairs, _) = data.as_bytes().as_chunks::<2>();
+    (0..)
+        .zip(pairs)
+        .filter(|(_, pair)| *pair != b"00")
+        .map(move |(index, pair)| {
+            let id = if channel == *b"03" {
+                parse_hex(pair.as_slice())
+            } else {
+                parse_base36(pair.as_slice())
+            };
+            (index, id)
+        })
+}
+
 fn parse_channel(
     source: &mut Source,
     limits: &Limits,
@@ -228,19 +249,11 @@ fn parse_channel(
     let (pairs, _) = bytes.as_chunks::<2>();
     let count = u32::try_from(pairs.len()).map_err(|_| LoadError::TooManyObjects { line })?;
     let mut warned_channel = false;
-    for (index, pair) in (0..).zip(pairs) {
-        if pair == b"00" {
-            continue;
-        }
+    for (index, id) in self::objects(channel, data) {
         *objects += 1;
         if *objects > limits.max_objects {
             return Err(LoadError::TooManyObjects { line });
         }
-        let id = if channel == *b"03" {
-            parse_hex(pair.as_slice())
-        } else {
-            parse_base36(pair.as_slice())
-        };
         let Some(id) = id else {
             warnings.push(Warning {
                 line: Some(line),

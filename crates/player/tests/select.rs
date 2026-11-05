@@ -61,7 +61,7 @@ fn write_notes(
     write_wav(&dir.join("key.wav"), amplitude);
     let text = format!(
         "#PLAYER 1\n#TITLE {title}\n#ARTIST テスト\n#PLAYLEVEL 3\n#BPM 120\n\
-         #WAV01 key.wav\n#00111:{}\n",
+         #WAV01 key.wav\n#00138:01\n#00111:{}\n",
         "01".repeat(notes)
     );
     let path = dir.join(name);
@@ -545,7 +545,7 @@ fn the_quit_key_during_a_load_returns_to_selection() {
 fn write_many_sounds(library: &Path, folder: &str, name: &str, files: usize) {
     let dir = library.join(folder);
     fs::create_dir_all(&dir).unwrap();
-    let mut text = "#PLAYER 1\n#TITLE 多い\n#BPM 120\n".to_owned();
+    let mut text = "#PLAYER 1\n#TITLE 多い\n#BPM 120\n#00138:01\n".to_owned();
     let mut notes = String::new();
     for i in 1..=files {
         // Distinct contents, so none is stored as another's duplicate.
@@ -801,7 +801,7 @@ fn refused_chart_shows_its_reason() {
     fs::create_dir_all(&bad).unwrap();
     fs::write(
         bad.join("bad.bms"),
-        "#TITLE 壊れた譜面\n#LNTYPE 2\n#00111:01\n",
+        "#TITLE 壊れた譜面\n#LNTYPE 2\n#00138:01\n#00111:01\n",
     )
     .unwrap();
     write_chart(&fx.library, "good", "good.bms", "譜面", 8_000);
@@ -842,7 +842,7 @@ fn refused_load_releases_the_scan_pause() {
     let fx = fixture();
     let bad = fx.library.join("bad");
     fs::create_dir_all(&bad).unwrap();
-    fs::write(bad.join("bad.bms"), "#LNTYPE 2\n#00111:01\n").unwrap();
+    fs::write(bad.join("bad.bms"), "#LNTYPE 2\n#00138:01\n#00111:01\n").unwrap();
     let mut child = select(
         &fx,
         "pick=bad.bms,enter,wait=added.bms,close",
@@ -879,7 +879,11 @@ fn charts_listed_above_keep_the_cursor_on_its_chart() {
     let fx = fixture();
     let m = fx.library.join("m");
     fs::create_dir_all(&m).unwrap();
-    fs::write(m.join("m00.bms"), "#TITLE M00\n#LNTYPE 2\n#00111:01\n").unwrap();
+    fs::write(
+        m.join("m00.bms"),
+        "#TITLE M00\n#LNTYPE 2\n#00138:01\n#00111:01\n",
+    )
+    .unwrap();
     for i in 1..30 {
         write_chart(
             &fx.library,
@@ -945,7 +949,7 @@ fn the_input_thread_idles_on_the_select_screen() {
     let fx = fixture();
     let bad = fx.library.join("bad");
     fs::create_dir_all(&bad).unwrap();
-    fs::write(bad.join("bad.bms"), "#LNTYPE 2\n#00111:01\n").unwrap();
+    fs::write(bad.join("bad.bms"), "#LNTYPE 2\n#00138:01\n#00111:01\n").unwrap();
     write_chart(&fx.library, "a", "a.bms", "譜面A", 8_000);
     let (_, stdout) = run(
         &fx,

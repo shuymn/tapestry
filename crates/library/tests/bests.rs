@@ -14,6 +14,51 @@ use common::{
 use library::{Best, BestsState, Ineligible, Ingested, LN_MODE, Score, Tuple};
 use replay::{EndStatus, InitialGauge, PlayRecord, PlayType, Practice};
 
+/// A database of the version before: deleted and rebuilt; its loudness goes,
+/// the bests come back from the records, whose bytes do not change.
+#[test]
+fn schema_5_is_rebuilt_with_its_bests_from_the_records() {
+    let fx = Fixture::new();
+    fx.chart("a.bms", CHART);
+    let lib = fx.open();
+    fx.pass(&lib);
+    let record = played(0);
+    let (rel, file) = fx.save(&record, "1-1.tprl");
+    fx.live(&lib, &rel, CHART, &record);
+    let best = score_of(&lib, &record).unwrap();
+    let loudness_key = library::LoudnessKey {
+        resolved_hash: [1; 32],
+        sounds: [2; 32],
+        mixer_version: 1,
+        analysis_version: 1,
+        rate: 48_000,
+    };
+    let mut lib = lib;
+    lib.store_loudness(
+        &loudness_key,
+        &library::LoudnessRow {
+            integrated: None,
+            true_peak: 1.0,
+            over_range: false,
+        },
+    )
+    .unwrap();
+    drop(lib);
+    let bytes = fs::read(&file).unwrap();
+    sql(&fx.db(), "PRAGMA user_version = 5");
+
+    let (lib, opened) = library::Library::open(&fx.db()).unwrap();
+    assert_eq!(opened, library::Opened::Rebuilt { old_version: 5 });
+    assert!(lib.charts().unwrap().is_empty());
+    assert_eq!(lib.loudness(&loudness_key).unwrap(), None);
+    assert_eq!(score_of(&lib, &record), None);
+    lib.request_bests_pass().unwrap();
+    let report = fx.pass(&lib);
+    assert_eq!(report.read, 1);
+    assert_eq!(score_of(&lib, &record), Some(best));
+    assert_eq!(fs::read(&file).unwrap(), bytes);
+}
+
 #[test]
 fn completed_full_play_updates_the_best() {
     let fx = Fixture::new();

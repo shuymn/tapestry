@@ -2182,7 +2182,8 @@ mod tests {
         let charts = dir.join("charts");
         std::fs::create_dir_all(&charts).unwrap();
         for (file, title, artist) in [("a", "A", "Z"), ("b", "B", "Y"), ("c", "C", "X")] {
-            let text = format!("#TITLE {title}\n#ARTIST {artist}\n#BPM 120\n#00111:01\n");
+            let text =
+                format!("#TITLE {title}\n#ARTIST {artist}\n#BPM 120\n#00138:01\n#00111:01\n");
             std::fs::write(charts.join(format!("{file}.bms")), text).unwrap();
         }
         let (library, _) = open(&DataRoot::new(dir.join("data"))).unwrap();
@@ -2205,6 +2206,26 @@ mod tests {
             #[cfg(feature = "dev-tools")]
             script: None,
         }
+    }
+
+    /// Charts of other modes reach no list: once a whole pass has indexed
+    /// them, the screen still lists only the 7-key charts.
+    #[test]
+    fn the_screen_lists_no_chart_of_another_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let charts = dir.path().join("charts");
+        std::fs::create_dir_all(&charts).unwrap();
+        std::fs::write(charts.join("five.bms"), "#TITLE F\n#00111:01\n").unwrap();
+        std::fs::write(charts.join("two.bms"), "#TITLE T\n#00118:01\n#00121:01\n").unwrap();
+        let mut sel = selection(dir.path());
+        let begun = Instant::now();
+        while sel.shelf.status() == "スキャン中" {
+            assert!(begun.elapsed() < Duration::from_secs(600), "no pass ended");
+            sel.shelf.poll(Instant::now());
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        sel.refresh();
+        assert_eq!(sel.screen.listed(), 3);
     }
 
     /// An order change queued before navigation is searched before the

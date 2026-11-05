@@ -14,9 +14,7 @@ const FALLBACK_EXTENSIONS: &[&str] = &["wav", "ogg", "flac", "mp3"];
 /// exists decides: inside the folder it is the result, outside it is an
 /// error, so a link or junction cannot redirect a sound.
 pub fn resolve(name: &str, line: usize, dir: &Path) -> Result<Option<PathBuf>, LoadError> {
-    if !is_confined_name(name) {
-        return Err(LoadError::SoundPathRejected { line });
-    }
+    check_name(name, line)?;
     let relative = PathBuf::from(name.replace('\\', "/"));
     let fallbacks = FALLBACK_EXTENSIONS
         .iter()
@@ -35,6 +33,15 @@ pub fn resolve(name: &str, line: usize, dir: &Path) -> Result<Option<PathBuf>, L
         }
     }
     Ok(None)
+}
+
+/// Refuses a name that could leave the folder by itself, with no file system.
+pub fn check_name(name: &str, line: usize) -> Result<(), LoadError> {
+    if is_confined_name(name) {
+        Ok(())
+    } else {
+        Err(LoadError::SoundPathRejected { line })
+    }
 }
 
 /// Whether `name` is a relative path that cannot leave the folder by itself:
