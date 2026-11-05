@@ -893,12 +893,12 @@ fn a_negative_input_offset_keeps_a_ready_frame_ready() {
     write_log(&fx.base.join("logs").join("none.tprl"), &[], 1);
     fs::create_dir_all(fx.data()).unwrap();
     let device = DeviceSettings {
-        input_offset_us: -400_000,
+        input_offset_us: -900_000,
         ..DeviceSettings::default()
     };
     game::save_settings(&fx.data().join("device.toml"), &device).unwrap();
     let (out, stdout, stderr) = fx.run(&scenario(&[
-        "capture = { ready_at = 800, file = \"r.png\" }",
+        "capture = { ready_at = 300, file = \"r.png\" }",
         "select = { path = \"library/a/a.bms\" }",
         "play = { input = \"logs/none.tprl\", until = \"end\" }",
         "result = \"back\"",
