@@ -1698,6 +1698,25 @@ fn chart_is_read_one_byte_past_the_adapter_limit_at_most() {
 }
 
 #[test]
+fn every_listed_chart_extension_loads_as_the_same_chart() {
+    let (_dir, root) = temp_root();
+    let load = |name: &str| {
+        let path = root.path().join(name);
+        fs::write(&path, "#BPM 120\n#WAV01 kick.wav\n#00111:01\n").unwrap();
+        let settings = tapestry_settings(&root);
+        let parts = Parts::standard(&root, &settings.player);
+        Loaded::load(root.clone(), settings, &path, config(), parts)
+            .unwrap()
+            .chart_at(bms_model::Speed::NORMAL)
+            .unwrap()
+    };
+    let bms = load("a.bms");
+    for name in ["a.bme", "a.bml", "a.BML"] {
+        assert_eq!(load(name).identity, bms.identity, "{name}");
+    }
+}
+
+#[test]
 fn a_step_that_does_not_move_the_clock_is_refused() {
     let (_dir, root) = temp_root();
     let chart = taps(&[(1, 1_000)]);
