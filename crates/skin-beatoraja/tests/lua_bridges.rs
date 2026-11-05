@@ -253,11 +253,7 @@ fn judge_reads_the_counts_by_index() {
         (6, 0),
         (-1, 0),
     ] {
-        assert_eq!(
-            value_of(&format!("ms.judge({n})"), t.clone(), false),
-            [want],
-            "{n}"
-        );
+        assert_eq!(value_of(&format!("ms.judge({n})"), t, false), [want], "{n}");
     }
     let left =
         "ms.number(106) - (ms.judge(0) + ms.judge(1) + ms.judge(2) + ms.judge(3) + ms.judge(4))";
