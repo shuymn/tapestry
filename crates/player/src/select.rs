@@ -461,7 +461,7 @@ impl SelectScreen {
                 let own = |c: &ChartEntry| c.path.parent() == Some(folder.as_path());
                 // A configured root, as its path's components compare: the
                 // stored key is that root's one spelling.
-                let root = self.roots.iter().any(|r| *r == folder);
+                let root = self.roots.contains(&folder);
                 let song_folder = !root
                     && level.folders.is_empty()
                     && !level.more
