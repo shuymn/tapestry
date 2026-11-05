@@ -573,11 +573,12 @@ fn branches_merge_locals_and_returns() {
         "function() local a, b = 1, 2 if ms.option(271) then a, b = b, a end return a end",
         "function() local a = 1 do local a = 2 end return a end",
         "function() local a, a = 1, 2 return a end",
+        "function() if ms.option(271) then if ms.option(272) then return 1 end else if ms.option(272) then return 2 end end return 3 end",
     ];
     let entry = numbers("", &values);
     assert!(closed(&entry));
     let r = run(&entry);
-    assert_eq!(r.callbacks, [Disposition::Lowered; 6]);
+    assert_eq!(r.callbacks, [Disposition::Lowered; 7]);
     assert_eq!(r.lowered[0], "(if (cover.enabled) then 2 else 1)");
     assert_eq!(
         r.lowered[2],
@@ -644,6 +645,23 @@ fn integers_follow_the_source_s_double_model() {
         (
             "function() return 9007199254740992 == 9007199254740992 end",
             Lowered,
+        ),
+        // A result folded at frame time past 2^53, where LuaJ rounds.
+        (
+            "function() return (9007199254740992 + 1) - 9007199254740992 == 0 end",
+            range,
+        ),
+        // A host argument folded just past 2^53, and one at it.
+        (
+            "function() return ms.number(4503599627370496 * 2 + 1) > 0 end",
+            range,
+        ),
+        (
+            "function() return ms.number(4503599627370496 * 2) > 0 end",
+            Replaced(Unsupported::Unmapped {
+                api: 1,
+                id: 1 << 53,
+            }),
         ),
     ] {
         assert_eq!(run(&skin("", &image(draw))).callbacks, [want], "{draw}");
