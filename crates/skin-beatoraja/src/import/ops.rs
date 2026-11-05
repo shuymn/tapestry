@@ -540,17 +540,16 @@ mod tests {
             }
         }
         assert!(supported > 0);
-        let guard = [
-            "bpm.range_valid",
-            "bpm.current_valid",
-            "hispeed.valid",
-            "duration.valid",
-        ]
-        .iter()
-        .map(|g| g.len() + 2 + 4)
-        .max()
-        .unwrap_or(0);
-        assert_eq!(guard, 23);
+        // The importer's own guards, over every integer property id.
+        let guard = (0..=2_000)
+            .filter_map(|id| match super::super::property::int_by_id(id) {
+                super::super::property::IntProp::Shown(v) => v.availability(),
+                _ => None,
+            })
+            .map(|g| g.len() + 2 + 4)
+            .max()
+            .unwrap_or(0);
+        assert_eq!(guard, 38);
         // Each condition parenthesized and joined by ` && `.
         let terms = 6 + 1;
         let joined = terms * (longest + 2) + (terms - 1) * 4 + guard;
