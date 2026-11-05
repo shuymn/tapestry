@@ -549,8 +549,8 @@ fn host_arguments_fold_from_upvalues() {
     for (op, want) in [
         (271, Disposition::Lowered),
         (
-            2244,
-            Disposition::Replaced(Unsupported::Unmapped { api: 0, id: 2244 }),
+            289,
+            Disposition::Replaced(Unsupported::Unmapped { api: 0, id: 289 }),
         ),
         (
             33,
@@ -645,10 +645,10 @@ fn conversion_keeps_its_reads() {
         crate::import::DeviationId::D4
     )));
     // An unmapped read a conversion or a fold drops is still refused.
-    let unmapped = Disposition::Replaced(Unsupported::Unmapped { api: 1, id: 425 });
+    let unmapped = Disposition::Replaced(Unsupported::Unmapped { api: 1, id: 426 });
     for draw in [
-        "function() return ms.number(425) end",
-        "function() return ms.number(425) == nil end",
+        "function() return ms.number(426) end",
+        "function() return ms.number(426) == nil end",
     ] {
         assert_eq!(run(&skin("", &image(draw))).callbacks, [unmapped], "{draw}");
     }
@@ -1140,7 +1140,7 @@ fn a_helper_tree_inlined_by_many_consumers_meets_the_expansion_cap() {
     // calls, is inlined in full by every consumer, past the cumulative
     // node cap: fatal.
     let entry = super::callback_tests::helper_tree(
-        "function() local unused = root() return ms.number(425) end",
+        "function() local unused = root() return ms.number(426) end",
     );
     assert!(matches!(
         run(&entry).r,

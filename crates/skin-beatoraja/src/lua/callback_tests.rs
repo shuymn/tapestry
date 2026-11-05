@@ -558,7 +558,7 @@ fn the_role_scan_visits_each_helper_once() {
     // tree is called behind a condition folded false, which evaluation
     // never enters and the scan reads.
     let entry =
-        helper_tree("function() if false then local unused = root() end return ms.number(425) end");
+        helper_tree("function() if false then local unused = root() end return ms.number(426) end");
     let start = std::time::Instant::now();
     crate::import::callback::SCANNED.with(|n| n.set(0));
     let i = import(&entry).unwrap();

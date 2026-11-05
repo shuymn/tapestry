@@ -543,7 +543,7 @@ fn widgets(elements: &mut Vec<ElementDef>) -> skin_model::WidgetDefs {
         ),
         (
             strip(DIGITS_10, GlyphSet::Ten, 3, Align::Center, Pad::Zero, 4, 1),
-            "bp - 3",
+            "bp + count.bad + count.early.poor + count.late.poor - 3",
         ),
     ];
     let places = [

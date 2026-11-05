@@ -577,12 +577,12 @@ mod tests {
                { id = \"i\", op = { 906 }, draw = function() return true end, dst = { { w = 64, h = 64 } } },\n\
                { id = \"i\", mouseRect = { x = 0, y = 0, w = 1, h = 1 }, draw = function() return true end, dst = { { w = 64, h = 64 } } },\n\
                { id = \"g\", draw = function() return ms.gauge_type() == 4 end, dst = { { w = 64, h = 64 } } },\n\
-               { id = \"i\", draw = function() return ms.number(425) > 0 end, dst = { { w = 64, h = 64 } } },\n\
+               { id = \"i\", draw = function() return ms.number(426) > 0 end, dst = { { w = 64, h = 64 } } },\n\
                { id = \"ex\", dst = { { w = 6, h = 6 } } }, { id = \"odd\", dst = { { w = 6, h = 6 } } },\n\
              }\n\
              skin.value = {\n\
                { id = \"ex\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, digit = 4, value = function() return ms.number(101) end },\n\
-               { id = \"odd\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, digit = 4, value = function() return ms.number(425) end },\n\
+               { id = \"odd\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, digit = 4, value = function() return ms.number(426) end },\n\
              }\n\
              return skin\n";
         let d = crate::lua::callback_tests::folder(entry);
@@ -615,16 +615,16 @@ mod tests {
                     Some(13),
                     "draw",
                     "decorative",
-                    "replaced Unmapped main_state.number 425",
-                    Some("Unmapped main_state.number 425")
+                    "replaced Unmapped main_state.number 426",
+                    Some("Unmapped main_state.number 426")
                 ),
                 (Some(17), "value", "critical ExScore", "lowered", None),
                 (
                     Some(18),
                     "value",
                     "decorative",
-                    "replaced Unmapped main_state.number 425",
-                    Some("Unmapped main_state.number 425")
+                    "replaced Unmapped main_state.number 426",
+                    Some("Unmapped main_state.number 426")
                 ),
                 (
                     Some(8),
@@ -674,7 +674,7 @@ mod tests {
                { id = \"odd\", dst = { { w = 6, h = 6 } } },\n\
              }\n\
              skin.value = {\n\
-               { id = \"odd\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, digit = 4, value = function() return ms.number(425) end },\n\
+               { id = \"odd\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, digit = 4, value = function() return ms.number(426) end },\n\
              }\n\
              return skin\n";
         let d = crate::lua::callback_tests::folder(entry);
@@ -682,7 +682,7 @@ mod tests {
         std::fs::write(
             d.path().join("parts").join("m.lua"),
             "local ms = require(\"main_state\")\n\
-             return { draw = function() return ms.number(425) > 0 end }\n",
+             return { draw = function() return ms.number(426) > 0 end }\n",
         )
         .unwrap();
         let run = |local| {
@@ -719,7 +719,7 @@ mod tests {
             got,
             [
                 (
-                    "replaced Unmapped main_state.number 425",
+                    "replaced Unmapped main_state.number 426",
                     Some(Local {
                         file: "parts/m.lua".to_owned(),
                         element: element(0, "i", "Image"),
@@ -743,7 +743,7 @@ mod tests {
                     })
                 ),
                 (
-                    "replaced Unmapped main_state.number 425",
+                    "replaced Unmapped main_state.number 426",
                     Some(Local {
                         file: "s.luaskin".to_owned(),
                         element: element(3, "odd", "Value"),
@@ -765,7 +765,7 @@ mod tests {
          if not skin_config then return skin end\n\
          skin.source = { { id = \"a\", path = \"a.png\" } }\n\
          skin.image = { { id = \"i\", src = \"a\", x = 0, y = 0, w = 64, h = 64 } }\n\
-         skin.value = { { id = \"lv\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, digit = 2, ref = 425 } }\n\
+         skin.value = { { id = \"lv\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, digit = 2, ref = 426 } }\n\
          skin.judgegraph = { { id = \"jg\", src = \"a\", x = 0, y = 0, w = 64, h = 64 } }\n\
          skin.destination = {\n\
            { id = \"i\", dst = { { w = 64, h = 64 } } },\n\
@@ -830,7 +830,7 @@ mod tests {
                 Severity::Dropped,
                 NoteKind::UnsupportedProperty {
                     kind: PropertyKind::Integer,
-                    id: Some(425)
+                    id: Some(426)
                 }
             ))
         );
@@ -932,7 +932,7 @@ mod tests {
             kinds[2],
             [NoteKind::UnsupportedProperty {
                 kind: PropertyKind::Integer,
-                id: Some(425)
+                id: Some(426)
             }]
         );
         assert!(matches!(kinds[3][..], [NoteKind::Unsupported { .. }]));
