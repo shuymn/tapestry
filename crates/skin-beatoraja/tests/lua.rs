@@ -2352,6 +2352,32 @@ fn a_mixed_table_where_an_array_or_condition_is_read_is_refused() {
     );
 }
 
+#[test]
+fn a_lua_cell_no_atlas_page_holds_drops_its_element_alone() {
+    // A whole-file frame drawn 1×1 beside its sheet's fitting frames, as a
+    // JSON skin's is.
+    let d = common::skin(&[(
+        "s.luaskin",
+        &skin(
+            "",
+            "skin.source = { { id = \"w\", path = \"w.png\" } }\n\
+             skin.image = {\n\
+               { id = \"whole\", src = \"w\", x = 0, y = 0, w = -1, h = -1 },\n\
+               { id = \"frames\", src = \"w\", x = 0, y = 0, w = 8177, h = 2, divx = 4 },\n\
+             }\n\
+             skin.destination = {\n\
+               { id = \"whole\", dst = { { x = 0, y = 0, w = 1, h = 1 } } },\n\
+               { id = \"frames\", dst = { { x = 0, y = 0, w = 64, h = 64 } } },\n\
+             }",
+        ),
+    )]);
+    common::png(d.path(), "w.png", 8_177, 2);
+    let r = import(&d).unwrap();
+    assert_eq!(kinds(&r), [NoteKind::CellTooLarge { w: 8_177, h: 2 }]);
+    assert_eq!(r.imported.report.notes[0].severity, Severity::Dropped);
+    assert_eq!(r.imported.report.usage.files, 1);
+}
+
 /// `json`, a JSON value of objects, arrays, strings and numbers, as a
 /// Lua table constructor.
 fn lua_table(json: &str) -> String {

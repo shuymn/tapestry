@@ -27,6 +27,7 @@ use super::{
     add_frames, check_cycle, checked_header, cut, decode_file, image_frames, push_frames,
     push_solid, read_encoded, read_file, renumber, resolve_file, texels,
 };
+use crate::atlas::cell_fits_page;
 use crate::quad::Filter;
 use crate::widget::text::MAX_TEXT_ELEMENTS;
 
@@ -339,6 +340,20 @@ impl SheetBuilder {
         u32::try_from(image).map_err(|_| ImageError::TooManyImages { n: image + 1 })
     }
 
+    /// The cell [`add_image`](Self::add_image) would cut from `def` in its
+    /// file's 1x version; `None` when it would refuse the file, the grid
+    /// or the cut.
+    #[must_use]
+    pub fn image_cell(&self, def: &ImageDef) -> Option<[u32; 2]> {
+        if def.grid.contains(&0) {
+            return None;
+        }
+        let file = usize::try_from(def.file)
+            .ok()
+            .and_then(|f| self.files.get(f))?;
+        cut(0, def, file.lo.dims).ok().map(|(_, cell)| cell)
+    }
+
     /// Adds a generated image of one colour, returning its index. No file
     /// is read, admitted or attempted.
     ///
@@ -425,10 +440,11 @@ impl SheetBuilder {
     /// more than the sheet has left of [`MAX_SHEET_GLYPHS`] and
     /// [`MAX_SHEET_KERNINGS`]. Then the pages, all or nothing: each page's
     /// attempt, metadata, byte totals, image and frame; then each header
-    /// and the texel totals; then every glyph inside its page; then each
-    /// page decoded and dropped, one at a time, so a corrupt page fails
-    /// this font rather than the atlas: whole, or in bands of rows when it
-    /// was admitted to be ([`MAX_STREAMED_TEXELS`](super::MAX_STREAMED_TEXELS)).
+    /// and the texel totals; then every page small enough for an atlas page
+    /// ([`cell_fits_page`]) and every glyph inside its page; then each page
+    /// decoded and dropped, one at a time, so a corrupt page fails this font
+    /// rather than the atlas: whole, or in bands of rows when it was
+    /// admitted to be ([`MAX_STREAMED_TEXELS`](super::MAX_STREAMED_TEXELS)).
     /// Each page becomes a whole-file image of one frame, filtered
     /// linearly.
     ///
@@ -537,6 +553,15 @@ impl SheetBuilder {
             lo_texels = lo_texels.with(texels(d)).ok_or(limit(FntLimit::Texels))?;
             hi_texels = hi_texels.with(texels(d)).ok_or(limit(FntLimit::Texels))?;
             dims.push((d, mode));
+        }
+        // A page is one cell of the atlas.
+        if let Some(p) = dims.iter().position(|&(d, _)| !cell_fits_page(d)) {
+            return Err(file_err(FntError {
+                line: 0,
+                kind: FntErrorKind::PageRefused {
+                    page: u8::try_from(p).unwrap_or(u8::MAX),
+                },
+            }));
         }
         for g in file.glyphs().iter().chain(file.missing().as_ref()) {
             let [x, y, w, h] = g.src.map(u32::from);

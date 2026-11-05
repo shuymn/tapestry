@@ -18,6 +18,7 @@ use skin_model::{
     Track, Ty,
 };
 
+use super::super::asset::NotAdded;
 use super::super::policy::{CriticalPart, Role};
 use super::super::property::{self, IndexProp, IntProp, Value};
 use super::super::report::{NoteKind, PropertyKind, Span, TrackWhy};
@@ -168,7 +169,11 @@ impl Cx<'_> {
         };
         Ok(match self.assets.add_image(key, None, def, cell) {
             Ok(found) => Ok(found),
-            Err(_) => Err(Unplaced {
+            Err(NotAdded::CellTooLarge { w, h }) => Err(Unplaced {
+                why: NoteKind::CellTooLarge { w, h },
+                missing: false,
+            }),
+            Err(NotAdded::Image(_)) => Err(Unplaced {
                 why: NoteKind::MissingAsset,
                 missing: false,
             }),

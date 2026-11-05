@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use skin_model::{
     AdmitError, BitmapFontError, Charge, FileDef, Filter, FntAdmitError, FntError, FntFileError,
     FntLimit, FontAdmitError, FontDef, FontError, ImageDef, ImageError, MAX_PATH_BYTES, Refused,
-    Root, Sheet, SheetBuilder, SolidImageDef, TexelCap, Unbanded,
+    Root, Sheet, SheetBuilder, SolidImageDef, TexelCap, Unbanded, cell_fits_page,
 };
 
 use super::Config;
@@ -247,6 +247,15 @@ pub(crate) type ImageKey = (u32, bool, [u32; 2], bool);
 /// the count.
 pub(crate) type Crop = [u32; 2];
 
+/// Why an image was not added to the sheet.
+#[derive(Debug)]
+pub(crate) enum NotAdded {
+    /// Its cell, as the sheet would admit it, fits no atlas page.
+    CellTooLarge { w: u32, h: u32 },
+    /// The sheet refused it.
+    Image(ImageError),
+}
+
 /// The size of a note part's generated paint, as the source generates
 /// it (`play/SkinNote.java:113-138`).
 pub(crate) const FALLBACK_SIZE: [u32; 2] = [32, 8];
@@ -463,14 +472,16 @@ impl Assets {
 
     /// Adds image `def` with cells of `cell` under `key`, its single
     /// frame cut to the rows of `crop` when there is one; returns the
-    /// image and its cell.
+    /// image and its cell. The cell the sheet admits, after an edge
+    /// substitution and `crop`, must fit an atlas page; no import has an
+    /// @2x file, so its 1x size is the one an atlas reads.
     pub(crate) fn add_image(
         &mut self,
         key: ImageKey,
         crop: Option<Crop>,
         def: ImageDef,
         cell: [u32; 2],
-    ) -> Result<(u32, [u32; 2]), ImageError> {
+    ) -> Result<(u32, [u32; 2]), NotAdded> {
         let (added, added_cell) = match (crop, def.rect) {
             (Some([y, rows]), Some([x, _, w, _])) => (
                 ImageDef {
@@ -481,7 +492,12 @@ impl Assets {
             ),
             _ => (def, cell),
         };
-        let i = self.builder.add_image(added)?;
+        if let Some(admitted @ [w, h]) = self.builder.image_cell(&added)
+            && !cell_fits_page(admitted)
+        {
+            return Err(NotAdded::CellTooLarge { w, h });
+        }
+        let i = self.builder.add_image(added).map_err(NotAdded::Image)?;
         self.bases.insert(key, (def, cell));
         self.images.insert((key, crop), (i, added_cell));
         Ok((i, added_cell))
