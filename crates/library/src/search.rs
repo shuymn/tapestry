@@ -22,10 +22,12 @@
 //! WAL mode it reads the last committed batch of a running scan and neither
 //! waits for the writer nor holds it up.
 
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
+use std::path::{MAIN_SEPARATOR, MAIN_SEPARATOR_STR, PathBuf};
 
 use bms_parser::Header;
-use rusqlite::{Connection, ToSql};
+use rusqlite::{Connection, ToSql, params_from_iter};
 use unicode_normalization::UnicodeNormalization as _;
 
 use crate::ChartEntry;
@@ -203,19 +205,28 @@ fn order(sort: Sort, by_folder: bool) -> String {
     terms
 }
 
+/// Every listed chart, of [`candidates`].
+const ALL_LISTED: &str = "charts c WHERE c.mode = 0";
+
+/// The statement that chooses a search's rows: its limit, parameter `limit`,
+/// counts only rows that match, and only listed ones match.
+fn candidates(from: &str, order: &str, limit: usize) -> String {
+    format!("SELECT c.id FROM {from} ORDER BY {order} LIMIT ?{limit}")
+}
+
 /// The charts `search` finds, in its order, at most its limit.
 pub fn run(conn: &Connection, search: &Search<'_>) -> rusqlite::Result<Vec<ChartEntry>> {
     let limit = i64::try_from(search.limit).unwrap_or(i64::MAX);
     let filter = Filter::of(search.text);
     let (from, mut args): (&str, Vec<&dyn ToSql>) = match &filter {
-        Filter::All => ("charts c", Vec::new()),
+        Filter::All => (ALL_LISTED, Vec::new()),
         Filter::Phrase { phrase, needle } => (
             "charts_fts JOIN charts c ON c.id = charts_fts.rowid
-             WHERE charts_fts MATCH ?1 AND instr(c.norm_text, ?2) > 0",
+             WHERE charts_fts MATCH ?1 AND instr(c.norm_text, ?2) > 0 AND c.mode = 0",
             vec![phrase, needle],
         ),
         Filter::Like(pattern) => (
-            r"charts c WHERE c.norm_text LIKE ?1 ESCAPE '\'",
+            r"charts c WHERE c.norm_text LIKE ?1 ESCAPE '\' AND c.mode = 0",
             vec![pattern],
         ),
     };
@@ -224,15 +235,199 @@ pub fn run(conn: &Connection, search: &Search<'_>) -> rusqlite::Result<Vec<Chart
     args.push(&limit);
     let order = order(search.sort, search.by_folder);
     let sql = format!(
-        "SELECT {} FROM charts c WHERE c.id IN (
-             SELECT c.id FROM {from} ORDER BY {order} LIMIT ?{}
-         ) ORDER BY {order}",
+        "SELECT {} FROM charts c WHERE c.id IN ({}) ORDER BY {order}",
         db::ENTRY_COLUMNS,
-        args.len(),
+        candidates(from, &order, args.len()),
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query(args.as_slice())?;
     rows.mapped(db::entry).collect()
+}
+
+/// A folder of the library as it is stored: made only by
+/// [`Library::top`](crate::Library::top) and
+/// [`Library::level`](crate::Library::level), so no spelling from the settings
+/// reaches a query.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct FolderKey(String);
+
+impl FolderKey {
+    /// The folder.
+    #[must_use]
+    pub fn path(&self) -> PathBuf {
+        PathBuf::from(&self.0)
+    }
+}
+
+/// A folder that is a level of its own.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FolderRow {
+    /// The folder.
+    pub key: FolderKey,
+    /// Its directory's name, or a root's whole path when it has none.
+    pub name: String,
+    /// The listed charts under it, at any depth.
+    pub charts: u64,
+}
+
+/// What [`Library::level`](crate::Library::level) lists of a folder.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Level {
+    /// Its subfolders that are levels, by name.
+    pub folders: Vec<FolderRow>,
+    /// Its own charts and its song folders', in the order asked for.
+    pub charts: Vec<ChartEntry>,
+    /// Whether there were more rows than the limit.
+    pub more: bool,
+}
+
+/// The stored folders under `key` are `lo <= folder < hi`: the bytes of its
+/// text, then exactly one separator, so a sibling sharing its text as a
+/// prefix (`a b`, `a]`) is not among them.
+fn range(key: &str) -> (String, String) {
+    let lo = if key.ends_with(MAIN_SEPARATOR) {
+        key.to_owned()
+    } else {
+        format!("{key}{MAIN_SEPARATOR_STR}")
+    };
+    let mut hi = lo.clone();
+    hi.pop();
+    hi.push(char::from(MAIN_SEPARATOR as u8 + 1));
+    (lo, hi)
+}
+
+/// `(folder, listed charts)` of every stored folder under `key`, in path order.
+fn under(conn: &Connection, key: &str) -> rusqlite::Result<Vec<(String, u64)>> {
+    let (lo, hi) = range(key);
+    let mut stmt = conn.prepare(
+        "SELECT folder, COUNT(*) FROM charts
+         WHERE mode = 0 AND folder >= ?1 AND folder < ?2 GROUP BY folder",
+    )?;
+    let rows = stmt.query_map([&lo, &hi], |r| {
+        Ok((r.get(0)?, u64::try_from(r.get::<_, i64>(1)?).unwrap_or(0)))
+    })?;
+    rows.collect()
+}
+
+/// The listed charts directly in `key`.
+fn direct(conn: &Connection, key: &str) -> rusqlite::Result<u64> {
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM charts WHERE mode = 0 AND folder = ?1",
+        [key],
+        |r| r.get(0),
+    )?;
+    Ok(u64::try_from(n).unwrap_or(0))
+}
+
+/// See [`Library::top`](crate::Library::top).
+pub fn top(conn: &Connection) -> rusqlite::Result<Vec<FolderRow>> {
+    let mut stmt = conn.prepare("SELECT path FROM roots ORDER BY path")?;
+    let roots: Vec<String> = stmt
+        .query_map([], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut rows = Vec::new();
+    for root in roots {
+        let below: u64 = under(conn, &root)?.iter().map(|&(_, n)| n).sum();
+        let charts = below + direct(conn, &root)?;
+        if charts > 0 {
+            let name = std::path::Path::new(&root)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(&root)
+                .to_owned();
+            rows.push(FolderRow {
+                key: FolderKey(root),
+                name,
+                charts,
+            });
+        }
+    }
+    Ok(rows)
+}
+
+/// The most song folders one chart query names: below SQLite's limit on
+/// parameters. Each holds a chart, so a level with more is past any list's
+/// limit.
+const MOST_FOLDERS: usize = 30_000;
+
+/// See [`Library::level`](crate::Library::level). `between` runs between its
+/// two reads, for the test that a commit there changes neither.
+pub fn level(
+    conn: &Connection,
+    key: &FolderKey,
+    sort: Sort,
+    limit: usize,
+    between: impl FnOnce(),
+) -> rusqlite::Result<Level> {
+    // A read transaction: one snapshot for both reads. Rolled back unused.
+    let tx = conn.unchecked_transaction()?;
+    let key_text = key.0.as_str();
+    let (lo, _) = range(key_text);
+    // Each direct subfolder: its own charts, those below it, by name.
+    let mut children: BTreeMap<&str, (u64, u64)> = BTreeMap::new();
+    let found = under(&tx, key_text)?;
+    for (folder, n) in &found {
+        let rest = folder.get(lo.len()..).unwrap_or_default();
+        let (name, below) = rest
+            .split_once(MAIN_SEPARATOR)
+            .map_or((rest, false), |(name, _)| (name, true));
+        let child = children.entry(name).or_default();
+        if below {
+            child.1 += n;
+        } else {
+            child.0 += n;
+        }
+    }
+    let mut folders = Vec::new();
+    // A song folder: charts of its own and nothing listed below it. It has no
+    // row: its charts are this level's.
+    let mut holding = vec![key_text.to_owned()];
+    for (name, (own, below)) in children {
+        if below == 0 {
+            holding.push(format!("{lo}{name}"));
+        } else {
+            folders.push(FolderRow {
+                key: FolderKey(format!("{lo}{name}")),
+                name: name.to_owned(),
+                charts: own + below,
+            });
+        }
+    }
+    between();
+    let more_folders = folders.len() > limit;
+    folders.truncate(limit);
+    let left = limit - folders.len();
+    let more_named = holding.len() > MOST_FOLDERS;
+    holding.truncate(MOST_FOLDERS);
+    let marks = vec!["?"; holding.len()].join(", ");
+    let sql = format!(
+        "SELECT {} FROM charts c INDEXED BY charts_browse
+         WHERE c.mode = 0 AND c.folder IN ({marks})
+         ORDER BY {} LIMIT {}",
+        db::ENTRY_COLUMNS,
+        order(sort, false),
+        i64::try_from(left)
+            .unwrap_or(i64::MAX - 1)
+            .saturating_add(1),
+    );
+    let mut stmt = tx.prepare(&sql)?;
+    let rows = stmt.query(params_from_iter(&holding))?;
+    let mut charts: Vec<ChartEntry> = rows.mapped(db::entry).collect::<rusqlite::Result<_>>()?;
+    let more_charts = charts.len() > left;
+    charts.truncate(left);
+    Ok(Level {
+        folders,
+        charts,
+        more: more_folders || more_named || more_charts,
+    })
+}
+
+/// See [`Library::unlisted`](crate::Library::unlisted).
+pub fn unlisted(conn: &Connection) -> rusqlite::Result<u64> {
+    let n: i64 = conn.query_row("SELECT COUNT(*) FROM charts WHERE mode <> 0", [], |r| {
+        r.get(0)
+    })?;
+    Ok(u64::try_from(n).unwrap_or(0))
 }
 
 #[cfg(test)]
@@ -275,17 +470,64 @@ mod tests {
         db::create(&conn).unwrap();
         let plan = |sql: &str| -> String {
             let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
-            let rows = stmt.query_map([], |r| r.get::<_, String>(3)).unwrap();
+            let rows = stmt.query_map([200], |r| r.get::<_, String>(3)).unwrap();
             rows.collect::<rusqlite::Result<Vec<_>>>()
                 .unwrap()
                 .join("; ")
         };
-        let title = plan(&format!(
-            "SELECT c.id FROM charts c ORDER BY {} LIMIT 200",
-            order(Sort::Title, false)
-        ));
+        let title = plan(&candidates(ALL_LISTED, &order(Sort::Title, false), 1));
         assert!(title.contains("charts_title"), "{title}");
         assert!(!title.contains("TEMP B-TREE"), "{title}");
+    }
+
+    /// A commit between a level's two reads changes neither: its song folder
+    /// was found before it, and its charts are read at the same snapshot.
+    #[test]
+    fn a_levels_two_reads_see_one_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("songs");
+        let song = root.join("shard").join("song");
+        std::fs::create_dir_all(&song).unwrap();
+        std::fs::write(song.join("a.bms"), "#TITLE a\n#00138:01\n").unwrap();
+        let db_path = dir.path().join("library.db");
+        let (lib, _) = crate::Library::open(&db_path).unwrap();
+        lib.scan(std::slice::from_ref(&root), crate::ScanOptions::default())
+            .unwrap()
+            .finish()
+            .unwrap();
+        let shard = FolderKey(root.join("shard").to_str().unwrap().to_owned());
+        let folder = song.to_str().unwrap().to_owned();
+        let before = level(lib.reader(), &shard, Sort::Title, 10, || {}).unwrap();
+        assert_eq!(before.charts.len(), 1);
+        let during = level(lib.reader(), &shard, Sort::Title, 10, || {
+            Connection::open(&db_path)
+                .unwrap()
+                .execute(
+                    "INSERT INTO charts (root, path, size, mtime_ns, sha256, md5, title, norm_text,
+                         folder, mode, random, loader)
+                     SELECT id, 'new.bms', 0, 0, zeroblob(32), zeroblob(16), 'new', 'new', ?1,
+                         0, 0, 0
+                     FROM roots",
+                    [&folder],
+                )
+                .unwrap();
+        })
+        .unwrap();
+        assert_eq!(during, before);
+        let after = level(lib.reader(), &shard, Sort::Title, 10, || {}).unwrap();
+        assert_eq!(after.charts.len(), 2, "the commit itself went through");
+    }
+
+    #[test]
+    fn a_range_ends_in_one_separator() {
+        let (lo, hi) = range("root");
+        assert_eq!(lo, format!("root{MAIN_SEPARATOR}"));
+        assert!(lo < hi);
+        let (rooted, _) = range(&format!("root{MAIN_SEPARATOR}"));
+        assert_eq!(rooted, lo);
+        assert!(format!("root{MAIN_SEPARATOR}child") < hi);
+        assert!("root b" < lo.as_str(), "a sibling sorts before");
+        assert!(format!("root{}", char::from(MAIN_SEPARATOR as u8 + 1)) >= hi);
     }
 
     #[test]

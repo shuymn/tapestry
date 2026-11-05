@@ -6,21 +6,27 @@
 //! the bests phase of a scan pass; and the cached loudness measurements of
 //! the charts played (design.md "Algorithms").
 //!
-//! # Schema version 5
+//! # Schema version 6
 //!
 //! [`SCHEMA_VERSION`] is kept in `PRAGMA user_version`.
 //!
 //! - `roots(id, path UNIQUE)`: the roots of the latest scan.
 //! - `charts(id, root, path UNIQUE, size, mtime_ns, sha256, md5, title,
 //!   subtitle, artist, subartist, genre, playlevel, difficulty, bpm,
-//!   norm_text, title_key, artist_key, folder)`: the header values as
-//!   [`bms_parser::read_header`] reads them, `NULL` when undeclared; the
-//!   searched fields normalized and joined ([`Search`]); the normalized
-//!   title and artist, by which [`Sort::Title`] and [`Sort::Artist`] order;
-//!   and the folder of the path, by which [`Search::by_folder`] groups.
-//!   Indexed by `root`, and by `(title_key IS NULL, title_key, path)`, the
+//!   norm_text, title_key, artist_key, folder, mode, random, loader, taps,
+//!   longs, mines, length_us, tempo_start, tempo_min, tempo_max)`: the header
+//!   values as [`bms_parser::read_scanned`] reads them, `NULL` when
+//!   undeclared; the searched fields normalized and joined ([`Search`]); the
+//!   normalized title and artist, by which [`Sort::Title`] and [`Sort::Artist`]
+//!   order; the folder of the path, by which [`Search::by_folder`] groups; the
+//!   mode ([`ChartMode`]), of which only 7-key is ever listed; the flag of
+//!   `#RANDOM`; the loader version that wrote the row, and a row of another is
+//!   read again; and the seed-0 branch's summary ([`ChartSummary`]), `NULL`
+//!   when the loader refuses it, its tempos 16 big-endian bytes.
+//!   Indexed by `root`; by `(mode, title_key IS NULL, title_key, path)`, the
 //!   [`Sort::Title`] order, so an unfiltered list reads only the rows it
-//!   returns.
+//!   returns; and by `(mode, folder)`, by which [`Library::level`] finds a
+//!   level's folders.
 //! - `charts_fts(norm_text)`: an FTS5 trigram index of `charts.norm_text`,
 //!   kept in the same transactions as `charts` by triggers.
 //! - `charts_sha(sha256, path)`: the index by which a record finds its
@@ -94,17 +100,18 @@ pub use bests::{
     BESTS_VERSION, Best, Contribution, Ineligible, Ingested, Key, LN_MODE, PlayId, Score, Verified,
     counts_for_best, ineligible,
 };
-pub use bms_parser::Header;
+pub use bms_model::ChartSummary;
+pub use bms_parser::{ChartMode, Header};
 pub use db::Tuple;
 pub use loudness::{LoudnessKey, LoudnessRow};
 pub use scan::{
     BATCH, BEST_BATCH, BestsReport, HEADER_FIELD_BYTES, REBUILD_MEMORY, Refusal, Refusals, Scan,
     ScanError, ScanOptions, ScanReport, ThreadStart, stamp,
 };
-pub use search::{SEPARATOR, Search, Sort};
+pub use search::{FolderKey, FolderRow, Level, SEPARATOR, Search, Sort};
 
 /// The schema version this build reads and writes.
-pub const SCHEMA_VERSION: i64 = 5;
+pub const SCHEMA_VERSION: i64 = 6;
 
 /// Why the library database cannot be opened, read or scanned.
 #[derive(Debug, thiserror::Error)]
@@ -207,6 +214,11 @@ pub struct ChartEntry {
     pub md5: [u8; 16],
     /// Its descriptive header.
     pub header: Header,
+    /// Whether it declares `#RANDOM` or `#SETRANDOM`, in any branch.
+    pub random: bool,
+    /// Its seed-0 branch's summary; `None` when the loader refuses that
+    /// branch.
+    pub summary: Option<ChartSummary>,
 }
 
 /// The lock beside a database file, held by its [`Library`] and by the lease
@@ -570,6 +582,39 @@ impl Library {
         })
     }
 
+    /// One folder row per stored root that has listed charts, in path order:
+    /// what selection lists with several roots, and the keys of the roots'
+    /// levels ([`level`](Self::level)).
+    ///
+    /// # Errors
+    ///
+    /// [`LibraryError::Database`] when SQLite refuses the query.
+    pub fn top(&self) -> Result<Vec<FolderRow>, LibraryError> {
+        search::top(&self.reader).map_err(|e| self.database(e))
+    }
+
+    /// A folder's level (design.md "Play Lifecycle", Selection): its folder
+    /// rows by name, then the chart rows, its own charts and its song
+    /// folders', in `sort` order, at most `limit` rows together. One read
+    /// transaction, so a scan's commit cannot fall between them.
+    ///
+    /// # Errors
+    ///
+    /// [`LibraryError::Database`] when SQLite refuses the query.
+    pub fn level(&self, key: &FolderKey, sort: Sort, limit: usize) -> Result<Level, LibraryError> {
+        search::level(&self.reader, key, sort, limit, || {}).map_err(|e| self.database(e))
+    }
+
+    /// How many indexed charts are of other modes and so listed nowhere, for
+    /// the log.
+    ///
+    /// # Errors
+    ///
+    /// [`LibraryError::Database`] when SQLite refuses the query.
+    pub fn unlisted(&self) -> Result<u64, LibraryError> {
+        search::unlisted(&self.reader).map_err(|e| self.database(e))
+    }
+
     /// Starts a scan of `roots` on its own threads, with its own writer
     /// connection (design.md "Coexisting with Other Software": it pauses
     /// during play, and [`ScanOptions::on_thread_start`] can lower its
@@ -590,7 +635,12 @@ impl Library {
             path: self.path.clone(),
             source,
         })?;
-        scan::start(writer, roots.to_vec(), options, lease).map_err(LibraryError::Spawn)
+        // One spelling of each root, from which every stored path derives.
+        let roots = roots
+            .iter()
+            .map(|root| root.components().collect())
+            .collect();
+        scan::start(writer, roots, options, lease).map_err(LibraryError::Spawn)
     }
 
     /// The reader connection, for tests that change the database under a
