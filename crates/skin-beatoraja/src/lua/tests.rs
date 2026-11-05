@@ -68,6 +68,47 @@ pub(crate) fn install_continued(lua: &mlua::Lua, env: &mlua::Table) -> mlua::Res
 }
 
 thread_local! {
+    /// The charge site that fails next, as its cap ([`fail_at`]).
+    static FAIL_AT: Cell<Option<&'static str>> = const { Cell::new(None) };
+    /// Each charge site's units charged, and how often its work started.
+    static SITE_CHARGED: RefCell<std::collections::HashMap<&'static str, u64>> =
+        RefCell::new(std::collections::HashMap::new());
+    static SITE_DID: RefCell<std::collections::HashMap<&'static str, u64>> =
+        RefCell::new(std::collections::HashMap::new());
+}
+
+/// Makes the charge at `site` fail with its cap, and clears every site's
+/// counts.
+pub(crate) fn fail_next(site: Option<&'static str>) {
+    FAIL_AT.with(|f| f.set(site));
+    SITE_CHARGED.with(|m| m.borrow_mut().clear());
+    SITE_DID.with(|m| m.borrow_mut().clear());
+}
+
+/// Whether the charge at `site` is to fail.
+pub(crate) fn fail_at(site: &'static str) -> bool {
+    FAIL_AT.with(Cell::get) == Some(site)
+}
+
+/// Records `n` units charged at `site`.
+pub(crate) fn site_charged(site: &'static str, n: u64) {
+    SITE_CHARGED.with(|m| *m.borrow_mut().entry(site).or_default() += n);
+}
+
+/// Records that the work charged at `site` started.
+pub(crate) fn site_did(site: &'static str) {
+    SITE_DID.with(|m| *m.borrow_mut().entry(site).or_default() += 1);
+}
+
+/// The units charged at `site`, and how often its work started.
+pub(crate) fn site(site: &'static str) -> (u64, u64) {
+    (
+        SITE_CHARGED.with(|m| m.borrow().get(site).copied().unwrap_or(0)),
+        SITE_DID.with(|m| m.borrow().get(site).copied().unwrap_or(0)),
+    )
+}
+
+thread_local! {
     /// The size-memo slots this thread's lowerings held, summed.
     pub(crate) static MEMO_SLOTS: Cell<usize> = const { Cell::new(0) };
 }

@@ -3,19 +3,23 @@
 //! node's line, lexical scopes resolved as it parses, and each function
 //! constructor recorded with its byte span, so that the configured pass
 //! can tag every closure before it runs ([`super::instrument`]) and the
-//! callbacks are classified on the tree ([`super::callback`]), never by
+//! callbacks are evaluated on the tree ([`super::residual`]), never by
 //! matching source text.
 //!
 //! Every name is resolved where it is read: to a local declaration (a
 //! `local`, a parameter, `self`, a loop variable), to the chunk's own
 //! `_ENV` cell for a bare `_ENV` no local shadows, or to a global, read
-//! through the `_ENV` in scope. A declaration counts the assignments to
-//! it after its own. A function lists the declarations of enclosing
-//! functions it reads directly, its upvalues, `_ENV` among them when it
-//! reads a global, and its static access paths: each chain of indexes by
-//! constant strings from one of its upvalues or a global, the entries its
-//! captures copy. Every statement keeps its parts, and a float numeral
-//! its value.
+//! through the `_ENV` in scope. A declaration records whether an
+//! assignment after its own targets it, in any function. A function lists
+//! the declarations of enclosing functions it reads directly, its
+//! upvalues, `_ENV` among them when it reads a global, and its static
+//! access paths: each chain of indexes by constant strings from one of
+//! its upvalues or a global, the entries its captures copy. Every
+//! statement keeps its parts, a float numeral its value, and an integer
+//! numeral written past 2^53 is recorded as wide
+//! ([`Ast::wide_numerals`]); each `local d = X.timer_off_value` with one
+//! name and one expression is recorded for the tagger's marker
+//! ([`Ast::marks`]).
 //!
 //! Bounds, each charged before its work: [`MAX_AST_NODES`] nodes
 //! (expressions, statements, declarations, functions, path steps and list
@@ -264,6 +268,9 @@ pub(crate) struct Decl {
     pub(crate) init: u32,
     /// Whether it is named `_ENV`.
     pub(crate) env: bool,
+    /// Whether an assignment after its declaration targets it, in any
+    /// function.
+    pub(crate) assigned: bool,
 }
 
 /// How a function constructor is written.
@@ -323,6 +330,23 @@ pub(crate) struct Ast {
     /// The numbers `n` of the names `tapestry_tag<n>` the source uses,
     /// which the tagger's name avoids ([`super::instrument`]).
     pub(crate) tag_names: Vec<u64>,
+    /// The integer numerals whose value as written is past [`EXACT`], by
+    /// expression id in increasing order, each charged as a node: the
+    /// source's LuaJ holds another double ([`Ast::wide`]).
+    pub(crate) wide_numerals: Vec<u32>,
+    /// The `local d = X.timer_off_value` declarations, one name and one
+    /// expression, each charged as a node: the tagger marks them
+    /// ([`super::instrument`]).
+    pub(crate) marks: Vec<Mark>,
+}
+
+/// A `local d = X.timer_off_value` declaration: `d`, where `X` starts,
+/// and where the `.` after it starts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Mark {
+    pub(crate) decl: u32,
+    pub(crate) start: u32,
+    pub(crate) dot: u32,
 }
 
 impl Ast {
@@ -362,6 +386,12 @@ impl Ast {
         self.paths.get(s..s + n).unwrap_or_default()
     }
 
+    /// Whether expression `e` is a wide integer numeral
+    /// ([`Self::wide_numerals`]): a binary search.
+    pub(crate) fn wide(&self, e: u32) -> bool {
+        self.wide_numerals.binary_search(&e).is_ok()
+    }
+
     /// The bytes of string `id`.
     pub(crate) fn str(&self, id: u32) -> &[u8] {
         self.strs
@@ -383,11 +413,17 @@ pub(crate) enum Fail {
     Cancelled,
 }
 
+/// 2^53: every integer of at most this magnitude is exact as a double.
+pub(crate) const EXACT: u64 = 1 << 53;
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Tok {
     Eof,
     Name,
     Int(i64),
+    /// An integer numeral whose value as written is past [`EXACT`], as
+    /// Lua 5.4 reads it.
+    Wide(i64),
     /// A float numeral, by its value's bits.
     Float(u64),
     Str(u32),
@@ -925,7 +961,10 @@ fn utf8(v: u32, out: &mut Vec<u8>) {
 /// only decimal digits that fit (an overflowing one is a float) or is
 /// hexadecimal without a point or an exponent (wrapping), else a float
 /// when it reads as one, its value rounded to nearest as `strtod` rounds
-/// it; `None` when it is malformed.
+/// it; `None` when it is malformed. An integer whose value as written is
+/// past [`EXACT`] is [`Tok::Wide`]: the source's LuaJ reads it as a double
+/// (`LexState.strx2number` accumulates a hexadecimal one in a double,
+/// which keeps it positive), another value than the integer.
 fn number(text: &[u8], tick: &mut dyn FnMut() -> Result<(), Fail>) -> Result<Option<Tok>, Fail> {
     // Each byte visited once per scan, each visit a tick.
     let mut all = |t: &[u8], f: fn(&u8) -> bool| -> Result<bool, Fail> {
@@ -942,12 +981,22 @@ fn number(text: &[u8], tick: &mut dyn FnMut() -> Result<(), Fail>) -> Result<Opt
         let digits = &text[2..];
         if !digits.is_empty() && all(digits, u8::is_ascii_hexdigit)? {
             let mut v: u64 = 0;
+            // The value as written, while it is within `EXACT`.
+            let mut exact = Some(0_u64);
             for &d in digits {
                 tick()?;
                 let d = char::from(d).to_digit(16).unwrap_or(0);
                 v = v.wrapping_mul(16).wrapping_add(u64::from(d));
+                exact = exact
+                    .and_then(|x| x.checked_mul(16)?.checked_add(u64::from(d)))
+                    .filter(|&x| x <= EXACT);
             }
-            return Ok(Some(Tok::Int(v.cast_signed())));
+            let v = v.cast_signed();
+            return Ok(Some(if exact.is_some() {
+                Tok::Int(v)
+            } else {
+                Tok::Wide(v)
+            }));
         }
         if !float(digits, true, tick)? {
             return Ok(None);
@@ -966,7 +1015,11 @@ fn number(text: &[u8], tick: &mut dyn FnMut() -> Result<(), Fail>) -> Result<Opt
                 None => return Ok(Some(Tok::Float(decimal_float(text)))),
             }
         }
-        return Ok(Some(Tok::Int(v)));
+        return Ok(Some(if v.unsigned_abs() <= EXACT {
+            Tok::Int(v)
+        } else {
+            Tok::Wide(v)
+        }));
     }
     Ok(float(text, false, tick)?.then(|| Tok::Float(decimal_float(text))))
 }
@@ -1174,6 +1227,9 @@ struct Parser<'a, 'c> {
     scratch: Vec<u32>,
     /// Where the last token consumed ends.
     last_end: u32,
+    /// The last index by `.name` parsed: its expression and where its
+    /// `.` starts.
+    last_dot: (u32, u32),
 }
 
 /// Parses `src`, charging its nodes to `charged` (the candidate's count
@@ -1200,6 +1256,7 @@ pub(crate) fn parse(src: &[u8], charged: &mut u64, cancel: &dyn Fn() -> bool) ->
         funcs: Vec::new(),
         scratch: Vec::new(),
         last_end: 0,
+        last_dot: (NONE, 0),
     };
     p.chunk()?;
     Ok(p.ast)
@@ -1220,6 +1277,20 @@ impl<'a> Parser<'a, '_> {
             return Err(Fail::Cancelled);
         }
         Ok(())
+    }
+
+    /// [`Self::charge`] at a named site, which a test can make fail.
+    fn charge_at(&mut self, site: &'static str) -> Result<(), Fail> {
+        #[cfg(test)]
+        {
+            if super::tests::fail_at(site) {
+                return Err(Fail::Nodes);
+            }
+            super::tests::site_charged(site, 1);
+        }
+        #[cfg(not(test))]
+        let _ = site;
+        self.charge()
     }
 
     fn enter(&mut self) -> Result<(), Fail> {
@@ -1319,6 +1390,7 @@ impl<'a> Parser<'a, '_> {
             attrib: Attrib::None,
             init: NONE,
             env,
+            assigned: false,
         });
         Ok(u32::try_from(self.ast.decls.len() - 1).unwrap_or(NONE))
     }
@@ -1773,10 +1845,29 @@ impl<'a> Parser<'a, '_> {
         }
         let names = self.list_from(mark)?;
         let mark = self.scratch.len();
-        if self.accept(Tok::Assign)? {
+        let start = self.tok.start;
+        let assigns = self.accept(Tok::Assign)?;
+        let start = if assigns { self.tok.start } else { start };
+        if assigns {
             self.exprlist()?;
         }
         let exprs = self.list_from(mark)?;
+        // `local d = X.timer_off_value`, the index by `.` the whole
+        // expression: a declaration the tagger marks.
+        if let (&[decl], &[e]) = (self.ast.list(names), self.ast.list(exprs))
+            && let Expr::Index { key, .. } = self.ast.expr(e)
+            && matches!(self.ast.expr(key), Expr::Str(s) if self.ast.str(s) == b"timer_off_value")
+            && self.last_dot.0 == e
+        {
+            self.charge_at("mark")?;
+            #[cfg(test)]
+            super::tests::site_did("mark");
+            self.ast.marks.push(Mark {
+                decl,
+                start,
+                dot: self.last_dot.1,
+            });
+        }
         // Each name its own initializer, a call's first result; the names
         // past the expressions have none.
         let ns = self.ast.list(names).to_vec();
@@ -1817,10 +1908,17 @@ impl<'a> Parser<'a, '_> {
         self.stmt(Stmt::Call(e), line)
     }
 
-    /// Checks an assignment's target: a local, a global, or a field.
-    fn target(&self, e: u32) -> Result<(), Fail> {
+    /// Checks an assignment's target: a local (counted as assigned), a
+    /// global, or a field.
+    fn target(&mut self, e: u32) -> Result<(), Fail> {
         match self.ast.expr(e) {
-            Expr::Local(_) | Expr::Global { .. } | Expr::Index { .. } => Ok(()),
+            Expr::Local(d) => {
+                if let Some(x) = self.ast.decls.get_mut(d as usize) {
+                    x.assigned = true;
+                }
+                Ok(())
+            }
+            Expr::Global { .. } | Expr::Index { .. } => Ok(()),
             _ => Err(self.fail()),
         }
     }
@@ -2009,7 +2107,7 @@ impl<'a> Parser<'a, '_> {
     fn simple(&mut self) -> Result<u32, Fail> {
         let t = self.tok;
         let e = match t.tok {
-            Tok::Int(n) => Expr::Int(n),
+            Tok::Int(n) | Tok::Wide(n) => Expr::Int(n),
             Tok::Float(b) => Expr::Float(b),
             Tok::Str(s) => Expr::Str(s),
             Tok::Nil => Expr::Nil,
@@ -2025,7 +2123,15 @@ impl<'a> Parser<'a, '_> {
             _ => return self.suffixed(),
         };
         self.advance()?;
-        self.expr(e, t.line)
+        let id = self.expr(e, t.line)?;
+        if matches!(t.tok, Tok::Wide(_)) {
+            // One node, charged before it is recorded.
+            self.charge_at("wide")?;
+            #[cfg(test)]
+            super::tests::site_did("wide");
+            self.ast.wide_numerals.push(id);
+        }
+        Ok(id)
     }
 
     fn primary(&mut self) -> Result<u32, Fail> {
@@ -2054,11 +2160,12 @@ impl<'a> Parser<'a, '_> {
             let line = self.tok.line;
             match self.tok.tok {
                 Tok::Dot => {
-                    self.advance()?;
+                    let dot = self.advance()?.start;
                     let n = self.expect(Tok::Name)?;
                     let s = self.field_name(n);
                     let key = self.expr(Expr::Str(s), n.line)?;
                     e = self.expr(Expr::Index { obj: e, key }, line)?;
+                    self.last_dot = (e, dot);
                     at = self.path_step(at, s)?;
                 }
                 Tok::LBracket => {
@@ -2168,8 +2275,13 @@ mod tests {
         let n = |t: &[u8]| number(t, &mut || Ok(())).unwrap();
         assert_eq!(n(b"10"), Some(Tok::Int(10)));
         assert_eq!(n(b"0x10"), Some(Tok::Int(16)));
-        assert_eq!(n(b"0xffffffffffffffff"), Some(Tok::Int(-1)));
-        assert_eq!(n(b"9223372036854775807"), Some(Tok::Int(i64::MAX)));
+        assert_eq!(n(b"0xffffffffffffffff"), Some(Tok::Wide(-1)));
+        assert_eq!(n(b"9223372036854775807"), Some(Tok::Wide(i64::MAX)));
+        // Past 2^53, the source's double holds another value.
+        assert_eq!(n(b"9007199254740992"), Some(Tok::Int(1 << 53)));
+        assert_eq!(n(b"9007199254740993"), Some(Tok::Wide((1 << 53) + 1)));
+        assert_eq!(n(b"0x20000000000000"), Some(Tok::Int(1 << 53)));
+        assert_eq!(n(b"0x20000000000001"), Some(Tok::Wide((1 << 53) + 1)));
         let float = |x: f64| Some(Tok::Float(x.to_bits()));
         assert_eq!(
             n(b"9223372036854775808"),

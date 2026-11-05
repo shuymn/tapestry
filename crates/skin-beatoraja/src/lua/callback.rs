@@ -240,6 +240,14 @@ pub(crate) struct Analysis {
     pub(crate) tables: Vec<HashMap<u32, Captured>>,
     /// The captured table that is the pass's own `skin_config`, if one is.
     pub(crate) config: Option<u32>,
+    /// The provenance marker's records ([`super::instrument`]): each
+    /// marked declaration, by its file and declaration (`file << 32 |
+    /// decl`), to whether every value it read `timer_off_value` from was
+    /// the host module's proxy.
+    pub(crate) marks: HashMap<u64, bool>,
+    /// Whether the host module's proxy is as the pass built it: its
+    /// `timer_off_value` read is the host's off value.
+    pub(crate) module_intact: bool,
     /// The first place where the source may run code the analysis does
     /// not model: in conversion order, a script root, an unread entry of
     /// a table it lists, or a font fallback with a metatable; then, in the

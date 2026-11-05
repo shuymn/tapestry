@@ -79,6 +79,8 @@ struct Tags {
     /// The sandbox's library functions, to their index in
     /// [`super::sandbox::LIBS`].
     libs: Table,
+    /// The provenance marker's records ([`super::instrument`]).
+    marks: Table,
     /// The host module proxies: address, module, unchanged.
     proxies: Vec<(usize, u8, bool)>,
     config: Option<Table>,
@@ -179,6 +181,7 @@ pub(super) fn convert(
                 ids: lua.named_registry_value(super::sandbox::TAG_IDS)?,
                 readers: lua.named_registry_value(super::sandbox::TAG_READERS)?,
                 libs: lua.named_registry_value(super::sandbox::LIB_IDS)?,
+                marks: lua.named_registry_value(super::sandbox::TAG_MARKS)?,
                 proxies: super::host::proxies(lua)?,
                 config,
             })
@@ -616,6 +619,38 @@ impl Conv<'_> {
         super::tests::capturing(false);
         r?;
         self.reached();
+        self.marks()
+    }
+
+    /// Copies the provenance marker's records, each charged as a capture
+    /// before it is kept, and whether the host module's proxy is as the
+    /// pass built it.
+    fn marks(&mut self) -> Result<(), ImportError> {
+        let Some(tags) = &self.tags else {
+            return Ok(());
+        };
+        self.analysis.module_intact = tags
+            .proxies
+            .iter()
+            .any(|&(_, m, intact)| m == callback::MAIN_STATE && intact);
+        let marks = tags.marks.clone();
+        for (seen, pair) in marks.pairs::<Value, Value>().enumerate() {
+            self.poll(seen)?;
+            let (k, v) = pair.map_err(|e| self.mlua(&e))?;
+            #[cfg(test)]
+            {
+                if super::tests::fail_at("mark copy") {
+                    return Err(self.lua(LuaWhy::Limit(LuaLimit::Captures)));
+                }
+                super::tests::site_charged("mark copy", 1);
+            }
+            self.charge()?;
+            #[cfg(test)]
+            super::tests::site_did("mark copy");
+            if let (Value::Integer(k), Value::Boolean(v)) = (k, v) {
+                self.analysis.marks.insert(k.cast_unsigned(), v);
+            }
+        }
         Ok(())
     }
 
