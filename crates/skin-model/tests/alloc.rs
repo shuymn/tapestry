@@ -2039,7 +2039,7 @@ fn loading_frame<'a>(
 ) -> LoadingFrame<'a> {
     let view = views.lanes[(no / 7) % views.lanes.len()];
     LoadingFrame {
-        autoplay: no % 2 == 0,
+        autoplay: no.is_multiple_of(2),
         now: TimeUs(since.0 + i64::try_from(no).unwrap() * 16 * MS),
         load: LoadState {
             since,
