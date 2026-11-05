@@ -1069,6 +1069,23 @@ mod tests {
         assert!(lit(&screen) > 100);
     }
 
+    /// A screen for plays only opens no font for what shows no page, its
+    /// launch screen and its text frames: only its first page does.
+    #[test]
+    fn a_screen_for_plays_only_opens_no_font_without_a_page() {
+        use std::time::Duration;
+        let mut screen = MenuScreen::new(warp(), None).with_sink(Box::new(Sent::default()));
+        assert!(matches!(
+            screen.splash(Duration::from_millis(750)),
+            Some(Ok(true))
+        ));
+        screen.text(&["play"]).unwrap();
+        assert!(screen.fonts.is_none());
+        let wait = crate::loading_text::skin_wait_page();
+        screen.menu(&wait, true).unwrap();
+        assert!(screen.fonts.is_some());
+    }
+
     /// Fading the launch screen lays nothing out again: once its glyphs are
     /// in the atlas, a step allocates only inside wgpu's write of the
     /// glyphs' vertices (its staging, as every frame's sprite upload has),
