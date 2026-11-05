@@ -422,6 +422,7 @@ fn other_text_shapes_follow_the_role() {
         "function() return 1 end",
         "function() return nil end",
         "function() return ms.text(1) end",
+        "function() local n = ms.number(110) return \"x\" end",
         "function() return ms.number(101) == 0 and \"a\" or \"b\" end",
         "function() if ms.option(289) then return ms.text(10) else return ms.text(11) end end",
         "function() local tx = ms.text(10)\n\
