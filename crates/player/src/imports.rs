@@ -1062,36 +1062,26 @@ pub fn startup(
             Ran::Refused(why) | Ran::Done(KindOutcome::Refused(why)) => Shown::Refused(why),
             // Only play's skin can be pending ([`built`]).
             Ran::Done(KindOutcome::Pending(play, note)) => {
-                match answered(kind, render.pend(kind), &mut stop) {
-                    Ok(None) => {
+                match answered(kind, render.pend(kind), &mut stop)? {
+                    None => {
                         started.pending = Some(PendingSkin::new(play));
                         Shown::Pending(note.fact)
                     }
-                    Ok(Some(why)) => Shown::Refused(why),
-                    Err(StartupEnd::Failed(e)) => {
-                        report(kind, &Shown::Refused(format!("{e:#}")));
-                        return Err(StartupEnd::Failed(e));
-                    }
-                    Err(closed) => return Err(closed),
+                    Some(why) => Shown::Refused(why),
                 }
             }
             Ran::Done(KindOutcome::BuiltIn(why)) => Shown::BuiltIn(why),
             Ran::Done(KindOutcome::Bundle(bundle, summary)) => {
                 let (texels, side) = (bundle.atlas_texels(), bundle.side());
                 let pending = render.select(kind, Some(bundle));
-                match answered(kind, pending, &mut stop) {
-                    Ok(None) => {
+                match answered(kind, pending, &mut stop)? {
+                    None => {
                         committed = committed.saturating_add(texels);
                         let atlas = Atlas { texels, side };
                         log_installed(kind, &summary, atlas, committed, log::logger());
                         Shown::Installed
                     }
-                    Ok(Some(why)) => Shown::Refused(why),
-                    Err(StartupEnd::Failed(e)) => {
-                        report(kind, &Shown::Refused(format!("{e:#}")));
-                        return Err(StartupEnd::Failed(e));
-                    }
-                    Err(closed) => return Err(closed),
+                    Some(why) => Shown::Refused(why),
                 }
             }
         };
@@ -1132,9 +1122,28 @@ const fn choice_of(skins: &SkinChoices, kind: ScreenKind) -> Option<&SkinChoice>
     }
 }
 
+/// [`polled`], with a failure reported as `kind`'s refused line once the
+/// selection is withdrawn: `None` committed, or the healthy refusal's
+/// reason.
+///
+/// # Errors
+///
+/// As [`polled`].
+fn answered(
+    kind: ScreenKind,
+    pending: crate::render_side::PendingSelect,
+    stop: &mut impl FnMut() -> bool,
+) -> Result<Option<String>, StartupEnd> {
+    let answer = polled(kind, pending, stop);
+    if let Err(StartupEnd::Failed(e)) = &answer {
+        report(kind, &Shown::Refused(format!("{e:#}")));
+    }
+    answer
+}
+
 /// Polls `kind`'s selection `pending` (an installation or the pending
 /// marker) to its end: `None` committed, or the healthy refusal's reason.
-fn answered(
+fn polled(
     kind: ScreenKind,
     mut pending: crate::render_side::PendingSelect,
     stop: &mut impl FnMut() -> bool,
