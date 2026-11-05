@@ -321,6 +321,9 @@ pub(crate) enum Value {
     /// `duration_green`, `:292-314`), while it is known.
     Duration,
     DurationGreen,
+    /// The chart's play level (`playlevel`, `:154`, `:580-584`), while it
+    /// is known.
+    PlayLevel,
     /// One of the eight duration variants' ms or green number, 1312 to
     /// 1327 as `id − 1312` (`:532-556`): the tempo `n / 4` (current,
     /// MAIN, minimum, maximum), with the configured lane cover or none
@@ -410,6 +413,7 @@ impl Value {
             Self::HispeedFraction => "hispeed.x100 % 100",
             Self::Duration => "duration.ms",
             Self::DurationGreen => "duration.green",
+            Self::PlayLevel => "chart.level",
             Self::DurationVariant(n) => DURATION_VARIANTS
                 .get(usize::from(n))
                 .copied()
@@ -425,6 +429,7 @@ impl Value {
             Self::BpmNow => Some("bpm.current_valid"),
             Self::HispeedX100 | Self::HispeedWhole | Self::HispeedFraction => Some("hispeed.valid"),
             Self::Duration | Self::DurationGreen => Some("duration.valid"),
+            Self::PlayLevel => Some("chart.level_valid"),
             Self::DurationVariant(n) => DURATION_VARIANTS_VALID.get(usize::from(n / 2)).copied(),
             _ => None,
         }
@@ -442,6 +447,7 @@ impl Value {
                 | Self::Slow
                 | Self::Early(_)
                 | Self::Late(_)
+                | Self::PlayLevel
         )
     }
 
@@ -528,6 +534,7 @@ fn shown(id: i32) -> Option<Value> {
         422 => Value::Late(5),
         90 => Value::BpmMax,
         91 => Value::BpmMin,
+        96 => Value::PlayLevel,
         160 => Value::BpmNow,
         161 => Value::ElapsedMinutes,
         162 => Value::ElapsedSeconds,
@@ -997,7 +1004,7 @@ mod tests {
 
 #[cfg(test)]
 mod range_tests {
-    use super::{IntProp, int_by_id};
+    use super::{IntProp, Value, int_by_id};
 
     #[test]
     fn every_shown_value_reads_a_declared_field() {
@@ -1010,7 +1017,13 @@ mod range_tests {
                     v.expr()
                 );
                 let (lo, hi) = v.range();
-                assert!(lo >= 0 && lo <= hi && hi <= i64::from(i32::MAX), "{id}");
+                // The play level alone is signed, as `Integer.parseInt` is.
+                let least = if v == Value::PlayLevel {
+                    -i64::from(i32::MAX)
+                } else {
+                    0
+                };
+                assert!(lo >= least && lo <= hi && hi <= i64::from(i32::MAX), "{id}");
             }
         }
     }

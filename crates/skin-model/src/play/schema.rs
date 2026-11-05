@@ -79,9 +79,9 @@ const E: Export = Export::Exportable;
 const T: Export = Export::TapestryOnly;
 
 /// The play screen's state. Fields come from the play view's snapshot,
-/// the rates' whole-attempt denominator, the gauge kind, the BPM range and
-/// the BPM-change fact from the play context, the readouts from the frame and the clocks from
-/// the prepared chart; timers from the play context, the scroll map, the
+/// the rates' whole-attempt denominator, the gauge kind, the BPM range,
+/// the BPM-change fact and the play level from the play context, the
+/// readouts from the frame and the clocks from the prepared chart; timers from the play context, the scroll map, the
 /// snapshot's fail time and the drained effects (stage3.md R3).
 pub static PLAY: Schema = Schema {
     fields: &[
@@ -192,6 +192,15 @@ pub static PLAY: Schema = Schema {
         flag("native.floating", T),
         flag("bpm.change", T),
         flag("bpm.change_valid", T),
+        Field {
+            name: "chart.level",
+            ty: FieldTy::Int {
+                lo: -i32::MAX,
+                hi: READOUT_MAX,
+            },
+            export: T,
+        },
+        flag("chart.level_valid", T),
     ],
     timers: &[
         timer("ready", E),
@@ -396,8 +405,13 @@ pub mod field {
     pub const BPM_CHANGE: u16 = 86;
     /// Whether the play context gives the chart's BPM-change fact.
     pub const BPM_CHANGE_VALID: u16 = 87;
+    /// The chart's play level; 0 while `chart.level_valid` is false.
+    pub const CHART_LEVEL: u16 = 88;
+    /// Whether the chart's play level is known and a number can show it:
+    /// a source number widget reserves `i32::MIN` and `i32::MAX`.
+    pub const CHART_LEVEL_VALID: u16 = 89;
     /// The number of fields.
-    pub const COUNT: usize = 88;
+    pub const COUNT: usize = 90;
 
     /// The `duration.<t>.<k>.ms` slot of the variant at `tempo` (0 to 3:
     /// current, main, min, max), `covered` or not; `.green` and `.valid`
@@ -662,7 +676,9 @@ mod tests {
         assert_eq!(slot("bpm.change"), Some(86));
         assert_eq!(field::BPM_CHANGE_VALID, 87);
         assert_eq!(slot("bpm.change_valid"), Some(87));
-        assert_eq!(field::COUNT, 88);
+        assert_eq!(slot("chart.level"), Some(field::CHART_LEVEL));
+        assert_eq!(slot("chart.level_valid"), Some(field::CHART_LEVEL_VALID));
+        assert_eq!(field::COUNT, 90);
     }
 
     #[test]

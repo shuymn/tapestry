@@ -28,7 +28,10 @@
 //!    phase (alpha, its first key, its end, an image cycle without a
 //!    timer) depends on the start, noted (D3, [`untimed_ok`]); an image
 //!    cycle without a timer runs on `screen` under a timed destination
-//!    too, noted on a critical one ([`start_dependent`]).
+//!    too, noted on a critical one ([`start_dependent`]). A critical one
+//!    whose placement or other colour does change is admitted only if it
+//!    settles, drawn at its last key from the start, its entrance lost
+//!    and noted (D20, [`settles`]).
 //! 8. Play-state display differences on decorative elements are accepted
 //!    (D4, [`super::ops`], [`super::property`]).
 //! 9. Text is always drawn with smooth sampling and normal blending (D5).
@@ -169,6 +172,16 @@ pub(crate) fn unsupported(
 /// visual comparison of a real skin against the source's timing.
 pub(crate) fn untimed_ok(track: &Accepted) -> bool {
     track.fixed_but_alpha()
+}
+
+/// Whether a critical element without a timer is held at its last key
+/// from the start (D20): [`untimed_ok`] refuses its track, and that track
+/// shows its last key's values for all later time. That is exactly a hold:
+/// `loop` at the last key, or past it where the source's first key
+/// (`SkinObject.java:365-371, 573-574`) shows the last's values. A `loop`
+/// before the last key repeats and one of -1 hides (`:361-364`).
+pub(crate) fn settles(track: &Accepted) -> bool {
+    !untimed_ok(track) && track.end == End::Hold
 }
 
 /// Whether what a critical element shows depends on when the state

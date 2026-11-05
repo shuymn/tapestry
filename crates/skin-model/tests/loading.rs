@@ -112,6 +112,7 @@ struct Loader {
     since: TimeUs,
     percent: i32,
     gauge: Option<LoadingGauge>,
+    play_level: Option<i32>,
     covers: CoverSettings,
 }
 
@@ -127,6 +128,7 @@ impl Loader {
             since: TimeUs(0),
             percent: 0,
             gauge: None,
+            play_level: None,
             covers: readouts_for(VIEW).covers,
         }
     }
@@ -145,6 +147,7 @@ impl Loader {
             lanes: VIEW,
             covers: self.covers,
             gauge: self.gauge,
+            play_level: self.play_level,
         };
         self.skin
             .build_loading(&mut self.loading, &frame, &self.uvs, &mut self.batch)
@@ -521,6 +524,54 @@ fn descriptor_programs_follow_the_frame() {
     l.build(400);
     assert_eq!(shown(&l), [0; 4]);
     assert_eq!(l.start(timer::BUILTIN), None);
+}
+
+/// The chosen chart's play level: the programs reading it draw while the
+/// frame gives one, following it; without one, or with what a number
+/// reserves, they draw nothing, negated and unguarded included, and a `when`
+/// on it clears. One reading the descriptor too needs both.
+#[test]
+fn play_level_programs_follow_the_frame() {
+    let mut on_when = untimed(Source::Image(GRADE), [0, 0, 10, 10], Place::SCREEN);
+    on_when.timer = TimerRef::When(0);
+    let mut l = Loader::new(skin(
+        vec![boolean("chart.level == 0")],
+        None,
+        vec![
+            untimed(Source::Number(0), [0, 200, 80, 20], Place::SCREEN),
+            shown_when(MARK, [0, 0, 10, 10], "chart.level_valid"),
+            shown_when(OTHER, [0, 0, 10, 10], "!chart.level_valid"),
+            shown_when(NOTES, [0, 0, 10, 10], "gauge.valid && chart.level_valid"),
+            on_when,
+        ],
+        WidgetDefs {
+            numbers: vec![number("chart.level")],
+            ..WidgetDefs::default()
+        },
+    ));
+    let shown = |l: &Loader| [MARK, OTHER, NOTES, GRADE].map(|i| l.count(i));
+    l.build(100);
+    assert_eq!(shown(&l), [0; 4]);
+    assert_eq!(l.digits(), [0; 0]);
+    l.play_level = Some(12);
+    l.build(200);
+    assert_eq!(shown(&l), [1, 0, 0, 0]);
+    assert_eq!(l.digits(), [1, 2]);
+    assert_eq!(l.field(field::CHART_LEVEL), 12);
+    l.gauge = descriptor(GaugeLook::Normal);
+    l.build(300);
+    assert_eq!(shown(&l), [1, 0, 1, 0]);
+    l.play_level = Some(0);
+    l.build(400);
+    assert_eq!(shown(&l), [1, 0, 1, 1]);
+    assert_eq!(l.start(timer::BUILTIN), Some(400 * MS));
+    for reserved in [None, Some(i32::MIN), Some(i32::MAX)] {
+        l.play_level = reserved;
+        l.build(500);
+        assert_eq!(shown(&l), [0; 4], "{reserved:?}");
+        assert_eq!(l.digits(), [0; 0], "{reserved:?}");
+        assert_eq!(l.start(timer::BUILTIN), None, "{reserved:?}");
+    }
 }
 
 /// The test lines' uv, apart from every sheet frame.

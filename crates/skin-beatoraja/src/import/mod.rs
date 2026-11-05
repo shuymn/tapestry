@@ -308,6 +308,9 @@ struct Common {
     stretch: Stretch,
     stretch_mode: i32,
     untimed: bool,
+    /// Held at its last key from the start ([`policy::settles`]): a D20
+    /// note when it is retained.
+    settled: bool,
     /// Whether a condition differs from the source's in an owner-decided
     /// way, or the element's value does: a D4 note when it is retained.
     display_deviation: bool,
@@ -1227,6 +1230,12 @@ impl<'d> Cx<'d> {
             }
         }
         let mut track = track;
+        // At rest the source's colour is the key's, so an alpha offset adds
+        // to it even where the colour animates (`SkinObject.java:493-519`).
+        let settled = untimed && matches!(role, Role::Critical(_)) && policy::settles(&track);
+        if settled {
+            track.keep_last_from_start();
+        }
         if o.neutral && !alpha.is_empty() {
             self.ignored(
                 at,
@@ -1320,6 +1329,7 @@ impl<'d> Cx<'d> {
             stretch: Stretch::of(dst.stretch),
             stretch_mode: dst.stretch,
             untimed,
+            settled,
             track,
             display_deviation: deviates,
         }))
@@ -1524,10 +1534,18 @@ impl<'d> Cx<'d> {
 
     /// Notes what a retained element or judge part carries: D3 once when
     /// what it shows depends on the state's start ([`Self::untimed_phase`]),
-    /// D4 once when it deviates ([`Common::display_deviation`]), and D9
+    /// D20 once when it lost its entrance ([`Common::settled`]), D4 once
+    /// when it deviates ([`Common::display_deviation`]), and D9
     /// [`LaneApprox::CoverMotion`] once when it follows the covers.
     fn retained(&mut self, c: &Common) -> Result<(), ImportError> {
         self.untimed_phase(c);
+        if c.settled {
+            self.note(
+                Some(c.span),
+                Severity::Deviation,
+                NoteKind::Deviation(DeviationId::D20),
+            );
+        }
         if c.display_deviation {
             self.note(
                 Some(c.span),
