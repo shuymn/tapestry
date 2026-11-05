@@ -279,7 +279,7 @@ pub(crate) enum Unused {
 
 /// A callback where the import consumed it, for the report.
 #[cfg(feature = "dev-tools")]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct Consumed {
     /// The node holding it.
     pub(crate) node: u32,
@@ -289,6 +289,10 @@ pub(crate) struct Consumed {
     pub(crate) disposition: Disposition,
     /// Why it did not lower, when it did not.
     pub(crate) why: Option<Unsupported>,
+    /// The destination it was consumed for.
+    pub(crate) element: Option<super::survey::Element>,
+    /// What it lowered to, when it lowered.
+    pub(crate) lowered: Option<super::survey::Lowered>,
 }
 
 impl Analysis {
