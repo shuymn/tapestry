@@ -406,21 +406,10 @@ impl Lower<'_> {
         let Expr::Global { env, .. } = ast.expr(cfg) else {
             return Err(Stop::Unsupported(Unsupported::Type));
         };
-        let Some(Captured::Env(i)) = self.an.upvalue(inst, env) else {
-            return Err(Stop::Unsupported(Unsupported::Capture("_ENV")));
-        };
-        let k = ast.str(k);
-        let set = self
-            .an
-            .envs
-            .get(i as usize)
-            .ok_or(Stop::Unsupported(Unsupported::Capture("_ENV")))?
-            .options;
         self.an
-            .option(set, k)
-            .map_err(stop)?
+            .option_entry(inst, env, ast.str(k))
             .map(V::Config)
-            .ok_or(Stop::Unsupported(Unsupported::Capture("an option entry")))
+            .map_err(stop)
     }
 
     /// A host read of API `api` with the numeral `arg`.
@@ -632,8 +621,8 @@ impl Lower<'_> {
 
     /// What a proof resting on captured state needs: a fold of a captured
     /// value (an upvalue, `skin_config.option`, `timer_off_value`) or a
-    /// host module or helper binding, the syntactic chunk-local proof
-    /// included. While the analysis is open, code it does not see may
+    /// host module or helper binding, each proven by its captured final
+    /// binding. While the analysis is open, code it does not see may
     /// change that state, so none holds.
     fn bound(&self) -> R<()> {
         if self.an.open.is_some() {

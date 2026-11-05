@@ -30,7 +30,7 @@ fn beside(body: &str, dst: &str) -> String {
 
 /// The configured pass of `entry`: its definition, converted and not
 /// yet imported.
-fn configured(entry: &str) -> crate::resolve::Definition {
+pub(super) fn configured(entry: &str) -> crate::resolve::Definition {
     let d = super::callback_tests::folder(entry);
     let cancel = super::Cancel::new();
     let h = super::read_lua_header(d.path(), "s.luaskin", &cancel).unwrap();
@@ -40,7 +40,7 @@ fn configured(entry: &str) -> crate::resolve::Definition {
 }
 
 /// The analysis of `def`.
-fn analysis(def: &crate::resolve::Definition) -> &super::callback::Analysis {
+pub(super) fn analysis(def: &crate::resolve::Definition) -> &super::callback::Analysis {
     def.arena
         .lua
         .as_deref()
@@ -53,7 +53,7 @@ fn analysis(def: &crate::resolve::Definition) -> &super::callback::Analysis {
 /// converted node of `kind` under `key` that the configured pass met
 /// first.
 #[track_caller]
-fn interferes(entry: &str, (kind, key): (Kind, Option<&str>)) {
+pub(super) fn interferes(entry: &str, (kind, key): (Kind, Option<&str>)) {
     let def = configured(entry);
     let open = analysis(&def).open.expect("an open site");
     assert_eq!(def.arena.node(open).kind, kind);
@@ -75,13 +75,13 @@ fn interferes(entry: &str, (kind, key): (Kind, Option<&str>)) {
 }
 
 /// A script's site: its string under `key`.
-fn script(key: &str) -> (Kind, Option<&str>) {
+pub(super) fn script(key: &str) -> (Kind, Option<&str>) {
     (Kind::Lua, Some(key))
 }
 
 /// Checks that `r` imported with the critical reader lowered.
 #[track_caller]
-fn lowers(r: Result<LuaImported, ImportError>) -> LuaImported {
+pub(super) fn lowers(r: Result<LuaImported, ImportError>) -> LuaImported {
     let i = r.unwrap_or_else(|e| panic!("{e:?}"));
     assert!(
         i.callbacks.contains(&Disposition::Lowered),
@@ -429,7 +429,7 @@ fn the_open_site_is_counted_where_the_conversion_meets_it() {
 
 /// `critical`, a critical gauge `draw`, beside a decorative `draw` script
 /// that opens the analysis, after `body`.
-fn opened(body: &str, critical: &str) -> String {
+pub(super) fn opened(body: &str, critical: &str) -> String {
     skin(
         body,
         &format!(
