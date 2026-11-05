@@ -158,8 +158,8 @@ pub struct Shelf {
     /// The background measurement of charts whose load was cancelled
     /// during theirs; none when its thread could not start.
     background: Option<Worker>,
-    /// Passes completed (dev-tools).
-    #[cfg(feature = "dev-tools")]
+    /// Passes completed (dev-tools and tests).
+    #[cfg(any(test, feature = "dev-tools"))]
     passes: u64,
     /// When the running pass started (dev-tools).
     #[cfg(feature = "dev-tools")]
@@ -235,7 +235,7 @@ impl Shelf {
             status: String::new(),
             loudness: Loudness::default(),
             background,
-            #[cfg(feature = "dev-tools")]
+            #[cfg(any(test, feature = "dev-tools"))]
             passes: 0,
             #[cfg(feature = "dev-tools")]
             pass_started: None,
@@ -426,7 +426,7 @@ impl Shelf {
                     log::info!("{line}");
                 }
                 self.status = String::new();
-                #[cfg(feature = "dev-tools")]
+                #[cfg(any(test, feature = "dev-tools"))]
                 {
                     self.passes += 1;
                 }
@@ -642,9 +642,9 @@ impl Shelf {
         self.loudness.gain()
     }
 
-    /// How many passes have completed (dev-tools): what a search lists is
+    /// How many passes have completed (dev-tools and tests): what a search lists is
     /// the whole library's once one has.
-    #[cfg(feature = "dev-tools")]
+    #[cfg(any(test, feature = "dev-tools"))]
     pub const fn passes(&self) -> u64 {
         self.passes
     }

@@ -315,11 +315,11 @@ enum Place {
 /// Where the cursor goes when the next list arrives.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 enum Arrival {
-    /// To its row by the rule, over the list it is on.
+    /// To its row by the rule, over the list it is on. In a place just
+    /// entered that is its first row: no row of the place left is in it,
+    /// except the one root's own charts on Top, which lead the all-chart list.
     #[default]
     Keep,
-    /// To the first row: a place just entered.
-    First,
     /// To this saved list's row by the rule, at its line.
     Restore(Saved),
 }
@@ -480,8 +480,8 @@ impl SelectScreen {
     }
 
     /// Puts a new list in place. The cursor goes where [`Arrival`] says, by
-    /// [`Saved::resolve`] unless the place was just entered, and the list
-    /// scrolls so it stays on its line where the list allows.
+    /// [`Saved::resolve`], and the list scrolls so it stays on its line where
+    /// the list allows.
     fn arrive(
         &mut self,
         all_row: Option<u64>,
@@ -491,9 +491,8 @@ impl SelectScreen {
         headings: bool,
     ) {
         let saved = match std::mem::take(&mut self.arrival) {
-            Arrival::Keep => Some(self.saved()),
-            Arrival::First => None,
-            Arrival::Restore(saved) => Some(saved),
+            Arrival::Keep => self.saved(),
+            Arrival::Restore(saved) => saved,
         };
         let rows = folders.len() + entries.len();
         self.more = more || rows > LIMIT;
@@ -516,17 +515,9 @@ impl SelectScreen {
             }
             self.rows.push(Row::Chart(i));
         }
-        match saved {
-            Some(saved) => {
-                let fresh = self.row_ids().enumerate().map(|(i, id)| (id, i)).collect();
-                self.cursor = saved.resolve(&fresh);
-                self.scroll(saved.line);
-            }
-            None => {
-                self.cursor = 0;
-                self.scroll(CURSOR_LINE);
-            }
-        }
+        let fresh = self.row_ids().enumerate().map(|(i, id)| (id, i)).collect();
+        self.cursor = saved.resolve(&fresh);
+        self.scroll(saved.line);
     }
 
     /// How many selectable rows come before the charts.
@@ -566,7 +557,7 @@ impl SelectScreen {
     fn enter(&mut self, place: Place) -> Acted {
         let left = std::mem::replace(&mut self.place, place);
         self.stack.push((left, self.saved()));
-        self.arrival = Arrival::First;
+        self.arrival = Arrival::Keep;
         Acted::Search
     }
 
@@ -583,7 +574,7 @@ impl SelectScreen {
                 ..Saved::default()
             },
         ));
-        self.arrival = Arrival::First;
+        self.arrival = Arrival::Keep;
     }
 
     /// Puts the cursor on the chart at `path`; `false` when it is not
@@ -847,7 +838,7 @@ impl SelectScreen {
                     // keeps the place saved then.
                     self.under_query = Some(match std::mem::take(&mut self.arrival) {
                         Arrival::Restore(saved) => saved,
-                        Arrival::Keep | Arrival::First => self.saved(),
+                        Arrival::Keep => self.saved(),
                     });
                 }
                 self.query.push_str(&text);

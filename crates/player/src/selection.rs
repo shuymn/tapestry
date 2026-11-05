@@ -3366,7 +3366,8 @@ mod tests {
             script: None,
         };
         let listed: usize = roots.iter().map(|r| walk_count(r)).sum();
-        until(&mut sel, |s| s.screen.listed() == listed);
+        settle(&mut sel);
+        assert_eq!(sel.screen.listed(), listed, "{:?}", list(&sel));
         (sel, roots)
     }
 
@@ -3403,23 +3404,22 @@ mod tests {
         std::fs::write(&path, format!("#TITLE {stem}\n#BPM 120\n#001{lane}:01\n")).unwrap();
     }
 
-    /// Reads the list, as a scan's batch does, until `done`. The bound only
-    /// catches a pass that never gets there on a loaded machine.
-    fn until(sel: &mut Selection, done: impl Fn(&Selection) -> bool) {
+    /// Reads the list once two scan passes have completed after now, so the
+    /// second started after any change the test made. The bound only catches
+    /// a scan that stops passing; what the list then shows is the test's to
+    /// assert.
+    fn settle(sel: &mut Selection) {
+        let target = sel.shelf.passes() + 2;
         let begun = Instant::now();
-        loop {
-            sel.shelf.poll(Instant::now());
-            sel.refresh();
-            if done(sel) {
-                return;
-            }
+        while sel.shelf.passes() < target {
             assert!(
                 begun.elapsed() < Duration::from_secs(600),
-                "never: {:?}",
-                list(sel)
+                "the scan stopped passing"
             );
-            std::thread::sleep(Duration::from_millis(5));
+            sel.shelf.poll(Instant::now());
+            std::thread::sleep(Duration::from_millis(2));
         }
+        sel.refresh();
     }
 
     fn keys(sel: &mut Selection, pressed: &[MenuKey]) -> Option<game::Pick> {
@@ -3511,10 +3511,9 @@ mod tests {
         );
         keys(&mut sel, &[MenuKey::Down, MenuKey::Enter]);
         assert_eq!(list(&sel), [">a", "b"]);
-        until(&mut sel, |s| list(s) == [">a", "b"]);
         std::fs::remove_file(roots[0].join("a.bms")).unwrap();
         std::fs::remove_file(roots[0].join("b.bms")).unwrap();
-        until(&mut sel, |s| cursor(s).0 == folder_row("root1", 1));
+        settle(&mut sel);
         assert_eq!(
             list(&sel),
             [all_row(1), format!(">{}", folder_row("root1", 1))]
@@ -3642,9 +3641,12 @@ mod tests {
         sel.menu.push(MenuInput::Text("x".to_owned()));
         keys(&mut sel, &[MenuKey::Backspace, MenuKey::Enter]);
         assert_eq!(cursor(&sel), place);
-        // A place typed over before its list was read keeps what was saved.
+        // A query emptied and retyped before the place's list was read keeps
+        // the place saved before the first, not the results then shown.
         keys(&mut sel, &[MenuKey::Tab]);
         sel.menu.push(MenuInput::Text("x".to_owned()));
+        keys(&mut sel, &[MenuKey::Enter, MenuKey::Down, MenuKey::Tab]);
+        assert_eq!(cursor(&sel).0, "xc");
         sel.menu.push(MenuInput::Key(MenuKey::Backspace));
         sel.menu.push(MenuInput::Text("x".to_owned()));
         keys(&mut sel, &[MenuKey::Enter, MenuKey::Escape]);
@@ -3667,11 +3669,7 @@ mod tests {
         keys(&mut sel, &[MenuKey::Enter]);
         std::fs::remove_file(roots[0].join("s/x/b.bms")).unwrap();
         write_chart(&roots[0], "s/x/bb.bms");
-        until(&mut sel, |s| {
-            s.screen
-                .selected()
-                .is_some_and(|c| c.path.ends_with("bb.bms"))
-        });
+        settle(&mut sel);
         keys(&mut sel, &[MenuKey::Escape]);
         assert_eq!(cursor(&sel).0, "c");
         assert_eq!(list(&sel), ["a", "bb", ">c"]);
@@ -3692,24 +3690,21 @@ mod tests {
         assert_eq!(cursor(&sel), ("n".to_owned(), 1));
         write_chart(root, "s/y/a.bms");
         write_chart(root, "s/y/z.bms");
-        until(&mut sel, |s| list(s).len() == 5);
+        settle(&mut sel);
         assert_eq!(list(&sel), ["a", "m", ">n", "o", "z"]);
         std::fs::remove_file(root.join("s/x/n.bms")).unwrap();
-        until(&mut sel, |s| list(s).len() == 4);
+        settle(&mut sel);
         assert_eq!(list(&sel), ["a", "m", ">o", "z"]);
         std::fs::remove_file(root.join("s/x/o.bms")).unwrap();
         std::fs::remove_file(root.join("s/y/z.bms")).unwrap();
-        until(&mut sel, |s| list(s).len() == 2);
+        settle(&mut sel);
         assert_eq!(list(&sel), ["a", ">m"]);
         // Back in the parent, a new folder above and a removed one below leave
         // the cursor on its row.
         keys(&mut sel, &[MenuKey::Escape]);
         std::fs::remove_dir_all(root.join("t")).unwrap();
         write_chart(root, "r/q/k.bms");
-        until(&mut sel, |s| {
-            let rows = list(s);
-            rows.contains(&folder_row("r", 1)) && !rows.contains(&folder_row("t", 1))
-        });
+        settle(&mut sel);
         assert_eq!(
             list(&sel),
             [
@@ -3741,13 +3736,11 @@ mod tests {
         keys(&mut sel, &[MenuKey::Down, MenuKey::Enter]);
         assert_eq!(list(&sel), [">x", "y"]);
         std::fs::remove_file(root.join("a/b/y.bms")).unwrap();
-        until(&mut sel, |s| {
-            s.screen.listed() == 3 + 1 && list(s).contains(&"x".to_owned())
-        });
+        settle(&mut sel);
         assert_eq!(cursor(&sel).0, folder_row("p", 3));
         // Under a query: seen when it ends.
         write_chart(root, "a/b/y.bms");
-        until(&mut sel, |s| list(s).contains(&folder_row("a", 2)));
+        settle(&mut sel);
         keys(
             &mut sel,
             &[MenuKey::Home, MenuKey::Down, MenuKey::Enter, MenuKey::Tab],
@@ -3756,7 +3749,7 @@ mod tests {
         sel.menu.push(MenuInput::Text("y".to_owned()));
         keys(&mut sel, &[MenuKey::Enter]);
         std::fs::remove_file(root.join("a/b/y.bms")).unwrap();
-        until(&mut sel, |s| s.screen.listed() == 0);
+        settle(&mut sel);
         keys(&mut sel, &[MenuKey::Escape]);
         assert_eq!(cursor(&sel).0, folder_row("p", 3));
         // Two levels down: a branch emptied climbs to what is left of it.
@@ -3765,7 +3758,7 @@ mod tests {
         keys(&mut sel, &[MenuKey::Enter]);
         assert_eq!(list(&sel), [">deep", "deep2"]);
         std::fs::remove_dir_all(root.join("p/q")).unwrap();
-        until(&mut sel, |s| s.screen.listed() == 1);
+        settle(&mut sel);
         // `p` itself is left with `t`, so the climb stops there.
         assert_eq!(list(&sel), [format!(">{}", folder_row("t", 1))]);
     }
@@ -3779,7 +3772,7 @@ mod tests {
         keys(&mut sel, &[MenuKey::Down]);
         assert_eq!(cursor(&sel).0, "a");
         write_chart(&roots[0], "s/t/u/b.bms");
-        until(&mut sel, |s| s.screen.listed() == 3);
+        settle(&mut sel);
         assert_eq!(
             list(&sel),
             [all_row(3), folder_row("s", 2), ">z".to_owned()]
@@ -3798,13 +3791,7 @@ mod tests {
         );
         std::fs::write(roots[0].join("m.bms"), "#TITLE m\n#ARTIST z\n#00138:01\n").unwrap();
         std::fs::write(roots[0].join("n.bms"), "#TITLE n\n#ARTIST a\n#00138:01\n").unwrap();
-        until(&mut sel, |s| {
-            s.screen
-                .page("")
-                .lines
-                .iter()
-                .any(|l| l.text.ends_with("/ z"))
-        });
+        settle(&mut sel);
         let names = |sel: &Selection| -> Vec<String> {
             let page = sel.screen.page("");
             page.lines[4..8]
