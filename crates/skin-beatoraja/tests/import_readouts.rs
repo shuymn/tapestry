@@ -363,6 +363,70 @@ fn number(props: &str) -> common::Loaded {
     ))
 }
 
+/// `ref` 96 shows the chart's play level with no deviation, a negative as
+/// its magnitude on a ten-glyph strip, and draws nothing while it is
+/// unknown or what a number reserves.
+#[test]
+fn the_play_level_shows_under_its_availability() {
+    let loaded = number(r#""ref": 96"#);
+    assert!(
+        loaded.report().notes.is_empty(),
+        "{:?}",
+        loaded.report().notes
+    );
+    let skin = loaded.ok().skin.clone();
+    let drawn = |level| {
+        let mut d = Drawn::over_level(skin.clone(), &chart(), level);
+        d.frame(0, &[]).len()
+    };
+    assert_eq!(drawn(Some(12)), 2);
+    assert_eq!(drawn(Some(0)), 1);
+    assert_eq!(drawn(Some(-3)), 1);
+    for unknown in [None, Some(i32::MIN), Some(i32::MAX)] {
+        assert_eq!(drawn(unknown), 0, "{unknown:?}");
+    }
+    assert_eq!(drawn(Some(-i32::MAX)), 4);
+    assert_eq!(drawn(Some(i32::MAX - 1)), 4);
+    let by_name = number(r#""value": "playlevel""#);
+    assert!(by_name.report().notes.is_empty());
+}
+
+/// On a 24-glyph strip a negative play level takes the second half's digits
+/// and sign, and a positive one the first half's: the sign is kept, not only
+/// the magnitude.
+#[test]
+fn a_negative_play_level_shows_its_sign_and_digits() {
+    let loaded = import_body(
+        r#""value": [{"id": "v", "src": "n", "w": 120, "h": 20, "divx": 24, "digit": 4,
+                      "ref": 96}],
+           "destination": [{"id": "v", "dst": [{"w": 12, "h": 20}]}]"#,
+    );
+    let skin = loaded.ok().skin.clone();
+    // Each drawn cell's index in the uv table, left to right.
+    let cells = |level| {
+        let mut d = Drawn::over_level(skin.clone(), &chart(), Some(level));
+        let mut quads = d.frame(0, &[]);
+        quads.sort_by(|a, b| a.rect[0].total_cmp(&b.rect[0]));
+        quads
+            .iter()
+            .map(|q| {
+                d.uvs
+                    .frames()
+                    .iter()
+                    .position(|f| f.uv == q.uv && f.layer == q.layer)
+                    .expect("a frame of the sheet")
+            })
+            .collect::<Vec<_>>()
+    };
+    // The first half: digits from 0, the sign at 11.
+    let zero = cells(0)[1];
+    assert_eq!(cells(3), [zero + 11, zero + 3]);
+    assert_eq!(cells(12), [zero + 11, zero + 1, zero + 2]);
+    // The second half: digits from 12, the sign at 23.
+    assert_eq!(cells(-3), [zero + 23, zero + 15]);
+    assert_eq!(cells(-12), [zero + 23, zero + 13, zero + 14]);
+}
+
 #[test]
 fn ids_without_these_contracts_stay_unsupported() {
     for id in [92, 1_163, 1_164, 372, 373] {

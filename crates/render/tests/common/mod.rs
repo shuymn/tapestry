@@ -81,6 +81,7 @@ pub fn context(gauges: &[GaugeDesc], counted: bool) -> PlayContext<'_> {
         last_note_end: TimeUs(3_600_000 * MS),
         bpm_range: None,
         bpm_whole_change: None,
+        play_level: None,
     }
 }
 
@@ -261,6 +262,7 @@ pub const fn loading_frame(lifetime: u64, now: TimeUs, since: TimeUs) -> Loading
         covers: FrameReadouts::UNAVAILABLE.covers,
         gauge: None,
         text: 0,
+        play_level: None,
     }
 }
 

@@ -19,6 +19,7 @@ use crate::place::{Bind, Bounds, Fill, Follow, Native, Place, Placement, Regions
 use crate::play::loading::{Loading, LoadingFrame, LoadingGauge, Need};
 use crate::play::schema::Grade;
 use crate::play::schema::timer::BUILTIN;
+use crate::play::timers::level_fields;
 use crate::play::{BuildError, Play, PlayContext, PrepareError, SkinFrame};
 use crate::quad::{Blend, ClipId, Filter, QuadBatch, RunKey};
 use crate::schema::Ty;
@@ -323,8 +324,12 @@ enum Phase<'a> {
         shown: usize,
     },
     /// The loading runtime: no chart, the gauge from the frame's
-    /// descriptor, if any.
-    Loading { gauge: Option<LoadingGauge> },
+    /// descriptor, if any, and whether the frame gives the chosen chart's
+    /// play level.
+    Loading {
+        gauge: Option<LoadingGauge>,
+        level: bool,
+    },
 }
 
 /// A loaded skin.
@@ -1358,7 +1363,7 @@ impl Skin {
                         }
                         _ => None,
                     };
-                    Need::of(e.visible.as_ref()).max(Need::of(value))
+                    Need::of(e.visible.as_ref()).and(Need::of(value))
                 },
                 kind: match e.source {
                     Source::Image(i) => Kind::Image(image(i)),
@@ -2082,7 +2087,10 @@ impl Skin {
             lanes: frame.lanes,
             complete: false,
             hidden_enabled: frame.covers.hidden_enabled,
-            phase: Phase::Loading { gauge: frame.gauge },
+            phase: Phase::Loading {
+                gauge: frame.gauge,
+                level: level_fields(frame.play_level).1 != 0,
+            },
         };
         self.draw(&rt, &scene, None, uvs, &canvas, &placement, out);
         Ok(())
@@ -2120,8 +2128,8 @@ impl Skin {
             // While loading, an element reading what loading lacks draws
             // nothing: its condition is false, its value or selector
             // unread.
-            if let Phase::Loading { gauge } = scene.phase
-                && !e.loading.met(gauge.is_some())
+            if let Phase::Loading { gauge, level } = scene.phase
+                && !e.loading.met(gauge.is_some(), level)
             {
                 continue;
             }
@@ -2260,7 +2268,7 @@ impl Skin {
                                 ..
                             } => Shown::of(gauges, play.gauge_desc(shown), shown),
                             // The empty frame: no value while loading.
-                            Phase::Loading { gauge } => gauge.map(|g| Shown {
+                            Phase::Loading { gauge, .. } => gauge.map(|g| Shown {
                                 look: g.look,
                                 max: g.max,
                                 border: g.border,
@@ -2390,6 +2398,7 @@ mod tests {
             last_note_end: TimeUs(0),
             bpm_range: None,
             bpm_whole_change: None,
+            play_level: None,
         };
         let mut play = skin.prepare(&chart, &ctx).unwrap();
         skin.attach_bitmap_text(&mut play, &ChartText::default());

@@ -887,6 +887,7 @@ fn loading_frames() {
         },
         gauge: Some(skin_model::LoadingGauge::of(0, &GAUGES[0])),
         text: 1,
+        play_level: Some(12),
         ..common::loading_frame(1, TimeUs(k * FRAME_US), TimeUs(0))
     };
     skin.enter_loading(1);
@@ -904,6 +905,16 @@ fn loading_frames() {
     });
     assert!(later.unwrap() > 0);
     assert_eq!(later_allocs, 0, "a later loading frame allocated");
+    // The frame's play level reaches the skin: its mark draws with it, and
+    // not in a frame without one.
+    staging.build_loading(&mut skin, &at(FRAMES)).unwrap();
+    let with_level = staging.instances().len();
+    let without = LoadingFrame {
+        play_level: None,
+        ..at(FRAMES)
+    };
+    staging.build_loading(&mut skin, &without).unwrap();
+    assert_eq!(staging.instances().len() + 1, with_level);
     let mut bad = at(FRAMES);
     bad.covers.cover_enabled = true;
     bad.covers.cover = 100;

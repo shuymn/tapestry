@@ -91,6 +91,9 @@ pub struct PlayContext<'a> {
     /// `bpm.change` reads; `None` when the caller has no chart, which
     /// clears `bpm.change_valid`.
     pub bpm_whole_change: Option<bool>,
+    /// The chart's play level, which `chart.level` reads; `None` when the
+    /// caller has no chart, which clears `chart.level_valid`.
+    pub play_level: Option<i32>,
 }
 
 /// A chart's BPM range in floored hundredths of a BPM.
@@ -389,6 +392,8 @@ pub struct Play {
     bpm_range: Option<BpmRange>,
     /// The context's [`PlayContext::bpm_whole_change`].
     bpm_whole_change: Option<bool>,
+    /// The context's [`PlayContext::play_level`].
+    play_level: Option<i32>,
     scratch: Side,
     /// Whether a long note's release is judged on its own (CN and HCN).
     separate_end_judgment: bool,
@@ -536,6 +541,7 @@ impl Play {
             readout_end,
             bpm_range: ctx.bpm_range,
             bpm_whole_change: ctx.bpm_whole_change,
+            play_level: ctx.play_level,
             scratch: ctx.scratch,
             // As eval decides the chart's mode (evaluator.rs, `ln_mode`):
             // a new preset mode must be placed here.
@@ -788,6 +794,7 @@ mod tests {
             last_note_end: TimeUs(3_000 * MS),
             bpm_range: None,
             bpm_whole_change: None,
+            play_level: None,
         };
         let mut play = skin.prepare(&chart, &ctx).unwrap();
         let zero = PerJudgment {

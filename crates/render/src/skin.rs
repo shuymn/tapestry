@@ -85,6 +85,9 @@ pub struct LoadingFrame<'a> {
     /// The shown gauge's descriptor; `None` leaves what depends on it
     /// undrawn.
     pub gauge: Option<LoadingGauge>,
+    /// The chosen chart's play level; `None` leaves what depends on it
+    /// undrawn.
+    pub play_level: Option<i32>,
     /// The revision of the loading text installed for this lifetime; 0
     /// with none.
     pub text: u64,
@@ -102,6 +105,7 @@ impl<'a> LoadingFrame<'a> {
             lanes: self.lanes,
             covers: self.covers,
             gauge: self.gauge,
+            play_level: self.play_level,
         }
     }
 }

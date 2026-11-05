@@ -1240,10 +1240,23 @@ fn loading_skin() -> Loaded {
         )
         .unwrap()
     };
+    elements.push(untimed(Source::Number(0), still(), Place::SCREEN));
     let widgets = skin_model::WidgetDefs {
         gauges: gauges(),
         image_choices: image_choice_tables(int),
         cover_paints: cover_paints(),
+        numbers: vec![NumberDef {
+            digits: DigitsDef {
+                image: u32::from(DIGITS_10),
+                set: GlyphSet::Ten,
+                cells: 4,
+                align: Align::Right,
+                pad: Pad::Blank,
+                space: 0,
+                offsets: Vec::new(),
+            },
+            value: int("chart.level"),
+        }],
         ..skin_model::WidgetDefs::default()
     };
     load(whens, elements, widgets)
@@ -1683,6 +1696,7 @@ fn build_does_not_allocate() {
         last_note_end: TimeUs(0),
         bpm_range: None,
         bpm_whole_change: None,
+        play_level: None,
     };
     let round = Section {
         start: TimeUs(30_000 * MS),
@@ -1986,6 +2000,7 @@ fn build_does_not_allocate() {
             lanes: views.lanes[0],
             covers: readouts_for(views.lanes[0]).covers,
             gauge: None,
+            play_level: None,
         };
         bitmap
             .build_loading(&mut loading, &frame, &uvs, &mut batch)
@@ -2003,7 +2018,8 @@ fn build_does_not_allocate() {
 
 /// The loading frame `no` of a lifetime begun at `since`: the clock, the
 /// progress, the target, the layout, the lanes and the covers moving, the
-/// descriptor of either gauge given on two frames of three.
+/// descriptor of either gauge given on two frames of three, the chosen
+/// chart's play level on four of five.
 fn loading_frame<'a>(
     views: &'a Views,
     descs: &[GaugeDesc],
@@ -2022,6 +2038,7 @@ fn loading_frame<'a>(
         lanes: view,
         covers: readouts_for(view).covers,
         gauge: (no % 3 != 2).then(|| LoadingGauge::of(no % 2, &descs[no % 2])),
+        play_level: (no % 5 != 4).then_some(12),
     }
 }
 
@@ -2076,8 +2093,9 @@ fn track_loading(
 /// and one after it, which draw nothing. Over the play fixture the
 /// elements on `loading` and `screen` draw, none on `ready`; over
 /// the structural fixture its background, the lanes' line, the gauges'
-/// empty frames, the cover paints, the gauge look's choice and the `when`
-/// images draw, in the first build and in later ones.
+/// empty frames, the cover paints, the gauge look's choice, the `when`
+/// images and the play level's digits draw, in the first build and in later
+/// ones, the digits only on the frames that give a level.
 fn loading_does_not_allocate(loaded: &Loaded, views: &Views, descs: &[GaugeDesc]) {
     let mut loading = loaded.skin.prepare_loading(Side::Left);
     loaded
@@ -2109,8 +2127,8 @@ fn loading_does_not_allocate(loaded: &Loaded, views: &Views, descs: &[GaugeDesc]
     let mut loading = structural.skin.prepare_loading(Side::Left);
     // Per kind, whether it drew in the first build and in a later one:
     // the background, the lanes' line, a gauge, a cover paint, the look
-    // choice and a `when` image.
-    let mut seen = [[false; 6]; 2];
+    // choice, a `when` image and a play level's digit.
+    let mut seen = [[false; 7]; 2];
     let refused = track_loading(&structural, &mut loading, views, descs, |no, quads| {
         if no == 600 {
             assert!(quads.is_empty(), "a refused build drew");
@@ -2121,7 +2139,7 @@ fn loading_does_not_allocate(loaded: &Loaded, views: &Views, descs: &[GaugeDesc]
             if structural.parts.get(&part_key(q.uv, q.layer)) == Some(&(PARTS + 7)) {
                 at[1] = true;
             }
-            let Some(&(image, _)) = structural.shows.get(&uv_key(q.uv, q.layer)) else {
+            let Some(&(image, frame)) = structural.shows.get(&uv_key(q.uv, q.layer)) else {
                 continue;
             };
             at[0] |= image == timer::SCREEN;
@@ -2129,10 +2147,16 @@ fn loading_does_not_allocate(loaded: &Loaded, views: &Views, descs: &[GaugeDesc]
             at[3] |= image == SUDDEN || image == LIFT;
             at[4] |= image == CHOICES + 2;
             at[5] |= (timer::BUILTIN..timer::BUILTIN + 3).contains(&image);
+            at[6] |= image == DIGITS_10;
+            assert!(
+                image != DIGITS_10 || (no % 5 != 4 && [1, 2].contains(&(frame % 10))),
+                "frame {no} drew digit {frame} of the level"
+            );
         }
     });
     assert_eq!(seen[0][..5], [true; 5], "first build: {:?}", seen[0]);
-    assert_eq!(seen[1], [true; 6], "later builds");
+    assert!(seen[0][6], "first build: {:?}", seen[0]);
+    assert_eq!(seen[1], [true; 7], "later builds");
     assert_eq!(refused, [Err(BuildError::InvalidReadouts); 2]);
 }
 
@@ -3564,6 +3588,7 @@ fn readouts_do_not_allocate(loaded: &Loaded, descs: &[GaugeDesc]) {
             max_x100: 15_000,
         }),
         bpm_whole_change: None,
+        play_level: None,
     };
     let round = PlayContext {
         attempt: Attempt::Section(&section),

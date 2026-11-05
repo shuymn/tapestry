@@ -210,6 +210,7 @@ pub fn full(lead_in_ms: i64) -> PlayContext<'static> {
         last_note_end: NO_END,
         bpm_range: None,
         bpm_whole_change: None,
+        play_level: None,
     }
 }
 

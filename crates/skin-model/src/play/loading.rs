@@ -11,7 +11,7 @@ use bms_model::TimeUs;
 use rules::GaugeValue;
 
 use super::schema::{field, timer};
-use super::timers::{covers, read_timers};
+use super::timers::{covers, level_fields, read_timers};
 use super::{BuildError, CoverSettings, GaugeDesc, LoadState};
 use crate::expr::{Program, State, TIMER_OFF};
 use crate::layout::Layout;
@@ -30,6 +30,8 @@ pub enum LoadingField {
     Setting,
     /// Available while the frame gives a gauge descriptor.
     Descriptor,
+    /// Available while the frame gives the chosen chart's play level.
+    Chosen,
     /// Not read: a program reading it is rejected for loading.
     Unavailable,
 }
@@ -45,7 +47,7 @@ pub enum LoadingTimer {
 
 /// Every PLAY field's class while loading, in slot order (`field::*`).
 const FIELDS: [LoadingField; field::COUNT] = {
-    use LoadingField::{Descriptor, Live, Setting, Unavailable};
+    use LoadingField::{Chosen, Descriptor, Live, Setting, Unavailable};
     [
         Unavailable, // combo
         Unavailable, // max_combo
@@ -148,6 +150,9 @@ const FIELDS: [LoadingField; field::COUNT] = {
         // loading frame carries.
         Unavailable, // bpm.change
         Unavailable, // bpm.change_valid
+        // The play level, 88 and 89: the chosen chart's, from the frame.
+        Chosen, // chart.level
+        Chosen, // chart.level_valid
     ]
 };
 
@@ -170,14 +175,15 @@ pub const fn loading_timer(slot: u16) -> Option<LoadingTimer> {
 }
 
 /// What a program needs to be evaluated while loading, from its read set.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum Need {
-    /// It reads only live fields and settings.
-    Always,
+/// It reads only live fields and settings when it needs nothing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Need {
     /// It reads a descriptor field: evaluated while a descriptor is given.
-    Descriptor,
+    descriptor: bool,
+    /// It reads the play level: evaluated while the frame gives one.
+    level: bool,
     /// It reads an unavailable field: never evaluated while loading.
-    Never,
+    never: bool,
 }
 
 impl Need {
@@ -185,22 +191,36 @@ impl Need {
     pub(crate) fn of(p: Option<&Program>) -> Self {
         p.into_iter()
             .flat_map(Program::fields)
-            .map(|slot| match loading_field(slot) {
-                Some(LoadingField::Live | LoadingField::Setting) => Self::Always,
-                Some(LoadingField::Descriptor) => Self::Descriptor,
-                Some(LoadingField::Unavailable) | None => Self::Never,
+            .fold(Self::default(), |need, slot| match loading_field(slot) {
+                Some(LoadingField::Live | LoadingField::Setting) => need,
+                Some(LoadingField::Descriptor) => Self {
+                    descriptor: true,
+                    ..need
+                },
+                Some(LoadingField::Chosen) => Self {
+                    level: true,
+                    ..need
+                },
+                Some(LoadingField::Unavailable) | None => Self {
+                    never: true,
+                    ..need
+                },
             })
-            .max()
-            .unwrap_or(Self::Always)
     }
 
-    /// Whether it is met in a frame that gives a descriptor or not.
-    pub(crate) fn met(self, descriptor: bool) -> bool {
-        match self {
-            Self::Always => true,
-            Self::Descriptor => descriptor,
-            Self::Never => false,
+    /// What it and `other` need together.
+    pub(crate) const fn and(self, other: Self) -> Self {
+        Self {
+            descriptor: self.descriptor || other.descriptor,
+            level: self.level || other.level,
+            never: self.never || other.never,
         }
+    }
+
+    /// Whether it is met in a frame that gives a descriptor or not, and a
+    /// play level or not.
+    pub(crate) const fn met(self, descriptor: bool, level: bool) -> bool {
+        !self.never && (descriptor || !self.descriptor) && (level || !self.level)
     }
 }
 
@@ -252,6 +272,9 @@ pub struct LoadingFrame<'a> {
     /// The shown gauge's descriptor; `None` leaves what depends on it
     /// undrawn.
     pub gauge: Option<LoadingGauge>,
+    /// The chosen chart's play level, never a previous attempt's; `None`
+    /// leaves what depends on it undrawn.
+    pub play_level: Option<i32>,
 }
 
 /// The loading runtime's state as of its last build: every timer's start
@@ -406,6 +429,9 @@ impl Loading {
         set(field::LIFT_ENABLED, c.lift_enabled);
         set(field::HIDDEN_ENABLED, c.hidden_enabled);
         set(field::COVER_ADJUSTING, c.adjusting);
+        let (level, level_valid) = level_fields(frame.play_level);
+        set(field::CHART_LEVEL, level);
+        set(field::CHART_LEVEL_VALID, level_valid);
         self.fields = fields;
         for (slot, start) in (0..timer::BUILTIN).zip(self.starts.iter_mut()) {
             *start = match loading_timer(slot) {
@@ -420,7 +446,11 @@ impl Loading {
             &mut self.starts,
             &mut self.ms,
             whens,
-            |i| whens_need.get(i).is_some_and(|n| n.met(descriptor)),
+            |i| {
+                whens_need
+                    .get(i)
+                    .is_some_and(|n| n.met(descriptor, level_valid != 0))
+            },
         );
         Ok(())
     }
@@ -438,6 +468,9 @@ mod tests {
         assert_eq!(FIELDS.len(), PLAY.fields.len());
         let class = |name: &str| PLAY.field(name).and_then(|(s, _)| loading_field(s));
         assert_eq!(class("load.percent"), Some(LoadingField::Live));
+        for name in ["chart.level", "chart.level_valid"] {
+            assert_eq!(class(name), Some(LoadingField::Chosen), "{name}");
+        }
         for name in ["gauge.kind", "gauge.valid"] {
             assert_eq!(class(name), Some(LoadingField::Descriptor), "{name}");
         }
@@ -455,7 +488,14 @@ mod tests {
             assert_eq!(class(name), Some(LoadingField::Setting), "{name}");
         }
         for f in PLAY.fields {
-            let named = ["load.percent", "gauge.kind", "gauge.valid"].contains(&f.name)
+            let named = [
+                "load.percent",
+                "gauge.kind",
+                "gauge.valid",
+                "chart.level",
+                "chart.level_valid",
+            ]
+            .contains(&f.name)
                 || settings.contains(&f.name);
             if !named {
                 assert_eq!(class(f.name), Some(LoadingField::Unavailable), "{}", f.name);
