@@ -50,6 +50,22 @@ fn ops_read_the_attempts_autoplay_and_fold_course_mode() {
     }
 }
 
+/// A rearmed READY keeps its attempt's autoplay; a retry reads its own
+/// attempt's, here a play that is not autoplay after one that is.
+#[test]
+fn a_rearm_keeps_and_a_retry_takes_the_attempts_autoplay() {
+    let body = drawn_under(&[(33, 10), (32, 11)]);
+    let loaded = import_body(&body);
+    let mut d = Drawn::with_autoplay(loaded.ok().skin.clone(), 10, true);
+    assert_eq!(widths(&d.rects(1_000)), [10]);
+    d.play.rearm();
+    assert_eq!(widths(&d.rects(1_000)), [10], "rearmed");
+    d.retry(10);
+    assert_eq!(widths(&d.rects(1_000)), [11], "retried");
+    d.play.rearm();
+    assert_eq!(widths(&d.rects(1_000)), [11], "retried and rearmed");
+}
+
 /// While loading, the frame's autoplay is read: known, never hidden.
 #[test]
 fn loading_reads_the_frames_autoplay() {
