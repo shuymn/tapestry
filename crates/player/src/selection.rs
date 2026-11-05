@@ -196,7 +196,6 @@ impl Selection {
                 ListQuery::Top { one_root, sort } => {
                     let roots = self.shelf.top()?;
                     let charts = roots.iter().map(|r| r.charts).sum();
-                    let keys = roots.iter().map(|r| r.key.clone()).collect();
                     let level = match roots.as_slice() {
                         [root] if one_root => self.shelf.level(&root.key, sort, limit)?,
                         _ => library::Level {
@@ -204,7 +203,7 @@ impl Selection {
                             ..library::Level::default()
                         },
                     };
-                    self.screen.set_top(level, keys, charts);
+                    self.screen.set_top(level, charts);
                     return Ok(());
                 }
                 ListQuery::Level { key, sort } => {
@@ -3772,6 +3771,27 @@ mod tests {
         std::fs::remove_file(outer.join("A/B/y.bms")).unwrap();
         settle(&mut sel);
         // Still in `A`: `root0`'s level would list `Z`'s row and `x`.
+        assert_eq!(list(&sel), [">x"]);
+    }
+
+    /// A configured root that held nothing when Top was read, and fills while
+    /// a scan runs, is a root too: reached through another root it stays a
+    /// level when it holds only its own charts.
+    #[test]
+    fn a_newly_populated_root_stays_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let outer = dir.path().join("root0");
+        std::fs::create_dir_all(outer.join("A")).unwrap();
+        write_chart(&outer, "Z/q/w.bms");
+        let (mut sel, _) = over(dir.path(), vec![outer.clone(), outer.join("A")]);
+        keys(&mut sel, &[MenuKey::Down, MenuKey::Enter]);
+        write_chart(&outer, "A/x.bms");
+        write_chart(&outer, "A/B/y.bms");
+        settle(&mut sel);
+        keys(&mut sel, &[MenuKey::Home, MenuKey::Enter]);
+        assert_eq!(list(&sel), [">x", "y"]);
+        std::fs::remove_file(outer.join("A/B/y.bms")).unwrap();
+        settle(&mut sel);
         assert_eq!(list(&sel), [">x"]);
     }
 

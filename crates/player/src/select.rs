@@ -349,8 +349,6 @@ pub struct SelectScreen {
     all_row: Option<u64>,
     /// The folder rows, after it.
     folders: Vec<FolderRow>,
-    /// The roots' keys, as Top last read them: a root is never a song folder.
-    root_keys: Vec<FolderKey>,
     /// The charts listed, after them; with the folder rows at most [`LIMIT`].
     entries: Vec<ChartEntry>,
     /// Whether there were more rows than [`LIMIT`].
@@ -378,7 +376,8 @@ pub struct SelectScreen {
     preset_error: Option<String>,
     /// Why `player.toml` could not be written, until it is.
     save_error: Option<String>,
-    /// The library roots as configured, for folder names and how many.
+    /// The library roots as configured: for folder names, how many, and which
+    /// folders are roots, never song folders.
     roots: Vec<PathBuf>,
     /// The chosen preset, whose bests the list shows.
     bests_preset: Option<RulePreset>,
@@ -445,10 +444,8 @@ impl SelectScreen {
     }
 
     /// Top's list: the "all charts" row of the library's `charts` listed, then
-    /// `level`, which is the one root's or the rows of the roots, whose keys
-    /// are `root_keys`.
-    pub fn set_top(&mut self, level: Level, root_keys: Vec<FolderKey>, charts: u64) {
-        self.root_keys = root_keys;
+    /// `level`, which is the one root's or the rows of the roots.
+    pub fn set_top(&mut self, level: Level, charts: u64) {
         self.arrive(Some(charts), level.folders, level.charts, level.more, false);
     }
 
@@ -462,7 +459,10 @@ impl SelectScreen {
             Place::Folder { key, .. } => {
                 let folder = key.path();
                 let own = |c: &ChartEntry| c.path.parent() == Some(folder.as_path());
-                let song_folder = !self.root_keys.contains(key)
+                // A configured root, as its path's components compare: the
+                // stored key is that root's one spelling.
+                let root = self.roots.iter().any(|r| *r == folder);
+                let song_folder = !root
                     && level.folders.is_empty()
                     && !level.more
                     && level.charts.iter().all(own);
@@ -1500,7 +1500,6 @@ mod tests {
                 charts,
                 ..library::Level::default()
             },
-            Vec::new(),
             5_001,
         );
         assert_eq!(s.listed(), super::LIMIT);
