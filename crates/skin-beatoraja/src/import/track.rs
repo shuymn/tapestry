@@ -172,6 +172,15 @@ impl Accepted {
             _ => true,
         })
     }
+
+    /// Leaves one key at 0: the last, whose rect, colour and angle stand
+    /// for the whole track.
+    pub(crate) fn keep_last_from_start(&mut self) {
+        self.keys.drain(..self.keys.len().saturating_sub(1));
+        for k in &mut self.keys {
+            k.at = 0;
+        }
+    }
 }
 
 /// Sorts `keys` stably by time and accepts them with loop point `l`:
