@@ -8,6 +8,51 @@ use std::time::{Duration, SystemTime};
 use library::{HEADER_FIELD_BYTES, Library, Opened, SCHEMA_VERSION, ScanOptions, ScanReport};
 use tempfile::TempDir;
 
+/// A summary comes with its row: it follows the file, to none when the loader
+/// refuses seed 0's branch, and stays listed then, though another seed loads.
+#[test]
+fn the_scan_writes_each_charts_summary() {
+    let fx = Fixture::new();
+    let path = fx.root.join("a.bms");
+    let write = |text: &str| fs::write(&path, text).unwrap();
+    let summary = |lib: &Library| lib.charts().unwrap()[0].summary;
+    write("#BPM 120\n#00111:0101\n#00138:01\n");
+    let (lib, _) = fx.open();
+    scan(&lib, std::slice::from_ref(&fx.root));
+    let first = summary(&lib).unwrap();
+    assert_eq!((first.taps, first.longs, first.mines), (2, 0, 0));
+    assert!(!lib.charts().unwrap()[0].random);
+    // Another file, of another size.
+    write("#BPM 120\n#00111:010101\n#00138:01\n");
+    scan(&lib, std::slice::from_ref(&fx.root));
+    assert_eq!(summary(&lib).unwrap().taps, 3);
+    // Seed 0 draws 2 from `#RANDOM 2`, whose branch the loader refuses.
+    let branch = "#BPM 120\n#00111:01\n#00138:01\n#RANDOM 2\n#IF 2\n#LNTYPE 2\n#ENDIF\n";
+    write(branch);
+    scan(&lib, std::slice::from_ref(&fx.root));
+    assert_eq!(summary(&lib), None, "the stored summary goes too");
+    assert!(lib.charts().unwrap()[0].random);
+    let dir = tempfile::tempdir().unwrap();
+    let load = |seed| {
+        let opts = bms_parser::LoadOptions {
+            seed,
+            ..bms_parser::LoadOptions::default()
+        };
+        bms_parser::load_bms(branch.as_bytes(), dir.path(), &opts)
+    };
+    assert!(load(0).is_err());
+    assert!((1..16).any(|seed| load(seed).is_ok()), "another seed loads");
+    let listed = lib
+        .search(&library::Search {
+            text: "",
+            sort: library::Sort::Title,
+            by_folder: false,
+            limit: 10,
+        })
+        .unwrap();
+    assert_eq!(listed.len(), 1, "listed and selectable");
+}
+
 fn chart_text(title: &str) -> String {
     format!("#PLAYER 1\n#TITLE {title}\n#ARTIST Maker\n#BPM 150\n#PLAYLEVEL 7\n#00111:0101\n")
 }

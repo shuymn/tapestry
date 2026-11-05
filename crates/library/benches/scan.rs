@@ -100,7 +100,7 @@ fn index(db: &Path, root: &Path) {
     fs::create_dir_all(folder(0)).expect("create the folder");
     fs::write(
         file(0),
-        format!("#TITLE {title}\n#ARTIST {artist}\n#GENRE bench\n#PLAYLEVEL {level}\n"),
+        format!("#TITLE {title}\n#ARTIST {artist}\n#GENRE bench\n#PLAYLEVEL {level}\n#00138:01\n"),
     )
     .expect("write a chart");
     let (lib, _) = Library::open(db).expect("the database opens");
@@ -116,9 +116,10 @@ fn index(db: &Path, root: &Path) {
         let mut insert = tx
             .prepare(
                 "INSERT INTO charts (root, path, size, mtime_ns, sha256, md5, title, artist,
-                     genre, playlevel, norm_text, title_key, artist_key, folder)
+                     genre, playlevel, norm_text, title_key, artist_key, folder, mode, random,
+                     loader)
                  VALUES (1, ?1, 0, ?2, zeroblob(32), zeroblob(16), ?3, ?4, 'bench', ?5,
-                     ?3 || char(31, 31) || ?4 || char(31, 31) || 'bench', ?3, ?4, ?6)",
+                     ?3 || char(31, 31) || ?4 || char(31, 31) || 'bench', ?3, ?4, ?6, 0, 0, 0)",
             )
             .expect("the statement");
         for i in 1..INDEXED {
@@ -193,6 +194,14 @@ fn bench_search(c: &mut Criterion) {
             b.iter(|| run(black_box(text), Sort::Title, false));
         });
     }
+    let root = lib.top().expect("the roots").remove(0).key;
+    let level = |sort| lib.level(&root, sort, SHOWN).expect("the level");
+    // Each folder of the index is a song folder, so the root's level names
+    // them all and shows the first charts.
+    assert_eq!(level(Sort::Title).charts.len(), SHOWN);
+    group.bench_function("level_of_song_folders", |b| {
+        b.iter(|| level(black_box(Sort::Title)));
+    });
     let sorts = [
         ("sort_title", Sort::Title, false),
         ("sort_artist", Sort::Artist, false),

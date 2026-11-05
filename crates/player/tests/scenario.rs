@@ -26,7 +26,7 @@ const EXIT: &str = include_str!("scenarios/exit.toml");
 fn chart_text(title: &str) -> String {
     format!(
         "#PLAYER 1\n#TITLE {title}\n#ARTIST テスト\n#PLAYLEVEL 3\n#BPM 120\n\
-         #WAV01 key.wav\n#00111:01010101\n"
+         #WAV01 key.wav\n#00138:01\n#00111:01010101\n"
     )
 }
 
@@ -76,7 +76,7 @@ fn write_refused(library: &Path) {
     fs::create_dir_all(&dir).unwrap();
     fs::write(
         dir.join("bad.bms"),
-        "#TITLE 壊れた譜面\n#LNTYPE 2\n#00111:01\n",
+        "#TITLE 壊れた譜面\n#LNTYPE 2\n#00138:01\n#00111:01\n",
     )
     .unwrap();
 }
@@ -1424,7 +1424,7 @@ fn a_middle_measure_round_sounds_its_lead_in_and_draws_its_targets() {
     write_wav_at(&dir.join("key.wav"), 1_000);
     write_wav_at(&dir.join("loud.wav"), 8_000);
     let text = "#PLAYER 1\n#TITLE 譜面M\n#BPM 120\n#WAV01 key.wav\n#WAV02 loud.wav\n\
-                #00112:02020202\n#00211:01010101\n";
+                #00138:01\n#00112:02020202\n#00211:01010101\n";
     fs::write(dir.join("m.bms"), text).unwrap();
     let chart = bms_parser::load_bms(text.as_bytes(), &dir, &Default::default())
         .unwrap()

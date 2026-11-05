@@ -30,7 +30,8 @@ impl Fixture {
 
     /// Writes a chart whose header holds `lines`, each `NAME value`.
     fn chart(&self, relative: &str, lines: &[&str]) -> PathBuf {
-        let mut text = String::from("#PLAYER 1\n");
+        // An invisible key 6 object: listed, with no note to judge.
+        let mut text = String::from("#PLAYER 1\n#00138:01\n");
         for line in lines {
             text.push('#');
             text.push_str(line);
@@ -384,14 +385,14 @@ fn rescan_changes_and_removals_update_the_search() {
     let changed = fx.chart("changed.bms", &["TITLE Old Title"]);
     let other = fx.dir.path().join("other");
     fs::create_dir_all(&other).unwrap();
-    fs::write(other.join("o.bms"), "#TITLE Other Root\n").unwrap();
+    fs::write(other.join("o.bms"), "#TITLE Other Root\n#00138:01\n").unwrap();
     let (lib, _) = Library::open(&fx.db()).unwrap();
     scan(&lib, &[fx.root.clone(), other]);
     assert_eq!(found(&lib, "song"), titles(&["Gone Song", "Kept Song"]));
     assert_eq!(found(&lib, "other root"), titles(&["Other Root"]));
 
     fs::remove_file(&gone).unwrap();
-    fs::write(&changed, "#TITLE New Title, longer\n").unwrap();
+    fs::write(&changed, "#TITLE New Title, longer\n#00138:01\n").unwrap();
     scan(&lib, std::slice::from_ref(&fx.root));
     assert_eq!(found(&lib, "song"), titles(&["Kept Song"]));
     assert_eq!(found(&lib, "old title"), Vec::<String>::new());
@@ -430,8 +431,9 @@ fn a_query_reads_committed_rows_without_waiting_for_the_writer() {
         .execute_batch(
             "BEGIN IMMEDIATE;
              INSERT INTO charts (root, path, size, mtime_ns, sha256, md5, title, norm_text,
-                 folder)
-                 SELECT id, 'pending.bms', 0, 0, zeroblob(32), zeroblob(16), 'Pending', 'pending', ''
+                 folder, mode, random, loader)
+                 SELECT id, 'pending.bms', 0, 0, zeroblob(32), zeroblob(16), 'Pending', 'pending',
+                     '', 0, 0, 0
                  FROM roots;",
         )
         .unwrap();
@@ -445,6 +447,349 @@ fn a_query_reads_committed_rows_without_waiting_for_the_writer() {
     );
     writer.execute_batch("COMMIT").unwrap();
     assert_eq!(found(&lib, "pending"), titles(&["Pending"]));
+}
+
+impl Fixture {
+    /// Writes a chart of exactly `text` under the root.
+    fn file(&self, relative: &str, text: &str) -> PathBuf {
+        let path = self.root.join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, text).unwrap();
+        path
+    }
+
+    /// A listed chart of this title.
+    fn listed(&self, relative: &str, title: &str) -> PathBuf {
+        self.file(relative, &format!("#TITLE {title}\n#00138:01\n"))
+    }
+}
+
+/// Only 7-key charts are listed, by every filter and order; the index and the
+/// bests keep every chart.
+#[test]
+fn only_seven_key_charts_are_listed() {
+    let fx = Fixture::new();
+    let seven = fx.file("seven.bms", "#TITLE Song here\n#00118:01\n");
+    fx.file("five.bms", "#TITLE Song here\n#00111:01\n");
+    fx.file("header.bms", "#TITLE Song here\n");
+    fx.file("two.bms", "#TITLE Song here\n#00118:01\n#00121:01\n");
+    fx.file("four.bms", "#TITLE Song here\n#00118:01\n#00141:01\n");
+    let lib = fx.scanned();
+    let path: &Path = &seven;
+    for sort in [Sort::Title, Sort::Artist, Sort::Level, Sort::Modified] {
+        for by_folder in [false, true] {
+            // Every chart, a phrase and a short query.
+            for text in ["", "song here", "so"] {
+                assert_eq!(search(&lib, text, sort, by_folder), [path], "{text:?}");
+            }
+        }
+    }
+    assert_eq!(lib.charts().unwrap().len(), 5);
+    assert_eq!(lib.unlisted().unwrap(), 4);
+    let top = lib.top().unwrap();
+    assert_eq!(top[0].charts, 1);
+    let level = lib.level(&top[0].key, Sort::Title, 10).unwrap();
+    let listed: Vec<&Path> = level.charts.iter().map(|c| c.path.as_path()).collect();
+    assert_eq!(listed, [path]);
+}
+
+/// Top's one root's key, and its level.
+fn root_level(lib: &Library) -> (library::FolderKey, library::Level) {
+    let top = lib.top().unwrap();
+    assert_eq!(top.len(), 1);
+    let key = top[0].key.clone();
+    let level = lib.level(&key, Sort::Title, 100).unwrap();
+    (key, level)
+}
+
+/// The names and counts of a level's folder rows.
+fn rows(level: &library::Level) -> Vec<(&str, u64)> {
+    level
+        .folders
+        .iter()
+        .map(|f| (f.name.as_str(), f.charts))
+        .collect()
+}
+
+fn chart_titles(level: &library::Level) -> Vec<&str> {
+    level
+        .charts
+        .iter()
+        .map(|c| c.header.title.as_deref().unwrap_or_default())
+        .collect()
+}
+
+/// A level by the table of design.md "Play Lifecycle", Selection: a song
+/// folder has no row and its charts are its parent's.
+#[test]
+fn a_song_folder_has_no_level_and_its_charts_are_its_parents() {
+    let fx = Fixture::new();
+    // In a shard: two song folders, their charts in one order.
+    fx.listed("shard/song1/a.bms", "b");
+    fx.listed("shard/song1/b.bms", "d");
+    fx.listed("shard/song2/c.bms", "c");
+    // A root's direct chart, and a song folder directly under the root.
+    fx.listed("direct.bms", "e");
+    fx.listed("song0/x.bms", "a");
+    // Nested: the leaf flattens once, its parent stays a row.
+    fx.listed("outer/inner/n.bms", "n");
+    // Mixed: its own charts, its song folder's, and a row for what is deeper.
+    fx.listed("mixed/own.bms", "o");
+    fx.listed("mixed/sub/s.bms", "s");
+    fx.listed("mixed/deep/er/z.bms", "z");
+    // Hidden charts: no row, no level, and they do not make a subfolder.
+    fx.file("hidden/five.bms", "#TITLE h\n#00111:01\n");
+    fx.listed("song3/y.bms", "y");
+    fx.file("song3/below/five.bms", "#TITLE h\n#00111:01\n");
+    let lib = fx.scanned();
+
+    let (_, root) = root_level(&lib);
+    assert_eq!(
+        rows(&root),
+        [("mixed", 3), ("outer", 1), ("shard", 3)],
+        "by name, counts at any depth"
+    );
+    assert_eq!(chart_titles(&root), ["a", "e", "y"]);
+    assert!(!root.more);
+
+    let child = |level: &library::Level, name: &str| {
+        let key = &level.folders.iter().find(|f| f.name == name).unwrap().key;
+        lib.level(key, Sort::Title, 100).unwrap()
+    };
+    let shard = child(&root, "shard");
+    assert!(shard.folders.is_empty());
+    assert_eq!(chart_titles(&shard), ["b", "c", "d"], "one list, by title");
+    let outer = child(&root, "outer");
+    assert!(outer.folders.is_empty());
+    assert_eq!(chart_titles(&outer), ["n"]);
+    let mixed = child(&root, "mixed");
+    assert_eq!(rows(&mixed), [("deep", 1)]);
+    assert_eq!(chart_titles(&mixed), ["o", "s"]);
+    assert_eq!(chart_titles(&child(&mixed, "deep")), ["z"]);
+}
+
+/// A folder's identity is its path: equal titles in two folders stay two
+/// folders' charts, and its charts' titles need not be alike.
+#[test]
+fn a_title_groups_nothing() {
+    let fx = Fixture::new();
+    fx.listed("shard/one/a.bms", "same");
+    fx.listed("shard/one/b.bms", "zzz");
+    fx.listed("shard/two/c.bms", "same");
+    let lib = fx.scanned();
+    let (_, root) = root_level(&lib);
+    assert_eq!(rows(&root), [("shard", 3)]);
+    let shard = lib.level(&root.folders[0].key, Sort::Title, 100).unwrap();
+    let names: Vec<_> = shard
+        .charts
+        .iter()
+        .map(|c| c.path.file_name().unwrap().to_str().unwrap())
+        .collect();
+    // Ties by path; another folder's chart between one folder's.
+    assert_eq!(names, ["a.bms", "c.bms", "b.bms"]);
+}
+
+/// A sibling sharing a folder's text as a prefix is no child of it.
+#[test]
+fn a_level_leaves_out_a_sibling_sharing_its_prefix() {
+    let fx = Fixture::new();
+    fx.listed("a/in/x.bms", "x");
+    fx.listed("a b/y.bms", "y");
+    fx.listed("a]/z.bms", "z");
+    fx.listed("a0/w.bms", "w");
+    let lib = fx.scanned();
+    let (_, root) = root_level(&lib);
+    assert_eq!(rows(&root), [("a", 1)]);
+    assert_eq!(chart_titles(&root), ["w", "y", "z"]);
+    let a = lib.level(&root.folders[0].key, Sort::Title, 100).unwrap();
+    assert_eq!(chart_titles(&a), ["x"]);
+}
+
+/// A level past its limit lists the first rows and says so, folders first.
+#[test]
+fn a_level_stops_at_its_limit() {
+    let fx = Fixture::new();
+    fx.listed("r1/deep/a.bms", "a");
+    fx.listed("r2/deep/b.bms", "b");
+    fx.listed("c.bms", "c");
+    fx.listed("d.bms", "d");
+    let lib = fx.scanned();
+    let key = lib.top().unwrap()[0].key.clone();
+    let of = |limit| lib.level(&key, Sort::Title, limit).unwrap();
+    let all = of(4);
+    assert_eq!(
+        (all.folders.len(), all.charts.len(), all.more),
+        (2, 2, false)
+    );
+    let cut = of(3);
+    assert_eq!(
+        (cut.folders.len(), cut.charts.len(), cut.more),
+        (2, 1, true)
+    );
+    let none = of(1);
+    assert_eq!(
+        (none.folders.len(), none.charts.len(), none.more),
+        (1, 0, true)
+    );
+}
+
+/// A hidden chart sorting first takes no place under a limit: the limit counts
+/// only listed charts, by every filter, and in a level.
+#[test]
+fn a_hidden_chart_takes_no_place_under_a_limit() {
+    let fx = Fixture::new();
+    fx.file("song/a.bms", "#TITLE aaa hit\n#00111:01\n");
+    fx.file("song/b.bms", "#TITLE aab hit\n#00121:01\n#00118:01\n");
+    fx.listed("song/z.bms", "zzz hit");
+    let lib = fx.scanned();
+    for text in ["", "hi", "hit"] {
+        for sort in [Sort::Title, Sort::Artist, Sort::Level] {
+            for by_folder in [false, true] {
+                let list = search_limited(&lib, text, sort, by_folder, 1);
+                let titles: Vec<_> = list.iter().map(|c| c.header.title.as_deref()).collect();
+                assert_eq!(titles, [Some("zzz hit")], "{text:?} {sort:?} {by_folder}");
+            }
+        }
+    }
+    let key = lib.top().unwrap()[0].key.clone();
+    let level = lib.level(&key, Sort::Title, 1).unwrap();
+    assert_eq!(chart_titles(&level), ["zzz hit"]);
+    assert!(!level.more);
+}
+
+/// Inserts listed charts (path, folder, title) under `root` directly: more
+/// than a test's scan should write, in folders no temporary folder can spell.
+fn insert_listed(db: &Path, root: &str, charts: &[(String, String, &str)]) {
+    let mut conn = rusqlite::Connection::open(db).unwrap();
+    let tx = conn.transaction().unwrap();
+    tx.execute("INSERT INTO roots (path) VALUES (?1)", [root])
+        .unwrap();
+    {
+        let mut insert = tx
+            .prepare(
+                "INSERT INTO charts (root, path, size, mtime_ns, sha256, md5, title, norm_text,
+                     title_key, folder, mode, random, loader)
+                 SELECT id, ?1, 0, 0, zeroblob(32), zeroblob(16), ?3, ?3, ?3, ?2, 0, 0, 0
+                 FROM roots WHERE path = ?4",
+            )
+            .unwrap();
+        for (path, folder, title) in charts {
+            insert
+                .execute(rusqlite::params![path, folder, title, root])
+                .unwrap();
+        }
+    }
+    tx.commit().unwrap();
+}
+
+/// A level's order is global over its song folders, however many there are:
+/// here the first chart is in the last folder, past SQLite's limit on
+/// parameters.
+#[test]
+fn a_levels_order_reaches_its_last_song_folder() {
+    const FOLDERS: usize = 33_000;
+    let fx = Fixture::new();
+    let (lib, _) = Library::open(&fx.db()).unwrap();
+    let sep = std::path::MAIN_SEPARATOR;
+    let charts: Vec<_> = (0..FOLDERS)
+        .map(|i| {
+            let folder = format!("flat{sep}s{i:05}");
+            let title = if i + 1 == FOLDERS { "A" } else { "Z" };
+            (format!("{folder}{sep}c.bms"), folder, title)
+        })
+        .collect();
+    insert_listed(&fx.db(), "flat", &charts);
+    let top = lib.top().unwrap();
+    assert_eq!(top[0].charts, FOLDERS as u64);
+    let level = lib.level(&top[0].key, Sort::Title, 1).unwrap();
+    assert_eq!(chart_titles(&level), ["A"]);
+    assert!(level.more);
+}
+
+/// A root that ends in its separator, a drive's or a share's, may directly
+/// hold charts: each is counted once and listed once.
+#[test]
+fn a_chart_at_a_drive_or_share_root_is_counted_once() {
+    let sep = std::path::MAIN_SEPARATOR;
+    for root in [
+        format!("D:{sep}"),
+        format!("{sep}{sep}server{sep}share{sep}"),
+    ] {
+        let fx = Fixture::new();
+        let (lib, _) = Library::open(&fx.db()).unwrap();
+        let chart = |folder: String, title: &'static str| {
+            (format!("{folder}{sep}{title}.bms"), folder, title)
+        };
+        insert_listed(
+            &fx.db(),
+            &root,
+            &[
+                (format!("{root}direct.bms"), root.clone(), "direct"),
+                chart(format!("{root}song"), "song"),
+                chart(format!("{root}shard{sep}deep"), "deep"),
+            ],
+        );
+        let top = lib.top().unwrap();
+        assert_eq!(top.len(), 1, "{root}");
+        assert_eq!(top[0].charts, 3, "{root}");
+        let level = lib.level(&top[0].key, Sort::Title, 10).unwrap();
+        assert_eq!(rows(&level), [("shard", 1)], "{root}");
+        assert_eq!(chart_titles(&level), ["direct", "song"], "{root}");
+        assert!(!level.more, "{root}");
+    }
+}
+
+/// Spellings of one root are one stored root; two roots each list theirs; a
+/// replaced root's rows go, and an unreadable one's stay.
+#[test]
+fn roots_are_stored_by_one_spelling() {
+    let fx = Fixture::new();
+    fx.listed("deep/er/a.bms", "a");
+    let other = fx.dir.path().join("other");
+    fs::create_dir_all(other.join("deep").join("er")).unwrap();
+    fs::write(
+        other.join("deep").join("er").join("o.bms"),
+        "#TITLE o\n#00138:01\n",
+    )
+    .unwrap();
+    let (lib, _) = Library::open(&fx.db()).unwrap();
+    // A trailing separator.
+    scan(&lib, &[fx.root.join("")]);
+    let top = lib.top().unwrap();
+    assert_eq!(top.len(), 1);
+    assert_eq!(top[0].key.path(), fx.root);
+    assert_eq!(top[0].name, "songs");
+    let plain = scan_read(&lib, std::slice::from_ref(&fx.root));
+    assert_eq!(plain, 0, "the same stored root: nothing is read again");
+    #[cfg(windows)]
+    {
+        let slashes = PathBuf::from(fx.root.to_str().unwrap().replace('\\', "/"));
+        assert_eq!(scan_read(&lib, &[slashes]), 0, "one spelling of the root");
+    }
+    // Two roots.
+    scan(&lib, &[fx.root.clone(), other.clone()]);
+    let top = lib.top().unwrap();
+    let names: Vec<_> = top.iter().map(|f| f.name.as_str()).collect();
+    assert_eq!(names, ["other", "songs"]);
+    let level = lib.level(&top[0].key, Sort::Title, 10).unwrap();
+    assert_eq!(rows(&level), [("deep", 1)]);
+    // Unreadable: its rows and its row stay.
+    fs::rename(&other, fx.dir.path().join("moved")).unwrap();
+    scan(&lib, &[fx.root.clone(), other.clone()]);
+    assert_eq!(lib.top().unwrap().len(), 2);
+    // Replaced: they go.
+    scan(&lib, std::slice::from_ref(&fx.root));
+    let top = lib.top().unwrap();
+    assert_eq!(top.len(), 1);
+    assert_eq!(top[0].name, "songs");
+}
+
+fn scan_read(lib: &Library, roots: &[PathBuf]) -> u64 {
+    lib.scan(roots, ScanOptions::default())
+        .unwrap()
+        .finish()
+        .unwrap()
+        .read
 }
 
 /// Schema 1 as it was created: `charts` without the search columns.
