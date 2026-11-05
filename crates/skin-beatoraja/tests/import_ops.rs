@@ -336,6 +336,29 @@ fn every_condition_together_passes_the_source_limit() {
         "{e:?}"
     );
     assert!(at.line > 0, "{e:?}");
+
+    // One sign of every supported built-in, the longer negated one, on a
+    // number with an availability guard: refused at the destination too.
+    let ops = (230..=241)
+        .chain([42, 43, 1_046, 270, 271, 272, 273, 176, 177, 80, 81])
+        .chain(2_242..=2_245)
+        .map(|id| (-id).to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let loaded = import_body(&format!(
+        r#""value": [{{"id": "v", "src": "n", "w": 120, "h": 20, "divx": 10, "digit": 3,
+                      "ref": 160}}],
+           "destination": [{{"id": "v", "op": [{ops}], "dst": [{{"w": 12, "h": 20}}]}}]"#
+    ));
+    let e = loaded.result.as_ref().err();
+    let Some(ImportError::Expr { at, source }) = e else {
+        panic!("{e:?}");
+    };
+    assert!(
+        matches!(source.kind, skin_model::ErrorKind::TooLong { .. }),
+        "{e:?}"
+    );
+    assert!(at.line > 0, "{e:?}");
 }
 
 fn gauge_name(k: u32) -> String {

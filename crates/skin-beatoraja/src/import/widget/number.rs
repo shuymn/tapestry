@@ -11,6 +11,7 @@ use super::super::report::{NoteKind, PropertyKind};
 use super::super::track::{self, Stretch};
 use super::super::{Cx, Dst, Opts, Prop};
 use crate::error::ImportError;
+use crate::lua::residual::Conv;
 
 /// The most cells the model draws.
 const CELLS: i32 = skin_model::MAX_CELLS as i32;
@@ -94,7 +95,7 @@ impl Cx<'_> {
         let base = Role::Decorative.or_failure(dst.failure);
         // A callable keeps its precedence over `ref`.
         let shown = if let Prop::Callable(id) = value {
-            match self.value_callback(at, id, base)? {
+            match self.value_callback(at, id, base, Conv::Int)? {
                 Some(v) => v,
                 None => return Ok(()),
             }

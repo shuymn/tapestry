@@ -193,16 +193,25 @@ fn launch<T>(
     input: PlayInput,
     mut options: dev::Options,
     clock: QpcClock,
-    headless: impl FnOnce(&Path, PlayInput, Option<TimeUs>, Option<PathBuf>, QpcClock, Tune) -> T,
+    headless: impl FnOnce(
+        &Path,
+        PlayInput,
+        Option<TimeUs>,
+        Option<PathBuf>,
+        (u32, u32),
+        QpcClock,
+        Tune,
+    ) -> T,
     interactive: impl FnOnce(&Path, PlayInput, Option<TimeUs>, QpcClock, bool, Tune) -> T,
 ) -> T {
     // A mid-chart start (`--dev-start`).
     let start = options.start;
     let scripted = options.headless || matches!(input, PlayInput::Script(..));
     let frames = options.frames.take();
+    let size = options.size.unwrap_or(dev::DEFAULT_SIZE);
     let tune: Tune = Box::new(move |rig| options.tune(rig));
     if scripted {
-        headless(chart, input, start, frames, clock, tune)
+        headless(chart, input, start, frames, size, clock, tune)
     } else {
         interactive(chart, input, start, clock, false, tune)
     }
@@ -1253,6 +1262,12 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
     #[cfg(feature = "dev-tools")]
     let scenario = s.dev.scenario.take();
     #[cfg(feature = "dev-tools")]
+    let size = scenario
+        .as_ref()
+        .and_then(|sc| sc.size)
+        .or(s.dev.size)
+        .unwrap_or(dev::DEFAULT_SIZE);
+    #[cfg(feature = "dev-tools")]
     if let Some(sc) = &scenario {
         roots.clone_from(&sc.roots);
     }
@@ -1414,10 +1429,10 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
         }),
         // Headless (dev-tools): offscreen on WARP.
         #[cfg(feature = "dev-tools")]
-        _ => Box::new(|| {
+        _ => Box::new(move || {
             let target = Target::Offscreen {
-                width: 1280,
-                height: 720,
+                width: size.0,
+                height: size.1,
             };
             let r = Renderer::new(target, AdapterChoice::Warp)?;
             let fonts = render::text::Fonts::runtime()?;
@@ -1600,6 +1615,7 @@ fn headless(
     input: PlayInput,
     start: Option<TimeUs>,
     frames: Option<PathBuf>,
+    size: (u32, u32),
     clock: QpcClock,
     tune: impl FnOnce(&mut PlayerRig<'_>),
 ) -> anyhow::Result<()> {
@@ -1643,10 +1659,10 @@ fn headless(
         Some(dir) => Box::new(dev::FrameDump::new(dir, TimeUs(last_note.0 / 2))),
         None => Box::new(NoFrames),
     };
-    let make: MakeScreen = Box::new(|| {
+    let make: MakeScreen = Box::new(move || {
         let target = Target::Offscreen {
-            width: 1280,
-            height: 720,
+            width: size.0,
+            height: size.1,
         };
         Renderer::new(target, AdapterChoice::Warp)
             .map(|r| Box::new(MenuScreen::new(r, None)) as Box<dyn Screen>)
@@ -2248,7 +2264,7 @@ mod tests {
             input,
             options,
             QpcClock::start(),
-            |_, _, _, _, _, tune| run("headless", tune),
+            |_, _, _, _, _, _, tune| run("headless", tune),
             |_, _, _, _, _, tune| run("interactive", tune),
         )
     }

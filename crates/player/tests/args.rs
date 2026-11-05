@@ -261,6 +261,7 @@ fn dev_scripted_input_is_unknown_without_feature() {
         "--dev-scripted-input",
     );
     assert_unknown(&["play", "a.bms", "--dev-frames", "x"], "--dev-frames");
+    assert_unknown(&["play", "a.bms", "--dev-size", "8x8"], "--dev-size");
     assert_unknown(&["play", "a.bms", "--dev-auto-retry"], "--dev-auto-retry");
     assert_unknown(&["play", "a.bms", "--dev-overlay"], "--dev-overlay");
     assert_unknown(
@@ -334,6 +335,11 @@ fn usage_errors_touch_no_data_root() {
     #[cfg(feature = "dev-tools")]
     const DEV_CASES: &[&[&str]] = &[
         &["play", "a.bms", "--dev-frames"],
+        &["play", "a.bms", "--dev-size"],
+        &["play", "a.bms", "--dev-size", "1920"],
+        &["play", "a.bms", "--dev-size", "0x1080"],
+        &["play", "a.bms", "--dev-size", "8193x1080"],
+        &["--dev-size", "ax1"],
         &["play", "a.bms", "--dev-adjust-at", "x"],
         &["keys", "--dev-scripted-keys", "zz"],
         &["measure", "play"],
